@@ -1,0 +1,49 @@
+[general]
+name = "causal_conv1d"
+universal = false
+
+[torch]
+src = [
+  "torch-ext/pytorch_shim.h",
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h"
+]
+
+[kernel.causal_conv1d]
+backend = "cuda"
+src = [
+  "causal-conv1d/causal_conv1d_bwd.cu",
+  "causal-conv1d/causal_conv1d_common.h",
+  "causal-conv1d/causal_conv1d.cpp",
+  "causal-conv1d/causal_conv1d_fwd.cu",
+  "causal-conv1d/causal_conv1d.h",
+  "causal-conv1d/causal_conv1d_update.cu",
+  "causal-conv1d/static_switch.h",
+]
+include = [ "causal-conv1d" ]
+depends = [ "torch" ]
+
+#[kernel.causal_conv1d_rocm]
+#backend = "rocm"
+#rocm-archs = [
+#    "gfx906",
+#    "gfx908",
+#    "gfx90a",
+#    "gfx940",
+#    "gfx941",
+#    "gfx942",
+#    "gfx1030",
+#    "gfx1100",
+#    "gfx1101",
+#]
+#src = [
+#  "causal-conv1d/causal_conv1d_bwd.cu",
+#  "causal-conv1d/causal_conv1d_common.h",
+#  "causal-conv1d/causal_conv1d.cpp",
+#  "causal-conv1d/causal_conv1d_fwd.cu",
+#  "causal-conv1d/causal_conv1d.h",
+#  "causal-conv1d/causal_conv1d_update.cu",
+#  "causal-conv1d/static_switch.h",
+#]
+#include = [ "causal-conv1d" ]
+#depends = [ "torch" ]
