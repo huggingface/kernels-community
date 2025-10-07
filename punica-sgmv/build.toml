@@ -1,0 +1,76 @@
+[general]
+name = "punica_sgmv"
+universal = false
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.punica_kernels]
+backend = "cuda"
+depends = ["torch"]
+include = ["."]
+src = [
+    "bgmv/bgmv_config.h",
+    "punica_kernels/punica_ops.cc",
+    "sgmv/sgmv.h",
+    "sgmv_flashinfer/sgmv_config.h",
+]
+
+[kernel.sgmv]
+backend = "cuda"
+depends = [
+    "cutlass_3_8",
+    "torch",
+]
+src = [
+    "sgmv/sgmv_cutlass.cu",
+    "sgmv/sgmv_cutlass.cuh",
+]
+
+[kernel.sgmv_flashinfer]
+backend = "cuda"
+cuda-capabilities = [
+    "8.0",
+    "8.6",
+    "8.7",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.1",
+    "12.0",
+]
+depends = ["torch"]
+include = ["."]
+src = [
+    "flashinfer/cp_async.cuh",
+    "flashinfer/mma.cuh",
+    "flashinfer/permuted_smem.cuh",
+    "flashinfer/vec_dtypes.cuh",
+    "sgmv_flashinfer/sgmv_all.cu",
+    "sgmv_flashinfer/sgmv_config.h",
+    "sgmv_flashinfer/sgmv_flashinfer.cuh",
+]
+
+[kernel.bgmv]
+backend = "cuda"
+cuda-capabilities = [
+    "8.0",
+    "8.6",
+    "8.7",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.1",
+    "12.0",
+]
+depends = ["torch"]
+include = ["."]
+src = [
+    "bgmv/bgmv_all.cu",
+    "bgmv/bgmv_impl.cuh",
+    "bgmv/bgmv_config.h",
+    "flashinfer/vec_dtypes.cuh",
+]
