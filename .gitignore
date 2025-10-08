@@ -14,3 +14,6 @@ build
 
 # Editor files
 .*
+
+# Python stuff
+__pycache__/
