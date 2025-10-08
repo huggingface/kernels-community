@@ -1,7 +1,6 @@
-name: Nightly Kernels Check
+name: Scheduled Kernels Check
 
 on:
-  pull_request:
   schedule:
     - cron: "0 2 * * *"
   workflow_dispatch:
