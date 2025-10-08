@@ -1,6 +1,7 @@
 [general]
 name = "quantization_eetq"
 universal = false
+cuda-maxver = "12.9"
 
 [torch]
 src = [
