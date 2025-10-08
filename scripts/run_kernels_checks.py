@@ -1,7 +1,7 @@
 import argparse
 import logging
-import os
 import subprocess
+from pathlib import Path
 
 ORG = "kernels-community"
 
@@ -34,20 +34,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def discover_kernel_dirs(root: str, excludes: list[str]) -> list[str]:
+def discover_kernel_dirs(root: Path, excludes: list[str]) -> list[str]:
     filtered = {exclude.strip() for exclude in excludes}
     try:
-        entries = os.listdir(root)
+        entries = sorted(root.iterdir(), key=lambda path: path.name)
     except OSError as err:
         raise RuntimeError(f"Unable to list directories under {root}: {err}") from err
 
     directories = []
-    for entry in sorted(entries):
-        if entry.startswith(".") or entry in filtered:
+    for entry in entries:
+        name = entry.name
+        if name in filtered:
             continue
-        path = os.path.join(root, entry)
-        if os.path.isdir(path):
-            directories.append(entry)
+        elif not (entry / "build.toml").exists():
+            logging.debug(f"Skipping {name} because it doesn't contain a `build.toml`.")
+            continue
+        if entry.is_dir():
+            directories.append(name)
     return directories
 
 
@@ -73,7 +76,7 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
     )
 
-    root_path = os.path.abspath(args.root)
+    root_path = Path(args.root).resolve()
     logging.debug(f"Using root path {root_path}")
 
     try:
