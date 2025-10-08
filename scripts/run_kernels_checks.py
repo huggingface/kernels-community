@@ -46,7 +46,7 @@ def discover_kernel_dirs(root: Path, excludes: list[str]) -> list[str]:
         name = entry.name
         if name in filtered:
             continue
-        elif not (entry / "build.toml").exists():
+        elif entry.is_dir() and not (entry / "build.toml").exists():
             logging.debug(f"Skipping {name} because it doesn't contain a `build.toml`.")
             continue
         if entry.is_dir():
@@ -83,11 +83,11 @@ def main() -> int:
         directories = discover_kernel_dirs(root_path, args.exclude)
     except RuntimeError as err:
         logging.error(err)
-        raise
+        return 1
 
     if not directories:
         logging.error(f"⛔️ No kernel directories found in {root_path}.")
-        raise
+        return 1
 
     logging.info(f"🧪 Checking {len(directories)} kernel directories: {directories=}.")
 
@@ -98,10 +98,11 @@ def main() -> int:
             len(failures),
             ", ".join(sorted(failures)),
         )
-        raise
+        return 1
 
     logging.info("✅ All kernels checks completed successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

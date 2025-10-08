@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install kernels kernel-abi-check
+          pip install git+https://github.com/huggingface/kernels kernel-abi-check
 
       - name: Run kernels checks
         run: |
