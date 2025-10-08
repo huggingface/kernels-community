@@ -1,0 +1,92 @@
+[general]
+name = "quantization_eetq"
+universal = false
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.weight_only_batched_gemv]
+backend = "cuda"
+depends = [
+    "cutlass_2_10",
+    "torch",
+]
+include = ["cutlass_extensions/include"]
+src = [
+    "cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/kernel/mixed_gemm_B_layout.h",
+    "weightOnlyBatchedGemv/common.h",
+    "weightOnlyBatchedGemv/enabled.h",
+    "weightOnlyBatchedGemv/kernel.h",
+    "weightOnlyBatchedGemv/kernelLauncher.cu",
+    "weightOnlyBatchedGemv/kernelLauncher.h",
+    "weightOnlyBatchedGemv/utility.h",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs1Int4b.cu",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs1Int8b.cu",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs2Int4b.cu",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs2Int8b.cu",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs3Int4b.cu",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs3Int8b.cu",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs4Int4b.cu",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs4Int8b.cu",
+]
+
+[kernel.cutlass_kernels]
+backend = "cuda"
+depends = [
+    "cutlass_2_10",
+    "torch",
+]
+include = [
+    ".",
+    "utils",
+    "cutlass_extensions/include",
+]
+src = [
+    "cutlass_extensions/include/cutlass_extensions/arch/mma.h",
+    "cutlass_extensions/include/cutlass_extensions/compute_occupancy.h",
+    "cutlass_extensions/include/cutlass_extensions/epilogue/epilogue_quant_helper.h",
+    "cutlass_extensions/include/cutlass_extensions/epilogue/thread/ft_fused_activations.h",
+    "cutlass_extensions/include/cutlass_extensions/epilogue/threadblock/epilogue_per_row_per_col_scale.h",
+    "cutlass_extensions/include/cutlass_extensions/epilogue/threadblock/epilogue_tensor_op_int32.h",
+    "cutlass_extensions/include/cutlass_extensions/epilogue_helpers.h",
+    "cutlass_extensions/include/cutlass_extensions/ft_gemm_configs.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/kernel/default_fpA_intB_traits.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/kernel/fpA_intB_gemm.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/kernel/fpA_intB_gemm_with_broadcast.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/kernel/mixed_gemm_B_layout.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/threadblock/default_dq_mma.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/threadblock/default_dq_mma_multistage.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/threadblock/default_dq_mma_pipelined.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/threadblock/default_mma.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/threadblock/default_mma_bf16.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/threadblock/dq_mma_base.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/threadblock/dq_mma_multistage.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/threadblock/dq_mma_pipelined.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/warp/default_mma_tensor_op.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/warp/mma_tensorop_compute_B_with_f16.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/warp/mma_tensorop_dequantizer.h",
+    "cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h",
+    "cutlass_extensions/include/cutlass_extensions/tile_interleaved_layout.h",
+    "cutlass_kernels/cutlass_heuristic.cu",
+    "cutlass_kernels/cutlass_heuristic.h",
+    "cutlass_kernels/cutlass_preprocessors.cc",
+    "cutlass_kernels/cutlass_preprocessors.h",
+    "cutlass_kernels/fpA_intB_gemm.cu",
+    "cutlass_kernels/fpA_intB_gemm.h",
+    "cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm.h",
+    "cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm_template.h",
+    "cutlass_kernels/fpA_intB_gemm_wrapper.cu",
+    "cutlass_kernels/fpA_intB_gemm_wrapper.h",
+    "weightOnlyBatchedGemv/common.h",
+    "weightOnlyBatchedGemv/enabled.h",
+    "utils/activation_types.h",
+    "utils/cuda_utils.h",
+    "utils/logger.cc",
+    "utils/logger.h",
+    "utils/string_utils.h",
+    "utils/torch_utils.h",
+]
