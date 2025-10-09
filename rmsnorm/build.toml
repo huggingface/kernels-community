@@ -1,0 +1,51 @@
+[general]
+name = "rmsnorm"
+universal = false
+
+[torch]
+src = ["torch-ext/torch_binding.cpp"]
+
+[kernel.rmsnorm_xpu]
+backend = "xpu"
+depends = ["torch"]
+src = [
+    "rmsnorm_xpu/rmsnorm_xpu.cpp",
+    "rmsnorm_xpu/RMSNorm.hpp",
+    "rmsnorm_xpu/RMSNorm.cpp",
+    "rmsnorm_xpu/Norm.h",
+    "rmsnorm_xpu/dpcpp/Device.cpp",
+    "rmsnorm_xpu/dpcpp/Device.h",
+    "rmsnorm_xpu/dpcpp/Utils.h",
+    "rmsnorm_xpu/dpcpp/Array.h",
+    "rmsnorm_xpu/dpcpp/AccumulateType.h",
+    "rmsnorm_xpu/dpcpp/Allocator.cpp",
+    "rmsnorm_xpu/dpcpp/Allocator.h",
+    "rmsnorm_xpu/dpcpp/AllocationInfo.h",
+    "rmsnorm_xpu/dpcpp/IndexUtils.cpp",
+    "rmsnorm_xpu/dpcpp/IndexUtils.h",
+    "rmsnorm_xpu/dpcpp/MemoryAccess.h",
+    "rmsnorm_xpu/dpcpp/MemoryFormat.h",
+    "rmsnorm_xpu/dpcpp/Memory.h",
+    "rmsnorm_xpu/dpcpp/Memory.cpp",
+    "rmsnorm_xpu/dpcpp/Numerics.h",
+    "rmsnorm_xpu/dpcpp/DPCPP.h",
+    "rmsnorm_xpu/dpcpp/CachingDeviceAllocator.cpp",
+    "rmsnorm_xpu/dpcpp/CachingDeviceAllocator.h",
+    "rmsnorm_xpu/dpcpp/DeviceAllocator.h",
+    "rmsnorm_xpu/dpcpp/Barrier.h",
+    "rmsnorm_xpu/dpcpp/Barrier.cpp",
+    "rmsnorm_xpu/dpcpp/tensor/Context.cpp",
+    "rmsnorm_xpu/dpcpp/tensor/Context.h",
+    "rmsnorm_xpu/dpcpp/tensor/OpaqueTensorFactories.h",
+    "rmsnorm_xpu/dpcpp/tensor/OpaqueTensorFactories.cpp",
+    "rmsnorm_xpu/dpcpp/tensor/Tensor.cpp",
+    "rmsnorm_xpu/dpcpp/tensor/Tensor.h",
+    "rmsnorm_xpu/dpcpp/tensor/TensorMeta.cpp",
+    "rmsnorm_xpu/dpcpp/tensor/TensorMeta.h",
+    "rmsnorm_xpu/dpcpp/oneDNN/Reorder.h",
+    "rmsnorm_xpu/dpcpp/oneDNN/Runtime.cpp",
+    "rmsnorm_xpu/dpcpp/oneDNN/Runtime.h",
+    "rmsnorm_xpu/dpcpp/oneDNN/Utils.h",
+]
+include = ["rmsnorm_xpu/dpcpp"]
+
