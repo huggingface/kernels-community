@@ -20,7 +20,6 @@ cuda-flags = [
   "--ftemplate-backtrace-limit=0",              # To debug template code
   "--use_fast_math",
   "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
-  "-DCUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1",
   "-DCUTLASS_ENABLE_GDC_FOR_SM90",
   "--expt-relaxed-constexpr",
   "--expt-extended-lambda",
@@ -53,7 +52,6 @@ cuda-flags = [
   "--ftemplate-backtrace-limit=0",              # To debug template code
   "--use_fast_math",
   "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
-  "-DCUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1",
   "-DCUTLASS_ENABLE_GDC_FOR_SM90",
   "--expt-relaxed-constexpr",
   "--expt-extended-lambda",
@@ -202,7 +200,6 @@ cuda-flags = [
   "--ftemplate-backtrace-limit=0",              # To debug template code
   "--use_fast_math",
   "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
-  "-DCUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1",
   "-DCUTLASS_ENABLE_GDC_FOR_SM90",
   "--expt-relaxed-constexpr",
   "--expt-extended-lambda",
@@ -551,7 +548,6 @@ depends = ["torch", "cutlass_3_9"]
 #   "--ftemplate-backtrace-limit=0",              # To debug template code
 #   "--use_fast_math",
 #   "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
-#   "-DCUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1",
 #   "-DCUTLASS_ENABLE_GDC_FOR_SM90",
 #   "--expt-relaxed-constexpr",
 #   "--expt-extended-lambda",
