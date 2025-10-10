@@ -24,4 +24,4 @@ jobs:
 
       - name: Run kernels checks
         run: |
-          python scripts/run_kernels_checks.py --verbose
+          python scripts/run_kernels_checks.py --verbose --clear-cache

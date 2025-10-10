@@ -22,6 +22,9 @@ def parse_args() -> argparse.Namespace:
         help="Directory name to skip. Can be passed multiple times. Defaults to .github.",
     )
     parser.add_argument(
+        "--clear-cache", action="store_true", help="Whether to clear the cache after running `kernels check`."
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Only print commands instead of executing them.",
@@ -54,7 +57,7 @@ def discover_kernel_dirs(root: Path, excludes: list[str]) -> list[str]:
     return directories
 
 
-def run_kernels_checks(directories: list[str], dry_run: bool) -> list[str]:
+def run_kernels_checks(directories: list[str], dry_run: bool, clear_cache: bool = False) -> list[str]:
     failures = []
     for directory in directories:
         target = f"{ORG}/{directory}"
@@ -65,6 +68,14 @@ def run_kernels_checks(directories: list[str], dry_run: bool) -> list[str]:
         completed = subprocess.run(command, check=False)
         if completed.returncode != 0:
             failures.append(directory)
+
+        # Important to do this otherwise the space can add up.
+        if clear_cache:
+            del_cache_command = "rm -rf ~/.cache/huggingface/hub/models--kernels-community-*".split()
+            del_successful = subprocess.run(del_cache_command)
+            if del_successful.returncode != 0:
+                logging.error(f"{del_cache_command} didn't execute successdully.")
+
     return failures
 
 
@@ -91,7 +102,7 @@ def main() -> int:
 
     logging.info(f"🧪 Checking {len(directories)} kernel directories: {directories=}.")
 
-    failures = run_kernels_checks(directories, args.dry_run)
+    failures = run_kernels_checks(directories, args.dry_run, args.clear_cache)
     if failures:
         logging.error(
             "❌ kernels check failed for %d directories: %s",
