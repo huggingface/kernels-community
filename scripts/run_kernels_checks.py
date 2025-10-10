@@ -75,6 +75,8 @@ def run_kernels_checks(directories: list[str], dry_run: bool, clear_cache: bool 
             del_successful = subprocess.run(del_cache_command)
             if del_successful.returncode != 0:
                 logging.error(f"{del_cache_command} didn't execute successdully.")
+            else:
+                logging.debug(f"Deleted {target} cache successfully.")
 
     return failures
 
