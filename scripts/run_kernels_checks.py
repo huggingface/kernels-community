@@ -65,18 +65,27 @@ def run_kernels_checks(directories: list[str], dry_run: bool, clear_cache: bool 
         logging.info("🧪 Running %s", " ".join(command))
         if dry_run:
             continue
-        completed = subprocess.run(command, check=False)
+        try:
+            completed = subprocess.run(command, check=False)
+        except Exception as err:
+            logging.error("❌ Execution failed for %s: %s", directory, err)
+            failures.append(directory)
+            continue
         if completed.returncode != 0:
             failures.append(directory)
 
         # Important to do this otherwise the space can add up.
         if clear_cache:
             del_cache_command = "rm -rf ~/.cache/huggingface/hub/models--kernels-community-*".split()
-            del_successful = subprocess.run(del_cache_command)
-            if del_successful.returncode != 0:
-                logging.error(f"{del_cache_command} didn't execute successdully.")
+            try:
+                del_successful = subprocess.run(del_cache_command, check=False)
+            except Exception as err:
+                logging.error("❌ Cache cleanup failed for %s: %s", target, err)
             else:
-                logging.debug(f"Deleted {target} cache successfully.")
+                if del_successful.returncode != 0:
+                    logging.error(f"{del_cache_command} didn't execute successdully.")
+                else:
+                    logging.debug(f"Deleted {target} cache successfully.")
 
     return failures
 
