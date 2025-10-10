@@ -77,16 +77,16 @@ def _delete_kernel_cache(org: str, directory: str) -> None:
     pattern = f"models--{org}--{directory}*"
     matches = list(cache_root.glob(pattern))
     if not matches:
-        logging.debug("No cache entries matched %s under %s.", pattern, cache_root)
+        logging.debug(f"No cache entries matched {pattern} under {cache_root}.")
         return
 
     for match in matches:
         try:
             shutil.rmtree(match)
         except OSError as err:
-            logging.error("❌ Cache cleanup failed for %s: %s", match, err)
+            logging.error(f"❌ Cache cleanup failed for {match}: {err}")
         else:
-            logging.debug("Deleted cache entry %s", match)
+            logging.debug(f"Deleted cache entry {match}")
 
 
 def run_kernels_checks(directories: list[str], dry_run: bool, clear_cache: bool = False) -> list[str]:
