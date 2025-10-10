@@ -1,5 +1,7 @@
 import argparse
 import logging
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -57,6 +59,36 @@ def discover_kernel_dirs(root: Path, excludes: list[str]) -> list[str]:
     return directories
 
 
+def _cache_root() -> Path:
+    if hub_cache := os.getenv("HF_HUB_CACHE"):
+        return Path(hub_cache).expanduser()
+    hf_home = os.getenv("HF_HOME")
+    if hf_home:
+        return Path(hf_home).expanduser() / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _delete_kernel_cache(org: str, directory: str) -> None:
+    cache_root = _cache_root()
+    if not cache_root.exists():
+        logging.debug("Cache root %s does not exist; nothing to delete.", cache_root)
+        return
+
+    pattern = f"models--{org}--{directory}*"
+    matches = list(cache_root.glob(pattern))
+    if not matches:
+        logging.debug("No cache entries matched %s under %s.", pattern, cache_root)
+        return
+
+    for match in matches:
+        try:
+            shutil.rmtree(match)
+        except OSError as err:
+            logging.error("❌ Cache cleanup failed for %s: %s", match, err)
+        else:
+            logging.debug("Deleted cache entry %s", match)
+
+
 def run_kernels_checks(directories: list[str], dry_run: bool, clear_cache: bool = False) -> list[str]:
     failures = []
     for directory in directories:
@@ -68,24 +100,14 @@ def run_kernels_checks(directories: list[str], dry_run: bool, clear_cache: bool 
         try:
             completed = subprocess.run(command, check=False)
         except Exception as err:
-            logging.error("❌ Execution failed for %s: %s", directory, err)
+            logging.error(f"❌ Execution failed for {directory}: {err}")
             failures.append(directory)
             continue
         if completed.returncode != 0:
             failures.append(directory)
 
-        # Important to do this otherwise the space can add up.
         if clear_cache:
-            del_cache_command = "rm -rf ~/.cache/huggingface/hub/models--kernels-community-*".split()
-            try:
-                del_successful = subprocess.run(del_cache_command, check=False)
-            except Exception as err:
-                logging.error("❌ Cache cleanup failed for %s: %s", target, err)
-            else:
-                if del_successful.returncode != 0:
-                    logging.error(f"{del_cache_command} didn't execute successdully.")
-                else:
-                    logging.debug(f"Deleted {target} cache successfully.")
+            _delete_kernel_cache(ORG, directory)
 
     return failures
 
