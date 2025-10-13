@@ -48,5 +48,4 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
-          nix run .#kernels -- upload --repo_id "kernels-community/$KERNEL" "$KERNEL"
-
+          ( cd "$KERNEL" && nix run .#kernels -- upload --repo_id "kernels-community/$KERNEL" . )
