@@ -38,7 +38,7 @@ rocm-archs = [
 depends = ["torch"]
 src = ["relu_cuda/relu.cu"]
 
-[kernel.activation_xpu]
-backend = "xpu"
-depends = ["torch"]
-src = ["relu_xpu/relu.cpp"]
+#[kernel.activation_xpu]
+#backend = "xpu"
+#depends = ["torch"]
+#src = ["relu_xpu/relu.cpp"]
