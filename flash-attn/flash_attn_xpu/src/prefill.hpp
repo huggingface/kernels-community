@@ -6,6 +6,7 @@
 #include "cutlass/util/device_memory.h"
 #include <cute/tensor.hpp>
 
+#include "./compat_wrapper.hpp"
 #include "./kernel/tile_scheduler.hpp"
 #include "./kernel/xe_flash_attn_prefill.hpp"
 #include "./collective/fmha_fusion.hpp"
@@ -239,7 +240,6 @@ struct FMHAKernel {
         cutlass::flash_attention::collective::FlashPrefillSoftmaxEpilogue<
             Causal, EpilogueDispatchPolicy, ElementAccumulator>;
 
-    // 根据 ArgsType 选择 ProblemShape
     using ProblemShape = typename std::conditional<
         std::is_same<ArgsType, prefill_args_varlen_t>::value,
         cute::tuple<int, int, int, cutlass::fmha::collective::VariableLength, 
