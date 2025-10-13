@@ -1,0 +1,52 @@
+name: Build Release
+on:
+  pull_request:
+    types: [closed]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build-kernel:
+    # Only run if the PR was actually merged (not just closed)
+    if: github.event.pull_request.merged == true
+    runs-on:
+      group: aws-highmemory-32-plus-nix
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 12
+            sandbox-fallback = false
+      - name: Nix info
+        run: nix-shell -p nix-info --run "nix-info -m"
+      - uses: cachix/cachix-action@v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
+      - name: Validate kernel directory
+        id: validate
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release" "$PR_TITLE"); then
+            echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            echo "skip=true" >> $GITHUB_OUTPUT
+          fi
+      - name: Build and copy kernel
+        if: steps.validate.outputs.skip == 'false'
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          ( cd "$KERNEL" && nix run -L .#build-and-copy )
+      - name: Upload kernel
+        if: steps.validate.outputs.skip == 'false'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          nix run .#kernels -- upload --repo_id "kernels-community/$KERNEL" "$KERNEL"
+
