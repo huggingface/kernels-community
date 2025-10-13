@@ -190,6 +190,14 @@ public:
     const auto sycl_block = COMPAT::dim3(block.x, block.y, block.z);
     const auto sycl_grid = COMPAT::dim3(grid.x, grid.y, grid.z);
 
+// Launch parameters depend on whether SYCL compiler supports work-group scratch memory extension
+#if !defined(SYCL_EXT_ONEAPI_WORK_GROUP_SCRATCH_MEMORY)
+    using namespace COMPAT::experimental;
+    auto event = launch<cutlass::device_kernel<FMHAPrefillKernel>>(
+        launch_policy{sycl_grid, sycl_block, local_mem_size{static_cast<std::size_t>(smem_size)},
+                      kernel_properties{sycl_exp::sub_group_size<FMHAPrefillKernel::DispatchPolicy::SubgroupSize>}},
+        params);
+#else
     COMPAT::experimental::launch_properties launch_props{
         sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
     };
@@ -199,9 +207,10 @@ public:
     COMPAT::experimental::launch_policy policy{sycl_grid, sycl_block,
                                                    launch_props, kernel_props};
 #if defined(OLD_API)
-      auto event = COMPAT::experimental::launch<cutlass::device_kernel<FMHAPrefillKernel>>(policy, params);
+    auto event = COMPAT::experimental::launch<cutlass::device_kernel<FMHAPrefillKernel>>(policy, params);
 #else
-      auto event = COMPAT::experimental::launch<cutlass::device_kernel<FMHAPrefillKernel>, FMHAPrefillKernel>(policy, params);
+    auto event = COMPAT::experimental::launch<cutlass::device_kernel<FMHAPrefillKernel>, FMHAPrefillKernel>(policy, params);
+#endif
 #endif
 
     EventManager::getInstance().addEvent(event);
