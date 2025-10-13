@@ -187,18 +187,18 @@ public:
     // configure smem size and carveout
     int smem_size = FMHAPrefillKernel::SharedStorageSize;
 
-    const auto sycl_block = compat::dim3(block.x, block.y, block.z);
-    const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
+    const auto sycl_block = COMPAT::dim3(block.x, block.y, block.z);
+    const auto sycl_grid = COMPAT::dim3(grid.x, grid.y, grid.z);
 
-    compat::experimental::launch_properties launch_props{
+    COMPAT::experimental::launch_properties launch_props{
         sycl::ext::oneapi::experimental::work_group_scratch_size(smem_size),
     };
-    compat::experimental::kernel_properties kernel_props{
+    COMPAT::experimental::kernel_properties kernel_props{
         sycl::ext::oneapi::experimental::sub_group_size<
             FMHAPrefillKernel::DispatchPolicy::SubgroupSize>};
-    compat::experimental::launch_policy policy{sycl_grid, sycl_block,
+    COMPAT::experimental::launch_policy policy{sycl_grid, sycl_block,
                                                    launch_props, kernel_props};
-    auto event = compat::experimental::launch<cutlass::device_kernel<FMHAPrefillKernel>, FMHAPrefillKernel>(policy, params);
+    auto event = COMPAT::experimental::launch<cutlass::device_kernel<FMHAPrefillKernel>, FMHAPrefillKernel>(policy, params);
 
     EventManager::getInstance().addEvent(event);
   }

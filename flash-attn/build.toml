@@ -123,6 +123,7 @@ src = [
 
   "flash_attn_xpu/src/prefill.hpp",
   "flash_attn_xpu/src/fmha_utils.hpp",
+  "flash_attn_xpu/src/compat_wrapper.hpp",
 
   "flash_attn_xpu/src/collective/fmha_fusion.hpp",
   "flash_attn_xpu/src/collective/xe_flash_attn_prefill_epilogue.hpp",

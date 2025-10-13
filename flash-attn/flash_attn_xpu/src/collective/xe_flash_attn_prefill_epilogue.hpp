@@ -163,7 +163,7 @@ public:
     constexpr int FragsM = shape<1>(FragOutLayout{});
     constexpr int FragsN = size(select<2,3>(shape(FragOutLayout{})));
 
-    auto g = compat::get_nd_item<1>().get_sub_group();
+    auto g = COMPAT::get_nd_item<1>().get_sub_group();
     auto out_reg = make_tensor(static_cast<decltype(out) &&>(out).data() , Shape<Int<Vec>, Int<FragsM>, Int<FragsN>>{});
 
     CUTLASS_PRAGMA_UNROLL
