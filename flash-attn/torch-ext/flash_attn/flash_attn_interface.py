@@ -24,12 +24,10 @@ def maybe_contiguous(x):
 
 
 def _get_device():
-    if torch.cuda.is_available():
-        return "cuda"
-    elif torch.xpu.is_available():
+    if torch.xpu.is_available():
         return "xpu"
     else:
-        raise RuntimeError("No supported device found (CUDA or XPU)")
+        return "cuda"
 
 _XPU_AVAILABLE = torch.xpu.is_available() if hasattr(torch, "xpu") else False # TODO remove hasattr check when bwd is supported on XPU
 
