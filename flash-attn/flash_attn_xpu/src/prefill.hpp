@@ -198,7 +198,11 @@ public:
             FMHAPrefillKernel::DispatchPolicy::SubgroupSize>};
     COMPAT::experimental::launch_policy policy{sycl_grid, sycl_block,
                                                    launch_props, kernel_props};
-    auto event = COMPAT::experimental::launch<cutlass::device_kernel<FMHAPrefillKernel>, FMHAPrefillKernel>(policy, params);
+    #if defined(OLD_API)
+      auto event = COMPAT::experimental::launch<cutlass::device_kernel<FMHAPrefillKernel>>(policy, params);
+    #else
+      auto event = COMPAT::experimental::launch<cutlass::device_kernel<FMHAPrefillKernel>, FMHAPrefillKernel>(policy, params);
+    #endif
 
     EventManager::getInstance().addEvent(event);
   }
