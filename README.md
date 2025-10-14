@@ -11,11 +11,3 @@ about the Kernel Hub in the [docs](https://huggingface.co/docs/kernels/index).
 
 This repository contains sources for the kernels in [hf.co/kernels-community](https://huggingface.co/kernels-community).
 
-## Development
-
-CI will run on a PR for a kernel `example` if the PR title has the following
-format:
-
-```
-example: short description of the change
-```
