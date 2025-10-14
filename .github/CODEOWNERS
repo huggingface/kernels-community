@@ -16,6 +16,7 @@
 /deformable-detr/ @danieldk
 /flash-attn2/ @drbh @MekkCyber
 /flash-attn3/ @danieldk @MekkCyber
+/mamba-ssm/ @danieldk
 /megablocks/ @drbh
 /paged-attention/ @danieldk @MekkCyber @EricLBuehler
 /punica-sgmv/ @danieldk
