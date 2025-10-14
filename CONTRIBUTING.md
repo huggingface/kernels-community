@@ -9,13 +9,13 @@ This repository contains kernels that are maintained, but not necessarily develo
 
 Kernels in this repository are automatically built and uploaded to [hf.co/kernels-community](https://hf.co/kernels-community).
 
-For for your own kernels, we recommend you to develop them under your own GitHub organization and upload them to the Hugging Face Hub under your own namespace. Similarly to models and datasets, the kernels ecosystem is designed to empower the community to share their own kernels on the Hub. Of course, you are free to copy and alter our GitHub actions to build and upload kernels.
+For your own kernels, we recommend you to develop them under your own GitHub organization and upload them to the Hugging Face Hub under your own namespace. Similarly to models and datasets, the kernels ecosystem is designed to empower the community to share their own kernels on the Hub. Of course, you are free to copy and alter our GitHub actions to build and upload kernels.
 
 If you see an impactful kernel that you think we should host, please open a GitHub issue.
 
 ## Why is the kernel that I developed in this repository?
 
-We packaged it as a Hub kernel because it is very impactful and most likely used by transformers, diffusers, or other Hugging Face projects. If you would like to maintain the Hub kernel yourself, we can transfer ownership to you. Please contact us through ours shared Slack collab channel (if available) or open a GitHub issue.
+We packaged it as a Hub kernel because it is very impactful and most likely used by transformers, diffusers, or other Hugging Face projects. If you would like to maintain the Hub kernel yourself, we can transfer ownership to you. Please contact us through our shared Slack collab channel (if available) or open a GitHub issue.
 
 ## How to add a new kernel?
 
