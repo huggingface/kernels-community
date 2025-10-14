@@ -21,10 +21,10 @@
 /punica-sgmv/ @danieldk
 /quantization-eetq/ @danieldk
 /relu/ @danieldk
-/rmsnorm/ @sywangyi @MekkCyber
+/rmsnorm/ @MekkCyber
 /rotary/ @danieldk
 /rwkv/ @MekkCyber
-/scattermoe/ @shawntan @MekkCyber
+/scattermoe/ @MekkCyber
 /trimul_gpumode/ @MekkCyber
 /yoso/ @MekkCyber
 
