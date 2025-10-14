@@ -1,4 +1,4 @@
-name: Mention non-collaborator reviewers
+name: Mention kernel contributors
 
 on:
   pull_request:
@@ -18,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Mention reviewers based on changed paths
+      - name: Mention contributors based on changed paths
         uses: actions/github-script@v7
         with:
           script: |
@@ -71,7 +71,7 @@ jobs:
               return;
             }
 
-            const marker = '<!-- mention-non-collab-reviewers -->';
+            const marker = '<!-- mention-kernel-contributors -->';
             const body = `${marker}\nRequesting input from community reviewers based on changed paths:\n\n${[...mentions].join(' ')}`;
 
             // Check for an existing bot comment with our marker
