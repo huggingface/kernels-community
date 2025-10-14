@@ -22,6 +22,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install git+https://github.com/huggingface/kernels kernel-abi-check
 
-      - name: Run kernels checks
+      - name: Run kernels checks and report failures
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          python scripts/run_kernels_checks.py --verbose --clear-cache
+          python scripts/report_kernel_failures.py --verbose --clear-cache
