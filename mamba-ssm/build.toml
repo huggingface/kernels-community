@@ -1,0 +1,32 @@
+[general]
+name = "mamba_ssm"
+universal = false
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.selective_scan]
+backend = "cuda"
+depends = ["torch"]
+src = [
+    "selective-scan/reverse_scan.cuh",
+    "selective-scan/selective_scan.cpp",
+    "selective-scan/selective_scan.h",
+    "selective-scan/selective_scan_bwd_bf16_complex.cu",
+    "selective-scan/selective_scan_bwd_bf16_real.cu",
+    "selective-scan/selective_scan_bwd_fp16_complex.cu",
+    "selective-scan/selective_scan_bwd_fp16_real.cu",
+    "selective-scan/selective_scan_bwd_fp32_complex.cu",
+    "selective-scan/selective_scan_bwd_fp32_real.cu",
+    "selective-scan/selective_scan_bwd_kernel.cuh",
+    "selective-scan/selective_scan_common.h",
+    "selective-scan/selective_scan_fwd_bf16.cu",
+    "selective-scan/selective_scan_fwd_fp16.cu",
+    "selective-scan/selective_scan_fwd_fp32.cu",
+    "selective-scan/selective_scan_fwd_kernel.cuh",
+    "selective-scan/static_switch.h",
+    "selective-scan/uninitialized_copy.cuh",
+]
