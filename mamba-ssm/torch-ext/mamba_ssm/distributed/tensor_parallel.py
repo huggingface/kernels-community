@@ -43,11 +43,7 @@ class ParallelLinearFunc(torch.autograd.Function):
 
         if torch.is_autocast_enabled():
             weight = weight.to(dtype=torch.get_autocast_gpu_dtype())
-            bias = (
-                bias.to(dtype=torch.get_autocast_gpu_dtype())
-                if bias is not None
-                else None
-            )
+            bias = bias.to(dtype=torch.get_autocast_gpu_dtype()) if bias is not None else None
         weight = weight.contiguous()
         if process_group is not None and sequence_parallel:
             handle_x.wait()
@@ -84,9 +80,7 @@ class ParallelLinearFunc(torch.autograd.Function):
             grad_input = grad_input.reshape(*batch_shape, grad_input.shape[-1])
             if process_group is not None:
                 reduce_fn = reduce_scatter_raw if sequence_parallel else all_reduce_raw
-                grad_input, handle_grad_input = reduce_fn(
-                    grad_input, process_group, async_op=True
-                )
+                grad_input, handle_grad_input = reduce_fn(grad_input, process_group, async_op=True)
         else:
             grad_input = None
         if ctx.needs_input_grad[1]:
@@ -128,9 +122,7 @@ class ColumnParallelLinear(nn.Linear):
     ) -> None:
         world_size = torch.distributed.get_world_size(process_group)
         if out_features % multiple_of:
-            raise ValueError(
-                f"out_features ({out_features}) must be a multiple of {multiple_of}"
-            )
+            raise ValueError(f"out_features ({out_features}) must be a multiple of {multiple_of}")
         multiple = out_features // multiple_of
         # We want to split @multiple across world_size, but it could be an uneven split
         div = multiple // world_size
@@ -138,11 +130,7 @@ class ColumnParallelLinear(nn.Linear):
         # The first @mod ranks get @div + 1 copies, the rest get @div copies
         local_multiple = div + int(torch.distributed.get_rank(process_group) < mod)
         super().__init__(
-            in_features,
-            local_multiple * multiple_of,
-            bias=bias,
-            device=device,
-            dtype=dtype,
+            in_features, local_multiple * multiple_of, bias=bias, device=device, dtype=dtype
         )
         self.process_group = process_group
         self.sequence_parallel = sequence_parallel
@@ -175,9 +163,7 @@ class RowParallelLinear(nn.Linear):
         world_size = torch.distributed.get_world_size(process_group)
         rank = torch.distributed.get_rank(process_group)
         if in_features % multiple_of:
-            raise ValueError(
-                f"in_features ({in_features}) must be a multiple of {multiple_of}"
-            )
+            raise ValueError(f"in_features ({in_features}) must be a multiple of {multiple_of}")
         multiple = in_features // multiple_of
         # We want to split @multiple across world_size, but it could be an uneven split
         div = multiple // world_size
@@ -206,9 +192,7 @@ class RowParallelLinear(nn.Linear):
 
 
 class VocabParallelEmbedding(nn.Embedding):
-    def __init__(
-        self, num_embeddings, *args, process_group=None, padding_idx=None, **kwargs
-    ):
+    def __init__(self, num_embeddings, *args, process_group=None, padding_idx=None, **kwargs):
         self.process_group = process_group
         if process_group is not None:
             world_size = torch.distributed.get_world_size(process_group)
@@ -221,9 +205,7 @@ class VocabParallelEmbedding(nn.Embedding):
                 raise RuntimeError("ParallelEmbedding does not support padding_idx")
         else:
             world_size = 1
-        super().__init__(
-            num_embeddings // world_size, *args, padding_idx=padding_idx, **kwargs
-        )
+        super().__init__(num_embeddings // world_size, *args, padding_idx=padding_idx, **kwargs)
 
     def forward(self, input: Tensor) -> Tensor:
         if self.process_group is None:
@@ -231,10 +213,7 @@ class VocabParallelEmbedding(nn.Embedding):
         else:
             rank = torch.distributed.get_rank(self.process_group)
             vocab_size = self.num_embeddings
-            vocab_start_index, vocab_end_index = (
-                rank * vocab_size,
-                (rank + 1) * vocab_size,
-            )
+            vocab_start_index, vocab_end_index = rank * vocab_size, (rank + 1) * vocab_size
             # Create a mask of valid vocab ids (1 means it needs to be masked).
             input_ids_mask = (input < vocab_start_index) | (input >= vocab_end_index)
             input = input - vocab_start_index
@@ -245,9 +224,7 @@ class VocabParallelEmbedding(nn.Embedding):
 
 
 class ColumnParallelEmbedding(nn.Embedding):
-    def __init__(
-        self, num_embeddings, embedding_dim, *args, process_group=None, **kwargs
-    ):
+    def __init__(self, num_embeddings, embedding_dim, *args, process_group=None, **kwargs):
         self.process_group = process_group
         if process_group is not None:
             world_size = torch.distributed.get_world_size(process_group)
@@ -290,10 +267,7 @@ class ParallelEmbeddings(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         if self.max_position_embeddings > 0:
             self.position_embeddings = ColumnParallelEmbedding(
-                max_position_embeddings,
-                embed_dim,
-                process_group=process_group,
-                **factory_kwargs,
+                max_position_embeddings, embed_dim, process_group=process_group, **factory_kwargs
             )
 
     def forward(self, input_ids, position_ids=None, combine_batch_seqlen_dim=False):
@@ -306,9 +280,7 @@ class ParallelEmbeddings(nn.Module):
         embeddings = self.word_embeddings(input_ids)
         if self.max_position_embeddings > 0:
             if position_ids is None:
-                position_ids = torch.arange(
-                    seqlen, dtype=torch.long, device=input_ids.device
-                )
+                position_ids = torch.arange(seqlen, dtype=torch.long, device=input_ids.device)
             position_embeddings = self.position_embeddings(position_ids)
             if world_size <= 1:
                 embeddings = embeddings + position_embeddings
@@ -321,6 +293,4 @@ class ParallelEmbeddings(nn.Module):
         if combine_batch_seqlen_dim:
             embeddings = rearrange(embeddings, "b s d -> (b s) d")
         reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
-        return (
-            embeddings if world_size <= 1 else reduce_fn(embeddings, self.process_group)
-        )
+        return embeddings if world_size <= 1 else reduce_fn(embeddings, self.process_group)
