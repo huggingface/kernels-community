@@ -16,8 +16,8 @@
 /deformable-detr/ @danieldk
 /flash-attn2/ @drbh @MekkCyber
 /flash-attn3/ @danieldk @MekkCyber
-/megablocks/ @danieldk
-/paged-attention/ @danieldk @MekkCyber
+/megablocks/ @drbh
+/paged-attention/ @danieldk @MekkCyber EricLBuehler
 /punica-sgmv/ @danieldk
 /quantization-eetq/ @danieldk
 /relu/ @danieldk
