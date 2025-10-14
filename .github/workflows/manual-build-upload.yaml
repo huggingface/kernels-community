@@ -1,0 +1,86 @@
+name: Manual Kernel Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_name:
+        description: 'Kernel directory to build and upload (e.g. flash-attn3)'
+        required: true
+      pr_number:
+        description: 'Optional PR number to checkout before building'
+        required: false
+        default: ''
+      target_branch:
+        description: 'Target branch on kernels-community/<kernel> to publish to'
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-upload:
+    runs-on:
+      group: aws-highmemory-32-plus-nix
+    steps:
+      - name: Ensure workflow is not run from main
+        if: ${{ github.ref == 'refs/heads/main' }}
+        run: |
+          echo "❌ This workflow must be dispatched from a non-main branch."
+          exit 1
+
+      - name: Checkout selected branch
+        if: ${{ inputs.pr_number == '' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout PR branch
+        if: ${{ inputs.pr_number != '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 12
+            sandbox-fallback = false
+
+      - name: Nix info
+        run: nix-shell -p nix-info --run "nix-info -m"
+
+      - uses: cachix/cachix-action@v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
+
+      - name: Validate kernel directory
+        id: validate
+        run: |
+          set -eu
+          KERNEL_INPUT="${{ inputs.kernel_name }}"
+          if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release" "${KERNEL_INPUT}: manual dispatch"); then
+            echo "kernel=$KERNEL" >> "$GITHUB_OUTPUT"
+          else
+            echo "Kernel validation failed."
+            exit 1
+          fi
+
+      - name: Build and copy kernel
+        run: |
+          set -eu
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          ( cd "$KERNEL" && nix run -L .#build-and-copy )
+
+      - name: Upload kernel
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -eu
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          TARGET_BRANCH="${{ inputs.target_branch }}"
+          ( cd "$KERNEL" && nix run .#kernels -- upload --repo_id "kernels-community/$KERNEL" --branch "$TARGET_BRANCH" . )
