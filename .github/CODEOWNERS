@@ -1,0 +1,30 @@
+# CODEOWNERS for kernels-community
+#
+# Default owners are requested for review on any change unless a more specific
+# rule below matches. To assign owners for a specific kernel directory, add a
+# line like:
+#   /flash-attn2/ @owner1 @owner2
+#
+# See GitHub docs: https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owners
+* @danieldk @drbh @MekkCyber
+
+# Per-kernel ownership (examples; add real owners as needed)
+/activation/ @danieldk @MekkCyber
+/causal-conv1d/ @danieldk @MekkCyber
+/deformable-detr/ @danieldk
+/flash-attn2/ @drbh
+/flash-attn3/ @danieldk
+/megablocks/ @danieldk
+/paged-attention/ @danieldk @MekkCyber
+/punica-sgmv/ @danieldk
+/quantization-eetq/ @danieldk
+/relu/ @danieldk
+/rmsnorm/ @sywangyi @MekkCyber
+/rotary/ @danieldk
+/rwkv/ @MekkCyber
+/scattermoe/ @shawntan @MekkCyber
+/trimul_gpumode/ @MekkCyber
+/yoso/ @MekkCyber
+
