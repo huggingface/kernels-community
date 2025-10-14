@@ -1,0 +1,42 @@
+[general]
+name = "megablocks"
+universal = false
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[kernel.megablocks]
+backend = "cuda"
+cuda-capabilities = [
+  "7.0",
+  "7.2",
+  "7.5",
+  "8.0",
+  "8.6",
+  "8.7",
+  "8.9",
+  "9.0",
+  "10.0",
+  "10.1",
+  "11.8",
+  "12.0",
+]
+depends = ["torch", "cutlass_3_8"]
+src = [
+  "csrc/cumsum.h",
+  "csrc/cumsum.cu", #
+  "csrc/histogram.h",
+  "csrc/histogram.cu", #
+  "csrc/indices.h",
+  "csrc/indices.cu", #
+  "csrc/replicate.h",
+  "csrc/replicate.cu", #
+  "csrc/sort.h",
+  "csrc/sort.cu", # vendored grouped gemm
+  "csrc/grouped_gemm/fill_arguments.cuh",
+  "csrc/grouped_gemm/grouped_gemm.cu",
+  "csrc/grouped_gemm/grouped_gemm.h",
+]
