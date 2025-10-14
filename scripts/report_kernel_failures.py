@@ -9,6 +9,7 @@ from urllib import error, request
 
 import run_kernels_checks
 
+GITHUB_REPO = "huggingface/kernels-community"
 
 def parse_args() -> argparse.Namespace:
     parser = run_kernels_checks.build_parser()
@@ -24,9 +25,10 @@ def parse_args() -> argparse.Namespace:
 def _github_run_url() -> Optional[str]:
     repository = os.getenv("GITHUB_REPOSITORY")
     run_id = os.getenv("GITHUB_RUN_ID")
+    action_url = f"https://github.com/{GITHUB_REPO}/actions/runs/{run_id}"
     if not repository or not run_id:
         return None
-    return run_id
+    return action_url
 
 
 def _format_failure_message(failures: list[str]) -> str:
