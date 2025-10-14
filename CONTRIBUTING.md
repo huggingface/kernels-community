@@ -1,21 +1,21 @@
-# Contributing <img src="https://github.com/user-attachments/assets/64a652f3-0cd3-4829-b3c1-df13f7933569" width="50" height="50" style="vertical-align:middle;"> to kernels-community 
+# Contributing <img src="https://github.com/user-attachments/assets/64a652f3-0cd3-4829-b3c1-df13f7933569" width="50" height="50" style="vertical-align:middle;"> to kernels-community
 
 ## Which kernels are accepted?
 
-We are looking for kernels that are:
+This repository contains kernels that are maintained, but not necessarily developed by Hugging Face. This mainly concerns kernels:
 
-- Useful / Impactful for the community.
-- Have a clear use case.
-- Clearly documented.
-- Extensively tested.
-- Have a good performance compared to the naive PyTorch implementation + torch.compile.
+- That are developed by Hugging Face (such as yamoe).
+- Kernels that are useful/high-impact, but where the upstream maintainer does not support kernels yet.
 
+Kernels in this repository are automatically built and uploaded to [hf.co/kernels-community](https://hf.co/kernels-community).
 
-## How to get your kernel accepted?
+For for your own kernels, we recommend you to develop them under your own GitHub organization and upload them to the Hugging Face Hub under your own namespace. Similarly to models and datasets, the kernels ecosystem is designed to empower the community to share their own kernels on the Hub. Of course, you are free to copy and alter our GitHub actions to build and upload kernels.
 
-1. Open an issue/feature request with the kernel details, benchmark results and a link to the kernel's source code.
-2. The kernel will be reviewed and accepted or rejected.
-3. If accepted, we will ask you to create a PR, and we will build the kernel and upload it to the Hub. We will then add you as a CODEOWNER of the kernel.
+If you see an impactful kernel that you think we should host, please open a GitHub issue.
+
+## Why is the kernel that I developed in this repository?
+
+We packaged it as a Hub kernel because it is very impactful and most likely used by transformers, diffusers, or other Hugging Face projects. If you would like to maintain the Hub kernel yourself, we can transfer ownership to you. Please contact us through ours shared Slack collab channel (if available) or open a GitHub issue.
 
 ## How to add a new kernel?
 
@@ -38,3 +38,4 @@ When you are done, you can open a PR to the `kernels-community` repository. Plea
 ## How to benchmark a kernel?
 
 #TODO: Add benchmarking instructions after https://github.com/huggingface/kernels-uvnotes is ready.
+
