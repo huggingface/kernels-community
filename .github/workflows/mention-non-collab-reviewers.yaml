@@ -72,7 +72,7 @@ jobs:
             }
 
             const marker = '<!-- mention-non-collab-reviewers -->';
-            const body = `${marker}\nRequesting input from non-collaborator reviewers based on changed paths:\n\n${[...mentions].join(' ')}`;
+            const body = `${marker}\nRequesting input from community reviewers based on changed paths:\n\n${[...mentions].join(' ')}`;
 
             // Check for an existing bot comment with our marker
             const comments = await github.paginate(github.rest.issues.listComments, {

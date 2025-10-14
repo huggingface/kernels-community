@@ -1,6 +1,5 @@
 [general]
 name = "rmsnorm"
-universal = false
 
 [torch]
 src = ["torch-ext/torch_binding.cpp"]
