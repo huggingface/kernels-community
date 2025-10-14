@@ -13,6 +13,8 @@ This repository contains sources for the kernels in [hf.co/kernels-community](ht
 
 ## Development
 
+Before submitting a kernel PR, please make sure to read the [Contributing Guidelines](./CONTRIBUTING.md).
+
 CI will run on a PR for a kernel `example` if the PR title has the following
 format:
 
