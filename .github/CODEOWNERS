@@ -14,8 +14,8 @@
 /activation/ @danieldk @MekkCyber
 /causal-conv1d/ @danieldk @MekkCyber
 /deformable-detr/ @danieldk
-/flash-attn2/ @drbh
-/flash-attn3/ @danieldk
+/flash-attn2/ @drbh @MekkCyber
+/flash-attn3/ @danieldk @MekkCyber
 /megablocks/ @danieldk
 /paged-attention/ @danieldk @MekkCyber
 /punica-sgmv/ @danieldk
