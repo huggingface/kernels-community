@@ -8,7 +8,7 @@ from pathlib import Path
 ORG = "kernels-community"
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=("Run `kernels check` for every top-level directory in the current repository.")
     )
@@ -36,7 +36,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable verbose logging output.",
     )
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return build_parser().parse_args()
 
 
 def discover_kernel_dirs(root: Path, excludes: list[str]) -> list[str]:
