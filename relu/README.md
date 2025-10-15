@@ -4,3 +4,5 @@ and sync here.
 
 This kernel is not for actual use (use the `activation` kernel instead),
 but for testing purposes (e.g. testing CI changes).
+
+Trying to trigger some CI stuff. Don't take it seriously.
