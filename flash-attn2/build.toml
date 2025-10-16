@@ -115,3 +115,22 @@ src = [
   "flash_attn/src/flash_fwd_split_hdim96_fp16_sm80.cu",
 ]
 depends = ["torch", "cutlass_3_6"]
+
+[kernel.flash_attn_xpu]
+backend = "xpu"
+src = [
+  "flash_attn_xpu/flash_api.cpp",
+
+  "flash_attn_xpu/src/prefill.hpp",
+  "flash_attn_xpu/src/fmha_utils.hpp",
+  "flash_attn_xpu/src/compat_wrapper.hpp",
+
+  "flash_attn_xpu/src/collective/fmha_fusion.hpp",
+  "flash_attn_xpu/src/collective/xe_flash_attn_prefill_epilogue.hpp",
+  "flash_attn_xpu/src/collective/xe_flash_attn_prefill_mma.hpp",
+  "flash_attn_xpu/src/collective/xe_flash_attn_prefill_softmax_epilogue.hpp",
+
+  "flash_attn_xpu/src/kernel/tile_scheduler.hpp",
+  "flash_attn_xpu/src/kernel/xe_flash_attn_prefill.hpp",
+]
+depends = ["torch", "cutlass_sycl"]

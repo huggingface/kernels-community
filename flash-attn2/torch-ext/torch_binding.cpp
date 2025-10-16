@@ -28,7 +28,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     "float softcap, "
     "bool return_softmax, "
     "Generator? gen_) -> Tensor[]");
+#if defined(CUDA_KERNEL)
   ops.impl("fwd", torch::kCUDA, &mha_fwd);
+#elif defined(XPU_KERNEL)
+  ops.impl("fwd", torch::kXPU, &mha_fwd);
+#endif
 
   ops.def("varlen_fwd("
     "Tensor! q, "
@@ -52,7 +56,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     "float softcap, "
     "bool return_softmax, "
     "Generator? gen_) -> Tensor[]");
+#if defined(CUDA_KERNEL)
   ops.impl("varlen_fwd", torch::kCUDA, &mha_varlen_fwd);
+#elif defined(XPU_KERNEL)
+  ops.impl("varlen_fwd", torch::kXPU, &mha_varlen_fwd);
+#endif
 
   ops.def("bwd("
     "Tensor! dout, "
@@ -75,7 +83,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     "bool deterministic, "
     "Generator? gen_, "
     "Tensor? rng_state) -> Tensor[]");
+#if defined(CUDA_KERNEL)
   ops.impl("bwd", torch::kCUDA, &mha_bwd);
+#endif
 
   ops.def("varlen_bwd("
     "Tensor! dout, "
@@ -101,7 +111,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     "bool deterministic, "
     "Generator? gen_, "
     "Tensor? rng_state) -> Tensor[]");
+#if defined(CUDA_KERNEL)
   ops.impl("varlen_bwd", torch::kCUDA, &mha_varlen_bwd);
+#endif
 
   ops.def("fwd_kvcache("
     "Tensor! q, "
@@ -124,7 +136,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     "float softcap, "
     "bool is_rotary_interleaved, "
     "int num_splits) -> Tensor[]");
+#if defined(CUDA_KERNEL)
   ops.impl("fwd_kvcache", torch::kCUDA, &mha_fwd_kvcache);
+#endif
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
