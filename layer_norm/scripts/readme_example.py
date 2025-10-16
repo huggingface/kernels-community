@@ -1,12 +1,3 @@
----
-tags:
-- kernel
----
-This CUDA extension implements fused dropout + residual + LayerNorm from the [flash-attention](https://github.com/Dao-AILab/flash-attention/tree/main/csrc/layer_norm) repo.
-
-## Usage
-
-```python
 # /// script
 # dependencies = [
 #   "numpy",
@@ -18,6 +9,7 @@ import torch
 from kernels import get_kernel
 
 # Setup
+torch.manual_seed(42)
 layer_norm = get_kernel("kernels-community/layer-norm")
 device = torch.device("cuda")
 
@@ -28,6 +20,16 @@ input_tensor = torch.randn(
 )
 weight = torch.ones(hidden_dim, device=device, dtype=torch.float16)
 epsilon = 1e-5
+
+# Reference implementation using PyTorch LayerNorm
+ref_ln = torch.nn.LayerNorm(
+    hidden_dim,
+    eps=epsilon,
+    elementwise_affine=False,
+    device=device,
+    dtype=torch.float16,
+)
+out_ref = ref_ln(input_tensor)
 
 # Custom kernel LayerNorm
 out_kernel = layer_norm.dropout_add_ln_fwd(
@@ -47,8 +49,6 @@ out_kernel = layer_norm.dropout_add_ln_fwd(
     is_rms_norm=False,
 )[0].view(batch_size, seq_len, hidden_dim)
 
-print(f"Output: {out_kernel.shape}")
-# Output: torch.Size([2, 5, 768])
-```
-
-See [scripts/readme_example.py](scripts/readme_example.py) for a complete example.
+print(f"Reference output: {out_ref.shape}")
+print(f"Kernel output: {out_kernel.shape}")
+print(f"Outputs close: {torch.allclose(out_kernel, out_ref, atol=1e-2, rtol=1e-3)}")
