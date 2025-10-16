@@ -1,15 +1,3 @@
----
-tags:
-  - kernel
----
-
-# MRA (Multi-Resolution Attention)
-
-MRA kernels for transformers implementing efficient sparse attention operations.
-
-## Usage
-
-```python
 # /// script
 # dependencies = [
 #   "numpy",
@@ -40,6 +28,7 @@ dense_b = torch.randn(
 )
 
 # Create block indices for sparse attention pattern
+# Each block attends to a subset of other blocks
 indices_per_block = 4
 indices = torch.randint(
     0,
@@ -50,9 +39,15 @@ indices = torch.randint(
 )
 
 # Compute sparse attention scores using mm_to_sparse
+# This computes dense_a @ dense_b but only keeps values at specified block indices
 sparse_scores = mra.mm_to_sparse(dense_a, dense_b, indices)
 
-# Use sparse_dense_mm to compute output from sparse scores
+print(f"Dense A shape: {dense_a.shape}")
+print(f"Dense B shape: {dense_b.shape}")
+print(f"Indices shape: {indices.shape}")
+print(f"Sparse scores shape: {sparse_scores.shape}")
+
+# Now use sparse_dense_mm to compute output from sparse scores
 dense_values = torch.randn(
     batch_size * num_heads, seq_len, head_dim, device=device, dtype=torch.float32
 )
@@ -62,7 +57,8 @@ output = mra.sparse_dense_mm(
 )
 
 print(f"Output shape: {output.shape}")
+# Dense A shape: torch.Size([16, 128, 64])
+# Dense B shape: torch.Size([16, 64, 128])
+# Indices shape: torch.Size([128, 4])
+# Sparse scores shape: torch.Size([16, 4, 32, 32])
 # Output shape: torch.Size([16, 128, 64, 32])
-```
-
-See [scripts/readme_example.py](scripts/readme_example.py) for a complete example.
