@@ -1,0 +1,102 @@
+[general]
+name = "layer_norm"
+universal = false
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[kernel.layer_norm]
+depends = ["torch"]
+backend = "cuda"
+cuda-capabilities = [
+    "8.0",
+    "8.9",
+    "9.0",
+    "10.0",
+    "12.0",
+]
+include = ["."]
+src = [
+    "layer_norm/ln.h",
+    "layer_norm/ln_api.cpp",
+    "layer_norm/ln_bwd_1024.cu",
+    "layer_norm/ln_bwd_1280.cu",
+    "layer_norm/ln_bwd_1536.cu",
+    "layer_norm/ln_bwd_2048.cu",
+    "layer_norm/ln_bwd_256.cu",
+    "layer_norm/ln_bwd_2560.cu",
+    "layer_norm/ln_bwd_3072.cu",
+    "layer_norm/ln_bwd_4096.cu",
+    "layer_norm/ln_bwd_512.cu",
+    "layer_norm/ln_bwd_5120.cu",
+    "layer_norm/ln_bwd_6144.cu",
+    "layer_norm/ln_bwd_7168.cu",
+    "layer_norm/ln_bwd_768.cu",
+    "layer_norm/ln_bwd_8192.cu",
+    "layer_norm/ln_bwd_kernels.cuh",
+    "layer_norm/ln_fwd_1024.cu",
+    "layer_norm/ln_fwd_1280.cu",
+    "layer_norm/ln_fwd_1536.cu",
+    "layer_norm/ln_fwd_2048.cu",
+    "layer_norm/ln_fwd_256.cu",
+    "layer_norm/ln_fwd_2560.cu",
+    "layer_norm/ln_fwd_3072.cu",
+    "layer_norm/ln_fwd_4096.cu",
+    "layer_norm/ln_fwd_512.cu",
+    "layer_norm/ln_fwd_5120.cu",
+    "layer_norm/ln_fwd_6144.cu",
+    "layer_norm/ln_fwd_7168.cu",
+    "layer_norm/ln_fwd_768.cu",
+    "layer_norm/ln_fwd_8192.cu",
+    "layer_norm/ln_fwd_kernels.cuh",
+    "layer_norm/ln_kernel_traits.h",
+    "layer_norm/ln_parallel_bwd_1024.cu",
+    "layer_norm/ln_parallel_bwd_1280.cu",
+    "layer_norm/ln_parallel_bwd_1536.cu",
+    "layer_norm/ln_parallel_bwd_2048.cu",
+    "layer_norm/ln_parallel_bwd_256.cu",
+    "layer_norm/ln_parallel_bwd_2560.cu",
+    "layer_norm/ln_parallel_bwd_3072.cu",
+    "layer_norm/ln_parallel_bwd_4096.cu",
+    "layer_norm/ln_parallel_bwd_512.cu",
+    "layer_norm/ln_parallel_bwd_5120.cu",
+    "layer_norm/ln_parallel_bwd_6144.cu",
+    "layer_norm/ln_parallel_bwd_7168.cu",
+    "layer_norm/ln_parallel_bwd_768.cu",
+    "layer_norm/ln_parallel_bwd_8192.cu",
+    "layer_norm/ln_parallel_fwd_1024.cu",
+    "layer_norm/ln_parallel_fwd_1280.cu",
+    "layer_norm/ln_parallel_fwd_1536.cu",
+    "layer_norm/ln_parallel_fwd_2048.cu",
+    "layer_norm/ln_parallel_fwd_256.cu",
+    "layer_norm/ln_parallel_fwd_2560.cu",
+    "layer_norm/ln_parallel_fwd_3072.cu",
+    "layer_norm/ln_parallel_fwd_4096.cu",
+    "layer_norm/ln_parallel_fwd_512.cu",
+    "layer_norm/ln_parallel_fwd_5120.cu",
+    "layer_norm/ln_parallel_fwd_6144.cu",
+    "layer_norm/ln_parallel_fwd_7168.cu",
+    "layer_norm/ln_parallel_fwd_768.cu",
+    "layer_norm/ln_parallel_fwd_8192.cu",
+    "layer_norm/ln_parallel_residual_bwd_kernels.cuh",
+    "layer_norm/ln_parallel_residual_fwd_kernels.cuh",
+    "layer_norm/ln_utils.cuh",
+    "layer_norm/static_switch.h"
+]
+cxx-flags = ["-DFLASHATTENTION_DISABLE_PYBIND", "-mcmodel=large"]
+cuda-flags = [
+    "-O3",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--use_fast_math",
+]
+
