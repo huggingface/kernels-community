@@ -1,0 +1,20 @@
+[general]
+name = "mra"
+universal = false
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/cuda_launch.h",
+]
+
+
+[kernel.mra]
+backend = "cuda"
+depends = ["torch"]
+src = [
+    "mra/cuda_kernel.cu",
+    "mra/cuda_kernel.h",
+    "mra/cuda_launch.cu",
+    "mra/cuda_launch.h",
+]

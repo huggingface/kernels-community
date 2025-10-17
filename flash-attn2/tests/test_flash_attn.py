@@ -20,10 +20,16 @@ from flash_attn.layers.rotary import apply_rotary_emb
 MAX_HEADDIM_SM8x = 192
 
 
-is_sm75 = torch.cuda.get_device_capability("cuda") == (7, 5)
-is_sm8x = torch.cuda.get_device_capability("cuda")[0] == 8
-is_sm80 = torch.cuda.get_device_capability("cuda") == (8, 0)
-is_sm90 = torch.cuda.get_device_capability("cuda") == (9, 0)
+if torch.cuda.is_available():
+    is_sm75 = torch.cuda.get_device_capability("cuda") == (7, 5)
+    is_sm8x = torch.cuda.get_device_capability("cuda")[0] == 8
+    is_sm80 = torch.cuda.get_device_capability("cuda") == (8, 0)
+    is_sm90 = torch.cuda.get_device_capability("cuda") == (9, 0)
+else:
+    is_sm75 = False
+    is_sm8x = False
+    is_sm80 = False
+    is_sm90 = False
 
 
 def attn_bias_from_alibi_slopes(
@@ -582,10 +588,19 @@ def get_dropout_fraction(
 # @pytest.mark.parametrize("seqlen", [512])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 # @pytest.mark.parametrize("dropout_p", [0.0])
-def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype):
-    if seqlen >= 2048 and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30:
+def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype, device):
+    if device == "cuda" and seqlen >= 2048 and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
-    device = "cuda"
+    if device == "xpu":
+        if alibi:
+            pytest.skip("alibi not supported on xpu currently")
+        if local:
+            pytest.skip("local attention not supported on xpu currently")
+        if dropout_p != 0.0:
+            pytest.skip("dropout not supported on xpu currently")
+        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
+            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
+
     # set seed
     torch.random.manual_seed(0)
     batch_size = 4
@@ -681,6 +696,11 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
+    if torch.xpu.is_available():
+        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+        print("XPU does not support backward currentlly, skipping grad check.")
+        return
+
     g = torch.randn_like(out)
     # do_o = (g.float() * out.float()).sum(-1)
     # dv_tmp = torch.einsum('bhts,bthd->bshd', attn_pt[:, :, :64], g[:, :64])
@@ -730,11 +750,20 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 # @pytest.mark.parametrize('dropout_p', [0.0])
 def test_flash_attn_varlen_qkvpacked(
-    seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype
+    seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype, device
 ):
-    if seqlen >= 2048 and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30:
+    if device == "cuda" and seqlen >= 2048 and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
-    device = "cuda"
+    if device == "xpu":
+        if alibi:
+            pytest.skip("alibi not supported on xpu currently")
+        if local:
+            pytest.skip("local attention not supported on xpu currently")
+        if dropout_p != 0.0:
+            pytest.skip("dropout not supported on xpu currently")
+        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
+            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
+
     # set seed
     torch.random.manual_seed(0)
     batch_size = 5
@@ -831,6 +860,11 @@ def test_flash_attn_varlen_qkvpacked(
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
+    if torch.xpu.is_available():
+        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+        print("XPU does not support backward currentlly, skipping grad check.")
+        return
+
     g = torch.randn_like(out)
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
         (dqkv_unpad,) = torch.autograd.grad(out, qkv_unpad, g)
@@ -900,16 +934,28 @@ def test_flash_attn_varlen_qkvpacked(
 # @pytest.mark.parametrize("dropout_p", [0.0])
 @pytest.mark.parametrize("softcap", [0.0, 50.0])
 def test_flash_attn_output(
-    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
+    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap, device
 ):
     if (
-        max(seqlen_q, seqlen_k) >= 2048
+        device == "cuda"
+        and max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
     ):
         pytest.skip()  # Reference implementation OOM
     if softcap > 0.0 and dropout_p > 0.0:
         pytest.skip("Softcap and dropout not supported together")
-    device = "cuda"
+    if device == "xpu":
+        if alibi:
+            pytest.skip("alibi not supported on xpu currently")
+        if local:
+            pytest.skip("local attention not supported on xpu currently")
+        if dropout_p != 0.0:
+            pytest.skip("dropout not supported on xpu currently")
+        if softcap != 0.0:
+            pytest.skip("softcap not supported on xpu currently")
+        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
+            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
+
     # set seed
     torch.random.manual_seed(0)
     batch_size = 4
@@ -1067,6 +1113,11 @@ def test_flash_attn_output(
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
+    if torch.xpu.is_available():
+        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+        print("XPU does not support backward currentlly, skipping grad check.")
+        return
+
     g = torch.randn_like(out)
     do_o = (g.float() * out.float()).sum(-1)
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
@@ -1169,16 +1220,28 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("softcap", [0.0, 50.0])
 # @pytest.mark.parametrize('dropout_p', [0.0])
 def test_flash_attn_varlen_output(
-    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
+    seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap, device
 ):
     if (
-        max(seqlen_q, seqlen_k) >= 2048
+        device == "cuda"
+        and max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
     ):
         pytest.skip()  # Reference implementation OOM
     if softcap > 0.0 and dropout_p > 0.0:
         pytest.skip("Softcap and dropout not supported together")
-    device = "cuda"
+    if device == "xpu":
+        if alibi:
+            pytest.skip("alibi not supported on xpu currently")
+        if local:
+            pytest.skip("local attention not supported on xpu currently")
+        if dropout_p != 0.0:
+            pytest.skip("dropout not supported on xpu currently")
+        if softcap != 0.0:
+            pytest.skip("softcap not supported on xpu currently")
+        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
+            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
+
     # set seed
     torch.random.manual_seed(0)
     batch_size = 4
@@ -1384,6 +1447,11 @@ def test_flash_attn_varlen_output(
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
+    if torch.xpu.is_available():
+        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+        print("XPU does not support backward currentlly, skipping grad check.")
+        return
+
     g = torch.randn_like(out)
     if ((d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90)):
         if kvpacked:
@@ -1478,15 +1546,21 @@ def test_flash_attn_varlen_output(
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
-def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
+def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype, device):
     if (
-        max(seqlen_q, seqlen_k) >= 2048
+        device == "cuda"
+        and max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
     ):
         pytest.skip()  # Reference implementation OOM
+    if device == "xpu":
+        if local:
+            pytest.skip("local attention not supported on xpu currently")
+        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
+            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
+
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
-    device = "cuda"
     causal = True
     # set seed
     torch.random.manual_seed(0)
@@ -1519,6 +1593,11 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+
+    if torch.xpu.is_available():
+        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
+        print("XPU does not support backward currentlly, skipping grad check.")
+        return
 
     g = torch.randn_like(out)
     do_o = (g.float() * out.float()).sum(-1)
@@ -1590,16 +1669,24 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
 @pytest.mark.parametrize("paged_kv_block_size", [None, 256, 512])
 # @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 128)])
 def test_flash_attn_varlen_causal(
-    seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, dtype
+    seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, dtype, device
 ):
     if (
-        max(seqlen_q, seqlen_k) >= 2048
+        device == "cuda"
+        and max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
     ):
         pytest.skip()  # Reference implementation OOM
+    if device == "xpu":
+        if local:
+            pytest.skip("local attention not supported on xpu currently")
+        if paged_kv_block_size is not None:
+            pytest.skip("paged_kv_block_size not supported on xpu currently")
+        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
+            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
+
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
-    device = "cuda"
     causal = True
     # set seed
     torch.random.manual_seed(0)
@@ -1683,6 +1770,11 @@ def test_flash_attn_varlen_causal(
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
 
+    if torch.xpu.is_available():
+        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
+        print("XPU does not support backward currentlly, skipping grad check.")
+        return
+
     g = torch.randn_like(out)
     do_o = (g.float() * out.float()).sum(-1)
     test_backward = block_table is None
@@ -1762,11 +1854,18 @@ def test_flash_attn_varlen_causal(
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_flash_attn_splitkv(
-    seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, alibi, deterministic, dtype
+    seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, alibi, deterministic, dtype, device
 ):
+    if device == "xpu":
+        if alibi:
+            pytest.skip("alibi not supported on xpu currently")
+        if local:
+            pytest.skip("local attention not supported on xpu currently")
+        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
+            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
+
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
-    device = "cuda"
     # set seed
     torch.random.manual_seed(0)
     batch_size = 1
@@ -1813,6 +1912,11 @@ def test_flash_attn_splitkv(
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+
+    if torch.xpu.is_available():
+        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
+        print("XPU does not support backward currentlly, skipping grad check.")
+        return
 
     g = torch.randn_like(out)
     do_o = (g.float() * out.float()).sum(-1)
@@ -1920,7 +2024,10 @@ def test_flash_attn_kvcache(
     mha_type,
     num_splits,
     dtype,
+    device,
 ):
+    if device == "xpu":
+        pytest.skip("kvcache not supported on xpu currently")
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
@@ -1929,7 +2036,7 @@ def test_flash_attn_kvcache(
         pytest.skip()
     if has_leftpad and paged_kv_block_size is not None:
         pytest.skip()
-    device = "cuda"
+
     # set seed
     torch.random.manual_seed(0)
     batch_size = 2
@@ -2195,8 +2302,13 @@ def _generate_block_kvcache(seqlen_k, paged_kv_block_size, batch_size, nheads_k,
 )
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 # @pytest.mark.parametrize("dropout_p", [0.0])
-def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dtype):
-    device = "cuda"
+def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dtype, device):
+    if device == "xpu":
+        if dropout_p != 0.0:
+            pytest.skip("dropout not supported on xpu currently")
+        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
+            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
+
     # set seed
     torch.random.manual_seed(0)
     batch_size = 60  # Sometimes we need large batch size for the race conditions to trigger
@@ -2206,6 +2318,16 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
     v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     torch.random.manual_seed(42)
     out0, lse0, _ = flash_attn_func(q, k, v, dropout_p, causal=causal, return_attn_probs=True)
+
+    if device == "xpu":
+        for i in range(250):
+            torch.random.manual_seed(42)
+            out, lse, _ = flash_attn_func(q, k, v, dropout_p, causal=causal, return_attn_probs=True)
+            assert torch.equal(out, out0)
+            # assert torch.equal(lse, lse0) # lse not implemented on xpu yet
+            print("XPU does not support backward currentlly, skipping grad check.")
+        return
+
     g = torch.randn_like(out0)
     if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
         (
@@ -2243,11 +2365,13 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
 # @pytest.mark.parametrize('d', [16])
 @pytest.mark.parametrize("seqlen", [1, 2, 5, 17, 128])
 # @pytest.mark.parametrize('seqlen', [2])
-def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
+def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype, device):
     """We previously had a bug where not masking elements beyond seqlen_k caused NaN in dQ,
     in the case where seqlen % 128 != 0.
     """
-    device = "cuda"
+    if device == "xpu":
+        pytest.skip("bwd test not supported on xpu currently")
+
     # set seed
     torch.random.manual_seed(0)
     batch_size = 2
@@ -2299,11 +2423,13 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
 # @pytest.mark.parametrize('d', [64])
 @pytest.mark.parametrize("seqlen", [97, 128, 200, 256])
 # @pytest.mark.parametrize('seqlen', [128])
-def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
+def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype, device):
     """We previously had a bug where we were using the wrong strides of dout, which shows up
     when dout is not contiguous.
     """
-    device = "cuda"
+    if device == "xpu":
+        pytest.skip("bwd test not supported on xpu currently")
+
     # set seed
     torch.random.manual_seed(0)
     batch_size = 5
@@ -2351,11 +2477,13 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
 # @pytest.mark.parametrize('causal', [False])
 @pytest.mark.parametrize("d", [16, 32, 64])
 # @pytest.mark.parametrize('d', [16])
-def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
+def test_flash_attn_bwd_varlen_overflow(d, causal, dtype, device):
     """We previously had a bug where not masking elements beyond seqlen_k caused NaN in dQ,
     in the case where seqlen % 128 != 0 or varlen.
     """
-    device = "cuda"
+    if device == "xpu":
+        pytest.skip("bwd test not supported on xpu currently")
+
     # set seed
     torch.random.manual_seed(0)
     nheads = 5
@@ -2409,15 +2537,18 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
-def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype):
+def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype, device):
+    if device == "xpu":
+        pytest.skip("bwd test not supported on xpu currently")
     if (
-        max(seqlen_q, seqlen_k) >= 2048
+        device == "cuda"
+        and max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
     ):
         pytest.skip()  # Reference implementation OOM
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
-    device = "cuda"
+
     # set seed
     torch.random.manual_seed(0)
     batch_size = 4
@@ -2467,15 +2598,18 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
     ],
 )
 # @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 128)])
-def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype):
+def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype, device):
+    if device == "xpu":
+        pytest.skip("bwd test not supported on xpu currently")
     if (
-        max(seqlen_q, seqlen_k) >= 2048
+        device == "cuda"
+        and max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
     ):
         pytest.skip()  # Reference implementation OOM
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
-    device = "cuda"
+
     # set seed
     torch.random.manual_seed(0)
     batch_size = 2
