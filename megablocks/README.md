@@ -4,11 +4,7 @@ tags:
   - kernel
 ---
 
-## Quickstart
-
-```bash
-uv run https://huggingface.co/kernels-community/megablocks/raw/main/readme_example.py
-```
+## Usage
 
 ```python
 # /// script
@@ -62,4 +58,7 @@ print(f"Output shape: {output.shape}")
 print(f"Output range: [{output.min():.3f}, {output.max():.3f}]")
 print(f"Output: {output.flatten()[:10]}")
 print(f"Expert weights sum: {expert_weights.sum():.3f}")
+# Output shape: torch.Size([1, 1, 1152])
 ```
+
+See [scripts/readme_example.py](scripts/readme_example.py) for a complete example.
