@@ -16,8 +16,10 @@
 /deformable-detr/ @danieldk
 /flash-attn2/ @drbh @MekkCyber
 /flash-attn3/ @danieldk @MekkCyber
+/layer_norm/ @MekkCyber
 /mamba-ssm/ @danieldk
 /megablocks/ @drbh
+/mra/ @MekkCyber
 /paged-attention/ @danieldk @MekkCyber @EricLBuehler
 /punica-sgmv/ @danieldk
 /quantization-eetq/ @danieldk
