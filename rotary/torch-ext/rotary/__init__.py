@@ -16,7 +16,7 @@ def apply_rotary(
     ops.apply_rotary(x1, x2, cos, sin, out1, out2, conj)
 
 
-def apply_rotary_kernel(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def apply_rotary_transformers(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """
     Rotary kernel implementation wrapper
     Adapts rotary kernels implementation to match transformers apply_rotary_pos_emb signature
@@ -43,4 +43,4 @@ def apply_rotary_kernel(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_rotated, k_rotated
 
 
-__all__ = ["apply_rotary", "apply_rotary_kernel"]
+__all__ = ["apply_rotary", "apply_rotary_transformers"]
