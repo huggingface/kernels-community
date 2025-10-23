@@ -3,6 +3,10 @@
 
 namespace FLASH_NAMESPACE {
 
+inline int round_multiple(int x, int m) {
+    return (x + m - 1) / m * m;
+}
+
 std::vector<at::Tensor>
 mha_fwd(
         at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
@@ -18,19 +22,47 @@ mha_fwd(
         const float softcap,
         const bool return_softmax,
         std::optional<at::Generator> gen_) {
-  
-    at::Tensor out;
-    if (out_.has_value()) {
-      out = *out_;
-    } else {
-      out = torch::zeros_like(q);
+    // XPU requires head_size to be a multiple of 32
+    const int head_size_og = q.size(3);
+    const int head_size_padded = round_multiple(head_size_og, 32);
+
+    at::Tensor q_padded = q;
+    at::Tensor k_padded = k;
+    at::Tensor v_padded = v;
+
+    // Apply padding if needed
+    if (head_size_og != head_size_padded) {
+        const int pad_size = head_size_padded - head_size_og;
+        q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, pad_size}));
+        k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, pad_size}));
+        v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, pad_size}));
     }
 
-    cutlass_prefill_fixed_impl(q, k, v, out, softmax_scale, is_causal);
+    at::Tensor out_padded;
+    if (out_.has_value()) {
+        auto out_val = out_.value();
+        if (head_size_og != head_size_padded) {
+            const int pad_size = head_size_padded - head_size_og;
+            out_padded = torch::nn::functional::pad(out_val, torch::nn::functional::PadFuncOptions({0, pad_size}));
+        } else {
+            out_padded = out_val;
+        }
+    } else {
+        out_padded = torch::zeros_like(q_padded);
+    }
+
+    cutlass_prefill_fixed_impl(q_padded, k_padded, v_padded, out_padded, softmax_scale, is_causal);
+
+    // Remove padding from output
+    at::Tensor out = out_padded;
+    if (head_size_og != head_size_padded) {
+        out = out_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                                torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)});
+    }
 
     // TODO: current do not support store softmax_lse out
     // hard code to return empty tensor for softmax_lse, S_dmask, rng_state
-    auto softmax_lse = torch::empty_like(out);
+    at::Tensor softmax_lse;
     at::Tensor S_dmask;
     at::Tensor rng_state;
     return {out, softmax_lse, S_dmask, rng_state};
@@ -59,21 +91,50 @@ mha_varlen_fwd(
               const float softcap,
               const bool return_softmax,
               std::optional<at::Generator> gen_) {
-    at::Tensor out;
-    if (out_.has_value()) {
-      out = *out_;
-    } else {
-      out = torch::zeros_like(q);
+    // XPU requires head_size to be a multiple of 32
+    const int head_size_og = q.size(2);
+    const int head_size_padded = round_multiple(head_size_og, 32);
+
+    at::Tensor q_padded = q;
+    at::Tensor k_padded = k;
+    at::Tensor v_padded = v;
+
+    // Apply padding if needed
+    if (head_size_og != head_size_padded) {
+        const int pad_size = head_size_padded - head_size_og;
+        q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, pad_size}));
+        k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, pad_size}));
+        v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, pad_size}));
     }
 
-    cutlass_prefill_varlen_impl(q, k, v, out,
+    at::Tensor out_padded;
+    if (out_.has_value()) {
+        auto out_val = out_.value();
+        if (head_size_og != head_size_padded) {
+            const int pad_size = head_size_padded - head_size_og;
+            out_padded = torch::nn::functional::pad(out_val, torch::nn::functional::PadFuncOptions({0, pad_size}));
+        } else {
+            out_padded = out_val;
+        }
+    } else {
+        out_padded = torch::zeros_like(q_padded);
+    }
+
+    cutlass_prefill_varlen_impl(q_padded, k_padded, v_padded, out_padded,
                               cu_seqlens_q, cu_seqlens_k,
                               max_seqlen_q, max_seqlen_k,
                               softmax_scale, is_causal);
 
+    // Remove padding from output
+    at::Tensor out = out_padded;
+    if (head_size_og != head_size_padded) {
+        out = out_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                                torch::indexing::Slice(0, head_size_og)});
+    }
+
     // TODO: current do not support store softmax_lse out
     // hard code to return empty tensor for softmax_lse, S_dmask, rng_state
-    auto softmax_lse = torch::empty_like(out);
+    at::Tensor softmax_lse;
     at::Tensor S_dmask;
     at::Tensor rng_state;
     return {out, softmax_lse, S_dmask, rng_state};

@@ -953,8 +953,6 @@ def test_flash_attn_output(
             pytest.skip("dropout not supported on xpu currently")
         if softcap != 0.0:
             pytest.skip("softcap not supported on xpu currently")
-        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
-            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)
@@ -1239,8 +1237,6 @@ def test_flash_attn_varlen_output(
             pytest.skip("dropout not supported on xpu currently")
         if softcap != 0.0:
             pytest.skip("softcap not supported on xpu currently")
-        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
-            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)
