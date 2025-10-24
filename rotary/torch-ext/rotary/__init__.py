@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Optional, Tuple
 import torch
 
 from ._ops import ops
@@ -12,11 +12,18 @@ def apply_rotary(
     out1: torch.Tensor,
     out2: torch.Tensor,
     conj: bool,
-):
+) -> None:
     ops.apply_rotary(x1, x2, cos, sin, out1, out2, conj)
 
 
-def apply_rotary_transformers(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def apply_rotary_transformers(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: Optional[torch.Tensor] = None,
+    unsqueeze_dim: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Rotary kernel implementation wrapper
     Adapts rotary kernels implementation to match transformers apply_rotary_pos_emb signature
