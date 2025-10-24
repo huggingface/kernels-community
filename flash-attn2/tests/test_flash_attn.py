@@ -598,8 +598,6 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
             pytest.skip("local attention not supported on xpu currently")
         if dropout_p != 0.0:
             pytest.skip("dropout not supported on xpu currently")
-        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
-            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)
@@ -761,8 +759,6 @@ def test_flash_attn_varlen_qkvpacked(
             pytest.skip("local attention not supported on xpu currently")
         if dropout_p != 0.0:
             pytest.skip("dropout not supported on xpu currently")
-        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
-            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)
@@ -953,8 +949,6 @@ def test_flash_attn_output(
             pytest.skip("dropout not supported on xpu currently")
         if softcap != 0.0:
             pytest.skip("softcap not supported on xpu currently")
-        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
-            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)
@@ -1239,8 +1233,6 @@ def test_flash_attn_varlen_output(
             pytest.skip("dropout not supported on xpu currently")
         if softcap != 0.0:
             pytest.skip("softcap not supported on xpu currently")
-        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
-            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)
@@ -1556,8 +1548,6 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype, devi
     if device == "xpu":
         if local:
             pytest.skip("local attention not supported on xpu currently")
-        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
-            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
 
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
@@ -1682,8 +1672,6 @@ def test_flash_attn_varlen_causal(
             pytest.skip("local attention not supported on xpu currently")
         if paged_kv_block_size is not None:
             pytest.skip("paged_kv_block_size not supported on xpu currently")
-        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
-            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
 
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
@@ -1861,8 +1849,6 @@ def test_flash_attn_splitkv(
             pytest.skip("alibi not supported on xpu currently")
         if local:
             pytest.skip("local attention not supported on xpu currently")
-        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
-            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
 
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
@@ -2306,8 +2292,6 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
     if device == "xpu":
         if dropout_p != 0.0:
             pytest.skip("dropout not supported on xpu currently")
-        if (((d + 7) // 8) * 8) % 32 != 0 or d > 192:
-            pytest.skip("d must be a multiple of 32 and < 192 on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)

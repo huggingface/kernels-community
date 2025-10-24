@@ -365,8 +365,11 @@ void dispatch_by_head_size(CutlassType cuType, const ArgsType& args) {
   else if (h <= 192) {
     policy_dispatch<prefill_policy_head192>(cuType, args);
   } 
+  else if (h <= 256) {
+    policy_dispatch<prefill_policy_head256>(cuType, args);
+  }
   else {
-    throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 192");
+    throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
   }
 }
 
