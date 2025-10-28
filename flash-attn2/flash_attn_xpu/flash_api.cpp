@@ -1,6 +1,8 @@
 #include "src/prefill.hpp"
 #include <torch/all.h>
 
+#include "cute/util/compat/device.hpp"
+
 namespace FLASH_NAMESPACE {
 
 inline int round_multiple(int x, int m) {
@@ -22,6 +24,10 @@ mha_fwd(
         const float softcap,
         const bool return_softmax,
         std::optional<at::Generator> gen_) {
+
+    auto device_idx = q.device().index();
+    compat::select_device(device_idx);
+
     // XPU requires head_size to be a multiple of 32
     const int head_size_og = q.size(3);
     const int head_size_padded = round_multiple(head_size_og, 32);
@@ -91,6 +97,10 @@ mha_varlen_fwd(
               const float softcap,
               const bool return_softmax,
               std::optional<at::Generator> gen_) {
+
+    auto device_idx = q.device().index();
+    compat::select_device(device_idx);
+
     // XPU requires head_size to be a multiple of 32
     const int head_size_og = q.size(2);
     const int head_size_padded = round_multiple(head_size_og, 32);
