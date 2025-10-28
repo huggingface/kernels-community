@@ -37,15 +37,10 @@ jobs:
           else
             echo "skip=true" >> $GITHUB_OUTPUT
           fi
-      - name: Build and copy kernel
-        if: steps.validate.outputs.skip == 'false'
-        run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
-          ( cd "$KERNEL" && nix run -L .#build-and-copy )
-      - name: Upload kernel
+      - name: Build and upload kernel
         if: steps.validate.outputs.skip == 'false'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
-          ( cd "$KERNEL" && nix run .#kernels -- upload --repo_id "kernels-community/$KERNEL" . )
+          ( cd "$KERNEL" && nix run -L .#build-and-upload )
