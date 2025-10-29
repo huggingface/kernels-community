@@ -1,7 +1,7 @@
-#include "src/prefill.hpp"
 #include <torch/all.h>
+#include <cute/util/compat/device.hpp>
 
-#include "cute/util/compat/device.hpp"
+#include "src/prefill.hpp"
 
 namespace FLASH_NAMESPACE {
 
