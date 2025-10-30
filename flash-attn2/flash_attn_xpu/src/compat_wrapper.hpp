@@ -3,7 +3,7 @@
 // Define namespace based on CUTLASS_SYCL_REVISION
 #if defined(OLD_API)
     #define COMPAT syclcompat
-    #include <compat/device.hpp>
+    #include <syclcompat.hpp>
 #else
     #define COMPAT compat
     #include <cute/util/compat/device.hpp>
