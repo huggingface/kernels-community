@@ -1,5 +1,4 @@
 #include <torch/all.h>
-#include <cute/util/compat/device.hpp>
 
 #include "src/prefill.hpp"
 
@@ -30,7 +29,7 @@ mha_fwd(
         std::optional<at::Generator> gen_) {
 
     auto device_idx = q.device().index();
-    compat::select_device(device_idx);
+    COMPAT::select_device(device_idx);
 
     // check inputs
     const auto sizes = q.sizes();
@@ -116,7 +115,7 @@ mha_varlen_fwd(
               std::optional<at::Generator> gen_) {
 
     auto device_idx = q.device().index();
-    compat::select_device(device_idx);
+    COMPAT::select_device(device_idx);
 
     // check inputs
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
