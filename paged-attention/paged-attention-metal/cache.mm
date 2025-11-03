@@ -4,24 +4,17 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#include <dlfcn.h>
-#include <mach-o/dyld.h>
 #include <string>
+
+// Include the auto-generated header with embedded metallib
+#ifdef EMBEDDED_METALLIB_HEADER
+#include EMBEDDED_METALLIB_HEADER
+#else
+#error "EMBEDDED_METALLIB_HEADER not defined"
+#endif
 
 static inline id<MTLBuffer> getMTLBufferStorage(const torch::Tensor &tensor) {
   return __builtin_bit_cast(id<MTLBuffer>, tensor.storage().data());
-}
-
-static std::string getModuleDirectory() {
-  Dl_info dl_info;
-  if (dladdr((void *)getModuleDirectory, &dl_info)) {
-    std::string path(dl_info.dli_fname);
-    size_t pos = path.find_last_of('/');
-    if (pos != std::string::npos) {
-      return path.substr(0, pos);
-    }
-  }
-  return ".";
 }
 
 void swap_blocks(torch::Tensor &src, torch::Tensor &dst,
@@ -120,19 +113,12 @@ void copy_blocks(const std::vector<torch::Tensor> &key_caches,
     id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
     TORCH_CHECK(cmdBuf, "Failed to get command buffer");
 
-    // Construct the full path to the metallib file
-    std::string moduleDir = getModuleDirectory();
-    std::string metallibPath = moduleDir + "/" + METALLIB_PATH;
-
-    NSString *metallibPathStr =
-        [NSString stringWithUTF8String:metallibPath.c_str()];
-    NSURL *metallibURL = [NSURL fileURLWithPath:metallibPathStr];
+    // Load the embedded Metal library from memory
     NSError *error = nil;
-    id<MTLLibrary> lib = [device newLibraryWithURL:metallibURL error:&error];
-    if (!lib) {
-      NSLog(@"[cache.mm] Failed to load pre-compiled Metal library at %@: %@",
-            metallibPathStr, error.localizedDescription);
-    }
+    id<MTLLibrary> lib =
+        EMBEDDED_METALLIB_NAMESPACE::createLibrary(device, &error);
+    TORCH_CHECK(lib, "Failed to create Metal library from embedded data: ",
+                error.localizedDescription.UTF8String);
 
     // Process each layer separately
     for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
@@ -219,11 +205,15 @@ void reshape_and_cache(
 
   // Determine cache dtype and FP8 usage
   torch::ScalarType cache_dtype = key_cache.scalar_type();
-  bool use_fp8_scales = (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3");
+  bool use_fp8_scales =
+      (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3");
   if (use_fp8_scales) {
-    TORCH_CHECK(cache_dtype == torch::kUInt8, "FP8 cache requires UInt8 tensor type");
-    TORCH_CHECK(k_scale.numel() == 1 && v_scale.numel() == 1, "FP8 scales must be scalars");
-    TORCH_CHECK(k_scale.scalar_type() == torch::kFloat32 && v_scale.scalar_type() == torch::kFloat32,
+    TORCH_CHECK(cache_dtype == torch::kUInt8,
+                "FP8 cache requires UInt8 tensor type");
+    TORCH_CHECK(k_scale.numel() == 1 && v_scale.numel() == 1,
+                "FP8 scales must be scalars");
+    TORCH_CHECK(k_scale.scalar_type() == torch::kFloat32 &&
+                    v_scale.scalar_type() == torch::kFloat32,
                 "FP8 scales must be float32");
   }
 
@@ -254,23 +244,16 @@ void reshape_and_cache(
     id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
     TORCH_CHECK(cmdBuf, "Failed to get command buffer");
 
-    // Construct the full path to the metallib file
-    std::string moduleDir = getModuleDirectory();
-    std::string metallibPath = moduleDir + "/" + METALLIB_PATH;
-
-    NSString *metallibPathStr =
-        [NSString stringWithUTF8String:metallibPath.c_str()];
-    NSURL *metallibURL = [NSURL fileURLWithPath:metallibPathStr];
+    // Load the embedded Metal library from memory
     NSError *error = nil;
-    id<MTLLibrary> lib = [device newLibraryWithURL:metallibURL error:&error];
-    if (!lib) {
-      NSLog(@"[cache.mm] Failed to load pre-compiled Metal library at %@: %@",
-            metallibPathStr, error.localizedDescription);
-    }
+    id<MTLLibrary> lib =
+        EMBEDDED_METALLIB_NAMESPACE::createLibrary(device, &error);
+    TORCH_CHECK(lib, "Failed to create Metal library from embedded data: ",
+                error.localizedDescription.UTF8String);
 
     NSString *kernName = nil;
     std::string kv_dtype_str, cache_dtype_str;
-    
+
     // Get KV dtype string
     switch (key.scalar_type()) {
     case torch::kFloat:
@@ -285,7 +268,7 @@ void reshape_and_cache(
     default:
       TORCH_CHECK(false, "Unsupported dtype for reshape_and_cache");
     }
-    
+
     // Get cache dtype string
     switch (cache_dtype) {
     case torch::kFloat:
@@ -303,17 +286,26 @@ void reshape_and_cache(
     default:
       TORCH_CHECK(false, "Unsupported cache dtype for reshape_and_cache");
     }
-    
-    std::string kernName_str = "reshape_and_cache_kv_" + kv_dtype_str + "_cache_" + cache_dtype_str;
+
+    std::string kernName_str =
+        "reshape_and_cache_kv_" + kv_dtype_str + "_cache_" + cache_dtype_str;
     kernName = [NSString stringWithUTF8String:kernName_str.c_str()];
 
     // Create function constants for FP8 support
-    MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
-    [constants setConstantValue:&use_fp8_scales type:MTLDataTypeBool atIndex:10];
-    
-    id<MTLFunction> fn = [lib newFunctionWithName:kernName constantValues:constants error:&error];
-    TORCH_CHECK(fn, "Missing Metal kernel function: ", kernName.UTF8String, 
-                error ? [NSString stringWithFormat:@": %@", error.localizedDescription].UTF8String : "");
+    MTLFunctionConstantValues *constants =
+        [[MTLFunctionConstantValues alloc] init];
+    [constants setConstantValue:&use_fp8_scales
+                           type:MTLDataTypeBool
+                        atIndex:10];
+
+    id<MTLFunction> fn = [lib newFunctionWithName:kernName
+                                   constantValues:constants
+                                            error:&error];
+    TORCH_CHECK(
+        fn, "Missing Metal kernel function: ", kernName.UTF8String,
+        error ? [NSString stringWithFormat:@": %@", error.localizedDescription]
+                    .UTF8String
+              : "");
 
     id<MTLComputePipelineState> pso =
         [device newComputePipelineStateWithFunction:fn error:&error];
@@ -450,19 +442,12 @@ void reshape_and_cache_flash(
     id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
     TORCH_CHECK(cmdBuf, "Failed to get command buffer");
 
-    // Construct the full path to the metallib file
-    std::string moduleDir = getModuleDirectory();
-    std::string metallibPath = moduleDir + "/" + METALLIB_PATH;
-
-    NSString *metallibPathStr =
-        [NSString stringWithUTF8String:metallibPath.c_str()];
-    NSURL *metallibURL = [NSURL fileURLWithPath:metallibPathStr];
+    // Load the embedded Metal library from memory
     NSError *error = nil;
-    id<MTLLibrary> lib = [device newLibraryWithURL:metallibURL error:&error];
-    if (!lib) {
-      NSLog(@"[cache.mm] Failed to load pre-compiled Metal library at %@: %@",
-            metallibPathStr, error.localizedDescription);
-    }
+    id<MTLLibrary> lib =
+        EMBEDDED_METALLIB_NAMESPACE::createLibrary(device, &error);
+    TORCH_CHECK(lib, "Failed to create Metal library from embedded data: ",
+                error.localizedDescription.UTF8String);
 
     NSString *kernName = nil;
     switch (key.scalar_type()) {
