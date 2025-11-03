@@ -11,7 +11,16 @@
 # limitations under the License.
 
 
-from .layers import flash_attn_func, flash_attn_varlen_func
+import torch
+from ._ops import ops
+
+
+def  flash_attn_func():
+    return ops.flash_attn_func
+
+
+def flash_attn_varlen_func():
+    return ops.flash_attn_varlen_func
 
 
 __all__ = [

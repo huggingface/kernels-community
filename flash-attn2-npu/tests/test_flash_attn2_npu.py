@@ -13,7 +13,7 @@
 
 import torch
 import torch_npu
-from fusion_torch_npu import (
+from flash_attn2_npu import (
     flash_attn_func,
     flash_attn_varlen_func,
 )

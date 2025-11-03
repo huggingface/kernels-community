@@ -39,7 +39,7 @@ if SPARSE_MODE not in [
 ATTN_MASK_NPU_CACHE = {}
 
 
-def get_attn_mask_npu(device):
+def _get_attn_mask_npu(device):
     """Get or create attention mask for the specified device."""
     if device not in ATTN_MASK_NPU_CACHE:
         ATTN_MASK_NPU_CACHE[device] = torch.triu(
@@ -48,8 +48,8 @@ def get_attn_mask_npu(device):
     return ATTN_MASK_NPU_CACHE[device]
 
 
-@torch.library.custom_op(add_op_namespace_prefix("flash_attn2_npu"), mutates_args=())
-def flash_attn_func(
+@torch.library.custom_op(add_op_namespace_prefix("flash_attn_func"), mutates_args=())
+def _flash_attn_func_npu(
     q,
     k,
     v,
@@ -69,7 +69,7 @@ def flash_attn_func(
             q, k, v, head_num, "BSND", keep_prob=keep_prob, scale=softmax_scale
         )[0]
     else:
-        attn_mask_npu = get_attn_mask_npu(q.device)
+        attn_mask_npu = _get_attn_mask_npu(q.device)
         head_num = q.shape[2]
         output = torch_npu.npu_fusion_attention(
             q,
@@ -86,7 +86,8 @@ def flash_attn_func(
     return output
 
 
-def flash_attn_varlen_func(
+@torch.library.custom_op(add_op_namespace_prefix("flash_attn_varlen_func"), mutates_args=())
+def _flash_attn_varlen_func_npu(
     q,
     k,
     v,
@@ -120,7 +121,7 @@ def flash_attn_varlen_func(
             actual_seq_kvlen=tuple(cu_seqlens_k[1:].cpu().numpy().tolist()),
         )[0]
     else:
-        attn_mask_npu = get_attn_mask_npu(q.device)
+        attn_mask_npu = _get_attn_mask_npu(q.device)
         head_num = q.shape[1]
         output = torch_npu.npu_fusion_attention(
             q,
