@@ -2,6 +2,9 @@
 name = "paged_attention"
 universal = false
 
+[general.hub]
+repo-id = "kernels-community/paged-attention"
+
 [torch]
 src = [
   "torch-ext/torch_binding.cpp",
