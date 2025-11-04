@@ -86,7 +86,9 @@ def _flash_attn_func_npu(
     return output
 
 
-@torch.library.custom_op(add_op_namespace_prefix("flash_attn_varlen_func"), mutates_args=())
+@torch.library.custom_op(
+    add_op_namespace_prefix("flash_attn_varlen_func"), mutates_args=()
+)
 def _flash_attn_varlen_func_npu(
     q,
     k,
