@@ -8,11 +8,7 @@ tags:
 
 This is an implementation of Flash Attention 3 CUDA kernels with support for attention sinks. The attention sinks implementation was contributed to Flash Attention by the [vLLM team](https://huggingface.co/vllm-project). The [transformers team](https://huggingface.co/transformers-community) packaged the implementation and pre-built it for use with the [kernels library](https://github.com/huggingface/kernels).
 
-## Quickstart
-
-```bash
-uv run https://raw.githubusercontent.com/huggingface/kernels-community/refs/heads/main/vllm-flash-attn3/readme_example.py
-```
+## Usage
 
 ```python
 # /// script
@@ -62,7 +58,11 @@ print(f"\nOutput shape: {output.shape}")
 print(f"LSE (log-sum-exp) shape: {lse.shape}")
 print(f"\nAttention computation successful!")
 print(f"Output tensor stats - Mean: {output.mean().item():.4f}, Std: {output.std().item():.4f}")
+# Output shape: torch.Size([2, 128, 8, 64])
+# LSE (log-sum-exp) shape: torch.Size([2, 8, 128])
 ```
+
+See [scripts/readme_example.py](scripts/readme_example.py) for a complete example.
 
 ## How to Use
 

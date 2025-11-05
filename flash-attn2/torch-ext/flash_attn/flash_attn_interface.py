@@ -23,6 +23,15 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def _get_device():
+    if torch.xpu.is_available():
+        return "xpu"
+    else:
+        return "cuda"
+
+_XPU_AVAILABLE = torch.xpu.is_available() if hasattr(torch, "xpu") else False # TODO remove hasattr check when bwd is supported on XPU
+
+
 def _get_block_size_n(device, head_dim, is_dropout, is_causal):
     # This should match the block sizes in the CUDA kernel
     assert head_dim <= 256
@@ -76,7 +85,7 @@ else:
     _torch_register_fake_wrapper = noop_register_fake_wrapper
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_forward", mutates_args=(), device_types="cuda")
+@_torch_custom_op_wrapper("flash_attn::_flash_attn_forward", mutates_args=(), device_types=_get_device())
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -142,7 +151,7 @@ else:
     _wrapped_flash_attn_forward = _flash_attn_forward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_forward", mutates_args=(), device_types="cuda")
+@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_forward", mutates_args=(), device_types=_get_device())
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -237,7 +246,7 @@ else:
     _wrapped_flash_attn_varlen_forward = _flash_attn_varlen_forward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
+@_torch_custom_op_wrapper("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types=_get_device())
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -329,7 +338,7 @@ else:
     _wrapped_flash_attn_backward = _flash_attn_backward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
+@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types=_get_device())
 def _flash_attn_varlen_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -1053,7 +1062,7 @@ def flash_attn_qkvpacked_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
-        torch.is_grad_enabled(),
+        False if _XPU_AVAILABLE else torch.is_grad_enabled(),
     )
 
 
@@ -1131,7 +1140,7 @@ def flash_attn_kvpacked_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
-        torch.is_grad_enabled(),
+        False if _XPU_AVAILABLE else torch.is_grad_enabled(),
     )
 
 
@@ -1208,7 +1217,7 @@ def flash_attn_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
-        torch.is_grad_enabled(),
+        False if _XPU_AVAILABLE else torch.is_grad_enabled(),
     )
 
 
@@ -1274,7 +1283,7 @@ def flash_attn_varlen_qkvpacked_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
-        torch.is_grad_enabled(),
+        False if _XPU_AVAILABLE else torch.is_grad_enabled(),
     )
 
 
@@ -1366,7 +1375,7 @@ def flash_attn_varlen_kvpacked_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
-        torch.is_grad_enabled(),
+        False if _XPU_AVAILABLE else torch.is_grad_enabled(),
     )
 
 
@@ -1460,7 +1469,7 @@ def flash_attn_varlen_func(
         deterministic,
         return_attn_probs,
         block_table,
-        torch.is_grad_enabled(),
+        False if _XPU_AVAILABLE else torch.is_grad_enabled(),
     )
 
 
