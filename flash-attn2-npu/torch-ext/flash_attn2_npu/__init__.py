@@ -26,7 +26,6 @@ def flash_attn_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    **kwargs,
 ):
     return ops.flash_attn_func(
         q,
@@ -35,7 +34,6 @@ def flash_attn_func(
         dropout_p=0.0,
         softmax_scale=None,
         causal=False,
-        **kwargs,
     )
 
 
@@ -45,12 +43,11 @@ def flash_attn_varlen_func(
     v,
     cu_seqlens_q,
     cu_seqlens_k,
-    max_seqlen_q=None,  # defined for aligning params order with corresponding function in `flash-attn`
-    max_seqlen_k=None,  # defined for aligning params order with corresponding function in `flash-attn`
+    max_seqlen_q=None,
+    max_seqlen_k=None,
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    **kwargs,
 ):
     return ops.flash_attn_varlen_func(
         q,
@@ -58,12 +55,11 @@ def flash_attn_varlen_func(
         v,
         cu_seqlens_q,
         cu_seqlens_k,
-        max_seqlen_q=None,  # defined for aligning params order with corresponding function in `flash-attn`
-        max_seqlen_k=None,  # defined for aligning params order with corresponding function in `flash-attn`
+        max_seqlen_q=None,
+        max_seqlen_k=None,
         dropout_p=0.0,
         softmax_scale=None,
         causal=False,
-        **kwargs,
     )
 
 

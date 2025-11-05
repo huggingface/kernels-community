@@ -13,5 +13,6 @@
     kernel-builder.lib.genFlakeOutputs {
       inherit self;
       path = ./.;
+      doGetKernelCheck = false;
     };
 }

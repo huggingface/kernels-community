@@ -13,6 +13,7 @@
 
 import os
 import math
+from typing import Optional
 
 import torch
 import torch_npu
@@ -50,14 +51,13 @@ def _get_attn_mask_npu(device):
 
 @torch.library.custom_op(add_op_namespace_prefix("flash_attn_func"), mutates_args=())
 def _flash_attn_func_npu(
-    q,
-    k,
-    v,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    **kwargs,
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+) -> torch.Tensor:
     keep_prob = 1.0 - dropout_p
 
     if softmax_scale is None:
@@ -90,18 +90,21 @@ def _flash_attn_func_npu(
     add_op_namespace_prefix("flash_attn_varlen_func"), mutates_args=()
 )
 def _flash_attn_varlen_func_npu(
-    q,
-    k,
-    v,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    max_seqlen_q=None,  # defined for aligning params order with corresponding function in `flash-attn`
-    max_seqlen_k=None,  # defined for aligning params order with corresponding function in `flash-attn`
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    **kwargs,
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[
+        torch.Tensor
+    ] = None,  # defined for aligning params order with corresponding function in `flash-attn`
+    max_seqlen_k: Optional[
+        torch.Tensor
+    ] = None,  # defined for aligning params order with corresponding function in `flash-attn`
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+) -> torch.Tensor:
     keep_prob = 1.0 - dropout_p
 
     if softmax_scale is None:
