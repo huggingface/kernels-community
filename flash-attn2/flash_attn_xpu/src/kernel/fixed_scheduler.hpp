@@ -40,7 +40,7 @@
 
 namespace cutlass::flash_attention {
 
-namespace kernel {
+namespace kernel::fixed {
 
 struct XeFlashIndividualTileScheduler {
 
@@ -226,15 +226,14 @@ struct XeFlashPersistentTileScheduler {
   }
 };
 
-
-////////////////////////////////////////////////////////////////////////////////
-}  // namespace kernel
-
   struct IndividualScheduler{};
   struct PersistentScheduler{};
   struct FlashDecodeIndividualScheduler{};
 
-  namespace detail
+////////////////////////////////////////////////////////////////////////////////
+}  // namespace kernel::fixed
+
+  namespace detail::fixed
   {
 
     template <
@@ -255,37 +254,37 @@ struct XeFlashPersistentTileScheduler {
         cute::enable_if_t<cute::is_same_v<ArchTag, cutlass::arch::IntelXe>>>
     {
       using Scheduler = typename TileSchedulerSelector<
-          IndividualScheduler,
+          kernel::fixed::IndividualScheduler,
           ArchTag>::Scheduler;
     };
 
     template <class ArchTag>
     struct TileSchedulerSelector<
-        IndividualScheduler,
+        kernel::fixed::IndividualScheduler,
         ArchTag,
         cute::enable_if_t<cute::is_same_v<ArchTag, cutlass::arch::IntelXe>>>
     {
-      using Scheduler = kernel::XeFlashIndividualTileScheduler;
+      using Scheduler = kernel::fixed::XeFlashIndividualTileScheduler;
     };
 
     template <class ArchTag>
     struct TileSchedulerSelector<
-        PersistentScheduler,
+        kernel::fixed::PersistentScheduler,
         ArchTag,
         cute::enable_if_t<cute::is_same_v<ArchTag, cutlass::arch::IntelXe>>>
     {
-      using Scheduler = kernel::XeFlashPersistentTileScheduler;
+      using Scheduler = kernel::fixed::XeFlashPersistentTileScheduler;
     };
 
     template <class ArchTag>
     struct TileSchedulerSelector<
-        FlashDecodeIndividualScheduler,
+        kernel::fixed::FlashDecodeIndividualScheduler,
         ArchTag,
         cute::enable_if_t<cute::is_same_v<ArchTag, cutlass::arch::IntelXe>>>
     {
-      using Scheduler = kernel::XeFlashDecodeIndividualTileScheduler;
+      using Scheduler = kernel::fixed::XeFlashDecodeIndividualTileScheduler;
     };
-  } // namespace detail
+  } // namespace detail::fixed
 
 ////////////////////////////////////////////////////////////////////////////////
 

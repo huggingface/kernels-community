@@ -1,15 +1,16 @@
 #include <torch/all.h>
 
-#include "src/prefill.hpp"
-
-#define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
-#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
-#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#include "src/fixed.hpp"
+#include "src/varlen.hpp"
 
 namespace FLASH_NAMESPACE {
 
 inline int round_multiple(int x, int m) {
     return (x + m - 1) / m * m;
+}
+
+inline at::Tensor ensure_contiguous(const at::Tensor& tensor) {
+    return tensor.is_contiguous() ? tensor : tensor.contiguous();
 }
 
 std::vector<at::Tensor>
@@ -40,10 +41,6 @@ mha_fwd(
     const int seqlen_k = k.size(1);
     const int num_heads_k = k.size(2);
 
-    CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
-    CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size_og);
-    CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_og);
-
     // XPU requires head_size to be a multiple of 32
     const int head_size_padded = round_multiple(head_size_og, 32);
 
@@ -72,7 +69,10 @@ mha_fwd(
         out_padded = torch::zeros_like(q_padded);
     }
 
-    cutlass_prefill_fixed_impl(q_padded, k_padded, v_padded, out_padded, softmax_scale, is_causal);
+    q_padded = ensure_contiguous(q_padded);
+    k_padded = ensure_contiguous(k_padded);
+    v_padded = ensure_contiguous(v_padded);
+    cutlass::flash_attention::fixed::cutlass_fixed_impl(q_padded, k_padded, v_padded, out_padded, softmax_scale, is_causal);
 
     // Remove padding from output
     at::Tensor out = out_padded;
@@ -80,7 +80,7 @@ mha_fwd(
         out = out_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
                                 torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)});
     }
-    out = out.contiguous();
+    out = ensure_contiguous(out);
 
     // TODO: current do not support store softmax_lse out
     // hard code to return empty tensor for softmax_lse, S_dmask, rng_state
@@ -117,16 +117,6 @@ mha_varlen_fwd(
     auto device_idx = q.device().index();
     COMPAT::select_device(device_idx);
 
-    // check inputs
-    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
-    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
-    CHECK_DEVICE(cu_seqlens_q);
-    CHECK_DEVICE(cu_seqlens_k);
-    TORCH_CHECK(cu_seqlens_q.dim() == 1, "cu_seqlens_q must be 1-dimensional, but got ", cu_seqlens_q.dim(), " dimensions");
-    TORCH_CHECK(cu_seqlens_k.dim() == 1, "cu_seqlens_k must be 1-dimensional, but got ", cu_seqlens_k.dim(), " dimensions");
-    CHECK_CONTIGUOUS(cu_seqlens_q);
-    CHECK_CONTIGUOUS(cu_seqlens_k);
-
     // Extract dimensions
     const auto sizes = q.sizes();
     const int total_q = sizes[0];
@@ -135,12 +125,6 @@ mha_varlen_fwd(
     const int total_k = k.size(0);
     const int num_heads_k = k.size(1);
     const int batch_size = cu_seqlens_q.numel() - 1;
-
-    CHECK_SHAPE(q, total_q, num_heads, head_size_og);
-    CHECK_SHAPE(k, total_k, num_heads_k, head_size_og);
-    CHECK_SHAPE(v, total_k, num_heads_k, head_size_og);
-    CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
-    CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
 
     // XPU requires head_size to be a multiple of 32
     const int head_size_padded = round_multiple(head_size_og, 32);
@@ -169,8 +153,11 @@ mha_varlen_fwd(
     } else {
         out_padded = torch::zeros_like(q_padded);
     }
-
-    cutlass_prefill_varlen_impl(q_padded, k_padded, v_padded, out_padded,
+    
+    q_padded = ensure_contiguous(q_padded);
+    k_padded = ensure_contiguous(k_padded);
+    v_padded = ensure_contiguous(v_padded);
+    cutlass::flash_attention::varlen::cutlass_varlen_impl(q_padded, k_padded, v_padded, out_padded, block_table_, 
                               cu_seqlens_q, cu_seqlens_k,
                               max_seqlen_q, max_seqlen_k,
                               softmax_scale, is_causal);
@@ -181,7 +168,7 @@ mha_varlen_fwd(
         out = out_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
                                 torch::indexing::Slice(0, head_size_og)});
     }
-    out = out.contiguous();
+    out = ensure_contiguous(out);
 
     // TODO: current do not support store softmax_lse out
     // hard code to return empty tensor for softmax_lse, S_dmask, rng_state

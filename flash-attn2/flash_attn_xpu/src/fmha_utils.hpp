@@ -2,11 +2,6 @@
 #include "torch/all.h"
 #include <cute/tensor.hpp>
 
-#define HEAD_SIZE_LIMIT_0 64
-#define HEAD_SIZE_LIMIT_1 96
-#define HEAD_SIZE_LIMIT_2 128
-#define HEAD_SIZE_LIMIT_3 192
-
 enum class CutlassType {
   half,
   bfloat16,
@@ -26,6 +21,14 @@ inline CutlassType aten_to_Cutlass_dtype(const at::Tensor& input) {
 }
 
 using namespace cute;
+
+struct prefill_policy_head32 {
+  using ShapeQK = Shape<_64, _64, _32>;
+  using ShapePV = Shape<_64, _32, _64>;
+  using ShapeOutPut = Shape<_64, _32, _64>;
+  using SubgroupLayout = Layout<Shape<_4, _1, _1>, Stride<_1, _1, _1>>;
+};
+
 struct prefill_policy_head64 {
   using ShapeQK = Shape<_128, _64, _64>;
   using ShapePV = Shape<_128, _32, _64>;
@@ -47,6 +50,13 @@ struct prefill_policy_head128 {
   using SubgroupLayout = Layout<Shape<_16, _1, _1>, Stride<_1, _1, _1>>;
 };
 
+struct prefill_policy_head160 {
+  using ShapeQK = Shape<_256, _64, _32>;
+  using ShapePV = Shape<_256, _32, _64>;
+  using ShapeOutPut = Shape<_256, _160, _64>;
+  using SubgroupLayout = Layout<Shape<_32, _1, _1>, Stride<_1, _1, _1>>;
+};
+
 struct prefill_policy_head192 {
   using ShapeQK = Shape<_256, _64, _64>;
   using ShapePV = Shape<_256, _32, _64>;
@@ -54,9 +64,16 @@ struct prefill_policy_head192 {
   using SubgroupLayout = Layout<Shape<_32, _1, _1>, Stride<_1, _1, _1>>;
 };
 
-struct prefill_policy_head256 {
-  using ShapeQK = Shape<_256, _64, _64>;
+struct prefill_policy_head224 {
+  using ShapeQK = Shape<_256, _64, _32>;
   using ShapePV = Shape<_256, _32, _64>;
-  using ShapeOutPut = Shape<_256, _256, _64>;
+  using ShapeOutPut = Shape<_256, _224, _64>;
   using SubgroupLayout = Layout<Shape<_32, _1, _1>, Stride<_1, _1, _1>>;
+};
+
+struct prefill_policy_head256 {
+  using ShapeQK = Shape<_128, _64, _64>;
+  using ShapePV = Shape<_128, _32, _64>;
+  using ShapeOutPut = Shape<_128, _256, _64>;
+  using SubgroupLayout = Layout<Shape<_16, _1, _1>, Stride<_1, _1, _1>>;
 };
