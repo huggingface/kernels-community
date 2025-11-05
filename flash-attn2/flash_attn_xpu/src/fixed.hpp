@@ -242,27 +242,24 @@ void dispatch_by_head_size(CutlassType cuType, const prefill_args_fixed_t& args)
   if (h <= 32) {
     policy_dispatch<prefill_policy_head32>(cuType, args);
   }
-  // else if (h <= 64) {
-  //   policy_dispatch<prefill_policy_head64>(cuType, args);
-  // }
-  // else if (h <= 96) {
-  //   policy_dispatch<prefill_policy_head96>(cuType, args);
-  // }
-  // else if (h <= 128) {
-  //   policy_dispatch<prefill_policy_head128>(cuType, args);
-  // }
-  // else if (h <= 160) {
-  //   policy_dispatch<prefill_policy_head160>(cuType, args);
-  // }
-  // else if (h <= 192) {
-  //   policy_dispatch<prefill_policy_head192>(cuType, args);
-  // }
-  // else if (h <= 224) {
-  //   policy_dispatch<prefill_policy_head224>(cuType, args);
-  // }
-  // else if (h <= 256) {
-  //   policy_dispatch<prefill_policy_head256>(cuType, args);
-  // }
+  else if (h <= 64) {
+    policy_dispatch<prefill_policy_head64>(cuType, args);
+  }
+  else if (h <= 96) {
+    policy_dispatch<prefill_policy_head96>(cuType, args);
+  }
+  else if (h <= 128) {
+    policy_dispatch<prefill_policy_head128>(cuType, args);
+  }
+  else if (h <= 160) {
+    policy_dispatch<prefill_policy_head160>(cuType, args);
+  }
+  else if (h <= 192) {
+    policy_dispatch<prefill_policy_head192>(cuType, args);
+  }
+  else if (h <= 256) {
+    policy_dispatch<prefill_policy_head256>(cuType, args);
+  }
   else {
     throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
   }

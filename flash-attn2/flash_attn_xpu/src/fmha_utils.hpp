@@ -64,13 +64,6 @@ struct prefill_policy_head192 {
   using SubgroupLayout = Layout<Shape<_32, _1, _1>, Stride<_1, _1, _1>>;
 };
 
-struct prefill_policy_head224 {
-  using ShapeQK = Shape<_256, _64, _32>;
-  using ShapePV = Shape<_256, _32, _64>;
-  using ShapeOutPut = Shape<_256, _224, _64>;
-  using SubgroupLayout = Layout<Shape<_32, _1, _1>, Stride<_1, _1, _1>>;
-};
-
 struct prefill_policy_head256 {
   using ShapeQK = Shape<_128, _64, _64>;
   using ShapePV = Shape<_128, _32, _64>;

@@ -6,7 +6,10 @@
 namespace FLASH_NAMESPACE {
 
 inline int round_multiple(int x, int m) {
-    return (x + m - 1) / m * m;
+    int pad_res = (x + m - 1) / m * m;
+    if (pad_res == 224)
+        pad_res = 256;
+    return pad_res;
 }
 
 inline at::Tensor ensure_contiguous(const at::Tensor& tensor) {
@@ -40,6 +43,12 @@ mha_fwd(
     const int head_size_og = sizes[3];
     const int seqlen_k = k.size(1);
     const int num_heads_k = k.size(2);
+
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
     // XPU requires head_size to be a multiple of 32
     const int head_size_padded = round_multiple(head_size_og, 32);
@@ -117,7 +126,7 @@ mha_varlen_fwd(
     auto device_idx = q.device().index();
     COMPAT::select_device(device_idx);
 
-    // Extract dimensions
+    // check inputs
     const auto sizes = q.sizes();
     const int total_q = sizes[0];
     const int num_heads = sizes[1];
@@ -125,6 +134,12 @@ mha_varlen_fwd(
     const int total_k = k.size(0);
     const int num_heads_k = k.size(1);
     const int batch_size = cu_seqlens_q.numel() - 1;
+
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
     // XPU requires head_size to be a multiple of 32
     const int head_size_padded = round_multiple(head_size_og, 32);
