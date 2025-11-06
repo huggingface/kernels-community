@@ -36,6 +36,7 @@ mha_fwd(
     COMPAT::select_device(device_idx);
 
     // check inputs
+    q = ensure_contiguous(q);
     const auto sizes = q.sizes();
     const int batch_size = sizes[0];
     const int seqlen_q = sizes[1];
@@ -127,6 +128,7 @@ mha_varlen_fwd(
     COMPAT::select_device(device_idx);
 
     // check inputs
+    q = ensure_contiguous(q);
     const auto sizes = q.sizes();
     const int total_q = sizes[0];
     const int num_heads = sizes[1];
