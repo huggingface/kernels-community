@@ -5,32 +5,24 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <algorithm>
-#include <dlfcn.h>
-#include <mach-o/dyld.h>
 #include <string>
 #include <vector>
+
+// Include the auto-generated header with embedded metallib
+#ifdef EMBEDDED_METALLIB_HEADER
+#include EMBEDDED_METALLIB_HEADER
+#else
+#error "EMBEDDED_METALLIB_HEADER not defined"
+#endif
 
 static inline id<MTLBuffer> getMTLBufferStorage(const torch::Tensor &tensor) {
   return __builtin_bit_cast(id<MTLBuffer>, tensor.storage().data());
 }
 
-static std::string getModuleDirectory() {
-  Dl_info dl_info;
-  if (dladdr((void *)getModuleDirectory, &dl_info)) {
-    std::string path(dl_info.dli_fname);
-    size_t pos = path.find_last_of('/');
-    if (pos != std::string::npos) {
-      return path.substr(0, pos);
-    }
-  }
-  return ".";
-}
-
 // Helper function to get kernel name based on dtype and parameters
 static std::string getKernelName(const std::string &base_name,
-                                 torch::ScalarType dtype, 
-                                 torch::ScalarType cache_dtype,
-                                 int head_size,
+                                 torch::ScalarType dtype,
+                                 torch::ScalarType cache_dtype, int head_size,
                                  int block_size, int num_threads,
                                  int num_simd_lanes, int partition_size = 0) {
   std::string dtype_str;
@@ -63,13 +55,14 @@ static std::string getKernelName(const std::string &base_name,
     cache_dtype_str = "uchar";
     break;
   default:
-    TORCH_CHECK(false, "Unsupported cache dtype for paged attention: ", cache_dtype);
+    TORCH_CHECK(false,
+                "Unsupported cache dtype for paged attention: ", cache_dtype);
   }
 
   std::string kernel_name =
-      base_name + "_" + dtype_str + "_cache_" + cache_dtype_str + "_hs" + std::to_string(head_size) + "_bs" +
-      std::to_string(block_size) + "_nt" + std::to_string(num_threads) +
-      "_nsl" + std::to_string(num_simd_lanes);
+      base_name + "_" + dtype_str + "_cache_" + cache_dtype_str + "_hs" +
+      std::to_string(head_size) + "_bs" + std::to_string(block_size) + "_nt" +
+      std::to_string(num_threads) + "_nsl" + std::to_string(num_simd_lanes);
 
   if (partition_size >= 0) {
     kernel_name += "_ps" + std::to_string(partition_size);
@@ -130,14 +123,18 @@ void paged_attention_v1(
   TORCH_CHECK(
       !is_block_sparse,
       "Block sparse attention is not yet supported in Metal implementation");
-  
+
   // Determine cache dtype based on kv_cache_dtype
   torch::ScalarType cache_dtype = key_cache.scalar_type();
-  bool use_fp8_scales = (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3");
+  bool use_fp8_scales =
+      (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3");
   if (use_fp8_scales) {
-    TORCH_CHECK(cache_dtype == torch::kUInt8, "FP8 cache requires UInt8 tensor type");
-    TORCH_CHECK(k_scale.numel() == 1 && v_scale.numel() == 1, "FP8 scales must be scalars");
-    TORCH_CHECK(k_scale.scalar_type() == torch::kFloat32 && v_scale.scalar_type() == torch::kFloat32,
+    TORCH_CHECK(cache_dtype == torch::kUInt8,
+                "FP8 cache requires UInt8 tensor type");
+    TORCH_CHECK(k_scale.numel() == 1 && v_scale.numel() == 1,
+                "FP8 scales must be scalars");
+    TORCH_CHECK(k_scale.scalar_type() == torch::kFloat32 &&
+                    v_scale.scalar_type() == torch::kFloat32,
                 "FP8 scales must be float32");
   }
 
@@ -173,24 +170,19 @@ void paged_attention_v1(
   const size_t shared_memory_size = std::max(logits_size, outputs_size);
 
   // Get kernel name - v1 kernels have partition_size=0 in their name
-  std::string kernel_name =
-      getKernelName("paged_attention", query.scalar_type(), cache_dtype, head_size,
-                    block_size, num_threads, num_simd_lanes, partition_size);
+  std::string kernel_name = getKernelName(
+      "paged_attention", query.scalar_type(), cache_dtype, head_size,
+      block_size, num_threads, num_simd_lanes, partition_size);
 
   @autoreleasepool {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
 
-    // Load Metal library
-    std::string moduleDir = getModuleDirectory();
-    std::string metallibPath = moduleDir + "/" + METALLIB_PATH;
-    NSString *metallibPathStr =
-        [NSString stringWithUTF8String:metallibPath.c_str()];
-    NSURL *metallibURL = [NSURL fileURLWithPath:metallibPathStr];
+    // Load the embedded Metal library from memory
     NSError *error = nil;
-    id<MTLLibrary> lib = [device newLibraryWithURL:metallibURL error:&error];
-    TORCH_CHECK(lib, "Failed to load Metal library at ", metallibPath, ": ",
-                error ? error.localizedDescription.UTF8String
-                      : "unknown error");
+    id<MTLLibrary> lib =
+        EMBEDDED_METALLIB_NAMESPACE::createLibrary(device, &error);
+    TORCH_CHECK(lib, "Failed to create Metal library from embedded data: ",
+                error.localizedDescription.UTF8String);
 
     // Create function constants for conditional compilation
     MTLFunctionConstantValues *constants =
@@ -201,7 +193,9 @@ void paged_attention_v1(
                            type:MTLDataTypeBool
                         atIndex:10];
     [constants setConstantValue:&use_alibi type:MTLDataTypeBool atIndex:20];
-    [constants setConstantValue:&use_fp8_scales type:MTLDataTypeBool atIndex:30];
+    [constants setConstantValue:&use_fp8_scales
+                           type:MTLDataTypeBool
+                        atIndex:30];
 
     NSString *kernelNameStr =
         [NSString stringWithUTF8String:kernel_name.c_str()];
@@ -369,14 +363,18 @@ void paged_attention_v2(
   TORCH_CHECK(
       !is_block_sparse,
       "Block sparse attention is not yet supported in Metal implementation");
-  
+
   // Determine cache dtype based on kv_cache_dtype
   torch::ScalarType cache_dtype = key_cache.scalar_type();
-  bool use_fp8_scales = (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3");
+  bool use_fp8_scales =
+      (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3");
   if (use_fp8_scales) {
-    TORCH_CHECK(cache_dtype == torch::kUInt8, "FP8 cache requires UInt8 tensor type");
-    TORCH_CHECK(k_scale.numel() == 1 && v_scale.numel() == 1, "FP8 scales must be scalars");
-    TORCH_CHECK(k_scale.scalar_type() == torch::kFloat32 && v_scale.scalar_type() == torch::kFloat32,
+    TORCH_CHECK(cache_dtype == torch::kUInt8,
+                "FP8 cache requires UInt8 tensor type");
+    TORCH_CHECK(k_scale.numel() == 1 && v_scale.numel() == 1,
+                "FP8 scales must be scalars");
+    TORCH_CHECK(k_scale.scalar_type() == torch::kFloat32 &&
+                    v_scale.scalar_type() == torch::kFloat32,
                 "FP8 scales must be float32");
   }
 
@@ -411,9 +409,9 @@ void paged_attention_v2(
   const size_t shared_memory_size = std::max(logits_size, outputs_size);
 
   // Get kernel names
-  std::string kernel_name =
-      getKernelName("paged_attention", query.scalar_type(), cache_dtype, head_size,
-                    block_size, num_threads, num_simd_lanes, partition_size);
+  std::string kernel_name = getKernelName(
+      "paged_attention", query.scalar_type(), cache_dtype, head_size,
+      block_size, num_threads, num_simd_lanes, partition_size);
   // Reduce kernel doesn't have block_size in its name
   std::string reduce_kernel_name = "paged_attention_v2_reduce";
   switch (query.scalar_type()) {
@@ -438,17 +436,12 @@ void paged_attention_v2(
   @autoreleasepool {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
 
-    // Load Metal library
-    std::string moduleDir = getModuleDirectory();
-    std::string metallibPath = moduleDir + "/" + METALLIB_PATH;
-    NSString *metallibPathStr =
-        [NSString stringWithUTF8String:metallibPath.c_str()];
-    NSURL *metallibURL = [NSURL fileURLWithPath:metallibPathStr];
+    // Load the embedded Metal library from memory
     NSError *error = nil;
-    id<MTLLibrary> lib = [device newLibraryWithURL:metallibURL error:&error];
-    TORCH_CHECK(lib, "Failed to load Metal library at ", metallibPath, ": ",
-                error ? error.localizedDescription.UTF8String
-                      : "unknown error");
+    id<MTLLibrary> lib =
+        EMBEDDED_METALLIB_NAMESPACE::createLibrary(device, &error);
+    TORCH_CHECK(lib, "Failed to create Metal library from embedded data: ",
+                error.localizedDescription.UTF8String);
 
     // Setup command buffer and queue
     at::mps::MPSStream *stream = at::mps::getCurrentMPSStream();
