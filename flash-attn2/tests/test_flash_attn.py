@@ -1670,8 +1670,6 @@ def test_flash_attn_varlen_causal(
     if device == "xpu":
         if local:
             pytest.skip("local attention not supported on xpu currently")
-        if paged_kv_block_size is not None:
-            pytest.skip("paged_kv_block_size not supported on xpu currently")
 
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q

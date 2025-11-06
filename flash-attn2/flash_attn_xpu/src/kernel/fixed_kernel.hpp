@@ -35,7 +35,7 @@
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/kernel_hardware_info.hpp"
 
-#include "../collective/xe_flash_attn_prefill_mma.hpp"
+#include "../collective/fixed_mma.hpp"
 
 namespace cutlass::flash_attention::kernel {
 
@@ -77,10 +77,10 @@ public:
   using SoftmaxArguments = typename CollectiveSoftmaxEpilogue::Arguments;
   using SoftmaxParams = typename CollectiveSoftmaxEpilogue::Params;
   
-  static_assert(cute::is_void_v<TileScheduler_> or cute::is_same_v<TileScheduler_, PersistentScheduler> or 
-    cute::is_same_v<TileScheduler_, IndividualScheduler>, "Unsupported TileScheduler for Intel Xe.");
+  static_assert(cute::is_void_v<TileScheduler_> or cute::is_same_v<TileScheduler_, cutlass::flash_attention::kernel::fixed::PersistentScheduler> or 
+    cute::is_same_v<TileScheduler_, cutlass::flash_attention::kernel::fixed::IndividualScheduler>, "Unsupported TileScheduler for Intel Xe.");
   using TileSchedulerTag = TileScheduler_;
-  using TileScheduler = typename detail::TileSchedulerSelector<TileScheduler_, ArchTag>::Scheduler;
+  using TileScheduler = typename detail::fixed::TileSchedulerSelector<TileScheduler_, ArchTag>::Scheduler;
   using TileSchedulerParams = typename TileScheduler::Params;
   
   // Epilogue derived types
