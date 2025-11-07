@@ -1,5 +1,5 @@
 [general]
-name = "flash_attn"
+name = "flash_attn2"
 universal=false
 
 [torch]
