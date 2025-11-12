@@ -1,9 +1,6 @@
 [general]
-name = "flash_attn2"
+name = "flash-attn2"
 universal=false
-
-[general.hub]
-repo-id = "kernels-community/flash-attn2"
 
 [torch]
 src = ["torch-ext/torch_binding.cpp", "torch-ext/torch_binding.h"]
