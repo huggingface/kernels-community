@@ -92,6 +92,10 @@ namespace rmsnorm_cpu
         grad_weight[j] = (scalar_t)0;
       }
 
+      // Allocate per-thread accumulators and re-run accumulation serially per-thread.
+      int max_threads = omp_get_max_threads();
+      std::vector<std::vector<scalar_t>> all_acc(max_threads, std::vector<scalar_t>(HS, (scalar_t)0));
+
       // Parallel over tokens: compute grad_input and accumulate into thread-local
       // buffers for grad_weight to avoid atomics.
 #pragma omp parallel
@@ -101,8 +105,7 @@ namespace rmsnorm_cpu
         int start = (NT * tid) / nthreads;
         int end = (NT * (tid + 1)) / nthreads;
 
-        std::vector<scalar_t> local_acc(HS, (scalar_t)0);
-
+        auto &local_acc = all_acc[tid];
         for (int i = start; i < end; ++i)
         {
           const scalar_t *input_p = input + i * HS;
@@ -169,13 +172,14 @@ namespace rmsnorm_cpu
             }
           }
         }
+      }
 
-#pragma omp critical
+      // reduce all_acc into grad_weight
+      for (int t = 0; t < (int)all_acc.size(); ++t)
+      {
+        for (int j = 0; j < HS; ++j)
         {
-          for (int j = 0; j < HS; ++j)
-          {
-            grad_weight[j] += local_acc[j];
-          }
+          grad_weight[j] += all_acc[t][j];
         }
       }
     }
