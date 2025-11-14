@@ -199,5 +199,5 @@ namespace rmsnorm_cpu
     CPU_KERNEL_GUARD_OUT(rms_norm_backward_impl) });
     }
 
-  } // namespace avx2
+  } // namespace avx512
 } // namespace rmsnorm_cpu
