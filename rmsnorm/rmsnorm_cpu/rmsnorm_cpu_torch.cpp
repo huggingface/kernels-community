@@ -3,32 +3,31 @@
 
 // Forward implementation for CPU
 torch::Tensor rmsnorm_cpu_forward(
-    const torch::Tensor& hidden_states,
-    const torch::Tensor& weight,
-    double variance_epsilon
-) {
+    const torch::Tensor &hidden_states,
+    const torch::Tensor &weight,
+    double variance_epsilon)
+{
     TORCH_CHECK(hidden_states.is_contiguous(), "hidden_states must be contiguous");
     TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
-    
+
     auto output = torch::empty_like(hidden_states);
 
     rmsnorm_cpu::rmsnorm(
         output,
         hidden_states,
         weight,
-        static_cast<float>(variance_epsilon)
-    );
+        static_cast<float>(variance_epsilon));
 
     return output;
 }
 
 // Backward implementation for CPU
 std::tuple<torch::Tensor, torch::Tensor> rmsnorm_cpu_backward(
-    const torch::Tensor& grad_output,
-    const torch::Tensor& hidden_states,
-    const torch::Tensor& weight,
-    double variance_epsilon
-) {
+    const torch::Tensor &grad_output,
+    const torch::Tensor &hidden_states,
+    const torch::Tensor &weight,
+    double variance_epsilon)
+{
     TORCH_CHECK(grad_output.is_contiguous(), "grad_output must be contiguous");
     TORCH_CHECK(hidden_states.is_contiguous(), "hidden_states must be contiguous");
     TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
@@ -42,22 +41,21 @@ std::tuple<torch::Tensor, torch::Tensor> rmsnorm_cpu_backward(
         grad_output,
         hidden_states,
         weight,
-        static_cast<float>(variance_epsilon)
-    );
+        static_cast<float>(variance_epsilon));
 
     return std::make_tuple(grad_input, grad_weight);
 }
 
-
 // Custom autograd function for CPU RMSNorm
-class RMSNormCPUFunction : public torch::autograd::Function<RMSNormCPUFunction> {
+class RMSNormCPUFunction : public torch::autograd::Function<RMSNormCPUFunction>
+{
 public:
     static torch::Tensor forward(
         torch::autograd::AutogradContext *ctx,
-        const torch::Tensor& hidden_states,
-        const torch::Tensor& weight,
-        double variance_epsilon
-    ) {
+        const torch::Tensor &hidden_states,
+        const torch::Tensor &weight,
+        double variance_epsilon)
+    {
         ctx->save_for_backward({hidden_states, weight});
         ctx->saved_data["variance_epsilon"] = variance_epsilon;
         return rmsnorm_cpu_forward(hidden_states, weight, variance_epsilon);
@@ -65,8 +63,8 @@ public:
 
     static torch::autograd::variable_list backward(
         torch::autograd::AutogradContext *ctx,
-        torch::autograd::variable_list grad_outputs
-    ) {
+        torch::autograd::variable_list grad_outputs)
+    {
         auto saved = ctx->get_saved_variables();
         auto hidden_states = saved[0];
         auto weight = saved[1];
@@ -81,13 +79,12 @@ public:
     }
 };
 
-
 torch::Tensor apply_rms_norm_cpu(
-    const torch::Tensor& hidden_states,
-    const torch::Tensor& weight,
-    double variance_epsilon) {
+    const torch::Tensor &hidden_states,
+    const torch::Tensor &weight,
+    double variance_epsilon)
+{
 
     auto output = RMSNormCPUFunction::apply(hidden_states, weight, variance_epsilon);
     return output;
 }
-
