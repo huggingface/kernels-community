@@ -445,10 +445,31 @@ inline void storeFP32<c10::BFloat16>(float v, c10::BFloat16* ptr) {
 
 __m128i FP32Vec8_to_BF16Vec8_avx2(__m256 a) {
   __m256i ai = _mm256_castps_si256(a);
-  ai = _mm256_srli_epi32(ai, 16);
-  ai = _mm256_packus_epi32(ai, ai);
-  ai = _mm256_permute4x64_epi64(ai, 0b00111001);
-  return _mm256_extracti128_si256(ai, 0);
+  const __m256i lowmask = _mm256_set1_epi32(0x0000FFFF);
+  const __m256i tieval  = _mm256_set1_epi32(0x00008000); // 0x8000 low half = tie
+  const __m256i bias    = _mm256_set1_epi32(0x00007FFF); // rounding bias
+
+  // detect tie (low 16 == 0x8000)
+  __m256i low = _mm256_and_si256(ai, lowmask);
+  __m256i tie = _mm256_cmpeq_epi32(low, tieval);
+
+  // hi bits and LSB of hi (for tie->round-to-even)
+  __m256i hi = _mm256_srli_epi32(ai, 16);
+  __m256i lsb = _mm256_and_si256(hi, _mm256_set1_epi32(1));
+
+  // if tie && hi_lsb == 1 then add extra 1 to rounding bias (tie-to-even)
+  __m256i tiecorr = _mm256_and_si256(tie, lsb);
+  __m256i tiecorr_shift = _mm256_slli_epi32(tiecorr, 16); // add at bit16
+
+  // add bias and optional tie correction, then shift down
+  __m256i tmp = _mm256_add_epi32(ai, bias);
+  tmp = _mm256_add_epi32(tmp, tiecorr_shift);
+  tmp = _mm256_srli_epi32(tmp, 16); // now each lane holds rounded bf16 in low16
+
+  // pack 32->16 and reorder to extract 128-bit with 8 bf16 lanes
+  tmp = _mm256_packus_epi32(tmp, tmp);
+  tmp = _mm256_permute4x64_epi64(tmp, 0b00111001);
+  return _mm256_extracti128_si256(tmp, 0);
 }
 
 inline BF16Vec8::BF16Vec8(const FP32Vec8& v)

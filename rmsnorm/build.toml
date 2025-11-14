@@ -18,7 +18,7 @@ src = [
     "rmsnorm_cpu/cpu_types_avx512.hpp",
 ]
 include = ["rmsnorm_cpu"]
-cxx-flags = ["-mavx2", "-mfma", "-fopenmp", "-mf16c", "-mavx512f", "-mavx512bf16"]
+cxx-flags = ["-mavx2", "-mfma", "-fopenmp", "-mf16c", "-mavx512f", "-mavx512bf16", "-mavx512vl"]
 
 [kernel.rmsnorm_xpu]
 backend = "xpu"
