@@ -50,13 +50,13 @@ namespace collective {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <bool CausalMask_, class DispatchPolicy, class... Args> class FlashPrefillSoftmaxEpilogue {
+template <bool CausalMask_, bool LocalMask_, class DispatchPolicy, class... Args> class FlashPrefillSoftmaxEpilogue {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy>, "Could not find an epilogue specialization.");
 };
 
 
-template <bool CausalMask_, class Element_>
-class FlashPrefillSoftmaxEpilogue<CausalMask_, epilogue::IntelXeXMX16, Element_> {
+template <bool CausalMask_, bool LocalMask_, class Element_>
+class FlashPrefillSoftmaxEpilogue<CausalMask_, LocalMask_, epilogue::IntelXeXMX16, Element_> {
 public:
 
   //
@@ -66,6 +66,7 @@ public:
   using Element = Element_;
 
   static constexpr bool CausalMask = CausalMask_;
+  static constexpr bool LocalMask = LocalMask_;
 
   using GmemTiledCopyOut = void;
 
@@ -115,8 +116,18 @@ public:
       CUTLASS_PRAGMA_UNROLL
       for (int z = 0; z < FragsN; z++) {
         auto base_indx = indx + (z * Vec * FragsM);
-        Element eq = frag_s(base_indx) - max_scale_bcast;
-        frag_s(base_indx) = sycl::native::exp2(eq);
+        if constexpr (LocalMask) {
+          if ((std::isinf(max_scale_bcast) && max_scale_bcast < 0) ||
+              (std::isinf(frag_s(base_indx)) && frag_s(base_indx) < 0)) {
+            frag_s(base_indx) = 0.f;
+          } else {
+            Element eq = frag_s(base_indx) - max_scale_bcast;
+            frag_s(base_indx) = sycl::native::exp2(eq);
+          }
+        } else {
+          Element eq = frag_s(base_indx) - max_scale_bcast;
+          frag_s(base_indx) = sycl::native::exp2(eq);
+        }
         sum(indx) += frag_s(base_indx);
       }
     }
@@ -155,7 +166,18 @@ public:
     if (!is_first) {
       auto g = COMPAT::get_nd_item<1>().get_sub_group();
       Element max_scale{max * params.scale};
-      Element exp_scale{sycl::native::exp2(max_prev * params.scale - max_scale)};
+      Element exp_scale;
+      if constexpr (LocalMask) {
+        if ((std::isinf(max_scale) && max_scale < 0) ||
+            (std::isinf(max_prev) && max_prev < 0)) {
+          exp_scale = 0.f;
+        } else {
+          exp_scale = sycl::native::exp2(max_prev * params.scale - max_scale);
+        }
+      } else {
+        exp_scale = sycl::native::exp2(max_prev * params.scale - max_scale);
+      }
+
       CUTLASS_PRAGMA_UNROLL
       for (int indx = 0; indx < Vec * FragsM; indx++) {
         auto max_scale_bcast = group_broadcast(g, max_scale, indx);
@@ -164,7 +186,17 @@ public:
         CUTLASS_PRAGMA_UNROLL
         for (int z = 0; z < FragsNAcc; z++) {
           auto base_indx = indx + (z * Vec * FragsM);
-          frag_s(base_indx) = sycl::native::exp2((frag_s(base_indx) - max_scale_bcast));
+          if constexpr (LocalMask) {
+            if ((std::isinf(max_scale_bcast) && max_scale_bcast < 0) ||
+                (std::isinf(frag_s(base_indx)) && frag_s(base_indx) < 0)) {
+              frag_s(base_indx) = 0.f;
+            } else {
+              Element eq = frag_s(base_indx) - max_scale_bcast;
+              frag_s(base_indx) = sycl::native::exp2(eq);
+            }
+          } else {
+            frag_s(base_indx) = sycl::native::exp2((frag_s(base_indx) - max_scale_bcast));
+          }
           sum(indx) += frag_s(base_indx);  
         }
         CUTLASS_PRAGMA_UNROLL

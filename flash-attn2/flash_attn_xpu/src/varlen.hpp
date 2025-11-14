@@ -45,7 +45,7 @@ struct chunk_prefill_args_t {
   bool is_local;
 };
 
-template <class FMHAChunkPrefillKernel, bool isVarLen>
+template <class FMHAChunkPrefillKernel>
 struct KernelLauncher {
   using StrideQ = typename FMHAChunkPrefillKernel::StrideQ;
   using StrideK = typename FMHAChunkPrefillKernel::StrideK;
@@ -188,7 +188,7 @@ template <typename TileShapeQK, typename TileShapePV, typename TileShapeOutput,
           typename ElementComputeEpilogue = float,
           typename GmemTiledCopyStore = XE_2D_U16x8x16_ST_N>
 struct FMHAKernel {
-  template <bool isVarLen, bool Causal, bool PagedKV, bool Local,
+  template <bool Causal, bool PagedKV, bool Local,
             class Scheduler>
   static void run(const chunk_prefill_args_t& args) {
     cutlass::KernelHardwareInfo hw_info;
@@ -219,7 +219,7 @@ struct FMHAKernel {
     using ProblemShapeVarlen =
         cute::tuple<int, int, int, VariableLength, VariableLength, int, int>;
     using ProblemShapeType =
-        std::conditional_t<isVarLen, ProblemShapeVarlen, ProblemShapeRegular>;
+        std::conditional_t<true, ProblemShapeVarlen, ProblemShapeRegular>;
 
     // Mainloop
     using CollectiveMainloop =
@@ -239,7 +239,7 @@ struct FMHAKernel {
             ProblemShapeType, CollectiveMainloop, CollectiveSoftmaxEpilogue,
             CollectiveEpilogue, Scheduler>;
 
-    KernelLauncher<FMHAChunkPrefillKernel, isVarLen> launcher;
+    KernelLauncher<FMHAChunkPrefillKernel> launcher;
 
     launcher.run(args, hw_info);
   }
@@ -247,10 +247,10 @@ struct FMHAKernel {
   static void dispatch(const chunk_prefill_args_t& args) {
     #define DISPATCH_LOCAL(PagedKV, Causal) \
       if (args.is_local) { \
-        run<true, Causal, PagedKV, true, \
+        run<Causal, PagedKV, true, \
             cutlass::flash_attention::kernel::varlen::IndividualScheduler>(args); \
       } else { \
-        run<true, Causal, PagedKV, false, \
+        run<Causal, PagedKV, false, \
             cutlass::flash_attention::kernel::varlen::IndividualScheduler>(args); \
       }
 

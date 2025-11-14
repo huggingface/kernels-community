@@ -101,6 +101,7 @@ public:
   static constexpr int SharedStorageSize = 0;
 
   static constexpr bool CausalMask = CollectiveMainloop::CausalMask;
+   static constexpr bool LocalMask = CollectiveMainloop::LocalMask;
   static constexpr int SubgroupSize = CollectiveMainloop::SubgroupSize; // sub_group size
   static constexpr uint32_t MaxThreadsPerBlock = CollectiveMainloop::MaxThreadsPerBlock;
   using MmaAtomShape = typename CollectiveMainloop::MmaAtomShape;           // 8,16,16
@@ -341,6 +342,30 @@ public:
             }
         }
 
+        if constexpr (LocalMask) {
+            const int item_id = thread_idx % SubgroupSize;
+            int col_idx = item_id + nblock * QK_BLK_N;
+
+            CUTLASS_PRAGMA_UNROLL
+            for (int n = 0; n < FragsN; n++, col_idx += get<1>(MmaAtomShape())) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int m = 0; m < FragsM; m++) {
+                    int row_idx = m * Vec + seq_coord;
+                    int col_ref = seq_len_kv - seq_len_qo;
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int row = 0; row < Vec; row++) {
+                        bool left_mask = col_idx < cute::max(0,
+                            row + row_idx + col_ref - mainloop_params.window_left);
+                        bool right_mask = col_idx > cute::min(seq_len_kv,
+                            row + row_idx + col_ref + mainloop_params.window_right);
+                        if (left_mask || right_mask) {
+                            tSr(row, m, n) = ElementAccumulator{-INFINITY};
+                        }
+                    }
+                }
+            }
+        }
+
         // we only need one block ahead, there is enough gap to prefetch it while doing softmax. because the gap between the two MMA is big,
         // prefetching it the same way as cutlass K matrix does not make sense
         for(int i=0; i < size<1>(pVgV); i++) {
@@ -389,6 +414,31 @@ public:
               }
           }
       }
+
+      if constexpr (LocalMask) {
+          const int item_id = thread_idx % SubgroupSize;
+          int col_idx = item_id + (nblock_limit - 1) * QK_BLK_N;
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int n = 0; n < FragsN; n++, col_idx += get<1>(MmaAtomShape())) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int m = 0; m < FragsM; m++) {
+                  int row_idx = m * Vec + seq_coord;
+                  int col_ref = seq_len_kv - seq_len_qo;
+                  CUTLASS_PRAGMA_UNROLL
+                  for (int row = 0; row < Vec; row++) {
+                      bool left_mask = col_idx < cute::max(0,
+                          row + row_idx + col_ref - mainloop_params.window_left);
+                      bool right_mask = col_idx > cute::min(seq_len_kv,
+                          row + row_idx + col_ref + mainloop_params.window_right);
+                      if (left_mask || right_mask) {
+                          tSr(row, m, n) = ElementAccumulator{-INFINITY};
+                      }
+                  }
+              }
+          }
+      }
+
       // Add masking for partial tiles at the end block
       if (seq_len % QK_BLK_N != 0) {
         const int remainder = seq_len % QK_BLK_N;

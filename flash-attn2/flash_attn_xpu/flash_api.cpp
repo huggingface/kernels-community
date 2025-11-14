@@ -79,10 +79,16 @@ mha_fwd(
         out_padded = torch::zeros_like(q_padded);
     }
 
+    bool is_local = (window_size_left != -1) | (window_size_right != -1);
+
     q_padded = ensure_contiguous(q_padded);
     k_padded = ensure_contiguous(k_padded);
     v_padded = ensure_contiguous(v_padded);
-    cutlass::flash_attention::fixed::cutlass_fixed_impl(q_padded, k_padded, v_padded, out_padded, softmax_scale, is_causal);
+    cutlass::flash_attention::fixed::cutlass_fixed_impl(
+        q_padded, k_padded, v_padded, out_padded,
+        softmax_scale,
+        window_size_left, window_size_right,
+        is_causal, is_local);
 
     // Remove padding from output
     at::Tensor out = out_padded;
