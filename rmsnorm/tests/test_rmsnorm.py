@@ -4,9 +4,11 @@ import torch
 
 from rmsnorm.layers import RMSNorm
 
-
 def test_rmsnorm():
-    device = torch.device("xpu")
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        device = torch.device("xpu")
+    else:
+        device = torch.device("cpu")
     x = torch.randn(1024, 1024, dtype=torch.bfloat16, device=device)
     rmsnorm_layer = RMSNorm()
     rmsnorm_layer.weight = torch.randn(1024, device=device, dtype=torch.bfloat16)
@@ -16,12 +18,15 @@ def test_rmsnorm():
     x = x.to(torch.float32)
     variance = x.pow(2).mean(-1, keepdim=True)
     x = x * torch.rsqrt(variance + rmsnorm_layer.variance_epsilon)
-    ref_out = rmsnorm_layer.weight * x.to(torch.bfloat16)
-    torch.testing.assert_close(output, ref_out)
+    ref_out =  x * rmsnorm_layer.weight
+    torch.testing.assert_close(output, ref_out.to(torch.bfloat16))
 
 
 def test_rmsnorm_backward():
-    device = torch.device("xpu")
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        device = torch.device("xpu")
+    else:
+        device = torch.device("cpu")
     x = torch.randn(1024, 1024, dtype=torch.float32, device=device, requires_grad=True)
     rmsnorm_layer = RMSNorm()
     rmsnorm_layer.weight = torch.randn(1024, device=device, dtype=torch.float32, requires_grad=True)
