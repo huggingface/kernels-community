@@ -170,14 +170,19 @@ mha_varlen_fwd(
     } else {
         out_padded = torch::zeros_like(q_padded);
     }
-    
+
+    bool is_local = (window_size_left != -1) | (window_size_right != -1);
+
     q_padded = ensure_contiguous(q_padded);
     k_padded = ensure_contiguous(k_padded);
     v_padded = ensure_contiguous(v_padded);
-    cutlass::flash_attention::varlen::cutlass_varlen_impl(q_padded, k_padded, v_padded, out_padded, block_table_, 
-                              cu_seqlens_q, cu_seqlens_k,
-                              max_seqlen_q, max_seqlen_k,
-                              softmax_scale, is_causal);
+    cutlass::flash_attention::varlen::cutlass_varlen_impl(
+                            q_padded, k_padded, v_padded, out_padded, block_table_,
+                            cu_seqlens_q, cu_seqlens_k,
+                            max_seqlen_q, max_seqlen_k,
+                            softmax_scale,
+                            window_size_left, window_size_right,
+                            is_causal, is_local);
 
     // Remove padding from output
     at::Tensor out = out_padded;

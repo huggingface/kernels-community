@@ -755,8 +755,6 @@ def test_flash_attn_varlen_qkvpacked(
     if device == "xpu":
         if alibi:
             pytest.skip("alibi not supported on xpu currently")
-        if local:
-            pytest.skip("local attention not supported on xpu currently")
         if dropout_p != 0.0:
             pytest.skip("dropout not supported on xpu currently")
 
@@ -1227,8 +1225,6 @@ def test_flash_attn_varlen_output(
     if device == "xpu":
         if alibi:
             pytest.skip("alibi not supported on xpu currently")
-        if local:
-            pytest.skip("local attention not supported on xpu currently")
         if dropout_p != 0.0:
             pytest.skip("dropout not supported on xpu currently")
         if softcap != 0.0:
@@ -1667,9 +1663,6 @@ def test_flash_attn_varlen_causal(
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
     ):
         pytest.skip()  # Reference implementation OOM
-    if device == "xpu":
-        if local:
-            pytest.skip("local attention not supported on xpu currently")
 
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q

@@ -40,6 +40,9 @@ struct chunk_prefill_args_t {
   int block_size;
   bool is_causal;
   bool use_paged_kv;
+  int window_size_left;
+  int window_size_right;
+  bool is_local;
 };
 
 template <class FMHAChunkPrefillKernel, bool isVarLen>
@@ -117,7 +120,8 @@ struct KernelLauncher {
          reinterpret_cast<ElementK*>(args.key), stride_K_cache,
          reinterpret_cast<ElementV*>(args.value), stride_V_cache,
          static_cast<int*>(args.block_table), args.block_size,
-         args.max_blocks_per_seq, args.total_seqlen_k, -1, -1},
+         args.max_blocks_per_seq, args.total_seqlen_k,
+         args.window_size_left, args.window_size_right},
         {args.sm_scale},
         {reinterpret_cast<ElementOutput*>(args.out), stride_O},
         hw_info};
@@ -241,23 +245,33 @@ struct FMHAKernel {
   }
 
   static void dispatch(const chunk_prefill_args_t& args) {
+    #define DISPATCH_LOCAL(PagedKV, Causal) \
+      if (args.is_local) { \
+        run<true, Causal, PagedKV, true, \
+            cutlass::flash_attention::kernel::varlen::IndividualScheduler>(args); \
+      } else { \
+        run<true, Causal, PagedKV, false, \
+            cutlass::flash_attention::kernel::varlen::IndividualScheduler>(args); \
+      }
+
     if (args.use_paged_kv) {
       if (args.is_causal) {
-        run<true, true, true, false,
-            cutlass::flash_attention::kernel::varlen::IndividualScheduler>(args);
+        DISPATCH_LOCAL(true, true)
+
       } else {
-        run<true, false, true, false,
-            cutlass::flash_attention::kernel::varlen::IndividualScheduler>(args);
+        DISPATCH_LOCAL(true, false)
+
       }
     } else {
       if (args.is_causal) {
-        run<true, true, false, false,
-            cutlass::flash_attention::kernel::varlen::IndividualScheduler>(args);
+        DISPATCH_LOCAL(false, true)
+
       } else {
-        run<true, false, false, false,
-            cutlass::flash_attention::kernel::varlen::IndividualScheduler>(args);
+        DISPATCH_LOCAL(false, false)
+
       }
     }
+    #undef DISPATCH_LOCAL
   }
 };
 
@@ -313,7 +327,9 @@ void cutlass_varlen_impl(
     const at::Tensor& value_cache, at::Tensor& out,
     const std::optional<at::Tensor>& block_table, const at::Tensor& cu_seqlens_q,
     const at::Tensor& cu_seqlens_k, int max_seqlen_q, int max_seqlen_k,
-    double sm_scale, bool is_causal) {
+    double sm_scale,
+    int window_size_left = -1, int  window_size_right = -1,
+    bool is_causal = false, bool is_local = false) {
   int num_heads_q = query.size(1);
   int head_size = query.size(2);
   int batch_size = cu_seqlens_q.numel() - 1;
@@ -336,6 +352,11 @@ void cutlass_varlen_impl(
     total_seqlen_k = key_cache.size(0);
   }
 
+  if (is_local) {
+    window_size_left = window_size_left == -1 ? max_seqlen_k : window_size_left;
+    window_size_right = window_size_right == -1 ? max_seqlen_k : window_size_right;
+  }
+
   chunk_prefill_args_t args = {query.data_ptr(),
                                key_cache.data_ptr(),
                                value_cache.data_ptr(),
@@ -355,7 +376,10 @@ void cutlass_varlen_impl(
                                max_blocks_per_seq,
                                block_size,
                                is_causal,
-                               use_paged_kv};
+                               use_paged_kv,
+                               window_size_left,
+                               window_size_right,
+                               is_local};
 
   CutlassType cuType = aten_to_Cutlass_dtype(query);
 
