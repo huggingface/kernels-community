@@ -11,7 +11,7 @@ jobs:
   build-kernel:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: DeterminateSystems/nix-installer-action@v20
         with:
           extra-conf: |
