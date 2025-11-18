@@ -1,0 +1,5 @@
+[general]
+name = "flash-attn-cute"
+cuda-minver = "12.8"
+universal = true
+python-depends = ["nvidia-cutlass-dsl"]
