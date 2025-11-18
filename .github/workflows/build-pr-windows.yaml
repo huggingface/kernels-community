@@ -1,10 +1,13 @@
 name: Build PR (Windows)
 on:
-  push:
-    branches: ['windows-build-*']
-#  pull_request:
-#    paths-ignore:
-#      - "**/README.md"
+#  push:
+#    branches: ['windows-build-*']
+  pull_request:
+    types: [opened, synchronize]
+    paths-ignore:
+      - "**/README.md"
+
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
