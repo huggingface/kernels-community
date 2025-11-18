@@ -1,0 +1,74 @@
+name: Build PR (Windows)
+on:
+  push:
+    branches: ['windows-build-*']
+#  pull_request:
+#    paths-ignore:
+#      - "**/README.md"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build-kernel:
+    strategy:
+      matrix:
+        os: [ windows-2022 ]
+        python: [ 3.11, 3.12 ]
+        torch: [
+          #          { version: '2.9.1', cuda: '12.6.3', wheel: '126' },
+          { version: '2.9.1', cuda: '12.8.1', wheel: '128' },
+          #          { version: '2.9.1', cuda: '13.0.1', wheel: '130' }
+        ]
+
+    runs-on: windows-2022
+    steps:
+      - uses: Jimver/cuda-toolkit@v0.2.29
+        id: setup-cuda-toolkit
+        with:
+          cuda: ${{ matrix.torch.cuda }}
+
+      - name: Install PyTorch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cu${{ matrix.torch.wheel }}
+
+      - uses: actions/checkout@v5
+      - name: Validate kernel directory
+        id: validate
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "pr" "$PR_TITLE"); then
+            echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            echo "skip=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout kernel-builder
+        if: steps.validate.outputs.skip == 'false'
+        uses: actions/checkout@v5
+        with:
+          repository: huggingface/kernel-builder
+          path: kernel-builder
+
+      - name: Cache Rust build
+        if: steps.validate.outputs.skip == 'false'
+        uses: actions/cache@v4
+        with:
+          path: |
+            kernel-builder/build2cmake/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-rust-debug-${{ hashFiles('kernel-builder/build2cmake/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-debug-
+
+      - name: Build build2cmake
+        if: steps.validate.outputs.skip == 'false'
+        working-directory: kernel-builder/build2cmake
+        run: cargo build
+
+      - name: Build kernel
+        if: steps.validate.outputs.skip == 'false'
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          echo "$KERNEL"
