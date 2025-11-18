@@ -38,14 +38,17 @@ jobs:
       - uses: actions/checkout@v5
       - name: Validate kernel directory
         id: validate
+        shell: pwsh
         run: |
-          PR_TITLE="${{ github.event.pull_request.title }}"
-          if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "pr" "$PR_TITLE"); then
-            echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
-            echo "skip=false" >> $GITHUB_OUTPUT
-          else
-            echo "skip=true" >> $GITHUB_OUTPUT
-          fi
+          $PR_TITLE = "${{ github.event.pull_request.title }}"
+          $KERNEL = python .github/workflows/validate-kernel-pr.py "pr" "$PR_TITLE"
+          if ($LASTEXITCODE -eq 0) {
+            echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
+            echo "skip=false" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "skip=true" >> $env:GITHUB_OUTPUT
+          }
+
 
       - name: Checkout kernel-builder
         if: steps.validate.outputs.skip == 'false'
@@ -73,6 +76,7 @@ jobs:
 
       - name: Build kernel
         if: steps.validate.outputs.skip == 'false'
+        shell: pwsh
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
-          echo "$KERNEL"
+          $KERNEL = "${{ steps.validate.outputs.kernel }}"
+          Write-Output $KERNEL
