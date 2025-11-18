@@ -93,4 +93,4 @@ jobs:
         shell: pwsh
         run: |
           $KERNEL = "${{ steps.validate.outputs.kernel }}"
-          & "kernel-builder\scripts\windows\build.ps1" -SourceFolder $KERNEL -BuildConfig Release -Build
+          "$GITHUB_WORKSPACE\kernel-builder\scripts\windows\build.ps1" -SourceFolder $KERNEL -BuildConfig Release -Build
