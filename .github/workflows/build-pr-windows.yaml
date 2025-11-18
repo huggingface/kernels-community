@@ -23,6 +23,8 @@ jobs:
 
     runs-on: windows-2022
     steps:
+      - run: echo "${{ github.event.pull_request.title }}"
+
       - uses: Jimver/cuda-toolkit@v0.2.29
         id: setup-cuda-toolkit
         with:
