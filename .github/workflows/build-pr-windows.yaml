@@ -92,4 +92,4 @@ jobs:
         shell: pwsh
         run: |
           KERNEL_BUILDER_PATH = "${{ steps.checkout-kernel-builder.outputs.path }}"
-          ${KERNEL_BUILDER_PATH}\scripts\windows\build.ps1 -SourceFolder "${{ KERNEL }}" -BuildConfig Release -Build
+          "${{ KERNEL_BUILDER_PATH}}\scripts\windows\build.ps1" -SourceFolder "${{ KERNEL }}" -BuildConfig Release -Build
