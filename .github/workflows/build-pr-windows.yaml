@@ -26,20 +26,6 @@ jobs:
 
     runs-on: windows-2022
     steps:
-      - run: echo "${{ github.event.pull_request.title }}"
-
-      - uses: Jimver/cuda-toolkit@v0.2.29
-        id: setup-cuda-toolkit
-        with:
-          cuda: ${{ matrix.torch.cuda }}
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-
-      - name: Install PyTorch
-        run: pip install torch --index-url https://download.pytorch.org/whl/cu${{ matrix.torch.wheel }}
-
       - uses: actions/checkout@v5
       - name: Validate kernel directory
         id: validate
@@ -54,9 +40,31 @@ jobs:
             echo "skip=true" >> $env:GITHUB_OUTPUT
           }
 
+      - name: Kernel Info
+        shell: pwsh
+        run: |
+          $KERNEL = "${{ steps.validate.outputs.kernel }}"
+          Write-Output Building Kernel: "${{ KERNEL }}"
+
+      - uses: Jimver/cuda-toolkit@v0.2.29
+        if: steps.validate.outputs.skip == 'false'
+        id: setup-cuda-toolkit
+        with:
+          cuda: ${{ matrix.torch.cuda }}
+
+      - name: Setup Python
+        if: steps.validate.outputs.skip == 'false'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install PyTorch
+        if: steps.validate.outputs.skip == 'false'
+        run: pip install torch --index-url https://download.pytorch.org/whl/cu${{ matrix.torch.wheel }}
 
       - name: Checkout kernel-builder
         if: steps.validate.outputs.skip == 'false'
+        id: checkout-kernel-builder
         uses: actions/checkout@v5
         with:
           repository: huggingface/kernel-builder
@@ -83,5 +91,5 @@ jobs:
         if: steps.validate.outputs.skip == 'false'
         shell: pwsh
         run: |
-          $KERNEL = "${{ steps.validate.outputs.kernel }}"
-          Write-Output $KERNEL
+          KERNEL_BUILDER_PATH = "${{ steps.checkout-kernel-builder.outputs.path }}"
+          ${KERNEL_BUILDER_PATH}\scripts\windows\build.ps1 -SourceFolder ${KERNEL} -BuildConfig Release -Build
