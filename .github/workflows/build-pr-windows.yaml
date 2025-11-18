@@ -41,10 +41,11 @@ jobs:
           }
 
       - name: Kernel Info
+        if: steps.validate.outputs.skip == 'false'
         shell: pwsh
         run: |
           $KERNEL = "${{ steps.validate.outputs.kernel }}"
-          Write-Output Building Kernel: "${{ KERNEL }}"
+          Write-Output "Building Kernel: $KERNEL"
 
       - uses: Jimver/cuda-toolkit@v0.2.29
         if: steps.validate.outputs.skip == 'false'
@@ -91,5 +92,5 @@ jobs:
         if: steps.validate.outputs.skip == 'false'
         shell: pwsh
         run: |
-          KERNEL_BUILDER_PATH = "${{ steps.checkout-kernel-builder.outputs.path }}"
-          "${{ KERNEL_BUILDER_PATH}}\scripts\windows\build.ps1" -SourceFolder "${{ KERNEL }}" -BuildConfig Release -Build
+          $KERNEL = "${{ steps.validate.outputs.kernel }}"
+          & "kernel-builder\scripts\windows\build.ps1" -SourceFolder $KERNEL -BuildConfig Release -Build
