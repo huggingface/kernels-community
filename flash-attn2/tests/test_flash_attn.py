@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from flash_attn import (
+from flash_attn2 import (
     flash_attn_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
@@ -13,9 +13,9 @@ from flash_attn import (
     flash_attn_varlen_qkvpacked_func,
     flash_attn_with_kvcache,
 )
-from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn.flash_attn_interface import _get_block_size_n
-from flash_attn.layers.rotary import apply_rotary_emb
+from flash_attn2.bert_padding import pad_input, unpad_input
+from flash_attn2.flash_attn_interface import _get_block_size_n
+from flash_attn2.layers.rotary import apply_rotary_emb
 
 MAX_HEADDIM_SM8x = 192
 
@@ -594,8 +594,6 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
     if device == "xpu":
         if alibi:
             pytest.skip("alibi not supported on xpu currently")
-        if local:
-            pytest.skip("local attention not supported on xpu currently")
         if dropout_p != 0.0:
             pytest.skip("dropout not supported on xpu currently")
 
@@ -755,8 +753,6 @@ def test_flash_attn_varlen_qkvpacked(
     if device == "xpu":
         if alibi:
             pytest.skip("alibi not supported on xpu currently")
-        if local:
-            pytest.skip("local attention not supported on xpu currently")
         if dropout_p != 0.0:
             pytest.skip("dropout not supported on xpu currently")
 
@@ -943,8 +939,6 @@ def test_flash_attn_output(
     if device == "xpu":
         if alibi:
             pytest.skip("alibi not supported on xpu currently")
-        if local:
-            pytest.skip("local attention not supported on xpu currently")
         if dropout_p != 0.0:
             pytest.skip("dropout not supported on xpu currently")
         if softcap != 0.0:
@@ -1227,8 +1221,6 @@ def test_flash_attn_varlen_output(
     if device == "xpu":
         if alibi:
             pytest.skip("alibi not supported on xpu currently")
-        if local:
-            pytest.skip("local attention not supported on xpu currently")
         if dropout_p != 0.0:
             pytest.skip("dropout not supported on xpu currently")
         if softcap != 0.0:
@@ -1545,9 +1537,6 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype, devi
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
     ):
         pytest.skip()  # Reference implementation OOM
-    if device == "xpu":
-        if local:
-            pytest.skip("local attention not supported on xpu currently")
 
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
@@ -1667,9 +1656,6 @@ def test_flash_attn_varlen_causal(
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
     ):
         pytest.skip()  # Reference implementation OOM
-    if device == "xpu":
-        if local:
-            pytest.skip("local attention not supported on xpu currently")
 
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
@@ -1845,8 +1831,6 @@ def test_flash_attn_splitkv(
     if device == "xpu":
         if alibi:
             pytest.skip("alibi not supported on xpu currently")
-        if local:
-            pytest.skip("local attention not supported on xpu currently")
 
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q

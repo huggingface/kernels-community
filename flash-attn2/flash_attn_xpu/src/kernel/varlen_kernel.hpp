@@ -111,7 +111,7 @@ class FMHAPrefillChunk {
   static constexpr bool CausalMask = CollectiveMainloop::CausalMask;
   static constexpr bool LocalMask = CollectiveMainloop::LocalMask;
 
-  static_assert(!(CausalMask && LocalMask), "Cannot be both causal and local");
+  // static_assert(!(CausalMask && LocalMask), "Cannot be both causal and local");
   static constexpr bool PagedKV = CollectiveMainloop::PagedKV;
 
   static constexpr int SubgroupSize =
@@ -464,15 +464,15 @@ class FMHAPrefillChunk {
             CUTLASS_PRAGMA_UNROLL
             for (int m = 0; m < FragsM; m++) {  // 2
               int row_idx = m * Vec + seq_coord;
+              int col_ref = seq_len_kv_cache - seq_len_qo;
               CUTLASS_PRAGMA_UNROLL
               for (int row = 0; row < Vec; row++) {  // 8
                 bool left_mask =
-                    col_idx < cute::max(0, row + row_idx + seq_len_kv_cache -
-                                               mainloop_params.window_left);
+                    col_idx < cute::max(0,
+                      row + row_idx + col_ref - mainloop_params.window_left);
                 bool right_mask =
                     col_idx > cute::min(seq_len_kv_cache,
-                                        row + row_idx + seq_len_kv_cache +
-                                            mainloop_params.window_right);
+                      row + row_idx + col_ref + mainloop_params.window_right);
                 if (left_mask || right_mask) {
                   tSr(row, m, n) = ElementAccumulator{-INFINITY};
                 }

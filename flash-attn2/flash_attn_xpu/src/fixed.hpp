@@ -33,6 +33,9 @@ struct prefill_args_fixed_t {
   int batch_size;
   int seq_len_q;
   int seq_len_k;
+  int window_size_left;
+  int window_size_right;
+  bool is_local;
 };
 
 template <class FMHAPrefillKernel>
@@ -83,7 +86,7 @@ struct KernelLauncher {
         {reinterpret_cast<ElementQ*>(args.query), stride_Q,
          reinterpret_cast<ElementK*>(args.key), stride_K,
          reinterpret_cast<ElementV*>(args.value), stride_V,
-        },  // window_left, window_right for local mask (not supported currently)
+         args.window_size_left, args.window_size_right,},
         {args.softmax_scale},
         {reinterpret_cast<ElementOutput*>(args.out), stride_O},
         hw_info};
@@ -165,7 +168,7 @@ template <typename TileShapeQK, typename TileShapePV, typename TileShapeOutput,
           typename ElementAccumulator = float,
           typename ElementComputeEpilogue = float>
 struct FMHAKernel {
-  template <bool Causal, class Scheduler>
+  template <bool Causal, bool Local, class Scheduler>
   static void run_impl(const prefill_args_fixed_t& args) {
     cutlass::KernelHardwareInfo hw_info;
 
@@ -186,7 +189,7 @@ struct FMHAKernel {
     
     using CollectiveSoftmaxEpilogue =
         cutlass::flash_attention::collective::FlashPrefillSoftmaxEpilogue<
-            Causal, EpilogueDispatchPolicy, ElementAccumulator>;
+            Causal, Local, EpilogueDispatchPolicy, ElementAccumulator>;
 
     using ProblemShape = cute::tuple<int, int, int, int, int, int, int>;
 
@@ -197,7 +200,7 @@ struct FMHAKernel {
             cutlass::gemm::TagToStrideB_t<LayoutK>, ElementInputKV,
             cutlass::gemm::TagToStrideB_t<LayoutV>, MMAOperation, TileShapeQK,
             TileShapePV, SubgroupLayout, GmemTiledCopyQ, GmemTiledCopyK, 
-            GmemTiledCopyV, Causal>;
+            GmemTiledCopyV, Causal, Local>;
 
     using FMHAPrefillKernel = cutlass::flash_attention::kernel::FMHAPrefill<
         ProblemShape, CollectiveMainloop, CollectiveSoftmaxEpilogue,
@@ -209,9 +212,17 @@ struct FMHAKernel {
 
   static void dispatch(const prefill_args_fixed_t& args) {
     if (args.is_causal) {
-      run_impl<true, cutlass::flash_attention::kernel::fixed::IndividualScheduler>(args);
+      if (args.is_local) {
+        run_impl<true, true, cutlass::flash_attention::kernel::fixed::IndividualScheduler>(args);
+      } else {
+        run_impl<true, false, cutlass::flash_attention::kernel::fixed::IndividualScheduler>(args);
+      }
     } else {
-      run_impl<false, cutlass::flash_attention::kernel::fixed::IndividualScheduler>(args);
+      if (args.is_local) {
+        run_impl<false, true, cutlass::flash_attention::kernel::fixed::IndividualScheduler>(args);
+      } else {
+        run_impl<false, false, cutlass::flash_attention::kernel::fixed::IndividualScheduler>(args);
+      }
     }
   }
 };
@@ -271,7 +282,8 @@ void cutlass_fixed_impl(
     const at::Tensor& key,        // [batch, seq_k, heads, head_size]
     const at::Tensor& value,      // [batch, seq_k, heads, head_size]
     at::Tensor& out,              // [batch, seq_q, heads, head_size]
-    double softmax_scale, bool is_causal) {
+    double softmax_scale, int window_size_left = -1, int  window_size_right = -1,
+    bool is_causal = false, bool is_local = false) {
   
   int batch_size = query.size(0);
   int seq_len_q = query.size(1);
@@ -286,12 +298,17 @@ void cutlass_fixed_impl(
   auto v_reshaped = value.transpose(1, 2).contiguous();
   auto out_temp = torch::zeros_like(q_reshaped);
 
+  if (is_local) {
+    window_size_left = window_size_left == -1 ? seq_len_q : window_size_left;
+    window_size_right = window_size_right == -1 ? seq_len_k : window_size_right;
+  }
+
   // Prepare arguments
   prefill_args_fixed_t args{
     q_reshaped.data_ptr(), k_reshaped.data_ptr(), v_reshaped.data_ptr(), 
     out_temp.data_ptr(), static_cast<float>(softmax_scale), 
     num_heads_q, num_heads_kv, head_size, is_causal, batch_size,
-    seq_len_q, seq_len_k
+    seq_len_q, seq_len_k, window_size_left, window_size_right, is_local
   };
   
   dispatch_by_head_size(aten_to_Cutlass_dtype(query), args);
