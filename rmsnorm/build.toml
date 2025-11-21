@@ -5,6 +5,16 @@ universal = false
 [torch]
 src = ["torch-ext/torch_binding.cpp"]
 
+[kernel.rmsnorm_cpu]
+backend = "cpu"
+depends = ["torch"]
+src = [
+    "rmsnorm_cpu/rmsnorm_cpu_torch.cpp",
+    "rmsnorm_cpu/rmsnorm_cpu.cpp",
+    "rmsnorm_cpu/rmsnorm_cpu.hpp",
+    "rmsnorm_cpu/cpu_features.hpp",
+]
+include = ["rmsnorm_cpu"]
 
 [kernel.rmsnorm_cpu_avx512]
 backend = "cpu"
