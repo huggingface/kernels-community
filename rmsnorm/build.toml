@@ -20,10 +20,6 @@ include = ["rmsnorm_cpu"]
 backend = "cpu"
 depends = ["torch"]
 src = [
-    "rmsnorm_cpu/rmsnorm_cpu_torch.cpp",
-    "rmsnorm_cpu/rmsnorm_cpu.cpp",
-    "rmsnorm_cpu/rmsnorm_cpu.hpp",
-    "rmsnorm_cpu/cpu_features.hpp",
     "rmsnorm_cpu/rmsnorm_avx512.cpp",
     "rmsnorm_cpu/rmsnorm_avx512.hpp",
     "rmsnorm_cpu/cpu_types_avx512.hpp",
@@ -35,10 +31,6 @@ cxx-flags = ["-mfma", "-fopenmp", "-mf16c", "-mavx512f", "-mavx512bf16", "-mavx5
 backend = "cpu"
 depends = ["torch"]
 src = [
-    "rmsnorm_cpu/rmsnorm_cpu_torch.cpp",
-    "rmsnorm_cpu/rmsnorm_cpu.cpp",
-    "rmsnorm_cpu/rmsnorm_cpu.hpp",
-    "rmsnorm_cpu/cpu_features.hpp",
     "rmsnorm_cpu/rmsnorm_avx2.cpp",
     "rmsnorm_cpu/rmsnorm_avx2.hpp",
     "rmsnorm_cpu/cpu_types_avx2.hpp",
