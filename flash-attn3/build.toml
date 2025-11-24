@@ -1,8 +1,7 @@
 [general]
-name = "flash_attn3"
+name = "flash-attn3"
 universal = false
-cuda-minver = "12.4"
-cuda-maxver = "12.4"
+cuda-minver = "12.8"
 
 [torch]
 src = [
@@ -19,11 +18,11 @@ cuda-flags = [
   "-std=c++17",
   "--ftemplate-backtrace-limit=0",              # To debug template code
   "--use_fast_math",
+  #"--resource-usage",
+  #"-lineinfo",
   "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
   "-DCUTLASS_ENABLE_GDC_FOR_SM90",
-  "--expt-relaxed-constexpr",
-  "--expt-extended-lambda",
-  "--use_fast_math",
+  "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
   "-DNDEBUG",
 ]
 
@@ -45,17 +44,17 @@ depends = ["torch", "cutlass_3_9"]
 
 [kernel.flash_attn_sm80]
 backend = "cuda"
-cuda-capabilities = ["8.0", "9.0a"]
+cuda-capabilities = ["8.0"]
 cuda-flags = [
   "-O3",
   "-std=c++17",
   "--ftemplate-backtrace-limit=0",              # To debug template code
   "--use_fast_math",
+  #"--resource-usage",
+  #"-lineinfo",
   "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
   "-DCUTLASS_ENABLE_GDC_FOR_SM90",
-  "--expt-relaxed-constexpr",
-  "--expt-extended-lambda",
-  "--use_fast_math",
+  "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
   "-DNDEBUG",
 ]
 src = [
@@ -193,17 +192,17 @@ depends = ["torch", "cutlass_3_9"]
 
 [kernel.flash_attn_sm90]
 backend = "cuda"
-cuda-capabilities = ["8.0", "9.0a"]
+cuda-capabilities = ["9.0a"]
 cuda-flags = [
   "-O3",
   "-std=c++17",
   "--ftemplate-backtrace-limit=0",              # To debug template code
   "--use_fast_math",
+  #"--resource-usage",
+  #"-lineinfo",
   "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
   "-DCUTLASS_ENABLE_GDC_FOR_SM90",
-  "--expt-relaxed-constexpr",
-  "--expt-extended-lambda",
-  "--use_fast_math",
+  "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
   "-DNDEBUG",
 ]
 src = [
@@ -547,11 +546,11 @@ depends = ["torch", "cutlass_3_9"]
 #   "-std=c++17",
 #   "--ftemplate-backtrace-limit=0",              # To debug template code
 #   "--use_fast_math",
+#   "--resource-usage",
+#   "-lineinfo",
 #   "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
 #   "-DCUTLASS_ENABLE_GDC_FOR_SM90",
-#   "--expt-relaxed-constexpr",
-#   "--expt-extended-lambda",
-#   "--use_fast_math",
+#   "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
 #   "-DNDEBUG",
 # ]
 # src = [
