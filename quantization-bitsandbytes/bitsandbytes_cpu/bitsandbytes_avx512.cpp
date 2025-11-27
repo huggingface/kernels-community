@@ -1,7 +1,6 @@
 // AVX512 implementation - compile with -mavx512f -mavx512bf16
 #include <ATen/ATen.h>
 #include <ATen/native/CPUBlas.h>
-#include <BinSearch.h>
 #include <bitsandbytes_avx512.hpp>
 #include <thread>
 #include <omp.h>
