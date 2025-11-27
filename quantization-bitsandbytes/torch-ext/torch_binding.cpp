@@ -27,7 +27,7 @@ torch::Tensor gemm_4bit_forward(
     }
 #endif
     else {
-        TORCH_CHECK(false, "Unsupported device type: ", hidden_states.device().type());
+        TORCH_CHECK(false, "Unsupported device type: ", input.device().type());
     }
 }
 
