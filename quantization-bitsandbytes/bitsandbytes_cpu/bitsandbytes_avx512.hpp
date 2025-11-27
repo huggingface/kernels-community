@@ -1,7 +1,6 @@
 // AVX512 implementation - compile with -mavx512f -mavx512bf16
 #include <algorithm>
 #include <cmath>
-#include <common.h>
 #include <cstdint>
 #include <cstring>
 #include <thread>
