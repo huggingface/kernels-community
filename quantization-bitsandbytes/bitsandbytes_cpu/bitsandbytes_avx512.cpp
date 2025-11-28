@@ -1,6 +1,9 @@
 // AVX512 implementation - compile with -mavx512f -mavx512bf16
+#define CPU_CAPABILITY_AVX512
 #include <ATen/ATen.h>
 #include <ATen/native/CPUBlas.h>
+#include <ATen/cpu/vec/vec.h>
+#include <ATen/cpu/vec/functional.h>
 #include <bitsandbytes_avx512.hpp>
 #include <thread>
 #include <omp.h>
@@ -10,34 +13,6 @@ namespace bitsandbytes_cpu
 {
     namespace avx512
     {
-        inline __m256i cvt_fp32_to_fp16(const __m512 src)
-        {
-            return _mm512_cvtps_ph(src, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-        }
-
-        inline __m256i cvt_fp32_to_bf16(const __m512 src)
-        {
-            if (has_avx512bf16())
-            {
-                return reinterpret_cast<__m256i>(_mm512_cvtneps_pbh(src));
-            }
-            __m512i value = _mm512_castps_si512(src);
-            __m512i nan = _mm512_set1_epi32(0xffff);
-            auto mask_value = _mm512_cmp_ps_mask(src, src, _CMP_ORD_Q);
-            __m512i ones = _mm512_set1_epi32(0x1);
-            __m512i vec_bias = _mm512_set1_epi32(0x7fff);
-            // uint32_t lsb = (input >> 16) & 1;
-            auto t_value = _mm512_and_si512(_mm512_srli_epi32(value, 16), ones);
-            // uint32_t rounding_bias = 0x7fff + lsb;
-            t_value = _mm512_add_epi32(t_value, vec_bias);
-            // input += rounding_bias;
-            t_value = _mm512_add_epi32(t_value, value);
-            // input = input >> 16;
-            t_value = _mm512_srli_epi32(t_value, 16);
-            // Check NaN before converting back to bf16
-            t_value = _mm512_mask_blend_epi32(mask_value, nan, t_value);
-            return _mm512_cvtusepi32_epi16(t_value);
-        }
 
         static inline __m512 set_nf4_lut()
         {
@@ -56,22 +31,10 @@ namespace bitsandbytes_cpu
 
 #define CVT_BF16_TO_FP32(a) _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a), 16))
 
-        static inline const at::BFloat16 *cast_at_bf16(const bf16_t *p)
-        {
-            static_assert(sizeof(bf16_t) == sizeof(at::BFloat16), "bf16_t size mismatch");
-            return reinterpret_cast<const at::BFloat16 *>(p);
-        }
-
-        static inline at::BFloat16 *cast_at_bf16(bf16_t *p)
-        {
-            static_assert(sizeof(bf16_t) == sizeof(at::BFloat16), "bf16_t size mismatch");
-            return reinterpret_cast<at::BFloat16 *>(p);
-        }
-
         template <int DATA_TYPE>
         inline void unpack_B(
-            bf16_t *__restrict__ Btmp, const unsigned char *__restrict__ packed_B,
-            const bf16_t *__restrict__ Bs, // scales [K/gs, N] in bf16
+            at::BFloat16 *__restrict__ Btmp, const unsigned char *__restrict__ packed_B,
+            const at::BFloat16 *__restrict__ Bs, // scales [K/gs, N] in bf16
             int64_t N, int64_t K, int blocksize, int64_t ldb, int64_t ldb_tmp, int64_t strideBs)
         {
             // Dequant: (w - z) * s -> bf16
@@ -171,11 +134,11 @@ namespace bitsandbytes_cpu
         };
 
         template <int BLOCK_M, int BLOCK_N, int DATA_TYPE>
-        struct tinygemm_kernel_nn<bf16_t, BLOCK_M, BLOCK_N, DATA_TYPE>
+        struct tinygemm_kernel_nn<at::BFloat16, BLOCK_M, BLOCK_N, DATA_TYPE>
         {
             static inline void apply(
-                const bf16_t *__restrict__ A, const unsigned char *__restrict__ B, bf16_t *__restrict__ C,
-                const bf16_t *__restrict__ Bs, int64_t K, int blocksize, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBs)
+                const at::BFloat16 *__restrict__ A, const unsigned char *__restrict__ B, at::BFloat16 *__restrict__ C,
+                const at::BFloat16 *__restrict__ Bs, int64_t K, int blocksize, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBs)
             {
                 static_assert(BLOCK_N % 32 == 0);
                 constexpr int ROWS = BLOCK_M;      // 32
@@ -307,55 +270,42 @@ namespace bitsandbytes_cpu
             return hi;
         }
 
+        template <typename scalar_t, typename std::enable_if_t<at::vec::is_reduced_floating_point_v<scalar_t>, int> = 0>
+        inline at::vec::Vectorized<scalar_t> convert_from_float_ext(const at::vec::Vectorized<float>& a, const at::vec::Vectorized<float>& b) {
+            return at::vec::convert_from_float<scalar_t>(a, b);
+        }
+
+        template <>
+        inline at::vec::Vectorized<at::BFloat16>
+        convert_from_float_ext<at::BFloat16>(const at::vec::Vectorized<float>& a, const at::vec::Vectorized<float>& b) {
+            return (__m512i)(_mm512_cvtne2ps_pbh(__m512(b), __m512(a)));
+        }
+
         template <typename scalar_t>
-        inline void copy_stub(scalar_t *__restrict__ out, const float *__restrict__ input, int64_t size)
-        {
-            if (has_avx512bf16())
-            {
-                int64_t d = 0;
-                const int V = 32;
-                for (; d + V <= size; d += V)
-                {
-                    __m512 lo = _mm512_loadu_ps(input + d);
-                    __m512 hi = _mm512_loadu_ps(input + d + 16);
-                    __m512bh packed = _mm512_cvtne2ps_pbh(hi, lo);
-                    _mm512_storeu_si512(reinterpret_cast<void *>(out + d), (__m512i)packed);
-                }
-                for (; d < size; ++d)
-                {
-                    if constexpr (std::is_same_v<scalar_t, bf16_t>)
-                    {
-                        // store raw bf16 bits
-                        reinterpret_cast<uint16_t *>(out)[d] = float_to_bf16_round(input[d]);
-                    }
-                    else
-                    {
-                        out[d] = static_cast<scalar_t>(input[d]);
-                    }
-                }
+        inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
+            using bVec = at::vec::Vectorized<scalar_t>;
+            using fVec = at::vec::Vectorized<float>;
+            constexpr int kVecSize = bVec::size();
+
+            int64_t d;
+            #pragma GCC unroll 4
+            for (d = 0; d <= size - kVecSize; d += kVecSize) {
+                fVec data0 = fVec::loadu(input + d);
+                fVec data1 = fVec::loadu(input + d + fVec::size());
+                bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
+                out_vec.store(out + d);
             }
-            else
-            {
-                for (int64_t d = 0; d < size; ++d)
-                {
-                    if constexpr (std::is_same_v<scalar_t, bf16_t>)
-                    {
-                        reinterpret_cast<uint16_t *>(out)[d] = float_to_bf16_round(input[d]);
-                    }
-                    else
-                    {
-                        out[d] = static_cast<scalar_t>(input[d]);
-                    }
-                }
+            for (; d < size; ++d) {
+                out[d] = static_cast<scalar_t>(input[d]);
             }
         }
 
         template <int DATA_TYPE>
-        struct brgemm<bf16_t, DATA_TYPE>
+        struct brgemm<at::BFloat16, DATA_TYPE>
         {
             static inline void apply(
-                const bf16_t *__restrict__ A, const unsigned char *__restrict__ B, bf16_t *__restrict__ C,
-                const bf16_t *__restrict__ Bs, bf16_t *__restrict__ Btmp, float *__restrict__ Ctmp, int64_t M, int64_t N,
+                const at::BFloat16 *__restrict__ A, const unsigned char *__restrict__ B, at::BFloat16 *__restrict__ C,
+                const at::BFloat16 *__restrict__ Bs, at::BFloat16 *__restrict__ Btmp, float *__restrict__ Ctmp, int64_t M, int64_t N,
                 int64_t K, int blocksize, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBs, bool use_brgemm_dequant_out)
             {
                 constexpr int BLOCK_N = block_size_n();
@@ -363,7 +313,7 @@ namespace bitsandbytes_cpu
                 if (use_brgemm_dequant_out)
                 {
                     at::native::cpublas::brgemm(
-                        M, N, K, lda, ldb_tmp, BLOCK_N, false, cast_at_bf16(A), cast_at_bf16(Btmp), Ctmp);
+                        M, N, K, lda, ldb_tmp, BLOCK_N, false, A, Btmp, Ctmp);
                 }
                 else
                 {
@@ -377,14 +327,14 @@ namespace bitsandbytes_cpu
 
                         const bool add_C = k != 0;
                         at::native::cpublas::brgemm(
-                            M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, cast_at_bf16(A + k), cast_at_bf16(Btmp), Ctmp);
+                            M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, A + k, Btmp, Ctmp);
                     }
                 }
 
                 // copy from Ctmp to C
                 for (int64_t m = 0; m < M; ++m)
                 {
-                    copy_stub<bf16_t>(C + m * ldc, Ctmp + m * BLOCK_N, N);
+                    copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
                 }
             }
         };
@@ -539,11 +489,11 @@ namespace bitsandbytes_cpu
         //                   TEMPLATE DEFINITIONS
         //==============================================================
 
-        template void gemm_4bit_inference<bf16_t, FP4>(
-            int64_t M, int64_t N, int64_t K, const bf16_t *__restrict__ x, const unsigned char *__restrict__ w,
-            const bf16_t *__restrict__ absmax, bf16_t *__restrict__ out, int64_t blocksize, int64_t x_stride, int64_t out_stride);
-        template void gemm_4bit_inference<bf16_t, NF4>(
-            int64_t M, int64_t N, int64_t K, const bf16_t *__restrict__ x, const unsigned char *__restrict__ w,
-            const bf16_t *__restrict__ absmax, bf16_t *__restrict__ out, int64_t blocksize, int64_t x_stride, int64_t out_stride);
+        template void gemm_4bit_inference<at::BFloat16, FP4>(
+            int64_t M, int64_t N, int64_t K, const at::BFloat16 *__restrict__ x, const unsigned char *__restrict__ w,
+            const at::BFloat16 *__restrict__ absmax, at::BFloat16 *__restrict__ out, int64_t blocksize, int64_t x_stride, int64_t out_stride);
+        template void gemm_4bit_inference<at::BFloat16, NF4>(
+            int64_t M, int64_t N, int64_t K, const at::BFloat16 *__restrict__ x, const unsigned char *__restrict__ w,
+            const at::BFloat16 *__restrict__ absmax, at::BFloat16 *__restrict__ out, int64_t blocksize, int64_t x_stride, int64_t out_stride);
     } // namespace avx512
 } // namespace bitsandbytes_cpu

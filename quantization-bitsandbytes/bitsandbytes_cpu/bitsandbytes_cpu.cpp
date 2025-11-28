@@ -1,6 +1,5 @@
 #include "bitsandbytes_cpu.hpp"
 
-using bf16_t = bitsandbytes_cpu::avx512::bf16_t;
 using bitsandbytes_cpu::avx512::DataType_t;
 
 namespace bitsandbytes_cpu
@@ -21,21 +20,21 @@ namespace bitsandbytes_cpu
         {
             // Use AVX512 optimized implementation
             if (quant_type == 1) {
-                bitsandbytes_cpu::avx512::gemm_4bit_inference<bf16_t, DataType_t::FP4>(
+                bitsandbytes_cpu::avx512::gemm_4bit_inference<at::BFloat16, DataType_t::FP4>(
                     M, N, K,
-                    reinterpret_cast<const bf16_t*>(input.data_ptr<at::BFloat16>()),
+                    input.data_ptr<at::BFloat16>(),
                     weight.data_ptr<unsigned char>(),
-                    reinterpret_cast<const bf16_t*>(absmax.data_ptr<at::BFloat16>()),
-                    reinterpret_cast<bf16_t*>(out.data_ptr<at::BFloat16>()),
+                    absmax.data_ptr<at::BFloat16>(),
+                    out.data_ptr<at::BFloat16>(),
                     blocksize, x_strideM, out_strideM);
             }
             else {
-                bitsandbytes_cpu::avx512::gemm_4bit_inference<bf16_t, DataType_t::NF4>(
+                bitsandbytes_cpu::avx512::gemm_4bit_inference<at::BFloat16, DataType_t::NF4>(
                     M, N, K,
-                    reinterpret_cast<const bf16_t*>(input.data_ptr<at::BFloat16>()),
+                    input.data_ptr<at::BFloat16>(),
                     weight.data_ptr<unsigned char>(),
-                    reinterpret_cast<const bf16_t*>(absmax.data_ptr<at::BFloat16>()),
-                    reinterpret_cast<bf16_t*>(out.data_ptr<at::BFloat16>()),
+                    absmax.data_ptr<at::BFloat16>(),
+                    out.data_ptr<at::BFloat16>(),
                     blocksize, x_strideM, out_strideM);
             }
         }
