@@ -24,4 +24,4 @@ src = [
     "bitsandbytes_cpu/bitsandbytes_avx512.hpp",
 ]
 include = ["bitsandbytes_cpu"]
-cxx-flags = ["-mfma", "-fopenmp", "-mf16c", "-mavx512f", "-mavx512bf16", "-mavx512vl", "-mavx512dq", "-mavx512bw"]
+cxx-flags = ["-mfma", "-fopenmp", "-mf16c", "-mavx512f", "-mavx512bf16", "-mavx512vl", "-mavx512dq", "-mavx512bw", "-mavx512vbmi"]

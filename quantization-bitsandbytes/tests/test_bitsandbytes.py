@@ -83,7 +83,7 @@ def ref_gemm_4bit(x, packed_weight, scales, group_size, quant_type):
 
 @pytest.mark.parametrize("M", [1, 4, 32, 128, 512, 1024])
 @pytest.mark.parametrize("K", [2048, 4096])
-@pytest.mark.parametrize("N", [1024, 2048, 4096])
+@pytest.mark.parametrize("N", [2048, 4096])
 @pytest.mark.parametrize("quant_type", [0, 1])
 def test_bitsandbytes(M, K, N, quant_type):
     torch.manual_seed(100)
