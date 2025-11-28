@@ -4,6 +4,7 @@
 #include <ATen/native/CPUBlas.h>
 #include <ATen/cpu/vec/vec.h>
 #include <ATen/cpu/vec/functional.h>
+#include <c10/core/ScalarType.h>
 #include <bitsandbytes_avx512.hpp>
 #include <thread>
 #include <omp.h>
@@ -422,7 +423,7 @@ namespace bitsandbytes_cpu
             if (use_brgemm_dequant_out)
             {
                 // Layout: contiguous [N*K] elements, 64-byte aligned for AVX512 loads
-                at::Tensor Btmp_t = at::zeros({N, K}, c10::CppTypeToScalarType<scalar_t>::value);
+                at::Tensor Btmp_t = at::zeros({N, K}, c10::CppTypeToScalarType<T>::value);
                 Btmp_start = Btmp_t.data_ptr<T>();
                 for (int64_t nb = 0; nb < NB; ++nb)
                 {
