@@ -425,6 +425,7 @@ namespace bitsandbytes_cpu
                 // Layout: contiguous [N*K] elements, 64-byte aligned for AVX512 loads
                 at::Tensor Btmp_t = at::zeros({N, K}, c10::CppTypeToScalarType<T>::value);
                 Btmp_start = Btmp_t.data_ptr<T>();
+#pragma omp parallel for
                 for (int64_t nb = 0; nb < NB; ++nb)
                 {
                     int64_t nb_start = nb * BLOCK_N;
