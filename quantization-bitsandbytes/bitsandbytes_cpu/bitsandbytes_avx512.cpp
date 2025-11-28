@@ -422,10 +422,8 @@ namespace bitsandbytes_cpu
             if (use_brgemm_dequant_out)
             {
                 // Layout: contiguous [N*K] elements, 64-byte aligned for AVX512 loads
-                at::Tensor Btmp_t = at::zeros({N, K}, at::dtype(at::kBFloat16));
-                at::BFloat16 *Btmp_start_pt = Btmp_t.data_ptr<at::BFloat16>();
-                Btmp_start = reinterpret_cast<T *>(Btmp_start_pt);
-#pragma omp parallel for
+                at::Tensor Btmp_t = at::zeros({N, K}, c10::CppTypeToScalarType<scalar_t>::value);
+                Btmp_start = Btmp_t.data_ptr<T>();
                 for (int64_t nb = 0; nb < NB; ++nb)
                 {
                     int64_t nb_start = nb * BLOCK_N;
