@@ -418,12 +418,13 @@ namespace bitsandbytes_cpu
             const int64_t NB = div_up(N, BLOCK_N);
             // TODO: Find better threshold.
             T *Btmp_start = nullptr;
+            at::Tensor Btmp_t;
             const bool use_brgemm = M > 4;
             const bool use_brgemm_dequant_out = M > 100;
             if (use_brgemm_dequant_out)
             {
                 // Layout: contiguous [N*K] elements, 64-byte aligned for AVX512 loads
-                at::Tensor Btmp_t = at::zeros({N, K}, c10::CppTypeToScalarType<T>::value);
+                Btmp_t = at::zeros({N, K}, c10::CppTypeToScalarType<T>::value);
                 Btmp_start = Btmp_t.data_ptr<T>();
 #pragma omp parallel for
                 for (int64_t nb = 0; nb < NB; ++nb)

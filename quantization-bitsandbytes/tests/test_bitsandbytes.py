@@ -81,12 +81,11 @@ def ref_gemm_4bit(x, packed_weight, scales, group_size, quant_type):
     res = torch.matmul(x, original_weight.T.to(x.dtype))
     return res
 
-@pytest.mark.parametrize("M", [1, 4, 32, 128, 512, 1024])
-@pytest.mark.parametrize("K", [2048, 4096])
-@pytest.mark.parametrize("N", [2048, 4096])
+@pytest.mark.parametrize("M", [1, 4, 32, 97, 128, 244, 512, 1024, 1666])
+@pytest.mark.parametrize("K", [2048, 4096, 14336])
+@pytest.mark.parametrize("N", [1024, 2048, 4096, 7168])
 @pytest.mark.parametrize("quant_type", [0, 1])
 def test_bitsandbytes(M, K, N, quant_type):
-    torch.manual_seed(100)
     device = torch.device("cpu")
     dtype = torch.bfloat16
     group_size = 64
