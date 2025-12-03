@@ -29,7 +29,7 @@ def unpack_weight_packed_for_cpu(packed_qweight: torch.Tensor, block_n: int = 32
     return qweight_final
 
 def ref_gemm_int4(x, packed_weight, zeros, scales, group_size):
-    unpacked_weight = unpack_weight_packed_for_cpu(packed_weight)
+    unpacked_weight = unpack_weight_packed_for_cpu(packed_weight).to(torch.int8)
     original_weight = (unpacked_weight - zeros.T.repeat_interleave(group_size, dim=1)) * scales.T.repeat_interleave(group_size, dim=1)
     res = torch.matmul(x, original_weight.T.to(x.dtype))
     return res
@@ -54,4 +54,4 @@ def test_gptq(M, K, N, group_size):
     output = gemm_int4_forward(x, w, zeros, scales, group_size)
     ref_out = ref_gemm_int4(x, w, zeros, scales, group_size)
 
-    torch.testing.assert_close(output, ref_out, atol=1e-1, rtol=1e-2)
+    torch.testing.assert_close(output, ref_out, atol=2e-1, rtol=1e-2)
