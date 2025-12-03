@@ -1,6 +1,5 @@
 #include "gptq_cpu.hpp"
 
-using gptq_cpu::avx512::DataType_t;
 
 namespace gptq_cpu
 {
