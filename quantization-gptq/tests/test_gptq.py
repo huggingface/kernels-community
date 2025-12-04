@@ -3,33 +3,20 @@ import pytest
 
 from quantization_gptq import gemm_int4_forward
 
-def unpack_weight_packed_for_cpu(packed_qweight: torch.Tensor, block_n: int = 32):
-    """
-    Inverse of convert_weight_packed_for_cpu.
-    packed_qweight: (N, K//2) uint8, each byte = (high<<4)|low, both 4-bit values in 0..15
-    returns: qweight_final (N, K) uint8 with original 4-bit values (0..15)
-    """
-    assert packed_qweight.dtype == torch.uint8
-    assert packed_qweight.dim() == 2
-    N, K_half = packed_qweight.shape
-    assert N % block_n == 0
-    BIT_COUNT = block_n  # 32
-    # reshape to rows of 32 packed bytes
-    qw = packed_qweight.reshape(-1, BIT_COUNT)           # [(N//block_n)*K_half, 32]
-    low  = (qw & 0x0F)
-    high = (qw >> 4) & 0x0F
-    # restore 64 nibbles (low first then high, matching original pack order)
-    restored = torch.cat([low, high], dim=1)             # [..., 64]
-    # reshape back (inverse of flatten)
-    restored = restored.reshape(N // block_n, K_half, block_n, 2)  # [N/block_n, K//2, block_n, 2]
-    # inverse transpose
-    restored = restored.transpose(-3, -2)                # [N/block_n, block_n, K//2, 2]
-    # final shape
-    qweight_final = restored.reshape(N, K_half * 2).to(torch.uint8)
-    return qweight_final
 
 def ref_gemm_int4(x, packed_weight, zeros, scales, group_size):
-    unpacked_weight = unpack_weight_packed_for_cpu(packed_weight).to(torch.int8)
+    block_n = 32
+    assert packed_weight.dtype == torch.uint8
+    assert packed_weight.dim() == 2
+    N, K_half = packed_weight.shape
+    assert N % block_n == 0
+    qw = packed_weight.reshape(-1, block_n)
+    low  = (qw & 0x0F)
+    high = (qw >> 4) & 0x0F
+    restored = torch.cat([low, high], dim=1)
+    restored = restored.reshape(N // block_n, K_half, block_n, 2)
+    restored = restored.transpose(-3, -2)
+    unpacked_weight = restored.reshape(N, K_half * 2).to(torch.int8)
     original_weight = (unpacked_weight - zeros.T.repeat_interleave(group_size, dim=1)) * scales.T.repeat_interleave(group_size, dim=1)
     res = torch.matmul(x, original_weight.T.to(x.dtype))
     return res
