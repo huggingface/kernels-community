@@ -2,79 +2,38 @@ import torch
 import pytest
 
 from quantization_bitsandbytes import gemm_4bit_forward
-
-def unpack_weight_packed_for_cpu(packed_qweight: torch.Tensor, block_n: int = 32):
-    """
-    Inverse of convert_weight_packed_for_cpu.
-    packed_qweight: (N, K//2) uint8, each byte = (high<<4)|low, both 4-bit values in 0..15
-    returns: qweight_final (N, K) uint8 with original 4-bit values (0..15)
-    """
-    assert packed_qweight.dtype == torch.uint8
-    assert packed_qweight.dim() == 2
-    N, K_half = packed_qweight.shape
-    assert N % block_n == 0
-    BIT_COUNT = block_n  # 32
-    # reshape to rows of 32 packed bytes
-    qw = packed_qweight.reshape(-1, BIT_COUNT)           # [(N//block_n)*K_half, 32]
-    low  = (qw & 0x0F)
-    high = (qw >> 4) & 0x0F
-    # restore 64 nibbles (low first then high, matching original pack order)
-    restored = torch.cat([low, high], dim=1)             # [..., 64]
-    # reshape back (inverse of flatten)
-    restored = restored.reshape(N // block_n, K_half, block_n, 2)  # [N/block_n, K//2, block_n, 2]
-    # inverse transpose
-    restored = restored.transpose(-3, -2)                # [N/block_n, block_n, K//2, 2]
-    # final shape
-    qweight_final = restored.reshape(N, K_half * 2).to(torch.uint8)
-    return qweight_final
  
  
 _NF4_QUANT_TABLE = torch.tensor(
     [
-        -1.0,
-        -0.6961928009986877,
-        -0.5250730514526367,
-        -0.39491748809814453,
-        -0.28444138169288635,
-        -0.18477343022823334,
-        -0.09105003625154495,
-        0.0,
-        0.07958029955625534,
-        0.16093020141124725,
-        0.24611230194568634,
-        0.33791524171829224,
-        0.44070982933044434,
-        0.5626170039176941,
-        0.7229568362236023,
-        1.0,
+        -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453, -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+        0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224, 0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0,
     ],
     dtype=torch.float32,
 )
 
 _FP4_QUANT_TABLE = torch.tensor(
     [
-        0.0000,
-        0.0052,
-        0.6667,
-        1.0000,
-        0.3333,
-        0.5000,
-        0.1667,
-        0.2500,
-        0.0000,
-        -0.0052,
-        -0.6667,
-        -1.0000,
-        -0.3333,
-        -0.5000,
-        -0.1667,
-        -0.2500,
+        0.0000, 0.0052, 0.6667, 1.0000, 0.3333, 0.5000, 0.1667, 0.2500,
+        0.0000, -0.0052, -0.6667, -1.0000, -0.3333, -0.5000, -0.1667, -0.2500,
     ],
     dtype=torch.float32,
 )
 
 def ref_gemm_4bit(x, packed_weight, scales, group_size, quant_type):
-    unpacked_weight = unpack_weight_packed_for_cpu(packed_weight)
+    assert packed_weight.dtype == torch.uint8
+    assert packed_weight.dim() == 2
+    block_n = 32
+    N, K_half = packed_weight.shape
+    assert N % block_n == 0
+    BIT_COUNT = block_n
+    qw = packed_weight.reshape(-1, BIT_COUNT)
+    low  = (qw & 0x0F)
+    high = (qw >> 4) & 0x0F
+    restored = torch.cat([low, high], dim=1)
+    restored = restored.reshape(N // block_n, K_half, block_n, 2)
+    restored = restored.transpose(-3, -2)
+    unpacked_weight = restored.reshape(N, K_half * 2).to(torch.uint8)
     shape = unpacked_weight.shape
     table = _FP4_QUANT_TABLE if quant_type == 1 else _NF4_QUANT_TABLE
     original_weight = table[unpacked_weight.reshape(-1).int()].reshape(shape) * scales.T.repeat_interleave(group_size, dim=1)
