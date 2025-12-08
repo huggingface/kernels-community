@@ -1,5 +1,4 @@
 ---
-library_name: kernel-community
 tags:
 - kernel
 ---
