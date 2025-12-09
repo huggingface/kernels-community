@@ -85,6 +85,8 @@ __device__ __forceinline__ T gelu_tanh_kernel(const T& x) {
 void silu_and_mul(torch::Tensor& out,    // [..., d]
                   torch::Tensor& input)  // [..., 2 * d]
 {
+  TORCH_CHECK(input.is_contiguous());
+  TORCH_CHECK(out.is_contiguous());
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, true);
 }
 
@@ -93,18 +95,24 @@ void mul_and_silu(torch::Tensor& out,    // [..., d]
 {
   // The difference between mul_and_silu and silu_and_mul is that mul_and_silu
   // applies the silu to the latter half of the input.
+  TORCH_CHECK(input.is_contiguous());
+  TORCH_CHECK(out.is_contiguous());
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, false);
 }
 
 void gelu_and_mul(torch::Tensor& out,    // [..., d]
                   torch::Tensor& input)  // [..., 2 * d]
 {
+  TORCH_CHECK(input.is_contiguous());
+  TORCH_CHECK(out.is_contiguous());
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_kernel, true);
 }
 
 void gelu_tanh_and_mul(torch::Tensor& out,    // [..., d]
                        torch::Tensor& input)  // [..., 2 * d]
 {
+  TORCH_CHECK(input.is_contiguous());
+  TORCH_CHECK(out.is_contiguous());
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_tanh_kernel, true);
 }
 
@@ -148,6 +156,8 @@ __global__ void act_and_mul_kernel_with_param(
 void fatrelu_and_mul(torch::Tensor& out,    // [..., d],
                      torch::Tensor& input,  // [..., 2 * d]
                      double threshold) {
+  TORCH_CHECK(input.is_contiguous());
+  TORCH_CHECK(out.is_contiguous());
   LAUNCH_ACTIVATION_GATE_KERNEL_WITH_PARAM(vllm::fatrelu_kernel, threshold);
 }
 namespace vllm {
@@ -210,35 +220,47 @@ __device__ __forceinline__ T gelu_quick_kernel(const T& x) {
 void gelu_new(torch::Tensor& out,    // [..., d]
               torch::Tensor& input)  // [..., d]
 {
+  TORCH_CHECK(input.is_contiguous());
+  TORCH_CHECK(out.is_contiguous());
   LAUNCH_ACTIVATION_KERNEL(vllm::gelu_new_kernel);
 }
 
 void gelu_fast(torch::Tensor& out,    // [..., d]
                torch::Tensor& input)  // [..., d]
 {
+  TORCH_CHECK(input.is_contiguous());
+  TORCH_CHECK(out.is_contiguous());
   LAUNCH_ACTIVATION_KERNEL(vllm::gelu_fast_kernel);
 }
 
 void gelu_quick(torch::Tensor& out,    // [..., d]
                 torch::Tensor& input)  // [..., d]
 {
+  TORCH_CHECK(input.is_contiguous());
+  TORCH_CHECK(out.is_contiguous());
   LAUNCH_ACTIVATION_KERNEL(vllm::gelu_quick_kernel);
 }
 
 void gelu(torch::Tensor& out,    // [..., d]
           torch::Tensor& input)  // [..., d]
 {
+  TORCH_CHECK(input.is_contiguous());
+  TORCH_CHECK(out.is_contiguous());
   LAUNCH_ACTIVATION_KERNEL(vllm::gelu_kernel);
 }
 
 void gelu_tanh(torch::Tensor& out,    // [..., d]
                torch::Tensor& input)  // [..., d]
 {
+  TORCH_CHECK(input.is_contiguous());
+  TORCH_CHECK(out.is_contiguous());
   LAUNCH_ACTIVATION_KERNEL(vllm::gelu_tanh_kernel);
 }
 
 void silu(torch::Tensor& out,    // [..., d]
           torch::Tensor& input)  // [..., d]
 {
+  TORCH_CHECK(input.is_contiguous());
+  TORCH_CHECK(out.is_contiguous());
   LAUNCH_ACTIVATION_KERNEL(vllm::silu_kernel);
 }
