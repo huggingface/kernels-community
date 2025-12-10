@@ -13,12 +13,12 @@ except ImportError:
     causal_conv1d_fn = None
 
 try:
-    from ..ops.triton.layernorm_gated import RMSNorm as RMSNormGated, LayerNorm
+    from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated, LayerNorm
 except ImportError:
     RMSNormGated, LayerNorm = None, None
 
-from ..ops.triton.ssd_combined import mamba_chunk_scan_combined
-from ..ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
 
 class Mamba2Simple(nn.Module):
@@ -85,17 +85,14 @@ class Mamba2Simple(nn.Module):
         # self.conv1d.weight._no_weight_decay = True
 
         if self.learnable_init_states:
-            self.init_states = nn.Parameter(
-                torch.zeros(self.nheads, self.headdim, self.d_state, **factory_kwargs)
-            )
+            self.init_states = nn.Parameter(torch.zeros(self.nheads, self.headdim, self.d_state, **factory_kwargs))
             self.init_states._no_weight_decay = True
 
         self.act = nn.SiLU()
 
         # Initialize log dt bias
         dt = torch.exp(
-            torch.rand(self.nheads, **factory_kwargs)
-            * (math.log(dt_max) - math.log(dt_min))
+            torch.rand(self.nheads, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         )
         dt = torch.clamp(dt, min=dt_init_floor)
@@ -108,9 +105,7 @@ class Mamba2Simple(nn.Module):
 
         # A parameter
         assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
-        A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(
-            *A_init_range
-        )
+        A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(*A_init_range)
         A_log = torch.log(A).to(dtype=dtype)
         self.A_log = nn.Parameter(A_log)
         # self.register_buffer("A_log", torch.zeros(self.nheads, dtype=torch.float32, device=device), persistent=True)
@@ -122,13 +117,9 @@ class Mamba2Simple(nn.Module):
 
         # Extra normalization layer right before output projection
         assert RMSNormGated is not None
-        self.norm = RMSNormGated(
-            self.d_inner, eps=1e-5, norm_before_gate=False, **factory_kwargs
-        )
+        self.norm = RMSNormGated(self.d_inner, eps=1e-5, norm_before_gate=False, **factory_kwargs)
 
-        self.out_proj = nn.Linear(
-            self.d_inner, self.d_model, bias=bias, **factory_kwargs
-        )
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
     def forward(self, u, seq_idx=None):
         """
@@ -139,14 +130,8 @@ class Mamba2Simple(nn.Module):
 
         zxbcdt = self.in_proj(u)  # (B, L, d_in_proj)
         A = -torch.exp(self.A_log)  # (nheads) or (d_inner, d_state)
-        initial_states = (
-            repeat(self.init_states, "... -> b ...", b=batch)
-            if self.learnable_init_states
-            else None
-        )
-        dt_limit_kwargs = (
-            {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
-        )
+        initial_states=repeat(self.init_states, "... -> b ...", b=batch) if self.learnable_init_states else None
+        dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
 
         if self.use_mem_eff_path:
             # Fully fused path
@@ -172,13 +157,7 @@ class Mamba2Simple(nn.Module):
             )
         else:
             z, xBC, dt = torch.split(
-                zxbcdt,
-                [
-                    self.d_inner,
-                    self.d_inner + 2 * self.ngroups * self.d_state,
-                    self.nheads,
-                ],
-                dim=-1,
+                zxbcdt, [self.d_inner, self.d_inner + 2 * self.ngroups * self.d_state, self.nheads], dim=-1
             )
             dt = F.softplus(dt + self.dt_bias)  # (B, L, nheads)
             assert self.activation in ["silu", "swish"]
@@ -199,15 +178,7 @@ class Mamba2Simple(nn.Module):
 
             # Split into 3 main branches: X, B, C
             # These correspond to V, K, Q respectively in the SSM/attention duality
-            x, B, C = torch.split(
-                xBC,
-                [
-                    self.d_inner,
-                    self.ngroups * self.d_state,
-                    self.ngroups * self.d_state,
-                ],
-                dim=-1,
-            )
+            x, B, C = torch.split(xBC, [self.d_inner, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
             y = mamba_chunk_scan_combined(
                 rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
                 dt,

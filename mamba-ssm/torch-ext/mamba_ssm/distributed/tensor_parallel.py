@@ -7,11 +7,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.distributed import ProcessGroup
-from ..utils.torch import custom_bwd, custom_fwd
+from mamba_ssm.utils.torch import custom_bwd, custom_fwd
 
 from einops import rearrange
 
-from ..distributed.distributed_utils import (
+from mamba_ssm.distributed.distributed_utils import (
     all_gather_raw,
     all_reduce,
     all_reduce_raw,

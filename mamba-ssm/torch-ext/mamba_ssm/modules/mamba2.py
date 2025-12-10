@@ -19,17 +19,17 @@ except ImportError:
     causal_conv1d_varlen_states = None
 
 try:
-    from ..ops.triton.selective_state_update import selective_state_update
+    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
 except ImportError:
     selective_state_update = None
 
-from ..ops.triton.layernorm_gated import RMSNorm as RMSNormGated
+from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
-from ..distributed.tensor_parallel import ColumnParallelLinear, RowParallelLinear
-from ..distributed.distributed_utils import all_reduce, reduce_scatter
+from mamba_ssm.distributed.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+from mamba_ssm.distributed.distributed_utils import all_reduce, reduce_scatter
 
-from ..ops.triton.ssd_combined import mamba_chunk_scan_combined
-from ..ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
 from huggingface_hub import PyTorchModelHubMixin
 
@@ -95,18 +95,11 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         # Order: [z, x, B, C, dt]
         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
         if self.process_group is None:
-            self.in_proj = nn.Linear(
-                self.d_model, d_in_proj, bias=bias, **factory_kwargs
-            )
+            self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=bias, **factory_kwargs)
         else:
-            self.in_proj = ColumnParallelLinear(
-                self.d_model,
-                d_in_proj * self.world_size,
-                bias=bias,
-                process_group=self.process_group,
-                sequence_parallel=self.sequence_parallel,
-                **factory_kwargs,
-            )
+            self.in_proj = ColumnParallelLinear(self.d_model, d_in_proj * self.world_size, bias=bias,
+                                                process_group=self.process_group, sequence_parallel=self.sequence_parallel,
+                                                **factory_kwargs)
 
         conv_dim = self.d_ssm + 2 * self.ngroups * self.d_state
         self.conv1d = nn.Conv1d(
@@ -125,8 +118,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 
         # Initialize log dt bias
         dt = torch.exp(
-            torch.rand(self.nheads, **factory_kwargs)
-            * (math.log(dt_max) - math.log(dt_min))
+            torch.rand(self.nheads, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         )
         dt = torch.clamp(dt, min=dt_init_floor)
@@ -138,46 +130,28 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.dt_bias._no_weight_decay = True
 
         assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
-        A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(
-            *A_init_range
-        )
+        A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(*A_init_range)
         A_log = torch.log(A).to(dtype=dtype)
         self.A_log = nn.Parameter(A_log)
         self.A_log._no_weight_decay = True
 
         # D "skip" parameter
-        self.D = nn.Parameter(
-            torch.ones(self.d_ssm if self.D_has_hdim else self.nheads, device=device)
-        )
+        self.D = nn.Parameter(torch.ones(self.d_ssm if self.D_has_hdim else self.nheads, device=device))
         self.D._no_weight_decay = True
 
         if self.rmsnorm:
             assert RMSNormGated is not None
-            self.norm = RMSNormGated(
-                self.d_ssm,
-                eps=1e-5,
-                norm_before_gate=self.norm_before_gate,
-                group_size=self.d_ssm // ngroups,
-                **factory_kwargs,
-            )
+            self.norm = RMSNormGated(self.d_ssm, eps=1e-5, norm_before_gate=self.norm_before_gate,
+                                     group_size=self.d_ssm // ngroups, **factory_kwargs)
 
         if self.process_group is None:
-            self.out_proj = nn.Linear(
-                self.d_inner, self.d_model, bias=bias, **factory_kwargs
-            )
+            self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         else:
-            self.out_proj = RowParallelLinear(
-                self.d_inner * self.world_size,
-                self.d_model,
-                bias=bias,
-                process_group=self.process_group,
-                sequence_parallel=self.sequence_parallel,
-                **factory_kwargs,
-            )
+            self.out_proj = RowParallelLinear(self.d_inner * self.world_size, self.d_model, bias=bias,
+                                              process_group=self.process_group, sequence_parallel=self.sequence_parallel,
+                                              **factory_kwargs)
 
-    def forward(
-        self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None
-    ):
+    def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
         """
         u: (batch, seqlen, hidden_dim) if seqlen=None.
             If seqlen is not None, u is (batch * seqlen, hidden_dim). This is so that when we
@@ -194,12 +168,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 
         conv_state, ssm_state = None, None
         if inference_params is not None:
-            inference_batch = (
-                cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch
-            )
-            conv_state, ssm_state = self._get_states_from_cache(
-                inference_params, inference_batch
-            )
+            inference_batch = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else batch
+            conv_state, ssm_state = self._get_states_from_cache(inference_params, inference_batch)
             if inference_params.seqlen_offset > 0:
                 # The states are updated inplace
                 out, _, _ = self.step(u, conv_state, ssm_state)
@@ -210,9 +180,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         A = -torch.exp(self.A_log.float())  # (nheads) or (d_inner, d_state)
-        dt_limit_kwargs = (
-            {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
-        )
+        dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
         if self.use_mem_eff_path and inference_params is None:
             out = mamba_split_conv1d_scan_combined(
                 zxbcdt,
@@ -220,11 +188,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 self.conv1d.bias,
                 self.dt_bias,
                 A,
-                D=(
-                    rearrange(self.D, "(h p) -> h p", p=self.headdim)
-                    if self.D_has_hdim
-                    else self.D
-                ),
+                D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
                 chunk_size=self.chunk_size,
                 seq_idx=seq_idx,
                 activation=self.activation,
@@ -243,51 +207,30 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
                 out = reduce_fn(out, self.process_group)
         else:
-            d_mlp = (
-                zxbcdt.shape[-1]
-                - 2 * self.d_ssm
-                - 2 * self.ngroups * self.d_state
-                - self.nheads
-            ) // 2
+            d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
             z0, x0, z, xBC, dt = torch.split(
                 zxbcdt,
-                [
-                    d_mlp,
-                    d_mlp,
-                    self.d_ssm,
-                    self.d_ssm + 2 * self.ngroups * self.d_state,
-                    self.nheads,
-                ],
-                dim=-1,
+                [d_mlp, d_mlp, self.d_ssm, self.d_ssm + 2 * self.ngroups * self.d_state, self.nheads],
+                dim=-1
             )
             if conv_state is not None:
                 if cu_seqlens is None:
                     # If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
                     # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
                     xBC_t = rearrange(xBC, "b l d -> b d l")
-                    conv_state.copy_(
-                        F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0))
-                    )  # Update state (B D W)
+                    conv_state.copy_(F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0)))  # Update state (B D W)
                 else:
-                    assert (
-                        causal_conv1d_varlen_states is not None
-                    ), "varlen inference requires causal_conv1d package"
-                    assert (
-                        batch == 1
-                    ), "varlen inference only supports batch dimension 1"
+                    assert causal_conv1d_varlen_states is not None, "varlen inference requires causal_conv1d package"
+                    assert batch == 1, "varlen inference only supports batch dimension 1"
                     conv_varlen_states = causal_conv1d_varlen_states(
                         xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
                     )
                     conv_state.copy_(conv_varlen_states)
             assert self.activation in ["silu", "swish"]
             if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
-                assert (
-                    seq_idx is None
-                ), "varlen conv1d requires the causal_conv1d package"
+                assert seq_idx is None, "varlen conv1d requires the causal_conv1d package"
                 xBC = self.act(
-                    self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[
-                        :, : -(self.d_conv - 1)
-                    ]
+                    self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :-(self.d_conv - 1)]
                 )  # (B, L, self.d_ssm + 2 * ngroups * d_state)
             else:
                 xBC = causal_conv1d_fn(
@@ -297,11 +240,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                     activation=self.activation,
                     seq_idx=seq_idx,
                 ).transpose(1, 2)
-            x, B, C = torch.split(
-                xBC,
-                [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state],
-                dim=-1,
-            )
+            x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
             y = mamba_chunk_scan_combined(
                 rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
                 dt,
@@ -309,24 +248,15 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
                 rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
                 chunk_size=self.chunk_size,
-                D=(
-                    rearrange(self.D, "(h p) -> h p", p=self.headdim)
-                    if self.D_has_hdim
-                    else self.D
-                ),
-                z=(
-                    rearrange(z, "b l (h p) -> b l h p", p=self.headdim)
-                    if not self.rmsnorm
-                    else None
-                ),
+                D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+                z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
                 dt_bias=self.dt_bias,
                 dt_softplus=True,
                 seq_idx=seq_idx,
                 cu_seqlens=cu_seqlens,
                 **dt_limit_kwargs,
                 return_final_states=ssm_state is not None,
-                return_varlen_states=cu_seqlens is not None
-                and inference_params is not None,
+                return_varlen_states=cu_seqlens is not None and inference_params is not None,
             )
             if ssm_state is not None:
                 y, last_state, *rest = y
@@ -347,37 +277,20 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 
     def step(self, hidden_states, conv_state, ssm_state):
         dtype = hidden_states.dtype
-        assert (
-            hidden_states.shape[1] == 1
-        ), "Only support decoding with 1 token at a time for now"
+        assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
         zxbcdt = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
-        d_mlp = (
-            zxbcdt.shape[-1]
-            - 2 * self.d_ssm
-            - 2 * self.ngroups * self.d_state
-            - self.nheads
-        ) // 2
+        d_mlp = (zxbcdt.shape[-1] - 2 * self.d_ssm - 2 * self.ngroups * self.d_state - self.nheads) // 2
         z0, x0, z, xBC, dt = torch.split(
             zxbcdt,
-            [
-                d_mlp,
-                d_mlp,
-                self.d_ssm,
-                self.d_ssm + 2 * self.ngroups * self.d_state,
-                self.nheads,
-            ],
-            dim=-1,
+            [d_mlp, d_mlp, self.d_ssm, self.d_ssm + 2 * self.ngroups * self.d_state, self.nheads],
+            dim=-1
         )
 
         # Conv step
         if causal_conv1d_update is None:
-            conv_state.copy_(
-                torch.roll(conv_state, shifts=-1, dims=-1)
-            )  # Update state (B D W)
+            conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
             conv_state[:, :, -1] = xBC
-            xBC = torch.sum(
-                conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
-            )  # (B D)
+            xBC = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
             if self.conv1d.bias is not None:
                 xBC = xBC + self.conv1d.bias
             xBC = self.act(xBC).to(dtype=dtype)
@@ -390,18 +303,12 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 self.activation,
             )
 
-        x, B, C = torch.split(
-            xBC,
-            [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state],
-            dim=-1,
-        )
+        x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
         A = -torch.exp(self.A_log.float())  # (nheads,)
 
         # SSM step
         if selective_state_update is None:
-            assert (
-                self.ngroups == 1
-            ), "Only support ngroups=1 for this inference code path"
+            assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
             # Discretize A and B
             dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
             dA = torch.exp(dt * A)  # (batch, nheads)
@@ -414,9 +321,7 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             if not self.rmsnorm:
                 y = y * self.act(z)  # (B D)
         else:
-            A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(
-                dtype=torch.float32
-            )
+            A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
             dt = repeat(dt, "b h -> b h p", p=self.headdim)
             dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
             D = repeat(self.D, "h -> h p", p=self.headdim)
@@ -426,16 +331,8 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             if not self.rmsnorm:
                 z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
             y = selective_state_update(
-                ssm_state,
-                x_reshaped,
-                dt,
-                A,
-                B,
-                C,
-                D,
-                z=z if not self.rmsnorm else None,
-                dt_bias=dt_bias,
-                dt_softplus=True,
+                ssm_state, x_reshaped, dt, A, B, C, D, z=z if not self.rmsnorm else None,
+                dt_bias=dt_bias, dt_softplus=True
             )
             y = rearrange(y, "b h p -> b (h p)")
         if self.rmsnorm:
@@ -449,26 +346,15 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         device = self.out_proj.weight.device
         conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
         conv_state = torch.zeros(
-            batch_size,
-            self.d_conv,
-            self.conv1d.weight.shape[0],
-            device=device,
-            dtype=conv_dtype,
+            batch_size, self.d_conv, self.conv1d.weight.shape[0], device=device, dtype=conv_dtype
         ).transpose(1, 2)
         ssm_dtype = self.in_proj.weight.dtype if dtype is None else dtype
         ssm_state = torch.zeros(
-            batch_size,
-            self.nheads,
-            self.headdim,
-            self.d_state,
-            device=device,
-            dtype=ssm_dtype,
+            batch_size, self.nheads, self.headdim, self.d_state, device=device, dtype=ssm_dtype
         )
         return conv_state, ssm_state
 
-    def _get_states_from_cache(
-        self, inference_params, batch_size, initialize_states=False
-    ):
+    def _get_states_from_cache(self, inference_params, batch_size, initialize_states=False):
         assert self.layer_idx is not None
         if self.layer_idx not in inference_params.key_value_memory_dict:
             batch_shape = (batch_size,)
@@ -487,14 +373,9 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                 device=self.in_proj.weight.device,
                 dtype=self.in_proj.weight.dtype,
             )
-            inference_params.key_value_memory_dict[self.layer_idx] = (
-                conv_state,
-                ssm_state,
-            )
+            inference_params.key_value_memory_dict[self.layer_idx] = (conv_state, ssm_state)
         else:
-            conv_state, ssm_state = inference_params.key_value_memory_dict[
-                self.layer_idx
-            ]
+            conv_state, ssm_state = inference_params.key_value_memory_dict[self.layer_idx]
             # TODO: What if batch size changes between generation, and we reuse the same states?
             if initialize_states:
                 conv_state.zero_()

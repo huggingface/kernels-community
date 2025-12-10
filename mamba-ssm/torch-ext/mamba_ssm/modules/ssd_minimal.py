@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from ..ops.triton.ssd_combined import mamba_chunk_scan_combined
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 
 def segsum_unstable(x):
@@ -20,7 +20,6 @@ def segsum_unstable(x):
     x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
     return x_segsum
 
-
 def segsum(x):
     """More stable segment sum calculation."""
     T = x.size(-1)
@@ -31,7 +30,6 @@ def segsum(x):
     mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
     x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
     return x_segsum
-
 
 def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
     """
@@ -47,16 +45,14 @@ def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
     assert X.shape[1] % block_len == 0
 
     # Rearrange into blocks/chunks
-    X, A, B, C = [
-        rearrange(x, "b (c l) ... -> b c l ...", l=block_len) for x in (X, A, B, C)
-    ]
+    X, A, B, C = [rearrange(x, "b (c l) ... -> b c l ...", l=block_len) for x in (X, A, B, C)]
 
     A = rearrange(A, "b c l h -> b h c l")
     A_cumsum = torch.cumsum(A, dim=-1)
 
     # 1. Compute the output for each intra-chunk (diagonal blocks)
     L = torch.exp(segsum(A))
-    Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, X)
+    Y_diag  = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, X)
 
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
@@ -75,10 +71,10 @@ def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
     # 4. Compute state -> output conversion per chunk
     # (left term of low-rank factorization of off-diagonal blocks; C terms)
     state_decay_out = torch.exp(A_cumsum)
-    Y_off = torch.einsum("bclhn,bchpn,bhcl->bclhp", C, states, state_decay_out)
+    Y_off = torch.einsum('bclhn,bchpn,bhcl->bclhp', C, states, state_decay_out)
 
     # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
-    Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
+    Y = rearrange(Y_diag+Y_off, "b c l h p -> b (c l) h p")
     return Y, final_state
 
 
@@ -90,22 +86,18 @@ def test_correctness():
     # Denoted (B, T, Q, D, P) in the paper
     batch, seqlen, chunk_size, dim, headdim = 1, 2048, 64, 2048, 64
     nheads = dim // headdim  # (H) in the paper
-    ngroups = 1  # (G) in the paper
+    ngroups = 1 # (G) in the paper
     dstate = 64  # (N) in the paper
     dtype = torch.float32
     device = "cuda"
 
     x = torch.randn(batch, seqlen, nheads, headdim, dtype=dtype, device=device)
-    dt = F.softplus(
-        torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=device) - 4
-    ).requires_grad_()
-    A = (
-        -torch.exp(torch.rand(nheads, dtype=torch.float32, device=device))
-    ).requires_grad_()
+    dt = F.softplus(torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=device) - 4).requires_grad_()
+    A = (-torch.exp(torch.rand(nheads, dtype=torch.float32, device=device))).requires_grad_()
     B = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device=device)
     C = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device=device)
     D = torch.randn(nheads, dtype=dtype, device=device)
 
     # Comparing fused version and minimal version
     y = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None)
-    y_min, _ = ssd_minimal_discrete(x * dt.unsqueeze(-1), A * dt, B, C, chunk_size)
+    y_min, _ = ssd_minimal_discrete(x*dt.unsqueeze(-1), A*dt, B, C, chunk_size)

@@ -4,18 +4,12 @@ from typing import Optional
 import torch
 from torch import nn, Tensor
 
-from ..ops.triton.layer_norm import RMSNorm, layer_norm_fn
+from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn
 
 
 class Block(nn.Module):
     def __init__(
-        self,
-        dim,
-        mixer_cls,
-        mlp_cls,
-        norm_cls=nn.LayerNorm,
-        fused_add_norm=False,
-        residual_in_fp32=False,
+        self, dim, mixer_cls, mlp_cls, norm_cls=nn.LayerNorm, fused_add_norm=False, residual_in_fp32=False
     ):
         """
         Simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection"
@@ -46,11 +40,7 @@ class Block(nn.Module):
             ), "Only LayerNorm and RMSNorm are supported for fused_add_norm"
 
     def forward(
-        self,
-        hidden_states: Tensor,
-        residual: Optional[Tensor] = None,
-        inference_params=None,
-        **mixer_kwargs
+            self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None, **mixer_kwargs
     ):
         r"""Pass the input through the encoder layer.
 
@@ -59,9 +49,7 @@ class Block(nn.Module):
             residual: hidden_states = Mixer(LN(residual))
         """
         if not self.fused_add_norm:
-            residual = (
-                (hidden_states + residual) if residual is not None else hidden_states
-            )
+            residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
             if self.residual_in_fp32:
                 residual = residual.to(torch.float32)
@@ -74,11 +62,9 @@ class Block(nn.Module):
                 prenorm=True,
                 residual_in_fp32=self.residual_in_fp32,
                 eps=self.norm.eps,
-                is_rms_norm=isinstance(self.norm, RMSNorm),
+                is_rms_norm=isinstance(self.norm, RMSNorm)
             )
-        hidden_states = self.mixer(
-            hidden_states, inference_params=inference_params, **mixer_kwargs
-        )
+        hidden_states = self.mixer(hidden_states, inference_params=inference_params, **mixer_kwargs)
 
         if self.mlp is not None:
             if not self.fused_add_norm:
@@ -95,13 +81,11 @@ class Block(nn.Module):
                     prenorm=True,
                     residual_in_fp32=self.residual_in_fp32,
                     eps=self.norm2.eps,
-                    is_rms_norm=isinstance(self.norm2, RMSNorm),
+                    is_rms_norm=isinstance(self.norm2, RMSNorm)
                 )
             hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
-        return self.mixer.allocate_inference_cache(
-            batch_size, max_seqlen, dtype=dtype, **kwargs
-        )
+        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)

@@ -11,7 +11,7 @@ from packaging import version
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from ...utils.torch import custom_bwd, custom_fwd
+from mamba_ssm.utils.torch import custom_bwd, custom_fwd
 
 import triton
 import triton.language as tl
@@ -20,28 +20,30 @@ from einops import rearrange, repeat
 
 try:
     from causal_conv1d import causal_conv1d_fn
-    from causal_conv1d.causal_conv1d_interface import causal_conv1d_cuda
+    from causal_conv1d.cpp_functions import causal_conv1d_fwd_function, causal_conv1d_bwd_function, causal_conv1d_update_function
 except ImportError:
     causal_conv1d_fn = None
-    causal_conv1d_cuda = None
+    causal_conv1d_fwd_function = None
+    causal_conv1d_bwd_function = None
+    causal_conv1d_update_function = None
 
-from .ssd_bmm import _bmm_chunk_fwd, _bmm_chunk_bwd
-from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_cumsum_bwd
-from .ssd_chunk_state import _chunk_state_fwd, _chunk_state_bwd_db
-from .ssd_chunk_state import _chunk_state_bwd_ddAcs_stable
-from .ssd_chunk_state import chunk_state, chunk_state_ref
-from .ssd_chunk_state import chunk_state_varlen
-from .ssd_state_passing import _state_passing_fwd, _state_passing_bwd
-from .ssd_state_passing import state_passing, state_passing_ref
-from .ssd_chunk_scan import _chunk_scan_fwd, _chunk_scan_bwd_dz, _chunk_scan_bwd_dstates
-from .ssd_chunk_scan import _chunk_scan_bwd_dC, _chunk_scan_bwd_dcb
-from .ssd_chunk_scan import _chunk_scan_bwd_ddAcs_stable
-from .ssd_chunk_scan import chunk_scan, chunk_scan_ref
-from .ssd_chunk_scan import _chunk_scan_bwd_ddAcs_prev
-from .layernorm_gated import rmsnorm_fn, _layer_norm_fwd, _layer_norm_bwd
-from .k_activations import _swiglu_fwd, _swiglu_bwd
+from mamba_ssm.ops.triton.ssd_bmm import _bmm_chunk_fwd, _bmm_chunk_bwd
+from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_cumsum_bwd
+from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_state_fwd, _chunk_state_bwd_db
+from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_state_bwd_ddAcs_stable
+from mamba_ssm.ops.triton.ssd_chunk_state import chunk_state, chunk_state_ref
+from mamba_ssm.ops.triton.ssd_chunk_state import chunk_state_varlen
+from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd, _state_passing_bwd
+from mamba_ssm.ops.triton.ssd_state_passing import state_passing, state_passing_ref
+from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_fwd, _chunk_scan_bwd_dz, _chunk_scan_bwd_dstates
+from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_dC, _chunk_scan_bwd_dcb
+from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_ddAcs_stable
+from mamba_ssm.ops.triton.ssd_chunk_scan import chunk_scan, chunk_scan_ref
+from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_ddAcs_prev
+from mamba_ssm.ops.triton.layernorm_gated import rmsnorm_fn, _layer_norm_fwd, _layer_norm_bwd
+from mamba_ssm.ops.triton.k_activations import _swiglu_fwd, _swiglu_bwd
 
-TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
+TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 
 
 def init_to_zero(names):
@@ -684,7 +686,7 @@ def ssd_selective_scan(x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus
     Return:
         out: (batch, seqlen, nheads, headdim)
     """
-    from ..selective_scan_interface import selective_scan_fn
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
@@ -769,7 +771,6 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
     def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu",
                 rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None,
                 ngroups=1, norm_before_gate=True):
-        assert causal_conv1d_cuda is not None, "causal_conv1d_cuda is not available. Please install causal-conv1d."
         assert activation in [None, "silu", "swish"]
         if D.dim() == 1:
             assert headdim is not None
@@ -788,7 +789,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + ngroups * dstate * 2, nheads], dim=-1)
         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
         xBC_conv = rearrange(
-            causal_conv1d_cuda.causal_conv1d_fwd(rearrange_and_update_stride(xBC, "b s d -> b d s"),
+            causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
                                                  conv1d_weight, conv1d_bias, seq_idx, None, None, activation in ["silu", "swish"]),
             "b d s -> b s d"
         )
@@ -846,7 +847,6 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, dout, *args):
-        assert causal_conv1d_cuda is not None, "causal_conv1d_cuda is not available. Please install causal-conv1d."
         zxbcdt, conv1d_weight, conv1d_bias, out, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias = ctx.saved_tensors
         dfinal_states = args[0] if ctx.return_final_states else None
         headdim = ctx.headdim
@@ -863,7 +863,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
         # Recompute x, B, C
         xBC_conv = rearrange(
-            causal_conv1d_cuda.causal_conv1d_fwd(rearrange_and_update_stride(xBC, "b s d -> b d s"),
+            causal_conv1d_fwd_function(rearrange_and_update_stride(xBC, "b s d -> b d s"),
                                        conv1d_weight, conv1d_bias, seq_idx, None, None, ctx.activation in ["silu", "swish"]),
             "b d s -> b s d"
         )
@@ -913,7 +913,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         else:
             doutproj_weight, doutproj_bias = None, None
         dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
-        dxBC_given_update, dweight, dbias, *_ = causal_conv1d_cuda.causal_conv1d_bwd(
+        dxBC_given_update, dweight, dbias, *_ = causal_conv1d_bwd_function(
             rearrange_and_update_stride(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
             rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, rearrange_and_update_stride(dxBC_given), False, ctx.activation in ["silu", "swish"]
         )

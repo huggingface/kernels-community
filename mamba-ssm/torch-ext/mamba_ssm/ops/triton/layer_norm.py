@@ -11,7 +11,7 @@ import warnings
 
 import torch
 import torch.nn.functional as F
-from ...utils.torch import custom_bwd, custom_fwd
+from mamba_ssm.utils.torch import custom_bwd, custom_fwd
 
 import triton
 import triton.language as tl
