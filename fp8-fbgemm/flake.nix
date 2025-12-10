@@ -1,5 +1,5 @@
 {
-  description = "Flake for scattermoe kernels";
+  description = "Flake for fp8-fbgemm kernels";
 
   inputs = {
     kernel-builder.url = "github:huggingface/kernel-builder";
