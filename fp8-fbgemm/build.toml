@@ -1,0 +1,3 @@
+[general]
+name = "fp8-fbgemm"
+universal = true
