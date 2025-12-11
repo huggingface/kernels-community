@@ -1,0 +1,58 @@
+[general]
+name = "gpt_oss_metal_kernels"
+universal = false
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[general.hub]
+repo-id = "kernels-community/gpt-oss-metal-kernels"
+
+[kernel.gpt_oss_metal_kernels]
+
+depends = ["torch"]
+backend = "metal"
+
+src = [
+  "gptoss_kernels/include/gpt-oss.h",
+"gptoss_kernels/include/gpt-oss/types.h",
+"gptoss_kernels/include/gpt-oss/macros.h",
+"gptoss_kernels/include/gpt-oss/functions.h",
+"gptoss_kernels/source/accumulate.metal",
+"gptoss_kernels/source/log.c",
+"gptoss_kernels/source/expert_routing_metadata.metal",
+"gptoss_kernels/source/metal.mm",
+"gptoss_kernels/source/scatter.metal",
+"gptoss_kernels/source/topk.metal",
+"gptoss_kernels/source/embeddings.metal",
+"gptoss_kernels/source/metal-kernels.c",
+"gptoss_kernels/source/tensor_wrappers.cpp",
+"gptoss_kernels/source/random.metal",
+"gptoss_kernels/source/sdpa.metal",
+"gptoss_kernels/source/matmul.metal",
+"gptoss_kernels/source/rmsnorm.metal",
+"gptoss_kernels/source/sample.metal",
+"gptoss_kernels/source/moematmul.metal",
+"gptoss_kernels/source/convert.metal",
+"gptoss_kernels/source/rope.metal",
+"gptoss_kernels/source/gather_and_accumulate.metal",
+"gptoss_kernels/source/include/internal/uuid.h",
+"gptoss_kernels/source/include/internal/metal.hpp",
+"gptoss_kernels/source/include/internal/datatype.h",
+"gptoss_kernels/source/include/internal/rng.h",
+"gptoss_kernels/source/include/internal/rng.hpp",
+"gptoss_kernels/source/include/internal/log.h",
+"gptoss_kernels/source/include/internal/macros.h",
+"gptoss_kernels/source/include/internal/storage.h",
+"gptoss_kernels/source/include/internal/model.h",
+"gptoss_kernels/source/include/internal/math.h",
+"gptoss_kernels/source/include/internal/metal.h",
+"gptoss_kernels/source/include/internal/kernel-args.h",
+"gptoss_kernels/source/include/internal/datatype.hpp",
+"gptoss_kernels/source/include/internal/metal-kernels.h",
+]
+
+include = ["gptoss_kernels/source/include", "gptoss_kernels/include", "."]
