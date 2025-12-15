@@ -42,22 +42,6 @@ jobs:
           ref: refs/pull/${{ inputs.pr_number }}/head
           fetch-depth: 0
 
-      - uses: DeterminateSystems/nix-installer-action@main
-        with:
-          extra-conf: |
-            max-jobs = 2
-            cores = 12
-            sandbox-fallback = false
-
-      - name: Nix info
-        run: nix-shell -p nix-info --run "nix-info -m"
-
-      - uses: cachix/cachix-action@v16
-        with:
-          name: huggingface
-        env:
-          USER: runner
-
       - name: Validate kernel directory
         id: validate
         run: |
@@ -71,10 +55,15 @@ jobs:
           fi
 
       - name: Build and copy kernel
-        run: |
-          set -eu
-          KERNEL="${{ steps.validate.outputs.kernel }}"
-          ( cd "$KERNEL" && nix run -L .#build-and-copy )
+        uses: huggingface/publish-to-the-kernel-hub-action@main
+        with:
+          kernel-path: ${{ steps.validate.outputs.kernel }}
+          build-target: build-and-copy
+          nix-command: run
+          nix-max-jobs: '2'
+          nix-cores: '12'
+          sandbox-mode: fallback
+          upload-artifact: 'false'
 
       - name: Upload kernel
         env:

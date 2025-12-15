@@ -13,19 +13,6 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@v20
-        with:
-          extra-conf: |
-            max-jobs = 1
-            cores = 3
-            sandbox = relaxed
-      - name: Nix info
-        run: nix-shell -p nix-info --run "nix-info -m"
-      - uses: cachix/cachix-action@v16
-        with:
-          name: huggingface
-        env:
-          USER: runner
       - name: Validate kernel directory
         id: validate
         run: |
@@ -38,8 +25,14 @@ jobs:
           fi
       - name: Build and upload kernel
         if: steps.validate.outputs.skip == 'false'
+        uses: huggingface/publish-to-the-kernel-hub-action@main
+        with:
+          kernel-path: ${{ steps.validate.outputs.kernel }}
+          build-target: build-and-upload
+          nix-command: run
+          nix-max-jobs: '1'
+          nix-cores: '3'
+          sandbox-mode: relaxed
+          upload-artifact: 'false'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
-          ( cd "$KERNEL" && nix run -L .#build-and-upload )

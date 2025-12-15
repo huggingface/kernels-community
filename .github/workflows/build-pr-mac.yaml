@@ -11,20 +11,7 @@ jobs:
   build-kernel:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v5
-      - uses: DeterminateSystems/nix-installer-action@v20
-        with:
-          extra-conf: |
-            max-jobs = 1
-            cores = 3
-            sandbox = relaxed
-      - name: Nix info
-        run: nix-shell -p nix-info --run "nix-info -m"
-      - uses: cachix/cachix-action@v16
-        with:
-          name: huggingface
-        env:
-          USER: runner
+      - uses: actions/checkout@v4
       - name: Validate kernel directory
         id: validate
         env:
@@ -38,6 +25,12 @@ jobs:
           fi
       - name: Build kernel
         if: steps.validate.outputs.skip == 'false'
-        run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
-          ( cd "$KERNEL" && nix build -L .#ci && ls -l result/ )
+        uses: huggingface/publish-to-the-kernel-hub-action@main
+        with:
+          kernel-path: ${{ steps.validate.outputs.kernel }}
+          build-target: ci
+          nix-command: build
+          nix-max-jobs: '1'
+          nix-cores: '3'
+          sandbox-mode: relaxed
+          upload-artifact: 'false'
