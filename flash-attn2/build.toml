@@ -121,22 +121,16 @@ backend = "xpu"
 src = [
   "flash_attn_xpu/flash_api.cpp",
 
-  "flash_attn_xpu/src/fixed.hpp",
-  "flash_attn_xpu/src/varlen.hpp",
+  "flash_attn_xpu/src/fmha_fwd.hpp",
   "flash_attn_xpu/src/fmha_utils.hpp",
   "flash_attn_xpu/src/compat_wrapper.hpp",
 
   "flash_attn_xpu/src/collective/fmha_fusion.hpp",
-  "flash_attn_xpu/src/collective/fixed_epilogue.hpp",
-  "flash_attn_xpu/src/collective/fixed_mma.hpp",
-  "flash_attn_xpu/src/collective/fixed_softmax_epilogue.hpp",
-  "flash_attn_xpu/src/collective/varlen_epilogue.hpp",
-  "flash_attn_xpu/src/collective/varlen_mma.hpp",
-  "flash_attn_xpu/src/collective/varlen_softmax_epilogue.hpp",
+  "flash_attn_xpu/src/collective/copy_block_slm.hpp",
+  "flash_attn_xpu/src/collective/fmha_fwd_epilogue.hpp",
+  "flash_attn_xpu/src/collective/fmha_fwd_mainloop.hpp",
+  "flash_attn_xpu/src/collective/fmha_fwd_scheduler.hpp",
 
-  "flash_attn_xpu/src/kernel/fixed_scheduler.hpp",
-  "flash_attn_xpu/src/kernel/fixed_kernel.hpp",
-  "flash_attn_xpu/src/kernel/varlen_scheduler.hpp",
-  "flash_attn_xpu/src/kernel/varlen_kernel.hpp",
+  "flash_attn_xpu/src/kernel/fmha_fwd_kernel.hpp",
 ]
 depends = ["torch", "cutlass_sycl"]

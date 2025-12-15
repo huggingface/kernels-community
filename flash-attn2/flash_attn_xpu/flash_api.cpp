@@ -1,14 +1,11 @@
 #include <torch/all.h>
 
-#include "src/fixed.hpp"
-#include "src/varlen.hpp"
+#include "src/fmha_fwd.hpp"
 
 namespace FLASH_NAMESPACE {
 
 inline int round_multiple(int x, int m) {
     int pad_res = (x + m - 1) / m * m;
-    if (pad_res == 224)
-        pad_res = 256;
     return pad_res;
 }
 
@@ -84,7 +81,8 @@ mha_fwd(
     q_padded = ensure_contiguous(q_padded);
     k_padded = ensure_contiguous(k_padded);
     v_padded = ensure_contiguous(v_padded);
-    cutlass::flash_attention::fixed::cutlass_fixed_impl(
+
+    cutlass_fmha_fwd_fix_impl(
         q_padded, k_padded, v_padded, out_padded,
         softmax_scale,
         window_size_left, window_size_right,
@@ -105,6 +103,7 @@ mha_fwd(
     at::Tensor rng_state;
     return {out, softmax_lse, S_dmask, rng_state};
   }
+
 
 std::vector<at::Tensor>
 mha_varlen_fwd(
@@ -178,17 +177,18 @@ mha_varlen_fwd(
     }
 
     bool is_local = (window_size_left != -1) | (window_size_right != -1);
+    bool is_paged = block_table_.has_value() && block_table_->defined();
 
     q_padded = ensure_contiguous(q_padded);
     k_padded = ensure_contiguous(k_padded);
     v_padded = ensure_contiguous(v_padded);
-    cutlass::flash_attention::varlen::cutlass_varlen_impl(
+    cutlass_fmha_fwd_varlen_impl(
                             q_padded, k_padded, v_padded, out_padded, block_table_,
                             cu_seqlens_q, cu_seqlens_k,
                             max_seqlen_q, max_seqlen_k,
                             softmax_scale,
                             window_size_left, window_size_right,
-                            is_causal, is_local);
+                            true, is_paged, is_causal, is_local);
 
     // Remove padding from output
     at::Tensor out = out_padded;
