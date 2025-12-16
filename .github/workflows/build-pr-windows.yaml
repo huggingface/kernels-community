@@ -28,8 +28,9 @@ jobs:
       - name: Validate kernel directory
         id: validate
         shell: pwsh
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          $PR_TITLE = "${{ github.event.pull_request.title }}"
           $KERNEL = python .github/workflows/validate-kernel-pr.py "pr" "$PR_TITLE"
           if ($LASTEXITCODE -eq 0) {
             echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
