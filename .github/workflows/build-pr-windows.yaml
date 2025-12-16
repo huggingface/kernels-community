@@ -25,17 +25,6 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v5
-
-      - name: Kernel extract required builder version
-        id: extract-builder-version
-        # if: steps.validate.outputs.skip == 'false'
-        shell: pwsh
-        run: |
-          $lock = Get-Content ${KERNEL}/flake.lock
-          $revision = $lock.nodes."kernel-builder".locked.rev
-          Write-Output "Building Kernel with revision: $revision"
-          echo "revision=$revision" >> $env:GITHUB_OUTPUT
-
       - name: Validate kernel directory
         id: validate
         shell: pwsh
@@ -55,6 +44,16 @@ jobs:
         run: |
           $KERNEL = "${{ steps.validate.outputs.kernel }}"
           Write-Output "Building Kernel: $KERNEL"
+
+      - name: Kernel extract required builder version
+        id: extract-builder-version
+        if: steps.validate.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          $lock = Get-Content ${KERNEL}/flake.lock
+          $revision = $lock.nodes."kernel-builder".locked.rev
+          Write-Output "Building Kernel with revision: $revision"
+          echo "revision=$revision" >> $env:GITHUB_OUTPUT
 
       - uses: Jimver/cuda-toolkit@v0.2.29
         if: steps.validate.outputs.skip == 'false'
