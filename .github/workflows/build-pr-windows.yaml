@@ -50,6 +50,7 @@ jobs:
         if: steps.validate.outputs.skip == 'false'
         shell: pwsh
         run: |
+          $KERNEL = "${{ steps.validate.outputs.kernel }}"
           $lock = Get-Content ${KERNEL}/flake.lock
           $revision = $lock.nodes."kernel-builder".locked.rev
           Write-Output "Building Kernel with revision: $revision"
