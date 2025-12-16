@@ -51,7 +51,7 @@ jobs:
         shell: pwsh
         run: |
           $KERNEL = "${{ steps.validate.outputs.kernel }}"
-          $lock = Get-Content ${KERNEL}/flake.lock
+          $lock = Get-Content "${KERNEL}/flake.lock" | ConvertFrom-Json
           $revision = $lock.nodes."kernel-builder".locked.rev
           Write-Output "Building Kernel with revision: $revision"
           echo "revision=$revision" >> $env:GITHUB_OUTPUT
