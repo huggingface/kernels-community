@@ -1,6 +1,5 @@
 #pragma once
 
-// #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "./collective/fmha_fusion.hpp"
 #include "cutlass/util/packed_stride.hpp"
@@ -8,8 +7,6 @@
 #include <cute/tensor.hpp>
 
 #include "cutlass/util/device_memory.h"
-// #include "cutlass/util/reference/device/gemm_complex.h"
-// #include "cutlass/util/reference/device/tensor_compare.h"
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include "./compat_wrapper.hpp"
@@ -130,7 +127,8 @@ struct KernelLauncher {
   }
 
   cutlass::Status
-  run(const fmha_fwd_args_t& args,
+  run(sycl::queue& queue, 
+      const fmha_fwd_args_t& args,
       const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(args);
 
@@ -166,12 +164,12 @@ struct KernelLauncher {
     auto params =
         FMHAKernel::to_underlying_arguments(arguments, workspace.get());
 
-    run(params);
+    run(queue, params);
 
     return cutlass::Status::kSuccess;
   }
 
-  static void run(typename FMHAKernel::Params params) {
+  static void run(sycl::queue& queue, typename FMHAKernel::Params params) {
     namespace syclex = sycl::ext::oneapi::experimental;
     namespace intelex = sycl::ext::intel::experimental;
 
@@ -195,7 +193,7 @@ struct KernelLauncher {
         sycl_grid, sycl_block, launch_props, kernel_props};
     auto event =
         COMPAT::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
-            policy, params);
+            policy, queue, params);
 
     EventManager::getInstance().addEvent(event);
   }
@@ -239,7 +237,7 @@ struct FMHAConfig {
       bool Paged,
       bool Causal,
       bool Local>
-  static void run(const fmha_fwd_args_t& args) {
+  static void run(sycl::queue& queue, const fmha_fwd_args_t& args) {
     cutlass::KernelHardwareInfo hw_info;
 
     using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<VarLen>;
@@ -301,27 +299,27 @@ struct FMHAConfig {
 
     KernelLauncher<FMHAKernel, VarLen> launcher;
 
-    launcher.run(args, hw_info);
+    launcher.run(queue, args, hw_info);
   }
 
   template <bool... Bs>
   static void
-  kernel_dispatch(const fmha_fwd_args_t& args) {
-    return run<cutlass::fmha::kernel::XeFHMAIndividualTileScheduler, Bs...>(args);
+  kernel_dispatch(sycl::queue& queue, const fmha_fwd_args_t& args) {
+    return run<cutlass::fmha::kernel::XeFHMAIndividualTileScheduler, Bs...>(queue, args);
   }
 
   template <bool... Bs, typename... Ts>
-  static void kernel_dispatch(const fmha_fwd_args_t& args, bool b, Ts... ts) {
+  static void kernel_dispatch(sycl::queue& queue, const fmha_fwd_args_t& args, bool b, Ts... ts) {
     if (b) {
-      kernel_dispatch<Bs..., true>(args, ts...);
+      kernel_dispatch<Bs..., true>(queue, args, ts...);
     } else {
-      kernel_dispatch<Bs..., false>(args, ts...);
+      kernel_dispatch<Bs..., false>(queue, args, ts...);
     }
   }
 };
 
 template <typename chunk_policy, int PipelineStages>
-void policy_dispatch(CutlassType cuType, const fmha_fwd_args_t& args) {
+void policy_dispatch(sycl::queue& queue, CutlassType cuType, const fmha_fwd_args_t& args) {
   if (cuType == CutlassType::half) {
     return FMHAConfig<
         typename chunk_policy::ShapeQK,
@@ -335,6 +333,7 @@ void policy_dispatch(CutlassType cuType, const fmha_fwd_args_t& args) {
         half_t,
         half_t>::
         kernel_dispatch(
+            queue,
             args,
             args.is_varlen,
             args.is_paged,
@@ -349,6 +348,7 @@ void policy_dispatch(CutlassType cuType, const fmha_fwd_args_t& args) {
         void,
         PipelineStages>::
         kernel_dispatch(
+            queue,
             args,
             args.is_varlen,
             args.is_paged,
@@ -358,6 +358,7 @@ void policy_dispatch(CutlassType cuType, const fmha_fwd_args_t& args) {
 }
 
 void cutlass_fmha_fwd_varlen_impl(
+    sycl::queue& queue,
     const at::Tensor& query,      // [seq_q, heads, head_size]
     const at::Tensor& key_cache,  // [num_block, block_size, heads, head_size] or [total_seqlen_k, heads, head_size]
     const at::Tensor& value_cache,
@@ -449,26 +450,26 @@ void cutlass_fmha_fwd_varlen_impl(
   CutlassType cuType = aten_to_Cutlass_dtype(query);
 
   const int h = args.head_size;
-  // if (h <= 32) {
-  //   policy_dispatch<prefill_policy_head32, PipelineStages_Prefill>(cuType, args);
-  // }
+  if (h <= 32) {
+    policy_dispatch<prefill_policy_head32, PipelineStages_Prefill>(queue, cuType, args);
+  }
   // else if (h <= 64) {
-  //   policy_dispatch<prefill_policy_head64, PipelineStages_Prefill>(cuType, args);
+  //   policy_dispatch<prefill_policy_head64, PipelineStages_Prefill>(queue, cuType, args);
   // }
   // else if (h <= 96) {
-  //   policy_dispatch<prefill_policy_head96, PipelineStages_Prefill>(cuType, args);
+  //   policy_dispatch<prefill_policy_head96, PipelineStages_Prefill>(queue, cuType, args);
   // }
-  if (h <= 128) {
-    policy_dispatch<prefill_policy_head128, PipelineStages_Prefill>(cuType, args);
-  }
+  // else if (h <= 128) {
+  //   policy_dispatch<prefill_policy_head128, PipelineStages_Prefill>(queue, cuType, args);
+  // }
   // else if (h <= 160) {
-  //   policy_dispatch<prefill_policy_head160, PipelineStages_Prefill>(cuType, args);
+  //   policy_dispatch<prefill_policy_head160, PipelineStages_Prefill>(queue, cuType, args);
   // }
   // else if (h <= 192) {
-  //   policy_dispatch<prefill_policy_head192, PipelineStages_Prefill>(cuType, args);
+  //   policy_dispatch<prefill_policy_head192, PipelineStages_Prefill>(queue, cuType, args);
   // }
   // else if (h <= 256) {
-  //   policy_dispatch<prefill_policy_head256, PipelineStages_Prefill>(cuType, args);
+  //   policy_dispatch<prefill_policy_head256, PipelineStages_Prefill>(queue, cuType, args);
   // }
   else {
     throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
@@ -476,6 +477,7 @@ void cutlass_fmha_fwd_varlen_impl(
 }
 
 void cutlass_fmha_fwd_fix_impl(
+    sycl::queue& queue,
     const at::Tensor& query,      // [batch, seq_q, num_heads, head_size]
     const at::Tensor& key,        // [batch, seq_k, num_heads_k, head_size]
     const at::Tensor& value,      // [batch, seq_k, num_heads_k, head_size]
@@ -535,55 +537,55 @@ void cutlass_fmha_fwd_fix_impl(
   CutlassType cuType = aten_to_Cutlass_dtype(query);
   const int h = args.head_size;
 
-  // if (max_seqlen_q == 1) {
-  //   if (h <= 32) {
-  //     policy_dispatch<decode_policy_head32, PipelineStages_Decode>(cuType, args);
-  //   }
-  //   else if (h <= 64) {
-  //     policy_dispatch<decode_policy_head64, PipelineStages_Decode>(cuType, args);
-  //   }
-  //   else if (h <= 96) {
-  //     policy_dispatch<decode_policy_head96, PipelineStages_Decode>(cuType, args);
-  //   }
-  //   else if (h <= 128) {
-  //     policy_dispatch<decode_policy_head128, PipelineStages_Decode>(cuType, args);
-  //   }
-  //   else if (h <= 160) {
-  //     policy_dispatch<decode_policy_head160, PipelineStages_Decode>(cuType, args);
-  //   }
-  //   else if (h <= 192) {
-  //     policy_dispatch<decode_policy_head192, PipelineStages_Decode>(cuType, args);
-  //   }
-  //   else if (h <= 256) {
-  //     policy_dispatch<decode_policy_head256, PipelineStages_Decode>(cuType, args);
-  //   }
-  //   else {
-  //     throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
-  //   }
-  // } else {
-  //   if (h <= 32) {
-  //     policy_dispatch<prefill_policy_head32, PipelineStages_Prefill>(cuType, args);
-  //   }
-  //   else if (h <= 64) {
-  //     policy_dispatch<prefill_policy_head64, PipelineStages_Prefill>(cuType, args);
-  //   }
-  //   else if (h <= 96) {
-  //     policy_dispatch<prefill_policy_head96, PipelineStages_Prefill>(cuType, args);
-  //   }
-  //   else if (h <= 128) {
-  //     policy_dispatch<prefill_policy_head128, PipelineStages_Prefill>(cuType, args);
-  //   }
-  //   else if (h <= 160) {
-  //     policy_dispatch<prefill_policy_head160, PipelineStages_Prefill>(cuType, args);
-  //   }
-  //   else if (h <= 192) {
-  //     policy_dispatch<prefill_policy_head192, PipelineStages_Prefill>(cuType, args);
-  //   }
-  //   else if (h <= 256) {
-  //     policy_dispatch<prefill_policy_head256, PipelineStages_Prefill>(cuType, args);
-  //   }
-  //   else {
-  //     throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
-  //   }
-  // }
+  if (max_seqlen_q == 1) {
+    if (h <= 32) {
+      policy_dispatch<decode_policy_head32, PipelineStages_Decode>(queue, cuType, args);
+    }
+    // else if (h <= 64) {
+    //   policy_dispatch<decode_policy_head64, PipelineStages_Decode>(queue, cuType, args);
+    // }
+    // else if (h <= 96) {
+    //   policy_dispatch<decode_policy_head96, PipelineStages_Decode>(queue, cuType, args);
+    // }
+    // else if (h <= 128) {
+    //   policy_dispatch<decode_policy_head128, PipelineStages_Decode>(queue, cuType, args);
+    // }
+    // else if (h <= 160) {
+    //   policy_dispatch<decode_policy_head160, PipelineStages_Decode>(queue, cuType, args);
+    // }
+    // else if (h <= 192) {
+    //   policy_dispatch<decode_policy_head192, PipelineStages_Decode>(queue, cuType, args);
+    // }
+    // else if (h <= 256) {
+    //   policy_dispatch<decode_policy_head256, PipelineStages_Decode>(queue, cuType, args);
+    // }
+    else {
+      throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
+    }
+  } else {
+    if (h <= 32) {
+      policy_dispatch<prefill_policy_head32, PipelineStages_Prefill>(queue, cuType, args);
+    }
+    // else if (h <= 64) {
+    //   policy_dispatch<prefill_policy_head64, PipelineStages_Prefill>(queue, cuType, args);
+    // }
+    // else if (h <= 96) {
+    //   policy_dispatch<prefill_policy_head96, PipelineStages_Prefill>(queue, cuType, args);
+    // }
+    // else if (h <= 128) {
+    //   policy_dispatch<prefill_policy_head128, PipelineStages_Prefill>(queue, cuType, args);
+    // }
+    // else if (h <= 160) {
+    //   policy_dispatch<prefill_policy_head160, PipelineStages_Prefill>(queue, cuType, args);
+    // }
+    // else if (h <= 192) {
+    //   policy_dispatch<prefill_policy_head192, PipelineStages_Prefill>(queue, cuType, args);
+    // }
+    // else if (h <= 256) {
+    //   policy_dispatch<prefill_policy_head256, PipelineStages_Prefill>(queue, cuType, args);
+    // }
+    else {
+      throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
+    }
+  }
 }

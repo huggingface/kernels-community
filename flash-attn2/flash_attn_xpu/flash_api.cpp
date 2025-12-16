@@ -1,4 +1,5 @@
 #include <torch/all.h>
+#include <c10/xpu/XPUStream.h>
 
 #include "src/fmha_fwd.hpp"
 
@@ -12,6 +13,8 @@ inline int round_multiple(int x, int m) {
 inline at::Tensor ensure_contiguous(const at::Tensor& tensor) {
     return tensor.is_contiguous() ? tensor : tensor.contiguous();
 }
+
+#define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
 
 std::vector<at::Tensor>
 mha_fwd(
@@ -47,6 +50,12 @@ mha_fwd(
                 "FlashAttention only support fp16 and bf16 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(k.size(-1) == head_size_og, "Key head dimension must match Query head dimension");
+    TORCH_CHECK(v.size(-1) == head_size_og, "Value head dimension must match Query head dimension");
+
+    CHECK_DEVICE(q);
+    CHECK_DEVICE(k);
+    CHECK_DEVICE(v);
 
     // XPU requires head_size to be a multiple of 32
     const int head_size_padded = round_multiple(head_size_og, 32);
@@ -82,7 +91,10 @@ mha_fwd(
     k_padded = ensure_contiguous(k_padded);
     v_padded = ensure_contiguous(v_padded);
 
+    auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
+
     cutlass_fmha_fwd_fix_impl(
+        queue,
         q_padded, k_padded, v_padded, out_padded,
         softmax_scale,
         window_size_left, window_size_right,
@@ -147,6 +159,12 @@ mha_varlen_fwd(
                 "FlashAttention only support fp16 and bf16 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(k.size(-1) == head_size_og, "Key head dimension must match Query head dimension");
+    TORCH_CHECK(v.size(-1) == head_size_og, "Value head dimension must match Query head dimension");
+
+    CHECK_DEVICE(q);
+    CHECK_DEVICE(k);
+    CHECK_DEVICE(v);
 
     // XPU requires head_size to be a multiple of 32
     const int head_size_padded = round_multiple(head_size_og, 32);
@@ -182,13 +200,17 @@ mha_varlen_fwd(
     q_padded = ensure_contiguous(q_padded);
     k_padded = ensure_contiguous(k_padded);
     v_padded = ensure_contiguous(v_padded);
+
+    auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
+
     cutlass_fmha_fwd_varlen_impl(
-                            q_padded, k_padded, v_padded, out_padded, block_table_,
-                            cu_seqlens_q, cu_seqlens_k,
-                            max_seqlen_q, max_seqlen_k,
-                            softmax_scale,
-                            window_size_left, window_size_right,
-                            true, is_paged, is_causal, is_local);
+        queue,
+        q_padded, k_padded, v_padded, out_padded, block_table_,
+        cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k,
+        softmax_scale,
+        window_size_left, window_size_right,
+        true, is_paged, is_causal, is_local);
 
     // Remove padding from output
     at::Tensor out = out_padded;

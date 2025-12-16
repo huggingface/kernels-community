@@ -50,17 +50,6 @@ class XeDefault {};  // Default FMHA mainloop, P in registers.
 
 namespace cutlass::fmha::collective {
 
-static inline void sbarrier_wait() { asm volatile("sbarrier.wait\n"); }
-
-static inline void sbarrier_signal() { asm volatile("sbarrier.signal\n"); }
-
-static inline void gfence() { asm volatile("lsc_fence.ugm.none.group\n"); }
-
-static inline void barrier() {
-  asm volatile("lsc_fence.ugm.none.group\n");
-  asm volatile("barrier\n");
-}
-
 using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
