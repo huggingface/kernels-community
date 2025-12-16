@@ -318,10 +318,10 @@ struct FMHAConfig {
   }
 };
 
-template <typename chunk_policy, int PipelineStages>
+template <typename chunk_policy, int PipelineStages, int IsVarLen = -1, int IsPaged = -1>
 void policy_dispatch(sycl::queue& queue, CutlassType cuType, const fmha_fwd_args_t& args) {
   if (cuType == CutlassType::half) {
-    return FMHAConfig<
+    using Config = FMHAConfig<
         typename chunk_policy::ShapeQK,
         typename chunk_policy::ShapePV,
         typename chunk_policy::ShapeOut,
@@ -331,29 +331,62 @@ void policy_dispatch(sycl::queue& queue, CutlassType cuType, const fmha_fwd_args
         half_t,
         half_t,
         half_t,
-        half_t>::
-        kernel_dispatch(
-            queue,
-            args,
-            args.is_varlen,
-            args.is_paged,
-            args.is_causal,
-            args.is_local);
+        half_t>;
+    if constexpr (IsVarLen != -1 && IsPaged != -1) {
+      return Config::template kernel_dispatch<IsVarLen, IsPaged>(
+          queue,
+          args,
+          args.is_causal,
+          args.is_local);
+    } else {
+      return Config::kernel_dispatch(
+          queue,
+          args,
+          args.is_varlen,
+          args.is_paged,
+          args.is_causal,
+          args.is_local);
+    }
   } else {
-    return FMHAConfig<
+    using Config = FMHAConfig<
         typename chunk_policy::ShapeQK,
         typename chunk_policy::ShapePV,
         typename chunk_policy::ShapeOut,
         typename chunk_policy::SubgroupLayoutQK,
         void,
-        PipelineStages>::
-        kernel_dispatch(
-            queue,
-            args,
-            args.is_varlen,
-            args.is_paged,
-            args.is_causal,
-            args.is_local);
+        PipelineStages>;
+    if constexpr (IsVarLen != -1 && IsPaged != -1) {
+      return Config::template kernel_dispatch<IsVarLen, IsPaged>(
+          queue,
+          args,
+          args.is_causal,
+          args.is_local);
+    } else {
+      return Config::kernel_dispatch(
+          queue,
+          args,
+          args.is_varlen,
+          args.is_paged,
+          args.is_causal,
+          args.is_local);
+    }
+  }
+}
+
+template <typename chunk_policy, int PipelineStages>
+void policy_dispatch_dynamic(sycl::queue& queue, CutlassType cuType, const fmha_fwd_args_t& args) {
+  if (args.is_varlen) {
+    if (args.is_paged) {
+      policy_dispatch<chunk_policy, PipelineStages, 1, 1>(queue, cuType, args);
+    } else {
+      policy_dispatch<chunk_policy, PipelineStages, 1, 0>(queue, cuType, args);
+    }
+  } else {
+    if (args.is_paged) {
+      policy_dispatch<chunk_policy, PipelineStages, 0, 1>(queue, cuType, args);
+    } else {
+      policy_dispatch<chunk_policy, PipelineStages, 0, 0>(queue, cuType, args);
+    }
   }
 }
 
@@ -451,26 +484,26 @@ void cutlass_fmha_fwd_varlen_impl(
 
   const int h = args.head_size;
   if (h <= 32) {
-    policy_dispatch<prefill_policy_head32, PipelineStages_Prefill>(queue, cuType, args);
+    policy_dispatch_dynamic<prefill_policy_head32, PipelineStages_Prefill>(queue, cuType, args);
   }
-  // else if (h <= 64) {
-  //   policy_dispatch<prefill_policy_head64, PipelineStages_Prefill>(queue, cuType, args);
-  // }
-  // else if (h <= 96) {
-  //   policy_dispatch<prefill_policy_head96, PipelineStages_Prefill>(queue, cuType, args);
-  // }
-  // else if (h <= 128) {
-  //   policy_dispatch<prefill_policy_head128, PipelineStages_Prefill>(queue, cuType, args);
-  // }
-  // else if (h <= 160) {
-  //   policy_dispatch<prefill_policy_head160, PipelineStages_Prefill>(queue, cuType, args);
-  // }
-  // else if (h <= 192) {
-  //   policy_dispatch<prefill_policy_head192, PipelineStages_Prefill>(queue, cuType, args);
-  // }
-  // else if (h <= 256) {
-  //   policy_dispatch<prefill_policy_head256, PipelineStages_Prefill>(queue, cuType, args);
-  // }
+  else if (h <= 64) {
+    policy_dispatch_dynamic<prefill_policy_head64, PipelineStages_Prefill>(queue, cuType, args);
+  }
+  else if (h <= 96) {
+    policy_dispatch_dynamic<prefill_policy_head96, PipelineStages_Prefill>(queue, cuType, args);
+  }
+  else if (h <= 128) {
+    policy_dispatch_dynamic<prefill_policy_head128, PipelineStages_Prefill>(queue, cuType, args);
+  }
+  else if (h <= 160) {
+    policy_dispatch_dynamic<prefill_policy_head160, PipelineStages_Prefill>(queue, cuType, args);
+  }
+  else if (h <= 192) {
+    policy_dispatch_dynamic<prefill_policy_head192, PipelineStages_Prefill>(queue, cuType, args);
+  }
+  else if (h <= 256) {
+    policy_dispatch_dynamic<prefill_policy_head256, PipelineStages_Prefill>(queue, cuType, args);
+  }
   else {
     throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
   }
@@ -539,51 +572,51 @@ void cutlass_fmha_fwd_fix_impl(
 
   if (max_seqlen_q == 1) {
     if (h <= 32) {
-      policy_dispatch<decode_policy_head32, PipelineStages_Decode>(queue, cuType, args);
+      policy_dispatch<decode_policy_head32, PipelineStages_Decode, 0, 0>(queue, cuType, args);
     }
-    // else if (h <= 64) {
-    //   policy_dispatch<decode_policy_head64, PipelineStages_Decode>(queue, cuType, args);
-    // }
-    // else if (h <= 96) {
-    //   policy_dispatch<decode_policy_head96, PipelineStages_Decode>(queue, cuType, args);
-    // }
-    // else if (h <= 128) {
-    //   policy_dispatch<decode_policy_head128, PipelineStages_Decode>(queue, cuType, args);
-    // }
-    // else if (h <= 160) {
-    //   policy_dispatch<decode_policy_head160, PipelineStages_Decode>(queue, cuType, args);
-    // }
-    // else if (h <= 192) {
-    //   policy_dispatch<decode_policy_head192, PipelineStages_Decode>(queue, cuType, args);
-    // }
-    // else if (h <= 256) {
-    //   policy_dispatch<decode_policy_head256, PipelineStages_Decode>(queue, cuType, args);
-    // }
+    else if (h <= 64) {
+      policy_dispatch<decode_policy_head64, PipelineStages_Decode, 0, 0>(queue, cuType, args);
+    }
+    else if (h <= 96) {
+      policy_dispatch<decode_policy_head96, PipelineStages_Decode, 0, 0>(queue, cuType, args);
+    }
+    else if (h <= 128) {
+      policy_dispatch<decode_policy_head128, PipelineStages_Decode, 0, 0>(queue, cuType, args);
+    }
+    else if (h <= 160) {
+      policy_dispatch<decode_policy_head160, PipelineStages_Decode, 0, 0>(queue, cuType, args);
+    }
+    else if (h <= 192) {
+      policy_dispatch<decode_policy_head192, PipelineStages_Decode, 0, 0>(queue, cuType, args);
+    }
+    else if (h <= 256) {
+      policy_dispatch<decode_policy_head256, PipelineStages_Decode, 0, 0>(queue, cuType, args);
+    }
     else {
       throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
     }
   } else {
     if (h <= 32) {
-      policy_dispatch<prefill_policy_head32, PipelineStages_Prefill>(queue, cuType, args);
+      policy_dispatch<prefill_policy_head32, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
     }
-    // else if (h <= 64) {
-    //   policy_dispatch<prefill_policy_head64, PipelineStages_Prefill>(queue, cuType, args);
-    // }
-    // else if (h <= 96) {
-    //   policy_dispatch<prefill_policy_head96, PipelineStages_Prefill>(queue, cuType, args);
-    // }
-    // else if (h <= 128) {
-    //   policy_dispatch<prefill_policy_head128, PipelineStages_Prefill>(queue, cuType, args);
-    // }
-    // else if (h <= 160) {
-    //   policy_dispatch<prefill_policy_head160, PipelineStages_Prefill>(queue, cuType, args);
-    // }
-    // else if (h <= 192) {
-    //   policy_dispatch<prefill_policy_head192, PipelineStages_Prefill>(queue, cuType, args);
-    // }
-    // else if (h <= 256) {
-    //   policy_dispatch<prefill_policy_head256, PipelineStages_Prefill>(queue, cuType, args);
-    // }
+    else if (h <= 64) {
+      policy_dispatch<prefill_policy_head64, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
+    }
+    else if (h <= 96) {
+      policy_dispatch<prefill_policy_head96, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
+    }
+    else if (h <= 128) {
+      policy_dispatch<prefill_policy_head128, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
+    }
+    else if (h <= 160) {
+      policy_dispatch<prefill_policy_head160, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
+    }
+    else if (h <= 192) {
+      policy_dispatch<prefill_policy_head192, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
+    }
+    else if (h <= 256) {
+      policy_dispatch<prefill_policy_head256, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
+    }
     else {
       throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
     }
