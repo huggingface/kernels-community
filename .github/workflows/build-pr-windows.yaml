@@ -25,6 +25,17 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v5
+
+      - name: Kernel extract required builder version
+        id: extract-builder-version
+        if: steps.validate.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          $lock = Get-Content ${KERNEL}/flake.lock
+          $revision = $lock.nodes."kernel-builder".locked.rev
+          Write-Output "Building Kernel with revision: $revision"
+          echo "revision=$revision" >> $env:GITHUB_OUTPUT
+
       - name: Validate kernel directory
         id: validate
         shell: pwsh
@@ -67,7 +78,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: huggingface/kernel-builder
-          ref: v0.8.0  # todo(mfuntowicz): Find a way to pull the latest version
+          ref: "${{ steps.extract-builder-version.outputs.revision }}"
           path: kernel-builder
 
       - name: Cache Rust build
