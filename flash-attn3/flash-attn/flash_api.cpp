@@ -1670,6 +1670,8 @@ mha_combine(at::Tensor out_partial,         // num_splits x batch_size x seqlen 
     return {out, softmax_lse};
 }
 
+#if false
+
 TORCH_LIBRARY(flash_attn_3, m) {
     m.def("fwd("
         "Tensor q,"
@@ -1767,3 +1769,5 @@ TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
     m.impl("fwd_combine", &mha_combine);
     m.impl("get_scheduler_metadata", &mha_fwd_get_scheduler_metadata);
 }
+
+#endif
