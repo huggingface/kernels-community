@@ -1,5 +1,6 @@
 #include <torch/all.h>
 #include <c10/xpu/XPUStream.h>
+#include <cute/util/compat/device.hpp>
 
 #include "src/fmha_fwd.hpp"
 
@@ -7,6 +8,9 @@ namespace FLASH_NAMESPACE {
 
 inline int round_multiple(int x, int m) {
     int pad_res = (x + m - 1) / m * m;
+    if (pad_res == 224) {
+        pad_res = 256;
+    }
     return pad_res;
 }
 
@@ -33,7 +37,7 @@ mha_fwd(
         std::optional<at::Generator> gen_) {
 
     auto device_idx = q.device().index();
-    COMPAT::select_device(device_idx);
+    compat::select_device(device_idx);
 
     // check inputs
     q = ensure_contiguous(q);
@@ -142,7 +146,7 @@ mha_varlen_fwd(
               std::optional<at::Generator> gen_) {
 
     auto device_idx = q.device().index();
-    COMPAT::select_device(device_idx);
+    compat::select_device(device_idx);
 
     // check inputs
     q = ensure_contiguous(q);

@@ -1,11 +1,7 @@
 #pragma once
+#include "fmha_fwd_types.hpp"
 #include "torch/all.h"
 #include <cute/tensor.hpp>
-
-enum class CutlassType {
-  half,
-  bfloat16,
-};
 
 inline CutlassType aten_to_Cutlass_dtype(const at::Tensor& input) {
   CutlassType cuType;
@@ -19,9 +15,6 @@ inline CutlassType aten_to_Cutlass_dtype(const at::Tensor& input) {
   }
   return cuType;
 }
-
-const int PipelineStages_Decode = 1;
-const int PipelineStages_Prefill = 2;
 
 using namespace cute;
 
