@@ -6,10 +6,9 @@ backends = ["cuda"]
 minver = "12.8"
 
 [torch]
+minver = "2.9"
 src = [
-    "torch-ext/pytorch_shim.h",
-    "torch-ext/torch_binding.cpp",
-    "torch-ext/torch_binding.h",
+    "flash-attn/flash_api.cpp",
 ]
 
 [kernel.flash_attn_sm80]
@@ -182,7 +181,6 @@ depends = [
 ]
 src = [
     "flash-attn/cuda_check.h",
-    "flash-attn/flash_api.cpp",
     "flash-attn/flash_fwd_combine.cu",
     "flash-attn/flash_fwd_combine_kernel.h",
     "flash-attn/flash_fwd_combine_launch_template.h",

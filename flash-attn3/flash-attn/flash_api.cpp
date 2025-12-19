@@ -1670,9 +1670,9 @@ mha_combine(at::Tensor out_partial,         // num_splits x batch_size x seqlen 
     return {out, softmax_lse};
 }
 
-#if false
+#include "../torch-ext/registration.h"
 
-TORCH_LIBRARY(flash_attn_3, m) {
+TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
     m.def("fwd("
         "Tensor q,"
         "Tensor k,"
@@ -1761,13 +1761,11 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
         "int sm_margin = 0) -> Tensor");
-}
 
-TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
     m.impl("fwd", &mha_fwd);
     m.impl("bwd", &mha_bwd);
     m.impl("fwd_combine", &mha_combine);
     m.impl("get_scheduler_metadata", &mha_fwd_get_scheduler_metadata);
 }
 
-#endif
+REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
