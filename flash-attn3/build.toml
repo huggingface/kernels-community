@@ -6,7 +6,6 @@ backends = ["cuda"]
 minver = "12.8"
 
 [torch]
-minver = "2.9"
 src = [
     "flash-attn/flash_api.cpp",
 ]
