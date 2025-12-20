@@ -336,20 +336,3 @@ void policy_dispatch(sycl::queue& queue, CutlassType cuType, const fmha_fwd_args
     }
   }
 }
-
-template <typename chunk_policy, int PipelineStages>
-void policy_dispatch_dynamic(sycl::queue& queue, CutlassType cuType, const fmha_fwd_args_t& args) {
-  if (args.is_varlen) {
-    if (args.is_paged) {
-      policy_dispatch<chunk_policy, PipelineStages, 1, 1>(queue, cuType, args);
-    } else {
-      policy_dispatch<chunk_policy, PipelineStages, 1, 0>(queue, cuType, args);
-    }
-  } else {
-    if (args.is_paged) {
-      policy_dispatch<chunk_policy, PipelineStages, 0, 1>(queue, cuType, args);
-    } else {
-      policy_dispatch<chunk_policy, PipelineStages, 0, 0>(queue, cuType, args);
-    }
-  }
-}

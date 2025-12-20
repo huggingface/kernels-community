@@ -91,26 +91,57 @@ void cutlass_fmha_fwd_varlen_impl(
   CutlassType cuType = aten_to_Cutlass_dtype(query);
 
   const int h = args.head_size;
+  
+  // Note: is_varlen is always true in this function (cutlass_fmha_fwd_varlen_impl)
+  // Only need to dispatch based on head size and paged mode
   if (h <= 32) {
-    policy_dispatch_dynamic<prefill_policy_head32, PipelineStages_Prefill>(queue, cuType, args);
+    if (args.is_paged) {
+      policy_dispatch<prefill_policy_head32, PipelineStages_Prefill, 1, 1>(queue, cuType, args);
+    } else {
+      policy_dispatch<prefill_policy_head32, PipelineStages_Prefill, 1, 0>(queue, cuType, args);
+    }
   }
   else if (h <= 64) {
-    policy_dispatch_dynamic<prefill_policy_head64, PipelineStages_Prefill>(queue, cuType, args);
+    if (args.is_paged) {
+      policy_dispatch<prefill_policy_head64, PipelineStages_Prefill, 1, 1>(queue, cuType, args);
+    } else {
+      policy_dispatch<prefill_policy_head64, PipelineStages_Prefill, 1, 0>(queue, cuType, args);
+    }
   }
   else if (h <= 96) {
-    policy_dispatch_dynamic<prefill_policy_head96, PipelineStages_Prefill>(queue, cuType, args);
+    if (args.is_paged) {
+      policy_dispatch<prefill_policy_head96, PipelineStages_Prefill, 1, 1>(queue, cuType, args);
+    } else {
+      policy_dispatch<prefill_policy_head96, PipelineStages_Prefill, 1, 0>(queue, cuType, args);
+    }
   }
   else if (h <= 128) {
-    policy_dispatch_dynamic<prefill_policy_head128, PipelineStages_Prefill>(queue, cuType, args);
+    if (args.is_paged) {
+      policy_dispatch<prefill_policy_head128, PipelineStages_Prefill, 1, 1>(queue, cuType, args);
+    } else {
+      policy_dispatch<prefill_policy_head128, PipelineStages_Prefill, 1, 0>(queue, cuType, args);
+    }
   }
   else if (h <= 160) {
-    policy_dispatch_dynamic<prefill_policy_head160, PipelineStages_Prefill>(queue, cuType, args);
+    if (args.is_paged) {
+      policy_dispatch<prefill_policy_head160, PipelineStages_Prefill, 1, 1>(queue, cuType, args);
+    } else {
+      policy_dispatch<prefill_policy_head160, PipelineStages_Prefill, 1, 0>(queue, cuType, args);
+    }
   }
   else if (h <= 192) {
-    policy_dispatch_dynamic<prefill_policy_head192, PipelineStages_Prefill>(queue, cuType, args);
+    if (args.is_paged) {
+      policy_dispatch<prefill_policy_head192, PipelineStages_Prefill, 1, 1>(queue, cuType, args);
+    } else {
+      policy_dispatch<prefill_policy_head192, PipelineStages_Prefill, 1, 0>(queue, cuType, args);
+    }
   }
   else if (h <= 256) {
-    policy_dispatch_dynamic<prefill_policy_head256, PipelineStages_Prefill>(queue, cuType, args);
+    if (args.is_paged) {
+      policy_dispatch<prefill_policy_head256, PipelineStages_Prefill, 1, 1>(queue, cuType, args);
+    } else {
+      policy_dispatch<prefill_policy_head256, PipelineStages_Prefill, 1, 0>(queue, cuType, args);
+    }
   }
   else {
     throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");

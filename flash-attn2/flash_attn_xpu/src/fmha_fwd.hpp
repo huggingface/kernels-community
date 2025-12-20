@@ -38,26 +38,37 @@ void policy_dispatch(
     CutlassType cuType, 
     const fmha_fwd_args_t& args);
 
-template <typename chunk_policy, int PipelineStages>
-void policy_dispatch_dynamic(
-    sycl::queue& queue, 
-    CutlassType cuType, 
-    const fmha_fwd_args_t& args);
+// Varlen mode extern declarations (IsVarLen=1, IsPaged=0/1)
+extern template void policy_dispatch<prefill_policy_head32, PipelineStages_Prefill, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<prefill_policy_head32, PipelineStages_Prefill, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<prefill_policy_head64, PipelineStages_Prefill, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<prefill_policy_head64, PipelineStages_Prefill, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<prefill_policy_head96, PipelineStages_Prefill, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<prefill_policy_head96, PipelineStages_Prefill, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<prefill_policy_head128, PipelineStages_Prefill, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<prefill_policy_head128, PipelineStages_Prefill, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<prefill_policy_head160, PipelineStages_Prefill, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<prefill_policy_head160, PipelineStages_Prefill, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<prefill_policy_head192, PipelineStages_Prefill, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<prefill_policy_head192, PipelineStages_Prefill, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<prefill_policy_head256, PipelineStages_Prefill, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<prefill_policy_head256, PipelineStages_Prefill, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
 
-extern template void policy_dispatch_dynamic<prefill_policy_head32, PipelineStages_Prefill>(
-    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
-extern template void policy_dispatch_dynamic<prefill_policy_head64, PipelineStages_Prefill>(
-    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
-extern template void policy_dispatch_dynamic<prefill_policy_head96, PipelineStages_Prefill>(
-    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
-extern template void policy_dispatch_dynamic<prefill_policy_head128, PipelineStages_Prefill>(
-    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
-extern template void policy_dispatch_dynamic<prefill_policy_head160, PipelineStages_Prefill>(
-    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
-extern template void policy_dispatch_dynamic<prefill_policy_head192, PipelineStages_Prefill>(
-    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
-extern template void policy_dispatch_dynamic<prefill_policy_head256, PipelineStages_Prefill>(
-    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+// Fixed mode extern declarations (IsVarLen=0, IsPaged=0)
 
 extern template void policy_dispatch<decode_policy_head32, PipelineStages_Decode, 0, 0>(
     sycl::queue&, CutlassType, const fmha_fwd_args_t&);
