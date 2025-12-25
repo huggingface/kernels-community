@@ -2,6 +2,8 @@
 
 #include <ATen/ATen.h>
 
+namespace flash_attn_cpu {
+
 // Forward declaration of the flash attention varlen implementation
 // 
 // Parameters:
@@ -27,3 +29,5 @@ void fmha_fwd_varlen_impl(
     int max_seqlen_k,
     float softmax_scale,
     bool is_causal);
+
+}  // namespace flash_attn_cpu

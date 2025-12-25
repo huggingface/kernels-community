@@ -69,7 +69,7 @@ mha_varlen_fwd(
     TORCH_CHECK(window_size_left == -1, "Sliding window attention (window_size_left != -1) is not supported in CPU implementation");
     TORCH_CHECK(window_size_right == -1, "Sliding window attention (window_size_right != -1) is not supported in CPU implementation");
 
-    fmha_fwd_varlen_impl(
+    flash_attn_cpu::fmha_fwd_varlen_impl(
         q, k_contig, v_contig, out,
         cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q, max_seqlen_k,
