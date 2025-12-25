@@ -29,10 +29,26 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  ****************************************************************************************/
-#include "common.h"
-#include "gemm.h"
-#include "vec.h"
-#include "vec_pack.h"
+
+
+// Define CPU_CAPABILITY_AVX512 before including ATen headers
+// This enables AVX512-specific code paths in PyTorch's Vectorized classes
+#if defined(__AVX512F__) && defined(__AVX512BF16__) && defined(__AMX_BF16__)
+#define CPU_CAPABILITY_AVX512
+#endif
+
+#include <ATen/ATen.h>
+#include <ATen/Parallel.h>
+#include <ATen/record_function.h>
+#include <ATen/cpu/vec/functional.h>
+#include <ATen/cpu/vec/vec.h>
+#include <ATen/native/CPUBlas.h>
+
+#include "fmha_fwd.hpp"
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 // [NOTE]: flash_attn_varlen_func for CPU
 //
@@ -40,6 +56,64 @@
 //
 
 namespace {
+
+//==============================================================================
+// Common utilities (from common.h)
+//==============================================================================
+
+#define CHECK_CPU(x) TORCH_CHECK(x.device().type() == at::kCPU, #x " must be a CPU tensor")
+
+#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_LAST_DIM_CONTIGUOUS(x) \
+  TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "must be contiguous at last dimension")
+
+#define CHECK_INPUT(x) \
+  CHECK_CPU(x);        \
+  CHECK_CONTIGUOUS(x)
+#define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
+  CHECK_CPU(x);                            \
+  CHECK_LAST_DIM_CONTIGUOUS(x)
+
+#define CHECK_DIM(d, x) TORCH_CHECK(x.dim() == d, #x " must be a " #d "D tensor")
+
+#define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
+
+template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
+inline T div_up(T x, T y) {
+  return (x + y - 1) / y;
+}
+
+inline int get_thread_num() {
+#if defined(_OPENMP)
+  return omp_get_thread_num();
+#else
+  return 0;
+#endif
+}
+
+// balance payload across each thread
+template <typename T>
+inline void balance211(T n, T nth, T ith, T& n_start, T& n_end) {
+  T n_my = div_up(n, nth);
+  n_start = ith * n_my;
+  n_end = std::min(n_start + n_my, n);
+}
+
+template <typename func_t>
+inline void parallel_for(int n, const func_t& f) {
+#if defined(_OPENMP)
+#pragma omp parallel
+  {
+    int nth = omp_get_num_threads();
+    int ith = omp_get_thread_num();
+    int tbegin, tend;
+    balance211(n, nth, ith, tbegin, tend);
+    f(tbegin, tend);
+  }
+#else
+  f(0, n);
+#endif
+}
 
 // data indexing for dimension collapse
 template <typename T>
@@ -67,65 +141,445 @@ inline bool data_index_step(T& x, const T& X, Args&&... args) {
   return false;
 }
 
-inline int get_thread_num() {
-#if defined(_OPENMP)
-  return omp_get_thread_num();
+// forced unroll for perf critical path
+#if __has_attribute(always_inline)
+#define ALWAYS_INLINE __attribute__((__always_inline__)) inline
 #else
-  return 0;
+#define ALWAYS_INLINE inline
 #endif
-}
 
-// balance payload across each thread
-template <typename T>
-inline void balance211(T n, T nth, T ith, T& n_start, T& n_end) {
-#if 0
-    // onednn partition pattern
-    T& n_my = n_end;
-    if (nth <= 1 || n == 0) {
-        n_start = 0;
-        n_my = n;
-    } else {
-        T n1 = div_up(n, nth);
-        T n2 = n1 - 1;
-        T T1 = n - n2 * nth;
-        n_my = ith < T1 ? n1 : n2;
-        n_start = ith <= T1 ? ith*n1 : T1 * n1 + (ith - T1) * n2;
-    }
-    n_end += n_start;
-#else
-  // pytorch aten partition pattern
-  T n_my = div_up(n, nth);
-  n_start = ith * n_my;
-  n_end = std::min(n_start + n_my, n);
-#endif
-}
-
-template <typename func_t>
-inline void parallel_for(int n, const func_t& f) {
-#if defined(_OPENMP)
-#pragma omp parallel
-  {
-    int nth = omp_get_num_threads();
-    int ith = omp_get_thread_num();
-    int tbegin, tend;
-    balance211(n, nth, ith, tbegin, tend);
-    f(tbegin, tend);
+template <int n>
+struct Unroll {
+  template <typename Func, typename... Args>
+  ALWAYS_INLINE void operator()(const Func& f, Args... args) const {
+    Unroll<n - 1>{}(f, args...);
+    f(std::integral_constant<int, n - 1>{}, args...);
   }
-#else
-  f(0, n);
-#endif
-}
-
-template <typename scalar_t, typename std::enable_if_t<at::vec::is_reduced_floating_point_v<scalar_t>, int> = 0>
-inline at::vec::Vectorized<scalar_t> convert_from_float_ext(const at::vec::Vectorized<float>& a, const at::vec::Vectorized<float>& b) {
-    return at::vec::convert_from_float<scalar_t>(a, b);
-}
+};
 
 template <>
-inline at::vec::Vectorized<at::BFloat16>
-convert_from_float_ext<at::BFloat16>(const at::vec::Vectorized<float>& a, const at::vec::Vectorized<float>& b) {
-    return (__m512i)(_mm512_cvtne2ps_pbh(__m512(b), __m512(a)));
+struct Unroll<1> {
+  template <typename Func, typename... Args>
+  ALWAYS_INLINE void operator()(const Func& f, Args... args) const {
+    f(std::integral_constant<int, 0>{}, args...);
+  }
+};
+
+//==============================================================================
+// GEMM utilities (from gemm.h)
+//==============================================================================
+
+// amx-bf16
+#define TILE_M 16
+#define TILE_N 16
+#define TILE_K 32
+
+//==============================================================================
+// Vector utilities (from vec.h)
+//==============================================================================
+
+using namespace at::vec;
+
+template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 0>
+inline Vectorized<scalar_t> convert_from_float_ext(const Vectorized<float>& a, const Vectorized<float>& b) {
+  return at::vec::convert_from_float<scalar_t>(a, b);
 }
+
+#if defined(CPU_CAPABILITY_AVX512)
+
+// `at::vec::convert_from_float<>` from PyTorch doesn't have avx512-bf16 intrinsics
+// use native instruction for bfloat16->float32 conversion
+template <>
+inline Vectorized<at::BFloat16>
+convert_from_float_ext<at::BFloat16>(const Vectorized<float>& a, const Vectorized<float>& b) {
+  return (__m512i)(_mm512_cvtne2ps_pbh(__m512(b), __m512(a)));
+}
+
+//==============================================================================
+// Transpose utilities (from vec.h)
+//==============================================================================
+
+inline void transpose_16x16_32bit(__m512i* v) {
+  __m512i v1[16];
+  v1[0] = _mm512_unpacklo_epi32(v[0], v[1]);
+  v1[1] = _mm512_unpackhi_epi32(v[0], v[1]);
+  v1[2] = _mm512_unpacklo_epi32(v[2], v[3]);
+  v1[3] = _mm512_unpackhi_epi32(v[2], v[3]);
+  v1[4] = _mm512_unpacklo_epi32(v[4], v[5]);
+  v1[5] = _mm512_unpackhi_epi32(v[4], v[5]);
+  v1[6] = _mm512_unpacklo_epi32(v[6], v[7]);
+  v1[7] = _mm512_unpackhi_epi32(v[6], v[7]);
+  v1[8] = _mm512_unpacklo_epi32(v[8], v[9]);
+  v1[9] = _mm512_unpackhi_epi32(v[8], v[9]);
+  v1[10] = _mm512_unpacklo_epi32(v[10], v[11]);
+  v1[11] = _mm512_unpackhi_epi32(v[10], v[11]);
+  v1[12] = _mm512_unpacklo_epi32(v[12], v[13]);
+  v1[13] = _mm512_unpackhi_epi32(v[12], v[13]);
+  v1[14] = _mm512_unpacklo_epi32(v[14], v[15]);
+  v1[15] = _mm512_unpackhi_epi32(v[14], v[15]);
+
+  v[0] = _mm512_unpacklo_epi64(v1[0], v1[2]);
+  v[1] = _mm512_unpackhi_epi64(v1[0], v1[2]);
+  v[2] = _mm512_unpacklo_epi64(v1[1], v1[3]);
+  v[3] = _mm512_unpackhi_epi64(v1[1], v1[3]);
+  v[4] = _mm512_unpacklo_epi64(v1[4], v1[6]);
+  v[5] = _mm512_unpackhi_epi64(v1[4], v1[6]);
+  v[6] = _mm512_unpacklo_epi64(v1[5], v1[7]);
+  v[7] = _mm512_unpackhi_epi64(v1[5], v1[7]);
+  v[8] = _mm512_unpacklo_epi64(v1[8], v1[10]);
+  v[9] = _mm512_unpackhi_epi64(v1[8], v1[10]);
+  v[10] = _mm512_unpacklo_epi64(v1[9], v1[11]);
+  v[11] = _mm512_unpackhi_epi64(v1[9], v1[11]);
+  v[12] = _mm512_unpacklo_epi64(v1[12], v1[14]);
+  v[13] = _mm512_unpackhi_epi64(v1[12], v1[14]);
+  v[14] = _mm512_unpacklo_epi64(v1[13], v1[15]);
+  v[15] = _mm512_unpackhi_epi64(v1[13], v1[15]);
+
+  v1[0] = _mm512_shuffle_i32x4(v[0], v[4], 0x88);
+  v1[1] = _mm512_shuffle_i32x4(v[1], v[5], 0x88);
+  v1[2] = _mm512_shuffle_i32x4(v[2], v[6], 0x88);
+  v1[3] = _mm512_shuffle_i32x4(v[3], v[7], 0x88);
+  v1[4] = _mm512_shuffle_i32x4(v[0], v[4], 0xdd);
+  v1[5] = _mm512_shuffle_i32x4(v[1], v[5], 0xdd);
+  v1[6] = _mm512_shuffle_i32x4(v[2], v[6], 0xdd);
+  v1[7] = _mm512_shuffle_i32x4(v[3], v[7], 0xdd);
+  v1[8] = _mm512_shuffle_i32x4(v[8], v[12], 0x88);
+  v1[9] = _mm512_shuffle_i32x4(v[9], v[13], 0x88);
+  v1[10] = _mm512_shuffle_i32x4(v[10], v[14], 0x88);
+  v1[11] = _mm512_shuffle_i32x4(v[11], v[15], 0x88);
+  v1[12] = _mm512_shuffle_i32x4(v[8], v[12], 0xdd);
+  v1[13] = _mm512_shuffle_i32x4(v[9], v[13], 0xdd);
+  v1[14] = _mm512_shuffle_i32x4(v[10], v[14], 0xdd);
+  v1[15] = _mm512_shuffle_i32x4(v[11], v[15], 0xdd);
+
+  v[0] = _mm512_shuffle_i32x4(v1[0], v1[8], 0x88);
+  v[1] = _mm512_shuffle_i32x4(v1[1], v1[9], 0x88);
+  v[2] = _mm512_shuffle_i32x4(v1[2], v1[10], 0x88);
+  v[3] = _mm512_shuffle_i32x4(v1[3], v1[11], 0x88);
+  v[4] = _mm512_shuffle_i32x4(v1[4], v1[12], 0x88);
+  v[5] = _mm512_shuffle_i32x4(v1[5], v1[13], 0x88);
+  v[6] = _mm512_shuffle_i32x4(v1[6], v1[14], 0x88);
+  v[7] = _mm512_shuffle_i32x4(v1[7], v1[15], 0x88);
+  v[8] = _mm512_shuffle_i32x4(v1[0], v1[8], 0xdd);
+  v[9] = _mm512_shuffle_i32x4(v1[1], v1[9], 0xdd);
+  v[10] = _mm512_shuffle_i32x4(v1[2], v1[10], 0xdd);
+  v[11] = _mm512_shuffle_i32x4(v1[3], v1[11], 0xdd);
+  v[12] = _mm512_shuffle_i32x4(v1[4], v1[12], 0xdd);
+  v[13] = _mm512_shuffle_i32x4(v1[5], v1[13], 0xdd);
+  v[14] = _mm512_shuffle_i32x4(v1[6], v1[14], 0xdd);
+  v[15] = _mm512_shuffle_i32x4(v1[7], v1[15], 0xdd);
+}
+
+// remove warning : ignoring attributes on template argument '__m512i' [-Wignored-attributes]
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wignored-attributes"
+
+// transpose from [2, 32] to [32, 2]
+inline std::tuple<__m512i, __m512i> transpose_2x32_16bit(__m512i r0, __m512i r1) {
+  __m512i d0 = _mm512_unpacklo_epi16(r0, r1);
+  __m512i d1 = _mm512_unpackhi_epi16(r0, r1);
+  r0 = _mm512_shuffle_i32x4(d0, d1, 0x88);
+  r1 = _mm512_shuffle_i32x4(d0, d1, 0xdd);
+  d0 = _mm512_shuffle_i32x4(r0, r1, 0x88);
+  d1 = _mm512_shuffle_i32x4(r0, r1, 0xdd);
+  return std::make_tuple(d0, d1);
+}
+#pragma GCC diagnostic pop
+
+#endif  // CPU_CAPABILITY_AVX512
+
+//==============================================================================
+// VNNI packing utilities (from vec_pack.h)
+//==============================================================================
+
+template <typename index_t>
+inline index_t get_index(index_t* ind, int i) {
+  return (ind == nullptr) ? (index_t)i : ind[i];
+}
+
+#if defined(CPU_CAPABILITY_AVX512)
+
+// key: from [N, 32] to [32/2, N, 2]
+template <typename scalar_t, typename index_t>
+inline void pack_vnni_Nx32(
+    scalar_t* __restrict__ dst,
+    const scalar_t* __restrict__ src,
+    const index_t* __restrict__ ind,
+    int N,
+    int ld_src,
+    int ld_dst) {
+  __m512i vinputs[16];
+
+  int n = 0;
+  for (; n < N; ++n) {
+    index_t index = get_index(ind, n);
+    vinputs[n] = _mm512_loadu_si512(src + index * ld_src);
+  }
+  // padding with zero to avoid uninitialized vectors
+  for (; n < 16; ++n) {
+    vinputs[n] = _mm512_set1_epi32(0);
+  }
+
+  // pack key
+  transpose_16x16_32bit(vinputs);
+
+  const __mmask16 vmask = (1 << N) - 1;
+  for (int k = 0; k < 16; ++k) {
+    _mm512_mask_storeu_epi32(dst + k * ld_dst * 2, vmask, vinputs[k]);
+  }
+}
+
+template <typename scalar_t, typename index_t>
+inline void pack_vnni_N_remainder(
+    scalar_t* __restrict__ dst,
+    const scalar_t* __restrict__ src,
+    const index_t* __restrict__ ind,
+    int N,
+    int K,
+    int ld_src,
+    int ld_dst) {
+  __m512i vinputs[16];
+
+  int K2 = K >> 1;
+  const __mmask16 vmask = (1 << K2) - 1;
+
+  int n = 0;
+  for (; n < N; ++n) {
+    index_t index = get_index(ind, n);
+    vinputs[n] = _mm512_maskz_loadu_epi32(vmask, src + index * ld_src);
+  }
+  // padding with zero to avoid uninitialized vectors
+  for (; n < 16; ++n) {
+    vinputs[n] = _mm512_set1_epi32(0);
+  }
+
+  // pack key
+  transpose_16x16_32bit(vinputs);
+
+  const __mmask16 vmask2 = (1 << N) - 1;
+  for (int k = 0; k < K2; ++k) {
+    _mm512_mask_storeu_epi32(dst + k * ld_dst * 2, vmask2, vinputs[k]);
+  }
+}
+
+// value: from [K, 32] to [K/2, 32, 2]
+template <typename scalar_t, typename index_t>
+inline void pack_vnni_Kx32(
+    scalar_t* __restrict__ dst,
+    const scalar_t* __restrict__ src,
+    const index_t* __restrict__ ind,
+    int K,
+    int ld_src,
+    int ld_dst) {
+  __m512i vinputs[2];
+
+  int k = 0;
+  for (; k < K; ++k) {
+    index_t index = get_index(ind, k);
+    vinputs[k] = _mm512_loadu_si512(src + index * ld_src);
+  }
+  // padding with zero to avoid uninitialized vectors
+  for (; k < 2; ++k) {
+    vinputs[k] = _mm512_set1_epi32(0);
+  }
+
+  // pack value
+  __m512i d0, d1;
+  std::tie(d0, d1) = transpose_2x32_16bit(vinputs[0], vinputs[1]);
+  _mm512_storeu_si512(dst + 0 * ld_dst * 2, d0);
+  _mm512_storeu_si512(dst + 0 * ld_dst * 2 + 32, d1);
+}
+
+template <typename scalar_t, typename index_t>
+inline void pack_vnni_K_remainder(
+    scalar_t* __restrict__ dst,
+    const scalar_t* __restrict__ src,
+    const index_t* __restrict__ ind,
+    int K,
+    int N,
+    int ld_src,
+    int ld_dst) {
+  __m512i vinputs[2];
+
+  const __mmask32 vmask = (1 << N) - 1;
+
+  int k = 0;
+  for (; k < K; ++k) {
+    index_t index = get_index(ind, k);
+    vinputs[k] = _mm512_maskz_loadu_epi16(vmask, src + index * ld_src);
+  }
+  // padding with zero to avoid uninitialized vectors
+  for (; k < 2; ++k) {
+    vinputs[k] = _mm512_set1_epi32(0);
+  }
+
+  // pack value
+  __m512i d0, d1;
+  std::tie(d0, d1) = transpose_2x32_16bit(vinputs[0], vinputs[1]);
+
+  if (N <= 16) {
+    // 2N * 16bits: N * 32bits
+    const __mmask16 vmask2 = (1 << N) - 1;
+    _mm512_mask_storeu_epi32(dst + 0 * ld_dst * 2, vmask2, d0);
+  } else {
+    // 2(N-16) * 16bits: (N-16) * 32bits
+    const __mmask16 vmask2 = (1 << (N - 16)) - 1;
+    _mm512_storeu_epi32(dst + 0 * ld_dst * 2, d0);
+    _mm512_mask_storeu_epi32(dst + 0 * ld_dst * 2 + 32, vmask2, d1);
+  }
+}
+#endif  // CPU_CAPABILITY_AVX512
+
+// convert to vnni format
+// from [N, K/2, 2] to [K/2, N, 2] for bfloat16 and float16
+template <typename scalar_t, typename index_t, bool is_indexed>
+void pack_vnni(
+    scalar_t* __restrict__ dst,
+    const scalar_t* __restrict__ src,
+    const index_t* __restrict__ ind,
+    int N,
+    int K,
+    int ld_src,
+    int ld_dst) {
+#if defined(CPU_CAPABILITY_AVX512)
+  const int NB = div_up(N, 16);
+  const int KB = K / 32;
+  const int K_remainder = K - KB * 32;
+
+  for (int nb = 0; nb < NB; ++nb) {
+    int nb_size = std::min(N - nb * 16, 16);
+    for (int kb = 0; kb < KB; ++kb) {
+      // handle 16x512bits each block
+      pack_vnni_Nx32<scalar_t, index_t>(
+          /*    dst */ dst + ((kb * 32) >> 1) * ld_dst * 2 + nb * 16 * 2,
+          /*    src */ src + kb * 32 + (is_indexed ? 0 : nb * 16 * ld_src),
+          /*    ind */ is_indexed ? ind + nb * 16 : nullptr,
+          /*      N */ nb_size,
+          /* ld_src */ ld_src,
+          /* ld_dst */ ld_dst);
+    }
+    if (K_remainder > 0) {
+      pack_vnni_N_remainder<scalar_t, index_t>(
+          /*    dst */ dst + ((KB * 32) >> 1) * ld_dst * 2 + nb * 16 * 2,
+          /*    src */ src + KB * 32 + (is_indexed ? 0 : nb * 16 * ld_src),
+          /*    ind */ is_indexed ? ind + nb * 16 : nullptr,
+          /*      N */ nb_size,
+          /*      K */ K_remainder,
+          /* ld_src */ ld_src,
+          /* ld_dst */ ld_dst);
+    }
+  }
+#else
+  for (int n = 0; n < N; ++n) {
+    index_t index = get_index(ind, n);
+    for (int k = 0; k < K / 2; ++k) {
+      for (int d = 0; d < 2; ++d) {
+        dst[k * ld_dst * 2 + n * 2 + d] = src[index * ld_src + k * 2 + d];
+      }
+    }
+  }
+#endif
+}
+
+template <typename scalar_t>
+void pack_vnni(scalar_t* __restrict__ dst, const scalar_t* __restrict__ src, int N, int K, int ld_src, int ld_dst) {
+  pack_vnni<scalar_t, int32_t, false>(dst, src, nullptr, N, K, ld_src, ld_dst);
+}
+
+template <typename scalar_t, typename index_t>
+void pack_vnni(
+    scalar_t* __restrict__ dst,
+    const scalar_t* __restrict__ src,
+    const index_t* __restrict__ ind,
+    int N,
+    int K,
+    int ld_src,
+    int ld_dst) {
+  assert(ind != nullptr);
+  pack_vnni<scalar_t, index_t, true>(dst, src, ind, N, K, ld_src, ld_dst);
+}
+
+// convert to vnni format
+// from [K/2, 2, N] to [K/2, N, 2] for bfloat16 and float16
+template <typename scalar_t, typename index_t, bool is_indexed>
+void pack_vnni2(
+    scalar_t* __restrict__ dst,
+    const scalar_t* __restrict__ src,
+    const index_t* __restrict__ ind,
+    int K,
+    int N,
+    int ld_src,
+    int ld_dst) {
+#if defined(CPU_CAPABILITY_AVX512)
+  const int KB = div_up(K, 2);
+  const int NB = N / 32;
+  const int N_remainder = N - NB * 32;
+
+  for (int kb = 0; kb < KB; ++kb) {
+    int kb_size = std::min(K - kb * 2, 2);
+    for (int nb = 0; nb < NB; ++nb) {
+      // handle 2x512bits each block
+      pack_vnni_Kx32<scalar_t, index_t>(
+          /*    dst */ dst + ((kb * 2) >> 1) * ld_dst * 2 + nb * 32 * 2,
+          /*    src */ src + (is_indexed ? 0 : kb * 2 * ld_src) + nb * 32,
+          /*    ind */ is_indexed ? ind + kb * 2 : nullptr,
+          /*      K */ kb_size,
+          /* ld_src */ ld_src,
+          /* ld_dst */ ld_dst);
+    }
+    if (N_remainder > 0) {
+      pack_vnni_K_remainder(
+          /*    dst */ dst + ((kb * 2) >> 1) * ld_dst * 2 + NB * 32 * 2,
+          /*    src */ src + (is_indexed ? 0 : kb * 2 * ld_src) + NB * 32,
+          /*    ind */ is_indexed ? ind + kb * 2 : nullptr,
+          /*      K */ kb_size,
+          /*      N */ N_remainder,
+          /* ld_src */ ld_src,
+          /* ld_dst */ ld_dst);
+    }
+  }
+#else
+  int k = 0;
+  for (; k < (K >> 1) * 2; k += 2) {
+    index_t index0 = get_index(ind, k + 0);
+    index_t index1 = get_index(ind, k + 1);
+    for (int n = 0; n < N; ++n) {
+      dst[(k >> 1) * ld_dst * 2 + n * 2 + 0] = src[index0 * ld_src + n];
+      dst[(k >> 1) * ld_dst * 2 + n * 2 + 1] = src[index1 * ld_src + n];
+    }
+  }
+  if (K % 2 != 0) {
+    index_t index = get_index(ind, K - 1);
+    for (int n = 0; n < N; ++n) {
+      dst[(K >> 1) * ld_dst * 2 + n * 2 + 0] = src[index * ld_src + n];
+      dst[(K >> 1) * ld_dst * 2 + n * 2 + 1] = 0;
+    }
+    k += 2;
+  }
+#endif
+}
+
+template <typename scalar_t>
+void pack_vnni2(scalar_t* __restrict__ dst, const scalar_t* __restrict__ src, int K, int N, int ld_src, int ld_dst) {
+  pack_vnni2<scalar_t, int32_t, false>(dst, src, nullptr, K, N, ld_src, ld_dst);
+}
+
+template <typename scalar_t, typename index_t>
+void pack_vnni2(
+    scalar_t* __restrict__ dst,
+    const scalar_t* __restrict__ src,
+    const index_t* __restrict__ ind,
+    int K,
+    int N,
+    int ld_src,
+    int ld_dst) {
+  assert(ind != nullptr);
+  pack_vnni2<scalar_t, index_t, true>(dst, src, ind, K, N, ld_src, ld_dst);
+}
+
+//==============================================================================
+// Flash Attention Kernel Implementation
+//==============================================================================
 
 template <typename scalar_t>
 inline void fill_stub(scalar_t* __restrict__ out, float val, int size) {
@@ -521,4 +975,103 @@ at::Tensor flash_attn_varlen_func(
   });
 
   return out;
+}
+
+// Wrapper function for flash_api.cpp
+// This version takes softmax_scale as input and writes to provided output tensor
+void fmha_fwd_varlen_impl(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    at::Tensor& out,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& cu_seqlens_k,
+    int max_seqlen_q,
+    int max_seqlen_k,
+    float softmax_scale,
+    bool is_causal) {
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
+  CHECK_DIM(3, q);
+  CHECK_DIM(3, k);
+  CHECK_DIM(3, v);
+  CHECK_INPUT(cu_seqlens_q);
+  CHECK_INPUT(cu_seqlens_k);
+  CHECK_EQ(cu_seqlens_q.scalar_type(), at::kInt);
+  CHECK_EQ(cu_seqlens_k.scalar_type(), at::kInt);
+
+  int num_seqs = cu_seqlens_q.size(0) - 1;
+  int num_tokens = q.size(0);
+  int num_heads = q.size(1);
+  int num_heads_kv = k.size(1);
+  int head_size = q.size(2);
+  int head_size_v = v.size(2);
+
+  // strides for q, k and v
+  int q_strideM = q.stride(0);
+  int q_strideH = q.stride(1);
+  int k_strideN = k.stride(0);
+  int k_strideH = k.stride(1);
+  int v_strideN = v.stride(0);
+  int v_strideH = v.stride(1);
+
+  // check sizes
+  CHECK_EQ(k.size(2), head_size);
+  CHECK_EQ(v.size(1), num_heads_kv);
+  CHECK_EQ(cu_seqlens_k.size(0), num_seqs + 1);
+
+  // D and DV need to be even as we transpose by 512-bit
+  TORCH_CHECK(head_size % 2 == 0, "invalid head_size ", head_size);
+  TORCH_CHECK(head_size_v % 2 == 0, "invalid head_size_v ", head_size_v);
+
+  // Use default softmax_scale if not provided (0 or NaN)
+  float sm_scale = softmax_scale;
+  if (sm_scale == 0.0f || std::isnan(sm_scale)) {
+    sm_scale = 1.0f / std::sqrt(static_cast<float>(head_size));
+  }
+
+  int num_threads = at::get_num_threads();
+  at::Tensor buffer = at::empty({}, q.options().dtype(at::kChar));
+  at::Tensor indices = at::empty({}, q.options().dtype(at::kInt));
+
+  // Resize output if needed
+  if (out.numel() == 0) {
+    out.resize_({num_tokens, num_heads, head_size_v});
+  }
+
+  constexpr int BLOCK_M = 256;
+  constexpr int BLOCK_N = 768;
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "fmha_fwd_varlen_impl", [&] {
+    int sz = resize_buffer<BLOCK_M, BLOCK_N>(buffer, num_threads, head_size, head_size_v);
+    resize_indices<BLOCK_M>(indices, num_seqs, max_seqlen_q);
+
+    flash_attn_varlen_kernel_impl<scalar_t, BLOCK_M, BLOCK_N>(
+        out.data_ptr<scalar_t>(),
+        q.data_ptr<scalar_t>(),
+        k.data_ptr<scalar_t>(),
+        v.data_ptr<scalar_t>(),
+        cu_seqlens_q.data_ptr<int32_t>(),
+        cu_seqlens_k.data_ptr<int32_t>(),
+        buffer.data_ptr(),
+        indices.data_ptr<int32_t>(),
+        max_seqlen_q,
+        max_seqlen_k,
+        num_seqs,
+        num_heads,
+        num_heads_kv,
+        head_size,
+        head_size_v,
+        q_strideM,
+        q_strideH,
+        k_strideN,
+        k_strideH,
+        v_strideN,
+        v_strideH,
+        sm_scale,
+        sz,
+        is_causal);
+  });
 }

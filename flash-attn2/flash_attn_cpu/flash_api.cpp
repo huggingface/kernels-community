@@ -95,17 +95,20 @@ mha_varlen_fwd(
 
     bool is_paged = block_table_.has_value() && block_table_->defined();
 
+    // Current implementation limitations
+    TORCH_CHECK(!is_paged, "Paged cache is not supported in CPU implementation");
+    TORCH_CHECK(window_size_left == -1, "Sliding window attention (window_size_left != -1) is not supported in CPU implementation");
+    TORCH_CHECK(window_size_right == -1, "Sliding window attention (window_size_right != -1) is not supported in CPU implementation");
+
     q_padded = ensure_contiguous(q_padded);
     k_padded = ensure_contiguous(k_padded);
     v_padded = ensure_contiguous(v_padded);
 
     fmha_fwd_varlen_impl(
-        q_padded, k_padded, v_padded, out_padded, block_table_,
+        q_padded, k_padded, v_padded, out_padded,
         cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q, max_seqlen_k,
-        softmax_scale,
-        window_size_left, window_size_right,
-        true, is_paged, is_causal);
+        softmax_scale, is_causal);
 
     // Remove padding from output
     at::Tensor out = out_padded;
