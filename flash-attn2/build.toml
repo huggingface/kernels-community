@@ -1,10 +1,6 @@
 [general]
 name = "flash-attn2"
-backends = [
-    "cpu",
-    "cuda",
-    "xpu",
-]
+universal=false
 
 [torch]
 src = [
