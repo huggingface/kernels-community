@@ -140,3 +140,14 @@ src = [
   "flash_attn_xpu/src/kernel/varlen_kernel.hpp",
 ]
 depends = ["torch", "cutlass_sycl"]
+
+[kernel.flash_attn_cpu]
+backend = "cpu"
+depends = ["torch"]
+src = [
+  "flash_attn_cpu/flash_api.cpp",
+  "flash_attn_cpu/src/fmha_fwd.cpp",
+  "flash_attn_cpu/src/fmha_fwd.hpp",
+]
+include = ["flash_attn_cpu"]
+cxx-flags = ["-fopenmp", "-mavx512f", "-mavx512bf16", "-mavx512vl", "-mavx512dq", "-mavx512bw", "-mamx-bf16", "-mamx-int8", "-mamx-tile"]
