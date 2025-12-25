@@ -9,5 +9,4 @@ def device(request):
     elif torch.xpu.is_available():
         return "xpu"
     else:
-        return pytest.skip("No supported device found (CUDA or XPU)")
-        
+        return "cpu"
