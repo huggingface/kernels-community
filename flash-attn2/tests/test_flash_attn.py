@@ -1450,9 +1450,9 @@ def test_flash_attn_varlen_output(
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
-    if torch.xpu.is_available():
+    if device in ["xpu", "cpu"]:
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
-        print("XPU does not support backward currentlly, skipping grad check.")
+        print("XPU and CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out)
