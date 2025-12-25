@@ -50,9 +50,10 @@
 #include <omp.h>
 #endif
 
-// [NOTE]: flash_attn_varlen_func for CPU
+// [NOTE]: Flash Attention Varlen CPU Implementation
 //
-//   this one is the same as 2nd stage of `extend_attention`
+// This is a CPU implementation of flash attention using AMX/BRGEMM.
+// Supports both prefill (seqlen_q == seqlen_k) and decode (seqlen_q < seqlen_k) scenarios.
 //
 
 namespace {
@@ -188,7 +189,7 @@ inline Vectorized<scalar_t> convert_from_float_ext(const Vectorized<float>& a, c
 #if defined(CPU_CAPABILITY_AVX512)
 
 // `at::vec::convert_from_float<>` from PyTorch doesn't have avx512-bf16 intrinsics
-// use native instruction for bfloat16->float32 conversion
+// use native instruction for float32->bfloat16 conversion
 template <>
 inline Vectorized<at::BFloat16>
 convert_from_float_ext<at::BFloat16>(const Vectorized<float>& a, const Vectorized<float>& b) {
@@ -742,7 +743,13 @@ void flash_attn_varlen_kernel_impl(
       fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
 
       int seqlen_k = cu_seqlens_k[bs + 1] - cu_seqlens_k[bs];
-      int num_keys = causal ? std::min(m + m_size, seqlen_k) : seqlen_k;
+      // For causal attention, each query at position q_pos can only attend to keys at positions <= q_pos
+      // The query positions in this block are [m, m + m_size), so the last query is at position (m + m_size - 1)
+      // Therefore, we need all keys from [0, m + m_size) to attend properly
+      // But we also need to consider when seqlen_q != seqlen_k (e.g., decoding with KV cache)
+      // In decoding: seqlen_q = 1, and the query should attend to all seqlen_k keys
+      // The actual query position in the full sequence is (seqlen_k - seqlen_q + m + row)
+      int num_keys = causal ? std::min(seqlen_k - seqlen_q + m + m_size, seqlen_k) : seqlen_k;
       for (int n = 0; n < num_keys; n += BLOCK_N) {
         int n_size = std::min(BLOCK_N, num_keys - n);
 
@@ -772,12 +779,21 @@ void flash_attn_varlen_kernel_impl(
             /* C     */ s_i);
 
         // apply causal mask
+        // For causal attention with different seqlen_q and seqlen_k (e.g., decoding with KV cache):
+        // Query at local position 'row' (within this block) corresponds to global position (m + row) in query sequence
+        // Its actual position in the key sequence is: seqlen_k - seqlen_q + m + row
+        // It can only attend to keys at positions <= its position
         if (causal && num_keys - n <= BLOCK_N) {
           for (int row = 0; row < m_size; ++row) {
-            int last_col = m + row - n;
+            // Global query position in key sequence
+            int q_pos_in_k = seqlen_k - seqlen_q + m + row;
+            int last_col = q_pos_in_k - n;
             // fill [last_col + 1, n_size) to -inf
-            float* row_ptr = s_i + row * BLOCK_N;
-            fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);
+            if (last_col < n_size - 1) {
+              float* row_ptr = s_i + row * BLOCK_N;
+              int start_col = std::max(0, last_col + 1);
+              fill_stub(row_ptr + start_col, -std::numeric_limits<float>::infinity(), n_size - start_col);
+            }
           }
         }
 
@@ -874,111 +890,20 @@ inline void resize_indices(at::Tensor& indices, int num_seqs, int max_seqlen_q) 
   indices.resize_({num_seqs, div_up(max_seqlen_q, BLOCK_M), 2});
 }
 
-// [NOTE]: `flash_attn_varlen_func` AMX kernel
+// [NOTE]: `fmha_fwd_varlen_impl` - Flash Attention Varlen Implementation using AMX
 //
+// Inputs:
 //   q: [num_tokens, num_heads, head_size]
 //   k: [num_tokens, num_heads_kv, head_size]
 //   v: [num_tokens, num_heads_kv, head_size_v]
+//   out: [num_tokens, num_heads, head_size_v] - output tensor
 //   cu_seqlens_q: [num_seqs + 1]
 //   cu_seqlens_k: [num_seqs + 1]
-//   out: [num_tokens, num_heads, head_size_v]
+//   max_seqlen_q: maximum query sequence length
+//   max_seqlen_k: maximum key sequence length
+//   softmax_scale: scaling factor (use 0 for default 1/sqrt(head_size))
+//   is_causal: whether to apply causal masking
 //
-at::Tensor flash_attn_varlen_func(
-    const at::Tensor& q,
-    const at::Tensor& k,
-    const at::Tensor& v,
-    const at::Tensor& cu_seqlens_q,
-    const at::Tensor& cu_seqlens_k,
-    int64_t max_seqlen_q,
-    int64_t max_seqlen_k,
-    bool causal) {
-  RECORD_FUNCTION(
-      "sgl_kernel::flash_attn_varlen_func",
-      std::vector<c10::IValue>({q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal}));
-
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
-  CHECK_DIM(3, q);
-  CHECK_DIM(3, k);
-  CHECK_DIM(3, v);
-  CHECK_INPUT(cu_seqlens_q);
-  CHECK_INPUT(cu_seqlens_k);
-  CHECK_EQ(cu_seqlens_q.scalar_type(), at::kInt);
-  CHECK_EQ(cu_seqlens_k.scalar_type(), at::kInt);
-
-  int num_seqs = cu_seqlens_q.size(0) - 1;
-  int num_tokens = q.size(0);
-  int num_heads = q.size(1);
-  int num_heads_kv = k.size(1);
-  int head_size = q.size(2);
-  int head_size_v = v.size(2);
-
-  // strides for q, k and v
-  int q_strideM = q.stride(0);
-  int q_strideH = q.stride(1);
-  int k_strideN = k.stride(0);
-  int k_strideH = k.stride(1);
-  int v_strideN = v.stride(0);
-  int v_strideH = v.stride(1);
-
-  // check sizes
-  CHECK_EQ(k.size(2), head_size);
-  CHECK_EQ(v.size(1), num_heads_kv);
-  CHECK_EQ(cu_seqlens_k.size(0), num_seqs + 1);
-
-  // D and DV need to be even as we transpose by 512-bit
-  TORCH_CHECK(head_size % 2 == 0, "invalid head_size ", head_size);
-  TORCH_CHECK(head_size_v % 2 == 0, "invalid head_size_v ", head_size_v);
-
-  // softmax scale
-  double sm_scale = 1.0 / std::sqrt(static_cast<double>(head_size));
-
-  int num_threads = at::get_num_threads();
-  at::Tensor buffer = at::empty({}, q.options().dtype(at::kChar));
-  at::Tensor indices = at::empty({}, q.options().dtype(at::kInt));
-  at::Tensor out = at::empty({num_tokens, num_heads, head_size_v}, q.options());
-
-  // TODO: tune the block size
-  constexpr int BLOCK_M = 256;
-  constexpr int BLOCK_N = 768;
-
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "flash_attn_varlen_func", [&] {
-    int sz = resize_buffer<BLOCK_M, BLOCK_N>(buffer, num_threads, head_size, head_size_v);
-    resize_indices<BLOCK_M>(indices, num_seqs, max_seqlen_q);
-
-    flash_attn_varlen_kernel_impl<scalar_t, BLOCK_M, BLOCK_N>(
-        out.data_ptr<scalar_t>(),
-        q.data_ptr<scalar_t>(),
-        k.data_ptr<scalar_t>(),
-        v.data_ptr<scalar_t>(),
-        cu_seqlens_q.data_ptr<int32_t>(),
-        cu_seqlens_k.data_ptr<int32_t>(),
-        buffer.data_ptr(),
-        indices.data_ptr<int32_t>(),
-        max_seqlen_q,
-        max_seqlen_k,
-        num_seqs,
-        num_heads,
-        num_heads_kv,
-        head_size,
-        head_size_v,
-        q_strideM,
-        q_strideH,
-        k_strideN,
-        k_strideH,
-        v_strideN,
-        v_strideH,
-        sm_scale,
-        sz,
-        causal);
-  });
-
-  return out;
-}
-
-// Wrapper function for flash_api.cpp
-// This version takes softmax_scale as input and writes to provided output tensor
 void fmha_fwd_varlen_impl(
     const at::Tensor& q,
     const at::Tensor& k,
