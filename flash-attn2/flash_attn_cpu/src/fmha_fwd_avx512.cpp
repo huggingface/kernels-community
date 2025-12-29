@@ -22,7 +22,7 @@ namespace avx512 {
 using namespace at::vec;
 
 //==============================================================================
-// AVX512 specific: float32->bfloat16 conversion using native instruction
+// AVX512 specific: float32->bfloat16/float16 conversion
 //==============================================================================
 
 template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 0>
@@ -30,10 +30,19 @@ inline Vectorized<scalar_t> convert_from_float_avx512(const Vectorized<float>& a
   return at::vec::convert_from_float<scalar_t>(a, b);
 }
 
+// BFloat16 specialization using native AVX512-BF16 instruction
 template <>
 inline Vectorized<at::BFloat16>
 convert_from_float_avx512<at::BFloat16>(const Vectorized<float>& a, const Vectorized<float>& b) {
   return (__m512i)(_mm512_cvtne2ps_pbh(__m512(b), __m512(a)));
+}
+
+// Float16 specialization using AVX512-FP16 or fallback
+template <>
+inline Vectorized<at::Half>
+convert_from_float_avx512<at::Half>(const Vectorized<float>& a, const Vectorized<float>& b) {
+  // Use PyTorch's vectorized conversion which handles fp16 correctly
+  return at::vec::convert_from_float<at::Half>(a, b);
 }
 
 //==============================================================================
