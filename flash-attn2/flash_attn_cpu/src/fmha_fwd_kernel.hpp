@@ -114,7 +114,7 @@ void flash_attn_varlen_kernel_impl(
 
       fill_stub(v_prime, 0.f, m_size * head_size_v);
       fill_stub(s_prime, 0.f, m_size);
-      fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
+      fill_stub(m_prime, -std::numeric_limits<float>::infinity(), m_size);
 
       int seqlen_k = cu_seqlens_k[bs + 1] - cu_seqlens_k[bs];
       int num_keys = causal ? std::min(seqlen_k - seqlen_q + m + m_size, seqlen_k) : seqlen_k;
