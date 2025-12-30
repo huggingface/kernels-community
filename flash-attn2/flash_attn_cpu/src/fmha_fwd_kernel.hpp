@@ -139,10 +139,12 @@ void flash_attn_varlen_kernel_impl(
             false,
             q_ptr, Btmp, s_i);
 
-        // causal mask
-        if (causal && num_keys - n <= BLOCK_N) {
+        // causal mask - apply to every block where masking is needed
+        if (causal) {
           for (int row = 0; row < m_size; ++row) {
+            // q_pos_in_k is the position in K that this query can attend up to (inclusive)
             int q_pos_in_k = seqlen_k - seqlen_q + m + row;
+            // last_col is the last valid column in the current K block
             int last_col = q_pos_in_k - n;
             if (last_col < n_size - 1) {
               float* row_ptr = s_i + row * BLOCK_N;
@@ -160,6 +162,15 @@ void flash_attn_varlen_kernel_impl(
           float m_i = at::vec::reduce_all<float>(
               [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, s_i + row * BLOCK_N, n_size);
           m_i = std::max(m_i, m_prime[row]);
+
+          // Handle case where entire row is masked (m_i == -inf)
+          // In this case, skip the update to avoid NaN from exp(-inf - (-inf))
+          if (std::isinf(m_i) && m_i < 0) {
+            // Entire row is masked, fill s_delta with zeros
+            fill_stub(s_delta + row * BLOCK_N, 0.f, padded_n_size);
+            PackPolicy::template copy_stub_block<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
+            continue;
+          }
 
           float m_delta = std::exp(m_prime[row] - m_i);
 
@@ -198,8 +209,13 @@ void flash_attn_varlen_kernel_impl(
 
       scalar_t* __restrict__ out_ptr = out + (seq_q_start_loc + m) * o_strideM + head_id * o_strideH;
       for (int row = 0; row < m_size; ++row) {
-        float s = 1 / s_prime[row];
-        copy_stub<scalar_t>(out_ptr + row * o_strideM, v_prime + row * head_size_v, s, head_size_v);
+        // When s_prime[row] == 0 (entire row masked by causal), output zeros instead of NaN
+        if (s_prime[row] == 0.f) {
+          fill_stub(out_ptr + row * o_strideM, static_cast<scalar_t>(0), head_size_v);
+        } else {
+          float s = 1 / s_prime[row];
+          copy_stub<scalar_t>(out_ptr + row * o_strideM, v_prime + row * head_size_v, s, head_size_v);
+        }
       }
 
       data_index_step(head_id, num_heads, mb, MB);
