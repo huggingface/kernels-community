@@ -694,9 +694,9 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
-    if torch.xpu.is_available():
+    if device in ["xpu", "cpu"]:
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
-        print("XPU does not support backward currentlly, skipping grad check.")
+        print("XPU and CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out)
@@ -856,9 +856,9 @@ def test_flash_attn_varlen_qkvpacked(
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
-    if torch.xpu.is_available():
+    if device in ["xpu", "cpu"]:
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
-        print("XPU does not support backward currentlly, skipping grad check.")
+        print("XPU and CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out)
@@ -1107,9 +1107,9 @@ def test_flash_attn_output(
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
-    if torch.xpu.is_available():
+    if device in ["xpu", "cpu"]:
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
-        print("XPU does not support backward currentlly, skipping grad check.")
+        print("XPU and CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out)
@@ -1594,9 +1594,9 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype, devi
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
 
-    if torch.xpu.is_available():
+    if device in ["xpu", "cpu"]:
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
-        print("XPU does not support backward currentlly, skipping grad check.")
+        print("XPU and CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out)
@@ -1768,9 +1768,9 @@ def test_flash_attn_varlen_causal(
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
 
-    if torch.xpu.is_available():
+    if device in ["xpu", "cpu"]:
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
-        print("XPU does not support backward currentlly, skipping grad check.")
+        print("XPU and CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out)
@@ -1909,9 +1909,9 @@ def test_flash_attn_splitkv(
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
 
-    if torch.xpu.is_available():
+    if device in ["xpu", "cpu"]:
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
-        print("XPU does not support backward currentlly, skipping grad check.")
+        print("XPU and CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out)
@@ -2323,7 +2323,7 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
             out, lse, _ = flash_attn_func(q, k, v, dropout_p, causal=causal, return_attn_probs=True)
             assert torch.equal(out, out0)
             # assert torch.equal(lse, lse0) # lse not implemented on xpu yet
-            print("XPU does not support backward currentlly, skipping grad check.")
+            print("XPU and CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out0)
