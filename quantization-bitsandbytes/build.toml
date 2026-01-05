@@ -1,6 +1,6 @@
 [general]
 name = "quantization-bitsandbytes"
-universal = false
+backends = ["cpu"]
 
 [torch]
 src = ["torch-ext/torch_binding.cpp"]
@@ -8,20 +8,30 @@ src = ["torch-ext/torch_binding.cpp"]
 [kernel.bitsandbytes_cpu]
 backend = "cpu"
 depends = ["torch"]
+include = ["bitsandbytes_cpu"]
 src = [
     "bitsandbytes_cpu/bitsandbytes_cpu_torch.cpp",
     "bitsandbytes_cpu/bitsandbytes_cpu.cpp",
     "bitsandbytes_cpu/bitsandbytes_cpu.hpp",
     "bitsandbytes_cpu/cpu_features.hpp",
 ]
-include = ["bitsandbytes_cpu"]
 
 [kernel.bitsandbytes_cpu_avx512]
 backend = "cpu"
+cxx-flags = [
+    "-mfma",
+    "-fopenmp",
+    "-mf16c",
+    "-mavx512f",
+    "-mavx512bf16",
+    "-mavx512vl",
+    "-mavx512dq",
+    "-mavx512bw",
+    "-mavx512vbmi",
+]
 depends = ["torch"]
+include = ["bitsandbytes_cpu"]
 src = [
     "bitsandbytes_cpu/bitsandbytes_avx512.cpp",
     "bitsandbytes_cpu/bitsandbytes_avx512.hpp",
 ]
-include = ["bitsandbytes_cpu"]
-cxx-flags = ["-mfma", "-fopenmp", "-mf16c", "-mavx512f", "-mavx512bf16", "-mavx512vl", "-mavx512dq", "-mavx512bw", "-mavx512vbmi"]
