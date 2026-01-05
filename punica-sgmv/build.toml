@@ -1,6 +1,6 @@
 [general]
 name = "punica_sgmv"
-universal = false
+backends = ["cuda"]
 
 [torch]
 src = [
@@ -17,17 +17,6 @@ src = [
     "punica_kernels/punica_ops.cc",
     "sgmv/sgmv.h",
     "sgmv_flashinfer/sgmv_config.h",
-]
-
-[kernel.sgmv]
-backend = "cuda"
-depends = [
-    "cutlass_3_8",
-    "torch",
-]
-src = [
-    "sgmv/sgmv_cutlass.cu",
-    "sgmv/sgmv_cutlass.cuh",
 ]
 
 [kernel.sgmv_flashinfer]
@@ -73,4 +62,15 @@ src = [
     "bgmv/bgmv_impl.cuh",
     "bgmv/bgmv_config.h",
     "flashinfer/vec_dtypes.cuh",
+]
+
+[kernel.sgmv]
+backend = "cuda"
+depends = [
+    "cutlass_3_8",
+    "torch",
+]
+src = [
+    "sgmv/sgmv_cutlass.cu",
+    "sgmv/sgmv_cutlass.cuh",
 ]
