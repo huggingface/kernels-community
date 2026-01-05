@@ -9,7 +9,7 @@ concurrency:
 
 jobs:
   build-kernel:
-    runs-on: macos-15
+    runs-on: macos-16
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v20

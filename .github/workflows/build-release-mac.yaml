@@ -10,7 +10,7 @@ jobs:
   build-kernel:
     # Only run if the PR was actually merged (not just closed)
     if: github.event.pull_request.merged == true
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v20
