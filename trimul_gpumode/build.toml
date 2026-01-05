@@ -1,9 +1,7 @@
 [general]
 name = "trimul_gpumode"
 backends = [
-    "cpu",
     "cuda",
-    "metal",
     "rocm",
     "xpu",
 ]
