@@ -1,9 +1,7 @@
 [general]
 name = "scattermoe"
 backends = [
-    "cpu",
     "cuda",
-    "metal",
     "rocm",
     "xpu",
 ]
