@@ -1,13 +1,12 @@
 [general]
 name = "mra"
-universal = false
+backends = ["cuda"]
 
 [torch]
 src = [
     "torch-ext/torch_binding.cpp",
     "torch-ext/cuda_launch.h",
 ]
-
 
 [kernel.mra]
 backend = "cuda"
