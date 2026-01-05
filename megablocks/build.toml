@@ -1,42 +1,79 @@
 [general]
 name = "megablocks"
-universal = false
+backends = [
+    "cuda",
+    "xpu",
+]
 
 [torch]
 src = [
-  "torch-ext/torch_binding.cpp",
-  "torch-ext/torch_binding.h",
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
 ]
 
 [kernel.megablocks]
 backend = "cuda"
 cuda-capabilities = [
-  "7.0",
-  "7.2",
-  "7.5",
-  "8.0",
-  "8.6",
-  "8.7",
-  "8.9",
-  "9.0",
-  "10.0",
-  "10.1",
-  "11.8",
-  "12.0",
+    "7.0",
+    "7.2",
+    "7.5",
+    "8.0",
+    "8.6",
+    "8.7",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.1",
+    "11.8",
+    "12.0",
 ]
-depends = ["torch", "cutlass_3_8"]
+depends = [
+    "torch",
+    "cutlass_3_8",
+]
 src = [
-  "csrc/cumsum.h",
-  "csrc/cumsum.cu", #
-  "csrc/histogram.h",
-  "csrc/histogram.cu", #
-  "csrc/indices.h",
-  "csrc/indices.cu", #
-  "csrc/replicate.h",
-  "csrc/replicate.cu", #
-  "csrc/sort.h",
-  "csrc/sort.cu", # vendored grouped gemm
-  "csrc/grouped_gemm/fill_arguments.cuh",
-  "csrc/grouped_gemm/grouped_gemm.cu",
-  "csrc/grouped_gemm/grouped_gemm.h",
+    "csrc/cumsum.h",
+    "csrc/cumsum.cu",
+    "csrc/histogram.h",
+    "csrc/histogram.cu",
+    "csrc/indices.h",
+    "csrc/indices.cu",
+    "csrc/replicate.h",
+    "csrc/replicate.cu",
+    "csrc/sort.h",
+    "csrc/sort.cu", # vendored grouped gemm
+    "csrc/grouped_gemm/fill_arguments.cuh",
+    "csrc/grouped_gemm/grouped_gemm.cu",
+    "csrc/grouped_gemm/grouped_gemm.h",
+]
+
+[kernel.megablocks_xpu]
+backend = "xpu"
+depends = [
+    "torch",
+    "cutlass_sycl",
+]
+src = [
+    "csrc_xpu/utils.h",
+    "csrc_xpu/dispatch_utils.h",
+    "csrc_xpu/core/registration.h",
+    "csrc_xpu/activation.cpp",
+    "csrc_xpu/activation.h",
+    "csrc_xpu/moe/moe_ops.h",
+    "csrc_xpu/moe/moe_align_sum_kernels.cpp",
+    "csrc_xpu/moe/moe_lora_align_sum_kernels.cpp",
+    "csrc_xpu/moe/moe_gather.cpp",
+    "csrc_xpu/moe/topk_softmax.cpp",
+    "csrc_xpu/moe/grouped_topk.cpp",
+    "csrc_xpu/moe/fused_grouped_topk.cpp",
+    "csrc_xpu/moe/fused_moe_prologue.cpp",
+    "csrc_xpu/moe/fused_moe_prologue.hpp",
+    "csrc_xpu/grouped_gemm/grouped_gemm_interface.cpp",
+    "csrc_xpu/grouped_gemm/grouped_gemm_interface.h",
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.cpp",
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.h",
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/gemm_xe2.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/gemm_xe2_policy.hpp",
 ]
