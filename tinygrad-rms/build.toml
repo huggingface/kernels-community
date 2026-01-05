@@ -1,6 +1,6 @@
 [general]
 name = "tinygrad-rms"
-universal = false
+backends = ["cuda"]
 
 [torch]
 src = [
