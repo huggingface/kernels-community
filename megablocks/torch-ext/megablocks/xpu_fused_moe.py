@@ -5,10 +5,6 @@ import torch
 
 from ._ops import ops
 
-# Debug flag controlled by environment variable
-# Usage: DEBUG_MOE=1 python your_script.py
-DEBUG_MOE = os.environ.get("DEBUG_MOE", "0") == "1"
-
 
 # Install meta kernels for torch.compile compatibility
 def _install_xpu_meta_kernels():
@@ -80,6 +76,7 @@ def _install_xpu_meta_kernels():
 _install_xpu_meta_kernels()
 
 
+# default
 def cutlass_grouped_gemm(input_A, input_B, bias, output, expert_token_count, n,
                          k, num_experts):
     # expert_token_count_ = torch.tensor(expert_token_count,
@@ -217,21 +214,7 @@ def xpu_fused_moe(hidden_states,
 
     output = torch.empty_like(hidden_states)
     num_rows, hidden_size = list(hidden_states.shape)
-    
-    if DEBUG_MOE:
-        print(f"[MOE DEBUG] === xpu_fused_moe called ===")
-        print(f"[MOE DEBUG] hidden_states: dtype={hidden_states.dtype}, shape={hidden_states.shape}, device={hidden_states.device}")
-        print(f"[MOE DEBUG] w13: dtype={w13.dtype}, shape={w13.shape}")
-        print(f"[MOE DEBUG] w2: dtype={w2.dtype}, shape={w2.shape}")
-        print(f"[MOE DEBUG] topk_weights: dtype={topk_weights.dtype}, shape={topk_weights.shape}")
-        print(f"[MOE DEBUG] topk_ids: dtype={topk_ids.dtype}, shape={topk_ids.shape}")
-        print(f"[MOE DEBUG] activation={activation}, num_experts={num_experts}, n_experts_per_token={n_experts_per_token}")
-        print(f"[MOE DEBUG] is_fp8={is_fp8}, is_int4={is_int4}, is_mxfp4={is_mxfp4}")
-        if w13_scales is not None:
-            print(f"[MOE DEBUG] w13_scales: dtype={w13_scales.dtype}, shape={w13_scales.shape}")
-        if w13_bias is not None:
-            print(f"[MOE DEBUG] w13_bias: dtype={w13_bias.dtype}, shape={w13_bias.shape}")
-    
+
     dim_last = w13.shape[-1]
     dim_second_last = w13.shape[-2]
 
@@ -490,12 +473,6 @@ class MegaBlocksMoeMLP(torch.nn.Module):
                 - output: Tensor of same shape as input
                 - expert_weights: Expert weights for each token [tokens, top_k]
         """
-        
-        if DEBUG_MOE:
-            print(f"[MOE DEBUG] === MegaBlocksMoeMLP.forward called ===")
-            print(f"[MOE DEBUG] Input x: dtype={x.dtype}, shape={x.shape}, device={x.device}")
-            print(f"[MOE DEBUG] Router: {type(self.router).__name__}")
-            print(f"[MOE DEBUG] Experts: {type(self.experts).__name__}")
 
         # Get MoE parameters from the wrapped modules
         moe_top_k = getattr(self.router, "top_k", 4)
@@ -511,11 +488,7 @@ class MegaBlocksMoeMLP(torch.nn.Module):
             activation = "swigluoai"
         else:
             activation = getattr(self.experts, "activation", "silu")
-        
-        if DEBUG_MOE:
-            print(f"[MOE DEBUG] moe_top_k={moe_top_k}, moe_num_experts={moe_num_experts}")
-            print(f"[MOE DEBUG] activation={activation}")
-        
+
         # Get weight tensors - support different naming conventions
         if hasattr(self.experts, "gate_up_proj"):
             w13 = self.experts.gate_up_proj
