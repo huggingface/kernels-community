@@ -1,20 +1,24 @@
 #include <torch/all.h>
+#include <c10/xpu/XPUStream.h>
+#include <cute/util/compat/device.hpp>
 
-#include "src/fixed.hpp"
-#include "src/varlen.hpp"
+#include "src/fmha_fwd.hpp"
 
 namespace FLASH_NAMESPACE {
 
 inline int round_multiple(int x, int m) {
     int pad_res = (x + m - 1) / m * m;
-    if (pad_res == 224)
+    if (pad_res == 224) {
         pad_res = 256;
+    }
     return pad_res;
 }
 
 inline at::Tensor ensure_contiguous(const at::Tensor& tensor) {
     return tensor.is_contiguous() ? tensor : tensor.contiguous();
 }
+
+#define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
 
 std::vector<at::Tensor>
 mha_fwd(
@@ -33,7 +37,7 @@ mha_fwd(
         std::optional<at::Generator> gen_) {
 
     auto device_idx = q.device().index();
-    COMPAT::select_device(device_idx);
+    compat::select_device(device_idx);
 
     // check inputs
     q = ensure_contiguous(q);
@@ -50,6 +54,12 @@ mha_fwd(
                 "FlashAttention only support fp16 and bf16 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(k.size(-1) == head_size_og, "Key head dimension must match Query head dimension");
+    TORCH_CHECK(v.size(-1) == head_size_og, "Value head dimension must match Query head dimension");
+
+    CHECK_DEVICE(q);
+    CHECK_DEVICE(k);
+    CHECK_DEVICE(v);
 
     // XPU requires head_size to be a multiple of 32
     const int head_size_padded = round_multiple(head_size_og, 32);
@@ -84,7 +94,11 @@ mha_fwd(
     q_padded = ensure_contiguous(q_padded);
     k_padded = ensure_contiguous(k_padded);
     v_padded = ensure_contiguous(v_padded);
-    cutlass::flash_attention::fixed::cutlass_fixed_impl(
+
+    auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
+
+    cutlass_fmha_fwd_fix_impl(
+        queue,
         q_padded, k_padded, v_padded, out_padded,
         softmax_scale,
         window_size_left, window_size_right,
@@ -105,6 +119,7 @@ mha_fwd(
     at::Tensor rng_state;
     return {out, softmax_lse, S_dmask, rng_state};
   }
+
 
 std::vector<at::Tensor>
 mha_varlen_fwd(
@@ -131,7 +146,7 @@ mha_varlen_fwd(
               std::optional<at::Generator> gen_) {
 
     auto device_idx = q.device().index();
-    COMPAT::select_device(device_idx);
+    compat::select_device(device_idx);
 
     // check inputs
     q = ensure_contiguous(q);
@@ -148,6 +163,12 @@ mha_varlen_fwd(
                 "FlashAttention only support fp16 and bf16 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(k.size(-1) == head_size_og, "Key head dimension must match Query head dimension");
+    TORCH_CHECK(v.size(-1) == head_size_og, "Value head dimension must match Query head dimension");
+
+    CHECK_DEVICE(q);
+    CHECK_DEVICE(k);
+    CHECK_DEVICE(v);
 
     // XPU requires head_size to be a multiple of 32
     const int head_size_padded = round_multiple(head_size_og, 32);
@@ -178,17 +199,22 @@ mha_varlen_fwd(
     }
 
     bool is_local = (window_size_left != -1) | (window_size_right != -1);
+    bool is_paged = block_table_.has_value() && block_table_->defined();
 
     q_padded = ensure_contiguous(q_padded);
     k_padded = ensure_contiguous(k_padded);
     v_padded = ensure_contiguous(v_padded);
-    cutlass::flash_attention::varlen::cutlass_varlen_impl(
-                            q_padded, k_padded, v_padded, out_padded, block_table_,
-                            cu_seqlens_q, cu_seqlens_k,
-                            max_seqlen_q, max_seqlen_k,
-                            softmax_scale,
-                            window_size_left, window_size_right,
-                            is_causal, is_local);
+
+    auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
+
+    cutlass_fmha_fwd_varlen_impl(
+        queue,
+        q_padded, k_padded, v_padded, out_padded, block_table_,
+        cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k,
+        softmax_scale,
+        window_size_left, window_size_right,
+        true, is_paged, is_causal, is_local);
 
     // Remove padding from output
     at::Tensor out = out_padded;
