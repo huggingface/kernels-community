@@ -10,7 +10,7 @@ jobs:
   build-kernel:
     # Only run if the PR was actually merged (not just closed)
     if: github.event.pull_request.merged == true
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/nix-installer-action@v20
@@ -37,6 +37,9 @@ jobs:
           else
             echo "skip=true" >> $GITHUB_OUTPUT
           fi
+      - name: Install Metal toolchain
+        if: steps.validate.outputs.skip == 'false'
+        run: xcodebuild -downloadComponent MetalToolchain
       - name: Build and upload kernel
         if: steps.validate.outputs.skip == 'false'
         env:
