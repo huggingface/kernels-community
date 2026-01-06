@@ -35,6 +35,9 @@ jobs:
           else
             echo "skip=true" >> $GITHUB_OUTPUT
           fi
+      - name: Install Metal toolchain
+        if: steps.validate.outputs.skip == 'false'
+        run: xcodebuild -downloadComponent MetalToolchain
       - name: Build kernel
         if: steps.validate.outputs.skip == 'false'
         run: |
