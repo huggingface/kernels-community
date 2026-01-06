@@ -3,8 +3,7 @@ name = "vllm-flash-attn3"
 backends = ["cuda"]
 
 [general.cuda]
-minver = "12.4"
-maxver = "12.4"
+minver = "12.8"
 
 [torch]
 src = [

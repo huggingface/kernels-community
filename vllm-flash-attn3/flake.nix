@@ -13,25 +13,5 @@
     kernel-builder.lib.genFlakeOutputs {
       inherit self;
       path = ./.;
-      # Building with CUDA later than 12.4 fails with:
-      #
-      # error: 'ptxas' died due to signal 11 (Invalid memory reference)
-      #
-      # So, build for 12.4 only and copy to all the other build variants
-      # by hand (which works fine thanks to backward compat).
-      #
-      # Still need to check if upstream FA3 has the same issue.
-      torchVersions = _: [
-        {
-          torchVersion = "2.9";
-          cudaVersion = "12.4";
-          cxx11Abi = true;
-          systems = [
-            "x86_64-linux"
-            "aarch64-linux"
-          ];
-          bundleBuild = true;
-        }
-      ];
     };
 }
