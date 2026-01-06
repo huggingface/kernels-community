@@ -1,5 +1,5 @@
 [general]
-name = "mamba_ssm"
+name = "mamba-ssm"
 backends = ["cuda"]
 
 [torch]
