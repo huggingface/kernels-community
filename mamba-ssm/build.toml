@@ -1,6 +1,6 @@
 [general]
 name = "mamba_ssm"
-universal = false
+backends = ["cuda"]
 
 [torch]
 src = [

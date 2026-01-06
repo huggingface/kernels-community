@@ -1,3 +1,9 @@
 [general]
 name = "scattermoe"
-universal = true
+backends = [
+    "cuda",
+    "rocm",
+    "xpu",
+]
+
+[kernel]

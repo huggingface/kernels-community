@@ -2,11 +2,11 @@
   "nodes": {
     "flake-compat": {
       "locked": {
-        "lastModified": 1761588595,
-        "narHash": "sha256-XKUZz9zewJNUj46b4AJdiRZJAvSZ0Dqj2BNfXvFlJC4=",
+        "lastModified": 1765121682,
+        "narHash": "sha256-4VBOP18BFeiPkyhy9o4ssBNQEvfvv1kXkasAYd0+rrA=",
         "owner": "edolstra",
         "repo": "flake-compat",
-        "rev": "f387cd2afec9419c8ee37694406ca490c3f34ee5",
+        "rev": "65f23138d8d09a92e30f1e5c87611b23ef451bf3",
         "type": "github"
       },
       "original": {
@@ -40,32 +40,33 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1764280248,
-        "narHash": "sha256-WNUbjnUnnDJtwK5ATn7VkkOZ+qyVF1UpKXaTkzbJsmI=",
+        "lastModified": 1767616147,
+        "narHash": "sha256-0rQI29rwgbNwVXkqsGMdkGBZcjSaCAbz1APpY2FqXfQ=",
         "owner": "huggingface",
         "repo": "kernel-builder",
-        "rev": "cc4997dc60691b597aa76a4173541721bc17c224",
+        "rev": "8d35e7246070841d59a0b328f2aba3f4e0b168eb",
         "type": "github"
       },
       "original": {
         "owner": "huggingface",
+        "ref": "torch-2.10",
         "repo": "kernel-builder",
         "type": "github"
       }
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1763291491,
-        "narHash": "sha256-eEYvm+45PPmy+Qe+nZDpn1uhoMUjJwx3PwVVQoO9ksA=",
+        "lastModified": 1766341660,
+        "narHash": "sha256-4yG6vx7Dddk9/zh45Y2KM82OaRD4jO3HA9r98ORzysA=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "c543a59edf25ada193719764f3bc0c6ba835f94d",
+        "rev": "26861f5606e3e4d1400771b513cc63e5f70151a6",
         "type": "github"
       },
       "original": {
         "owner": "NixOS",
+        "ref": "nixos-unstable-small",
         "repo": "nixpkgs",
-        "rev": "c543a59edf25ada193719764f3bc0c6ba835f94d",
         "type": "github"
       }
     },
