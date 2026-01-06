@@ -40,11 +40,11 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1767618929,
-        "narHash": "sha256-OVNXKs7vQ9n2klENSNs9nhqY183GzIZQFaQk9tqypes=",
+        "lastModified": 1767690319,
+        "narHash": "sha256-9txtrhouZoNog8M7VwPKBviS2rX87ddQOcZy2pVLUVg=",
         "owner": "huggingface",
         "repo": "kernel-builder",
-        "rev": "4f57f114dd94a980799ca685cd3c800dbefb4969",
+        "rev": "97cee5d00d29c141013ff6884c172507b1fad674",
         "type": "github"
       },
       "original": {
