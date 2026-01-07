@@ -1,11 +1,79 @@
 [general]
 name = "flash-attn2"
-universal=false
+backends = [
+    "cpu",
+    "cuda",
+    "xpu",
+]
 
 [torch]
 src = [
     "torch-ext/torch_binding.cpp",
     "torch-ext/torch_binding.h",
+]
+
+[kernel.flash_attn_cpu_avx512]
+backend = "cpu"
+cxx-flags = [
+    "-fopenmp",
+    "-mavx512f",
+    "-mavx512bf16",
+    "-mavx512vl",
+    "-mavx512dq",
+    "-mavx512bw",
+    "-mamx-bf16",
+    "-mamx-int8",
+    "-mamx-tile",
+]
+depends = ["torch"]
+include = ["flash_attn_cpu"]
+src = [
+    "flash_attn_cpu/src/fmha_fwd_avx512.cpp",
+    "flash_attn_cpu/src/fmha_fwd_avx512.hpp",
+    "flash_attn_cpu/src/fmha_fwd_common.hpp",
+    "flash_attn_cpu/src/fmha_fwd_kernel.hpp",
+]
+
+[kernel.flash_attn_cpu]
+backend = "cpu"
+cxx-flags = ["-fopenmp"]
+depends = ["torch"]
+include = ["flash_attn_cpu"]
+src = [
+    "flash_attn_cpu/flash_api.cpp",
+    "flash_attn_cpu/src/fmha_fwd_dispatch.cpp",
+    "flash_attn_cpu/src/fmha_fwd_fallback.cpp",
+    "flash_attn_cpu/src/fmha_fwd.hpp",
+    "flash_attn_cpu/src/fmha_fwd_common.hpp",
+    "flash_attn_cpu/src/fmha_fwd_kernel.hpp",
+    "flash_attn_cpu/src/fmha_fwd_avx512.hpp",
+    "flash_attn_cpu/src/fmha_fwd_fallback.hpp",
+    "flash_attn_cpu/src/cpu_features.hpp",
+]
+
+[kernel.flash_attn_xpu]
+backend = "xpu"
+depends = [
+    "torch",
+    "cutlass_sycl",
+]
+src = [
+    "flash_attn_xpu/flash_api.cpp",
+    "flash_attn_xpu/src/fixed.hpp",
+    "flash_attn_xpu/src/varlen.hpp",
+    "flash_attn_xpu/src/fmha_utils.hpp",
+    "flash_attn_xpu/src/compat_wrapper.hpp",
+    "flash_attn_xpu/src/collective/fmha_fusion.hpp",
+    "flash_attn_xpu/src/collective/fixed_epilogue.hpp",
+    "flash_attn_xpu/src/collective/fixed_mma.hpp",
+    "flash_attn_xpu/src/collective/fixed_softmax_epilogue.hpp",
+    "flash_attn_xpu/src/collective/varlen_epilogue.hpp",
+    "flash_attn_xpu/src/collective/varlen_mma.hpp",
+    "flash_attn_xpu/src/collective/varlen_softmax_epilogue.hpp",
+    "flash_attn_xpu/src/kernel/fixed_scheduler.hpp",
+    "flash_attn_xpu/src/kernel/fixed_kernel.hpp",
+    "flash_attn_xpu/src/kernel/varlen_scheduler.hpp",
+    "flash_attn_xpu/src/kernel/varlen_kernel.hpp",
 ]
 
 [kernel.flash_attn]
@@ -113,68 +181,4 @@ src = [
     "flash_attn/src/flash_fwd_split_hdim96_bf16_sm80.cu",
     "flash_attn/src/flash_fwd_split_hdim96_fp16_causal_sm80.cu",
     "flash_attn/src/flash_fwd_split_hdim96_fp16_sm80.cu",
-]
-
-[kernel.flash_attn_xpu]
-backend = "xpu"
-depends = [
-    "torch",
-    "cutlass_sycl",
-]
-src = [
-    "flash_attn_xpu/flash_api.cpp",
-    "flash_attn_xpu/src/fixed.hpp",
-    "flash_attn_xpu/src/varlen.hpp",
-    "flash_attn_xpu/src/fmha_utils.hpp",
-    "flash_attn_xpu/src/compat_wrapper.hpp",
-    "flash_attn_xpu/src/collective/fmha_fusion.hpp",
-    "flash_attn_xpu/src/collective/fixed_epilogue.hpp",
-    "flash_attn_xpu/src/collective/fixed_mma.hpp",
-    "flash_attn_xpu/src/collective/fixed_softmax_epilogue.hpp",
-    "flash_attn_xpu/src/collective/varlen_epilogue.hpp",
-    "flash_attn_xpu/src/collective/varlen_mma.hpp",
-    "flash_attn_xpu/src/collective/varlen_softmax_epilogue.hpp",
-    "flash_attn_xpu/src/kernel/fixed_scheduler.hpp",
-    "flash_attn_xpu/src/kernel/fixed_kernel.hpp",
-    "flash_attn_xpu/src/kernel/varlen_scheduler.hpp",
-    "flash_attn_xpu/src/kernel/varlen_kernel.hpp",
-]
-
-[kernel.flash_attn_cpu]
-backend = "cpu"
-cxx-flags = ["-fopenmp"]
-depends = ["torch"]
-include = ["flash_attn_cpu"]
-src = [
-    "flash_attn_cpu/flash_api.cpp",
-    "flash_attn_cpu/src/fmha_fwd_dispatch.cpp",
-    "flash_attn_cpu/src/fmha_fwd_fallback.cpp",
-    "flash_attn_cpu/src/fmha_fwd.hpp",
-    "flash_attn_cpu/src/fmha_fwd_common.hpp",
-    "flash_attn_cpu/src/fmha_fwd_kernel.hpp",
-    "flash_attn_cpu/src/fmha_fwd_avx512.hpp",
-    "flash_attn_cpu/src/fmha_fwd_fallback.hpp",
-    "flash_attn_cpu/src/cpu_features.hpp",
-]
-
-[kernel.flash_attn_cpu_avx512]
-backend = "cpu"
-cxx-flags = [
-    "-fopenmp",
-    "-mavx512f",
-    "-mavx512bf16",
-    "-mavx512vl",
-    "-mavx512dq",
-    "-mavx512bw",
-    "-mamx-bf16",
-    "-mamx-int8",
-    "-mamx-tile",
-]
-depends = ["torch"]
-include = ["flash_attn_cpu"]
-src = [
-    "flash_attn_cpu/src/fmha_fwd_avx512.cpp",
-    "flash_attn_cpu/src/fmha_fwd_avx512.hpp",
-    "flash_attn_cpu/src/fmha_fwd_common.hpp",
-    "flash_attn_cpu/src/fmha_fwd_kernel.hpp",
 ]
