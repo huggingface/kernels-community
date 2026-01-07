@@ -2,7 +2,7 @@
   description = "Flake for Punica SGMV kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernel-builder/torch-2.10";
+    kernel-builder.url = "github:huggingface/kernel-builder";
   };
 
   outputs =
