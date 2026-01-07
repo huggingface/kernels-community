@@ -2,7 +2,7 @@
   description = "Flake for Hopper Flash Attention kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernel-builder";
+    kernel-builder.url = "github:huggingface/kernel-builder/torch-2.10";
   };
 
   outputs =
@@ -13,5 +13,10 @@
     kernel-builder.lib.genFlakeOutputs {
       inherit self;
       path = ./.;
+
+      pythonCheckInputs =
+        ps: with ps; [
+          einops
+        ];
     };
 }

@@ -2,7 +2,7 @@
   description = "Flake for fp8-fbgemm kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernel-builder";
+    kernel-builder.url = "github:huggingface/kernel-builder/torch-2.10";
   };
 
   outputs =

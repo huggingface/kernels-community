@@ -1,5 +1,5 @@
 [general]
-name = "causal_conv1d"
+name = "causal-conv1d"
 backends = ["cuda"]
 
 [torch]
