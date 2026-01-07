@@ -40,16 +40,15 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1767712606,
-        "narHash": "sha256-LRhmQvWlJAU0bnhb4F5pRKrffVkaUvrNvIWWo7rwVc0=",
+        "lastModified": 1767779164,
+        "narHash": "sha256-BAgLAlkQb2AJPU5j+C0e2kvQnSHYwaNKrK5TZ7hTp1I=",
         "owner": "huggingface",
         "repo": "kernel-builder",
-        "rev": "5a1bb4dd2abb83fd8a865211da1d3f8974a11143",
+        "rev": "b61370a67492ddd2ea10bd45a9ceb17d4ec5d729",
         "type": "github"
       },
       "original": {
         "owner": "huggingface",
-        "ref": "torch-2.10",
         "repo": "kernel-builder",
         "type": "github"
       }
