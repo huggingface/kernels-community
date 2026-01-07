@@ -18,5 +18,16 @@
         pkgs: with pkgs; [
           einops
         ];
+
+      torchVersions =
+        let
+          supported =
+            # Only x86_64-linux CPU builds are supported currently.
+            version: system: !(version ? "cpu") || system == "x86_64-linux";
+        in
+        allVersions:
+        builtins.map (
+          version: version // { systems = builtins.filter (supported version) version.systems; }
+        ) allVersions;
     };
 }
