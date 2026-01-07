@@ -10,12 +10,12 @@ import os
 # # We need to import the CUDA kernels after importing torch
 # USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 # if USE_TRITON_ROCM:
-#     from .flash_attn_triton_amd import interface_fa as flash_attn_gpu
+#     from .flash_attn_triton_amd import interface_fa as flash_attn
 # else:
-#     import flash_attn_2_cuda as flash_attn_gpu
+#     import flash_attn_2_cuda as flash_attn
 
 
-from ._ops import ops as flash_attn_gpu
+from ._ops import ops as flash_attn
 
 # # isort: on
 
@@ -26,8 +26,10 @@ def maybe_contiguous(x):
 def _get_device():
     if torch.xpu.is_available():
         return "xpu"
-    else:
+    elif torch.cuda.is_available():
         return "cuda"
+    else:
+        return "cpu"
 
 _XPU_AVAILABLE = torch.xpu.is_available() if hasattr(torch, "xpu") else False # TODO remove hasattr check when bwd is supported on XPU
 
@@ -100,7 +102,7 @@ def _flash_attn_forward(
     return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
+    out, softmax_lse, S_dmask, rng_state = flash_attn.fwd(
         q,
         k,
         v,
@@ -174,7 +176,7 @@ def _flash_attn_varlen_forward(
     zero_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
+    out, softmax_lse, S_dmask, rng_state = flash_attn.varlen_fwd(
         q,
         k,
         v,
@@ -274,7 +276,7 @@ def _flash_attn_backward(
         dk,
         dv,
         softmax_d,
-    ) = flash_attn_gpu.bwd(
+    ) = flash_attn.bwd(
         dout,
         q,
         k,
@@ -371,7 +373,7 @@ def _flash_attn_varlen_backward(
         dk,
         dv,
         softmax_d,
-    ) = flash_attn_gpu.varlen_bwd(
+    ) = flash_attn.varlen_bwd(
         dout,
         q,
         k,
@@ -1469,7 +1471,7 @@ def flash_attn_varlen_func(
         deterministic,
         return_attn_probs,
         block_table,
-        False if _XPU_AVAILABLE else torch.is_grad_enabled(),
+        False if _XPU_AVAILABLE or q.device.type == "cpu" else torch.is_grad_enabled(),
     )
 
 
@@ -1593,7 +1595,7 @@ def flash_attn_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
-    out, softmax_lse = flash_attn_gpu.fwd_kvcache(
+    out, softmax_lse = flash_attn.fwd_kvcache(
         q,
         k_cache,
         v_cache,
