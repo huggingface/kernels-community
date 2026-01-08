@@ -1223,3 +1223,8 @@ class MegaBlocksMoeMLPWithSharedExpert(MegaBlocksMoeMLP):
             shared_activation_fn=self.shared_activation_fn,
         )
         return output, expert_weights_out
+
+
+# Patch for XPU support
+if hasattr(torch, "xpu") and torch.xpu.is_available():
+    from .xpu_fused_moe import MegaBlocksMoeMLP
