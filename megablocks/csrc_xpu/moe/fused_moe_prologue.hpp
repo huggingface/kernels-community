@@ -11,25 +11,6 @@ inline T ceilDiv(T a, T b) {
   return (a + b - 1) / b;
 }
 
-// TODO: this function causes a build error
-// template <int RANGE_DIM, typename T>
-// inline void sycl_print_decimal(sycl::nd_item<RANGE_DIM> item, T* data, int
-// size,
-//                                char* name) {
-//   int local_id = item.get_local_id(2);
-//   int group_id_x = item.get_group(2);
-//   int group_id_y = item.get_group(1);
-
-//   if (group_id_x == 0 && group_id_y == 0 && local_id == 0) {
-//     sycl::ext::oneapi::experimental::printf("%s:\n", name);
-//     for (int i = 0; i < size; ++i) {
-//       sycl::ext::oneapi::experimental::printf("  idx=%d, val=%d", i,
-//                                               static_cast<int>(data[i]));
-//     }
-//     sycl::ext::oneapi::experimental::printf("\n");
-//   }
-// }
-
 int64_t computeNumTokensPerBlock(
     int64_t const num_tokens, int64_t const num_experts_per_node) {
   for (int64_t num_tokens_per_block = 32; num_tokens_per_block <= 1024;
@@ -215,9 +196,8 @@ class blockExpertPrefixSumKernel {
 
 #define LAUNCH_BLOCK_PREFIXSUM_KERNEL(kNumTokensPerBlock) \
   stream.submit([&](sycl::handler& cgh) {                 \
-    \                     
     cgh.parallel_for(                                     \
-        sycl::nd_range<3>(grid * block, block), \ 
+        sycl::nd_range<3>(grid * block, block),           \
         blockExpertPrefixSumKernel<kNumTokensPerBlock>(   \
             token_selected_experts,                       \
             blocked_expert_counts,                        \
@@ -361,9 +341,8 @@ class GlobalExpertPrefixSumKernel {
 
 #define LAUNCH_GLOBAL_PREFIXSUM_KERNEL(kNumThreadsPerBlock) \
   stream.submit([&](sycl::handler& cgh) {                   \
-    \                     
     cgh.parallel_for(                                       \
-        sycl::nd_range<3>(grid * block, block), \ 
+        sycl::nd_range<3>(grid * block, block),             \
         GlobalExpertPrefixSumKernel<kNumThreadsPerBlock>(   \
             blocked_expert_counts,                          \
             blocked_expert_counts_cumsum,                   \
@@ -602,9 +581,7 @@ class ExpandInputRowsKernel {
 
       int64_t const start_offset = item.get_local_id(2);
       int64_t const stride = EXPAND_THREADS_PER_BLOCK;
-      int64_t const num_elems_in_col = hidden_size;
-      // assert(hidden_size % ELEM_PER_THREAD == 0);
-      for (int elem_index = start_offset; elem_index < num_elems_in_col;
+      for (int elem_index = start_offset; elem_index < hidden_size;
            elem_index += stride) {
         dest_row_ptr[elem_index] = source_row_ptr[elem_index];
       }

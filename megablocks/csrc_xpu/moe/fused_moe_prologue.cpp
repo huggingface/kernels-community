@@ -20,7 +20,9 @@ void fused_moe_prologue(
       static_cast<int>(num_experts_on_rank * ep_size);
   auto& stream = at::xpu::getCurrentXPUStream(input.device().index()).queue();
 
-  assert(token_selected_experts.dtype() == torch::kInt64);
+  TORCH_CHECK(
+      token_selected_experts.dtype() == torch::kInt64,
+      "token_selected_experts must be int64 dtype");
   auto const* token_selected_experts_ =
       reinterpret_cast<int64_t const*>(token_selected_experts.data_ptr());
   auto const* input_activations =
@@ -29,7 +31,6 @@ void fused_moe_prologue(
       reinterpret_cast<float const*>(token_final_scales.data_ptr());
   int const num_experts_per_node = num_experts_total / ep_size;
   int start_expert = num_experts_per_node * 0;
-  int end_expert = start_expert + num_experts_per_node;
   auto expanded_num_rows = num_rows * experts_per_token;
 
   // workspace configure

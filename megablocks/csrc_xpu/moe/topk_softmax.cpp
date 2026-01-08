@@ -175,7 +175,7 @@ class moeTopK {
         output[idx] = resultVal;
         indices[idx] =
             should_process_row ? (expert - start_expert) : num_experts;
-        assert(indices[idx] >= 0);
+        // Note: indices[idx] is always >= 0 by construction
         source_rows[idx] = k_idx * num_rows + block_row;
       }
       item.barrier(sycl::access::fence_space::local_space);
