@@ -5,20 +5,14 @@ from collections import namedtuple
 
 def test_megablocks_moe_mlp_import():
     """Test if MegaBlocksMoeMLP can be imported."""
-    if torch.cuda.is_available():
-        from megablocks.layers import MegaBlocksMoeMLP
-    elif torch.xpu.is_available():
-        from megablocks.xpu_fused_moe import MegaBlocksMoeMLP
+    from megablocks.layers import MegaBlocksMoeMLP
 
     assert MegaBlocksMoeMLP is not None, "MegaBlocksMoeMLP import failed."
 
 
 def test_megablocks_moe_mlp_functionality(device):
     """Test the functionality of MegaBlocksMoeMLP."""
-    if torch.cuda.is_available():
-        from megablocks.layers import MegaBlocksMoeMLP
-    elif torch.xpu.is_available():
-        from megablocks.xpu_fused_moe import MegaBlocksMoeMLP
+    from megablocks.layers import MegaBlocksMoeMLP
 
     # Create a simple instance of MegaBlocksMoeMLP
     model = MegaBlocksMoeMLP()
