@@ -6,6 +6,7 @@ backends = [
 ]
 
 [torch]
+minver = "2.9"
 src = [
     "torch-ext/torch_binding.cpp",
     "torch-ext/torch_binding.h",
