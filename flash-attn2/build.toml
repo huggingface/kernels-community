@@ -13,6 +13,44 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
+[kernel.flash_attn_cpu_avx512]
+backend = "cpu"
+cxx-flags = [
+    "-fopenmp",
+    "-mavx512f",
+    "-mavx512bf16",
+    "-mavx512vl",
+    "-mavx512dq",
+    "-mavx512bw",
+    "-mamx-bf16",
+    "-mamx-int8",
+    "-mamx-tile",
+]
+depends = ["torch"]
+include = ["flash_attn_cpu"]
+src = [
+    "flash_attn_cpu/src/fmha_fwd_avx512.cpp",
+    "flash_attn_cpu/src/fmha_fwd_avx512.hpp",
+    "flash_attn_cpu/src/fmha_fwd_common.hpp",
+    "flash_attn_cpu/src/fmha_fwd_kernel.hpp",
+]
+
+[kernel.flash_attn_cpu]
+backend = "cpu"
+cxx-flags = ["-fopenmp"]
+depends = ["torch"]
+include = ["flash_attn_cpu"]
+src = [
+    "flash_attn_cpu/flash_api.cpp",
+    "flash_attn_cpu/src/fmha_fwd_dispatch.cpp",
+    "flash_attn_cpu/src/fmha_fwd_fallback.cpp",
+    "flash_attn_cpu/src/fmha_fwd.hpp",
+    "flash_attn_cpu/src/fmha_fwd_common.hpp",
+    "flash_attn_cpu/src/fmha_fwd_kernel.hpp",
+    "flash_attn_cpu/src/fmha_fwd_avx512.hpp",
+    "flash_attn_cpu/src/fmha_fwd_fallback.hpp",
+    "flash_attn_cpu/src/cpu_features.hpp",
+]
 
 
 [kernel.flash_attn]
