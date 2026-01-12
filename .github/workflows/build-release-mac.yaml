@@ -10,7 +10,7 @@ jobs:
   build-kernel:
     # Only run if the PR was actually merged (not just closed)
     if: github.event.pull_request.merged == true
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/nix-installer-action@v20
@@ -28,14 +28,18 @@ jobs:
           USER: runner
       - name: Validate kernel directory
         id: validate
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          PR_TITLE="${{ github.event.pull_request.title }}"
           if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release" "$PR_TITLE"); then
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
           else
             echo "skip=true" >> $GITHUB_OUTPUT
           fi
+      - name: Install Metal toolchain
+        if: steps.validate.outputs.skip == 'false'
+        run: xcodebuild -downloadComponent MetalToolchain
       - name: Build and upload kernel
         if: steps.validate.outputs.skip == 'false'
         env:

@@ -1,5 +1,5 @@
 [general]
-name = "quantization_eetq"
+name = "quantization-eetq"
 backends = ["cuda"]
 
 [general.cuda]

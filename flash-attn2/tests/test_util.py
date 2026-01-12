@@ -2,7 +2,11 @@ import math
 
 import torch
 from einops import rearrange, repeat
-from flash_attn.bert_padding import pad_input, unpad_input
+
+try:
+    from flash_attn.bert_padding import pad_input, unpad_input
+except ImportError:
+    from flash_attn2.bert_padding import pad_input, unpad_input
 
 
 def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random", zero_lengths=False):
