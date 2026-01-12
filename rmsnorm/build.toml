@@ -1,46 +1,17 @@
 [general]
 name = "rmsnorm"
-universal = false
+backends = [
+    "cpu",
+    "xpu",
+]
 
 [torch]
 src = ["torch-ext/torch_binding.cpp"]
 
-[kernel.rmsnorm_cpu]
-backend = "cpu"
-depends = ["torch"]
-src = [
-    "rmsnorm_cpu/rmsnorm_cpu_torch.cpp",
-    "rmsnorm_cpu/rmsnorm_cpu.cpp",
-    "rmsnorm_cpu/rmsnorm_cpu.hpp",
-    "rmsnorm_cpu/cpu_features.hpp",
-]
-include = ["rmsnorm_cpu"]
-
-[kernel.rmsnorm_cpu_avx512]
-backend = "cpu"
-depends = ["torch"]
-src = [
-    "rmsnorm_cpu/rmsnorm_avx512.cpp",
-    "rmsnorm_cpu/rmsnorm_avx512.hpp",
-    "rmsnorm_cpu/cpu_types_avx512.hpp",
-]
-include = ["rmsnorm_cpu"]
-cxx-flags = ["-mfma", "-fopenmp", "-mf16c", "-mavx512f", "-mavx512bf16", "-mavx512vl"]
-
-[kernel.rmsnorm_cpu_avx2]
-backend = "cpu"
-depends = ["torch"]
-src = [
-    "rmsnorm_cpu/rmsnorm_avx2.cpp",
-    "rmsnorm_cpu/rmsnorm_avx2.hpp",
-    "rmsnorm_cpu/cpu_types_avx2.hpp",
-]
-include = ["rmsnorm_cpu"]
-cxx-flags = ["-mavx2", "-mfma", "-fopenmp", "-mf16c"]
-
 [kernel.rmsnorm_xpu]
 backend = "xpu"
 depends = ["torch"]
+include = ["rmsnorm_xpu/dpcpp"]
 src = [
     "rmsnorm_xpu/rmsnorm_xpu.cpp",
     "rmsnorm_xpu/RMSNorm.hpp",
@@ -80,5 +51,48 @@ src = [
     "rmsnorm_xpu/dpcpp/oneDNN/Runtime.h",
     "rmsnorm_xpu/dpcpp/oneDNN/Utils.h",
 ]
-include = ["rmsnorm_xpu/dpcpp"]
 
+[kernel.rmsnorm_cpu_avx2]
+backend = "cpu"
+cxx-flags = [
+    "-mavx2",
+    "-mfma",
+    "-fopenmp",
+    "-mf16c",
+]
+depends = ["torch"]
+include = ["rmsnorm_cpu"]
+src = [
+    "rmsnorm_cpu/rmsnorm_avx2.cpp",
+    "rmsnorm_cpu/rmsnorm_avx2.hpp",
+    "rmsnorm_cpu/cpu_types_avx2.hpp",
+]
+
+[kernel.rmsnorm_cpu]
+backend = "cpu"
+depends = ["torch"]
+include = ["rmsnorm_cpu"]
+src = [
+    "rmsnorm_cpu/rmsnorm_cpu_torch.cpp",
+    "rmsnorm_cpu/rmsnorm_cpu.cpp",
+    "rmsnorm_cpu/rmsnorm_cpu.hpp",
+    "rmsnorm_cpu/cpu_features.hpp",
+]
+
+[kernel.rmsnorm_cpu_avx512]
+backend = "cpu"
+cxx-flags = [
+    "-mfma",
+    "-fopenmp",
+    "-mf16c",
+    "-mavx512f",
+    "-mavx512bf16",
+    "-mavx512vl",
+]
+depends = ["torch"]
+include = ["rmsnorm_cpu"]
+src = [
+    "rmsnorm_cpu/rmsnorm_avx512.cpp",
+    "rmsnorm_cpu/rmsnorm_avx512.hpp",
+    "rmsnorm_cpu/cpu_types_avx512.hpp",
+]

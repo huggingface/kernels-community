@@ -1,6 +1,6 @@
 [general]
 name = "activation"
-universal = false
+backends = ["cuda"]
 
 [torch]
 src = [

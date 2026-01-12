@@ -1,0 +1,14 @@
+[general]
+name = "tinygrad-rms"
+backends = ["cuda"]
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.tinygrad_rms]
+backend = "cuda"
+depends = ["torch"]
+src = ["tinygrad_rms_cuda/tinygrad_rms.cu"]
