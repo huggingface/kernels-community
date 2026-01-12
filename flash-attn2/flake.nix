@@ -23,8 +23,7 @@
         allVersions:
         let
           # For CPU builds, only x86_64-linux is currently supported.
-          supported =
-            version: system: !(version ? "cpu") || system == "x86_64-linux";
+          supported = version: system: !(version ? "cpu") || system == "x86_64-linux";
           filteredSystems = builtins.map (
             version: version // { systems = builtins.filter (supported version) version.systems; }
           ) allVersions;
