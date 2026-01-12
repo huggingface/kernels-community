@@ -42,7 +42,7 @@ src = [
     "csrc/replicate.h",
     "csrc/replicate.cu",
     "csrc/sort.h",
-    "csrc/sort.cu", # vendored grouped gemm
+    "csrc/sort.cu",
     "csrc/grouped_gemm/fill_arguments.cuh",
     "csrc/grouped_gemm/grouped_gemm.cu",
     "csrc/grouped_gemm/grouped_gemm.h",
