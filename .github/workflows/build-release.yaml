@@ -58,6 +58,6 @@ jobs:
             VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
             if [ -n "$VERSION" ]; then
               nix build -L
-              nix run -L .#kernels upload --repo-id kernels-community/$KERNEL --branch main result
+              nix run -L .#kernels -- upload --repo-id kernels-community/$KERNEL --branch main result
             fi
           fi
