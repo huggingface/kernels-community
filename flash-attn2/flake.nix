@@ -20,14 +20,17 @@
         ];
 
       torchVersions =
-        let
-          supported =
-            # Only x86_64-linux CPU builds are supported currently.
-            version: system: !(version ? "cpu") || system == "x86_64-linux";
-        in
         allVersions:
-        builtins.map (
-          version: version // { systems = builtins.filter (supported version) version.systems; }
-        ) allVersions;
+        let
+          # For CPU builds, only x86_64-linux is currently supported.
+          supported = version: system: !(version ? "cpu") || system == "x86_64-linux";
+          filteredSystems = builtins.map (
+            version: version // { systems = builtins.filter (supported version) version.systems; }
+          ) allVersions;
+        in
+        # For XPU, require Torch >= 2.9.
+        builtins.filter (
+          version: !(version ? xpuVersion) || builtins.compareVersions version.torchVersion "2.9" >= 0
+        ) filteredSystems;
     };
 }
