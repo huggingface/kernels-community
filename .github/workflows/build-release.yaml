@@ -45,3 +45,19 @@ jobs:
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
           ( cd "$KERNEL" && nix run -L .#build-and-upload )
+      - name: Upload v1 kernels to main
+        if: steps.validate.outputs.skip == 'false'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          cd "$KERNEL"
+
+          # Check if build.toml exists and has version = 1
+          if [ -f "build.toml" ]; then
+            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
+            if [ -n "$VERSION" ]; then
+              nix build -L
+              nix run -L .#kernels upload --repo-id kernels-community/$KERNEL --branch main result
+            fi
+          fi
