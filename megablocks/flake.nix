@@ -21,5 +21,10 @@
           importlib-metadata
           torchmetrics
         ];
+
+      torchVersions = builtins.filter (
+        version: !(version ? xpuVersion) || builtins.compareVersions version.torchVersion "2.9" >= 0
+      );
     };
+
 }
