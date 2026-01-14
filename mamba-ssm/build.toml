@@ -1,5 +1,6 @@
 [general]
 name = "mamba-ssm"
+version = 1
 backends = ["cuda"]
 
 [torch]
