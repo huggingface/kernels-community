@@ -1,5 +1,6 @@
 [general]
 name = "scattermoe"
+version = 1
 backends = [
     "cuda",
     "rocm",
