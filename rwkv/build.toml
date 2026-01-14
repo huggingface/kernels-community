@@ -1,5 +1,6 @@
 [general]
 name = "rwkv"
+version = 1
 backends = ["cuda"]
 
 [torch]
