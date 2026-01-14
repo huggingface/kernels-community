@@ -1,5 +1,6 @@
 [general]
 name = "flash-attn2"
+version = 1
 backends = [
     "cpu",
     "cuda",
