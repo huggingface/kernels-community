@@ -1,5 +1,6 @@
 [general]
 name = "activation"
+version = 1
 backends = ["cuda"]
 
 [torch]
