@@ -1,5 +1,6 @@
 [general]
 name = "trimul_gpumode"
+version = 1
 backends = [
     "cuda",
     "rocm",
