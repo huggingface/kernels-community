@@ -13,5 +13,10 @@
     kernel-builder.lib.genFlakeOutputs {
       inherit self;
       path = ./.;
+
+      pythonCheckInputs =
+        ps: with ps; [
+          einops
+        ];
     };
 }

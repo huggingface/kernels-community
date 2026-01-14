@@ -1,6 +1,7 @@
 [general]
-name = "deformable_detr"
-universal = false
+name = "deformable-detr"
+version = 1
+backends = ["cuda"]
 
 [torch]
 src = [

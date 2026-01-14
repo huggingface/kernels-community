@@ -60,6 +60,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("varlen_fwd", torch::kCUDA, &mha_varlen_fwd);
 #elif defined(XPU_KERNEL)
   ops.impl("varlen_fwd", torch::kXPU, &mha_varlen_fwd);
+#elif defined(CPU_KERNEL)
+  ops.impl("varlen_fwd", torch::kCPU, &mha_varlen_fwd);
 #endif
 
   ops.def("bwd("

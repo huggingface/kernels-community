@@ -27,14 +27,14 @@ jobs:
 
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Validate kernel directory
         id: validate
         shell: pwsh
         env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
+          PRTITLE: ${{ github.event.pull_request.title }}
         run: |
-          $KERNEL = python .github/workflows/validate-kernel-pr.py "pr" "$PR_TITLE"
+          $KERNEL = python .github/workflows/validate-kernel-pr.py "pr" "$Env:PRTITLE"
           if ($LASTEXITCODE -eq 0) {
             echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
             echo "skip=false" >> $env:GITHUB_OUTPUT
@@ -93,7 +93,7 @@ jobs:
 
       - name: Setup Python
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
 
@@ -108,7 +108,7 @@ jobs:
       - name: Checkout kernel-builder
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         id: checkout-kernel-builder
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: huggingface/kernel-builder
           ref: "${{ steps.extract-builder-version.outputs.revision }}"
@@ -116,7 +116,7 @@ jobs:
 
       - name: Cache Rust build
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             kernel-builder/build2cmake/target

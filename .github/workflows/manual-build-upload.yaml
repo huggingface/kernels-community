@@ -31,13 +31,13 @@ jobs:
 
       - name: Checkout selected branch
         if: ${{ inputs.pr_number == '' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Checkout PR branch
         if: ${{ inputs.pr_number != '' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: refs/pull/${{ inputs.pr_number }}/head
           fetch-depth: 0

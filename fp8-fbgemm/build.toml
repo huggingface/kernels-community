@@ -1,9 +1,8 @@
 [general]
 name = "fp8-fbgemm"
+version = 1
 backends = [
-    "cpu",
     "cuda",
-    "metal",
     "rocm",
     "xpu",
 ]

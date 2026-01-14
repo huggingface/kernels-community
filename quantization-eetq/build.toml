@@ -1,38 +1,14 @@
 [general]
-name = "quantization_eetq"
-universal = false
-cuda-maxver = "12.9"
+name = "quantization-eetq"
+backends = ["cuda"]
+
+[general.cuda]
+maxver = "12.9"
 
 [torch]
 src = [
     "torch-ext/torch_binding.cpp",
     "torch-ext/torch_binding.h",
-]
-
-[kernel.weight_only_batched_gemv]
-backend = "cuda"
-depends = [
-    "cutlass_2_10",
-    "torch",
-]
-include = ["cutlass_extensions/include"]
-src = [
-    "cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h",
-    "cutlass_extensions/include/cutlass_extensions/gemm/kernel/mixed_gemm_B_layout.h",
-    "weightOnlyBatchedGemv/common.h",
-    "weightOnlyBatchedGemv/enabled.h",
-    "weightOnlyBatchedGemv/kernel.h",
-    "weightOnlyBatchedGemv/kernelLauncher.cu",
-    "weightOnlyBatchedGemv/kernelLauncher.h",
-    "weightOnlyBatchedGemv/utility.h",
-    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs1Int4b.cu",
-    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs1Int8b.cu",
-    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs2Int4b.cu",
-    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs2Int8b.cu",
-    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs3Int4b.cu",
-    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs3Int8b.cu",
-    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs4Int4b.cu",
-    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs4Int8b.cu",
 ]
 
 [kernel.cutlass_kernels]
@@ -90,4 +66,30 @@ src = [
     "utils/logger.h",
     "utils/string_utils.h",
     "utils/torch_utils.h",
+]
+
+[kernel.weight_only_batched_gemv]
+backend = "cuda"
+depends = [
+    "cutlass_2_10",
+    "torch",
+]
+include = ["cutlass_extensions/include"]
+src = [
+    "cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h",
+    "cutlass_extensions/include/cutlass_extensions/gemm/kernel/mixed_gemm_B_layout.h",
+    "weightOnlyBatchedGemv/common.h",
+    "weightOnlyBatchedGemv/enabled.h",
+    "weightOnlyBatchedGemv/kernel.h",
+    "weightOnlyBatchedGemv/kernelLauncher.cu",
+    "weightOnlyBatchedGemv/kernelLauncher.h",
+    "weightOnlyBatchedGemv/utility.h",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs1Int4b.cu",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs1Int8b.cu",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs2Int4b.cu",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs2Int8b.cu",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs3Int4b.cu",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs3Int8b.cu",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs4Int4b.cu",
+    "weightOnlyBatchedGemv/weightOnlyBatchedGemvBs4Int8b.cu",
 ]

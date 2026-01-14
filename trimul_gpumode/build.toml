@@ -1,3 +1,10 @@
 [general]
 name = "trimul_gpumode"
-universal = true
+version = 1
+backends = [
+    "cuda",
+    "rocm",
+    "xpu",
+]
+
+[kernel]

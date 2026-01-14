@@ -5,6 +5,7 @@ import os
 from typing import List, Optional
 
 import pytest
+import torch
 # from composer.utils import reproducibility
 
 # Allowed options for pytest.mark.world_size()
@@ -108,3 +109,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int):
     if exitstatus == 5:
         session.exitstatus = 0  # Ignore no-test-ran errors
+
+
+@pytest.fixture(scope="session")
+def device(request):
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.xpu.is_available():
+        return "xpu"
+    else:
+        return pytest.skip("No supported device found (CUDA or XPU)")
