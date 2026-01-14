@@ -1,5 +1,6 @@
 [general]
 name = "rmsnorm"
+version = 1
 backends = [
     "cpu",
     "xpu",
