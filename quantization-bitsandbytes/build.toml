@@ -1,5 +1,6 @@
 [general]
 name = "quantization-bitsandbytes"
+version = 1
 backends = ["cpu"]
 
 [torch]
