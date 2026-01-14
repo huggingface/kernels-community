@@ -117,4 +117,41 @@ jobs:
         shell: pwsh
         run: |
           $KERNEL = "${{ steps.validate.outputs.kernel }}"
+          # Initialize oneAPI environment for XPU builds
+          if ("${{ matrix.platform.backend }}" -eq "xpu") {
+            $setvarsPath = "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+            if (Test-Path $setvarsPath) {
+              Write-Host "Initializing Intel oneAPI environment for XPU build..." -ForegroundColor Cyan
+              
+              # Create a temporary file to capture environment variables
+              $tempFile = [System.IO.Path]::GetTempFileName()
+              
+              # Run setvars.bat and capture all environment variables
+              cmd.exe /c "`"$setvarsPath`" && set > `"$tempFile`""
+              
+              # Parse and set each environment variable in PowerShell
+              Get-Content $tempFile | ForEach-Object {
+                if ($_ -match "^(.*?)=(.*)$") {
+                  $varName = $matches[1]
+                  $varValue = $matches[2]
+                  [System.Environment]::SetEnvironmentVariable($varName, $varValue, [System.EnvironmentVariableTarget]::Process)
+                }
+              }
+              
+              Remove-Item $tempFile -ErrorAction SilentlyContinue
+              
+              # Verify Intel compiler is now in PATH
+              $icxPath = (Get-Command icx-cl -ErrorAction SilentlyContinue).Path
+              if ($icxPath) {
+                Write-Host "Intel oneAPI environment initialized successfully" -ForegroundColor Green
+                Write-Host "Intel C++ Compiler found at: $icxPath" -ForegroundColor Green
+              } else {
+                Write-Error "Intel compiler (icx-cl) still not found in PATH after initialization"
+                exit 1
+              }
+            } else {
+              Write-Error "setvars.bat not found at $setvarsPath"
+              exit 1
+            }
+          }
           & "$env:GITHUB_WORKSPACE\kernel-builder\scripts\windows\builder.ps1" -Backend ${{ matrix.platform.backend }} -SourceFolder "$KERNEL" -BuildConfig Release -Build
