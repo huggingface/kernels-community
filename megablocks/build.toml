@@ -1,5 +1,6 @@
 [general]
 name = "megablocks"
+version = 1
 backends = [
     "cuda",
     "xpu",
