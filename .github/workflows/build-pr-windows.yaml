@@ -42,8 +42,27 @@ jobs:
             echo "skip=true" >> $env:GITHUB_OUTPUT
           }
 
-      - name: Kernel Info
+      - name: Check backend support
+        id: check-backend
         if: steps.validate.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          $KERNEL = "${{ steps.validate.outputs.kernel }}"
+          $BACKEND = "${{ matrix.platform.backend }}"
+          $buildToml = Get-Content "${KERNEL}/build.toml" -Raw
+          
+          # Check if any kernel section has the specified backend
+          $pattern = "backend\s*=\s*[`"']${BACKEND}[`"']"
+          if ($buildToml -match $pattern) {
+            Write-Output "Kernel '$KERNEL' supports backend '$BACKEND'"
+            echo "supported=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Output "Kernel '$KERNEL' does NOT support backend '$BACKEND' - skipping build"
+            echo "supported=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Kernel Info
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         shell: pwsh
         run: |
           $KERNEL = "${{ steps.validate.outputs.kernel }}"
@@ -51,7 +70,7 @@ jobs:
 
       - name: Kernel extract required builder version
         id: extract-builder-version
-        if: steps.validate.outputs.skip == 'false'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         shell: pwsh
         run: |
           $KERNEL = "${{ steps.validate.outputs.kernel }}"
@@ -61,33 +80,33 @@ jobs:
           echo "revision=$revision" >> $env:GITHUB_OUTPUT
 
       - uses: Jimver/cuda-toolkit@v0.2.29
-        if: steps.validate.outputs.skip == 'false' && matrix.platform.backend == 'cuda'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'cuda'
         id: setup-cuda-toolkit
         with:
           cuda: ${{ matrix.platform.cuda }}
 
       - name: Setup Intel oneAPI
-        if: steps.validate.outputs.skip == 'false' && matrix.platform.backend == 'xpu'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'xpu'
         shell: pwsh
         run: |
           & "$env:GITHUB_WORKSPACE\.github\scripts\windows\install-oneapi.ps1" -OneApiVersion "${{ matrix.platform.oneapi }}"
 
       - name: Setup Python
-        if: steps.validate.outputs.skip == 'false'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
 
       - name: Install PyTorch (CUDA)
-        if: steps.validate.outputs.skip == 'false' && matrix.platform.backend == 'cuda'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'cuda'
         run: pip install torch --index-url https://download.pytorch.org/whl/cu${{ matrix.platform.wheel }}
 
       - name: Install PyTorch (XPU)
-        if: steps.validate.outputs.skip == 'false' && matrix.platform.backend == 'xpu'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'xpu'
         run: pip3 install torch==${{ matrix.platform.torch_version }} --index-url https://download.pytorch.org/whl/xpu
 
       - name: Checkout kernel-builder
-        if: steps.validate.outputs.skip == 'false'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         id: checkout-kernel-builder
         uses: actions/checkout@v5
         with:
@@ -96,7 +115,7 @@ jobs:
           path: kernel-builder
 
       - name: Cache Rust build
-        if: steps.validate.outputs.skip == 'false'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -108,12 +127,12 @@ jobs:
             ${{ runner.os }}-rust-debug-
 
       - name: Build build2cmake
-        if: steps.validate.outputs.skip == 'false'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         working-directory: kernel-builder/build2cmake
         run: cargo build
 
       - name: Build kernel
-        if: steps.validate.outputs.skip == 'false'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         shell: pwsh
         run: |
           $KERNEL = "${{ steps.validate.outputs.kernel }}"
