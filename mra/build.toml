@@ -1,5 +1,6 @@
 [general]
 name = "mra"
+version = 1
 backends = ["cuda"]
 
 [torch]
