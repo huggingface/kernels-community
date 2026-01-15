@@ -63,7 +63,7 @@ jobs:
           }
 
           # Kernels that require oneAPI setup for XPU builds
-          $xpuNeedsOneApi = @("rotary", "rmsnorm")
+          $xpuNeedsOneApi = @("relu", "rotary", "rmsnorm")
           if ($BACKEND -eq "xpu" -and $KERNEL -in $xpuNeedsOneApi) {
             echo "needs_oneapi=true" >> $env:GITHUB_OUTPUT
           } else {
