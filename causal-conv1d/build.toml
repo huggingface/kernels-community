@@ -1,5 +1,6 @@
 [general]
 name = "causal-conv1d"
+version = 1
 backends = ["cuda"]
 
 [torch]
