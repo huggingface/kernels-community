@@ -51,9 +51,13 @@ jobs:
           $BACKEND = "${{ matrix.platform.backend }}"
           $buildToml = Get-Content "${KERNEL}/build.toml" -Raw
           
-          # Check if any kernel section has the specified backend
-          $pattern = "backend\s*=\s*[`"']${BACKEND}[`"']"
-          if ($buildToml -match $pattern) {
+          # Check two formats:
+          # 1. [kernel.*] section with: backend = "xpu"
+          # 2. [general] section with: backends = ["cuda", "xpu", ...] (can be multi-line)
+          $kernelPattern = "backend\s*=\s*[`"']${BACKEND}[`"']"
+          $backendsPattern = "(?s)backends\s*=\s*\[.*?[`"']${BACKEND}[`"'].*?\]"
+          
+          if (($buildToml -match $kernelPattern) -or ($buildToml -match $backendsPattern)) {
             Write-Output "Kernel '$KERNEL' supports backend '$BACKEND'"
             echo "supported=true" >> $env:GITHUB_OUTPUT
           } else {
