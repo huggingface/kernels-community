@@ -1,5 +1,6 @@
 [general]
 name = "punica-sgmv"
+version = 1
 backends = ["cuda"]
 
 [torch]
