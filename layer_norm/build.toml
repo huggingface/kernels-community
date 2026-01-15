@@ -1,5 +1,6 @@
 [general]
 name = "layer_norm"
+version = 1
 backends = ["cuda"]
 
 [torch]
