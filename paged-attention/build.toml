@@ -1,5 +1,6 @@
 [general]
 name = "paged-attention"
+version = 1
 backends = [
     "cuda",
     "metal",
