@@ -51,6 +51,25 @@ jobs:
           $BACKEND = "${{ matrix.platform.backend }}"
           $buildToml = Get-Content "${KERNEL}/build.toml" -Raw
           
+          # XPU block list for Windows - these kernels are not compatible with Windows XPU builds
+          $xpuBlockList = @("megablocks", "flash-attn2")
+
+          # Check if XPU backend and kernel is in block list
+          if ($BACKEND -eq "xpu" -and $KERNEL -in $xpuBlockList) {
+            Write-Output "Kernel '$KERNEL' is not compatible with Windows XPU builds - skipping"
+            Write-Output "Blocked XPU kernels: $($xpuBlockList -join ', ')"
+            echo "supported=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          # Kernels that require oneAPI setup for XPU builds
+          $xpuNeedsOneApi = @("rotary", "rmsnorm")
+          if ($BACKEND -eq "xpu" -and $KERNEL -in $xpuNeedsOneApi) {
+            echo "needs_oneapi=true" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "needs_oneapi=false" >> $env:GITHUB_OUTPUT
+          }
+
           # Check two formats:
           # 1. [kernel.*] section with: backend = "xpu"
           # 2. [general] section with: backends = ["cuda", "xpu", ...] (can be multi-line)
@@ -90,7 +109,7 @@ jobs:
           cuda: ${{ matrix.platform.cuda }}
 
       - name: Setup Intel oneAPI
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'xpu'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'xpu' && steps.check-backend.outputs.needs_oneapi == 'true'
         shell: pwsh
         run: |
           & "$env:GITHUB_WORKSPACE\.github\scripts\windows\install-oneapi.ps1" -OneApiVersion "${{ matrix.platform.oneapi }}"
@@ -140,8 +159,10 @@ jobs:
         shell: pwsh
         run: |
           $KERNEL = "${{ steps.validate.outputs.kernel }}"
-          # Initialize oneAPI environment for XPU builds
-          if ("${{ matrix.platform.backend }}" -eq "xpu") {
+          $NEEDS_ONEAPI = "${{ steps.check-backend.outputs.needs_oneapi }}"
+
+          # Initialize oneAPI environment for XPU builds that require it
+          if ("${{ matrix.platform.backend }}" -eq "xpu" -and $NEEDS_ONEAPI -eq "true") {
             $setvarsPath = "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
             if (Test-Path $setvarsPath) {
               Write-Host "Initializing Intel oneAPI environment for XPU build..." -ForegroundColor Cyan
