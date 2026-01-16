@@ -17,6 +17,10 @@ from ._layers.moe import MoE, ParallelMLP, get_load_balancing_loss
 
 from . import layers
 
+# Import device-specific fused MoE implementations
+from . import cpu_fused_moe
+from . import xpu_fused_moe
+
 # This section contains the direct kernel exports (not inlcuded in the original code)
 def exclusive_cumsum(x: torch.Tensor, dim: int, out: torch.Tensor) -> torch.Tensor:
     """
