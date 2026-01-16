@@ -4,6 +4,7 @@ version = 1
 backends = [
     "cuda",
     "xpu",
+    "cpu",
 ]
 
 [torch]
@@ -78,3 +79,10 @@ src = [
     "csrc_xpu/grouped_gemm/xe_2/gemm_xe2.hpp",
     "csrc_xpu/grouped_gemm/xe_2/gemm_xe2_policy.hpp",
 ]
+
+[kernel.megablocks_cpu]
+backend = "cpu"
+depends = [
+    "torch",
+]
+src = []
