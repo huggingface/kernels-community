@@ -85,4 +85,8 @@ backend = "cpu"
 depends = [
     "torch",
 ]
-src = []
+src = [
+    "csrc_cpu/registration.h",
+    "csrc_cpu/moe_ops.h",
+    "csrc_cpu/moe_ops.cpp",
+]
