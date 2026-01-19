@@ -114,9 +114,21 @@ class FMHAFwdEpilogue {
   using TiledCopyO =
       conditional_t<is_void_v<TiledCopyO_>, DefaultTiledCopyO, TiledCopyO_>;
 
-  // Stateless design -- no arguments or parameters.
-  struct Arguments {};
-  struct Params {};
+  // LSE output type (float for numerical stability)
+  using ElementLSE = float;
+
+  // Arguments and Parameters for LSE output
+  struct Arguments {
+    ElementLSE* lse_ptr = nullptr;  // Output: (batch, num_heads, seqlen_q)
+    int lse_stride_head = 0;        // Stride between heads
+    int lse_stride_batch = 0;       // Stride between batches
+  };
+  
+  struct Params {
+    ElementLSE* lse_ptr = nullptr;
+    int lse_stride_head = 0;
+    int lse_stride_batch = 0;
+  };
 
   // Shared memory storage
   // Note sum/max tiles are padded to 16 elements, due to limitations in CuTe
@@ -139,11 +151,12 @@ class FMHAFwdEpilogue {
 
  private:
   SharedStorage& shared;
+  Params params;
 
  public:
   static constexpr Params
   to_underlying_arguments(Arguments const& args, void* /* workspace */) {
-    return {};
+    return {args.lse_ptr, args.lse_stride_head, args.lse_stride_batch};
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -151,7 +164,8 @@ class FMHAFwdEpilogue {
   }
 
   CUTLASS_HOST_DEVICE
-  FMHAFwdEpilogue(Params const&, SharedStorage& shared_) : shared(shared_) {}
+  FMHAFwdEpilogue(Params const& params_, SharedStorage& shared_) 
+      : shared(shared_), params(params_) {}
 
   template <typename QVCoord>
   CUTLASS_DEVICE void operator()(
@@ -160,16 +174,24 @@ class FMHAFwdEpilogue {
       FragARow& tA_max,    // Softmax row-wise max accumulator
       FragARow& tA_sum,    // Softmax row-wise sum accumulator
       QVCoord blk_qv,      // WG tile indices: (q,v)
-      int thr_id) {        // Work-item ID
+      int thr_id,          // Work-item ID
+      int head_idx = 0,    // Head index for LSE storage
+      int batch_idx = 0,   // Batch index for LSE storage
+      int seq_len_q = 0) { // Sequence length for bounds checking
 
     using namespace cute;
     using ElementA = typename FragA::element_type;
 
     // Reduce k-blocks of A and A_sum across WG, if needed.
-    auto [rA, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+    auto [rA, rA_sum, rA_max, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
 
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
+
+    /* Store LSE = max + log(sum) if lse_ptr is provided */
+    if (params.lse_ptr != nullptr) {
+      store_lse(rA, rA_max, rA_sum, blk_qv, thr_id, head_idx, batch_idx, seq_len_q);
+    }
 
     /* Complete softmax, dividing out sums. */
     CUTLASS_PRAGMA_UNROLL
@@ -200,6 +222,66 @@ class FMHAFwdEpilogue {
     copy(copy_o, tOrO, tOgO);
   }
 
+  // Store LSE = max + log(sum) for backward pass
+  // Use TiledMMA partitioning to determine row indices (same as mainloop)
+  template <typename FragA_, typename FragARow, typename QVCoord>
+  CUTLASS_DEVICE void store_lse(
+      FragA_& rA,           // O accumulator for layout reference
+      FragARow& rA_max,     // Row-wise max (reduced over V dimension)
+      FragARow& rA_sum,     // Row-wise sum (before normalization)
+      QVCoord blk_qv,       // WG tile indices: (q,v)
+      int thr_id,           // Work-item ID
+      int head_idx,         // Head index
+      int batch_idx,        // Batch index
+      int seq_len_q) {      // Sequence length for bounds checking
+
+    using namespace cute;
+    using namespace sycl::ext::oneapi::this_work_item;
+    
+    // LSE base offset for this head and batch
+    ElementLSE* lse_base = params.lse_ptr + 
+                           batch_idx * params.lse_stride_batch + 
+                           head_idx * params.lse_stride_head;
+    
+    constexpr float kLn2 = 0.6931471805599453f;  // ln(2)
+    
+    // Use TiledMMAPV to get coordinates, similar to how mainloop does masking
+    // Create identity tensor for the output tile
+    Tensor cA = make_identity_tensor(make_shape(
+        get<0>(TileShapeO{}), get<1>(TileShapeO{})));
+    Tensor gA = local_tile(cA, TileShapeO{}, blk_qv);
+    
+    // Use TiledMMAPV's partitioning to get thread-specific coordinates
+    TiledMMAPV mma_pv;
+    auto thr_mma = mma_pv.get_slice(thr_id);
+    auto cA_thread = thr_mma.partition_C(gA);
+    
+    // Iterate through elements and write LSE for each unique row
+    int prev_row = -1;
+    
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA.size(); i++) {
+      // Get the global row coordinate
+      int row_idx = get<0>(cA_thread(i));
+      
+      // Only write each row once (first V position)
+      if (row_idx != prev_row && row_idx < seq_len_q) {
+        // Use broadcast to get the correct max/sum values for this row
+        auto max_val = static_cast<ElementLSE>(broadcast<0>(rA_max, rA, i));
+        auto sum_val = static_cast<ElementLSE>(broadcast<0>(rA_sum, rA, i));
+        
+        // LSE = max + log(sum)
+        // max was scaled by log2(e), so: LSE = max * ln(2) + log(sum)
+        ElementLSE lse = (sum_val > 0) ? (max_val * kLn2 + sycl::log(sum_val)) : -INFINITY;
+        
+        // Write LSE value
+        lse_base[row_idx] = lse;
+        
+        prev_row = row_idx;
+      }
+    }
+  }
+
   // Reduce k-blocks of A and A_sum across WG, if needed.
   // Note that each k block has its own scale factor based on A_max,
   //   so A/A_sum contributions need to be rescaled to match.
@@ -213,7 +295,7 @@ class FMHAFwdEpilogue {
     using namespace sycl::ext::oneapi::this_work_item;
 
     if constexpr (ReduceK{} == _1{}) {
-      return std::make_tuple(tArA, tA_sum, true);
+      return std::make_tuple(tArA, tA_sum, tA_max, true);
     } else {
       /* Identify A tile ID and k block for this subgroup. */
       auto thr_vak = group<1, 3>(TiledMMAPV{}.get_thr_layout_vmnk())
@@ -327,7 +409,7 @@ class FMHAFwdEpilogue {
           }
         }
       }
-      return std::make_tuple(rA, rA_sum, active);
+      return std::make_tuple(rA, rA_sum, rA_max, active);
     }
   }
 };
