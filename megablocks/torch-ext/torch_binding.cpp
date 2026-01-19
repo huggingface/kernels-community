@@ -259,68 +259,42 @@ REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
 #elif defined(CPU_KERNEL)
 // ======================== CPU Implementation ========================
 
-// Wrapper functions for CPU operations
-torch::Tensor fused_experts_cpu_wrapper(
-    torch::Tensor& hidden_states,
-    torch::Tensor& w1,
-    torch::Tensor& w2,
-    torch::Tensor& topk_weights,
-    torch::Tensor& topk_ids,
-    bool inplace,
-    const std::optional<torch::Tensor>& w1_bias,
-    const std::optional<torch::Tensor>& w2_bias,
-    const std::optional<double>& alpha,
-    const std::optional<double>& limit,
-    const std::string& activation
+torch::Tensor fused_moe_cpu_wrapper(
+    torch::Tensor hidden_states,
+    torch::Tensor w1,
+    torch::Tensor w2,
+    torch::Tensor topk_weights,
+    torch::Tensor topk_ids,
+    const c10::optional<torch::Tensor>& w1_bias,
+    const c10::optional<torch::Tensor>& w2_bias,
+    std::string activation,
+    double alpha,
+    double limit,
+    bool is_interleaved
 ) {
-    return megablocks::cpu::fused_experts(
+    return megablocks::cpu::fused_moe_cpu(
         hidden_states, w1, w2, topk_weights, topk_ids,
-        inplace, w1_bias, w2_bias, alpha, limit, activation
+        w1_bias, w2_bias, activation, (float)alpha, (float)limit, is_interleaved
     );
 }
 
-void silu_and_mul_cpu_wrapper(torch::Tensor& out, torch::Tensor& input) {
-    megablocks::cpu::silu_and_mul(out, input);
-}
-
-void swigluoai_and_mul_cpu_wrapper(
-    torch::Tensor& out, 
-    torch::Tensor& input, 
-    double alpha, 
-    double limit
-) {
-    megablocks::cpu::swigluoai_and_mul(out, input, alpha, limit);
-}
-
-// Register CPU operations
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
-    // ==================== Fused Experts ====================
     ops.def(
-        "fused_experts("
-        "    Tensor(a!) hidden_states,"
-        "    Tensor(b!) w1,"
-        "    Tensor(c!) w2,"
+        "fused_moe_cpu("
+        "    Tensor hidden_states,"
+        "    Tensor w1,"
+        "    Tensor w2,"
         "    Tensor topk_weights,"
         "    Tensor topk_ids,"
-        "    bool inplace,"
         "    Tensor? w1_bias,"
         "    Tensor? w2_bias,"
-        "    float? alpha,"
-        "    float? limit,"
-        "    str activation"
+        "    str activation='silu',"
+        "    float alpha=1.702,"
+        "    float limit=7.0,"
+        "    bool is_interleaved=True"
         ") -> Tensor"
     );
-    ops.impl("fused_experts", torch::kCPU, &fused_experts_cpu_wrapper);
-
-    // ==================== Activation Operations ====================
-    ops.def("silu_and_mul(Tensor! out, Tensor! input) -> ()");
-    ops.impl("silu_and_mul", torch::kCPU, &silu_and_mul_cpu_wrapper);
-
-    ops.def(
-        "swigluoai_and_mul(Tensor! out, Tensor input, float alpha=1.702, float "
-        "limit=7.0) -> ()"
-    );
-    ops.impl("swigluoai_and_mul", torch::kCPU, &swigluoai_and_mul_cpu_wrapper);
+    ops.impl("fused_moe_cpu", torch::kCPU, &fused_moe_cpu_wrapper);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

@@ -88,5 +88,5 @@ depends = [
 src = [
     "csrc_cpu/registration.h",
     "csrc_cpu/moe_ops.h",
-    "csrc_cpu/moe_ops.cpp",
+    "csrc_cpu/cpu_moe_kernel.cpp",
 ]

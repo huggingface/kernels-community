@@ -21,6 +21,13 @@ from . import layers
 from . import cpu_fused_moe
 from . import xpu_fused_moe
 
+# Import C++ optimized version
+try:
+    from . import cpu_moe_cpp
+    HAS_CPP_MOE = True
+except (ImportError, RuntimeError):
+    HAS_CPP_MOE = False
+
 # This section contains the direct kernel exports (not inlcuded in the original code)
 def exclusive_cumsum(x: torch.Tensor, dim: int, out: torch.Tensor) -> torch.Tensor:
     """
