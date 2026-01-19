@@ -4,11 +4,11 @@
 // Optimized with brgemm (batch-reduced GEMM) for Intel AMX
 
 #include "moe_ops.h"
+#include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <ATen/native/CPUBlas.h>
 #include <ATen/cpu/vec/functional.h>
 #include <ATen/cpu/vec/vec.h>
-#include <torch/extension.h>
 #include <cmath>
 #include <algorithm>
 
@@ -18,18 +18,19 @@ namespace cpu {
 namespace {
 
 // Determine if we should use brgemm based on data type
+// brgemm only supports BFloat16 and Half with float output
 template <typename scalar_t>
-inline bool can_use_brgemm(int64_t M) {
-  return false;  // Default: disable
+inline constexpr bool can_use_brgemm(int64_t M) {
+  return false;  // Default: disable for float/double
 }
 
 template <>
-inline bool can_use_brgemm<at::BFloat16>(int64_t M) {
+inline constexpr bool can_use_brgemm<at::BFloat16>(int64_t M) {
   return M > 4;  // brgemm efficient for larger M
 }
 
 template <>
-inline bool can_use_brgemm<at::Half>(int64_t M) {
+inline constexpr bool can_use_brgemm<at::Half>(int64_t M) {
   return true;
 }
 
@@ -169,6 +170,11 @@ torch::Tensor fused_moe_cpu(
       std::vector<scalar_t> activated_buf(inter_size);
       std::vector<scalar_t> expert_out_buf(hidden_size);
       
+      // brgemm requires float output buffers
+      std::vector<float> gate_buf_f(inter_size);
+      std::vector<float> up_buf_f(inter_size);
+      std::vector<float> expert_out_buf_f(hidden_size);
+      
       for (int64_t tok = begin; tok < end; ++tok) {
         const scalar_t* h_tok = h_ptr + tok * hidden_size;
         scalar_t* out_tok = out_ptr + tok * hidden_size;
@@ -224,7 +230,7 @@ torch::Tensor fused_moe_cpu(
                   /* add_C */ false,
                   /* A */ h_tok,
                   /* B */ w1_exp,
-                  /* C */ gate_buf.data());
+                  /* C */ gate_buf_f.data());
               
               at::native::cpublas::brgemm(
                   /* M */ 1,
@@ -236,7 +242,13 @@ torch::Tensor fused_moe_cpu(
                   /* add_C */ false,
                   /* A */ h_tok,
                   /* B */ w1_exp + hidden_size * inter_size,
-                  /* C */ up_buf.data());
+                  /* C */ up_buf_f.data());
+              
+              // Convert float output to scalar_t
+              for (int64_t i = 0; i < inter_size; ++i) {
+                gate_buf[i] = scalar_t(gate_buf_f[i]);
+                up_buf[i] = scalar_t(up_buf_f[i]);
+              }
             }
           } else {
             // Fallback: manual GEMM
@@ -295,7 +307,12 @@ torch::Tensor fused_moe_cpu(
                 /* add_C */ false,
                 /* A */ activated_buf.data(),
                 /* B */ w2_exp,
-                /* C */ expert_out_buf.data());
+                /* C */ expert_out_buf_f.data());
+            
+            // Convert float output to scalar_t
+            for (int64_t i = 0; i < hidden_size; ++i) {
+              expert_out_buf[i] = scalar_t(expert_out_buf_f[i]);
+            }
           } else {
             std::fill(expert_out_buf.begin(), expert_out_buf.end(), scalar_t(0));
             for (int64_t i = 0; i < hidden_size; ++i) {
