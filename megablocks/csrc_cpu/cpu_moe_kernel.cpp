@@ -144,6 +144,11 @@ torch::Tensor fused_moe_cpu(
   const int64_t inter_size = w2.size(1);
   const int64_t topk = topk_weights.size(1);
   
+  TORCH_CHECK(hidden_states.scalar_type() == at::kFloat ||
+              hidden_states.scalar_type() == at::kBFloat16 ||
+              hidden_states.scalar_type() == at::kHalf,
+              "fused_moe_cpu only supports float32, bfloat16, and float16");
+  
   auto output = torch::zeros_like(hidden_states);
   
   AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -191,20 +196,69 @@ torch::Tensor fused_moe_cpu(
           
           // ========== GEMM 1: hidden @ w1 -> [gate; up] or [g0,u0,g1,u1,...] ==========
           if (use_brgemm) {
-            // Use brgemm for better performance with AMX
-            // gate_up layout: [2*inter_size], split to gate[inter_size] and up[inter_size]
-            
-            // Compute gate = h @ w1[:, :inter_size*2:2] (even columns)
-            // Compute up = h @ w1[:, 1:inter_size*2:2] (odd columns)
-            
-            if (is_interleaved) {
-              // w1 layout: [h0_g, h0_u, h1_g, h1_u, ...] need to deinterleave
-              // For brgemm, we need contiguous layout, so use regular matmul here
-              // TODO: optimize by pre-transposing weights to [2, inter_size, hidden_size]
+              // Use brgemm for better performance with AMX
+              // gate_up layout: [2*inter_size], split to gate[inter_size] and up[inter_size]
               
-              std::vector<scalar_t> gate_up_buf(2 * inter_size);
+              // Compute gate = h @ w1[:, :inter_size*2:2] (even columns)
+              // Compute up = h @ w1[:, 1:inter_size*2:2] (odd columns)
               
-              // gate_up = h @ w1
+              if (is_interleaved) {
+                // w1 layout: [h0_g, h0_u, h1_g, h1_u, ...] need to deinterleave
+                // For brgemm, we need contiguous layout, so use regular matmul here
+                // TODO: optimize by pre-transposing weights to [2, inter_size, hidden_size]
+                
+                std::vector<scalar_t> gate_up_buf(2 * inter_size);
+                
+                // gate_up = h @ w1
+                for (int64_t i = 0; i < 2 * inter_size; ++i) {
+                  scalar_t sum = 0;
+                  for (int64_t j = 0; j < hidden_size; ++j) {
+                    sum += h_tok[j] * w1_exp[j * 2 * inter_size + i];
+                  }
+                  gate_up_buf[i] = sum;
+                }
+                
+                // Deinterleave
+                for (int64_t i = 0; i < inter_size; ++i) {
+                  gate_buf[i] = gate_up_buf[2*i];
+                  up_buf[i] = gate_up_buf[2*i + 1];
+                }
+              } else {
+                // Stacked layout: [gate; up]
+                at::native::cpublas::brgemm(
+                    /* M */ 1,
+                    /* N */ inter_size,
+                    /* K */ hidden_size,
+                    /* lda */ hidden_size,
+                    /* ldb */ inter_size,
+                    /* ldc */ inter_size,
+                    /* add_C */ false,
+                    /* A */ h_tok,
+                    /* B */ w1_exp,
+                    /* C */ gate_buf_f.data());
+                
+                at::native::cpublas::brgemm(
+                    /* M */ 1,
+                    /* N */ inter_size,
+                    /* K */ hidden_size,
+                    /* lda */ hidden_size,
+                    /* ldb */ inter_size,
+                    /* ldc */ inter_size,
+                    /* add_C */ false,
+                    /* A */ h_tok,
+                    /* B */ w1_exp + hidden_size * inter_size,
+                    /* C */ up_buf_f.data());
+                
+                // Convert float output to scalar_t
+                for (int64_t i = 0; i < inter_size; ++i) {
+                  gate_buf[i] = scalar_t(gate_buf_f[i]);
+                  up_buf[i] = scalar_t(up_buf_f[i]);
+                }
+              }
+            } else {
+              // Fallback: manual GEMM
+              std::vector<scalar_t> gate_up_buf(2 * inter_size, 0);
+              
               for (int64_t i = 0; i < 2 * inter_size; ++i) {
                 scalar_t sum = 0;
                 for (int64_t j = 0; j < hidden_size; ++j) {
@@ -213,41 +267,14 @@ torch::Tensor fused_moe_cpu(
                 gate_up_buf[i] = sum;
               }
               
-              // Deinterleave
-              for (int64_t i = 0; i < inter_size; ++i) {
-                gate_buf[i] = gate_up_buf[2*i];
-                up_buf[i] = gate_up_buf[2*i + 1];
-              }
-            } else {
-              // Stacked layout: [gate; up]
-              at::native::cpublas::brgemm(
-                  /* M */ 1,
-                  /* N */ inter_size,
-                  /* K */ hidden_size,
-                  /* lda */ hidden_size,
-                  /* ldb */ inter_size,
-                  /* ldc */ inter_size,
-                  /* add_C */ false,
-                  /* A */ h_tok,
-                  /* B */ w1_exp,
-                  /* C */ gate_buf_f.data());
-              
-              at::native::cpublas::brgemm(
-                  /* M */ 1,
-                  /* N */ inter_size,
-                  /* K */ hidden_size,
-                  /* lda */ hidden_size,
-                  /* ldb */ inter_size,
-                  /* ldc */ inter_size,
-                  /* add_C */ false,
-                  /* A */ h_tok,
-                  /* B */ w1_exp + hidden_size * inter_size,
-                  /* C */ up_buf_f.data());
-              
-              // Convert float output to scalar_t
-              for (int64_t i = 0; i < inter_size; ++i) {
-                gate_buf[i] = scalar_t(gate_buf_f[i]);
-                up_buf[i] = scalar_t(up_buf_f[i]);
+              if (is_interleaved) {
+                for (int64_t i = 0; i < inter_size; ++i) {
+                  gate_buf[i] = gate_up_buf[2*i];
+                  up_buf[i] = gate_up_buf[2*i + 1];
+                }
+              } else {
+                copy_vec(gate_buf.data(), gate_up_buf.data(), inter_size);
+                copy_vec(up_buf.data(), gate_up_buf.data() + inter_size, inter_size);
               }
             }
           } else {
@@ -297,21 +324,31 @@ torch::Tensor fused_moe_cpu(
           
           // ========== GEMM 2: activated @ w2 -> expert_out ==========
           if (use_brgemm) {
-            at::native::cpublas::brgemm(
-                /* M */ 1,
-                /* N */ hidden_size,
-                /* K */ inter_size,
-                /* lda */ inter_size,
-                /* ldb */ hidden_size,
-                /* ldc */ hidden_size,
-                /* add_C */ false,
-                /* A */ activated_buf.data(),
-                /* B */ w2_exp,
-                /* C */ expert_out_buf_f.data());
-            
-            // Convert float output to scalar_t
-            for (int64_t i = 0; i < hidden_size; ++i) {
-              expert_out_buf[i] = scalar_t(expert_out_buf_f[i]);
+              at::native::cpublas::brgemm(
+                  /* M */ 1,
+                  /* N */ hidden_size,
+                  /* K */ inter_size,
+                  /* lda */ inter_size,
+                  /* ldb */ hidden_size,
+                  /* ldc */ hidden_size,
+                  /* add_C */ false,
+                  /* A */ activated_buf.data(),
+                  /* B */ w2_exp,
+                  /* C */ expert_out_buf_f.data());
+              
+              // Convert float output to scalar_t
+              for (int64_t i = 0; i < hidden_size; ++i) {
+                expert_out_buf[i] = scalar_t(expert_out_buf_f[i]);
+              }
+            } else {
+              std::fill(expert_out_buf.begin(), expert_out_buf.end(), scalar_t(0));
+              for (int64_t i = 0; i < hidden_size; ++i) {
+                scalar_t sum = 0;
+                for (int64_t j = 0; j < inter_size; ++j) {
+                  sum += activated_buf[j] * w2_exp[j * hidden_size + i];
+                }
+                expert_out_buf[i] = sum;
+              }
             }
           } else {
             std::fill(expert_out_buf.begin(), expert_out_buf.end(), scalar_t(0));
