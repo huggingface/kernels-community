@@ -82,6 +82,21 @@ src = [
 
 [kernel.megablocks_cpu]
 backend = "cpu"
+cxx-flags = [
+    "-O3",
+    "-mfma",
+    "-fopenmp",
+    "-mf16c",
+    "-mavx512f",
+    "-mavx512bf16",
+    "-mavx512vl",
+    "-mavx512dq",
+    "-mavx512bw",
+    "-mavx512vbmi",
+    "-mamx-tile",
+    "-mamx-bf16",
+    "-mamx-int8",
+]
 depends = [
     "torch",
 ]
