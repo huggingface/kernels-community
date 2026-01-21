@@ -19,29 +19,50 @@ def fused_moe_cpp(
     w2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    inplace: bool = False,
+    use_int8_w8a8: bool = False,
+    use_fp8_w8a16: bool = False,
+    use_mxfp4: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    block_size: Optional[list] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
+    alpha: Optional[float] = None,
+    limit: Optional[float] = None,
     is_vnni: bool = False,
-    activation: str = "silu",
-    alpha: float = 1.702,
-    limit: float = 7.0,
 ) -> torch.Tensor:
     """
-    C++ Fused MoE with brgemm optimization.
+    C++ Fused MoE with brgemm optimization (sglang compatible interface).
     
     Uses at::native::cpublas::brgemm for efficient batch GEMM on Intel CPUs.
     Supports both silu_and_mul (standard SwiGLU) and swigluoai (GptOss) activations.
     
     Args:
-        is_vnni: Whether w1/w2 are already in VNNI packed format. Set True if
-                 weights were preprocessed with convert_weight_packed().
-        activation: "silu" for standard SwiGLU, "swigluoai" for GptOss activation
-        alpha: swigluoai alpha parameter (default: 1.702)
-        limit: swigluoai limit parameter (default: 7.0)
+        hidden_states: Input tensor [M, K]
+        w1: Gate and up projections [E, 2N, K]
+        w2: Down projection [E, K, N]
+        topk_weights: Expert weights [M, topk]
+        topk_ids: Expert indices [M, topk]
+        inplace: Whether to use hidden_states as output
+        use_int8_w8a8: Use int8 quantization
+        use_fp8_w8a16: Use fp8 quantization
+        use_mxfp4: Use mxfp4 quantization
+        w1_scale, w2_scale: Quantization scales
+        block_size: Block size for fp8
+        a1_scale, a2_scale: Activation scales
+        w1_bias, w2_bias: Optional biases
+        alpha: swigluoai alpha parameter (set to enable swiglu)
+        limit: swigluoai limit parameter (set to enable swiglu)
+        is_vnni: Whether w1/w2 are already in VNNI packed format
     """
-    return ops.fused_moe_cpu(
+    return ops.fused_experts_cpu(
         hidden_states, w1, w2, topk_weights, topk_ids,
-        w1_bias, w2_bias, is_vnni, activation, alpha, limit
+        inplace, use_int8_w8a8, use_fp8_w8a16, use_mxfp4,
+        w1_scale, w2_scale, block_size, a1_scale, a2_scale,
+        w1_bias, w2_bias, alpha, limit, is_vnni
     )
 
 
@@ -130,6 +151,10 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         # Flatten input
         x_flat = x.view(-1, x.shape[-1])
         
+        # Determine alpha/limit for swiglu activation
+        use_alpha = alpha if activation == "swigluoai" else None
+        use_limit = limit if activation == "swigluoai" else None
+        
         # Call C++ optimized kernel (main performance bottleneck)
         output = fused_moe_cpp(
             hidden_states=x_flat,
@@ -137,12 +162,20 @@ class MegaBlocksMoeMLP(torch.nn.Module):
             w2=w2,
             topk_weights=expert_weights,
             topk_ids=expert_indices,
+            inplace=False,
+            use_int8_w8a8=False,
+            use_fp8_w8a16=False,
+            use_mxfp4=False,
+            w1_scale=None,
+            w2_scale=None,
+            block_size=None,
+            a1_scale=None,
+            a2_scale=None,
             w1_bias=w1_bias,
             w2_bias=w2_bias,
+            alpha=use_alpha,
+            limit=use_limit,
             is_vnni=getattr(self, "packed_weight", False),
-            activation=activation,
-            alpha=alpha,
-            limit=limit,
         )
         
         # Restore original shape

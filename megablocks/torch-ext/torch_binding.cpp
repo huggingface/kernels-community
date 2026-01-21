@@ -1,4 +1,6 @@
 #include <torch/library.h>
+#include <optional>
+#include <vector>
 
 #if defined(CUDA_KERNEL)
 #include "registration.h"
@@ -260,25 +262,71 @@ REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
 // ======================== CPU Implementation ========================
 
 torch::Tensor convert_weight_packed_wrapper(torch::Tensor weight) {
-    return megablocks::cpu::convert_weight_packed(weight);
+    // Make a copy since the API requires reference but we receive by value
+    auto weight_copy = weight;
+    return megablocks::cpu::convert_weight_packed(weight_copy);
 }
 
-torch::Tensor fused_moe_cpu_wrapper(
+torch::Tensor fused_experts_cpu_wrapper(
     torch::Tensor hidden_states,
     torch::Tensor w1,
     torch::Tensor w2,
     torch::Tensor topk_weights,
     torch::Tensor topk_ids,
+    bool inplace,
+    bool use_int8_w8a8,
+    bool use_fp8_w8a16,
+    bool use_mxfp4,
+    const c10::optional<torch::Tensor>& w1_scale,
+    const c10::optional<torch::Tensor>& w2_scale,
+    const c10::optional<std::vector<int64_t>>& block_size,
+    const c10::optional<torch::Tensor>& a1_scale,
+    const c10::optional<torch::Tensor>& a2_scale,
     const c10::optional<torch::Tensor>& w1_bias,
     const c10::optional<torch::Tensor>& w2_bias,
-    bool is_vnni,
-    std::string activation,
-    double alpha,
-    double limit
+    const c10::optional<double>& alpha,
+    const c10::optional<double>& limit,
+    bool is_vnni
 ) {
-    return megablocks::cpu::fused_moe_cpu(
-        hidden_states, w1, w2, topk_weights, topk_ids,
-        w1_bias, w2_bias, is_vnni, activation, (float)alpha, (float)limit
+    // Create copies for mutable references
+    auto hs = hidden_states;
+    auto w1_copy = w1;
+    auto w2_copy = w2;
+    auto tw = topk_weights;
+    auto ti = topk_ids;
+    return megablocks::cpu::fused_experts_cpu(
+        hs, w1_copy, w2_copy, tw, ti,
+        inplace, use_int8_w8a8, use_fp8_w8a16, use_mxfp4,
+        w1_scale, w2_scale, block_size, a1_scale, a2_scale,
+        w1_bias, w2_bias, alpha, limit, is_vnni
+    );
+}
+
+torch::Tensor shared_expert_cpu_wrapper(
+    torch::Tensor hidden_states,
+    torch::Tensor w1,
+    torch::Tensor w2,
+    torch::Tensor fused_experts_out,
+    double routed_scaling_factor,
+    bool inplace,
+    bool use_int8_w8a8,
+    bool use_fp8_w8a16,
+    const c10::optional<torch::Tensor>& w1_scale,
+    const c10::optional<torch::Tensor>& w2_scale,
+    const c10::optional<std::vector<int64_t>>& block_size,
+    const c10::optional<torch::Tensor>& a1_scale,
+    const c10::optional<torch::Tensor>& a2_scale,
+    bool is_vnni
+) {
+    // Create copies for mutable references
+    auto hs = hidden_states;
+    auto w1_copy = w1;
+    auto w2_copy = w2;
+    auto feo = fused_experts_out;
+    return megablocks::cpu::shared_expert_cpu(
+        hs, w1_copy, w2_copy, feo,
+        routed_scaling_factor, inplace, use_int8_w8a8, use_fp8_w8a16,
+        w1_scale, w2_scale, block_size, a1_scale, a2_scale, is_vnni
     );
 }
 
@@ -287,23 +335,52 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def("convert_weight_packed(Tensor weight) -> Tensor");
     ops.impl("convert_weight_packed", torch::kCPU, &convert_weight_packed_wrapper);
 
-    // Fused MoE kernel
+    // Fused experts kernel (sglang compatible)
     ops.def(
-        "fused_moe_cpu("
+        "fused_experts_cpu("
         "    Tensor hidden_states,"
         "    Tensor w1,"
         "    Tensor w2,"
         "    Tensor topk_weights,"
         "    Tensor topk_ids,"
-        "    Tensor? w1_bias,"
-        "    Tensor? w2_bias,"
-        "    bool is_vnni=False,"
-        "    str activation='silu',"
-        "    float alpha=1.702,"
-        "    float limit=7.0"
+        "    bool inplace=False,"
+        "    bool use_int8_w8a8=False,"
+        "    bool use_fp8_w8a16=False,"
+        "    bool use_mxfp4=False,"
+        "    Tensor? w1_scale=None,"
+        "    Tensor? w2_scale=None,"
+        "    int[]? block_size=None,"
+        "    Tensor? a1_scale=None,"
+        "    Tensor? a2_scale=None,"
+        "    Tensor? w1_bias=None,"
+        "    Tensor? w2_bias=None,"
+        "    float? alpha=None,"
+        "    float? limit=None,"
+        "    bool is_vnni=False"
         ") -> Tensor"
     );
-    ops.impl("fused_moe_cpu", torch::kCPU, &fused_moe_cpu_wrapper);
+    ops.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu_wrapper);
+
+    // Shared expert kernel
+    ops.def(
+        "shared_expert_cpu("
+        "    Tensor hidden_states,"
+        "    Tensor w1,"
+        "    Tensor w2,"
+        "    Tensor fused_experts_out,"
+        "    float routed_scaling_factor,"
+        "    bool inplace=False,"
+        "    bool use_int8_w8a8=False,"
+        "    bool use_fp8_w8a16=False,"
+        "    Tensor? w1_scale=None,"
+        "    Tensor? w2_scale=None,"
+        "    int[]? block_size=None,"
+        "    Tensor? a1_scale=None,"
+        "    Tensor? a2_scale=None,"
+        "    bool is_vnni=False"
+        ") -> Tensor"
+    );
+    ops.impl("shared_expert_cpu", torch::kCPU, &shared_expert_cpu_wrapper);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
