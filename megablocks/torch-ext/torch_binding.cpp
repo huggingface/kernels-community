@@ -259,6 +259,10 @@ REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
 #elif defined(CPU_KERNEL)
 // ======================== CPU Implementation ========================
 
+torch::Tensor convert_weight_packed_wrapper(torch::Tensor weight) {
+    return megablocks::cpu::convert_weight_packed(weight);
+}
+
 torch::Tensor fused_moe_cpu_wrapper(
     torch::Tensor hidden_states,
     torch::Tensor w1,
@@ -267,18 +271,23 @@ torch::Tensor fused_moe_cpu_wrapper(
     torch::Tensor topk_ids,
     const c10::optional<torch::Tensor>& w1_bias,
     const c10::optional<torch::Tensor>& w2_bias,
+    bool is_vnni,
     std::string activation,
     double alpha,
-    double limit,
-    bool is_interleaved
+    double limit
 ) {
     return megablocks::cpu::fused_moe_cpu(
         hidden_states, w1, w2, topk_weights, topk_ids,
-        w1_bias, w2_bias, activation, (float)alpha, (float)limit, is_interleaved
+        w1_bias, w2_bias, is_vnni, activation, (float)alpha, (float)limit
     );
 }
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+    // Convert weight to VNNI packed format for brgemm
+    ops.def("convert_weight_packed(Tensor weight) -> Tensor");
+    ops.impl("convert_weight_packed", torch::kCPU, &convert_weight_packed_wrapper);
+
+    // Fused MoE kernel
     ops.def(
         "fused_moe_cpu("
         "    Tensor hidden_states,"
@@ -288,10 +297,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
         "    Tensor topk_ids,"
         "    Tensor? w1_bias,"
         "    Tensor? w2_bias,"
+        "    bool is_vnni=False,"
         "    str activation='silu',"
         "    float alpha=1.702,"
-        "    float limit=7.0,"
-        "    bool is_interleaved=True"
+        "    float limit=7.0"
         ") -> Tensor"
     );
     ops.impl("fused_moe_cpu", torch::kCPU, &fused_moe_cpu_wrapper);

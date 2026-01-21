@@ -21,19 +21,27 @@ def fused_moe_cpp(
     topk_ids: torch.Tensor,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
+    is_vnni: bool = False,
     activation: str = "silu",
     alpha: float = 1.702,
     limit: float = 7.0,
-    is_interleaved: bool = True,
 ) -> torch.Tensor:
     """
     C++ Fused MoE with brgemm optimization.
     
     Uses at::native::cpublas::brgemm for efficient batch GEMM on Intel CPUs.
+    Supports both silu_and_mul (standard SwiGLU) and swigluoai (GptOss) activations.
+    
+    Args:
+        is_vnni: Whether w1/w2 are already in VNNI packed format. Set True if
+                 weights were preprocessed with convert_weight_packed().
+        activation: "silu" for standard SwiGLU, "swigluoai" for GptOss activation
+        alpha: swigluoai alpha parameter (default: 1.702)
+        limit: swigluoai limit parameter (default: 7.0)
     """
     return megablocks_cpu.fused_moe_cpu(
         hidden_states, w1, w2, topk_weights, topk_ids,
-        w1_bias, w2_bias, activation, alpha, limit, is_interleaved
+        w1_bias, w2_bias, is_vnni, activation, alpha, limit
     )
 
 
@@ -43,10 +51,9 @@ class MegaBlocksMoeMLP(torch.nn.Module):
     Drop-in replacement for cpu_fused_moe.MegaBlocksMoeMLP with better performance.
     
     Usage in transformers:
-        from megablocks.cpu_moe_cpp import MegaBlocksMoeMLP
         # Will be used via @use_kernel_forward_from_hub decorator
     """
-    can_torch_compile: bool = False  # C++ kernels don't support torch.compile
+    can_torch_compile: bool = True
     
     def forward(self, x: torch.Tensor) -> tuple:
         """
@@ -77,13 +84,11 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         # Get weight tensors
         if hasattr(self.experts, "gate_up_proj"):
             w1 = self.experts.gate_up_proj
-            is_interleaved = True  # GptOss uses interleaved layout
         elif hasattr(self.experts, "w1"):
             w1 = self.experts.w1
             w3 = getattr(self.experts, "w3", None)
             if w3 is not None:
                 w1 = torch.cat([w1, w3], dim=-1)
-            is_interleaved = False
         else:
             raise AttributeError("experts module must have 'gate_up_proj' or 'w1' attribute")
         
@@ -126,7 +131,6 @@ class MegaBlocksMoeMLP(torch.nn.Module):
             activation=activation,
             alpha=alpha,
             limit=limit,
-            is_interleaved=is_interleaved,
         )
         
         # Restore original shape
