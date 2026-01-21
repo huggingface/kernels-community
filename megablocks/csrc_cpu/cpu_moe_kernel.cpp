@@ -352,12 +352,11 @@ inline void clamp_sigmoid_and_mul(
       x0 = x0 / (one + (x0 * alpha_v).neg().exp_u20());
       y0 = y0 + one;
       x0 = x0 * y0;
-      bVec out_vec = convert_from_float_ext<scalar_t>(x0, fVec(0.f));
-      // Store only first half since we deinterleaved
-      at::vec::Vectorized<scalar_t>::loadu(out + d / 2 + offset); // placeholder
-      // Actually store half
+      // Store to temp buffer first, then convert
+      float tmp_out[fVec::size()];
+      x0.store(tmp_out);
       for (int j = 0; j < fVec::size(); ++j) {
-        out[d / 2 + offset + j] = static_cast<scalar_t>(x0[j]);
+        out[d / 2 + offset + j] = static_cast<scalar_t>(tmp_out[j]);
       }
     }
   }
