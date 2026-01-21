@@ -306,11 +306,106 @@ inline void pack_vnni(packed_t* __restrict__ packed, const packed_t* __restrict_
   }
 }
 
+// int8 specialization with s8s8 compensation
+template <int N>
+inline void s8s8_compensation(int8_t* __restrict__ packed, int K) {
+  int32_t* comp = reinterpret_cast<int32_t*>(packed + N * K);
+  for (int n = 0; n < N; ++n) {
+    int32_t sum = 0;
+    for (int k = 0; k < K; ++k) {
+      sum += static_cast<int32_t>(packed[k / 4 * N * 4 + n * 4 + k % 4]);
+    }
+    comp[n] = sum * 128;
+  }
+}
+
+template <>
+inline void pack_vnni<int8_t>(int8_t* __restrict__ packed, const int8_t* __restrict__ weight, int N, int K) {
+  constexpr int BLOCK_N = block_size_n();
+  TORCH_CHECK(N == BLOCK_N);
+
+  const int VNNI_BLK = 4;
+  for (int n = 0; n < N; ++n) {
+    for (int k = 0; k < K / VNNI_BLK; ++k) {
+      for (int d = 0; d < VNNI_BLK; ++d) {
+        packed[k * N * VNNI_BLK + n * VNNI_BLK + d] = weight[n * K + k * VNNI_BLK + d];
+      }
+    }
+  }
+  s8s8_compensation<BLOCK_N>(packed, K);
+}
+
+// uint8_t: mxfp4 or int4
+// pack to vnni2 format as they are computed with bfloat16
+//
+// from [N, K'/2, 2] to [K'/2, N, 2], view 2x int4 as uint8:
+// from [N,    K   ] to [K,    N   ] where K = K'/2
+//
+template <>
+inline void pack_vnni<uint8_t>(uint8_t* __restrict__ packed, const uint8_t* __restrict__ weight, int N, int K) {
+  constexpr int BLOCK_N = block_size_n();
+
+  uint8_t unpacked[2 * BLOCK_N];
+
+  // 32-way pack (align with BLOCK_N), faster for avx512 unpacking
+  //
+  // for a range of (64):
+  //   {0, 1, 2, ..., 63}
+  //
+  // original format:
+  //   { 1|0,  3|2, ..., 63|62}
+  //
+  // packed format:
+  //   {32|0, 33|1, ..., 63|31}
+  //
+  for (int k = 0; k < K; ++k) {
+    // unpack first
+    for (int n = 0; n < N; ++n) {
+      uint8_t value = weight[n * K + k];
+      unpacked[n * 2 + 0] = value & 0xF;  // lower 4 bits
+      unpacked[n * 2 + 1] = value >> 4;   // higher 4 bits
+    }
+    // re-pack to 32-way
+    for (int n = 0; n < N; ++n) {
+      packed[k * N + n] = (unpacked[n + BLOCK_N] << 4) | unpacked[n];
+    }
+  }
+}
+
 }  // namespace (anonymous) - temporarily close to expose convert_weight_packed
 
 // ============================================================================
 // convert_weight_packed implementation (exposed to megablocks::cpu namespace)
 // ============================================================================
+
+// dispatch: bfloat16, float16, int8_t, fp8_e4m3, uint8_t(mxfp4/int4)
+#define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                     \
+  [&] {                                                          \
+    switch (TYPE) {                                              \
+      case at::ScalarType::BFloat16: {                           \
+        using packed_t = at::BFloat16;                           \
+        return __VA_ARGS__();                                    \
+      }                                                          \
+      case at::ScalarType::Half: {                               \
+        using packed_t = at::Half;                               \
+        return __VA_ARGS__();                                    \
+      }                                                          \
+      case at::ScalarType::Char: {                               \
+        using packed_t = int8_t;                                 \
+        return __VA_ARGS__();                                    \
+      }                                                          \
+      case at::ScalarType::Float8_e4m3fn: {                      \
+        using packed_t = at::Float8_e4m3fn;                      \
+        return __VA_ARGS__();                                    \
+      }                                                          \
+      case at::ScalarType::Byte: {                               \
+        using packed_t = uint8_t;                                \
+        return __VA_ARGS__();                                    \
+      }                                                          \
+      default:                                                   \
+        TORCH_CHECK(false, "Unsupported data type for convert_weight_packed.\n"); \
+    }                                                            \
+  }()
 
 at::Tensor convert_weight_packed(at::Tensor& weight) {
   CHECK_INPUT(weight);
@@ -318,25 +413,45 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
   const int64_t ndim = weight.ndimension();
   TORCH_CHECK(ndim == 2 || ndim == 3, "expect weight to be 2d or 3d, got ", ndim, "d tensor.");
 
+  if (ndim == 2 && weight.size(0) < TILE_N) {
+    // for 2D weight and small OC shape, we use fma linear path, which needs transpose not pack
+    return weight.to(at::kFloat).t().contiguous();
+  }
+
   const auto st = weight.scalar_type();
   const int64_t E = ndim == 3 ? weight.size(0) : 1;
   const int64_t OC = ndim == 3 ? weight.size(1) : weight.size(0);
   const int64_t IC = ndim == 3 ? weight.size(2) : weight.size(1);
 
+  // mxfp4 or int4 are packed with uint8 (2 elements per byte)
+  const int64_t actual_IC = st == at::kByte ? IC * 2 : IC;
+
   TORCH_CHECK(OC % TILE_N == 0, "invalid weight out features ", OC);
-  TORCH_CHECK(IC % TILE_K == 0, "invalid weight input features ", IC);
+  TORCH_CHECK(actual_IC % TILE_K == 0, "invalid weight input features ", actual_IC);
 
   constexpr int64_t BLOCK_N = block_size_n();
   const int64_t NB = div_up(OC, BLOCK_N);
 
-  auto packed_weight = at::empty_like(weight);
+  // use phony sizes here [E, OC, IC], for each [E], [OC, IC] -> [IC / 2, OC, 2]
+  auto packed_weight = at::empty({}, weight.options());
   const int64_t stride = OC * IC;
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "convert_weight_packed", [&] {
-    const int packed_row_size = IC;
-    const scalar_t* w_data = weight.data_ptr<scalar_t>();
-    scalar_t* packed_data = packed_weight.data_ptr<scalar_t>();
+  // Note: for `kByte` (uint8), it represents either `mxfp4` or `int4`.
+  TORCH_CHECK(
+      st == at::kBFloat16 || st == at::kHalf || st == at::kChar || st == at::kFloat8_e4m3fn || st == at::kByte,
+      "expect weight to be bfloat16, float16, int8, fp8_e4m3 or uint8(mxfp4 or int4).");
 
+  CPU_DISPATCH_PACKED_TYPES(st, [&] {
+    // adjust most inner dimension size
+    const int packed_row_size = get_row_size<packed_t>(actual_IC);
+    auto sizes = weight.sizes().vec();
+    sizes[ndim - 1] = packed_row_size;
+    packed_weight.resize_(sizes);
+
+    const packed_t* w_data = weight.data_ptr<packed_t>();
+    packed_t* packed_data = packed_weight.data_ptr<packed_t>();
+
+    // parallel on {E, NB}
     at::parallel_for(0, E * NB, 0, [&](int64_t begin, int64_t end) {
       int64_t e{0}, nb{0};
       data_index_init(begin, e, E, nb, NB);
@@ -346,9 +461,10 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
 
         int64_t n = nb * BLOCK_N;
         int64_t n_size = std::min(BLOCK_N, OC - n);
-        pack_vnni<scalar_t>(
+        pack_vnni<packed_t>(
             packed_data + e * OC * packed_row_size + n * packed_row_size, w_data + e * stride + n * IC, n_size, IC);
 
+        // move to the next index
         data_index_step(e, E, nb, NB);
       }
     });
