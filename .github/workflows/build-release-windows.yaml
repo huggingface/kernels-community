@@ -159,12 +159,13 @@ jobs:
       - name: Build kernel
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         shell: pwsh
+        env:
+          KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
+          NEEDS_ONEAPI: ${{ steps.check-backend.outputs.needs_oneapi }}
+          PLATFORM_BACKEND: ${{ matrix.platform.backend }}
         run: |
-          $KERNEL = "${{ steps.validate.outputs.kernel }}"
-          $NEEDS_ONEAPI = "${{ steps.check-backend.outputs.needs_oneapi }}"
-
           # Initialize oneAPI environment for XPU builds that require it
-          if ("${{ matrix.platform.backend }}" -eq "xpu" -and $NEEDS_ONEAPI -eq "true") {
+          if ($env:PLATFORM_BACKEND -eq "xpu" -and $env:NEEDS_ONEAPI -eq "true") {
             $setvarsPath = "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
             if (Test-Path $setvarsPath) {
               Write-Host "Initializing Intel oneAPI environment for XPU build..." -ForegroundColor Cyan
@@ -200,19 +201,18 @@ jobs:
               exit 1
             }
           }
-          & "$env:GITHUB_WORKSPACE\kernel-builder\scripts\windows\builder.ps1" -Backend ${{ matrix.platform.backend }} -SourceFolder "$KERNEL" -BuildConfig Release -Build -LocalInstall
+          & "$env:GITHUB_WORKSPACE\kernel-builder\scripts\windows\builder.ps1" -Backend $env:PLATFORM_BACKEND -SourceFolder "$env:KERNEL_SOURCE" -BuildConfig Release -Build -LocalInstall
 
       - name: Upload kernel to Hub
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         shell: pwsh
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
         run: |
-          $KERNEL = "${{ steps.validate.outputs.kernel }}"
-          
           # Install kernels package for upload
           pip install kernels
           
           # Upload using the kernels CLI
-          # The build output is in $KERNEL/build directory
-          kernels upload "$KERNEL" --repo-id "kernels-community/$KERNEL"
+          # The build output is in $KERNEL_SOURCE/build directory
+          kernels upload "$env:KERNEL_SOURCE" --repo-id "kernels-community/$env:KERNEL_SOURCE"
