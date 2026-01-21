@@ -9,6 +9,7 @@
 //   5. tinygemm_kernel_nn2 with _mm512_dpbf16_ps
 //   6. moe_align_block_size with thread-local counting
 
+#define CPU_CAPABILITY_AVX512
 #include "moe_ops.h"
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>

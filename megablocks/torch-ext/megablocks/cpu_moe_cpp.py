@@ -10,7 +10,7 @@ import torch
 from typing import Optional
 # Import routing from Python version (lightweight, no performance impact)
 from .cpu_fused_moe import route_tokens_cpu
-import megablocks_cpu
+from ._ops import ops
 
 
 def fused_moe_cpp(
@@ -39,7 +39,7 @@ def fused_moe_cpp(
         alpha: swigluoai alpha parameter (default: 1.702)
         limit: swigluoai limit parameter (default: 7.0)
     """
-    return megablocks_cpu.fused_moe_cpu(
+    return ops.fused_moe_cpu(
         hidden_states, w1, w2, topk_weights, topk_ids,
         w1_bias, w2_bias, is_vnni, activation, alpha, limit
     )
@@ -54,6 +54,12 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         # Will be used via @use_kernel_forward_from_hub decorator
     """
     can_torch_compile: bool = True
+
+    def convert_weight(self):
+        data_1 = ops.convert_weight_packed(self.experts.gate_up_proj.data.transpose(-1, -2).contiguous())
+        data_2 = ops.convert_weight_packed(self.experts.down_proj.data.transpose(-1, -2).contiguous())
+        self.experts.gate_up_proj.set_(data_1)
+        self.experts.down_proj.set_(data_2)
     
     def forward(self, x: torch.Tensor) -> tuple:
         """
@@ -65,7 +71,12 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         Returns:
             Tuple of (output, expert_weights)
         """
-        
+        # import pdb; pdb.set_trace()
+        if not getattr(self, "packed_weight", False):
+            self.convert_weight()
+            self.packed_weight = True
+            print("convert weight success")
+
         # Get MoE parameters
         moe_top_k = getattr(self.router, "top_k", 4)
         moe_num_experts = getattr(self.experts, "num_experts", 128)
@@ -128,6 +139,7 @@ class MegaBlocksMoeMLP(torch.nn.Module):
             topk_ids=expert_indices,
             w1_bias=w1_bias,
             w2_bias=w2_bias,
+            is_vnni=getattr(self, "packed_weight", False),
             activation=activation,
             alpha=alpha,
             limit=limit,
