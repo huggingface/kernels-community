@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // MegaBlocks CPU Fused MoE Implementation
 //
-// Based on sglang implementation with all dependencies inlined.
+// Based on sglang implementation.
 
 #define CPU_CAPABILITY_AVX512
 #include "moe_ops.h"
@@ -1579,13 +1579,13 @@ at::Tensor fused_experts_cpu(
   CHECK_DIM(2, topk_weights);
   CHECK_DIM(2, topk_ids);
 
-  CHECK_EQ(topk_ids.scalar_type(), at::kInt);
+  // Convert topk_ids to int32 if needed (PyTorch often uses int64)
+  auto topk_ids_ = topk_ids.to(at::kInt);
 
   // TODO: support topk_weights to be bf16 or fp16 in the kernel.
   // The topk_weights of llama4 is computed via Llama4MoE:custom_routing_function and is bf16/fp16
   // while the kernel currently only supports it to be float32
   auto topk_weights_ = topk_weights.to(at::kFloat);
-  CHECK_EQ(topk_weights_.scalar_type(), at::kFloat);
 
   int64_t M = hidden_states.size(0);
   int64_t K = hidden_states.size(1);
@@ -1620,7 +1620,7 @@ at::Tensor fused_experts_cpu(
   int64_t max_num_blocks = div_up(max_num_tokens_padded, BLOCK_M);
   auto buffer = at::empty(
       {max_num_tokens_padded + max_num_blocks + (num_threads + 1) * E + (E + 1) + (max_num_blocks + 1)},
-      topk_ids.options());
+      topk_ids_.options());
 
   int32_t* __restrict__ sorted_ids = buffer.data_ptr<int32_t>();
   int32_t* __restrict__ expert_ids = sorted_ids + max_num_tokens_padded;
@@ -1644,7 +1644,7 @@ at::Tensor fused_experts_cpu(
 
   // align experts index
   int64_t num_tokens_post_pad = moe_align_block_size<BLOCK_M>(
-      sorted_ids, expert_ids, topk_ids.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
+      sorted_ids, expert_ids, topk_ids_.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
 
   // unlike triton kernel, we fuse silu with gemm1 so only need 2 intermediate_caches:
   //   1. intermediate_cache1 : [M * topk, N]
