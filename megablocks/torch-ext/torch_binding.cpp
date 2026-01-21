@@ -267,6 +267,12 @@ torch::Tensor convert_weight_packed_wrapper(torch::Tensor weight) {
     return megablocks::cpu::convert_weight_packed(weight_copy);
 }
 
+torch::Tensor convert_scale_packed_wrapper(torch::Tensor scale) {
+    // Make a copy since the API requires reference but we receive by value
+    auto scale_copy = scale;
+    return megablocks::cpu::convert_scale_packed(scale_copy);
+}
+
 torch::Tensor fused_experts_cpu_wrapper(
     torch::Tensor hidden_states,
     torch::Tensor w1,
@@ -334,6 +340,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     // Convert weight to VNNI packed format for brgemm
     ops.def("convert_weight_packed(Tensor weight) -> Tensor");
     ops.impl("convert_weight_packed", torch::kCPU, &convert_weight_packed_wrapper);
+
+    // Convert scale to packed format for MXFP4 quantization
+    ops.def("convert_scale_packed(Tensor scale) -> Tensor");
+    ops.impl("convert_scale_packed", torch::kCPU, &convert_scale_packed_wrapper);
 
     // Fused experts kernel (sglang compatible)
     ops.def(

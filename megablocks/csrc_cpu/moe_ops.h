@@ -18,6 +18,11 @@ namespace cpu {
 // Call this once during model loading, then set is_vnni=true in fused_experts_cpu
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
+// Convert scale to packed format for MXFP4 quantization
+// Input:  scale [E, N, G] where G is number of groups (e.g., K/32)
+// Output: packed scale with reordered layout for VNNI access
+at::Tensor convert_scale_packed(at::Tensor& scale);
+
 // Fused MoE kernel (sglang compatible interface)
 // Supports bf16/fp16 with silu_and_mul or swiglu activation
 //

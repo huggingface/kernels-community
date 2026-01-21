@@ -357,6 +357,45 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
   return packed_weight;
 }
 
+// ============================================================================
+// convert_scale_packed implementation (for MXFP4 scales)
+// ============================================================================
+
+at::Tensor convert_scale_packed(at::Tensor& scale) {
+  CHECK_INPUT(scale);
+
+  const int64_t ndim = scale.ndimension();
+  TORCH_CHECK(ndim == 2 || ndim == 3, "expect scale to be 2d or 3d, got ", ndim, "d tensor.");
+  const auto st = scale.scalar_type();
+  const int64_t E = ndim == 3 ? scale.size(0) : 1;
+  const int64_t N = ndim == 3 ? scale.size(1) : scale.size(0);
+  // number of groups, e.g. K/32
+  const int64_t G = ndim == 3 ? scale.size(2) : scale.size(1);
+
+  constexpr int64_t BLOCK_N = block_size_n();
+  TORCH_CHECK(N % BLOCK_N == 0, "invalid weight out features ", N);
+  const int64_t NB = N / BLOCK_N;
+
+  auto packed_scale = at::empty_like(scale);
+  TORCH_CHECK(st == at::kByte, "expect scale to be uint8.");
+
+  const uint8_t* s_data = scale.data_ptr<uint8_t>();
+  uint8_t* packed_data = packed_scale.data_ptr<uint8_t>();
+
+  // parallel on src {E, NB, BLOCK_N, G}, dst {E, NB, G, BLOCK_N}
+  at::parallel_for(0, E * NB * BLOCK_N * G, 0, [&](int64_t begin, int64_t end) {
+    int64_t e{0}, nb{0}, n{0}, g{0};
+    data_index_init(begin, e, E, nb, NB, n, BLOCK_N, g, G);
+
+    for (int64_t i = begin; i < end; ++i) {
+      packed_data[e * N * G + nb * G * BLOCK_N + g * BLOCK_N + n] = s_data[i];
+      // move to the next index
+      data_index_step(e, E, nb, NB, n, BLOCK_N, g, G);
+    }
+  });
+  return packed_scale;
+}
+
 namespace {  // Re-open anonymous namespace for internal implementation details
 
 // ============================================================================
