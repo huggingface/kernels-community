@@ -199,9 +199,6 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         
         # Call C++ optimized kernel (main performance bottleneck)
         # import pdb; pdb.set_trace()
-        print(f"w1 shape: {w1.data.shape}, w2 shape: {w2.data.shape}")
-        print(f"hidden_states shape: {x_flat.shape}")
-        print(f"topk_weights shape: {expert_weights.shape}, topk_ids shape: {expert_indices.shape}")
         output = fused_moe_cpp(
             hidden_states=x_flat,
             w1=w1.data,
