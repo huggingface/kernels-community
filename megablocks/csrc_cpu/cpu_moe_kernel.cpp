@@ -515,7 +515,7 @@ at::Tensor convert_scale_packed(at::Tensor& scale) {
 namespace {  // Re-open anonymous namespace for internal implementation details
 
 // ============================================================================
-// Forward declarations for quantized kernels (not implemented here)
+// Forward declarations for quantized kernels (stubs)
 // ============================================================================
 
 template <typename scalar_t>
@@ -545,107 +545,9 @@ void fused_experts_int8_kernel_impl(
   TORCH_CHECK(false, "int8 kernel not implemented");
 }
 
-template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4>
-void fused_experts_fp_kernel_impl(
-    scalar_t* __restrict__ output,
-    scalar_t* __restrict__ ic0,
-    scalar_t* __restrict__ ic1,
-    scalar_t* __restrict__ ic2,
-    scalar_t* __restrict__ A_tmp,
-    scalar_t* __restrict__ B_tmp,
-    float* __restrict__ C_tmp,
-    const scalar_t* __restrict__ input,
-    const packed_t* __restrict__ packed_w1,
-    const packed_t* __restrict__ packed_w2,
-    const scalar_t* __restrict__ w1_bias,
-    const scalar_t* __restrict__ w2_bias,
-    const param_t* __restrict__ w1s,
-    const param_t* __restrict__ w2s,
-    int64_t block_size_N,
-    int64_t block_size_K,
-    const float* __restrict__ topk_weights,
-    const int32_t* __restrict__ sorted_ids,
-    const int32_t* __restrict__ expert_ids,
-    const int32_t* __restrict__ offsets,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t E,
-    int64_t topk,
-    int64_t num_tokens_post_pad,
-    float alpha,
-    float limit,
-    CPUAcTMethod act_func,
-    bool with_bias) {
-  TORCH_CHECK(false, "fp8/mxfp4 kernel not implemented");
-}
-
-template <typename scalar_t>
-void shared_expert_int8_kernel_impl(
-    scalar_t* __restrict__ output,
-    scalar_t* __restrict__ ic1,
-    float* __restrict__ C_tmp,
-    uint8_t* __restrict__ Aq_tmp,
-    float* __restrict__ As_tmp,
-    const scalar_t* __restrict__ input,
-    const int8_t* __restrict__ packed_w1,
-    const int8_t* __restrict__ packed_w2,
-    const float* __restrict__ w1s,
-    const float* __restrict__ w2s,
-    const scalar_t* __restrict__ fused_experts_out,
-    float routed_scaling_factor,
-    int64_t M,
-    int64_t N,
-    int64_t K) {
-  TORCH_CHECK(false, "shared expert int8 kernel not implemented");
-}
-
-template <typename scalar_t>
-void shared_expert_fp8_kernel_impl(
-    scalar_t* __restrict__ output,
-    scalar_t* __restrict__ ic0,
-    scalar_t* __restrict__ ic1,
-    scalar_t* __restrict__ B_tmp,
-    float* __restrict__ C_tmp,
-    const scalar_t* __restrict__ input,
-    const at::Float8_e4m3fn* __restrict__ packed_w1,
-    const at::Float8_e4m3fn* __restrict__ packed_w2,
-    const float* __restrict__ w1s,
-    const float* __restrict__ w2s,
-    int64_t block_size_N,
-    int64_t block_size_K,
-    const scalar_t* __restrict__ fused_experts_out,
-    float routed_scaling_factor,
-    int64_t M,
-    int64_t N,
-    int64_t K) {
-  TORCH_CHECK(false, "shared expert fp8 kernel not implemented");
-}
-
 // ============================================================================
-// Original sglang moe.cpp content (stubs section)
+// Vectorized Helper Functions
 // ============================================================================
-
-// [NOTE]: Fused MoE kernel with AMX
-//
-//   This file contains implementations for
-//     * `moe_align_block_size`
-//     * `fused_moe`
-//
-//   The functionality is identical to triton kernel, excepts:
-//     * fuse silu_and_mul with gemm1, therefore this kernel
-//       allocates 2 intermediate_caches instead of 3
-//     * add `offsets` in `moe_align_block_size` which keeps track
-//       of starting offset for each M block. this is for keeping
-//       output of silu_and_mul in sorted order, thus load_A for
-//       the 2nd gemm would be contiguous, therefore we can directly
-//       load A from intermediate_cache1.
-//
-//  TODO:
-//     1. tune BLOCK_M and BLOCK_N (BLOCK_N * K fit L2)
-//     2. add prefetch for load A which is indexed access
-//     3. abstract at::native::cpublas::brgemm with WoQ gemm (M = 1 & M != 1)
-//
 
 template <typename scalar_t>
 inline void fill_stub(scalar_t* __restrict__ out, scalar_t val, int64_t size) {
@@ -657,7 +559,6 @@ inline void fill_stub(scalar_t* __restrict__ out, scalar_t val, int64_t size) {
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t size) {
   using Vec = at::vec::Vectorized<scalar_t>;
-// no remainder
 #pragma GCC unroll 4
   for (int64_t d = 0; d < size; d += Vec::size()) {
     Vec data = Vec::loadu(input + d);
@@ -665,6 +566,27 @@ inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ i
   }
 }
 
+// Copy from float* to scalar_t*
+template <typename scalar_t>
+inline void copy_from_float_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
+
+  int64_t d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    fVec data0 = fVec::loadu(input + d);
+    fVec data1 = fVec::loadu(input + d + fVec::size());
+    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
+    out_vec.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = static_cast<scalar_t>(input[d]);
+  }
+}
+
+// Copy with weight multiplication (float* input -> scalar_t* output)
 template <typename scalar_t>
 inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, float weight, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -684,17 +606,38 @@ inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ 
   }
 }
 
-// acc from [topk, K] to [K]
+// Copy with weight multiplication (scalar_t* input -> scalar_t* output)
+template <typename scalar_t>
+inline void copy_mul_from_scalar_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, float weight, int64_t size) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
+  const fVec weight_vec = fVec(weight);
+  int64_t d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    bVec x = bVec::loadu(input + d);
+    fVec x0, x1;
+    std::tie(x0, x1) = at::vec::convert_to_float(x);
+    x0 = x0 * weight_vec;
+    x1 = x1 * weight_vec;
+    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
+    out_vec.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = static_cast<scalar_t>(float(input[d]) * weight);
+  }
+}
+
+// Accumulate from [topk, K] to [K]
 template <typename scalar_t>
 inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t topk, int64_t K) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
   if (topk == 1) {
-    // do copy for topk = 1
     copy_stub(out, input, K);
   } else {
-    // do sum for topk != 1
     int64_t d;
 #pragma GCC unroll 4
     for (d = 0; d <= K - kVecSize; d += kVecSize) {
@@ -704,7 +647,6 @@ inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ in
         bVec x_bvec = bVec::loadu(input + t * K + d);
         fVec x_fvec0, x_fvec1;
         std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
-
         sum_fvec0 += x_fvec0;
         sum_fvec1 += x_fvec1;
       }
@@ -753,7 +695,7 @@ inline void add_mul_stub(
   }
 }
 
-// out = input + input2 * scale
+// Add bias to float buffer
 template <typename scalar_t>
 inline void add_bias_stub(float* __restrict__ input, const scalar_t* __restrict__ input2, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -778,6 +720,485 @@ inline void add_bias_stub(float* __restrict__ input, const scalar_t* __restrict_
     input[d] = input[d] + float(input2[d]);
   }
 }
+
+// ============================================================================
+// Activation Functions
+// ============================================================================
+
+// SiLU and multiply (scalar_t* inputs, for MXFP4 kernel)
+template <typename scalar_t>
+inline void silu_and_mul_stub(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ input2,
+    int64_t size) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  const fVec one = fVec(1.f);
+
+#pragma GCC unroll 4
+  for (int64_t d = 0; d < size; d += bVec::size()) {
+    bVec x = bVec::loadu(input + d);
+    fVec x0, x1;
+    std::tie(x0, x1) = at::vec::convert_to_float(x);
+    bVec y = bVec::loadu(input2 + d);
+    fVec y0, y1;
+    std::tie(y0, y1) = at::vec::convert_to_float(y);
+    x0 = x0 / (one + x0.neg().exp_u20());
+    x1 = x1 / (one + x1.neg().exp_u20());
+    x0 = x0 * y0;
+    x1 = x1 * y1;
+    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
+    out_vec.store(out + d);
+  }
+}
+
+// SiLU and multiply (float* inputs, for BF16 kernel)
+template <typename scalar_t, int BLOCK_N>
+inline void silu_and_mul(
+    scalar_t* __restrict__ output,
+    const float* __restrict__ input0,
+    const float* __restrict__ input1,
+    int64_t m_size,
+    int64_t N) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  const fVec one = fVec(1.f);
+
+  for (int64_t m = 0; m < m_size; ++m) {
+    scalar_t* __restrict__ out = output + m * N;
+    const float* __restrict__ x = input0 + m * BLOCK_N;
+    const float* __restrict__ y = input1 + m * BLOCK_N;
+
+    for (int64_t d = 0; d < BLOCK_N; d += bVec::size()) {
+      fVec x0 = fVec::loadu(x + d);
+      fVec x1 = fVec::loadu(x + d + fVec::size());
+      fVec y0 = fVec::loadu(y + d);
+      fVec y1 = fVec::loadu(y + d + fVec::size());
+
+      x0 = x0 / (one + x0.neg().exp_u20());
+      x1 = x1 / (one + x1.neg().exp_u20());
+      x0 = x0 * y0;
+      x1 = x1 * y1;
+
+      bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
+      out_vec.store(out + d);
+    }
+  }
+}
+
+// Clamp, sigmoid and multiply (Swiglu activation)
+template <typename scalar_t, int BLOCK_N>
+inline void clamp_sigmoid_and_mul(
+    scalar_t* __restrict__ output,
+    const float* __restrict__ input0,
+    int64_t m_size,
+    int64_t N,
+    const float alpha,
+    const float limit,
+    int64_t offset) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  const fVec one = fVec(1.f);
+  const fVec limit_v = fVec(limit);
+  const fVec nlimit_v = fVec(-limit);
+  const fVec alpha_v = fVec(alpha);
+
+  for (int64_t m = 0; m < m_size; ++m) {
+    scalar_t* __restrict__ out = output + m * N;
+    const float* __restrict__ cur_ptr = input0 + m * BLOCK_N;
+    for (int64_t d = 0; d < BLOCK_N; d += bVec::size()) {
+      float tmp_glu0[fVec::size()];
+      float tmp_linear0[fVec::size()];
+
+      // Interleaved: x[2i] = glu, x[2i+1] = linear
+      for (int j = 0; j < fVec::size(); ++j) {
+        tmp_glu0[j] = cur_ptr[d + j * 2];
+        tmp_linear0[j] = cur_ptr[d + j * 2 + 1];
+      }
+      fVec x0 = fVec::loadu(tmp_glu0);
+      fVec y0 = fVec::loadu(tmp_linear0);
+
+      // Clamp
+      x0 = at::vec::minimum(x0, limit_v);
+      y0 = at::vec::minimum(limit_v, at::vec::maximum(nlimit_v, y0));
+      // x * sigmoid(x * alpha)
+      x0 = x0 / (one + (x0 * alpha_v).neg().exp_u20());
+      // (y + 1) * x
+      y0 = y0 + one;
+      x0 = x0 * y0;
+      // Convert and store
+      convert_from_float_and_store<scalar_t>(out + d / 2 + offset, x0);
+    }
+  }
+}
+
+// ============================================================================
+// MXFP4/FP8 Kernel Helpers
+// ============================================================================
+
+#if defined(CPU_CAPABILITY_AVX512)
+// MXFP4 conversion constants
+constexpr int kFP8_BIAS = 0x3F800000;  // 1.0f in IEEE 754
+
+inline std::pair<__m512i, __m512i> transpose_2x32_16bit(__m512i a, __m512i b) {
+  __m512i idx_lo = _mm512_set_epi16(
+      47, 15, 46, 14, 45, 13, 44, 12, 43, 11, 42, 10, 41, 9, 40, 8,
+      39, 7, 38, 6, 37, 5, 36, 4, 35, 3, 34, 2, 33, 1, 32, 0);
+  __m512i idx_hi = _mm512_set_epi16(
+      63, 31, 62, 30, 61, 29, 60, 28, 59, 27, 58, 26, 57, 25, 56, 24,
+      55, 23, 54, 22, 53, 21, 52, 20, 51, 19, 50, 18, 49, 17, 48, 16);
+  return std::make_pair(
+      _mm512_permutex2var_epi16(a, idx_lo, b),
+      _mm512_permutex2var_epi16(a, idx_hi, b));
+}
+
+// Convert FP8 e4m3 to BF16
+#define CVT_FP8_TO_BF16_EXT(x) \
+  (__m512bh)_mm512_slli_epi16(_mm512_cvtepu8_epi16(x), 8)
+
+#define CVT_BF16_TO_FP32(x) \
+  _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(x), 16))
+
+// Convert MXFP4 to BF16 with scale
+inline std::pair<__m512bh, __m512bh> CVT_MXFP4_TO_BF16(__m256i b4, __m512i vscale0, __m512i vscale1) {
+  // MXFP4 LUT for 4-bit values
+  alignas(64) static const uint16_t mxfp4_lut[16] = {
+      0x0000, 0x3800, 0x3C00, 0x3E00,  // 0, 0.5, 1.0, 1.5
+      0x4000, 0x4100, 0x4200, 0x4300,  // 2.0, 2.5, 3.0, 3.5
+      0x4400, 0x4500, 0x4600, 0x4700,  // 4.0, 5.0, 6.0, 7.0
+      0x0000, 0x0000, 0x0000, 0x0000   // reserved
+  };
+  __m512i lut = _mm512_broadcast_i32x4(_mm_load_si128(reinterpret_cast<const __m128i*>(mxfp4_lut)));
+
+  // Unpack 4-bit values
+  __m512i b8 = _mm512_cvtepu8_epi16(b4);
+  __m512i lo = _mm512_and_si512(b8, _mm512_set1_epi16(0x0F));
+  __m512i hi = _mm512_srli_epi16(b8, 4);
+
+  // Lookup in table
+  __m512i bf16_lo = _mm512_permutexvar_epi16(lo, lut);
+  __m512i bf16_hi = _mm512_permutexvar_epi16(hi, lut);
+
+  // Apply scales (multiply by 2^(scale-127))
+  bf16_lo = _mm512_add_epi16(bf16_lo, vscale0);
+  bf16_hi = _mm512_add_epi16(bf16_hi, vscale1);
+
+  return std::make_pair((__m512bh)bf16_lo, (__m512bh)bf16_hi);
+}
+#endif
+
+// Simplified tinygemm for mxfp4 (scalar fallback + AVX512 when available)
+template <typename scalar_t>
+void tinygemm_kernel_mxfp4(
+    const scalar_t* __restrict__ A,
+    const uint8_t* __restrict__ B,
+    float* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    const uint8_t* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg,
+    int64_t block_size_K,
+    bool do_unpack) {
+#if defined(CPU_CAPABILITY_AVX512)
+  // Use brgemm path with unpacked weights
+  constexpr int64_t BLOCK_N = block_size_n();
+  const int64_t K2 = K >> 1;
+  const int64_t ldb2 = ldb;
+  const uint8_t* b_ptr = B;
+  const __m512i off = _mm512_set1_epi16(0x7F);
+
+  if (do_unpack) {
+    // Unpack MXFP4 to BF16
+    __m256i s8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(scale));
+    __m512i s16 = _mm512_slli_epi16(_mm512_sub_epi16(_mm512_cvtepu8_epi16(s8), off), 0x7);
+    auto [vscale0, vscale1] = transpose_2x32_16bit(s16, s16);
+
+    for (int64_t k = 0; k < K2; ++k) {
+      __m256i b4 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + k * ldb2));
+      auto [vb0, vb1] = CVT_MXFP4_TO_BF16(b4, vscale0, vscale1);
+      _mm512_storeu_si512(Btmp + k * BLOCK_N * 2 + 0, (__m512i)vb0);
+      _mm512_storeu_si512(Btmp + k * BLOCK_N * 2 + 32, (__m512i)vb1);
+    }
+  }
+
+  // Use brgemm for the actual GEMM
+  if (brg && M > 4) {
+    at::native::cpublas::brgemm(M, N, K, lda, N, ldc, false, A, Btmp, C);
+  } else {
+    // Fallback to simple GEMM
+    for (int64_t m = 0; m < M; ++m) {
+      for (int64_t n = 0; n < N; ++n) {
+        float sum = 0.0f;
+        for (int64_t k = 0; k < K; ++k) {
+          sum += float(A[m * lda + k]) * float(Btmp[k * N + n]);
+        }
+        C[m * ldc + n] = sum;
+      }
+    }
+  }
+#else
+  TORCH_CHECK(false, "tinygemm_kernel_mxfp4: requires AVX512 support");
+#endif
+}
+
+// ============================================================================
+// fused_experts_fp_kernel_impl - MXFP4/FP8 implementation
+// ============================================================================
+
+template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4>
+void fused_experts_fp_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic0,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ ic2,
+    scalar_t* __restrict__ A_tmp,
+    scalar_t* __restrict__ B_tmp,
+    float* __restrict__ C_tmp,
+    const scalar_t* __restrict__ input,
+    const packed_t* __restrict__ packed_w1,
+    const packed_t* __restrict__ packed_w2,
+    const scalar_t* __restrict__ w1_bias,
+    const scalar_t* __restrict__ w2_bias,
+    const param_t* __restrict__ w1s,
+    const param_t* __restrict__ w2s,
+    int64_t block_size_N,
+    int64_t block_size_K,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ offsets,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t E,
+    int64_t topk,
+    int64_t num_tokens_post_pad,
+    float alpha,
+    float limit,
+    CPUAcTMethod act_func,
+    bool with_bias) {
+  
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+
+  const int64_t MB = div_up(num_tokens_post_pad, BLOCK_M);
+  const int64_t NB = div_up(2 * N, BLOCK_N);
+  int64_t scale_size_N = div_up(2 * N, block_size_N);
+  int64_t scale_size_K = div_up(K, block_size_K);
+
+  std::function<int64_t(int64_t)> scale_offset_per_block;
+  if constexpr (is_mxfp4) {
+    scale_offset_per_block = [&](int64_t a) { return a * BLOCK_N; };
+  } else {
+    int64_t blocks_n_per_group = block_size_N / BLOCK_N;
+    scale_offset_per_block = [&](int64_t a) { return a / blocks_n_per_group; };
+  }
+
+  const int64_t packed_K = get_row_size<packed_t>(K);
+  const int64_t stride_e = 2 * N * packed_K;
+  const int64_t stride_n = packed_K;
+
+  int64_t B_tmp_offset_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * K;
+  int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * K * 2;
+
+  // Stage 1: intermediate_cache0 = hidden_states @ w1
+  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+    int tid = get_thread_num();
+    scalar_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
+    float* __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+
+    loop_2d<packed_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      int64_t n_size = std::min(2 * N - nb * BLOCK_N, BLOCK_N);
+
+      int32_t expert_id = expert_ids[mb];
+      const packed_t* __restrict__ B = packed_w1 + expert_id * stride_e + nb * BLOCK_N * stride_n;
+      const param_t* __restrict__ Bs = w1s + expert_id * scale_size_N * scale_size_K + scale_offset_per_block(nb) * scale_size_K;
+
+      int32_t pre_expert_id = mb == 0 ? -1 : expert_ids[mb - 1];
+      bool do_unpack = (mb == mb0) || (expert_id != pre_expert_id);
+
+      const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+      int64_t m_size = offsets[mb + 1] - offsets[mb];
+
+      for (int64_t m = 0; m < m_size; ++m) {
+        int32_t index = A_ids[m] / topk;
+        copy_stub(A + m * K, input + index * K, K);
+      }
+
+      const int64_t offset = offsets[mb];
+
+      if constexpr (is_mxfp4) {
+        tinygemm_kernel_mxfp4<scalar_t>(
+            A, B, C0,
+            B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * K,
+            Bs, m_size, n_size, K, K, n_size, BLOCK_N, true, block_size_K, do_unpack);
+      } else {
+        // FP8 path - simplified
+        TORCH_CHECK(false, "FP8 path not yet implemented in this kernel");
+      }
+
+      if (with_bias) {
+        const scalar_t* __restrict__ B_bias = w1_bias + expert_id * 2 * N + nb * BLOCK_N;
+        for (int64_t m = 0; m < m_size; ++m) {
+          add_bias_stub(C0 + m * BLOCK_N, B_bias, n_size);
+        }
+      }
+
+      if (act_func == CPUAcTMethod::swiglu) {
+        clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(
+            ic1 + offset * N, C0, m_size, N, alpha, limit, nb * (BLOCK_N / 2));
+      } else if (act_func == CPUAcTMethod::silu_and_mul) {
+        for (int64_t m = 0; m < m_size; ++m) {
+          copy_from_float_stub(ic0 + (offset + m) * N * 2 + nb * BLOCK_N, C0 + m * BLOCK_N, n_size);
+        }
+      }
+    });
+  });
+
+  // Stage 1.5: silu_and_mul if needed
+  if (act_func == CPUAcTMethod::silu_and_mul) {
+    at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
+      for (int64_t m = begin; m < end; ++m) {
+        silu_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N);
+      }
+    });
+  }
+
+  // Stage 2: intermediate_cache2 = intermediate_cache1 @ w2
+  const int64_t OC = K;
+  const int64_t IC = N;
+  const int64_t MB2 = MB;
+  const int64_t NB2 = div_up(OC, BLOCK_N);
+  scale_size_N = div_up(K, block_size_N);
+  scale_size_K = div_up(N, block_size_K);
+  const int64_t packed_IC = get_row_size<packed_t>(IC);
+  const int64_t stride_e2 = OC * packed_IC;
+  const int64_t stride_oc = packed_IC;
+
+  parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+    int tid = get_thread_num();
+    float* __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+
+    loop_2d<packed_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      int64_t m_size = offsets[mb + 1] - offsets[mb];
+      int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
+
+      const scalar_t* __restrict__ A = ic1 + offsets[mb] * N;
+      const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+
+      int32_t expert_id = expert_ids[mb];
+      const packed_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
+      const param_t* __restrict__ Bs = w2s + expert_id * scale_size_N * scale_size_K + scale_offset_per_block(nb) * scale_size_K;
+
+      int32_t pre_expert_id = mb == 0 ? -1 : expert_ids[mb - 1];
+      bool do_unpack = (mb == mb0) || (expert_id != pre_expert_id);
+
+      if constexpr (is_mxfp4) {
+        tinygemm_kernel_mxfp4<scalar_t>(
+            A, B, C0,
+            B_tmp + tid * B_tmp_size_per_thread + B_tmp_offset_per_thread + nb_offset * BLOCK_N * IC,
+            Bs, m_size, n_size, IC, IC, n_size, BLOCK_N, true, block_size_K, do_unpack);
+      } else {
+        TORCH_CHECK(false, "FP8 path not yet implemented in this kernel");
+      }
+
+      if (with_bias) {
+        const scalar_t* __restrict__ B_bias = w2_bias + expert_id * OC + nb * BLOCK_N;
+        for (int64_t m = 0; m < m_size; ++m) {
+          add_bias_stub(C0 + m * BLOCK_N, B_bias, n_size);
+        }
+      }
+
+      for (int64_t m = 0; m < m_size; ++m) {
+        int32_t index = A_ids[m];
+        float weight = topk_weights[index];
+        copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C0 + m * BLOCK_N, weight, n_size);
+      }
+    });
+  });
+
+  // Stage 3: out = intermediate_cache2.sum(dim=1)
+  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t m = begin; m < end; ++m) {
+      sum_stub(output + m * K, ic2 + m * topk * K, topk, K);
+    }
+  });
+}
+
+// Explicit template instantiations
+template void fused_experts_fp_kernel_impl<at::BFloat16, at::Float8_e4m3fn, float, false>(
+    at::BFloat16*, at::BFloat16*, at::BFloat16*, at::BFloat16*, at::BFloat16*, at::BFloat16*, float*,
+    const at::BFloat16*, const at::Float8_e4m3fn*, const at::Float8_e4m3fn*,
+    const at::BFloat16*, const at::BFloat16*, const float*, const float*,
+    int64_t, int64_t, const float*, const int32_t*, const int32_t*, const int32_t*,
+    int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, float, float, CPUAcTMethod, bool);
+
+template void fused_experts_fp_kernel_impl<at::BFloat16, uint8_t, uint8_t, true>(
+    at::BFloat16*, at::BFloat16*, at::BFloat16*, at::BFloat16*, at::BFloat16*, at::BFloat16*, float*,
+    const at::BFloat16*, const uint8_t*, const uint8_t*,
+    const at::BFloat16*, const at::BFloat16*, const uint8_t*, const uint8_t*,
+    int64_t, int64_t, const float*, const int32_t*, const int32_t*, const int32_t*,
+    int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, float, float, CPUAcTMethod, bool);
+
+template void fused_experts_fp_kernel_impl<at::Half, uint8_t, uint8_t, true>(
+    at::Half*, at::Half*, at::Half*, at::Half*, at::Half*, at::Half*, float*,
+    const at::Half*, const uint8_t*, const uint8_t*,
+    const at::Half*, const at::Half*, const uint8_t*, const uint8_t*,
+    int64_t, int64_t, const float*, const int32_t*, const int32_t*, const int32_t*,
+    int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, float, float, CPUAcTMethod, bool);
+
+template <typename scalar_t>
+void shared_expert_int8_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic1,
+    float* __restrict__ C_tmp,
+    uint8_t* __restrict__ Aq_tmp,
+    float* __restrict__ As_tmp,
+    const scalar_t* __restrict__ input,
+    const int8_t* __restrict__ packed_w1,
+    const int8_t* __restrict__ packed_w2,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    const scalar_t* __restrict__ fused_experts_out,
+    float routed_scaling_factor,
+    int64_t M,
+    int64_t N,
+    int64_t K) {
+  TORCH_CHECK(false, "shared expert int8 kernel not implemented");
+}
+
+template <typename scalar_t>
+void shared_expert_fp8_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic0,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ B_tmp,
+    float* __restrict__ C_tmp,
+    const scalar_t* __restrict__ input,
+    const at::Float8_e4m3fn* __restrict__ packed_w1,
+    const at::Float8_e4m3fn* __restrict__ packed_w2,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    int64_t block_size_N,
+    int64_t block_size_K,
+    const scalar_t* __restrict__ fused_experts_out,
+    float routed_scaling_factor,
+    int64_t M,
+    int64_t N,
+    int64_t K) {
+  TORCH_CHECK(false, "shared expert fp8 kernel not implemented");
+}
+
+// ============================================================================
+// MoE Block Alignment
+// ============================================================================
 
 template <int BLOCK_M>
 int moe_align_block_size(
@@ -871,95 +1292,9 @@ int moe_align_block_size(
   return num_tokens_post_pad;
 }
 
-//   silu :    shape          leading dimension
-//  input0  [m_size, BLOCK_N]    BLOCK_N
-//  input1  [m_size, BLOCK_N]    BLOCK_N
-//  output  [M * topk, N]          N
-template <typename scalar_t, int BLOCK_N>
-inline void silu_and_mul(
-    scalar_t* __restrict__ output,
-    const float* __restrict__ input0,  // x: x0, x1
-    const float* __restrict__ input1,  // y: y0, y1
-    int64_t m_size,
-    int64_t N) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-
-  const fVec one = fVec(1.f);
-
-  // no remainder
-  for (int64_t m = 0; m < m_size; ++m) {
-    scalar_t* __restrict__ out = output + m * N;
-    const float* __restrict__ x = input0 + m * BLOCK_N;
-    const float* __restrict__ y = input1 + m * BLOCK_N;
-
-    for (int64_t d = 0; d < BLOCK_N; d += bVec::size()) {
-      fVec x0 = fVec::loadu(x + d);
-      fVec x1 = fVec::loadu(x + d + fVec::size());
-      fVec y0 = fVec::loadu(y + d);
-      fVec y1 = fVec::loadu(y + d + fVec::size());
-      // silu
-      x0 = x0 / (one + x0.neg().exp_u20());
-      x1 = x1 / (one + x1.neg().exp_u20());
-      // mul
-      x0 = x0 * y0;
-      x1 = x1 * y1;
-      // convert
-      bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-      out_vec.store(out + d);
-    }
-  }
-}
-
-template <typename scalar_t, int BLOCK_N>
-inline void clamp_sigmoid_and_mul(
-    scalar_t* __restrict__ output,
-    const float* __restrict__ input0,
-    int64_t m_size,
-    int64_t N,
-    const float alpha,
-    const float limit,
-    int64_t offset) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-
-  const fVec one = fVec(1.f);
-  const fVec zero = fVec(0.f);
-  const fVec limit_v = fVec(limit);
-  const fVec nlimit_v = fVec(-limit);
-  const fVec alpha_v = fVec(alpha);
-
-  // no remainder
-  for (int64_t m = 0; m < m_size; ++m) {
-    scalar_t* __restrict__ out = output + m * N;
-    const float* __restrict__ cur_ptr = input0 + m * BLOCK_N;
-    for (int64_t d = 0; d < BLOCK_N; d += bVec::size()) {
-      float tmp_glu0[fVec::size()];     // 16
-      float tmp_linear0[fVec::size()];  // 16
-
-      // interleaved: x[2i] = glu, x[2i+1] = linear
-      for (int j = 0; j < fVec::size(); ++j) {
-        // x0 [0,2,..30]
-        tmp_glu0[j] = cur_ptr[d + j * 2];
-        // y0 [1,3,...31]
-        tmp_linear0[j] = cur_ptr[d + j * 2 + 1];
-      }
-      fVec x0 = fVec::loadu(tmp_glu0);
-      fVec y0 = fVec::loadu(tmp_linear0);
-
-      // clamp
-      x0 = at::vec::minimum(x0, limit_v);
-      y0 = at::vec::minimum(limit_v, at::vec::maximum(nlimit_v, y0));
-      // x * sigmoid(x * alpha)
-      x0 = x0 / (one + (x0 * alpha_v).neg().exp_u20());
-      // (y + 1) * x
-      y0 = y0 + one;
-      x0 = x0 * y0;
-      // // convert
-      convert_from_float_and_store<scalar_t>(out + d / 2 + offset, x0);
-    }
-  }
-}
+// ============================================================================
+// BF16 GEMM Kernel (tinygemm_kernel_nn2)
+// ============================================================================
 
 template <typename scalar_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn2 {
