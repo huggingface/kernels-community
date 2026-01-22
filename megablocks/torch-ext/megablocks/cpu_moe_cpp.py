@@ -10,10 +10,10 @@ import torch
 from typing import Optional
 # Import routing from Python version (lightweight, no performance impact)
 from .cpu_fused_moe import route_tokens_cpu
-from ._ops import ops
-# import sgl_kernel
+# from ._ops import ops
+import sgl_kernel
 
-# ops = torch.ops.sgl_kernel
+ops = torch.ops.sgl_kernel
 
 def fused_moe_cpp(
     hidden_states: torch.Tensor,
@@ -92,9 +92,9 @@ class MegaBlocksMoeMLP(torch.nn.Module):
             self.experts.down_proj.data = data_2
 
         if getattr(self.experts, "gate_up_proj_bias", None) is not None:
-            self.experts.gate_up_proj_bias = self.experts.gate_up_proj_bias.to(dtype)
+            self.experts.gate_up_proj_bias.data = self.experts.gate_up_proj_bias.data.to(dtype)
         if getattr(self.experts, "down_proj_bias", None) is not None:
-            self.experts.down_proj_bias = self.experts.down_proj_bias.to(dtype)
+            self.experts.down_proj_bias.data = self.experts.down_proj_bias.data.to(dtype)
 
     def convert_scales(self):
         data_1 = ops.convert_scale_packed(self.experts.gate_up_proj_precision_config.weight_scale.data.transpose(-1, -2).contiguous())
@@ -172,6 +172,8 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         # Get optional bias tensors
         w1_bias = getattr(self.experts, "gate_up_proj_bias", None)
         w2_bias = getattr(self.experts, "down_proj_bias", None)
+        w1_bias = w1_bias if w1_bias is None else w1_bias.data
+        w2_bias = w2_bias if w2_bias is None else w2_bias.data
 
         if use_mxfp4:
             w1_scale = self.experts.gate_up_proj_precision_config.weight_scale.data
