@@ -915,15 +915,13 @@ inline __m512bh CVT_FP8_TO_BF16_EXT(__m256i a) {
 
   return (__m512bh)(_mm512_ternarylogic_epi32(vsign, mask2, vexp_and_mant, 0b11111110));
 }
-
-#define CVT_BF16_TO_FP32(x) \
-  _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(x), 16))
 #endif
 
-// Unpack MXFP4 to BF16 for brgemm path
+// Unpack MXFP4 to BF16/FP16 for brgemm path
 #if defined(CPU_CAPABILITY_AVX512)
+template <typename scalar_t>
 inline void unpack_mxfp4_to_bf16(
-    at::BFloat16* __restrict__ Btmp,
+    scalar_t* __restrict__ Btmp,
     const uint8_t* __restrict__ packed_B,
     int64_t N,
     int64_t K,
