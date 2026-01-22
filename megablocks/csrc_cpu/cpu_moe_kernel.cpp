@@ -840,52 +840,128 @@ inline void clamp_sigmoid_and_mul(
 
 #if defined(CPU_CAPABILITY_AVX512)
 // MXFP4 conversion constants
-constexpr int kFP8_BIAS = 0x3F800000;  // 1.0f in IEEE 754
+constexpr int kFP8_BIAS = 0x3b800000;  // 1/256 in float32 for FP8 scale
 
-inline std::pair<__m512i, __m512i> transpose_2x32_16bit(__m512i a, __m512i b) {
-  __m512i idx_lo = _mm512_set_epi16(
-      47, 15, 46, 14, 45, 13, 44, 12, 43, 11, 42, 10, 41, 9, 40, 8,
-      39, 7, 38, 6, 37, 5, 36, 4, 35, 3, 34, 2, 33, 1, 32, 0);
-  __m512i idx_hi = _mm512_set_epi16(
-      63, 31, 62, 30, 61, 29, 60, 28, 59, 27, 58, 26, 57, 25, 56, 24,
-      55, 23, 54, 22, 53, 21, 52, 20, 51, 19, 50, 18, 49, 17, 48, 16);
-  return std::make_pair(
-      _mm512_permutex2var_epi16(a, idx_lo, b),
-      _mm512_permutex2var_epi16(a, idx_hi, b));
+// MXFP4 LUT values: -6.0f, -4.0f, -3.0f, -2.0f, -1.5f, -1.0f, -0.5f, -0.0f, 6.0f, 4.0f, 3.0f, 2.0f, 1.5f, 1.0f, 0.5f, 0.0f
+#define MXFP4_VALUES \
+  -6.0f, -4.0f, -3.0f, -2.0f, -1.5f, -1.0f, -0.5f, -0.0f, 6.0f, 4.0f, 3.0f, 2.0f, 1.5f, 1.0f, 0.5f, 0.0f
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wignored-attributes"
+
+// transpose from [2, 32] to [32, 2]
+inline std::tuple<__m512i, __m512i> transpose_2x32_16bit(__m512i r0, __m512i r1) {
+  // r0: {a0, a1, ..., a31}
+  // r1: {b0, b1, ..., b31}
+  //
+  // d0: {a0,   b0, ..., a15, b15}
+  // d1: {a16, b16, ..., a31, b31}
+  //
+  __m512i d0 = _mm512_unpacklo_epi16(r0, r1);
+  __m512i d1 = _mm512_unpackhi_epi16(r0, r1);
+  r0 = _mm512_shuffle_i32x4(d0, d1, 0x88);
+  r1 = _mm512_shuffle_i32x4(d0, d1, 0xdd);
+  d0 = _mm512_shuffle_i32x4(r0, r1, 0x88);
+  d1 = _mm512_shuffle_i32x4(r0, r1, 0xdd);
+  return std::make_tuple(d0, d1);
 }
 
-// Convert FP8 e4m3 to BF16
-#define CVT_FP8_TO_BF16_EXT(x) \
-  (__m512bh)_mm512_slli_epi16(_mm512_cvtepu8_epi16(x), 8)
+// convert 64 mxfp4 to 2x bf16 vectors, expect input 32-way packing
+inline std::tuple<__m512bh, __m512bh> CVT_MXFP4_TO_BF16(__m256i a, __m512i s0, __m512i s1) {
+  // LUT
+  const __m512 values = _mm512_set_ps(MXFP4_VALUES);
+  const __m512i lut = (__m512i)(_mm512_cvtne2ps_pbh(values, values));
+
+  const __m512i abs_mask = _mm512_set1_epi16(0x7FFF);
+  const __m512i zero = _mm512_setzero_si512();
+
+  // expand values to 16-bit integers
+  __m512i x0 = _mm512_cvtepu8_epi16(a);
+  __m512i x1 = _mm512_srli_epi32(x0, 4);
+
+  // LUT to convert mxfp4 values to bf16
+  x0 = _mm512_permutexvar_epi16(x0, lut);
+  x1 = _mm512_permutexvar_epi16(x1, lut);
+
+  // check for zeros
+  __mmask32 mask0 = _mm512_cmp_epi16_mask(_mm512_and_si512(x0, abs_mask), zero, _MM_CMPINT_EQ);
+  __mmask32 mask1 = _mm512_cmp_epi16_mask(_mm512_and_si512(x1, abs_mask), zero, _MM_CMPINT_EQ);
+
+  // emulate bf16 mul with scale factor
+  x0 = _mm512_add_epi16(x0, s0);
+  x1 = _mm512_add_epi16(x1, s1);
+
+  // blend with zero
+  x0 = _mm512_mask_blend_epi16(mask0, x0, zero);
+  x1 = _mm512_mask_blend_epi16(mask1, x1, zero);
+
+  return std::make_tuple(__m512bh(x0), __m512bh(x1));
+}
+
+#pragma GCC diagnostic pop
+
+// Convert FP8 e4m3 to BF16 (fast version)
+inline __m512bh CVT_FP8_TO_BF16_EXT(__m256i a) {
+  const __m512i mask0 = _mm512_set1_epi16(0x80);  // sign bit
+  const __m512i mask1 = _mm512_set1_epi16(0x7F);  // exponent and mantissa
+  const __m512i mask2 = _mm512_set1_epi16(0x4000);
+
+  __m512i x = _mm512_cvtepu8_epi16(a);
+  __m512i vsign = _mm512_and_si512(x, mask0);
+  vsign = _mm512_slli_epi16(vsign, 8);
+
+  __m512i vexp_and_mant = _mm512_and_si512(x, mask1);
+  vexp_and_mant = _mm512_slli_epi16(vexp_and_mant, 4);
+
+  return (__m512bh)(_mm512_ternarylogic_epi32(vsign, mask2, vexp_and_mant, 0b11111110));
+}
 
 #define CVT_BF16_TO_FP32(x) \
   _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(x), 16))
+#endif
 
-// Convert MXFP4 to BF16 with scale
-inline std::pair<__m512bh, __m512bh> CVT_MXFP4_TO_BF16(__m256i b4, __m512i vscale0, __m512i vscale1) {
-  // MXFP4 LUT for 4-bit values
-  alignas(64) static const uint16_t mxfp4_lut[16] = {
-      0x0000, 0x3800, 0x3C00, 0x3E00,  // 0, 0.5, 1.0, 1.5
-      0x4000, 0x4100, 0x4200, 0x4300,  // 2.0, 2.5, 3.0, 3.5
-      0x4400, 0x4500, 0x4600, 0x4700,  // 4.0, 5.0, 6.0, 7.0
-      0x0000, 0x0000, 0x0000, 0x0000   // reserved
-  };
-  __m512i lut = _mm512_broadcast_i32x4(_mm_load_si128(reinterpret_cast<const __m128i*>(mxfp4_lut)));
+// Unpack MXFP4 to BF16 for brgemm path
+#if defined(CPU_CAPABILITY_AVX512)
+inline void unpack_mxfp4_to_bf16(
+    at::BFloat16* __restrict__ Btmp,
+    const uint8_t* __restrict__ packed_B,
+    int64_t N,
+    int64_t K,
+    int64_t ldb,
+    int64_t ldb_tmp,
+    const uint8_t* __restrict__ scale) {
+  // [K/2, N, 2]
+  const int64_t K2 = K >> 1;
+  const int64_t ldb2 = ldb;  // ldb * 2 >> 1;
+  const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(packed_B);
 
-  // Unpack 4-bit values
-  __m512i b8 = _mm512_cvtepu8_epi16(b4);
-  __m512i lo = _mm512_and_si512(b8, _mm512_set1_epi16(0x0F));
-  __m512i hi = _mm512_srli_epi16(b8, 4);
+  constexpr int BLOCK_N = block_size_n();
+  static_assert(BLOCK_N == 32);
 
-  // Lookup in table
-  __m512i bf16_lo = _mm512_permutexvar_epi16(lo, lut);
-  __m512i bf16_hi = _mm512_permutexvar_epi16(hi, lut);
+  // prefetch distance
+  constexpr int PREFETCH_SIZE_K = 64;
 
-  // Apply scales (multiply by 2^(scale-127))
-  bf16_lo = _mm512_add_epi16(bf16_lo, vscale0);
-  bf16_hi = _mm512_add_epi16(bf16_hi, vscale1);
+  // exponent bias 127
+  const __m512i off = _mm512_set1_epi16(0x7F);
 
-  return std::make_pair((__m512bh)bf16_lo, (__m512bh)bf16_hi);
+  // load 32 bytes only once for each block
+  __m256i s8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(scale));
+  __m512i s16 = _mm512_slli_epi16(_mm512_sub_epi16(_mm512_cvtepu8_epi16(s8), off), 0x7);
+
+  // holds Nx2(64) scales, interleaved as 2 belongs to K dimension
+  auto [vscale0, vscale1] = transpose_2x32_16bit(s16, s16);
+
+#pragma GCC unroll 4
+  for (int64_t k = 0; k < K2; ++k) {
+    __m256i b4 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + k * ldb2));
+    if constexpr (PREFETCH_SIZE_K > 0) {
+      _mm_prefetch(b_ptr + (k + PREFETCH_SIZE_K) * ldb2, _MM_HINT_T0);
+    }
+    auto [vb0, vb1] = CVT_MXFP4_TO_BF16(b4, vscale0, vscale1);
+
+    _mm512_storeu_si512(Btmp + k * ldb_tmp * 2 + 0, (__m512i)vb0);
+    _mm512_storeu_si512(Btmp + k * ldb_tmp * 2 + 32, (__m512i)vb1);
+  }
 }
 #endif
 
@@ -907,41 +983,84 @@ void tinygemm_kernel_mxfp4(
     int64_t block_size_K,
     bool do_unpack) {
 #if defined(CPU_CAPABILITY_AVX512)
-  // Use brgemm path with unpacked weights
-  constexpr int64_t BLOCK_N = block_size_n();
-  const int64_t K2 = K >> 1;
-  const int64_t ldb2 = ldb;
-  const uint8_t* b_ptr = B;
-  const __m512i off = _mm512_set1_epi16(0x7F);
+  // mxfp4 supports only group size of 32
+  assert(block_size_K == 32);
+  
+  constexpr int BLOCK_N = block_size_n();
+  const int ldb_tmp = BLOCK_N;
 
-  if (do_unpack) {
-    // Unpack MXFP4 to BF16
-    __m256i s8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(scale));
-    __m512i s16 = _mm512_slli_epi16(_mm512_sub_epi16(_mm512_cvtepu8_epi16(s8), off), 0x7);
-    auto [vscale0, vscale1] = transpose_2x32_16bit(s16, s16);
-
-    for (int64_t k = 0; k < K2; ++k) {
-      __m256i b4 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + k * ldb2));
-      auto [vb0, vb1] = CVT_MXFP4_TO_BF16(b4, vscale0, vscale1);
-      _mm512_storeu_si512(Btmp + k * BLOCK_N * 2 + 0, (__m512i)vb0);
-      _mm512_storeu_si512(Btmp + k * BLOCK_N * 2 + 32, (__m512i)vb1);
-    }
-  }
-
-  // Use brgemm for the actual GEMM
+  // Use brgemm path for larger M
   if (brg && M > 4) {
-    at::native::cpublas::brgemm(M, N, K, lda, N, ldc, false, A, Btmp, C);
-  } else {
-    // Fallback to simple GEMM
-    for (int64_t m = 0; m < M; ++m) {
-      for (int64_t n = 0; n < N; ++n) {
-        float sum = 0.0f;
-        for (int64_t k = 0; k < K; ++k) {
-          sum += float(A[m * lda + k]) * float(Btmp[k * N + n]);
-        }
-        C[m * ldc + n] = sum;
+    // Unpack MXFP4 to BF16 first (group by group)
+    if (do_unpack) {
+      for (int k = 0; k < K; k += 32) {
+        unpack_mxfp4_to_bf16(
+            Btmp + k * ldb_tmp,
+            B + k * (ldb >> 1),
+            N, 32, ldb, ldb_tmp,
+            scale + (k >> 5) * BLOCK_N);
       }
     }
+
+    // Call brgemm
+    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, /* add_C */ false, A, Btmp, C);
+    return;
+  }
+
+  // Small M path: use tinygemm with dpbf16
+  assert(N == 32);  // BLOCK_N = 32
+  constexpr int COLS = BLOCK_N / 16;  // 2
+
+  // prefetch distance
+  constexpr int PREFETCH_SIZE_K = 64;
+
+  const __m512i off = _mm512_set1_epi16(0x7F);
+
+  const int64_t K2 = K >> 1;
+  const int64_t lda2 = lda >> 1;
+  const int64_t ldb2 = ldb;  // ldb * 2 >> 1
+  const float* a_ptr = reinterpret_cast<const float*>(A);
+  const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(B);
+
+  // Process each row
+  for (int64_t m = 0; m < M; ++m) {
+    // Initialize accumulators
+    __m512 vc[COLS];
+    for (int col = 0; col < COLS; ++col) {
+      vc[col] = _mm512_setzero_ps();
+    }
+
+    // holds Nx2(64) scales, interleaved as 2 belongs to K dimension
+    __m512i vscale[COLS];
+
+    for (int64_t k = 0; k < K2; ++k) {
+      // update scales every 16x2 K
+      if ((k & 15) == 0) {
+        __m256i s8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(scale + (k >> 4) * 32));
+        __m512i s16 = _mm512_slli_epi16(_mm512_sub_epi16(_mm512_cvtepu8_epi16(s8), off), 0x7);
+        std::tie(vscale[0], vscale[1]) = transpose_2x32_16bit(s16, s16);
+      }
+
+      // Load A value (bf16 pair as float)
+      __m512bh va = (__m512bh)(_mm512_set1_ps(a_ptr[m * lda2 + k]));
+
+      // Load B and convert
+      __m256i b4 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + k * ldb2));
+      if constexpr (PREFETCH_SIZE_K > 0) {
+        _mm_prefetch(b_ptr + (k + PREFETCH_SIZE_K) * ldb2, _MM_HINT_T0);
+      }
+
+      __m512bh vb0, vb1;
+      std::tie(vb0, vb1) = CVT_MXFP4_TO_BF16(b4, vscale[0], vscale[1]);
+
+      // BF16 dot product
+      vc[0] = _mm512_dpbf16_ps(vc[0], va, vb0);
+      vc[1] = _mm512_dpbf16_ps(vc[1], va, vb1);
+    }
+
+    // Store results
+    _mm512_storeu_ps(C + m * ldc + 0, vc[0]);
+    _mm512_storeu_ps(C + m * ldc + 16, vc[1]);
   }
 #else
   TORCH_CHECK(false, "tinygemm_kernel_mxfp4: requires AVX512 support");
@@ -1060,6 +1179,9 @@ void fused_experts_fp_kernel_impl(
         }
       }
     });
+
+    // Release brgemm resources after processing
+    at::native::cpublas::brgemm_release();
   });
 
   // Stage 1.5: silu_and_mul if needed
@@ -1122,6 +1244,9 @@ void fused_experts_fp_kernel_impl(
         copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C0 + m * BLOCK_N, weight, n_size);
       }
     });
+
+    // Release brgemm resources after processing
+    at::native::cpublas::brgemm_release();
   });
 
   // Stage 3: out = intermediate_cache2.sum(dim=1)
