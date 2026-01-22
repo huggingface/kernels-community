@@ -113,7 +113,9 @@ class MegaBlocksMoeMLP(torch.nn.Module):
             Tuple of (output, expert_weights)
         """
         # Optimization for GPT-OSS model
-        use_mxfp4 = False
+        if getattr(self, "use_mxfp4", None) is None:
+            self.use_mxfp4 = False
+
         w1_scale = None
         w2_scale = None
 
@@ -126,13 +128,13 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         ):
             self.convert_scales()
             self.packed_scales = True
-            use_mxfp4 = True
+            self.use_mxfp4 = True
             print("convert scales success")
 
         if not getattr(self, "packed_weight", False) and hasattr(
             self.experts, "gate_up_proj"
         ):
-            self.convert_weight(x.dtype, use_mxfp4)
+            self.convert_weight(x.dtype, self.use_mxfp4)
             self.packed_weight = True
             print("convert weight success")
 
@@ -175,7 +177,7 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         w1_bias = w1_bias if w1_bias is None else w1_bias.data
         w2_bias = w2_bias if w2_bias is None else w2_bias.data
 
-        if use_mxfp4:
+        if self.use_mxfp4:
             w1_scale = self.experts.gate_up_proj_precision_config.weight_scale.data
             w2_scale = self.experts.down_proj_precision_config.weight_scale.data
         
@@ -210,7 +212,7 @@ class MegaBlocksMoeMLP(torch.nn.Module):
             inplace=False,
             use_int8_w8a8=False,
             use_fp8_w8a16=False,
-            use_mxfp4=use_mxfp4,
+            use_mxfp4=self.use_mxfp4,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             block_size=None,
