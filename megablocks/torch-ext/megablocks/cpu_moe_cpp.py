@@ -10,8 +10,10 @@ import torch
 from typing import Optional
 # Import routing from Python version (lightweight, no performance impact)
 from .cpu_fused_moe import route_tokens_cpu
-from ._ops import ops
+# from ._ops import ops
+import sgl_kernel
 
+ops = torch.ops.sgl_kernel
 
 def fused_moe_cpp(
     hidden_states: torch.Tensor,
@@ -76,11 +78,24 @@ class MegaBlocksMoeMLP(torch.nn.Module):
     """
     can_torch_compile: bool = True
 
-    def convert_weight(self):
-        data_1 = ops.convert_weight_packed(self.experts.gate_up_proj.data.transpose(-1, -2).contiguous())
-        data_2 = ops.convert_weight_packed(self.experts.down_proj.data.transpose(-1, -2).contiguous())
-        self.experts.gate_up_proj.set_(data_1)
-        self.experts.down_proj.set_(data_2)
+    def convert_weight(self, use_mxfp4: bool = False):
+        if use_mxfp4:
+            # import pdb; pdb.set_trace()
+            data_1 = ops.convert_weight_packed(self.experts.gate_up_proj.data.transpose(-1, -2).contiguous())
+            data_2 = ops.convert_weight_packed(self.experts.down_proj.data.transpose(-1, -2).contiguous())
+            self.experts.gate_up_proj.storage.data = data_1
+            self.experts.down_proj.storage.data = data_2
+        else:
+            data_1 = ops.convert_weight_packed(self.experts.gate_up_proj.data.transpose(-1, -2).contiguous())
+            data_2 = ops.convert_weight_packed(self.experts.down_proj.data.transpose(-1, -2).contiguous())
+            self.experts.gate_up_proj.data = data_1
+            self.experts.down_proj.data = data_2
+
+    def convert_scales(self):
+        data_1 = ops.convert_scale_packed(self.experts.gate_up_proj_precision_config.weight_scale.data.transpose(-1, -2).contiguous())
+        data_2 = ops.convert_scale_packed(self.experts.down_proj_precision_config.weight_scale.data.transpose(-1, -2).contiguous())
+        self.experts.gate_up_proj_precision_config.weight_scale.storage.data = data_1
+        self.experts.down_proj_precision_config.weight_scale.storage.data = data_2
     
     def forward(self, x: torch.Tensor) -> tuple:
         """
@@ -92,9 +107,27 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         Returns:
             Tuple of (output, expert_weights)
         """
+        # Optimization for GPT-OSS model
+        use_mxfp4 = False
+        w1_scale = None
+        w2_scale = None
+
         # import pdb; pdb.set_trace()
-        if not getattr(self, "packed_weight", False):
-            self.convert_weight()
+
+        if (
+            not getattr(self, "packed_scales", False)
+            and hasattr(self.experts, "gate_up_proj")
+            and getattr(self.experts, "gate_up_proj_precision_config", None) is not None
+        ):
+            self.convert_scales()
+            self.packed_scales = True
+            use_mxfp4 = True
+            print("convert scales success")
+
+        if not getattr(self, "packed_weight", False) and hasattr(
+            self.experts, "gate_up_proj"
+        ):
+            self.convert_weight(use_mxfp4)
             self.packed_weight = True
             print("convert weight success")
 
@@ -134,6 +167,10 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         # Get optional bias tensors
         w1_bias = getattr(self.experts, "gate_up_proj_bias", None)
         w2_bias = getattr(self.experts, "down_proj_bias", None)
+
+        if use_mxfp4:
+            w1_scale = self.experts.gate_up_proj_precision_config.weight_scale.data
+            w2_scale = self.experts.down_proj_precision_config.weight_scale.data
         
         # Store original shape
         in_shape = x.size()
@@ -156,18 +193,22 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         use_limit = limit if activation == "swigluoai" else None
         
         # Call C++ optimized kernel (main performance bottleneck)
+        # import pdb; pdb.set_trace()
+        print(f"w1 shape: {w1.data.shape}, w2 shape: {w2.data.shape}")
+        print(f"hidden_states shape: {x_flat.shape}")
+        print(f"topk_weights shape: {expert_weights.shape}, topk_ids shape: {expert_indices.shape}")
         output = fused_moe_cpp(
             hidden_states=x_flat,
-            w1=w1,
-            w2=w2,
+            w1=w1.data,
+            w2=w2.data,
             topk_weights=expert_weights,
-            topk_ids=expert_indices,
+            topk_ids=expert_indices.to(torch.int32),
             inplace=False,
             use_int8_w8a8=False,
             use_fp8_w8a16=False,
-            use_mxfp4=False,
-            w1_scale=None,
-            w2_scale=None,
+            use_mxfp4=use_mxfp4,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
             block_size=None,
             a1_scale=None,
             a2_scale=None,
