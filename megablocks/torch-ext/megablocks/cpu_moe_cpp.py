@@ -10,10 +10,10 @@ import torch
 from typing import Optional
 # Import routing from Python version (lightweight, no performance impact)
 from .cpu_fused_moe import route_tokens_cpu
-# from ._ops import ops
-import sgl_kernel
+from ._ops import ops
+# import sgl_kernel
 
-ops = torch.ops.sgl_kernel
+# ops = torch.ops.sgl_kernel
 
 def fused_moe_cpp(
     hidden_states: torch.Tensor,
@@ -78,7 +78,7 @@ class MegaBlocksMoeMLP(torch.nn.Module):
     """
     can_torch_compile: bool = True
 
-    def convert_weight(self, use_mxfp4: bool = False):
+    def convert_weight(self, dtype, use_mxfp4: bool = False):
         if use_mxfp4:
             # import pdb; pdb.set_trace()
             data_1 = ops.convert_weight_packed(self.experts.gate_up_proj.data.transpose(-1, -2).contiguous())
@@ -90,6 +90,11 @@ class MegaBlocksMoeMLP(torch.nn.Module):
             data_2 = ops.convert_weight_packed(self.experts.down_proj.data.transpose(-1, -2).contiguous())
             self.experts.gate_up_proj.data = data_1
             self.experts.down_proj.data = data_2
+
+        if getattr(self.experts, "gate_up_proj_bias", None) is not None:
+            self.experts.gate_up_proj_bias = self.experts.gate_up_proj_bias.to(dtype)
+        if getattr(self.experts, "down_proj_bias", None) is not None:
+            self.experts.down_proj_bias = self.experts.down_proj_bias.to(dtype)
 
     def convert_scales(self):
         data_1 = ops.convert_scale_packed(self.experts.gate_up_proj_precision_config.weight_scale.data.transpose(-1, -2).contiguous())
@@ -127,7 +132,7 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         if not getattr(self, "packed_weight", False) and hasattr(
             self.experts, "gate_up_proj"
         ):
-            self.convert_weight(use_mxfp4)
+            self.convert_weight(x.dtype, use_mxfp4)
             self.packed_weight = True
             print("convert weight success")
 
