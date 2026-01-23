@@ -702,7 +702,7 @@ struct unpack_helper<uint8_t, uint8_t> {
   }
 };
 
-// Unified brgemm template (output to scalar_t)
+// Unified brgemm template (output to scalar_t) - primary template throws error
 template <typename scalar_t, typename packed_t, typename param_t>
 struct brgemm {
   static inline void apply(
@@ -715,14 +715,31 @@ struct brgemm {
       int M, int N, int K,
       int lda, int ldb, int ldc,
       bool do_unpack = true) {
+    TORCH_CHECK(false, "brgemm: primary template not implemented, only BFloat16 is supported!");
+  }
+};
+
+// FP8 specialization for BFloat16
+template <>
+struct brgemm<at::BFloat16, at::Float8_e4m3fn, float> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const at::Float8_e4m3fn* __restrict__ B,
+      at::BFloat16* __restrict__ C,
+      at::BFloat16* __restrict__ Btmp,
+      float* __restrict__ Ctmp,
+      const float* __restrict__ scale,
+      int M, int N, int K,
+      int lda, int ldb, int ldc,
+      bool do_unpack = true) {
     constexpr int BLOCK_N = block_size_n();
     const int ldb_tmp = BLOCK_N;
 
     if (do_unpack) {
-      unpack_helper<packed_t, param_t>::unpack(reinterpret_cast<at::BFloat16*>(Btmp), B, N, K, ldb, ldb_tmp, scale);
+      unpack_helper<at::Float8_e4m3fn, float>::unpack(Btmp, B, N, K, ldb, ldb_tmp, scale);
     }
 
-    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, false, A, reinterpret_cast<at::BFloat16*>(Btmp), Ctmp);
+    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, false, A, Btmp, Ctmp);
 
     for (int m = 0; m < M; ++m) {
       copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
@@ -730,7 +747,35 @@ struct brgemm {
   }
 };
 
-// Unified brgemm2 template (output to float)
+// MXFP4 specialization for BFloat16
+template <>
+struct brgemm<at::BFloat16, uint8_t, uint8_t> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const uint8_t* __restrict__ B,
+      at::BFloat16* __restrict__ C,
+      at::BFloat16* __restrict__ Btmp,
+      float* __restrict__ Ctmp,
+      const uint8_t* __restrict__ scale,
+      int M, int N, int K,
+      int lda, int ldb, int ldc,
+      bool do_unpack = true) {
+    constexpr int BLOCK_N = block_size_n();
+    const int ldb_tmp = BLOCK_N;
+
+    if (do_unpack) {
+      unpack_helper<uint8_t, uint8_t>::unpack(Btmp, B, N, K, ldb, ldb_tmp, scale);
+    }
+
+    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, false, A, Btmp, Ctmp);
+
+    for (int m = 0; m < M; ++m) {
+      copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
+    }
+  }
+};
+
+// Unified brgemm2 template (output to float) - primary template throws error
 template <typename scalar_t, typename packed_t, typename param_t>
 struct brgemm2 {
   static inline void apply(
@@ -742,14 +787,53 @@ struct brgemm2 {
       int M, int N, int K,
       int lda, int ldb, int ldc,
       bool do_unpack = true) {
+    TORCH_CHECK(false, "brgemm2: primary template not implemented, only BFloat16 is supported!");
+  }
+};
+
+// FP8 specialization for BFloat16
+template <>
+struct brgemm2<at::BFloat16, at::Float8_e4m3fn, float> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const at::Float8_e4m3fn* __restrict__ B,
+      float* __restrict__ C,
+      at::BFloat16* __restrict__ Btmp,
+      const float* __restrict__ scale,
+      int M, int N, int K,
+      int lda, int ldb, int ldc,
+      bool do_unpack = true) {
     constexpr int BLOCK_N = block_size_n();
     const int ldb_tmp = BLOCK_N;
 
     if (do_unpack) {
-      unpack_helper<packed_t, param_t>::unpack(reinterpret_cast<at::BFloat16*>(Btmp), B, N, K, ldb, ldb_tmp, scale);
+      unpack_helper<at::Float8_e4m3fn, float>::unpack(Btmp, B, N, K, ldb, ldb_tmp, scale);
     }
 
-    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, false, A, reinterpret_cast<at::BFloat16*>(Btmp), C);
+    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, false, A, Btmp, C);
+  }
+};
+
+// MXFP4 specialization for BFloat16
+template <>
+struct brgemm2<at::BFloat16, uint8_t, uint8_t> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const uint8_t* __restrict__ B,
+      float* __restrict__ C,
+      at::BFloat16* __restrict__ Btmp,
+      const uint8_t* __restrict__ scale,
+      int M, int N, int K,
+      int lda, int ldb, int ldc,
+      bool do_unpack = true) {
+    constexpr int BLOCK_N = block_size_n();
+    const int ldb_tmp = BLOCK_N;
+
+    if (do_unpack) {
+      unpack_helper<uint8_t, uint8_t>::unpack(Btmp, B, N, K, ldb, ldb_tmp, scale);
+    }
+
+    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, false, A, Btmp, C);
   }
 };
 
