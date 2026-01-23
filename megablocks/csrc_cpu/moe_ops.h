@@ -60,6 +60,51 @@ void fused_experts_fp_kernel_impl(
     CPUAcTMethod act_func,
     bool with_bias);
 
+// Fused experts kernel implementation for INT8 W8A8
+template <typename scalar_t>
+void fused_experts_int8_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ ic2,
+    uint8_t* __restrict__ A_tmp,
+    float* __restrict__ C_tmp,
+    uint8_t* __restrict__ Aq_tmp,
+    float* __restrict__ As_tmp,
+    const scalar_t* __restrict__ input,
+    const int8_t* __restrict__ packed_w1,
+    const int8_t* __restrict__ packed_w2,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ offsets,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t E,
+    int64_t topk,
+    int64_t num_tokens_post_pad);
+
+// Shared expert kernel implementation for INT8 W8A8
+template <typename scalar_t>
+void shared_expert_int8_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic1,
+    float* __restrict__ C_tmp,
+    uint8_t* __restrict__ Aq_tmp,
+    float* __restrict__ As_tmp,
+    const scalar_t* __restrict__ input,
+    const int8_t* __restrict__ packed_w1,
+    const int8_t* __restrict__ packed_w2,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    const scalar_t* __restrict__ fused_experts_out,
+    float routed_scaling_factor,
+    int64_t M,
+    int64_t N,
+    int64_t K);
+
 // Shared expert kernel implementation for FP8
 template <typename scalar_t>
 void shared_expert_fp8_kernel_impl(
