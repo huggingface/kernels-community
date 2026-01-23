@@ -407,8 +407,8 @@ inline void add_mul_stub(
   for (; i <= size - bVec::size(); i += bVec::size()) {
     auto [v0, v1] = convert_to_float<scalar_t>(bVec::loadu(input + i));
     auto [u0, u1] = convert_to_float<scalar_t>(bVec::loadu(input2 + i));
-    v0 = fVec::fmadd(u0, vweight, v0);
-    v1 = fVec::fmadd(u1, vweight, v1);
+    v0 = v0 + u0 * vweight;
+    v1 = v1 + u1 * vweight;
     convert_from_float_ext<scalar_t>(v0, v1).store(out + i);
   }
   for (; i < size; ++i) {
