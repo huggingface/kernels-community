@@ -60,12 +60,28 @@ def fused_moe_cpp(
         limit: swigluoai limit parameter (set to enable swiglu)
         is_vnni: Whether w1/w2 are already in VNNI packed format
     """
-    return ops.fused_experts_cpu(
+    # MXFP4/FP8 kernels only support bf16, convert if needed
+    orig_dtype = hidden_states.dtype
+    need_convert = (use_mxfp4 or use_fp8_w8a16) and orig_dtype != torch.bfloat16
+    if need_convert:
+        hidden_states = hidden_states.to(torch.bfloat16)
+        # bias must match hidden_states dtype
+        if w1_bias is not None:
+            w1_bias = w1_bias.to(torch.bfloat16)
+        if w2_bias is not None:
+            w2_bias = w2_bias.to(torch.bfloat16)
+    
+    output = ops.fused_experts_cpu(
         hidden_states, w1, w2, topk_weights, topk_ids,
         inplace, use_int8_w8a8, use_fp8_w8a16, use_mxfp4,
         w1_scale, w2_scale, block_size, a1_scale, a2_scale,
         w1_bias, w2_bias, alpha, limit, is_vnni
     )
+    
+    # Convert back to original dtype if needed
+    if need_convert:
+        output = output.to(orig_dtype)
+    return output
 
 
 class MegaBlocksMoeMLP(torch.nn.Module):
