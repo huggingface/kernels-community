@@ -280,7 +280,7 @@ inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
 
-enum class CPUAcTMethod : int { silu_and_mul = 0, swiglu = 1 };
+// CPUAcTMethod is defined in moe_ops.h
 
 constexpr bool operator==(CPUAcTMethod a, int b) {
   return static_cast<int>(a) == b;
@@ -513,114 +513,6 @@ at::Tensor convert_scale_packed(at::Tensor& scale) {
 }
 
 namespace {  // Re-open anonymous namespace for internal implementation details
-
-// ============================================================================
-// Forward declarations for quantized kernels (not implemented here)
-// ============================================================================
-
-template <typename scalar_t>
-void fused_experts_int8_kernel_impl(
-    scalar_t* __restrict__ output,
-    scalar_t* __restrict__ ic1,
-    scalar_t* __restrict__ ic2,
-    uint8_t* __restrict__ A_tmp,
-    float* __restrict__ C_tmp,
-    uint8_t* __restrict__ Aq_tmp,
-    float* __restrict__ As_tmp,
-    const scalar_t* __restrict__ input,
-    const int8_t* __restrict__ packed_w1,
-    const int8_t* __restrict__ packed_w2,
-    const float* __restrict__ w1s,
-    const float* __restrict__ w2s,
-    const float* __restrict__ topk_weights,
-    const int32_t* __restrict__ sorted_ids,
-    const int32_t* __restrict__ expert_ids,
-    const int32_t* __restrict__ offsets,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t E,
-    int64_t topk,
-    int64_t num_tokens_post_pad) {
-  TORCH_CHECK(false, "int8 kernel not implemented");
-}
-
-template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4>
-void fused_experts_fp_kernel_impl(
-    scalar_t* __restrict__ output,
-    scalar_t* __restrict__ ic0,
-    scalar_t* __restrict__ ic1,
-    scalar_t* __restrict__ ic2,
-    scalar_t* __restrict__ A_tmp,
-    scalar_t* __restrict__ B_tmp,
-    float* __restrict__ C_tmp,
-    const scalar_t* __restrict__ input,
-    const packed_t* __restrict__ packed_w1,
-    const packed_t* __restrict__ packed_w2,
-    const scalar_t* __restrict__ w1_bias,
-    const scalar_t* __restrict__ w2_bias,
-    const param_t* __restrict__ w1s,
-    const param_t* __restrict__ w2s,
-    int64_t block_size_N,
-    int64_t block_size_K,
-    const float* __restrict__ topk_weights,
-    const int32_t* __restrict__ sorted_ids,
-    const int32_t* __restrict__ expert_ids,
-    const int32_t* __restrict__ offsets,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t E,
-    int64_t topk,
-    int64_t num_tokens_post_pad,
-    float alpha,
-    float limit,
-    CPUAcTMethod act_func,
-    bool with_bias) {
-  TORCH_CHECK(false, "fp8/mxfp4 kernel not implemented");
-}
-
-template <typename scalar_t>
-void shared_expert_int8_kernel_impl(
-    scalar_t* __restrict__ output,
-    scalar_t* __restrict__ ic1,
-    float* __restrict__ C_tmp,
-    uint8_t* __restrict__ Aq_tmp,
-    float* __restrict__ As_tmp,
-    const scalar_t* __restrict__ input,
-    const int8_t* __restrict__ packed_w1,
-    const int8_t* __restrict__ packed_w2,
-    const float* __restrict__ w1s,
-    const float* __restrict__ w2s,
-    const scalar_t* __restrict__ fused_experts_out,
-    float routed_scaling_factor,
-    int64_t M,
-    int64_t N,
-    int64_t K) {
-  TORCH_CHECK(false, "shared expert int8 kernel not implemented");
-}
-
-template <typename scalar_t>
-void shared_expert_fp8_kernel_impl(
-    scalar_t* __restrict__ output,
-    scalar_t* __restrict__ ic0,
-    scalar_t* __restrict__ ic1,
-    scalar_t* __restrict__ B_tmp,
-    float* __restrict__ C_tmp,
-    const scalar_t* __restrict__ input,
-    const at::Float8_e4m3fn* __restrict__ packed_w1,
-    const at::Float8_e4m3fn* __restrict__ packed_w2,
-    const float* __restrict__ w1s,
-    const float* __restrict__ w2s,
-    int64_t block_size_N,
-    int64_t block_size_K,
-    const scalar_t* __restrict__ fused_experts_out,
-    float routed_scaling_factor,
-    int64_t M,
-    int64_t N,
-    int64_t K) {
-  TORCH_CHECK(false, "shared expert fp8 kernel not implemented");
-}
 
 // ============================================================================
 // Original sglang moe.cpp content (stubs section)

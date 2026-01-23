@@ -5,12 +5,81 @@
 #pragma once
 
 #include <torch/torch.h>
+#include <ATen/ATen.h>
 #include <string>
 #include <optional>
 #include <vector>
 
 namespace megablocks {
 namespace cpu {
+
+// Activation method for fused experts
+enum class CPUAcTMethod : int { silu_and_mul = 0, swiglu = 1 };
+
+// ============================================================================
+// Internal kernel implementations for FP8/MXFP4 quantization
+// These are called from cpu_moe_kernel.cpp
+// ============================================================================
+
+// Fused experts kernel implementation for FP8/MXFP4
+// Template parameters:
+//   scalar_t: bf16 or fp16
+//   packed_t: Float8_e4m3fn (FP8) or uint8_t (MXFP4)
+//   param_t: float (FP8) or uint8_t (MXFP4)
+//   is_mxfp4: true for MXFP4, false for FP8
+template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4>
+void fused_experts_fp_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic0,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ ic2,
+    scalar_t* __restrict__ A_tmp,
+    scalar_t* __restrict__ B_tmp,
+    float* __restrict__ C_tmp,
+    const scalar_t* __restrict__ input,
+    const packed_t* __restrict__ packed_w1,
+    const packed_t* __restrict__ packed_w2,
+    const scalar_t* __restrict__ w1_bias,
+    const scalar_t* __restrict__ w2_bias,
+    const param_t* __restrict__ w1s,
+    const param_t* __restrict__ w2s,
+    int64_t block_size_N,
+    int64_t block_size_K,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ offsets,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t E,
+    int64_t topk,
+    int64_t num_tokens_post_pad,
+    float alpha,
+    float limit,
+    CPUAcTMethod act_func,
+    bool with_bias);
+
+// Shared expert kernel implementation for FP8
+template <typename scalar_t>
+void shared_expert_fp8_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic0,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ B_tmp,
+    float* __restrict__ C_tmp,
+    const scalar_t* __restrict__ input,
+    const at::Float8_e4m3fn* __restrict__ packed_w1,
+    const at::Float8_e4m3fn* __restrict__ packed_w2,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    int64_t block_size_N,
+    int64_t block_size_K,
+    const scalar_t* __restrict__ fused_experts_out,
+    float routed_scaling_factor,
+    int64_t M,
+    int64_t N,
+    int64_t K);
 
 // Convert weight to VNNI packed format for brgemm
 // Input:  weight [E, OC, IC] in row-major format
