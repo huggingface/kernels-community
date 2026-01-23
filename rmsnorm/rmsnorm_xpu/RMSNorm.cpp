@@ -564,59 +564,5 @@ std::tuple<Tensor, Tensor> rms_norm_bw(
       grad_input_mask[1] ? grad_weight.reshape(weight.sizes()) : grad_weight);
 }
 
-class RmsNormOp : public Function<RmsNormOp> {
- public:
-  static variable_list forward(
-      AutogradContext* ctx,
-      const Tensor& input,
-      at::IntArrayRef normalized_shape,
-      const Tensor& weight,
-      double epsilon) {
-    ctx->saved_data["input_requires_grad"] = input.requires_grad();
-    ctx->saved_data["weight_requires_grad"] = weight.requires_grad();
-    ctx->saved_data["normalized_shape"] = normalized_shape;
-    auto outputs = rms_norm_fw(input, normalized_shape, weight, epsilon);
-
-    ctx->save_for_backward(
-        {input, weight, std::get<0>(outputs), std::get<1>(outputs)});
-    variable_list result = {std::get<0>(outputs), std::get<1>(outputs)};
-    return result;
-  }
-
-  static variable_list backward(
-      AutogradContext* ctx,
-      variable_list grad_outputs) {
-    auto weight_requires_grad =
-        ctx->saved_data["weight_requires_grad"].toBool();
-    auto input_requires_grad = ctx->saved_data["input_requires_grad"].toBool();
-    auto saved = ctx->get_saved_variables();
-    Tensor input = saved[0];
-    Tensor weight = saved[1];
-    Tensor output = saved[2];
-    Tensor rstd = saved[3];
-    auto normalized_shape = weight.sizes();
-
-    auto grad_inputs = rms_norm_bw(
-        grad_outputs[0],
-        input,
-        normalized_shape,
-        rstd,
-        weight,
-        output,
-        {input_requires_grad, weight_requires_grad});
-    return {
-        std::get<0>(grad_inputs), Tensor(), std::get<1>(grad_inputs), Tensor()};
-  }
-};
 } // namespace AtenTypeXPU
 } // namespace at
-
-
-Tensor rms_norm_impl(
-    const Tensor& input,
-    at::IntArrayRef normalized_shape,
-    const Tensor& weight,
-    double epsilon) {
-  auto output = at::AtenTypeXPU::RmsNormOp::apply(input, normalized_shape, weight, epsilon);
-  return output[0];
-}
