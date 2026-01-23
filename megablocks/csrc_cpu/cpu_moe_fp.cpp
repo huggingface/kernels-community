@@ -894,7 +894,7 @@ struct tinygemm_kernel_nn2<at::BFloat16, at::Float8_e4m3fn, float, BLOCK_M, BLOC
       int64_t block_size_K,
       bool do_unpack) {
     
-    constexpr int BLOCK_K = 128;
+    constexpr int64_t BLOCK_K = 128;
     constexpr int64_t BLOCK_K2 = BLOCK_K >> 1;
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N / 16;
@@ -1644,7 +1644,7 @@ void shared_expert_fp8_kernel_impl(
   // parallel on [MB2, NB2]
   parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     int tid = get_thread_num();
-    alignas(64) scalar_t C[BLOCK_M * BLOCK_K];
+    alignas(64) scalar_t C[BLOCK_M * BLOCK_N];
 
     loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t m_size = std::min(M - mb * BLOCK_M, BLOCK_M);
