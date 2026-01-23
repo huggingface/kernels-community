@@ -8,12 +8,9 @@ Direct replacement for cpu_fused_moe.MegaBlocksMoeMLP with better performance.
 
 import torch
 from typing import Optional
-# Import routing from Python version (lightweight, no performance impact)
 from .cpu_fused_moe import route_tokens_cpu
 from ._ops import ops
-# import sgl_kernel
 
-# ops = torch.ops.sgl_kernel
 
 def fused_moe_cpp(
     hidden_states: torch.Tensor,
