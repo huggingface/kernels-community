@@ -817,31 +817,35 @@ struct tinygemm_kernel_nn<at::BFloat16, uint8_t, uint8_t, BLOCK_M, BLOCK_N> {
       int64_t ldc,
       int64_t block_size_K,
       bool do_unpack) {
+    // mxfp4 supports only group size of 32
+    // expect weight packed in 32-way, vnni2 format Nx2(64)
+    (void)Btmp;  // not used in inline conversion
+    (void)Ctmp;
+    (void)do_unpack;  // always do inline conversion
     
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N / 16;
-    constexpr int ldb_tmp = BLOCK_N;
-    
-    const int64_t K2 = K >> 1;
-    
+
     __m512bh va;
     __m512bh vb[COLS];
     __m512 vc[ROWS * COLS];
-    
+
+    // holds Nx2(64) scales, interleaved as 2 belongs to K dimension
+    __m512i vscale[COLS];
+
+    // exponent bias 127
+    const __m512i off = _mm512_set1_epi16(0x7F);
+
     auto loadc = [&](auto i) {
       vc[i] = _mm512_setzero_ps();
     };
     Unroll<ROWS * COLS>{}(loadc);
 
+    const int64_t K2 = K >> 1;
     const int64_t lda2 = lda >> 1;
+    const int64_t ldb2 = ldb;  // ldb * 2 >> 1;
     const float* a_ptr = reinterpret_cast<const float*>(A);
-
-    // Unpack B if needed
-    if (do_unpack) {
-      for (int k = 0; k < K; k += 32) {
-        unpack_B(Btmp + k * ldb_tmp, B + k * (ldb >> 1), N, 32, ldb, ldb_tmp, scale + (k >> 5) * BLOCK_N);
-      }
-    }
+    const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(B);
 
     auto compute = [&](auto i, int k) {
       constexpr int row = i / COLS;
@@ -851,28 +855,36 @@ struct tinygemm_kernel_nn<at::BFloat16, uint8_t, uint8_t, BLOCK_M, BLOCK_N> {
         va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
       }
       if constexpr (row == 0) {
+        // load 32 * 2 (64) int4 at a time
         if constexpr (col % 2 == 0) {
-          __m512i b0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(Btmp + k * ldb_tmp * 2 + col * 16));
-          vb[col + 0] = (__m512bh)(_mm512_castsi256_si512(_mm512_extracti32x8_epi32(b0, 0)));
-          vb[col + 1] = (__m512bh)(_mm512_castsi256_si512(_mm512_extracti32x8_epi32(b0, 1)));
+          __m256i b4 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + k * ldb2 + col * 16));
+          std::tie(vb[col + 0], vb[col + 1]) = CVT_MXFP4_TO_BF16(b4, vscale[col + 0], vscale[col + 1]);
         }
       }
       vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
     };
 
     for (int64_t k = 0; k < K2; ++k) {
+      // update scales every 16x2 K
+      if ((k & 15) == 0) {
+        __m256i s8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(scale + (k >> 4) * 32));
+        __m512i s16 = _mm512_slli_epi16(_mm512_sub_epi16(_mm512_cvtepu8_epi16(s8), off), 0x7);
+        std::tie(vscale[0], vscale[1]) = transpose_2x32_16bit(s16, s16);
+      }
       Unroll<ROWS * COLS>{}(compute, k);
     }
 
-    // Store results
-    for (int m = 0; m < M; ++m) {
-      for (int n = 0; n < N; n += 32) {
-        __m512 f0 = vc[m * COLS + n / 16];
-        __m512 f1 = vc[m * COLS + n / 16 + 1];
-        __m512bh bf = _mm512_cvtne2ps_pbh(f1, f0);
-        _mm512_storeu_si512(reinterpret_cast<__m512i*>(C + m * ldc + n), (__m512i)bf);
+    auto storec = [&](auto i) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+      // for COLS = 2,4 use 512bit store
+      if constexpr (col % 2 == 0) {
+        _mm512_storeu_si512(
+            reinterpret_cast<__m512i*>((C + row * ldc + col * 16)),
+            (__m512i)(_mm512_cvtne2ps_pbh(vc[row * COLS + col + 1], vc[row * COLS + col])));
       }
-    }
+    };
+    Unroll<ROWS * COLS>{}(storec);
   }
 };
 
@@ -978,31 +990,34 @@ struct tinygemm_kernel_nn2<at::BFloat16, uint8_t, uint8_t, BLOCK_M, BLOCK_N> {
       int64_t ldc,
       int64_t block_size_K,
       bool do_unpack) {
+    // mxfp4 supports only group size of 32
+    // expect weight packed in 32-way, vnni2 format Nx2(64)
+    (void)Btmp;  // not used in inline conversion
+    (void)do_unpack;  // always do inline conversion
     
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N / 16;
-    constexpr int ldb_tmp = BLOCK_N;
-    
-    const int64_t K2 = K >> 1;
 
     __m512bh va;
     __m512bh vb[COLS];
     __m512 vc[ROWS * COLS];
+
+    // holds Nx2(64) scales, interleaved as 2 belongs to K dimension
+    __m512i vscale[COLS];
+
+    // exponent bias 127
+    const __m512i off = _mm512_set1_epi16(0x7F);
 
     auto loadc = [&](auto i) {
       vc[i] = _mm512_setzero_ps();
     };
     Unroll<ROWS * COLS>{}(loadc);
 
+    const int64_t K2 = K >> 1;
     const int64_t lda2 = lda >> 1;
+    const int64_t ldb2 = ldb;  // ldb * 2 >> 1;
     const float* a_ptr = reinterpret_cast<const float*>(A);
-
-    // Unpack B if needed
-    if (do_unpack) {
-      for (int k = 0; k < K; k += 32) {
-        unpack_B(Btmp + k * ldb_tmp, B + k * (ldb >> 1), N, 32, ldb, ldb_tmp, scale + (k >> 5) * BLOCK_N);
-      }
-    }
+    const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(B);
 
     auto compute = [&](auto i, int k) {
       constexpr int row = i / COLS;
@@ -1012,16 +1027,22 @@ struct tinygemm_kernel_nn2<at::BFloat16, uint8_t, uint8_t, BLOCK_M, BLOCK_N> {
         va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
       }
       if constexpr (row == 0) {
+        // load 32 * 2 (64) int4 at a time
         if constexpr (col % 2 == 0) {
-          __m512i b0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(Btmp + k * ldb_tmp * 2 + col * 16));
-          vb[col + 0] = (__m512bh)(_mm512_castsi256_si512(_mm512_extracti32x8_epi32(b0, 0)));
-          vb[col + 1] = (__m512bh)(_mm512_castsi256_si512(_mm512_extracti32x8_epi32(b0, 1)));
+          __m256i b4 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + k * ldb2 + col * 16));
+          std::tie(vb[col + 0], vb[col + 1]) = CVT_MXFP4_TO_BF16(b4, vscale[col + 0], vscale[col + 1]);
         }
       }
       vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
     };
 
     for (int64_t k = 0; k < K2; ++k) {
+      // update scales every 16x2 K
+      if ((k & 15) == 0) {
+        __m256i s8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(scale + (k >> 4) * 32));
+        __m512i s16 = _mm512_slli_epi16(_mm512_sub_epi16(_mm512_cvtepu8_epi16(s8), off), 0x7);
+        std::tie(vscale[0], vscale[1]) = transpose_2x32_16bit(s16, s16);
+      }
       Unroll<ROWS * COLS>{}(compute, k);
     }
 
