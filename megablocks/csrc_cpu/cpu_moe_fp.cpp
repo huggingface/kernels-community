@@ -1059,7 +1059,39 @@ struct tinygemm_kernel_nn2<at::BFloat16, uint8_t, uint8_t, BLOCK_M, BLOCK_N> {
 // brgemm structures for MXFP4 and FP8
 // ============================================================================
 
-// Primary template - will throw error if instantiated
+// Helper: unpack_B dispatcher based on packed_t type
+template <typename packed_t, typename param_t>
+struct unpack_helper;
+
+// FP8 unpack helper
+template <>
+struct unpack_helper<at::Float8_e4m3fn, float> {
+  static inline void unpack(
+      at::BFloat16* Btmp, const at::Float8_e4m3fn* B,
+      int N, int K, int ldb, int ldb_tmp, const float* scale) {
+    constexpr int64_t BLOCK_K_LOCAL = 128;
+    for (int k = 0; k < K; k += BLOCK_K_LOCAL) {
+      int64_t kb_size = std::min((int64_t)BLOCK_K_LOCAL, (int64_t)(K - k));
+      int idx = k >> 7;
+      unpack_B(Btmp + k * ldb_tmp, B + k * ldb, N, kb_size, ldb, ldb_tmp, scale[idx]);
+    }
+  }
+};
+
+// MXFP4 unpack helper
+template <>
+struct unpack_helper<uint8_t, uint8_t> {
+  static inline void unpack(
+      at::BFloat16* Btmp, const uint8_t* B,
+      int N, int K, int ldb, int ldb_tmp, const uint8_t* scale) {
+    constexpr int BLOCK_N = block_size_n();
+    for (int k = 0; k < K; k += 32) {
+      unpack_B(Btmp + k * ldb_tmp, B + k * (ldb >> 1), N, 32, ldb, ldb_tmp, scale + (k >> 5) * BLOCK_N);
+    }
+  }
+};
+
+// Unified brgemm template (output to scalar_t)
 template <typename scalar_t, typename packed_t, typename param_t>
 struct brgemm {
   static inline void apply(
@@ -1069,97 +1101,25 @@ struct brgemm {
       scalar_t* __restrict__ Btmp,
       float* __restrict__ Ctmp,
       const param_t* __restrict__ scale,
-      int M,
-      int N,
-      int K,
-      int lda,
-      int ldb,
-      int ldc,
-      bool do_unpack = true) {
-    TORCH_CHECK(false, "struct brgemm: primary template not implemented!");
-  }
-};
-
-// FP8 specialization for brgemm (output to bf16)
-template <>
-struct brgemm<at::BFloat16, at::Float8_e4m3fn, float> {
-  static inline void apply(
-      const at::BFloat16* __restrict__ A,
-      const at::Float8_e4m3fn* __restrict__ B,
-      at::BFloat16* __restrict__ C,
-      at::BFloat16* __restrict__ Btmp,
-      float* __restrict__ Ctmp,
-      const float* __restrict__ scale,
-      int M,
-      int N,
-      int K,
-      int lda,
-      int ldb,
-      int ldc,
+      int M, int N, int K,
+      int lda, int ldb, int ldc,
       bool do_unpack = true) {
     constexpr int BLOCK_N = block_size_n();
-    constexpr int64_t BLOCK_K_LOCAL = 128;
-
-    // [K, BLOCK_N] -> [K / 2, BLOCK_N * 2]
     const int ldb_tmp = BLOCK_N;
 
     if (do_unpack) {
-      for (int k = 0; k < K; k += BLOCK_K_LOCAL) {
-        int64_t kb_size = std::min((int64_t)BLOCK_K_LOCAL, (int64_t)(K - k));
-
-        int idx = k >> 7;  // k / BLOCK_K where BLOCK_K = 128
-        unpack_B(Btmp + k * ldb_tmp, B + k * ldb, N, kb_size, ldb, ldb_tmp, scale[idx]);
-      }
+      unpack_helper<packed_t, param_t>::unpack(Btmp, B, N, K, ldb, ldb_tmp, scale);
     }
 
-    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, /* add_C */ false, A, Btmp, Ctmp);
+    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, false, A, Btmp, Ctmp);
 
-    // copy from Ctmp to C
     for (int m = 0; m < M; ++m) {
       copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
     }
   }
 };
 
-// MXFP4 specialization for brgemm (output to bf16)
-template <>
-struct brgemm<at::BFloat16, uint8_t, uint8_t> {
-  static inline void apply(
-      const at::BFloat16* __restrict__ A,
-      const uint8_t* __restrict__ B,
-      at::BFloat16* __restrict__ C,
-      at::BFloat16* __restrict__ Btmp,
-      float* __restrict__ Ctmp,
-      const uint8_t* __restrict__ scale,
-      int M,
-      int N,
-      int K,
-      int lda,
-      int ldb,
-      int ldc,
-      bool do_unpack = true) {
-    constexpr int BLOCK_N = block_size_n();
-
-    // [K, BLOCK_N] -> [K / 2, BLOCK_N * 2]
-    const int ldb_tmp = BLOCK_N;
-
-    if (do_unpack) {
-      // group size 32 for mxfp4
-      for (int k = 0; k < K; k += 32) {
-        unpack_B(Btmp + k * ldb_tmp, B + k * (ldb >> 1), N, 32, ldb, ldb_tmp, scale + (k >> 5) * BLOCK_N);
-      }
-    }
-
-    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, /* add_C */ false, A, Btmp, Ctmp);
-
-    // copy from Ctmp to C
-    for (int m = 0; m < M; ++m) {
-      copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
-    }
-  }
-};
-
-// Primary template for brgemm2 (output to float)
+// Unified brgemm2 template (output to float)
 template <typename scalar_t, typename packed_t, typename param_t>
 struct brgemm2 {
   static inline void apply(
@@ -1168,81 +1128,17 @@ struct brgemm2 {
       float* __restrict__ C,
       scalar_t* __restrict__ Btmp,
       const param_t* __restrict__ scale,
-      int M,
-      int N,
-      int K,
-      int lda,
-      int ldb,
-      int ldc,
-      bool do_unpack = true) {
-    TORCH_CHECK(false, "struct brgemm2: primary template not implemented!");
-  }
-};
-
-// FP8 specialization for brgemm2 (output to float)
-template <>
-struct brgemm2<at::BFloat16, at::Float8_e4m3fn, float> {
-  static inline void apply(
-      const at::BFloat16* __restrict__ A,
-      const at::Float8_e4m3fn* __restrict__ B,
-      float* __restrict__ C,
-      at::BFloat16* __restrict__ Btmp,
-      const float* __restrict__ scale,
-      int M,
-      int N,
-      int K,
-      int lda,
-      int ldb,
-      int ldc,
+      int M, int N, int K,
+      int lda, int ldb, int ldc,
       bool do_unpack = true) {
     constexpr int BLOCK_N = block_size_n();
-    constexpr int64_t BLOCK_K_LOCAL = 128;
-
-    // [K, BLOCK_N] -> [K / 2, BLOCK_N * 2]
     const int ldb_tmp = BLOCK_N;
 
     if (do_unpack) {
-      for (int k = 0; k < K; k += BLOCK_K_LOCAL) {
-        int64_t kb_size = std::min((int64_t)BLOCK_K_LOCAL, (int64_t)(K - k));
-
-        int idx = k >> 7;  // k / BLOCK_K where BLOCK_K = 128
-        unpack_B(Btmp + k * ldb_tmp, B + k * ldb, N, kb_size, ldb, ldb_tmp, scale[idx]);
-      }
+      unpack_helper<packed_t, param_t>::unpack(Btmp, B, N, K, ldb, ldb_tmp, scale);
     }
 
-    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, /* add_C */ false, A, Btmp, C);
-  }
-};
-
-// MXFP4 specialization for brgemm2 (output to float)
-template <>
-struct brgemm2<at::BFloat16, uint8_t, uint8_t> {
-  static inline void apply(
-      const at::BFloat16* __restrict__ A,
-      const uint8_t* __restrict__ B,
-      float* __restrict__ C,
-      at::BFloat16* __restrict__ Btmp,
-      const uint8_t* __restrict__ scale,
-      int M,
-      int N,
-      int K,
-      int lda,
-      int ldb,
-      int ldc,
-      bool do_unpack = true) {
-    constexpr int BLOCK_N = block_size_n();
-
-    // [K, BLOCK_N] -> [K / 2, BLOCK_N * 2]
-    const int ldb_tmp = BLOCK_N;
-
-    if (do_unpack) {
-      // group size 32 for mxfp4
-      for (int k = 0; k < K; k += 32) {
-        unpack_B(Btmp + k * ldb_tmp, B + k * (ldb >> 1), N, 32, ldb, ldb_tmp, scale + (k >> 5) * BLOCK_N);
-      }
-    }
-
-    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, /* add_C */ false, A, Btmp, C);
+    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, false, A, Btmp, C);
   }
 };
 
@@ -1250,27 +1146,33 @@ struct brgemm2<at::BFloat16, uint8_t, uint8_t> {
 
 // ===== tinygemm_kernel interface functions =====
 
-// Interface for FP8 (output to scalar_t)
-template <typename scalar_t>
+// Macro to dispatch tinygemm_kernel_nn based on block size
+#define DISPATCH_TINYGEMM_NN(SCALAR_T, PACKED_T, PARAM_T, MB_SIZE)                    \
+  tinygemm_kernel_nn<SCALAR_T, PACKED_T, PARAM_T, MB_SIZE, 32>::apply(                \
+      A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start,            \
+      Btmp, Ctmp, scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block)
+
+// Macro to dispatch tinygemm_kernel_nn2 based on block size
+#define DISPATCH_TINYGEMM_NN2(SCALAR_T, PACKED_T, PARAM_T, MB_SIZE)                   \
+  tinygemm_kernel_nn2<SCALAR_T, PACKED_T, PARAM_T, MB_SIZE, 32>::apply(               \
+      A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start,            \
+      Btmp, scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block)
+
+// Unified tinygemm_kernel interface (output to scalar_t)
+template <typename scalar_t, typename packed_t, typename param_t>
 void tinygemm_kernel(
     const scalar_t* __restrict__ A,
-    const at::Float8_e4m3fn* __restrict__ B,
+    const packed_t* __restrict__ B,
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
-    const float* __restrict__ scale,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t lda,
-    int64_t ldb,
-    int64_t ldc,
-    bool brg,
-    int64_t block_size_K,
-    bool do_unpack) {
+    const param_t* __restrict__ scale,
+    int64_t M, int64_t N, int64_t K,
+    int64_t lda, int64_t ldb, int64_t ldc,
+    bool brg, int64_t block_size_K, bool do_unpack) {
   
   if (brg) {
-    brgemm<scalar_t, at::Float8_e4m3fn, float>::apply(
+    brgemm<scalar_t, packed_t, param_t>::apply(
         A, B, C, Btmp, Ctmp, scale, M, N, K, lda, ldb, ldc, do_unpack);
     return;
   }
@@ -1286,124 +1188,33 @@ void tinygemm_kernel(
     for (int64_t nb = 0; nb < NB; ++nb) {
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
-
       bool do_unpack_block = (mb == 0) && do_unpack;
 
       switch (mb_size << 4 | nb_size >> 4) {
-        case 0x12:
-          tinygemm_kernel_nn<scalar_t, at::Float8_e4m3fn, float, 1, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp, Ctmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        case 0x22:
-          tinygemm_kernel_nn<scalar_t, at::Float8_e4m3fn, float, 2, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp, Ctmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        case 0x32:
-          tinygemm_kernel_nn<scalar_t, at::Float8_e4m3fn, float, 3, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp, Ctmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        case 0x42:
-          tinygemm_kernel_nn<scalar_t, at::Float8_e4m3fn, float, 4, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp, Ctmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        default:
-          TORCH_CHECK(false, "Unexpected block size");
+        case 0x12: DISPATCH_TINYGEMM_NN(scalar_t, packed_t, param_t, 1); break;
+        case 0x22: DISPATCH_TINYGEMM_NN(scalar_t, packed_t, param_t, 2); break;
+        case 0x32: DISPATCH_TINYGEMM_NN(scalar_t, packed_t, param_t, 3); break;
+        case 0x42: DISPATCH_TINYGEMM_NN(scalar_t, packed_t, param_t, 4); break;
+        default: TORCH_CHECK(false, "Unexpected block size");
       }
     }
   }
 }
 
-// Interface for MXFP4 (output to scalar_t)
-template <typename scalar_t>
+// Unified tinygemm_kernel interface (output to float)
+template <typename scalar_t, typename packed_t, typename param_t>
 void tinygemm_kernel(
     const scalar_t* __restrict__ A,
-    const uint8_t* __restrict__ B,
-    scalar_t* __restrict__ C,
-    scalar_t* __restrict__ Btmp,
-    float* __restrict__ Ctmp,
-    const uint8_t* __restrict__ scale,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t lda,
-    int64_t ldb,
-    int64_t ldc,
-    bool brg,
-    int64_t block_size_K,
-    bool do_unpack) {
-  
-  if (brg) {
-    brgemm<scalar_t, uint8_t, uint8_t>::apply(
-        A, B, C, Btmp, Ctmp, scale, M, N, K, lda, ldb, ldc, do_unpack);
-    return;
-  }
-
-  constexpr int64_t BLOCK_M = 4;
-  constexpr int64_t BLOCK_N = 32;
-  const int64_t MB = div_up(M, BLOCK_M);
-  const int64_t NB = div_up(N, BLOCK_N);
-  
-  for (int mb = 0; mb < MB; ++mb) {
-    int64_t mb_start = mb * BLOCK_M;
-    int64_t mb_size = std::min(BLOCK_M, M - mb_start);
-    for (int64_t nb = 0; nb < NB; ++nb) {
-      int64_t nb_start = nb * BLOCK_N;
-      int64_t nb_size = std::min(BLOCK_N, N - nb_start);
-
-      bool do_unpack_block = (mb == 0) && do_unpack;
-
-      switch (mb_size << 4 | nb_size >> 4) {
-        case 0x12:
-          tinygemm_kernel_nn<scalar_t, uint8_t, uint8_t, 1, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp, Ctmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        case 0x22:
-          tinygemm_kernel_nn<scalar_t, uint8_t, uint8_t, 2, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp, Ctmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        case 0x32:
-          tinygemm_kernel_nn<scalar_t, uint8_t, uint8_t, 3, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp, Ctmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        case 0x42:
-          tinygemm_kernel_nn<scalar_t, uint8_t, uint8_t, 4, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp, Ctmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        default:
-          TORCH_CHECK(false, "Unexpected block size");
-      }
-    }
-  }
-}
-
-// Interface for FP8 (output to float)
-template <typename scalar_t>
-void tinygemm_kernel(
-    const scalar_t* __restrict__ A,
-    const at::Float8_e4m3fn* __restrict__ B,
+    const packed_t* __restrict__ B,
     float* __restrict__ C,
     scalar_t* __restrict__ Btmp,
-    const float* __restrict__ scale,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t lda,
-    int64_t ldb,
-    int64_t ldc,
-    bool brg,
-    int64_t block_size_K,
-    bool do_unpack) {
+    const param_t* __restrict__ scale,
+    int64_t M, int64_t N, int64_t K,
+    int64_t lda, int64_t ldb, int64_t ldc,
+    bool brg, int64_t block_size_K, bool do_unpack) {
   
   if (brg) {
-    brgemm2<scalar_t, at::Float8_e4m3fn, float>::apply(
+    brgemm2<scalar_t, packed_t, param_t>::apply(
         A, B, C, Btmp, scale, M, N, K, lda, ldb, ldc, do_unpack);
     return;
   }
@@ -1419,102 +1230,21 @@ void tinygemm_kernel(
     for (int64_t nb = 0; nb < NB; ++nb) {
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(BLOCK_N, N - nb_start);
-
       bool do_unpack_block = (mb == 0) && do_unpack;
 
       switch (mb_size << 4 | nb_size >> 4) {
-        case 0x12:
-          tinygemm_kernel_nn2<scalar_t, at::Float8_e4m3fn, float, 1, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        case 0x22:
-          tinygemm_kernel_nn2<scalar_t, at::Float8_e4m3fn, float, 2, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        case 0x32:
-          tinygemm_kernel_nn2<scalar_t, at::Float8_e4m3fn, float, 3, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        case 0x42:
-          tinygemm_kernel_nn2<scalar_t, at::Float8_e4m3fn, float, 4, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        default:
-          TORCH_CHECK(false, "Unexpected block size");
+        case 0x12: DISPATCH_TINYGEMM_NN2(scalar_t, packed_t, param_t, 1); break;
+        case 0x22: DISPATCH_TINYGEMM_NN2(scalar_t, packed_t, param_t, 2); break;
+        case 0x32: DISPATCH_TINYGEMM_NN2(scalar_t, packed_t, param_t, 3); break;
+        case 0x42: DISPATCH_TINYGEMM_NN2(scalar_t, packed_t, param_t, 4); break;
+        default: TORCH_CHECK(false, "Unexpected block size");
       }
     }
   }
 }
 
-// Interface for MXFP4 (output to float)
-template <typename scalar_t>
-void tinygemm_kernel(
-    const scalar_t* __restrict__ A,
-    const uint8_t* __restrict__ B,
-    float* __restrict__ C,
-    scalar_t* __restrict__ Btmp,
-    const uint8_t* __restrict__ scale,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t lda,
-    int64_t ldb,
-    int64_t ldc,
-    bool brg,
-    int64_t block_size_K,
-    bool do_unpack) {
-  
-  if (brg) {
-    brgemm2<scalar_t, uint8_t, uint8_t>::apply(
-        A, B, C, Btmp, scale, M, N, K, lda, ldb, ldc, do_unpack);
-    return;
-  }
-
-  constexpr int64_t BLOCK_M = 4;
-  constexpr int64_t BLOCK_N = 32;
-  const int64_t MB = div_up(M, BLOCK_M);
-  const int64_t NB = div_up(N, BLOCK_N);
-  
-  for (int mb = 0; mb < MB; ++mb) {
-    int64_t mb_start = mb * BLOCK_M;
-    int64_t mb_size = std::min(BLOCK_M, M - mb_start);
-    for (int64_t nb = 0; nb < NB; ++nb) {
-      int64_t nb_start = nb * BLOCK_N;
-      int64_t nb_size = std::min(BLOCK_N, N - nb_start);
-
-      bool do_unpack_block = (mb == 0) && do_unpack;
-
-      switch (mb_size << 4 | nb_size >> 4) {
-        case 0x12:
-          tinygemm_kernel_nn2<scalar_t, uint8_t, uint8_t, 1, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        case 0x22:
-          tinygemm_kernel_nn2<scalar_t, uint8_t, uint8_t, 2, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        case 0x32:
-          tinygemm_kernel_nn2<scalar_t, uint8_t, uint8_t, 3, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        case 0x42:
-          tinygemm_kernel_nn2<scalar_t, uint8_t, uint8_t, 4, 32>::apply(
-              A + mb_start * lda, B + nb_start * 2, C + mb_start * ldc + nb_start, Btmp,
-              scale, M, N, K, lda, ldb, ldc, block_size_K, do_unpack_block);
-          break;
-        default:
-          TORCH_CHECK(false, "Unexpected block size");
-      }
-    }
-  }
-}
+#undef DISPATCH_TINYGEMM_NN
+#undef DISPATCH_TINYGEMM_NN2
 
 }  // anonymous namespace
 
