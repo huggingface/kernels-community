@@ -142,14 +142,12 @@ class MegaBlocksMoeMLP(torch.nn.Module):
             self.convert_scales()
             self.packed_scales = True
             self.use_mxfp4 = True
-            print("convert scales success")
 
         if not getattr(self, "packed_weight", False) and hasattr(
             self.experts, "gate_up_proj"
         ):
             self.convert_weight(x.dtype, self.use_mxfp4)
             self.packed_weight = True
-            print("convert weight success")
 
         # Get MoE parameters
         moe_top_k = getattr(self.router, "top_k", 4)
