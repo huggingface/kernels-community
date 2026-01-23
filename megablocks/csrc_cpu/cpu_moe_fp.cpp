@@ -1055,6 +1055,197 @@ struct tinygemm_kernel_nn2<at::BFloat16, uint8_t, uint8_t, BLOCK_M, BLOCK_N> {
   }
 };
 
+// ============================================================================
+// brgemm structures for MXFP4 and FP8
+// ============================================================================
+
+// Primary template - will throw error if instantiated
+template <typename scalar_t, typename packed_t, typename param_t>
+struct brgemm {
+  static inline void apply(
+      const scalar_t* __restrict__ A,
+      const packed_t* __restrict__ B,
+      scalar_t* __restrict__ C,
+      scalar_t* __restrict__ Btmp,
+      float* __restrict__ Ctmp,
+      const param_t* __restrict__ scale,
+      int M,
+      int N,
+      int K,
+      int lda,
+      int ldb,
+      int ldc,
+      bool do_unpack = true) {
+    TORCH_CHECK(false, "struct brgemm: primary template not implemented!");
+  }
+};
+
+// FP8 specialization for brgemm (output to bf16)
+template <>
+struct brgemm<at::BFloat16, at::Float8_e4m3fn, float> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const at::Float8_e4m3fn* __restrict__ B,
+      at::BFloat16* __restrict__ C,
+      at::BFloat16* __restrict__ Btmp,
+      float* __restrict__ Ctmp,
+      const float* __restrict__ scale,
+      int M,
+      int N,
+      int K,
+      int lda,
+      int ldb,
+      int ldc,
+      bool do_unpack = true) {
+    constexpr int BLOCK_N = block_size_n();
+    constexpr int64_t BLOCK_K_LOCAL = 128;
+
+    // [K, BLOCK_N] -> [K / 2, BLOCK_N * 2]
+    const int ldb_tmp = BLOCK_N;
+
+    if (do_unpack) {
+      for (int k = 0; k < K; k += BLOCK_K_LOCAL) {
+        int64_t kb_size = std::min((int64_t)BLOCK_K_LOCAL, (int64_t)(K - k));
+
+        int idx = k >> 7;  // k / BLOCK_K where BLOCK_K = 128
+        unpack_B(Btmp + k * ldb_tmp, B + k * ldb, N, kb_size, ldb, ldb_tmp, scale[idx]);
+      }
+    }
+
+    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, /* add_C */ false, A, Btmp, Ctmp);
+
+    // copy from Ctmp to C
+    for (int m = 0; m < M; ++m) {
+      copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
+    }
+  }
+};
+
+// MXFP4 specialization for brgemm (output to bf16)
+template <>
+struct brgemm<at::BFloat16, uint8_t, uint8_t> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const uint8_t* __restrict__ B,
+      at::BFloat16* __restrict__ C,
+      at::BFloat16* __restrict__ Btmp,
+      float* __restrict__ Ctmp,
+      const uint8_t* __restrict__ scale,
+      int M,
+      int N,
+      int K,
+      int lda,
+      int ldb,
+      int ldc,
+      bool do_unpack = true) {
+    constexpr int BLOCK_N = block_size_n();
+
+    // [K, BLOCK_N] -> [K / 2, BLOCK_N * 2]
+    const int ldb_tmp = BLOCK_N;
+
+    if (do_unpack) {
+      // group size 32 for mxfp4
+      for (int k = 0; k < K; k += 32) {
+        unpack_B(Btmp + k * ldb_tmp, B + k * (ldb >> 1), N, 32, ldb, ldb_tmp, scale + (k >> 5) * BLOCK_N);
+      }
+    }
+
+    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, /* add_C */ false, A, Btmp, Ctmp);
+
+    // copy from Ctmp to C
+    for (int m = 0; m < M; ++m) {
+      copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
+    }
+  }
+};
+
+// Primary template for brgemm2 (output to float)
+template <typename scalar_t, typename packed_t, typename param_t>
+struct brgemm2 {
+  static inline void apply(
+      const scalar_t* __restrict__ A,
+      const packed_t* __restrict__ B,
+      float* __restrict__ C,
+      scalar_t* __restrict__ Btmp,
+      const param_t* __restrict__ scale,
+      int M,
+      int N,
+      int K,
+      int lda,
+      int ldb,
+      int ldc,
+      bool do_unpack = true) {
+    TORCH_CHECK(false, "struct brgemm2: primary template not implemented!");
+  }
+};
+
+// FP8 specialization for brgemm2 (output to float)
+template <>
+struct brgemm2<at::BFloat16, at::Float8_e4m3fn, float> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const at::Float8_e4m3fn* __restrict__ B,
+      float* __restrict__ C,
+      at::BFloat16* __restrict__ Btmp,
+      const float* __restrict__ scale,
+      int M,
+      int N,
+      int K,
+      int lda,
+      int ldb,
+      int ldc,
+      bool do_unpack = true) {
+    constexpr int BLOCK_N = block_size_n();
+    constexpr int64_t BLOCK_K_LOCAL = 128;
+
+    // [K, BLOCK_N] -> [K / 2, BLOCK_N * 2]
+    const int ldb_tmp = BLOCK_N;
+
+    if (do_unpack) {
+      for (int k = 0; k < K; k += BLOCK_K_LOCAL) {
+        int64_t kb_size = std::min((int64_t)BLOCK_K_LOCAL, (int64_t)(K - k));
+
+        int idx = k >> 7;  // k / BLOCK_K where BLOCK_K = 128
+        unpack_B(Btmp + k * ldb_tmp, B + k * ldb, N, kb_size, ldb, ldb_tmp, scale[idx]);
+      }
+    }
+
+    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, /* add_C */ false, A, Btmp, C);
+  }
+};
+
+// MXFP4 specialization for brgemm2 (output to float)
+template <>
+struct brgemm2<at::BFloat16, uint8_t, uint8_t> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const uint8_t* __restrict__ B,
+      float* __restrict__ C,
+      at::BFloat16* __restrict__ Btmp,
+      const uint8_t* __restrict__ scale,
+      int M,
+      int N,
+      int K,
+      int lda,
+      int ldb,
+      int ldc,
+      bool do_unpack = true) {
+    constexpr int BLOCK_N = block_size_n();
+
+    // [K, BLOCK_N] -> [K / 2, BLOCK_N * 2]
+    const int ldb_tmp = BLOCK_N;
+
+    if (do_unpack) {
+      // group size 32 for mxfp4
+      for (int k = 0; k < K; k += 32) {
+        unpack_B(Btmp + k * ldb_tmp, B + k * (ldb >> 1), N, 32, ldb, ldb_tmp, scale + (k >> 5) * BLOCK_N);
+      }
+    }
+
+    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, /* add_C */ false, A, Btmp, C);
+  }
+};
+
 #endif // CPU_CAPABILITY_AVX512
 
 // ===== tinygemm_kernel interface functions =====
@@ -1079,8 +1270,9 @@ void tinygemm_kernel(
     bool do_unpack) {
   
   if (brg) {
-    // Use brgemm path (not fully implemented here, would call brgemm)
-    TORCH_CHECK(false, "brgemm path not implemented in standalone version");
+    brgemm<scalar_t, at::Float8_e4m3fn, float>::apply(
+        A, B, C, Btmp, Ctmp, scale, M, N, K, lda, ldb, ldc, do_unpack);
+    return;
   }
 
   constexpr int64_t BLOCK_M = 4;
@@ -1145,7 +1337,9 @@ void tinygemm_kernel(
     bool do_unpack) {
   
   if (brg) {
-    TORCH_CHECK(false, "brgemm path not implemented in standalone version");
+    brgemm<scalar_t, uint8_t, uint8_t>::apply(
+        A, B, C, Btmp, Ctmp, scale, M, N, K, lda, ldb, ldc, do_unpack);
+    return;
   }
 
   constexpr int64_t BLOCK_M = 4;
@@ -1209,7 +1403,9 @@ void tinygemm_kernel(
     bool do_unpack) {
   
   if (brg) {
-    TORCH_CHECK(false, "brgemm path not implemented in standalone version");
+    brgemm2<scalar_t, at::Float8_e4m3fn, float>::apply(
+        A, B, C, Btmp, scale, M, N, K, lda, ldb, ldc, do_unpack);
+    return;
   }
 
   constexpr int64_t BLOCK_M = 4;
@@ -1273,7 +1469,9 @@ void tinygemm_kernel(
     bool do_unpack) {
   
   if (brg) {
-    TORCH_CHECK(false, "brgemm path not implemented in standalone version");
+    brgemm2<scalar_t, uint8_t, uint8_t>::apply(
+        A, B, C, Btmp, scale, M, N, K, lda, ldb, ldc, do_unpack);
+    return;
   }
 
   constexpr int64_t BLOCK_M = 4;
