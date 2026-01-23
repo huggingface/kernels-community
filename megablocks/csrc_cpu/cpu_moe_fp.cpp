@@ -205,7 +205,7 @@ inline bool can_use_brgemm<at::Float8_e4m3fn>(int M) {
   return M > 4;
 }
 
-#define BLOCK_K 128
+constexpr int64_t kBlockK = 128;
 
 template <typename T>
 inline int64_t get_row_size(int64_t K) {
@@ -723,13 +723,13 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, float, BLOCK_M, BLOCK
       int64_t block_size_K,
       bool do_unpack) {
     
-    constexpr int BLOCK_K = 128;
-    constexpr int64_t BLOCK_K2 = BLOCK_K >> 1;
+    constexpr int64_t BLOCK_K_LOCAL = 128;
+    constexpr int64_t BLOCK_K2 = BLOCK_K_LOCAL >> 1;
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N / 16;
     constexpr int ldb_tmp = BLOCK_N;
     
-    const int64_t KB = div_up(K, (int64_t)BLOCK_K);
+    const int64_t KB = div_up(K, BLOCK_K_LOCAL);
 
     __m512bh va;
     __m512bh vb[COLS];
@@ -751,9 +751,9 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, float, BLOCK_M, BLOCK
 
     // Unpack B if needed
     if (do_unpack) {
-      for (int k = 0; k < K; k += BLOCK_K) {
-        int kb_size = std::min(BLOCK_K, K - k);
-        int idx = k >> 7;
+      for (int64_t k = 0; k < K; k += BLOCK_K_LOCAL) {
+        int64_t kb_size = std::min(BLOCK_K_LOCAL, K - k);
+        int64_t idx = k >> 7;
         unpack_B(Btmp + k * ldb_tmp, B + k * ldb, N, kb_size, ldb, ldb_tmp, scale[idx]);
       }
     }
@@ -768,8 +768,8 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, float, BLOCK_M, BLOCK
       if constexpr (row == 0) {
         if constexpr (col % 2 == 0) {
           __m512i b_vec = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(Btmp + k * ldb_tmp * 2 + col * 16));
-          vb[col + 0] = (__m512bh)(_mm512_extracti32x8_epi32(b_vec, 0));
-          vb[col + 1] = (__m512bh)(_mm512_extracti32x8_epi32(b_vec, 1));
+          vb[col + 0] = (__m512bh)(_mm512_castsi256_si512(_mm512_extracti32x8_epi32(b_vec, 0)));
+          vb[col + 1] = (__m512bh)(_mm512_castsi256_si512(_mm512_extracti32x8_epi32(b_vec, 1)));
         }
       }
       vsum[i] = _mm512_dpbf16_ps(vsum[i], va, vb[col]);
@@ -853,8 +853,8 @@ struct tinygemm_kernel_nn<at::BFloat16, uint8_t, uint8_t, BLOCK_M, BLOCK_N> {
       if constexpr (row == 0) {
         if constexpr (col % 2 == 0) {
           __m512i b0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(Btmp + k * ldb_tmp * 2 + col * 16));
-          vb[col + 0] = (__m512bh)(_mm512_extracti32x8_epi32(b0, 0));
-          vb[col + 1] = (__m512bh)(_mm512_extracti32x8_epi32(b0, 1));
+          vb[col + 0] = (__m512bh)(_mm512_castsi256_si512(_mm512_extracti32x8_epi32(b0, 0)));
+          vb[col + 1] = (__m512bh)(_mm512_castsi256_si512(_mm512_extracti32x8_epi32(b0, 1)));
         }
       }
       vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
@@ -934,8 +934,8 @@ struct tinygemm_kernel_nn2<at::BFloat16, at::Float8_e4m3fn, float, BLOCK_M, BLOC
       if constexpr (row == 0) {
         if constexpr (col % 2 == 0) {
           __m512i b_vec = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(Btmp + k * ldb_tmp * 2 + col * 16));
-          vb[col + 0] = (__m512bh)(_mm512_extracti32x8_epi32(b_vec, 0));
-          vb[col + 1] = (__m512bh)(_mm512_extracti32x8_epi32(b_vec, 1));
+          vb[col + 0] = (__m512bh)(_mm512_castsi256_si512(_mm512_extracti32x8_epi32(b_vec, 0)));
+          vb[col + 1] = (__m512bh)(_mm512_castsi256_si512(_mm512_extracti32x8_epi32(b_vec, 1)));
         }
       }
       vsum[i] = _mm512_dpbf16_ps(vsum[i], va, vb[col]);
@@ -1014,8 +1014,8 @@ struct tinygemm_kernel_nn2<at::BFloat16, uint8_t, uint8_t, BLOCK_M, BLOCK_N> {
       if constexpr (row == 0) {
         if constexpr (col % 2 == 0) {
           __m512i b0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(Btmp + k * ldb_tmp * 2 + col * 16));
-          vb[col + 0] = (__m512bh)(_mm512_extracti32x8_epi32(b0, 0));
-          vb[col + 1] = (__m512bh)(_mm512_extracti32x8_epi32(b0, 1));
+          vb[col + 0] = (__m512bh)(_mm512_castsi256_si512(_mm512_extracti32x8_epi32(b0, 0)));
+          vb[col + 1] = (__m512bh)(_mm512_castsi256_si512(_mm512_extracti32x8_epi32(b0, 1)));
         }
       }
       vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
