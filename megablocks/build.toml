@@ -101,6 +101,7 @@ depends = [
     "torch",
 ]
 src = [
+    "csrc_cpu/common.h",
     "csrc_cpu/registration.h",
     "csrc_cpu/moe_ops.h",
     "csrc_cpu/cpu_moe_kernel.cpp",
