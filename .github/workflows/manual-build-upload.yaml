@@ -42,7 +42,7 @@ jobs:
           ref: refs/pull/${{ inputs.pr_number }}/head
           fetch-depth: 0
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v21
         with:
           extra-conf: |
             max-jobs = 2
