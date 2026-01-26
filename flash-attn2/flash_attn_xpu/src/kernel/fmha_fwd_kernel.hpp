@@ -343,7 +343,9 @@ class XeFMHAFwdKernel {
           thr_id,
           seq_len,
           full_tile_offset,
-          discard_seq_coord);
+          discard_seq_coord,
+          head_q,
+          s.num_heads_q);
       if constexpr (
           !is_empty_v<MainloopSharedStorage> &&
           !is_empty_v<EpilogueSharedStorage>) {

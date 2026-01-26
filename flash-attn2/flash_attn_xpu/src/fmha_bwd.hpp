@@ -133,4 +133,7 @@ void cutlass_fmha_bwd_fix_impl(
     int window_size_left,
     int window_size_right,
     bool is_causal,
-    bool is_local);
+    bool is_local,
+    float p_dropout = 0.0f,
+    uint64_t philox_seed = 0,
+    uint64_t philox_offset = 0);

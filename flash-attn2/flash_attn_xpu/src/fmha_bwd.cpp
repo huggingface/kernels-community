@@ -34,7 +34,10 @@ void cutlass_fmha_bwd_fix_impl(
     int window_size_left,
     int window_size_right,
     bool is_causal,
-    bool is_local) {
+    bool is_local,
+    float p_dropout,
+    uint64_t philox_seed,
+    uint64_t philox_offset) {
 
     // Get dimensions from tensors - assuming BSHD layout (batch, seq, head, dim)
     int batch_size = q.size(0);
@@ -80,7 +83,10 @@ void cutlass_fmha_bwd_fix_impl(
         q.scalar_type() == at::ScalarType::BFloat16,
         false,  // deterministic
         window_size_left,
-        window_size_right
+        window_size_right,
+        p_dropout,
+        philox_seed,
+        philox_offset
     };
 
     BwdCutlassType cuType = aten_to_Bwd_Cutlass_dtype(q);

@@ -531,6 +531,38 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
             gemm_SdP(trait, mVt, mdO, rdP, tiled_mma_sdp);
             Tensor dS = make_tensor(rdP.data(), scores.layout());
             
+            // Apply dropout mask to P and dS (backward)
+            // In backward, we need to regenerate the same dropout mask used in forward
+            if (param.dropout.is_enabled) {
+                int sg_local_id = sg.get_local_id();
+                uint32_t batch_head = bidb * param.num_head_q + bidh;
+                float rp_dropout = param.dropout.get_scale();
+                
+                // Convert 3D layout to 2D for proper coordinate indexing
+                Tensor taccScS_rt_2d = make_tensor(
+                    taccScS_rt.data(),
+                    convert_layout_2d_layout(taccScS_rt.layout()));
+                
+                CUTLASS_PRAGMA_UNROLL
+                for (int ni = 0; ni < size<1>(scores); ++ni) {
+                    int n = get<1>(taccScS_rt_2d(0, ni)) + sg_local_id;
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int mi = 0; mi < size<0>(scores); ++mi) {
+                        int m = get<0>(taccScS_rt_2d(mi, ni));
+                        int row_idx = m_block * kBlockM + m;
+                        int col_idx = n_block * kBlockN + n;
+                        
+                        bool keep = param.dropout.should_keep(batch_head, row_idx, col_idx);
+                        if (keep) {
+                            scores(mi, ni) = static_cast<V>(static_cast<float>(scores(mi, ni)) * rp_dropout);
+                        } else {
+                            scores(mi, ni) = V(0);
+                            dS(mi, ni) = V(0);
+                        }
+                    }
+                }
+            }
+            
             // dS = P * (dP - sum) * scale
             softmax_backward(scores, mdPsum, dS, taccScS_rt, param.scale_softmax);
             
@@ -857,6 +889,9 @@ struct BwdKernelLauncher {
         param.window_size_left = args.window_size_left;
         param.window_size_right = args.window_size_right;
         param.is_local = args.is_local;
+        
+        // Setup dropout
+        param.dropout = cutlass::fmha::Dropout(args.philox_seed, args.philox_offset, args.p_dropout);
         
         // Setup strides (BSHD layout - batch, seq, head, dim)
         setup_bshd_stride_bwd(param);

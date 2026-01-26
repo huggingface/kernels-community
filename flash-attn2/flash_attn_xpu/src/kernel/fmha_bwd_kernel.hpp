@@ -1,6 +1,7 @@
 #pragma once
 #include <sycl/sycl.hpp>
 #include <cute/tensor.hpp>
+#include "../philox.hpp"
 using namespace cute;
 
 template <class T_, int kHeadDim_, int kBlockM_, int kBlockN_, int kNSGs_,
@@ -165,6 +166,9 @@ struct BwdParam {
 
     bool is_bhsd;
     bool is_local;
+    
+    // Dropout
+    cutlass::fmha::Dropout dropout;
 };
 
 template<typename T>

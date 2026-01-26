@@ -1,11 +1,23 @@
 #include <torch/all.h>
 #include <c10/xpu/XPUStream.h>
 #include <cute/util/compat/device.hpp>
+#include <ATen/xpu/XPUGeneratorImpl.h>
 
 #include "src/fmha_fwd.hpp"
 #include "src/fmha_bwd.hpp"
 
 namespace FLASH_NAMESPACE {
+
+// Helper to get philox seed and offset from generator
+inline std::pair<uint64_t, uint64_t> get_philox_state(
+    std::optional<at::Generator> gen,
+    int64_t counter_offset) {
+    auto gen_val = gen.has_value() ? gen.value() : at::xpu::detail::getDefaultXPUGenerator();
+    auto* xpu_gen = at::check_generator<at::XPUGeneratorImpl>(gen_val);
+    // Get current state and advance
+    auto [seed, offset] = xpu_gen->philox_engine_inputs(counter_offset);
+    return {seed, offset};
+}
 
 inline int round_multiple(int x, int m) {
     int pad_res = (x + m - 1) / m * m;
@@ -102,13 +114,32 @@ mha_fwd(
 
     auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
 
+    // Handle dropout
+    uint64_t philox_seed = 0;
+    uint64_t philox_offset = 0;
+    at::Tensor rng_state;
+    
+    if (p_dropout > 0.0f) {
+        // Calculate counter offset for RNG: batch_size * num_heads * 32
+        int64_t counter_offset = batch_size * num_heads * 32;
+        auto [seed, offset] = get_philox_state(gen_, counter_offset);
+        philox_seed = seed;
+        philox_offset = offset;
+        
+        // Store RNG state for backward pass
+        rng_state = at::empty({2}, q.options().dtype(at::kLong));
+        rng_state[0] = static_cast<int64_t>(philox_seed);
+        rng_state[1] = static_cast<int64_t>(philox_offset);
+    }
+
     cutlass_fmha_fwd_fix_impl(
         queue,
         q_padded, k_padded, v_padded, out_padded,
         softmax_lse,
         softmax_scale,
         window_size_left, window_size_right,
-        is_causal, is_local);
+        is_causal, is_local,
+        p_dropout, philox_seed, philox_offset, nullptr);
 
     // Remove padding from output
     at::Tensor out = out_padded;
@@ -119,7 +150,6 @@ mha_fwd(
     out = ensure_contiguous(out);
 
     at::Tensor S_dmask;
-    at::Tensor rng_state;
     return {out, softmax_lse, S_dmask, rng_state};
   }
 
@@ -263,12 +293,22 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads x head_siz
 
     auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
 
+    // Handle dropout - get RNG state from forward pass
+    uint64_t philox_seed = 0;
+    uint64_t philox_offset = 0;
+    if (p_dropout > 0.0f && rng_state.has_value()) {
+        auto rng_state_val = rng_state.value();
+        philox_seed = static_cast<uint64_t>(rng_state_val[0].item<int64_t>());
+        philox_offset = static_cast<uint64_t>(rng_state_val[1].item<int64_t>());
+    }
+
     // Call the cutlass backward implementation
     cutlass_fmha_bwd_fix_impl(
         queue,
         dout_padded, q_padded, k_padded, v_padded, out_padded, softmax_lse,
         dq_work, dk_expanded, dv_expanded, softmax_d,
-        softmax_scale, window_size_left, window_size_right, is_causal, is_local);
+        softmax_scale, window_size_left, window_size_right, is_causal, is_local,
+        p_dropout, philox_seed, philox_offset);
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
