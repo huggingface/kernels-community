@@ -64,7 +64,7 @@ at::Tensor fused_experts(
       auto up = hidden.slice(0, N, N2);    // [N]
 
       // SiLU and mul
-      auto activated = silu(gate) * up;  // [N]
+      auto activated = silu_activation(gate) * up;  // [N]
 
       // Second linear: [N] @ [N, K] -> [K]
       auto expert_out = torch::matmul(activated, expert_w2.t());  // [K]
@@ -113,7 +113,7 @@ at::Tensor shared_expert(
   auto up = hidden.slice(1, N, N2);    // [M, N]
 
   // SiLU and mul
-  auto activated = silu(gate) * up;  // [M, N]
+  auto activated = silu_activation(gate) * up;  // [M, N]
 
   // Second linear: [M, N] @ [N, K] -> [M, K]
   auto expert_out = torch::matmul(activated, w2_fp32.t());

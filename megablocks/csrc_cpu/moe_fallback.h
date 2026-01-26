@@ -20,7 +20,7 @@ namespace cpu {
 namespace fallback {
 
 // SiLU activation: x * sigmoid(x)
-inline at::Tensor silu(const at::Tensor& x) {
+inline at::Tensor silu_activation(const at::Tensor& x) {
   return x * torch::sigmoid(x);
 }
 
