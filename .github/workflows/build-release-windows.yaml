@@ -203,6 +203,12 @@ jobs:
           }
           & "$env:GITHUB_WORKSPACE\kernel-builder\scripts\windows\builder.ps1" -Backend $env:PLATFORM_BACKEND -SourceFolder "$env:KERNEL_SOURCE" -BuildConfig Release -Build
 
+          # Run the local_install target to create the correct directory structure for kernels upload
+          # This installs to build/<variant>/<package>/ which is what kernels CLI expects
+          Push-Location "$env:KERNEL_SOURCE\build"
+          cmake --build . --config Release --target local_install
+          Pop-Location
+
       - name: Upload kernel to Hub
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         shell: pwsh
