@@ -7,6 +7,7 @@ struct fmha_fwd_args_t {
   void* key;
   void* value;
   void* out;
+  void* softmax_lse;  // Output: log-sum-exp for backward pass (batch, num_heads, seqlen_q)
   void* block_table;
   void* cu_seqlens_q;
   void* cu_seqlens_k;

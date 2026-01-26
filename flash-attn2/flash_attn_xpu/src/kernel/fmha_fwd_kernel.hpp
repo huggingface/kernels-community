@@ -358,7 +358,10 @@ class XeFMHAFwdKernel {
           tA_max,
           tA_sum,
           blk_qv,
-          thr_id);
+          thr_id,
+          head_q,
+          idx_b,
+          seq_len_qo);
       }
     }
   };
