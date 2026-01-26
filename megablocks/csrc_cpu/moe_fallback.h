@@ -1,4 +1,8 @@
-// SPDX-License-Identifier: Apache-2.0
+/*****************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************************/
+
 // MegaBlocks CPU MoE Fallback Implementation
 //
 // Pure PyTorch implementation for CPUs without AVX512 support.

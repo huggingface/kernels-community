@@ -1,3 +1,10 @@
+/*****************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************************/
+
+// CPU Feature Detection for MegaBlocks
+
 #pragma once
 
 #ifdef _MSC_VER

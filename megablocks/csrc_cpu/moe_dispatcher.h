@@ -1,4 +1,8 @@
-// SPDX-License-Identifier: Apache-2.0
+/*****************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************************/
+
 // MegaBlocks CPU MoE Dispatcher Header
 //
 // This header declares the dispatcher functions that automatically select

@@ -1,4 +1,8 @@
-// SPDX-License-Identifier: Apache-2.0
+/*****************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************************/
+
 // MegaBlocks CPU Fused MoE Implementation for INT8
 //
 // Stub implementation - INT8 kernels are not yet implemented.

@@ -1,5 +1,10 @@
-// SPDX-License-Identifier: Apache-2.0
+/*****************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************************/
+
 // MegaBlocks CPU Registration Header
+
 #pragma once
 
 #include <Python.h>
