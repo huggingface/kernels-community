@@ -104,72 +104,72 @@ void cutlass_fmha_bwd_fix_impl(
             bwd_policy_dispatch<bwd_policy_head32, 0, 0>(queue, cuType, args);
         }
     }
-    // else if (h <= 64) {
-    //     if (is_causal && is_local) {
-    //         bwd_policy_dispatch<bwd_policy_head64, 1, 1>(queue, cuType, args);
-    //     } else if (is_causal) {
-    //         bwd_policy_dispatch<bwd_policy_head64, 1, 0>(queue, cuType, args);
-    //     } else if (is_local) {
-    //         bwd_policy_dispatch<bwd_policy_head64, 0, 1>(queue, cuType, args);
-    //     } else {
-    //         bwd_policy_dispatch<bwd_policy_head64, 0, 0>(queue, cuType, args);
-    //     }
-    // }
-    // else if (h <= 96) {
-    //     if (is_causal && is_local) {
-    //         bwd_policy_dispatch<bwd_policy_head96, 1, 1>(queue, cuType, args);
-    //     } else if (is_causal) {
-    //         bwd_policy_dispatch<bwd_policy_head96, 1, 0>(queue, cuType, args);
-    //     } else if (is_local) {
-    //         bwd_policy_dispatch<bwd_policy_head96, 0, 1>(queue, cuType, args);
-    //     } else {
-    //         bwd_policy_dispatch<bwd_policy_head96, 0, 0>(queue, cuType, args);
-    //     }
-    // }
-    // else if (h <= 128) {
-    //     if (is_causal && is_local) {
-    //         bwd_policy_dispatch<bwd_policy_head128, 1, 1>(queue, cuType, args);
-    //     } else if (is_causal) {
-    //         bwd_policy_dispatch<bwd_policy_head128, 1, 0>(queue, cuType, args);
-    //     } else if (is_local) {
-    //         bwd_policy_dispatch<bwd_policy_head128, 0, 1>(queue, cuType, args);
-    //     } else {
-    //         bwd_policy_dispatch<bwd_policy_head128, 0, 0>(queue, cuType, args);
-    //     }
-    // }
-    // else if (h <= 160) {
-    //     if (is_causal && is_local) {
-    //         bwd_policy_dispatch<bwd_policy_head160, 1, 1>(queue, cuType, args);
-    //     } else if (is_causal) {
-    //         bwd_policy_dispatch<bwd_policy_head160, 1, 0>(queue, cuType, args);
-    //     } else if (is_local) {
-    //         bwd_policy_dispatch<bwd_policy_head160, 0, 1>(queue, cuType, args);
-    //     } else {
-    //         bwd_policy_dispatch<bwd_policy_head160, 0, 0>(queue, cuType, args);
-    //     }
-    // }
-    // if (h <= 192) {
-    //     if (is_causal && is_local) {
-    //         bwd_policy_dispatch<bwd_policy_head192, 1, 1>(queue, cuType, args);
-    //     } else if (is_causal) {
-    //         bwd_policy_dispatch<bwd_policy_head192, 1, 0>(queue, cuType, args);
-    //     } else if (is_local) {
-    //         bwd_policy_dispatch<bwd_policy_head192, 0, 1>(queue, cuType, args);
-    //     } else {
-    //         bwd_policy_dispatch<bwd_policy_head192, 0, 0>(queue, cuType, args);
-    //     }
-    // }
-    // else if (h <= 256) {
-    //     if (is_causal && is_local) {
-    //         bwd_policy_dispatch<bwd_policy_head256, 1, 1>(queue, cuType, args);
-    //     } else if (is_causal) {
-    //         bwd_policy_dispatch<bwd_policy_head256, 1, 0>(queue, cuType, args);
-    //     } else if (is_local) {
-    //         bwd_policy_dispatch<bwd_policy_head256, 0, 1>(queue, cuType, args);
-    //     } else {
-    //         bwd_policy_dispatch<bwd_policy_head256, 0, 0>(queue, cuType, args);
-    //     }
-    // }
+    else if (h <= 64) {
+        if (is_causal && is_local) {
+            bwd_policy_dispatch<bwd_policy_head64, 1, 1>(queue, cuType, args);
+        } else if (is_causal) {
+            bwd_policy_dispatch<bwd_policy_head64, 1, 0>(queue, cuType, args);
+        } else if (is_local) {
+            bwd_policy_dispatch<bwd_policy_head64, 0, 1>(queue, cuType, args);
+        } else {
+            bwd_policy_dispatch<bwd_policy_head64, 0, 0>(queue, cuType, args);
+        }
+    }
+    else if (h <= 96) {
+        if (is_causal && is_local) {
+            bwd_policy_dispatch<bwd_policy_head96, 1, 1>(queue, cuType, args);
+        } else if (is_causal) {
+            bwd_policy_dispatch<bwd_policy_head96, 1, 0>(queue, cuType, args);
+        } else if (is_local) {
+            bwd_policy_dispatch<bwd_policy_head96, 0, 1>(queue, cuType, args);
+        } else {
+            bwd_policy_dispatch<bwd_policy_head96, 0, 0>(queue, cuType, args);
+        }
+    }
+    else if (h <= 128) {
+        if (is_causal && is_local) {
+            bwd_policy_dispatch<bwd_policy_head128, 1, 1>(queue, cuType, args);
+        } else if (is_causal) {
+            bwd_policy_dispatch<bwd_policy_head128, 1, 0>(queue, cuType, args);
+        } else if (is_local) {
+            bwd_policy_dispatch<bwd_policy_head128, 0, 1>(queue, cuType, args);
+        } else {
+            bwd_policy_dispatch<bwd_policy_head128, 0, 0>(queue, cuType, args);
+        }
+    }
+    else if (h <= 160) {
+        if (is_causal && is_local) {
+            bwd_policy_dispatch<bwd_policy_head160, 1, 1>(queue, cuType, args);
+        } else if (is_causal) {
+            bwd_policy_dispatch<bwd_policy_head160, 1, 0>(queue, cuType, args);
+        } else if (is_local) {
+            bwd_policy_dispatch<bwd_policy_head160, 0, 1>(queue, cuType, args);
+        } else {
+            bwd_policy_dispatch<bwd_policy_head160, 0, 0>(queue, cuType, args);
+        }
+    }
+    else if (h <= 192) {
+        if (is_causal && is_local) {
+            bwd_policy_dispatch<bwd_policy_head192, 1, 1>(queue, cuType, args);
+        } else if (is_causal) {
+            bwd_policy_dispatch<bwd_policy_head192, 1, 0>(queue, cuType, args);
+        } else if (is_local) {
+            bwd_policy_dispatch<bwd_policy_head192, 0, 1>(queue, cuType, args);
+        } else {
+            bwd_policy_dispatch<bwd_policy_head192, 0, 0>(queue, cuType, args);
+        }
+    }
+    else if (h <= 256) {
+        if (is_causal && is_local) {
+            bwd_policy_dispatch<bwd_policy_head256, 1, 1>(queue, cuType, args);
+        } else if (is_causal) {
+            bwd_policy_dispatch<bwd_policy_head256, 1, 0>(queue, cuType, args);
+        } else if (is_local) {
+            bwd_policy_dispatch<bwd_policy_head256, 0, 1>(queue, cuType, args);
+        } else {
+            bwd_policy_dispatch<bwd_policy_head256, 0, 0>(queue, cuType, args);
+        }
+    }
     else {
         throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
     }
