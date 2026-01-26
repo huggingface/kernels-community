@@ -82,6 +82,20 @@ src = [
 
 [kernel.megablocks_cpu]
 backend = "cpu"
+depends = [
+    "torch",
+]
+include = ["csrc_cpu"]
+src = [
+    "csrc_cpu/cpu_features.hpp",
+    "csrc_cpu/moe_dispatcher.h",
+    "csrc_cpu/moe_dispatcher.cpp",
+    "csrc_cpu/moe_fallback.h",
+    "csrc_cpu/moe_fallback.cpp",
+]
+
+[kernel.megablocks_cpu_avx512]
+backend = "cpu"
 cxx-flags = [
     "-O3",
     "-mfma",
@@ -100,6 +114,7 @@ cxx-flags = [
 depends = [
     "torch",
 ]
+include = ["csrc_cpu"]
 src = [
     "csrc_cpu/common.h",
     "csrc_cpu/registration.h",

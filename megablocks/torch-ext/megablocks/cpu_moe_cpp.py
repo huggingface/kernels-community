@@ -68,7 +68,7 @@ def fused_moe_cpp(
         if w2_bias is not None:
             w2_bias = w2_bias.to(torch.bfloat16)
     
-    output = ops.fused_experts_cpu(
+    output = ops.fused_experts(
         hidden_states, w1, w2, topk_weights, topk_ids,
         inplace, use_int8_w8a8, use_fp8_w8a16, use_mxfp4,
         w1_scale, w2_scale, block_size, a1_scale, a2_scale,
