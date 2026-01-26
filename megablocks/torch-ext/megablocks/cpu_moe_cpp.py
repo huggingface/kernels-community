@@ -117,7 +117,6 @@ class MegaBlocksMoeMLP(torch.nn.Module):
 
     def convert_weight(self, dtype, use_mxfp4: bool = False):
         if use_mxfp4:
-            # import pdb; pdb.set_trace()
             data_1 = ops.convert_weight_packed(self.experts.gate_up_proj.data.transpose(-1, -2).contiguous())
             data_2 = ops.convert_weight_packed(self.experts.down_proj.data.transpose(-1, -2).contiguous())
             self.experts.gate_up_proj.storage.data = data_1
@@ -155,8 +154,6 @@ class MegaBlocksMoeMLP(torch.nn.Module):
 
         w1_scale = None
         w2_scale = None
-
-        # import pdb; pdb.set_trace()
 
         if (
             not getattr(self, "packed_scales", False)
@@ -236,8 +233,7 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         use_alpha = alpha if activation == "swigluoai" else None
         use_limit = limit if activation == "swigluoai" else None
         
-        # Call C++ optimized kernel (main performance bottleneck)
-        # import pdb; pdb.set_trace()
+        # Call C++ optimized kernel
         output = fused_moe_cpp(
             hidden_states=x_flat,
             w1=w1.data,
