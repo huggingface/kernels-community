@@ -21,6 +21,7 @@
 #elif defined(CPU_KERNEL)
 #include "../csrc_cpu/registration.h"
 #include "../csrc_cpu/moe_ops.h"
+#include "../csrc_cpu/moe_dispatcher.h"
 #endif
 
 #if defined(CUDA_KERNEL)
@@ -264,16 +265,16 @@ REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
 torch::Tensor convert_weight_packed_wrapper(torch::Tensor weight) {
     // Make a copy since the API requires reference but we receive by value
     auto weight_copy = weight;
-    return megablocks::cpu::convert_weight_packed(weight_copy);
+    return megablocks::cpu::dispatch::convert_weight_packed(weight_copy);
 }
 
 torch::Tensor convert_scale_packed_wrapper(torch::Tensor scale) {
     // Make a copy since the API requires reference but we receive by value
     auto scale_copy = scale;
-    return megablocks::cpu::convert_scale_packed(scale_copy);
+    return megablocks::cpu::dispatch::convert_scale_packed(scale_copy);
 }
 
-torch::Tensor fused_experts_cpu_wrapper(
+torch::Tensor fused_experts_wrapper(
     torch::Tensor hidden_states,
     torch::Tensor w1,
     torch::Tensor w2,
@@ -300,7 +301,7 @@ torch::Tensor fused_experts_cpu_wrapper(
     auto w2_copy = w2;
     auto tw = topk_weights;
     auto ti = topk_ids;
-    return megablocks::cpu::fused_experts_cpu(
+    return megablocks::cpu::dispatch::fused_experts(
         hs, w1_copy, w2_copy, tw, ti,
         inplace, use_int8_w8a8, use_fp8_w8a16, use_mxfp4,
         w1_scale, w2_scale, block_size, a1_scale, a2_scale,
@@ -308,7 +309,7 @@ torch::Tensor fused_experts_cpu_wrapper(
     );
 }
 
-torch::Tensor shared_expert_cpu_wrapper(
+torch::Tensor shared_expert_wrapper(
     torch::Tensor hidden_states,
     torch::Tensor w1,
     torch::Tensor w2,
@@ -329,7 +330,7 @@ torch::Tensor shared_expert_cpu_wrapper(
     auto w1_copy = w1;
     auto w2_copy = w2;
     auto feo = fused_experts_out;
-    return megablocks::cpu::shared_expert_cpu(
+    return megablocks::cpu::dispatch::shared_expert(
         hs, w1_copy, w2_copy, feo,
         routed_scaling_factor, inplace, use_int8_w8a8, use_fp8_w8a16,
         w1_scale, w2_scale, block_size, a1_scale, a2_scale, is_vnni
@@ -347,7 +348,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
     // Fused experts kernel (sglang compatible)
     ops.def(
-        "fused_experts_cpu("
+        "fused_experts("
         "    Tensor hidden_states,"
         "    Tensor w1,"
         "    Tensor w2,"
@@ -369,11 +370,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
         "    bool is_vnni=False"
         ") -> Tensor"
     );
-    ops.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu_wrapper);
+    ops.impl("fused_experts", torch::kCPU, &fused_experts_wrapper);
 
     // Shared expert kernel
     ops.def(
-        "shared_expert_cpu("
+        "shared_expert("
         "    Tensor hidden_states,"
         "    Tensor w1,"
         "    Tensor w2,"
@@ -390,7 +391,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
         "    bool is_vnni=False"
         ") -> Tensor"
     );
-    ops.impl("shared_expert_cpu", torch::kCPU, &shared_expert_cpu_wrapper);
+    ops.impl("shared_expert", torch::kCPU, &shared_expert_wrapper);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

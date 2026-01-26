@@ -40,7 +40,7 @@ at::Tensor fused_experts(
   // Runtime CPU feature detection
   if (CPUFeatures::hasAVX512() && CPUFeatures::hasAVX512BF16()) {
     // Use AVX512 optimized implementation
-    return fused_experts_cpu(
+    return megablocks::cpu::fused_experts_cpu(
         hidden_states, w1, w2, topk_weights, topk_ids,
         inplace, use_int8_w8a8, use_fp8_w8a16, use_mxfp4,
         w1_scale, w2_scale, block_size, a1_scale, a2_scale,
@@ -76,7 +76,7 @@ at::Tensor shared_expert(
   // Runtime CPU feature detection
   if (CPUFeatures::hasAVX512() && CPUFeatures::hasAVX512BF16()) {
     // Use AVX512 optimized implementation
-    return shared_expert_cpu(
+    return megablocks::cpu::shared_expert_cpu(
         hidden_states, w1, w2, fused_experts_out,
         routed_scaling_factor, inplace, use_int8_w8a8, use_fp8_w8a16,
         w1_scale, w2_scale, block_size, a1_scale, a2_scale, is_vnni);
