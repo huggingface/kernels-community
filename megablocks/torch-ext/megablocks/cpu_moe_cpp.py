@@ -12,6 +12,16 @@ from .cpu_fused_moe import route_tokens_cpu
 from ._ops import ops
 
 
+def _to_local_tensor(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Convert DTensor to local torch.Tensor if needed for custom ops compatibility."""
+    if tensor is None:
+        return None
+    # Check if it's a DTensor by looking for the to_local() method
+    if hasattr(tensor, "to_local"):
+        return tensor.to_local()
+    return tensor
+
+
 def fused_moe_cpp(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -62,11 +72,25 @@ def fused_moe_cpp(
     need_convert = (use_mxfp4 or use_fp8_w8a16) and orig_dtype != torch.bfloat16
     if need_convert:
         hidden_states = hidden_states.to(torch.bfloat16)
-        # bias must match hidden_states dtype
-        if w1_bias is not None:
-            w1_bias = w1_bias.to(torch.bfloat16)
-        if w2_bias is not None:
-            w2_bias = w2_bias.to(torch.bfloat16)
+
+    # bias must match hidden_states dtype
+    if w1_bias is not None:
+        w1_bias = w1_bias.to(hidden_states.dtype)
+    if w2_bias is not None:
+        w2_bias = w2_bias.to(hidden_states.dtype)
+
+    # Convert DTensor to local tensor for custom ops compatibility (TP mode)
+    hidden_states = _to_local_tensor(hidden_states)
+    w1 = _to_local_tensor(w1)
+    w2 = _to_local_tensor(w2)
+    topk_weights = _to_local_tensor(topk_weights)
+    topk_ids = _to_local_tensor(topk_ids)
+    w1_scale = _to_local_tensor(w1_scale)
+    w2_scale = _to_local_tensor(w2_scale)
+    a1_scale = _to_local_tensor(a1_scale)
+    a2_scale = _to_local_tensor(a2_scale)
+    w1_bias = _to_local_tensor(w1_bias)
+    w2_bias = _to_local_tensor(w2_bias)
     
     output = ops.fused_experts(
         hidden_states, w1, w2, topk_weights, topk_ids,
