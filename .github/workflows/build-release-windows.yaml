@@ -201,7 +201,7 @@ jobs:
               exit 1
             }
           }
-          & "$env:GITHUB_WORKSPACE\kernel-builder\scripts\windows\builder.ps1" -Backend $env:PLATFORM_BACKEND -SourceFolder "$env:KERNEL_SOURCE" -BuildConfig Release -Build -LocalInstall
+          & "$env:GITHUB_WORKSPACE\kernel-builder\scripts\windows\builder.ps1" -Backend $env:PLATFORM_BACKEND -SourceFolder "$env:KERNEL_SOURCE" -BuildConfig Release -Build
 
       - name: Upload kernel to Hub
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
