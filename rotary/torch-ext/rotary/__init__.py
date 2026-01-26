@@ -25,7 +25,7 @@ def apply_rotary_transformers(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Rotary kernel implementation wrapper
-    Adapts rotary kernels implementation to match transformers apply_rotary_pos_emb signature
+    Adapts rotary kernel implementation to match transformers apply_rotary_pos_emb signature
     """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
