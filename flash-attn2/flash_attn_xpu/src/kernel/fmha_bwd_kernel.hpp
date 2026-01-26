@@ -5,7 +5,7 @@ using namespace cute;
 
 template <class T_, int kHeadDim_, int kBlockM_, int kBlockN_, int kNSGs_,
           int AtomLayoutMSdP_ = 2, int AtomLayoutNdKV_ = 2, int AtomLayoutMdQ_ = 2,
-          bool is_causal_ = false>
+          bool is_causal_ = false, bool is_local_ = false>
 struct FABwdKernel {
     /*
       Q BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_QK
@@ -24,6 +24,7 @@ struct FABwdKernel {
     static constexpr int AtomLayoutNdKV = AtomLayoutNdKV_;
     static constexpr int AtomLayoutMdQ = AtomLayoutMdQ_;
     static constexpr bool is_causal = is_causal_;
+    static constexpr bool is_local = is_local_;
     using MMA_Atom_ARCH = XE_DPAS_TT<8, VType, DType>;
     using _K = Int<MMA_Atom_ARCH::K>;
     using SubgroupLayoutSdP = Layout<Shape<Int<AtomLayoutMSdP>, Int<kNSGs / AtomLayoutMSdP>, _1>>;
@@ -158,7 +159,12 @@ struct BwdParam {
     int dq_h_stride;
     int dq_b_stride;
 
+    // Window size for local attention
+    int window_size_left;
+    int window_size_right;
+
     bool is_bhsd;
+    bool is_local;
 };
 
 template<typename T>
@@ -256,4 +262,3 @@ void setup_bshd_stride_bwd(BwdParam<T> &param) {
     param.dq_h_stride = param.head_dim;
     param.dq_b_stride = param.num_head_q * param.seq_len_q_pad * param.head_dim;
 }
-

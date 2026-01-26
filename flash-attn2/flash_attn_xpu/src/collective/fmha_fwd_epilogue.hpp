@@ -245,27 +245,30 @@ class FMHAFwdEpilogue {
     
     constexpr float kLn2 = 0.6931471805599453f;  // ln(2)
     
-    // Use TiledMMAPV to get coordinates, similar to how mainloop does masking
-    // Create identity tensor for the output tile
+    int blk_q = get<0>(blk_qv);
+    int global_row_offset = blk_q * get<0>(TileShapeO{});
+    
+    // Use TiledMMAPV to get coordinates within the tile
+    // Create identity tensor for a single tile (coordinates are tile-local: [0, TileShapeO))
     Tensor cA = make_identity_tensor(make_shape(
         get<0>(TileShapeO{}), get<1>(TileShapeO{})));
-    Tensor gA = local_tile(cA, TileShapeO{}, blk_qv);
-    
+
     // Use TiledMMAPV's partitioning to get thread-specific coordinates
     TiledMMAPV mma_pv;
     auto thr_mma = mma_pv.get_slice(thr_id);
-    auto cA_thread = thr_mma.partition_C(gA);
+    auto cA_thread = thr_mma.partition_C(cA);
     
     // Iterate through elements and write LSE for each unique row
     int prev_row = -1;
     
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA.size(); i++) {
-      // Get the global row coordinate
-      int row_idx = get<0>(cA_thread(i));
+      // Get the tile-local row coordinate and convert to global
+      int local_row_idx = get<0>(cA_thread(i));
+      int row_idx = global_row_offset + local_row_idx;
       
       // Only write each row once (first V position)
-      if (row_idx != prev_row && row_idx < seq_len_q) {
+      if (local_row_idx != prev_row && row_idx < seq_len_q) {
         // Use broadcast to get the correct max/sum values for this row
         auto max_val = static_cast<ElementLSE>(broadcast<0>(rA_max, rA, i));
         auto sum_val = static_cast<ElementLSE>(broadcast<0>(rA_sum, rA, i));
@@ -277,7 +280,7 @@ class FMHAFwdEpilogue {
         // Write LSE value
         lse_base[row_idx] = lse;
         
-        prev_row = row_idx;
+        prev_row = local_row_idx;
       }
     }
   }

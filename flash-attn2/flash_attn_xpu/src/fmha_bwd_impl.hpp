@@ -11,7 +11,7 @@
 #include "cutlass/util/GPU_Clock.hpp"
 
 #include "fmha_bwd_types.hpp"
-#include "fmha_bwd_kernel.hpp"
+#include "kernel/fmha_bwd_kernel.hpp"
 
 using namespace cute;
 
@@ -53,6 +53,39 @@ apply_mask_causal(Tensor<Engine0, Layout0> &tensor,
             int y = m_offset + get<1>(rC_2d(m, n)) + sg_local_id + diagonal_offset;
             int x = n_offset + get<0>(rC_2d(m, n));
             if (x > y) {
+                tensor(m, n) = -INFINITY;
+            }
+        }
+    }
+}
+
+// Apply local (sliding window) mask to tensor
+template <typename Engine0, typename Layout0,
+          typename Engine1, typename Layout1>
+CUTLASS_DEVICE void
+apply_mask_local(Tensor<Engine0, Layout0> &tensor,
+                 Tensor<Engine1, Layout1> &rC,
+                 int m_offset, int n_offset,
+                 int window_size_left, int window_size_right,
+                 int seqlen_k_minus_seqlen_q = 0) {
+    auto sg = compat::get_nd_item<1>().get_sub_group();
+    int sg_local_id = sg.get_local_id();
+    Tensor rC_2d = make_tensor(
+        rC.data(),
+        convert_layout_2d_layout(rC.layout()));
+    CUTLASS_PRAGMA_UNROLL
+    for (int n = 0; n < size<1>(tensor); ++n) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int m = 0; m < size<0>(tensor); ++m) {
+            // row_idx is the query position, col_idx is the key position
+            int row_idx = m_offset + get<1>(rC_2d(m, n)) + sg_local_id;
+            int col_idx = n_offset + get<0>(rC_2d(m, n));
+            // col must be in [row + offset - window_left, row + offset + window_right]
+            // where offset = seqlen_k - seqlen_q
+            int adjusted_row = row_idx + seqlen_k_minus_seqlen_q;
+            bool left_mask = (window_size_left >= 0) && (col_idx < adjusted_row - window_size_left);
+            bool right_mask = (window_size_right >= 0) && (col_idx > adjusted_row + window_size_right);
+            if (left_mask || right_mask) {
                 tensor(m, n) = -INFINITY;
             }
         }
@@ -353,6 +386,7 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
     constexpr int kNSGs = Trait::kNSGs;
     constexpr int SubgroupSize = Trait::SubgroupSize;
     constexpr bool is_causal = Trait::is_causal;
+    constexpr bool is_local = Trait::is_local;
     
     auto sg = compat::get_nd_item<1>().get_sub_group();
     auto group = compat::get_nd_item<1>().get_group();
@@ -482,6 +516,12 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
                 apply_mask_causal(scores, taccScS_rt, m_block * kBlockM, n_block * kBlockN, 
                                   param.seq_len_kv - param.seq_len_q);
             }
+            
+            if constexpr(is_local) {
+                apply_mask_local(scores, taccScS_rt, m_block * kBlockM, n_block * kBlockN,
+                                 param.window_size_left, param.window_size_right,
+                                 param.seq_len_kv - param.seq_len_q);
+            }
 
             // P = softmax(S, lse)
             scale_apply_exp2(scores, mLSE, taccScS_rt, param.scale_softmax_log2);
@@ -566,13 +606,17 @@ compute_o_dot_do(T &trait, BwdParam<typename T::DType> &param,
     
     using ThreadLayout = Layout<Shape<Int<kNSGs>, Int<SubgroupSize>>,
                                 Stride<Int<SubgroupSize>, _1>>;
+    // Must ensure AlignedArray size results in power-of-2 alignment
     using ValueLayout = std::conditional_t<
         kHeadDim == 96,
         Layout<Shape<_1, _2>>,
         std::conditional_t<
-            kHeadDim == 192,
-            Layout<Shape<_1, _4>>,
-            Layout<Shape<_1, Int<kHeadDim / SubgroupSize>>>>>;
+            kHeadDim == 160,
+            Layout<Shape<_1, _2>>,
+            std::conditional_t<
+                kHeadDim == 192,
+                Layout<Shape<_1, _4>>,
+                Layout<Shape<_1, Int<kHeadDim / SubgroupSize>>>>>>;
     using OdOType = cutlass::AlignedArray<DType, size(ValueLayout{})>;
     using OdOAtom = Copy_Atom<UniversalCopy<OdOType>, DType>;
     using dQType = cutlass::AlignedArray<VType, size(ValueLayout{})>;
@@ -810,6 +854,9 @@ struct BwdKernelLauncher {
         param.tail_m = tail_m;
         param.seq_len_kv_pad = args.seqlen_k_rounded;
         param.seq_len_q_pad = args.seqlen_q_rounded;
+        param.window_size_left = args.window_size_left;
+        param.window_size_right = args.window_size_right;
+        param.is_local = args.is_local;
         
         // Setup strides (BSHD layout - batch, seq, head, dim)
         setup_bshd_stride_bwd(param);
@@ -873,7 +920,7 @@ template <
 struct FMHABwdConfig {
     using DType = ElementQ;
 
-    template <bool Causal>
+    template <bool Causal, bool Local>
     static void run(sycl::queue& queue, const fmha_bwd_args_t& args) {
         using FABwdKernelType = FABwdKernel<
             DType,
@@ -884,7 +931,8 @@ struct FMHABwdConfig {
             bwd_policy::AtomLayoutMSdP,
             bwd_policy::AtomLayoutNdKV,
             bwd_policy::AtomLayoutMdQ,
-            Causal>;
+            Causal,
+            Local>;
 
         BwdKernelLauncher<FABwdKernelType> launcher;
         launcher.run(queue, args);
@@ -906,7 +954,7 @@ struct FMHABwdConfig {
 };
 
 // bwd_policy_dispatch - similar to policy_dispatch in fmha_fwd_impl.hpp
-template <typename bwd_policy, int IsCausal = -1>
+template <typename bwd_policy, int IsCausal = -1, int IsLocal = -1>
 void bwd_policy_dispatch(sycl::queue& queue, BwdCutlassType cuType, const fmha_bwd_args_t& args) {
     if (cuType == BwdCutlassType::half) {
         using Config = FMHABwdConfig<
@@ -915,10 +963,10 @@ void bwd_policy_dispatch(sycl::queue& queue, BwdCutlassType cuType, const fmha_b
             cute::half_t,
             cute::half_t,
             cute::half_t>;
-        if constexpr (IsCausal != -1) {
-            return Config::template kernel_dispatch<IsCausal>(queue, args);
+        if constexpr (IsCausal != -1 && IsLocal != -1) {
+            return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
         } else {
-            return Config::kernel_dispatch(queue, args, args.is_causal);
+            return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
         }
     } else {
         using Config = FMHABwdConfig<
@@ -927,10 +975,10 @@ void bwd_policy_dispatch(sycl::queue& queue, BwdCutlassType cuType, const fmha_b
             cute::bfloat16_t,
             cute::bfloat16_t,
             cute::bfloat16_t>;
-        if constexpr (IsCausal != -1) {
-            return Config::template kernel_dispatch<IsCausal>(queue, args);
+        if constexpr (IsCausal != -1 && IsLocal != -1) {
+            return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
         } else {
-            return Config::kernel_dispatch(queue, args, args.is_causal);
+            return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
         }
     }
 }

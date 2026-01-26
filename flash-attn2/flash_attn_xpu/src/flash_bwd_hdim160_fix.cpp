@@ -1,9 +1,9 @@
 #include "fmha_bwd_impl.hpp"
 
-// Fixed mode backward for head_dim=256
+// Fixed mode backward for head_dim=160
 // IsCausal=0 (non-causal), IsLocal=0 (non-local)
 template void bwd_policy_dispatch<
-    bwd_policy_head256, 
+    bwd_policy_head160, 
     0, 0>(
     sycl::queue& queue, 
     BwdCutlassType cuType, 
@@ -11,7 +11,7 @@ template void bwd_policy_dispatch<
 
 // IsCausal=0 (non-causal), IsLocal=1 (local)
 template void bwd_policy_dispatch<
-    bwd_policy_head256, 
+    bwd_policy_head160, 
     0, 1>(
     sycl::queue& queue, 
     BwdCutlassType cuType, 
@@ -19,7 +19,7 @@ template void bwd_policy_dispatch<
 
 // IsCausal=1 (causal), IsLocal=0 (non-local)
 template void bwd_policy_dispatch<
-    bwd_policy_head256, 
+    bwd_policy_head160, 
     1, 0>(
     sycl::queue& queue, 
     BwdCutlassType cuType, 
@@ -27,7 +27,7 @@ template void bwd_policy_dispatch<
 
 // IsCausal=1 (causal), IsLocal=1 (local)
 template void bwd_policy_dispatch<
-    bwd_policy_head256, 
+    bwd_policy_head160, 
     1, 1>(
     sycl::queue& queue, 
     BwdCutlassType cuType, 

@@ -37,8 +37,13 @@ struct fmha_bwd_args_t {
 
   // Flags
   bool is_causal = false;
+  bool is_local = false;
   bool is_bf16 = false;
   bool deterministic = false;
+
+  // Window size for local attention
+  int window_size_left = -1;
+  int window_size_right = -1;
 };
 
 enum class BwdCutlassType {
@@ -49,6 +54,16 @@ enum class BwdCutlassType {
 constexpr int PipelineStages_Bwd = 1;
 
 // Block configuration for backward pass
+struct bwd_policy_head32 {
+  static constexpr int kBlockM = 64;
+  static constexpr int kBlockN = 32;
+  static constexpr int kHeadDim = 32;
+  static constexpr int kNSGs = 8;
+  static constexpr int AtomLayoutMSdP = 4;
+  static constexpr int AtomLayoutNdKV = 2;
+  static constexpr int AtomLayoutMdQ = 2;
+};
+
 struct bwd_policy_head64 {
   static constexpr int kBlockM = 64;
   static constexpr int kBlockN = 32;
@@ -79,6 +94,16 @@ struct bwd_policy_head128 {
   static constexpr int AtomLayoutMdQ = 4;
 };
 
+struct bwd_policy_head160 {
+  static constexpr int kBlockM = 64;
+  static constexpr int kBlockN = 32;
+  static constexpr int kHeadDim = 160;
+  static constexpr int kNSGs = 8;
+  static constexpr int AtomLayoutMSdP = 4;
+  static constexpr int AtomLayoutNdKV = 2;
+  static constexpr int AtomLayoutMdQ = 2;
+};
+
 struct bwd_policy_head192 {
   static constexpr int kBlockM = 64;
   static constexpr int kBlockN = 32;
@@ -98,4 +123,3 @@ struct bwd_policy_head256 {
   static constexpr int AtomLayoutNdKV = 2;
   static constexpr int AtomLayoutMdQ = 2;
 };
-

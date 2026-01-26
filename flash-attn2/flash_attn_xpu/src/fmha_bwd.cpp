@@ -31,7 +31,10 @@ void cutlass_fmha_bwd_fix_impl(
     at::Tensor& dv,
     at::Tensor& softmax_d,
     float sm_scale,
-    bool is_causal) {
+    int window_size_left,
+    int window_size_right,
+    bool is_causal,
+    bool is_local) {
 
     // Get dimensions from tensors - assuming BSHD layout (batch, seq, head, dim)
     int batch_size = q.size(0);
@@ -43,8 +46,8 @@ void cutlass_fmha_bwd_fix_impl(
     int num_heads_k = k.size(2);
 
     // Round up sequence lengths for internal buffers
-    int seqlen_q_rounded = round_multiple(seqlen_q, 128);
-    int seqlen_k_rounded = round_multiple(seqlen_k, 128);
+    int seqlen_q_rounded = round_multiple(seqlen_q, 64);
+    int seqlen_k_rounded = round_multiple(seqlen_k, 64);
 
     // Allocate dq_accum buffer (float)
     auto dq_accum = at::zeros({batch_size, seqlen_q_rounded, num_heads_q, head_size}, 
@@ -73,51 +76,95 @@ void cutlass_fmha_bwd_fix_impl(
         seqlen_k_rounded,
         sm_scale,
         is_causal,
+        is_local,
         q.scalar_type() == at::ScalarType::BFloat16,
-        false  // deterministic
+        false,  // deterministic
+        window_size_left,
+        window_size_right
     };
 
     BwdCutlassType cuType = aten_to_Bwd_Cutlass_dtype(q);
     const int h = args.head_size;
 
-    // Dispatch based on head size and causal mode
-    if (h <= 64) {
-        if (is_causal) {
-            bwd_policy_dispatch<bwd_policy_head64, 1>(queue, cuType, args);
+    // Dispatch based on head size, causal mode, and local mode
+    if (h <= 32) {
+        if (is_causal && is_local) {
+            bwd_policy_dispatch<bwd_policy_head32, 1, 1>(queue, cuType, args);
+        } else if (is_causal) {
+            bwd_policy_dispatch<bwd_policy_head32, 1, 0>(queue, cuType, args);
+        } else if (is_local) {
+            bwd_policy_dispatch<bwd_policy_head32, 0, 1>(queue, cuType, args);
         } else {
-            bwd_policy_dispatch<bwd_policy_head64, 0>(queue, cuType, args);
+            bwd_policy_dispatch<bwd_policy_head32, 0, 0>(queue, cuType, args);
         }
     }
-    // else if (h <= 96) {
-    //     if (is_causal) {
-    //         bwd_policy_dispatch<bwd_policy_head96, 1>(queue, cuType, args);
+    // else if (h <= 64) {
+    //     if (is_causal && is_local) {
+    //         bwd_policy_dispatch<bwd_policy_head64, 1, 1>(queue, cuType, args);
+    //     } else if (is_causal) {
+    //         bwd_policy_dispatch<bwd_policy_head64, 1, 0>(queue, cuType, args);
+    //     } else if (is_local) {
+    //         bwd_policy_dispatch<bwd_policy_head64, 0, 1>(queue, cuType, args);
     //     } else {
-    //         bwd_policy_dispatch<bwd_policy_head96, 0>(queue, cuType, args);
+    //         bwd_policy_dispatch<bwd_policy_head64, 0, 0>(queue, cuType, args);
+    //     }
+    // }
+    // else if (h <= 96) {
+    //     if (is_causal && is_local) {
+    //         bwd_policy_dispatch<bwd_policy_head96, 1, 1>(queue, cuType, args);
+    //     } else if (is_causal) {
+    //         bwd_policy_dispatch<bwd_policy_head96, 1, 0>(queue, cuType, args);
+    //     } else if (is_local) {
+    //         bwd_policy_dispatch<bwd_policy_head96, 0, 1>(queue, cuType, args);
+    //     } else {
+    //         bwd_policy_dispatch<bwd_policy_head96, 0, 0>(queue, cuType, args);
     //     }
     // }
     // else if (h <= 128) {
-    //     if (is_causal) {
-    //         bwd_policy_dispatch<bwd_policy_head128, 1>(queue, cuType, args);
+    //     if (is_causal && is_local) {
+    //         bwd_policy_dispatch<bwd_policy_head128, 1, 1>(queue, cuType, args);
+    //     } else if (is_causal) {
+    //         bwd_policy_dispatch<bwd_policy_head128, 1, 0>(queue, cuType, args);
+    //     } else if (is_local) {
+    //         bwd_policy_dispatch<bwd_policy_head128, 0, 1>(queue, cuType, args);
     //     } else {
-    //         bwd_policy_dispatch<bwd_policy_head128, 0>(queue, cuType, args);
+    //         bwd_policy_dispatch<bwd_policy_head128, 0, 0>(queue, cuType, args);
     //     }
     // }
-    // else if (h <= 192) {
-    //     if (is_causal) {
-    //         bwd_policy_dispatch<bwd_policy_head192, 1>(queue, cuType, args);
+    // else if (h <= 160) {
+    //     if (is_causal && is_local) {
+    //         bwd_policy_dispatch<bwd_policy_head160, 1, 1>(queue, cuType, args);
+    //     } else if (is_causal) {
+    //         bwd_policy_dispatch<bwd_policy_head160, 1, 0>(queue, cuType, args);
+    //     } else if (is_local) {
+    //         bwd_policy_dispatch<bwd_policy_head160, 0, 1>(queue, cuType, args);
     //     } else {
-    //         bwd_policy_dispatch<bwd_policy_head192, 0>(queue, cuType, args);
+    //         bwd_policy_dispatch<bwd_policy_head160, 0, 0>(queue, cuType, args);
+    //     }
+    // }
+    // if (h <= 192) {
+    //     if (is_causal && is_local) {
+    //         bwd_policy_dispatch<bwd_policy_head192, 1, 1>(queue, cuType, args);
+    //     } else if (is_causal) {
+    //         bwd_policy_dispatch<bwd_policy_head192, 1, 0>(queue, cuType, args);
+    //     } else if (is_local) {
+    //         bwd_policy_dispatch<bwd_policy_head192, 0, 1>(queue, cuType, args);
+    //     } else {
+    //         bwd_policy_dispatch<bwd_policy_head192, 0, 0>(queue, cuType, args);
     //     }
     // }
     // else if (h <= 256) {
-    //     if (is_causal) {
-    //         bwd_policy_dispatch<bwd_policy_head256, 1>(queue, cuType, args);
+    //     if (is_causal && is_local) {
+    //         bwd_policy_dispatch<bwd_policy_head256, 1, 1>(queue, cuType, args);
+    //     } else if (is_causal) {
+    //         bwd_policy_dispatch<bwd_policy_head256, 1, 0>(queue, cuType, args);
+    //     } else if (is_local) {
+    //         bwd_policy_dispatch<bwd_policy_head256, 0, 1>(queue, cuType, args);
     //     } else {
-    //         bwd_policy_dispatch<bwd_policy_head256, 0>(queue, cuType, args);
+    //         bwd_policy_dispatch<bwd_policy_head256, 0, 0>(queue, cuType, args);
     //     }
     // }
     else {
-        // throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
-        throw std::runtime_error("Bwd error !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
     }
 }

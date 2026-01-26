@@ -213,12 +213,12 @@ void cutlass_fmha_fwd_fix_impl(
   const int h = args.head_size;
 
   if (max_seqlen_q == 1) {
-    // if (h <= 32) {
-    //   policy_dispatch<decode_policy_head32, PipelineStages_Decode, 0, 0>(queue, cuType, args);
-    // }
-    if (h <= 64) {
-      policy_dispatch<decode_policy_head64, PipelineStages_Decode, 0, 0>(queue, cuType, args);
+    if (h <= 32) {
+      policy_dispatch<decode_policy_head32, PipelineStages_Decode, 0, 0>(queue, cuType, args);
     }
+    // else if (h <= 64) {
+    //   policy_dispatch<decode_policy_head64, PipelineStages_Decode, 0, 0>(queue, cuType, args);
+    // }
     // else if (h <= 96) {
     //   policy_dispatch<decode_policy_head96, PipelineStages_Decode, 0, 0>(queue, cuType, args);
     // }
@@ -238,12 +238,12 @@ void cutlass_fmha_fwd_fix_impl(
       throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
     }
   } else {
-    // if (h <= 32) {
-    //   policy_dispatch<prefill_policy_head32, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
-    // }
-    if (h <= 64) {
-      policy_dispatch<prefill_policy_head64, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
+    if (h <= 32) {
+      policy_dispatch<prefill_policy_head32, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
     }
+    // else if (h <= 64) {
+    //   policy_dispatch<prefill_policy_head64, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
+    // }
     // else if (h <= 96) {
     //   policy_dispatch<prefill_policy_head96, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
     // }

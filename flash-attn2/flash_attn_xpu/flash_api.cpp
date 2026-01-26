@@ -179,106 +179,135 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads x head_siz
     const int batch_size = sizes[0];
     const int seqlen_q = sizes[1];
     const int num_heads = sizes[2];
-    const int head_size = sizes[3];
+    const int head_size_og = sizes[3];
     const int seqlen_k = k_contig.size(1);
     const int num_heads_k = k_contig.size(2);
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
-    TORCH_CHECK(head_size <= 256, "FlashAttention backward only supports head dimension at most 256");
+    TORCH_CHECK(head_size_og % 8 == 0, "head_size should be a multiple of 8");
+    TORCH_CHECK(head_size_og <= 256, "FlashAttention backward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
-    // Compute rounded dimensions
-    auto round_mult = [](int x, int m) { return (x + m - 1) / m * m; };
-    const int seqlen_q_rounded = round_mult(seqlen_q, 128);
+    // XPU requires head_size to be a multiple of 32
+    const int head_size_padded = round_multiple(head_size_og, 32);
+    const bool needs_padding = (head_size_og != head_size_padded);
 
-    // Allocate output gradients - always allocate contiguous tensors
-    // We'll copy back to non-contiguous dq_, dk_, dv_ if needed
-    at::Tensor dq, dk, dv;
-    at::Tensor dq_orig, dk_orig, dv_orig;  // Original (possibly non-contiguous) tensors
-    bool dq_needs_copy = false, dk_needs_copy = false, dv_needs_copy = false;
+    at::Tensor q_padded, k_padded, v_padded, out_padded, dout_padded;
 
-    if (dq_.has_value()) {
-        dq_orig = dq_.value();
-        TORCH_CHECK(dq_orig.dtype() == q_dtype, "dq must have the same dtype as q");
-        CHECK_DEVICE(dq_orig);
-        if (dq_orig.is_contiguous()) {
-            dq = dq_orig;
-        } else {
-            dq = torch::empty_like(q_contig);
-            dq_needs_copy = true;
-        }
+    // Apply padding only if needed
+    if (needs_padding) {
+        const int pad_size = head_size_padded - head_size_og;
+        q_padded = torch::nn::functional::pad(q_contig, torch::nn::functional::PadFuncOptions({0, pad_size}));
+        k_padded = torch::nn::functional::pad(k_contig, torch::nn::functional::PadFuncOptions({0, pad_size}));
+        v_padded = torch::nn::functional::pad(v_contig, torch::nn::functional::PadFuncOptions({0, pad_size}));
+        out_padded = torch::nn::functional::pad(out_contig, torch::nn::functional::PadFuncOptions({0, pad_size}));
+        dout_padded = torch::nn::functional::pad(dout_contig, torch::nn::functional::PadFuncOptions({0, pad_size}));
     } else {
-        dq = torch::empty_like(q_contig);
-    }
-    if (dk_.has_value()) {
-        dk_orig = dk_.value();
-        TORCH_CHECK(dk_orig.dtype() == q_dtype, "dk must have the same dtype as q");
-        CHECK_DEVICE(dk_orig);
-        if (dk_orig.is_contiguous()) {
-            dk = dk_orig;
-        } else {
-            dk = torch::empty_like(k_contig);
-            dk_needs_copy = true;
-        }
-    } else {
-        dk = torch::empty_like(k_contig);
-    }
-    if (dv_.has_value()) {
-        dv_orig = dv_.value();
-        TORCH_CHECK(dv_orig.dtype() == q_dtype, "dv must have the same dtype as q");
-        CHECK_DEVICE(dv_orig);
-        if (dv_orig.is_contiguous()) {
-            dv = dv_orig;
-        } else {
-            dv = torch::empty_like(v_contig);
-            dv_needs_copy = true;
-        }
-    } else {
-        dv = torch::empty_like(v_contig);
+        // No padding needed, reuse contiguous tensors directly
+        q_padded = q_contig;
+        k_padded = k_contig;
+        v_padded = v_contig;
+        out_padded = out_contig;
+        dout_padded = dout_contig;
     }
 
     auto opts = q_contig.options();
+
+    // Allocate output gradients
+    // When no padding needed and user provides contiguous tensors, reuse them directly
+    at::Tensor dq, dk, dv;
+    at::Tensor dq_work, dk_work, dv_work;  // Working tensors for kernel
+    bool dq_needs_copy = false, dk_needs_copy = false, dv_needs_copy = false;
+
+    if (!needs_padding && num_heads_k == num_heads) {
+        // Optimal path: no padding, no MQA/GQA - can write directly to output
+        if (dq_.has_value() && dq_.value().is_contiguous()) {
+            dq_work = dq_.value();
+        } else {
+            dq_work = torch::empty({batch_size, seqlen_q, num_heads, head_size_og}, opts);
+            if (dq_.has_value()) dq_needs_copy = true;
+        }
+        if (dk_.has_value() && dk_.value().is_contiguous()) {
+            dk_work = dk_.value();
+        } else {
+            dk_work = torch::empty({batch_size, seqlen_k, num_heads_k, head_size_og}, opts);
+            if (dk_.has_value()) dk_needs_copy = true;
+        }
+        if (dv_.has_value() && dv_.value().is_contiguous()) {
+            dv_work = dv_.value();
+        } else {
+            dv_work = torch::empty({batch_size, seqlen_k, num_heads_k, head_size_og}, opts);
+            if (dv_.has_value()) dv_needs_copy = true;
+        }
+    } else {
+        // Need padding or MQA/GQA - allocate with padded size
+        dq_work = torch::empty({batch_size, seqlen_q, num_heads, head_size_padded}, opts);
+        dk_work = torch::empty({batch_size, seqlen_k, num_heads_k, head_size_padded}, opts);
+        dv_work = torch::empty({batch_size, seqlen_k, num_heads_k, head_size_padded}, opts);
+    }
+
     // Allocate intermediate buffers
-    at::Tensor softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
+    at::Tensor softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
 
     // Handle MQA/GQA
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {
-        dk_expanded = torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts);
-        dv_expanded = torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts);
+        dk_expanded = torch::empty({batch_size, seqlen_k, num_heads, head_size_padded}, opts);
+        dv_expanded = torch::empty({batch_size, seqlen_k, num_heads, head_size_padded}, opts);
     } else {
-        dk_expanded = dk;
-        dv_expanded = dv;
+        dk_expanded = dk_work;
+        dv_expanded = dv_work;
     }
+
+    bool is_local = (window_size_left != -1) | (window_size_right != -1);
 
     auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
 
     // Call the cutlass backward implementation
     cutlass_fmha_bwd_fix_impl(
         queue,
-        dout_contig, q_contig, k_contig, v_contig, out_contig, softmax_lse,
-        dq, dk_expanded, dv_expanded, softmax_d,
-        softmax_scale, is_causal);
+        dout_padded, q_padded, k_padded, v_padded, out_padded, softmax_lse,
+        dq_work, dk_expanded, dv_expanded, softmax_d,
+        softmax_scale, window_size_left, window_size_right, is_causal, is_local);
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
-        at::sum_out(dk, at::reshape(dk_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
-        at::sum_out(dv, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
+        at::sum_out(dk_work, at::reshape(dk_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size_padded}), {3});
+        at::sum_out(dv_work, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size_padded}), {3});
     }
 
-    // Copy results back to original non-contiguous tensors if needed
-    if (dq_needs_copy) {
-        dq_orig.copy_(dq);
-        dq = dq_orig;
-    }
-    if (dk_needs_copy) {
-        dk_orig.copy_(dk);
-        dk = dk_orig;
-    }
-    if (dv_needs_copy) {
-        dv_orig.copy_(dv);
-        dv = dv_orig;
+    // Remove padding from output gradients if needed
+    if (needs_padding) {
+        dq = dq_work.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                           torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)}).contiguous();
+        dk = dk_work.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                           torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)}).contiguous();
+        dv = dv_work.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                           torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)}).contiguous();
+        // Copy to user tensors if provided
+        if (dq_.has_value()) dq_.value().copy_(dq);
+        if (dk_.has_value()) dk_.value().copy_(dk);
+        if (dv_.has_value()) dv_.value().copy_(dv);
+    } else if (num_heads_k != num_heads) {
+        // MQA/GQA without padding: need to slice and copy
+        dq = dq_work.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                           torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)}).contiguous();
+        dk = dk_work.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                           torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)}).contiguous();
+        dv = dv_work.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                           torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)}).contiguous();
+        if (dq_.has_value()) dq_.value().copy_(dq);
+        if (dk_.has_value()) dk_.value().copy_(dk);
+        if (dv_.has_value()) dv_.value().copy_(dv);
+    } else {
+        // Optimal path: no padding, no MQA/GQA - results already in place
+        dq = dq_work;
+        dk = dk_work;
+        dv = dv_work;
+        // Copy to non-contiguous user tensors if needed
+        if (dq_needs_copy) dq_.value().copy_(dq);
+        if (dk_needs_copy) dk_.value().copy_(dk);
+        if (dv_needs_copy) dv_.value().copy_(dv);
     }
 
     return {dq, dk, dv, softmax_d};
