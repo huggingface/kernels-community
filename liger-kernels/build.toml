@@ -1,9 +1,7 @@
 [general]
 name = "liger_kernels"
 backends = [
-    "cpu",
     "cuda",
-    "metal",
     "rocm",
     "xpu",
 ]
