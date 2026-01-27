@@ -33,6 +33,8 @@ inline at::Tensor silu_activation(const at::Tensor& x) {
 //   w2: [E, N, K] - down projection (after convert_weight_packed)
 //   topk_weights: [M, topk]
 //   topk_ids: [M, topk]
+//   w1_bias: optional [E, 2N] - bias for gate and up projections
+//   w2_bias: optional [E, K] - bias for down projection
 //   inplace: whether to use hidden_states as output
 at::Tensor fused_experts(
     at::Tensor& hidden_states,
@@ -40,6 +42,8 @@ at::Tensor fused_experts(
     at::Tensor& w2,
     at::Tensor& topk_weights,
     at::Tensor& topk_ids,
+    const std::optional<at::Tensor>& w1_bias,
+    const std::optional<at::Tensor>& w2_bias,
     bool inplace);
 
 // Shared expert using pure PyTorch operations
@@ -70,6 +74,8 @@ at::Tensor shared_expert(
 //   topk_ids: [M, topk]
 //   w1_scale: [E, N*2, K/32] - scales for w1
 //   w2_scale: [E, K, N/32] - scales for w2
+//   w1_bias: optional [E, 2N] - bias for gate and up projections
+//   w2_bias: optional [E, K] - bias for down projection
 //   block_size: block size for quantization (typically 32)
 //   inplace: whether to use hidden_states as output
 at::Tensor fused_experts_mxfp4(
@@ -80,6 +86,8 @@ at::Tensor fused_experts_mxfp4(
     at::Tensor& topk_ids,
     const at::Tensor& w1_scale,
     const at::Tensor& w2_scale,
+    const std::optional<at::Tensor>& w1_bias,
+    const std::optional<at::Tensor>& w2_bias,
     int64_t block_size,
     bool inplace);
 

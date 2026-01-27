@@ -21,12 +21,16 @@ at::Tensor fused_experts(
     at::Tensor& w2,
     at::Tensor& topk_weights,
     at::Tensor& topk_ids,
+    const std::optional<at::Tensor>& w1_bias,
+    const std::optional<at::Tensor>& w2_bias,
     bool inplace) {
   // hidden_states: [M, K]
   // w1: [E, K, 2N] - gate and up projections (after convert_weight_packed transpose)
   // w2: [E, N, K] - down projection (after convert_weight_packed transpose)
   // topk_weights: [M, topk]
   // topk_ids: [M, topk]
+  // w1_bias: optional [E, 2N] - bias for gate and up projections
+  // w2_bias: optional [E, K] - bias for down projection
 
   int64_t M = hidden_states.size(0);
   int64_t K = hidden_states.size(1);
@@ -67,6 +71,11 @@ at::Tensor fused_experts(
     // First projection: [num_selected, K] @ [K, 2N] -> [num_selected, 2N]
     auto gate_up = torch::mm(current_hidden, expert_w1);
     
+    // Add w1 bias if present
+    if (w1_bias.has_value()) {
+      gate_up = gate_up + w1_bias.value()[expert_idx];
+    }
+    
     // Split gate and up (interleaved layout: [g0, u0, g1, u1, ...])
     // This matches GptOss's gate_up_proj layout
     auto gate = gate_up.index({torch::indexing::Slice(), torch::indexing::Slice(0, torch::indexing::None, 2)});  // [num_selected, N]
@@ -77,6 +86,11 @@ at::Tensor fused_experts(
     
     // Second projection: [num_selected, N] @ [N, K] -> [num_selected, K]
     auto expert_out = torch::mm(activated, expert_w2);
+    
+    // Add w2 bias if present
+    if (w2_bias.has_value()) {
+      expert_out = expert_out + w2_bias.value()[expert_idx];
+    }
     
     // Apply routing weights: [num_selected]
     auto weights = topk_weights.index({token_indices, topk_positions}).unsqueeze(1);
@@ -215,6 +229,8 @@ at::Tensor fused_experts_mxfp4(
     at::Tensor& topk_ids,
     const at::Tensor& w1_scale,
     const at::Tensor& w2_scale,
+    const std::optional<at::Tensor>& w1_bias,
+    const std::optional<at::Tensor>& w2_bias,
     int64_t block_size,
     bool inplace) {
   // hidden_states: [M, K]
@@ -222,6 +238,8 @@ at::Tensor fused_experts_mxfp4(
   // w2: [E, K, N/2] - packed mxfp4 (down projection)
   // w1_scale: [E, N*2, K/block_size]
   // w2_scale: [E, K, N/block_size]
+  // w1_bias: optional [E, 2N] - bias for gate and up projections
+  // w2_bias: optional [E, K] - bias for down projection
 
   int64_t M = hidden_states.size(0);
   int64_t K = hidden_states.size(1);
@@ -278,6 +296,11 @@ at::Tensor fused_experts_mxfp4(
     // First projection: [num_selected, K] @ [K, 2N] -> [num_selected, 2N]
     auto gate_up = torch::mm(current_hidden, expert_w1.t());
     
+    // Add w1 bias if present
+    if (w1_bias.has_value()) {
+      gate_up = gate_up + w1_bias.value()[expert_idx].to(at::kFloat);
+    }
+    
     // Split and activate (interleaved layout: [g0, u0, g1, u1, ...])
     // This matches GptOss's gate_up_proj layout
     auto gate = gate_up.index({torch::indexing::Slice(), torch::indexing::Slice(0, torch::indexing::None, 2)});  // [num_selected, N]
@@ -302,6 +325,11 @@ at::Tensor fused_experts_mxfp4(
     
     // Second projection: [num_selected, N] @ [N, K] -> [num_selected, K]
     auto expert_out = torch::mm(activated, expert_w2.t());
+    
+    // Add w2 bias if present
+    if (w2_bias.has_value()) {
+      expert_out = expert_out + w2_bias.value()[expert_idx].to(at::kFloat);
+    }
     
     // Apply routing weights and accumulate
     auto weights = topk_weights.index({token_indices, topk_positions}).unsqueeze(1);

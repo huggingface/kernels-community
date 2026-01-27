@@ -66,11 +66,11 @@ at::Tensor fused_experts(
       
       return fallback::fused_experts_mxfp4(
           hidden_states, w1, w2, topk_weights, topk_ids,
-          w1_scale.value(), w2_scale.value(), bs, inplace);
+          w1_scale.value(), w2_scale.value(), w1_bias, w2_bias, bs, inplace);
     }
 
     return fallback::fused_experts(
-        hidden_states, w1, w2, topk_weights, topk_ids, inplace);
+        hidden_states, w1, w2, topk_weights, topk_ids, w1_bias, w2_bias, inplace);
   }
 }
 
