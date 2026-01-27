@@ -53,6 +53,10 @@ at::Tensor fused_experts(
         "Quantized MoE (int8/fp8) requires AVX512 and AVX512-BF16 support. "
         "Your CPU does not support these features. Please use non-quantized weights or MXFP4.");
 
+    // Get alpha and limit values (default to swigluoai defaults)
+    float alpha_val = alpha.has_value() ? static_cast<float>(alpha.value()) : 1.702f;
+    float limit_val = limit.has_value() ? static_cast<float>(limit.value()) : 7.0f;
+
     if (use_mxfp4) {
       // Use MXFP4 fallback implementation
       TORCH_CHECK(w1_scale.has_value() && w2_scale.has_value(),
@@ -66,11 +70,13 @@ at::Tensor fused_experts(
       
       return fallback::fused_experts_mxfp4(
           hidden_states, w1, w2, topk_weights, topk_ids,
-          w1_scale.value(), w2_scale.value(), w1_bias, w2_bias, bs, inplace);
+          w1_scale.value(), w2_scale.value(), w1_bias, w2_bias, bs,
+          alpha_val, limit_val, inplace);
     }
 
     return fallback::fused_experts(
-        hidden_states, w1, w2, topk_weights, topk_ids, w1_bias, w2_bias, inplace);
+        hidden_states, w1, w2, topk_weights, topk_ids, w1_bias, w2_bias,
+        alpha_val, limit_val, inplace);
   }
 }
 

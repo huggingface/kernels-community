@@ -24,6 +24,20 @@ inline at::Tensor silu_activation(const at::Tensor& x) {
   return x * torch::sigmoid(x);
 }
 
+// SwigluOAI activation function used in GptOss models
+// Formula:
+//   gate = clamp(gate, max=limit)
+//   up = clamp(up, -limit, limit)
+//   glu = gate * sigmoid(gate * alpha)
+//   output = (up + 1) * glu
+inline at::Tensor swigluoai_activation(const at::Tensor& gate, const at::Tensor& up,
+                                       float alpha = 1.702f, float limit = 7.0f) {
+  auto gate_clamped = gate.clamp(-std::numeric_limits<float>::infinity(), limit);
+  auto up_clamped = up.clamp(-limit, limit);
+  auto glu = gate_clamped * torch::sigmoid(gate_clamped * alpha);
+  return (up_clamped + 1.0f) * glu;
+}
+
 // Fused experts using pure PyTorch operations
 // Only supports non-quantized bf16/fp16 weights
 //
@@ -35,6 +49,8 @@ inline at::Tensor silu_activation(const at::Tensor& x) {
 //   topk_ids: [M, topk]
 //   w1_bias: optional [E, 2N] - bias for gate and up projections
 //   w2_bias: optional [E, K] - bias for down projection
+//   alpha: swigluoai alpha parameter (default 1.702)
+//   limit: swigluoai limit parameter (default 7.0)
 //   inplace: whether to use hidden_states as output
 at::Tensor fused_experts(
     at::Tensor& hidden_states,
@@ -44,6 +60,8 @@ at::Tensor fused_experts(
     at::Tensor& topk_ids,
     const std::optional<at::Tensor>& w1_bias,
     const std::optional<at::Tensor>& w2_bias,
+    float alpha,
+    float limit,
     bool inplace);
 
 // Shared expert using pure PyTorch operations
@@ -77,6 +95,8 @@ at::Tensor shared_expert(
 //   w1_bias: optional [E, 2N] - bias for gate and up projections
 //   w2_bias: optional [E, K] - bias for down projection
 //   block_size: block size for quantization (typically 32)
+//   alpha: swigluoai alpha parameter (default 1.702)
+//   limit: swigluoai limit parameter (default 7.0)
 //   inplace: whether to use hidden_states as output
 at::Tensor fused_experts_mxfp4(
     at::Tensor& hidden_states,
@@ -89,6 +109,8 @@ at::Tensor fused_experts_mxfp4(
     const std::optional<at::Tensor>& w1_bias,
     const std::optional<at::Tensor>& w2_bias,
     int64_t block_size,
+    float alpha,
+    float limit,
     bool inplace);
 
 // Dequantize MXFP4 tensor to float

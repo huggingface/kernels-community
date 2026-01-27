@@ -23,6 +23,8 @@ at::Tensor fused_experts(
     at::Tensor& topk_ids,
     const std::optional<at::Tensor>& w1_bias,
     const std::optional<at::Tensor>& w2_bias,
+    float alpha,
+    float limit,
     bool inplace) {
   // hidden_states: [M, K]
   // w1: [E, K, 2N] - gate and up projections (after convert_weight_packed transpose)
@@ -81,8 +83,8 @@ at::Tensor fused_experts(
     auto gate = gate_up.index({torch::indexing::Slice(), torch::indexing::Slice(0, torch::indexing::None, 2)});  // [num_selected, N]
     auto up = gate_up.index({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None, 2)});    // [num_selected, N]
     
-    // SiLU activation
-    auto activated = torch::silu(gate) * up;  // [num_selected, N]
+    // SwigluOAI activation
+    auto activated = swigluoai_activation(gate, up, alpha, limit);  // [num_selected, N]
     
     // Second projection: [num_selected, N] @ [N, K] -> [num_selected, K]
     auto expert_out = torch::mm(activated, expert_w2);
@@ -136,8 +138,8 @@ at::Tensor shared_expert(
   auto gate = hidden.index({torch::indexing::Slice(), torch::indexing::Slice(0, torch::indexing::None, 2)});  // [M, N]
   auto up = hidden.index({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None, 2)});    // [M, N]
 
-  // SiLU and mul
-  auto activated = silu_activation(gate) * up;  // [M, N]
+  // SwigluOAI activation (using default alpha=1.702, limit=7.0)
+  auto activated = swigluoai_activation(gate, up);  // [M, N]
 
   // Second linear: [M, N] @ [N, K] -> [M, K]
   auto expert_out = torch::matmul(activated, w2_fp32);
@@ -232,6 +234,8 @@ at::Tensor fused_experts_mxfp4(
     const std::optional<at::Tensor>& w1_bias,
     const std::optional<at::Tensor>& w2_bias,
     int64_t block_size,
+    float alpha,
+    float limit,
     bool inplace) {
   // hidden_states: [M, K]
   // w1: [E, N*2, K/2] - packed mxfp4 (gate + up projections)
@@ -305,7 +309,7 @@ at::Tensor fused_experts_mxfp4(
     // This matches GptOss's gate_up_proj layout
     auto gate = gate_up.index({torch::indexing::Slice(), torch::indexing::Slice(0, torch::indexing::None, 2)});  // [num_selected, N]
     auto up = gate_up.index({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None, 2)});    // [num_selected, N]
-    auto activated = torch::silu(gate) * up;  // [num_selected, N]
+    auto activated = swigluoai_activation(gate, up, alpha, limit);  // [num_selected, N]
     
     // Dequantize w2 for this expert: [K, N/2] -> [K, N]
     auto expert_w2_packed = w2[expert_idx];  // [K, N/2]
