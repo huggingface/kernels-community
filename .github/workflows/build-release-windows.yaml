@@ -153,7 +153,8 @@ jobs:
 
       - name: Build build2cmake
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
-        working-directory: kernels/builder/build2cmake
+        working-directory: kernels\builder\build2cmake
+        shell: pwsh
         run: cargo build
 
       - name: Build kernel
