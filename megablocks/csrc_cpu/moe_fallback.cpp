@@ -157,27 +157,6 @@ at::Tensor shared_expert(
   return output;
 }
 
-// MXFP4 E2M1 lookup table values
-// 4-bit format: 1 sign bit, 2 exponent bits, 1 mantissa bit
-static const float mxfp4_lut[16] = {
-    0.0f,   // 0b0000
-    0.5f,   // 0b0001
-    1.0f,   // 0b0010
-    1.5f,   // 0b0011
-    2.0f,   // 0b0100
-    3.0f,   // 0b0101
-    4.0f,   // 0b0110
-    6.0f,   // 0b0111
-   -0.0f,   // 0b1000
-   -0.5f,   // 0b1001
-   -1.0f,   // 0b1010
-   -1.5f,   // 0b1011
-   -2.0f,   // 0b1100
-   -3.0f,   // 0b1101
-   -4.0f,   // 0b1110
-   -6.0f,   // 0b1111
-};
-
 at::Tensor dequantize_mxfp4(
     const at::Tensor& packed_weight,
     const at::Tensor& scale,
@@ -237,18 +216,19 @@ at::Tensor fused_experts_mxfp4(
     float alpha,
     float limit,
     bool inplace) {
+  // After convert_weight_packed/convert_scale_packed transpose:
   // hidden_states: [M, K]
-  // w1: [E, N*2, K/2] - packed mxfp4 (gate + up projections)
-  // w2: [E, K, N/2] - packed mxfp4 (down projection)
-  // w1_scale: [E, N*2, K/block_size]
-  // w2_scale: [E, K, N/block_size]
+  // w1: [E, K/2, N*2] - packed mxfp4 (gate + up projections), transposed
+  // w2: [E, N/2, K] - packed mxfp4 (down projection), transposed
+  // w1_scale: [E, K/block_size, N*2] - scales for w1, transposed
+  // w2_scale: [E, N/block_size, K] - scales for w2, transposed
   // w1_bias: optional [E, 2N] - bias for gate and up projections
   // w2_bias: optional [E, K] - bias for down projection
 
   int64_t M = hidden_states.size(0);
   int64_t K = hidden_states.size(1);
   int64_t E = w1.size(0);
-  int64_t N2 = w1.size(1);  // 2N (gate + up)
+  int64_t N2 = w1.size(2);  // 2N (last dim after transpose)
   int64_t N = N2 / 2;
   int64_t topk = topk_ids.size(1);
 
@@ -280,25 +260,27 @@ at::Tensor fused_experts_mxfp4(
     // Gather input tokens: [num_selected, K]
     auto current_hidden = hidden_states.index_select(0, token_indices).to(at::kFloat);
     
-    // Dequantize w1 for this expert only: [N*2, K/2] -> [N*2, K]
-    auto expert_w1_packed = w1[expert_idx];  // [N*2, K/2]
-    auto expert_w1_scale = w1_scale[expert_idx];  // [N*2, K/block_size]
+    // Dequantize w1 for this expert only: [K/2, N*2] -> [K, N*2]
+    auto expert_w1_packed = w1[expert_idx];  // [K/2, N*2]
+    auto expert_w1_scale = w1_scale[expert_idx];  // [K/block_size, N*2]
     
     auto w1_packed_int = expert_w1_packed.to(at::kInt);
     auto w1_low = w1_packed_int.bitwise_and(0x0F);
     auto w1_high = w1_packed_int.div(16, "trunc").bitwise_and(0x0F);
     auto w1_low_f = lut.index_select(0, w1_low.flatten().to(at::kLong)).reshape(expert_w1_packed.sizes());
     auto w1_high_f = lut.index_select(0, w1_high.flatten().to(at::kLong)).reshape(expert_w1_packed.sizes());
+    // Stack along dim 0 to get [2, K/2, N*2], then permute and reshape to [K, N*2]
     std::vector<at::Tensor> w1_stack = {w1_low_f, w1_high_f};
-    auto expert_w1 = at::stack(w1_stack, -1).reshape({N2, K});
+    auto expert_w1 = at::stack(w1_stack, 0).permute({1, 0, 2}).reshape({K, N2});  // [K, N*2]
     
-    // Apply scale
+    // Apply scale: [K/block_size, N*2] -> expand to [K, N*2]
     auto w1_scale_f = at::pow(2.0f, expert_w1_scale.to(at::kFloat) - 127.0f);
-    auto w1_scale_expanded = w1_scale_f.unsqueeze(-1).expand({N2, -1, block_size}).reshape({N2, K});
+    // Each scale covers block_size elements along K dimension
+    auto w1_scale_expanded = w1_scale_f.unsqueeze(1).expand({-1, block_size, N2}).reshape({K, N2});
     expert_w1 = expert_w1 * w1_scale_expanded;
     
     // First projection: [num_selected, K] @ [K, 2N] -> [num_selected, 2N]
-    auto gate_up = torch::mm(current_hidden, expert_w1.t());
+    auto gate_up = torch::mm(current_hidden, expert_w1);
     
     // Add w1 bias if present
     if (w1_bias.has_value()) {
@@ -311,24 +293,26 @@ at::Tensor fused_experts_mxfp4(
     auto up = gate_up.index({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None, 2)});    // [num_selected, N]
     auto activated = swigluoai_activation(gate, up, alpha, limit);  // [num_selected, N]
     
-    // Dequantize w2 for this expert: [K, N/2] -> [K, N]
-    auto expert_w2_packed = w2[expert_idx];  // [K, N/2]
-    auto expert_w2_scale = w2_scale[expert_idx];  // [K, N/block_size]
+    // Dequantize w2 for this expert: [N/2, K] -> [N, K]
+    auto expert_w2_packed = w2[expert_idx];  // [N/2, K]
+    auto expert_w2_scale = w2_scale[expert_idx];  // [N/block_size, K]
     
     auto w2_packed_int = expert_w2_packed.to(at::kInt);
     auto w2_low = w2_packed_int.bitwise_and(0x0F);
     auto w2_high = w2_packed_int.div(16, "trunc").bitwise_and(0x0F);
     auto w2_low_f = lut.index_select(0, w2_low.flatten().to(at::kLong)).reshape(expert_w2_packed.sizes());
     auto w2_high_f = lut.index_select(0, w2_high.flatten().to(at::kLong)).reshape(expert_w2_packed.sizes());
+    // Stack along dim 0 to get [2, N/2, K], then permute and reshape to [N, K]
     std::vector<at::Tensor> w2_stack = {w2_low_f, w2_high_f};
-    auto expert_w2 = at::stack(w2_stack, -1).reshape({K, N});
+    auto expert_w2 = at::stack(w2_stack, 0).permute({1, 0, 2}).reshape({N, K});  // [N, K]
     
+    // Apply scale: [N/block_size, K] -> expand to [N, K]
     auto w2_scale_f = at::pow(2.0f, expert_w2_scale.to(at::kFloat) - 127.0f);
-    auto w2_scale_expanded = w2_scale_f.unsqueeze(-1).expand({K, -1, block_size}).reshape({K, N});
+    auto w2_scale_expanded = w2_scale_f.unsqueeze(1).expand({-1, block_size, K}).reshape({N, K});
     expert_w2 = expert_w2 * w2_scale_expanded;
     
     // Second projection: [num_selected, N] @ [N, K] -> [num_selected, K]
-    auto expert_out = torch::mm(activated, expert_w2.t());
+    auto expert_out = torch::mm(activated, expert_w2);
     
     // Add w2 bias if present
     if (w2_bias.has_value()) {
@@ -360,7 +344,7 @@ at::Tensor convert_weight_packed(at::Tensor& weight) {
 at::Tensor convert_scale_packed(at::Tensor& scale) {
   // For fallback, we don't need special scale packing
   // Just return a contiguous copy
-  return scale.contiguous();
+  return scale.transpose(-1, -2).contiguous();
 }
 
 }  // namespace fallback
