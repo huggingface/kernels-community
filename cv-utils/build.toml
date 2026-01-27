@@ -1,6 +1,7 @@
 [general]
 name = "cv_utils"
 backends = ["cuda"]
+version = 1
 
 [general.hub]
 repo-id = "kernels-community/cv-utils"
