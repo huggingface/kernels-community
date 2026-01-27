@@ -84,7 +84,9 @@ class MegaBlocksMoeBenchmark(Benchmark):
         batch, seq = 8, 1
 
         # Router
-        self.router_weight = torch.randn(ne, hs, device=self.device, dtype=torch.float32)
+        self.router_weight = torch.randn(
+            ne, hs, device=self.device, dtype=torch.float32
+        )
         torch.nn.init.kaiming_uniform_(self.router_weight)
         self.router_bias = torch.zeros(ne, device=self.device, dtype=torch.float32)
 
@@ -96,12 +98,17 @@ class MegaBlocksMoeBenchmark(Benchmark):
             ne, isz, device=self.device, dtype=torch.float32
         )
         self.down_proj = (
-            torch.randn(ne, isz // 2, hs, device=self.device, dtype=torch.float32) * 0.02
+            torch.randn(ne, isz // 2, hs, device=self.device, dtype=torch.float32)
+            * 0.02
         )
-        self.down_proj_bias = torch.zeros(ne, hs, device=self.device, dtype=torch.float32)
+        self.down_proj_bias = torch.zeros(
+            ne, hs, device=self.device, dtype=torch.float32
+        )
 
         # Input
-        self.x = torch.randn(seq, batch, hs, device=self.device, dtype=torch.float32) * 0.1
+        self.x = (
+            torch.randn(seq, batch, hs, device=self.device, dtype=torch.float32) * 0.1
+        )
 
         # Setup the model
         self.model = self.kernel.layers.MegaBlocksMoeMLP()
@@ -153,7 +160,9 @@ class MegaBlocksMoeBenchmark(Benchmark):
         batch, seq = 32, 16
 
         # Router
-        self.router_weight = torch.randn(ne, hs, device=self.device, dtype=torch.float32)
+        self.router_weight = torch.randn(
+            ne, hs, device=self.device, dtype=torch.float32
+        )
         torch.nn.init.kaiming_uniform_(self.router_weight)
         self.router_bias = torch.zeros(ne, device=self.device, dtype=torch.float32)
 
@@ -165,12 +174,17 @@ class MegaBlocksMoeBenchmark(Benchmark):
             ne, isz, device=self.device, dtype=torch.float32
         )
         self.down_proj = (
-            torch.randn(ne, isz // 2, hs, device=self.device, dtype=torch.float32) * 0.02
+            torch.randn(ne, isz // 2, hs, device=self.device, dtype=torch.float32)
+            * 0.02
         )
-        self.down_proj_bias = torch.zeros(ne, hs, device=self.device, dtype=torch.float32)
+        self.down_proj_bias = torch.zeros(
+            ne, hs, device=self.device, dtype=torch.float32
+        )
 
         # Input
-        self.x = torch.randn(seq, batch, hs, device=self.device, dtype=torch.float32) * 0.1
+        self.x = (
+            torch.randn(seq, batch, hs, device=self.device, dtype=torch.float32) * 0.1
+        )
 
         # Setup the model
         self.model = self.kernel.layers.MegaBlocksMoeMLP()

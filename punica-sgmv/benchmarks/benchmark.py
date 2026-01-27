@@ -141,7 +141,9 @@ class PunicaSgmvBenchmark(Benchmark):
 
         # Scale inputs to keep outputs in reasonable range for float16 precision
         scale = 0.01
-        self.x = torch.randn(batch_size, hidden_dim, device=self.device, dtype=dtype) * scale
+        self.x = (
+            torch.randn(batch_size, hidden_dim, device=self.device, dtype=dtype) * scale
+        )
 
         if use_cutlass_shrink(lora_rank):
             self.wa = (
@@ -159,7 +161,9 @@ class PunicaSgmvBenchmark(Benchmark):
             )
 
         self.wb = (
-            torch.randn(num_layers, lora_rank, hidden_dim, device=self.device, dtype=dtype)
+            torch.randn(
+                num_layers, lora_rank, hidden_dim, device=self.device, dtype=dtype
+            )
             * scale
         )
 
