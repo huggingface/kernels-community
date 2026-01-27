@@ -10,6 +10,7 @@
 
 #include "moe_fallback.h"
 #include <cmath>
+#include <ATen/Parallel.h>
 
 namespace megablocks {
 namespace cpu {
@@ -43,37 +44,39 @@ at::Tensor fused_experts(
 
   at::Tensor output_fp32 = at::zeros({M, K}, hidden_fp32.options());
 
-  // Process each token
-  for (int64_t m = 0; m < M; ++m) {
-    auto token = hidden_fp32[m];  // [K]
+  // Process each token in parallel
+  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t m = begin; m < end; ++m) {
+      auto token = hidden_fp32[m];  // [K]
 
-    for (int64_t t = 0; t < topk; ++t) {
-      int64_t expert_id = topk_ids[m][t].item<int64_t>();
-      float weight = topk_weights_fp32[m][t].item<float>();
+      for (int64_t t = 0; t < topk; ++t) {
+        int64_t expert_id = topk_ids[m][t].item<int64_t>();
+        float weight = topk_weights_fp32[m][t].item<float>();
 
-      if (expert_id < 0 || expert_id >= E) continue;
+        if (expert_id < 0 || expert_id >= E) continue;
 
-      // Get expert weights
-      auto expert_w1 = w1_fp32[expert_id];  // [2N, K]
-      auto expert_w2 = w2_fp32[expert_id];  // [K, N]
+        // Get expert weights
+        auto expert_w1 = w1_fp32[expert_id];  // [2N, K]
+        auto expert_w2 = w2_fp32[expert_id];  // [K, N]
 
-      // First linear: [K] @ [K, 2N] -> [2N]
-      auto hidden = torch::matmul(token, expert_w1.t());  // [2N]
+        // First linear: [K] @ [K, 2N] -> [2N]
+        auto hidden = torch::matmul(token, expert_w1.t());  // [2N]
 
-      // Split into gate and up
-      auto gate = hidden.slice(0, 0, N);   // [N]
-      auto up = hidden.slice(0, N, N2);    // [N]
+        // Split into gate and up
+        auto gate = hidden.slice(0, 0, N);   // [N]
+        auto up = hidden.slice(0, N, N2);    // [N]
 
-      // SiLU and mul
-      auto activated = silu_activation(gate) * up;  // [N]
+        // SiLU and mul
+        auto activated = silu_activation(gate) * up;  // [N]
 
-      // Second linear: [N] @ [N, K] -> [K]
-      auto expert_out = torch::matmul(activated, expert_w2.t());  // [K]
+        // Second linear: [N] @ [N, K] -> [K]
+        auto expert_out = torch::matmul(activated, expert_w2.t());  // [K]
 
-      // Accumulate with weight
-      output_fp32[m] += weight * expert_out;
+        // Accumulate with weight
+        output_fp32[m] += weight * expert_out;
+      }
     }
-  }
+  });
 
   // Convert back to original dtype
   at::Tensor output = output_fp32.to(hidden_states.scalar_type());
@@ -173,32 +176,30 @@ at::Tensor dequantize_mxfp4(
   auto packed_ptr = packed_flat.data_ptr<uint8_t>();
   auto scale_ptr = scale_flat.data_ptr<float>();
   
-  // Each scale covers block_size elements
-  // Scale is stored as 8-bit exponent (bias 127)
-  int64_t scale_idx = 0;
-  int64_t elem_in_block = 0;
+  // Each scale covers block_size elements (block_size/2 packed bytes)
+  const int64_t packed_per_block = block_size / 2;
+  const int64_t num_blocks = (num_packed + packed_per_block - 1) / packed_per_block;
   
-  for (int64_t i = 0; i < num_packed; ++i) {
-    uint8_t packed = packed_ptr[i];
-    uint8_t low = packed & 0x0F;   // low 4 bits
-    uint8_t high = (packed >> 4) & 0x0F;  // high 4 bits
-    
-    // Get scale for current block
-    // Scale is 2^(scale_value - 127) in MXFP4
-    float s = scale_ptr[scale_idx];
-    float scale_factor = std::pow(2.0f, s - 127.0f);
-    
-    // Dequantize using LUT
-    output_ptr[i * 2] = mxfp4_lut[low] * scale_factor;
-    output_ptr[i * 2 + 1] = mxfp4_lut[high] * scale_factor;
-    
-    // Update block tracking
-    elem_in_block += 2;
-    if (elem_in_block >= block_size) {
-      elem_in_block = 0;
-      scale_idx++;
+  // Parallel dequantization by blocks
+  at::parallel_for(0, num_blocks, 0, [&](int64_t block_begin, int64_t block_end) {
+    for (int64_t block_idx = block_begin; block_idx < block_end; ++block_idx) {
+      int64_t i_start = block_idx * packed_per_block;
+      int64_t i_end = std::min(i_start + packed_per_block, num_packed);
+      
+      // Get scale for this block
+      float s = scale_ptr[block_idx];
+      float scale_factor = std::pow(2.0f, s - 127.0f);
+      
+      for (int64_t i = i_start; i < i_end; ++i) {
+        uint8_t packed = packed_ptr[i];
+        uint8_t low = packed & 0x0F;
+        uint8_t high = (packed >> 4) & 0x0F;
+        
+        output_ptr[i * 2] = mxfp4_lut[low] * scale_factor;
+        output_ptr[i * 2 + 1] = mxfp4_lut[high] * scale_factor;
+      }
     }
-  }
+  });
   
   return output;
 }
@@ -232,67 +233,83 @@ at::Tensor fused_experts_mxfp4(
 
   at::Tensor output_fp32 = at::zeros({M, K}, hidden_fp32.options());
 
-  // Dequantize all expert weights (this is slow but correct for fallback)
-  // In practice, you'd want to cache these
+  // Dequantize all expert weights in parallel
+  // Only dequantize experts that are actually used
   std::vector<at::Tensor> w1_dequant(E);
   std::vector<at::Tensor> w2_dequant(E);
+  std::vector<bool> expert_used(E, false);
   
-  for (int64_t e = 0; e < E; ++e) {
-    // Dequantize w1[e]: [N*2, K/2] -> [N*2, K]
-    auto w1_e = w1[e];  // [N*2, K/2]
-    auto w1_scale_e = w1_scale[e];  // [N*2, K/block_size]
-    
-    // Dequantize each row
-    std::vector<at::Tensor> w1_rows;
-    for (int64_t row = 0; row < N2; ++row) {
-      auto row_dequant = dequantize_mxfp4(w1_e[row], w1_scale_e[row], block_size);
-      w1_rows.push_back(row_dequant.unsqueeze(0));
-    }
-    w1_dequant[e] = at::cat(w1_rows, 0);  // [N*2, K]
-    
-    // Dequantize w2[e]: [K, N/2] -> [K, N]
-    auto w2_e = w2[e];  // [K, N/2]
-    auto w2_scale_e = w2_scale[e];  // [K, N/block_size]
-    
-    std::vector<at::Tensor> w2_rows;
-    for (int64_t row = 0; row < K; ++row) {
-      auto row_dequant = dequantize_mxfp4(w2_e[row], w2_scale_e[row], block_size);
-      w2_rows.push_back(row_dequant.unsqueeze(0));
-    }
-    w2_dequant[e] = at::cat(w2_rows, 0);  // [K, N]
-  }
-
-  // Process each token
+  // First pass: mark which experts are used
+  auto topk_ids_accessor = topk_ids.accessor<int32_t, 2>();
   for (int64_t m = 0; m < M; ++m) {
-    auto token = hidden_fp32[m];  // [K]
-
     for (int64_t t = 0; t < topk; ++t) {
-      int64_t expert_id = topk_ids[m][t].item<int64_t>();
-      float weight = topk_weights_fp32[m][t].item<float>();
-
-      if (expert_id < 0 || expert_id >= E) continue;
-
-      // Get dequantized expert weights
-      auto expert_w1 = w1_dequant[expert_id];  // [2N, K]
-      auto expert_w2 = w2_dequant[expert_id];  // [K, N]
-
-      // First linear: [K] @ [K, 2N] -> [2N]
-      auto hidden = torch::matmul(token, expert_w1.t());  // [2N]
-
-      // Split into gate and up
-      auto gate = hidden.slice(0, 0, N);   // [N]
-      auto up = hidden.slice(0, N, N2);    // [N]
-
-      // SiLU and mul
-      auto activated = silu_activation(gate) * up;  // [N]
-
-      // Second linear: [N] @ [N, K] -> [K]
-      auto expert_out = torch::matmul(activated, expert_w2.t());  // [K]
-
-      // Accumulate with weight
-      output_fp32[m] += weight * expert_out;
+      int64_t expert_id = topk_ids_accessor[m][t];
+      if (expert_id >= 0 && expert_id < E) {
+        expert_used[expert_id] = true;
+      }
     }
   }
+  
+  // Parallel dequantization of used experts
+  at::parallel_for(0, E, 0, [&](int64_t e_begin, int64_t e_end) {
+    for (int64_t e = e_begin; e < e_end; ++e) {
+      if (!expert_used[e]) continue;
+      
+      // Dequantize w1[e]: [N*2, K/2] -> [N*2, K]
+      auto w1_e = w1[e];  // [N*2, K/2]
+      auto w1_scale_e = w1_scale[e];  // [N*2, K/block_size]
+      
+      std::vector<at::Tensor> w1_rows(N2);
+      for (int64_t row = 0; row < N2; ++row) {
+        w1_rows[row] = dequantize_mxfp4(w1_e[row], w1_scale_e[row], block_size).unsqueeze(0);
+      }
+      w1_dequant[e] = at::cat(w1_rows, 0);  // [N*2, K]
+      
+      // Dequantize w2[e]: [K, N/2] -> [K, N]
+      auto w2_e = w2[e];  // [K, N/2]
+      auto w2_scale_e = w2_scale[e];  // [K, N/block_size]
+      
+      std::vector<at::Tensor> w2_rows(K);
+      for (int64_t row = 0; row < K; ++row) {
+        w2_rows[row] = dequantize_mxfp4(w2_e[row], w2_scale_e[row], block_size).unsqueeze(0);
+      }
+      w2_dequant[e] = at::cat(w2_rows, 0);  // [K, N]
+    }
+  });
+
+  // Process each token in parallel
+  at::parallel_for(0, M, 0, [&](int64_t m_begin, int64_t m_end) {
+    for (int64_t m = m_begin; m < m_end; ++m) {
+      auto token = hidden_fp32[m];  // [K]
+
+      for (int64_t t = 0; t < topk; ++t) {
+        int64_t expert_id = topk_ids_accessor[m][t];
+        float weight = topk_weights_fp32[m][t].item<float>();
+
+        if (expert_id < 0 || expert_id >= E) continue;
+
+        // Get dequantized expert weights
+        auto expert_w1 = w1_dequant[expert_id];  // [2N, K]
+        auto expert_w2 = w2_dequant[expert_id];  // [K, N]
+
+        // First linear: [K] @ [K, 2N] -> [2N]
+        auto hidden = torch::matmul(token, expert_w1.t());  // [2N]
+
+        // Split into gate and up
+        auto gate = hidden.slice(0, 0, N);   // [N]
+        auto up = hidden.slice(0, N, N2);    // [N]
+
+        // SiLU and mul
+        auto activated = silu_activation(gate) * up;  // [N]
+
+        // Second linear: [N] @ [N, K] -> [K]
+        auto expert_out = torch::matmul(activated, expert_w2.t());  // [K]
+
+        // Accumulate with weight
+        output_fp32[m] += weight * expert_out;
+      }
+    }
+  });
 
   // Convert back to original dtype
   at::Tensor output = output_fp32.to(hidden_states.scalar_type());
