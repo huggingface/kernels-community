@@ -29,8 +29,8 @@ inline at::Tensor silu_activation(const at::Tensor& x) {
 //
 // Args:
 //   hidden_states: [M, K]
-//   w1: [E, 2N, K] - gate and up projections
-//   w2: [E, K, N] - down projection
+//   w1: [E, K, 2N] - gate and up projections (hidden_size, 2*inter_size)
+//   w2: [E, N, K] - down projection (inter_size, hidden_size)
 //   topk_weights: [M, topk]
 //   topk_ids: [M, topk]
 //   inplace: whether to use hidden_states as output

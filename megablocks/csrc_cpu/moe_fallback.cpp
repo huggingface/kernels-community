@@ -61,11 +61,11 @@ at::Tensor fused_experts(
     auto current_hidden = hidden_states.index_select(0, token_indices);
     
     // Get weights for this expert
-    auto expert_w1 = w1[expert_idx];  // [2N, K]
-    auto expert_w2 = w2[expert_idx];  // [K, N]
+    auto expert_w1 = w1[expert_idx];  // [K, 2N]
+    auto expert_w2 = w2[expert_idx];  // [N, K]
     
     // First projection: [num_selected, K] @ [K, 2N] -> [num_selected, 2N]
-    auto gate_up = torch::mm(current_hidden, expert_w1.t());
+    auto gate_up = torch::mm(current_hidden, expert_w1);
     
     // Split gate and up
     auto gate = gate_up.slice(1, 0, N);    // [num_selected, N]
@@ -75,7 +75,7 @@ at::Tensor fused_experts(
     auto activated = torch::silu(gate) * up;  // [num_selected, N]
     
     // Second projection: [num_selected, N] @ [N, K] -> [num_selected, K]
-    auto expert_out = torch::mm(activated, expert_w2.t());
+    auto expert_out = torch::mm(activated, expert_w2);
     
     // Apply routing weights: [num_selected]
     auto weights = topk_weights.index({token_indices, topk_positions}).unsqueeze(1);
