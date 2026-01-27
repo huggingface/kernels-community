@@ -177,15 +177,17 @@ at::Tensor dequantize_mxfp4(
   int64_t num_packed = packed_flat.numel();
   
   // Extract low and high nibbles
-  auto low = (packed_flat.to(at::kInt) & 0x0F);
-  auto high = ((packed_flat.to(at::kInt) >> 4) & 0x0F);
+  auto packed_int = packed_flat.to(at::kInt);
+  auto low = packed_int.bitwise_and(0x0F);
+  auto high = packed_int.div(16, "trunc").bitwise_and(0x0F);  // >> 4
   
-  // Lookup values
-  auto low_f = lut.index({low});   // [num_packed]
-  auto high_f = lut.index({high}); // [num_packed]
+  // Lookup values using index_select
+  auto low_f = lut.index_select(0, low.flatten().to(at::kLong));
+  auto high_f = lut.index_select(0, high.flatten().to(at::kLong));
   
   // Interleave: [num_packed] -> [num_packed * 2]
-  auto output = at::stack({low_f, high_f}, 1).flatten();  // [num_packed * 2]
+  std::vector<at::Tensor> stack_vec = {low_f, high_f};
+  auto output = at::stack(stack_vec, 1).flatten();  // [num_packed * 2]
   
   // Apply scales
   auto scale_f = at::pow(2.0f, scale.contiguous().to(at::kFloat).flatten() - 127.0f);
@@ -258,11 +260,13 @@ at::Tensor fused_experts_mxfp4(
     auto expert_w1_packed = w1[expert_idx];  // [N*2, K/2]
     auto expert_w1_scale = w1_scale[expert_idx];  // [N*2, K/block_size]
     
-    auto w1_low = (expert_w1_packed.to(at::kInt) & 0x0F);
-    auto w1_high = ((expert_w1_packed.to(at::kInt) >> 4) & 0x0F);
-    auto w1_low_f = lut.index({w1_low.flatten()}).reshape(expert_w1_packed.sizes());
-    auto w1_high_f = lut.index({w1_high.flatten()}).reshape(expert_w1_packed.sizes());
-    auto expert_w1 = at::stack({w1_low_f, w1_high_f}, -1).reshape({N2, K});
+    auto w1_packed_int = expert_w1_packed.to(at::kInt);
+    auto w1_low = w1_packed_int.bitwise_and(0x0F);
+    auto w1_high = w1_packed_int.div(16, "trunc").bitwise_and(0x0F);
+    auto w1_low_f = lut.index_select(0, w1_low.flatten().to(at::kLong)).reshape(expert_w1_packed.sizes());
+    auto w1_high_f = lut.index_select(0, w1_high.flatten().to(at::kLong)).reshape(expert_w1_packed.sizes());
+    std::vector<at::Tensor> w1_stack = {w1_low_f, w1_high_f};
+    auto expert_w1 = at::stack(w1_stack, -1).reshape({N2, K});
     
     // Apply scale
     auto w1_scale_f = at::pow(2.0f, expert_w1_scale.to(at::kFloat) - 127.0f);
@@ -281,11 +285,13 @@ at::Tensor fused_experts_mxfp4(
     auto expert_w2_packed = w2[expert_idx];  // [K, N/2]
     auto expert_w2_scale = w2_scale[expert_idx];  // [K, N/block_size]
     
-    auto w2_low = (expert_w2_packed.to(at::kInt) & 0x0F);
-    auto w2_high = ((expert_w2_packed.to(at::kInt) >> 4) & 0x0F);
-    auto w2_low_f = lut.index({w2_low.flatten()}).reshape(expert_w2_packed.sizes());
-    auto w2_high_f = lut.index({w2_high.flatten()}).reshape(expert_w2_packed.sizes());
-    auto expert_w2 = at::stack({w2_low_f, w2_high_f}, -1).reshape({K, N});
+    auto w2_packed_int = expert_w2_packed.to(at::kInt);
+    auto w2_low = w2_packed_int.bitwise_and(0x0F);
+    auto w2_high = w2_packed_int.div(16, "trunc").bitwise_and(0x0F);
+    auto w2_low_f = lut.index_select(0, w2_low.flatten().to(at::kLong)).reshape(expert_w2_packed.sizes());
+    auto w2_high_f = lut.index_select(0, w2_high.flatten().to(at::kLong)).reshape(expert_w2_packed.sizes());
+    std::vector<at::Tensor> w2_stack = {w2_low_f, w2_high_f};
+    auto expert_w2 = at::stack(w2_stack, -1).reshape({K, N});
     
     auto w2_scale_f = at::pow(2.0f, expert_w2_scale.to(at::kFloat) - 127.0f);
     auto w2_scale_expanded = w2_scale_f.unsqueeze(-1).expand({K, -1, block_size}).reshape({K, N});
