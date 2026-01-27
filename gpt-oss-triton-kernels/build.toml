@@ -1,9 +1,8 @@
 [general]
 name = "gpt_oss_triton_kernels"
+version = 1
 backends = [
-    "cpu",
     "cuda",
-    "metal",
     "rocm",
     "xpu",
 ]
