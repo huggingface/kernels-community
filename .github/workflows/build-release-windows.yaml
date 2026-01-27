@@ -219,6 +219,10 @@ jobs:
           # Install kernels package for upload
           pip install kernels
           
+          # Debug: list the build directory structure
+          Write-Host "Build directory structure:"
+          Get-ChildItem -Path "$env:KERNEL_SOURCE\build" -Recurse -Depth 2 | ForEach-Object { Write-Host $_.FullName }
+          
           # Upload using the kernels CLI
-          # The build output is in $KERNEL_SOURCE/build directory
-          kernels upload "$env:KERNEL_SOURCE" --repo-id "kernels-community/$env:KERNEL_SOURCE"
+          # The build output is in $KERNEL_SOURCE/build directory with variant subdirectories
+          kernels upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE"
