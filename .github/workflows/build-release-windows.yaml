@@ -217,8 +217,16 @@ jobs:
           KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
         run: |
           # Install kernels package for upload
-          pip install kernels
+          pip install -U kernels --no-cache-dir
+          
+          # Debug: list the build directory structure to check for metadata.json
+          Write-Host "Build directory structure:"
+          Get-ChildItem -Path "$env:KERNEL_SOURCE\build" -Recurse -Depth 3 | ForEach-Object { Write-Host $_.FullName }
+          
+          # Check if metadata.json exists in any variant directory
+          Write-Host "`nChecking for metadata.json files:"
+          Get-ChildItem -Path "$env:KERNEL_SOURCE\build" -Recurse -Filter "metadata.json" | ForEach-Object { Write-Host "Found: $($_.FullName)" }
           
           # Upload using the kernels CLI
-          # The build output is in $KERNEL_SOURCE/build directory
-          kernels upload "$env:KERNEL_SOURCE" --repo-id "kernels-community/$env:KERNEL_SOURCE"
+          # The kernels CLI checks both kernel_dir and kernel_dir/build for torch* variants with metadata.json
+          kernels upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE"
