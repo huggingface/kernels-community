@@ -1,0 +1,14 @@
+[general]
+name = "gpt_oss_triton_kernels"
+backends = [
+    "cpu",
+    "cuda",
+    "metal",
+    "rocm",
+    "xpu",
+]
+
+[general.hub]
+repo-id = "kernels-community/gpt-oss-triton-kernels"
+
+[kernel]
