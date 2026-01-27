@@ -10,7 +10,6 @@
 
 #include "moe_fallback.h"
 #include <cmath>
-#include <ATen/Parallel.h>
 
 namespace megablocks {
 namespace cpu {
@@ -36,50 +35,55 @@ at::Tensor fused_experts(
   int64_t N = N2 / 2;
   int64_t topk = topk_ids.size(1);
 
-  // Ensure float32 computation for accuracy
-  auto hidden_fp32 = hidden_states.to(at::kFloat);
-  auto w1_fp32 = w1.to(at::kFloat);
-  auto w2_fp32 = w2.to(at::kFloat);
-  auto topk_weights_fp32 = topk_weights.to(at::kFloat);
+  // Initialize output
+  auto output = at::zeros({M, K}, hidden_states.options());
 
-  at::Tensor output_fp32 = at::zeros({M, K}, hidden_fp32.options());
-
-  // Process each token in parallel
-  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
-    for (int64_t m = begin; m < end; ++m) {
-      auto token = hidden_fp32[m];  // [K]
-
-      for (int64_t t = 0; t < topk; ++t) {
-        int64_t expert_id = topk_ids[m][t].item<int64_t>();
-        float weight = topk_weights_fp32[m][t].item<float>();
-
-        if (expert_id < 0 || expert_id >= E) continue;
-
-        // Get expert weights
-        auto expert_w1 = w1_fp32[expert_id];  // [2N, K]
-        auto expert_w2 = w2_fp32[expert_id];  // [K, N]
-
-        // First linear: [K] @ [K, 2N] -> [2N]
-        auto hidden = torch::matmul(token, expert_w1.t());  // [2N]
-
-        // Split into gate and up
-        auto gate = hidden.slice(0, 0, N);   // [N]
-        auto up = hidden.slice(0, N, N2);    // [N]
-
-        // SiLU and mul
-        auto activated = silu_activation(gate) * up;  // [N]
-
-        // Second linear: [N] @ [N, K] -> [K]
-        auto expert_out = torch::matmul(activated, expert_w2.t());  // [K]
-
-        // Accumulate with weight
-        output_fp32[m] += weight * expert_out;
-      }
+  // Process by expert: gather tokens for each expert, do batched matmul
+  for (int64_t expert_idx = 0; expert_idx < E; ++expert_idx) {
+    // Find tokens assigned to this expert
+    // mask: [M, topk] where topk_ids == expert_idx
+    auto mask = (topk_ids == expert_idx);
+    
+    if (!mask.any().item<bool>()) {
+      continue;
     }
-  });
-
-  // Convert back to original dtype
-  at::Tensor output = output_fp32.to(hidden_states.scalar_type());
+    
+    // Get token indices and topk positions: where mask is true
+    auto where_result = at::where(mask);
+    auto token_indices = where_result[0];   // [num_selected]
+    auto topk_positions = where_result[1];  // [num_selected]
+    
+    if (token_indices.size(0) == 0) {
+      continue;
+    }
+    
+    // Gather input tokens for this expert: [num_selected, K]
+    auto current_hidden = hidden_states.index_select(0, token_indices);
+    
+    // Get weights for this expert
+    auto expert_w1 = w1[expert_idx];  // [2N, K]
+    auto expert_w2 = w2[expert_idx];  // [K, N]
+    
+    // First projection: [num_selected, K] @ [K, 2N] -> [num_selected, 2N]
+    auto gate_up = torch::mm(current_hidden, expert_w1.t());
+    
+    // Split gate and up
+    auto gate = gate_up.slice(1, 0, N);    // [num_selected, N]
+    auto up = gate_up.slice(1, N, N2);     // [num_selected, N]
+    
+    // SiLU activation
+    auto activated = torch::silu(gate) * up;  // [num_selected, N]
+    
+    // Second projection: [num_selected, N] @ [N, K] -> [num_selected, K]
+    auto expert_out = torch::mm(activated, expert_w2.t());
+    
+    // Apply routing weights: [num_selected]
+    auto weights = topk_weights.index({token_indices, topk_positions}).unsqueeze(1);
+    auto weighted_out = expert_out * weights;
+    
+    // Accumulate to output using index_add
+    output.index_add_(0, token_indices, weighted_out);
+  }
 
   if (inplace) {
     hidden_states.copy_(output);
@@ -164,42 +168,37 @@ at::Tensor dequantize_mxfp4(
   // scale: [..., N/block_size] - 8-bit scale per block
   // block_size: typically 32
   
+  // Create LUT tensor for vectorized lookup
+  auto lut = at::tensor({0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                         -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f},
+                        at::kFloat);
+  
   auto packed_flat = packed_weight.contiguous().flatten();
-  auto scale_flat = scale.contiguous().to(at::kFloat).flatten();
-  
   int64_t num_packed = packed_flat.numel();
-  int64_t num_values = num_packed * 2;  // 2 values per byte
   
-  // Create output tensor
-  auto output = at::zeros({num_values}, at::TensorOptions().dtype(at::kFloat));
-  auto output_ptr = output.data_ptr<float>();
-  auto packed_ptr = packed_flat.data_ptr<uint8_t>();
-  auto scale_ptr = scale_flat.data_ptr<float>();
+  // Extract low and high nibbles
+  auto low = (packed_flat.to(at::kInt) & 0x0F);
+  auto high = ((packed_flat.to(at::kInt) >> 4) & 0x0F);
   
-  // Each scale covers block_size elements (block_size/2 packed bytes)
-  const int64_t packed_per_block = block_size / 2;
-  const int64_t num_blocks = (num_packed + packed_per_block - 1) / packed_per_block;
+  // Lookup values
+  auto low_f = lut.index({low});   // [num_packed]
+  auto high_f = lut.index({high}); // [num_packed]
   
-  // Parallel dequantization by blocks
-  at::parallel_for(0, num_blocks, 0, [&](int64_t block_begin, int64_t block_end) {
-    for (int64_t block_idx = block_begin; block_idx < block_end; ++block_idx) {
-      int64_t i_start = block_idx * packed_per_block;
-      int64_t i_end = std::min(i_start + packed_per_block, num_packed);
-      
-      // Get scale for this block
-      float s = scale_ptr[block_idx];
-      float scale_factor = std::pow(2.0f, s - 127.0f);
-      
-      for (int64_t i = i_start; i < i_end; ++i) {
-        uint8_t packed = packed_ptr[i];
-        uint8_t low = packed & 0x0F;
-        uint8_t high = (packed >> 4) & 0x0F;
-        
-        output_ptr[i * 2] = mxfp4_lut[low] * scale_factor;
-        output_ptr[i * 2 + 1] = mxfp4_lut[high] * scale_factor;
-      }
-    }
-  });
+  // Interleave: [num_packed] -> [num_packed * 2]
+  auto output = at::stack({low_f, high_f}, 1).flatten();  // [num_packed * 2]
+  
+  // Apply scales
+  auto scale_f = at::pow(2.0f, scale.contiguous().to(at::kFloat).flatten() - 127.0f);
+  // Each scale covers block_size elements
+  auto scale_expanded = scale_f.unsqueeze(1).expand({-1, block_size}).flatten();
+  
+  // Truncate or pad scale_expanded to match output size
+  int64_t num_values = num_packed * 2;
+  if (scale_expanded.size(0) >= num_values) {
+    scale_expanded = scale_expanded.slice(0, 0, num_values);
+  }
+  
+  output = output * scale_expanded;
   
   return output;
 }
@@ -227,92 +226,80 @@ at::Tensor fused_experts_mxfp4(
   int64_t N = N2 / 2;
   int64_t topk = topk_ids.size(1);
 
-  // Ensure float32 computation for accuracy
-  auto hidden_fp32 = hidden_states.to(at::kFloat);
-  auto topk_weights_fp32 = topk_weights.to(at::kFloat);
+  // Create LUT tensor for vectorized lookup
+  auto lut = at::tensor({0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                         -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f},
+                        at::kFloat);
 
-  at::Tensor output_fp32 = at::zeros({M, K}, hidden_fp32.options());
+  // Initialize output
+  auto output = at::zeros({M, K}, hidden_states.options());
 
-  // Dequantize all expert weights in parallel
-  // Only dequantize experts that are actually used
-  std::vector<at::Tensor> w1_dequant(E);
-  std::vector<at::Tensor> w2_dequant(E);
-  std::vector<bool> expert_used(E, false);
-  
-  // First pass: mark which experts are used
-  auto topk_ids_accessor = topk_ids.accessor<int32_t, 2>();
-  for (int64_t m = 0; m < M; ++m) {
-    for (int64_t t = 0; t < topk; ++t) {
-      int64_t expert_id = topk_ids_accessor[m][t];
-      if (expert_id >= 0 && expert_id < E) {
-        expert_used[expert_id] = true;
-      }
+  // Process by expert (same pattern as fused_experts)
+  for (int64_t expert_idx = 0; expert_idx < E; ++expert_idx) {
+    // Find tokens assigned to this expert
+    auto mask = (topk_ids == expert_idx);
+    
+    if (!mask.any().item<bool>()) {
+      continue;
     }
+    
+    auto where_result = at::where(mask);
+    auto token_indices = where_result[0];
+    auto topk_positions = where_result[1];
+    
+    if (token_indices.size(0) == 0) {
+      continue;
+    }
+    
+    // Gather input tokens: [num_selected, K]
+    auto current_hidden = hidden_states.index_select(0, token_indices).to(at::kFloat);
+    
+    // Dequantize w1 for this expert only: [N*2, K/2] -> [N*2, K]
+    auto expert_w1_packed = w1[expert_idx];  // [N*2, K/2]
+    auto expert_w1_scale = w1_scale[expert_idx];  // [N*2, K/block_size]
+    
+    auto w1_low = (expert_w1_packed.to(at::kInt) & 0x0F);
+    auto w1_high = ((expert_w1_packed.to(at::kInt) >> 4) & 0x0F);
+    auto w1_low_f = lut.index({w1_low.flatten()}).reshape(expert_w1_packed.sizes());
+    auto w1_high_f = lut.index({w1_high.flatten()}).reshape(expert_w1_packed.sizes());
+    auto expert_w1 = at::stack({w1_low_f, w1_high_f}, -1).reshape({N2, K});
+    
+    // Apply scale
+    auto w1_scale_f = at::pow(2.0f, expert_w1_scale.to(at::kFloat) - 127.0f);
+    auto w1_scale_expanded = w1_scale_f.unsqueeze(-1).expand({N2, -1, block_size}).reshape({N2, K});
+    expert_w1 = expert_w1 * w1_scale_expanded;
+    
+    // First projection: [num_selected, K] @ [K, 2N] -> [num_selected, 2N]
+    auto gate_up = torch::mm(current_hidden, expert_w1.t());
+    
+    // Split and activate
+    auto gate = gate_up.slice(1, 0, N);
+    auto up = gate_up.slice(1, N, N2);
+    auto activated = torch::silu(gate) * up;  // [num_selected, N]
+    
+    // Dequantize w2 for this expert: [K, N/2] -> [K, N]
+    auto expert_w2_packed = w2[expert_idx];  // [K, N/2]
+    auto expert_w2_scale = w2_scale[expert_idx];  // [K, N/block_size]
+    
+    auto w2_low = (expert_w2_packed.to(at::kInt) & 0x0F);
+    auto w2_high = ((expert_w2_packed.to(at::kInt) >> 4) & 0x0F);
+    auto w2_low_f = lut.index({w2_low.flatten()}).reshape(expert_w2_packed.sizes());
+    auto w2_high_f = lut.index({w2_high.flatten()}).reshape(expert_w2_packed.sizes());
+    auto expert_w2 = at::stack({w2_low_f, w2_high_f}, -1).reshape({K, N});
+    
+    auto w2_scale_f = at::pow(2.0f, expert_w2_scale.to(at::kFloat) - 127.0f);
+    auto w2_scale_expanded = w2_scale_f.unsqueeze(-1).expand({K, -1, block_size}).reshape({K, N});
+    expert_w2 = expert_w2 * w2_scale_expanded;
+    
+    // Second projection: [num_selected, N] @ [N, K] -> [num_selected, K]
+    auto expert_out = torch::mm(activated, expert_w2.t());
+    
+    // Apply routing weights and accumulate
+    auto weights = topk_weights.index({token_indices, topk_positions}).unsqueeze(1);
+    auto weighted_out = expert_out * weights;
+    
+    output.index_add_(0, token_indices, weighted_out.to(output.scalar_type()));
   }
-  
-  // Parallel dequantization of used experts
-  at::parallel_for(0, E, 0, [&](int64_t e_begin, int64_t e_end) {
-    for (int64_t e = e_begin; e < e_end; ++e) {
-      if (!expert_used[e]) continue;
-      
-      // Dequantize w1[e]: [N*2, K/2] -> [N*2, K]
-      auto w1_e = w1[e];  // [N*2, K/2]
-      auto w1_scale_e = w1_scale[e];  // [N*2, K/block_size]
-      
-      std::vector<at::Tensor> w1_rows(N2);
-      for (int64_t row = 0; row < N2; ++row) {
-        w1_rows[row] = dequantize_mxfp4(w1_e[row], w1_scale_e[row], block_size).unsqueeze(0);
-      }
-      w1_dequant[e] = at::cat(w1_rows, 0);  // [N*2, K]
-      
-      // Dequantize w2[e]: [K, N/2] -> [K, N]
-      auto w2_e = w2[e];  // [K, N/2]
-      auto w2_scale_e = w2_scale[e];  // [K, N/block_size]
-      
-      std::vector<at::Tensor> w2_rows(K);
-      for (int64_t row = 0; row < K; ++row) {
-        w2_rows[row] = dequantize_mxfp4(w2_e[row], w2_scale_e[row], block_size).unsqueeze(0);
-      }
-      w2_dequant[e] = at::cat(w2_rows, 0);  // [K, N]
-    }
-  });
-
-  // Process each token in parallel
-  at::parallel_for(0, M, 0, [&](int64_t m_begin, int64_t m_end) {
-    for (int64_t m = m_begin; m < m_end; ++m) {
-      auto token = hidden_fp32[m];  // [K]
-
-      for (int64_t t = 0; t < topk; ++t) {
-        int64_t expert_id = topk_ids_accessor[m][t];
-        float weight = topk_weights_fp32[m][t].item<float>();
-
-        if (expert_id < 0 || expert_id >= E) continue;
-
-        // Get dequantized expert weights
-        auto expert_w1 = w1_dequant[expert_id];  // [2N, K]
-        auto expert_w2 = w2_dequant[expert_id];  // [K, N]
-
-        // First linear: [K] @ [K, 2N] -> [2N]
-        auto hidden = torch::matmul(token, expert_w1.t());  // [2N]
-
-        // Split into gate and up
-        auto gate = hidden.slice(0, 0, N);   // [N]
-        auto up = hidden.slice(0, N, N2);    // [N]
-
-        // SiLU and mul
-        auto activated = silu_activation(gate) * up;  // [N]
-
-        // Second linear: [N] @ [N, K] -> [K]
-        auto expert_out = torch::matmul(activated, expert_w2.t());  // [K]
-
-        // Accumulate with weight
-        output_fp32[m] += weight * expert_out;
-      }
-    }
-  });
-
-  // Convert back to original dtype
-  at::Tensor output = output_fp32.to(hidden_states.scalar_type());
 
   if (inplace) {
     hidden_states.copy_(output);
