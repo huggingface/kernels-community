@@ -29,8 +29,8 @@ inline at::Tensor silu_activation(const at::Tensor& x) {
 //
 // Args:
 //   hidden_states: [M, K]
-//   w1: [E, K, 2N] - gate and up projections (hidden_size, 2*inter_size)
-//   w2: [E, N, K] - down projection (inter_size, hidden_size)
+//   w1: [E, K, 2N] - gate and up projections (after convert_weight_packed)
+//   w2: [E, N, K] - down projection (after convert_weight_packed)
 //   topk_weights: [M, topk]
 //   topk_ids: [M, topk]
 //   inplace: whether to use hidden_states as output
@@ -47,8 +47,8 @@ at::Tensor fused_experts(
 //
 // Args:
 //   hidden_states: [M, K]
-//   w1: [2N, K]
-//   w2: [K, N]
+//   w1: [K, 2N] (after convert_weight_packed)
+//   w2: [N, K] (after convert_weight_packed)
 //   fused_experts_out: [M, K] - output from fused experts
 //   routed_scaling_factor: scaling factor for shared expert output
 //   inplace: whether to use hidden_states as output

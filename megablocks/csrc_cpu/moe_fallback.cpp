@@ -23,15 +23,15 @@ at::Tensor fused_experts(
     at::Tensor& topk_ids,
     bool inplace) {
   // hidden_states: [M, K]
-  // w1: [E, 2N, K] - gate and up projections
-  // w2: [E, K, N] - down projection
+  // w1: [E, K, 2N] - gate and up projections (after convert_weight_packed transpose)
+  // w2: [E, N, K] - down projection (after convert_weight_packed transpose)
   // topk_weights: [M, topk]
   // topk_ids: [M, topk]
 
   int64_t M = hidden_states.size(0);
   int64_t K = hidden_states.size(1);
   int64_t E = w1.size(0);
-  int64_t N2 = w1.size(1);  // 2N
+  int64_t N2 = w1.size(2);  // 2N (last dim after transpose)
   int64_t N = N2 / 2;
   int64_t topk = topk_ids.size(1);
 
@@ -60,14 +60,14 @@ at::Tensor fused_experts(
     // Gather input tokens for this expert: [num_selected, K]
     auto current_hidden = hidden_states.index_select(0, token_indices);
     
-    // Get weights for this expert
+    // Get weights for this expert (after convert_weight_packed transpose back)
     auto expert_w1 = w1[expert_idx];  // [K, 2N]
     auto expert_w2 = w2[expert_idx];  // [N, K]
     
     // First projection: [num_selected, K] @ [K, 2N] -> [num_selected, 2N]
     auto gate_up = torch::mm(current_hidden, expert_w1);
     
-    // Split gate and up
+    // Split gate and up (standard layout: [gate_all, up_all])
     auto gate = gate_up.slice(1, 0, N);    // [num_selected, N]
     auto up = gate_up.slice(1, N, N2);     // [num_selected, N]
     
@@ -100,11 +100,11 @@ at::Tensor shared_expert(
     double routed_scaling_factor,
     bool inplace) {
   // hidden_states: [M, K]
-  // w1: [2N, K]
-  // w2: [K, N]
+  // w1: [K, 2N] (after convert_weight_packed transpose)
+  // w2: [N, K] (after convert_weight_packed transpose)
   // fused_experts_out: [M, K]
 
-  int64_t N2 = w1.size(0);  // 2N
+  int64_t N2 = w1.size(1);  // 2N (last dim after transpose)
   int64_t N = N2 / 2;
 
   // Ensure float32 computation for accuracy
@@ -114,7 +114,7 @@ at::Tensor shared_expert(
   auto fused_out_fp32 = fused_experts_out.to(at::kFloat);
 
   // First linear: [M, K] @ [K, 2N] -> [M, 2N]
-  auto hidden = torch::matmul(hidden_fp32, w1_fp32.t());
+  auto hidden = torch::matmul(hidden_fp32, w1_fp32);
 
   // Split into gate and up
   auto gate = hidden.slice(1, 0, N);   // [M, N]
@@ -124,7 +124,7 @@ at::Tensor shared_expert(
   auto activated = silu_activation(gate) * up;  // [M, N]
 
   // Second linear: [M, N] @ [N, K] -> [M, K]
-  auto expert_out = torch::matmul(activated, w2_fp32.t());
+  auto expert_out = torch::matmul(activated, w2_fp32);
 
   // Combine with fused_experts_out
   auto output_fp32 = fused_out_fp32 + float(routed_scaling_factor) * expert_out;
@@ -316,9 +316,10 @@ at::Tensor fused_experts_mxfp4(
 
 at::Tensor convert_weight_packed(at::Tensor& weight) {
   // For fallback, we don't need VNNI packing
-  // Just return a contiguous copy of the weight
-  // The weight will be used directly with torch::matmul
-  return weight.contiguous();
+  // The input weight was transposed in Python from [E, K, 2N] to [E, 2N, K]
+  // We transpose it back to [E, K, 2N] so we can use simple matmul without transpose
+  // weight: [E, 2N, K] -> [E, K, 2N] (or [E, K, N] -> [E, N, K] for w2)
+  return weight.transpose(-1, -2).contiguous();
 }
 
 at::Tensor convert_scale_packed(at::Tensor& scale) {
