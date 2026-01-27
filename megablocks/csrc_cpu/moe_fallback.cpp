@@ -67,9 +67,10 @@ at::Tensor fused_experts(
     // First projection: [num_selected, K] @ [K, 2N] -> [num_selected, 2N]
     auto gate_up = torch::mm(current_hidden, expert_w1);
     
-    // Split gate and up (standard layout: [gate_all, up_all])
-    auto gate = gate_up.slice(1, 0, N);    // [num_selected, N]
-    auto up = gate_up.slice(1, N, N2);     // [num_selected, N]
+    // Split gate and up (interleaved layout: [g0, u0, g1, u1, ...])
+    // This matches GptOss's gate_up_proj layout
+    auto gate = gate_up.index({torch::indexing::Slice(), torch::indexing::Slice(0, torch::indexing::None, 2)});  // [num_selected, N]
+    auto up = gate_up.index({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None, 2)});    // [num_selected, N]
     
     // SiLU activation
     auto activated = torch::silu(gate) * up;  // [num_selected, N]
@@ -116,9 +117,10 @@ at::Tensor shared_expert(
   // First linear: [M, K] @ [K, 2N] -> [M, 2N]
   auto hidden = torch::matmul(hidden_fp32, w1_fp32);
 
-  // Split into gate and up
-  auto gate = hidden.slice(1, 0, N);   // [M, N]
-  auto up = hidden.slice(1, N, N2);    // [M, N]
+  // Split into gate and up (interleaved layout: [g0, u0, g1, u1, ...])
+  // This matches GptOss's gate_up_proj layout
+  auto gate = hidden.index({torch::indexing::Slice(), torch::indexing::Slice(0, torch::indexing::None, 2)});  // [M, N]
+  auto up = hidden.index({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None, 2)});    // [M, N]
 
   // SiLU and mul
   auto activated = silu_activation(gate) * up;  // [M, N]
@@ -276,9 +278,10 @@ at::Tensor fused_experts_mxfp4(
     // First projection: [num_selected, K] @ [K, 2N] -> [num_selected, 2N]
     auto gate_up = torch::mm(current_hidden, expert_w1.t());
     
-    // Split and activate
-    auto gate = gate_up.slice(1, 0, N);
-    auto up = gate_up.slice(1, N, N2);
+    // Split and activate (interleaved layout: [g0, u0, g1, u1, ...])
+    // This matches GptOss's gate_up_proj layout
+    auto gate = gate_up.index({torch::indexing::Slice(), torch::indexing::Slice(0, torch::indexing::None, 2)});  // [num_selected, N]
+    auto up = gate_up.index({torch::indexing::Slice(), torch::indexing::Slice(1, torch::indexing::None, 2)});    // [num_selected, N]
     auto activated = torch::silu(gate) * up;  // [num_selected, N]
     
     // Dequantize w2 for this expert: [K, N/2] -> [K, N]
