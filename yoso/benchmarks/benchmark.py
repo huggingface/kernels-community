@@ -73,25 +73,25 @@ class YosoBenchmark(Benchmark):
         self.hashtable_capacity = 1 << self.hash_code_len
 
         self.query_mask = torch.ones(
-            batch_size, num_query, device="cuda", dtype=torch.int32
+            batch_size, num_query, device=self.device, dtype=torch.int32
         )
         self.query_vector = torch.randn(
-            batch_size, num_query, dim, device="cuda", dtype=torch.float32
+            batch_size, num_query, dim, device=self.device, dtype=torch.float32
         )
         self.key_mask = torch.ones(
-            batch_size, num_key, device="cuda", dtype=torch.int32
+            batch_size, num_key, device=self.device, dtype=torch.int32
         )
         self.key_vector = torch.randn(
-            batch_size, num_key, dim, device="cuda", dtype=torch.float32
+            batch_size, num_key, dim, device=self.device, dtype=torch.float32
         )
         self.value = torch.randn(
-            batch_size, num_key, self.value_dim, device="cuda", dtype=torch.float32
+            batch_size, num_key, self.value_dim, device=self.device, dtype=torch.float32
         )
         self.query_weight = torch.randn(
-            batch_size, num_query, self.weight_dim, device="cuda", dtype=torch.float32
+            batch_size, num_query, self.weight_dim, device=self.device, dtype=torch.float32
         )
         self.key_weight = torch.randn(
-            batch_size, num_key, self.weight_dim, device="cuda", dtype=torch.float32
+            batch_size, num_key, self.weight_dim, device=self.device, dtype=torch.float32
         )
 
         # Pre-compute hash codes for cumulation benchmarks
@@ -109,7 +109,7 @@ class YosoBenchmark(Benchmark):
         self.key_hash_code = hash_result[1]
 
         self.out = torch.empty(
-            batch_size, num_query, self.value_dim, device="cuda", dtype=torch.float32
+            batch_size, num_query, self.value_dim, device=self.device, dtype=torch.float32
         )
 
     def benchmark_base(self):
@@ -150,25 +150,25 @@ class YosoBenchmark(Benchmark):
         self.hashtable_capacity = 1 << self.hash_code_len
 
         self.query_mask = torch.ones(
-            batch_size, num_query, device="cuda", dtype=torch.int32
+            batch_size, num_query, device=self.device, dtype=torch.int32
         )
         self.query_vector = torch.randn(
-            batch_size, num_query, dim, device="cuda", dtype=torch.float32
+            batch_size, num_query, dim, device=self.device, dtype=torch.float32
         )
         self.key_mask = torch.ones(
-            batch_size, num_key, device="cuda", dtype=torch.int32
+            batch_size, num_key, device=self.device, dtype=torch.int32
         )
         self.key_vector = torch.randn(
-            batch_size, num_key, dim, device="cuda", dtype=torch.float32
+            batch_size, num_key, dim, device=self.device, dtype=torch.float32
         )
         self.value = torch.randn(
-            batch_size, num_key, self.value_dim, device="cuda", dtype=torch.float32
+            batch_size, num_key, self.value_dim, device=self.device, dtype=torch.float32
         )
         self.query_weight = torch.randn(
-            batch_size, num_query, self.weight_dim, device="cuda", dtype=torch.float32
+            batch_size, num_query, self.weight_dim, device=self.device, dtype=torch.float32
         )
         self.key_weight = torch.randn(
-            batch_size, num_key, self.weight_dim, device="cuda", dtype=torch.float32
+            batch_size, num_key, self.weight_dim, device=self.device, dtype=torch.float32
         )
 
         hash_result = self.kernel.fast_hash(
@@ -185,7 +185,7 @@ class YosoBenchmark(Benchmark):
         self.key_hash_code = hash_result[1]
 
         self.out = torch.empty(
-            batch_size, num_query, self.value_dim, device="cuda", dtype=torch.float32
+            batch_size, num_query, self.value_dim, device=self.device, dtype=torch.float32
         )
 
     def benchmark_large(self):

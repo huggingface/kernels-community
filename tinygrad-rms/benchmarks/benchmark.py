@@ -18,7 +18,7 @@ class TinygradRmsBenchmark(Benchmark):
         self.eps = 1e-6
 
         self.x = torch.randn(
-            batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float32
+            batch_size, seq_len, hidden_size, device=self.device, dtype=torch.float32
         )
         self.out = torch.empty_like(self.x)
 
@@ -36,7 +36,7 @@ class TinygradRmsBenchmark(Benchmark):
         self.eps = 1e-6
 
         self.x = torch.randn(
-            batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float32
+            batch_size, seq_len, hidden_size, device=self.device, dtype=torch.float32
         )
         self.out = torch.empty_like(self.x)
 

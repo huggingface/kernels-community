@@ -57,34 +57,34 @@ class PunicaSgmvBenchmark(Benchmark):
         self.layer_idx = layer_idx
 
         # Input tensor
-        self.x = torch.randn(batch_size, hidden_dim, device="cuda", dtype=dtype)
+        self.x = torch.randn(batch_size, hidden_dim, device=self.device, dtype=dtype)
 
         # LoRA weights - layout depends on rank
         if use_cutlass_shrink(lora_rank):
             # cutlass shrink uses (num_layers, H, r) layout
             self.wa = torch.randn(
-                num_layers, hidden_dim, lora_rank, device="cuda", dtype=dtype
+                num_layers, hidden_dim, lora_rank, device=self.device, dtype=dtype
             )
         else:
             # custom kernel uses (num_layers, r, H) layout
             self.wa = torch.randn(
-                num_layers, lora_rank, hidden_dim, device="cuda", dtype=dtype
+                num_layers, lora_rank, hidden_dim, device=self.device, dtype=dtype
             )
 
         self.wb = torch.randn(
-            num_layers, lora_rank, hidden_dim, device="cuda", dtype=dtype
+            num_layers, lora_rank, hidden_dim, device=self.device, dtype=dtype
         )
 
         # Segment indices - split batch into segments
-        self.s_start = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
-        self.s_end = torch.tensor([4, 8], dtype=torch.int32, device="cuda")
+        self.s_start = torch.tensor([0, 4], dtype=torch.int32, device=self.device)
+        self.s_end = torch.tensor([4, 8], dtype=torch.int32, device=self.device)
 
         # Pointers to LoRA weights (both segments use same weights for simplicity)
         self.wa_ptr = torch.tensor(
-            [self.wa.data_ptr()] * num_segments, dtype=torch.int64, device="cuda"
+            [self.wa.data_ptr()] * num_segments, dtype=torch.int64, device=self.device
         )
         self.wb_ptr = torch.tensor(
-            [self.wb.data_ptr()] * num_segments, dtype=torch.int64, device="cuda"
+            [self.wb.data_ptr()] * num_segments, dtype=torch.int64, device=self.device
         )
 
         # Get temporary buffers
@@ -93,7 +93,7 @@ class PunicaSgmvBenchmark(Benchmark):
         )
 
         # Output tensor
-        self.out = torch.zeros(batch_size, hidden_dim, device="cuda", dtype=dtype)
+        self.out = torch.zeros(batch_size, hidden_dim, device=self.device, dtype=dtype)
 
     def benchmark_base(self):
         self.out.zero_()
@@ -141,25 +141,25 @@ class PunicaSgmvBenchmark(Benchmark):
 
         # Scale inputs to keep outputs in reasonable range for float16 precision
         scale = 0.01
-        self.x = torch.randn(batch_size, hidden_dim, device="cuda", dtype=dtype) * scale
+        self.x = torch.randn(batch_size, hidden_dim, device=self.device, dtype=dtype) * scale
 
         if use_cutlass_shrink(lora_rank):
             self.wa = (
                 torch.randn(
-                    num_layers, hidden_dim, lora_rank, device="cuda", dtype=dtype
+                    num_layers, hidden_dim, lora_rank, device=self.device, dtype=dtype
                 )
                 * scale
             )
         else:
             self.wa = (
                 torch.randn(
-                    num_layers, lora_rank, hidden_dim, device="cuda", dtype=dtype
+                    num_layers, lora_rank, hidden_dim, device=self.device, dtype=dtype
                 )
                 * scale
             )
 
         self.wb = (
-            torch.randn(num_layers, lora_rank, hidden_dim, device="cuda", dtype=dtype)
+            torch.randn(num_layers, lora_rank, hidden_dim, device=self.device, dtype=dtype)
             * scale
         )
 
@@ -168,26 +168,26 @@ class PunicaSgmvBenchmark(Benchmark):
         self.s_start = torch.tensor(
             [i * seg_size for i in range(num_segments)],
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
         self.s_end = torch.tensor(
             [(i + 1) * seg_size for i in range(num_segments)],
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
 
         self.wa_ptr = torch.tensor(
-            [self.wa.data_ptr()] * num_segments, dtype=torch.int64, device="cuda"
+            [self.wa.data_ptr()] * num_segments, dtype=torch.int64, device=self.device
         )
         self.wb_ptr = torch.tensor(
-            [self.wb.data_ptr()] * num_segments, dtype=torch.int64, device="cuda"
+            [self.wb.data_ptr()] * num_segments, dtype=torch.int64, device=self.device
         )
 
         self.tmp_shrink, self.tmp_expand = self.kernel.get_tmp_tensors(
             num_segments, lora_rank, torch.device("cuda")
         )
 
-        self.out = torch.zeros(batch_size, hidden_dim, device="cuda", dtype=dtype)
+        self.out = torch.zeros(batch_size, hidden_dim, device=self.device, dtype=dtype)
 
     def benchmark_large(self):
         self.out.zero_()

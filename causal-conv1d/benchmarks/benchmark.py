@@ -10,12 +10,12 @@ class CausalConv1dBenchmark(Benchmark):
     def setup(self):
         batch_size, dim, seqlen, width = 2, 64, 128, 4
         self.x = torch.randn(
-            batch_size, dim, seqlen, device="cuda", dtype=torch.float16
+            batch_size, dim, seqlen, device=self.device, dtype=torch.float16
         )
-        self.weight = torch.randn(dim, width, device="cuda", dtype=torch.float32)
-        self.bias = torch.randn(dim, device="cuda", dtype=torch.float32)
+        self.weight = torch.randn(dim, width, device=self.device, dtype=torch.float32)
+        self.bias = torch.randn(dim, device=self.device, dtype=torch.float32)
         self.out = torch.empty(
-            batch_size, dim, seqlen, device="cuda", dtype=torch.float16
+            batch_size, dim, seqlen, device=self.device, dtype=torch.float16
         )
         self.dim = dim
         self.width = width
@@ -38,12 +38,12 @@ class CausalConv1dBenchmark(Benchmark):
     def setup_large(self):
         batch_size, dim, seqlen, width = 8, 256, 512, 4
         self.x = torch.randn(
-            batch_size, dim, seqlen, device="cuda", dtype=torch.float16
+            batch_size, dim, seqlen, device=self.device, dtype=torch.float16
         )
-        self.weight = torch.randn(dim, width, device="cuda", dtype=torch.float32)
-        self.bias = torch.randn(dim, device="cuda", dtype=torch.float32)
+        self.weight = torch.randn(dim, width, device=self.device, dtype=torch.float32)
+        self.bias = torch.randn(dim, device=self.device, dtype=torch.float32)
         self.out = torch.empty(
-            batch_size, dim, seqlen, device="cuda", dtype=torch.float16
+            batch_size, dim, seqlen, device=self.device, dtype=torch.float16
         )
         self.dim = dim
         self.width = width
@@ -66,12 +66,12 @@ class CausalConv1dBenchmark(Benchmark):
     def setup_xlarge(self):
         batch_size, dim, seqlen, width = 16, 512, 1024, 4
         self.x = torch.randn(
-            batch_size, dim, seqlen, device="cuda", dtype=torch.float16
+            batch_size, dim, seqlen, device=self.device, dtype=torch.float16
         )
-        self.weight = torch.randn(dim, width, device="cuda", dtype=torch.float32)
-        self.bias = torch.randn(dim, device="cuda", dtype=torch.float32)
+        self.weight = torch.randn(dim, width, device=self.device, dtype=torch.float32)
+        self.bias = torch.randn(dim, device=self.device, dtype=torch.float32)
         self.out = torch.empty(
-            batch_size, dim, seqlen, device="cuda", dtype=torch.float16
+            batch_size, dim, seqlen, device=self.device, dtype=torch.float16
         )
         self.dim = dim
         self.width = width

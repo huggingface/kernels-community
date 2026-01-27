@@ -55,8 +55,8 @@ class QuantizeFp8PerRowBenchmark(Benchmark):
 
     def setup(self):
         M, K = 512, 1024
-        self.a = torch.randn(M, K, device="cuda", dtype=torch.float32)
-        self.out = torch.empty(M, K, device="cuda", dtype=torch.float32)
+        self.a = torch.randn(M, K, device=self.device, dtype=torch.float32)
+        self.out = torch.empty(M, K, device=self.device, dtype=torch.float32)
 
     def benchmark_base(self):
         a_fp8, a_scale = self.kernel.quantize_fp8_per_row(self.a)
@@ -68,8 +68,8 @@ class QuantizeFp8PerRowBenchmark(Benchmark):
 
     def setup_large(self):
         M, K = 2048, 4096
-        self.a = torch.randn(M, K, device="cuda", dtype=torch.float32)
-        self.out = torch.empty(M, K, device="cuda", dtype=torch.float32)
+        self.a = torch.randn(M, K, device=self.device, dtype=torch.float32)
+        self.out = torch.empty(M, K, device=self.device, dtype=torch.float32)
 
     def benchmark_large(self):
         a_fp8, a_scale = self.kernel.quantize_fp8_per_row(self.a)

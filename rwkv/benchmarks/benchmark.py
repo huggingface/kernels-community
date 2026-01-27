@@ -50,12 +50,12 @@ class RwkvBenchmark(Benchmark):
         B, T, C = 2, 64, 256
 
         self.w = torch.randn(
-            C, device="cuda", dtype=torch.float32
+            C, device=self.device, dtype=torch.float32
         ).abs()  # Decay should be positive
-        self.u = torch.randn(C, device="cuda", dtype=torch.float32)
-        self.k = torch.randn(B, T, C, device="cuda", dtype=torch.float32) * 0.1
-        self.v = torch.randn(B, T, C, device="cuda", dtype=torch.float32) * 0.1
-        self.out = torch.zeros(B, T, C, device="cuda", dtype=torch.float32)
+        self.u = torch.randn(C, device=self.device, dtype=torch.float32)
+        self.k = torch.randn(B, T, C, device=self.device, dtype=torch.float32) * 0.1
+        self.v = torch.randn(B, T, C, device=self.device, dtype=torch.float32) * 0.1
+        self.out = torch.zeros(B, T, C, device=self.device, dtype=torch.float32)
 
     def benchmark_base(self):
         self.out.zero_()
@@ -67,11 +67,11 @@ class RwkvBenchmark(Benchmark):
     def setup_large(self):
         B, T, C = 8, 256, 512
 
-        self.w = torch.randn(C, device="cuda", dtype=torch.float32).abs()
-        self.u = torch.randn(C, device="cuda", dtype=torch.float32)
-        self.k = torch.randn(B, T, C, device="cuda", dtype=torch.float32) * 0.1
-        self.v = torch.randn(B, T, C, device="cuda", dtype=torch.float32) * 0.1
-        self.out = torch.zeros(B, T, C, device="cuda", dtype=torch.float32)
+        self.w = torch.randn(C, device=self.device, dtype=torch.float32).abs()
+        self.u = torch.randn(C, device=self.device, dtype=torch.float32)
+        self.k = torch.randn(B, T, C, device=self.device, dtype=torch.float32) * 0.1
+        self.v = torch.randn(B, T, C, device=self.device, dtype=torch.float32) * 0.1
+        self.out = torch.zeros(B, T, C, device=self.device, dtype=torch.float32)
 
     def benchmark_large(self):
         self.out.zero_()

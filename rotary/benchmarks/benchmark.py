@@ -31,7 +31,7 @@ class RotaryBenchmark(Benchmark):
             seqlen,
             num_heads,
             rotary_dim,
-            device="cuda",
+            device=self.device,
             dtype=torch.float32,
         )
         self.x2 = torch.randn(
@@ -39,16 +39,16 @@ class RotaryBenchmark(Benchmark):
             seqlen,
             num_heads,
             rotary_dim,
-            device="cuda",
+            device=self.device,
             dtype=torch.float32,
         )
 
         # Rotary position embeddings
         self.cos = torch.randn(
-            seqlen, 1, rotary_dim, device="cuda", dtype=torch.float32
+            seqlen, 1, rotary_dim, device=self.device, dtype=torch.float32
         )
         self.sin = torch.randn(
-            seqlen, 1, rotary_dim, device="cuda", dtype=torch.float32
+            seqlen, 1, rotary_dim, device=self.device, dtype=torch.float32
         )
 
         # Output tensors (in-place, so clone inputs)
@@ -82,7 +82,7 @@ class RotaryBenchmark(Benchmark):
             seqlen,
             num_heads,
             rotary_dim,
-            device="cuda",
+            device=self.device,
             dtype=torch.float32,
         )
         self.x2 = torch.randn(
@@ -90,15 +90,15 @@ class RotaryBenchmark(Benchmark):
             seqlen,
             num_heads,
             rotary_dim,
-            device="cuda",
+            device=self.device,
             dtype=torch.float32,
         )
 
         self.cos = torch.randn(
-            seqlen, 1, rotary_dim, device="cuda", dtype=torch.float32
+            seqlen, 1, rotary_dim, device=self.device, dtype=torch.float32
         )
         self.sin = torch.randn(
-            seqlen, 1, rotary_dim, device="cuda", dtype=torch.float32
+            seqlen, 1, rotary_dim, device=self.device, dtype=torch.float32
         )
 
         self.out1 = self.x1.clone()
