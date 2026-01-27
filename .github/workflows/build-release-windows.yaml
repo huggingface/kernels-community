@@ -217,7 +217,7 @@ jobs:
           KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
         run: |
           # Install kernels package for upload
-          pip install kernels
+          pip install -U kernels --no-cache-dir
           
           # Debug: list the build directory structure
           Write-Host "Build directory structure:"
