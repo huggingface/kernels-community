@@ -47,11 +47,24 @@ at::Tensor fused_experts(
         w1_bias, w2_bias, alpha, limit, is_vnni);
   } else {
     // Use fallback implementation
-    // Fallback only supports non-quantized weights
+    // Fallback supports non-quantized and MXFP4 weights
     TORCH_CHECK(
-        !use_int8_w8a8 && !use_fp8_w8a16 && !use_mxfp4,
-        "Quantized MoE (int8/fp8/mxfp4) requires AVX512 and AVX512-BF16 support. "
-        "Your CPU does not support these features. Please use non-quantized weights.");
+        !use_int8_w8a8 && !use_fp8_w8a16,
+        "Quantized MoE (int8/fp8) requires AVX512 and AVX512-BF16 support. "
+        "Your CPU does not support these features. Please use non-quantized weights or MXFP4.");
+
+    if (use_mxfp4) {
+      // Use MXFP4 fallback implementation
+      TORCH_CHECK(w1_scale.has_value() && w2_scale.has_value(),
+          "MXFP4 requires w1_scale and w2_scale");
+      TORCH_CHECK(block_size.has_value() && !block_size->empty(),
+          "MXFP4 requires block_size");
+      
+      int64_t bs = block_size->front();
+      return fallback::fused_experts_mxfp4(
+          hidden_states, w1, w2, topk_weights, topk_ids,
+          w1_scale.value(), w2_scale.value(), bs, inplace);
+    }
 
     return fallback::fused_experts(
         hidden_states, w1, w2, topk_weights, topk_ids, inplace);

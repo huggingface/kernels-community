@@ -60,6 +60,36 @@ at::Tensor shared_expert(
     double routed_scaling_factor,
     bool inplace);
 
+// Fused experts with MXFP4 quantization using pure PyTorch operations
+//
+// Args:
+//   hidden_states: [M, K]
+//   w1: [E, N, K/2] - packed mxfp4 gate and up projections (2 values per byte)
+//   w2: [E, K/2, N/2] - packed mxfp4 down projection
+//   topk_weights: [M, topk]
+//   topk_ids: [M, topk]
+//   w1_scale: [E, N*2, K/32] - scales for w1
+//   w2_scale: [E, K, N/32] - scales for w2
+//   block_size: block size for quantization (typically 32)
+//   inplace: whether to use hidden_states as output
+at::Tensor fused_experts_mxfp4(
+    at::Tensor& hidden_states,
+    at::Tensor& w1,
+    at::Tensor& w2,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    const at::Tensor& w1_scale,
+    const at::Tensor& w2_scale,
+    int64_t block_size,
+    bool inplace);
+
+// Dequantize MXFP4 tensor to float
+// MXFP4 format: 4-bit E2M1 format with shared 8-bit scale per block
+at::Tensor dequantize_mxfp4(
+    const at::Tensor& packed_weight,  // [... , N/2] - 2 values per byte
+    const at::Tensor& scale,          // [... , N/block_size]
+    int64_t block_size);
+
 // Convert weight - for fallback, just transpose for matmul compatibility
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
