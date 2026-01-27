@@ -94,7 +94,9 @@ class MSDeformAttnBenchmark(Benchmark):
 
         # Spatial shapes for 4 levels: 64x64, 32x32, 16x16, 8x8
         spatial_shapes = torch.tensor(
-            [[64, 64], [32, 32], [16, 16], [8, 8]], dtype=torch.int64, device=self.device
+            [[64, 64], [32, 32], [16, 16], [8, 8]],
+            dtype=torch.int64,
+            device=self.device,
         )
         # Calculate spatial_size = sum of H*W for all levels
         spatial_size = (64 * 64) + (32 * 32) + (16 * 16) + (8 * 8)  # 5440
@@ -107,7 +109,12 @@ class MSDeformAttnBenchmark(Benchmark):
         )
 
         self.value = torch.randn(
-            batch, spatial_size, num_heads, channels, device=self.device, dtype=torch.float32
+            batch,
+            spatial_size,
+            num_heads,
+            channels,
+            device=self.device,
+            dtype=torch.float32,
         )
         self.spatial_shapes = spatial_shapes
         self.level_start_index = level_start_index
@@ -135,7 +142,11 @@ class MSDeformAttnBenchmark(Benchmark):
         self.im2col_step = im2col_step
 
         self.out = torch.empty(
-            batch, num_query, num_heads * channels, device=self.device, dtype=torch.float32
+            batch,
+            num_query,
+            num_heads * channels,
+            device=self.device,
+            dtype=torch.float32,
         )
 
     def benchmark_forward(self):
@@ -167,7 +178,9 @@ class MSDeformAttnBenchmark(Benchmark):
         im2col_step = 64
 
         spatial_shapes = torch.tensor(
-            [[64, 64], [32, 32], [16, 16], [8, 8]], dtype=torch.int64, device=self.device
+            [[64, 64], [32, 32], [16, 16], [8, 8]],
+            dtype=torch.int64,
+            device=self.device,
         )
         spatial_size = (64 * 64) + (32 * 32) + (16 * 16) + (8 * 8)
 
@@ -178,7 +191,12 @@ class MSDeformAttnBenchmark(Benchmark):
         )
 
         self.value = torch.randn(
-            batch, spatial_size, num_heads, channels, device=self.device, dtype=torch.float32
+            batch,
+            spatial_size,
+            num_heads,
+            channels,
+            device=self.device,
+            dtype=torch.float32,
         )
         self.spatial_shapes = spatial_shapes
         self.level_start_index = level_start_index
@@ -205,7 +223,11 @@ class MSDeformAttnBenchmark(Benchmark):
         self.im2col_step = im2col_step
 
         self.out = torch.empty(
-            batch, num_query, num_heads * channels, device=self.device, dtype=torch.float32
+            batch,
+            num_query,
+            num_heads * channels,
+            device=self.device,
+            dtype=torch.float32,
         )
 
     def benchmark_large(self):

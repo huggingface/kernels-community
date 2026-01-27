@@ -120,7 +120,12 @@ class PagedAttentionBenchmark(Benchmark):
             dtype=dtype,
         )
         self.value_cache = torch.randn(
-            num_blocks, num_heads, head_size, block_size, device=self.device, dtype=dtype
+            num_blocks,
+            num_heads,
+            head_size,
+            block_size,
+            device=self.device,
+            dtype=dtype,
         )
 
         # Block tables: mapping from sequences to memory blocks
@@ -202,7 +207,12 @@ class PagedAttentionBenchmark(Benchmark):
             dtype=dtype,
         )
         self.value_cache = torch.randn(
-            num_blocks, num_heads, head_size, block_size, device=self.device, dtype=dtype
+            num_blocks,
+            num_heads,
+            head_size,
+            block_size,
+            device=self.device,
+            dtype=dtype,
         )
 
         max_num_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
