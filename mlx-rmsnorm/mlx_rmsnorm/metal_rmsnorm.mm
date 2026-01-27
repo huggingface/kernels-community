@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <torch/version.h>
 #include <ATen/Functions.h>
 #include <ATen/mps/MPSStream.h>
 #include <ATen/native/mps/OperationUtils.h>
@@ -17,11 +18,16 @@
 #include EMBEDDED_METALLIB_HEADER
 #endif
 
+#if defined(TORCH_VERSION_MAJOR) && defined(TORCH_VERSION_MINOR) && \
+    (TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 10))
+#define HAS_GLOBAL_DISPATCH_SYNC_WITH_RETHROW 1
+#endif
+
 static inline void dispatch_sync_with_rethrow_compat(dispatch_queue_t q, void (^block)()) {
-#ifdef MLX_RMSNORM_TORCH_MPS_NS_DISPATCH
-  at::native::mps::dispatch_sync_with_rethrow(q, block);
+#ifdef HAS_GLOBAL_DISPATCH_SYNC_WITH_RETHROW
+  dispatch_sync_with_rethrow(q, block);
 #else
-  dispatch_sync(q, block);
+  at::native::mps::dispatch_sync_with_rethrow(q, block);
 #endif
 }
 
