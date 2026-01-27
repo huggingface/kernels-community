@@ -17,6 +17,13 @@
 #include EMBEDDED_METALLIB_HEADER
 #endif
 
+static inline void dispatch_sync_with_rethrow_compat(dispatch_queue_t q, void (^block)()) {
+#ifdef MLX_RMSNORM_TORCH_MPS_NS_DISPATCH
+  at::native::mps::dispatch_sync_with_rethrow(q, block);
+#else
+  dispatch_sync(q, block);
+#endif
+}
 
 #import "metal_rmsnorm.h"
 
@@ -161,7 +168,7 @@ void dispatch_kernel(const std::string& name,
   at::mps::MPSStream* stream = at::mps::getCurrentMPSStream();
   TORCH_CHECK(stream, "MPS stream is unavailable");
 
-  at::native::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
+  dispatch_sync_with_rethrow_compat(stream->queue(), ^{
     @autoreleasepool {
       id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
       id<MTLDevice> device = stream->device();
