@@ -57,7 +57,7 @@ class MRABenchmark(Benchmark):
             A_num_block,
             head_dim,
             block_size,
-            device="cuda",
+            device=self.device,
             dtype=torch.float32,
         )
         # dense_B: [batch_size, B_num_block, dim, 32]
@@ -66,7 +66,7 @@ class MRABenchmark(Benchmark):
             B_num_block,
             head_dim,
             block_size,
-            device="cuda",
+            device=self.device,
             dtype=torch.float32,
         )
         # indices: [batch_size, num_block]
@@ -74,7 +74,7 @@ class MRABenchmark(Benchmark):
             0,
             total_blocks,
             (self.batch_heads, indices_per_block),
-            device="cuda",
+            device=self.device,
             dtype=torch.int32,
         )
 
@@ -102,7 +102,7 @@ class MRABenchmark(Benchmark):
             A_num_block,
             head_dim,
             block_size,
-            device="cuda",
+            device=self.device,
             dtype=torch.float32,
         )
         self.dense_b = torch.randn(
@@ -110,14 +110,14 @@ class MRABenchmark(Benchmark):
             B_num_block,
             head_dim,
             block_size,
-            device="cuda",
+            device=self.device,
             dtype=torch.float32,
         )
         self.indices = torch.randint(
             0,
             total_blocks,
             (self.batch_heads, indices_per_block),
-            device="cuda",
+            device=self.device,
             dtype=torch.int32,
         )
 

@@ -84,28 +84,28 @@ class MegaBlocksMoeBenchmark(Benchmark):
         batch, seq = 8, 1
 
         # Router
-        self.router_weight = torch.randn(ne, hs, device="cuda", dtype=torch.float32)
+        self.router_weight = torch.randn(ne, hs, device=self.device, dtype=torch.float32)
         torch.nn.init.kaiming_uniform_(self.router_weight)
-        self.router_bias = torch.zeros(ne, device="cuda", dtype=torch.float32)
+        self.router_bias = torch.zeros(ne, device=self.device, dtype=torch.float32)
 
         # Expert weights
         self.gate_up_proj = (
-            torch.randn(ne, hs, isz, device="cuda", dtype=torch.float32) * 0.02
+            torch.randn(ne, hs, isz, device=self.device, dtype=torch.float32) * 0.02
         )
         self.gate_up_proj_bias = torch.zeros(
-            ne, isz, device="cuda", dtype=torch.float32
+            ne, isz, device=self.device, dtype=torch.float32
         )
         self.down_proj = (
-            torch.randn(ne, isz // 2, hs, device="cuda", dtype=torch.float32) * 0.02
+            torch.randn(ne, isz // 2, hs, device=self.device, dtype=torch.float32) * 0.02
         )
-        self.down_proj_bias = torch.zeros(ne, hs, device="cuda", dtype=torch.float32)
+        self.down_proj_bias = torch.zeros(ne, hs, device=self.device, dtype=torch.float32)
 
         # Input
-        self.x = torch.randn(seq, batch, hs, device="cuda", dtype=torch.float32) * 0.1
+        self.x = torch.randn(seq, batch, hs, device=self.device, dtype=torch.float32) * 0.1
 
         # Setup the model
         self.model = self.kernel.layers.MegaBlocksMoeMLP()
-        self.model.router = torch.nn.Linear(hs, ne, device="cuda")
+        self.model.router = torch.nn.Linear(hs, ne, device=self.device)
         self.model.router.weight.data = self.router_weight.clone()
         self.model.router.bias.data = self.router_bias.clone()
 
@@ -129,7 +129,7 @@ class MegaBlocksMoeBenchmark(Benchmark):
             num_experts=ne,
         )
 
-        self.out = torch.empty(seq, batch, hs, device="cuda", dtype=torch.float32)
+        self.out = torch.empty(seq, batch, hs, device=self.device, dtype=torch.float32)
 
     def benchmark_base(self):
         self.out, self.expert_weights = self.model(self.x)
@@ -153,28 +153,28 @@ class MegaBlocksMoeBenchmark(Benchmark):
         batch, seq = 32, 16
 
         # Router
-        self.router_weight = torch.randn(ne, hs, device="cuda", dtype=torch.float32)
+        self.router_weight = torch.randn(ne, hs, device=self.device, dtype=torch.float32)
         torch.nn.init.kaiming_uniform_(self.router_weight)
-        self.router_bias = torch.zeros(ne, device="cuda", dtype=torch.float32)
+        self.router_bias = torch.zeros(ne, device=self.device, dtype=torch.float32)
 
         # Expert weights
         self.gate_up_proj = (
-            torch.randn(ne, hs, isz, device="cuda", dtype=torch.float32) * 0.02
+            torch.randn(ne, hs, isz, device=self.device, dtype=torch.float32) * 0.02
         )
         self.gate_up_proj_bias = torch.zeros(
-            ne, isz, device="cuda", dtype=torch.float32
+            ne, isz, device=self.device, dtype=torch.float32
         )
         self.down_proj = (
-            torch.randn(ne, isz // 2, hs, device="cuda", dtype=torch.float32) * 0.02
+            torch.randn(ne, isz // 2, hs, device=self.device, dtype=torch.float32) * 0.02
         )
-        self.down_proj_bias = torch.zeros(ne, hs, device="cuda", dtype=torch.float32)
+        self.down_proj_bias = torch.zeros(ne, hs, device=self.device, dtype=torch.float32)
 
         # Input
-        self.x = torch.randn(seq, batch, hs, device="cuda", dtype=torch.float32) * 0.1
+        self.x = torch.randn(seq, batch, hs, device=self.device, dtype=torch.float32) * 0.1
 
         # Setup the model
         self.model = self.kernel.layers.MegaBlocksMoeMLP()
-        self.model.router = torch.nn.Linear(hs, ne, device="cuda")
+        self.model.router = torch.nn.Linear(hs, ne, device=self.device)
         self.model.router.weight.data = self.router_weight.clone()
         self.model.router.bias.data = self.router_bias.clone()
 
@@ -200,7 +200,7 @@ class MegaBlocksMoeBenchmark(Benchmark):
             capacity_factor=4.0,  # Higher capacity to avoid token dropping
         )
 
-        self.out = torch.empty(seq, batch, hs, device="cuda", dtype=torch.float32)
+        self.out = torch.empty(seq, batch, hs, device=self.device, dtype=torch.float32)
 
     def benchmark_large(self):
         self.out, self.expert_weights = self.model(self.x)

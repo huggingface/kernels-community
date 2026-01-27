@@ -8,7 +8,7 @@ class ReluBenchmark(Benchmark):
     seed: int = 42
 
     def setup(self):
-        self.x = torch.randn(1024, 1024, device="cuda", dtype=torch.float32)
+        self.x = torch.randn(1024, 1024, device=self.device, dtype=torch.float32)
         self.out = torch.empty_like(self.x)
 
     def benchmark_base(self):
@@ -18,7 +18,7 @@ class ReluBenchmark(Benchmark):
         return F.relu(self.x)
 
     def setup_large(self):
-        self.x = torch.randn(4096, 4096, device="cuda", dtype=torch.float32)
+        self.x = torch.randn(4096, 4096, device=self.device, dtype=torch.float32)
         self.out = torch.empty_like(self.x)
 
     def benchmark_large(self):

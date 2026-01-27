@@ -104,7 +104,7 @@ class PagedAttentionBenchmark(Benchmark):
 
         # Query tensor (current token)
         self.query = torch.randn(
-            num_seqs, num_heads, head_size, device="cuda", dtype=dtype
+            num_seqs, num_heads, head_size, device=self.device, dtype=dtype
         )
 
         # KV cache with proper layout for the kernel
@@ -116,11 +116,11 @@ class PagedAttentionBenchmark(Benchmark):
             head_size // x,
             block_size,
             x,
-            device="cuda",
+            device=self.device,
             dtype=dtype,
         )
         self.value_cache = torch.randn(
-            num_blocks, num_heads, head_size, block_size, device="cuda", dtype=dtype
+            num_blocks, num_heads, head_size, block_size, device=self.device, dtype=dtype
         )
 
         # Block tables: mapping from sequences to memory blocks
@@ -129,18 +129,18 @@ class PagedAttentionBenchmark(Benchmark):
             0,
             num_blocks,
             (num_seqs, max_num_blocks_per_seq),
-            device="cuda",
+            device=self.device,
             dtype=torch.int32,
         )
 
         # Sequence lengths
         self.seq_lens = torch.tensor(
-            [64, 96, 48, 128], device="cuda", dtype=torch.int32
+            [64, 96, 48, 128], device=self.device, dtype=torch.int32
         )
 
         # KV scales
-        self.k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
-        self.v_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+        self.k_scale = torch.tensor(1.0, dtype=torch.float32, device=self.device)
+        self.v_scale = torch.tensor(1.0, dtype=torch.float32, device=self.device)
 
         # Output tensor
         self.out = torch.empty_like(self.query)
@@ -188,7 +188,7 @@ class PagedAttentionBenchmark(Benchmark):
         self.scale = 1.0 / (head_size**0.5)
 
         self.query = torch.randn(
-            num_seqs, num_heads, head_size, device="cuda", dtype=dtype
+            num_seqs, num_heads, head_size, device=self.device, dtype=dtype
         )
 
         x = 16 // torch.tensor([], dtype=dtype).element_size()
@@ -198,11 +198,11 @@ class PagedAttentionBenchmark(Benchmark):
             head_size // x,
             block_size,
             x,
-            device="cuda",
+            device=self.device,
             dtype=dtype,
         )
         self.value_cache = torch.randn(
-            num_blocks, num_heads, head_size, block_size, device="cuda", dtype=dtype
+            num_blocks, num_heads, head_size, block_size, device=self.device, dtype=dtype
         )
 
         max_num_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
@@ -210,17 +210,17 @@ class PagedAttentionBenchmark(Benchmark):
             0,
             num_blocks,
             (num_seqs, max_num_blocks_per_seq),
-            device="cuda",
+            device=self.device,
             dtype=torch.int32,
         )
 
         # Variable sequence lengths
         self.seq_lens = torch.randint(
-            64, max_seq_len + 1, (num_seqs,), device="cuda", dtype=torch.int32
+            64, max_seq_len + 1, (num_seqs,), device=self.device, dtype=torch.int32
         )
 
-        self.k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
-        self.v_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+        self.k_scale = torch.tensor(1.0, dtype=torch.float32, device=self.device)
+        self.v_scale = torch.tensor(1.0, dtype=torch.float32, device=self.device)
 
         self.out = torch.empty_like(self.query)
 
