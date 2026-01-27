@@ -57,10 +57,13 @@ at::Tensor fused_experts(
       // Use MXFP4 fallback implementation
       TORCH_CHECK(w1_scale.has_value() && w2_scale.has_value(),
           "MXFP4 requires w1_scale and w2_scale");
-      TORCH_CHECK(block_size.has_value() && !block_size->empty(),
-          "MXFP4 requires block_size");
       
-      int64_t bs = block_size->front();
+      // Default block_size to 32 if not provided (same as AVX512 path)
+      int64_t bs = 32;
+      if (block_size.has_value() && !block_size->empty()) {
+        bs = block_size->front();
+      }
+      
       return fallback::fused_experts_mxfp4(
           hidden_states, w1, w2, topk_weights, topk_ids,
           w1_scale.value(), w2_scale.value(), bs, inplace);
