@@ -2,7 +2,7 @@
   description = "Flake for megablocks_moe kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernel-builder/version-option";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
@@ -10,7 +10,7 @@
       self,
       kernel-builder,
     }:
-    kernel-builder.lib.genFlakeOutputs {
+    kernel-builder.lib.genKernelFlakeOutputs {
       inherit self;
       path = ./.;
 
@@ -22,9 +22,15 @@
           torchmetrics
         ];
 
-      torchVersions = builtins.filter (
-        version: !(version ? xpuVersion) || builtins.compareVersions version.torchVersion "2.9" >= 0
-      );
+      torchVersions =
+        let
+          # For CPU builds, only x86_64-linux is currently supported.
+          cpuSupported = version: system: !(version ? "cpu") || system == "x86_64-linux";
+        in
+        allVersions:
+        builtins.map (
+          version: version // { systems = builtins.filter (cpuSupported version) version.systems; }
+        ) allVersions;
     };
 
 }
