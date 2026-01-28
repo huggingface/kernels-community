@@ -251,7 +251,7 @@ jobs:
           $buildTomlPath = "$env:KERNEL_SOURCE\build.toml"
           if (Test-Path $buildTomlPath) {
             $content = Get-Content $buildTomlPath -Raw
-            if ($content -match '^\s*version\s*=\s*1\s*$') {
+            if ($content -match '(?m)^\s*version\s*=\s*1\s*(\r)?$') {
               Write-Host "Kernel version is 1, uploading to main branch..."
               kernels upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE" --branch main
             } else {
