@@ -1,0 +1,13 @@
+[general]
+name = "liger_kernels"
+backends = [
+    "cuda",
+    "rocm",
+    "xpu",
+]
+version = 1
+
+[general.hub]
+repo-id = "kernels-community/liger-kernels"
+
+[kernel]

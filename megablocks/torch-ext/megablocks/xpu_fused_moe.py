@@ -6,6 +6,14 @@ import torch
 from ._ops import ops
 
 
+def resolve_dtensor(weight: torch.Tensor):
+    """Convert DTensor to local tensor for use with custom ops."""
+    from torch.distributed._tensor import DTensor
+    if isinstance(weight, DTensor):
+        return weight.to_local()
+    return weight
+
+
 # Install meta kernels for torch.compile compatibility
 def _install_xpu_meta_kernels():
     """Install meta kernels for XPU MoE operations to support torch.compile"""
@@ -211,6 +219,21 @@ def xpu_fused_moe(hidden_states,
     is_int4: bool
     is_mxfp4: bool
     '''
+
+    # Resolve DTensors to local tensors before passing to custom ops
+    hidden_states = resolve_dtensor(hidden_states)
+    w13 = resolve_dtensor(w13)
+    w2 = resolve_dtensor(w2)
+    if w13_scales is not None:
+        w13_scales = resolve_dtensor(w13_scales)
+    if w13_bias is not None:
+        w13_bias = resolve_dtensor(w13_bias)
+    if w2_scales is not None:
+        w2_scales = resolve_dtensor(w2_scales)
+    if w2_bias is not None:
+        w2_bias = resolve_dtensor(w2_bias)
+    topk_weights = resolve_dtensor(topk_weights)
+    topk_ids = resolve_dtensor(topk_ids)
 
     output = torch.empty_like(hidden_states)
     num_rows, hidden_size = list(hidden_states.shape)

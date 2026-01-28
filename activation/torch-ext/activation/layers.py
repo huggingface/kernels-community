@@ -17,6 +17,8 @@ class SiluAndMul(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor):
+        if not x.is_contiguous():
+            x = x.contiguous()
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -36,6 +38,8 @@ class Silu(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor):
+        if not x.is_contiguous():
+            x = x.contiguous()
         out = torch.empty_like(x)
         ops.silu(out, x)
         return out
@@ -53,6 +57,8 @@ class Gelu(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor):
+        if not x.is_contiguous():
+            x = x.contiguous()
         out = torch.empty_like(x)
         ops.gelu(out, x)
         return out
@@ -70,6 +76,8 @@ class GeluTanh(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor):
+        if not x.is_contiguous():
+            x = x.contiguous()
         out = torch.empty_like(x)
         ops.gelu_tanh(out, x)
         return out
@@ -88,6 +96,8 @@ class MulAndSilu(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_contiguous():
+            x = x.contiguous()
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -108,6 +118,8 @@ class GeluAndMul(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor):
+        if not x.is_contiguous():
+            x = x.contiguous()
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -119,6 +131,8 @@ class GeluTanhAndMul(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor):
+        if not x.is_contiguous():
+            x = x.contiguous()
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -145,6 +159,8 @@ class FatreluAndMul(nn.Module):
         self.threshold = threshold
 
     def forward(self, x: torch.Tensor):
+        if not x.is_contiguous():
+            x = x.contiguous()
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -156,6 +172,8 @@ class FastGELU(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_contiguous():
+            x = x.contiguous()
         out = torch.empty_like(x)
         ops.gelu_fast(out, x)
         return out
@@ -165,6 +183,8 @@ class NewGELU(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_contiguous():
+            x = x.contiguous()
         out = torch.empty_like(x)
         ops.gelu_new(out, x)
         return out
@@ -174,6 +194,8 @@ class QuickGELU(nn.Module):
     can_torch_compile: bool = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_contiguous():
+            x = x.contiguous()
         out = torch.empty_like(x)
         ops.gelu_quick(out, x)
         return out
