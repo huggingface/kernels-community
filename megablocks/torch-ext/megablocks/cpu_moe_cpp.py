@@ -69,7 +69,7 @@ def fused_moe_cpp(
     """
     # MXFP4/FP8 kernels only support bf16, convert if needed
     orig_dtype = hidden_states.dtype
-    need_convert = (use_mxfp4 or use_fp8_w8a16) and orig_dtype != torch.bfloat16
+    need_convert = orig_dtype != torch.bfloat16
     if need_convert:
         hidden_states = hidden_states.to(torch.bfloat16)
 
@@ -116,17 +116,20 @@ class MegaBlocksMoeMLP(torch.nn.Module):
     can_torch_compile: bool = True
 
     def convert_weight(self, dtype, use_mxfp4: bool = False):
+        data_1 = self.experts.gate_up_proj.data.transpose(-1, -2).contiguous()
+        data_2 = self.experts.down_proj.data.transpose(-1, -2).contiguous()
         if use_mxfp4:
-            data_1 = ops.convert_weight_packed(self.experts.gate_up_proj.data.transpose(-1, -2).contiguous())
-            data_2 = ops.convert_weight_packed(self.experts.down_proj.data.transpose(-1, -2).contiguous())
-            self.experts.gate_up_proj.storage.data = data_1
-            self.experts.down_proj.storage.data = data_2
+            self.experts.gate_up_proj.storage.data = ops.convert_weight_packed(data_1)
+            self.experts.down_proj.storage.data = ops.convert_weight_packed(data_2)
         else:
-            data_1 = ops.convert_weight_packed(self.experts.gate_up_proj.data.transpose(-1, -2).contiguous())
-            data_2 = ops.convert_weight_packed(self.experts.down_proj.data.transpose(-1, -2).contiguous())
-            self.experts.gate_up_proj.data = data_1
-            self.experts.down_proj.data = data_2
+            # convert_weight_packed onlu supports bfloat16, float16, int8, fp8_e4m3 or uint8(mxfp4 or int4).
+            data_1 = data_1.to(torch.bfloat16) if data_1.dtype == torch.float32 else data_1
+            data_2 = data_2.to(torch.bfloat16) if data_2.dtype == torch.float32 else data_2
+            self.experts.gate_up_proj.data = ops.convert_weight_packed(data_1)
+            self.experts.down_proj.data = ops.convert_weight_packed(data_2)
 
+        # C++ kernel does not support float32.
+        dtype = torch.bfloat16 if dtype == torch.float32 else dtype
         if getattr(self.experts, "gate_up_proj_bias", None) is not None:
             self.experts.gate_up_proj_bias.data = self.experts.gate_up_proj_bias.data.to(dtype)
         if getattr(self.experts, "down_proj_bias", None) is not None:
