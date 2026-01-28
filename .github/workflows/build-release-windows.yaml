@@ -235,6 +235,28 @@ jobs:
           Write-Host "`nChecking for metadata.json files:"
           Get-ChildItem -Path "$env:KERNEL_SOURCE\build" -Recurse -Filter "metadata.json" | ForEach-Object { Write-Host "Found: $($_.FullName)" }
 
-          # Upload using the kernels CLI
-          # The kernels CLI checks both kernel_dir and kernel_dir/build for torch* variants with metadata.json
+          # Upload using the kernels CLI (branchless - uploads to version branch like v1, v2, etc.)
           kernels upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE"
+
+      - name: Upload v1 kernels to main
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        shell: pwsh
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
+          PYTHONUTF8: 1
+          PYTHONIOENCODING: utf-8
+        run: |
+          # Check if build.toml exists and has version = 1
+          $buildTomlPath = "$env:KERNEL_SOURCE\build.toml"
+          if (Test-Path $buildTomlPath) {
+            $content = Get-Content $buildTomlPath -Raw
+            if ($content -match '^\s*version\s*=\s*1\s*$') {
+              Write-Host "Kernel version is 1, uploading to main branch..."
+              kernels upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE" --branch main
+            } else {
+              Write-Host "Kernel version is not 1, skipping main branch upload"
+            }
+          } else {
+            Write-Host "build.toml not found, skipping main branch upload"
+          }
