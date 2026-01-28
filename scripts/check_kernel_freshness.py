@@ -90,6 +90,10 @@ def _github_api_request(url: str, token: str | None = None) -> dict:
         with request.urlopen(req, timeout=30) as response:
             return json.loads(response.read().decode())
     except error.HTTPError as e:
+        if e.code == 422:
+            # 422 means the branch does not exist and we only check main/master
+            # so we can ignore this error 
+            raise
         print(f"HTTP error {e.code} for {url}: {e.reason}")
         raise
     except error.URLError as e:
