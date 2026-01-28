@@ -1,10 +1,22 @@
-#pragma once
+#include "registration.h"
+#include "pytorch_shim.h"
 
-#include <optional>
-#include <vector>
+#include <torch/nn/functional.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
-#include <torch/torch.h>
+/**
+ *  Externs for the flash_attn ops to be exposed as a pytorch library
+ */
 
+// b: batch_size
+// b_k: batch_size_k
+// s_q: seqlen_q
+// s_k: seqlen_k
+// s_k_new: seqlen_k_new
+// h: num_heads
+// h_k: num_heads_k
+// d: head_size
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
         const at::Tensor &k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table.
@@ -40,40 +52,13 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         int num_splits,
         std::optional<bool> pack_gqa_,
         int const sm_margin,
-        std::optional<const at::Tensor> &s_aux_ // (h)
-        );
+        std::optional<const at::Tensor> &s_aux_,
+        int const cp_world_size,
+        int const cp_rank,
+        std::optional<const at::Tensor> &cp_tot_seqused_k
+);
 
-std::vector<at::Tensor> mha_bwd(
-    const at::Tensor &dout,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-    const at::Tensor &q,     // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-    const at::Tensor &k,     // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
-    const at::Tensor &v,     // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
-    const at::Tensor &out,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-    const at::Tensor &softmax_lse,    // (b, h, s_q) or (h, total_q) if there is cu_seqlens_q
-    std::optional<at::Tensor> &dq_,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-    std::optional<at::Tensor> &dk_,   // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
-    std::optional<at::Tensor> &dv_,   // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
-    std::optional<const at::Tensor> &cu_seqlens_q_,   // b+1
-    std::optional<const at::Tensor> &cu_seqlens_k_,   // b+1
-    std::optional<const at::Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
-    std::optional<const at::Tensor> &seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
-    std::optional<int> max_seqlen_q_,
-    std::optional<int> max_seqlen_k_,
-    float const softmax_scale,
-    bool is_causal,
-    int window_size_left,
-    int window_size_right,
-    float const softcap,
-    bool const deterministic,
-    int const sm_margin);
-
-std::vector<at::Tensor>
-mha_combine(const at::Tensor &out_partial,         // num_splits x batch_size x seqlen x num_heads x head_size
-            const at::Tensor &lse_partial,         // num_splits x batch_size x seqlen x num_heads
-            std::optional<at::Tensor> out_,        // batch_size x seqlen x num_heads x head_size
-            std::optional<at::ScalarType> out_dtype_
-            );
-
+// Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
 at::Tensor
 mha_fwd_get_scheduler_metadata(
         int batch_size,
@@ -99,5 +84,77 @@ mha_fwd_get_scheduler_metadata(
         int num_splits,
         std::optional<bool> pack_gqa_,
         int const sm_margin
-        );
+);
 
+/**
+ *  Torch Library Registration
+ */
+TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+    ops.def("fwd(Tensor!  q,"
+            "    Tensor   k,"
+            "    Tensor   v,"
+            "    Tensor?  k_new,"
+            "    Tensor?  v_new,"
+            "    Tensor?  q_v,"
+            "    Tensor!? out,"
+            "    Tensor?  cu_seqlens_q,"
+            "    Tensor?  cu_seqlens_k,"
+            "    Tensor?  cu_seqlens_k_new,"
+            "    Tensor?  seqused_q,"
+            "    Tensor?  seqused_k,"
+            "    int?     max_seqlen_q,"
+            "    int?     max_seqlen_k,"
+            "    Tensor?  page_table,"
+            "    Tensor?  kv_batch_idx,"
+            "    Tensor?  leftpad_k,"
+            "    Tensor?  rotary_cos,"
+            "    Tensor?  rotary_sin,"
+            "    Tensor?  seqlens_rotary,"
+            "    Tensor?  q_descale,"
+            "    Tensor?  k_descale,"
+            "    Tensor?  v_descale,"
+            "    float    softmax_scale,"
+            "    bool     is_causal,"
+            "    int      window_size_left,"
+            "    int      window_size_right,"
+            "    float    softcap,"
+            "    bool     is_rotary_interleaved,"
+            "    Tensor?  scheduler_metadata,"
+            "    int      num_splits,"
+            "    bool?    pack_gqa,"
+            "    int      sm_margin,"
+            "    Tensor?  s_aux,"
+            "    int      cp_world_size,"
+            "    int      cp_rank,"
+            "    Tensor?  cp_tot_seqused_k) -> Tensor[]");
+    ops.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
+
+    ops.def("get_scheduler_metadata("
+            "    int      batch_size,"
+            "    int      max_seqlen_q,"
+            "    int      max_seqlen_k,"
+            "    int      num_heads,"
+            "    int      num_heads_k,"
+            "    int      headdim,"
+            "    int      headdim_v,"
+            "    ScalarType qkv_dtype,"
+            "    Tensor   seqused_k,"
+            "    Tensor?  cu_seqlens_q,"
+            "    Tensor?  cu_seqlens_k,"
+            "    Tensor?  cu_seqlens_k_new,"
+            "    Tensor?  seqused_q,"
+            "    Tensor?  leftpad_k,"
+            "    int?     page_size,"
+            "    int      max_seqlen_k_new," // 0 means we're not appending new KV
+            "    bool     is_causal,"
+            "    int      window_size_left,"
+            "    int      window_size_right,"
+            "    bool     has_softcap,"
+            "    int      num_splits,"
+            "    bool?    pack_gqa,"
+            "    int      sm_margin) -> Tensor");
+   ops.impl("get_scheduler_metadata", torch::kCUDA, 
+        make_pytorch_shim(&mha_fwd_get_scheduler_metadata));
+}
+
+REGISTER_EXTENSION(TORCH_EXTENSION_NAME);

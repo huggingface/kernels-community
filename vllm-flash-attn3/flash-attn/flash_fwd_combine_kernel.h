@@ -153,6 +153,7 @@ public:
         int const* const cu_seqlens = nullptr;
         int const* const seqused = nullptr;
         int const* const num_splits_dynamic_ptr = nullptr;
+        int const* const varlen_batch_idx_ptr = nullptr;
         int* const semaphore_to_reset = nullptr;
     };
 
@@ -173,6 +174,7 @@ public:
         int const* const cu_seqlens = nullptr;
         int const* const seqused = nullptr;
         int const* const num_splits_dynamic_ptr = nullptr;
+        int const* const varlen_batch_idx_ptr = nullptr;
         int* const semaphore_to_reset = nullptr;
     };
 
@@ -197,6 +199,7 @@ public:
             args.cu_seqlens,
             args.seqused,
             args.num_splits_dynamic_ptr,
+            args.varlen_batch_idx_ptr,
             args.semaphore_to_reset
         };
     }
@@ -206,9 +209,12 @@ public:
         int seqlen_q;
         int total_q;
         int num_heads;
+        int num_heads_kv;
         int dv;
+        bool pack_gqa;
         int const* cu_seqlens_q;
         int const* seqused_q;
+        int const* prepare_seqlen_q_ptr;
     };
 
     struct StaticTileScheduler {
@@ -253,10 +259,13 @@ public:
         };
 
         struct Params {
-            int b;
-            int num_heads;
+            int const b;
+            int const num_heads;
+            int const num_heads_kv;
+            bool const pack_gqa;
             int const* const cu_seqlens_q;
             int const* const seqused_q;
+            int const* const prepare_seqlen_q_ptr;
             SchedulingAlgo algo;
         };
 
@@ -281,8 +290,11 @@ public:
             return {
                 args.b,
                 args.num_heads,
+                args.num_heads_kv,
+                args.pack_gqa,
                 args.cu_seqlens_q,
                 args.seqused_q,
+                args.prepare_seqlen_q_ptr,
                 choose_scheduling_algo(args)
             }; 
         }
@@ -292,7 +304,6 @@ public:
 
             switch (choose_scheduling_algo(args)) {
             case SchedulingAlgo::STANDARD: {
-                unsigned int num_blocks_k = cute::ceil_div(args.dv, kBlockK);
                 unsigned int num_blocks_m = cute::ceil_div(args.seqlen_q * args.num_heads, kBlockM);
                 return {num_blocks_m, num_blocks_k, static_cast<unsigned int>(args.b)};
             }
@@ -310,7 +321,6 @@ public:
         }
 
         CUTE_DEVICE BlockCoord get_block_coord_linearized_m_and_batch(Params const& params) {
-            int num_heads = params.num_heads;
             int curr_tile_id = blockIdx.x;
 
             // Scan through the batches find the batch that contains the current
@@ -333,8 +343,13 @@ public:
 
                     auto get_num_m_blocks = [&](int bidb) {
                         if (bidb >= params.b) return 0;
-                        flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, 0, params.cu_seqlens_q, params.seqused_q};
-                        return cute::ceil_div(seqlen_info.seqlen * num_heads, Int<kBlockM>{}());
+                        if (params.prepare_seqlen_q_ptr) {
+                            int length = params.prepare_seqlen_q_ptr[bidb] * (!params.pack_gqa ? params.num_heads : params.num_heads_kv);
+                            return cute::ceil_div(length, Int<kBlockM>{});
+                        } else {
+                            flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, 0, params.cu_seqlens_q, params.seqused_q};
+                            return cute::ceil_div(seqlen_info.seqlen * params.num_heads, Int<kBlockM>{});
+                        }
                     };
 
                     // Cumulative number of blocks for the next 31 batches
@@ -409,6 +424,11 @@ public:
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
         TileScheduler tile_scheduler{shared_storage};
 
+        if (params.semaphore_to_reset && threadIdx.x == 0 && blockIdx.x == gridDim.x - 1 && blockIdx.y == gridDim.y - 1 && blockIdx.z == gridDim.z - 1) {
+            cutlass::arch::wait_on_dependent_grids();
+            *params.semaphore_to_reset = 0;
+        }
+
         Tensor sLSE = make_tensor(make_smem_ptr(shared_storage.smem_lse_partial.data()), SmemLayoutLSE{});
         Tensor sMaxValidSplit = make_tensor(make_smem_ptr(shared_storage.smem_max_valid_split.data()), Shape<Int<kBlockM>>{});
         Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o_partial.data()), SmemLayoutO{});
@@ -419,24 +439,18 @@ public:
 
         int const m_block = block_coord.block_m;
         int const k_block = block_coord.block_k;
-        int const batch = block_coord.bidb;
-
-        if (params.semaphore_to_reset && threadIdx.x == 0 && blockIdx.x == gridDim.x - 1 && blockIdx.y == gridDim.y - 1 && blockIdx.z == gridDim.z - 1) {
-            cutlass::arch::wait_on_dependent_grids();
-            *params.semaphore_to_reset = 0;
-        }
-
+        int const maybe_virtual_batch = block_coord.bidb;
+        if (maybe_virtual_batch >= params.b) { return; }
+        int const batch = params.varlen_batch_idx_ptr ? params.varlen_batch_idx_ptr[maybe_virtual_batch] : maybe_virtual_batch;
+        
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
         int const offset = seqlen_info.offset;
         int const seqlen = seqlen_info.seqlen;
         int max_idx = seqlen * get<2>(params.shape_LSE_partial);
 
-        bool block_coord_valid = 
-            block_coord.block_m < cute::ceil_div(max_idx, Int<kBlockM>{}) &&
-            block_coord.bidb < params.b;
-        if (!block_coord_valid) { return; }
+        if (m_block >= cute::ceil_div(max_idx, Int<kBlockM>{})) { return; }
 
-        int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[batch] : get<1>(params.shape_LSE_partial);
+        int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[maybe_virtual_batch] : get<1>(params.shape_LSE_partial);
         if (num_splits <= 1) { return; }
 
         cutlass::FastDivmod seqlen_divmod_dynamic(seqlen);

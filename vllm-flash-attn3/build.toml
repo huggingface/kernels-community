@@ -9,8 +9,7 @@ minver = "12.8"
 [torch]
 src = [
     "torch-ext/pytorch_shim.h",
-    "torch-ext/torch_binding.cpp",
-    "torch-ext/torch_binding.h",
+    "torch-ext/flash_api_torch_lib.cpp",
 ]
 
 [kernel.flash_attn]

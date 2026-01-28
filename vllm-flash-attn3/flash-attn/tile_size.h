@@ -20,9 +20,18 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             } else if (headdim_v == 256) {
                 return {128, 112, true, false};
             } else {
-                // Switch to tile size 192 x 192 for now
-                bool const use_blockN_128 = is_causal || is_local;
-                return {192, use_blockN_128 ? 128 : 192, use_blockN_128, true};
+                if (use_one_mma_wg) {
+                    return {64, 192, true, true};
+                } else {
+                    // Switch to tile size 192 x 192 for now
+                    // bool const use_blockN_128 = is_causal || is_local;
+                    // return {192, use_blockN_128 ? 128 : 192, use_blockN_128, true}; // BASE
+                    // Benefits SWA when window length <= 128
+                    return {192, is_causal ? 128 : is_local || paged_kv_non_TMA ? 160 : 192, is_causal || is_local, !is_local};
+                    // return {192, is_causal ? 128 : 160, true, !is_local};
+                    // return {128, use_blockN_128 ? 160 : 192, use_blockN_128, !use_blockN_128};
+                    // return {192, is_local ? 160 : 192, true, false};
+                }
             }
             // Good for long seqlen (>= 4k) but suffers from tile quantization at short seqlen
             // return {192, is_causal || is_local ? 192 : 176, true, false};
@@ -32,22 +41,30 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             if (use_one_mma_wg) {
                 return {64, is_causal || is_local || paged_kv_non_TMA ? 128 : 176, true, true};
             } else {
-                return {128, is_causal || is_local || paged_kv_non_TMA ? 128 : 176, true, true};
+                return {128, is_causal || is_local || paged_kv_non_TMA ? 128 : 160, true, true};
             }
             // {128, 192, false, false} and {192, 128, false, true} are quite good too
             // 128 x 192 hits the limit of smem if MmaPV_is_RS, 128 x 144 hits the limit if !MmaPV_is_RS
         } else if (headdim <= 192) {
-            return {128, paged_kv_non_TMA || is_local ? 96 : (headdim_v <= 128 ? 128 : 112), true, true};  // 128 x 112 hits the limit of smem
+            return {128, paged_kv_non_TMA || is_local ? 96 : (headdim_v <= 128 ? 128 : 96), true, true};  // 128 x 112 hits the limit of smem
         } else {
             return {128, is_local ? 64 : 80, true, true};  // 128 x 80 hits the limit of smem
         }
     } else {
         if (headdim <= 64) {
-            return {192, 160, true, true};
+            if (use_one_mma_wg) {
+                return {64, 128, true, true};
+            } else {
+                return {192, 160, true, true};
+            }
         } else if (headdim <= 96) {
             return {192, 128, true, true};
         } else if (headdim <= 128) {
-            return {128, paged_kv_non_TMA ? 160 : (v_colmajor || (softcap && is_local) ? 192 : 224), true, true};
+            if (use_one_mma_wg) {
+                return {64, 96, true, true};
+            } else{
+                return {128, paged_kv_non_TMA ? 160 : (v_colmajor || (softcap && is_local) ? 192 : 224), true, true};
+            }
         } else if (headdim <= 192) {
             return {128, (paged_kv_non_TMA || softcap) && is_local ? 128 : 160, true, true};
         } else {
