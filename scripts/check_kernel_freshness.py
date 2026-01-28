@@ -28,7 +28,6 @@ KERNEL_SOURCE_MAPPING = {
     "quantization-bitsandbytes": "https://github.com/bitsandbytes-foundation/bitsandbytes",
     "quantization-eetq": "https://github.com/NetEase-FuXi/EETQ",
     "quantization-gptq": "https://github.com/IST-DASLab/gptq",
-    "relu": "https://github.com/huggingface/kernel-builder",
     "rmsnorm": "https://github.com/intel/intel-extension-for-pytorch",
     "rotary": "https://github.com/Dao-AILab/flash-attention",
     "rwkv": "https://github.com/BlinkDL/RWKV-LM",
@@ -38,7 +37,6 @@ KERNEL_SOURCE_MAPPING = {
     "vllm-flash-attn3": "https://github.com/Dao-AILab/flash-attention",
     "yoso": "https://github.com/mlpen/YOSO",
 }
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()

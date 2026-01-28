@@ -5,7 +5,7 @@ from check_kernel_freshness import KERNEL_SOURCE_MAPPING
 
 
 def discover_kernel_dirs(root_path: Path) -> list[str]:
-    excluded_dirs = {".github", "scripts", ".git"}
+    excluded_dirs = {".github", "scripts", ".git", "relu"}
 
     kernel_dirs = []
     for item in root_path.iterdir():
