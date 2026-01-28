@@ -1,0 +1,27 @@
+name: Bi-Weekly Kernel Freshness Check
+
+on:
+  schedule:
+    - cron: "0 2 1,15 * *"
+  workflow_dispatch:
+
+jobs:
+  freshness-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Check kernel freshness and report
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/check_kernel_freshness.py --verbose
