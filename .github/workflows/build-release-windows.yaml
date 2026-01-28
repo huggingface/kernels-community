@@ -237,4 +237,4 @@ jobs:
 
           # Upload using the kernels CLI
           # The kernels CLI checks both kernel_dir and kernel_dir/build for torch* variants with metadata.json
-          kernels upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE"
+          kernels upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE" --branch main
