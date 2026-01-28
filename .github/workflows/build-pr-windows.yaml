@@ -128,30 +128,31 @@ jobs:
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'xpu'
         run: pip3 install torch==${{ matrix.platform.torch_version }} --index-url https://download.pytorch.org/whl/xpu
 
-      - name: Checkout kernel-builder
+      - name: Checkout kernels
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
-        id: checkout-kernel-builder
+        id: checkout-kernels
         uses: actions/checkout@v6
         with:
-          repository: huggingface/kernel-builder
+          repository: huggingface/kernels
           ref: "${{ steps.extract-builder-version.outputs.revision }}"
-          path: kernel-builder
+          path: kernels
 
       - name: Cache Rust build
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         uses: actions/cache@v5
         with:
           path: |
-            kernel-builder/build2cmake/target
+            kernels/build2cmake/target
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-rust-debug-${{ hashFiles('kernel-builder/build2cmake/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-debug-${{ hashFiles('kernels/build2cmake/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-debug-
 
       - name: Build build2cmake
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
-        working-directory: kernel-builder/build2cmake
+        working-directory: kernels\build2cmake
+        shell: pwsh
         run: cargo build
 
       - name: Build kernel
@@ -198,4 +199,4 @@ jobs:
               exit 1
             }
           }
-          & "$env:GITHUB_WORKSPACE\kernel-builder\scripts\windows\builder.ps1" -Backend ${{ matrix.platform.backend }} -SourceFolder "$KERNEL" -BuildConfig Release -Build
+          & "$env:GITHUB_WORKSPACE\kernels\builder\scripts\windows\builder.ps1" -Backend ${{ matrix.platform.backend }} -SourceFolder "$KERNEL" -BuildConfig Release -Build
