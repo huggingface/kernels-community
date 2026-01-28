@@ -69,7 +69,7 @@ def fused_moe_cpp(
     """
     # MXFP4/FP8 kernels only support bf16, convert if needed
     orig_dtype = hidden_states.dtype
-    need_convert = orig_dtype != torch.bfloat16
+    need_convert = ((use_mxfp4 or use_fp8_w8a16) and orig_dtype != torch.bfloat16) or orig_dtype == torch.float32
     if need_convert:
         hidden_states = hidden_states.to(torch.bfloat16)
 
