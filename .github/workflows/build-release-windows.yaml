@@ -28,7 +28,12 @@ jobs:
             },
             # { backend: 'cuda', torch_version: '2.9.1', cuda: '13.0.1', wheel: '130' },
             # Intel XPU platform
-            { backend: "xpu", torch_version: "2.9.1", oneapi: "2025.2.1" },
+            {
+              backend: "xpu",
+              torch_version: "2.10.0",
+              oneapi: "2025.3.1",
+              oneapi_url: "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe",
+            },
           ]
 
     runs-on: windows-2022
@@ -119,7 +124,7 @@ jobs:
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'xpu' && steps.check-backend.outputs.needs_oneapi == 'true'
         shell: pwsh
         run: |
-          & "$env:GITHUB_WORKSPACE\.github\scripts\windows\install-oneapi.ps1" -OneApiVersion "${{ matrix.platform.oneapi }}"
+          & "$env:GITHUB_WORKSPACE\.github\scripts\windows\install-oneapi.ps1" -OneApiVersion "${{ matrix.platform.oneapi }}" -OneApiUrl "${{ matrix.platform.oneapi_url }}"
 
       - name: Setup Python
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
