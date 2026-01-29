@@ -109,7 +109,7 @@ jobs:
           Write-Output "Building Kernel with revision: $revision"
           echo "revision=$revision" >> $env:GITHUB_OUTPUT
 
-      - uses: Jimver/cuda-toolkit@v0.2.29
+      - uses: Jimver/cuda-toolkit@v0.2.30
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'cuda'
         id: setup-cuda-toolkit
         with:
