@@ -1,4 +1,6 @@
 #include <torch/library.h>
+#include <optional>
+#include <vector>
 
 #if defined(CUDA_KERNEL)
 #include "registration.h"
@@ -16,6 +18,10 @@
 #include "../csrc_xpu/moe/moe_ops.h"
 #include "../csrc_xpu/activation.h"
 #include "../csrc_xpu/grouped_gemm/grouped_gemm_interface.h"
+#elif defined(CPU_KERNEL)
+#include "../csrc_cpu/registration.h"
+#include "../csrc_cpu/moe_ops.h"
+#include "../csrc_cpu/moe_dispatcher.h"
 #endif
 
 #if defined(CUDA_KERNEL)
@@ -253,4 +259,141 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
 
-#endif  // CUDA_KERNEL / XPU_KERNEL
+#elif defined(CPU_KERNEL)
+// ======================== CPU Implementation ========================
+
+torch::Tensor convert_weight_packed_wrapper(torch::Tensor weight) {
+    // Make a copy since the API requires reference but we receive by value
+    auto weight_copy = weight;
+    return megablocks::cpu::dispatch::convert_weight_packed(weight_copy);
+}
+
+torch::Tensor convert_scale_packed_wrapper(torch::Tensor scale) {
+    // Make a copy since the API requires reference but we receive by value
+    auto scale_copy = scale;
+    return megablocks::cpu::dispatch::convert_scale_packed(scale_copy);
+}
+
+torch::Tensor fused_experts_wrapper(
+    torch::Tensor hidden_states,
+    torch::Tensor w1,
+    torch::Tensor w2,
+    torch::Tensor topk_weights,
+    torch::Tensor topk_ids,
+    bool inplace,
+    bool use_int8_w8a8,
+    bool use_fp8_w8a16,
+    bool use_mxfp4,
+    const c10::optional<torch::Tensor>& w1_scale,
+    const c10::optional<torch::Tensor>& w2_scale,
+    const c10::optional<std::vector<int64_t>>& block_size,
+    const c10::optional<torch::Tensor>& a1_scale,
+    const c10::optional<torch::Tensor>& a2_scale,
+    const c10::optional<torch::Tensor>& w1_bias,
+    const c10::optional<torch::Tensor>& w2_bias,
+    const c10::optional<double>& alpha,
+    const c10::optional<double>& limit,
+    bool is_vnni
+) {
+    // Create copies for mutable references
+    auto hs = hidden_states;
+    auto w1_copy = w1;
+    auto w2_copy = w2;
+    auto tw = topk_weights;
+    auto ti = topk_ids;
+    return megablocks::cpu::dispatch::fused_experts(
+        hs, w1_copy, w2_copy, tw, ti,
+        inplace, use_int8_w8a8, use_fp8_w8a16, use_mxfp4,
+        w1_scale, w2_scale, block_size, a1_scale, a2_scale,
+        w1_bias, w2_bias, alpha, limit, is_vnni
+    );
+}
+
+torch::Tensor shared_expert_wrapper(
+    torch::Tensor hidden_states,
+    torch::Tensor w1,
+    torch::Tensor w2,
+    torch::Tensor fused_experts_out,
+    double routed_scaling_factor,
+    bool inplace,
+    bool use_int8_w8a8,
+    bool use_fp8_w8a16,
+    const c10::optional<torch::Tensor>& w1_scale,
+    const c10::optional<torch::Tensor>& w2_scale,
+    const c10::optional<std::vector<int64_t>>& block_size,
+    const c10::optional<torch::Tensor>& a1_scale,
+    const c10::optional<torch::Tensor>& a2_scale,
+    bool is_vnni
+) {
+    // Create copies for mutable references
+    auto hs = hidden_states;
+    auto w1_copy = w1;
+    auto w2_copy = w2;
+    auto feo = fused_experts_out;
+    return megablocks::cpu::dispatch::shared_expert(
+        hs, w1_copy, w2_copy, feo,
+        routed_scaling_factor, inplace, use_int8_w8a8, use_fp8_w8a16,
+        w1_scale, w2_scale, block_size, a1_scale, a2_scale, is_vnni
+    );
+}
+
+TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+    // Convert weight to VNNI packed format for brgemm
+    ops.def("convert_weight_packed(Tensor weight) -> Tensor");
+    ops.impl("convert_weight_packed", torch::kCPU, &convert_weight_packed_wrapper);
+
+    // Convert scale to packed format for MXFP4 quantization
+    ops.def("convert_scale_packed(Tensor scale) -> Tensor");
+    ops.impl("convert_scale_packed", torch::kCPU, &convert_scale_packed_wrapper);
+
+    // Fused experts kernel (sglang compatible)
+    ops.def(
+        "fused_experts("
+        "    Tensor hidden_states,"
+        "    Tensor w1,"
+        "    Tensor w2,"
+        "    Tensor topk_weights,"
+        "    Tensor topk_ids,"
+        "    bool inplace=False,"
+        "    bool use_int8_w8a8=False,"
+        "    bool use_fp8_w8a16=False,"
+        "    bool use_mxfp4=False,"
+        "    Tensor? w1_scale=None,"
+        "    Tensor? w2_scale=None,"
+        "    int[]? block_size=None,"
+        "    Tensor? a1_scale=None,"
+        "    Tensor? a2_scale=None,"
+        "    Tensor? w1_bias=None,"
+        "    Tensor? w2_bias=None,"
+        "    float? alpha=None,"
+        "    float? limit=None,"
+        "    bool is_vnni=False"
+        ") -> Tensor"
+    );
+    ops.impl("fused_experts", torch::kCPU, &fused_experts_wrapper);
+
+    // Shared expert kernel
+    ops.def(
+        "shared_expert("
+        "    Tensor hidden_states,"
+        "    Tensor w1,"
+        "    Tensor w2,"
+        "    Tensor fused_experts_out,"
+        "    float routed_scaling_factor,"
+        "    bool inplace=False,"
+        "    bool use_int8_w8a8=False,"
+        "    bool use_fp8_w8a16=False,"
+        "    Tensor? w1_scale=None,"
+        "    Tensor? w2_scale=None,"
+        "    int[]? block_size=None,"
+        "    Tensor? a1_scale=None,"
+        "    Tensor? a2_scale=None,"
+        "    bool is_vnni=False"
+        ") -> Tensor"
+    );
+    ops.impl("shared_expert", torch::kCPU, &shared_expert_wrapper);
+}
+
+REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
+
+#endif  // CUDA_KERNEL / XPU_KERNEL / CPU_KERNEL
