@@ -149,21 +149,24 @@ class CPUMegaBlocksMoeMLP(torch.nn.Module):
             self.experts, "gate_up_proj"
         ):
             # convert weights
+            data_1 = self.experts.gate_up_proj.data.transpose(-1, -2).contiguous()
+            data_2 = self.experts.down_proj.data.transpose(-1, -2).contiguous()
             if self.use_mxfp4:
-                data_1 = ops.convert_weight_packed(self.experts.gate_up_proj.data.transpose(-1, -2).contiguous())
-                data_2 = ops.convert_weight_packed(self.experts.down_proj.data.transpose(-1, -2).contiguous())
-                self.experts.gate_up_proj.storage.data = data_1
-                self.experts.down_proj.storage.data = data_2
+                self.experts.gate_up_proj.storage.data = ops.convert_weight_packed(data_1)
+                self.experts.down_proj.storage.data = ops.convert_weight_packed(data_2)
             else:
-                data_1 = ops.convert_weight_packed(self.experts.gate_up_proj.data.transpose(-1, -2).contiguous())
-                data_2 = ops.convert_weight_packed(self.experts.down_proj.data.transpose(-1, -2).contiguous())
-                self.experts.gate_up_proj.data = data_1
-                self.experts.down_proj.data = data_2
+                # convert_weight_packed only supports bfloat16, float16, int8, fp8_e4m3 or uint8(mxfp4 or int4).
+                data_1 = data_1.to(torch.bfloat16) if data_1.dtype == torch.float32 else data_1
+                data_2 = data_2.to(torch.bfloat16) if data_2.dtype == torch.float32 else data_2
+                self.experts.gate_up_proj.data = ops.convert_weight_packed(data_1)
+                self.experts.down_proj.data = ops.convert_weight_packed(data_2)
 
+            # C++ kernel does not support float32.
+            dtype = torch.bfloat16 if dtype == torch.float32 else dtype
             if getattr(self.experts, "gate_up_proj_bias", None) is not None:
-                self.experts.gate_up_proj_bias.data = self.experts.gate_up_proj_bias.data.to(x.dtype)
+                self.experts.gate_up_proj_bias.data = self.experts.gate_up_proj_bias.data.to(dtype)
             if getattr(self.experts, "down_proj_bias", None) is not None:
-                self.experts.down_proj_bias.data = self.experts.down_proj_bias.data.to(x.dtype)
+                self.experts.down_proj_bias.data = self.experts.down_proj_bias.data.to(dtype)
 
             self.packed_weight = True
 
