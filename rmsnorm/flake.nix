@@ -1,7 +1,7 @@
 {
   description = "Flake for Torch kernel extension";
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/buildset-fixes";
+    kernel-builder.url = "github:huggingface/kernels";
   };
   outputs =
     { self, kernel-builder }:
