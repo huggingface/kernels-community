@@ -105,7 +105,7 @@ def fused_moe_cpp(
     return output
 
 
-class MegaBlocksMoeMLP(torch.nn.Module):
+class CPUMegaBlocksMoeMLP(torch.nn.Module):
     """
     C++ optimized MoE MLP using brgemm.
     Drop-in replacement for cpu_fused_moe.MegaBlocksMoeMLP with better performance.
@@ -115,32 +115,6 @@ class MegaBlocksMoeMLP(torch.nn.Module):
     """
     can_torch_compile: bool = True
 
-    def convert_weight(self, dtype, use_mxfp4: bool = False):
-        data_1 = self.experts.gate_up_proj.data.transpose(-1, -2).contiguous()
-        data_2 = self.experts.down_proj.data.transpose(-1, -2).contiguous()
-        if use_mxfp4:
-            self.experts.gate_up_proj.storage.data = ops.convert_weight_packed(data_1)
-            self.experts.down_proj.storage.data = ops.convert_weight_packed(data_2)
-        else:
-            # convert_weight_packed onlu supports bfloat16, float16, int8, fp8_e4m3 or uint8(mxfp4 or int4).
-            data_1 = data_1.to(torch.bfloat16) if data_1.dtype == torch.float32 else data_1
-            data_2 = data_2.to(torch.bfloat16) if data_2.dtype == torch.float32 else data_2
-            self.experts.gate_up_proj.data = ops.convert_weight_packed(data_1)
-            self.experts.down_proj.data = ops.convert_weight_packed(data_2)
-
-        # C++ kernel does not support float32.
-        dtype = torch.bfloat16 if dtype == torch.float32 else dtype
-        if getattr(self.experts, "gate_up_proj_bias", None) is not None:
-            self.experts.gate_up_proj_bias.data = self.experts.gate_up_proj_bias.data.to(dtype)
-        if getattr(self.experts, "down_proj_bias", None) is not None:
-            self.experts.down_proj_bias.data = self.experts.down_proj_bias.data.to(dtype)
-
-    def convert_scales(self):
-        data_1 = ops.convert_scale_packed(self.experts.gate_up_proj_precision_config.weight_scale.data.transpose(-1, -2).contiguous())
-        data_2 = ops.convert_scale_packed(self.experts.down_proj_precision_config.weight_scale.data.transpose(-1, -2).contiguous())
-        self.experts.gate_up_proj_precision_config.weight_scale.storage.data = data_1
-        self.experts.down_proj_precision_config.weight_scale.storage.data = data_2
-    
     def forward(self, x: torch.Tensor) -> tuple:
         """
         Forward pass through the MoE layer using C++ kernel.
@@ -163,14 +137,37 @@ class MegaBlocksMoeMLP(torch.nn.Module):
             and hasattr(self.experts, "gate_up_proj")
             and getattr(self.experts, "gate_up_proj_precision_config", None) is not None
         ):
-            self.convert_scales()
+            # convert scales
+            data_1 = ops.convert_scale_packed(self.experts.gate_up_proj_precision_config.weight_scale.data.transpose(-1, -2).contiguous())
+            data_2 = ops.convert_scale_packed(self.experts.down_proj_precision_config.weight_scale.data.transpose(-1, -2).contiguous())
+            self.experts.gate_up_proj_precision_config.weight_scale.storage.data = data_1
+            self.experts.down_proj_precision_config.weight_scale.storage.data = data_2
             self.packed_scales = True
             self.use_mxfp4 = True
 
         if not getattr(self, "packed_weight", False) and hasattr(
             self.experts, "gate_up_proj"
         ):
-            self.convert_weight(x.dtype, self.use_mxfp4)
+            # convert weights
+            data_1 = self.experts.gate_up_proj.data.transpose(-1, -2).contiguous()
+            data_2 = self.experts.down_proj.data.transpose(-1, -2).contiguous()
+            if self.use_mxfp4:
+                self.experts.gate_up_proj.storage.data = ops.convert_weight_packed(data_1)
+                self.experts.down_proj.storage.data = ops.convert_weight_packed(data_2)
+            else:
+                # convert_weight_packed only supports bfloat16, float16, int8, fp8_e4m3 or uint8(mxfp4 or int4).
+                data_1 = data_1.to(torch.bfloat16) if data_1.dtype == torch.float32 else data_1
+                data_2 = data_2.to(torch.bfloat16) if data_2.dtype == torch.float32 else data_2
+                self.experts.gate_up_proj.data = ops.convert_weight_packed(data_1)
+                self.experts.down_proj.data = ops.convert_weight_packed(data_2)
+
+            # C++ kernel does not support float32.
+            dtype = torch.bfloat16 if x.dtype == torch.float32 else x.dtype
+            if getattr(self.experts, "gate_up_proj_bias", None) is not None:
+                self.experts.gate_up_proj_bias.data = self.experts.gate_up_proj_bias.data.to(dtype)
+            if getattr(self.experts, "down_proj_bias", None) is not None:
+                self.experts.down_proj_bias.data = self.experts.down_proj_bias.data.to(dtype)
+
             self.packed_weight = True
 
         # Get MoE parameters
