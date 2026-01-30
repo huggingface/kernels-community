@@ -162,7 +162,7 @@ class CPUMegaBlocksMoeMLP(torch.nn.Module):
                 self.experts.down_proj.data = ops.convert_weight_packed(data_2)
 
             # C++ kernel does not support float32.
-            dtype = torch.bfloat16 if dtype == torch.float32 else dtype
+            dtype = torch.bfloat16 if x.dtype == torch.float32 else x.dtype
             if getattr(self.experts, "gate_up_proj_bias", None) is not None:
                 self.experts.gate_up_proj_bias.data = self.experts.gate_up_proj_bias.data.to(dtype)
             if getattr(self.experts, "down_proj_bias", None) is not None:
