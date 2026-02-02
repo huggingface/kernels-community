@@ -53,6 +53,8 @@ mha_fwd(
     compat::select_device(device_idx);
 
     // check inputs
+    TORCH_CHECK(p_dropout == 0.0, "FlashAttentionForwardXPU kernel does not only support dropout > 0.0 yet");
+
     q = ensure_contiguous(q);
     const auto sizes = q.sizes();
     const int batch_size = sizes[0];
@@ -179,6 +181,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads x head_siz
     compat::select_device(device_idx);
 
     auto q_dtype = q.dtype();
+    TORCH_CHECK(p_dropout == 0.0, "FlashAttentionBackwardXPU kernel does not only support dropout > 0.0 yet");
+
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
                 "FlashAttention backward only supports fp16 and bf16 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
@@ -438,8 +442,7 @@ mha_varlen_fwd(
     k_padded = ensure_contiguous(k_padded);
     v_padded = ensure_contiguous(v_padded);
 
-    // Allocate softmax_lse output tensor: (batch_size, num_heads, max_seqlen_q)
-    // For varlen, we use max_seqlen_q as the third dimension
+    // Allocate softmax_lse output tensor
     auto opts = q.options().dtype(torch::kFloat32);
     at::Tensor softmax_lse = torch::empty({batch_size, num_heads, max_seqlen_q}, opts);
 

@@ -106,7 +106,8 @@ struct KernelLauncher {
     ProblemShapeType shape = initialize(args);
 
     // Calculate LSE strides: LSE layout is (batch, num_heads, seqlen_q)
-    int lse_stride_head = isVarLen ? args.total_seqlen_q : args.max_queries;
+    // For both varlen and non-varlen, use max_queries as the stride
+    int lse_stride_head = args.max_queries;
     int lse_stride_batch = args.num_heads_q * lse_stride_head;
 
     typename FMHAKernel::Arguments arguments{

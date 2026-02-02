@@ -93,14 +93,18 @@ apply_mask_local(Tensor<Engine0, Layout0> &tensor,
 }
 
 // Scale and apply exp2 for softmax
-template<class Engine0, class Layout0,
+// Is_even_M: template parameter to control boundary check
+// tail_m: when Is_even_M is false, indicates the valid number of rows
+template<bool Is_even_M,
+         class Engine0, class Layout0,
          class Engine1, class Layout1,
          class Engine2, class Layout2>
 CUTLASS_DEVICE void
 scale_apply_exp2(Tensor<Engine0, Layout0> &tensor,
                  Tensor<Engine1, Layout1> &max,
                  Tensor<Engine2, Layout2> &rC,
-                 const float scale) {
+                 const float scale,
+                 const int tail_m = 0) {
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
     auto sg = compat::get_nd_item<1>().get_sub_group();
@@ -108,19 +112,35 @@ scale_apply_exp2(Tensor<Engine0, Layout0> &tensor,
     Tensor rC_2d = make_tensor(
         rC.data(),
         convert_layout_2d_layout(rC.layout()));
-    CUTLASS_PRAGMA_UNROLL
-    for (int ni = 0; ni < size<1>(tensor); ++ni)  {
-        int n = get<1>(rC_2d(0, ni)) + sg_local_id;
-        const float max_scaled = max(n) == -INFINITY ? 0.f : max(n) * M_LOG2E;
+    if constexpr(Is_even_M) {
         CUTLASS_PRAGMA_UNROLL
-        for (int mi = 0; mi < size<0>(tensor); ++mi) {
-            tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
+            int n = get<1>(rC_2d(0, ni)) + sg_local_id;
+            const float max_scaled = max(n) == -INFINITY ? 0.f : max(n) * M_LOG2E;
+            CUTLASS_PRAGMA_UNROLL
+            for (int mi = 0; mi < size<0>(tensor); ++mi) {
+                tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+            }
+        }
+    } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 0; ni < size<1>(tensor); ++ni)  {
+            int n = get<1>(rC_2d(0, ni)) + sg_local_id;
+            // For tail case: avoid reading out-of-bounds mLSE
+            const float max_scaled = ((max(n) == -INFINITY) || (n >= tail_m)) ? 0.f : max(n) * M_LOG2E;
+            CUTLASS_PRAGMA_UNROLL
+            for (int mi = 0; mi < size<0>(tensor); ++mi) {
+                tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+            }
         }
     }
 }
 
 // Softmax backward: dS = P * (dP - sum) * scale
-template<class Engine0, class Layout0,
+// Is_even_M: template parameter to control boundary check
+// tail_m: when Is_even_M is false, indicates the valid number of rows
+template<bool Is_even_M,
+         class Engine0, class Layout0,
          class Engine1, class Layout1,
          class Engine2, class Layout2,
          class Engine3, class Layout3>
@@ -129,19 +149,35 @@ softmax_backward(Tensor<Engine0, Layout0> &P,
                  Tensor<Engine1, Layout1> &dP_sum,
                  Tensor<Engine2, Layout2> &dP,
                  Tensor<Engine3, Layout3> &rC,
-                 const float scale) {
+                 const float scale,
+                 const int tail_m = 0) {
     Tensor rC_2d = make_tensor(
         rC.data(),
         convert_layout_2d_layout(rC.layout()));
     auto sg = compat::get_nd_item<1>().get_sub_group();
     int sg_local_id = sg.get_local_id();
-    CUTLASS_PRAGMA_UNROLL
-    for (int ni = 0; ni < size<1>(dP); ++ni) {
-        int n = get<1>(rC_2d(0, ni)) + sg_local_id;
-        const float dpsum = dP_sum(n);
+    if constexpr(Is_even_M) {
         CUTLASS_PRAGMA_UNROLL
-        for (int mi = 0; mi < size<0>(dP); ++mi) {
-            dP(mi, ni) = P(mi, ni) * (dP(mi, ni) - dpsum) * scale;
+        for (int ni = 0; ni < size<1>(dP); ++ni) {
+            int n = get<1>(rC_2d(0, ni)) + sg_local_id;
+            const float dpsum = dP_sum(n);
+            CUTLASS_PRAGMA_UNROLL
+            for (int mi = 0; mi < size<0>(dP); ++mi) {
+                dP(mi, ni) = P(mi, ni) * (dP(mi, ni) - dpsum) * scale;
+            }
+        }
+    } else {
+        CUTLASS_PRAGMA_UNROLL
+        for (int ni = 0; ni < size<1>(dP); ++ni) {
+            int n = get<1>(rC_2d(0, ni)) + sg_local_id;
+            // For tail case: skip out-of-bounds rows
+            if (n < tail_m) {
+                const float dpsum = dP_sum(n);
+                CUTLASS_PRAGMA_UNROLL
+                for (int mi = 0; mi < size<0>(dP); ++mi) {
+                    dP(mi, ni) = P(mi, ni) * (dP(mi, ni) - dpsum) * scale;
+                }
+            }
         }
     }
 }
@@ -524,7 +560,11 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
             }
 
             // P = softmax(S, lse)
-            scale_apply_exp2(scores, mLSE, taccScS_rt, param.scale_softmax_log2);
+            if (Is_even_M) {
+                scale_apply_exp2<true>(scores, mLSE, taccScS_rt, param.scale_softmax_log2);
+            } else {
+                scale_apply_exp2<false>(scores, mLSE, taccScS_rt, param.scale_softmax_log2, tail_m);
+            }
             
             auto rdP = create_reg<V>(trait, mdP, tiled_mma_sdp);
             // dP = dO * V^T
@@ -554,7 +594,9 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
                         
                         bool keep = param.dropout.should_keep(batch_head, row_idx, col_idx);
                         if (keep) {
+                            // Scale both P and dP by rp_dropout = 1/(1-p)
                             scores(mi, ni) = static_cast<V>(static_cast<float>(scores(mi, ni)) * rp_dropout);
+                            dS(mi, ni) = static_cast<V>(static_cast<float>(dS(mi, ni)) * rp_dropout);
                         } else {
                             scores(mi, ni) = V(0);
                             dS(mi, ni) = V(0);
@@ -564,7 +606,11 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
             }
             
             // dS = P * (dP - sum) * scale
-            softmax_backward(scores, mdPsum, dS, taccScS_rt, param.scale_softmax);
+            if (Is_even_M) {
+                softmax_backward<true>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax);
+            } else {
+                softmax_backward<false>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax, tail_m);
+            }
             
             mha_reorder_copy(trait, tiled_mma_sdp, rS, mPt);
             mha_reorder_copy(trait, tiled_mma_sdp, rdP, mdPt);
