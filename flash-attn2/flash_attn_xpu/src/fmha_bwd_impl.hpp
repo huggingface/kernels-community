@@ -59,6 +59,31 @@ apply_mask_causal(Tensor<Engine0, Layout0> &tensor,
     }
 }
 
+// Apply seqlen_k boundary mask to tensor (for handling tail_n cases)
+// Sets elements beyond seqlen_k to zero to prevent NaN in dQ computation
+template <typename Engine0, typename Layout0,
+          typename Engine1, typename Layout1>
+CUTLASS_DEVICE void
+apply_mask_seqlen_k(Tensor<Engine0, Layout0> &tensor,
+                    Tensor<Engine1, Layout1> &rC,
+                    int n_offset, int seqlen_k) {
+    auto sg = compat::get_nd_item<1>().get_sub_group();
+    int sg_local_id = sg.get_local_id();
+    Tensor rC_2d = make_tensor(
+        rC.data(),
+        convert_layout_2d_layout(rC.layout()));
+    CUTLASS_PRAGMA_UNROLL
+    for (int n = 0; n < size<1>(tensor); ++n) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int m = 0; m < size<0>(tensor); ++m) {
+            int col_idx = n_offset + get<0>(rC_2d(m, n));
+            if (col_idx >= seqlen_k) {
+                tensor(m, n) = 0;
+            }
+        }
+    }
+}
+
 // Apply local (sliding window) mask to tensor
 template <typename Engine0, typename Layout0,
           typename Engine1, typename Layout1>
@@ -612,6 +637,13 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
                 softmax_backward<false>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax, tail_m);
             }
             
+            // Mask out elements beyond seqlen_k to prevent NaN in dQ computation
+            // This is needed when seqlen_k is not a multiple of kBlockN
+            if constexpr(!Is_even_N) {
+                apply_mask_seqlen_k(scores, taccScS_rt, n_block * kBlockN, param.seq_len_kv);
+                apply_mask_seqlen_k(dS, taccScS_rt, n_block * kBlockN, param.seq_len_kv);
+            }
+
             mha_reorder_copy(trait, tiled_mma_sdp, rS, mPt);
             mha_reorder_copy(trait, tiled_mma_sdp, rdP, mdPt);
         }
