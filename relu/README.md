@@ -1,5 +1,5 @@
 Do not make changes to this kernel, make the changes in
-https://github.com/huggingface/kernel-builder/tree/main/examples/relu
+https://github.com/huggingface/kernels/tree/main/builder/examples/relu
 and sync here.
 
 This kernel is not for actual use (use the `activation` kernel instead),
