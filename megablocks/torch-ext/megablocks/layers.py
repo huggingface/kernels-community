@@ -1225,6 +1225,8 @@ class MegaBlocksMoeMLPWithSharedExpert(MegaBlocksMoeMLP):
         return output, expert_weights_out
 
 
-# Patch for XPU support
+# Patch for XPU or CPU support
 if hasattr(torch, "xpu") and torch.xpu.is_available():
     from .xpu_fused_moe import MegaBlocksMoeMLP
+
+from .cpu_moe_cpp import CPUMegaBlocksMoeMLP

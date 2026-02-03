@@ -1,9 +1,12 @@
 param(
     [Parameter(Mandatory=$true)]
-    [string]$OneApiVersion
+    [string]$OneApiVersion,
+    
+    [Parameter(Mandatory=$true)]
+    [string]$OneApiUrl
 )
 
-$url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/f5881e61-dcdc-40f1-9bd9-717081ac623c/intel-oneapi-base-toolkit-2025.2.1.46_offline.exe"
+$url = $OneApiUrl
 $installer = "$env:TEMP\oneapi_installer.exe"
 
 # Remove old installer if exists to avoid corruption

@@ -2,7 +2,7 @@
   description = "Flake for Unsloth Kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernel-builder";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
