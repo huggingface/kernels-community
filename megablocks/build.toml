@@ -4,6 +4,7 @@ version = 1
 backends = [
     "cuda",
     "xpu",
+    "cpu",
 ]
 
 [torch]
@@ -77,4 +78,48 @@ src = [
     "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp",
     "csrc_xpu/grouped_gemm/xe_2/gemm_xe2.hpp",
     "csrc_xpu/grouped_gemm/xe_2/gemm_xe2_policy.hpp",
+]
+
+[kernel.megablocks_cpu]
+backend = "cpu"
+depends = [
+    "torch",
+]
+include = ["csrc_cpu"]
+src = [
+    "csrc_cpu/cpu_features.hpp",
+    "csrc_cpu/moe_dispatcher.h",
+    "csrc_cpu/moe_dispatcher.cpp",
+    "csrc_cpu/moe_fallback.h",
+    "csrc_cpu/moe_fallback.cpp",
+]
+
+[kernel.megablocks_cpu_avx512]
+backend = "cpu"
+cxx-flags = [
+    "-O3",
+    "-mfma",
+    "-fopenmp",
+    "-mf16c",
+    "-mavx512f",
+    "-mavx512bf16",
+    "-mavx512vl",
+    "-mavx512dq",
+    "-mavx512bw",
+    "-mavx512vbmi",
+    "-mamx-tile",
+    "-mamx-bf16",
+    "-mamx-int8",
+]
+depends = [
+    "torch",
+]
+include = ["csrc_cpu"]
+src = [
+    "csrc_cpu/common.h",
+    "csrc_cpu/registration.h",
+    "csrc_cpu/moe_ops.h",
+    "csrc_cpu/cpu_moe_kernel.cpp",
+    "csrc_cpu/cpu_moe_fp.cpp",
+    "csrc_cpu/cpu_moe_int8.cpp",
 ]

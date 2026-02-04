@@ -22,7 +22,12 @@ jobs:
           { backend: 'cuda', torch_version: '2.9.1', cuda: '12.8.1', wheel: '128' },
           # { backend: 'cuda', torch_version: '2.9.1', cuda: '13.0.1', wheel: '130' },
           # Intel XPU platform
-          { backend: 'xpu', torch_version: '2.9.1', oneapi: '2025.2.1' }
+          {
+            backend: "xpu",
+            torch_version: "2.10.0",
+            oneapi: "2025.3.1",
+            oneapi_url: "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe",
+          }
         ]
 
     runs-on: windows-2022
@@ -102,7 +107,7 @@ jobs:
           Write-Output "Building Kernel with revision: $revision"
           echo "revision=$revision" >> $env:GITHUB_OUTPUT
 
-      - uses: Jimver/cuda-toolkit@v0.2.29
+      - uses: Jimver/cuda-toolkit@v0.2.30
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'cuda'
         id: setup-cuda-toolkit
         with:
@@ -112,7 +117,7 @@ jobs:
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'xpu' && steps.check-backend.outputs.needs_oneapi == 'true'
         shell: pwsh
         run: |
-          & "$env:GITHUB_WORKSPACE\.github\scripts\windows\install-oneapi.ps1" -OneApiVersion "${{ matrix.platform.oneapi }}"
+          & "$env:GITHUB_WORKSPACE\.github\scripts\windows\install-oneapi.ps1" -OneApiVersion "${{ matrix.platform.oneapi }}" -OneApiUrl "${{ matrix.platform.oneapi_url }}"
 
       - name: Setup Python
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
@@ -128,30 +133,31 @@ jobs:
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'xpu'
         run: pip3 install torch==${{ matrix.platform.torch_version }} --index-url https://download.pytorch.org/whl/xpu
 
-      - name: Checkout kernel-builder
+      - name: Checkout kernels
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
-        id: checkout-kernel-builder
+        id: checkout-kernels
         uses: actions/checkout@v6
         with:
-          repository: huggingface/kernel-builder
+          repository: huggingface/kernels
           ref: "${{ steps.extract-builder-version.outputs.revision }}"
-          path: kernel-builder
+          path: kernels
 
       - name: Cache Rust build
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         uses: actions/cache@v5
         with:
           path: |
-            kernel-builder/build2cmake/target
+            kernels/build2cmake/target
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-rust-debug-${{ hashFiles('kernel-builder/build2cmake/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-debug-${{ hashFiles('kernels/build2cmake/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-debug-
 
       - name: Build build2cmake
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
-        working-directory: kernel-builder/build2cmake
+        working-directory: kernels\build2cmake
+        shell: pwsh
         run: cargo build
 
       - name: Build kernel
@@ -198,4 +204,4 @@ jobs:
               exit 1
             }
           }
-          & "$env:GITHUB_WORKSPACE\kernel-builder\scripts\windows\builder.ps1" -Backend ${{ matrix.platform.backend }} -SourceFolder "$KERNEL" -BuildConfig Release -Build
+          & "$env:GITHUB_WORKSPACE\kernels\builder\scripts\windows\builder.ps1" -Backend ${{ matrix.platform.backend }} -SourceFolder "$KERNEL" -BuildConfig Release -Build

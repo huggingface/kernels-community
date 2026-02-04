@@ -14,7 +14,6 @@ backend = "xpu"
 depends = ["torch"]
 include = ["rmsnorm_xpu/dpcpp"]
 src = [
-    "rmsnorm_xpu/rmsnorm_xpu.cpp",
     "rmsnorm_xpu/RMSNorm.hpp",
     "rmsnorm_xpu/RMSNorm.cpp",
     "rmsnorm_xpu/Norm.h",
