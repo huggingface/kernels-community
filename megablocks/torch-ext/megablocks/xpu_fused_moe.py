@@ -3,7 +3,9 @@
 import os
 import torch
 
-from ._ops import ops
+from ._ops import ops, add_op_namespace_prefix
+
+from torch.library import register_fake
 
 
 def resolve_dtensor(weight: torch.Tensor):
@@ -14,74 +16,65 @@ def resolve_dtensor(weight: torch.Tensor):
     return weight
 
 
-# Install meta kernels for torch.compile compatibility
-def _install_xpu_meta_kernels():
-    """Install meta kernels for XPU MoE operations to support torch.compile"""
-    
-    # Patch cutlass_grouped_gemm_interface
-    if hasattr(ops, "cutlass_grouped_gemm_interface"):
-        original_gemm = ops.cutlass_grouped_gemm_interface
-        
-        def gemm_with_meta(ptr_A, ptr_B, ptr_scales, ptr_bias, ptr_D, 
-                          expert_first_token_offset, N, K, num_experts,
-                          is_B_int4, is_B_mxfp4):
-            if torch.compiler.is_compiling():
-                # Meta implementation - ptr_D is the output, return it
-                return ptr_D
-            return original_gemm(ptr_A, ptr_B, ptr_scales, ptr_bias, ptr_D,
-                               expert_first_token_offset, N, K, num_experts,
-                               is_B_int4, is_B_mxfp4)
-        
-        ops.cutlass_grouped_gemm_interface = gemm_with_meta
-    
-    # Patch fused_moe_prologue
-    if hasattr(ops, "fused_moe_prologue"):
-        original_prologue = ops.fused_moe_prologue
-        
-        def prologue_with_meta(input, token_selected_experts, token_final_scales,
-                              workspace, hidden_size, inter_size, num_experts_on_rank):
-            if torch.compiler.is_compiling():
-                # Meta implementation - this op modifies workspace in-place
-                return None
-            return original_prologue(input, token_selected_experts, token_final_scales,
-                                    workspace, hidden_size, inter_size, num_experts_on_rank)
-        
-        ops.fused_moe_prologue = prologue_with_meta
-    
-    # Patch moe_gather
-    if hasattr(ops, "moe_gather"):
-        original_gather = ops.moe_gather
-        
-        def gather_with_meta(output, moe_output, topk_weights, 
-                            unpermuted_row_to_permuted_row, num_experts):
-            if torch.compiler.is_compiling():
-                # Meta implementation - output is modified in-place
-                return None
-            return original_gather(output, moe_output, topk_weights,
-                                  unpermuted_row_to_permuted_row, num_experts)
-        
-        ops.moe_gather = gather_with_meta
-    
-    # Patch activation ops
-    for act_name in ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul", 
-                     "gelu_fast", "gelu_new", "gelu_quick", "mul_and_silu",
-                     "swigluoai_and_mul"]:
-        if hasattr(ops, act_name):
-            original_act = getattr(ops, act_name)
-            
-            def make_act_wrapper(orig_fn):
-                def act_with_meta(*args, **kwargs):
-                    if torch.compiler.is_compiling():
-                        # Meta implementation - in-place ops, return None
-                        return None
-                    return orig_fn(*args, **kwargs)
-                return act_with_meta
-            
-            setattr(ops, act_name, make_act_wrapper(original_act))
+# Register fake/meta kernels for torch.compile compatibility
+def _register_xpu_fake_kernels():
+    """Register fake kernels for XPU MoE operations to support torch.compile."""
+
+    def _register_if_available(op_name, fn):
+        if hasattr(ops, op_name):
+            register_fake(add_op_namespace_prefix(op_name))(fn)
+
+    _register_if_available(
+        "cutlass_grouped_gemm_interface",
+        lambda ptr_A, ptr_B, ptr_scales, ptr_bias, ptr_D, expert_first_token_offset, N, K, num_experts, is_B_int4, is_B_mxfp4: ptr_D,
+    )
+
+    _register_if_available(
+        "fused_moe_prologue",
+        lambda input, token_selected_experts, token_final_scales, workspace, hidden_size, inter_size, num_experts_on_rank: None,
+    )
+
+    _register_if_available(
+        "moe_gather",
+        lambda output, moe_output, topk_weights, unpermuted_row_to_permuted_row, num_experts: None,
+    )
+
+    _register_if_available(
+        "silu_and_mul",
+        lambda out, input: None,
+    )
+    _register_if_available(
+        "mul_and_silu",
+        lambda out, input: None,
+    )
+    _register_if_available(
+        "gelu_and_mul",
+        lambda out, input: None,
+    )
+    _register_if_available(
+        "gelu_tanh_and_mul",
+        lambda out, input: None,
+    )
+    _register_if_available(
+        "gelu_fast",
+        lambda out, input: None,
+    )
+    _register_if_available(
+        "gelu_new",
+        lambda out, input: None,
+    )
+    _register_if_available(
+        "gelu_quick",
+        lambda out, input: None,
+    )
+    _register_if_available(
+        "swigluoai_and_mul",
+        lambda out, input, alpha=1.702, limit=7.0: None,
+    )
 
 
-# Install meta kernels on module load
-_install_xpu_meta_kernels()
+# Register fake kernels on module load
+_register_xpu_fake_kernels()
 
 
 # default
@@ -149,6 +142,21 @@ def compute_num_tokens_per_block(num_tokens, num_experts_per_node):
         if num_blocks_per_seq * num_experts_per_node <= num_tokens_per_block:
             return num_tokens_per_block
     return 1024
+
+
+def _bytes_to_typed_tensor(byte_tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Reinterpret a uint8 buffer as a typed tensor by copying bytes.
+
+    This avoids `Tensor.view(dtype)` which can fail under torch.compile
+    constant folding when shape divisibility is not proven.
+    """
+    if byte_tensor.dtype != torch.uint8:
+        raise ValueError("byte_tensor must be uint8")
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    numel = byte_tensor.numel() // itemsize
+    out = torch.empty((numel,), dtype=dtype, device=byte_tensor.device)
+    out.view(torch.uint8).copy_(byte_tensor.contiguous())
+    return out
 
 
 def implement_zp(qweight):
@@ -321,7 +329,7 @@ def xpu_fused_moe(hidden_states,
     config_ws("permuted_token_final_scales", permuted_token_final_scales_size)
     config_ws("overlapped_gemm1_gemm2_inputs", permuted_data_size)
 
-    workspace = torch.zeros(map_offset,
+    workspace = torch.empty(map_offset,
                             dtype=torch.uint8,
                             device=hidden_states.device)
     if topk_ids.dtype == torch.int32:
@@ -335,14 +343,25 @@ def xpu_fused_moe(hidden_states,
         inter_size=inter_size,
         num_experts_on_rank=num_experts_per_node)
 
-    expert_first_token_offset = workspace[
+    expert_first_token_offset_bytes = workspace[
         ws_map["expert_first_token_offset"][1]:
         ws_map["expert_first_token_offset"][1] +
-        expert_first_token_offset_size].view(torch.int64)
-    unpermuted_row_to_permuted_row = workspace[
+        expert_first_token_offset_size]
+    unpermuted_row_to_permuted_row_bytes = workspace[
         ws_map["unpermuted_row_to_permuted_row"][1]:
         ws_map["unpermuted_row_to_permuted_row"][1] +
-        src_to_dest_map_size].view(torch.int32)
+        src_to_dest_map_size]
+
+    if torch.compiler.is_compiling():
+        expert_first_token_offset = _bytes_to_typed_tensor(
+            expert_first_token_offset_bytes, torch.int64
+        )
+        unpermuted_row_to_permuted_row = _bytes_to_typed_tensor(
+            unpermuted_row_to_permuted_row_bytes, torch.int32
+        )
+    else:
+        expert_first_token_offset = expert_first_token_offset_bytes.view(torch.int64)
+        unpermuted_row_to_permuted_row = unpermuted_row_to_permuted_row_bytes.view(torch.int32)
     gemm1_input = workspace[ws_map["overlapped_gemm1_gemm2_inputs"][1]:
                             ws_map["overlapped_gemm1_gemm2_inputs"][1] +
                             permuted_data_size].view(hidden_states.dtype).view(
