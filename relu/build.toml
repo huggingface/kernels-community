@@ -2,6 +2,7 @@
 name = "relu"
 version = 1
 backends = [
+    "cpu",
     "cuda",
     "metal",
     "rocm",
@@ -54,3 +55,8 @@ rocm-archs = [
 src = [
     "relu_cuda/relu.cu",
 ]
+
+[kernel.relu_cpu]
+backend = "cpu"
+depends = ["torch"]
+src = ["relu_cpu/relu_cpu.cpp"]
