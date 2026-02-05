@@ -168,6 +168,7 @@ depends = [
 ]
 src = [
     "flash_attn_xpu/flash_api.cpp",
+    "flash_attn_xpu/src/philox.hpp",
     "flash_attn_xpu/src/fmha_fwd_types.hpp",
     "flash_attn_xpu/src/fmha_fwd.hpp",
     "flash_attn_xpu/src/fmha_fwd_impl.hpp",
