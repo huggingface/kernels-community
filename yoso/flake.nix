@@ -2,7 +2,7 @@
   description = "Flake for yoso kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels";
+    kernel-builder.url = "github:huggingface/kernels/remove-backend";
   };
 
   outputs =
