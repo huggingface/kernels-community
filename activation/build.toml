@@ -1,7 +1,7 @@
 [general]
 name = "activation"
 version = 1
-backends = ["cuda"]
+backends = ["cuda", "metal"]
 
 [torch]
 src = [
@@ -16,4 +16,12 @@ src = [
     "activation/activation_kernels.cu",
     "activation/cuda_compat.h",
     "activation/dispatch_utils.h",
+]
+
+[kernel.activation_metal]
+backend = "metal"
+depends = ["torch"]
+src = [
+    "activation_metal/activation.mm",
+    "activation_metal/activation.metal",
 ]
