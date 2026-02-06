@@ -168,6 +168,7 @@ depends = [
 ]
 src = [
     "flash_attn_xpu/flash_api.cpp",
+    "flash_attn_xpu/src/philox.hpp",
     "flash_attn_xpu/src/fmha_fwd_types.hpp",
     "flash_attn_xpu/src/fmha_fwd.hpp",
     "flash_attn_xpu/src/fmha_fwd_impl.hpp",
@@ -186,6 +187,17 @@ src = [
     "flash_attn_xpu/src/flash_fwd_hdim160_fix.cpp",
     "flash_attn_xpu/src/flash_fwd_hdim192_fix.cpp",
     "flash_attn_xpu/src/flash_fwd_hdim256_fix.cpp",
+    "flash_attn_xpu/src/fmha_bwd_types.hpp",
+    "flash_attn_xpu/src/fmha_bwd.hpp",
+    "flash_attn_xpu/src/fmha_bwd_impl.hpp",
+    "flash_attn_xpu/src/fmha_bwd.cpp",
+    "flash_attn_xpu/src/flash_bwd_hdim32_fix.cpp",
+    "flash_attn_xpu/src/flash_bwd_hdim64_fix.cpp",
+    "flash_attn_xpu/src/flash_bwd_hdim96_fix.cpp",
+    "flash_attn_xpu/src/flash_bwd_hdim128_fix.cpp",
+    "flash_attn_xpu/src/flash_bwd_hdim160_fix.cpp",
+    "flash_attn_xpu/src/flash_bwd_hdim192_fix.cpp",
+    "flash_attn_xpu/src/flash_bwd_hdim256_fix.cpp",
     "flash_attn_xpu/src/fmha_utils.hpp",
     "flash_attn_xpu/src/collective/fmha_fusion.hpp",
     "flash_attn_xpu/src/collective/copy_block_slm.hpp",
@@ -193,4 +205,5 @@ src = [
     "flash_attn_xpu/src/collective/fmha_fwd_mainloop.hpp",
     "flash_attn_xpu/src/collective/fmha_fwd_scheduler.hpp",
     "flash_attn_xpu/src/kernel/fmha_fwd_kernel.hpp",
+    "flash_attn_xpu/src/kernel/fmha_bwd_kernel.hpp",
 ]

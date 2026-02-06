@@ -105,6 +105,11 @@ struct KernelLauncher {
       const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(args);
 
+    // Calculate LSE strides: LSE layout is (batch, num_heads, seqlen_q)
+    // For both varlen and non-varlen, use max_queries as the stride
+    int lse_stride_head = args.max_queries;
+    int lse_stride_batch = args.num_heads_q * lse_stride_head;
+
     typename FMHAKernel::Arguments arguments{
         {shape,
          reinterpret_cast<ElementQ*>(args.query),
@@ -121,8 +126,13 @@ struct KernelLauncher {
          args.max_blocks_per_seq,
          args.total_seqlen_k,
          args.window_size_left,
-         args.window_size_right},
-        {},
+         args.window_size_right,
+         args.p_dropout,
+         args.philox_seed,
+         args.philox_offset},
+        {reinterpret_cast<float*>(args.softmax_lse),
+         lse_stride_head,
+         lse_stride_batch},
         hw_info};
 
     size_t workspace_size = FMHAKernel::get_workspace_size(arguments);

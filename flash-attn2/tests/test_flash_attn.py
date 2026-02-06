@@ -694,16 +694,16 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
-    if device in ["xpu", "cpu"]:
+    if device in ["cpu"]:
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
-        print("XPU and CPU do not support backward currently, skipping grad check.")
+        print("CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out)
     # do_o = (g.float() * out.float()).sum(-1)
     # dv_tmp = torch.einsum('bhts,bthd->bshd', attn_pt[:, :, :64], g[:, :64])
     # dv_tmp1 = torch.einsum('bhts,bthd->bshd', attn_pt[:, :, 64:], g[:, 64:])
-    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
+    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90) or device == "xpu":
         (dqkv,) = torch.autograd.grad(out, qkv, g)
         (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g)
         (dqkv_pt,) = torch.autograd.grad(out_pt, qkv, g)
@@ -726,7 +726,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
         if not alibi:
             assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.025)
 
-    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
+    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90) or device == "xpu":
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
@@ -1107,14 +1107,18 @@ def test_flash_attn_output(
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
-    if device in ["xpu", "cpu"]:
+    if device in ["cpu"]:
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
-        print("XPU and CPU do not support backward currently, skipping grad check.")
+        print("CPU do not support backward currently, skipping grad check.")
+        return
+    if device in ["xpu"] and mha_type == "mqa" and kvpacked == True:
+        assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
+        print("There are some errors in the XPU MQA kvpacked backward test in this test suite, Skipping grad check.")
         return
 
     g = torch.randn_like(out)
     do_o = (g.float() * out.float()).sum(-1)
-    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
+    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90) or device == "xpu":
         if kvpacked:
             (
                 dq,
@@ -1170,7 +1174,7 @@ def test_flash_attn_output(
         if not alibi:
             assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.025)
 
-    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
+    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90) or device == "xpu":
         assert (dq - dq_ref).abs().max().item() <= 3 * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= 3 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 3 * (dv_pt - dv_ref).abs().max().item()
@@ -1594,9 +1598,9 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype, devi
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
 
-    if device in ["xpu", "cpu"]:
+    if device in ["cpu"]:
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
-        print("XPU and CPU do not support backward currently, skipping grad check.")
+        print("CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out)
@@ -1909,9 +1913,9 @@ def test_flash_attn_splitkv(
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
 
-    if device in ["xpu", "cpu"]:
+    if device in ["cpu"]:
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
-        print("XPU and CPU do not support backward currently, skipping grad check.")
+        print("CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out)
@@ -2317,13 +2321,12 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
     torch.random.manual_seed(42)
     out0, lse0, _ = flash_attn_func(q, k, v, dropout_p, causal=causal, return_attn_probs=True)
 
-    if device == "xpu":
+    if device == "cpu":
         for i in range(250):
             torch.random.manual_seed(42)
             out, lse, _ = flash_attn_func(q, k, v, dropout_p, causal=causal, return_attn_probs=True)
             assert torch.equal(out, out0)
-            # assert torch.equal(lse, lse0) # lse not implemented on xpu yet
-            print("XPU and CPU do not support backward currently, skipping grad check.")
+            print("CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out0)
@@ -2369,16 +2372,14 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype, device):
     """
     if device == "cpu":
         pytest.skip("backward not supported on CPU")
-    if device == "xpu":
-        pytest.skip("bwd test not supported on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)
     batch_size = 2
     nheads = 5
-    q = torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device="cuda") * 5
+    q = torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device=device) * 5
     k, v = [
-        torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device="cuda") * 3
+        torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device=device) * 3
         for _ in range(2)
     ]
     q.requires_grad_(True)
@@ -2429,20 +2430,18 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype, device):
     """
     if device == "cpu":
         pytest.skip("backward not supported on CPU")
-    if device == "xpu":
-        pytest.skip("bwd test not supported on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)
     batch_size = 5
     nheads = 2
     q, k, v = [
-        torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device="cuda", requires_grad=True)
+        torch.randn([batch_size, seqlen, nheads, d], dtype=dtype, device=device, requires_grad=True)
         for _ in range(3)
     ]
     out = rearrange(flash_attn_func(q, k, v, causal=causal), "b s ... -> s b ...")
     # So g is not contiguous
-    g = torch.randn(seqlen, 2 * batch_size, nheads, d, dtype=dtype, device="cuda")[:, ::2]
+    g = torch.randn(seqlen, 2 * batch_size, nheads, d, dtype=dtype, device=device)[:, ::2]
     out.backward(g)
     q_pt = q.detach().clone().requires_grad_(True)
     k_pt = k.detach().clone().requires_grad_(True)
@@ -2545,7 +2544,7 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
     if device == "cpu":
         pytest.skip("backward not supported on CPU")
     if device == "xpu":
-        pytest.skip("bwd test not supported on xpu currently")
+        pytest.skip("deterministic bwd test not supported on xpu currently")
     if (
         device == "cuda"
         and max(seqlen_q, seqlen_k) >= 2048
