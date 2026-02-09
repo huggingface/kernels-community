@@ -1064,7 +1064,7 @@ def flash_attn_qkvpacked_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
-        False if _XPU_AVAILABLE else torch.is_grad_enabled(),
+        torch.is_grad_enabled(),
     )
 
 
@@ -1142,7 +1142,7 @@ def flash_attn_kvpacked_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
-        False if _XPU_AVAILABLE else torch.is_grad_enabled(),
+        torch.is_grad_enabled(),
     )
 
 
@@ -1219,7 +1219,7 @@ def flash_attn_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
-        False if _XPU_AVAILABLE else torch.is_grad_enabled(),
+        torch.is_grad_enabled(),
     )
 
 

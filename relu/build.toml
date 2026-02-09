@@ -2,6 +2,7 @@
 name = "relu"
 version = 1
 backends = [
+    "cpu",
     "cuda",
     "metal",
     "rocm",
@@ -17,7 +18,9 @@ src = [
 [kernel.activation_xpu]
 backend = "xpu"
 depends = ["torch"]
-src = ["relu_xpu/relu.cpp"]
+src = [
+    "relu_xpu/relu.cpp",
+]
 
 [kernel.activation_metal]
 backend = "metal"
@@ -31,7 +34,9 @@ src = [
 [kernel.activation]
 backend = "cuda"
 depends = ["torch"]
-src = ["relu_cuda/relu.cu"]
+src = [
+    "relu_cuda/relu.cu",
+]
 
 [kernel.activation_rocm]
 backend = "rocm"
@@ -47,4 +52,11 @@ rocm-archs = [
     "gfx1100",
     "gfx1101",
 ]
-src = ["relu_cuda/relu.cu"]
+src = [
+    "relu_cuda/relu.cu",
+]
+
+[kernel.relu_cpu]
+backend = "cpu"
+depends = ["torch"]
+src = ["relu_cpu/relu_cpu.cpp"]

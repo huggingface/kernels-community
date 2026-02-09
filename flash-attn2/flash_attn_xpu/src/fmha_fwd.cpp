@@ -9,6 +9,7 @@ void cutlass_fmha_fwd_varlen_impl(
     const at::Tensor& key_cache,
     const at::Tensor& value_cache,
     at::Tensor& out,
+    at::Tensor& softmax_lse,
     const std::optional<at::Tensor>& block_table,
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& cu_seqlens_k,
@@ -67,6 +68,7 @@ void cutlass_fmha_fwd_varlen_impl(
       key_cache.data_ptr(),
       value_cache.data_ptr(),
       out.data_ptr(),
+      softmax_lse.data_ptr(),
       is_paged && block_table.has_value() ? block_table->data_ptr() : nullptr,
       cu_seqlens_q.data_ptr(),
       cu_seqlens_k.data_ptr(),
@@ -154,11 +156,16 @@ void cutlass_fmha_fwd_fix_impl(
     const at::Tensor& key,
     const at::Tensor& value,
     at::Tensor& out,
+    at::Tensor& softmax_lse,
     float sm_scale,
     int window_size_left,
     int window_size_right,
     bool is_causal,
-    bool is_local) {
+    bool is_local,
+    float p_dropout,
+    uint64_t philox_seed,
+    uint64_t philox_offset,
+    void* rng_state) {
   int batch_size = query.size(0);
   int max_seqlen_q = query.size(1);
   int num_heads_q = query.size(2);
@@ -184,6 +191,7 @@ void cutlass_fmha_fwd_fix_impl(
       key.data_ptr(),
       value.data_ptr(),
       out.data_ptr(),
+      softmax_lse.data_ptr(),
       nullptr,
       nullptr,
       nullptr,
@@ -203,7 +211,11 @@ void cutlass_fmha_fwd_fix_impl(
       false,
       false,
       is_causal,
-      is_local};
+      is_local,
+      p_dropout,
+      philox_seed,
+      philox_offset,
+      rng_state};
 
   CutlassType cuType = aten_to_Cutlass_dtype(query);
   const int h = args.head_size;

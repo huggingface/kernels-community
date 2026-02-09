@@ -40,6 +40,7 @@
 #include "cute/algorithm/subgroup_algorithms.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "./fmha_fusion.hpp"
+#include "../philox.hpp"
 
 namespace cutlass::fmha {
 
@@ -182,10 +183,23 @@ struct FMHAFwdMainloop<
     int total_seqlen_kv;
     // Local Mask
     int local_left, local_right;
+    // Dropout
+    float p_dropout;
+    uint64_t philox_seed;
+    uint64_t philox_offset;
   };
 
   // Kernel-facing parameters
-  using Params = Arguments;
+  struct Params {
+    ElementS scale;
+    int* ptr_page_table;
+    int page_size;
+    int max_pages_per_seq;
+    int total_seqlen_kv;
+    int local_left, local_right;
+    // Dropout
+    cutlass::fmha::Dropout dropout;
+  };
 
   // SLM data
   struct SharedStorage {};
@@ -209,7 +223,8 @@ struct FMHAFwdMainloop<
         args.max_pages_per_seq,
         args.total_seqlen_kv,
         args.local_left,
-        args.local_right};
+        args.local_right,
+        cutlass::fmha::Dropout(args.philox_seed, args.philox_offset, args.p_dropout)};
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -232,7 +247,9 @@ struct FMHAFwdMainloop<
       int thr_id,
       int seq_len,
       int full_tile_offset,
-      int discard_seq_coord) {
+      int discard_seq_coord,
+      int head_q = 0,         // Head index for dropout
+      int num_heads = 1) {    // Total number of heads for dropout
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -422,6 +439,25 @@ struct FMHAFwdMainloop<
 
       /* Apply softmax and scaling */
       softmax(K == 0, tSrS, tA_max, tA_sum, tArA);
+      
+      /* Apply dropout to attention probabilities (P) */
+      if (params.dropout.is_enabled) {
+        Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
+        Tensor gP = local_tile(
+            cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+        auto cS_thread = thr_mma_qk.partition_C(gP);
+        // Encode batch and head into batch_head for unique random sequence
+        uint32_t batch_head = static_cast<uint32_t>(idx_b * num_heads + head_q);
+        int sg_local_id = get_sub_group().get_local_id()[0];
+        
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tSrS.size(); ++i) {
+          int row_idx = get<0>(cS_thread(i));
+          int col_idx = get<1>(cS_thread(i)) + sg_local_id;
+          tSrS(i) = params.dropout.apply(tSrS(i), batch_head, row_idx, col_idx);
+        }
+      }
+      
       reorder(tSrS, tArP);
 
       /* GEMM 2: A += P * V, split in v dimension */

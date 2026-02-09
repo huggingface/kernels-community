@@ -54,7 +54,6 @@ src = [
 [kernel.flash_attn_sm90]
 backend = "cuda"
 cuda-capabilities = [
-    "8.0",
     "9.0a",
 ]
 cuda-flags = [
@@ -408,7 +407,6 @@ src = [
 backend = "cuda"
 cuda-capabilities = [
     "8.0",
-    "9.0a",
 ]
 cuda-flags = [
     "-O3",

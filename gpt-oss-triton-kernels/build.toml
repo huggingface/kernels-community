@@ -5,6 +5,7 @@ backends = [
     "cuda",
     "rocm",
     "xpu",
+    "cpu",
 ]
 
 [general.hub]
