@@ -215,7 +215,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "fused_moe_prologue(Tensor input, Tensor token_selected_experts, "
       "Tensor "
-      "token_final_scales, Tensor workspace, int hidden_size, int inter_size, "
+      "token_final_scales, Tensor! workspace, int hidden_size, int inter_size, "
       "int num_experts_on_rank) -> "
       "()");
   ops.impl("fused_moe_prologue", torch::kXPU, &fused_moe_prologue);
