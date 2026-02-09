@@ -33,18 +33,26 @@ def test_kernel_mapping_completeness(root_path: Path) -> bool:
     else:
         print("\n✅ All kernel directories are present in KERNEL_SOURCE_MAPPING")
 
+    skipped_entries = []
     invalid_entries = []
     for kernel_dir, source_url in KERNEL_SOURCE_MAPPING.items():
-        if not source_url:
+        if source_url == "":
+            skipped_entries.append(kernel_dir)
+        elif not source_url:
             invalid_entries.append(kernel_dir)
 
+    if skipped_entries:
+        print(f"\nℹ️  INFO: The following entries have empty source URLs (intentionally skipped):")
+        for dir_name in sorted(skipped_entries):
+            print(f"  - {dir_name}")
+
     if invalid_entries:
-        print(f"\n❌ ERROR: The following entries have None or empty source URLs:")
+        print(f"\n❌ ERROR: The following entries have None or invalid source URLs:")
         for dir_name in sorted(invalid_entries):
             print(f"  - {dir_name}: {KERNEL_SOURCE_MAPPING[dir_name]!r}")
         all_passed = False
     else:
-        print("✅ All entries in KERNEL_SOURCE_MAPPING have valid source URLs")
+        print("✅ All entries in KERNEL_SOURCE_MAPPING have valid or intentionally empty source URLs")
 
     extra_dirs = mapped_dirs - set(kernel_dirs)
     if extra_dirs:

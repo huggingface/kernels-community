@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Test kernel mapping completeness
+      - name: Test kernel lookup completeness
         run: |
           cd scripts
-          python test_kernel_mapping.py
+          python test_kernel_freshness_lookup.py

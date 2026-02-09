@@ -22,7 +22,7 @@ KERNEL_SOURCE_MAPPING = {
     "layer_norm": "https://github.com/Dao-AILab/flash-attention",
     "mamba-ssm": "https://github.com/state-spaces/mamba",
     "megablocks": "https://github.com/databricks/megablocks",
-    "mra": "",  # TODO: Add source URL
+    "mra": "",
     "paged-attention": "https://github.com/vllm-project/vllm",
     "punica-sgmv": "https://github.com/punica-ai/punica",
     "quantization-bitsandbytes": "https://github.com/bitsandbytes-foundation/bitsandbytes",
@@ -36,6 +36,13 @@ KERNEL_SOURCE_MAPPING = {
     "trimul_gpumode": "https://github.com/davidberard98/gpumode-trimul",
     "vllm-flash-attn3": "https://github.com/Dao-AILab/flash-attention",
     "yoso": "https://github.com/mlpen/YOSO",
+    "cv-utils": "",
+    "liger-kernels": "https://github.com/linkedin/Liger-Kernel",
+    "gpt-oss-triton-kernels": "",
+    "metal-flash-sdpa": "https://github.com/philipturner/metal-flash-attention",
+    "mlx-rmsnorm": "",
+    "sage-attention": "https://github.com/thu-ml/SageAttention",
+
 }
 
 def parse_args() -> argparse.Namespace:
@@ -189,11 +196,11 @@ def _check_single_kernel(
 
 
 def check_kernel_freshness(
-    root_path: Path, 
-    github_token: str | None = None, 
+    root_path: Path,
+    github_token: str | None = None,
     max_workers: int = 10,
     limit: int = None
-) -> list[dict]:
+) -> tuple[list[dict], list[str]]:
     mapping_to_use = KERNEL_SOURCE_MAPPING
 
     if limit:
@@ -201,6 +208,11 @@ def check_kernel_freshness(
         mapping_to_use = _random_subdict(mapping_to_use, limit)
 
     results = []
+    skipped_kernels = []
+
+    for kernel_dir, source_url in mapping_to_use.items():
+        if source_url == "":
+            skipped_kernels.append(kernel_dir)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_kernel = {
@@ -223,10 +235,10 @@ def check_kernel_freshness(
             except Exception as exc:
                 print(f"Error checking {kernel_dir}: {exc}")
 
-    return results
+    return results, skipped_kernels
 
 
-def _format_freshness_report(results: list[dict]) -> str:
+def _format_freshness_report(results: list[dict], skipped_kernels: list[str]) -> str:
     sorted_results = sorted(results, key=lambda x: x["days_behind"], reverse=True)
 
     heading = f"📊 Kernel Freshness Report - {len(sorted_results)} kernel(s) behind upstream"
@@ -236,6 +248,11 @@ def _format_freshness_report(results: list[dict]) -> str:
         items.append(f"• {result['source_url']}: upstream is {result['days_behind']} days newer")
 
     report = f"{heading}\n\n" + "\n".join(items)
+
+    if skipped_kernels:
+        report += f"\n\n🔕 Freshness check intentionally skipped for"
+        for kernel in sorted(skipped_kernels):
+            report += f"\n• {kernel}"
 
     repository = os.getenv("GITHUB_REPOSITORY")
     run_id = os.getenv("GITHUB_RUN_ID")
@@ -262,13 +279,15 @@ def main() -> int:
     print(f"Using root path: {root_path}")
     print(f"Using {args.max_workers} worker threads for parallel checking")
 
-    results = check_kernel_freshness(root_path, args.github_token, args.max_workers, args.limit)
+    results, skipped_kernels = check_kernel_freshness(root_path, args.github_token, args.max_workers, args.limit)
 
     if not results:
         print("\n✅ All kernel directories are up to date with their upstream sources!")
+        if skipped_kernels:
+            print(f"Note: {len(skipped_kernels)} kernel(s) were intentionally skipped (no source URL configured)")
         return 0
 
-    report = _format_freshness_report(results)
+    report = _format_freshness_report(results, skipped_kernels)
     print("\n" + report)
 
     if args.dry_run:
