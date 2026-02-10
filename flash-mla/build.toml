@@ -12,8 +12,8 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
-# Cross-architecture utility kernels and API dispatch (SM90+)
-[kernel.flash_mla_smxx]
+# SM90 (Hopper/H100) kernels
+[kernel.flash_mla_sm90]
 backend = "cuda"
 cuda-capabilities = ["9.0a"]
 cuda-flags = [
@@ -43,7 +43,7 @@ include = [
     "csrc/sm100",
 ]
 src = [
-    # API implementation (includes dispatch logic)
+    # API implementation
     "csrc/api/api_impl.cu",
     "csrc/api/common.h",
     "csrc/api/dense_decode.h",
@@ -85,36 +85,9 @@ src = [
     "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h",
     "csrc/sm100/decode/head64/config.h",
     "csrc/sm100/decode/head64/kernel.h",
-]
 
-# SM90 (Hopper/H100) kernels
-[kernel.flash_mla_sm90]
-backend = "cuda"
-cuda-capabilities = ["9.0a"]
-cuda-flags = [
-    "-O3",
-    "-std=c++20",
-    "-DNDEBUG",
-    "-D_USE_MATH_DEFINES",
-    "-Wno-deprecated-declarations",
-    "-U__CUDA_NO_HALF_OPERATORS__",
-    "-U__CUDA_NO_HALF_CONVERSIONS__",
-    "-U__CUDA_NO_HALF2_OPERATORS__",
-    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-    "--expt-relaxed-constexpr",
-    "--expt-extended-lambda",
-    "--use_fast_math",
-]
-depends = [
-    "torch",
-    "cutlass_4_0",
-]
-include = [
-    "csrc",
-    "csrc/kerutils/include",
-    "csrc/sm90",
-]
-src = [
+    ### SM90-specific headers and sources
+
     # SM90 helpers
     "csrc/sm90/helpers.h",
     # Dense decode
@@ -146,6 +119,8 @@ src = [
     "csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu",
     "csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
 ]
+
+# TODO: uncomment when 10.0f is supported by the builder
 
 # # SM100 (Blackwell/B200) kernels - requires CUDA 12.9+
 # [kernel.flash_mla_sm100]
