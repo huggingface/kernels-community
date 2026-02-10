@@ -119,8 +119,12 @@ mha_fwd(
     // Handle dropout
     uint64_t philox_seed = 0;
     uint64_t philox_offset = 0;
-    at::Tensor rng_state;
-    
+
+    // Always allocate rng_state to match the meta function and ensure
+    // torch.compile compatibility (inductor expects all return values to be
+    // valid tensors).
+    at::Tensor rng_state = at::empty({2}, q.options().dtype(at::kLong));
+
     if (p_dropout > 0.0f) {
         // Calculate counter offset for RNG: batch_size * num_heads * 32
         int64_t counter_offset = batch_size * num_heads * 32;
@@ -129,7 +133,6 @@ mha_fwd(
         philox_offset = offset;
         
         // Store RNG state for backward pass
-        rng_state = at::empty({2}, q.options().dtype(at::kLong));
         rng_state[0] = static_cast<int64_t>(philox_seed);
         rng_state[1] = static_cast<int64_t>(philox_offset);
     }
@@ -151,7 +154,9 @@ mha_fwd(
     }
     out = ensure_contiguous(out);
 
-    at::Tensor S_dmask;
+    // Always return a valid (possibly empty) tensor for S_dmask to ensure
+    // torch.compile compatibility — the meta function returns torch.empty((0,)).
+    at::Tensor S_dmask = at::empty({0}, q.options());
     return {out, softmax_lse, S_dmask, rng_state};
   }
 
