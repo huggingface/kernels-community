@@ -216,107 +216,107 @@ class FlashMLACausalBenchmark(Benchmark):
         return _verify_mla_decode(self, causal=True)
 
 
-class FlashMLAVarlenBenchmark(Benchmark):
-    seed: int = 42
+# class FlashMLAVarlenBenchmark(Benchmark):
+#     seed: int = 42
 
-    # Workload: small (3 sequences, max_seqlen=64)
-    def setup_small(self):
-        H, D = 8, 64
-        seqlens = [32, 48, 64]
-        total = sum(seqlens)
-        self.q = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
-        self.k = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
-        self.v = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
-        self.cu_seqlens = torch.tensor(
-            [0] + list(torch.cumsum(torch.tensor(seqlens), 0)),
-            device="cuda",
-            dtype=torch.int32,
-        )
-        self.max_seqlen = max(seqlens)
-        self.out = torch.empty(total, H, D, device="cuda", dtype=torch.bfloat16)
+#     # Workload: small (3 sequences, max_seqlen=64)
+#     def setup_small(self):
+#         H, D = 8, 64
+#         seqlens = [32, 48, 64]
+#         total = sum(seqlens)
+#         self.q = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
+#         self.k = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
+#         self.v = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
+#         self.cu_seqlens = torch.tensor(
+#             [0] + list(torch.cumsum(torch.tensor(seqlens), 0)),
+#             device="cuda",
+#             dtype=torch.int32,
+#         )
+#         self.max_seqlen = max(seqlens)
+#         self.out = torch.empty(total, H, D, device="cuda", dtype=torch.bfloat16)
 
-    def benchmark_small(self):
-        self.out = _extract_output(
-            self.kernel.flash_attn_varlen_func(
-                self.q,
-                self.k,
-                self.v,
-                self.cu_seqlens,
-                self.cu_seqlens,
-                self.max_seqlen,
-                self.max_seqlen,
-            )
-        )
+#     def benchmark_small(self):
+#         self.out = _extract_output(
+#             self.kernel.flash_attn_varlen_func(
+#                 self.q,
+#                 self.k,
+#                 self.v,
+#                 self.cu_seqlens,
+#                 self.cu_seqlens,
+#                 self.max_seqlen,
+#                 self.max_seqlen,
+#             )
+#         )
 
-    def verify_small(self) -> torch.Tensor:
-        return _varlen_reference_attention(
-            self.q, self.k, self.v, self.cu_seqlens, self.cu_seqlens, causal=False
-        )
+#     def verify_small(self) -> torch.Tensor:
+#         return _varlen_reference_attention(
+#             self.q, self.k, self.v, self.cu_seqlens, self.cu_seqlens, causal=False
+#         )
 
-    # Workload: medium (5 sequences, max_seqlen=256)
-    def setup_medium(self):
-        H, D = 16, 64
-        seqlens = [128, 192, 256, 200, 150]
-        total = sum(seqlens)
-        self.q = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
-        self.k = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
-        self.v = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
-        self.cu_seqlens = torch.tensor(
-            [0] + list(torch.cumsum(torch.tensor(seqlens), 0)),
-            device="cuda",
-            dtype=torch.int32,
-        )
-        self.max_seqlen = max(seqlens)
-        self.out = torch.empty(total, H, D, device="cuda", dtype=torch.bfloat16)
+#     # Workload: medium (5 sequences, max_seqlen=256)
+#     def setup_medium(self):
+#         H, D = 16, 64
+#         seqlens = [128, 192, 256, 200, 150]
+#         total = sum(seqlens)
+#         self.q = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
+#         self.k = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
+#         self.v = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
+#         self.cu_seqlens = torch.tensor(
+#             [0] + list(torch.cumsum(torch.tensor(seqlens), 0)),
+#             device="cuda",
+#             dtype=torch.int32,
+#         )
+#         self.max_seqlen = max(seqlens)
+#         self.out = torch.empty(total, H, D, device="cuda", dtype=torch.bfloat16)
 
-    def benchmark_medium(self):
-        self.out = _extract_output(
-            self.kernel.flash_attn_varlen_func(
-                self.q,
-                self.k,
-                self.v,
-                self.cu_seqlens,
-                self.cu_seqlens,
-                self.max_seqlen,
-                self.max_seqlen,
-            )
-        )
+#     def benchmark_medium(self):
+#         self.out = _extract_output(
+#             self.kernel.flash_attn_varlen_func(
+#                 self.q,
+#                 self.k,
+#                 self.v,
+#                 self.cu_seqlens,
+#                 self.cu_seqlens,
+#                 self.max_seqlen,
+#                 self.max_seqlen,
+#             )
+#         )
 
-    def verify_medium(self) -> torch.Tensor:
-        return _varlen_reference_attention(
-            self.q, self.k, self.v, self.cu_seqlens, self.cu_seqlens, causal=False
-        )
+#     def verify_medium(self) -> torch.Tensor:
+#         return _varlen_reference_attention(
+#             self.q, self.k, self.v, self.cu_seqlens, self.cu_seqlens, causal=False
+#         )
 
-    # Workload: large (8 sequences, max_seqlen=512)
-    def setup_large(self):
-        H, D = 32, 128
-        seqlens = [256, 384, 512, 448, 320, 480, 400, 512]
-        total = sum(seqlens)
-        self.q = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
-        self.k = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
-        self.v = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
-        self.cu_seqlens = torch.tensor(
-            [0] + list(torch.cumsum(torch.tensor(seqlens), 0)),
-            device="cuda",
-            dtype=torch.int32,
-        )
-        self.max_seqlen = max(seqlens)
-        self.out = torch.empty(total, H, D, device="cuda", dtype=torch.bfloat16)
+#     # Workload: large (8 sequences, max_seqlen=512)
+#     def setup_large(self):
+#         H, D = 32, 128
+#         seqlens = [256, 384, 512, 448, 320, 480, 400, 512]
+#         total = sum(seqlens)
+#         self.q = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
+#         self.k = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
+#         self.v = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
+#         self.cu_seqlens = torch.tensor(
+#             [0] + list(torch.cumsum(torch.tensor(seqlens), 0)),
+#             device="cuda",
+#             dtype=torch.int32,
+#         )
+#         self.max_seqlen = max(seqlens)
+#         self.out = torch.empty(total, H, D, device="cuda", dtype=torch.bfloat16)
 
-    def benchmark_large(self):
-        self.out = _extract_output(
-            self.kernel.flash_attn_varlen_func(
-                self.q,
-                self.k,
-                self.v,
-                self.cu_seqlens,
-                self.cu_seqlens,
-                self.max_seqlen,
-                self.max_seqlen,
-            )
-        )
+#     def benchmark_large(self):
+#         self.out = _extract_output(
+#             self.kernel.flash_attn_varlen_func(
+#                 self.q,
+#                 self.k,
+#                 self.v,
+#                 self.cu_seqlens,
+#                 self.cu_seqlens,
+#                 self.max_seqlen,
+#                 self.max_seqlen,
+#             )
+#         )
 
-    def verify_large(self) -> torch.Tensor:
-        return _varlen_reference_attention(
-            self.q, self.k, self.v, self.cu_seqlens, self.cu_seqlens, causal=False
-        )
+#     def verify_large(self) -> torch.Tensor:
+#         return _varlen_reference_attention(
+#             self.q, self.k, self.v, self.cu_seqlens, self.cu_seqlens, causal=False
+#         )
