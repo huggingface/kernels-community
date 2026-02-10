@@ -5,8 +5,10 @@
 #include "params.h"
 
 #include "sm90/decode/sparse_fp8/splitkv_mla.h"
+#ifndef FLASH_MLA_SM90_ONLY
 #include "sm100/decode/head64/kernel.h"
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
+#endif
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "smxx/decode/combine/combine.h"
 
@@ -75,6 +77,7 @@ protected:
     }
 };
 
+#ifndef FLASH_MLA_SM90_ONLY
 class Decode_Sm100_Head64_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         DecodeFeatures::HEAD_64,
@@ -179,8 +182,9 @@ protected:
         sm100::fwd_for_small_topk::head128::run_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::DecodeWithSplitKV, 512>(params);
     }
 };
+#endif // FLASH_MLA_SM90_ONLY
 
-static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 sparse_attn_decode_interface(
     const at::Tensor &q,   // [b, s_q, h_q, d_qk]
     const at::Tensor &kv,   // [num_blocks, page_block_size, h_k, d_qk]
@@ -360,6 +364,7 @@ sparse_attn_decode_interface(
     }
 
     DecodeImplBase* impl;
+#ifndef FLASH_MLA_SM90_ONLY
     if (arch.is_sm100f()) {
         if (h_q == 64) {
             impl = new Decode_Sm100_Head64_Impl();
@@ -374,10 +379,12 @@ sparse_attn_decode_interface(
         } else {
             TORCH_CHECK(false, "Unsupported h_q: ", h_q);
         }
-    } else if (arch.is_sm90a()) {
+    } else
+#endif
+    if (arch.is_sm90a()) {
         impl = new Decode_Sm90_Impl();
     } else {
-        TORCH_CHECK(false, "Unsupported architecture for sparse decode fwd");
+        TORCH_CHECK(false, "Unsupported architecture for sparse decode fwd (SM90 only build)");
     }
 
     DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);

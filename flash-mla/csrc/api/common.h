@@ -2,7 +2,7 @@
 
 #include <span>
 
-#include <torch/extension.h>
+#include <torch/torch.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <kerutils/supplemental/torch_tensors.h>

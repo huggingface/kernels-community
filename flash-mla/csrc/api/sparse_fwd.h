@@ -5,9 +5,11 @@
 #include "params.h"
 
 #include "sm90/prefill/sparse/phase1.h"
+#ifndef FLASH_MLA_SM90_ONLY
 #include "sm100/prefill/sparse/fwd/head128/phase1.h"
 #include "sm100/prefill/sparse/fwd/head64/phase1.h"
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
+#endif
 
 enum class FwdFeatures : int {
     HEAD_64,
@@ -47,6 +49,7 @@ protected:
     }
 };
 
+#ifndef FLASH_MLA_SM90_ONLY
 class Fwd_Sm100_Head64_Impl : public FwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
         FwdFeatures::HEAD_64,
@@ -97,8 +100,9 @@ protected:
         sm100::fwd_for_small_topk::head128::run_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::Prefill, 512>(params);
     }
 };
+#endif // FLASH_MLA_SM90_ONLY
 
-static std::vector<at::Tensor> sparse_attn_prefill_interface(
+std::vector<at::Tensor> sparse_attn_prefill_interface(
     const at::Tensor &q,
     const at::Tensor &kv,
     const at::Tensor &indices,
@@ -111,8 +115,12 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     
     Arch arch = Arch();
     bool is_sm90a = arch.is_sm90a();
+#ifndef FLASH_MLA_SM90_ONLY
     bool is_sm100f = arch.is_sm100f();
     TORCH_CHECK(is_sm90a || is_sm100f, "Sparse Attention Forward Kernel is only supported on SM90a and SM100f architectures.");
+#else
+    TORCH_CHECK(is_sm90a, "Sparse Attention Forward Kernel is only supported on SM90a in this build.");
+#endif
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 3);
@@ -213,7 +221,9 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     if (is_sm90a) {
         Fwd_Sm90_Impl fwd_impl;
         fwd_impl.run(params, required_features);
-    } else if (is_sm100f) {
+    }
+#ifndef FLASH_MLA_SM90_ONLY
+    else if (is_sm100f) {
         if (h_q == 64) {
             Fwd_Sm100_Head64_Impl fwd_impl;
             fwd_impl.run(params, required_features);
@@ -235,7 +245,9 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
         } else {
             TORCH_CHECK(false, "Unsupported h_q: ", h_q);
         }
-    } else {
+    }
+#endif
+    else {
         TORCH_CHECK(false, "Unsupported architecture");
     }
 
