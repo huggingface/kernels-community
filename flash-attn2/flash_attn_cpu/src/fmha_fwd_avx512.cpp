@@ -330,44 +330,55 @@ void pack_vnni2_impl(
   }
 }
 
-//==============================================================================
-// AVX512 PackPolicy
-//==============================================================================
-
-struct AVX512PackPolicy {
-  template <typename scalar_t>
-  static void pack_vnni(scalar_t* dst, const scalar_t* src, int N, int K, int ld_src, int ld_dst) {
-    pack_vnni_impl<scalar_t, int32_t, false>(dst, src, nullptr, N, K, ld_src, ld_dst);
-  }
-
-  template <typename scalar_t>
-  static void pack_vnni2(scalar_t* dst, const scalar_t* src, int K, int N, int ld_src, int ld_dst) {
-    pack_vnni2_impl<scalar_t, int32_t, false>(dst, src, nullptr, K, N, ld_src, ld_dst);
-  }
-
-  template <typename scalar_t, int BLOCK_N>
-  static void copy_stub_block(scalar_t* __restrict__ out, const float* __restrict__ input) {
-    static_assert(BLOCK_N % 32 == 0);
-    using bVec = at::vec::Vectorized<scalar_t>;
-    using fVec = at::vec::Vectorized<float>;
-
-    constexpr int COLS = BLOCK_N / 16;
-    auto store = [&](auto i) {
-      constexpr int col = i % COLS;
-      if constexpr (col % 2 == 0) {
-        fVec a_fvec0 = fVec::loadu(input + col * 16);
-        fVec a_fvec1 = fVec::loadu(input + col * 16 + 16);
-        bVec out_bvec = convert_from_float_avx512<scalar_t>(a_fvec0, a_fvec1);
-        out_bvec.store(out + col * 16);
-      }
-    };
-    Unroll<COLS>{}(store);
-  }
-};
+}  // namespace avx512
 
 //==============================================================================
-// Public API
+// Pack functions implementation (called from fmha_fwd_kernel.hpp)
+// These are in flash_attn_cpu namespace to match declarations in fmha_fwd_kernel.hpp
 //==============================================================================
+
+template <typename scalar_t>
+void pack_vnni(scalar_t* dst, const scalar_t* src, int N, int K, int ld_src, int ld_dst) {
+  avx512::pack_vnni_impl<scalar_t, int32_t, false>(dst, src, nullptr, N, K, ld_src, ld_dst);
+}
+
+template <typename scalar_t>
+void pack_vnni2(scalar_t* dst, const scalar_t* src, int K, int N, int ld_src, int ld_dst) {
+  avx512::pack_vnni2_impl<scalar_t, int32_t, false>(dst, src, nullptr, K, N, ld_src, ld_dst);
+}
+
+template <typename scalar_t, int BLOCK_N>
+void copy_stub_block(scalar_t* __restrict__ out, const float* __restrict__ input) {
+  static_assert(BLOCK_N % 32 == 0);
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  constexpr int COLS = BLOCK_N / 16;
+  auto store = [&](auto i) {
+    constexpr int col = i % COLS;
+    if constexpr (col % 2 == 0) {
+      fVec a_fvec0 = fVec::loadu(input + col * 16);
+      fVec a_fvec1 = fVec::loadu(input + col * 16 + 16);
+      bVec out_bvec = avx512::convert_from_float_avx512<scalar_t>(a_fvec0, a_fvec1);
+      out_bvec.store(out + col * 16);
+    }
+  };
+  Unroll<COLS>{}(store);
+}
+
+// Explicit template instantiations
+template void pack_vnni<at::BFloat16>(at::BFloat16*, const at::BFloat16*, int, int, int, int);
+template void pack_vnni<at::Half>(at::Half*, const at::Half*, int, int, int, int);
+template void pack_vnni2<at::BFloat16>(at::BFloat16*, const at::BFloat16*, int, int, int, int);
+template void pack_vnni2<at::Half>(at::Half*, const at::Half*, int, int, int, int);
+template void copy_stub_block<at::BFloat16, 768>(at::BFloat16*, const float*);
+template void copy_stub_block<at::Half, 768>(at::Half*, const float*);
+
+//==============================================================================
+// Public API wrapper in avx512 namespace
+//==============================================================================
+
+namespace avx512 {
 
 void fmha_fwd_varlen_impl(
     const at::Tensor& q,
@@ -380,7 +391,7 @@ void fmha_fwd_varlen_impl(
     int max_seqlen_k,
     float softmax_scale,
     bool is_causal) {
-  fmha_fwd_varlen_impl_template<AVX512PackPolicy>(
+  flash_attn_cpu::fmha_fwd_varlen_impl(
       q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal);
 }
 
