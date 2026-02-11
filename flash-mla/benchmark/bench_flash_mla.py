@@ -1,3 +1,13 @@
+# /// script
+# dependencies = [
+#   "numpy",
+#   "torch",
+#   "kernels",
+#   "flashinfer-python",
+#   "triton"
+# ]
+# ///
+
 # MLA Triton kernel is from: https://github.com/monellz/vllm/commit/feebaa7c063be6bfb590a876741aeef1c5f58cf8#diff-7b2e1c9032522f7266051b9887246a65753871dfb3625a258fee40109fe6e87a
 import argparse
 import math
@@ -8,8 +18,13 @@ import torch
 import triton
 import triton.language as tl
 
+from kernels import get_kernel, get_local_kernel
+
 # pip install flashinfer-python
-from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+# from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+flash_mla = get_kernel("drbh/tmp-kernel-123")
+flash_mla_with_kvcache = flash_mla.flash_mla_with_kvcache
+get_mla_metadata = flash_mla.get_mla_metadata
 
 
 def scaled_dot_product_attention(query, key, value, h_q, h_kv, is_causal=False):
@@ -503,6 +518,7 @@ def get_args():
     
 if __name__ == "__main__":
     args = get_args()
+    print("test")
     benchmark_type = "all" if args.all else f"{args.baseline}_vs_{args.target}" if args.compare else args.target
     with open(f"{benchmark_type}_perf.csv", "w") as fout:
         fout.write("name,batch,seqlen,head,bw\n")

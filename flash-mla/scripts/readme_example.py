@@ -20,8 +20,8 @@ from pathlib import Path
 
 # Setup
 torch.manual_seed(42)
-# flash_mla = get_kernel("kernels-community/flash-mla")
-flash_mla = get_local_kernel(Path("build"), "flash-mla")
+flash_mla = get_kernel("drbh/tmp-kernel-123")
+# flash_mla = get_local_kernel(Path("build"), "flash-mla")
 device = torch.device("cuda")
 
 # Check GPU architecture

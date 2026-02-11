@@ -1,3 +1,10 @@
+# /// script
+# dependencies = [
+#   "matplotlib",
+#   "pandas"
+# ]
+# ///
+
 import argparse
 
 import matplotlib.pyplot as plt
