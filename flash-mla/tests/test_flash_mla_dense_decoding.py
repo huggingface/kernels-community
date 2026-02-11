@@ -1,3 +1,12 @@
+# /// script
+# dependencies = [
+#   "numpy",
+#   "torch",
+#   "kernels",
+#   "triton",
+#   "rich",
+# ]
+# ///
 import argparse
 import math
 import random
@@ -7,7 +16,10 @@ from typing import Tuple
 import torch
 
 import kernelkit as kk
-import flash_mla
+# import flash_mla
+from kernels import get_kernel
+
+flash_mla = get_kernel("drbh/tmp-kernel-123")
 
 @dataclasses.dataclass
 class TestParam:
