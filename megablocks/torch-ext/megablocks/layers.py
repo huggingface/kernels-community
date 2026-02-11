@@ -39,7 +39,7 @@ def _install_meta_kernels():
 
         def sort_with_meta(x, end_bit=None):
             if torch.compiler.is_compiling():
-                print("Using meta kernel for sort")
+                # print("Using meta kernel for sort")
                 # Meta implementation - return tensors with correct shape/dtype/device
                 return torch.empty_like(x), torch.empty_like(x)
             # print("Using original sort kernel")
