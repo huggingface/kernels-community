@@ -496,6 +496,36 @@ mha_fwd(
 }
 
 std::vector<torch::Tensor>
+mha_varlen_bwd(
+        const torch::Tensor &dout,
+        const torch::Tensor &q,
+        const torch::Tensor &k,
+        const torch::Tensor &v,
+        const torch::Tensor &out,
+        const torch::Tensor &softmax_lse,
+        const c10::optional<torch::Tensor> &dq_,
+        const c10::optional<torch::Tensor> &dk_,
+        const c10::optional<torch::Tensor> &dv_,
+        const torch::Tensor &cu_seqlens_q,
+        const torch::Tensor &cu_seqlens_k,
+        const c10::optional<torch::Tensor> &alibi_slopes_,
+        const int64_t max_seqlen_q,
+        const int64_t max_seqlen_k,
+        const double p_dropout,
+        const double softmax_scale,
+        const bool zero_tensors,
+        const bool is_causal,
+        const int64_t window_size_left,
+        const int64_t window_size_right,
+        const double softcap,
+        const bool deterministic,
+        c10::optional<at::Generator> gen_,
+        const c10::optional<torch::Tensor> &rng_state) {
+    TORCH_CHECK(false, "FlashAttention varlen backward is not supported on XPU yet.");
+    return {};
+}
+
+std::vector<torch::Tensor>
 mha_varlen_fwd(
     torch::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
     const torch::Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
