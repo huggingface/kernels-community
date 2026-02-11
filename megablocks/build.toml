@@ -53,7 +53,7 @@ src = [
 backend = "xpu"
 depends = [
     "torch",
-    "cutlass_sycl",
+    "sycl_tla",
 ]
 src = [
     "csrc_xpu/utils.h",
