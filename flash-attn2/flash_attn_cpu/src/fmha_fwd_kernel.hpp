@@ -255,10 +255,10 @@ inline void resize_indices(at::Tensor& indices, int num_seqs, int max_seqlen_q) 
 }
 
 //==============================================================================
-// fmha_fwd_varlen_impl for AVX512
+// fmha_fwd_varlen_kernel for AVX512
 //==============================================================================
 
-inline void fmha_fwd_varlen_impl(
+inline void fmha_fwd_varlen_kernel(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,

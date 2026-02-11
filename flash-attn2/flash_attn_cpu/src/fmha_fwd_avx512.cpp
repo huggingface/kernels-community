@@ -391,7 +391,7 @@ void fmha_fwd_varlen_impl(
     int max_seqlen_k,
     float softmax_scale,
     bool is_causal) {
-  flash_attn_cpu::fmha_fwd_varlen_impl(
+  flash_attn_cpu::fmha_fwd_varlen_kernel(
       q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal);
 }
 
