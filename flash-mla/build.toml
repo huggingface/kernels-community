@@ -4,7 +4,7 @@ version = 1
 backends = ["cuda"]
 
 [general.cuda]
-minver = "12.8"
+minver = "12.9"
 
 [torch]
 src = [
@@ -120,88 +120,133 @@ src = [
     "csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
 ]
 
-# TODO: uncomment when 10.0f is supported by the builder
 
-# # SM100 (Blackwell/B200) kernels - requires CUDA 12.9+
-# [kernel.flash_mla_sm100]
-# backend = "cuda"
-# cuda-capabilities = ["10.0f"]
-# cuda-flags = [
-#     "-O3",
-#     "-std=c++20",
-#     "-DNDEBUG",
-#     "-D_USE_MATH_DEFINES",
-#     "-Wno-deprecated-declarations",
-#     "-U__CUDA_NO_HALF_OPERATORS__",
-#     "-U__CUDA_NO_HALF_CONVERSIONS__",
-#     "-U__CUDA_NO_HALF2_OPERATORS__",
-#     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-#     "--expt-relaxed-constexpr",
-#     "--expt-extended-lambda",
-#     "--use_fast_math",
-# ]
-# depends = [
-#     "torch",
-#     "cutlass_4_0",
-# ]
-# include = [
-#     "csrc",
-#     "csrc/kerutils/include",
-#     "csrc/sm100",
-# ]
-# src = [
-#     # SM100 helpers
-#     "csrc/sm100/helpers.h",
-#     # Dense prefill
-#     "csrc/sm100/prefill/dense/interface.h",
-#     "csrc/sm100/prefill/dense/common/helper.h",
-#     "csrc/sm100/prefill/dense/common/mask.cuh",
-#     "csrc/sm100/prefill/dense/common/pow_2.hpp",
-#     "csrc/sm100/prefill/dense/common/gather_tensor.hpp",
-#     "csrc/sm100/prefill/dense/common/pipeline_mla.hpp",
-#     "csrc/sm100/prefill/dense/common/utils.hpp",
-#     "csrc/sm100/prefill/dense/collective/fmha_fusion.hpp",
-#     "csrc/sm100/prefill/dense/collective/fmha_common.hpp",
-#     "csrc/sm100/prefill/dense/collective/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp",
-#     "csrc/sm100/prefill/dense/collective/sm100_fmha_load_tma_warpspecialized.hpp",
-#     "csrc/sm100/prefill/dense/collective/sm100_fmha_mla_load_tma_warpspecialized.hpp",
-#     "csrc/sm100/prefill/dense/collective/sm100_fmha_mla_fwd_mainloop_tma_warpspecialized.hpp",
-#     "csrc/sm100/prefill/dense/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp",
-#     "csrc/sm100/prefill/dense/device/fmha_device_bwd.hpp",
-#     "csrc/sm100/prefill/dense/device/fmha.hpp",
-#     "csrc/sm100/prefill/dense/kernel/fmha_kernel_bwd_sum_OdO.hpp",
-#     "csrc/sm100/prefill/dense/kernel/fmha_options.hpp",
-#     "csrc/sm100/prefill/dense/kernel/fmha_tile_scheduler.hpp",
-#     "csrc/sm100/prefill/dense/kernel/fmha_causal_tile_scheduler.hpp",
-#     "csrc/sm100/prefill/dense/kernel/fmha_kernel_bwd_convert.hpp",
-#     "csrc/sm100/prefill/dense/kernel/sm100_fmha_bwd_kernel_tma_warpspecialized.hpp",
-#     "csrc/sm100/prefill/dense/kernel/sm100_fmha_bwd_mla_kernel_tma_warpspecialized.hpp",
-#     "csrc/sm100/prefill/dense/kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp",
-#     "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cuh",
-#     "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cuh",
-#     "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
-#     "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
-#     # Sparse prefill
-#     "csrc/sm100/prefill/sparse/common_subroutine.h",
-#     "csrc/sm100/prefill/sparse/fwd/head64/config.h",
-#     "csrc/sm100/prefill/sparse/fwd/head64/phase1.h",
-#     "csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh",
-#     "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
-#     "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu",
-#     "csrc/sm100/prefill/sparse/fwd/head128/config.h",
-#     "csrc/sm100/prefill/sparse/fwd/head128/phase1.h",
-#     "csrc/sm100/prefill/sparse/fwd/head128/phase1.cuh",
-#     "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
-#     "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
-#     "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/config.h",
-#     "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h",
-#     "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.cuh",
-#     "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
-#     "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
-#     # Sparse decode
-#     "csrc/sm100/decode/head64/config.h",
-#     "csrc/sm100/decode/head64/kernel.h",
-#     "csrc/sm100/decode/head64/kernel.cuh",
-#     "csrc/sm100/decode/head64/instantiations/v32.cu",
-#     "csrc/sm100/decode/head64/instantiations/model1.cu",
-# ]
+# SM100 (Blackwell/B200) kernels - requires CUDA 12.9+
+[kernel.flash_mla_sm100]
+backend = "cuda"
+cuda-capabilities = ["10.0f"]
+cuda-flags = [
+    "-O3",
+    "-std=c++20",
+    "-DNDEBUG",
+    "-D_USE_MATH_DEFINES",
+    "-Wno-deprecated-declarations",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--use_fast_math",
+]
+depends = [
+    "torch",
+    "cutlass_4_0",
+]
+include = [
+    "csrc",
+    "csrc/kerutils/include",
+    "csrc/sm100",
+]
+src = [
+
+    # API implementation
+    "csrc/api/api_impl.cu",
+    "csrc/api/common.h",
+    "csrc/api/dense_decode.h",
+    "csrc/api/dense_fwd.h",
+    "csrc/api/sparse_decode.h",
+    "csrc/api/sparse_fwd.h",
+    "csrc/defines.h",
+    "csrc/params.h",
+    "csrc/utils.h",
+    # Utility kernels
+    "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
+    "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h",
+    "csrc/smxx/decode/combine/combine.cu",
+    "csrc/smxx/decode/combine/combine.h",
+    # Kerutils headers
+    "csrc/kerutils/include/kerutils/kerutils.cuh",
+    "csrc/kerutils/include/kerutils/common/common.h",
+    "csrc/kerutils/include/kerutils/host/host.h",
+    "csrc/kerutils/include/kerutils/device/common.h",
+    "csrc/kerutils/include/kerutils/device/device.cuh",
+    "csrc/kerutils/include/kerutils/device/sm80/intrinsics.cuh",
+    "csrc/kerutils/include/kerutils/device/sm80/helpers.cuh",
+    "csrc/kerutils/include/kerutils/device/sm90/intrinsics.cuh",
+    "csrc/kerutils/include/kerutils/device/sm90/helpers.cuh",
+    "csrc/kerutils/include/kerutils/device/sm100/intrinsics.cuh",
+    "csrc/kerutils/include/kerutils/device/sm100/helpers.cuh",
+    "csrc/kerutils/include/kerutils/device/sm100/gemm.cuh",
+    "csrc/kerutils/include/kerutils/device/sm100/tma_cta_group2_nosplit.cuh",
+    "csrc/kerutils/include/kerutils/supplemental/torch_tensors.h",
+    # SM100 headers needed for dispatch (headers only, no .cu files compiled for SM90)
+    "csrc/sm100/helpers.h",
+    "csrc/sm100/prefill/dense/interface.h",
+    "csrc/sm100/prefill/sparse/common_subroutine.h",
+    "csrc/sm100/prefill/sparse/fwd/head64/config.h",
+    "csrc/sm100/prefill/sparse/fwd/head64/phase1.h",
+    "csrc/sm100/prefill/sparse/fwd/head128/config.h",
+    "csrc/sm100/prefill/sparse/fwd/head128/phase1.h",
+    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/config.h",
+    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h",
+    "csrc/sm100/decode/head64/config.h",
+    "csrc/sm100/decode/head64/kernel.h",
+
+    ### SM100-specific headers and sources
+
+    # SM100 helpers
+    "csrc/sm100/helpers.h",
+    # Dense prefill
+    "csrc/sm100/prefill/dense/interface.h",
+    "csrc/sm100/prefill/dense/common/helper.h",
+    "csrc/sm100/prefill/dense/common/mask.cuh",
+    "csrc/sm100/prefill/dense/common/pow_2.hpp",
+    "csrc/sm100/prefill/dense/common/gather_tensor.hpp",
+    "csrc/sm100/prefill/dense/common/pipeline_mla.hpp",
+    "csrc/sm100/prefill/dense/common/utils.hpp",
+    "csrc/sm100/prefill/dense/collective/fmha_fusion.hpp",
+    "csrc/sm100/prefill/dense/collective/fmha_common.hpp",
+    "csrc/sm100/prefill/dense/collective/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp",
+    "csrc/sm100/prefill/dense/collective/sm100_fmha_load_tma_warpspecialized.hpp",
+    "csrc/sm100/prefill/dense/collective/sm100_fmha_mla_load_tma_warpspecialized.hpp",
+    "csrc/sm100/prefill/dense/collective/sm100_fmha_mla_fwd_mainloop_tma_warpspecialized.hpp",
+    "csrc/sm100/prefill/dense/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp",
+    "csrc/sm100/prefill/dense/device/fmha_device_bwd.hpp",
+    "csrc/sm100/prefill/dense/device/fmha.hpp",
+    "csrc/sm100/prefill/dense/kernel/fmha_kernel_bwd_sum_OdO.hpp",
+    "csrc/sm100/prefill/dense/kernel/fmha_options.hpp",
+    "csrc/sm100/prefill/dense/kernel/fmha_tile_scheduler.hpp",
+    "csrc/sm100/prefill/dense/kernel/fmha_causal_tile_scheduler.hpp",
+    "csrc/sm100/prefill/dense/kernel/fmha_kernel_bwd_convert.hpp",
+    "csrc/sm100/prefill/dense/kernel/sm100_fmha_bwd_kernel_tma_warpspecialized.hpp",
+    "csrc/sm100/prefill/dense/kernel/sm100_fmha_bwd_mla_kernel_tma_warpspecialized.hpp",
+    "csrc/sm100/prefill/dense/kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp",
+    "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cuh",
+    "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cuh",
+    "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
+    "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
+    # Sparse prefill
+    "csrc/sm100/prefill/sparse/common_subroutine.h",
+    "csrc/sm100/prefill/sparse/fwd/head64/config.h",
+    "csrc/sm100/prefill/sparse/fwd/head64/phase1.h",
+    "csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh",
+    "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
+    "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu",
+    "csrc/sm100/prefill/sparse/fwd/head128/config.h",
+    "csrc/sm100/prefill/sparse/fwd/head128/phase1.h",
+    "csrc/sm100/prefill/sparse/fwd/head128/phase1.cuh",
+    "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
+    "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
+    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/config.h",
+    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h",
+    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.cuh",
+    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
+    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
+    # Sparse decode
+    "csrc/sm100/decode/head64/config.h",
+    "csrc/sm100/decode/head64/kernel.h",
+    "csrc/sm100/decode/head64/kernel.cuh",
+    "csrc/sm100/decode/head64/instantiations/v32.cu",
+    "csrc/sm100/decode/head64/instantiations/model1.cu",
+]
