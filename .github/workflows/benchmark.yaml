@@ -48,4 +48,32 @@ jobs:
         run: pip install "kernels[benchmark] @ git+https://github.com/huggingface/kernels#subdirectory=kernels"
       - name: Benchmark kernel
         if: steps.kernel.outputs.skip != 'true'
-        run: kernels benchmark "kernels-community/${{ steps.kernel.outputs.kernel }}" --branch main
+        run: kernels benchmark "kernels-community/${{ steps.kernel.outputs.kernel }}" --branch main --visual benches
+      - name: Ensure README has performance section
+        if: steps.kernel.outputs.skip != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          REPO="kernels-community/${{ steps.kernel.outputs.kernel }}"
+          hf download "$REPO" README.md --local-dir /tmp/kernel-readme --revision main
+          if ! grep -q '### Performance' /tmp/kernel-readme/README.md; then
+          cat >> /tmp/kernel-readme/README.md << 'EOF'
+
+          ### Performance
+
+          <img class="dark:hidden border border-gray-200 dark:border-gray-700 rounded-lg" src="media/benches_light_animation.svg" />
+          <img class="hidden dark:block border border-gray-200 dark:border-gray-700 rounded-lg" src="media/benches_dark_animation.svg" />
+
+          <img class="dark:hidden border border-gray-200 dark:border-gray-700 rounded-lg" src="media/benches_light_latency.svg" />
+          <img class="hidden dark:block border border-gray-200 dark:border-gray-700 rounded-lg" src="media/benches_dark_latency.svg" />
+
+          <img class="dark:hidden border border-gray-200 dark:border-gray-700 rounded-lg" src="media/benches_light_throughput.svg" />
+          <img class="hidden dark:block border border-gray-200 dark:border-gray-700 rounded-lg" src="media/benches_dark_throughput.svg" />
+          EOF
+          hf upload "$REPO" /tmp/kernel-readme/README.md README.md --revision main
+          fi
+      - name: Upload benchmark visuals
+        if: steps.kernel.outputs.skip != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: hf upload "kernels-community/${{ steps.kernel.outputs.kernel }}" media media --revision main
