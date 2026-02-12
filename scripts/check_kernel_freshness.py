@@ -38,9 +38,9 @@ KERNEL_SOURCE_MAPPING = {
     "yoso": "https://github.com/mlpen/YOSO",
     "cv-utils": "",
     "liger-kernels": "https://github.com/linkedin/Liger-Kernel",
-    "gpt-oss-triton-kernels": "",
+    "gpt-oss-triton-kernels": "https://github.com/triton-lang/triton",
     "metal-flash-sdpa": "https://github.com/philipturner/metal-flash-attention",
-    "mlx-rmsnorm": "",
+    "mlx-rmsnorm": "https://github.com/ml-explore/mlx",
     "sage-attention": "https://github.com/thu-ml/SageAttention",
 
 }
