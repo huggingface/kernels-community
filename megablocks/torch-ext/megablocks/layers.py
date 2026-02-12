@@ -39,7 +39,7 @@ def _install_meta_kernels():
 
         def sort_with_meta(x, end_bit=None):
             if torch.compiler.is_compiling():
-                print("Using meta kernel for sort")
+                # print("Using meta kernel for sort")
                 # Meta implementation - return tensors with correct shape/dtype/device
                 return torch.empty_like(x), torch.empty_like(x)
             # print("Using original sort kernel")
@@ -1223,3 +1223,10 @@ class MegaBlocksMoeMLPWithSharedExpert(MegaBlocksMoeMLP):
             shared_activation_fn=self.shared_activation_fn,
         )
         return output, expert_weights_out
+
+
+# Patch for XPU or CPU support
+if hasattr(torch, "xpu") and torch.xpu.is_available():
+    from .xpu_fused_moe import MegaBlocksMoeMLP
+
+from .cpu_moe_cpp import CPUMegaBlocksMoeMLP

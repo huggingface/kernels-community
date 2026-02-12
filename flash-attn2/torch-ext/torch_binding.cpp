@@ -60,6 +60,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("varlen_fwd", torch::kCUDA, &mha_varlen_fwd);
 #elif defined(XPU_KERNEL)
   ops.impl("varlen_fwd", torch::kXPU, &mha_varlen_fwd);
+#elif defined(CPU_KERNEL)
+  ops.impl("varlen_fwd", torch::kCPU, &mha_varlen_fwd);
 #endif
 
   ops.def("bwd("
@@ -85,6 +87,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     "Tensor? rng_state) -> Tensor[]");
 #if defined(CUDA_KERNEL)
   ops.impl("bwd", torch::kCUDA, &mha_bwd);
+#elif defined(XPU_KERNEL)
+  ops.impl("bwd", torch::kXPU, &mha_bwd);
 #endif
 
   ops.def("varlen_bwd("
@@ -113,6 +117,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     "Tensor? rng_state) -> Tensor[]");
 #if defined(CUDA_KERNEL)
   ops.impl("varlen_bwd", torch::kCUDA, &mha_varlen_bwd);
+#elif defined(XPU_KERNEL)
+  ops.impl("varlen_bwd", torch::kXPU, &mha_varlen_bwd);
 #endif
 
   ops.def("fwd_kvcache("

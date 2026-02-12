@@ -1,15 +1,15 @@
 [general]
 name = "layer_norm"
-universal = false
+version = 1
+backends = ["cuda"]
 
 [torch]
 src = [
-  "torch-ext/torch_binding.cpp",
-  "torch-ext/torch_binding.h",
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
 ]
 
 [kernel.layer_norm]
-depends = ["torch"]
 backend = "cuda"
 cuda-capabilities = [
     "8.0",
@@ -18,6 +18,23 @@ cuda-capabilities = [
     "10.0",
     "12.0",
 ]
+cuda-flags = [
+    "-O3",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--use_fast_math",
+]
+cxx-flags = [
+    "-DFLASHATTENTION_DISABLE_PYBIND",
+    "-mcmodel=large",
+]
+depends = ["torch"]
 include = ["."]
 src = [
     "layer_norm/ln.h",
@@ -84,19 +101,5 @@ src = [
     "layer_norm/ln_parallel_residual_bwd_kernels.cuh",
     "layer_norm/ln_parallel_residual_fwd_kernels.cuh",
     "layer_norm/ln_utils.cuh",
-    "layer_norm/static_switch.h"
+    "layer_norm/static_switch.h",
 ]
-cxx-flags = ["-DFLASHATTENTION_DISABLE_PYBIND", "-mcmodel=large"]
-cuda-flags = [
-    "-O3",
-    "-U__CUDA_NO_HALF_OPERATORS__",
-    "-U__CUDA_NO_HALF_CONVERSIONS__",
-    "-U__CUDA_NO_BFLOAT16_OPERATORS__",
-    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-    "-U__CUDA_NO_BFLOAT162_OPERATORS__",
-    "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
-    "--expt-relaxed-constexpr",
-    "--expt-extended-lambda",
-    "--use_fast_math",
-]
-

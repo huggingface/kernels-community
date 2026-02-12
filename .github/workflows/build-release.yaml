@@ -13,7 +13,7 @@ jobs:
     runs-on:
       group: aws-highmemory-32-plus-nix
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: DeterminateSystems/nix-installer-action@main
         with:
           extra-conf: |
@@ -29,8 +29,9 @@ jobs:
           USER: runner
       - name: Validate kernel directory
         id: validate
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          PR_TITLE="${{ github.event.pull_request.title }}"
           if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release" "$PR_TITLE"); then
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
@@ -44,3 +45,19 @@ jobs:
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
           ( cd "$KERNEL" && nix run -L .#build-and-upload )
+      - name: Upload v1 kernels to main
+        if: steps.validate.outputs.skip == 'false'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          cd "$KERNEL"
+
+          # Check if build.toml exists and has version = 1
+          if [ -f "build.toml" ]; then
+            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
+            if [ -n "$VERSION" ]; then
+              nix build -L
+              nix run -L .#kernels -- upload --repo-id kernels-community/$KERNEL --branch main result
+            fi
+          fi

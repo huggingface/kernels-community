@@ -1,0 +1,259 @@
+name: Build Release (Windows)
+on:
+  pull_request:
+    types: [closed]
+    paths-ignore:
+      - "**/README.md"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build-kernel:
+    # Only run if the PR was actually merged (not just closed)
+    if: github.event.pull_request.merged == true
+    strategy:
+      matrix:
+        os: [windows-2022]
+        python: [3.11, 3.12]
+        platform: [
+            # CUDA platforms
+            # { backend: 'cuda', torch_version: '2.9.1', cuda: '12.6.3', wheel: '126' },
+            {
+              backend: "cuda",
+              torch_version: "2.9.1",
+              cuda: "12.8.1",
+              wheel: "128",
+            },
+            # { backend: 'cuda', torch_version: '2.9.1', cuda: '13.0.1', wheel: '130' },
+            # Intel XPU platform
+            {
+              backend: "xpu",
+              torch_version: "2.10.0",
+              oneapi: "2025.3.1",
+              oneapi_url: "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe",
+            },
+          ]
+
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate kernel directory
+        id: validate
+        shell: pwsh
+        env:
+          PRTITLE: ${{ github.event.pull_request.title }}
+        run: |
+          $KERNEL = python .github/workflows/validate-kernel-pr.py "release" "$Env:PRTITLE"
+          if ($LASTEXITCODE -eq 0) {
+            echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
+            echo "skip=false" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "skip=true" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Check backend support
+        id: check-backend
+        if: steps.validate.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          $KERNEL = "${{ steps.validate.outputs.kernel }}"
+          $BACKEND = "${{ matrix.platform.backend }}"
+          $buildToml = Get-Content "${KERNEL}/build.toml" -Raw
+
+          # XPU block list for Windows - these kernels are not compatible with Windows XPU builds
+          $xpuBlockList = @("megablocks", "flash-attn2")
+
+          # Check if XPU backend and kernel is in block list
+          if ($BACKEND -eq "xpu" -and $KERNEL -in $xpuBlockList) {
+            Write-Output "Kernel '$KERNEL' is not compatible with Windows XPU builds - skipping"
+            Write-Output "Blocked XPU kernels: $($xpuBlockList -join ', ')"
+            echo "supported=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          # Kernels that require oneAPI setup for XPU builds
+          $xpuNeedsOneApi = @("relu", "rotary", "rmsnorm")
+          if ($BACKEND -eq "xpu" -and $KERNEL -in $xpuNeedsOneApi) {
+            echo "needs_oneapi=true" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "needs_oneapi=false" >> $env:GITHUB_OUTPUT
+          }
+
+          # Check two formats:
+          # 1. [kernel.*] section with: backend = "xpu"
+          # 2. [general] section with: backends = ["cuda", "xpu", ...] (can be multi-line)
+          $kernelPattern = "backend\s*=\s*[`"']${BACKEND}[`"']"
+          $backendsPattern = "(?s)backends\s*=\s*\[.*?[`"']${BACKEND}[`"'].*?\]"
+
+          if (($buildToml -match $kernelPattern) -or ($buildToml -match $backendsPattern)) {
+            Write-Output "Kernel '$KERNEL' supports backend '$BACKEND'"
+            echo "supported=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Output "Kernel '$KERNEL' does NOT support backend '$BACKEND' - skipping build"
+            echo "supported=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Kernel Info
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        shell: pwsh
+        run: |
+          $KERNEL = "${{ steps.validate.outputs.kernel }}"
+          Write-Output "Building Kernel: $KERNEL"
+
+      - name: Kernel extract required builder version
+        id: extract-builder-version
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        shell: pwsh
+        run: |
+          $KERNEL = "${{ steps.validate.outputs.kernel }}"
+          $lock = Get-Content "${KERNEL}/flake.lock" | ConvertFrom-Json
+          $revision = $lock.nodes."kernel-builder".locked.rev
+          Write-Output "Building Kernel with revision: $revision"
+          echo "revision=$revision" >> $env:GITHUB_OUTPUT
+
+      - uses: Jimver/cuda-toolkit@v0.2.30
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'cuda'
+        id: setup-cuda-toolkit
+        with:
+          cuda: ${{ matrix.platform.cuda }}
+
+      - name: Setup Intel oneAPI
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'xpu' && steps.check-backend.outputs.needs_oneapi == 'true'
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\.github\scripts\windows\install-oneapi.ps1" -OneApiVersion "${{ matrix.platform.oneapi }}" -OneApiUrl "${{ matrix.platform.oneapi_url }}"
+
+      - name: Setup Python
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install PyTorch (CUDA)
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'cuda'
+        run: pip install torch --index-url https://download.pytorch.org/whl/cu${{ matrix.platform.wheel }}
+
+      - name: Install PyTorch (XPU)
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'xpu'
+        run: pip3 install torch==${{ matrix.platform.torch_version }} --index-url https://download.pytorch.org/whl/xpu
+
+      - name: Checkout kernels
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        id: checkout-kernels
+        uses: actions/checkout@v6
+        with:
+          repository: huggingface/kernels
+          ref: "${{ steps.extract-builder-version.outputs.revision }}"
+          path: kernels
+
+      - name: Cache Rust build
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        uses: actions/cache@v5
+        with:
+          path: |
+            kernels/build2cmake/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-rust-debug-${{ hashFiles('kernels/build2cmake/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-debug-
+
+      - name: Build build2cmake
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        working-directory: kernels\build2cmake
+        shell: pwsh
+        run: cargo build
+
+      - name: Build kernel
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        shell: pwsh
+        env:
+          KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
+          NEEDS_ONEAPI: ${{ steps.check-backend.outputs.needs_oneapi }}
+          PLATFORM_BACKEND: ${{ matrix.platform.backend }}
+        run: |
+          # Initialize oneAPI environment for XPU builds that require it
+          if ($env:PLATFORM_BACKEND -eq "xpu" -and $env:NEEDS_ONEAPI -eq "true") {
+            $setvarsPath = "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+            if (Test-Path $setvarsPath) {
+              Write-Host "Initializing Intel oneAPI environment for XPU build..." -ForegroundColor Cyan
+              
+              # Create a temporary file to capture environment variables
+              $tempFile = [System.IO.Path]::GetTempFileName()
+              
+              # Run setvars.bat and capture all environment variables
+              cmd.exe /c "`"$setvarsPath`" && set > `"$tempFile`""
+              
+              # Parse and set each environment variable in PowerShell
+              Get-Content $tempFile | ForEach-Object {
+                if ($_ -match "^(.*?)=(.*)$") {
+                  $varName = $matches[1]
+                  $varValue = $matches[2]
+                  [System.Environment]::SetEnvironmentVariable($varName, $varValue, [System.EnvironmentVariableTarget]::Process)
+                }
+              }
+              
+              Remove-Item $tempFile -ErrorAction SilentlyContinue
+              
+              # Verify Intel compiler is now in PATH
+              $icxPath = (Get-Command icx-cl -ErrorAction SilentlyContinue).Path
+              if ($icxPath) {
+                Write-Host "Intel oneAPI environment initialized successfully" -ForegroundColor Green
+                Write-Host "Intel C++ Compiler found at: $icxPath" -ForegroundColor Green
+              } else {
+                Write-Error "Intel compiler (icx-cl) still not found in PATH after initialization"
+                exit 1
+              }
+            } else {
+              Write-Error "setvars.bat not found at $setvarsPath"
+              exit 1
+            }
+          }
+          & "$env:GITHUB_WORKSPACE\kernels\builder\scripts\windows\builder.ps1" -Backend $env:PLATFORM_BACKEND -SourceFolder "$env:KERNEL_SOURCE" -BuildConfig Release -Build
+
+          # Run the local_install target to create the correct directory structure for kernels upload
+          # This installs to build/<variant>/<package>/ which is what kernels CLI expects
+          Push-Location "$env:KERNEL_SOURCE\build"
+          cmake --build . --config Release --target local_install
+          Pop-Location
+
+      - name: Upload kernel to Hub
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        shell: pwsh
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
+          PYTHONUTF8: 1
+          PYTHONIOENCODING: utf-8
+        run: |
+          # Install kernels package for upload
+          pip install -U kernels --no-cache-dir
+
+          # Upload using the kernels CLI (branchless - uploads to version branch like v1, v2, etc.)
+          kernels upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE"
+
+      - name: Upload v1 kernels to main
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        shell: pwsh
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
+          PYTHONUTF8: 1
+          PYTHONIOENCODING: utf-8
+        run: |
+          # Check if build.toml exists and has version = 1
+          $buildTomlPath = "$env:KERNEL_SOURCE\build.toml"
+          if (Test-Path $buildTomlPath) {
+            $content = Get-Content $buildTomlPath -Raw
+            if ($content -match '(?m)^\s*version\s*=\s*1\s*(\r)?$') {
+              Write-Host "Kernel version is 1, uploading to main branch..."
+              kernels upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE" --branch main
+            } else {
+              Write-Host "Kernel version is not 1, skipping main branch upload"
+            }
+          } else {
+            Write-Host "build.toml not found, skipping main branch upload"
+          }

@@ -1,14 +1,12 @@
 [general]
 name = "rwkv"
-universal = false
+version = 1
+backends = ["cuda"]
 
 [torch]
-src = [
-  "torch-ext/torch_binding.cpp",
-]
+src = ["torch-ext/torch_binding.cpp"]
 
 [kernel.rwkv]
-depends = ["torch"]
 backend = "cuda"
 cuda-capabilities = [
     "8.0",
@@ -17,15 +15,16 @@ cuda-capabilities = [
     "10.0",
     "12.0",
 ]
+cuda-flags = [
+    "-res-usage",
+    "--use_fast_math",
+    "-O3",
+    "--extra-device-vectorization",
+    "-DTmax=1024",
+]
+depends = ["torch"]
 include = ["."]
 src = [
     "rwkv/wkv_cuda.cu",
     "rwkv/wkv_cuda_bf16.cu",
-]
-cuda-flags = [
-        "-res-usage",
-        "--use_fast_math",
-        "-O3",
-        "--extra-device-vectorization",
-        "-DTmax=1024",
 ]

@@ -10,10 +10,10 @@ jobs:
   build-kernel:
     # Only run if the PR was actually merged (not just closed)
     if: github.event.pull_request.merged == true
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@v20
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@v21
         with:
           extra-conf: |
             max-jobs = 1
@@ -28,14 +28,18 @@ jobs:
           USER: runner
       - name: Validate kernel directory
         id: validate
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          PR_TITLE="${{ github.event.pull_request.title }}"
           if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release" "$PR_TITLE"); then
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
           else
             echo "skip=true" >> $GITHUB_OUTPUT
           fi
+      - name: Install Metal toolchain
+        if: steps.validate.outputs.skip == 'false'
+        run: xcodebuild -downloadComponent MetalToolchain
       - name: Build and upload kernel
         if: steps.validate.outputs.skip == 'false'
         env:
@@ -43,3 +47,18 @@ jobs:
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
           ( cd "$KERNEL" && nix run -L .#build-and-upload )
+      - name: Upload v1 kernels to main
+        if: steps.validate.outputs.skip == 'false'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          cd "$KERNEL"
+
+          if [ -f "build.toml" ]; then
+            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
+            if [ -n "$VERSION" ]; then
+              nix build -L
+              nix run -L .#kernels -- upload --repo-id kernels-community/$KERNEL --branch main result
+            fi
+          fi

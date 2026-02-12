@@ -1,0 +1,27 @@
+[general]
+name = "cv_utils"
+backends = ["cuda"]
+version = 1
+
+[general.hub]
+repo-id = "kernels-community/cv-utils"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.cv_utils]
+backend = "cuda"
+cuda-flags = [
+    "-DCUDA_HAS_FP16=1",
+    "-D__CUDA_NO_HALF_OPERATORS__",
+    "-D__CUDA_NO_HALF_CONVERSIONS__",
+    "-D__CUDA_NO_HALF2_OPERATORS__",
+]
+depends = ["torch"]
+src = [
+    "cv_utils/connected_components.cu",
+    "cv_utils/generic_nms.cu",
+]

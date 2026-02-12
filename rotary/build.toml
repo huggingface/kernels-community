@@ -1,14 +1,13 @@
 [general]
 name = "rotary"
-universal = false
+version = 1
+backends = [
+    "cuda",
+    "xpu",
+]
 
 [torch]
 src = ["torch-ext/torch_binding.cpp"]
-
-[kernel.activation]
-backend = "cuda"
-depends = ["torch"]
-src = ["rotary/rotary_cuda.cu"]
 
 [kernel.rotary_xpu]
 backend = "xpu"
@@ -16,4 +15,9 @@ depends = ["torch"]
 src = [
     "rotary-xpu/rotary_xpu.cpp",
     "rotary-xpu/rotary_xpu.hpp",
-    ]
+]
+
+[kernel.activation]
+backend = "cuda"
+depends = ["torch"]
+src = ["rotary/rotary_cuda.cu"]

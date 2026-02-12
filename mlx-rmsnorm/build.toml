@@ -1,0 +1,28 @@
+[general]
+name = "mlx_rmsnorm"
+version = 1
+backends = ["metal"]
+
+[general.hub]
+repo-id = "mlx-rmsnorm/mlx-rmsnorm"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.mlx_rmsnorm]
+backend = "metal"
+depends = ["torch"]
+include = ["."]
+src = [
+    "mlx_rmsnorm/rmsnorm.metal",
+    "mlx_rmsnorm/metal_rmsnorm.mm",
+    "mlx_rmsnorm/bf16.h",
+    "mlx_rmsnorm/bf16_math.h",
+    "mlx_rmsnorm/complex.h",
+    "mlx_rmsnorm/defines.h",
+    "mlx_rmsnorm/utils.h",
+    "mlx_rmsnorm/metal_rmsnorm.h",
+]

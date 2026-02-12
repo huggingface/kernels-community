@@ -1,0 +1,19 @@
+[general]
+name = "metal_flash_sdpa"
+version = 1
+backends = ["metal"]
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.sdpa_metal]
+backend = "metal"
+depends = ["torch"]
+src = [
+    "sdpa-metal/scaled_dot_product_attention.mm",
+    "sdpa-metal/scaled_dot_product_attention.metal",
+    "sdpa-metal/common.h",
+]
