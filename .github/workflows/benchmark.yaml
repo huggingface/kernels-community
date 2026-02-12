@@ -29,7 +29,13 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "kernel=${{ inputs.kernel }}" >> $GITHUB_OUTPUT
           else
-            KERNEL=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}" --jq '.display_title' | cut -d: -f1 | xargs)
+            PR_TITLE=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}" --jq '.display_title')
+            if [[ "$PR_TITLE" != *:* ]]; then
+              echo "Workflow run title does not contain a kernel name, skipping"
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            KERNEL=$(echo "$PR_TITLE" | cut -d: -f1 | xargs)
             if [ -z "$KERNEL" ]; then
               echo "Could not extract kernel name from workflow run title, skipping"
               echo "skip=true" >> $GITHUB_OUTPUT
