@@ -45,7 +45,7 @@ jobs:
           python-version: '3.12'
       - name: Install kernels
         if: steps.kernel.outputs.skip != 'true'
-        run: pip install "kernels[benchmark] @ git+https://github.com/huggingface/kernels"
+        run: pip install "kernels[benchmark] @ git+https://github.com/huggingface/kernels#subdirectory=kernels"
       - name: Benchmark kernel
         if: steps.kernel.outputs.skip != 'true'
         run: kernels benchmark "kernels-community/${{ steps.kernel.outputs.kernel }}"
