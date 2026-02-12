@@ -119,8 +119,12 @@ mha_fwd(
     // Handle dropout
     uint64_t philox_seed = 0;
     uint64_t philox_offset = 0;
-    at::Tensor rng_state;
-    
+
+    // Always allocate rng_state to match the meta function and ensure
+    // torch.compile compatibility (inductor expects all return values to be
+    // valid tensors).
+    at::Tensor rng_state = at::empty({2}, q.options().dtype(at::kLong));
+
     if (p_dropout > 0.0f) {
         // Calculate counter offset for RNG: batch_size * num_heads * 32
         int64_t counter_offset = batch_size * num_heads * 32;
@@ -129,7 +133,6 @@ mha_fwd(
         philox_offset = offset;
         
         // Store RNG state for backward pass
-        rng_state = at::empty({2}, q.options().dtype(at::kLong));
         rng_state[0] = static_cast<int64_t>(philox_seed);
         rng_state[1] = static_cast<int64_t>(philox_offset);
     }
@@ -151,7 +154,9 @@ mha_fwd(
     }
     out = ensure_contiguous(out);
 
-    at::Tensor S_dmask;
+    // Always return a valid (possibly empty) tensor for S_dmask to ensure
+    // torch.compile compatibility — the meta function returns torch.empty((0,)).
+    at::Tensor S_dmask = at::empty({0}, q.options());
     return {out, softmax_lse, S_dmask, rng_state};
   }
 
@@ -488,6 +493,36 @@ mha_fwd(
       return_softmax,
       gen_
     );
+}
+
+std::vector<torch::Tensor>
+mha_varlen_bwd(
+        const torch::Tensor &dout,
+        const torch::Tensor &q,
+        const torch::Tensor &k,
+        const torch::Tensor &v,
+        const torch::Tensor &out,
+        const torch::Tensor &softmax_lse,
+        const c10::optional<torch::Tensor> &dq_,
+        const c10::optional<torch::Tensor> &dk_,
+        const c10::optional<torch::Tensor> &dv_,
+        const torch::Tensor &cu_seqlens_q,
+        const torch::Tensor &cu_seqlens_k,
+        const c10::optional<torch::Tensor> &alibi_slopes_,
+        const int64_t max_seqlen_q,
+        const int64_t max_seqlen_k,
+        const double p_dropout,
+        const double softmax_scale,
+        const bool zero_tensors,
+        const bool is_causal,
+        const int64_t window_size_left,
+        const int64_t window_size_right,
+        const double softcap,
+        const bool deterministic,
+        c10::optional<at::Generator> gen_,
+        const c10::optional<torch::Tensor> &rng_state) {
+    TORCH_CHECK(false, "FlashAttention varlen backward is not supported on XPU yet.");
+    return {};
 }
 
 std::vector<torch::Tensor>
