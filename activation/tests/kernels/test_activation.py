@@ -64,6 +64,7 @@ def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
 def silu(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x)
 
+@pytest.mark.kernels_ci
 @pytest.mark.parametrize(
     "activation_name", ["silu_and_mul", "mul_and_silu", "gelu", "gelu_tanh", "fatrelu"]
 )
@@ -132,6 +133,7 @@ def test_act_and_mul(
         opcheck(op, (out, x))
 
 
+@pytest.mark.kernels_ci
 @pytest.mark.parametrize(
     "activation_fns",
     [
