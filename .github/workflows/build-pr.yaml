@@ -2,13 +2,16 @@ name: Build PR
 on:
   pull_request:
     paths-ignore:
-      - '**/README.md'
+      - "**/README.md"
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
   build-kernel:
+    outputs:
+      skip: ${{ steps.validate.outputs.skip }}
+      ci-test-path: ${{ steps.export-closure.outputs.ci-test-path }}
     runs-on:
       group: aws-highmemory-32-plus-nix
     steps:
@@ -42,3 +45,58 @@ jobs:
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
           ( cd "$KERNEL" && nix build -L .#ci && ls -l result/ )
+      - name: Build ci-test
+        if: steps.validate.outputs.skip == 'false'
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          ( cd "$KERNEL" && nix build -L .#ci-test )
+      - name: Export ci-test closure
+        if: steps.validate.outputs.skip == 'false'
+        id: export-closure
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          CI_TEST_PATH=$(readlink -f "$KERNEL/result")
+          echo "ci-test-path=$CI_TEST_PATH" >> $GITHUB_OUTPUT
+          nix-store --export $(nix-store -qR "$CI_TEST_PATH") | nix run nixpkgs#zstd -- -T0 > ci-test-closure.nar.zst
+      - name: Upload ci-test closure
+        if: steps.validate.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-closure
+          path: ci-test-closure.nar.zst
+          retention-days: 1
+
+  test-kernel-gpu:
+    needs: build-kernel
+    if: needs.build-kernel.outputs.skip == 'false'
+    runs-on:
+      group: aws-g6-12xlarge-plus
+    steps:
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 12
+      - uses: cachix/cachix-action@v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
+      - name: Setup Nix driver location
+        run: |
+          sudo mkdir -p /run/opengl-driver/lib
+          sudo find /usr/lib64 \
+            -name 'libcuda.so*' \
+            -exec ln -s {} /run/opengl-driver/lib/ \;
+          find /run/opengl-driver
+      - name: Download ci-test closure
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-test-closure
+      - name: Import ci-test closure
+        run: |
+          nix run nixpkgs#zstd -- -d ci-test-closure.nar.zst -c | nix-store --import
+      - name: Run GPU tests
+        run: |
+          CI_TEST_PATH="${{ needs.build-kernel.outputs.ci-test-path }}"
+          "$CI_TEST_PATH/bin/ci-test"
