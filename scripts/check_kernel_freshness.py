@@ -12,9 +12,9 @@ import random
 
 
 KERNEL_SOURCE_MAPPING = {
-    "activation": "https://github.com/vllm-project/vllm",
+    "activation": "",
     "causal-conv1d": "https://github.com/Dao-AILab/causal-conv1d",
-    "deformable-detr": "https://github.com/chengdazhi/Deformable-Convolution-V2-PyTorch",
+    "deformable-detr": "",
     "flash-attn2": "https://github.com/Dao-AILab/flash-attention",
     "flash-attn3": "https://github.com/Dao-AILab/flash-attention",
     "fp8-fbgemm": "https://github.com/pytorch/FBGEMM",
@@ -23,11 +23,11 @@ KERNEL_SOURCE_MAPPING = {
     "mamba-ssm": "https://github.com/state-spaces/mamba",
     "megablocks": "https://github.com/databricks/megablocks",
     "mra": "",
-    "paged-attention": "https://github.com/vllm-project/vllm",
-    "punica-sgmv": "https://github.com/punica-ai/punica",
+    "paged-attention": "",
+    "punica-sgmv": "https://github.com/predibase/lorax",
     "quantization-bitsandbytes": "https://github.com/bitsandbytes-foundation/bitsandbytes",
     "quantization-eetq": "https://github.com/NetEase-FuXi/EETQ",
-    "quantization-gptq": "https://github.com/IST-DASLab/gptq",
+    "quantization-gptq": "",
     "rmsnorm": "https://github.com/intel/intel-extension-for-pytorch",
     "rotary": "https://github.com/Dao-AILab/flash-attention",
     "rwkv": "https://github.com/BlinkDL/RWKV-LM",
