@@ -55,7 +55,22 @@ jobs:
           $KERNEL = "${{ steps.validate.outputs.kernel }}"
           $BACKEND = "${{ matrix.platform.backend }}"
           $buildToml = Get-Content "${KERNEL}/build.toml" -Raw
-          
+
+          # Check CUDA minimum version requirement from build.toml [general.cuda] minver
+          if ($BACKEND -eq "cuda") {
+            $CUDA_VERSION = "${{ matrix.platform.cuda }}"
+            if ($buildToml -match 'minver\s*=\s*"([^"]+)"') {
+              $minver = $matches[1]
+              # Compare versions: strip patch from CUDA version (e.g. 12.8.1 -> 12.8)
+              $cudaMajorMinor = ($CUDA_VERSION -split '\.')[0..1] -join '.'
+              if ([version]$cudaMajorMinor -lt [version]$minver) {
+                Write-Output "Kernel '$KERNEL' requires CUDA >= $minver but matrix provides $CUDA_VERSION - skipping"
+                echo "supported=false" >> $env:GITHUB_OUTPUT
+                exit 0
+              }
+            }
+          }
+
           # XPU block list for Windows - these kernels are not compatible with Windows XPU builds
           $xpuBlockList = @("megablocks", "flash-attn2")
 
