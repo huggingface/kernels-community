@@ -2,7 +2,7 @@
   description = "Flake for activation kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels";
+    kernel-builder.url = "github:huggingface/kernels/flake-ci-test";
   };
 
   outputs =
