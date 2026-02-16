@@ -1,5 +1,5 @@
 [general]
-name = "quantization_mlx"
+name = "mlx_quantization_metal_kernels"
 backends = ["metal"]
 
 [torch]
@@ -9,9 +9,9 @@ src = [
 ]
 
 [general.hub]
-repo-id = "kernels-community/quantization-mlx"
+repo-id = "kernels-community/mlx-quantization-metal-kernels"
 
-[kernel.quantization_mlx]
+[kernel.mlx_quantization_metal_kernels]
 
 depends = ["torch"]
 backend = "metal"
