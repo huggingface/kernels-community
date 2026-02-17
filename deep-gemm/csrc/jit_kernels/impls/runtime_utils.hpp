@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cuda.h>
-#include <torch/python.h>
+#include <torch/torch.h>
 
 #include "../heuristics/sm90.hpp"
 #include "../../jit/handle.hpp"
@@ -68,7 +68,9 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& 
         case torch::kFloat:         return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
         case torch::kBFloat16:      return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
         case torch::kFloat8_e4m3fn: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+#if CUDART_VERSION >= 12080
         case kPackedFP4:            return CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
+#endif
         default: DG_HOST_UNREACHABLE("Unsupported dtype");
     }
 }

@@ -1,7 +1,9 @@
 #pragma once
 
+#ifdef DG_USE_PYBIND11
 #include <pybind11/pybind11.h>
 #include <torch/python.h>
+#endif
 
 #include "../utils/exception.hpp"
 #include "../utils/format.hpp"
@@ -214,6 +216,7 @@ static void fp8_einsum(const std::string& expr,
 }
 #endif
 
+#ifdef DG_USE_PYBIND11
 static void register_apis(pybind11::module_& m) {
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
     m.def("einsum", &einsum,
@@ -226,5 +229,6 @@ static void register_apis(pybind11::module_& m) {
           py::arg("recipe") = std::make_tuple(1, 128, 128));
 #endif
 }
+#endif
 
 } // namespace deep_gemm::einsum

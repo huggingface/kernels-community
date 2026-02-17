@@ -99,6 +99,7 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
 
 #endif
 
+#ifdef DG_USE_PYBIND11
 static void register_apis(pybind11::module_& m) {
 
 #if DG_TENSORMAP_COMPATIBLE
@@ -116,5 +117,6 @@ static void register_apis(pybind11::module_& m) {
 
     m.def("get_mk_alignment_for_contiguous_layout", &get_mk_alignment_for_contiguous_layout);
 }
+#endif
 
 } // namespace deep_gemm::layout

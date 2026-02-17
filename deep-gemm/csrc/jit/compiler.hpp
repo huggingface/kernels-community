@@ -18,6 +18,57 @@
 
 namespace deep_gemm {
 
+// Lazy-load NVRTC to avoid link-time dependency on libnvrtc.so.
+// kernel-builder doesn't support linking extra CUDA libs yet, so we dlopen
+// at runtime — same pattern as the CUDA driver API in jit/handle.hpp.
+static void* get_nvrtc_handle() {
+    static void* handle = nullptr;
+    if (handle == nullptr) {
+        handle = dlopen("libnvrtc.so", RTLD_LAZY | RTLD_LOCAL);
+        if (handle == nullptr)
+            handle = dlopen("libnvrtc.so.12", RTLD_LAZY | RTLD_LOCAL);
+        DG_HOST_ASSERT(handle != nullptr and "Failed to load NVRTC library");
+    }
+    return handle;
+}
+
+#define DECL_LAZY_NVRTC_FUNCTION(name) \
+template <typename... Args> \
+static auto lazy_##name(Args&&... args) -> decltype(name(args...)) { \
+    using FuncType = decltype(&name); \
+    static FuncType func = nullptr; \
+    if (func == nullptr) { \
+        func = reinterpret_cast<FuncType>(dlsym(get_nvrtc_handle(), #name)); \
+        DG_HOST_ASSERT(func != nullptr and "Failed to load NVRTC function"); \
+    } \
+    return func(std::forward<decltype(args)>(args)...); \
+}
+
+DECL_LAZY_NVRTC_FUNCTION(nvrtcVersion);
+DECL_LAZY_NVRTC_FUNCTION(nvrtcCreateProgram);
+DECL_LAZY_NVRTC_FUNCTION(nvrtcCompileProgram);
+DECL_LAZY_NVRTC_FUNCTION(nvrtcGetProgramLogSize);
+DECL_LAZY_NVRTC_FUNCTION(nvrtcGetProgramLog);
+DECL_LAZY_NVRTC_FUNCTION(nvrtcGetPTXSize);
+DECL_LAZY_NVRTC_FUNCTION(nvrtcGetPTX);
+DECL_LAZY_NVRTC_FUNCTION(nvrtcGetCUBINSize);
+DECL_LAZY_NVRTC_FUNCTION(nvrtcGetCUBIN);
+DECL_LAZY_NVRTC_FUNCTION(nvrtcDestroyProgram);
+DECL_LAZY_NVRTC_FUNCTION(nvrtcGetErrorString);
+
+// Redirect nvrtc calls to lazy-loaded versions so NVRTCCompiler is unchanged
+#define nvrtcVersion lazy_nvrtcVersion
+#define nvrtcCreateProgram lazy_nvrtcCreateProgram
+#define nvrtcCompileProgram lazy_nvrtcCompileProgram
+#define nvrtcGetProgramLogSize lazy_nvrtcGetProgramLogSize
+#define nvrtcGetProgramLog lazy_nvrtcGetProgramLog
+#define nvrtcGetPTXSize lazy_nvrtcGetPTXSize
+#define nvrtcGetPTX lazy_nvrtcGetPTX
+#define nvrtcGetCUBINSize lazy_nvrtcGetCUBINSize
+#define nvrtcGetCUBIN lazy_nvrtcGetCUBIN
+#define nvrtcDestroyProgram lazy_nvrtcDestroyProgram
+#define nvrtcGetErrorString lazy_nvrtcGetErrorString
+
 class Compiler {
 public:
     static std::filesystem::path library_root_path;
@@ -345,9 +396,8 @@ public:
 static auto compiler = LazyInit<Compiler>([]() -> std::shared_ptr<Compiler> {
     if (get_env<int>("DG_JIT_USE_NVRTC", 0)) {
         return std::make_shared<NVRTCCompiler>();
-    } else {
-        return std::make_shared<NVCCCompiler>();
     }
+    return std::make_shared<NVCCCompiler>();
 });
 
 } // namespace deep_gemm
