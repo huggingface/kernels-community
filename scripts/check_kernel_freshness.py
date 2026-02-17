@@ -41,6 +41,7 @@ KERNEL_SOURCE_MAPPING = {
     "liger-kernels": "https://github.com/linkedin/Liger-Kernel",
     "gpt-oss-triton-kernels": "https://github.com/triton-lang/triton",
     "metal-flash-sdpa": "https://github.com/philipturner/metal-flash-attention",
+    "mlx-quantization-metal-kernels": "https://github.com/ml-explore/mlx",
     "mlx-rmsnorm": "https://github.com/ml-explore/mlx",
     "sage-attention": "https://github.com/thu-ml/SageAttention",
 
