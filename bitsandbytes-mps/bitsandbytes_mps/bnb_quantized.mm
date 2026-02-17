@@ -1,26 +1,32 @@
 // bitsandbytes MPS Metal kernels - ObjC++ dispatch
 // Interfaces between PyTorch MPS tensors and Metal compute kernels.
-// Adapted from quantization-mlx/quantized.mm.
+// Uses the same dispatch pattern as kernels-community/activation, with
+// get_command_buffer() moved inside dispatch_sync to avoid race conditions
+// during model loading.
 
-#include <ATen/ATen.h>
-#include <ATen/native/mps/OperationUtils.h>
-#include <Foundation/Foundation.h>
-#include <Metal/Metal.h>
-#include <torch/mps.h>
+#include <torch/torch.h>
+
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
 
 #include <algorithm>
 #include <iostream>
 #include <sstream>
+#include <unordered_map>
 
 #ifdef EMBEDDED_METALLIB_HEADER
 #include EMBEDDED_METALLIB_HEADER
 #endif
 
-namespace {
+// ============================================================================
+// Metal helpers
+// ============================================================================
 
-// ============================================================================
-// Metal library / pipeline helpers
-// ============================================================================
+static inline id<MTLBuffer> getMTLBufferStorage(const torch::Tensor& t) {
+  return __builtin_bit_cast(id<MTLBuffer>, t.storage().data());
+}
+
+namespace {
 
 static id<MTLLibrary> library = nil;
 
@@ -80,30 +86,22 @@ id<MTLComputePipelineState> get_pipeline(const std::string& name) {
   return state;
 }
 
-std::string type_str(at::ScalarType type) {
+std::string type_str(torch::ScalarType type) {
   switch (type) {
-    case at::ScalarType::Float:
+    case torch::kFloat32:
       return "float";
-    case at::ScalarType::Half:
+    case torch::kFloat16:
       return "half";
-    case at::ScalarType::BFloat16:
+    case torch::kBFloat16:
       return "bfloat16_t";
     default:
       throw std::runtime_error("Unsupported dtype for BnB MPS kernels");
   }
 }
 
-// ============================================================================
-// Encoder helpers
-// ============================================================================
-
-static inline id<MTLBuffer> getMTLBufferStorage(const at::Tensor& t) {
-  return __builtin_bit_cast(id<MTLBuffer>, t.storage().data());
-}
-
 void set_tensor(
     id<MTLComputeCommandEncoder> enc,
-    const at::Tensor& t,
+    const torch::Tensor& t,
     int index) {
   [enc setBuffer:getMTLBufferStorage(t)
           offset:t.storage_offset() * t.element_size()
@@ -113,7 +111,7 @@ void set_tensor(
 } // namespace
 
 // ============================================================================
-// Public API: quantize_4bit (returns both packed and absmax)
+// Public API: quantize_4bit
 // ============================================================================
 
 std::tuple<at::Tensor, at::Tensor> bnb_quantize_4bit(
@@ -129,28 +127,33 @@ std::tuple<at::Tensor, at::Tensor> bnb_quantize_4bit(
       "quant_type must be 1 (FP4) or 2 (NF4)");
 
   int n = static_cast<int>(input.numel());
-  int num_blocks = (n + static_cast<int>(blocksize) - 1) / static_cast<int>(blocksize);
+  int num_blocks =
+      (n + static_cast<int>(blocksize) - 1) / static_cast<int>(blocksize);
   int packed_size = (n + 1) / 2;
 
-  auto absmax = at::empty({num_blocks}, input.options().dtype(at::ScalarType::Float));
-  auto packed = at::empty({packed_size}, input.options().dtype(at::ScalarType::Byte));
+  auto absmax =
+      torch::empty({num_blocks}, input.options().dtype(torch::kFloat32));
+  auto packed =
+      torch::empty({packed_size}, input.options().dtype(torch::kUInt8));
 
   std::stringstream ss;
-  ss << "bnb_quantize_blockwise_" << type_str(input.scalar_type())
-     << "_bs_" << blocksize << "_qt_" << quant_type;
+  ss << "bnb_quantize_blockwise_" << type_str(input.scalar_type()) << "_bs_"
+     << blocksize << "_qt_" << quant_type;
 
   auto pipeline = get_pipeline(ss.str());
   TORCH_CHECK(pipeline, "Kernel not found: ", ss.str());
 
   @autoreleasepool {
-    id<MTLCommandBuffer> cmdBuf = torch::mps::get_command_buffer();
-    TORCH_CHECK(cmdBuf, "Failed to get MPS command buffer");
-    dispatch_queue_t queue = torch::mps::get_dispatch_queue();
-
-    dispatch_sync(queue, ^{
+    dispatch_sync(torch::mps::get_dispatch_queue(), ^{
       @autoreleasepool {
+        id<MTLCommandBuffer> commandBuffer =
+            torch::mps::get_command_buffer();
+        TORCH_CHECK(commandBuffer, "Failed to get MPS command buffer");
+
         id<MTLComputeCommandEncoder> encoder =
-            [cmdBuf computeCommandEncoder];
+            [commandBuffer computeCommandEncoder];
+        TORCH_CHECK(encoder, "Failed to create compute encoder");
+
         [encoder setComputePipelineState:pipeline];
 
         int idx = 0;
@@ -183,7 +186,7 @@ at::Tensor bnb_dequantize_4bit(
     int64_t blocksize,
     int64_t quant_type,
     int64_t numel,
-    c10::ScalarType output_dtype) {
+    torch::ScalarType output_dtype) {
   TORCH_CHECK(packed.is_mps(), "packed must be on MPS device");
   TORCH_CHECK(absmax.is_mps(), "absmax must be on MPS device");
   TORCH_CHECK(
@@ -191,33 +194,36 @@ at::Tensor bnb_dequantize_4bit(
       "Only blocksize 64 and 128 are supported");
 
   int n = static_cast<int>(numel);
-  int num_blocks = (n + static_cast<int>(blocksize) - 1) / static_cast<int>(blocksize);
+  int num_blocks =
+      (n + static_cast<int>(blocksize) - 1) / static_cast<int>(blocksize);
 
-  auto output = at::empty({n}, packed.options().dtype(output_dtype));
+  auto output = torch::empty({n}, packed.options().dtype(output_dtype));
 
   std::stringstream ss;
-  ss << "bnb_dequantize_blockwise_" << type_str(output_dtype)
-     << "_bs_" << blocksize << "_qt_" << quant_type;
+  ss << "bnb_dequantize_blockwise_" << type_str(output_dtype) << "_bs_"
+     << blocksize << "_qt_" << quant_type;
 
   auto pipeline = get_pipeline(ss.str());
   TORCH_CHECK(pipeline, "Kernel not found: ", ss.str());
 
   @autoreleasepool {
-    id<MTLCommandBuffer> cmdBuf = torch::mps::get_command_buffer();
-    TORCH_CHECK(cmdBuf, "Failed to get MPS command buffer");
-    dispatch_queue_t queue = torch::mps::get_dispatch_queue();
-
-    dispatch_sync(queue, ^{
+    dispatch_sync(torch::mps::get_dispatch_queue(), ^{
       @autoreleasepool {
+        id<MTLCommandBuffer> commandBuffer =
+            torch::mps::get_command_buffer();
+        TORCH_CHECK(commandBuffer, "Failed to get MPS command buffer");
+
         id<MTLComputeCommandEncoder> encoder =
-            [cmdBuf computeCommandEncoder];
+            [commandBuffer computeCommandEncoder];
+        TORCH_CHECK(encoder, "Failed to create compute encoder");
+
         [encoder setComputePipelineState:pipeline];
 
         int idx = 0;
-        set_tensor(encoder, packed, idx++);  // 0
-        set_tensor(encoder, absmax, idx++);  // 1
-        set_tensor(encoder, output, idx++);  // 2
-        [encoder setBytes:&n length:sizeof(int) atIndex:idx++]; // 3
+        set_tensor(encoder, packed, idx++);
+        set_tensor(encoder, absmax, idx++);
+        set_tensor(encoder, output, idx++);
+        [encoder setBytes:&n length:sizeof(int) atIndex:idx++];
 
         NSUInteger max_tg = pipeline.maxTotalThreadsPerThreadgroup;
         NSUInteger desired = (blocksize + 1) / 2;
@@ -243,7 +249,6 @@ at::Tensor bnb_dequantize_4bit(
 // ============================================================================
 // Public API: GEMV (matrix-vector multiply)
 // y = dequant(W) @ x
-// W: [N, K/2], absmax: [N, K_groups], x: [..., K], y: [..., N]
 // ============================================================================
 
 at::Tensor bnb_gemv_4bit(
@@ -253,7 +258,8 @@ at::Tensor bnb_gemv_4bit(
     int64_t blocksize,
     int64_t quant_type,
     int64_t output_features) {
-  TORCH_CHECK(x.is_mps() && w.is_mps() && absmax.is_mps(),
+  TORCH_CHECK(
+      x.is_mps() && w.is_mps() && absmax.is_mps(),
       "All tensors must be on MPS device");
 
   int K = static_cast<int>(x.size(-1));
@@ -261,40 +267,41 @@ at::Tensor bnb_gemv_4bit(
 
   auto out_sizes = x.sizes().vec();
   out_sizes.back() = N;
-  auto y = at::zeros(out_sizes, x.options());
+  auto y = torch::zeros(out_sizes, x.options());
 
   std::stringstream ss;
-  ss << "bnb_qmv_" << type_str(x.scalar_type())
-     << "_bs_" << blocksize << "_qt_" << quant_type;
+  ss << "bnb_qmv_" << type_str(x.scalar_type()) << "_bs_" << blocksize
+     << "_qt_" << quant_type;
 
   auto pipeline = get_pipeline(ss.str());
   TORCH_CHECK(pipeline, "Kernel not found: ", ss.str());
 
   @autoreleasepool {
-    id<MTLCommandBuffer> cmdBuf = torch::mps::get_command_buffer();
-    TORCH_CHECK(cmdBuf, "Failed to get MPS command buffer");
-    dispatch_queue_t queue = torch::mps::get_dispatch_queue();
-
-    dispatch_sync(queue, ^{
+    dispatch_sync(torch::mps::get_dispatch_queue(), ^{
       @autoreleasepool {
+        id<MTLCommandBuffer> commandBuffer =
+            torch::mps::get_command_buffer();
+        TORCH_CHECK(commandBuffer, "Failed to get MPS command buffer");
+
         id<MTLComputeCommandEncoder> encoder =
-            [cmdBuf computeCommandEncoder];
+            [commandBuffer computeCommandEncoder];
+        TORCH_CHECK(encoder, "Failed to create compute encoder");
+
         [encoder setComputePipelineState:pipeline];
 
         int idx = 0;
-        set_tensor(encoder, w, idx++);       // 0: packed weights
-        set_tensor(encoder, absmax, idx++);  // 1: absmax scales
-        set_tensor(encoder, x, idx++);       // 2: input
-        set_tensor(encoder, y, idx++);       // 3: output
-        [encoder setBytes:&K length:sizeof(int) atIndex:idx++]; // 4
-        [encoder setBytes:&N length:sizeof(int) atIndex:idx++]; // 5
+        set_tensor(encoder, w, idx++);
+        set_tensor(encoder, absmax, idx++);
+        set_tensor(encoder, x, idx++);
+        set_tensor(encoder, y, idx++);
+        [encoder setBytes:&K length:sizeof(int) atIndex:idx++];
+        [encoder setBytes:&N length:sizeof(int) atIndex:idx++];
 
         int rows_per_tg = 8;
         int grid_y = (N + rows_per_tg - 1) / rows_per_tg;
 
-        [encoder
-            dispatchThreadgroups:MTLSizeMake(1, grid_y, 1)
-            threadsPerThreadgroup:MTLSizeMake(32 * 2, 1, 1)];
+        [encoder dispatchThreadgroups:MTLSizeMake(1, grid_y, 1)
+                threadsPerThreadgroup:MTLSizeMake(32 * 2, 1, 1)];
         [encoder endEncoding];
 
         torch::mps::commit();
@@ -308,7 +315,6 @@ at::Tensor bnb_gemv_4bit(
 // ============================================================================
 // Public API: GEMM (matrix-matrix multiply with transposed weight)
 // Y = X @ dequant(W).T
-// X: [M, K], W: [N, K/2], absmax: [N, K_groups], Y: [M, N]
 // ============================================================================
 
 at::Tensor bnb_gemm_4bit(
@@ -318,7 +324,8 @@ at::Tensor bnb_gemm_4bit(
     int64_t blocksize,
     int64_t quant_type,
     int64_t output_features) {
-  TORCH_CHECK(x.is_mps() && w.is_mps() && absmax.is_mps(),
+  TORCH_CHECK(
+      x.is_mps() && w.is_mps() && absmax.is_mps(),
       "All tensors must be on MPS device");
   TORCH_CHECK(x.dim() >= 2, "Input must be at least 2D for GEMM");
 
@@ -328,41 +335,42 @@ at::Tensor bnb_gemm_4bit(
 
   auto out_sizes = x.sizes().vec();
   out_sizes.back() = N;
-  auto y = at::zeros(out_sizes, x.options());
+  auto y = torch::zeros(out_sizes, x.options());
 
   std::stringstream ss;
-  ss << "bnb_qmm_t_" << type_str(x.scalar_type())
-     << "_bs_" << blocksize << "_qt_" << quant_type;
+  ss << "bnb_qmm_t_" << type_str(x.scalar_type()) << "_bs_" << blocksize
+     << "_qt_" << quant_type;
 
   auto pipeline = get_pipeline(ss.str());
   TORCH_CHECK(pipeline, "Kernel not found: ", ss.str());
 
   @autoreleasepool {
-    id<MTLCommandBuffer> cmdBuf = torch::mps::get_command_buffer();
-    TORCH_CHECK(cmdBuf, "Failed to get MPS command buffer");
-    dispatch_queue_t queue = torch::mps::get_dispatch_queue();
-
-    dispatch_sync(queue, ^{
+    dispatch_sync(torch::mps::get_dispatch_queue(), ^{
       @autoreleasepool {
+        id<MTLCommandBuffer> commandBuffer =
+            torch::mps::get_command_buffer();
+        TORCH_CHECK(commandBuffer, "Failed to get MPS command buffer");
+
         id<MTLComputeCommandEncoder> encoder =
-            [cmdBuf computeCommandEncoder];
+            [commandBuffer computeCommandEncoder];
+        TORCH_CHECK(encoder, "Failed to create compute encoder");
+
         [encoder setComputePipelineState:pipeline];
 
         int idx = 0;
-        set_tensor(encoder, w, idx++);       // 0: packed weights
-        set_tensor(encoder, absmax, idx++);  // 1: absmax
-        set_tensor(encoder, x, idx++);       // 2: input
-        set_tensor(encoder, y, idx++);       // 3: output
-        [encoder setBytes:&K length:sizeof(int) atIndex:idx++]; // 4: K
-        [encoder setBytes:&N length:sizeof(int) atIndex:idx++]; // 5: N
-        [encoder setBytes:&M length:sizeof(int) atIndex:idx++]; // 6: M
+        set_tensor(encoder, w, idx++);
+        set_tensor(encoder, absmax, idx++);
+        set_tensor(encoder, x, idx++);
+        set_tensor(encoder, y, idx++);
+        [encoder setBytes:&K length:sizeof(int) atIndex:idx++];
+        [encoder setBytes:&N length:sizeof(int) atIndex:idx++];
+        [encoder setBytes:&M length:sizeof(int) atIndex:idx++];
 
         int grid_x = (N + 31) / 32;
         int grid_y = (M + 31) / 32;
 
-        [encoder
-            dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
-            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [encoder endEncoding];
 
         torch::mps::commit();
