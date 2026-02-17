@@ -2,7 +2,7 @@
   description = "Flake for ReLU kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/ops-backend-name";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
