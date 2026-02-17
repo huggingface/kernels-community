@@ -1,8 +1,8 @@
 from ._ops import ops
 import torch
+from ._ops import add_op_namespace_prefix
 
-
-@torch.library.custom_op("sageattention_sm90::qk_int8_sv_f8_accum_f32_attn_inst_buf", mutates_args=("output",), device_types="cuda")
+@torch.library.custom_op(add_op_namespace_prefix("qk_int8_sv_f8_accum_f32_attn_inst_buf"), mutates_args=("output",), device_types="cuda")
 def qk_int8_sv_f8_accum_f32_attn_inst_buf(
     query: torch.Tensor, 
     key: torch.Tensor, 
@@ -22,7 +22,7 @@ def qk_int8_sv_f8_accum_f32_attn_inst_buf(
     )
 
 
-@torch.library.register_fake("sageattention_sm90::qk_int8_sv_f8_accum_f32_attn_inst_buf")
+@torch.library.register_fake(add_op_namespace_prefix("qk_int8_sv_f8_accum_f32_attn_inst_buf"))
 def qk_int8_sv_f8_accum_f32_attn_inst_buf_fake_impl(
     query: torch.Tensor, 
     key: torch.Tensor, 
@@ -52,7 +52,7 @@ def qk_int8_sv_f8_accum_f32_attn_inst_buf_fake_impl(
     return lse
 
 
-@torch.library.custom_op("sageattention_sm90::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90", mutates_args=("output",), device_types="cuda")
+@torch.library.custom_op(add_op_namespace_prefix("qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90"), mutates_args=("output",), device_types="cuda")
 def qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90(
     query: torch.Tensor, 
     key: torch.Tensor, 
@@ -73,7 +73,7 @@ def qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90(
     )
 
 
-@torch.library.register_fake("sageattention_sm90::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90")
+@torch.library.register_fake(add_op_namespace_prefix("qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90"))
 def qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90_fake_impl(
     query: torch.Tensor, 
     key: torch.Tensor, 

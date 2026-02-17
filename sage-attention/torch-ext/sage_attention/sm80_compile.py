@@ -1,8 +1,8 @@
 from ._ops import ops
 import torch
+from ._ops import add_op_namespace_prefix
 
-
-@torch.library.custom_op("sageattention::qk_int8_sv_f16_accum_f16_attn", mutates_args=("output",), device_types="cuda")
+@torch.library.custom_op(add_op_namespace_prefix("qk_int8_sv_f16_accum_f16_attn"), mutates_args=("output",), device_types="cuda")
 def qk_int8_sv_f16_accum_f16_attn(
     query: torch.Tensor, 
     key: torch.Tensor, 
@@ -25,7 +25,7 @@ def qk_int8_sv_f16_accum_f16_attn(
     )
 
 
-@torch.library.custom_op("sageattention::qk_int8_sv_f16_accum_f32_attn", mutates_args=("output",), device_types="cuda")
+@torch.library.custom_op(add_op_namespace_prefix("qk_int8_sv_f16_accum_f32_attn"), mutates_args=("output",), device_types="cuda")
 def qk_int8_sv_f16_accum_f32_attn(
     query: torch.Tensor, 
     key: torch.Tensor, 
@@ -48,7 +48,7 @@ def qk_int8_sv_f16_accum_f32_attn(
     )
 
 
-@torch.library.custom_op("sageattention::qk_int8_sv_f16_accum_f16_attn_inst_buf", mutates_args=("output",), device_types="cuda")
+@torch.library.custom_op(add_op_namespace_prefix("qk_int8_sv_f16_accum_f16_attn_inst_buf"), mutates_args=("output",), device_types="cuda")
 def qk_int8_sv_f16_accum_f16_attn_inst_buf(
     query: torch.Tensor, 
     key: torch.Tensor, 
@@ -71,7 +71,7 @@ def qk_int8_sv_f16_accum_f16_attn_inst_buf(
     )
 
 
-@torch.library.custom_op("sageattention::qk_int8_sv_f16_accum_f16_fuse_v_mean_attn", mutates_args=("output",), device_types="cuda")
+@torch.library.custom_op(add_op_namespace_prefix("qk_int8_sv_f16_accum_f16_fuse_v_mean_attn"), mutates_args=("output",), device_types="cuda")
 def qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(
     query: torch.Tensor, 
     key: torch.Tensor, 
@@ -123,12 +123,12 @@ def sm80_qk_fake_impl(
         lse = torch.empty((0))
     return lse
 
-torch.library.register_fake("sageattention::qk_int8_sv_f16_accum_f16_attn")(sm80_qk_fake_impl)
-torch.library.register_fake("sageattention::qk_int8_sv_f16_accum_f32_attn")(sm80_qk_fake_impl)
-torch.library.register_fake("sageattention::qk_int8_sv_f16_accum_f16_attn_inst_buf")(sm80_qk_fake_impl)
+torch.library.register_fake(add_op_namespace_prefix("qk_int8_sv_f16_accum_f16_attn"))(sm80_qk_fake_impl)
+torch.library.register_fake(add_op_namespace_prefix("qk_int8_sv_f16_accum_f32_attn"))(sm80_qk_fake_impl)
+torch.library.register_fake(add_op_namespace_prefix("qk_int8_sv_f16_accum_f16_attn_inst_buf"))(sm80_qk_fake_impl)
 
 
-@torch.library.register_fake("sageattention::qk_int8_sv_f16_accum_f16_fuse_v_mean_attn")
+@torch.library.register_fake(add_op_namespace_prefix("qk_int8_sv_f16_accum_f16_fuse_v_mean_attn"))
 def qk_int8_sv_f16_accum_f16_fuse_v_mean_attn_fake_impl(
     query: torch.Tensor, 
     key: torch.Tensor, 
