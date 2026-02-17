@@ -3,18 +3,19 @@ backends = ["cuda"]
 name = "flash-mla"
 version = 1
 
-[general.cuda]
-minver = "12.9"
-
 [torch]
 src = [
   "torch-ext/torch_binding.cpp",
   "torch-ext/torch_binding.h",
 ]
 
+[general.cuda]
+minver = "12.8"
+
 # SM90 (Hopper/H100) kernels
 [kernel.flash_mla_sm90]
 backend = "cuda"
+cuda-minver = "12.8"
 cuda-capabilities = ["9.0a"]
 cuda-flags = [
   "-O3",
@@ -114,6 +115,7 @@ src = [
 # SM100 (Blackwell/B200) kernels - requires CUDA 12.9+
 [kernel.flash_mla_sm100]
 backend = "cuda"
+cuda-minver = "12.9"
 cuda-capabilities = ["10.0f"]
 cuda-flags = [
   "-O3",
