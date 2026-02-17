@@ -148,3 +148,15 @@ def affine_gather_qmm_rhs_nax(
     return ops.affine_gather_qmm_rhs_nax(
         x, w, scales, biases, indices, group_size, bits, output_features, transpose
     )
+
+
+__all__ = [
+    "mxfp4_qmm_n",
+    "mxfp4_qmv",
+    "affine_qmv",
+    "affine_qmm_t",
+    "affine_qmm_n",
+    "affine_qmm_t_nax",
+    "affine_qmm_n_nax",
+    "affine_gather_qmm_rhs_nax",
+]
