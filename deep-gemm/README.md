@@ -173,3 +173,7 @@ DeepGEMM is inspired by the [CUTLASS](https://github.com/nvidia/cutlass) project
 ## License
 
 This code repository is released under [the MIT License](LICENSE).
+
+--
+
+vendored at commit 477618cd51baffca09c4b0b87e97c03fe827ef03
