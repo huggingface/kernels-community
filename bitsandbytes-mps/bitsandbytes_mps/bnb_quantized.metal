@@ -35,7 +35,9 @@
 
 #define instantiate_bnb_blocksizes(type)     \
   instantiate_bnb_quant_types(type, 64)      \
-  instantiate_bnb_quant_types(type, 128)
+  instantiate_bnb_quant_types(type, 128)    \
+  instantiate_bnb_quant_types(type, 256)    \
+  instantiate_bnb_quant_types(type, 512)
 
 // ---- Instantiate for all scalar types ----
 

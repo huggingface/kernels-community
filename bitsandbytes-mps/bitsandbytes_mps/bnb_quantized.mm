@@ -120,8 +120,8 @@ std::tuple<at::Tensor, at::Tensor> bnb_quantize_4bit(
     int64_t quant_type) {
   TORCH_CHECK(input.is_mps(), "Input must be on MPS device");
   TORCH_CHECK(
-      blocksize == 64 || blocksize == 128,
-      "Only blocksize 64 and 128 are supported");
+      blocksize == 64 || blocksize == 128 || blocksize == 256 || blocksize == 512,
+      "Only blocksize 64, 128, 256, and 512 are supported");
   TORCH_CHECK(
       quant_type == 1 || quant_type == 2,
       "quant_type must be 1 (FP4) or 2 (NF4)");
@@ -190,8 +190,8 @@ at::Tensor bnb_dequantize_4bit(
   TORCH_CHECK(packed.is_mps(), "packed must be on MPS device");
   TORCH_CHECK(absmax.is_mps(), "absmax must be on MPS device");
   TORCH_CHECK(
-      blocksize == 64 || blocksize == 128,
-      "Only blocksize 64 and 128 are supported");
+      blocksize == 64 || blocksize == 128 || blocksize == 256 || blocksize == 512,
+      "Only blocksize 64, 128, 256, and 512 are supported");
 
   int n = static_cast<int>(numel);
   int num_blocks =
