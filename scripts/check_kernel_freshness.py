@@ -17,6 +17,7 @@ KERNEL_SOURCE_MAPPING = {
     "deformable-detr": "",
     "flash-attn2": "https://github.com/Dao-AILab/flash-attention",
     "flash-attn3": "https://github.com/Dao-AILab/flash-attention",
+    "flash-mla": "https://github.com/deepseek-ai/FlashMLA",
     "fp8-fbgemm": "https://github.com/pytorch/FBGEMM",
     "gpt-oss-metal-kernels": "https://github.com/openai/gpt-oss",
     "layer_norm": "https://github.com/Dao-AILab/flash-attention",
