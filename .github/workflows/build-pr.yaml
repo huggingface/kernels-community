@@ -9,11 +9,18 @@ concurrency:
 
 jobs:
   build-kernel:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64-linux
+            runner: aws-highmemory-32-plus-nix
+          - arch: aarch64-linux
+            runner: aws-r8g-8xl-plus-nix
     outputs:
       skip: ${{ steps.validate.outputs.skip }}
       ci-test-path: ${{ steps.export-closure.outputs.ci-test-path }}
     runs-on:
-      group: aws-highmemory-32-plus-nix
+      group: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/nix-installer-action@main
@@ -46,12 +53,12 @@ jobs:
           KERNEL="${{ steps.validate.outputs.kernel }}"
           ( cd "$KERNEL" && nix build -L .#ci && ls -l result/ )
       - name: Build ci-test
-        if: steps.validate.outputs.skip == 'false'
+        if: steps.validate.outputs.skip == 'false' && matrix.arch == 'x86_64-linux'
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
           ( cd "$KERNEL" && nix build -L .#ci-test )
       - name: Export ci-test closure
-        if: steps.validate.outputs.skip == 'false'
+        if: steps.validate.outputs.skip == 'false' && matrix.arch == 'x86_64-linux'
         id: export-closure
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
@@ -59,7 +66,7 @@ jobs:
           echo "ci-test-path=$CI_TEST_PATH" >> $GITHUB_OUTPUT
           nix-store --export $(nix-store -qR "$CI_TEST_PATH") | nix run nixpkgs#zstd -- -T0 > ci-test-closure.nar.zst
       - name: Upload ci-test closure
-        if: steps.validate.outputs.skip == 'false'
+        if: steps.validate.outputs.skip == 'false' && matrix.arch == 'x86_64-linux'
         uses: actions/upload-artifact@v4
         with:
           name: ci-test-closure
