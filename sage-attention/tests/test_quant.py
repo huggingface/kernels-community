@@ -9,6 +9,7 @@ from sage_attention import (
     per_channel_fp8,
 )
 
+
 cuda_available = torch.cuda.is_available()
 
 
