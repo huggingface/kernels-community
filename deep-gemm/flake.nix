@@ -2,7 +2,8 @@
   description = "Flake for DeepGEMM kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/b079fd8c66612177cc8edd13292613abb4de994c";
+    # kernel-builder.url = "github:huggingface/kernels";
+    kernel-builder.url = "path:/home/drbh/Projects/kernels";
   };
 
   outputs =

@@ -5,12 +5,9 @@
 #   "kernels"
 # ]
 # ///
-"""
-DeepGEMM example via kernel-builder.
 
-Demonstrates cuBLASLt GEMM (any GPU) and FP8 GEMM (SM90+ only).
-Computes D = A @ B.T and compares with a torch reference.
-"""
+
+# CUDA_HOME=/usr/local/cuda-12.9 uv run scripts/readme_example.py
 import torch
 from kernels import get_local_kernel
 from pathlib import Path
@@ -41,19 +38,9 @@ compare("cuBLASLt BF16", d, ref)
 # --- FP8 GEMM (requires SM90+ / Hopper+) ---
 arch = torch.cuda.get_device_capability()[0]
 if arch >= 9:
-    def per_token_cast_to_fp8(x, gran_k=128):
-        m, n = x.shape
-        padded_n = (n + gran_k - 1) // gran_k * gran_k
-        x_padded = torch.zeros((m, padded_n), dtype=x.dtype, device=x.device)
-        x_padded[:, :n] = x
-        x_view = x_padded.view(m, -1, gran_k)
-        x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-        sf = x_amax / 448.0
-        data = (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn)
-        return data.view(m, padded_n)[:, :n].contiguous(), sf
-
-    a_fp8 = per_token_cast_to_fp8(a)
-    b_fp8 = per_token_cast_to_fp8(b)
+    # SFA: per-row (1, 128), SFB: per-block (128, 128) — SM90 recipe
+    a_fp8 = deep_gemm.utils.per_token_cast_to_fp8(a, use_ue8m0=False)
+    b_fp8 = deep_gemm.utils.per_block_cast_to_fp8(b, use_ue8m0=False)
     d_fp8 = torch.empty((m, n), device=device, dtype=torch.bfloat16)
     deep_gemm.fp8_gemm_nt(a_fp8, b_fp8, d_fp8)
     compare("FP8 1D2D", d_fp8, ref)

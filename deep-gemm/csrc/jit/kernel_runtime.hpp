@@ -36,16 +36,21 @@ public:
         const auto& cuobjdump_path = cuda_home / "bin" / "cuobjdump";
         const auto& cubin_path = dir_path / "kernel.cubin";
         if (get_env<int>("DG_JIT_DEBUG"))
-            printf("Loading CUBIN: %s\n", cubin_path.c_str());
+            fprintf(stderr, "Loading CUBIN: %s\n", cubin_path.c_str());
 
         // Find the only symbol
         // TODO: use kernel enumeration for newer drivers
         const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal", "__assertfail"};
         const auto& [exit_code, symbols] = call_external_command(fmt::format("{} -symbols {}", cuobjdump_path.c_str(), cubin_path.c_str()));
         DG_HOST_ASSERT(exit_code == 0);
-        std::istringstream iss(symbols);
+        // Parse line-by-line without std::istringstream
         std::vector<std::string> symbol_names;
-        for (std::string line; std::getline(iss, line); ) {
+        size_t pos = 0;
+        while (pos < symbols.size()) {
+            size_t eol = symbols.find('\n', pos);
+            if (eol == std::string::npos) eol = symbols.size();
+            std::string line = symbols.substr(pos, eol - pos);
+            pos = eol + 1;
             if (line.find("STT_FUNC") == 0 and line.find("STO_ENTRY") != std::string::npos and
                 std::none_of(illegal_names.begin(), illegal_names.end(),
                 [&](const auto& name) { return line.find(name) != std::string::npos; })) {
@@ -54,10 +59,10 @@ public:
             }
         }
         if (get_env<int>("DG_JIT_DEBUG")) {
-            printf("Symbol names: ");
+            fprintf(stderr, "Symbol names: ");
             for (const auto& symbol: symbol_names)
-                printf("%s, ", symbol.c_str());
-            printf("\n");
+                fprintf(stderr, "%s, ", symbol.c_str());
+            fprintf(stderr, "\n");
         }
 
         // Load from the library
@@ -88,7 +93,7 @@ public:
     static std::string generate(const Args& args) {
         const auto& code = Derived::generate_impl(args);
         if (get_env<int>("DG_JIT_DEBUG", 0))
-            printf("Generated kernel code: %s\n", code.c_str());
+            fprintf(stderr, "Generated kernel code: %s\n", code.c_str());
         return code;
     }
 
@@ -107,7 +112,7 @@ public:
 
         // Launch in the derived class
         if (get_env<int>("DG_JIT_DEBUG")) {
-            printf("Launch kernel with {%d, %d} x %d, shared memory: %d bytes, cluster: %d, stream: %ld\n",
+            fprintf(stderr, "Launch kernel with {%d, %d} x %d, shared memory: %d bytes, cluster: %d, stream: %ld\n",
                    launch_args.grid_dim.first, launch_args.grid_dim.second, launch_args.num_threads,
                    launch_args.smem_size, launch_args.cluster_dim, stream.id());
         }

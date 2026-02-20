@@ -74,7 +74,7 @@ static std::filesystem::path make_dirs(const std::filesystem::path& path) {
                                         path.c_str(), created, capture.value()));
     }
     if (created and get_env<int>("DG_JIT_DEBUG"))
-        printf("Create directory: %s\n", path.c_str());
+        fprintf(stderr, "Create directory: %s\n", path.c_str());
     return path;
 }
 
@@ -85,13 +85,11 @@ static std::string get_uuid() {
     }());
     static std::uniform_int_distribution<uint32_t> dist;
 
-    std::stringstream ss;
-    ss << getpid() << "-"
-       << std::hex << std::setfill('0')
-       << std::setw(8) << dist(gen) << "-"
-       << std::setw(8) << dist(gen) << "-"
-       << std::setw(8) << dist(gen);
-    return ss.str();
+    // Use snprintf instead of stringstream
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%d-%08x-%08x-%08x",
+                  getpid(), dist(gen), dist(gen), dist(gen));
+    return std::string(buf);
 }
 
 } // deep_gemm

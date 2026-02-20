@@ -4,6 +4,7 @@ import torch
 
 # Import the compiled extension
 from ._ops import ops
+from . import utils
 
 __version__ = "2.3.0"
 
@@ -645,6 +646,22 @@ if not os.path.isdir(os.path.join(_lib_root, "include")):
 
 _initialized = False
 
+# Set DG_CUTLASS_INCLUDE for JIT kernel compilation (if not already set by user)
+if "DG_CUTLASS_INCLUDE" not in os.environ:
+    _include = os.path.join(_lib_root, "include")
+    if os.path.isdir(os.path.join(_include, "cutlass")):
+        # Bundled CUTLASS headers (from kernel-builder bundle-dep-includes)
+        print(f"Using bundled CUTLASS headers at {_include}")
+        os.environ["DG_CUTLASS_INCLUDE"] = _include
+    else:
+        # Fall back to nvidia-cutlass pip package
+        try:
+            import nvidia.cutlass as _nc
+            os.environ["DG_CUTLASS_INCLUDE"] = os.path.join(
+                os.path.dirname(_nc.__file__), "include"
+            )
+        except ImportError:
+            pass
 
 def _ensure_initialized():
     global _initialized

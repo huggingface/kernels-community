@@ -5,7 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <nvrtc.h>
-#include <regex>
+#include <cstring>
 #include <string>
 
 #include "../utils/exception.hpp"
@@ -78,12 +78,16 @@ public:
     static std::filesystem::path cuobjdump_path;
 
     static std::string get_library_version() {
+        const auto dg_include = library_include_path / "deep_gemm";
+        if (not std::filesystem::exists(dg_include)) {
+            // Fallback: hash the root path itself
+            std::string fallback(library_root_path.string());
+            return get_hex_digest(std::vector<char>(fallback.begin(), fallback.end()));
+        }
         std::vector<char> buffer;
-        for (const auto& f: collect_files(library_include_path / "deep_gemm")) {
+        for (const auto& f: collect_files(dg_include)) {
             std::ifstream in(f, std::ios::binary);
             DG_HOST_ASSERT(in.is_open());
-
-            // Append into the buffer
             buffer.insert(buffer.end(),
                           std::istreambuf_iterator<char>(in),
                           std::istreambuf_iterator<char>());
@@ -197,10 +201,10 @@ public:
         // Disassemble the CUBIN file to SASS
         const auto command = fmt::format("{} --dump-sass {} > {}", cuobjdump_path.c_str(), cubin_path.c_str(), sass_path.c_str());
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
-            printf("Running cuobjdump command: %s\n", command.c_str());
+            fprintf(stderr, "Running cuobjdump command: %s\n", command.c_str());
         const auto [return_code, output] = call_external_command(command);
         if (return_code != 0) {
-            printf("cuobjdump failed: %s\n", output.c_str());
+            fprintf(stderr, "cuobjdump failed: %s\n", output.c_str());
             DG_HOST_ASSERT(false and "cuobjdump failed");
         }
     }
@@ -225,14 +229,14 @@ class NVCCCompiler final: public Compiler {
         const auto& [return_code, output] = call_external_command(command);
         DG_HOST_ASSERT(return_code == 0);
 
-        // The version should be at least 12.3, for the best performance with 12.9
-        int major, minor;
-        std::smatch match;
-        DG_HOST_ASSERT(std::regex_search(output, match, std::regex(R"(release (\d+\.\d+))")));
-        std::sscanf(match[1].str().c_str(), "%d.%d", &major, &minor);
+        // Parse "release X.Y" without std::regex
+        int major = 0, minor = 0;
+        const char* release_pos = std::strstr(output.c_str(), "release ");
+        DG_HOST_ASSERT(release_pos != nullptr and "Could not find 'release' in nvcc --version output");
+        std::sscanf(release_pos + 8, "%d.%d", &major, &minor);
         DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVCC version should be >= 12.3");
         if (major == 12 and minor < 9)
-            printf("Warning: please use at least NVCC 12.9 for the best DeepGEMM performance\n");
+            fprintf(stderr, "Warning: please use at least NVCC 12.9 for the best DeepGEMM performance\n");
         return {major, minor};
     }
 
@@ -248,10 +252,17 @@ public:
         // The override the compiler flags
         // Only NVCC >= 12.9 supports arch-specific family suffix
         const auto& arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
-        flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
+        // DG_CUTLASS_INCLUDE is set by Python _find_cutlass_include() before ops.init()
+        const auto& cutlass_include = get_env<std::string>("DG_CUTLASS_INCLUDE");
+        std::string cutlass_flag = cutlass_include.empty() ? "" : fmt::format(" -I{}", cutlass_include);
+        flags = fmt::format("{} -I{}{} --gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), arch);
+                            flags, library_include_path.c_str(), cutlass_flag, arch);
+
+        // print flags if ENV is set
+        if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_FLAGS", 0))
+            fprintf(stderr, "NVCC compiler flags: %s\n", flags.c_str());
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path,
@@ -264,10 +275,10 @@ public:
         // Compile
         const auto& command = fmt::format("{} {} -cubin -o {} {}", nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
-            printf("Running NVCC command: %s\n", command.c_str());
+            fprintf(stderr, "Running NVCC command: %s\n", command.c_str());
         const auto& [return_code, output] = call_external_command(command);
         if (return_code != 0) {
-            printf("NVCC compilation failed: %s\n", output.c_str());
+            fprintf(stderr, "NVCC compilation failed: %s\n", output.c_str());
             DG_HOST_ASSERT(false and "NVCC compilation failed");
         }
 
@@ -275,21 +286,21 @@ public:
         if (ptx_path.has_value()) {
             const auto ptx_command = fmt::format("{} {} -ptx -o {} {}", nvcc_path.c_str(), code_path.c_str(), ptx_path->c_str(), flags);
             if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
-                printf("Running NVCC PTX command: %s\n", ptx_command.c_str());
+                fprintf(stderr, "Running NVCC PTX command: %s\n", ptx_command.c_str());
             const auto [ptx_return_code, ptx_output] = call_external_command(ptx_command);
             if (ptx_return_code != 0) {
-                printf("NVCC PTX compilation failed: %s\n", ptx_output.c_str());
+                fprintf(stderr, "NVCC PTX compilation failed: %s\n", ptx_output.c_str());
                 DG_HOST_ASSERT(false and "NVCC PTX compilation failed");
             }
         }
 
-        // Check local memory usage
+        // Check local memory usage (without std::regex — avoids ABI issues)
         if (get_env("DG_JIT_PTXAS_CHECK", 0))
-            DG_HOST_ASSERT(not std::regex_search(output, std::regex(R"(Local memory used)")));
+            DG_HOST_ASSERT(output.find("Local memory used") == std::string::npos);
 
         // Print PTXAS log
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0))
-            printf("%s", output.c_str());
+            fprintf(stderr, "%s", output.c_str());
     }
 };
 
@@ -306,6 +317,9 @@ public:
         std::string include_dirs;
         include_dirs += fmt::format("-I{} ", library_include_path.string());
         include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());
+        // DG_CUTLASS_INCLUDE is set by Python _find_cutlass_include() before ops.init()
+        if (const auto& cutlass_include = get_env<std::string>("DG_CUTLASS_INCLUDE"); not cutlass_include.empty())
+            include_dirs += fmt::format("-I{} ", cutlass_include);
 
         // Add PCH support for version 12.8 and above
         // NOTES: PCH is vital for compilation speed
@@ -330,12 +344,18 @@ public:
         const auto& code_path = dir_path / "kernel.cu";
         put(code_path, code);
 
-        // Parse compilation options
-        std::istringstream iss(flags);
+        // Split flags by whitespace (without std::istringstream — avoids ABI issues)
         std::vector<std::string> options;
-        std::string option;
-        while (iss >> option)
-            options.push_back(option);
+        {
+            size_t i = 0;
+            while (i < flags.size()) {
+                while (i < flags.size() && (flags[i] == ' ' || flags[i] == '\t')) ++i;
+                if (i >= flags.size()) break;
+                size_t start = i;
+                while (i < flags.size() && flags[i] != ' ' && flags[i] != '\t') ++i;
+                options.push_back(flags.substr(start, i - start));
+            }
+        }
 
         // Convert to C-style string array for NVRTC
         std::vector<const char*> option_cstrs;
@@ -344,10 +364,10 @@ public:
 
         // Print compiler command if requested
         if (get_env<int>("DG_JIT_DEBUG", 0) or get_env<int>("DG_JIT_PRINT_COMPILER_COMMAND", 0)) {
-            printf("Compiling JIT runtime with NVRTC options: ");
+            fprintf(stderr, "Compiling JIT runtime with NVRTC options: ");
             for (const auto& opt: options)
-                printf("%s ", opt.c_str());
-            printf("\n");
+                fprintf(stderr, "%s ", opt.c_str());
+            fprintf(stderr, "\n");
         }
 
         // Create NVRTC program and compile
@@ -364,7 +384,7 @@ public:
             if (log_size > 1) {
                 std::string compilation_log(log_size, '\0');
                 DG_NVRTC_CHECK(nvrtcGetProgramLog(program, compilation_log.data()));
-                printf("NVRTC log: %s\n", compilation_log.c_str());
+                fprintf(stderr, "NVRTC log: %s\n", compilation_log.c_str());
             }
         }
 

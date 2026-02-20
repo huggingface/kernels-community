@@ -11,6 +11,8 @@ src = [
   "torch-ext/torch_binding.cpp",
   "torch-ext/torch_binding.h",
 ]
+pyext = ["py", "cuh", "hpp", "h"]
+bundle-dep-includes = ["cutlass_4_0"]
 
 [kernel.deep_gemm]
 backend = "cuda"

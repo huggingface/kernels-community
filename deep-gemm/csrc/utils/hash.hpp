@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdio>
 #include <string>
+#include <vector>
 
 namespace deep_gemm {
 
@@ -25,11 +27,12 @@ static std::string get_hex_digest(const std::vector<char>& data) {
         return z ^ (z >> 31);
     };
 
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0')
-        << std::setw(16) << split_mix(state_0)
-        << std::setw(16) << split_mix(state_1);
-    return oss.str();
+    // Use snprintf instead of ostringstream
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%016lx%016lx",
+             (unsigned long)split_mix(state_0),
+             (unsigned long)split_mix(state_1));
+    return std::string(buf);
 }
 
 static std::string get_hex_digest(const std::string& data) {
