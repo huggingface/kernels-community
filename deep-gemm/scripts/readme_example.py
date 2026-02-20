@@ -9,10 +9,11 @@
 
 # CUDA_HOME=/usr/local/cuda-12.9 uv run scripts/readme_example.py
 import torch
-from kernels import get_local_kernel
+from kernels import get_local_kernel, get_kernel
 from pathlib import Path
 
-deep_gemm = get_local_kernel(Path("build"), "deep_gemm")
+# deep_gemm = get_local_kernel(Path("build"), "deep_gemm")
+deep_gemm = get_kernel("drbh/deep-gemm", version=1)
 
 m, n, k = 256, 1024, 512
 device = "cuda"
