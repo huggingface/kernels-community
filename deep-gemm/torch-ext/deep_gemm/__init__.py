@@ -651,7 +651,6 @@ if "DG_CUTLASS_INCLUDE" not in os.environ:
     _include = os.path.join(_lib_root, "include")
     if os.path.isdir(os.path.join(_include, "cutlass")):
         # Bundled CUTLASS headers (from kernel-builder bundle-dep-includes)
-        print(f"Using bundled CUTLASS headers at {_include}")
         os.environ["DG_CUTLASS_INCLUDE"] = _include
     else:
         # Fall back to nvidia-cutlass pip package
