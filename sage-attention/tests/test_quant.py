@@ -2,7 +2,12 @@ import math
 import pytest
 import torch
 
-import sage_attention as sa
+from sage_attention import (
+    per_block_int8,
+    per_warp_int8,
+    sub_mean,
+    per_channel_fp8,
+)
 
 
 cuda_available = torch.cuda.is_available()
@@ -31,7 +36,7 @@ def test_per_block_int8_shapes_and_types(tensor_layout):
         else torch.randn(2, 4, 128, dtype=dtype, device=device)
     )
 
-    q_int8, q_scale, k_int8, k_scale = sa.per_block_int8(
+    q_int8, q_scale, k_int8, k_scale = per_block_int8(
         q, k, km, tensor_layout=tensor_layout
     )
 
@@ -70,7 +75,7 @@ def test_per_warp_int8_shapes_and_types(tensor_layout, head_dim):
         )
         expected_k_scale_shape = (1, 2, math.ceil(70 / 64))
 
-    q_int8, q_scale, k_int8, k_scale = sa.per_warp_int8(
+    q_int8, q_scale, k_int8, k_scale = per_warp_int8(
         q,
         k,
         tensor_layout=tensor_layout,
@@ -102,7 +107,7 @@ def test_sub_mean_properties(tensor_layout):
         seq_dim = 1
         nh_dim = 2
 
-    v_smoothed, vm = sa.sub_mean(v, tensor_layout=tensor_layout)
+    v_smoothed, vm = sub_mean(v, tensor_layout=tensor_layout)
 
     assert v_smoothed.shape == v.shape and v_smoothed.dtype == torch.float16
     assert vm.shape == (v.size(0), v.size(nh_dim), v.size(-1)) and vm.dtype == v.dtype
@@ -126,7 +131,7 @@ def test_per_channel_fp8_shapes_and_outputs(tensor_layout, smooth_v):
         v = torch.randn(2, 77, 3, 128, dtype=dtype, device=device)
         kv_len = v.size(1)
 
-    v_fp8, v_scale, vm = sa.per_channel_fp8(
+    v_fp8, v_scale, vm = per_channel_fp8(
         v, tensor_layout=tensor_layout, smooth_v=smooth_v
     )
 

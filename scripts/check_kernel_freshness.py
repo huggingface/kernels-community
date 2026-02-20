@@ -44,6 +44,7 @@ KERNEL_SOURCE_MAPPING = {
     "mlx-quantization-metal-kernels": "https://github.com/ml-explore/mlx",
     "mlx-rmsnorm": "https://github.com/ml-explore/mlx",
     "sage-attention": "https://github.com/thu-ml/SageAttention",
+    "bitsandbytes-mps": "",
 
 }
 
