@@ -41,14 +41,18 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1771621704,
-        "narHash": "sha256-2i6LG+DPocfV3o6yyVzZOc0JB0H4FsryX6ZBjuIFY4A=",
-        "path": "/home/drbh/Projects/kernels",
-        "type": "path"
+        "lastModified": 1771622787,
+        "narHash": "sha256-L9SMWfBfBhliFgUK/D+qVUh1iMYcSDZZC1fdmo3Wjts=",
+        "owner": "huggingface",
+        "repo": "kernels",
+        "rev": "dcc0cca67997b6047fd07456c16a8488dbc2d5ef",
+        "type": "github"
       },
       "original": {
-        "path": "/home/drbh/Projects/kernels",
-        "type": "path"
+        "owner": "huggingface",
+        "ref": "support-bundling-deps",
+        "repo": "kernels",
+        "type": "github"
       }
     },
     "nixpkgs": {
