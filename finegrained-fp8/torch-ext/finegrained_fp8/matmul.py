@@ -105,7 +105,7 @@ def w8a8_block_fp8_matmul_kernel(
 
 
 @triton_op("finegrained_fp8::w8a8_block_fp8_matmul", mutates_args=())
-def w8a8_block_fp8_matmul(
+def _w8a8_block_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     As: torch.Tensor,
@@ -202,3 +202,31 @@ def w8a8_block_fp8_matmul(
     )
 
     return C
+
+
+def w8a8_block_fp8_matmul(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: list[int] | None,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Block-wise W8A8 FP8 matrix multiplication.
+
+    Computes ``C = A @ B.T`` where both operands are pre-quantized to
+    ``float8_e4m3fn`` with per-block scales, and accumulates in float32
+    before casting to ``output_dtype``.
+
+    Args:
+        A: Quantized activation tensor ``[M, K]`` in ``float8_e4m3fn``.
+        B: Quantized weight tensor ``[N, K]`` in ``float8_e4m3fn``.
+        As: Per-token-group activation scales ``[M, K // block_size[1]]``.
+        Bs: Per-block weight scales ``[N // block_size[0], K // block_size[1]]``.
+        block_size: ``[block_n, block_k]`` quantization block dimensions, e.g. ``[128, 128]``.
+        output_dtype: dtype of the returned tensor (default: ``torch.float32``).
+
+    Returns:
+        Output tensor ``[M, N]`` in ``output_dtype``.
+    """
+    return torch.ops.finegrained_fp8.w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype)
