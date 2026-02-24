@@ -1,12 +1,15 @@
 {
-  description = "Flake for Torch kernel extension";
+  description = "Flake for triton-kernels kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/pytest-no-cache";
+    kernel-builder.url = "github:huggingface/kernel-builder";
   };
 
   outputs =
-    { self, kernel-builder }:
+    {
+      self,
+      kernel-builder,
+    }:
     kernel-builder.lib.genFlakeOutputs {
       path = ./.;
       rev = self.shortRev or self.dirtyShortRev or self.lastModifiedDate;

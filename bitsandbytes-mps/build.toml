@@ -1,0 +1,49 @@
+[general]
+name = "bitsandbytes_mps"
+backends = ["metal"]
+
+[torch]
+minver = "2.9"
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[general.hub]
+repo-id = "kernels-community/bitsandbytes-mps"
+
+[kernel.bitsandbytes_mps]
+
+depends = ["torch"]
+backend = "metal"
+
+src = [
+# Utility headers (from MLX)
+"bitsandbytes_mps/bf16.h",
+"bitsandbytes_mps/bf16_math.h",
+"bitsandbytes_mps/complex.h",
+"bitsandbytes_mps/defines.h",
+"bitsandbytes_mps/utils.h",
+
+# GEMM infrastructure (from MLX steel)
+"bitsandbytes_mps/gemm/defines.h",
+"bitsandbytes_mps/gemm/gemm.h",
+"bitsandbytes_mps/gemm/loader.h",
+"bitsandbytes_mps/gemm/mma.h",
+"bitsandbytes_mps/gemm/params.h",
+"bitsandbytes_mps/gemm/transforms.h",
+"bitsandbytes_mps/gemm/utils.h",
+"bitsandbytes_mps/gemm/utils/integral_constant.h",
+"bitsandbytes_mps/gemm/utils/type_traits.h",
+
+# Quantized matmul utilities (from MLX)
+"bitsandbytes_mps/quantized_utils.h",
+
+# BnB-specific: codebook types, kernel logic, Metal shaders, dispatch
+"bitsandbytes_mps/bnb_types.h",
+"bitsandbytes_mps/bnb_quantized.h",
+"bitsandbytes_mps/bnb_quantized.metal",
+"bitsandbytes_mps/bnb_quantized.mm",
+]
+
+include = ["bitsandbytes_mps"]

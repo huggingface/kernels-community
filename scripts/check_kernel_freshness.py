@@ -45,6 +45,7 @@ KERNEL_SOURCE_MAPPING = {
     "mlx-rmsnorm": "https://github.com/ml-explore/mlx",
     "sage-attention": "https://github.com/thu-ml/SageAttention",
     "deep-gemm": "https://github.com/deepseek-ai/DeepGEMM",
+    "bitsandbytes-mps": "",
 
 }
 
