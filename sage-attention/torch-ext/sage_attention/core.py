@@ -16,6 +16,7 @@ limitations under the License.
 
 import torch
 import torch.nn.functional as F
+import warnings
 
 from ._ops import ops
 
@@ -33,8 +34,9 @@ try:
         qk_int8_sv_f16_accum_f16_attn_inst_buf as sm80_qk_int8_sv_f16_accum_f16_attn_inst_buf,
     )
     SM80_ENABLED = True
-except Exception:
+except Exception as e:
     SM80_ENABLED = False
+    warnings.warn(f"Failed to load SM80 SageAttention kernels: {e}")
 
 try:
     from .sm89_compile import (
@@ -44,20 +46,20 @@ try:
         qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf as sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf,
     )
     SM89_ENABLED = True
-except Exception:
+except Exception as e:
     SM89_ENABLED = False
+    warnings.warn(f"Failed to load SM89 SageAttention kernels: {e}")
 
 try:
     from .sm90_compile import (
         qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90 as sm90_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90,
     )
     SM90_ENABLED = True
-except Exception:
+except Exception as e:
     SM90_ENABLED = False
+    warnings.warn(f"Failed to load SM90 SageAttention kernels: {e}")
 
 from typing import Any, List, Literal, Optional, Tuple, Union
-import warnings
-
 
 import subprocess
 import re
@@ -148,6 +150,11 @@ def sageattn(
     """
     arch = get_cuda_arch_versions()[q.device.index]
     if arch == "sm80":
+        if not SM80_ENABLED:
+            raise RuntimeError(
+                "SM80 SageAttention kernels failed to load. "
+                "Ensure the kernel was compiled for SM80 (Ampere)."
+            )
         return sageattn_qk_int8_pv_fp16_cuda(
             q,
             k,
@@ -159,6 +166,11 @@ def sageattn(
             pv_accum_dtype="fp32",
         )
     elif arch == "sm89":
+        if not SM89_ENABLED:
+            raise RuntimeError(
+                "SM89 SageAttention kernels failed to load. "
+                "Ensure the kernel was compiled for SM89 (Ada Lovelace)."
+            )
         return sageattn_qk_int8_pv_fp8_cuda(
             q,
             k,
@@ -170,6 +182,11 @@ def sageattn(
             pv_accum_dtype="fp32+fp16",
         )
     elif arch == "sm90":
+        if not SM90_ENABLED:
+            raise RuntimeError(
+                "SM90 SageAttention kernels failed to load. "
+                "Ensure the kernel was compiled for SM90 (Hopper)."
+            )
         return sageattn_qk_int8_pv_fp8_cuda_sm90(
             q,
             k,
@@ -181,6 +198,11 @@ def sageattn(
             pv_accum_dtype="fp32+fp32",
         )
     elif arch == "sm120":
+        if not SM89_ENABLED:
+            raise RuntimeError(
+                "SM89 SageAttention kernels failed to load. "
+                "SM120 (Blackwell) uses SM89 kernels; ensure they were compiled."
+            )
         return sageattn_qk_int8_pv_fp8_cuda(
             q,
             k,
