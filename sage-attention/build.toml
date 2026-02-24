@@ -3,6 +3,9 @@ name = "sage-attention"
 backends = ["cuda"]
 version = 1
 
+[general.cuda]
+minver = "12.8"
+
 [general.hub]
 repo-id = "kernels-community/sage-attention"
 
@@ -25,7 +28,6 @@ cuda-flags = [
     "-Xptxas=-v",
     "-diag-suppress=174",
 ]
-cuda-minver = "12.6"
 cxx-flags = [
     "-g",
     "-O3",
@@ -62,7 +64,6 @@ cuda-flags = [
     "-Xptxas=-v",
     "-diag-suppress=174",
 ]
-cuda-minver = "12.6"
 cxx-flags = [
     "-g",
     "-O3",
@@ -96,7 +97,6 @@ cuda-flags = [
     "-Xptxas=-v",
     "-diag-suppress=174",
 ]
-cuda-minver = "12.6"
 cxx-flags = [
     "-g",
     "-O3",
@@ -132,7 +132,6 @@ cuda-flags = [
     "-Xptxas=-v",
     "-diag-suppress=174",
 ]
-cuda-minver = "12.6"
 cxx-flags = [
     "-g",
     "-O3",
@@ -166,7 +165,6 @@ cuda-flags = [
     "-Xptxas=-v",
     "-diag-suppress=174",
 ]
-cuda-minver = "12.6"
 cxx-flags = [
     "-g",
     "-O3",
@@ -186,7 +184,6 @@ src = [
 [kernel._fp4attn_sm100]
 backend = "cuda"
 cuda-capabilities = ["10.0a"]
-cuda-minver = "12.8"
 cuda-flags = [
     "-O3",
     "-std=c++17",
@@ -242,7 +239,6 @@ src = [
 [kernel._fp4quant_sm100]
 backend = "cuda"
 cuda-capabilities = ["10.0a"]
-cuda-minver = "12.8"
 cuda-flags = [
     "-O3",
     "-std=c++17",
