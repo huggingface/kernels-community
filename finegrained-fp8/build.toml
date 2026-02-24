@@ -1,0 +1,12 @@
+[general]
+name = "finegrained_fp8"
+backends = [
+    "cuda",
+    "rocm",
+    "xpu",
+]
+version = 1
+
+[general.hub]
+repo-id = "kernels-community/finegrained-fp8"
+

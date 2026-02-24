@@ -15,6 +15,7 @@ KERNEL_SOURCE_MAPPING = {
     "activation": "",
     "causal-conv1d": "https://github.com/Dao-AILab/causal-conv1d",
     "deformable-detr": "",
+    "finegrained-fp8": "",
     "flash-attn2": "https://github.com/Dao-AILab/flash-attention",
     "flash-attn3": "https://github.com/Dao-AILab/flash-attention",
     "flash-mla": "https://github.com/deepseek-ai/FlashMLA",
