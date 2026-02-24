@@ -1,5 +1,5 @@
 [general]
-name = "finegrained_fp8"
+name = "finegrained-fp8"
 backends = [
     "cuda",
     "rocm",
