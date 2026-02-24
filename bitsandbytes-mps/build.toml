@@ -13,9 +13,6 @@ src = [
   "torch-ext/torch_binding.h",
 ]
 
-[general.hub]
-repo-id = "kernels-community/bitsandbytes-mps"
-
 [kernel.bitsandbytes_mps]
 
 depends = ["torch"]
