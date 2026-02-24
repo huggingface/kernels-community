@@ -1,6 +1,10 @@
 [general]
-name = "bitsandbytes_mps"
+name = "bitsandbytes-mps"
 backends = ["metal"]
+version = 1
+
+[general.hub]
+repo-id = "kernels-community/bitsandbytes-mps"
 
 [torch]
 minver = "2.9"
