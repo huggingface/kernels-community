@@ -98,16 +98,23 @@ def w8a8_block_fp8_grouped_mm_kernel(
     offs_am_safe = offs_global_m % S
 
     a_ptrs = A + offs_am_safe[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = B + expert_id * stride_Eb + offs_k[:, None] * stride_bk + offs_bn_safe[None, :] * stride_bn
+    b_ptrs = (
+        B
+        + expert_id * stride_Eb
+        + offs_k[:, None] * stride_bk
+        + offs_bn_safe[None, :] * stride_bn
+    )
     offs_bsn_safe = offs_bn_safe // group_n
     Bs_ptrs = Bs + expert_id * stride_Esb + offs_bsn_safe * stride_Bsn
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # ---- fused act_quant (replaces: a = tl.load(a_ptrs); a_s = tl.load(As_ptrs)) ----
-        a_raw = tl.load(a_ptrs, mask=row_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K), other=0.0).to(
-            tl.float32
-        )
+        a_raw = tl.load(
+            a_ptrs,
+            mask=row_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+            other=0.0,
+        ).to(tl.float32)
         a_s = tl.max(tl.abs(a_raw), axis=1) / 448.0  # per-row scale  (BLOCK_SIZE_M,)
         # clamp denominator so masked all-zero rows don't produce NaN
         # (their a_s multiplier is 0 anyway, so the output row is correct)
@@ -136,7 +143,7 @@ def w8a8_block_fp8_grouped_mm_kernel(
 
 
 @triton_op("finegrained_fp8::w8a8_block_fp8_matmul_grouped", mutates_args=())
-def w8a8_block_fp8_matmul_grouped(
+def _w8a8_block_fp8_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -152,7 +159,6 @@ def w8a8_block_fp8_matmul_grouped(
     into the matmul loop.  ``tokens_per_expert`` is needed (in addition to
     ``offsets``) to build the per-expert tile schedule inside the kernel.
     """
-
     assert A.ndim == 2, "A must be (S, K)"
     assert A.is_contiguous()
 
@@ -196,13 +202,13 @@ def w8a8_block_fp8_matmul_grouped(
         K,
         block_n,
         block_k,
-        A.stride(0),   # stride_am
-        A.stride(1),   # stride_ak
-        B.stride(0),   # stride_Eb
-        B.stride(2),   # stride_bk
-        B.stride(1),   # stride_bn
-        C.stride(0),   # stride_cm
-        C.stride(1),   # stride_cn
+        A.stride(0),  # stride_am
+        A.stride(1),  # stride_ak
+        B.stride(0),  # stride_Eb
+        B.stride(2),  # stride_bk
+        B.stride(1),  # stride_bn
+        C.stride(0),  # stride_cm
+        C.stride(1),  # stride_cn
         Bs.stride(0),  # stride_Esb
         Bs.stride(2),  # stride_Bsk
         Bs.stride(1),  # stride_Bsn
@@ -213,3 +219,34 @@ def w8a8_block_fp8_matmul_grouped(
     )
 
     return C
+
+
+def w8a8_block_fp8_matmul_grouped(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    offsets: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    block_size: list[int] | None,
+) -> torch.Tensor:
+    """Grouped W8A8 FP8 matmul for MoE expert dispatch with fused activation quantization.
+
+    Tokens in ``A`` must be pre-sorted by expert id. The kernel quantizes ``A``
+    to FP8 on-the-fly (fused ``act_quant``), uses a static over-provisioned grid
+    for CUDA-graph compatibility, and resolves each tile's expert via an O(log E)
+    binary search over ``offsets``.
+
+    Args:
+        A: Raw activation matrix ``[S, K]`` sorted by expert, in bf16/fp16/fp32.
+        B: Stacked expert weight tensor ``[E, N, K]`` in ``float8_e4m3fn``.
+        Bs: Stacked expert weight scales ``[E, N // block_size[0], K // block_size[1]]``.
+        offsets: Cumulative token counts per expert ``[E]`` (i.e. ``cumsum(tokens_per_expert)``).
+        tokens_per_expert: Number of tokens routed to each expert ``[E]``.
+        block_size: ``[block_n, block_k]`` quantization block dimensions, e.g. ``[128, 128]``.
+
+    Returns:
+        Output tensor ``[S, N]`` in the same dtype as ``A``, in expert-sorted order.
+    """
+    return torch.ops.finegrained_fp8.w8a8_block_fp8_matmul_grouped(
+        A, B, Bs, offsets, tokens_per_expert, block_size
+    )
