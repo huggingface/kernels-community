@@ -649,9 +649,14 @@ _initialized = False
 # Set DG_CUTLASS_INCLUDE for JIT kernel compilation (if not already set by user)
 if "DG_CUTLASS_INCLUDE" not in os.environ:
     _include = os.path.join(_lib_root, "include")
-    if os.path.isdir(os.path.join(_include, "cutlass")):
-        # Bundled CUTLASS headers (from kernel-builder bundle-dep-includes)
-        os.environ["DG_CUTLASS_INCLUDE"] = _include
+    _cutlass_include_candidates = [
+        _include,  # legacy layout: include/cutlass
+        os.path.join(_include, "third-party", "cutlass", "include"),  # submodule layout
+    ]
+    for _cutlass_include in _cutlass_include_candidates:
+        if os.path.isdir(os.path.join(_cutlass_include, "cutlass")):
+            os.environ["DG_CUTLASS_INCLUDE"] = _cutlass_include
+            break
     else:
         # Fall back to nvidia-cutlass pip package
         try:
