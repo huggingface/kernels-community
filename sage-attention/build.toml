@@ -3,6 +3,9 @@ name = "sage-attention"
 backends = ["cuda"]
 version = 1
 
+[general.cuda]
+minver = "12.8"
+
 [general.hub]
 repo-id = "kernels-community/sage-attention"
 
@@ -25,7 +28,6 @@ cuda-flags = [
     "-Xptxas=-v",
     "-diag-suppress=174",
 ]
-cuda-minver = "12.6"
 cxx-flags = [
     "-g",
     "-O3",
@@ -62,7 +64,6 @@ cuda-flags = [
     "-Xptxas=-v",
     "-diag-suppress=174",
 ]
-cuda-minver = "12.6"
 cxx-flags = [
     "-g",
     "-O3",
@@ -96,7 +97,6 @@ cuda-flags = [
     "-Xptxas=-v",
     "-diag-suppress=174",
 ]
-cuda-minver = "12.6"
 cxx-flags = [
     "-g",
     "-O3",
@@ -132,7 +132,6 @@ cuda-flags = [
     "-Xptxas=-v",
     "-diag-suppress=174",
 ]
-cuda-minver = "12.6"
 cxx-flags = [
     "-g",
     "-O3",
@@ -166,7 +165,6 @@ cuda-flags = [
     "-Xptxas=-v",
     "-diag-suppress=174",
 ]
-cuda-minver = "12.6"
 cxx-flags = [
     "-g",
     "-O3",
@@ -180,4 +178,91 @@ include = ["."]
 src = [
     "sage_attention/fused/fused.cu",
     "sage_attention/fused/fused.h",
+]
+
+# SM100 (Blackwell) FP4 attention kernel
+[kernel._fp4attn_sm100]
+backend = "cuda"
+cuda-capabilities = ["10.0a"]
+cuda-flags = [
+    "-O3",
+    "-std=c++17",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--use_fast_math",
+    "--ptxas-options=--verbose,--warn-on-local-memory-usage",
+    "-lineinfo",
+    "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
+    "-DNDEBUG",
+    "-DQBLKSIZE=128",
+    "-DKBLKSIZE=128",
+    "-DCTA256",
+    "-DDQINRMEM",
+    "-DEXECMODE=0",
+]
+cxx-flags = [
+    "-O3",
+    "-std=c++17",
+]
+depends = [
+    "torch",
+    "cutlass_4_0",
+]
+include = [
+    "sage_attention/blackwell",
+]
+src = [
+    "sage_attention/blackwell/api.cu",
+    "sage_attention/blackwell/block_info.h",
+    "sage_attention/blackwell/blockscaled_layout.h",
+    "sage_attention/blackwell/cute_extension.h",
+    "sage_attention/blackwell/epilogue_tma_ws.h",
+    "sage_attention/blackwell/kernel_traits.h",
+    "sage_attention/blackwell/kernel_ws.h",
+    "sage_attention/blackwell/launch.h",
+    "sage_attention/blackwell/mainloop_tma_ws.h",
+    "sage_attention/blackwell/named_barrier.h",
+    "sage_attention/blackwell/params.h",
+    "sage_attention/blackwell/softmax_fused.h",
+    "sage_attention/blackwell/static_switch.h",
+    "sage_attention/blackwell/tile_scheduler.h",
+    "sage_attention/blackwell/utils.h",
+]
+
+# SM100 (Blackwell) FP4 quantization kernel
+[kernel._fp4quant_sm100]
+backend = "cuda"
+cuda-capabilities = ["10.0a"]
+cuda-flags = [
+    "-O3",
+    "-std=c++17",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--use_fast_math",
+    "-DNDEBUG",
+    "-DEXECMODE=0",
+]
+cxx-flags = [
+    "-O3",
+    "-std=c++17",
+]
+depends = ["torch"]
+include = [
+    "sage_attention/quantization",
+]
+src = [
+    "sage_attention/quantization/fp4_quantization_4d.cu",
+    "sage_attention/quantization/cuda_utils.h",
 ]
