@@ -66,7 +66,7 @@ def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
     # midpoints: 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0
     boundaries = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
                               device=x.device, dtype=ax.dtype)
-    idx = torch.bucketize(ax, boundaries)
+    idx = torch.bucketize(ax, boundaries) 
     code = idx.to(torch.uint8)
     sign = (x < 0) & (idx != 0)
     code = code | (sign.to(torch.uint8) << 3)
