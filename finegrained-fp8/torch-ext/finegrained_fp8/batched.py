@@ -102,7 +102,7 @@ def w8a8_block_fp8_matmul_batched_kernel(
 
 
 @triton_op("finegrained_fp8::w8a8_block_fp8_matmul_batched", mutates_args=())
-def w8a8_block_fp8_matmul_batched(
+def _w8a8_block_fp8_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -167,3 +167,30 @@ def w8a8_block_fp8_matmul_batched(
     )
 
     return C
+
+
+def w8a8_block_fp8_matmul_batched(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    expert_ids: torch.Tensor,
+    block_size: list[int] | None,
+) -> torch.Tensor:
+    """Batched W8A8 FP8 matmul for MoE expert dispatch with fused activation quantization.
+
+    Each token in ``A`` is routed to one expert via ``expert_ids``. The kernel
+    quantizes ``A`` to FP8 on-the-fly (fused ``act_quant``), reads the correct
+    expert weight slice of ``B`` directly using ``expert_ids[batch_id]`` — no
+    ``(S, N, K)`` weight gather needed — and accumulates in float32.
+
+    Args:
+        A: Raw activation matrix ``[S, K]`` in bf16/fp16/fp32.
+        B: Stacked expert weight tensor ``[E, N, K]`` in ``float8_e4m3fn``.
+        Bs: Stacked expert weight scales ``[E, N // block_size[0], K // block_size[1]]``.
+        expert_ids: Expert index per token ``[S]``, values in ``[0, E)``.
+        block_size: ``[block_n, block_k]`` quantization block dimensions, e.g. ``[128, 128]``.
+
+    Returns:
+        Output tensor ``[S, N]`` in the same dtype as ``A``.
+    """
+    return torch.ops.finegrained_fp8.w8a8_block_fp8_matmul_batched(A, B, Bs, expert_ids, block_size)
