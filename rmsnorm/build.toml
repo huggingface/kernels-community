@@ -1,5 +1,6 @@
 [general]
 name = "rmsnorm"
+license = "Apache-2.0"
 version = 1
 backends = [
     "cpu",
