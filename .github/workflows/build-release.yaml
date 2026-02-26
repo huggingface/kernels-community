@@ -51,7 +51,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
-          ( cd "$KERNEL" && nix run -L .#build-and-upload )
+          ( cd "$KERNEL" && nix run -L .?submodules=1#build-and-upload )
       - name: Upload v1 kernels to main
         if: steps.validate.outputs.skip == 'false'
         env:
