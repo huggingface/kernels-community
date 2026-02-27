@@ -34,6 +34,7 @@ KERNEL_SOURCE_MAPPING = {
     "rotary": "https://github.com/Dao-AILab/flash-attention",
     "rwkv": "https://github.com/BlinkDL/RWKV-LM",
     "scattermoe": "https://github.com/shawntan/scattermoe",
+    "sgl-flash-attn3": "https://github.com/sgl-project/sgl-flash-attn",
     "tinygrad-rms": "https://github.com/tinygrad/tinygrad",
     "trimul_gpumode": "https://github.com/davidberard98/gpumode-trimul",
     "vllm-flash-attn3": "https://github.com/Dao-AILab/flash-attention",
