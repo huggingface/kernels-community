@@ -4,7 +4,7 @@ version = 1
 backends = ["cuda"]
 
 [general.cuda]
-minver = "12.4"
+minver = "12.8"
 
 [torch]
 src = [
@@ -28,6 +28,10 @@ cuda-flags = [
   "--expt-extended-lambda",
   "--use_fast_math",
   "-DNDEBUG",
+  "-DFLASHATTENTION_DISABLE_BACKWARD",
+  "-DFLASHATTENTION_DISABLE_DROPOUT",
+  "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+  "-DFLASHATTENTION_VARLEN_ONLY",
 ]
 cxx-flags = [
   "-DFLASHATTENTION_DISABLE_BACKWARD",
@@ -66,6 +70,10 @@ cuda-flags = [
   "--expt-extended-lambda",
   "--use_fast_math",
   "-DNDEBUG",
+  "-DFLASHATTENTION_DISABLE_BACKWARD",
+  "-DFLASHATTENTION_DISABLE_DROPOUT",
+  "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+  "-DFLASHATTENTION_VARLEN_ONLY",
 ]
 cxx-flags = [
   "-DFLASHATTENTION_DISABLE_BACKWARD",
@@ -233,6 +241,10 @@ cuda-flags = [
   "--expt-extended-lambda",
   "--use_fast_math",
   "-DNDEBUG",
+  "-DFLASHATTENTION_DISABLE_BACKWARD",
+  "-DFLASHATTENTION_DISABLE_DROPOUT",
+  "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+  "-DFLASHATTENTION_VARLEN_ONLY",
 ]
 cxx-flags = [
   "-DFLASHATTENTION_DISABLE_BACKWARD",
