@@ -39,6 +39,17 @@ def post_issue_comment(api_base: str, token: str, issue_number: int, message: st
     github_api_request(url, token, method="POST", data={"body": message})
 
 
+def try_post_issue_comment(api_base: str, token: str, issue_number: int, message: str):
+    try:
+        post_issue_comment(api_base, token, issue_number, message)
+        return True
+    except urllib.error.HTTPError as e:
+        err_text = e.read().decode("utf-8", errors="replace")
+        print(f"Failed to post PR comment (HTTP {e.code}).", file=sys.stderr)
+        print(err_text, file=sys.stderr)
+        return False
+
+
 def get_user_permission(api_base: str, token: str, username: str):
     url = f"{api_base}/collaborators/{username}/permission"
     try:
@@ -137,7 +148,7 @@ def main():
 
     permission = get_user_permission(api_base, token, commenter)
     if permission not in ALLOWED_PERMISSIONS:
-        post_issue_comment(
+        try_post_issue_comment(
             api_base,
             token,
             issue_number,
@@ -147,7 +158,7 @@ def main():
 
     kernels, target_branch, parse_error = parse_command(comment)
     if parse_error:
-        post_issue_comment(
+        try_post_issue_comment(
             api_base,
             token,
             issue_number,
@@ -194,7 +205,12 @@ def main():
         failed_text = ", ".join(f"{kernel} (HTTP {code})" for kernel, code in failed)
         lines.extend(["", f"Failed ({len(failed)}): `{failed_text}`"])
 
-    post_issue_comment(api_base, token, issue_number, "\n".join(lines))
+    comment_posted = try_post_issue_comment(api_base, token, issue_number, "\n".join(lines))
+    if not comment_posted:
+        print(
+            "Bot response could not be posted. Ensure workflow token has issues/pull-requests write permission.",
+            file=sys.stderr,
+        )
     return 1 if failed else 0
 
 
