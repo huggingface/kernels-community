@@ -9,7 +9,7 @@ import urllib.request
 
 KERNEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
-ALLOWED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+ALLOWED_PERMISSIONS = {"admin", "write"}
 
 
 def github_api_request(
@@ -37,6 +37,18 @@ def github_api_request(
 def post_issue_comment(api_base: str, token: str, issue_number: int, message: str):
     url = f"{api_base}/issues/{issue_number}/comments"
     github_api_request(url, token, method="POST", data={"body": message})
+
+
+def get_user_permission(api_base: str, token: str, username: str):
+    url = f"{api_base}/collaborators/{username}/permission"
+    try:
+        _, body = github_api_request(url, token, method="GET")
+        parsed = json.loads(body)
+        return parsed.get("permission")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
 
 
 def parse_command(comment: str):
@@ -110,7 +122,7 @@ def main():
 
     comment = event.get("comment", {}).get("body", "")
     issue_number = event.get("issue", {}).get("number")
-    association = event.get("comment", {}).get("author_association", "")
+    commenter = event.get("comment", {}).get("user", {}).get("login", "")
     default_branch = event.get("repository", {}).get("default_branch", "main")
 
     if not issue_number:
@@ -119,12 +131,17 @@ def main():
 
     api_base = f"https://api.github.com/repos/{repository}"
 
-    if association not in ALLOWED_ASSOCIATIONS:
+    if not commenter:
+        print("No commenter username in event payload.", file=sys.stderr)
+        return 1
+
+    permission = get_user_permission(api_base, token, commenter)
+    if permission not in ALLOWED_PERMISSIONS:
         post_issue_comment(
             api_base,
             token,
             issue_number,
-            "I can only run builds for repository members/collaborators.",
+            "I can only run builds for users with `write` or `admin` repository permission.",
         )
         return 0
 
