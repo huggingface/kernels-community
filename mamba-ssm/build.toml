@@ -1,7 +1,11 @@
 [general]
-name = "mamba-ssm"
-version = 1
+name = "mamba_ssm"
 backends = ["cuda"]
+version = 1
+python-depends = ["einops"]
+
+[general.hub]
+repo-id = "kernels-community/mamba-ssm"
 
 [torch]
 src = [

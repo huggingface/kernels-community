@@ -11,8 +11,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import Tensor
 from torch.profiler import ProfilerActivity, profile, record_function
-from transformers.generation import GreedySearchDecoderOnlyOutput, SampleDecoderOnlyOutput, TextStreamer
-
+from transformers.generation import GenerateDecoderOnlyOutput, TextStreamer
 
 @dataclass
 class InferenceParams:

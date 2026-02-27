@@ -117,6 +117,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     "Tensor? rng_state) -> Tensor[]");
 #if defined(CUDA_KERNEL)
   ops.impl("varlen_bwd", torch::kCUDA, &mha_varlen_bwd);
+#elif defined(XPU_KERNEL)
+  ops.impl("varlen_bwd", torch::kXPU, &mha_varlen_bwd);
 #endif
 
   ops.def("fwd_kvcache("

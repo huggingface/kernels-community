@@ -470,3 +470,61 @@ static void mean_scale_fuse_quant_cuda_wrap(
         input, output, mean, scale,
         static_cast<int>(num_tokens), static_cast<float>(scale_max), static_cast<int>(tensor_layout));
 }
+
+// ##############################################################################
+// SM100 (Blackwell) - FP4 attention
+// ##############################################################################
+std::vector<at::Tensor> mha_fwd(
+    at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+    const at::Tensor &sfq, const at::Tensor &sfk, const at::Tensor &sfv,
+    const at::Tensor &delta_s, int unpadded_k,
+    c10::optional<at::Tensor> &out_,
+    const float softmax_scale, bool is_causal,
+    bool per_block_mean, bool is_bf16);
+
+static std::vector<at::Tensor> mha_fwd_wrap(
+    at::Tensor q, at::Tensor k, at::Tensor v,
+    at::Tensor sfq, at::Tensor sfk, at::Tensor sfv,
+    at::Tensor delta_s, int64_t unpadded_k,
+    c10::optional<at::Tensor> out_,
+    double softmax_scale, bool is_causal,
+    bool per_block_mean, bool is_bf16) {
+    return mha_fwd(q, k, v, sfq, sfk, sfv, delta_s,
+        static_cast<int>(unpadded_k), out_,
+        static_cast<float>(softmax_scale), is_causal,
+        per_block_mean, is_bf16);
+}
+
+// SM100 (Blackwell) - FP4 quantization
+void scaled_fp4_quant(torch::Tensor const& input,
+                      torch::Tensor const& output,
+                      torch::Tensor const& output_sf,
+                      int tensor_layout);
+
+void scaled_fp4_quant_permute(torch::Tensor const& input,
+                              torch::Tensor const& output,
+                              torch::Tensor const& output_sf,
+                              int tensor_layout);
+
+void scaled_fp4_quant_trans(torch::Tensor const& input,
+                            torch::Tensor const& output,
+                            torch::Tensor const& output_sf,
+                            int tensor_layout);
+
+static void scaled_fp4_quant_wrap(
+    at::Tensor input, at::Tensor output, at::Tensor output_sf,
+    int64_t tensor_layout) {
+    scaled_fp4_quant(input, output, output_sf, static_cast<int>(tensor_layout));
+}
+
+static void scaled_fp4_quant_permute_wrap(
+    at::Tensor input, at::Tensor output, at::Tensor output_sf,
+    int64_t tensor_layout) {
+    scaled_fp4_quant_permute(input, output, output_sf, static_cast<int>(tensor_layout));
+}
+
+static void scaled_fp4_quant_trans_wrap(
+    at::Tensor input, at::Tensor output, at::Tensor output_sf,
+    int64_t tensor_layout) {
+    scaled_fp4_quant_trans(input, output, output_sf, static_cast<int>(tensor_layout));
+}

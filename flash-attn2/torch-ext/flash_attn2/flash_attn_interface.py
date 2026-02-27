@@ -31,8 +31,6 @@ def _get_device():
     else:
         return "cpu"
 
-_XPU_AVAILABLE = torch.xpu.is_available() if hasattr(torch, "xpu") else False # TODO remove hasattr check when bwd is supported on XPU
-
 
 def _get_block_size_n(device, head_dim, is_dropout, is_causal):
     # This should match the block sizes in the CUDA kernel
@@ -1285,7 +1283,7 @@ def flash_attn_varlen_qkvpacked_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
-        False if _XPU_AVAILABLE else torch.is_grad_enabled(),
+        torch.is_grad_enabled(),
     )
 
 
@@ -1377,7 +1375,7 @@ def flash_attn_varlen_kvpacked_func(
         alibi_slopes,
         deterministic,
         return_attn_probs,
-        False if _XPU_AVAILABLE else torch.is_grad_enabled(),
+        torch.is_grad_enabled(),
     )
 
 
@@ -1471,7 +1469,7 @@ def flash_attn_varlen_func(
         deterministic,
         return_attn_probs,
         block_table,
-        False if _XPU_AVAILABLE or q.device.type == "cpu" else torch.is_grad_enabled(),
+        False if q.device.type == "cpu" else torch.is_grad_enabled(),
     )
 
 

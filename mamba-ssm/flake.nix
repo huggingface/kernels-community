@@ -13,6 +13,7 @@
     kernel-builder.lib.genKernelFlakeOutputs {
       inherit self;
       path = ./.;
+
       # Has many external dependencies, see README.md, this kernel should
       # probably be more lean.
       doGetKernelCheck = false;
@@ -24,4 +25,5 @@
           transformers
         ];
     };
+
 }
