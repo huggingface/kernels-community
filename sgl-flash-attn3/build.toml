@@ -35,7 +35,7 @@ cxx-flags = [
   "-DFLASHATTENTION_DISABLE_UNEVEN_K",
   "-DFLASHATTENTION_VARLEN_ONLY",
 ]
-depends = ["torch", "cutlass_3_9"]
+depends = ["torch", "cutlass_4_0"]
 src = [
   "flash-attn/cuda_check.h",
   "flash-attn/flash_api.cpp",
@@ -73,7 +73,7 @@ cxx-flags = [
   "-DFLASHATTENTION_DISABLE_UNEVEN_K",
   "-DFLASHATTENTION_VARLEN_ONLY",
 ]
-depends = ["torch", "cutlass_3_9"]
+depends = ["torch", "cutlass_4_0"]
 include = ["flash-attn"]
 src = [
   "flash-attn/block.h",
@@ -240,7 +240,7 @@ cxx-flags = [
   "-DFLASHATTENTION_DISABLE_UNEVEN_K",
   "-DFLASHATTENTION_VARLEN_ONLY",
 ]
-depends = ["torch", "cutlass_3_9"]
+depends = ["torch", "cutlass_4_0"]
 include = ["flash-attn"]
 src = [
   "flash-attn/block.h",
