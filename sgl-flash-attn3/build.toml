@@ -1,5 +1,6 @@
 [general]
 name = "sgl-flash-attn3"
+license = "BSD-3-Clause"
 version = 1
 backends = ["cuda"]
 
@@ -23,7 +24,6 @@ cuda-flags = [
   "--use_fast_math",
   "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
   "-DCUTLASS_ENABLE_GDC_FOR_SM90",
-  "-DCUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1",
   "--expt-relaxed-constexpr",
   "--expt-extended-lambda",
   "--use_fast_math",
@@ -65,7 +65,6 @@ cuda-flags = [
   "--use_fast_math",
   "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
   "-DCUTLASS_ENABLE_GDC_FOR_SM90",
-  "-DCUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1",
   "--expt-relaxed-constexpr",
   "--expt-extended-lambda",
   "--use_fast_math",
@@ -236,7 +235,6 @@ cuda-flags = [
   "--use_fast_math",
   "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
   "-DCUTLASS_ENABLE_GDC_FOR_SM90",
-  "-DCUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1",
   "--expt-relaxed-constexpr",
   "--expt-extended-lambda",
   "--use_fast_math",
