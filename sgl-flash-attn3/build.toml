@@ -1,5 +1,5 @@
 [general]
-name = "sgl_flash_attn3"
+name = "sgl-flash-attn3"
 version = 1
 backends = ["cuda"]
 
