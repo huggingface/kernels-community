@@ -6,7 +6,7 @@ tags:
 
 # sgl-flash-attn3
 
-SGLang's Flash Attention 3 kernel (forward-only, with attention sinks support). This is a port of the [sgl-attn fork](https://github.com/sgl-project/sgl-attn) used by [SGLang](https://github.com/sgl-project/sglang), packaged for use with the [kernels library](https://github.com/huggingface/kernels).
+SGLang's Flash Attention 3 kernel (forward-only, with attention sinks support). This is a port of the [sgl-attn fork](https://github.com/sgl-project/sgl-flash-attn) used by [SGLang](https://github.com/sgl-project/sglang), packaged for use with the [kernels library](https://github.com/huggingface/kernels).
 
 Compared to upstream flash-attn3, this kernel includes sglang-specific features:
 - Forward-only (no backward pass) for inference workloads
