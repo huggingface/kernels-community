@@ -5,86 +5,19 @@
  ****************************************************************************************/
 
 // Fallback implementation - no special CPU features required
-// Uses PyTorch's brgemm which has multiple backend implementations
+// Uses PyTorch tensor operations (matmul, softmax) for maximum compatibility
 
 #include <ATen/ATen.h>
+#include <limits>
 
-#include "fmha_fwd_common.hpp"
-#include "fmha_fwd_kernel.hpp"
 #include "fmha_fwd_fallback.hpp"
 
 namespace flash_attn_cpu {
 namespace fallback {
 
 //==============================================================================
-// Scalar VNNI packing utilities (no AVX512 intrinsics)
-//==============================================================================
-
-template <typename scalar_t>
-void pack_vnni_scalar(
-    scalar_t* __restrict__ dst,
-    const scalar_t* __restrict__ src,
-    int N,
-    int K,
-    int ld_src,
-    int ld_dst) {
-  for (int n = 0; n < N; ++n) {
-    for (int k = 0; k < K / 2; ++k) {
-      for (int d = 0; d < 2; ++d) {
-        dst[k * ld_dst * 2 + n * 2 + d] = src[n * ld_src + k * 2 + d];
-      }
-    }
-  }
-}
-
-template <typename scalar_t>
-void pack_vnni2_scalar(
-    scalar_t* __restrict__ dst,
-    const scalar_t* __restrict__ src,
-    int K,
-    int N,
-    int ld_src,
-    int ld_dst) {
-  int k = 0;
-  for (; k < (K >> 1) * 2; k += 2) {
-    for (int n = 0; n < N; ++n) {
-      dst[(k >> 1) * ld_dst * 2 + n * 2 + 0] = src[(k + 0) * ld_src + n];
-      dst[(k >> 1) * ld_dst * 2 + n * 2 + 1] = src[(k + 1) * ld_src + n];
-    }
-  }
-  if (K % 2 != 0) {
-    for (int n = 0; n < N; ++n) {
-      dst[(K >> 1) * ld_dst * 2 + n * 2 + 0] = src[(K - 1) * ld_src + n];
-      dst[(K >> 1) * ld_dst * 2 + n * 2 + 1] = 0;
-    }
-  }
-}
-
-//==============================================================================
-// Fallback PackPolicy
-//==============================================================================
-
-struct FallbackPackPolicy {
-  template <typename scalar_t>
-  static void pack_vnni(scalar_t* dst, const scalar_t* src, int N, int K, int ld_src, int ld_dst) {
-    pack_vnni_scalar<scalar_t>(dst, src, N, K, ld_src, ld_dst);
-  }
-
-  template <typename scalar_t>
-  static void pack_vnni2(scalar_t* dst, const scalar_t* src, int K, int N, int ld_src, int ld_dst) {
-    pack_vnni2_scalar<scalar_t>(dst, src, K, N, ld_src, ld_dst);
-  }
-
-  template <typename scalar_t, int BLOCK_N>
-  static void copy_stub_block(scalar_t* __restrict__ out, const float* __restrict__ input) {
-    for (int i = 0; i < BLOCK_N; ++i) {
-      out[i] = static_cast<scalar_t>(input[i]);
-    }
-  }
-};
-
-//==============================================================================
-// Public API
+// Naive Flash Attention using PyTorch ops
+// This works on any CPU but is slower than optimized implementations
 //==============================================================================
 
 void fmha_fwd_varlen_impl(
@@ -98,8 +31,65 @@ void fmha_fwd_varlen_impl(
     int max_seqlen_k,
     float softmax_scale,
     bool is_causal) {
-  fmha_fwd_varlen_impl_template<FallbackPackPolicy>(
-      q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal);
+
+  // q, k, v: [total_tokens, num_heads, head_dim]
+  // cu_seqlens_q, cu_seqlens_k: [batch_size + 1]
+  // out: [total_tokens, num_heads, head_dim]
+
+  const int batch_size = cu_seqlens_q.size(0) - 1;
+  const int num_heads = q.size(1);
+  const int head_dim = q.size(2);
+  const int head_dim_v = v.size(2);
+
+  auto cu_seqlens_q_cpu = cu_seqlens_q.to(at::kCPU).contiguous();
+  auto cu_seqlens_k_cpu = cu_seqlens_k.to(at::kCPU).contiguous();
+  const int32_t* cu_q = cu_seqlens_q_cpu.data_ptr<int32_t>();
+  const int32_t* cu_k = cu_seqlens_k_cpu.data_ptr<int32_t>();
+
+  // Process each sequence in the batch
+  for (int b = 0; b < batch_size; ++b) {
+    int32_t q_start = cu_q[b];
+    int32_t q_end = cu_q[b + 1];
+    int32_t k_start = cu_k[b];
+    int32_t k_end = cu_k[b + 1];
+
+    int32_t seqlen_q = q_end - q_start;
+    int32_t seqlen_k = k_end - k_start;
+
+    if (seqlen_q == 0 || seqlen_k == 0) {
+      continue;
+    }
+
+    // Extract sequences: [seqlen, num_heads, head_dim] -> [num_heads, seqlen, head_dim]
+    auto q_seq = q.slice(0, q_start, q_end).transpose(0, 1);  // [num_heads, seqlen_q, head_dim]
+    auto k_seq = k.slice(0, k_start, k_end).transpose(0, 1);  // [num_heads, seqlen_k, head_dim]
+    auto v_seq = v.slice(0, k_start, k_end).transpose(0, 1);  // [num_heads, seqlen_k, head_dim_v]
+
+    // Compute attention scores: Q @ K^T * scale
+    // [num_heads, seqlen_q, head_dim] @ [num_heads, head_dim, seqlen_k] -> [num_heads, seqlen_q, seqlen_k]
+    auto scores = at::matmul(q_seq, k_seq.transpose(-2, -1)) * softmax_scale;
+
+    // Apply causal mask if needed
+    if (is_causal) {
+      // Create causal mask: positions where q_pos > k_pos should be masked
+      auto mask = at::ones({seqlen_q, seqlen_k}, scores.options().dtype(at::kBool));
+      mask = at::tril(mask, /*diagonal=*/seqlen_k - seqlen_q);
+      mask = mask.unsqueeze(0);  // [1, seqlen_q, seqlen_k]
+
+      // Apply mask: set masked positions to -inf
+      scores = scores.masked_fill(~mask, -std::numeric_limits<float>::infinity());
+    }
+
+    // Softmax over last dimension
+    auto attn_weights = at::softmax(scores.to(at::kFloat), -1).to(q.scalar_type());
+
+    // Compute output: attn_weights @ V
+    // [num_heads, seqlen_q, seqlen_k] @ [num_heads, seqlen_k, head_dim_v] -> [num_heads, seqlen_q, head_dim_v]
+    auto out_seq = at::matmul(attn_weights, v_seq);
+
+    // Transpose back and copy to output: [num_heads, seqlen_q, head_dim_v] -> [seqlen_q, num_heads, head_dim_v]
+    out.slice(0, q_start, q_end).copy_(out_seq.transpose(0, 1));
+  }
 }
 
 }  // namespace fallback

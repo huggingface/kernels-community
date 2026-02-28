@@ -1,0 +1,49 @@
+[general]
+name = "mlx_quantization_metal_kernels"
+backends = ["metal"]
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[general.hub]
+repo-id = "kernels-community/mlx-quantization-metal-kernels"
+
+[kernel.mlx_quantization_metal_kernels]
+
+depends = ["torch"]
+backend = "metal"
+
+src = [
+"quantization_mlx/bf16.h",
+"quantization_mlx/bf16_math.h",
+"quantization_mlx/complex.h",
+"quantization_mlx/defines.h",
+"quantization_mlx/utils.h",
+
+"quantization_mlx/gemm/defines.h",
+"quantization_mlx/gemm/gemm.h",
+"quantization_mlx/gemm/loader.h",
+"quantization_mlx/gemm/mma.h",
+"quantization_mlx/gemm/params.h",
+"quantization_mlx/gemm/transforms.h",
+"quantization_mlx/gemm/utils.h",
+"quantization_mlx/gemm/utils/integral_constant.h",
+"quantization_mlx/gemm/utils/type_traits.h",
+
+"quantization_mlx/quantized_utils.h",
+"quantization_mlx/fp4.h",
+"quantization_mlx/fp8.h",
+
+"quantization_mlx/quantized.h",
+"quantization_mlx/quantized.metal",
+"quantization_mlx/quantized.mm",
+
+"quantization_mlx/fp_quantized.h",
+"quantization_mlx/fp_quantized.metal",
+"quantization_mlx/fp_quantized.mm",
+]
+
+include = ["quantization_mlx"]

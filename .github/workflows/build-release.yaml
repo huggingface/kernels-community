@@ -10,8 +10,15 @@ jobs:
   build-kernel:
     # Only run if the PR was actually merged (not just closed)
     if: github.event.pull_request.merged == true
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64-linux
+            runner: aws-highmemory-32-plus-nix
+          - arch: aarch64-linux
+            runner: aws-r8g-8xl-plus-nix
     runs-on:
-      group: aws-highmemory-32-plus-nix
+      group: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/nix-installer-action@main

@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: BSD-3-Clause
  ****************************************************************************************/
 
-// Shared flash attention kernel implementation
-// This template is parameterized by PackPolicy which provides pack_vnni, pack_vnni2, copy_stub_block
+// Flash attention kernel implementation for AVX512
+// Pack functions (pack_vnni, pack_vnni2, copy_stub_block) are defined in fmha_fwd_avx512.cpp
 
 #pragma once
 
@@ -23,14 +23,23 @@
 namespace flash_attn_cpu {
 
 //==============================================================================
-// Flash Attention Kernel Implementation (shared)
-// PackPolicy must provide:
-//   - template<scalar_t> pack_vnni(dst, src, N, K, ld_src, ld_dst)
-//   - template<scalar_t> pack_vnni2(dst, src, K, N, ld_src, ld_dst)
-//   - template<scalar_t, BLOCK_N> copy_stub_block(out, input)
+// Pack functions - declared here, defined in fmha_fwd_avx512.cpp
 //==============================================================================
 
-template <typename scalar_t, int BLOCK_M, int BLOCK_N, typename PackPolicy>
+template <typename scalar_t>
+void pack_vnni(scalar_t* dst, const scalar_t* src, int N, int K, int ld_src, int ld_dst);
+
+template <typename scalar_t>
+void pack_vnni2(scalar_t* dst, const scalar_t* src, int K, int N, int ld_src, int ld_dst);
+
+template <typename scalar_t, int BLOCK_N>
+void copy_stub_block(scalar_t* __restrict__ out, const float* __restrict__ input);
+
+//==============================================================================
+// Flash Attention Kernel Implementation
+//==============================================================================
+
+template <typename scalar_t, int BLOCK_M, int BLOCK_N>
 void flash_attn_varlen_kernel_impl(
     scalar_t* __restrict__ out,
     const scalar_t* __restrict__ q,
@@ -124,7 +133,7 @@ void flash_attn_varlen_kernel_impl(
         const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
 
         // pack key
-        PackPolicy::template pack_vnni<scalar_t>(
+        pack_vnni<scalar_t>(
             Btmp,
             k + (seq_k_start_loc + n) * k_strideN + head_kv_id * k_strideH,
             n_size,
@@ -168,7 +177,7 @@ void flash_attn_varlen_kernel_impl(
           if (std::isinf(m_i) && m_i < 0) {
             // Entire row is masked, fill s_delta with zeros
             fill_stub(s_delta + row * BLOCK_N, 0.f, padded_n_size);
-            PackPolicy::template copy_stub_block<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
+            copy_stub_block<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
             continue;
           }
 
@@ -187,11 +196,11 @@ void flash_attn_varlen_kernel_impl(
               v_prime + row * head_size_v, v_prime + row * head_size_v, head_size_v);
 
           fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-          PackPolicy::template copy_stub_block<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
+          copy_stub_block<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
         }
 
         // pack value
-        PackPolicy::template pack_vnni2<scalar_t>(
+        pack_vnni2<scalar_t>(
             Btmp,
             v + (seq_k_start_loc + n) * v_strideN + head_kv_id * v_strideH,
             n_size,
@@ -246,11 +255,10 @@ inline void resize_indices(at::Tensor& indices, int num_seqs, int max_seqlen_q) 
 }
 
 //==============================================================================
-// Shared fmha_fwd_varlen_impl template
+// fmha_fwd_varlen_kernel for AVX512
 //==============================================================================
 
-template <typename PackPolicy>
-void fmha_fwd_varlen_impl_template(
+inline void fmha_fwd_varlen_kernel(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
@@ -314,7 +322,7 @@ void fmha_fwd_varlen_impl_template(
     int sz = resize_buffer<BLOCK_M, BLOCK_N>(buffer, num_threads, head_size, head_size_v);
     resize_indices<BLOCK_M>(indices, num_seqs, max_seqlen_q);
 
-    flash_attn_varlen_kernel_impl<scalar_t, BLOCK_M, BLOCK_N, PackPolicy>(
+    flash_attn_varlen_kernel_impl<scalar_t, BLOCK_M, BLOCK_N>(
         out.data_ptr<scalar_t>(),
         q.data_ptr<scalar_t>(),
         k.data_ptr<scalar_t>(),

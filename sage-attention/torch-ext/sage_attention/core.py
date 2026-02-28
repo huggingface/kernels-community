@@ -16,6 +16,7 @@ limitations under the License.
 
 import torch
 import torch.nn.functional as F
+import warnings
 
 from ._ops import ops
 
@@ -25,9 +26,40 @@ from .quant import sub_mean
 from .quant import per_channel_fp8
 from .quant_per_thread import per_thread_int8 as per_thread_int8_triton
 
-from typing import Any, List, Literal, Optional, Tuple, Union
-import warnings
+try:
+    from .sm80_compile import (
+        qk_int8_sv_f16_accum_f32_attn as sm80_qk_int8_sv_f16_accum_f32_attn,
+        qk_int8_sv_f16_accum_f16_fuse_v_mean_attn as sm80_qk_int8_sv_f16_accum_f16_fuse_v_mean_attn,
+        qk_int8_sv_f16_accum_f16_attn as sm80_qk_int8_sv_f16_accum_f16_attn,
+        qk_int8_sv_f16_accum_f16_attn_inst_buf as sm80_qk_int8_sv_f16_accum_f16_attn_inst_buf,
+    )
+    SM80_ENABLED = True
+except Exception as e:
+    SM80_ENABLED = False
+    warnings.warn(f"Failed to load SM80 SageAttention kernels: {e}")
 
+try:
+    from .sm89_compile import (
+        qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn as sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn,
+        qk_int8_sv_f8_accum_f32_fuse_v_scale_attn as sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn,
+        qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf as sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf,
+        qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf as sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf,
+    )
+    SM89_ENABLED = True
+except Exception as e:
+    SM89_ENABLED = False
+    warnings.warn(f"Failed to load SM89 SageAttention kernels: {e}")
+
+try:
+    from .sm90_compile import (
+        qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90 as sm90_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90,
+    )
+    SM90_ENABLED = True
+except Exception as e:
+    SM90_ENABLED = False
+    warnings.warn(f"Failed to load SM90 SageAttention kernels: {e}")
+
+from typing import Any, List, Literal, Optional, Tuple, Union
 
 import subprocess
 import re
@@ -116,9 +148,13 @@ def sageattn(
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
     - All tensors must be on the same cuda device.
     """
-    print("########tensor_layout", tensor_layout)
     arch = get_cuda_arch_versions()[q.device.index]
     if arch == "sm80":
+        if not SM80_ENABLED:
+            raise RuntimeError(
+                "SM80 SageAttention kernels failed to load. "
+                "Ensure the kernel was compiled for SM80 (Ampere)."
+            )
         return sageattn_qk_int8_pv_fp16_cuda(
             q,
             k,
@@ -130,6 +166,11 @@ def sageattn(
             pv_accum_dtype="fp32",
         )
     elif arch == "sm89":
+        if not SM89_ENABLED:
+            raise RuntimeError(
+                "SM89 SageAttention kernels failed to load. "
+                "Ensure the kernel was compiled for SM89 (Ada Lovelace)."
+            )
         return sageattn_qk_int8_pv_fp8_cuda(
             q,
             k,
@@ -141,6 +182,11 @@ def sageattn(
             pv_accum_dtype="fp32+fp16",
         )
     elif arch == "sm90":
+        if not SM90_ENABLED:
+            raise RuntimeError(
+                "SM90 SageAttention kernels failed to load. "
+                "Ensure the kernel was compiled for SM90 (Hopper)."
+            )
         return sageattn_qk_int8_pv_fp8_cuda_sm90(
             q,
             k,
@@ -152,6 +198,11 @@ def sageattn(
             pv_accum_dtype="fp32+fp32",
         )
     elif arch == "sm120":
+        if not SM89_ENABLED:
+            raise RuntimeError(
+                "SM89 SageAttention kernels failed to load. "
+                "SM120 (Blackwell) uses SM89 kernels; ensure they were compiled."
+            )
         return sageattn_qk_int8_pv_fp8_cuda(
             q,
             k,
@@ -166,8 +217,6 @@ def sageattn(
     else:
         raise ValueError(f"Unsupported CUDA architecture: {arch}")
 
-
-@torch.compiler.disable
 def sageattn_qk_int8_pv_fp16_cuda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -363,7 +412,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
 
     if pv_accum_dtype == "fp32":
         v = v.to(torch.float16)
-        lse = ops.qk_int8_sv_f16_accum_f32_attn(
+        lse = sm80_qk_int8_sv_f16_accum_f32_attn(
             q_int8,
             k_int8,
             v,
@@ -379,7 +428,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
     elif pv_accum_dtype == "fp16":
         if smooth_v:
             smoothed_v, vm = sub_mean(v, tensor_layout=tensor_layout)
-            lse = ops.qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(
+            lse = sm80_qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(
                 q_int8,
                 k_int8,
                 smoothed_v,
@@ -395,7 +444,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
             )
         else:
             v = v.to(torch.float16)
-            lse = ops.qk_int8_sv_f16_accum_f16_attn(
+            lse = sm80_qk_int8_sv_f16_accum_f16_attn(
                 q_int8,
                 k_int8,
                 v,
@@ -410,7 +459,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
             )
     elif pv_accum_dtype == "fp16+fp32":
         v = v.to(torch.float16)
-        lse = ops.qk_int8_sv_f16_accum_f16_attn_inst_buf(
+        lse = sm80_qk_int8_sv_f16_accum_f16_attn_inst_buf(
             q_int8,
             k_int8,
             v,
@@ -438,8 +487,6 @@ def sageattn_qk_int8_pv_fp16_cuda(
     else:
         return o
 
-
-@torch.compiler.disable
 def sageattn_qk_int8_pv_fp8_cuda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -635,10 +682,9 @@ def sageattn_qk_int8_pv_fp8_cuda(
     v_fp8, v_scale, vm = per_channel_fp8(
         v, tensor_layout=tensor_layout, scale_max=quant_v_scale_max, smooth_v=smooth_v
     )
-    print("before kernel call")
     if pv_accum_dtype == "fp32":
         if smooth_v:
-            lse = ops.qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(
+            lse = sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn(
                 q_int8,
                 k_int8,
                 v_fp8,
@@ -655,7 +701,7 @@ def sageattn_qk_int8_pv_fp8_cuda(
             )
             torch.cuda.synchronize()
         else:
-            lse = ops.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(
+            lse = sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(
                 q_int8,
                 k_int8,
                 v_fp8,
@@ -671,7 +717,7 @@ def sageattn_qk_int8_pv_fp8_cuda(
             )
             torch.cuda.synchronize()
     elif pv_accum_dtype == "fp32+fp32":
-        lse = ops.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
+        lse = sm89_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
             q_int8,
             k_int8,
             v_fp8,
@@ -687,7 +733,7 @@ def sageattn_qk_int8_pv_fp8_cuda(
         )
         torch.cuda.synchronize()
     elif pv_accum_dtype == "fp32+fp16":
-        lse = ops.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
+        lse = sm89_qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
             q_int8,
             k_int8,
             v_fp8,
@@ -703,7 +749,6 @@ def sageattn_qk_int8_pv_fp8_cuda(
         )
         torch.cuda.synchronize()
     o = o[..., :head_dim_og]
-    print("after kernel call")
     if return_lse:
         return (
             o,
@@ -715,7 +760,6 @@ def sageattn_qk_int8_pv_fp8_cuda(
         return o
 
 
-@torch.compiler.disable
 def sageattn_qk_int8_pv_fp8_cuda_sm90(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -926,7 +970,7 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
 
     if pv_accum_dtype == "fp32":
         raise NotImplementedError("Please use pv_accum_dtype='fp32+fp32' for sm90.")
-        lse = ops.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(
+        lse = sm90_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(
             q_int8,
             k_int8,
             v_fp8,
@@ -941,7 +985,7 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
             _return_lse,
         )
     elif pv_accum_dtype == "fp32+fp32":
-        lse = ops.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90(
+        lse = sm90_qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90(
             q_int8,
             k_int8,
             v_fp8,
