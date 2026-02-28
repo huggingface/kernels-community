@@ -2,7 +2,7 @@
   description = "Flake for flash-attn kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/v0.12.1";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
