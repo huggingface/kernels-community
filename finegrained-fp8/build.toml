@@ -1,5 +1,6 @@
 [general]
 name = "finegrained-fp8"
+license = "Apache-2.0"
 backends = [
     "cuda",
     "rocm",
