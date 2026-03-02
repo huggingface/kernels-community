@@ -1,0 +1,24 @@
+name: PR Comment Build Bot
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  handle-comment:
+    if: ${{ github.event.issue.pull_request && startsWith(github.event.comment.body, '/kernel-bot') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Handle /kernel-bot command
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 .github/scripts/pr_comment_kernel_bot.py
