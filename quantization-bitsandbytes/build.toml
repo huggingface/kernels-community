@@ -1,5 +1,6 @@
 [general]
 name = "quantization-bitsandbytes"
+license = "MIT"
 version = 1
 backends = ["cpu"]
 

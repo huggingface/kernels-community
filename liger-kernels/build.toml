@@ -1,5 +1,6 @@
 [general]
 name = "liger_kernels"
+license = "BSD-2-Clause"
 backends = [
     "cuda",
     "rocm",

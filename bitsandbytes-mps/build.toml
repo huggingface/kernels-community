@@ -1,5 +1,6 @@
 [general]
 name = "bitsandbytes-mps"
+license = "MIT"
 backends = ["metal"]
 version = 1
 
