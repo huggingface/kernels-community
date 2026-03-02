@@ -35,14 +35,29 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Validate PR number
+        if: ${{ inputs.pr_number != '' }}
+        id: validate-pr-number
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -eu
+          case "$PR_NUMBER" in
+            ''|*[!0-9]*)
+              echo "Invalid pr_number input: must be numeric"
+              exit 1
+              ;;
+          esac
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
       - name: Checkout PR branch
         if: ${{ inputs.pr_number != '' }}
         uses: actions/checkout@v6
         with:
-          ref: refs/pull/${{ inputs.pr_number }}/head
+          ref: refs/pull/${{ steps.validate-pr-number.outputs.pr_number }}/head
           fetch-depth: 0
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@d96bc962e61b3049ce8128d03d57a1144fa96539
         with:
           extra-conf: |
             max-jobs = 2
@@ -60,9 +75,10 @@ jobs:
 
       - name: Validate kernel directory
         id: validate
+        env:
+          KERNEL_INPUT: ${{ inputs.kernel_name }}
         run: |
           set -eu
-          KERNEL_INPUT="${{ inputs.kernel_name }}"
           if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release" "${KERNEL_INPUT}: manual dispatch"); then
             echo "kernel=$KERNEL" >> "$GITHUB_OUTPUT"
           else
@@ -79,8 +95,8 @@ jobs:
       - name: Upload kernel
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
           set -eu
           KERNEL="${{ steps.validate.outputs.kernel }}"
-          TARGET_BRANCH="${{ inputs.target_branch }}"
           ( cd "$KERNEL" && nix run .#kernels -- upload --repo-id "kernels-community/$KERNEL" --branch "$TARGET_BRANCH" . )
