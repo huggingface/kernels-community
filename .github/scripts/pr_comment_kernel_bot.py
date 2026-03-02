@@ -233,11 +233,10 @@ def main():
             },
         }
         try:
-            # TODO: actually dispatch the workflow. For now, just simulate success.
-            # github_api_request(dispatch_url, token, method="POST", data=dispatch_body)
             print(
-                f"Simulating dispatch for kernel `{kernel_name}` to branch `{target_branch}`"
+                f"Dispatching workflow for kernel `{kernel_name}` to branch `{target_branch}`"
             )
+            github_api_request(dispatch_url, token, method="POST", data=dispatch_body)
             succeeded.append(kernel_name)
         except urllib.error.HTTPError as e:
             err_text = e.read().decode("utf-8", errors="replace")
