@@ -83,4 +83,4 @@ jobs:
           set -eu
           KERNEL="${{ steps.validate.outputs.kernel }}"
           TARGET_BRANCH="${{ inputs.target_branch }}"
-          ( cd "$KERNEL" && nix run .#kernels -- upload --repo_id "kernels-community/$KERNEL" --branch "$TARGET_BRANCH" . )
+          ( cd "$KERNEL" && nix run .#kernels -- upload --repo-id "kernels-community/$KERNEL" --branch "$TARGET_BRANCH" . )
