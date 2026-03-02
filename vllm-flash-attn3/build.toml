@@ -6,6 +6,10 @@ backends = ["cuda"]
 [general.cuda]
 minver = "12.8"
 
+
+[general.hub]
+repo-id = "kernels-community/vllm-flash-attn3"
+
 [torch]
 src = [
     "torch-ext/pytorch_shim.h",

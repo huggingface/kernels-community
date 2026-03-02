@@ -7,6 +7,10 @@ backends = [
     "cpu",
 ]
 
+
+[general.hub]
+repo-id = "kernels-community/megablocks"
+
 [torch]
 src = [
     "torch-ext/torch_binding.cpp",

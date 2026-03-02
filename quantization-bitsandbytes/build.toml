@@ -3,6 +3,10 @@ name = "quantization-bitsandbytes"
 version = 1
 backends = ["cpu"]
 
+
+[general.hub]
+repo-id = "kernels-community/quantization-bitsandbytes"
+
 [torch]
 src = ["torch-ext/torch_binding.cpp"]
 

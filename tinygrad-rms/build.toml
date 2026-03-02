@@ -3,6 +3,10 @@ name = "tinygrad-rms"
 version = 1
 backends = ["cuda"]
 
+
+[general.hub]
+repo-id = "kernels-community/tinygrad-rms"
+
 [torch]
 src = [
     "torch-ext/torch_binding.cpp",

@@ -6,6 +6,10 @@ backends = ["cuda"]
 [general.cuda]
 minver = "12.8"
 
+
+[general.hub]
+repo-id = "kernels-community/flash-attn3"
+
 [torch]
 src = [
     "flash-attn/flash_api.cpp",

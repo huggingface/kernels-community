@@ -3,6 +3,10 @@ name = "metal_flash_sdpa"
 version = 1
 backends = ["metal"]
 
+
+[general.hub]
+repo-id = "kernels-community/metal-flash-sdpa"
+
 [torch]
 src = [
     "torch-ext/torch_binding.cpp",

@@ -3,6 +3,10 @@ name = "deformable-detr"
 version = 1
 backends = ["cuda"]
 
+
+[general.hub]
+repo-id = "kernels-community/deformable-detr"
+
 [torch]
 src = [
     "torch-ext/torch_binding.cpp",

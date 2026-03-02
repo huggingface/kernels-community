@@ -7,6 +7,10 @@ backends = [
     "xpu",
 ]
 
+
+[general.hub]
+repo-id = "kernels-community/flash-attn2"
+
 [torch]
 src = [
     "torch-ext/torch_binding.cpp",
