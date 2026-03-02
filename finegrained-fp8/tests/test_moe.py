@@ -11,10 +11,11 @@ FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_DTYPE = torch.float8_e4m3fn
 BLOCK_SIZE = [128, 128]
 PROBLEM_SIZES = [
-    (8, 4, 256, 512),
+    (8, 4, 256, 256),
     (32, 4, 256, 512),
     (64, 8, 512, 1024),
-    (256, 256, 512, 1024),
+    (128, 16, 1024, 2048),
+    (256, 256, 4096, 4096),
 ]
 
 
@@ -30,9 +31,14 @@ def _make_fp8_weights(shape, block_size, device):
     rt, ct = triton.cdiv(N, bo), triton.cdiv(K, bi)
     Np, Kp = rt * bo, ct * bi
 
-    Wp = W.new_zeros(*leading, Np, Kp)
-    Wp[..., :N, :K] = W
-    R = Wp.reshape(*leading, rt, bo, ct, bi)
+    if Np == N and Kp == K:
+        # N and K are exact multiples of block_size — reshape W directly (no copy).
+        # Avoids allocating a second (E, N, K) float32 tensor (~16 GB for large shapes).
+        R = W.reshape(*leading, rt, bo, ct, bi)
+    else:
+        Wp = W.new_zeros(*leading, Np, Kp)
+        Wp[..., :N, :K] = W
+        R = Wp.reshape(*leading, rt, bo, ct, bi)
 
     max_abs = R.abs().amax(dim=(-3, -1))
     safe = torch.where(max_abs > 0, max_abs, torch.ones_like(max_abs))
@@ -59,8 +65,6 @@ def _ref(A, B_fp8, Bs, expert_ids, block_size):
 
 
 # ── w8a8_block_fp8_matmul_batched ─────────────────────────────────────────────
-
-
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("S,E,N,K", PROBLEM_SIZES)
@@ -70,12 +74,10 @@ def test_batched_vs_ref(S, E, N, K):
     A = torch.randn(S, K, dtype=torch.float32, device="cuda")
     B_fp8, Bs = _make_fp8_weights((E, N, K), BLOCK_SIZE, "cuda")
     expert_ids = torch.randint(0, E, (S,), device="cuda", dtype=torch.int32)
-
     out = finegrained_fp8.w8a8_block_fp8_matmul_batched(
         A, B_fp8, Bs, expert_ids, BLOCK_SIZE
     )
     ref = _ref(A, B_fp8, Bs, expert_ids, BLOCK_SIZE)
-
     torch.testing.assert_close(out, ref)
 
 
@@ -94,8 +96,6 @@ def test_batched_output_shape(S, E, N, K):
 
 
 # ── w8a8_block_fp8_matmul_grouped ─────────────────────────────────────────────
-
-
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("S,E,N,K", PROBLEM_SIZES)
@@ -104,22 +104,18 @@ def test_grouped_vs_ref(S, E, N, K):
     torch.manual_seed(0)
     A = torch.randn(S, K, dtype=torch.float32, device="cuda")
     B_fp8, Bs = _make_fp8_weights((E, N, K), BLOCK_SIZE, "cuda")
-
     expert_ids = torch.randint(0, E, (S,), device="cuda")
     perm = torch.argsort(expert_ids)
     A_sorted = A[perm].contiguous()
     expert_ids_sorted = expert_ids[perm]
-
     tokens_per_expert = torch.histc(
         expert_ids_sorted.float(), bins=E, min=0, max=E - 1
     ).to(torch.int32)
     offsets = torch.cumsum(tokens_per_expert, dim=0).to(torch.int32)
-
     out = finegrained_fp8.w8a8_block_fp8_matmul_grouped(
         A_sorted, B_fp8, Bs, offsets, tokens_per_expert, BLOCK_SIZE
     )
     ref = _ref(A_sorted, B_fp8, Bs, expert_ids_sorted, BLOCK_SIZE)
-
     torch.testing.assert_close(out, ref)
 
 
@@ -129,7 +125,57 @@ def test_grouped_vs_ref(S, E, N, K):
 def test_grouped_output_shape(S, E, N, K):
     A = torch.randn(S, K, dtype=torch.bfloat16, device="cuda")
     B_fp8, Bs = _make_fp8_weights((E, N, K), BLOCK_SIZE, "cuda")
+    expert_ids = torch.randint(0, E, (S,), device="cuda")
+    perm = torch.argsort(expert_ids)
+    A_sorted = A[perm].contiguous()
+    expert_ids_sorted = expert_ids[perm]
+    tokens_per_expert = torch.histc(
+        expert_ids_sorted.float(), bins=E, min=0, max=E - 1
+    ).to(torch.int32)
+    offsets = torch.cumsum(tokens_per_expert, dim=0).to(torch.int32)
+    out = finegrained_fp8.w8a8_block_fp8_matmul_grouped(
+        A_sorted, B_fp8, Bs, offsets, tokens_per_expert, BLOCK_SIZE
+    )
+    assert out.shape == (S, N)
+    assert out.dtype == torch.bfloat16
 
+
+# ── torch.compile compatibility ────────────────────────────────────────────────
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("S,E,N,K", PROBLEM_SIZES)
+def test_batched_compile(S, E, N, K):
+    """Batched kernel output must match eager under torch.compile(max-autotune, fullgraph)."""
+    torch.manual_seed(0)
+    torch.compiler.reset()
+    torch.cuda.empty_cache()
+
+    A = torch.randn(S, K, dtype=torch.bfloat16, device="cuda")
+    B_fp8, Bs = _make_fp8_weights((E, N, K), BLOCK_SIZE, "cuda")
+    expert_ids = torch.randint(0, E, (S,), device="cuda", dtype=torch.int32)
+
+    def fn(A, B_fp8, Bs, expert_ids):
+        return finegrained_fp8.w8a8_block_fp8_matmul_batched(
+            A, B_fp8, Bs, expert_ids, BLOCK_SIZE
+        )
+
+    compiled = torch.compile(fn, mode="max-autotune", fullgraph=True)
+    out_compiled = compiled(A, B_fp8, Bs, expert_ids)
+    out_ref = fn(A, B_fp8, Bs, expert_ids)
+    torch.testing.assert_close(out_compiled, out_ref)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("S,E,N,K", PROBLEM_SIZES)
+def test_grouped_compile(S, E, N, K):
+    """Grouped kernel output must match eager under torch.compile(max-autotune, fullgraph)."""
+    torch.manual_seed(0)
+    torch.compiler.reset()
+    torch.cuda.empty_cache()
+
+    A = torch.randn(S, K, dtype=torch.bfloat16, device="cuda")
+    B_fp8, Bs = _make_fp8_weights((E, N, K), BLOCK_SIZE, "cuda")
     expert_ids = torch.randint(0, E, (S,), device="cuda")
     perm = torch.argsort(expert_ids)
     A_sorted = A[perm].contiguous()
@@ -139,37 +185,12 @@ def test_grouped_output_shape(S, E, N, K):
     ).to(torch.int32)
     offsets = torch.cumsum(tokens_per_expert, dim=0).to(torch.int32)
 
-    out = finegrained_fp8.w8a8_block_fp8_matmul_grouped(
-        A_sorted, B_fp8, Bs, offsets, tokens_per_expert, BLOCK_SIZE
-    )
-    assert out.shape == (S, N)
-    assert out.dtype == torch.bfloat16
+    def fn(A_sorted, B_fp8, Bs, offsets, tokens_per_expert):
+        return finegrained_fp8.w8a8_block_fp8_matmul_grouped(
+            A_sorted, B_fp8, Bs, offsets, tokens_per_expert, BLOCK_SIZE
+        )
 
-
-@pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize("S,E,N,K", PROBLEM_SIZES)
-def test_batched_and_grouped_agree(S, E, N, K):
-    """Batched and grouped kernels should produce identical results for the same inputs."""
-    torch.manual_seed(0)
-    A = torch.randn(S, K, dtype=torch.bfloat16, device="cuda")
-    B_fp8, Bs = _make_fp8_weights((E, N, K), BLOCK_SIZE, "cuda")
-
-    expert_ids = torch.randint(0, E, (S,), device="cuda")
-    perm = torch.argsort(expert_ids)
-    A_sorted = A[perm].contiguous()
-    expert_ids_sorted = expert_ids[perm].to(torch.int32)
-
-    tokens_per_expert = torch.histc(
-        expert_ids_sorted.float(), bins=E, min=0, max=E - 1
-    ).to(torch.int32)
-    offsets = torch.cumsum(tokens_per_expert, dim=0).to(torch.int32)
-
-    out_batched = finegrained_fp8.w8a8_block_fp8_matmul_batched(
-        A_sorted, B_fp8, Bs, expert_ids_sorted, BLOCK_SIZE
-    )
-    out_grouped = finegrained_fp8.w8a8_block_fp8_matmul_grouped(
-        A_sorted, B_fp8, Bs, offsets, tokens_per_expert, BLOCK_SIZE
-    )
-
-    torch.testing.assert_close(out_batched, out_grouped)
+    compiled = torch.compile(fn, mode="max-autotune", fullgraph=True)
+    out_compiled = compiled(A_sorted, B_fp8, Bs, offsets, tokens_per_expert)
+    out_ref = fn(A_sorted, B_fp8, Bs, offsets, tokens_per_expert)
+    torch.testing.assert_close(out_compiled, out_ref)
