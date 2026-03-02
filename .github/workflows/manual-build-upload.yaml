@@ -57,7 +57,7 @@ jobs:
           ref: refs/pull/${{ steps.validate-pr-number.outputs.pr_number }}/head
           fetch-depth: 0
 
-      - uses: DeterminateSystems/nix-installer-action@d96bc962e61b3049ce8128d03d57a1144fa96539
+      - uses: DeterminateSystems/nix-installer-action@v21
         with:
           extra-conf: |
             max-jobs = 2
