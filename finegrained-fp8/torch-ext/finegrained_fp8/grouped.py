@@ -31,8 +31,8 @@ def w8a8_block_fp8_grouped_mm_kernel(
     N,
     K,
     # Block size for block-wise quantization
-    group_n,
-    group_k,
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
     # Strides
     stride_am,
     stride_ak,
@@ -98,14 +98,18 @@ def w8a8_block_fp8_grouped_mm_kernel(
     offs_am_safe = offs_global_m % S
 
     a_ptrs = A + offs_am_safe[:, None] * stride_am + offs_k[None, :] * stride_ak
+    # Cast expert_id to int64 to prevent int32 overflow when computing
+    # expert_id * stride_Eb (e.g. 255 * 9_437_184 > 2^31 for 256 experts of
+    # 3072×3072 FP8 weights).
+    expert_id_i64 = expert_id.to(tl.int64)
     b_ptrs = (
         B
-        + expert_id * stride_Eb
+        + expert_id_i64 * stride_Eb
         + offs_k[:, None] * stride_bk
         + offs_bn_safe[None, :] * stride_bn
     )
     offs_bsn_safe = offs_bn_safe // group_n
-    Bs_ptrs = Bs + expert_id * stride_Esb + offs_bsn_safe * stride_Bsn
+    Bs_ptrs = Bs + expert_id_i64 * stride_Esb + offs_bsn_safe * stride_Bsn
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):

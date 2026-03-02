@@ -29,8 +29,8 @@ def w8a8_block_fp8_matmul_batched_kernel(
     N,
     K,
     # Block size for block-wise quantization
-    group_n,
-    group_k,
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
     # Per-row strides
     stride_ak,
     stride_bk,
@@ -41,7 +41,7 @@ def w8a8_block_fp8_matmul_batched_kernel(
     # Batch / expert strides
     stride_Ab,  # stride between rows in A (one token per program)
     stride_Eb,  # stride between experts in B
-    stride_Cb,
+    stride_Cb,  # stride between rows in C (one token per program)
     stride_Esb,  # stride between experts in Bs
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
@@ -72,7 +72,9 @@ def w8a8_block_fp8_matmul_batched_kernel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # ---- fused act_quant (replaces: a = tl.load(a_ptrs); a_s = tl.load(As_ptrs)) ----
-        a_raw = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0).to(tl.float32)
+        a_raw = tl.load(
+            a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+        ).to(tl.float32)
         a_s = tl.max(tl.abs(a_raw)) / 448.0  # per-block scale (scalar for M=1)
         a = (a_raw / tl.maximum(a_s, 1e-12)).to(tl.float8e4nv)
         # ---- same as baseline from here ----
@@ -151,15 +153,15 @@ def _w8a8_block_fp8_matmul_batched(
         K,
         block_n,
         block_k,
-        A.stride(1),   # stride_ak
-        B.stride(2),   # stride_bk
-        B.stride(1),   # stride_bn
-        C.stride(1),   # stride_cn
+        A.stride(1),  # stride_ak
+        B.stride(2),  # stride_bk
+        B.stride(1),  # stride_bn
+        C.stride(1),  # stride_cn
         Bs.stride(2),  # stride_Bs_k
         Bs.stride(1),  # stride_Bs_n
-        A.stride(0),   # stride_Ab
-        B.stride(0),   # stride_Eb
-        C.stride(0),   # stride_Cb
+        A.stride(0),  # stride_Ab
+        B.stride(0),  # stride_Eb
+        C.stride(0),  # stride_Cb
         Bs.stride(0),  # stride_Esb
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=block_n,
@@ -193,4 +195,6 @@ def w8a8_block_fp8_matmul_batched(
     Returns:
         Output tensor ``[S, N]`` in the same dtype as ``A``.
     """
-    return torch.ops.finegrained_fp8.w8a8_block_fp8_matmul_batched(A, B, Bs, expert_ids, block_size)
+    return torch.ops.finegrained_fp8.w8a8_block_fp8_matmul_batched(
+        A, B, Bs, expert_ids, block_size
+    )
