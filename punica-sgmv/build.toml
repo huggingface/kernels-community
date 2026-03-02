@@ -3,6 +3,10 @@ name = "punica-sgmv"
 version = 1
 backends = ["cuda"]
 
+
+[general.hub]
+repo-id = "kernels-community/punica-sgmv"
+
 [torch]
 src = [
     "torch-ext/torch_binding.cpp",

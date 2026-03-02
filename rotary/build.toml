@@ -6,6 +6,10 @@ backends = [
     "xpu",
 ]
 
+
+[general.hub]
+repo-id = "kernels-community/rotary"
+
 [torch]
 src = ["torch-ext/torch_binding.cpp"]
 

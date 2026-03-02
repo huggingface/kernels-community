@@ -3,6 +3,10 @@ name = "activation"
 version = 1
 backends = ["cuda", "metal"]
 
+
+[general.hub]
+repo-id = "kernels-community/activation"
+
 [torch]
 src = [
     "torch-ext/torch_binding.cpp",

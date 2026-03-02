@@ -6,6 +6,10 @@ backends = ["cuda"]
 [general.cuda]
 maxver = "12.9"
 
+
+[general.hub]
+repo-id = "kernels-community/quantization-eetq"
+
 [torch]
 src = [
     "torch-ext/torch_binding.cpp",

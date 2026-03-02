@@ -3,6 +3,10 @@ backends = ["cuda"]
 name = "flash-mla"
 version = 1
 
+
+[general.hub]
+repo-id = "kernels-community/flash-mla"
+
 [torch]
 src = [
   "torch-ext/torch_binding.cpp",
