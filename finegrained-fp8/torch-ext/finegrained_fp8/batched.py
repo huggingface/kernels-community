@@ -54,10 +54,14 @@ def w8a8_block_fp8_matmul_batched_kernel(
     # Advance base pointers to this token's activation row and its expert's
     # weight / scale slice. No pre-gather of weights needed (like in non-fp8 impls)
     expert_id = tl.load(ExpertIds + batch_id)
+    # Cast expert_id to int64 to prevent int32 overflow when computing
+    # expert_id * stride_Eb (e.g. 255 * 9_437_184 > 2^31 for 256 experts of
+    # 3072×3072 FP8 weights).
+    expert_id_i64 = expert_id.to(tl.int64)
     A = A + batch_id * stride_Ab
-    B = B + expert_id * stride_Eb
+    B = B + expert_id_i64 * stride_Eb
     C = C + batch_id * stride_Cb
-    Bs = Bs + expert_id * stride_Esb
+    Bs = Bs + expert_id_i64 * stride_Esb
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
