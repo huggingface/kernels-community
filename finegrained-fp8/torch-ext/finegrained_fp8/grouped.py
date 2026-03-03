@@ -171,6 +171,7 @@ def _w8a8_block_fp8_matmul_grouped(
     if block_n == N and block_k == K:
         block_n, block_k = 128, 128
 
+    # we specifically require block-aligned shapes to keep the kernel simpler
     assert N % block_n == 0, f"N ({N}) must be divisible by block_n ({block_n})"
     assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
 
