@@ -24,4 +24,4 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python scripts/check_kernel_freshness.py --verbose
+          python scripts/check_kernel_freshness.py
