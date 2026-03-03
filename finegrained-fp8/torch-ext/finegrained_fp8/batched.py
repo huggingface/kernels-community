@@ -63,8 +63,6 @@ def w8a8_block_fp8_matmul_batched_kernel(
 
     offs_bn = pid_n * block_n + tl.arange(0, block_n)
     offs_k = tl.arange(0, block_k)
-    # M=1: broadcast the single activation row to BLOCK_SIZE_M identical rows
-    # so tl.dot gets the required (BLOCK_SIZE_M, block_k) shape.
     a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_ak
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
@@ -73,7 +71,7 @@ def w8a8_block_fp8_matmul_batched_kernel(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, block_n), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, block_k)):
-        # ---- fused act_quant (replaces: a = tl.load(a_ptrs); a_s = tl.load(As_ptrs)) ----
+        # ---- fused fp8_act_quant ----
         a_raw = tl.load(a_ptrs).to(tl.float32)
         a_s = tl.max(tl.abs(a_raw)) / 448.0  # per-block scale (scalar for M=1)
         a = (a_raw / tl.maximum(a_s, 1e-12)).to(tl.float8e4nv)

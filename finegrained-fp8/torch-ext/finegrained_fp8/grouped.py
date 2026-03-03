@@ -70,7 +70,11 @@ def w8a8_block_fp8_grouped_mm_kernel(
         is_left = mid_val <= pid_m
         lo = tl.where(is_left, mid + 1, lo)
         hi = tl.where(is_left, hi, mid)
-    expert_id = lo
+
+    # Cast expert_id to int64 to prevent int32 overflow when computing
+    # expert_id * stride_Eb (e.g. 255 * 9_437_184 > 2^31 for 256 experts of
+    # 3072×3072 FP8 weights).
+    expert_id = lo.to(tl.int64)
 
     prev_eid = tl.maximum(expert_id - 1, 0)
 
@@ -90,32 +94,26 @@ def w8a8_block_fp8_grouped_mm_kernel(
     offs_k = tl.arange(0, block_k)
 
     a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    # Cast expert_id to int64 to prevent int32 overflow when computing
-    # expert_id * stride_Eb (e.g. 255 * 9_437_184 > 2^31 for 256 experts of
-    # 3072×3072 FP8 weights).
-    expert_id_i64 = expert_id.to(tl.int64)
     b_ptrs = (
         B
-        + expert_id_i64 * stride_Eb
+        + expert_id * stride_Eb
         + offs_k[:, None] * stride_bk
         + offs_bn[None, :] * stride_bn
     )
     offs_bsn = offs_bn // block_n
-    Bs_ptrs = Bs + expert_id_i64 * stride_Esb + offs_bsn * stride_Bsn
+    Bs_ptrs = Bs + expert_id * stride_Esb + offs_bsn * stride_Bsn
 
     accumulator = tl.zeros((BLOCK_SIZE_M, block_n), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, block_k)):
-        # ---- fused act_quant (replaces: a = tl.load(a_ptrs); a_s = tl.load(As_ptrs)) ----
+        # ---- fused fp8_act_quant ----
         a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
         a_s = tl.max(tl.abs(a_raw), axis=1) / 448.0  # per-row scale  (BLOCK_SIZE_M,)
         a = (a_raw / tl.maximum(a_s[:, None], 1e-12)).to(tl.float8e4nv)
         # ---- same as baseline from here ----
         b = tl.load(b_ptrs)
-
         k_start = k * block_k
         offs_ks = k_start // block_k
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bsk)
-
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += block_k * stride_ak
         b_ptrs += block_k * stride_bk
