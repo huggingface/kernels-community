@@ -23,16 +23,13 @@ def w8a8_block_fp8_grouped_mm_kernel(
     A,  # (S, K)  raw BF16/FP16 activations, sorted/grouped by expert id
     B,  # (E, N, K) FP8 weight matrices
     C,  # (S, N)  output
-    Bs,  # (E, N // group_n, K // group_k) weight scales
+    Bs,  # (E, N // block_n, K // block_k) weight scales
     Offsets,  # (E,) int32 — cumulative row-end per expert
     TileOffsets,  # (E,) int32 — cumulative tile-end per expert
     # Shape
     S,
     N,
     K,
-    # Block size for block-wise quantization
-    group_n: tl.constexpr,
-    group_k: tl.constexpr,
     # Strides
     stride_am,
     stride_ak,
@@ -45,15 +42,13 @@ def w8a8_block_fp8_grouped_mm_kernel(
     stride_Bsk,
     stride_Bsn,
     # Meta-parameters
-    NUM_EXPERTS: tl.constexpr,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    pid_m = pid // num_pid_n
-    pid_n = pid % num_pid_n
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
 
     # Exit early for programs beyond the actual tile count.
     total_tiles = tl.load(TileOffsets + NUM_EXPERTS - 1)
@@ -91,13 +86,10 @@ def w8a8_block_fp8_grouped_mm_kernel(
     row_mask = offs_am < M_expert
     offs_global_m = expert_start + offs_am
 
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_bn_safe = offs_bn % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_bn = pid_n * block_n + tl.arange(0, block_n)
+    offs_k = tl.arange(0, block_k)
 
-    offs_am_safe = offs_global_m % S
-
-    a_ptrs = A + offs_am_safe[:, None] * stride_am + offs_k[None, :] * stride_ak
+    a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     # Cast expert_id to int64 to prevent int32 overflow when computing
     # expert_id * stride_Eb (e.g. 255 * 9_437_184 > 2^31 for 256 experts of
     # 3072×3072 FP8 weights).
@@ -106,33 +98,27 @@ def w8a8_block_fp8_grouped_mm_kernel(
         B
         + expert_id_i64 * stride_Eb
         + offs_k[:, None] * stride_bk
-        + offs_bn_safe[None, :] * stride_bn
+        + offs_bn[None, :] * stride_bn
     )
-    offs_bsn_safe = offs_bn_safe // group_n
-    Bs_ptrs = Bs + expert_id_i64 * stride_Esb + offs_bsn_safe * stride_Bsn
+    offs_bsn = offs_bn // block_n
+    Bs_ptrs = Bs + expert_id_i64 * stride_Esb + offs_bsn * stride_Bsn
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    accumulator = tl.zeros((BLOCK_SIZE_M, block_n), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, block_k)):
         # ---- fused act_quant (replaces: a = tl.load(a_ptrs); a_s = tl.load(As_ptrs)) ----
-        a_raw = tl.load(
-            a_ptrs,
-            mask=row_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=0.0,
-        ).to(tl.float32)
+        a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
         a_s = tl.max(tl.abs(a_raw), axis=1) / 448.0  # per-row scale  (BLOCK_SIZE_M,)
-        # clamp denominator so masked all-zero rows don't produce NaN
-        # (their a_s multiplier is 0 anyway, so the output row is correct)
         a = (a_raw / tl.maximum(a_s[:, None], 1e-12)).to(tl.float8e4nv)
         # ---- same as baseline from here ----
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        b = tl.load(b_ptrs)
 
-        k_start = k * BLOCK_SIZE_K
-        offs_ks = k_start // group_k
+        k_start = k * block_k
+        offs_ks = k_start // block_k
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bsk)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        a_ptrs += block_k * stride_ak
+        b_ptrs += block_k * stride_bk
 
     if C.dtype.element_ty == tl.bfloat16:
         c = accumulator.to(tl.bfloat16)
@@ -142,7 +128,7 @@ def w8a8_block_fp8_grouped_mm_kernel(
         c = accumulator.to(tl.float32)
 
     c_ptrs = C + stride_cm * offs_global_m[:, None] + stride_cn * offs_bn[None, :]
-    c_mask = row_mask[:, None] & (offs_bn[None, :] < N)
+    c_mask = row_mask[:, None]
     tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -164,23 +150,25 @@ def _w8a8_block_fp8_matmul_grouped(
     ``offsets``) to build the per-expert tile schedule inside the kernel.
     """
     assert A.ndim == 2, "A must be (S, K)"
-    assert A.is_contiguous()
+    assert A.is_contiguous(), "A must be contiguous"
 
     assert B.ndim == 3, "B must be (E, N, K)"
-    assert B.is_contiguous()
+    assert B.is_contiguous(), "B must be contiguous"
 
-    assert tokens_per_expert.is_contiguous()
-    assert offsets.is_contiguous()
-    assert Bs.is_contiguous()
+    assert A.shape[1] == B.shape[2], "K dimension mismatch between A and B"
+    assert tokens_per_expert.is_contiguous(), "tokens_per_expert must be contiguous"
+    assert offsets.is_contiguous(), "offsets must be contiguous"
+    assert Bs.is_contiguous(), "Bs must be contiguous"
 
     if block_size is None:
         block_n, block_k = 128, 128
     else:
-        assert len(block_size) == 2
         block_n, block_k = block_size[0], block_size[1]
 
     S, K = A.shape
     E, N, _ = B.shape
+    assert N % block_n == 0, f"N ({N}) must be divisible by block_n ({block_n})"
+    assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
     C = A.new_empty(S, N)
 
     # Adaptive BLOCK_SIZE_M: match tile to average tokens per expert.
@@ -193,7 +181,7 @@ def _w8a8_block_fp8_matmul_grouped(
     # exit immediately via the early-return guard inside the kernel.
     max_M_tiles = triton.cdiv(S, BLOCK_SIZE_M) + E
 
-    grid = (max_M_tiles * triton.cdiv(N, block_n),)
+    grid = (max_M_tiles, triton.cdiv(N, block_n))
     wrap_triton(w8a8_block_fp8_grouped_mm_kernel)[grid](
         A,
         B,
@@ -204,8 +192,6 @@ def _w8a8_block_fp8_matmul_grouped(
         S,
         N,
         K,
-        block_n,
-        block_k,
         A.stride(0),  # stride_am
         A.stride(1),  # stride_ak
         B.stride(0),  # stride_Eb
@@ -216,10 +202,11 @@ def _w8a8_block_fp8_matmul_grouped(
         Bs.stride(0),  # stride_Esb
         Bs.stride(2),  # stride_Bsk
         Bs.stride(1),  # stride_Bsn
-        NUM_EXPERTS=E,
+        # Meta-parameters
+        block_n=block_n,
+        block_k=block_k,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=block_n,
-        BLOCK_SIZE_K=block_k,
+        NUM_EXPERTS=E,
     )
 
     return C
