@@ -17,6 +17,7 @@ PROBLEM_SIZES = [
     (128, 16, 1024, 2048, 2),
     (256, 256, 4096, 4096, 1),
 ]
+SCALE_LAYOUTS = ["block", "per_tensor_1d", "per_tensor_111"]
 
 
 def _make_experts_weights(num_experts, out_features, in_features, block_size, device):
@@ -86,17 +87,30 @@ def _ref(A, B_fp8, Bs, expert_ids, block_size):
     return out
 
 
+def _convert_scale_layout(Bs, layout: str):
+    if layout == "block":
+        return Bs
+    per_tensor = Bs[:, 0, 0].contiguous()
+    if layout == "per_tensor_1d":
+        return per_tensor
+    if layout == "per_tensor_111":
+        return per_tensor.view(-1, 1, 1).contiguous()
+    raise ValueError(f"Unsupported scale layout: {layout}")
+
+
 # ── w8a8_block_fp8_matmul_batched ─────────────────────────────────────────────
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("S,E,N,K,TOP_K", PROBLEM_SIZES)
-def test_batched_vs_ref(S, E, N, K, TOP_K):
+@pytest.mark.parametrize("scale_layout", SCALE_LAYOUTS)
+def test_batched_vs_ref(S, E, N, K, TOP_K, scale_layout):
     """Batched output should match the per-token reference (both in float32)."""
     torch.manual_seed(0)
     A, expert_ids = _make_routed_inputs(
         S, E, K, dtype=torch.float32, device="cuda", top_k=TOP_K
     )
     B_fp8, Bs = _make_experts_weights(E, N, K, BLOCK_SIZE, "cuda")
+    Bs = _convert_scale_layout(Bs, scale_layout)
     out = finegrained_fp8.w8a8_block_fp8_matmul_batched(
         A, B_fp8, Bs, expert_ids, BLOCK_SIZE
     )
@@ -107,11 +121,13 @@ def test_batched_vs_ref(S, E, N, K, TOP_K):
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("S,E,N,K,TOP_K", PROBLEM_SIZES)
-def test_batched_output_shape(S, E, N, K, TOP_K):
+@pytest.mark.parametrize("scale_layout", SCALE_LAYOUTS)
+def test_batched_output_shape(S, E, N, K, TOP_K, scale_layout):
     A, expert_ids = _make_routed_inputs(
         S, E, K, dtype=torch.bfloat16, device="cuda", top_k=TOP_K
     )
     B_fp8, Bs = _make_experts_weights(E, N, K, BLOCK_SIZE, "cuda")
+    Bs = _convert_scale_layout(Bs, scale_layout)
     out = finegrained_fp8.w8a8_block_fp8_matmul_batched(
         A, B_fp8, Bs, expert_ids, BLOCK_SIZE
     )
@@ -123,13 +139,15 @@ def test_batched_output_shape(S, E, N, K, TOP_K):
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("S,E,N,K,TOP_K", PROBLEM_SIZES)
-def test_grouped_vs_ref(S, E, N, K, TOP_K):
+@pytest.mark.parametrize("scale_layout", SCALE_LAYOUTS)
+def test_grouped_vs_ref(S, E, N, K, TOP_K, scale_layout):
     """Grouped output (on sorted tokens) should match the per-token reference (both in float32)."""
     torch.manual_seed(0)
     A, expert_ids = _make_routed_inputs(
         S, E, K, dtype=torch.float32, device="cuda", top_k=TOP_K
     )
     B_fp8, Bs = _make_experts_weights(E, N, K, BLOCK_SIZE, "cuda")
+    Bs = _convert_scale_layout(Bs, scale_layout)
     perm = torch.argsort(expert_ids)
     A_sorted = A[perm].contiguous()
     expert_ids_sorted = expert_ids[perm]
@@ -147,11 +165,13 @@ def test_grouped_vs_ref(S, E, N, K, TOP_K):
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("S,E,N,K,TOP_K", PROBLEM_SIZES)
-def test_grouped_output_shape(S, E, N, K, TOP_K):
+@pytest.mark.parametrize("scale_layout", SCALE_LAYOUTS)
+def test_grouped_output_shape(S, E, N, K, TOP_K, scale_layout):
     A, expert_ids = _make_routed_inputs(
         S, E, K, dtype=torch.bfloat16, device="cuda", top_k=TOP_K
     )
     B_fp8, Bs = _make_experts_weights(E, N, K, BLOCK_SIZE, "cuda")
+    Bs = _convert_scale_layout(Bs, scale_layout)
     perm = torch.argsort(expert_ids)
     A_sorted = A[perm].contiguous()
     expert_ids_sorted = expert_ids[perm]
