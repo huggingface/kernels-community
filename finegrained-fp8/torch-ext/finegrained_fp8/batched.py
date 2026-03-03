@@ -93,7 +93,6 @@ def w8a8_block_fp8_matmul_batched_kernel(
     else:
         c = accumulator.to(tl.float32)
 
-
     offs_cm = tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * block_n + tl.arange(0, block_n)
     c_ptrs = C + offs_cm[:, None] * 0 + stride_cn * offs_cn[None, :]
@@ -126,15 +125,41 @@ def _w8a8_block_fp8_matmul_batched(
     assert expert_ids.is_contiguous(), "expert_ids must be contiguous"
     assert Bs.is_contiguous(), "Bs must be contiguous"
 
+    S, K = A.shape
+    E, N, K = B.shape
+
     if block_size is None:
         block_n, block_k = 128, 128
     else:
         block_n, block_k = block_size[0], block_size[1]
 
-    S, K = A.shape
-    _, N, _ = B.shape
+    # if we have per-tensor quantization, we use 128x128 block size for tiled matmul multiplication
+    if block_n == N and block_k == K:
+        block_n, block_k = 128, 128
+
     assert N % block_n == 0, f"N ({N}) must be divisible by block_n ({block_n})"
     assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
+
+    # For per-tensor scales, expand to block-scale shape with strides (0, 0).
+    # This is a zero-copy view; all loads for a given expert hit the same value.
+    if Bs.ndim == 1:
+        Bs = Bs.reshape(E, 1, 1).expand(E, N // block_n, K // block_k)
+    elif Bs.ndim == 3 and Bs.shape[0] == E and Bs.shape[1] == 1 and Bs.shape[2] == 1:
+        Bs = Bs.expand(E, N // block_n, K // block_k)
+    else:
+        assert Bs.ndim == 3, (
+            "Bs must be either (E,) / (E,1,1) for per-tensor scales or (E,N//block_n,K//block_k)"
+        )
+        assert Bs.shape[0] == E, (
+            f"Bs expert dim mismatch: expected {E}, got {Bs.shape[0]}"
+        )
+        assert Bs.shape[1] == N // block_n, (
+            f"Bs N-block dim mismatch: expected {N // block_n}, got {Bs.shape[1]}"
+        )
+        assert Bs.shape[2] == K // block_k, (
+            f"Bs K-block dim mismatch: expected {K // block_k}, got {Bs.shape[2]}"
+        )
+
     C = A.new_empty(S, N)
 
     BLOCK_SIZE_M = 1
