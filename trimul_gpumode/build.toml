@@ -7,4 +7,8 @@ backends = [
     "xpu",
 ]
 
+
+[general.hub]
+repo-id = "kernels-community/trimul_gpumode"
+
 [kernel]

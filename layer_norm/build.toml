@@ -4,6 +4,10 @@ license = "BSD-3-Clause"
 version = 1
 backends = ["cuda"]
 
+
+[general.hub]
+repo-id = "kernels-community/layer_norm"
+
 [torch]
 src = [
     "torch-ext/torch_binding.cpp",

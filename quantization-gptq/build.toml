@@ -4,6 +4,10 @@ license = "MIT"
 version = 1
 backends = ["cpu"]
 
+
+[general.hub]
+repo-id = "kernels-community/quantization-gptq"
+
 [torch]
 src = ["torch-ext/torch_binding.cpp"]
 
