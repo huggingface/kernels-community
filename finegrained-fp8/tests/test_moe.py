@@ -15,7 +15,9 @@ PROBLEM_SIZES = [
     (32, 4, 256, 512, 2),
     (64, 8, 512, 1024, 4),
     (128, 16, 1024, 2048, 2),
-    (256, 256, 4096, 4096, 1),
+    (256, 256, 4096, 4096, 1)
+    if torch.cuda.get_device_properties(0).total_memory >= 40 * 1024**3
+    else (256, 256, 1024, 1024, 1),
 ]
 SCALE_LAYOUTS = ["block", "per_tensor_1d", "per_tensor_111"]
 
