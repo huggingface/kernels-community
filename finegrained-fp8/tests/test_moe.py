@@ -15,6 +15,7 @@ PROBLEM_SIZES = [
     (32, 4, 256, 512, 2),
     (64, 8, 512, 1024, 4),
     (128, 16, 1024, 2048, 2),
+    # Edge case with large expert ids * strides to trigger potential int32 overflow bugs
     (256, 256, 4096, 4096, 1)
     if torch.cuda.get_device_properties(0).total_memory >= 40 * 1024**3
     else (256, 256, 1024, 1024, 1),
@@ -23,7 +24,7 @@ SCALE_LAYOUTS = ["block", "per_tensor_1d", "per_tensor_111"]
 
 
 def _make_experts_weights(num_experts, out_features, in_features, block_size, device):
-    """Create FP8 expert weights/scales with FP8Expert-compatible layouts.
+    """Create FP8 expert weights/scales with FP8Experts-compatible layouts.
 
     Returns:
         weights_fp8: [E, N, K] where E=num_experts, N=out_features, K=in_features
@@ -51,9 +52,9 @@ def _make_experts_weights(num_experts, out_features, in_features, block_size, de
 
 
 def _make_routed_inputs(S, E, K, dtype, device, top_k):
-    """Build flattened routed inputs like FP8Expert paths.
+    """Build flattened routed inputs like FP8Experts paths.
 
-    FP8Expert builds token-expert pairs from `top_k_index` by flattening
+    FP8Experts builds token-expert pairs from `top_k_index` by flattening
     `[num_tokens, num_top_k] -> [S]`, then gathers hidden states with token_idx.
     This helper reproduces that pattern while keeping total routed pairs `S`.
     """
@@ -299,7 +300,7 @@ def _assert_latency_with_tolerance(measured_ms: float, expected_ms: float):
 
 @pytest.mark.benchmark
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize("S,E,N,K,TOP_K", PROBLEM_SIZES)
+@pytest.mark.parametrize("S,E,N,K,TOP_K", EXPECTED_MS_BATCHED.keys())
 def test_batched_speedup(S, E, N, K, TOP_K):
     """Batched kernel median latency stays within ±15% of baseline."""
     A, B_fp8, Bs, expert_ids, _, _ = _bench_setup(S, E, N, K, TOP_K)
@@ -320,7 +321,7 @@ def test_batched_speedup(S, E, N, K, TOP_K):
 
 @pytest.mark.benchmark
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize("S,E,N,K,TOP_K", PROBLEM_SIZES)
+@pytest.mark.parametrize("S,E,N,K,TOP_K", EXPECTED_MS_GROUPED.keys())
 def test_grouped_speedup(S, E, N, K, TOP_K):
     """Grouped kernel median latency stays within ±15% of baseline."""
     A, B_fp8, Bs, _, offsets, tokens_per_expert = _bench_setup(S, E, N, K, TOP_K)

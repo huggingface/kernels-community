@@ -160,9 +160,12 @@ def _w8a8_block_fp8_matmul_batched(
         )
 
     C = A.new_empty(S, N)
-
-    BLOCK_SIZE_M = 1
     grid = (S, triton.cdiv(N, block_n))
+    # Adaptive BLOCK_SIZE_M: smallest power-of-2 >= M, floored at 16, capped at 128.
+    # Matches the WGMMA tile to the actual row count — smaller tiles use less
+    # register pressure and a better-matched FP8 WGMMA instruction, improving
+    # both accuracy and performance for small M (decode).
+    BLOCK_SIZE_M = min(max(triton.next_power_of_2((S + E - 1) // E), 16), 128)
     wrap_triton(w8a8_block_fp8_matmul_batched_kernel)[grid](
         A,
         B,
