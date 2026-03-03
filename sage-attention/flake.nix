@@ -2,7 +2,7 @@
   description = "Flake for Torch kernel extension";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/pytest-no-cache";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
