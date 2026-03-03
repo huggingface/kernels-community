@@ -1,5 +1,6 @@
 [general]
 name = "quantization-gptq"
+license = "MIT"
 version = 1
 backends = ["cpu"]
 
