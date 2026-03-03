@@ -11,6 +11,7 @@ jobs:
     # Only run if the PR was actually merged (not just closed)
     if: github.event.pull_request.merged == true
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x86_64-linux
