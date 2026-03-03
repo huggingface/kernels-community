@@ -1,5 +1,6 @@
 [general]
 name = "gpt_oss_metal_kernels"
+license = "MIT"
 version = 1
 backends = ["metal"]
 

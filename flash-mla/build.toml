@@ -2,6 +2,7 @@
 backends = ["cuda"]
 name = "flash-mla"
 version = 1
+license = "MIT"
 
 [torch]
 src = [

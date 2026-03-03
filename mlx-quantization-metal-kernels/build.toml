@@ -1,5 +1,6 @@
 [general]
 name = "mlx_quantization_metal_kernels"
+license = "MIT"
 backends = ["metal"]
 
 [torch]
