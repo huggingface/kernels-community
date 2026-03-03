@@ -10,6 +10,7 @@ import urllib.request
 KERNEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 ALLOWED_PERMISSIONS = {"admin", "write"}
+MAX_COMMENT_LENGTH = 1024
 
 
 def github_api_request(
@@ -60,6 +61,12 @@ def get_user_permission(api_base: str, token: str, username: str):
         if e.code == 404:
             return None
         raise
+
+
+def get_pull_request(api_base: str, token: str, issue_number: int):
+    url = f"{api_base}/pulls/{issue_number}"
+    _, body = github_api_request(url, token, method="GET")
+    return json.loads(body)
 
 
 def parse_command(comment: str):
@@ -114,37 +121,51 @@ def parse_command(comment: str):
     return kernels, branch, None
 
 
+def parse_issue_number(raw_value: str | None):
+    if raw_value is None:
+        return None
+    raw = raw_value.strip()
+    if not raw.isdigit():
+        return None
+    return int(raw)
+
+
 def main():
     token = os.environ.get("GITHUB_TOKEN")
-    event_path = os.environ.get("GITHUB_EVENT_PATH")
     repository = os.environ.get("GITHUB_REPOSITORY")
 
-    if not token or not event_path or not repository:
+    if not token or not repository:
         print("Missing required environment variables.", file=sys.stderr)
         return 1
 
-    with open(event_path, "r", encoding="utf-8") as f:
-        event = json.load(f)
+    comment = os.environ.get("COMMENT_BODY")
+    issue_number = parse_issue_number(os.environ.get("COMMENT_ISSUE_NUMBER"))
+    commenter = os.environ.get("COMMENT_AUTHOR")
+    sender_type = os.environ.get("COMMENT_SENDER_TYPE")
+    default_branch = os.environ.get("COMMENT_DEFAULT_BRANCH")
 
-    sender_type = event.get("sender", {}).get("type")
+    if (
+        comment is None
+        or issue_number is None
+        or not commenter
+        or sender_type is None
+        or not default_branch
+    ):
+        print("Missing required comment context environment variables.", file=sys.stderr)
+        return 1
+
     if sender_type == "Bot":
         print("Ignoring bot comment.")
         return 0
 
-    comment = event.get("comment", {}).get("body", "")
-    issue_number = event.get("issue", {}).get("number")
-    commenter = event.get("comment", {}).get("user", {}).get("login", "")
-    default_branch = event.get("repository", {}).get("default_branch", "main")
-
-    if not issue_number:
-        print("No issue/PR number in event payload.", file=sys.stderr)
-        return 1
+    if len(comment) > MAX_COMMENT_LENGTH:
+        print("Ignoring oversized comment payload.", file=sys.stderr)
+        return 0
+    if not comment.strip().startswith("/kernel-bot"):
+        print("Ignoring non /kernel-bot comment.")
+        return 0
 
     api_base = f"https://api.github.com/repos/{repository}"
-
-    if not commenter:
-        print("No commenter username in event payload.", file=sys.stderr)
-        return 1
 
     permission = get_user_permission(api_base, token, commenter)
     if permission not in ALLOWED_PERMISSIONS:
@@ -153,6 +174,34 @@ def main():
             token,
             issue_number,
             "I can only run builds for users with `write` or `admin` repository permission.",
+        )
+        return 0
+
+    try:
+        pull_request = get_pull_request(api_base, token, issue_number)
+    except urllib.error.HTTPError as e:
+        err_text = e.read().decode("utf-8", errors="replace")
+        print(
+            f"Failed to fetch PR metadata for #{issue_number} (HTTP {e.code}).",
+            file=sys.stderr,
+        )
+        print(err_text, file=sys.stderr)
+        try_post_issue_comment(
+            api_base,
+            token,
+            issue_number,
+            "Could not verify PR source repository, so `/kernel-bot build` was not run.",
+        )
+        return 1
+
+    head_repo = pull_request.get("head", {}).get("repo", {}) or {}
+    head_full_name = head_repo.get("full_name")
+    if head_full_name != repository:
+        try_post_issue_comment(
+            api_base,
+            token,
+            issue_number,
+            "Fork PRs are blocked for `/kernel-bot build`. Use a branch in this repository.",
         )
         return 0
 
@@ -168,6 +217,9 @@ def main():
 
     dispatch_url = f"{api_base}/actions/workflows/manual-build-upload.yaml/dispatches"
     target_branch = target_branch or f"pr-{issue_number}"
+    command_summary = f"/kernel-bot build {' '.join(kernels)}"
+    if target_branch and target_branch != f"pr-{issue_number}":
+        command_summary += f" --branch {target_branch}"
     succeeded = []
     failed = []
 
@@ -181,11 +233,10 @@ def main():
             },
         }
         try:
-            # TODO: actually dispatch the workflow. For now, just simulate success.
-            # github_api_request(dispatch_url, token, method="POST", data=dispatch_body)
             print(
-                f"Simulating dispatch for kernel `{kernel_name}` to branch `{target_branch}`"
+                f"Dispatching workflow for kernel `{kernel_name}` to branch `{target_branch}`"
             )
+            github_api_request(dispatch_url, token, method="POST", data=dispatch_body)
             succeeded.append(kernel_name)
         except urllib.error.HTTPError as e:
             err_text = e.read().decode("utf-8", errors="replace")
@@ -195,7 +246,7 @@ def main():
     lines = [
         "Build request processed.",
         "",
-        f"Command: `{comment.strip()}`",
+        f"Command: `{command_summary}`",
         f"Target branch: `{target_branch}`",
         "Triggered workflow: `manual-build-upload.yaml`",
     ]
