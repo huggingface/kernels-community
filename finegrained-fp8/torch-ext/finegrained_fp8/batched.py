@@ -15,6 +15,7 @@
 import torch
 import triton
 import triton.language as tl
+from .act_quant import fp8_act_quant
 from torch.library import triton_op, wrap_triton
 
 
@@ -46,6 +47,11 @@ def w8a8_block_fp8_matmul_batched_kernel(
     block_k: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
 ):
+    """Block-scale batched FP8 expert matmul kernel.
+
+    Each program handles one routed token row and one N-tile, looks up the
+    owning expert from ``ExpertIds``, and applies fused activation quantization.
+    """
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
@@ -97,6 +103,75 @@ def w8a8_block_fp8_matmul_batched_kernel(
     tl.store(c_ptrs, c)
 
 
+@triton.jit
+def w8a8_tensor_fp8_matmul_batched_kernel(
+    A,  # (S, K) pre-quantized FP8 activations
+    B,  # (E, N, K) FP8 weight matrices
+    C,  # (S, N) output
+    As,  # (S, 1) per-tensor activation scales
+    Bs,  # (E, 1, 1) per-tensor weight scales
+    ExpertIds,
+    S,
+    N,
+    K,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cn,
+    stride_As_b,
+    stride_Ab,
+    stride_Eb,
+    stride_Cb,
+    stride_Esb,
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    """Tensor-scale batched FP8 expert matmul kernel.
+
+    Activations are already quantized; the kernel applies per-token activation
+    scales and per-expert tensor weight scales.
+    """
+    batch_id = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    expert_id = tl.load(ExpertIds + batch_id).to(tl.int64)
+
+    A = A + batch_id * stride_Ab
+    B = B + expert_id * stride_Eb
+    C = C + batch_id * stride_Cb
+    Bs = Bs + expert_id * stride_Esb
+
+    offs_bn = pid_n * block_n + tl.arange(0, block_n)
+    offs_k = tl.arange(0, block_k)
+    a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_ak
+    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    b_s = tl.load(Bs)
+    a_s = tl.load(As + batch_id * stride_As_b)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, block_n), dtype=tl.float32)
+    for _ in range(0, tl.cdiv(K, block_k)):
+        a = tl.load(a_ptrs)
+        b = tl.load(b_ptrs)
+
+        accumulator += tl.dot(a, b) * a_s * b_s[None, :]
+        a_ptrs += block_k * stride_ak
+        b_ptrs += block_k * stride_bk
+
+    if C.dtype.element_ty == tl.bfloat16:
+        c = accumulator.to(tl.bfloat16)
+    elif C.dtype.element_ty == tl.float16:
+        c = accumulator.to(tl.float16)
+    else:
+        c = accumulator.to(tl.float32)
+
+    offs_cm = tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * block_n + tl.arange(0, block_n)
+    c_ptrs = C + offs_cm[:, None] * 0 + stride_cn * offs_cn[None, :]
+    tl.store(c_ptrs, c)
+
+
 @triton_op("finegrained_fp8::w8a8_block_fp8_matmul_batched", mutates_args=())
 def _w8a8_block_fp8_matmul_batched(
     A: torch.Tensor,
@@ -105,13 +180,11 @@ def _w8a8_block_fp8_matmul_batched(
     expert_ids: torch.Tensor,
     block_size: list[int] | None,
 ) -> torch.Tensor:
-    """Batched FP8 block-wise matmul with fused activation quantization.
+    """Internal block-scale batched FP8 matmul op.
 
-    Mirrors ``_batched_linear`` for FP8 weights: A is the raw (BF16/FP16)
-    activation matrix, B / Bs are the stacked expert weights / scales.
-    The kernel looks up ``expert_ids[batch_id]`` to address the correct expert
-    slice of B directly — no (S, N, K) weight gather is needed.
-    Activation quantization (``act_quant``) is fused into the matmul loop.
+    ``A`` is raw activations, ``B``/``Bs`` are stacked expert weights/scales,
+    and ``expert_ids`` routes each token row to one expert. Per-token
+    activation quantization is fused into the matmul loop.
     """
     assert A.ndim == 2, "A must be (S, K)"
     assert A.is_contiguous(), "A must be contiguous"
@@ -194,6 +267,81 @@ def _w8a8_block_fp8_matmul_batched(
     return C
 
 
+@triton_op("finegrained_fp8::w8a8_tensor_fp8_matmul_batched", mutates_args=())
+def _w8a8_tensor_fp8_matmul_batched(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    expert_ids: torch.Tensor,
+    block_size: list[int] | None,
+) -> torch.Tensor:
+    """Tensor-scale batched FP8 matmul for routed experts.
+
+    Activations are quantized once with per-token tensor scales and multiplied
+    with expert-selected FP8 weights using per-expert tensor scales.
+
+    Accepted ``Bs`` layouts: ``[E]`` or ``[E,1,1]``.
+    """
+    assert A.ndim == 2, "A must be (S, K)"
+    assert A.is_contiguous(), "A must be contiguous"
+
+    assert B.ndim == 3, "B must be (E, N, K)"
+    assert B.is_contiguous(), "B must be contiguous"
+
+    assert A.shape[1] == B.shape[2], "K dimension mismatch between A and B"
+    assert expert_ids.is_contiguous(), "expert_ids must be contiguous"
+    assert Bs.is_contiguous(), "Bs must be contiguous"
+
+    S, K = A.shape
+    E, N, K = B.shape
+
+    if Bs.ndim == 1:
+        Bs = Bs.reshape(E, 1, 1)
+    elif Bs.ndim == 3 and Bs.shape[0] == E and Bs.shape[1] == 1 and Bs.shape[2] == 1:
+        pass
+    else:
+        assert Bs.ndim == 3, "Tensor mode expects Bs in (E,) or (E,1,1)"
+        assert Bs.shape[0] == E and Bs.shape[1] == 1 and Bs.shape[2] == 1, (
+            f"Tensor mode expects Bs shape (E,1,1), got {tuple(Bs.shape)}"
+        )
+
+    block_n = 128 if N % 128 == 0 else N
+    block_k = 128 if K % 128 == 0 else K
+    assert N % block_n == 0, f"N ({N}) must be divisible by block_n ({block_n})"
+    assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
+
+    C = A.new_empty(S, N)
+    BLOCK_SIZE_M = min(max(triton.next_power_of_2((S + E - 1) // E), 16), 128)
+    qA, As = fp8_act_quant(A, K)
+
+    grid = (S, triton.cdiv(N, block_n))
+    wrap_triton(w8a8_tensor_fp8_matmul_batched_kernel)[grid](
+        qA,
+        B,
+        C,
+        As,
+        Bs,
+        expert_ids,
+        S,
+        N,
+        K,
+        qA.stride(1),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),
+        As.stride(0),
+        qA.stride(0),
+        B.stride(0),
+        C.stride(0),
+        Bs.stride(0),
+        block_n=block_n,
+        block_k=block_k,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+    )
+
+    return C
+
+
 def w8a8_block_fp8_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -211,7 +359,8 @@ def w8a8_block_fp8_matmul_batched(
     Args:
         A: Raw activation matrix ``[S, K]`` in bf16/fp16/fp32.
         B: Stacked expert weight tensor ``[E, N, K]`` in ``float8_e4m3fn``.
-        Bs: Stacked expert weight scales ``[E, N // block_size[0], K // block_size[1]]``.
+        Bs: Expert weight scales, accepted as ``[E, nb, kb]`` (block)
+            or ``[E]`` / ``[E,1,1]`` (per-tensor; expanded internally).
         expert_ids: Expert index per token ``[S]``, values in ``[0, E)``.
         block_size: ``[block_n, block_k]`` quantization block dimensions, e.g. ``[128, 128]``.
 
@@ -221,3 +370,52 @@ def w8a8_block_fp8_matmul_batched(
     return torch.ops.finegrained_fp8.w8a8_block_fp8_matmul_batched(
         A, B, Bs, expert_ids, block_size
     )
+
+
+def w8a8_tensor_fp8_matmul_batched(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    expert_ids: torch.Tensor,
+    block_size: list[int] | None,
+) -> torch.Tensor:
+    """Tensor-scale batched W8A8 FP8 matmul for MoE expert dispatch.
+
+    Args:
+        A: Raw activation matrix ``[S, K]`` in bf16/fp16/fp32.
+        B: Stacked expert weight tensor ``[E, N, K]`` in ``float8_e4m3fn``.
+        Bs: Per-expert tensor scales ``[E]`` or ``[E,1,1]``.
+        expert_ids: Expert index per token ``[S]``, values in ``[0, E)``.
+        block_size: Kept for API consistency; tensor path derives tile sizes from ``N`` and ``K``.
+
+    Returns:
+        Output tensor ``[S, N]`` in the same dtype as ``A``.
+    """
+    return torch.ops.finegrained_fp8.w8a8_tensor_fp8_matmul_batched(
+        A, B, Bs, expert_ids, block_size
+    )
+
+
+def w8a8_fp8_matmul_batched(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    expert_ids: torch.Tensor,
+    block_size: list[int] | None,
+) -> torch.Tensor:
+    """Unified batched W8A8 FP8 matmul dispatcher.
+
+    Dispatch rules:
+    - tensor mode when ``block_size is None``
+    - tensor mode when ``block_size == [N, K]``
+    - otherwise block mode
+
+    Returns:
+        Output tensor ``[S, N]`` in the same dtype as ``A``.
+    """
+    if block_size is None or (
+        block_size[0] == B.size(1) and block_size[1] == B.size(2)
+    ):
+        return w8a8_tensor_fp8_matmul_batched(A, B, Bs, expert_ids, block_size)
+
+    return w8a8_block_fp8_matmul_batched(A, B, Bs, expert_ids, block_size)
