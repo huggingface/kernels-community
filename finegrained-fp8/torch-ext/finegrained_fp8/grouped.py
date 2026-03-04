@@ -46,6 +46,7 @@ def w8a8_block_fp8_grouped_mm_kernel(
     block_k: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
+    NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -59,12 +60,12 @@ def w8a8_block_fp8_grouped_mm_kernel(
     # Finds the smallest e such that TileOffsets[e] > pid_m (upper_bound semantics),
     # which is the expert whose tile range contains pid_m.
     # O(log2(NUM_EXPERTS)) loads instead of the O(NUM_EXPERTS) linear scan.
-    # NUM_EXPERTS.bit_length() is ceil(log2(E))+1 for powers-of-two, giving one
+    # NUM_EXPERTS_BIT_LENGTH is ceil(log2(E))+1 for powers-of-two, giving one
     # harmless extra iteration when lo==hi; it's a compile-time constant so the
     # loop is fully unrolled by the compiler.
     lo = 0
     hi = NUM_EXPERTS
-    for _ in tl.static_range(NUM_EXPERTS.bit_length()):
+    for _ in tl.static_range(NUM_EXPERTS_BIT_LENGTH):
         mid = (lo + hi) >> 1
         mid_val = tl.load(TileOffsets + mid)
         is_left = mid_val <= pid_m
@@ -231,6 +232,7 @@ def _w8a8_block_fp8_matmul_grouped(
         block_k=block_k,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         NUM_EXPERTS=E,
+        NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
     )
 
     return C
