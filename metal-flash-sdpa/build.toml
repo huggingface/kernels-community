@@ -1,5 +1,5 @@
 [general]
-name = "metal_flash_sdpa"
+name = "metal-flash-sdpa"
 license = "Apache-2.0"
 version = 1
 backends = ["metal"]
