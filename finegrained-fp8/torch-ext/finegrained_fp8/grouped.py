@@ -48,6 +48,11 @@ def w8a8_block_fp8_grouped_mm_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
 ):
+    """Block-scale grouped FP8 expert matmul kernel.
+
+    Tokens are assumed sorted by expert. The kernel maps each M-tile to its
+    owning expert via ``TileOffsets`` and applies fused activation quantization.
+    """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
@@ -157,6 +162,11 @@ def w8a8_tensor_fp8_grouped_mm_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
 ):
+    """Tensor-scale grouped FP8 expert matmul kernel.
+
+    Uses grouped expert scheduling with pre-quantized activations plus
+    per-token activation scales and per-expert tensor weight scales.
+    """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
@@ -231,13 +241,10 @@ def _w8a8_block_fp8_matmul_grouped(
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
 ) -> torch.Tensor:
-    """Grouped FP8 block-wise matmul with fused activation quantization.
+    """Internal block-scale grouped FP8 matmul op.
 
-    Mirrors ``_grouped_linear`` / ``_grouped_mm`` for FP8 weights: A is the
-    raw (BF16/FP16) activation matrix sorted by expert, B / Bs are the stacked
-    expert weights / scales.  Activation quantization (``act_quant``) is fused
-    into the matmul loop.  ``tokens_per_expert`` is needed (in addition to
-    ``offsets``) to build the per-expert tile schedule inside the kernel.
+    ``A`` must be sorted by expert, ``offsets``/``tokens_per_expert`` define
+    grouped scheduling, and activation quantization is fused into the matmul.
     """
     assert A.ndim == 2, "A must be (S, K)"
     assert A.is_contiguous(), "A must be contiguous"
@@ -337,6 +344,13 @@ def _w8a8_tensor_fp8_matmul_grouped(
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
 ) -> torch.Tensor:
+    """Tensor-scale grouped FP8 matmul for sorted routed experts.
+
+    Uses the same grouped scheduling as block mode, but with per-token tensor
+    activation scales and per-expert tensor weight scales.
+
+    Accepted ``Bs`` layouts: ``[E]`` or ``[E,1,1]``.
+    """
     assert A.ndim == 2, "A must be (S, K)"
     assert A.is_contiguous(), "A must be contiguous"
 
@@ -422,7 +436,8 @@ def w8a8_block_fp8_matmul_grouped(
     Args:
         A: Raw activation matrix ``[S, K]`` sorted by expert, in bf16/fp16/fp32.
         B: Stacked expert weight tensor ``[E, N, K]`` in ``float8_e4m3fn``.
-        Bs: Stacked expert weight scales ``[E, N // block_size[0], K // block_size[1]]``.
+        Bs: Expert weight scales, accepted as ``[E, nb, kb]`` (block)
+            or ``[E]`` / ``[E,1,1]`` (per-tensor; expanded internally).
         offsets: Cumulative token counts per expert ``[E]`` (i.e. ``cumsum(tokens_per_expert)``).
         tokens_per_expert: Number of tokens routed to each expert ``[E]``.
         block_size: ``[block_n, block_k]`` quantization block dimensions, e.g. ``[128, 128]``.
@@ -443,6 +458,19 @@ def w8a8_tensor_fp8_matmul_grouped(
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
 ) -> torch.Tensor:
+    """Tensor-scale grouped W8A8 FP8 matmul for MoE expert dispatch.
+
+    Args:
+        A: Raw activation matrix ``[S, K]`` sorted by expert, in bf16/fp16/fp32.
+        B: Stacked expert weight tensor ``[E, N, K]`` in ``float8_e4m3fn``.
+        Bs: Per-expert tensor scales ``[E]`` or ``[E,1,1]``.
+        offsets: Cumulative token counts per expert ``[E]``.
+        tokens_per_expert: Number of tokens routed to each expert ``[E]``.
+        block_size: Kept for API consistency; tensor path derives tile sizes from ``N`` and ``K``.
+
+    Returns:
+        Output tensor ``[S, N]`` in the same dtype as ``A``, in expert-sorted order.
+    """
     return torch.ops.finegrained_fp8.w8a8_tensor_fp8_matmul_grouped(
         A, B, Bs, offsets, tokens_per_expert, block_size
     )
@@ -456,6 +484,16 @@ def w8a8_fp8_matmul_grouped(
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
 ) -> torch.Tensor:
+    """Unified grouped W8A8 FP8 matmul dispatcher.
+
+    Dispatch rules:
+    - tensor mode when ``block_size is None``
+    - tensor mode when ``block_size == [N, K]``
+    - otherwise block mode
+
+    Returns:
+        Output tensor ``[S, N]`` in the same dtype as ``A``, in expert-sorted order.
+    """
     if block_size is None or (
         block_size[0] == B.size(1) and block_size[1] == B.size(2)
     ):

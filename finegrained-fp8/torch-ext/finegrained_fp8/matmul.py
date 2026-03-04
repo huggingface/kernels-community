@@ -51,9 +51,9 @@ def w8a8_block_fp8_matmul_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
-    """Triton-accelerated function used to perform linear operations (dot
-    product) on input tensors `A` and `B` with block-wise quantization, and
-    store the result in output tensor `C`.
+    """Block-scale FP8 GEMM kernel.
+
+    Computes ``C = A @ B.T`` with block-wise activation/weight scales.
     """
 
     pid = tl.program_id(axis=0)
@@ -126,6 +126,11 @@ def w8a8_tensor_fp8_matmul_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
+    """Tensor-scale FP8 GEMM kernel.
+
+    Computes ``C = A @ B.T`` with one activation scale per row and one
+    weight scale for the full matrix.
+    """
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -182,20 +187,11 @@ def _w8a8_block_fp8_matmul(
     block_size: list[int] | None,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """This function performs matrix multiplication with block-wise
-    quantization.
-    It takes two input tensors `A` and `B` with scales `As` and `Bs`.
-    The output is returned in the specified `output_dtype`.
-    Args:
-        A: The input tensor, e.g., activation.
-        B: The input tensor, e.g., weight.
-        As: The per-token-group quantization scale for `A`.
-        Bs: The per-block quantization scale for `B`.
-        block_size: The block size for per-block quantization. It should
-        be 2-dim, e.g., [128, 128].
-        output_dtype: The dtype of the returned tensor.
-    Returns:
-        torch.Tensor: The result of matmul.
+    """Internal block-scale FP8 matmul op.
+
+    Accepts pre-quantized FP8 ``A``/``B`` and block scales ``As``/``Bs``.
+    For convenience, scalar ``As``/``Bs`` are expanded to the expected
+    block-scale shapes.
     """
     if block_size is None:
         block_n, block_k = 128, 128
@@ -277,6 +273,13 @@ def _w8a8_tensor_fp8_matmul(
     block_size: list[int] | None,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
+    """Tensor-scale W8A8 FP8 matrix multiplication.
+
+    Expects pre-quantized FP8 activations/weights and tensor scales.
+    Accepted scale layouts are normalized to the canonical kernel layout:
+    - ``As``: scalar, ``[M]``, or ``[M,1]`` -> ``[M]``
+    - ``Bs``: scalar, ``[1]``, or ``[1,1]`` -> ``[1]``
+    """
     assert A.shape[-1] == B.shape[-1]
     assert A.is_contiguous()
 
@@ -386,6 +389,22 @@ def w8a8_tensor_fp8_matmul(
     block_size: list[int] | None,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
+    """Tensor-scale W8A8 FP8 matrix multiplication.
+
+    Computes ``C = A @ B.T`` in tensor-scale mode using pre-quantized FP8
+    activations/weights and tensor scales.
+
+    Args:
+        A: Quantized activation tensor ``[M, K]`` in ``float8_e4m3fn``.
+        B: Quantized weight tensor ``[N, K]`` in ``float8_e4m3fn``.
+        As: Activation scale(s), accepted as scalar, ``[M]``, or ``[M,1]``.
+        Bs: Weight scale(s), accepted as scalar, ``[1]``, or ``[1,1]``.
+        block_size: Kept for API consistency; tensor path derives tile sizes from ``N`` and ``K``.
+        output_dtype: dtype of the returned tensor.
+
+    Returns:
+        Output tensor ``[M, N]`` in ``output_dtype``.
+    """
     return torch.ops.finegrained_fp8.w8a8_tensor_fp8_matmul(
         A, B, As, Bs, block_size, output_dtype
     )
@@ -399,6 +418,16 @@ def w8a8_fp8_matmul(
     block_size: list[int] | None,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
+    """Unified W8A8 FP8 matmul dispatcher.
+
+    Dispatch rules:
+    - tensor mode when ``block_size is None``
+    - tensor mode when ``block_size == [N, K]``
+    - otherwise block mode
+
+    Returns:
+        Output tensor ``[M, N]`` in ``output_dtype``.
+    """
     if block_size is None or (
         block_size[0] == B.size(0) and block_size[1] == B.size(1)
     ):

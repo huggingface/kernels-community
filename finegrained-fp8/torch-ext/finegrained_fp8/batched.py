@@ -47,6 +47,11 @@ def w8a8_block_fp8_matmul_batched_kernel(
     block_k: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
 ):
+    """Block-scale batched FP8 expert matmul kernel.
+
+    Each program handles one routed token row and one N-tile, looks up the
+    owning expert from ``ExpertIds``, and applies fused activation quantization.
+    """
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
@@ -122,6 +127,11 @@ def w8a8_tensor_fp8_matmul_batched_kernel(
     block_k: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
 ):
+    """Tensor-scale batched FP8 expert matmul kernel.
+
+    Activations are already quantized; the kernel applies per-token activation
+    scales and per-expert tensor weight scales.
+    """
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
@@ -170,13 +180,11 @@ def _w8a8_block_fp8_matmul_batched(
     expert_ids: torch.Tensor,
     block_size: list[int] | None,
 ) -> torch.Tensor:
-    """Batched FP8 block-wise matmul with fused activation quantization.
+    """Internal block-scale batched FP8 matmul op.
 
-    Mirrors ``_batched_linear`` for FP8 weights: A is the raw (BF16/FP16)
-    activation matrix, B / Bs are the stacked expert weights / scales.
-    The kernel looks up ``expert_ids[batch_id]`` to address the correct expert
-    slice of B directly — no (S, N, K) weight gather is needed.
-    Activation quantization (``act_quant``) is fused into the matmul loop.
+    ``A`` is raw activations, ``B``/``Bs`` are stacked expert weights/scales,
+    and ``expert_ids`` routes each token row to one expert. Per-token
+    activation quantization is fused into the matmul loop.
     """
     assert A.ndim == 2, "A must be (S, K)"
     assert A.is_contiguous(), "A must be contiguous"
@@ -267,6 +275,13 @@ def _w8a8_tensor_fp8_matmul_batched(
     expert_ids: torch.Tensor,
     block_size: list[int] | None,
 ) -> torch.Tensor:
+    """Tensor-scale batched FP8 matmul for routed experts.
+
+    Activations are quantized once with per-token tensor scales and multiplied
+    with expert-selected FP8 weights using per-expert tensor scales.
+
+    Accepted ``Bs`` layouts: ``[E]`` or ``[E,1,1]``.
+    """
     assert A.ndim == 2, "A must be (S, K)"
     assert A.is_contiguous(), "A must be contiguous"
 
@@ -344,7 +359,8 @@ def w8a8_block_fp8_matmul_batched(
     Args:
         A: Raw activation matrix ``[S, K]`` in bf16/fp16/fp32.
         B: Stacked expert weight tensor ``[E, N, K]`` in ``float8_e4m3fn``.
-        Bs: Stacked expert weight scales ``[E, N // block_size[0], K // block_size[1]]``.
+        Bs: Expert weight scales, accepted as ``[E, nb, kb]`` (block)
+            or ``[E]`` / ``[E,1,1]`` (per-tensor; expanded internally).
         expert_ids: Expert index per token ``[S]``, values in ``[0, E)``.
         block_size: ``[block_n, block_k]`` quantization block dimensions, e.g. ``[128, 128]``.
 
@@ -363,6 +379,18 @@ def w8a8_tensor_fp8_matmul_batched(
     expert_ids: torch.Tensor,
     block_size: list[int] | None,
 ) -> torch.Tensor:
+    """Tensor-scale batched W8A8 FP8 matmul for MoE expert dispatch.
+
+    Args:
+        A: Raw activation matrix ``[S, K]`` in bf16/fp16/fp32.
+        B: Stacked expert weight tensor ``[E, N, K]`` in ``float8_e4m3fn``.
+        Bs: Per-expert tensor scales ``[E]`` or ``[E,1,1]``.
+        expert_ids: Expert index per token ``[S]``, values in ``[0, E)``.
+        block_size: Kept for API consistency; tensor path derives tile sizes from ``N`` and ``K``.
+
+    Returns:
+        Output tensor ``[S, N]`` in the same dtype as ``A``.
+    """
     return torch.ops.finegrained_fp8.w8a8_tensor_fp8_matmul_batched(
         A, B, Bs, expert_ids, block_size
     )
@@ -375,6 +403,16 @@ def w8a8_fp8_matmul_batched(
     expert_ids: torch.Tensor,
     block_size: list[int] | None,
 ) -> torch.Tensor:
+    """Unified batched W8A8 FP8 matmul dispatcher.
+
+    Dispatch rules:
+    - tensor mode when ``block_size is None``
+    - tensor mode when ``block_size == [N, K]``
+    - otherwise block mode
+
+    Returns:
+        Output tensor ``[S, N]`` in the same dtype as ``A``.
+    """
     if block_size is None or (
         block_size[0] == B.size(1) and block_size[1] == B.size(2)
     ):
