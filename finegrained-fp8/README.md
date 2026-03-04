@@ -16,7 +16,7 @@ Dynamic per-block activation quantization from BF16/FP16 to `float8_e4m3fn`. Spl
 
 ### `w8a8_block_fp8_matmul`
 
-Block-wise W8A8 FP8 matrix multiplication. Takes a pre-quantized activation matrix `A` (float8, `[M, K]`) with per-token-group scales `As`, and a pre-quantized weight matrix `B` (float8, `[N, K]`) with per-block scales `Bs`, and returns the result in the requested output dtype. The tile shape adapts to M so that small decode batches use the smallest valid FP8 WGMMA tile (16), while larger prefill batches use 128. Used by `FP8Linear` and by the `eager` per-expert loop in `FP8Expert`.
+Block-wise W8A8 FP8 matrix multiplication. Takes a pre-quantized activation matrix `A` (float8, `[M, K]`) with per-token-group scales `As`, and a pre-quantized weight matrix `B` (float8, `[N, K]`) with per-block scales `Bs`, and returns the result in the requested output dtype. The tile shape adapts to M so that small decode batches use the smallest valid FP8 WGMMA tile (16), while larger prefill batches use 128. Used by `FP8Linear` and by the `eager` per-expert loop in `FP8Experts`.
 
 ### `w8a8_block_fp8_matmul_batched`
 

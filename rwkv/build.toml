@@ -4,6 +4,10 @@ license = "Apache-2.0"
 version = 1
 backends = ["cuda"]
 
+
+[general.hub]
+repo-id = "kernels-community/rwkv"
+
 [torch]
 src = ["torch-ext/torch_binding.cpp"]
 
