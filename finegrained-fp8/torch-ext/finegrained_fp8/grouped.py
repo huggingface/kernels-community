@@ -20,7 +20,7 @@ from torch.library import triton_op, wrap_triton
 
 
 @triton.jit
-def w8a8_block_fp8_grouped_mm_kernel(
+def w8a8_block_fp8_matmul_grouped_kernel(
     A,  # (S, K)  raw BF16/FP16 activations, sorted/grouped by expert id
     B,  # (E, N, K) FP8 weight matrices
     C,  # (S, N)  output
@@ -137,7 +137,7 @@ def w8a8_block_fp8_grouped_mm_kernel(
 
 
 @triton.jit
-def w8a8_tensor_fp8_grouped_mm_kernel(
+def w8a8_tensor_fp8_matmul_grouped_kernel(
     A,  # (S, K) pre-quantized FP8 activations
     B,  # (E, N, K) FP8 weight matrices
     C,  # (S, N) output
@@ -305,7 +305,7 @@ def _w8a8_block_fp8_matmul_grouped(
     max_M_tiles = triton.cdiv(S, BLOCK_SIZE_M) + E
 
     grid = (max_M_tiles, triton.cdiv(N, block_n))
-    wrap_triton(w8a8_block_fp8_grouped_mm_kernel)[grid](
+    wrap_triton(w8a8_block_fp8_matmul_grouped_kernel)[grid](
         A,
         B,
         C,
@@ -389,7 +389,7 @@ def _w8a8_tensor_fp8_matmul_grouped(
 
     qA, As = fp8_act_quant(A, K)
     grid = (max_M_tiles, triton.cdiv(N, block_n))
-    wrap_triton(w8a8_tensor_fp8_grouped_mm_kernel)[grid](
+    wrap_triton(w8a8_tensor_fp8_matmul_grouped_kernel)[grid](
         qA,
         B,
         C,
