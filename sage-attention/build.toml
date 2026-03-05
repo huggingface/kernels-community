@@ -2,7 +2,7 @@
 name = "sage-attention"
 license = "Apache-2.0"
 backends = ["cuda"]
-version = 1
+version = 2
 
 [general.cuda]
 minver = "12.8"
