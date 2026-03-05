@@ -4,6 +4,10 @@ name = "flash-mla"
 version = 1
 license = "MIT"
 
+
+[general.hub]
+repo-id = "kernels-community/flash-mla"
+
 [torch]
 src = [
   "torch-ext/torch_binding.cpp",
