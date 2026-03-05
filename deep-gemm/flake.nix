@@ -2,6 +2,7 @@
   description = "Flake for DeepGEMM kernel";
 
   inputs = {
+    self.submodules = true;
     kernel-builder.url = "github:huggingface/kernels";
   };
 
