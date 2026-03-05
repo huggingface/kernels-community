@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from dataclasses import dataclass, field
 import json
 import os
 import re
@@ -9,8 +10,25 @@ import urllib.request
 
 KERNEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
-ALLOWED_PERMISSIONS = {"admin", "write"}
+COMMAND_PERMISSIONS = {
+    "build": {"admin", "write"},
+    "build-and-upload": {"admin"},
+    "merge-and-upload": {"admin"},
+}
+FORK_BLOCKED_COMMANDS = {"build", "build-and-upload"}
 MAX_COMMENT_LENGTH = 1024
+COMMAND_USAGE = (
+    "Invalid command. Use `/kernel-bot <build|build-and-upload|merge-and-upload> "
+    "<kernel1> [kernel2 ...] [--branch <target_branch>]`."
+)
+
+
+@dataclass
+class ParsedCommand:
+    command: str | None = None
+    kernels: list[str] = field(default_factory=list)
+    branch: str | None = None
+    error: str | None = None
 
 
 def github_api_request(
@@ -69,21 +87,20 @@ def get_pull_request(api_base: str, token: str, issue_number: int):
     return json.loads(body)
 
 
-def parse_command(comment: str):
+def merge_pull_request(api_base: str, token: str, issue_number: int):
+    url = f"{api_base}/pulls/{issue_number}/merge"
+    _, body = github_api_request(url, token, method="PUT", data={})
+    return json.loads(body)
+
+
+def parse_command(comment: str) -> ParsedCommand:
     tokens = comment.strip().split()
     if len(tokens) < 3:
-        return (
-            None,
-            None,
-            "Invalid command. Use `/kernel-bot build <kernel1> [kernel2 ...] [--branch <target_branch>]`.",
-        )
+        return ParsedCommand(error=COMMAND_USAGE)
 
-    if tokens[0] != "/kernel-bot" or tokens[1] != "build":
-        return (
-            None,
-            None,
-            "Invalid command. Use `/kernel-bot build <kernel1> [kernel2 ...] [--branch <target_branch>]`.",
-        )
+    command = tokens[1]
+    if tokens[0] != "/kernel-bot" or command not in COMMAND_PERMISSIONS:
+        return ParsedCommand(error=COMMAND_USAGE)
 
     branch = None
     args = tokens[2:]
@@ -91,34 +108,30 @@ def parse_command(comment: str):
     if "--branch" in args:
         branch_idx = args.index("--branch")
         if branch_idx != len(args) - 2:
-            return (
-                None,
-                None,
-                "Invalid `--branch` usage. Put it at the end: `--branch <target_branch>`.",
+            return ParsedCommand(
+                error="Invalid `--branch` usage. Put it at the end: `--branch <target_branch>`.",
             )
         branch = args[branch_idx + 1]
         args = args[:branch_idx]
 
     if not args:
-        return (
-            None,
-            None,
-            "No kernels provided. Use `/kernel-bot build <kernel1> [kernel2 ...]`.",
+        return ParsedCommand(
+            error="No kernels provided. Use `/kernel-bot <build|build-and-upload|merge-and-upload> <kernel1> [kernel2 ...]`.",
         )
 
     kernels = []
     seen = set()
     for kernel in args:
         if not KERNEL_RE.match(kernel):
-            return None, None, f"Invalid kernel name `{kernel}`."
+            return ParsedCommand(error=f"Invalid kernel name `{kernel}`.")
         if kernel not in seen:
             kernels.append(kernel)
             seen.add(kernel)
 
     if branch is not None and not BRANCH_RE.match(branch):
-        return None, None, f"Invalid target branch `{branch}`."
+        return ParsedCommand(error=f"Invalid target branch `{branch}`.")
 
-    return kernels, branch, None
+    return ParsedCommand(command=command, kernels=kernels, branch=branch)
 
 
 def parse_issue_number(raw_value: str | None):
@@ -167,13 +180,41 @@ def main():
 
     api_base = f"https://api.github.com/repos/{repository}"
 
-    permission = get_user_permission(api_base, token, commenter)
-    if permission not in ALLOWED_PERMISSIONS:
+    parsed_command = parse_command(comment)
+    if parsed_command.error:
         try_post_issue_comment(
             api_base,
             token,
             issue_number,
-            "I can only run builds for users with `write` or `admin` repository permission.",
+            parsed_command.error,
+        )
+        return 0
+
+    command = parsed_command.command
+    kernels = parsed_command.kernels
+    requested_branch = parsed_command.branch
+    if command is None:
+        print("Internal error: command parsing returned no command.", file=sys.stderr)
+        return 1
+
+    permission = get_user_permission(api_base, token, commenter)
+    allowed_permissions = COMMAND_PERMISSIONS[command]
+    if permission not in allowed_permissions:
+        if command == "build":
+            permission_error = (
+                "I can only run `/kernel-bot build` for users with `write` or `admin` "
+                "repository permission."
+            )
+        else:
+            permission_error = (
+                f"I can only run `/kernel-bot {command}` for users with `admin` "
+                "repository permission."
+            )
+        try_post_issue_comment(
+            api_base,
+            token,
+            issue_number,
+            permission_error,
         )
         return 0
 
@@ -190,36 +231,88 @@ def main():
             api_base,
             token,
             issue_number,
-            "Could not verify PR source repository, so `/kernel-bot build` was not run.",
+            f"Could not verify PR metadata, so `/kernel-bot {command}` was not run.",
         )
         return 1
 
-    head_repo = pull_request.get("head", {}).get("repo", {}) or {}
-    head_full_name = head_repo.get("full_name")
-    if head_full_name != repository:
-        try_post_issue_comment(
-            api_base,
-            token,
-            issue_number,
-            "Fork PRs are blocked for `/kernel-bot build`. Use a branch in this repository.",
-        )
-        return 0
+    if command in FORK_BLOCKED_COMMANDS:
+        head_repo = pull_request.get("head", {}).get("repo", {}) or {}
+        head_full_name = head_repo.get("full_name")
+        if head_full_name != repository:
+            try_post_issue_comment(
+                api_base,
+                token,
+                issue_number,
+                f"Fork PRs are blocked for `/kernel-bot {command}`. Use a branch in this repository.",
+            )
+            return 0
 
-    kernels, target_branch, parse_error = parse_command(comment)
-    if parse_error:
-        try_post_issue_comment(
-            api_base,
-            token,
-            issue_number,
-            parse_error,
-        )
-        return 0
+    merge_result_message = None
+    if command == "merge-and-upload":
+        if pull_request.get("merged"):
+            merge_result_message = "PR is already merged. Continuing with build/upload."
+        elif pull_request.get("state") != "open":
+            try_post_issue_comment(
+                api_base,
+                token,
+                issue_number,
+                "PR is not open and cannot be merged via `/kernel-bot merge-and-upload`.",
+            )
+            return 0
+        else:
+            try:
+                merge_response = merge_pull_request(api_base, token, issue_number)
+            except urllib.error.HTTPError as e:
+                err_text = e.read().decode("utf-8", errors="replace")
+                print(
+                    f"Failed to merge PR #{issue_number} (HTTP {e.code}).",
+                    file=sys.stderr,
+                )
+                print(err_text, file=sys.stderr)
+                try_post_issue_comment(
+                    api_base,
+                    token,
+                    issue_number,
+                    "Failed to merge PR before build/upload. Check mergeability and required checks.",
+                )
+                return 1
+
+            if not merge_response.get("merged"):
+                merge_message = merge_response.get(
+                    "message", "PR merge failed for an unknown reason."
+                )
+                try_post_issue_comment(
+                    api_base,
+                    token,
+                    issue_number,
+                    f"PR merge failed: {merge_message}",
+                )
+                return 1
+
+            merge_result_message = merge_response.get(
+                "message", "PR merged successfully."
+            )
 
     dispatch_url = f"{api_base}/actions/workflows/manual-build-upload.yaml/dispatches"
-    target_branch = target_branch or f"pr-{issue_number}"
-    command_summary = f"/kernel-bot build {' '.join(kernels)}"
-    if target_branch and target_branch != f"pr-{issue_number}":
-        command_summary += f" --branch {target_branch}"
+    if command == "build":
+        target_branch = requested_branch or f"pr-{issue_number}"
+        dispatch_pr_number = str(issue_number)
+        upload_flag = "false"
+        allow_main_dispatch = "false"
+    elif command == "build-and-upload":
+        target_branch = requested_branch or f"pr-{issue_number}"
+        dispatch_pr_number = str(issue_number)
+        upload_flag = "true"
+        allow_main_dispatch = "false"
+    else:
+        target_branch = requested_branch or "main"
+        dispatch_pr_number = ""
+        upload_flag = "true"
+        allow_main_dispatch = "true"
+
+    command_summary = f"/kernel-bot {command} {' '.join(kernels)}"
+    if requested_branch is not None:
+        command_summary += f" --branch {requested_branch}"
     succeeded = []
     failed = []
 
@@ -228,13 +321,15 @@ def main():
             "ref": default_branch,
             "inputs": {
                 "kernel_name": kernel_name,
-                "pr_number": str(issue_number),
+                "pr_number": dispatch_pr_number,
                 "target_branch": target_branch,
+                "upload": upload_flag,
+                "allow_main_dispatch": allow_main_dispatch,
             },
         }
         try:
             print(
-                f"Dispatching workflow for kernel `{kernel_name}` to branch `{target_branch}`"
+                f"Dispatching workflow for command `{command}`, kernel `{kernel_name}`, branch `{target_branch}`"
             )
             github_api_request(dispatch_url, token, method="POST", data=dispatch_body)
             succeeded.append(kernel_name)
@@ -243,13 +338,22 @@ def main():
             print(err_text, file=sys.stderr)
             failed.append((kernel_name, e.code))
 
+    mode_text = {
+        "build": "build only",
+        "build-and-upload": "build and upload",
+        "merge-and-upload": "merge, build and upload",
+    }[command]
+
     lines = [
         "Build request processed.",
         "",
         f"Command: `{command_summary}`",
+        f"Mode: `{mode_text}`",
         f"Target branch: `{target_branch}`",
         "Triggered workflow: `manual-build-upload.yaml`",
     ]
+    if merge_result_message:
+        lines.extend(["", f"Merge result: {merge_result_message}"])
     if succeeded:
         lines.extend(["", f"Dispatched ({len(succeeded)}): `{', '.join(succeeded)}`"])
     if failed:
