@@ -65,7 +65,9 @@ void moe_gather(
     torch::Tensor& output,
     const torch::Tensor& moe_output,
     const torch::Tensor& topk_weights,
+    const torch::Tensor& permuted_row_to_unpermuted_row,
     const torch::Tensor& unpermuted_row_to_permuted_row,
+    const torch::Tensor& expert_first_token_offset,
     const int64_t num_experts);
 
 void fused_moe_prologue(
@@ -75,4 +77,6 @@ void fused_moe_prologue(
     torch::Tensor workspace,
     int64_t hidden_size,
     int64_t inter_size,
+    int64_t ep_rank,
+    int64_t ep_size,
     int64_t num_experts_on_rank);
