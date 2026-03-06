@@ -1,0 +1,105 @@
+[general]
+name = "deep-gemm"
+license = "MIT"
+backends = ["cuda"]
+version = 1
+
+[general.cuda]
+minver = "12.3"
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+pyext = ["py", "cuh", "hpp", "h"]
+
+[kernel.deep_gemm]
+backend = "cuda"
+cuda-minver = "12.3"
+cuda-capabilities = ["9.0a"]
+depends = ["torch", "cutlass_4_0"]
+include = [
+  "csrc",
+  "deep_gemm/include",
+]
+cuda-flags = [
+  "-std=c++17",
+  "-O3",
+  "-DNDEBUG",
+  "--expt-relaxed-constexpr",
+  "--expt-extended-lambda",
+  "-Wno-deprecated-declarations",
+]
+src = [
+  # Compiled source
+  "csrc/impl.cu",
+  # API headers
+  "csrc/apis/attention.hpp",
+  "csrc/apis/einsum.hpp",
+  "csrc/apis/gemm.hpp",
+  "csrc/apis/hyperconnection.hpp",
+  "csrc/apis/layout.hpp",
+  "csrc/apis/runtime.hpp",
+  # JIT infrastructure headers
+  "csrc/jit/cache.hpp",
+  "csrc/jit/compiler.hpp",
+  "csrc/jit/device_runtime.hpp",
+  "csrc/jit/handle.hpp",
+  "csrc/jit/kernel_runtime.hpp",
+  # JIT kernel heuristics
+  "csrc/jit_kernels/heuristics/common.hpp",
+  "csrc/jit_kernels/heuristics/sm100.hpp",
+  "csrc/jit_kernels/heuristics/sm90.hpp",
+  # JIT kernel implementations
+  "csrc/jit_kernels/impls/epilogue.hpp",
+  "csrc/jit_kernels/impls/runtime_utils.hpp",
+  "csrc/jit_kernels/impls/sm100_bf16_gemm.hpp",
+  "csrc/jit_kernels/impls/sm100_bmk_bnk_mn.hpp",
+  "csrc/jit_kernels/impls/sm100_fp8_gemm_1d1d.hpp",
+  "csrc/jit_kernels/impls/sm100_tf32_hc_prenorm_gemm.hpp",
+  "csrc/jit_kernels/impls/sm90_bf16_gemm.hpp",
+  "csrc/jit_kernels/impls/sm90_bmk_bnk_mn.hpp",
+  "csrc/jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp",
+  "csrc/jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp",
+  "csrc/jit_kernels/impls/sm90_tf32_hc_prenorm_gemm.hpp",
+  "csrc/jit_kernels/impls/smxx_clean_logits.hpp",
+  "csrc/jit_kernels/impls/smxx_cublaslt.hpp",
+  "csrc/jit_kernels/impls/smxx_fp8_mqa_logits.hpp",
+  "csrc/jit_kernels/impls/smxx_fp8_paged_mqa_logits.hpp",
+  "csrc/jit_kernels/impls/smxx_layout.hpp",
+  # Utility headers
+  "csrc/utils/compatibility.hpp",
+  "csrc/utils/exception.hpp",
+  "csrc/utils/format.hpp",
+  "csrc/utils/hash.hpp",
+  "csrc/utils/layout.hpp",
+  "csrc/utils/lazy_init.hpp",
+  "csrc/utils/math.hpp",
+  "csrc/utils/system.hpp",
+  # Runtime JIT headers (deep_gemm/include)
+  "deep_gemm/include/deep_gemm/common/cute_tie.cuh",
+  "deep_gemm/include/deep_gemm/common/epilogue_utils.cuh",
+  "deep_gemm/include/deep_gemm/common/types.hpp",
+  "deep_gemm/include/deep_gemm/common/sm90_utils.cuh",
+  "deep_gemm/include/deep_gemm/common/reduction.cuh",
+  "deep_gemm/include/deep_gemm/common/utils.cuh",
+  "deep_gemm/include/deep_gemm/common/tma_utils.cuh",
+  "deep_gemm/include/deep_gemm/common/sm100_utils.cuh",
+  "deep_gemm/include/deep_gemm/common/scheduler.cuh",
+  "deep_gemm/include/deep_gemm/impls/smxx_layout.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm100_fp8_mqa_logits.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh",
+  "deep_gemm/include/deep_gemm/impls/smxx_clean_logits.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d1d.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm100_tf32_hc_prenorm_gemm.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm100_fp8_paged_mqa_logits.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm90_fp8_paged_mqa_logits.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm90_fp8_mqa_logits.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm90_bmk_bnk_mn.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm90_tf32_hc_prenorm_gemm.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm100_bmk_bnk_mn.cuh",
+]

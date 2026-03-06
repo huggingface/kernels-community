@@ -1,0 +1,3 @@
+[submodule "deep-gemm/torch-ext/deep_gemm/include/third-party/cutlass"]
+	path = deep-gemm/torch-ext/deep_gemm/include/third-party/cutlass
+	url = https://github.com/NVIDIA/cutlass.git
