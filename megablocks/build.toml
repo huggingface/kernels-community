@@ -8,6 +8,10 @@ backends = [
     "cpu",
 ]
 
+
+[general.hub]
+repo-id = "kernels-community/megablocks"
+
 [torch]
 src = [
     "torch-ext/torch_binding.cpp",
@@ -54,7 +58,7 @@ src = [
 backend = "xpu"
 depends = [
     "torch",
-    "cutlass_sycl",
+    "sycl_tla",
 ]
 src = [
     "csrc_xpu/utils.h",

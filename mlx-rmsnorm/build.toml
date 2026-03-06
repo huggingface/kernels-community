@@ -1,5 +1,5 @@
 [general]
-name = "mlx_rmsnorm"
+name = "mlx-rmsnorm"
 license = "MIT"
 version = 1
 backends = ["metal"]

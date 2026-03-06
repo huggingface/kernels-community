@@ -11,11 +11,12 @@ void fused_moe_prologue(
     torch::Tensor workspace,
     int64_t hidden_size,
     int64_t inter_size,
+    int64_t ep_rank,
+    int64_t ep_size,
     int64_t num_experts_on_rank) {
   int experts_per_token = token_selected_experts.size(1);
   int64_t num_rows = input.size(0);
-  // TODO: EP
-  int ep_size = 1;
+  assert(ep_rank >= 0 && ep_rank < ep_size);
   auto const num_experts_total =
       static_cast<int>(num_experts_on_rank * ep_size);
   auto& stream = at::xpu::getCurrentXPUStream(input.device().index()).queue();
@@ -30,7 +31,7 @@ void fused_moe_prologue(
   auto const* token_topk_unpermuted_scales =
       reinterpret_cast<float const*>(token_final_scales.data_ptr());
   int const num_experts_per_node = num_experts_total / ep_size;
-  int start_expert = num_experts_per_node * 0;
+  int start_expert = num_experts_per_node * ep_rank;
   auto expanded_num_rows = num_rows * experts_per_token;
 
   // workspace configure

@@ -13,6 +13,14 @@ on:
       target_branch:
         description: 'Target branch on kernels-community/<kernel> to publish to'
         required: true
+      upload:
+        description: 'Whether to upload after build (internal use by kernel-bot)'
+        required: false
+        default: 'true'
+      allow_main_dispatch:
+        description: 'Allow dispatch from default branch without pr_number (internal)'
+        required: false
+        default: 'false'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -24,7 +32,7 @@ jobs:
       group: aws-highmemory-32-plus-nix
     steps:
       - name: Ensure workflow is not run from main
-        if: ${{ github.ref == 'refs/heads/main' && inputs.pr_number == '' }}
+        if: ${{ github.ref == 'refs/heads/main' && inputs.pr_number == '' && inputs.allow_main_dispatch != 'true' }}
         run: |
           echo "❌ This workflow must be dispatched from a non-main branch."
           exit 1
@@ -35,14 +43,29 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Validate PR number
+        if: ${{ inputs.pr_number != '' }}
+        id: validate-pr-number
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -eu
+          case "$PR_NUMBER" in
+            ''|*[!0-9]*)
+              echo "Invalid pr_number input: must be numeric"
+              exit 1
+              ;;
+          esac
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
       - name: Checkout PR branch
         if: ${{ inputs.pr_number != '' }}
         uses: actions/checkout@v6
         with:
-          ref: refs/pull/${{ inputs.pr_number }}/head
+          ref: refs/pull/${{ steps.validate-pr-number.outputs.pr_number }}/head
           fetch-depth: 0
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v21
         with:
           extra-conf: |
             max-jobs = 2
@@ -60,9 +83,10 @@ jobs:
 
       - name: Validate kernel directory
         id: validate
+        env:
+          KERNEL_INPUT: ${{ inputs.kernel_name }}
         run: |
           set -eu
-          KERNEL_INPUT="${{ inputs.kernel_name }}"
           if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release" "${KERNEL_INPUT}: manual dispatch"); then
             echo "kernel=$KERNEL" >> "$GITHUB_OUTPUT"
           else
@@ -77,10 +101,11 @@ jobs:
           ( cd "$KERNEL" && nix run -L .#build-and-copy )
 
       - name: Upload kernel
+        if: ${{ inputs.upload == 'true' }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
           set -eu
           KERNEL="${{ steps.validate.outputs.kernel }}"
-          TARGET_BRANCH="${{ inputs.target_branch }}"
           ( cd "$KERNEL" && nix run .#kernels -- upload --repo-id "kernels-community/$KERNEL" --branch "$TARGET_BRANCH" . )

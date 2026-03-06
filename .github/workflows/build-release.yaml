@@ -11,6 +11,7 @@ jobs:
     # Only run if the PR was actually merged (not just closed)
     if: github.event.pull_request.merged == true
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x86_64-linux
@@ -19,6 +20,7 @@ jobs:
             runner: aws-r8g-8xl-plus-nix
     runs-on:
       group: ${{ matrix.runner }}
+    timeout-minutes: 600 # 10h
     steps:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/nix-installer-action@main

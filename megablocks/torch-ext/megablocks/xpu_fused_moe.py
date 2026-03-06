@@ -31,12 +31,12 @@ def _register_xpu_fake_kernels():
 
     _register_if_available(
         "fused_moe_prologue",
-        lambda input, token_selected_experts, token_final_scales, workspace, hidden_size, inter_size, num_experts_on_rank: None,
+        lambda input, token_selected_experts, token_final_scales, workspace, hidden_size, inter_size, ep_rank, ep_size, num_experts_on_rank: None,
     )
 
     _register_if_available(
         "moe_gather",
-        lambda output, moe_output, topk_weights, unpermuted_row_to_permuted_row, num_experts: None,
+        lambda output, moe_output, topk_weights, permuted_row_to_unpermuted_row, unpermuted_row_to_permuted_row, expert_first_token_offset, num_experts: None,
     )
 
     _register_if_available(
@@ -202,6 +202,8 @@ def xpu_fused_moe(hidden_states,
                   n_experts_per_token,
                   activation,
                   num_experts,
+                  ep_rank=0,
+                  ep_size=1,
                   is_fp8=False,
                   is_int4=False,
                   is_mxfp4=False):
@@ -329,7 +331,7 @@ def xpu_fused_moe(hidden_states,
     config_ws("permuted_token_final_scales", permuted_token_final_scales_size)
     config_ws("overlapped_gemm1_gemm2_inputs", permuted_data_size)
 
-    workspace = torch.empty(map_offset,
+    workspace = torch.zeros(map_offset,
                             dtype=torch.uint8,
                             device=hidden_states.device)
     if topk_ids.dtype == torch.int32:
@@ -341,6 +343,8 @@ def xpu_fused_moe(hidden_states,
         workspace=workspace,
         hidden_size=hidden_size,
         inter_size=inter_size,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
         num_experts_on_rank=num_experts_per_node)
 
     expert_first_token_offset_bytes = workspace[
@@ -351,6 +355,10 @@ def xpu_fused_moe(hidden_states,
         ws_map["unpermuted_row_to_permuted_row"][1]:
         ws_map["unpermuted_row_to_permuted_row"][1] +
         src_to_dest_map_size]
+    permuted_row_to_unpermuted_row_bytes = workspace[
+        ws_map["permuted_row_to_unpermuted_row"][1]:
+        ws_map["permuted_row_to_unpermuted_row"][1] +
+        permuted_row_to_unpermuted_row_size]
 
     if torch.compiler.is_compiling():
         expert_first_token_offset = _bytes_to_typed_tensor(
@@ -359,9 +367,13 @@ def xpu_fused_moe(hidden_states,
         unpermuted_row_to_permuted_row = _bytes_to_typed_tensor(
             unpermuted_row_to_permuted_row_bytes, torch.int32
         )
+        permuted_row_to_unpermuted_row = _bytes_to_typed_tensor(
+            permuted_row_to_unpermuted_row_bytes, torch.int32
+        )
     else:
         expert_first_token_offset = expert_first_token_offset_bytes.view(torch.int64)
         unpermuted_row_to_permuted_row = unpermuted_row_to_permuted_row_bytes.view(torch.int32)
+        permuted_row_to_unpermuted_row = permuted_row_to_unpermuted_row_bytes.view(torch.int32)
     gemm1_input = workspace[ws_map["overlapped_gemm1_gemm2_inputs"][1]:
                             ws_map["overlapped_gemm1_gemm2_inputs"][1] +
                             permuted_data_size].view(hidden_states.dtype).view(
@@ -451,7 +463,9 @@ def xpu_fused_moe(hidden_states,
             is_B_mxfp4=is_mxfp4)
 
     ops.moe_gather(output, gemm2_output, topk_weights,
+                                permuted_row_to_unpermuted_row,
                                 unpermuted_row_to_permuted_row,
+                                expert_first_token_offset,
                                 num_experts_per_node)
     return output
 
@@ -500,6 +514,21 @@ def route_tokens_xpu(
     return logits, expert_weights, expert_indices
 
 
+def _get_device_mesh(model):
+    """Extract device_mesh from child's unused pre_hook closure for EP support."""
+    try:
+        hook = next(
+            h
+            for h in model.experts._forward_pre_hooks.values()
+            if "device_mesh" in h.__code__.co_freevars
+        )
+        return hook.__closure__[
+            hook.__code__.co_freevars.index("device_mesh")
+        ].cell_contents
+    except Exception:
+        return None
+
+
 class MegaBlocksMoeMLP(torch.nn.Module):
     can_torch_compile: bool = True
         
@@ -523,6 +552,23 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         moe_normalize_expert_weights = getattr(
             self.experts, "normalize_expert_weights", None
         )
+        
+        # Get EP (Expert Parallelism) parameters
+        ep_size = 1
+        ep_rank = 0
+        expert_parallel_group = getattr(self, "expert_parallel_group", None)
+        if expert_parallel_group is None:
+            device_mesh = _get_device_mesh(self)
+            if device_mesh is not None:
+                expert_parallel_group = device_mesh.get_group()
+        if expert_parallel_group is not None:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                ep_size = dist.get_world_size(expert_parallel_group)
+                ep_rank = dist.get_rank(expert_parallel_group)
+        
+        # Number of experts on this rank
+        num_experts_on_rank = moe_num_experts // ep_size
         
         # Detect activation type - check for GptOss-style swigluoai activation
         # GptOssExperts has alpha and limit attributes for swigluoai
@@ -598,11 +644,18 @@ class MegaBlocksMoeMLP(torch.nn.Module):
             topk_ids=expert_indices,
             n_experts_per_token=moe_top_k,
             activation=activation,
-            num_experts=moe_num_experts,
+            num_experts=num_experts_on_rank,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
             is_fp8=is_fp8,
             is_int4=is_int4,
             is_mxfp4=is_mxfp4,
         )
+        
+        # All-reduce across EP group to combine partial expert outputs
+        if ep_size > 1 and expert_parallel_group is not None:
+            import torch.distributed as dist
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=expert_parallel_group)
         
         # Restore original shape
         output = output.view(in_shape)

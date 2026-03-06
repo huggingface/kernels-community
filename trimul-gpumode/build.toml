@@ -1,0 +1,14 @@
+[general]
+name = "trimul_gpumode"
+version = 1
+backends = [
+    "cuda",
+    "rocm",
+    "xpu",
+]
+
+
+[general.hub]
+repo-id = "kernels-community/trimul_gpumode"
+
+[kernel]

@@ -277,7 +277,8 @@ struct Numerics<int8_t> {
     return a / b;
   }
   static inline int8_t abs(int8_t a) {
-    return std::abs((int)a);
+  	if (a == std::numeric_limits<int8_t>::min()) return std::numeric_limits<int8_t>::max();
+  	return std::abs((int)a);
   }
   static inline int8_t pow(int8_t a, int8_t b) {
     return powi<int8_t>(a, b);
@@ -355,7 +356,8 @@ struct Numerics<int16_t> {
     return a / b;
   }
   static inline int16_t abs(int16_t a) {
-    return std::abs(a);
+  	if (a == std::numeric_limits<int16_t>::min()) return std::numeric_limits<int16_t>::max();
+  	return std::abs(a);
   }
   static inline int16_t pow(int16_t a, int16_t b) {
     return powi<int16_t>(a, b);
@@ -436,7 +438,8 @@ struct Numerics<int32_t> {
     return a / b;
   }
   static inline int32_t abs(int32_t a) {
-    return std::abs(a);
+  	if (a == std::numeric_limits<int32_t>::min()) return std::numeric_limits<int32_t>::max();
+  	return std::abs(a);
   }
   static inline int32_t pow(int32_t a, int32_t b) {
     return powi<int32_t>(a, b);
@@ -517,7 +520,8 @@ struct Numerics<int64_t> {
     return a / b;
   }
   static inline int64_t abs(int64_t a) {
-    return std::abs(a);
+  	if (a == std::numeric_limits<int64_t>::min()) return std::numeric_limits<int64_t>::max();
+  	return std::abs(a);
   }
   static inline int64_t pow(int64_t a, int64_t b) {
     return powi<int64_t>(a, b);
