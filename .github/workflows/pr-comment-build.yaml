@@ -24,6 +24,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
           COMMENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
           COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
           COMMENT_SENDER_TYPE: ${{ github.event.sender.type }}
