@@ -13,6 +13,7 @@ import uuid
 
 KERNEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+COMMENT_CHARS_RE = re.compile(r"^/kernel-bot[ A-Za-z0-9_./-]*$")
 COMMAND_PERMISSIONS = {
     "build": {"admin", "write"},
     "build-and-upload": {"admin"},
@@ -419,6 +420,10 @@ def try_send_issue_comment(
     return try_post_issue_comment(api_base, token, issue_number, message)
 
 
+def comment_has_only_supported_characters(comment: str):
+    return bool(COMMENT_CHARS_RE.fullmatch(comment))
+
+
 def main():
     token = os.environ.get("GITHUB_TOKEN")
     repository = os.environ.get("GITHUB_REPOSITORY")
@@ -453,6 +458,9 @@ def main():
         return 0
     if not comment.strip().startswith("/kernel-bot"):
         print("Ignoring non /kernel-bot comment.")
+        return 0
+    if not comment_has_only_supported_characters(comment.strip()):
+        print("Ignoring /kernel-bot comment with unsupported characters.")
         return 0
 
     api_base = f"https://api.github.com/repos/{repository}"
