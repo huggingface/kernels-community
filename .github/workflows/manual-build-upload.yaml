@@ -93,6 +93,12 @@ jobs:
           KERNEL_INPUT: ${{ inputs.kernel_name }}
         run: |
           set -eu
+          case "$KERNEL_INPUT" in
+            ''|*[!A-Za-z0-9_-]*)
+              echo "Invalid kernel_name: must contain only alphanumeric characters, underscores, and hyphens"
+              exit 1
+              ;;
+          esac
           if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release" "${KERNEL_INPUT}: manual dispatch"); then
             echo "kernel=$KERNEL" >> "$GITHUB_OUTPUT"
           else
