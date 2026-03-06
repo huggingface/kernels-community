@@ -48,6 +48,18 @@ jobs:
           else
             echo "skip=true" >> $GITHUB_OUTPUT
           fi
+      - name: Validate kernel path
+        if: steps.validate.outputs.skip == 'false'
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          if [[ ! "$KERNEL" =~ ^[a-zA-Z0-9._/-]+$ ]] || [[ "$KERNEL" == *..* ]]; then
+            echo "Invalid kernel path: $KERNEL"
+            exit 1
+          fi
+          if [[ "$KERNEL" == /* ]] || [[ "$KERNEL" == ~* ]]; then
+            echo "Absolute paths not allowed: $KERNEL"
+            exit 1
+          fi
       - name: Build kernel
         if: steps.validate.outputs.skip == 'false'
         run: |
