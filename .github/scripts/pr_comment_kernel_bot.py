@@ -67,9 +67,17 @@ def github_api_request(
         return resp.status, resp.read().decode("utf-8")
 
 
-def post_issue_comment(api_base: str, token: str, issue_number: int, message: str):
+def create_issue_comment(api_base: str, token: str, issue_number: int, message: str):
     url = f"{api_base}/issues/{issue_number}/comments"
-    github_api_request(url, token, method="POST", data={"body": message})
+    _, body = github_api_request(url, token, method="POST", data={"body": message})
+    if not body:
+        return {}
+    return json.loads(body)
+
+
+def update_issue_comment(api_base: str, token: str, comment_id: int, message: str):
+    url = f"{api_base}/issues/comments/{comment_id}"
+    github_api_request(url, token, method="PATCH", data={"body": message})
 
 
 def post_issue_comment_reaction(
@@ -81,11 +89,32 @@ def post_issue_comment_reaction(
 
 def try_post_issue_comment(api_base: str, token: str, issue_number: int, message: str):
     try:
-        post_issue_comment(api_base, token, issue_number, message)
+        create_issue_comment(api_base, token, issue_number, message)
         return True
     except urllib.error.HTTPError as e:
         err_text = e.read().decode("utf-8", errors="replace")
         print(f"Failed to post PR comment (HTTP {e.code}).", file=sys.stderr)
+        print(err_text, file=sys.stderr)
+        return False
+
+
+def try_create_issue_comment(api_base: str, token: str, issue_number: int, message: str):
+    try:
+        return create_issue_comment(api_base, token, issue_number, message)
+    except urllib.error.HTTPError as e:
+        err_text = e.read().decode("utf-8", errors="replace")
+        print(f"Failed to post PR comment (HTTP {e.code}).", file=sys.stderr)
+        print(err_text, file=sys.stderr)
+        return None
+
+
+def try_update_issue_comment(api_base: str, token: str, comment_id: int, message: str):
+    try:
+        update_issue_comment(api_base, token, comment_id, message)
+        return True
+    except urllib.error.HTTPError as e:
+        err_text = e.read().decode("utf-8", errors="replace")
+        print(f"Failed to update PR comment {comment_id} (HTTP {e.code}).", file=sys.stderr)
         print(err_text, file=sys.stderr)
         return False
 
@@ -240,6 +269,80 @@ def format_dispatched_lines(dispatches: list[DispatchResult]):
     return lines
 
 
+def comment_base_lines(
+    title: str,
+    command_summary: str,
+    mode_text: str,
+    target_branch: str,
+    pr_head_sha: str | None,
+):
+    lines = [
+        title,
+        "",
+        f"Command: `{command_summary}`",
+        f"Mode: `{mode_text}`",
+        f"Target branch: `{target_branch}`",
+    ]
+    if pr_head_sha:
+        lines.append(f"PR head SHA: `{pr_head_sha}`")
+    lines.append(f"Workflow: `{DISPATCH_WORKFLOW}`")
+    return lines
+
+
+def format_pending_comment(
+    command_summary: str,
+    mode_text: str,
+    target_branch: str,
+    pr_head_sha: str | None,
+):
+    lines = comment_base_lines(
+        "Build request received.",
+        command_summary,
+        mode_text,
+        target_branch,
+        pr_head_sha,
+    )
+    lines.extend(["", "Status: `processing`"])
+    return "\n".join(lines)
+
+
+def format_result_comment(
+    command_summary: str,
+    mode_text: str,
+    target_branch: str,
+    pr_head_sha: str | None,
+    *,
+    merge_result_message: str | None = None,
+    dispatches: list[DispatchResult] | None = None,
+    failed: list[tuple[str, int]] | None = None,
+    failure_message: str | None = None,
+):
+    dispatches = dispatches or []
+    failed = failed or []
+    if failure_message is not None or (failed and not dispatches):
+        title = "Build request failed."
+    else:
+        title = "Build request processed."
+
+    lines = comment_base_lines(
+        title,
+        command_summary,
+        mode_text,
+        target_branch,
+        pr_head_sha,
+    )
+    if failure_message:
+        lines.extend(["", f"Failure: {failure_message}"])
+    if merge_result_message:
+        lines.extend(["", f"Merge result: {merge_result_message}"])
+    if dispatches:
+        lines.extend(format_dispatched_lines(dispatches))
+    if failed:
+        failed_text = ", ".join(f"{kernel} (HTTP {code})" for kernel, code in failed)
+        lines.extend(["", f"Failed ({len(failed)}): `{failed_text}`"])
+    return "\n".join(lines)
+
+
 def parse_command(comment: str) -> ParsedCommand:
     tokens = comment.strip().split()
     if len(tokens) < 3:
@@ -288,6 +391,32 @@ def parse_numeric_id(raw_value: str | None):
     if not raw.isdigit():
         return None
     return int(raw)
+
+
+def comment_id_from_response(comment: dict | None):
+    if not isinstance(comment, dict):
+        return None
+    raw_comment_id = comment.get("id")
+    if isinstance(raw_comment_id, int):
+        return raw_comment_id
+    if isinstance(raw_comment_id, str):
+        return parse_numeric_id(raw_comment_id)
+    return None
+
+
+def try_send_issue_comment(
+    api_base: str,
+    token: str,
+    issue_number: int,
+    message: str,
+    *,
+    comment_id: int | None = None,
+):
+    if comment_id is not None and try_update_issue_comment(
+        api_base, token, comment_id, message
+    ):
+        return True
+    return try_post_issue_comment(api_base, token, issue_number, message)
 
 
 def main():
@@ -397,52 +526,6 @@ def main():
             )
             return 0
 
-    merge_result_message = None
-    if command == "merge-and-upload":
-        if pull_request.get("merged"):
-            merge_result_message = "PR is already merged. Continuing with build/upload."
-        elif pull_request.get("state") != "open":
-            try_post_issue_comment(
-                api_base,
-                token,
-                issue_number,
-                "PR is not open and cannot be merged via `/kernel-bot merge-and-upload`.",
-            )
-            return 0
-        else:
-            try:
-                merge_response = merge_pull_request(api_base, token, issue_number)
-            except urllib.error.HTTPError as e:
-                err_text = e.read().decode("utf-8", errors="replace")
-                print(
-                    f"Failed to merge PR #{issue_number} (HTTP {e.code}).",
-                    file=sys.stderr,
-                )
-                print(err_text, file=sys.stderr)
-                try_post_issue_comment(
-                    api_base,
-                    token,
-                    issue_number,
-                    "Failed to merge PR before build/upload. Check mergeability and required checks.",
-                )
-                return 1
-
-            if not merge_response.get("merged"):
-                merge_message = merge_response.get(
-                    "message", "PR merge failed for an unknown reason."
-                )
-                try_post_issue_comment(
-                    api_base,
-                    token,
-                    issue_number,
-                    f"PR merge failed: {merge_message}",
-                )
-                return 1
-
-            merge_result_message = merge_response.get(
-                "message", "PR merged successfully."
-            )
-
     dispatch_url = f"{api_base}/actions/workflows/{DISPATCH_WORKFLOW}/dispatches"
     if command == "build":
         target_branch = requested_branch or f"pr-{issue_number}"
@@ -460,9 +543,95 @@ def main():
         upload_flag = "true"
         allow_main_dispatch = "true"
 
+    mode_text = {
+        "build": "build only",
+        "build-and-upload": "build and upload",
+        "merge-and-upload": "merge, build and upload",
+    }[command]
     command_summary = f"/kernel-bot {command} {' '.join(kernels)}"
     if requested_branch is not None:
         command_summary += f" --branch {requested_branch}"
+    pr_head_sha = pull_request.get("head", {}).get("sha")
+    status_comment_id = comment_id_from_response(
+        try_create_issue_comment(
+            api_base,
+            token,
+            issue_number,
+            format_pending_comment(
+                command_summary,
+                mode_text,
+                target_branch,
+                pr_head_sha,
+            ),
+        )
+    )
+
+    merge_result_message = None
+    if command == "merge-and-upload":
+        if pull_request.get("merged"):
+            merge_result_message = "PR is already merged. Continuing with build/upload."
+        elif pull_request.get("state") != "open":
+            try_send_issue_comment(
+                api_base,
+                token,
+                issue_number,
+                format_result_comment(
+                    command_summary,
+                    mode_text,
+                    target_branch,
+                    pr_head_sha,
+                    failure_message="PR is not open and cannot be merged via `/kernel-bot merge-and-upload`.",
+                ),
+                comment_id=status_comment_id,
+            )
+            return 0
+        else:
+            try:
+                merge_response = merge_pull_request(api_base, token, issue_number)
+            except urllib.error.HTTPError as e:
+                err_text = e.read().decode("utf-8", errors="replace")
+                print(
+                    f"Failed to merge PR #{issue_number} (HTTP {e.code}).",
+                    file=sys.stderr,
+                )
+                print(err_text, file=sys.stderr)
+                try_send_issue_comment(
+                    api_base,
+                    token,
+                    issue_number,
+                    format_result_comment(
+                        command_summary,
+                        mode_text,
+                        target_branch,
+                        pr_head_sha,
+                        failure_message="Failed to merge PR before build/upload. Check mergeability and required checks.",
+                    ),
+                    comment_id=status_comment_id,
+                )
+                return 1
+
+            if not merge_response.get("merged"):
+                merge_message = merge_response.get(
+                    "message", "PR merge failed for an unknown reason."
+                )
+                try_send_issue_comment(
+                    api_base,
+                    token,
+                    issue_number,
+                    format_result_comment(
+                        command_summary,
+                        mode_text,
+                        target_branch,
+                        pr_head_sha,
+                        failure_message=f"PR merge failed: {merge_message}",
+                    ),
+                    comment_id=status_comment_id,
+                )
+                return 1
+
+            merge_result_message = merge_response.get(
+                "message", "PR merged successfully."
+            )
     dispatches = []
     failed = []
 
@@ -500,30 +669,22 @@ def main():
         dispatches,
     )
 
-    mode_text = {
-        "build": "build only",
-        "build-and-upload": "build and upload",
-        "merge-and-upload": "merge, build and upload",
-    }[command]
-
-    lines = [
-        "Build request processed.",
-        "",
-        f"Command: `{command_summary}`",
-        f"Mode: `{mode_text}`",
-        f"Target branch: `{target_branch}`",
-        f"Triggered workflow: `{DISPATCH_WORKFLOW}`",
-    ]
-    if merge_result_message:
-        lines.extend(["", f"Merge result: {merge_result_message}"])
-    if dispatches:
-        lines.extend(format_dispatched_lines(dispatches))
-    if failed:
-        failed_text = ", ".join(f"{kernel} (HTTP {code})" for kernel, code in failed)
-        lines.extend(["", f"Failed ({len(failed)}): `{failed_text}`"])
-
-    comment_posted = try_post_issue_comment(api_base, token, issue_number, "\n".join(lines))
-    if not comment_posted:
+    comment_written = try_send_issue_comment(
+        api_base,
+        token,
+        issue_number,
+        format_result_comment(
+            command_summary,
+            mode_text,
+            target_branch,
+            pr_head_sha,
+            merge_result_message=merge_result_message,
+            dispatches=dispatches,
+            failed=failed,
+        ),
+        comment_id=status_comment_id,
+    )
+    if not comment_written:
         print(
             "Bot response could not be posted. Ensure workflow token has issues/pull-requests write permission.",
             file=sys.stderr,
