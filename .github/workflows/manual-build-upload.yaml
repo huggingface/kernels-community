@@ -87,10 +87,23 @@ jobs:
         env:
           USER: runner
 
+      - name: Validate kernel name input
+        id: validate-kernel-name
+        env:
+          KERNEL_INPUT: ${{ inputs.kernel_name }}
+        run: |
+          set -eu
+          # Only allow alphanumeric characters, hyphens, and underscores
+          if ! echo "$KERNEL_INPUT" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+            echo "Invalid kernel_name: must contain only alphanumeric characters, hyphens, and underscores"
+            exit 1
+          fi
+          echo "kernel_name=$KERNEL_INPUT" >> "$GITHUB_OUTPUT"
+
       - name: Validate kernel directory
         id: validate
         env:
-          KERNEL_INPUT: ${{ inputs.kernel_name }}
+          KERNEL_INPUT: ${{ steps.validate-kernel-name.outputs.kernel_name }}
         run: |
           set -eu
           if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release" "${KERNEL_INPUT}: manual dispatch"); then
