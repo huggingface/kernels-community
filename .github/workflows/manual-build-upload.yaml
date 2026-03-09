@@ -1,4 +1,6 @@
 name: Manual Kernel Build
+run-name: >-
+  Manual Kernel Build / ${{ inputs.kernel_name }} / target=${{ inputs.target_branch }} / request=${{ inputs.dispatch_key }}
 
 on:
   workflow_dispatch:
@@ -13,6 +15,18 @@ on:
       target_branch:
         description: 'Target branch on kernels-community/<kernel> to publish to'
         required: true
+      upload:
+        description: 'Whether to upload after build (internal use by kernel-bot)'
+        required: false
+        default: 'true'
+      allow_main_dispatch:
+        description: 'Allow dispatch from default branch without pr_number (internal)'
+        required: false
+        default: 'false'
+      dispatch_key:
+        description: 'Unique request token for correlating workflow runs (internal)'
+        required: false
+        default: 'manual'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -24,7 +38,7 @@ jobs:
       group: aws-highmemory-32-plus-nix
     steps:
       - name: Ensure workflow is not run from main
-        if: ${{ github.ref == 'refs/heads/main' && inputs.pr_number == '' }}
+        if: ${{ github.ref == 'refs/heads/main' && inputs.pr_number == '' && inputs.allow_main_dispatch != 'true' }}
         run: |
           echo "❌ This workflow must be dispatched from a non-main branch."
           exit 1
@@ -79,6 +93,12 @@ jobs:
           KERNEL_INPUT: ${{ inputs.kernel_name }}
         run: |
           set -eu
+          case "$KERNEL_INPUT" in
+            ''|*[!A-Za-z0-9_-]*)
+              echo "Invalid kernel_name: must contain only alphanumeric characters, underscores, and hyphens"
+              exit 1
+              ;;
+          esac
           if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release" "${KERNEL_INPUT}: manual dispatch"); then
             echo "kernel=$KERNEL" >> "$GITHUB_OUTPUT"
           else
@@ -93,6 +113,7 @@ jobs:
           ( cd "$KERNEL" && nix run -L .#build-and-copy )
 
       - name: Upload kernel
+        if: ${{ inputs.upload == 'true' }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           TARGET_BRANCH: ${{ inputs.target_branch }}

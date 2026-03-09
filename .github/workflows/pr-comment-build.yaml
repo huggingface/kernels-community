@@ -24,8 +24,26 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
           COMMENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
           COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
           COMMENT_SENDER_TYPE: ${{ github.event.sender.type }}
           COMMENT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: python3 .github/scripts/pr_comment_kernel_bot.py
+        run: |
+          set -eu
+          if [ "${#COMMENT_BODY}" -gt 1024 ]; then
+            echo "Ignoring oversized comment payload."
+            exit 0
+          fi
+          case "$COMMENT_BODY" in
+            /kernel-bot*) ;;
+            *)
+              echo "Ignoring non /kernel-bot comment."
+              exit 0
+              ;;
+          esac
+          if ! printf '%s' "$COMMENT_BODY" | grep -Eq '^/kernel-bot[ A-Za-z0-9_./-]*$'; then
+            echo "Ignoring /kernel-bot comment with unsupported characters."
+            exit 0
+          fi
+          python3 .github/scripts/pr_comment_kernel_bot.py
