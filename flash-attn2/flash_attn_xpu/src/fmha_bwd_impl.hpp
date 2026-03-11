@@ -596,8 +596,12 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
             gemm_SdP(trait, mVt, mdO, rdP, tiled_mma_sdp);
             Tensor dS = make_tensor(rdP.data(), scores.layout());
             
-            // Apply dropout mask to P and dS (backward)
-            // In backward, we need to regenerate the same dropout mask used in forward
+            // Dropout backward: apply mask only to dP (gradient), keep P (scores) unchanged
+            // for softmax_backward. Then apply mask to P after softmax_backward for dV.
+            //
+            // Math: dS = scale * P * (mask * rp * dP_dropped - dpsum)
+            // where P is the original softmax output, dP_dropped = dO * V^T,
+            // and dpsum = sum(dO * O) with O having rp scaling from forward.
             if (param.dropout.is_enabled) {
                 int sg_local_id = sg.get_local_id();
                 uint32_t batch_head = bidb * param.num_head_q + bidh;
@@ -608,33 +612,65 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
                     taccScS_rt.data(),
                     convert_layout_2d_layout(taccScS_rt.layout()));
                 
+                // Step 1: Apply dropout mask to dS (g_Pd -> g_P = mask * rp * g_Pd)
+                // Keep scores (P) unchanged for softmax_backward multiplier
                 CUTLASS_PRAGMA_UNROLL
-                for (int ni = 0; ni < size<1>(scores); ++ni) {
-                    int n = get<1>(taccScS_rt_2d(0, ni)) + sg_local_id;
+                for (int ni = 0; ni < size<1>(dS); ++ni) {
+                    // get<1> is query dim (N dim of backward MMA St=Kt*Q)
+                    int query_in_block = get<1>(taccScS_rt_2d(0, ni)) + sg_local_id;
                     CUTLASS_PRAGMA_UNROLL
-                    for (int mi = 0; mi < size<0>(scores); ++mi) {
-                        int m = get<0>(taccScS_rt_2d(mi, ni));
-                        int row_idx = m_block * kBlockM + m;
-                        int col_idx = n_block * kBlockN + n;
+                    for (int mi = 0; mi < size<0>(dS); ++mi) {
+                        // get<0> is key dim (M dim of backward MMA)
+                        int key_in_block = get<0>(taccScS_rt_2d(mi, ni));
+                        int row_idx = m_block * kBlockM + query_in_block;
+                        int col_idx = n_block * kBlockN + key_in_block;
                         
                         bool keep = param.dropout.should_keep(batch_head, row_idx, col_idx);
                         if (keep) {
-                            // Scale both P and dP by rp_dropout = 1/(1-p)
-                            scores(mi, ni) = static_cast<V>(static_cast<float>(scores(mi, ni)) * rp_dropout);
                             dS(mi, ni) = static_cast<V>(static_cast<float>(dS(mi, ni)) * rp_dropout);
                         } else {
-                            scores(mi, ni) = V(0);
                             dS(mi, ni) = V(0);
                         }
                     }
                 }
             }
             
-            // dS = P * (dP - sum) * scale
+            // dS = P * (dP_masked - dpsum) * scale
+            // Uses ORIGINAL P from scores, and dropout-masked gradient from dS
             if (Is_even_M) {
                 softmax_backward<true>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax);
             } else {
                 softmax_backward<false>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax, tail_m);
+            }
+            
+            // Step 2: Apply dropout mask to P (scores) for dV computation
+            // P_dropped = mask * rp * P (or 0) for dV = P_dropped^T * dO
+            if (param.dropout.is_enabled) {
+                int sg_local_id = sg.get_local_id();
+                uint32_t batch_head = bidb * param.num_head_q + bidh;
+                float rp_dropout = param.dropout.get_scale();
+                
+                Tensor taccScS_rt_2d = make_tensor(
+                    taccScS_rt.data(),
+                    convert_layout_2d_layout(taccScS_rt.layout()));
+                
+                CUTLASS_PRAGMA_UNROLL
+                for (int ni = 0; ni < size<1>(scores); ++ni) {
+                    int query_in_block = get<1>(taccScS_rt_2d(0, ni)) + sg_local_id;
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int mi = 0; mi < size<0>(scores); ++mi) {
+                        int key_in_block = get<0>(taccScS_rt_2d(mi, ni));
+                        int row_idx = m_block * kBlockM + query_in_block;
+                        int col_idx = n_block * kBlockN + key_in_block;
+                        
+                        bool keep = param.dropout.should_keep(batch_head, row_idx, col_idx);
+                        if (keep) {
+                            scores(mi, ni) = static_cast<V>(static_cast<float>(scores(mi, ni)) * rp_dropout);
+                        } else {
+                            scores(mi, ni) = V(0);
+                        }
+                    }
+                }
             }
             
             // Mask out elements beyond seqlen_k to prevent NaN in dQ computation

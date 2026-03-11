@@ -53,7 +53,7 @@ mha_fwd(
     compat::select_device(device_idx);
 
     // check inputs
-    TORCH_CHECK(p_dropout == 0.0, "FlashAttentionForwardXPU kernel does not only support dropout > 0.0 yet");
+    TORCH_CHECK(p_dropout < 1.0f, "FlashAttention dropout probability must be less than 1.0");
 
     q = ensure_contiguous(q);
     const auto sizes = q.sizes();
@@ -137,6 +137,21 @@ mha_fwd(
         rng_state[1] = static_cast<int64_t>(philox_offset);
     }
 
+    // Allocate S_dmask for return_softmax (attention matrix with dropout sign-bit encoding)
+    // seqlen_q_rounded must be >= the kernel's Q tile size, otherwise the S_dmask
+    // write in the mainloop will go out of bounds for rows in the padding region
+    // of the tile.  The Q tile size depends on head_size (see fmha_utils.hpp):
+    const int q_tile_size = (head_size_og <= 32) ? 64 : (head_size_og <= 128) ? 128 : 256;
+    const int seqlen_q_rounded = round_multiple(seqlen_q, q_tile_size);
+    const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
+    at::Tensor S_dmask;
+    if (return_softmax) {
+        TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
+        S_dmask = torch::empty({batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded}, q.options());
+    } else {
+        S_dmask = torch::empty({0}, q.options());
+    }
+
     cutlass_fmha_fwd_fix_impl(
         queue,
         q_padded, k_padded, v_padded, out_padded,
@@ -144,7 +159,9 @@ mha_fwd(
         softmax_scale,
         window_size_left, window_size_right,
         is_causal, is_local,
-        p_dropout, philox_seed, philox_offset, nullptr);
+        p_dropout, philox_seed, philox_offset, nullptr,
+        return_softmax ? S_dmask.data_ptr() : nullptr,
+        seqlen_q_rounded, seqlen_k_rounded);
 
     // Remove padding from output
     at::Tensor out = out_padded;
@@ -154,9 +171,6 @@ mha_fwd(
     }
     out = ensure_contiguous(out);
 
-    // Always return a valid (possibly empty) tensor for S_dmask to ensure
-    // torch.compile compatibility — the meta function returns torch.empty((0,)).
-    at::Tensor S_dmask = at::empty({0}, q.options());
     return {out, softmax_lse, S_dmask, rng_state};
   }
 
@@ -186,7 +200,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads x head_siz
     compat::select_device(device_idx);
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(p_dropout == 0.0, "FlashAttentionBackwardXPU kernel does not only support dropout > 0.0 yet");
+    TORCH_CHECK(p_dropout < 1.0f, "FlashAttention dropout probability must be less than 1.0");
 
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
                 "FlashAttention backward only supports fp16 and bf16 data type");

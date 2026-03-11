@@ -165,7 +165,10 @@ void cutlass_fmha_fwd_fix_impl(
     float p_dropout,
     uint64_t philox_seed,
     uint64_t philox_offset,
-    void* rng_state) {
+    void* rng_state,
+    void* s_dmask,
+    int seqlen_q_rounded,
+    int seqlen_k_rounded) {
   int batch_size = query.size(0);
   int max_seqlen_q = query.size(1);
   int num_heads_q = query.size(2);
@@ -215,7 +218,10 @@ void cutlass_fmha_fwd_fix_impl(
       p_dropout,
       philox_seed,
       philox_offset,
-      rng_state};
+      rng_state,
+      s_dmask,
+      seqlen_q_rounded,
+      seqlen_k_rounded};
 
   CutlassType cuType = aten_to_Cutlass_dtype(query);
   const int h = args.head_size;
