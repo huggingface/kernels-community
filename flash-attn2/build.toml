@@ -169,7 +169,7 @@ src = [
 backend = "xpu"
 depends = [
     "torch",
-    "sycl_tla",
+    "cutlass_sycl",
 ]
 src = [
     "flash_attn_xpu/flash_api.cpp",
