@@ -320,7 +320,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads x head_siz
         dout_padded, q_padded, k_padded, v_padded, out_padded, softmax_lse,
         dq_work, dk_expanded, dv_expanded, softmax_d,
         softmax_scale, window_size_left, window_size_right, is_causal, is_local,
-        p_dropout, philox_seed, philox_offset);
+        p_dropout, philox_seed, philox_offset, deterministic);
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {

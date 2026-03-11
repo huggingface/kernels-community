@@ -2539,8 +2539,6 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype, device):
 def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype, device):
     if device == "cpu":
         pytest.skip("backward not supported on CPU")
-    if device == "xpu":
-        pytest.skip("deterministic bwd test not supported on xpu currently")
     if (
         device == "cuda"
         and max(seqlen_q, seqlen_k) >= 2048

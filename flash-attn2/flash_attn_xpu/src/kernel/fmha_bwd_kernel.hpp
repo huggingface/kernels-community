@@ -166,6 +166,9 @@ struct BwdParam {
 
     bool is_bhsd;
     bool is_local;
+    bool deterministic;
+    int nsplits;
+    int dq_accum_split_stride;
     
     // Dropout
     cutlass::fmha::Dropout dropout;

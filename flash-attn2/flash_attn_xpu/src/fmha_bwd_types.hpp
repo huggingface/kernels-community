@@ -41,6 +41,10 @@ struct fmha_bwd_args_t {
   bool is_bf16 = false;
   bool deterministic = false;
 
+  // Deterministic mode parameters
+  int nsplits = 1;
+  int dq_accum_split_stride = 0;
+
   // Window size for local attention
   int window_size_left = -1;
   int window_size_right = -1;

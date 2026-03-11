@@ -888,7 +888,28 @@ convert_dq(T &trait, BwdParam<typename T::DType> &param, int m_block, int bidb, 
     auto tdQrdQ = thr_save_dQ.partition_sg_fragment_S(gdQ);
     Tensor tdQgdQ = thr_save_dQ.partition_D(gdQ);
 
-    copy(tileloaddQ, tdQgdQaccum, tdQrdQaccum);
+    const int nsplits = param.nsplits;
+    if (nsplits <= 1) {
+        // Non-deterministic path: single split, direct copy
+        copy(tileloaddQ, tdQgdQaccum, tdQrdQaccum);
+    } else {
+        // Deterministic path: sum across all splits
+        // First read split 0
+        copy(tileloaddQ, tdQgdQaccum, tdQrdQaccum);
+        // Accumulate remaining splits
+        auto tdQrdQaccum_tmp = make_fragment_like(tdQrdQaccum);
+        for (int s = 1; s < nsplits; ++s) {
+            // Move pointer to next split
+            mdQaccum.data() = mdQaccum.data() + param.dq_accum_split_stride;
+            auto tileloaddQ_s = make_block_2d_copy_C(tiled_mma_dq, mdQaccum);
+            auto thr_load_dQ_s = tileloaddQ_s.get_slice(first_thread_in_sg_idx);
+            copy(tileloaddQ_s, thr_load_dQ_s.partition_S(gdQaccum), tdQrdQaccum_tmp);
+            #pragma unroll
+            for (int i = 0; i < size(tdQgdQaccum); ++i) {
+                tdQrdQaccum(i) += tdQrdQaccum_tmp(i);
+            }
+        }
+    }
     reorder(tdQrdQaccum, tdQrdQ);
     copy(tilesavedQ, tdQrdQ, tdQgdQ);
 }
@@ -914,6 +935,10 @@ mha_backward_seq(T trait, BwdParam<typename T::DType> param) {
     const int bidhq = BlockIdxY();
     const int bidnblk = BlockIdxX();
     const int bidhkv = bidhq / param.num_qh_per_kvh;
+    // For deterministic mode, each work-group writes to its own dq_accum split
+    if (param.deterministic) {
+        param.dqaccum_ptr = param.dqaccum_ptr + bidnblk * param.dq_accum_split_stride;
+    }
     for (int n_block = bidnblk; n_block < param.n_block; n_block += GridDimX()) {
         if (param.tail_n > 0 and n_block == param.n_block - 1)
             dq_dk_dv_1colblock<false, false>(trait, param, bidb, bidhq, bidhkv, param.n_block - 1, param.tail_n);
@@ -1003,6 +1028,9 @@ struct BwdKernelLauncher {
         param.window_size_left = args.window_size_left;
         param.window_size_right = args.window_size_right;
         param.is_local = args.is_local;
+        param.deterministic = args.deterministic;
+        param.nsplits = args.nsplits;
+        param.dq_accum_split_stride = args.dq_accum_split_stride;
         
         // Setup dropout
         param.dropout = cutlass::fmha::Dropout(args.philox_seed, args.philox_offset, args.p_dropout);
@@ -1024,7 +1052,15 @@ struct BwdKernelLauncher {
         compat::wait_and_throw();
 
         // Phase 2: Main backward pass
-        auto dimGrid1 = compat::dim3(size(ceil_div(param.n_block, param.num_nb_per_blk)),
+        int gridDimx;
+        if (args.deterministic) {
+            // Deterministic: fix grid X to nsplits so each work-group has
+            // a unique BlockIdxX and writes to its own dq_accum split
+            gridDimx = args.nsplits;
+        } else {
+            gridDimx = ceil_div(param.n_block, param.num_nb_per_blk);
+        }
+        auto dimGrid1 = compat::dim3(size(gridDimx),
                                      size(param.num_head_q), size(param.batch));
         auto dimBlock1 = compat::dim3(size(kNSGs * SubgroupSize), size(1), size(1));
         compat::experimental::launch_properties launch_props1{

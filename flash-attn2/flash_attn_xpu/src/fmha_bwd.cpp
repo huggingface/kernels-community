@@ -37,7 +37,8 @@ void cutlass_fmha_bwd_fix_impl(
     bool is_local,
     float p_dropout,
     uint64_t philox_seed,
-    uint64_t philox_offset) {
+    uint64_t philox_offset,
+    bool deterministic) {
 
     // Get dimensions from tensors - assuming BSHD layout (batch, seq, head, dim)
     int batch_size = q.size(0);
@@ -53,8 +54,24 @@ void cutlass_fmha_bwd_fix_impl(
     int seqlen_k_rounded = round_multiple(seqlen_k, 64);
 
     // Allocate dq_accum buffer (float)
-    auto dq_accum = at::zeros({batch_size, seqlen_q_rounded, num_heads_q, head_size}, 
-                               q.options().dtype(at::kFloat));
+    // For deterministic mode, allocate separate splits to avoid atomicAdd races
+    int nsplits = 1;
+    int dq_accum_split_stride = 0;
+    at::Tensor dq_accum;
+    if (!deterministic) {
+        dq_accum = at::zeros({batch_size, seqlen_q_rounded, num_heads_q, head_size}, 
+                              q.options().dtype(at::kFloat));
+    } else {
+        // Each work-group gets its own split to write dQ accumulator
+        // Use a reasonable number of splits based on batch/head parallelism
+        // Similar to CUDA: nsplits = ceil(num_compute_units / (batch * heads))
+        // Use 1024 as a proxy for XPU compute units (Xe-cores * threads)
+        const int num_compute_units = 1024;
+        nsplits = std::max((num_compute_units + batch_size * num_heads_q - 1) / (batch_size * num_heads_q), 1);
+        dq_accum = at::zeros({nsplits, batch_size, seqlen_q_rounded, num_heads_q, head_size}, 
+                              q.options().dtype(at::kFloat));
+        dq_accum_split_stride = batch_size * seqlen_q_rounded * num_heads_q * head_size;
+    }
 
     // Build args structure
     fmha_bwd_args_t args = {
@@ -81,7 +98,9 @@ void cutlass_fmha_bwd_fix_impl(
         is_causal,
         is_local,
         q.scalar_type() == at::ScalarType::BFloat16,
-        false,  // deterministic
+        deterministic,
+        nsplits,
+        dq_accum_split_stride,
         window_size_left,
         window_size_right,
         p_dropout,
