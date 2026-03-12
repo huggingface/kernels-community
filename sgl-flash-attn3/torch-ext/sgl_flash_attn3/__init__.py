@@ -86,7 +86,7 @@ def flash_attn_with_kvcache(
     rotary_seqlens = maybe_contiguous(rotary_seqlens)
     attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
-    out, softmax_lse, *rest = ops.fwd(
+    out, softmax_lse, *_ = ops.fwd(
         q,
         k_cache,
         v_cache,
@@ -123,7 +123,8 @@ def flash_attn_with_kvcache(
         sm_margin,
         sinks,
     )
-    return (out, softmax_lse, *rest) if return_softmax_lse else out
+
+    return (out, softmax_lse) if return_softmax_lse else out
 
 
 def flash_attn_varlen_func(
@@ -166,7 +167,7 @@ def flash_attn_varlen_func(
         )
     attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
-    out, softmax_lse, *rest = ops.fwd(
+    out, softmax_lse, *_ = ops.fwd(
         q,
         k,
         v,
@@ -204,4 +205,4 @@ def flash_attn_varlen_func(
         sinks,
     )
 
-    return (out, softmax_lse, *rest) if return_softmax_lse else out
+    return (out, softmax_lse) if return_softmax_lse else out

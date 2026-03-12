@@ -111,6 +111,45 @@ def test_flash_attn_with_kvcache_basic():
 
 @requires_fa3
 @pytest.mark.kernels_ci
+def test_flash_attn_with_kvcache_with_lse():
+    """Test that return_softmax_lse returns exactly output and finite LSE."""
+    from sgl_flash_attn3 import flash_attn_with_kvcache
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size = 2
+    seqlen_k = 128
+    nheads = 8
+    headdim = 128
+
+    q = torch.randn(batch_size, 1, nheads, headdim, device=device, dtype=dtype)
+    k_cache = torch.randn(
+        batch_size, seqlen_k, nheads, headdim, device=device, dtype=dtype
+    )
+    v_cache = torch.randn(
+        batch_size, seqlen_k, nheads, headdim, device=device, dtype=dtype
+    )
+    cache_seqlens = torch.full(
+        (batch_size,), seqlen_k, dtype=torch.int32, device=device
+    )
+
+    out, lse = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        causal=True,
+        return_softmax_lse=True,
+    )
+
+    assert out.shape == (batch_size, 1, nheads, headdim)
+    assert lse is not None
+    assert not torch.isnan(lse).any(), "LSE contains NaN"
+    assert not torch.isinf(lse).any(), "LSE contains Inf"
+
+
+@requires_fa3
+@pytest.mark.kernels_ci
 def test_flash_attn_varlen_with_lse():
     """Test that return_softmax_lse works and returns finite values."""
     from sgl_flash_attn3 import flash_attn_varlen_func
