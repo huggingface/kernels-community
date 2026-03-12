@@ -761,7 +761,7 @@ def test_flash_attn_varlen_qkvpacked(
         if alibi:
             pytest.skip("alibi not supported on xpu currently")
         if dropout_p != 0.0:
-            pytest.skip("dropout not supported on xpu currently")
+            pytest.skip("dropout for varlen not supported on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)
@@ -1234,6 +1234,8 @@ def test_flash_attn_varlen_output(
             pytest.skip("alibi not supported on xpu currently")
         if softcap != 0.0:
             pytest.skip("softcap not supported on xpu currently")
+        if dropout_p != 0.0:
+            pytest.skip("dropout for varlen not supported on xpu currently")
     if device == "cpu":
         if alibi:
             pytest.skip("alibi not supported on CPU")

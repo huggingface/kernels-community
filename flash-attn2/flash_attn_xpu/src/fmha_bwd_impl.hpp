@@ -894,17 +894,21 @@ convert_dq(T &trait, BwdParam<typename T::DType> &param, int m_block, int bidb, 
         copy(tileloaddQ, tdQgdQaccum, tdQrdQaccum);
     } else {
         // Deterministic path: sum across all splits
-        // First read split 0
+        // Read split 0
         copy(tileloaddQ, tdQgdQaccum, tdQrdQaccum);
+        // Create temporary register using the same partition method
+        auto tdQrdQaccum_tmp = thr_load_dQ.partition_sg_fragment_D(gdQaccum);
         // Accumulate remaining splits
-        auto tdQrdQaccum_tmp = make_fragment_like(tdQrdQaccum);
         for (int s = 1; s < nsplits; ++s) {
-            // Move pointer to next split
-            mdQaccum.data() = mdQaccum.data() + param.dq_accum_split_stride;
-            auto tileloaddQ_s = make_block_2d_copy_C(tiled_mma_dq, mdQaccum);
+            // Create tensor view for split s with the correct base pointer
+            Tensor mdQaccum_s = make_tensor(
+                make_gmem_ptr(param.dqaccum_ptr + dq_offset + (index_t)s * param.dq_accum_split_stride),
+                make_layout(Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                            make_stride(param.dq_r_stride, _1{})));
+            auto tileloaddQ_s = make_block_2d_copy_C(tiled_mma_dq, mdQaccum_s);
             auto thr_load_dQ_s = tileloaddQ_s.get_slice(first_thread_in_sg_idx);
             copy(tileloaddQ_s, thr_load_dQ_s.partition_S(gdQaccum), tdQrdQaccum_tmp);
-            #pragma unroll
+            CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < size(tdQgdQaccum); ++i) {
                 tdQrdQaccum(i) += tdQrdQaccum_tmp(i);
             }
@@ -1055,8 +1059,11 @@ struct BwdKernelLauncher {
         int gridDimx;
         if (args.deterministic) {
             // Deterministic: fix grid X to nsplits so each work-group has
-            // a unique BlockIdxX and writes to its own dq_accum split
-            gridDimx = args.nsplits;
+            // a unique BlockIdxX and writes to its own dq_accum split.
+            // Cap by actual N_BLOCK — no need for more splits than K blocks.
+            int actual_nsplits = std::min(args.nsplits, N_BLOCK);
+            gridDimx = actual_nsplits;
+            param.nsplits = actual_nsplits;
         } else {
             gridDimx = ceil_div(param.n_block, param.num_nb_per_blk);
         }

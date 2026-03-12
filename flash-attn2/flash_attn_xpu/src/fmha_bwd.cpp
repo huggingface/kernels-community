@@ -65,9 +65,13 @@ void cutlass_fmha_bwd_fix_impl(
         // Each work-group gets its own split to write dQ accumulator
         // Use a reasonable number of splits based on batch/head parallelism
         // Similar to CUDA: nsplits = ceil(num_compute_units / (batch * heads))
-        // Use 1024 as a proxy for XPU compute units (Xe-cores * threads)
-        const int num_compute_units = 1024;
+        // Query actual XPU compute units from the device
+        const int num_compute_units = static_cast<int>(queue.get_device().get_info<sycl::info::device::max_compute_units>());
         nsplits = std::max((num_compute_units + batch_size * num_heads_q - 1) / (batch_size * num_heads_q), 1);
+        // Cap nsplits by max possible N_BLOCK to avoid excessive memory allocation.
+        // The minimum kBlockN across all head size policies is 32.
+        const int max_n_blocks = std::max((seqlen_k + 31) / 32, 1);
+        nsplits = std::min(nsplits, max_n_blocks);
         dq_accum = at::zeros({nsplits, batch_size, seqlen_q_rounded, num_heads_q, head_size}, 
                               q.options().dtype(at::kFloat));
         dq_accum_split_stride = batch_size * seqlen_q_rounded * num_heads_q * head_size;
