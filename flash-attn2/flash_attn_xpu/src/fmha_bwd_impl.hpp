@@ -15,32 +15,33 @@
 
 using namespace cute;
 
-// Helper function to convert layout
+/// Convert a rank-3 CuTe layout to rank-2 by fusing the first two modes.
 template <typename Layout>
 auto convert_layout_2d_layout(Layout layout) {
-    auto l = make_layout(make_layout(get<0>(layout),
-                                     get<1>(layout)),
-                         get<2>(layout));
-    return l;
+    return make_layout(
+        make_layout(get<0>(layout), get<1>(layout)),
+        get<2>(layout));
 }
 
+/// Reshape a rank-3 accumulator layout (8, N, M) to ((1,N), M) for 2D indexing.
 template<typename Layout>
 CUTLASS_DEVICE auto convert_layout_acc_layout(Layout acc_layout) {
     static_assert(decltype(size<0>(acc_layout))::value == 8);
     static_assert(decltype(rank(acc_layout))::value == 3);
     auto l = logical_divide(acc_layout, Shape<_1>{});
-    auto l2 = make_layout(make_layout(get<0, 1>(l), get<1>(l)),
-                          make_layout(get<2>(l)));
-    return l2;
+    return make_layout(
+        make_layout(get<0, 1>(l), get<1>(l)),
+        make_layout(get<2>(l)));
 }
 
-// Apply causal mask to tensor
+/// Apply causal mask: set S[m,n] = -INF where column > row + diagonal_offset.
 template <typename Engine0, typename Layout0,
           typename Engine1, typename Layout1>
 CUTLASS_DEVICE void
 apply_mask_causal(Tensor<Engine0, Layout0> &tensor,
-                  Tensor<Engine1, Layout1> &rC,
-                  int m_offset, int n_offset, int diagonal_offset = 0) {
+                  Tensor<Engine1, Layout1> const &rC,
+                  const int m_offset, const int n_offset,
+                  const int diagonal_offset = 0) {
     auto sg = compat::get_nd_item<1>().get_sub_group();
     int sg_local_id = sg.get_local_id();
     Tensor rC_2d = make_tensor(
@@ -59,14 +60,13 @@ apply_mask_causal(Tensor<Engine0, Layout0> &tensor,
     }
 }
 
-// Apply seqlen_k boundary mask to tensor (for handling tail_n cases)
-// Sets elements beyond seqlen_k to zero to prevent NaN in dQ computation
+/// Apply seqlen_k boundary mask: zero out columns >= seqlen_k to prevent NaN in dQ.
 template <typename Engine0, typename Layout0,
           typename Engine1, typename Layout1>
 CUTLASS_DEVICE void
 apply_mask_seqlen_k(Tensor<Engine0, Layout0> &tensor,
-                    Tensor<Engine1, Layout1> &rC,
-                    int n_offset, int seqlen_k) {
+                    Tensor<Engine1, Layout1> const &rC,
+                    const int n_offset, const int seqlen_k) {
     auto sg = compat::get_nd_item<1>().get_sub_group();
     int sg_local_id = sg.get_local_id();
     Tensor rC_2d = make_tensor(
@@ -84,15 +84,15 @@ apply_mask_seqlen_k(Tensor<Engine0, Layout0> &tensor,
     }
 }
 
-// Apply local (sliding window) mask to tensor
+/// Apply sliding-window (local) attention mask.
 template <typename Engine0, typename Layout0,
           typename Engine1, typename Layout1>
 CUTLASS_DEVICE void
 apply_mask_local(Tensor<Engine0, Layout0> &tensor,
-                 Tensor<Engine1, Layout1> &rC,
-                 int m_offset, int n_offset,
-                 int window_size_left, int window_size_right,
-                 int seqlen_k_minus_seqlen_q = 0) {
+                 Tensor<Engine1, Layout1> const &rC,
+                 const int m_offset, const int n_offset,
+                 const int window_size_left, const int window_size_right,
+                 const int seqlen_k_minus_seqlen_q = 0) {
     auto sg = compat::get_nd_item<1>().get_sub_group();
     int sg_local_id = sg.get_local_id();
     Tensor rC_2d = make_tensor(
@@ -211,7 +211,7 @@ softmax_backward(Tensor<Engine0, Layout0> &P,
 template<bool Is_even_M, class Tensor0, class Tensor1, class Tensor2>
 CUTLASS_DEVICE void
 load_1colvec(Tensor0 &reg, Tensor1 &mT, Tensor2 &coord_row,
-             int tail_m = 0) {
+             const int tail_m = 0) {
     if constexpr(Is_even_M) {
         CUTLASS_PRAGMA_UNROLL
         for (int mi = 0; mi < size(reg); ++mi) {
@@ -428,8 +428,8 @@ mha_reorder_copy(Trait & trait, TiledMma &tiled_mma,
     mha_copy(trait, tiled_mma, r16, m);
 }
 
-// Helper function to round up to multiple
-inline int round_multiple(int x, int m) {
+// Helper function to round up to nearest multiple
+constexpr int round_up(int x, int m) {
     return (x + m - 1) / m * m;
 }
 
@@ -985,17 +985,17 @@ struct BwdKernelLauncher {
 
     cutlass::Status
     run(sycl::queue& queue, const fmha_bwd_args_t& args) {
-        auto trait = FABwdKernel{};
+        const auto trait = FABwdKernel{};
 
-        const int BATCH = args.batch_size;
-        const int NUM_HEAD_Q = args.num_heads_q;
+        const int BATCH      = args.batch_size;
+        const int NUM_HEAD_Q  = args.num_heads_q;
         const int NUM_HEAD_KV = args.num_heads_k;
-        const int SEQ_LEN_Q = args.seqlen_q;
-        const int SEQ_LEN_KV = args.seqlen_k;
-        const int N_BLOCK = ceil_div(SEQ_LEN_KV, kBlockN);
-        const int tail_n = SEQ_LEN_KV % kBlockN;
-        const int M_BLOCK = ceil_div(SEQ_LEN_Q, kBlockM);
-        const int tail_m = SEQ_LEN_Q % kBlockM;
+        const int SEQ_LEN_Q   = args.seqlen_q;
+        const int SEQ_LEN_KV  = args.seqlen_k;
+        const int N_BLOCK     = ceil_div(SEQ_LEN_KV, kBlockN);
+        const int tail_n      = SEQ_LEN_KV % kBlockN;
+        const int M_BLOCK     = ceil_div(SEQ_LEN_Q, kBlockM);
+        const int tail_m      = SEQ_LEN_Q % kBlockM;
         
         // Allocate intermediate buffer
         DType* pbuff = compat::malloc<DType>(BATCH * NUM_HEAD_Q * args.seqlen_k_rounded * 2 * kBlockM);
@@ -1148,29 +1148,18 @@ struct FMHABwdConfig {
 // bwd_policy_dispatch - similar to policy_dispatch in fmha_fwd_impl.hpp
 template <typename bwd_policy, int IsCausal = -1, int IsLocal = -1>
 void bwd_policy_dispatch(sycl::queue& queue, BwdCutlassType cuType, const fmha_bwd_args_t& args) {
+    auto dispatch = [&]<typename ElemT>(ElemT) {
+        using Config = FMHABwdConfig<bwd_policy, ElemT, ElemT, ElemT, ElemT>;
+        if constexpr (IsCausal != -1 && IsLocal != -1) {
+            return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
+        } else {
+            return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
+        }
+    };
+
     if (cuType == BwdCutlassType::half) {
-        using Config = FMHABwdConfig<
-            bwd_policy,
-            cute::half_t,
-            cute::half_t,
-            cute::half_t,
-            cute::half_t>;
-        if constexpr (IsCausal != -1 && IsLocal != -1) {
-            return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
-        } else {
-            return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
-        }
+        dispatch(cute::half_t{});
     } else {
-        using Config = FMHABwdConfig<
-            bwd_policy,
-            cute::bfloat16_t,
-            cute::bfloat16_t,
-            cute::bfloat16_t,
-            cute::bfloat16_t>;
-        if constexpr (IsCausal != -1 && IsLocal != -1) {
-            return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
-        } else {
-            return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
-        }
+        dispatch(cute::bfloat16_t{});
     }
 }

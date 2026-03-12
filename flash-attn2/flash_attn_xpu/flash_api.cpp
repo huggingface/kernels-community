@@ -8,23 +8,21 @@
 
 namespace FLASH_NAMESPACE {
 
-// Helper to get philox seed and offset from generator
+/// Retrieve Philox RNG seed and offset, advancing the generator state.
 inline std::pair<uint64_t, uint64_t> get_philox_state(
     std::optional<at::Generator> gen,
     int64_t counter_offset) {
-    auto gen_val = gen.has_value() ? gen.value() : at::xpu::detail::getDefaultXPUGenerator();
+    auto gen_val = gen.has_value() ? gen.value()
+                                  : at::xpu::detail::getDefaultXPUGenerator();
     auto* xpu_gen = at::check_generator<at::XPUGeneratorImpl>(gen_val);
-    // Get current state and advance
     auto [seed, offset] = xpu_gen->philox_engine_inputs(counter_offset);
     return {seed, offset};
 }
 
-inline int round_multiple(int x, int m) {
-    int pad_res = (x + m - 1) / m * m;
-    if (pad_res == 224) {
-        pad_res = 256;
-    }
-    return pad_res;
+/// Round `x` up to the nearest multiple of `m`.
+constexpr int round_multiple(int x, int m) {
+    const int pad_res = (x + m - 1) / m * m;
+    return (pad_res == 224) ? 256 : pad_res;
 }
 
 inline at::Tensor ensure_contiguous(const at::Tensor& tensor) {
@@ -78,13 +76,14 @@ mha_fwd(
 
     // XPU requires head_size to be a multiple of 32
     const int head_size_padded = round_multiple(head_size_og, 32);
+    const bool needs_padding = (head_size_og != head_size_padded);
 
     at::Tensor q_padded = q;
     at::Tensor k_padded = k;
     at::Tensor v_padded = v;
 
     // Apply padding if needed
-    if (head_size_og != head_size_padded) {
+    if (needs_padding) {
         const int pad_size = head_size_padded - head_size_og;
         q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, pad_size}));
         k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, pad_size}));
@@ -108,7 +107,7 @@ mha_fwd(
     auto opts = q.options().dtype(torch::kFloat32);
     at::Tensor softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts);
 
-    bool is_local = (window_size_left != -1) | (window_size_right != -1);
+    const bool is_local = (window_size_left != -1) || (window_size_right != -1);
 
     q_padded = ensure_contiguous(q_padded);
     k_padded = ensure_contiguous(k_padded);
@@ -116,7 +115,7 @@ mha_fwd(
 
     auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
 
-    // Handle dropout
+    // Handle dropout RNG state
     uint64_t philox_seed = 0;
     uint64_t philox_offset = 0;
 
@@ -163,13 +162,12 @@ mha_fwd(
         return_softmax ? S_dmask.data_ptr() : nullptr,
         seqlen_q_rounded, seqlen_k_rounded);
 
-    // Remove padding from output
-    at::Tensor out = out_padded;
-    if (head_size_og != head_size_padded) {
-        out = out_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
-                                torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)});
-    }
-    out = ensure_contiguous(out);
+    // Strip padding from output back to original head_size
+    at::Tensor out = needs_padding
+        ? out_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                            torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)})
+                    .contiguous()
+        : ensure_contiguous(out_padded);
 
     return {out, softmax_lse, S_dmask, rng_state};
   }
@@ -301,7 +299,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads x head_siz
         dv_expanded = dv_work;
     }
 
-    bool is_local = (window_size_left != -1) | (window_size_right != -1);
+    const bool is_local = (window_size_left != -1) || (window_size_right != -1);
 
     auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
 
@@ -412,34 +410,24 @@ mha_varlen_fwd(
 
     // XPU requires head_size to be a multiple of 32
     const int head_size_padded = round_multiple(head_size_og, 32);
+    const bool needs_padding = (head_size_og != head_size_padded);
+    const int pad_size = head_size_padded - head_size_og;
 
-    at::Tensor q_padded = q;
-    at::Tensor k_padded = k;
-    at::Tensor v_padded = v;
+    auto maybe_pad = [&](const at::Tensor& t) -> at::Tensor {
+        return needs_padding
+            ? torch::nn::functional::pad(t, torch::nn::functional::PadFuncOptions({0, pad_size}))
+            : t;
+    };
 
-    // Apply padding if needed
-    if (head_size_og != head_size_padded) {
-        const int pad_size = head_size_padded - head_size_og;
-        q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, pad_size}));
-        k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, pad_size}));
-        v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, pad_size}));
-    }
+    at::Tensor q_padded = maybe_pad(q);
+    at::Tensor k_padded = maybe_pad(k);
+    at::Tensor v_padded = maybe_pad(v);
 
-    at::Tensor out_padded;
-    if (out_.has_value()) {
-        auto out_val = out_.value();
-        if (head_size_og != head_size_padded) {
-            const int pad_size = head_size_padded - head_size_og;
-            out_padded = torch::nn::functional::pad(out_val, torch::nn::functional::PadFuncOptions({0, pad_size}));
-        } else {
-            out_padded = out_val;
-        }
-    } else {
-        out_padded = torch::zeros_like(q_padded);
-    }
+    at::Tensor out_padded = out_.has_value() ? maybe_pad(out_.value())
+                                             : torch::zeros_like(q_padded);
 
-    bool is_local = (window_size_left != -1) | (window_size_right != -1);
-    bool is_paged = block_table_.has_value() && block_table_->defined();
+    const bool is_local = (window_size_left != -1) || (window_size_right != -1);
+    const bool is_paged = block_table_.has_value() && block_table_->defined();
 
     q_padded = ensure_contiguous(q_padded);
     k_padded = ensure_contiguous(k_padded);
@@ -462,13 +450,12 @@ mha_varlen_fwd(
         window_size_left, window_size_right,
         true, is_paged, is_causal, is_local);
 
-    // Remove padding from output
-    at::Tensor out = out_padded;
-    if (head_size_og != head_size_padded) {
-        out = out_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
-                                torch::indexing::Slice(0, head_size_og)});
-    }
-    out = ensure_contiguous(out);
+    // Strip padding from output back to original head_size
+    at::Tensor out = needs_padding
+        ? out_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                            torch::indexing::Slice(0, head_size_og)})
+                    .contiguous()
+        : ensure_contiguous(out_padded);
 
     at::Tensor S_dmask;
     at::Tensor rng_state;
@@ -570,6 +557,8 @@ mha_varlen_fwd(
         cu_seqlens_q, 
         cu_seqlens_k,
         seqused_k,
+        // reinterpret_cast: c10::optional<T> and std::optional<const T> share
+        // the same ABI layout; this avoids an unnecessary copy.
         reinterpret_cast<std::optional<const at::Tensor>&>(leftpad_k_),
         block_table_,
         alibi_slopes_,
@@ -586,6 +575,7 @@ mha_varlen_fwd(
         gen_
     );
 }
+
 std::vector<torch::Tensor>
 mha_bwd(const torch::Tensor &dout,
         const torch::Tensor &q,
@@ -606,12 +596,16 @@ mha_bwd(const torch::Tensor &dout,
         const bool deterministic,
         c10::optional<at::Generator> gen_,
         const c10::optional<torch::Tensor> &rng_state) {
-    // Convert optional types
-    std::optional<at::Tensor> dq_opt = dq_.has_value() ? std::optional<at::Tensor>(dq_.value()) : std::nullopt;
-    std::optional<at::Tensor> dk_opt = dk_.has_value() ? std::optional<at::Tensor>(dk_.value()) : std::nullopt;
-    std::optional<at::Tensor> dv_opt = dv_.has_value() ? std::optional<at::Tensor>(dv_.value()) : std::nullopt;
-    std::optional<at::Tensor> alibi_opt = alibi_slopes_.has_value() ? std::optional<at::Tensor>(alibi_slopes_.value()) : std::nullopt;
-    std::optional<at::Tensor> rng_opt = rng_state.has_value() ? std::optional<at::Tensor>(rng_state.value()) : std::nullopt;
+    // Helper: convert c10::optional<T> -> std::optional<T>
+    auto to_std_opt = [](const c10::optional<at::Tensor>& opt) -> std::optional<at::Tensor> {
+        return opt.has_value() ? std::optional<at::Tensor>(opt.value()) : std::nullopt;
+    };
+
+    auto dq_opt    = to_std_opt(dq_);
+    auto dk_opt    = to_std_opt(dk_);
+    auto dv_opt    = to_std_opt(dv_);
+    auto alibi_opt = to_std_opt(alibi_slopes_);
+    auto rng_opt   = to_std_opt(rng_state);
     
     return FLASH_NAMESPACE::mha_bwd(
         dout,
