@@ -48,6 +48,14 @@ jobs:
           else
             echo "skip=true" >> $GITHUB_OUTPUT
           fi
+      - name: "Check that repo-id is present"
+        if: steps.validate.outputs.skip == 'false'
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          if ! cat $KERNEL/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
+            echo "Mandatory repo-id is missing in $KERNEL/build.toml"
+            exit 1
+          fi
       - name: Build kernel
         if: steps.validate.outputs.skip == 'false'
         run: |
