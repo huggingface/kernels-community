@@ -42,7 +42,7 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "pr" "$PR_TITLE"); then
+          if KERNEL=$(echo "$PR_TITLE" | python3 .github/workflows/validate-kernel-pr.py "pr"); then
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
           else
