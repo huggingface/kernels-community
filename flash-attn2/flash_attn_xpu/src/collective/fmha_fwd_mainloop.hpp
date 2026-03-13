@@ -187,6 +187,10 @@ struct FMHAFwdMainloop<
     float p_dropout;
     uint64_t philox_seed;
     uint64_t philox_offset;
+    // S_dmask (return_softmax with dropout)
+    void* s_dmask_ptr;
+    int seqlen_q_rounded;
+    int seqlen_k_rounded;
   };
 
   // Kernel-facing parameters
@@ -199,6 +203,10 @@ struct FMHAFwdMainloop<
     int local_left, local_right;
     // Dropout
     cutlass::fmha::Dropout dropout;
+    // S_dmask (return_softmax with dropout)
+    void* s_dmask_ptr;
+    int seqlen_q_rounded;
+    int seqlen_k_rounded;
   };
 
   // SLM data
@@ -224,7 +232,10 @@ struct FMHAFwdMainloop<
         args.total_seqlen_kv,
         args.local_left,
         args.local_right,
-        cutlass::fmha::Dropout(args.philox_seed, args.philox_offset, args.p_dropout)};
+        cutlass::fmha::Dropout(args.philox_seed, args.philox_offset, args.p_dropout),
+        args.s_dmask_ptr,
+        args.seqlen_q_rounded,
+        args.seqlen_k_rounded};
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -446,15 +457,35 @@ struct FMHAFwdMainloop<
         Tensor gP = local_tile(
             cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
         auto cS_thread = thr_mma_qk.partition_C(gP);
-        // Encode batch and head into batch_head for unique random sequence
         uint32_t batch_head = static_cast<uint32_t>(idx_b * num_heads + head_q);
-        int sg_local_id = get_sub_group().get_local_id()[0];
-        
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tSrS.size(); ++i) {
-          int row_idx = get<0>(cS_thread(i));
-          int col_idx = get<1>(cS_thread(i)) + sg_local_id;
-          tSrS(i) = params.dropout.apply(tSrS(i), batch_head, row_idx, col_idx);
+
+        if (params.s_dmask_ptr != nullptr) {
+          // return_softmax path: write post-softmax P with sign-bit encoding
+          // XPU iterates K blocks left-to-right, so the values stored are
+          // exp(score * scale - prefix_running_max).
+          using ElementInput = typename TensorQ::element_type;
+          auto* s_dmask_base = reinterpret_cast<ElementInput*>(params.s_dmask_ptr);
+          int64_t bh_offset = int64_t(idx_b * num_heads + head_q)
+              * int64_t(params.seqlen_q_rounded) * params.seqlen_k_rounded;
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            int row_idx = get<0>(cS_thread(i));
+            int col_idx = get<1>(cS_thread(i));
+            bool keep = params.dropout.should_keep(batch_head, row_idx, col_idx);
+            ElementInput val = static_cast<ElementInput>(tSrS(i));
+            s_dmask_base[bh_offset + int64_t(row_idx) * params.seqlen_k_rounded + col_idx] =
+                keep ? val : -val;
+            tSrS(i) = keep ? tSrS(i) * params.dropout.get_scale() : ElementS(0);
+          }
+        } else {
+          // Fast path: dropout only, no S_dmask write
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            int row_idx = get<0>(cS_thread(i));
+            int col_idx = get<1>(cS_thread(i));
+            tSrS(i) = params.dropout.apply(tSrS(i), batch_head, row_idx, col_idx);
+          }
         }
       }
       

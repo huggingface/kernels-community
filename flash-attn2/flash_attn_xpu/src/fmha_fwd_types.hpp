@@ -34,6 +34,11 @@ struct fmha_fwd_args_t {
   uint64_t philox_seed = 0;   // Philox RNG seed
   uint64_t philox_offset = 0; // Philox RNG offset
   void* rng_state = nullptr;  // Output: RNG state for backward pass (2 x int64)
+
+  // S_dmask parameters (for return_softmax with dropout)
+  void* s_dmask = nullptr;    // Output: attention matrix with dropout sign-bit encoding
+  int seqlen_q_rounded = 0;   // Q sequence length rounded up (stride for s_dmask)
+  int seqlen_k_rounded = 0;   // K sequence length rounded up (stride for s_dmask)
 };
 
 enum class CutlassType {

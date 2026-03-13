@@ -2,21 +2,55 @@
 #include "torch/all.h"
 #include <sycl/sycl.hpp>
 
-// Helper to convert tensor dtype to BwdCutlassType
-inline BwdCutlassType aten_to_Bwd_Cutlass_dtype(const at::Tensor& tensor) {
+namespace {
+
+/// Map PyTorch scalar type to BwdCutlassType enum.
+[[nodiscard]] inline BwdCutlassType aten_to_Bwd_Cutlass_dtype(const at::Tensor& tensor) {
     if (tensor.scalar_type() == at::ScalarType::Half) {
         return BwdCutlassType::half;
-    } else if (tensor.scalar_type() == at::ScalarType::BFloat16) {
+    }
+    if (tensor.scalar_type() == at::ScalarType::BFloat16) {
         return BwdCutlassType::bfloat16;
+    }
+    throw std::runtime_error("Unsupported dtype for backward pass. Expected half or bfloat16.");
+}
+
+/// Round `x` up to the nearest multiple of `m`.
+constexpr int round_up(int x, int m) {
+    return (x + m - 1) / m * m;
+}
+
+/// Dispatch backward kernel by head_size with pre-resolved causal/local flags.
+template <typename Policy>
+void dispatch_bwd_causal_local(sycl::queue& queue, BwdCutlassType cuType,
+                               const fmha_bwd_args_t& args,
+                               bool is_causal, bool is_local) {
+    if (is_causal && is_local) {
+        bwd_policy_dispatch<Policy, 1, 1>(queue, cuType, args);
+    } else if (is_causal) {
+        bwd_policy_dispatch<Policy, 1, 0>(queue, cuType, args);
+    } else if (is_local) {
+        bwd_policy_dispatch<Policy, 0, 1>(queue, cuType, args);
     } else {
-        throw std::runtime_error("Unsupported dtype for backward pass. Expected half or bfloat16.");
+        bwd_policy_dispatch<Policy, 0, 0>(queue, cuType, args);
     }
 }
 
-// Helper function to round up to multiple
-inline int round_multiple(int x, int m) {
-    return (x + m - 1) / m * m;
+/// Dispatch backward kernel by head dimension.
+void dispatch_bwd_by_head(sycl::queue& queue, BwdCutlassType cuType,
+                          const fmha_bwd_args_t& args, int head_size,
+                          bool is_causal, bool is_local) {
+    if      (head_size <=  32) dispatch_bwd_causal_local<bwd_policy_head32> (queue, cuType, args, is_causal, is_local);
+    else if (head_size <=  64) dispatch_bwd_causal_local<bwd_policy_head64> (queue, cuType, args, is_causal, is_local);
+    else if (head_size <=  96) dispatch_bwd_causal_local<bwd_policy_head96> (queue, cuType, args, is_causal, is_local);
+    else if (head_size <= 128) dispatch_bwd_causal_local<bwd_policy_head128>(queue, cuType, args, is_causal, is_local);
+    else if (head_size <= 160) dispatch_bwd_causal_local<bwd_policy_head160>(queue, cuType, args, is_causal, is_local);
+    else if (head_size <= 192) dispatch_bwd_causal_local<bwd_policy_head192>(queue, cuType, args, is_causal, is_local);
+    else if (head_size <= 256) dispatch_bwd_causal_local<bwd_policy_head256>(queue, cuType, args, is_causal, is_local);
+    else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Max supported is 256");
 }
+
+}  // anonymous namespace
 
 void cutlass_fmha_bwd_fix_impl(
     sycl::queue& queue,
@@ -37,24 +71,45 @@ void cutlass_fmha_bwd_fix_impl(
     bool is_local,
     float p_dropout,
     uint64_t philox_seed,
-    uint64_t philox_offset) {
+    uint64_t philox_offset,
+    bool deterministic) {
 
-    // Get dimensions from tensors - assuming BSHD layout (batch, seq, head, dim)
-    int batch_size = q.size(0);
-    int seqlen_q = q.size(1);
-    int num_heads_q = q.size(2);
-    int head_size = q.size(3);
+    // Get dimensions from tensors — assuming BSHD layout (batch, seq, head, dim)
+    const int batch_size   = q.size(0);
+    const int seqlen_q     = q.size(1);
+    const int num_heads_q  = q.size(2);
+    const int head_size    = q.size(3);
 
-    int seqlen_k = k.size(1);
-    int num_heads_k = k.size(2);
+    const int seqlen_k     = k.size(1);
+    const int num_heads_k  = k.size(2);
 
     // Round up sequence lengths for internal buffers
-    int seqlen_q_rounded = round_multiple(seqlen_q, 64);
-    int seqlen_k_rounded = round_multiple(seqlen_k, 64);
+    const int seqlen_q_rounded = round_up(seqlen_q, 64);
+    const int seqlen_k_rounded = round_up(seqlen_k, 64);
 
     // Allocate dq_accum buffer (float)
-    auto dq_accum = at::zeros({batch_size, seqlen_q_rounded, num_heads_q, head_size}, 
-                               q.options().dtype(at::kFloat));
+    // For deterministic mode, allocate separate splits to avoid atomicAdd races
+    int nsplits = 1;
+    int dq_accum_split_stride = 0;
+    at::Tensor dq_accum;
+    if (!deterministic) {
+        dq_accum = at::zeros({batch_size, seqlen_q_rounded, num_heads_q, head_size}, 
+                              q.options().dtype(at::kFloat));
+    } else {
+        // Each work-group gets its own split to write dQ accumulator
+        // Use a reasonable number of splits based on batch/head parallelism
+        // Similar to CUDA: nsplits = ceil(num_compute_units / (batch * heads))
+        // Query actual XPU compute units from the device
+        const int num_compute_units = static_cast<int>(queue.get_device().get_info<sycl::info::device::max_compute_units>());
+        nsplits = std::max((num_compute_units + batch_size * num_heads_q - 1) / (batch_size * num_heads_q), 1);
+        // Cap nsplits by max possible N_BLOCK to avoid excessive memory allocation.
+        // The minimum kBlockN across all head size policies is 32.
+        const int max_n_blocks = std::max((seqlen_k + 31) / 32, 1);
+        nsplits = std::min(nsplits, max_n_blocks);
+        dq_accum = at::zeros({nsplits, batch_size, seqlen_q_rounded, num_heads_q, head_size}, 
+                              q.options().dtype(at::kFloat));
+        dq_accum_split_stride = batch_size * seqlen_q_rounded * num_heads_q * head_size;
+    }
 
     // Build args structure
     fmha_bwd_args_t args = {
@@ -81,7 +136,9 @@ void cutlass_fmha_bwd_fix_impl(
         is_causal,
         is_local,
         q.scalar_type() == at::ScalarType::BFloat16,
-        false,  // deterministic
+        deterministic,
+        nsplits,
+        dq_accum_split_stride,
         window_size_left,
         window_size_right,
         p_dropout,
@@ -89,88 +146,6 @@ void cutlass_fmha_bwd_fix_impl(
         philox_offset
     };
 
-    BwdCutlassType cuType = aten_to_Bwd_Cutlass_dtype(q);
-    const int h = args.head_size;
-
-    // Dispatch based on head size, causal mode, and local mode
-    if (h <= 32) {
-        if (is_causal && is_local) {
-            bwd_policy_dispatch<bwd_policy_head32, 1, 1>(queue, cuType, args);
-        } else if (is_causal) {
-            bwd_policy_dispatch<bwd_policy_head32, 1, 0>(queue, cuType, args);
-        } else if (is_local) {
-            bwd_policy_dispatch<bwd_policy_head32, 0, 1>(queue, cuType, args);
-        } else {
-            bwd_policy_dispatch<bwd_policy_head32, 0, 0>(queue, cuType, args);
-        }
-    }
-    else if (h <= 64) {
-        if (is_causal && is_local) {
-            bwd_policy_dispatch<bwd_policy_head64, 1, 1>(queue, cuType, args);
-        } else if (is_causal) {
-            bwd_policy_dispatch<bwd_policy_head64, 1, 0>(queue, cuType, args);
-        } else if (is_local) {
-            bwd_policy_dispatch<bwd_policy_head64, 0, 1>(queue, cuType, args);
-        } else {
-            bwd_policy_dispatch<bwd_policy_head64, 0, 0>(queue, cuType, args);
-        }
-    }
-    else if (h <= 96) {
-        if (is_causal && is_local) {
-            bwd_policy_dispatch<bwd_policy_head96, 1, 1>(queue, cuType, args);
-        } else if (is_causal) {
-            bwd_policy_dispatch<bwd_policy_head96, 1, 0>(queue, cuType, args);
-        } else if (is_local) {
-            bwd_policy_dispatch<bwd_policy_head96, 0, 1>(queue, cuType, args);
-        } else {
-            bwd_policy_dispatch<bwd_policy_head96, 0, 0>(queue, cuType, args);
-        }
-    }
-    else if (h <= 128) {
-        if (is_causal && is_local) {
-            bwd_policy_dispatch<bwd_policy_head128, 1, 1>(queue, cuType, args);
-        } else if (is_causal) {
-            bwd_policy_dispatch<bwd_policy_head128, 1, 0>(queue, cuType, args);
-        } else if (is_local) {
-            bwd_policy_dispatch<bwd_policy_head128, 0, 1>(queue, cuType, args);
-        } else {
-            bwd_policy_dispatch<bwd_policy_head128, 0, 0>(queue, cuType, args);
-        }
-    }
-    else if (h <= 160) {
-        if (is_causal && is_local) {
-            bwd_policy_dispatch<bwd_policy_head160, 1, 1>(queue, cuType, args);
-        } else if (is_causal) {
-            bwd_policy_dispatch<bwd_policy_head160, 1, 0>(queue, cuType, args);
-        } else if (is_local) {
-            bwd_policy_dispatch<bwd_policy_head160, 0, 1>(queue, cuType, args);
-        } else {
-            bwd_policy_dispatch<bwd_policy_head160, 0, 0>(queue, cuType, args);
-        }
-    }
-    else if (h <= 192) {
-        if (is_causal && is_local) {
-            bwd_policy_dispatch<bwd_policy_head192, 1, 1>(queue, cuType, args);
-        } else if (is_causal) {
-            bwd_policy_dispatch<bwd_policy_head192, 1, 0>(queue, cuType, args);
-        } else if (is_local) {
-            bwd_policy_dispatch<bwd_policy_head192, 0, 1>(queue, cuType, args);
-        } else {
-            bwd_policy_dispatch<bwd_policy_head192, 0, 0>(queue, cuType, args);
-        }
-    }
-    else if (h <= 256) {
-        if (is_causal && is_local) {
-            bwd_policy_dispatch<bwd_policy_head256, 1, 1>(queue, cuType, args);
-        } else if (is_causal) {
-            bwd_policy_dispatch<bwd_policy_head256, 1, 0>(queue, cuType, args);
-        } else if (is_local) {
-            bwd_policy_dispatch<bwd_policy_head256, 0, 1>(queue, cuType, args);
-        } else {
-            bwd_policy_dispatch<bwd_policy_head256, 0, 0>(queue, cuType, args);
-        }
-    }
-    else {
-        throw std::runtime_error("Unsupported head_size: " + std::to_string(h) + ". Max supported head_size is 256");
-    }
+    const BwdCutlassType cuType = aten_to_Bwd_Cutlass_dtype(q);
+    dispatch_bwd_by_head(queue, cuType, args, args.head_size, is_causal, is_local);
 }

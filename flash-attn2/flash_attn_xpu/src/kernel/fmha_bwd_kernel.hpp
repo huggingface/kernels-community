@@ -166,41 +166,45 @@ struct BwdParam {
 
     bool is_bhsd;
     bool is_local;
+    bool deterministic;
+    int nsplits;
+    int dq_accum_split_stride;
     
     // Dropout
     cutlass::fmha::Dropout dropout;
 };
 
+/// Computes linear offsets into the Q/K/V/dQ/dK/dV/O/LSE buffers.
 template<typename T>
 struct BwdOffset {
-    BwdOffset(BwdParam<T> &param_) : param(param_) {}
+    explicit BwdOffset(const BwdParam<T> &param_) : param(param_) {}
     
-    index_t q_offset(const index_t b_id, const index_t h_id, const index_t s_id) {
+    [[nodiscard]] index_t q_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
         return b_id * param.q_b_stride + h_id * param.q_h_stride + s_id * param.q_r_stride;
     }
-    index_t k_offset(const index_t b_id, const index_t h_id, const index_t s_id) {
+    [[nodiscard]] index_t k_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
         return b_id * param.k_b_stride + h_id * param.k_h_stride + s_id * param.k_r_stride;
     }
-    index_t v_offset(const index_t b_id, const index_t h_id, const index_t s_id) {
+    [[nodiscard]] index_t v_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
         return b_id * param.v_b_stride + h_id * param.v_h_stride + s_id * param.v_r_stride;
     }
-    index_t dk_offset(const index_t b_id, const index_t h_id, const index_t s_id) {
+    [[nodiscard]] index_t dk_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
         return b_id * param.dk_b_stride + h_id * param.dk_h_stride + s_id * param.dk_r_stride;
     }
-    index_t dv_offset(const index_t b_id, const index_t h_id, const index_t s_id) {
+    [[nodiscard]] index_t dv_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
         return b_id * param.dv_b_stride + h_id * param.dv_h_stride + s_id * param.dv_r_stride;
     }
-    index_t lse_offset(const index_t b_id, const index_t h_id, const index_t s_id) {
+    [[nodiscard]] index_t lse_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
         return b_id * param.seq_len_q * param.num_head_q + h_id * param.seq_len_q + s_id;
     }
-    index_t o_offset(const index_t b_id, const index_t h_id, const index_t s_id) {
+    [[nodiscard]] index_t o_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
         return b_id * param.o_b_stride + h_id * param.o_h_stride + s_id * param.o_r_stride;
     }
-    index_t dq_offset(const index_t b_id, const index_t h_id, const index_t s_id) {
+    [[nodiscard]] index_t dq_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
         return b_id * param.dq_b_stride + h_id * param.dq_h_stride + s_id * param.dq_r_stride;
     }
     
-    BwdParam<T> &param;
+    const BwdParam<T> &param;
 };
 
 // Setup strides for BHSD layout (batch, heads, seq, dim)

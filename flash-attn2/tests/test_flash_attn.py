@@ -518,7 +518,12 @@ def normalize_flash_attn_S(
     # so that when we do torch.exp(m - lse), we get 0.0 instead of NaN.
     lse[lse == float("-inf")] = float("inf")
     scores_max_block = torch.stack([torch.amax(s, dim=-1) for s in scores_block], dim=-1)
-    cummax_block = torch.cummax(scores_max_block.flip(-1), dim=-1).values.flip(-1).unbind(dim=-1)
+    # CUDA iterates K blocks right-to-left → suffix running max;
+    # XPU iterates K blocks left-to-right  → prefix running max.
+    if scores.device.type == "xpu":
+        cummax_block = torch.cummax(scores_max_block, dim=-1).values.unbind(dim=-1)
+    else:
+        cummax_block = torch.cummax(scores_max_block.flip(-1), dim=-1).values.flip(-1).unbind(dim=-1)
     attn_unnorm_block = attn_unnorm.split(block_size_n, dim=-1)
     attn_norm = torch.cat(
         [
@@ -596,8 +601,6 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
     if device == "xpu":
         if alibi:
             pytest.skip("alibi not supported on xpu currently")
-        if dropout_p != 0.0:
-            pytest.skip("dropout not supported on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)
@@ -758,7 +761,7 @@ def test_flash_attn_varlen_qkvpacked(
         if alibi:
             pytest.skip("alibi not supported on xpu currently")
         if dropout_p != 0.0:
-            pytest.skip("dropout not supported on xpu currently")
+            pytest.skip("dropout for varlen not supported on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)
@@ -945,8 +948,6 @@ def test_flash_attn_output(
     if device == "xpu":
         if alibi:
             pytest.skip("alibi not supported on xpu currently")
-        if dropout_p != 0.0:
-            pytest.skip("dropout not supported on xpu currently")
         if softcap != 0.0:
             pytest.skip("softcap not supported on xpu currently")
 
@@ -1231,10 +1232,10 @@ def test_flash_attn_varlen_output(
     if device == "xpu":
         if alibi:
             pytest.skip("alibi not supported on xpu currently")
-        if dropout_p != 0.0:
-            pytest.skip("dropout not supported on xpu currently")
         if softcap != 0.0:
             pytest.skip("softcap not supported on xpu currently")
+        if dropout_p != 0.0:
+            pytest.skip("dropout for varlen not supported on xpu currently")
     if device == "cpu":
         if alibi:
             pytest.skip("alibi not supported on CPU")
@@ -2307,9 +2308,6 @@ def _generate_block_kvcache(seqlen_k, paged_kv_block_size, batch_size, nheads_k,
 def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dtype, device):
     if device == "cpu":
         pytest.skip("Only varlen forward is supported on CPU")
-    if device == "xpu":
-        if dropout_p != 0.0:
-            pytest.skip("dropout not supported on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)
@@ -2330,7 +2328,7 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
         return
 
     g = torch.randn_like(out0)
-    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
+    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90) or device == "xpu":
         (
             dq0,
             dk0,
@@ -2345,7 +2343,7 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
         assert torch.equal(out, out0)
         assert torch.equal(lse, lse0)
 
-        if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
+        if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90) or device == "xpu":
             (
                 dq,
                 dk,
@@ -2543,8 +2541,6 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype, device):
 def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype, device):
     if device == "cpu":
         pytest.skip("backward not supported on CPU")
-    if device == "xpu":
-        pytest.skip("deterministic bwd test not supported on xpu currently")
     if (
         device == "cuda"
         and max(seqlen_q, seqlen_k) >= 2048
@@ -2607,7 +2603,7 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
     if device == "cpu":
         pytest.skip("backward not supported on CPU")
     if device == "xpu":
-        pytest.skip("bwd test not supported on xpu currently")
+        pytest.skip("varlen backward not supported on XPU currently")
     if (
         device == "cuda"
         and max(seqlen_q, seqlen_k) >= 2048

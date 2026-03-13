@@ -33,8 +33,12 @@ def _get_device():
 
 
 def _get_block_size_n(device, head_dim, is_dropout, is_causal):
-    # This should match the block sizes in the CUDA kernel
     assert head_dim <= 256
+
+    if device.type == "xpu":
+        return 64
+
+    # This should match the block sizes in the CUDA kernel
     major, minor = torch.cuda.get_device_capability(device)
     is_sm8x = major == 8 and minor > 0  # Only include sm86 and sm89, exclude sm80 (A100)
     is_sm80 = major == 8 and minor == 0

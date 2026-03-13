@@ -3,17 +3,17 @@
 #include "torch/all.h"
 #include <cute/tensor.hpp>
 
-inline CutlassType aten_to_Cutlass_dtype(const at::Tensor& input) {
-  CutlassType cuType;
+/// Map PyTorch scalar type to internal CutlassType enum.
+[[nodiscard]] inline CutlassType aten_to_Cutlass_dtype(const at::Tensor& input) {
   if (input.scalar_type() == torch::kHalf) {
-    cuType = CutlassType::half;
-  } else if (input.scalar_type() == torch::kBFloat16) {
-    cuType = CutlassType::bfloat16;
-  } else {
-    TORCH_INTERNAL_ASSERT(
-        false, "Current cutlass kernel only support half/bf16 data type.");
+    return CutlassType::half;
   }
-  return cuType;
+  if (input.scalar_type() == torch::kBFloat16) {
+    return CutlassType::bfloat16;
+  }
+  TORCH_INTERNAL_ASSERT(
+      false, "Current cutlass kernel only support half/bf16 data type.");
+  return {};  // unreachable; silences compiler warning
 }
 
 using namespace cute;

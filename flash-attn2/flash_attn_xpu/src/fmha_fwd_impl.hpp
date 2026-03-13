@@ -45,15 +45,20 @@ struct KernelLauncher {
   ProblemShapeType initialize(const fmha_fwd_args_t& args) {
     ProblemShapeType shape;
     ProblemShapeTypeInit shape_init;
-    auto batch = shape.batch = shape_init.batch = args.batch_size;
-    auto num_heads_q = shape.num_heads_q = shape_init.num_heads_q =
-        args.num_heads_q;
-    auto num_heads_kv = shape.num_heads_kv = shape_init.num_heads_kv =
-        args.num_heads_k;
-    auto head_size_qk = shape.head_size_qk = shape_init.head_size_qk =
-        args.head_size;
-    auto head_size_vo = shape.head_size_vo = shape_init.head_size_vo =
-        args.head_size;
+
+    // Common dimensions shared by both shape types
+    const auto num_heads_q  = args.num_heads_q;
+    const auto num_heads_kv = args.num_heads_k;
+    const auto head_size_qk = args.head_size;
+    const auto head_size_vo = args.head_size;
+
+    shape.batch       = shape_init.batch       = args.batch_size;
+    shape.num_heads_q = shape_init.num_heads_q = num_heads_q;
+    shape.num_heads_kv = shape_init.num_heads_kv = num_heads_kv;
+    shape.head_size_qk = shape_init.head_size_qk = head_size_qk;
+    shape.head_size_vo = shape_init.head_size_vo = head_size_vo;
+
+    auto batch = shape.batch;
 
     if constexpr (isVarLen) {
       batch = shape_init.batch = 1;
@@ -73,8 +78,8 @@ struct KernelLauncher {
       shape.seq_len_kv = shape_init.seq_len_kv = args.max_keys;
     }
 
-    auto seq_len_qo = shape_init.seq_len_qo;
-    auto seq_len_kv = shape_init.seq_len_kv;
+    const auto seq_len_qo = shape_init.seq_len_qo;
+    const auto seq_len_kv = shape_init.seq_len_kv;
 
     if constexpr (isVarLen) {
       stride_Q = cutlass::make_cute_packed_stride(
@@ -129,7 +134,10 @@ struct KernelLauncher {
          args.window_size_right,
          args.p_dropout,
          args.philox_seed,
-         args.philox_offset},
+         args.philox_offset,
+         args.s_dmask,
+         args.seqlen_q_rounded,
+         args.seqlen_k_rounded},
         {reinterpret_cast<float*>(args.softmax_lse),
          lse_stride_head,
          lse_stride_batch},
@@ -294,7 +302,7 @@ struct FMHAConfig {
 
 template <typename chunk_policy, int PipelineStages, int IsVarLen = -1, int IsPaged = -1>
 void policy_dispatch(sycl::queue& queue, CutlassType cuType, const fmha_fwd_args_t& args) {
-  if (cuType == CutlassType::half) {
+  auto dispatch = [&]<typename ElemT>(ElemT) {
     using Config = FMHAConfig<
         typename chunk_policy::ShapeQK,
         typename chunk_policy::ShapePV,
@@ -302,47 +310,19 @@ void policy_dispatch(sycl::queue& queue, CutlassType cuType, const fmha_fwd_args
         typename chunk_policy::SubgroupLayoutQK,
         void,
         PipelineStages,
-        half_t,
-        half_t,
-        half_t,
-        half_t>;
+        ElemT, ElemT, ElemT, ElemT>;
     if constexpr (IsVarLen != -1 && IsPaged != -1) {
       return Config::template kernel_dispatch<IsVarLen, IsPaged>(
-          queue,
-          args,
-          args.is_causal,
-          args.is_local);
+          queue, args, args.is_causal, args.is_local);
     } else {
       return Config::kernel_dispatch(
-          queue,
-          args,
-          args.is_varlen,
-          args.is_paged,
-          args.is_causal,
-          args.is_local);
+          queue, args, args.is_varlen, args.is_paged, args.is_causal, args.is_local);
     }
+  };
+
+  if (cuType == CutlassType::half) {
+    dispatch(half_t{});
   } else {
-    using Config = FMHAConfig<
-        typename chunk_policy::ShapeQK,
-        typename chunk_policy::ShapePV,
-        typename chunk_policy::ShapeOut,
-        typename chunk_policy::SubgroupLayoutQK,
-        void,
-        PipelineStages>;
-    if constexpr (IsVarLen != -1 && IsPaged != -1) {
-      return Config::template kernel_dispatch<IsVarLen, IsPaged>(
-          queue,
-          args,
-          args.is_causal,
-          args.is_local);
-    } else {
-      return Config::kernel_dispatch(
-          queue,
-          args,
-          args.is_varlen,
-          args.is_paged,
-          args.is_causal,
-          args.is_local);
-    }
+    dispatch(bfloat16_t{});
   }
 }

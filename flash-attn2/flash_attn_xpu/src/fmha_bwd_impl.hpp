@@ -15,32 +15,33 @@
 
 using namespace cute;
 
-// Helper function to convert layout
+/// Convert a rank-3 CuTe layout to rank-2 by fusing the first two modes.
 template <typename Layout>
 auto convert_layout_2d_layout(Layout layout) {
-    auto l = make_layout(make_layout(get<0>(layout),
-                                     get<1>(layout)),
-                         get<2>(layout));
-    return l;
+    return make_layout(
+        make_layout(get<0>(layout), get<1>(layout)),
+        get<2>(layout));
 }
 
+/// Reshape a rank-3 accumulator layout (8, N, M) to ((1,N), M) for 2D indexing.
 template<typename Layout>
 CUTLASS_DEVICE auto convert_layout_acc_layout(Layout acc_layout) {
     static_assert(decltype(size<0>(acc_layout))::value == 8);
     static_assert(decltype(rank(acc_layout))::value == 3);
     auto l = logical_divide(acc_layout, Shape<_1>{});
-    auto l2 = make_layout(make_layout(get<0, 1>(l), get<1>(l)),
-                          make_layout(get<2>(l)));
-    return l2;
+    return make_layout(
+        make_layout(get<0, 1>(l), get<1>(l)),
+        make_layout(get<2>(l)));
 }
 
-// Apply causal mask to tensor
+/// Apply causal mask: set S[m,n] = -INF where column > row + diagonal_offset.
 template <typename Engine0, typename Layout0,
           typename Engine1, typename Layout1>
 CUTLASS_DEVICE void
 apply_mask_causal(Tensor<Engine0, Layout0> &tensor,
-                  Tensor<Engine1, Layout1> &rC,
-                  int m_offset, int n_offset, int diagonal_offset = 0) {
+                  Tensor<Engine1, Layout1> const &rC,
+                  const int m_offset, const int n_offset,
+                  const int diagonal_offset = 0) {
     auto sg = compat::get_nd_item<1>().get_sub_group();
     int sg_local_id = sg.get_local_id();
     Tensor rC_2d = make_tensor(
@@ -59,14 +60,13 @@ apply_mask_causal(Tensor<Engine0, Layout0> &tensor,
     }
 }
 
-// Apply seqlen_k boundary mask to tensor (for handling tail_n cases)
-// Sets elements beyond seqlen_k to zero to prevent NaN in dQ computation
+/// Apply seqlen_k boundary mask: zero out columns >= seqlen_k to prevent NaN in dQ.
 template <typename Engine0, typename Layout0,
           typename Engine1, typename Layout1>
 CUTLASS_DEVICE void
 apply_mask_seqlen_k(Tensor<Engine0, Layout0> &tensor,
-                    Tensor<Engine1, Layout1> &rC,
-                    int n_offset, int seqlen_k) {
+                    Tensor<Engine1, Layout1> const &rC,
+                    const int n_offset, const int seqlen_k) {
     auto sg = compat::get_nd_item<1>().get_sub_group();
     int sg_local_id = sg.get_local_id();
     Tensor rC_2d = make_tensor(
@@ -84,15 +84,15 @@ apply_mask_seqlen_k(Tensor<Engine0, Layout0> &tensor,
     }
 }
 
-// Apply local (sliding window) mask to tensor
+/// Apply sliding-window (local) attention mask.
 template <typename Engine0, typename Layout0,
           typename Engine1, typename Layout1>
 CUTLASS_DEVICE void
 apply_mask_local(Tensor<Engine0, Layout0> &tensor,
-                 Tensor<Engine1, Layout1> &rC,
-                 int m_offset, int n_offset,
-                 int window_size_left, int window_size_right,
-                 int seqlen_k_minus_seqlen_q = 0) {
+                 Tensor<Engine1, Layout1> const &rC,
+                 const int m_offset, const int n_offset,
+                 const int window_size_left, const int window_size_right,
+                 const int seqlen_k_minus_seqlen_q = 0) {
     auto sg = compat::get_nd_item<1>().get_sub_group();
     int sg_local_id = sg.get_local_id();
     Tensor rC_2d = make_tensor(
@@ -211,7 +211,7 @@ softmax_backward(Tensor<Engine0, Layout0> &P,
 template<bool Is_even_M, class Tensor0, class Tensor1, class Tensor2>
 CUTLASS_DEVICE void
 load_1colvec(Tensor0 &reg, Tensor1 &mT, Tensor2 &coord_row,
-             int tail_m = 0) {
+             const int tail_m = 0) {
     if constexpr(Is_even_M) {
         CUTLASS_PRAGMA_UNROLL
         for (int mi = 0; mi < size(reg); ++mi) {
@@ -428,8 +428,8 @@ mha_reorder_copy(Trait & trait, TiledMma &tiled_mma,
     mha_copy(trait, tiled_mma, r16, m);
 }
 
-// Helper function to round up to multiple
-inline int round_multiple(int x, int m) {
+// Helper function to round up to nearest multiple
+constexpr int round_up(int x, int m) {
     return (x + m - 1) / m * m;
 }
 
@@ -596,8 +596,12 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
             gemm_SdP(trait, mVt, mdO, rdP, tiled_mma_sdp);
             Tensor dS = make_tensor(rdP.data(), scores.layout());
             
-            // Apply dropout mask to P and dS (backward)
-            // In backward, we need to regenerate the same dropout mask used in forward
+            // Dropout backward: apply mask only to dP (gradient), keep P (scores) unchanged
+            // for softmax_backward. Then apply mask to P after softmax_backward for dV.
+            //
+            // Math: dS = scale * P * (mask * rp * dP_dropped - dpsum)
+            // where P is the original softmax output, dP_dropped = dO * V^T,
+            // and dpsum = sum(dO * O) with O having rp scaling from forward.
             if (param.dropout.is_enabled) {
                 int sg_local_id = sg.get_local_id();
                 uint32_t batch_head = bidb * param.num_head_q + bidh;
@@ -608,33 +612,65 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
                     taccScS_rt.data(),
                     convert_layout_2d_layout(taccScS_rt.layout()));
                 
+                // Step 1: Apply dropout mask to dS (g_Pd -> g_P = mask * rp * g_Pd)
+                // Keep scores (P) unchanged for softmax_backward multiplier
                 CUTLASS_PRAGMA_UNROLL
-                for (int ni = 0; ni < size<1>(scores); ++ni) {
-                    int n = get<1>(taccScS_rt_2d(0, ni)) + sg_local_id;
+                for (int ni = 0; ni < size<1>(dS); ++ni) {
+                    // get<1> is query dim (N dim of backward MMA St=Kt*Q)
+                    int query_in_block = get<1>(taccScS_rt_2d(0, ni)) + sg_local_id;
                     CUTLASS_PRAGMA_UNROLL
-                    for (int mi = 0; mi < size<0>(scores); ++mi) {
-                        int m = get<0>(taccScS_rt_2d(mi, ni));
-                        int row_idx = m_block * kBlockM + m;
-                        int col_idx = n_block * kBlockN + n;
+                    for (int mi = 0; mi < size<0>(dS); ++mi) {
+                        // get<0> is key dim (M dim of backward MMA)
+                        int key_in_block = get<0>(taccScS_rt_2d(mi, ni));
+                        int row_idx = m_block * kBlockM + query_in_block;
+                        int col_idx = n_block * kBlockN + key_in_block;
                         
                         bool keep = param.dropout.should_keep(batch_head, row_idx, col_idx);
                         if (keep) {
-                            // Scale both P and dP by rp_dropout = 1/(1-p)
-                            scores(mi, ni) = static_cast<V>(static_cast<float>(scores(mi, ni)) * rp_dropout);
                             dS(mi, ni) = static_cast<V>(static_cast<float>(dS(mi, ni)) * rp_dropout);
                         } else {
-                            scores(mi, ni) = V(0);
                             dS(mi, ni) = V(0);
                         }
                     }
                 }
             }
             
-            // dS = P * (dP - sum) * scale
+            // dS = P * (dP_masked - dpsum) * scale
+            // Uses ORIGINAL P from scores, and dropout-masked gradient from dS
             if (Is_even_M) {
                 softmax_backward<true>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax);
             } else {
                 softmax_backward<false>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax, tail_m);
+            }
+            
+            // Step 2: Apply dropout mask to P (scores) for dV computation
+            // P_dropped = mask * rp * P (or 0) for dV = P_dropped^T * dO
+            if (param.dropout.is_enabled) {
+                int sg_local_id = sg.get_local_id();
+                uint32_t batch_head = bidb * param.num_head_q + bidh;
+                float rp_dropout = param.dropout.get_scale();
+                
+                Tensor taccScS_rt_2d = make_tensor(
+                    taccScS_rt.data(),
+                    convert_layout_2d_layout(taccScS_rt.layout()));
+                
+                CUTLASS_PRAGMA_UNROLL
+                for (int ni = 0; ni < size<1>(scores); ++ni) {
+                    int query_in_block = get<1>(taccScS_rt_2d(0, ni)) + sg_local_id;
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int mi = 0; mi < size<0>(scores); ++mi) {
+                        int key_in_block = get<0>(taccScS_rt_2d(mi, ni));
+                        int row_idx = m_block * kBlockM + query_in_block;
+                        int col_idx = n_block * kBlockN + key_in_block;
+                        
+                        bool keep = param.dropout.should_keep(batch_head, row_idx, col_idx);
+                        if (keep) {
+                            scores(mi, ni) = static_cast<V>(static_cast<float>(scores(mi, ni)) * rp_dropout);
+                        } else {
+                            scores(mi, ni) = V(0);
+                        }
+                    }
+                }
             }
             
             // Mask out elements beyond seqlen_k to prevent NaN in dQ computation
@@ -852,7 +888,32 @@ convert_dq(T &trait, BwdParam<typename T::DType> &param, int m_block, int bidb, 
     auto tdQrdQ = thr_save_dQ.partition_sg_fragment_S(gdQ);
     Tensor tdQgdQ = thr_save_dQ.partition_D(gdQ);
 
-    copy(tileloaddQ, tdQgdQaccum, tdQrdQaccum);
+    const int nsplits = param.nsplits;
+    if (nsplits <= 1) {
+        // Non-deterministic path: single split, direct copy
+        copy(tileloaddQ, tdQgdQaccum, tdQrdQaccum);
+    } else {
+        // Deterministic path: sum across all splits
+        // Read split 0
+        copy(tileloaddQ, tdQgdQaccum, tdQrdQaccum);
+        // Create temporary register using the same partition method
+        auto tdQrdQaccum_tmp = thr_load_dQ.partition_sg_fragment_D(gdQaccum);
+        // Accumulate remaining splits
+        for (int s = 1; s < nsplits; ++s) {
+            // Create tensor view for split s with the correct base pointer
+            Tensor mdQaccum_s = make_tensor(
+                make_gmem_ptr(param.dqaccum_ptr + dq_offset + (index_t)s * param.dq_accum_split_stride),
+                make_layout(Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                            make_stride(param.dq_r_stride, _1{})));
+            auto tileloaddQ_s = make_block_2d_copy_C(tiled_mma_dq, mdQaccum_s);
+            auto thr_load_dQ_s = tileloaddQ_s.get_slice(first_thread_in_sg_idx);
+            copy(tileloaddQ_s, thr_load_dQ_s.partition_S(gdQaccum), tdQrdQaccum_tmp);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(tdQgdQaccum); ++i) {
+                tdQrdQaccum(i) += tdQrdQaccum_tmp(i);
+            }
+        }
+    }
     reorder(tdQrdQaccum, tdQrdQ);
     copy(tilesavedQ, tdQrdQ, tdQgdQ);
 }
@@ -878,6 +939,10 @@ mha_backward_seq(T trait, BwdParam<typename T::DType> param) {
     const int bidhq = BlockIdxY();
     const int bidnblk = BlockIdxX();
     const int bidhkv = bidhq / param.num_qh_per_kvh;
+    // For deterministic mode, each work-group writes to its own dq_accum split
+    if (param.deterministic) {
+        param.dqaccum_ptr = param.dqaccum_ptr + bidnblk * param.dq_accum_split_stride;
+    }
     for (int n_block = bidnblk; n_block < param.n_block; n_block += GridDimX()) {
         if (param.tail_n > 0 and n_block == param.n_block - 1)
             dq_dk_dv_1colblock<false, false>(trait, param, bidb, bidhq, bidhkv, param.n_block - 1, param.tail_n);
@@ -920,17 +985,17 @@ struct BwdKernelLauncher {
 
     cutlass::Status
     run(sycl::queue& queue, const fmha_bwd_args_t& args) {
-        auto trait = FABwdKernel{};
+        const auto trait = FABwdKernel{};
 
-        const int BATCH = args.batch_size;
-        const int NUM_HEAD_Q = args.num_heads_q;
+        const int BATCH      = args.batch_size;
+        const int NUM_HEAD_Q  = args.num_heads_q;
         const int NUM_HEAD_KV = args.num_heads_k;
-        const int SEQ_LEN_Q = args.seqlen_q;
-        const int SEQ_LEN_KV = args.seqlen_k;
-        const int N_BLOCK = ceil_div(SEQ_LEN_KV, kBlockN);
-        const int tail_n = SEQ_LEN_KV % kBlockN;
-        const int M_BLOCK = ceil_div(SEQ_LEN_Q, kBlockM);
-        const int tail_m = SEQ_LEN_Q % kBlockM;
+        const int SEQ_LEN_Q   = args.seqlen_q;
+        const int SEQ_LEN_KV  = args.seqlen_k;
+        const int N_BLOCK     = ceil_div(SEQ_LEN_KV, kBlockN);
+        const int tail_n      = SEQ_LEN_KV % kBlockN;
+        const int M_BLOCK     = ceil_div(SEQ_LEN_Q, kBlockM);
+        const int tail_m      = SEQ_LEN_Q % kBlockM;
         
         // Allocate intermediate buffer
         DType* pbuff = compat::malloc<DType>(BATCH * NUM_HEAD_Q * args.seqlen_k_rounded * 2 * kBlockM);
@@ -967,6 +1032,9 @@ struct BwdKernelLauncher {
         param.window_size_left = args.window_size_left;
         param.window_size_right = args.window_size_right;
         param.is_local = args.is_local;
+        param.deterministic = args.deterministic;
+        param.nsplits = args.nsplits;
+        param.dq_accum_split_stride = args.dq_accum_split_stride;
         
         // Setup dropout
         param.dropout = cutlass::fmha::Dropout(args.philox_seed, args.philox_offset, args.p_dropout);
@@ -988,7 +1056,18 @@ struct BwdKernelLauncher {
         compat::wait_and_throw();
 
         // Phase 2: Main backward pass
-        auto dimGrid1 = compat::dim3(size(ceil_div(param.n_block, param.num_nb_per_blk)),
+        int gridDimx;
+        if (args.deterministic) {
+            // Deterministic: fix grid X to nsplits so each work-group has
+            // a unique BlockIdxX and writes to its own dq_accum split.
+            // Cap by actual N_BLOCK — no need for more splits than K blocks.
+            int actual_nsplits = std::min(args.nsplits, N_BLOCK);
+            gridDimx = actual_nsplits;
+            param.nsplits = actual_nsplits;
+        } else {
+            gridDimx = ceil_div(param.n_block, param.num_nb_per_blk);
+        }
+        auto dimGrid1 = compat::dim3(size(gridDimx),
                                      size(param.num_head_q), size(param.batch));
         auto dimBlock1 = compat::dim3(size(kNSGs * SubgroupSize), size(1), size(1));
         compat::experimental::launch_properties launch_props1{
@@ -1069,29 +1148,18 @@ struct FMHABwdConfig {
 // bwd_policy_dispatch - similar to policy_dispatch in fmha_fwd_impl.hpp
 template <typename bwd_policy, int IsCausal = -1, int IsLocal = -1>
 void bwd_policy_dispatch(sycl::queue& queue, BwdCutlassType cuType, const fmha_bwd_args_t& args) {
+    auto dispatch = [&]<typename ElemT>(ElemT) {
+        using Config = FMHABwdConfig<bwd_policy, ElemT, ElemT, ElemT, ElemT>;
+        if constexpr (IsCausal != -1 && IsLocal != -1) {
+            return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
+        } else {
+            return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
+        }
+    };
+
     if (cuType == BwdCutlassType::half) {
-        using Config = FMHABwdConfig<
-            bwd_policy,
-            cute::half_t,
-            cute::half_t,
-            cute::half_t,
-            cute::half_t>;
-        if constexpr (IsCausal != -1 && IsLocal != -1) {
-            return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
-        } else {
-            return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
-        }
+        dispatch(cute::half_t{});
     } else {
-        using Config = FMHABwdConfig<
-            bwd_policy,
-            cute::bfloat16_t,
-            cute::bfloat16_t,
-            cute::bfloat16_t,
-            cute::bfloat16_t>;
-        if constexpr (IsCausal != -1 && IsLocal != -1) {
-            return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
-        } else {
-            return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
-        }
+        dispatch(cute::bfloat16_t{});
     }
 }
