@@ -31,12 +31,16 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release" "$PR_TITLE"); then
+          python3 .github/workflows/validate-kernel-pr.py "release" "$PR_TITLE" > /tmp/validate_output.txt
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 0 ]; then
+            KERNEL=$(cat /tmp/validate_output.txt)
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
           else
             echo "skip=true" >> $GITHUB_OUTPUT
           fi
+          rm -f /tmp/validate_output.txt
       - name: "Check that repo-id is present"
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
