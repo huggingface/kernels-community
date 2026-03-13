@@ -1,0 +1,8 @@
+[general]
+name = "triton-kernels"
+backends = [
+    "cuda",
+]
+
+[general.hub]
+repo-id = "kernels-community/triton-kernels"

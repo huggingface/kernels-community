@@ -37,6 +37,7 @@ KERNEL_SOURCE_MAPPING = {
     "sgl-flash-attn3": "https://github.com/sgl-project/sgl-flash-attn",
     "tinygrad-rms": "https://github.com/tinygrad/tinygrad",
     "trimul-gpumode": "https://github.com/davidberard98/gpumode-trimul",
+    "triton-kernels": "https://github.com/triton-lang/triton.git",
     "vllm-flash-attn3": "https://github.com/Dao-AILab/flash-attention",
     "yoso": "https://github.com/mlpen/YOSO",
     "cv-utils": "",
