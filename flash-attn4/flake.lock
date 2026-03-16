@@ -41,16 +41,15 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1773673260,
+        "lastModified": 1773686332,
         "narHash": "sha256-+m+WzpcevJDaMfQWyEHwi2erFIonJdsV1hh01RkJZ0Q=",
         "owner": "huggingface",
         "repo": "kernels",
-        "rev": "ebe9b7ccd9886ad2ae20bf00a82de1c3884dddd5",
+        "rev": "76cd73a820c9650e7e1878182a45e329616e61c7",
         "type": "github"
       },
       "original": {
         "owner": "huggingface",
-        "ref": "tvm-ffi-python-dep",
         "repo": "kernels",
         "type": "github"
       }
