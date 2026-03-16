@@ -1,12 +1,68 @@
 # Copyright (c) 2025, Tri Dao.
 
-import math
-import operator
 
 import cutlass
 import cutlass.cute as cute
 
+from .quack import layout_utils
 from . import utils
+
+
+def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
+    """Reshape a tensor to fold qhead_per_kvhead into the seqlen dimension (mode 0).
+
+    The head dimension is at mode ``head_idx``.  Modes before it (1..head_idx-1)
+    are kept as-is (e.g. headdim for Q/O tensors), and modes after it are kept
+    as-is (e.g. batch).
+
+    For Q/O tensors (head_idx=2):
+        (seqlen_q, headdim, nheads, batch, ...) -> ((qhead_per_kvhead, seqlen_q), headdim, nheads_kv, batch, ...)
+    For LSE tensors (head_idx=1):
+        (seqlen_q, nheads, batch, ...) -> ((qhead_per_kvhead, seqlen_q), nheads_kv, batch, ...)
+    """
+    head_stride = T.stride[head_idx]
+    shape_packed = (
+        (qhead_per_kvhead, T.shape[0]),
+        *[T.shape[i] for i in range(1, head_idx)],
+        nheads_kv,
+        *[T.shape[i] for i in range(head_idx + 1, len(T.shape))],
+    )
+    stride_packed = (
+        (head_stride, T.stride[0]),
+        *[T.stride[i] for i in range(1, head_idx)],
+        head_stride * qhead_per_kvhead,
+        *[T.stride[i] for i in range(head_idx + 1, len(T.shape))],
+    )
+    return cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
+
+
+def unpack_gqa_layout(T, qhead_per_kvhead, head_idx):
+    """Reverse of pack_gqa_layout: unfold qhead_per_kvhead from the seqlen dimension (mode 0).
+
+    The head dimension is at mode ``head_idx``.  Modes before it (1..head_idx-1)
+    are kept as-is (e.g. headdim for Q/O tensors), and modes after it are kept
+    as-is (e.g. batch).
+
+    For Q/O tensors (head_idx=2):
+        ((qhead_per_kvhead, seqlen_q), headdim, nheads_kv, batch, ...) -> (seqlen_q, headdim, nheads, batch, ...)
+    For LSE tensors (head_idx=1):
+        ((qhead_per_kvhead, seqlen_q), nheads_kv, batch, ...) -> (seqlen_q, nheads, batch, ...)
+    """
+    seqlen_stride = T.stride[0][1]
+    head_stride = T.stride[0][0]
+    shape_unpacked = (
+        T.shape[0][1],
+        *[T.shape[i] for i in range(1, head_idx)],
+        T.shape[head_idx] * qhead_per_kvhead,
+        *[T.shape[i] for i in range(head_idx + 1, len(T.shape))],
+    )
+    stride_unpacked = (
+        seqlen_stride,
+        *[T.stride[i] for i in range(1, head_idx)],
+        head_stride,
+        *[T.stride[i] for i in range(head_idx + 1, len(T.shape))],
+    )
+    return cute.make_tensor(T.iterator, cute.make_layout(shape_unpacked, stride=stride_unpacked))
 
 
 class PackGQA:
@@ -100,7 +156,7 @@ class PackGQA:
         thr_mma = tiled_mma.get_slice(tidx)
         caccO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
         taccOcO = thr_mma.partition_C(caccO)
-        taccOcO_row = utils.make_acc_tensor_mn_view(taccOcO)[None, 0]
+        taccOcO_row = layout_utils.reshape_acc_to_mn(taccOcO)[None, 0]
         assert cute.size(tLSErLSE) == cute.size(taccOcO_row)
         threads_per_row = tiled_mma.tv_layout_C.shape[0][0]
         assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"

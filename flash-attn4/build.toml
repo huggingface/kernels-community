@@ -1,6 +1,7 @@
 [general]
 name = "flash-attn-cute"
 backends = [ "cuda" ]
+python-depends = [ "einops", "tvm-ffi" ]
 
 [general.cuda]
 minver = "12.8"
