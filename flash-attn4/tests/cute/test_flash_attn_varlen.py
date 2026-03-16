@@ -1,11 +1,9 @@
-import itertools
 from typing import Optional
-from einops import rearrange
 import pytest
 
 import torch
 import torch.nn.functional as F
-from flash_attn_cute import flash_attn_varlen_func
+from flash_attn4 import flash_attn_varlen_func
 
 @pytest.mark.parametrize("B", [1, 7, 20])
 @pytest.mark.parametrize("H", [1, 4, 6])
@@ -40,10 +38,6 @@ def test_varlen(
         dtype=dtype
     )
 
-    # SM100 (Blackwell) backward pass doesn't support varlen yet
-    compute_capability = torch.cuda.get_device_capability()[0]
-    skip_backward = (compute_capability == 10)
-
     ok = check_varlen_vs_torch_flash(
         q, k, v,
         cu_seqlens_q, cu_seqlens_k,
@@ -51,7 +45,6 @@ def test_varlen(
         softmax_scale=softmax_scale,
         causal=causal,
         mha_type=mha_type,
-        skip_backward=skip_backward,
     )
     assert ok
 
@@ -69,7 +62,6 @@ def check_varlen_vs_torch_flash(
     softcap=0.0,
     atol=3e-2,
     rtol=3e-2,
-    skip_backward=False,
 ):
     assert q.requires_grad and k.requires_grad and v.requires_grad, "Set requires_grad=True on inputs"
 
@@ -125,10 +117,6 @@ def check_varlen_vs_torch_flash(
     ok_fwd = torch.allclose(out_fa.float(), out_t.float(), atol=atol, rtol=rtol)
     if not ok_fwd:
         return False
-
-    # Skip backward if not supported (e.g., SM100 varlen)
-    if skip_backward:
-        return True
 
     # Use the same upstream gradient to compare backward paths
     grad_out = torch.randn_like(out_fa)
