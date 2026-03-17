@@ -76,9 +76,6 @@ def test_flash_attn_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
-    is_sm90 = torch.cuda.get_device_capability()[0] == 9
-    if is_sm90 and d == 192:
-        pytest.xfail("headdim 192 not supported on sm90")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -333,14 +330,14 @@ def test_flash_attn_output(
                 max_idx = diff_dv.argmax()
                 print(f"dV max diff: {diff_dv.max().item()}")
                 print(f"  at index {max_idx.item()}: dV={dv.flatten()[max_idx].item()}, dV2={dv2.flatten()[max_idx].item()}")
-
+                
                 # print(f"dQ max diff with myself: {(dq - dq2).abs().max().item()}")
                 # print(f"dK max diff with myself: {(dk - dk2).abs().max().item()}")
                 # print(f"dV max diff with myself: {(dv - dv2).abs().max().item()}")
                 # print(f"dQ mean diff with myself: {(dq - dq2).abs().mean().item()}")
                 # print(f"dK mean diff with myself: {(dk - dk2).abs().mean().item()}")
                 # print(f"dV mean diff with myself: {(dv - dv2).abs().mean().item()}")
-
+                
                 assert torch.equal(dq, dq2)
                 assert torch.equal(dk, dk2)
                 assert torch.equal(dv, dv2)
@@ -415,8 +412,8 @@ def test_flash_attn_varlen_output(
     is_sm90 = torch.cuda.get_device_capability()[0] == 9
     if is_sm90 and local:
         pytest.xfail("bwd local attention not supported on sm90")
-    if is_sm90 and d == 192:
-        pytest.xfail("headdim 192 not supported on sm90")
+    if is_sm90 and deterministic:
+        pytest.xfail("bwd deterministic not supported on sm90")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
@@ -780,7 +777,7 @@ def test_flash_attn_varlen_output(
                 if i % 100 == 0:
                     print(f"dV max diff: {diff_dv.max().item()}")
                     print(f"  at index {max_idx.item()}: dV={dv_unpad.flatten()[max_idx].item()}, dV2={dv_unpad2.flatten()[max_idx].item()}")
-
+                
                 assert torch.equal(dq_unpad, dq_unpad2)
                 assert torch.equal(dk_unpad, dk_unpad2)
                 assert torch.equal(dv_unpad, dv_unpad2)

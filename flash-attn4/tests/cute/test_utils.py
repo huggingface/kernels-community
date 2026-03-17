@@ -210,3 +210,4 @@ class TestHashCallableIntegration:
         # getsource should never be called because __cute_hash__ is set
         assert call_count[0] == 0, f"getsource was called {call_count[0]} times"
         assert hash1 == hash2 == hash3 == "inductor-generated-hash"
+

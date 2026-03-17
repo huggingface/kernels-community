@@ -22,7 +22,6 @@ from .mask import AttentionMask
 from .seqlen_info import SeqlenInfoQK
 from .quack.cute_dsl_utils import ParamsBase
 from .tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
-from .block_sparsity import BlockSparseTensors
 
 
 class FlashAttentionBackwardSm80:
@@ -382,14 +381,8 @@ class FlashAttentionBackwardSm80:
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
-        mdK_semaphore: Optional[cute.Tensor] = None,
-        mdV_semaphore: Optional[cute.Tensor] = None,
-        aux_tensors: Optional[list] = None,
-        blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
-        assert mdQ_semaphore is None and mdK_semaphore is None and mdV_semaphore is None, (
-            "determinism not supported yet for Sm80"
-        )
+        assert mdQ_semaphore is None, "semaphore not supported yet"
         # Get the data type and check if it is fp16 or bf16
         self._check_type(*(t.element_type if t is not None else None
                            for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)))
@@ -519,17 +512,7 @@ class FlashAttentionBackwardSm80:
         n_block, head_idx, batch_idx, _ = work_tile.tile_idx
 
         if work_tile.is_valid_tile:
-            seqlen = SeqlenInfoQK.create(
-                batch_idx,
-                mQ.shape[1],
-                mK.shape[1],
-                mCuSeqlensQ=mCuSeqlensQ,
-                mCuSeqlensK=mCuSeqlensK,
-                mSeqUsedQ=mSeqUsedQ,
-                mSeqUsedK=mSeqUsedK,
-                tile_m=self.m_block_size,
-                tile_n=self.n_block_size,
-            )
+            seqlen = SeqlenInfoQK.create(batch_idx, mQ.shape[1], mK.shape[1], mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK, mSeqUsedQ=mSeqUsedQ, mSeqUsedK=mSeqUsedK)
 
             m_block_max = cute.ceil_div(seqlen.seqlen_q, self.m_block_size)
             m_block_min = 0
@@ -555,7 +538,7 @@ class FlashAttentionBackwardSm80:
                 mdPsum_cur = mdPsum[batch_idx, head_idx, None]
                 mdQaccum_cur = mdQaccum[batch_idx, head_idx, None]
             else:
-                padded_offset_q = seqlen.padded_offset_q
+                padded_offset_q = seqlen.offset_q + batch_idx * self.m_block_size
                 mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, head_idx, None])
                 mLSE_cur = cute.domain_offset((padded_offset_q,), mLSE[head_idx, None])
                 mdO_cur = cute.domain_offset((seqlen.offset_q, 0), mdO[None, head_idx, None])
@@ -811,10 +794,9 @@ class FlashAttentionBackwardSm80:
             # Mainloop
             # ///////////////////////////////////////////////////////////////////////////////
             # Start processing of the first n-block.
-            mask = AttentionMask(self.m_block_size, self.n_block_size, seqlen)
+            mask = AttentionMask(self.m_block_size, self.n_block_size, seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
                 mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
-                batch_idx=batch_idx, head_idx=head_idx,
                 mask_seqlen=True, mask_causal=self.is_causal
             )
             smem_pipe_read_q = cutlass.Int32(0)
@@ -986,7 +968,7 @@ class FlashAttentionBackwardSm80:
 
         # MMA dK
         if cutlass.const_expr(self.Mma_dKV_is_RS):
-            tdKrdS = layout_utils.reshape_acc_to_frgA(rdS)
+            tdVrP = layout_utils.reshape_acc_to_frgA(rdS)
         else:
             tdKrdS = mma_params.tdKrdS
         sm80_utils.gemm(
