@@ -1,0 +1,29 @@
+[general]
+name = "mamba_selective_scan"
+backends = ["cpu"]
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.mamba_selective_scan]
+backend = "cpu"
+depends = ["torch"]
+include = ["mamba_selective_scan_cpu"]
+src = [
+    "mamba_selective_scan_cpu/mamba_selective_scan.cpp",
+    "mamba_selective_scan_cpu/mamba_selective_scan.hpp",
+    "mamba_selective_scan_cpu/cpu_feature.hpp",
+]
+
+[kernel.mamba_selective_scan_sve]
+backend = "cpu"
+cxx-flags = ["-march=armv8-a+sve", "-O3", "-ffast-math"]
+depends = ["torch"]
+include = ["mamba_selective_scan_cpu"]
+src = [
+    "mamba_selective_scan_cpu/mamba_selective_scan_sve.cpp",
+    "mamba_selective_scan_cpu/mamba_selective_scan_sve.hpp",
+]
