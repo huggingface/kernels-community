@@ -103,3 +103,6 @@ src = [
   "deep_gemm/include/deep_gemm/impls/sm90_tf32_hc_prenorm_gemm.cuh",
   "deep_gemm/include/deep_gemm/impls/sm100_bmk_bnk_mn.cuh",
 ]
+
+[general.hub]
+repo-id = "kernels-community/deep-gemm"
