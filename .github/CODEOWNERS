@@ -16,6 +16,7 @@
 /deformable-detr/ @danieldk
 /flash-attn2/ @drbh @MekkCyber
 /flash-attn3/ @danieldk @MekkCyber
+/flash-attn4/ @danieldk
 /layer_norm/ @MekkCyber
 /mamba-ssm/ @danieldk
 /megablocks/ @drbh
