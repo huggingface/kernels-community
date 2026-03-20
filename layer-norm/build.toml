@@ -1,5 +1,5 @@
 [general]
-name = "layer_norm"
+name = "layer-norm"
 license = "BSD-3-Clause"
 version = 1
 backends = ["cuda"]
