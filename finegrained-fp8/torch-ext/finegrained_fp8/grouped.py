@@ -256,7 +256,7 @@ def _w8a8_block_fp8_matmul_grouped(
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
-    allow_sync: bool = False,
+    allow_sync: bool = True,
 ) -> torch.Tensor:
     """Internal block-scale grouped FP8 matmul op.
 
@@ -365,7 +365,7 @@ def _w8a8_tensor_fp8_matmul_grouped(
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
-    allow_sync: bool = False,
+    allow_sync: bool = True,
 ) -> torch.Tensor:
     """Tensor-scale grouped FP8 matmul for sorted routed experts.
 
@@ -457,7 +457,7 @@ def w8a8_block_fp8_matmul_grouped(
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
-    allow_sync: bool = False,
+    allow_sync: bool = True,
 ) -> torch.Tensor:
     """Grouped W8A8 FP8 matmul for MoE expert dispatch with fused activation quantization.
 
@@ -493,7 +493,7 @@ def w8a8_tensor_fp8_matmul_grouped(
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
-    allow_sync: bool = False,
+    allow_sync: bool = True,
 ) -> torch.Tensor:
     """Tensor-scale grouped W8A8 FP8 matmul for MoE expert dispatch.
 
@@ -521,7 +521,7 @@ def w8a8_fp8_matmul_grouped(
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
-    allow_sync: bool = False,
+    allow_sync: bool = True,
 ) -> torch.Tensor:
     """Unified grouped W8A8 FP8 matmul dispatcher.
 

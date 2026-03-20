@@ -48,6 +48,7 @@ class Problem:
 
 
 PROBLEMS = [
+    # ── Small problems (correctness only, no speedup expectations) ──
     Problem(
         S=8,
         E=4,
@@ -56,7 +57,6 @@ PROBLEMS = [
         TOP_K=1,
         scale_layout="block",
         block_size=(128, 128),
-        expectation=Expectations(batched_ms=0.0346, grouped_ms=0.1291),
     ),
     Problem(
         S=32,
@@ -75,27 +75,6 @@ PROBLEMS = [
         TOP_K=2,
         scale_layout="block",
         block_size=(128, 128),
-        expectation=Expectations(batched_ms=0.0344, grouped_ms=0.1283),
-    ),
-    Problem(
-        S=64,
-        E=8,
-        N=512,
-        K=1024,
-        TOP_K=4,
-        scale_layout="block",
-        block_size=(128, 128),
-        expectation=Expectations(batched_ms=0.0348, grouped_ms=0.1272),
-    ),
-    Problem(
-        S=128,
-        E=16,
-        N=1024,
-        K=2048,
-        TOP_K=2,
-        scale_layout="block",
-        block_size=(128, 128),
-        expectation=Expectations(batched_ms=0.0558, grouped_ms=0.1306),
     ),
     Problem(
         S=128,
@@ -104,6 +83,7 @@ PROBLEMS = [
         K=2048,
         TOP_K=2,
         scale_layout="per_tensor_1d",
+        block_size=None,
     ),
     Problem(
         S=64,
@@ -112,6 +92,49 @@ PROBLEMS = [
         K=1024,
         TOP_K=4,
         scale_layout="per_tensor_111",
+        block_size=None,
+    ),
+    # ── Qwen3-30B-A3B (E=128, H=2048, I=768, top_k=8) ──
+    # gate_up: N=1536, K=2048 — down: N=2048, K=768
+    Problem(
+        S=256,
+        E=128,
+        N=1536,
+        K=2048,
+        TOP_K=8,
+        scale_layout="block",
+        block_size=(128, 128),
+        expectation=Expectations(batched_ms=0.1641, grouped_ms=0.1596),
+    ),
+    Problem(
+        S=256,
+        E=128,
+        N=2048,
+        K=768,
+        TOP_K=8,
+        scale_layout="block",
+        block_size=(128, 128),
+        expectation=Expectations(batched_ms=0.0956, grouped_ms=0.1582),
+    ),
+    Problem(
+        S=1024,
+        E=128,
+        N=1536,
+        K=2048,
+        TOP_K=8,
+        scale_layout="block",
+        block_size=(128, 128),
+        expectation=Expectations(batched_ms=0.5731, grouped_ms=0.1904),
+    ),
+    Problem(
+        S=1024,
+        E=128,
+        N=2048,
+        K=768,
+        TOP_K=8,
+        scale_layout="block",
+        block_size=(128, 128),
+        expectation=Expectations(batched_ms=0.3151, grouped_ms=0.1571),
     ),
 ]
 
@@ -347,6 +370,7 @@ def test_grouped_compile():
             offsets,
             tokens_per_expert,
             COMPILE_PROBLEM.block_size,
+            allow_sync=False,
         )
 
     compiled = torch.compile(fn, mode="max-autotune", fullgraph=True)
