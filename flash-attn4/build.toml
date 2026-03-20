@@ -1,0 +1,13 @@
+[general]
+name = "flash-attn4"
+backends = [ "cuda" ]
+python-depends = [ "einops", "tvm-ffi" ]
+license = "BSD-3-Clause"
+version = 0
+
+[general.hub]
+repo-id = "kernels-community/flash-attn4"
+
+[general.cuda]
+minver = "12.8"
+python-depends = [ "nvidia-cutlass-dsl" ]
