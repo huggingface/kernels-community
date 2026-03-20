@@ -19,6 +19,14 @@ from .act_quant import fp8_act_quant
 from torch.library import triton_op, wrap_triton
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=w, num_stages=s)
+        for w in [2, 4, 8, 16]
+        for s in [2, 3, 4, 5]
+    ],
+    key=["N", "K"],
+)
 @triton.jit
 def w8a8_block_fp8_matmul_batched_kernel(
     A,  # (S, K)  raw BF16/FP16 activations
@@ -103,6 +111,14 @@ def w8a8_block_fp8_matmul_batched_kernel(
     tl.store(c_ptrs, c)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=w, num_stages=s)
+        for w in [2, 4, 8, 16]
+        for s in [2, 3, 4, 5]
+    ],
+    key=["N", "K"],
+)
 @triton.jit
 def w8a8_tensor_fp8_matmul_batched_kernel(
     A,  # (S, K) pre-quantized FP8 activations
