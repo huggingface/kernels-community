@@ -18,6 +18,7 @@ KERNEL_SOURCE_MAPPING = {
     "finegrained-fp8": "",
     "flash-attn2": "https://github.com/Dao-AILab/flash-attention",
     "flash-attn3": "https://github.com/Dao-AILab/flash-attention",
+    "flash-attn4": "https://github.com/Dao-AILab/flash-attention",
     "flash-mla": "https://github.com/deepseek-ai/FlashMLA",
     "fp8-fbgemm": "https://github.com/pytorch/FBGEMM",
     "gpt-oss-metal-kernels": "https://github.com/openai/gpt-oss",
