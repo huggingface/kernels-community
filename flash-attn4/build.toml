@@ -3,6 +3,7 @@ name = "flash-attn4"
 backends = [ "cuda" ]
 python-depends = [ "einops", "tvm-ffi" ]
 version = 0
+repo-id = "kernels-community/flash-attn4"
 
 [general.cuda]
 minver = "12.8"
