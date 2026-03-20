@@ -2,6 +2,7 @@
 name = "flash-attn4"
 backends = [ "cuda" ]
 python-depends = [ "einops", "tvm-ffi" ]
+license = "BSD-3-Clause"
 version = 0
 
 [general.hub]
