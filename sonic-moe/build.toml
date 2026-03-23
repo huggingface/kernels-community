@@ -1,0 +1,38 @@
+[general]
+name = "sonic-moe"
+license = "Apache-2.0"
+version = 1
+backends = ["cuda"]
+
+[general.hub]
+repo-id = "kernels-community/sonic-moe"
+
+[general.cuda]
+minver = "12.8"
+python-depends = ["nvidia-cutlass-dsl"]
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.sonic_moe]
+backend = "cuda"
+depends = ["torch"]
+include = ["csrc"]
+cuda-flags = [
+    "-O3",
+    "-std=c++17",
+    "-DNDEBUG",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--use_fast_math",
+]
+src = [
+    "csrc/count_cumsum.cu",
+    "csrc/utils.h",
+]
