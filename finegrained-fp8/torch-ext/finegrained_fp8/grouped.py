@@ -18,6 +18,8 @@ import triton.language as tl
 from .act_quant import fp8_act_quant
 from torch.library import triton_op, wrap_triton
 
+from .utils import device_context
+
 
 @triton.autotune(
     configs=[
@@ -256,7 +258,6 @@ def _w8a8_block_fp8_matmul_grouped(
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
-    allow_sync: bool = False,
 ) -> torch.Tensor:
     """Internal block-scale grouped FP8 matmul op.
 
@@ -315,44 +316,41 @@ def _w8a8_block_fp8_matmul_grouped(
     BLOCK_SIZE_M = min(max(triton.next_power_of_2((S + E - 1) // E), 16), 128)
     tiles_per_expert = (tokens_per_expert + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
     tile_offsets = torch.cumsum(tiles_per_expert, dim=0).to(torch.int32)
-    if allow_sync:
-        # Exact tile count via CPU/GPU sync — no wasted programs.
-        max_M_tiles = int(tile_offsets[-1].item())
-    else:
-        # Upper bound on M-tiles: sum_e ceil(M_e / BLOCK_M) <= ceil(S / BLOCK_M) + E.
-        # Using a static upper bound keeps the grid size data-independent, which is
-        # required for cuda-graph compatibility.  Programs beyond the real tile count
-        # exit immediately via the early-return guard inside the kernel.
-        max_M_tiles = triton.cdiv(S, BLOCK_SIZE_M) + E
+    # Upper bound on M-tiles: sum_e ceil(M_e / BLOCK_M) <= ceil(S / BLOCK_M) + E.
+    # Programs beyond the real tile count exit immediately via the early-return
+    # guard inside the kernel. This is faster than syncing for the exact count
+    # and keeps the grid size data-independent (cuda-graph / torch.compile safe).
+    max_M_tiles = triton.cdiv(S, BLOCK_SIZE_M) + E
 
     grid = (max_M_tiles, triton.cdiv(N, block_n))
-    wrap_triton(w8a8_block_fp8_matmul_grouped_kernel)[grid](
-        A,
-        B,
-        C,
-        Bs,
-        offsets,
-        tile_offsets,
-        S,
-        N,
-        K,
-        A.stride(0),  # stride_am
-        A.stride(1),  # stride_ak
-        B.stride(0),  # stride_Eb
-        B.stride(2),  # stride_bk
-        B.stride(1),  # stride_bn
-        C.stride(0),  # stride_cm
-        C.stride(1),  # stride_cn
-        Bs.stride(0),  # stride_Esb
-        Bs.stride(2),  # stride_Bsk
-        Bs.stride(1),  # stride_Bsn
-        # Meta-parameters
-        block_n=block_n,
-        block_k=block_k,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        NUM_EXPERTS=E,
-        NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
-    )
+    with device_context(A.device):
+        wrap_triton(w8a8_block_fp8_matmul_grouped_kernel)[grid](
+            A,
+            B,
+            C,
+            Bs,
+            offsets,
+            tile_offsets,
+            S,
+            N,
+            K,
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            C.stride(0),
+            C.stride(1),
+            Bs.stride(0),
+            Bs.stride(2),
+            Bs.stride(1),
+            # Meta-parameters
+            block_n=block_n,
+            block_k=block_k,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            NUM_EXPERTS=E,
+            NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
+        )
 
     return C
 
@@ -365,7 +363,6 @@ def _w8a8_tensor_fp8_matmul_grouped(
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
-    allow_sync: bool = False,
 ) -> torch.Tensor:
     """Tensor-scale grouped FP8 matmul for sorted routed experts.
 
@@ -408,44 +405,41 @@ def _w8a8_tensor_fp8_matmul_grouped(
     BLOCK_SIZE_M = min(max(triton.next_power_of_2((S + E - 1) // E), 16), 128)
     tiles_per_expert = (tokens_per_expert + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
     tile_offsets = torch.cumsum(tiles_per_expert, dim=0).to(torch.int32)
-    if allow_sync:
-        # Exact tile count via CPU/GPU sync — no wasted programs.
-        max_M_tiles = int(tile_offsets[-1].item())
-    else:
-        # Upper bound on M-tiles: sum_e ceil(M_e / BLOCK_M) <= ceil(S / BLOCK_M) + E.
-        # Using a static upper bound keeps the grid size data-independent, which is
-        # required for cuda-graph compatibility.  Programs beyond the real tile count
-        # exit immediately via the early-return guard inside the kernel.
-        max_M_tiles = triton.cdiv(S, BLOCK_SIZE_M) + E
+    # Upper bound on M-tiles: sum_e ceil(M_e / BLOCK_M) <= ceil(S / BLOCK_M) + E.
+    # Programs beyond the real tile count exit immediately via the early-return
+    # guard inside the kernel. This is faster than syncing for the exact count
+    # and keeps the grid size data-independent (cuda-graph / torch.compile safe).
+    max_M_tiles = triton.cdiv(S, BLOCK_SIZE_M) + E
 
     qA, As = fp8_act_quant(A, K)
     grid = (max_M_tiles, triton.cdiv(N, block_n))
-    wrap_triton(w8a8_tensor_fp8_matmul_grouped_kernel)[grid](
-        qA,
-        B,
-        C,
-        As,
-        Bs,
-        offsets,
-        tile_offsets,
-        S,
-        N,
-        K,
-        qA.stride(0),
-        qA.stride(1),
-        B.stride(0),
-        B.stride(2),
-        B.stride(1),
-        C.stride(0),
-        C.stride(1),
-        As.stride(0),
-        Bs.stride(0),
-        block_n=block_n,
-        block_k=block_k,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        NUM_EXPERTS=E,
-        NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
-    )
+    with device_context(A.device):
+        wrap_triton(w8a8_tensor_fp8_matmul_grouped_kernel)[grid](
+            qA,
+            B,
+            C,
+            As,
+            Bs,
+            offsets,
+            tile_offsets,
+            S,
+            N,
+            K,
+            qA.stride(0),
+            qA.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            C.stride(0),
+            C.stride(1),
+            As.stride(0),
+            Bs.stride(0),
+            block_n=block_n,
+            block_k=block_k,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            NUM_EXPERTS=E,
+            NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
+        )
 
     return C
 
@@ -457,14 +451,13 @@ def w8a8_block_fp8_matmul_grouped(
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
-    allow_sync: bool = False,
 ) -> torch.Tensor:
     """Grouped W8A8 FP8 matmul for MoE expert dispatch with fused activation quantization.
 
     Tokens in ``A`` must be pre-sorted by expert id. The kernel quantizes ``A``
     to FP8 on-the-fly (fused ``act_quant``), uses a static over-provisioned grid
-    for CUDA-graph compatibility, and resolves each tile's expert via an O(log E)
-    binary search over ``offsets``.
+    with early-exit for excess programs, and resolves each tile's expert via an
+    O(log E) binary search over ``offsets``.
 
     Args:
         A: Raw activation matrix ``[S, K]`` sorted by expert, in bf16/fp16/fp32.
@@ -474,15 +467,12 @@ def w8a8_block_fp8_matmul_grouped(
         offsets: Cumulative token counts per expert ``[E]`` (i.e. ``cumsum(tokens_per_expert)``).
         tokens_per_expert: Number of tokens routed to each expert ``[E]``.
         block_size: ``[block_n, block_k]`` quantization block dimensions, e.g. ``[128, 128]``.
-        allow_sync: If True (default), read back the exact tile count from the GPU
-            (avoids wasted programs). If False, use a data-independent upper bound
-            (required for CUDA-graph / torch.compile compatibility).
 
     Returns:
         Output tensor ``[S, N]`` in the same dtype as ``A``, in expert-sorted order.
     """
     return torch.ops.finegrained_fp8.w8a8_block_fp8_matmul_grouped(
-        A, B, Bs, offsets, tokens_per_expert, block_size, allow_sync
+        A, B, Bs, offsets, tokens_per_expert, block_size
     )
 
 
@@ -493,7 +483,6 @@ def w8a8_tensor_fp8_matmul_grouped(
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
-    allow_sync: bool = False,
 ) -> torch.Tensor:
     """Tensor-scale grouped W8A8 FP8 matmul for MoE expert dispatch.
 
@@ -504,13 +493,12 @@ def w8a8_tensor_fp8_matmul_grouped(
         offsets: Cumulative token counts per expert ``[E]``.
         tokens_per_expert: Number of tokens routed to each expert ``[E]``.
         block_size: Kept for API consistency; tensor path derives tile sizes from ``N`` and ``K``.
-        allow_sync: If True, sync for exact grid; if False, use upper bound.
 
     Returns:
         Output tensor ``[S, N]`` in the same dtype as ``A``, in expert-sorted order.
     """
     return torch.ops.finegrained_fp8.w8a8_tensor_fp8_matmul_grouped(
-        A, B, Bs, offsets, tokens_per_expert, block_size, allow_sync
+        A, B, Bs, offsets, tokens_per_expert, block_size
     )
 
 
@@ -521,7 +509,6 @@ def w8a8_fp8_matmul_grouped(
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
-    allow_sync: bool = False,
 ) -> torch.Tensor:
     """Unified grouped W8A8 FP8 matmul dispatcher.
 
@@ -537,9 +524,9 @@ def w8a8_fp8_matmul_grouped(
         block_size[0] == B.size(1) and block_size[1] == B.size(2)
     ):
         return w8a8_tensor_fp8_matmul_grouped(
-            A, B, Bs, offsets, tokens_per_expert, block_size, allow_sync
+            A, B, Bs, offsets, tokens_per_expert, block_size
         )
 
     return w8a8_block_fp8_matmul_grouped(
-        A, B, Bs, offsets, tokens_per_expert, block_size, allow_sync
+        A, B, Bs, offsets, tokens_per_expert, block_size
     )

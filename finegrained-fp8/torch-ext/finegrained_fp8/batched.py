@@ -18,6 +18,8 @@ import triton.language as tl
 from .act_quant import fp8_act_quant
 from torch.library import triton_op, wrap_triton
 
+from .utils import device_context
+
 
 @triton.autotune(
     configs=[
@@ -255,30 +257,31 @@ def _w8a8_block_fp8_matmul_batched(
     # register pressure and a better-matched FP8 WGMMA instruction, improving
     # both accuracy and performance for small M (decode).
     BLOCK_SIZE_M = min(max(triton.next_power_of_2((S + E - 1) // E), 16), 128)
-    wrap_triton(w8a8_block_fp8_matmul_batched_kernel)[grid](
-        A,
-        B,
-        C,
-        Bs,
-        expert_ids,
-        S,
-        N,
-        K,
-        A.stride(1),  # stride_ak
-        B.stride(2),  # stride_bk
-        B.stride(1),  # stride_bn
-        C.stride(1),  # stride_cn
-        Bs.stride(2),  # stride_Bs_k
-        Bs.stride(1),  # stride_Bs_n
-        A.stride(0),  # stride_Ab
-        B.stride(0),  # stride_Eb
-        C.stride(0),  # stride_Cb
-        Bs.stride(0),  # stride_Esb
-        # Meta-parameters
-        block_n=block_n,
-        block_k=block_k,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-    )
+    with device_context(A.device):
+        wrap_triton(w8a8_block_fp8_matmul_batched_kernel)[grid](
+            A,
+            B,
+            C,
+            Bs,
+            expert_ids,
+            S,
+            N,
+            K,
+            A.stride(1),
+            B.stride(2),
+            B.stride(1),
+            C.stride(1),
+            Bs.stride(2),
+            Bs.stride(1),
+            A.stride(0),
+            B.stride(0),
+            C.stride(0),
+            Bs.stride(0),
+            # Meta-parameters
+            block_n=block_n,
+            block_k=block_k,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+        )
 
     return C
 
@@ -331,29 +334,30 @@ def _w8a8_tensor_fp8_matmul_batched(
     qA, As = fp8_act_quant(A, K)
 
     grid = (S, triton.cdiv(N, block_n))
-    wrap_triton(w8a8_tensor_fp8_matmul_batched_kernel)[grid](
-        qA,
-        B,
-        C,
-        As,
-        Bs,
-        expert_ids,
-        S,
-        N,
-        K,
-        qA.stride(1),
-        B.stride(2),
-        B.stride(1),
-        C.stride(1),
-        As.stride(0),
-        qA.stride(0),
-        B.stride(0),
-        C.stride(0),
-        Bs.stride(0),
-        block_n=block_n,
-        block_k=block_k,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-    )
+    with device_context(A.device):
+        wrap_triton(w8a8_tensor_fp8_matmul_batched_kernel)[grid](
+            qA,
+            B,
+            C,
+            As,
+            Bs,
+            expert_ids,
+            S,
+            N,
+            K,
+            qA.stride(1),
+            B.stride(2),
+            B.stride(1),
+            C.stride(1),
+            As.stride(0),
+            qA.stride(0),
+            B.stride(0),
+            C.stride(0),
+            Bs.stride(0),
+            block_n=block_n,
+            block_k=block_k,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+        )
 
     return C
 

@@ -17,6 +17,8 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
+from .utils import device_context
+
 
 _FP8_DTYPE = torch.float8_e4m3fn
 
@@ -40,10 +42,12 @@ def _fp8_act_quant(
     assert x.is_contiguous()
     assert x.shape[-1] % block_size == 0
     y = torch.empty_like(x, dtype=_FP8_DTYPE)
+    grid = (triton.cdiv(x.numel(), block_size),)
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
 
-    grid = (triton.cdiv(x.numel(), block_size),)
-    wrap_triton(_fp8_act_quant_kernel)[grid](x, y, s, BLOCK_SIZE=block_size)
+    with device_context(x.device):
+        wrap_triton(_fp8_act_quant_kernel)[grid](x, y, s, BLOCK_SIZE=block_size)
+
     return y, s
 
 

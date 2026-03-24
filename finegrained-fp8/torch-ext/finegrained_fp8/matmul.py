@@ -17,6 +17,8 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
+from .utils import device_context
+
 
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/quantization/fp8_kernel.py
 @triton.jit
@@ -234,32 +236,33 @@ def _w8a8_block_fp8_matmul(
     BLOCK_SIZE_N = block_n
 
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
-    wrap_triton(w8a8_block_fp8_matmul_kernel)[grid](
-        A,
-        B,
-        C,
-        As,
-        Bs,
-        M,
-        N,
-        K,
-        block_n,
-        block_k,
-        A.stride(-2),
-        A.stride(-1),
-        B.stride(1),
-        B.stride(0),
-        C.stride(-2),
-        C.stride(-1),
-        As.stride(-2),
-        As.stride(-1),
-        Bs.stride(1),
-        Bs.stride(0),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=8,
-    )
+    with device_context(A.device):
+        wrap_triton(w8a8_block_fp8_matmul_kernel)[grid](
+            A,
+            B,
+            C,
+            As,
+            Bs,
+            M,
+            N,
+            K,
+            block_n,
+            block_k,
+            A.stride(-2),
+            A.stride(-1),
+            B.stride(1),
+            B.stride(0),
+            C.stride(-2),
+            C.stride(-1),
+            As.stride(-2),
+            As.stride(-1),
+            Bs.stride(1),
+            Bs.stride(0),
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=8,
+        )
 
     return C
 
@@ -289,8 +292,8 @@ def _w8a8_tensor_fp8_matmul(
     N, K = B.shape
     M = A.numel() // A.shape[-1]
 
-    block_n = 128 if N % 128 == 0 else N
-    block_k = 128 if K % 128 == 0 else K
+    block_n = 128 if N % 128 == 0 else triton.next_power_of_2(N)
+    block_k = 128 if K % 128 == 0 else triton.next_power_of_2(K)
 
     if As.numel() == 1:
         As = As.reshape(1).expand(M).contiguous()
@@ -326,27 +329,28 @@ def _w8a8_tensor_fp8_matmul(
     BLOCK_SIZE_N = block_n
 
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
-    wrap_triton(w8a8_tensor_fp8_matmul_kernel)[grid](
-        A,
-        B,
-        C,
-        As,
-        Bs,
-        M,
-        N,
-        K,
-        A.stride(-2),
-        A.stride(-1),
-        B.stride(1),
-        B.stride(0),
-        C.stride(-2),
-        C.stride(-1),
-        As.stride(0),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=8,
-    )
+    with device_context(A.device):
+        wrap_triton(w8a8_tensor_fp8_matmul_kernel)[grid](
+            A,
+            B,
+            C,
+            As,
+            Bs,
+            M,
+            N,
+            K,
+            A.stride(-2),
+            A.stride(-1),
+            B.stride(1),
+            B.stride(0),
+            C.stride(-2),
+            C.stride(-1),
+            As.stride(0),
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=8,
+        )
 
     return C
 
