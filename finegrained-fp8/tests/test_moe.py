@@ -370,7 +370,6 @@ def test_grouped_compile():
             offsets,
             tokens_per_expert,
             COMPILE_PROBLEM.block_size,
-            allow_sync=False,
         )
 
     compiled = torch.compile(fn, mode="max-autotune", fullgraph=True)
