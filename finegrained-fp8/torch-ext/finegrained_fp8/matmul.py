@@ -292,9 +292,6 @@ def _w8a8_tensor_fp8_matmul(
     N, K = B.shape
     M = A.numel() // A.shape[-1]
 
-    block_n = 128 if N % 128 == 0 else triton.next_power_of_2(N)
-    block_k = 128 if K % 128 == 0 else triton.next_power_of_2(K)
-
     if As.numel() == 1:
         As = As.reshape(1).expand(M).contiguous()
     elif As.ndim == 1:
@@ -325,8 +322,8 @@ def _w8a8_tensor_fp8_matmul(
     C = A.new_empty(C_shape, dtype=output_dtype)
 
     BLOCK_SIZE_M = min(max(triton.next_power_of_2(M), 16), 128)
-    BLOCK_SIZE_K = block_k
-    BLOCK_SIZE_N = block_n
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 128
 
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
     with device_context(A.device):
