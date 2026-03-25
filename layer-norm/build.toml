@@ -37,7 +37,7 @@ cuda-flags = [
 ]
 cxx-flags = [
     "-DFLASHATTENTION_DISABLE_PYBIND",
-    "-mcmodel=large",
+    # "-mcmodel=large",
 ]
 depends = ["torch"]
 include = ["."]
