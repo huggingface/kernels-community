@@ -20,6 +20,7 @@
           py-cpuinfo
           importlib-metadata
           torchmetrics
+          absl
         ];
 
       torchVersions =
