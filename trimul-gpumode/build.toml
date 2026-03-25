@@ -1,5 +1,5 @@
 [general]
-name = "trimul_gpumode"
+name = "trimul-gpumode"
 version = 1
 backends = [
     "cuda",
@@ -9,6 +9,6 @@ backends = [
 
 
 [general.hub]
-repo-id = "kernels-community/trimul_gpumode"
+repo-id = "kernels-community/trimul-gpumode"
 
 [kernel]
