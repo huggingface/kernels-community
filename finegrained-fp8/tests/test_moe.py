@@ -8,7 +8,7 @@ import pytest
 import torch
 import triton
 
-import finegrained_fp8
+import finegrained_fp8  # type: ignore
 
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
