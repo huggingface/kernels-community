@@ -6,9 +6,9 @@
   };
 
   outputs =
-    { self
-    , kernel-builder
-    ,
+    {
+      self,
+      kernel-builder,
     }:
     kernel-builder.lib.genKernelFlakeOutputs {
       inherit self;
