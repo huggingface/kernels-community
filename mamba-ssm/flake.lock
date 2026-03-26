@@ -41,15 +41,16 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1774458486,
-        "narHash": "sha256-PSTV0y3Bxspr2kUoiWenRj5PS0dBAg85Asvvee7BpSo=",
+        "lastModified": 1774516404,
+        "narHash": "sha256-dEMB89WiK4JhDaIhjRVxkOM8zlG5yIzJfSWVO7bHDq8=",
         "owner": "huggingface",
         "repo": "kernels",
-        "rev": "131f49f79407b7ace1f175c1d7ed9f946ebd1538",
+        "rev": "e35c125741d290c3f0c55decbac00c1b5d666788",
         "type": "github"
       },
       "original": {
         "owner": "huggingface",
+        "ref": "transformers-5.3.0",
         "repo": "kernels",
         "type": "github"
       }

@@ -2,13 +2,13 @@
   description = "Flake for Mamba kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels";
+    kernel-builder.url = "github:huggingface/kernels/transformers-5.3.0";
   };
 
   outputs =
-    {
-      self,
-      kernel-builder,
+    { self
+    , kernel-builder
+    ,
     }:
     kernel-builder.lib.genKernelFlakeOutputs {
       inherit self;
@@ -22,6 +22,7 @@
         ps: with ps; [
           causal-conv1d
           einops
+          huggingface-hub
           transformers
         ];
     };
