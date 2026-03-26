@@ -42,8 +42,14 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release" "$PR_TITLE"); then
-            echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
-            echo "skip=false" >> $GITHUB_OUTPUT
+            # Validate kernel output matches expected pattern (alphanumeric, hyphens, underscores, slashes only)
+            if echo "$KERNEL" | grep -qE '^[a-zA-Z0-9_/-]+$'; then
+              echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+              echo "skip=false" >> $GITHUB_OUTPUT
+            else
+              echo "Invalid kernel name format: $KERNEL" >&2
+              echo "skip=true" >> $GITHUB_OUTPUT
+            fi
           else
             echo "skip=true" >> $GITHUB_OUTPUT
           fi
@@ -51,15 +57,25 @@ jobs:
         if: steps.validate.outputs.skip == 'false'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KERNEL: ${{ steps.validate.outputs.kernel }}
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
+          # Re-validate kernel name format
+          if ! echo "$KERNEL" | grep -qE '^[a-zA-Z0-9_/-]+$'; then
+            echo "Invalid kernel name format" >&2
+            exit 1
+          fi
           ( cd "$KERNEL" && nix run -L .#build-and-upload )
       - name: Upload v1 kernels to main
         if: steps.validate.outputs.skip == 'false'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KERNEL: ${{ steps.validate.outputs.kernel }}
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
+          # Re-validate kernel name format
+          if ! echo "$KERNEL" | grep -qE '^[a-zA-Z0-9_/-]+$'; then
+            echo "Invalid kernel name format" >&2
+            exit 1
+          fi
           cd "$KERNEL"
 
           # Check if build.toml exists and has version = 1
