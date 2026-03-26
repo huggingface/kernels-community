@@ -2,7 +2,7 @@
   description = "Flake for Mamba kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/transformers-5.3.0";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
