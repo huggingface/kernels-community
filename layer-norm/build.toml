@@ -1,12 +1,12 @@
 [general]
-name = "layer_norm"
+name = "layer-norm"
 license = "BSD-3-Clause"
 version = 1
 backends = ["cuda"]
 
 
 [general.hub]
-repo-id = "kernels-community/layer_norm"
+repo-id = "kernels-community/layer-norm"
 
 [torch]
 src = [
@@ -37,7 +37,7 @@ cuda-flags = [
 ]
 cxx-flags = [
     "-DFLASHATTENTION_DISABLE_PYBIND",
-    "-mcmodel=large",
+    # "-mcmodel=large",
 ]
 depends = ["torch"]
 include = ["."]
