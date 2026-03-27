@@ -1,5 +1,5 @@
 [general]
-name = "liger_kernels"
+name = "liger-kernels"
 license = "BSD-2-Clause"
 backends = [
     "cuda",
