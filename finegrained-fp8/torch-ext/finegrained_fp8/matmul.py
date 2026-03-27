@@ -21,6 +21,14 @@ from .utils import device_context
 
 
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/quantization/fp8_kernel.py
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=w, num_stages=s)
+        for w in [2, 4, 8, 16]
+        for s in [2, 3, 4, 5]
+    ],
+    key=["N", "K"],
+)
 @triton.jit
 def w8a8_block_fp8_matmul_kernel(
     # Pointers to inputs and output
@@ -80,8 +88,9 @@ def w8a8_block_fp8_matmul_kernel(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        k_remaining = K - k * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
 
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
@@ -106,6 +115,14 @@ def w8a8_block_fp8_matmul_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=w, num_stages=s)
+        for w in [2, 4, 8, 16]
+        for s in [2, 3, 4, 5]
+    ],
+    key=["N", "K"],
+)
 @triton.jit
 def w8a8_tensor_fp8_matmul_kernel(
     A,
@@ -143,25 +160,21 @@ def w8a8_tensor_fp8_matmul_kernel(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     a_ptrs = A + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = B + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
 
-    a_s = tl.load(As + offs_am * stride_As_m, mask=offs_am < M, other=0.0)
+    a_s = tl.load(As + offs_am * stride_As_m)
     b_s = tl.load(Bs)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        k_offs = k * BLOCK_SIZE_K + offs_k
-        a = tl.load(
-            a_ptrs, mask=(offs_am[:, None] < M) & (k_offs[None, :] < K), other=0.0
-        )
-        b = tl.load(
-            b_ptrs, mask=(k_offs[:, None] < K) & (offs_bn[None, :] < N), other=0.0
-        )
+        k_remaining = K - k * BLOCK_SIZE_K
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -186,43 +199,35 @@ def _w8a8_block_fp8_matmul(
     B: torch.Tensor,
     As: torch.Tensor,
     Bs: torch.Tensor,
-    block_size: list[int] | None,
+    block_size: list[int],
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Internal block-scale FP8 matmul op.
+    """Block-scale FP8 matmul: C = A @ B.T with per-block scales.
 
-    Accepts pre-quantized FP8 ``A``/``B`` and block scales ``As``/``Bs``.
-    For convenience, scalar ``As``/``Bs`` are expanded to the expected
-    block-scale shapes.
+    As: (M, K // block_k) — per-token-group activation scales
+    Bs: (N // block_n, K // block_k) — per-block weight scales
     """
-    if block_size is None:
-        block_n, block_k = 128, 128
-    else:
-        assert len(block_size) == 2
-        block_n, block_k = block_size[0], block_size[1]
+    assert len(block_size) == 2
+    block_n, block_k = block_size[0], block_size[1]
 
     assert A.shape[-1] == B.shape[-1]
     assert A.is_contiguous()
-
     assert B.ndim == 2
     assert B.is_contiguous()
 
     N, K = B.shape
     M = A.numel() // A.shape[-1]
 
-    # For per-tensor scales (scalar), expand to block-scale shape with strides (0, 0).
-    # This is a zero-copy view; all loads inside the kernel hit the same cached value.
-    if As.numel() == 1:
-        As = As.reshape(1, 1).expand(M, triton.cdiv(K, block_k))
-    else:
-        assert A.shape[:-1] == As.shape[:-1]
-        assert triton.cdiv(K, block_k) == As.shape[-1]
-    if Bs.numel() == 1:
-        Bs = Bs.reshape(1, 1).expand(triton.cdiv(N, block_n), triton.cdiv(K, block_k))
-    else:
-        assert Bs.ndim == 2
-        assert triton.cdiv(N, block_n) == Bs.shape[0], f"{N}, {block_n}, {Bs.shape}"
-        assert triton.cdiv(K, block_k) == Bs.shape[1], f"{K}, {block_k}, {Bs.shape}"
+    assert As.ndim >= 2 and As.shape[-1] == triton.cdiv(K, block_k), (
+        f"As shape {tuple(As.shape)} doesn't match block-scale layout (M, {triton.cdiv(K, block_k)})"
+    )
+    assert (
+        Bs.ndim == 2
+        and Bs.shape[0] == triton.cdiv(N, block_n)
+        and Bs.shape[1] == triton.cdiv(K, block_k)
+    ), (
+        f"Bs shape {tuple(Bs.shape)} doesn't match ({triton.cdiv(N, block_n)}, {triton.cdiv(K, block_k)})"
+    )
 
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
@@ -273,50 +278,33 @@ def _w8a8_tensor_fp8_matmul(
     B: torch.Tensor,
     As: torch.Tensor,
     Bs: torch.Tensor,
-    block_size: list[int] | None,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Tensor-scale W8A8 FP8 matrix multiplication.
+    """Tensor-scale FP8 matmul: C = A @ B.T with per-row / per-tensor scales.
 
-    Expects pre-quantized FP8 activations/weights and tensor scales.
-    Accepted scale layouts are normalized to the canonical kernel layout:
-    - ``As``: scalar, ``[M]``, or ``[M,1]`` -> ``[M]``
-    - ``Bs``: scalar, ``[1]``, or ``[1,1]`` -> ``[1]``
+    As: scalar, (M,), or (M, 1) — per-row activation scales
+    Bs: scalar, (1,), or (1, 1) — single weight scale
     """
     assert A.shape[-1] == B.shape[-1]
     assert A.is_contiguous()
-
     assert B.ndim == 2
     assert B.is_contiguous()
 
     N, K = B.shape
     M = A.numel() // A.shape[-1]
 
+    # Normalize As to (M,)
     if As.numel() == 1:
         As = As.reshape(1).expand(M).contiguous()
-    elif As.ndim == 1:
-        assert As.shape[0] == M, (
-            f"Tensor mode expects As shape [M], got {tuple(As.shape)}"
-        )
-        As = As.contiguous()
-    else:
-        assert As.ndim == 2 and As.shape[0] == M and As.shape[1] == 1, (
-            f"Tensor mode expects As shape [M,1], got {tuple(As.shape)}"
-        )
-        As = As.reshape(M).contiguous()
+    elif As.ndim == 2:
+        As = As.reshape(M)
+    assert As.ndim == 1 and As.shape[0] == M, (
+        f"As must be scalar, (M,), or (M,1), got {tuple(As.shape)}"
+    )
 
-    if Bs.numel() == 1:
-        Bs = Bs.reshape(1).contiguous()
-    elif Bs.ndim == 1:
-        assert Bs.shape[0] == 1, (
-            f"Tensor mode expects Bs shape [1], got {tuple(Bs.shape)}"
-        )
-        Bs = Bs.contiguous()
-    else:
-        assert Bs.ndim == 2 and Bs.shape[0] == 1 and Bs.shape[1] == 1, (
-            f"Tensor mode expects Bs shape [1,1], got {tuple(Bs.shape)}"
-        )
-        Bs = Bs.reshape(1).contiguous()
+    # Normalize Bs to (1,)
+    assert Bs.numel() == 1, f"Bs must be scalar or (1,), got {tuple(Bs.shape)}"
+    Bs = Bs.reshape(1)
 
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
@@ -357,7 +345,7 @@ def w8a8_block_fp8_matmul(
     B: torch.Tensor,
     As: torch.Tensor,
     Bs: torch.Tensor,
-    block_size: list[int] | None,
+    block_size: list[int],
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Block-wise W8A8 FP8 matrix multiplication.
@@ -387,7 +375,6 @@ def w8a8_tensor_fp8_matmul(
     B: torch.Tensor,
     As: torch.Tensor,
     Bs: torch.Tensor,
-    block_size: list[int] | None,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Tensor-scale W8A8 FP8 matrix multiplication.
@@ -398,17 +385,14 @@ def w8a8_tensor_fp8_matmul(
     Args:
         A: Quantized activation tensor ``[M, K]`` in ``float8_e4m3fn``.
         B: Quantized weight tensor ``[N, K]`` in ``float8_e4m3fn``.
-        As: Activation scale(s), accepted as scalar, ``[M]``, or ``[M,1]``.
-        Bs: Weight scale(s), accepted as scalar, ``[1]``, or ``[1,1]``.
-        block_size: Kept for API consistency; tensor path derives tile sizes from ``N`` and ``K``.
+        As: Per-row activation scales ``[M]``.
+        Bs: Single weight scale, scalar or ``[1]``.
         output_dtype: dtype of the returned tensor.
 
     Returns:
         Output tensor ``[M, N]`` in ``output_dtype``.
     """
-    return torch.ops.finegrained_fp8.w8a8_tensor_fp8_matmul(
-        A, B, As, Bs, block_size, output_dtype
-    )
+    return torch.ops.finegrained_fp8.w8a8_tensor_fp8_matmul(A, B, As, Bs, output_dtype)
 
 
 def w8a8_fp8_matmul(
@@ -432,6 +416,6 @@ def w8a8_fp8_matmul(
     if block_size is None or (
         block_size[0] == B.size(0) and block_size[1] == B.size(1)
     ):
-        return w8a8_tensor_fp8_matmul(A, B, As, Bs, block_size, output_dtype)
+        return w8a8_tensor_fp8_matmul(A, B, As, Bs, output_dtype)
 
     return w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype)
