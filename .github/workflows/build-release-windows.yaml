@@ -154,16 +154,16 @@ jobs:
         uses: actions/cache@v5
         with:
           path: |
-            kernels/build2cmake/target
+            kernels/kernel-builder/target
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-rust-debug-${{ hashFiles('kernels/build2cmake/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-debug-${{ hashFiles('kernels/kernel-builder/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-debug-
 
-      - name: Build build2cmake
+      - name: Build kernel-builder
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
-        working-directory: kernels\build2cmake
+        working-directory: kernels\kernel-builder
         shell: pwsh
         run: cargo build
 
@@ -212,7 +212,7 @@ jobs:
               exit 1
             }
           }
-          & "$env:GITHUB_WORKSPACE\kernels\builder\scripts\windows\builder.ps1" -Backend $env:PLATFORM_BACKEND -SourceFolder "$env:KERNEL_SOURCE" -BuildConfig Release -Build
+          & "$env:GITHUB_WORKSPACE\kernels\nix-builder\scripts\windows\builder.ps1" -Backend $env:PLATFORM_BACKEND -SourceFolder "$env:KERNEL_SOURCE" -BuildConfig Release -Build
 
           # Run the local_install target to create the correct directory structure for kernels upload
           # This installs to build/<variant>/<package>/ which is what kernels CLI expects

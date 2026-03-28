@@ -5,7 +5,6 @@ on:
     paths-ignore:
       - "**/README.md"
 
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
@@ -14,21 +13,26 @@ jobs:
   build-kernel:
     strategy:
       matrix:
-        os: [ windows-2022 ]
-        python: [ 3.11, 3.12 ]
+        os: [windows-2022]
+        python: [3.11, 3.12]
         platform: [
-          # CUDA platforms
-          # { backend: 'cuda', torch_version: '2.9.1', cuda: '12.6.3', wheel: '126' },
-          { backend: 'cuda', torch_version: '2.9.1', cuda: '12.8.1', wheel: '128' },
-          # { backend: 'cuda', torch_version: '2.9.1', cuda: '13.0.1', wheel: '130' },
-          # Intel XPU platform
-          {
-            backend: "xpu",
-            torch_version: "2.10.0",
-            oneapi: "2025.3.1",
-            oneapi_url: "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe",
-          }
-        ]
+            # CUDA platforms
+            # { backend: 'cuda', torch_version: '2.9.1', cuda: '12.6.3', wheel: '126' },
+            {
+              backend: "cuda",
+              torch_version: "2.9.1",
+              cuda: "12.8.1",
+              wheel: "128",
+            },
+            # { backend: 'cuda', torch_version: '2.9.1', cuda: '13.0.1', wheel: '130' },
+            # Intel XPU platform
+            {
+              backend: "xpu",
+              torch_version: "2.10.0",
+              oneapi: "2025.3.1",
+              oneapi_url: "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe",
+            },
+          ]
 
     runs-on: windows-2022
     steps:
@@ -95,7 +99,7 @@ jobs:
           # 2. [general] section with: backends = ["cuda", "xpu", ...] (can be multi-line)
           $kernelPattern = "backend\s*=\s*[`"']${BACKEND}[`"']"
           $backendsPattern = "(?s)backends\s*=\s*\[.*?[`"']${BACKEND}[`"'].*?\]"
-          
+
           if (($buildToml -match $kernelPattern) -or ($buildToml -match $backendsPattern)) {
             Write-Output "Kernel '$KERNEL' supports backend '$BACKEND'"
             echo "supported=true" >> $env:GITHUB_OUTPUT
@@ -162,16 +166,16 @@ jobs:
         uses: actions/cache@v5
         with:
           path: |
-            kernels/build2cmake/target
+            kernels/kernel-builder/target
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-rust-debug-${{ hashFiles('kernels/build2cmake/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-debug-${{ hashFiles('kernels/kernel-builder/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-debug-
 
-      - name: Build build2cmake
+      - name: Build kernel-builder
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
-        working-directory: kernels\build2cmake
+        working-directory: kernels\kernel-builder
         shell: pwsh
         run: cargo build
 
@@ -219,4 +223,4 @@ jobs:
               exit 1
             }
           }
-          & "$env:GITHUB_WORKSPACE\kernels\builder\scripts\windows\builder.ps1" -Backend ${{ matrix.platform.backend }} -SourceFolder "$KERNEL" -BuildConfig Release -Build
+          & "$env:GITHUB_WORKSPACE\kernels\nix-builder\scripts\windows\builder.ps1" -Backend ${{ matrix.platform.backend }} -SourceFolder "$KERNEL" -BuildConfig Release -Build
