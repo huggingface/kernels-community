@@ -27,7 +27,7 @@ from .utils import device_context
         for w in [2, 4, 8, 16]
         for s in [2, 3, 4, 5]
     ],
-    key=["N", "K"],
+    key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
 def w8a8_block_fp8_matmul_kernel(
@@ -41,9 +41,6 @@ def w8a8_block_fp8_matmul_kernel(
     M,
     N,
     K,
-    # Block size for block-wise quantization
-    group_n,
-    group_k,
     # Stride for inputs and output
     stride_am,
     stride_ak,
@@ -83,7 +80,7 @@ def w8a8_block_fp8_matmul_kernel(
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     As_ptrs = As + offs_am * stride_As_m
-    offs_bsn = offs_bn // group_n
+    offs_bsn = offs_bn // BLOCK_SIZE_N
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -92,10 +89,8 @@ def w8a8_block_fp8_matmul_kernel(
         a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
 
-        k_start = k * BLOCK_SIZE_K
-        offs_ks = k_start // group_k
-        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
-        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+        a_s = tl.load(As_ptrs + k * stride_As_k)
+        b_s = tl.load(Bs_ptrs + k * stride_Bs_k)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -121,7 +116,7 @@ def w8a8_block_fp8_matmul_kernel(
         for w in [2, 4, 8, 16]
         for s in [2, 3, 4, 5]
     ],
-    key=["N", "K"],
+    key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
 def w8a8_tensor_fp8_matmul_kernel(
@@ -207,39 +202,39 @@ def _w8a8_block_fp8_matmul(
     As: (M, K // block_k) — per-token-group activation scales
     Bs: (N // block_n, K // block_k) — per-block weight scales
     """
-    assert len(block_size) == 2
+    assert len(block_size) == 2, (
+        f"block_size must be [block_n, block_k], got {block_size}"
+    )
     block_n, block_k = block_size[0], block_size[1]
 
-    assert A.shape[-1] == B.shape[-1]
-    assert A.is_contiguous()
-    assert B.ndim == 2
-    assert B.is_contiguous()
+    assert A.shape[-1] == B.shape[-1], (
+        f"K mismatch: A has K={A.shape[-1]}, B has K={B.shape[-1]}"
+    )
+    assert A.is_contiguous(), "A must be contiguous"
+    assert B.ndim == 2, f"B must be 2D (N, K), got ndim={B.ndim}"
+    assert B.is_contiguous(), "B must be contiguous"
 
     N, K = B.shape
     M = A.numel() // A.shape[-1]
 
-    assert As.ndim >= 2 and As.shape[-1] == triton.cdiv(K, block_k), (
-        f"As shape {tuple(As.shape)} doesn't match block-scale layout (M, {triton.cdiv(K, block_k)})"
+    assert As.ndim >= 2, f"As must be at least 2D, got ndim={As.ndim}"
+    assert As.shape[-1] == triton.cdiv(K, block_k), (
+        f"As last dim {As.shape[-1]} != expected {triton.cdiv(K, block_k)} (cdiv(K={K}, block_k={block_k}))"
     )
-    assert (
-        Bs.ndim == 2
-        and Bs.shape[0] == triton.cdiv(N, block_n)
-        and Bs.shape[1] == triton.cdiv(K, block_k)
-    ), (
-        f"Bs shape {tuple(Bs.shape)} doesn't match ({triton.cdiv(N, block_n)}, {triton.cdiv(K, block_k)})"
+    assert Bs.ndim == 2, f"Bs must be 2D (N//block_n, K//block_k), got ndim={Bs.ndim}"
+    assert Bs.shape == (triton.cdiv(N, block_n), triton.cdiv(K, block_k)), (
+        f"Bs shape {tuple(Bs.shape)} != expected ({triton.cdiv(N, block_n)}, {triton.cdiv(K, block_k)})"
     )
 
+    BLOCK_SIZE_K = block_k
+    BLOCK_SIZE_N = block_n
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
-
     # Adaptive BLOCK_SIZE_M: smallest power-of-2 >= M, floored at 16, capped at 128.
     # Matches the WGMMA tile to the actual row count — smaller tiles use less
     # register pressure and a better-matched FP8 WGMMA instruction, improving
     # both accuracy and performance for small M (decode).
     BLOCK_SIZE_M = min(max(triton.next_power_of_2(M), 16), 128)
-    BLOCK_SIZE_K = block_k
-    BLOCK_SIZE_N = block_n
-
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
     with device_context(A.device):
         wrap_triton(w8a8_block_fp8_matmul_kernel)[grid](
@@ -251,8 +246,6 @@ def _w8a8_block_fp8_matmul(
             M,
             N,
             K,
-            block_n,
-            block_k,
             A.stride(-2),
             A.stride(-1),
             B.stride(1),
@@ -263,6 +256,7 @@ def _w8a8_block_fp8_matmul(
             As.stride(-1),
             Bs.stride(1),
             Bs.stride(0),
+            # Meta-parameters
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
@@ -285,10 +279,12 @@ def _w8a8_tensor_fp8_matmul(
     As: scalar, (M,), or (M, 1) — per-row activation scales
     Bs: scalar, (1,), or (1, 1) — single weight scale
     """
-    assert A.shape[-1] == B.shape[-1]
-    assert A.is_contiguous()
-    assert B.ndim == 2
-    assert B.is_contiguous()
+    assert A.shape[-1] == B.shape[-1], (
+        f"K mismatch: A has K={A.shape[-1]}, B has K={B.shape[-1]}"
+    )
+    assert A.is_contiguous(), "A must be contiguous"
+    assert B.ndim == 2, f"B must be 2D (N, K), got ndim={B.ndim}"
+    assert B.is_contiguous(), "B must be contiguous"
 
     N, K = B.shape
     M = A.numel() // A.shape[-1]
@@ -299,20 +295,18 @@ def _w8a8_tensor_fp8_matmul(
     elif As.ndim == 2:
         As = As.reshape(M)
     assert As.ndim == 1 and As.shape[0] == M, (
-        f"As must be scalar, (M,), or (M,1), got {tuple(As.shape)}"
+        f"As must be scalar, (M,), or (M,1) with M={M}, got {tuple(As.shape)}"
     )
 
     # Normalize Bs to (1,)
     assert Bs.numel() == 1, f"Bs must be scalar or (1,), got {tuple(Bs.shape)}"
     Bs = Bs.reshape(1)
 
-    C_shape = A.shape[:-1] + (N,)
-    C = A.new_empty(C_shape, dtype=output_dtype)
-
-    BLOCK_SIZE_M = min(max(triton.next_power_of_2(M), 16), 128)
     BLOCK_SIZE_N = 128
     BLOCK_SIZE_K = 128
-
+    C_shape = A.shape[:-1] + (N,)
+    C = A.new_empty(C_shape, dtype=output_dtype)
+    BLOCK_SIZE_M = min(max(triton.next_power_of_2(M), 16), 128)
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
     with device_context(A.device):
         wrap_triton(w8a8_tensor_fp8_matmul_kernel)[grid](
@@ -331,6 +325,7 @@ def _w8a8_tensor_fp8_matmul(
             C.stride(-2),
             C.stride(-1),
             As.stride(0),
+            # Meta-parameters
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
