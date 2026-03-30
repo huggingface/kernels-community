@@ -40,18 +40,16 @@ def w8a8_block_fp8_matmul_batched_kernel(
     S,
     N,
     K,
-    # Per-row strides
+    stride_am,
     stride_ak,
+    stride_be,
     stride_bk,
     stride_bn,
+    stride_cm,
     stride_cn,
-    stride_Bs_k,
-    stride_Bs_n,
-    # Batch / expert strides
-    stride_Ab,  # stride between rows in A (one token per program)
-    stride_Eb,  # stride between experts in B
-    stride_Cb,  # stride between rows in C (one token per program)
-    stride_Esb,  # stride between experts in Bs
+    stride_bs_e,
+    stride_bs_k,
+    stride_bs_n,
     # Meta-parameters
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -70,17 +68,17 @@ def w8a8_block_fp8_matmul_batched_kernel(
     # 3072×3072 FP8 weights).
     expert_id = tl.load(ExpertIds + batch_id).to(tl.int64)
 
-    A = A + batch_id * stride_Ab
-    B = B + expert_id * stride_Eb
-    C = C + batch_id * stride_Cb
-    Bs = Bs + expert_id * stride_Esb
+    A = A + batch_id * stride_am
+    B = B + expert_id * stride_be
+    C = C + batch_id * stride_cm
+    Bs = Bs + expert_id * stride_bs_e
 
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_ak
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    Bs_ptrs = Bs + pid_n * stride_Bs_n
+    bs_ptrs = Bs + pid_n * stride_bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -90,7 +88,7 @@ def w8a8_block_fp8_matmul_batched_kernel(
         a = (a_raw / tl.maximum(a_s, 1e-12)).to(tl.float8e4nv)
         # ---- matmul ----
         b = tl.load(b_ptrs)
-        b_s = tl.load(Bs_ptrs + k * stride_Bs_k)
+        b_s = tl.load(bs_ptrs + k * stride_bs_k)
         accumulator += tl.dot(a, b) * a_s * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -127,15 +125,15 @@ def w8a8_tensor_fp8_matmul_batched_kernel(
     S,
     N,
     K,
+    stride_am,
     stride_ak,
+    stride_be,
     stride_bk,
     stride_bn,
+    stride_cm,
     stride_cn,
-    stride_As_b,
-    stride_Ab,
-    stride_Eb,
-    stride_Cb,
-    stride_Esb,
+    stride_as_m,
+    stride_bs_e,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -150,10 +148,10 @@ def w8a8_tensor_fp8_matmul_batched_kernel(
 
     expert_id = tl.load(ExpertIds + batch_id).to(tl.int64)
 
-    A = A + batch_id * stride_Ab
-    B = B + expert_id * stride_Eb
-    C = C + batch_id * stride_Cb
-    Bs = Bs + expert_id * stride_Esb
+    A = A + batch_id * stride_am
+    B = B + expert_id * stride_be
+    C = C + batch_id * stride_cm
+    Bs = Bs + expert_id * stride_bs_e
 
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -161,7 +159,7 @@ def w8a8_tensor_fp8_matmul_batched_kernel(
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     b_s = tl.load(Bs)
-    a_s = tl.load(As + batch_id * stride_As_b)
+    a_s = tl.load(As + batch_id * stride_as_m)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -226,14 +224,12 @@ def _w8a8_block_fp8_matmul_batched(
     )
 
     C = A.new_empty(S, N)
-    BLOCK_SIZE_N = block_n
-    BLOCK_SIZE_K = block_k
-    grid = (S, triton.cdiv(N, block_n))
     # Adaptive BLOCK_SIZE_M: smallest power-of-2 >= M, floored at 16, capped at 128.
     # Matches the WGMMA tile to the actual row count — smaller tiles use less
     # register pressure and a better-matched FP8 WGMMA instruction, improving
     # both accuracy and performance for small M (decode).
     BLOCK_SIZE_M = min(max(triton.next_power_of_2((S + E - 1) // E), 16), 128)
+    grid = (S, triton.cdiv(N, block_n))
     with device_context(A.device):
         wrap_triton(w8a8_block_fp8_matmul_batched_kernel)[grid](
             A,
@@ -244,19 +240,18 @@ def _w8a8_block_fp8_matmul_batched(
             S,
             N,
             K,
+            A.stride(0),
             A.stride(1),
+            B.stride(0),
             B.stride(2),
             B.stride(1),
+            C.stride(0),
             C.stride(1),
+            Bs.stride(0),
             Bs.stride(2),
             Bs.stride(1),
-            A.stride(0),
-            B.stride(0),
-            C.stride(0),
-            Bs.stride(0),
-            # Meta-parameters
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            BLOCK_SIZE_N=block_n,
+            BLOCK_SIZE_K=block_k,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
         )
 
@@ -306,6 +301,7 @@ def _w8a8_tensor_fp8_matmul_batched(
     # register pressure and a better-matched FP8 WGMMA instruction, improving
     # both accuracy and performance for small M (decode).
     BLOCK_SIZE_M = min(max(triton.next_power_of_2((S + E - 1) // E), 16), 128)
+    grid = (S, triton.cdiv(N, BLOCK_SIZE_N))
     with device_context(A.device):
         wrap_triton(w8a8_tensor_fp8_matmul_batched_kernel)[grid](
             qA,
@@ -317,14 +313,14 @@ def _w8a8_tensor_fp8_matmul_batched(
             S,
             N,
             K,
+            qA.stride(0),
             qA.stride(1),
+            B.stride(0),
             B.stride(2),
             B.stride(1),
+            C.stride(0),
             C.stride(1),
             As.stride(0),
-            qA.stride(0),
-            B.stride(0),
-            C.stride(0),
             Bs.stride(0),
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_K=BLOCK_SIZE_K,

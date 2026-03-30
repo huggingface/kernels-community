@@ -44,14 +44,14 @@ def w8a8_block_fp8_matmul_grouped_kernel(
     # Strides
     stride_am,
     stride_ak,
-    stride_Eb,
+    stride_be,
     stride_bk,
     stride_bn,
     stride_cm,
     stride_cn,
-    stride_Esb,
-    stride_Bsk,
-    stride_Bsn,
+    stride_bs_e,
+    stride_bs_k,
+    stride_bs_n,
     # Meta-parameters
     NUM_EXPERTS: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -89,7 +89,7 @@ def w8a8_block_fp8_matmul_grouped_kernel(
         hi = tl.where(is_left, hi, mid)
 
     # Cast expert_id to int64 to prevent int32 overflow when computing
-    # expert_id * stride_Eb (e.g. 255 * 9_437_184 > 2^31 for 256 experts of
+    # expert_id * stride_be (e.g. 255 * 9_437_184 > 2^31 for 256 experts of
     # 3072×3072 FP8 weights).
     expert_id = lo.to(tl.int64)
 
@@ -112,11 +112,11 @@ def w8a8_block_fp8_matmul_grouped_kernel(
     a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = (
         B
-        + expert_id * stride_Eb
+        + expert_id * stride_be
         + offs_k[:, None] * stride_bk
         + offs_bn[None, :] * stride_bn
     )
-    Bs_ptrs = Bs + expert_id * stride_Esb + pid_n * stride_Bsn
+    bs_ptrs = Bs + expert_id * stride_bs_e + pid_n * stride_bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -126,7 +126,7 @@ def w8a8_block_fp8_matmul_grouped_kernel(
         a = (a_raw / tl.maximum(a_s[:, None], 1e-12)).to(tl.float8e4nv)
         # ---- matmul ----
         b = tl.load(b_ptrs)
-        b_s = tl.load(Bs_ptrs + k * stride_Bsk)
+        b_s = tl.load(bs_ptrs + k * stride_bs_k)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -165,13 +165,13 @@ def w8a8_tensor_fp8_matmul_grouped_kernel(
     K,
     stride_am,
     stride_ak,
-    stride_Eb,
+    stride_be,
     stride_bk,
     stride_bn,
     stride_cm,
     stride_cn,
-    stride_As_m,
-    stride_Esb,
+    stride_as_m,
+    stride_bs_e,
     NUM_EXPERTS: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -219,13 +219,13 @@ def w8a8_tensor_fp8_matmul_grouped_kernel(
     a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = (
         B
-        + expert_id * stride_Eb
+        + expert_id * stride_be
         + offs_k[:, None] * stride_bk
         + offs_bn[None, :] * stride_bn
     )
 
-    a_s = tl.load(As + offs_global_m * stride_As_m, mask=row_mask, other=0.0)
-    b_s = tl.load(Bs + expert_id * stride_Esb)
+    a_s = tl.load(As + offs_global_m * stride_as_m, mask=row_mask, other=0.0)
+    b_s = tl.load(Bs + expert_id * stride_bs_e)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -291,8 +291,6 @@ def _w8a8_block_fp8_matmul_grouped(
     )
 
     C = A.new_empty(S, N)
-    BLOCK_SIZE_N = block_n
-    BLOCK_SIZE_K = block_k
     # Adaptive BLOCK_SIZE_M: match tile to average tokens per expert.
     BLOCK_SIZE_M = min(max(triton.next_power_of_2((S + E - 1) // E), 16), 128)
     tiles_per_expert = (tokens_per_expert + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
@@ -326,8 +324,8 @@ def _w8a8_block_fp8_matmul_grouped(
             Bs.stride(1),
             # Meta-parameters
             NUM_EXPERTS=E,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            BLOCK_SIZE_N=block_n,
+            BLOCK_SIZE_K=block_k,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
         )

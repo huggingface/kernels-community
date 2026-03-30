@@ -41,17 +41,16 @@ def w8a8_block_fp8_matmul_kernel(
     M,
     N,
     K,
-    # Stride for inputs and output
     stride_am,
     stride_ak,
     stride_bk,
     stride_bn,
     stride_cm,
     stride_cn,
-    stride_As_m,
-    stride_As_k,
-    stride_Bs_k,
-    stride_Bs_n,
+    stride_as_m,
+    stride_as_k,
+    stride_bs_k,
+    stride_bs_n,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -61,17 +60,13 @@ def w8a8_block_fp8_matmul_kernel(
     """Block-scale FP8 GEMM kernel.
 
     Computes ``C = A @ B.T`` with block-wise activation/weight scales.
+    Uses a 2D grid with swizzle for L2 cache locality on B tiles.
     """
-
-    pid = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
@@ -79,9 +74,9 @@ def w8a8_block_fp8_matmul_kernel(
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    As_ptrs = As + offs_am * stride_As_m
+    as_ptrs = As + offs_am * stride_as_m
     offs_bsn = offs_bn // BLOCK_SIZE_N
-    Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+    bs_ptrs = Bs + offs_bsn * stride_bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -89,8 +84,8 @@ def w8a8_block_fp8_matmul_kernel(
         a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
 
-        a_s = tl.load(As_ptrs + k * stride_As_k)
-        b_s = tl.load(Bs_ptrs + k * stride_Bs_k)
+        a_s = tl.load(as_ptrs + k * stride_as_k)
+        b_s = tl.load(bs_ptrs + k * stride_bs_k)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -134,7 +129,7 @@ def w8a8_tensor_fp8_matmul_kernel(
     stride_bn,
     stride_cm,
     stride_cn,
-    stride_As_m,
+    stride_as_m,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -144,16 +139,13 @@ def w8a8_tensor_fp8_matmul_kernel(
 
     Computes ``C = A @ B.T`` with one activation scale per row and one
     weight scale for the full matrix.
+    Uses a 2D grid with swizzle for L2 cache locality on B tiles.
     """
-    pid = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
@@ -162,7 +154,7 @@ def w8a8_tensor_fp8_matmul_kernel(
     a_ptrs = A + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = B + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
 
-    a_s = tl.load(As + offs_am * stride_As_m)
+    a_s = tl.load(As + offs_am * stride_as_m)
     b_s = tl.load(Bs)
 
     # Accumulate raw dot products, apply scales once after the loop.
@@ -238,7 +230,7 @@ def _w8a8_block_fp8_matmul(
     # register pressure and a better-matched FP8 WGMMA instruction, improving
     # both accuracy and performance for small M (decode).
     BLOCK_SIZE_M = min(max(triton.next_power_of_2(M), 16), 128)
-    grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
+    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
     with device_context(A.device):
         wrap_triton(w8a8_block_fp8_matmul_kernel)[grid](
             A,
@@ -310,7 +302,7 @@ def _w8a8_tensor_fp8_matmul(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
     BLOCK_SIZE_M = min(max(triton.next_power_of_2(M), 16), 128)
-    grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
+    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
     with device_context(A.device):
         wrap_triton(w8a8_tensor_fp8_matmul_kernel)[grid](
             A,
