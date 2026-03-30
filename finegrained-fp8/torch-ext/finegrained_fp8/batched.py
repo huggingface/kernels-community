@@ -80,8 +80,7 @@ def w8a8_block_fp8_matmul_batched_kernel(
     a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_ak
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    offs_bsn = offs_bn // BLOCK_SIZE_N
-    Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+    Bs_ptrs = Bs + pid_n * stride_Bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -168,10 +167,11 @@ def w8a8_tensor_fp8_matmul_batched_kernel(
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs)
         b = tl.load(b_ptrs)
-
-        accumulator += tl.dot(a, b) * a_s * b_s[None, :]
+        accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    accumulator = accumulator * a_s * b_s
 
     if C.dtype.element_ty == tl.bfloat16:
         c = accumulator.to(tl.bfloat16)

@@ -53,10 +53,10 @@ def w8a8_block_fp8_matmul_grouped_kernel(
     stride_Bsk,
     stride_Bsn,
     # Meta-parameters
+    NUM_EXPERTS: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
     NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
 ):
     """Block-scale grouped FP8 expert matmul kernel.
@@ -94,7 +94,6 @@ def w8a8_block_fp8_matmul_grouped_kernel(
     expert_id = lo.to(tl.int64)
 
     prev_eid = tl.maximum(expert_id - 1, 0)
-
     expert_start = tl.where(expert_id == 0, 0, tl.load(Offsets + prev_eid))
     expert_end = tl.load(Offsets + expert_id)
     M_expert = expert_end - expert_start
@@ -117,8 +116,7 @@ def w8a8_block_fp8_matmul_grouped_kernel(
         + offs_k[:, None] * stride_bk
         + offs_bn[None, :] * stride_bn
     )
-    offs_bsn = offs_bn // BLOCK_SIZE_N
-    Bs_ptrs = Bs + expert_id * stride_Esb + offs_bsn * stride_Bsn
+    Bs_ptrs = Bs + expert_id * stride_Esb + pid_n * stride_Bsn
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -155,7 +153,7 @@ def w8a8_block_fp8_matmul_grouped_kernel(
 )
 @triton.jit
 def w8a8_tensor_fp8_matmul_grouped_kernel(
-    A,  # (S, K) pre-quantized FP8 activations
+    A,  # (S, K) raw BF16/FP16 activations, sorted/grouped by expert idc
     B,  # (E, N, K) FP8 weight matrices
     C,  # (S, N) output
     As,  # (S, 1) activation scales
@@ -174,10 +172,10 @@ def w8a8_tensor_fp8_matmul_grouped_kernel(
     stride_cn,
     stride_As_m,
     stride_Esb,
+    NUM_EXPERTS: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
     NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
 ):
     """Tensor-scale grouped FP8 expert matmul kernel.
@@ -234,9 +232,11 @@ def w8a8_tensor_fp8_matmul_grouped_kernel(
         a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
         b = tl.load(b_ptrs)
 
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s
+        accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    accumulator = accumulator * a_s[:, None] * b_s
 
     if C.dtype.element_ty == tl.bfloat16:
         c = accumulator.to(tl.bfloat16)

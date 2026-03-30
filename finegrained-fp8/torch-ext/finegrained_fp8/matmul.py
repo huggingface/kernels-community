@@ -25,7 +25,7 @@ from .utils import device_context
     configs=[
         triton.Config({}, num_warps=w, num_stages=s)
         for w in [2, 4, 8, 16]
-        for s in [2, 3, 4, 5]
+        for s in [2, 3, 4]
     ],
     key=["N", "K", "BLOCK_SIZE_M"],
 )
@@ -114,7 +114,7 @@ def w8a8_block_fp8_matmul_kernel(
     configs=[
         triton.Config({}, num_warps=w, num_stages=s)
         for w in [2, 4, 8, 16]
-        for s in [2, 3, 4, 5]
+        for s in [2, 3, 4]
     ],
     key=["N", "K", "BLOCK_SIZE_M"],
 )
@@ -165,14 +165,17 @@ def w8a8_tensor_fp8_matmul_kernel(
     a_s = tl.load(As + offs_am * stride_As_m)
     b_s = tl.load(Bs)
 
+    # Accumulate raw dot products, apply scales once after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         k_remaining = K - k * BLOCK_SIZE_K
         a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s
+        accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    accumulator = accumulator * a_s[:, None] * b_s
 
     if C.dtype.element_ty == tl.bfloat16:
         c = accumulator.to(tl.bfloat16)
