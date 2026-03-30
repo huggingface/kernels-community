@@ -8,7 +8,7 @@ import pytest
 import torch
 import triton
 
-import finegrained_fp8
+import finegrained_fp8  # type: ignore
 
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -370,7 +370,6 @@ def test_grouped_compile():
             offsets,
             tokens_per_expert,
             COMPILE_PROBLEM.block_size,
-            allow_sync=False,
         )
 
     compiled = torch.compile(fn, mode="max-autotune", fullgraph=True)
