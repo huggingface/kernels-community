@@ -72,22 +72,21 @@ CASES = [
     (16, 512, 1024, None),
 ]
 
-# CUDA 13+ (shipped with torch 2.11+) has bigger
-# numerical diffs vs the dequant+matmul reference.
-_cuda_version = torch.version.cuda or "0.0"
-_cuda_major = int(_cuda_version.split(".")[0])
+# CI (L4, SM89) has looser FP8 numerics vs the dequant+matmul reference on Hopper and newer.
+_sm = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+_is_hopper_or_newer = _sm >= (9, 0)
 
-if _cuda_major >= 13:
-    DTYPE_TO_TOL = {
-        torch.bfloat16: (0.2, 0.05),
-        torch.float16: (0.2, 0.05),
-        torch.float32: (0.2, 0.05),
-    }
-else:
+if _is_hopper_or_newer:
     DTYPE_TO_TOL = {
         torch.bfloat16: (1e-4, 1e-2),
         torch.float16: (1e-4, 1e-2),
         torch.float32: (1e-4, 1e-4),
+    }
+else:
+    DTYPE_TO_TOL = {
+        torch.bfloat16: (0.2, 0.05),
+        torch.float16: (0.2, 0.05),
+        torch.float32: (0.2, 0.05),
     }
 
 
