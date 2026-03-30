@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 import torch
-from absl.testing import parameterized
+# from absl.testing import parameterized
 
 from .. import ops
 
@@ -53,32 +53,32 @@ def log_benchmark(arguments, mean_t, std_t):
     print('=' * 60)
 
 
-class SortBenchmark(parameterized.TestCase):
-
-    @parameterized.parameters(*_SORT_TESTS)
-    def testSort(self, n, dtype, max_val):
-        if max_val is None:
-            max_val = np.iinfo(numpy_dtype(dtype)).max
-        end_bit = int(np.ceil(np.log2(max_val)))
-        x = torch.randint(0, max_val, (n,)).cuda().to(dtype)
-
-        mean_t, std_t, max_t, min_t = benchmark_function(lambda: ops.sort(x, end_bit),)
-        arguments = {
-            'n': n,
-            'dtype': dtype,
-            'max_val': max_val,
-        }
-        log_benchmark(arguments, mean_t, std_t)
-
-    @parameterized.parameters(*_BASELINE_SORT_TESTS)
-    def testTorchSort(self, n):
-        x = torch.randint(0, 128, (n,)).cuda().to(torch.int32)
-
-        mean_t, std_t, max_t, min_t = benchmark_function(lambda: torch.sort(x))
-        arguments = {
-            'n': n,
-        }
-        log_benchmark(arguments, mean_t, std_t)
+# class SortBenchmark(parameterized.TestCase):
+#
+#     @parameterized.parameters(*_SORT_TESTS)
+#     def testSort(self, n, dtype, max_val):
+#         if max_val is None:
+#             max_val = np.iinfo(numpy_dtype(dtype)).max
+#         end_bit = int(np.ceil(np.log2(max_val)))
+#         x = torch.randint(0, max_val, (n,)).cuda().to(dtype)
+#
+#         mean_t, std_t, max_t, min_t = benchmark_function(lambda: ops.sort(x, end_bit),)
+#         arguments = {
+#             'n': n,
+#             'dtype': dtype,
+#             'max_val': max_val,
+#         }
+#         log_benchmark(arguments, mean_t, std_t)
+#
+#     @parameterized.parameters(*_BASELINE_SORT_TESTS)
+#     def testTorchSort(self, n):
+#         x = torch.randint(0, 128, (n,)).cuda().to(torch.int32)
+#
+#         mean_t, std_t, max_t, min_t = benchmark_function(lambda: torch.sort(x))
+#         arguments = {
+#             'n': n,
+#         }
+#         log_benchmark(arguments, mean_t, std_t)
 
 
 if __name__ == '__main__':

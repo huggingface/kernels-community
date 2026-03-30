@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 import torch
-from absl.testing import parameterized
+# from absl.testing import parameterized
 
 from .. import ops
 
@@ -47,31 +47,31 @@ def log_benchmark(arguments, mean_t, std_t):
     print('=' * 60)
 
 
-class HistogramBenchmark(parameterized.TestCase):
-
-    @parameterized.parameters(*_HISTOGRAM_TESTS)
-    def testHistogram(self, n, dtype, max_val):
-        x = torch.randint(0, max_val, (n,)).cuda().to(dtype)
-
-        mean_t, std_t, max_t, min_t = benchmark_function(lambda: ops.histogram(x, max_val),)
-        arguments = {
-            'n': n,
-            'dtype': dtype,
-            'max_val': max_val,
-        }
-        log_benchmark(arguments, mean_t, std_t)
-
-    @parameterized.parameters(*_HISTOGRAM_TESTS)
-    def testTorchHistogram(self, n, dtype, max_val):
-        x = torch.randint(0, 128, (n,)).cuda().to(dtype)
-
-        mean_t, std_t, max_t, min_t = benchmark_function(lambda: torch.histc(x, max_val, 0, max_val - 1),)
-        arguments = {
-            'n': n,
-            'dtype': dtype,
-            'max_val': max_val,
-        }
-        log_benchmark(arguments, mean_t, std_t)
+# class HistogramBenchmark(parameterized.TestCase):
+#
+#     @parameterized.parameters(*_HISTOGRAM_TESTS)
+#     def testHistogram(self, n, dtype, max_val):
+#         x = torch.randint(0, max_val, (n,)).cuda().to(dtype)
+#
+#         mean_t, std_t, max_t, min_t = benchmark_function(lambda: ops.histogram(x, max_val),)
+#         arguments = {
+#             'n': n,
+#             'dtype': dtype,
+#             'max_val': max_val,
+#         }
+#         log_benchmark(arguments, mean_t, std_t)
+#
+#     @parameterized.parameters(*_HISTOGRAM_TESTS)
+#     def testTorchHistogram(self, n, dtype, max_val):
+#         x = torch.randint(0, 128, (n,)).cuda().to(dtype)
+#
+#         mean_t, std_t, max_t, min_t = benchmark_function(lambda: torch.histc(x, max_val, 0, max_val - 1),)
+#         arguments = {
+#             'n': n,
+#             'dtype': dtype,
+#             'max_val': max_val,
+#         }
+#         log_benchmark(arguments, mean_t, std_t)
 
 
 if __name__ == '__main__':

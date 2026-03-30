@@ -1,5 +1,5 @@
 [general]
-name = "gpt_oss_triton_kernels"
+name = "gpt-oss-triton-kernels"
 license = "MIT"
 version = 1
 backends = [
