@@ -169,25 +169,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
     // BF16 GEMM ops (CUDA dispatch)
     ops.def(
-        "bf16_gemm_nt(Tensor a, Tensor b, Tensor d, Tensor? c, "
+        "bf16_gemm_nt(Tensor a, Tensor b, Tensor! d, Tensor? c, "
         "str compiled_dims) -> ()"
     );
     ops.impl("bf16_gemm_nt", torch::kCUDA, &deep_gemm_bf16_gemm_nt);
 
     ops.def(
-        "bf16_gemm_nn(Tensor a, Tensor b, Tensor d, Tensor? c, "
+        "bf16_gemm_nn(Tensor a, Tensor b, Tensor! d, Tensor? c, "
         "str compiled_dims) -> ()"
     );
     ops.impl("bf16_gemm_nn", torch::kCUDA, &deep_gemm_bf16_gemm_nn);
 
     ops.def(
-        "bf16_gemm_tn(Tensor a, Tensor b, Tensor d, Tensor? c, "
+        "bf16_gemm_tn(Tensor a, Tensor b, Tensor! d, Tensor? c, "
         "str compiled_dims) -> ()"
     );
     ops.impl("bf16_gemm_tn", torch::kCUDA, &deep_gemm_bf16_gemm_tn);
 
     ops.def(
-        "bf16_gemm_tt(Tensor a, Tensor b, Tensor d, Tensor? c, "
+        "bf16_gemm_tt(Tensor a, Tensor b, Tensor! d, Tensor? c, "
         "str compiled_dims) -> ()"
     );
     ops.impl("bf16_gemm_tt", torch::kCUDA, &deep_gemm_bf16_gemm_tt);
@@ -195,7 +195,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     // M-grouped BF16 GEMM ops (CUDA dispatch)
     ops.def(
         "m_grouped_bf16_gemm_nt_contiguous("
-        "Tensor a, Tensor b, Tensor d, Tensor grouped_layout, "
+        "Tensor a, Tensor b, Tensor! d, Tensor grouped_layout, "
         "str compiled_dims, bool use_psum_layout, "
         "int expected_m_for_psum_layout, bool has_expected_m_for_psum_layout) -> ()"
     );
@@ -204,7 +204,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
     ops.def(
         "m_grouped_bf16_gemm_nn_contiguous("
-        "Tensor a, Tensor b, Tensor d, Tensor grouped_layout, "
+        "Tensor a, Tensor b, Tensor! d, Tensor grouped_layout, "
         "str compiled_dims, bool use_psum_layout) -> ()"
     );
     ops.impl("m_grouped_bf16_gemm_nn_contiguous", torch::kCUDA,
@@ -212,7 +212,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
     ops.def(
         "m_grouped_bf16_gemm_nt_masked("
-        "Tensor a, Tensor b, Tensor d, Tensor masked_m, "
+        "Tensor a, Tensor b, Tensor! d, Tensor masked_m, "
         "int expected_m, str compiled_dims) -> ()"
     );
     ops.impl("m_grouped_bf16_gemm_nt_masked", torch::kCUDA,
@@ -221,7 +221,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     // K-grouped BF16 GEMM ops (CUDA dispatch)
     ops.def(
         "k_grouped_bf16_gemm_tn_contiguous("
-        "Tensor a, Tensor b, Tensor d, Tensor ks_tensor, Tensor? c, "
+        "Tensor a, Tensor b, Tensor! d, Tensor ks_tensor, Tensor? c, "
         "str compiled_dims) -> ()"
     );
     ops.impl("k_grouped_bf16_gemm_tn_contiguous", torch::kCUDA,
@@ -229,22 +229,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
     // cuBLASLt GEMM ops (CUDA dispatch)
     ops.def(
-        "cublaslt_gemm_nt(Tensor a, Tensor b, Tensor d, Tensor? c) -> ()"
+        "cublaslt_gemm_nt(Tensor a, Tensor b, Tensor! d, Tensor? c) -> ()"
     );
     ops.impl("cublaslt_gemm_nt", torch::kCUDA, &deep_gemm_cublaslt_gemm_nt);
 
     ops.def(
-        "cublaslt_gemm_nn(Tensor a, Tensor b, Tensor d, Tensor? c) -> ()"
+        "cublaslt_gemm_nn(Tensor a, Tensor b, Tensor! d, Tensor? c) -> ()"
     );
     ops.impl("cublaslt_gemm_nn", torch::kCUDA, &deep_gemm_cublaslt_gemm_nn);
 
     ops.def(
-        "cublaslt_gemm_tn(Tensor a, Tensor b, Tensor d, Tensor? c) -> ()"
+        "cublaslt_gemm_tn(Tensor a, Tensor b, Tensor! d, Tensor? c) -> ()"
     );
     ops.impl("cublaslt_gemm_tn", torch::kCUDA, &deep_gemm_cublaslt_gemm_tn);
 
     ops.def(
-        "cublaslt_gemm_tt(Tensor a, Tensor b, Tensor d, Tensor? c) -> ()"
+        "cublaslt_gemm_tt(Tensor a, Tensor b, Tensor! d, Tensor? c) -> ()"
     );
     ops.impl("cublaslt_gemm_tt", torch::kCUDA, &deep_gemm_cublaslt_gemm_tt);
 
