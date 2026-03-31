@@ -3,10 +3,40 @@ import subprocess
 import torch
 
 # Import the compiled extension
-from ._ops import ops
+from ._ops import ops, add_op_namespace_prefix
 from . import utils
 
 __version__ = "2.3.0"
+
+
+# ── Register fake tensor implementations for torch.compile ──────────────────
+# All GEMM ops mutate the output tensor `d` in-place and return void.
+# The fake implementations are no-ops since `d` is pre-allocated by the caller.
+
+
+for _op in [
+    "fp8_fp4_gemm_nt",
+    "fp8_fp4_gemm_nn",
+    "fp8_fp4_gemm_tn",
+    "fp8_fp4_gemm_tt",
+    "m_grouped_fp8_fp4_gemm_nt_contiguous",
+    "m_grouped_fp8_fp4_gemm_nn_contiguous",
+    "m_grouped_fp8_fp4_gemm_nt_masked",
+    "k_grouped_fp8_gemm_nt_contiguous",
+    "k_grouped_fp8_gemm_tn_contiguous",
+    "bf16_gemm_nt",
+    "bf16_gemm_nn",
+    "bf16_gemm_tn",
+    "bf16_gemm_tt",
+    "m_grouped_bf16_gemm_nt_contiguous",
+    "m_grouped_bf16_gemm_nn_contiguous",
+    "m_grouped_bf16_gemm_nt_masked",
+    "fp8_gemm_nt_skip_head_mid",
+]:
+
+    @torch.library.register_fake(add_op_namespace_prefix(_op))
+    def _fake(*args, **kwargs):
+        pass
 
 
 # Runtime
@@ -661,11 +691,13 @@ if "DG_CUTLASS_INCLUDE" not in os.environ:
         # Fall back to nvidia-cutlass pip package
         try:
             import nvidia.cutlass as _nc
+
             os.environ["DG_CUTLASS_INCLUDE"] = os.path.join(
                 os.path.dirname(_nc.__file__), "include"
             )
         except ImportError:
             pass
+
 
 def _ensure_initialized():
     global _initialized

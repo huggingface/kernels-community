@@ -65,7 +65,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def(
         "fp8_fp4_gemm_nt("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
-        "Tensor d, Tensor? c, "
+        "Tensor! d, Tensor? c, "
         "int recipe_0, int recipe_1, int recipe_2, bool has_recipe, "
         "int recipe_a_0, int recipe_a_1, bool has_recipe_a, "
         "int recipe_b_0, int recipe_b_1, bool has_recipe_b, "
@@ -76,7 +76,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def(
         "fp8_fp4_gemm_nn("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
-        "Tensor d, Tensor? c, "
+        "Tensor! d, Tensor? c, "
         "int recipe_0, int recipe_1, int recipe_2, bool has_recipe, "
         "int recipe_a_0, int recipe_a_1, bool has_recipe_a, "
         "int recipe_b_0, int recipe_b_1, bool has_recipe_b, "
@@ -87,7 +87,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def(
         "fp8_fp4_gemm_tn("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
-        "Tensor d, Tensor? c, "
+        "Tensor! d, Tensor? c, "
         "int recipe_0, int recipe_1, int recipe_2, bool has_recipe, "
         "int recipe_a_0, int recipe_a_1, bool has_recipe_a, "
         "int recipe_b_0, int recipe_b_1, bool has_recipe_b, "
@@ -98,7 +98,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def(
         "fp8_fp4_gemm_tt("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
-        "Tensor d, Tensor? c, "
+        "Tensor! d, Tensor? c, "
         "int recipe_0, int recipe_1, int recipe_2, bool has_recipe, "
         "int recipe_a_0, int recipe_a_1, bool has_recipe_a, "
         "int recipe_b_0, int recipe_b_1, bool has_recipe_b, "
@@ -110,7 +110,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def(
         "m_grouped_fp8_fp4_gemm_nt_contiguous("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
-        "Tensor d, Tensor grouped_layout, "
+        "Tensor! d, Tensor grouped_layout, "
         "int recipe_0, int recipe_1, int recipe_2, bool has_recipe, "
         "int recipe_a_0, int recipe_a_1, bool has_recipe_a, "
         "int recipe_b_0, int recipe_b_1, bool has_recipe_b, "
@@ -124,7 +124,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def(
         "m_grouped_fp8_fp4_gemm_nn_contiguous("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
-        "Tensor d, Tensor grouped_layout, "
+        "Tensor! d, Tensor grouped_layout, "
         "int recipe_0, int recipe_1, int recipe_2, bool has_recipe, "
         "int recipe_a_0, int recipe_a_1, bool has_recipe_a, "
         "int recipe_b_0, int recipe_b_1, bool has_recipe_b, "
@@ -137,7 +137,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def(
         "m_grouped_fp8_fp4_gemm_nt_masked("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
-        "Tensor d, Tensor masked_m, int expected_m, "
+        "Tensor! d, Tensor masked_m, int expected_m, "
         "int recipe_0, int recipe_1, int recipe_2, bool has_recipe, "
         "int recipe_a_0, int recipe_a_1, bool has_recipe_a, "
         "int recipe_b_0, int recipe_b_1, bool has_recipe_b, "
@@ -150,7 +150,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def(
         "k_grouped_fp8_gemm_tn_contiguous("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
-        "Tensor d, Tensor ks_tensor, Tensor? c, "
+        "Tensor! d, Tensor ks_tensor, Tensor? c, "
         "int recipe_0, int recipe_1, int recipe_2, "
         "str compiled_dims) -> ()"
     );
@@ -160,7 +160,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def(
         "k_grouped_fp8_gemm_nt_contiguous("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
-        "Tensor d, Tensor ks_tensor, Tensor? c, "
+        "Tensor! d, Tensor ks_tensor, Tensor? c, "
         "int recipe_0, int recipe_1, int recipe_2, "
         "str compiled_dims) -> ()"
     );
@@ -252,7 +252,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def(
         "fp8_gemm_nt_skip_head_mid("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
-        "Tensor d, "
+        "Tensor! d, "
         "int head_split_left, int head_split_mid, int head_split_right, "
         "int recipe_0, int recipe_1, int recipe_2, bool has_recipe, "
         "str compiled_dims, bool disable_ue8m0_cast) -> ()"
@@ -287,7 +287,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
     // Einsum ops (CUDA dispatch)
     ops.def(
-        "einsum(str expr, Tensor a, Tensor b, Tensor d, "
+        "einsum(str expr, Tensor a, Tensor b, Tensor! d, "
         "Tensor? c, bool use_cublaslt) -> ()"
     );
     ops.impl("einsum", torch::kCUDA, &deep_gemm_einsum);
@@ -295,7 +295,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def(
         "fp8_einsum(str expr, "
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
-        "Tensor d, Tensor? c, "
+        "Tensor! d, Tensor? c, "
         "int recipe_0, int recipe_1, int recipe_2) -> ()"
     );
     ops.impl("fp8_einsum", torch::kCUDA, &deep_gemm_fp8_einsum);
@@ -303,7 +303,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     // Hyperconnection ops (CUDA dispatch)
     ops.def(
         "tf32_hc_prenorm_gemm("
-        "Tensor a, Tensor b, Tensor d, Tensor sqr_sum, "
+        "Tensor a, Tensor b, Tensor! d, Tensor! sqr_sum, "
         "int num_splits, bool has_num_splits) -> ()"
     );
     ops.impl("tf32_hc_prenorm_gemm", torch::kCUDA,
