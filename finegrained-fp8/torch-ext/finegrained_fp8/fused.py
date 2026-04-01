@@ -42,8 +42,8 @@ from .utils import device_context
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=w, num_stages=s)
-        for w in [4, 8, 16]
-        for s in [2, 3, 4]
+        for w in [2, 4, 8, 16]
+        for s in [2, 3, 4, 5]
     ],
     key=["N_inter", "K", "BLOCK_SIZE_M"],
 )
@@ -191,8 +191,8 @@ def fused_gate_up_silu_kernel(
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=w, num_stages=s)
-        for w in [4, 8, 16]
-        for s in [2, 3, 4]
+        for w in [2, 4, 8, 16]
+        for s in [2, 3, 4, 5]
     ],
     key=["N_inter", "hidden", "BLOCK_SIZE_M"],
 )
