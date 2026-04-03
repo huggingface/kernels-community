@@ -47,7 +47,8 @@ void dispatch_bwd_by_head(sycl::queue& queue, BwdCutlassType cuType,
     else if (head_size <= 160) dispatch_bwd_causal_local<bwd_policy_head160>(queue, cuType, args, is_causal, is_local);
     else if (head_size <= 192) dispatch_bwd_causal_local<bwd_policy_head192>(queue, cuType, args, is_causal, is_local);
     else if (head_size <= 256) dispatch_bwd_causal_local<bwd_policy_head256>(queue, cuType, args, is_causal, is_local);
-    else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Max supported is 256");
+    else if (head_size == 512) dispatch_bwd_causal_local<bwd_policy_head512>(queue, cuType, args, is_causal, is_local);
+    else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");
 }
 
 }  // anonymous namespace

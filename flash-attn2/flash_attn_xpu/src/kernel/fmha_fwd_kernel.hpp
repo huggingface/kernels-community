@@ -240,13 +240,10 @@ class XeFMHAFwdKernel {
       auto [seq_len_qo, seq_len_kv] = sequence_length_shape;
       if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo) continue;
 
-      auto offset = seq_len_qo;
-      auto discard_seq_coord = seq_len_qo - offset;
-      auto full_tile_offset = seq_len_kv - offset;
+      auto full_tile_offset = seq_len_kv - seq_len_qo;
       int seq_coord =
           cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
 
-      if (CausalMask && seq_coord < discard_seq_coord) continue;
       // calc sg level seq_len_kv
       int seq_len =
           CausalMask
@@ -343,7 +340,6 @@ class XeFMHAFwdKernel {
           thr_id,
           seq_len,
           full_tile_offset,
-          discard_seq_coord,
           head_q,
           s.num_heads_q);
       if constexpr (
