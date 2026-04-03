@@ -132,3 +132,13 @@ struct bwd_policy_head256 {
   static constexpr int AtomLayoutNdKV = 2;
   static constexpr int AtomLayoutMdQ = 2;
 };
+
+struct bwd_policy_head512 {
+  static constexpr int kBlockM = 64;
+  static constexpr int kBlockN = 32;
+  static constexpr int kHeadDim = 512;
+  static constexpr int kNSGs = 8;
+  static constexpr int AtomLayoutMSdP = 4;
+  static constexpr int AtomLayoutNdKV = 2;
+  static constexpr int AtomLayoutMdQ = 2;
+};

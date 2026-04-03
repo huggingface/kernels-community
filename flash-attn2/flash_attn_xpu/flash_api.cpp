@@ -69,6 +69,8 @@ mha_fwd(
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(k.size(-1) == head_size_og, "Key head dimension must match Query head dimension");
     TORCH_CHECK(v.size(-1) == head_size_og, "Value head dimension must match Query head dimension");
+    TORCH_CHECK(head_size_og <= 256 || head_size_og == 512,
+                "FlashAttention XPU only supports head dimension up to 256 or exactly 512. Got: " + std::to_string(head_size_og));
 
     CHECK_DEVICE(q);
     CHECK_DEVICE(k);
@@ -236,7 +238,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads x head_siz
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size_og % 8 == 0, "head_size should be a multiple of 8");
-    TORCH_CHECK(head_size_og <= 256, "FlashAttention backward only supports head dimension at most 256");
+    TORCH_CHECK(head_size_og <= 256 || head_size_og == 512,
+                "FlashAttention XPU backward only supports head dimension up to 256 or exactly 512. Got: " + std::to_string(head_size_og));
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     // XPU requires head_size to be a multiple of 32
@@ -403,6 +406,8 @@ mha_varlen_fwd(
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(k.size(-1) == head_size_og, "Key head dimension must match Query head dimension");
     TORCH_CHECK(v.size(-1) == head_size_og, "Value head dimension must match Query head dimension");
+    TORCH_CHECK(head_size_og <= 256 || head_size_og == 512,
+                "FlashAttention XPU varlen only supports head dimension up to 256 or exactly 512. Got: " + std::to_string(head_size_og));
 
     CHECK_DEVICE(q);
     CHECK_DEVICE(k);

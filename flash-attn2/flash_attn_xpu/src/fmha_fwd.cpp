@@ -33,7 +33,8 @@ void dispatch_fwd_varlen_by_head(sycl::queue& queue, CutlassType cuType,
   else if (head_size <= 160) dispatch_varlen_paged<prefill_policy_head160, PipelineStages_Prefill>(queue, cuType, args);
   else if (head_size <= 192) dispatch_varlen_paged<prefill_policy_head192, PipelineStages_Prefill>(queue, cuType, args);
   else if (head_size <= 256) dispatch_varlen_paged<prefill_policy_head256, PipelineStages_Prefill>(queue, cuType, args);
-  else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Max supported is 256");
+  else if (head_size == 512) dispatch_varlen_paged<prefill_policy_head512, PipelineStages_Prefill>(queue, cuType, args);
+  else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");
 }
 
 /// Dispatch forward kernel by head_size for the decode path (seqlen_q == 1).
@@ -46,7 +47,8 @@ void dispatch_fwd_decode_by_head(sycl::queue& queue, CutlassType cuType,
   else if (head_size <= 160) policy_dispatch<decode_policy_head160, PipelineStages_Decode, 0, 0>(queue, cuType, args);
   else if (head_size <= 192) policy_dispatch<decode_policy_head192, PipelineStages_Decode, 0, 0>(queue, cuType, args);
   else if (head_size <= 256) policy_dispatch<decode_policy_head256, PipelineStages_Decode, 0, 0>(queue, cuType, args);
-  else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Max supported is 256");
+  else if (head_size == 512) policy_dispatch<decode_policy_head512, PipelineStages_Decode, 0, 0>(queue, cuType, args);
+  else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");
 }
 
 /// Dispatch forward kernel by head_size for the prefill path (seqlen_q > 1).
@@ -59,7 +61,8 @@ void dispatch_fwd_prefill_by_head(sycl::queue& queue, CutlassType cuType,
   else if (head_size <= 160) policy_dispatch<prefill_policy_head160, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
   else if (head_size <= 192) policy_dispatch<prefill_policy_head192, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
   else if (head_size <= 256) policy_dispatch<prefill_policy_head256, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
-  else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Max supported is 256");
+  else if (head_size == 512) policy_dispatch<prefill_policy_head512, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
+  else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");
 }
 
 /// Clamp window sizes for local attention and fold causal into local when both are set.

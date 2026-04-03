@@ -1,3 +1,5 @@
+import gc
+
 import pytest
 import torch
 
@@ -10,3 +12,13 @@ def device(request):
         return "xpu"
     else:
         return "cpu"
+
+
+@pytest.fixture(autouse=True)
+def cleanup_gpu_memory():
+    yield
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.xpu.is_available():
+        torch.xpu.empty_cache()
