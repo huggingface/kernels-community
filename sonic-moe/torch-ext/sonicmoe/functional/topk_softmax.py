@@ -14,7 +14,7 @@ from cutlass import const_expr
 from quack.sort.bitonic_sort import bitonic_topk
 from triton import next_power_of_2
 
-from sonicmoe.utils import domain_offset_i64
+from ..utils import domain_offset_i64
 
 
 class TopK_Softmax:
