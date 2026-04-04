@@ -3,9 +3,11 @@ name = "sonicmoe"
 license = "Apache-2.0"
 backends = ["cuda"]
 version = 1
-python-depends = ["nvidia-cutlass-dsl"]
 
 [general.hub]
 repo-id = "kernels-community/sonic-moe"
+
+[general.cuda]
+python-depends = ["nvidia-cutlass-dsl"]
 
 [kernel]
