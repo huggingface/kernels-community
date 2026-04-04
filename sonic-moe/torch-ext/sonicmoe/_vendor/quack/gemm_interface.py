@@ -36,7 +36,23 @@ gated_to_pytorch_fn_map = {
 }
 
 
-default_device_capacity = get_device_capacity(torch.device("cuda"))
+def _get_default_device_capacity():
+    if not torch.cuda.is_available():
+        return (9, 0)
+    return get_device_capacity(torch.device("cuda"))
+
+
+class _LazyDeviceCapacity:
+    """Defer torch.cuda.get_device_capability until first access so the
+    module can be imported in environments without a GPU (e.g. nix build)."""
+    _value = None
+    def __getitem__(self, idx):
+        if self._value is None:
+            self._value = _get_default_device_capacity()
+        return self._value[idx]
+
+
+default_device_capacity = _LazyDeviceCapacity()
 
 
 def default_config(device):

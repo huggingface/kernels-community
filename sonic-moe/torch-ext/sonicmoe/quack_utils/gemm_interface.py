@@ -16,7 +16,20 @@ from .gemm_dgated import gemm_dgated as gemm_dgated_sm90_sm100
 from .gemm_gated import gemm_gated as gemm_gated_sm90_sm100
 
 
-default_device_capacity = get_device_capacity(torch.device("cuda"))
+class _LazyDeviceCapacity:
+    """Defer torch.cuda.get_device_capability until first access so the
+    module can be imported in environments without a GPU (e.g. nix build)."""
+    _value = None
+    def __getitem__(self, idx):
+        if self._value is None:
+            if not torch.cuda.is_available():
+                self._value = (9, 0)
+            else:
+                self._value = get_device_capacity(torch.device("cuda"))
+        return self._value[idx]
+
+
+default_device_capacity = _LazyDeviceCapacity()
 
 
 @autotune(
