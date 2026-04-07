@@ -36,6 +36,7 @@ KERNEL_SOURCE_MAPPING = {
     "rwkv": "https://github.com/BlinkDL/RWKV-LM",
     "scattermoe": "https://github.com/shawntan/scattermoe",
     "sgl-flash-attn3": "https://github.com/sgl-project/sgl-flash-attn",
+    "sonic-moe": "https://github.com/Dao-AILab/sonic-moe",
     "tinygrad-rms": "https://github.com/tinygrad/tinygrad",
     "trimul-gpumode": "https://github.com/davidberard98/gpumode-trimul",
     "triton-kernels": "https://github.com/triton-lang/triton.git",
