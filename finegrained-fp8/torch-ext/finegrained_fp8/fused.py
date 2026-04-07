@@ -37,13 +37,17 @@ from .utils import device_context
 
 
 # ── Kernel 1: gather + gate_up + SiLU + FP8 quant ──────────────────────────
+#
+# Optimizations: block pointers for weight loads, L2 swizzle (GROUP_SIZE_M),
+# tile-to-expert via bucketize (replaces binary search), BLOCK_SIZE_M capped at 64.
 
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
+        triton.Config({"GROUP_SIZE_M": g}, num_warps=w, num_stages=s)
         for w in [2, 4, 8, 16]
         for s in [2, 3, 4, 5]
+        for g in [1, 8]
     ],
     key=["N_inter", "K", "BLOCK_SIZE_M"],
 )
@@ -61,10 +65,12 @@ def fused_gate_up_silu_kernel(
     # Expert scheduling
     Offsets,
     TileOffsets,
+    TileToExpert,  # (max_M_tiles,) int32 — tile → expert lookup
     # Shapes
     N_inter,
     K,
     num_top_k,
+    num_M_tiles,
     # Strides — A, W_gu, Ws_gu, Inter
     stride_am,
     stride_ak,
@@ -81,8 +87,8 @@ def fused_gate_up_silu_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
-    NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
     """Kernel 1: gather A from unsorted → gate_up GEMM → SiLU → FP8 quant.
 
@@ -91,21 +97,15 @@ def fused_gate_up_silu_kernel(
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
+    num_N_tiles = tl.cdiv(N_inter, BLOCK_SIZE_N)
+    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_M_tiles, num_N_tiles, GROUP_SIZE_M)
 
     total_tiles = tl.load(TileOffsets + NUM_EXPERTS - 1)
     if pid_m >= total_tiles:
         return
 
-    # Binary search for expert
-    lo = 0
-    hi = NUM_EXPERTS
-    for _ in tl.static_range(NUM_EXPERTS_BIT_LENGTH):
-        mid = (lo + hi) >> 1
-        mid_val = tl.load(TileOffsets + mid)
-        is_left = mid_val <= pid_m
-        lo = tl.where(is_left, mid + 1, lo)
-        hi = tl.where(is_left, hi, mid)
-    expert_id = lo.to(tl.int64)
+    # O(1) tile → expert lookup
+    expert_id = tl.load(TileToExpert + pid_m).to(tl.int64)
 
     prev_eid = tl.maximum(expert_id - 1, 0)
     expert_start = tl.where(expert_id == 0, 0, tl.load(Offsets + prev_eid))
@@ -129,9 +129,23 @@ def fused_gate_up_silu_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     a_ptrs = A + original_tokens[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_base = W_gu + expert_id * stride_be + offs_k[:, None] * stride_bk
-    b_gate_ptrs = b_base + offs_bn[None, :] * stride_bn
-    b_up_ptrs = b_base + (N_inter + offs_bn)[None, :] * stride_bn
+
+    b_gate_ptr = tl.make_block_ptr(
+        base=W_gu + expert_id * stride_be,
+        shape=(K, N_inter * 2),
+        strides=(stride_bk, stride_bn),
+        offsets=(0, pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(0, 1),
+    )
+    b_up_ptr = tl.make_block_ptr(
+        base=W_gu + expert_id * stride_be,
+        shape=(K, N_inter * 2),
+        strides=(stride_bk, stride_bn),
+        offsets=(0, N_inter + pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(0, 1),
+    )
 
     n_scale_blocks = N_inter // BLOCK_SIZE_N
     bs_base = Ws_gu + expert_id * stride_bs_e
@@ -142,8 +156,8 @@ def fused_gate_up_silu_kernel(
     acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        b_gate = tl.load(b_gate_ptrs)
-        b_up = tl.load(b_up_ptrs)
+        b_gate = tl.load(b_gate_ptr)
+        b_up = tl.load(b_up_ptr)
         bs_gate = tl.load(bs_gate_ptrs + k * stride_bs_k)
         bs_up = tl.load(bs_up_ptrs + k * stride_bs_k)
 
@@ -155,8 +169,8 @@ def fused_gate_up_silu_kernel(
         acc_up += tl.dot(a, b_up) * a_s[:, None] * bs_up[None, :]
 
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_gate_ptrs += BLOCK_SIZE_K * stride_bk
-        b_up_ptrs += BLOCK_SIZE_K * stride_bk
+        b_gate_ptr = tl.advance(b_gate_ptr, (BLOCK_SIZE_K, 0))
+        b_up_ptr = tl.advance(b_up_ptr, (BLOCK_SIZE_K, 0))
 
     # SiLU(gate) * up
     if SIMULATE_UNFUSED:
@@ -180,7 +194,6 @@ def fused_gate_up_silu_kernel(
     tl.store(inter_ptrs, inter_fp8, mask=row_mask[:, None])
 
     # Store per-row scale (one per row per N-tile)
-    # Layout: Inter_s[sorted_idx, pid_n]
     scale_ptrs = Inter_s + sorted_indices * tl.cdiv(N_inter, BLOCK_SIZE_N) + pid_n
     tl.store(scale_ptrs, inter_s, mask=row_mask)
 
@@ -190,9 +203,10 @@ def fused_gate_up_silu_kernel(
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
+        triton.Config({"GROUP_SIZE_M": g}, num_warps=w, num_stages=s)
         for w in [2, 4, 8, 16]
         for s in [2, 3, 4, 5]
+        for g in [1, 8]
     ],
     key=["N_inter", "hidden", "BLOCK_SIZE_M"],
 )
@@ -210,9 +224,11 @@ def fused_down_proj_kernel(
     # Expert scheduling
     Offsets,
     TileOffsets,
+    TileToExpert,  # (max_M_tiles,) int32 — tile → expert lookup
     # Shapes
     N_inter,
     hidden,
+    num_M_tiles,
     # Strides — Inter, W_down, Ws_down, Out
     stride_im,
     stride_in,
@@ -230,8 +246,8 @@ def fused_down_proj_kernel(
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     NUM_N_TILES: tl.constexpr,
-    NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
     """Kernel 2: fp8 intermediate → down_proj → output.
 
@@ -241,21 +257,15 @@ def fused_down_proj_kernel(
     """
     pid_m = tl.program_id(axis=0)
     pid_h = tl.program_id(axis=1)
+    num_H_tiles = tl.cdiv(hidden, BLOCK_SIZE_H)
+    pid_m, pid_h = tl.swizzle2d(pid_m, pid_h, num_M_tiles, num_H_tiles, GROUP_SIZE_M)
 
     total_tiles = tl.load(TileOffsets + NUM_EXPERTS - 1)
     if pid_m >= total_tiles:
         return
 
-    # Binary search for expert
-    lo = 0
-    hi = NUM_EXPERTS
-    for _ in tl.static_range(NUM_EXPERTS_BIT_LENGTH):
-        mid = (lo + hi) >> 1
-        mid_val = tl.load(TileOffsets + mid)
-        is_left = mid_val <= pid_m
-        lo = tl.where(is_left, mid + 1, lo)
-        hi = tl.where(is_left, hi, mid)
-    expert_id = lo.to(tl.int64)
+    # O(1) tile → expert lookup
+    expert_id = tl.load(TileToExpert + pid_m).to(tl.int64)
 
     prev_eid = tl.maximum(expert_id - 1, 0)
     expert_start = tl.where(expert_id == 0, 0, tl.load(Offsets + prev_eid))
@@ -271,12 +281,21 @@ def fused_down_proj_kernel(
     sorted_indices = expert_start + offs_am
 
     offs_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
-    offs_n = tl.arange(0, BLOCK_SIZE_N)
+
+    # Block pointer for down weights
+    w_down_ptr = tl.make_block_ptr(
+        base=W_down + expert_id * stride_be,
+        shape=(N_inter, hidden),
+        strides=(stride_bk, stride_bn),
+        offsets=(0, pid_h * BLOCK_SIZE_H),
+        block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_H),
+        order=(0, 1),
+    )
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_H), dtype=tl.float32)
 
     for n_tile in range(0, NUM_N_TILES):
-        n_offs = n_tile * BLOCK_SIZE_N + offs_n
+        n_offs = n_tile * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
         # Load fp8 intermediate tile
         inter_ptrs = (
@@ -288,14 +307,8 @@ def fused_down_proj_kernel(
         scale_ptrs = Inter_s + sorted_indices * NUM_N_TILES + n_tile
         inter_s = tl.load(scale_ptrs, mask=row_mask, other=0.0)
 
-        # Load down weights
-        w_down_ptrs = (
-            W_down
-            + expert_id * stride_be
-            + n_offs[:, None] * stride_bk
-            + offs_h[None, :] * stride_bn
-        )
-        w_down = tl.load(w_down_ptrs)
+        # Load down weights via block pointer
+        w_down = tl.load(w_down_ptr)
         ws_down = tl.load(
             Ws_down
             + expert_id * stride_bs_e
@@ -304,6 +317,7 @@ def fused_down_proj_kernel(
         )
 
         acc += tl.dot(inter_fp8, w_down) * inter_s[:, None] * ws_down
+        w_down_ptr = tl.advance(w_down_ptr, (BLOCK_SIZE_N, 0))
 
     # Apply routing weights and scatter to original flat order via Perm
     if SIMULATE_UNFUSED:
@@ -365,13 +379,19 @@ def _moe_grouped_fused(
     )
     offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
 
-    # Tile setup
+    # Tile setup — BLOCK_SIZE_M capped at 64 for better SM utilization with many experts
     BLOCK_SIZE_M = min(
-        max(triton.next_power_of_2((S + num_experts - 1) // num_experts), 16), 128
+        max(triton.next_power_of_2((S + num_experts - 1) // num_experts), 16), 64
     )
     tiles_per_expert = (tokens_per_expert + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
     tile_offsets = torch.cumsum(tiles_per_expert, dim=0).to(torch.int32)
     max_M_tiles = triton.cdiv(S, BLOCK_SIZE_M) + num_experts
+    tile_to_expert = torch.bucketize(
+        torch.arange(max_M_tiles, device=device, dtype=torch.int32),
+        tile_offsets,
+        right=True,
+    )
+
     num_N_tiles = triton.cdiv(intermediate_dim, block_n)
     num_H_tiles = triton.cdiv(hidden_dim, block_n)
 
@@ -393,9 +413,11 @@ def _moe_grouped_fused(
             inter_scales,
             offsets,
             tile_offsets,
+            tile_to_expert,
             intermediate_dim,
             hidden_states.shape[1],
             num_top_k,
+            max_M_tiles,
             hidden_states.stride(0),
             hidden_states.stride(1),
             gate_up_proj.stride(0),
@@ -410,7 +432,6 @@ def _moe_grouped_fused(
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=block_k,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
-            NUM_EXPERTS_BIT_LENGTH=num_experts.bit_length(),
             SIMULATE_UNFUSED=simulate_unfused,
         )
 
@@ -428,8 +449,10 @@ def _moe_grouped_fused(
             proj_out,
             offsets,
             tile_offsets,
+            tile_to_expert,
             intermediate_dim,
             hidden_dim,
+            max_M_tiles,
             inter_fp8.stride(0),
             inter_fp8.stride(1),
             down_proj.stride(0),
@@ -445,7 +468,6 @@ def _moe_grouped_fused(
             BLOCK_SIZE_H=block_n,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             NUM_N_TILES=num_N_tiles,
-            NUM_EXPERTS_BIT_LENGTH=num_experts.bit_length(),
             SIMULATE_UNFUSED=simulate_unfused,
         )
 
@@ -487,11 +509,12 @@ def moe_grouped_fused(
     )
 
 
-# ── Batched fused: gate_up + SiLU + down (no sorting, no atomics) ───────────
+# ── Batched fused: two-kernel approach (no sorting, no atomics) ──────────────
 #
-# Each program handles one (token, H-tile) and loops over N-tiles sequentially.
-# The intermediate stays entirely in registers. No sorting needed — expert
-# lookup is per-token via ExpertIds.
+# Same two-kernel architecture as grouped fused but with per-token dispatch:
+# Kernel 1: (S, N-tiles) — gate_up + SiLU + FP8 quant → intermediate buffer
+# Kernel 2: (S, H-tiles) — fp8 intermediate → down proj → output
+# No sorting needed — expert lookup is per-token via ExpertIds.
 
 
 @triton.autotune(
@@ -503,142 +526,196 @@ def moe_grouped_fused(
     key=["N_inter", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
-def moe_batched_fused_kernel(
-    A,  # (S, K) raw BF16/FP16 activations
-    W_gu,  # (E, 2*N_inter, K) FP8 gate_up weights
-    W_down,  # (E, hidden, N_inter) FP8 down weights
-    Out,  # (S, hidden) output
-    Ws_gu,  # gate_up scales
-    Ws_down,  # down scales
-    ExpertIds,  # (S,) expert index per token
-    SampleWeights,  # (S,) routing weights
-    # Shapes
+def batched_gate_up_silu_kernel(
+    A,
+    W_gu,
+    Ws_gu,
+    Inter,
+    Inter_s,
+    ExpertIds,
     N_inter,
     K,
-    hidden,
-    # Strides — A
     stride_am,
     stride_ak,
-    # Strides — W_gu, Ws_gu
-    stride_be_gu,
-    stride_bk_gu,
-    stride_bn_gu,
-    stride_bs_e_gu,
-    stride_bs_k_gu,
-    stride_bs_n_gu,
-    # Strides — W_down, Ws_down
-    stride_be_down,
-    stride_bk_down,
-    stride_bn_down,
-    stride_bs_e_down,
-    stride_bs_k_down,
-    stride_bs_n_down,
-    # Strides — Out
-    stride_om,
-    stride_oh,
-    # Constexprs
-    NUM_N_TILES: tl.constexpr,
-    NUM_K_TILES: tl.constexpr,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_bs_e,
+    stride_bs_k,
+    stride_bs_n,
+    stride_im,
+    stride_in,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
 ):
-    """Batched fused MoE kernel: gate_up + SiLU + down in one kernel, no atomics.
+    """Batched kernel 1: per-token gate_up + SiLU + FP8 quant. Grid: (S, N-tiles)."""
+    batch_id = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
 
-    Grid: (S, H-tiles). Each program handles one (token, H-tile) and loops
-    over N-tiles. The intermediate stays entirely in registers.
-    """
+    expert_id = tl.load(ExpertIds + batch_id).to(tl.int64)
+    offs_m = tl.arange(0, BLOCK_SIZE_M)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    a_ptrs = A + batch_id * stride_am + offs_k[None, :] * stride_ak
+
+    b_gate_ptr = tl.make_block_ptr(
+        base=W_gu + expert_id * stride_be,
+        shape=(K, N_inter * 2),
+        strides=(stride_bk, stride_bn),
+        offsets=(0, pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(0, 1),
+    )
+    b_up_ptr = tl.make_block_ptr(
+        base=W_gu + expert_id * stride_be,
+        shape=(K, N_inter * 2),
+        strides=(stride_bk, stride_bn),
+        offsets=(0, N_inter + pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(0, 1),
+    )
+
+    n_scale_blocks = N_inter // BLOCK_SIZE_N
+    bs_base = Ws_gu + expert_id * stride_bs_e
+    bs_gate_ptrs = bs_base + pid_n * stride_bs_n
+    bs_up_ptrs = bs_base + (n_scale_blocks + pid_n) * stride_bs_n
+
+    acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a_raw = tl.load(a_ptrs + offs_m[:, None] * 0).to(tl.float32)
+        a_s = tl.max(tl.abs(a_raw)) / 448.0
+        a = (a_raw / tl.maximum(a_s, 1e-12)).to(tl.float8e4nv)
+
+        b_gate = tl.load(b_gate_ptr)
+        b_up = tl.load(b_up_ptr)
+        bs_gate = tl.load(bs_gate_ptrs + k * stride_bs_k)
+        bs_up = tl.load(bs_up_ptrs + k * stride_bs_k)
+
+        acc_gate += tl.dot(a, b_gate) * a_s * bs_gate[None, :]
+        acc_up += tl.dot(a, b_up) * a_s * bs_up[None, :]
+
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_gate_ptr = tl.advance(b_gate_ptr, (BLOCK_SIZE_K, 0))
+        b_up_ptr = tl.advance(b_up_ptr, (BLOCK_SIZE_K, 0))
+
+    if SIMULATE_UNFUSED:
+        acc_gate = acc_gate.to(tl.bfloat16).to(tl.float32)
+        acc_up = acc_up.to(tl.bfloat16).to(tl.float32)
+        intermediate = (acc_gate * tl.sigmoid(acc_gate)).to(tl.bfloat16).to(
+            tl.float32
+        ) * acc_up
+        intermediate = intermediate.to(tl.bfloat16).to(tl.float32)
+    else:
+        intermediate = acc_gate * tl.sigmoid(acc_gate) * acc_up
+
+    inter_s = tl.max(tl.abs(intermediate)) / 448.0
+    inter_fp8 = (intermediate / tl.maximum(inter_s, 1e-12)).to(tl.float8e4nv)
+
+    inter_ptrs = (
+        Inter
+        + batch_id * stride_im
+        + offs_bn[None, :] * stride_in
+        + offs_m[:, None] * 0
+    )
+    tl.store(inter_ptrs, inter_fp8)
+
+    num_N_tiles = tl.cdiv(N_inter, BLOCK_SIZE_N)
+    tl.store(Inter_s + batch_id * num_N_tiles + pid_n, inter_s)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=w, num_stages=s)
+        for w in [4, 8, 16]
+        for s in [2, 3, 4]
+    ],
+    key=["N_inter", "hidden", "BLOCK_SIZE_M"],
+)
+@triton.jit
+def batched_down_proj_kernel(
+    Inter,
+    Inter_s,
+    W_down,
+    Ws_down,
+    ExpertIds,
+    SampleWeights,
+    Out,
+    N_inter,
+    hidden,
+    stride_im,
+    stride_in,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_bs_e,
+    stride_bs_k,
+    stride_bs_n,
+    stride_om,
+    stride_oh,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    NUM_N_TILES: tl.constexpr,
+    SIMULATE_UNFUSED: tl.constexpr,
+):
+    """Batched kernel 2: fp8 intermediate → down proj → output. Grid: (S, H-tiles)."""
     batch_id = tl.program_id(axis=0)
     pid_h = tl.program_id(axis=1)
 
     expert_id = tl.load(ExpertIds + batch_id).to(tl.int64)
-
-    offs_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
     offs_m = tl.arange(0, BLOCK_SIZE_M)
+    offs_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
 
-    acc_down = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_H), dtype=tl.float32)
+    w_down_ptr = tl.make_block_ptr(
+        base=W_down + expert_id * stride_be,
+        shape=(N_inter, hidden),
+        strides=(stride_bk, stride_bn),
+        offsets=(0, pid_h * BLOCK_SIZE_H),
+        block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_H),
+        order=(0, 1),
+    )
 
-    for n_inter in range(0, NUM_N_TILES):
-        offs_n = n_inter * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        offs_k = tl.arange(0, BLOCK_SIZE_K)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_H), dtype=tl.float32)
 
-        # ── Gate + Up projection for this N-tile ──
-        a_ptrs = A + batch_id * stride_am + offs_k[None, :] * stride_ak
-        b_base = W_gu + expert_id * stride_be_gu + offs_k[:, None] * stride_bk_gu
-        b_gate_ptrs = b_base + offs_n[None, :] * stride_bn_gu
-        b_up_ptrs = b_base + (N_inter + offs_n)[None, :] * stride_bn_gu
-
-        n_scale_blocks = N_inter // BLOCK_SIZE_N
-        bs_base = Ws_gu + expert_id * stride_bs_e_gu
-        bs_gate_ptr = bs_base + n_inter * stride_bs_n_gu
-        bs_up_ptr = bs_base + (n_scale_blocks + n_inter) * stride_bs_n_gu
-
-        acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-        for k in range(0, NUM_K_TILES):
-            a_raw = tl.load(a_ptrs + offs_m[:, None] * 0).to(tl.float32)
-            a_s = tl.max(tl.abs(a_raw)) / 448.0
-            a = (a_raw / tl.maximum(a_s, 1e-12)).to(tl.float8e4nv)
-
-            b_gate = tl.load(b_gate_ptrs)
-            b_up = tl.load(b_up_ptrs)
-            bs_gate = tl.load(bs_gate_ptr + k * stride_bs_k_gu)
-            bs_up = tl.load(bs_up_ptr + k * stride_bs_k_gu)
-
-            acc_gate += tl.dot(a, b_gate) * a_s * bs_gate[None, :]
-            acc_up += tl.dot(a, b_up) * a_s * bs_up[None, :]
-
-            a_ptrs += BLOCK_SIZE_K * stride_ak
-            b_gate_ptrs += BLOCK_SIZE_K * stride_bk_gu
-            b_up_ptrs += BLOCK_SIZE_K * stride_bk_gu
-
-        # ── SiLU(gate) * up ──
-        if SIMULATE_UNFUSED:
-            acc_gate = acc_gate.to(tl.bfloat16).to(tl.float32)
-            acc_up = acc_up.to(tl.bfloat16).to(tl.float32)
-            intermediate = (acc_gate * tl.sigmoid(acc_gate)).to(tl.bfloat16).to(
-                tl.float32
-            ) * acc_up
-            intermediate = intermediate.to(tl.bfloat16).to(tl.float32)
-        else:
-            intermediate = acc_gate * tl.sigmoid(acc_gate) * acc_up
-
-        # ── Quantize intermediate to FP8 ──
-        inter_s = tl.max(tl.abs(intermediate)) / 448.0
-        inter_fp8 = (intermediate / tl.maximum(inter_s, 1e-12)).to(tl.float8e4nv)
-
-        # ── Partial down projection ──
-        w_down_ptrs = (
-            W_down
-            + expert_id * stride_be_down
-            + offs_n[:, None] * stride_bk_down
-            + offs_h[None, :] * stride_bn_down
+    for n_tile in range(0, NUM_N_TILES):
+        n_offs = n_tile * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        inter_ptrs = (
+            Inter
+            + batch_id * stride_im
+            + n_offs[None, :] * stride_in
+            + offs_m[:, None] * 0
         )
-        w_down = tl.load(w_down_ptrs)
+        inter_fp8 = tl.load(inter_ptrs)
+
+        inter_s = tl.load(Inter_s + batch_id * NUM_N_TILES + n_tile)
+
+        w_down = tl.load(w_down_ptr)
         ws_down = tl.load(
             Ws_down
-            + expert_id * stride_bs_e_down
-            + pid_h * stride_bs_n_down
-            + n_inter * stride_bs_k_down
+            + expert_id * stride_bs_e
+            + pid_h * stride_bs_n
+            + n_tile * stride_bs_k
         )
 
-        acc_down += tl.dot(inter_fp8, w_down) * inter_s * ws_down
+        acc += tl.dot(inter_fp8, w_down) * inter_s * ws_down
+        w_down_ptr = tl.advance(w_down_ptr, (BLOCK_SIZE_N, 0))
 
-    # ── Apply routing weight and store ──
     if SIMULATE_UNFUSED:
-        acc_down = acc_down.to(tl.bfloat16).to(tl.float32)
+        acc = acc.to(tl.bfloat16).to(tl.float32)
     routing_w = tl.load(SampleWeights + batch_id)
-    acc_down = acc_down * routing_w
+    acc = acc * routing_w
 
     if Out.dtype.element_ty == tl.bfloat16:
-        c = acc_down.to(tl.bfloat16)
+        c = acc.to(tl.bfloat16)
     elif Out.dtype.element_ty == tl.float16:
-        c = acc_down.to(tl.float16)
+        c = acc.to(tl.float16)
     else:
-        c = acc_down.to(tl.float32)
+        c = acc.to(tl.float32)
 
     c_ptrs = (
         Out + batch_id * stride_om + offs_h[None, :] * stride_oh + offs_m[:, None] * 0
@@ -658,13 +735,9 @@ def _moe_batched_fused(
     block_size: list[int],
     simulate_unfused: bool = False,
 ) -> torch.Tensor:
-    """Batched fused MoE expert layer: deterministic, no sorting, no atomics.
+    """Two-kernel batched fused MoE: deterministic, no sorting, no atomics.
 
-    Input:  unsorted hidden_states + router outputs (top_k_index, top_k_weights)
-    Output: (num_tokens, hidden) — accumulated across top_k experts
-
-    Pipeline: expand → ONE kernel (gate_up + SiLU + down per token) → routing + reduce
-    Deterministic: each token processed independently. Intermediate stays in registers.
+    Pipeline: expand → kernel 1 (gate_up + SiLU + FP8 quant) → kernel 2 (down proj + routing) → reduce
     """
     device = hidden_states.device
     num_top_k = top_k_index.size(-1)
@@ -673,7 +746,6 @@ def _moe_batched_fused(
     intermediate_dim = down_proj.shape[2]
     block_n, block_k = block_size
 
-    # S is the number of selected token-expert pairs (S = num_tokens * num_top_k)
     token_idx = (
         torch.arange(num_tokens, device=device)
         .unsqueeze(1)
@@ -682,10 +754,18 @@ def _moe_batched_fused(
     )
     sample_weights = top_k_weights.reshape(-1)
     expert_ids = top_k_index.reshape(-1)
-
     selected_hidden_states = hidden_states[token_idx]
     S = expert_ids.size(0)
 
+    num_N_tiles = triton.cdiv(intermediate_dim, block_n)
+    num_H_tiles = triton.cdiv(hidden_dim, block_n)
+
+    inter_fp8 = torch.empty(
+        S, intermediate_dim, device=device, dtype=torch.float8_e4m3fn
+    )
+    inter_scales = torch.empty(S, num_N_tiles, device=device, dtype=torch.float32)
+
+    # Kernel 1: gate_up + SiLU + FP8 quant — grid (S, N-tiles)
     BLOCK_SIZE_M = min(
         max(
             triton.next_power_of_2(
@@ -693,25 +773,19 @@ def _moe_batched_fused(
             ),
             16,
         ),
-        128,
+        64,
     )
-    Out = selected_hidden_states.new_empty(S, hidden_dim)
-    num_H_tiles = triton.cdiv(hidden_dim, block_n)
-    grid = (S, num_H_tiles)
-
+    grid1 = (S, num_N_tiles)
     with device_context(device):
-        wrap_triton(moe_batched_fused_kernel)[grid](
+        wrap_triton(batched_gate_up_silu_kernel)[grid1](
             selected_hidden_states,
             gate_up_proj,
-            down_proj,
-            Out,
             gate_up_proj_scale_inv,
-            down_proj_scale_inv,
+            inter_fp8,
+            inter_scales,
             expert_ids,
-            sample_weights,
             intermediate_dim,
             hidden_states.shape[1],
-            hidden_dim,
             selected_hidden_states.stride(0),
             selected_hidden_states.stride(1),
             gate_up_proj.stride(0),
@@ -720,6 +794,30 @@ def _moe_batched_fused(
             gate_up_proj_scale_inv.stride(0),
             gate_up_proj_scale_inv.stride(2),
             gate_up_proj_scale_inv.stride(1),
+            inter_fp8.stride(0),
+            inter_fp8.stride(1),
+            BLOCK_SIZE_N=block_n,
+            BLOCK_SIZE_K=block_k,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            SIMULATE_UNFUSED=simulate_unfused,
+        )
+
+    # Kernel 2: down proj + routing — grid (S, H-tiles)
+    Out = selected_hidden_states.new_empty(S, hidden_dim)
+    grid2 = (S, num_H_tiles)
+    with device_context(device):
+        wrap_triton(batched_down_proj_kernel)[grid2](
+            inter_fp8,
+            inter_scales,
+            down_proj,
+            down_proj_scale_inv,
+            expert_ids,
+            sample_weights,
+            Out,
+            intermediate_dim,
+            hidden_dim,
+            inter_fp8.stride(0),
+            inter_fp8.stride(1),
             down_proj.stride(0),
             down_proj.stride(2),
             down_proj.stride(1),
@@ -728,18 +826,14 @@ def _moe_batched_fused(
             down_proj_scale_inv.stride(1),
             Out.stride(0),
             Out.stride(1),
-            NUM_N_TILES=triton.cdiv(intermediate_dim, block_n),
-            NUM_K_TILES=triton.cdiv(hidden_states.shape[1], block_k),
             BLOCK_SIZE_N=block_n,
-            BLOCK_SIZE_K=block_k,
             BLOCK_SIZE_H=block_n,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
+            NUM_N_TILES=num_N_tiles,
             SIMULATE_UNFUSED=simulate_unfused,
         )
 
-    # Routing weights already applied in kernel — just reduce
     final_hidden_states = Out.view(num_tokens, num_top_k, hidden_dim).sum(dim=1)
-
     return final_hidden_states.to(hidden_states.dtype)
 
 
@@ -754,14 +848,7 @@ def moe_batched_fused(
     block_size: list[int],
     simulate_unfused: bool = False,
 ) -> torch.Tensor:
-    """Batched fused MoE expert layer: deterministic, no sorting, no atomics.
-
-    Input:  unsorted hidden_states + router outputs (top_k_index, top_k_weights)
-    Output: (num_tokens, hidden) — accumulated across top_k experts
-
-    Pipeline: expand → ONE kernel (gate_up + SiLU + down per token) → routing + reduce
-    Deterministic: each token processed independently. Intermediate stays in registers.
-    """
+    """Two-kernel batched fused MoE: deterministic, no sorting, no atomics."""
     return torch.ops.finegrained_fp8.moe_batched_fused(
         hidden_states,
         top_k_index,

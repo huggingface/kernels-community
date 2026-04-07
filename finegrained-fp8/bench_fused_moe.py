@@ -1,19 +1,23 @@
-"""Benchmark all MoE dispatch methods: correctness matrix + performance sweep + plot.
+"""Benchmark MoE dispatch methods: correctness matrix + performance sweep + plot.
 
 Usage:
-    python bench_fused_moe.py
+    python bench_fused_moe.py --grouped    # grouped variants
+    python bench_fused_moe.py --batched    # batched variants
+    python bench_fused_moe.py --all        # all variants
 """
 
+import argparse
 import sys
 
 sys.path.append("torch-ext")
 
-import matplotlib
-import matplotlib.pyplot as plt
 import torch
 import triton
-from rich.console import Console
+import matplotlib
 from rich.table import Table
+from rich.console import Console
+import matplotlib.pyplot as plt
+
 from finegrained_fp8 import (
     moe_grouped,
     moe_batched,
@@ -30,14 +34,19 @@ FP8_MAX = torch.finfo(FP8_DTYPE).max
 
 console = Console()
 
-METHODS = {
+GROUPED_METHODS = {
     "grouped": moe_grouped,
-    # "batched": moe_batched,
     "grouped_fused": moe_grouped_fused,
-    # "batched_fused": moe_batched_fused,
     "grouped_atomic": moe_grouped_atomic,
-    # "batched_atomic": moe_batched_atomic,
 }
+
+BATCHED_METHODS = {
+    "batched": moe_batched,
+    "batched_fused": moe_batched_fused,
+    "batched_atomic": moe_batched_atomic,
+}
+
+ALL_METHODS = {**GROUPED_METHODS, **BATCHED_METHODS}
 
 
 def quantize_weights_block(W, block_n=128, block_k=128):
@@ -79,6 +88,23 @@ def diff_emoji(d):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Benchmark MoE dispatch methods")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--grouped", action="store_true", help="Benchmark grouped variants")
+    group.add_argument("--batched", action="store_true", help="Benchmark batched variants")
+    group.add_argument("--all", action="store_true", help="Benchmark all variants")
+    cli_args = parser.parse_args()
+
+    if cli_args.all:
+        METHODS = ALL_METHODS
+        variant = "all"
+    elif cli_args.batched:
+        METHODS = BATCHED_METHODS
+        variant = "batched"
+    else:
+        METHODS = GROUPED_METHODS
+        variant = "grouped"
+
     device = "cuda"
     block_size = [128, 128]
 
@@ -172,7 +198,7 @@ def main():
     )
 
     def run_sweep(bench_fn_factory, title, mode="eager"):
-        """Run adaptive token sweep, dropping methods that plateau (<10% TFLOPS gain)."""
+        """Run adaptive token sweep, stopping when TFLOPS plateau (<5% gain)."""
         table = Table(title=title)
         table.add_column("Tokens", justify="right", style="bold")
         for name in names:
@@ -201,16 +227,19 @@ def main():
                 down_proj_scale_inv,
                 block_size,
             )
-
             results = {}
             for name, fn in METHODS.items():
+                msg = f"  [dim]benching {name} @ {num_tokens} tokens...[/dim]"
+                console.print(msg + " " * 40, end="\r")
 
+                @torch.no_grad()
                 def _bench(fn=fn):
                     return fn(*args)
 
                 try:
                     results[name] = bench_fn_factory(_bench)
-                except Exception:
+                except Exception as e:
+                    console.print(f"  [red]{name} @ {num_tokens} tokens: {e}[/red]")
                     results[name] = float("inf")
 
             all_res.append((num_tokens, results))
@@ -218,8 +247,9 @@ def main():
             # Compute per-method TFLOPS and check progress
             S = num_tokens * top_k
             flops = 2 * S * K * 2 * N_inter + 2 * S * N_inter * K
+            valid = {n: ms for n, ms in results.items() if ms != float("inf")}
+            best_name = min(valid, key=valid.get) if valid else "n/a"
 
-            best_name = min(results, key=results.get)
             cells = []
             for name in names:
                 ms = results[name]
@@ -233,7 +263,7 @@ def main():
                     increase = (tflops - prev_tflops[name]) / max(
                         prev_tflops[name], 1e-12
                     )
-                    if increase < 0.10:
+                    if increase < 0.05:
                         active.discard(name)
 
                 prev_tflops[name] = tflops
@@ -271,7 +301,7 @@ def main():
     # ═══════════════════════════════════════════════════════════════════════════
     import csv
 
-    csv_path = "moe_results.csv"
+    csv_path = f"moe_results_{variant}.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["tokens", "method", "mode", "time_ms", "tflops"])
@@ -296,18 +326,18 @@ def main():
     # ═══════════════════════════════════════════════════════════════════════════
     colors = {
         "grouped": "#e74c3c",
-        "batched": "#c0392b",
         "grouped_fused": "#2ecc71",
-        "batched_fused": "#27ae60",
         "grouped_atomic": "#3498db",
+        "batched": "#c0392b",
+        "batched_fused": "#27ae60",
         "batched_atomic": "#2980b9",
     }
     linestyles = {
         "grouped": "--",
-        "batched": "--",
         "grouped_fused": "-",
-        "batched_fused": "-",
         "grouped_atomic": ":",
+        "batched": "--",
+        "batched_fused": "-",
         "batched_atomic": ":",
     }
 
@@ -330,37 +360,31 @@ def main():
     tflops_eager = compute_tflops(all_results)
     tflops_cg = compute_tflops(all_results_cg)
 
-    fig, axes = plt.subplots(2, 2, figsize=(18, 14))
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
 
-    for col, (yscale, title_suffix) in enumerate(
-        [("linear", "Linear"), ("log", "Log")]
+    for col, (tflops_data, mode) in enumerate(
+        [(tflops_eager, "Eager"), (tflops_cg, "CUDA Graphs")]
     ):
-        for row, (tflops_data, mode) in enumerate(
-            [(tflops_eager, "Eager"), (tflops_cg, "CUDA Graphs")]
-        ):
-            ax = axes[row, col]
-            for name in names:
-                xs, ys = tflops_data[name]
-                if xs:
-                    ax.plot(
-                        xs,
-                        ys,
-                        linestyles.get(name, "-"),
-                        marker="o",
-                        markersize=4,
-                        color=colors.get(name, "gray"),
-                        label=name,
-                        linewidth=2,
-                    )
-            ax.set_xlabel("Tokens", fontsize=12)
-            ax.set_ylabel("TFLOPS", fontsize=12)
-            ax.set_title(
-                f"{mode} — TFLOPS ({title_suffix})", fontsize=13, fontweight="bold"
-            )
-            ax.set_xscale("log", base=2)
-            ax.set_yscale(yscale)
-            ax.legend(fontsize=8, loc="best")
-            ax.grid(True, alpha=0.3)
+        ax = axes[col]
+        for name in names:
+            xs, ys = tflops_data[name]
+            if xs:
+                ax.plot(
+                    xs,
+                    ys,
+                    linestyles.get(name, "-"),
+                    marker="o",
+                    markersize=4,
+                    color=colors.get(name, "gray"),
+                    label=name,
+                    linewidth=2,
+                )
+        ax.set_xlabel("Tokens", fontsize=12)
+        ax.set_ylabel("TFLOPS", fontsize=12)
+        ax.set_title(f"{mode} — TFLOPS", fontsize=13, fontweight="bold")
+        ax.set_xscale("log", base=2)
+        ax.legend(fontsize=8, loc="best")
+        ax.grid(True, alpha=0.3)
 
     fig.suptitle(
         f"FP8 MoE Expert Dispatch — {model_name} (E={E}, N_inter={N_inter}, K={K}, top_k={top_k})",
@@ -368,8 +392,9 @@ def main():
         fontweight="bold",
     )
     fig.tight_layout()
-    fig.savefig("moe_tflops.png", dpi=150)
-    console.print("\nPlot saved to [bold]moe_tflops.png[/bold]")
+    plot_path = f"moe_tflops_{variant}.png"
+    fig.savefig(plot_path, dpi=150)
+    console.print(f"\nPlot saved to [bold]{plot_path}[/bold]")
     plt.close(fig)
 
 

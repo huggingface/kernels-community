@@ -33,9 +33,10 @@ from .utils import device_context
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
+        triton.Config({"GROUP_SIZE_M": g}, num_warps=w, num_stages=s)
         for w in [2, 4, 8, 16]
         for s in [2, 3, 4, 5]
+        for g in [1, 8]
     ],
     key=["N_inter", "K", "BLOCK_SIZE_M"],
     reset_to_zero=["Out"],
@@ -56,11 +57,13 @@ def moe_atomic_kernel(
     # Expert scheduling
     Offsets,
     TileOffsets,
+    TileToExpert,  # (max_M_tiles,) int32 — tile → expert lookup
     # Shapes
     N_inter,
     K,
     hidden,
     num_top_k,
+    num_M_tiles,
     # Strides — A, W_gu, Ws_gu, W_down, Ws_down, Out
     stride_am,
     stride_ak,
@@ -85,8 +88,8 @@ def moe_atomic_kernel(
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     NUM_H_TILES: tl.constexpr,
-    NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
     """Single fused MoE kernel: gather + gate_up + SiLU + down in one pass.
 
@@ -97,21 +100,15 @@ def moe_atomic_kernel(
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
+    num_N_tiles = tl.cdiv(N_inter, BLOCK_SIZE_N)
+    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_M_tiles, num_N_tiles, GROUP_SIZE_M)
 
     total_tiles = tl.load(TileOffsets + NUM_EXPERTS - 1)
     if pid_m >= total_tiles:
         return
 
-    # Binary search for expert
-    lo = 0
-    hi = NUM_EXPERTS
-    for _ in tl.static_range(NUM_EXPERTS_BIT_LENGTH):
-        mid = (lo + hi) >> 1
-        mid_val = tl.load(TileOffsets + mid)
-        is_left = mid_val <= pid_m
-        lo = tl.where(is_left, mid + 1, lo)
-        hi = tl.where(is_left, hi, mid)
-    expert_id = lo.to(tl.int64)
+    # O(1) tile → expert lookup
+    expert_id = tl.load(TileToExpert + pid_m).to(tl.int64)
 
     prev_eid = tl.maximum(expert_id - 1, 0)
     expert_start = tl.where(expert_id == 0, 0, tl.load(Offsets + prev_eid))
@@ -130,14 +127,26 @@ def moe_atomic_kernel(
     perm_vals = tl.load(Perm + sorted_indices, mask=row_mask, other=0)
     original_tokens = perm_vals // num_top_k
 
-    # ── Gate + Up projection ──
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    # ── Gate + Up projection — block pointers for weight loads ──
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-
     a_ptrs = A + original_tokens[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_base = W_gu + expert_id * stride_be_gu + offs_k[:, None] * stride_bk_gu
-    b_gate_ptrs = b_base + offs_bn[None, :] * stride_bn_gu
-    b_up_ptrs = b_base + (N_inter + offs_bn)[None, :] * stride_bn_gu
+
+    b_gate_ptr = tl.make_block_ptr(
+        base=W_gu + expert_id * stride_be_gu,
+        shape=(K, N_inter * 2),
+        strides=(stride_bk_gu, stride_bn_gu),
+        offsets=(0, pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(0, 1),
+    )
+    b_up_ptr = tl.make_block_ptr(
+        base=W_gu + expert_id * stride_be_gu,
+        shape=(K, N_inter * 2),
+        strides=(stride_bk_gu, stride_bn_gu),
+        offsets=(0, N_inter + pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(0, 1),
+    )
 
     n_scale_blocks = N_inter // BLOCK_SIZE_N
     bs_base = Ws_gu + expert_id * stride_bs_e_gu
@@ -148,8 +157,8 @@ def moe_atomic_kernel(
     acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        b_gate = tl.load(b_gate_ptrs)
-        b_up = tl.load(b_up_ptrs)
+        b_gate = tl.load(b_gate_ptr)
+        b_up = tl.load(b_up_ptr)
         bs_gate = tl.load(bs_gate_ptrs + k * stride_bs_k_gu)
         bs_up = tl.load(bs_up_ptrs + k * stride_bs_k_gu)
 
@@ -161,8 +170,8 @@ def moe_atomic_kernel(
         acc_up += tl.dot(a, b_up) * a_s[:, None] * bs_up[None, :]
 
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_gate_ptrs += BLOCK_SIZE_K * stride_bk_gu
-        b_up_ptrs += BLOCK_SIZE_K * stride_bk_gu
+        b_gate_ptr = tl.advance(b_gate_ptr, (BLOCK_SIZE_K, 0))
+        b_up_ptr = tl.advance(b_up_ptr, (BLOCK_SIZE_K, 0))
 
     # ── SiLU(gate) * up ──
     if SIMULATE_UNFUSED:
@@ -179,17 +188,19 @@ def moe_atomic_kernel(
     inter_s = tl.max(tl.abs(intermediate), axis=1) / 448.0
     inter_fp8 = (intermediate / tl.maximum(inter_s[:, None], 1e-12)).to(tl.float8e4nv)
 
-    # ── Down projection + atomic accumulate ──
-    offs_h = tl.arange(0, BLOCK_SIZE_H)
+    # ── Down projection + atomic accumulate — block pointer for weights ──
+    w_down_ptr = tl.make_block_ptr(
+        base=W_down + expert_id * stride_be_down,
+        shape=(N_inter, hidden),
+        strides=(stride_bk_down, stride_bn_down),
+        offsets=(pid_n * BLOCK_SIZE_N, 0),
+        block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_H),
+        order=(0, 1),
+    )
+
     for h in range(0, NUM_H_TILES):
-        h_offs = h * BLOCK_SIZE_H + offs_h
-        w_down_ptrs = (
-            W_down
-            + expert_id * stride_be_down
-            + offs_bn[:, None] * stride_bk_down
-            + h_offs[None, :] * stride_bn_down
-        )
-        w_down = tl.load(w_down_ptrs)
+        h_offs = h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
+        w_down = tl.load(w_down_ptr)
         ws_down = tl.load(
             Ws_down
             + expert_id * stride_bs_e_down
@@ -208,6 +219,7 @@ def moe_atomic_kernel(
             mask=row_mask[:, None],
             sem="relaxed",
         )
+        w_down_ptr = tl.advance(w_down_ptr, (0, BLOCK_SIZE_H))
 
 
 # ── Wrapper ──────────────────────────────────────────────────────────────────
@@ -258,13 +270,21 @@ def _moe_grouped_atomic(
     )
     offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
 
-    # Tile setup
+    # Tile setup — BLOCK_SIZE_M capped at 64 for better SM utilization with many experts
     BLOCK_SIZE_M = min(
-        max(triton.next_power_of_2((S + num_experts - 1) // num_experts), 16), 128
+        max(triton.next_power_of_2((S + num_experts - 1) // num_experts), 16), 64
     )
     tiles_per_expert = (tokens_per_expert + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
     tile_offsets = torch.cumsum(tiles_per_expert, dim=0).to(torch.int32)
     max_M_tiles = triton.cdiv(S, BLOCK_SIZE_M) + num_experts
+
+    # Tile-to-expert lookup via bucketize (CUDA-graph safe, replaces binary search)
+    tile_to_expert = torch.bucketize(
+        torch.arange(max_M_tiles, device=device, dtype=torch.int32),
+        tile_offsets,
+        right=True,
+    )
+
     num_N_tiles = triton.cdiv(intermediate_dim, block_n)
 
     # fp32 output for atomic accumulation
@@ -283,10 +303,12 @@ def _moe_grouped_atomic(
             proj_out,
             offsets,
             tile_offsets,
+            tile_to_expert,
             intermediate_dim,
             hidden_states.shape[1],
             hidden_dim,
             num_top_k,
+            max_M_tiles,
             hidden_states.stride(0),
             hidden_states.stride(1),
             gate_up_proj.stride(0),
@@ -309,7 +331,6 @@ def _moe_grouped_atomic(
             BLOCK_SIZE_H=block_n,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             NUM_H_TILES=triton.cdiv(hidden_dim, block_n),
-            NUM_EXPERTS_BIT_LENGTH=num_experts.bit_length(),
             SIMULATE_UNFUSED=simulate_unfused,
         )
 
@@ -363,8 +384,8 @@ def moe_grouped_atomic(
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4, 5]
+        for w in [4, 8, 16]
+        for s in [2, 3, 4]
     ],
     key=["N_inter", "K", "BLOCK_SIZE_M"],
     reset_to_zero=["Out"],
@@ -547,7 +568,7 @@ def _moe_batched_atomic(
     S = expert_ids.size(0)
 
     BLOCK_SIZE_M = min(
-        max(triton.next_power_of_2((S + num_experts - 1) // num_experts), 16), 128
+        max(triton.next_power_of_2((S + num_experts - 1) // num_experts), 16), 64
     )
     num_N_tiles = triton.cdiv(intermediate_dim, block_n)
 
