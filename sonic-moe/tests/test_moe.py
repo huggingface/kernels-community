@@ -9,8 +9,14 @@ import numpy as np
 import torch
 from torch.testing import assert_close
 
-from sonicmoe import KernelBackendMoE, MoE, enable_quack_gemm
-from sonicmoe.enums import ActivationType
+if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 9:
+    pytest.skip("SonicMoE requires Hopper (SM90) or newer GPU", allow_module_level=True)
+
+try:
+    from sonicmoe import KernelBackendMoE, MoE, enable_quack_gemm
+    from sonicmoe.enums import ActivationType
+except ImportError as e:
+    pytest.skip(f"sonicmoe dependencies not available: {e}", allow_module_level=True)
 
 _SEED = 42
 

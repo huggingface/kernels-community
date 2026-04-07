@@ -25,7 +25,8 @@ class _LazyDeviceCapacity:
             if not torch.cuda.is_available():
                 self._value = (9, 0)
             else:
-                self._value = get_device_capacity(torch.device("cuda"))
+                cap = get_device_capacity(torch.device("cuda"))
+                self._value = cap if cap[0] in (9, 10) else (9, 0)
         return self._value[idx]
 
 

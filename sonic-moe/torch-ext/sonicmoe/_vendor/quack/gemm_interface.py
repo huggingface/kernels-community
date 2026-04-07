@@ -39,7 +39,10 @@ gated_to_pytorch_fn_map = {
 def _get_default_device_capacity():
     if not torch.cuda.is_available():
         return (9, 0)
-    return get_device_capacity(torch.device("cuda"))
+    cap = get_device_capacity(torch.device("cuda"))
+    if cap[0] not in (9, 10):
+        return (9, 0)
+    return cap
 
 
 class _LazyDeviceCapacity:
