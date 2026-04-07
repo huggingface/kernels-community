@@ -13,6 +13,25 @@ if _vendor_dir not in _sys.path:
 
 __version__ = "0.1.1"
 
+# Lazy imports: defer heavy dependencies (cutlass, cuda, triton) so that
+# `import sonicmoe` succeeds in environments without GPU libraries
+# (e.g. the nix build sandbox get-kernel-check).
 from .enums import KernelBackendMoE
-from .functional import enable_quack_gemm, moe_general_routing_inputs, moe_TC_softmax_topk_layer
-from .moe import MoE
+
+_LAZY_IMPORTS = {
+    "MoE": ".moe",
+    "enable_quack_gemm": ".functional",
+    "moe_general_routing_inputs": ".functional",
+    "moe_TC_softmax_topk_layer": ".functional",
+}
+
+
+def __getattr__(name):
+    if name in _LAZY_IMPORTS:
+        module_path = _LAZY_IMPORTS[name]
+        import importlib
+        mod = importlib.import_module(module_path, __name__)
+        val = getattr(mod, name)
+        globals()[name] = val
+        return val
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
