@@ -15,6 +15,9 @@ from cutlass._mlir.dialects import llvm
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 
+from . import layout_utils
+from .utils import make_vector
+
 
 Sm100MmaPeerBitMask = 0xFEFFFFFF
 
@@ -39,6 +42,30 @@ def cvt_copy(
     if const_expr(retile):
         src = tiled_copy.retile(src)
     cute.copy(tiled_copy, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
+
+
+@dsl_user_op
+def sr_cvt_copy(
+    tiled_copy: cute.TiledCopy,
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    seed: Int32,
+    tidx: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Like cvt_copy but uses stochastic rounding for FP32 -> BF16 conversion."""
+    assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
+    from .rounding import convert_f32_to_bf16_sr
+    from cutlass.cute.tensor import TensorSSA
+
+    src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
+    src_vec = src.load()
+    raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx, loc=loc, ip=ip)
+    src_cvt.store(TensorSSA(raw_vec, src_vec.shape, dst.element_type))
+    src = src_cvt
+    cute.copy(tiled_copy, src, dst, loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -796,17 +823,17 @@ def gather_m_get_copy_fn(
     limit_m: Int32,
     limit_k: Int32,
 ) -> Callable:
-    tile_shape_mk = (cute.size(sA, mode=[0]), cute.size(sA, mode=[1]))
-    tAsA = thr_copy_A.partition_D(sA)
+    tile_M, tile_K = cute.size(sA, mode=[0]), cute.size(sA, mode=[1])
+    tAsA = partition_D_position_independent(thr_copy_A, sA)
     # k-major
     assert tAsA.shape[2] == 1
     tAsA = cute.group_modes(cute.slice_(tAsA, (None, None, 0, None)), 0, 2)
 
-    is_even_m_smem = tile_shape_mk[0] % thr_copy_A.tiler_mn[0].shape == 0
+    is_even_m_smem = tile_M % thr_copy_A.tiler_mn[0].shape == 0
     if const_expr(not is_even_m_smem):
-        limit_m = min(limit_m, tile_shape_mk[0])
+        limit_m = min(limit_m, tile_M)
     elems_per_load = cute.size(tAsA.shape[0][0])
-    cA = cute.make_identity_tensor(tile_shape_mk)
+    cA = cute.make_identity_tensor((tile_M, tile_K))
     tAcA = thr_copy_A.partition_S(cA)
     t0AcA = thr_copy_A.get_slice(0).partition_S(cA)
     # Instead of comparing tAcA to limit_m, we instead compare t0AcA to limit_m - tAcA[0][0]
@@ -828,13 +855,13 @@ def gather_m_get_copy_fn(
         else:
             m_idx[m] = 0  # It's ok to load row 0 in the case of OOB
 
-    mA_k = cute.logical_divide(mA, (None, tile_shape_mk[1]))
+    mA_k = cute.logical_divide(mA, (None, tile_K))
 
     def copy_fn(src_idx, dst_idx, pred: bool = False):
         tApA_k = None
         if const_expr(pred):
             tApA_k = cute.make_rmem_tensor(cols_per_thread, Boolean)
-            limit_k_cur = limit_k - src_idx * tile_shape_mk[1]
+            limit_k_cur = limit_k - src_idx * tile_K
             for k in cutlass.range(cols_per_thread, unroll_full=True):
                 tApA_k[k] = t0AcA[0, 0, k][1] < limit_k_cur
         mA_cur = mA_k[None, (None, src_idx)]
@@ -997,11 +1024,162 @@ def gather_m_get_tma_copy_fn(
     tma_gather4_load_fn = partial(tma_gather4_load, tma_desc_ptr, num_cta=cta_group)
 
     def copy_fn(src_idx, dst_idx, tma_bar_ptr: cute.Pointer):
+        tSR_sA_cur = tSR_sA[None, None, None, dst_idx]
         col_idx = tile_K * src_idx
         for m in cutlass.range(cute.size(tSR_rAIdx, mode=[1]), unroll_full=True):
             row_indices = [tSR_rAIdx[v, m] for v in range(4)]
-            smem_ptr = tSR_sA[None, m, None, dst_idx].iterator
+            smem_ptr = tSR_sA_cur[None, m, None].iterator
             with cute.arch.elect_one():
                 tma_gather4_load_fn(smem_ptr, tma_bar_ptr, col_idx, row_indices)
 
     return copy_fn
+
+
+@cute.jit
+def gather_k_get_tma_copy_fn(
+    tma_atom: cute.CopyAtom,
+    sA: cute.Tensor,  # ((4, tile_K/4), (tile_M,), STAGE) — K-grouped load layout
+    sAIdx: cute.Tensor,  # (tile_K, a_prefetch_stage) — K indices in smem
+    col_idx: Int32,  # M offset in global tensor (contiguous dim for M-major)
+    warp_idx: Int32,
+    num_warps: int,
+    num_cta: int = 1,
+) -> Tuple[Callable, Callable]:
+    """Build a copy function for TMA gather4 in K dimension (M-major A).
+
+    Each gather4 instruction loads 4 K-columns × tile_M contiguous M-elements.
+    col_idx is the absolute M position in the global tensor.
+    K indices come from sAIdx (prefetched to smem by the scheduler warp).
+
+    Returns copy_fn(src_idx, dst_idx, tma_bar_ptr) which:
+      Issues gather4 calls with those K indices as row_indices
+    """
+    tile_K = cute.size(sAIdx, mode=[0])
+    assert tile_K % 4 == 0
+    cta_group = num_cta
+
+    # Tiled copy for loading K indices from smem to registers (4 per vector, across warps)
+    copy_AIdx_s2r = cute.make_tiled_copy_tv(
+        cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Int32, num_bits_per_copy=128),
+        cute.make_layout(num_warps),  # thr_layout
+        cute.make_layout(4),  # val_layout — 4 K indices per gather4
+    )
+    warp_idx = cute.arch.make_warp_uniform(warp_idx)
+    warp_copy_AIdx_s2r = copy_AIdx_s2r.get_slice(warp_idx)
+    tSR_sAIdx = warp_copy_AIdx_s2r.partition_S(sAIdx)  # (((4,1),4,4))
+    # ((4,1),4,(64,2),(1,4)):((64,0),1024,(1,4096),(0,8192))
+    tSR_sA = warp_copy_AIdx_s2r.partition_S(layout_utils.transpose_view(sA))
+    tma_desc_ptr = get_tma_desc_addr(tma_atom)
+    tma_gather4_load_fn = partial(tma_gather4_load, tma_desc_ptr, num_cta=cta_group)
+
+    def prefetch_from_smem_fn(
+        a_prefetch_pipeline,
+        src_idx,
+        dst_idx,
+        a_prefetch_consumer_state,
+    ) -> cute.Tensor:
+        a_prefetch_pipeline.consumer_wait(a_prefetch_consumer_state)
+        tSR_rAIdx = load_s2r(tSR_sAIdx[None, None, dst_idx])
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
+        return tSR_rAIdx
+
+    def copy_fn(src_idx, dst_idx, tSR_rAIdx, tma_bar_ptr: cute.Pointer):
+        # Issue gather4: col_idx = M position, row_indices = 4 K positions
+        tSR_sA_cur = tSR_sA[None, None, None, dst_idx]
+        gather_dim = cute.size(tSR_sA_cur, mode=[2, 0])  # Typically 64
+        for k in cutlass.range(cute.size(tSR_rAIdx, mode=[1]), unroll_full=True):
+            row_indices = [tSR_rAIdx[v, k] for v in range(4)]
+            for m in cutlass.range(cute.size(tSR_sA_cur, mode=[2, 1]), unroll_full=True):
+                smem_ptr = tSR_sA_cur[None, k, (None, m)].iterator
+                with cute.arch.elect_one():
+                    tma_gather4_load_fn(
+                        smem_ptr, tma_bar_ptr, col_idx + m * gather_dim, row_indices
+                    )
+
+    return copy_fn, prefetch_from_smem_fn
+
+
+# ---------------------------------------------------------------------------
+# Store helpers
+# ---------------------------------------------------------------------------
+
+
+@dsl_user_op
+@cute.jit
+def store(
+    ptr: cute.Pointer,
+    val,
+    pred: Optional[Boolean] = None,
+    cop: cutlass.Constexpr = None,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Store a scalar value via cute.arch.store.
+
+    ptr:  cute.Pointer (any address space).
+    val:  DSL Numeric value.
+    pred: None → unconditional.  DSL Boolean → skipped when pred == 0.
+    cop:  Cache operator — "wb" (default), "cg", "cs" (streaming), "wt".
+    """
+    if const_expr(pred is None):
+        cute.arch.store(ptr.llvm_ptr, type(val)(val), cop=cop, loc=loc, ip=ip)
+    else:
+        if pred:
+            cute.arch.store(ptr.llvm_ptr, type(val)(val), cop=cop, loc=loc, ip=ip)
+
+
+@dsl_user_op
+@cute.jit
+def store_v2(
+    ptr: cute.Pointer,
+    v0,
+    v1,
+    pred: Optional[Boolean] = None,
+    cop: cutlass.Constexpr = None,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Vectorized store of 2 elements via cute.arch.store.
+
+    Packs v0, v1 into an MLIR <2 x T> vector.
+    ptr:  cute.Pointer (any address space, must be aligned for vector width).
+    cop:  Cache operator — "wb" (default), "cg", "cs" (streaming), "wt".
+    """
+    vec = make_vector(type(v0), v0, v1, loc=loc, ip=ip)
+    if const_expr(pred is None):
+        cute.arch.store(ptr.llvm_ptr, vec, cop=cop, loc=loc, ip=ip)
+    else:
+        if pred:
+            cute.arch.store(ptr.llvm_ptr, vec, cop=cop, loc=loc, ip=ip)
+
+
+@dsl_user_op
+@cute.jit
+def store_v4(
+    ptr: cute.Pointer,
+    v0,
+    v1,
+    v2,
+    v3,
+    pred: Optional[Boolean] = None,
+    cop: cutlass.Constexpr = None,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Vectorized store of 4 elements via cute.arch.store.
+
+    Packs v0–v3 into an MLIR <4 x T> vector.
+    ptr:  cute.Pointer (any address space, must be aligned for vector width).
+    cop:  Cache operator — "wb" (default), "cg", "cs" (streaming), "wt".
+    """
+    vec = make_vector(type(v0), v0, v1, v2, v3, loc=loc, ip=ip)
+    if const_expr(pred is None):
+        cute.arch.store(ptr.llvm_ptr, vec, cop=cop, loc=loc, ip=ip)
+    else:
+        if pred:
+            cute.arch.store(ptr.llvm_ptr, vec, cop=cop, loc=loc, ip=ip)

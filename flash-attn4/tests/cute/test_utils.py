@@ -1,4 +1,4 @@
-"""Unit tests for flash_attn4.utils module."""
+"""Unit tests for flash_attn.cute.utils module."""
 
 import functools
 

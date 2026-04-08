@@ -10,7 +10,7 @@ import cutlass.cute as cute
 from cutlass import Float32
 
 from .quack import layout_utils
-from . import utils
+from . import utils as utils
 from .quack.cute_dsl_utils import ParamsBase
 from .seqlen_info import SeqlenInfoQK
 

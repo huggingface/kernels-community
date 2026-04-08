@@ -84,7 +84,6 @@ class FlashAttentionBackwardSm100:
         self.use_2cta_instrs = bool(
             use_2cta_instrs
             and cluster_size == 2
-            and not is_local
             and score_mod is None
             and score_mod_bwd is None
             and mask_mod is None
@@ -453,7 +452,6 @@ class FlashAttentionBackwardSm100:
         mdK: cute.Tensor,
         mdV: cute.Tensor,
         softmax_scale: Float32,
-        stream: cuda.CUstream,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
@@ -467,6 +465,8 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        stream: cuda.CUstream = None,
     ):
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
@@ -926,10 +926,6 @@ class FlashAttentionBackwardSm100:
             assert blocksparse_tensors is None, (
                 "2-CTA mode does not support block sparsity. "
                 "Please create kernel with use_2cta_instrs=False for block sparse attention."
-            )
-            assert window_size_left is None and window_size_right is None, (
-                "2-CTA mode does not support window attention. "
-                "Please create kernel with use_2cta_instrs=False for window attention."
             )
         # 2-CTA: 231424 and 1-CTA: 232448
         # print("SMEM: ", self.shared_storage.size_in_bytes())
@@ -3143,6 +3139,8 @@ class FlashAttentionBackwardSm100:
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S_P_dP)
                         # pipeline_S_P.sync_object_empty.arrive(0, pipeline_S_P.consumer_mask)
+                # Normally we'd need syncwarp here since only 1 thread will signal in
+                # consumer_release, but we already have the self.compute_sync_barrier before this
                 pipeline_LSE.consumer_release(consumer_state_LSE)
                 consumer_state_LSE.advance()
                 # ---------------------------------------------
@@ -3253,6 +3251,8 @@ class FlashAttentionBackwardSm100:
 
                 cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
+                # Normally we'd need syncwarp here since only 1 thread will signal in
+                # consumer_release, but we already have the self.compute_sync_barrier before this
                 pipeline_dPsum.consumer_release(consumer_state_dPsum)
                 consumer_state_dPsum.advance()
                 # when 2cta hdim 128, pipeline_dS also signals S tmem load completion so is deferred
@@ -3649,6 +3649,9 @@ class FlashAttentionBackwardSm100:
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+        if const_expr(not self.deterministic):
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit
     def epilogue_dKV(
