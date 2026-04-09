@@ -70,9 +70,9 @@ class GemmDActSm100(GemmDActMixin, GemmSm100):
 
 dact_fn_map = {
     None: None,
-    "relu": quack.activation.drelu,
-    "relu_sq": quack.activation.drelu_sq,
-    "gelu_tanh_approx": quack.activation.dgelu_tanh_approx,
+    "relu": activation.drelu,
+    "relu_sq": activation.drelu_sq,
+    "gelu_tanh_approx": activation.dgelu_tanh_approx,
 }
 
 

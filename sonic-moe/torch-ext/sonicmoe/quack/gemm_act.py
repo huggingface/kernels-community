@@ -354,9 +354,9 @@ class GemmActSm100(GemmActMixin, GemmSm100):
 
 act_fn_map = {
     None: None,
-    "relu": quack.activation.relu,
-    "relu_sq": quack.activation.relu_sq,
-    "gelu_tanh_approx": quack.activation.gelu_tanh_approx,
+    "relu": activation.relu,
+    "relu_sq": activation.relu_sq,
+    "gelu_tanh_approx": activation.gelu_tanh_approx,
 }
 
 
