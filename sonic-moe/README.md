@@ -50,7 +50,7 @@ output, aux_loss = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe)
 ## Vendored Dependencies
 
 This kernel vendors [QuACK](https://github.com/Dao-AILab/quack) (quack-kernels) for CuTe-DSL
-GEMM infrastructure. The vendored copy is located at `torch-ext/sonicmoe/_vendor/quack/`.
+GEMM infrastructure. The vendored copy is located at `torch-ext/sonicmoe/quack/`.
 
 ## License
 

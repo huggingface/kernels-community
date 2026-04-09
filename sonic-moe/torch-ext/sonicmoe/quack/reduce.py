@@ -8,7 +8,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Float32, Boolean, const_expr
 
-import quack.utils as utils
+from . import utils as utils
 
 
 @cute.jit

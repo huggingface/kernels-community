@@ -19,20 +19,20 @@ from cutlass.cutlass_dsl import if_generate
 from cutlass.utils import LayoutEnum
 
 
-from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
-from quack.tile_scheduler import (
+from .cute_dsl_utils import ParamsBase, ArgumentsBase
+from .tile_scheduler import (
     TileSchedulerOptions,
     TileSchedulerArguments,
     TileScheduler,
     VarlenMTileSchedulerArguments,
     VarlenMTileScheduler,
 )
-from quack.varlen_utils import VarlenArguments, VarlenManager
+from .varlen_utils import VarlenArguments, VarlenManager
 
 # return PipelineStateWAdvance instead of PipelineState
-from quack.pipeline import make_pipeline_state, PipelineTmaCpAsync
-import quack.copy_utils as copy_utils
-import quack.sm90_utils as quack_sm90_utils
+from .pipeline import make_pipeline_state, PipelineTmaCpAsync
+from . import copy_utils as copy_utils
+from . import sm90_utils as quack_sm90_utils
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture

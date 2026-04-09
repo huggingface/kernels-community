@@ -25,13 +25,13 @@ from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 from cutlass.cute.runtime import from_dlpack, make_ptr
 
-from quack.pipeline import PipelineTmaCpAsyncUmma
-from quack.cute_dsl_utils import ParamsBase, ArgumentsBase
-from quack.tile_scheduler import TileSchedulerOptions
-from quack.varlen_utils import VarlenArguments, VarlenManager
-from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
-import quack.copy_utils as copy_utils
-import quack.sm100_utils as quack_sm100_utils
+from .pipeline import PipelineTmaCpAsyncUmma
+from .cute_dsl_utils import ParamsBase, ArgumentsBase
+from .tile_scheduler import TileSchedulerOptions
+from .varlen_utils import VarlenArguments, VarlenManager
+from .gemm_sm90 import GemmSm90, NamedBarrierGemm
+from . import copy_utils as copy_utils
+from . import sm100_utils as quack_sm100_utils
 
 # return PipelineStateWAdvance instead of PipelineState
 

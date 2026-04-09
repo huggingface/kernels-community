@@ -5,15 +5,16 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from ._ops_compat import add_quack_op_namespace_prefix
 
-from quack.gemm_config import GemmConfig, get_all_configs
+from .gemm_config import GemmConfig, get_all_configs
 
-from quack.autotuner import autotune, AutotuneConfig
-from quack.cute_dsl_utils import get_device_capacity
-from quack.gemm import gemm as gemm_sm90_sm100
-from quack.gemm_act import gemm_act as gemm_act_sm90_sm100
-from quack.gemm_dact import gemm_dact as gemm_dact_sm90_sm100
-from quack.gemm_symmetric import gemm_symmetric as gemm_symmetric_sm90_sm100
+from .autotuner import autotune, AutotuneConfig
+from .cute_dsl_utils import get_device_capacity
+from .gemm import gemm as gemm_sm90_sm100
+from .gemm_act import gemm_act as gemm_act_sm90_sm100
+from .gemm_dact import gemm_dact as gemm_dact_sm90_sm100
+from .gemm_symmetric import gemm_symmetric as gemm_symmetric_sm90_sm100
 
 
 # Dictionary mapping activation names to PyTorch functions
@@ -342,7 +343,7 @@ def gemm(
 
 
 @torch.library.custom_op(
-    "quack::gemm_out",
+    add_quack_op_namespace_prefix("gemm_out"),
     mutates_args=("out",),
     device_types="cuda",
     # We have to split out alpha and alpha_tensor since torch.library requires
@@ -500,7 +501,7 @@ def gemm_add(
 
 
 @torch.library.custom_op(
-    "quack::gemm_add_out",
+    add_quack_op_namespace_prefix("gemm_add_out"),
     mutates_args=("out",),
     device_types="cuda",
     # We have to split out alpha and alpha_tensor since torch.library requires
@@ -660,7 +661,7 @@ def gemm_add_inplace(
 
 
 @torch.library.custom_op(
-    "quack::gemm_add_inplace",
+    add_quack_op_namespace_prefix("gemm_add_inplace"),
     mutates_args=("out",),
     device_types="cuda",
     # We have to split out alpha and alpha_tensor since torch.library requires
@@ -753,7 +754,7 @@ def gemm_act(
 
 
 @torch.library.custom_op(
-    "quack::gemm_act_out",
+    add_quack_op_namespace_prefix("gemm_act_out"),
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
@@ -835,7 +836,7 @@ def gemm_dact(
 
 
 @torch.library.custom_op(
-    "quack::gemm_dact_out",
+    add_quack_op_namespace_prefix("gemm_dact_out"),
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True) -> ()",
@@ -970,7 +971,7 @@ def gemm_dgated_ref(
 
 
 @torch.library.custom_op(
-    "quack::gemm_symmetric_out",
+    add_quack_op_namespace_prefix("gemm_symmetric_out"),
     mutates_args=("out",),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor(a2!) out, Tensor? C=None, bool dynamic_scheduler=False, float alpha=1.0, float beta=1.0) -> ()",

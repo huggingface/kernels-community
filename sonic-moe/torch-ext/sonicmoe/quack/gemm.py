@@ -8,9 +8,9 @@ import cutlass.torch as cutlass_torch
 from cutlass import Float32
 from cutlass.cute.runtime import from_dlpack, make_ptr
 
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from quack.gemm_wrapper_utils import GemmWrapperBase
-from quack.gemm_default_epi import GemmDefaultSm90, GemmDefaultSm100
+from .cute_dsl_utils import get_device_capacity, get_max_active_clusters
+from .gemm_wrapper_utils import GemmWrapperBase
+from .gemm_default_epi import GemmDefaultSm90, GemmDefaultSm100
 
 
 def gemm(

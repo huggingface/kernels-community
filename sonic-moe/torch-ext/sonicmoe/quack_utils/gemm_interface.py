@@ -6,10 +6,11 @@ from functools import partial
 from typing import Literal, Optional, Tuple
 
 import torch
-from quack.autotuner import AutotuneConfig, autotune
-from quack.cute_dsl_utils import get_device_capacity
-from quack.gemm_config import GemmConfig, get_all_configs
-from quack.gemm_interface import default_config, prune_invalid_gemm_configs
+from ..quack.autotuner import AutotuneConfig, autotune
+from ..quack.cute_dsl_utils import get_device_capacity
+from ..quack.gemm_config import GemmConfig, get_all_configs
+from ..quack._ops_compat import add_quack_op_namespace_prefix
+from ..quack.gemm_interface import default_config, prune_invalid_gemm_configs
 from torch import Tensor
 
 from .gemm_dgated import gemm_dgated as gemm_dgated_sm90_sm100
@@ -243,7 +244,7 @@ def gemm_gated(
 
 
 @torch.library.custom_op(
-    "quack::gemm_gated_out",
+    add_quack_op_namespace_prefix("gemm_gated_out"),
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
@@ -320,7 +321,7 @@ def gemm_dgated(
 
 
 @torch.library.custom_op(
-    "quack::gemm_dgated_out",
+    add_quack_op_namespace_prefix("gemm_dgated_out"),
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True) -> Tensor?",
@@ -356,7 +357,7 @@ def gemm_dgated_out(
     )
 
 
-@torch.library.register_fake("quack::gemm_dgated_out")
+@torch.library.register_fake(add_quack_op_namespace_prefix("gemm_dgated_out"))
 def gemm_dgated_out_fake(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
     B: Tensor,  # (K, N) or (L, K, N)

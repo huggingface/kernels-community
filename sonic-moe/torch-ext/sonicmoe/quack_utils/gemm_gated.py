@@ -9,17 +9,17 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
-import quack.activation
-import quack.sm90_utils as sm90_utils
+from ..quack import activation
+from ..quack import sm90_utils
 from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from quack.gemm_act import GemmActMixin
-from quack.gemm_default_epi import GemmDefaultEpiMixin
-from quack.gemm_sm90 import GemmSm90
-from quack.gemm_sm100 import GemmSm100
-from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
-from quack.layout_utils import permute_gated_Cregs_b16
+from ..quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
+from ..quack.gemm_act import GemmActMixin
+from ..quack.gemm_default_epi import GemmDefaultEpiMixin
+from ..quack.gemm_sm90 import GemmSm90
+from ..quack.gemm_sm100 import GemmSm100
+from ..quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
+from ..quack.layout_utils import permute_gated_Cregs_b16
 from torch import Tensor
 
 

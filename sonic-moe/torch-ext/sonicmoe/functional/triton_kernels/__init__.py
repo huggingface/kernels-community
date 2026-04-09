@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ..._ops_compat import add_op_namespace_prefix
 from .bitmatrix import _bitmatrix_metadata_compute_stage1, _bitmatrix_metadata_compute_stage2, _keyed_add
 
 
@@ -63,7 +64,7 @@ def _compute_col_partial_sum_kernel(
 
 
 @torch.library.custom_op(
-    f"triton_kernels::TC_topk_router_metadata",
+    add_op_namespace_prefix("triton_kernels__TC_topk_router_metadata"),
     mutates_args={
         "expert_frequency",
         "expert_frequency_offset",
@@ -265,7 +266,7 @@ def _token_offset_searchsorted_kernel(
 
 
 @torch.library.custom_op(
-    "triton_kernels::general_routing_router_metadata",
+    add_op_namespace_prefix("triton_kernels__general_routing_router_metadata"),
     mutates_args={
         "expert_frequency",
         "expert_frequency_offset",

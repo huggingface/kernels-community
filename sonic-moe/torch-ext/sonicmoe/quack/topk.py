@@ -1,3 +1,4 @@
+from ._ops_compat import add_quack_op_namespace_prefix
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Tri Dao.
 
 import math
@@ -12,13 +13,13 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32, const_expr
 
-import quack.utils as utils
-import quack.copy_utils as copy_utils
-from quack.compile_utils import make_fake_tensor as fake_tensor
-from quack.reduction_base import ReductionBase
-from quack.reduce import row_reduce
-from quack.cute_dsl_utils import torch2cute_dtype_map
-from quack.sort.bitonic_sort import bitonic_topk
+from . import utils as utils
+from . import copy_utils as copy_utils
+from .compile_utils import make_fake_tensor as fake_tensor
+from .reduction_base import ReductionBase
+from .reduce import row_reduce
+from .cute_dsl_utils import torch2cute_dtype_map
+from .sort.bitonic_sort import bitonic_topk
 
 
 class TopK:
@@ -214,7 +215,7 @@ class TopK:
                     cute.autovec_copy(topk_indices[None, i], mIndices_store[None, col])
 
 
-@torch.library.custom_op("quack::_topk_fwd", mutates_args={"values", "indices"})
+@torch.library.custom_op(add_quack_op_namespace_prefix("topk_fwd"), mutates_args={"values", "indices"})
 def _topk_fwd(
     x: torch.Tensor, k: int, softmax: bool, values: torch.Tensor, indices: torch.Tensor
 ) -> None:
@@ -440,7 +441,7 @@ class TopKBackward(ReductionBase):
             copy_dx(tXrdX, tXgdX)
 
 
-@torch.library.custom_op("quack::_topk_bwd", mutates_args={"dx"})
+@torch.library.custom_op(add_quack_op_namespace_prefix("topk_bwd"), mutates_args={"dx"})
 def _topk_bwd(
     dvalues: torch.Tensor,
     values: Optional[torch.Tensor],

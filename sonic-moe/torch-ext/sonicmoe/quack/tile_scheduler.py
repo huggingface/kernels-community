@@ -8,10 +8,10 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32, Boolean, const_expr
 
-import quack.utils as utils
-from quack.fast_math import FastDivmod
-from quack.pipeline import PipelineStateWAdvance
-from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
+from . import utils as utils
+from .fast_math import FastDivmod
+from .pipeline import PipelineStateWAdvance
+from .cute_dsl_utils import ArgumentsBase, ParamsBase
 
 
 class RasterOrderOption(IntEnum):

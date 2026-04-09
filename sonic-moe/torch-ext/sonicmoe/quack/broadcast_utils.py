@@ -5,7 +5,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
-from quack.layout_utils import make_acc_tensor_mn_view
+from .layout_utils import make_acc_tensor_mn_view
 
 
 @cute.jit

@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
+from .._ops_compat import add_op_namespace_prefix
 from ..enums import LIBRARY_NAME, TENSORMAP, ActivationType
 from ..utils import ceil_divide, convert_torch_tensor_to_cute_tensor, get_powers_of_2
 from .moe_config import (
@@ -193,7 +194,7 @@ def _colsum_smallN_kernel(
     tl.store(y_ptr + row * stride_y, acc)
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_backward_act", mutates_args={"dx_expanded", "db1"})
+@torch.library.custom_op(add_op_namespace_prefix("_up_projection_backward_act"), mutates_args={"dx_expanded", "db1"})
 def _up_projection_backward_act(
     w1: torch.Tensor,
     dx_expanded: torch.Tensor,
@@ -262,7 +263,7 @@ def _up_projection_backward_act(
 _up_projection_backward_act.compile_cache = {}
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_backward_weight", mutates_args={"dw1"})
+@torch.library.custom_op(add_op_namespace_prefix("_up_projection_backward_weight"), mutates_args={"dw1"})
 def _up_projection_backward_weight(
     x: torch.Tensor,
     dw1: torch.Tensor,
@@ -325,7 +326,7 @@ def _up_projection_backward_weight(
 _up_projection_backward_weight.compile_cache = {}
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_backward_act", mutates_args={"dz", "ds", "db2", "y1s"})
+@torch.library.custom_op(add_op_namespace_prefix("_down_projection_backward_act"), mutates_args={"dz", "ds", "db2", "y1s"})
 def _down_projection_backward_act(
     dout: torch.Tensor,
     z: torch.Tensor,
@@ -480,7 +481,7 @@ def _down_projection_backward_act(
 _down_projection_backward_act.compile_cache = {}
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_backward_weight", mutates_args={"dw2"})
+@torch.library.custom_op(add_op_namespace_prefix("_down_projection_backward_weight"), mutates_args={"dw2"})
 def _down_projection_backward_weight(
     dout: torch.Tensor,
     y1s: torch.Tensor,
@@ -530,7 +531,7 @@ def _down_projection_backward_weight(
 _down_projection_backward_weight.compile_cache = {}
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_token_broadcast_backward", mutates_args={"dx_reduced"})
+@torch.library.custom_op(add_op_namespace_prefix("_token_broadcast_backward"), mutates_args={"dx_reduced"})
 def _token_broadcast_backward(
     dx_reduced: torch.Tensor,
     dx_expanded: torch.Tensor,
@@ -596,7 +597,7 @@ def _softmax_bwd_scatter_small_kernel(
     tl.store(dlogits_full_ptr + indices, add_vals, mask=k_mask)
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_softmax_topk_bwd", mutates_args={"dlogits_full"})
+@torch.library.custom_op(add_op_namespace_prefix("_softmax_topk_bwd"), mutates_args={"dlogits_full"})
 def _softmax_topk_bwd(
     dlogits_full: torch.Tensor,
     dlogits: Optional[torch.Tensor],
@@ -657,7 +658,7 @@ def _topk_bwd_scatter_small_kernel(
     tl.store(dlogits_full_ptr + indices, add_vals, mask=k_mask)
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_topk_bwd", mutates_args={"dlogits_full"})
+@torch.library.custom_op(add_op_namespace_prefix("_topk_bwd"), mutates_args={"dlogits_full"})
 def _topk_bwd(
     dlogits_full: torch.Tensor,
     dtopk_values: torch.Tensor,

@@ -6,7 +6,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Float32, const_expr
 
-import quack.copy_utils as copy_utils
+from . import copy_utils as copy_utils
 
 
 class ReductionBase:

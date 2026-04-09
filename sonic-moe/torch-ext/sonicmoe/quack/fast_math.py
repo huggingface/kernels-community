@@ -9,7 +9,7 @@ from cutlass import Int32, Uint32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-from quack.cute_dsl_utils import ParamsBase
+from .cute_dsl_utils import ParamsBase
 
 
 @cute.jit

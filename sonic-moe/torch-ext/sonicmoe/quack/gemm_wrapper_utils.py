@@ -9,9 +9,9 @@ import cutlass.cute as cute
 from cutlass import Int32
 from cutlass.cute.runtime import from_dlpack, make_ptr
 
-from quack.cute_dsl_utils import torch2cute_dtype_map
-from quack.varlen_utils import VarlenArguments
-from quack.tile_scheduler import TileSchedulerOptions
+from .cute_dsl_utils import torch2cute_dtype_map
+from .varlen_utils import VarlenArguments
+from .tile_scheduler import TileSchedulerOptions
 
 
 @dataclass

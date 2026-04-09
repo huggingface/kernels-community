@@ -9,9 +9,9 @@ from typing import Type
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import quack.utils as utils
+from ..quack import utils
 from cutlass import const_expr
-from quack.sort.bitonic_sort import bitonic_topk
+from ..quack.sort.bitonic_sort import bitonic_topk
 from triton import next_power_of_2
 
 from ..utils import domain_offset_i64

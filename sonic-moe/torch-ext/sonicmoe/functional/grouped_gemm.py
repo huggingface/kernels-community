@@ -48,15 +48,15 @@ from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
-from quack.copy_utils import sm90_get_smem_load_op
-from quack.cute_dsl_utils import ParamsBase
-from quack.layout_utils import make_acc_tensor_mn_view
+from ..quack.copy_utils import sm90_get_smem_load_op
+from ..quack.cute_dsl_utils import ParamsBase
+from ..quack.layout_utils import make_acc_tensor_mn_view
 
 # return PipelineStateWAdvance instead of PipelineState
-from quack.pipeline import PipelineTmaCpAsync, make_pipeline_state
-from quack.sm90_utils import partition_for_epilogue
-from quack.tensormap_manager import TensorMapManagerSm90
-from quack.tile_scheduler import RasterOrderOption, TileSchedulerArguments, VarlenMTileSchedulerArguments
+from ..quack.pipeline import PipelineTmaCpAsync, make_pipeline_state
+from ..quack.sm90_utils import partition_for_epilogue
+from ..quack.tensormap_manager import TensorMapManagerSm90
+from ..quack.tile_scheduler import RasterOrderOption, TileSchedulerArguments, VarlenMTileSchedulerArguments
 
 from .tile_scheduler import SonicMoETileScheduler, SonicMoEVarlenMTileScheduler
 

@@ -7,9 +7,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32, const_expr
 
-import quack.utils as utils
-from quack.sort.utils import compare_and_swap
-from quack.sort.sorting_networks import optimal_sort
+from .. import utils
+from .utils import compare_and_swap
+from .sorting_networks import optimal_sort
 
 
 @cute.jit

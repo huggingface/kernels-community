@@ -1,14 +1,14 @@
 from typing import Tuple, Optional, Callable
 from functools import partial
 from torch import Tensor
-from quack.gemm_act import GemmActMixin, act_fn_map, gemm_act
-from quack.gemm_sm90 import GemmSm90
-from quack.gemm_sm100 import GemmSm100
-from quack.tile_scheduler import TriangularTileScheduler
-from quack.gemm_wrapper_utils import GemmWrapperBase
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from quack.varlen_utils import VarlenManager
-import quack.copy_utils as copy_utils
+from .gemm_act import GemmActMixin, act_fn_map, gemm_act
+from .gemm_sm90 import GemmSm90
+from .gemm_sm100 import GemmSm100
+from .tile_scheduler import TriangularTileScheduler
+from .gemm_wrapper_utils import GemmWrapperBase
+from .cute_dsl_utils import get_device_capacity, get_max_active_clusters
+from .varlen_utils import VarlenManager
+from . import copy_utils as copy_utils
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch

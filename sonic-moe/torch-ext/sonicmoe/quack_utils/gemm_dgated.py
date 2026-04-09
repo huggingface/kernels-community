@@ -11,27 +11,27 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
-import quack.activation
-import quack.layout_utils as layout_utils
-import quack.sm90_utils as sm90_utils
-import quack.utils as utils
+from ..quack import activation
+from ..quack import layout_utils
+from ..quack import sm90_utils
+from ..quack import utils
 import torch
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
-from quack.cute_dsl_utils import (
+from ..quack.cute_dsl_utils import (
     ArgumentsBase,
     ParamsBase,
     get_device_capacity,
     get_max_active_clusters,
     torch2cute_dtype_map,
 )
-from quack.gemm_act import GemmActMixin
-from quack.gemm_default_epi import GemmDefaultEpiMixin
-from quack.gemm_sm90 import GemmSm90
-from quack.gemm_sm100 import GemmSm100
-from quack.gemm_wrapper_utils import GemmWrapperBase
-from quack.sm90_utils import partition_for_epilogue
-from quack.varlen_utils import VarlenManager
+from ..quack.gemm_act import GemmActMixin
+from ..quack.gemm_default_epi import GemmDefaultEpiMixin
+from ..quack.gemm_sm90 import GemmSm90
+from ..quack.gemm_sm100 import GemmSm100
+from ..quack.gemm_wrapper_utils import GemmWrapperBase
+from ..quack.sm90_utils import partition_for_epilogue
+from ..quack.varlen_utils import VarlenManager
 from torch import Tensor
 
 

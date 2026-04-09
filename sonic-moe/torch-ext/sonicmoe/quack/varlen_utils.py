@@ -8,8 +8,8 @@ import cutlass.cute as cute
 from cutlass import Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
-from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
-from quack.tensormap_manager import TensorMapManagerSm90
+from .cute_dsl_utils import ArgumentsBase, ParamsBase
+from .tensormap_manager import TensorMapManagerSm90
 
 
 # Grouping arguments together that should be passed to __call__

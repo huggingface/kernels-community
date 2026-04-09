@@ -8,16 +8,17 @@ import torch
 import triton
 import triton.language as tl
 from cutlass.cute.runtime import from_dlpack
-from quack.cute_dsl_utils import torch2cute_dtype_map
+from ..quack.cute_dsl_utils import torch2cute_dtype_map
 
 from ..enums import LIBRARY_NAME, TENSORMAP, ActivationType
+from .._ops_compat import add_op_namespace_prefix
 from ..utils import convert_torch_tensor_to_cute_tensor
 from .moe_config import HopperWgmma_MoE_Down_proj_Fwd, HopperWgmma_MoE_Up_proj_Fwd
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 from .topk_softmax import TopK_Softmax
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_topk_fwd", mutates_args={"values", "indices"})
+@torch.library.custom_op(add_op_namespace_prefix("_topk_fwd"), mutates_args={"values", "indices"})
 def _topk_fwd(
     x: torch.Tensor, k: int, values: torch.Tensor, indices: torch.Tensor, require_softmax_fusion: bool = True
 ) -> None:
@@ -50,7 +51,7 @@ def _topk_fwd(
 _topk_fwd.compile_cache = {}
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_forward", mutates_args={"z", "y1"})
+@torch.library.custom_op(add_op_namespace_prefix("_up_projection_forward"), mutates_args={"z", "y1"})
 def _up_projection_forward(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -129,7 +130,7 @@ def _up_projection_forward(
 _up_projection_forward.compile_cache = {}
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_forward", mutates_args={"y2"})
+@torch.library.custom_op(add_op_namespace_prefix("_down_projection_forward"), mutates_args={"y2"})
 def _down_projection_forward(
     w2: torch.Tensor,
     y1: torch.Tensor,
@@ -178,7 +179,7 @@ def _down_projection_forward(
 _down_projection_forward.compile_cache = {}
 
 
-@torch.library.custom_op(f"{LIBRARY_NAME}::_router_forward", mutates_args={"o"})
+@torch.library.custom_op(add_op_namespace_prefix("_router_forward"), mutates_args={"o"})
 def _router_forward(
     y2: torch.Tensor,
     o: torch.Tensor,
@@ -222,7 +223,7 @@ def _softmax_fwd_small_kernel(
 
 
 @torch.library.custom_op(
-    f"{LIBRARY_NAME}::_softmax_topk_fwd", mutates_args={"topk_router_score", "topk_router_indices"}
+    add_op_namespace_prefix("_softmax_topk_fwd"), mutates_args={"topk_router_score", "topk_router_indices"}
 )
 def _softmax_topk_fwd(
     router_logits: torch.Tensor, topk_router_score: torch.Tensor, topk_router_indices: torch.Tensor, E: int, K: int

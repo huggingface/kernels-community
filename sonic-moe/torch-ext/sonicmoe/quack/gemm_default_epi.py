@@ -8,13 +8,13 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32, Boolean, const_expr
 
-from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
-from quack.gemm_sm90 import GemmSm90
-from quack.gemm_sm100 import GemmSm100
-from quack.sm90_utils import partition_for_epilogue
-import quack.utils as utils
-import quack.copy_utils as copy_utils
-from quack.varlen_utils import VarlenManager
+from .cute_dsl_utils import ArgumentsBase, ParamsBase
+from .gemm_sm90 import GemmSm90
+from .gemm_sm100 import GemmSm100
+from .sm90_utils import partition_for_epilogue
+from . import utils as utils
+from . import copy_utils as copy_utils
+from .varlen_utils import VarlenManager
 
 
 class GemmDefaultEpiMixin:

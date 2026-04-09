@@ -9,13 +9,13 @@ import cutlass.cute as cute
 from cutlass import Float32, const_expr
 import cutlass.torch as cutlass_torch
 
-from quack.gemm_sm90 import GemmSm90
-from quack.gemm_sm100 import GemmSm100
-from quack.gemm_default_epi import GemmDefaultEpiMixin
-from quack.gemm_act import GemmActMixin
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from quack.gemm_wrapper_utils import GemmWrapperBase
-import quack.activation
+from .gemm_sm90 import GemmSm90
+from .gemm_sm100 import GemmSm100
+from .gemm_default_epi import GemmDefaultEpiMixin
+from .gemm_act import GemmActMixin
+from .cute_dsl_utils import get_device_capacity, get_max_active_clusters
+from .gemm_wrapper_utils import GemmWrapperBase
+from . import activation
 
 
 class GemmDActMixin(GemmActMixin):

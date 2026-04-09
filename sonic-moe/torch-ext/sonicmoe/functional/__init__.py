@@ -6,7 +6,7 @@ import os
 
 import torch
 import torch.nn.functional as F
-from quack.gemm_interface import gemm
+from ..quack.gemm_interface import gemm
 
 from ..enums import ActivationType, is_glu
 from ..quack_utils import gemm_dgated, gemm_gated

@@ -8,7 +8,7 @@ from cutlass import Float32, Boolean, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-import quack.utils as utils
+from . import utils as utils
 
 
 F32_or_F32x2 = Float32 | Tuple[Float32, Float32]

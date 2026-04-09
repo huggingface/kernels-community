@@ -10,7 +10,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import const_expr
-from quack.tile_scheduler import RasterOrderOption
+from ..quack.tile_scheduler import RasterOrderOption
 
 from ..enums import ActivationType, is_glu
 from .grouped_gemm import HopperWgmma_MoE_kernel

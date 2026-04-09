@@ -1,7 +1,7 @@
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
-import quack.utils as utils
+from .. import utils
 
 
 @cute.jit

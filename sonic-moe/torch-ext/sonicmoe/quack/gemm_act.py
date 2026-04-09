@@ -14,16 +14,16 @@ from cutlass.cutlass_dsl import if_generate
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
-from quack.cute_dsl_utils import ArgumentsBase, ParamsBase
-from quack.varlen_utils import VarlenManager
-from quack.gemm_sm90 import GemmSm90
-from quack.gemm_sm100 import GemmSm100
-from quack.gemm_default_epi import GemmDefaultEpiMixin
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from quack.gemm_wrapper_utils import GemmWrapperBase
-import quack.sm90_utils as sm90_utils
-import quack.copy_utils as copy_utils
-import quack.activation
+from .cute_dsl_utils import ArgumentsBase, ParamsBase
+from .varlen_utils import VarlenManager
+from .gemm_sm90 import GemmSm90
+from .gemm_sm100 import GemmSm100
+from .gemm_default_epi import GemmDefaultEpiMixin
+from .cute_dsl_utils import get_device_capacity, get_max_active_clusters
+from .gemm_wrapper_utils import GemmWrapperBase
+from . import sm90_utils as sm90_utils
+from . import copy_utils as copy_utils
+from . import activation
 
 
 class GemmActMixin(GemmDefaultEpiMixin):

@@ -6,7 +6,7 @@ import cutlass.cute as cute
 
 from cutlass import Int32, const_expr
 
-from quack.utils import prmt
+from .utils import prmt
 
 
 def transpose_view(a: cute.Tensor) -> cute.Tensor:
