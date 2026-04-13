@@ -122,11 +122,11 @@ class GemmGatedSm100(GemmGatedMixin, GemmSm100):
 
 
 gate_fn_map = {
-    "swiglu": quack.activation.swiglu,
-    "swiglu_oai": quack.activation.swiglu_oai,
-    "reglu": quack.activation.reglu,
-    "geglu": quack.activation.geglu,
-    "glu": quack.activation.glu,
+    "swiglu": activation.swiglu,
+    "swiglu_oai": activation.swiglu_oai,
+    "reglu": activation.reglu,
+    "geglu": activation.geglu,
+    "glu": activation.glu,
 }
 
 
