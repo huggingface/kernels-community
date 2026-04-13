@@ -1,5 +1,5 @@
 [general]
-name = "sonicmoe"
+name = "sonic-moe"
 license = "Apache-2.0"
 backends = ["cuda"]
 version = 1
@@ -10,5 +10,3 @@ repo-id = "kernels-community/sonic-moe"
 [general.cuda]
 minver = "12.8"
 python-depends = ["nvidia-cutlass-dsl"]
-
-[kernel]
