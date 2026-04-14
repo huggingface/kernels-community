@@ -47,6 +47,9 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           $ErrorActionPreference = "Continue"
+          # Sanitize PR_TITLE to prevent command injection
+          $sanitizedTitle = $env:PR_TITLE -replace '[^a-zA-Z0-9\s\-_\.]', ''
+          $env:PR_TITLE = $sanitizedTitle
           $KERNEL = python .github/workflows/validate-kernel-pr.py "release" 2>&1
           if ($LASTEXITCODE -eq 0) {
             echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
@@ -248,12 +251,12 @@ jobs:
           $buildTomlPath = "$env:KERNEL_SOURCE\build.toml"
           if (Test-Path $buildTomlPath) {
             $content = Get-Content $buildTomlPath -Raw
-            if ($content -match '(?m)^\s*version\s*=\s*1\s*(\r)?$' -and $content -notmatch '(?m)^\s*branch\s*=') {
-              Write-Host "Kernel version is 1 and no branch override, uploading to main branch..."
+            if ($content -match '(?m)^\s*version\s*=\s*1\s*(\r)?$') {
+              Write-Host "Kernel version is 1, uploading to main branch..."
               & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "kernels-community/$env:KERNEL_SOURCE" --branch main
               & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "kernels-community/$env:KERNEL_SOURCE" --branch main
             } else {
-              Write-Host "Kernel version is not 1 or branch is overridden, skipping main branch upload"
+              Write-Host "Kernel version is not 1, skipping main branch upload"
             }
           } else {
             Write-Host "build.toml not found, skipping main branch upload"
