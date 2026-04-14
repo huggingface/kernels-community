@@ -51,6 +51,7 @@ jobs:
           } else {
             echo "skip=true" >> $env:GITHUB_OUTPUT
           }
+          exit 0
 
       - name: Check backend support
         id: check-backend
