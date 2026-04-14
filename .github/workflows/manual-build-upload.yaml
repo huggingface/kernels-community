@@ -121,3 +121,15 @@ jobs:
           set -eu
           KERNEL="${{ steps.validate.outputs.kernel }}"
           ( cd "$KERNEL" && nix run .#kernels -- upload --repo-id "kernels-community/$KERNEL" --branch "$TARGET_BRANCH" . )
+
+      - name: Sync kernel repo to model repo
+        if: ${{ inputs.upload == 'true' }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -eu
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          pip install -U huggingface_hub
+          python3 .github/scripts/sync_kernel_to_model.py \
+            "kernels-community/$KERNEL" "$TARGET_BRANCH"

@@ -1,0 +1,124 @@
+name: Sync Kernel to Model Repo
+on:
+  workflow_run:
+    workflows:
+      - "Build Release"
+      - "Build Release (macOS)"
+      - "Build Release (Windows)"
+    types: [completed]
+
+jobs:
+  sync:
+    # Only proceed if the triggering workflow was for a merged PR and succeeded.
+    # The build-release workflows themselves gate on `github.event.pull_request.merged == true`,
+    # so a successful conclusion already implies the PR was merged. We additionally verify
+    # via the GitHub API below to be explicit.
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify PR was merged (not just closed)
+        id: verify-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # Find the PR associated with this head SHA and confirm it was merged
+          MERGED=$(gh pr list --state merged --search "$HEAD_SHA" \
+            --json merged --jq '.[0].merged // false')
+
+          if [ "$MERGED" != "true" ]; then
+            echo "PR was not merged, skipping sync."
+            echo "merged=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "merged=true" >> $GITHUB_OUTPUT
+
+      - name: Check if all platform workflows have completed
+        if: steps.verify-merge.outputs.merged == 'true'
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # Get the status of all three build-release workflows for this commit.
+          # Each workflow creates check runs tied to the head SHA of the PR.
+          WORKFLOWS=("Build Release" "Build Release (macOS)" "Build Release (Windows)")
+          ALL_DONE=true
+
+          for wf in "${WORKFLOWS[@]}"; do
+            # Find the most recent run for this workflow + commit
+            STATUS=$(gh run list \
+              --workflow "$wf" \
+              --commit "$HEAD_SHA" \
+              --limit 1 \
+              --json status,conclusion \
+              --jq '.[0].status // "not_found"')
+
+            echo "$wf: $STATUS"
+
+            if [ "$STATUS" != "completed" ]; then
+              ALL_DONE=false
+              break
+            fi
+          done
+
+          echo "all_done=$ALL_DONE" >> $GITHUB_OUTPUT
+
+      - name: Extract kernel name from triggering PR
+        if: >-
+          steps.verify-merge.outputs.merged == 'true' &&
+          steps.check.outputs.all_done == 'true'
+        id: kernel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          # Look up the merged PR by head SHA to get its title
+          PR_TITLE=$(gh pr list --state merged --search "$HEAD_SHA" \
+            --json title --jq '.[0].title // empty')
+
+          if [ -z "$PR_TITLE" ]; then
+            echo "Could not determine PR title, skipping sync."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          KERNEL=$(python3 .github/workflows/validate-kernel-pr.py \
+            "release" "$PR_TITLE") || {
+            echo "Not a release PR, skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          }
+
+          VERSION=$(grep -oP 'version\s*=\s*\K\d+' \
+            "$KERNEL/build.toml" | head -1)
+
+          echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+      - name: Sync kernel repo to model repo
+        if: >-
+          steps.verify-merge.outputs.merged == 'true' &&
+          steps.check.outputs.all_done == 'true' &&
+          steps.kernel.outputs.skip == 'false'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          pip install -U huggingface_hub
+          KERNEL="${{ steps.kernel.outputs.kernel }}"
+          VERSION="${{ steps.kernel.outputs.version }}"
+
+          echo "All platform builds done. Syncing kernels-community/$KERNEL..."
+          python3 .github/scripts/sync_kernel_to_model.py \
+            "kernels-community/$KERNEL" "v$VERSION"
+
+          if [ "$VERSION" = "1" ]; then
+            python3 .github/scripts/sync_kernel_to_model.py \
+              "kernels-community/$KERNEL" "main"
+          fi
