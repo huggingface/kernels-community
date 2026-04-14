@@ -46,7 +46,8 @@ jobs:
         env:
           PRTITLE: ${{ github.event.pull_request.title }}
         run: |
-          $KERNEL = python .github/workflows/validate-kernel-pr.py "release" "$Env:PRTITLE"
+          $ErrorActionPreference = "Continue"
+          $KERNEL = python .github/workflows/validate-kernel-pr.py "release" "$Env:PRTITLE" 2>&1
           if ($LASTEXITCODE -eq 0) {
             echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
             echo "skip=false" >> $env:GITHUB_OUTPUT
