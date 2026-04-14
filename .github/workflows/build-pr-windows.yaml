@@ -40,8 +40,6 @@ jobs:
       - name: Validate kernel directory
         id: validate
         shell: pwsh
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           $ErrorActionPreference = "Continue"
           $KERNEL = python .github/workflows/validate-kernel-pr.py "pr" 2>&1
