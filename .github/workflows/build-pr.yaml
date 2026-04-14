@@ -39,8 +39,6 @@ jobs:
           USER: runner
       - name: Validate kernel directory
         id: validate
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "pr"); then
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
