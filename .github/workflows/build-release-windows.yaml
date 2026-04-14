@@ -226,14 +226,11 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
-          PYTHONUTF8: 1
-          PYTHONIOENCODING: utf-8
         run: |
-          # Install kernels package for upload
-          pip install -U kernels --no-cache-dir
+          $KB = "$env:GITHUB_WORKSPACE\kernels\kernel-builder\target\debug\kernel-builder.exe"
 
-          # Upload using the kernels CLI (branchless - uploads to version branch like v1, v2, etc.)
-          kernels upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE"
+          # Upload using kernel-builder (branchless - uploads to version branch like v1, v2, etc.)
+          & $KB upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE"
 
       - name: Upload v1 kernels to main
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
@@ -241,16 +238,16 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
-          PYTHONUTF8: 1
-          PYTHONIOENCODING: utf-8
         run: |
+          $KB = "$env:GITHUB_WORKSPACE\kernels\kernel-builder\target\debug\kernel-builder.exe"
+
           # Check if build.toml exists and has version = 1
           $buildTomlPath = "$env:KERNEL_SOURCE\build.toml"
           if (Test-Path $buildTomlPath) {
             $content = Get-Content $buildTomlPath -Raw
             if ($content -match '(?m)^\s*version\s*=\s*1\s*(\r)?$') {
               Write-Host "Kernel version is 1, uploading to main branch..."
-              kernels upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE" --branch main
+              & $KB upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE" --branch main
             } else {
               Write-Host "Kernel version is not 1, skipping main branch upload"
             }
