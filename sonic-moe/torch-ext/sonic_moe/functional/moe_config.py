@@ -529,8 +529,7 @@ class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
 
 
 class HopperWgmma_MoE_Up_proj_WeightGrad_Bwd:
-    def __init__(self, E: int, H: int, I: int, is_glu_activation: bool,
-                 is_concatenated_gate_up: bool = False):
+    def __init__(self, E: int, H: int, I: int, is_glu_activation: bool, is_concatenated_gate_up: bool = False):
         self.is_concatenated_gate_up = is_concatenated_gate_up
         super().__init__()
         if is_glu_activation:
