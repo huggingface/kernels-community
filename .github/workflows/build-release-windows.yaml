@@ -229,8 +229,9 @@ jobs:
         run: |
           $KB = "$env:GITHUB_WORKSPACE\kernels\kernel-builder\target\debug\kernel-builder.exe"
 
-          # Upload using kernel-builder (branchless - uploads to version branch like v1, v2, etc.)
-          & $KB upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE"
+          # Upload to both model and kernel repo types
+          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "kernels-community/$env:KERNEL_SOURCE"
+          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "kernels-community/$env:KERNEL_SOURCE"
 
       - name: Upload v1 kernels to main
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
@@ -247,7 +248,8 @@ jobs:
             $content = Get-Content $buildTomlPath -Raw
             if ($content -match '(?m)^\s*version\s*=\s*1\s*(\r)?$') {
               Write-Host "Kernel version is 1, uploading to main branch..."
-              & $KB upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE" --branch main
+              & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "kernels-community/$env:KERNEL_SOURCE" --branch main
+              & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "kernels-community/$env:KERNEL_SOURCE" --branch main
             } else {
               Write-Host "Kernel version is not 1, skipping main branch upload"
             }
