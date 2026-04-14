@@ -28,9 +28,8 @@ jobs:
           USER: runner
       - name: Validate kernel directory
         id: validate
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
+          PR_TITLE='${{ github.event.pull_request.title }}'
           if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release"); then
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
@@ -64,8 +63,7 @@ jobs:
 
           if [ -f "build.toml" ]; then
             VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
-            BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
-            if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
+            if [ -n "$VERSION" ]; then
               nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "kernels-community/$KERNEL" --branch main result
               nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/$KERNEL" --branch main result
             fi
