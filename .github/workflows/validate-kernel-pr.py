@@ -3,9 +3,10 @@
 Validate kernel build request and directory structure.
 """
 
-import sys
-import re
 import argparse
+import os
+import re
+import sys
 from pathlib import Path
 
 
@@ -27,22 +28,23 @@ def validate_kernel_name(kernel_name: str) -> bool:
 def main():
     parser = argparse.ArgumentParser(
         description="Validate kernel build request and directory structure",
-        epilog="Returns exit code 0 if valid, 1 if invalid, and outputs kernel name to stdout"
+        epilog="Returns exit code 0 if valid, 1 if invalid, and outputs kernel name to stdout",
     )
     parser.add_argument(
-        "build_type",
-        choices=["pr", "release"],
-        help="Type of build to validate for"
+        "build_type", choices=["pr", "release"], help="Type of build to validate for"
     )
-    parser.add_argument(
-        "pr_title",
-        help="Title of the pull request containing kernel name"
-    )
-    
+
     args = parser.parse_args()
-    
+
     build_type = args.build_type
-    pr_title = args.pr_title
+    pr_title = os.environ.get("PR_TITLE", "")
+
+    if not pr_title:
+        print(
+            "PR_TITLE environment variable is not set or empty, skipping build",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if ":" not in pr_title:
         print("No colon found in PR title, skipping build", file=sys.stderr)
@@ -62,7 +64,10 @@ def main():
     # Check for build-type specific skip-ci file
     skip_ci_file = kernel_path / f".skip-{build_type}-ci"
     if skip_ci_file.exists():
-        print(f"Kernel '{kernel_name}' has .skip-{build_type}-ci file, skipping build", file=sys.stderr)
+        print(
+            f"Kernel '{kernel_name}' has .skip-{build_type}-ci file, skipping build",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     flake_nix = kernel_path / "flake.nix"

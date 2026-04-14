@@ -41,10 +41,10 @@ jobs:
         id: validate
         shell: pwsh
         env:
-          PRTITLE: ${{ github.event.pull_request.title }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           $ErrorActionPreference = "Continue"
-          $KERNEL = python .github/workflows/validate-kernel-pr.py "pr" "$Env:PRTITLE" 2>&1
+          $KERNEL = python .github/workflows/validate-kernel-pr.py "pr" 2>&1
           if ($LASTEXITCODE -eq 0) {
             echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
             echo "skip=false" >> $env:GITHUB_OUTPUT
@@ -193,13 +193,13 @@ jobs:
             $setvarsPath = "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
             if (Test-Path $setvarsPath) {
               Write-Host "Initializing Intel oneAPI environment for XPU build..." -ForegroundColor Cyan
-              
+
               # Create a temporary file to capture environment variables
               $tempFile = [System.IO.Path]::GetTempFileName()
-              
+
               # Run setvars.bat and capture all environment variables
               cmd.exe /c "`"$setvarsPath`" && set > `"$tempFile`""
-              
+
               # Parse and set each environment variable in PowerShell
               Get-Content $tempFile | ForEach-Object {
                 if ($_ -match "^(.*?)=(.*)$") {
@@ -208,9 +208,9 @@ jobs:
                   [System.Environment]::SetEnvironmentVariable($varName, $varValue, [System.EnvironmentVariableTarget]::Process)
                 }
               }
-              
+
               Remove-Item $tempFile -ErrorAction SilentlyContinue
-              
+
               # Verify Intel compiler is now in PATH
               $icxPath = (Get-Command icx-cl -ErrorAction SilentlyContinue).Path
               if ($icxPath) {

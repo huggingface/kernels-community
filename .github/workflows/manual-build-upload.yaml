@@ -91,6 +91,7 @@ jobs:
         id: validate
         env:
           KERNEL_INPUT: ${{ inputs.kernel_name }}
+          PR_TITLE: "${{ inputs.kernel_name }}: manual dispatch"
         run: |
           set -eu
           case "$KERNEL_INPUT" in
@@ -99,7 +100,7 @@ jobs:
               exit 1
               ;;
           esac
-          if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release" "${KERNEL_INPUT}: manual dispatch"); then
+          if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release"); then
             echo "kernel=$KERNEL" >> "$GITHUB_OUTPUT"
           else
             echo "Kernel validation failed."
