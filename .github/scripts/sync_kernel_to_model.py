@@ -1,11 +1,3 @@
-"""Syncs a kernel repo to its model repo counterpart using huggingface_hub.
-
-Usage: python sync_kernel_to_model.py <repo_id> <branch>
-Example: python sync_kernel_to_model.py kernels-community/flash-attn3 v1
-
-Requires: HF_TOKEN env var, huggingface_hub installed
-"""
-
 import sys
 
 from huggingface_hub import HfApi
