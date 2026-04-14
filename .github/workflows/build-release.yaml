@@ -59,8 +59,8 @@ jobs:
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
           cd "$KERNEL"
-          nix run -L .#kernel-builder -- upload --repo-type model --repo-id "kernels-community/$KERNEL" result
-          nix run -L .#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/$KERNEL" result
+          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "kernels-community/$KERNEL" result
+          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/$KERNEL" result
       - name: Upload v1 kernels to main
         if: steps.validate.outputs.skip == 'false'
         env:
@@ -73,7 +73,7 @@ jobs:
           if [ -f "build.toml" ]; then
             VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
             if [ -n "$VERSION" ]; then
-              nix run -L .#kernel-builder -- upload --repo-type model --repo-id "kernels-community/$KERNEL" --branch main result
-              nix run -L .#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/$KERNEL" --branch main result
+              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "kernels-community/$KERNEL" --branch main result
+              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/$KERNEL" --branch main result
             fi
           fi
