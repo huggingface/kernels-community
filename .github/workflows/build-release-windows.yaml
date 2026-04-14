@@ -44,10 +44,11 @@ jobs:
         id: validate
         shell: pwsh
         env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
+          PRTITLE: ${{ github.event.pull_request.title }}
         run: |
           $ErrorActionPreference = "Continue"
-          $KERNEL = python .github/workflows/validate-kernel-pr.py "release" 2>&1
+          # Use Python's sys.stdin to safely pass untrusted input
+          $KERNEL = $Env:PRTITLE | python .github/workflows/validate-kernel-pr.py "release" 2>&1
           if ($LASTEXITCODE -eq 0) {
             echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
             echo "skip=false" >> $env:GITHUB_OUTPUT
