@@ -112,11 +112,26 @@ jobs:
           KERNEL="${{ steps.validate.outputs.kernel }}"
           ( cd "$KERNEL" && nix run -L .#build-and-copy )
 
+      - name: Validate target branch
+        if: ${{ inputs.upload == 'true' }}
+        id: validate-target-branch
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -eu
+          case "$TARGET_BRANCH" in
+            ''|*[!A-Za-z0-9/_-]*)
+              echo "Invalid target_branch: must contain only alphanumeric characters, underscores, hyphens, and slashes"
+              exit 1
+              ;;
+          esac
+          echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+
       - name: Upload kernel
         if: ${{ inputs.upload == 'true' }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          TARGET_BRANCH: ${{ inputs.target_branch }}
+          TARGET_BRANCH: ${{ steps.validate-target-branch.outputs.target_branch }}
         run: |
           set -eu
           KERNEL="${{ steps.validate.outputs.kernel }}"
