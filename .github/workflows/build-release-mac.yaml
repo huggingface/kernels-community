@@ -64,7 +64,8 @@ jobs:
 
           if [ -f "build.toml" ]; then
             VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
-            if [ -n "$VERSION" ]; then
+            BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
+            if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
               nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "kernels-community/$KERNEL" --branch main result
               nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/$KERNEL" --branch main result
             fi
