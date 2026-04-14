@@ -165,7 +165,7 @@ jobs:
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         working-directory: kernels\kernel-builder
         shell: pwsh
-        run: cargo build
+        run: cargo install
 
       - name: Build kernel
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
@@ -233,7 +233,8 @@ jobs:
           pip install -U kernels --no-cache-dir
 
           # Upload using the kernels CLI (branchless - uploads to version branch like v1, v2, etc.)
-          kernels upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE"
+          kernel-builder upload "$env:KERNEL_SOURCE\build"
+          kernel-builder upload --repo-type kernel "$env:KERNEL_SOURCE\build"
 
       - name: Upload v1 kernels to main
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
@@ -250,7 +251,8 @@ jobs:
             $content = Get-Content $buildTomlPath -Raw
             if ($content -match '(?m)^\s*version\s*=\s*1\s*(\r)?$') {
               Write-Host "Kernel version is 1, uploading to main branch..."
-              kernels upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE" --branch main
+              kernel-builder upload "$env:KERNEL_SOURCE\build" --repo-id "kernels-community/$env:KERNEL_SOURCE" --branch main
+              kernel-builder upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "kernels-community/$env:KERNEL_SOURCE" --branch main
             } else {
               Write-Host "Kernel version is not 1, skipping main branch upload"
             }

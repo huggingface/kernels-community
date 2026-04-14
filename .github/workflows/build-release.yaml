@@ -53,7 +53,12 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
-          ( cd "$KERNEL" && nix run -L .#build-and-upload )
+          (
+            cd "$KERNEL"
+            nix build -L
+            nix run -L github:huggingface/kernels#kernel-builder -- upload result
+            nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel result
+          )
       - name: Upload v1 kernels to main
         if: steps.validate.outputs.skip == 'false'
         env:
@@ -67,6 +72,7 @@ jobs:
             VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
             if [ -n "$VERSION" ]; then
               nix build -L
-              nix run -L .#kernels -- upload --repo-id kernels-community/$KERNEL --branch main result
+              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-id kernels-community/$KERNEL --branch main result
+              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id kernels-community/$KERNEL --branch main result
             fi
           fi
