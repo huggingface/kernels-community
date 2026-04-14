@@ -47,8 +47,7 @@ jobs:
           PRTITLE: ${{ github.event.pull_request.title }}
         run: |
           $ErrorActionPreference = "Continue"
-          # Pass PR title via stdin to avoid shell injection
-          $KERNEL = $Env:PRTITLE | python .github/workflows/validate-kernel-pr.py "release" 2>&1
+          $KERNEL = python .github/workflows/validate-kernel-pr.py "release" "$Env:PRTITLE" 2>&1
           if ($LASTEXITCODE -eq 0) {
             echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
             echo "skip=false" >> $env:GITHUB_OUTPUT
