@@ -120,4 +120,5 @@ jobs:
         run: |
           set -eu
           KERNEL="${{ steps.validate.outputs.kernel }}"
-          ( cd "$KERNEL" && nix run .#kernels -- upload --repo-id "kernels-community/$KERNEL" --branch "$TARGET_BRANCH" . )
+          ( cd "$KERNEL" && nix run .#kernel-builder -- upload --repo-type model --repo-id "kernels-community/$KERNEL" --branch "$TARGET_BRANCH" . )
+          ( cd "$KERNEL" && nix run .#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/$KERNEL" --branch "$TARGET_BRANCH" . )
