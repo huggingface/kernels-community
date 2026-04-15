@@ -51,6 +51,11 @@ jobs:
         if: steps.validate.outputs.skip == 'false'
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
+          # Validate KERNEL contains only safe characters (alphanumeric, dash, underscore)
+          if ! [[ "$KERNEL" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            echo "Error: Invalid kernel name: $KERNEL"
+            exit 1
+          fi
           ( cd "$KERNEL" && nix run -L github:huggingface/kernels#kernel-builder -- build )
       - name: Upload kernel to Hub
         if: steps.validate.outputs.skip == 'false'
@@ -58,6 +63,11 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
+          # Validate KERNEL contains only safe characters (alphanumeric, dash, underscore)
+          if ! [[ "$KERNEL" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            echo "Error: Invalid kernel name: $KERNEL"
+            exit 1
+          fi
           cd "$KERNEL"
           nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "kernels-community/$KERNEL" result
           nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/$KERNEL" result
@@ -67,6 +77,11 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
+          # Validate KERNEL contains only safe characters (alphanumeric, dash, underscore)
+          if ! [[ "$KERNEL" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            echo "Error: Invalid kernel name: $KERNEL"
+            exit 1
+          fi
           cd "$KERNEL"
 
           # Check if build.toml exists, has version = 1, and does not specify a branch.
