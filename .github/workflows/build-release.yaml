@@ -51,7 +51,7 @@ jobs:
         if: steps.validate.outputs.skip == 'false'
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
-          ( cd "$KERNEL" && nix build -L )
+          ( cd "$KERNEL" && nix run -L github:huggingface/kernels#kernel-builder -- build )
       - name: Upload kernel to Hub
         if: steps.validate.outputs.skip == 'false'
         env:
