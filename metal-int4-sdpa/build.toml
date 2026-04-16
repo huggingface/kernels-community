@@ -1,0 +1,22 @@
+[general]
+backends = ["metal"]
+name = "sdpa_int4"
+license = "Apache-2.0"
+version = 1
+
+[general.hub]
+repo-id = "kernels-community/metal-int4-sdpa"
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[kernel.sdpa_int4_metal]
+backend = "metal"
+src = [
+  "sdpa_int4_metal/sdpa_int4.mm",
+  "sdpa_int4_metal/sdpa_int4.metal",
+]
+depends = ["torch"]
