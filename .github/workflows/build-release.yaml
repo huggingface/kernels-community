@@ -42,6 +42,11 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release"); then
+            # Validate kernel name to prevent injection
+            if [[ ! "$KERNEL" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+              echo "Invalid kernel name: $KERNEL"
+              exit 1
+            fi
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
           else
@@ -59,8 +64,8 @@ jobs:
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
           cd "$KERNEL"
-          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "kernels-community/$KERNEL"
-          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/$KERNEL"
+          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "kernels-community/${KERNEL}"
+          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/${KERNEL}"
       - name: Upload v1 kernels to main
         if: steps.validate.outputs.skip == 'false'
         env:
@@ -74,7 +79,7 @@ jobs:
             VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
             BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
             if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
-              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "kernels-community/$KERNEL" --branch main
-              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/$KERNEL" --branch main
+              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "kernels-community/${KERNEL}" --branch main
+              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/${KERNEL}" --branch main
             fi
           fi
