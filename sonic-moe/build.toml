@@ -6,6 +6,7 @@ version = 1
 
 [general.hub]
 repo-id = "kernels-community/sonic-moe"
+branch = "concatenated-gate-up"
 
 [general.cuda]
 minver = "12.8"
