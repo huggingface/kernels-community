@@ -65,7 +65,6 @@ def _up_projection_forward(
     activation_type: str,
     is_glu_activation: bool,
     is_inference_mode_enabled: bool = False,
-    is_concatenated_gate_up: bool = False,
 ) -> None:
     I, H, E = w1.size()
     if is_glu_activation:
@@ -90,10 +89,10 @@ def _up_projection_forward(
 
     current_stream = cuda.CUstream(stream_id)
 
-    compile_w1_key = (E, H, I, (b1 is None), x.dtype, activation_type, is_inference_mode_enabled, is_concatenated_gate_up)
+    compile_w1_key = (E, H, I, (b1 is None), x.dtype, activation_type, is_inference_mode_enabled)
     if compile_w1_key not in _up_projection_forward.compile_cache:
         w1_module = HopperWgmma_MoE_Up_proj_Fwd(
-            E, H, I, activation_type=ActivationType(activation_type), inference_mode=is_inference_mode_enabled, is_concatenated_gate_up=is_concatenated_gate_up,
+            E, H, I, activation_type=ActivationType(activation_type), inference_mode=is_inference_mode_enabled
         )
         tensormaps = [w1_module.module.generate_tensormap(None, None, None) for _ in range(2)]
         _up_projection_forward.compile_cache[compile_w1_key] = cute.compile(
@@ -110,9 +109,9 @@ def _up_projection_forward(
             mE_permute_order,
             current_stream,
         )
-        _up_projection_forward.compile_cache[(TENSORMAP, compile_w1_key)] = tensormaps
+        _up_projection_forward.compile_cache[TENSORMAP] = tensormaps
 
-    w1_tensormaps = _up_projection_forward.compile_cache[(TENSORMAP, compile_w1_key)]
+    w1_tensormaps = _up_projection_forward.compile_cache[TENSORMAP]
     _up_projection_forward.compile_cache[compile_w1_key](
         mX,
         mW1,
@@ -169,9 +168,9 @@ def _down_projection_forward(
         _down_projection_forward.compile_cache[compile_w2_key] = cute.compile(
             w2_module, mY1, mW2, mY2, mB2, mE_offset, mX_gather, tensormaps[0], mE_permute_order, current_stream
         )
-        _down_projection_forward.compile_cache[(TENSORMAP, compile_w2_key)] = tensormaps
+        _down_projection_forward.compile_cache[TENSORMAP] = tensormaps
 
-    w2_tensormaps = _down_projection_forward.compile_cache[(TENSORMAP, compile_w2_key)]
+    w2_tensormaps = _down_projection_forward.compile_cache[TENSORMAP]
     _down_projection_forward.compile_cache[compile_w2_key](
         mY1, mW2, mY2, mB2, mE_offset, mX_gather, w2_tensormaps[0], mE_permute_order, current_stream
     )
