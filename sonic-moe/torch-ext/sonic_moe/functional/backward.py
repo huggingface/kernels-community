@@ -206,7 +206,6 @@ def _up_projection_backward_act(
     s_scatter_idx: torch.Tensor,
     is_glu_activation: bool,
     stream_id: int,
-    is_concatenated_gate_up: bool = False,
 ) -> None:
     I, H, E = w1.size()
     if is_glu_activation:
@@ -229,9 +228,9 @@ def _up_projection_backward_act(
         mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
     current_stream = cuda.CUstream(stream_id)
 
-    compile_dx_key = ("dx", E, H, I, is_glu_activation, dx_expanded.dtype, is_concatenated_gate_up)
+    compile_dx_key = ("dx", E, H, I, is_glu_activation, dx_expanded.dtype)
     if compile_dx_key not in _up_projection_backward_act.compile_cache:
-        dx_module = HopperWgmma_MoE_Up_proj_ActGrad_Bwd(E, H, I, is_glu_activation, is_concatenated_gate_up=is_concatenated_gate_up)
+        dx_module = HopperWgmma_MoE_Up_proj_ActGrad_Bwd(E, H, I, is_glu_activation)
         tensormaps = [dx_module.module.generate_tensormap(None, None, None) for _ in range(2)]
         _up_projection_backward_act.compile_cache[compile_dx_key] = cute.compile(
             dx_module,
@@ -245,9 +244,9 @@ def _up_projection_backward_act(
             mE_permute_order,
             current_stream,
         )
-        _up_projection_backward_act.compile_cache[(TENSORMAP, compile_dx_key)] = tensormaps
+        _up_projection_backward_act.compile_cache[f"dx-{TENSORMAP}"] = tensormaps
 
-    dx_tensormaps = _up_projection_backward_act.compile_cache[(TENSORMAP, compile_dx_key)]
+    dx_tensormaps = _up_projection_backward_act.compile_cache[f"dx-{TENSORMAP}"]
     _up_projection_backward_act.compile_cache[compile_dx_key](
         mDz,
         mW1_trans,
@@ -274,7 +273,6 @@ def _up_projection_backward_weight(
     x_gather_idx: torch.Tensor,
     is_glu_activation: bool,
     stream_id: int,
-    is_concatenated_gate_up: bool = False,
 ) -> None:
     I, H, E = dw1.size()
     if is_glu_activation:
@@ -295,9 +293,9 @@ def _up_projection_backward_weight(
         mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
     current_stream = cuda.CUstream(stream_id)
 
-    compile_dw1_key = ("dw1", E, H, I, is_glu_activation, x.dtype, is_concatenated_gate_up)
+    compile_dw1_key = ("dw1", E, H, I, is_glu_activation, x.dtype)
     if compile_dw1_key not in _up_projection_backward_weight.compile_cache:
-        dw1_module = HopperWgmma_MoE_Up_proj_WeightGrad_Bwd(E, H, I, is_glu_activation, is_concatenated_gate_up=is_concatenated_gate_up)
+        dw1_module = HopperWgmma_MoE_Up_proj_WeightGrad_Bwd(E, H, I, is_glu_activation)
         tensormaps = [dw1_module.module.generate_tensormap(None, None, None) for _ in range(1)]
         _up_projection_backward_weight.compile_cache[compile_dw1_key] = cute.compile(
             dw1_module,
@@ -310,9 +308,9 @@ def _up_projection_backward_weight(
             mE_permute_order,
             current_stream,
         )
-        _up_projection_backward_weight.compile_cache[(TENSORMAP, compile_dw1_key)] = tensormaps
+        _up_projection_backward_weight.compile_cache[f"dw1-{TENSORMAP}"] = tensormaps
 
-    dw1_tensormaps = _up_projection_backward_weight.compile_cache[(TENSORMAP, compile_dw1_key)]
+    dw1_tensormaps = _up_projection_backward_weight.compile_cache[f"dw1-{TENSORMAP}"]
     _up_projection_backward_weight.compile_cache[compile_dw1_key](
         mX_trans,
         mDz_trans,
@@ -408,14 +406,14 @@ def _down_projection_backward_act(
             mE_permute_order,
             current_stream,
         )
-        _down_projection_backward_act.compile_cache[(TENSORMAP, compile_dz_key)] = tensormaps
+        _down_projection_backward_act.compile_cache[f"dz-{TENSORMAP}"] = tensormaps
 
     if ds_partial is None:
         ds_partial_N = _down_projection_backward_act.compile_cache["ds_partial_N"]
         ds_partial = torch.empty(TK, ds_partial_N, dtype=torch.float32, device=topk_scores.device)
         mDS_partial = convert_torch_tensor_to_cute_tensor(ds_partial, (0, 1), 1, 4, 1, stream=stream_id)
 
-    dz_tensormaps = _down_projection_backward_act.compile_cache[(TENSORMAP, compile_dz_key)]
+    dz_tensormaps = _down_projection_backward_act.compile_cache[f"dz-{TENSORMAP}"]
     _down_projection_backward_act.compile_cache[compile_dz_key](
         mDout,
         mW2_trans,
@@ -522,9 +520,9 @@ def _down_projection_backward_weight(
             mE_permute_order,
             current_stream,
         )
-        _down_projection_backward_weight.compile_cache[(TENSORMAP, compile_dw2_key)] = tensormaps
+        _down_projection_backward_weight.compile_cache[f"dw2-{TENSORMAP}"] = tensormaps
 
-    dw2_tensormaps = _down_projection_backward_weight.compile_cache[(TENSORMAP, compile_dw2_key)]
+    dw2_tensormaps = _down_projection_backward_weight.compile_cache[f"dw2-{TENSORMAP}"]
     _down_projection_backward_weight.compile_cache[compile_dw2_key](
         mDout_trans, mY1S_trans, mDw2, mE_offset, mX_gather, dw2_tensormaps, mE_permute_order, current_stream
     )
