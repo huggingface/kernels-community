@@ -102,7 +102,7 @@ mha_fwd(
             out_padded = out_val;
         }
     } else {
-        out_padded = torch::zeros_like(q_padded);
+        out_padded = torch::empty_like(q_padded);
     }
 
     // Allocate softmax_lse output tensor: (batch_size, num_heads, seqlen_q)
@@ -429,7 +429,7 @@ mha_varlen_fwd(
     at::Tensor v_padded = maybe_pad(v);
 
     at::Tensor out_padded = out_.has_value() ? maybe_pad(out_.value())
-                                             : torch::zeros_like(q_padded);
+                                             : torch::empty_like(q_padded);
 
     const bool is_local = (window_size_left != -1) || (window_size_right != -1);
     const bool is_paged = block_table_.has_value() && block_table_->defined();

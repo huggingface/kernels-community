@@ -15,6 +15,13 @@
 #include "./collective/fmha_fwd_epilogue.hpp"
 #include "./kernel/fmha_fwd_kernel.hpp"
 
+// Fast-path (SDPA-equivalent) kernel for non-varlen / non-paged / non-local /
+// no-dropout configurations. Forked to keep binary small enough to avoid IGC
+// register spill on BMG.
+#include "./collective/fmha_fwd_mainloop_fast.hpp"
+#include "./collective/fmha_fwd_epilogue_fast.hpp"
+#include "./kernel/fmha_fwd_kernel_fast.hpp"
+
 #include "fmha_utils.hpp"
 
 using namespace cute;
@@ -143,13 +150,9 @@ struct KernelLauncher {
          lse_stride_batch},
         hw_info};
 
-    size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
-    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-
-    FMHAKernel::initialize_workspace(arguments, workspace.get());
-
+    // Workspace is always 0 for forward kernels — skip allocation
     auto params =
-        FMHAKernel::to_underlying_arguments(arguments, workspace.get());
+        FMHAKernel::to_underlying_arguments(arguments, nullptr);
 
     run(queue, params);
 
@@ -175,11 +178,8 @@ struct KernelLauncher {
         syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<256>};
     compat::experimental::launch_policy policy{
         sycl_grid, sycl_block, launch_props, kernel_props};
-    auto event =
-        compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
-            policy, queue, params);
-
-    EventManager::getInstance().addEvent(event);
+    compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
+        policy, queue, params);
   }
 };
 
@@ -220,7 +220,8 @@ struct FMHAConfig {
       bool VarLen,
       bool Paged,
       bool Causal,
-      bool Local>
+      bool Local,
+      bool Dropout = false>
   static void run(sycl::queue& queue, const fmha_fwd_args_t& args) {
     cutlass::KernelHardwareInfo hw_info;
 
@@ -257,6 +258,7 @@ struct FMHAConfig {
         Causal,
         Local,
         Paged,
+        Dropout,
         TiledMMAQK,
         TiledMMAPV,
         VTiles,
@@ -282,6 +284,162 @@ struct FMHAConfig {
     KernelLauncher<FMHAKernel, VarLen> launcher;
 
     launcher.run(queue, args, hw_info);
+  }
+
+  //
+  // Fast path: SDPA-equivalent, forked kernel. Only used when
+  //   !is_varlen && !is_paged && !is_local && p_dropout == 0.
+  //
+  template <class Scheduler, bool Causal>
+  static void run_fast(sycl::queue& queue, const fmha_fwd_args_t& args) {
+    cutlass::KernelHardwareInfo hw_info;
+
+    using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<false>;
+
+    using TiledMMAQK = typename TiledMMAHelper<
+        MMA_Atom<MMAOperation>,
+        Layout<TileShapeQK>,
+        SubgroupLayoutQK>::TiledMMA;
+    using TiledMMAPV = typename TiledMMAHelper<
+        MMA_Atom<MMAOperation>,
+        Layout<TileShapePV>,
+        SubgroupLayoutPV>::TiledMMA;
+
+    static_assert(
+        get<0>(TileShapeOutput{}) == get<0>(TileShapePV{}),
+        "Output tile and P*V tile have different sizes in Q dimension");
+    constexpr int VTiles = get<1>(TileShapeOutput{}) / get<1>(TileShapePV{});
+
+    auto make_dummy_tensor = [&](auto val, auto stride) {
+      return make_tensor(
+          make_gmem_ptr(&val),
+          make_layout(repeat<rank_v<decltype(stride)>>(1), stride));
+    };
+
+    using TensorQ = decltype(make_dummy_tensor(ElementQ{}, StrideQ{}));
+    using TensorK = decltype(make_dummy_tensor(ElementK{}, StrideK{}));
+    using TensorV = decltype(make_dummy_tensor(ElementV{}, StrideV{}));
+    using TensorO = decltype(make_dummy_tensor(ElementO{}, StrideO{}));
+
+    using MainloopDispatchPolicy = cutlass::fmha::XeFast<PipelineStages>;
+    using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloopFast<
+        MainloopDispatchPolicy,
+        Causal,
+        TiledMMAQK,
+        TiledMMAPV,
+        VTiles,
+        TensorQ,
+        TensorK,
+        TensorV,
+        GmemTiledCopyQ,
+        GmemTiledCopyK,
+        GmemTiledCopyV>;
+
+    using CollectiveEpilogue = cutlass::fmha::collective::FMHAFwdEpilogueFast<
+        CollectiveMainloop,
+        TileShapeOutput,
+        TensorO,
+        GmemTiledCopyO>;
+
+    using FMHAKernel = cutlass::fmha::kernel::XeFMHAFwdKernelFast<
+        ProblemShapeType,
+        CollectiveMainloop,
+        CollectiveEpilogue,
+        Scheduler>;
+
+    using ElementS = typename CollectiveMainloop::ElementS;
+
+    // Problem shape
+    ProblemShapeType shape;
+    shape.batch = args.batch_size;
+    shape.num_heads_q = args.num_heads_q;
+    shape.num_heads_kv = args.num_heads_k;
+    shape.head_size_qk = args.head_size;
+    shape.head_size_vo = args.head_size;
+    shape.seq_len_qo = args.max_queries;
+    shape.seq_len_kv = args.max_keys;
+
+    // Contiguous (B,S,H,D) layout strides.
+    int64_t head_size = args.head_size;
+    int64_t nh_q = args.num_heads_q;
+    int64_t nh_kv = args.num_heads_k;
+    int64_t sq = args.max_queries;
+    int64_t sk = args.max_keys;
+
+    int64_t q_row_stride = nh_q * head_size;
+    int64_t q_head_stride = head_size;
+    int64_t q_batch_stride = sq * nh_q * head_size;
+
+    int64_t k_row_stride = nh_kv * head_size;
+    int64_t k_head_stride = head_size;
+    int64_t k_batch_stride = sk * nh_kv * head_size;
+
+    int64_t v_row_stride = nh_kv * head_size;
+    int64_t v_head_stride = head_size;
+    int64_t v_batch_stride = sk * nh_kv * head_size;
+
+    int64_t o_row_stride = nh_q * head_size;
+    int64_t o_head_stride = head_size;
+    int64_t o_batch_stride = sq * nh_q * head_size;
+
+    typename FMHAKernel::Arguments arguments{
+        {shape,
+         reinterpret_cast<const ElementQ*>(args.query),
+         q_batch_stride, q_head_stride, q_row_stride,
+         reinterpret_cast<const ElementK*>(args.key),
+         k_batch_stride, k_head_stride, k_row_stride,
+         reinterpret_cast<const ElementV*>(args.value),
+         v_batch_stride, v_head_stride, v_row_stride,
+         reinterpret_cast<ElementO*>(args.out),
+         o_batch_stride, o_head_stride, o_row_stride,
+         reinterpret_cast<float*>(args.softmax_lse)},
+        {static_cast<ElementS>(args.sm_scale)},
+        {},
+        hw_info};
+
+    auto params = FMHAKernel::to_underlying_arguments(arguments, nullptr);
+
+    // Launch (same pattern as KernelLauncher::run).
+    {
+      namespace syclex = sycl::ext::oneapi::experimental;
+      namespace intelex = sycl::ext::intel::experimental;
+
+      dim3 const block = FMHAKernel::get_block_shape();
+      dim3 const grid = FMHAKernel::get_grid_shape(params);
+
+      int smem_size = FMHAKernel::SharedStorageSize;
+
+      const auto sycl_block = compat::dim3(block.x, block.y, block.z);
+      const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
+
+      compat::experimental::launch_properties launch_props{
+          syclex::work_group_scratch_size(smem_size),
+      };
+      compat::experimental::kernel_properties kernel_props{
+          syclex::sub_group_size<cute::intel::sg_size>,
+          intelex::grf_size<256>};
+      compat::experimental::launch_policy policy{
+          sycl_grid, sycl_block, launch_props, kernel_props};
+      compat::experimental::launch<cutlass::device_kernel<FMHAKernel>>(
+          policy, queue, params);
+    }
+  }
+
+  // Returns true if the current call matches the fast-path feature set.
+  static bool can_use_fast_path(const fmha_fwd_args_t& args) {
+    return !args.is_varlen && !args.is_paged && !args.is_local &&
+        args.p_dropout == 0.0f;
+  }
+
+  // Dispatch the fast path by expanding the causal boolean at compile time.
+  template <class Scheduler = cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>
+  static void
+  fast_dispatch(sycl::queue& queue, const fmha_fwd_args_t& args) {
+    if (args.is_causal) {
+      run_fast<Scheduler, true>(queue, args);
+    } else {
+      run_fast<Scheduler, false>(queue, args);
+    }
   }
 
   template <bool... Bs>
@@ -311,6 +469,17 @@ void policy_dispatch(sycl::queue& queue, CutlassType cuType, const fmha_fwd_args
         void,
         PipelineStages,
         ElemT, ElemT, ElemT, ElemT>;
+
+    // Fast path: minimal SDPA-equivalent kernel for the common case.
+    // Only considered when the caller has not statically forced varlen/paged.
+    if constexpr (
+        (IsVarLen == -1 || IsVarLen == 0) &&
+        (IsPaged == -1 || IsPaged == 0)) {
+      if (Config::can_use_fast_path(args)) {
+        return Config::fast_dispatch(queue, args);
+      }
+    }
+
     if constexpr (IsVarLen != -1 && IsPaged != -1) {
       return Config::template kernel_dispatch<IsVarLen, IsPaged>(
           queue, args, args.is_causal, args.is_local);

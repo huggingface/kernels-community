@@ -20,3 +20,12 @@ template void policy_dispatch<
     sycl::queue& queue, 
     CutlassType cuType, 
     const fmha_fwd_args_t& args);
+
+// BMG prefill fixed mode
+template void policy_dispatch<
+    prefill_policy_head192_bmg, 
+    PipelineStages_Prefill, 
+    0, 0>(
+    sycl::queue& queue, 
+    CutlassType cuType, 
+    const fmha_fwd_args_t& args);

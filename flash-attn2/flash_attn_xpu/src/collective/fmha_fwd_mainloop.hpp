@@ -60,6 +60,7 @@ template <
     bool CausalMask_,
     bool LocalMask_,
     bool PagedKV_,
+    bool HasDropout_,
     class TiledMMAQK_,  // Tiling for Q*K GEMM
     class TiledMMAPV_,  // Tiling for P*V GEMM
     int VTiles_,        // # of tiles in V dimension
@@ -82,6 +83,7 @@ template <
     bool CausalMask_,
     bool LocalMask_,
     bool PagedKV_,
+    bool HasDropout_,
     class TiledMMAQK_,
     class TiledMMAPV_,
     int VTiles_,
@@ -96,6 +98,7 @@ struct FMHAFwdMainloop<
     CausalMask_,
     LocalMask_,
     PagedKV_,
+    HasDropout_,
     TiledMMAQK_,
     TiledMMAPV_,
     VTiles_,
@@ -171,6 +174,7 @@ struct FMHAFwdMainloop<
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool LocalMask = LocalMask_;
   static constexpr bool PagedKV = PagedKV_;
+  static constexpr bool HasDropout = HasDropout_;
 
   // User-facing arguments
   struct Arguments {
@@ -193,20 +197,32 @@ struct FMHAFwdMainloop<
     int seqlen_k_rounded;
   };
 
-  // Kernel-facing parameters
-  struct Params {
-    ElementS scale;
+  // Conditional sub-structs to reduce kernel params register pressure
+  struct PagedKVFields {
     int* ptr_page_table;
     int page_size;
     int max_pages_per_seq;
     int total_seqlen_kv;
+  };
+  struct LocalMaskFields {
     int local_left, local_right;
-    // Dropout
+  };
+  struct DropoutFields {
     cutlass::fmha::Dropout dropout;
-    // S_dmask (return_softmax with dropout)
     void* s_dmask_ptr;
     int seqlen_q_rounded;
     int seqlen_k_rounded;
+  };
+  struct EmptyPaged {};
+  struct EmptyLocal {};
+  struct EmptyDropout {};
+
+  // Kernel-facing parameters
+  struct Params {
+    ElementS scale;
+    [[no_unique_address]] conditional_t<PagedKV, PagedKVFields, EmptyPaged> paged;
+    [[no_unique_address]] conditional_t<LocalMask, LocalMaskFields, EmptyLocal> local;
+    [[no_unique_address]] conditional_t<HasDropout, DropoutFields, EmptyDropout> dropout_fields;
   };
 
   // SLM data
@@ -220,22 +236,27 @@ struct FMHAFwdMainloop<
 
   FMHAFwdMainloop(Params const& params_, SharedStorage&) : params(params_) {}
 
-  static constexpr Params
+  static Params
   to_underlying_arguments(Arguments const& args, void* /* workspace */) {
     constexpr double kLog2e = 1.4426950408889634074;  // log_2(e)
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
-    return Params{
-        val,
-        args.ptr_page_table,
-        args.page_size,
-        args.max_pages_per_seq,
-        args.total_seqlen_kv,
-        args.local_left,
-        args.local_right,
-        cutlass::fmha::Dropout(args.philox_seed, args.philox_offset, args.p_dropout),
-        args.s_dmask_ptr,
-        args.seqlen_q_rounded,
-        args.seqlen_k_rounded};
+    Params p{};
+    p.scale = val;
+    if constexpr (PagedKV) {
+      p.paged = {args.ptr_page_table, args.page_size,
+                 args.max_pages_per_seq, args.total_seqlen_kv};
+    }
+    if constexpr (LocalMask) {
+      p.local = {args.local_left, args.local_right};
+    }
+    if constexpr (HasDropout) {
+      p.dropout_fields = {
+          cutlass::fmha::Dropout(args.philox_seed, args.philox_offset, args.p_dropout),
+          args.s_dmask_ptr,
+          args.seqlen_q_rounded,
+          args.seqlen_k_rounded};
+    }
+    return p;
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -346,13 +367,15 @@ struct FMHAFwdMainloop<
                    (thr_id / intel::sg_size) * sg_tile_q;
 
     // PagedKV
-    int tiles_per_page = params.page_size / get<1>(TileShapeQK{});
-    int page_idx, next_page_idx = blk_k0;
-    int b_offset = idx_b * params.max_pages_per_seq;
+    int tiles_per_page = 0;
+    int page_idx = 0, next_page_idx = blk_k0;
+    int b_offset = 0;
     if constexpr (PagedKV) {
-      int page_local_idx = blk_k0 * get<1>(TileShapeQK{}) / params.page_size;
+      tiles_per_page = params.paged.page_size / get<1>(TileShapeQK{});
+      b_offset = idx_b * params.paged.max_pages_per_seq;
+      int page_local_idx = blk_k0 * get<1>(TileShapeQK{}) / params.paged.page_size;
       next_page_idx =
-          params.ptr_page_table[b_offset + page_local_idx] * tiles_per_page +
+          params.paged.ptr_page_table[b_offset + page_local_idx] * tiles_per_page +
           blk_k0 % tiles_per_page;
     }
 
@@ -375,7 +398,6 @@ struct FMHAFwdMainloop<
 
     /* Main loop, blocked in k. */
     for (int K = blk_k0; K < blk_k1; K++) {
-      // barrier_arrive(ScopeSubgroup);
 
       bool need_causal = false;
       if constexpr (CausalMask) {
@@ -384,19 +406,17 @@ struct FMHAFwdMainloop<
 
       page_idx = next_page_idx;
       next_page_idx = K + 1;
-      // next paged_idx
       if constexpr (PagedKV) {
         int next_page_local_idx =
-            next_page_idx * get<1>(TileShapeQK{}) / params.page_size;
-        bool valid_page = next_page_local_idx < params.max_pages_per_seq;
+            next_page_idx * get<1>(TileShapeQK{}) / params.paged.page_size;
+        bool valid_page = next_page_local_idx < params.paged.max_pages_per_seq;
         if (valid_page) {
           next_page_idx =
-              params.ptr_page_table[b_offset + next_page_local_idx] *
+              params.paged.ptr_page_table[b_offset + next_page_local_idx] *
                   tiles_per_page +
               next_page_idx % tiles_per_page;
         } else {
-          // set to last page
-          next_page_idx = params.max_pages_per_seq * tiles_per_page - 1;
+          next_page_idx = params.paged.max_pages_per_seq * tiles_per_page - 1;
         }
       }
 
@@ -409,7 +429,7 @@ struct FMHAFwdMainloop<
       prefetch(prefetch_v, pVgV(_, _, _, page_idx));
 
       /* GEMM 1: S = Q * K^T */
-      clear(tSrS); /* TODO: fuse w/ initial gemm call */
+      clear(tSrS);
       CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < size<4>(tKgK); D++) {
         copy(copy_q, tQgQ(_, _, _, D), tQrQ);
@@ -463,8 +483,8 @@ struct FMHAFwdMainloop<
         for (int i = 0; i < tSrS.size(); ++i) {
           int row_idx = get<0>(cS_thread(i));
           int col_idx = get<1>(cS_thread(i)) - full_tile_offset;
-          bool left_mask = col_idx < row_idx - params.local_left;
-          bool right_mask = col_idx > row_idx + params.local_right;
+          bool left_mask = col_idx < row_idx - params.local.local_left;
+          bool right_mask = col_idx > row_idx + params.local.local_right;
           if (left_mask || right_mask) {
             tSrS(i) = ElementS(-INFINITY);
           }
@@ -473,43 +493,41 @@ struct FMHAFwdMainloop<
 
       /* Apply softmax */
       auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum);
-      
+
       /* Apply dropout to attention probabilities (P) */
-      if (params.dropout.is_enabled) {
+      if constexpr (HasDropout) {
         Tensor cPgP = make_identity_tensor(make_shape(seq_len, seq_len));
         Tensor gP = local_tile(
             cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
         auto cS_thread = thr_mma_qk.partition_C(gP);
         uint32_t batch_head = static_cast<uint32_t>(idx_b * num_heads + head_q);
 
-        if (params.s_dmask_ptr != nullptr) {
-          // return_softmax path: write post-softmax P with sign-bit encoding
+        if (params.dropout_fields.s_dmask_ptr != nullptr) {
           using ElementInput = typename TensorQ::element_type;
-          auto* s_dmask_base = reinterpret_cast<ElementInput*>(params.s_dmask_ptr);
+          auto* s_dmask_base = reinterpret_cast<ElementInput*>(params.dropout_fields.s_dmask_ptr);
           int64_t bh_offset = int64_t(idx_b * num_heads + head_q)
-              * int64_t(params.seqlen_q_rounded) * params.seqlen_k_rounded;
+              * int64_t(params.dropout_fields.seqlen_q_rounded) * params.dropout_fields.seqlen_k_rounded;
 
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < tSrS.size(); ++i) {
             int row_idx = get<0>(cS_thread(i));
             int col_idx = get<1>(cS_thread(i));
-            bool keep = params.dropout.should_keep(batch_head, row_idx, col_idx);
+            bool keep = params.dropout_fields.dropout.should_keep(batch_head, row_idx, col_idx);
             ElementInput val = static_cast<ElementInput>(tSrS(i));
-            s_dmask_base[bh_offset + int64_t(row_idx) * params.seqlen_k_rounded + col_idx] =
+            s_dmask_base[bh_offset + int64_t(row_idx) * params.dropout_fields.seqlen_k_rounded + col_idx] =
                 keep ? val : -val;
-            tSrS(i) = keep ? tSrS(i) * params.dropout.get_scale() : ElementS(0);
+            tSrS(i) = keep ? tSrS(i) * params.dropout_fields.dropout.get_scale() : ElementS(0);
           }
         } else {
-          // Fast path: dropout only, no S_dmask write
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < tSrS.size(); ++i) {
             int row_idx = get<0>(cS_thread(i));
             int col_idx = get<1>(cS_thread(i));
-            tSrS(i) = params.dropout.apply(tSrS(i), batch_head, row_idx, col_idx);
+            tSrS(i) = params.dropout_fields.dropout.apply(tSrS(i), batch_head, row_idx, col_idx);
           }
         }
       }
-      
+
       reorder(tSrS, tArP);
 
       /* GEMM 2: A += P * V, split in v dimension */
@@ -530,8 +548,6 @@ struct FMHAFwdMainloop<
       for (int D = 0; D < size<4>(pKgK); D++) {
         prefetch(prefetch_k, pKgK(_, _, _, next_page_idx, D));
       }
-
-      // barrier_wait(ScopeSubgroup);
     }
   }
 

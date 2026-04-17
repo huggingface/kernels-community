@@ -39,11 +39,20 @@ struct prefill_policy_head96 {
   using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
 };
 
+// PVC: original policy (high bandwidth, many EUs)
 struct prefill_policy_head128 {
   using ShapeQK = Shape<_128, _64, _32>;
   using ShapePV = Shape<_128, _32, _64>;
   using ShapeOut = Shape<_128, _128>;
   using SubgroupLayoutQK = Layout<Shape<_16, _1, _1>>;
+};
+
+// BMG: match SDPA config (smaller K tile, fewer subgroups)
+struct prefill_policy_head128_bmg {
+  using ShapeQK = Shape<_128, _32, _32>;
+  using ShapePV = Shape<_128, _32, _32>;
+  using ShapeOut = Shape<_128, _128>;
+  using SubgroupLayoutQK = Layout<Shape<_8, _1, _1>>;
 };
 
 struct prefill_policy_head160 {
@@ -54,6 +63,13 @@ struct prefill_policy_head160 {
 };
 
 struct prefill_policy_head192 {
+  using ShapeQK = Shape<_256, _64, _32>;
+  using ShapePV = Shape<_256, _32, _64>;
+  using ShapeOut = Shape<_256, _192>;
+  using SubgroupLayoutQK = Layout<Shape<_32, _1, _1>>;
+};
+
+struct prefill_policy_head192_bmg {
   using ShapeQK = Shape<_256, _64, _32>;
   using ShapePV = Shape<_256, _32, _64>;
   using ShapeOut = Shape<_256, _192>;

@@ -20,3 +20,21 @@ template void policy_dispatch<
     sycl::queue& queue, 
     CutlassType cuType, 
     const fmha_fwd_args_t& args);
+
+// BMG varlen + non-paged
+template void policy_dispatch<
+    prefill_policy_head192_bmg, 
+    PipelineStages_Prefill, 
+    1, 0>(
+    sycl::queue& queue, 
+    CutlassType cuType, 
+    const fmha_fwd_args_t& args);
+
+// BMG varlen + paged
+template void policy_dispatch<
+    prefill_policy_head192_bmg, 
+    PipelineStages_Prefill, 
+    1, 1>(
+    sycl::queue& queue, 
+    CutlassType cuType, 
+    const fmha_fwd_args_t& args);

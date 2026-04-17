@@ -245,24 +245,27 @@ class XeFMHAFwdKernel {
           cute::min(seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
 
       // calc sg level seq_len_kv
-      int seq_len =
-          CausalMask
-              ? LocalMask
-                    ? cute::min(
-                          seq_len_kv,
-                          full_tile_offset + seq_coord + q_sg_tile +
-                              params.mainloop.local_right)
-                    : cute::min(
-                          seq_len_kv, full_tile_offset + seq_coord + q_sg_tile)
-              : seq_len_kv;
+      int seq_len;
+      if constexpr (CausalMask && LocalMask) {
+        seq_len = cute::min(
+            seq_len_kv,
+            full_tile_offset + seq_coord + q_sg_tile +
+                params.mainloop.local.local_right);
+      } else if constexpr (CausalMask) {
+        seq_len = cute::min(
+            seq_len_kv, full_tile_offset + seq_coord + q_sg_tile);
+      } else {
+        seq_len = seq_len_kv;
+      }
       if (seq_len < 0) seq_len = 0;
-      const int k_block0 =
-          LocalMask
-              ? cute::max(
-                    seq_coord + full_tile_offset - params.mainloop.local_left,
-                    0) /
-                    get<1>(TileShapeQK{})
-              : 0;
+      int k_block0;
+      if constexpr (LocalMask) {
+        k_block0 = cute::max(
+            seq_coord + full_tile_offset - params.mainloop.local.local_left,
+            0) / get<1>(TileShapeQK{});
+      } else {
+        k_block0 = 0;
+      }
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
       const int k_blocks_causal =
           CausalMask ? (seq_coord + full_tile_offset) / get<1>(TileShapeQK{})
@@ -284,8 +287,12 @@ class XeFMHAFwdKernel {
       }
 
       auto batch_dim = is_var_len ? 1 : s.batch;
-      auto total_seqlen_kv =
-          PagedKV ? params.mainloop.total_seqlen_kv : seq_len_kv;
+      int total_seqlen_kv;
+      if constexpr (PagedKV) {
+        total_seqlen_kv = params.mainloop.paged.total_seqlen_kv;
+      } else {
+        total_seqlen_kv = seq_len_kv;
+      }
       auto shape_Q =
           make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
       auto shape_K = make_shape(
