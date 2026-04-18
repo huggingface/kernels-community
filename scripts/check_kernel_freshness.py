@@ -254,7 +254,7 @@ def _format_freshness_report(results: list[dict], skipped_kernels: list[str]) ->
 
     items = []
     for result in sorted_results:
-        items.append(f"• {result['source_url']}: upstream is {result['days_behind']} days newer")
+        items.append(f"• `{result['kernel_dir']}` ({result['source_url']}): upstream is {result['days_behind']} days newer")
 
     report = f"{heading}\n\n" + "\n".join(items)
 
