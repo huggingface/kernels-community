@@ -643,7 +643,26 @@ def main():
     dispatches = []
     failed = []
 
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
     for kernel_name in kernels:
+        kernel_path = os.path.join(repo_root, kernel_name)
+        if not os.path.isdir(kernel_path) or not os.path.isfile(os.path.join(kernel_path, "build.toml")):
+            try_send_issue_comment(
+                api_base,
+                token,
+                issue_number,
+                format_result_comment(
+                    command_summary,
+                    mode_text,
+                    target_branch,
+                    pr_head_sha,
+                    failure_message=f"Kernel `{kernel_name}` was not found in this repository. Check the spelling and try again.",
+                ),
+                comment_id=status_comment_id,
+            )
+            return 0
+
         dispatch_key = make_dispatch_key(issue_number, kernel_name)
         dispatch_body = {
             "ref": default_branch,
