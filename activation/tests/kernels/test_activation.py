@@ -14,7 +14,7 @@ from .utils import opcheck
 from .allclose_default import get_default_atol, get_default_rtol
 
 DTYPES = [torch.half, torch.bfloat16, torch.float]
-NUM_TOKENS = [7, 83, 2048]  # Arbitrary values for testing
+NUM_TOKENS = [0, 7, 83, 2048]  # 0 tests the empty-batch guard path
 D = [512, 13824]  # Arbitrary values for testing
 SEEDS = [0]
 CUDA_DEVICES = [f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)]
