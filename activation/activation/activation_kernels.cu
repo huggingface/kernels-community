@@ -24,10 +24,59 @@ __global__ void act_and_mul_kernel(
     const scalar_t* __restrict__ input,  // [..., 2, d]
     const int d) {
   const int64_t token_idx = blockIdx.x;
-  for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
-    const scalar_t x = VLLM_LDG(&input[token_idx * 2 * d + idx]);
-    const scalar_t y = VLLM_LDG(&input[token_idx * 2 * d + d + idx]);
-    out[token_idx * d + idx] = compute<scalar_t, ACT_FN, act_first>(x, y);
+  // Vectorized path: load 4 fp32 values (or 8 fp16/bf16) per iteration via
+  // 128-bit reads, matching the bandwidth efficiency of the Metal backend.
+  if constexpr (sizeof(scalar_t) == 2) {
+    // fp16 / bf16: pack 8 scalars into float4 (128 bits)
+    using vec_t = float4;
+    constexpr int VEC = 8;
+    const int d_vec = d / VEC;
+    const scalar_t* in_x = input + token_idx * 2 * d;
+    const scalar_t* in_y = input + token_idx * 2 * d + d;
+    scalar_t* out_row   = out   + token_idx * d;
+    for (int64_t i = threadIdx.x; i < d_vec; i += blockDim.x) {
+      vec_t vx = reinterpret_cast<const vec_t*>(in_x)[i];
+      vec_t vy = reinterpret_cast<const vec_t*>(in_y)[i];
+      scalar_t* sx = reinterpret_cast<scalar_t*>(&vx);
+      scalar_t* sy = reinterpret_cast<scalar_t*>(&vy);
+      vec_t vout;
+      scalar_t* so = reinterpret_cast<scalar_t*>(&vout);
+      #pragma unroll
+      for (int j = 0; j < VEC; ++j)
+        so[j] = compute<scalar_t, ACT_FN, act_first>(sx[j], sy[j]);
+      reinterpret_cast<vec_t*>(out_row)[i] = vout;
+    }
+    // Scalar tail for d not divisible by VEC
+    for (int64_t idx = d_vec * VEC + threadIdx.x; idx < d; idx += blockDim.x) {
+      const scalar_t x = VLLM_LDG(&in_x[idx]);
+      const scalar_t y = VLLM_LDG(&in_y[idx]);
+      out_row[idx] = compute<scalar_t, ACT_FN, act_first>(x, y);
+    }
+  } else {
+    // fp32: pack 4 values into float4 (128 bits)
+    using vec_t = float4;
+    constexpr int VEC = 4;
+    const int d_vec = d / VEC;
+    const scalar_t* in_x = input + token_idx * 2 * d;
+    const scalar_t* in_y = input + token_idx * 2 * d + d;
+    scalar_t* out_row   = out   + token_idx * d;
+    for (int64_t i = threadIdx.x; i < d_vec; i += blockDim.x) {
+      vec_t vx = reinterpret_cast<const vec_t*>(in_x)[i];
+      vec_t vy = reinterpret_cast<const vec_t*>(in_y)[i];
+      scalar_t* sx = reinterpret_cast<scalar_t*>(&vx);
+      scalar_t* sy = reinterpret_cast<scalar_t*>(&vy);
+      vec_t vout;
+      scalar_t* so = reinterpret_cast<scalar_t*>(&vout);
+      #pragma unroll
+      for (int j = 0; j < VEC; ++j)
+        so[j] = compute<scalar_t, ACT_FN, act_first>(sx[j], sy[j]);
+      reinterpret_cast<vec_t*>(out_row)[i] = vout;
+    }
+    for (int64_t idx = d_vec * VEC + threadIdx.x; idx < d; idx += blockDim.x) {
+      const scalar_t x = VLLM_LDG(&in_x[idx]);
+      const scalar_t y = VLLM_LDG(&in_y[idx]);
+      out_row[idx] = compute<scalar_t, ACT_FN, act_first>(x, y);
+    }
   }
 }
 
