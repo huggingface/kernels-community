@@ -3,12 +3,13 @@
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * BMG-path FMHA forward outer kernel -- minimal functionality matching the
- * torch-xpu-ops SDPA flash-attention backend kernel.
+ * torch-xpu-ops SDPA flash-attention backend kernel, plus optional varlen.
  *
- *   - Non-varlen, non-paged, non-local, non-dropout.
+ *   - Non-paged, non-local, non-dropout.
  *   - Optional causal mask.
- *   - Uses contiguous int64_t strides (row_stride, head_stride, batch_stride)
- *     rather than cute::Stride types, matching SDPA.
+ *   - Optional variable-length sequences (selected via ProblemShape::SeqLenType).
+ *   - For non-varlen: contiguous int64_t strides (row_stride, head_stride,
+ *     batch_stride) rather than cute::Stride types, matching SDPA.
  *   - Optional LSE output pointer.
  **************************************************************************************************/
 
@@ -37,10 +38,8 @@ template <
 class XeFMHAFwdKernelBmg {
  public:
   using ProblemShape = ProblemShape_;
-  static_assert(
-      !cutlass::fmha::collective::is_variable_length_v<
-          typename ProblemShape::SeqLenType>,
-      "BMG path does not support variable-length sequences");
+  static constexpr bool is_var_len = cutlass::fmha::collective::
+      is_variable_length_v<typename ProblemShape::SeqLenType>;
 
   using CollectiveMainloop = CollectiveMainloop_;
   using MainloopArguments = typename CollectiveMainloop::Arguments;
@@ -101,6 +100,8 @@ class XeFMHAFwdKernelBmg {
     int64_t o_head_stride;
     int64_t o_row_stride;
     float* pLSE;
+    int lse_stride_head;
+    int lse_stride_batch;
   };
   using KernelParams = KernelArguments;
 
@@ -150,6 +151,22 @@ class XeFMHAFwdKernelBmg {
   }
 
   CUTLASS_DEVICE
+  Shape<int, int> get_sequence_length_shape(
+      ProblemShape const& problem_shape, int const& batch) {
+    if constexpr (is_var_len) {
+      return cutlass::fmha::collective::apply_variable_length(
+          Shape<
+              cutlass::fmha::collective::VariableLength,
+              cutlass::fmha::collective::VariableLength>{
+              problem_shape.seq_len_qo, problem_shape.seq_len_kv},
+          batch);
+    } else {
+      return Shape<int, int>{
+          problem_shape.seq_len_qo, problem_shape.seq_len_kv};
+    }
+  }
+
+  CUTLASS_DEVICE
   int calculate_longest_non_masked_length(
       const int& seq_len_kv, const int& seq_len_qo,
       const int& last_seq_coord, const int& first_non_masked_sequence) {
@@ -193,8 +210,8 @@ class XeFMHAFwdKernelBmg {
       auto blk_qv = make_coord(blk_q, blk_v);
       int head = head_q / head_group_q;
 
-      int seq_len_qo = s.seq_len_qo;
-      int seq_len_kv = s.seq_len_kv;
+      auto sequence_length_shape = get_sequence_length_shape(s, idx_b);
+      auto [seq_len_qo, seq_len_kv] = sequence_length_shape;
       if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo)
         continue;
 
@@ -214,14 +231,25 @@ class XeFMHAFwdKernelBmg {
           : seq_len_kv;
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
 
+      int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
+      if constexpr (is_var_len) {
+        auto qo_cumulative = s.seq_len_qo.cumulative_length;
+        auto kv_cumulative = s.seq_len_kv.cumulative_length;
+        offset_q = s.num_heads_q  * s.head_size_qk * qo_cumulative[idx_b];
+        offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
+        offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
+        offset_o = s.num_heads_q  * s.head_size_vo * qo_cumulative[idx_b];
+      }
+
+      auto batch_dim = is_var_len ? 1 : s.batch;
       auto shape_Q =
-          make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, s.batch);
+          make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
       auto shape_K =
-          make_shape(seq_len_kv, s.head_size_qk, s.num_heads_kv, s.batch);
+          make_shape(seq_len_kv, s.head_size_qk, s.num_heads_kv, batch_dim);
       auto shape_V =
-          make_shape(s.head_size_vo, seq_len_kv, s.num_heads_kv, s.batch);
+          make_shape(s.head_size_vo, seq_len_kv, s.num_heads_kv, batch_dim);
       auto shape_O =
-          make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, s.batch);
+          make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
 
       auto stride_q = cutlass::make_stride(
           static_cast<int>(p.q_row_stride), Int<1>{},
@@ -240,19 +268,28 @@ class XeFMHAFwdKernelBmg {
           static_cast<int>(p.o_head_stride),
           static_cast<int>(p.o_batch_stride));
 
-      auto dcQ = const_cast<ElementQ*>(p.Q);
-      auto dcK = const_cast<ElementK*>(p.K);
-      auto dcV = const_cast<ElementV*>(p.V);
-      auto ptrO = p.O;
+      auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);
+      auto dcK = const_cast<ElementK*>(p.K + offset_k);
+      auto dcV = const_cast<ElementV*>(p.V + offset_v);
+      auto ptrO = p.O + offset_o;
 
-      Tensor Q =
-          make_tensor(make_gmem_ptr(dcQ), make_layout(shape_Q, stride_q));
-      Tensor K =
-          make_tensor(make_gmem_ptr(dcK), make_layout(shape_K, stride_k));
-      Tensor V =
-          make_tensor(make_gmem_ptr(dcV), make_layout(shape_V, stride_v));
-      Tensor O =
-          make_tensor(make_gmem_ptr(ptrO), make_layout(shape_O, stride_o));
+      auto layout_q = is_var_len
+          ? make_ordered_layout(shape_Q, Step<_2, _0, _1, _3>{})
+          : make_layout(shape_Q, stride_q);
+      auto layout_k = is_var_len
+          ? make_ordered_layout(shape_K, Step<_2, _0, _1, _3>{})
+          : make_layout(shape_K, stride_k);
+      auto layout_v = is_var_len
+          ? make_ordered_layout(shape_V, Step<_0, _2, _1, _3>{})
+          : make_layout(shape_V, stride_v);
+      auto layout_o = is_var_len
+          ? make_ordered_layout(shape_O, Step<_2, _0, _1, _3>{})
+          : make_layout(shape_O, stride_o);
+
+      Tensor Q = make_tensor(make_gmem_ptr(dcQ), layout_q);
+      Tensor K = make_tensor(make_gmem_ptr(dcK), layout_k);
+      Tensor V = make_tensor(make_gmem_ptr(dcV), layout_v);
+      Tensor O = make_tensor(make_gmem_ptr(ptrO), layout_o);
 
       FragA tArA;
       FragARow tA_max, tA_sum;
@@ -260,11 +297,12 @@ class XeFMHAFwdKernelBmg {
       int rows_of_maxima =
           get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
 
+      int l_coord = is_var_len ? 0 : idx_b;
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop(
-          Q(_, _, head_q, idx_b),
-          K(_, _, head, idx_b),
-          V(_, _, head, idx_b),
+          Q(_, _, head_q, l_coord),
+          K(_, _, head, l_coord),
+          V(_, _, head, l_coord),
           tArA,
           tA_max,
           tA_sum,
@@ -289,14 +327,15 @@ class XeFMHAFwdKernelBmg {
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
       auto metadata_for_lse = std::make_tuple(
           get<0>(TileShapePV{}),
-          s.num_heads_q,
+          p.lse_stride_head,
+          p.lse_stride_batch,
           seq_len_qo,
           idx_b,
           head_q,
           tile_row_idx,
           rows_of_maxima);
       epilogue(
-          O(_, _, head_q, idx_b),
+          O(_, _, head_q, l_coord),
           tArA,
           tA_max,
           tA_sum,

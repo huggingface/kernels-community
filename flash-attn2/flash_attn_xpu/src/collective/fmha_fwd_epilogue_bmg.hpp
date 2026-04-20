@@ -72,7 +72,7 @@ class FMHAFwdEpilogueBmg {
       QVCoord blk_qv,
       int thr_id,
       float* pLSE,
-      const std::tuple<int, int, int, int, int, int, int>& metadata_for_lse) {
+      const std::tuple<int, int, int, int, int, int, int, int>& metadata_for_lse) {
     using namespace cute;
     using ElementA_ = typename FragA::element_type;
 
@@ -103,7 +103,8 @@ class FMHAFwdEpilogueBmg {
 
     auto
         [blk_q,
-         num_heads_q,
+         lse_stride_head,
+         lse_stride_batch,
          seq_len_qo,
          batch_idx,
          q_head_idx,
@@ -111,8 +112,8 @@ class FMHAFwdEpilogueBmg {
          rows_of_maxima] = metadata_for_lse;
     int blk_q_coord = get<0>(blk_qv);
     size_t lse_offset =
-        static_cast<size_t>(batch_idx) * num_heads_q * seq_len_qo +
-        static_cast<size_t>(q_head_idx) * seq_len_qo +
+        static_cast<size_t>(batch_idx) * lse_stride_batch +
+        static_cast<size_t>(q_head_idx) * lse_stride_head +
         static_cast<size_t>(blk_q_coord) * blk_q;
     size_t seq_coord =
         static_cast<size_t>(blk_q_coord) * blk_q + tile_row_idx;

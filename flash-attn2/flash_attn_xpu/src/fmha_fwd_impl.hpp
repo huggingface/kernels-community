@@ -288,13 +288,13 @@ struct FMHAConfig {
 
   //
   // BMG path: SDPA-equivalent, forked kernel. Only used when
-  //   !is_varlen && !is_paged && !is_local && p_dropout == 0.
+  //   !is_paged && !is_local && p_dropout == 0.
   //
-  template <class Scheduler, bool Causal>
+  template <class Scheduler, bool Causal, bool VarLen>
   static void run_bmg(sycl::queue& queue, const fmha_fwd_args_t& args) {
     cutlass::KernelHardwareInfo hw_info;
 
-    using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<false>;
+    using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<VarLen>;
 
     using TiledMMAQK = typename TiledMMAHelper<
         MMA_Atom<MMAOperation>,
@@ -356,10 +356,22 @@ struct FMHAConfig {
     shape.num_heads_kv = args.num_heads_k;
     shape.head_size_qk = args.head_size;
     shape.head_size_vo = args.head_size;
-    shape.seq_len_qo = args.max_queries;
-    shape.seq_len_kv = args.max_keys;
+    if constexpr (VarLen) {
+      shape.seq_len_qo =
+          cutlass::fmha::collective::VariableLength{args.max_queries};
+      shape.seq_len_qo.cumulative_length =
+          reinterpret_cast<int*>(args.cu_seqlens_q);
+      shape.seq_len_kv =
+          cutlass::fmha::collective::VariableLength{args.max_keys};
+      shape.seq_len_kv.cumulative_length =
+          reinterpret_cast<int*>(args.cu_seqlens_k);
+    } else {
+      shape.seq_len_qo = args.max_queries;
+      shape.seq_len_kv = args.max_keys;
+    }
 
-    // Contiguous (B,S,H,D) layout strides.
+    // Contiguous (B,S,H,D) layout strides (used only for non-varlen; for
+    // varlen the kernel constructs ordered layouts and ignores them).
     int64_t head_size = args.head_size;
     int64_t nh_q = args.num_heads_q;
     int64_t nh_kv = args.num_heads_k;
@@ -382,6 +394,10 @@ struct FMHAConfig {
     int64_t o_head_stride = head_size;
     int64_t o_batch_stride = sq * nh_q * head_size;
 
+    // LSE strides: (batch, num_heads, max_queries) -- same for varlen.
+    int lse_stride_head = args.max_queries;
+    int lse_stride_batch = args.num_heads_q * lse_stride_head;
+
     typename FMHAKernel::Arguments arguments{
         {shape,
          reinterpret_cast<const ElementQ*>(args.query),
@@ -392,7 +408,9 @@ struct FMHAConfig {
          v_batch_stride, v_head_stride, v_row_stride,
          reinterpret_cast<ElementO*>(args.out),
          o_batch_stride, o_head_stride, o_row_stride,
-         reinterpret_cast<float*>(args.softmax_lse)},
+         reinterpret_cast<float*>(args.softmax_lse),
+         lse_stride_head,
+         lse_stride_batch},
         {static_cast<ElementS>(args.sm_scale)},
         {},
         hw_info};
@@ -427,18 +445,26 @@ struct FMHAConfig {
 
   // Returns true if the current call matches the BMG-path feature set.
   static bool can_use_bmg_path(const fmha_fwd_args_t& args) {
-    return !args.is_varlen && !args.is_paged && !args.is_local &&
-        args.p_dropout == 0.0f;
+    return !args.is_paged && !args.is_local && args.p_dropout == 0.0f;
   }
 
-  // Dispatch the BMG path by expanding the causal boolean at compile time.
+  // Dispatch the BMG path by expanding the (causal, varlen) booleans at
+  // compile time.
   template <class Scheduler = cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>
   static void
   bmg_dispatch(sycl::queue& queue, const fmha_fwd_args_t& args) {
-    if (args.is_causal) {
-      run_bmg<Scheduler, true>(queue, args);
+    if (args.is_varlen) {
+      if (args.is_causal) {
+        run_bmg<Scheduler, true,  true >(queue, args);
+      } else {
+        run_bmg<Scheduler, false, true >(queue, args);
+      }
     } else {
-      run_bmg<Scheduler, false>(queue, args);
+      if (args.is_causal) {
+        run_bmg<Scheduler, true,  false>(queue, args);
+      } else {
+        run_bmg<Scheduler, false, false>(queue, args);
+      }
     }
   }
 
@@ -471,10 +497,8 @@ void policy_dispatch(sycl::queue& queue, CutlassType cuType, const fmha_fwd_args
         ElemT, ElemT, ElemT, ElemT>;
 
     // BMG path: minimal SDPA-equivalent kernel for the common case.
-    // Only considered when the caller has not statically forced varlen/paged.
-    if constexpr (
-        (IsVarLen == -1 || IsVarLen == 0) &&
-        (IsPaged == -1 || IsPaged == 0)) {
+    // Supports varlen now; only excluded when caller forced paged.
+    if constexpr (IsPaged == -1 || IsPaged == 0) {
       if (Config::can_use_bmg_path(args)) {
         return Config::bmg_dispatch(queue, args);
       }
