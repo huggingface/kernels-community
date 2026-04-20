@@ -2,7 +2,7 @@
  * Copyright (C) 2025 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * "Fast" FMHA forward mainloop -- minimal functionality matching the
+ * BMG-path FMHA forward mainloop -- minimal functionality matching the
  * torch-xpu-ops SDPA flash-attention backend.  Supports:
  *   - Forward pass only
  *   - Optional causal masking
@@ -11,25 +11,20 @@
  *
  * This kernel is forked from the full FA2 mainloop in order to keep the
  * compiled binary small enough to avoid IGC register spill on BMG.
+ *
+ * Common type aliases live in fmha_fwd_common.hpp (FMHAFwdMainloopTraits).
  **************************************************************************************************/
 
 #pragma once
 
-#include "cutlass/cutlass.h"
-#include "cutlass/gemm/dispatch_policy.hpp"
-
-#include "cute/algorithm/functional.hpp"
-#include "cute/algorithm/gemm.hpp"
-#include "cute/algorithm/subgroup_algorithms.hpp"
-#include "cute/atom/mma_atom.hpp"
-#include "./fmha_fusion.hpp"
+#include "./fmha_fwd_common.hpp"
 
 namespace cutlass::fmha {
 
-// Dispatch tag for the fast path. Distinct from XeDefault to avoid
+// Dispatch tag for the BMG path. Distinct from XeDefault to avoid
 // conflicting partial specialization with the full-featured mainloop.
 template <int Stages>
-class XeFast {};
+class XeBmg {};
 
 }  // namespace cutlass::fmha
 
@@ -42,19 +37,19 @@ using namespace cute;
 template <
     class DispatchPolicy_,
     bool CausalMask_,
-    class TiledMMAQK_,  // Tiling for Q*K GEMM
-    class TiledMMAPV_,  // Tiling for P*V GEMM
-    int VTiles_,        // # of tiles in V dimension
-    class TensorQ_,     // Global Q/K/V tensors
+    class TiledMMAQK_,
+    class TiledMMAPV_,
+    int VTiles_,
+    class TensorQ_,
     class TensorK_,
     class TensorV_,
     class TiledCopyQ_ = void,
     class TiledCopyK_ = void,
     class TiledCopyV_ = void>
-struct FMHAFwdMainloopFast {
+struct FMHAFwdMainloopBmg {
   static_assert(
       cutlass::detail::dependent_false<DispatchPolicy_>,
-      "Could not find a fast mainloop specialization.");
+      "Could not find a BMG mainloop specialization.");
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -71,8 +66,8 @@ template <
     class TiledCopyQ_,
     class TiledCopyK_,
     class TiledCopyV_>
-struct FMHAFwdMainloopFast<
-    XeFast<Stages>,
+struct FMHAFwdMainloopBmg<
+    XeBmg<Stages>,
     CausalMask_,
     TiledMMAQK_,
     TiledMMAPV_,
@@ -83,57 +78,38 @@ struct FMHAFwdMainloopFast<
     TiledCopyQ_,
     TiledCopyK_,
     TiledCopyV_> {
-  //
-  // Type Aliases
-  //
-  using TiledMMAQK = TiledMMAQK_;
-  using TiledMMAPV = TiledMMAPV_;
-  using TileShapeQK = decltype(TiledMMAQK{}.tile_mnk());
-  using TileShapePV = decltype(TiledMMAPV{}.tile_mnk());
-  static constexpr int VTiles = VTiles_;
-  using SubgroupLayoutQK = decltype(TiledMMAQK{}.get_atom_layout_mnk());
-  using SGPerWG = decltype(product(
-      take<1, 4>(shape(typename TiledMMAQK::ThrLayoutVMNK{}))));
 
-  using TensorQ = TensorQ_;
-  using TensorK = TensorK_;
-  using TensorV = TensorV_;
+  // Pull in common type aliases from the shared traits.
+  using Traits = FMHAFwdMainloopTraits<
+      TiledMMAQK_, TiledMMAPV_, VTiles_,
+      TensorQ_, TensorK_, TensorV_,
+      TiledCopyQ_, TiledCopyK_, TiledCopyV_>;
 
-  using TensorQ2D =
-      decltype(TensorQ_{}(append<rank_v<TensorQ_>>(make_coord(_, _), 0)));
-  using TensorK2D =
-      decltype(TensorK_{}(append<rank_v<TensorK_>>(make_coord(_, _), 0)));
-  using TensorV2D =
-      decltype(TensorV_{}(append<rank_v<TensorV_>>(make_coord(_, _), 0)));
+  using TiledMMAQK = typename Traits::TiledMMAQK;
+  using TiledMMAPV = typename Traits::TiledMMAPV;
+  using TileShapeQK = typename Traits::TileShapeQK;
+  using TileShapePV = typename Traits::TileShapePV;
+  static constexpr int VTiles = Traits::VTiles;
+  using SubgroupLayoutQK = typename Traits::SubgroupLayoutQK;
+  using SGPerWG = typename Traits::SGPerWG;
 
-  using TiledCopyQ = conditional_t<
-      is_void_v<TiledCopyQ_>,
-      decltype(make_block_2d_copy_A(TiledMMAQK{}, TensorQ2D{})),
-      TiledCopyQ_>;
-  using TiledCopyK = conditional_t<
-      is_void_v<TiledCopyK_>,
-      decltype(make_block_2d_copy_B(TiledMMAQK{}, TensorK2D{})),
-      TiledCopyK_>;
-  using TiledCopyV = conditional_t<
-      is_void_v<TiledCopyV_>,
-      decltype(make_block_2d_copy_B(TiledMMAPV{}, TensorV2D{})),
-      TiledCopyV_>;
+  using TensorQ = typename Traits::TensorQ;
+  using TensorK = typename Traits::TensorK;
+  using TensorV = typename Traits::TensorV;
+  using TensorQ2D = typename Traits::TensorQ2D;
+  using TensorK2D = typename Traits::TensorK2D;
+  using TensorV2D = typename Traits::TensorV2D;
+  using TiledCopyQ = typename Traits::TiledCopyQ;
+  using TiledCopyK = typename Traits::TiledCopyK;
+  using TiledCopyV = typename Traits::TiledCopyV;
 
-  //
-  // Accumulator types
-  //
-  template <typename TiledMMA>
-  using FragC = decltype(TiledMMA{}.get_slice(0).partition_sg_fragment_C(
-      make_identity_tensor(select<0, 1>(TiledMMA{}.tile_mnk()))));
-
-  using FragS = FragC<TiledMMAQK>;
-  using FragSRow = decltype(reduce<1>(FragS{}, sycl::plus<void>{}));
-  using ElementS = typename TiledMMAQK::ValTypeD;
-
-  using SingleFragA = FragC<TiledMMAPV>;
-  using FragA = expand_sg_fragment_t<SingleFragA, 1, VTiles>;
-  using FragARow = decltype(reduce<1>(FragA{}, sycl::plus<void>{}));
-  using ElementA = typename TiledMMAPV::ValTypeD;
+  using FragS = typename Traits::FragS;
+  using FragSRow = typename Traits::FragSRow;
+  using ElementS = typename Traits::ElementS;
+  using SingleFragA = typename Traits::SingleFragA;
+  using FragA = typename Traits::FragA;
+  using FragARow = typename Traits::FragARow;
+  using ElementA = typename Traits::ElementA;
 
   static constexpr bool CausalMask = CausalMask_;
 
@@ -153,7 +129,7 @@ struct FMHAFwdMainloopFast<
   // Methods
   //
 
-  FMHAFwdMainloopFast(Params const& params_, SharedStorage&) : params(params_) {}
+  FMHAFwdMainloopBmg(Params const& params_, SharedStorage&) : params(params_) {}
 
   static constexpr Params to_underlying_arguments(
       Arguments const& args,
@@ -169,14 +145,14 @@ struct FMHAFwdMainloopFast<
 
   template <typename QVCoord>
   CUTLASS_DEVICE void operator()(
-      TensorQ2D const& Q_2D,  // (q,d)
-      TensorK2D const& K_2D,  // (k,d)
-      TensorV2D const& V_2D,  // (d,k)
-      FragA& tArA,            // Output accumulator (q,v)
-      FragARow& tA_max,       // Softmax row-wise max accumulator
-      FragARow& tA_sum,       // Softmax row-wise sum accumulator
-      QVCoord blk_qv,         // WG tile indices: (Q,V)
-      int blk_k0,             // K block range: [K0,K1)
+      TensorQ2D const& Q_2D,
+      TensorK2D const& K_2D,
+      TensorV2D const& V_2D,
+      FragA& tArA,
+      FragARow& tA_max,
+      FragARow& tA_sum,
+      QVCoord blk_qv,
+      int blk_k0,
       int blk_k1,
       int total_blk,
       int thr_id,
@@ -340,28 +316,9 @@ struct FMHAFwdMainloopFast<
       }
     }
 
-    get_LSE_metadata(
-        thr_id, TileShapePV{}, thr_mma_pv, rows_of_maxima, tile_row_idx);
-  }
-
-  template <class Shape, class ThrMMA>
-  CUTLASS_DEVICE void get_LSE_metadata(
-      const int& thr_id,
-      const Shape& tile_shape_PV,
-      const ThrMMA& thr_mma_pv,
-      const int& rows_of_maxima,
-      int& tile_row_idx) {
-    auto sg = compat::get_nd_item<1>().get_sub_group();
-    int lane_id = static_cast<int>(sg.get_local_linear_id());
-    auto coord_tensor = make_identity_tensor(tile_shape_PV);
-    auto thr_mma = thr_mma_pv.get_slice(thr_id);
-    auto tC_coords = thr_mma.partition_C(coord_tensor);
-
-    tile_row_idx = -1;
-    if (lane_id < rows_of_maxima) {
-      auto coord = tC_coords(lane_id);
-      tile_row_idx = get<0>(coord);
-    }
+    // Use shared get_LSE_metadata from fmha_fwd_common.hpp
+    cutlass::fmha::collective::get_LSE_metadata(
+        thr_id, TileShapePV{}, mma_pv, rows_of_maxima, tile_row_idx);
   }
 
   CUTLASS_DEVICE

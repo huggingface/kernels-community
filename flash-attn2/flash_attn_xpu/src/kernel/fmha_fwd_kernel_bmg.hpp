@@ -2,7 +2,7 @@
  * Copyright (C) 2025 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * "Fast" FMHA forward outer kernel -- minimal functionality matching the
+ * BMG-path FMHA forward outer kernel -- minimal functionality matching the
  * torch-xpu-ops SDPA flash-attention backend kernel.
  *
  *   - Non-varlen, non-paged, non-local, non-dropout.
@@ -21,8 +21,8 @@
 
 #include "cute/util/type_traits.hpp"
 #include "../collective/fmha_fusion.hpp"
-#include "../collective/fmha_fwd_mainloop_fast.hpp"
-#include "../collective/fmha_fwd_epilogue_fast.hpp"
+#include "../collective/fmha_fwd_mainloop_bmg.hpp"
+#include "../collective/fmha_fwd_epilogue_bmg.hpp"
 #include "./fmha_fwd_kernel.hpp"  // for FMHAProblemShape
 
 namespace cutlass::fmha::kernel {
@@ -34,18 +34,14 @@ template <
     class CollectiveMainloop_,
     class CollectiveEpilogue_,
     class TileScheduler_>
-class XeFMHAFwdKernelFast {
+class XeFMHAFwdKernelBmg {
  public:
-  //
-  // Type Aliases
-  //
   using ProblemShape = ProblemShape_;
   static_assert(
       !cutlass::fmha::collective::is_variable_length_v<
           typename ProblemShape::SeqLenType>,
-      "Fast path does not support variable-length sequences");
+      "BMG path does not support variable-length sequences");
 
-  // Mainloop derived types
   using CollectiveMainloop = CollectiveMainloop_;
   using MainloopArguments = typename CollectiveMainloop::Arguments;
   using MainloopParams = typename CollectiveMainloop::Params;
@@ -64,11 +60,9 @@ class XeFMHAFwdKernelFast {
   using FragA = typename CollectiveMainloop::FragA;
   using FragARow = typename CollectiveMainloop::FragARow;
 
-  // Tile scheduler derived types
   using TileScheduler = TileScheduler_;
   using TileSchedulerParams = typename TileScheduler::Params;
 
-  // Epilogue derived types
   using CollectiveEpilogue = CollectiveEpilogue_;
   using EpilogueArguments = typename CollectiveEpilogue::Arguments;
   using EpilogueParams = typename CollectiveEpilogue::Params;
@@ -88,7 +82,6 @@ class XeFMHAFwdKernelFast {
   static constexpr int SharedStorageSize =
       is_empty_v<SharedStorage> ? size_t(0) : sizeof(SharedStorage);
 
-  // Device side arguments: contiguous int64_t strides, matching SDPA.
   struct KernelArguments {
     ProblemShape shape;
     const ElementQ* Q;
@@ -107,7 +100,7 @@ class XeFMHAFwdKernelFast {
     int64_t o_batch_stride;
     int64_t o_head_stride;
     int64_t o_row_stride;
-    float* pLSE;  // May be nullptr.
+    float* pLSE;
   };
   using KernelParams = KernelArguments;
 
@@ -125,9 +118,7 @@ class XeFMHAFwdKernelFast {
     TileSchedulerParams scheduler;
   };
 
-  static Params to_underlying_arguments(
-      Arguments const& args,
-      void* workspace) {
+  static Params to_underlying_arguments(Arguments const& args, void* workspace) {
     return {
         args.kernel,
         CollectiveMainloop::to_underlying_arguments(args.mainloop, workspace),
@@ -141,15 +132,11 @@ class XeFMHAFwdKernelFast {
         CollectiveEpilogue::can_implement(args.epilogue);
   }
 
-  static int get_workspace_size(Arguments const&) {
-    return 0;
-  }
+  static int get_workspace_size(Arguments const&) { return 0; }
 
   static cutlass::Status initialize_workspace(
-      Arguments const&,
-      void* = nullptr,
-      cudaStream_t = nullptr,
-      CudaHostAdapter* = nullptr) {
+      Arguments const&, void* = nullptr,
+      cudaStream_t = nullptr, CudaHostAdapter* = nullptr) {
     return Status::kSuccess;
   }
 
@@ -164,10 +151,8 @@ class XeFMHAFwdKernelFast {
 
   CUTLASS_DEVICE
   int calculate_longest_non_masked_length(
-      const int& seq_len_kv,
-      const int& seq_len_qo,
-      const int& last_seq_coord,
-      const int& first_non_masked_sequence) {
+      const int& seq_len_kv, const int& seq_len_qo,
+      const int& last_seq_coord, const int& first_non_masked_sequence) {
     int longest_non_masked_length = 0;
     if (seq_len_kv > seq_len_qo) {
       int elements_in_first_line = seq_len_kv - (seq_len_qo - 1);

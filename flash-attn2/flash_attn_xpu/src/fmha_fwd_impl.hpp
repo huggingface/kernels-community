@@ -15,12 +15,12 @@
 #include "./collective/fmha_fwd_epilogue.hpp"
 #include "./kernel/fmha_fwd_kernel.hpp"
 
-// Fast-path (SDPA-equivalent) kernel for non-varlen / non-paged / non-local /
+// BMG-path (SDPA-equivalent) kernel for non-varlen / non-paged / non-local /
 // no-dropout configurations. Forked to keep binary small enough to avoid IGC
 // register spill on BMG.
-#include "./collective/fmha_fwd_mainloop_fast.hpp"
-#include "./collective/fmha_fwd_epilogue_fast.hpp"
-#include "./kernel/fmha_fwd_kernel_fast.hpp"
+#include "./collective/fmha_fwd_mainloop_bmg.hpp"
+#include "./collective/fmha_fwd_epilogue_bmg.hpp"
+#include "./kernel/fmha_fwd_kernel_bmg.hpp"
 
 #include "fmha_utils.hpp"
 
@@ -287,11 +287,11 @@ struct FMHAConfig {
   }
 
   //
-  // Fast path: SDPA-equivalent, forked kernel. Only used when
+  // BMG path: SDPA-equivalent, forked kernel. Only used when
   //   !is_varlen && !is_paged && !is_local && p_dropout == 0.
   //
   template <class Scheduler, bool Causal>
-  static void run_fast(sycl::queue& queue, const fmha_fwd_args_t& args) {
+  static void run_bmg(sycl::queue& queue, const fmha_fwd_args_t& args) {
     cutlass::KernelHardwareInfo hw_info;
 
     using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<false>;
@@ -321,8 +321,8 @@ struct FMHAConfig {
     using TensorV = decltype(make_dummy_tensor(ElementV{}, StrideV{}));
     using TensorO = decltype(make_dummy_tensor(ElementO{}, StrideO{}));
 
-    using MainloopDispatchPolicy = cutlass::fmha::XeFast<PipelineStages>;
-    using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloopFast<
+    using MainloopDispatchPolicy = cutlass::fmha::XeBmg<PipelineStages>;
+    using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloopBmg<
         MainloopDispatchPolicy,
         Causal,
         TiledMMAQK,
@@ -335,13 +335,13 @@ struct FMHAConfig {
         GmemTiledCopyK,
         GmemTiledCopyV>;
 
-    using CollectiveEpilogue = cutlass::fmha::collective::FMHAFwdEpilogueFast<
+    using CollectiveEpilogue = cutlass::fmha::collective::FMHAFwdEpilogueBmg<
         CollectiveMainloop,
         TileShapeOutput,
         TensorO,
         GmemTiledCopyO>;
 
-    using FMHAKernel = cutlass::fmha::kernel::XeFMHAFwdKernelFast<
+    using FMHAKernel = cutlass::fmha::kernel::XeFMHAFwdKernelBmg<
         ProblemShapeType,
         CollectiveMainloop,
         CollectiveEpilogue,
@@ -425,20 +425,20 @@ struct FMHAConfig {
     }
   }
 
-  // Returns true if the current call matches the fast-path feature set.
-  static bool can_use_fast_path(const fmha_fwd_args_t& args) {
+  // Returns true if the current call matches the BMG-path feature set.
+  static bool can_use_bmg_path(const fmha_fwd_args_t& args) {
     return !args.is_varlen && !args.is_paged && !args.is_local &&
         args.p_dropout == 0.0f;
   }
 
-  // Dispatch the fast path by expanding the causal boolean at compile time.
+  // Dispatch the BMG path by expanding the causal boolean at compile time.
   template <class Scheduler = cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>
   static void
-  fast_dispatch(sycl::queue& queue, const fmha_fwd_args_t& args) {
+  bmg_dispatch(sycl::queue& queue, const fmha_fwd_args_t& args) {
     if (args.is_causal) {
-      run_fast<Scheduler, true>(queue, args);
+      run_bmg<Scheduler, true>(queue, args);
     } else {
-      run_fast<Scheduler, false>(queue, args);
+      run_bmg<Scheduler, false>(queue, args);
     }
   }
 
@@ -470,13 +470,13 @@ void policy_dispatch(sycl::queue& queue, CutlassType cuType, const fmha_fwd_args
         PipelineStages,
         ElemT, ElemT, ElemT, ElemT>;
 
-    // Fast path: minimal SDPA-equivalent kernel for the common case.
+    // BMG path: minimal SDPA-equivalent kernel for the common case.
     // Only considered when the caller has not statically forced varlen/paged.
     if constexpr (
         (IsVarLen == -1 || IsVarLen == 0) &&
         (IsPaged == -1 || IsPaged == 0)) {
-      if (Config::can_use_fast_path(args)) {
-        return Config::fast_dispatch(queue, args);
+      if (Config::can_use_bmg_path(args)) {
+        return Config::bmg_dispatch(queue, args);
       }
     }
 

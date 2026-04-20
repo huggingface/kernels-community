@@ -39,7 +39,7 @@
 #include "cute/algorithm/gemm.hpp"
 #include "cute/algorithm/subgroup_algorithms.hpp"
 #include "cute/atom/mma_atom.hpp"
-#include "./fmha_fusion.hpp"
+#include "./fmha_fwd_common.hpp"
 #include "../philox.hpp"
 
 namespace cutlass::fmha {
@@ -108,68 +108,42 @@ struct FMHAFwdMainloop<
     TiledCopyQ_,
     TiledCopyK_,
     TiledCopyV_> {
-  //
-  // Type Aliases
-  //
-  using TiledMMAQK = TiledMMAQK_;
-  using TiledMMAPV = TiledMMAPV_;
-  using TileShapeQK = decltype(TiledMMAQK{}.tile_mnk());
-  using TileShapePV = decltype(TiledMMAPV{}.tile_mnk());
-  static constexpr int VTiles = VTiles_;
-  using SubgroupLayoutQK = decltype(TiledMMAQK{}.get_atom_layout_mnk());
-  using SGPerWG = decltype(product(
-      take<1, 4>(shape(typename TiledMMAQK::ThrLayoutVMNK{}))));
 
-  using TensorQ = TensorQ_;
-  using TensorK = TensorK_;
-  using TensorV = TensorV_;
+  // Pull in common type aliases from the shared traits.
+  using Traits = FMHAFwdMainloopTraits<
+      TiledMMAQK_, TiledMMAPV_, VTiles_,
+      TensorQ_, TensorK_, TensorV_,
+      TiledCopyQ_, TiledCopyK_, TiledCopyV_>;
 
-  using TensorQ2D =
-      decltype(TensorQ_{}(append<rank_v<TensorQ_>>(make_coord(_, _), 0)));
-  using TensorK2D =
-      decltype(TensorK_{}(append<rank_v<TensorK_>>(make_coord(_, _), 0)));
-  using TensorV2D =
-      decltype(TensorV_{}(append<rank_v<TensorV_>>(make_coord(_, _), 0)));
+  using TiledMMAQK = typename Traits::TiledMMAQK;
+  using TiledMMAPV = typename Traits::TiledMMAPV;
+  using TileShapeQK = typename Traits::TileShapeQK;
+  using TileShapePV = typename Traits::TileShapePV;
+  static constexpr int VTiles = Traits::VTiles;
+  using SubgroupLayoutQK = typename Traits::SubgroupLayoutQK;
+  using SGPerWG = typename Traits::SGPerWG;
 
-  using TiledCopyQ = conditional_t<
-      is_void_v<TiledCopyQ_>,
-      decltype(make_block_2d_copy_A(TiledMMAQK{}, TensorQ2D{})),
-      TiledCopyQ_>;
-  using TiledCopyK = conditional_t<
-      is_void_v<TiledCopyK_>,
-      decltype(make_block_2d_copy_B(TiledMMAQK{}, TensorK2D{})),
-      TiledCopyK_>;
-  using TiledCopyV = conditional_t<
-      is_void_v<TiledCopyV_>,
-      decltype(make_block_2d_copy_B(TiledMMAPV{}, TensorV2D{})),
-      TiledCopyV_>;
+  using TensorQ = typename Traits::TensorQ;
+  using TensorK = typename Traits::TensorK;
+  using TensorV = typename Traits::TensorV;
+  using TensorQ2D = typename Traits::TensorQ2D;
+  using TensorK2D = typename Traits::TensorK2D;
+  using TensorV2D = typename Traits::TensorV2D;
+  using TiledCopyQ = typename Traits::TiledCopyQ;
+  using TiledCopyK = typename Traits::TiledCopyK;
+  using TiledCopyV = typename Traits::TiledCopyV;
 
-  // TODO: static_asserts on TiledMMAPV here...
-
-  //
-  // Accumulator types
-  //
-  // FragS:    accumulator for Q*K MMA
-  // FragO:    accumulator for P*V MMAs.
-  //           Note: v mode may be split into multiple pieces
-  //             to reduce register pressure.
-  // Frag*Row types are reductions of the corresponding Frag* types
-  //   over rows.
-  //
   template <typename TiledMMA>
-  using FragC = decltype(TiledMMA{}.get_slice(0).partition_sg_fragment_C(
-      make_identity_tensor(select<0, 1>(TiledMMA{}.tile_mnk()))));
+  using FragC = typename Traits::template FragC<TiledMMA>;
 
-  using FragS = FragC<TiledMMAQK>;
-  using FragSRow = decltype(reduce<1>(FragS{}, sycl::plus<void>{}));
-  using FragSCol = decltype(reduce<0>(FragS{}, sycl::plus<void>{}));
-  using ElementS = typename TiledMMAQK::ValTypeD;
-
-  using SingleFragA = FragC<TiledMMAPV>;  // (atom val,q',v')
-  using FragA =
-      expand_sg_fragment_t<SingleFragA, 1, VTiles>;  // (atom val,q',v',VV)
-  using FragARow = decltype(reduce<1>(FragA{}, sycl::plus<void>{}));
-  using ElementA = typename TiledMMAPV::ValTypeD;
+  using FragS = typename Traits::FragS;
+  using FragSRow = typename Traits::FragSRow;
+  using FragSCol = typename Traits::FragSCol;
+  using ElementS = typename Traits::ElementS;
+  using SingleFragA = typename Traits::SingleFragA;
+  using FragA = typename Traits::FragA;
+  using FragARow = typename Traits::FragARow;
+  using ElementA = typename Traits::ElementA;
 
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool LocalMask = LocalMask_;
