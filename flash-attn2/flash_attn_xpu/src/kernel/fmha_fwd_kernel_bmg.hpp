@@ -70,6 +70,7 @@ class XeFMHAFwdKernelBmg {
   using ElementO = typename CollectiveEpilogue::TensorO::element_type;
 
   static constexpr bool CausalMask = CollectiveMainloop::CausalMask;
+  static constexpr bool LocalMask  = CollectiveMainloop::LocalMask;
 
   using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
   using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
@@ -215,21 +216,45 @@ class XeFMHAFwdKernelBmg {
       if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo)
         continue;
 
+      auto full_tile_offset = seq_len_kv - seq_len_qo;
       int seq_coord = cute::min(
           seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
-      int first_non_masked_sequence = seq_len_qo - seq_len_kv;
       int last_seq_coord = seq_coord + q_sg_tile - 1;
+      int first_non_masked_sequence = seq_len_qo - seq_len_kv;
 
-      if (CausalMask && first_non_masked_sequence > last_seq_coord) {
+      // Causal-only early-exit: skip SGs that are fully masked. With
+      // LocalMask we can't easily do this here, so let the loop body mask.
+      if (CausalMask && !LocalMask &&
+          first_non_masked_sequence > last_seq_coord) {
         continue;
       }
 
-      const int seq_len = CausalMask
-          ? calculate_longest_non_masked_length(
-                seq_len_kv, seq_len_qo, last_seq_coord,
-                first_non_masked_sequence)
-          : seq_len_kv;
+      // Per-SG effective KV length.
+      int seq_len;
+      if constexpr (CausalMask && LocalMask) {
+        seq_len = cute::min(
+            seq_len_kv,
+            full_tile_offset + seq_coord + q_sg_tile +
+                params.mainloop.local.local_right);
+      } else if constexpr (CausalMask) {
+        seq_len = calculate_longest_non_masked_length(
+            seq_len_kv, seq_len_qo, last_seq_coord,
+            first_non_masked_sequence);
+      } else {
+        seq_len = seq_len_kv;
+      }
+      if (seq_len < 0) seq_len = 0;
+
+      int k_block0;
+      if constexpr (LocalMask) {
+        k_block0 = cute::max(
+            seq_coord + full_tile_offset - params.mainloop.local.local_left,
+            0) / get<1>(TileShapeQK{});
+      } else {
+        k_block0 = 0;
+      }
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
+      const int total_blk = k_blocks - k_block0;
 
       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
       if constexpr (is_var_len) {
@@ -307,9 +332,9 @@ class XeFMHAFwdKernelBmg {
           tA_max,
           tA_sum,
           blk_qv,
-          0,
+          k_block0,
           k_blocks,
-          k_blocks,
+          total_blk,
           thr_id,
           seq_len,
           seq_len_qo,

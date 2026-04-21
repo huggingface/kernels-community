@@ -6,8 +6,9 @@
  * torch-xpu-ops SDPA flash-attention backend.  Supports:
  *   - Forward pass only
  *   - Optional causal masking
- *   - Contiguous (non-paged, non-varlen) Q/K/V
- *   - No dropout, no local (sliding-window) mask
+ *   - Optional local (sliding-window) mask
+ *   - Contiguous or variable-length Q/K/V (non-paged)
+ *   - No dropout
  *
  * This kernel is forked from the full FA2 mainloop in order to keep the
  * compiled binary small enough to avoid IGC register spill on BMG.
@@ -37,6 +38,7 @@ using namespace cute;
 template <
     class DispatchPolicy_,
     bool CausalMask_,
+    bool LocalMask_,
     class TiledMMAQK_,
     class TiledMMAPV_,
     int VTiles_,
@@ -57,6 +59,7 @@ struct FMHAFwdMainloopBmg {
 template <
     int Stages,
     bool CausalMask_,
+    bool LocalMask_,
     class TiledMMAQK_,
     class TiledMMAPV_,
     int VTiles_,
@@ -69,6 +72,7 @@ template <
 struct FMHAFwdMainloopBmg<
     XeBmg<Stages>,
     CausalMask_,
+    LocalMask_,
     TiledMMAQK_,
     TiledMMAPV_,
     VTiles_,
@@ -112,13 +116,27 @@ struct FMHAFwdMainloopBmg<
   using ElementA = typename Traits::ElementA;
 
   static constexpr bool CausalMask = CausalMask_;
+  static constexpr bool LocalMask  = LocalMask_;
 
   // User-facing arguments
   struct Arguments {
     ElementS const scale;
+    // Local Mask (sliding window). Only consumed when LocalMask is true.
+    int local_left  = 0;
+    int local_right = 0;
   };
 
-  using Params = Arguments;
+  struct LocalMaskFields {
+    int local_left, local_right;
+  };
+  struct EmptyLocal {};
+
+  // Kernel-facing parameters
+  struct Params {
+    ElementS scale;
+    [[no_unique_address]] conditional_t<LocalMask, LocalMaskFields, EmptyLocal>
+        local;
+  };
 
   // SLM data
   struct SharedStorage {};
@@ -136,7 +154,12 @@ struct FMHAFwdMainloopBmg<
       void* /* workspace */) {
     constexpr double kLog2e = 1.4426950408889634074;
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
-    return Params{val};
+    Params p{};
+    p.scale = val;
+    if constexpr (LocalMask) {
+      p.local = {args.local_left, args.local_right};
+    }
+    return p;
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
@@ -292,6 +315,21 @@ struct FMHAFwdMainloopBmg<
                 col_idx > row_idx - first_non_masked_sequence) {
               tSrS(i) = ElementS{-INFINITY};
             }
+          }
+        }
+      }
+
+      /* Local masking (sliding window) */
+      if constexpr (LocalMask) {
+        int full_tile_offset = seq_len_kv - seq_len_qo;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tSrS.size(); ++i) {
+          int row_idx = get<0>(cS_thread(i));
+          int col_idx = get<1>(cS_thread(i)) - full_tile_offset;
+          bool left_mask  = col_idx < row_idx - params.local.local_left;
+          bool right_mask = col_idx > row_idx + params.local.local_right;
+          if (left_mask || right_mask) {
+            tSrS(i) = ElementS(-INFINITY);
           }
         }
       }

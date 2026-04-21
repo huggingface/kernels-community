@@ -287,9 +287,9 @@ struct FMHAConfig {
   }
 
   //
-  // BMG path: Only used when !is_paged && !is_local && p_dropout == 0.
+  // BMG path: Only used when !is_paged && p_dropout == 0.
   //
-  template <class Scheduler, bool Causal, bool VarLen>
+  template <class Scheduler, bool Causal, bool Local, bool VarLen>
   static void run_bmg(sycl::queue& queue, const fmha_fwd_args_t& args) {
     cutlass::KernelHardwareInfo hw_info;
 
@@ -324,6 +324,7 @@ struct FMHAConfig {
     using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloopBmg<
         MainloopDispatchPolicy,
         Causal,
+        Local,
         TiledMMAQK,
         TiledMMAPV,
         VTiles,
@@ -410,7 +411,8 @@ struct FMHAConfig {
          reinterpret_cast<float*>(args.softmax_lse),
          lse_stride_head,
          lse_stride_batch},
-        {static_cast<ElementS>(args.sm_scale)},
+        {static_cast<ElementS>(args.sm_scale),
+         args.window_size_left, args.window_size_right},
         {},
         hw_info};
 
@@ -444,27 +446,27 @@ struct FMHAConfig {
 
   // Returns true if the current call matches the BMG-path feature set.
   static bool can_use_bmg_path(const fmha_fwd_args_t& args) {
-    return !args.is_paged && !args.is_local && args.p_dropout == 0.0f;
+    return !args.is_paged && args.p_dropout == 0.0f;
   }
 
-  // Dispatch the BMG path by expanding the (causal, varlen) booleans at
-  // compile time.
+  // Dispatch the BMG path by expanding the (causal, local, varlen) booleans
+  // at compile time.
   template <class Scheduler = cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>
   static void
   bmg_dispatch(sycl::queue& queue, const fmha_fwd_args_t& args) {
-    if (args.is_varlen) {
-      if (args.is_causal) {
-        run_bmg<Scheduler, true,  true >(queue, args);
-      } else {
-        run_bmg<Scheduler, false, true >(queue, args);
-      }
-    } else {
-      if (args.is_causal) {
-        run_bmg<Scheduler, true,  false>(queue, args);
-      } else {
-        run_bmg<Scheduler, false, false>(queue, args);
-      }
-    }
+#define BMG_DISPATCH_CASE(C, L, V) \
+  if (args.is_causal == C && args.is_local == L && args.is_varlen == V) { \
+    run_bmg<Scheduler, C, L, V>(queue, args); return; \
+  }
+    BMG_DISPATCH_CASE(false, false, false)
+    BMG_DISPATCH_CASE(true,  false, false)
+    BMG_DISPATCH_CASE(false, true,  false)
+    BMG_DISPATCH_CASE(true,  true,  false)
+    BMG_DISPATCH_CASE(false, false, true )
+    BMG_DISPATCH_CASE(true,  false, true )
+    BMG_DISPATCH_CASE(false, true,  true )
+    BMG_DISPATCH_CASE(true,  true,  true )
+#undef BMG_DISPATCH_CASE
   }
 
   template <bool... Bs>
