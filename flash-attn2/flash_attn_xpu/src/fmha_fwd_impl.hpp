@@ -15,7 +15,7 @@
 #include "./collective/fmha_fwd_epilogue.hpp"
 #include "./kernel/fmha_fwd_kernel.hpp"
 
-// BMG-path (SDPA-equivalent) kernel for non-varlen / non-paged / non-local /
+// BMG-path (SDPA-equivalent) kernel for non-paged / non-local /
 // no-dropout configurations. Forked to keep binary small enough to avoid IGC
 // register spill on BMG.
 #include "./collective/fmha_fwd_mainloop_bmg.hpp"
@@ -287,8 +287,7 @@ struct FMHAConfig {
   }
 
   //
-  // BMG path: SDPA-equivalent, forked kernel. Only used when
-  //   !is_paged && !is_local && p_dropout == 0.
+  // BMG path: Only used when !is_paged && !is_local && p_dropout == 0.
   //
   template <class Scheduler, bool Causal, bool VarLen>
   static void run_bmg(sycl::queue& queue, const fmha_fwd_args_t& args) {
