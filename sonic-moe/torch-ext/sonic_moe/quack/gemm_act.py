@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
-from typing import Tuple, Optional, Callable
+from __future__ import annotations
+from typing import NamedTuple, Tuple, Optional, Callable
 from functools import partial
-from dataclasses import dataclass
 
 from torch import Tensor
 
@@ -9,183 +9,85 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_og
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass import Int32, Float32, Boolean, const_expr
-from cutlass.cutlass_dsl import if_generate
-import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack
+from cutlass import Int32, Float32, const_expr
+from cutlass.cute.runtime import make_ptr
 
-from .cute_dsl_utils import ArgumentsBase, ParamsBase
-from .varlen_utils import VarlenManager
+from .compile_utils import make_fake_tensor as fake_tensor
+from .cute_dsl_utils import (
+    ParamsBase,
+    mlir_namedtuple,
+    get_device_capacity,
+    get_max_active_clusters,
+    torch2cute_dtype_map,
+)
+from .epi_ops import TileStore
 from .gemm_sm90 import GemmSm90
 from .gemm_sm100 import GemmSm100
+from .gemm_sm120 import GemmSm120
 from .gemm_default_epi import GemmDefaultEpiMixin
-from .cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from .gemm_wrapper_utils import GemmWrapperBase
-from . import sm90_utils as sm90_utils
-from . import copy_utils as copy_utils
-from . import activation
+from .gemm_tvm_ffi_utils import (
+    get_major,
+    perm3d_single,
+    make_scheduler_args,
+    make_varlen_args,
+    make_fake_scheduler_args,
+    make_fake_varlen_args,
+    div_for_dtype,
+    make_fake_gemm_tensors,
+    compile_gemm_kernel,
+)
+from .cache_utils import jit_cache
+from . import layout_utils as layout_utils
+from .layout_utils import permute_gated_Cregs_b16
+from .activation import act_fn_map, gate_fn_map
+from .rounding import RoundingMode
 
 
 class GemmActMixin(GemmDefaultEpiMixin):
-    num_epi_tensormaps: int = 1
+    _epi_ops = (*GemmDefaultEpiMixin._epi_ops, TileStore("mPostAct"))
+    _extra_param_fields = (("act_fn", cutlass.Constexpr, None),)
+    _epi_param_bases = (ParamsBase,)
 
-    @dataclass
-    class EpilogueArguments(ArgumentsBase):
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
         mPostAct: cute.Tensor
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
+        sr_seed: Optional[Int32 | cute.Tensor] = None
 
-    @dataclass
-    class EpilogueParams(ParamsBase):
-        tma_atom_postact: cute.CopyAtom
-        mPostAct_mnl: cute.Tensor
-        epi_postact_smem_layout_staged: cute.ComposedLayout
-        epi_tile_postact: cute.Tile
-        act_fn: cutlass.Constexpr[Optional[Callable]] = None
-        alpha: Optional[Float32 | cute.Tensor] = None
-        beta: Optional[Float32 | cute.Tensor] = None
-        mRowVecBroadcast: Optional[cute.Tensor] = None
-        mColVecBroadcast: Optional[cute.Tensor] = None
+    # EpilogueParams auto-generated from _epi_ops + _extra_param_fields
 
-    def epi_to_underlying_arguments(
-        self, args: EpilogueArguments, *, loc=None, ip=None
-    ) -> EpilogueParams:
+    def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None):
+        self.rounding_mode = args.rounding_mode
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
-
         self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
-        epi_tile_postact = self.epi_tile
-        utils_cls = sm100_utils if self.arch == 100 else sm90_utils
-        epi_postact_smem_layout_staged = utils_cls.make_smem_layout_epi(
-            self.postact_dtype, self.postact_layout, epi_tile_postact, self.epi_stage
-        )
-        tma_atom_postact, tma_tensor_postact = self._make_tma_epi_atoms_and_tensors(
-            args.mPostAct,
-            epi_postact_smem_layout_staged,
-            epi_tile_postact,
-            op_type="store",
-        )
-        # Assume all strides are divisible by 32 bits except the last stride
-        new_stride = lambda t: tuple(
-            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s
-            for s in t.stride
-        )
-        mRowVecBroadcast, mColVecBroadcast = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            if t is not None
-            else None
-            for t in (args.mRowVecBroadcast, args.mColVecBroadcast)
-        ]
-        return self.EpilogueParams(
-            tma_atom_postact,
-            tma_tensor_postact,
-            epi_postact_smem_layout_staged,
-            epi_tile_postact,
-            args.act_fn,
-            alpha=args.alpha,
-            beta=args.beta,
-            mRowVecBroadcast=mRowVecBroadcast,
-            mColVecBroadcast=mColVecBroadcast,
-        )
+        d = self._epi_ops_to_params_dict(args)
+        d["act_fn"] = args.act_fn
+        for key in ("mRowVecBroadcast", "mColVecBroadcast"):
+            if key in self.concat_layout and key in d and d[key] is not None:
+                d[key] = layout_utils.concat_to_interleave(d[key], 1)
+        return self.EpilogueParams(**d)
 
-    def epi_get_tma_atoms(
-        self, params: EpilogueParams, *, loc=None, ip=None
-    ) -> list[cute.CopyAtom]:
-        return [params.tma_atom_postact]
+    # epi_get_tma_atoms, epi_smem_bytes_per_stage, epi_get_smem_struct,
+    # epi_get_smem_tensors are all inherited from ComposableEpiMixin via _epi_ops.
 
-    def epi_get_tensormap_update_shapes_orders(
+    def epi_setup_postact(
         self,
-        params: EpilogueParams,
-        cu_seqlens_m: Optional[cute.Tensor],
-        batch_idx: Int32,
-        *,
-        loc=None,
-        ip=None,
-    ) -> tuple[list[Int32], list[int]]:
-        shapes = [cu_seqlens_m[batch_idx + 1] if cu_seqlens_m is not None else None]
-        orders = [0 if const_expr(self.postact_layout.is_m_major_c()) else 1]
-        return shapes, orders
-
-    @staticmethod
-    def epi_smem_bytes_per_stage(
-        args: EpilogueArguments, cta_tile_shape_mnk: Tuple[int, int, int], epi_tile: cute.Tile
-    ) -> int:
-        postact_dtype = args.mPostAct.element_type
-        postact_bytes_per_stage = cute.size(cute.shape(epi_tile)) * (postact_dtype.width // 8)
-        rowvec_colvec_bytes = GemmDefaultEpiMixin.epi_smem_bytes_per_stage(
-            args, cta_tile_shape_mnk, epi_tile
-        )
-        return postact_bytes_per_stage + rowvec_colvec_bytes
-
-    def epi_get_smem_struct(self, params: EpilogueParams):
-        row_vec_smem_size = 0 if params.mRowVecBroadcast is None else self.cta_tile_shape_mnk[1]
-        col_vec_smem_size = 0 if params.mColVecBroadcast is None else self.cta_tile_shape_mnk[0]
-        row_vec_dtype = (
-            params.mRowVecBroadcast.element_type if params.mRowVecBroadcast is not None else Float32
-        )
-        col_vec_dtype = (
-            params.mColVecBroadcast.element_type if params.mColVecBroadcast is not None else Float32
-        )
-
-        @cute.struct
-        class EpiSharedStorage:
-            sRowVec: cute.struct.Align[cute.struct.MemRange[row_vec_dtype, row_vec_smem_size], 16]
-            sColVec: cute.struct.Align[cute.struct.MemRange[col_vec_dtype, col_vec_smem_size], 16]
-            sPostAct: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.postact_dtype, cute.cosize(params.epi_postact_smem_layout_staged)
-                ],
-                self.buffer_align_bytes,
-            ]
-
-        return EpiSharedStorage
-
-    def epi_get_smem_tensors(self, params: EpilogueParams, storage) -> Tuple[cute.Tensor, ...]:
-        sRowVec, sColVec = super().epi_get_smem_tensors(params, storage)
-        sPostAct = storage.epi.sPostAct.get_tensor(
-            params.epi_postact_smem_layout_staged.outer,
-            swizzle=params.epi_postact_smem_layout_staged.inner,
-        )
-        return (sRowVec, sColVec, sPostAct)
-
-    @cute.jit
-    def epilogue(
-        self,
-        params: EpilogueParams,
-        epi_smem_tensors: Tuple[cute.Tensor, ...],
-        tma_desc_epi_ptrs: list[Optional[cute.Pointer]],
-        epi_pipeline: cutlass.pipeline.PipelineAsync,
-        epi_store_pipeline: cutlass.pipeline.PipelineAsync,
-        epi_read_state: cutlass.pipeline.PipelineState,
-        epi_producer_state: cutlass.pipeline.PipelineState,
-        epi_tile: cute.Tile,
-        load_acc_subtile: Callable,
-        tRS_rD: cute.Tensor,
-        tRS_rC: Optional[cute.Tensor],
-        tiled_copy_t2r: Optional[cute.TiledCopy],  # Only for Sm100
-        tiled_copy_r2s: cute.TiledCopy,
-        tRS_sD: cute.Tensor,
-        tiled_copy_s2r: Optional[cute.TiledCopy],
-        tSR_rC: Optional[cute.Tensor],
-        tSR_sC: Optional[cute.Tensor],
-        copy_D: Optional[Callable],
-        copy_C: Optional[Callable],
-        tile_coord_mnkl: cute.Coord,
-        varlen_manager: VarlenManager,
-        epilogue_barrier: cutlass.pipeline.NamedBarrier,
-        tile_scheduler,
-        tidx: Int32,
-        is_tma_warp: Boolean,
-    ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
-        has_C = const_expr(tRS_rC is not None)
-        has_D = const_expr(copy_D is not None)
-
-        tma_atom_postact = params.tma_atom_postact
-        mPostAct_mnl = params.mPostAct_mnl
-        sRowVec, sColVec, sPostAct = epi_smem_tensors
+        params,
+        epi_smem_tensors,
+        tiled_copy_r2s,
+        tiled_copy_t2r,
+        tile_coord_mnkl,
+        varlen_manager,
+        tidx,
+    ):
+        """Setup postact TMA copies and partitions before the epilogue loop."""
+        sPostAct = epi_smem_tensors[self._epi_smem_map["mPostAct"]]
         get_smem_store_op = (
             partial(sm100_utils.get_smem_store_op, tiled_tmem_load=tiled_copy_t2r)
             if self.arch == 100
@@ -194,131 +96,56 @@ class GemmActMixin(GemmDefaultEpiMixin):
         copy_atom_postact_r2s = get_smem_store_op(
             self.postact_layout, self.postact_dtype, self.acc_dtype
         )
-        # tiled_copy_C_atom = self.epilog_smem_copy_atom(tiled_mma)
-        # tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_C_atom)
         tiled_copy_postact_r2s = cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
         tRS_sPostAct = tiled_copy_postact_r2s.get_slice(tidx).partition_D(sPostAct)
-        (tma_desc_postact_ptr,) = tma_desc_epi_ptrs
         batch_idx = tile_coord_mnkl[3]
         copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
-            tma_atom_postact,
-            varlen_manager.offset_batch_epi(mPostAct_mnl, batch_idx),
+            params.tma_atom_mPostAct,
+            varlen_manager.offset_batch_epi(params.mPostAct, batch_idx),
             self.cta_tile_shape_postact_mn,
-            params.epi_tile_postact,
+            params.epi_tile_mPostAct,
             sPostAct,
             tile_coord_mnkl,
-            tma_desc_ptr=tma_desc_postact_ptr,
         )
+        return tiled_copy_postact_r2s, tRS_sPostAct, copy_postact
 
-        # We iterate over epi tiles in the N dimension first before the M dimension
-        epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
-        ).shape[1]
-        epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
-        epi_tile_num = cute.size(epi_tile_shape)
-        num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
+    @cute.jit
+    def epi_convert_postact(
+        self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+    ):
+        """Convert postact from acc_dtype to postact_dtype. Override for custom postprocessing."""
+        if const_expr(
+            self.rounding_mode == RoundingMode.RS
+            and tRS_rPostAct.element_type == cutlass.Float32
+            and self.postact_dtype == cutlass.BFloat16
+        ):
+            from .rounding import convert_f32_to_bf16_sr
+            from cutlass.cute.tensor import TensorSSA
 
-        epi_tensors = self.epi_begin(
-            params,
-            epi_smem_tensors,
-            epi_tile,
-            tiled_copy_t2r,
-            tiled_copy_r2s,
-            tile_coord_mnkl,
-            varlen_manager,
-            epilogue_barrier,
-            tidx,
-        )
-
-        if const_expr(copy_C is not None):
-            for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
-                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
-                if is_tma_warp:
-                    epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
-                    epi_pipeline.producer_commit(epi_producer_state)
-                epi_producer_state.advance()
-
-        def tma_store_fn(src_idx, dst_idx):
-            # Fence and barrier to make sure shared memory store is visible to TMA store
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
-            epilogue_barrier.arrive_and_wait()
-            # Copy from shared memory to global memory
-            if is_tma_warp:
-                if const_expr(has_D):
-                    copy_D(src_idx=src_idx, dst_idx=dst_idx)
-                copy_postact(src_idx=src_idx, dst_idx=dst_idx)
-            # Can't use if statement here, epi_store_pipeline object isn't captured somehow
-            if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_commit())
-            if_generate(is_tma_warp, lambda: epi_store_pipeline.producer_acquire())
-            epilogue_barrier.arrive_and_wait()
-
-        delay_tma_store = True
-
-        src_idx_prev, dst_idx_prev = None, None
-        for epi_idx in cutlass.range_constexpr(epi_tile_num):
-            # The global memory coordinate for the current epi tile
-            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
-            # Copy from acc to D registers
-            load_acc_subtile(tRS_rD, epi_idx)
-            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, gmem_coord)
-            if const_expr(has_C):
-                epi_pipeline.consumer_wait(epi_read_state)
-                cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC)
-                # Fence to make sure shared memory read is visible to TMA load
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            # Salt with 0x9E3779B1 to avoid sharing entropy with the D output seed
+            seed = (
+                sr_seed
+                + 0x9E3779B1
+                + (
+                    tile_coord_mnkl[0] * 65537
+                    + tile_coord_mnkl[1] * 257
+                    + tile_coord_mnkl[3] * 17
+                    + (num_prev_subtiles + epi_idx) * 7
                 )
-                cute.arch.sync_warp()
-                with cute.arch.elect_one():
-                    epi_pipeline.consumer_release(epi_read_state)
-                epi_read_state.advance()
-            if const_expr(copy_C is not None and epi_idx + self.epi_c_stage < epi_tile_num):
-                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
-                if is_tma_warp:
-                    epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
-                    epi_pipeline.producer_commit(epi_producer_state)
-                epi_producer_state.advance()
-            tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
-            epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
-            if const_expr(delay_tma_store):
-                if const_expr(epi_idx > 0):
-                    tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev)
-                src_idx_prev, dst_idx_prev = epi_buffer, gmem_coord
-            # Copy from D registers to shared memory
-            if const_expr(has_D):
-                copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
-            cute.copy(
-                tiled_copy_postact_r2s,
-                tiled_copy_postact_r2s.retile(tRS_rPostAct),
-                tRS_sPostAct[None, None, None, epi_buffer],
             )
-            if const_expr(not delay_tma_store):
-                tma_store_fn(src_idx=epi_buffer, dst_idx=gmem_coord)
-
-        if const_expr(delay_tma_store):
-            tma_store_fn(src_idx=src_idx_prev, dst_idx=dst_idx_prev)
-
-        self.epi_end(
-            params,
-            epi_tensors,
-            epi_tile,
-            tiled_copy_t2r,
-            tiled_copy_r2s,
-            tile_coord_mnkl,
-            varlen_manager,
-            tidx,
-        )
-
-        return epi_read_state, epi_producer_state
+            tRS_rPostAct_out = cute.make_rmem_tensor_like(tRS_rPostAct, self.postact_dtype)
+            src_vec = tRS_rPostAct.load()
+            raw_vec = convert_f32_to_bf16_sr(src_vec, seed, tidx)
+            tRS_rPostAct_out.store(TensorSSA(raw_vec, src_vec.shape, self.postact_dtype))
+        else:
+            tRS_rPostAct_out = cute.make_rmem_tensor_like(tRS_rPostAct, self.postact_dtype)
+            tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
+        return tRS_rPostAct_out
 
     @cute.jit
     def epi_visit_subtile(
         self,
-        params: EpilogueParams,
+        params,
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
@@ -327,7 +154,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
         # Apply activation function if provided
         # If we don't have .shape here, the compiler generates local stores and loads
         if const_expr(params.act_fn is not None):
-            tRS_rPostAct = cute.make_fragment(tRS_rD.layout.shape, self.acc_dtype)
+            tRS_rPostAct = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
             if const_expr(self.arch < 100):
                 for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
                     tRS_rPostAct[i] = params.act_fn(tRS_rD[i])
@@ -338,10 +165,7 @@ class GemmActMixin(GemmDefaultEpiMixin):
                     )
         else:
             tRS_rPostAct = tRS_rD
-        # Type conversion
-        tRS_rPostAct_out = cute.make_fragment_like(tRS_rPostAct, self.postact_dtype)
-        tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
-        return tRS_rPostAct_out
+        return tRS_rPostAct
 
 
 class GemmActSm90(GemmActMixin, GemmSm90):
@@ -352,12 +176,202 @@ class GemmActSm100(GemmActMixin, GemmSm100):
     pass
 
 
-act_fn_map = {
-    None: None,
-    "relu": activation.relu,
-    "relu_sq": activation.relu_sq,
-    "gelu_tanh_approx": activation.gelu_tanh_approx,
-}
+class GemmActSm120(GemmActMixin, GemmSm120):
+    pass
+
+
+def _gated_epi_tile_fn(gemm, epi_tile):
+    """Halve the N dimension of the epi_tile for gated postact."""
+    if isinstance(epi_tile[1], cute.Layout):
+        return (epi_tile[0], cute.recast_layout(2, 1, epi_tile[1]))
+    return (epi_tile[0], epi_tile[1] // 2)
+
+
+class GemmGatedMixin(GemmActMixin):
+    _epi_ops = (
+        *GemmDefaultEpiMixin._epi_ops,
+        TileStore("mPostAct", epi_tile_fn=_gated_epi_tile_fn),
+    )
+
+    def epi_to_underlying_arguments(
+        self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
+    ) -> GemmActMixin.EpilogueParams:
+        assert args.mPostAct.element_type.width == 16, (
+            "GemmGated only supports 16bit postact for now"
+        )
+        assert self.d_layout is None or self.d_layout.is_n_major_c()
+        assert cutlass.utils.LayoutEnum.from_tensor(args.mPostAct).is_n_major_c()
+        if self.arch == 90:
+            assert self.cta_tile_shape_mnk[1] % 32 == 0, (
+                "GemmGatedSm90 requires tileN to be divisible by 32"
+            )
+        self.rounding_mode = args.rounding_mode
+        self.postact_dtype = args.mPostAct.element_type
+        self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
+        self.cta_tile_shape_postact_mn = (
+            self.cta_tile_shape_mnk[0],
+            self.cta_tile_shape_mnk[1] // 2,
+        )
+        d = self._epi_ops_to_params_dict(args)
+        d["act_fn"] = args.act_fn
+        for key in ("mRowVecBroadcast", "mColVecBroadcast"):
+            if key in self.concat_layout and key in d and d[key] is not None:
+                d[key] = layout_utils.concat_to_interleave(d[key], 1)
+        return self.EpilogueParams(**d)
+
+    @cute.jit
+    def epi_visit_subtile(
+        self,
+        params: GemmActMixin.EpilogueParams,
+        epi_loop_tensors: Tuple[cute.Tensor, ...],
+        tRS_rD: cute.Tensor,
+        tRS_rC: Optional[cute.Tensor] = None,
+    ) -> Optional[cute.Tensor]:
+        GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
+        tRS_rPostAct_layout = cute.recast_layout(2, 1, tRS_rD.layout)
+        # If we don't have .shape here, the compiler generates local stores and loads
+        tRS_rPostAct = cute.make_rmem_tensor(tRS_rPostAct_layout.shape, self.acc_dtype)
+        if const_expr(self.arch < 100):
+            for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
+                tRS_rPostAct[i] = params.act_fn(tRS_rD[2 * i], tRS_rD[2 * i + 1])
+        else:
+            for i in cutlass.range(cute.size(tRS_rPostAct) // 2, unroll_full=True):
+                tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(
+                    (tRS_rD[4 * i], tRS_rD[4 * i + 2]), (tRS_rD[4 * i + 1], tRS_rD[4 * i + 3])
+                )
+        return tRS_rPostAct
+
+    @cute.jit
+    def epi_convert_postact(
+        self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+    ):
+        tRS_rPostAct_out = GemmActMixin.epi_convert_postact(
+            self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        )
+        if const_expr(self.arch == 90):
+            # Only need this if we're using STSM
+            permute_gated_Cregs_b16(tRS_rPostAct_out)
+        return tRS_rPostAct_out
+
+
+class GemmGatedSm90(GemmGatedMixin, GemmSm90):
+    pass
+
+
+class GemmGatedSm100(GemmGatedMixin, GemmSm100):
+    pass
+
+
+class GemmGatedSm120(GemmGatedMixin, GemmSm120):
+    pass
+
+
+@jit_cache
+def _compile_gemm_act(
+    a_dtype,
+    b_dtype,
+    d_dtype,
+    c_dtype,
+    postact_dtype,
+    a_major,
+    b_major,
+    d_major,
+    c_major,
+    postact_major,
+    tile_shape_mn,
+    cluster_shape_mnk,
+    pingpong,
+    persistent,
+    is_dynamic_persistent,
+    activation,
+    rowvec_dtype,
+    colvec_dtype,
+    colvec_ndim,
+    varlen_m,
+    gather_A,
+    concat_layout,
+    device_capacity,
+    gemm_cls_name,
+    rounding_mode=RoundingMode.RN,
+    sr_seed_mode=0,
+    use_tma_gather=False,
+):
+    sm_to_cls = {
+        "act": {9: GemmActSm90, 10: GemmActSm100, 11: GemmActSm100, 12: GemmActSm120},
+        "gated": {9: GemmGatedSm90, 10: GemmGatedSm100, 11: GemmGatedSm100, 12: GemmGatedSm120},
+    }
+    if device_capacity[0] == 12 and gemm_cls_name == "act":
+        raise NotImplementedError("SM120 non-gated activation GEMM epilogue is not yet supported")
+    GemmCls = sm_to_cls[gemm_cls_name][device_capacity[0]]
+    pa_leading = 1 if postact_major == "n" else 0
+    mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
+        a_dtype,
+        b_dtype,
+        d_dtype,
+        c_dtype,
+        a_major,
+        b_major,
+        d_major,
+        c_major,
+        varlen_m=varlen_m,
+        gather_A=gather_A,
+    )
+    pa_n = cute.sym_int() if gemm_cls_name == "gated" else n
+    div_pa = div_for_dtype(postact_dtype)
+    pa_leading_dim = 1 if gemm_cls_name == "gated" else pa_leading
+    pa_shape = (m, pa_n) if varlen_m else (m, pa_n, l)
+    mPostAct = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading_dim, divisibility=div_pa)
+
+    mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
+    if colvec_ndim == 2:
+        mColVec = fake_tensor(colvec_dtype, (l, m), leading_dim=1, divisibility=4)
+    elif colvec_ndim == 1:
+        mColVec = fake_tensor(colvec_dtype, (m,), leading_dim=0, divisibility=4)
+    else:
+        mColVec = None
+
+    act_fn = act_fn_map[activation] if gemm_cls_name == "act" else gate_fn_map[activation]
+
+    def fake_scalar(mode, dtype=Int32):
+        if mode == 0:
+            return None
+        elif mode == 1:
+            return dtype(0)
+        else:
+            return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=4)
+
+    epi_args = GemmCls.EpilogueArguments(
+        mPostAct,
+        act_fn,
+        mRowVecBroadcast=mRowVec,
+        mColVecBroadcast=mColVec,
+        rounding_mode=rounding_mode,
+        sr_seed=fake_scalar(sr_seed_mode),
+    )
+    scheduler_args = make_fake_scheduler_args(
+        (is_dynamic_persistent and device_capacity[0] == 9), False, l
+    )
+    varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
+    return compile_gemm_kernel(
+        GemmCls,
+        a_dtype,
+        tile_shape_mn,
+        cluster_shape_mnk,
+        pingpong,
+        persistent,
+        gather_A,
+        is_dynamic_persistent,
+        device_capacity,
+        mA,
+        mB,
+        mD,
+        mC,
+        epi_args,
+        scheduler_args,
+        varlen_args,
+        use_tma_gather=use_tma_gather,
+        concat_layout=concat_layout or None,
+    )
 
 
 def gemm_act(
@@ -365,7 +379,7 @@ def gemm_act(
     B: Tensor,  # (l, n, k)
     D: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
     C: Optional[Tensor],  # (l, m, n) or (total_m, n) if varlen_m
-    PostAct: Tensor,  # (l, m, n) or (total_m, n) if varlen_m
+    PostAct: Tensor,  # (l, m, n) or (total_m, n//2) if gated
     tile_count_semaphore: Optional[Tensor],  # (1,)
     activation: Optional[str],
     tile_M: int,
@@ -374,137 +388,132 @@ def gemm_act(
     cluster_N: int,
     pingpong: bool = False,
     persistent: bool = True,
+    is_dynamic_persistent: bool = False,
     max_swizzle_size: int = 8,
     rowvec_bias: Optional[Tensor] = None,  # (l, n)
     colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
+    rounding_mode: int = RoundingMode.RN,
+    sr_seed: int | Tensor = 0,
+    use_tma_gather: bool = False,
+    concat_layout: tuple | None = None,
 ) -> None:
-    if cu_seqlens_m is not None:
+    if activation in gate_fn_map:
+        gemm_cls_name = "gated"
+    else:
+        assert activation in act_fn_map, f"Unsupported activation {activation}"
+        gemm_cls_name = "act"
+
+    varlen_m = cu_seqlens_m is not None
+    gather_A = A_idx is not None
+    if varlen_m:
         assert persistent, "varlen_m requires persistent=True"
         assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
         if D is not None:
             assert D.stride(-1) == 1, "varlen_m requires D to be n-major"
         assert PostAct.stride(-1) == 1, "varlen_m requires PostAct to be n-major"
-    gather_A = A_idx is not None
     if gather_A:
-        assert cu_seqlens_m is not None, "gather_A requires varlen (cu_seqlens_m must be specified)"
+        assert cu_seqlens_m is not None, "gather_A requires varlen"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
-    assert activation in act_fn_map, f"Unsupported activation {activation}"
 
-    L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, D, C, additional_tensors={"PostAct": PostAct}, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
-    )
-    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=cu_seqlens_m is not None)
-    GemmWrapperBase.extract_dtypes(tensor_infos)
-    major_configs = {
-        "A": ("m", "k", "l"),
-        "B": ("n", "k", "l"),
-        "D": ("m", "n", "l"),
-        "C": ("m", "n", "l"),
-        "PostAct": ("m", "n", "l"),
-    }
-    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
+    A_p = perm3d_single(A, varlen_m)
+    B_p = perm3d_single(B)
+    D_p = perm3d_single(D, varlen_m)
+    C_p = perm3d_single(C, varlen_m)
+    PostAct_p = perm3d_single(PostAct, varlen_m)
+
+    a_major = get_major(A_p, "m", "k")
+    b_major = get_major(B_p, "n", "k")
+    d_major = get_major(D_p, "m", "n") if D_p is not None else None
+    c_major = get_major(C_p, "m", "n") if C_p is not None else None
+    postact_major = get_major(PostAct_p, "m", "n")
+
+    a_dtype = torch2cute_dtype_map[A.dtype]
+    b_dtype = torch2cute_dtype_map[B.dtype]
+    d_dtype = torch2cute_dtype_map[D.dtype] if D is not None else None
+    c_dtype = torch2cute_dtype_map[C.dtype] if C is not None else None
+    postact_dtype = torch2cute_dtype_map[PostAct.dtype]
+    colvec_ndim = colvec_bias.ndim if colvec_bias is not None else 0
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
-    GemmCls = GemmActSm100 if device_capacity[0] > 9 else GemmActSm90
+    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
+    if rounding_mode == RoundingMode.RS:
+        assert device_capacity[0] == 10, "Stochastic rounding (RoundingMode.RS) requires SM100"
 
-    acc_dtype = Float32
-    tile_shape_mn = (tile_M, tile_N)
-    cluster_shape_mnk = (cluster_M, cluster_N, 1)
-    if not GemmCls.is_valid_dtypes(
-        tensor_infos["A"].dtype,
-        tensor_infos["B"].dtype,
-        acc_dtype,
-        tensor_infos["D"].dtype,
-        tensor_infos["A"].major,
-        tensor_infos["B"].major,
-    ):
-        raise TypeError("Skipping due to unsupported combination of types and majors")
-
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
-    GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
-    act_fn = act_fn_map[activation]
-    epi_args = GemmCls.EpilogueArguments(
-        tensor_infos["PostAct"].cute_tensor,
-        act_fn,
-        mRowVecBroadcast=from_dlpack(rowvec_bias.detach(), assumed_align=4).mark_layout_dynamic(
-            leading_dim=1
+    if is_dynamic_persistent and device_capacity[0] == 9:
+        assert tile_count_semaphore is not None, (
+            "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
         )
-        if rowvec_bias is not None
-        else None,
-        mColVecBroadcast=from_dlpack(colvec_bias.detach(), assumed_align=4).mark_layout_dynamic(
-            leading_dim=1 if cu_seqlens_m is None else 0
-        )
-        if colvec_bias is not None
-        else None,
-    )
-    scheduler_args = GemmWrapperBase.create_scheduler_args(
-        max_active_clusters, tile_count_semaphore, max_swizzle_size=max_swizzle_size
-    )
 
-    # Create varlen arguments if needed (assumes persistent=True when varlen_m)
-    varlen_args = GemmWrapperBase.create_varlen_args(
-        cu_seqlens_m,
-        None,  # cu_seqlens_k
-        A_idx,
-        max_active_clusters,
-        cluster_shape_mnk,
-        tensor_infos,
-        GemmCls.num_epi_tensormaps,
-        pingpong,
+    sr_seed_mode = (
+        2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
     )
-
-    current_stream = cutlass_torch.current_stream()
-    compile_key = GemmWrapperBase.get_compile_key(
-        tensor_infos,
-        activation,
-        tile_shape_mn,
-        cluster_shape_mnk,
+    concat_layout = tuple(sorted(concat_layout)) if concat_layout else ()
+    compiled_fn = _compile_gemm_act(
+        a_dtype,
+        b_dtype,
+        d_dtype,
+        c_dtype,
+        postact_dtype,
+        a_major,
+        b_major,
+        d_major,
+        c_major,
+        postact_major,
+        (tile_M, tile_N),
+        (cluster_M, cluster_N, 1),
         pingpong,
         persistent,
-        tile_count_semaphore is not None,
+        is_dynamic_persistent,
+        activation,
+        torch2cute_dtype_map[rowvec_bias.dtype] if rowvec_bias is not None else None,
+        torch2cute_dtype_map[colvec_bias.dtype] if colvec_bias is not None else None,
+        colvec_ndim,
+        varlen_m,
+        gather_A,
+        concat_layout,
         device_capacity,
+        gemm_cls_name,
+        rounding_mode=rounding_mode,
+        sr_seed_mode=sr_seed_mode,
+        use_tma_gather=use_tma_gather,
+    )
+
+    from .cache_utils import COMPILE_ONLY
+
+    if COMPILE_ONLY:
+        return
+
+    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+
+    def scalar_arg(scalar, mode, dtype=Int32):
+        if mode == 0:
+            return None
+        elif mode == 1:
+            return dtype(scalar)
+        else:
+            return scalar.data_ptr()
+
+    epi_args = GemmActMixin.EpilogueArguments(
+        PostAct_p,
+        None,  # act_fn is Constexpr, pass None at call time
+        mRowVecBroadcast=rowvec_bias,
+        mColVecBroadcast=colvec_bias,
+        rounding_mode=None,  # Constexpr, pass None at call time
+        sr_seed=scalar_arg(sr_seed, sr_seed_mode),
+    )
+    scheduler_args = make_scheduler_args(
+        max_active_clusters,
         max_swizzle_size,
-        rowvec_bias.dtype if rowvec_bias is not None else None,
-        colvec_bias.dtype if colvec_bias is not None else None,
-        cu_seqlens_m is not None,
-        A_idx is not None,
-        key_tensor_names=("A", "B", "D", "PostAct", "C"),
+        tile_count_semaphore,
     )
-    cache = gemm_act.compile_cache
-    if compile_key not in cache:
-        if device_capacity[0] == 9:
-            GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
-        gemm_obj = GemmCls(
-            acc_dtype,
-            tensor_infos["A"].dtype,
-            tile_shape_mn,
-            cluster_shape_mnk,
-            gather_A=gather_A,
-        )
-        cache[compile_key] = cute.compile(
-            gemm_obj,
-            tensor_infos["A"].cute_tensor,
-            tensor_infos["B"].cute_tensor,
-            tensor_infos["D"].cute_tensor,
-            tensor_infos["C"].cute_tensor,
-            epi_args,
-            scheduler_args,
-            varlen_args,
-            current_stream,
-        )
-    cache[compile_key](
-        tensor_infos["A"].cute_tensor,
-        tensor_infos["B"].cute_tensor,
-        tensor_infos["D"].cute_tensor,
-        tensor_infos["C"].cute_tensor,
-        epi_args,
-        scheduler_args,
-        varlen_args,
-        current_stream,
-    )
+    varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
+
+    if device_capacity[0] in [10, 11]:
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, None)
+    else:
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None)
 
 
-gemm_act.compile_cache = {}
+gemm_gated = gemm_act
