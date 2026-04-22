@@ -2,24 +2,8 @@
 #include "fmha_utils.hpp"
 #include "torch/all.h"
 #include <sycl/sycl.hpp>
-#include <sycl/ext/oneapi/experimental/device_architecture.hpp>
 
 namespace {
-
-/// XPU platform type for runtime dispatch
-enum class XPUPlatform { PVC, BMG };
-
-/// Detect XPU platform at runtime
-XPUPlatform detect_xpu_platform(sycl::queue& queue) {
-  try {
-    auto arch = queue.get_device().get_info<
-        sycl::ext::oneapi::experimental::info::device::architecture>();
-    if (arch == sycl::ext::oneapi::experimental::architecture::intel_gpu_bmg_g21)
-      return XPUPlatform::BMG;
-  } catch (...) {}
-  int cus = queue.get_device().get_info<sycl::info::device::max_compute_units>();
-  return (cus >= 256) ? XPUPlatform::PVC : XPUPlatform::BMG;
-}
 
 /// Round `x` up to the nearest multiple of `m` (plain version, no 224→256 special case).
 constexpr int round_up(int x, int m) {
@@ -45,19 +29,9 @@ void dispatch_fwd_varlen_by_head(sycl::queue& queue, CutlassType cuType,
   if      (head_size <=  32) dispatch_varlen_paged<prefill_policy_head32,  PipelineStages_Prefill>(queue, cuType, args);
   else if (head_size <=  64) dispatch_varlen_paged<prefill_policy_head64,  PipelineStages_Prefill>(queue, cuType, args);
   else if (head_size <=  96) dispatch_varlen_paged<prefill_policy_head96,  PipelineStages_Prefill>(queue, cuType, args);
-  else if (head_size <= 128) {
-    if (detect_xpu_platform(queue) == XPUPlatform::BMG)
-      dispatch_varlen_paged<prefill_policy_head128_bmg, PipelineStages_Prefill>(queue, cuType, args);
-    else
-      dispatch_varlen_paged<prefill_policy_head128, PipelineStages_Prefill>(queue, cuType, args);
-  }
+  else if (head_size <= 128) dispatch_varlen_paged<prefill_policy_head128, PipelineStages_Prefill>(queue, cuType, args);
   else if (head_size <= 160) dispatch_varlen_paged<prefill_policy_head160, PipelineStages_Prefill>(queue, cuType, args);
-  else if (head_size <= 192) {
-    if (detect_xpu_platform(queue) == XPUPlatform::BMG)
-      dispatch_varlen_paged<prefill_policy_head192_bmg, PipelineStages_Prefill>(queue, cuType, args);
-    else
-      dispatch_varlen_paged<prefill_policy_head192, PipelineStages_Prefill>(queue, cuType, args);
-  }
+  else if (head_size <= 192) dispatch_varlen_paged<prefill_policy_head192, PipelineStages_Prefill>(queue, cuType, args);
   else if (head_size <= 256) dispatch_varlen_paged<prefill_policy_head256, PipelineStages_Prefill>(queue, cuType, args);
   else if (head_size == 512) dispatch_varlen_paged<prefill_policy_head512, PipelineStages_Prefill>(queue, cuType, args);
   else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");
@@ -83,19 +57,9 @@ void dispatch_fwd_prefill_by_head(sycl::queue& queue, CutlassType cuType,
   if      (head_size <=  32) policy_dispatch<prefill_policy_head32,  PipelineStages_Prefill, 0, 0>(queue, cuType, args);
   else if (head_size <=  64) policy_dispatch<prefill_policy_head64,  PipelineStages_Prefill, 0, 0>(queue, cuType, args);
   else if (head_size <=  96) policy_dispatch<prefill_policy_head96,  PipelineStages_Prefill, 0, 0>(queue, cuType, args);
-  else if (head_size <= 128) {
-    if (detect_xpu_platform(queue) == XPUPlatform::BMG)
-      policy_dispatch<prefill_policy_head128_bmg, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
-    else
-      policy_dispatch<prefill_policy_head128, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
-  }
+  else if (head_size <= 128) policy_dispatch<prefill_policy_head128, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
   else if (head_size <= 160) policy_dispatch<prefill_policy_head160, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
-  else if (head_size <= 192) {
-    if (detect_xpu_platform(queue) == XPUPlatform::BMG)
-      policy_dispatch<prefill_policy_head192_bmg, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
-    else
-      policy_dispatch<prefill_policy_head192, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
-  }
+  else if (head_size <= 192) policy_dispatch<prefill_policy_head192, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
   else if (head_size <= 256) policy_dispatch<prefill_policy_head256, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
   else if (head_size == 512) policy_dispatch<prefill_policy_head512, PipelineStages_Prefill, 0, 0>(queue, cuType, args);
   else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");

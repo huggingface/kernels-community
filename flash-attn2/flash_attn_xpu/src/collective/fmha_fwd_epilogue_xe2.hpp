@@ -2,11 +2,8 @@
  * Copyright (C) 2025 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * BMG-path FMHA forward epilogue -- minimal functionality matching the
- * torch-xpu-ops SDPA flash-attention backend epilogue.
- *
- * Common type aliases and the ReduceK>1 reduce body live in
- * fmha_fwd_common.hpp (FMHAFwdEpilogueTraits).
+ * Xe2 (BMG / Arc Pro B60) FMHA forward epilogue. Common type aliases and the
+ * ReduceK>1 reduce body live in fmha_fwd_common.hpp (FMHAFwdEpilogueTraits).
  **************************************************************************************************/
 
 #pragma once
@@ -23,7 +20,7 @@ template <
     class TileShapeO_,
     class TensorO_,
     class TiledCopyO_ = void>
-class FMHAFwdEpilogueBmg {
+class FMHAFwdEpilogueXe2 {
  public:
   using ETraits = FMHAFwdEpilogueTraits<
       CollectiveMainloop, TileShapeO_, TensorO_, TiledCopyO_>;
@@ -61,7 +58,7 @@ class FMHAFwdEpilogueBmg {
   }
 
   CUTLASS_HOST_DEVICE
-  FMHAFwdEpilogueBmg(Params const&, SharedStorage& shared_) : shared(shared_) {}
+  FMHAFwdEpilogueXe2(Params const&, SharedStorage& shared_) : shared(shared_) {}
 
   template <typename QVCoord>
   CUTLASS_DEVICE void operator()(
@@ -142,7 +139,7 @@ class FMHAFwdEpilogueBmg {
     } else {
       auto [rA, rA_sum, rA_max, active] =
           ETraits::reduce_A_multi_k(tArA, tA_max, tA_sum, thr_id, shared);
-      // BMG epilogue doesn't need rA_max; drop it.
+      // Xe2 epilogue doesn't need rA_max; drop it.
       return std::make_tuple(rA, rA_sum, active);
     }
   }

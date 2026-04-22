@@ -2,11 +2,8 @@
  * Copyright (C) 2025 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Common type traits and device functions shared between the full FA2
- * mainloop/epilogue and the BMG (minimal) mainloop/epilogue.
- *
- * Extracting these avoids code duplication and ensures both paths stay
- * in sync for the parts that are algorithmically identical.
+ * Common type traits and device functions shared by the Xe2
+ * mainloop/epilogue.
  **************************************************************************************************/
 
 #pragma once
@@ -28,7 +25,7 @@ using namespace cute;
 /////////////////////////////////////////////////////////////////////////////////////////////////
 //
 // FMHAFwdMainloopTraits: common type aliases derived from TiledMMA / VTiles.
-// Used by both FMHAFwdMainloop (full) and FMHAFwdMainloopBmg (BMG path).
+// Used by FMHAFwdMainloopXe2 (Xe2 / BMG path).
 //
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -121,8 +118,20 @@ CUTLASS_DEVICE void get_LSE_metadata(
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 //
+// get_sg_layout_pv: derive the PV subgroup layout from the QK one.
+//
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename SGLayoutQK>
+CUTLASS_HOST_DEVICE constexpr auto get_sg_layout_pv(SGLayoutQK const&) {
+  return make_layout(
+      get<0>(SGLayoutQK{}), Layout<_1, _0>{}, get<1>(SGLayoutQK{}));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+//
 // FMHAFwdEpilogueTraits: common type aliases and the ReduceK>1 reduce_A
-// body shared between FMHAFwdEpilogue and FMHAFwdEpilogueBmg.
+// body used by FMHAFwdEpilogueXe2.
 //
 /////////////////////////////////////////////////////////////////////////////////////////////////
 

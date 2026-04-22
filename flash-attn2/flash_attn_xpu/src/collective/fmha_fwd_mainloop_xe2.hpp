@@ -2,16 +2,17 @@
  * Copyright (C) 2025 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * BMG-path FMHA forward mainloop -- minimal functionality matching the
- * torch-xpu-ops SDPA flash-attention backend.  Supports:
+ * Xe2 (BMG / Arc Pro B60) FMHA forward mainloop. Supports the full FA2
+ * feature set:
  *   - Forward pass only
  *   - Optional causal masking
  *   - Optional local (sliding-window) mask
  *   - Optional dropout
- *   - Contiguous or variable-length Q/K/V (non-paged)
+ *   - Optional paged KV cache
+ *   - Contiguous or variable-length Q/K/V
  *
- * This kernel is forked from the full FA2 mainloop in order to keep the
- * compiled binary small enough to avoid IGC register spill on BMG.
+ * Forked from the original PVC mainloop in order to keep the compiled binary
+ * small enough to avoid IGC register spill on BMG.
  *
  * Common type aliases live in fmha_fwd_common.hpp (FMHAFwdMainloopTraits).
  **************************************************************************************************/
@@ -23,10 +24,9 @@
 
 namespace cutlass::fmha {
 
-// Dispatch tag for the BMG path. Distinct from XeDefault to avoid
-// conflicting partial specialization with the full-featured mainloop.
+// Dispatch tag for the Xe2 path (BMG / Arc Pro B60).
 template <int Stages>
-class XeBmg {};
+class Xe2 {};
 
 }  // namespace cutlass::fmha
 
@@ -41,6 +41,7 @@ template <
     bool CausalMask_,
     bool LocalMask_,
     bool HasDropout_,
+    bool PagedKV_,
     class TiledMMAQK_,
     class TiledMMAPV_,
     int VTiles_,
@@ -50,10 +51,10 @@ template <
     class TiledCopyQ_ = void,
     class TiledCopyK_ = void,
     class TiledCopyV_ = void>
-struct FMHAFwdMainloopBmg {
+struct FMHAFwdMainloopXe2 {
   static_assert(
       cutlass::detail::dependent_false<DispatchPolicy_>,
-      "Could not find a BMG mainloop specialization.");
+      "Could not find an Xe2 mainloop specialization.");
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -63,6 +64,7 @@ template <
     bool CausalMask_,
     bool LocalMask_,
     bool HasDropout_,
+    bool PagedKV_,
     class TiledMMAQK_,
     class TiledMMAPV_,
     int VTiles_,
@@ -72,11 +74,12 @@ template <
     class TiledCopyQ_,
     class TiledCopyK_,
     class TiledCopyV_>
-struct FMHAFwdMainloopBmg<
-    XeBmg<Stages>,
+struct FMHAFwdMainloopXe2<
+    Xe2<Stages>,
     CausalMask_,
     LocalMask_,
     HasDropout_,
+    PagedKV_,
     TiledMMAQK_,
     TiledMMAPV_,
     VTiles_,
@@ -122,6 +125,7 @@ struct FMHAFwdMainloopBmg<
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool LocalMask  = LocalMask_;
   static constexpr bool HasDropout = HasDropout_;
+  static constexpr bool PagedKV   = PagedKV_;
 
   // User-facing arguments
   struct Arguments {
@@ -136,6 +140,11 @@ struct FMHAFwdMainloopBmg<
     void* s_dmask_ptr = nullptr;
     int seqlen_q_rounded = 0;
     int seqlen_k_rounded = 0;
+    // Paged KV. Only consumed when PagedKV is true.
+    int* ptr_page_table = nullptr;
+    int page_size = 0;
+    int max_pages_per_seq = 0;
+    int total_seqlen_kv = 0;
   };
 
   struct LocalMaskFields {
@@ -151,6 +160,14 @@ struct FMHAFwdMainloopBmg<
   };
   struct EmptyDropout {};
 
+  struct PagedKVFields {
+    int* ptr_page_table;
+    int page_size;
+    int max_pages_per_seq;
+    int total_seqlen_kv;
+  };
+  struct EmptyPaged {};
+
   // Kernel-facing parameters
   struct Params {
     ElementS scale;
@@ -158,6 +175,8 @@ struct FMHAFwdMainloopBmg<
         local;
     [[no_unique_address]] conditional_t<HasDropout, DropoutFields, EmptyDropout>
         dropout_fields;
+    [[no_unique_address]] conditional_t<PagedKV, PagedKVFields, EmptyPaged>
+        paged;
   };
 
   // SLM data
@@ -169,7 +188,7 @@ struct FMHAFwdMainloopBmg<
   // Methods
   //
 
-  FMHAFwdMainloopBmg(Params const& params_, SharedStorage&) : params(params_) {}
+  FMHAFwdMainloopXe2(Params const& params_, SharedStorage&) : params(params_) {}
 
   static constexpr Params to_underlying_arguments(
       Arguments const& args,
@@ -188,6 +207,10 @@ struct FMHAFwdMainloopBmg<
           args.s_dmask_ptr,
           args.seqlen_q_rounded,
           args.seqlen_k_rounded};
+    }
+    if constexpr (PagedKV) {
+      p.paged = {args.ptr_page_table, args.page_size,
+                 args.max_pages_per_seq, args.total_seqlen_kv};
     }
     return p;
   }
@@ -273,6 +296,21 @@ struct FMHAFwdMainloopBmg<
     auto pKgK = prefetch_k.get_slice(thr_id).partition_S(gK);
     auto pVgV = prefetch_v.get_slice(thr_id).partition_S(gV_split);
 
+    // PagedKV: translate logical K index to physical page-tile index.
+    int tiles_per_page = 0;
+    int b_offset = 0;
+    int page_idx = 0, next_page_idx = blk_k0;
+    if constexpr (PagedKV) {
+      tiles_per_page = params.paged.page_size / get<1>(TileShapeQK{});
+      b_offset = idx_b * params.paged.max_pages_per_seq;
+      int page_local_idx =
+          blk_k0 * get<1>(TileShapeQK{}) / params.paged.page_size;
+      next_page_idx =
+          params.paged.ptr_page_table[b_offset + page_local_idx] *
+              tiles_per_page +
+          blk_k0 % tiles_per_page;
+    }
+
     for (int D = 0; D < size<3>(pQgQ); D++) {
       prefetch(prefetch_q, pQgQ(_, _, _, D));
     }
@@ -280,7 +318,8 @@ struct FMHAFwdMainloopBmg<
     for (int D = 0; D < size<4>(pKgK); D++) {
       CUTLASS_PRAGMA_UNROLL
       for (int K = blk_k0; K < blk_k0 + prefetch_k_stages; K++) {
-        prefetch(prefetch_k, pKgK(_, _, _, K, D));
+        int pk = PagedKV ? next_page_idx : K;
+        prefetch(prefetch_k, pKgK(_, _, _, pk, D));
       }
     }
     if (blk_k0 == 0) {
@@ -296,12 +335,35 @@ struct FMHAFwdMainloopBmg<
         cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), _));
 
     for (int K = blk_k0; K < blk_k1; K++) {
+      // PagedKV: advance page index (current = next computed last iter).
+      if constexpr (PagedKV) {
+        page_idx = next_page_idx;
+        int next_logical = K + 1;
+        int next_page_local_idx =
+            next_logical * get<1>(TileShapeQK{}) / params.paged.page_size;
+        bool valid_page =
+            next_page_local_idx < params.paged.max_pages_per_seq;
+        if (valid_page) {
+          next_page_idx =
+              params.paged.ptr_page_table[b_offset + next_page_local_idx] *
+                  tiles_per_page +
+              next_logical % tiles_per_page;
+        } else {
+          next_page_idx = params.paged.max_pages_per_seq * tiles_per_page - 1;
+        }
+      }
+
+      auto tKgK_cache =
+          PagedKV ? tKgK(_, _, _, page_idx, _) : tKgK(_, _, _, K, _);
+      auto tVgV_cache =
+          PagedKV ? tVgV(_, _, _, _, page_idx) : tVgV(_, _, _, _, K);
+
       /* GEMM 1: S = Q * K^T */
       clear(tSrS);
       CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < size<4>(tKgK); D++) {
         copy(copy_q, tQgQ(_, _, _, D), tQrQ);
-        copy(copy_k, tKgK(_, _, _, K, D), tKrK);
+        copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
@@ -309,7 +371,8 @@ struct FMHAFwdMainloopBmg<
 
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
-        prefetch(prefetch_v, pVgV(_, _, _, VV, K));
+        int pk = PagedKV ? page_idx : K;
+        prefetch(prefetch_v, pVgV(_, _, _, VV, pk));
       }
 
       auto cS_thread = thr_mma_qk.partition_C(gP_all(_, _, K));
@@ -410,16 +473,34 @@ struct FMHAFwdMainloopBmg<
       /* GEMM 2: A += P * V, split in v dimension */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
-        copy(copy_v, tVgV(_, _, _, VV, K), tVrV);
+        copy(copy_v, tVgV_cache(_, _, _, VV), tVrV);
         reorder(tVrV, tArV);
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
       }
 
       int K_next = K + Stages;
       if (K_next < blk_k1) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int D = 0; D < size<4>(pKgK); D++) {
-          prefetch(prefetch_k, pKgK(_, _, _, K_next, D));
+        if constexpr (PagedKV) {
+          int next_page_local_idx =
+              K_next * get<1>(TileShapeQK{}) / params.paged.page_size;
+          int pk_next;
+          if (next_page_local_idx < params.paged.max_pages_per_seq) {
+            pk_next =
+                params.paged.ptr_page_table[b_offset + next_page_local_idx] *
+                    tiles_per_page +
+                K_next % tiles_per_page;
+          } else {
+            pk_next = params.paged.max_pages_per_seq * tiles_per_page - 1;
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int D = 0; D < size<4>(pKgK); D++) {
+            prefetch(prefetch_k, pKgK(_, _, _, pk_next, D));
+          }
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int D = 0; D < size<4>(pKgK); D++) {
+            prefetch(prefetch_k, pKgK(_, _, _, K_next, D));
+          }
         }
       }
     }

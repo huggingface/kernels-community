@@ -20,10 +20,8 @@ struct prefill_policy_head32;
 struct prefill_policy_head64;
 struct prefill_policy_head96;
 struct prefill_policy_head128;
-struct prefill_policy_head128_bmg;
 struct prefill_policy_head160;
 struct prefill_policy_head192;
-struct prefill_policy_head192_bmg;
 struct prefill_policy_head256;
 struct prefill_policy_head512;
 
@@ -36,10 +34,10 @@ struct decode_policy_head192;
 struct decode_policy_head256;
 struct decode_policy_head512;
 
-template <typename chunk_policy, int PipelineStages, int IsVarLen = -1, int IsPaged = -1>
+template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged>
 void policy_dispatch(
-    sycl::queue& queue, 
-    CutlassType cuType, 
+    sycl::queue& queue,
+    CutlassType cuType,
     const fmha_fwd_args_t& args);
 
 // Varlen mode extern declarations (IsVarLen=1, IsPaged=0/1)
@@ -59,10 +57,6 @@ extern template void policy_dispatch<prefill_policy_head128, PipelineStages_Pref
     sycl::queue&, CutlassType, const fmha_fwd_args_t&);
 extern template void policy_dispatch<prefill_policy_head128, PipelineStages_Prefill, 1, 1>(
     sycl::queue&, CutlassType, const fmha_fwd_args_t&);
-extern template void policy_dispatch<prefill_policy_head128_bmg, PipelineStages_Prefill, 1, 0>(
-    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
-extern template void policy_dispatch<prefill_policy_head128_bmg, PipelineStages_Prefill, 1, 1>(
-    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
 extern template void policy_dispatch<prefill_policy_head160, PipelineStages_Prefill, 1, 0>(
     sycl::queue&, CutlassType, const fmha_fwd_args_t&);
 extern template void policy_dispatch<prefill_policy_head160, PipelineStages_Prefill, 1, 1>(
@@ -70,10 +64,6 @@ extern template void policy_dispatch<prefill_policy_head160, PipelineStages_Pref
 extern template void policy_dispatch<prefill_policy_head192, PipelineStages_Prefill, 1, 0>(
     sycl::queue&, CutlassType, const fmha_fwd_args_t&);
 extern template void policy_dispatch<prefill_policy_head192, PipelineStages_Prefill, 1, 1>(
-    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
-extern template void policy_dispatch<prefill_policy_head192_bmg, PipelineStages_Prefill, 1, 0>(
-    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
-extern template void policy_dispatch<prefill_policy_head192_bmg, PipelineStages_Prefill, 1, 1>(
     sycl::queue&, CutlassType, const fmha_fwd_args_t&);
 extern template void policy_dispatch<prefill_policy_head256, PipelineStages_Prefill, 1, 0>(
     sycl::queue&, CutlassType, const fmha_fwd_args_t&);
@@ -111,13 +101,9 @@ extern template void policy_dispatch<prefill_policy_head96, PipelineStages_Prefi
     sycl::queue&, CutlassType, const fmha_fwd_args_t&);
 extern template void policy_dispatch<prefill_policy_head128, PipelineStages_Prefill, 0, 0>(
     sycl::queue&, CutlassType, const fmha_fwd_args_t&);
-extern template void policy_dispatch<prefill_policy_head128_bmg, PipelineStages_Prefill, 0, 0>(
-    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
 extern template void policy_dispatch<prefill_policy_head160, PipelineStages_Prefill, 0, 0>(
     sycl::queue&, CutlassType, const fmha_fwd_args_t&);
 extern template void policy_dispatch<prefill_policy_head192, PipelineStages_Prefill, 0, 0>(
-    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
-extern template void policy_dispatch<prefill_policy_head192_bmg, PipelineStages_Prefill, 0, 0>(
     sycl::queue&, CutlassType, const fmha_fwd_args_t&);
 extern template void policy_dispatch<prefill_policy_head256, PipelineStages_Prefill, 0, 0>(
     sycl::queue&, CutlassType, const fmha_fwd_args_t&);

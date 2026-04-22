@@ -2,15 +2,10 @@
  * Copyright (C) 2025 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * BMG-path FMHA forward outer kernel -- minimal functionality matching the
- * torch-xpu-ops SDPA flash-attention backend kernel, plus optional varlen.
- *
- *   - Non-paged, non-local, non-dropout.
- *   - Optional causal mask.
- *   - Optional variable-length sequences (selected via ProblemShape::SeqLenType).
- *   - For non-varlen: contiguous int64_t strides (row_stride, head_stride,
- *     batch_stride) rather than cute::Stride types, matching SDPA.
- *   - Optional LSE output pointer.
+ * Xe2 (BMG / Arc Pro B60) FMHA forward outer kernel -- supports the full FA2
+ * feature set (causal, local, dropout, paged, varlen) via compile-time flags.
+ * For non-varlen: uses contiguous int64_t strides (row_stride, head_stride,
+ * batch_stride) rather than cute::Stride types, matching SDPA.
  **************************************************************************************************/
 
 #pragma once
@@ -22,9 +17,9 @@
 
 #include "cute/util/type_traits.hpp"
 #include "../collective/fmha_fusion.hpp"
-#include "../collective/fmha_fwd_mainloop_bmg.hpp"
-#include "../collective/fmha_fwd_epilogue_bmg.hpp"
-#include "./fmha_fwd_kernel.hpp"  // for FMHAProblemShape
+#include "../collective/fmha_fwd_mainloop_xe2.hpp"
+#include "../collective/fmha_fwd_epilogue_xe2.hpp"
+#include "./fmha_problem_shape.hpp"
 
 namespace cutlass::fmha::kernel {
 
@@ -35,7 +30,7 @@ template <
     class CollectiveMainloop_,
     class CollectiveEpilogue_,
     class TileScheduler_>
-class XeFMHAFwdKernelBmg {
+class XeFMHAFwdKernelXe2 {
  public:
   using ProblemShape = ProblemShape_;
   static constexpr bool is_var_len = cutlass::fmha::collective::
@@ -72,6 +67,7 @@ class XeFMHAFwdKernelBmg {
   static constexpr bool CausalMask = CollectiveMainloop::CausalMask;
   static constexpr bool LocalMask  = CollectiveMainloop::LocalMask;
   static constexpr bool HasDropout = CollectiveMainloop::HasDropout;
+  static constexpr bool PagedKV    = CollectiveMainloop::PagedKV;
 
   using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
   using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
@@ -262,18 +258,28 @@ class XeFMHAFwdKernelBmg {
         auto qo_cumulative = s.seq_len_qo.cumulative_length;
         auto kv_cumulative = s.seq_len_kv.cumulative_length;
         offset_q = s.num_heads_q  * s.head_size_qk * qo_cumulative[idx_b];
-        offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
-        offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
+        offset_k = PagedKV
+            ? 0
+            : s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
+        offset_v = PagedKV
+            ? 0
+            : s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
         offset_o = s.num_heads_q  * s.head_size_vo * qo_cumulative[idx_b];
       }
 
       auto batch_dim = is_var_len ? 1 : s.batch;
+      int total_seqlen_kv;
+      if constexpr (PagedKV) {
+        total_seqlen_kv = params.mainloop.paged.total_seqlen_kv;
+      } else {
+        total_seqlen_kv = seq_len_kv;
+      }
       auto shape_Q =
           make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
-      auto shape_K =
-          make_shape(seq_len_kv, s.head_size_qk, s.num_heads_kv, batch_dim);
-      auto shape_V =
-          make_shape(s.head_size_vo, seq_len_kv, s.num_heads_kv, batch_dim);
+      auto shape_K = make_shape(
+          total_seqlen_kv, s.head_size_qk, s.num_heads_kv, batch_dim);
+      auto shape_V = make_shape(
+          s.head_size_vo, total_seqlen_kv, s.num_heads_kv, batch_dim);
       auto shape_O =
           make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
 
