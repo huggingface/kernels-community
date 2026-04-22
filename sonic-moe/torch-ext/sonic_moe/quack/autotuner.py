@@ -25,6 +25,29 @@ PACKAGE_NAME = "quack"
 VERSION = __version__
 
 
+def _get_current_cuda_device() -> str | None:
+    """Return the physical CUDA device identifier for the current process.
+
+    Maps the logical ``torch.cuda.current_device()`` index through
+    ``CUDA_VISIBLE_DEVICES`` (if set) so the result is valid as a
+    standalone ``CUDA_VISIBLE_DEVICES`` value (handles integer IDs,
+    GPU UUIDs, and MIG IDs).
+
+    Returns ``None`` if CUDA is not initialized or the device cannot
+    be determined.
+    """
+    if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+        return None
+    logical_device = torch.cuda.current_device()
+    parent_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if parent_visible is not None:
+        visible_devices = [d.strip() for d in parent_visible.split(",")]
+        if logical_device < len(visible_devices):
+            return visible_devices[logical_device]
+        return None
+    return str(logical_device)
+
+
 def get_home_dir():
     return os.getenv(f"{PACKAGE_NAME.upper()}_HOME", Path.home())
 
@@ -50,6 +73,22 @@ class FileCacheManager(triton.runtime.cache.FileCacheManager):
 def _base32(key):
     # Assume key is a hex string.
     return base64.b32encode(bytes.fromhex(key)).decode("utf-8").rstrip("=")
+
+
+def _gpu_warmup(duration_ms=200):
+    """Saturate the GPU to reach thermal steady-state before benchmarking.
+
+    Without this, the first autotuning config gets artificially good numbers
+    because the GPU hasn't been power-throttled yet.
+    """
+    a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+    torch.cuda.synchronize()
+    target = duration_ms / 1000
+    t0 = time.time()
+    while time.time() - t0 < target:
+        for _ in range(100):
+            a = a @ a
+        torch.cuda.synchronize()
 
 
 class Autotuner:
@@ -123,6 +162,146 @@ class Autotuner:
         if self._do_bench is None:
             return partial(triton.testing.do_bench, warmup=5, rep=25)
         return self._do_bench
+
+    def _precompile(self, *args, configs, **kwargs):
+        """Pre-compile all configs in parallel subprocesses to populate .o cache.
+
+        cute.compile() is not thread-safe (MLIR thread-local state) and fork after
+        CUDA init causes segfaults. So we spawn persistent subprocess workers: each
+        has its own CUDA context, creates FakeTensors matching the parent's tensor
+        metadata, and compiles with COMPILE_ONLY=True. Workers stay alive to amortize
+        import overhead across multiple configs. The parent then loads instantly from
+        the .o cache during benchmarking.
+        """
+        from .cache_utils import CACHE_ENABLED
+
+        if not CACHE_ENABLED:
+            return
+
+        max_workers = min(len(configs), int(os.getenv("QUACK_COMPILE_WORKERS", "8")))
+        if max_workers <= 1:
+            return
+
+        # Quick check: compile first config in-process. If it loads from .o cache
+        # (<0.5s), the rest are likely cached too — skip spawning workers.
+        t_check = time.time()
+        try:
+            current = dict(kwargs, **configs[0].all_kwargs())
+            self.fn(*args, **current)
+        except Exception:
+            pass
+        if time.time() - t_check < 0.5:
+            return
+
+        verbose = os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
+        if verbose:
+            print(f"Pre-compiling {len(configs)} configs with {max_workers} workers")
+        t0 = time.time()
+
+        import pickle
+        import struct
+        import subprocess
+        import sys
+
+        def _send(stream, msg):
+            data = pickle.dumps(msg)
+            stream.write(struct.pack("<I", len(data)))
+            stream.write(data)
+            stream.flush()
+
+        def _recv(stream):
+            header = stream.read(4)
+            if len(header) < 4:
+                return None
+            length = struct.unpack("<I", header)[0]
+            return pickle.loads(stream.read(length)) if length else None
+
+        # Serialize tensor metadata
+        tensor_meta = []
+        for arg in args:
+            if isinstance(arg, Tensor):
+                tensor_meta.append(
+                    {
+                        "shape": list(arg.shape),
+                        "stride": list(arg.stride()),
+                        "dtype": str(arg.dtype),
+                    }
+                )
+            else:
+                tensor_meta.append(arg)
+
+        fn_module = self.fn.__module__
+        fn_qualname = self.fn.__qualname__
+
+        # Restrict worker subprocesses to the parent's current CUDA device.
+        # Without this, all workers default to cuda:0 and their CUDA context
+        # initialization can OOM when many ranks share a node.
+        worker_env = os.environ.copy()
+        current_device = _get_current_cuda_device()
+        if current_device is not None:
+            worker_env["CUDA_VISIBLE_DEVICES"] = current_device
+
+        # Launch persistent worker pool. When vendored under sonic_moe (loaded
+        # via kernels.get_kernel), the quack package isn't importable as a
+        # top-level module, so invoke the worker via its fully-qualified dotted
+        # path and inject PYTHONPATH so the subprocess can import it.
+        worker_module = __package__ + "._compile_worker" if __package__ else "quack._compile_worker"
+        if __package__:
+            import importlib.util
+            spec = importlib.util.find_spec(__package__.split(".")[0])
+            if spec is not None and spec.submodule_search_locations:
+                pkg_parent = os.path.dirname(list(spec.submodule_search_locations)[0])
+                existing_pp = worker_env.get("PYTHONPATH", "")
+                worker_env["PYTHONPATH"] = (
+                    f"{pkg_parent}{os.pathsep}{existing_pp}" if existing_pp else pkg_parent
+                )
+
+        workers = []
+        for _ in range(max_workers):
+            p = subprocess.Popen(
+                [sys.executable, "-m", worker_module],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL if not verbose else None,
+                env=worker_env,
+            )
+            ready = _recv(p.stdout)
+            if ready != "READY":
+                p.kill()
+                continue
+            workers.append(p)
+
+        if not workers:
+            return
+
+        # Round-robin dispatch configs to workers
+        pending = [0] * len(workers)
+        for i, config in enumerate(configs):
+            w = workers[i % len(workers)]
+            _send(
+                w.stdin,
+                {
+                    "fn_module": fn_module,
+                    "fn_qualname": fn_qualname,
+                    "tensor_meta": tensor_meta,
+                    "kwargs": kwargs,
+                    "config_kwargs": config.all_kwargs(),
+                },
+            )
+            pending[i % len(workers)] += 1
+
+        # Collect all results
+        for wi, w in enumerate(workers):
+            for _ in range(pending[wi]):
+                _recv(w.stdout)
+
+        # Shutdown workers (close stdin → worker exits)
+        for w in workers:
+            w.stdin.close()
+            w.wait()
+
+        if verbose:
+            print(f"Pre-compilation done in {time.time() - t0:.1f}s")
 
     def _bench(self, *args, config, **meta):
         verbose = os.environ.get(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
@@ -227,6 +406,8 @@ class Autotuner:
 
                 @torch.compiler.disable  # Don't want any tracing here
                 def benchmark():
+                    self._precompile(*args, configs=pruned_configs, **kwargs)
+                    _gpu_warmup()
                     bench_start = time.time()
                     timings = {
                         config: self._bench(*args, config=config, **kwargs)
@@ -316,11 +497,11 @@ class AutotuneConfig:
         return ", ".join(res)
 
     def __hash__(self):
-        return hash(tuple(*self.all_kwargs().items()))
+        return hash(tuple(self.all_kwargs().items()))
 
     def __eq__(self, other):
-        self_tuple = tuple(*self.all_kwargs().items())
-        other_tuple = tuple(*other.all_kwargs().items())
+        self_tuple = tuple(self.all_kwargs().items())
+        other_tuple = tuple(other.all_kwargs().items())
         return self_tuple == other_tuple
 
 

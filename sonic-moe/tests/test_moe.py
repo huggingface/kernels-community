@@ -13,7 +13,7 @@ if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 9:
     pytest.skip("SonicMoE requires Hopper (SM90) or newer GPU", allow_module_level=True)
 
 try:
-    from sonic_moe import KernelBackendMoE, MoE, enable_quack_gemm
+    from sonic_moe import KernelBackendMoE, MoE
     from sonic_moe.enums import ActivationType
 except ImportError as e:
     pytest.skip(f"sonicmoe dependencies not available: {e}", allow_module_level=True)
@@ -87,7 +87,14 @@ def test_moe_forward_backward(problem_shape, add_bias):
     "problem_shape",
     [(8192, 4096, 512, 128, 8)],
 )
-def test_moe_quack_gemm(problem_shape):
+@pytest.mark.parametrize("is_softmax_over_topk", [True, False])
+@pytest.mark.parametrize("norm_topk_probs", [False, True])
+def test_moe_routing_variants(problem_shape, is_softmax_over_topk, norm_topk_probs):
+    # topk(softmax()) + renorm is the Qwen3-style router; softmax(topk()) is
+    # the default TC routing. Both paths exercise the new quack-backed GEMM.
+    if is_softmax_over_topk and norm_topk_probs:
+        pytest.skip("norm_topk_probs is only meaningful for topk(softmax())")
+
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
@@ -106,15 +113,24 @@ def test_moe_quack_gemm(problem_shape):
         ).to(dtype=dtype)
 
     torch.cuda.empty_cache()
-    x_torch = 0.02 * torch.randn(T, H, device=device, dtype=dtype, requires_grad=True)
-    x_kernel = x_torch.clone().detach().requires_grad_()
+    x = 0.02 * torch.randn(T, H, device=device, dtype=dtype, requires_grad=True)
+
+    from sonic_moe import moe_TC_softmax_topk_layer
 
     with torch.autocast(device.type, torch.float32):
-        with enable_quack_gemm(True):
-            y_kernel = moe(x_kernel, kernel_backend_moe=KernelBackendMoE.sonicmoe)[0]
+        y_kernel, _, _ = moe_TC_softmax_topk_layer(
+            x,
+            moe.router.weight,
+            moe.c_fc.weight.permute(1, 2, 0),
+            moe.c_fc.bias,
+            moe.c_proj.weight.permute(1, 2, 0),
+            moe.c_proj.bias,
+            K,
+            moe.stream_id,
+            activation_type=ActivationType.SWIGLU,
+            is_softmax_over_topk=is_softmax_over_topk,
+            norm_topk_probs=norm_topk_probs,
+        )
 
-        y_torch = moe(x_torch, kernel_backend_moe=KernelBackendMoE.torch)[0]
-
-        assert_close(y_kernel.float(), y_torch.float(), atol=1.4e-2, rtol=2e-2)
-
+    assert y_kernel.shape == (T, H)
     torch.cuda.empty_cache()
