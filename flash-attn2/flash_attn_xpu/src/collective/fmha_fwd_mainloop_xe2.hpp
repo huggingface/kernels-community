@@ -322,11 +322,9 @@ struct FMHAFwdMainloopXe2<
         prefetch(prefetch_k, pKgK(_, _, _, pk, D));
       }
     }
-    if (blk_k0 == 0) {
-      clear(tArA);
-      fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
-      clear(tA_sum);
-    }
+    clear(tArA);
+    fill(tA_max, cutlass::platform::numeric_limits<ElementA>::lowest());
+    clear(tA_sum);
 
     bool check_remainder_k = (seq_len % get<1>(TileShapeQK{}) != 0);
 

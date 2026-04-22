@@ -388,10 +388,13 @@ gemm_dQ(Trait &trait,
     Tensor tCgC = thr_mma.partition_C(gC);
     gemm_kernel<true>(trait, A, B, tCrC, mma, m_block, n_block);
     int local_id = sg.get_local_id();
+    constexpr int kHeadDim = Trait::kHeadDim;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(tCgC); ++i) {
         auto [m, n] = tCgC(i);
-        cutlass::atomicAdd(&C(m, n + local_id), tCrC(i));
+        if (n + local_id < kHeadDim) {
+            cutlass::atomicAdd(&C(m, n + local_id), tCrC(i));
+        }
     }
 }
 
@@ -1049,10 +1052,9 @@ struct BwdKernelLauncher {
         compat::experimental::kernel_properties kernel_props0{
             sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>};
         compat::experimental::launch_policy policy0{dimGrid0, dimBlock0, launch_props0, kernel_props0};
-        auto event0 = compat::experimental::launch<
+        compat::experimental::launch<
             mha_dot_do_o<decltype(trait)>,
             mhaodoDeviceNameBwd<decltype(trait)>>(policy0, trait, param);
-        EventManager::getInstance().addEvent(event0);
         compat::wait_and_throw();
 
         // Phase 2: Main backward pass
@@ -1076,10 +1078,9 @@ struct BwdKernelLauncher {
         compat::experimental::kernel_properties kernel_props1{
             sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>};
         compat::experimental::launch_policy policy1{dimGrid1, dimBlock1, launch_props1, kernel_props1};
-        auto event1 = compat::experimental::launch<
+        compat::experimental::launch<
             mha_backward_seq<decltype(trait)>,
             mhabwdDeviceNameBwd<decltype(trait)>>(policy1, trait, param);
-        EventManager::getInstance().addEvent(event1);
         compat::wait_and_throw();
 
         // Phase 3: Convert dQ from float to target type
@@ -1089,10 +1090,9 @@ struct BwdKernelLauncher {
         compat::experimental::kernel_properties kernel_props2{
             sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>};
         compat::experimental::launch_policy policy2{dimGrid2, dimBlock2, launch_props2, kernel_props2};
-        auto event2 = compat::experimental::launch<
+        compat::experimental::launch<
             mhd_convert_dq<decltype(trait)>,
             mhacvtDeviceNameBwd<decltype(trait)>>(policy2, trait, param);
-        EventManager::getInstance().addEvent(event2);
         compat::wait_and_throw();
         
         // Free intermediate buffer

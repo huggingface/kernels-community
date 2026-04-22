@@ -36,7 +36,14 @@ def _get_block_size_n(device, head_dim, is_dropout, is_causal):
     assert head_dim <= 256
 
     if device.type == "xpu":
-        return 64
+        if head_dim <= 96:
+            return 64
+        elif head_dim <= 128:
+            return 32
+        elif head_dim <= 256:
+            return 64
+        else:
+            return 32
 
     # This should match the block sizes in the CUDA kernel
     major, minor = torch.cuda.get_device_capability(device)
