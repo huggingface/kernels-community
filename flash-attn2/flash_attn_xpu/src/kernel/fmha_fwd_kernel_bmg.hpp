@@ -71,6 +71,7 @@ class XeFMHAFwdKernelBmg {
 
   static constexpr bool CausalMask = CollectiveMainloop::CausalMask;
   static constexpr bool LocalMask  = CollectiveMainloop::LocalMask;
+  static constexpr bool HasDropout = CollectiveMainloop::HasDropout;
 
   using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
   using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
@@ -341,7 +342,9 @@ class XeFMHAFwdKernelBmg {
           seq_len_kv,
           idx_b,
           tile_row_idx,
-          rows_of_maxima);
+          rows_of_maxima,
+          head_q,
+          s.num_heads_q);
 
       if constexpr (
           !is_empty_v<MainloopSharedStorage> &&

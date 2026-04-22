@@ -7,8 +7,8 @@
  *   - Forward pass only
  *   - Optional causal masking
  *   - Optional local (sliding-window) mask
+ *   - Optional dropout
  *   - Contiguous or variable-length Q/K/V (non-paged)
- *   - No dropout
  *
  * This kernel is forked from the full FA2 mainloop in order to keep the
  * compiled binary small enough to avoid IGC register spill on BMG.
@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "../philox.hpp"
 #include "./fmha_fwd_common.hpp"
 
 namespace cutlass::fmha {
@@ -39,6 +40,7 @@ template <
     class DispatchPolicy_,
     bool CausalMask_,
     bool LocalMask_,
+    bool HasDropout_,
     class TiledMMAQK_,
     class TiledMMAPV_,
     int VTiles_,
@@ -60,6 +62,7 @@ template <
     int Stages,
     bool CausalMask_,
     bool LocalMask_,
+    bool HasDropout_,
     class TiledMMAQK_,
     class TiledMMAPV_,
     int VTiles_,
@@ -73,6 +76,7 @@ struct FMHAFwdMainloopBmg<
     XeBmg<Stages>,
     CausalMask_,
     LocalMask_,
+    HasDropout_,
     TiledMMAQK_,
     TiledMMAPV_,
     VTiles_,
@@ -117,6 +121,7 @@ struct FMHAFwdMainloopBmg<
 
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool LocalMask  = LocalMask_;
+  static constexpr bool HasDropout = HasDropout_;
 
   // User-facing arguments
   struct Arguments {
@@ -124,6 +129,13 @@ struct FMHAFwdMainloopBmg<
     // Local Mask (sliding window). Only consumed when LocalMask is true.
     int local_left  = 0;
     int local_right = 0;
+    // Dropout. Only consumed when HasDropout is true.
+    float p_dropout = 0.0f;
+    uint64_t philox_seed = 0;
+    uint64_t philox_offset = 0;
+    void* s_dmask_ptr = nullptr;
+    int seqlen_q_rounded = 0;
+    int seqlen_k_rounded = 0;
   };
 
   struct LocalMaskFields {
@@ -131,11 +143,21 @@ struct FMHAFwdMainloopBmg<
   };
   struct EmptyLocal {};
 
+  struct DropoutFields {
+    cutlass::fmha::Dropout dropout;
+    void* s_dmask_ptr;
+    int seqlen_q_rounded;
+    int seqlen_k_rounded;
+  };
+  struct EmptyDropout {};
+
   // Kernel-facing parameters
   struct Params {
     ElementS scale;
     [[no_unique_address]] conditional_t<LocalMask, LocalMaskFields, EmptyLocal>
         local;
+    [[no_unique_address]] conditional_t<HasDropout, DropoutFields, EmptyDropout>
+        dropout_fields;
   };
 
   // SLM data
@@ -158,6 +180,14 @@ struct FMHAFwdMainloopBmg<
     p.scale = val;
     if constexpr (LocalMask) {
       p.local = {args.local_left, args.local_right};
+    }
+    if constexpr (HasDropout) {
+      p.dropout_fields = {
+          cutlass::fmha::Dropout(
+              args.philox_seed, args.philox_offset, args.p_dropout),
+          args.s_dmask_ptr,
+          args.seqlen_q_rounded,
+          args.seqlen_k_rounded};
     }
     return p;
   }
@@ -182,9 +212,11 @@ struct FMHAFwdMainloopBmg<
       int seq_len,
       int seq_len_qo,
       int seq_len_kv,
-      int l_coord,
+      int idx_b,
       int& tile_row_idx,
-      const int& rows_of_maxima) {
+      const int& rows_of_maxima,
+      int head_q,
+      int num_heads) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     auto tile_shape_v =
@@ -335,6 +367,44 @@ struct FMHAFwdMainloopBmg<
       }
 
       softmax(K == blk_k0, tSrS, tA_max, tA_sum, tArA);
+
+      /* Apply dropout to attention probabilities (P) */
+      if constexpr (HasDropout) {
+        uint32_t batch_head =
+            static_cast<uint32_t>(idx_b * num_heads + head_q);
+        if (params.dropout_fields.s_dmask_ptr != nullptr) {
+          using ElementInput = typename TensorQ::element_type;
+          auto* s_dmask_base = reinterpret_cast<ElementInput*>(
+              params.dropout_fields.s_dmask_ptr);
+          int64_t bh_offset = int64_t(idx_b * num_heads + head_q) *
+              int64_t(params.dropout_fields.seqlen_q_rounded) *
+              params.dropout_fields.seqlen_k_rounded;
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            int row_idx = get<0>(cS_thread(i));
+            int col_idx = get<1>(cS_thread(i));
+            bool keep = params.dropout_fields.dropout.should_keep(
+                batch_head, row_idx, col_idx);
+            ElementInput val = static_cast<ElementInput>(tSrS(i));
+            s_dmask_base[bh_offset +
+                         int64_t(row_idx) *
+                             params.dropout_fields.seqlen_k_rounded +
+                         col_idx] = keep ? val : -val;
+            tSrS(i) = keep
+                ? tSrS(i) * params.dropout_fields.dropout.get_scale()
+                : ElementS(0);
+          }
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            int row_idx = get<0>(cS_thread(i));
+            int col_idx = get<1>(cS_thread(i));
+            tSrS(i) = params.dropout_fields.dropout.apply(
+                tSrS(i), batch_head, row_idx, col_idx);
+          }
+        }
+      }
+
       reorder(tSrS, tArP);
 
       /* GEMM 2: A += P * V, split in v dimension */
