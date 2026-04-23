@@ -687,7 +687,7 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
             mha_reorder_copy(trait, tiled_mma_sdp, rdP, mdPt);
         }
         sycl::group_barrier(group);
-        
+
         // dV = P^T * dO
         gemm_dKV(trait, mPt, mdOt, rdV, tiled_mma_dkv);
         // dK = dP^T * Q

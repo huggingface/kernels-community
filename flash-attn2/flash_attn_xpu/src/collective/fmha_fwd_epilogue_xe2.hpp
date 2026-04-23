@@ -73,7 +73,8 @@ class FMHAFwdEpilogueXe2 {
     using namespace cute;
     using ElementA_ = typename FragA::element_type;
 
-    auto [rA, rA_sum, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
+    auto [rA, rA_sum, rA_max_opt, active] =
+        reduce_A(tArA, tA_max, tA_sum, thr_id);
 
     if (!active)
       return;
@@ -121,13 +122,24 @@ class FMHAFwdEpilogueXe2 {
     if (tile_row_idx != -1 && seq_coord < static_cast<size_t>(seq_len_qo) &&
         (tile_row_idx % rows_of_maxima) == lane_id) {
       constexpr double kLog2e = 1.4426950408889634074;
-      float max_val = static_cast<float>(tA_max[0]) / static_cast<float>(kLog2e);
+      // For ReduceK==1, tA_max is the per-SG (and only) global max.
+      // For ReduceK>1,  rA_max_opt is the cross-k-block reduced global max;
+      //                 tA_max would only be this SG's local k-block max.
+      float max_in_log2;
+      if constexpr (ReduceK{} == _1{}) {
+        max_in_log2 = static_cast<float>(tA_max[0]);
+      } else {
+        max_in_log2 = static_cast<float>(rA_max_opt[0]);
+      }
+      float max_val = max_in_log2 / static_cast<float>(kLog2e);
       float lse_val = max_val + logf(non_reciprocal_rAsum);
       pLSE[lse_offset + tile_row_idx] = lse_val == -INFINITY ? 0 : lse_val;
     }
   }
 
   // Reduce k-blocks of A and A_sum across WG, if needed.
+  // Always returns a 4-tuple (rA, rA_sum, rA_max, active). For ReduceK==1
+  // there is no cross-SG reduction so rA_max is just tA_max.
   template <typename FragA_, typename FragARow_>
   CUTLASS_DEVICE decltype(auto) reduce_A(
       FragA_& tArA,
@@ -135,12 +147,9 @@ class FMHAFwdEpilogueXe2 {
       FragARow_& tA_sum,
       int thr_id) {
     if constexpr (ReduceK{} == _1{}) {
-      return std::make_tuple(tArA, tA_sum, true);
+      return std::make_tuple(tArA, tA_sum, tA_max, true);
     } else {
-      auto [rA, rA_sum, rA_max, active] =
-          ETraits::reduce_A_multi_k(tArA, tA_max, tA_sum, thr_id, shared);
-      // Xe2 epilogue doesn't need rA_max; drop it.
-      return std::make_tuple(rA, rA_sum, active);
+      return ETraits::reduce_A_multi_k(tArA, tA_max, tA_sum, thr_id, shared);
     }
   }
 };
