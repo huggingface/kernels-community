@@ -11,9 +11,6 @@
  *   - Optional paged KV cache
  *   - Contiguous or variable-length Q/K/V
  *
- * Forked from the original PVC mainloop in order to keep the compiled binary
- * small enough to avoid IGC register spill on BMG.
- *
  * Common type aliases live in fmha_fwd_common.hpp (FMHAFwdMainloopTraits).
  **************************************************************************************************/
 
