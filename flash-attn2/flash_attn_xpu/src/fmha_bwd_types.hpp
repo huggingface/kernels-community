@@ -53,6 +53,9 @@ struct fmha_bwd_args_t {
   float p_dropout = 0.0f;     // Probability of dropping (NOT keeping)
   uint64_t philox_seed = 0;   // Philox RNG seed (from forward pass)
   uint64_t philox_offset = 0; // Philox RNG offset (from forward pass)
+
+  // Pre-allocated intermediate buffer (P and dS tiles)
+  void* pbuff = nullptr;
 };
 
 enum class BwdCutlassType {

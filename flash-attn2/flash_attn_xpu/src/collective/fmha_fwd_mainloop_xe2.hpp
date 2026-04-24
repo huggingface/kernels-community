@@ -353,6 +353,13 @@ struct FMHAFwdMainloopXe2<
       auto tVgV_cache =
           PagedKV ? tVgV(_, _, _, _, page_idx) : tVgV(_, _, _, _, K);
 
+      // Prefetch V early to overlap with GEMM1 computation
+      CUTLASS_PRAGMA_UNROLL
+      for (int VV = 0; VV < VTiles; VV++) {
+        int pk = PagedKV ? page_idx : K;
+        prefetch(prefetch_v, pVgV(_, _, _, VV, pk));
+      }
+
       /* GEMM 1: S = Q * K^T */
       clear(tSrS);
       CUTLASS_PRAGMA_UNROLL
@@ -362,12 +369,6 @@ struct FMHAFwdMainloopXe2<
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
-      }
-
-      CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        int pk = PagedKV ? page_idx : K;
-        prefetch(prefetch_v, pVgV(_, _, _, VV, pk));
       }
 
       auto cS_thread = thr_mma_qk.partition_C(gP_all(_, _, K));
@@ -383,26 +384,28 @@ struct FMHAFwdMainloopXe2<
       }
 
       if constexpr (CausalMask) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < tSrS.size(); ++i) {
-          int row_idx = get<0>(cS_thread(i));
-          int col_idx = get<1>(cS_thread(i));
-
-          if (seq_len_qo == seq_len_kv) {
-            if (col_idx > row_idx) {
+        if (seq_len_qo == seq_len_kv) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            if (get<1>(cS_thread(i)) > get<0>(cS_thread(i))) {
               tSrS(i) = ElementS(-INFINITY);
             }
           }
-          if (seq_len_kv > seq_len_qo) {
-            int first_masked_col_index = seq_len_kv - (seq_len_qo - 1) + row_idx;
-            if (col_idx >= first_masked_col_index) {
+        } else if (seq_len_kv > seq_len_qo) {
+          int base = seq_len_kv - (seq_len_qo - 1);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            if (get<1>(cS_thread(i)) >= base + get<0>(cS_thread(i))) {
               tSrS(i) = ElementS{-INFINITY};
             }
           }
-          if (seq_len_qo > seq_len_kv) {
-            int first_non_masked_sequence = seq_len_qo - seq_len_kv;
-            if (row_idx < first_non_masked_sequence ||
-                col_idx > row_idx - first_non_masked_sequence) {
+        } else {
+          int first_non_masked = seq_len_qo - seq_len_kv;
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < tSrS.size(); ++i) {
+            int row_idx = get<0>(cS_thread(i));
+            if (row_idx < first_non_masked ||
+                get<1>(cS_thread(i)) > row_idx - first_non_masked) {
               tSrS(i) = ElementS{-INFINITY};
             }
           }
@@ -515,7 +518,6 @@ struct FMHAFwdMainloopXe2<
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
 
     FragSRow rescale;
-    auto tS_prev_max = tS_max;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS_max.size(); i++) {
       ElementS new_max = sycl::max(tS_max(i), params.scale * tS_bmax(i));
@@ -531,7 +533,6 @@ struct FMHAFwdMainloopXe2<
     if (!first_block) {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tS_max.size(); i++) {
-        rescale(i) = sycl::native::exp2(tS_prev_max(i) - tS_max(i));
         tS_sum(i) *= rescale(i);
       }
 
