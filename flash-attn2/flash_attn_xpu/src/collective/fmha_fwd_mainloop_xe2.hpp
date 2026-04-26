@@ -315,7 +315,15 @@ struct FMHAFwdMainloopXe2<
     for (int D = 0; D < size<4>(pKgK); D++) {
       CUTLASS_PRAGMA_UNROLL
       for (int K = blk_k0; K < blk_k0 + prefetch_k_stages; K++) {
-        int pk = PagedKV ? next_page_idx : K;
+        int pk;
+        if constexpr (PagedKV) {
+          int ploc = K * get<1>(TileShapeQK{}) / params.paged.page_size;
+          pk = params.paged.ptr_page_table[b_offset + ploc] *
+                   tiles_per_page +
+               K % tiles_per_page;
+        } else {
+          pk = K;
+        }
         prefetch(prefetch_k, pKgK(_, _, _, pk, D));
       }
     }
@@ -353,11 +361,13 @@ struct FMHAFwdMainloopXe2<
       auto tVgV_cache =
           PagedKV ? tVgV(_, _, _, _, page_idx) : tVgV(_, _, _, _, K);
 
-      // Prefetch V early to overlap with GEMM1 computation
-      CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        int pk = PagedKV ? page_idx : K;
-        prefetch(prefetch_v, pVgV(_, _, _, VV, pk));
+      // Non-paged: prefetch V before GEMM1 to overlap with computation.
+      // Paged: prefetch V after GEMM1 to avoid BMG hardware hang. TODO IGC 2.28
+      if constexpr (!PagedKV) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          prefetch(prefetch_v, pVgV(_, _, _, VV, K));
+        }
       }
 
       /* GEMM 1: S = Q * K^T */
@@ -369,6 +379,13 @@ struct FMHAFwdMainloopXe2<
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+      }
+
+      if constexpr (PagedKV) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int VV = 0; VV < VTiles; VV++) {
+          prefetch(prefetch_v, pVgV(_, _, _, VV, page_idx));
+        }
       }
 
       auto cS_thread = thr_mma_qk.partition_C(gP_all(_, _, K));
@@ -384,29 +401,58 @@ struct FMHAFwdMainloopXe2<
       }
 
       if constexpr (CausalMask) {
-        if (seq_len_qo == seq_len_kv) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrS.size(); ++i) {
-            if (get<1>(cS_thread(i)) > get<0>(cS_thread(i))) {
-              tSrS(i) = ElementS(-INFINITY);
+        if constexpr (!PagedKV) {
+          // Optimized: separate loops per case, avoid redundant branches.
+          if (seq_len_qo == seq_len_kv) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tSrS.size(); ++i) {
+              if (get<1>(cS_thread(i)) > get<0>(cS_thread(i))) {
+                tSrS(i) = ElementS(-INFINITY);
+              }
             }
-          }
-        } else if (seq_len_kv > seq_len_qo) {
-          int base = seq_len_kv - (seq_len_qo - 1);
-          CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < tSrS.size(); ++i) {
-            if (get<1>(cS_thread(i)) >= base + get<0>(cS_thread(i))) {
-              tSrS(i) = ElementS{-INFINITY};
+          } else if (seq_len_kv > seq_len_qo) {
+            int base = seq_len_kv - (seq_len_qo - 1);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tSrS.size(); ++i) {
+              if (get<1>(cS_thread(i)) >= base + get<0>(cS_thread(i))) {
+                tSrS(i) = ElementS{-INFINITY};
+              }
+            }
+          } else {
+            int first_non_masked = seq_len_qo - seq_len_kv;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tSrS.size(); ++i) {
+              int row_idx = get<0>(cS_thread(i));
+              if (row_idx < first_non_masked ||
+                  get<1>(cS_thread(i)) > row_idx - first_non_masked) {
+                tSrS(i) = ElementS{-INFINITY};
+              }
             }
           }
         } else {
-          int first_non_masked = seq_len_qo - seq_len_kv;
+          // Paged path: single loop to avoid IGC codegen hang on BMG. TODO IGC 2.28
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < tSrS.size(); ++i) {
             int row_idx = get<0>(cS_thread(i));
-            if (row_idx < first_non_masked ||
-                get<1>(cS_thread(i)) > row_idx - first_non_masked) {
-              tSrS(i) = ElementS{-INFINITY};
+            int col_idx = get<1>(cS_thread(i));
+
+            if (seq_len_qo == seq_len_kv) {
+              if (col_idx > row_idx) {
+                tSrS(i) = ElementS(-INFINITY);
+              }
+            }
+            if (seq_len_kv > seq_len_qo) {
+              int first_masked_col_index = seq_len_kv - (seq_len_qo - 1) + row_idx;
+              if (col_idx >= first_masked_col_index) {
+                tSrS(i) = ElementS{-INFINITY};
+              }
+            }
+            if (seq_len_qo > seq_len_kv) {
+              int first_non_masked_sequence = seq_len_qo - seq_len_kv;
+              if (row_idx < first_non_masked_sequence ||
+                  col_idx > row_idx - first_non_masked_sequence) {
+                tSrS(i) = ElementS{-INFINITY};
+              }
             }
           }
         }
