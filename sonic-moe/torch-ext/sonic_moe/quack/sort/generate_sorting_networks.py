@@ -179,7 +179,7 @@ def add_network_from_string(size: int, network_str: str, description: str = ""):
 
 
 def generate_networks_dict(
-    networks_data: Dict[int, Tuple[int, int, List[List[Tuple[int, int]]]]]
+    networks_data: Dict[int, Tuple[int, int, List[List[Tuple[int, int]]]]],
 ) -> str:
     """Generate the global networks dictionary."""
     lines = ["networks = {"]

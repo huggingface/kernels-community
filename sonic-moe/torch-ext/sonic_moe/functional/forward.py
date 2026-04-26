@@ -9,18 +9,21 @@ import triton
 import triton.language as tl
 from cutlass.cute.runtime import from_dlpack
 from ..quack.cute_dsl_utils import torch2cute_dtype_map
+from ..quack.gemm_interface import gemm, gemm_gated
 
-from ..enums import LIBRARY_NAME, TENSORMAP, ActivationType
 from .._ops_compat import add_op_namespace_prefix
-from ..utils import convert_torch_tensor_to_cute_tensor
-from .moe_config import HopperWgmma_MoE_Down_proj_Fwd, HopperWgmma_MoE_Up_proj_Fwd
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
-from .topk_softmax import TopK_Softmax
+from .topk import Softmax_Over_TopK, TopK_Over_Softmax
 
 
 @torch.library.custom_op(add_op_namespace_prefix("_topk_fwd"), mutates_args={"values", "indices"})
 def _topk_fwd(
-    x: torch.Tensor, k: int, values: torch.Tensor, indices: torch.Tensor, require_softmax_fusion: bool = True
+    x: torch.Tensor,
+    k: int,
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    is_softmax_over_topk: bool,
+    norm_topk_probs: bool,
 ) -> None:
     """Top-k forward pass.
     Args:
@@ -39,9 +42,17 @@ def _topk_fwd(
 
     x_tensor, values_tensor, indices_tensor = [convert_from_dlpack(tensor) for tensor in (x, values, indices)]
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    compile_key = (input_dtype, output_dtype, N, k, require_softmax_fusion)
+    if is_softmax_over_topk:
+        compile_key = (input_dtype, output_dtype, N, k, True)
+    else:
+        compile_key = (input_dtype, output_dtype, N, k, False, norm_topk_probs)
+
     if compile_key not in _topk_fwd.compile_cache:
-        topk_op = TopK_Softmax(input_dtype, output_dtype, N, k, require_softmax_fusion)
+        if is_softmax_over_topk:
+            topk_op = Softmax_Over_TopK(input_dtype, output_dtype, N, k)
+        else:
+            topk_op = TopK_Over_Softmax(input_dtype, output_dtype, N, k, norm_topk_probs)
+
         _topk_fwd.compile_cache[compile_key] = cute.compile(
             topk_op, x_tensor, values_tensor, indices_tensor, current_stream
         )
@@ -51,130 +62,49 @@ def _topk_fwd(
 _topk_fwd.compile_cache = {}
 
 
-@torch.library.custom_op(add_op_namespace_prefix("_up_projection_forward"), mutates_args={"z", "y1"})
+@torch.library.custom_op(add_op_namespace_prefix("_up_projection_forward"), mutates_args={"h", "a"})
 def _up_projection_forward(
     x: torch.Tensor,
     w1: torch.Tensor,
-    z: torch.Tensor,
-    y1: torch.Tensor,
+    h: torch.Tensor,
+    a: torch.Tensor,
     b1: torch.Tensor | None,
     expert_frequency_offset: torch.Tensor,
-    expert_schedule_order: torch.Tensor,
     x_gather_idx: torch.Tensor,
-    stream_id: int,
     activation_type: str,
-    is_glu_activation: bool,
     is_inference_mode_enabled: bool = False,
-    is_concatenated_gate_up: bool = False,
+    concat_layout: bool = False,
 ) -> None:
-    I, H, E = w1.size()
-    if is_glu_activation:
-        I //= 2
-
-    mX = convert_torch_tensor_to_cute_tensor(x.detach(), (0, 1), 1, 16, 8, stream=stream_id)
-    mW1 = convert_torch_tensor_to_cute_tensor(w1.detach(), (2, 0, 1), 1, 16, 8, stream=stream_id)
-    mZ = convert_torch_tensor_to_cute_tensor(z, (0, 1), 1, 16, 8, stream=stream_id)
-    mY1 = convert_torch_tensor_to_cute_tensor(y1, (0, 1), 1, 16, 8, stream=stream_id)
-    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1, stream=stream_id)
-    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1, stream=stream_id)
-
-    if expert_schedule_order is None:
-        mE_permute_order = None
-    else:
-        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
-
-    if b1 is None:
-        mB1 = None
-    else:
-        mB1 = convert_torch_tensor_to_cute_tensor(b1.detach(), (0, 1), 1, 16, 8, stream=stream_id)
-
-    current_stream = cuda.CUstream(stream_id)
-
-    compile_w1_key = (E, H, I, (b1 is None), x.dtype, activation_type, is_inference_mode_enabled, is_concatenated_gate_up)
-    if compile_w1_key not in _up_projection_forward.compile_cache:
-        w1_module = HopperWgmma_MoE_Up_proj_Fwd(
-            E, H, I, activation_type=ActivationType(activation_type), inference_mode=is_inference_mode_enabled, is_concatenated_gate_up=is_concatenated_gate_up,
-        )
-        tensormaps = [w1_module.module.generate_tensormap(None, None, None) for _ in range(2)]
-        _up_projection_forward.compile_cache[compile_w1_key] = cute.compile(
-            w1_module,
-            mX,
-            mW1,
-            mZ,
-            mY1,
-            mB1,
-            mE_offset,
-            mX_gather,
-            tensormaps[0],
-            tensormaps[1],
-            mE_permute_order,
-            current_stream,
-        )
-        _up_projection_forward.compile_cache[(TENSORMAP, compile_w1_key)] = tensormaps
-
-    w1_tensormaps = _up_projection_forward.compile_cache[(TENSORMAP, compile_w1_key)]
-    _up_projection_forward.compile_cache[compile_w1_key](
-        mX,
-        mW1,
-        mZ,
-        mY1,
-        mB1,
-        mE_offset,
-        mX_gather,
-        w1_tensormaps[0],
-        w1_tensormaps[1],
-        mE_permute_order,
-        current_stream,
+    assert activation_type in (
+        "swiglu",
+        "geglu",
+    ), f"QuACK gemm_gated only supports glu activations, got {activation_type}"
+    gemm_gated(
+        x,
+        w1.permute(2, 1, 0),
+        activation=activation_type,
+        cu_seqlens_m=expert_frequency_offset,
+        A_idx=x_gather_idx,
+        preact_out=h,
+        postact_out=a,
+        store_preact=(not is_inference_mode_enabled),
+        bias=b1,
+        concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
     )
 
 
 _up_projection_forward.compile_cache = {}
 
 
-@torch.library.custom_op(add_op_namespace_prefix("_down_projection_forward"), mutates_args={"y2"})
+@torch.library.custom_op(add_op_namespace_prefix("_down_projection_forward"), mutates_args={"y"})
 def _down_projection_forward(
     w2: torch.Tensor,
-    y1: torch.Tensor,
-    y2: torch.Tensor,
+    a: torch.Tensor,
+    y: torch.Tensor,
     b2: torch.Tensor | None,
     expert_frequency_offset: torch.Tensor,
-    expert_schedule_order: torch.Tensor,
-    x_gather_idx: torch.Tensor,
-    stream_id: int,
 ) -> None:
-    H, I, E = w2.size()
-
-    mW2 = convert_torch_tensor_to_cute_tensor(w2.detach(), (2, 0, 1), 1, 16, 8, stream=stream_id)
-    mY1 = convert_torch_tensor_to_cute_tensor(y1.detach(), (0, 1), 1, 16, 8, stream=stream_id)
-    mY2 = convert_torch_tensor_to_cute_tensor(y2, (0, 1), 1, 16, 8, stream=stream_id)
-    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1, stream=stream_id)
-    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1, stream=stream_id)
-
-    if expert_schedule_order is None:
-        mE_permute_order = None
-    else:
-        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
-
-    if b2 is None:
-        mB2 = None
-    else:
-        mB2 = convert_torch_tensor_to_cute_tensor(b2.detach(), (0, 1), 1, 16, 8, stream=stream_id)
-
-    current_stream = cuda.CUstream(stream_id)
-
-    compile_w2_key = (E, H, I, (b2 is None), w2.dtype)
-    if compile_w2_key not in _down_projection_forward.compile_cache:
-        w2_module = HopperWgmma_MoE_Down_proj_Fwd(E, H, I)
-        tensormaps = [w2_module.module.generate_tensormap(None, None, None) for _ in range(1)]
-        _down_projection_forward.compile_cache[compile_w2_key] = cute.compile(
-            w2_module, mY1, mW2, mY2, mB2, mE_offset, mX_gather, tensormaps[0], mE_permute_order, current_stream
-        )
-        _down_projection_forward.compile_cache[(TENSORMAP, compile_w2_key)] = tensormaps
-
-    w2_tensormaps = _down_projection_forward.compile_cache[(TENSORMAP, compile_w2_key)]
-    _down_projection_forward.compile_cache[compile_w2_key](
-        mY1, mW2, mY2, mB2, mE_offset, mX_gather, w2_tensormaps[0], mE_permute_order, current_stream
-    )
+    gemm(a, w2.permute(2, 1, 0), out=y, cu_seqlens_m=expert_frequency_offset, bias=b2)
 
 
 _down_projection_forward.compile_cache = {}
@@ -182,7 +112,7 @@ _down_projection_forward.compile_cache = {}
 
 @torch.library.custom_op(add_op_namespace_prefix("_router_forward"), mutates_args={"o"})
 def _router_forward(
-    y2: torch.Tensor,
+    y: torch.Tensor,
     o: torch.Tensor,
     topk_scores: torch.Tensor,
     s_reverse_scatter_idx: torch.Tensor,
@@ -192,7 +122,7 @@ def _router_forward(
     is_varlen_K: bool,
 ) -> None:
     token_gather_and_sum_varlen_K_triton(
-        y2,
+        y,
         topk_scores,
         o,
         s_reverse_scatter_idx,
@@ -226,14 +156,35 @@ def _softmax_fwd_small_kernel(
 @torch.library.custom_op(
     add_op_namespace_prefix("_softmax_topk_fwd"), mutates_args={"topk_router_score", "topk_router_indices"}
 )
-def _softmax_topk_fwd(
-    router_logits: torch.Tensor, topk_router_score: torch.Tensor, topk_router_indices: torch.Tensor, E: int, K: int
+def _topk_softmax_fwd(
+    router_logits: torch.Tensor,
+    topk_router_score: torch.Tensor,
+    topk_router_indices: torch.Tensor,
+    E: int,
+    K: int,
+    is_softmax_over_topk: bool,
+    norm_topk_probs: bool,
 ) -> None:
-    # T = router_logits.shape[0]
     if E <= 4096 and K <= 16 and E % 8 == 0:
-        # fast topk-softmax fusion that covers most common MoE configs
-        _topk_fwd(router_logits, K, topk_router_score, topk_router_indices, require_softmax_fusion=True)
+        _topk_fwd(
+            router_logits,
+            K,
+            topk_router_score,
+            topk_router_indices,
+            is_softmax_over_topk=is_softmax_over_topk,
+            norm_topk_probs=norm_topk_probs,
+        )
     else:
-        topk_results = router_logits.topk(K, dim=-1)
-        topk_router_score.copy_(topk_results.values.softmax(dim=-1, dtype=torch.float32).to(topk_router_score.dtype))
-        topk_router_indices.copy_(topk_results.indices.to(topk_router_indices.dtype))
+        if is_softmax_over_topk:
+            topk_results = router_logits.topk(K, dim=-1)
+            vals = topk_results.values.softmax(dim=-1, dtype=torch.float32)
+            topk_router_score.copy_(vals.to(topk_router_score.dtype))
+            topk_router_indices.copy_(topk_results.indices.to(topk_router_indices.dtype))
+        else:
+            probs = router_logits.softmax(dim=-1, dtype=torch.float32)
+            topk_results = probs.topk(K, dim=-1)
+            vals = topk_results.values
+            if norm_topk_probs:
+                vals = vals / vals.sum(dim=-1, keepdim=True)
+            topk_router_score.copy_(vals.to(topk_router_score.dtype))
+            topk_router_indices.copy_(topk_results.indices.to(topk_router_indices.dtype))

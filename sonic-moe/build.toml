@@ -3,11 +3,11 @@ name = "sonic-moe"
 license = "Apache-2.0"
 backends = ["cuda"]
 version = 1
+python-depends = ["tvm-ffi"]
 
 [general.hub]
 repo-id = "kernels-community/sonic-moe"
-branch = "concatenated-gate-up"
 
 [general.cuda]
-minver = "12.8"
+minver = "12.9"
 python-depends = ["nvidia-cutlass-dsl"]

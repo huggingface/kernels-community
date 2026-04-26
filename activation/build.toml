@@ -1,9 +1,11 @@
 [general]
 name = "activation"
-license = "Apache-2.0"
 version = 1
-backends = ["cuda", "metal"]
-
+license = "Apache-2.0"
+backends = [
+    "cuda",
+    "metal",
+]
 
 [general.hub]
 repo-id = "kernels-community/activation"
@@ -14,6 +16,14 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
+[kernel.activation_metal]
+backend = "metal"
+depends = ["torch"]
+src = [
+    "activation_metal/activation.mm",
+    "activation_metal/activation.metal",
+]
+
 [kernel.activation]
 backend = "cuda"
 depends = ["torch"]
@@ -21,12 +31,4 @@ src = [
     "activation/activation_kernels.cu",
     "activation/cuda_compat.h",
     "activation/dispatch_utils.h",
-]
-
-[kernel.activation_metal]
-backend = "metal"
-depends = ["torch"]
-src = [
-    "activation_metal/activation.mm",
-    "activation_metal/activation.metal",
 ]

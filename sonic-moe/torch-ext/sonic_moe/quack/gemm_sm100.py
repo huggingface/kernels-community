@@ -1,18 +1,18 @@
+# Copyright (c) 2025-2026, Tri Dao.
 # Based on the cute-dsl example:
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/dense_gemm_persistent.py
 
-import argparse
 from typing import Optional, Type, Tuple, Union, Callable, Literal
 from functools import partial
+import math
 
 import cuda.bindings.driver as cuda
-import torch
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
-import cutlass.torch as cutlass_torch
 import cutlass.pipeline as pipeline
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu.warp import (
@@ -23,15 +23,15 @@ from cutlass.cute.nvgpu.warp import (
 )
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
-from cutlass.cute.runtime import from_dlpack, make_ptr
 
-from .pipeline import PipelineTmaCpAsyncUmma
-from .cute_dsl_utils import ParamsBase, ArgumentsBase
+from .pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
 from .tile_scheduler import TileSchedulerOptions
 from .varlen_utils import VarlenArguments, VarlenManager
 from .gemm_sm90 import GemmSm90, NamedBarrierGemm
+from . import layout_utils
 from . import copy_utils as copy_utils
 from . import sm100_utils as quack_sm100_utils
+from .layout_utils import tile_atom_to_shape_SF_strided
 
 # return PipelineStateWAdvance instead of PipelineState
 
@@ -93,11 +93,9 @@ Constraints are same as dense_gemm.py:
 * Mma tiler M must be 64/128 (use_2cta_instrs=False) or 128/256 (use_2cta_instrs=True)
 * Mma tiler N must be 32-256, step 32
 * Cluster shape M/N must be positive and power of 2, total cluster size <= 16
-* Cluster shape M must be multiple of 2 if use_2cta_instrs=True
 * The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
   i.e, number of elements is a multiple of 4, 8, and 16 for TFloat32,
   Float16/BFloat16, and Int8/Uint8/Float8, respectively.
-* OOB tiles are not allowed when TMA store is disabled
 """
 
 
@@ -107,8 +105,9 @@ class GemmSm100(GemmSm90):
 
     :param acc_dtype: Data type for accumulation during computation
     :type acc_dtype: type[cutlass.Numeric]
-    :param mma_tiler_mn: Shape of the Matrix Multiply-Accumulate (MMA) tile (M,N)
-    :type mma_tiler_mn: Tuple[int, int]
+    :param mma_tiler_mn: Shape of the MMA tile. Pass (M, N) to default K to
+        4 MMA instructions, or (M, N, K) to set the K tile size explicitly.
+    :type mma_tiler_mn: Union[Tuple[int, int], Tuple[int, int, int]]
     :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
     :type cluster_shape_mn: Tuple[int, int]
 
@@ -149,7 +148,6 @@ class GemmSm100(GemmSm90):
     """
 
     arch = 100
-    num_epi_tensormaps = GemmSm90.num_epi_tensormaps
 
     EpilogueArguments = GemmSm90.EpilogueArguments
     EpilogueParams = GemmSm90.EpilogueParams
@@ -158,10 +156,14 @@ class GemmSm100(GemmSm90):
         self,
         acc_dtype: Type[cutlass.Numeric],
         a_dtype: Type[cutlass.Numeric],  # ignored for now
-        mma_tiler_mn: Tuple[int, int],
+        mma_tiler_mn: Union[Tuple[int, int], Tuple[int, int, int]],
         cluster_shape_mnk: Tuple[int, int, int],
         sf_vec_size: Optional[int] = None,
         gather_A: bool = False,
+        use_tma_gather: bool = False,
+        use_clc_persistence: bool = True,
+        concat_layout: tuple | None = None,
+        use_pdl: bool = True,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -178,37 +180,61 @@ class GemmSm100(GemmSm90):
 
         :param acc_dtype: Data type of the accumulator.
         :type acc_dtype: type[cutlass.Numeric]
-        :param mma_tiler_mn: Tuple (M, N) shape of the MMA instruction.
-        :type mma_tiler_mn: Tuple[int, int]
+        :param mma_tiler_mn: (M, N) or (M, N, K) shape of the MMA tile.
+            If only (M, N) is given, K defaults to 4 * instruction K.
+        :type mma_tiler_mn: Union[Tuple[int, int], Tuple[int, int, int]]
         :param cluster_shape_mnk: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mnk: Tuple[int, int]
         """
 
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
-        self.use_2cta_instrs = cluster_shape_mnk[0] == 2 and mma_tiler_mn[0] in (256,)
+        self.use_2cta_instrs = mma_tiler_mn[0] in (256,)
         self.cluster_shape_mnk = cluster_shape_mnk
         assert cluster_shape_mnk[2] == 1, "Cluster shape K must be 1"
-        # K dimension is deferred in _setup_attributes
-        self.mma_tiler = (*mma_tiler_mn, 1)
+        # K dimension: if user provides 3 values, use their K; otherwise default in _setup_attributes
+        if len(mma_tiler_mn) == 3:
+            self.mma_tiler = tuple(mma_tiler_mn)
+        else:
+            self.mma_tiler = (*mma_tiler_mn, 0)
         self.sf_vec_size = sf_vec_size
         self.blockscaled = sf_vec_size is not None
         self.is_persistent = True
         self.pingpong = False  # for compatibility with GemmSm90
+        self.use_clc_persistence = use_clc_persistence
         self.gather_A = gather_A
+        self.concat_layout = concat_layout or ()
+        self.use_tma_gather = use_tma_gather
+        self.use_pdl = use_pdl
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
+        if use_tma_gather:
+            assert gather_A, "TMA gather requires gather_A=True"
 
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
-        self.num_ab_load_warps = 1 if not self.gather_A else 5
+        self.num_ab_load_warps = 1 if not self.gather_A else 4
         self.occupancy = 1
         # Set specialized warp ids
-        self.epilog_warp_id = (0, 1, 2, 3)
-        self.mma_warp_id = 4
-        self.ab_load_warp_id = 5
+        self.epi_warps_per_accumulator = 4
+        num_epi_warps = self.epi_warps_per_accumulator
+        self.epilog_warp_id = tuple(range(num_epi_warps))
+        self.mma_warp_id = len(self.epilog_warp_id)
+        self.ab_load_warp_id = self.mma_warp_id + 1
         self.epi_load_warp_id = self.ab_load_warp_id + self.num_ab_load_warps
         self.scheduler_warp_id = self.epi_load_warp_id + 1
+        # For gather_A: separate A-index prefetch warp (was the empty warp)
+        self.a_prefetch_warp_id = self.scheduler_warp_id + 1 if self.gather_A else None
         self.num_epi_warps = len(self.epilog_warp_id)
+        self.epilogue_barrier = pipeline.NamedBarrier(
+            barrier_id=int(NamedBarrierGemm.Epilogue),
+            num_threads=self.num_epi_warps * cute.arch.WARP_SIZE,
+        )
+        # Register reallocation for gather_A (3 warp groups, 504 regs total, 168 per WG default).
+        # Heavy epilogues (e.g. colvec_reduce in DGated) override these to avoid register spilling.
+        # Without gather_A there are only 2 WGs (512 total, 256 per WG = max), no reallocation needed.
+        self.num_regs_other = 120
+        self.num_regs_epi = 256
+        extra_warp_ids = (self.a_prefetch_warp_id,) if self.gather_A else ()
         self.threads_per_cta = cute.arch.WARP_SIZE * (
             self.num_ab_load_warps
             + len(
@@ -217,9 +243,12 @@ class GemmSm100(GemmSm90):
                     self.epi_load_warp_id,
                     self.scheduler_warp_id,
                     *self.epilog_warp_id,
+                    *extra_warp_ids,
                 )
             )
         )
+        # Multiple of 4 warps to increase/decrease number of registers
+        assert self.threads_per_cta % 128 == 0
 
     def _setup_attributes(self, epilogue_args: EpilogueArguments, varlen_args: VarlenArguments):
         """Set up configurations that are dependent on GEMM inputs
@@ -238,9 +267,10 @@ class GemmSm100(GemmSm90):
         # Compute mma instruction shapes
         mma_inst_bits_k = 256
         # (MMA_Tile_Shape_M, MMA_Tile_Shape_N, MMA_Inst_Shape_K)
+        mma_inst_shape_n = self.mma_tiler[1] if self.mma_tiler[1] <= 256 else self.mma_tiler[1] // 2
         self.mma_inst_shape_mnk = (
             self.mma_tiler[0],
-            self.mma_tiler[1],
+            mma_inst_shape_n,
             mma_inst_bits_k // self.a_dtype.width,
         )
         # (CTA_Tile_Shape_M, Round_Up(MMA_Tile_Shape_N, 128), MMA_Inst_Shape_K)
@@ -258,7 +288,7 @@ class GemmSm100(GemmSm90):
                 self.b_major_mode,
                 self.acc_dtype,
                 self.cta_group,
-                self.mma_tiler[:2],
+                self.mma_inst_shape_mnk[:2],
             )
             self.tiled_mma_sfb = None
         else:
@@ -282,10 +312,13 @@ class GemmSm100(GemmSm90):
             )
 
         # Compute mma/cluster/tile shapes
-        mma_inst_tile_k = 4
+        if self.mma_tiler[2] > 0:
+            mma_inst_tile_k = self.mma_tiler[2] // self.mma_inst_shape_mnk[2]
+        else:
+            mma_inst_tile_k = 4
         self.mma_tiler = (
-            self.mma_inst_shape_mnk[0],
-            self.mma_inst_shape_mnk[1],
+            self.mma_tiler[0],
+            self.mma_tiler[1],
             self.mma_inst_shape_mnk[2] * mma_inst_tile_k,
         )
         if const_expr(self.blockscaled):
@@ -301,6 +334,14 @@ class GemmSm100(GemmSm90):
             self.mma_tiler[1],
             self.mma_tiler[2],
         )
+        if const_expr(self.blockscaled):
+            self.cta_tile_shape_mnk_sfb = (
+                self.mma_tiler_sfb[0] // cute.size(self.tiled_mma.thr_id.shape),
+                self.mma_tiler_sfb[1],
+                self.mma_tiler_sfb[2],
+            )
+        else:
+            self.cta_tile_shape_mnk_sfb = None
 
         # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -335,6 +376,16 @@ class GemmSm100(GemmSm90):
             layout_c=self.c_layout,
             elem_ty_c=self.c_dtype,
         )
+        # TMA store tile starts must stay aligned when advancing across CTA-N tiles.
+        # There's a bug w compute_epilogue_tile_shape (as of cutlass-dsl 4.4.2) where if
+        # tile_n = 224 and there's C, it will set epi_tile to (128, 64).
+        if const_expr(self.cta_tile_shape_mnk[1] % cute.size(self.epi_tile[1]) != 0):
+            warp_n = 2 if (self.cta_tile_shape_mnk[0] == 64 and self.use_2cta_instrs) else 1
+            epi_tile_n = math.gcd(self.cta_tile_shape_mnk[1], cute.size(self.epi_tile[1]))
+            epi_tile_n_layout = cute.make_layout(
+                (epi_tile_n // warp_n, warp_n), stride=(1, self.cta_tile_shape_mnk[1] // warp_n)
+            )
+            self.epi_tile = (self.epi_tile[0], cute.coalesce(epi_tile_n_layout))
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
         prefetch_A_idx = (
@@ -378,9 +429,14 @@ class GemmSm100(GemmSm90):
         )
         self.a_smem_load_layout_staged = self.a_smem_layout_staged
         if const_expr(self.gather_A):
-            self.a_smem_load_layout_staged = quack_sm100_utils.make_smem_layout_cpasync_a(
-                self.tiled_mma, self.mma_tiler, self.a_dtype, self.ab_stage
-            )
+            if const_expr(self.use_tma_gather):
+                self.a_smem_load_layout_staged = quack_sm100_utils.make_smem_layout_tma_gather_a(
+                    self.tiled_mma, self.mma_tiler, self.a_dtype, self.ab_stage
+                )
+            else:
+                self.a_smem_load_layout_staged = quack_sm100_utils.make_smem_layout_cpasync_a(
+                    self.tiled_mma, self.mma_tiler, self.a_dtype, self.ab_stage
+                )
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             self.tiled_mma, self.mma_tiler, self.b_dtype, self.ab_stage
         )
@@ -416,8 +472,32 @@ class GemmSm100(GemmSm90):
                 self.tiled_mma, self.mma_tiler, self.num_acc_stage
             )
         else:
-            SM100_TMEM_CAPACITY_COLUMNS = 512
-            self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
+            self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
+
+        # Overlapping accumulator and scaling factor in tmem, targetting the case tile_n == 256
+        # For iter 0, 2, ..., accum is in col 0...255 and SF are in col 256...256+SF_size.
+        # For iter 1, 3, ..., accum is in col 256...511 and SF are in col 0...0+SF_size.
+        # During the epilogue, we release acc_pipeline after being done with @SF_size columns.
+        # In the cute-dsl example,
+        # https://github.com/NVIDIA/cutlass/blob/08185b9c3e90510ee2b656662ed0d53b06d28157/examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py#L369
+        # instead the 2 stages of accum are in col 0...255 and 256-SF_size...512-SF_size, and
+        # the SF are in 512-SF_size...511. The 2 accum stages overlap, so in the epilogue,
+        # they alternate the direction of epi tiles (from right to left, then from left to right)
+        # to release acc_pipeline early.
+        # The two approaches perform about the same.
+        self.overlap_accum_sf = self.blockscaled and self.num_acc_stage == 1
+        if const_expr(self.overlap_accum_sf):
+            num_sf_tmem_cols = (
+                (
+                    cute.ceil_div(self.cta_tile_shape_mnk[0], 128)
+                    + cute.ceil_div(self.cta_tile_shape_mnk[1], 128)
+                )
+                * 4  # 4 cols per stage
+                * (self.mma_inst_shape_mnk[2] // self.sf_vec_size)
+            )
+            self.iter_acc_early_release = num_sf_tmem_cols // cute.size(self.epi_tile[1])
+        else:
+            self.iter_acc_early_release = -1
 
     @cute.jit
     def __call__(
@@ -426,12 +506,13 @@ class GemmSm100(GemmSm90):
         mB: cute.Tensor,
         mD: Optional[cute.Tensor],
         mC: Optional[cute.Tensor],
-        epilogue_args: ArgumentsBase,
+        epilogue_args: tuple,
         scheduler_args: TileSchedulerOptions,
         varlen_args: Optional[VarlenArguments],
         stream: cuda.CUstream,
         mSFA: Optional[cute.Tensor] = None,
         mSFB: Optional[cute.Tensor] = None,
+        trace_ptr: Optional[cutlass.Int64] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -455,6 +536,13 @@ class GemmSm100(GemmSm90):
         """
         if const_expr(self.blockscaled):
             assert mSFA is not None and mSFB is not None
+        # Concat layout: interleave the non-contiguous dim (detected via leading_dim).
+        mA, mB, mD, mC = [
+            layout_utils.concat_to_interleave(mT, 1 - mT.leading_dim)
+            if const_expr(name in self.concat_layout and mT is not None)
+            else mT
+            for name, mT in [("A", mA), ("B", mB), ("out", mD), ("C", mC)]
+        ]
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype = mA.element_type
         self.b_dtype = mB.element_type
@@ -477,29 +565,32 @@ class GemmSm100(GemmSm90):
         if const_expr(varlen_args is None):
             varlen_args = VarlenArguments()
         assert (varlen_args.mAIdx is not None) == self.gather_A
-
-        # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: tuple(
-            cute.assume(s, divby=128 // t.element_type.width) if not cute.is_static(s) else s
-            for s in t.stride
-        )
-        mA, mD = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            if t is not None
-            else None
-            for t in (mA, mD)
-        ]
+        varlen_m = varlen_args.mCuSeqlensM is not None
+        varlen_k = varlen_args.mCuSeqlensK is not None
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes(epilogue_args, varlen_args)
 
         if const_expr(self.blockscaled):
-            # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
-            # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
-            sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(mA.shape, self.sf_vec_size)
+            # Rebuild the SFA/SFB layouts from mSFA/mSFB's actual strides
+            # so non-packed buffers work (e.g. a slice of a larger scale tensor).
+            # Only the innermost 512-B tile must be contiguous.
+            # For varlen_m, mSFA is sized for per-expert 128-row-padded storage
+            # (dQaccum format), so use its own M dim (= total_padded_rm * 128)
+            # instead of mA.shape[0] (= total_m, unpadded).
+            if const_expr(cute.rank(mA) == 3):
+                sfa_shape = mA.shape
+            elif const_expr(varlen_m):
+                sfa_shape = (mSFA.shape[1] * 128, mA.shape[1])
+            else:  # varlen_k
+                sfa_shape = (mA.shape[0], mSFA.shape[2] * 128)
+            sfa_layout = tile_atom_to_shape_SF_strided(sfa_shape, self.sf_vec_size, mSFA.stride)
             mSFA = cute.make_tensor(mSFA.iterator, sfa_layout)
-            # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
-            sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(mB.shape, self.sf_vec_size)
+            if const_expr(cute.rank(mB) == 3):
+                sfb_shape = mB.shape
+            else:  # varlen_k: mB is (n, total_k)
+                sfb_shape = (mB.shape[0], mSFB.shape[2] * 128)
+            sfb_layout = tile_atom_to_shape_SF_strided(sfb_shape, self.sf_vec_size, mSFB.stride)
             mSFB = cute.make_tensor(mSFB.iterator, sfb_layout)
 
         atom_thr_size = cute.size(self.tiled_mma.thr_id.shape)
@@ -508,17 +599,33 @@ class GemmSm100(GemmSm90):
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
         tma_atom_a, tma_tensor_a = None, None
+        a_op = sm100_utils.cluster_shape_to_tma_atom_A(
+            self.cluster_shape_mnk, self.tiled_mma.thr_id
+        )
         if const_expr(not self.gather_A):
-            a_op = sm100_utils.cluster_shape_to_tma_atom_A(
-                self.cluster_shape_mnk, self.tiled_mma.thr_id
-            )
             tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
                 a_op,
-                mA,
+                copy_utils.create_ragged_tensor_for_tma(mA, ragged_dim=1, ptr_shift=False)
+                if varlen_k and not self.gather_A
+                else mA,
                 a_smem_layout,
                 self.mma_tiler,
                 self.tiled_mma,
                 self.cluster_layout_vmnk.shape,
+                internal_type=(cutlass.TFloat32 if mA.element_type is Float32 else None),
+            )
+        elif const_expr(self.use_tma_gather):
+            # gather4 descriptor: box has 1 in the gathered dim, tile size in the contiguous dim.
+            # varlen_m (K-major): box (1, tile_K), gather M rows at K offset
+            # varlen_k (M-major): box (64, 1), gather K cols at M offset
+            tma_smem_layout = quack_sm100_utils.make_smem_layout_atom_tma_gather_a(
+                self.tiled_mma, self.mma_tiler, self.a_dtype, gather_size=1
+            )
+            tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+                a_op,
+                mA,
+                tma_smem_layout,
+                tma_smem_layout.shape,
                 internal_type=(cutlass.TFloat32 if mA.element_type is Float32 else None),
             )
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(
@@ -526,7 +633,7 @@ class GemmSm100(GemmSm90):
         )
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
             b_op,
-            mB,
+            copy_utils.create_ragged_tensor_for_tma(mB, ragged_dim=1) if varlen_k else mB,
             b_smem_layout,
             self.mma_tiler,
             self.tiled_mma,
@@ -565,9 +672,29 @@ class GemmSm100(GemmSm90):
                 self.cluster_layout_sfb_vmnk.shape,
                 internal_type=cutlass.Int16,
             )
+            if const_expr(
+                self.cta_tile_shape_mnk[1] == 192 and self.sf_dtype is cutlass.Float8E8M0FNU
+            ):
+                x = tma_tensor_sfb.stride[0][1]
+                y = cute.ceil_div(tma_tensor_sfb.shape[0][1], 4)
+                tma_tensor_sfb = cute.make_tensor(
+                    tma_tensor_sfb.iterator,
+                    cute.make_layout(
+                        (
+                            (tma_tensor_sfb.shape[0][0], ((2, 2), y)),
+                            tma_tensor_sfb.shape[1],
+                            tma_tensor_sfb.shape[2],
+                        ),
+                        stride=(
+                            (tma_tensor_sfb.stride[0][0], ((x, x), 3 * x)),
+                            tma_tensor_sfb.stride[1],
+                            tma_tensor_sfb.stride[2],
+                        ),
+                    ),
+                )
 
         self.num_tma_load_bytes = cute.size_in_bytes(self.b_dtype, b_smem_layout)
-        if const_expr(not self.gather_A):
+        if const_expr(not self.gather_A or self.use_tma_gather):
             self.num_tma_load_bytes += cute.size_in_bytes(self.a_dtype, a_smem_layout)
         if const_expr(self.blockscaled):
             sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
@@ -579,7 +706,9 @@ class GemmSm100(GemmSm90):
         tma_atom_d, tma_tensor_d = None, None
         if const_expr(mD is not None):
             tma_atom_d, tma_tensor_d = self._make_tma_epi_atoms_and_tensors(
-                mD,
+                copy_utils.create_ragged_tensor_for_tma(mD, ragged_dim=0, ptr_shift=True)
+                if varlen_m
+                else mD,
                 self.epi_smem_layout_staged,
                 self.epi_tile,
                 op_type="store"
@@ -595,8 +724,10 @@ class GemmSm100(GemmSm90):
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
         varlen_params = VarlenManager.to_underlying_arguments(varlen_args)
 
-        TileSchedulerCls = self.get_scheduler_class(varlen_m=varlen_args.mCuSeqlensM is not None)
-        tile_sched_args = self.get_scheduler_arguments(mA, mB, mD, scheduler_args, varlen_args)
+        TileSchedulerCls = self.get_scheduler_class(varlen_m=varlen_m)
+        tile_sched_args = self.get_scheduler_arguments(
+            mA, mB, mD, scheduler_args, varlen_args, epilogue_args
+        )
         tile_sched_params = TileSchedulerCls.to_underlying_arguments(tile_sched_args)
         grid = TileSchedulerCls.get_grid_shape(
             tile_sched_params, scheduler_args.max_active_clusters
@@ -616,9 +747,7 @@ class GemmSm100(GemmSm90):
         a_idx_smem_size = 0
         if const_expr(self.gather_A):
             a_idx_smem_size = self.a_prefetch_stage * (
-                self.cta_tile_shape_mnk[0]
-                if varlen_args.mCuSeqlensM is not None
-                else self.cta_tile_shape_mnk[2]
+                self.cta_tile_shape_mnk[0] if varlen_m else self.cta_tile_shape_mnk[2]
             )
 
         # Define shared storage for kernel
@@ -631,7 +760,7 @@ class GemmSm100(GemmSm90):
             a_prefetch_pipeline_array_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.a_prefetch_stage * 2
             ]
-            tile_count: cute.struct.MemRange[Int32, self.sched_stage]
+            sched_data: cute.struct.MemRange[Int32, self.sched_stage * 12]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: Int32
             sAIdx: cute.struct.Align[cute.struct.MemRange[Int32, a_idx_smem_size], 16]
@@ -677,7 +806,7 @@ class GemmSm100(GemmSm90):
             self.tiled_mma,
             self.tiled_mma_sfb,
             tma_atom_a,
-            tma_tensor_a if const_expr(not self.gather_A) else mA,
+            tma_tensor_a if const_expr(not self.gather_A or self.use_tma_gather) else mA,
             tma_atom_b,
             tma_tensor_b,
             tma_atom_sfa,
@@ -702,12 +831,14 @@ class GemmSm100(GemmSm90):
             self.epi_tile,
             tile_sched_params,
             TileSchedulerCls,
+            trace_ptr,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
         )
         return
 
@@ -729,7 +860,7 @@ class GemmSm100(GemmSm90):
         mD_mnl: Optional[cute.Tensor],
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: Optional[cute.Tensor],
-        epilogue_params: ParamsBase,
+        epilogue_params,
         varlen_params: VarlenManager.Params,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: Optional[cute.Layout],
@@ -741,12 +872,17 @@ class GemmSm100(GemmSm90):
         epi_smem_layout: Union[cute.Layout, cute.ComposedLayout, None],
         epi_c_smem_layout: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
-        tile_sched_params: ParamsBase,
+        tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
+        trace_ptr: Optional[cutlass.Int64] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
+
+        from .trace import TraceContext
+
+        tctx = TraceContext.create(trace_ptr)
 
         varlen_m = const_expr(varlen_params.cu_seqlens_m is not None)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
@@ -758,9 +894,7 @@ class GemmSm100(GemmSm90):
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        # /////////////////////////////////////////////////////////////////////////////
-        #  Prefetch Tma desc
-        # /////////////////////////////////////////////////////////////////////////////
+        # Prefetch Tma desc
         if warp_idx == self.ab_load_warp_id:
             for tma_atom in (
                 tma_atom_a,
@@ -775,9 +909,7 @@ class GemmSm100(GemmSm90):
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
-        #
         # Setup cta/thread coordinates
-        #
         # Coords inside cluster
         bidx, _, _ = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
@@ -786,20 +918,9 @@ class GemmSm100(GemmSm90):
         # Coord inside cta
         tidx, _, _ = cute.arch.thread_idx()
 
-        #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
-        #
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
-
-        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
-        tmem_holding_buf = storage.tmem_holding_buf
-
-        # Tensor memory dealloc barrier init
-        if use_2cta_instrs:
-            if warp_idx == self.ab_load_warp_id:
-                num_tmem_dealloc_threads = 32
-                cute.arch.mbarrier_init(tmem_dealloc_mbar_ptr, num_tmem_dealloc_threads)
 
         # Initialize pipelines and states
         ab_pipeline = self.make_ab_pipeline(
@@ -819,20 +940,35 @@ class GemmSm100(GemmSm90):
             acc_pipeline_mbar_ptr=storage.acc_pipeline_array_ptr.data_ptr(),
         )
         sched_pipeline = None
-        tile_count = None
-        if const_expr(tile_sched_params.tile_count_semaphore is not None):
-            # Dynamic persistent scheduler
+        sched_data = None
+        if const_expr(self.is_persistent):
             sched_pipeline = self.make_sched_pipeline(
                 self.cluster_shape_mnk,
                 sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr(),
                 has_C=has_C,
             )
-            tile_count = storage.tile_count.get_tensor((self.sched_stage,))
+            sched_data = storage.sched_data.get_tensor((12, self.sched_stage))
         a_prefetch_pipeline = None
         if const_expr(self.gather_A):
             a_prefetch_pipeline = self.make_a_prefetch_pipeline(
                 storage.a_prefetch_pipeline_array_ptr.data_ptr(),
             )
+
+        tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=int(NamedBarrierGemm.TmemPtr),
+            num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.epilog_warp_id)),
+        )
+        # Tensor memory dealloc barrier init
+        tmem = cutlass.utils.TmemAllocator(
+            storage.tmem_holding_buf,
+            barrier_for_retrieve=tmem_alloc_barrier,
+            allocator_warp_id=self.epilog_warp_id[0],
+            is_two_cta=use_2cta_instrs,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+        )
+
+        # Cluster arrive after barrier init
+        pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
 
         # Setup smem tensor A/B/D
         # (MMA, MMA_M, MMA_K, STAGE)
@@ -868,44 +1004,44 @@ class GemmSm100(GemmSm90):
         # (MMA, MMA_M, MMA_N)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         # (MMA, MMA_M, MMA_N, STAGE)
-        tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
+        tCtAcc_fake = tiled_mma.make_fragment_C(
+            cute.append(acc_shape, self.num_acc_stage if not self.overlap_accum_sf else 2)
+        )
 
         varlen_manager = VarlenManager.create(
             varlen_params,
-            has_D,
-            self.num_epi_tensormaps,
             # Only used if not varlen_m
             len_m_static=Int32(
-                mA_mkl.shape[0]
+                cute.size(mA_mkl, mode=[0])
                 if varlen_k or varlen_params.mAIdx is None
                 else varlen_params.mAIdx.shape[0]
             ),
-            len_k_static=Int32(mA_mkl.shape[1]),
+            len_k_static=Int32(cute.size(mA_mkl, mode=[1])),
         )
 
         TileSchedulerCls = partial(
-            TileSchedulerCls.create, tile_sched_params, tile_count, sched_pipeline
+            TileSchedulerCls.create, tile_sched_params, sched_data, sched_pipeline
         )
 
-        tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id=int(NamedBarrierGemm.TmemPtr),
-            num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.epilog_warp_id)),
-        )
         epi_load_barrier = None
         if const_expr(has_C):
             epi_load_barrier = pipeline.NamedBarrier(
                 barrier_id=int(NamedBarrierGemm.EpilogueLoad), num_threads=2 * cute.arch.WARP_SIZE
             )
 
-        #
+        # Cluster wait before tensor memory alloc
+        pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+
         # Specialized AB load warps
-        #
-        if warp_idx == self.ab_load_warp_id:
-            is_tma_warp = True
-            # initialize tensormap for A & B
-            varlen_manager.init_tensormap_AB(tma_atom_a, tma_atom_b, is_tma_warp)
-            tma_desc_a_ptr = varlen_manager.get_tma_desc_a_ptr()
-            tma_desc_b_ptr = varlen_manager.get_tma_desc_b_ptr()
+        if (
+            warp_idx >= self.ab_load_warp_id
+            and warp_idx < self.ab_load_warp_id + self.num_ab_load_warps
+        ):
+            # PDL: wait for prior kernel before any TMA loads (matches cutlass C++ main_load)
+            if const_expr(self.use_pdl):
+                cute.arch.griddepcontrol_wait()
+            if const_expr(self.gather_A):
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Compute multicast mask for A/B buffer full
             block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
             block_in_cluster_coord_sfb_vmnk = None
@@ -936,22 +1072,14 @@ class GemmSm100(GemmSm90):
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.ab_stage
             )
-            if const_expr(varlen_k):
-                # wait tensormap initialization complete before update
-                varlen_manager.fence_tensormap_init()
+            a_prefetch_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.a_prefetch_stage
+            )
             do_epi_load_barrier_arrive = Boolean(True)
             while work_tile.is_valid_tile:
                 tile_coord_mnkl = work_tile.tile_idx
                 batch_idx = tile_coord_mnkl[3]
-                varlen_manager.update_tensormap_AB(
-                    batch_idx,
-                    self.a_layout,
-                    self.b_layout,
-                    is_tma_warp,
-                )
-                # ///////////////////////////////////////////////////////////////////////////
-                #  Local_tile partition global tensors
-                # ///////////////////////////////////////////////////////////////////////////
+                # Local_tile partition global tensors
                 mma_tile_coord_mnl = (
                     tile_coord_mnkl[0] // cute.size(tiled_mma.thr_id.shape),
                     tile_coord_mnkl[1],
@@ -974,27 +1102,37 @@ class GemmSm100(GemmSm90):
                 )
                 if const_expr(self.blockscaled):
                     # (bM, bK)
+                    # SFA uses padded per-expert offset (dQaccum format), not
+                    # the A-data offset — allows varlen_m seqlens that aren't
+                    # multiples of 128.
                     gSFA_mkl = cute.local_tile(
-                        varlen_manager.offset_batch_A(mSFA_mkl, batch_idx),
+                        varlen_manager.offset_batch_SFA(mSFA_mkl, batch_idx),
                         cute.select(self.mma_tiler, [0, 2]),
                         (mma_tile_coord_mnl[0], None),
                     )
                     # (bN, bK)
+                    # SFB uses padded per-expert K offset in varlen_k (dQaccum format).
                     gSFB_nkl = cute.local_tile(
-                        varlen_manager.offset_batch_B(mSFB_nkl, batch_idx),
-                        cute.select(self.mma_tiler, [1, 2]),
-                        (mma_tile_coord_mnl[1], None),
+                        varlen_manager.offset_batch_SFB(mSFB_nkl, batch_idx),
+                        cute.select(self.mma_tiler_sfb, [1, 2]),
+                        (
+                            (
+                                mma_tile_coord_mnl[1] // 2
+                                if self.cta_tile_shape_mnk[1] == 64
+                                else mma_tile_coord_mnl[1]
+                            ),
+                            None,
+                        ),
                     )
 
                 # Partition global tensor for TiledMMA_A/B/D
                 # Then partition global/shared tensor for TMA load A/B
-                varlen_manager.fence_tensormap_update_AB(is_tma_warp)
                 len_k = varlen_manager.len_k(batch_idx)
                 # TMA load A partition_S/D
                 a_cta_layout = cute.make_layout(
                     cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
                 )
-                copy_A = None
+                copy_A, prefetch_A = None, None
                 if const_expr(not self.gather_A):
                     # (MMA, MMA_M, MMA_K, RestK)
                     tCgA = thr_mma.partition_A(gA_mk)
@@ -1005,8 +1143,31 @@ class GemmSm100(GemmSm90):
                         src_tensor=tCgA,
                         dst_tensor=sA,
                         mcast_mask=a_mcast_mask,
-                        tma_desc_ptr=tma_desc_a_ptr,
                     )
+                else:
+                    # For varlen_m paths (TMA or cp.async): consume indices from
+                    # a_prefetch_pipeline once per work tile.
+                    sAIdx_stage = sAIdx
+                    if const_expr(varlen_m):
+                        a_prefetch_pipeline.consumer_wait(a_prefetch_consumer_state)
+                        sAIdx_stage = sAIdx[None, a_prefetch_consumer_state.index]
+                    copy_A, prefetch_A = self._make_gather_A_copy(
+                        mA_mkl,
+                        sA,
+                        sAIdx_stage,
+                        tma_atom_a,
+                        varlen_manager,
+                        tile_coord_mnkl,
+                        batch_idx,
+                        warp_idx,
+                    )
+                    if const_expr(varlen_m):
+                        cute.arch.sync_warp()
+                        with cute.arch.elect_one():
+                            a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
+                        a_prefetch_consumer_state.advance()
+                    if const_expr(prefetch_A is not None):
+                        prefetch_A = partial(prefetch_A, a_prefetch_pipeline)
                 # (MMA, MMA_N, MMA_K, RestK)
                 tCgB = thr_mma.partition_B(gB_nk)
                 if const_expr(self.blockscaled):
@@ -1024,7 +1185,6 @@ class GemmSm100(GemmSm90):
                     src_tensor=tCgB,
                     dst_tensor=sB,
                     mcast_mask=b_mcast_mask,
-                    tma_desc_ptr=tma_desc_b_ptr,
                 )
                 copy_SFA, copy_SFB = None, None
                 if const_expr(self.blockscaled):
@@ -1037,7 +1197,6 @@ class GemmSm100(GemmSm90):
                         dst_tensor=sSFA,
                         filter_zeros=True,
                         mcast_mask=sfa_mcast_mask,
-                        # tma_desc_ptr=tma_desc_sfa_ptr,
                     )
                     # TMA load SFB partition_S/D
                     sfb_cta_layout = cute.make_layout(
@@ -1051,18 +1210,40 @@ class GemmSm100(GemmSm90):
                         dst_tensor=sSFB,
                         filter_zeros=True,
                         mcast_mask=sfb_mcast_mask,
-                        # tma_desc_ptr=tma_desc_sfa_ptr,
                     )
                 k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
-                ab_producer_state = self.load_AB(
-                    ab_pipeline,
-                    ab_producer_state,
-                    copy_A,
-                    copy_B,
-                    k_tile_cnt,
-                    copy_SFA,
-                    copy_SFB,
-                )
+                tctx.b("tma_load")
+                if const_expr(not self.gather_A):
+                    ab_producer_state = self.load_AB(
+                        ab_pipeline,
+                        ab_producer_state,
+                        copy_A,
+                        copy_B,
+                        k_tile_cnt,
+                        copy_SFA,
+                        copy_SFB,
+                    )
+                elif const_expr(self.use_tma_gather):
+                    ab_producer_state, a_prefetch_consumer_state = self.load_AB_tma_gather(
+                        ab_pipeline,
+                        ab_producer_state,
+                        a_prefetch_consumer_state,
+                        copy_A,
+                        prefetch_A,
+                        copy_B,
+                        k_tile_cnt,
+                    )
+                else:
+                    ab_producer_state, a_prefetch_consumer_state = self.load_AB_gather_A(
+                        ab_pipeline,
+                        ab_producer_state,
+                        a_prefetch_consumer_state,
+                        copy_A,
+                        prefetch_A,
+                        copy_B,
+                        k_tile_cnt,
+                    )
+                tctx.e("tma_load")
                 if const_expr(epi_load_barrier is not None):
                     # In the first work tile, the epi load warp will wait for the signal
                     # from the mainloop load warp to start loading C, to avoid interfering
@@ -1074,177 +1255,113 @@ class GemmSm100(GemmSm90):
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
             # Wait A/B buffer empty
-            ab_pipeline.producer_tail(ab_producer_state)
+            if warp_idx == self.ab_load_warp_id:
+                ab_pipeline.producer_tail(ab_producer_state)
 
-        if const_expr(self.gather_A):
-            if (
-                warp_idx >= self.ab_load_warp_id + 1
-                and warp_idx < self.ab_load_warp_id + self.num_ab_load_warps
-            ):
-                # Persistent tile scheduling loop
-                tile_scheduler = TileSchedulerCls()
-                work_tile = tile_scheduler.initial_work_tile_info()
-                ab_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.ab_stage
-                )
-                a_prefetch_consumer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, self.a_prefetch_stage
-                )
-                while work_tile.is_valid_tile:
-                    tile_coord_mnkl = work_tile.tile_idx
-                    batch_idx = tile_coord_mnkl[3]
-                    # ///////////////////////////////////////////////////////////////////////////
-                    #  Local_tile partition global tensors
-                    # ///////////////////////////////////////////////////////////////////////////
-                    mAIdx_mk = varlen_manager.offset_batch_AIdx(batch_idx)
-                    if const_expr(varlen_m):
-                        # (M, K)
-                        mA_mk = mA_mkl
-                    else:
-                        assert varlen_k
-                        # (tile_M, K)
-                        mA_mk = cute.local_tile(
-                            mA_mkl, (self.cta_tile_shape_mnk[0],), (tile_coord_mnkl[0], None)
-                        )
-                    # Partition global tensor for TiledMMA_A/B/D
-                    len_m = varlen_manager.len_m(batch_idx)
-                    len_k = varlen_manager.len_k(batch_idx)
-                    # TMA load A partition_S/D
-                    tiled_copy_A = self._make_gmem_tiled_copy_A(
-                        mA_mkl.element_type, self.a_layout, (self.num_ab_load_warps - 1) * 32
-                    )
-                    tidx = cute.arch.thread_idx()[0] - (self.ab_load_warp_id + 1) * 32
-                    thr_copy_A = tiled_copy_A.get_slice(tidx)
-                    copy_A, prefetch_A = None, None
-                    if const_expr(varlen_m):
-                        a_prefetch_pipeline.consumer_wait(a_prefetch_consumer_state)
-                        copy_A = copy_utils.gather_m_get_copy_fn(
-                            thr_copy_A,
-                            mA_mk,
-                            sA,
-                            sAIdx[None, a_prefetch_consumer_state.index],
-                            limit_m=len_m - tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0],
-                            limit_k=len_k,
-                        )
-                        cute.arch.sync_warp()
-                        with cute.arch.elect_one():
-                            a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
-                        a_prefetch_consumer_state.advance()
-                    else:
-                        copy_A, prefetch_A = copy_utils.gather_k_get_copy_fn(
-                            thr_copy_A,
-                            mA_mk,
-                            sA,
-                            sAIdx,
-                            limit_m=len_m - tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0],
-                            limit_k=len_k,
-                        )
-                        prefetch_A = partial(prefetch_A, a_prefetch_pipeline)
-                    k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
-                    ab_producer_state, a_prefetch_consumer_state = self.load_A_gather_A(
-                        ab_pipeline,
-                        ab_producer_state,
-                        a_prefetch_consumer_state,
-                        copy_A,
-                        prefetch_A,
-                        k_tile_cnt,
-                    )
-                    # Advance to next tile
-                    tile_scheduler.advance_to_next_work()
-                    work_tile = tile_scheduler.get_current_work()
-
-        #
-        # Specialized scheduler warp. Will also prefetch A indices if gatherA
-        #
-        if const_expr(tile_sched_params.tile_count_semaphore is not None or self.gather_A):
+        # Specialized scheduler warp
+        if const_expr(self.is_persistent or self.gather_A):
             if warp_idx == self.scheduler_warp_id:
+                # PDL: wait for prior kernel before reading CLC state (matches cutlass C++ sched)
+                if const_expr(self.use_pdl):
+                    cute.arch.griddepcontrol_wait()
+                if const_expr(self.gather_A):
+                    cute.arch.setmaxregister_decrease(self.num_regs_other)
                 is_scheduler_warp = True
                 if const_expr(cute.size(cluster_layout_vmnk) > 1):
                     is_scheduler_warp = cute.arch.block_idx_in_cluster() == 0
-                tile_M = self.cta_tile_shape_mnk[0]
-                tile_K = self.cta_tile_shape_mnk[2]
-                thr_copy_AIdx, tAsAIdx, tAcAIdx = None, None, None
-                if const_expr(self.gather_A):
-                    tiled_copy_AIdx = copy_utils.tiled_copy_1d(Int32, num_threads=32, is_async=True)
-                    thr_copy_AIdx = tiled_copy_AIdx.get_slice(cute.arch.lane_idx())
-                    tAsAIdx = thr_copy_AIdx.partition_D(sAIdx)
-                    tAcAIdx = thr_copy_AIdx.partition_S(
-                        cute.make_identity_tensor(tile_M if varlen_m else tile_K)
-                    )
                 # Persistent tile scheduling loop
                 tile_scheduler = TileSchedulerCls(is_scheduler_warp=is_scheduler_warp)
                 work_tile = tile_scheduler.initial_work_tile_info()
-                a_prefetch_producer_state = None
-                if const_expr(self.gather_A):
-                    a_prefetch_producer_state = pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Producer, self.a_prefetch_stage
-                    )
                 while work_tile.is_valid_tile:
-                    if const_expr(self.gather_A):
-                        tile_coord_mnkl = work_tile.tile_idx
-                        batch_idx = tile_coord_mnkl[3]
-                        mAIdx_mk = varlen_manager.offset_batch_AIdx(batch_idx)
-                        if const_expr(varlen_m):
-                            # (tile_M,)
-                            gAIdx = cute.local_tile(mAIdx_mk, (tile_M,), (tile_coord_mnkl[0],))
-                            tAgAIdx = thr_copy_AIdx.partition_S(gAIdx)
-                            len_m = varlen_manager.len_m(batch_idx)
-                            m_limit = len_m - tile_coord_mnkl[0] * tile_M
-                            tApAIdx_m = cute.make_fragment((1, tAsAIdx.shape[1]), Boolean)
-                            for m in cutlass.range(tAsAIdx.shape[1], unroll_full=True):
-                                tApAIdx_m[0, m] = tAcAIdx[0, m] < m_limit
-                            a_prefetch_pipeline.producer_acquire(a_prefetch_producer_state)
-                            cute.copy(
-                                thr_copy_AIdx,
-                                tAgAIdx,
-                                tAsAIdx[None, None, a_prefetch_producer_state.index],
-                                pred=tApAIdx_m,
-                            )
-                            a_prefetch_pipeline.producer_commit(a_prefetch_producer_state)
-                            a_prefetch_producer_state.advance()
-                        else:
-                            # (tile_K, RestK)
-                            gAIdx = cute.flat_divide(mAIdx_mk, (tile_K,))
-                            tAgAIdx = thr_copy_AIdx.partition_S(gAIdx)
-                            len_k = varlen_manager.len_k(batch_idx)
-                            k_tile_cnt = cute.ceil_div(len_k, tile_K)
-                            for k_tile in cutlass.range(k_tile_cnt - 1, unroll=1):
-                                a_prefetch_pipeline.producer_acquire(a_prefetch_producer_state)
-                                cute.copy(
-                                    thr_copy_AIdx,
-                                    tAgAIdx[None, None, k_tile],
-                                    tAsAIdx[None, None, a_prefetch_producer_state.index],
-                                )
-                                a_prefetch_pipeline.producer_commit(a_prefetch_producer_state)
-                                a_prefetch_producer_state.advance()
-                            if 0 < k_tile_cnt:
-                                k_tile = k_tile_cnt - 1
-                                k_limit = len_k - k_tile * tile_K
-                                tApAIdx_k = cute.make_fragment((1, tAsAIdx.shape[1]), Boolean)
-                                for m in cutlass.range(tAsAIdx.shape[1], unroll_full=True):
-                                    tApAIdx_k[0, m] = tAcAIdx[0, m] < k_limit
-                                a_prefetch_pipeline.producer_acquire(a_prefetch_producer_state)
-                                cute.copy(
-                                    tiled_copy_AIdx,
-                                    tAgAIdx[None, None, k_tile],
-                                    tAsAIdx[None, None, a_prefetch_producer_state.index],
-                                    pred=tApAIdx_k,
-                                )
-                                a_prefetch_pipeline.producer_commit(a_prefetch_producer_state)
-                                a_prefetch_producer_state.advance()
                     # Advance to next tile
-                    tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                     work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
                 if is_scheduler_warp:
                     tile_scheduler.producer_tail()
 
-        #
+        # Specialized A-index prefetch warp (gather_A only)
+        if const_expr(self.gather_A):
+            if warp_idx == self.a_prefetch_warp_id:
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
+                tile_M = self.cta_tile_shape_mnk[0]
+                tile_K = self.cta_tile_shape_mnk[2]
+                tiled_copy_AIdx = copy_utils.tiled_copy_1d(Int32, num_threads=32, is_async=True)
+                thr_copy_AIdx = tiled_copy_AIdx.get_slice(cute.arch.lane_idx())
+                tAsAIdx = thr_copy_AIdx.partition_D(sAIdx)
+                tAcAIdx = thr_copy_AIdx.partition_S(
+                    cute.make_identity_tensor(tile_M if varlen_m else tile_K)
+                )
+                # Persistent tile scheduling loop
+                tile_scheduler = TileSchedulerCls()
+                work_tile = tile_scheduler.initial_work_tile_info()
+                a_prefetch_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.a_prefetch_stage
+                )
+                while work_tile.is_valid_tile:
+                    tile_coord_mnkl = work_tile.tile_idx
+                    batch_idx = tile_coord_mnkl[3]
+                    mAIdx_mk = varlen_manager.offset_batch_AIdx(batch_idx)
+                    if const_expr(varlen_m):
+                        # (tile_M,)
+                        gAIdx = cute.local_tile(mAIdx_mk, (tile_M,), (tile_coord_mnkl[0],))
+                        tAgAIdx = thr_copy_AIdx.partition_S(gAIdx)
+                        len_m = varlen_manager.len_m(batch_idx)
+                        m_limit = len_m - tile_coord_mnkl[0] * tile_M
+                        tApAIdx_m = cute.make_rmem_tensor((1, tAsAIdx.shape[1]), Boolean)
+                        for m in cutlass.range(tAsAIdx.shape[1], unroll_full=True):
+                            tApAIdx_m[0, m] = tAcAIdx[0, m] < m_limit
+                        a_prefetch_pipeline.producer_acquire(a_prefetch_producer_state)
+                        cute.copy(
+                            thr_copy_AIdx,
+                            tAgAIdx,
+                            tAsAIdx[None, None, a_prefetch_producer_state.index],
+                            pred=tApAIdx_m,
+                        )
+                        a_prefetch_pipeline.producer_commit(a_prefetch_producer_state)
+                        a_prefetch_producer_state.advance()
+                    else:
+                        # (tile_K, RestK)
+                        gAIdx = cute.flat_divide(mAIdx_mk, (tile_K,))
+                        tAgAIdx = thr_copy_AIdx.partition_S(gAIdx)
+                        len_k = varlen_manager.len_k(batch_idx)
+                        k_tile_cnt = cute.ceil_div(len_k, tile_K)
+                        for k_tile in cutlass.range(k_tile_cnt - 1, unroll=1):
+                            a_prefetch_pipeline.producer_acquire(a_prefetch_producer_state)
+                            cute.copy(
+                                thr_copy_AIdx,
+                                tAgAIdx[None, None, k_tile],
+                                tAsAIdx[None, None, a_prefetch_producer_state.index],
+                            )
+                            a_prefetch_pipeline.producer_commit(a_prefetch_producer_state)
+                            a_prefetch_producer_state.advance()
+                        if 0 < k_tile_cnt:
+                            k_tile = k_tile_cnt - 1
+                            k_limit = len_k - k_tile * tile_K
+                            tApAIdx_k = cute.make_rmem_tensor((1, tAsAIdx.shape[1]), Boolean)
+                            for m in cutlass.range(tAsAIdx.shape[1], unroll_full=True):
+                                tApAIdx_k[0, m] = tAcAIdx[0, m] < k_limit
+                            a_prefetch_pipeline.producer_acquire(a_prefetch_producer_state)
+                            cute.copy(
+                                tiled_copy_AIdx,
+                                tAgAIdx[None, None, k_tile],
+                                tAsAIdx[None, None, a_prefetch_producer_state.index],
+                                pred=tApAIdx_k,
+                            )
+                            a_prefetch_pipeline.producer_commit(a_prefetch_producer_state)
+                            a_prefetch_producer_state.advance()
+                    # Advance to next tile
+                    tile_scheduler.advance_to_next_work()
+                    work_tile = tile_scheduler.get_current_work()
+
         # Specialized TMA epi load warp
-        #
-        if const_expr(mC_mnl is not None):
-            if warp_idx == self.epi_load_warp_id:
+        if warp_idx == self.epi_load_warp_id:
+            if const_expr(self.gather_A):
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
+            # PDL: wait for prior kernel before any C TMA loads (matches cutlass C++ epi_load)
+            if const_expr(self.use_pdl and mC_mnl is not None):
+                cute.arch.griddepcontrol_wait()
+            if const_expr(mC_mnl is not None):
                 epi_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.epi_c_stage
                 )
@@ -1281,15 +1398,13 @@ class GemmSm100(GemmSm90):
                     # End of persistent scheduler loop
                 epi_pipeline.producer_tail(epi_producer_state)
 
-        #
         # Specialized MMA warp
-        #
         if warp_idx == self.mma_warp_id:
-            tmem_alloc_barrier.arrive_and_wait()
+            if const_expr(self.gather_A):
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Retrieving tensor memory ptr and make accumulator tensor
-            acc_tmem_ptr = cute.arch.retrieve_tmem_ptr(
-                self.acc_dtype, alignment=16, ptr_to_buffer_holding_addr=tmem_holding_buf
-            )
+            tmem.wait_for_alloc()
+            acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # Partition shared/tensor memory tensor for TiledMMA_A/B/D
             # (MMA, MMA_M, MMA_K, STAGE)
             tCrA = tiled_mma.make_fragment_A(sA_mma)
@@ -1300,9 +1415,15 @@ class GemmSm100(GemmSm90):
 
             if const_expr(self.blockscaled):
                 # Make SFA tmem tensor
+                acc_tmem_col_offset = const_expr(
+                    tcgen05.find_tmem_tensor_col_offset(
+                        tCtAcc_base
+                        if const_expr(not self.overlap_accum_sf)
+                        else tCtAcc_base[None, None, None, 0]
+                    )
+                )
                 sfa_tmem_ptr = cute.recast_ptr(
-                    acc_tmem_ptr + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base),
-                    dtype=self.sf_dtype,
+                    acc_tmem_ptr + acc_tmem_col_offset, dtype=self.sf_dtype
                 )
                 # (MMA, MMA_M, MMA_K)
                 tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
@@ -1313,12 +1434,10 @@ class GemmSm100(GemmSm90):
                 )
                 tCtSFA = cute.make_tensor(sfa_tmem_ptr, tCtSFA_layout)
                 # Make SFB tmem tensor
-                sfb_tmem_ptr = cute.recast_ptr(
-                    acc_tmem_ptr
-                    + tcgen05.find_tmem_tensor_col_offset(tCtAcc_base)
-                    + tcgen05.find_tmem_tensor_col_offset(tCtSFA),
-                    dtype=self.sf_dtype,
-                )
+                sfa_tmem_col_offset = tcgen05.find_tmem_tensor_col_offset(tCtSFA)
+                sfb_tmem_col_offset = acc_tmem_col_offset + sfa_tmem_col_offset
+                sfb_tmem_base_ptr = acc_tmem_ptr + sfb_tmem_col_offset
+                sfb_tmem_ptr = cute.recast_ptr(sfb_tmem_base_ptr, dtype=self.sf_dtype)
                 # (MMA, MMA_N, MMA_K)
                 tCtSFB_layout = blockscaled_utils.make_tmem_layout_sfb(
                     tiled_mma,
@@ -1360,7 +1479,22 @@ class GemmSm100(GemmSm90):
                 k_tile_cnt = cute.ceil_div(k_len, self.mma_tiler[2])
                 # Set tensor memory buffer for current tile
                 # (MMA, MMA_M, MMA_N)
-                tCtAcc = tCtAcc_base[None, None, None, acc_producer_state.index]
+                acc_stage_idx = (
+                    acc_producer_state.phase ^ 1
+                    if const_expr(self.overlap_accum_sf)
+                    else acc_producer_state.index
+                )
+                tCtAcc = tCtAcc_base[None, None, None, acc_stage_idx]
+                tCtSFB_mma = tCtSFB
+                if const_expr(self.blockscaled and self.mma_inst_shape_mnk[1] in (64, 192)):
+                    tCtSFB_mma = cute.make_tensor(
+                        cute.recast_ptr(
+                            sfb_tmem_base_ptr + Int32((tile_coord_mnkl[1] % 2) * 2),
+                            dtype=self.sf_dtype,
+                        ),
+                        tCtSFB.layout,
+                    )
+                tctx.b("mma")
                 ab_consumer_state, acc_producer_state, tiled_mma = self.mma(
                     ab_pipeline,
                     acc_pipeline,
@@ -1374,7 +1508,7 @@ class GemmSm100(GemmSm90):
                     is_leader_cta,
                     cta_rank_in_cluster,
                     tCtSFA,
-                    tCtSFB,
+                    tCtSFB_mma,
                     tiled_copy_s2t_sfa,
                     tiled_copy_s2t_sfb,
                     tCsSFA_compact_s2t,
@@ -1382,10 +1516,34 @@ class GemmSm100(GemmSm90):
                     tCtSFA_compact_s2t,
                     tCtSFB_compact_s2t,
                 )
+                if const_expr(self.overlap_accum_sf):
+                    # After iter 0, 2, ..., shift tmem ptr by -256.
+                    # After iter 1, 3, ..., shift tmem ptr by 256.
+                    tCtSFA, tCtSFB, tCtSFA_compact_s2t, tCtSFB_compact_s2t = [
+                        cute.make_tensor(
+                            cute.recast_ptr(
+                                # Doing tmem ptr arithmetic requires 32-bit type, wrong otherwise
+                                cute.recast_ptr(mT.iterator, dtype=Float32)
+                                + cute.assume(
+                                    acc_tmem_col_offset * (acc_producer_state.phase * 2 - 1),
+                                    divby=acc_tmem_col_offset,
+                                ),
+                                dtype=self.sf_dtype,
+                            ),
+                            mT.layout,
+                        )
+                        for mT in [tCtSFA, tCtSFB, tCtSFA_compact_s2t, tCtSFB_compact_s2t]
+                    ]
+                tctx.e("mma")
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
 
+            # PDL: hint the next kernel to launch early now that all MMAs are issued
+            if const_expr(self.use_pdl):
+                cute.arch.griddepcontrol_launch_dependents()
+
+            tmem_alloc_barrier.arrive()
             # Wait for accumulator buffer empty
             acc_pipeline.producer_tail(acc_producer_state)
 
@@ -1393,32 +1551,18 @@ class GemmSm100(GemmSm90):
         # Specialized epilogue warps
         #
         if warp_idx < self.mma_warp_id:
+            if const_expr(self.gather_A):
+                cute.arch.setmaxregister_increase(self.num_regs_epi)
             # Alloc tensor memory buffer
-            if warp_idx == self.epilog_warp_id[0]:
-                cute.arch.alloc_tmem(
-                    self.num_tmem_alloc_cols, tmem_holding_buf, is_two_cta=use_2cta_instrs
-                )
-            # Bar sync for retrieve tensor memory ptr from shared memory
-            tmem_alloc_barrier.arrive_and_wait()
+            tmem.allocate(self.num_tmem_alloc_cols)
+            tmem.wait_for_alloc()
 
             is_tma_warp = Boolean(warp_idx == self.epilog_warp_id[0])
-            varlen_manager.init_tensormap_epi(
-                tma_atom_d, self.epi_get_tma_atoms(epilogue_params), is_tma_warp
-            )
-            tma_desc_d_ptr = varlen_manager.get_tma_desc_d_ptr()
-            tma_desc_epi_ptrs = varlen_manager.get_tma_desc_epi_ptrs()
 
             # Retrieving tensor memory ptr and make accumulator tensor
-            acc_tmem_ptr = cute.arch.retrieve_tmem_ptr(
-                self.acc_dtype, alignment=16, ptr_to_buffer_holding_addr=tmem_holding_buf
-            )
+            acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
-
-            epilogue_barrier = pipeline.NamedBarrier(
-                barrier_id=int(NamedBarrierGemm.Epilogue),
-                num_threads=self.num_epi_warps * cute.arch.WARP_SIZE,
-            )
 
             # Partition for epilogue
             epi_tidx = tidx
@@ -1426,7 +1570,7 @@ class GemmSm100(GemmSm90):
                 epi_tidx, tCtAcc_base, epi_tile, use_2cta_instrs
             )
 
-            tTR_rD = cute.make_fragment(tTR_rAcc.shape, self.acc_dtype)
+            tTR_rD = cute.make_rmem_tensor(tTR_rAcc.shape, self.acc_dtype)
             tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
                 tiled_copy_t2r, self.d_layout, self.d_dtype, tTR_rD, sD, epi_tidx
             )
@@ -1447,32 +1591,20 @@ class GemmSm100(GemmSm90):
             epi_read_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.epi_c_stage
             )
-            if const_expr(varlen_m):
-                # wait tensormap initialization complete before update
-                varlen_manager.fence_tensormap_init()
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 tile_coord_mnkl = work_tile.tile_idx
                 batch_idx = tile_coord_mnkl[3]
-                epi_shapes, epi_orders = self.epi_get_tensormap_update_shapes_orders(
-                    epilogue_params, varlen_params.cu_seqlens_m, batch_idx
-                )
-                varlen_manager.update_tensormap_epi(
-                    batch_idx,
-                    self.d_layout,
-                    epi_shapes,
-                    epi_orders,
-                    is_tma_warp,
-                )
-
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
-                tTR_tAcc = tTR_tAcc_base[None, None, None, None, None, acc_consumer_state.index]
-
+                epi_acc_stage = (
+                    acc_consumer_state.index
+                    if const_expr(not self.overlap_accum_sf)
+                    else acc_consumer_state.phase
+                )
+                tTR_tAcc = tTR_tAcc_base[None, None, None, None, None, epi_acc_stage]
                 # Wait for accumulator buffer full
                 acc_pipeline.consumer_wait(acc_consumer_state)
-
-                varlen_manager.fence_tensormap_update_epi(is_tma_warp)
 
                 copy_D = None
                 if const_expr(has_D):
@@ -1483,25 +1615,33 @@ class GemmSm100(GemmSm90):
                         epi_tile,
                         sD,
                         tile_coord_mnkl,
-                        tma_desc_ptr=tma_desc_d_ptr,
                     )
                 copy_C = None  # We're using a separate warp to load C
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 k_len = varlen_manager.len_k(batch_idx)
+                epi_tile_num = cute.size(
+                    cute.zipped_divide(cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile),
+                    mode=[1],
+                )
                 load_acc_subtile = partial(
                     self.epi_load_acc_subtile,
                     tiled_copy_t2r,
                     tiled_copy_r2s,
                     tTR_tAcc,
                     tTR_rAcc,
+                    acc_pipeline=acc_pipeline,
+                    acc_consumer_state=acc_consumer_state,
+                    acc_release_idx=self.iter_acc_early_release
+                    if const_expr(self.overlap_accum_sf)
+                    else epi_tile_num - 1,
                     clear_acc=varlen_k and k_len == 0,
                 )
 
+                tctx.b("epilogue")
                 epi_read_state, _ = self.epilogue(
                     epilogue_params,
                     epi_smem_tensors,
-                    tma_desc_epi_ptrs,
                     epi_pipeline,
                     epi_store_pipeline,
                     epi_read_state,
@@ -1520,82 +1660,205 @@ class GemmSm100(GemmSm90):
                     copy_C,
                     tile_coord_mnkl,
                     varlen_manager,
-                    epilogue_barrier,
+                    self.epilogue_barrier,
                     tile_scheduler,
                     epi_tidx,
                     is_tma_warp,
                 )
-
-                # Async arrive accumulator buffer empty
-                with cute.arch.elect_one():
-                    acc_pipeline.consumer_release(acc_consumer_state)
+                # acc_pipeline.consumer_release was already called in self.epi_load_acc_subtile
                 acc_consumer_state.advance()
+                tctx.e("epilogue")
 
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
 
-            # Dealloc the tensor memory buffer
-            if warp_idx == self.epilog_warp_id[0]:
-                cute.arch.relinquish_tmem_alloc_permit(is_two_cta=use_2cta_instrs)
-            epilogue_barrier.arrive_and_wait()
-            if warp_idx == self.epilog_warp_id[0]:
-                if const_expr(use_2cta_instrs):
-                    cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr, cta_rank_in_cluster ^ 1)
-                    cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
-                cute.arch.dealloc_tmem(
-                    acc_tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=use_2cta_instrs
-                )
-
             # Wait for D store complete
             if is_tma_warp:
                 epi_store_pipeline.producer_tail()
 
+            # Dealloc the tensor memory buffer
+            tmem.relinquish_alloc_permit()
+            tmem_alloc_barrier.arrive_and_wait()
+            tmem.free(acc_tmem_ptr)
+
+        tctx.flush()
+
     @cute.jit
-    def load_A_gather_A(
+    def _make_gather_A_copy(
         self,
-        a_pipeline: cutlass.pipeline.PipelineAsync,
-        a_producer_state: cutlass.pipeline.PipelineState,
+        mA_mkl: cute.Tensor,
+        sA: cute.Tensor,
+        sAIdx: cute.Tensor,  # if varlen, this is already sliced into the current prefetch stage
+        tma_atom_a: Optional[cute.CopyAtom],
+        varlen_manager: VarlenManager,
+        tile_coord_mnkl,
+        batch_idx: Int32,
+        warp_idx: Int32,
+    ):
+        """Create copy_A and prefetch_A for gather_A (cp.async and TMA gather paths).
+        sAIdx: sAIdx sliced to the current prefetch stage (for varlen_m paths).
+        For varlen_k TMA gather, sAIdx (full) is used instead.
+        """
+        varlen_m = varlen_manager.varlen_m
+        varlen_k = varlen_manager.varlen_k
+        if const_expr(varlen_m):
+            mA_mk = mA_mkl
+        else:
+            mA_mk = cute.local_tile(
+                mA_mkl, (self.cta_tile_shape_mnk[0],), (tile_coord_mnkl[0], None)
+            )
+        len_m = varlen_manager.len_m(batch_idx)
+        len_k = varlen_manager.len_k(batch_idx)
+        num_cta = 2 if self.use_2cta_instrs else 1
+        dma_warp_idx = warp_idx - self.ab_load_warp_id
+        dma_tidx = cute.arch.thread_idx()[0] - self.ab_load_warp_id * 32
+        copy_A, prefetch_A = None, None
+        if const_expr(self.use_tma_gather):
+            if const_expr(varlen_m):
+                copy_A = copy_utils.gather_m_get_tma_copy_fn(
+                    tma_atom_a,
+                    mA_mk,
+                    sA,
+                    sAIdx,
+                    dma_warp_idx,
+                    num_warps=self.num_ab_load_warps,
+                    num_cta=num_cta,
+                )
+            elif const_expr(varlen_k):
+                col_idx = Int32(tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0])
+                copy_A, prefetch_A = copy_utils.gather_k_get_tma_copy_fn(
+                    tma_atom_a,
+                    sA,
+                    sAIdx,
+                    col_idx,
+                    dma_warp_idx,
+                    num_warps=self.num_ab_load_warps,
+                    num_cta=num_cta,
+                )
+        else:
+            # cp.async path
+            tiled_copy_A = self._make_gmem_tiled_copy_A(
+                self.a_dtype, self.a_layout, self.num_ab_load_warps * 32
+            )
+            thr_copy_A = tiled_copy_A.get_slice(dma_tidx)
+            if const_expr(varlen_m):
+                copy_A = copy_utils.gather_m_get_copy_fn(
+                    thr_copy_A,
+                    mA_mk,
+                    sA,
+                    sAIdx,
+                    limit_m=len_m - tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0],
+                    limit_k=len_k,
+                )
+            else:
+                copy_A, prefetch_A = copy_utils.gather_k_get_copy_fn(
+                    thr_copy_A,
+                    mA_mk,
+                    sA,
+                    sAIdx,
+                    limit_m=len_m - tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0],
+                    limit_k=len_k,
+                )
+        return copy_A, prefetch_A
+
+    @cute.jit
+    def load_AB_gather_A(
+        self,
+        ab_pipeline: cutlass.pipeline.PipelineAsync,
+        ab_producer_state: cutlass.pipeline.PipelineState,
         a_prefetch_consumer_state: Optional[cutlass.pipeline.PipelineState],
         copy_A: Callable,
         prefetch_A: Optional[Callable],
+        copy_B: Callable,
         k_tile_cnt: Int32,
+        varlen_m: bool = True,
     ) -> Tuple[cutlass.pipeline.PipelineState, Optional[cutlass.pipeline.PipelineState]]:
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Peek (try_wait) AB buffer empty for k_block = prefetch_k_tile_cnt
-        peek_a_empty_status = Boolean(True)
+        peek_ab_empty_status = Boolean(True)
         if 0 < k_tile_cnt:
-            peek_a_empty_status = a_pipeline.producer_try_acquire(a_producer_state)
-        # /////////////////////////////////////////////////////////////////////////
-        # cp.async on A
-        # /////////////////////////////////////////////////////////////////////////
-        is_tma_warp = False
-        for k_tile in cutlass.range(k_tile_cnt - 1, unroll=1):
-            smem_idx = a_producer_state.index
+            peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+        # TMA load on B and cp.async on A
+        for k_tile in cutlass.range(k_tile_cnt - 1, unroll=2 if const_expr(varlen_m) else 1):
+            smem_idx = ab_producer_state.index
             prefetch_out = ()
             if const_expr(prefetch_A is not None):  # Prefetch early, even before smem is free
                 prefetch_out = (prefetch_A(k_tile, smem_idx, a_prefetch_consumer_state),)
                 a_prefetch_consumer_state.advance()
-            a_pipeline.producer_acquire(a_producer_state, peek_a_empty_status, is_tma_warp)
+            # Wait for A/B buffers to be empty before loading into them
+            # Also sets the transaction barrier for the A/B buffers
+            # A tiny bit faster to rotate the warp that does TMA
+            is_tma_warp = warp_idx == self.ab_load_warp_id + (k_tile % self.num_ab_load_warps)
+            ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status, is_tma_warp)
+            # A bit faster to load B first while we calculate the indices for A
+            tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
+            if is_tma_warp:
+                copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             copy_A(k_tile, smem_idx, *prefetch_out)
             # This tells mbarrier to track the completion of cp.async
-            a_pipeline.producer_cpasync_commit(a_producer_state)
-            a_producer_state.advance()
-            peek_a_empty_status = Boolean(True)
+            ab_pipeline.producer_cpasync_commit(ab_producer_state)
+            ab_producer_state.advance()
+            peek_ab_empty_status = Boolean(True)
             if k_tile + 1 < k_tile_cnt:
-                peek_a_empty_status = a_pipeline.producer_try_acquire(a_producer_state)
+                peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
         # bound checking in the K dimension on the last k_tile
         if 0 < k_tile_cnt:
             k_tile = k_tile_cnt - 1
-            smem_idx = a_producer_state.index
+            smem_idx = ab_producer_state.index
             prefetch_out = ()
             if const_expr(prefetch_A is not None):  # Prefetch early, even before smem is free
                 prefetch_out = (prefetch_A(k_tile, smem_idx, a_prefetch_consumer_state, pred=True),)
                 a_prefetch_consumer_state.advance()
-            a_pipeline.producer_acquire(a_producer_state, peek_a_empty_status, is_tma_warp)
+            is_tma_warp = warp_idx == self.ab_load_warp_id + k_tile % self.num_ab_load_warps
+            ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status, is_tma_warp)
+            tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
+            if is_tma_warp:
+                copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
             copy_A(k_tile, smem_idx, *prefetch_out, pred=True)
-            a_pipeline.producer_cpasync_commit(a_producer_state)
-            a_producer_state.advance()
-        return a_producer_state, a_prefetch_consumer_state
+            ab_pipeline.producer_cpasync_commit(ab_producer_state)
+            ab_producer_state.advance()
+        return ab_producer_state, a_prefetch_consumer_state
+
+    @cute.jit
+    def load_AB_tma_gather(
+        self,
+        ab_pipeline: cutlass.pipeline.PipelineAsync,
+        ab_producer_state: cutlass.pipeline.PipelineState,
+        a_prefetch_consumer_state: Optional[cutlass.pipeline.PipelineState],
+        copy_A: Callable,
+        prefetch_A: Optional[Callable],
+        copy_B: Callable,
+        k_tile_cnt: Int32,
+    ) -> Tuple[cutlass.pipeline.PipelineState, Optional[cutlass.pipeline.PipelineState]]:
+        """Unified TMA gather loading loop for both varlen_m and varlen_k.
+
+        For varlen_m: a_prefetch_pipeline is None, copy_A receives k_tile as src_idx.
+        For varlen_k: a_prefetch_pipeline is set, copy_A receives the prefetch stage index,
+          and indices are consumed/released per K-tile.
+        """
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        peek_ab_empty_status = Boolean(True)
+        if 0 < k_tile_cnt:
+            peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+        for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+            smem_idx = ab_producer_state.index
+            prefetch_out = ()
+            if const_expr(prefetch_A is not None):  # Prefetch early, even before smem is free
+                prefetch_out = (prefetch_A(k_tile, smem_idx, a_prefetch_consumer_state),)
+                a_prefetch_consumer_state.advance()
+            is_tma_warp = warp_idx == self.ab_load_warp_id + (k_tile % self.num_ab_load_warps)
+            ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status, is_tma_warp)
+            tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
+            if is_tma_warp:
+                copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+            copy_A(k_tile, smem_idx, *prefetch_out, tma_bar_ptr=tma_bar_ptr)
+            ab_pipeline.producer_commit(ab_producer_state)
+            ab_producer_state.advance()
+            peek_ab_empty_status = Boolean(True)
+            if k_tile + 1 < k_tile_cnt:
+                peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+        return ab_producer_state, a_prefetch_consumer_state
 
     @cute.jit
     def mma(
@@ -1629,7 +1892,9 @@ class GemmSm100(GemmSm90):
         # If gather_A and use_2cta_instrs, the cp.async for the non-leader CTA will
         # arrive at an mbarrier on the non-leader CTA side, then the mma warp of the non-leader
         # CTA will wait for that then arrive at the mbarrier on the leader CTA.
-        need_nonleader_cta = const_expr(self.gather_A and self.use_2cta_instrs)
+        need_nonleader_cta = const_expr(
+            self.gather_A and self.use_2cta_instrs and not self.use_tma_gather
+        )
         # Peek (try_wait) AB buffer full for k_tile = 0
         peek_ab_full_status = Boolean(True)
         if 0 < k_tile_cnt and (is_leader_cta or need_nonleader_cta):
@@ -1693,6 +1958,9 @@ class GemmSm100(GemmSm90):
         tTR_rAcc: cute.Tensor,
         tRS_rD: cute.Tensor,
         epi_idx: int,
+        acc_pipeline: pipeline.PipelineAsync,
+        acc_consumer_state: pipeline.PipelineState,
+        acc_release_idx: int,
         clear_acc: Boolean = False,
     ):
         if not clear_acc:
@@ -1702,6 +1970,10 @@ class GemmSm100(GemmSm90):
             tRS_rD.store(tRS_rAcc.load())
         else:
             tRS_rD.fill(0.0)
+        if epi_idx == acc_release_idx:
+            cute.arch.fence_view_async_tmem_load()
+            with cute.arch.elect_one():
+                acc_pipeline.consumer_release(acc_consumer_state)
 
     def mainloop_s2t_copy_and_partition(
         self,
@@ -1787,7 +2059,7 @@ class GemmSm100(GemmSm90):
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_N)
         tTR_cAcc = thr_copy_t2r.partition_D(cAcc_epi)
         # (T2R, T2R_M, T2R_N)
-        tTR_rAcc = cute.make_fragment(tTR_cAcc[None, None, None, 0, 0].shape, self.acc_dtype)
+        tTR_rAcc = cute.make_rmem_tensor(tTR_cAcc[None, None, None, 0, 0].shape, self.acc_dtype)
         return tiled_copy_t2r, tTR_tAcc, tTR_rAcc
 
     def epilog_smem_store_and_partition(
@@ -1860,7 +2132,7 @@ class GemmSm100(GemmSm90):
         thr_copy_s2r = tiled_copy_s2r.get_slice(tidx)
         # (R2S, R2S_M, R2S_N, PIPE_D)
         tSR_sC = thr_copy_s2r.partition_S(sC)
-        tRS_rC = cute.make_fragment(tRS_rD_layout, dtype)
+        tRS_rC = cute.make_rmem_tensor(tRS_rD_layout, dtype)
         # (R2S, R2S_M, R2S_N)
         tSR_rC = tiled_copy_s2r.retile(tRS_rC)
         return tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC
@@ -1880,10 +2152,10 @@ class GemmSm100(GemmSm90):
         # + 1 (from non-leader CTA).
         # The producer count for the non-leader CTA is num_cpasync_threads
         # (TMA doesn't arrive there).
-        if const_expr(not self.gather_A):
+        if const_expr(not self.gather_A or self.use_tma_gather):
             producer_cnt = 1
         else:
-            producer_cnt = (self.num_ab_load_warps - 1) * 32 + (
+            producer_cnt = self.num_ab_load_warps * 32 + (
                 1 if const_expr(not self.use_2cta_instrs) else 2
             )
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
@@ -1901,6 +2173,17 @@ class GemmSm100(GemmSm90):
                 consumer_group=ab_pipeline_consumer_group,
                 tx_count=self.num_tma_load_bytes,
                 cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=True,
+            )
+        elif const_expr(self.use_tma_gather):
+            pipeline_ab = PipelineTmaUmma.create(
+                barrier_storage=ab_pipeline_mbar_ptr,
+                num_stages=self.ab_stage,
+                producer_group=ab_pipeline_producer_group,
+                consumer_group=ab_pipeline_consumer_group,
+                tx_count=self.num_tma_load_bytes,
+                cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=True,
             )
         else:
             pipeline_ab = PipelineTmaCpAsyncUmma.create(
@@ -1913,6 +2196,7 @@ class GemmSm100(GemmSm90):
                 producer_drop_count=None
                 if not self.use_2cta_instrs
                 else (2 if not is_leader_cta else 0),
+                defer_sync=True,
             )
         return pipeline_ab
 
@@ -1930,6 +2214,7 @@ class GemmSm100(GemmSm90):
             producer_group=acc_pipeline_producer_group,
             consumer_group=acc_pipeline_consumer_group,
             cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
         )
 
     def make_sched_pipeline(
@@ -1941,13 +2226,14 @@ class GemmSm100(GemmSm90):
         # Threads/warps participating in this pipeline
         sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         cluster_size = cute.size(cluster_layout_mnk)
-        # Each warp that are not the scheduler warp will contribute 1 to the arrive count
+        # Each warp will contribute 1 to the arrive count
+        extra_warp_ids = (self.a_prefetch_warp_id,) if self.gather_A else ()
         warps_per_cta = self.num_ab_load_warps + len(
-            (self.mma_warp_id, *self.epilog_warp_id, self.scheduler_warp_id)
+            (self.mma_warp_id, *self.epilog_warp_id, self.scheduler_warp_id, *extra_warp_ids)
         )
         if has_C:
             warps_per_cta += 1
-        consumer_arrive_cnt = warps_per_cta * cluster_size - 1
+        consumer_arrive_cnt = warps_per_cta * cluster_size
         sched_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -1958,6 +2244,7 @@ class GemmSm100(GemmSm90):
             consumer_group=sched_pipeline_consumer_group,
             # If there's cluster, the consumers must arrive at the mbar of CTA 0 in the cluster.
             consumer_mask=None if const_expr(cluster_size == 1) else 0,
+            defer_sync=True,
         )
 
     @cute.jit
@@ -1965,10 +2252,8 @@ class GemmSm100(GemmSm90):
         self, a_prefetch_pipeline_mbar_ptr: cute.Pointer
     ) -> pipeline.PipelineAsync:
         producer_cnt = 32
-        a_prefetch_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, producer_cnt, alignment=producer_cnt
-        )
-        consumer_arrive_cnt = self.num_ab_load_warps - 1
+        a_prefetch_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
+        consumer_arrive_cnt = self.num_ab_load_warps
         a_prefetch_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -1977,6 +2262,7 @@ class GemmSm100(GemmSm90):
             num_stages=self.a_prefetch_stage,
             producer_group=a_prefetch_producer_group,
             consumer_group=a_prefetch_consumer_group,
+            defer_sync=True,
         )
 
     @classmethod
@@ -2027,9 +2313,9 @@ class GemmSm100(GemmSm90):
         blockscaled = sf_dtype is not None
         # Default ACC stages
         if const_expr(not blockscaled):
-            num_acc_stage = 2
+            num_acc_stage = 1 if mma_tiler_mnk[1] > 256 else 2
         else:
-            num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
+            num_acc_stage = 1 if mma_tiler_mnk[1] >= 256 else 2
 
         # Default D stages
         epi_stage = 4 if cute.size(epi_tile[1]) <= 16 else 2
@@ -2267,7 +2553,7 @@ class GemmSm100(GemmSm90):
 
     @staticmethod
     def is_valid_mma_tiler_and_cluster_shape(
-        mma_tiler_mn: Tuple[int, int],
+        mma_tiler_mn: Union[Tuple[int, int], Tuple[int, int, int]],
         cluster_shape_mn: Tuple[int, int],
         blockscaled: bool,
     ) -> bool:
@@ -2284,14 +2570,22 @@ class GemmSm100(GemmSm90):
         """
         is_valid = True
         # Skip invalid mma tile shape
-        if mma_tiler_mn[0] not in [64, 128, 256]:
-            is_valid = False
         if not blockscaled:
-            if mma_tiler_mn[1] not in range(32, 257, 32):
+            if mma_tiler_mn[0] not in [64, 128, 256]:
                 is_valid = False
         else:
-            if mma_tiler_mn[1] not in [128, 256]:
+            if mma_tiler_mn[0] not in [128, 256]:
                 is_valid = False
+        mma_inst_n = mma_tiler_mn[1] if mma_tiler_mn[1] <= 256 else mma_tiler_mn[1] // 2
+        if not blockscaled:
+            if mma_inst_n not in range(32, 257, 32):
+                is_valid = False
+        else:
+            # Blockscaled currently supports tile_n in {64, 128, 192, 256}.
+            if mma_tiler_mn[1] not in [64, 128, 192, 256]:
+                is_valid = False
+        if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
+            is_valid = False
         # Skip invalid cluster shape
         is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
         if (
@@ -2363,11 +2657,48 @@ class GemmSm100(GemmSm90):
         return is_valid
 
     @staticmethod
+    def can_implement_blockscaled(
+        ab_dtype: Type[cutlass.Numeric],
+        sf_dtype: Type[cutlass.Numeric],
+        sf_vec_size: int,
+        d_dtype: Type[cutlass.Numeric],
+        mma_tiler_mn: Union[Tuple[int, int], Tuple[int, int, int]],
+        cluster_shape_mn: Tuple[int, int],
+        m: int,
+        n: int,
+        k: int,
+        l: int,
+        a_major: str,
+        b_major: str,
+        d_major: str,
+    ) -> bool:
+        can_implement = True
+        if not GemmSm100.is_valid_dtypes_and_scale_factor_vec_size(
+            ab_dtype, sf_dtype, sf_vec_size, d_dtype
+        ):
+            can_implement = False
+        if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
+            can_implement = False
+        if not GemmSm100.is_valid_mma_tiler_and_cluster_shape(
+            mma_tiler_mn, cluster_shape_mn, blockscaled=True
+        ):
+            can_implement = False
+        # Multi-tile N iteration with an asymmetric SFB atom size needs the same
+        # kind of special-case layout rewriting as tile_n==192.
+        if mma_tiler_mn[1] == 224 and n > 224:
+            can_implement = False
+        if not GemmSm100.is_valid_tensor_alignment(
+            m, n, k, l, ab_dtype, d_dtype, a_major, b_major, d_major
+        ):
+            can_implement = False
+        return can_implement
+
+    @staticmethod
     def can_implement(
         ab_dtype: Type[cutlass.Numeric],
         acc_dtype: Type[cutlass.Numeric],
         d_dtype: Type[cutlass.Numeric],
-        mma_tiler_mn: Tuple[int, int],
+        mma_tiler_mn: Union[Tuple[int, int], Tuple[int, int, int]],
         cluster_shape_mn: Tuple[int, int],
         m: int,
         n: int,
@@ -2423,387 +2754,3 @@ class GemmSm100(GemmSm90):
         ):
             can_implement = False
         return can_implement
-
-
-def run(
-    mnkl: Tuple[int, int, int, int],
-    ab_dtype: Type[cutlass.Numeric],
-    d_dtype: Type[cutlass.Numeric],
-    c_dtype: Optional[Type[cutlass.Numeric]],
-    acc_dtype: Type[cutlass.Numeric],
-    a_major: str,
-    b_major: str,
-    d_major: str,
-    c_major: str,
-    mma_tiler_mn: Tuple[int, int] = (256, 256),
-    cluster_shape_mn: Tuple[int, int] = (2, 1),
-    tolerance: float = 1e-01,
-    warmup_iterations: int = 0,
-    iterations: int = 1,
-    skip_ref_check: bool = False,
-    dynamic_persistent: bool = False,
-    **kwargs,
-):
-    """Execute a persistent batched dense GEMM operation on Blackwell architecture with performance benchmarking.
-
-    This function prepares input tensors, configures and launches the persistent GEMM kernel,
-    optionally performs reference validation, and benchmarks the execution performance.
-
-    :param mnkl: Problem size (M, N, K, L)
-    :type mnkl: Tuple[int, int, int, int]
-    :param ab_dtype: Data type for input tensors A and B
-    :type ab_dtype: Type[cutlass.Numeric]
-    :param d_dtype: Data type for output tensor C
-    :type d_dtype: Type[cutlass.Numeric]
-    :param acc_dtype: Data type for accumulation during matrix multiplication
-    :type acc_dtype: Type[cutlass.Numeric]
-    :param a_major/b_major/d_major: Memory layout of tensor A/B/C
-    :type a_major/b_major/d_major: str
-    :param mma_tiler_mn: MMA tiling size. If not specified in the decorator parameters, the autotuner will use the
-        default value of (256, 256). Otherwise, the autotuner will use the value specified in the decorator parameters.
-    :type mma_tiler_mn: Tuple[int, int], optional
-    :param cluster_shape_mn: Cluster shape. If not specified in the decorator parameters, the autotuner will use the
-        default value of (2, 1). Otherwise, the autotuner will use the value specified in the decorator parameters.
-    :type cluster_shape_mn: Tuple[int, int], optional
-    :param tolerance: Tolerance value for reference validation comparison, defaults to 1e-01
-    :type tolerance: float, optional
-    :param warmup_iterations: Number of warmup iterations before benchmarking, defaults to 0
-    :type warmup_iterations: int, optional
-    :param iterations: Number of benchmark iterations to run, defaults to 1
-    :type iterations: int, optional
-    :param skip_ref_check: Whether to skip reference result validation, defaults to False
-    :type skip_ref_check: bool, optional
-    :raises RuntimeError: If CUDA GPU is not available
-    :raises ValueError: If the configuration is invalid or unsupported by the kernel
-    :return: Execution time of the GEMM kernel
-    :rtype: float
-    """
-    print("Running Blackwell Persistent Dense GEMM test with:")
-    print(f"mnkl: {mnkl}")
-    print(f"AB dtype: {ab_dtype}, C dtype: {d_dtype}, Acc dtype: {acc_dtype}")
-    print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {d_major}")
-    print(f"Mma Tiler (M, N): {mma_tiler_mn}, Cluster Shape (M, N): {cluster_shape_mn}")
-    print(f"Tolerance: {tolerance}")
-    print(f"Warmup iterations: {warmup_iterations}")
-    print(f"Iterations: {iterations}")
-    print(f"Skip reference checking: {skip_ref_check}")
-
-    assert not dynamic_persistent, "Dynamic persistent mode is not supported yet."
-
-    # Unpack parameters
-    m, n, k, l = mnkl
-
-    # Skip unsupported testcase
-    if not GemmSm100.can_implement(
-        ab_dtype,
-        acc_dtype,
-        d_dtype,
-        mma_tiler_mn,
-        cluster_shape_mn,
-        m,
-        n,
-        k,
-        l,
-        a_major,
-        b_major,
-        d_major,
-    ):
-        raise TypeError(
-            f"Unsupported testcase {ab_dtype}, {acc_dtype}, {d_dtype}, {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {d_major}"
-        )
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("GPU is required to run this example!")
-
-    torch.manual_seed(1111)
-
-    # Create and permute tensor A/B/C
-    def create_and_permute_tensor(l, mode0, mode1, is_mode0_major, dtype, is_dynamic_layout=True):
-        # is_mode0_major: (l, mode1, mode0) -> (mode0, mode1, l)
-        # else: (l, mode0, mode1) -> (mode0, mode1, l)
-        shape = (l, mode1, mode0) if is_mode0_major else (l, mode0, mode1)
-        permute_order = (2, 1, 0) if is_mode0_major else (1, 2, 0)
-        is_unsigned = dtype in {cutlass.Uint8}
-        # Temporarily use uint8 as torch does not support fp8 type
-        torch_dtype = cutlass_torch.dtype(dtype)
-        gen_dtype = (
-            torch_dtype
-            if dtype not in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}
-            else torch.bfloat16
-        )
-
-        # Create dtype torch tensor (cpu)
-        torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
-            shape,
-            gen_dtype,
-            permute_order=permute_order,
-            # init_type=cutlass.torch.TensorInitType.RANDOM,
-            # init_config=cutlass.torch.RandomInitConfig(
-            #     min_val=0 if is_unsigned else -2, max_val=4 if is_unsigned else 2
-            # ),
-            init_type=cutlass.torch.TensorInitType.GAUSSIAN,
-            init_config=cutlass.torch.GaussianInitConfig(std=k ** (-0.5), scale=1),
-        ).to(torch_dtype)
-        # Create dtype torch tensor (gpu)
-        torch_tensor = torch_tensor_cpu.cuda()
-
-        # Create f32 torch tensor (cpu)
-        f32_torch_tensor = torch_tensor_cpu.to(dtype=torch.float32)
-
-        # Create dtype cute tensor (gpu)
-        torch_tensor_view = (
-            torch_tensor
-            if dtype not in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}
-            else torch_tensor.view(torch.uint8)
-        )
-        cute_tensor = from_dlpack(torch_tensor_view, assumed_align=16)
-        cute_tensor.element_type = dtype
-        if is_dynamic_layout:
-            cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=(0 if is_mode0_major else 1))
-        cute_tensor = cutlass_torch.convert_cute_tensor(
-            f32_torch_tensor,
-            cute_tensor,
-            dtype,
-            is_dynamic_layout=is_dynamic_layout,
-        )
-
-        return f32_torch_tensor, cute_tensor, torch_tensor, torch_tensor_cpu
-
-    a_ref, mA, a_torch, a_torch_cpu = create_and_permute_tensor(
-        l, m, k, a_major == "m", ab_dtype, is_dynamic_layout=True
-    )
-    b_ref, mB, b_torch, b_torch_cpu = create_and_permute_tensor(
-        l, n, k, b_major == "n", ab_dtype, is_dynamic_layout=True
-    )
-    _, mD, d_torch, d_torch_cpu = create_and_permute_tensor(
-        l, m, n, d_major == "m", d_dtype, is_dynamic_layout=True
-    )
-    if c_dtype is not None:
-        c, mC, c_torch, d_torch_cpu = create_and_permute_tensor(l, m, n, c_major == "m", c_dtype)
-    else:
-        c, mC, c_torch = None, None, None
-
-    # Configure gemm kernel
-    cluster_shape_mnk = (*cluster_shape_mn, 1)
-    gemm = GemmSm100(acc_dtype, ab_dtype, mma_tiler_mn, cluster_shape_mnk)
-
-    # Compute max active clusters on current device
-    hardware_info = cutlass.utils.HardwareInfo()
-    max_active_clusters = hardware_info.get_max_active_clusters(
-        cluster_shape_mn[0] * cluster_shape_mn[1]
-    )
-    if dynamic_persistent:
-        tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device="cuda")
-    else:
-        tile_count_semaphore = None
-
-    scheduler_args = TileSchedulerOptions(
-        Int32(max_active_clusters),
-        tile_count_semaphore=make_ptr(
-            Int32, tile_count_semaphore.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
-        )
-        if tile_count_semaphore is not None
-        else None,
-    )
-    epi_args = gemm.EpilogueArguments()
-    varlen_args = VarlenArguments()
-
-    # Get current CUDA stream from PyTorch
-    torch_stream = torch.cuda.current_stream()
-    # Get the raw stream pointer as a CUstream
-    current_stream = cuda.CUstream(torch_stream.cuda_stream)
-    # Compile gemm kernel
-    compiled_gemm = cute.compile(
-        gemm,
-        mA,
-        mB,
-        mD,
-        mC,
-        epi_args,
-        scheduler_args,
-        varlen_args,
-        current_stream,
-    )
-
-    if not skip_ref_check:
-        compiled_gemm(mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, current_stream)
-        if ab_dtype in {
-            cutlass.Int8,
-            cutlass.Uint8,
-            cutlass.Float8E4M3FN,
-            cutlass.Float8E5M2,
-        }:
-            ref = torch.einsum("mkl,nkl->mnl", a_ref.cpu(), b_ref.cpu())
-        else:
-            ref = torch.einsum("mkl,nkl->mnl", a_ref, b_ref)
-        if c is not None:
-            ref = ref + c
-        ref = ref.cpu()
-
-        # Copy gpu result back
-        gpu_d = d_torch.cpu()
-
-        # Convert ref to c_type
-        if d_dtype == Float32:
-            ref_d = ref
-        elif d_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN}:
-            # m major: (l, n, m) -> (m, n, l)
-            # n major: (l, m, n) -> (m, n, l)
-            permute_order = (1, 2, 0) if d_major == "n" else (2, 1, 0)
-            shape = (l, m, n) if d_major == "n" else (l, n, m)
-            f8_torch_tensor = cutlass_torch.create_and_permute_torch_tensor(
-                shape,
-                torch.uint8,
-                permute_order=permute_order,
-                init_type=cutlass_torch.TensorInitType.SKIP,
-            ).cuda()
-            # Create dtype cute tensor (gpu)
-            ref_d_tensor = from_dlpack(f8_torch_tensor, assumed_align=16).mark_layout_dynamic(
-                leading_dim=(1 if d_major == "n" else 0)
-            )
-            ref_d_tensor.element_type = d_dtype
-            ref_d_tensor = cutlass_torch.convert_cute_tensor(
-                ref,
-                ref_d_tensor,
-                d_dtype,
-                is_dynamic_layout=True,
-            )
-
-            ref_d = f8_torch_tensor.cpu()
-        else:
-            ref_d = ref.to(cutlass_torch.dtype(d_dtype))
-
-        # Reference checking ref_d and gpu_d
-        torch.testing.assert_close(gpu_d, ref_d, atol=tolerance, rtol=1e-05)
-
-    from triton.testing import do_bench
-
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    flops = 2 * m * n * k * l
-
-    repeats = iterations
-    warmup = warmup_iterations
-
-    import time
-
-    time.sleep(0.5)
-    if ab_dtype.width == 8:
-        assert l == 1
-        scale_ab = torch.ones((1,), dtype=torch.float32, device="cuda")
-        fn_cublas = lambda: torch._scaled_mm(
-            a_torch[:, :, 0],
-            b_torch[:, :, 0].mT,
-            scale_a=scale_ab,
-            scale_b=scale_ab,
-            out_dtype=torch.bfloat16,
-            # use_fast_accum=fp8_fast_accum,
-        )
-    else:
-        if c_torch is None:
-            fn_cublas = lambda: torch.matmul(a_torch.permute(2, 0, 1), b_torch.permute(2, 0, 1).mT)
-        else:
-            c_torch_convert = c_torch.to(a_torch.dtype)  # In case C is in FP32
-            fn_cublas = lambda: torch.baddbmm(
-                c_torch_convert.permute(2, 0, 1),
-                a_torch.permute(2, 0, 1),
-                b_torch.permute(2, 0, 1).mT,
-            )
-    timing_cublas = do_bench(fn_cublas, warmup=warmup, rep=repeats)
-    tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
-    print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
-
-    time.sleep(0.5)
-    fn = lambda: compiled_gemm(
-        mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, current_stream
-    )
-    timing = do_bench(fn, warmup=warmup, rep=repeats)
-    tflops = flops / (timing * 1e9)  # Convert to TFlops
-    print(f"Cute-DSL Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}")
-
-    # time.sleep(0.5)
-    # timing_cublas = do_bench(fn_cublas, warmup=warmup, rep=repeats)
-    # tflops_cublas = flops / (timing_cublas * 1e9)  # Convert to TFlops
-    # print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
-
-
-if __name__ == "__main__":
-
-    def parse_comma_separated_ints(s: str) -> Tuple[int, ...]:
-        try:
-            return tuple(int(x.strip()) for x in s.split(","))
-        except ValueError:
-            raise argparse.ArgumentTypeError("Invalid format. Expected comma-separated integers.")
-
-    parser = argparse.ArgumentParser(description="Example of Dense Persistent GEMM on Blackwell.")
-
-    parser.add_argument(
-        "--mnkl",
-        type=parse_comma_separated_ints,
-        default=(256, 256, 512, 1),
-        help="mnkl dimensions (comma-separated)",
-    )
-    parser.add_argument(
-        "--mma_tiler_mn",
-        type=parse_comma_separated_ints,
-        default=(128, 128),
-        help="Mma tile shape (comma-separated)",
-    )
-    parser.add_argument(
-        "--cluster_shape_mn",
-        type=parse_comma_separated_ints,
-        default=(1, 1),
-        help="Cluster shape (comma-separated)",
-    )
-    parser.add_argument("--ab_dtype", type=cutlass.dtype, default=cutlass.BFloat16)
-    parser.add_argument("--d_dtype", type=cutlass.dtype, default=cutlass.BFloat16)
-    parser.add_argument("--c_dtype", type=cutlass.dtype, default=None)
-    parser.add_argument("--acc_dtype", type=cutlass.dtype, default=Float32)
-    parser.add_argument("--a_major", choices=["k", "m"], type=str, default="k")
-    parser.add_argument("--b_major", choices=["k", "n"], type=str, default="k")
-    parser.add_argument("--d_major", choices=["n", "m"], type=str, default="n")
-    parser.add_argument("--c_major", choices=["n", "m"], type=str, default="n")
-
-    parser.add_argument("--tolerance", type=float, default=3e-02, help="Tolerance for validation")
-    parser.add_argument("--warmup_iterations", type=int, default=5, help="Warmup iterations")
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=30,
-        help="Number of iterations to run the kernel",
-    )
-    parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
-    parser.add_argument(
-        "--dynamic_persistent", action="store_true", help="Dynamic persistent kernel"
-    )
-
-    args = parser.parse_args()
-
-    if len(args.mnkl) != 4:
-        parser.error("--mnkl must contain exactly 4 values")
-
-    if len(args.mma_tiler_mn) != 2:
-        parser.error("--mma_tiler_mn must contain exactly 2 values")
-
-    if len(args.cluster_shape_mn) != 2:
-        parser.error("--cluster_shape_mn must contain exactly 2 values")
-
-    run(
-        args.mnkl,
-        args.ab_dtype,
-        args.d_dtype,
-        args.c_dtype,
-        args.acc_dtype,
-        args.a_major,
-        args.b_major,
-        args.d_major,
-        args.c_major,
-        args.mma_tiler_mn,
-        args.cluster_shape_mn,
-        args.tolerance,
-        args.warmup_iterations,
-        args.iterations,
-        args.skip_ref_check,
-        args.dynamic_persistent,
-    )
-    print("PASS")

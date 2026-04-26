@@ -1,27 +1,15 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import math
-from functools import partial
 from typing import Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, Int32, const_expr
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import arith as _arith
 from cutlass._mlir.dialects import llvm, nvvm, vector
-
-
-# cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default
-fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-sub_packed_f32x2 = partial(
-    cute.arch.calc_packed_f32x2_op,
-    src_c=None,
-    calc_func=nvvm.sub_packed_f32x2,
-    rnd=nvvm.RoundingModeKind.RN,
-)
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 @dsl_user_op
@@ -30,11 +18,10 @@ def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cut
 
 
 @cute.jit
-def load_scalar_or_pointer(x: Float32 | cute.Pointer) -> Float32:
+def load_scalar_or_pointer(x, dtype=Float32):
     if const_expr(isinstance(x, cute.Pointer)):
-        return Float32(cute.make_tensor(x, cute.make_layout(1))[0])
+        return dtype(cute.make_tensor(x, cute.make_layout(1))[0])
     else:
-        assert isinstance(x, Float32)
         return x
 
 
@@ -52,7 +39,6 @@ def set_block_rank(
             "=r,r,r",
             has_side_effects=False,
             is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
 
@@ -85,15 +71,70 @@ def store_shared_remote(
         f"r,{constraint},r",
         has_side_effects=True,
         is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def store_shared_remote_x4(
+    val0: Float32 | Int32,
+    val1: Float32 | Int32,
+    val2: Float32 | Int32,
+    val3: Float32 | Int32,
+    smem_ptr: cute.Pointer,
+    mbar_ptr: cute.Pointer,
+    peer_cta_rank_in_cluster: cute.typing.Int,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    remote_smem_ptr_i32 = set_block_rank(
+        smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    remote_mbar_ptr_i32 = set_block_rank(
+        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    assert isinstance(val0, (Float32, Int32)), "val must be Float32, or Int32"
+    dtype = Float32 if isinstance(val0, Float32) else Int32
+    suffix = {Float32: "f32", Int32: "s32"}[dtype]
+    constraint = {Float32: "f", Int32: "r"}[dtype]
+    llvm.inline_asm(
+        None,
+        [
+            remote_smem_ptr_i32,
+            remote_mbar_ptr_i32,
+            dtype(val0).ir_value(loc=loc, ip=ip),
+            dtype(val1).ir_value(loc=loc, ip=ip),
+            dtype(val2).ir_value(loc=loc, ip=ip),
+            dtype(val3).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t"
+        f".reg .v4 .{suffix} abcd;\n\t"
+        f"mov.{suffix} abcd.x, $2;\n\t"
+        f"mov.{suffix} abcd.y, $3;\n\t"
+        f"mov.{suffix} abcd.z, $4;\n\t"
+        f"mov.{suffix} abcd.w, $5;\n\t"
+        f"st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.{suffix} [$0], abcd, [$1];\n\t"
+        "}\n",
+        f"r,r,{constraint},{constraint},{constraint},{constraint}",
+        has_side_effects=True,
+        is_align_stack=False,
     )
 
 
 @dsl_user_op
 def fmin(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=None) -> Float32:
+    if cutlass.const_expr(cutlass.CUDA_VERSION.major) == 12:
+        return Float32(
+            nvvm.fmin(
+                T.f32(),
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+                loc=loc,
+                ip=ip,
+            )
+        )
     return Float32(
         nvvm.fmin(
-            T.f32(),
             Float32(a).ir_value(loc=loc, ip=ip),
             Float32(b).ir_value(loc=loc, ip=ip),
             loc=loc,
@@ -112,7 +153,6 @@ def sqrt(a: float | Float32, *, loc=None, ip=None) -> Float32:
             "=f,f",
             has_side_effects=False,
             is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
 
@@ -127,26 +167,6 @@ def ceil(a: float | Float32, *, loc=None, ip=None) -> Int32:
             "=r,f",
             has_side_effects=False,
             is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def prmt(a: int | Int32, b: int | Int32, c: int | Int32, *, loc=None, ip=None) -> Int32:
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                Int32(a).ir_value(loc=loc, ip=ip),
-                Int32(b).ir_value(loc=loc, ip=ip),
-                Int32(c).ir_value(loc=loc, ip=ip),
-            ],
-            "prmt.b32 $0, $1, $2, $3;",
-            "=r,r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
 
@@ -160,7 +180,7 @@ def fill_oob(tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Nu
         tXpX: Predicate tensor indicating valid elements
         fill_value: Value to fill OOB locations with
     """
-    tXrX_fill = cute.make_fragment_like(tXsX[(None, 0), None, 0])
+    tXrX_fill = cute.make_rmem_tensor_like(tXsX[(None, 0), None, 0])
     tXrX_fill.fill(fill_value)
     for rest_v in cutlass.range_constexpr(tXsX.shape[0][1]):
         for rest_k in cutlass.range_constexpr(tXsX.shape[2]):
@@ -169,6 +189,34 @@ def fill_oob(tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Nu
                     cute.autovec_copy(tXrX_fill, tXsX[(None, rest_v), None, rest_k])
             else:
                 cute.autovec_copy(tXrX_fill, tXsX[(None, rest_v), None, rest_k])
+
+
+# ---------------------------------------------------------------------------
+# General-purpose DSL store / vector helpers
+# ---------------------------------------------------------------------------
+
+
+@dsl_user_op
+def make_vector(elem_type, *values, loc=None, ip=None):
+    """Build an MLIR vector <N x elem_type> from N scalar DSL values.
+
+    Example: make_vector(cutlass.Uint32, v0, v1) -> <2 x i32> MLIR vector
+    """
+    from cutlass._mlir import ir
+
+    n = len(values)
+    mlir_ty = elem_type.mlir_type
+    vec_ty = ir.VectorType.get([n], mlir_ty)
+    vec = llvm.mlir_undef(vec_ty, loc=loc, ip=ip)
+    for i, v in enumerate(values):
+        vec = vector.insertelement(
+            elem_type(v).ir_value(loc=loc, ip=ip),
+            vec,
+            position=_arith.constant(T.i32(), i, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+    return vec
 
 
 @dsl_user_op
@@ -210,14 +258,62 @@ def warp_prefix_sum(val: Int32, lane: Optional[Int32] = None) -> Int32:
 
 
 @dsl_user_op
-def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
-    return nvvm.atomicrmw(
-        res=T.i32(), op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
-    )
+def atomic_inc_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    from cutlass import CUDA_VERSION
+
+    # * NVVM call based on nvvm version
+    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
+        # Old API: requires explicit result type as first positional argument
+        return nvvm.atomicrmw(
+            res=T.i32(), op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
+        )
+    else:
+        # New API: infers result type automatically
+        return nvvm.atomicrmw(
+            op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
+        )
 
 
 @dsl_user_op
-def atomic_inc_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
-    return nvvm.atomicrmw(
-        res=T.i32(), op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
+def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    from cutlass import CUDA_VERSION
+
+    # * NVVM call based on nvvm version
+    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
+        # Old API: requires explicit result type as first positional argument
+        return nvvm.atomicrmw(
+            res=T.i32(), op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
+        )
+    else:
+        # New API: infers result type automatically
+        return nvvm.atomicrmw(
+            op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
+        )
+
+
+@dsl_user_op
+def issue_clc_query_nomulticast(
+    mbar_ptr: cute.Pointer,
+    clc_response_ptr: cute.Pointer,
+    loc=None,
+    ip=None,
+) -> None:
+    """
+    The clusterlaunchcontrol.try_cancel instruction requests atomically cancelling the launch
+    of a cluster that has not started running yet. It asynchronously writes an opaque response
+    to shared memory indicating whether the operation succeeded or failed. On success, the
+    opaque response contains the ctaid of the first CTA of the canceled cluster.
+
+    :param mbar_ptr: A pointer to the mbarrier address in SMEM
+    :type mbar_ptr:  Pointer
+    :param clc_response_ptr: A pointer to the cluster launch control response address in SMEM
+    :type clc_response_ptr:  Pointer
+    """
+    mbar_llvm_ptr = mbar_ptr.llvm_ptr
+    clc_response_llvm_ptr = clc_response_ptr.llvm_ptr
+    nvvm.clusterlaunchcontrol_try_cancel(
+        clc_response_llvm_ptr,
+        mbar_llvm_ptr,
+        loc=loc,
+        ip=ip,
     )
