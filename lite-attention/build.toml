@@ -1,0 +1,105 @@
+[general]
+name = "lite-attention"
+backends = ["cuda"]
+python-depends = ["structlog", "tomli", "tomli-w", "typing-extensions"]
+license = "BSD-3-Clause AND MIT"
+version = 1
+
+[general.cuda]
+minver = "12.8"
+
+[general.hub]
+repo-id = "kernels-community/lite-attention"
+
+[torch]
+src = [
+    "lite-attention/flash_api.cpp",
+]
+
+[kernel.lite_attention_sm90]
+backend = "cuda"
+cuda-capabilities = ["9.0a"]
+cuda-flags = [
+    "-O3",
+    "-std=c++20",
+    "--ftemplate-backtrace-limit=0",
+    "--use_fast_math",
+    "--resource-usage",
+    "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+    "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
+    "-DNDEBUG",
+    "-DFLASHATTENTION_DISABLE_BACKWARD",
+    "-DFLASHATTENTION_DISABLE_SPLIT",
+    "-DFLASHATTENTION_DISABLE_PAGEDKV",
+    "-DFLASHATTENTION_DISABLE_APPENDKV",
+    "-DFLASHATTENTION_DISABLE_LOCAL",
+    "-DFLASHATTENTION_DISABLE_SOFTCAP",
+    "-DFLASHATTENTION_DISABLE_PACKGQA",
+    "-DFLASHATTENTION_DISABLE_FP16",
+    "-DFLASHATTENTION_DISABLE_FP8",
+    "-DFLASHATTENTION_DISABLE_VARLEN",
+    "-DFLASHATTENTION_DISABLE_CLUSTER",
+    "-DFLASHATTENTION_DISABLE_SM8x",
+    "-DFLASHATTENTION_DISABLE_HDIMDIFF64",
+    "-DFLASHATTENTION_DISABLE_HDIMDIFF192",
+]
+cxx-flags = [
+    "-O3",
+    "-std=c++17",
+    "-DFLASHATTENTION_DISABLE_BACKWARD",
+    "-DFLASHATTENTION_DISABLE_SPLIT",
+    "-DFLASHATTENTION_DISABLE_PAGEDKV",
+    "-DFLASHATTENTION_DISABLE_APPENDKV",
+    "-DFLASHATTENTION_DISABLE_LOCAL",
+    "-DFLASHATTENTION_DISABLE_SOFTCAP",
+    "-DFLASHATTENTION_DISABLE_PACKGQA",
+    "-DFLASHATTENTION_DISABLE_FP16",
+    "-DFLASHATTENTION_DISABLE_FP8",
+    "-DFLASHATTENTION_DISABLE_VARLEN",
+    "-DFLASHATTENTION_DISABLE_CLUSTER",
+    "-DFLASHATTENTION_DISABLE_SM8x",
+    "-DFLASHATTENTION_DISABLE_HDIMDIFF64",
+    "-DFLASHATTENTION_DISABLE_HDIMDIFF192",
+]
+depends = [
+    "torch",
+    "cutlass_4_0",
+]
+include = ["lite-attention"]
+src = [
+    "lite-attention/block.h",
+    "lite-attention/copy_sm90_bulk_reduce.hpp",
+    "lite-attention/cuda_check.h",
+    "lite-attention/epilogue_fwd.hpp",
+    "lite-attention/flash.h",
+    "lite-attention/flash_fwd_kernel_sm90.h",
+    "lite-attention/flash_fwd_launch_template.h",
+    "lite-attention/flash_prepare_scheduler.cu",
+    "lite-attention/heuristics.h",
+    "lite-attention/mainloop_fwd_sm90_tma_gmma_ws.hpp",
+    "lite-attention/mask.h",
+    "lite-attention/named_barrier.hpp",
+    "lite-attention/pack_gqa.h",
+    "lite-attention/paged_kv.h",
+    "lite-attention/quant.cu",
+    "lite-attention/quant.h",
+    "lite-attention/rotary.h",
+    "lite-attention/seqlen.h",
+    "lite-attention/skip_list.h",
+    "lite-attention/sm90_pipeline_no_cluster.hpp",
+    "lite-attention/softmax.h",
+    "lite-attention/static_switch.h",
+    "lite-attention/tile_scheduler.hpp",
+    "lite-attention/tile_size.h",
+    "lite-attention/utils.h",
+    "lite-attention/instantiations/flash_fwd_hdim64_bf16_sm90.cu",
+    "lite-attention/instantiations/flash_fwd_hdim96_bf16_sm90.cu",
+    "lite-attention/instantiations/flash_fwd_hdim128_bf16_sm90.cu",
+    "lite-attention/instantiations/flash_fwd_hdim192_bf16_sm90.cu",
+    "lite-attention/instantiations/flash_fwd_hdim256_bf16_sm90.cu",
+    "lite-attention/instantiations/flash_fwd_hdim64_int8_sm90.cu",
+    "lite-attention/instantiations/flash_fwd_hdim96_int8_sm90.cu",
+    "lite-attention/instantiations/flash_fwd_hdim128_int8_sm90.cu",
+    "lite-attention/instantiations/flash_fwd_hdim192_int8_sm90.cu",
+    "lite-attention/instantiations/flash_fwd_hdim256_int8_sm90.cu",
+]
