@@ -1,5 +1,7 @@
 [general]
 name = "mra"
+# license is best-effort, happy to update if it doesn't match the upstream license
+license = "Apache-2.0"
 version = 1
 backends = ["cuda"]
 
