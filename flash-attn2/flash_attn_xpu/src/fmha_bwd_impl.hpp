@@ -605,7 +605,7 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
             // Math: dS = scale * P * (mask * rp * dP_dropped - dpsum)
             // where P is the original softmax output, dP_dropped = dO * V^T,
             // and dpsum = sum(dO * O) with O having rp scaling from forward.
-            constexpr int kDropMaskMax = 128;
+            constexpr int kDropMaskMax = decltype(size(rS))::value;
             bool drop_keep[kDropMaskMax];
             int drop_mask_count = 0;
 
