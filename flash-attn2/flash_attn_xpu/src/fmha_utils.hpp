@@ -130,3 +130,59 @@ struct decode_policy_head512 {
   using ShapeOut = Shape<_1, _512>;
   using SubgroupLayoutQK = Layout<Shape<_1, _8, _1>>;
 };
+
+struct decode_paged_policy_head32 {
+  using ShapeQK = Shape<_1, _64, _64>;
+  using ShapePV = Shape<_1, _32, _64>;
+  using ShapeOut = Shape<_1, _32>;
+  using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
+};
+
+struct decode_paged_policy_head64 {
+  using ShapeQK = Shape<_1, _64, _64>;
+  using ShapePV = Shape<_1, _32, _64>;
+  using ShapeOut = Shape<_1, _64>;
+  using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
+};
+
+struct decode_paged_policy_head96 {
+  using ShapeQK = Shape<_1, _64, _64>;
+  using ShapePV = Shape<_1, _32, _64>;
+  using ShapeOut = Shape<_1, _96>;
+  using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
+};
+
+struct decode_paged_policy_head128 {
+  using ShapeQK = Shape<_1, _64, _64>;
+  using ShapePV = Shape<_1, _32, _64>;
+  using ShapeOut = Shape<_1, _128>;
+  using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
+};
+
+struct decode_paged_policy_head160 {
+  using ShapeQK = Shape<_1, _64, _64>;
+  using ShapePV = Shape<_1, _32, _64>;
+  using ShapeOut = Shape<_1, _160>;
+  using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
+};
+
+struct decode_paged_policy_head192 {
+  using ShapeQK = Shape<_1, _64, _64>;
+  using ShapePV = Shape<_1, _32, _64>;
+  using ShapeOut = Shape<_1, _192>;
+  using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
+};
+
+struct decode_paged_policy_head256 {
+  using ShapeQK = Shape<_1, _64, _64>;
+  using ShapePV = Shape<_1, _32, _64>;
+  using ShapeOut = Shape<_1, _256>;
+  using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
+};
+
+struct decode_paged_policy_head512 {
+  using ShapeQK = Shape<_1, _64, _64>;
+  using ShapePV = Shape<_1, _32, _64>;
+  using ShapeOut = Shape<_1, _512>;
+  using SubgroupLayoutQK = Layout<Shape<_1, _4, _1>>;
+};

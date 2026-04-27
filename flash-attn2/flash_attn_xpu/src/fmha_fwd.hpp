@@ -34,6 +34,15 @@ struct decode_policy_head192;
 struct decode_policy_head256;
 struct decode_policy_head512;
 
+struct decode_paged_policy_head32;
+struct decode_paged_policy_head64;
+struct decode_paged_policy_head96;
+struct decode_paged_policy_head128;
+struct decode_paged_policy_head160;
+struct decode_paged_policy_head192;
+struct decode_paged_policy_head256;
+struct decode_paged_policy_head512;
+
 template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged>
 void policy_dispatch(
     sycl::queue& queue,
@@ -72,6 +81,40 @@ extern template void policy_dispatch<prefill_policy_head256, PipelineStages_Pref
 extern template void policy_dispatch<prefill_policy_head512, PipelineStages_Prefill, 1, 0>(
     sycl::queue&, CutlassType, const fmha_fwd_args_t&);
 extern template void policy_dispatch<prefill_policy_head512, PipelineStages_Prefill, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+
+// Varlen decode mode extern declarations (IsVarLen=1, IsPaged=0/1)
+extern template void policy_dispatch<decode_policy_head32, PipelineStages_Decode, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_paged_policy_head32, PipelineStages_Decode, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_policy_head64, PipelineStages_Decode, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_paged_policy_head64, PipelineStages_Decode, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_policy_head96, PipelineStages_Decode, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_paged_policy_head96, PipelineStages_Decode, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_policy_head128, PipelineStages_Decode, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_paged_policy_head128, PipelineStages_Decode, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_policy_head160, PipelineStages_Decode, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_paged_policy_head160, PipelineStages_Decode, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_policy_head192, PipelineStages_Decode, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_paged_policy_head192, PipelineStages_Decode, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_policy_head256, PipelineStages_Decode, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_paged_policy_head256, PipelineStages_Decode, 1, 1>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_policy_head512, PipelineStages_Decode, 1, 0>(
+    sycl::queue&, CutlassType, const fmha_fwd_args_t&);
+extern template void policy_dispatch<decode_paged_policy_head512, PipelineStages_Decode, 1, 1>(
     sycl::queue&, CutlassType, const fmha_fwd_args_t&);
 
 // Fixed mode extern declarations (IsVarLen=0, IsPaged=0)

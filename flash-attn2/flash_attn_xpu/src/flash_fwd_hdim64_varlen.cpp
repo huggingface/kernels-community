@@ -20,3 +20,21 @@ template void policy_dispatch<
     sycl::queue& queue, 
     CutlassType cuType, 
     const fmha_fwd_args_t& args);
+
+// Varlen decode + non-paged
+template void policy_dispatch<
+    decode_policy_head64,
+    PipelineStages_Decode,
+    1, 0>(
+    sycl::queue& queue,
+    CutlassType cuType,
+    const fmha_fwd_args_t& args);
+
+// Varlen decode + paged
+template void policy_dispatch<
+    decode_paged_policy_head64,
+    PipelineStages_Decode,
+    1, 1>(
+    sycl::queue& queue,
+    CutlassType cuType,
+    const fmha_fwd_args_t& args);

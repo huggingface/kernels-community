@@ -10,6 +10,29 @@ constexpr int round_up(int x, int m) {
   return (x + m - 1) / m * m;
 }
 
+int paged_k_tile_size_n(int head_size, int max_seqlen_q) {
+  if (max_seqlen_q == 1) {
+    return 64;
+  }
+  if (head_size <= 96) {
+    return 64;
+  }
+  if (head_size <= 128) {
+    return 32;
+  }
+  if (head_size <= 256) {
+    return 64;
+  }
+  if (head_size == 512) {
+    return 32;
+  }
+  return 0;
+}
+
+bool is_supported_paged_block_size(int block_size) {
+  return block_size >= 64 && block_size % 64 == 0;
+}
+
 /// Dispatch the varlen forward kernel by head_size, delegating paged/non-paged variants.
 /// The Policy template parameter is selected by the caller based on head_size.
 template <typename Policy, int PipelineStages>
@@ -22,8 +45,18 @@ void dispatch_varlen_paged(sycl::queue& queue, CutlassType cuType,
   }
 }
 
-/// Dispatch forward kernel by head_size for the varlen path.
-/// All supported head dimensions (32..256) are mapped to their corresponding prefill policies.
+template <typename Policy, typename PagedPolicy, int PipelineStages>
+void dispatch_varlen_decode_paged(sycl::queue& queue, CutlassType cuType,
+                                  const fmha_fwd_args_t& args) {
+  if (args.is_paged) {
+    policy_dispatch<PagedPolicy, PipelineStages, /*IsVarLen=*/1, /*IsPaged=*/1>(queue, cuType, args);
+  } else {
+    policy_dispatch<Policy, PipelineStages, /*IsVarLen=*/1, /*IsPaged=*/0>(queue, cuType, args);
+  }
+}
+
+/// Dispatch forward kernel by head_size for the varlen prefill path.
+/// Supported head dimensions are bucketed to the corresponding prefill policies.
 void dispatch_fwd_varlen_by_head(sycl::queue& queue, CutlassType cuType,
                                  const fmha_fwd_args_t& args, int head_size) {
   if      (head_size <=  32) dispatch_varlen_paged<prefill_policy_head32,  PipelineStages_Prefill>(queue, cuType, args);
@@ -34,6 +67,20 @@ void dispatch_fwd_varlen_by_head(sycl::queue& queue, CutlassType cuType,
   else if (head_size <= 192) dispatch_varlen_paged<prefill_policy_head192, PipelineStages_Prefill>(queue, cuType, args);
   else if (head_size <= 256) dispatch_varlen_paged<prefill_policy_head256, PipelineStages_Prefill>(queue, cuType, args);
   else if (head_size == 512) dispatch_varlen_paged<prefill_policy_head512, PipelineStages_Prefill>(queue, cuType, args);
+  else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");
+}
+
+/// Dispatch forward kernel by head_size for the varlen decode path (max_seqlen_q == 1).
+void dispatch_fwd_varlen_decode_by_head(sycl::queue& queue, CutlassType cuType,
+                                        const fmha_fwd_args_t& args, int head_size) {
+  if      (head_size <=  32) dispatch_varlen_decode_paged<decode_policy_head32,  decode_paged_policy_head32,  PipelineStages_Decode>(queue, cuType, args);
+  else if (head_size <=  64) dispatch_varlen_decode_paged<decode_policy_head64,  decode_paged_policy_head64,  PipelineStages_Decode>(queue, cuType, args);
+  else if (head_size <=  96) dispatch_varlen_decode_paged<decode_policy_head96,  decode_paged_policy_head96,  PipelineStages_Decode>(queue, cuType, args);
+  else if (head_size <= 128) dispatch_varlen_decode_paged<decode_policy_head128, decode_paged_policy_head128, PipelineStages_Decode>(queue, cuType, args);
+  else if (head_size <= 160) dispatch_varlen_decode_paged<decode_policy_head160, decode_paged_policy_head160, PipelineStages_Decode>(queue, cuType, args);
+  else if (head_size <= 192) dispatch_varlen_decode_paged<decode_policy_head192, decode_paged_policy_head192, PipelineStages_Decode>(queue, cuType, args);
+  else if (head_size <= 256) dispatch_varlen_decode_paged<decode_policy_head256, decode_paged_policy_head256, PipelineStages_Decode>(queue, cuType, args);
+  else if (head_size == 512) dispatch_varlen_decode_paged<decode_policy_head512, decode_paged_policy_head512, PipelineStages_Decode>(queue, cuType, args);
   else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");
 }
 
@@ -124,6 +171,18 @@ void cutlass_fmha_fwd_varlen_impl(
     num_heads_kv       = key_cache.size(2);
     max_blocks_per_seq = block_table->size(1);
     total_seqlen_k     = num_blocks * block_size;
+    TORCH_CHECK(
+      is_supported_paged_block_size(block_size),
+      "Unsupported paged KV block_size=", block_size,
+      ". This FA2 XPU path supports block_size values that are positive multiples of 64 ",
+      "(64, 128, 256, ...). block_size=16/32 need dedicated paged policies and are not enabled.");
+    const int k_tile_n = paged_k_tile_size_n(head_size, max_seqlen_q);
+    TORCH_CHECK(k_tile_n > 0, "Unsupported head_size for paged FA2 forward: ", head_size);
+    TORCH_CHECK(
+      block_size % k_tile_n == 0,
+      "Paged KV block_size must be a multiple of the kernel K tile. Got block_size=",
+      block_size, ", K tile=", k_tile_n,
+      ". Current paged mapping does not support tiles crossing page boundaries.");
   } else {
     num_blocks         = 0;
     block_size         = 0;
@@ -163,7 +222,11 @@ void cutlass_fmha_fwd_varlen_impl(
       is_local};
 
   const CutlassType cuType = aten_to_Cutlass_dtype(query);
-  dispatch_fwd_varlen_by_head(queue, cuType, args, args.head_size);
+  if (args.max_queries == 1) {
+    dispatch_fwd_varlen_decode_by_head(queue, cuType, args, args.head_size);
+  } else {
+    dispatch_fwd_varlen_by_head(queue, cuType, args, args.head_size);
+  }
 }
 
 void cutlass_fmha_fwd_fix_impl(

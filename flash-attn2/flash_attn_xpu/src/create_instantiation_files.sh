@@ -7,7 +7,7 @@
 # - flash_fwd_hdim{N}_varlen.cpp: Variable length mode (IsVarLen=1) with paged/non-paged variants
 # - flash_fwd_hdim{N}_fix.cpp: Fixed length mode (IsVarLen=0, IsPaged=0) for both decode and prefill
 
-HDIMS=(32 64 96 128 160 192 256)
+HDIMS=(32 64 96 128 160 192 256 512)
 
 # Create varlen instantiation files (IsVarLen=1, with paged/non-paged)
 echo "Creating varlen instantiation files..."
@@ -34,6 +34,24 @@ template void policy_dispatch<
     1, 1>(
     sycl::queue& queue, 
     CutlassType cuType, 
+    const fmha_fwd_args_t& args);
+
+// Varlen decode + non-paged
+template void policy_dispatch<
+    decode_policy_head${hdim},
+    PipelineStages_Decode,
+    1, 0>(
+    sycl::queue& queue,
+    CutlassType cuType,
+    const fmha_fwd_args_t& args);
+
+// Varlen decode + paged
+template void policy_dispatch<
+    decode_paged_policy_head${hdim},
+    PipelineStages_Decode,
+    1, 1>(
+    sycl::queue& queue,
+    CutlassType cuType,
     const fmha_fwd_args_t& args);
 ENDFILE
   echo "  Created flash_fwd_hdim${hdim}_varlen.cpp"

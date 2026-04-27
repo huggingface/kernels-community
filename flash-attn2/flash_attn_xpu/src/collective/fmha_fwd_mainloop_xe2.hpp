@@ -362,7 +362,7 @@ struct FMHAFwdMainloopXe2<
           PagedKV ? tVgV(_, _, _, _, page_idx) : tVgV(_, _, _, _, K);
 
       // Non-paged: prefetch V before GEMM1 to overlap with computation.
-      // Paged: prefetch V after GEMM1 to avoid BMG hardware hang. TODO IGC 2.28
+      // Paged: prefetch V after GEMM1 to avoid BMG hardware hang.
       if constexpr (!PagedKV) {
         CUTLASS_PRAGMA_UNROLL
         for (int VV = 0; VV < VTiles; VV++) {
@@ -430,7 +430,7 @@ struct FMHAFwdMainloopXe2<
             }
           }
         } else {
-          // Paged path: single loop to avoid IGC codegen hang on BMG. TODO IGC 2.28
+          // Paged path: single loop to avoid IGC codegen hang on BMG.
           CUTLASS_PRAGMA_UNROLL
           for (int i = 0; i < tSrS.size(); ++i) {
             int row_idx = get<0>(cS_thread(i));
