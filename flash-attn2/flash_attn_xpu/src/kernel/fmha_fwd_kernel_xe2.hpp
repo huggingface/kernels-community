@@ -4,8 +4,6 @@
  *
  * Xe2 (BMG / Arc Pro B60) FMHA forward outer kernel -- supports the full FA2
  * feature set (causal, local, dropout, paged, varlen) via compile-time flags.
- * For non-varlen: uses contiguous int64_t strides (row_stride, head_stride,
- * batch_stride) rather than cute::Stride types, matching SDPA.
  **************************************************************************************************/
 
 #pragma once
