@@ -306,3 +306,88 @@ void cutlass_fmha_fwd_fix_impl(
     dispatch_fwd_prefill_by_head(queue, cuType, args, h);
   }
 }
+
+void cutlass_fmha_fwd_kvcache_impl(
+    sycl::queue& queue,
+    const at::Tensor& query,
+    const at::Tensor& kcache,
+    const at::Tensor& vcache,
+    at::Tensor& out,
+    at::Tensor& softmax_lse,
+    const at::Tensor& seqlens_k,
+    const std::optional<at::Tensor>& cache_batch_idx,
+    const std::optional<at::Tensor>& cache_leftpad,
+    const std::optional<at::Tensor>& knew,
+    const std::optional<at::Tensor>& vnew,
+    float sm_scale,
+    int window_size_left,
+    int window_size_right,
+    bool is_causal,
+    bool is_local) {
+  const int batch_size   = query.size(0);
+  const int max_seqlen_q = query.size(1);
+  const int num_heads_q  = query.size(2);
+  const int head_size    = query.size(3);
+
+  const int max_seqlen_k = kcache.size(1);
+  const int num_heads_kv = kcache.size(2);
+
+  const int total_seqlen_q = batch_size * max_seqlen_q;
+  const int total_seqlen_k = batch_size * max_seqlen_k;
+
+  normalize_window_params(window_size_left, window_size_right,
+                          is_causal, is_local, max_seqlen_k);
+
+  fmha_fwd_args_t args = {
+      query.data_ptr(),
+      kcache.data_ptr(),
+      vcache.data_ptr(),
+      out.data_ptr(),
+      softmax_lse.data_ptr(),
+      nullptr,      // block_table
+      nullptr,      // cu_seqlens_q
+      nullptr,      // cu_seqlens_k
+      max_seqlen_q,
+      max_seqlen_k,
+      total_seqlen_q,
+      total_seqlen_k,
+      sm_scale,
+      batch_size,
+      num_heads_q,
+      num_heads_kv,
+      head_size,
+      0,            // max_blocks_per_seq
+      0,            // block_size
+      window_size_left,
+      window_size_right,
+      false,        // is_varlen
+      false,        // is_paged
+      is_causal,
+      is_local,
+      0.0f, 0, 0, nullptr, nullptr, 0, 0,  // dropout & s_dmask defaults
+      static_cast<int*>(seqlens_k.data_ptr()),
+      cache_batch_idx.has_value()
+          ? static_cast<int*>(cache_batch_idx->data_ptr())
+          : nullptr,
+      cache_leftpad.has_value()
+          ? static_cast<int*>(cache_leftpad->data_ptr())
+          : nullptr,
+      knew.has_value() ? knew->data_ptr() : nullptr,
+      vnew.has_value() ? vnew->data_ptr() : nullptr,
+      knew.has_value() ? static_cast<int>(knew->size(1)) : 0,
+      knew.has_value() ? knew->stride(0) : 0,
+      knew.has_value() ? knew->stride(2) : 0,
+      knew.has_value() ? knew->stride(1) : 0,
+      vnew.has_value() ? vnew->stride(0) : 0,
+      vnew.has_value() ? vnew->stride(2) : 0,
+      vnew.has_value() ? vnew->stride(1) : 0};
+
+  const CutlassType cuType = aten_to_Cutlass_dtype(query);
+  const int h = args.head_size;
+
+  if (max_seqlen_q == 1) {
+    dispatch_fwd_decode_by_head(queue, cuType, args, h);
+  } else {
+    dispatch_fwd_prefill_by_head(queue, cuType, args, h);
+  }
+}

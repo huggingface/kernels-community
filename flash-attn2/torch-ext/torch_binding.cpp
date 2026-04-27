@@ -144,6 +144,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     "int num_splits) -> Tensor[]");
 #if defined(CUDA_KERNEL)
   ops.impl("fwd_kvcache", torch::kCUDA, &mha_fwd_kvcache);
+#elif defined(XPU_KERNEL)
+  ops.impl("fwd_kvcache", torch::kXPU, &mha_fwd_kvcache);
 #endif
 }
 

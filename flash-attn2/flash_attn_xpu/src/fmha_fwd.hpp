@@ -158,3 +158,21 @@ void cutlass_fmha_fwd_fix_impl(
     void* s_dmask = nullptr,
     int seqlen_q_rounded = 0,
     int seqlen_k_rounded = 0);
+
+void cutlass_fmha_fwd_kvcache_impl(
+    sycl::queue& queue,
+    const at::Tensor& query,
+    const at::Tensor& kcache,
+    const at::Tensor& vcache,
+    at::Tensor& out,
+    at::Tensor& softmax_lse,
+    const at::Tensor& seqlens_k,
+    const std::optional<at::Tensor>& cache_batch_idx,
+    const std::optional<at::Tensor>& cache_leftpad,
+    const std::optional<at::Tensor>& knew,
+    const std::optional<at::Tensor>& vnew,
+    float sm_scale,
+    int window_size_left,
+    int window_size_right,
+    bool is_causal,
+    bool is_local);

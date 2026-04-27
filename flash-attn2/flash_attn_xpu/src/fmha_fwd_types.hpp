@@ -39,6 +39,22 @@ struct fmha_fwd_args_t {
   void* s_dmask = nullptr;    // Output: attention matrix with dropout sign-bit encoding
   int seqlen_q_rounded = 0;   // Q sequence length rounded up (stride for s_dmask)
   int seqlen_k_rounded = 0;   // K sequence length rounded up (stride for s_dmask)
+
+  // KV Cache fields (optional, set to nullptr for non-kvcache paths)
+  int* cache_seqlens = nullptr;    // (batch_size,) per-batch effective KV length
+  int* cache_batch_idx = nullptr;  // (batch_size,) indices into KV cache batch dim
+  int* cache_leftpad = nullptr;    // (batch_size,) left padding per batch in KV cache
+
+  // Fused KV cache append: new K/V to scatter into cache inside the kernel
+  void* knew = nullptr;
+  void* vnew = nullptr;
+  int seqlen_knew = 0;
+  int64_t knew_batch_stride = 0;
+  int64_t knew_head_stride = 0;
+  int64_t knew_row_stride = 0;
+  int64_t vnew_batch_stride = 0;
+  int64_t vnew_head_stride = 0;
+  int64_t vnew_row_stride = 0;
 };
 
 enum class CutlassType {

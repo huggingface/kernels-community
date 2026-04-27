@@ -98,6 +98,20 @@ class XeFMHAFwdKernelXe2 {
     float* pLSE;
     int lse_stride_head;
     int lse_stride_batch;
+    // KV Cache: per-batch effective KV length (nullptr for non-kvcache paths)
+    int* cache_seqlens = nullptr;
+    int* cache_batch_idx = nullptr;
+    int* cache_leftpad = nullptr;
+    // Fused KV cache append
+    const ElementK* Knew = nullptr;
+    int64_t knew_batch_stride = 0;
+    int64_t knew_head_stride = 0;
+    int64_t knew_row_stride = 0;
+    const ElementV* Vnew = nullptr;
+    int64_t vnew_batch_stride = 0;
+    int64_t vnew_head_stride = 0;
+    int64_t vnew_row_stride = 0;
+    int seqlen_knew = 0;
   };
   using KernelParams = KernelArguments;
 
@@ -211,11 +225,52 @@ class XeFMHAFwdKernelXe2 {
       if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo)
         continue;
 
-      auto full_tile_offset = seq_len_kv - seq_len_qo;
+      // KV Cache: override seq_len_kv with per-batch effective length
+      int effective_seq_kv = seq_len_kv;
+      int leftpad_k = 0;
+      if (p.cache_seqlens) {
+        int bidx = p.cache_batch_idx ? p.cache_batch_idx[idx_b] : idx_b;
+        int orig_cache_seqlens = p.cache_seqlens[bidx];
+        if (p.cache_leftpad) {
+          leftpad_k = p.cache_leftpad[bidx];
+        }
+
+        // Fused cache update: copy knew/vnew into kcache/vcache
+        if (p.Knew != nullptr && p.seqlen_knew > 0) {
+          constexpr int num_threads = SGPerWG::value * cute::intel::sg_size;
+          auto* k_dst = const_cast<ElementK*>(p.K)
+              + bidx * p.k_batch_stride + head * p.k_head_stride
+              + static_cast<int64_t>(orig_cache_seqlens) * p.k_row_stride;
+          auto* k_src = p.Knew
+              + idx_b * p.knew_batch_stride + head * p.knew_head_stride;
+          for (int si = 0; si < p.seqlen_knew; si++) {
+            for (int d = thr_id; d < s.head_size_qk; d += num_threads) {
+              k_dst[si * p.k_row_stride + d] = k_src[si * p.knew_row_stride + d];
+            }
+          }
+          auto* v_dst = const_cast<ElementV*>(p.V)
+              + bidx * p.v_batch_stride + head * p.v_head_stride
+              + static_cast<int64_t>(orig_cache_seqlens) * p.v_row_stride;
+          auto* v_src = p.Vnew
+              + idx_b * p.vnew_batch_stride + head * p.vnew_head_stride;
+          for (int si = 0; si < p.seqlen_knew; si++) {
+            for (int d = thr_id; d < s.head_size_vo; d += num_threads) {
+              v_dst[si * p.v_row_stride + d] = v_src[si * p.vnew_row_stride + d];
+            }
+          }
+          sycl::group_barrier(get_work_group<3>());
+          effective_seq_kv = (orig_cache_seqlens + p.seqlen_knew) - leftpad_k;
+        } else {
+          effective_seq_kv = orig_cache_seqlens - leftpad_k;
+        }
+      }
+      if (effective_seq_kv <= 0) continue;
+
+      auto full_tile_offset = effective_seq_kv - seq_len_qo;
       int seq_coord = cute::min(
           seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
       int last_seq_coord = seq_coord + q_sg_tile - 1;
-      int first_non_masked_sequence = seq_len_qo - seq_len_kv;
+      int first_non_masked_sequence = seq_len_qo - effective_seq_kv;
 
       // Causal-only early-exit: skip SGs that are fully masked. With
       // LocalMask we can't easily do this here, so let the loop body mask.
@@ -228,15 +283,15 @@ class XeFMHAFwdKernelXe2 {
       int seq_len;
       if constexpr (CausalMask && LocalMask) {
         seq_len = cute::min(
-            seq_len_kv,
+            effective_seq_kv,
             full_tile_offset + seq_coord + q_sg_tile +
                 params.mainloop.local.local_right);
       } else if constexpr (CausalMask) {
         seq_len = calculate_longest_non_masked_length(
-            seq_len_kv, seq_len_qo, last_seq_coord,
+            effective_seq_kv, seq_len_qo, last_seq_coord,
             first_non_masked_sequence);
       } else {
-        seq_len = seq_len_kv;
+        seq_len = effective_seq_kv;
       }
       if (seq_len < 0) seq_len = 0;
 
@@ -272,12 +327,17 @@ class XeFMHAFwdKernelXe2 {
       } else {
         total_seqlen_kv = seq_len_kv;
       }
+      // When leftpad is applied, the K/V base pointer is shifted forward.
+      // Reduce the surface height so it accurately describes the data
+      // reachable from the shifted base, preventing 2D block loads from
+      // extending past the per-batch allocation.
+      int kv_surface_len = total_seqlen_kv - leftpad_k;
       auto shape_Q =
           make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
       auto shape_K = make_shape(
-          total_seqlen_kv, s.head_size_qk, s.num_heads_kv, batch_dim);
+          kv_surface_len, s.head_size_qk, s.num_heads_kv, batch_dim);
       auto shape_V = make_shape(
-          s.head_size_vo, total_seqlen_kv, s.num_heads_kv, batch_dim);
+          s.head_size_vo, kv_surface_len, s.num_heads_kv, batch_dim);
       auto shape_O =
           make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
 
@@ -302,6 +362,12 @@ class XeFMHAFwdKernelXe2 {
       auto dcK = const_cast<ElementK*>(p.K + offset_k);
       auto dcV = const_cast<ElementV*>(p.V + offset_v);
       auto ptrO = p.O + offset_o;
+
+      // Offset K/V by leftpad to skip left-padding tokens in the cache
+      if (leftpad_k > 0) {
+        dcK += leftpad_k * static_cast<int>(p.k_row_stride);
+        dcV += leftpad_k * static_cast<int>(p.v_row_stride);
+      }
 
       auto layout_q = is_var_len
           ? make_ordered_layout(shape_Q, Step<_2, _0, _1, _3>{})
@@ -343,7 +409,7 @@ class XeFMHAFwdKernelXe2 {
           thr_id,
           seq_len,
           seq_len_qo,
-          seq_len_kv,
+          effective_seq_kv,
           idx_b,
           tile_row_idx,
           rows_of_maxima,
