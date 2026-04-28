@@ -7,7 +7,7 @@
 
   outputs =
     { self, kernel-builder }:
-    kernel-builder.lib.genFlakeOutputs {
+    kernel-builder.lib.genKernelFlakeOutputs {
       inherit self;
       path = ./.;
     };

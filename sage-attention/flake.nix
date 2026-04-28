@@ -7,8 +7,8 @@
 
   outputs =
     { self, kernel-builder }:
-    kernel-builder.lib.genFlakeOutputs {
+    kernel-builder.lib.genKernelFlakeOutputs {
+      inherit self;
       path = ./.;
-      rev = self.shortRev or self.dirtyShortRev or self.lastModifiedDate;
     };
 }

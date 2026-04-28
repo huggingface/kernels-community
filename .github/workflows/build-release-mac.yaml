@@ -2,14 +2,19 @@ name: Build Release (macOS)
 on:
   pull_request:
     types: [closed]
+  workflow_dispatch:
+    inputs:
+      kernel_name:
+        description: "Kernel directory name to build"
+        required: true
+        type: string
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
   build-kernel:
-    # Only run if the PR was actually merged (not just closed)
-    if: github.event.pull_request.merged == true
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
@@ -31,11 +36,21 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release"); then
-            echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
-            echo "skip=false" >> $GITHUB_OUTPUT
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            KERNEL="${{ inputs.kernel_name }}"
+            if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$KERNEL/build.toml" ]; then
+              echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+              echo "skip=false" >> $GITHUB_OUTPUT
+            else
+              echo "skip=true" >> $GITHUB_OUTPUT
+            fi
           else
-            echo "skip=true" >> $GITHUB_OUTPUT
+            if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release"); then
+              echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+              echo "skip=false" >> $GITHUB_OUTPUT
+            else
+              echo "skip=true" >> $GITHUB_OUTPUT
+            fi
           fi
       - name: Install Metal toolchain
         if: steps.validate.outputs.skip == 'false'
