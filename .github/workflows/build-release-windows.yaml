@@ -1,4 +1,6 @@
 name: Build Release (Windows)
+run-name: >-
+  Build Release (Windows) / ${{ inputs.kernel_name || '' }} / request=${{ inputs.dispatch_key || '' }}
 on:
   pull_request:
     types: [closed]
@@ -9,6 +11,10 @@ on:
       kernel_name:
         description: "Kernel directory name to build"
         required: true
+        type: string
+      dispatch_key:
+        description: "Unique key for matching this run back to a bot dispatch"
+        required: false
         type: string
 
 concurrency:
