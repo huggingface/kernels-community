@@ -92,7 +92,7 @@ def has_native_mxfp():
 
 
 def num_sms():
-    if is_cuda():
+    if is_cuda() or is_hip():
         return torch.cuda.get_device_properties(0).multi_processor_count
     if is_xpu():
         return torch.xpu.get_device_properties(0).max_compute_units
