@@ -2,7 +2,7 @@
   description = "Flake for activation kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/kernels-use-kernels-data";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =

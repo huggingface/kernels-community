@@ -670,6 +670,7 @@ def main():
                     "ref": default_branch,
                     "inputs": {
                         "kernel_name": kernel_name,
+                        "dispatch_key": dispatch_key,
                     },
                 }
                 try:
