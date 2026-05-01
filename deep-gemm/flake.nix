@@ -3,7 +3,7 @@
 
   inputs = {
     self.submodules = true;
-    kernel-builder.url = "github:huggingface/kernels";
+    kernel-builder.url = "github:huggingface/kernels/torch-2.12";
   };
 
   outputs =
