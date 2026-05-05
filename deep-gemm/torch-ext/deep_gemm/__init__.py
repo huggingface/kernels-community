@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sysconfig
 import torch
 
 # Avoid holding a CUDA tensor in DeepGEMM's process-lifetime runtime singleton.
@@ -794,6 +795,14 @@ if "DG_CUTLASS_INCLUDE" not in os.environ:
         _include,  # legacy layout: include/cutlass
         os.path.join(_include, "third-party", "cutlass", "include"),  # submodule layout
     ]
+    for _site_packages in {
+        sysconfig.get_paths().get("purelib"),
+        sysconfig.get_paths().get("platlib"),
+    }:
+        if _site_packages:
+            _cutlass_include_candidates.append(
+                os.path.join(_site_packages, "cutlass_library", "source", "include")
+            )
     for _cutlass_include in _cutlass_include_candidates:
         if os.path.isdir(os.path.join(_cutlass_include, "cutlass")):
             os.environ["DG_CUTLASS_INCLUDE"] = _cutlass_include
