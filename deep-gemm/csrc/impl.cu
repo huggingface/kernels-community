@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "../torch-ext/torch_binding.h"
+#include "utils/exception.hpp"
 #include "apis/attention.hpp"
 #include "apis/einsum.hpp"
 #include "apis/hyperconnection.hpp"
