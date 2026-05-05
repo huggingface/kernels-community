@@ -63,7 +63,9 @@ static std::string to_string(const at::ScalarType& dtype) {
 
 static std::string to_string(const float& v) {
     if (std::isfinite(v)) {
-        return fmt::format(R"({:a}f)", v);
+        char buffer[32];
+        std::snprintf(buffer, sizeof(buffer), "%.9gf", v);
+        return buffer;
     } else if (std::isinf(v)) {
         return v > 0 ? "cute::numeric_limits<float>::infinity()"
                      : "-cute::numeric_limits<float>::infinity()";

@@ -87,12 +87,12 @@ public:
     }
 
     std::string get_hash_value(const std::string& code, const bool& exclude_code = true) {
-        std::stringstream ss;
+        std::string hash_input;
         for (const auto& i: get_includes(code))
-            ss << get_hash_value_by_path(library_include_path / i) << "$";
+            hash_input += get_hash_value_by_path(library_include_path / i) + "$";
         if (not exclude_code)
-            ss << "#" << get_hex_digest(code);
-        return get_hex_digest(ss.str());
+            hash_input += "#" + get_hex_digest(code);
+        return get_hex_digest(hash_input);
     }
 
     std::string get_hash_value_by_path(const std::filesystem::path& path) {
