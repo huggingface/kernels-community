@@ -2,6 +2,11 @@ import os
 import subprocess
 import torch
 
+# Avoid holding a CUDA tensor in DeepGEMM's process-lifetime runtime singleton.
+# In packaged/lazy-loaded use, that can outlive PyTorch's CUDA teardown and crash
+# during interpreter shutdown.
+os.environ.setdefault("DG_USE_TEMP_CUBLASLT_WORKSPACE", "1")
+
 # Import the compiled extension
 from ._ops import ops as _ops, add_op_namespace_prefix
 from . import utils
