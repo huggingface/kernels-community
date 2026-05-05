@@ -173,6 +173,14 @@ def get_theoretical_mk_alignment_for_contiguous_layout(expected_m=None) -> int:
 
 
 def get_token_alignment_for_mega_moe() -> int:
+    # Mega MoE is SM_100 / Blackwell, CUDA 12.8+. The C++ binding is only
+    # compiled on toolchains that support it; otherwise raise a clear error.
+    if not hasattr(ops, "get_token_alignment_for_mega_moe"):
+        raise RuntimeError(
+            "Mega MoE is unavailable: this build of deep-gemm was compiled "
+            "with a CUDA toolchain older than 12.8 (Blackwell intrinsics "
+            "such as __fmul2_rn are required)."
+        )
     return ops.get_token_alignment_for_mega_moe()
 
 

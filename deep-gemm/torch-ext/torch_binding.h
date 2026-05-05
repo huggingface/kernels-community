@@ -260,10 +260,13 @@ Tensor deep_gemm_fp8_fp4_paged_mqa_logits(
     const std::optional<Tensor>& indices);
 
 // ============================================================================
-// Mega MoE ops
+// Mega MoE ops (SM_100 / Blackwell, CUDA 12.8+ only)
 // ============================================================================
 
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
+#define DG_HAS_MEGA_APIS 1
 int64_t deep_gemm_get_token_alignment_for_mega_moe();
+#endif
 
 // ============================================================================
 // Einsum ops

@@ -8,8 +8,13 @@
 #include "apis/hyperconnection.hpp"
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
-#include "apis/mega.hpp"
 #include "apis/runtime.hpp"
+// apis/mega.hpp transitively includes deep_gemm/common/math.cuh, which uses
+// __fmul2_rn — a CUDA 12.8+ Blackwell intrinsic. Only include when nvcc is
+// new enough (DG_HAS_MEGA_APIS is set by torch_binding.h based on CUDA_VERSION).
+#ifdef DG_HAS_MEGA_APIS
+#include "apis/mega.hpp"
+#endif
 #if DG_TENSORMAP_COMPATIBLE
 #include "jit/include_parser.hpp"
 #endif
@@ -483,11 +488,12 @@ Tensor deep_gemm_fp8_fp4_paged_mqa_logits(
         static_cast<int>(max_context_len), clean_logits, dtype, indices);
 }
 
-// Mega MoE ops
-
+// Mega MoE ops (SM_100 / Blackwell, CUDA 12.8+ only)
+#ifdef DG_HAS_MEGA_APIS
 int64_t deep_gemm_get_token_alignment_for_mega_moe() {
     return deep_gemm::mega::get_token_alignment_for_mega_moe();
 }
+#endif
 
 // Einsum ops
 

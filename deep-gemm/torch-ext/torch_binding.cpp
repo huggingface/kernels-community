@@ -328,10 +328,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.impl("fp8_fp4_paged_mqa_logits", torch::kCUDA,
              &deep_gemm_fp8_fp4_paged_mqa_logits);
 
-    // Mega MoE ops (host-side query)
+    // Mega MoE ops (SM_100 / Blackwell, CUDA 12.8+ only)
+#ifdef DG_HAS_MEGA_APIS
     ops.def("get_token_alignment_for_mega_moe() -> int");
     ops.impl("get_token_alignment_for_mega_moe",
              &deep_gemm_get_token_alignment_for_mega_moe);
+#endif
 
     // Einsum ops (CUDA dispatch)
     ops.def(
