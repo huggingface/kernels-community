@@ -64,7 +64,7 @@ int64_t deep_gemm_get_tc_util() {
 // Layout ops
 
 int64_t deep_gemm_get_mk_alignment_for_contiguous_layout() {
-    return deep_gemm::get_mk_alignment_for_contiguous_layout();
+    return deep_gemm::heuristics_runtime->get_mk_alignment_for_contiguous_layout();
 }
 
 Tensor deep_gemm_get_tma_aligned_size(int64_t mn, int64_t element_size) {
@@ -84,7 +84,7 @@ Tensor deep_gemm_get_mn_major_tma_aligned_packed_ue8m0_tensor(const Tensor& sf) 
 Tensor deep_gemm_get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
     const Tensor& sf, const Tensor& ks_tensor, const Tensor& ks_int_tensor) {
     auto ks = tensor_to_vec_int(ks_int_tensor);
-    return deep_gemm::get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, ks_tensor, ks);
+    return deep_gemm::get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, ks_tensor, ks, 128);
 }
 
 Tensor deep_gemm_transform_sf_into_required_layout(
@@ -93,12 +93,23 @@ Tensor deep_gemm_transform_sf_into_required_layout(
     int64_t recipe_ab_0, int64_t recipe_ab_1, bool has_recipe_ab,
     int64_t num_groups, bool has_num_groups,
     bool is_sfa, bool disable_ue8m0_cast) {
-    auto recipe = make_recipe3(recipe_0, recipe_1, recipe_2, has_recipe);
-    auto recipe_ab = make_recipe2(recipe_ab_0, recipe_ab_1, has_recipe_ab);
+    std::variant<std::tuple<int, int, int>, std::tuple<int, int>> recipe_v;
+    std::optional<bool> is_sfa_opt;
+    if (has_recipe) {
+        recipe_v = std::make_tuple(static_cast<int>(recipe_0),
+                                   static_cast<int>(recipe_1),
+                                   static_cast<int>(recipe_2));
+        is_sfa_opt = is_sfa;
+    } else {
+        DG_HOST_ASSERT(has_recipe_ab);
+        recipe_v = std::make_tuple(static_cast<int>(recipe_ab_0),
+                                   static_cast<int>(recipe_ab_1));
+        is_sfa_opt = std::nullopt;
+    }
     auto ng = has_num_groups ? std::make_optional(static_cast<int>(num_groups)) : std::nullopt;
     return deep_gemm::layout::transform_sf_into_required_layout(
         sf, static_cast<int>(mn), static_cast<int>(k),
-        recipe, recipe_ab, ng, is_sfa, disable_ue8m0_cast);
+        recipe_v, ng, is_sfa_opt, disable_ue8m0_cast);
 }
 
 // GEMM ops - FP8/FP4
@@ -394,7 +405,8 @@ Tensor deep_gemm_fp8_mqa_logits(
 Tensor deep_gemm_get_paged_mqa_logits_metadata(
     const Tensor& context_lens, int64_t block_kv, int64_t num_sms) {
     return deep_gemm::attention::get_paged_mqa_logits_metadata(
-        context_lens, static_cast<int>(block_kv), static_cast<int>(num_sms));
+        context_lens, static_cast<int>(block_kv), static_cast<int>(num_sms),
+        std::nullopt);
 }
 
 Tensor deep_gemm_fp8_paged_mqa_logits(
@@ -404,7 +416,7 @@ Tensor deep_gemm_fp8_paged_mqa_logits(
     int64_t max_context_len, bool clean_logits) {
     return deep_gemm::attention::fp8_paged_mqa_logits(
         q, fused_kv_cache, weights, context_lens, block_table, schedule_meta,
-        static_cast<int>(max_context_len), clean_logits);
+        static_cast<int>(max_context_len), clean_logits, std::nullopt);
 }
 
 // Einsum ops
