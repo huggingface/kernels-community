@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cute/arch/mma_sm100_umma.hpp>
+#ifdef DG_USE_PYBIND11
 #include <torch/python.h>
+#endif
 
 #include "math.hpp"
 #include "exception.hpp"

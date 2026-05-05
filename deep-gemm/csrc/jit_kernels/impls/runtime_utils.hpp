@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cuda.h>
+#ifdef DG_USE_PYBIND11
 #include <torch/python.h>
+#endif
 
 #include "../heuristics/sm90.hpp"
 #include "../../jit/handle.hpp"

@@ -1,6 +1,8 @@
 #pragma once
 
+#ifdef DG_USE_PYBIND11
 #include <torch/python.h>
+#endif
 
 #include "../../jit/kernel_runtime.hpp"
 #include "../../jit/compiler.hpp"

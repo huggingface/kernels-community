@@ -1,7 +1,9 @@
 // TODO: merge this file with `math.cuh` (the device part)
 #pragma once
 
+#ifdef DG_USE_PYBIND11
 #include <torch/python.h>
+#endif
 
 #include "exception.hpp"
 
