@@ -2,10 +2,13 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#ifdef DG_ENABLE_NVRTC_COMPILER
 #include <nvrtc.h>
-#include <cstring>
+#endif
+#include <regex>
 #include <string>
 
 #include "../utils/exception.hpp"
@@ -15,92 +18,22 @@
 #include "../utils/system.hpp"
 #include "cache.hpp"
 #include "device_runtime.hpp"
+#include "include_parser.hpp"
 
 namespace deep_gemm {
-
-// Lazy-load NVRTC to avoid link-time dependency on libnvrtc.so.
-// kernel-builder doesn't support linking extra CUDA libs yet, so we dlopen
-// at runtime — same pattern as the CUDA driver API in jit/handle.hpp.
-static void* get_nvrtc_handle() {
-    static void* handle = nullptr;
-    if (handle == nullptr) {
-        handle = dlopen("libnvrtc.so", RTLD_LAZY | RTLD_LOCAL);
-        if (handle == nullptr)
-            handle = dlopen("libnvrtc.so.12", RTLD_LAZY | RTLD_LOCAL);
-        DG_HOST_ASSERT(handle != nullptr and "Failed to load NVRTC library");
-    }
-    return handle;
-}
-
-#define DECL_LAZY_NVRTC_FUNCTION(name) \
-template <typename... Args> \
-static auto lazy_##name(Args&&... args) -> decltype(name(args...)) { \
-    using FuncType = decltype(&name); \
-    static FuncType func = nullptr; \
-    if (func == nullptr) { \
-        func = reinterpret_cast<FuncType>(dlsym(get_nvrtc_handle(), #name)); \
-        DG_HOST_ASSERT(func != nullptr and "Failed to load NVRTC function"); \
-    } \
-    return func(std::forward<decltype(args)>(args)...); \
-}
-
-DECL_LAZY_NVRTC_FUNCTION(nvrtcVersion);
-DECL_LAZY_NVRTC_FUNCTION(nvrtcCreateProgram);
-DECL_LAZY_NVRTC_FUNCTION(nvrtcCompileProgram);
-DECL_LAZY_NVRTC_FUNCTION(nvrtcGetProgramLogSize);
-DECL_LAZY_NVRTC_FUNCTION(nvrtcGetProgramLog);
-DECL_LAZY_NVRTC_FUNCTION(nvrtcGetPTXSize);
-DECL_LAZY_NVRTC_FUNCTION(nvrtcGetPTX);
-DECL_LAZY_NVRTC_FUNCTION(nvrtcGetCUBINSize);
-DECL_LAZY_NVRTC_FUNCTION(nvrtcGetCUBIN);
-DECL_LAZY_NVRTC_FUNCTION(nvrtcDestroyProgram);
-DECL_LAZY_NVRTC_FUNCTION(nvrtcGetErrorString);
-
-// Redirect nvrtc calls to lazy-loaded versions so NVRTCCompiler is unchanged
-#define nvrtcVersion lazy_nvrtcVersion
-#define nvrtcCreateProgram lazy_nvrtcCreateProgram
-#define nvrtcCompileProgram lazy_nvrtcCompileProgram
-#define nvrtcGetProgramLogSize lazy_nvrtcGetProgramLogSize
-#define nvrtcGetProgramLog lazy_nvrtcGetProgramLog
-#define nvrtcGetPTXSize lazy_nvrtcGetPTXSize
-#define nvrtcGetPTX lazy_nvrtcGetPTX
-#define nvrtcGetCUBINSize lazy_nvrtcGetCUBINSize
-#define nvrtcGetCUBIN lazy_nvrtcGetCUBIN
-#define nvrtcDestroyProgram lazy_nvrtcDestroyProgram
-#define nvrtcGetErrorString lazy_nvrtcGetErrorString
 
 class Compiler {
 public:
     static std::filesystem::path library_root_path;
     static std::filesystem::path library_include_path;
     static std::filesystem::path cuda_home;
-    static std::string library_version;
     static std::filesystem::path cuobjdump_path;
-
-    static std::string get_library_version() {
-        const auto dg_include = library_include_path / "deep_gemm";
-        if (not std::filesystem::exists(dg_include)) {
-            // Fallback: hash the root path itself
-            std::string fallback(library_root_path.string());
-            return get_hex_digest(std::vector<char>(fallback.begin(), fallback.end()));
-        }
-        std::vector<char> buffer;
-        for (const auto& f: collect_files(dg_include)) {
-            std::ifstream in(f, std::ios::binary);
-            DG_HOST_ASSERT(in.is_open());
-            buffer.insert(buffer.end(),
-                          std::istreambuf_iterator<char>(in),
-                          std::istreambuf_iterator<char>());
-        }
-        return get_hex_digest(buffer);
-    }
 
     static void prepare_init(const std::string& library_root_path,
                              const std::string& cuda_home_path_by_python) {
         Compiler::library_root_path = library_root_path;
         Compiler::library_include_path = Compiler::library_root_path / "include";
         Compiler::cuda_home = cuda_home_path_by_python;
-        Compiler::library_version = get_library_version();
         Compiler::cuobjdump_path = Compiler::cuda_home / "bin" / "cuobjdump";
     }
 
@@ -112,12 +45,11 @@ public:
         DG_HOST_ASSERT(not library_root_path.empty());
         DG_HOST_ASSERT(not library_include_path.empty());
         DG_HOST_ASSERT(not cuda_home.empty());
-        DG_HOST_ASSERT(not library_version.empty());
         DG_HOST_ASSERT(not cuobjdump_path.empty());
 
         // Cache settings
         cache_dir_path = std::filesystem::path(get_env<std::string>("HOME")) / ".deep_gemm";
-        if (const auto& env_cache_dir_path = get_env<std::string>("DG_JIT_CACHE_DIR"); not env_cache_dir_path.empty())
+        if (const auto env_cache_dir_path = get_env<std::string>("DG_JIT_CACHE_DIR"); not env_cache_dir_path.empty())
             cache_dir_path = env_cache_dir_path;
 
         // The compiler flags applied to all derived compilers
@@ -137,58 +69,79 @@ public:
         return make_dirs(cache_dir_path / "tmp");
     }
 
-    std::filesystem::path get_tmp_file_path() const {
-        return make_tmp_dir() / get_uuid();
+    static void fsync_path(const std::filesystem::path& path) {
+        const auto fd = ::open(path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            ::fsync(fd);
+            ::close(fd);
+        }
     }
 
-    void put(const std::filesystem::path& path, const std::string& data) const {
-        const auto tmp_file_path = get_tmp_file_path();
+    // Recursively fsync a directory: files and subdirectories first (bottom-up), then the directory itself
+    // NOTES: ensures data and directory entries are visible on other nodes in distributed filesystems
+    static void fsync_dir(const std::filesystem::path& dir_path) { // NOLINT(*-no-recursion)
+        for (const auto& entry: std::filesystem::directory_iterator(dir_path)) {
+            if (entry.is_directory())
+                fsync_dir(entry.path());
+            else if (entry.is_regular_file())
+                fsync_path(entry.path());
+        }
+        fsync_path(dir_path);
+    }
 
-        // Write into the temporary file
-        std::ofstream out(tmp_file_path, std::ios::binary);
+    static void put(const std::filesystem::path& path, const std::string& data) {
+        std::ofstream out(path, std::ios::binary);
         DG_HOST_ASSERT(out.write(data.data(), data.size()));
         out.close();
 
-        // Atomically replace
-        std::filesystem::rename(tmp_file_path, path);
+        // NOTES: fsync to ensure the data is visible to other processes (e.g., NVCC)
+        // on distributed filesystems, where `close()` alone does not guarantee persistence
+        fsync_path(path);
     }
 
     std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code) const {
-        const auto kernel_signature = fmt::format("{}$${}$${}$${}$${}", name, library_version, signature, flags, code);
+        const auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags, code);
         const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
 
         // Hit the runtime cache
-        if (const auto& runtime = kernel_runtime_cache->get(dir_path); runtime != nullptr)
+        if (const auto runtime = kernel_runtime_cache->get(dir_path); runtime != nullptr)
             return runtime;
 
-        // Create the kernel directory
-        make_dirs(dir_path);
+        // Compile into a temporary directory, then atomically rename the whole directory
+        // NOTES: renaming a directory is atomic on both local and distributed filesystems,
+        // avoiding the stale inode issue that occurs when renaming individual files
+        const auto tmp_dir_path = make_tmp_dir() / get_uuid();
+        make_dirs(tmp_dir_path);
 
-        // Compile into a temporary CUBIN
-        const auto tmp_cubin_path = get_tmp_file_path();
+        // Compile into the temporary directory
+        const auto tmp_cubin_path = tmp_dir_path / "kernel.cubin";
         if (get_env<int>("DG_JIT_DUMP_ASM") or get_env<int>("DG_JIT_DUMP_PTX")) {
-            // Dump PTX if needed
-            const auto tmp_ptx_path = get_tmp_file_path();
-            compile(code, dir_path, tmp_cubin_path, tmp_ptx_path);
-
-            // Replace into the cache directory
-            std::filesystem::rename(tmp_ptx_path, dir_path / "kernel.ptx");
+            const auto tmp_ptx_path = tmp_dir_path / "kernel.ptx";
+            compile(code, tmp_dir_path, tmp_cubin_path, tmp_ptx_path);
         } else {
-            compile(code, dir_path, tmp_cubin_path);
+            compile(code, tmp_dir_path, tmp_cubin_path);
         }
-
-        // Replace into the cache directory
-        const auto cubin_path = dir_path / "kernel.cubin";
-        std::filesystem::rename(tmp_cubin_path, cubin_path);
 
         // Disassemble if needed
         if (get_env<int>("DG_JIT_DUMP_ASM") or get_env<int>("DG_JIT_DUMP_SASS")) {
-            // Dump into a temporary SASS
-            const auto tmp_sass_path = get_tmp_file_path();
-            disassemble(cubin_path, tmp_sass_path);
+            const auto tmp_sass_path = tmp_dir_path / "kernel.sass";
+            disassemble(tmp_cubin_path, tmp_sass_path);
+        }
 
-            // Replace into the current directory
-            std::filesystem::rename(tmp_sass_path, dir_path / "kernel.sass");
+        // Fsync before rename to ensure visibility on distributed filesystems
+        fsync_dir(tmp_dir_path);
+
+        // Atomically rename the temporary directory to the final cache path
+        // NOTES: if another rank already created dir_path, rename will fail — that's fine
+        make_dirs(dir_path.parent_path());
+        std::error_code error_code;
+        std::filesystem::rename(tmp_dir_path, dir_path, error_code);
+        if (error_code) {
+            // Another rank beat us, then clean up our dir and use the existing one
+            // NOTES: avoid `std::filesystem::remove_all` here — it can segfault on
+            // distributed filesystems, when concurrent processes operate
+            // on the same parent directory, causing stale directory entries
+            safe_remove_all(tmp_dir_path);
         }
 
         // Put into the runtime cache
@@ -201,10 +154,10 @@ public:
         // Disassemble the CUBIN file to SASS
         const auto command = fmt::format("{} --dump-sass {} > {}", cuobjdump_path.c_str(), cubin_path.c_str(), sass_path.c_str());
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
-            fprintf(stderr, "Running cuobjdump command: %s\n", command.c_str());
+            printf("Running cuobjdump command: %s\n", command.c_str());
         const auto [return_code, output] = call_external_command(command);
         if (return_code != 0) {
-            fprintf(stderr, "cuobjdump failed: %s\n", output.c_str());
+            printf("cuobjdump failed: %s\n", output.c_str());
             DG_HOST_ASSERT(false and "cuobjdump failed");
         }
     }
@@ -215,7 +168,6 @@ public:
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_root_path);
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_include_path);
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, cuda_home);
-DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_version);
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, cuobjdump_path);
 
 class NVCCCompiler final: public Compiler {
@@ -225,18 +177,18 @@ class NVCCCompiler final: public Compiler {
         DG_HOST_ASSERT(std::filesystem::exists(nvcc_path));
 
         // Call the version command
-        const auto& command = std::string(nvcc_path) + " --version";
-        const auto& [return_code, output] = call_external_command(command);
+        const auto command = std::string(nvcc_path) + " --version";
+        const auto [return_code, output] = call_external_command(command);
         DG_HOST_ASSERT(return_code == 0);
 
-        // Parse "release X.Y" without std::regex
-        int major = 0, minor = 0;
-        const char* release_pos = std::strstr(output.c_str(), "release ");
-        DG_HOST_ASSERT(release_pos != nullptr and "Could not find 'release' in nvcc --version output");
-        std::sscanf(release_pos + 8, "%d.%d", &major, &minor);
+        // The version should be at least 12.3, for the best performance with 12.9
+        int major, minor;
+        std::smatch match;
+        DG_HOST_ASSERT(std::regex_search(output, match, std::regex(R"(release (\d+\.\d+))")));
+        std::sscanf(match[1].str().c_str(), "%d.%d", &major, &minor);
         DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVCC version should be >= 12.3");
         if (major == 12 and minor < 9)
-            fprintf(stderr, "Warning: please use at least NVCC 12.9 for the best DeepGEMM performance\n");
+            printf("Warning: please use at least NVCC 12.9 for the best DeepGEMM performance\n");
         return {major, minor};
     }
 
@@ -244,66 +196,64 @@ public:
     NVCCCompiler() {
         // Override the compiler signature
         nvcc_path = cuda_home / "bin" / "nvcc";
-        if (const auto& env_nvcc_path = get_env<std::string>("DG_JIT_NVCC_COMPILER"); not env_nvcc_path.empty())
+        if (const auto env_nvcc_path = get_env<std::string>("DG_JIT_NVCC_COMPILER"); not env_nvcc_path.empty())
             nvcc_path = env_nvcc_path;
-        const auto& [nvcc_major, nvcc_minor] = get_nvcc_version();
+        const auto [nvcc_major, nvcc_minor] = get_nvcc_version();
         signature = fmt::format("NVCC{}.{}", nvcc_major, nvcc_minor);
 
         // The override the compiler flags
         // Only NVCC >= 12.9 supports arch-specific family suffix
-        const auto& arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
-        // DG_CUTLASS_INCLUDE is set by Python _find_cutlass_include() before ops.init()
-        const auto& cutlass_include = get_env<std::string>("DG_CUTLASS_INCLUDE");
-        std::string cutlass_flag = cutlass_include.empty() ? "" : fmt::format(" -I{}", cutlass_include);
-        flags = fmt::format("{} -I{}{} --gpu-architecture=sm_{} "
+        const auto arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
+        flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), cutlass_flag, arch);
-
-        // print flags if ENV is set
-        if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_FLAGS", 0))
-            fprintf(stderr, "NVCC compiler flags: %s\n", flags.c_str());
+                            flags, library_include_path.c_str(), arch);
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path,
                  const std::filesystem::path &cubin_path,
                  const std::optional<std::filesystem::path> &ptx_path) const override {
         // Write the code into the cache directory
-        const auto& code_path = dir_path / "kernel.cu";
+        const auto code_path = dir_path / "kernel.cu";
         put(code_path, code);
 
         // Compile
-        const auto& command = fmt::format("{} {} -cubin -o {} {}", nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
+        // Avoid cwd files shadowing C++ standard library headers
+        const auto compile_dir = make_tmp_dir();
+        const auto command = fmt::format("cd {} && {} {} -cubin -o {} {}",
+            compile_dir.c_str(), nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
-            fprintf(stderr, "Running NVCC command: %s\n", command.c_str());
-        const auto& [return_code, output] = call_external_command(command);
+            printf("Running NVCC command: %s\n", command.c_str());
+        const auto [return_code, output] = call_external_command(command);
         if (return_code != 0) {
-            fprintf(stderr, "NVCC compilation failed: %s\n", output.c_str());
+            printf("NVCC compilation failed: %s\n", output.c_str());
             DG_HOST_ASSERT(false and "NVCC compilation failed");
         }
 
         // Compile to PTX if needed
         if (ptx_path.has_value()) {
-            const auto ptx_command = fmt::format("{} {} -ptx -o {} {}", nvcc_path.c_str(), code_path.c_str(), ptx_path->c_str(), flags);
+            const auto ptx_command = fmt::format("cd {} && {} {} -ptx -o {} {}",
+                compile_dir.c_str(), nvcc_path.c_str(), code_path.c_str(), ptx_path->c_str(), flags);
             if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
-                fprintf(stderr, "Running NVCC PTX command: %s\n", ptx_command.c_str());
+                printf("Running NVCC PTX command: %s\n", ptx_command.c_str());
             const auto [ptx_return_code, ptx_output] = call_external_command(ptx_command);
             if (ptx_return_code != 0) {
-                fprintf(stderr, "NVCC PTX compilation failed: %s\n", ptx_output.c_str());
+                printf("NVCC PTX compilation failed: %s\n", ptx_output.c_str());
                 DG_HOST_ASSERT(false and "NVCC PTX compilation failed");
             }
         }
 
-        // Check local memory usage (without std::regex — avoids ABI issues)
+        // Check local memory usage
         if (get_env("DG_JIT_PTXAS_CHECK", 0))
-            DG_HOST_ASSERT(output.find("Local memory used") == std::string::npos);
+            DG_HOST_ASSERT(not std::regex_search(output, std::regex(R"(Local memory used)")));
 
         // Print PTXAS log
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0))
-            fprintf(stderr, "%s", output.c_str());
+            printf("%s", output.c_str());
     }
 };
 
+#ifdef DG_ENABLE_NVRTC_COMPILER
 class NVRTCCompiler final: public Compiler {
 public:
     NVRTCCompiler() {
@@ -317,9 +267,6 @@ public:
         std::string include_dirs;
         include_dirs += fmt::format("-I{} ", library_include_path.string());
         include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());
-        // DG_CUTLASS_INCLUDE is set by Python _find_cutlass_include() before ops.init()
-        if (const auto& cutlass_include = get_env<std::string>("DG_CUTLASS_INCLUDE"); not cutlass_include.empty())
-            include_dirs += fmt::format("-I{} ", cutlass_include);
 
         // Add PCH support for version 12.8 and above
         // NOTES: PCH is vital for compilation speed
@@ -332,7 +279,7 @@ public:
 
         // Override the compiler flags
         // Only NVRTC >= 12.9 supports arch-specific family suffix
-        const auto& arch = device_runtime->get_arch(false, major > 12 or minor >= 9);
+        const auto arch = device_runtime->get_arch(false, major > 12 or minor >= 9);
         flags = fmt::format("{} {}--gpu-architecture=sm_{} -default-device {} --device-int128",
                             flags, include_dirs, arch, pch_flags);
     }
@@ -341,21 +288,15 @@ public:
                  const std::filesystem::path &cubin_path,
                  const std::optional<std::filesystem::path> &ptx_path) const override {
         // Write the code into the cache directory
-        const auto& code_path = dir_path / "kernel.cu";
+        const auto code_path = dir_path / "kernel.cu";
         put(code_path, code);
 
-        // Split flags by whitespace (without std::istringstream — avoids ABI issues)
+        // Parse compilation options
+        std::istringstream iss(flags);
         std::vector<std::string> options;
-        {
-            size_t i = 0;
-            while (i < flags.size()) {
-                while (i < flags.size() && (flags[i] == ' ' || flags[i] == '\t')) ++i;
-                if (i >= flags.size()) break;
-                size_t start = i;
-                while (i < flags.size() && flags[i] != ' ' && flags[i] != '\t') ++i;
-                options.push_back(flags.substr(start, i - start));
-            }
-        }
+        std::string option;
+        while (iss >> option)
+            options.push_back(option);
 
         // Convert to C-style string array for NVRTC
         std::vector<const char*> option_cstrs;
@@ -364,16 +305,16 @@ public:
 
         // Print compiler command if requested
         if (get_env<int>("DG_JIT_DEBUG", 0) or get_env<int>("DG_JIT_PRINT_COMPILER_COMMAND", 0)) {
-            fprintf(stderr, "Compiling JIT runtime with NVRTC options: ");
+            printf("Compiling JIT runtime with NVRTC options: ");
             for (const auto& opt: options)
-                fprintf(stderr, "%s ", opt.c_str());
-            fprintf(stderr, "\n");
+                printf("%s ", opt.c_str());
+            printf("\n");
         }
 
         // Create NVRTC program and compile
         nvrtcProgram program;
         DG_NVRTC_CHECK(nvrtcCreateProgram(&program, code.c_str(), "kernel.cu", 0, nullptr, nullptr));
-        const auto& compile_result = nvrtcCompileProgram(program, static_cast<int>(option_cstrs.size()), option_cstrs.data());
+        const auto compile_result = nvrtcCompileProgram(program, static_cast<int>(option_cstrs.size()), option_cstrs.data());
 
         // Get and print compiler log
         size_t log_size;
@@ -384,7 +325,7 @@ public:
             if (log_size > 1) {
                 std::string compilation_log(log_size, '\0');
                 DG_NVRTC_CHECK(nvrtcGetProgramLog(program, compilation_log.data()));
-                fprintf(stderr, "NVRTC log: %s\n", compilation_log.c_str());
+                printf("NVRTC log: %s\n", compilation_log.c_str());
             }
         }
 
@@ -412,11 +353,16 @@ public:
         DG_NVRTC_CHECK(nvrtcDestroyProgram(&program));
     }
 };
+#endif
 
 static auto compiler = LazyInit<Compiler>([]() -> std::shared_ptr<Compiler> {
+#ifdef DG_ENABLE_NVRTC_COMPILER
     if (get_env<int>("DG_JIT_USE_NVRTC", 0)) {
         return std::make_shared<NVRTCCompiler>();
     }
+#endif
+    if (get_env<int>("DG_JIT_USE_NVRTC", 0))
+        printf("Warning: DG_JIT_USE_NVRTC is ignored in Kernel Hub builds; using NVCC\n");
     return std::make_shared<NVCCCompiler>();
 });
 

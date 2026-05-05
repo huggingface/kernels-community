@@ -6,6 +6,7 @@
 // Uses std::string concatenation instead of std::ostringstream to avoid
 // potential locale/ABI issues with ostringstream across different platforms.
 
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -39,6 +40,13 @@ inline std::string to_str(const T& v) {
         os << v;
         return os.str();
     }
+}
+
+template<typename T>
+inline std::string to_hex_float_str(const T& v) {
+    std::ostringstream os;
+    os << std::hexfloat << v;
+    return os.str();
 }
 
 // Overload for C string literals (arrays)
@@ -79,6 +87,11 @@ std::string format_impl(std::string_view fmt,
             } else if (i + 1 < fmt.size() && fmt[i + 1] == '}') {
                 result += to_str(first);
                 result += format_impl(fmt.substr(i + 2), rest...);
+                return result;
+            } else if (i + 3 < fmt.size() && fmt[i + 1] == ':' &&
+                       fmt[i + 2] == 'a' && fmt[i + 3] == '}') {
+                result += to_hex_float_str(first);
+                result += format_impl(fmt.substr(i + 4), rest...);
                 return result;
             } else {
                 result += fmt[i++];

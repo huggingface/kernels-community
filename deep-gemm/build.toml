@@ -2,10 +2,10 @@
 name = "deep-gemm"
 license = "MIT"
 backends = ["cuda"]
-version = 1
+version = 2
 
 [general.cuda]
-minver = "12.3"
+minver = "12.8"
 
 [torch]
 src = [
@@ -16,7 +16,7 @@ pyext = ["py", "cuh", "hpp", "h"]
 
 [kernel.deep_gemm]
 backend = "cuda"
-cuda-minver = "12.3"
+cuda-minver = "12.8"
 cuda-capabilities = ["9.0a"]
 depends = ["torch", "cutlass_4_0"]
 include = [
@@ -24,7 +24,7 @@ include = [
   "deep_gemm/include",
 ]
 cuda-flags = [
-  "-std=c++17",
+  "-std=c++20",
   "-O3",
   "-DNDEBUG",
   "--expt-relaxed-constexpr",
@@ -32,30 +32,33 @@ cuda-flags = [
   "-Wno-deprecated-declarations",
 ]
 src = [
-  # Compiled source
   "csrc/impl.cu",
-  # API headers
   "csrc/apis/attention.hpp",
   "csrc/apis/einsum.hpp",
   "csrc/apis/gemm.hpp",
   "csrc/apis/hyperconnection.hpp",
   "csrc/apis/layout.hpp",
+  "csrc/apis/mega.hpp",
   "csrc/apis/runtime.hpp",
-  # JIT infrastructure headers
   "csrc/jit/cache.hpp",
   "csrc/jit/compiler.hpp",
   "csrc/jit/device_runtime.hpp",
   "csrc/jit/handle.hpp",
+  "csrc/jit/include_parser.hpp",
   "csrc/jit/kernel_runtime.hpp",
-  # JIT kernel heuristics
   "csrc/jit_kernels/heuristics/common.hpp",
+  "csrc/jit_kernels/heuristics/config.hpp",
+  "csrc/jit_kernels/heuristics/mega_moe.hpp",
+  "csrc/jit_kernels/heuristics/runtime.hpp",
   "csrc/jit_kernels/heuristics/sm100.hpp",
   "csrc/jit_kernels/heuristics/sm90.hpp",
-  # JIT kernel implementations
+  "csrc/jit_kernels/heuristics/utils.hpp",
   "csrc/jit_kernels/impls/epilogue.hpp",
   "csrc/jit_kernels/impls/runtime_utils.hpp",
   "csrc/jit_kernels/impls/sm100_bf16_gemm.hpp",
   "csrc/jit_kernels/impls/sm100_bmk_bnk_mn.hpp",
+  "csrc/jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp",
+  "csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp",
   "csrc/jit_kernels/impls/sm100_fp8_gemm_1d1d.hpp",
   "csrc/jit_kernels/impls/sm100_tf32_hc_prenorm_gemm.hpp",
   "csrc/jit_kernels/impls/sm90_bf16_gemm.hpp",
@@ -65,10 +68,11 @@ src = [
   "csrc/jit_kernels/impls/sm90_tf32_hc_prenorm_gemm.hpp",
   "csrc/jit_kernels/impls/smxx_clean_logits.hpp",
   "csrc/jit_kernels/impls/smxx_cublaslt.hpp",
+  "csrc/jit_kernels/impls/smxx_fp8_fp4_mqa_logits.hpp",
+  "csrc/jit_kernels/impls/smxx_fp8_fp4_paged_mqa_logits.hpp",
   "csrc/jit_kernels/impls/smxx_fp8_mqa_logits.hpp",
   "csrc/jit_kernels/impls/smxx_fp8_paged_mqa_logits.hpp",
   "csrc/jit_kernels/impls/smxx_layout.hpp",
-  # Utility headers
   "csrc/utils/compatibility.hpp",
   "csrc/utils/exception.hpp",
   "csrc/utils/format.hpp",
@@ -77,31 +81,56 @@ src = [
   "csrc/utils/lazy_init.hpp",
   "csrc/utils/math.hpp",
   "csrc/utils/system.hpp",
-  # Runtime JIT headers (deep_gemm/include)
+  "csrc/utils/torch_compat.hpp",
+  "deep_gemm/include/deep_gemm/comm/barrier.cuh",
+  "deep_gemm/include/deep_gemm/common/compile.cuh",
   "deep_gemm/include/deep_gemm/common/cute_tie.cuh",
   "deep_gemm/include/deep_gemm/common/epilogue_utils.cuh",
-  "deep_gemm/include/deep_gemm/common/types.hpp",
-  "deep_gemm/include/deep_gemm/common/sm90_utils.cuh",
+  "deep_gemm/include/deep_gemm/common/exception.cuh",
+  "deep_gemm/include/deep_gemm/common/math.cuh",
   "deep_gemm/include/deep_gemm/common/reduction.cuh",
-  "deep_gemm/include/deep_gemm/common/utils.cuh",
-  "deep_gemm/include/deep_gemm/common/tma_utils.cuh",
-  "deep_gemm/include/deep_gemm/common/sm100_utils.cuh",
   "deep_gemm/include/deep_gemm/common/scheduler.cuh",
-  "deep_gemm/include/deep_gemm/impls/smxx_layout.cuh",
-  "deep_gemm/include/deep_gemm/impls/sm100_fp8_mqa_logits.cuh",
-  "deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh",
-  "deep_gemm/include/deep_gemm/impls/smxx_clean_logits.cuh",
+  "deep_gemm/include/deep_gemm/common/sm100_utils.cuh",
+  "deep_gemm/include/deep_gemm/common/sm90_utils.cuh",
+  "deep_gemm/include/deep_gemm/common/tma_copy.cuh",
+  "deep_gemm/include/deep_gemm/common/tma_utils.cuh",
+  "deep_gemm/include/deep_gemm/common/types.cuh",
+  "deep_gemm/include/deep_gemm/common/types.hpp",
+  "deep_gemm/include/deep_gemm/common/utils.cuh",
+  "deep_gemm/include/deep_gemm/epilogue/sm100_store_cd.cuh",
+  "deep_gemm/include/deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh",
+  "deep_gemm/include/deep_gemm/epilogue/transform.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm100_bmk_bnk_mn.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm100_fp4_mqa_logits.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm100_fp4_paged_mqa_logits.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh",
   "deep_gemm/include/deep_gemm/impls/sm100_fp8_gemm_1d1d.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm100_fp8_mqa_logits.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm100_fp8_paged_mqa_logits.cuh",
   "deep_gemm/include/deep_gemm/impls/sm100_tf32_hc_prenorm_gemm.cuh",
   "deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh",
-  "deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh",
-  "deep_gemm/include/deep_gemm/impls/sm100_fp8_paged_mqa_logits.cuh",
-  "deep_gemm/include/deep_gemm/impls/sm90_fp8_paged_mqa_logits.cuh",
-  "deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh",
-  "deep_gemm/include/deep_gemm/impls/sm90_fp8_mqa_logits.cuh",
   "deep_gemm/include/deep_gemm/impls/sm90_bmk_bnk_mn.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm90_fp8_mqa_logits.cuh",
+  "deep_gemm/include/deep_gemm/impls/sm90_fp8_paged_mqa_logits.cuh",
   "deep_gemm/include/deep_gemm/impls/sm90_tf32_hc_prenorm_gemm.cuh",
-  "deep_gemm/include/deep_gemm/impls/sm100_bmk_bnk_mn.cuh",
+  "deep_gemm/include/deep_gemm/impls/smxx_clean_logits.cuh",
+  "deep_gemm/include/deep_gemm/impls/smxx_layout.cuh",
+  "deep_gemm/include/deep_gemm/layout/mega_moe.cuh",
+  "deep_gemm/include/deep_gemm/layout/sym_buffer.cuh",
+  "deep_gemm/include/deep_gemm/mma/sm100.cuh",
+  "deep_gemm/include/deep_gemm/mma/sm90.cuh",
+  "deep_gemm/include/deep_gemm/ptx/ld_st.cuh",
+  "deep_gemm/include/deep_gemm/ptx/tcgen05.cuh",
+  "deep_gemm/include/deep_gemm/ptx/tma.cuh",
+  "deep_gemm/include/deep_gemm/ptx/utils.cuh",
+  "deep_gemm/include/deep_gemm/ptx/wgmma.cuh",
+  "deep_gemm/include/deep_gemm/scheduler/gemm.cuh",
+  "deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh",
+  "deep_gemm/include/deep_gemm/scheduler/paged_mqa_logits.cuh",
 ]
 
 [general.hub]
