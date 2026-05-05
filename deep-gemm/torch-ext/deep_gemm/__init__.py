@@ -31,7 +31,15 @@ for _op in [
     "m_grouped_bf16_gemm_nt_contiguous",
     "m_grouped_bf16_gemm_nn_contiguous",
     "m_grouped_bf16_gemm_nt_masked",
+    "k_grouped_bf16_gemm_tn_contiguous",
     "fp8_gemm_nt_skip_head_mid",
+    "tf32_hc_prenorm_gemm",
+    "einsum",
+    "fp8_einsum",
+    "cublaslt_gemm_nt",
+    "cublaslt_gemm_nn",
+    "cublaslt_gemm_tn",
+    "cublaslt_gemm_tt",
 ]:
 
     @torch.library.register_fake(add_op_namespace_prefix(_op))

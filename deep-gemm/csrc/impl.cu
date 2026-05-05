@@ -9,6 +9,9 @@
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
 #include "apis/runtime.hpp"
+#if DG_TENSORMAP_COMPATIBLE
+#include "jit/include_parser.hpp"
+#endif
 
 using Tensor = at::Tensor;
 
@@ -35,23 +38,27 @@ static std::optional<std::tuple<int, int>> make_recipe2(
 // Runtime ops
 
 void deep_gemm_init(const std::string& path, const std::string& cuda_home) {
-    deep_gemm::runtime::deep_gemm_init(path, cuda_home);
+#if DG_TENSORMAP_COMPATIBLE
+    deep_gemm::Compiler::prepare_init(path, cuda_home);
+    deep_gemm::KernelRuntime::prepare_init(cuda_home);
+    deep_gemm::IncludeParser::prepare_init(path);
+#endif
 }
 
 void deep_gemm_set_num_sms(int64_t num_sms) {
-    deep_gemm::runtime::deep_gemm_set_num_sms(num_sms);
+    deep_gemm::device_runtime->set_num_sms(static_cast<int>(num_sms));
 }
 
 int64_t deep_gemm_get_num_sms() {
-    return deep_gemm::runtime::deep_gemm_get_num_sms();
+    return deep_gemm::device_runtime->get_num_sms();
 }
 
 void deep_gemm_set_tc_util(int64_t tc_util) {
-    deep_gemm::runtime::deep_gemm_set_tc_util(tc_util);
+    deep_gemm::device_runtime->set_tc_util(static_cast<int>(tc_util));
 }
 
 int64_t deep_gemm_get_tc_util() {
-    return deep_gemm::runtime::deep_gemm_get_tc_util();
+    return deep_gemm::device_runtime->get_tc_util();
 }
 
 // Layout ops
