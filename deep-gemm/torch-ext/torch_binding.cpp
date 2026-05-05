@@ -21,9 +21,29 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def("get_tc_util() -> int");
     ops.impl("get_tc_util", &deep_gemm_get_tc_util);
 
+    ops.def("set_pdl(bool enable) -> ()");
+    ops.impl("set_pdl", &deep_gemm_set_pdl);
+
+    ops.def("get_pdl() -> bool");
+    ops.impl("get_pdl", &deep_gemm_get_pdl);
+
+    ops.def("set_ignore_compile_dims(bool value) -> ()");
+    ops.impl("set_ignore_compile_dims", &deep_gemm_set_ignore_compile_dims);
+
+    ops.def("set_block_size_multiple_of(int x, int y) -> ()");
+    ops.impl("set_block_size_multiple_of", &deep_gemm_set_block_size_multiple_of);
+
     ops.def("get_mk_alignment_for_contiguous_layout() -> int");
     ops.impl("get_mk_alignment_for_contiguous_layout",
              &deep_gemm_get_mk_alignment_for_contiguous_layout);
+
+    ops.def("set_mk_alignment_for_contiguous_layout(int value) -> ()");
+    ops.impl("set_mk_alignment_for_contiguous_layout",
+             &deep_gemm_set_mk_alignment_for_contiguous_layout);
+
+    ops.def("get_theoretical_mk_alignment_for_contiguous_layout(int expected_m_or_neg1) -> int");
+    ops.impl("get_theoretical_mk_alignment_for_contiguous_layout",
+             &deep_gemm_get_theoretical_mk_alignment_for_contiguous_layout);
 
     // Layout ops (CUDA dispatch)
     ops.def(
@@ -45,7 +65,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
     ops.def(
         "get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor("
-        "Tensor sf, Tensor ks_tensor, Tensor ks_int_tensor) -> Tensor"
+        "Tensor sf, Tensor ks_tensor, Tensor ks_int_tensor, int gran_k) -> Tensor"
     );
     ops.impl("get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor", torch::kCUDA,
              &deep_gemm_get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor);
@@ -270,7 +290,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
     ops.def(
         "get_paged_mqa_logits_metadata("
-        "Tensor context_lens, int block_kv, int num_sms) -> Tensor"
+        "Tensor context_lens, int block_kv, int num_sms, "
+        "Tensor? indices) -> Tensor"
     );
     ops.impl("get_paged_mqa_logits_metadata", torch::kCUDA,
              &deep_gemm_get_paged_mqa_logits_metadata);
@@ -280,10 +301,37 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
         "Tensor q, Tensor fused_kv_cache, "
         "Tensor weights, Tensor context_lens, "
         "Tensor block_table, Tensor schedule_meta, "
-        "int max_context_len, bool clean_logits) -> Tensor"
+        "int max_context_len, bool clean_logits, "
+        "Tensor? indices) -> Tensor"
     );
     ops.impl("fp8_paged_mqa_logits", torch::kCUDA,
              &deep_gemm_fp8_paged_mqa_logits);
+
+    ops.def(
+        "fp8_fp4_mqa_logits("
+        "Tensor q_fp, Tensor? q_sf, "
+        "Tensor kv_fp, Tensor kv_sf, "
+        "Tensor weights, Tensor cu_seq_len_k_start, Tensor cu_seq_len_k_end, "
+        "bool clean_logits, int max_seqlen_k, int logits_dtype_int) -> Tensor"
+    );
+    ops.impl("fp8_fp4_mqa_logits", torch::kCUDA,
+             &deep_gemm_fp8_fp4_mqa_logits);
+
+    ops.def(
+        "fp8_fp4_paged_mqa_logits("
+        "Tensor q_fp, Tensor? q_sf, "
+        "Tensor fused_kv_cache, Tensor weights, "
+        "Tensor context_lens, Tensor block_table, Tensor schedule_meta, "
+        "int max_context_len, bool clean_logits, int logits_dtype_int, "
+        "Tensor? indices) -> Tensor"
+    );
+    ops.impl("fp8_fp4_paged_mqa_logits", torch::kCUDA,
+             &deep_gemm_fp8_fp4_paged_mqa_logits);
+
+    // Mega MoE ops (host-side query)
+    ops.def("get_token_alignment_for_mega_moe() -> int");
+    ops.impl("get_token_alignment_for_mega_moe",
+             &deep_gemm_get_token_alignment_for_mega_moe);
 
     // Einsum ops (CUDA dispatch)
     ops.def(

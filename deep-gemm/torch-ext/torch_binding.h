@@ -18,11 +18,20 @@ int64_t deep_gemm_get_num_sms();
 void deep_gemm_set_tc_util(int64_t tc_util);
 int64_t deep_gemm_get_tc_util();
 
+void deep_gemm_set_pdl(bool enable);
+bool deep_gemm_get_pdl();
+
+void deep_gemm_set_ignore_compile_dims(bool value);
+
+void deep_gemm_set_block_size_multiple_of(int64_t x, int64_t y);
+
 // ============================================================================
 // Layout ops
 // ============================================================================
 
 int64_t deep_gemm_get_mk_alignment_for_contiguous_layout();
+void deep_gemm_set_mk_alignment_for_contiguous_layout(int64_t value);
+int64_t deep_gemm_get_theoretical_mk_alignment_for_contiguous_layout(int64_t expected_m_or_neg1);
 
 Tensor deep_gemm_get_tma_aligned_size(int64_t mn, int64_t element_size);
 
@@ -31,7 +40,8 @@ Tensor deep_gemm_get_mn_major_tma_aligned_tensor(const Tensor& sf);
 Tensor deep_gemm_get_mn_major_tma_aligned_packed_ue8m0_tensor(const Tensor& sf);
 
 Tensor deep_gemm_get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
-    const Tensor& sf, const Tensor& ks_tensor, const Tensor& ks_int_tensor);
+    const Tensor& sf, const Tensor& ks_tensor, const Tensor& ks_int_tensor,
+    int64_t gran_k);
 
 Tensor deep_gemm_transform_sf_into_required_layout(
     const Tensor& sf, int64_t mn, int64_t k,
@@ -223,13 +233,37 @@ Tensor deep_gemm_fp8_mqa_logits(
     bool clean_logits, int64_t max_seqlen_k);
 
 Tensor deep_gemm_get_paged_mqa_logits_metadata(
-    const Tensor& context_lens, int64_t block_kv, int64_t num_sms);
+    const Tensor& context_lens, int64_t block_kv, int64_t num_sms,
+    const std::optional<Tensor>& indices);
 
 Tensor deep_gemm_fp8_paged_mqa_logits(
     const Tensor& q, const Tensor& fused_kv_cache,
     const Tensor& weights, const Tensor& context_lens,
     const Tensor& block_table, const Tensor& schedule_meta,
-    int64_t max_context_len, bool clean_logits);
+    int64_t max_context_len, bool clean_logits,
+    const std::optional<Tensor>& indices);
+
+Tensor deep_gemm_fp8_fp4_mqa_logits(
+    const Tensor& q_fp, const std::optional<Tensor>& q_sf,
+    const Tensor& kv_fp, const Tensor& kv_sf,
+    const Tensor& weights,
+    const Tensor& cu_seq_len_k_start, const Tensor& cu_seq_len_k_end,
+    bool clean_logits, int64_t max_seqlen_k, int64_t logits_dtype_int);
+
+Tensor deep_gemm_fp8_fp4_paged_mqa_logits(
+    const Tensor& q_fp, const std::optional<Tensor>& q_sf,
+    const Tensor& fused_kv_cache, const Tensor& weights,
+    const Tensor& context_lens, const Tensor& block_table,
+    const Tensor& schedule_meta,
+    int64_t max_context_len, bool clean_logits,
+    int64_t logits_dtype_int,
+    const std::optional<Tensor>& indices);
+
+// ============================================================================
+// Mega MoE ops
+// ============================================================================
+
+int64_t deep_gemm_get_token_alignment_for_mega_moe();
 
 // ============================================================================
 // Einsum ops

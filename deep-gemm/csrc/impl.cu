@@ -8,6 +8,7 @@
 #include "apis/hyperconnection.hpp"
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
+#include "apis/mega.hpp"
 #include "apis/runtime.hpp"
 #if DG_TENSORMAP_COMPATIBLE
 #include "jit/include_parser.hpp"
@@ -61,10 +62,40 @@ int64_t deep_gemm_get_tc_util() {
     return deep_gemm::device_runtime->get_tc_util();
 }
 
+void deep_gemm_set_pdl(bool enable) {
+    deep_gemm::device_runtime->set_pdl(enable);
+}
+
+bool deep_gemm_get_pdl() {
+    return deep_gemm::device_runtime->get_pdl();
+}
+
+void deep_gemm_set_ignore_compile_dims(bool value) {
+    deep_gemm::heuristics_runtime->set_ignore_compile_dims(value);
+}
+
+void deep_gemm_set_block_size_multiple_of(int64_t x, int64_t y) {
+    // y < 0 sentinel means "use x for both"
+    const int xi = static_cast<int>(x);
+    const int yi = (y < 0) ? xi : static_cast<int>(y);
+    deep_gemm::heuristics_runtime->set_block_size_multiple_of(xi, yi);
+}
+
 // Layout ops
 
 int64_t deep_gemm_get_mk_alignment_for_contiguous_layout() {
     return deep_gemm::heuristics_runtime->get_mk_alignment_for_contiguous_layout();
+}
+
+void deep_gemm_set_mk_alignment_for_contiguous_layout(int64_t value) {
+    deep_gemm::heuristics_runtime->set_mk_alignment_for_contiguous_layout(static_cast<int>(value));
+}
+
+int64_t deep_gemm_get_theoretical_mk_alignment_for_contiguous_layout(int64_t expected_m_or_neg1) {
+    auto opt = (expected_m_or_neg1 < 0)
+        ? std::nullopt
+        : std::make_optional(static_cast<int>(expected_m_or_neg1));
+    return deep_gemm::heuristics_runtime->get_theoretical_mk_alignment_for_contiguous_layout(opt);
 }
 
 Tensor deep_gemm_get_tma_aligned_size(int64_t mn, int64_t element_size) {
@@ -82,9 +113,11 @@ Tensor deep_gemm_get_mn_major_tma_aligned_packed_ue8m0_tensor(const Tensor& sf) 
 }
 
 Tensor deep_gemm_get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
-    const Tensor& sf, const Tensor& ks_tensor, const Tensor& ks_int_tensor) {
+    const Tensor& sf, const Tensor& ks_tensor, const Tensor& ks_int_tensor,
+    int64_t gran_k) {
     auto ks = tensor_to_vec_int(ks_int_tensor);
-    return deep_gemm::get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, ks_tensor, ks, 128);
+    return deep_gemm::get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
+        sf, ks_tensor, ks, static_cast<int>(gran_k));
 }
 
 Tensor deep_gemm_transform_sf_into_required_layout(
@@ -404,20 +437,56 @@ Tensor deep_gemm_fp8_mqa_logits(
 }
 
 Tensor deep_gemm_get_paged_mqa_logits_metadata(
-    const Tensor& context_lens, int64_t block_kv, int64_t num_sms) {
+    const Tensor& context_lens, int64_t block_kv, int64_t num_sms,
+    const std::optional<Tensor>& indices) {
     return deep_gemm::attention::get_paged_mqa_logits_metadata(
-        context_lens, static_cast<int>(block_kv), static_cast<int>(num_sms),
-        std::nullopt);
+        context_lens, static_cast<int>(block_kv), static_cast<int>(num_sms), indices);
 }
 
 Tensor deep_gemm_fp8_paged_mqa_logits(
     const Tensor& q, const Tensor& fused_kv_cache,
     const Tensor& weights, const Tensor& context_lens,
     const Tensor& block_table, const Tensor& schedule_meta,
-    int64_t max_context_len, bool clean_logits) {
+    int64_t max_context_len, bool clean_logits,
+    const std::optional<Tensor>& indices) {
     return deep_gemm::attention::fp8_paged_mqa_logits(
         q, fused_kv_cache, weights, context_lens, block_table, schedule_meta,
-        static_cast<int>(max_context_len), clean_logits, std::nullopt);
+        static_cast<int>(max_context_len), clean_logits, indices);
+}
+
+Tensor deep_gemm_fp8_fp4_mqa_logits(
+    const Tensor& q_fp, const std::optional<Tensor>& q_sf,
+    const Tensor& kv_fp, const Tensor& kv_sf,
+    const Tensor& weights,
+    const Tensor& cu_seq_len_k_start, const Tensor& cu_seq_len_k_end,
+    bool clean_logits, int64_t max_seqlen_k, int64_t logits_dtype_int) {
+    auto q = std::make_tuple(q_fp, q_sf);
+    auto kv = std::make_tuple(kv_fp, kv_sf);
+    auto dtype = static_cast<at::ScalarType>(logits_dtype_int);
+    return deep_gemm::attention::fp8_fp4_mqa_logits(
+        q, kv, weights, cu_seq_len_k_start, cu_seq_len_k_end,
+        clean_logits, static_cast<int>(max_seqlen_k), dtype);
+}
+
+Tensor deep_gemm_fp8_fp4_paged_mqa_logits(
+    const Tensor& q_fp, const std::optional<Tensor>& q_sf,
+    const Tensor& fused_kv_cache, const Tensor& weights,
+    const Tensor& context_lens, const Tensor& block_table,
+    const Tensor& schedule_meta,
+    int64_t max_context_len, bool clean_logits,
+    int64_t logits_dtype_int,
+    const std::optional<Tensor>& indices) {
+    auto q = std::make_tuple(q_fp, q_sf);
+    auto dtype = static_cast<at::ScalarType>(logits_dtype_int);
+    return deep_gemm::attention::fp8_fp4_paged_mqa_logits(
+        q, fused_kv_cache, weights, context_lens, block_table, schedule_meta,
+        static_cast<int>(max_context_len), clean_logits, dtype, indices);
+}
+
+// Mega MoE ops
+
+int64_t deep_gemm_get_token_alignment_for_mega_moe() {
+    return deep_gemm::mega::get_token_alignment_for_mega_moe();
 }
 
 // Einsum ops

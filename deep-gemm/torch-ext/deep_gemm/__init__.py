@@ -6,6 +6,12 @@ import torch
 from ._ops import ops, add_op_namespace_prefix
 from . import utils
 
+# Optional legacy Triton kernels (require triton)
+try:
+    from . import legacy
+except Exception:
+    legacy = None
+
 __version__ = "2.3.0"
 
 
@@ -47,6 +53,72 @@ for _op in [
         pass
 
 
+# ── Fakes for tensor-returning attention ops ────────────────────────────────
+# Output: [seq_len_q, seq_len_kv] for non-paged, [batch*next_n, max_ctx_len] for paged.
+
+
+@torch.library.register_fake(add_op_namespace_prefix("fp8_mqa_logits"))
+def _fake_fp8_mqa_logits(q, kv_data, kv_sf, weights, cu_start, cu_end, clean_logits, max_seqlen_k):
+    seq_len_q = q.shape[0]
+    seq_len_kv = kv_data.shape[0]
+    return torch.empty((seq_len_q, seq_len_kv), dtype=torch.float32, device=q.device)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("fp8_fp4_mqa_logits"))
+def _fake_fp8_fp4_mqa_logits(q_fp, q_sf, kv_fp, kv_sf, weights, cu_start, cu_end,
+                             clean_logits, max_seqlen_k, logits_dtype_int):
+    seq_len_q = q_fp.shape[0]
+    seq_len_kv = kv_fp.shape[0]
+    dtype = torch.float32 if logits_dtype_int == 6 else torch.bfloat16
+    return torch.empty((seq_len_q, seq_len_kv), dtype=dtype, device=q_fp.device)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("get_paged_mqa_logits_metadata"))
+def _fake_get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices):
+    return torch.empty((num_sms + 1, 2), dtype=context_lens.dtype, device=context_lens.device)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("fp8_paged_mqa_logits"))
+def _fake_fp8_paged_mqa_logits(q, kv_cache, weights, ctx_lens, blk_tbl, sched, max_ctx_len, clean, indices):
+    bsz, next_n = q.shape[0], q.shape[1]
+    return torch.empty((bsz * next_n, int(max_ctx_len)), dtype=torch.float32, device=q.device)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("fp8_fp4_paged_mqa_logits"))
+def _fake_fp8_fp4_paged_mqa_logits(q_fp, q_sf, kv_cache, weights, ctx_lens, blk_tbl, sched,
+                                   max_ctx_len, clean, logits_dtype_int, indices):
+    bsz, next_n = q_fp.shape[0], q_fp.shape[1]
+    dtype = torch.float32 if logits_dtype_int == 6 else torch.bfloat16
+    return torch.empty((bsz * next_n, int(max_ctx_len)), dtype=dtype, device=q_fp.device)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("transform_sf_into_required_layout"))
+def _fake_transform_sf_into_required_layout(sf, mn, k, *args, **kwargs):
+    # Output is a transformed scale-factor tensor; concrete shape depends on layout heuristics.
+    # Conservatively return same shape/dtype/device as input — sufficient for tracing.
+    return torch.empty_like(sf)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("get_tma_aligned_size"))
+def _fake_get_tma_aligned_size(mn, element_size):
+    return torch.empty((), dtype=torch.int64, device="cpu")
+
+
+@torch.library.register_fake(add_op_namespace_prefix("get_mn_major_tma_aligned_tensor"))
+def _fake_get_mn_major_tma_aligned_tensor(sf):
+    return torch.empty_like(sf)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("get_mn_major_tma_aligned_packed_ue8m0_tensor"))
+def _fake_get_mn_major_tma_aligned_packed_ue8m0_tensor(sf):
+    return torch.empty_like(sf)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor"))
+def _fake_get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, ks_tensor, ks_int_tensor, gran_k):
+    return torch.empty_like(sf)
+
+
 # Runtime
 
 
@@ -66,8 +138,42 @@ def get_tc_util() -> int:
     return ops.get_tc_util()
 
 
+def set_pdl(enable: bool) -> None:
+    ops.set_pdl(enable)
+
+
+def get_pdl() -> bool:
+    return ops.get_pdl()
+
+
+def set_ignore_compile_dims(value: bool) -> None:
+    ops.set_ignore_compile_dims(value)
+
+
+def set_block_size_multiple_of(value) -> None:
+    if isinstance(value, tuple):
+        x, y = value
+    else:
+        x, y = int(value), -1
+    ops.set_block_size_multiple_of(int(x), int(y))
+
+
 def get_mk_alignment_for_contiguous_layout() -> int:
     return ops.get_mk_alignment_for_contiguous_layout()
+
+
+def set_mk_alignment_for_contiguous_layout(value: int) -> None:
+    ops.set_mk_alignment_for_contiguous_layout(int(value))
+
+
+def get_theoretical_mk_alignment_for_contiguous_layout(expected_m=None) -> int:
+    return ops.get_theoretical_mk_alignment_for_contiguous_layout(
+        -1 if expected_m is None else int(expected_m)
+    )
+
+
+def get_token_alignment_for_mega_moe() -> int:
+    return ops.get_token_alignment_for_mega_moe()
 
 
 # Layout utilities
@@ -85,10 +191,10 @@ def get_mn_major_tma_aligned_packed_ue8m0_tensor(sf):
     return ops.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
 
 
-def get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, ks_tensor, ks):
+def get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, ks_tensor, ks, gran_k: int = 128):
     ks_int = torch.tensor(ks, dtype=torch.int32, device="cpu")
     return ops.get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
-        sf, ks_tensor, ks_int
+        sf, ks_tensor, ks_int, gran_k
     )
 
 
@@ -579,6 +685,19 @@ def fp8_gemm_nt_skip_head_mid(
     )
 
 
+_DTYPE_TO_INT = {
+    torch.float32: 6,    # at::ScalarType::Float
+    torch.float: 6,
+    torch.bfloat16: 15,  # at::ScalarType::BFloat16
+}
+
+
+def _scalar_type_int(dtype):
+    if dtype is None:
+        return _DTYPE_TO_INT[torch.float32]
+    return _DTYPE_TO_INT[dtype] if dtype in _DTYPE_TO_INT else int(dtype)
+
+
 def fp8_mqa_logits(
     q,
     kv,
@@ -601,8 +720,31 @@ def fp8_mqa_logits(
     )
 
 
-def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms):
-    return ops.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms)
+def fp8_fp4_mqa_logits(
+    q,
+    kv,
+    weights,
+    cu_seq_len_k_start,
+    cu_seq_len_k_end,
+    clean_logits=True,
+    max_seqlen_k=0,
+    logits_dtype=torch.float32,
+):
+    # q: (q_fp, optional q_sf); kv: (kv_fp, kv_sf)
+    if isinstance(q, tuple):
+        q_fp, q_sf = q
+    else:
+        q_fp, q_sf = q, None
+    kv_fp, kv_sf = kv
+    return ops.fp8_fp4_mqa_logits(
+        q_fp, q_sf, kv_fp, kv_sf, weights,
+        cu_seq_len_k_start, cu_seq_len_k_end,
+        clean_logits, max_seqlen_k, _scalar_type_int(logits_dtype),
+    )
+
+
+def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices=None):
+    return ops.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices)
 
 
 def fp8_paged_mqa_logits(
@@ -614,6 +756,7 @@ def fp8_paged_mqa_logits(
     schedule_meta,
     max_context_len,
     clean_logits=False,
+    indices=None,
 ):
     return ops.fp8_paged_mqa_logits(
         q,
@@ -624,6 +767,29 @@ def fp8_paged_mqa_logits(
         schedule_meta,
         max_context_len,
         clean_logits,
+        indices,
+    )
+
+
+def fp8_fp4_paged_mqa_logits(
+    q,
+    kv_cache,
+    weights,
+    context_lens,
+    block_table,
+    schedule_meta,
+    max_context_len,
+    clean_logits=False,
+    logits_dtype=torch.float32,
+    indices=None,
+):
+    if isinstance(q, tuple):
+        q_fp, q_sf = q
+    else:
+        q_fp, q_sf = q, None
+    return ops.fp8_fp4_paged_mqa_logits(
+        q_fp, q_sf, kv_cache, weights, context_lens, block_table, schedule_meta,
+        max_context_len, clean_logits, _scalar_type_int(logits_dtype), indices,
     )
 
 
