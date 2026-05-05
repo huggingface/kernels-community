@@ -2,7 +2,7 @@
 name = "deep-gemm"
 license = "MIT"
 backends = ["cuda"]
-version = 1
+version = 2
 
 [general.cuda]
 minver = "12.3"
