@@ -1,7 +1,9 @@
 #pragma once
 
 #include <functional>
+#ifdef DG_USE_PYBIND11
 #include <pybind11/functional.h>
+#endif
 
 #if DG_TENSORMAP_COMPATIBLE
 #include "../jit/compiler.hpp"
@@ -224,6 +226,7 @@ static void fp8_fp4_mega_moe(
         sym_buffer.zero_();
 }
 
+#ifdef DG_USE_PYBIND11
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
@@ -231,5 +234,6 @@ static void register_apis(pybind11::module_& m) {
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
 #endif
 }
+#endif
 
 } // namespace deep_gemm::mega
