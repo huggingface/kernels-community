@@ -3,7 +3,6 @@
 #include <vector>
 
 #include "../torch-ext/torch_binding.h"
-#include "utils/exception.hpp"
 #include "apis/attention.hpp"
 #include "apis/einsum.hpp"
 #include "apis/hyperconnection.hpp"
@@ -102,7 +101,8 @@ Tensor deep_gemm_transform_sf_into_required_layout(
                                    static_cast<int>(recipe_2));
         is_sfa_opt = is_sfa;
     } else {
-        DG_HOST_ASSERT(has_recipe_ab);
+        TORCH_CHECK(has_recipe_ab,
+                    "transform_sf_into_required_layout: exactly one of recipe or recipe_ab must be provided");
         recipe_v = std::make_tuple(static_cast<int>(recipe_ab_0),
                                    static_cast<int>(recipe_ab_1));
         is_sfa_opt = std::nullopt;
