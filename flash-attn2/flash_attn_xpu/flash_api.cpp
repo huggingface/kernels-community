@@ -632,10 +632,22 @@ mha_fwd_kvcache(
         TORCH_CHECK(leftpad_k.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
     }
 
-    // Write new K/V to cache in-place
-    // Non-paged without padding: fused in kernel (knew/vnew passed to dispatch)
-    // Paged or needs-padding: API-layer scatter (kernel fusion not applicable)
-    bool fuse_knew = k_.has_value() && seqlen_new > 0 && !paged_KV && !needs_padding;
+    // Write new K/V to cache.
+    //
+    // Strategy:
+    //   - Always prefer kernel-fused scatter (passes knew/vnew to the kernel,
+    //     which writes them in-place during the prologue).  This avoids any
+    //     host sync and works for both contiguous and paged caches.
+    //   - Fall back to API-layer scatter only when fusion is impossible:
+    //       * needs_padding: the cache pad is a separate buffer, so the
+    //         in-kernel writer would write to the padded copy, not the user
+    //         tensor; do the scatter on the user tensor and re-pad.
+    //       * rotary_cos: the rotary application happened on the padded
+    //         buffer; we need to slice off the padding before scattering to
+    //         the user cache. (Kernel-fused scatter copies the padded buffer
+    //         instead, which is wrong.)
+    bool fuse_knew = k_.has_value() && seqlen_new > 0
+                     && !needs_padding && !rotary_cos_.has_value();
     if (k_.has_value() && seqlen_new > 0 && !fuse_knew) {
         auto seqlens_cpu = seqlens_k.to(torch::kCPU);
         auto seqlens_accessor = seqlens_cpu.accessor<int32_t, 1>();
@@ -683,28 +695,8 @@ mha_fwd_kvcache(
         seqlens_k = seqlens_k + seqlen_new;
     }
 
-    // For paged KV, gather to contiguous format
-    if (paged_KV) {
-        int num_pages_needed = (seqlen_k + page_block_size - 1) / page_block_size;
-        auto block_indices = block_table.index({
-            torch::indexing::Slice(),
-            torch::indexing::Slice(0, num_pages_needed)
-        }).flatten();
-        auto k_gathered = kcache_padded.index_select(0, block_indices.to(torch::kLong));
-        auto v_gathered = vcache_padded.index_select(0, block_indices.to(torch::kLong));
-        k_gathered = k_gathered.view({batch_size, num_pages_needed, page_block_size, num_heads_k, head_size_padded});
-        v_gathered = v_gathered.view({batch_size, num_pages_needed, page_block_size, num_heads_k, head_size_padded});
-        k_gathered = k_gathered.view({batch_size, num_pages_needed * page_block_size, num_heads_k, head_size_padded});
-        v_gathered = v_gathered.view({batch_size, num_pages_needed * page_block_size, num_heads_k, head_size_padded});
-        kcache_padded = k_gathered.index({
-            torch::indexing::Slice(), torch::indexing::Slice(0, seqlen_k)
-        }).contiguous();
-        vcache_padded = v_gathered.index({
-            torch::indexing::Slice(), torch::indexing::Slice(0, seqlen_k)
-        }).contiguous();
-    }
-
-    // Dispatch to kernel
+    // Dispatch to kernel.  Paged caches are now passed natively (block_table
+    // routed straight through to the kernel, no host gather).
     auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
     const bool is_local = (window_size_left >= 0);
 
@@ -718,11 +710,16 @@ mha_fwd_kvcache(
         leftpad_k_opt = leftpad_k;
     }
 
-    // For non-paged path with new KV, pass knew/vnew for fused scatter in kernel
+    // For paths where new KV is appended in-kernel, pass knew/vnew through.
     std::optional<at::Tensor> knew_opt, vnew_opt;
     if (fuse_knew) {
         knew_opt = k_padded;
         vnew_opt = v_padded;
+    }
+
+    std::optional<at::Tensor> block_table_opt;
+    if (paged_KV) {
+        block_table_opt = block_table;
     }
 
     cutlass_fmha_fwd_kvcache_impl(
@@ -731,6 +728,7 @@ mha_fwd_kvcache(
         out, softmax_lse,
         seqlens_k, cache_batch_idx_opt, leftpad_k_opt,
         knew_opt, vnew_opt,
+        block_table_opt, seqlen_k,
         softmax_scale, window_size_left, window_size_right,
         is_causal, is_local);
 

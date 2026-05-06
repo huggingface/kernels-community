@@ -112,6 +112,37 @@ void dispatch_fwd_prefill_by_head(sycl::queue& queue, CutlassType cuType,
   else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");
 }
 
+/// Dispatch forward kernel by head_size for the kvcache prefill paged path
+/// (non-varlen, seqlen_q > 1, IsPaged=1).
+void dispatch_fwd_kvcache_prefill_paged_by_head(sycl::queue& queue, CutlassType cuType,
+                                                const fmha_fwd_args_t& args, int head_size) {
+  if      (head_size <=  32) policy_dispatch<prefill_policy_head32,  PipelineStages_Prefill, 0, 1>(queue, cuType, args);
+  else if (head_size <=  64) policy_dispatch<prefill_policy_head64,  PipelineStages_Prefill, 0, 1>(queue, cuType, args);
+  else if (head_size <=  96) policy_dispatch<prefill_policy_head96,  PipelineStages_Prefill, 0, 1>(queue, cuType, args);
+  else if (head_size <= 128) policy_dispatch<prefill_policy_head128, PipelineStages_Prefill, 0, 1>(queue, cuType, args);
+  else if (head_size <= 160) policy_dispatch<prefill_policy_head160, PipelineStages_Prefill, 0, 1>(queue, cuType, args);
+  else if (head_size <= 192) policy_dispatch<prefill_policy_head192, PipelineStages_Prefill, 0, 1>(queue, cuType, args);
+  else if (head_size <= 256) policy_dispatch<prefill_policy_head256, PipelineStages_Prefill, 0, 1>(queue, cuType, args);
+  else if (head_size == 512) policy_dispatch<prefill_policy_head512, PipelineStages_Prefill, 0, 1>(queue, cuType, args);
+  else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");
+}
+
+/// Dispatch forward kernel by head_size for the kvcache decode paged path
+/// (non-varlen, seqlen_q == 1, IsPaged=1). Uses decode_paged_policy with a
+/// smaller K-tile so block_size=64 multiples don't overshoot a page.
+void dispatch_fwd_kvcache_decode_paged_by_head(sycl::queue& queue, CutlassType cuType,
+                                               const fmha_fwd_args_t& args, int head_size) {
+  if      (head_size <=  32) policy_dispatch<decode_paged_policy_head32,  PipelineStages_Decode, 0, 1>(queue, cuType, args);
+  else if (head_size <=  64) policy_dispatch<decode_paged_policy_head64,  PipelineStages_Decode, 0, 1>(queue, cuType, args);
+  else if (head_size <=  96) policy_dispatch<decode_paged_policy_head96,  PipelineStages_Decode, 0, 1>(queue, cuType, args);
+  else if (head_size <= 128) policy_dispatch<decode_paged_policy_head128, PipelineStages_Decode, 0, 1>(queue, cuType, args);
+  else if (head_size <= 160) policy_dispatch<decode_paged_policy_head160, PipelineStages_Decode, 0, 1>(queue, cuType, args);
+  else if (head_size <= 192) policy_dispatch<decode_paged_policy_head192, PipelineStages_Decode, 0, 1>(queue, cuType, args);
+  else if (head_size <= 256) policy_dispatch<decode_paged_policy_head256, PipelineStages_Decode, 0, 1>(queue, cuType, args);
+  else if (head_size == 512) policy_dispatch<decode_paged_policy_head512, PipelineStages_Decode, 0, 1>(queue, cuType, args);
+  else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");
+}
+
 /// Clamp window sizes for local attention and fold causal into local when both are set.
 void normalize_window_params(int& window_size_left, int& window_size_right,
                              bool& is_causal, bool is_local, int max_seqlen_k) {
@@ -319,21 +350,46 @@ void cutlass_fmha_fwd_kvcache_impl(
     const std::optional<at::Tensor>& cache_leftpad,
     const std::optional<at::Tensor>& knew,
     const std::optional<at::Tensor>& vnew,
+    const std::optional<at::Tensor>& block_table,
+    int max_seqlen_k_paged,
     float sm_scale,
     int window_size_left,
     int window_size_right,
     bool is_causal,
     bool is_local) {
+  const bool is_paged = block_table.has_value() && block_table->defined();
+
   const int batch_size   = query.size(0);
   const int max_seqlen_q = query.size(1);
   const int num_heads_q  = query.size(2);
   const int head_size    = query.size(3);
 
-  const int max_seqlen_k = kcache.size(1);
-  const int num_heads_kv = kcache.size(2);
+  int max_seqlen_k;
+  int num_heads_kv;
+  int num_blocks = 0;
+  int block_size = 0;
+  int max_blocks_per_seq = 0;
+  if (is_paged) {
+    // Paged layout: kcache is (num_blocks, page_block_size, num_heads_kv, head_size)
+    num_blocks         = kcache.size(0);
+    block_size         = kcache.size(1);
+    num_heads_kv       = kcache.size(2);
+    max_blocks_per_seq = block_table->size(1);
+    max_seqlen_k       = max_seqlen_k_paged;
+    TORCH_CHECK(num_blocks * block_size >= max_seqlen_k,
+                "Paged KV pool too small for max_seqlen_k: ",
+                num_blocks * block_size, " < ", max_seqlen_k);
+    TORCH_CHECK(!cache_batch_idx.has_value(),
+                "Paged KVcache does not support cache_batch_idx");
+  } else {
+    max_seqlen_k = kcache.size(1);
+    num_heads_kv = kcache.size(2);
+  }
 
   const int total_seqlen_q = batch_size * max_seqlen_q;
-  const int total_seqlen_k = batch_size * max_seqlen_k;
+  const int total_seqlen_k = is_paged
+      ? num_blocks * block_size
+      : batch_size * max_seqlen_k;
 
   normalize_window_params(window_size_left, window_size_right,
                           is_causal, is_local, max_seqlen_k);
@@ -344,7 +400,7 @@ void cutlass_fmha_fwd_kvcache_impl(
       vcache.data_ptr(),
       out.data_ptr(),
       softmax_lse.data_ptr(),
-      nullptr,      // block_table
+      is_paged ? block_table->data_ptr() : nullptr,
       nullptr,      // cu_seqlens_q
       nullptr,      // cu_seqlens_k
       max_seqlen_q,
@@ -356,12 +412,12 @@ void cutlass_fmha_fwd_kvcache_impl(
       num_heads_q,
       num_heads_kv,
       head_size,
-      0,            // max_blocks_per_seq
-      0,            // block_size
+      max_blocks_per_seq,
+      block_size,
       window_size_left,
       window_size_right,
       false,        // is_varlen
-      false,        // is_paged
+      is_paged,
       is_causal,
       is_local,
       0.0f, 0, 0, nullptr, nullptr, 0, 0,  // dropout & s_dmask defaults
@@ -385,9 +441,28 @@ void cutlass_fmha_fwd_kvcache_impl(
   const CutlassType cuType = aten_to_Cutlass_dtype(query);
   const int h = args.head_size;
 
-  if (max_seqlen_q == 1) {
-    dispatch_fwd_decode_by_head(queue, cuType, args, h);
+  if (is_paged) {
+    // Paged dispatch requires the K-tile to evenly divide block_size,
+    // because each tile is loaded from a single page.
+    const int k_tile_n = paged_k_tile_size_n(h, max_seqlen_q);
+    TORCH_CHECK(k_tile_n > 0,
+                "Unsupported head_size for paged FA2 kvcache: ", h);
+    TORCH_CHECK(is_supported_paged_block_size(block_size),
+                "Unsupported paged KV block_size=", block_size,
+                ". Supported values are positive multiples of 64.");
+    TORCH_CHECK(block_size % k_tile_n == 0,
+                "Paged KV block_size must be a multiple of the kernel K tile. "
+                "Got block_size=", block_size, ", K tile=", k_tile_n);
+    if (max_seqlen_q == 1) {
+      dispatch_fwd_kvcache_decode_paged_by_head(queue, cuType, args, h);
+    } else {
+      dispatch_fwd_kvcache_prefill_paged_by_head(queue, cuType, args, h);
+    }
   } else {
-    dispatch_fwd_prefill_by_head(queue, cuType, args, h);
+    if (max_seqlen_q == 1) {
+      dispatch_fwd_decode_by_head(queue, cuType, args, h);
+    } else {
+      dispatch_fwd_prefill_by_head(queue, cuType, args, h);
+    }
   }
 }

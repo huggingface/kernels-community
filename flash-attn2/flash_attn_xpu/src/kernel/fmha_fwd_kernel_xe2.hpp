@@ -228,8 +228,11 @@ class XeFMHAFwdKernelXe2 {
       // KV Cache: override seq_len_kv with per-batch effective length
       int effective_seq_kv = seq_len_kv;
       int leftpad_k = 0;
+      // bidx maps the logical request to a slot in the physical KV cache.
+      // - paged path: cache_batch_idx is forbidden, K/V are flat blocks
+      // - non-paged path: bidx selects the per-batch KV slice
+      int bidx = (!PagedKV && p.cache_batch_idx) ? p.cache_batch_idx[idx_b] : idx_b;
       if (p.cache_seqlens) {
-        int bidx = p.cache_batch_idx ? p.cache_batch_idx[idx_b] : idx_b;
         int orig_cache_seqlens = p.cache_seqlens[bidx];
         if (p.cache_leftpad) {
           leftpad_k = p.cache_leftpad[bidx];
@@ -238,24 +241,62 @@ class XeFMHAFwdKernelXe2 {
         // Fused cache update: copy knew/vnew into kcache/vcache
         if (p.Knew != nullptr && p.seqlen_knew > 0) {
           constexpr int num_threads = SGPerWG::value * cute::intel::sg_size;
-          auto* k_dst = const_cast<ElementK*>(p.K)
-              + bidx * p.k_batch_stride + head * p.k_head_stride
-              + static_cast<int64_t>(orig_cache_seqlens) * p.k_row_stride;
           auto* k_src = p.Knew
               + idx_b * p.knew_batch_stride + head * p.knew_head_stride;
-          for (int si = 0; si < p.seqlen_knew; si++) {
-            for (int d = thr_id; d < s.head_size_qk; d += num_threads) {
-              k_dst[si * p.k_row_stride + d] = k_src[si * p.knew_row_stride + d];
-            }
-          }
-          auto* v_dst = const_cast<ElementV*>(p.V)
-              + bidx * p.v_batch_stride + head * p.v_head_stride
-              + static_cast<int64_t>(orig_cache_seqlens) * p.v_row_stride;
           auto* v_src = p.Vnew
               + idx_b * p.vnew_batch_stride + head * p.vnew_head_stride;
-          for (int si = 0; si < p.seqlen_knew; si++) {
-            for (int d = thr_id; d < s.head_size_vo; d += num_threads) {
-              v_dst[si * p.v_row_stride + d] = v_src[si * p.vnew_row_stride + d];
+          if constexpr (PagedKV) {
+            // Paged scatter: per-token compute (block, page_offset) from
+            // block_table, then write to the corresponding page slot.
+            // Each "block" in the paged K/V tensor spans `page_size` rows,
+            // so the per-block byte stride is `page_size * row_stride`,
+            // not `k_batch_stride` (which is sized for the *whole* logical
+            // KV layout, not per-page).
+            const int page_size = params.mainloop.paged.page_size;
+            const int max_pages_per_seq =
+                params.mainloop.paged.max_pages_per_seq;
+            const int* page_table = params.mainloop.paged.ptr_page_table
+                + idx_b * max_pages_per_seq;
+            const int64_t k_block_stride =
+                static_cast<int64_t>(page_size) * p.k_row_stride;
+            const int64_t v_block_stride =
+                static_cast<int64_t>(page_size) * p.v_row_stride;
+            for (int si = 0; si < p.seqlen_knew; si++) {
+              int global_pos = orig_cache_seqlens + si;
+              int page_idx = global_pos / page_size;
+              int page_off = global_pos % page_size;
+              int block = page_table[page_idx];
+              auto* k_dst = const_cast<ElementK*>(p.K)
+                  + static_cast<int64_t>(block) * k_block_stride
+                  + head * p.k_head_stride
+                  + static_cast<int64_t>(page_off) * p.k_row_stride;
+              auto* v_dst = const_cast<ElementV*>(p.V)
+                  + static_cast<int64_t>(block) * v_block_stride
+                  + head * p.v_head_stride
+                  + static_cast<int64_t>(page_off) * p.v_row_stride;
+              for (int d = thr_id; d < s.head_size_qk; d += num_threads) {
+                k_dst[d] = k_src[si * p.knew_row_stride + d];
+              }
+              for (int d = thr_id; d < s.head_size_vo; d += num_threads) {
+                v_dst[d] = v_src[si * p.vnew_row_stride + d];
+              }
+            }
+          } else {
+            auto* k_dst = const_cast<ElementK*>(p.K)
+                + bidx * p.k_batch_stride + head * p.k_head_stride
+                + static_cast<int64_t>(orig_cache_seqlens) * p.k_row_stride;
+            auto* v_dst = const_cast<ElementV*>(p.V)
+                + bidx * p.v_batch_stride + head * p.v_head_stride
+                + static_cast<int64_t>(orig_cache_seqlens) * p.v_row_stride;
+            for (int si = 0; si < p.seqlen_knew; si++) {
+              for (int d = thr_id; d < s.head_size_qk; d += num_threads) {
+                k_dst[si * p.k_row_stride + d] = k_src[si * p.knew_row_stride + d];
+              }
+            }
+            for (int si = 0; si < p.seqlen_knew; si++) {
+              for (int d = thr_id; d < s.head_size_vo; d += num_threads) {
+                v_dst[si * p.v_row_stride + d] = v_src[si * p.vnew_row_stride + d];
+              }
             }
           }
           sycl::group_barrier(get_work_group<3>());
@@ -320,7 +361,10 @@ class XeFMHAFwdKernelXe2 {
         offset_o = s.num_heads_q  * s.head_size_vo * qo_cumulative[idx_b];
       }
 
-      auto batch_dim = is_var_len ? 1 : s.batch;
+      auto batch_dim_q = is_var_len ? 1 : s.batch;
+      // Paged KV is laid out as (num_blocks * page_size, head, num_heads_kv)
+      // with no batch dimension; treat it like the varlen K/V layout.
+      auto batch_dim_kv = (is_var_len || PagedKV) ? 1 : s.batch;
       int total_seqlen_kv;
       if constexpr (PagedKV) {
         total_seqlen_kv = params.mainloop.paged.total_seqlen_kv;
@@ -333,13 +377,13 @@ class XeFMHAFwdKernelXe2 {
       // extending past the per-batch allocation.
       int kv_surface_len = total_seqlen_kv - leftpad_k;
       auto shape_Q =
-          make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
+          make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim_q);
       auto shape_K = make_shape(
-          kv_surface_len, s.head_size_qk, s.num_heads_kv, batch_dim);
+          kv_surface_len, s.head_size_qk, s.num_heads_kv, batch_dim_kv);
       auto shape_V = make_shape(
-          s.head_size_vo, kv_surface_len, s.num_heads_kv, batch_dim);
+          s.head_size_vo, kv_surface_len, s.num_heads_kv, batch_dim_kv);
       auto shape_O =
-          make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
+          make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim_q);
 
       auto stride_q = cutlass::make_stride(
           static_cast<int>(p.q_row_stride), Int<1>{},
@@ -393,12 +437,16 @@ class XeFMHAFwdKernelXe2 {
       int rows_of_maxima =
           get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
 
-      int l_coord = is_var_len ? 0 : idx_b;
+      // For non-paged KV, reuse cache_batch_idx remap (bidx) so that the
+      // KV slice matches the per-request seqlen. Q/O always use idx_b.
+      int l_coord_q  = is_var_len ? 0 : idx_b;
+      int l_coord_kv = is_var_len ? 0
+                       : (PagedKV ? 0 : bidx);
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop(
-          Q(_, _, head_q, l_coord),
-          K(_, _, head, l_coord),
-          V(_, _, head, l_coord),
+          Q(_, _, head_q, l_coord_q),
+          K(_, _, head, l_coord_kv),
+          V(_, _, head, l_coord_kv),
           tArA,
           tA_max,
           tA_sum,
@@ -433,7 +481,7 @@ class XeFMHAFwdKernelXe2 {
           tile_row_idx,
           rows_of_maxima);
       epilogue(
-          O(_, _, head_q, l_coord),
+          O(_, _, head_q, l_coord_q),
           tArA,
           tA_max,
           tA_sum,

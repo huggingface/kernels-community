@@ -119,6 +119,23 @@ EXTERN_DISPATCH_FIX(256)
 EXTERN_DISPATCH_FIX(512)
 #undef EXTERN_DISPATCH_FIX
 
+// KVCache + paged extern declarations (IsVarLen=0, IsPaged=1)
+#define EXTERN_DISPATCH_KVCACHE_PAGED(HDIM) \
+  extern template void policy_dispatch_fp16<prefill_policy_head##HDIM, PipelineStages_Prefill, 0, 1>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_fp16<decode_paged_policy_head##HDIM, PipelineStages_Decode, 0, 1>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_bf16<prefill_policy_head##HDIM, PipelineStages_Prefill, 0, 1>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_bf16<decode_paged_policy_head##HDIM, PipelineStages_Decode, 0, 1>(sycl::queue&, const fmha_fwd_args_t&);
+
+EXTERN_DISPATCH_KVCACHE_PAGED(32)
+EXTERN_DISPATCH_KVCACHE_PAGED(64)
+EXTERN_DISPATCH_KVCACHE_PAGED(96)
+EXTERN_DISPATCH_KVCACHE_PAGED(128)
+EXTERN_DISPATCH_KVCACHE_PAGED(160)
+EXTERN_DISPATCH_KVCACHE_PAGED(192)
+EXTERN_DISPATCH_KVCACHE_PAGED(256)
+EXTERN_DISPATCH_KVCACHE_PAGED(512)
+#undef EXTERN_DISPATCH_KVCACHE_PAGED
+
 void cutlass_fmha_fwd_varlen_impl(
     sycl::queue& queue,
     const at::Tensor& query,
@@ -171,6 +188,8 @@ void cutlass_fmha_fwd_kvcache_impl(
     const std::optional<at::Tensor>& cache_leftpad,
     const std::optional<at::Tensor>& knew,
     const std::optional<at::Tensor>& vnew,
+    const std::optional<at::Tensor>& block_table,
+    int max_seqlen_k_paged,
     float sm_scale,
     int window_size_left,
     int window_size_right,
