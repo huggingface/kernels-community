@@ -26,7 +26,7 @@ def _bitmatrix_metadata_compute_stage1(
     BLOCK_M: tl.constexpr,  # chunk size for iterating over tiles per expert
     BLOCK_N: tl.constexpr,  # chunk size for iterating over experts in cumsum
 ):
-    # Assume grid size == E + 1
+    # Assume grid size == E + 1 (E programs for stage1 cumsum + 1 program for expert_offs)
 
     pid = tl.program_id(0)
     if pid < E:
