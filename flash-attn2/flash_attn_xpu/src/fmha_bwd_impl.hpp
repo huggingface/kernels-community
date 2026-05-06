@@ -1121,21 +1121,25 @@ struct FMHABwdConfig {
     }
 };
 
-// bwd_policy_dispatch - similar to policy_dispatch in fmha_fwd_impl.hpp
+// Single-dtype bwd dispatch: only instantiates one dtype path per TU.
 template <typename bwd_policy, int IsCausal = -1, int IsLocal = -1>
-void bwd_policy_dispatch(sycl::queue& queue, BwdCutlassType cuType, const fmha_bwd_args_t& args) {
-    auto dispatch = [&]<typename ElemT>(ElemT) {
-        using Config = FMHABwdConfig<bwd_policy, ElemT, ElemT, ElemT, ElemT>;
-        if constexpr (IsCausal != -1 && IsLocal != -1) {
-            return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
-        } else {
-            return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
-        }
-    };
-
-    if (cuType == BwdCutlassType::half) {
-        dispatch(cute::half_t{});
+void bwd_policy_dispatch_fp16(sycl::queue& queue, const fmha_bwd_args_t& args) {
+    using Config = FMHABwdConfig<bwd_policy, cute::half_t, cute::half_t, cute::half_t, cute::half_t>;
+    if constexpr (IsCausal != -1 && IsLocal != -1) {
+        return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
     } else {
-        dispatch(cute::bfloat16_t{});
+        return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
     }
 }
+
+template <typename bwd_policy, int IsCausal = -1, int IsLocal = -1>
+void bwd_policy_dispatch_bf16(sycl::queue& queue, const fmha_bwd_args_t& args) {
+    using Config = FMHABwdConfig<bwd_policy, cute::bfloat16_t, cute::bfloat16_t, cute::bfloat16_t, cute::bfloat16_t>;
+    if constexpr (IsCausal != -1 && IsLocal != -1) {
+        return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
+    } else {
+        return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
+    }
+}
+
+// Combined bwd_policy_dispatch is now defined inline in fmha_bwd.hpp

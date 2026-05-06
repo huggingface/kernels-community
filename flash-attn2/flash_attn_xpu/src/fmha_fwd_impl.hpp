@@ -269,24 +269,32 @@ struct FMHAConfig {
   }
 };
 
+// Single-dtype dispatch: only instantiates one dtype path per TU to reduce
+// per-file IGC memory usage from ~40 GB to ~20 GB.
 template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged>
-void policy_dispatch(sycl::queue& queue, CutlassType cuType,
-                     const fmha_fwd_args_t& args) {
-  auto dispatch = [&]<typename ElemT>(ElemT) {
-    using Config = FMHAConfig<
-        typename chunk_policy::ShapeQK,
-        typename chunk_policy::ShapePV,
-        typename chunk_policy::ShapeOut,
-        typename chunk_policy::SubgroupLayoutQK,
-        void,
-        PipelineStages,
-        ElemT, ElemT, ElemT, ElemT>;
-    Config::template xe2_dispatch<IsVarLen, IsPaged>(queue, args);
-  };
-
-  if (cuType == CutlassType::half) {
-    dispatch(half_t{});
-  } else {
-    dispatch(bfloat16_t{});
-  }
+void policy_dispatch_fp16(sycl::queue& queue, const fmha_fwd_args_t& args) {
+  using Config = FMHAConfig<
+      typename chunk_policy::ShapeQK,
+      typename chunk_policy::ShapePV,
+      typename chunk_policy::ShapeOut,
+      typename chunk_policy::SubgroupLayoutQK,
+      void,
+      PipelineStages,
+      half_t, half_t, half_t, half_t>;
+  Config::template xe2_dispatch<IsVarLen, IsPaged>(queue, args);
 }
+
+template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged>
+void policy_dispatch_bf16(sycl::queue& queue, const fmha_fwd_args_t& args) {
+  using Config = FMHAConfig<
+      typename chunk_policy::ShapeQK,
+      typename chunk_policy::ShapePV,
+      typename chunk_policy::ShapeOut,
+      typename chunk_policy::SubgroupLayoutQK,
+      void,
+      PipelineStages,
+      bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t>;
+  Config::template xe2_dispatch<IsVarLen, IsPaged>(queue, args);
+}
+
+// Combined policy_dispatch is now defined inline in fmha_fwd.hpp
