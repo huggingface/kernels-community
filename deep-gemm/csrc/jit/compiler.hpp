@@ -6,7 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <nvrtc.h>
-#include <regex>
+#include <sstream>
 #include <string>
 
 #include "../utils/exception.hpp"
@@ -179,11 +179,13 @@ class NVCCCompiler final: public Compiler {
         const auto [return_code, output] = call_external_command(command);
         DG_HOST_ASSERT(return_code == 0);
 
-        // The version should be at least 12.3, for the best performance with 12.9
-        int major, minor;
-        std::smatch match;
-        DG_HOST_ASSERT(std::regex_search(output, match, std::regex(R"(release (\d+\.\d+))")));
-        std::sscanf(match[1].str().c_str(), "%d.%d", &major, &minor);
+        // The version should be at least 12.3, for the best performance with 12.9.
+        // Manual parse (avoids std::regex which segfaults on some libstdc++ ABIs;
+        // see include_parser.hpp for the same patch motivation).
+        int major = 0, minor = 0;
+        const auto rpos = output.find("release ");
+        DG_HOST_ASSERT(rpos != std::string::npos);
+        DG_HOST_ASSERT(std::sscanf(output.c_str() + rpos + 8, "%d.%d", &major, &minor) == 2);
         DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVCC version should be >= 12.3");
         if (major == 12 and minor < 9)
             printf("Warning: please use at least NVCC 12.9 for the best DeepGEMM performance\n");
@@ -241,9 +243,9 @@ public:
             }
         }
 
-        // Check local memory usage
+        // Check local memory usage (substring search; avoids std::regex).
         if (get_env("DG_JIT_PTXAS_CHECK", 0))
-            DG_HOST_ASSERT(not std::regex_search(output, std::regex(R"(Local memory used)")));
+            DG_HOST_ASSERT(output.find("Local memory used") == std::string::npos);
 
         // Print PTXAS log
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0))
@@ -264,6 +266,31 @@ public:
         std::string include_dirs;
         include_dirs += fmt::format("-I{} ", library_include_path.string());
         include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());
+
+        // Bundled CUTLASS resolution (matches the kernels-community packaging).
+        // The wheel ships cutlass under <library_root>/include/third-party/cutlass/,
+        // not at the canonical <library_root>/include/cutlass/. Auto-add the
+        // bundled paths when present; no-op for upstream-style layouts.
+        const auto bundled_cutlass = library_include_path / "third-party" / "cutlass" / "include";
+        if (std::filesystem::exists(bundled_cutlass))
+            include_dirs += fmt::format("-I{} ", bundled_cutlass.string());
+        const auto bundled_cute = library_include_path / "third-party" / "cutlass" / "tools" / "util" / "include";
+        if (std::filesystem::exists(bundled_cute))
+            include_dirs += fmt::format("-I{} ", bundled_cute.string());
+
+        // Honour the legacy `DG_CUTLASS_INCLUDE` env var (kernels-community
+        // wrappers set it to the bundled path) and a generic colon-separated
+        // `DG_INCLUDE_PATH` for power users.
+        if (const auto cutlass_inc = get_env<std::string>("DG_CUTLASS_INCLUDE"); not cutlass_inc.empty())
+            include_dirs += fmt::format("-I{} ", cutlass_inc);
+        if (const auto extra = get_env<std::string>("DG_INCLUDE_PATH"); not extra.empty()) {
+            std::stringstream ss(extra);
+            std::string item;
+            while (std::getline(ss, item, ':')) {
+                if (not item.empty())
+                    include_dirs += fmt::format("-I{} ", item);
+            }
+        }
 
         // Add PCH support for version 12.8 and above
         // NOTES: PCH is vital for compilation speed

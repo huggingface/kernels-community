@@ -1,8 +1,8 @@
 #pragma once
 
 #include <filesystem>
-#include <regex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "../utils/format.hpp"
@@ -13,26 +13,63 @@ namespace deep_gemm {
 class IncludeParser {
     std::unordered_map<std::string, std::optional<std::string>> cache;
 
+    // Manual scanner replacing `std::regex` — the regex implementation in some
+    // libstdc++ builds segfaults inside `std::codecvt<char16_t,char>::do_unshift`
+    // when an ABI mismatch is present at load time. Hand-rolled parsing also
+    // dodges locale facets entirely and is faster.
     static std::vector<std::string> get_includes(const std::string& code, const std::filesystem::path& file_path = "") {
         std::vector<std::string> includes;
-        const std::regex pattern(R"(#\s*include\s*[<"][^>"]+[>"])");
-        std::sregex_iterator iter(code.begin(), code.end(), pattern);
-        const std::sregex_iterator end;
+        constexpr std::string_view kInclude = "include";
+        const size_t n = code.size();
+        size_t pos = 0;
 
-        // TODO: parse relative paths as well
-        for (; iter != end; ++ iter) {
-            const auto include_str = iter->str();
-            const int len = include_str.length();
-            if (include_str.substr(0, 10) == "#include <" and include_str[len - 1] == '>' and include_str[10] != ' ' and include_str[len - 2] != ' ') {
-                std::string filename = include_str.substr(10, len - 11);
-                if (filename.substr(0, 9) == "deep_gemm")  // We only parse `<deep_gemm/*>`
-                    includes.push_back(filename);
-            } else {
-                std::string error_info = fmt::format("Non-standard include: {}", include_str);
-                if (file_path != "")
-                    error_info += fmt::format(" ({})", file_path.string());
-                DG_HOST_UNREACHABLE(error_info);
+        while (pos < n) {
+            // Find next `#` that starts (or is at) a line.
+            const size_t hash = code.find('#', pos);
+            if (hash == std::string::npos) break;
+            if (hash != 0 && code[hash - 1] != '\n') {
+                pos = hash + 1;
+                continue;
             }
+
+            // Skip horizontal whitespace after `#`.
+            size_t i = hash + 1;
+            while (i < n && (code[i] == ' ' || code[i] == '\t')) ++i;
+
+            // Must be "include".
+            if (i + kInclude.size() > n || code.compare(i, kInclude.size(), kInclude) != 0) {
+                pos = hash + 1;
+                continue;
+            }
+            i += kInclude.size();
+
+            // Skip horizontal whitespace before the opening bracket/quote.
+            while (i < n && (code[i] == ' ' || code[i] == '\t')) ++i;
+            if (i >= n) break;
+
+            const char open = code[i];
+            char close;
+            if (open == '<') close = '>';
+            else if (open == '"') close = '"';
+            else { pos = i; continue; }  // not a recognised include form
+
+            const size_t end = code.find(close, i + 1);
+            if (end == std::string::npos) break;
+            const std::string filename = code.substr(i + 1, end - i - 1);
+
+            if (open == '<') {
+                // Upstream only ingests `<deep_gemm/...>`; other angle-bracket
+                // system includes (e.g. `<cuda_fp16.h>`) are silently skipped.
+                if (filename.compare(0, 9, "deep_gemm") == 0) {
+                    includes.push_back(filename);
+                }
+            } else {
+                // Quoted form is treated as non-standard (matches upstream).
+                std::string err = fmt::format("Non-standard include: #include \"{}\"", filename);
+                if (file_path != "") err += fmt::format(" ({})", file_path.string());
+                DG_HOST_UNREACHABLE(err);
+            }
+            pos = end + 1;
         }
         return includes;
     }

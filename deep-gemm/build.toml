@@ -17,7 +17,7 @@ pyext = ["py", "cuh", "hpp", "h"]
 [kernel.deep_gemm]
 backend = "cuda"
 cuda-minver = "12.3"
-cuda-capabilities = ["9.0a"]
+cuda-capabilities = ["9.0a", "10.0a"]
 depends = ["torch", "cutlass_4_0"]
 include = [
   "csrc",
@@ -30,6 +30,10 @@ cuda-flags = [
   "--expt-relaxed-constexpr",
   "--expt-extended-lambda",
   "-Wno-deprecated-declarations",
+  # DeepGEMM uses NVRTC at runtime for JIT kernel compilation — link against
+  # libnvrtc so the resulting .so resolves nvrtc* symbols.
+  "-lnvrtc",
+  "-lcuda",
 ]
 src = [
   # Compiled source
@@ -140,4 +144,4 @@ src = [
 ]
 
 [general.hub]
-repo-id = "kernels-community/deep-gemm"
+repo-id = "IlyasMoutawwakil/deep-gemm"

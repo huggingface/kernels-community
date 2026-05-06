@@ -828,22 +828,69 @@ def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None):
 
 
 def _find_cuda_home() -> str:
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    if cuda_home is None:
-        try:
-            with open(os.devnull, "w") as devnull:
-                nvcc = (
-                    subprocess.check_output(["which", "nvcc"], stderr=devnull)
-                    .decode()
-                    .rstrip("\r\n")
-                )
-                cuda_home = os.path.dirname(os.path.dirname(nvcc))
-        except Exception:
-            cuda_home = "/usr/local/cuda"
-            if not os.path.exists(cuda_home):
-                cuda_home = None
-    assert cuda_home is not None, "Could not find CUDA installation"
-    return cuda_home
+    """Find a CUDA toolkit directory (containing `bin/nvcc`) without requiring
+    the user to set any environment variable. Search order:
+
+      1. CUDA_HOME / CUDA_PATH env (explicit override).
+      2. `nvcc` on PATH.
+      3. pip-installed nvidia-cuda-nvcc-cu12 (only if it actually ships nvcc).
+      4. Conventional system locations (/usr/local/cuda, /opt/cuda, /opt/nvidia).
+    """
+    def _has_nvcc(d):
+        return d and os.path.isfile(os.path.join(d, "bin", "nvcc"))
+
+    # 1. Explicit override (still honoured for power users / CI).
+    for var in ("CUDA_HOME", "CUDA_PATH"):
+        cand = os.environ.get(var)
+        if _has_nvcc(cand):
+            return cand
+
+    # 2. nvcc on PATH (covers system installs that put nvcc in /usr/bin).
+    try:
+        nvcc = subprocess.check_output(
+            ["which", "nvcc"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        if nvcc:
+            home = os.path.dirname(os.path.dirname(nvcc))
+            if _has_nvcc(home):
+                return home
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        pass
+
+    # 3. pip-installed `nvidia-cuda-nvcc-cu12`. Note: in some package versions
+    #    the binary `nvcc` is missing and only `ptxas` ships — skip those.
+    try:
+        import nvidia.cuda_nvcc as _nvcc_pkg  # type: ignore
+        cand = os.path.dirname(_nvcc_pkg.__file__)
+        if _has_nvcc(cand):
+            return cand
+    except ImportError:
+        pass
+
+    # 4. Conventional system layouts (DGX images often have one of these).
+    for cand in (
+        "/usr/local/cuda",
+        "/opt/cuda",
+        "/opt/nvidia/cuda",
+        "/usr/lib/cuda",
+    ):
+        if _has_nvcc(cand):
+            return cand
+    # Versioned siblings: /usr/local/cuda-12.9, etc. — pick the highest.
+    import glob
+    versioned = sorted(
+        (d for d in glob.glob("/usr/local/cuda-*") if _has_nvcc(d)),
+        reverse=True,
+    )
+    if versioned:
+        return versioned[0]
+
+    raise RuntimeError(
+        "Could not find a CUDA installation with nvcc. DeepGEMM JIT-compiles "
+        "kernels at runtime and needs nvcc available. Set CUDA_HOME to a "
+        "toolkit directory, install `nvidia-cuda-nvcc-cu12`, or install the "
+        "system CUDA toolkit."
+    )
 
 
 # Find the library root for JIT headers
