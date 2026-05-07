@@ -2,7 +2,7 @@
   description = "Flake for ReLU kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/torch-2.12";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
