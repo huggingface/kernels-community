@@ -60,6 +60,7 @@ jobs:
     needs: setup
     if: needs.setup.outputs.skip == 'false'
     strategy:
+      fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     runs-on:
       group: ${{ matrix.runner }}
