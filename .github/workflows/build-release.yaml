@@ -19,29 +19,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-kernel:
+  setup:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64-linux
-            runner: aws-highmemory-32-plus-nix
-          - arch: aarch64-linux
-            runner: aws-r8g-8xl-plus-nix
-    runs-on:
-      group: ${{ matrix.runner }}
-    timeout-minutes: 1200 # 20h
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.validate.outputs.skip }}
+      kernel: ${{ steps.validate.outputs.kernel }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/nix-installer-action@main
         with:
           extra-conf: |
             max-jobs = 2
-            cores = 12
+            cores = 4
             sandbox-fallback = false
-      - name: Nix info
-        run: nix-shell -p nix-info --run "nix-info -m"
       - uses: cachix/cachix-action@v16
         with:
           name: huggingface
@@ -68,26 +60,57 @@ jobs:
               echo "skip=true" >> $GITHUB_OUTPUT
             fi
           fi
-      - name: Build kernel
+      - name: Generate build matrix
         if: steps.validate.outputs.skip == 'false'
+        id: matrix
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
-          ( cd "$KERNEL" && nix run -L github:huggingface/kernels#kernel-builder -- build )
+          X86_BACKENDS=$(cd "$KERNEL" && nix eval .#backendBundle --apply builtins.attrNames --json --system x86_64-linux)
+          ARM_BACKENDS=$(cd "$KERNEL" && nix eval .#backendBundle --apply builtins.attrNames --json --system aarch64-linux)
+          MATRIX=$(python3 .github/workflows/generate-build-matrix.py "$X86_BACKENDS" "$ARM_BACKENDS")
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+  build-kernel:
+    needs: setup
+    if: needs.setup.outputs.skip == 'false'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    runs-on:
+      group: ${{ matrix.runner }}
+    timeout-minutes: 1200 # 20h
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 12
+            sandbox-fallback = false
+      - name: Nix info
+        run: nix-shell -p nix-info --run "nix-info -m"
+      - uses: cachix/cachix-action@v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
+      - name: Build kernel
+        run: |
+          KERNEL="${{ needs.setup.outputs.kernel }}"
+          ( cd "$KERNEL" && nix build -L .#backendBundle.${{ matrix.backend }} && ls -l result/ )
       - name: Upload kernel to Hub
-        if: steps.validate.outputs.skip == 'false'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
+          KERNEL="${{ needs.setup.outputs.kernel }}"
           cd "$KERNEL"
           nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "kernels-community/$KERNEL"
           nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/$KERNEL"
       - name: Upload v1 kernels to main
-        if: steps.validate.outputs.skip == 'false'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
+          KERNEL="${{ needs.setup.outputs.kernel }}"
           cd "$KERNEL"
 
           # Check if build.toml exists, has version = 1, and does not specify a branch.

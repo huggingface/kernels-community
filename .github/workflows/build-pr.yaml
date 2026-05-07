@@ -8,17 +8,60 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-kernel:
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64-linux
-            runner: aws-highmemory-32-plus-nix
-          - arch: aarch64-linux
-            runner: aws-r8g-8xl-plus-nix
+  setup:
+    runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.validate.outputs.skip }}
-      ci-test-path: ${{ steps.export-closure.outputs.ci-test-path }}
+      kernel: ${{ steps.validate.outputs.kernel }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 4
+            sandbox-fallback = false
+      - uses: cachix/cachix-action@v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
+      - name: Validate kernel directory
+        id: validate
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "pr"); then
+            echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            echo "skip=true" >> $GITHUB_OUTPUT
+          fi
+      - name: Check that repo-id is present
+        if: steps.validate.outputs.skip == 'false'
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          if ! cat $KERNEL/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
+            echo "Mandatory repo-id is missing in $KERNEL/build.toml"
+            exit 1
+          fi
+      - name: Generate build matrix
+        if: steps.validate.outputs.skip == 'false'
+        id: matrix
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          X86_BACKENDS=$(cd "$KERNEL" && nix eval .#backendCi --apply builtins.attrNames --json --system x86_64-linux)
+          ARM_BACKENDS=$(cd "$KERNEL" && nix eval .#backendCi --apply builtins.attrNames --json --system aarch64-linux)
+          MATRIX=$(python3 .github/workflows/generate-build-matrix.py "$X86_BACKENDS" "$ARM_BACKENDS")
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+  build-kernel:
+    needs: setup
+    if: needs.setup.outputs.skip == 'false'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     runs-on:
       group: ${{ matrix.runner }}
     timeout-minutes: 600 # 10h
@@ -37,45 +80,46 @@ jobs:
           name: huggingface
         env:
           USER: runner
-      - name: Validate kernel directory
-        id: validate
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "pr"); then
-            echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
-            echo "skip=false" >> $GITHUB_OUTPUT
-          else
-            echo "skip=true" >> $GITHUB_OUTPUT
-          fi
-      - name: "Check that repo-id is present"
-        if: steps.validate.outputs.skip == 'false'
-        run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
-          if ! cat $KERNEL/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
-            echo "Mandatory repo-id is missing in $KERNEL/build.toml"
-            exit 1
-          fi
       - name: Build kernel
-        if: steps.validate.outputs.skip == 'false'
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
-          ( cd "$KERNEL" && nix build -L .#ci && ls -l result/ )
+          KERNEL="${{ needs.setup.outputs.kernel }}"
+          ( cd "$KERNEL" && nix build -L .#backendCi.${{ matrix.backend }} && ls -l result/ )
+
+  build-ci-test:
+    needs: setup
+    if: needs.setup.outputs.skip == 'false'
+    runs-on:
+      group: aws-highmemory-32-plus-nix
+    timeout-minutes: 600 # 10h
+    outputs:
+      ci-test-path: ${{ steps.export-closure.outputs.ci-test-path }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 12
+            sandbox-fallback = false
+      - name: Nix info
+        run: nix-shell -p nix-info --run "nix-info -m"
+      - uses: cachix/cachix-action@v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
       - name: Build ci-test
-        if: steps.validate.outputs.skip == 'false' && matrix.arch == 'x86_64-linux'
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
+          KERNEL="${{ needs.setup.outputs.kernel }}"
           ( cd "$KERNEL" && nix build -L .#ci-test )
       - name: Export ci-test closure
-        if: steps.validate.outputs.skip == 'false' && matrix.arch == 'x86_64-linux'
         id: export-closure
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
+          KERNEL="${{ needs.setup.outputs.kernel }}"
           CI_TEST_PATH=$(readlink -f "$KERNEL/result")
           echo "ci-test-path=$CI_TEST_PATH" >> $GITHUB_OUTPUT
           nix-store --export $(nix-store -qR "$CI_TEST_PATH") | nix run nixpkgs#zstd -- -T0 > ci-test-closure.nar.zst
       - name: Upload ci-test closure
-        if: steps.validate.outputs.skip == 'false' && matrix.arch == 'x86_64-linux'
         uses: actions/upload-artifact@v4
         with:
           name: ci-test-closure
@@ -83,8 +127,8 @@ jobs:
           retention-days: 1
 
   test-kernel-gpu:
-    needs: build-kernel
-    if: needs.build-kernel.outputs.skip == 'false'
+    needs: [setup, build-kernel, build-ci-test]
+    if: needs.setup.outputs.skip == 'false'
     runs-on:
       group: aws-g6-12xlarge-plus
     steps:
@@ -114,5 +158,5 @@ jobs:
           nix run nixpkgs#zstd -- -d ci-test-closure.nar.zst -c | nix-store --import
       - name: Run GPU tests
         run: |
-          CI_TEST_PATH="${{ needs.build-kernel.outputs.ci-test-path }}"
+          CI_TEST_PATH="${{ needs.build-ci-test.outputs.ci-test-path }}"
           "$CI_TEST_PATH/bin/ci-test"
