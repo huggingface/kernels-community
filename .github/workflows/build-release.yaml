@@ -41,8 +41,6 @@ jobs:
           USER: runner
       - name: Validate kernel directory
         id: validate
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             KERNEL="${{ inputs.kernel_name }}"
@@ -53,7 +51,7 @@ jobs:
               echo "skip=true" >> $GITHUB_OUTPUT
             fi
           else
-            if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release"); then
+            if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release" "${{ github.event.pull_request.title }}"); then
               echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
               echo "skip=false" >> $GITHUB_OUTPUT
             else
