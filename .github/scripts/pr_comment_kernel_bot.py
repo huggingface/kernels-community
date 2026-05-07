@@ -18,15 +18,21 @@ COMMAND_PERMISSIONS = {
     "build": {"admin", "write"},
     "build-and-upload": {"admin"},
     "merge-and-upload": {"admin"},
+    "release": {"admin"},
 }
-FORK_BLOCKED_COMMANDS = {"build", "build-and-upload"}
+FORK_BLOCKED_COMMANDS = {"build", "build-and-upload", "release"}
+RELEASE_WORKFLOWS = [
+    "build-release.yaml",
+    "build-release-mac.yaml",
+    "build-release-windows.yaml",
+]
 MAX_COMMENT_LENGTH = 1024
 DISPATCH_WORKFLOW = "manual-build-upload.yaml"
 RUN_LOOKUP_ATTEMPTS = 10
 RUN_LOOKUP_SLEEP_SECONDS = 2
 RUN_LOOKUP_PAGE_SIZE = 100
 COMMAND_USAGE = (
-    "Invalid command. Use `/kernel-bot <build|build-and-upload|merge-and-upload> "
+    "Invalid command. Use `/kernel-bot <build|build-and-upload|merge-and-upload|release> "
     "<kernel1> [kernel2 ...] [--branch <target_branch>]`."
 )
 
@@ -211,42 +217,48 @@ def resolve_dispatch_run_urls(
     repository: str,
     default_branch: str,
     dispatches: list[DispatchResult],
+    *,
+    workflows: list[str] | None = None,
 ):
     pending = {dispatch.dispatch_key: dispatch for dispatch in dispatches}
     if not pending:
         return
 
-    for attempt in range(RUN_LOOKUP_ATTEMPTS):
-        try:
-            workflow_runs = list_workflow_runs(
-                api_base,
-                token,
-                DISPATCH_WORKFLOW,
-                branch=default_branch,
-                event="workflow_dispatch",
-            )
-        except urllib.error.HTTPError as e:
-            err_text = e.read().decode("utf-8", errors="replace")
-            print(
-                f"Failed to list workflow runs for `{DISPATCH_WORKFLOW}` (HTTP {e.code}).",
-                file=sys.stderr,
-            )
-            print(err_text, file=sys.stderr)
-            return
+    if workflows is None:
+        workflows = [DISPATCH_WORKFLOW]
 
-        for run in workflow_runs:
-            matched_key = next(
-                (
-                    dispatch_key
-                    for dispatch_key in pending
-                    if workflow_run_matches_dispatch(run, dispatch_key)
-                ),
-                None,
-            )
-            if matched_key is None:
+    for attempt in range(RUN_LOOKUP_ATTEMPTS):
+        for workflow in workflows:
+            try:
+                workflow_runs = list_workflow_runs(
+                    api_base,
+                    token,
+                    workflow,
+                    branch=default_branch,
+                    event="workflow_dispatch",
+                )
+            except urllib.error.HTTPError as e:
+                err_text = e.read().decode("utf-8", errors="replace")
+                print(
+                    f"Failed to list workflow runs for `{workflow}` (HTTP {e.code}).",
+                    file=sys.stderr,
+                )
+                print(err_text, file=sys.stderr)
                 continue
 
-            pending[matched_key].action_url = workflow_run_url(repository, run)
+            for run in workflow_runs:
+                matched_key = next(
+                    (
+                        dispatch_key
+                        for dispatch_key in pending
+                        if workflow_run_matches_dispatch(run, dispatch_key)
+                    ),
+                    None,
+                )
+                if matched_key is None:
+                    continue
+
+                pending[matched_key].action_url = workflow_run_url(repository, run)
 
         pending = {
             dispatch_key: dispatch
@@ -545,6 +557,11 @@ def main():
         dispatch_pr_number = str(issue_number)
         upload_flag = "true"
         allow_main_dispatch = "false"
+    elif command == "release":
+        target_branch = requested_branch or default_branch
+        dispatch_pr_number = ""
+        upload_flag = "true"
+        allow_main_dispatch = "true"
     else:
         target_branch = requested_branch or "main"
         dispatch_pr_number = ""
@@ -555,6 +572,7 @@ def main():
         "build": "build only",
         "build-and-upload": "build and upload",
         "merge-and-upload": "merge, build and upload",
+        "release": "release (linux + mac + windows)",
     }[command]
     command_summary = f"/kernel-bot {command} {' '.join(kernels)}"
     if requested_branch is not None:
@@ -643,31 +661,56 @@ def main():
     dispatches = []
     failed = []
 
-    for kernel_name in kernels:
-        dispatch_key = make_dispatch_key(issue_number, kernel_name)
-        dispatch_body = {
-            "ref": default_branch,
-            "inputs": {
-                "kernel_name": kernel_name,
-                "pr_number": dispatch_pr_number,
-                "target_branch": target_branch,
-                "upload": upload_flag,
-                "allow_main_dispatch": allow_main_dispatch,
-                "dispatch_key": dispatch_key,
-            },
-        }
-        try:
-            print(
-                f"Dispatching workflow for command `{command}`, kernel `{kernel_name}`, branch `{target_branch}`"
-            )
-            github_api_request(dispatch_url, token, method="POST", data=dispatch_body)
-            dispatches.append(
-                DispatchResult(kernel_name=kernel_name, dispatch_key=dispatch_key)
-            )
-        except urllib.error.HTTPError as e:
-            err_text = e.read().decode("utf-8", errors="replace")
-            print(err_text, file=sys.stderr)
-            failed.append((kernel_name, e.code))
+    if command == "release":
+        for kernel_name in kernels:
+            for workflow in RELEASE_WORKFLOWS:
+                release_dispatch_url = f"{api_base}/actions/workflows/{workflow}/dispatches"
+                dispatch_key = make_dispatch_key(issue_number, f"{kernel_name}-{workflow}")
+                dispatch_body = {
+                    "ref": default_branch,
+                    "inputs": {
+                        "kernel_name": kernel_name,
+                        "dispatch_key": dispatch_key,
+                    },
+                }
+                try:
+                    print(
+                        f"Dispatching {workflow} for kernel `{kernel_name}`"
+                    )
+                    github_api_request(release_dispatch_url, token, method="POST", data=dispatch_body)
+                    dispatches.append(
+                        DispatchResult(kernel_name=f"{kernel_name} ({workflow})", dispatch_key=dispatch_key)
+                    )
+                except urllib.error.HTTPError as e:
+                    err_text = e.read().decode("utf-8", errors="replace")
+                    print(err_text, file=sys.stderr)
+                    failed.append((f"{kernel_name} ({workflow})", e.code))
+    else:
+        for kernel_name in kernels:
+            dispatch_key = make_dispatch_key(issue_number, kernel_name)
+            dispatch_body = {
+                "ref": default_branch,
+                "inputs": {
+                    "kernel_name": kernel_name,
+                    "pr_number": dispatch_pr_number,
+                    "target_branch": target_branch,
+                    "upload": upload_flag,
+                    "allow_main_dispatch": allow_main_dispatch,
+                    "dispatch_key": dispatch_key,
+                },
+            }
+            try:
+                print(
+                    f"Dispatching workflow for command `{command}`, kernel `{kernel_name}`, branch `{target_branch}`"
+                )
+                github_api_request(dispatch_url, token, method="POST", data=dispatch_body)
+                dispatches.append(
+                    DispatchResult(kernel_name=kernel_name, dispatch_key=dispatch_key)
+                )
+            except urllib.error.HTTPError as e:
+                err_text = e.read().decode("utf-8", errors="replace")
+                print(err_text, file=sys.stderr)
+                failed.append((kernel_name, e.code))
 
     resolve_dispatch_run_urls(
         api_base,
@@ -675,6 +718,7 @@ def main():
         repository,
         default_branch,
         dispatches,
+        workflows=RELEASE_WORKFLOWS if command == "release" else None,
     )
 
     comment_written = try_send_issue_comment(
