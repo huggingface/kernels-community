@@ -39,8 +39,6 @@ jobs:
           USER: runner
       - name: Validate kernel directory
         id: validate
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             KERNEL="${{ inputs.kernel_name }}"
