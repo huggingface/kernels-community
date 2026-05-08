@@ -1,0 +1,67 @@
+name: Build Release (Dispatch)
+run-name: >-
+  Build Release (Dispatch) / ${{ inputs.kernel_name || github.event.pull_request.title || '' }} / request=${{ inputs.dispatch_key || '' }}
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      kernel_name:
+        description: "Kernel directory name to build"
+        required: true
+        type: string
+      dispatch_key:
+        description: "Unique key for matching this run back to a bot dispatch"
+        required: false
+        type: string
+
+permissions:
+  actions: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  setup:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.validate.outputs.skip }}
+      kernel: ${{ steps.validate.outputs.kernel }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Validate kernel directory
+        id: validate
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            KERNEL="${{ inputs.kernel_name }}"
+            if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$KERNEL/build.toml" ]; then
+              echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+              echo "skip=false" >> $GITHUB_OUTPUT
+            else
+              echo "skip=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release"); then
+              echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+              echo "skip=false" >> $GITHUB_OUTPUT
+            else
+              echo "skip=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+      - name: Print result
+        run: |
+          echo "skip=${{ steps.validate.outputs.skip }}"
+          echo "kernel=${{ steps.validate.outputs.kernel }}"
+      - name: Dispatch release workflows
+        if: steps.validate.outputs.skip == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          REF="${{ github.event.repository.default_branch || 'main' }}"
+          python3 .github/scripts/dispatch_release.py "$KERNEL" --ref "$REF"

@@ -2,10 +2,6 @@ name: Build Release (Windows)
 run-name: >-
   Build Release (Windows) / ${{ inputs.kernel_name || '' }} / request=${{ inputs.dispatch_key || '' }}
 on:
-  pull_request:
-    types: [closed]
-    paths-ignore:
-      - "**/README.md"
   workflow_dispatch:
     inputs:
       kernel_name:
@@ -23,7 +19,6 @@ concurrency:
 
 jobs:
   build-kernel:
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     strategy:
       matrix:
         os: [windows-2022]
@@ -54,26 +49,14 @@ jobs:
       - name: Validate kernel directory
         id: validate
         shell: pwsh
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           $ErrorActionPreference = "Continue"
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            $KERNEL = "${{ inputs.kernel_name }}"
-            if ((Test-Path "$KERNEL") -and (Test-Path "$KERNEL/flake.nix") -and (Test-Path "$KERNEL/build.toml")) {
-              echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
-              echo "skip=false" >> $env:GITHUB_OUTPUT
-            } else {
-              echo "skip=true" >> $env:GITHUB_OUTPUT
-            }
+          $KERNEL = "${{ inputs.kernel_name }}"
+          if ((Test-Path "$KERNEL") -and (Test-Path "$KERNEL/flake.nix") -and (Test-Path "$KERNEL/build.toml")) {
+            echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
+            echo "skip=false" >> $env:GITHUB_OUTPUT
           } else {
-            $KERNEL = python .github/workflows/validate-kernel-pr.py "release" 2>&1
-            if ($LASTEXITCODE -eq 0) {
-              echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
-              echo "skip=false" >> $env:GITHUB_OUTPUT
-            } else {
-              echo "skip=true" >> $env:GITHUB_OUTPUT
-            }
+            echo "skip=true" >> $env:GITHUB_OUTPUT
           }
           exit 0
 

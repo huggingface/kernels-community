@@ -10,6 +10,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from dispatch_release import RELEASE_WORKFLOWS, dispatch_release as do_dispatch_release
+
 
 KERNEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
@@ -21,11 +23,6 @@ COMMAND_PERMISSIONS = {
     "release": {"admin"},
 }
 FORK_BLOCKED_COMMANDS = {"build", "build-and-upload", "release"}
-RELEASE_WORKFLOWS = [
-    "build-release.yaml",
-    "build-release-mac.yaml",
-    "build-release-windows.yaml",
-]
 MAX_COMMENT_LENGTH = 1024
 DISPATCH_WORKFLOW = "manual-build-upload.yaml"
 RUN_LOOKUP_ATTEMPTS = 10
@@ -663,28 +660,19 @@ def main():
 
     if command == "release":
         for kernel_name in kernels:
-            for workflow in RELEASE_WORKFLOWS:
-                release_dispatch_url = f"{api_base}/actions/workflows/{workflow}/dispatches"
-                dispatch_key = make_dispatch_key(issue_number, f"{kernel_name}-{workflow}")
-                dispatch_body = {
-                    "ref": default_branch,
-                    "inputs": {
-                        "kernel_name": kernel_name,
-                        "dispatch_key": dispatch_key,
-                    },
-                }
-                try:
-                    print(
-                        f"Dispatching {workflow} for kernel `{kernel_name}`"
-                    )
-                    github_api_request(release_dispatch_url, token, method="POST", data=dispatch_body)
-                    dispatches.append(
-                        DispatchResult(kernel_name=f"{kernel_name} ({workflow})", dispatch_key=dispatch_key)
-                    )
-                except urllib.error.HTTPError as e:
-                    err_text = e.read().decode("utf-8", errors="replace")
-                    print(err_text, file=sys.stderr)
-                    failed.append((f"{kernel_name} ({workflow})", e.code))
+            release_result = do_dispatch_release(
+                kernel_name,
+                token=token,
+                repo=repository,
+                ref=default_branch,
+                dispatch_key_prefix=f"pr{issue_number}-",
+            )
+            for wf, dk in release_result.dispatched:
+                dispatches.append(
+                    DispatchResult(kernel_name=f"{kernel_name} ({wf})", dispatch_key=dk)
+                )
+            for wf, code in release_result.failed:
+                failed.append((f"{kernel_name} ({wf})", code))
     else:
         for kernel_name in kernels:
             dispatch_key = make_dispatch_key(issue_number, kernel_name)
