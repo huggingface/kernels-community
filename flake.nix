@@ -27,12 +27,14 @@
         pkgs = nixpkgs.legacyPackages.${system};
       in
       {
-        devShell = with pkgs; mkShell {
-          name = "kernels-community-dev-shell";
-          nativeBuildInputs = [
-            pinact
-          ];
-        };
+        devShell =
+          with pkgs;
+          mkShell {
+            name = "kernels-community-dev-shell";
+            nativeBuildInputs = [
+              pinact
+            ];
+          };
 
         formatter = pkgs.nixfmt-tree;
       }
