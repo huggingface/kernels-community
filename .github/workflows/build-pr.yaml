@@ -15,14 +15,14 @@ jobs:
       kernel: ${{ steps.validate.outputs.kernel }}
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
           extra-conf: |
             max-jobs = 2
             cores = 4
             sandbox-fallback = false
-      - uses: cachix/cachix-action@v16
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
         with:
           name: huggingface
         env:
@@ -68,8 +68,8 @@ jobs:
       group: ${{ matrix.runner }}
     timeout-minutes: 600 # 10h
     steps:
-      - uses: actions/checkout@v6
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
           extra-conf: |
             max-jobs = ${{ matrix.max_jobs }}
@@ -77,7 +77,7 @@ jobs:
             sandbox-fallback = false
       - name: Nix info
         run: nix-shell -p nix-info --run "nix-info -m"
-      - uses: cachix/cachix-action@v16
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
         with:
           name: huggingface
         env:
@@ -96,8 +96,8 @@ jobs:
     outputs:
       ci-test-path: ${{ steps.export-closure.outputs.ci-test-path }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
           extra-conf: |
             max-jobs = 2
@@ -105,7 +105,7 @@ jobs:
             sandbox-fallback = false
       - name: Nix info
         run: nix-shell -p nix-info --run "nix-info -m"
-      - uses: cachix/cachix-action@v16
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
         with:
           name: huggingface
         env:
@@ -122,7 +122,7 @@ jobs:
           echo "ci-test-path=$CI_TEST_PATH" >> $GITHUB_OUTPUT
           nix-store --export $(nix-store -qR "$CI_TEST_PATH") | nix run nixpkgs#zstd -- -T0 > ci-test-closure.nar.zst
       - name: Upload ci-test closure
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ci-test-closure
           path: ci-test-closure.nar.zst
@@ -134,12 +134,12 @@ jobs:
     runs-on:
       group: aws-g6-12xlarge-plus
     steps:
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
           extra-conf: |
             max-jobs = 2
             cores = 12
-      - uses: cachix/cachix-action@v16
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
         with:
           name: huggingface
         env:
@@ -152,7 +152,7 @@ jobs:
             -exec ln -s {} /run/opengl-driver/lib/ \;
           find /run/opengl-driver
       - name: Download ci-test closure
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ci-test-closure
       - name: Import ci-test closure

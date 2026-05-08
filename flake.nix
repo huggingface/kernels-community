@@ -3,15 +3,15 @@
 
   inputs = {
     flake-utils.url = "github:numtide/flake-utils";
-    nixpkgs.follows = "hf-nix/nixpkgs";
-    hf-nix.url = "github:huggingface/hf-nix";
+    nixpkgs.follows = "kernels/nixpkgs";
+    kernels.url = "github:huggingface/kernels";
   };
 
   outputs =
     {
       self,
       flake-utils,
-      hf-nix,
+      kernels,
       nixpkgs,
     }:
     let
@@ -27,6 +27,15 @@
         pkgs = nixpkgs.legacyPackages.${system};
       in
       {
+        devShell =
+          with pkgs;
+          mkShell {
+            name = "kernels-community-dev-shell";
+            nativeBuildInputs = [
+              pinact
+            ];
+          };
+
         formatter = pkgs.nixfmt-tree;
       }
     );
