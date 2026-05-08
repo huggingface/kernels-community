@@ -17,6 +17,21 @@ on:
         required: false
         type: boolean
         default: false
+      pr_number:
+        description: "Optional PR number to checkout before building"
+        required: false
+        type: string
+        default: ""
+      target_branch:
+        description: "Target branch for upload (default: repo default)"
+        required: false
+        type: string
+        default: ""
+      upload:
+        description: "Whether to upload after build"
+        required: false
+        type: boolean
+        default: true
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
@@ -29,7 +44,25 @@ jobs:
       kernel: ${{ steps.validate.outputs.kernel }}
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Validate PR number
+        if: inputs.pr_number != ''
+        id: validate-pr
+        run: |
+          case "${{ inputs.pr_number }}" in
+            ''|*[!0-9]*)
+              echo "Invalid pr_number input: must be numeric"
+              exit 1
+              ;;
+          esac
+      - name: Checkout PR branch
+        if: inputs.pr_number != ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0
+      - name: Checkout default branch
+        if: inputs.pr_number == ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
           extra-conf: |
@@ -73,7 +106,15 @@ jobs:
       group: ${{ matrix.runner }}
     timeout-minutes: 1200 # 20h
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Checkout PR branch
+        if: inputs.pr_number != ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0
+      - name: Checkout default branch
+        if: inputs.pr_number == ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
           extra-conf: |
@@ -92,14 +133,20 @@ jobs:
           KERNEL="${{ needs.setup.outputs.kernel }}"
           ( cd "$KERNEL" && nix build -L .#backendBundle.${{ matrix.backend }} && ls -l result/ )
       - name: Upload kernel to Hub
+        if: inputs.upload != false
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           KERNEL="${{ needs.setup.outputs.kernel }}"
           cd "$KERNEL"
-          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "kernels-community/$KERNEL"
-          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/$KERNEL"
+          BRANCH_FLAG=""
+          if [ -n "${{ inputs.target_branch }}" ]; then
+            BRANCH_FLAG="--branch ${{ inputs.target_branch }}"
+          fi
+          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "kernels-community/$KERNEL" $BRANCH_FLAG
+          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/$KERNEL" $BRANCH_FLAG
       - name: Upload v1 kernels to main
+        if: inputs.upload != false && inputs.target_branch == ''
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |

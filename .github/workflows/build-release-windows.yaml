@@ -17,6 +17,21 @@ on:
         required: false
         type: boolean
         default: false
+      pr_number:
+        description: "Optional PR number to checkout before building"
+        required: false
+        type: string
+        default: ""
+      target_branch:
+        description: "Target branch for upload (default: repo default)"
+        required: false
+        type: string
+        default: ""
+      upload:
+        description: "Whether to upload after build"
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -49,7 +64,23 @@ jobs:
 
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Validate PR number
+        if: inputs.pr_number != ''
+        shell: pwsh
+        run: |
+          if ("${{ inputs.pr_number }}" -notmatch '^\d+$') {
+            Write-Error "Invalid pr_number input: must be numeric"
+            exit 1
+          }
+      - name: Checkout PR branch
+        if: inputs.pr_number != ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0
+      - name: Checkout default branch
+        if: inputs.pr_number == ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Validate kernel directory
         id: validate
@@ -232,20 +263,26 @@ jobs:
           Pop-Location
 
       - name: Upload kernel to Hub
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && inputs.upload != false
         shell: pwsh
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
           $KB = "$env:GITHUB_WORKSPACE\kernels\kernel-builder\target\debug\kernel-builder.exe"
 
+          $branchArgs = @()
+          if ($env:TARGET_BRANCH -ne "") {
+            $branchArgs = @("--branch", $env:TARGET_BRANCH)
+          }
+
           # Upload to both model and kernel repo types
-          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "kernels-community/$env:KERNEL_SOURCE"
-          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "kernels-community/$env:KERNEL_SOURCE"
+          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "kernels-community/$env:KERNEL_SOURCE" @branchArgs
+          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "kernels-community/$env:KERNEL_SOURCE" @branchArgs
 
       - name: Upload v1 kernels to main
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && inputs.upload != false && inputs.target_branch == ''
         shell: pwsh
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}

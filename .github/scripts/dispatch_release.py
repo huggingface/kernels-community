@@ -61,7 +61,15 @@ def github_api_request(
         return resp.status, resp.read().decode("utf-8")
 
 
-def run_local(workflow: str, kernel_name: str, *, skip_build: bool = False) -> bool:
+def run_local(
+    workflow: str,
+    kernel_name: str,
+    *,
+    skip_build: bool = False,
+    pr_number: str = "",
+    target_branch: str = "",
+    upload: bool = True,
+) -> bool:
     """Run a release workflow locally via act."""
     cmd = [
         "act", "workflow_dispatch",
@@ -71,6 +79,12 @@ def run_local(workflow: str, kernel_name: str, *, skip_build: bool = False) -> b
     ]
     if skip_build:
         cmd.extend(["--input", "skip_build=true"])
+    if pr_number:
+        cmd.extend(["--input", f"pr_number={pr_number}"])
+    if target_branch:
+        cmd.extend(["--input", f"target_branch={target_branch}"])
+    if not upload:
+        cmd.extend(["--input", "upload=false"])
     print(f"Running locally: {' '.join(cmd)}")
     result = subprocess.run(cmd)
     return result.returncode == 0
@@ -175,6 +189,9 @@ def dispatch_release(
     dispatch_key_prefix: str = "",
     local: bool = False,
     skip_build: bool = False,
+    pr_number: str = "",
+    target_branch: str = "",
+    upload: bool = True,
 ) -> ReleaseDispatchResult:
     """
     Dispatch the appropriate release workflows for a kernel.
@@ -185,6 +202,11 @@ def dispatch_release(
         repo: GitHub repository in "owner/repo" format.
         ref: Git ref to dispatch against (default "main").
         dispatch_key_prefix: Optional prefix for dispatch keys (e.g. "pr42-").
+        local: Run locally via act instead of remote dispatch.
+        skip_build: Skip build and upload steps.
+        pr_number: Optional PR number to checkout before building.
+        target_branch: Target branch for upload.
+        upload: Whether to upload after build.
 
     Returns:
         ReleaseDispatchResult with dispatched/failed/skipped lists.
@@ -208,7 +230,13 @@ def dispatch_release(
             f"{dispatch_key_prefix}{kernel_name}-{workflow}-{uuid.uuid4().hex[:12]}"
         )
         if local:
-            if run_local(workflow, kernel_name, skip_build=skip_build):
+            if run_local(
+                workflow, kernel_name,
+                skip_build=skip_build,
+                pr_number=pr_number,
+                target_branch=target_branch,
+                upload=upload,
+            ):
                 result.dispatched.append((workflow, dispatch_key))
             else:
                 result.failed.append((workflow, 0))
@@ -220,6 +248,12 @@ def dispatch_release(
             }
             if skip_build:
                 inputs["skip_build"] = "true"
+            if pr_number:
+                inputs["pr_number"] = pr_number
+            if target_branch:
+                inputs["target_branch"] = target_branch
+            if not upload:
+                inputs["upload"] = "false"
             dispatch_body = {
                 "ref": ref,
                 "inputs": inputs,
@@ -255,7 +289,26 @@ def main() -> int:
         "--skip-build", action="store_true",
         help="Skip build and upload steps (for testing workflow plumbing)",
     )
+    parser.add_argument(
+        "--pr-number", default="",
+        help="PR number to checkout before building",
+    )
+    parser.add_argument(
+        "--target-branch", default="",
+        help="Target branch for upload",
+    )
+    parser.add_argument(
+        "--no-upload", action="store_true",
+        help="Build only, do not upload",
+    )
     args = parser.parse_args()
+
+    common = dict(
+        skip_build=args.skip_build,
+        pr_number=args.pr_number,
+        target_branch=args.target_branch,
+        upload=not args.no_upload,
+    )
 
     if args.local:
         result = dispatch_release(
@@ -264,7 +317,7 @@ def main() -> int:
             repo="",
             ref=args.ref,
             local=True,
-            skip_build=args.skip_build,
+            **common,
         )
     else:
         token = get_token()
@@ -288,7 +341,7 @@ def main() -> int:
             token=token,
             repo=repo,
             ref=args.ref,
-            skip_build=args.skip_build,
+            **common,
         )
 
     if result.dispatched:
