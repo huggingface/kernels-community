@@ -3,74 +3,93 @@
 # This script generates explicit template instantiation files for different head dimensions
 # to reduce compilation time by compiling each instantiation separately.
 #
+# Files are split by dtype (fp16/bf16) to reduce per-TU memory usage from ~40 GB to ~20 GB,
+# allowing higher build parallelism.
+#
 # File naming convention:
-# - flash_fwd_hdim{N}_varlen.cpp: Variable length mode (IsVarLen=1) with paged/non-paged variants
-# - flash_fwd_hdim{N}_fix.cpp: Fixed length mode (IsVarLen=0, IsPaged=0) for both decode and prefill
+# - flash_fwd_hdim{N}_varlen_fp16.cpp: Variable length fp16 mode
+# - flash_fwd_hdim{N}_varlen_bf16.cpp: Variable length bf16 mode
+# - flash_fwd_hdim{N}_fix_fp16.cpp: Fixed length fp16 mode
+# - flash_fwd_hdim{N}_fix_bf16.cpp: Fixed length bf16 mode
 
-HDIMS=(32 64 96 128 160 192 256)
+HDIMS=(32 64 96 128 160 192 256 512)
 
-# Create varlen instantiation files (IsVarLen=1, with paged/non-paged)
-echo "Creating varlen instantiation files..."
+# Create varlen instantiation files split by dtype
+echo "Creating varlen instantiation files (split by dtype)..."
 for hdim in "${HDIMS[@]}"; do
-  cat > flash_fwd_hdim${hdim}_varlen.cpp << ENDFILE
+  for dtype in fp16 bf16; do
+    cat > flash_fwd_hdim${hdim}_varlen_${dtype}.cpp << ENDFILE
 #include "fmha_fwd_impl.hpp"
 
-// Varlen mode: IsVarLen=1, handles both paged and non-paged cases
-// No need for dynamic dispatch since we know it's varlen
+// Varlen mode: IsVarLen=1, dtype=${dtype}
 
-// Varlen + non-paged
-template void policy_dispatch<
-    prefill_policy_head${hdim}, 
-    PipelineStages_Prefill, 
+// Varlen prefill + non-paged
+template void policy_dispatch_${dtype}<
+    prefill_policy_head${hdim},
+    PipelineStages_Prefill,
     1, 0>(
-    sycl::queue& queue, 
-    CutlassType cuType, 
+    sycl::queue& queue,
     const fmha_fwd_args_t& args);
 
-// Varlen + paged
-template void policy_dispatch<
-    prefill_policy_head${hdim}, 
-    PipelineStages_Prefill, 
+// Varlen prefill + paged
+template void policy_dispatch_${dtype}<
+    prefill_policy_head${hdim},
+    PipelineStages_Prefill,
     1, 1>(
-    sycl::queue& queue, 
-    CutlassType cuType, 
+    sycl::queue& queue,
+    const fmha_fwd_args_t& args);
+
+// Varlen decode + non-paged
+template void policy_dispatch_${dtype}<
+    decode_policy_head${hdim},
+    PipelineStages_Decode,
+    1, 0>(
+    sycl::queue& queue,
+    const fmha_fwd_args_t& args);
+
+// Varlen decode + paged
+template void policy_dispatch_${dtype}<
+    decode_paged_policy_head${hdim},
+    PipelineStages_Decode,
+    1, 1>(
+    sycl::queue& queue,
     const fmha_fwd_args_t& args);
 ENDFILE
-  echo "  Created flash_fwd_hdim${hdim}_varlen.cpp"
+    echo "  Created flash_fwd_hdim${hdim}_varlen_${dtype}.cpp"
+  done
 done
 
-# Create fixed mode instantiation files (decode + prefill in one file)
-echo "Creating fixed mode instantiation files..."
+# Create fixed mode instantiation files split by dtype
+echo "Creating fixed mode instantiation files (split by dtype)..."
 for hdim in "${HDIMS[@]}"; do
-  cat > flash_fwd_hdim${hdim}_fix.cpp << ENDFILE
+  for dtype in fp16 bf16; do
+    cat > flash_fwd_hdim${hdim}_fix_${dtype}.cpp << ENDFILE
 #include "fmha_fwd_impl.hpp"
 
-// Fixed mode: non-varlen (IsVarLen=0), non-paged (IsPaged=0)
-// Includes both decode and prefill policies
+// Fixed mode: IsVarLen=0, IsPaged=0, dtype=${dtype}
 
 // Decode fixed mode
-template void policy_dispatch<
-    decode_policy_head${hdim}, 
-    PipelineStages_Decode, 
+template void policy_dispatch_${dtype}<
+    decode_policy_head${hdim},
+    PipelineStages_Decode,
     0, 0>(
-    sycl::queue& queue, 
-    CutlassType cuType, 
+    sycl::queue& queue,
     const fmha_fwd_args_t& args);
 
 // Prefill fixed mode
-template void policy_dispatch<
-    prefill_policy_head${hdim}, 
-    PipelineStages_Prefill, 
+template void policy_dispatch_${dtype}<
+    prefill_policy_head${hdim},
+    PipelineStages_Prefill,
     0, 0>(
-    sycl::queue& queue, 
-    CutlassType cuType, 
+    sycl::queue& queue,
     const fmha_fwd_args_t& args);
 ENDFILE
-  echo "  Created flash_fwd_hdim${hdim}_fix.cpp"
+    echo "  Created flash_fwd_hdim${hdim}_fix_${dtype}.cpp"
+  done
 done
 
 echo ""
 echo "✓ All instantiation files created successfully!"
-echo "  - ${#HDIMS[@]} varlen files (IsVarLen=1, paged + non-paged)"
-echo "  - ${#HDIMS[@]} fixed files (IsVarLen=0, decode + prefill)"
-echo "  Total: $((${#HDIMS[@]} * 2)) files"
+echo "  - $((${#HDIMS[@]} * 2)) varlen files (split by dtype)"
+echo "  - $((${#HDIMS[@]} * 2)) fixed files (split by dtype)"
+echo "  Total: $((${#HDIMS[@]} * 4)) files"

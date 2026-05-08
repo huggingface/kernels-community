@@ -107,7 +107,7 @@ mha_fwd(
 
     // Allocate softmax_lse output tensor: (batch_size, num_heads, seqlen_q)
     auto opts = q.options().dtype(torch::kFloat32);
-    at::Tensor softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts);
+    at::Tensor softmax_lse = torch::zeros({batch_size, num_heads, seqlen_q}, opts);
 
     const bool is_local = (window_size_left != -1) || (window_size_right != -1);
 
@@ -440,7 +440,7 @@ mha_varlen_fwd(
 
     // Allocate softmax_lse output tensor
     auto opts = q.options().dtype(torch::kFloat32);
-    at::Tensor softmax_lse = torch::empty({batch_size, num_heads, max_seqlen_q}, opts);
+    at::Tensor softmax_lse = torch::zeros({batch_size, num_heads, max_seqlen_q}, opts);
 
     auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
 

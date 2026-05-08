@@ -388,10 +388,13 @@ gemm_dQ(Trait &trait,
     Tensor tCgC = thr_mma.partition_C(gC);
     gemm_kernel<true>(trait, A, B, tCrC, mma, m_block, n_block);
     int local_id = sg.get_local_id();
+    constexpr int kHeadDim = Trait::kHeadDim;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(tCgC); ++i) {
         auto [m, n] = tCgC(i);
-        cutlass::atomicAdd(&C(m, n + local_id), tCrC(i));
+        if (n + local_id < kHeadDim) {
+            cutlass::atomicAdd(&C(m, n + local_id), tCrC(i));
+        }
     }
 }
 
@@ -596,36 +599,37 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
             gemm_SdP(trait, mVt, mdO, rdP, tiled_mma_sdp);
             Tensor dS = make_tensor(rdP.data(), scores.layout());
             
-            // Dropout backward: apply mask only to dP (gradient), keep P (scores) unchanged
-            // for softmax_backward. Then apply mask to P after softmax_backward for dV.
+            // Dropout backward: compute mask once, apply to dP first, then to P
+            // after softmax_backward. Caches mask to avoid redundant Philox RNG.
             //
             // Math: dS = scale * P * (mask * rp * dP_dropped - dpsum)
             // where P is the original softmax output, dP_dropped = dO * V^T,
             // and dpsum = sum(dO * O) with O having rp scaling from forward.
+            constexpr int kDropMaskMax = 128;
+            bool drop_keep[kDropMaskMax];
+            int drop_mask_count = 0;
+
             if (param.dropout.is_enabled) {
                 int sg_local_id = sg.get_local_id();
                 uint32_t batch_head = bidb * param.num_head_q + bidh;
                 float rp_dropout = param.dropout.get_scale();
                 
-                // Convert 3D layout to 2D for proper coordinate indexing
                 Tensor taccScS_rt_2d = make_tensor(
                     taccScS_rt.data(),
                     convert_layout_2d_layout(taccScS_rt.layout()));
                 
-                // Step 1: Apply dropout mask to dS (g_Pd -> g_P = mask * rp * g_Pd)
-                // Keep scores (P) unchanged for softmax_backward multiplier
+                // Step 1: Compute dropout mask and apply to dS
                 CUTLASS_PRAGMA_UNROLL
                 for (int ni = 0; ni < size<1>(dS); ++ni) {
-                    // get<1> is query dim (N dim of backward MMA St=Kt*Q)
                     int query_in_block = get<1>(taccScS_rt_2d(0, ni)) + sg_local_id;
                     CUTLASS_PRAGMA_UNROLL
                     for (int mi = 0; mi < size<0>(dS); ++mi) {
-                        // get<0> is key dim (M dim of backward MMA)
                         int key_in_block = get<0>(taccScS_rt_2d(mi, ni));
                         int row_idx = m_block * kBlockM + query_in_block;
                         int col_idx = n_block * kBlockN + key_in_block;
                         
                         bool keep = param.dropout.should_keep(batch_head, row_idx, col_idx);
+                        drop_keep[drop_mask_count++] = keep;
                         if (keep) {
                             dS(mi, ni) = static_cast<V>(static_cast<float>(dS(mi, ni)) * rp_dropout);
                         } else {
@@ -643,28 +647,16 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
                 softmax_backward<false>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax, tail_m);
             }
             
-            // Step 2: Apply dropout mask to P (scores) for dV computation
-            // P_dropped = mask * rp * P (or 0) for dV = P_dropped^T * dO
+            // Step 2: Apply cached dropout mask to P (scores) for dV computation
             if (param.dropout.is_enabled) {
-                int sg_local_id = sg.get_local_id();
-                uint32_t batch_head = bidb * param.num_head_q + bidh;
                 float rp_dropout = param.dropout.get_scale();
-                
-                Tensor taccScS_rt_2d = make_tensor(
-                    taccScS_rt.data(),
-                    convert_layout_2d_layout(taccScS_rt.layout()));
+                int mask_idx = 0;
                 
                 CUTLASS_PRAGMA_UNROLL
                 for (int ni = 0; ni < size<1>(scores); ++ni) {
-                    int query_in_block = get<1>(taccScS_rt_2d(0, ni)) + sg_local_id;
                     CUTLASS_PRAGMA_UNROLL
                     for (int mi = 0; mi < size<0>(scores); ++mi) {
-                        int key_in_block = get<0>(taccScS_rt_2d(mi, ni));
-                        int row_idx = m_block * kBlockM + query_in_block;
-                        int col_idx = n_block * kBlockN + key_in_block;
-                        
-                        bool keep = param.dropout.should_keep(batch_head, row_idx, col_idx);
-                        if (keep) {
+                        if (drop_keep[mask_idx++]) {
                             scores(mi, ni) = static_cast<V>(static_cast<float>(scores(mi, ni)) * rp_dropout);
                         } else {
                             scores(mi, ni) = V(0);
@@ -684,7 +676,7 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
             mha_reorder_copy(trait, tiled_mma_sdp, rdP, mdPt);
         }
         sycl::group_barrier(group);
-        
+
         // dV = P^T * dO
         gemm_dKV(trait, mPt, mdOt, rdV, tiled_mma_dkv);
         // dK = dP^T * Q
@@ -790,9 +782,6 @@ compute_o_dot_do(T &trait, BwdParam<typename T::DType> &param,
     Tensor rO_2d = make_tensor(rO.data(), rdO_2d.layout());
 
     constexpr int NumValperCol = size<0>(rdO_2d);
-    auto smem = compat::local_mem<VType[kNSGs * SubgroupSize * NumValperCol]>();
-    auto stensor = make_tensor(make_smem_ptr(smem),
-                               make_layout(Shape<Int<NumValperCol>, Int<kNSGs>, Int<SubgroupSize>>{}));
     clear(rdO_2d);
     clear(rO_2d);
     
@@ -808,7 +797,6 @@ compute_o_dot_do(T &trait, BwdParam<typename T::DType> &param,
         }
     }
     
-    int sg_group_id = sg.get_group_id();
     int sg_local_id = sg.get_local_id();
     
     CUTLASS_PRAGMA_UNROLL
@@ -818,17 +806,9 @@ compute_o_dot_do(T &trait, BwdParam<typename T::DType> &param,
         for (int ni = 0; ni < size<1>(rdO_2d); ++ni) {
             accum = accum + (float)rdO_2d(mi, ni) * (float)rO_2d(mi, ni);
         }
-        stensor(mi, sg_group_id, sg_local_id) = accum;
-    }
-    
-    if (sg_local_id == 0) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int mi = 0; mi < NumValperCol; ++mi) {
-            float accum = 0.0f;
-            CUTLASS_PRAGMA_UNROLL
-            for (int ni = 0; ni < SubgroupSize; ++ni) {
-                accum += stensor(mi, sg_group_id, ni);
-            }
+        // Use subgroup shuffle reduction instead of SLM
+        accum = sycl::reduce_over_group(sg, accum, sycl::plus<float>{});
+        if (sg_local_id == 0) {
             if constexpr(Is_even_M) {
                 mdPsum(get<0>(tcO_row(mi))) = accum;
             } else {
@@ -997,8 +977,8 @@ struct BwdKernelLauncher {
         const int M_BLOCK     = ceil_div(SEQ_LEN_Q, kBlockM);
         const int tail_m      = SEQ_LEN_Q % kBlockM;
         
-        // Allocate intermediate buffer
-        DType* pbuff = compat::malloc<DType>(BATCH * NUM_HEAD_Q * args.seqlen_k_rounded * 2 * kBlockM);
+        // Use pre-allocated intermediate buffer from caller (PyTorch caching allocator)
+        DType* pbuff = reinterpret_cast<DType*>(args.pbuff);
         
         auto param = BwdParam<DType>(
             reinterpret_cast<const DType*>(args.dout),
@@ -1049,11 +1029,11 @@ struct BwdKernelLauncher {
         compat::experimental::kernel_properties kernel_props0{
             sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>};
         compat::experimental::launch_policy policy0{dimGrid0, dimBlock0, launch_props0, kernel_props0};
-        auto event0 = compat::experimental::launch<
+        compat::experimental::launch<
             mha_dot_do_o<decltype(trait)>,
             mhaodoDeviceNameBwd<decltype(trait)>>(policy0, trait, param);
-        EventManager::getInstance().addEvent(event0);
-        compat::wait_and_throw();
+        // No explicit sync needed: in-order SYCL queue guarantees Phase 1
+        // completes before Phase 2 starts.
 
         // Phase 2: Main backward pass
         int gridDimx;
@@ -1076,11 +1056,11 @@ struct BwdKernelLauncher {
         compat::experimental::kernel_properties kernel_props1{
             sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>};
         compat::experimental::launch_policy policy1{dimGrid1, dimBlock1, launch_props1, kernel_props1};
-        auto event1 = compat::experimental::launch<
+        compat::experimental::launch<
             mha_backward_seq<decltype(trait)>,
             mhabwdDeviceNameBwd<decltype(trait)>>(policy1, trait, param);
-        EventManager::getInstance().addEvent(event1);
-        compat::wait_and_throw();
+        // No explicit sync needed: in-order SYCL queue guarantees Phase 2
+        // completes before Phase 3 starts.
 
         // Phase 3: Convert dQ from float to target type
         auto dimGrid2 = compat::dim3(size(M_BLOCK), size(param.num_head_q), size(param.batch));
@@ -1089,14 +1069,10 @@ struct BwdKernelLauncher {
         compat::experimental::kernel_properties kernel_props2{
             sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>};
         compat::experimental::launch_policy policy2{dimGrid2, dimBlock2, launch_props2, kernel_props2};
-        auto event2 = compat::experimental::launch<
+        compat::experimental::launch<
             mhd_convert_dq<decltype(trait)>,
             mhacvtDeviceNameBwd<decltype(trait)>>(policy2, trait, param);
-        EventManager::getInstance().addEvent(event2);
         compat::wait_and_throw();
-        
-        // Free intermediate buffer
-        compat::free(pbuff);
         
         return cutlass::Status::kSuccess;
     }
@@ -1145,21 +1121,25 @@ struct FMHABwdConfig {
     }
 };
 
-// bwd_policy_dispatch - similar to policy_dispatch in fmha_fwd_impl.hpp
+// Single-dtype bwd dispatch: only instantiates one dtype path per TU.
 template <typename bwd_policy, int IsCausal = -1, int IsLocal = -1>
-void bwd_policy_dispatch(sycl::queue& queue, BwdCutlassType cuType, const fmha_bwd_args_t& args) {
-    auto dispatch = [&]<typename ElemT>(ElemT) {
-        using Config = FMHABwdConfig<bwd_policy, ElemT, ElemT, ElemT, ElemT>;
-        if constexpr (IsCausal != -1 && IsLocal != -1) {
-            return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
-        } else {
-            return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
-        }
-    };
-
-    if (cuType == BwdCutlassType::half) {
-        dispatch(cute::half_t{});
+void bwd_policy_dispatch_fp16(sycl::queue& queue, const fmha_bwd_args_t& args) {
+    using Config = FMHABwdConfig<bwd_policy, cute::half_t, cute::half_t, cute::half_t, cute::half_t>;
+    if constexpr (IsCausal != -1 && IsLocal != -1) {
+        return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
     } else {
-        dispatch(cute::bfloat16_t{});
+        return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
     }
 }
+
+template <typename bwd_policy, int IsCausal = -1, int IsLocal = -1>
+void bwd_policy_dispatch_bf16(sycl::queue& queue, const fmha_bwd_args_t& args) {
+    using Config = FMHABwdConfig<bwd_policy, cute::bfloat16_t, cute::bfloat16_t, cute::bfloat16_t, cute::bfloat16_t>;
+    if constexpr (IsCausal != -1 && IsLocal != -1) {
+        return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
+    } else {
+        return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
+    }
+}
+
+// Combined bwd_policy_dispatch is now defined inline in fmha_bwd.hpp
