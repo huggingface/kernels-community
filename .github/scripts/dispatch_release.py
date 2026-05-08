@@ -14,10 +14,12 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 RELEASE_WORKFLOWS = [
@@ -44,19 +46,34 @@ def github_api_request(
     if data is not None:
         body = json.dumps(data).encode("utf-8")
 
-    # req = urllib.request.Request(
-    #     url=url,
-    #     data=body,
-    #     method=method,
-    #     headers={
-    #         "Accept": "application/vnd.github+json",
-    #         "Authorization": f"Bearer {token}",
-    #         "X-GitHub-Api-Version": "2022-11-28",
-    #         "Content-Type": "application/json",
-    #     },
-    # )
-    # with urllib.request.urlopen(req) as resp:
-    #     return resp.status, resp.read().decode("utf-8")
+    req = urllib.request.Request(
+        url=url,
+        data=body,
+        method=method,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req) as resp:
+        return resp.status, resp.read().decode("utf-8")
+
+
+def run_local(workflow: str, kernel_name: str, *, skip_build: bool = False) -> bool:
+    """Run a release workflow locally via act."""
+    cmd = [
+        "act", "workflow_dispatch",
+        "--container-options", "--privileged",
+        "-W", f".github/workflows/{workflow}",
+        "--input", f"kernel_name={kernel_name}",
+    ]
+    if skip_build:
+        cmd.extend(["--input", "skip_build=true"])
+    print(f"Running locally: {' '.join(cmd)}")
+    result = subprocess.run(cmd)
+    return result.returncode == 0
 
 
 def get_token() -> str | None:
@@ -97,14 +114,56 @@ def get_repo() -> str | None:
     return None
 
 
+BACKEND_TO_WORKFLOWS = {
+    "cuda": {"build-release.yaml", "build-release-windows.yaml"},
+    "cpu": {"build-release.yaml"},
+    "rocm": {"build-release.yaml"},
+    "metal": {"build-release-mac.yaml"},
+    "xpu": {"build-release.yaml", "build-release-windows.yaml"},
+}
+
+
+def read_backends(kernel_name: str) -> list[str] | None:
+    """Read the backends list from a kernel's build.toml. Returns None if not found."""
+    build_toml = Path(kernel_name) / "build.toml"
+    if not build_toml.exists():
+        return None
+    with open(build_toml, "rb") as f:
+        config = tomllib.load(f)
+    backends = config.get("general", {}).get("backends")
+    if backends is None:
+        backends = config.get("backends")
+    if isinstance(backends, list):
+        return backends
+    return None
+
+
 def select_workflows(kernel_name: str) -> list[str]:
     """
-    Determine which release workflows to dispatch for this kernel.
+    Determine which release workflows to dispatch based on the kernel's
+    backends declared in build.toml.
 
-    Currently returns all 3 workflows. This is the extension point for
-    future filtering logic (e.g., skip mac for CUDA-only kernels).
+    Mapping:
+      cuda, cpu, rocm -> build-release.yaml (Linux)
+      metal           -> build-release-mac.yaml (macOS)
+      xpu             -> build-release-windows.yaml (Windows)
+
+    Falls back to all workflows if build.toml can't be read.
     """
-    return list(RELEASE_WORKFLOWS)
+    backends = read_backends(kernel_name)
+    if backends is None:
+        print(f"Could not read backends for {kernel_name}, dispatching all workflows")
+        return set(RELEASE_WORKFLOWS)
+
+    workflows = set()
+    for b in backends:
+        workflows.update(BACKEND_TO_WORKFLOWS.get(b, set()))
+
+    if not workflows:
+        print(f"No known backends found for {kernel_name}: {backends}, dispatching all workflows")
+        return set(RELEASE_WORKFLOWS)
+
+    return workflows
 
 
 def dispatch_release(
@@ -114,6 +173,8 @@ def dispatch_release(
     repo: str,
     ref: str = "main",
     dispatch_key_prefix: str = "",
+    local: bool = False,
+    skip_build: bool = False,
 ) -> ReleaseDispatchResult:
     """
     Dispatch the appropriate release workflows for a kernel.
@@ -138,7 +199,7 @@ def dispatch_release(
     result = ReleaseDispatchResult(kernel_name=kernel_name)
 
     workflows = select_workflows(kernel_name)
-    skipped_workflows = set(RELEASE_WORKFLOWS) - set(workflows)
+    skipped_workflows = set(RELEASE_WORKFLOWS) - workflows
     result.skipped = sorted(skipped_workflows)
 
     api_base = f"https://api.github.com/repos/{repo}"
@@ -146,22 +207,31 @@ def dispatch_release(
         dispatch_key = (
             f"{dispatch_key_prefix}{kernel_name}-{workflow}-{uuid.uuid4().hex[:12]}"
         )
-        dispatch_url = f"{api_base}/actions/workflows/{workflow}/dispatches"
-        dispatch_body = {
-            "ref": ref,
-            "inputs": {
+        if local:
+            if run_local(workflow, kernel_name, skip_build=skip_build):
+                result.dispatched.append((workflow, dispatch_key))
+            else:
+                result.failed.append((workflow, 0))
+        else:
+            dispatch_url = f"{api_base}/actions/workflows/{workflow}/dispatches"
+            inputs = {
                 "kernel_name": kernel_name,
                 "dispatch_key": dispatch_key,
-            },
-        }
-        try:
-            print(f"Dispatching {workflow} for kernel `{kernel_name}` on ref `{ref}`")
-            github_api_request(dispatch_url, token, method="POST", data=dispatch_body)
-            result.dispatched.append((workflow, dispatch_key))
-        except urllib.error.HTTPError as e:
-            err_text = e.read().decode("utf-8", errors="replace")
-            print(f"Failed to dispatch {workflow} (HTTP {e.code}): {err_text}", file=sys.stderr)
-            result.failed.append((workflow, e.code))
+            }
+            if skip_build:
+                inputs["skip_build"] = "true"
+            dispatch_body = {
+                "ref": ref,
+                "inputs": inputs,
+            }
+            try:
+                print(f"Dispatching {workflow} for kernel `{kernel_name}` on ref `{ref}`")
+                github_api_request(dispatch_url, token, method="POST", data=dispatch_body)
+                result.dispatched.append((workflow, dispatch_key))
+            except urllib.error.HTTPError as e:
+                err_text = e.read().decode("utf-8", errors="replace")
+                print(f"Failed to dispatch {workflow} (HTTP {e.code}): {err_text}", file=sys.stderr)
+                result.failed.append((workflow, e.code))
 
     return result
 
@@ -177,30 +247,49 @@ def main() -> int:
     parser.add_argument(
         "--repo", default=None, help="GitHub repo in owner/repo format (default: auto-detect)"
     )
+    parser.add_argument(
+        "--local", action="store_true",
+        help="Run release workflows locally via act instead of dispatching remotely",
+    )
+    parser.add_argument(
+        "--skip-build", action="store_true",
+        help="Skip build and upload steps (for testing workflow plumbing)",
+    )
     args = parser.parse_args()
 
-    token = get_token()
-    if not token:
-        print(
-            "Error: No GitHub token found. Set GITHUB_TOKEN or run `gh auth login`.",
-            file=sys.stderr,
+    if args.local:
+        result = dispatch_release(
+            args.kernel_name,
+            token="",
+            repo="",
+            ref=args.ref,
+            local=True,
+            skip_build=args.skip_build,
         )
-        return 1
+    else:
+        token = get_token()
+        if not token:
+            print(
+                "Error: No GitHub token found. Set GITHUB_TOKEN or run `gh auth login`.",
+                file=sys.stderr,
+            )
+            return 1
 
-    repo = args.repo or get_repo()
-    if not repo:
-        print(
-            "Error: Cannot determine repository. Set GITHUB_REPOSITORY or use --repo.",
-            file=sys.stderr,
+        repo = args.repo or get_repo()
+        if not repo:
+            print(
+                "Error: Cannot determine repository. Set GITHUB_REPOSITORY or use --repo.",
+                file=sys.stderr,
+            )
+            return 1
+
+        result = dispatch_release(
+            args.kernel_name,
+            token=token,
+            repo=repo,
+            ref=args.ref,
+            skip_build=args.skip_build,
         )
-        return 1
-
-    result = dispatch_release(
-        args.kernel_name,
-        token=token,
-        repo=repo,
-        ref=args.ref,
-    )
 
     if result.dispatched:
         print(f"\nDispatched ({len(result.dispatched)}):")

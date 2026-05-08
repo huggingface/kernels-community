@@ -12,6 +12,11 @@ on:
         description: "Unique key for matching this run back to a bot dispatch"
         required: false
         type: string
+      skip_build:
+        description: "Skip build and upload steps (for testing workflow plumbing)"
+        required: false
+        type: boolean
+        default: false
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
@@ -45,15 +50,15 @@ jobs:
             echo "skip=true" >> $GITHUB_OUTPUT
           fi
       - name: Install Metal toolchain
-        if: steps.validate.outputs.skip == 'false'
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true
         run: xcodebuild -downloadComponent MetalToolchain
       - name: Build kernel
-        if: steps.validate.outputs.skip == 'false'
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
           ( cd "$KERNEL" && nix build -L )
       - name: Upload kernel to Hub
-        if: steps.validate.outputs.skip == 'false'
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
@@ -62,7 +67,7 @@ jobs:
           nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "kernels-community/$KERNEL"
           nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "kernels-community/$KERNEL"
       - name: Upload v1 kernels to main
-        if: steps.validate.outputs.skip == 'false'
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |

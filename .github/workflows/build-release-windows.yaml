@@ -12,6 +12,11 @@ on:
         description: "Unique key for matching this run back to a bot dispatch"
         required: false
         type: string
+      skip_build:
+        description: "Skip build and upload steps (for testing workflow plumbing)"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -103,7 +108,7 @@ jobs:
           }
 
       - name: Kernel Info
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
         shell: pwsh
         run: |
           $KERNEL = "${{ steps.validate.outputs.kernel }}"
@@ -111,7 +116,7 @@ jobs:
 
       - name: Kernel extract required builder version
         id: extract-builder-version
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
         shell: pwsh
         run: |
           $KERNEL = "${{ steps.validate.outputs.kernel }}"
@@ -121,33 +126,33 @@ jobs:
           echo "revision=$revision" >> $env:GITHUB_OUTPUT
 
       - uses: Jimver/cuda-toolkit@b6fc3a9f3f15256d9d94ffe1254f9c5a2565cde6 # v0.2.30
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'cuda'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && matrix.platform.backend == 'cuda'
         id: setup-cuda-toolkit
         with:
           cuda: ${{ matrix.platform.cuda }}
 
       - name: Setup Intel oneAPI
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'xpu' && steps.check-backend.outputs.needs_oneapi == 'true'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && matrix.platform.backend == 'xpu' && steps.check-backend.outputs.needs_oneapi == 'true'
         shell: pwsh
         run: |
           & "$env:GITHUB_WORKSPACE\.github\scripts\windows\install-oneapi.ps1" -OneApiVersion "${{ matrix.platform.oneapi }}" -OneApiUrl "${{ matrix.platform.oneapi_url }}"
 
       - name: Setup Python
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python }}
 
       - name: Install PyTorch (CUDA)
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'cuda'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && matrix.platform.backend == 'cuda'
         run: pip install torch --index-url https://download.pytorch.org/whl/cu${{ matrix.platform.wheel }}
 
       - name: Install PyTorch (XPU)
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'xpu'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && matrix.platform.backend == 'xpu'
         run: pip3 install torch==${{ matrix.platform.torch_version }} --index-url https://download.pytorch.org/whl/xpu
 
       - name: Checkout kernels
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
         id: checkout-kernels
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -156,7 +161,7 @@ jobs:
           path: kernels
 
       - name: Cache Rust build
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
@@ -168,13 +173,13 @@ jobs:
             ${{ runner.os }}-rust-debug-
 
       - name: Build kernel-builder
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
         working-directory: kernels\kernel-builder
         shell: pwsh
         run: cargo build
 
       - name: Build kernel
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
         shell: pwsh
         env:
           KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
@@ -227,7 +232,7 @@ jobs:
           Pop-Location
 
       - name: Upload kernel to Hub
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
         shell: pwsh
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -240,7 +245,7 @@ jobs:
           & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "kernels-community/$env:KERNEL_SOURCE"
 
       - name: Upload v1 kernels to main
-        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
         shell: pwsh
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}

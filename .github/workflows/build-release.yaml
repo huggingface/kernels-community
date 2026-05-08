@@ -12,6 +12,11 @@ on:
         description: "Unique key for matching this run back to a bot dispatch"
         required: false
         type: string
+      skip_build:
+        description: "Skip build and upload steps (for testing workflow plumbing)"
+        required: false
+        type: boolean
+        default: false
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
@@ -60,7 +65,7 @@ jobs:
 
   build-kernel:
     needs: setup
-    if: needs.setup.outputs.skip == 'false'
+    if: needs.setup.outputs.skip == 'false' && inputs.skip_build != true
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
