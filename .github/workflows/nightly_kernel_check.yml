@@ -26,4 +26,5 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          python scripts/report_kernel_failures.py --verbose --clear-cache
+          # Pass webhook URL via stdin to avoid exposure in process listings and logs
+          echo "$SLACK_WEBHOOK_URL" | python scripts/report_kernel_failures.py --verbose --clear-cache --webhook-stdin
