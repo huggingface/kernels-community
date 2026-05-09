@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cmath>
-#include <cstdio>
 #include <cuda.h>
 #include "../../utils/torch_compat.hpp"
 
@@ -65,13 +64,7 @@ static std::string to_string(const at::ScalarType& dtype) {
 
 static std::string to_string(const float& v) {
     if (std::isfinite(v)) {
-        char buffer[32];
-        std::snprintf(buffer, sizeof(buffer), "%.9g", v);
-        std::string literal = buffer;
-        if (literal.find_first_of(".eE") == std::string::npos)
-            literal += ".0";
-        literal += "f";
-        return literal;
+        return fmt::format(R"({:a}f)", v);
     } else if (std::isinf(v)) {
         return v > 0 ? "cute::numeric_limits<float>::infinity()"
                      : "-cute::numeric_limits<float>::infinity()";
