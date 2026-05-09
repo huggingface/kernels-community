@@ -1,17 +1,3 @@
-/***************************************************************************************************
- * Copyright (C) 2025 Intel Corporation, All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
- *
- * Xe2 (BMG / Arc Pro B60) FMHA forward dispatch. Builds the full
- * mainloop+epilogue+kernel for a given tile policy and feature combination,
- * and launches it.
- *
- * The PVC path has been removed; only the Xe2 fork is built. Each per-head
- * translation unit instantiates the (Causal x Local x Dropout) cases for a
- * single (IsVarLen, IsPaged) combination, controlled by the IsVarLen / IsPaged
- * template arguments to policy_dispatch.
- **************************************************************************************************/
-
 #pragma once
 
 #include "fmha_fwd_types.hpp"
