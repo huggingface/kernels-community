@@ -592,29 +592,19 @@ mha_fwd_kvcache(
         CHECK_DEVICE(seqlens_k);
     }
 
-    // Handle rotary embedding (pre-process in-place before kernel)
-    if (rotary_cos_.has_value()) {
+    at::Tensor rotary_cos, rotary_sin;
+    int rotary_dim = 0;
+    const bool has_rotary = rotary_cos_.has_value();
+    if (has_rotary) {
         TORCH_CHECK(k_.has_value(), "If rotary cos/sin are provided, new key/value must also be provided");
-        auto rotary_cos = rotary_cos_.value();
-        auto rotary_sin = rotary_sin_.value();
+        TORCH_CHECK(rotary_sin_.has_value(), "If rotary cos is provided, rotary sin must also be provided");
+        rotary_cos = ensure_contiguous(rotary_cos_.value());
+        rotary_sin = ensure_contiguous(rotary_sin_.value());
         CHECK_DEVICE(rotary_cos); CHECK_DEVICE(rotary_sin);
-        int rotary_dim = rotary_cos.size(1) * 2;
+        rotary_dim = rotary_cos.size(1) * 2;
         TORCH_CHECK(rotary_dim <= head_size_og, "rotary_dim must be <= headdim");
         TORCH_CHECK(rotary_dim % 16 == 0, "Only rotary dimensions divisible by 16 are currently supported");
         TORCH_CHECK(rotary_cos.scalar_type() == q_dtype && rotary_sin.scalar_type() == q_dtype);
-
-        std::optional<at::Tensor> seqlen_offsets_opt;
-        if (seqlens_k_.has_value()) { seqlen_offsets_opt = seqlens_k; }
-
-        bool is_local = (window_size_left >= 0);
-        if (is_causal || is_local) {
-            apply_rotary_emb_inplace(q_padded, rotary_cos, rotary_sin, seqlen_offsets_opt, is_rotary_interleaved);
-        } else {
-            auto q_shape = q_padded.sizes();
-            auto q_reshaped = q_padded.view({q_shape[0], 1, q_shape[1] * q_shape[2], q_shape[3]});
-            apply_rotary_emb_inplace(q_reshaped, rotary_cos, rotary_sin, seqlen_offsets_opt, is_rotary_interleaved);
-        }
-        apply_rotary_emb_inplace(k_padded, rotary_cos, rotary_sin, seqlen_offsets_opt, is_rotary_interleaved);
     }
 
     at::Tensor cache_batch_idx;
@@ -638,21 +628,30 @@ mha_fwd_kvcache(
     //   - Always prefer kernel-fused scatter (passes knew/vnew to the kernel,
     //     which writes them in-place during the prologue).  This avoids any
     //     host sync and works for both contiguous and paged caches.
-    //   - Fall back to API-layer scatter only when fusion is impossible:
-    //       * needs_padding: the cache pad is a separate buffer, so the
-    //         in-kernel writer would write to the padded copy, not the user
-    //         tensor; do the scatter on the user tensor and re-pad.
-    //       * rotary_cos: the rotary application happened on the padded
-    //         buffer; we need to slice off the padding before scattering to
-    //         the user cache. (Kernel-fused scatter copies the padded buffer
-    //         instead, which is wrong.)
+    //   - Fall back to API-layer scatter only when padding is needed: the
+    //     padded cache is a separate buffer, so the in-kernel writer would
+    //     not update the user tensor.
     bool fuse_knew = k_.has_value() && seqlen_new > 0
-                     && !needs_padding && !rotary_cos_.has_value();
+                     && !needs_padding;
+    if (has_rotary && !fuse_knew) {
+        std::optional<at::Tensor> seqlen_offsets_opt;
+        if (seqlens_k_.has_value()) { seqlen_offsets_opt = seqlens_k; }
+
+        bool is_local = (window_size_left >= 0);
+        if (is_causal || is_local) {
+            apply_rotary_emb_inplace(q_padded, rotary_cos, rotary_sin, seqlen_offsets_opt, is_rotary_interleaved);
+        } else {
+            auto q_shape = q_padded.sizes();
+            auto q_reshaped = q_padded.view({q_shape[0], 1, q_shape[1] * q_shape[2], q_shape[3]});
+            apply_rotary_emb_inplace(q_reshaped, rotary_cos, rotary_sin, seqlen_offsets_opt, is_rotary_interleaved);
+        }
+        apply_rotary_emb_inplace(k_padded, rotary_cos, rotary_sin, seqlen_offsets_opt, is_rotary_interleaved);
+    }
     if (k_.has_value() && seqlen_new > 0 && !fuse_knew) {
         auto seqlens_cpu = seqlens_k.to(torch::kCPU);
         auto seqlens_accessor = seqlens_cpu.accessor<int32_t, 1>();
 
-        at::Tensor k_for_cache = rotary_cos_.has_value()
+        at::Tensor k_for_cache = has_rotary
             ? k_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
                               torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)}).contiguous()
             : ensure_contiguous(k_.value());
@@ -722,13 +721,20 @@ mha_fwd_kvcache(
         block_table_opt = block_table;
     }
 
+    std::optional<at::Tensor> rotary_cos_opt, rotary_sin_opt;
+    if (fuse_knew && has_rotary) {
+        rotary_cos_opt = rotary_cos;
+        rotary_sin_opt = rotary_sin;
+    }
+
     cutlass_fmha_fwd_kvcache_impl(
         queue,
         q_padded, kcache_padded, vcache_padded,
         out, softmax_lse,
         seqlens_k, cache_batch_idx_opt, leftpad_k_opt,
         knew_opt, vnew_opt,
-        block_table_opt, seqlen_k,
+        block_table_opt, rotary_cos_opt, rotary_sin_opt,
+        fuse_knew ? rotary_dim : 0, is_rotary_interleaved, seqlen_k,
         softmax_scale, window_size_left, window_size_right,
         is_causal, is_local);
 

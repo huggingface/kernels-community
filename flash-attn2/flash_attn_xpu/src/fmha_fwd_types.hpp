@@ -55,6 +55,12 @@ struct fmha_fwd_args_t {
   int64_t vnew_batch_stride = 0;
   int64_t vnew_head_stride = 0;
   int64_t vnew_row_stride = 0;
+
+  // Fused rotary embedding for kvcache append and Q load
+  void* rotary_cos = nullptr;
+  void* rotary_sin = nullptr;
+  int rotary_dim = 0;
+  bool is_rotary_interleaved = true;
 };
 
 enum class CutlassType {

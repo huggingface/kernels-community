@@ -72,7 +72,8 @@ struct FMHAConfig {
       bool Local,
       bool Dropout,
       bool Paged,
-      bool VarLen>
+      bool VarLen,
+      bool HasRotary>
   static void run_xe2(sycl::queue& queue, const fmha_fwd_args_t& args) {
     cutlass::KernelHardwareInfo hw_info;
 
@@ -118,7 +119,8 @@ struct FMHAConfig {
         TensorV,
         GmemTiledCopyQ,
         GmemTiledCopyK,
-        GmemTiledCopyV>;
+        GmemTiledCopyV,
+        HasRotary>;
 
     using CollectiveEpilogue = cutlass::fmha::collective::FMHAFwdEpilogueXe2<
         CollectiveMainloop,
@@ -213,7 +215,11 @@ struct FMHAConfig {
          static_cast<int*>(args.block_table),
          args.block_size,
          args.max_blocks_per_seq,
-         args.total_seqlen_k},
+         args.total_seqlen_k,
+         reinterpret_cast<const ElementQ*>(args.rotary_cos),
+         reinterpret_cast<const ElementQ*>(args.rotary_sin),
+         args.rotary_dim,
+         args.is_rotary_interleaved},
         {},
         hw_info};
 
@@ -249,6 +255,7 @@ struct FMHAConfig {
   template <
       int IsVarLen,
       int IsPaged,
+      bool HasRotary = false,
       class Scheduler = cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>
   static void
   xe2_dispatch(sycl::queue& queue, const fmha_fwd_args_t& args) {
@@ -262,7 +269,7 @@ struct FMHAConfig {
     bool has_dropout = args.p_dropout > 0.0f;
 #define XE2_CASE(C, L, D)                                                      \
   if (args.is_causal == C && args.is_local == L && has_dropout == D) {         \
-    run_xe2<Scheduler, C, L, D, kPaged, kVarLen>(queue, args);                 \
+        run_xe2<Scheduler, C, L, D, kPaged, kVarLen, HasRotary>(queue, args);      \
     return;                                                                    \
   }
     XE2_CASE(false, false, false)
@@ -279,7 +286,8 @@ struct FMHAConfig {
 
 // Single-dtype dispatch: only instantiates one dtype path per TU to reduce
 // per-file IGC memory usage from ~40 GB to ~20 GB.
-template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged>
+template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged,
+          bool HasRotary = false>
 void policy_dispatch_fp16(sycl::queue& queue, const fmha_fwd_args_t& args) {
   using Config = FMHAConfig<
       typename chunk_policy::ShapeQK,
@@ -289,10 +297,11 @@ void policy_dispatch_fp16(sycl::queue& queue, const fmha_fwd_args_t& args) {
       void,
       PipelineStages,
       half_t, half_t, half_t, half_t>;
-  Config::template xe2_dispatch<IsVarLen, IsPaged>(queue, args);
+    Config::template xe2_dispatch<IsVarLen, IsPaged, HasRotary>(queue, args);
 }
 
-template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged>
+template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged,
+                    bool HasRotary = false>
 void policy_dispatch_bf16(sycl::queue& queue, const fmha_fwd_args_t& args) {
   using Config = FMHAConfig<
       typename chunk_policy::ShapeQK,
@@ -302,7 +311,7 @@ void policy_dispatch_bf16(sycl::queue& queue, const fmha_fwd_args_t& args) {
       void,
       PipelineStages,
       bfloat16_t, bfloat16_t, bfloat16_t, bfloat16_t>;
-  Config::template xe2_dispatch<IsVarLen, IsPaged>(queue, args);
+    Config::template xe2_dispatch<IsVarLen, IsPaged, HasRotary>(queue, args);
 }
 
 // Combined policy_dispatch is now defined inline in fmha_fwd.hpp

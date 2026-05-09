@@ -55,6 +55,19 @@ void dispatch_varlen_decode_paged(sycl::queue& queue, CutlassType cuType,
   }
 }
 
+template <typename Policy, int PipelineStages, int IsPaged>
+void dispatch_kvcache_policy(sycl::queue& queue, CutlassType cuType,
+                             const fmha_fwd_args_t& args,
+                             bool has_rotary) {
+  if (has_rotary) {
+    policy_dispatch<Policy, PipelineStages, /*IsVarLen=*/0, IsPaged,
+                    /*HasRotary=*/true>(queue, cuType, args);
+  } else {
+    policy_dispatch<Policy, PipelineStages, /*IsVarLen=*/0, IsPaged,
+                    /*HasRotary=*/false>(queue, cuType, args);
+  }
+}
+
 /// Dispatch forward kernel by head_size for the varlen prefill path.
 /// Supported head dimensions are bucketed to the corresponding prefill policies.
 void dispatch_fwd_varlen_by_head(sycl::queue& queue, CutlassType cuType,
@@ -115,15 +128,16 @@ void dispatch_fwd_prefill_by_head(sycl::queue& queue, CutlassType cuType,
 /// Dispatch forward kernel by head_size for the kvcache prefill paged path
 /// (non-varlen, seqlen_q > 1, IsPaged=1).
 void dispatch_fwd_kvcache_prefill_paged_by_head(sycl::queue& queue, CutlassType cuType,
-                                                const fmha_fwd_args_t& args, int head_size) {
-  if      (head_size <=  32) policy_dispatch<prefill_policy_head32,  PipelineStages_Prefill, 0, 1>(queue, cuType, args);
-  else if (head_size <=  64) policy_dispatch<prefill_policy_head64,  PipelineStages_Prefill, 0, 1>(queue, cuType, args);
-  else if (head_size <=  96) policy_dispatch<prefill_policy_head96,  PipelineStages_Prefill, 0, 1>(queue, cuType, args);
-  else if (head_size <= 128) policy_dispatch<prefill_policy_head128, PipelineStages_Prefill, 0, 1>(queue, cuType, args);
-  else if (head_size <= 160) policy_dispatch<prefill_policy_head160, PipelineStages_Prefill, 0, 1>(queue, cuType, args);
-  else if (head_size <= 192) policy_dispatch<prefill_policy_head192, PipelineStages_Prefill, 0, 1>(queue, cuType, args);
-  else if (head_size <= 256) policy_dispatch<prefill_policy_head256, PipelineStages_Prefill, 0, 1>(queue, cuType, args);
-  else if (head_size == 512) policy_dispatch<prefill_policy_head512, PipelineStages_Prefill, 0, 1>(queue, cuType, args);
+                                                const fmha_fwd_args_t& args, int head_size,
+                                                bool has_rotary) {
+  if      (head_size <=  32) dispatch_kvcache_policy<prefill_policy_head32,  PipelineStages_Prefill, 1>(queue, cuType, args, has_rotary);
+  else if (head_size <=  64) dispatch_kvcache_policy<prefill_policy_head64,  PipelineStages_Prefill, 1>(queue, cuType, args, has_rotary);
+  else if (head_size <=  96) dispatch_kvcache_policy<prefill_policy_head96,  PipelineStages_Prefill, 1>(queue, cuType, args, has_rotary);
+  else if (head_size <= 128) dispatch_kvcache_policy<prefill_policy_head128, PipelineStages_Prefill, 1>(queue, cuType, args, has_rotary);
+  else if (head_size <= 160) dispatch_kvcache_policy<prefill_policy_head160, PipelineStages_Prefill, 1>(queue, cuType, args, has_rotary);
+  else if (head_size <= 192) dispatch_kvcache_policy<prefill_policy_head192, PipelineStages_Prefill, 1>(queue, cuType, args, has_rotary);
+  else if (head_size <= 256) dispatch_kvcache_policy<prefill_policy_head256, PipelineStages_Prefill, 1>(queue, cuType, args, has_rotary);
+  else if (head_size == 512) dispatch_kvcache_policy<prefill_policy_head512, PipelineStages_Prefill, 1>(queue, cuType, args, has_rotary);
   else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");
 }
 
@@ -131,15 +145,44 @@ void dispatch_fwd_kvcache_prefill_paged_by_head(sycl::queue& queue, CutlassType 
 /// (non-varlen, seqlen_q == 1, IsPaged=1). Uses decode_paged_policy with a
 /// smaller K-tile so block_size=64 multiples don't overshoot a page.
 void dispatch_fwd_kvcache_decode_paged_by_head(sycl::queue& queue, CutlassType cuType,
-                                               const fmha_fwd_args_t& args, int head_size) {
-  if      (head_size <=  32) policy_dispatch<decode_paged_policy_head32,  PipelineStages_Decode, 0, 1>(queue, cuType, args);
-  else if (head_size <=  64) policy_dispatch<decode_paged_policy_head64,  PipelineStages_Decode, 0, 1>(queue, cuType, args);
-  else if (head_size <=  96) policy_dispatch<decode_paged_policy_head96,  PipelineStages_Decode, 0, 1>(queue, cuType, args);
-  else if (head_size <= 128) policy_dispatch<decode_paged_policy_head128, PipelineStages_Decode, 0, 1>(queue, cuType, args);
-  else if (head_size <= 160) policy_dispatch<decode_paged_policy_head160, PipelineStages_Decode, 0, 1>(queue, cuType, args);
-  else if (head_size <= 192) policy_dispatch<decode_paged_policy_head192, PipelineStages_Decode, 0, 1>(queue, cuType, args);
-  else if (head_size <= 256) policy_dispatch<decode_paged_policy_head256, PipelineStages_Decode, 0, 1>(queue, cuType, args);
-  else if (head_size == 512) policy_dispatch<decode_paged_policy_head512, PipelineStages_Decode, 0, 1>(queue, cuType, args);
+                                               const fmha_fwd_args_t& args, int head_size,
+                                               bool has_rotary) {
+  if      (head_size <=  32) dispatch_kvcache_policy<decode_paged_policy_head32,  PipelineStages_Decode, 1>(queue, cuType, args, has_rotary);
+  else if (head_size <=  64) dispatch_kvcache_policy<decode_paged_policy_head64,  PipelineStages_Decode, 1>(queue, cuType, args, has_rotary);
+  else if (head_size <=  96) dispatch_kvcache_policy<decode_paged_policy_head96,  PipelineStages_Decode, 1>(queue, cuType, args, has_rotary);
+  else if (head_size <= 128) dispatch_kvcache_policy<decode_paged_policy_head128, PipelineStages_Decode, 1>(queue, cuType, args, has_rotary);
+  else if (head_size <= 160) dispatch_kvcache_policy<decode_paged_policy_head160, PipelineStages_Decode, 1>(queue, cuType, args, has_rotary);
+  else if (head_size <= 192) dispatch_kvcache_policy<decode_paged_policy_head192, PipelineStages_Decode, 1>(queue, cuType, args, has_rotary);
+  else if (head_size <= 256) dispatch_kvcache_policy<decode_paged_policy_head256, PipelineStages_Decode, 1>(queue, cuType, args, has_rotary);
+  else if (head_size == 512) dispatch_kvcache_policy<decode_paged_policy_head512, PipelineStages_Decode, 1>(queue, cuType, args, has_rotary);
+  else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");
+}
+
+void dispatch_fwd_kvcache_decode_by_head(sycl::queue& queue, CutlassType cuType,
+                                         const fmha_fwd_args_t& args, int head_size,
+                                         bool has_rotary) {
+  if      (head_size <=  32) dispatch_kvcache_policy<decode_policy_head32,  PipelineStages_Decode, 0>(queue, cuType, args, has_rotary);
+  else if (head_size <=  64) dispatch_kvcache_policy<decode_policy_head64,  PipelineStages_Decode, 0>(queue, cuType, args, has_rotary);
+  else if (head_size <=  96) dispatch_kvcache_policy<decode_policy_head96,  PipelineStages_Decode, 0>(queue, cuType, args, has_rotary);
+  else if (head_size <= 128) dispatch_kvcache_policy<decode_policy_head128, PipelineStages_Decode, 0>(queue, cuType, args, has_rotary);
+  else if (head_size <= 160) dispatch_kvcache_policy<decode_policy_head160, PipelineStages_Decode, 0>(queue, cuType, args, has_rotary);
+  else if (head_size <= 192) dispatch_kvcache_policy<decode_policy_head192, PipelineStages_Decode, 0>(queue, cuType, args, has_rotary);
+  else if (head_size <= 256) dispatch_kvcache_policy<decode_policy_head256, PipelineStages_Decode, 0>(queue, cuType, args, has_rotary);
+  else if (head_size == 512) dispatch_kvcache_policy<decode_policy_head512, PipelineStages_Decode, 0>(queue, cuType, args, has_rotary);
+  else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");
+}
+
+void dispatch_fwd_kvcache_prefill_by_head(sycl::queue& queue, CutlassType cuType,
+                                          const fmha_fwd_args_t& args, int head_size,
+                                          bool has_rotary) {
+  if      (head_size <=  32) dispatch_kvcache_policy<prefill_policy_head32,  PipelineStages_Prefill, 0>(queue, cuType, args, has_rotary);
+  else if (head_size <=  64) dispatch_kvcache_policy<prefill_policy_head64,  PipelineStages_Prefill, 0>(queue, cuType, args, has_rotary);
+  else if (head_size <=  96) dispatch_kvcache_policy<prefill_policy_head96,  PipelineStages_Prefill, 0>(queue, cuType, args, has_rotary);
+  else if (head_size <= 128) dispatch_kvcache_policy<prefill_policy_head128, PipelineStages_Prefill, 0>(queue, cuType, args, has_rotary);
+  else if (head_size <= 160) dispatch_kvcache_policy<prefill_policy_head160, PipelineStages_Prefill, 0>(queue, cuType, args, has_rotary);
+  else if (head_size <= 192) dispatch_kvcache_policy<prefill_policy_head192, PipelineStages_Prefill, 0>(queue, cuType, args, has_rotary);
+  else if (head_size <= 256) dispatch_kvcache_policy<prefill_policy_head256, PipelineStages_Prefill, 0>(queue, cuType, args, has_rotary);
+  else if (head_size == 512) dispatch_kvcache_policy<prefill_policy_head512, PipelineStages_Prefill, 0>(queue, cuType, args, has_rotary);
   else throw std::runtime_error("Unsupported head_size: " + std::to_string(head_size) + ". Only <= 256 or exactly 512 is supported");
 }
 
@@ -351,6 +394,10 @@ void cutlass_fmha_fwd_kvcache_impl(
     const std::optional<at::Tensor>& knew,
     const std::optional<at::Tensor>& vnew,
     const std::optional<at::Tensor>& block_table,
+    const std::optional<at::Tensor>& rotary_cos,
+    const std::optional<at::Tensor>& rotary_sin,
+    int rotary_dim,
+    bool is_rotary_interleaved,
     int max_seqlen_k_paged,
     float sm_scale,
     int window_size_left,
@@ -436,10 +483,16 @@ void cutlass_fmha_fwd_kvcache_impl(
       knew.has_value() ? knew->stride(1) : 0,
       vnew.has_value() ? vnew->stride(0) : 0,
       vnew.has_value() ? vnew->stride(2) : 0,
-      vnew.has_value() ? vnew->stride(1) : 0};
+      vnew.has_value() ? vnew->stride(1) : 0,
+      rotary_cos.has_value() ? rotary_cos->data_ptr() : nullptr,
+      rotary_sin.has_value() ? rotary_sin->data_ptr() : nullptr,
+      rotary_dim,
+      is_rotary_interleaved};
 
   const CutlassType cuType = aten_to_Cutlass_dtype(query);
   const int h = args.head_size;
+  const bool has_rotary = args.rotary_dim > 0 && args.rotary_cos != nullptr &&
+                          args.rotary_sin != nullptr;
 
   if (is_paged) {
     // Paged dispatch requires the K-tile to evenly divide block_size,
@@ -454,15 +507,15 @@ void cutlass_fmha_fwd_kvcache_impl(
                 "Paged KV block_size must be a multiple of the kernel K tile. "
                 "Got block_size=", block_size, ", K tile=", k_tile_n);
     if (max_seqlen_q == 1) {
-      dispatch_fwd_kvcache_decode_paged_by_head(queue, cuType, args, h);
+      dispatch_fwd_kvcache_decode_paged_by_head(queue, cuType, args, h, has_rotary);
     } else {
-      dispatch_fwd_kvcache_prefill_paged_by_head(queue, cuType, args, h);
+      dispatch_fwd_kvcache_prefill_paged_by_head(queue, cuType, args, h, has_rotary);
     }
   } else {
     if (max_seqlen_q == 1) {
-      dispatch_fwd_decode_by_head(queue, cuType, args, h);
+      dispatch_fwd_kvcache_decode_by_head(queue, cuType, args, h, has_rotary);
     } else {
-      dispatch_fwd_prefill_by_head(queue, cuType, args, h);
+      dispatch_fwd_kvcache_prefill_by_head(queue, cuType, args, h, has_rotary);
     }
   }
 }

@@ -18,3 +18,32 @@ template void policy_dispatch_bf16<
     0, 1>(
     sycl::queue& queue,
     const fmha_fwd_args_t& args);
+
+// Rotary kvcache variants keep rotary code out of non-rotary kernels.
+template void policy_dispatch_bf16<
+    prefill_policy_head256,
+    PipelineStages_Prefill,
+    0, 0, true>(
+    sycl::queue& queue,
+    const fmha_fwd_args_t& args);
+
+template void policy_dispatch_bf16<
+    decode_policy_head256,
+    PipelineStages_Decode,
+    0, 0, true>(
+    sycl::queue& queue,
+    const fmha_fwd_args_t& args);
+
+template void policy_dispatch_bf16<
+    prefill_policy_head256,
+    PipelineStages_Prefill,
+    0, 1, true>(
+    sycl::queue& queue,
+    const fmha_fwd_args_t& args);
+
+template void policy_dispatch_bf16<
+    decode_paged_policy_head256,
+    PipelineStages_Decode,
+    0, 1, true>(
+    sycl::queue& queue,
+    const fmha_fwd_args_t& args);

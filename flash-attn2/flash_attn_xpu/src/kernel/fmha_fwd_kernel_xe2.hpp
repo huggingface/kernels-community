@@ -233,9 +233,9 @@ class XeFMHAFwdKernelXe2 {
       // - non-paged path: bidx selects the per-batch KV slice
       int bidx = (!PagedKV && p.cache_batch_idx) ? p.cache_batch_idx[idx_b] : idx_b;
       if (p.cache_seqlens) {
-        int orig_cache_seqlens = p.cache_seqlens[bidx];
+        int orig_cache_seqlens = p.cache_seqlens[idx_b];
         if (p.cache_leftpad) {
-          leftpad_k = p.cache_leftpad[bidx];
+          leftpad_k = p.cache_leftpad[idx_b];
         }
 
         // Fused cache update: copy knew/vnew into kcache/vcache
@@ -275,7 +275,24 @@ class XeFMHAFwdKernelXe2 {
                   + head * p.v_head_stride
                   + static_cast<int64_t>(page_off) * p.v_row_stride;
               for (int d = thr_id; d < s.head_size_qk; d += num_threads) {
-                k_dst[d] = k_src[si * p.knew_row_stride + d];
+                auto k_value = k_src[si * p.knew_row_stride + d];
+                if constexpr (CollectiveMainloop::HasRotary) {
+                  if (params.mainloop.rotary.rotary_dim > 0 &&
+                      params.mainloop.rotary.rotary_cos != nullptr &&
+                      params.mainloop.rotary.rotary_sin != nullptr &&
+                      d < params.mainloop.rotary.rotary_dim) {
+                    int pair_dim = cutlass::fmha::collective::rotary_pair_dim(
+                        d, params.mainloop.rotary.rotary_dim,
+                        params.mainloop.rotary.is_rotary_interleaved);
+                    k_value = cutlass::fmha::collective::apply_rotary_scalar(
+                        k_value, k_src[si * p.knew_row_stride + pair_dim],
+                        params.mainloop.rotary.rotary_cos,
+                        params.mainloop.rotary.rotary_sin,
+                        global_pos, d, params.mainloop.rotary.rotary_dim,
+                        params.mainloop.rotary.is_rotary_interleaved);
+                  }
+                }
+                k_dst[d] = k_value;
               }
               for (int d = thr_id; d < s.head_size_vo; d += num_threads) {
                 v_dst[d] = v_src[si * p.vnew_row_stride + d];
@@ -290,7 +307,25 @@ class XeFMHAFwdKernelXe2 {
                 + static_cast<int64_t>(orig_cache_seqlens) * p.v_row_stride;
             for (int si = 0; si < p.seqlen_knew; si++) {
               for (int d = thr_id; d < s.head_size_qk; d += num_threads) {
-                k_dst[si * p.k_row_stride + d] = k_src[si * p.knew_row_stride + d];
+                auto k_value = k_src[si * p.knew_row_stride + d];
+                if constexpr (CollectiveMainloop::HasRotary) {
+                  if (params.mainloop.rotary.rotary_dim > 0 &&
+                      params.mainloop.rotary.rotary_cos != nullptr &&
+                      params.mainloop.rotary.rotary_sin != nullptr &&
+                      d < params.mainloop.rotary.rotary_dim) {
+                    int pair_dim = cutlass::fmha::collective::rotary_pair_dim(
+                        d, params.mainloop.rotary.rotary_dim,
+                        params.mainloop.rotary.is_rotary_interleaved);
+                    k_value = cutlass::fmha::collective::apply_rotary_scalar(
+                        k_value, k_src[si * p.knew_row_stride + pair_dim],
+                        params.mainloop.rotary.rotary_cos,
+                        params.mainloop.rotary.rotary_sin,
+                        orig_cache_seqlens + si, d,
+                        params.mainloop.rotary.rotary_dim,
+                        params.mainloop.rotary.is_rotary_interleaved);
+                  }
+                }
+                k_dst[si * p.k_row_stride + d] = k_value;
               }
             }
             for (int si = 0; si < p.seqlen_knew; si++) {
@@ -462,7 +497,9 @@ class XeFMHAFwdKernelXe2 {
           tile_row_idx,
           rows_of_maxima,
           head_q,
-          s.num_heads_q);
+          s.num_heads_q,
+          q_offset_sg,
+          p.cache_seqlens ? p.cache_seqlens[idx_b] : 0);
 
       if constexpr (
           !is_empty_v<MainloopSharedStorage> &&

@@ -44,27 +44,30 @@ struct decode_paged_policy_head256;
 struct decode_paged_policy_head512;
 
 // Dtype-specific dispatch functions (instantiated in per-head TUs)
-template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged>
+template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged,
+      bool HasRotary = false>
 void policy_dispatch_fp16(
     sycl::queue& queue,
     const fmha_fwd_args_t& args);
 
-template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged>
+template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged,
+      bool HasRotary = false>
 void policy_dispatch_bf16(
     sycl::queue& queue,
     const fmha_fwd_args_t& args);
 
 // Combined dispatch (delegates to fp16/bf16 based on cuType)
 // Defined inline in header so callers (fmha_fwd.cpp) can see the template body.
-template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged>
+template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged,
+          bool HasRotary = false>
 inline void policy_dispatch(
     sycl::queue& queue,
     CutlassType cuType,
     const fmha_fwd_args_t& args) {
   if (cuType == CutlassType::half) {
-    policy_dispatch_fp16<chunk_policy, PipelineStages, IsVarLen, IsPaged>(queue, args);
+    policy_dispatch_fp16<chunk_policy, PipelineStages, IsVarLen, IsPaged, HasRotary>(queue, args);
   } else {
-    policy_dispatch_bf16<chunk_policy, PipelineStages, IsVarLen, IsPaged>(queue, args);
+    policy_dispatch_bf16<chunk_policy, PipelineStages, IsVarLen, IsPaged, HasRotary>(queue, args);
   }
 }
 
@@ -189,6 +192,10 @@ void cutlass_fmha_fwd_kvcache_impl(
     const std::optional<at::Tensor>& knew,
     const std::optional<at::Tensor>& vnew,
     const std::optional<at::Tensor>& block_table,
+    const std::optional<at::Tensor>& rotary_cos,
+    const std::optional<at::Tensor>& rotary_sin,
+    int rotary_dim,
+    bool is_rotary_interleaved,
     int max_seqlen_k_paged,
     float sm_scale,
     int window_size_left,

@@ -113,6 +113,35 @@ template void policy_dispatch_${dtype}<
     0, 1>(
     sycl::queue& queue,
     const fmha_fwd_args_t& args);
+
+// Rotary kvcache variants keep rotary code out of non-rotary kernels.
+template void policy_dispatch_${dtype}<
+  prefill_policy_head${hdim},
+  PipelineStages_Prefill,
+  0, 0, true>(
+  sycl::queue& queue,
+  const fmha_fwd_args_t& args);
+
+template void policy_dispatch_${dtype}<
+  decode_policy_head${hdim},
+  PipelineStages_Decode,
+  0, 0, true>(
+  sycl::queue& queue,
+  const fmha_fwd_args_t& args);
+
+template void policy_dispatch_${dtype}<
+  prefill_policy_head${hdim},
+  PipelineStages_Prefill,
+  0, 1, true>(
+  sycl::queue& queue,
+  const fmha_fwd_args_t& args);
+
+template void policy_dispatch_${dtype}<
+  decode_paged_policy_head${hdim},
+  PipelineStages_Decode,
+  0, 1, true>(
+  sycl::queue& queue,
+  const fmha_fwd_args_t& args);
 ENDFILE
     echo "  Created flash_fwd_hdim${hdim}_kvcache_paged_${dtype}.cpp"
   done

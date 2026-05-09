@@ -47,7 +47,8 @@ template <
     class TensorV_,
     class TiledCopyQ_ = void,
     class TiledCopyK_ = void,
-    class TiledCopyV_ = void>
+    class TiledCopyV_ = void,
+    bool HasRotary_ = false>
 struct FMHAFwdMainloopXe2 {
   static_assert(
       cutlass::detail::dependent_false<DispatchPolicy_>,
@@ -70,7 +71,8 @@ template <
     class TensorV_,
     class TiledCopyQ_,
     class TiledCopyK_,
-    class TiledCopyV_>
+    class TiledCopyV_,
+    bool HasRotary_>
 struct FMHAFwdMainloopXe2<
     Xe2<Stages>,
     CausalMask_,
@@ -85,7 +87,8 @@ struct FMHAFwdMainloopXe2<
     TensorV_,
     TiledCopyQ_,
     TiledCopyK_,
-    TiledCopyV_> {
+    TiledCopyV_,
+    HasRotary_> {
 
   // Pull in common type aliases from the shared traits.
   using Traits = FMHAFwdMainloopTraits<
@@ -123,6 +126,7 @@ struct FMHAFwdMainloopXe2<
   static constexpr bool LocalMask  = LocalMask_;
   static constexpr bool HasDropout = HasDropout_;
   static constexpr bool PagedKV   = PagedKV_;
+  static constexpr bool HasRotary = HasRotary_;
 
   // User-facing arguments
   struct Arguments {
@@ -142,6 +146,10 @@ struct FMHAFwdMainloopXe2<
     int page_size = 0;
     int max_pages_per_seq = 0;
     int total_seqlen_kv = 0;
+    const typename TensorQ::element_type* rotary_cos = nullptr;
+    const typename TensorQ::element_type* rotary_sin = nullptr;
+    int rotary_dim = 0;
+    bool is_rotary_interleaved = true;
   };
 
   struct LocalMaskFields {
@@ -165,6 +173,14 @@ struct FMHAFwdMainloopXe2<
   };
   struct EmptyPaged {};
 
+  struct RotaryFields {
+    const typename TensorQ::element_type* rotary_cos = nullptr;
+    const typename TensorQ::element_type* rotary_sin = nullptr;
+    int rotary_dim = 0;
+    bool is_rotary_interleaved = true;
+  };
+  struct EmptyRotary {};
+
   // Kernel-facing parameters
   struct Params {
     ElementS scale;
@@ -174,6 +190,8 @@ struct FMHAFwdMainloopXe2<
         dropout_fields;
     [[no_unique_address]] conditional_t<PagedKV, PagedKVFields, EmptyPaged>
         paged;
+    [[no_unique_address]] conditional_t<HasRotary, RotaryFields, EmptyRotary>
+      rotary;
   };
 
   // SLM data
@@ -209,6 +227,10 @@ struct FMHAFwdMainloopXe2<
       p.paged = {args.ptr_page_table, args.page_size,
                  args.max_pages_per_seq, args.total_seqlen_kv};
     }
+    if constexpr (HasRotary) {
+      p.rotary = {args.rotary_cos, args.rotary_sin,
+                  args.rotary_dim, args.is_rotary_interleaved};
+    }
     return p;
   }
 
@@ -236,7 +258,9 @@ struct FMHAFwdMainloopXe2<
       int& tile_row_idx,
       const int& rows_of_maxima,
       int head_q,
-      int num_heads) {
+      int num_heads,
+      int q_offset_sg,
+      int rotary_base) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     auto tile_shape_v =
@@ -387,6 +411,38 @@ struct FMHAFwdMainloopXe2<
       CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < size<4>(tKgK); D++) {
         copy(copy_q, tQgQ(_, _, _, D), tQrQ);
+        if constexpr (HasRotary) {
+          if (params.rotary.rotary_dim > 0 &&
+              params.rotary.rotary_cos != nullptr &&
+              params.rotary.rotary_sin != nullptr) {
+            auto tQrQ_coords = tQrQ.tv_layout();
+            int lane_id = static_cast<int>(get_sub_group().get_local_linear_id());
+            int q_tile_base = get<0>(blk_qv) * get<0>(TileShapeQK{}) + q_offset_sg;
+            int dim_tile_base = D * get<2>(TileShapeQK{});
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tQrQ.size(); ++i) {
+              auto value_coord = idx2crd(
+                  i, make_shape(
+                         get<1>(shape(tQrQ_coords)),
+                         get<2>(shape(tQrQ_coords))));
+              auto coord = tQrQ_coords(
+                  make_coord(lane_id, get<0>(value_coord), get<1>(value_coord)));
+              int row = q_tile_base + get<0>(coord);
+              int dim = dim_tile_base + get<1>(coord);
+                if (row < seq_len_qo && dim < params.rotary.rotary_dim) {
+                int pair_dim = rotary_pair_dim(
+                  dim, params.rotary.rotary_dim,
+                  params.rotary.is_rotary_interleaved);
+                int position = rotary_base + ((CausalMask || LocalMask) ? row : 0);
+                tQrQ(i) = apply_rotary_scalar(
+                  tQrQ(i), Q_2D(row, pair_dim), params.rotary.rotary_cos,
+                  params.rotary.rotary_sin, position, dim,
+                  params.rotary.rotary_dim,
+                  params.rotary.is_rotary_interleaved);
+              }
+            }
+          }
+        }
         copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
