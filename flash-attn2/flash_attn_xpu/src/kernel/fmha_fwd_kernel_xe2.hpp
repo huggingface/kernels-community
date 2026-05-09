@@ -284,12 +284,14 @@ class XeFMHAFwdKernelXe2 {
                     int pair_dim = cutlass::fmha::collective::rotary_pair_dim(
                         d, params.mainloop.rotary.rotary_dim,
                         params.mainloop.rotary.is_rotary_interleaved);
-                    k_value = cutlass::fmha::collective::apply_rotary_scalar(
-                        k_value, k_src[si * p.knew_row_stride + pair_dim],
-                        params.mainloop.rotary.rotary_cos,
-                        params.mainloop.rotary.rotary_sin,
-                        global_pos, d, params.mainloop.rotary.rotary_dim,
-                        params.mainloop.rotary.is_rotary_interleaved);
+                    if (pair_dim < s.head_size_qk) {
+                      k_value = cutlass::fmha::collective::apply_rotary_scalar(
+                          k_value, k_src[si * p.knew_row_stride + pair_dim],
+                          params.mainloop.rotary.rotary_cos,
+                          params.mainloop.rotary.rotary_sin,
+                          global_pos, d, params.mainloop.rotary.rotary_dim,
+                          params.mainloop.rotary.is_rotary_interleaved);
+                    }
                   }
                 }
                 k_dst[d] = k_value;
@@ -316,13 +318,15 @@ class XeFMHAFwdKernelXe2 {
                     int pair_dim = cutlass::fmha::collective::rotary_pair_dim(
                         d, params.mainloop.rotary.rotary_dim,
                         params.mainloop.rotary.is_rotary_interleaved);
-                    k_value = cutlass::fmha::collective::apply_rotary_scalar(
-                        k_value, k_src[si * p.knew_row_stride + pair_dim],
-                        params.mainloop.rotary.rotary_cos,
-                        params.mainloop.rotary.rotary_sin,
-                        orig_cache_seqlens + si, d,
-                        params.mainloop.rotary.rotary_dim,
-                        params.mainloop.rotary.is_rotary_interleaved);
+                    if (pair_dim < s.head_size_qk) {
+                      k_value = cutlass::fmha::collective::apply_rotary_scalar(
+                          k_value, k_src[si * p.knew_row_stride + pair_dim],
+                          params.mainloop.rotary.rotary_cos,
+                          params.mainloop.rotary.rotary_sin,
+                          orig_cache_seqlens + si, d,
+                          params.mainloop.rotary.rotary_dim,
+                          params.mainloop.rotary.is_rotary_interleaved);
+                    }
                   }
                 }
                 k_dst[si * p.k_row_stride + d] = k_value;

@@ -469,8 +469,6 @@ mha_varlen_fwd(
     return {out, softmax_lse, S_dmask, rng_state};
   }
 
-#include "src/rotary.hpp"
-
 std::vector<at::Tensor>
 mha_fwd_kvcache(
         at::Tensor &q,
@@ -622,77 +620,7 @@ mha_fwd_kvcache(
         TORCH_CHECK(leftpad_k.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
     }
 
-    // Write new K/V to cache.
-    //
-    // Strategy:
-    //   - Always prefer kernel-fused scatter (passes knew/vnew to the kernel,
-    //     which writes them in-place during the prologue).  This avoids any
-    //     host sync and works for both contiguous and paged caches.
-    //   - Fall back to API-layer scatter only when padding is needed: the
-    //     padded cache is a separate buffer, so the in-kernel writer would
-    //     not update the user tensor.
-    bool fuse_knew = k_.has_value() && seqlen_new > 0
-                     && !needs_padding;
-    if (has_rotary && !fuse_knew) {
-        std::optional<at::Tensor> seqlen_offsets_opt;
-        if (seqlens_k_.has_value()) { seqlen_offsets_opt = seqlens_k; }
-
-        bool is_local = (window_size_left >= 0);
-        if (is_causal || is_local) {
-            apply_rotary_emb_inplace(q_padded, rotary_cos, rotary_sin, seqlen_offsets_opt, is_rotary_interleaved);
-        } else {
-            auto q_shape = q_padded.sizes();
-            auto q_reshaped = q_padded.view({q_shape[0], 1, q_shape[1] * q_shape[2], q_shape[3]});
-            apply_rotary_emb_inplace(q_reshaped, rotary_cos, rotary_sin, seqlen_offsets_opt, is_rotary_interleaved);
-        }
-        apply_rotary_emb_inplace(k_padded, rotary_cos, rotary_sin, seqlen_offsets_opt, is_rotary_interleaved);
-    }
-    if (k_.has_value() && seqlen_new > 0 && !fuse_knew) {
-        auto seqlens_cpu = seqlens_k.to(torch::kCPU);
-        auto seqlens_accessor = seqlens_cpu.accessor<int32_t, 1>();
-
-        at::Tensor k_for_cache = has_rotary
-            ? k_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
-                              torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)}).contiguous()
-            : ensure_contiguous(k_.value());
-        at::Tensor v_for_cache = ensure_contiguous(v_.value());
-
-        at::Tensor kc = ensure_contiguous(kcache);
-        at::Tensor vc = ensure_contiguous(vcache);
-
-        if (paged_KV) {
-            auto bt_cpu = block_table.to(torch::kCPU);
-            auto bt_acc = bt_cpu.accessor<int32_t, 2>();
-            for (int b = 0; b < batch_size; b++) {
-                int cache_seqlen = seqlens_accessor[b];
-                for (int s = 0; s < seqlen_new; s++) {
-                    int global_pos = cache_seqlen + s;
-                    int page_idx = global_pos / page_block_size;
-                    int page_offset = global_pos % page_block_size;
-                    int block_idx = bt_acc[b][page_idx];
-                    kc.index({block_idx, page_offset}) = k_for_cache.index({b, s});
-                    vc.index({block_idx, page_offset}) = v_for_cache.index({b, s});
-                }
-            }
-        } else {
-            for (int b = 0; b < batch_size; b++) {
-                int cache_b = cache_batch_idx_.has_value()
-                    ? cache_batch_idx.index({b}).item<int32_t>() : b;
-                int cache_seqlen = seqlens_accessor[b];
-                int write_start = cache_seqlen;
-                TORCH_CHECK(write_start + seqlen_new <= seqlen_k,
-                            "Cache overflow: cache_seqlen + seqlen_new > cache capacity");
-                kc.index({cache_b, torch::indexing::Slice(write_start, write_start + seqlen_new)}) =
-                    k_for_cache.index({b});
-                vc.index({cache_b, torch::indexing::Slice(write_start, write_start + seqlen_new)}) =
-                    v_for_cache.index({b});
-            }
-        }
-
-        kcache_padded = maybe_pad(kc);
-        vcache_padded = maybe_pad(vc);
-        seqlens_k = seqlens_k + seqlen_new;
-    }
+    bool fuse_knew = k_.has_value() && seqlen_new > 0;
 
     // Dispatch to kernel.  Paged caches are now passed natively (block_table
     // routed straight through to the kernel, no host gather).
@@ -748,6 +676,13 @@ mha_fwd_kvcache(
                          torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)})
                  .contiguous();
         if (out_.has_value()) { out_.value().copy_(out); }
+        if (fuse_knew) {
+            // The fused kernel updates the padded cache buffer; publish valid dims back to the user cache.
+            kcache.copy_(kcache_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                                              torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)}));
+            vcache.copy_(vcache_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                                              torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)}));
+        }
     }
 
     return {out, softmax_lse};
