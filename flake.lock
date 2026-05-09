@@ -2,11 +2,11 @@
   "nodes": {
     "flake-compat": {
       "locked": {
-        "lastModified": 1761588595,
-        "narHash": "sha256-XKUZz9zewJNUj46b4AJdiRZJAvSZ0Dqj2BNfXvFlJC4=",
+        "lastModified": 1767039857,
+        "narHash": "sha256-vNpUSpF5Nuw8xvDLj2KCwwksIbjua2LZCqhV1LNRDns=",
         "owner": "edolstra",
         "repo": "flake-compat",
-        "rev": "f387cd2afec9419c8ee37694406ca490c3f34ee5",
+        "rev": "5edf11c44bc78a0d334f6334cdaf7d60d732daab",
         "type": "github"
       },
       "original": {
@@ -51,37 +51,38 @@
         "type": "github"
       }
     },
-    "hf-nix": {
+    "kernels": {
       "inputs": {
         "flake-compat": "flake-compat",
         "flake-utils": "flake-utils_2",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1763454682,
-        "narHash": "sha256-XJuN1/aO8ZTfI959EIcb07nePS78MtDDwe+BTCu4PM4=",
+        "lastModified": 1778133282,
+        "narHash": "sha256-Qf5zaO7pnqsAiArT6uytQxYhVDJl1Hq3YF6oWCsRcJY=",
         "owner": "huggingface",
-        "repo": "hf-nix",
-        "rev": "dacf34fa85ad80d437d3a51fe95ea3637344208e",
+        "repo": "kernels",
+        "rev": "9cc776021f73e3f4236144b387a7cd8967ca5c97",
         "type": "github"
       },
       "original": {
         "owner": "huggingface",
-        "repo": "hf-nix",
+        "repo": "kernels",
         "type": "github"
       }
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1763291491,
-        "narHash": "sha256-eEYvm+45PPmy+Qe+nZDpn1uhoMUjJwx3PwVVQoO9ksA=",
-        "owner": "nixos",
+        "lastModified": 1776927958,
+        "narHash": "sha256-XOzEtft7E0P6TgQViLUOQeGHlEYiQ0+FY24BPEksj6s=",
+        "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "c543a59edf25ada193719764f3bc0c6ba835f94d",
+        "rev": "fec2c46cca5bf9767486a290abae51200b656d69",
         "type": "github"
       },
       "original": {
-        "owner": "nixos",
+        "owner": "NixOS",
         "ref": "nixos-unstable-small",
         "repo": "nixpkgs",
         "type": "github"
@@ -90,11 +91,32 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
-        "hf-nix": "hf-nix",
+        "kernels": "kernels",
         "nixpkgs": [
-          "hf-nix",
+          "kernels",
           "nixpkgs"
         ]
+      }
+    },
+    "rust-overlay": {
+      "inputs": {
+        "nixpkgs": [
+          "kernels",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1776914043,
+        "narHash": "sha256-qug5r56yW1qOsjSI99l3Jm15JNT9CvS2otkXNRNtrPI=",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "rev": "2d35c4358d7de3a0e606a6e8b27925d981c01cc3",
+        "type": "github"
+      },
+      "original": {
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "type": "github"
       }
     },
     "systems": {

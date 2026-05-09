@@ -36,7 +36,7 @@ jobs:
 
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Validate kernel directory
         id: validate
         shell: pwsh
@@ -128,7 +128,7 @@ jobs:
           Write-Output "Building Kernel with revision: $revision"
           echo "revision=$revision" >> $env:GITHUB_OUTPUT
 
-      - uses: Jimver/cuda-toolkit@v0.2.30
+      - uses: Jimver/cuda-toolkit@b6fc3a9f3f15256d9d94ffe1254f9c5a2565cde6 # v0.2.30
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && matrix.platform.backend == 'cuda'
         id: setup-cuda-toolkit
         with:
@@ -142,7 +142,7 @@ jobs:
 
       - name: Setup Python
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python }}
 
@@ -157,7 +157,7 @@ jobs:
       - name: Checkout kernels
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
         id: checkout-kernels
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: huggingface/kernels
           ref: "${{ steps.extract-builder-version.outputs.revision }}"
@@ -165,7 +165,7 @@ jobs:
 
       - name: Cache Rust build
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true'
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             kernels/kernel-builder/target

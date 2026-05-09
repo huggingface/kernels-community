@@ -45,7 +45,7 @@ jobs:
 
       - name: Checkout selected branch
         if: ${{ inputs.pr_number == '' }}
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
 
@@ -66,12 +66,12 @@ jobs:
 
       - name: Checkout PR branch
         if: ${{ inputs.pr_number != '' }}
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: refs/pull/${{ steps.validate-pr-number.outputs.pr_number }}/head
           fetch-depth: 0
 
-      - uses: DeterminateSystems/nix-installer-action@v21
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
           extra-conf: |
             max-jobs = 2
@@ -81,7 +81,7 @@ jobs:
       - name: Nix info
         run: nix-shell -p nix-info --run "nix-info -m"
 
-      - uses: cachix/cachix-action@v16
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
         with:
           name: huggingface
         env:

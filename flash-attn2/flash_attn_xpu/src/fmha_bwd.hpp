@@ -22,94 +22,51 @@ struct bwd_policy_head192;
 struct bwd_policy_head256;
 struct bwd_policy_head512;
 
-// Template declarations for different head dimensions
-// IsCausal: 0 = non-causal, 1 = causal
-// IsLocal: 0 = non-local, 1 = local (sliding window)
+// Dtype-specific bwd dispatch functions (instantiated in per-head TUs)
 template <typename bwd_policy, int IsCausal = -1, int IsLocal = -1>
-void bwd_policy_dispatch(
+void bwd_policy_dispatch_fp16(
     sycl::queue& queue,
-    BwdCutlassType cuType,
     const fmha_bwd_args_t& args);
 
-// Extern template declarations for head32 (causal x local combinations)
-extern template void bwd_policy_dispatch<bwd_policy_head32, 0, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head32, 0, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head32, 1, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head32, 1, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
+template <typename bwd_policy, int IsCausal = -1, int IsLocal = -1>
+void bwd_policy_dispatch_bf16(
+    sycl::queue& queue,
+    const fmha_bwd_args_t& args);
 
-// Extern template declarations for head64 (causal x local combinations)
-extern template void bwd_policy_dispatch<bwd_policy_head64, 0, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head64, 0, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head64, 1, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head64, 1, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
+// Combined bwd dispatch (delegates to fp16/bf16 based on cuType)
+// Defined inline in header so callers (fmha_bwd.cpp) can see the template body.
+template <typename bwd_policy, int IsCausal = -1, int IsLocal = -1>
+inline void bwd_policy_dispatch(
+    sycl::queue& queue,
+    BwdCutlassType cuType,
+    const fmha_bwd_args_t& args) {
+  if (cuType == BwdCutlassType::half) {
+    bwd_policy_dispatch_fp16<bwd_policy, IsCausal, IsLocal>(queue, args);
+  } else {
+    bwd_policy_dispatch_bf16<bwd_policy, IsCausal, IsLocal>(queue, args);
+  }
+}
 
-// Extern template declarations for head96
-extern template void bwd_policy_dispatch<bwd_policy_head96, 0, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head96, 0, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head96, 1, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head96, 1, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
+// Extern template declarations for all head dimensions (dtype-split)
+#define EXTERN_BWD_DISPATCH(HDIM) \
+  extern template void bwd_policy_dispatch_fp16<bwd_policy_head##HDIM, 0, 0>(sycl::queue&, const fmha_bwd_args_t&); \
+  extern template void bwd_policy_dispatch_fp16<bwd_policy_head##HDIM, 0, 1>(sycl::queue&, const fmha_bwd_args_t&); \
+  extern template void bwd_policy_dispatch_fp16<bwd_policy_head##HDIM, 1, 0>(sycl::queue&, const fmha_bwd_args_t&); \
+  extern template void bwd_policy_dispatch_fp16<bwd_policy_head##HDIM, 1, 1>(sycl::queue&, const fmha_bwd_args_t&); \
+  extern template void bwd_policy_dispatch_bf16<bwd_policy_head##HDIM, 0, 0>(sycl::queue&, const fmha_bwd_args_t&); \
+  extern template void bwd_policy_dispatch_bf16<bwd_policy_head##HDIM, 0, 1>(sycl::queue&, const fmha_bwd_args_t&); \
+  extern template void bwd_policy_dispatch_bf16<bwd_policy_head##HDIM, 1, 0>(sycl::queue&, const fmha_bwd_args_t&); \
+  extern template void bwd_policy_dispatch_bf16<bwd_policy_head##HDIM, 1, 1>(sycl::queue&, const fmha_bwd_args_t&);
 
-// Extern template declarations for head128
-extern template void bwd_policy_dispatch<bwd_policy_head128, 0, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head128, 0, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head128, 1, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head128, 1, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-
-// Extern template declarations for head160
-extern template void bwd_policy_dispatch<bwd_policy_head160, 0, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head160, 0, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head160, 1, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head160, 1, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-
-// Extern template declarations for head192
-extern template void bwd_policy_dispatch<bwd_policy_head192, 0, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head192, 0, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head192, 1, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head192, 1, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-
-// Extern template declarations for head256
-extern template void bwd_policy_dispatch<bwd_policy_head256, 0, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head256, 0, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head256, 1, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head256, 1, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-
-// Extern template declarations for head512
-extern template void bwd_policy_dispatch<bwd_policy_head512, 0, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head512, 0, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head512, 1, 0>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
-extern template void bwd_policy_dispatch<bwd_policy_head512, 1, 1>(
-    sycl::queue&, BwdCutlassType, const fmha_bwd_args_t&);
+EXTERN_BWD_DISPATCH(32)
+EXTERN_BWD_DISPATCH(64)
+EXTERN_BWD_DISPATCH(96)
+EXTERN_BWD_DISPATCH(128)
+EXTERN_BWD_DISPATCH(160)
+EXTERN_BWD_DISPATCH(192)
+EXTERN_BWD_DISPATCH(256)
+EXTERN_BWD_DISPATCH(512)
+#undef EXTERN_BWD_DISPATCH
 
 /**
  * Main backward pass implementation for fixed-length sequences

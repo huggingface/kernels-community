@@ -8,31 +8,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-kernel:
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64-linux
-            runner: aws-highmemory-32-plus-nix
-          - arch: aarch64-linux
-            runner: aws-r8g-8xl-plus-nix
+  setup:
+    runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.validate.outputs.skip }}
-      ci-test-path: ${{ steps.export-closure.outputs.ci-test-path }}
-    runs-on:
-      group: ${{ matrix.runner }}
-    timeout-minutes: 600 # 10h
+      kernel: ${{ steps.validate.outputs.kernel }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
           extra-conf: |
             max-jobs = 2
-            cores = 12
+            cores = 4
             sandbox-fallback = false
-      - name: Nix info
-        run: nix-shell -p nix-info --run "nix-info -m"
-      - uses: cachix/cachix-action@v16
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
         with:
           name: huggingface
         env:
@@ -48,7 +38,7 @@ jobs:
           else
             echo "skip=true" >> $GITHUB_OUTPUT
           fi
-      - name: "Check that repo-id is present"
+      - name: Check that repo-id is present
         if: steps.validate.outputs.skip == 'false'
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
@@ -56,44 +46,100 @@ jobs:
             echo "Mandatory repo-id is missing in $KERNEL/build.toml"
             exit 1
           fi
-      - name: Build kernel
+      - name: Generate build matrix
         if: steps.validate.outputs.skip == 'false'
+        id: matrix
+        env:
+          KERNEL: ${{ steps.validate.outputs.kernel }}
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
-          ( cd "$KERNEL" && nix build -L .#ci && ls -l result/ )
+          X86_BACKENDS=$(cd "$KERNEL" && nix eval .#backendCi --apply builtins.attrNames --json --system x86_64-linux)
+          ARM_BACKENDS=$(cd "$KERNEL" && nix eval .#backendCi --apply builtins.attrNames --json --system aarch64-linux)
+          MATRIX=$(python3 .github/workflows/generate-build-matrix.py "$X86_BACKENDS" "$ARM_BACKENDS")
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+  build-kernel:
+    needs: setup
+    if: needs.setup.outputs.skip == 'false'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    runs-on:
+      group: ${{ matrix.runner }}
+    timeout-minutes: 600 # 10h
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = ${{ matrix.max_jobs }}
+            cores = ${{ matrix.cores }}
+            sandbox-fallback = false
+      - name: Nix info
+        run: nix-shell -p nix-info --run "nix-info -m"
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
+      - name: Build kernel
+        run: |
+          KERNEL="${{ needs.setup.outputs.kernel }}"
+          ( cd "$KERNEL" && nix build -L .#backendCi.${{ matrix.backend }} && ls -l result/ )
+
+  build-ci-test:
+    needs: setup
+    if: needs.setup.outputs.skip == 'false'
+    runs-on:
+      group: aws-highmemory-32-plus-nix
+    timeout-minutes: 600 # 10h
+    outputs:
+      ci-test-path: ${{ steps.export-closure.outputs.ci-test-path }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 12
+            sandbox-fallback = false
+      - name: Nix info
+        run: nix-shell -p nix-info --run "nix-info -m"
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
       - name: Build ci-test
-        if: steps.validate.outputs.skip == 'false' && matrix.arch == 'x86_64-linux'
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
+          KERNEL="${{ needs.setup.outputs.kernel }}"
           ( cd "$KERNEL" && nix build -L .#ci-test )
       - name: Export ci-test closure
-        if: steps.validate.outputs.skip == 'false' && matrix.arch == 'x86_64-linux'
         id: export-closure
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
+          KERNEL="${{ needs.setup.outputs.kernel }}"
           CI_TEST_PATH=$(readlink -f "$KERNEL/result")
           echo "ci-test-path=$CI_TEST_PATH" >> $GITHUB_OUTPUT
           nix-store --export $(nix-store -qR "$CI_TEST_PATH") | nix run nixpkgs#zstd -- -T0 > ci-test-closure.nar.zst
       - name: Upload ci-test closure
-        if: steps.validate.outputs.skip == 'false' && matrix.arch == 'x86_64-linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ci-test-closure
           path: ci-test-closure.nar.zst
           retention-days: 1
 
   test-kernel-gpu:
-    needs: build-kernel
-    if: needs.build-kernel.outputs.skip == 'false'
+    needs: [setup, build-kernel, build-ci-test]
+    if: needs.setup.outputs.skip == 'false'
     runs-on:
       group: aws-g6-12xlarge-plus
     steps:
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
           extra-conf: |
             max-jobs = 2
             cores = 12
-      - uses: cachix/cachix-action@v16
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
         with:
           name: huggingface
         env:
@@ -106,7 +152,7 @@ jobs:
             -exec ln -s {} /run/opengl-driver/lib/ \;
           find /run/opengl-driver
       - name: Download ci-test closure
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ci-test-closure
       - name: Import ci-test closure
@@ -114,5 +160,5 @@ jobs:
           nix run nixpkgs#zstd -- -d ci-test-closure.nar.zst -c | nix-store --import
       - name: Run GPU tests
         run: |
-          CI_TEST_PATH="${{ needs.build-kernel.outputs.ci-test-path }}"
+          CI_TEST_PATH="${{ needs.build-ci-test.outputs.ci-test-path }}"
           "$CI_TEST_PATH/bin/ci-test"

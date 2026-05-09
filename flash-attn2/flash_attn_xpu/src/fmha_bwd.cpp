@@ -112,6 +112,14 @@ void cutlass_fmha_bwd_fix_impl(
         dq_accum_split_stride = batch_size * seqlen_q_rounded * num_heads_q * head_size;
     }
 
+    // Pre-allocate intermediate buffer using PyTorch caching allocator
+    // (avoids expensive compat::malloc/free per backward call).
+    // All backward policies use kBlockM=64. TODO hard code
+    constexpr int kBlockM_bwd = 64;
+    at::Tensor pbuff_tensor = at::empty(
+        {batch_size * num_heads_q * seqlen_k_rounded * 2 * kBlockM_bwd},
+        q.options());
+
     // Build args structure
     fmha_bwd_args_t args = {
         dout.data_ptr(),
@@ -144,7 +152,8 @@ void cutlass_fmha_bwd_fix_impl(
         window_size_right,
         p_dropout,
         philox_seed,
-        philox_offset
+        philox_offset,
+        pbuff_tensor.data_ptr()
     };
 
     const BwdCutlassType cuType = aten_to_Bwd_Cutlass_dtype(q);
