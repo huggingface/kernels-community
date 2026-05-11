@@ -126,7 +126,8 @@ jobs:
             `pull_request_target` or that make trusted jobs run untrusted PR code. Verify all
             third-party actions are SHA-pinned (full 40-char SHA), not version-tagged. Flag any
             workflow that hands `secrets.HF_TOKEN`, `secrets.ANTHROPIC_API_KEY`,
-            `secrets.SLACK_WEBHOOK_URL_SECURITY*`, or Cachix signing keys to PR-triggered code paths.
+            `secrets.SLACK_WEBHOOK_URL*` (including `SLACK_WEBHOOK_URL` and `SLACK_WEBHOOK_URL_SECURITY`),
+            or Cachix signing keys to PR-triggered code paths.
           - **Hub upload pipeline (`manual-build-upload.yaml`, release workflows):** Anything
             that widens what gets uploaded, that uploads to a `repo-id` not declared in the
             kernel's `build.toml`, or that uses elevated tokens in steps that also execute
