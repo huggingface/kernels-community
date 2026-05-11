@@ -80,9 +80,9 @@ jobs:
             (timing, cache, shared-memory residue) that could leak tensor contents. Watch for
             kernels whose math doesn't match their name (e.g. a "relu" kernel that also writes
             to a second buffer).
-          - **Python torch-ext code:** `torch-ext/**/__init__.py`, `_ops.py`, and any helper
+          - **Python torch-ext code:** `torch-ext/**/__init__.py` and any helper
             Python modules run inside the user's interpreter the moment the kernel is loaded.
-            Flag any of: network calls (`urllib`, `requests`, `socket`, `http.client`),
+            Flag any of: network calls (`urllib`, `requests`, `socket`, `http.client`, etc.),
             filesystem writes outside obvious cache/log paths, `subprocess`/`os.system`/`os.exec*`,
             `eval`/`exec`/`compile` of dynamic strings, `ctypes.CDLL`/`cffi` loading of
             arbitrary paths, `importlib` with attacker-controllable module names, base64/hex
@@ -110,8 +110,7 @@ jobs:
             for security-relevant packages (CUDA toolchain, glibc, OpenSSL, PyTorch) are also
             high-impact.
           - **Embedded download URLs and fetch-at-build-time:** `curl`/`wget`/`fetchurl`/
-            `fetchTarball`/`fetchGit` calls with unpinned refs, URLs in `setup.py`, `pyproject.toml`,
-            CMake `ExternalProject_Add`, or shell snippets in `build.toml`/`flake.nix`. Anything
+            `fetchTarball`/`fetchGit` calls with unpinned refs or shell snippets in `build.toml`/`flake.nix`. Anything
             that pulls bytes from the network at build or import time without a SHA pin is a
             supply-chain risk.
           - **Test and benchmark scripts:** `tests/` and `benchmarks/` run on CI GPU runners
@@ -127,7 +126,7 @@ jobs:
             `pull_request_target` or that make trusted jobs run untrusted PR code. Verify all
             third-party actions are SHA-pinned (full 40-char SHA), not version-tagged. Flag any
             workflow that hands `secrets.HF_TOKEN`, `secrets.ANTHROPIC_API_KEY`,
-            `secrets.SLACK_WEBHOOK_URL*`, or Cachix signing keys to PR-triggered code paths.
+            `secrets.SLACK_WEBHOOK_URL_SECURITY*`, or Cachix signing keys to PR-triggered code paths.
           - **Hub upload pipeline (`manual-build-upload.yaml`, release workflows):** Anything
             that widens what gets uploaded, that uploads to a `repo-id` not declared in the
             kernel's `build.toml`, or that uses elevated tokens in steps that also execute
