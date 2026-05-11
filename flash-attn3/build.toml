@@ -5,7 +5,7 @@ version = 1
 backends = ["cuda"]
 
 [general.cuda]
-minver = "12.8"
+minver = "12.6"
 # ptxas fails on 13.2, but the 13.0 build is backwards compatible.
 maxver = "13.0"
 
