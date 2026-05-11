@@ -83,7 +83,7 @@ jobs:
           - **Python torch-ext code:** `torch-ext/**/__init__.py` and any helper
             Python modules run inside the user's interpreter the moment the kernel is loaded.
             Flag any of: network calls (`urllib`, `requests`, `socket`, `http.client`, etc.),
-            filesystem writes outside obvious cache/log paths, `subprocess`/`os.system`/`os.exec*`,
+            filesystem writes, spawning of other processes (e.g. `subprocess`/`os.system`/`os.exec*`),
             `eval`/`exec`/`compile` of dynamic strings, `ctypes.CDLL`/`cffi` loading of
             arbitrary paths, `importlib` with attacker-controllable module names, base64/hex
             blobs decoded then executed, environment variable reads that change control flow in
