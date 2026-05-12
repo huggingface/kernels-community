@@ -21,7 +21,7 @@ jobs:
           node-version: "20"
 
       - name: Install Claude Code
-        run: npm install -g @anthropic-ai/claude-code
+        run: npm install -g @anthropic-ai/claude-code@2.1.139
 
       - name: Generate diff
         run: git diff ${{ github.event.before || github.event.pull_request.base.sha }}...${{ github.sha }} > /tmp/changes.diff
