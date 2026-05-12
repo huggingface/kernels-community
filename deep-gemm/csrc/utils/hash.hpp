@@ -25,17 +25,11 @@ static std::string get_hex_digest(const std::vector<char>& data) {
         return z ^ (z >> 31);
     };
 
-    static constexpr char kHex[] = "0123456789abcdef";
-    std::string out(32, '0');
-    const uint64_t states[] = {split_mix(state_0), split_mix(state_1)};
-    for (size_t state_idx = 0; state_idx < 2; ++ state_idx) {
-        auto value = states[state_idx];
-        for (int nibble = 15; nibble >= 0; -- nibble) {
-            out[state_idx * 16 + static_cast<size_t>(nibble)] = kHex[value & 0x0f];
-            value >>= 4;
-        }
-    }
-    return out;
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0')
+        << std::setw(16) << split_mix(state_0)
+        << std::setw(16) << split_mix(state_1);
+    return oss.str();
 }
 
 static std::string get_hex_digest(const std::string& data) {

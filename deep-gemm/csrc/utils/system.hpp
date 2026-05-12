@@ -88,20 +88,13 @@ static std::string get_uuid() {
     }());
     static std::uniform_int_distribution<uint32_t> dist;
 
-    static constexpr char kHex[] = "0123456789abcdef";
-    const auto append_hex_u32 = [](std::string& out, uint32_t value) {
-        for (int nibble = 7; nibble >= 0; -- nibble) {
-            out += kHex[(value >> (nibble * 4)) & 0x0f];
-        }
-    };
-
-    std::string uuid = std::to_string(getpid()) + "-";
-    append_hex_u32(uuid, dist(gen));
-    uuid += "-";
-    append_hex_u32(uuid, dist(gen));
-    uuid += "-";
-    append_hex_u32(uuid, dist(gen));
-    return uuid;
+    std::stringstream ss;
+    ss << getpid() << "-"
+       << std::hex << std::setfill('0')
+       << std::setw(8) << dist(gen) << "-"
+       << std::setw(8) << dist(gen) << "-"
+       << std::setw(8) << dist(gen);
+    return ss.str();
 }
 
 static void safe_remove_all(const std::filesystem::path& path) {
