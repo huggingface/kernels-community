@@ -439,10 +439,28 @@ constexpr int round_up(int x, int m) {
     return (x + m - 1) / m * m;
 }
 
+template<class T, int kBlockM, int kBlockN, bool VarLen>
+CUTLASS_DEVICE BwdParam<T, VarLen>
+resolve_varlen_batch(BwdParam<T, VarLen> param, const int bidb) {
+    if constexpr (VarLen) {
+        const int q_start = param.cu_seqlens_q[bidb];
+        const int q_end = param.cu_seqlens_q[bidb + 1];
+        const int k_start = param.cu_seqlens_k[bidb];
+        const int k_end = param.cu_seqlens_k[bidb + 1];
+        param.seq_len_q = q_end - q_start;
+        param.seq_len_kv = k_end - k_start;
+        param.m_block = ceil_div(param.seq_len_q, kBlockM);
+        param.n_block = ceil_div(param.seq_len_kv, kBlockN);
+        param.tail_m = param.seq_len_q % kBlockM;
+        param.tail_n = param.seq_len_kv % kBlockN;
+    }
+    return param;
+}
+
 // Main 1-col-block backward computation
 template<bool Is_even_N, bool Seq_parallel, class Trait>
 void
-dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
+dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType, Trait::is_varlen> &param,
                    const int bidb, const int bidh, const int bidhkv, const int n_block,
                    const int tail_n = 0) {
     using T = typename Trait::DType;
@@ -460,7 +478,7 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
     auto group = compat::get_nd_item<1>().get_group();
     const int local_id = sg.get_local_id();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
-    auto bofst = BwdOffset(param);
+    auto bofst = BwdOffset<typename Trait::DType, Trait::is_varlen>(param);
 
     const index_t q_offset = bofst.q_offset(bidb, bidh, 0);
     const index_t k_offset = bofst.k_offset(bidb, bidhkv, n_block * kBlockN);
@@ -698,7 +716,7 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
 // Compute O * dO (dot product)
 template<bool Is_even_M, class T>
 void
-compute_o_dot_do(T &trait, BwdParam<typename T::DType> &param,
+compute_o_dot_do(T &trait, BwdParam<typename T::DType, T::is_varlen> &param,
                  const int m_block, const int bidb, const int bidh) {
     constexpr int kBlockM = T::kBlockM;
     constexpr int kHeadDim = T::kHeadDim;
@@ -710,7 +728,7 @@ compute_o_dot_do(T &trait, BwdParam<typename T::DType> &param,
     auto sg = compat::get_nd_item<1>().get_sub_group();
     auto group = compat::get_nd_item<1>().get_group();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
-    auto bofst = BwdOffset(param);
+    auto bofst = BwdOffset<typename T::DType, T::is_varlen>(param);
 
     const index_t o_offset = bofst.o_offset(bidb, bidh, m_block * kBlockM);
     const index_t dqaccum_offset = bofst.dqaccum_offset(bidb, bidh, m_block * kBlockM);
@@ -820,7 +838,7 @@ compute_o_dot_do(T &trait, BwdParam<typename T::DType> &param,
 // Convert dQ from float accumulator to target type
 template<bool Is_even_M, class T>
 void
-convert_dq(T &trait, BwdParam<typename T::DType> &param, int m_block, int bidb, int bidh) {
+convert_dq(T &trait, BwdParam<typename T::DType, T::is_varlen> &param, int m_block, int bidb, int bidh) {
     constexpr int kBlockM = T::kBlockM;
     constexpr int kHeadDim = T::kHeadDim;
     using DType = typename T::DType;
@@ -828,7 +846,7 @@ convert_dq(T &trait, BwdParam<typename T::DType> &param, int m_block, int bidb, 
     auto sg = compat::get_nd_item<1>().get_sub_group();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
 
-    auto bofst = BwdOffset(param);
+    auto bofst = BwdOffset<typename T::DType, T::is_varlen>(param);
     const index_t dq_offset = bofst.dq_offset(bidb, bidh, m_block * kBlockM);
     const index_t dqaccum_offset = bofst.dqaccum_offset(bidb, bidh, m_block * kBlockM);
     
@@ -898,46 +916,64 @@ convert_dq(T &trait, BwdParam<typename T::DType> &param, int m_block, int bidb, 
 // Kernel entry points
 template<class T>
 void
-mha_dot_do_o(T trait, BwdParam<typename T::DType> param) {
+mha_dot_do_o(T trait, BwdParam<typename T::DType, T::is_varlen> param) {
     const int m_block = BlockIdxX();
     const int bidb = BlockIdxZ();
     const int bidh = BlockIdxY();
-    if (m_block == param.m_block - 1 and param.tail_m > 0) {
-        compute_o_dot_do<false>(trait, param, m_block, bidb, bidh);
+    auto batch_param = resolve_varlen_batch<typename T::DType, T::kBlockM, T::kBlockN, T::is_varlen>(param, bidb);
+    if constexpr (T::is_varlen) {
+        if (m_block >= batch_param.m_block) {
+            return;
+        }
+    }
+    if (m_block == batch_param.m_block - 1 and batch_param.tail_m > 0) {
+        compute_o_dot_do<false>(trait, batch_param, m_block, bidb, bidh);
     } else {
-        compute_o_dot_do<true>(trait, param, m_block, bidb, bidh);
+        compute_o_dot_do<true>(trait, batch_param, m_block, bidb, bidh);
     }
 }
 
 template<class T>
 void
-mha_backward_seq(T trait, BwdParam<typename T::DType> param) {
+mha_backward_seq(T trait, BwdParam<typename T::DType, T::is_varlen> param) {
     const int bidb = BlockIdxZ();
     const int bidhq = BlockIdxY();
     const int bidnblk = BlockIdxX();
-    const int bidhkv = bidhq / param.num_qh_per_kvh;
-    // For deterministic mode, each work-group writes to its own dq_accum split
-    if (param.deterministic) {
-        param.dqaccum_ptr = param.dqaccum_ptr + bidnblk * param.dq_accum_split_stride;
+    auto batch_param = resolve_varlen_batch<typename T::DType, T::kBlockM, T::kBlockN, T::is_varlen>(param, bidb);
+    if constexpr (T::is_varlen) {
+        if (bidnblk >= batch_param.n_block || batch_param.m_block == 0) {
+            return;
+        }
     }
-    for (int n_block = bidnblk; n_block < param.n_block; n_block += GridDimX()) {
-        if (param.tail_n > 0 and n_block == param.n_block - 1)
-            dq_dk_dv_1colblock<false, false>(trait, param, bidb, bidhq, bidhkv, param.n_block - 1, param.tail_n);
+    const int bidhkv = bidhq / batch_param.num_qh_per_kvh;
+    // For deterministic mode, each work-group writes to its own dq_accum split
+    if (batch_param.deterministic) {
+        batch_param.dqaccum_ptr = batch_param.dqaccum_ptr + bidnblk * batch_param.dq_accum_split_stride;
+    }
+    for (int n_block = bidnblk; n_block < batch_param.n_block; n_block += GridDimX()) {
+        if (batch_param.tail_n > 0 and n_block == batch_param.n_block - 1)
+            dq_dk_dv_1colblock<false, false>(trait, batch_param, bidb, bidhq, bidhkv, batch_param.n_block - 1, batch_param.tail_n);
         else
-            dq_dk_dv_1colblock<true, false>(trait, param, bidb, bidhq, bidhkv, n_block);
+            dq_dk_dv_1colblock<true, false>(trait, batch_param, bidb, bidhq, bidhkv, n_block);
     }
 }
 
 template<class T>
 void
-mhd_convert_dq(T trait, BwdParam<typename T::DType> param) {
+mhd_convert_dq(T trait, BwdParam<typename T::DType, T::is_varlen> param) {
     const int m_block = BlockIdxX();
     const int bidb = BlockIdxZ();
     const int bidh = BlockIdxY();
-    if (param.tail_m > 0 and m_block == param.m_block - 1) {
-        convert_dq<false>(trait, param, m_block, bidb, bidh);
+    auto batch_param = resolve_varlen_batch<typename T::DType, T::kBlockM, T::kBlockN, T::is_varlen>(param, bidb);
+    if constexpr (T::is_varlen) {
+        if (m_block >= batch_param.m_block) {
+            return;
+        }
+    }
+    if (batch_param.tail_m > 0 and m_block == batch_param.m_block - 1) {
+        convert_dq<false>(trait, batch_param, m_block, bidb, bidh);
     } else {
-        convert_dq<true>(trait, param, m_block, bidb, bidh);
+        convert_dq<true>(trait, batch_param, m_block, bidb, bidh);
     }
 }
 
@@ -977,7 +1013,7 @@ struct BwdKernelLauncher {
         // Use pre-allocated intermediate buffer from caller (PyTorch caching allocator)
         DType* pbuff = reinterpret_cast<DType*>(args.pbuff);
         
-        auto param = BwdParam<DType>(
+        auto param = BwdParam<DType, FABwdKernel::is_varlen>(
             reinterpret_cast<const DType*>(args.dout),
             reinterpret_cast<const DType*>(args.out),
             reinterpret_cast<const DType*>(args.query),
@@ -998,6 +1034,7 @@ struct BwdKernelLauncher {
         param.num_qh_per_kvh = NUM_HEAD_Q / NUM_HEAD_KV;
         param.num_nb_per_blk = std::max(N_BLOCK * NUM_HEAD_Q * BATCH / 1024, 1);
         param.seq_len_q = SEQ_LEN_Q;
+        param.max_seqlen_q = SEQ_LEN_Q;
         param.seq_len_kv = SEQ_LEN_KV;
         param.head_dim = kHeadDim;
         param.n_block = N_BLOCK;
@@ -1008,7 +1045,10 @@ struct BwdKernelLauncher {
         param.seq_len_q_pad = args.seqlen_q_rounded;
         param.window_size_left = args.window_size_left;
         param.window_size_right = args.window_size_right;
-        param.is_local = args.is_local;
+        if constexpr (FABwdKernel::is_varlen) {
+            param.cu_seqlens_q = reinterpret_cast<const int*>(args.cu_seqlens_q);
+            param.cu_seqlens_k = reinterpret_cast<const int*>(args.cu_seqlens_k);
+        }
         param.deterministic = args.deterministic;
         param.nsplits = args.nsplits;
         param.dq_accum_split_stride = args.dq_accum_split_stride;
@@ -1084,7 +1124,7 @@ template <
 struct FMHABwdConfig {
     using DType = ElementQ;
 
-    template <bool Causal, bool Local, bool HasDropout>
+    template <bool Causal, bool Local, bool VarLen, bool HasDropout>
     static void run_impl(sycl::queue& queue, const fmha_bwd_args_t& args) {
         using FABwdKernelType = FABwdKernel<
             DType,
@@ -1097,18 +1137,19 @@ struct FMHABwdConfig {
             bwd_policy::AtomLayoutMdQ,
             Causal,
             Local,
+            VarLen,
             HasDropout>;
 
         BwdKernelLauncher<FABwdKernelType> launcher;
         launcher.run(queue, args);
     }
 
-    template <bool Causal, bool Local>
+    template <bool Causal, bool Local, bool VarLen>
     static void run(sycl::queue& queue, const fmha_bwd_args_t& args) {
         if (args.p_dropout > 0.0f) {
-            return run_impl<Causal, Local, true>(queue, args);
+            return run_impl<Causal, Local, VarLen, true>(queue, args);
         }
-        return run_impl<Causal, Local, false>(queue, args);
+        return run_impl<Causal, Local, VarLen, false>(queue, args);
     }
 
     template <bool... Bs>
@@ -1116,35 +1157,19 @@ struct FMHABwdConfig {
         return run<Bs...>(queue, args);
     }
 
-    template <bool... Bs, typename... Ts>
-    static void kernel_dispatch(sycl::queue& queue, const fmha_bwd_args_t& args, bool b, Ts... ts) {
-        if (b) {
-            kernel_dispatch<Bs..., true>(queue, args, ts...);
-        } else {
-            kernel_dispatch<Bs..., false>(queue, args, ts...);
-        }
-    }
 };
 
 // Single-dtype bwd dispatch: only instantiates one dtype path per TU.
-template <typename bwd_policy, int IsCausal = -1, int IsLocal = -1>
+template <typename bwd_policy, int IsCausal, int IsLocal, int IsVarLen>
 void bwd_policy_dispatch_fp16(sycl::queue& queue, const fmha_bwd_args_t& args) {
     using Config = FMHABwdConfig<bwd_policy, cute::half_t, cute::half_t, cute::half_t, cute::half_t>;
-    if constexpr (IsCausal != -1 && IsLocal != -1) {
-        return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
-    } else {
-        return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
-    }
+    return Config::template kernel_dispatch<IsCausal, IsLocal, IsVarLen>(queue, args);
 }
 
-template <typename bwd_policy, int IsCausal = -1, int IsLocal = -1>
+template <typename bwd_policy, int IsCausal, int IsLocal, int IsVarLen>
 void bwd_policy_dispatch_bf16(sycl::queue& queue, const fmha_bwd_args_t& args) {
     using Config = FMHABwdConfig<bwd_policy, cute::bfloat16_t, cute::bfloat16_t, cute::bfloat16_t, cute::bfloat16_t>;
-    if constexpr (IsCausal != -1 && IsLocal != -1) {
-        return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
-    } else {
-        return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
-    }
+    return Config::template kernel_dispatch<IsCausal, IsLocal, IsVarLen>(queue, args);
 }
 
 // Combined bwd_policy_dispatch is now defined inline in fmha_bwd.hpp

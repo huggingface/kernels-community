@@ -6,7 +6,8 @@ using namespace cute;
 
 template <class T_, int kHeadDim_, int kBlockM_, int kBlockN_, int kNSGs_,
           int AtomLayoutMSdP_ = 2, int AtomLayoutNdKV_ = 2, int AtomLayoutMdQ_ = 2,
-          bool is_causal_ = false, bool is_local_ = false, bool has_dropout_ = false>
+          bool is_causal_ = false, bool is_local_ = false, bool is_varlen_ = false,
+          bool has_dropout_ = false>
 struct FABwdKernel {
     /*
       Q BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_QK
@@ -26,6 +27,7 @@ struct FABwdKernel {
     static constexpr int AtomLayoutMdQ = AtomLayoutMdQ_;
     static constexpr bool is_causal = is_causal_;
     static constexpr bool is_local = is_local_;
+    static constexpr bool is_varlen = is_varlen_;
     static constexpr bool has_dropout = has_dropout_;
     using MMA_Atom_ARCH = XE_DPAS_TT<8, VType, DType>;
     using _K = Int<MMA_Atom_ARCH::K>;
@@ -56,8 +58,17 @@ struct FABwdKernel {
 
 using index_t = uint64_t;
 
-template<typename T>
-struct BwdParam {
+template<bool VarLen>
+struct BwdVarLenParam {};
+
+template<>
+struct BwdVarLenParam<true> {
+    const int *cu_seqlens_q = nullptr;
+    const int *cu_seqlens_k = nullptr;
+};
+
+template<typename T, bool VarLen = false>
+struct BwdParam : BwdVarLenParam<VarLen> {
     BwdParam(const T *dO,
              const T *o,
              const T *q,
@@ -84,8 +95,7 @@ struct BwdParam {
           dv_ptr(dv),
           pb_ptr(pb),
           scale_softmax(softmax_scale),
-          scale_softmax_log2(softmax_scale * M_LOG2E),
-          is_bhsd(true) {}
+          scale_softmax_log2(softmax_scale * M_LOG2E) {}
     
     // read only
     const T *do_ptr;
@@ -110,6 +120,7 @@ struct BwdParam {
     int num_head_q;
     int num_head_kv;
     int seq_len_q;
+    int max_seqlen_q;
     int seq_len_q_pad;
     int seq_len_kv;
     int seq_len_kv_pad;
@@ -151,11 +162,6 @@ struct BwdParam {
     int o_h_stride;
     int o_b_stride;
 
-    // Strides for S (softmax)
-    int s_r_stride;
-    int s_s_stride;
-    int s_b_stride;
-
     // Strides for dQ
     int dq_r_stride;
     int dq_h_stride;
@@ -170,8 +176,6 @@ struct BwdParam {
     int window_size_left;
     int window_size_right;
 
-    bool is_bhsd;
-    bool is_local;
     bool deterministic;
     int nsplits;
     int dq_accum_split_stride;
@@ -181,44 +185,72 @@ struct BwdParam {
 };
 
 /// Computes linear offsets into the Q/K/V/dQ/dK/dV/O/LSE buffers.
-template<typename T>
+template<typename T, bool VarLen = false>
 struct BwdOffset {
-    explicit BwdOffset(const BwdParam<T> &param_) : param(param_) {}
+    explicit BwdOffset(const BwdParam<T, VarLen> &param_) : param(param_) {}
     
     [[nodiscard]] index_t q_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
+        if constexpr (VarLen) {
+            return (static_cast<index_t>(param.cu_seqlens_q[b_id]) + s_id) * param.num_head_q * param.head_dim
+                + h_id * param.head_dim;
+        }
         return b_id * param.q_b_stride + h_id * param.q_h_stride + s_id * param.q_r_stride;
     }
     [[nodiscard]] index_t k_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
+        if constexpr (VarLen) {
+            return (static_cast<index_t>(param.cu_seqlens_k[b_id]) + s_id) * param.num_head_kv * param.head_dim
+                + h_id * param.head_dim;
+        }
         return b_id * param.k_b_stride + h_id * param.k_h_stride + s_id * param.k_r_stride;
     }
     [[nodiscard]] index_t v_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
+        if constexpr (VarLen) {
+            return (static_cast<index_t>(param.cu_seqlens_k[b_id]) + s_id) * param.num_head_kv * param.head_dim
+                + h_id * param.head_dim;
+        }
         return b_id * param.v_b_stride + h_id * param.v_h_stride + s_id * param.v_r_stride;
     }
     [[nodiscard]] index_t dk_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
+        if constexpr (VarLen) {
+            return (static_cast<index_t>(param.cu_seqlens_k[b_id]) + s_id) * param.num_head_q * param.head_dim
+                + h_id * param.head_dim;
+        }
         return b_id * param.dk_b_stride + h_id * param.dk_h_stride + s_id * param.dk_r_stride;
     }
     [[nodiscard]] index_t dv_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
+        if constexpr (VarLen) {
+            return (static_cast<index_t>(param.cu_seqlens_k[b_id]) + s_id) * param.num_head_q * param.head_dim
+                + h_id * param.head_dim;
+        }
         return b_id * param.dv_b_stride + h_id * param.dv_h_stride + s_id * param.dv_r_stride;
     }
     [[nodiscard]] index_t lse_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
-        return b_id * param.seq_len_q * param.num_head_q + h_id * param.seq_len_q + s_id;
+        return b_id * param.max_seqlen_q * param.num_head_q + h_id * param.max_seqlen_q + s_id;
     }
     [[nodiscard]] index_t o_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
+        if constexpr (VarLen) {
+            return (static_cast<index_t>(param.cu_seqlens_q[b_id]) + s_id) * param.num_head_q * param.head_dim
+                + h_id * param.head_dim;
+        }
         return b_id * param.o_b_stride + h_id * param.o_h_stride + s_id * param.o_r_stride;
     }
     [[nodiscard]] index_t dq_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
+        if constexpr (VarLen) {
+            return (static_cast<index_t>(param.cu_seqlens_q[b_id]) + s_id) * param.num_head_q * param.head_dim
+                + h_id * param.head_dim;
+        }
         return b_id * param.dq_b_stride + h_id * param.dq_h_stride + s_id * param.dq_r_stride;
     }
     [[nodiscard]] index_t dqaccum_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
         return b_id * param.dqaccum_b_stride + h_id * param.dqaccum_h_stride + s_id * param.dqaccum_r_stride;
     }
     
-    const BwdParam<T> &param;
+    const BwdParam<T, VarLen> &param;
 };
 
 // Setup strides for BHSD layout (batch, heads, seq, dim)
-template<typename T>
-void setup_bhsd_stride_bwd(BwdParam<T> &param) {
+template<typename T, bool VarLen>
+void setup_bhsd_stride_bwd(BwdParam<T, VarLen> &param) {
     param.q_r_stride = param.head_dim;
     param.q_h_stride = param.seq_len_q * param.head_dim;
     param.q_b_stride = param.num_head_q * param.seq_len_q * param.head_dim;
@@ -253,8 +285,8 @@ void setup_bhsd_stride_bwd(BwdParam<T> &param) {
 }
 
 // Setup strides for BSHD layout (batch, seq, heads, dim)
-template<typename T>
-void setup_bshd_stride_bwd(BwdParam<T> &param) {
+template<typename T, bool VarLen>
+void setup_bshd_stride_bwd(BwdParam<T, VarLen> &param) {
     param.q_r_stride = param.num_head_q * param.head_dim;
     param.q_h_stride = param.head_dim;
     param.q_b_stride = param.num_head_q * param.seq_len_q * param.head_dim;

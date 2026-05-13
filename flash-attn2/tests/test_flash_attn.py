@@ -859,9 +859,9 @@ def test_flash_attn_varlen_qkvpacked(
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
-    if device in ["xpu", "cpu"]:
+    if device == "cpu":
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
-        print("XPU and CPU do not support backward currently, skipping grad check.")
+        print("CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out)
@@ -1451,9 +1451,9 @@ def test_flash_attn_varlen_output(
         print(f"Attention max diff: {(attn - attn_ref).abs().max().item()}")
         print(f"Attention Pytorch max diff: {(attn_pt - attn_ref).abs().max().item()}")
 
-    if device in ["xpu", "cpu"]:
+    if device == "cpu":
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
-        print("XPU and CPU do not support backward currently, skipping grad check.")
+        print("CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out)
@@ -1769,9 +1769,9 @@ def test_flash_attn_varlen_causal(
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
 
-    if device in ["xpu", "cpu"]:
+    if device == "cpu":
         assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
-        print("XPU and CPU do not support backward currently, skipping grad check.")
+        print("CPU do not support backward currently, skipping grad check.")
         return
 
     g = torch.randn_like(out)
@@ -2478,8 +2478,6 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype, device):
     """
     if device == "cpu":
         pytest.skip("backward not supported on CPU")
-    if device == "xpu":
-        pytest.skip("bwd test not supported on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)
@@ -2598,8 +2596,6 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
 def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype, device):
     if device == "cpu":
         pytest.skip("backward not supported on CPU")
-    if device == "xpu":
-        pytest.skip("varlen backward not supported on XPU currently")
     if (
         device == "cuda"
         and max(seqlen_q, seqlen_k) >= 2048

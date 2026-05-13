@@ -10,6 +10,8 @@ struct fmha_bwd_args_t {
   void* key;
   void* value;
   void* softmax_lse; // logsumexp from forward
+  void* cu_seqlens_q = nullptr;
+  void* cu_seqlens_k = nullptr;
 
   // Output gradient tensors
   void* dq;
@@ -36,9 +38,6 @@ struct fmha_bwd_args_t {
   float sm_scale;
 
   // Flags
-  bool is_causal = false;
-  bool is_local = false;
-  bool is_bf16 = false;
   bool deterministic = false;
 
   // Deterministic mode parameters
