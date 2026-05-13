@@ -20,6 +20,23 @@ constexpr int round_up(int x, int m) {
     return (x + m - 1) / m * m;
 }
 
+[[nodiscard]] constexpr int bwd_block_m_for_head(int head_size) {
+    return (head_size > 96 && head_size <= 128) ? 128 : 64;
+}
+
+[[nodiscard]] constexpr int bwd_block_n_for_head(int head_size) {
+    if (head_size <= 64) {
+        return 32;
+    }
+    if (head_size <= 96) {
+        return 64;
+    }
+    if (head_size <= 128) {
+        return 128;
+    }
+    return 32;
+}
+
 /// Dispatch backward kernel by head_size with pre-resolved causal/local flags.
 template <typename Policy>
 void dispatch_bwd_causal_local(sycl::queue& queue, BwdCutlassType cuType,
@@ -84,9 +101,12 @@ void cutlass_fmha_bwd_fix_impl(
     const int seqlen_k     = k.size(1);
     const int num_heads_k  = k.size(2);
 
-    // Round up sequence lengths for internal buffers
-    const int seqlen_q_rounded = round_up(seqlen_q, 64);
-    const int seqlen_k_rounded = round_up(seqlen_k, 64);
+    const int kBlockM_bwd = bwd_block_m_for_head(head_size);
+    const int kBlockN_bwd = bwd_block_n_for_head(head_size);
+
+    // Round up sequence lengths for internal buffers using the selected policy.
+    const int seqlen_q_rounded = round_up(seqlen_q, kBlockM_bwd);
+    const int seqlen_k_rounded = round_up(seqlen_k, kBlockN_bwd);
 
     // Allocate dq_accum buffer (float)
     // For deterministic mode, allocate separate splits to avoid atomicAdd races
@@ -94,7 +114,7 @@ void cutlass_fmha_bwd_fix_impl(
     int dq_accum_split_stride = 0;
     at::Tensor dq_accum;
     if (!deterministic) {
-        dq_accum = at::zeros({batch_size, seqlen_q_rounded, num_heads_q, head_size}, 
+        dq_accum = at::zeros({batch_size, num_heads_q, seqlen_q_rounded, head_size},
                               q.options().dtype(at::kFloat));
     } else {
         // Each work-group gets its own split to write dQ accumulator
@@ -107,15 +127,13 @@ void cutlass_fmha_bwd_fix_impl(
         // The minimum kBlockN across all head size policies is 32.
         const int max_n_blocks = std::max((seqlen_k + 31) / 32, 1);
         nsplits = std::min(nsplits, max_n_blocks);
-        dq_accum = at::zeros({nsplits, batch_size, seqlen_q_rounded, num_heads_q, head_size}, 
+        dq_accum = at::zeros({nsplits, batch_size, num_heads_q, seqlen_q_rounded, head_size},
                               q.options().dtype(at::kFloat));
         dq_accum_split_stride = batch_size * seqlen_q_rounded * num_heads_q * head_size;
     }
 
     // Pre-allocate intermediate buffer using PyTorch caching allocator
     // (avoids expensive compat::malloc/free per backward call).
-    // All backward policies use kBlockM=64. TODO hard code
-    constexpr int kBlockM_bwd = 64;
     at::Tensor pbuff_tensor = at::empty(
         {batch_size * num_heads_q * seqlen_k_rounded * 2 * kBlockM_bwd},
         q.options());

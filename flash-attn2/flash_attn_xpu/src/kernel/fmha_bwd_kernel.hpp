@@ -6,7 +6,7 @@ using namespace cute;
 
 template <class T_, int kHeadDim_, int kBlockM_, int kBlockN_, int kNSGs_,
           int AtomLayoutMSdP_ = 2, int AtomLayoutNdKV_ = 2, int AtomLayoutMdQ_ = 2,
-          bool is_causal_ = false, bool is_local_ = false>
+          bool is_causal_ = false, bool is_local_ = false, bool has_dropout_ = false>
 struct FABwdKernel {
     /*
       Q BATCH,NUM_HEAD_Q,SEQ_LEN_QO,HEAD_SIZE_QK
@@ -26,6 +26,7 @@ struct FABwdKernel {
     static constexpr int AtomLayoutMdQ = AtomLayoutMdQ_;
     static constexpr bool is_causal = is_causal_;
     static constexpr bool is_local = is_local_;
+    static constexpr bool has_dropout = has_dropout_;
     using MMA_Atom_ARCH = XE_DPAS_TT<8, VType, DType>;
     using _K = Int<MMA_Atom_ARCH::K>;
     using SubgroupLayoutSdP = Layout<Shape<Int<AtomLayoutMSdP>, Int<kNSGs / AtomLayoutMSdP>, _1>>;
@@ -160,6 +161,11 @@ struct BwdParam {
     int dq_h_stride;
     int dq_b_stride;
 
+    // Strides for intermediate dQ accumulator (stored as B,H,S,D)
+    int dqaccum_r_stride;
+    int dqaccum_h_stride;
+    int dqaccum_b_stride;
+
     // Window size for local attention
     int window_size_left;
     int window_size_right;
@@ -203,6 +209,9 @@ struct BwdOffset {
     [[nodiscard]] index_t dq_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
         return b_id * param.dq_b_stride + h_id * param.dq_h_stride + s_id * param.dq_r_stride;
     }
+    [[nodiscard]] index_t dqaccum_offset(const index_t b_id, const index_t h_id, const index_t s_id) const {
+        return b_id * param.dqaccum_b_stride + h_id * param.dqaccum_h_stride + s_id * param.dqaccum_r_stride;
+    }
     
     const BwdParam<T> &param;
 };
@@ -235,8 +244,12 @@ void setup_bhsd_stride_bwd(BwdParam<T> &param) {
     param.o_b_stride = param.num_head_q * param.seq_len_q * param.head_dim;
 
     param.dq_r_stride = param.head_dim;
-    param.dq_h_stride = param.seq_len_q_pad * param.head_dim;
-    param.dq_b_stride = param.num_head_q * param.seq_len_q_pad * param.head_dim;
+    param.dq_h_stride = param.seq_len_q * param.head_dim;
+    param.dq_b_stride = param.num_head_q * param.seq_len_q * param.head_dim;
+
+    param.dqaccum_r_stride = param.head_dim;
+    param.dqaccum_h_stride = param.seq_len_q_pad * param.head_dim;
+    param.dqaccum_b_stride = param.num_head_q * param.seq_len_q_pad * param.head_dim;
 }
 
 // Setup strides for BSHD layout (batch, seq, heads, dim)
@@ -268,5 +281,9 @@ void setup_bshd_stride_bwd(BwdParam<T> &param) {
 
     param.dq_r_stride = param.num_head_q * param.head_dim;
     param.dq_h_stride = param.head_dim;
-    param.dq_b_stride = param.num_head_q * param.seq_len_q_pad * param.head_dim;
+    param.dq_b_stride = param.num_head_q * param.seq_len_q * param.head_dim;
+
+    param.dqaccum_r_stride = param.head_dim;
+    param.dqaccum_h_stride = param.seq_len_q_pad * param.head_dim;
+    param.dqaccum_b_stride = param.num_head_q * param.seq_len_q_pad * param.head_dim;
 }

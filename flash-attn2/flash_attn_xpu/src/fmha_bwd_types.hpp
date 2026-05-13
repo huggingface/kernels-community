@@ -97,12 +97,12 @@ struct bwd_policy_head96 {
 };
 
 struct bwd_policy_head128 {
-  static constexpr int kBlockM = 64;
-  static constexpr int kBlockN = 64;
+  static constexpr int kBlockM = 128;
+  static constexpr int kBlockN = 128;
   static constexpr int kHeadDim = 128;
-  static constexpr int kNSGs = 8;
-  static constexpr int AtomLayoutMSdP = 2;
-  static constexpr int AtomLayoutNdKV = 2;
+  static constexpr int kNSGs = 32;
+  static constexpr int AtomLayoutMSdP = 4;
+  static constexpr int AtomLayoutNdKV = 4;
   static constexpr int AtomLayoutMdQ = 4;
 };
 
