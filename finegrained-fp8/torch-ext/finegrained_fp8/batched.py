@@ -103,7 +103,13 @@ def w8a8_block_fp8_matmul_batched_kernel(
     offs_cm = tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + offs_cm[:, None] * 0 + stride_cn * offs_cn[None, :]
-    tl.store(c_ptrs, c)
+    # Fake-batch trick aliases all BLOCK_SIZE_M lanes to the same C row, so emitting
+    # `tl.store(c_ptrs, c)` issues BLOCK_SIZE_M duplicate-address stores. On NVIDIA
+    # WGMMA this is usually benign (last-write-wins of identical bytes), but on Intel
+    # XPU the duplicate-address store has hardware-undefined behavior and corrupts the
+    # output. Mask so only lane 0 stores — the (M, N) accumulator rows are
+    # mathematically identical (same A row × same B), so lane 0 holds the right value.
+    tl.store(c_ptrs, c, mask=(offs_cm == 0)[:, None])
 
 
 @triton.autotune(
@@ -181,7 +187,9 @@ def w8a8_tensor_fp8_matmul_batched_kernel(
     offs_cm = tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + offs_cm[:, None] * 0 + stride_cn * offs_cn[None, :]
-    tl.store(c_ptrs, c)
+    # See block-FP8 kernel above: BLOCK_SIZE_M lanes alias the same C row;
+    # mask so only lane 0 stores to avoid hardware-undefined duplicate writes on XPU.
+    tl.store(c_ptrs, c, mask=(offs_cm == 0)[:, None])
 
 
 @triton_op("finegrained_fp8::w8a8_block_fp8_matmul_batched", mutates_args=())
