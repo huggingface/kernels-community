@@ -55,32 +55,6 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - CUTLASS 4.0 or higher (could be cloned by Git submodule)
 - `{fmt}` library (could be cloned by Git submodule)
 
-### Development
-
-```bash
-# Submodule must be cloned
-git clone --recursive git@github.com:deepseek-ai/DeepGEMM.git
-cd DeepGEMM
-
-# Link some essential includes and build the CPP JIT module
-cat develop.sh
-./develop.sh
-
-# Test all GEMM implements
-python tests/test_layout.py
-python tests/test_attention.py
-python tests/test_core.py
-```
-
-### Installation
-
-```bash
-cat install.sh
-./install.sh
-```
-
-Then, import `deep_gemm` in your Python project, and enjoy!
-
 ## Interfaces
 
 #### Notices
