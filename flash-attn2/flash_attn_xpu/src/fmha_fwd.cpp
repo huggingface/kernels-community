@@ -144,7 +144,14 @@ void cutlass_fmha_fwd_varlen_impl(
     bool is_varlen,
     bool is_paged,
     bool is_causal,
-    bool is_local) {
+    bool is_local,
+    float p_dropout,
+    uint64_t philox_seed,
+    uint64_t philox_offset,
+    void* rng_state,
+    void* s_dmask,
+    int seqlen_q_rounded,
+    int seqlen_k_rounded) {
   int batch_size, num_heads_q, num_heads_kv, head_size;
   int total_seqlen_q, total_seqlen_k;
   int num_blocks, block_size, max_blocks_per_seq;
@@ -219,7 +226,14 @@ void cutlass_fmha_fwd_varlen_impl(
       is_varlen,
       is_paged,
       is_causal,
-      is_local};
+      is_local,
+      p_dropout,
+      philox_seed,
+      philox_offset,
+      rng_state,
+      s_dmask,
+      seqlen_q_rounded,
+      seqlen_k_rounded};
 
   const CutlassType cuType = aten_to_Cutlass_dtype(query);
   if (args.max_queries == 1) {

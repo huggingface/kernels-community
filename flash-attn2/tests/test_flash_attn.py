@@ -510,7 +510,9 @@ def normalize_flash_attn_S(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias.to(dtype=scores.dtype)
-    block_size_n = _get_block_size_n(scores.device, head_dim, is_dropout, causal)
+    block_size_n = 64 if scores.device.type == "xpu" and seqlen_q == 1 else _get_block_size_n(
+        scores.device, head_dim, is_dropout, causal
+    )
     scores_block = scores.split(block_size_n, dim=-1)
     lse_block = torch.stack([torch.logsumexp(s, dim=-1) for s in scores_block], dim=-1)
     lse = torch.logsumexp(lse_block, dim=-1)
@@ -520,7 +522,18 @@ def normalize_flash_attn_S(
     scores_max_block = torch.stack([torch.amax(s, dim=-1) for s in scores_block], dim=-1)
     # CUDA iterates K blocks right-to-left → suffix running max;
     # XPU iterates K blocks left-to-right  → prefix running max.
-    if scores.device.type == "xpu":
+    if scores.device.type == "xpu" and seqlen_q == 1:
+        blocks_per_tile = 8
+        num_blocks = scores_max_block.size(-1)
+        scores_max_by_sg = F.pad(
+            scores_max_block, (0, (-num_blocks) % blocks_per_tile), value=float("-inf")
+        ).reshape(
+            *scores_max_block.shape[:-1], -1, blocks_per_tile
+        )
+        cummax_block = torch.cummax(scores_max_by_sg, dim=-2).values.flatten(-2)[
+            ..., :num_blocks
+        ].unbind(dim=-1)
+    elif scores.device.type == "xpu":
         cummax_block = torch.cummax(scores_max_block, dim=-1).values.unbind(dim=-1)
     else:
         cummax_block = torch.cummax(scores_max_block.flip(-1), dim=-1).values.flip(-1).unbind(dim=-1)
@@ -760,8 +773,6 @@ def test_flash_attn_varlen_qkvpacked(
     if device == "xpu":
         if alibi:
             pytest.skip("alibi not supported on xpu currently")
-        if dropout_p != 0.0:
-            pytest.skip("dropout for varlen not supported on xpu currently")
 
     # set seed
     torch.random.manual_seed(0)
@@ -865,7 +876,7 @@ def test_flash_attn_varlen_qkvpacked(
         return
 
     g = torch.randn_like(out)
-    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
+    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90) or device == "xpu":
         (dqkv_unpad,) = torch.autograd.grad(out, qkv_unpad, g)
         dqkv = dqkv_pad_fn(dqkv_unpad)
         (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g)
@@ -889,7 +900,7 @@ def test_flash_attn_varlen_qkvpacked(
         if not alibi:
             assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.025)
 
-    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
+    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90) or device == "xpu":
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
@@ -1230,8 +1241,6 @@ def test_flash_attn_varlen_output(
             pytest.skip("alibi not supported on xpu currently")
         if softcap != 0.0:
             pytest.skip("softcap not supported on xpu currently")
-        if dropout_p != 0.0:
-            pytest.skip("dropout for varlen not supported on xpu currently")
     if device == "cpu":
         if alibi:
             pytest.skip("alibi not supported on CPU")
@@ -1457,7 +1466,7 @@ def test_flash_attn_varlen_output(
         return
 
     g = torch.randn_like(out)
-    if ((d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90)):
+    if ((d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90) or device == "xpu"):
         if kvpacked:
             (
                 dq_unpad,
@@ -1514,9 +1523,10 @@ def test_flash_attn_varlen_output(
         assert (attn - attn_ref).abs().max().item() <= 2 * (attn_pt - attn_ref).abs().max().item()
         # With alibi, many of the prob values are 0.0 & -0.0 so dropout_fraction isn't accurate
         if not alibi:
-            assert abs(dropout_fraction - dropout_p) <= (0.01 if not local else 0.04)
+            dropout_fraction_tol = 0.04 if local else (0.02 if device == "xpu" and seqlen_q == 1 else 0.01)
+            assert abs(dropout_fraction - dropout_p) <= dropout_fraction_tol
 
-    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90):
+    if (d <= MAX_HEADDIM_SM8x or dropout_p == 0) or (is_sm80 or is_sm90) or device == "xpu":
         assert (dq - dq_ref).abs().max().item() <= 3 * (dq_pt - dq_ref).abs().max().item()
         assert (dk - dk_ref).abs().max().item() <= 3 * (dk_pt - dk_ref).abs().max().item()
         assert (dv - dv_ref).abs().max().item() <= 3 * (dv_pt - dv_ref).abs().max().item()

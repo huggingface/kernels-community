@@ -390,6 +390,8 @@ mha_varlen_fwd(
     compat::select_device(device_idx);
 
     // check inputs
+    TORCH_CHECK(p_dropout < 1.0f, "FlashAttention dropout probability must be less than 1.0");
+
     q = ensure_contiguous(q);
     const auto sizes = q.sizes();
     const int total_q = sizes[0];
@@ -444,6 +446,31 @@ mha_varlen_fwd(
 
     auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
 
+    uint64_t philox_seed = 0;
+    uint64_t philox_offset = 0;
+    at::Tensor rng_state = at::empty({2}, q.options().dtype(at::kLong));
+
+    if (p_dropout > 0.0f) {
+        int64_t counter_offset = batch_size * num_heads * 32;
+        auto [seed, offset] = get_philox_state(gen_, counter_offset);
+        philox_seed = seed;
+        philox_offset = offset;
+        rng_state[0] = static_cast<int64_t>(philox_seed);
+        rng_state[1] = static_cast<int64_t>(philox_offset);
+    }
+
+    const int q_tile_size = (head_size_og <= 32) ? 64 : (head_size_og <= 128) ? 128 : 256;
+    const int k_tile_size = (max_seqlen_q == 1 && !is_paged) ? 512 : 128;
+    const int seqlen_q_rounded = round_multiple(max_seqlen_q, q_tile_size);
+    const int seqlen_k_rounded = round_multiple(max_seqlen_k, k_tile_size);
+    at::Tensor S_dmask;
+    if (return_softmax) {
+        TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
+        S_dmask = torch::empty({batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded}, q.options());
+    } else {
+        S_dmask = torch::empty({0}, q.options());
+    }
+
     cutlass_fmha_fwd_varlen_impl(
         queue,
         q_padded, k_padded, v_padded, out_padded,
@@ -453,7 +480,10 @@ mha_varlen_fwd(
         max_seqlen_q, max_seqlen_k,
         softmax_scale,
         window_size_left, window_size_right,
-        true, is_paged, is_causal, is_local);
+        true, is_paged, is_causal, is_local,
+        p_dropout, philox_seed, philox_offset, nullptr,
+        return_softmax ? S_dmask.data_ptr() : nullptr,
+        seqlen_q_rounded, seqlen_k_rounded);
 
     // Strip padding from output back to original head_size
     at::Tensor out = needs_padding
@@ -462,8 +492,6 @@ mha_varlen_fwd(
                     .contiguous()
         : ensure_contiguous(out_padded);
 
-    at::Tensor S_dmask;
-    at::Tensor rng_state;
     return {out, softmax_lse, S_dmask, rng_state};
   }
 
@@ -497,8 +525,7 @@ mha_varlen_bwd(
     auto device_idx = q.device().index();
     compat::select_device(device_idx);
 
-    TORCH_CHECK(p_dropout == 0.0f,
-                "FlashAttention XPU varlen backward does not support dropout yet");
+    TORCH_CHECK(p_dropout < 1.0f, "FlashAttention dropout probability must be less than 1.0");
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -622,6 +649,14 @@ mha_varlen_bwd(
     const bool is_local = (window_size_left != -1) || (window_size_right != -1);
     auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
 
+    uint64_t philox_seed = 0;
+    uint64_t philox_offset = 0;
+    if (p_dropout > 0.0f && rng_state.has_value()) {
+        auto rng_state_val = rng_state.value();
+        philox_seed = static_cast<uint64_t>(rng_state_val[0].item<int64_t>());
+        philox_offset = static_cast<uint64_t>(rng_state_val[1].item<int64_t>());
+    }
+
     cutlass_fmha_bwd_varlen_impl(
         queue,
         dout_padded, q_padded, k_padded, v_padded, out_padded, softmax_lse_contig,
@@ -630,7 +665,7 @@ mha_varlen_bwd(
         softmax_scale,
         max_seqlen_q, max_seqlen_k,
         window_size_left, window_size_right, is_causal, is_local,
-        p_dropout, 0, 0, deterministic);
+        p_dropout, philox_seed, philox_offset, deterministic);
 
     if (num_heads_k != num_heads) {
         at::sum_out(dk_work, at::reshape(dk_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size_padded}), {2});
