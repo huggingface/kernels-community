@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from dispatch_release import RELEASE_WORKFLOWS, dispatch_release as do_dispatch_release
+from dispatch import RELEASE_WORKFLOWS, dispatch_release as do_dispatch_release
 
 
 KERNEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -18,17 +18,17 @@ BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 COMMENT_CHARS_RE = re.compile(r"^/kernel-bot[ A-Za-z0-9_./-]*$")
 COMMAND_PERMISSIONS = {
     "build": {"admin", "write"},
-    "build-and-upload": {"admin"},
+    "build-and-stage": {"admin", "write"},
     "merge-and-upload": {"admin"},
     "release": {"admin"},
 }
-FORK_BLOCKED_COMMANDS = {"build", "build-and-upload", "release"}
+FORK_BLOCKED_COMMANDS = {"build", "build-and-stage", "release"}
 MAX_COMMENT_LENGTH = 1024
 RUN_LOOKUP_ATTEMPTS = 10
 RUN_LOOKUP_SLEEP_SECONDS = 2
 RUN_LOOKUP_PAGE_SIZE = 100
 COMMAND_USAGE = (
-    "Invalid command. Use `/kernel-bot <build|build-and-upload|merge-and-upload|release> "
+    "Invalid command. Use `/kernel-bot <build|build-and-stage|merge-and-upload|release> "
     "<kernel1> [kernel2 ...] [--branch <target_branch>]`."
 )
 
@@ -375,7 +375,7 @@ def parse_command(comment: str) -> ParsedCommand:
 
     if not args:
         return ParsedCommand(
-            error="No kernels provided. Use `/kernel-bot <build|build-and-upload|merge-and-upload> <kernel1> [kernel2 ...]`.",
+            error="No kernels provided. Use `/kernel-bot <build|build-and-stage|merge-and-upload> <kernel1> [kernel2 ...]`.",
         )
 
     kernels = []
@@ -546,22 +546,26 @@ def main():
         target_branch = requested_branch or f"pr-{issue_number}"
         dispatch_pr_number = str(issue_number)
         dispatch_upload = False
-    elif command == "build-and-upload":
+        dispatch_repo_prefix = "kernels-community"
+    elif command == "build-and-stage":
         target_branch = requested_branch or f"pr-{issue_number}"
         dispatch_pr_number = str(issue_number)
         dispatch_upload = True
+        dispatch_repo_prefix = "kernels-staging"
     elif command == "release":
         target_branch = requested_branch or ""
         dispatch_pr_number = ""
         dispatch_upload = True
+        dispatch_repo_prefix = "kernels-community"
     else:  # merge-and-upload
         target_branch = requested_branch or "main"
         dispatch_pr_number = ""
         dispatch_upload = True
+        dispatch_repo_prefix = "kernels-community"
 
     mode_text = {
         "build": "build only",
-        "build-and-upload": "build and upload",
+        "build-and-stage": "build and stage",
         "merge-and-upload": "merge, build and upload",
         "release": "release (linux + mac + windows)",
     }[command]
@@ -658,6 +662,8 @@ def main():
             token=token,
             repo=repository,
             ref=default_branch,
+            mode="release",
+            repo_prefix=dispatch_repo_prefix,
             dispatch_key_prefix=f"pr{issue_number}-",
             pr_number=dispatch_pr_number,
             target_branch=target_branch,

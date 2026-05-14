@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Dispatch release workflows for a kernel.
+Dispatch build workflows for a kernel.
 
-Three entrypoints call this script:
-  1. The PR-merge dummy workflow (via CLI)
-  2. The comment bot (via import)
-  3. Local CLI invocation
+Four entrypoints call this script:
+  1. The PR-merge dispatch workflow (via CLI)
+  2. The PR-open dispatch workflow (via CLI)
+  3. The comment bot (via import)
+  4. Local CLI invocation
 """
 
 import argparse
@@ -23,9 +24,9 @@ from pathlib import Path
 
 
 RELEASE_WORKFLOWS = [
-    "build-release.yaml",
-    "build-release-mac.yaml",
-    "build-release-windows.yaml",
+    "build.yaml",
+    "build-mac.yaml",
+    "build-windows.yaml",
 ]
 
 KERNEL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -65,6 +66,9 @@ def run_local(
     workflow: str,
     kernel_name: str,
     *,
+    mode: str = "release",
+    backends: str = "",
+    repo_prefix: str = "kernels-community",
     skip_build: bool = False,
     pr_number: str = "",
     target_branch: str = "",
@@ -76,6 +80,9 @@ def run_local(
         "--container-options", "--privileged",
         "-W", f".github/workflows/{workflow}",
         "--input", f"kernel_name={kernel_name}",
+        "--input", f"mode={mode}",
+        "--input", f"backends={backends}",
+        "--input", f"repo_prefix={repo_prefix}",
     ]
     if skip_build:
         cmd.extend(["--input", "skip_build=true"])
@@ -129,11 +136,19 @@ def get_repo() -> str | None:
 
 
 BACKEND_TO_WORKFLOWS = {
-    "cuda": {"build-release.yaml", "build-release-windows.yaml"},
-    "cpu": {"build-release.yaml"},
-    "rocm": {"build-release.yaml"},
-    "metal": {"build-release-mac.yaml"},
-    "xpu": {"build-release.yaml", "build-release-windows.yaml"},
+    "cuda": {"build.yaml", "build-windows.yaml"},
+    "cpu": {"build.yaml"},
+    "rocm": {"build.yaml"},
+    "metal": {"build-mac.yaml"},
+    "xpu": {"build.yaml", "build-windows.yaml"},
+}
+
+# Only these kernels are known to build successfully on Windows.
+# Add new entries here as Windows support is validated for a kernel.
+WINDOWS_KERNELS = {
+    "relu",
+    "activation",
+    "flash-attn2",
 }
 
 
@@ -152,15 +167,15 @@ def read_backends(kernel_name: str) -> list[str] | None:
     return None
 
 
-def select_workflows(kernel_name: str) -> list[str]:
+def select_workflows(kernel_name: str) -> set[str]:
     """
-    Determine which release workflows to dispatch based on the kernel's
+    Determine which build workflows to dispatch based on the kernel's
     backends declared in build.toml.
 
     Mapping:
-      cuda, cpu, rocm -> build-release.yaml (Linux)
-      metal           -> build-release-mac.yaml (macOS)
-      xpu             -> build-release-windows.yaml (Windows)
+      cuda, cpu, rocm -> build.yaml (Linux)
+      metal           -> build-mac.yaml (macOS)
+      cuda, xpu       -> build-windows.yaml (Windows, allowlisted kernels only)
 
     Falls back to all workflows if build.toml can't be read.
     """
@@ -177,6 +192,11 @@ def select_workflows(kernel_name: str) -> list[str]:
         print(f"No known backends found for {kernel_name}: {backends}, dispatching all workflows")
         return set(RELEASE_WORKFLOWS)
 
+    # Only dispatch Windows builds for kernels known to build there.
+    if "build-windows.yaml" in workflows and kernel_name not in WINDOWS_KERNELS:
+        workflows.discard("build-windows.yaml")
+        print(f"Skipping Windows build for {kernel_name} (not in WINDOWS_KERNELS allowlist)")
+
     return workflows
 
 
@@ -186,23 +206,29 @@ def dispatch_release(
     token: str,
     repo: str,
     ref: str = "main",
+    mode: str = "release",
+    repo_prefix: str = "kernels-community",
     dispatch_key_prefix: str = "",
     local: bool = False,
+    dry_run: bool = False,
     skip_build: bool = False,
     pr_number: str = "",
     target_branch: str = "",
     upload: bool = True,
 ) -> ReleaseDispatchResult:
     """
-    Dispatch the appropriate release workflows for a kernel.
+    Dispatch the appropriate build workflows for a kernel.
 
     Args:
         kernel_name: Name of the kernel directory.
         token: GitHub API token.
         repo: GitHub repository in "owner/repo" format.
         ref: Git ref to dispatch against (default "main").
+        mode: Build mode - "pr" for CI builds, "release" for full builds.
+        repo_prefix: Hub org prefix for uploads (default "kernels-community").
         dispatch_key_prefix: Optional prefix for dispatch keys (e.g. "pr42-").
         local: Run locally via act instead of remote dispatch.
+        dry_run: Print what would be dispatched without actually dispatching.
         skip_build: Skip build and upload steps.
         pr_number: Optional PR number to checkout before building.
         target_branch: Target branch for upload.
@@ -220,18 +246,54 @@ def dispatch_release(
 
     result = ReleaseDispatchResult(kernel_name=kernel_name)
 
+    backends = read_backends(kernel_name) or []
     workflows = select_workflows(kernel_name)
+
+    # Invert BACKEND_TO_WORKFLOWS so we can scope backends per workflow.
+    workflow_to_backends: dict[str, set[str]] = {}
+    for backend, wfs in BACKEND_TO_WORKFLOWS.items():
+        for wf in wfs:
+            workflow_to_backends.setdefault(wf, set()).add(backend)
+
     skipped_workflows = set(RELEASE_WORKFLOWS) - workflows
     result.skipped = sorted(skipped_workflows)
 
     api_base = f"https://api.github.com/repos/{repo}"
     for workflow in workflows:
+        # Only pass backends that this workflow can actually build.
+        scoped = sorted(b for b in backends if b in workflow_to_backends.get(workflow, set()))
+        backends_csv = ",".join(scoped)
+
         dispatch_key = (
             f"{dispatch_key_prefix}{kernel_name}-{workflow}-{uuid.uuid4().hex[:12]}"
         )
+        if dry_run:
+            inputs = {
+                "kernel_name": kernel_name,
+                "dispatch_key": dispatch_key,
+                "mode": mode,
+                "backends": backends_csv,
+                "repo_prefix": repo_prefix,
+            }
+            if skip_build:
+                inputs["skip_build"] = "true"
+            if pr_number:
+                inputs["pr_number"] = pr_number
+            if target_branch:
+                inputs["target_branch"] = target_branch
+            if not upload:
+                inputs["upload"] = "false"
+            dispatch_body = {"ref": ref, "inputs": inputs}
+            print(f"\n[dry-run] {workflow}:")
+            print(json.dumps(dispatch_body, indent=2))
+            result.dispatched.append((workflow, dispatch_key))
+            continue
         if local:
             if run_local(
                 workflow, kernel_name,
+                mode=mode,
+                backends=backends_csv,
+                repo_prefix=repo_prefix,
                 skip_build=skip_build,
                 pr_number=pr_number,
                 target_branch=target_branch,
@@ -245,6 +307,9 @@ def dispatch_release(
             inputs = {
                 "kernel_name": kernel_name,
                 "dispatch_key": dispatch_key,
+                "mode": mode,
+                "backends": backends_csv,
+                "repo_prefix": repo_prefix,
             }
             if skip_build:
                 inputs["skip_build"] = "true"
@@ -279,6 +344,10 @@ def main() -> int:
         "--ref", default="main", help="Git ref to dispatch on (default: main)"
     )
     parser.add_argument(
+        "--mode", default="release", choices=["pr", "release"],
+        help="Build mode: pr (CI only) or release (build + upload) (default: release)",
+    )
+    parser.add_argument(
         "--repo", default=None, help="GitHub repo in owner/repo format (default: auto-detect)"
     )
     parser.add_argument(
@@ -301,22 +370,33 @@ def main() -> int:
         "--no-upload", action="store_true",
         help="Build only, do not upload",
     )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print the dispatch payloads without actually dispatching",
+    )
+    parser.add_argument(
+        "--repo-prefix", default="kernels-community",
+        help="Hub org prefix for uploads (default: kernels-community)",
+    )
     args = parser.parse_args()
 
     common = dict(
+        mode=args.mode,
+        repo_prefix=args.repo_prefix,
+        dry_run=args.dry_run,
         skip_build=args.skip_build,
         pr_number=args.pr_number,
         target_branch=args.target_branch,
         upload=not args.no_upload,
     )
 
-    if args.local:
+    if args.dry_run or args.local:
         result = dispatch_release(
             args.kernel_name,
             token="",
-            repo="",
+            repo=args.repo or "",
             ref=args.ref,
-            local=True,
+            local=args.local,
             **common,
         )
     else:

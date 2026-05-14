@@ -64,4 +64,4 @@ jobs:
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
           REF="${{ github.event.repository.default_branch || 'main' }}"
-          python3 .github/scripts/dispatch_release.py "$KERNEL" --ref "$REF"
+          python3 .github/scripts/dispatch.py "$KERNEL" --ref "$REF" --mode release
