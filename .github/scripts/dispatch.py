@@ -62,40 +62,6 @@ def github_api_request(
         return resp.status, resp.read().decode("utf-8")
 
 
-def run_local(
-    workflow: str,
-    kernel_name: str,
-    *,
-    mode: str = "release",
-    backends: str = "",
-    repo_prefix: str = "kernels-community",
-    skip_build: bool = False,
-    pr_number: str = "",
-    target_branch: str = "",
-    upload: bool = True,
-) -> bool:
-    """Run a release workflow locally via act."""
-    cmd = [
-        "act", "workflow_dispatch",
-        "--container-options", "--privileged",
-        "-W", f".github/workflows/{workflow}",
-        "--input", f"kernel_name={kernel_name}",
-        "--input", f"mode={mode}",
-        "--input", f"backends={backends}",
-        "--input", f"repo_prefix={repo_prefix}",
-    ]
-    if skip_build:
-        cmd.extend(["--input", "skip_build=true"])
-    if pr_number:
-        cmd.extend(["--input", f"pr_number={pr_number}"])
-    if target_branch:
-        cmd.extend(["--input", f"target_branch={target_branch}"])
-    if not upload:
-        cmd.extend(["--input", "upload=false"])
-    print(f"Running locally: {' '.join(cmd)}")
-    result = subprocess.run(cmd)
-    return result.returncode == 0
-
 
 def get_token() -> str | None:
     """Resolve GitHub token: env var first, then ``gh auth token`` fallback."""
@@ -209,7 +175,6 @@ def dispatch_release(
     mode: str = "release",
     repo_prefix: str = "kernels-community",
     dispatch_key_prefix: str = "",
-    local: bool = False,
     dry_run: bool = False,
     skip_build: bool = False,
     pr_number: str = "",
@@ -227,7 +192,6 @@ def dispatch_release(
         mode: Build mode - "pr" for CI builds, "release" for full builds.
         repo_prefix: Hub org prefix for uploads (default "kernels-community").
         dispatch_key_prefix: Optional prefix for dispatch keys (e.g. "pr42-").
-        local: Run locally via act instead of remote dispatch.
         dry_run: Print what would be dispatched without actually dispatching.
         skip_build: Skip build and upload steps.
         pr_number: Optional PR number to checkout before building.
@@ -288,49 +252,34 @@ def dispatch_release(
             print(json.dumps(dispatch_body, indent=2))
             result.dispatched.append((workflow, dispatch_key))
             continue
-        if local:
-            if run_local(
-                workflow, kernel_name,
-                mode=mode,
-                backends=backends_csv,
-                repo_prefix=repo_prefix,
-                skip_build=skip_build,
-                pr_number=pr_number,
-                target_branch=target_branch,
-                upload=upload,
-            ):
-                result.dispatched.append((workflow, dispatch_key))
-            else:
-                result.failed.append((workflow, 0))
-        else:
-            dispatch_url = f"{api_base}/actions/workflows/{workflow}/dispatches"
-            inputs = {
-                "kernel_name": kernel_name,
-                "dispatch_key": dispatch_key,
-                "mode": mode,
-                "backends": backends_csv,
-                "repo_prefix": repo_prefix,
-            }
-            if skip_build:
-                inputs["skip_build"] = "true"
-            if pr_number:
-                inputs["pr_number"] = pr_number
-            if target_branch:
-                inputs["target_branch"] = target_branch
-            if not upload:
-                inputs["upload"] = "false"
-            dispatch_body = {
-                "ref": ref,
-                "inputs": inputs,
-            }
-            try:
-                print(f"Dispatching {workflow} for kernel `{kernel_name}` on ref `{ref}`")
-                github_api_request(dispatch_url, token, method="POST", data=dispatch_body)
-                result.dispatched.append((workflow, dispatch_key))
-            except urllib.error.HTTPError as e:
-                err_text = e.read().decode("utf-8", errors="replace")
-                print(f"Failed to dispatch {workflow} (HTTP {e.code}): {err_text}", file=sys.stderr)
-                result.failed.append((workflow, e.code))
+        dispatch_url = f"{api_base}/actions/workflows/{workflow}/dispatches"
+        inputs = {
+            "kernel_name": kernel_name,
+            "dispatch_key": dispatch_key,
+            "mode": mode,
+            "backends": backends_csv,
+            "repo_prefix": repo_prefix,
+        }
+        if skip_build:
+            inputs["skip_build"] = "true"
+        if pr_number:
+            inputs["pr_number"] = pr_number
+        if target_branch:
+            inputs["target_branch"] = target_branch
+        if not upload:
+            inputs["upload"] = "false"
+        dispatch_body = {
+            "ref": ref,
+            "inputs": inputs,
+        }
+        try:
+            print(f"Dispatching {workflow} for kernel `{kernel_name}` on ref `{ref}`")
+            github_api_request(dispatch_url, token, method="POST", data=dispatch_body)
+            result.dispatched.append((workflow, dispatch_key))
+        except urllib.error.HTTPError as e:
+            err_text = e.read().decode("utf-8", errors="replace")
+            print(f"Failed to dispatch {workflow} (HTTP {e.code}): {err_text}", file=sys.stderr)
+            result.failed.append((workflow, e.code))
 
     return result
 
@@ -349,10 +298,6 @@ def main() -> int:
     )
     parser.add_argument(
         "--repo", default=None, help="GitHub repo in owner/repo format (default: auto-detect)"
-    )
-    parser.add_argument(
-        "--local", action="store_true",
-        help="Run release workflows locally via act instead of dispatching remotely",
     )
     parser.add_argument(
         "--skip-build", action="store_true",
@@ -390,13 +335,12 @@ def main() -> int:
         upload=not args.no_upload,
     )
 
-    if args.dry_run or args.local:
+    if args.dry_run:
         result = dispatch_release(
             args.kernel_name,
             token="",
             repo=args.repo or "",
             ref=args.ref,
-            local=args.local,
             **common,
         )
     else:
