@@ -1,0 +1,10 @@
+[general]
+name = "amd-triton-kernels"
+license = "Apache-2.0"
+version = 1
+backends = [
+    "rocm",
+]
+
+[general.hub]
+repo-id = "kernels-community/amd-triton-kernels"
