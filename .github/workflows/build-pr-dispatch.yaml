@@ -40,9 +40,7 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
-          # TODO: revert --ref to main before merging (needed for bootstrap testing)
           python3 .github/scripts/dispatch.py "$KERNEL" \
-            --ref revamp-release-pipeline \
             --mode pr \
             --pr-number "${{ github.event.pull_request.number }}" \
             --no-upload

@@ -63,5 +63,5 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           KERNEL="${{ steps.validate.outputs.kernel }}"
-          # TODO: revert --ref to default_branch before merging (needed for bootstrap testing)
-          python3 .github/scripts/dispatch.py "$KERNEL" --ref revamp-release-pipeline --mode release
+          REF="${{ github.event.repository.default_branch || 'main' }}"
+          python3 .github/scripts/dispatch.py "$KERNEL" --ref "$REF" --mode release
