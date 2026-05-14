@@ -1109,6 +1109,7 @@ struct BwdKernelLauncher {
         compat::experimental::launch<
             mhd_convert_dq<decltype(trait)>,
             mhacvtDeviceNameBwd<decltype(trait)>>(policy2, trait, param);
+        compat::wait_and_throw();
         
         return cutlass::Status::kSuccess;
     }
