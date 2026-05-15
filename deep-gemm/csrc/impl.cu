@@ -5,6 +5,20 @@
 #include <variant>
 #include <vector>
 
+// CUTLASS 4.0 uses _MSVC_LANG to detect C++17, but one platform shim still
+// checks __cplusplus. MSVC leaves that macro stale unless /Zc:__cplusplus is
+// passed, so provide the missing aliases for Windows NVCC builds.
+#if defined(_MSC_VER) && defined(__CUDACC__) && (__cplusplus < 201703L)
+#include <type_traits>
+#include <cutlass/platform/platform.h>
+namespace cutlass::platform {
+template <typename T>
+inline constexpr bool is_integral_v = std::is_integral<T>::value;
+template <typename T>
+inline constexpr bool is_unsigned_v = std::is_unsigned<T>::value;
+}  // namespace cutlass::platform
+#endif
+
 // Upstream's DG_UNIFIED_ASSERT maps to device `trap` whenever NVCC is compiling.
 // In Kernel Hub builds, that also affects NVCC's host pass and breaks x86 asm.
 #ifndef DG_UNIFIED_ASSERT
