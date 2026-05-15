@@ -6,7 +6,12 @@
 #include <random>
 #include <string>
 #include <memory>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include "exception.hpp"
 #include "format.hpp"
@@ -34,18 +39,34 @@ static dtype_t get_env(const std::string& name, const dtype_t& default_value = d
 
 static std::tuple<int, std::string> call_external_command(std::string command) {
     command = command + " 2>&1";
-    const auto deleter = [](FILE* f) { if (f) pclose(f); };
+    const auto deleter = [](FILE* f) {
+        if (f) {
+#ifdef _WIN32
+            _pclose(f);
+#else
+            pclose(f);
+#endif
+        }
+    };
+#ifdef _WIN32
+    std::unique_ptr<FILE, decltype(deleter)> pipe(_popen(command.c_str(), "r"), deleter);
+#else
     std::unique_ptr<FILE, decltype(deleter)> pipe(popen(command.c_str(), "r"), deleter);
+#endif
     DG_HOST_ASSERT(pipe != nullptr);
 
     std::array<char, 512> buffer;
     std::string output;
     while (fgets(buffer.data(), buffer.size(), pipe.get()))
         output += buffer.data();
+#ifdef _WIN32
+    const auto exit_code = _pclose(pipe.release());
+#else
     const auto status = pclose(pipe.release());
     // NOTES: if the child was killed by a signal (e.g., SIGINT from Ctrl+C),
     // WEXITSTATUS would incorrectly return 0. Treat signal death as failure.
     const auto exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+#endif
     return {exit_code, output};
 }
 
@@ -95,7 +116,12 @@ static std::string get_uuid() {
         }
     };
 
-    std::string uuid = std::to_string(getpid()) + "-";
+#ifdef _WIN32
+    const auto pid = _getpid();
+#else
+    const auto pid = getpid();
+#endif
+    std::string uuid = std::to_string(pid) + "-";
     append_hex_u32(uuid, dist(gen));
     uuid += "-";
     append_hex_u32(uuid, dist(gen));
