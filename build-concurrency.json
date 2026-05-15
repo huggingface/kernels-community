@@ -2,7 +2,7 @@
   "flash-attn2": {
     "xpu": {
       "max-jobs": 1,
-      "cores": 8
+      "cores": 4
     }
   }
 }
