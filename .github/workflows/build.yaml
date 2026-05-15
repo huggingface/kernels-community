@@ -64,8 +64,10 @@ jobs:
       - name: Validate PR number
         if: inputs.pr_number != ''
         id: validate-pr
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
-          case "${{ inputs.pr_number }}" in
+          case "$PR_NUMBER" in
             ''|*[!0-9]*)
               echo "Invalid pr_number input: must be numeric"
               exit 1
@@ -99,8 +101,9 @@ jobs:
       # Ensure the kernel directory exists and has the required config files.
       - name: Validate kernel directory
         id: validate
+        env:
+          KERNEL: ${{ inputs.kernel_name }}
         run: |
-          KERNEL="${{ inputs.kernel_name }}"
           if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$KERNEL/build.toml" ]; then
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
@@ -111,8 +114,9 @@ jobs:
       # PR-only: verify the kernel has a Hub repo-id before burning CI time.
       - name: Check that repo-id is present
         if: steps.validate.outputs.skip == 'false' && inputs.mode == 'pr'
+        env:
+          KERNEL: ${{ steps.validate.outputs.kernel }}
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
           if ! cat $KERNEL/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
             echo "Mandatory repo-id is missing in $KERNEL/build.toml"
             exit 1
@@ -125,7 +129,6 @@ jobs:
         env:
           KERNEL: ${{ steps.validate.outputs.kernel }}
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
           if [ "${{ inputs.mode }}" = "pr" ]; then
             NIX_TARGET="backendCi"
           else
@@ -177,8 +180,9 @@ jobs:
       # PR mode builds backendCi (single representative variant);
       # release mode builds backendBundle (full set of variants).
       - name: Build kernel
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
         run: |
-          KERNEL="${{ needs.setup.outputs.kernel }}"
           if [ "${{ inputs.mode }}" = "pr" ]; then
             ( cd "$KERNEL" && nix build -L .#backendCi.${{ matrix.backend }} && ls -l result/ )
           else
@@ -190,23 +194,26 @@ jobs:
         if: inputs.mode != 'pr' && inputs.upload != false
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+          REPO_PREFIX: ${{ inputs.repo_prefix }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
-          KERNEL="${{ needs.setup.outputs.kernel }}"
           cd "$KERNEL"
           BRANCH_FLAG=""
-          if [ -n "${{ inputs.target_branch }}" ]; then
-            BRANCH_FLAG="--branch ${{ inputs.target_branch }}"
+          if [ -n "$TARGET_BRANCH" ]; then
+            BRANCH_FLAG="--branch $TARGET_BRANCH"
           fi
-          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "${{ inputs.repo_prefix }}/$KERNEL" $BRANCH_FLAG
-          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "${{ inputs.repo_prefix }}/$KERNEL" $BRANCH_FLAG
+          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "$REPO_PREFIX/$KERNEL" $BRANCH_FLAG
+          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "$REPO_PREFIX/$KERNEL" $BRANCH_FLAG
 
       # v1 kernels without an explicit branch override also get uploaded to main.
       - name: Upload v1 kernels to main
         if: inputs.mode != 'pr' && inputs.upload != false && inputs.target_branch == ''
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+          REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
-          KERNEL="${{ needs.setup.outputs.kernel }}"
           cd "$KERNEL"
 
           # Check if build.toml exists, has version = 1, and does not specify a branch.
@@ -214,8 +221,8 @@ jobs:
             VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
             BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
             if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
-              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "${{ inputs.repo_prefix }}/$KERNEL" --branch main
-              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "${{ inputs.repo_prefix }}/$KERNEL" --branch main
+              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "$REPO_PREFIX/$KERNEL" --branch main
+              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "$REPO_PREFIX/$KERNEL" --branch main
             fi
           fi
 
@@ -258,16 +265,18 @@ jobs:
 
       # Build the test binary that will run on the GPU runner.
       - name: Build ci-test
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
         run: |
-          KERNEL="${{ needs.setup.outputs.kernel }}"
           ( cd "$KERNEL" && nix build -L .#ci-test )
 
       # Serialize the full Nix closure so the GPU runner can import it
       # without needing to rebuild or have access to the Nix store.
       - name: Export ci-test closure
         id: export-closure
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
         run: |
-          KERNEL="${{ needs.setup.outputs.kernel }}"
           CI_TEST_PATH=$(readlink -f "$KERNEL/result")
           echo "ci-test-path=$CI_TEST_PATH" >> $GITHUB_OUTPUT
           nix-store --export $(nix-store -qR "$CI_TEST_PATH") | nix run nixpkgs#zstd -- -T0 > ci-test-closure.nar.zst
