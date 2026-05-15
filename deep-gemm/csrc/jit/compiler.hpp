@@ -2,13 +2,13 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
+#include <cstdio>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #ifdef DG_ENABLE_NVRTC_COMPILER
 #include <nvrtc.h>
 #endif
-#include <regex>
 #include <string>
 
 #include "../utils/exception.hpp"
@@ -178,6 +178,14 @@ DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, cuobjdump_path);
 class NVCCCompiler final: public Compiler {
     std::filesystem::path nvcc_path;
 
+    static bool parse_nvcc_release(const std::string& output, int& major, int& minor) {
+        const std::string marker = "release ";
+        const auto pos = output.find(marker);
+        if (pos == std::string::npos)
+            return false;
+        return std::sscanf(output.c_str() + pos + marker.size(), "%d.%d", &major, &minor) == 2;
+    }
+
     std::pair<int, int> get_nvcc_version() const {
         DG_HOST_ASSERT(std::filesystem::exists(nvcc_path));
 
@@ -188,9 +196,7 @@ class NVCCCompiler final: public Compiler {
 
         // The version should be at least 12.3, for the best performance with 12.9
         int major, minor;
-        std::smatch match;
-        DG_HOST_ASSERT(std::regex_search(output, match, std::regex(R"(release (\d+\.\d+))")));
-        std::sscanf(match[1].str().c_str(), "%d.%d", &major, &minor);
+        DG_HOST_ASSERT(parse_nvcc_release(output, major, minor));
         DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVCC version should be >= 12.3");
         if (major == 12 and minor < 9)
             printf("Warning: please use at least NVCC 12.9 for the best DeepGEMM performance\n");
@@ -250,7 +256,7 @@ public:
 
         // Check local memory usage
         if (get_env("DG_JIT_PTXAS_CHECK", 0))
-            DG_HOST_ASSERT(not std::regex_search(output, std::regex(R"(Local memory used)")));
+            DG_HOST_ASSERT(output.find("Local memory used") == std::string::npos);
 
         // Print PTXAS log
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0))
@@ -298,11 +304,19 @@ public:
         put(code_path, code);
 
         // Parse compilation options
-        std::istringstream iss(flags);
         std::vector<std::string> options;
-        std::string option;
-        while (iss >> option)
-            options.push_back(option);
+        size_t option_begin = 0;
+        while (option_begin < flags.size()) {
+            while (option_begin < flags.size() and flags[option_begin] == ' ')
+                ++ option_begin;
+            if (option_begin == flags.size())
+                break;
+            auto option_end = flags.find(' ', option_begin);
+            if (option_end == std::string::npos)
+                option_end = flags.size();
+            options.push_back(flags.substr(option_begin, option_end - option_begin));
+            option_begin = option_end + (option_end < flags.size());
+        }
 
         // Convert to C-style string array for NVRTC
         std::vector<const char*> option_cstrs;

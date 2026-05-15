@@ -22,7 +22,6 @@ depends = ["torch", "cutlass_4_0"]
 include = [
   "csrc",
   "deep_gemm/include",
-  "third-party/fmt/include",
 ]
 cuda-flags = [
   "-std=c++20",
@@ -132,21 +131,8 @@ src = [
   "deep_gemm/include/deep_gemm/scheduler/gemm.cuh",
   "deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh",
   "deep_gemm/include/deep_gemm/scheduler/paged_mqa_logits.cuh",
-  "third-party/fmt/include/fmt/args.h",
-  "third-party/fmt/include/fmt/base.h",
-  "third-party/fmt/include/fmt/chrono.h",
-  "third-party/fmt/include/fmt/color.h",
-  "third-party/fmt/include/fmt/compile.h",
-  "third-party/fmt/include/fmt/core.h",
-  "third-party/fmt/include/fmt/format-inl.h",
-  "third-party/fmt/include/fmt/format.h",
-  "third-party/fmt/include/fmt/os.h",
-  "third-party/fmt/include/fmt/ostream.h",
-  "third-party/fmt/include/fmt/printf.h",
-  "third-party/fmt/include/fmt/ranges.h",
-  "third-party/fmt/include/fmt/std.h",
-  "third-party/fmt/include/fmt/xchar.h",
 ]
 
 [general.hub]
 repo-id = "kernels-community/deep-gemm"
+branch = "v2-no-regex"

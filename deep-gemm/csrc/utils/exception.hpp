@@ -3,7 +3,6 @@
 #include <cublasLt.h>
 #include <exception>
 #include <string>
-#include <sstream>
 
 #include "compatibility.hpp"
 
@@ -54,11 +53,10 @@ do { \
 do { \
     const auto e = (cmd); \
     if (e != CUDA_SUCCESS) { \
-        std::stringstream ss; \
         const char *name, *info; \
         lazy_cuGetErrorName(e, &name), lazy_cuGetErrorString(e, &info); \
-        ss << static_cast<int>(e) << " (" << name << ", " << info << ")"; \
-        throw DGException("CUDA driver", __FILE__, __LINE__, ss.str()); \
+        throw DGException("CUDA driver", __FILE__, __LINE__, \
+                          std::to_string(static_cast<int>(e)) + " (" + name + ", " + info + ")"); \
     } \
 } while (0)
 #endif
@@ -68,9 +66,8 @@ do { \
 do { \
     const auto e = (cmd); \
     if (e != cudaSuccess) { \
-        std::stringstream ss; \
-        ss << static_cast<int>(e) << " (" << cudaGetErrorName(e) << ", " << cudaGetErrorString(e) << ")"; \
-        throw DGException("CUDA runtime", __FILE__, __LINE__, ss.str()); \
+        throw DGException("CUDA runtime", __FILE__, __LINE__, \
+                          std::to_string(static_cast<int>(e)) + " (" + cudaGetErrorName(e) + ", " + cudaGetErrorString(e) + ")"); \
     } \
 } while (0)
 #endif
@@ -99,9 +96,8 @@ inline const char* cublasGetStatusString(cublasStatus_t status) {
 do { \
     const auto e = (cmd); \
     if (e != CUBLAS_STATUS_SUCCESS) { \
-        std::ostringstream ss; \
-        ss << static_cast<int>(e) << " (" << cublasGetStatusString(e) << ")"; \
-        throw DGException("cuBLASLt", __FILE__, __LINE__, ss.str()); \
+        throw DGException("cuBLASLt", __FILE__, __LINE__, \
+                          std::to_string(static_cast<int>(e)) + " (" + cublasGetStatusString(e) + ")"); \
     } \
 } while (0)
 #endif

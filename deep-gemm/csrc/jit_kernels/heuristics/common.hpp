@@ -38,9 +38,15 @@ static GemmConfig get_best_config(const GemmDesc& desc) {
 
     // Print configs for the first time
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
-        std::stringstream ss;
-        ss << desc;
-        const auto key = ss.str();
+        const auto key = fmt::format("{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                                     static_cast<int>(desc.gemm_type), static_cast<int>(desc.kernel_type),
+                                     desc.m, desc.n, desc.k, desc.num_groups,
+                                     static_cast<int>(desc.a_dtype), static_cast<int>(desc.b_dtype),
+                                     static_cast<int>(desc.cd_dtype), static_cast<int>(desc.major_a),
+                                     static_cast<int>(desc.major_b), static_cast<int>(desc.with_accumulation),
+                                     desc.num_sms, desc.tc_util, desc.compiled_dims,
+                                     desc.expected_m, desc.expected_n, desc.expected_k,
+                                     desc.expected_num_groups);
 
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {
