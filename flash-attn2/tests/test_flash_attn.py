@@ -2026,7 +2026,8 @@ def test_flash_attn_kvcache(
     if device == "cpu":
         pytest.skip("kvcache not supported on CPU")
     if device == "xpu":
-        pytest.skip("kvcache not supported on xpu currently")
+        if alibi:
+            pytest.skip("alibi not supported on xpu currently")
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
