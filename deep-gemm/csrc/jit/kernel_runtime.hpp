@@ -39,8 +39,10 @@ public:
         // NOLINT(*-pro-type-member-init)
         const auto cuobjdump_path = cuda_home / "bin" / "cuobjdump";
         const auto cubin_path = dir_path / "kernel.cubin";
+        const auto cubin_path_str = cubin_path.string();
+        const auto dir_path_str = dir_path.string();
         if (get_env<int>("DG_JIT_DEBUG"))
-            printf("Loading CUBIN: %s\n", cubin_path.c_str());
+            printf("Loading CUBIN: %s\n", cubin_path_str.c_str());
 
         // Record start time
         std::chrono::high_resolution_clock::time_point start_time;
@@ -54,7 +56,7 @@ public:
         // Find the only symbol
         // TODO: use kernel enumeration for newer drivers
         const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal", "__assertfail"};
-        const auto [exit_code, symbols] = call_external_command(fmt::format("{} -symbols {}", cuobjdump_path.c_str(), cubin_path.c_str()));
+        const auto [exit_code, symbols] = call_external_command(fmt::format("{} -symbols {}", cuobjdump_path.string(), cubin_path_str));
         DG_HOST_ASSERT(exit_code == 0);
         std::vector<std::string> symbol_names;
         size_t line_begin = 0;
@@ -75,7 +77,7 @@ public:
         // Print symbols
         if (symbol_names.size() != 1 or get_env<int>("DG_JIT_DEBUG")) {
             printf("Symbols: ");
-            printf(" > CUBIN: %s\n", cubin_path.c_str());
+            printf(" > CUBIN: %s\n", cubin_path_str.c_str());
             printf(" > Raw symbols: %s\n", symbols.c_str());
             printf(" > Parsed symbols:\n");
             for (const auto& symbol: symbol_names)
@@ -90,7 +92,7 @@ public:
         // Print load time
         if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_JIT_PRINT_LOAD_TIME")) {
             std::chrono::duration<double, std::milli> load_time = std::chrono::high_resolution_clock::now() - start_time;
-            printf("Load time (%s): %.2lf ms\n", dir_path.c_str(), load_time.count());
+            printf("Load time (%s): %.2lf ms\n", dir_path_str.c_str(), load_time.count());
         }
     }
 
@@ -106,9 +108,10 @@ public:
         // because the directory is created atomically via rename
         if (not std::filesystem::exists(dir_path / "kernel.cu") or
             not std::filesystem::exists(dir_path / "kernel.cubin")) {
+            const auto dir_path_str = dir_path.string();
             printf("Corrupted JIT cache directory (missing kernel.cu or kernel.cubin): %s, "
                    "please run `rm -rf %s` and restart your task.\n",
-                   dir_path.c_str(), dir_path.c_str());
+                   dir_path_str.c_str(), dir_path_str.c_str());
             DG_HOST_ASSERT(false and "Corrupted JIT cache directory");
         }
         return true;

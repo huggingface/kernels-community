@@ -3,7 +3,13 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cstdio>
+#ifdef _WIN32
+#include <io.h>
 #include <fcntl.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <filesystem>
 #include <fstream>
 #ifdef DG_ENABLE_NVRTC_COMPILER
@@ -75,11 +81,20 @@ public:
     }
 
     static void fsync_path(const std::filesystem::path& path) {
-        const auto fd = ::open(path.c_str(), O_RDONLY);
+        const auto path_str = path.string();
+#ifdef _WIN32
+        const auto fd = ::_open(path_str.c_str(), _O_RDONLY);
+        if (fd >= 0) {
+            ::_commit(fd);
+            ::_close(fd);
+        }
+#else
+        const auto fd = ::open(path_str.c_str(), O_RDONLY);
         if (fd >= 0) {
             ::fsync(fd);
             ::close(fd);
         }
+#endif
     }
 
     // Recursively fsync a directory: files and subdirectories first (bottom-up), then the directory itself
@@ -157,7 +172,7 @@ public:
 
     static void disassemble(const std::filesystem::path &cubin_path, const std::filesystem::path &sass_path) {
         // Disassemble the CUBIN file to SASS
-        const auto command = fmt::format("{} --dump-sass {} > {}", cuobjdump_path.c_str(), cubin_path.c_str(), sass_path.c_str());
+        const auto command = fmt::format("{} --dump-sass {} > {}", cuobjdump_path.string(), cubin_path.string(), sass_path.string());
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
             printf("Running cuobjdump command: %s\n", command.c_str());
         const auto [return_code, output] = call_external_command(command);
@@ -218,7 +233,7 @@ public:
         flags = fmt::format("{} -I{} {}--gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), get_cutlass_include_flags(), arch);
+                            flags, library_include_path.string(), get_cutlass_include_flags(), arch);
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path,
@@ -232,7 +247,7 @@ public:
         // Avoid cwd files shadowing C++ standard library headers
         const auto compile_dir = make_tmp_dir();
         const auto command = fmt::format("cd {} && {} {} -cubin -o {} {}",
-            compile_dir.c_str(), nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
+            compile_dir.string(), nvcc_path.string(), code_path.string(), cubin_path.string(), flags);
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
             printf("Running NVCC command: %s\n", command.c_str());
         const auto [return_code, output] = call_external_command(command);
@@ -244,7 +259,7 @@ public:
         // Compile to PTX if needed
         if (ptx_path.has_value()) {
             const auto ptx_command = fmt::format("cd {} && {} {} -ptx -o {} {}",
-                compile_dir.c_str(), nvcc_path.c_str(), code_path.c_str(), ptx_path->c_str(), flags);
+                compile_dir.string(), nvcc_path.string(), code_path.string(), ptx_path->string(), flags);
             if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
                 printf("Running NVCC PTX command: %s\n", ptx_command.c_str());
             const auto [ptx_return_code, ptx_output] = call_external_command(ptx_command);
