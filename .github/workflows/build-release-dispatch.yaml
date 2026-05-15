@@ -45,6 +45,14 @@ jobs:
               echo "skip=true" >> $GITHUB_OUTPUT
             fi
           else
+            # Verify PR was merged by a trusted user
+            MERGED_BY="${{ github.event.pull_request.merged_by.login }}"
+            AUTHOR_ASSOCIATION="${{ github.event.pull_request.author_association }}"
+            if [[ "$AUTHOR_ASSOCIATION" != "MEMBER" && "$AUTHOR_ASSOCIATION" != "OWNER" && "$AUTHOR_ASSOCIATION" != "COLLABORATOR" ]]; then
+              echo "PR not merged by trusted user (association: $AUTHOR_ASSOCIATION)"
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
             if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "release"); then
               echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
               echo "skip=false" >> $GITHUB_OUTPUT
