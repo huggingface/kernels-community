@@ -10,7 +10,6 @@ __global__ void relu_kernel(float *__restrict__ out,
   for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
     auto x = input[token_idx * d + idx];
     out[token_idx * d + idx] = x > 0.0f ? x : 0.0f;
-    out[token_idx * d + idx] += 0.1f; // test change
   }
 }
 
