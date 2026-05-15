@@ -38,8 +38,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          KERNEL: ${{ steps.validate.outputs.kernel }}
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
           python3 .github/scripts/dispatch.py "$KERNEL" \
             --mode pr \
             --pr-number "${{ github.event.pull_request.number }}" \
