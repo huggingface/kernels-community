@@ -1,0 +1,7 @@
+[general]
+name = "hydra"
+license = "MIT"
+backends = ["cuda"]
+
+[general.hub]
+repo-id = "kernels-community/hydra"
