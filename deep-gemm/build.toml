@@ -135,4 +135,4 @@ src = [
 
 [general.hub]
 repo-id = "kernels-community/deep-gemm"
-branch = "v2-no-regex"
+branch = "v2"
