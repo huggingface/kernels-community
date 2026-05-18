@@ -1,0 +1,327 @@
+name: Build
+run-name: >-
+  Build / ${{ inputs.kernel_name || '' }} / mode=${{ inputs.mode || 'release' }} / request=${{ inputs.dispatch_key || '' }}
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_name:
+        description: "Kernel directory name to build"
+        required: true
+        type: string
+      dispatch_key:
+        description: "Unique key for matching this run back to a bot dispatch"
+        required: false
+        type: string
+      mode:
+        description: "Build mode: pr (CI only) or release (build + upload)"
+        required: false
+        type: string
+        default: "release"
+      skip_build:
+        description: "Skip build and upload steps (for testing workflow plumbing)"
+        required: false
+        type: boolean
+        default: false
+      pr_number:
+        description: "Optional PR number to checkout before building"
+        required: false
+        type: string
+        default: ""
+      target_branch:
+        description: "Target branch for upload (default: repo default)"
+        required: false
+        type: string
+        default: ""
+      upload:
+        description: "Whether to upload after build"
+        required: false
+        type: boolean
+        default: true
+      repo_prefix:
+        description: "Hub org prefix for uploads (e.g. kernels-community, kernels-staging)"
+        required: false
+        type: string
+        default: "kernels-community"
+      backends:
+        description: "Comma-separated list of backends to build (e.g. cuda,cpu,rocm)"
+        required: false
+        type: string
+        default: ""
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # Validate inputs, resolve the kernel directory, and generate the build matrix.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.validate.outputs.skip }}
+      kernel: ${{ steps.validate.outputs.kernel }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      # Guard against injection via pr_number input.
+      - name: Validate PR number
+        if: inputs.pr_number != ''
+        id: validate-pr
+        run: |
+          case "${{ inputs.pr_number }}" in
+            ''|*[!0-9]*)
+              echo "Invalid pr_number input: must be numeric"
+              exit 1
+              ;;
+          esac
+
+      # When building for a PR, check out the PR head; otherwise use default branch.
+      - name: Checkout PR branch
+        if: inputs.pr_number != ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0
+      - name: Checkout default branch
+        if: inputs.pr_number == ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Nix toolchain + binary cache setup.
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 4
+            sandbox-fallback = false
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
+
+      # Ensure the kernel directory exists and has the required config files.
+      - name: Validate kernel directory
+        id: validate
+        run: |
+          KERNEL="${{ inputs.kernel_name }}"
+          if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$KERNEL/build.toml" ]; then
+            echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            echo "skip=true" >> $GITHUB_OUTPUT
+          fi
+
+      # PR-only: verify the kernel has a Hub repo-id before burning CI time.
+      - name: Check that repo-id is present
+        if: steps.validate.outputs.skip == 'false' && inputs.mode == 'pr'
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          if ! cat $KERNEL/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
+            echo "Mandatory repo-id is missing in $KERNEL/build.toml"
+            exit 1
+          fi
+
+      # PR mode uses backendCi (lighter, faster); release uses backendBundle (all variants).
+      - name: Generate build matrix
+        if: steps.validate.outputs.skip == 'false'
+        id: matrix
+        env:
+          KERNEL: ${{ steps.validate.outputs.kernel }}
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          if [ "${{ inputs.mode }}" = "pr" ]; then
+            NIX_TARGET="backendCi"
+          else
+            NIX_TARGET="backendBundle"
+          fi
+          X86_BACKENDS=$(cd "$KERNEL" && nix eval .#${NIX_TARGET} --apply builtins.attrNames --json --system x86_64-linux)
+          ARM_BACKENDS=$(cd "$KERNEL" && nix eval .#${NIX_TARGET} --apply builtins.attrNames --json --system aarch64-linux)
+          MATRIX=$(python3 .github/workflows/generate-build-matrix.py "$X86_BACKENDS" "$ARM_BACKENDS")
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+  # Compile the kernel for each (backend, arch) pair; release mode also uploads to the Hub.
+  build-kernel:
+    needs: setup
+    if: needs.setup.outputs.skip == 'false' && inputs.skip_build != true
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    runs-on:
+      group: ${{ matrix.runner }}
+    # PR builds get 10h; release builds get 20h (more variants to compile).
+    timeout-minutes: ${{ inputs.mode == 'pr' && 600 || 1200 }}
+    steps:
+      # When building for a PR, check out the PR head; otherwise use default branch.
+      - name: Checkout PR branch
+        if: inputs.pr_number != ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0
+      - name: Checkout default branch
+        if: inputs.pr_number == ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Nix toolchain + binary cache setup (uses matrix-specific concurrency limits).
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = ${{ matrix.max_jobs }}
+            cores = ${{ matrix.cores }}
+            sandbox-fallback = false
+      - name: Nix info
+        run: nix-shell -p nix-info --run "nix-info -m"
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
+
+      # PR mode builds backendCi (single representative variant);
+      # release mode builds backendBundle (full set of variants).
+      - name: Build kernel
+        run: |
+          KERNEL="${{ needs.setup.outputs.kernel }}"
+          if [ "${{ inputs.mode }}" = "pr" ]; then
+            ( cd "$KERNEL" && nix build -L .#backendCi.${{ matrix.backend }} && ls -l result/ )
+          else
+            ( cd "$KERNEL" && nix build -L .#backendBundle.${{ matrix.backend }} && ls -l result/ )
+          fi
+
+      # Upload built artifacts to both model and kernel Hub repos.
+      - name: Upload kernel to Hub
+        if: inputs.mode != 'pr' && inputs.upload != false
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          KERNEL="${{ needs.setup.outputs.kernel }}"
+          cd "$KERNEL"
+          BRANCH_FLAG=""
+          if [ -n "${{ inputs.target_branch }}" ]; then
+            BRANCH_FLAG="--branch ${{ inputs.target_branch }}"
+          fi
+          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "${{ inputs.repo_prefix }}/$KERNEL" $BRANCH_FLAG
+          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "${{ inputs.repo_prefix }}/$KERNEL" $BRANCH_FLAG
+
+      # v1 kernels without an explicit branch override also get uploaded to main.
+      - name: Upload v1 kernels to main
+        if: inputs.mode != 'pr' && inputs.upload != false && inputs.target_branch == ''
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          KERNEL="${{ needs.setup.outputs.kernel }}"
+          cd "$KERNEL"
+
+          # Check if build.toml exists, has version = 1, and does not specify a branch.
+          if [ -f "build.toml" ]; then
+            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
+            BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
+            if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
+              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "${{ inputs.repo_prefix }}/$KERNEL" --branch main
+              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "${{ inputs.repo_prefix }}/$KERNEL" --branch main
+            fi
+          fi
+
+  # Build the ci-test derivation and export its Nix closure as an artifact
+  # so the GPU test job can import it on a GPU-enabled runner.
+  build-ci-test:
+    needs: setup
+    if: needs.setup.outputs.skip == 'false' && inputs.mode == 'pr'
+    runs-on:
+      group: aws-highmemory-32-plus-nix
+    timeout-minutes: 600 # 10h
+    outputs:
+      ci-test-path: ${{ steps.export-closure.outputs.ci-test-path }}
+    steps:
+      # When building for a PR, check out the PR head; otherwise use default branch.
+      - name: Checkout PR branch
+        if: inputs.pr_number != ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0
+      - name: Checkout default branch
+        if: inputs.pr_number == ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Nix toolchain + binary cache setup.
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 12
+            sandbox-fallback = false
+      - name: Nix info
+        run: nix-shell -p nix-info --run "nix-info -m"
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
+
+      # Build the test binary that will run on the GPU runner.
+      - name: Build ci-test
+        run: |
+          KERNEL="${{ needs.setup.outputs.kernel }}"
+          ( cd "$KERNEL" && nix build -L .#ci-test )
+
+      # Serialize the full Nix closure so the GPU runner can import it
+      # without needing to rebuild or have access to the Nix store.
+      - name: Export ci-test closure
+        id: export-closure
+        run: |
+          KERNEL="${{ needs.setup.outputs.kernel }}"
+          CI_TEST_PATH=$(readlink -f "$KERNEL/result")
+          echo "ci-test-path=$CI_TEST_PATH" >> $GITHUB_OUTPUT
+          nix-store --export $(nix-store -qR "$CI_TEST_PATH") | nix run nixpkgs#zstd -- -T0 > ci-test-closure.nar.zst
+
+      # Upload the closure as a short-lived artifact for the GPU test job.
+      - name: Upload ci-test closure
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-test-closure
+          path: ci-test-closure.nar.zst
+          retention-days: 1
+
+  # Import the ci-test closure onto a GPU runner and execute the test suite.
+  # Runs after both build-kernel and build-ci-test complete.
+  test-kernel-gpu:
+    needs: [setup, build-kernel, build-ci-test]
+    if: needs.setup.outputs.skip == 'false' && inputs.mode == 'pr'
+    runs-on:
+      group: aws-g6-12xlarge-plus
+    steps:
+      # Nix toolchain + binary cache setup (needed to import the closure).
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 12
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
+
+      # Symlink host CUDA driver into the Nix-expected location.
+      - name: Setup Nix driver location
+        run: |
+          sudo mkdir -p /run/opengl-driver/lib
+          sudo find /usr/lib64 \
+            -name 'libcuda.so*' \
+            -exec ln -s {} /run/opengl-driver/lib/ \;
+          find /run/opengl-driver
+
+      # Retrieve the ci-test closure built in the previous job.
+      - name: Download ci-test closure
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ci-test-closure
+
+      # Decompress and import the closure into the local Nix store.
+      - name: Import ci-test closure
+        run: |
+          nix run nixpkgs#zstd -- -d ci-test-closure.nar.zst -c | nix-store --import
+
+      # Run the kernel's test suite on a real GPU.
+      - name: Run GPU tests
+        run: |
+          CI_TEST_PATH="${{ needs.build-ci-test.outputs.ci-test-path }}"
+          "$CI_TEST_PATH/bin/ci-test"

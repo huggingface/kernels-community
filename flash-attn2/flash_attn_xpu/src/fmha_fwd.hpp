@@ -44,27 +44,30 @@ struct decode_paged_policy_head256;
 struct decode_paged_policy_head512;
 
 // Dtype-specific dispatch functions (instantiated in per-head TUs)
-template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged>
+template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged,
+      bool HasRotary = false>
 void policy_dispatch_fp16(
     sycl::queue& queue,
     const fmha_fwd_args_t& args);
 
-template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged>
+template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged,
+      bool HasRotary = false>
 void policy_dispatch_bf16(
     sycl::queue& queue,
     const fmha_fwd_args_t& args);
 
 // Combined dispatch (delegates to fp16/bf16 based on cuType)
 // Defined inline in header so callers (fmha_fwd.cpp) can see the template body.
-template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged>
+template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged,
+          bool HasRotary = false>
 inline void policy_dispatch(
     sycl::queue& queue,
     CutlassType cuType,
     const fmha_fwd_args_t& args) {
   if (cuType == CutlassType::half) {
-    policy_dispatch_fp16<chunk_policy, PipelineStages, IsVarLen, IsPaged>(queue, args);
+    policy_dispatch_fp16<chunk_policy, PipelineStages, IsVarLen, IsPaged, HasRotary>(queue, args);
   } else {
-    policy_dispatch_bf16<chunk_policy, PipelineStages, IsVarLen, IsPaged>(queue, args);
+    policy_dispatch_bf16<chunk_policy, PipelineStages, IsVarLen, IsPaged, HasRotary>(queue, args);
   }
 }
 
@@ -119,6 +122,23 @@ EXTERN_DISPATCH_FIX(256)
 EXTERN_DISPATCH_FIX(512)
 #undef EXTERN_DISPATCH_FIX
 
+// KVCache + paged extern declarations (IsVarLen=0, IsPaged=1)
+#define EXTERN_DISPATCH_KVCACHE_PAGED(HDIM) \
+  extern template void policy_dispatch_fp16<prefill_policy_head##HDIM, PipelineStages_Prefill, 0, 1>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_fp16<decode_paged_policy_head##HDIM, PipelineStages_Decode, 0, 1>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_bf16<prefill_policy_head##HDIM, PipelineStages_Prefill, 0, 1>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_bf16<decode_paged_policy_head##HDIM, PipelineStages_Decode, 0, 1>(sycl::queue&, const fmha_fwd_args_t&);
+
+EXTERN_DISPATCH_KVCACHE_PAGED(32)
+EXTERN_DISPATCH_KVCACHE_PAGED(64)
+EXTERN_DISPATCH_KVCACHE_PAGED(96)
+EXTERN_DISPATCH_KVCACHE_PAGED(128)
+EXTERN_DISPATCH_KVCACHE_PAGED(160)
+EXTERN_DISPATCH_KVCACHE_PAGED(192)
+EXTERN_DISPATCH_KVCACHE_PAGED(256)
+EXTERN_DISPATCH_KVCACHE_PAGED(512)
+#undef EXTERN_DISPATCH_KVCACHE_PAGED
+
 void cutlass_fmha_fwd_varlen_impl(
     sycl::queue& queue,
     const at::Tensor& query,
@@ -158,3 +178,27 @@ void cutlass_fmha_fwd_fix_impl(
     void* s_dmask = nullptr,
     int seqlen_q_rounded = 0,
     int seqlen_k_rounded = 0);
+
+void cutlass_fmha_fwd_kvcache_impl(
+    sycl::queue& queue,
+    const at::Tensor& query,
+    const at::Tensor& kcache,
+    const at::Tensor& vcache,
+    at::Tensor& out,
+    at::Tensor& softmax_lse,
+    const at::Tensor& seqlens_k,
+    const std::optional<at::Tensor>& cache_batch_idx,
+    const std::optional<at::Tensor>& cache_leftpad,
+    const std::optional<at::Tensor>& knew,
+    const std::optional<at::Tensor>& vnew,
+    const std::optional<at::Tensor>& block_table,
+    const std::optional<at::Tensor>& rotary_cos,
+    const std::optional<at::Tensor>& rotary_sin,
+    int rotary_dim,
+    bool is_rotary_interleaved,
+    int max_seqlen_k_paged,
+    float sm_scale,
+    int window_size_left,
+    int window_size_right,
+    bool is_causal,
+    bool is_local);

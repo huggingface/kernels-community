@@ -47,7 +47,8 @@ template <
     class TensorV_,
     class TiledCopyQ_ = void,
     class TiledCopyK_ = void,
-    class TiledCopyV_ = void>
+    class TiledCopyV_ = void,
+    bool HasRotary_ = false>
 struct FMHAFwdMainloopXe2 {
   static_assert(
       cutlass::detail::dependent_false<DispatchPolicy_>,
@@ -70,7 +71,8 @@ template <
     class TensorV_,
     class TiledCopyQ_,
     class TiledCopyK_,
-    class TiledCopyV_>
+    class TiledCopyV_,
+    bool HasRotary_>
 struct FMHAFwdMainloopXe2<
     Xe2<Stages>,
     CausalMask_,
@@ -85,7 +87,8 @@ struct FMHAFwdMainloopXe2<
     TensorV_,
     TiledCopyQ_,
     TiledCopyK_,
-    TiledCopyV_> {
+    TiledCopyV_,
+    HasRotary_> {
 
   // Pull in common type aliases from the shared traits.
   using Traits = FMHAFwdMainloopTraits<
@@ -123,6 +126,7 @@ struct FMHAFwdMainloopXe2<
   static constexpr bool LocalMask  = LocalMask_;
   static constexpr bool HasDropout = HasDropout_;
   static constexpr bool PagedKV   = PagedKV_;
+  static constexpr bool HasRotary = HasRotary_;
 
   // User-facing arguments
   struct Arguments {
@@ -142,6 +146,10 @@ struct FMHAFwdMainloopXe2<
     int page_size = 0;
     int max_pages_per_seq = 0;
     int total_seqlen_kv = 0;
+    const typename TensorQ::element_type* rotary_cos = nullptr;
+    const typename TensorQ::element_type* rotary_sin = nullptr;
+    int rotary_dim = 0;
+    bool is_rotary_interleaved = true;
   };
 
   struct LocalMaskFields {
@@ -165,6 +173,14 @@ struct FMHAFwdMainloopXe2<
   };
   struct EmptyPaged {};
 
+  struct RotaryFields {
+    const typename TensorQ::element_type* rotary_cos = nullptr;
+    const typename TensorQ::element_type* rotary_sin = nullptr;
+    int rotary_dim = 0;
+    bool is_rotary_interleaved = true;
+  };
+  struct EmptyRotary {};
+
   // Kernel-facing parameters
   struct Params {
     ElementS scale;
@@ -174,6 +190,8 @@ struct FMHAFwdMainloopXe2<
         dropout_fields;
     [[no_unique_address]] conditional_t<PagedKV, PagedKVFields, EmptyPaged>
         paged;
+    [[no_unique_address]] conditional_t<HasRotary, RotaryFields, EmptyRotary>
+      rotary;
   };
 
   // SLM data
@@ -209,6 +227,10 @@ struct FMHAFwdMainloopXe2<
       p.paged = {args.ptr_page_table, args.page_size,
                  args.max_pages_per_seq, args.total_seqlen_kv};
     }
+    if constexpr (HasRotary) {
+      p.rotary = {args.rotary_cos, args.rotary_sin,
+                  args.rotary_dim, args.is_rotary_interleaved};
+    }
     return p;
   }
 
@@ -236,7 +258,9 @@ struct FMHAFwdMainloopXe2<
       int& tile_row_idx,
       const int& rows_of_maxima,
       int head_q,
-      int num_heads) {
+      int num_heads,
+      int q_offset_sg,
+      int rotary_base) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     auto tile_shape_v =
@@ -288,10 +312,13 @@ struct FMHAFwdMainloopXe2<
     auto prefetch_q = make_block_2d_prefetch(copy_q);
     auto prefetch_k = make_block_2d_prefetch(copy_k);
     auto prefetch_v = make_block_2d_prefetch(copy_v);
+    auto prefetch_v_paged =
+        make_block_2d_prefetch<SGPerWG::value>(tile_shape_v, V_2D);
 
     auto pQgQ = prefetch_q.get_slice(thr_id).partition_S(gQ);
     auto pKgK = prefetch_k.get_slice(thr_id).partition_S(gK);
     auto pVgV = prefetch_v.get_slice(thr_id).partition_S(gV_split);
+    auto pVgV_paged = prefetch_v_paged.get_slice(thr_id).partition_S(gV);
 
     // PagedKV: translate logical K index to physical page-tile index.
     int tiles_per_page = 0;
@@ -311,20 +338,27 @@ struct FMHAFwdMainloopXe2<
     for (int D = 0; D < size<3>(pQgQ); D++) {
       prefetch(prefetch_q, pQgQ(_, _, _, D));
     }
-    int prefetch_k_stages = (total_blk < Stages ? total_blk : Stages);
-    for (int D = 0; D < size<4>(pKgK); D++) {
+    if constexpr (PagedKV) {
       CUTLASS_PRAGMA_UNROLL
-      for (int K = blk_k0; K < blk_k0 + prefetch_k_stages; K++) {
-        int pk;
-        if constexpr (PagedKV) {
-          int ploc = K * get<1>(TileShapeQK{}) / params.paged.page_size;
-          pk = params.paged.ptr_page_table[b_offset + ploc] *
-                   tiles_per_page +
-               K % tiles_per_page;
-        } else {
-          pk = K;
+      for (int D = 0; D < size<4>(pKgK); D++) {
+        prefetch(prefetch_k, pKgK(_, _, _, next_page_idx, D));
+      }
+    } else {
+      int prefetch_k_stages = (total_blk < Stages ? total_blk : Stages);
+      for (int D = 0; D < size<4>(pKgK); D++) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int K = blk_k0; K < blk_k0 + prefetch_k_stages; K++) {
+          int pk;
+          if constexpr (PagedKV) {
+            int ploc = K * get<1>(TileShapeQK{}) / params.paged.page_size;
+            pk = params.paged.ptr_page_table[b_offset + ploc] *
+                     tiles_per_page +
+                 K % tiles_per_page;
+          } else {
+            pk = K;
+          }
+          prefetch(prefetch_k, pKgK(_, _, _, pk, D));
         }
-        prefetch(prefetch_k, pKgK(_, _, _, pk, D));
       }
     }
     clear(tArA);
@@ -361,9 +395,11 @@ struct FMHAFwdMainloopXe2<
       auto tVgV_cache =
           PagedKV ? tVgV(_, _, _, _, page_idx) : tVgV(_, _, _, _, K);
 
-      // Non-paged: prefetch V before GEMM1 to overlap with computation.
-      // Paged: prefetch V after GEMM1 to avoid BMG hardware hang.
-      if constexpr (!PagedKV) {
+      // Paged path uses the old whole-V-tile prefetch pattern; split-V
+      // prefetch-after-GEMM can hang on BMG for some paged cases.
+      if constexpr (PagedKV) {
+        prefetch(prefetch_v_paged, pVgV_paged(_, _, _, page_idx));
+      } else if constexpr (!PagedKV) {
         CUTLASS_PRAGMA_UNROLL
         for (int VV = 0; VV < VTiles; VV++) {
           prefetch(prefetch_v, pVgV(_, _, _, VV, K));
@@ -375,17 +411,42 @@ struct FMHAFwdMainloopXe2<
       CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < size<4>(tKgK); D++) {
         copy(copy_q, tQgQ(_, _, _, D), tQrQ);
+        if constexpr (HasRotary) {
+          if (params.rotary.rotary_dim > 0 &&
+              params.rotary.rotary_cos != nullptr &&
+              params.rotary.rotary_sin != nullptr) {
+            auto tQrQ_coords = tQrQ.tv_layout();
+            int lane_id = static_cast<int>(get_sub_group().get_local_linear_id());
+            int q_tile_base = get<0>(blk_qv) * get<0>(TileShapeQK{}) + q_offset_sg;
+            int dim_tile_base = D * get<2>(TileShapeQK{});
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < tQrQ.size(); ++i) {
+              auto value_coord = idx2crd(
+                  i, make_shape(
+                         get<1>(shape(tQrQ_coords)),
+                         get<2>(shape(tQrQ_coords))));
+              auto coord = tQrQ_coords(
+                  make_coord(lane_id, get<0>(value_coord), get<1>(value_coord)));
+              int row = q_tile_base + get<0>(coord);
+              int dim = dim_tile_base + get<1>(coord);
+                if (row < seq_len_qo && dim < params.rotary.rotary_dim) {
+                int pair_dim = rotary_pair_dim(
+                  dim, params.rotary.rotary_dim,
+                  params.rotary.is_rotary_interleaved);
+                int position = rotary_base + ((CausalMask || LocalMask) ? row : 0);
+                tQrQ(i) = apply_rotary_scalar(
+                  tQrQ(i), Q_2D(row, pair_dim), params.rotary.rotary_cos,
+                  params.rotary.rotary_sin, position, dim,
+                  params.rotary.rotary_dim,
+                  params.rotary.is_rotary_interleaved);
+              }
+            }
+          }
+        }
         copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
         reorder(tQrQ, tSrQ);
         reorder(tKrK, tSrK);
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
-      }
-
-      if constexpr (PagedKV) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int VV = 0; VV < VTiles; VV++) {
-          prefetch(prefetch_v, pVgV(_, _, _, VV, page_idx));
-        }
       }
 
       auto cS_thread = thr_mma_qk.partition_C(gP_all(_, _, K));
@@ -522,28 +583,35 @@ struct FMHAFwdMainloopXe2<
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
       }
 
-      int K_next = K + Stages;
-      if (K_next < blk_k1) {
-        if constexpr (PagedKV) {
-          int next_page_local_idx =
-              K_next * get<1>(TileShapeQK{}) / params.paged.page_size;
-          int pk_next;
-          if (next_page_local_idx < params.paged.max_pages_per_seq) {
-            pk_next =
-                params.paged.ptr_page_table[b_offset + next_page_local_idx] *
-                    tiles_per_page +
-                K_next % tiles_per_page;
+      if constexpr (PagedKV) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int D = 0; D < size<4>(pKgK); D++) {
+          prefetch(prefetch_k, pKgK(_, _, _, next_page_idx, D));
+        }
+      } else {
+        int K_next = K + Stages;
+        if (K_next < blk_k1) {
+          if constexpr (PagedKV) {
+            int next_page_local_idx =
+                K_next * get<1>(TileShapeQK{}) / params.paged.page_size;
+            int pk_next;
+            if (next_page_local_idx < params.paged.max_pages_per_seq) {
+              pk_next =
+                  params.paged.ptr_page_table[b_offset + next_page_local_idx] *
+                      tiles_per_page +
+                  K_next % tiles_per_page;
+            } else {
+              pk_next = params.paged.max_pages_per_seq * tiles_per_page - 1;
+            }
+            CUTLASS_PRAGMA_UNROLL
+            for (int D = 0; D < size<4>(pKgK); D++) {
+              prefetch(prefetch_k, pKgK(_, _, _, pk_next, D));
+            }
           } else {
-            pk_next = params.paged.max_pages_per_seq * tiles_per_page - 1;
-          }
-          CUTLASS_PRAGMA_UNROLL
-          for (int D = 0; D < size<4>(pKgK); D++) {
-            prefetch(prefetch_k, pKgK(_, _, _, pk_next, D));
-          }
-        } else {
-          CUTLASS_PRAGMA_UNROLL
-          for (int D = 0; D < size<4>(pKgK); D++) {
-            prefetch(prefetch_k, pKgK(_, _, _, K_next, D));
+            CUTLASS_PRAGMA_UNROLL
+            for (int D = 0; D < size<4>(pKgK); D++) {
+              prefetch(prefetch_k, pKgK(_, _, _, K_next, D));
+            }
           }
         }
       }

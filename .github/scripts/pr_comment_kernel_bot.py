@@ -10,29 +10,25 @@ import urllib.error
 import urllib.request
 import uuid
 
+from dispatch import RELEASE_WORKFLOWS, dispatch_release as do_dispatch_release
+
 
 KERNEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 COMMENT_CHARS_RE = re.compile(r"^/kernel-bot[ A-Za-z0-9_./-]*$")
 COMMAND_PERMISSIONS = {
     "build": {"admin", "write"},
-    "build-and-upload": {"admin"},
+    "build-and-stage": {"admin", "write"},
     "merge-and-upload": {"admin"},
     "release": {"admin"},
 }
-FORK_BLOCKED_COMMANDS = {"build", "build-and-upload", "release"}
-RELEASE_WORKFLOWS = [
-    "build-release.yaml",
-    "build-release-mac.yaml",
-    "build-release-windows.yaml",
-]
+FORK_BLOCKED_COMMANDS = {"build", "build-and-stage", "release"}
 MAX_COMMENT_LENGTH = 1024
-DISPATCH_WORKFLOW = "manual-build-upload.yaml"
 RUN_LOOKUP_ATTEMPTS = 10
 RUN_LOOKUP_SLEEP_SECONDS = 2
 RUN_LOOKUP_PAGE_SIZE = 100
 COMMAND_USAGE = (
-    "Invalid command. Use `/kernel-bot <build|build-and-upload|merge-and-upload|release> "
+    "Invalid command. Use `/kernel-bot <build|build-and-stage|merge-and-upload|release> "
     "<kernel1> [kernel2 ...] [--branch <target_branch>]`."
 )
 
@@ -225,7 +221,7 @@ def resolve_dispatch_run_urls(
         return
 
     if workflows is None:
-        workflows = [DISPATCH_WORKFLOW]
+        workflows = RELEASE_WORKFLOWS
 
     for attempt in range(RUN_LOOKUP_ATTEMPTS):
         for workflow in workflows:
@@ -298,7 +294,7 @@ def comment_base_lines(
     ]
     if pr_head_sha:
         lines.append(f"PR head SHA: `{pr_head_sha}`")
-    lines.append(f"Workflow: `{DISPATCH_WORKFLOW}`")
+    lines.append(f"Workflows: `{', '.join(RELEASE_WORKFLOWS)}`")
     return lines
 
 
@@ -379,7 +375,7 @@ def parse_command(comment: str) -> ParsedCommand:
 
     if not args:
         return ParsedCommand(
-            error="No kernels provided. Use `/kernel-bot <build|build-and-upload|merge-and-upload> <kernel1> [kernel2 ...]`.",
+            error="No kernels provided. Use `/kernel-bot <build|build-and-stage|merge-and-upload> <kernel1> [kernel2 ...]`.",
         )
 
     kernels = []
@@ -546,31 +542,30 @@ def main():
             )
             return 0
 
-    dispatch_url = f"{api_base}/actions/workflows/{DISPATCH_WORKFLOW}/dispatches"
     if command == "build":
         target_branch = requested_branch or f"pr-{issue_number}"
         dispatch_pr_number = str(issue_number)
-        upload_flag = "false"
-        allow_main_dispatch = "false"
-    elif command == "build-and-upload":
+        dispatch_upload = False
+        dispatch_repo_prefix = "kernels-community"
+    elif command == "build-and-stage":
         target_branch = requested_branch or f"pr-{issue_number}"
         dispatch_pr_number = str(issue_number)
-        upload_flag = "true"
-        allow_main_dispatch = "false"
+        dispatch_upload = True
+        dispatch_repo_prefix = "kernels-staging"
     elif command == "release":
-        target_branch = requested_branch or default_branch
+        target_branch = requested_branch or ""
         dispatch_pr_number = ""
-        upload_flag = "true"
-        allow_main_dispatch = "true"
-    else:
+        dispatch_upload = True
+        dispatch_repo_prefix = "kernels-community"
+    else:  # merge-and-upload
         target_branch = requested_branch or "main"
         dispatch_pr_number = ""
-        upload_flag = "true"
-        allow_main_dispatch = "true"
+        dispatch_upload = True
+        dispatch_repo_prefix = "kernels-community"
 
     mode_text = {
         "build": "build only",
-        "build-and-upload": "build and upload",
+        "build-and-stage": "build and stage",
         "merge-and-upload": "merge, build and upload",
         "release": "release (linux + mac + windows)",
     }[command]
@@ -661,56 +656,25 @@ def main():
     dispatches = []
     failed = []
 
-    if command == "release":
-        for kernel_name in kernels:
-            for workflow in RELEASE_WORKFLOWS:
-                release_dispatch_url = f"{api_base}/actions/workflows/{workflow}/dispatches"
-                dispatch_key = make_dispatch_key(issue_number, f"{kernel_name}-{workflow}")
-                dispatch_body = {
-                    "ref": default_branch,
-                    "inputs": {
-                        "kernel_name": kernel_name,
-                        "dispatch_key": dispatch_key,
-                    },
-                }
-                try:
-                    print(
-                        f"Dispatching {workflow} for kernel `{kernel_name}`"
-                    )
-                    github_api_request(release_dispatch_url, token, method="POST", data=dispatch_body)
-                    dispatches.append(
-                        DispatchResult(kernel_name=f"{kernel_name} ({workflow})", dispatch_key=dispatch_key)
-                    )
-                except urllib.error.HTTPError as e:
-                    err_text = e.read().decode("utf-8", errors="replace")
-                    print(err_text, file=sys.stderr)
-                    failed.append((f"{kernel_name} ({workflow})", e.code))
-    else:
-        for kernel_name in kernels:
-            dispatch_key = make_dispatch_key(issue_number, kernel_name)
-            dispatch_body = {
-                "ref": default_branch,
-                "inputs": {
-                    "kernel_name": kernel_name,
-                    "pr_number": dispatch_pr_number,
-                    "target_branch": target_branch,
-                    "upload": upload_flag,
-                    "allow_main_dispatch": allow_main_dispatch,
-                    "dispatch_key": dispatch_key,
-                },
-            }
-            try:
-                print(
-                    f"Dispatching workflow for command `{command}`, kernel `{kernel_name}`, branch `{target_branch}`"
-                )
-                github_api_request(dispatch_url, token, method="POST", data=dispatch_body)
-                dispatches.append(
-                    DispatchResult(kernel_name=kernel_name, dispatch_key=dispatch_key)
-                )
-            except urllib.error.HTTPError as e:
-                err_text = e.read().decode("utf-8", errors="replace")
-                print(err_text, file=sys.stderr)
-                failed.append((kernel_name, e.code))
+    for kernel_name in kernels:
+        release_result = do_dispatch_release(
+            kernel_name,
+            token=token,
+            repo=repository,
+            ref=default_branch,
+            mode="release",
+            repo_prefix=dispatch_repo_prefix,
+            dispatch_key_prefix=f"pr{issue_number}-",
+            pr_number=dispatch_pr_number,
+            target_branch=target_branch,
+            upload=dispatch_upload,
+        )
+        for wf, dk in release_result.dispatched:
+            dispatches.append(
+                DispatchResult(kernel_name=f"{kernel_name} ({wf})", dispatch_key=dk)
+            )
+        for wf, code in release_result.failed:
+            failed.append((f"{kernel_name} ({wf})", code))
 
     resolve_dispatch_run_urls(
         api_base,
@@ -718,7 +682,7 @@ def main():
         repository,
         default_branch,
         dispatches,
-        workflows=RELEASE_WORKFLOWS if command == "release" else None,
+        workflows=RELEASE_WORKFLOWS,
     )
 
     comment_written = try_send_issue_comment(

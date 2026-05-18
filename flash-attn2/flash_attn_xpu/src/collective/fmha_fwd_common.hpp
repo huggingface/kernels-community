@@ -22,6 +22,48 @@ namespace cutlass::fmha::collective {
 
 using namespace cute;
 
+template <typename Element, typename RotaryElement>
+CUTLASS_DEVICE Element apply_rotary_scalar(
+    Element x,
+    Element x_pair,
+    const RotaryElement* cos,
+    const RotaryElement* sin,
+    int position,
+    int dim,
+    int rotary_dim,
+    bool interleaved) {
+  if (rotary_dim == 0 || dim >= rotary_dim) {
+    return x;
+  }
+
+  int half_rotary = rotary_dim / 2;
+  int cos_sin_idx = interleaved ? dim / 2
+                                : (dim < half_rotary ? dim : dim - half_rotary);
+  bool is_second = interleaved ? (dim % 2) : (dim >= half_rotary);
+
+  float x_f = static_cast<float>(x);
+  float x_pair_f = static_cast<float>(x_pair);
+  float c = static_cast<float>(cos[position * half_rotary + cos_sin_idx]);
+  float s = static_cast<float>(sin[position * half_rotary + cos_sin_idx]);
+  float rotated = is_second ? x_pair_f * s + x_f * c
+                            : x_f * c - x_pair_f * s;
+  return static_cast<Element>(rotated);
+}
+
+CUTLASS_DEVICE int rotary_pair_dim(
+    int dim,
+    int rotary_dim,
+    bool interleaved) {
+  if (dim >= rotary_dim) {
+    return dim;
+  }
+  if (interleaved) {
+    return dim ^ 1;
+  }
+  int half_rotary = rotary_dim / 2;
+  return dim < half_rotary ? dim + half_rotary : dim - half_rotary;
+}
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 //
 // FMHAFwdMainloopTraits: common type aliases derived from TiledMMA / VTiles.

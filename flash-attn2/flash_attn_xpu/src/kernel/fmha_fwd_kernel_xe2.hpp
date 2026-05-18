@@ -98,6 +98,20 @@ class XeFMHAFwdKernelXe2 {
     float* pLSE;
     int lse_stride_head;
     int lse_stride_batch;
+    // KV Cache: per-batch effective KV length (nullptr for non-kvcache paths)
+    int* cache_seqlens = nullptr;
+    int* cache_batch_idx = nullptr;
+    int* cache_leftpad = nullptr;
+    // Fused KV cache append
+    const ElementK* Knew = nullptr;
+    int64_t knew_batch_stride = 0;
+    int64_t knew_head_stride = 0;
+    int64_t knew_row_stride = 0;
+    const ElementV* Vnew = nullptr;
+    int64_t vnew_batch_stride = 0;
+    int64_t vnew_head_stride = 0;
+    int64_t vnew_row_stride = 0;
+    int seqlen_knew = 0;
   };
   using KernelParams = KernelArguments;
 
@@ -211,11 +225,132 @@ class XeFMHAFwdKernelXe2 {
       if (blk_q * get<0>(TileShapeQK{}) >= seq_len_qo)
         continue;
 
-      auto full_tile_offset = seq_len_kv - seq_len_qo;
+      // KV Cache: override seq_len_kv with per-batch effective length
+      int effective_seq_kv = seq_len_kv;
+      int leftpad_k = 0;
+      // bidx maps the logical request to a slot in the physical KV cache.
+      // - paged path: cache_batch_idx is forbidden, K/V are flat blocks
+      // - non-paged path: bidx selects the per-batch KV slice
+      int bidx = (!PagedKV && p.cache_batch_idx) ? p.cache_batch_idx[idx_b] : idx_b;
+      if (p.cache_seqlens) {
+        int orig_cache_seqlens = p.cache_seqlens[idx_b];
+        if (p.cache_leftpad) {
+          leftpad_k = p.cache_leftpad[idx_b];
+        }
+
+        // Fused cache update: copy knew/vnew into kcache/vcache
+        if (p.Knew != nullptr && p.seqlen_knew > 0) {
+          constexpr int num_threads = SGPerWG::value * cute::intel::sg_size;
+          auto* k_src = p.Knew
+              + idx_b * p.knew_batch_stride + head * p.knew_head_stride;
+          auto* v_src = p.Vnew
+              + idx_b * p.vnew_batch_stride + head * p.vnew_head_stride;
+          if constexpr (PagedKV) {
+            // Paged scatter: per-token compute (block, page_offset) from
+            // block_table, then write to the corresponding page slot.
+            // Each "block" in the paged K/V tensor spans `page_size` rows,
+            // so the per-block byte stride is `page_size * row_stride`,
+            // not `k_batch_stride` (which is sized for the *whole* logical
+            // KV layout, not per-page).
+            const int page_size = params.mainloop.paged.page_size;
+            const int max_pages_per_seq =
+                params.mainloop.paged.max_pages_per_seq;
+            const int* page_table = params.mainloop.paged.ptr_page_table
+                + idx_b * max_pages_per_seq;
+            const int64_t k_block_stride =
+                static_cast<int64_t>(page_size) * p.k_row_stride;
+            const int64_t v_block_stride =
+                static_cast<int64_t>(page_size) * p.v_row_stride;
+            for (int si = 0; si < p.seqlen_knew; si++) {
+              int global_pos = orig_cache_seqlens + si;
+              int page_idx = global_pos / page_size;
+              int page_off = global_pos % page_size;
+              int block = page_table[page_idx];
+              auto* k_dst = const_cast<ElementK*>(p.K)
+                  + static_cast<int64_t>(block) * k_block_stride
+                  + head * p.k_head_stride
+                  + static_cast<int64_t>(page_off) * p.k_row_stride;
+              auto* v_dst = const_cast<ElementV*>(p.V)
+                  + static_cast<int64_t>(block) * v_block_stride
+                  + head * p.v_head_stride
+                  + static_cast<int64_t>(page_off) * p.v_row_stride;
+              for (int d = thr_id; d < s.head_size_qk; d += num_threads) {
+                auto k_value = k_src[si * p.knew_row_stride + d];
+                if constexpr (CollectiveMainloop::HasRotary) {
+                  if (params.mainloop.rotary.rotary_dim > 0 &&
+                      params.mainloop.rotary.rotary_cos != nullptr &&
+                      params.mainloop.rotary.rotary_sin != nullptr &&
+                      d < params.mainloop.rotary.rotary_dim) {
+                    int pair_dim = cutlass::fmha::collective::rotary_pair_dim(
+                        d, params.mainloop.rotary.rotary_dim,
+                        params.mainloop.rotary.is_rotary_interleaved);
+                    if (pair_dim < s.head_size_qk) {
+                      k_value = cutlass::fmha::collective::apply_rotary_scalar(
+                          k_value, k_src[si * p.knew_row_stride + pair_dim],
+                          params.mainloop.rotary.rotary_cos,
+                          params.mainloop.rotary.rotary_sin,
+                          global_pos, d, params.mainloop.rotary.rotary_dim,
+                          params.mainloop.rotary.is_rotary_interleaved);
+                    }
+                  }
+                }
+                k_dst[d] = k_value;
+              }
+              for (int d = thr_id; d < s.head_size_vo; d += num_threads) {
+                v_dst[d] = v_src[si * p.vnew_row_stride + d];
+              }
+            }
+          } else {
+            auto* k_dst = const_cast<ElementK*>(p.K)
+                + bidx * p.k_batch_stride + head * p.k_head_stride
+                + static_cast<int64_t>(orig_cache_seqlens) * p.k_row_stride;
+            auto* v_dst = const_cast<ElementV*>(p.V)
+                + bidx * p.v_batch_stride + head * p.v_head_stride
+                + static_cast<int64_t>(orig_cache_seqlens) * p.v_row_stride;
+            for (int si = 0; si < p.seqlen_knew; si++) {
+              for (int d = thr_id; d < s.head_size_qk; d += num_threads) {
+                auto k_value = k_src[si * p.knew_row_stride + d];
+                if constexpr (CollectiveMainloop::HasRotary) {
+                  if (params.mainloop.rotary.rotary_dim > 0 &&
+                      params.mainloop.rotary.rotary_cos != nullptr &&
+                      params.mainloop.rotary.rotary_sin != nullptr &&
+                      d < params.mainloop.rotary.rotary_dim) {
+                    int pair_dim = cutlass::fmha::collective::rotary_pair_dim(
+                        d, params.mainloop.rotary.rotary_dim,
+                        params.mainloop.rotary.is_rotary_interleaved);
+                    if (pair_dim < s.head_size_qk) {
+                      k_value = cutlass::fmha::collective::apply_rotary_scalar(
+                          k_value, k_src[si * p.knew_row_stride + pair_dim],
+                          params.mainloop.rotary.rotary_cos,
+                          params.mainloop.rotary.rotary_sin,
+                          orig_cache_seqlens + si, d,
+                          params.mainloop.rotary.rotary_dim,
+                          params.mainloop.rotary.is_rotary_interleaved);
+                    }
+                  }
+                }
+                k_dst[si * p.k_row_stride + d] = k_value;
+              }
+            }
+            for (int si = 0; si < p.seqlen_knew; si++) {
+              for (int d = thr_id; d < s.head_size_vo; d += num_threads) {
+                v_dst[si * p.v_row_stride + d] = v_src[si * p.vnew_row_stride + d];
+              }
+            }
+          }
+          sycl::group_barrier(get_work_group<3>());
+          effective_seq_kv = (orig_cache_seqlens + p.seqlen_knew) - leftpad_k;
+        } else {
+          effective_seq_kv = orig_cache_seqlens - leftpad_k;
+        }
+      }
+      if (effective_seq_kv <= 0) continue;
+
+      auto full_tile_offset = effective_seq_kv - seq_len_qo;
       int seq_coord = cute::min(
           seq_len_qo, (blk_q * get<0>(TileShapeQK{}) + q_offset_sg));
       int last_seq_coord = seq_coord + q_sg_tile - 1;
-      int first_non_masked_sequence = seq_len_qo - seq_len_kv;
+      int first_non_masked_sequence = seq_len_qo - effective_seq_kv;
 
       // Causal-only early-exit: skip SGs that are fully masked. With
       // LocalMask we can't easily do this here, so let the loop body mask.
@@ -228,15 +363,15 @@ class XeFMHAFwdKernelXe2 {
       int seq_len;
       if constexpr (CausalMask && LocalMask) {
         seq_len = cute::min(
-            seq_len_kv,
+            effective_seq_kv,
             full_tile_offset + seq_coord + q_sg_tile +
                 params.mainloop.local.local_right);
       } else if constexpr (CausalMask) {
         seq_len = calculate_longest_non_masked_length(
-            seq_len_kv, seq_len_qo, last_seq_coord,
+            effective_seq_kv, seq_len_qo, last_seq_coord,
             first_non_masked_sequence);
       } else {
-        seq_len = seq_len_kv;
+        seq_len = effective_seq_kv;
       }
       if (seq_len < 0) seq_len = 0;
 
@@ -265,21 +400,29 @@ class XeFMHAFwdKernelXe2 {
         offset_o = s.num_heads_q  * s.head_size_vo * qo_cumulative[idx_b];
       }
 
-      auto batch_dim = is_var_len ? 1 : s.batch;
+      auto batch_dim_q = is_var_len ? 1 : s.batch;
+      // Paged KV is laid out as (num_blocks * page_size, head, num_heads_kv)
+      // with no batch dimension; treat it like the varlen K/V layout.
+      auto batch_dim_kv = (is_var_len || PagedKV) ? 1 : s.batch;
       int total_seqlen_kv;
       if constexpr (PagedKV) {
         total_seqlen_kv = params.mainloop.paged.total_seqlen_kv;
       } else {
         total_seqlen_kv = seq_len_kv;
       }
+      // When leftpad is applied, the K/V base pointer is shifted forward.
+      // Reduce the surface height so it accurately describes the data
+      // reachable from the shifted base, preventing 2D block loads from
+      // extending past the per-batch allocation.
+      int kv_surface_len = total_seqlen_kv - leftpad_k;
       auto shape_Q =
-          make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
+          make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim_q);
       auto shape_K = make_shape(
-          total_seqlen_kv, s.head_size_qk, s.num_heads_kv, batch_dim);
+          kv_surface_len, s.head_size_qk, s.num_heads_kv, batch_dim_kv);
       auto shape_V = make_shape(
-          s.head_size_vo, total_seqlen_kv, s.num_heads_kv, batch_dim);
+          s.head_size_vo, kv_surface_len, s.num_heads_kv, batch_dim_kv);
       auto shape_O =
-          make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
+          make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim_q);
 
       auto stride_q = cutlass::make_stride(
           static_cast<int>(p.q_row_stride), Int<1>{},
@@ -302,6 +445,12 @@ class XeFMHAFwdKernelXe2 {
       auto dcK = const_cast<ElementK*>(p.K + offset_k);
       auto dcV = const_cast<ElementV*>(p.V + offset_v);
       auto ptrO = p.O + offset_o;
+
+      // Offset K/V by leftpad to skip left-padding tokens in the cache
+      if (leftpad_k > 0) {
+        dcK += leftpad_k * static_cast<int>(p.k_row_stride);
+        dcV += leftpad_k * static_cast<int>(p.v_row_stride);
+      }
 
       auto layout_q = is_var_len
           ? make_ordered_layout(shape_Q, Step<_2, _0, _1, _3>{})
@@ -327,12 +476,16 @@ class XeFMHAFwdKernelXe2 {
       int rows_of_maxima =
           get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
 
-      int l_coord = is_var_len ? 0 : idx_b;
+      // For non-paged KV, reuse cache_batch_idx remap (bidx) so that the
+      // KV slice matches the per-request seqlen. Q/O always use idx_b.
+      int l_coord_q  = is_var_len ? 0 : idx_b;
+      int l_coord_kv = is_var_len ? 0
+                       : (PagedKV ? 0 : bidx);
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop(
-          Q(_, _, head_q, l_coord),
-          K(_, _, head, l_coord),
-          V(_, _, head, l_coord),
+          Q(_, _, head_q, l_coord_q),
+          K(_, _, head, l_coord_kv),
+          V(_, _, head, l_coord_kv),
           tArA,
           tA_max,
           tA_sum,
@@ -343,12 +496,14 @@ class XeFMHAFwdKernelXe2 {
           thr_id,
           seq_len,
           seq_len_qo,
-          seq_len_kv,
+          effective_seq_kv,
           idx_b,
           tile_row_idx,
           rows_of_maxima,
           head_q,
-          s.num_heads_q);
+          s.num_heads_q,
+          q_offset_sg,
+          p.cache_seqlens ? p.cache_seqlens[idx_b] : 0);
 
       if constexpr (
           !is_empty_v<MainloopSharedStorage> &&
@@ -367,7 +522,7 @@ class XeFMHAFwdKernelXe2 {
           tile_row_idx,
           rows_of_maxima);
       epilogue(
-          O(_, _, head_q, l_coord),
+          O(_, _, head_q, l_coord_q),
           tArA,
           tA_max,
           tA_sum,
