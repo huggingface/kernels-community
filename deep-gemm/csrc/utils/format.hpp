@@ -42,9 +42,13 @@ inline std::string to_str(const T& v) {
 
 template<typename T>
 inline std::string to_hex_float_str(const T& v) {
-    char buffer[64];
-    std::snprintf(buffer, sizeof(buffer), "%a", static_cast<double>(v));
-    return buffer;
+    if constexpr (std::is_floating_point_v<T>) {
+        char buffer[64];
+        std::snprintf(buffer, sizeof(buffer), "%a", static_cast<double>(v));
+        return buffer;
+    } else {
+        return to_str(v);
+    }
 }
 
 // Overload for C string literals (arrays)
