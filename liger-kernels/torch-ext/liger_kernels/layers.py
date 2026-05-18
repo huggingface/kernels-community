@@ -1,3 +1,5 @@
+import inspect
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -304,6 +306,119 @@ class LigerGEGLUMLP(nn.Module):
         return self.down_proj(LigerGELUMulFunction.apply(self.gate_proj(x), self.up_proj(x)))
 
 
+@dataclass
+class CrossEntropyOutput:
+    loss: torch.Tensor
+    z_loss: Optional[torch.Tensor] = None
+    token_accuracy: Optional[torch.Tensor] = None
+    predicted_tokens: Optional[torch.Tensor] = None
+
+
+def liger_fused_linear_cross_entropy(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    target: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    ce_weight: Optional[torch.Tensor] = None,
+    ignore_index: int = -100,
+    lse_square_scale: float = 0.0,
+    label_smoothing: float = 0.0,
+    reduction: str = "mean",
+    softcap: Optional[float] = None,
+    return_z_loss: bool = False,
+    accum_dtype: Optional[torch.dtype] = None,
+    use_token_scaling: bool = False,
+    return_token_accuracy: bool = False,
+    return_predicted_tokens: bool = False,
+):
+    loss, z_loss, token_accuracy, predicted_tokens = LigerFusedLinearCrossEntropyFunction.apply(
+        input,
+        weight,
+        target,
+        bias,
+        ce_weight,
+        ignore_index,
+        lse_square_scale,
+        label_smoothing,
+        reduction,
+        softcap,
+        return_z_loss,
+        accum_dtype,
+        use_token_scaling,
+        return_token_accuracy,
+        return_predicted_tokens,
+    )
+    if not return_z_loss and not return_token_accuracy and not return_predicted_tokens:
+        return loss
+    return CrossEntropyOutput(
+        loss=loss,
+        z_loss=z_loss,
+        token_accuracy=token_accuracy,
+        predicted_tokens=predicted_tokens,
+    )
+
+
+def LigerForCausalLMLoss(
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    labels: torch.Tensor,
+    hidden_size: int,
+    num_items_in_batch: Optional[int] = None,
+    ignore_index: int = -100,
+    shift_labels: Optional[torch.Tensor] = None,
+    final_logit_softcapping: Optional[float] = None,
+    return_token_accuracy: bool = False,
+    return_predicted_tokens: bool = False,
+    **kwargs,
+):
+    """Drop-in replacement for ``transformers.loss.ForCausalLMLoss`` that fuses the
+    final ``lm_head`` projection with the cross-entropy loss. Returns a scalar
+    ``loss`` by default; returns a :class:`CrossEntropyOutput` when
+    ``return_token_accuracy`` or ``return_predicted_tokens`` is set."""
+    applicable_params = inspect.signature(liger_fused_linear_cross_entropy).parameters
+    kwargs = {k: v for k, v in kwargs.items() if k in applicable_params}
+
+    if shift_labels is None:
+        labels = nn.functional.pad(labels, (0, 1), value=ignore_index)
+        shift_labels = labels[..., 1:].contiguous()
+
+    hidden_states = hidden_states.view(-1, hidden_size)
+    shift_labels = shift_labels.view(-1).to(hidden_states.device)
+
+    reduction = "sum" if num_items_in_batch is not None else "mean"
+    result = liger_fused_linear_cross_entropy(
+        hidden_states,
+        lm_head_weight,
+        shift_labels,
+        reduction=reduction,
+        ignore_index=ignore_index,
+        softcap=final_logit_softcapping,
+        return_token_accuracy=return_token_accuracy,
+        return_predicted_tokens=return_predicted_tokens,
+        **kwargs,
+    )
+
+    if isinstance(result, CrossEntropyOutput):
+        loss = result.loss
+        token_accuracy = result.token_accuracy
+        predicted_tokens = result.predicted_tokens
+    else:
+        loss = result
+        token_accuracy = None
+        predicted_tokens = None
+
+    if reduction == "sum":
+        loss = loss / num_items_in_batch
+
+    if return_token_accuracy or return_predicted_tokens:
+        return CrossEntropyOutput(
+            loss=loss,
+            token_accuracy=token_accuracy,
+            predicted_tokens=predicted_tokens,
+        )
+    return loss
+
+
 def liger_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -340,6 +455,9 @@ __all__ = [
     "LigerTVDLoss",
     "LigerSwiGLUMLP",
     "LigerGEGLUMLP",
+    "CrossEntropyOutput",
+    "liger_fused_linear_cross_entropy",
+    "LigerForCausalLMLoss",
     "liger_rotary_pos_emb",
     "liger_multimodal_rotary_pos_emb",
 ]
