@@ -22,6 +22,14 @@ from torch.library import wrap_triton
 from .utils import device_context
 
 
+FP4_VALUES_PER_BYTE = 2
+FP4_SCALE_GROUP_K = 32
+DEFAULT_BLOCK_M = 32
+DEFAULT_BLOCK_N = 128
+DEFAULT_BLOCK_K = 128
+DEFAULT_GROUP_M = 8
+
+
 def _autotune_configs():
     return [
         triton.Config({}, num_warps=w, num_stages=s)
@@ -52,6 +60,8 @@ def w4a16_fp4_matmul_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
+    VALUES_PER_BYTE: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -65,8 +75,8 @@ def w4a16_fp4_matmul_kernel(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k_byte = tl.arange(0, BLOCK_K // 2)
-    offs_sf = tl.arange(0, BLOCK_K // 32)
+    offs_k_byte = tl.arange(0, BLOCK_K // VALUES_PER_BYTE)
+    offs_sf = tl.arange(0, BLOCK_K // SCALE_GROUP_K)
 
     a_base = A_ptr + offs_m[:, None] * stride_am
     b_base = B_ptr + offs_n[:, None] * stride_bn
@@ -77,8 +87,8 @@ def w4a16_fp4_matmul_kernel(
     for k0 in range(0, tl.cdiv(K, BLOCK_K)):
         k_base = k0 * BLOCK_K
         a_k = k_base + tl.arange(0, BLOCK_K)
-        b_k = k_base // 2 + offs_k_byte
-        s_k = k_base // 32 + offs_sf
+        b_k = k_base // VALUES_PER_BYTE + offs_k_byte
+        s_k = k_base // SCALE_GROUP_K + offs_sf
 
         a = tl.load(
             a_base + a_k[None, :] * stride_ak,
@@ -87,13 +97,13 @@ def w4a16_fp4_matmul_kernel(
         )
         b_nk = tl.load(
             b_base + b_k[None, :] * stride_bk,
-            mask=(offs_n[:, None] < N) & (b_k[None, :] < (K // 2)),
+            mask=(offs_n[:, None] < N) & (b_k[None, :] < (K // VALUES_PER_BYTE)),
             other=0,
         ).to(tl.uint8)
         b = tl.trans(b_nk)
         sf = tl.load(
             sf_base + s_k[None, :] * stride_sfk,
-            mask=(offs_n[:, None] < N) & (s_k[None, :] < (K // 32)),
+            mask=(offs_n[:, None] < N) & (s_k[None, :] < (K // SCALE_GROUP_K)),
             other=0,
         ).to(tl.uint8)
 
@@ -128,6 +138,8 @@ def w4a16_fp4_matmul_batched_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    VALUES_PER_BYTE: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
 ):
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -141,16 +153,16 @@ def w4a16_fp4_matmul_batched_kernel(
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k_byte = tl.arange(0, BLOCK_K // 2)
-    offs_sf = tl.arange(0, BLOCK_K // 32)
+    offs_k_byte = tl.arange(0, BLOCK_K // VALUES_PER_BYTE)
+    offs_sf = tl.arange(0, BLOCK_K // SCALE_GROUP_K)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k0 in range(0, tl.cdiv(K, BLOCK_K)):
         k_base = k0 * BLOCK_K
         a_k = k_base + tl.arange(0, BLOCK_K)
-        b_k = k_base // 2 + offs_k_byte
-        s_k = k_base // 32 + offs_sf
+        b_k = k_base // VALUES_PER_BYTE + offs_k_byte
+        s_k = k_base // SCALE_GROUP_K + offs_sf
 
         a = tl.load(
             A_ptr + offs_m[:, None] * 0 + a_k[None, :] * stride_ak,
@@ -159,13 +171,13 @@ def w4a16_fp4_matmul_batched_kernel(
         )
         b_nk = tl.load(
             B_ptr + offs_n[:, None] * stride_bn + b_k[None, :] * stride_bk,
-            mask=(offs_n[:, None] < N) & (b_k[None, :] < (K // 2)),
+            mask=(offs_n[:, None] < N) & (b_k[None, :] < (K // VALUES_PER_BYTE)),
             other=0,
         ).to(tl.uint8)
         b = tl.trans(b_nk)
         sf = tl.load(
             SF_ptr + offs_n[:, None] * stride_sfn + s_k[None, :] * stride_sfk,
-            mask=(offs_n[:, None] < N) & (s_k[None, :] < (K // 32)),
+            mask=(offs_n[:, None] < N) & (s_k[None, :] < (K // SCALE_GROUP_K)),
             other=0,
         ).to(tl.uint8)
 
@@ -202,6 +214,8 @@ def w4a16_fp4_matmul_grouped_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
+    VALUES_PER_BYTE: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -233,8 +247,8 @@ def w4a16_fp4_matmul_grouped_kernel(
     row_mask = offs_m < m_expert
     offs_global_m = expert_start + offs_m
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k_byte = tl.arange(0, BLOCK_K // 2)
-    offs_sf = tl.arange(0, BLOCK_K // 32)
+    offs_k_byte = tl.arange(0, BLOCK_K // VALUES_PER_BYTE)
+    offs_sf = tl.arange(0, BLOCK_K // SCALE_GROUP_K)
 
     a_base = A_ptr + offs_global_m[:, None] * stride_am
     b_base = B_ptr + expert_id * stride_be + offs_n[:, None] * stride_bn
@@ -245,8 +259,8 @@ def w4a16_fp4_matmul_grouped_kernel(
     for k0 in range(0, tl.cdiv(K, BLOCK_K)):
         k_base = k0 * BLOCK_K
         a_k = k_base + tl.arange(0, BLOCK_K)
-        b_k = k_base // 2 + offs_k_byte
-        s_k = k_base // 32 + offs_sf
+        b_k = k_base // VALUES_PER_BYTE + offs_k_byte
+        s_k = k_base // SCALE_GROUP_K + offs_sf
 
         a = tl.load(
             a_base + a_k[None, :] * stride_ak,
@@ -255,13 +269,13 @@ def w4a16_fp4_matmul_grouped_kernel(
         )
         b_nk = tl.load(
             b_base + b_k[None, :] * stride_bk,
-            mask=(offs_n[:, None] < N) & (b_k[None, :] < (K // 2)),
+            mask=(offs_n[:, None] < N) & (b_k[None, :] < (K // VALUES_PER_BYTE)),
             other=0,
         ).to(tl.uint8)
         b = tl.trans(b_nk)
         sf = tl.load(
             sf_base + s_k[None, :] * stride_sfk,
-            mask=(offs_n[:, None] < N) & (s_k[None, :] < (K // 32)),
+            mask=(offs_n[:, None] < N) & (s_k[None, :] < (K // SCALE_GROUP_K)),
             other=0,
         ).to(tl.uint8)
 
@@ -302,13 +316,17 @@ def w4a16_fp4_matmul(
 
     M, K = A.shape
     N, K_half = B.shape
-    assert K == 2 * K_half, f"K (={K}) must equal 2 * B.shape[1] (={K_half})"
-    assert Bs.shape == (N, K // 32), f"Bs shape {tuple(Bs.shape)} != ({N}, {K // 32})"
-    assert K % 32 == 0, f"K (={K}) must be a multiple of 32"
+    assert K == FP4_VALUES_PER_BYTE * K_half, (
+        f"K (={K}) must equal {FP4_VALUES_PER_BYTE} * B.shape[1] (={K_half})"
+    )
+    assert Bs.shape == (N, K // FP4_SCALE_GROUP_K), (
+        f"Bs shape {tuple(Bs.shape)} != ({N}, {K // FP4_SCALE_GROUP_K})"
+    )
+    assert K % FP4_SCALE_GROUP_K == 0, f"K (={K}) must be a multiple of {FP4_SCALE_GROUP_K}"
 
     sf_u8 = Bs.contiguous().view(torch.uint8)
-    block_n = 128 if block_size is None else block_size[0]
-    block_k = 128 if block_size is None else block_size[1]
+    block_n = DEFAULT_BLOCK_N if block_size is None else block_size[0]
+    block_k = DEFAULT_BLOCK_K if block_size is None else block_size[1]
     C = A.new_empty((M, N), dtype=output_dtype)
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
     with device_context(A.device):
@@ -328,10 +346,12 @@ def w4a16_fp4_matmul(
             sf_u8.stride(1),
             C.stride(0),
             C.stride(1),
-            BLOCK_M=32,
+            BLOCK_M=DEFAULT_BLOCK_M,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
-            GROUP_M=8,
+            GROUP_M=DEFAULT_GROUP_M,
+            VALUES_PER_BYTE=FP4_VALUES_PER_BYTE,
+            SCALE_GROUP_K=FP4_SCALE_GROUP_K,
         )
     return C
 
@@ -353,14 +373,18 @@ def w4a16_fp4_matmul_batched(
     S, K = A.shape
     E, N, K_half = B.shape
     assert expert_ids.shape[0] == S
-    assert K == 2 * K_half, f"K (={K}) must equal 2 * B.shape[2] (={K_half})"
-    assert Bs.shape == (E, N, K // 32), f"Bs shape {tuple(Bs.shape)} != ({E}, {N}, {K // 32})"
-    assert K % 32 == 0, f"K (={K}) must be a multiple of 32"
+    assert K == FP4_VALUES_PER_BYTE * K_half, (
+        f"K (={K}) must equal {FP4_VALUES_PER_BYTE} * B.shape[2] (={K_half})"
+    )
+    assert Bs.shape == (E, N, K // FP4_SCALE_GROUP_K), (
+        f"Bs shape {tuple(Bs.shape)} != ({E}, {N}, {K // FP4_SCALE_GROUP_K})"
+    )
+    assert K % FP4_SCALE_GROUP_K == 0, f"K (={K}) must be a multiple of {FP4_SCALE_GROUP_K}"
 
     sf_u8 = Bs.contiguous().view(torch.uint8)
     expert_ids = expert_ids.to(device=A.device, dtype=torch.int32).contiguous()
-    block_n = 128 if block_size is None else block_size[0]
-    block_k = 128 if block_size is None else block_size[1]
+    block_n = DEFAULT_BLOCK_N if block_size is None else block_size[0]
+    block_k = DEFAULT_BLOCK_K if block_size is None else block_size[1]
     C = A.new_empty((S, N), dtype=output_dtype)
     grid = (S, triton.cdiv(N, block_n))
     with device_context(A.device):
@@ -383,9 +407,11 @@ def w4a16_fp4_matmul_batched(
             sf_u8.stride(2),
             C.stride(0),
             C.stride(1),
-            BLOCK_M=32,
+            BLOCK_M=DEFAULT_BLOCK_M,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
+            VALUES_PER_BYTE=FP4_VALUES_PER_BYTE,
+            SCALE_GROUP_K=FP4_SCALE_GROUP_K,
         )
     return C
 
@@ -408,20 +434,24 @@ def w4a16_fp4_matmul_grouped(
     S, K = A.shape
     E, N, K_half = B.shape
     assert offsets.shape[0] == E and tokens_per_expert.shape[0] == E
-    assert K == 2 * K_half, f"K (={K}) must equal 2 * B.shape[2] (={K_half})"
-    assert Bs.shape == (E, N, K // 32), f"Bs shape {tuple(Bs.shape)} != ({E}, {N}, {K // 32})"
-    assert K % 32 == 0, f"K (={K}) must be a multiple of 32"
+    assert K == FP4_VALUES_PER_BYTE * K_half, (
+        f"K (={K}) must equal {FP4_VALUES_PER_BYTE} * B.shape[2] (={K_half})"
+    )
+    assert Bs.shape == (E, N, K // FP4_SCALE_GROUP_K), (
+        f"Bs shape {tuple(Bs.shape)} != ({E}, {N}, {K // FP4_SCALE_GROUP_K})"
+    )
+    assert K % FP4_SCALE_GROUP_K == 0, f"K (={K}) must be a multiple of {FP4_SCALE_GROUP_K}"
 
     sf_u8 = Bs.contiguous().view(torch.uint8)
     offsets = offsets.to(device=A.device, dtype=torch.int32).contiguous()
     tokens_per_expert = tokens_per_expert.to(device=A.device, dtype=torch.int32).contiguous()
-    block_n = 128 if block_size is None else block_size[0]
-    block_k = 128 if block_size is None else block_size[1]
-    BLOCK_M = 32
+    block_n = DEFAULT_BLOCK_N if block_size is None else block_size[0]
+    block_k = DEFAULT_BLOCK_K if block_size is None else block_size[1]
+    block_m = DEFAULT_BLOCK_M
     C = A.new_empty((S, N), dtype=output_dtype)
-    tiles_per_expert = (tokens_per_expert + BLOCK_M - 1) // BLOCK_M
+    tiles_per_expert = (tokens_per_expert + block_m - 1) // block_m
     tile_offsets = torch.cumsum(tiles_per_expert, dim=0).to(torch.int32)
-    max_m_tiles = triton.cdiv(S, BLOCK_M) + E
+    max_m_tiles = triton.cdiv(S, block_m) + E
     grid = (max_m_tiles, triton.cdiv(N, block_n))
     with device_context(A.device):
         _get_grouped_kernel()[grid](
@@ -445,9 +475,11 @@ def w4a16_fp4_matmul_grouped(
             C.stride(0),
             C.stride(1),
             NUM_EXPERTS=E,
-            BLOCK_M=BLOCK_M,
+            BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
             NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
+            VALUES_PER_BYTE=FP4_VALUES_PER_BYTE,
+            SCALE_GROUP_K=FP4_SCALE_GROUP_K,
         )
     return C
