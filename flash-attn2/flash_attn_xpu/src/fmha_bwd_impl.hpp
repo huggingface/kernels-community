@@ -622,7 +622,13 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType, Trait::is_varle
             Tensor dS = make_tensor(rdP.data(), scores.layout());
             
             if constexpr(has_dropout) {
-                constexpr int kDropMaskMax = 128;
+                // Dropout backward: compute mask once, apply to dP first, then to P
+                // after softmax_backward. Caches mask to avoid redundant Philox RNG.
+                //
+                // Math: dS = scale * P * (mask * rp * dP_dropped - dpsum)
+                // where P is the original softmax output, dP_dropped = dO * V^T,
+                // and dpsum = sum(dO * O) with O having rp scaling from forward.
+                constexpr int kDropMaskMax = decltype(size<0>(scores))::value * decltype(size<1>(scores))::value;
                 bool drop_keep[kDropMaskMax];
                 int drop_mask_count = 0;
                 int sg_local_id = sg.get_local_id();

@@ -89,7 +89,67 @@ ENDFILE
 done
 
 echo ""
+echo "Creating kvcache-paged instantiation files (split by dtype)..."
+for hdim in "${HDIMS[@]}"; do
+  for dtype in fp16 bf16; do
+    cat > flash_fwd_hdim${hdim}_kvcache_paged_${dtype}.cpp << ENDFILE
+#include "fmha_fwd_impl.hpp"
+
+// Non-varlen + paged: IsVarLen=0, IsPaged=1, dtype=${dtype}
+// Used by mha_fwd_kvcache when block_table is provided.
+
+// Prefill paged
+template void policy_dispatch_${dtype}<
+    prefill_policy_head${hdim},
+    PipelineStages_Prefill,
+    0, 1>(
+    sycl::queue& queue,
+    const fmha_fwd_args_t& args);
+
+// Decode paged (smaller K-tile to fit page boundaries)
+template void policy_dispatch_${dtype}<
+    decode_paged_policy_head${hdim},
+    PipelineStages_Decode,
+    0, 1>(
+    sycl::queue& queue,
+    const fmha_fwd_args_t& args);
+
+// Rotary kvcache variants keep rotary code out of non-rotary kernels.
+template void policy_dispatch_${dtype}<
+  prefill_policy_head${hdim},
+  PipelineStages_Prefill,
+  0, 0, true>(
+  sycl::queue& queue,
+  const fmha_fwd_args_t& args);
+
+template void policy_dispatch_${dtype}<
+  decode_policy_head${hdim},
+  PipelineStages_Decode,
+  0, 0, true>(
+  sycl::queue& queue,
+  const fmha_fwd_args_t& args);
+
+template void policy_dispatch_${dtype}<
+  prefill_policy_head${hdim},
+  PipelineStages_Prefill,
+  0, 1, true>(
+  sycl::queue& queue,
+  const fmha_fwd_args_t& args);
+
+template void policy_dispatch_${dtype}<
+  decode_paged_policy_head${hdim},
+  PipelineStages_Decode,
+  0, 1, true>(
+  sycl::queue& queue,
+  const fmha_fwd_args_t& args);
+ENDFILE
+    echo "  Created flash_fwd_hdim${hdim}_kvcache_paged_${dtype}.cpp"
+  done
+done
+
+echo ""
 echo "✓ All instantiation files created successfully!"
 echo "  - $((${#HDIMS[@]} * 2)) varlen files (split by dtype)"
 echo "  - $((${#HDIMS[@]} * 2)) fixed files (split by dtype)"
-echo "  Total: $((${#HDIMS[@]} * 4)) files"
+echo "  - $((${#HDIMS[@]} * 2)) kvcache_paged files (split by dtype)"
+echo "  Total: $((${#HDIMS[@]} * 6)) files"
