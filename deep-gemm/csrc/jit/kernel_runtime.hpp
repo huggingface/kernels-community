@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <sstream>
 
 #include "../utils/exception.hpp"
 #include "../utils/format.hpp"
@@ -58,20 +59,15 @@ public:
         const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal", "__assertfail"};
         const auto [exit_code, symbols] = call_external_command(fmt::format("{} -symbols {}", cuobjdump_path.string(), cubin_path_str));
         DG_HOST_ASSERT(exit_code == 0);
+        std::istringstream iss(symbols);
         std::vector<std::string> symbol_names;
-        size_t line_begin = 0;
-        while (line_begin < symbols.size()) {
-            auto line_end = symbols.find('\n', line_begin);
-            if (line_end == std::string::npos)
-                line_end = symbols.size();
-            const auto line = symbols.substr(line_begin, line_end - line_begin);
+        for (std::string line; std::getline(iss, line); ) {
             if (line.find("STT_FUNC") == 0 and line.find("STO_ENTRY") != std::string::npos and
                 std::none_of(illegal_names.begin(), illegal_names.end(),
                 [&](const auto name) { return line.find(name) != std::string::npos; })) {
                 const auto last_space = line.rfind(' ');
                 symbol_names.push_back(line.substr(last_space + 1));
             }
-            line_begin = line_end + (line_end < symbols.size());
         }
 
         // Print symbols
