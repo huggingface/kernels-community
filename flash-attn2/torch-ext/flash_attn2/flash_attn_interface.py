@@ -134,9 +134,6 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, p, rng_state
 
 
-_wrapped_flash_attn_forward = _flash_attn_forward
-
-
 @torch.library.custom_op(add_op_namespace_prefix("_flash_attn_varlen_forward"), mutates_args=(), device_types=_get_device())
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
@@ -226,9 +223,6 @@ def _flash_attn_varlen_forward_fake(
     return out, softmax_lse, p, rng_state
 
 
-_wrapped_flash_attn_varlen_forward = _flash_attn_varlen_forward
-
-
 @torch.library.custom_op(add_op_namespace_prefix("_flash_attn_backward"), mutates_args=("dq", "dk", "dv"), device_types=_get_device())
 def _flash_attn_backward(
     dout: torch.Tensor,
@@ -313,9 +307,6 @@ def _flash_attn_backward_fake(
     softmax_d = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128)), device=q.device, dtype=torch.float32)
     
     return softmax_d
-
-
-_wrapped_flash_attn_backward = _flash_attn_backward
 
 
 @torch.library.custom_op(add_op_namespace_prefix("_flash_attn_varlen_backward"), mutates_args=("dq", "dk", "dv"), device_types=_get_device())
@@ -423,9 +414,6 @@ def _flash_attn_varlen_backward_fake(
     return softmax_d
 
 
-_wrapped_flash_attn_varlen_backward = _flash_attn_varlen_backward
-
-
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -450,7 +438,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state =  _wrapped_flash_attn_forward(
+        out_padded, softmax_lse, S_dmask, rng_state =  _flash_attn_forward(
             q,
             k,
             v,
@@ -484,7 +472,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         dout_padded = dout
         if head_size_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
-        _wrapped_flash_attn_backward(
+        _flash_attn_backward(
             dout_padded,
             q,
             k,
@@ -534,7 +522,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
+        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
             q,
             k,
             v,
@@ -574,7 +562,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         dout_padded = dout
         if head_size_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
-        _wrapped_flash_attn_varlen_backward(
+        _flash_attn_varlen_backward(
             dout_padded,
             q,
             k,
@@ -629,7 +617,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(
+        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q,
             k,
             v,
@@ -664,7 +652,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         dout_padded = dout
         if head_size_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
-        _wrapped_flash_attn_backward(
+        _flash_attn_backward(
             dout_padded,
             q,
             k,
@@ -720,7 +708,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
+        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
             q,
             k,
             v,
@@ -764,7 +752,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         dout_padded = dout
         if head_size_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
-        _wrapped_flash_attn_varlen_backward(
+        _flash_attn_varlen_backward(
             dout_padded,
             q,
             k,
@@ -820,7 +808,7 @@ class FlashAttnFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(
+        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q,
             k,
             v,
@@ -853,7 +841,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dout_padded = dout
         if head_size_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
-        _wrapped_flash_attn_backward(
+        _flash_attn_backward(
             dout_padded,
             q,
             k,
@@ -911,7 +899,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
+        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
             q,
             k,
             v,
@@ -954,7 +942,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dout_padded = dout
         if head_size_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
-        _wrapped_flash_attn_varlen_backward(
+        _flash_attn_varlen_backward(
             dout_padded,
             q,
             k,
