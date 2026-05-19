@@ -101,6 +101,14 @@ def get_repo() -> str | None:
     return None
 
 
+# Maps workflow filename to the `name:` field in the YAML, used for commit
+# status context strings that must match between pending and final statuses.
+WORKFLOW_DISPLAY_NAMES = {
+    "build.yaml": "Build",
+    "build-mac.yaml": "Build (macOS)",
+    "build-windows.yaml": "Build (Windows)",
+}
+
 BACKEND_TO_WORKFLOWS = {
     "cuda": {"build.yaml", "build-windows.yaml"},
     "cpu": {"build.yaml"},
@@ -178,6 +186,7 @@ def dispatch_release(
     dry_run: bool = False,
     skip_build: bool = False,
     pr_number: str = "",
+    head_sha: str = "",
     target_branch: str = "",
     upload: bool = True,
 ) -> ReleaseDispatchResult:
@@ -195,6 +204,7 @@ def dispatch_release(
         dry_run: Print what would be dispatched without actually dispatching.
         skip_build: Skip build and upload steps.
         pr_number: Optional PR number to checkout before building.
+        head_sha: Optional PR head SHA for commit status reporting.
         target_branch: Target branch for upload.
         upload: Whether to upload after build.
 
@@ -243,6 +253,8 @@ def dispatch_release(
                 inputs["skip_build"] = "true"
             if pr_number:
                 inputs["pr_number"] = pr_number
+            if head_sha:
+                inputs["head_sha"] = head_sha
             if target_branch:
                 inputs["target_branch"] = target_branch
             if not upload:
@@ -264,6 +276,8 @@ def dispatch_release(
             inputs["skip_build"] = "true"
         if pr_number:
             inputs["pr_number"] = pr_number
+        if head_sha:
+            inputs["head_sha"] = head_sha
         if target_branch:
             inputs["target_branch"] = target_branch
         if not upload:
@@ -276,6 +290,27 @@ def dispatch_release(
             print(f"Dispatching {workflow} for kernel `{kernel_name}` on ref `{ref}`")
             github_api_request(dispatch_url, token, method="POST", data=dispatch_body)
             result.dispatched.append((workflow, dispatch_key))
+
+            # Post a pending commit status so the PR shows the build is in progress.
+            if head_sha:
+                display_name = WORKFLOW_DISPLAY_NAMES.get(workflow, workflow)
+                context = f"{display_name} / {kernel_name}"
+                status_url = f"{api_base}/statuses/{head_sha}"
+                try:
+                    github_api_request(
+                        status_url,
+                        token,
+                        method="POST",
+                        data={
+                            "state": "pending",
+                            "description": "Build queued",
+                            "context": context,
+                        },
+                    )
+                except urllib.error.HTTPError as e:
+                    # Non-fatal: the build was dispatched, status is best-effort.
+                    print(f"Warning: failed to set pending status for {context}: {e}", file=sys.stderr)
+
         except urllib.error.HTTPError as e:
             err_text = e.read().decode("utf-8", errors="replace")
             print(f"Failed to dispatch {workflow} (HTTP {e.code}): {err_text}", file=sys.stderr)
@@ -308,6 +343,10 @@ def main() -> int:
         help="PR number to checkout before building",
     )
     parser.add_argument(
+        "--head-sha", default="",
+        help="PR head SHA for commit status reporting",
+    )
+    parser.add_argument(
         "--target-branch", default="",
         help="Target branch for upload",
     )
@@ -331,6 +370,7 @@ def main() -> int:
         dry_run=args.dry_run,
         skip_build=args.skip_build,
         pr_number=args.pr_number,
+        head_sha=args.head_sha,
         target_branch=args.target_branch,
         upload=not args.no_upload,
     )

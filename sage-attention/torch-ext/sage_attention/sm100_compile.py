@@ -28,31 +28,6 @@ from torch.nn.functional import scaled_dot_product_attention as sdpa
 # Low-level ops with torch.compile support (custom_op + register_fake)
 # ---------------------------------------------------------------------------
 
-@torch.library.custom_op(
-    add_op_namespace_prefix("mha_fwd"), mutates_args=(), device_types="cuda"
-)
-def mha_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    sfq: torch.Tensor,
-    sfk: torch.Tensor,
-    sfv: torch.Tensor,
-    delta_s: torch.Tensor,
-    unpadded_k: int,
-    out: Optional[torch.Tensor],
-    softmax_scale: float,
-    is_causal: bool,
-    per_block_mean: bool,
-    is_bf16: bool,
-) -> List[torch.Tensor]:
-    return ops.mha_fwd(
-        q, k, v, sfq, sfk, sfv, delta_s,
-        unpadded_k, out, softmax_scale, is_causal,
-        per_block_mean, is_bf16,
-    )
-
-
 @torch.library.register_fake(add_op_namespace_prefix("mha_fwd"))
 def mha_fwd_fake(
     q: torch.Tensor,
@@ -86,20 +61,6 @@ def mha_fwd_fake(
     return [fake_out, fake_lse]
 
 
-@torch.library.custom_op(
-    add_op_namespace_prefix("scaled_fp4_quant"),
-    mutates_args=("output", "output_sf"),
-    device_types="cuda",
-)
-def scaled_fp4_quant(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    output_sf: torch.Tensor,
-    tensor_layout: int,
-) -> None:
-    ops.scaled_fp4_quant(input, output, output_sf, tensor_layout)
-
-
 @torch.library.register_fake(add_op_namespace_prefix("scaled_fp4_quant"))
 def scaled_fp4_quant_fake(
     input: torch.Tensor,
@@ -108,20 +69,6 @@ def scaled_fp4_quant_fake(
     tensor_layout: int,
 ) -> None:
     pass
-
-
-@torch.library.custom_op(
-    add_op_namespace_prefix("scaled_fp4_quant_permute"),
-    mutates_args=("output", "output_sf"),
-    device_types="cuda",
-)
-def scaled_fp4_quant_permute(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    output_sf: torch.Tensor,
-    tensor_layout: int,
-) -> None:
-    ops.scaled_fp4_quant_permute(input, output, output_sf, tensor_layout)
 
 
 @torch.library.register_fake(add_op_namespace_prefix("scaled_fp4_quant_permute"))
@@ -134,20 +81,6 @@ def scaled_fp4_quant_permute_fake(
     pass
 
 
-@torch.library.custom_op(
-    add_op_namespace_prefix("scaled_fp4_quant_trans"),
-    mutates_args=("output", "output_sf"),
-    device_types="cuda",
-)
-def scaled_fp4_quant_trans(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    output_sf: torch.Tensor,
-    tensor_layout: int,
-) -> None:
-    ops.scaled_fp4_quant_trans(input, output, output_sf, tensor_layout)
-
-
 @torch.library.register_fake(add_op_namespace_prefix("scaled_fp4_quant_trans"))
 def scaled_fp4_quant_trans_fake(
     input: torch.Tensor,
@@ -156,6 +89,13 @@ def scaled_fp4_quant_trans_fake(
     tensor_layout: int,
 ) -> None:
     pass
+
+
+# Direct references to C++ ops (same pattern as sm89_compile.py)
+mha_fwd = ops.mha_fwd
+scaled_fp4_quant = ops.scaled_fp4_quant
+scaled_fp4_quant_permute = ops.scaled_fp4_quant_permute
+scaled_fp4_quant_trans = ops.scaled_fp4_quant_trans
 
 
 # ---------------------------------------------------------------------------

@@ -47,12 +47,36 @@ on:
         required: false
         type: string
         default: "kernels-community"
+      head_sha:
+        description: "PR head SHA for posting commit statuses (empty = no status)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  statuses: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
+  # Post a running commit status so the PR shows the build is in progress.
+  set-running-status:
+    if: inputs.head_sha != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set running status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state="pending" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="Build in progress" \
+            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
+
   # Build the kernel for each CUDA/XPU variant; release mode uploads to the Hub.
   build-kernel:
     strategy:
@@ -329,3 +353,32 @@ jobs:
           } else {
             Write-Host "build.toml not found, skipping main branch upload"
           }
+
+  # Report the final build outcome as a commit status on the PR head SHA.
+  report-status:
+    if: always() && inputs.head_sha != ''
+    needs: [build-kernel]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set commit status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUILD="${{ needs.build-kernel.result }}"
+
+          if [ "$BUILD" = "success" ]; then
+            STATE="success"
+            DESC="Build passed"
+          elif [ "$BUILD" = "failure" ]; then
+            STATE="failure"
+            DESC="Build failed"
+          else
+            STATE="error"
+            DESC="Build did not complete (${BUILD})"
+          fi
+
+          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state="$STATE" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="$DESC" \
+            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
