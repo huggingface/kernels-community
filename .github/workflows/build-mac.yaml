@@ -52,6 +52,11 @@ on:
         required: false
         type: string
         default: ""
+
+permissions:
+  contents: read
+  statuses: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
@@ -61,6 +66,18 @@ jobs:
   build-kernel:
     runs-on: macos-26
     steps:
+      # Post a running commit status so the PR shows the build is in progress.
+      - name: Set running status
+        if: inputs.head_sha != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state="pending" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="Build in progress" \
+            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
+
       # Guard against injection via pr_number input.
       - name: Validate PR number
         if: inputs.pr_number != ''
@@ -174,8 +191,6 @@ jobs:
     if: always() && inputs.head_sha != ''
     needs: [build-kernel]
     runs-on: ubuntu-latest
-    permissions:
-      statuses: write
     steps:
       - name: Set commit status
         env:
