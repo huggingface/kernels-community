@@ -47,6 +47,11 @@ on:
         required: false
         type: string
         default: ""
+      head_sha:
+        description: "PR head SHA for posting commit statuses (empty = no status)"
+        required: false
+        type: string
+        default: ""
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
@@ -164,27 +169,33 @@ jobs:
             fi
           fi
 
-  # Post a comment on the originating PR with the build outcome.
-  report-pr:
-    if: always() && inputs.pr_number != ''
+  # Report the final build outcome as a commit status on the PR head SHA.
+  report-status:
+    if: always() && inputs.head_sha != ''
     needs: [build-kernel]
     runs-on: ubuntu-latest
     permissions:
-      pull-requests: write
+      statuses: write
     steps:
-      - name: Comment on PR
+      - name: Set commit status
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BUILD="${{ needs.build-kernel.result }}"
 
           if [ "$BUILD" = "success" ]; then
-            ICON="✅"
-            VERDICT="passed"
+            STATE="success"
+            DESC="Build passed"
+          elif [ "$BUILD" = "failure" ]; then
+            STATE="failure"
+            DESC="Build failed"
           else
-            ICON="❌"
-            VERDICT="failed (${BUILD})"
+            STATE="error"
+            DESC="Build did not complete (${BUILD})"
           fi
 
-          gh api repos/${{ github.repository }}/issues/${{ inputs.pr_number }}/comments \
-            -f body="${ICON} **${{ github.workflow }}** | \`${{ inputs.kernel_name }}\` | ${VERDICT} | [logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state="$STATE" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="$DESC" \
+            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
