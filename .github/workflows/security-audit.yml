@@ -24,7 +24,10 @@ jobs:
         run: npm install -g @anthropic-ai/claude-code@2.1.139
 
       - name: Generate diff
-        run: git diff ${{ github.event.before || github.event.pull_request.base.sha }}...${{ github.sha }} > /tmp/changes.diff
+        env:
+          BASE_SHA: ${{ github.event.before || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: git diff "${BASE_SHA}"..."${HEAD_SHA}" > /tmp/changes.diff
 
       - name: Run security audit
         id: audit
