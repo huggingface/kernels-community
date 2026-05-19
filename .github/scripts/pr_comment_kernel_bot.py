@@ -666,6 +666,7 @@ def main():
             repo_prefix=dispatch_repo_prefix,
             dispatch_key_prefix=f"pr{issue_number}-",
             pr_number=dispatch_pr_number,
+            head_sha=pr_head_sha or "",
             target_branch=target_branch,
             upload=dispatch_upload,
         )
