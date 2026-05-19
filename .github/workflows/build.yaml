@@ -47,6 +47,11 @@ on:
         required: false
         type: string
         default: ""
+      head_sha:
+        description: "PR head SHA for posting commit statuses (empty = no status)"
+        required: false
+        type: string
+        default: ""
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
@@ -325,3 +330,35 @@ jobs:
         run: |
           CI_TEST_PATH="${{ needs.build-ci-test.outputs.ci-test-path }}"
           "$CI_TEST_PATH/bin/ci-test"
+
+  # Report the final build/test outcome as a commit status on the PR head SHA.
+  report-status:
+    if: always() && inputs.head_sha != ''
+    needs: [build-kernel, test-kernel-gpu]
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Set commit status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUILD="${{ needs.build-kernel.result }}"
+          TEST="${{ needs.test-kernel-gpu.result }}"
+
+          if [ "$BUILD" = "success" ] && { [ "$TEST" = "success" ] || [ "$TEST" = "skipped" ]; }; then
+            STATE="success"
+            DESC="Build passed"
+          elif [ "$BUILD" = "failure" ] || [ "$TEST" = "failure" ]; then
+            STATE="failure"
+            DESC="Build failed (build: ${BUILD}, test: ${TEST})"
+          else
+            STATE="error"
+            DESC="Build did not complete (build: ${BUILD}, test: ${TEST})"
+          fi
+
+          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state="$STATE" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="$DESC" \
+            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"

@@ -47,6 +47,11 @@ on:
         required: false
         type: string
         default: ""
+      head_sha:
+        description: "PR head SHA for posting commit statuses (empty = no status)"
+        required: false
+        type: string
+        default: ""
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
@@ -163,3 +168,34 @@ jobs:
               nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "${{ inputs.repo_prefix }}/$KERNEL" --branch main
             fi
           fi
+
+  # Report the final build outcome as a commit status on the PR head SHA.
+  report-status:
+    if: always() && inputs.head_sha != ''
+    needs: [build-kernel]
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Set commit status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUILD="${{ needs.build-kernel.result }}"
+
+          if [ "$BUILD" = "success" ]; then
+            STATE="success"
+            DESC="Build passed"
+          elif [ "$BUILD" = "failure" ]; then
+            STATE="failure"
+            DESC="Build failed"
+          else
+            STATE="error"
+            DESC="Build did not complete (${BUILD})"
+          fi
+
+          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state="$STATE" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="$DESC" \
+            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"

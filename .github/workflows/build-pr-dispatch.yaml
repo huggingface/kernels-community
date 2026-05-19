@@ -9,6 +9,7 @@ concurrency:
 
 permissions:
   actions: write
+  statuses: write
 
 jobs:
   # Resolve the kernel from the PR title and fan out to per-platform build workflows.
@@ -43,4 +44,5 @@ jobs:
           python3 .github/scripts/dispatch.py "$KERNEL" \
             --mode pr \
             --pr-number "${{ github.event.pull_request.number }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
             --no-upload
