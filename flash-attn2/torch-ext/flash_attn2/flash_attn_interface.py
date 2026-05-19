@@ -16,6 +16,7 @@ import os
 
 
 from ._ops import ops as flash_attn
+from ._ops import add_op_namespace_prefix
 
 # # isort: on
 
@@ -73,30 +74,7 @@ def round_multiple(x, m):
     return (x + m - 1) // m * m
 
 
-# torch.compile() support is only enabled for pytorch >= 2.4
-# The reason for this is that we are using the new custom_op and register_fake
-# APIs, which support inplace modification of inputs in the function itself
-if torch.__version__ >= "2.4.0":
-    _torch_custom_op_wrapper = torch.library.custom_op
-    _torch_register_fake_wrapper = torch.library.register_fake
-else:
-    def noop_custom_op_wrapper(name, fn=None, /, *, mutates_args, device_types=None, schema=None):
-        def wrap(func):
-            return func
-        if fn is None:
-            return wrap
-        return fn
-    def noop_register_fake_wrapper(op, fn=None, /, *, lib=None, _stacklevel=1):
-        def wrap(func):
-            return func
-        if fn is None:
-            return wrap
-        return fn
-    _torch_custom_op_wrapper = noop_custom_op_wrapper
-    _torch_register_fake_wrapper = noop_register_fake_wrapper
-
-
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_forward", mutates_args=(), device_types=_get_device())
+@torch.library.custom_op(add_op_namespace_prefix("_flash_attn_forward"), mutates_args=(), device_types=_get_device())
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -129,7 +107,7 @@ def _flash_attn_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-@_torch_register_fake_wrapper("flash_attn::_flash_attn_forward")
+@torch.library.register_fake(add_op_namespace_prefix("_flash_attn_forward"))
 def _flash_attn_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -156,13 +134,10 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, p, rng_state
 
 
-if torch.__version__ >= "2.4.0":
-    _wrapped_flash_attn_forward = torch.ops.flash_attn._flash_attn_forward
-else:
-    _wrapped_flash_attn_forward = _flash_attn_forward
+_wrapped_flash_attn_forward = _flash_attn_forward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_forward", mutates_args=(), device_types=_get_device())
+@torch.library.custom_op(add_op_namespace_prefix("_flash_attn_varlen_forward"), mutates_args=(), device_types=_get_device())
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -213,7 +188,7 @@ def _flash_attn_varlen_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-@_torch_register_fake_wrapper("flash_attn::_flash_attn_varlen_forward")
+@torch.library.register_fake(add_op_namespace_prefix("_flash_attn_varlen_forward"))
 def _flash_attn_varlen_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -251,13 +226,10 @@ def _flash_attn_varlen_forward_fake(
     return out, softmax_lse, p, rng_state
 
 
-if torch.__version__ >= "2.4.0":
-    _wrapped_flash_attn_varlen_forward = torch.ops.flash_attn._flash_attn_varlen_forward
-else:
-    _wrapped_flash_attn_varlen_forward = _flash_attn_varlen_forward
+_wrapped_flash_attn_varlen_forward = _flash_attn_varlen_forward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types=_get_device())
+@torch.library.custom_op(add_op_namespace_prefix("_flash_attn_backward"), mutates_args=("dq", "dk", "dv"), device_types=_get_device())
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -309,7 +281,7 @@ def _flash_attn_backward(
     return softmax_d
 
 
-@_torch_register_fake_wrapper("flash_attn::_flash_attn_backward")
+@torch.library.register_fake(add_op_namespace_prefix("_flash_attn_backward"))
 def _flash_attn_backward_fake(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -343,13 +315,10 @@ def _flash_attn_backward_fake(
     return softmax_d
 
 
-if torch.__version__ >= "2.4.0":
-    _wrapped_flash_attn_backward = torch.ops.flash_attn._flash_attn_backward
-else:
-    _wrapped_flash_attn_backward = _flash_attn_backward
+_wrapped_flash_attn_backward = _flash_attn_backward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types=_get_device())
+@torch.library.custom_op(add_op_namespace_prefix("_flash_attn_varlen_backward"), mutates_args=("dq", "dk", "dv"), device_types=_get_device())
 def _flash_attn_varlen_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -413,7 +382,7 @@ def _flash_attn_varlen_backward(
     return softmax_d
 
 
-@_torch_register_fake_wrapper("flash_attn::_flash_attn_varlen_backward")
+@torch.library.register_fake(add_op_namespace_prefix("_flash_attn_varlen_backward"))
 def _flash_attn_varlen_backward_fake(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -454,10 +423,7 @@ def _flash_attn_varlen_backward_fake(
     return softmax_d
 
 
-if torch.__version__ >= "2.4.0":
-    _wrapped_flash_attn_varlen_backward = torch.ops.flash_attn._flash_attn_varlen_backward
-else:
-    _wrapped_flash_attn_varlen_backward = _flash_attn_varlen_backward
+_wrapped_flash_attn_varlen_backward = _flash_attn_varlen_backward
 
 
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
