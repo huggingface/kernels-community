@@ -325,3 +325,29 @@ jobs:
         run: |
           CI_TEST_PATH="${{ needs.build-ci-test.outputs.ci-test-path }}"
           "$CI_TEST_PATH/bin/ci-test"
+
+  # Post a comment on the originating PR with the build/test outcome.
+  report-pr:
+    if: always() && inputs.pr_number != ''
+    needs: [build-kernel, test-kernel-gpu]
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment on PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUILD="${{ needs.build-kernel.result }}"
+          TEST="${{ needs.test-kernel-gpu.result }}"
+
+          if [ "$BUILD" = "success" ] && { [ "$TEST" = "success" ] || [ "$TEST" = "skipped" ]; }; then
+            ICON="✅"
+            VERDICT="passed"
+          else
+            ICON="❌"
+            VERDICT="failed (build: ${BUILD}, test: ${TEST})"
+          fi
+
+          gh api repos/${{ github.repository }}/issues/${{ inputs.pr_number }}/comments \
+            -f body="${ICON} **${{ github.workflow }}** | \`${{ inputs.kernel_name }}\` | ${VERDICT} | [logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"

@@ -163,3 +163,28 @@ jobs:
               nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "${{ inputs.repo_prefix }}/$KERNEL" --branch main
             fi
           fi
+
+  # Post a comment on the originating PR with the build outcome.
+  report-pr:
+    if: always() && inputs.pr_number != ''
+    needs: [build-kernel]
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment on PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUILD="${{ needs.build-kernel.result }}"
+
+          if [ "$BUILD" = "success" ]; then
+            ICON="✅"
+            VERDICT="passed"
+          else
+            ICON="❌"
+            VERDICT="failed (${BUILD})"
+          fi
+
+          gh api repos/${{ github.repository }}/issues/${{ inputs.pr_number }}/comments \
+            -f body="${ICON} **${{ github.workflow }}** | \`${{ inputs.kernel_name }}\` | ${VERDICT} | [logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
