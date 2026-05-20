@@ -125,6 +125,11 @@ WINDOWS_KERNELS = {
     "flash-attn2",
 }
 
+# Backends to skip on Windows for specific kernels (e.g. due to toolchain issues).
+WINDOWS_SKIP_BACKENDS: dict[str, set[str]] = {
+    "flash-attn2": {"xpu"},  # CUTLASS XPU headers fail on Windows (ushort undefined)
+}
+
 
 def read_backends(kernel_name: str) -> list[str] | None:
     """Read the backends list from a kernel's build.toml. Returns None if not found."""
@@ -236,6 +241,21 @@ def dispatch_release(
     for workflow in workflows:
         # Only pass backends that this workflow can actually build.
         scoped = sorted(b for b in backends if b in workflow_to_backends.get(workflow, set()))
+
+        # Drop backends known to fail on Windows for this kernel.
+        if workflow == "build-windows.yaml":
+            skip = WINDOWS_SKIP_BACKENDS.get(kernel_name, set())
+            if skip:
+                before = set(scoped)
+                scoped = [b for b in scoped if b not in skip]
+                skipped_backends = before - set(scoped)
+                if skipped_backends:
+                    print(f"Skipping backends {skipped_backends} on Windows for {kernel_name}")
+            if not scoped:
+                result.skipped.append(workflow)
+                print(f"Skipping {workflow} for {kernel_name} (no backends remaining after filtering)")
+                continue
+
         backends_csv = ",".join(scoped)
 
         dispatch_key = (
