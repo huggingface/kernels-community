@@ -20,6 +20,7 @@ from ._ops import add_op_namespace_prefix
 
 # # isort: on
 
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -48,7 +49,9 @@ def _get_block_size_n(device, head_dim, is_dropout, is_causal):
 
     # This should match the block sizes in the CUDA kernel
     major, minor = torch.cuda.get_device_capability(device)
-    is_sm8x = major == 8 and minor > 0  # Only include sm86 and sm89, exclude sm80 (A100)
+    is_sm8x = (
+        major == 8 and minor > 0
+    )  # Only include sm86 and sm89, exclude sm80 (A100)
     is_sm80 = major == 8 and minor == 0
     is_sm90 = major == 9 and minor == 0
     if head_dim <= 32:
@@ -74,7 +77,11 @@ def round_multiple(x, m):
     return (x + m - 1) // m * m
 
 
-@torch.library.custom_op(add_op_namespace_prefix("_flash_attn_forward"), mutates_args=(), device_types=_get_device())
+@torch.library.custom_op(
+    add_op_namespace_prefix("_flash_attn_forward"),
+    mutates_args=(),
+    device_types=_get_device(),
+)
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -86,7 +93,7 @@ def _flash_attn_forward(
     window_size_right: int,
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
-    return_softmax: bool
+    return_softmax: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn.fwd(
@@ -119,22 +126,41 @@ def _flash_attn_forward_fake(
     window_size_right: int,
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
-    return_softmax: bool
+    return_softmax: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     batch_size, seqlen_q, num_heads, head_size = q.shape
     seqlen_k = k.shape[1]
     out = torch.empty_like(q)
-    softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device, layout=q.layout)
+    softmax_lse = torch.empty(
+        (batch_size, num_heads, seqlen_q),
+        dtype=torch.float32,
+        device=q.device,
+        layout=q.layout,
+    )
     p = torch.empty((0,), dtype=q.dtype, device=q.device, layout=q.layout)
     if return_softmax:
-        p = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
+        p = torch.empty(
+            (
+                batch_size,
+                num_heads,
+                round_multiple(seqlen_q, 128),
+                round_multiple(seqlen_k, 128),
+            ),
+            dtype=q.dtype,
+            device=q.device,
+            layout=q.layout,
+        )
     rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
 
     return out, softmax_lse, p, rng_state
 
 
-@torch.library.custom_op(add_op_namespace_prefix("_flash_attn_varlen_forward"), mutates_args=(), device_types=_get_device())
+@torch.library.custom_op(
+    add_op_namespace_prefix("_flash_attn_varlen_forward"),
+    mutates_args=(),
+    device_types=_get_device(),
+)
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -211,19 +237,30 @@ def _flash_attn_varlen_forward_fake(
     paged_kv = block_table is not None
     batch_size = cu_seqlens_q.numel() - 1
     total_q, num_heads, _ = q.shape
-    
+
     out = torch.empty_like(q)
-    softmax_lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device, layout=q.layout)
+    softmax_lse = torch.empty(
+        (num_heads, total_q), dtype=torch.float32, device=q.device, layout=q.layout
+    )
     p = torch.empty((0,), dtype=q.dtype, device=q.device, layout=q.layout)
     seqlen_q_rounded = round_multiple(max_seqlen_q, 128)
     seqlen_k_rounded = round_multiple(max_seqlen_k, 128)
     if return_softmax:
-        p = torch.empty((batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded), dtype=q.dtype, device=q.device, layout=q.layout)
+        p = torch.empty(
+            (batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded),
+            dtype=q.dtype,
+            device=q.device,
+            layout=q.layout,
+        )
     rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     return out, softmax_lse, p, rng_state
 
 
-@torch.library.custom_op(add_op_namespace_prefix("_flash_attn_backward"), mutates_args=("dq", "dk", "dv"), device_types=_get_device())
+@torch.library.custom_op(
+    add_op_namespace_prefix("_flash_attn_backward"),
+    mutates_args=("dq", "dk", "dv"),
+    device_types=_get_device(),
+)
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -304,12 +341,20 @@ def _flash_attn_backward_fake(
     if dv is None:
         dv = torch.empty_like(v)
     batch_size, seqlen_q, num_heads, _ = q.shape
-    softmax_d = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128)), device=q.device, dtype=torch.float32)
-    
+    softmax_d = torch.empty(
+        (batch_size, num_heads, round_multiple(seqlen_q, 128)),
+        device=q.device,
+        dtype=torch.float32,
+    )
+
     return softmax_d
 
 
-@torch.library.custom_op(add_op_namespace_prefix("_flash_attn_varlen_backward"), mutates_args=("dq", "dk", "dv"), device_types=_get_device())
+@torch.library.custom_op(
+    add_op_namespace_prefix("_flash_attn_varlen_backward"),
+    mutates_args=("dq", "dk", "dv"),
+    device_types=_get_device(),
+)
 def _flash_attn_varlen_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -409,8 +454,10 @@ def _flash_attn_varlen_backward_fake(
         dk = torch.empty_like(k)
     if dv is None:
         dv = torch.empty_like(v)
-    softmax_d = torch.empty((num_heads, total_q + 128 * batch_size), device=q.device, dtype=torch.float32)
-    
+    softmax_d = torch.empty(
+        (num_heads, total_q + 128 * batch_size), device=q.device, dtype=torch.float32
+    )
+
     return softmax_d
 
 
@@ -438,7 +485,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state =  _flash_attn_forward(
+        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q,
             k,
             v,
@@ -541,7 +588,9 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             block_table=None,
         )
         if is_grad:
-            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens, rng_state)
+            ctx.save_for_backward(
+                q, k, v, out_padded, softmax_lse, cu_seqlens, rng_state
+            )
             ctx.dropout_p = dropout_p
             ctx.max_seqlen = max_seqlen
             ctx.softmax_scale = softmax_scale
@@ -606,9 +655,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         return_softmax,
         is_grad_enabled,
     ):
-        is_grad = is_grad_enabled and any(
-            x.requires_grad for x in [q, kv]
-        )
+        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, kv])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         k, v = kv[:, :, 0].detach(), kv[:, :, 1].detach()
@@ -697,9 +744,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         return_softmax,
         is_grad_enabled,
     ):
-        is_grad = is_grad_enabled and any(
-            x.requires_grad for x in [q, kv]
-        )
+        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, kv])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         k, v = kv[:, 0].detach(), kv[:, 1].detach()
@@ -744,7 +789,9 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = (
+            ctx.saved_tensors
+        )
         dq = torch.empty_like(q)
         kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
         dkv = torch.empty(kv_shape, dtype=k.dtype, device=k.device)
@@ -778,7 +825,23 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., : dout.shape[-1]]
-        return dq, dkv, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return (
+            dq,
+            dkv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -798,9 +861,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return_softmax,
         is_grad_enabled,
     ):
-        is_grad = is_grad_enabled and any(
-            x.requires_grad for x in [q, k, v]
-        )
+        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_og = q.size(3)
@@ -889,9 +950,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_table,
         is_grad_enabled,
     ):
-        is_grad = is_grad_enabled and any(
-            x.requires_grad for x in [q, k, v]
-        )
+        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_og = q.size(2)
@@ -936,7 +995,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = (
+            ctx.saved_tensors
+        )
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         head_size_og = dout.size(2)
         dout_padded = dout
@@ -969,7 +1030,25 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def flash_attn_qkvpacked_func(
@@ -1117,7 +1196,7 @@ def flash_attn_func(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
+    softcap=0.0,  # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -1194,7 +1273,7 @@ def flash_attn_varlen_qkvpacked_func(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
+    softcap=0.0,  # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -1263,7 +1342,7 @@ def flash_attn_varlen_kvpacked_func(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
+    softcap=0.0,  # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -1356,7 +1435,7 @@ def flash_attn_varlen_func(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
+    softcap=0.0,  # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -1453,7 +1532,7 @@ def flash_attn_with_kvcache(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
+    softcap=0.0,  # 0.0 means deactivated
     rotary_interleaved=True,
     alibi_slopes=None,
     num_splits=0,
