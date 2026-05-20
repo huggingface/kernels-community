@@ -65,6 +65,8 @@ jobs:
   # Build the Metal kernel; PR mode builds .#ci, release builds the full bundle and uploads.
   build-kernel:
     runs-on: macos-26
+    strategy:
+      fail-fast: false
     steps:
       # Post a running commit status so the PR shows the build is in progress.
       - name: Set running status

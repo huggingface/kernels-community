@@ -80,6 +80,7 @@ jobs:
   # Build the kernel for each CUDA/XPU variant; release mode uploads to the Hub.
   build-kernel:
     strategy:
+      fail-fast: false
       matrix:
         os: [windows-2022]
         python: [3.12]
