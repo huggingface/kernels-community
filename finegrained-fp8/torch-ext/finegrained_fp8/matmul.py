@@ -17,6 +17,7 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
+from .fp4 import w4a8_tensor_fp8_matmul
 from .utils import device_context
 
 
@@ -393,9 +394,10 @@ def w8a8_fp8_matmul(
     block_size: list[int] | None,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Unified W8A8 FP8 matmul dispatcher.
+    """Unified W8A8/FP4 matmul dispatcher.
 
     Dispatch rules:
+    - FP4-weight path when ``B.dtype == torch.int8``
     - tensor mode when ``block_size is None``
     - tensor mode when ``block_size == [N, K]``
     - otherwise block mode
@@ -403,6 +405,9 @@ def w8a8_fp8_matmul(
     Returns:
         Output tensor ``[M, N]`` in ``output_dtype``.
     """
+    if B.dtype == torch.int8:
+        return w4a8_tensor_fp8_matmul(A, As, B, Bs, block_size, output_dtype)
+
     if block_size is None or (
         block_size[0] == B.size(0) and block_size[1] == B.size(1)
     ):

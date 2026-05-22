@@ -19,6 +19,7 @@ import triton
 import triton.language as tl
 from torch.library import wrap_triton
 
+from .act_quant import fp8_act_quant
 from .utils import device_context
 
 
@@ -28,6 +29,7 @@ DEFAULT_BLOCK_M = 32
 DEFAULT_BLOCK_N = 128
 DEFAULT_BLOCK_K = 128
 DEFAULT_GROUP_M = 8
+FP8_MAX = 448.0
 
 
 def _autotune_configs():
@@ -40,8 +42,9 @@ def _autotune_configs():
 
 @triton.autotune(configs=_autotune_configs(), key=["M", "N", "K", "BLOCK_M", "BLOCK_N", "BLOCK_K"])
 @triton.jit
-def w4a16_fp4_matmul_kernel(
+def w4a8_tensor_fp8_matmul_kernel(
     A_ptr,
+    AS_ptr,
     B_ptr,
     SF_ptr,
     C_ptr,
@@ -50,6 +53,8 @@ def w4a16_fp4_matmul_kernel(
     K,
     stride_am,
     stride_ak,
+    stride_asm,
+    stride_ask,
     stride_bn,
     stride_bk,
     stride_sfn,
@@ -78,7 +83,11 @@ def w4a16_fp4_matmul_kernel(
     offs_k_byte = tl.arange(0, BLOCK_K // VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_K // SCALE_GROUP_K)
 
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
     a_base = A_ptr + offs_m[:, None] * stride_am
+    as_base = AS_ptr + offs_m[:, None] * stride_asm
     b_base = B_ptr + offs_n[:, None] * stride_bn
     sf_base = SF_ptr + offs_n[:, None] * stride_sfn
 
@@ -89,25 +98,36 @@ def w4a16_fp4_matmul_kernel(
         a_k = k_base + tl.arange(0, BLOCK_K)
         b_k = k_base // VALUES_PER_BYTE + offs_k_byte
         s_k = k_base // SCALE_GROUP_K + offs_sf
-
         a = tl.load(
             a_base + a_k[None, :] * stride_ak,
-            mask=(offs_m[:, None] < M) & (a_k[None, :] < K),
+            mask=mask_m[:, None] & (a_k[None, :] < K),
             other=0.0,
         )
+        a_scale = tl.load(
+            as_base + s_k[None, :] * stride_ask,
+            mask=mask_m[:, None] & (s_k[None, :] < K // SCALE_GROUP_K),
+            other=0,
+        ).to(tl.uint8)
         b_nk = tl.load(
             b_base + b_k[None, :] * stride_bk,
-            mask=(offs_n[:, None] < N) & (b_k[None, :] < (K // VALUES_PER_BYTE)),
+            mask=mask_n[:, None] & (b_k[None, :] < (K // VALUES_PER_BYTE)),
             other=0,
         ).to(tl.uint8)
         b = tl.trans(b_nk)
         sf = tl.load(
             sf_base + s_k[None, :] * stride_sfk,
-            mask=(offs_n[:, None] < N) & (s_k[None, :] < (K // SCALE_GROUP_K)),
+            mask=mask_n[:, None] & (s_k[None, :] < (K // SCALE_GROUP_K)),
             other=0,
         ).to(tl.uint8)
-
-        acc = acc + tl.dot_scaled(a, None, "bf16", b, sf, "e2m1")
+        acc = tl.dot_scaled(
+            a,
+            a_scale,
+            "e4m3",
+            b,
+            sf,
+            "e2m1",
+            acc=acc,
+        )
 
     c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
@@ -116,8 +136,9 @@ def w4a16_fp4_matmul_kernel(
 
 @triton.autotune(configs=_autotune_configs(), key=["N", "K", "BLOCK_M", "BLOCK_N", "BLOCK_K"])
 @triton.jit
-def w4a16_fp4_matmul_batched_kernel(
+def w4a8_tensor_fp8_matmul_batched_kernel(
     A_ptr,
+    AS_ptr,
     B_ptr,
     SF_ptr,
     C_ptr,
@@ -127,6 +148,8 @@ def w4a16_fp4_matmul_batched_kernel(
     K,
     stride_am,
     stride_ak,
+    stride_asm,
+    stride_ask,
     stride_be,
     stride_bn,
     stride_bk,
@@ -147,6 +170,7 @@ def w4a16_fp4_matmul_batched_kernel(
     expert_id = tl.load(ExpertIds_ptr + batch_id).to(tl.int64)
 
     A_ptr = A_ptr + batch_id * stride_am
+    AS_ptr = AS_ptr + batch_id * stride_asm
     B_ptr = B_ptr + expert_id * stride_be
     SF_ptr = SF_ptr + expert_id * stride_sfe
     C_ptr = C_ptr + batch_id * stride_cm
@@ -156,6 +180,7 @@ def w4a16_fp4_matmul_batched_kernel(
     offs_k_byte = tl.arange(0, BLOCK_K // VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_K // SCALE_GROUP_K)
 
+    mask_n = offs_n < N
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k0 in range(0, tl.cdiv(K, BLOCK_K)):
@@ -163,25 +188,36 @@ def w4a16_fp4_matmul_batched_kernel(
         a_k = k_base + tl.arange(0, BLOCK_K)
         b_k = k_base // VALUES_PER_BYTE + offs_k_byte
         s_k = k_base // SCALE_GROUP_K + offs_sf
-
         a = tl.load(
             A_ptr + offs_m[:, None] * 0 + a_k[None, :] * stride_ak,
             mask=a_k[None, :] < K,
             other=0.0,
         )
+        a_scale = tl.load(
+            AS_ptr + offs_m[:, None] * 0 + s_k[None, :] * stride_ask,
+            mask=s_k[None, :] < K // SCALE_GROUP_K,
+            other=0,
+        ).to(tl.uint8)
         b_nk = tl.load(
             B_ptr + offs_n[:, None] * stride_bn + b_k[None, :] * stride_bk,
-            mask=(offs_n[:, None] < N) & (b_k[None, :] < (K // VALUES_PER_BYTE)),
+            mask=mask_n[:, None] & (b_k[None, :] < (K // VALUES_PER_BYTE)),
             other=0,
         ).to(tl.uint8)
         b = tl.trans(b_nk)
         sf = tl.load(
             SF_ptr + offs_n[:, None] * stride_sfn + s_k[None, :] * stride_sfk,
-            mask=(offs_n[:, None] < N) & (s_k[None, :] < (K // SCALE_GROUP_K)),
+            mask=mask_n[:, None] & (s_k[None, :] < (K // SCALE_GROUP_K)),
             other=0,
         ).to(tl.uint8)
-
-        acc = acc + tl.dot_scaled(a, None, "bf16", b, sf, "e2m1")
+        acc = tl.dot_scaled(
+            a,
+            a_scale,
+            "e4m3",
+            b,
+            sf,
+            "e2m1",
+            acc=acc,
+        )
 
     c_ptrs = C_ptr + offs_m[:, None] * 0 + offs_n[None, :] * stride_cn
     tl.store(c_ptrs, acc.to(C_ptr.dtype.element_ty), mask=(offs_m == 0)[:, None] & (offs_n[None, :] < N))
@@ -189,8 +225,9 @@ def w4a16_fp4_matmul_batched_kernel(
 
 @triton.autotune(configs=_autotune_configs(), key=["S", "N", "K", "BLOCK_M", "BLOCK_N", "BLOCK_K"])
 @triton.jit
-def w4a16_fp4_matmul_grouped_kernel(
+def w4a8_tensor_fp8_matmul_grouped_kernel(
     A_ptr,
+    AS_ptr,
     B_ptr,
     SF_ptr,
     C_ptr,
@@ -201,6 +238,8 @@ def w4a16_fp4_matmul_grouped_kernel(
     K,
     stride_am,
     stride_ak,
+    stride_asm,
+    stride_ask,
     stride_be,
     stride_bn,
     stride_bk,
@@ -251,9 +290,11 @@ def w4a16_fp4_matmul_grouped_kernel(
     offs_sf = tl.arange(0, BLOCK_K // SCALE_GROUP_K)
 
     a_base = A_ptr + offs_global_m[:, None] * stride_am
+    as_base = AS_ptr + offs_global_m[:, None] * stride_asm
     b_base = B_ptr + expert_id * stride_be + offs_n[:, None] * stride_bn
     sf_base = SF_ptr + expert_id * stride_sfe + offs_n[:, None] * stride_sfn
 
+    mask_n = offs_n < N
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k0 in range(0, tl.cdiv(K, BLOCK_K)):
@@ -261,25 +302,36 @@ def w4a16_fp4_matmul_grouped_kernel(
         a_k = k_base + tl.arange(0, BLOCK_K)
         b_k = k_base // VALUES_PER_BYTE + offs_k_byte
         s_k = k_base // SCALE_GROUP_K + offs_sf
-
         a = tl.load(
             a_base + a_k[None, :] * stride_ak,
             mask=row_mask[:, None] & (a_k[None, :] < K),
             other=0.0,
         )
+        a_scale = tl.load(
+            as_base + s_k[None, :] * stride_ask,
+            mask=row_mask[:, None] & (s_k[None, :] < K // SCALE_GROUP_K),
+            other=0,
+        ).to(tl.uint8)
         b_nk = tl.load(
             b_base + b_k[None, :] * stride_bk,
-            mask=(offs_n[:, None] < N) & (b_k[None, :] < (K // VALUES_PER_BYTE)),
+            mask=mask_n[:, None] & (b_k[None, :] < (K // VALUES_PER_BYTE)),
             other=0,
         ).to(tl.uint8)
         b = tl.trans(b_nk)
         sf = tl.load(
             sf_base + s_k[None, :] * stride_sfk,
-            mask=(offs_n[:, None] < N) & (s_k[None, :] < (K // SCALE_GROUP_K)),
+            mask=mask_n[:, None] & (s_k[None, :] < (K // SCALE_GROUP_K)),
             other=0,
         ).to(tl.uint8)
-
-        acc = acc + tl.dot_scaled(a, None, "bf16", b, sf, "e2m1")
+        acc = tl.dot_scaled(
+            a,
+            a_scale,
+            "e4m3",
+            b,
+            sf,
+            "e2m1",
+            acc=acc,
+        )
 
     c_ptrs = C_ptr + offs_global_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     c_mask = row_mask[:, None] & (offs_n[None, :] < N)
@@ -287,32 +339,59 @@ def w4a16_fp4_matmul_grouped_kernel(
 
 
 @functools.cache
-def _get_grouped_kernel():
-    return w4a16_fp4_matmul_grouped_kernel
+def _get_tensor_grouped_kernel():
+    return w4a8_tensor_fp8_matmul_grouped_kernel
 
 
 @functools.cache
-def _get_batched_kernel():
-    return w4a16_fp4_matmul_batched_kernel
+def _get_tensor_batched_kernel():
+    return w4a8_tensor_fp8_matmul_batched_kernel
 
 
 @functools.cache
-def _get_kernel():
-    return w4a16_fp4_matmul_kernel
+def _get_tensor_kernel():
+    return w4a8_tensor_fp8_matmul_kernel
 
 
-def w4a16_fp4_matmul(
+def _resolve_block_k(block_size: list[int] | None, K: int) -> int:
+    block_k = DEFAULT_BLOCK_K if block_size is None else block_size[1]
+    if K % block_k == 0:
+        return block_k
+    if block_size is None:
+        return FP4_SCALE_GROUP_K
+    raise AssertionError(f"K (={K}) must be divisible by block_k (={block_k}) for fp8_act_quant")
+
+
+def _expand_activation_scales_for_fp4(As: torch.Tensor, K: int, block_k: int) -> torch.Tensor:
+    expected_groups = K // FP4_SCALE_GROUP_K
+    if As.shape[-1] == expected_groups:
+        return As
+
+    expected_blocks = K // block_k
+    assert As.shape[-1] == expected_blocks, (
+        f"As shape {tuple(As.shape)} incompatible with K={K}, block_k={block_k}; "
+        f"expected last dim {expected_blocks} or {expected_groups}"
+    )
+    assert block_k % FP4_SCALE_GROUP_K == 0, (
+        f"block_k (={block_k}) must be divisible by {FP4_SCALE_GROUP_K} for FP4 scale expansion"
+    )
+    return As.repeat_interleave(block_k // FP4_SCALE_GROUP_K, dim=-1)
+
+
+def w4a8_tensor_fp8_matmul(
     A: torch.Tensor,
+    As: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
     block_size: list[int] | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    assert A.ndim == 2 and B.ndim == 2 and Bs.ndim == 2
-    assert A.dtype in (torch.bfloat16, torch.float16)
+    assert A.ndim == 2 and As.ndim == 2 and B.ndim == 2 and Bs.ndim == 2
+    assert A.dtype == torch.float8_e4m3fn
     assert B.dtype == torch.int8
     assert Bs.dtype == torch.float8_e8m0fnu
-    assert A.is_contiguous() and B.is_contiguous() and Bs.is_contiguous()
+    assert As.dtype in (torch.float32, torch.float8_e8m0fnu)
+    assert A.is_contiguous() and As.is_contiguous() and B.is_contiguous() and Bs.is_contiguous()
 
     M, K = A.shape
     N, K_half = B.shape
@@ -324,14 +403,19 @@ def w4a16_fp4_matmul(
     )
     assert K % FP4_SCALE_GROUP_K == 0, f"K (={K}) must be a multiple of {FP4_SCALE_GROUP_K}"
 
+    block_k = _resolve_block_k(block_size, K)
+    As = _expand_activation_scales_for_fp4(As, K, block_k)
+    assert As.shape == (M, K // FP4_SCALE_GROUP_K), f"As shape {tuple(As.shape)} != ({M}, {K // FP4_SCALE_GROUP_K})"
+
+    as_u8 = As.to(torch.float8_e8m0fnu).contiguous().view(torch.uint8)
     sf_u8 = Bs.contiguous().view(torch.uint8)
     block_n = DEFAULT_BLOCK_N if block_size is None else block_size[0]
-    block_k = DEFAULT_BLOCK_K if block_size is None else block_size[1]
     C = A.new_empty((M, N), dtype=output_dtype)
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
     with device_context(A.device):
-        _get_kernel()[grid](
+        _get_tensor_kernel()[grid](
             A,
+            as_u8,
             B,
             sf_u8,
             C,
@@ -340,6 +424,8 @@ def w4a16_fp4_matmul(
             K,
             A.stride(0),
             A.stride(1),
+            as_u8.stride(0),
+            as_u8.stride(1),
             B.stride(0),
             B.stride(1),
             sf_u8.stride(0),
@@ -356,17 +442,33 @@ def w4a16_fp4_matmul(
     return C
 
 
-def w4a16_fp4_matmul_batched(
+def w4a8_fp8_matmul(
     A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: list[int] | None = None,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    assert A.ndim == 2
+    assert A.dtype in (torch.bfloat16, torch.float16)
+    block_k = _resolve_block_k(block_size, A.shape[1])
+    qA, As = fp8_act_quant(A, block_k)
+    return w4a8_tensor_fp8_matmul(qA, As, B, Bs, [DEFAULT_BLOCK_N if block_size is None else block_size[0], block_k], output_dtype)
+
+
+def w4a8_tensor_fp8_matmul_batched(
+    A: torch.Tensor,
+    As: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
     block_size: list[int] | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    assert A.ndim == 2 and B.ndim == 3 and Bs.ndim == 3
+    assert A.ndim == 2 and As.ndim == 2 and B.ndim == 3 and Bs.ndim == 3
     assert expert_ids.ndim == 1
-    assert A.dtype in (torch.bfloat16, torch.float16)
+    assert A.dtype == torch.float8_e4m3fn
+    assert As.dtype in (torch.float32, torch.float8_e8m0fnu)
     assert B.dtype == torch.int8
     assert Bs.dtype == torch.float8_e8m0fnu
 
@@ -381,15 +483,20 @@ def w4a16_fp4_matmul_batched(
     )
     assert K % FP4_SCALE_GROUP_K == 0, f"K (={K}) must be a multiple of {FP4_SCALE_GROUP_K}"
 
+    block_k = _resolve_block_k(block_size, K)
+    As = _expand_activation_scales_for_fp4(As, K, block_k)
+    assert As.shape == (S, K // FP4_SCALE_GROUP_K), f"As shape {tuple(As.shape)} != ({S}, {K // FP4_SCALE_GROUP_K})"
+
+    as_u8 = As.to(torch.float8_e8m0fnu).contiguous().view(torch.uint8)
     sf_u8 = Bs.contiguous().view(torch.uint8)
     expert_ids = expert_ids.to(device=A.device, dtype=torch.int32).contiguous()
     block_n = DEFAULT_BLOCK_N if block_size is None else block_size[0]
-    block_k = DEFAULT_BLOCK_K if block_size is None else block_size[1]
     C = A.new_empty((S, N), dtype=output_dtype)
     grid = (S, triton.cdiv(N, block_n))
     with device_context(A.device):
-        _get_batched_kernel()[grid](
+        _get_tensor_batched_kernel()[grid](
             A,
+            as_u8,
             B,
             sf_u8,
             C,
@@ -399,6 +506,8 @@ def w4a16_fp4_matmul_batched(
             K,
             A.stride(0),
             A.stride(1),
+            as_u8.stride(0),
+            as_u8.stride(1),
             B.stride(0),
             B.stride(1),
             B.stride(2),
@@ -416,8 +525,32 @@ def w4a16_fp4_matmul_batched(
     return C
 
 
-def w4a16_fp4_matmul_grouped(
+def w4a8_fp8_matmul_batched(
     A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    expert_ids: torch.Tensor,
+    block_size: list[int] | None = None,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    assert A.ndim == 2
+    assert A.dtype in (torch.bfloat16, torch.float16)
+    block_k = _resolve_block_k(block_size, A.shape[1])
+    qA, As = fp8_act_quant(A, block_k)
+    return w4a8_tensor_fp8_matmul_batched(
+        qA,
+        As,
+        B,
+        Bs,
+        expert_ids,
+        [DEFAULT_BLOCK_N if block_size is None else block_size[0], block_k],
+        output_dtype,
+    )
+
+
+def w4a8_tensor_fp8_matmul_grouped(
+    A: torch.Tensor,
+    As: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
     offsets: torch.Tensor,
@@ -425,9 +558,10 @@ def w4a16_fp4_matmul_grouped(
     block_size: list[int] | None = None,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    assert A.ndim == 2 and B.ndim == 3 and Bs.ndim == 3
+    assert A.ndim == 2 and As.ndim == 2 and B.ndim == 3 and Bs.ndim == 3
     assert offsets.ndim == 1 and tokens_per_expert.ndim == 1
-    assert A.dtype in (torch.bfloat16, torch.float16)
+    assert A.dtype == torch.float8_e4m3fn
+    assert As.dtype in (torch.float32, torch.float8_e8m0fnu)
     assert B.dtype == torch.int8
     assert Bs.dtype == torch.float8_e8m0fnu
 
@@ -442,11 +576,15 @@ def w4a16_fp4_matmul_grouped(
     )
     assert K % FP4_SCALE_GROUP_K == 0, f"K (={K}) must be a multiple of {FP4_SCALE_GROUP_K}"
 
+    block_k = _resolve_block_k(block_size, K)
+    As = _expand_activation_scales_for_fp4(As, K, block_k)
+    assert As.shape == (S, K // FP4_SCALE_GROUP_K), f"As shape {tuple(As.shape)} != ({S}, {K // FP4_SCALE_GROUP_K})"
+
+    as_u8 = As.to(torch.float8_e8m0fnu).contiguous().view(torch.uint8)
     sf_u8 = Bs.contiguous().view(torch.uint8)
     offsets = offsets.to(device=A.device, dtype=torch.int32).contiguous()
     tokens_per_expert = tokens_per_expert.to(device=A.device, dtype=torch.int32).contiguous()
     block_n = DEFAULT_BLOCK_N if block_size is None else block_size[0]
-    block_k = DEFAULT_BLOCK_K if block_size is None else block_size[1]
     block_m = DEFAULT_BLOCK_M
     C = A.new_empty((S, N), dtype=output_dtype)
     tiles_per_expert = (tokens_per_expert + block_m - 1) // block_m
@@ -454,8 +592,9 @@ def w4a16_fp4_matmul_grouped(
     max_m_tiles = triton.cdiv(S, block_m) + E
     grid = (max_m_tiles, triton.cdiv(N, block_n))
     with device_context(A.device):
-        _get_grouped_kernel()[grid](
+        _get_tensor_grouped_kernel()[grid](
             A,
+            as_u8,
             B,
             sf_u8,
             C,
@@ -466,6 +605,8 @@ def w4a16_fp4_matmul_grouped(
             K,
             A.stride(0),
             A.stride(1),
+            as_u8.stride(0),
+            as_u8.stride(1),
             B.stride(0),
             B.stride(1),
             B.stride(2),
@@ -483,3 +624,28 @@ def w4a16_fp4_matmul_grouped(
             SCALE_GROUP_K=FP4_SCALE_GROUP_K,
         )
     return C
+
+
+def w4a8_fp8_matmul_grouped(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    offsets: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    block_size: list[int] | None = None,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    assert A.ndim == 2
+    assert A.dtype in (torch.bfloat16, torch.float16)
+    block_k = _resolve_block_k(block_size, A.shape[1])
+    qA, As = fp8_act_quant(A, block_k)
+    return w4a8_tensor_fp8_matmul_grouped(
+        qA,
+        As,
+        B,
+        Bs,
+        offsets,
+        tokens_per_expert,
+        [DEFAULT_BLOCK_N if block_size is None else block_size[0], block_k],
+        output_dtype,
+    )
