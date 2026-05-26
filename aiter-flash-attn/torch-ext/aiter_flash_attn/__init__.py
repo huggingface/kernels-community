@@ -6,7 +6,14 @@ Hugging Face Hub kernel. Exposes the two FlashAttention entry points used by
 the `transformers` ROCm fallback.
 """
 
-from .mha import flash_attn_func, flash_attn_varlen_func
+from .mha import (
+    flash_attn_func,
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+    mha_set_impl,
+    mha_set_use_fused_bwd_kernel,
+    mha_set_use_int64_strides,
+)
 
 
 __kernel_metadata__ = {
@@ -18,4 +25,8 @@ __all__ = [
     "__kernel_metadata__",
     "flash_attn_func",
     "flash_attn_varlen_func",
+    "flash_attn_with_kvcache",
+    "mha_set_impl",
+    "mha_set_use_fused_bwd_kernel",
+    "mha_set_use_int64_strides",
 ]
