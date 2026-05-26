@@ -394,10 +394,9 @@ def w8a8_fp8_matmul(
     block_size: list[int] | None,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Unified W8A8/FP4 matmul dispatcher.
+    """Unified W8A8 FP8 matmul dispatcher.
 
     Dispatch rules:
-    - FP4-weight path when ``B.dtype == torch.int8``
     - tensor mode when ``block_size is None``
     - tensor mode when ``block_size == [N, K]``
     - otherwise block mode
@@ -405,12 +404,28 @@ def w8a8_fp8_matmul(
     Returns:
         Output tensor ``[M, N]`` in ``output_dtype``.
     """
-    if B.dtype == torch.int8:
-        return w4a8_tensor_fp8_matmul(A, As, B, Bs, block_size, output_dtype)
-
     if block_size is None or (
         block_size[0] == B.size(0) and block_size[1] == B.size(1)
     ):
         return w8a8_tensor_fp8_matmul(A, B, As, Bs, output_dtype)
 
     return w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype)
+
+
+def fp8_matmul(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: list[int] | None,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Neutral FP8 matmul dispatcher.
+
+    Dispatches to the W8A8 FP8 path for FP8 weights and the W4A8 FP4 path for
+    FP4-packed weights.
+    """
+    if B.dtype == torch.int8:
+        return w4a8_tensor_fp8_matmul(A, As, B, Bs, block_size, output_dtype)
+
+    return w8a8_fp8_matmul(A, B, As, Bs, block_size, output_dtype)

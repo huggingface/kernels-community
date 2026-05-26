@@ -458,10 +458,9 @@ def w8a8_fp8_matmul_grouped(
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
 ) -> torch.Tensor:
-    """Unified grouped W8A8/FP4 matmul dispatcher.
+    """Unified grouped W8A8 FP8 matmul dispatcher.
 
     Dispatch rules:
-    - FP4-weight path when ``B.dtype == torch.int8``
     - tensor mode when ``block_size is None``
     - tensor mode when ``block_size == [N, K]``
     - otherwise block mode
@@ -469,9 +468,6 @@ def w8a8_fp8_matmul_grouped(
     Returns:
         Output tensor ``[S, N]`` in the same dtype as ``A``, in expert-sorted order.
     """
-    if B.dtype == torch.int8:
-        return w4a8_fp8_matmul_grouped(A, B, Bs, offsets, tokens_per_expert, block_size)
-
     if block_size is None or (
         block_size[0] == B.size(1) and block_size[1] == B.size(2)
     ):
@@ -480,3 +476,22 @@ def w8a8_fp8_matmul_grouped(
     return w8a8_block_fp8_matmul_grouped(
         A, B, Bs, offsets, tokens_per_expert, block_size
     )
+
+
+def fp8_matmul_grouped(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    offsets: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    block_size: list[int] | None,
+) -> torch.Tensor:
+    """Neutral grouped FP8 matmul dispatcher.
+
+    Dispatches to the W8A8 FP8 path for FP8 weights and the W4A8 FP4 path for
+    FP4-packed weights.
+    """
+    if B.dtype == torch.int8:
+        return w4a8_fp8_matmul_grouped(A, B, Bs, offsets, tokens_per_expert, block_size)
+
+    return w8a8_fp8_matmul_grouped(A, B, Bs, offsets, tokens_per_expert, block_size)
