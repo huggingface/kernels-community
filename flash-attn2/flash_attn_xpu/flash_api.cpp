@@ -2,6 +2,8 @@
 #include <c10/xpu/XPUStream.h>
 #include <cute/util/compat/device.hpp>
 #include <ATen/xpu/XPUGeneratorImpl.h>
+#include <sycl/sycl.hpp>
+#include <limits>
 
 #include "src/fmha_fwd.hpp"
 #include "src/fmha_bwd.hpp"
@@ -390,6 +392,8 @@ mha_varlen_fwd(
     compat::select_device(device_idx);
 
     // check inputs
+    TORCH_CHECK(p_dropout < 1.0f, "FlashAttention dropout probability must be less than 1.0");
+
     q = ensure_contiguous(q);
     const auto sizes = q.sizes();
     const int total_q = sizes[0];
@@ -444,6 +448,31 @@ mha_varlen_fwd(
 
     auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
 
+    uint64_t philox_seed = 0;
+    uint64_t philox_offset = 0;
+    at::Tensor rng_state = at::empty({2}, q.options().dtype(at::kLong));
+
+    if (p_dropout > 0.0f) {
+        int64_t counter_offset = batch_size * num_heads * 32;
+        auto [seed, offset] = get_philox_state(gen_, counter_offset);
+        philox_seed = seed;
+        philox_offset = offset;
+        rng_state[0] = static_cast<int64_t>(philox_seed);
+        rng_state[1] = static_cast<int64_t>(philox_offset);
+    }
+
+    const int q_tile_size = (head_size_og <= 32) ? 64 : (head_size_og <= 128) ? 128 : 256;
+    const int k_tile_size = (max_seqlen_q == 1 && !is_paged) ? 512 : 128;
+    const int seqlen_q_rounded = round_multiple(max_seqlen_q, q_tile_size);
+    const int seqlen_k_rounded = round_multiple(max_seqlen_k, k_tile_size);
+    at::Tensor S_dmask;
+    if (return_softmax) {
+        TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
+        S_dmask = torch::empty({batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded}, q.options());
+    } else {
+        S_dmask = torch::empty({0}, q.options());
+    }
+
     cutlass_fmha_fwd_varlen_impl(
         queue,
         q_padded, k_padded, v_padded, out_padded,
@@ -453,7 +482,10 @@ mha_varlen_fwd(
         max_seqlen_q, max_seqlen_k,
         softmax_scale,
         window_size_left, window_size_right,
-        true, is_paged, is_causal, is_local);
+        true, is_paged, is_causal, is_local,
+        p_dropout, philox_seed, philox_offset, nullptr,
+        return_softmax ? S_dmask.data_ptr() : nullptr,
+        seqlen_q_rounded, seqlen_k_rounded);
 
     // Strip padding from output back to original head_size
     at::Tensor out = needs_padding
@@ -462,10 +494,433 @@ mha_varlen_fwd(
                     .contiguous()
         : ensure_contiguous(out_padded);
 
-    at::Tensor S_dmask;
-    at::Tensor rng_state;
     return {out, softmax_lse, S_dmask, rng_state};
   }
+
+std::vector<at::Tensor>
+mha_varlen_bwd(
+        const at::Tensor &dout,
+        const at::Tensor &q,
+        const at::Tensor &k,
+        const at::Tensor &v,
+        const at::Tensor &out,
+        const at::Tensor &softmax_lse,
+        std::optional<at::Tensor> &dq_,
+        std::optional<at::Tensor> &dk_,
+        std::optional<at::Tensor> &dv_,
+        const at::Tensor &cu_seqlens_q,
+        const at::Tensor &cu_seqlens_k,
+        std::optional<at::Tensor> &alibi_slopes_,
+        const int max_seqlen_q,
+        const int max_seqlen_k,
+        const float p_dropout,
+        const float softmax_scale,
+        const bool zero_tensors,
+        const bool is_causal,
+        int window_size_left,
+        int window_size_right,
+        const float softcap,
+        const bool deterministic,
+        std::optional<at::Generator> gen_,
+        std::optional<at::Tensor> &rng_state) {
+
+    auto device_idx = q.device().index();
+    compat::select_device(device_idx);
+
+    TORCH_CHECK(p_dropout < 1.0f, "FlashAttention dropout probability must be less than 1.0");
+
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention varlen backward only supports fp16 and bf16 data type");
+    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
+    TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
+
+    CHECK_DEVICE(q);
+    CHECK_DEVICE(k);
+    CHECK_DEVICE(v);
+    CHECK_DEVICE(out);
+    CHECK_DEVICE(dout);
+    CHECK_DEVICE(softmax_lse);
+    CHECK_DEVICE(cu_seqlens_q);
+    CHECK_DEVICE(cu_seqlens_k);
+
+    TORCH_CHECK(q.dim() == 3, "q must have shape (total_q, num_heads, head_size)");
+    TORCH_CHECK(k.dim() == 3, "k must have shape (total_k, num_heads_k, head_size)");
+    TORCH_CHECK(v.dim() == 3, "v must have shape (total_k, num_heads_k, head_size)");
+    TORCH_CHECK(out.sizes() == q.sizes(), "out must have the same shape as q");
+    TORCH_CHECK(dout.sizes() == q.sizes(), "dout must have the same shape as q");
+    TORCH_CHECK(k.sizes() == v.sizes(), "k and v must have the same shape");
+    TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_k.dim() == 1,
+                "cu_seqlens_q and cu_seqlens_k must be 1D tensors");
+    TORCH_CHECK(cu_seqlens_q.scalar_type() == at::ScalarType::Int &&
+                cu_seqlens_k.scalar_type() == at::ScalarType::Int,
+                "cu_seqlens_q and cu_seqlens_k must be int32 tensors");
+    TORCH_CHECK(cu_seqlens_q.numel() == cu_seqlens_k.numel(),
+                "cu_seqlens_q and cu_seqlens_k must have the same length");
+    TORCH_CHECK(max_seqlen_q > 0 && max_seqlen_k > 0,
+                "max_seqlen_q and max_seqlen_k must be positive");
+
+    at::Tensor q_contig = ensure_contiguous(q);
+    at::Tensor k_contig = ensure_contiguous(k);
+    at::Tensor v_contig = ensure_contiguous(v);
+    at::Tensor out_contig = ensure_contiguous(out);
+    at::Tensor dout_contig = ensure_contiguous(dout);
+    at::Tensor softmax_lse_contig = ensure_contiguous(softmax_lse);
+    at::Tensor cu_q_contig = ensure_contiguous(cu_seqlens_q);
+    at::Tensor cu_k_contig = ensure_contiguous(cu_seqlens_k);
+
+    TORCH_CHECK(q_contig.stride(-1) == 1, "q must have contiguous last dimension");
+    TORCH_CHECK(k_contig.stride(-1) == 1, "k must have contiguous last dimension");
+    TORCH_CHECK(v_contig.stride(-1) == 1, "v must have contiguous last dimension");
+    TORCH_CHECK(out_contig.stride(-1) == 1, "out must have contiguous last dimension");
+    TORCH_CHECK(dout_contig.stride(-1) == 1, "dout must have contiguous last dimension");
+
+    const int total_q = q_contig.size(0);
+    const int total_k = k_contig.size(0);
+    const int num_heads = q_contig.size(1);
+    const int head_size_og = q_contig.size(2);
+    const int num_heads_k = k_contig.size(1);
+    const int batch_size = cu_q_contig.numel() - 1;
+
+    TORCH_CHECK(batch_size > 0, "batch size must be positive");
+    TORCH_CHECK(head_size_og % 8 == 0, "head_size should be a multiple of 8");
+    TORCH_CHECK(head_size_og <= 256 || head_size_og == 512,
+                "FlashAttention XPU varlen backward only supports head dimension up to 256 or exactly 512. Got: " + std::to_string(head_size_og));
+    TORCH_CHECK(k_contig.size(2) == head_size_og && v_contig.size(2) == head_size_og,
+                "k and v head dimensions must match q");
+    TORCH_CHECK(num_heads % num_heads_k == 0,
+                "Number of heads in key/value must divide number of heads in query");
+    TORCH_CHECK(softmax_lse_contig.dim() == 3 && softmax_lse_contig.size(0) == batch_size &&
+                softmax_lse_contig.size(1) == num_heads && softmax_lse_contig.size(2) == max_seqlen_q,
+                "softmax_lse must have shape (batch_size, num_heads, max_seqlen_q)");
+    const int head_size_padded = round_multiple(head_size_og, 32);
+    const bool needs_padding = (head_size_og != head_size_padded);
+    const int pad_size = head_size_padded - head_size_og;
+
+    auto maybe_pad = [&](const at::Tensor &t) -> at::Tensor {
+        return needs_padding
+            ? torch::nn::functional::pad(t, torch::nn::functional::PadFuncOptions({0, pad_size}))
+            : t;
+    };
+
+    at::Tensor q_padded = maybe_pad(q_contig);
+    at::Tensor k_padded = maybe_pad(k_contig);
+    at::Tensor v_padded = maybe_pad(v_contig);
+    at::Tensor out_padded = maybe_pad(out_contig);
+    at::Tensor dout_padded = maybe_pad(dout_contig);
+
+    auto opts = q_contig.options();
+    at::Tensor dq, dk, dv;
+    at::Tensor dq_work, dk_work, dv_work;
+    bool dq_needs_copy = false, dk_needs_copy = false, dv_needs_copy = false;
+
+    auto get_or_alloc = [&](const c10::optional<at::Tensor> &opt,
+                            const std::vector<int64_t> &sizes,
+                            bool &needs_copy) -> at::Tensor {
+        if (opt.has_value() && opt.value().is_contiguous()) {
+            return opt.value();
+        }
+        needs_copy = opt.has_value();
+        return torch::empty(sizes, opts);
+    };
+
+    if (!needs_padding && num_heads_k == num_heads) {
+        dq_work = get_or_alloc(dq_, {total_q, num_heads, head_size_og}, dq_needs_copy);
+        dk_work = get_or_alloc(dk_, {total_k, num_heads_k, head_size_og}, dk_needs_copy);
+        dv_work = get_or_alloc(dv_, {total_k, num_heads_k, head_size_og}, dv_needs_copy);
+    } else {
+        dq_work = torch::empty({total_q, num_heads, head_size_padded}, opts);
+        dk_work = torch::empty({total_k, num_heads_k, head_size_padded}, opts);
+        dv_work = torch::empty({total_k, num_heads_k, head_size_padded}, opts);
+    }
+
+    at::Tensor softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+
+    at::Tensor dk_expanded, dv_expanded;
+    if (num_heads_k != num_heads) {
+        dk_expanded = torch::empty({total_k, num_heads, head_size_padded}, opts);
+        dv_expanded = torch::empty({total_k, num_heads, head_size_padded}, opts);
+    } else {
+        dk_expanded = dk_work;
+        dv_expanded = dv_work;
+    }
+
+    const bool is_local = (window_size_left != -1) || (window_size_right != -1);
+    auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
+
+    uint64_t philox_seed = 0;
+    uint64_t philox_offset = 0;
+    if (p_dropout > 0.0f && rng_state.has_value()) {
+        auto rng_state_val = rng_state.value();
+        philox_seed = static_cast<uint64_t>(rng_state_val[0].item<int64_t>());
+        philox_offset = static_cast<uint64_t>(rng_state_val[1].item<int64_t>());
+    }
+
+    cutlass_fmha_bwd_varlen_impl(
+        queue,
+        dout_padded, q_padded, k_padded, v_padded, out_padded, softmax_lse_contig,
+        cu_q_contig, cu_k_contig,
+        dq_work, dk_expanded, dv_expanded, softmax_d,
+        softmax_scale,
+        max_seqlen_q, max_seqlen_k,
+        window_size_left, window_size_right, is_causal, is_local,
+        p_dropout, philox_seed, philox_offset, deterministic);
+
+    if (num_heads_k != num_heads) {
+        at::sum_out(dk_work, at::reshape(dk_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size_padded}), {2});
+        at::sum_out(dv_work, at::reshape(dv_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size_padded}), {2});
+    }
+
+    auto slice_head = [&](const at::Tensor &t) -> at::Tensor {
+        return t.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                        torch::indexing::Slice(0, head_size_og)}).contiguous();
+    };
+    auto copy_if_provided = [&](const c10::optional<at::Tensor> &opt, const at::Tensor &src) {
+        if (opt.has_value()) {
+            opt.value().copy_(src);
+        }
+    };
+
+    if (needs_padding || num_heads_k != num_heads) {
+        dq = slice_head(dq_work);
+        dk = slice_head(dk_work);
+        dv = slice_head(dv_work);
+        copy_if_provided(dq_, dq);
+        copy_if_provided(dk_, dk);
+        copy_if_provided(dv_, dv);
+    } else {
+        dq = dq_work;
+        dk = dk_work;
+        dv = dv_work;
+        if (dq_needs_copy) dq_.value().copy_(dq);
+        if (dk_needs_copy) dk_.value().copy_(dk);
+        if (dv_needs_copy) dv_.value().copy_(dv);
+    }
+
+    return {dq, dk, dv, softmax_d};
+}
+
+std::vector<at::Tensor>
+mha_fwd_kvcache(
+        at::Tensor &q,
+        const at::Tensor &kcache,
+        const at::Tensor &vcache,
+        std::optional<const at::Tensor> &k_,
+        std::optional<const at::Tensor> &v_,
+        std::optional<const at::Tensor> &seqlens_k_,
+        std::optional<const at::Tensor> &rotary_cos_,
+        std::optional<const at::Tensor> &rotary_sin_,
+        std::optional<const at::Tensor> &cache_batch_idx_,
+        std::optional<const at::Tensor> &leftpad_k_,
+        std::optional<at::Tensor> &block_table_,
+        std::optional<at::Tensor> &alibi_slopes_,
+        std::optional<at::Tensor> &out_,
+        const float softmax_scale,
+        bool is_causal,
+        int window_size_left,
+        int window_size_right,
+        const float softcap,
+        bool is_rotary_interleaved,
+        int num_splits) {
+    auto device_idx = q.device().index();
+    compat::select_device(device_idx);
+
+    TORCH_CHECK(!alibi_slopes_.has_value(),
+                "FlashAttention KVCache on XPU does not support alibi_slopes.");
+
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention KVCache only supports fp16 and bf16 data type");
+    TORCH_CHECK(kcache.dtype() == q_dtype, "query and key cache must have the same dtype");
+    TORCH_CHECK(vcache.dtype() == q_dtype, "query and value cache must have the same dtype");
+
+    CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
+    TORCH_CHECK(q.stride(-1) == 1, "Query must have contiguous last dimension");
+    TORCH_CHECK(kcache.stride(-1) == 1, "Key cache must have contiguous last dimension");
+    TORCH_CHECK(vcache.stride(-1) == 1, "Value cache must have contiguous last dimension");
+
+    const bool paged_KV = block_table_.has_value();
+    at::Tensor block_table;
+    if (paged_KV) {
+        TORCH_CHECK(!cache_batch_idx_.has_value(), "Paged KVcache does not support cache_batch_idx");
+        block_table = block_table_.value();
+        CHECK_DEVICE(block_table);
+        TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
+    }
+
+    const auto sizes = q.sizes();
+    const int batch_size = sizes[0];
+    int seqlen_q = sizes[1];
+    int num_heads = sizes[2];
+    const int head_size_og = sizes[3];
+
+    const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
+    const int page_block_size = !paged_KV ? 1 : kcache.size(1);
+    const int seqlen_k = !paged_KV ? kcache.size(1) : max_num_blocks_per_seq * page_block_size;
+    const int num_heads_k = kcache.size(2);
+
+    TORCH_CHECK(batch_size > 0, "batch size must be positive");
+    TORCH_CHECK(head_size_og <= 256 || head_size_og == 512,
+                "FlashAttention KVCache only supports head dimension up to 256 or exactly 512");
+    TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }
+    if (is_causal) { window_size_right = 0; }
+    if (window_size_left >= seqlen_k) { window_size_left = -1; }
+    if (window_size_right >= seqlen_k) { window_size_right = -1; }
+
+    const int head_size_padded = round_multiple(head_size_og, 32);
+    const bool needs_padding = (head_size_og != head_size_padded);
+    const int pad_size = head_size_padded - head_size_og;
+
+    auto maybe_pad = [&](const at::Tensor& t) -> at::Tensor {
+        return needs_padding
+            ? torch::nn::functional::pad(t, torch::nn::functional::PadFuncOptions({0, pad_size}))
+            : t;
+    };
+
+    at::Tensor q_padded = maybe_pad(ensure_contiguous(q));
+    at::Tensor kcache_padded = maybe_pad(ensure_contiguous(kcache));
+    at::Tensor vcache_padded = maybe_pad(ensure_contiguous(vcache));
+
+    at::Tensor out;
+    if (out_.has_value()) {
+        out = out_.value();
+        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        CHECK_DEVICE(out);
+        if (needs_padding) { out = maybe_pad(out); }
+    } else {
+        out = torch::zeros_like(q_padded);
+    }
+
+    auto opts = q.options();
+    auto softmax_lse = torch::full({batch_size, num_heads, seqlen_q},
+                                    -std::numeric_limits<float>::infinity(),
+                                    opts.dtype(at::kFloat));
+
+    // Handle new K/V
+    at::Tensor k_padded, v_padded;
+    int seqlen_new = 0;
+    if (k_.has_value()) {
+        TORCH_CHECK(v_.has_value(), "If key is supplied, value must also be passed in");
+        TORCH_CHECK(seqlens_k_.has_value(), "If key is supplied, seqlens_k must also be passed in");
+        auto k = k_.value();
+        auto v = v_.value();
+        TORCH_CHECK(k.dtype() == q_dtype && v.dtype() == q_dtype);
+        CHECK_DEVICE(k); CHECK_DEVICE(v);
+        TORCH_CHECK(k.stride(-1) == 1 && v.stride(-1) == 1);
+        seqlen_new = k.size(1);
+        k_padded = maybe_pad(ensure_contiguous(k));
+        v_padded = maybe_pad(ensure_contiguous(v));
+    }
+
+    at::Tensor seqlens_k;
+    if (seqlens_k_.has_value()) {
+        seqlens_k = seqlens_k_.value();
+        TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqlens_k must have dtype int32");
+        CHECK_DEVICE(seqlens_k);
+    }
+
+    at::Tensor rotary_cos, rotary_sin;
+    int rotary_dim = 0;
+    const bool has_rotary = rotary_cos_.has_value();
+    if (has_rotary) {
+        TORCH_CHECK(k_.has_value(), "If rotary cos/sin are provided, new key/value must also be provided");
+        TORCH_CHECK(rotary_sin_.has_value(), "If rotary cos is provided, rotary sin must also be provided");
+        rotary_cos = ensure_contiguous(rotary_cos_.value());
+        rotary_sin = ensure_contiguous(rotary_sin_.value());
+        CHECK_DEVICE(rotary_cos); CHECK_DEVICE(rotary_sin);
+        rotary_dim = rotary_cos.size(1) * 2;
+        TORCH_CHECK(rotary_dim <= head_size_og, "rotary_dim must be <= headdim");
+        TORCH_CHECK(rotary_dim % 16 == 0, "Only rotary dimensions divisible by 16 are currently supported");
+        TORCH_CHECK(rotary_cos.scalar_type() == q_dtype && rotary_sin.scalar_type() == q_dtype);
+    }
+
+    at::Tensor cache_batch_idx;
+    if (cache_batch_idx_.has_value()) {
+        cache_batch_idx = cache_batch_idx_.value();
+        CHECK_DEVICE(cache_batch_idx);
+        TORCH_CHECK(cache_batch_idx.scalar_type() == torch::kInt32);
+    }
+
+    at::Tensor leftpad_k;
+    if (leftpad_k_.has_value()) {
+        TORCH_CHECK(!paged_KV, "Paged KV and leftpad_k are not supported together");
+        leftpad_k = leftpad_k_.value();
+        CHECK_DEVICE(leftpad_k);
+        TORCH_CHECK(leftpad_k.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
+    }
+
+    bool fuse_knew = k_.has_value() && seqlen_new > 0;
+
+    // Dispatch to kernel.  Paged caches are now passed natively (block_table
+    // routed straight through to the kernel, no host gather).
+    auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
+    const bool is_local = (window_size_left >= 0);
+
+    std::optional<at::Tensor> cache_batch_idx_opt;
+    if (cache_batch_idx_.has_value()) {
+        cache_batch_idx_opt = cache_batch_idx;
+    }
+
+    std::optional<at::Tensor> leftpad_k_opt;
+    if (leftpad_k_.has_value()) {
+        leftpad_k_opt = leftpad_k;
+    }
+
+    // For paths where new KV is appended in-kernel, pass knew/vnew through.
+    std::optional<at::Tensor> knew_opt, vnew_opt;
+    if (fuse_knew) {
+        knew_opt = k_padded;
+        vnew_opt = v_padded;
+    }
+
+    std::optional<at::Tensor> block_table_opt;
+    if (paged_KV) {
+        block_table_opt = block_table;
+    }
+
+    std::optional<at::Tensor> rotary_cos_opt, rotary_sin_opt;
+    if (fuse_knew && has_rotary) {
+        rotary_cos_opt = rotary_cos;
+        rotary_sin_opt = rotary_sin;
+    }
+
+    cutlass_fmha_fwd_kvcache_impl(
+        queue,
+        q_padded, kcache_padded, vcache_padded,
+        out, softmax_lse,
+        seqlens_k, cache_batch_idx_opt, leftpad_k_opt,
+        knew_opt, vnew_opt,
+        block_table_opt, rotary_cos_opt, rotary_sin_opt,
+        fuse_knew ? rotary_dim : 0, is_rotary_interleaved, seqlen_k,
+        softmax_scale, window_size_left, window_size_right,
+        is_causal, is_local);
+
+    // Update seqlens_k after kernel completes (for fused scatter path)
+    if (fuse_knew) {
+        seqlens_k = seqlens_k + seqlen_new;
+    }
+
+    if (needs_padding) {
+        out = out.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                         torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)})
+                 .contiguous();
+        if (out_.has_value()) { out_.value().copy_(out); }
+        if (fuse_knew) {
+            // The fused kernel updates the padded cache buffer; publish valid dims back to the user cache.
+            kcache.copy_(kcache_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                                              torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)}));
+            vcache.copy_(vcache_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                                              torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)}));
+        }
+    }
+
+    return {out, softmax_lse};
+}
+
 }  // namespace FLASH_NAMESPACE
 
 // std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -527,8 +982,41 @@ mha_varlen_bwd(
         const bool deterministic,
         c10::optional<at::Generator> gen_,
         const c10::optional<torch::Tensor> &rng_state) {
-    TORCH_CHECK(false, "FlashAttention varlen backward is not supported on XPU yet.");
-    return {};
+    auto to_std_opt = [](const c10::optional<at::Tensor>& opt) -> std::optional<at::Tensor> {
+        return opt.has_value() ? std::optional<at::Tensor>(opt.value()) : std::nullopt;
+    };
+
+    auto dq_opt = to_std_opt(dq_);
+    auto dk_opt = to_std_opt(dk_);
+    auto dv_opt = to_std_opt(dv_);
+    auto alibi_opt = to_std_opt(alibi_slopes_);
+    auto rng_opt = to_std_opt(rng_state);
+
+    return FLASH_NAMESPACE::mha_varlen_bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq_opt,
+        dk_opt,
+        dv_opt,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        alibi_opt,
+        static_cast<int>(max_seqlen_q),
+        static_cast<int>(max_seqlen_k),
+        static_cast<float>(p_dropout),
+        static_cast<float>(softmax_scale),
+        zero_tensors,
+        is_causal,
+        static_cast<int>(window_size_left),
+        static_cast<int>(window_size_right),
+        static_cast<float>(softcap),
+        deterministic,
+        gen_,
+        rng_opt);
 }
 
 std::vector<torch::Tensor>
@@ -632,5 +1120,63 @@ mha_bwd(const torch::Tensor &dout,
         deterministic,
         gen_,
         rng_opt
+    );
+}
+
+std::vector<torch::Tensor>
+mha_fwd_kvcache(
+        const torch::Tensor &q,
+        const torch::Tensor &kcache,
+        const torch::Tensor &vcache,
+        const c10::optional<torch::Tensor> &k_,
+        const c10::optional<torch::Tensor> &v_,
+        const c10::optional<torch::Tensor> &seqlens_k_,
+        const c10::optional<torch::Tensor> &rotary_cos_,
+        const c10::optional<torch::Tensor> &rotary_sin_,
+        const c10::optional<torch::Tensor> &cache_batch_idx_,
+        const c10::optional<torch::Tensor> &leftpad_k_,
+        const c10::optional<torch::Tensor> &block_table_,
+        const c10::optional<torch::Tensor> &alibi_slopes_,
+        const c10::optional<torch::Tensor> &out_,
+        const double softmax_scale,
+        bool is_causal,
+        const int64_t window_size_left,
+        const int64_t window_size_right,
+        const double softcap,
+        bool is_rotary_interleaved,
+        const int64_t num_splits) {
+    // Convert c10::optional -> std::optional for the internal API
+    auto to_std_opt = [](const c10::optional<torch::Tensor>& opt) -> std::optional<at::Tensor> {
+        return opt.has_value() ? std::optional<at::Tensor>(opt.value()) : std::nullopt;
+    };
+    auto to_std_opt_const = [](const c10::optional<torch::Tensor>& opt) -> std::optional<const at::Tensor> {
+        return opt.has_value() ? std::optional<const at::Tensor>(opt.value()) : std::nullopt;
+    };
+
+    at::Tensor q_mut = q;
+    auto k_opt = to_std_opt_const(k_);
+    auto v_opt = to_std_opt_const(v_);
+    auto seqlens_opt = to_std_opt_const(seqlens_k_);
+    auto rotary_cos_opt = to_std_opt_const(rotary_cos_);
+    auto rotary_sin_opt = to_std_opt_const(rotary_sin_);
+    auto cache_batch_idx_opt = to_std_opt_const(cache_batch_idx_);
+    auto leftpad_k_opt = to_std_opt_const(leftpad_k_);
+    auto block_table_opt = to_std_opt(block_table_);
+    auto alibi_opt = to_std_opt(alibi_slopes_);
+    auto out_opt = to_std_opt(out_);
+
+    return FLASH_NAMESPACE::mha_fwd_kvcache(
+        q_mut, kcache, vcache,
+        k_opt, v_opt, seqlens_opt,
+        rotary_cos_opt, rotary_sin_opt,
+        cache_batch_idx_opt, leftpad_k_opt,
+        block_table_opt, alibi_opt, out_opt,
+        static_cast<float>(softmax_scale),
+        is_causal,
+        static_cast<int>(window_size_left),
+        static_cast<int>(window_size_right),
+        static_cast<float>(softcap),
+        is_rotary_interleaved,
+        static_cast<int>(num_splits)
     );
 }

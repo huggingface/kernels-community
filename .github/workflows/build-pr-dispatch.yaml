@@ -1,0 +1,48 @@
+name: Build PR (Dispatch)
+on:
+  pull_request:
+    paths-ignore:
+      - "**/README.md"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+  statuses: write
+
+jobs:
+  # Resolve the kernel from the PR title and fan out to per-platform build workflows.
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Extract kernel name from PR title (format: "kernel-name: description")
+      # and verify the directory has the required flake.nix + build.toml files.
+      - name: Validate kernel directory
+        id: validate
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if KERNEL=$(python3 .github/workflows/validate-kernel-pr.py "pr"); then
+            echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            echo "skip=true" >> $GITHUB_OUTPUT
+          fi
+
+      # Fan out to per-platform build workflows (linux, mac, windows) based
+      # on the backends declared in the kernel's build.toml.
+      - name: Dispatch build workflows
+        if: steps.validate.outputs.skip == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          python3 .github/scripts/dispatch.py "$KERNEL" \
+            --mode pr \
+            --pr-number "${{ github.event.pull_request.number }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --no-upload
