@@ -32,6 +32,7 @@ cuda-flags = [
   "-Wno-deprecated-declarations",
 ]
 src = [
+  # Compiled source
   "csrc/impl.cu",
   "csrc/apis/attention.hpp",
   "csrc/apis/einsum.hpp",
