@@ -34,6 +34,7 @@ cuda-flags = [
 src = [
   # Compiled source
   "csrc/impl.cu",
+ # API headers
   "csrc/apis/attention.hpp",
   "csrc/apis/einsum.hpp",
   "csrc/apis/gemm.hpp",
