@@ -51,6 +51,7 @@ KERNEL_SOURCE_MAPPING = {
     "sage-attention": "https://github.com/thu-ml/SageAttention",
     "deep-gemm": "https://github.com/deepseek-ai/DeepGEMM",
     "bitsandbytes-mps": "",
+    "aiter-flash-attn": "https://github.com/ROCm/aiter",
 
 }
 
