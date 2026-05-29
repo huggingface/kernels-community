@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (C) 2025 Intel Corporation, All rights reserved.
+ * Copyright (C) 2025 - 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -44,10 +44,13 @@ copy_block_r2s(Tensor<SrcEngine, SrcLayout> const& src,
   static_assert(is_rmem_v<SrcEngine> && is_smem_v<DstEngine>, "Expected rmem->smem copy");
 
   auto atom_r2s = Copy_Atom<XE_1D_STSM<float>, float>{};    // TODO: larger block messages
+  using _SG = intel::_SGSize;
+  int lane_id = int(ThreadIdxX()) % _SG{};
 
   auto atom_shape = make_shape(_1{}, size(src));
   auto src_v = src.compose(make_layout(atom_shape));
-  auto dst_v = dst.compose(make_layout(atom_shape, Stride<_0, _16>{}));
+  auto dst_composed = dst.compose(make_layout(atom_shape, Stride<_1, _SG>{}));
+  auto dst_v = make_tensor(dst_composed.data() + lane_id, dst_composed.layout());
 
   copy(atom_r2s, src_v, dst_v);
 }
@@ -62,9 +65,12 @@ copy_block_s2r(Tensor<SrcEngine, SrcLayout> const& src,
   static_assert(is_smem_v<SrcEngine> && is_rmem_v<DstEngine>, "Expected smem->rmem copy");
 
   auto atom_s2r = Copy_Atom<XE_1D_LDSM<float>, float>{};
+  using _SG = intel::_SGSize;
+  int lane_id = int(ThreadIdxX()) % _SG{};
 
   auto atom_shape = make_shape(_1{}, size(dst));
-  auto src_v = src.compose(make_layout(atom_shape, Stride<_0, _16>{}));
+  auto src_composed = src.compose(make_layout(atom_shape, Stride<_1, _SG>{}));
+  auto src_v = make_tensor(src_composed.data() + lane_id, src_composed.layout());
   auto dst_v = dst.compose(make_layout(atom_shape));
 
   copy(atom_s2r, src_v, dst_v);
@@ -85,14 +91,16 @@ copy_block_r2s(SubgroupTensor<SrcEngine, SrcLayout, SrcCoordLayout> const& src,
   static_assert(sizeof_bits_v<typename SrcEngine::value_type> == 32, "Only 32-bit data supported");
 
   auto atom_r2s = Copy_Atom<XE_1D_STSM<float>, float>{};    // TODO: larger block messages
+  int lane_id = int(ThreadIdxX()) % _SG{};
 
   auto atom_shape = make_shape(_1{}, size(SrcLayout{}));
 
-  auto src_c_wi0 = composition(project_strides(SrcCoordLayout{}), make_layout(atom_shape, Stride<_0, _SG>{}));
+  auto src_c_wi0 = composition(project_strides(SrcCoordLayout{}), make_layout(atom_shape, Stride<_1, _SG>{}));
   auto rlayout = composition(right_inverse(project_strides(dst_c)), src_c_wi0);
 
   auto src_v = src.compose(make_layout(atom_shape));
-  auto dst_v = dst.compose(rlayout);
+  auto dst_composed = dst.compose(rlayout);
+  auto dst_v = make_tensor(dst_composed.data() + lane_id, dst_composed.layout());
 
   copy(atom_r2s, src_v, dst_v);
 }
@@ -111,13 +119,15 @@ copy_block_s2r(Tensor<SrcEngine, SrcLayout>                         const& src,
   static_assert(sizeof_bits_v<typename SrcEngine::value_type> == 32, "Only 32-bit data supported");
 
   auto atom_s2r = Copy_Atom<XE_1D_LDSM<float>, float>{};
+  int lane_id = int(ThreadIdxX()) % _SG{};
 
   auto atom_shape = make_shape(_1{}, size(DstLayout{}));
 
-  auto dst_c_wi0 = composition(project_strides(DstCoordLayout{}), make_layout(atom_shape, Stride<_0, _SG>{}));
+  auto dst_c_wi0 = composition(project_strides(DstCoordLayout{}), make_layout(atom_shape, Stride<_1, _SG>{}));
   auto rlayout = composition(right_inverse(project_strides(src_c)), dst_c_wi0);
 
-  auto src_v = src.compose(rlayout);
+  auto src_composed = src.compose(rlayout);
+  auto src_v = make_tensor(src_composed.data() + lane_id, src_composed.layout());
   auto dst_v = dst.compose(make_layout(atom_shape));
 
   copy(atom_s2r, src_v, dst_v);
@@ -163,7 +173,7 @@ copy_block_s2r(Tensor<SrcEngine, SrcLayout>                         const& src,
                SrcCoordLayout                                       const& src_c,
                SubgroupTensor<DstEngine, DstLayout, DstCoordLayout>     && dst)
 {
-  return copy_block_s2r(src, dst);
+  return copy_block_s2r(src, src_c, dst);
 }
 
 } /* namespace cute */

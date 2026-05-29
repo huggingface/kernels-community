@@ -12,7 +12,25 @@ jobs:
     name: Check PR author
     runs-on: ubuntu-latest
     steps:
-      - uses: mitchellh/vouch/action/check-pr@v1
+      - name: Check if reopened by a maintainer
+        id: maintainer
+        if: github.event.action == 'reopened'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+        run: |
+          PERMISSION=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq '.permission' 2>/dev/null || echo "none")
+          echo "Actor $ACTOR has permission: $PERMISSION"
+          if [[ "$PERMISSION" == "admin" || "$PERMISSION" == "maintain" || "$PERMISSION" == "write" ]]; then
+            echo "is_maintainer=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_maintainer=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Vouch check
+        if: github.event.action == 'opened' || steps.maintainer.outputs.is_maintainer != 'true'
+        uses: mitchellh/vouch/action/check-pr@c6d80ead49839655b61b422700b7a3bc9d0804a9 # v1.4.2
         with:
           pr-number: ${{ github.event.pull_request.number }}
           auto-close: true

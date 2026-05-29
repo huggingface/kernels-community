@@ -1,0 +1,218 @@
+name: Build (macOS)
+run-name: >-
+  Build (macOS) / ${{ inputs.kernel_name || '' }} / mode=${{ inputs.mode || 'release' }} / request=${{ inputs.dispatch_key || '' }}
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_name:
+        description: "Kernel directory name to build"
+        required: true
+        type: string
+      dispatch_key:
+        description: "Unique key for matching this run back to a bot dispatch"
+        required: false
+        type: string
+      mode:
+        description: "Build mode: pr (CI only) or release (build + upload)"
+        required: false
+        type: string
+        default: "release"
+      skip_build:
+        description: "Skip build and upload steps (for testing workflow plumbing)"
+        required: false
+        type: boolean
+        default: false
+      pr_number:
+        description: "Optional PR number to checkout before building"
+        required: false
+        type: string
+        default: ""
+      target_branch:
+        description: "Target branch for upload (default: repo default)"
+        required: false
+        type: string
+        default: ""
+      upload:
+        description: "Whether to upload after build"
+        required: false
+        type: boolean
+        default: true
+      repo_prefix:
+        description: "Hub org prefix for uploads (e.g. kernels-community, kernels-staging)"
+        required: false
+        type: string
+        default: "kernels-community"
+      backends:
+        description: "Comma-separated list of backends to build (e.g. metal)"
+        required: false
+        type: string
+        default: ""
+      head_sha:
+        description: "PR head SHA for posting commit statuses (empty = no status)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # Build the Metal kernel; PR mode builds .#ci, release builds the full bundle and uploads.
+  build-kernel:
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+    steps:
+      # Post a running commit status so the PR shows the build is in progress.
+      - name: Set running status
+        if: inputs.head_sha != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state="pending" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="Build in progress" \
+            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
+
+      # Guard against injection via pr_number input.
+      - name: Validate PR number
+        if: inputs.pr_number != ''
+        run: |
+          case "${{ inputs.pr_number }}" in
+            ''|*[!0-9]*)
+              echo "Invalid pr_number input: must be numeric"
+              exit 1
+              ;;
+          esac
+
+      # When building for a PR, check out the PR head; otherwise use default branch.
+      - name: Checkout PR branch
+        if: inputs.pr_number != ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0
+      - name: Checkout default branch
+        if: inputs.pr_number == ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Nix toolchain + binary cache setup.
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = 1
+            cores = 3
+            sandbox = relaxed
+      - name: Nix info
+        run: nix-shell -p nix-info --run "nix-info -m"
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
+
+      # Ensure the kernel directory exists and has the required config files.
+      - name: Validate kernel directory
+        id: validate
+        run: |
+          KERNEL="${{ inputs.kernel_name }}"
+          if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$KERNEL/build.toml" ]; then
+            echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            echo "skip=true" >> $GITHUB_OUTPUT
+          fi
+
+      # PR-only: verify the kernel has a Hub repo-id before burning CI time.
+      - name: Check that repo-id is present
+        if: steps.validate.outputs.skip == 'false' && inputs.mode == 'pr'
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          if ! cat $KERNEL/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
+            echo "Mandatory repo-id is missing in $KERNEL/build.toml"
+            exit 1
+          fi
+
+      # Metal toolchain is required for macOS GPU kernel compilation.
+      - name: Install Metal toolchain
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      # PR mode builds the CI target (.#ci); release builds the full bundle.
+      - name: Build kernel
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          if [ "${{ inputs.mode }}" = "pr" ]; then
+            ( cd "$KERNEL" && nix build -L .#ci && ls -l result/ )
+          else
+            ( cd "$KERNEL" && nix build -L )
+          fi
+
+      # Upload built artifacts to both model and kernel Hub repos.
+      - name: Upload kernel to Hub
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          cd "$KERNEL"
+          BRANCH_FLAG=""
+          if [ -n "${{ inputs.target_branch }}" ]; then
+            BRANCH_FLAG="--branch ${{ inputs.target_branch }}"
+          fi
+          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "${{ inputs.repo_prefix }}/$KERNEL" $BRANCH_FLAG
+          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "${{ inputs.repo_prefix }}/$KERNEL" $BRANCH_FLAG
+
+      # v1 kernels without an explicit branch override also get uploaded to main.
+      - name: Upload v1 kernels to main
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false && inputs.target_branch == ''
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          cd "$KERNEL"
+
+          if [ -f "build.toml" ]; then
+            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
+            BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
+            if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
+              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "${{ inputs.repo_prefix }}/$KERNEL" --branch main
+              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "${{ inputs.repo_prefix }}/$KERNEL" --branch main
+            fi
+          fi
+
+  # Report the final build outcome as a commit status on the PR head SHA.
+  report-status:
+    if: always() && inputs.head_sha != ''
+    needs: [build-kernel]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set commit status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUILD="${{ needs.build-kernel.result }}"
+
+          if [ "$BUILD" = "success" ]; then
+            STATE="success"
+            DESC="Build passed"
+          elif [ "$BUILD" = "failure" ]; then
+            STATE="failure"
+            DESC="Build failed"
+          else
+            STATE="error"
+            DESC="Build did not complete (${BUILD})"
+          fi
+
+          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state="$STATE" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="$DESC" \
+            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"

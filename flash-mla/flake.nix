@@ -2,7 +2,7 @@
   description = "Flake for Flash MLA (Multi-head Latent Attention) kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels";
+    kernel-builder.url = "github:huggingface/kernels/torch-2.12";
   };
 
   outputs =

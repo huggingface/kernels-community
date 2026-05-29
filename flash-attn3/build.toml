@@ -6,14 +6,17 @@ backends = ["cuda"]
 
 [general.cuda]
 minver = "12.8"
+# ptxas fails on 13.2, but the 13.0 build is backwards compatible.
+maxver = "13.0"
 
 
 [general.hub]
 repo-id = "kernels-community/flash-attn3"
 
 [torch]
+stable-abi = "2.10"
 src = [
-    "flash-attn/flash_api.cpp",
+    "flash-attn/flash_api_stable.cpp",
 ]
 
 [kernel.flash_attn_sm80]

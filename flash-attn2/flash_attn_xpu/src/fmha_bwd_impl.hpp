@@ -185,10 +185,10 @@ softmax_backward(Tensor<Engine0, Layout0> &P,
         CUTLASS_PRAGMA_UNROLL
         for (int ni = 0; ni < size<1>(dP); ++ni) {
             int n = get<1>(rC_2d(0, ni)) + sg_local_id;
-            const float dpsum = dP_sum(n);
+            const float neg_dpsum_scaled = -(dP_sum(n) * scale);
             CUTLASS_PRAGMA_UNROLL
             for (int mi = 0; mi < size<0>(dP); ++mi) {
-                dP(mi, ni) = P(mi, ni) * (dP(mi, ni) - dpsum) * scale;
+                dP(mi, ni) = P(mi, ni) * fmaf(dP(mi, ni), scale, neg_dpsum_scaled);
             }
         }
     } else {
@@ -197,10 +197,10 @@ softmax_backward(Tensor<Engine0, Layout0> &P,
             int n = get<1>(rC_2d(0, ni)) + sg_local_id;
             // For tail case: skip out-of-bounds rows
             if (n < tail_m) {
-                const float dpsum = dP_sum(n);
+                const float neg_dpsum_scaled = -(dP_sum(n) * scale);
                 CUTLASS_PRAGMA_UNROLL
                 for (int mi = 0; mi < size<0>(dP); ++mi) {
-                    dP(mi, ni) = P(mi, ni) * (dP(mi, ni) - dpsum) * scale;
+                    dP(mi, ni) = P(mi, ni) * fmaf(dP(mi, ni), scale, neg_dpsum_scaled);
                 }
             }
         }
@@ -310,8 +310,9 @@ gemm_kernel(Trait &trait,
     if constexpr(clear_acc)
         clear(acc);
 
+    int prefetch_warmup = prefetch_dist < k_tile_count ? prefetch_dist : k_tile_count;
     CUTE_UNROLL
-    for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+    for (; k_tile_prefetch < prefetch_warmup; k_tile_prefetch++) {
         prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
         prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
     }
@@ -322,8 +323,10 @@ gemm_kernel(Trait &trait,
         copy(copy_a, tAgA(_,_,_,k_tile), tArA);
         copy(copy_b, tBgB(_,_,_,k_tile), tBrB);
 
-        prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
-        prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
+        if (k_tile_prefetch < k_tile_count) {
+            prefetch(prefetch_a, pAgA(_,_,_,k_tile_prefetch));
+            prefetch(prefetch_b, pBgB(_,_,_,k_tile_prefetch));
+        }
 
         reorder(tArA, tCrA);
         reorder(tBrB, tCrB);
@@ -388,10 +391,13 @@ gemm_dQ(Trait &trait,
     Tensor tCgC = thr_mma.partition_C(gC);
     gemm_kernel<true>(trait, A, B, tCrC, mma, m_block, n_block);
     int local_id = sg.get_local_id();
+    constexpr int kHeadDim = Trait::kHeadDim;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(tCgC); ++i) {
         auto [m, n] = tCgC(i);
-        cutlass::atomicAdd(&C(m, n + local_id), tCrC(i));
+        if (n + local_id < kHeadDim) {
+            cutlass::atomicAdd(&C(m, n + local_id), tCrC(i));
+        }
     }
 }
 
@@ -433,10 +439,28 @@ constexpr int round_up(int x, int m) {
     return (x + m - 1) / m * m;
 }
 
+template<class T, int kBlockM, int kBlockN, bool VarLen>
+CUTLASS_DEVICE BwdParam<T, VarLen>
+resolve_varlen_batch(BwdParam<T, VarLen> param, const int bidb) {
+    if constexpr (VarLen) {
+        const int q_start = param.cu_seqlens_q[bidb];
+        const int q_end = param.cu_seqlens_q[bidb + 1];
+        const int k_start = param.cu_seqlens_k[bidb];
+        const int k_end = param.cu_seqlens_k[bidb + 1];
+        param.seq_len_q = q_end - q_start;
+        param.seq_len_kv = k_end - k_start;
+        param.m_block = ceil_div(param.seq_len_q, kBlockM);
+        param.n_block = ceil_div(param.seq_len_kv, kBlockN);
+        param.tail_m = param.seq_len_q % kBlockM;
+        param.tail_n = param.seq_len_kv % kBlockN;
+    }
+    return param;
+}
+
 // Main 1-col-block backward computation
 template<bool Is_even_N, bool Seq_parallel, class Trait>
 void
-dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
+dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType, Trait::is_varlen> &param,
                    const int bidb, const int bidh, const int bidhkv, const int n_block,
                    const int tail_n = 0) {
     using T = typename Trait::DType;
@@ -448,12 +472,13 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
     constexpr int SubgroupSize = Trait::SubgroupSize;
     constexpr bool is_causal = Trait::is_causal;
     constexpr bool is_local = Trait::is_local;
+    constexpr bool has_dropout = Trait::has_dropout;
     
     auto sg = compat::get_nd_item<1>().get_sub_group();
     auto group = compat::get_nd_item<1>().get_group();
     const int local_id = sg.get_local_id();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
-    auto bofst = BwdOffset(param);
+    auto bofst = BwdOffset<typename Trait::DType, Trait::is_varlen>(param);
 
     const index_t q_offset = bofst.q_offset(bidb, bidh, 0);
     const index_t k_offset = bofst.k_offset(bidb, bidhkv, n_block * kBlockN);
@@ -461,7 +486,7 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
     const index_t dk_offset = bofst.dk_offset(bidb, bidh, n_block * kBlockN);
     const index_t dv_offset = bofst.dv_offset(bidb, bidh, n_block * kBlockN);
     const index_t o_offset = bofst.o_offset(bidb, bidh, 0);
-    const index_t dq_offset = bofst.dq_offset(bidb, bidh, 0);
+    const index_t dqaccum_offset = bofst.dqaccum_offset(bidb, bidh, 0);
     const index_t lse_offset = bofst.lse_offset(bidb, bidh, 0);
     
     // Buffer offset for intermediate P and dS
@@ -524,8 +549,8 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
                              make_layout(shapeKtVt, make_stride(param.dv_r_stride, _1{})));
     Tensor mdP = make_tensor(make_gmem_ptr(param.pb_ptr + dsb_offset),
                              make_layout(shapeSP, make_stride(_1{}, Int<kBlockM>{})));
-    Tensor mdQaccum = make_tensor(make_gmem_ptr(param.dqaccum_ptr + dq_offset),
-                                  make_layout(shapedQ, make_stride(param.dq_r_stride, _1{})));
+    Tensor mdQaccum = make_tensor(make_gmem_ptr(param.dqaccum_ptr + dqaccum_offset),
+                                  make_layout(shapedQ, make_stride(param.dqaccum_r_stride, _1{})));
     Tensor mdK = make_tensor(make_gmem_ptr(param.dk_ptr + dk_offset),
                               make_layout(shapeKtVt, make_stride(param.dk_r_stride, _1{})));
 
@@ -561,7 +586,7 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
                                make_layout(make_shape(Int<kHeadDim>{}, tail_m),
                                            make_stride(_1{}, param.o_r_stride)));
             mdQaccum = make_tensor(make_gmem_ptr(mdQaccum.data()),
-                                   make_layout(shapedQ, make_stride(param.dq_r_stride, _1{})));
+                                   make_layout(shapedQ, make_stride(param.dqaccum_r_stride, _1{})));
             mQt = make_tensor(make_gmem_ptr(mQt.data()),
                               make_layout(make_shape(Int<kHeadDim>{}, tail_m),
                                           make_stride(_1{}, param.q_r_stride)));
@@ -596,36 +621,36 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
             gemm_SdP(trait, mVt, mdO, rdP, tiled_mma_sdp);
             Tensor dS = make_tensor(rdP.data(), scores.layout());
             
-            // Dropout backward: apply mask only to dP (gradient), keep P (scores) unchanged
-            // for softmax_backward. Then apply mask to P after softmax_backward for dV.
-            //
-            // Math: dS = scale * P * (mask * rp * dP_dropped - dpsum)
-            // where P is the original softmax output, dP_dropped = dO * V^T,
-            // and dpsum = sum(dO * O) with O having rp scaling from forward.
-            if (param.dropout.is_enabled) {
+            if constexpr(has_dropout) {
+                // Dropout backward: compute mask once, apply to dP first, then to P
+                // after softmax_backward. Caches mask to avoid redundant Philox RNG.
+                //
+                // Math: dS = scale * P * (mask * rp * dP_dropped - dpsum)
+                // where P is the original softmax output, dP_dropped = dO * V^T,
+                // and dpsum = sum(dO * O) with O having rp scaling from forward.
+                constexpr int kDropMaskMax = decltype(size<0>(scores))::value * decltype(size<1>(scores))::value;
+                bool drop_keep[kDropMaskMax];
+                int drop_mask_count = 0;
                 int sg_local_id = sg.get_local_id();
                 uint32_t batch_head = bidb * param.num_head_q + bidh;
                 float rp_dropout = param.dropout.get_scale();
                 
-                // Convert 3D layout to 2D for proper coordinate indexing
                 Tensor taccScS_rt_2d = make_tensor(
                     taccScS_rt.data(),
                     convert_layout_2d_layout(taccScS_rt.layout()));
                 
-                // Step 1: Apply dropout mask to dS (g_Pd -> g_P = mask * rp * g_Pd)
-                // Keep scores (P) unchanged for softmax_backward multiplier
+                // Step 1: Compute dropout mask and apply to dS
                 CUTLASS_PRAGMA_UNROLL
                 for (int ni = 0; ni < size<1>(dS); ++ni) {
-                    // get<1> is query dim (N dim of backward MMA St=Kt*Q)
                     int query_in_block = get<1>(taccScS_rt_2d(0, ni)) + sg_local_id;
                     CUTLASS_PRAGMA_UNROLL
                     for (int mi = 0; mi < size<0>(dS); ++mi) {
-                        // get<0> is key dim (M dim of backward MMA)
                         int key_in_block = get<0>(taccScS_rt_2d(mi, ni));
                         int row_idx = m_block * kBlockM + query_in_block;
                         int col_idx = n_block * kBlockN + key_in_block;
                         
                         bool keep = param.dropout.should_keep(batch_head, row_idx, col_idx);
+                        drop_keep[drop_mask_count++] = keep;
                         if (keep) {
                             dS(mi, ni) = static_cast<V>(static_cast<float>(dS(mi, ni)) * rp_dropout);
                         } else {
@@ -633,43 +658,31 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
                         }
                     }
                 }
-            }
-            
-            // dS = P * (dP_masked - dpsum) * scale
-            // Uses ORIGINAL P from scores, and dropout-masked gradient from dS
-            if (Is_even_M) {
-                softmax_backward<true>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax);
-            } else {
-                softmax_backward<false>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax, tail_m);
-            }
-            
-            // Step 2: Apply dropout mask to P (scores) for dV computation
-            // P_dropped = mask * rp * P (or 0) for dV = P_dropped^T * dO
-            if (param.dropout.is_enabled) {
-                int sg_local_id = sg.get_local_id();
-                uint32_t batch_head = bidb * param.num_head_q + bidh;
-                float rp_dropout = param.dropout.get_scale();
-                
-                Tensor taccScS_rt_2d = make_tensor(
-                    taccScS_rt.data(),
-                    convert_layout_2d_layout(taccScS_rt.layout()));
+
+                if (Is_even_M) {
+                    softmax_backward<true>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax);
+                } else {
+                    softmax_backward<false>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax, tail_m);
+                }
+
+                int mask_idx = 0;
                 
                 CUTLASS_PRAGMA_UNROLL
                 for (int ni = 0; ni < size<1>(scores); ++ni) {
-                    int query_in_block = get<1>(taccScS_rt_2d(0, ni)) + sg_local_id;
                     CUTLASS_PRAGMA_UNROLL
                     for (int mi = 0; mi < size<0>(scores); ++mi) {
-                        int key_in_block = get<0>(taccScS_rt_2d(mi, ni));
-                        int row_idx = m_block * kBlockM + query_in_block;
-                        int col_idx = n_block * kBlockN + key_in_block;
-                        
-                        bool keep = param.dropout.should_keep(batch_head, row_idx, col_idx);
-                        if (keep) {
+                        if (drop_keep[mask_idx++]) {
                             scores(mi, ni) = static_cast<V>(static_cast<float>(scores(mi, ni)) * rp_dropout);
                         } else {
                             scores(mi, ni) = V(0);
                         }
                     }
+                }
+            } else {
+                if (Is_even_M) {
+                    softmax_backward<true>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax);
+                } else {
+                    softmax_backward<false>(scores, mdPsum, dS, taccScS_rt, param.scale_softmax, tail_m);
                 }
             }
             
@@ -684,7 +697,7 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
             mha_reorder_copy(trait, tiled_mma_sdp, rdP, mdPt);
         }
         sycl::group_barrier(group);
-        
+
         // dV = P^T * dO
         gemm_dKV(trait, mPt, mdOt, rdV, tiled_mma_dkv);
         // dK = dP^T * Q
@@ -696,7 +709,7 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
         mQ.data() = mQ.data() + int(kBlockM * param.q_r_stride);
         mdO.data() = mdO.data() + int(kBlockM * param.o_r_stride);
         mdOt.data() = mdOt.data() + int(kBlockM * param.o_r_stride);
-        mdQaccum.data() = mdQaccum.data() + int(kBlockM * param.dq_r_stride);
+        mdQaccum.data() = mdQaccum.data() + int(kBlockM * param.dqaccum_r_stride);
         mQt.data() = mQt.data() + int(kBlockM * param.q_r_stride);
         mLSE.data() = mLSE.data() + int(kBlockM);
         mdPsum.data() = mdPsum.data() + int(kBlockM);
@@ -709,7 +722,7 @@ dq_dk_dv_1colblock(Trait &trait, BwdParam<typename Trait::DType> &param,
 // Compute O * dO (dot product)
 template<bool Is_even_M, class T>
 void
-compute_o_dot_do(T &trait, BwdParam<typename T::DType> &param,
+compute_o_dot_do(T &trait, BwdParam<typename T::DType, T::is_varlen> &param,
                  const int m_block, const int bidb, const int bidh) {
     constexpr int kBlockM = T::kBlockM;
     constexpr int kHeadDim = T::kHeadDim;
@@ -721,10 +734,10 @@ compute_o_dot_do(T &trait, BwdParam<typename T::DType> &param,
     auto sg = compat::get_nd_item<1>().get_sub_group();
     auto group = compat::get_nd_item<1>().get_group();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
-    auto bofst = BwdOffset(param);
+    auto bofst = BwdOffset<typename T::DType, T::is_varlen>(param);
 
     const index_t o_offset = bofst.o_offset(bidb, bidh, m_block * kBlockM);
-    const index_t dq_offset = bofst.dq_offset(bidb, bidh, m_block * kBlockM);
+    const index_t dqaccum_offset = bofst.dqaccum_offset(bidb, bidh, m_block * kBlockM);
     const index_t dpsum_offset = bofst.lse_offset(bidb, bidh, m_block * kBlockM);
 
     using ShapeO = Shape<std::conditional_t<Is_even_M, Int<kBlockM>, int>, Int<kHeadDim>>;
@@ -744,9 +757,9 @@ compute_o_dot_do(T &trait, BwdParam<typename T::DType> &param,
                              make_layout(O_shape, make_stride(param.o_r_stride, _1{})));
     Tensor mO = make_tensor(make_gmem_ptr(param.o_ptr + o_offset),
                             make_layout(O_shape, make_stride(param.o_r_stride, _1{})));
-    Tensor mdQaccum = make_tensor(make_gmem_ptr(param.dqaccum_ptr + dq_offset),
+    Tensor mdQaccum = make_tensor(make_gmem_ptr(param.dqaccum_ptr + dqaccum_offset),
                                   make_layout(make_shape(Int<kBlockM>{}, Int<kHeadDim>{}),
-                                              make_stride(param.dq_r_stride, _1{})));
+                                              make_stride(param.dqaccum_r_stride, _1{})));
     Tensor mdPsum = make_tensor(make_gmem_ptr(param.odo_ptr + dpsum_offset),
                                 make_layout(dP_shape, Stride<_1>{}));
     
@@ -790,9 +803,6 @@ compute_o_dot_do(T &trait, BwdParam<typename T::DType> &param,
     Tensor rO_2d = make_tensor(rO.data(), rdO_2d.layout());
 
     constexpr int NumValperCol = size<0>(rdO_2d);
-    auto smem = compat::local_mem<VType[kNSGs * SubgroupSize * NumValperCol]>();
-    auto stensor = make_tensor(make_smem_ptr(smem),
-                               make_layout(Shape<Int<NumValperCol>, Int<kNSGs>, Int<SubgroupSize>>{}));
     clear(rdO_2d);
     clear(rO_2d);
     
@@ -808,7 +818,6 @@ compute_o_dot_do(T &trait, BwdParam<typename T::DType> &param,
         }
     }
     
-    int sg_group_id = sg.get_group_id();
     int sg_local_id = sg.get_local_id();
     
     CUTLASS_PRAGMA_UNROLL
@@ -818,17 +827,9 @@ compute_o_dot_do(T &trait, BwdParam<typename T::DType> &param,
         for (int ni = 0; ni < size<1>(rdO_2d); ++ni) {
             accum = accum + (float)rdO_2d(mi, ni) * (float)rO_2d(mi, ni);
         }
-        stensor(mi, sg_group_id, sg_local_id) = accum;
-    }
-    
-    if (sg_local_id == 0) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int mi = 0; mi < NumValperCol; ++mi) {
-            float accum = 0.0f;
-            CUTLASS_PRAGMA_UNROLL
-            for (int ni = 0; ni < SubgroupSize; ++ni) {
-                accum += stensor(mi, sg_group_id, ni);
-            }
+        // Use subgroup shuffle reduction instead of SLM
+        accum = sycl::reduce_over_group(sg, accum, sycl::plus<float>{});
+        if (sg_local_id == 0) {
             if constexpr(Is_even_M) {
                 mdPsum(get<0>(tcO_row(mi))) = accum;
             } else {
@@ -843,7 +844,7 @@ compute_o_dot_do(T &trait, BwdParam<typename T::DType> &param,
 // Convert dQ from float accumulator to target type
 template<bool Is_even_M, class T>
 void
-convert_dq(T &trait, BwdParam<typename T::DType> &param, int m_block, int bidb, int bidh) {
+convert_dq(T &trait, BwdParam<typename T::DType, T::is_varlen> &param, int m_block, int bidb, int bidh) {
     constexpr int kBlockM = T::kBlockM;
     constexpr int kHeadDim = T::kHeadDim;
     using DType = typename T::DType;
@@ -851,9 +852,9 @@ convert_dq(T &trait, BwdParam<typename T::DType> &param, int m_block, int bidb, 
     auto sg = compat::get_nd_item<1>().get_sub_group();
     auto first_thread_in_sg_idx = sg.get_group_linear_id() * trait.SubgroupSize;
 
-    auto bofst = BwdOffset(param);
+    auto bofst = BwdOffset<typename T::DType, T::is_varlen>(param);
     const index_t dq_offset = bofst.dq_offset(bidb, bidh, m_block * kBlockM);
-    const index_t q_offset = bofst.q_offset(bidb, bidh, m_block * kBlockM);
+    const index_t dqaccum_offset = bofst.dqaccum_offset(bidb, bidh, m_block * kBlockM);
     
     using ShapeQ = Shape<std::conditional_t<Is_even_M, Int<kBlockM>, int>, Int<kHeadDim>>;
     ShapeQ shapeQ;
@@ -863,11 +864,11 @@ convert_dq(T &trait, BwdParam<typename T::DType> &param, int m_block, int bidb, 
         shapeQ = make_shape(param.tail_m, Int<kHeadDim>{});
     }
 
-    Tensor mdQaccum = make_tensor(make_gmem_ptr(param.dqaccum_ptr + dq_offset),
+    Tensor mdQaccum = make_tensor(make_gmem_ptr(param.dqaccum_ptr + dqaccum_offset),
                                   make_layout(Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                                              make_stride(param.dq_r_stride, _1{})));
-    Tensor mdQ = make_tensor(make_gmem_ptr(param.dq_ptr + q_offset),
-                            make_layout(shapeQ, make_stride(param.q_r_stride, _1{})));
+                                              make_stride(param.dqaccum_r_stride, _1{})));
+    Tensor mdQ = make_tensor(make_gmem_ptr(param.dq_ptr + dq_offset),
+                            make_layout(shapeQ, make_stride(param.dq_r_stride, _1{})));
 
     typename T::TiledMmadQ tiled_mma_dq;
     auto thr_mma_dq = tiled_mma_dq.get_slice(first_thread_in_sg_idx);
@@ -902,9 +903,9 @@ convert_dq(T &trait, BwdParam<typename T::DType> &param, int m_block, int bidb, 
         for (int s = 1; s < nsplits; ++s) {
             // Create tensor view for split s with the correct base pointer
             Tensor mdQaccum_s = make_tensor(
-                make_gmem_ptr(param.dqaccum_ptr + dq_offset + (index_t)s * param.dq_accum_split_stride),
+                make_gmem_ptr(param.dqaccum_ptr + dqaccum_offset + (index_t)s * param.dq_accum_split_stride),
                 make_layout(Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                            make_stride(param.dq_r_stride, _1{})));
+                            make_stride(param.dqaccum_r_stride, _1{})));
             auto tileloaddQ_s = make_block_2d_copy_C(tiled_mma_dq, mdQaccum_s);
             auto thr_load_dQ_s = tileloaddQ_s.get_slice(first_thread_in_sg_idx);
             copy(tileloaddQ_s, thr_load_dQ_s.partition_S(gdQaccum), tdQrdQaccum_tmp);
@@ -921,46 +922,64 @@ convert_dq(T &trait, BwdParam<typename T::DType> &param, int m_block, int bidb, 
 // Kernel entry points
 template<class T>
 void
-mha_dot_do_o(T trait, BwdParam<typename T::DType> param) {
+mha_dot_do_o(T trait, BwdParam<typename T::DType, T::is_varlen> param) {
     const int m_block = BlockIdxX();
     const int bidb = BlockIdxZ();
     const int bidh = BlockIdxY();
-    if (m_block == param.m_block - 1 and param.tail_m > 0) {
-        compute_o_dot_do<false>(trait, param, m_block, bidb, bidh);
+    auto batch_param = resolve_varlen_batch<typename T::DType, T::kBlockM, T::kBlockN, T::is_varlen>(param, bidb);
+    if constexpr (T::is_varlen) {
+        if (m_block >= batch_param.m_block) {
+            return;
+        }
+    }
+    if (m_block == batch_param.m_block - 1 and batch_param.tail_m > 0) {
+        compute_o_dot_do<false>(trait, batch_param, m_block, bidb, bidh);
     } else {
-        compute_o_dot_do<true>(trait, param, m_block, bidb, bidh);
+        compute_o_dot_do<true>(trait, batch_param, m_block, bidb, bidh);
     }
 }
 
 template<class T>
 void
-mha_backward_seq(T trait, BwdParam<typename T::DType> param) {
+mha_backward_seq(T trait, BwdParam<typename T::DType, T::is_varlen> param) {
     const int bidb = BlockIdxZ();
     const int bidhq = BlockIdxY();
     const int bidnblk = BlockIdxX();
-    const int bidhkv = bidhq / param.num_qh_per_kvh;
-    // For deterministic mode, each work-group writes to its own dq_accum split
-    if (param.deterministic) {
-        param.dqaccum_ptr = param.dqaccum_ptr + bidnblk * param.dq_accum_split_stride;
+    auto batch_param = resolve_varlen_batch<typename T::DType, T::kBlockM, T::kBlockN, T::is_varlen>(param, bidb);
+    if constexpr (T::is_varlen) {
+        if (bidnblk >= batch_param.n_block || batch_param.m_block == 0) {
+            return;
+        }
     }
-    for (int n_block = bidnblk; n_block < param.n_block; n_block += GridDimX()) {
-        if (param.tail_n > 0 and n_block == param.n_block - 1)
-            dq_dk_dv_1colblock<false, false>(trait, param, bidb, bidhq, bidhkv, param.n_block - 1, param.tail_n);
+    const int bidhkv = bidhq / batch_param.num_qh_per_kvh;
+    // For deterministic mode, each work-group writes to its own dq_accum split
+    if (batch_param.deterministic) {
+        batch_param.dqaccum_ptr = batch_param.dqaccum_ptr + bidnblk * batch_param.dq_accum_split_stride;
+    }
+    for (int n_block = bidnblk; n_block < batch_param.n_block; n_block += GridDimX()) {
+        if (batch_param.tail_n > 0 and n_block == batch_param.n_block - 1)
+            dq_dk_dv_1colblock<false, false>(trait, batch_param, bidb, bidhq, bidhkv, batch_param.n_block - 1, batch_param.tail_n);
         else
-            dq_dk_dv_1colblock<true, false>(trait, param, bidb, bidhq, bidhkv, n_block);
+            dq_dk_dv_1colblock<true, false>(trait, batch_param, bidb, bidhq, bidhkv, n_block);
     }
 }
 
 template<class T>
 void
-mhd_convert_dq(T trait, BwdParam<typename T::DType> param) {
+mhd_convert_dq(T trait, BwdParam<typename T::DType, T::is_varlen> param) {
     const int m_block = BlockIdxX();
     const int bidb = BlockIdxZ();
     const int bidh = BlockIdxY();
-    if (param.tail_m > 0 and m_block == param.m_block - 1) {
-        convert_dq<false>(trait, param, m_block, bidb, bidh);
+    auto batch_param = resolve_varlen_batch<typename T::DType, T::kBlockM, T::kBlockN, T::is_varlen>(param, bidb);
+    if constexpr (T::is_varlen) {
+        if (m_block >= batch_param.m_block) {
+            return;
+        }
+    }
+    if (batch_param.tail_m > 0 and m_block == batch_param.m_block - 1) {
+        convert_dq<false>(trait, batch_param, m_block, bidb, bidh);
     } else {
-        convert_dq<true>(trait, param, m_block, bidb, bidh);
+        convert_dq<true>(trait, batch_param, m_block, bidb, bidh);
     }
 }
 
@@ -997,10 +1016,10 @@ struct BwdKernelLauncher {
         const int M_BLOCK     = ceil_div(SEQ_LEN_Q, kBlockM);
         const int tail_m      = SEQ_LEN_Q % kBlockM;
         
-        // Allocate intermediate buffer
-        DType* pbuff = compat::malloc<DType>(BATCH * NUM_HEAD_Q * args.seqlen_k_rounded * 2 * kBlockM);
+        // Use pre-allocated intermediate buffer from caller (PyTorch caching allocator)
+        DType* pbuff = reinterpret_cast<DType*>(args.pbuff);
         
-        auto param = BwdParam<DType>(
+        auto param = BwdParam<DType, FABwdKernel::is_varlen>(
             reinterpret_cast<const DType*>(args.dout),
             reinterpret_cast<const DType*>(args.out),
             reinterpret_cast<const DType*>(args.query),
@@ -1021,6 +1040,7 @@ struct BwdKernelLauncher {
         param.num_qh_per_kvh = NUM_HEAD_Q / NUM_HEAD_KV;
         param.num_nb_per_blk = std::max(N_BLOCK * NUM_HEAD_Q * BATCH / 1024, 1);
         param.seq_len_q = SEQ_LEN_Q;
+        param.max_seqlen_q = SEQ_LEN_Q;
         param.seq_len_kv = SEQ_LEN_KV;
         param.head_dim = kHeadDim;
         param.n_block = N_BLOCK;
@@ -1031,7 +1051,10 @@ struct BwdKernelLauncher {
         param.seq_len_q_pad = args.seqlen_q_rounded;
         param.window_size_left = args.window_size_left;
         param.window_size_right = args.window_size_right;
-        param.is_local = args.is_local;
+        if constexpr (FABwdKernel::is_varlen) {
+            param.cu_seqlens_q = reinterpret_cast<const int*>(args.cu_seqlens_q);
+            param.cu_seqlens_k = reinterpret_cast<const int*>(args.cu_seqlens_k);
+        }
         param.deterministic = args.deterministic;
         param.nsplits = args.nsplits;
         param.dq_accum_split_stride = args.dq_accum_split_stride;
@@ -1049,11 +1072,11 @@ struct BwdKernelLauncher {
         compat::experimental::kernel_properties kernel_props0{
             sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>};
         compat::experimental::launch_policy policy0{dimGrid0, dimBlock0, launch_props0, kernel_props0};
-        auto event0 = compat::experimental::launch<
+        compat::experimental::launch<
             mha_dot_do_o<decltype(trait)>,
             mhaodoDeviceNameBwd<decltype(trait)>>(policy0, trait, param);
-        EventManager::getInstance().addEvent(event0);
-        compat::wait_and_throw();
+        // No explicit sync needed: in-order SYCL queue guarantees Phase 1
+        // completes before Phase 2 starts.
 
         // Phase 2: Main backward pass
         int gridDimx;
@@ -1076,11 +1099,11 @@ struct BwdKernelLauncher {
         compat::experimental::kernel_properties kernel_props1{
             sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>};
         compat::experimental::launch_policy policy1{dimGrid1, dimBlock1, launch_props1, kernel_props1};
-        auto event1 = compat::experimental::launch<
+        compat::experimental::launch<
             mha_backward_seq<decltype(trait)>,
             mhabwdDeviceNameBwd<decltype(trait)>>(policy1, trait, param);
-        EventManager::getInstance().addEvent(event1);
-        compat::wait_and_throw();
+        // No explicit sync needed: in-order SYCL queue guarantees Phase 2
+        // completes before Phase 3 starts.
 
         // Phase 3: Convert dQ from float to target type
         auto dimGrid2 = compat::dim3(size(M_BLOCK), size(param.num_head_q), size(param.batch));
@@ -1089,14 +1112,10 @@ struct BwdKernelLauncher {
         compat::experimental::kernel_properties kernel_props2{
             sycl::ext::oneapi::experimental::sub_group_size<SubgroupSize>};
         compat::experimental::launch_policy policy2{dimGrid2, dimBlock2, launch_props2, kernel_props2};
-        auto event2 = compat::experimental::launch<
+        compat::experimental::launch<
             mhd_convert_dq<decltype(trait)>,
             mhacvtDeviceNameBwd<decltype(trait)>>(policy2, trait, param);
-        EventManager::getInstance().addEvent(event2);
         compat::wait_and_throw();
-        
-        // Free intermediate buffer
-        compat::free(pbuff);
         
         return cutlass::Status::kSuccess;
     }
@@ -1112,8 +1131,8 @@ template <
 struct FMHABwdConfig {
     using DType = ElementQ;
 
-    template <bool Causal, bool Local>
-    static void run(sycl::queue& queue, const fmha_bwd_args_t& args) {
+    template <bool Causal, bool Local, bool VarLen, bool HasDropout>
+    static void run_impl(sycl::queue& queue, const fmha_bwd_args_t& args) {
         using FABwdKernelType = FABwdKernel<
             DType,
             bwd_policy::kHeadDim,
@@ -1124,10 +1143,20 @@ struct FMHABwdConfig {
             bwd_policy::AtomLayoutNdKV,
             bwd_policy::AtomLayoutMdQ,
             Causal,
-            Local>;
+            Local,
+            VarLen,
+            HasDropout>;
 
         BwdKernelLauncher<FABwdKernelType> launcher;
         launcher.run(queue, args);
+    }
+
+    template <bool Causal, bool Local, bool VarLen>
+    static void run(sycl::queue& queue, const fmha_bwd_args_t& args) {
+        if (args.p_dropout > 0.0f) {
+            return run_impl<Causal, Local, VarLen, true>(queue, args);
+        }
+        return run_impl<Causal, Local, VarLen, false>(queue, args);
     }
 
     template <bool... Bs>
@@ -1135,31 +1164,19 @@ struct FMHABwdConfig {
         return run<Bs...>(queue, args);
     }
 
-    template <bool... Bs, typename... Ts>
-    static void kernel_dispatch(sycl::queue& queue, const fmha_bwd_args_t& args, bool b, Ts... ts) {
-        if (b) {
-            kernel_dispatch<Bs..., true>(queue, args, ts...);
-        } else {
-            kernel_dispatch<Bs..., false>(queue, args, ts...);
-        }
-    }
 };
 
-// bwd_policy_dispatch - similar to policy_dispatch in fmha_fwd_impl.hpp
-template <typename bwd_policy, int IsCausal = -1, int IsLocal = -1>
-void bwd_policy_dispatch(sycl::queue& queue, BwdCutlassType cuType, const fmha_bwd_args_t& args) {
-    auto dispatch = [&]<typename ElemT>(ElemT) {
-        using Config = FMHABwdConfig<bwd_policy, ElemT, ElemT, ElemT, ElemT>;
-        if constexpr (IsCausal != -1 && IsLocal != -1) {
-            return Config::template kernel_dispatch<IsCausal, IsLocal>(queue, args);
-        } else {
-            return Config::kernel_dispatch(queue, args, args.is_causal, args.is_local);
-        }
-    };
-
-    if (cuType == BwdCutlassType::half) {
-        dispatch(cute::half_t{});
-    } else {
-        dispatch(cute::bfloat16_t{});
-    }
+// Single-dtype bwd dispatch: only instantiates one dtype path per TU.
+template <typename bwd_policy, int IsCausal, int IsLocal, int IsVarLen>
+void bwd_policy_dispatch_fp16(sycl::queue& queue, const fmha_bwd_args_t& args) {
+    using Config = FMHABwdConfig<bwd_policy, cute::half_t, cute::half_t, cute::half_t, cute::half_t>;
+    return Config::template kernel_dispatch<IsCausal, IsLocal, IsVarLen>(queue, args);
 }
+
+template <typename bwd_policy, int IsCausal, int IsLocal, int IsVarLen>
+void bwd_policy_dispatch_bf16(sycl::queue& queue, const fmha_bwd_args_t& args) {
+    using Config = FMHABwdConfig<bwd_policy, cute::bfloat16_t, cute::bfloat16_t, cute::bfloat16_t, cute::bfloat16_t>;
+    return Config::template kernel_dispatch<IsCausal, IsLocal, IsVarLen>(queue, args);
+}
+
+// Combined bwd_policy_dispatch is now defined inline in fmha_bwd.hpp

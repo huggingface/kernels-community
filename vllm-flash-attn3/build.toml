@@ -6,6 +6,8 @@ backends = ["cuda"]
 
 [general.cuda]
 minver = "12.8"
+# CUDA 13.2 builds crash in ptxas, 13.0 build is compatible.
+maxver = "13.0"
 
 
 [general.hub]

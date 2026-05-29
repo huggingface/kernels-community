@@ -1,0 +1,385 @@
+name: Build (Windows)
+run-name: >-
+  Build (Windows) / ${{ inputs.kernel_name || '' }} / mode=${{ inputs.mode || 'release' }} / request=${{ inputs.dispatch_key || '' }}
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_name:
+        description: "Kernel directory name to build"
+        required: true
+        type: string
+      dispatch_key:
+        description: "Unique key for matching this run back to a bot dispatch"
+        required: false
+        type: string
+      mode:
+        description: "Build mode: pr (CI only) or release (build + upload)"
+        required: false
+        type: string
+        default: "release"
+      skip_build:
+        description: "Skip build and upload steps (for testing workflow plumbing)"
+        required: false
+        type: boolean
+        default: false
+      pr_number:
+        description: "Optional PR number to checkout before building"
+        required: false
+        type: string
+        default: ""
+      target_branch:
+        description: "Target branch for upload (default: repo default)"
+        required: false
+        type: string
+        default: ""
+      upload:
+        description: "Whether to upload after build"
+        required: false
+        type: boolean
+        default: true
+      backends:
+        description: "Comma-separated list of backends from build.toml (set by dispatch script)"
+        required: false
+        type: string
+        default: ""
+      repo_prefix:
+        description: "Hub org prefix for uploads (e.g. kernels-community, kernels-staging)"
+        required: false
+        type: string
+        default: "kernels-community"
+      head_sha:
+        description: "PR head SHA for posting commit statuses (empty = no status)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # Post a running commit status so the PR shows the build is in progress.
+  set-running-status:
+    if: inputs.head_sha != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set running status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state="pending" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="Build in progress" \
+            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
+
+  # Build the kernel for each CUDA/XPU variant; release mode uploads to the Hub.
+  build-kernel:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022]
+        python: [3.12]
+        platform: [
+            # CUDA platforms
+            # { backend: 'cuda', torch_version: '2.9.1', cuda: '12.6.3', wheel: '126' },
+            {
+              backend: "cuda",
+              torch_version: "2.9.1",
+              cuda: "12.8.1",
+              wheel: "128",
+            },
+            # { backend: 'cuda', torch_version: '2.9.1', cuda: '13.0.1', wheel: '130' },
+            # Intel XPU platform
+            {
+              backend: "xpu",
+              torch_version: "2.10.0",
+              oneapi: "2025.3.1",
+              oneapi_url: "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe",
+            },
+          ]
+
+    runs-on: windows-2022
+    steps:
+      # Guard against injection via pr_number input.
+      - name: Validate PR number
+        if: inputs.pr_number != ''
+        shell: pwsh
+        run: |
+          if ("${{ inputs.pr_number }}" -notmatch '^\d+$') {
+            Write-Error "Invalid pr_number input: must be numeric"
+            exit 1
+          }
+
+      # When building for a PR, check out the PR head; otherwise use default branch.
+      - name: Checkout PR branch
+        if: inputs.pr_number != ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          fetch-depth: 0
+      - name: Checkout default branch
+        if: inputs.pr_number == ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Ensure the kernel directory exists and has the required config files.
+      - name: Validate kernel directory
+        id: validate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $KERNEL = "${{ inputs.kernel_name }}"
+          if ((Test-Path "$KERNEL") -and (Test-Path "$KERNEL/flake.nix") -and (Test-Path "$KERNEL/build.toml")) {
+            echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
+            echo "skip=false" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "skip=true" >> $env:GITHUB_OUTPUT
+          }
+          exit 0
+
+      # Check if the kernel supports this matrix backend and meets CUDA
+      # minimum version. Backend list is passed by the dispatch script.
+      - name: Check backend support
+        id: check-backend
+        if: steps.validate.outputs.skip == 'false'
+        shell: pwsh
+        run: |
+          $KERNEL = "${{ steps.validate.outputs.kernel }}"
+          $BACKEND = "${{ matrix.platform.backend }}"
+          $backends = "${{ inputs.backends }}" -split ","
+
+          if ($BACKEND -notin $backends) {
+            Write-Output "Kernel '$KERNEL' does not support backend '$BACKEND' - skipping"
+            echo "supported=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          # Check CUDA minimum version requirement from build.toml [general.cuda] minver
+          if ($BACKEND -eq "cuda") {
+            $CUDA_VERSION = "${{ matrix.platform.cuda }}"
+            $buildToml = Get-Content "${KERNEL}/build.toml" -Raw
+            if ($buildToml -match 'minver\s*=\s*"([^"]+)"') {
+              $minver = $matches[1]
+              $cudaMajorMinor = ($CUDA_VERSION -split '\.')[0..1] -join '.'
+              if ([version]$cudaMajorMinor -lt [version]$minver) {
+                Write-Output "Kernel '$KERNEL' requires CUDA >= $minver but matrix provides $CUDA_VERSION - skipping"
+                echo "supported=false" >> $env:GITHUB_OUTPUT
+                exit 0
+              }
+            }
+          }
+
+          Write-Output "Kernel '$KERNEL' supports backend '$BACKEND'"
+          echo "supported=true" >> $env:GITHUB_OUTPUT
+
+      # Log the kernel being built for easier debugging in CI output.
+      - name: Kernel Info
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
+        shell: pwsh
+        run: |
+          $KERNEL = "${{ steps.validate.outputs.kernel }}"
+          Write-Output "Building Kernel: $KERNEL"
+
+      # Read the pinned kernel-builder revision from flake.lock so we build
+      # with the exact same tooling the kernel was developed against.
+      - name: Kernel extract required builder version
+        id: extract-builder-version
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
+        shell: pwsh
+        run: |
+          $KERNEL = "${{ steps.validate.outputs.kernel }}"
+          $lock = Get-Content "${KERNEL}/flake.lock" | ConvertFrom-Json
+          $revision = $lock.nodes."kernel-builder".locked.rev
+          Write-Output "Building Kernel with revision: $revision"
+          echo "revision=$revision" >> $env:GITHUB_OUTPUT
+
+      # Install the CUDA toolkit for CUDA backend builds.
+      - uses: Jimver/cuda-toolkit@b6fc3a9f3f15256d9d94ffe1254f9c5a2565cde6 # v0.2.30
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && matrix.platform.backend == 'cuda'
+        id: setup-cuda-toolkit
+        with:
+          cuda: ${{ matrix.platform.cuda }}
+
+      # Install Intel oneAPI for XPU builds (provides the icx-cl compiler).
+      - name: Setup Intel oneAPI
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && matrix.platform.backend == 'xpu'
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\.github\scripts\windows\install-oneapi.ps1" -OneApiVersion "${{ matrix.platform.oneapi }}" -OneApiUrl "${{ matrix.platform.oneapi_url }}"
+
+      # Python is needed for PyTorch and the build toolchain.
+      - name: Setup Python
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Install backend-specific PyTorch wheel.
+      - name: Install PyTorch (CUDA)
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && matrix.platform.backend == 'cuda'
+        run: pip install torch --index-url https://download.pytorch.org/whl/cu${{ matrix.platform.wheel }}
+      - name: Install PyTorch (XPU)
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && matrix.platform.backend == 'xpu'
+        run: pip3 install torch==${{ matrix.platform.torch_version }} --index-url https://download.pytorch.org/whl/xpu
+
+      # Check out the kernel-builder repo at the pinned revision for building.
+      - name: Checkout kernels
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
+        id: checkout-kernels
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: huggingface/kernels
+          ref: "${{ steps.extract-builder-version.outputs.revision }}"
+          path: kernels
+
+      # Cache Rust compilation artifacts to speed up kernel-builder builds.
+      - name: Cache Rust build
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            kernels/kernel-builder/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-rust-debug-${{ hashFiles('kernels/kernel-builder/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-debug-
+
+      # Build the kernel-builder CLI tool from source.
+      - name: Build kernel-builder
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
+        working-directory: kernels\kernel-builder
+        shell: pwsh
+        run: cargo build
+
+      # Compile the kernel using the Windows build script, then run
+      # cmake local_install to create the directory layout for upload.
+      - name: Build kernel
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
+        shell: pwsh
+        env:
+          KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
+          PLATFORM_BACKEND: ${{ matrix.platform.backend }}
+        run: |
+          # Initialize oneAPI environment for XPU builds
+          if ($env:PLATFORM_BACKEND -eq "xpu") {
+            $setvarsPath = "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+            if (Test-Path $setvarsPath) {
+              Write-Host "Initializing Intel oneAPI environment for XPU build..." -ForegroundColor Cyan
+
+              # Create a temporary file to capture environment variables
+              $tempFile = [System.IO.Path]::GetTempFileName()
+
+              # Run setvars.bat and capture all environment variables
+              cmd.exe /c "`"$setvarsPath`" && set > `"$tempFile`""
+
+              # Parse and set each environment variable in PowerShell
+              Get-Content $tempFile | ForEach-Object {
+                if ($_ -match "^(.*?)=(.*)$") {
+                  $varName = $matches[1]
+                  $varValue = $matches[2]
+                  [System.Environment]::SetEnvironmentVariable($varName, $varValue, [System.EnvironmentVariableTarget]::Process)
+                }
+              }
+
+              Remove-Item $tempFile -ErrorAction SilentlyContinue
+
+              # Verify Intel compiler is now in PATH
+              $icxPath = (Get-Command icx-cl -ErrorAction SilentlyContinue).Path
+              if ($icxPath) {
+                Write-Host "Intel oneAPI environment initialized successfully" -ForegroundColor Green
+                Write-Host "Intel C++ Compiler found at: $icxPath" -ForegroundColor Green
+              } else {
+                Write-Error "Intel compiler (icx-cl) still not found in PATH after initialization"
+                exit 1
+              }
+            } else {
+              Write-Error "setvars.bat not found at $setvarsPath"
+              exit 1
+            }
+          }
+          & "$env:GITHUB_WORKSPACE\kernels\nix-builder\scripts\windows\builder.ps1" -Backend $env:PLATFORM_BACKEND -SourceFolder "$env:KERNEL_SOURCE" -BuildConfig Release -Build
+
+          # Run the local_install target to create the correct directory structure for kernels upload
+          # This installs to build/<variant>/<package>/ which is what kernels CLI expects
+          Push-Location "$env:KERNEL_SOURCE\build"
+          cmake --build . --config Release --target local_install
+          Pop-Location
+
+      # Upload built artifacts to both model and kernel Hub repos.
+      - name: Upload kernel to Hub
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false
+        shell: pwsh
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          $KB = "$env:GITHUB_WORKSPACE\kernels\kernel-builder\target\debug\kernel-builder.exe"
+
+          $branchArgs = @()
+          if ($env:TARGET_BRANCH -ne "") {
+            $branchArgs = @("--branch", $env:TARGET_BRANCH)
+          }
+
+          # Upload to both model and kernel repo types
+          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "${{ inputs.repo_prefix }}/$env:KERNEL_SOURCE" @branchArgs
+          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "${{ inputs.repo_prefix }}/$env:KERNEL_SOURCE" @branchArgs
+
+      # v1 kernels without an explicit branch override also get uploaded to main.
+      - name: Upload v1 kernels to main
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false && inputs.target_branch == ''
+        shell: pwsh
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
+        run: |
+          $KB = "$env:GITHUB_WORKSPACE\kernels\kernel-builder\target\debug\kernel-builder.exe"
+
+          # Check if build.toml exists and has version = 1
+          $buildTomlPath = "$env:KERNEL_SOURCE\build.toml"
+          if (Test-Path $buildTomlPath) {
+            $content = Get-Content $buildTomlPath -Raw
+            if ($content -match '(?m)^\s*version\s*=\s*1\s*(\r)?$' -and $content -notmatch '(?m)^\s*branch\s*=') {
+              Write-Host "Kernel version is 1 and no branch override, uploading to main branch..."
+              & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "${{ inputs.repo_prefix }}/$env:KERNEL_SOURCE" --branch main
+              & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "${{ inputs.repo_prefix }}/$env:KERNEL_SOURCE" --branch main
+            } else {
+              Write-Host "Kernel version is not 1 or branch is overridden, skipping main branch upload"
+            }
+          } else {
+            Write-Host "build.toml not found, skipping main branch upload"
+          }
+
+  # Report the final build outcome as a commit status on the PR head SHA.
+  report-status:
+    if: always() && inputs.head_sha != ''
+    needs: [build-kernel]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set commit status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUILD="${{ needs.build-kernel.result }}"
+
+          if [ "$BUILD" = "success" ]; then
+            STATE="success"
+            DESC="Build passed"
+          elif [ "$BUILD" = "failure" ]; then
+            STATE="failure"
+            DESC="Build failed"
+          else
+            STATE="error"
+            DESC="Build did not complete (${BUILD})"
+          fi
+
+          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state="$STATE" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="$DESC" \
+            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"

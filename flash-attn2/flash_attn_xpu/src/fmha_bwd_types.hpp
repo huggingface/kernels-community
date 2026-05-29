@@ -10,6 +10,8 @@ struct fmha_bwd_args_t {
   void* key;
   void* value;
   void* softmax_lse; // logsumexp from forward
+  void* cu_seqlens_q = nullptr;
+  void* cu_seqlens_k = nullptr;
 
   // Output gradient tensors
   void* dq;
@@ -36,9 +38,6 @@ struct fmha_bwd_args_t {
   float sm_scale;
 
   // Flags
-  bool is_causal = false;
-  bool is_local = false;
-  bool is_bf16 = false;
   bool deterministic = false;
 
   // Deterministic mode parameters
@@ -53,6 +52,9 @@ struct fmha_bwd_args_t {
   float p_dropout = 0.0f;     // Probability of dropping (NOT keeping)
   uint64_t philox_seed = 0;   // Philox RNG seed (from forward pass)
   uint64_t philox_offset = 0; // Philox RNG offset (from forward pass)
+
+  // Pre-allocated intermediate buffer (P and dS tiles)
+  void* pbuff = nullptr;
 };
 
 enum class BwdCutlassType {
@@ -94,12 +96,12 @@ struct bwd_policy_head96 {
 };
 
 struct bwd_policy_head128 {
-  static constexpr int kBlockM = 64;
-  static constexpr int kBlockN = 64;
+  static constexpr int kBlockM = 128;
+  static constexpr int kBlockN = 128;
   static constexpr int kHeadDim = 128;
-  static constexpr int kNSGs = 8;
-  static constexpr int AtomLayoutMSdP = 2;
-  static constexpr int AtomLayoutNdKV = 2;
+  static constexpr int kNSGs = 32;
+  static constexpr int AtomLayoutMSdP = 4;
+  static constexpr int AtomLayoutNdKV = 4;
   static constexpr int AtomLayoutMdQ = 4;
 };
 

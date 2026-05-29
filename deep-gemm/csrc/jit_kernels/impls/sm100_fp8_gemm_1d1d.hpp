@@ -1,6 +1,6 @@
 #pragma once
 
-#include <torch/torch.h>
+#include "../../utils/torch_compat.hpp"
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/device_runtime.hpp"
