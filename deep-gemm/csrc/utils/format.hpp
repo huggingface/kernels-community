@@ -3,10 +3,9 @@
 // Minimal fmt::format shim — supports only "{}" placeholders and "{{" / "}}"
 // escapes. This covers all usage in DeepGEMM and avoids depending on libfmt.
 //
-// Uses std::string concatenation instead of std::ostringstream to avoid
-// potential locale/ABI issues with ostringstream across different platforms.
+// Uses std::string concatenation instead of locale-backed iostream formatting.
 
-#include <sstream>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -15,6 +14,9 @@
 namespace fmt {
 
 namespace detail {
+
+template<typename>
+inline constexpr bool kAlwaysFalse = false;
 
 // Convert value to string — specializations for common types
 template<typename T>
@@ -34,10 +36,18 @@ inline std::string to_str(const T& v) {
     } else if constexpr (std::is_floating_point_v<T>) {
         return std::to_string(v);
     } else {
-        // Fallback for other types with operator<<
-        std::ostringstream os;
-        os << v;
-        return os.str();
+        static_assert(kAlwaysFalse<T>, "Unsupported fmt::format argument type");
+    }
+}
+
+template<typename T>
+inline std::string to_hex_float_str(const T& v) {
+    if constexpr (std::is_floating_point_v<T>) {
+        char buffer[64];
+        std::snprintf(buffer, sizeof(buffer), "%a", static_cast<double>(v));
+        return buffer;
+    } else {
+        return to_str(v);
     }
 }
 
@@ -79,6 +89,11 @@ std::string format_impl(std::string_view fmt,
             } else if (i + 1 < fmt.size() && fmt[i + 1] == '}') {
                 result += to_str(first);
                 result += format_impl(fmt.substr(i + 2), rest...);
+                return result;
+            } else if (i + 3 < fmt.size() && fmt[i + 1] == ':' &&
+                       fmt[i + 2] == 'a' && fmt[i + 3] == '}') {
+                result += to_hex_float_str(first);
+                result += format_impl(fmt.substr(i + 4), rest...);
                 return result;
             } else {
                 result += fmt[i++];

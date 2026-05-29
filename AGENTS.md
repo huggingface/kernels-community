@@ -1,5 +1,43 @@
 # Kernel-specific instructions
 
+## flash-attn3
+
+When the user asks to sync a flash-attn3 release, carry out the following
+steps:
+
+- Fetch the upstream Git repository from https://github.com/Dao-AILab/flash-attention.git
+- Check out the tag that the user specified.
+- Flash Attention 3 is in the directory `hopper` of the upstream repo.
+- Copy upstream Flash Attention 3 CUDA files, as well as the stable API (`flash_api_stable.cpp`) to
+  `flash-attn3/flash-attn`.
+- Copy the Flash Attention 3 upstream `flash_attn_interface` Python modules to
+  `flash-attn3/torch-ext/flash_attn3`.
+- Copy the Python files prefixed with `test_` to `flash-attn3/tests`.
+- In every copied or updated test file, rewrite imports of `flash_attn_interface` to use
+  `flash_attn3`. For instance, `import flash_attn_interface` → `import flash_attn3.flash_attn_interface as flash_attn_interface`
+- Relativize imports of local test helpers and modules (files placed under `flash-attn3/tests`) so
+  they import from the local package rather than as top-level modules.
+- Add the following imports to `flash-attn3/torch-ext/flash_attn_interface.py`:
+
+  ```
+  from ._ops import ops as flash_attn_3_cuda
+  from ._ops import add_op_namespace_prefix
+  ```
+
+- Validate that all native (op) calls in `flash-attn3/torch-ext/flash_attn_interface.py` are
+  dispatched to `flash_attn3_cuda`.
+- Do not modify `flash-attn3/torch-ext/flash-attn3/__init__.py`, this is a local re-export of the
+  flash-attn3 functions. However, do check if anything vital is missing and if so, report to the
+  user.
+- Check whether any Torch custom ops are defined in `flash-attn3/torch-ext/flash_attn_interface.py`
+  (look for `torch.library.custom_op`, `torch.library.define`, etc.). If any are found, update them
+  to use `add_op_namespace_prefix` for the op name. For example, a definition like
+  `@torch.library.custom_op("_flash_attn_forward", mutates_args=(), device_types="cuda")`
+  should become
+  `@torch.library.custom_op(add_op_namespace_prefix("_flash_attn_forward"), mutates_args=(), device_types="cuda")`.
+  `add_op_namespace_prefix` is imported from `._ops` (see
+  `flash-attn3/torch-ext/flash_attn3/flash_attn_interface.py` prior to the update for an example).
+
 ## flash-attn4
 
 When the user asks to sync a flash-attn4 release, carry out the following

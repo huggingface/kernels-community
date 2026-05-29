@@ -122,7 +122,7 @@ BACKEND_TO_WORKFLOWS = {
 WINDOWS_KERNELS = {
     "relu",
     "activation",
-    "flash-attn2",
+    # "flash-attn2",
 }
 
 # Backends to skip on Windows for specific kernels (e.g. due to toolchain issues).

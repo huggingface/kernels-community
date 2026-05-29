@@ -13,6 +13,7 @@ import random
 
 KERNEL_SOURCE_MAPPING = {
     "activation": "",
+    "aiter-rope": "https://github.com/ROCm/aiter",
     "causal-conv1d": "https://github.com/Dao-AILab/causal-conv1d",
     "deformable-detr": "",
     "finegrained-fp8": "",
