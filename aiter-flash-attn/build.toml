@@ -9,4 +9,6 @@ backends = [
 [general.hub]
 repo-id = "kernels-community/aiter-flash-attn"
 
+[torch-noarch]
+
 [kernel]
