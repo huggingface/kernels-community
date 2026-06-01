@@ -1,8 +1,9 @@
 #pragma once
 
-#include <torch/torch.h>
+#include "utils/torch_compat.hpp"
 #include <optional>
 #include <string>
+#include <vector>
 
 using Tensor = at::Tensor;
 
@@ -18,11 +19,20 @@ int64_t deep_gemm_get_num_sms();
 void deep_gemm_set_tc_util(int64_t tc_util);
 int64_t deep_gemm_get_tc_util();
 
+void deep_gemm_set_pdl(bool enable_pdl);
+bool deep_gemm_get_pdl();
+
+void deep_gemm_set_ignore_compile_dims(bool ignore_compile_dims);
+void deep_gemm_set_block_size_multiple_of(int64_t block_m, int64_t block_n);
+
 // ============================================================================
 // Layout ops
 // ============================================================================
 
+void deep_gemm_set_mk_alignment_for_contiguous_layout(int64_t alignment);
 int64_t deep_gemm_get_mk_alignment_for_contiguous_layout();
+int64_t deep_gemm_get_theoretical_mk_alignment_for_contiguous_layout(
+    int64_t expected_m, bool has_expected_m);
 
 Tensor deep_gemm_get_tma_aligned_size(int64_t mn, int64_t element_size);
 
@@ -31,14 +41,13 @@ Tensor deep_gemm_get_mn_major_tma_aligned_tensor(const Tensor& sf);
 Tensor deep_gemm_get_mn_major_tma_aligned_packed_ue8m0_tensor(const Tensor& sf);
 
 Tensor deep_gemm_get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
-    const Tensor& sf, const Tensor& ks_tensor, const Tensor& ks_int_tensor);
+    const Tensor& sf, const Tensor& ks_tensor, const Tensor& ks_int_tensor, int64_t gran_k);
 
 Tensor deep_gemm_transform_sf_into_required_layout(
     const Tensor& sf, int64_t mn, int64_t k,
-    int64_t recipe_0, int64_t recipe_1, int64_t recipe_2, bool has_recipe,
-    int64_t recipe_ab_0, int64_t recipe_ab_1, bool has_recipe_ab,
+    int64_t recipe_0, int64_t recipe_1, int64_t recipe_2, int64_t recipe_len,
     int64_t num_groups, bool has_num_groups,
-    bool is_sfa, bool disable_ue8m0_cast);
+    bool is_sfa, bool has_is_sfa, bool disable_ue8m0_cast);
 
 // ============================================================================
 // GEMM ops - FP8/FP4
@@ -215,6 +224,13 @@ void deep_gemm_fp8_gemm_nt_skip_head_mid(
     int64_t recipe_0, int64_t recipe_1, int64_t recipe_2, bool has_recipe,
     const std::string& compiled_dims, bool disable_ue8m0_cast);
 
+Tensor deep_gemm_fp8_fp4_mqa_logits(
+    const Tensor& q_data, const std::optional<Tensor>& q_sf,
+    const Tensor& kv_data, const Tensor& kv_sf,
+    const Tensor& weights,
+    const Tensor& cu_seq_len_k_start, const Tensor& cu_seq_len_k_end,
+    bool clean_logits, int64_t max_seqlen_k, at::ScalarType logits_dtype);
+
 Tensor deep_gemm_fp8_mqa_logits(
     const Tensor& q,
     const Tensor& kv_data, const Tensor& kv_sf,
@@ -223,13 +239,42 @@ Tensor deep_gemm_fp8_mqa_logits(
     bool clean_logits, int64_t max_seqlen_k);
 
 Tensor deep_gemm_get_paged_mqa_logits_metadata(
-    const Tensor& context_lens, int64_t block_kv, int64_t num_sms);
+    const Tensor& context_lens, int64_t block_kv, int64_t num_sms,
+    const std::optional<Tensor>& indices);
+
+Tensor deep_gemm_fp8_fp4_paged_mqa_logits(
+    const Tensor& q_data, const std::optional<Tensor>& q_sf,
+    const Tensor& fused_kv_cache,
+    const Tensor& weights, const Tensor& context_lens,
+    const Tensor& block_table, const Tensor& schedule_meta,
+    int64_t max_context_len, bool clean_logits, at::ScalarType logits_dtype,
+    const std::optional<Tensor>& indices);
 
 Tensor deep_gemm_fp8_paged_mqa_logits(
     const Tensor& q, const Tensor& fused_kv_cache,
     const Tensor& weights, const Tensor& context_lens,
     const Tensor& block_table, const Tensor& schedule_meta,
-    int64_t max_context_len, bool clean_logits);
+    int64_t max_context_len, bool clean_logits, const std::optional<Tensor>& indices);
+
+int64_t deep_gemm_get_token_alignment_for_mega_moe();
+int64_t deep_gemm_get_symm_buffer_size_for_mega_moe(
+    int64_t num_ranks, int64_t num_experts, int64_t num_max_tokens_per_rank,
+    int64_t num_topk, int64_t hidden, int64_t intermediate_hidden,
+    bool use_fp8_dispatch, const std::string& activation);
+std::vector<Tensor> deep_gemm_get_symm_buffer_views_for_mega_moe(
+    const Tensor& buffer, int64_t num_ranks, int64_t num_experts,
+    int64_t num_max_tokens_per_rank, int64_t num_topk, int64_t hidden,
+    int64_t intermediate_hidden, bool use_fp8_dispatch, const std::string& activation);
+void deep_gemm_fp8_fp4_mega_moe(
+    const Tensor& y,
+    const Tensor& l1_weights, const Tensor& l1_weights_sf,
+    const Tensor& l2_weights, const Tensor& l2_weights_sf,
+    const std::optional<Tensor>& cumulative_local_expert_recv_stats,
+    const Tensor& sym_buffer, c10::List<int64_t> sym_buffer_ptrs, int64_t rank_idx,
+    int64_t num_max_tokens_per_rank, int64_t num_experts, int64_t num_topk,
+    int64_t recipe_0, int64_t recipe_1, int64_t recipe_2,
+    const std::string& activation, const std::optional<double>& activation_clamp,
+    bool fast_math);
 
 // ============================================================================
 // Einsum ops
