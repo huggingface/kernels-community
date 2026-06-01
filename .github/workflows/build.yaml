@@ -215,7 +215,7 @@ jobs:
 
       - name: Install Cosign
         if: needs.setup.outputs.kernel == 'relu'
-        uses: sigstore/cosign-installer@v4.0.0
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
 
       # Sign metadata.json for each built variant.
       - name: Sign kernel metadata
