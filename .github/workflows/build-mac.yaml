@@ -56,6 +56,7 @@ on:
 permissions:
   contents: read
   statuses: write
+  id-token: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -154,6 +155,23 @@ jobs:
           else
             ( cd "$KERNEL" && nix build -L )
           fi
+          cd "$KERNEL"
+          cp -rL result build
+          rm result
+          chmod -R u+w build
+
+      - name: Install Cosign
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && steps.validate.outputs.kernel == 'relu' && inputs.mode != 'pr'
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+
+      # Sign metadata.json for each built variant.
+      - name: Sign kernel metadata
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && steps.validate.outputs.kernel == 'relu' && inputs.mode != 'pr'
+        run: |
+          KERNEL="${{ steps.validate.outputs.kernel }}"
+          for metadata_file in "$KERNEL"/build/*/metadata.json; do
+            cosign sign-blob "$metadata_file" --bundle "${metadata_file}.sigstore" --yes
+          done
 
       # Upload built artifacts to both model and kernel Hub repos.
       - name: Upload kernel to Hub
