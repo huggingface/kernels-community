@@ -1,12 +1,18 @@
 import os
 import subprocess
+import sysconfig
 import torch
 
+# Avoid holding a CUDA tensor in DeepGEMM's process-lifetime runtime singleton.
+# In packaged/lazy-loaded use, that can outlive PyTorch's CUDA teardown and crash
+# during interpreter shutdown.
+os.environ.setdefault("DG_USE_TEMP_CUBLASLT_WORKSPACE", "1")
+
 # Import the compiled extension
-from ._ops import ops, add_op_namespace_prefix
+from ._ops import ops as _ops, add_op_namespace_prefix
 from . import utils
 
-__version__ = "2.3.0"
+__version__ = "2.5.0"
 
 
 # ── Register fake tensor implementations for torch.compile ──────────────────
@@ -32,6 +38,7 @@ for _op in [
     "m_grouped_bf16_gemm_nn_contiguous",
     "m_grouped_bf16_gemm_nt_masked",
     "fp8_gemm_nt_skip_head_mid",
+    "fp8_fp4_mega_moe",
 ]:
 
     @torch.library.register_fake(add_op_namespace_prefix(_op))
@@ -58,8 +65,39 @@ def get_tc_util() -> int:
     return ops.get_tc_util()
 
 
+def set_ignore_compile_dims(value: bool):
+    ops.set_ignore_compile_dims(value)
+
+
+def set_block_size_multiple_of(value):
+    if isinstance(value, tuple):
+        block_m, block_n = value
+    else:
+        block_m = block_n = value
+    ops.set_block_size_multiple_of(block_m, block_n)
+
+
+def set_pdl(enable_pdl: bool):
+    ops.set_pdl(enable_pdl)
+
+
+def get_pdl() -> bool:
+    return ops.get_pdl()
+
+
+def set_mk_alignment_for_contiguous_layout(alignment: int):
+    ops.set_mk_alignment_for_contiguous_layout(alignment)
+
+
 def get_mk_alignment_for_contiguous_layout() -> int:
     return ops.get_mk_alignment_for_contiguous_layout()
+
+
+def get_theoretical_mk_alignment_for_contiguous_layout(expected_m=None) -> int:
+    return ops.get_theoretical_mk_alignment_for_contiguous_layout(
+        0 if expected_m is None else expected_m,
+        expected_m is not None,
+    )
 
 
 # Layout utilities
@@ -77,10 +115,12 @@ def get_mn_major_tma_aligned_packed_ue8m0_tensor(sf):
     return ops.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
 
 
-def get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, ks_tensor, ks):
+def get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
+    sf, ks_tensor, ks, gran_k
+):
     ks_int = torch.tensor(ks, dtype=torch.int32, device="cpu")
     return ops.get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
-        sf, ks_tensor, ks_int
+        sf, ks_tensor, ks_int, gran_k
     )
 
 
@@ -88,16 +128,20 @@ def transform_sf_into_required_layout(
     sf,
     mn,
     k,
-    recipe=None,
-    recipe_ab=None,
+    recipe,
     num_groups=None,
-    is_sfa=False,
+    is_sfa=None,
     disable_ue8m0_cast=False,
 ):
-    has_recipe = recipe is not None
-    r0, r1, r2 = recipe if has_recipe else (0, 0, 0)
-    has_recipe_ab = recipe_ab is not None
-    rab0, rab1 = recipe_ab if has_recipe_ab else (0, 0)
+    if len(recipe) == 3:
+        r0, r1, r2 = recipe
+        recipe_len = 3
+    elif len(recipe) == 2:
+        r0, r1 = recipe
+        r2 = 0
+        recipe_len = 2
+    else:
+        raise ValueError("recipe must have length 2 or 3")
     has_ng = num_groups is not None
     ng = num_groups if has_ng else 0
     return ops.transform_sf_into_required_layout(
@@ -107,13 +151,11 @@ def transform_sf_into_required_layout(
         r0,
         r1,
         r2,
-        has_recipe,
-        rab0,
-        rab1,
-        has_recipe_ab,
+        recipe_len,
         ng,
         has_ng,
-        is_sfa,
+        False if is_sfa is None else is_sfa,
+        is_sfa is not None,
         disable_ue8m0_cast,
     )
 
@@ -593,8 +635,37 @@ def fp8_mqa_logits(
     )
 
 
-def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms):
-    return ops.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms)
+def fp8_fp4_mqa_logits(
+    q,
+    kv,
+    weights,
+    cu_seq_len_k_start,
+    cu_seq_len_k_end,
+    clean_logits=True,
+    max_seqlen_k=0,
+    logits_dtype=torch.float32,
+):
+    if isinstance(q, tuple):
+        q_data, q_sf = q
+    else:
+        q_data, q_sf = q, None
+    kv_data, kv_sf = kv
+    return ops.fp8_fp4_mqa_logits(
+        q_data,
+        q_sf,
+        kv_data,
+        kv_sf,
+        weights,
+        cu_seq_len_k_start,
+        cu_seq_len_k_end,
+        clean_logits,
+        max_seqlen_k,
+        logits_dtype,
+    )
+
+
+def get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices=None):
+    return ops.get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms, indices)
 
 
 def fp8_paged_mqa_logits(
@@ -606,6 +677,7 @@ def fp8_paged_mqa_logits(
     schedule_meta,
     max_context_len,
     clean_logits=False,
+    indices=None,
 ):
     return ops.fp8_paged_mqa_logits(
         q,
@@ -616,6 +688,38 @@ def fp8_paged_mqa_logits(
         schedule_meta,
         max_context_len,
         clean_logits,
+        indices,
+    )
+
+
+def fp8_fp4_paged_mqa_logits(
+    q,
+    kv_cache,
+    weights,
+    context_lens,
+    block_table,
+    schedule_meta,
+    max_context_len,
+    clean_logits=False,
+    logits_dtype=torch.float32,
+    indices=None,
+):
+    if isinstance(q, tuple):
+        q_data, q_sf = q
+    else:
+        q_data, q_sf = q, None
+    return ops.fp8_fp4_paged_mqa_logits(
+        q_data,
+        q_sf,
+        kv_cache,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_context_len,
+        clean_logits,
+        logits_dtype,
+        indices,
     )
 
 
@@ -640,6 +744,14 @@ def tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=None):
     has_ns = num_splits is not None
     ns = num_splits if has_ns else 0
     ops.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, ns, has_ns)
+
+
+from .mega import (
+    SymmBuffer,
+    get_symm_buffer_for_mega_moe,
+    transform_weights_for_mega_moe,
+    fp8_fp4_mega_moe,
+)
 
 
 # Initialize the C++ runtime
@@ -683,6 +795,14 @@ if "DG_CUTLASS_INCLUDE" not in os.environ:
         _include,  # legacy layout: include/cutlass
         os.path.join(_include, "third-party", "cutlass", "include"),  # submodule layout
     ]
+    for _site_packages in {
+        sysconfig.get_paths().get("purelib"),
+        sysconfig.get_paths().get("platlib"),
+    }:
+        if _site_packages:
+            _cutlass_include_candidates.append(
+                os.path.join(_site_packages, "cutlass_library", "source", "include")
+            )
     for _cutlass_include in _cutlass_include_candidates:
         if os.path.isdir(os.path.join(_cutlass_include, "cutlass")):
             os.environ["DG_CUTLASS_INCLUDE"] = _cutlass_include
@@ -703,8 +823,21 @@ def _ensure_initialized():
     global _initialized
     if _initialized:
         return
+    _ops.init(_lib_root, _find_cuda_home())
     _initialized = True
-    ops.init(_lib_root, _find_cuda_home())
+
+
+class _InitializedOps:
+    def __init__(self, raw_ops):
+        self._raw_ops = raw_ops
+
+    def __getattr__(self, name):
+        if name != "init":
+            _ensure_initialized()
+        return getattr(self._raw_ops, name)
+
+
+ops = _InitializedOps(_ops)
 
 
 # Try to initialize eagerly, but don't fail if CUDA is not found

@@ -1,0 +1,12 @@
+[general]
+name = "aiter-rope"
+version = 1
+license = "MIT"
+backends = ["rocm"]
+
+[general.hub]
+repo-id = "kernels-community/aiter-rope"
+
+[torch-noarch]
+
+[kernel]
