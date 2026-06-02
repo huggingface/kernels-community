@@ -22,7 +22,6 @@ COMMAND_PERMISSIONS = {
     "merge-and-upload": {"admin"},
     "release": {"admin"},
 }
-FORK_BLOCKED_COMMANDS = {"build", "build-and-stage", "release"}
 MAX_COMMENT_LENGTH = 1024
 RUN_LOOKUP_ATTEMPTS = 10
 RUN_LOOKUP_SLEEP_SECONDS = 2
@@ -529,18 +528,6 @@ def main():
             f"Could not verify PR metadata, so `/kernel-bot {command}` was not run.",
         )
         return 1
-
-    if command in FORK_BLOCKED_COMMANDS:
-        head_repo = pull_request.get("head", {}).get("repo", {}) or {}
-        head_full_name = head_repo.get("full_name")
-        if head_full_name != repository:
-            try_post_issue_comment(
-                api_base,
-                token,
-                issue_number,
-                f"Fork PRs are blocked for `/kernel-bot {command}`. Use a branch in this repository.",
-            )
-            return 0
 
     if command == "build":
         target_branch = requested_branch or f"pr-{issue_number}"
