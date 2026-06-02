@@ -32,17 +32,28 @@ DEFAULT_GROUP_M = 8
 FP8_MAX = 448.0
 
 
-def _autotune_configs():
+def _execution_autotune_configs(
+    warps: tuple[int, ...] = (2, 4, 8, 16),
+    stages: tuple[int, ...] = (2, 3, 4),
+):
     return [
         triton.Config({}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
+        for w in warps
+        for s in stages
     ]
+
+
+def _autotune_configs():
+    return _execution_autotune_configs(warps=(8, 16))
+
+
+def _grouped_autotune_configs():
+    return _execution_autotune_configs(warps=(4, 8))
 
 
 @triton.autotune(configs=_autotune_configs(), key=["M", "N", "K", "BLOCK_M", "BLOCK_N", "BLOCK_K"])
 @triton.jit
-def w4a8_tensor_fp8_matmul_kernel(
+def w4a8_block_fp8_matmul_kernel(
     A_ptr,
     AS_ptr,
     B_ptr,
@@ -136,7 +147,7 @@ def w4a8_tensor_fp8_matmul_kernel(
 
 @triton.autotune(configs=_autotune_configs(), key=["N", "K", "BLOCK_M", "BLOCK_N", "BLOCK_K"])
 @triton.jit
-def w4a8_tensor_fp8_matmul_batched_kernel(
+def w4a8_block_fp8_matmul_batched_kernel(
     A_ptr,
     AS_ptr,
     B_ptr,
@@ -158,6 +169,7 @@ def w4a8_tensor_fp8_matmul_batched_kernel(
     stride_sfk,
     stride_cm,
     stride_cn,
+    stride_expert_ids,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -167,7 +179,7 @@ def w4a8_tensor_fp8_matmul_batched_kernel(
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
-    expert_id = tl.load(ExpertIds_ptr + batch_id).to(tl.int64)
+    expert_id = tl.load(ExpertIds_ptr + batch_id * stride_expert_ids).to(tl.int64)
 
     A_ptr = A_ptr + batch_id * stride_am
     AS_ptr = AS_ptr + batch_id * stride_asm
@@ -223,9 +235,9 @@ def w4a8_tensor_fp8_matmul_batched_kernel(
     tl.store(c_ptrs, acc.to(C_ptr.dtype.element_ty), mask=(offs_m == 0)[:, None] & (offs_n[None, :] < N))
 
 
-@triton.autotune(configs=_autotune_configs(), key=["S", "N", "K", "BLOCK_M", "BLOCK_N", "BLOCK_K"])
+@triton.autotune(configs=_grouped_autotune_configs(), key=["S", "N", "K", "BLOCK_M", "BLOCK_N", "BLOCK_K"])
 @triton.jit
-def w4a8_tensor_fp8_matmul_grouped_kernel(
+def w4a8_block_fp8_matmul_grouped_kernel(
     A_ptr,
     AS_ptr,
     B_ptr,
@@ -248,6 +260,8 @@ def w4a8_tensor_fp8_matmul_grouped_kernel(
     stride_sfk,
     stride_cm,
     stride_cn,
+    stride_offsets,
+    stride_tile_offsets,
     NUM_EXPERTS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -259,7 +273,7 @@ def w4a8_tensor_fp8_matmul_grouped_kernel(
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
-    total_tiles = tl.load(TileOffsets_ptr + NUM_EXPERTS - 1)
+    total_tiles = tl.load(TileOffsets_ptr + (NUM_EXPERTS - 1) * stride_tile_offsets)
     if pid_m >= total_tiles:
         return
 
@@ -267,18 +281,18 @@ def w4a8_tensor_fp8_matmul_grouped_kernel(
     hi = NUM_EXPERTS - 1
     for _ in tl.static_range(NUM_EXPERTS_BIT_LENGTH):
         mid = (lo + hi) >> 1
-        mid_val = tl.load(TileOffsets_ptr + mid)
+        mid_val = tl.load(TileOffsets_ptr + mid * stride_tile_offsets)
         is_left = mid_val <= pid_m
         lo = tl.where(is_left, mid + 1, lo)
         hi = tl.where(is_left, hi, mid)
     expert_id = tl.minimum(lo, NUM_EXPERTS - 1).to(tl.int64)
 
     prev_eid = tl.maximum(expert_id - 1, 0)
-    expert_start = tl.where(expert_id == 0, 0, tl.load(Offsets_ptr + prev_eid))
-    expert_end = tl.load(Offsets_ptr + expert_id)
+    expert_start = tl.where(expert_id == 0, 0, tl.load(Offsets_ptr + prev_eid * stride_offsets))
+    expert_end = tl.load(Offsets_ptr + expert_id * stride_offsets)
     m_expert = expert_end - expert_start
 
-    expert_tile_start = tl.where(expert_id == 0, 0, tl.load(TileOffsets_ptr + prev_eid))
+    expert_tile_start = tl.where(expert_id == 0, 0, tl.load(TileOffsets_ptr + prev_eid * stride_tile_offsets))
     local_tile = pid_m - expert_tile_start
     m_off = local_tile * BLOCK_M
 
@@ -339,18 +353,18 @@ def w4a8_tensor_fp8_matmul_grouped_kernel(
 
 
 @functools.cache
-def _get_tensor_grouped_kernel():
-    return w4a8_tensor_fp8_matmul_grouped_kernel
+def _get_block_grouped_kernel():
+    return w4a8_block_fp8_matmul_grouped_kernel
 
 
 @functools.cache
-def _get_tensor_batched_kernel():
-    return w4a8_tensor_fp8_matmul_batched_kernel
+def _get_block_batched_kernel():
+    return w4a8_block_fp8_matmul_batched_kernel
 
 
 @functools.cache
-def _get_tensor_kernel():
-    return w4a8_tensor_fp8_matmul_kernel
+def _get_block_kernel():
+    return w4a8_block_fp8_matmul_kernel
 
 
 def _resolve_block_k(block_size: list[int] | None, K: int) -> int:
@@ -378,12 +392,12 @@ def _expand_activation_scales_for_fp4(As: torch.Tensor, K: int, block_k: int) ->
     return As.repeat_interleave(block_k // FP4_SCALE_GROUP_K, dim=-1)
 
 
-def w4a8_tensor_fp8_matmul(
+def w4a8_block_fp8_matmul(
     A: torch.Tensor,
     As: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
-    block_size: list[int] | None = None,
+    block_size: list[int],
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     assert A.ndim == 2 and As.ndim == 2 and B.ndim == 2 and Bs.ndim == 2
@@ -391,7 +405,10 @@ def w4a8_tensor_fp8_matmul(
     assert B.dtype == torch.int8
     assert Bs.dtype == torch.float8_e8m0fnu
     assert As.dtype in (torch.float32, torch.float8_e8m0fnu)
-    assert A.is_contiguous() and As.is_contiguous() and B.is_contiguous() and Bs.is_contiguous()
+    assert A.is_contiguous() and B.is_contiguous()
+    assert len(block_size) == 2, (
+        f"block_size must be [block_n, block_k], got {block_size}"
+    )
 
     M, K = A.shape
     N, K_half = B.shape
@@ -403,17 +420,20 @@ def w4a8_tensor_fp8_matmul(
     )
     assert K % FP4_SCALE_GROUP_K == 0, f"K (={K}) must be a multiple of {FP4_SCALE_GROUP_K}"
 
+    is_tensor_scale_input = As.shape[-1] == 1
+    block_n = block_size[0]
     block_k = _resolve_block_k(block_size, K)
     As = _expand_activation_scales_for_fp4(As, K, block_k)
     assert As.shape == (M, K // FP4_SCALE_GROUP_K), f"As shape {tuple(As.shape)} != ({M}, {K // FP4_SCALE_GROUP_K})"
 
-    as_u8 = As.to(torch.float8_e8m0fnu).contiguous().view(torch.uint8)
-    sf_u8 = Bs.contiguous().view(torch.uint8)
-    block_n = DEFAULT_BLOCK_N if block_size is None else block_size[0]
+    as_u8 = As.to(torch.float8_e8m0fnu).view(torch.uint8)
+    sf_u8 = Bs.view(torch.uint8)
+    launch_block_n = DEFAULT_BLOCK_N if is_tensor_scale_input else block_n
+    launch_block_k = DEFAULT_BLOCK_K if is_tensor_scale_input and K % DEFAULT_BLOCK_K == 0 else block_k
     C = A.new_empty((M, N), dtype=output_dtype)
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
     with device_context(A.device):
-        _get_tensor_kernel()[grid](
+        _get_block_kernel()[grid](
             A,
             as_u8,
             B,
@@ -433,8 +453,8 @@ def w4a8_tensor_fp8_matmul(
             C.stride(0),
             C.stride(1),
             BLOCK_M=DEFAULT_BLOCK_M,
-            BLOCK_N=block_n,
-            BLOCK_K=block_k,
+            BLOCK_N=launch_block_n,
+            BLOCK_K=launch_block_k,
             GROUP_M=DEFAULT_GROUP_M,
             VALUES_PER_BYTE=FP4_VALUES_PER_BYTE,
             SCALE_GROUP_K=FP4_SCALE_GROUP_K,
@@ -451,18 +471,30 @@ def w4a8_fp8_matmul(
 ) -> torch.Tensor:
     assert A.ndim == 2
     assert A.dtype in (torch.bfloat16, torch.float16)
-    block_k = _resolve_block_k(block_size, A.shape[1])
+    N = B.shape[0]
+    K = A.shape[1]
+
+    if block_size is None:
+        block_size = [N, K]
+    block_k = _resolve_block_k(block_size, K)
     qA, As = fp8_act_quant(A, block_k)
-    return w4a8_tensor_fp8_matmul(qA, As, B, Bs, [DEFAULT_BLOCK_N if block_size is None else block_size[0], block_k], output_dtype)
+    return w4a8_block_fp8_matmul(
+        qA,
+        As,
+        B,
+        Bs,
+        [block_size[0], block_k],
+        output_dtype,
+    )
 
 
-def w4a8_tensor_fp8_matmul_batched(
+def w4a8_block_fp8_matmul_batched(
     A: torch.Tensor,
     As: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
-    block_size: list[int] | None = None,
+    block_size: list[int],
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     assert A.ndim == 2 and As.ndim == 2 and B.ndim == 3 and Bs.ndim == 3
@@ -471,6 +503,9 @@ def w4a8_tensor_fp8_matmul_batched(
     assert As.dtype in (torch.float32, torch.float8_e8m0fnu)
     assert B.dtype == torch.int8
     assert Bs.dtype == torch.float8_e8m0fnu
+    assert len(block_size) == 2, (
+        f"block_size must be [block_n, block_k], got {block_size}"
+    )
 
     S, K = A.shape
     E, N, K_half = B.shape
@@ -483,18 +518,24 @@ def w4a8_tensor_fp8_matmul_batched(
     )
     assert K % FP4_SCALE_GROUP_K == 0, f"K (={K}) must be a multiple of {FP4_SCALE_GROUP_K}"
 
+    is_tensor_scale_input = As.shape[-1] == 1
+    block_n = block_size[0]
     block_k = _resolve_block_k(block_size, K)
     As = _expand_activation_scales_for_fp4(As, K, block_k)
     assert As.shape == (S, K // FP4_SCALE_GROUP_K), f"As shape {tuple(As.shape)} != ({S}, {K // FP4_SCALE_GROUP_K})"
 
-    as_u8 = As.to(torch.float8_e8m0fnu).contiguous().view(torch.uint8)
-    sf_u8 = Bs.contiguous().view(torch.uint8)
-    expert_ids = expert_ids.to(device=A.device, dtype=torch.int32).contiguous()
-    block_n = DEFAULT_BLOCK_N if block_size is None else block_size[0]
+    as_u8 = As.to(torch.float8_e8m0fnu).view(torch.uint8)
+    sf_u8 = Bs.view(torch.uint8)
+    expert_ids = expert_ids.to(device=A.device, dtype=torch.int32)
+    launch_block_n = DEFAULT_BLOCK_N if is_tensor_scale_input else block_n
+    launch_block_k = DEFAULT_BLOCK_K if is_tensor_scale_input and K % DEFAULT_BLOCK_K == 0 else block_k
     C = A.new_empty((S, N), dtype=output_dtype)
-    grid = (S, triton.cdiv(N, block_n))
+    # Decode handles one routed row per program. Using BLOCK_M > 1 only
+    # duplicates the same row computation and keeps a single row on store.
+    block_m = 1
+    grid = (S, triton.cdiv(N, launch_block_n))
     with device_context(A.device):
-        _get_tensor_batched_kernel()[grid](
+        _get_block_batched_kernel()[grid](
             A,
             as_u8,
             B,
@@ -516,9 +557,10 @@ def w4a8_tensor_fp8_matmul_batched(
             sf_u8.stride(2),
             C.stride(0),
             C.stride(1),
-            BLOCK_M=DEFAULT_BLOCK_M,
-            BLOCK_N=block_n,
-            BLOCK_K=block_k,
+            expert_ids.stride(0),
+            BLOCK_M=block_m,
+            BLOCK_N=launch_block_n,
+            BLOCK_K=launch_block_k,
             VALUES_PER_BYTE=FP4_VALUES_PER_BYTE,
             SCALE_GROUP_K=FP4_SCALE_GROUP_K,
         )
@@ -535,29 +577,37 @@ def w4a8_fp8_matmul_batched(
 ) -> torch.Tensor:
     assert A.ndim == 2
     assert A.dtype in (torch.bfloat16, torch.float16)
-    block_k = _resolve_block_k(block_size, A.shape[1])
+    N = B.shape[1]
+    K = A.shape[1]
+
+    if block_size is None:
+        block_size = [N, K]
+    block_k = _resolve_block_k(block_size, K)
     qA, As = fp8_act_quant(A, block_k)
-    return w4a8_tensor_fp8_matmul_batched(
+    return w4a8_block_fp8_matmul_batched(
         qA,
         As,
         B,
         Bs,
         expert_ids,
-        [DEFAULT_BLOCK_N if block_size is None else block_size[0], block_k],
+        [block_size[0], block_k],
         output_dtype,
     )
 
 
-def w4a8_tensor_fp8_matmul_grouped(
+def w4a8_block_fp8_matmul_grouped(
     A: torch.Tensor,
     As: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
-    block_size: list[int] | None = None,
+    block_size: list[int],
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
+    assert len(block_size) == 2, (
+        f"block_size must be [block_n, block_k], got {block_size}"
+    )
     assert A.ndim == 2 and As.ndim == 2 and B.ndim == 3 and Bs.ndim == 3
     assert offsets.ndim == 1 and tokens_per_expert.ndim == 1
     assert A.dtype == torch.float8_e4m3fn
@@ -576,23 +626,25 @@ def w4a8_tensor_fp8_matmul_grouped(
     )
     assert K % FP4_SCALE_GROUP_K == 0, f"K (={K}) must be a multiple of {FP4_SCALE_GROUP_K}"
 
-    block_k = _resolve_block_k(block_size, K)
-    As = _expand_activation_scales_for_fp4(As, K, block_k)
+    is_tensor_scale_input = As.shape[-1] == 1
+    quant_block_k = _resolve_block_k(block_size, K)
+    As = _expand_activation_scales_for_fp4(As, K, quant_block_k)
     assert As.shape == (S, K // FP4_SCALE_GROUP_K), f"As shape {tuple(As.shape)} != ({S}, {K // FP4_SCALE_GROUP_K})"
 
-    as_u8 = As.to(torch.float8_e8m0fnu).contiguous().view(torch.uint8)
-    sf_u8 = Bs.contiguous().view(torch.uint8)
-    offsets = offsets.to(device=A.device, dtype=torch.int32).contiguous()
-    tokens_per_expert = tokens_per_expert.to(device=A.device, dtype=torch.int32).contiguous()
-    block_n = DEFAULT_BLOCK_N if block_size is None else block_size[0]
-    block_m = DEFAULT_BLOCK_M
+    as_u8 = As.to(torch.float8_e8m0fnu).view(torch.uint8)
+    sf_u8 = Bs.view(torch.uint8)
+    offsets = offsets.to(device=A.device, dtype=torch.int32)
+    tokens_per_expert = tokens_per_expert.to(device=A.device, dtype=torch.int32)
+    block_n = DEFAULT_BLOCK_N if is_tensor_scale_input else block_size[0]
+    launch_block_k = DEFAULT_BLOCK_K if is_tensor_scale_input and K % DEFAULT_BLOCK_K == 0 else quant_block_k
+    block_m = min(max(triton.next_power_of_2((S + E - 1) // E), 16), 128)
     C = A.new_empty((S, N), dtype=output_dtype)
     tiles_per_expert = (tokens_per_expert + block_m - 1) // block_m
     tile_offsets = torch.cumsum(tiles_per_expert, dim=0).to(torch.int32)
     max_m_tiles = triton.cdiv(S, block_m) + E
-    grid = (max_m_tiles, triton.cdiv(N, block_n))
+    grid = lambda META: (max_m_tiles, triton.cdiv(N, block_n))
     with device_context(A.device):
-        _get_tensor_grouped_kernel()[grid](
+        _get_block_grouped_kernel()[grid](
             A,
             as_u8,
             B,
@@ -615,10 +667,12 @@ def w4a8_tensor_fp8_matmul_grouped(
             sf_u8.stride(2),
             C.stride(0),
             C.stride(1),
+            offsets.stride(0),
+            tile_offsets.stride(0),
             NUM_EXPERTS=E,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
-            BLOCK_K=block_k,
+            BLOCK_K=launch_block_k,
             NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
             VALUES_PER_BYTE=FP4_VALUES_PER_BYTE,
             SCALE_GROUP_K=FP4_SCALE_GROUP_K,
@@ -637,15 +691,20 @@ def w4a8_fp8_matmul_grouped(
 ) -> torch.Tensor:
     assert A.ndim == 2
     assert A.dtype in (torch.bfloat16, torch.float16)
-    block_k = _resolve_block_k(block_size, A.shape[1])
+    N = B.shape[1]
+    K = A.shape[1]
+
+    if block_size is None:
+        block_size = [N, K]
+    block_k = _resolve_block_k(block_size, K)
     qA, As = fp8_act_quant(A, block_k)
-    return w4a8_tensor_fp8_matmul_grouped(
+    return w4a8_block_fp8_matmul_grouped(
         qA,
         As,
         B,
         Bs,
         offsets,
         tokens_per_expert,
-        [DEFAULT_BLOCK_N if block_size is None else block_size[0], block_k],
+        [block_size[0], block_k],
         output_dtype,
     )

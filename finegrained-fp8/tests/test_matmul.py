@@ -4,10 +4,39 @@ import pytest
 import torch
 
 import finegrained_fp8  # type: ignore
+import finegrained_fp8.fp4 as finegrained_fp4  # type: ignore
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
 FP8_DTYPE = torch.float8_e4m3fn
+TEST_DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else None
+)
+
+
+def _accelerator_available():
+    return TEST_DEVICE is not None
+
+
+def _make_weights_fp4_2d(out_features, in_features, device):
+    assert in_features % 32 == 0, f"K ({in_features}) must be divisible by 32 for FP4"
+    packed_k = in_features // 2
+    weights = torch.randint(-8, 8, (out_features, packed_k), dtype=torch.int8, device=device)
+    scales = torch.ones(
+        (out_features, in_features // 32), dtype=torch.float8_e8m0fnu, device=device
+    )
+    return weights.contiguous(), scales.contiguous()
+
+
+def _ref_fp4_matmul_rows(qA, As, B, Bs, block_size, output_dtype=torch.float32):
+    out = torch.empty(qA.shape[0], B.shape[0], dtype=output_dtype, device=qA.device)
+    for idx in range(qA.shape[0]):
+        out[idx] = finegrained_fp4.w4a8_block_fp8_matmul(
+            qA[idx : idx + 1], As[idx : idx + 1], B, Bs, block_size, output_dtype
+        )
+    return out
 
 
 def _quantize_weights(W, block_n, block_k):
@@ -91,13 +120,13 @@ else:
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
 @pytest.mark.parametrize("M,N,K,block_size", CASES, ids=lambda x: str(x))
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_matmul_correctness(M, N, K, block_size, dtype):
     """w8a8_fp8_matmul matches pure-PyTorch dequant+matmul reference."""
     torch.manual_seed(42)
-    device = "cuda"
+    device = TEST_DEVICE
 
     # Quantize weights
     W = torch.randn(N, K, dtype=torch.float32, device=device)
@@ -120,3 +149,31 @@ def test_matmul_correctness(M, N, K, block_size, dtype):
     torch.testing.assert_close(
         out, ref, atol=DTYPE_TO_TOL[dtype][0], rtol=DTYPE_TO_TOL[dtype][1]
     )
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
+def test_w4a8_tensor_matmul_vs_row_ref():
+    torch.manual_seed(0)
+    M, N, K = 32, 256, 512
+    A = torch.randn(M, K, dtype=torch.bfloat16, device=TEST_DEVICE)
+    B, Bs = _make_weights_fp4_2d(N, K, TEST_DEVICE)
+    qA, As = finegrained_fp8.fp8_act_quant(A, K)
+
+    out = finegrained_fp4.w4a8_block_fp8_matmul(qA, As, B, Bs, [N, K], torch.float32)
+    ref = _ref_fp4_matmul_rows(qA, As, B, Bs, [N, K], torch.float32)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
+def test_w4a8_block_matmul_vs_row_ref():
+    torch.manual_seed(0)
+    M, N, K = 32, 256, 512
+    A = torch.randn(M, K, dtype=torch.bfloat16, device=TEST_DEVICE)
+    B, Bs = _make_weights_fp4_2d(N, K, TEST_DEVICE)
+    qA, As = finegrained_fp8.fp8_act_quant(A, 128)
+
+    out = finegrained_fp4.w4a8_block_fp8_matmul(qA, As, B, Bs, [128, 128], torch.float32)
+    ref = _ref_fp4_matmul_rows(qA, As, B, Bs, [128, 128], torch.float32)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)

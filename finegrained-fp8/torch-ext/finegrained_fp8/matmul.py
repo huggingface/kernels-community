@@ -17,7 +17,7 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
-from .fp4 import w4a8_tensor_fp8_matmul
+from .fp4 import w4a8_block_fp8_matmul
 from .utils import device_context
 
 
@@ -426,6 +426,8 @@ def fp8_matmul(
     FP4-packed weights.
     """
     if B.dtype == torch.int8:
-        return w4a8_tensor_fp8_matmul(A, As, B, Bs, block_size, output_dtype)
+        if block_size is None:
+            block_size = [B.shape[0], A.shape[1]]
+        return w4a8_block_fp8_matmul(A, As, B, Bs, block_size, output_dtype)
 
     return w8a8_fp8_matmul(A, B, As, Bs, block_size, output_dtype)

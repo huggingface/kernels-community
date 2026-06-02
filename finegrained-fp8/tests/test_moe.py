@@ -9,12 +9,30 @@ import torch
 import triton
 
 import finegrained_fp8  # type: ignore
+import finegrained_fp8.fp4 as finegrained_fp4  # type: ignore
 
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
 FP8_DTYPE = torch.float8_e4m3fn
 BENCH_REPEATS = 10
+TEST_DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else None
+)
+
+
+def _accelerator_available():
+    return TEST_DEVICE is not None
+
+
+def _accelerator_module():
+    if TEST_DEVICE == "cuda":
+        return torch.cuda
+    if TEST_DEVICE == "xpu":
+        return torch.xpu
+    raise RuntimeError("No supported accelerator available for finegrained-fp8 tests")
 
 
 @dataclass(frozen=True)
@@ -176,6 +194,20 @@ def _make_experts_weights(num_experts, out_features, in_features, block_size, de
     return Wq, inv_scales
 
 
+def _make_experts_weights_fp4(num_experts, out_features, in_features, device):
+    assert in_features % 32 == 0, f"K ({in_features}) must be divisible by 32 for FP4"
+    packed_k = in_features // 2
+    weights = torch.randint(
+        -8, 8, (num_experts, out_features, packed_k), dtype=torch.int8, device=device
+    )
+    scales = torch.ones(
+        (num_experts, out_features, in_features // 32),
+        dtype=torch.float8_e8m0fnu,
+        device=device,
+    )
+    return weights.contiguous(), scales.contiguous()
+
+
 def _make_routed_inputs(S, E, K, dtype, device, top_k):
     """Build flattened routed inputs like FP8Experts paths."""
     assert top_k > 0
@@ -219,7 +251,7 @@ def _setup_problem(problem: Problem, dtype):
         problem.E,
         problem.K,
         dtype=dtype,
-        device="cuda",
+        device=TEST_DEVICE,
         top_k=problem.TOP_K,
     )
     B_fp8, Bs_block = _make_experts_weights(
@@ -227,10 +259,32 @@ def _setup_problem(problem: Problem, dtype):
         problem.N,
         problem.K,
         problem.block_size,
-        "cuda",
+        TEST_DEVICE,
     )
     Bs = _convert_scale_layout(Bs_block, problem.scale_layout)
     return A, expert_ids, B_fp8, Bs
+
+
+def _make_noncontiguous_1d(x: torch.Tensor) -> torch.Tensor:
+    base = torch.empty((x.numel(), 2), dtype=x.dtype, device=x.device)
+    base[:, 0] = x
+    base[:, 1] = x
+    return base[:, 0]
+
+
+def _make_noncontiguous_bs(x: torch.Tensor) -> torch.Tensor:
+    if x.ndim == 1:
+        return _make_noncontiguous_1d(x)
+
+    assert x.ndim == 3
+    base = torch.empty(
+        (*x.shape[:-1], x.shape[-1] * 2),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    base[..., ::2] = x
+    base[..., 1::2] = x
+    return base[..., ::2]
 
 
 def _prepare_grouped(A, expert_ids, num_experts):
@@ -242,6 +296,59 @@ def _prepare_grouped(A, expert_ids, num_experts):
     ).to(torch.int32)
     offsets = torch.cumsum(tokens_per_expert, dim=0).to(torch.int32)
     return A_sorted, expert_ids_sorted, offsets, tokens_per_expert
+
+
+def _ref_fp4_grouped(qA, As, B, Bs, offsets, output_dtype=torch.float32):
+    S = qA.shape[0]
+    out = torch.empty(S, B.shape[1], dtype=output_dtype, device=qA.device)
+    start = 0
+    for expert_id in range(B.shape[0]):
+        end = int(offsets[expert_id].item())
+        if end > start:
+            out[start:end] = finegrained_fp4.w4a8_block_fp8_matmul(
+                qA[start:end],
+                As[start:end],
+                B[expert_id],
+                Bs[expert_id],
+                [B.shape[1], qA.shape[1]],
+                output_dtype,
+            )
+        start = end
+    return out
+
+
+def _ref_fp4_grouped_block(qA, As, B, Bs, offsets, block_size, output_dtype=torch.float32):
+    S = qA.shape[0]
+    out = torch.empty(S, B.shape[1], dtype=output_dtype, device=qA.device)
+    start = 0
+    for expert_id in range(B.shape[0]):
+        end = int(offsets[expert_id].item())
+        if end > start:
+            out[start:end] = finegrained_fp4.w4a8_block_fp8_matmul(
+                qA[start:end],
+                As[start:end],
+                B[expert_id],
+                Bs[expert_id],
+                block_size,
+                output_dtype,
+            )
+        start = end
+    return out
+
+
+def _ref_fp4_batched(qA, As, B, Bs, expert_ids, block_size, output_dtype=torch.float32):
+    out = torch.empty(qA.shape[0], B.shape[1], dtype=output_dtype, device=qA.device)
+    for idx in range(qA.shape[0]):
+        expert_id = int(expert_ids[idx].item())
+        out[idx] = finegrained_fp4.w4a8_block_fp8_matmul(
+            qA[idx : idx + 1],
+            As[idx : idx + 1],
+            B[expert_id],
+            Bs[expert_id],
+            block_size,
+            output_dtype,
+        )
+    return out
 
 
 def _ref(A, B_fp8, Bs, expert_ids, block_size):
@@ -266,7 +373,7 @@ def _ref(A, B_fp8, Bs, expert_ids, block_size):
 
 # ── unified wrapper correctness/shape ──────────────────────────────────────────
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_batched_vs_ref(problem):
     torch.manual_seed(0)
@@ -279,7 +386,7 @@ def test_batched_vs_ref(problem):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_batched_output_shape(problem):
     A, expert_ids, B_fp8, Bs = _setup_problem(problem, dtype=torch.bfloat16)
@@ -291,7 +398,136 @@ def test_batched_output_shape(problem):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
+def test_w4a8_batched_noncontiguous_bs_and_expert_ids():
+    torch.manual_seed(0)
+    S, E, N, K = 8, 4, 256, 256
+    A = torch.randn(S, K, dtype=torch.bfloat16, device=TEST_DEVICE)
+    B = torch.randint(-8, 8, (E, N, K // 2), dtype=torch.int8, device=TEST_DEVICE)
+    Bs = torch.ones((E, N, K // 32), dtype=torch.float8_e8m0fnu, device=TEST_DEVICE)
+    expert_ids = torch.randint(0, E, (S,), dtype=torch.int32, device=TEST_DEVICE)
+
+    out = finegrained_fp8.fp8_matmul_batched(
+        A,
+        B,
+        _make_noncontiguous_bs(Bs),
+        _make_noncontiguous_1d(expert_ids),
+        [128, 128],
+    )
+    ref = finegrained_fp8.fp8_matmul_batched(A, B, Bs, expert_ids, [128, 128])
+    torch.testing.assert_close(out, ref)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
+def test_w4a8_batched_tensor_vs_ref():
+    torch.manual_seed(0)
+    S, E, N, K = 32, 4, 256, 512
+    A, expert_ids = _make_routed_inputs(
+        S,
+        E,
+        K,
+        dtype=torch.bfloat16,
+        device=TEST_DEVICE,
+        top_k=1,
+    )
+    B, Bs = _make_experts_weights_fp4(E, N, K, TEST_DEVICE)
+    qA, As = finegrained_fp8.fp8_act_quant(A, K)
+
+    out = finegrained_fp4.w4a8_block_fp8_matmul_batched(
+        qA, As, B, Bs, expert_ids, [N, K], torch.float32
+    )
+    ref = _ref_fp4_batched(qA, As, B, Bs, expert_ids, [N, K], torch.float32)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
+def test_w4a8_batched_block_vs_ref():
+    torch.manual_seed(0)
+    S, E, N, K = 32, 4, 256, 512
+    A, expert_ids = _make_routed_inputs(
+        S,
+        E,
+        K,
+        dtype=torch.bfloat16,
+        device=TEST_DEVICE,
+        top_k=1,
+    )
+    B, Bs = _make_experts_weights_fp4(E, N, K, TEST_DEVICE)
+    qA, As = finegrained_fp8.fp8_act_quant(A, 128)
+
+    out = finegrained_fp4.w4a8_block_fp8_matmul_batched(
+        qA, As, B, Bs, expert_ids, [128, 128], torch.float32
+    )
+    ref = _ref_fp4_batched(qA, As, B, Bs, expert_ids, [128, 128], torch.float32)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
+def test_w4a8_grouped_tensor_vs_ref():
+    torch.manual_seed(0)
+    S, E, N, K = 32, 4, 256, 512
+    A, expert_ids = _make_routed_inputs(
+        S,
+        E,
+        K,
+        dtype=torch.bfloat16,
+        device=TEST_DEVICE,
+        top_k=1,
+    )
+    B, Bs = _make_experts_weights_fp4(E, N, K, TEST_DEVICE)
+    A_sorted, _, offsets, tokens_per_expert = _prepare_grouped(A, expert_ids, E)
+    qA, As = finegrained_fp8.fp8_act_quant(A_sorted, K)
+
+    out = finegrained_fp4.w4a8_block_fp8_matmul_grouped(
+        qA,
+        As,
+        B,
+        Bs,
+        offsets,
+        tokens_per_expert,
+        [N, K],
+        torch.float32,
+    )
+    ref = _ref_fp4_grouped(qA, As, B, Bs, offsets)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
+def test_w4a8_grouped_block_vs_ref():
+    torch.manual_seed(0)
+    S, E, N, K = 32, 4, 256, 512
+    A, expert_ids = _make_routed_inputs(
+        S,
+        E,
+        K,
+        dtype=torch.bfloat16,
+        device=TEST_DEVICE,
+        top_k=1,
+    )
+    B, Bs = _make_experts_weights_fp4(E, N, K, TEST_DEVICE)
+    A_sorted, _, offsets, tokens_per_expert = _prepare_grouped(A, expert_ids, E)
+    qA, As = finegrained_fp8.fp8_act_quant(A_sorted, 128)
+
+    out = finegrained_fp4.w4a8_block_fp8_matmul_grouped(
+        qA,
+        As,
+        B,
+        Bs,
+        offsets,
+        tokens_per_expert,
+        [128, 128],
+        torch.float32,
+    )
+    ref = _ref_fp4_grouped_block(qA, As, B, Bs, offsets, [128, 128])
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_grouped_vs_ref(problem):
     torch.manual_seed(0)
@@ -312,7 +548,7 @@ def test_grouped_vs_ref(problem):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_grouped_output_shape(problem):
     A, expert_ids, B_fp8, Bs = _setup_problem(problem, dtype=torch.bfloat16)
@@ -331,11 +567,11 @@ def test_grouped_output_shape(problem):
 
 # ── torch.compile compatibility ────────────────────────────────────────────────
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
 def test_batched_compile():
     torch.manual_seed(0)
     torch.compiler.reset()
-    torch.cuda.empty_cache()
+    _accelerator_module().empty_cache()
 
     A, expert_ids, B_fp8, Bs = _setup_problem(COMPILE_PROBLEM, dtype=torch.bfloat16)
 
@@ -351,11 +587,11 @@ def test_batched_compile():
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
 def test_grouped_compile():
     torch.manual_seed(0)
     torch.compiler.reset()
-    torch.cuda.empty_cache()
+    _accelerator_module().empty_cache()
 
     A, expert_ids, B_fp8, Bs = _setup_problem(COMPILE_PROBLEM, dtype=torch.bfloat16)
     A_sorted, _, offsets, tokens_per_expert = _prepare_grouped(
@@ -378,8 +614,8 @@ def test_grouped_compile():
     torch.testing.assert_close(out_compiled, out_ref)
 
 
-def _bench_setup(problem: Problem, device="cuda"):
-    torch.cuda.empty_cache()
+def _bench_setup(problem: Problem, device=TEST_DEVICE):
+    _accelerator_module().empty_cache()
     torch.compiler.reset()
     torch.manual_seed(0)
     A, expert_ids = _make_routed_inputs(
@@ -429,7 +665,8 @@ def _measure_latency_over_repeats(fn, repeats: int = BENCH_REPEATS):
 
 
 @pytest.mark.benchmark
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="Latency baselines are calibrated for CUDA only")
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_batched_speedup(problem):
     if problem.expectation is None:
@@ -455,7 +692,8 @@ def test_batched_speedup(problem):
 
 
 @pytest.mark.benchmark
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not _accelerator_available(), reason="Accelerator not available")
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="Latency baselines are calibrated for CUDA only")
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_grouped_speedup(problem):
     if problem.expectation is None:

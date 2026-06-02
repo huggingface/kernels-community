@@ -49,3 +49,31 @@ Tensor-scale grouped expert matmul. Uses the same grouped scheduling as block mo
 - `w8a8_fp8_matmul_grouped`: tensor mode if `block_size is None` or `block_size == [N, K]`, else block mode.
 
 All kernels target Hopper (SM90) FP8 WGMMA instructions and are also compatible with ROCm and XPU backends via Triton.
+
+## Benchmarking
+
+Use the standalone benchmark script to compare current latency before and after kernel changes:
+
+```bash
+cd kernels-community/finegrained-fp8
+python benchmark_perf.py --op grouped --device xpu --preset deepseek_v4_gate_up_prefill --weight-format fp8 --compare-eager
+python benchmark_perf.py --op batched --device xpu --preset deepseek_v4_gate_up_decode --weight-format fp4 --compare-eager
+python benchmark_perf.py --op all --device xpu --preset deepseek_v4_gate_up_prefill --matmul-preset deepseek_v4_gate_up_prefill --weight-format fp8 --compare-eager --json /tmp/finegrained-fp8-perf.json
+```
+
+The script prints median/mean/min/max latency and effective TOPS. With `--compare-eager`, it also reports speedup over the matching torch reference baseline:
+
+- `--weight-format fp8` benchmarks FP8-weight kernels and compares against `torch_fp8_baseline`.
+- `--weight-format fp4` benchmarks FP4-weight kernels and compares against `torch_fp4_baseline`.
+
+- `torch_fp8_baseline` for FP8 weights
+- `torch_fp4_baseline` for FP4 weights
+
+This is useful for tracking grouped, batched, and matmul kernel improvements against a consistent non-kernel reference.
+
+The default presets now target DeepSeek-V4-style expert shapes:
+
+- `deepseek_v4_gate_up_*`: `E=256`, `top_k=6`, `N=4096`, `K=4096`
+- `deepseek_v4_down_*`: `E=256`, `top_k=6`, `N=4096`, `K=2048`
+
+Legacy `qwen3_*` presets are still available for regression comparison against the original MoE test shapes.
