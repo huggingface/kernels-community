@@ -31,30 +31,43 @@ def fatrelu_and_mul(out: torch.Tensor, x: torch.Tensor, threshold: float = 0.0) 
 
 
 def gelu(out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    if not x.is_contiguous():
+        x = x.contiguous()
     ops.gelu(out, x)
     return out
 
+
 def silu(out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    if not x.is_contiguous():
+        x = x.contiguous()
     ops.silu(out, x)
     return out
 
 
 def gelu_tanh(out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    if not x.is_contiguous():
+        x = x.contiguous()
     ops.gelu_tanh(out, x)
     return out
 
 
 def gelu_fast(out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    if not x.is_contiguous():
+        x = x.contiguous()
     ops.gelu_fast(out, x)
     return out
 
 
 def gelu_new(out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    if not x.is_contiguous():
+        x = x.contiguous()
     ops.gelu_new(out, x)
     return out
 
 
 def gelu_quick(out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    if not x.is_contiguous():
+        x = x.contiguous()
     ops.gelu_quick(out, x)
     return out
 
