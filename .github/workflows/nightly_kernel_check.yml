@@ -4,8 +4,6 @@ on:
   schedule:
     - cron: "0 2 * * *"
   workflow_dispatch:
-  # TODO: temporary — remove before merging. Runs the check on PRs for testing.
-  pull_request:
 
 jobs:
   kernels-check:
