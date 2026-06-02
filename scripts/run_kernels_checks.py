@@ -10,7 +10,7 @@ ORG = "kernels-community"
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=("Run `kernels check` for every top-level directory in the current repository.")
+        description=("Run `kernel-builder check-abi` for every top-level directory in the current repository.")
     )
     parser.add_argument(
         "--root",
@@ -24,7 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory name to skip. Can be passed multiple times. Defaults to .github.",
     )
     parser.add_argument(
-        "--clear-cache", action="store_true", help="Whether to clear the cache after running `kernels check`."
+        "--clear-cache",
+        action="store_true",
+        help="Whether to clear the cache after running `kernel-builder check-abi`.",
     )
     parser.add_argument(
         "--dry-run",
@@ -78,7 +80,7 @@ def _delete_kernel_cache(org: str, directory: str) -> None:
         logging.debug("Cache root %s does not exist; nothing to delete.", cache_root)
         return
 
-    pattern = f"models--{org}--{directory}*"
+    pattern = f"kernels--{org}--{directory}*"
     matches = list(cache_root.glob(pattern))
     if not matches:
         logging.debug(f"No cache entries matched {pattern} under {cache_root}.")
@@ -93,22 +95,53 @@ def _delete_kernel_cache(org: str, directory: str) -> None:
             logging.debug(f"Deleted cache entry {match}")
 
 
+def _download_kernel_build(repo_id: str) -> Path:
+    """Download the build variants of a Hub kernel and return the snapshot path.
+
+    `kernel-builder check-abi` operates on a local kernel directory containing a
+    `build/` folder with the compiled variants, so we fetch a snapshot from the
+    Hub before handing the path to the checker.
+    """
+    # Imported lazily so that `--dry-run` does not require the `kernels` package.
+    from kernels.utils import CACHE_DIR, _get_hf_api
+
+    snapshot = _get_hf_api().snapshot_download(
+        repo_id,
+        repo_type="kernel",
+        allow_patterns=["build/*"],
+        cache_dir=CACHE_DIR,
+    )
+    return Path(snapshot)
+
+
 def run_kernels_checks(directories: list[str], dry_run: bool, clear_cache: bool = False) -> list[str]:
     failures = []
     for directory in directories:
         target = f"{ORG}/{directory}"
-        command = f"kernels check {target}".split()
-        logging.info("🧪 Running %s", " ".join(command))
         if dry_run:
+            logging.info("🧪 Would run `kernel-builder check-abi` for %s", target)
             continue
+
+        logging.info("⬇️  Downloading build variants for %s", target)
+        try:
+            kernel_dir = _download_kernel_build(target)
+        except Exception as err:
+            logging.error(f"❌ Failed to download {target}: {err}")
+            failures.append(directory)
+            if clear_cache:
+                _delete_kernel_cache(ORG, directory)
+            continue
+
+        command = ["kernel-builder", "check-abi", str(kernel_dir)]
+        logging.info("🧪 Running %s", " ".join(command))
         try:
             completed = subprocess.run(command, check=False)
         except Exception as err:
             logging.error(f"❌ Execution failed for {directory}: {err}")
             failures.append(directory)
-            continue
-        if completed.returncode != 0:
-            failures.append(directory)
+        else:
+            if completed.returncode != 0:
+                failures.append(directory)
 
         if clear_cache:
             _delete_kernel_cache(ORG, directory)
@@ -142,7 +175,7 @@ def main() -> int:
     failures = run_kernels_checks(directories, args.dry_run, args.clear_cache)
     if failures:
         logging.error(
-            "❌ kernels check failed for %d directories: %s",
+            "❌ ABI check failed for %d directories: %s",
             len(failures),
             ", ".join(sorted(failures)),
         )

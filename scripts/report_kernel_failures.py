@@ -79,7 +79,7 @@ def main() -> int:
         return 0
 
     logging.error(
-        "❌ kernels check failed for %d directories: %s",
+        "❌ ABI check failed for %d directories: %s",
         len(failures),
         ", ".join(sorted(failures)),
     )
