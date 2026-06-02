@@ -1,0 +1,7 @@
+[general]
+name = "flash-attn-triton"
+license = "BSD-3-Clause"
+backends = ["cuda", "xpu", "mps"]
+
+[general.hub]
+repo-id = "kernels-community/flash-attn-triton"
