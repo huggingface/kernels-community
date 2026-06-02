@@ -20,12 +20,12 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "git+https://github.com/huggingface/kernels#subdirectory=kernels"
+          pip install "git+https://github.com/huggingface/kernels@COMMIT_SHA_REQUIRED#subdirectory=kernels"
 
       - name: Install kernel-builder
         # ABI checks now live in `kernel-builder check-abi`; install the binary
         # from the kernels repository so it is available on PATH.
-        run: cargo install --git https://github.com/huggingface/kernels hf-kernel-builder
+        run: cargo install --git https://github.com/huggingface/kernels --rev COMMIT_SHA_REQUIRED hf-kernel-builder
 
       - name: Run kernels checks and report failures
         env:
