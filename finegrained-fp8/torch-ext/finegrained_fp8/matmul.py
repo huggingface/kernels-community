@@ -41,7 +41,7 @@ def w8a8_block_fp8_matmul_kernel(
     A,  # (M, K) raw BF16/FP16 activations
     B,  # (N, K) FP8 weights
     C,  # (M, N) output
-    Bs,  # (N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales
+    Bs,  # (N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (fp32 or uint8/UE8M0)
     # Shape
     M,
     N,
@@ -91,6 +91,9 @@ def w8a8_block_fp8_matmul_kernel(
         a, a_s = fp8_act_quant_inline(a_raw)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
         b_s = tl.load(bs_ptrs + k * stride_bs_k)
+        if b_s.dtype == tl.uint8:
+            # UE8M0 decode: value = 2^(exp - 127); build the fp32 bit pattern.
+            b_s = (b_s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -171,6 +174,89 @@ def w8a8_tensor_fp8_matmul_kernel(
 
     accumulator = accumulator * a_s[:, None] * b_s
 
+    c = accumulator.to(C.dtype.element_ty)
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=w, num_stages=s)
+        for w in [2, 4, 8, 16]
+        for s in [2, 3, 4]
+    ],
+    key=["N", "K", "BLOCK_SIZE_M"],
+)
+@triton.jit
+def w8a8_static_block_fp8_matmul_kernel(
+    A,  # (M, K) raw BF16/FP16 activations
+    B,  # (N, K) FP8 weights
+    C,  # (M, N) output
+    As,  # scalar — static per-tensor activation scale (calibration-time)
+    Bs,  # (N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (fp32 or uint8/UE8M0)
+    # Shape
+    M,
+    N,
+    K,
+    # Strides
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_bs_k,
+    stride_bs_n,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """Block-scale FP8 GEMM with static (per-tensor) activation scale.
+
+    ``A`` is raw bf16/fp16; the kernel divides by the scalar ``As`` and casts
+    to FP8 inline. Per-block weight scales apply per-K-tile during
+    accumulation; the scalar activation scale factors out of the loop and
+    is applied once at the end.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+    offs_bsn = offs_bn // BLOCK_SIZE_N
+    bs_ptrs = Bs + offs_bsn * stride_bs_n
+    a_s_static = tl.load(As)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_remaining = K - k * BLOCK_SIZE_K
+        a_raw = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0).to(
+            tl.float32
+        )
+        a = (a_raw / a_s_static).to(tl.float8e4nv)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
+        b_s = tl.load(bs_ptrs + k * stride_bs_k)
+        if b_s.dtype == tl.uint8:
+            # UE8M0 decode: value = 2^(exp - 127); build the fp32 bit pattern.
+            b_s = (b_s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        accumulator += tl.dot(a, b) * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    accumulator = accumulator * a_s_static
     c = accumulator.to(C.dtype.element_ty)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -310,12 +396,98 @@ def _w8a8_block_fp8_matmul(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m(M)
+    # UE8M0 scales: pass as uint8 (Triton binder doesn't recognize
+    # float8_e8m0fnu); kernel decodes 2^(exp-127) inline.
+    if Bs.dtype == torch.float8_e8m0fnu:
+        Bs = Bs.view(torch.uint8)
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
     with device_context(A.device):
         wrap_triton(w8a8_block_fp8_matmul_kernel)[grid](
             A,
             B,
             C,
+            Bs,
+            M,
+            N,
+            K,
+            A.stride(-2),
+            A.stride(-1),
+            B.stride(1),
+            B.stride(0),
+            C.stride(-2),
+            C.stride(-1),
+            Bs.stride(1),
+            Bs.stride(0),
+            # Meta-parameters
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            GROUP_SIZE_M=8,
+        )
+
+    return C
+
+
+@triton_op("finegrained_fp8::w8a8_static_block_fp8_matmul", mutates_args=())
+def _w8a8_static_block_fp8_matmul(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    As: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Block-scale FP8 matmul with static (per-tensor) activation quantization.
+
+    A:  (..., K) raw bf16/fp16 activations — quantized to FP8 inline against ``As``
+    B:  (N, K) FP8 weights
+    Bs: (N // block_n, K // block_k) per-block weight scales
+    As: scalar / (1,) — per-tensor static activation scale
+    """
+    assert len(block_size) == 2, (
+        f"block_size must be [block_n, block_k], got {block_size}"
+    )
+    block_n, block_k = block_size[0], block_size[1]
+
+    assert B.dtype != torch.int8, (
+        "static activation quant is not supported on the FP4 path"
+    )
+    assert not (block_n == B.size(0) and block_k == B.size(1)), (
+        "static activation quant requires block-wise weights, not tensor-mode"
+    )
+    assert A.shape[-1] == B.shape[-1], (
+        f"K mismatch: A has K={A.shape[-1]}, B has K={B.shape[-1]}"
+    )
+    assert A.is_contiguous(), "A must be contiguous"
+    assert B.ndim == 2, f"B must be 2D (N, K), got ndim={B.ndim}"
+    assert B.is_contiguous(), "B must be contiguous"
+    assert As.numel() == 1, f"As must be scalar or (1,), got {tuple(As.shape)}"
+
+    N, K = B.shape
+    M = A.numel() // A.shape[-1]
+
+    assert Bs.ndim == 2, f"Bs must be 2D (N//block_n, K//block_k), got ndim={Bs.ndim}"
+    assert Bs.shape == (triton.cdiv(N, block_n), triton.cdiv(K, block_k)), (
+        f"Bs shape {tuple(Bs.shape)} != expected ({triton.cdiv(N, block_n)}, {triton.cdiv(K, block_k)})"
+    )
+
+    As = As.reshape(1).to(torch.float32)
+    BLOCK_SIZE_K = block_k
+    BLOCK_SIZE_N = block_n
+    C_shape = A.shape[:-1] + (N,)
+    C = A.new_empty(C_shape, dtype=output_dtype)
+    BLOCK_SIZE_M = adaptive_block_size_m(M)
+    # UE8M0 scales: pass as uint8 (Triton binder doesn't recognize
+    # float8_e8m0fnu); kernel decodes 2^(exp-127) inline.
+    if Bs.dtype == torch.float8_e8m0fnu:
+        Bs = Bs.view(torch.uint8)
+    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+    with device_context(A.device):
+        wrap_triton(w8a8_static_block_fp8_matmul_kernel)[grid](
+            A,
+            B,
+            C,
+            As,
             Bs,
             M,
             N,
@@ -497,6 +669,32 @@ def w8a8_block_fp8_matmul(
     )
 
 
+def w8a8_static_block_fp8_matmul(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    As: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Block-wise W8A8 FP8 matmul with static (per-tensor) activation quantization.
+
+    Args:
+        A: Pre-quantized activation tensor ``[..., M, K]`` in ``float8_e4m3fn``.
+        B: FP8 weight tensor ``[N, K]`` in ``float8_e4m3fn``.
+        Bs: Per-block weight scales ``[N // block_size[0], K // block_size[1]]``.
+        As: Static per-tensor activation scale (scalar or ``[1]``).
+        block_size: ``[block_n, block_k]`` weight quantization block dimensions.
+        output_dtype: dtype of the returned tensor (default: ``torch.float32``).
+
+    Returns:
+        Output tensor ``[..., M, N]`` in ``output_dtype``.
+    """
+    return torch.ops.finegrained_fp8.w8a8_static_block_fp8_matmul(
+        A, B, Bs, As, block_size, output_dtype
+    )
+
+
 def w8a8_tensor_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -545,17 +743,27 @@ def matmul(
     Bs: torch.Tensor,
     block_size: list[int] | None,
     output_dtype: torch.dtype = torch.float32,
+    activation_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Quantized matmul dispatcher (W8A8 FP8 or W4A8 FP4). ``A`` is raw
-    bf16/fp16/fp32 — every path fuses activation quantization internally.
+    """Quantized matmul dispatcher (W8A8 FP8 or W4A8 FP4).
+
+    ``A`` is always raw bf16/fp16/fp32; quantization is fused into every path.
+    With ``activation_scale`` set, the kernel uses that per-tensor scalar
+    (static quant); otherwise it computes its own scale from ``A`` (dynamic).
 
     Routes by weight dtype and ``block_size``:
     - ``B.dtype == int8`` (packed FP4) → ``w4a8_fp4_matmul``
       (``block_size`` is ignored; FP4 scale granularity is fixed at 32 and
       tile sizes are autotuned).
     - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_fp8_matmul``.
-    - otherwise → ``w8a8_block_fp8_matmul``.
+    - otherwise → ``w8a8_block_fp8_matmul`` (or its static variant when
+      ``activation_scale`` is given).
     """
+    if activation_scale is not None:
+        return w8a8_static_block_fp8_matmul(
+            A, B, Bs, activation_scale, block_size, output_dtype
+        )
+
     if B.dtype == torch.int8:
         return w4a8_fp4_matmul(A, B, Bs, output_dtype)
 

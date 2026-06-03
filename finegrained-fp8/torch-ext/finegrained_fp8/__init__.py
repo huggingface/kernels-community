@@ -15,6 +15,7 @@ from .matmul import (
     matmul,
     w4a8_fp4_matmul,
     w8a8_block_fp8_matmul,
+    w8a8_static_block_fp8_matmul,
     w8a8_tensor_fp8_matmul,
 )
 
@@ -24,6 +25,7 @@ __all__ = [
     "matmul",
     "w4a8_fp4_matmul",
     "w8a8_block_fp8_matmul",
+    "w8a8_static_block_fp8_matmul",
     "w8a8_tensor_fp8_matmul",
     # Batched matmul
     "matmul_batched",

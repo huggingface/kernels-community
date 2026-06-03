@@ -11,8 +11,10 @@ from utils import (  # type: ignore
     DTYPE_TO_TOL,
     SUPPORTS_FP4,
     TEST_DEVICE,
+    accelerator_module,
     make_fp4_weights,
     make_fp8_weights,
+    make_static_activation_scale,
     ref_matmul,
 )
 
@@ -25,8 +27,11 @@ class Problem:
     N: int
     K: int
     block_size: Optional[Tuple[int, int]] = None
+    weight_scale_dtype: torch.dtype = torch.float32
+    static_activation_scale: bool = False
     dtype: torch.dtype = torch.bfloat16
     weight_format: str = "fp8"
+    compile: bool = False
 
     @property
     def id(self) -> str:
@@ -38,7 +43,14 @@ class Problem:
             tail = f"{head}_tensor"
         else:
             tail = f"{head}_b{self.block_size[0]}x{self.block_size[1]}"
-        return f"{tail}_{DTYPE_TAG[self.dtype]}"
+        tail = f"{tail}_{DTYPE_TAG[self.dtype]}"
+        if self.weight_scale_dtype is torch.float8_e8m0fnu:
+            tail = f"{tail}_ue8m0"
+        if self.static_activation_scale:
+            tail = f"{tail}_static"
+        if self.compile:
+            tail = f"{tail}_compile"
+        return tail
 
 
 PROBLEMS = [
@@ -51,6 +63,31 @@ PROBLEMS = [
     # fp16 / fp32 dtype coverage
     Problem(M=16, N=320, K=1024, block_size=(128, 128), dtype=torch.float16),
     Problem(M=16, N=320, K=1024, block_size=(128, 128), dtype=torch.float32),
+    # UE8M0 weight scales (DSv4-Flash style)
+    Problem(
+        M=16,
+        N=320,
+        K=1024,
+        block_size=(128, 128),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+    ),
+    # Static activation scale (calibration-time per-tensor)
+    Problem(
+        M=16,
+        N=320,
+        K=1024,
+        block_size=(128, 128),
+        static_activation_scale=True,
+    ),
+    Problem(
+        M=16,
+        N=1024,
+        K=2048,
+        block_size=(128, 128),
+        static_activation_scale=True,
+    ),
+    # torch.compile compatibility
+    Problem(M=16, N=320, K=1024, block_size=(128, 128), compile=True),
 ]
 if SUPPORTS_FP4:
     # ``block_size`` is ignored on the FP4 path (tile shape autotuned).
@@ -58,14 +95,27 @@ if SUPPORTS_FP4:
         Problem(M=32, N=256, K=512, weight_format="fp4"),
         Problem(M=32, N=256, K=512, weight_format="fp4", dtype=torch.float16),
         Problem(M=32, N=256, K=512, weight_format="fp4", dtype=torch.float32),
+        Problem(M=32, N=256, K=512, weight_format="fp4", compile=True),
     ]
 
 
-COMPILE_PROBLEMS = [
-    Problem(M=16, N=320, K=1024, block_size=(128, 128)),
-]
-if SUPPORTS_FP4:
-    COMPILE_PROBLEMS += [Problem(M=32, N=256, K=512, weight_format="fp4")]
+def _setup_problem(problem: Problem):
+    torch.manual_seed(42)
+    A = torch.randn(problem.M, problem.K, dtype=problem.dtype, device=TEST_DEVICE)
+    if problem.weight_format == "fp4":
+        B, Bs = make_fp4_weights(problem.N, problem.K, TEST_DEVICE)
+    else:
+        B, Bs = make_fp8_weights(
+            problem.N,
+            problem.K,
+            TEST_DEVICE,
+            problem.block_size,
+            scale_dtype=problem.weight_scale_dtype,
+        )
+    a_scale = (
+        make_static_activation_scale(A) if problem.static_activation_scale else None
+    )
+    return A, B, Bs, a_scale
 
 
 @pytest.mark.kernels_ci
@@ -73,40 +123,29 @@ if SUPPORTS_FP4:
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_matmul(problem: Problem):
     """``matmul`` matches the pure-PyTorch dequant+matmul reference."""
-    torch.manual_seed(42)
-    device = TEST_DEVICE
-    A = torch.randn(problem.M, problem.K, dtype=torch.bfloat16, device=device)
-
-    if problem.weight_format == "fp4":
-        B, Bs = make_fp4_weights(problem.N, problem.K, device)
-    else:
-        B, Bs = make_fp8_weights(problem.N, problem.K, device, problem.block_size)
-
-    out = finegrained_fp8.matmul(A, B, Bs, problem.block_size, problem.dtype)
-    ref = ref_matmul(A, B, Bs, problem.block_size, problem.dtype)
+    A, B, Bs, a_scale = _setup_problem(problem)
+    matmul = finegrained_fp8.matmul
+    if problem.compile:
+        torch.compiler.reset()
+        accelerator_module().empty_cache()
+        matmul = torch.compile(matmul, mode="max-autotune", fullgraph=True)
+    out = matmul(
+        A,
+        B,
+        Bs,
+        problem.block_size,
+        problem.dtype,
+        activation_scale=a_scale,
+    )
+    ref = ref_matmul(
+        A,
+        B,
+        Bs,
+        problem.block_size,
+        problem.dtype,
+        activation_scale=a_scale,
+    )
     assert out.dtype == problem.dtype
     assert out.shape == (problem.M, problem.N)
     atol, rtol = DTYPE_TO_TOL[problem.dtype]
     torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
-
-
-# ── torch.compile compatibility ────────────────────────────────────────────────
-@pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-@pytest.mark.parametrize("problem", COMPILE_PROBLEMS, ids=lambda p: p.id)
-def test_matmul_compile(problem: Problem):
-    torch.manual_seed(0)
-    torch.compiler.reset()
-    A = torch.randn(problem.M, problem.K, dtype=torch.bfloat16, device=TEST_DEVICE)
-    if problem.weight_format == "fp4":
-        B, Bs = make_fp4_weights(problem.N, problem.K, TEST_DEVICE)
-    else:
-        B, Bs = make_fp8_weights(problem.N, problem.K, TEST_DEVICE, problem.block_size)
-
-    def fn(A, B, Bs):
-        return finegrained_fp8.matmul(A, B, Bs, problem.block_size, torch.bfloat16)
-
-    compiled = torch.compile(fn, mode="max-autotune", fullgraph=True)
-    out_compiled = compiled(A, B, Bs)
-    out_ref = fn(A, B, Bs)
-    torch.testing.assert_close(out_compiled, out_ref)

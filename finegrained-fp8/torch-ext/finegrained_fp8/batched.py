@@ -99,6 +99,9 @@ def w8a8_block_fp8_matmul_batched_kernel(
         a, a_s = fp8_act_quant_inline(a_raw)
         b = tl.load(b_ptrs)
         b_s = tl.load(bs_ptrs + k * stride_bs_k)
+        if b_s.dtype == tl.uint8:
+            # UE8M0 decode: value = 2^(exp - 127); build the fp32 bit pattern.
+            b_s = (b_s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -337,6 +340,10 @@ def _w8a8_block_fp8_matmul_batched(
 
     C = A.new_empty(S, N)
     BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
+    # UE8M0 scales: pass as uint8 (Triton binder doesn't recognize
+    # float8_e8m0fnu); kernel decodes 2^(exp-127) inline.
+    if Bs.dtype == torch.float8_e8m0fnu:
+        Bs = Bs.view(torch.uint8)
     grid = (S, triton.cdiv(N, block_n))
     with device_context(A.device):
         wrap_triton(w8a8_block_fp8_matmul_batched_kernel)[grid](

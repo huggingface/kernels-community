@@ -61,10 +61,24 @@ FP8_MAX = torch.finfo(FP8_DTYPE).max
 FP8_MIN = torch.finfo(FP8_DTYPE).min
 
 
-def make_fp8_weights(out_features, in_features, device, block_size, num_experts=None):
+def make_fp8_weights(
+    out_features,
+    in_features,
+    device,
+    block_size,
+    num_experts=None,
+    scale_dtype=torch.float32,
+):
     """Random FP8 weights with block-wise inv-scales. ``num_experts`` toggles 2D
     (linear) vs 3D (MoE experts). Non-aligned ``out_features``/``in_features``
-    are padded to block boundaries before quantizing, then trimmed back."""
+    are padded to block boundaries before quantizing, then trimmed back.
+
+    ``scale_dtype`` selects the inv-scale storage:
+    - ``torch.float32`` (default): standard per-block fp32 scales.
+    - ``torch.float8_e8m0fnu``: UE8M0 (DSv4-Flash style) — inv-scales snapped
+      up to the nearest power-of-2 and re-quantization done against the snapped
+      scale so dequant exactly matches storage.
+    """
     is_2d = num_experts is None
     E = 1 if is_2d else num_experts
     W = torch.randn(E, out_features, in_features, dtype=torch.float32, device=device)
@@ -78,16 +92,43 @@ def make_fp8_weights(out_features, in_features, device, block_size, num_experts=
     R = W.reshape(E, Np // block_n, block_n, Kp // block_k, block_k)
     max_abs = R.abs().amax(dim=(-3, -1))
     safe = torch.where(max_abs > 0, max_abs, torch.ones_like(max_abs))
-    scale = FP8_MAX / safe
+    inv_scales = (safe / FP8_MAX).to(torch.float32)
+
+    if scale_dtype == torch.float8_e8m0fnu:
+        # Snap inv_scales up to next power-of-2 (UE8M0 encoding: 2^(exp-127)).
+        bits = inv_scales.contiguous().view(torch.int32)
+        exp_ceil = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+        exp_ceil = exp_ceil.clamp(1, 254)
+        inv_scales = (exp_ceil << 23).view(torch.float32)
+
+    scale = 1.0 / inv_scales
     Wq = (R * scale.unsqueeze(-1).unsqueeze(-3)).clamp(FP8_MIN, FP8_MAX).to(FP8_DTYPE)
     Wq = Wq.reshape(E, Np, Kp)[:, :out_features, :in_features].contiguous()
-    inv_scales = (1.0 / scale).to(torch.float32)
+
+    if scale_dtype == torch.float8_e8m0fnu:
+        inv_scales = exp_ceil.to(torch.uint8).view(torch.float8_e8m0fnu)
+
     return (Wq.squeeze(0), inv_scales.squeeze(0)) if is_2d else (Wq, inv_scales)
 
 
-def quant_dequant_a_fp8(A: torch.Tensor, block_k: int) -> torch.Tensor:
-    """Mirror the FP8 kernel's inline act-quant in fp32: per-row, per-block_k
-    fp32 scale = ``amax / 448``; quantize and multiply back by the scale."""
+def make_static_activation_scale(A: torch.Tensor) -> torch.Tensor:
+    """Calibration-style per-tensor static activation scale: ``amax / 448``,
+    floored at 1e-12 to avoid div-by-zero on all-zero inputs."""
+    return (A.abs().amax() / 448.0).clamp(min=1e-12).to(torch.float32)
+
+
+def quant_dequant_a_fp8(
+    A: torch.Tensor, block_k: int, scale: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Mirror the FP8 kernel's inline act-quant in fp32.
+
+    Dynamic (``scale=None``): per-row, per-block_k fp32 scale = ``amax / 448``;
+    quantize and multiply back. Static (scalar ``scale``): use the given
+    calibration scale for the whole tensor.
+    """
+    if scale is not None:
+        A_fp8 = (A.float() / scale).to(FP8_DTYPE)
+        return A_fp8.float() * scale
     M, K = A.shape
     groups = A.float().reshape(M, K // block_k, block_k)
     s = groups.abs().amax(dim=-1) / 448.0
@@ -98,7 +139,10 @@ def quant_dequant_a_fp8(A: torch.Tensor, block_k: int) -> torch.Tensor:
 def dequant_b_fp8(
     B: torch.Tensor, Bs: torch.Tensor, block_n: int, block_k: int
 ) -> torch.Tensor:
-    """Per-block FP8 weight dequant via broadcasted block scales."""
+    """Per-block FP8 weight dequant via broadcasted block scales. ``Bs`` may be
+    ``float32`` or ``float8_e8m0fnu`` (UE8M0; decoded as ``2^(exp - 127)``)."""
+    if Bs.dtype == torch.float8_e8m0fnu:
+        Bs = (Bs.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
     N, K = B.shape
     scales_full = Bs.repeat_interleave(block_n, dim=0).repeat_interleave(
         block_k, dim=1
@@ -178,15 +222,16 @@ def dequant_b_fp4(B: torch.Tensor, Bs: torch.Tensor) -> torch.Tensor:
 # ── Unified matmul reference ──────────────────────────────────────────────────
 
 
-def ref_matmul(A, B, Bs, block_size, output_dtype=torch.float32):
+def ref_matmul(A, B, Bs, block_size, output_dtype=torch.float32, activation_scale=None):
     """Pure-PyTorch reference for ``matmul``: quant+dequant both sides, fp32
-    matmul, cast to output. Dispatches on ``B.dtype``."""
+    matmul, cast to output. Dispatches on ``B.dtype``. ``activation_scale``
+    selects the static-quant path (single calibration scalar on FP8)."""
     if B.dtype == torch.int8:
         A_deq = quant_dequant_a_fp4(A)
         B_deq = dequant_b_fp4(B, Bs)
     else:
         N, K = B.shape
         block_n, block_k = block_size if block_size is not None else (N, K)
-        A_deq = quant_dequant_a_fp8(A, block_k)
+        A_deq = quant_dequant_a_fp8(A, block_k, scale=activation_scale)
         B_deq = dequant_b_fp8(B, Bs, block_n, block_k)
     return (A_deq @ B_deq.T).to(output_dtype)

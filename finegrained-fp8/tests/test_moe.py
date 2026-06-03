@@ -45,6 +45,7 @@ class Problem:
     sentinel_fraction: float = 0.0
     weight_format: str = "fp8"
     contiguous: bool = True
+    compile: bool = False
 
     @property
     def id(self):
@@ -65,6 +66,8 @@ class Problem:
         tail = f"{tail}_{contig_tag}_{DTYPE_TAG[self.dtype]}"
         if self.sentinel_fraction > 0:
             tail = f"{tail}_sentinel"
+        if self.compile:
+            tail = f"{tail}_compile"
         return tail
 
 
@@ -180,6 +183,17 @@ PROBLEMS = [
         block_size=(128, 128),
         sentinel_fraction=0.875,
     ),
+    # torch.compile compatibility
+    Problem(
+        S=8,
+        E=4,
+        N=256,
+        K=256,
+        TOP_K=1,
+        scale_layout="block",
+        block_size=(128, 128),
+        compile=True,
+    ),
     # fp16 / fp32 dtype coverage on the smallest FP8 shape
     Problem(
         S=8,
@@ -270,6 +284,18 @@ if SUPPORTS_FP4:
             weight_format="fp4",
             sentinel_fraction=0.875,
         ),
+        # torch.compile compatibility on FP4
+        Problem(
+            S=32,
+            E=4,
+            N=256,
+            K=512,
+            TOP_K=2,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
+            compile=True,
+        ),
         # fp16 / fp32 dtype coverage on the smallest FP4 shape
         Problem(
             S=32,
@@ -292,31 +318,6 @@ if SUPPORTS_FP4:
             block_size=None,
             weight_format="fp4",
             dtype=torch.float32,
-        ),
-    ]
-
-COMPILE_PROBLEMS = [
-    Problem(
-        S=8,
-        E=4,
-        N=256,
-        K=256,
-        TOP_K=1,
-        scale_layout="block",
-        block_size=(128, 128),
-    ),
-]
-if SUPPORTS_FP4:
-    COMPILE_PROBLEMS += [
-        Problem(
-            S=32,
-            E=4,
-            N=256,
-            K=512,
-            TOP_K=2,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
         ),
     ]
 
@@ -439,9 +440,7 @@ def _assert_correctness(out, ref, expert_ids, problem):
     assert out.dtype == problem.dtype
     local_mask = expert_ids.to(torch.int64) < problem.E
     atol, rtol = DTYPE_TO_TOL[problem.dtype]
-    torch.testing.assert_close(
-        out[local_mask], ref[local_mask], atol=atol, rtol=rtol
-    )
+    torch.testing.assert_close(out[local_mask], ref[local_mask], atol=atol, rtol=rtol)
 
 
 @pytest.mark.kernels_ci
@@ -450,7 +449,14 @@ def _assert_correctness(out, ref, expert_ids, problem):
 def test_batched(problem):
     torch.manual_seed(0)
     A, expert_ids, B, Bs = _setup_problem(problem, dtype=problem.dtype)
-    out = finegrained_fp8.matmul_batched(A, B, Bs, expert_ids, problem.block_size)
+    matmul_batched = finegrained_fp8.matmul_batched
+    if problem.compile:
+        torch.compiler.reset()
+        accelerator_module().empty_cache()
+        matmul_batched = torch.compile(
+            matmul_batched, mode="max-autotune", fullgraph=True
+        )
+    out = matmul_batched(A, B, Bs, expert_ids, problem.block_size)
     ref = _routed_matmul_ref(A, B, Bs, expert_ids, problem.block_size)
     _assert_correctness(out, ref, expert_ids, problem)
 
@@ -464,56 +470,18 @@ def test_grouped(problem):
     A_sorted, expert_ids_sorted, offsets, tokens_per_expert = _prepare_grouped(
         A, expert_ids, problem.E, contiguous=problem.contiguous
     )
-    out = finegrained_fp8.matmul_grouped(
+    matmul_grouped = finegrained_fp8.matmul_grouped
+    if problem.compile:
+        torch.compiler.reset()
+        accelerator_module().empty_cache()
+        matmul_grouped = torch.compile(
+            matmul_grouped, mode="max-autotune", fullgraph=True
+        )
+    out = matmul_grouped(
         A_sorted, B, Bs, offsets, tokens_per_expert, problem.block_size
     )
     ref = _routed_matmul_ref(A_sorted, B, Bs, expert_ids_sorted, problem.block_size)
     _assert_correctness(out, ref, expert_ids_sorted, problem)
-
-
-# ── torch.compile compatibility ────────────────────────────────────────────────
-@pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-@pytest.mark.parametrize("problem", COMPILE_PROBLEMS, ids=lambda p: p.id)
-def test_batched_compile(problem):
-    torch.manual_seed(0)
-    torch.compiler.reset()
-    accelerator_module().empty_cache()
-    A, expert_ids, B, Bs = _setup_problem(problem, dtype=torch.bfloat16)
-
-    def fn(A, B, Bs, expert_ids):
-        return finegrained_fp8.matmul_batched(A, B, Bs, expert_ids, problem.block_size)
-
-    compiled = torch.compile(fn, mode="max-autotune", fullgraph=True)
-    out_compiled = compiled(A, B, Bs, expert_ids)
-    out_ref = fn(A, B, Bs, expert_ids)
-    torch.testing.assert_close(out_compiled, out_ref)
-
-
-@pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-@pytest.mark.parametrize("problem", COMPILE_PROBLEMS, ids=lambda p: p.id)
-def test_grouped_compile(problem):
-    torch.manual_seed(0)
-    torch.compiler.reset()
-    accelerator_module().empty_cache()
-    A, expert_ids, B, Bs = _setup_problem(problem, dtype=torch.bfloat16)
-    A_sorted, _, offsets, tokens_per_expert = _prepare_grouped(A, expert_ids, problem.E)
-
-    def fn(A_sorted, B, Bs, offsets, tokens_per_expert):
-        return finegrained_fp8.matmul_grouped(
-            A_sorted,
-            B,
-            Bs,
-            offsets,
-            tokens_per_expert,
-            problem.block_size,
-        )
-
-    compiled = torch.compile(fn, mode="max-autotune", fullgraph=True)
-    out_compiled = compiled(A_sorted, B, Bs, offsets, tokens_per_expert)
-    out_ref = fn(A_sorted, B, Bs, offsets, tokens_per_expert)
-    torch.testing.assert_close(out_compiled, out_ref)
 
 
 def _bench_setup(problem: Problem, device=TEST_DEVICE):
