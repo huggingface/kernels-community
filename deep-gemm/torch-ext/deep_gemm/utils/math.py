@@ -18,7 +18,12 @@ def ceil_to_ue8m0(x: torch.Tensor):
 
 def pack_ue8m0_to_int(x: torch.Tensor):
     assert x.dtype == torch.float and x.size(-1) % 4 == 0
-    assert (x.view(torch.int) & ((1 << 23) - 1) == 0).all()
+    # Mantissa-is-zero precondition forces a GPU→CPU readback (kills cudagraph
+    # capture, breaks `torch.compile(fullgraph=True)` via unbacked symbols), so
+    # skip it under trace. Callers go through `ceil_to_ue8m0` which zeros the
+    # mantissa, so the eager-only check is sufficient.
+    if not torch.compiler.is_compiling():
+        assert (x.view(torch.int) & 0x7FFFFF == 0).all()
     return (x.view(torch.int) >> 23).to(torch.uint8).view(torch.int)
 
 
