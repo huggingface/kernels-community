@@ -42,6 +42,7 @@ class Problem:
     block_size: Optional[Tuple[int, int]] = None
     expectation: Optional[Expectations] = None
     dtype: torch.dtype = torch.bfloat16
+    sentinel_fraction: float = 0.0
     weight_format: str = "fp8"
     contiguous: bool = True
 
@@ -61,7 +62,10 @@ class Problem:
         else:
             tail = f"{head}_b{self.block_size[0]}x{self.block_size[1]}"
         contig_tag = "contiguous" if self.contiguous else "noncontiguous"
-        return f"{tail}_{contig_tag}_{DTYPE_TAG[self.dtype]}"
+        tail = f"{tail}_{contig_tag}_{DTYPE_TAG[self.dtype]}"
+        if self.sentinel_fraction > 0:
+            tail = f"{tail}_sentinel"
+        return tail
 
 
 PROBLEMS = [
@@ -165,6 +169,17 @@ PROBLEMS = [
         block_size=(128, 128),
         expectation=Expectations(batched_ms=0.3151, grouped_ms=0.1571),
     ),
+    # EP sentinel coverage: most rows routed to non-local experts, kernel skips tail
+    Problem(
+        S=64,
+        E=8,
+        N=256,
+        K=512,
+        TOP_K=4,
+        scale_layout="block",
+        block_size=(128, 128),
+        sentinel_fraction=0.875,
+    ),
     # fp16 / fp32 dtype coverage on the smallest FP8 shape
     Problem(
         S=8,
@@ -243,6 +258,18 @@ if SUPPORTS_FP4:
             block_size=None,
             weight_format="fp4",
         ),
+        # EP sentinel coverage on FP4
+        Problem(
+            S=64,
+            E=8,
+            N=256,
+            K=512,
+            TOP_K=4,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
+            sentinel_fraction=0.875,
+        ),
         # fp16 / fp32 dtype coverage on the smallest FP4 shape
         Problem(
             S=32,
@@ -294,8 +321,12 @@ if SUPPORTS_FP4:
     ]
 
 
-def _make_routed_inputs(S, E, K, dtype, device, top_k):
-    """Build flattened routed inputs like FP8Experts paths."""
+def _make_routed_inputs(S, E, K, dtype, device, top_k, sentinel_fraction=0.0):
+    """Build flattened routed inputs like FP8Experts paths.
+
+    ``sentinel_fraction`` marks a random subset of ``expert_ids`` as out-of-range
+    (== E), simulating EP routing where some tokens are owned by other ranks.
+    """
     assert top_k > 0
     assert S % top_k == 0, f"S ({S}) must be divisible by top_k ({top_k})"
     num_tokens = S // top_k
@@ -311,6 +342,10 @@ def _make_routed_inputs(S, E, K, dtype, device, top_k):
     )
     expert_ids = top_k_index.reshape(-1).to(torch.int32)
     selected_hidden_states = hidden_states[token_idx]
+    if sentinel_fraction > 0:
+        n_sentinel = int(round(S * sentinel_fraction))
+        idx = torch.randperm(S, device=device)[:n_sentinel]
+        expert_ids[idx] = E
     return selected_hidden_states, expert_ids
 
 
@@ -348,6 +383,7 @@ def _setup_problem(problem: Problem, dtype):
         dtype=dtype,
         device=TEST_DEVICE,
         top_k=problem.TOP_K,
+        sentinel_fraction=problem.sentinel_fraction,
     )
     if problem.weight_format == "fp4":
         B, Bs = make_fp4_weights(
@@ -378,20 +414,36 @@ def _prepare_grouped(A, expert_ids, num_experts, contiguous: bool = True):
     return A_sorted, expert_ids_sorted, offsets, tokens_per_expert
 
 
-def _ref(A, B, Bs, expert_ids, block_size):
+def _routed_matmul_ref(A, B, Bs, expert_ids, block_size):
     """Per-routed-row reference that re-uses the neutral ``matmul`` dispatcher
     (routes to FP4 when ``B.dtype == int8``, else block/tensor FP8). Output dtype
-    matches the batched/grouped kernels (both follow ``A.dtype``)."""
+    matches the batched/grouped kernels (both follow ``A.dtype``). Rows with
+    ``expert_ids[i] >= num_experts`` are EP sentinels — skipped, output undefined."""
     S = A.shape[0]
     N = B.shape[1]
+    E = B.shape[0]
     out = torch.empty(S, N, dtype=A.dtype, device=A.device)
     for i in range(S):
-        e = expert_ids[i]
+        e = int(expert_ids[i])
+        if e >= E:
+            continue
         out[i] = finegrained_fp8.matmul(A[i : i + 1], B[e], Bs[e], block_size)
     return out
 
 
 # ── unified wrapper correctness/shape ──────────────────────────────────────────
+def _assert_correctness(out, ref, expert_ids, problem):
+    """Shape, dtype, and per-local-row value checks. Sentinel rows
+    (``expert_ids >= problem.E``) are uninit by kernel design and excluded."""
+    assert out.shape == (problem.S, problem.N)
+    assert out.dtype == problem.dtype
+    local_mask = expert_ids.to(torch.int64) < problem.E
+    atol, rtol = DTYPE_TO_TOL[problem.dtype]
+    torch.testing.assert_close(
+        out[local_mask], ref[local_mask], atol=atol, rtol=rtol
+    )
+
+
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
@@ -399,11 +451,8 @@ def test_batched(problem):
     torch.manual_seed(0)
     A, expert_ids, B, Bs = _setup_problem(problem, dtype=problem.dtype)
     out = finegrained_fp8.matmul_batched(A, B, Bs, expert_ids, problem.block_size)
-    ref = _ref(A, B, Bs, expert_ids, problem.block_size)
-    assert out.shape == (problem.S, problem.N)
-    assert out.dtype == problem.dtype
-    atol, rtol = DTYPE_TO_TOL[problem.dtype]
-    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
+    ref = _routed_matmul_ref(A, B, Bs, expert_ids, problem.block_size)
+    _assert_correctness(out, ref, expert_ids, problem)
 
 
 @pytest.mark.kernels_ci
@@ -418,11 +467,8 @@ def test_grouped(problem):
     out = finegrained_fp8.matmul_grouped(
         A_sorted, B, Bs, offsets, tokens_per_expert, problem.block_size
     )
-    ref = _ref(A_sorted, B, Bs, expert_ids_sorted, problem.block_size)
-    assert out.shape == (problem.S, problem.N)
-    assert out.dtype == problem.dtype
-    atol, rtol = DTYPE_TO_TOL[problem.dtype]
-    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
+    ref = _routed_matmul_ref(A_sorted, B, Bs, expert_ids_sorted, problem.block_size)
+    _assert_correctness(out, ref, expert_ids_sorted, problem)
 
 
 # ── torch.compile compatibility ────────────────────────────────────────────────
