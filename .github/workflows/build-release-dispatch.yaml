@@ -2,8 +2,8 @@ name: Build Release (Dispatch)
 run-name: >-
   Build Release (Dispatch) / ${{ inputs.kernel_name || github.event.pull_request.title || '' }} / request=${{ inputs.dispatch_key || '' }}
 on:
-  pull_request:
-    types: [closed]
+  # pull_request:
+  #   types: [closed]
   workflow_dispatch:
     inputs:
       kernel_name:
