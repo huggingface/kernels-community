@@ -1712,9 +1712,6 @@ mha_fwd_kvcache(const torch::Tensor &q,                                // batch_
     std::optional<at::Tensor> alibi_slopes = alibi_slopes_.has_value() ? std::optional<at::Tensor>(const_cast<at::Tensor &>(alibi_slopes_.value())) : std::nullopt;
     std::optional<at::Tensor> out = out_.has_value() ? std::optional<at::Tensor>(const_cast<at::Tensor &>(out_.value())) : std::nullopt;
     
-    if (!out.has_value()){
-        out = torch::empty_like(q);
-    }
     
     // Convert double to float and int64_t to int.
     float softmax_scale_float = static_cast<float>(softmax_scale);
