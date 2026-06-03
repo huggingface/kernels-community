@@ -6,7 +6,7 @@ backends = [
     "rocm",
     "xpu",
 ]
-version = 1
+version = 2
 
 [general.hub]
 repo-id = "kernels-community/finegrained-fp8"
