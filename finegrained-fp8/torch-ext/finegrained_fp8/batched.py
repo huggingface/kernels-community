@@ -63,6 +63,7 @@ def w8a8_block_fp8_matmul_batched_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
 ):
     """Block-scale batched FP8 expert matmul kernel.
 
@@ -76,6 +77,9 @@ def w8a8_block_fp8_matmul_batched_kernel(
     # expert_id * stride_Eb (e.g. 255 * 9_437_184 > 2^31 for 256 experts of
     # 3072×3072 FP8 weights).
     expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
+    # EP sentinel: row routed to a non-local expert; output is left uninit.
+    if expert_id >= NUM_EXPERTS:
+        return
 
     A = A + batch_id * stride_am
     B = B + expert_id * stride_be
@@ -148,6 +152,7 @@ def w8a8_tensor_fp8_matmul_batched_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
 ):
     """Tensor-scale batched FP8 expert matmul kernel.
 
@@ -158,6 +163,9 @@ def w8a8_tensor_fp8_matmul_batched_kernel(
     pid_n = tl.program_id(axis=1)
 
     expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
+    # EP sentinel: row routed to a non-local expert; output is left uninit.
+    if expert_id >= NUM_EXPERTS:
+        return
 
     A = A + batch_id * stride_am
     B = B + expert_id * stride_be
@@ -235,6 +243,7 @@ def w4a8_fp4_matmul_batched_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     VALUES_PER_BYTE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
 ):
     """Block-scale batched W4A8 FP4 expert matmul with fused activation quant.
 
@@ -249,6 +258,9 @@ def w4a8_fp4_matmul_batched_kernel(
     # expert_id * stride_be (e.g. 255 * 9_437_184 > 2^31 for 256 experts of
     # 3072×3072 FP4 weights).
     expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
+    # EP sentinel: row routed to a non-local expert; output is left uninit.
+    if expert_id >= NUM_EXPERTS:
+        return
 
     A = A + batch_id * stride_am
     B = B + expert_id * stride_be
@@ -350,6 +362,7 @@ def _w8a8_block_fp8_matmul_batched(
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=block_k,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
+            NUM_EXPERTS=E,
         )
 
     return C
@@ -418,6 +431,7 @@ def _w8a8_tensor_fp8_matmul_batched(
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
+            NUM_EXPERTS=E,
         )
 
     return C
@@ -531,6 +545,7 @@ def _w4a8_fp4_matmul_batched(
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             VALUES_PER_BYTE=FP4_VALUES_PER_BYTE,
             SCALE_GROUP_K=FP4_SCALE_GROUP_K,
+            NUM_EXPERTS=E,
         )
     return C
 
