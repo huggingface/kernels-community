@@ -442,10 +442,10 @@ def _w4a8_fp4_matmul(
     bs_u8 = Bs.view(torch.uint8)
     C = A.new_empty((M, N), dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m(M)
-    grid = lambda META: (
-        triton.cdiv(M, BLOCK_SIZE_M),
-        triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
+
+    def grid(META):
+        return (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, META["BLOCK_SIZE_N"]))
+
     with device_context(A.device):
         wrap_triton(w4a8_fp4_matmul_kernel)[grid](
             A,

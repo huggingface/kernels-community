@@ -83,8 +83,14 @@ def w8a8_block_fp8_matmul_grouped_kernel(
         return
 
     expert_id, offs_global_m, row_mask = grouped_expert_lookup(
-        pid_m, Offsets, TileOffsets, stride_offs, stride_tile,
-        NUM_EXPERTS, NUM_EXPERTS_BIT_LENGTH, BLOCK_SIZE_M,
+        pid_m,
+        Offsets,
+        TileOffsets,
+        stride_offs,
+        stride_tile,
+        NUM_EXPERTS,
+        NUM_EXPERTS_BIT_LENGTH,
+        BLOCK_SIZE_M,
     )
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -167,8 +173,14 @@ def w8a8_tensor_fp8_matmul_grouped_kernel(
         return
 
     expert_id, offs_global_m, row_mask = grouped_expert_lookup(
-        pid_m, Offsets, TileOffsets, stride_offs, stride_tile,
-        NUM_EXPERTS, NUM_EXPERTS_BIT_LENGTH, BLOCK_SIZE_M,
+        pid_m,
+        Offsets,
+        TileOffsets,
+        stride_offs,
+        stride_tile,
+        NUM_EXPERTS,
+        NUM_EXPERTS_BIT_LENGTH,
+        BLOCK_SIZE_M,
     )
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -261,8 +273,14 @@ def w4a8_fp4_matmul_grouped_kernel(
         return
 
     expert_id, offs_global_m, row_mask = grouped_expert_lookup(
-        pid_m, Offsets, TileOffsets, stride_offs, stride_tile,
-        NUM_EXPERTS, NUM_EXPERTS_BIT_LENGTH, BLOCK_SIZE_M,
+        pid_m,
+        Offsets,
+        TileOffsets,
+        stride_offs,
+        stride_tile,
+        NUM_EXPERTS,
+        NUM_EXPERTS_BIT_LENGTH,
+        BLOCK_SIZE_M,
     )
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -544,7 +562,10 @@ def _w4a8_fp4_matmul_grouped(
     tile_offsets, max_m_tiles = grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, E
     )
-    grid = lambda META: (max_m_tiles, triton.cdiv(N, META["BLOCK_SIZE_N"]))
+
+    def grid(META):
+        return (max_m_tiles, triton.cdiv(N, META["BLOCK_SIZE_N"]))
+
     with device_context(A.device):
         wrap_triton(w4a8_fp4_matmul_grouped_kernel)[grid](
             A,
@@ -614,9 +635,7 @@ def matmul_grouped(
     - otherwise → ``w8a8_block_fp8_matmul_grouped``.
     """
     if B.dtype == torch.int8:
-        return w4a8_fp4_matmul_grouped(
-            A, B, Bs, offsets, tokens_per_expert, A.dtype
-        )
+        return w4a8_fp4_matmul_grouped(A, B, Bs, offsets, tokens_per_expert, A.dtype)
 
     if block_size is None or (
         block_size[0] == B.size(1) and block_size[1] == B.size(2)

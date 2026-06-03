@@ -9,6 +9,7 @@ import torch
 import triton
 
 from utils import (  # type: ignore
+    DTYPE_TAG,
     DTYPE_TO_TOL,
     IS_SM90,
     SUPPORTS_FP4,
@@ -40,7 +41,9 @@ class Problem:
     scale_layout: str
     block_size: Optional[Tuple[int, int]] = None
     expectation: Optional[Expectations] = None
+    dtype: torch.dtype = torch.bfloat16
     weight_format: str = "fp8"
+    contiguous: bool = True
 
     @property
     def id(self):
@@ -50,12 +53,15 @@ class Problem:
         )
         # FP4 ignores block_size (tile shape autotuned); always block-mode.
         if self.weight_format == "fp4":
-            return head
+            tail = head
         # FP8 with block_size carries block dims; without it, scale_layout names
         # the tensor-mode variant.
-        if self.block_size is None:
-            return f"{head}_{self.scale_layout}"
-        return f"{head}_b{self.block_size[0]}x{self.block_size[1]}"
+        elif self.block_size is None:
+            tail = f"{head}_{self.scale_layout}"
+        else:
+            tail = f"{head}_b{self.block_size[0]}x{self.block_size[1]}"
+        contig_tag = "contiguous" if self.contiguous else "noncontiguous"
+        return f"{tail}_{contig_tag}_{DTYPE_TAG[self.dtype]}"
 
 
 PROBLEMS = [
@@ -105,6 +111,18 @@ PROBLEMS = [
         scale_layout="per_tensor_111",
         block_size=None,
     ),
+    # Non-contig indexing tensors — exercises stride-aware loads for
+    # expert_ids (batched) and offsets / tokens_per_expert (grouped).
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(128, 128),
+        contiguous=False,
+    ),
     # ── Qwen3-30B-A3B (E=128, H=2048, I=768, top_k=8) ──
     # gate_up: N=1536, K=2048 — down: N=2048, K=768
     Problem(
@@ -147,6 +165,27 @@ PROBLEMS = [
         block_size=(128, 128),
         expectation=Expectations(batched_ms=0.3151, grouped_ms=0.1571),
     ),
+    # fp16 / fp32 dtype coverage on the smallest FP8 shape
+    Problem(
+        S=8,
+        E=4,
+        N=256,
+        K=256,
+        TOP_K=1,
+        scale_layout="block",
+        block_size=(128, 128),
+        dtype=torch.float16,
+    ),
+    Problem(
+        S=8,
+        E=4,
+        N=256,
+        K=256,
+        TOP_K=1,
+        scale_layout="block",
+        block_size=(128, 128),
+        dtype=torch.float32,
+    ),
 ]
 if SUPPORTS_FP4:
     # DeepSeek-V4-Flash FP4 shapes (E=256, top_k=6); first entry kept small so
@@ -162,6 +201,17 @@ if SUPPORTS_FP4:
             scale_layout="block",
             block_size=None,
             weight_format="fp4",
+        ),
+        Problem(
+            S=32,
+            E=4,
+            N=256,
+            K=512,
+            TOP_K=2,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
+            contiguous=False,
         ),
         Problem(
             S=192,
@@ -193,19 +243,53 @@ if SUPPORTS_FP4:
             block_size=None,
             weight_format="fp4",
         ),
+        # fp16 / fp32 dtype coverage on the smallest FP4 shape
+        Problem(
+            S=32,
+            E=4,
+            N=256,
+            K=512,
+            TOP_K=2,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
+            dtype=torch.float16,
+        ),
+        Problem(
+            S=32,
+            E=4,
+            N=256,
+            K=512,
+            TOP_K=2,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
+            dtype=torch.float32,
+        ),
     ]
 
 COMPILE_PROBLEMS = [
     Problem(
-        S=8, E=4, N=256, K=256, TOP_K=1,
-        scale_layout="block", block_size=(128, 128),
+        S=8,
+        E=4,
+        N=256,
+        K=256,
+        TOP_K=1,
+        scale_layout="block",
+        block_size=(128, 128),
     ),
 ]
 if SUPPORTS_FP4:
     COMPILE_PROBLEMS += [
         Problem(
-            S=32, E=4, N=256, K=512, TOP_K=2,
-            scale_layout="block", block_size=None, weight_format="fp4",
+            S=32,
+            E=4,
+            N=256,
+            K=512,
+            TOP_K=2,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
         ),
     ]
 
@@ -247,6 +331,15 @@ def _convert_scale_layout(Bs, layout: str):
     raise ValueError(f"Unsupported scale layout: {layout}")
 
 
+def _make_noncontig_1d(x: torch.Tensor) -> torch.Tensor:
+    # Stride-2 view with duplicated gaps: a stride-1 read returns
+    # [x[0], x[0], x[1], x[1], ...] instead of x, catching wrong-stride loads.
+    base = torch.empty((x.numel(), 2), dtype=x.dtype, device=x.device)
+    base[:, 0] = x
+    base[:, 1] = x
+    return base[:, 0]
+
+
 def _setup_problem(problem: Problem, dtype):
     A, expert_ids = _make_routed_inputs(
         problem.S,
@@ -260,15 +353,18 @@ def _setup_problem(problem: Problem, dtype):
         B, Bs = make_fp4_weights(
             problem.N, problem.K, TEST_DEVICE, num_experts=problem.E
         )
-        return A, expert_ids, B, Bs
-    B_fp8, Bs_block = make_fp8_weights(
-        problem.N, problem.K, TEST_DEVICE, problem.block_size, num_experts=problem.E
-    )
-    Bs = _convert_scale_layout(Bs_block, problem.scale_layout)
-    return A, expert_ids, B_fp8, Bs
+    else:
+        B_fp8, Bs_block = make_fp8_weights(
+            problem.N, problem.K, TEST_DEVICE, problem.block_size, num_experts=problem.E
+        )
+        Bs = _convert_scale_layout(Bs_block, problem.scale_layout)
+        B = B_fp8
+    if not problem.contiguous:
+        expert_ids = _make_noncontig_1d(expert_ids)
+    return A, expert_ids, B, Bs
 
 
-def _prepare_grouped(A, expert_ids, num_experts):
+def _prepare_grouped(A, expert_ids, num_experts, contiguous: bool = True):
     perm = torch.argsort(expert_ids)
     A_sorted = A[perm].contiguous()
     expert_ids_sorted = expert_ids[perm]
@@ -276,17 +372,19 @@ def _prepare_grouped(A, expert_ids, num_experts):
         expert_ids_sorted.float(), bins=num_experts, min=0, max=num_experts - 1
     ).to(torch.int32)
     offsets = torch.cumsum(tokens_per_expert, dim=0).to(torch.int32)
+    if not contiguous:
+        offsets = _make_noncontig_1d(offsets)
+        tokens_per_expert = _make_noncontig_1d(tokens_per_expert)
     return A_sorted, expert_ids_sorted, offsets, tokens_per_expert
 
 
 def _ref(A, B, Bs, expert_ids, block_size):
     """Per-routed-row reference that re-uses the neutral ``matmul`` dispatcher
     (routes to FP4 when ``B.dtype == int8``, else block/tensor FP8). Output dtype
-    matches the kernel-under-test."""
+    matches the batched/grouped kernels (both follow ``A.dtype``)."""
     S = A.shape[0]
     N = B.shape[1]
-    out_dtype = A.dtype if B.dtype == torch.int8 else torch.float32
-    out = torch.empty(S, N, dtype=out_dtype, device=A.device)
+    out = torch.empty(S, N, dtype=A.dtype, device=A.device)
     for i in range(S):
         e = expert_ids[i]
         out[i] = finegrained_fp8.matmul(A[i : i + 1], B[e], Bs[e], block_size)
@@ -294,31 +392,18 @@ def _ref(A, B, Bs, expert_ids, block_size):
 
 
 # ── unified wrapper correctness/shape ──────────────────────────────────────────
-def _input_dtype_for(problem: Problem) -> torch.dtype:
-    # FP4 inline-quant path expects bf16/fp16/fp32; the FP8 paths handle all three
-    # but tests historically use fp32 for tight reference matching.
-    return torch.bfloat16 if problem.weight_format == "fp4" else torch.float32
-
-
-def _tol_for(problem: Problem) -> dict:
-    """Output-dtype-keyed tolerance — kernel and ref agree at the output dtype's
-    precision floor (see ``DTYPE_TO_TOL`` in ``utils``)."""
-    atol, rtol = DTYPE_TO_TOL[_input_dtype_for(problem)]
-    return {"atol": atol, "rtol": rtol}
-
-
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_batched(problem):
     torch.manual_seed(0)
-    dtype = _input_dtype_for(problem)
-    A, expert_ids, B, Bs = _setup_problem(problem, dtype=dtype)
+    A, expert_ids, B, Bs = _setup_problem(problem, dtype=problem.dtype)
     out = finegrained_fp8.matmul_batched(A, B, Bs, expert_ids, problem.block_size)
     ref = _ref(A, B, Bs, expert_ids, problem.block_size)
     assert out.shape == (problem.S, problem.N)
-    assert out.dtype == dtype
-    torch.testing.assert_close(out, ref, **_tol_for(problem))
+    assert out.dtype == problem.dtype
+    atol, rtol = DTYPE_TO_TOL[problem.dtype]
+    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
 
 @pytest.mark.kernels_ci
@@ -326,18 +411,18 @@ def test_batched(problem):
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_grouped(problem):
     torch.manual_seed(0)
-    dtype = _input_dtype_for(problem)
-    A, expert_ids, B, Bs = _setup_problem(problem, dtype=dtype)
+    A, expert_ids, B, Bs = _setup_problem(problem, dtype=problem.dtype)
     A_sorted, expert_ids_sorted, offsets, tokens_per_expert = _prepare_grouped(
-        A, expert_ids, problem.E
+        A, expert_ids, problem.E, contiguous=problem.contiguous
     )
     out = finegrained_fp8.matmul_grouped(
         A_sorted, B, Bs, offsets, tokens_per_expert, problem.block_size
     )
     ref = _ref(A_sorted, B, Bs, expert_ids_sorted, problem.block_size)
     assert out.shape == (problem.S, problem.N)
-    assert out.dtype == dtype
-    torch.testing.assert_close(out, ref, **_tol_for(problem))
+    assert out.dtype == problem.dtype
+    atol, rtol = DTYPE_TO_TOL[problem.dtype]
+    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
 
 # ── torch.compile compatibility ────────────────────────────────────────────────
@@ -348,13 +433,10 @@ def test_batched_compile(problem):
     torch.manual_seed(0)
     torch.compiler.reset()
     accelerator_module().empty_cache()
-    dtype = _input_dtype_for(problem)
-    A, expert_ids, B, Bs = _setup_problem(problem, dtype=dtype)
+    A, expert_ids, B, Bs = _setup_problem(problem, dtype=torch.bfloat16)
 
     def fn(A, B, Bs, expert_ids):
-        return finegrained_fp8.matmul_batched(
-            A, B, Bs, expert_ids, problem.block_size
-        )
+        return finegrained_fp8.matmul_batched(A, B, Bs, expert_ids, problem.block_size)
 
     compiled = torch.compile(fn, mode="max-autotune", fullgraph=True)
     out_compiled = compiled(A, B, Bs, expert_ids)
@@ -369,15 +451,17 @@ def test_grouped_compile(problem):
     torch.manual_seed(0)
     torch.compiler.reset()
     accelerator_module().empty_cache()
-    dtype = _input_dtype_for(problem)
-    A, expert_ids, B, Bs = _setup_problem(problem, dtype=dtype)
-    A_sorted, _, offsets, tokens_per_expert = _prepare_grouped(
-        A, expert_ids, problem.E
-    )
+    A, expert_ids, B, Bs = _setup_problem(problem, dtype=torch.bfloat16)
+    A_sorted, _, offsets, tokens_per_expert = _prepare_grouped(A, expert_ids, problem.E)
 
     def fn(A_sorted, B, Bs, offsets, tokens_per_expert):
         return finegrained_fp8.matmul_grouped(
-            A_sorted, B, Bs, offsets, tokens_per_expert, problem.block_size,
+            A_sorted,
+            B,
+            Bs,
+            offsets,
+            tokens_per_expert,
+            problem.block_size,
         )
 
     compiled = torch.compile(fn, mode="max-autotune", fullgraph=True)

@@ -502,7 +502,10 @@ def _w4a8_fp4_matmul_batched(
     # Decode handles one routed row per program; BLOCK_SIZE_M > 1 would just
     # duplicate the same row computation and keep one row on store.
     BLOCK_SIZE_M = 1
-    grid = lambda META: (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
+
+    def grid(META):
+        return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
+
     with device_context(A.device):
         wrap_triton(w4a8_fp4_matmul_batched_kernel)[grid](
             A,

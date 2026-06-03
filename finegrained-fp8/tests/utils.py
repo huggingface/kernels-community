@@ -26,6 +26,11 @@ IS_SM89 = TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() == (8, 9)
 # SM90 (Hopper, e.g. H100) is the only architecture the benchmark baselines
 # are calibrated against — every other SM has its own latency profile.
 IS_SM90 = TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() == (9, 0)
+DTYPE_TAG = {
+    torch.bfloat16: "bf16",
+    torch.float16: "fp16",
+    torch.float32: "fp32",
+}
 DTYPE_TO_TOL = (
     {
         torch.bfloat16: (0.2, 0.05),

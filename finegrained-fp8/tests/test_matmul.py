@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from utils import (  # type: ignore
+    DTYPE_TAG,
     DTYPE_TO_TOL,
     SUPPORTS_FP4,
     TEST_DEVICE,
@@ -24,6 +25,7 @@ class Problem:
     N: int
     K: int
     block_size: Optional[Tuple[int, int]] = None
+    dtype: torch.dtype = torch.bfloat16
     weight_format: str = "fp8"
 
     @property
@@ -31,23 +33,32 @@ class Problem:
         head = f"{self.weight_format}_M{self.M}_N{self.N}_K{self.K}"
         # FP4 ignores block_size (tile shape autotuned).
         if self.weight_format == "fp4":
-            return head
-        if self.block_size is None:
-            return f"{head}_tensor"
-        return f"{head}_b{self.block_size[0]}x{self.block_size[1]}"
+            tail = head
+        elif self.block_size is None:
+            tail = f"{head}_tensor"
+        else:
+            tail = f"{head}_b{self.block_size[0]}x{self.block_size[1]}"
+        return f"{tail}_{DTYPE_TAG[self.dtype]}"
 
 
 PROBLEMS = [
+    # ── FP8: per-tensor ──
+    Problem(M=16, N=512, K=1024, block_size=None),
     # ── FP8: non-aligned N (MLA kv_a_proj style) ──
     Problem(M=16, N=320, K=1024, block_size=(128, 128)),
     # ── FP8: aligned block-wise ──
     Problem(M=16, N=1024, K=2048, block_size=(128, 128)),
-    # ── FP8: per-tensor ──
-    Problem(M=16, N=512, K=1024, block_size=None),
+    # fp16 / fp32 dtype coverage
+    Problem(M=16, N=320, K=1024, block_size=(128, 128), dtype=torch.float16),
+    Problem(M=16, N=320, K=1024, block_size=(128, 128), dtype=torch.float32),
 ]
 if SUPPORTS_FP4:
     # ``block_size`` is ignored on the FP4 path (tile shape autotuned).
-    PROBLEMS += [Problem(M=32, N=256, K=512, weight_format="fp4")]
+    PROBLEMS += [
+        Problem(M=32, N=256, K=512, weight_format="fp4"),
+        Problem(M=32, N=256, K=512, weight_format="fp4", dtype=torch.float16),
+        Problem(M=32, N=256, K=512, weight_format="fp4", dtype=torch.float32),
+    ]
 
 
 COMPILE_PROBLEMS = [
@@ -60,12 +71,7 @@ if SUPPORTS_FP4:
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
-@pytest.mark.parametrize(
-    "dtype",
-    [torch.bfloat16, torch.float16, torch.float32],
-    ids=["bf16", "fp16", "fp32"],
-)
-def test_matmul(problem: Problem, dtype):
+def test_matmul(problem: Problem):
     """``matmul`` matches the pure-PyTorch dequant+matmul reference."""
     torch.manual_seed(42)
     device = TEST_DEVICE
@@ -76,13 +82,12 @@ def test_matmul(problem: Problem, dtype):
     else:
         B, Bs = make_fp8_weights(problem.N, problem.K, device, problem.block_size)
 
-    out = finegrained_fp8.matmul(A, B, Bs, problem.block_size, dtype)
-    ref = ref_matmul(A, B, Bs, problem.block_size, dtype)
-    assert out.dtype == dtype
+    out = finegrained_fp8.matmul(A, B, Bs, problem.block_size, problem.dtype)
+    ref = ref_matmul(A, B, Bs, problem.block_size, problem.dtype)
+    assert out.dtype == problem.dtype
     assert out.shape == (problem.M, problem.N)
-    torch.testing.assert_close(
-        out, ref, atol=DTYPE_TO_TOL[dtype][0], rtol=DTYPE_TO_TOL[dtype][1]
-    )
+    atol, rtol = DTYPE_TO_TOL[problem.dtype]
+    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
 
 # ── torch.compile compatibility ────────────────────────────────────────────────
