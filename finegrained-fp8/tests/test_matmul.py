@@ -4,7 +4,6 @@ import pytest
 import torch
 
 import finegrained_fp8  # type: ignore
-import finegrained_fp8.fp4 as finegrained_fp4  # type: ignore
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
@@ -33,7 +32,7 @@ def _make_weights_fp4_2d(out_features, in_features, device):
 def _ref_fp4_matmul_rows(qA, As, B, Bs, block_size, output_dtype=torch.float32):
     out = torch.empty(qA.shape[0], B.shape[0], dtype=output_dtype, device=qA.device)
     for idx in range(qA.shape[0]):
-        out[idx] = finegrained_fp4.w4a8_block_fp8_matmul(
+        out[idx] = finegrained_fp8.w4a8_block_fp4_matmul(
             qA[idx : idx + 1], As[idx : idx + 1], B, Bs, block_size, output_dtype
         )
     return out
@@ -141,7 +140,7 @@ def test_matmul_correctness(M, N, K, block_size, dtype):
     act_block = block_k if block_size is not None else K
     qA, sA = finegrained_fp8.fp8_act_quant(A, act_block)
 
-    out = finegrained_fp8.w8a8_fp8_matmul(qA, B_fp8, sA, Bs, block_size, dtype)
+    out = finegrained_fp8.fp8_matmul(qA, B_fp8, sA, Bs, block_size, dtype)
     ref = _ref_matmul(qA, B_fp8, sA, Bs, block_n, block_k, dtype)
 
     assert out.dtype == dtype
@@ -160,7 +159,7 @@ def test_w4a8_tensor_matmul_vs_row_ref():
     B, Bs = _make_weights_fp4_2d(N, K, TEST_DEVICE)
     qA, As = finegrained_fp8.fp8_act_quant(A, K)
 
-    out = finegrained_fp4.w4a8_block_fp8_matmul(qA, As, B, Bs, [N, K], torch.float32)
+    out = finegrained_fp8.w4a8_block_fp4_matmul(qA, As, B, Bs, [N, K], torch.float32)
     ref = _ref_fp4_matmul_rows(qA, As, B, Bs, [N, K], torch.float32)
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
@@ -174,6 +173,6 @@ def test_w4a8_block_matmul_vs_row_ref():
     B, Bs = _make_weights_fp4_2d(N, K, TEST_DEVICE)
     qA, As = finegrained_fp8.fp8_act_quant(A, 128)
 
-    out = finegrained_fp4.w4a8_block_fp8_matmul(qA, As, B, Bs, [128, 128], torch.float32)
+    out = finegrained_fp8.w4a8_block_fp4_matmul(qA, As, B, Bs, [128, 128], torch.float32)
     ref = _ref_fp4_matmul_rows(qA, As, B, Bs, [128, 128], torch.float32)
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)

@@ -17,7 +17,6 @@ import torch
 import triton
 
 import finegrained_fp8
-import finegrained_fp8.fp4 as finegrained_fp4
 
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -319,22 +318,22 @@ def _bench_moe_op(
     if op == "batched":
         args = (a, weights, scales, expert_ids, problem.block_size)
         if weight_format == "fp4":
-            kernel_name = "w4a8_fp8_matmul_batched"
-            run = lambda: finegrained_fp4.w4a8_fp8_matmul_batched(*args)
+            kernel_name = "w4a8_block_fp4_matmul_batched"
+            run = lambda: finegrained_fp8.fp8_matmul_batched(*args)
         else:
             kernel_name = "w8a8_fp8_matmul_batched"
-            run = lambda: finegrained_fp8.w8a8_fp8_matmul_batched(*args)
+            run = lambda: finegrained_fp8.fp8_matmul_batched(*args)
         eager_a = a
         eager_expert_ids = expert_ids
     elif op == "grouped":
         a_sorted, eager_expert_ids, offsets, tokens_per_expert = _prepare_grouped(a, expert_ids, problem.E)
         args = (a_sorted, weights, scales, offsets, tokens_per_expert, problem.block_size)
         if weight_format == "fp4":
-            kernel_name = "w4a8_fp8_matmul_grouped"
-            run = lambda: finegrained_fp4.w4a8_fp8_matmul_grouped(*args)
+            kernel_name = "w4a8_block_fp4_matmul_grouped"
+            run = lambda: finegrained_fp8.fp8_matmul_grouped(*args)
         else:
             kernel_name = "w8a8_fp8_matmul_grouped"
-            run = lambda: finegrained_fp8.w8a8_fp8_matmul_grouped(*args)
+            run = lambda: finegrained_fp8.fp8_matmul_grouped(*args)
         eager_a = a_sorted
     else:
         raise ValueError(f"Unsupported MoE op: {op}")
@@ -368,7 +367,7 @@ def _bench_moe_op(
             for idx, expert in enumerate(eager_expert_ids_host):
                 q_a_i, s_a_i = quantized[idx]
                 if weight_format == "fp4":
-                    out[idx] = finegrained_fp4.w4a8_block_fp8_matmul(
+                    out[idx] = finegrained_fp8.w4a8_block_fp4_matmul(
                         q_a_i,
                         s_a_i,
                         weights[expert],
@@ -377,7 +376,7 @@ def _bench_moe_op(
                         torch.float32,
                     )
                 else:
-                    out[idx] = finegrained_fp8.w8a8_fp8_matmul(
+                    out[idx] = finegrained_fp8.fp8_matmul(
                         q_a_i,
                         weights[expert],
                         s_a_i,
@@ -467,8 +466,13 @@ def _bench_matmul(
     a = torch.randn(problem.M, problem.K, dtype=dtype, device=device)
     if weight_format == "fp4":
         weights, scales = _make_weights_fp4_2d(problem.N, problem.K, device)
-        run = lambda: finegrained_fp4.w4a8_fp8_matmul(a, weights, scales, problem.block_size)
-        kernel_name = "w4a8_fp8_matmul"
+        block_size = problem.block_size or [problem.N, problem.K]
+        block_k = block_size[1]
+        q_a, s_a = finegrained_fp8.fp8_act_quant(a, block_k)
+        run = lambda: finegrained_fp8.w4a8_block_fp4_matmul(
+            q_a, s_a, weights, scales, block_size, a.dtype
+        )
+        kernel_name = "w4a8_block_fp4_matmul"
     else:
         w = torch.randn(problem.N, problem.K, dtype=torch.float32, device=device)
         weights, scales = _quantize_weights_2d(w, problem.block_n, problem.block_k)
@@ -477,11 +481,11 @@ def _bench_matmul(
         if include_act_quant:
             def run():
                 q_a_local, s_a_local = finegrained_fp8.fp8_act_quant(a, problem.block_k)
-                return finegrained_fp8.w8a8_fp8_matmul(q_a_local, weights, s_a_local, scales, problem.block_size)
+                return finegrained_fp8.fp8_matmul(q_a_local, weights, s_a_local, scales, problem.block_size)
 
             kernel_name = "fp8_act_quant + w8a8_fp8_matmul"
         else:
-            run = lambda: finegrained_fp8.w8a8_fp8_matmul(q_a, weights, s_a, scales, problem.block_size)
+            run = lambda: finegrained_fp8.fp8_matmul(q_a, weights, s_a, scales, problem.block_size)
             kernel_name = "w8a8_fp8_matmul"
 
     stats = _measure(run, repeats=repeats)
@@ -542,20 +546,22 @@ def _bench_matmul(
 
     if check:
         if weight_format == "fp4":
-            out = finegrained_fp4.w4a8_fp8_matmul(a, weights, scales, problem.block_size)
+            out = finegrained_fp8.w4a8_block_fp4_matmul(q_a, s_a, weights, scales, block_size, a.dtype)
             ref_rows = []
             for idx in range(problem.M):
                 ref_rows.append(
-                    finegrained_fp4.w4a8_fp8_matmul(
-                        a[idx : idx + 1],
+                    finegrained_fp8.w4a8_block_fp4_matmul(
+                        q_a[idx : idx + 1],
+                        s_a[idx : idx + 1],
                         weights,
                         scales,
-                        problem.block_size,
+                        block_size,
+                        a.dtype,
                     )
                 )
             ref = torch.cat(ref_rows, dim=0)
         else:
-            out = finegrained_fp8.w8a8_fp8_matmul(q_a, weights, s_a, scales, problem.block_size)
+            out = finegrained_fp8.fp8_matmul(q_a, weights, s_a, scales, problem.block_size)
             ref = _ref_matmul(q_a, weights, s_a, scales, problem.block_n, problem.block_k)
         _sync(device)
         torch.testing.assert_close(out.float(), ref.float(), atol=1e-2, rtol=1e-2)

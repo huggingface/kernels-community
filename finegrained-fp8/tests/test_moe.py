@@ -9,7 +9,6 @@ import torch
 import triton
 
 import finegrained_fp8  # type: ignore
-import finegrained_fp8.fp4 as finegrained_fp4  # type: ignore
 
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -305,7 +304,7 @@ def _ref_fp4_grouped(qA, As, B, Bs, offsets, output_dtype=torch.float32):
     for expert_id in range(B.shape[0]):
         end = int(offsets[expert_id].item())
         if end > start:
-            out[start:end] = finegrained_fp4.w4a8_block_fp8_matmul(
+            out[start:end] = finegrained_fp8.w4a8_block_fp4_matmul(
                 qA[start:end],
                 As[start:end],
                 B[expert_id],
@@ -324,7 +323,7 @@ def _ref_fp4_grouped_block(qA, As, B, Bs, offsets, block_size, output_dtype=torc
     for expert_id in range(B.shape[0]):
         end = int(offsets[expert_id].item())
         if end > start:
-            out[start:end] = finegrained_fp4.w4a8_block_fp8_matmul(
+            out[start:end] = finegrained_fp8.w4a8_block_fp4_matmul(
                 qA[start:end],
                 As[start:end],
                 B[expert_id],
@@ -340,7 +339,7 @@ def _ref_fp4_batched(qA, As, B, Bs, expert_ids, block_size, output_dtype=torch.f
     out = torch.empty(qA.shape[0], B.shape[1], dtype=output_dtype, device=qA.device)
     for idx in range(qA.shape[0]):
         expert_id = int(expert_ids[idx].item())
-        out[idx] = finegrained_fp4.w4a8_block_fp8_matmul(
+        out[idx] = finegrained_fp8.w4a8_block_fp4_matmul(
             qA[idx : idx + 1],
             As[idx : idx + 1],
             B[expert_id],
@@ -365,7 +364,7 @@ def _ref(A, B_fp8, Bs, expert_ids, block_size):
     for i in range(S):
         e = expert_ids[i]
         qA_i, sA_i = finegrained_fp8.fp8_act_quant(A[i : i + 1], bi)
-        out[i] = finegrained_fp8.w8a8_fp8_matmul(
+        out[i] = finegrained_fp8.fp8_matmul(
             qA_i, B_fp8[e], sA_i, Bs[e], matmul_block_size
         )
     return out
@@ -378,7 +377,7 @@ def _ref(A, B_fp8, Bs, expert_ids, block_size):
 def test_batched_vs_ref(problem):
     torch.manual_seed(0)
     A, expert_ids, B_fp8, Bs = _setup_problem(problem, dtype=torch.float32)
-    out = finegrained_fp8.w8a8_fp8_matmul_batched(
+    out = finegrained_fp8.fp8_matmul_batched(
         A, B_fp8, Bs, expert_ids, problem.block_size
     )
     ref = _ref(A, B_fp8, Bs, expert_ids, problem.block_size)
@@ -390,7 +389,7 @@ def test_batched_vs_ref(problem):
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_batched_output_shape(problem):
     A, expert_ids, B_fp8, Bs = _setup_problem(problem, dtype=torch.bfloat16)
-    out = finegrained_fp8.w8a8_fp8_matmul_batched(
+    out = finegrained_fp8.fp8_matmul_batched(
         A, B_fp8, Bs, expert_ids, problem.block_size
     )
     assert out.shape == (problem.S, problem.N)
@@ -434,7 +433,7 @@ def test_w4a8_batched_tensor_vs_ref():
     B, Bs = _make_experts_weights_fp4(E, N, K, TEST_DEVICE)
     qA, As = finegrained_fp8.fp8_act_quant(A, K)
 
-    out = finegrained_fp4.w4a8_block_fp8_matmul_batched(
+    out = finegrained_fp8.w4a8_block_fp4_matmul_batched(
         qA, As, B, Bs, expert_ids, [N, K], torch.float32
     )
     ref = _ref_fp4_batched(qA, As, B, Bs, expert_ids, [N, K], torch.float32)
@@ -457,7 +456,7 @@ def test_w4a8_batched_block_vs_ref():
     B, Bs = _make_experts_weights_fp4(E, N, K, TEST_DEVICE)
     qA, As = finegrained_fp8.fp8_act_quant(A, 128)
 
-    out = finegrained_fp4.w4a8_block_fp8_matmul_batched(
+    out = finegrained_fp8.w4a8_block_fp4_matmul_batched(
         qA, As, B, Bs, expert_ids, [128, 128], torch.float32
     )
     ref = _ref_fp4_batched(qA, As, B, Bs, expert_ids, [128, 128], torch.float32)
@@ -481,7 +480,7 @@ def test_w4a8_grouped_tensor_vs_ref():
     A_sorted, _, offsets, tokens_per_expert = _prepare_grouped(A, expert_ids, E)
     qA, As = finegrained_fp8.fp8_act_quant(A_sorted, K)
 
-    out = finegrained_fp4.w4a8_block_fp8_matmul_grouped(
+    out = finegrained_fp8.w4a8_block_fp4_matmul_grouped(
         qA,
         As,
         B,
@@ -512,7 +511,7 @@ def test_w4a8_grouped_block_vs_ref():
     A_sorted, _, offsets, tokens_per_expert = _prepare_grouped(A, expert_ids, E)
     qA, As = finegrained_fp8.fp8_act_quant(A_sorted, 128)
 
-    out = finegrained_fp4.w4a8_block_fp8_matmul_grouped(
+    out = finegrained_fp8.w4a8_block_fp4_matmul_grouped(
         qA,
         As,
         B,
@@ -535,7 +534,7 @@ def test_grouped_vs_ref(problem):
     A_sorted, expert_ids_sorted, offsets, tokens_per_expert = _prepare_grouped(
         A, expert_ids, problem.E
     )
-    out = finegrained_fp8.w8a8_fp8_matmul_grouped(
+    out = finegrained_fp8.fp8_matmul_grouped(
         A_sorted,
         B_fp8,
         Bs,
@@ -553,7 +552,7 @@ def test_grouped_vs_ref(problem):
 def test_grouped_output_shape(problem):
     A, expert_ids, B_fp8, Bs = _setup_problem(problem, dtype=torch.bfloat16)
     A_sorted, _, offsets, tokens_per_expert = _prepare_grouped(A, expert_ids, problem.E)
-    out = finegrained_fp8.w8a8_fp8_matmul_grouped(
+    out = finegrained_fp8.fp8_matmul_grouped(
         A_sorted,
         B_fp8,
         Bs,
@@ -576,7 +575,7 @@ def test_batched_compile():
     A, expert_ids, B_fp8, Bs = _setup_problem(COMPILE_PROBLEM, dtype=torch.bfloat16)
 
     def fn(A, B_fp8, Bs, expert_ids):
-        return finegrained_fp8.w8a8_fp8_matmul_batched(
+        return finegrained_fp8.fp8_matmul_batched(
             A, B_fp8, Bs, expert_ids, COMPILE_PROBLEM.block_size
         )
 
@@ -599,7 +598,7 @@ def test_grouped_compile():
     )
 
     def fn(A_sorted, B_fp8, Bs, offsets, tokens_per_expert):
-        return finegrained_fp8.w8a8_fp8_matmul_grouped(
+        return finegrained_fp8.fp8_matmul_grouped(
             A_sorted,
             B_fp8,
             Bs,
@@ -676,7 +675,7 @@ def test_batched_speedup(problem):
 
     batched_ms, batched_mean_ms, batched_min_ms, batched_max_ms = (
         _measure_latency_over_repeats(
-            lambda: finegrained_fp8.w8a8_fp8_matmul_batched(
+            lambda: finegrained_fp8.fp8_matmul_batched(
                 A, B_fp8, Bs, expert_ids, problem.block_size
             )
         )
@@ -703,7 +702,7 @@ def test_grouped_speedup(problem):
 
     grouped_ms, grouped_mean_ms, grouped_min_ms, grouped_max_ms = (
         _measure_latency_over_repeats(
-            lambda: finegrained_fp8.w8a8_fp8_matmul_grouped(
+            lambda: finegrained_fp8.fp8_matmul_grouped(
                 A, B_fp8, Bs, offsets, tokens_per_expert, problem.block_size
             )
         )
