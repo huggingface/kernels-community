@@ -11,4 +11,6 @@ backends = [
 [general.hub]
 repo-id = "kernels-community/flash-attn-ops"
 
+[torch-noarch]
+
 [kernel]
