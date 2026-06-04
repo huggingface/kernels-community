@@ -62,6 +62,26 @@ class LigerRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+# TODO: experimental --> same as tiled but generalized to one MLP
+class LigerMLP(nn.Module):
+    weight: nn.Parameter
+    bias: nn.Parameter | None
+
+    def _forward(self, module, x):
+        return module(x)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        compute_params = [p for p in self.parameters() if p.requires_grad]
+
+        return apply_tiled_mlp(
+            fn=self._mlp_forward,
+            mlp_module=self,
+            x=input,
+            num_shards=None,
+            compute_params=compute_params,
+        )
+
+
 class LigerSwiGLUMLP(nn.Module):
     gate_proj: nn.Linear
     up_proj: nn.Linear
@@ -250,6 +270,7 @@ __all__ = [
     "LigerLayerNorm",
     "liger_rotary_pos_emb",
     "LigerRMSNorm",
+    "LigerMLP",
     "LigerSwiGLUMLP",
     "LigerGEGLUMLP",
     "LigerTiledGEGLUMLP",
