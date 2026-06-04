@@ -15,10 +15,11 @@ from utils import SUPPORTS_FP8  # type: ignore  # noqa: E402
 
 
 def pytest_collection_modifyitems(config, items):
-    """Skip every test when FP8 is unsupported — Triton's ``fp8e4nv`` fails to
-    compile on SM<89, so the entire FP8/FP4 suite is moot."""
+    """Skip every test when FP8 is unsupported — kernels require SM90+ on CUDA
+    (Hopper/Blackwell) or XPU. SM<89 can't even compile ``fp8e4nv``; SM89 (Ada)
+    compiles but has numerics drift we don't gate against."""
     if SUPPORTS_FP8:
         return
-    skip = pytest.mark.skip(reason="FP8 kernels require SM89+ on CUDA or XPU")
+    skip = pytest.mark.skip(reason="FP8 kernels require SM90+ on CUDA or XPU")
     for item in items:
         item.add_marker(skip)
