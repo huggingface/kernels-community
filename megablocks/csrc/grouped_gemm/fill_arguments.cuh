@@ -1,5 +1,10 @@
 #pragma once
 
+// Grouped GEMM (CUTLASS) is CUDA-only; compile out for ROCm/HIP builds so the
+// CUTLASS includes are never pulled in. The ROCm grouped GEMM is provided by
+// the vendored AITER Triton kernels in Python.
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(USE_ROCM)
+
 #include <ATen/cuda/detail/KernelUtils.h>
 #include <cub/cub.cuh>
 #include <cutlass/bfloat16.h>
@@ -139,3 +144,5 @@ __global__ void IgnoreK0Problems(int num_experts, Args args) {
 }
 
 }  // namespace grouped_gemm
+
+#endif  // !defined(__HIP_PLATFORM_AMD__) && !defined(USE_ROCM)
