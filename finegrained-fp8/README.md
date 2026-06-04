@@ -12,12 +12,6 @@ All kernels target Hopper (SM90) FP8 WGMMA instructions and are also compatible 
 
 ## Kernels
 
-### Activation quantization
-
-#### `fp8_act_quant`
-
-Standalone dynamic per-block activation quantization (BF16/FP16/FP32 → `float8_e4m3fn`). Splits the input's last dim into contiguous blocks of `block_size` elements, computes the per-block max-abs scale, and returns `(quantized, scales)`. Used internally by the tensor-mode matmul wrappers; most callers don't need to invoke it directly because the block-mode kernels fuse the same quant inline.
-
 ### Dispatchers
 
 #### `matmul`, `matmul_batched`, `matmul_grouped`
