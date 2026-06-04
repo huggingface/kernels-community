@@ -17,6 +17,7 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
+from ._ops import add_op_namespace_prefix, ops
 from .utils import (
     FP4_SCALE_GROUP_K,
     FP4_VALUES_PER_BYTE,
@@ -359,7 +360,7 @@ def w4a8_block_dynamic_fp4_matmul_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton_op("finegrained_fp8::w8a8_block_dynamic_fp8_matmul", mutates_args=())
+@triton_op(add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul"), mutates_args=())
 def _w8a8_block_dynamic_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -430,7 +431,7 @@ def _w8a8_block_dynamic_fp8_matmul(
     return C
 
 
-@triton_op("finegrained_fp8::w8a8_block_static_fp8_matmul", mutates_args=())
+@triton_op(add_op_namespace_prefix("w8a8_block_static_fp8_matmul"), mutates_args=())
 def _w8a8_block_static_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -512,7 +513,7 @@ def _w8a8_block_static_fp8_matmul(
     return C
 
 
-@triton_op("finegrained_fp8::w8a8_tensor_dynamic_fp8_matmul", mutates_args=())
+@triton_op(add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul"), mutates_args=())
 def _w8a8_tensor_dynamic_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -577,7 +578,7 @@ def _w8a8_tensor_dynamic_fp8_matmul(
     return C
 
 
-@triton_op("finegrained_fp8::w4a8_block_dynamic_fp4_matmul", mutates_args=())
+@triton_op(add_op_namespace_prefix("w4a8_block_dynamic_fp4_matmul"), mutates_args=())
 def _w4a8_block_dynamic_fp4_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -666,9 +667,7 @@ def w8a8_block_dynamic_fp8_matmul(
     Returns:
         Output tensor ``[..., M, N]`` in ``output_dtype``.
     """
-    return torch.ops.finegrained_fp8.w8a8_block_dynamic_fp8_matmul(
-        A, B, Bs, block_size, output_dtype
-    )
+    return ops.w8a8_block_dynamic_fp8_matmul(A, B, Bs, block_size, output_dtype)
 
 
 def w8a8_block_static_fp8_matmul(
@@ -693,9 +692,7 @@ def w8a8_block_static_fp8_matmul(
     Returns:
         Output tensor ``[..., M, N]`` in ``output_dtype``.
     """
-    return torch.ops.finegrained_fp8.w8a8_block_static_fp8_matmul(
-        A, B, Bs, As, block_size, output_dtype
-    )
+    return ops.w8a8_block_static_fp8_matmul(A, B, Bs, As, block_size, output_dtype)
 
 
 def w8a8_tensor_dynamic_fp8_matmul(
@@ -715,9 +712,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
         Bs: Single weight scale, scalar or ``[1]``.
         output_dtype: dtype of the returned tensor.
     """
-    return torch.ops.finegrained_fp8.w8a8_tensor_dynamic_fp8_matmul(
-        A, B, Bs, output_dtype
-    )
+    return ops.w8a8_tensor_dynamic_fp8_matmul(A, B, Bs, output_dtype)
 
 
 def w4a8_block_dynamic_fp4_matmul(
@@ -739,9 +734,7 @@ def w4a8_block_dynamic_fp4_matmul(
         Bs: UE8M0 weight scales ``[N, K // 32]``.
         output_dtype: dtype of the returned tensor (default ``bfloat16``).
     """
-    return torch.ops.finegrained_fp8.w4a8_block_dynamic_fp4_matmul(
-        A, B, Bs, output_dtype
-    )
+    return ops.w4a8_block_dynamic_fp4_matmul(A, B, Bs, output_dtype)
 
 
 def matmul(

@@ -17,6 +17,7 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
+from ._ops import add_op_namespace_prefix, ops
 from .utils import (
     FP4_SCALE_GROUP_K,
     FP4_VALUES_PER_BYTE,
@@ -296,7 +297,9 @@ def w4a8_block_dynamic_fp4_matmul_batched_kernel(
     tl.store(c_ptrs, accumulator.to(C.dtype.element_ty), mask=(offs_cm == 0)[:, None])
 
 
-@triton_op("finegrained_fp8::w8a8_block_dynamic_fp8_matmul_batched", mutates_args=())
+@triton_op(
+    add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_batched"), mutates_args=()
+)
 def _w8a8_block_dynamic_fp8_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -373,7 +376,9 @@ def _w8a8_block_dynamic_fp8_matmul_batched(
     return C
 
 
-@triton_op("finegrained_fp8::w8a8_tensor_dynamic_fp8_matmul_batched", mutates_args=())
+@triton_op(
+    add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul_batched"), mutates_args=()
+)
 def _w8a8_tensor_dynamic_fp8_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -459,7 +464,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     expert_ids: (S,) — kernel loads stride-aware, any int dtype works
     output_dtype: defaults to ``A.dtype``
     """
-    return torch.ops.finegrained_fp8.w8a8_block_dynamic_fp8_matmul_batched(
+    return ops.w8a8_block_dynamic_fp8_matmul_batched(
         A, B, Bs, expert_ids, block_size, output_dtype
     )
 
@@ -478,12 +483,14 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     Bs: (E,) or (E, 1, 1) per-expert weight scales
     output_dtype: defaults to ``A.dtype``
     """
-    return torch.ops.finegrained_fp8.w8a8_tensor_dynamic_fp8_matmul_batched(
+    return ops.w8a8_tensor_dynamic_fp8_matmul_batched(
         A, B, Bs, expert_ids, output_dtype
     )
 
 
-@triton_op("finegrained_fp8::w4a8_block_dynamic_fp4_matmul_batched", mutates_args=())
+@triton_op(
+    add_op_namespace_prefix("w4a8_block_dynamic_fp4_matmul_batched"), mutates_args=()
+)
 def _w4a8_block_dynamic_fp4_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -568,9 +575,7 @@ def w4a8_block_dynamic_fp4_matmul_batched(
 ) -> torch.Tensor:
     """Block-scale batched W4A8 FP4 matmul with fused activation quant. Tile
     shape autotuned; FP4 scale granularity is fixed at 32."""
-    return torch.ops.finegrained_fp8.w4a8_block_dynamic_fp4_matmul_batched(
-        A, B, Bs, expert_ids, output_dtype
-    )
+    return ops.w4a8_block_dynamic_fp4_matmul_batched(A, B, Bs, expert_ids, output_dtype)
 
 
 def matmul_batched(

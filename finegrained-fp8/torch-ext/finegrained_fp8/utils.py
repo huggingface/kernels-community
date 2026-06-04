@@ -20,6 +20,7 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
+from ._ops import add_op_namespace_prefix, ops
 
 # ── Format constants ──────────────────────────────────────────────────────────
 
@@ -192,7 +193,7 @@ def _fp8_act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     tl.store(s_ptr + pid, s)
 
 
-@triton_op("finegrained_fp8::fp8_act_quant", mutates_args=())
+@triton_op(add_op_namespace_prefix("fp8_act_quant"), mutates_args=())
 def _fp8_act_quant(
     x: torch.Tensor, block_size: int = 128
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -227,4 +228,4 @@ def fp8_act_quant(
         ``float8_e4m3fn`` with the same shape as ``x``, and ``scales`` has
         shape ``(*x.shape[:-1], x.shape[-1] // block_size)`` in float32.
     """
-    return torch.ops.finegrained_fp8.fp8_act_quant(x, block_size)
+    return ops.fp8_act_quant(x, block_size)

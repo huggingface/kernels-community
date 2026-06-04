@@ -17,6 +17,7 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
+from ._ops import add_op_namespace_prefix, ops
 from .utils import (
     FP4_SCALE_GROUP_K,
     FP4_VALUES_PER_BYTE,
@@ -323,7 +324,9 @@ def w4a8_block_dynamic_fp4_matmul_grouped_kernel(
     tl.store(c_ptrs, accumulator.to(C.dtype.element_ty), mask=c_mask)
 
 
-@triton_op("finegrained_fp8::w8a8_block_dynamic_fp8_matmul_grouped", mutates_args=())
+@triton_op(
+    add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_grouped"), mutates_args=()
+)
 def _w8a8_block_dynamic_fp8_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -408,7 +411,9 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
     return C
 
 
-@triton_op("finegrained_fp8::w8a8_tensor_dynamic_fp8_matmul_grouped", mutates_args=())
+@triton_op(
+    add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul_grouped"), mutates_args=()
+)
 def _w8a8_tensor_dynamic_fp8_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -502,7 +507,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     Bs: (E, N // block_n, K // block_k) per-block weight scales
     output_dtype: defaults to ``A.dtype``
     """
-    return torch.ops.finegrained_fp8.w8a8_block_dynamic_fp8_matmul_grouped(
+    return ops.w8a8_block_dynamic_fp8_matmul_grouped(
         A, B, Bs, offsets, tokens_per_expert, block_size, output_dtype
     )
 
@@ -522,12 +527,14 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     Bs: (E,) or (E, 1, 1) per-expert weight scales
     output_dtype: defaults to ``A.dtype``
     """
-    return torch.ops.finegrained_fp8.w8a8_tensor_dynamic_fp8_matmul_grouped(
+    return ops.w8a8_tensor_dynamic_fp8_matmul_grouped(
         A, B, Bs, offsets, tokens_per_expert, output_dtype
     )
 
 
-@triton_op("finegrained_fp8::w4a8_block_dynamic_fp4_matmul_grouped", mutates_args=())
+@triton_op(
+    add_op_namespace_prefix("w4a8_block_dynamic_fp4_matmul_grouped"), mutates_args=()
+)
 def _w4a8_block_dynamic_fp4_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -620,7 +627,7 @@ def w4a8_block_dynamic_fp4_matmul_grouped(
     """Block-scale grouped W4A8 FP4 matmul with fused activation quant. Per-expert
     ``C[s] = A[s] @ B[e].T`` over contiguous, expert-sorted rows. Tile shape
     autotuned; FP4 scale granularity is fixed at 32."""
-    return torch.ops.finegrained_fp8.w4a8_block_dynamic_fp4_matmul_grouped(
+    return ops.w4a8_block_dynamic_fp4_matmul_grouped(
         A, B, Bs, offsets, tokens_per_expert, output_dtype
     )
 
