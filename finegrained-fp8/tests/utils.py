@@ -17,6 +17,11 @@ TEST_DEVICE = (
     if hasattr(torch, "xpu") and torch.xpu.is_available()
     else None
 )
+# Triton's ``fp8e4nv`` (``float8_e4m3fn``) requires SM89+ on CUDA. SM80 (A100)
+# fails kernel compilation, so every FP8/FP4 test in this suite needs this gate.
+SUPPORTS_FP8 = TEST_DEVICE == "xpu" or (
+    TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() >= (8, 9)
+)
 SUPPORTS_FP4 = TEST_DEVICE == "xpu" or (
     TEST_DEVICE == "cuda" and torch.cuda.get_device_capability()[0] >= 10
 )
