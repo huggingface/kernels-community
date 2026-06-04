@@ -19,7 +19,7 @@ COMMENT_CHARS_RE = re.compile(r"^/kernel-bot[ A-Za-z0-9_./-]*$")
 COMMAND_PERMISSIONS = {
     "build": {"admin", "write"},
     "build-and-stage": {"admin", "write"},
-    "merge-and-upload": {"admin"},
+    "merge-and-upload": {"admin", "write"},
     "release": {"admin"},
 }
 MAX_COMMENT_LENGTH = 1024
