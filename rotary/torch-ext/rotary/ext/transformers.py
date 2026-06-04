@@ -1,6 +1,6 @@
 import torch
 
-from .layers import apply_rotary
+from ..layers import apply_rotary
 
 
 def apply_rotary_transformers(
