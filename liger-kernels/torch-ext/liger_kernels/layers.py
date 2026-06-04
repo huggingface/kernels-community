@@ -21,8 +21,8 @@ class LigerLayerNorm(nn.Module):
     bias: nn.Parameter | None
     eps: float
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return LigerLayerNormFunction.apply(x, self.weight, self.bias, self.eps)
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return LigerLayerNormFunction.apply(input, self.weight, self.bias, self.eps)
 
     def extra_repr(self) -> str:
         return f"{self.hidden_size}, eps={self.eps}"
