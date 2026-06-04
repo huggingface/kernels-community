@@ -545,7 +545,7 @@ def main():
         dispatch_upload = True
         dispatch_repo_prefix = "kernels-community"
     else:  # merge-and-upload
-        target_branch = requested_branch or "main"
+        target_branch = requested_branch or ""
         dispatch_pr_number = ""
         dispatch_upload = True
         dispatch_repo_prefix = "kernels-community"
