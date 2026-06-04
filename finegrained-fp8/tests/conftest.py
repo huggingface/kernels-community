@@ -5,10 +5,6 @@ step, then gates the whole suite on FP8 hardware support."""
 import sys
 from pathlib import Path
 
-_TORCH_EXT = Path(__file__).resolve().parent.parent / "torch-ext"
-if str(_TORCH_EXT) not in sys.path:
-    sys.path.insert(0, str(_TORCH_EXT))
-
 import pytest  # noqa: E402
 
 from utils import SUPPORTS_FP8  # type: ignore  # noqa: E402
