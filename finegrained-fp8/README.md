@@ -67,16 +67,16 @@ Every matmul kernel name spells out four axes:
 w<W>a<A>_<weight_scale_layout>_<activation_quant>_<weight_dtype>_matmul[_batched|_grouped]
 ```
 
-| Axis | Values |
-|---|---|
-| `w<W>` / `a<A>` | weight / activation bit-widths (`w8a8`, `w4a8`) |
-| `<weight_scale_layout>` | `block` (per-`block_n × block_k` weight scale) or `tensor` (one scalar) |
-| `<activation_quant>` | `dynamic` (kernel computes per-K-block / per-row scale inline) or `static` (caller passes a per-tensor scalar) |
-| `<weight_dtype>` | `fp8` (`float8_e4m3fn`) or `fp4` (packed E2M1) |
+| Axis                    | Values                                                                                                         |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `w<W>` / `a<A>`         | weight / activation bit-widths (`w8a8`, `w4a8`)                                                                |
+| `<weight_scale_layout>` | `block` (per-`block_n × block_k` weight scale) or `tensor` (one scalar)                                        |
+| `<activation_quant>`    | `dynamic` (kernel computes per-K-block / per-row scale inline) or `static` (caller passes a per-tensor scalar) |
+| `<weight_dtype>`        | `fp8` (`float8_e4m3fn`) or `fp4` (packed E2M1)                                                                 |
 
 The dispatch suffix selects the input layout:
 
-- *no suffix*: single matmul `(M, K) @ (N, K).T → (M, N)`
+- _no suffix_: single matmul `(M, K) @ (N, K).T → (M, N)`
 - `_batched`: per-row expert dispatch `(S, K) + expert_ids → (S, N)`
 - `_grouped`: expert-sorted grouped GEMM `(S, K) + offsets + tokens_per_expert → (S, N)`
 
