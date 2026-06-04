@@ -23,12 +23,12 @@ from torch.library import triton_op, wrap_triton
 
 # ── Format constants ──────────────────────────────────────────────────────────
 
+# FP8 (E4M3) is the main format for weights and activations;
+FP8_DTYPE = torch.float8_e4m3fn
 # FP4 (E2M1) packs two 4-bit values per byte; scale factors are UE8M0, one per
 # K-group of 32 elements. These are format constants, not tunables.
 FP4_VALUES_PER_BYTE = 2
 FP4_SCALE_GROUP_K = 32
-
-_FP8_DTYPE = torch.float8_e4m3fn
 
 
 # ── Host-side helpers ─────────────────────────────────────────────────────────
@@ -198,7 +198,7 @@ def _fp8_act_quant(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert x.is_contiguous()
     assert x.shape[-1] % block_size == 0
-    y = torch.empty_like(x, dtype=_FP8_DTYPE)
+    y = torch.empty_like(x, dtype=FP8_DTYPE)
     grid = (triton.cdiv(x.numel(), block_size),)
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
 
