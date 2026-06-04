@@ -30,7 +30,6 @@ class LigerRMSNormTransformers(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
-# TODO: no bias and only silu x swish act fn
 class LigerSwiGLUMLPTransformers(nn.Module):
     gate_proj: nn.Linear
     up_proj: nn.Linear
@@ -94,11 +93,10 @@ def liger_fused_linear_cross_entropy(
     )
 
 
-# TODO: no bias only?
 # NOTE: We have this intentional graph break as we encounter issues such as IMAs and Cublas errors.
 #       We know that this is an optimized kernel already so there is less ways to
 #       fuse it either way; we rely on torch compile to go through the base model to optimize.
-@torch._dynamo.disable
+@torch.compiler.disable
 def LigerForCausalLMLossTransformers(
     logits: None,  # to match transformers signature
     labels: torch.Tensor,
