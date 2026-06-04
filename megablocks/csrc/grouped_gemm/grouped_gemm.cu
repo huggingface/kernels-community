@@ -1,3 +1,8 @@
+// Grouped GEMM is CUTLASS-based and CUDA-only. On ROCm the grouped GEMM is
+// provided by the vendored AITER Triton kernels in Python, so this translation
+// unit (and its CUTLASS includes) is compiled out for AMD builds.
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(USE_ROCM)
+
 #include "grouped_gemm.h"
 #include "fill_arguments.cuh"
 
@@ -565,3 +570,5 @@ void GroupedGemm(torch::Tensor a,
 }
 
 }  // namespace grouped_gemm
+
+#endif  // !defined(__HIP_PLATFORM_AMD__) && !defined(USE_ROCM)

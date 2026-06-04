@@ -13,6 +13,14 @@
     TORCH_CHECK(status == cudaSuccess, err);		    \
   } while (0)
 
+// hipify's CUDA->HIP symbol table maps cub::DeviceRadixSort / cub::DeviceScan
+// but is missing cub::DeviceHistogram, so the namespace is selected explicitly.
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+  #define MEGABLOCKS_CUB hipcub
+#else
+  #define MEGABLOCKS_CUB cub
+#endif
+
 namespace megablocks {
 
 template <typename T>
@@ -28,7 +36,7 @@ torch::Tensor cub_histogram(torch::Tensor x, int num_bins) {
 
   // Get scratchpad size.
   size_t scratchpad_bytes = 0;
-  CUDA_CALL(cub::DeviceHistogram::HistogramEven(nullptr,
+  CUDA_CALL(MEGABLOCKS_CUB::DeviceHistogram::HistogramEven(nullptr,
 						scratchpad_bytes,
 						x.data_ptr<T>(),
 						out.data_ptr<int>(),
@@ -44,7 +52,7 @@ torch::Tensor cub_histogram(torch::Tensor x, int num_bins) {
 
   // Run the kernel.
   for (int i = 0; i < x.size(0); ++i) {
-    CUDA_CALL(cub::DeviceHistogram::HistogramEven(scratchpad.data_ptr(),
+    CUDA_CALL(MEGABLOCKS_CUB::DeviceHistogram::HistogramEven(scratchpad.data_ptr(),
 						  scratchpad_bytes,
 						  x.data_ptr<T>() + x.size(1) * i,
 						  out.data_ptr<int>() + out.size(1) * i,
