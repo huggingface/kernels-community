@@ -50,30 +50,32 @@ Tensor-scale grouped expert matmul. Uses the same grouped scheduling as block mo
 
 All kernels target Hopper (SM90) FP8 WGMMA instructions and are also compatible with ROCm and XPU backends via Triton.
 
-## Benchmarking
+## Naming convention
 
-Use the standalone benchmark script to compare current latency before and after kernel changes:
+Every matmul kernel name spells out four axes:
 
-```bash
-cd kernels-community/finegrained-fp8
-python benchmark_perf.py --op grouped --device xpu --preset deepseek_v4_gate_up_prefill --weight-format fp8 --compare-eager
-python benchmark_perf.py --op batched --device xpu --preset deepseek_v4_gate_up_decode --weight-format fp4 --compare-eager
-python benchmark_perf.py --op all --device xpu --preset deepseek_v4_gate_up_prefill --matmul-preset deepseek_v4_gate_up_prefill --weight-format fp8 --compare-eager --json /tmp/finegrained-fp8-perf.json
+```
+w<W>a<A>_<weight_scale_layout>_<activation_quant>_<weight_dtype>_matmul[_batched|_grouped]
 ```
 
-The script prints median/mean/min/max latency and effective TOPS. With `--compare-eager`, it also reports speedup over the matching torch reference baseline:
+| Axis | Values |
+|---|---|
+| `w<W>` / `a<A>` | weight / activation bit-widths (`w8a8`, `w4a8`) |
+| `<weight_scale_layout>` | `block` (per-`block_n × block_k` weight scale) or `tensor` (one scalar) |
+| `<activation_quant>` | `dynamic` (kernel computes per-K-block / per-row scale inline) or `static` (caller passes a per-tensor scalar) |
+| `<weight_dtype>` | `fp8` (`float8_e4m3fn`) or `fp4` (packed E2M1) |
 
-- `--weight-format fp8` benchmarks FP8-weight kernels and compares against `torch_fp8_baseline`.
-- `--weight-format fp4` benchmarks FP4-weight kernels and compares against `torch_fp4_baseline`.
+The dispatch suffix selects the input layout:
 
-- `torch_fp8_baseline` for FP8 weights
-- `torch_fp4_baseline` for FP4 weights
+- *no suffix*: single matmul `(M, K) @ (N, K).T → (M, N)`
+- `_batched`: per-row expert dispatch `(S, K) + expert_ids → (S, N)`
+- `_grouped`: expert-sorted grouped GEMM `(S, K) + offsets + tokens_per_expert → (S, N)`
 
-This is useful for tracking grouped, batched, and matmul kernel improvements against a consistent non-kernel reference.
+Not every combination is implemented — current set:
 
-The default presets now target DeepSeek-V4-style expert shapes:
+- `w8a8_block_static_fp8_matmul` (single-matmul only)
+- `w8a8_block_dynamic_fp8_matmul[_batched|_grouped]`
+- `w4a8_block_dynamic_fp4_matmul[_batched|_grouped]`
+- `w8a8_tensor_dynamic_fp8_matmul[_batched|_grouped]`
 
-- `deepseek_v4_gate_up_*`: `E=256`, `top_k=6`, `N=4096`, `K=4096`
-- `deepseek_v4_down_*`: `E=256`, `top_k=6`, `N=4096`, `K=2048`
-
-Legacy `qwen3_*` presets are still available for regression comparison against the original MoE test shapes.
+For convenience, neutral dispatchers `matmul`, `matmul_batched`, `matmul_grouped` route to the right kernel based on `B.dtype`, `block_size`, and the optional `activation_scale` kwarg.

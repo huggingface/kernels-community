@@ -37,7 +37,7 @@ from .utils import (
     key=["N", "K"],
 )
 @triton.jit
-def w8a8_block_fp8_matmul_batched_kernel(
+def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     A,  # (S, K) raw BF16/FP16 activations
     B,  # (E, N, K) FP8 weight matrices
     C,  # (S, N) output
@@ -128,7 +128,7 @@ def w8a8_block_fp8_matmul_batched_kernel(
     key=["N", "K"],
 )
 @triton.jit
-def w8a8_tensor_fp8_matmul_batched_kernel(
+def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     A,  # (S, K) pre-quantized FP8 activations
     B,  # (E, N, K) FP8 weight matrices
     C,  # (S, N) output
@@ -217,7 +217,7 @@ def w8a8_tensor_fp8_matmul_batched_kernel(
     key=["N", "K"],
 )
 @triton.jit
-def w4a8_fp4_matmul_batched_kernel(
+def w4a8_block_dynamic_fp4_matmul_batched_kernel(
     A,  # (S, K) raw BF16/FP16 activations
     B,  # (E, N, K // 2) packed FP4 (E2M1) expert weights as int8
     C,  # (S, N) output
@@ -296,8 +296,8 @@ def w4a8_fp4_matmul_batched_kernel(
     tl.store(c_ptrs, accumulator.to(C.dtype.element_ty), mask=(offs_cm == 0)[:, None])
 
 
-@triton_op("finegrained_fp8::w8a8_block_fp8_matmul_batched", mutates_args=())
-def _w8a8_block_fp8_matmul_batched(
+@triton_op("finegrained_fp8::w8a8_block_dynamic_fp8_matmul_batched", mutates_args=())
+def _w8a8_block_dynamic_fp8_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -344,7 +344,7 @@ def _w8a8_block_fp8_matmul_batched(
         Bs = Bs.view(torch.uint8)
     grid = (S, triton.cdiv(N, block_n))
     with device_context(A.device):
-        wrap_triton(w8a8_block_fp8_matmul_batched_kernel)[grid](
+        wrap_triton(w8a8_block_dynamic_fp8_matmul_batched_kernel)[grid](
             A,
             B,
             C,
@@ -373,8 +373,8 @@ def _w8a8_block_fp8_matmul_batched(
     return C
 
 
-@triton_op("finegrained_fp8::w8a8_tensor_fp8_matmul_batched", mutates_args=())
-def _w8a8_tensor_fp8_matmul_batched(
+@triton_op("finegrained_fp8::w8a8_tensor_dynamic_fp8_matmul_batched", mutates_args=())
+def _w8a8_tensor_dynamic_fp8_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -414,7 +414,7 @@ def _w8a8_tensor_fp8_matmul_batched(
     BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
     grid = (S, triton.cdiv(N, BLOCK_SIZE_N))
     with device_context(A.device):
-        wrap_triton(w8a8_tensor_fp8_matmul_batched_kernel)[grid](
+        wrap_triton(w8a8_tensor_dynamic_fp8_matmul_batched_kernel)[grid](
             qA,
             B,
             C,
@@ -443,7 +443,7 @@ def _w8a8_tensor_fp8_matmul_batched(
     return C
 
 
-def w8a8_block_fp8_matmul_batched(
+def w8a8_block_dynamic_fp8_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -459,12 +459,12 @@ def w8a8_block_fp8_matmul_batched(
     expert_ids: (S,) — kernel loads stride-aware, any int dtype works
     output_dtype: defaults to ``A.dtype``
     """
-    return torch.ops.finegrained_fp8.w8a8_block_fp8_matmul_batched(
+    return torch.ops.finegrained_fp8.w8a8_block_dynamic_fp8_matmul_batched(
         A, B, Bs, expert_ids, block_size, output_dtype
     )
 
 
-def w8a8_tensor_fp8_matmul_batched(
+def w8a8_tensor_dynamic_fp8_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -478,13 +478,13 @@ def w8a8_tensor_fp8_matmul_batched(
     Bs: (E,) or (E, 1, 1) per-expert weight scales
     output_dtype: defaults to ``A.dtype``
     """
-    return torch.ops.finegrained_fp8.w8a8_tensor_fp8_matmul_batched(
+    return torch.ops.finegrained_fp8.w8a8_tensor_dynamic_fp8_matmul_batched(
         A, B, Bs, expert_ids, output_dtype
     )
 
 
-@triton_op("finegrained_fp8::w4a8_fp4_matmul_batched", mutates_args=())
-def _w4a8_fp4_matmul_batched(
+@triton_op("finegrained_fp8::w4a8_block_dynamic_fp4_matmul_batched", mutates_args=())
+def _w4a8_block_dynamic_fp4_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -530,7 +530,7 @@ def _w4a8_fp4_matmul_batched(
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
-        wrap_triton(w4a8_fp4_matmul_batched_kernel)[grid](
+        wrap_triton(w4a8_block_dynamic_fp4_matmul_batched_kernel)[grid](
             A,
             B,
             C,
@@ -559,7 +559,7 @@ def _w4a8_fp4_matmul_batched(
     return C
 
 
-def w4a8_fp4_matmul_batched(
+def w4a8_block_dynamic_fp4_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -568,7 +568,7 @@ def w4a8_fp4_matmul_batched(
 ) -> torch.Tensor:
     """Block-scale batched W4A8 FP4 matmul with fused activation quant. Tile
     shape autotuned; FP4 scale granularity is fixed at 32."""
-    return torch.ops.finegrained_fp8.w4a8_fp4_matmul_batched(
+    return torch.ops.finegrained_fp8.w4a8_block_dynamic_fp4_matmul_batched(
         A, B, Bs, expert_ids, output_dtype
     )
 
@@ -584,17 +584,17 @@ def matmul_batched(
     routed row per program to ``B[expert_ids[s]]``.
 
     Routes by weight dtype and ``block_size``:
-    - ``B.dtype == int8`` (packed FP4) → ``w4a8_fp4_matmul_batched``
+    - ``B.dtype == int8`` (packed FP4) → ``w4a8_block_dynamic_fp4_matmul_batched``
       (``block_size`` is ignored; FP4 tile shape is autotuned).
-    - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_fp8_matmul_batched``.
-    - otherwise → ``w8a8_block_fp8_matmul_batched``.
+    - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_dynamic_fp8_matmul_batched``.
+    - otherwise → ``w8a8_block_dynamic_fp8_matmul_batched``.
     """
     if B.dtype == torch.int8:
-        return w4a8_fp4_matmul_batched(A, B, Bs, expert_ids, A.dtype)
+        return w4a8_block_dynamic_fp4_matmul_batched(A, B, Bs, expert_ids, A.dtype)
 
     if block_size is None or (
         block_size[0] == B.size(1) and block_size[1] == B.size(2)
     ):
-        return w8a8_tensor_fp8_matmul_batched(A, B, Bs, expert_ids)
+        return w8a8_tensor_dynamic_fp8_matmul_batched(A, B, Bs, expert_ids)
 
-    return w8a8_block_fp8_matmul_batched(A, B, Bs, expert_ids, block_size)
+    return w8a8_block_dynamic_fp8_matmul_batched(A, B, Bs, expert_ids, block_size)

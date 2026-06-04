@@ -37,7 +37,7 @@ from .utils import (
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
-def w8a8_block_fp8_matmul_kernel(
+def w8a8_block_dynamic_fp8_matmul_kernel(
     A,  # (M, K) raw BF16/FP16 activations
     B,  # (N, K) FP8 weights
     C,  # (M, N) output
@@ -117,7 +117,7 @@ def w8a8_block_fp8_matmul_kernel(
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
-def w8a8_tensor_fp8_matmul_kernel(
+def w8a8_tensor_dynamic_fp8_matmul_kernel(
     A,  # (M, K) pre-quantized FP8 activations
     B,  # (N, K) FP8 weights
     C,  # (M, N) output
@@ -193,7 +193,7 @@ def w8a8_tensor_fp8_matmul_kernel(
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
-def w8a8_static_block_fp8_matmul_kernel(
+def w8a8_block_static_fp8_matmul_kernel(
     A,  # (M, K) raw BF16/FP16 activations
     B,  # (N, K) FP8 weights
     C,  # (M, N) output
@@ -283,7 +283,7 @@ def w8a8_static_block_fp8_matmul_kernel(
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
-def w4a8_fp4_matmul_kernel(
+def w4a8_block_dynamic_fp4_matmul_kernel(
     A,  # (M, K) raw BF16/FP16 activations
     B,  # (N, K // 2) packed FP4 (E2M1) weights as int8
     C,  # (M, N) output
@@ -359,8 +359,8 @@ def w4a8_fp4_matmul_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton_op("finegrained_fp8::w8a8_block_fp8_matmul", mutates_args=())
-def _w8a8_block_fp8_matmul(
+@triton_op("finegrained_fp8::w8a8_block_dynamic_fp8_matmul", mutates_args=())
+def _w8a8_block_dynamic_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -404,7 +404,7 @@ def _w8a8_block_fp8_matmul(
         Bs = Bs.view(torch.uint8)
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
     with device_context(A.device):
-        wrap_triton(w8a8_block_fp8_matmul_kernel)[grid](
+        wrap_triton(w8a8_block_dynamic_fp8_matmul_kernel)[grid](
             A,
             B,
             C,
@@ -430,8 +430,8 @@ def _w8a8_block_fp8_matmul(
     return C
 
 
-@triton_op("finegrained_fp8::w8a8_static_block_fp8_matmul", mutates_args=())
-def _w8a8_static_block_fp8_matmul(
+@triton_op("finegrained_fp8::w8a8_block_static_fp8_matmul", mutates_args=())
+def _w8a8_block_static_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -485,7 +485,7 @@ def _w8a8_static_block_fp8_matmul(
         Bs = Bs.view(torch.uint8)
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
     with device_context(A.device):
-        wrap_triton(w8a8_static_block_fp8_matmul_kernel)[grid](
+        wrap_triton(w8a8_block_static_fp8_matmul_kernel)[grid](
             A,
             B,
             C,
@@ -512,8 +512,8 @@ def _w8a8_static_block_fp8_matmul(
     return C
 
 
-@triton_op("finegrained_fp8::w8a8_tensor_fp8_matmul", mutates_args=())
-def _w8a8_tensor_fp8_matmul(
+@triton_op("finegrained_fp8::w8a8_tensor_dynamic_fp8_matmul", mutates_args=())
+def _w8a8_tensor_dynamic_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -551,7 +551,7 @@ def _w8a8_tensor_fp8_matmul(
     BLOCK_SIZE_M = adaptive_block_size_m(M)
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
     with device_context(A.device):
-        wrap_triton(w8a8_tensor_fp8_matmul_kernel)[grid](
+        wrap_triton(w8a8_tensor_dynamic_fp8_matmul_kernel)[grid](
             qA,
             B,
             C,
@@ -577,8 +577,8 @@ def _w8a8_tensor_fp8_matmul(
     return C
 
 
-@triton_op("finegrained_fp8::w4a8_fp4_matmul", mutates_args=())
-def _w4a8_fp4_matmul(
+@triton_op("finegrained_fp8::w4a8_block_dynamic_fp4_matmul", mutates_args=())
+def _w4a8_block_dynamic_fp4_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -621,7 +621,7 @@ def _w4a8_fp4_matmul(
         return (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
-        wrap_triton(w4a8_fp4_matmul_kernel)[grid](
+        wrap_triton(w4a8_block_dynamic_fp4_matmul_kernel)[grid](
             A,
             B,
             C,
@@ -646,7 +646,7 @@ def _w4a8_fp4_matmul(
     return C
 
 
-def w8a8_block_fp8_matmul(
+def w8a8_block_dynamic_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -666,12 +666,12 @@ def w8a8_block_fp8_matmul(
     Returns:
         Output tensor ``[..., M, N]`` in ``output_dtype``.
     """
-    return torch.ops.finegrained_fp8.w8a8_block_fp8_matmul(
+    return torch.ops.finegrained_fp8.w8a8_block_dynamic_fp8_matmul(
         A, B, Bs, block_size, output_dtype
     )
 
 
-def w8a8_static_block_fp8_matmul(
+def w8a8_block_static_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -693,12 +693,12 @@ def w8a8_static_block_fp8_matmul(
     Returns:
         Output tensor ``[..., M, N]`` in ``output_dtype``.
     """
-    return torch.ops.finegrained_fp8.w8a8_static_block_fp8_matmul(
+    return torch.ops.finegrained_fp8.w8a8_block_static_fp8_matmul(
         A, B, Bs, As, block_size, output_dtype
     )
 
 
-def w8a8_tensor_fp8_matmul(
+def w8a8_tensor_dynamic_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -715,10 +715,12 @@ def w8a8_tensor_fp8_matmul(
         Bs: Single weight scale, scalar or ``[1]``.
         output_dtype: dtype of the returned tensor.
     """
-    return torch.ops.finegrained_fp8.w8a8_tensor_fp8_matmul(A, B, Bs, output_dtype)
+    return torch.ops.finegrained_fp8.w8a8_tensor_dynamic_fp8_matmul(
+        A, B, Bs, output_dtype
+    )
 
 
-def w4a8_fp4_matmul(
+def w4a8_block_dynamic_fp4_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -737,7 +739,9 @@ def w4a8_fp4_matmul(
         Bs: UE8M0 weight scales ``[N, K // 32]``.
         output_dtype: dtype of the returned tensor (default ``bfloat16``).
     """
-    return torch.ops.finegrained_fp8.w4a8_fp4_matmul(A, B, Bs, output_dtype)
+    return torch.ops.finegrained_fp8.w4a8_block_dynamic_fp4_matmul(
+        A, B, Bs, output_dtype
+    )
 
 
 def matmul(
@@ -755,11 +759,11 @@ def matmul(
     (static quant); otherwise it computes its own scale from ``A`` (dynamic).
 
     Routes by weight dtype and ``block_size``:
-    - ``B.dtype == int8`` (packed FP4) → ``w4a8_fp4_matmul``
+    - ``B.dtype == int8`` (packed FP4) → ``w4a8_block_dynamic_fp4_matmul``
       (``block_size`` is ignored; FP4 scale granularity is fixed at 32 and
       tile sizes are autotuned).
-    - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_fp8_matmul``.
-    - otherwise → ``w8a8_block_fp8_matmul`` (or its static variant when
+    - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_dynamic_fp8_matmul``.
+    - otherwise → ``w8a8_block_dynamic_fp8_matmul`` (or its static variant when
       ``activation_scale`` is given).
     """
     if activation_scale is not None:
@@ -774,16 +778,16 @@ def matmul(
                 "static activation_scale requires block-wise weights, "
                 "not tensor-mode (block_size None or full [N, K])"
             )
-        return w8a8_static_block_fp8_matmul(
+        return w8a8_block_static_fp8_matmul(
             A, B, Bs, activation_scale, block_size, output_dtype
         )
 
     if B.dtype == torch.int8:
-        return w4a8_fp4_matmul(A, B, Bs, output_dtype)
+        return w4a8_block_dynamic_fp4_matmul(A, B, Bs, output_dtype)
 
     if block_size is None or (
         block_size[0] == B.size(0) and block_size[1] == B.size(1)
     ):
-        return w8a8_tensor_fp8_matmul(A, B, Bs, output_dtype)
+        return w8a8_tensor_dynamic_fp8_matmul(A, B, Bs, output_dtype)
 
-    return w8a8_block_fp8_matmul(A, B, Bs, block_size, output_dtype)
+    return w8a8_block_dynamic_fp8_matmul(A, B, Bs, block_size, output_dtype)
