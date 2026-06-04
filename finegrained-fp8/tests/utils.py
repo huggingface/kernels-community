@@ -17,12 +17,15 @@ TEST_DEVICE = (
     if hasattr(torch, "xpu") and torch.xpu.is_available()
     else None
 )
+# FP8 kernels require Hopper (SM90) or newer on CUDA. SM89 (Ada Lovelace, L4)
+# can compile fp8e4nv but its numerics drift from the dequant+matmul reference
+# by enough to need separate tolerances — not worth maintaining for a non-target SM.
+SUPPORTS_FP8 = TEST_DEVICE == "xpu" or (
+    TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() >= (9, 0)
+)
 SUPPORTS_FP4 = TEST_DEVICE == "xpu" or (
     TEST_DEVICE == "cuda" and torch.cuda.get_device_capability()[0] >= 10
 )
-# SM89 (Ada Lovelace, e.g. L4) has looser FP8 numerics vs the dequant+matmul
-# reference than Hopper/Blackwell — wide tolerances here, tight everywhere else.
-IS_SM89 = TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() == (8, 9)
 # SM90 (Hopper, e.g. H100) is the only architecture the benchmark baselines
 # are calibrated against — every other SM has its own latency profile.
 IS_SM90 = TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() == (9, 0)
@@ -31,19 +34,11 @@ DTYPE_TAG = {
     torch.float16: "fp16",
     torch.float32: "fp32",
 }
-DTYPE_TO_TOL = (
-    {
-        torch.bfloat16: (0.2, 0.05),
-        torch.float16: (0.2, 0.05),
-        torch.float32: (0.2, 0.05),
-    }
-    if IS_SM89
-    else {
-        torch.bfloat16: (1e-4, 1e-2),
-        torch.float16: (1e-4, 1e-2),
-        torch.float32: (1e-4, 1e-4),
-    }
-)
+DTYPE_TO_TOL = {
+    torch.bfloat16: (1e-4, 1e-2),
+    torch.float16: (1e-4, 1e-2),
+    torch.float32: (1e-4, 1e-4),
+}
 
 
 def accelerator_module():
