@@ -3,6 +3,9 @@ library_name: kernels
 {% if license %}license: {{ license }}
 {% endif %}---
 
+> [!WARNING]
+> These rotary kernels are based on the old [CUDA implementations](https://github.com/Dao-AILab/flash-attention/tree/2715c53932c28e81c15ad4d1690639b77ddda6c1/csrc/rotary) in the [FlashAttention repository](https://github.com/Dao-AILab/flash-attention). These kernels are no longer maintained upstream.
+
 This is the repository card of {{ repo_id }} that has been pushed on the Hub. It was built to be used with the [`kernels` library](https://github.com/huggingface/kernels). This card was automatically generated.
 
 ## How to use
