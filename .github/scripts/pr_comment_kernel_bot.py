@@ -21,9 +21,7 @@ COMMAND_PERMISSIONS = {
     "build-and-stage": {"admin", "write"},
     "merge-and-upload": {"admin"},
     "release": {"admin"},
-    "security": {"admin", "write"},
 }
-KERNEL_LESS_COMMANDS = {"security"}
 SECURITY_WORKFLOW = "security-audit.yml"
 MAX_COMMENT_LENGTH = 1024
 RUN_LOOKUP_ATTEMPTS = 10
@@ -31,7 +29,7 @@ RUN_LOOKUP_SLEEP_SECONDS = 2
 RUN_LOOKUP_PAGE_SIZE = 100
 COMMAND_USAGE = (
     "Invalid command. Use `/kernel-bot <build|build-and-stage|merge-and-upload|release> "
-    "<kernel1> [kernel2 ...] [--branch <target_branch>]`, or `/kernel-bot security`."
+    "<kernel1> [kernel2 ...] [--branch <target_branch>]`."
 )
 
 
@@ -305,6 +303,8 @@ def format_pending_comment(
     mode_text: str,
     target_branch: str,
     pr_head_sha: str | None,
+    *,
+    include_security: bool = False,
 ):
     lines = comment_base_lines(
         "Build request received.",
@@ -313,6 +313,8 @@ def format_pending_comment(
         target_branch,
         pr_head_sha,
     )
+    if include_security:
+        lines.append(f"Security audit: `{SECURITY_WORKFLOW}` (running concurrently)")
     lines.extend(["", "Status: `processing`"])
     return "\n".join(lines)
 
@@ -327,6 +329,8 @@ def format_result_comment(
     dispatches: list[DispatchResult] | None = None,
     failed: list[tuple[str, int]] | None = None,
     failure_message: str | None = None,
+    security_dispatch: DispatchResult | None = None,
+    security_failure: str | None = None,
 ):
     dispatches = dispatches or []
     failed = failed or []
@@ -348,6 +352,18 @@ def format_result_comment(
         lines.extend(["", f"Merge result: {merge_result_message}"])
     if dispatches:
         lines.extend(format_dispatched_lines(dispatches))
+    if security_failure:
+        lines.extend(["", f"Security audit: {security_failure}"])
+    elif security_dispatch is not None:
+        if security_dispatch.action_url:
+            lines.extend(["", f"Security audit: {security_dispatch.action_url}"])
+        else:
+            lines.extend(
+                [
+                    "",
+                    f"Security audit: dispatched, but run URL is not available yet (`{SECURITY_WORKFLOW}`).",
+                ]
+            )
     if failed:
         failed_text = ", ".join(f"{kernel} (HTTP {code})" for kernel, code in failed)
         lines.extend(["", f"Failed ({len(failed)}): `{failed_text}`"])
@@ -356,7 +372,7 @@ def format_result_comment(
 
 def parse_command(comment: str) -> ParsedCommand:
     tokens = comment.strip().split()
-    if len(tokens) < 2:
+    if len(tokens) < 3:
         return ParsedCommand(error=COMMAND_USAGE)
 
     command = tokens[1]
@@ -364,16 +380,6 @@ def parse_command(comment: str) -> ParsedCommand:
         return ParsedCommand(error=COMMAND_USAGE)
 
     args = tokens[2:]
-
-    if command in KERNEL_LESS_COMMANDS:
-        if args:
-            return ParsedCommand(
-                error=f"`/kernel-bot {command}` takes no arguments. Use `/kernel-bot {command}`.",
-            )
-        return ParsedCommand(command=command)
-
-    if len(tokens) < 3:
-        return ParsedCommand(error=COMMAND_USAGE)
 
     branch = None
 
@@ -456,117 +462,26 @@ def dispatch_workflow(
     github_api_request(url, token, method="POST", data={"ref": ref, "inputs": inputs})
 
 
-def format_security_comment(
-    command_summary: str,
-    pr_head_sha: str | None,
-    *,
-    action_url: str | None = None,
-    status: str = "processing",
-    failure_message: str | None = None,
-):
-    title = (
-        "Security audit failed to start."
-        if failure_message
-        else "Security audit request received."
-    )
-    lines = [
-        title,
-        "",
-        f"Command: `{command_summary}`",
-        f"Workflow: `{SECURITY_WORKFLOW}`",
-    ]
-    if pr_head_sha:
-        lines.append(f"PR head SHA: `{pr_head_sha}`")
-    if failure_message:
-        lines.extend(["", f"Failure: {failure_message}"])
-    else:
-        lines.extend(["", f"Status: `{status}`"])
-        if action_url:
-            lines.append(f"Audit run: {action_url}")
-        elif status != "processing":
-            lines.append("Audit run: dispatched, but run URL is not available yet.")
-    lines.extend(
-        ["", "Findings (if any) will be posted as a follow-up comment on this PR."]
-    )
-    return "\n".join(lines)
-
-
-def handle_security_command(
+def dispatch_security_audit(
     api_base: str,
     token: str,
-    repository: str,
     default_branch: str,
     issue_number: int,
-    command_summary: str,
     pr_head_sha: str | None,
 ):
-    status_comment_id = comment_id_from_response(
-        try_create_issue_comment(
-            api_base,
-            token,
-            issue_number,
-            format_security_comment(command_summary, pr_head_sha),
-        )
-    )
-
     dispatch_key = make_dispatch_key(issue_number, "security")
-    try:
-        dispatch_workflow(
-            api_base,
-            token,
-            SECURITY_WORKFLOW,
-            default_branch,
-            {
-                "pr_number": str(issue_number),
-                "dispatch_key": dispatch_key,
-                "head_sha": pr_head_sha or "",
-            },
-        )
-    except urllib.error.HTTPError as e:
-        err_text = e.read().decode("utf-8", errors="replace")
-        print(
-            f"Failed to dispatch {SECURITY_WORKFLOW} (HTTP {e.code}).",
-            file=sys.stderr,
-        )
-        print(err_text, file=sys.stderr)
-        try_send_issue_comment(
-            api_base,
-            token,
-            issue_number,
-            format_security_comment(
-                command_summary,
-                pr_head_sha,
-                failure_message=(
-                    f"Could not dispatch `{SECURITY_WORKFLOW}` (HTTP {e.code})."
-                ),
-            ),
-            comment_id=status_comment_id,
-        )
-        return 1
-
-    dispatch = DispatchResult(kernel_name="security", dispatch_key=dispatch_key)
-    resolve_dispatch_run_urls(
+    dispatch_workflow(
         api_base,
         token,
-        repository,
+        SECURITY_WORKFLOW,
         default_branch,
-        [dispatch],
-        workflows=[SECURITY_WORKFLOW],
+        {
+            "pr_number": str(issue_number),
+            "dispatch_key": dispatch_key,
+            "head_sha": pr_head_sha or "",
+        },
     )
-
-    try_send_issue_comment(
-        api_base,
-        token,
-        issue_number,
-        format_security_comment(
-            command_summary,
-            pr_head_sha,
-            action_url=dispatch.action_url,
-            status="dispatched",
-        ),
-        comment_id=status_comment_id,
-    )
-    return 0
+    return DispatchResult(kernel_name="security", dispatch_key=dispatch_key)
 
 
 def main():
@@ -669,18 +584,6 @@ def main():
 
     pr_head_sha = pull_request.get("head", {}).get("sha")
 
-    if command == "security":
-        command_summary = f"/kernel-bot {command}"
-        return handle_security_command(
-            api_base,
-            token,
-            repository,
-            default_branch,
-            issue_number,
-            command_summary,
-            pr_head_sha,
-        )
-
     if command == "build":
         target_branch = requested_branch or f"pr-{issue_number}"
         dispatch_pr_number = str(issue_number)
@@ -711,6 +614,8 @@ def main():
     command_summary = f"/kernel-bot {command} {' '.join(kernels)}"
     if requested_branch is not None:
         command_summary += f" --branch {requested_branch}"
+    # `/kernel-bot build` always runs the security audit concurrently with the build.
+    run_security = command == "build"
     status_comment_id = comment_id_from_response(
         try_create_issue_comment(
             api_base,
@@ -721,6 +626,7 @@ def main():
                 mode_text,
                 target_branch,
                 pr_head_sha,
+                include_security=run_security,
             ),
         )
     )
@@ -815,13 +721,31 @@ def main():
         for wf, code in release_result.failed:
             failed.append((f"{kernel_name} ({wf})", code))
 
+    security_dispatch = None
+    security_failure = None
+    if run_security:
+        try:
+            security_dispatch = dispatch_security_audit(
+                api_base, token, default_branch, issue_number, pr_head_sha
+            )
+        except urllib.error.HTTPError as e:
+            err_text = e.read().decode("utf-8", errors="replace")
+            print(
+                f"Failed to dispatch {SECURITY_WORKFLOW} (HTTP {e.code}).",
+                file=sys.stderr,
+            )
+            print(err_text, file=sys.stderr)
+            security_failure = f"could not dispatch `{SECURITY_WORKFLOW}` (HTTP {e.code})."
+
     resolve_dispatch_run_urls(
         api_base,
         token,
         repository,
         default_branch,
-        dispatches,
-        workflows=RELEASE_WORKFLOWS,
+        [*dispatches, *([security_dispatch] if security_dispatch else [])],
+        workflows=[*RELEASE_WORKFLOWS, SECURITY_WORKFLOW]
+        if run_security
+        else RELEASE_WORKFLOWS,
     )
 
     comment_written = try_send_issue_comment(
@@ -836,6 +760,8 @@ def main():
             merge_result_message=merge_result_message,
             dispatches=dispatches,
             failed=failed,
+            security_dispatch=security_dispatch,
+            security_failure=security_failure,
         ),
         comment_id=status_comment_id,
     )
