@@ -20,24 +20,49 @@ from .swiglu import LigerSiLUMulFunction
 from .tvd import LigerTVDLossFunction
 
 
-# NOTE: Not compile-friendly --> large deviations to the original implementation under compile
 class LigerRMSNorm(nn.Module):
-    weight: nn.Parameter
-    variance_epsilon: float
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        offset: float = 0.0,
+        casting_mode: str = "llama",
+        init_fn: str = "ones",
+        in_place: bool = True,
+        row_mode: Optional[bool] = None,
+        elementwise_affine: bool = True,
+    ):
+        super().__init__()
+        assert init_fn in ("ones", "zeros"), f"init_fn must be 'ones' or 'zeros', got {init_fn}"
+        self.hidden_size = hidden_size
+        self.variance_epsilon = eps
+        self.offset = offset
+        self.casting_mode = casting_mode
+        self.in_place = in_place
+        self.row_mode = row_mode
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            init = torch.ones(hidden_size) if init_fn == "ones" else torch.zeros(hidden_size)
+            self.weight = nn.Parameter(init)
+        else:
+            self.register_parameter("weight", None)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return LigerRMSNormFunction.apply(
             hidden_states,
             self.weight,
             self.variance_epsilon,
-            0,
-            "llama",
-            True,
-            None,
+            self.offset,
+            self.casting_mode,
+            self.in_place,
+            self.row_mode,
         )
 
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+    def extra_repr(self) -> str:
+        return (
+            f"{self.hidden_size}, eps={self.variance_epsilon}, offset={self.offset}, "
+            f"in_place={self.in_place}, row_mode={self.row_mode}"
+        )
 
 
 class LigerLayerNorm(nn.Module):
@@ -246,11 +271,19 @@ class LigerTVDLoss(nn.Module):
 
 
 class LigerSwiGLUMLP(nn.Module):
-    gate_proj: nn.Linear
-    up_proj: nn.Linear
-    down_proj: nn.Linear
+    """SwiGLU MLP block. ``config`` must expose ``hidden_size``, ``intermediate_size``,
+    and ``hidden_act`` (must be ``silu`` or ``swish``)."""
 
-    can_torch_compile = True
+    def __init__(self, config):
+        super().__init__()
+        if config.hidden_act not in ("silu", "swish"):
+            raise ValueError(f"Activation function {config.hidden_act} not supported.")
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(LigerSiLUMulFunction.apply(self.gate_proj(x), self.up_proj(x)))
@@ -325,32 +358,23 @@ def liger_fused_linear_cross_entropy(
     )
 
 
-# NOTE: We have this intentional graph break as we encounter issues such as IMAs and Cublas errors.
-#       We know that this is an optimized kernel already so there is less ways to
-#       fuse it either way; we rely on torch compile to go through the base model to optimize.
-@torch._dynamo.disable
 def LigerForCausalLMLoss(
-    logits: None,  # to match transformers signature
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
     labels: torch.Tensor,
-    vocab_size: int,  # to match transformers signature
+    hidden_size: int,
     num_items_in_batch: Optional[int] = None,
     ignore_index: int = -100,
     shift_labels: Optional[torch.Tensor] = None,
-    hidden_states: torch.Tensor | None = None,
-    lm_head_weight: torch.Tensor | None = None,
+    final_logit_softcapping: Optional[float] = None,
+    return_token_accuracy: bool = False,
+    return_predicted_tokens: bool = False,
     **kwargs,
 ):
-    # To match signature we hide these behind the kwargs but we expect a few kwargs to exist
-    hidden_size = kwargs.pop("hidden_size", None)
-    final_logit_softcapping = kwargs.pop("final_logit_softcapping", None)
-
-    if hidden_size is None or hidden_states is None or lm_head_weight is None:
-        raise ValueError(
-            f"`LigerForCausalLMLoss` requires the LLM's weight (found `{lm_head_weight is not None}`),"
-            f"the last hidden state (found `{hidden_states is not None}`), and the `hidden_size`"
-            f"(found `{hidden_size is not None}`). Please make sure to pass the necessary kwargs."
-        )
-
+    """Drop-in replacement for ``transformers.loss.ForCausalLMLoss`` that fuses the
+    final ``lm_head`` projection with the cross-entropy loss. Returns a scalar
+    ``loss`` by default; returns a :class:`CrossEntropyOutput` when
+    ``return_token_accuracy`` or ``return_predicted_tokens`` is set."""
     applicable_params = inspect.signature(liger_fused_linear_cross_entropy).parameters
     kwargs = {k: v for k, v in kwargs.items() if k in applicable_params}
 
@@ -362,21 +386,36 @@ def LigerForCausalLMLoss(
     shift_labels = shift_labels.view(-1).to(hidden_states.device)
 
     reduction = "sum" if num_items_in_batch is not None else "mean"
-    loss = liger_fused_linear_cross_entropy(
+    result = liger_fused_linear_cross_entropy(
         hidden_states,
         lm_head_weight,
         shift_labels,
         reduction=reduction,
         ignore_index=ignore_index,
         softcap=final_logit_softcapping,
-        return_token_accuracy=False,
-        return_predicted_tokens=False,
+        return_token_accuracy=return_token_accuracy,
+        return_predicted_tokens=return_predicted_tokens,
         **kwargs,
     )
+
+    if isinstance(result, CrossEntropyOutput):
+        loss = result.loss
+        token_accuracy = result.token_accuracy
+        predicted_tokens = result.predicted_tokens
+    else:
+        loss = result
+        token_accuracy = None
+        predicted_tokens = None
 
     if reduction == "sum":
         loss = loss / num_items_in_batch
 
+    if return_token_accuracy or return_predicted_tokens:
+        return CrossEntropyOutput(
+            loss=loss,
+            token_accuracy=token_accuracy,
+            predicted_tokens=predicted_tokens,
+        )
     return loss
 
 
@@ -402,11 +441,6 @@ def liger_multimodal_rotary_pos_emb(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply Qwen2-VL multimodal rotary positional embedding (M-RoPE) to ``q`` and ``k``."""
     return LigerQwen2VLMRopeFunction.apply(q, k, cos, sin, mrope_section, unsqueeze_dim)
-
-
-# Add torch compile support for functions - in this case it's to allow this to be used
-# but the function itself will not be compiled (see the note at the function)
-LigerForCausalLMLoss.can_torch_compile = True
 
 
 __all__ = [
