@@ -73,9 +73,7 @@ def w8a8_block_fp8_matmul_batched_kernel(
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
-    # Cast expert_id to int64 to prevent int32 overflow when computing
-    # expert_id * stride_Eb (e.g. 255 * 9_437_184 > 2^31 for 256 experts of
-    # 3072×3072 FP8 weights).
+    # Cast to int64 to prevent overflow on expert_id * stride_be.
     expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
     # EP sentinel: row routed to a non-local expert; output is left uninit.
     if expert_id >= NUM_EXPERTS:
@@ -98,13 +96,14 @@ def w8a8_block_fp8_matmul_batched_kernel(
         a_raw = tl.load(a_ptrs).to(tl.float32)
         a, a_s = fp8_act_quant_inline(a_raw)
         b = tl.load(b_ptrs)
-        b_s = tl.load(bs_ptrs + k * stride_bs_k)
+        b_s = tl.load(bs_ptrs)
         if b_s.dtype == tl.uint8:
             # UE8M0 decode: value = 2^(exp - 127); build the fp32 bit pattern.
             b_s = (b_s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+        bs_ptrs += stride_bs_k
 
     c = accumulator.to(C.dtype.element_ty)
 
@@ -257,9 +256,7 @@ def w4a8_fp4_matmul_batched_kernel(
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
-    # Cast expert_id to int64 to prevent int32 overflow when computing
-    # expert_id * stride_be (e.g. 255 * 9_437_184 > 2^31 for 256 experts of
-    # 3072×3072 FP4 weights).
+    # Cast to int64 to prevent overflow on expert_id * stride_be.
     expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
     # EP sentinel: row routed to a non-local expert; output is left uninit.
     if expert_id >= NUM_EXPERTS:
@@ -306,6 +303,7 @@ def _w8a8_block_fp8_matmul_batched(
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
     block_size: list[int],
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Block-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T, with fused act quant.
 
@@ -338,7 +336,7 @@ def _w8a8_block_fp8_matmul_batched(
         f"Bs shape {tuple(Bs.shape)} != expected ({E}, {N // block_n}, {K // block_k})"
     )
 
-    C = A.new_empty(S, N)
+    C = A.new_empty(S, N, dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
     # UE8M0 scales: pass as uint8 (Triton binder doesn't recognize
     # float8_e8m0fnu); kernel decodes 2^(exp-127) inline.
@@ -381,6 +379,7 @@ def _w8a8_tensor_fp8_matmul_batched(
     B: torch.Tensor,
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Tensor-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T, with fused act quant.
 
@@ -410,7 +409,7 @@ def _w8a8_tensor_fp8_matmul_batched(
 
     BLOCK_SIZE_N = 128
     BLOCK_SIZE_K = 128
-    C = A.new_empty(S, N)
+    C = A.new_empty(S, N, dtype=output_dtype)
     qA, As = fp8_act_quant(A, K)
     BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
     grid = (S, triton.cdiv(N, BLOCK_SIZE_N))
@@ -450,16 +449,18 @@ def w8a8_block_fp8_matmul_batched(
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
     block_size: list[int],
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Block-scale batched FP8 matmul with fused activation quantization.
 
     A:  (S, K) raw activations, bf16/fp16/fp32
     B:  (E, N, K) FP8 expert weights
     Bs: (E, N // block_n, K // block_k) per-block weight scales
+    expert_ids: (S,) — kernel loads stride-aware, any int dtype works
+    output_dtype: defaults to ``A.dtype``
     """
-    expert_ids = expert_ids.to(device=A.device, dtype=torch.int32)
     return torch.ops.finegrained_fp8.w8a8_block_fp8_matmul_batched(
-        A, B, Bs, expert_ids, block_size
+        A, B, Bs, expert_ids, block_size, output_dtype
     )
 
 
@@ -468,16 +469,17 @@ def w8a8_tensor_fp8_matmul_batched(
     B: torch.Tensor,
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Tensor-scale batched FP8 matmul with fused activation quantization.
 
     A:  (S, K) raw activations, bf16/fp16/fp32
     B:  (E, N, K) FP8 expert weights
     Bs: (E,) or (E, 1, 1) per-expert weight scales
+    output_dtype: defaults to ``A.dtype``
     """
-    expert_ids = expert_ids.to(device=A.device, dtype=torch.int32)
     return torch.ops.finegrained_fp8.w8a8_tensor_fp8_matmul_batched(
-        A, B, Bs, expert_ids
+        A, B, Bs, expert_ids, output_dtype
     )
 
 
@@ -487,7 +489,7 @@ def _w4a8_fp4_matmul_batched(
     B: torch.Tensor,
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
-    output_dtype: torch.dtype = torch.bfloat16,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Block-scale batched W4A8 FP4 matmul with fused activation quant.
 
@@ -562,11 +564,10 @@ def w4a8_fp4_matmul_batched(
     B: torch.Tensor,
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
-    output_dtype: torch.dtype = torch.bfloat16,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Block-scale batched W4A8 FP4 matmul with fused activation quant. Tile
     shape autotuned; FP4 scale granularity is fixed at 32."""
-    expert_ids = expert_ids.to(device=A.device, dtype=torch.int32)
     return torch.ops.finegrained_fp8.w4a8_fp4_matmul_batched(
         A, B, Bs, expert_ids, output_dtype
     )

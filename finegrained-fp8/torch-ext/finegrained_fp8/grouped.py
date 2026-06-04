@@ -109,13 +109,14 @@ def w8a8_block_fp8_matmul_grouped_kernel(
         a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
         a, a_s = fp8_act_quant_inline(a_raw)
         b = tl.load(b_ptrs)
-        b_s = tl.load(bs_ptrs + k * stride_bs_k)
+        b_s = tl.load(bs_ptrs)
         if b_s.dtype == tl.uint8:
             # UE8M0 decode: value = 2^(exp - 127); build the fp32 bit pattern.
             b_s = (b_s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+        bs_ptrs += stride_bs_k
 
     c = accumulator.to(C.dtype.element_ty)
     c_ptrs = C + stride_cm * offs_global_m[:, None] + stride_cn * offs_bn[None, :]
@@ -330,6 +331,7 @@ def _w8a8_block_fp8_matmul_grouped(
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     block_size: list[int],
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Block-scale grouped FP8 matmul: C = A @ B.T per expert, with fused act quant.
 
@@ -362,7 +364,7 @@ def _w8a8_block_fp8_matmul_grouped(
         f"Bs shape {tuple(Bs.shape)} != expected ({E}, {N // block_n}, {K // block_k})"
     )
 
-    C = A.new_empty(S, N)
+    C = A.new_empty(S, N, dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
     tile_offsets, max_m_tiles = grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, E
@@ -413,6 +415,7 @@ def _w8a8_tensor_fp8_matmul_grouped(
     Bs: torch.Tensor,
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Tensor-scale grouped FP8 matmul: C = A @ B.T per expert, with fused act quant.
 
@@ -442,7 +445,7 @@ def _w8a8_tensor_fp8_matmul_grouped(
 
     BLOCK_SIZE_N = 128
     BLOCK_SIZE_K = 128
-    C = A.new_empty(S, N)
+    C = A.new_empty(S, N, dtype=output_dtype)
     qA, As = fp8_act_quant(A, K)
     BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
     tile_offsets, max_m_tiles = grouped_tile_layout(
@@ -490,17 +493,17 @@ def w8a8_block_fp8_matmul_grouped(
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     block_size: list[int],
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Block-scale grouped FP8 matmul with fused activation quantization.
 
     A:  (S, K) raw activations sorted by expert, bf16/fp16/fp32
     B:  (E, N, K) FP8 expert weights
     Bs: (E, N // block_n, K // block_k) per-block weight scales
+    output_dtype: defaults to ``A.dtype``
     """
-    offsets = offsets.to(device=A.device, dtype=torch.int32)
-    tokens_per_expert = tokens_per_expert.to(device=A.device, dtype=torch.int32)
     return torch.ops.finegrained_fp8.w8a8_block_fp8_matmul_grouped(
-        A, B, Bs, offsets, tokens_per_expert, block_size
+        A, B, Bs, offsets, tokens_per_expert, block_size, output_dtype
     )
 
 
@@ -510,17 +513,17 @@ def w8a8_tensor_fp8_matmul_grouped(
     Bs: torch.Tensor,
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Tensor-scale grouped FP8 matmul with fused activation quantization.
 
     A:  (S, K) raw activations sorted by expert, bf16/fp16/fp32
     B:  (E, N, K) FP8 expert weights
     Bs: (E,) or (E, 1, 1) per-expert weight scales
+    output_dtype: defaults to ``A.dtype``
     """
-    offsets = offsets.to(device=A.device, dtype=torch.int32)
-    tokens_per_expert = tokens_per_expert.to(device=A.device, dtype=torch.int32)
     return torch.ops.finegrained_fp8.w8a8_tensor_fp8_matmul_grouped(
-        A, B, Bs, offsets, tokens_per_expert
+        A, B, Bs, offsets, tokens_per_expert, output_dtype
     )
 
 
@@ -531,7 +534,7 @@ def _w4a8_fp4_matmul_grouped(
     Bs: torch.Tensor,
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
-    output_dtype: torch.dtype = torch.bfloat16,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Block-scale grouped W4A8 FP4 matmul with fused activation quant.
 
@@ -612,13 +615,11 @@ def w4a8_fp4_matmul_grouped(
     Bs: torch.Tensor,
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
-    output_dtype: torch.dtype = torch.bfloat16,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Block-scale grouped W4A8 FP4 matmul with fused activation quant. Per-expert
     ``C[s] = A[s] @ B[e].T`` over contiguous, expert-sorted rows. Tile shape
     autotuned; FP4 scale granularity is fixed at 32."""
-    offsets = offsets.to(device=A.device, dtype=torch.int32)
-    tokens_per_expert = tokens_per_expert.to(device=A.device, dtype=torch.int32)
     return torch.ops.finegrained_fp8.w4a8_fp4_matmul_grouped(
         A, B, Bs, offsets, tokens_per_expert, output_dtype
     )

@@ -39,6 +39,7 @@ class Problem:
     K: int
     TOP_K: int
     scale_layout: str
+    weight_scale_dtype: torch.dtype = torch.float32
     block_size: Optional[Tuple[int, int]] = None
     expectation: Optional[Expectations] = None
     dtype: torch.dtype = torch.bfloat16
@@ -64,6 +65,8 @@ class Problem:
             tail = f"{head}_b{self.block_size[0]}x{self.block_size[1]}"
         contig_tag = "contiguous" if self.contiguous else "noncontiguous"
         tail = f"{tail}_{contig_tag}_{DTYPE_TAG[self.dtype]}"
+        if self.weight_scale_dtype is torch.float8_e8m0fnu:
+            tail = f"{tail}_ue8m0"
         if self.sentinel_fraction > 0:
             tail = f"{tail}_sentinel"
         if self.compile:
@@ -193,6 +196,17 @@ PROBLEMS = [
         scale_layout="block",
         block_size=(128, 128),
         compile=True,
+    ),
+    # UE8M0 weight scales (DSv4-Flash style)
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(128, 128),
+        weight_scale_dtype=torch.float8_e8m0fnu,
     ),
     # fp16 / fp32 dtype coverage on the smallest FP8 shape
     Problem(
@@ -392,7 +406,12 @@ def _setup_problem(problem: Problem, dtype):
         )
     else:
         B_fp8, Bs_block = make_fp8_weights(
-            problem.N, problem.K, TEST_DEVICE, problem.block_size, num_experts=problem.E
+            problem.N,
+            problem.K,
+            TEST_DEVICE,
+            problem.block_size,
+            num_experts=problem.E,
+            scale_dtype=problem.weight_scale_dtype,
         )
         Bs = _convert_scale_layout(Bs_block, problem.scale_layout)
         B = B_fp8

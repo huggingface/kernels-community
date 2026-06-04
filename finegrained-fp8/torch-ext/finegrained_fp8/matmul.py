@@ -90,13 +90,14 @@ def w8a8_block_fp8_matmul_kernel(
         )
         a, a_s = fp8_act_quant_inline(a_raw)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
-        b_s = tl.load(bs_ptrs + k * stride_bs_k)
+        b_s = tl.load(bs_ptrs)
         if b_s.dtype == tl.uint8:
             # UE8M0 decode: value = 2^(exp - 127); build the fp32 bit pattern.
             b_s = (b_s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+        bs_ptrs += stride_bs_k
 
     c = accumulator.to(C.dtype.element_ty)
 
@@ -248,13 +249,14 @@ def w8a8_static_block_fp8_matmul_kernel(
         )
         a = (a_raw / a_s_static).to(tl.float8e4nv)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
-        b_s = tl.load(bs_ptrs + k * stride_bs_k)
+        b_s = tl.load(bs_ptrs)
         if b_s.dtype == tl.uint8:
             # UE8M0 decode: value = 2^(exp - 127); build the fp32 bit pattern.
             b_s = (b_s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
         accumulator += tl.dot(a, b) * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+        bs_ptrs += stride_bs_k
 
     accumulator = accumulator * a_s_static
     c = accumulator.to(C.dtype.element_ty)
@@ -363,7 +365,7 @@ def _w8a8_block_fp8_matmul(
     B: torch.Tensor,
     Bs: torch.Tensor,
     block_size: list[int],
-    output_dtype: torch.dtype = torch.float32,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Block-scale FP8 matmul: ``C = A @ B.T`` with fused activation quantization.
 
@@ -435,7 +437,7 @@ def _w8a8_static_block_fp8_matmul(
     Bs: torch.Tensor,
     As: torch.Tensor,
     block_size: list[int],
-    output_dtype: torch.dtype = torch.float32,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Block-scale FP8 matmul with static (per-tensor) activation quantization.
 
@@ -515,12 +517,12 @@ def _w8a8_tensor_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
-    output_dtype: torch.dtype = torch.float32,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Tensor-scale FP8 matmul: ``C = A @ B.T`` with fused activation quantization.
 
-    A:  (..., M, K) raw activations, bf16/fp16/fp32 — per-row scales computed
-        via ``fp8_act_quant(A, K)``.
+    A:  (..., K) raw activations, bf16/fp16/fp32 (flattened to (M, K)
+        internally) — per-row scales computed via ``fp8_act_quant(A, K)``.
     B:  (N, K) FP8 weights.
     Bs: scalar, (1,), or (1, 1) — single tensor-scale weight scale.
     """
@@ -580,7 +582,7 @@ def _w4a8_fp4_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
-    output_dtype: torch.dtype = torch.bfloat16,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Block-scale W4A8 FP4 matmul: ``C = A @ B.T`` with fused activation quant.
 
@@ -649,7 +651,7 @@ def w8a8_block_fp8_matmul(
     B: torch.Tensor,
     Bs: torch.Tensor,
     block_size: list[int],
-    output_dtype: torch.dtype = torch.float32,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Block-wise W8A8 FP8 matrix multiplication with fused activation quantization.
 
@@ -675,12 +677,13 @@ def w8a8_static_block_fp8_matmul(
     Bs: torch.Tensor,
     As: torch.Tensor,
     block_size: list[int],
-    output_dtype: torch.dtype = torch.float32,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Block-wise W8A8 FP8 matmul with static (per-tensor) activation quantization.
 
     Args:
-        A: Pre-quantized activation tensor ``[..., M, K]`` in ``float8_e4m3fn``.
+        A: Raw activation tensor ``[..., M, K]`` in bf16/fp16/fp32 — quantized
+            inline against the per-tensor scalar ``As``.
         B: FP8 weight tensor ``[N, K]`` in ``float8_e4m3fn``.
         Bs: Per-block weight scales ``[N // block_size[0], K // block_size[1]]``.
         As: Static per-tensor activation scale (scalar or ``[1]``).
@@ -699,7 +702,7 @@ def w8a8_tensor_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
-    output_dtype: torch.dtype = torch.float32,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Tensor-scale W8A8 FP8 matmul with fused activation quantization.
 
@@ -719,7 +722,7 @@ def w4a8_fp4_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
-    output_dtype: torch.dtype = torch.bfloat16,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Block-scale W4A8 FP4 matmul with fused activation quantization.
 
@@ -742,7 +745,7 @@ def matmul(
     B: torch.Tensor,
     Bs: torch.Tensor,
     block_size: list[int] | None,
-    output_dtype: torch.dtype = torch.float32,
+    output_dtype: torch.dtype | None = None,
     activation_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Quantized matmul dispatcher (W8A8 FP8 or W4A8 FP4).
@@ -760,6 +763,17 @@ def matmul(
       ``activation_scale`` is given).
     """
     if activation_scale is not None:
+        if B.dtype == torch.int8:
+            raise NotImplementedError(
+                "static activation_scale is not supported on the FP4 path"
+            )
+        if block_size is None or (
+            block_size[0] == B.size(0) and block_size[1] == B.size(1)
+        ):
+            raise NotImplementedError(
+                "static activation_scale requires block-wise weights, "
+                "not tensor-mode (block_size None or full [N, K])"
+            )
         return w8a8_static_block_fp8_matmul(
             A, B, Bs, activation_scale, block_size, output_dtype
         )
