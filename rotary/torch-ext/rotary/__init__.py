@@ -1,5 +1,5 @@
-from . import ext, layers
+from .ext import apply_rotary_transformers
 from .layers import apply_rotary
 
 
-__all__ = ["apply_rotary", "ext", "layers"]
+__all__ = ["apply_rotary", "apply_rotary_transformers"]
