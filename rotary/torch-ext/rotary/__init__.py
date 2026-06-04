@@ -49,4 +49,8 @@ def apply_rotary_transformers(
     return q_rotated, k_rotated
 
 
+# Add torch compile support for functions
+apply_rotary_transformers.can_torch_compile = True
+
+
 __all__ = ["apply_rotary", "apply_rotary_transformers"]
