@@ -1,14 +1,16 @@
 [general]
 name = "liger-kernels"
+version = 1
 license = "BSD-2-Clause"
 backends = [
     "cuda",
     "rocm",
     "xpu",
 ]
-version = 1
 
 [general.hub]
 repo-id = "kernels-community/liger-kernels"
+
+[torch-noarch]
 
 [kernel]
