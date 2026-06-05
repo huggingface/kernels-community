@@ -21,6 +21,7 @@ BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 COMMENT_CHARS_RE = re.compile(r"^/kernel-bot[ A-Za-z0-9_./-]*$")
 COMMAND_PERMISSIONS = {
     "build": {"admin", "write"},
+    "security-and-build": {"admin", "write"},
     "build-and-stage": {"admin", "write"},
     "merge-and-upload": {"admin", "write"},
     "release": {"admin"},
@@ -30,7 +31,7 @@ RUN_LOOKUP_ATTEMPTS = 10
 RUN_LOOKUP_SLEEP_SECONDS = 2
 RUN_LOOKUP_PAGE_SIZE = 100
 COMMAND_USAGE = (
-    "Invalid command. Use `/kernel-bot <build|build-and-stage|merge-and-upload|release> "
+    "Invalid command. Use `/kernel-bot <build|security-and-build|build-and-stage|merge-and-upload|release> "
     "<kernel1> [kernel2 ...] [--branch <target_branch>]`."
 )
 
@@ -392,7 +393,7 @@ def parse_command(comment: str) -> ParsedCommand:
 
     if not args:
         return ParsedCommand(
-            error="No kernels provided. Use `/kernel-bot <build|build-and-stage|merge-and-upload> <kernel1> [kernel2 ...]`.",
+            error="No kernels provided. Use `/kernel-bot <build|security-and-build|build-and-stage|merge-and-upload> <kernel1> [kernel2 ...]`.",
         )
 
     kernels = []
@@ -512,9 +513,9 @@ def main():
     permission = get_user_permission(api_base, token, commenter)
     allowed_permissions = COMMAND_PERMISSIONS[command]
     if permission not in allowed_permissions:
-        if command == "build":
+        if "write" in allowed_permissions:
             permission_error = (
-                "I can only run `/kernel-bot build` for users with `write` or `admin` "
+                f"I can only run `/kernel-bot {command}` for users with `write` or `admin` "
                 "repository permission."
             )
         else:
@@ -549,7 +550,7 @@ def main():
 
     pr_head_sha = pull_request.get("head", {}).get("sha")
 
-    if command == "build":
+    if command in ("build", "security-and-build"):
         target_branch = requested_branch or f"pr-{issue_number}"
         dispatch_pr_number = str(issue_number)
         dispatch_upload = False
@@ -572,6 +573,7 @@ def main():
 
     mode_text = {
         "build": "build only",
+        "security-and-build": "security audit + build",
         "build-and-stage": "build and stage",
         "merge-and-upload": "merge, build and upload",
         "release": "release (linux + mac + windows)",
@@ -579,8 +581,8 @@ def main():
     command_summary = f"/kernel-bot {command} {' '.join(kernels)}"
     if requested_branch is not None:
         command_summary += f" --branch {requested_branch}"
-    # `/kernel-bot build` always runs the security audit concurrently with the build.
-    run_security = command == "build"
+    # `/kernel-bot security-and-build` runs the security audit concurrently with the build.
+    run_security = command == "security-and-build"
     status_comment_id = comment_id_from_response(
         try_create_issue_comment(
             api_base,
