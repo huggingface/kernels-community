@@ -8,12 +8,20 @@ import pytest
 import torch
 import triton
 
+from utils import (  # type: ignore
+    DTYPE_TAG,
+    DTYPE_TO_TOL,
+    IS_SM90,
+    SUPPORTS_FP4,
+    TEST_DEVICE,
+    accelerator_module,
+    make_fp4_weights,
+    make_fp8_weights,
+)
+
 import finegrained_fp8  # type: ignore
 
 
-FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
-FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
-FP8_DTYPE = torch.float8_e4m3fn
 BENCH_REPEATS = 10
 
 
@@ -31,20 +39,39 @@ class Problem:
     K: int
     TOP_K: int
     scale_layout: str
+    weight_scale_dtype: torch.dtype = torch.float32
     block_size: Optional[Tuple[int, int]] = None
     expectation: Optional[Expectations] = None
+    dtype: torch.dtype = torch.bfloat16
+    sentinel_fraction: float = 0.0
+    weight_format: str = "fp8"
+    contiguous: bool = True
+    compile: bool = False
 
     @property
     def id(self):
-        bsz = (
-            "NxK"
-            if self.block_size is None
-            else f"{self.block_size[0]}x{self.block_size[1]}"
+        head = (
+            f"{self.weight_format}_S{self.S}_E{self.E}_N{self.N}_K{self.K}"
+            f"_top{self.TOP_K}"
         )
-        return (
-            f"S{self.S}_E{self.E}_N{self.N}_K{self.K}_T{self.TOP_K}"
-            f"__{self.scale_layout}__bsz{bsz}"
-        )
+        # FP4 ignores block_size (tile shape autotuned); always block-mode.
+        if self.weight_format == "fp4":
+            tail = head
+        # FP8 with block_size carries block dims; without it, scale_layout names
+        # the tensor-mode variant.
+        elif self.block_size is None:
+            tail = f"{head}_{self.scale_layout}"
+        else:
+            tail = f"{head}_b{self.block_size[0]}x{self.block_size[1]}"
+        contig_tag = "contiguous" if self.contiguous else "noncontiguous"
+        tail = f"{tail}_{contig_tag}_{DTYPE_TAG[self.dtype]}"
+        if self.weight_scale_dtype is torch.float8_e8m0fnu:
+            tail = f"{tail}_ue8m0"
+        if self.sentinel_fraction > 0:
+            tail = f"{tail}_sentinel"
+        if self.compile:
+            tail = f"{tail}_compile"
+        return tail
 
 
 PROBLEMS = [
@@ -94,6 +121,18 @@ PROBLEMS = [
         scale_layout="per_tensor_111",
         block_size=None,
     ),
+    # Non-contig indexing tensors — exercises stride-aware loads for
+    # expert_ids (batched) and offsets / tokens_per_expert (grouped).
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(128, 128),
+        contiguous=False,
+    ),
     # ── Qwen3-30B-A3B (E=128, H=2048, I=768, top_k=8) ──
     # gate_up: N=1536, K=2048 — down: N=2048, K=768
     Problem(
@@ -136,48 +175,173 @@ PROBLEMS = [
         block_size=(128, 128),
         expectation=Expectations(batched_ms=0.3151, grouped_ms=0.1571),
     ),
+    # EP sentinel coverage: most rows routed to non-local experts, kernel skips tail
+    Problem(
+        S=64,
+        E=8,
+        N=256,
+        K=512,
+        TOP_K=4,
+        scale_layout="block",
+        block_size=(128, 128),
+        sentinel_fraction=0.875,
+    ),
+    # torch.compile compatibility
+    Problem(
+        S=8,
+        E=4,
+        N=256,
+        K=256,
+        TOP_K=1,
+        scale_layout="block",
+        block_size=(128, 128),
+        compile=True,
+    ),
+    # UE8M0 weight scales (DSv4-Flash style)
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(128, 128),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+    ),
+    # fp16 / fp32 dtype coverage on the smallest FP8 shape
+    Problem(
+        S=8,
+        E=4,
+        N=256,
+        K=256,
+        TOP_K=1,
+        scale_layout="block",
+        block_size=(128, 128),
+        dtype=torch.float16,
+    ),
+    Problem(
+        S=8,
+        E=4,
+        N=256,
+        K=256,
+        TOP_K=1,
+        scale_layout="block",
+        block_size=(128, 128),
+        dtype=torch.float32,
+    ),
 ]
+if SUPPORTS_FP4:
+    # DeepSeek-V4-Flash FP4 shapes (E=256, top_k=6); first entry kept small so
+    # CI doesn't spend minutes on the larger problems. ``block_size`` is ignored
+    # by the FP4 path (tile shape autotuned).
+    PROBLEMS += [
+        Problem(
+            S=32,
+            E=4,
+            N=256,
+            K=512,
+            TOP_K=2,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
+        ),
+        Problem(
+            S=32,
+            E=4,
+            N=256,
+            K=512,
+            TOP_K=2,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
+            contiguous=False,
+        ),
+        Problem(
+            S=192,
+            E=256,
+            N=4096,
+            K=4096,
+            TOP_K=6,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
+        ),
+        Problem(
+            S=192,
+            E=256,
+            N=4096,
+            K=2048,
+            TOP_K=6,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
+        ),
+        Problem(
+            S=1536,
+            E=256,
+            N=4096,
+            K=4096,
+            TOP_K=6,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
+        ),
+        # EP sentinel coverage on FP4
+        Problem(
+            S=64,
+            E=8,
+            N=256,
+            K=512,
+            TOP_K=4,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
+            sentinel_fraction=0.875,
+        ),
+        # torch.compile compatibility on FP4
+        Problem(
+            S=32,
+            E=4,
+            N=256,
+            K=512,
+            TOP_K=2,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
+            compile=True,
+        ),
+        # fp16 / fp32 dtype coverage on the smallest FP4 shape
+        Problem(
+            S=32,
+            E=4,
+            N=256,
+            K=512,
+            TOP_K=2,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
+            dtype=torch.float16,
+        ),
+        Problem(
+            S=32,
+            E=4,
+            N=256,
+            K=512,
+            TOP_K=2,
+            scale_layout="block",
+            block_size=None,
+            weight_format="fp4",
+            dtype=torch.float32,
+        ),
+    ]
 
-COMPILE_PROBLEM = PROBLEMS[0]
 
+def _make_routed_inputs(S, E, K, dtype, device, top_k, sentinel_fraction=0.0):
+    """Build flattened routed inputs like FP8Experts paths.
 
-def _make_experts_weights(num_experts, out_features, in_features, block_size, device):
-    """Create FP8 expert weights/scales with FP8Experts-compatible layouts.
-
-    Returns:
-        weights_fp8: [E, N, K] where E=num_experts, N=out_features, K=in_features
-        scales_inv: [E, N // block_n, K // block_k] for block mode,
-                    [E, 1, 1] for per-tensor mode (block_size=None)
+    ``sentinel_fraction`` marks a random subset of ``expert_ids`` as out-of-range
+    (== E), simulating EP routing where some tokens are owned by other ranks.
     """
-    W = torch.randn(
-        num_experts, out_features, in_features, dtype=torch.float32, device=device
-    )
-    E, N, K = W.shape
-
-    if block_size is None:
-        block_n, block_k = N, K
-    else:
-        block_n, block_k = block_size
-
-    assert N % block_n == 0, f"N ({N}) must be divisible by block_n ({block_n})"
-    assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
-
-    rt, ct = N // block_n, K // block_k
-    R = W.reshape(E, rt, block_n, ct, block_k)
-
-    max_abs = R.abs().amax(dim=(-3, -1))
-    safe = torch.where(max_abs > 0, max_abs, torch.ones_like(max_abs))
-    scale = FP8_MAX / safe
-
-    Wq = (R * scale.unsqueeze(-1).unsqueeze(-3)).clamp(FP8_MIN, FP8_MAX).to(FP8_DTYPE)
-    Wq = Wq.reshape(E, N, K).contiguous()
-    inv_scales = (1.0 / scale).to(torch.float32)
-
-    return Wq, inv_scales
-
-
-def _make_routed_inputs(S, E, K, dtype, device, top_k):
-    """Build flattened routed inputs like FP8Experts paths."""
     assert top_k > 0
     assert S % top_k == 0, f"S ({S}) must be divisible by top_k ({top_k})"
     num_tokens = S // top_k
@@ -193,6 +357,10 @@ def _make_routed_inputs(S, E, K, dtype, device, top_k):
     )
     expert_ids = top_k_index.reshape(-1).to(torch.int32)
     selected_hidden_states = hidden_states[token_idx]
+    if sentinel_fraction > 0:
+        n_sentinel = int(round(S * sentinel_fraction))
+        idx = torch.randperm(S, device=device)[:n_sentinel]
+        expert_ids[idx] = E
     return selected_hidden_states, expert_ids
 
 
@@ -213,27 +381,46 @@ def _convert_scale_layout(Bs, layout: str):
     raise ValueError(f"Unsupported scale layout: {layout}")
 
 
+def _make_noncontig_1d(x: torch.Tensor) -> torch.Tensor:
+    # Stride-2 view with duplicated gaps: a stride-1 read returns
+    # [x[0], x[0], x[1], x[1], ...] instead of x, catching wrong-stride loads.
+    base = torch.empty((x.numel(), 2), dtype=x.dtype, device=x.device)
+    base[:, 0] = x
+    base[:, 1] = x
+    return base[:, 0]
+
+
 def _setup_problem(problem: Problem, dtype):
     A, expert_ids = _make_routed_inputs(
         problem.S,
         problem.E,
         problem.K,
         dtype=dtype,
-        device="cuda",
+        device=TEST_DEVICE,
         top_k=problem.TOP_K,
+        sentinel_fraction=problem.sentinel_fraction,
     )
-    B_fp8, Bs_block = _make_experts_weights(
-        problem.E,
-        problem.N,
-        problem.K,
-        problem.block_size,
-        "cuda",
-    )
-    Bs = _convert_scale_layout(Bs_block, problem.scale_layout)
-    return A, expert_ids, B_fp8, Bs
+    if problem.weight_format == "fp4":
+        B, Bs = make_fp4_weights(
+            problem.N, problem.K, TEST_DEVICE, num_experts=problem.E
+        )
+    else:
+        B_fp8, Bs_block = make_fp8_weights(
+            problem.N,
+            problem.K,
+            TEST_DEVICE,
+            problem.block_size,
+            num_experts=problem.E,
+            scale_dtype=problem.weight_scale_dtype,
+        )
+        Bs = _convert_scale_layout(Bs_block, problem.scale_layout)
+        B = B_fp8
+    if not problem.contiguous:
+        expert_ids = _make_noncontig_1d(expert_ids)
+    return A, expert_ids, B, Bs
 
 
-def _prepare_grouped(A, expert_ids, num_experts):
+def _prepare_grouped(A, expert_ids, num_experts, contiguous: bool = True):
     perm = torch.argsort(expert_ids)
     A_sorted = A[perm].contiguous()
     expert_ids_sorted = expert_ids[perm]
@@ -241,145 +428,83 @@ def _prepare_grouped(A, expert_ids, num_experts):
         expert_ids_sorted.float(), bins=num_experts, min=0, max=num_experts - 1
     ).to(torch.int32)
     offsets = torch.cumsum(tokens_per_expert, dim=0).to(torch.int32)
+    if not contiguous:
+        offsets = _make_noncontig_1d(offsets)
+        tokens_per_expert = _make_noncontig_1d(tokens_per_expert)
     return A_sorted, expert_ids_sorted, offsets, tokens_per_expert
 
 
-def _ref(A, B_fp8, Bs, expert_ids, block_size):
+def _routed_matmul_ref(A, B, Bs, expert_ids, block_size):
+    """Per-routed-row reference that re-uses the neutral ``matmul`` dispatcher
+    (routes to FP4 when ``B.dtype == int8``, else block/tensor FP8). Output dtype
+    matches the batched/grouped kernels (both follow ``A.dtype``). Rows with
+    ``expert_ids[i] >= num_experts`` are EP sentinels — skipped, output undefined."""
     S = A.shape[0]
-    N = B_fp8.shape[1]
-    if block_size is None:
-        bi = A.shape[-1]
-        matmul_block_size = None
-    else:
-        bi = block_size[1]
-        matmul_block_size = block_size
-
-    out = torch.empty(S, N, dtype=torch.float32, device=A.device)
+    N = B.shape[1]
+    E = B.shape[0]
+    out = torch.empty(S, N, dtype=A.dtype, device=A.device)
     for i in range(S):
-        e = expert_ids[i]
-        qA_i, sA_i = finegrained_fp8.fp8_act_quant(A[i : i + 1], bi)
-        out[i] = finegrained_fp8.w8a8_fp8_matmul(
-            qA_i, B_fp8[e], sA_i, Bs[e], matmul_block_size
-        )
+        e = int(expert_ids[i])
+        if e >= E:
+            continue
+        out[i] = finegrained_fp8.matmul(A[i : i + 1], B[e], Bs[e], block_size)
     return out
 
 
 # ── unified wrapper correctness/shape ──────────────────────────────────────────
-@pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
-def test_batched_vs_ref(problem):
-    torch.manual_seed(0)
-    A, expert_ids, B_fp8, Bs = _setup_problem(problem, dtype=torch.float32)
-    out = finegrained_fp8.w8a8_fp8_matmul_batched(
-        A, B_fp8, Bs, expert_ids, problem.block_size
-    )
-    ref = _ref(A, B_fp8, Bs, expert_ids, problem.block_size)
-    torch.testing.assert_close(out, ref)
-
-
-@pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
-def test_batched_output_shape(problem):
-    A, expert_ids, B_fp8, Bs = _setup_problem(problem, dtype=torch.bfloat16)
-    out = finegrained_fp8.w8a8_fp8_matmul_batched(
-        A, B_fp8, Bs, expert_ids, problem.block_size
-    )
+def _assert_correctness(out, ref, expert_ids, problem):
+    """Shape, dtype, and per-local-row value checks. Sentinel rows
+    (``expert_ids >= problem.E``) are uninit by kernel design and excluded."""
     assert out.shape == (problem.S, problem.N)
-    assert out.dtype == torch.bfloat16
+    assert out.dtype == problem.dtype
+    local_mask = expert_ids.to(torch.int64) < problem.E
+    atol, rtol = DTYPE_TO_TOL[problem.dtype]
+    torch.testing.assert_close(out[local_mask], ref[local_mask], atol=atol, rtol=rtol)
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
-def test_grouped_vs_ref(problem):
+def test_batched(problem):
     torch.manual_seed(0)
-    A, expert_ids, B_fp8, Bs = _setup_problem(problem, dtype=torch.float32)
+    A, expert_ids, B, Bs = _setup_problem(problem, dtype=problem.dtype)
+    matmul_batched = finegrained_fp8.matmul_batched
+    if problem.compile:
+        torch.compiler.reset()
+        accelerator_module().empty_cache()
+        matmul_batched = torch.compile(
+            matmul_batched, mode="max-autotune", fullgraph=True
+        )
+    out = matmul_batched(A, B, Bs, expert_ids, problem.block_size)
+    ref = _routed_matmul_ref(A, B, Bs, expert_ids, problem.block_size)
+    _assert_correctness(out, ref, expert_ids, problem)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
+@pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
+def test_grouped(problem):
+    torch.manual_seed(0)
+    A, expert_ids, B, Bs = _setup_problem(problem, dtype=problem.dtype)
     A_sorted, expert_ids_sorted, offsets, tokens_per_expert = _prepare_grouped(
-        A, expert_ids, problem.E
+        A, expert_ids, problem.E, contiguous=problem.contiguous
     )
-    out = finegrained_fp8.w8a8_fp8_matmul_grouped(
-        A_sorted,
-        B_fp8,
-        Bs,
-        offsets,
-        tokens_per_expert,
-        problem.block_size,
-    )
-    ref = _ref(A_sorted, B_fp8, Bs, expert_ids_sorted, problem.block_size)
-    torch.testing.assert_close(out, ref)
-
-
-@pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
-def test_grouped_output_shape(problem):
-    A, expert_ids, B_fp8, Bs = _setup_problem(problem, dtype=torch.bfloat16)
-    A_sorted, _, offsets, tokens_per_expert = _prepare_grouped(A, expert_ids, problem.E)
-    out = finegrained_fp8.w8a8_fp8_matmul_grouped(
-        A_sorted,
-        B_fp8,
-        Bs,
-        offsets,
-        tokens_per_expert,
-        problem.block_size,
-    )
-    assert out.shape == (problem.S, problem.N)
-    assert out.dtype == torch.bfloat16
-
-
-# ── torch.compile compatibility ────────────────────────────────────────────────
-@pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_batched_compile():
-    torch.manual_seed(0)
-    torch.compiler.reset()
-    torch.cuda.empty_cache()
-
-    A, expert_ids, B_fp8, Bs = _setup_problem(COMPILE_PROBLEM, dtype=torch.bfloat16)
-
-    def fn(A, B_fp8, Bs, expert_ids):
-        return finegrained_fp8.w8a8_fp8_matmul_batched(
-            A, B_fp8, Bs, expert_ids, COMPILE_PROBLEM.block_size
+    matmul_grouped = finegrained_fp8.matmul_grouped
+    if problem.compile:
+        torch.compiler.reset()
+        accelerator_module().empty_cache()
+        matmul_grouped = torch.compile(
+            matmul_grouped, mode="max-autotune", fullgraph=True
         )
-
-    compiled = torch.compile(fn, mode="max-autotune", fullgraph=True)
-    out_compiled = compiled(A, B_fp8, Bs, expert_ids)
-    out_ref = fn(A, B_fp8, Bs, expert_ids)
-    torch.testing.assert_close(out_compiled, out_ref)
-
-
-@pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_grouped_compile():
-    torch.manual_seed(0)
-    torch.compiler.reset()
-    torch.cuda.empty_cache()
-
-    A, expert_ids, B_fp8, Bs = _setup_problem(COMPILE_PROBLEM, dtype=torch.bfloat16)
-    A_sorted, _, offsets, tokens_per_expert = _prepare_grouped(
-        A, expert_ids, COMPILE_PROBLEM.E
+    out = matmul_grouped(
+        A_sorted, B, Bs, offsets, tokens_per_expert, problem.block_size
     )
-
-    def fn(A_sorted, B_fp8, Bs, offsets, tokens_per_expert):
-        return finegrained_fp8.w8a8_fp8_matmul_grouped(
-            A_sorted,
-            B_fp8,
-            Bs,
-            offsets,
-            tokens_per_expert,
-            COMPILE_PROBLEM.block_size,
-        )
-
-    compiled = torch.compile(fn, mode="max-autotune", fullgraph=True)
-    out_compiled = compiled(A_sorted, B_fp8, Bs, offsets, tokens_per_expert)
-    out_ref = fn(A_sorted, B_fp8, Bs, offsets, tokens_per_expert)
-    torch.testing.assert_close(out_compiled, out_ref)
+    ref = _routed_matmul_ref(A_sorted, B, Bs, expert_ids_sorted, problem.block_size)
+    _assert_correctness(out, ref, expert_ids_sorted, problem)
 
 
-def _bench_setup(problem: Problem, device="cuda"):
-    torch.cuda.empty_cache()
+def _bench_setup(problem: Problem, device=TEST_DEVICE):
+    accelerator_module().empty_cache()
     torch.compiler.reset()
     torch.manual_seed(0)
     A, expert_ids = _make_routed_inputs(
@@ -390,12 +515,8 @@ def _bench_setup(problem: Problem, device="cuda"):
         device=device,
         top_k=problem.TOP_K,
     )
-    B_fp8, Bs = _make_experts_weights(
-        problem.E,
-        problem.N,
-        problem.K,
-        problem.block_size,
-        device,
+    B_fp8, Bs = make_fp8_weights(
+        problem.N, problem.K, device, problem.block_size, num_experts=problem.E
     )
     A_sorted, expert_ids_sorted, offsets, tokens_per_expert = _prepare_grouped(
         A, expert_ids, problem.E
@@ -429,7 +550,9 @@ def _measure_latency_over_repeats(fn, repeats: int = BENCH_REPEATS):
 
 
 @pytest.mark.benchmark
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    not IS_SM90, reason="Latency baselines are calibrated for SM90 (H100) only"
+)
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_batched_speedup(problem):
     if problem.expectation is None:
@@ -439,7 +562,7 @@ def test_batched_speedup(problem):
 
     batched_ms, batched_mean_ms, batched_min_ms, batched_max_ms = (
         _measure_latency_over_repeats(
-            lambda: finegrained_fp8.w8a8_fp8_matmul_batched(
+            lambda: finegrained_fp8.matmul_batched(
                 A, B_fp8, Bs, expert_ids, problem.block_size
             )
         )
@@ -455,7 +578,9 @@ def test_batched_speedup(problem):
 
 
 @pytest.mark.benchmark
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    not IS_SM90, reason="Latency baselines are calibrated for SM90 (H100) only"
+)
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_grouped_speedup(problem):
     if problem.expectation is None:
@@ -465,7 +590,7 @@ def test_grouped_speedup(problem):
 
     grouped_ms, grouped_mean_ms, grouped_min_ms, grouped_max_ms = (
         _measure_latency_over_repeats(
-            lambda: finegrained_fp8.w8a8_fp8_matmul_grouped(
+            lambda: finegrained_fp8.matmul_grouped(
                 A, B_fp8, Bs, offsets, tokens_per_expert, problem.block_size
             )
         )

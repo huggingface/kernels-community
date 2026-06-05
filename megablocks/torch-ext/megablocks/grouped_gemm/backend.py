@@ -2,16 +2,16 @@
 # extensions. Otherwise libc10.so cannot be found.
 import torch
 
-# # TODO(tgale): Wrap this in a try-block with better
-# # error message and instructions for building the
-# # c++ operations.
-# import grouped_gemm_backend as backend
+# On ROCm there is no CUTLASS grouped GEMM; dispatch to the vendored AITER
+# Triton kernels instead. On CUDA we use the compiled CUTLASS `gmm` op.
+_IS_ROCM = torch.version.hip is not None
 
-# We import the backend operations from the megablocks package as
-# grouped_gemm is vendored in megablocks in this repository.
-# from ... import _ops as backend
-# from megablocks._ops import ops as backend  # type: ignore
-from .._ops import ops as backend  # type: ignore
+if _IS_ROCM:
+    from .._grouped_gemm_triton import adapter as backend
+else:
+    # We import the backend operations from the megablocks package as
+    # grouped_gemm is vendored in megablocks in this repository.
+    from .._ops import ops as backend  # type: ignore
 
 def _allocate_output(a, b, batch_sizes, trans_a, trans_b):
     assert not (trans_a and trans_b)
