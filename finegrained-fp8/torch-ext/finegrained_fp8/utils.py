@@ -30,6 +30,8 @@ FP8_DTYPE = torch.float8_e4m3fn
 # K-group of 32 elements. These are format constants, not tunables.
 FP4_VALUES_PER_BYTE = 2
 FP4_SCALE_GROUP_K = 32
+FP4_XPU_FIXED_BLOCK_SIZE_N = 128
+FP4_XPU_FIXED_BLOCK_SIZE_K = 128
 
 
 # ── Host-side helpers ─────────────────────────────────────────────────────────
@@ -76,6 +78,44 @@ def grouped_tile_layout(
     tile_offsets = torch.cumsum(tiles_per_expert, dim=0).to(torch.int32)
     max_m_tiles = triton.cdiv(S, block_size_m) + E
     return tile_offsets, max_m_tiles
+
+
+def prune_fp4_fixed_tile_configs(
+    configs,
+    nargs,
+    block_size_n: int = FP4_XPU_FIXED_BLOCK_SIZE_N,
+    block_size_k: int = FP4_XPU_FIXED_BLOCK_SIZE_K,
+    device_arg_name: str = "A",
+    min_num_warps_exclusive: int = 4,
+    **kwargs,
+):
+    """Keep full configs on non-XPU.
+
+    On XPU, pin FP4 N/K tile size and optionally require num_warps to be
+    greater than ``min_num_warps_exclusive``.
+    """
+    if nargs[device_arg_name].device.type != "xpu":
+        return configs
+    return [
+        c
+        for c in configs
+        if c.kwargs["BLOCK_SIZE_N"] == block_size_n
+        and c.kwargs["BLOCK_SIZE_K"] == block_size_k
+        and c.num_warps > min_num_warps_exclusive
+    ]
+
+
+def prune_xpu_min_num_warps_configs(
+    configs,
+    nargs,
+    min_num_warps_exclusive: int = 4,
+    device_arg_name: str = "A",
+    **kwargs,
+):
+    """Keep full configs on non-XPU; on XPU keep only configs with num_warps above a threshold."""
+    if nargs[device_arg_name].device.type != "xpu":
+        return configs
+    return [c for c in configs if c.num_warps > min_num_warps_exclusive]
 
 
 # ── Triton-side helpers (inlined by ``@triton.jit`` callers) ──────────────────

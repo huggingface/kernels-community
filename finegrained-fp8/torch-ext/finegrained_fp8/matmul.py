@@ -26,6 +26,8 @@ from .utils import (
     fp4_act_quant_inline,
     fp8_act_quant,
     fp8_act_quant_inline,
+    prune_fp4_fixed_tile_configs,
+    prune_xpu_min_num_warps_configs,
 )
 
 
@@ -36,6 +38,7 @@ from .utils import (
         for s in [2, 3, 4]
     ],
     key=["N", "K", "BLOCK_SIZE_M"],
+    prune_configs_by={"early_config_prune": prune_xpu_min_num_warps_configs},
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_kernel(
@@ -116,6 +119,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         for s in [2, 3, 4]
     ],
     key=["N", "K", "BLOCK_SIZE_M"],
+    prune_configs_by={"early_config_prune": prune_xpu_min_num_warps_configs},
 )
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_kernel(
@@ -192,6 +196,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
         for s in [2, 3, 4]
     ],
     key=["N", "K", "BLOCK_SIZE_M"],
+    prune_configs_by={"early_config_prune": prune_xpu_min_num_warps_configs},
 )
 @triton.jit
 def w8a8_block_static_fp8_matmul_kernel(
@@ -282,6 +287,7 @@ def w8a8_block_static_fp8_matmul_kernel(
         for s in [2, 3, 4]
     ],
     key=["N", "K", "BLOCK_SIZE_M"],
+    prune_configs_by={"early_config_prune": prune_fp4_fixed_tile_configs},
 )
 @triton.jit
 def w4a8_block_dynamic_fp4_matmul_kernel(
@@ -591,8 +597,9 @@ def _w4a8_block_dynamic_fp4_matmul(
     B:  (N, K // 2) packed FP4 (E2M1) weights, two codes per int8
     Bs: (N, K // 32) UE8M0 weight scales
 
-    BLOCK_SIZE_N and BLOCK_SIZE_K are autotuned — FP4 scale granularity is fixed
-    at 32, so tile shape is purely a perf knob.
+    On CUDA and other backends, BLOCK_SIZE_N and BLOCK_SIZE_K are autotuned.
+    On XPU they are fixed to 128x128 and only num_warps/num_stages are autotuned.
+    FP4 scale granularity is fixed at 32, so tile shape is purely a perf knob.
     """
     assert A.ndim == 2 and B.ndim == 2 and Bs.ndim == 2
     assert B.dtype == torch.int8, f"B must be int8 (packed FP4), got {B.dtype}"

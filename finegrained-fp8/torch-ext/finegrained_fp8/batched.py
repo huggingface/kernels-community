@@ -26,6 +26,8 @@ from .utils import (
     fp4_act_quant_inline,
     fp8_act_quant,
     fp8_act_quant_inline,
+    prune_fp4_fixed_tile_configs,
+    prune_xpu_min_num_warps_configs,
 )
 
 
@@ -36,6 +38,7 @@ from .utils import (
         for s in [2, 3, 4]
     ],
     key=["N", "K"],
+    prune_configs_by={"early_config_prune": prune_xpu_min_num_warps_configs},
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_batched_kernel(
@@ -127,6 +130,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         for s in [2, 3, 4]
     ],
     key=["N", "K"],
+    prune_configs_by={"early_config_prune": prune_xpu_min_num_warps_configs},
 )
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
@@ -216,6 +220,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
         for s in [2, 3, 4]
     ],
     key=["N", "K"],
+    prune_configs_by={"early_config_prune": prune_fp4_fixed_tile_configs},
 )
 @triton.jit
 def w4a8_block_dynamic_fp4_matmul_batched_kernel(

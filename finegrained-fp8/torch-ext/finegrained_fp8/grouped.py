@@ -28,6 +28,8 @@ from .utils import (
     fp8_act_quant_inline,
     grouped_expert_lookup,
     grouped_tile_layout,
+    prune_fp4_fixed_tile_configs,
+    prune_xpu_min_num_warps_configs,
 )
 
 
@@ -38,6 +40,7 @@ from .utils import (
         for s in [2, 3, 4]
     ],
     key=["N", "K", "BLOCK_SIZE_M"],
+    prune_configs_by={"early_config_prune": prune_xpu_min_num_warps_configs},
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
@@ -132,6 +135,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         for s in [2, 3, 4]
     ],
     key=["N", "K", "BLOCK_SIZE_M"],
+    prune_configs_by={"early_config_prune": prune_xpu_min_num_warps_configs},
 )
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
@@ -229,6 +233,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         for s in [2, 3, 4]
     ],
     key=["N", "K", "BLOCK_SIZE_M"],
+    prune_configs_by={"early_config_prune": prune_fp4_fixed_tile_configs},
 )
 @triton.jit
 def w4a8_block_dynamic_fp4_matmul_grouped_kernel(
