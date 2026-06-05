@@ -1,16 +1,13 @@
 [general]
 name = "finegrained-fp8"
-version = 2
 license = "Apache-2.0"
 backends = [
     "cuda",
     "rocm",
     "xpu",
 ]
+version = 1
 
 [general.hub]
 repo-id = "kernels-community/finegrained-fp8"
 
-[torch-noarch]
-
-[kernel]

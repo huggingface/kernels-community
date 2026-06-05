@@ -1,151 +1,122 @@
-"""Tests for ``matmul`` (FP8 and FP4 weights, including non-aligned dims)."""
-
-from dataclasses import dataclass
-from typing import Optional, Tuple
+"""Tests for the base w8a8_fp8_matmul kernel, including non-aligned dimensions."""
 
 import pytest
 import torch
 
-from utils import (  # type: ignore
-    DTYPE_TAG,
-    DTYPE_TO_TOL,
-    SUPPORTS_FP4,
-    TEST_DEVICE,
-    accelerator_module,
-    make_fp4_weights,
-    make_fp8_weights,
-    make_static_activation_scale,
-    ref_matmul,
-)
-
 import finegrained_fp8  # type: ignore
 
-
-@dataclass(frozen=True)
-class Problem:
-    M: int
-    N: int
-    K: int
-    block_size: Optional[Tuple[int, int]] = None
-    weight_scale_dtype: torch.dtype = torch.float32
-    static_activation_scale: bool = False
-    dtype: torch.dtype = torch.bfloat16
-    weight_format: str = "fp8"
-    compile: bool = False
-
-    @property
-    def id(self) -> str:
-        head = f"{self.weight_format}_M{self.M}_N{self.N}_K{self.K}"
-        # FP4 ignores block_size (tile shape autotuned).
-        if self.weight_format == "fp4":
-            tail = head
-        elif self.block_size is None:
-            tail = f"{head}_tensor"
-        else:
-            tail = f"{head}_b{self.block_size[0]}x{self.block_size[1]}"
-        tail = f"{tail}_{DTYPE_TAG[self.dtype]}"
-        if self.weight_scale_dtype is torch.float8_e8m0fnu:
-            tail = f"{tail}_ue8m0"
-        if self.static_activation_scale:
-            tail = f"{tail}_static"
-        if self.compile:
-            tail = f"{tail}_compile"
-        return tail
+FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
+FP8_DTYPE = torch.float8_e4m3fn
 
 
-PROBLEMS = [
-    # ── FP8: per-tensor ──
-    Problem(M=16, N=512, K=1024, block_size=None),
-    # ── FP8: non-aligned N (MLA kv_a_proj style) ──
-    Problem(M=16, N=320, K=1024, block_size=(128, 128)),
-    # ── FP8: aligned block-wise ──
-    Problem(M=16, N=1024, K=2048, block_size=(128, 128)),
-    # fp16 / fp32 dtype coverage
-    Problem(M=16, N=320, K=1024, block_size=(128, 128), dtype=torch.float16),
-    Problem(M=16, N=320, K=1024, block_size=(128, 128), dtype=torch.float32),
-    # UE8M0 weight scales (DSv4-Flash style)
-    Problem(
-        M=16,
-        N=320,
-        K=1024,
-        block_size=(128, 128),
-        weight_scale_dtype=torch.float8_e8m0fnu,
-    ),
-    # Static activation scale (calibration-time per-tensor)
-    Problem(
-        M=16,
-        N=320,
-        K=1024,
-        block_size=(128, 128),
-        static_activation_scale=True,
-    ),
-    Problem(
-        M=16,
-        N=1024,
-        K=2048,
-        block_size=(128, 128),
-        static_activation_scale=True,
-    ),
-    # torch.compile compatibility
-    Problem(M=16, N=320, K=1024, block_size=(128, 128), compile=True),
+def _quantize_weights(W, block_n, block_k):
+    """Quantize a 2D weight matrix to FP8 with block-wise scales.
+
+    Handles non-aligned N/K by padding to block boundaries before quantizing,
+    then trimming back to the original shape.
+    For per-tensor quantization, pass block_n=N, block_k=K.
+    """
+    N, K = W.shape
+    pad_n = (-N) % block_n
+    pad_k = (-K) % block_k
+    W_padded = torch.nn.functional.pad(W, [0, pad_k, 0, pad_n])
+    Np, Kp = W_padded.shape
+    rt, ct = Np // block_n, Kp // block_k
+    R = W_padded.reshape(rt, block_n, ct, block_k)
+    max_abs = R.abs().amax(dim=(1, 3))
+    safe = torch.where(max_abs > 0, max_abs, torch.ones_like(max_abs))
+    scale = FP8_MAX / safe
+    Wq = (R * scale[:, None, :, None]).clamp(FP8_MIN, FP8_MAX).to(FP8_DTYPE)
+    Wq = Wq.reshape(Np, Kp)[:N, :K].contiguous()
+    inv_scales = (1.0 / scale).to(torch.float32)
+    return Wq, inv_scales
+
+
+def _ref_matmul(A_fp8, B_fp8, As, Bs, block_n, block_k, output_dtype=torch.float32):
+    """Pure-PyTorch reference: dequant both sides to float32 and matmul.
+
+    Takes the same pre-quantized FP8 inputs as the kernel under test,
+    so this only tests the matmul logic, not quantization.
+    """
+    N, K = B_fp8.shape
+
+    # Dequantize A: A_deq[m, k] = A_fp8[m, k] * As[m, k // block_k]
+    A_deq = A_fp8.float()
+    for b in range(As.shape[1]):
+        start = b * block_k
+        end = min(start + block_k, K)
+        A_deq[:, start:end] *= As[:, b : b + 1]
+
+    # Dequantize B: B_deq[n, k] = B_fp8[n, k] * Bs[n // block_n, k // block_k]
+    B_deq = B_fp8.float()
+    for ni in range(Bs.shape[0]):
+        n_start = ni * block_n
+        n_end = min(n_start + block_n, N)
+        for ki in range(Bs.shape[1]):
+            k_start = ki * block_k
+            k_end = min(k_start + block_k, K)
+            B_deq[n_start:n_end, k_start:k_end] *= Bs[ni, ki]
+
+    return (A_deq @ B_deq.T).to(output_dtype)
+
+
+# (M, N, K, block_size)
+# block_size=[128,128] for block-wise, None for per-tensor
+CASES = [
+    # ── Non-aligned N (MLA kv_a_proj style) ──
+    (16, 320, 1024, [128, 128]),
+    # ── Aligned block-wise ──
+    (16, 1024, 2048, [128, 128]),
+    # ── Per-tensor ──
+    (16, 512, 1024, None),
 ]
-if SUPPORTS_FP4:
-    # ``block_size`` is ignored on the FP4 path (tile shape autotuned).
-    PROBLEMS += [
-        Problem(M=32, N=256, K=512, weight_format="fp4"),
-        Problem(M=32, N=256, K=512, weight_format="fp4", dtype=torch.float16),
-        Problem(M=32, N=256, K=512, weight_format="fp4", dtype=torch.float32),
-        Problem(M=32, N=256, K=512, weight_format="fp4", compile=True),
-    ]
 
+# CI (L4, SM89) has looser FP8 numerics vs the dequant+matmul reference on Hopper and newer.
+_sm = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+_is_hopper_or_newer = _sm >= (9, 0)
 
-def _setup_problem(problem: Problem):
-    torch.manual_seed(42)
-    A = torch.randn(problem.M, problem.K, dtype=problem.dtype, device=TEST_DEVICE)
-    if problem.weight_format == "fp4":
-        B, Bs = make_fp4_weights(problem.N, problem.K, TEST_DEVICE)
-    else:
-        B, Bs = make_fp8_weights(
-            problem.N,
-            problem.K,
-            TEST_DEVICE,
-            problem.block_size,
-            scale_dtype=problem.weight_scale_dtype,
-        )
-    a_scale = (
-        make_static_activation_scale(A) if problem.static_activation_scale else None
-    )
-    return A, B, Bs, a_scale
+if _is_hopper_or_newer:
+    DTYPE_TO_TOL = {
+        torch.bfloat16: (1e-4, 1e-2),
+        torch.float16: (1e-4, 1e-2),
+        torch.float32: (1e-4, 1e-4),
+    }
+else:
+    DTYPE_TO_TOL = {
+        torch.bfloat16: (0.2, 0.05),
+        torch.float16: (0.2, 0.05),
+        torch.float32: (0.2, 0.05),
+    }
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-@pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
-def test_matmul(problem: Problem):
-    """``matmul`` matches the pure-PyTorch dequant+matmul reference."""
-    A, B, Bs, a_scale = _setup_problem(problem)
-    matmul = finegrained_fp8.matmul
-    if problem.compile:
-        torch.compiler.reset()
-        accelerator_module().empty_cache()
-        matmul = torch.compile(matmul, mode="max-autotune", fullgraph=True)
-    out = matmul(
-        A,
-        B,
-        Bs,
-        problem.block_size,
-        problem.dtype,
-        activation_scale=a_scale,
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("M,N,K,block_size", CASES, ids=lambda x: str(x))
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_matmul_correctness(M, N, K, block_size, dtype):
+    """w8a8_fp8_matmul matches pure-PyTorch dequant+matmul reference."""
+    torch.manual_seed(42)
+    device = "cuda"
+
+    # Quantize weights
+    W = torch.randn(N, K, dtype=torch.float32, device=device)
+    if block_size is not None:
+        block_n, block_k = block_size
+    else:
+        block_n, block_k = N, K
+    B_fp8, Bs = _quantize_weights(W, block_n, block_k)
+
+    # Quantize activations (always use 128 for block-wise, K for per-tensor)
+    A = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    act_block = block_k if block_size is not None else K
+    qA, sA = finegrained_fp8.fp8_act_quant(A, act_block)
+
+    out = finegrained_fp8.w8a8_fp8_matmul(qA, B_fp8, sA, Bs, block_size, dtype)
+    ref = _ref_matmul(qA, B_fp8, sA, Bs, block_n, block_k, dtype)
+
+    assert out.dtype == dtype
+    assert out.shape == (M, N)
+    torch.testing.assert_close(
+        out, ref, atol=DTYPE_TO_TOL[dtype][0], rtol=DTYPE_TO_TOL[dtype][1]
     )
-    ref = ref_matmul(
-        A,
-        B,
-        Bs,
-        problem.block_size,
-        problem.dtype,
-        activation_scale=a_scale,
-    )
-    assert out.dtype == problem.dtype
-    assert out.shape == (problem.M, problem.N)
-    atol, rtol = DTYPE_TO_TOL[problem.dtype]
-    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
