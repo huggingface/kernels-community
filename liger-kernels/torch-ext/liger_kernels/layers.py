@@ -17,7 +17,6 @@ from .qwen2vl_mrope import LigerQwen2VLMRopeFunction
 from .rms_norm import LigerRMSNormFunction
 from .rope import LigerRopeFunction
 from .swiglu import LigerSiLUMulFunction
-from .tiled_mlp import apply_tiled_mlp
 from .tvd import LigerTVDLossFunction
 
 
@@ -307,54 +306,6 @@ class LigerGEGLUMLP(nn.Module):
         return self.down_proj(LigerGELUMulFunction.apply(self.gate_proj(x), self.up_proj(x)))
 
 
-class LigerTiledGEGLUMLP(nn.Module):
-    gate_proj: nn.Linear
-    up_proj: nn.Linear
-    down_proj: nn.Linear
-    num_shards: int
-
-    def _mlp_forward(self, module, x):
-        """Internal MLP forward function for tiled computation."""
-        gate = module.gate_proj(x)
-        up = module.up_proj(x)
-        return module.down_proj(LigerGELUMulFunction.apply(gate, up))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        compute_params = [p for p in self.parameters() if p.requires_grad]
-
-        return apply_tiled_mlp(
-            fn=self._mlp_forward,
-            mlp_module=self,
-            x=x,
-            num_shards=self.num_shards,
-            compute_params=compute_params,
-        )
-
-
-class LigerTiledSwiGLUMLP(nn.Module):
-    gate_proj: nn.Linear
-    up_proj: nn.Linear
-    down_proj: nn.Linear
-    num_shards: int
-
-    def _mlp_forward(self, module, x):
-        """Internal MLP forward function for tiled computation."""
-        gate = module.gate_proj(x)
-        up = module.up_proj(x)
-        return module.down_proj(LigerSiLUMulFunction.apply(gate, up))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        compute_params = [p for p in self.parameters() if p.requires_grad]
-
-        return apply_tiled_mlp(
-            fn=self._mlp_forward,
-            mlp_module=self,
-            x=x,
-            num_shards=self.num_shards,
-            compute_params=compute_params,
-        )
-
-
 @dataclass
 class CrossEntropyOutput:
     loss: torch.Tensor
@@ -504,8 +455,6 @@ __all__ = [
     "LigerTVDLoss",
     "LigerSwiGLUMLP",
     "LigerGEGLUMLP",
-    "LigerTiledGEGLUMLP",
-    "LigerTiledSwiGLUMLP",
     "CrossEntropyOutput",
     "liger_fused_linear_cross_entropy",
     "LigerForCausalLMLoss",

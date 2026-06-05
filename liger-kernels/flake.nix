@@ -2,7 +2,7 @@
   description = "Flake for Unsloth Kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/triton-rocm-fixes";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
