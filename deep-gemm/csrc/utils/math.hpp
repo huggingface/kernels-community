@@ -1,13 +1,14 @@
+// TODO: merge this file with `math.cuh` (the device part)
 #pragma once
 
-#include <torch/torch.h>
+#include "torch_compat.hpp"
 
 #include "exception.hpp"
 
 namespace deep_gemm {
 
-// TODO: Use `torch::kFloat4_e2m1fn_x2`
-constexpr auto kPackedFP4 = torch::kUInt8;
+// TODO: use `torch::kFloat4_e2m1fn_x2`
+constexpr auto kPackedFP4 = torch::kInt8;
 
 template <typename T>
 static T ceil_div(const T& a, const T& b) {
