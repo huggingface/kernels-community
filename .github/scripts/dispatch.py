@@ -29,6 +29,9 @@ RELEASE_WORKFLOWS = [
     "build-windows.yaml",
 ]
 
+# Dispatched alongside a build when run_security is set (see dispatch_release).
+SECURITY_WORKFLOW = "security-audit.yml"
+
 KERNEL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -38,6 +41,9 @@ class ReleaseDispatchResult:
     dispatched: list[tuple[str, str]] = field(default_factory=list)  # (workflow, dispatch_key)
     failed: list[tuple[str, int]] = field(default_factory=list)  # (workflow, http_code)
     skipped: list[str] = field(default_factory=list)  # workflow filenames
+    # Set when run_security dispatches the security audit (see dispatch_release).
+    security_dispatch_key: str | None = None  # dispatch_key of the audit run
+    security_failed_code: int | None = None  # http_code if the audit dispatch failed
 
 
 def github_api_request(
@@ -179,6 +185,46 @@ def select_workflows(kernel_name: str) -> set[str]:
     return workflows
 
 
+def dispatch_security_audit(
+    *,
+    token: str,
+    repo: str,
+    ref: str,
+    pr_number: str,
+    head_sha: str = "",
+    dispatch_key_prefix: str = "",
+    dry_run: bool = False,
+) -> str:
+    """
+    Dispatch the security-audit workflow for a PR and return its dispatch_key.
+
+    The workflow definition is always read from ``ref`` (the default branch),
+    while the audit itself checks out the PR head for analysis. Raises
+    ``urllib.error.HTTPError`` if the dispatch request fails.
+    """
+    dispatch_key = f"{dispatch_key_prefix}security-{uuid.uuid4().hex[:12]}"
+    dispatch_body = {
+        "ref": ref,
+        "inputs": {
+            "pr_number": pr_number,
+            "dispatch_key": dispatch_key,
+            "head_sha": head_sha,
+        },
+    }
+    if dry_run:
+        print(f"\n[dry-run] {SECURITY_WORKFLOW}:")
+        print(json.dumps(dispatch_body, indent=2))
+        return dispatch_key
+
+    dispatch_url = (
+        f"https://api.github.com/repos/{repo}"
+        f"/actions/workflows/{SECURITY_WORKFLOW}/dispatches"
+    )
+    print(f"Dispatching {SECURITY_WORKFLOW} for PR #{pr_number} on ref `{ref}`")
+    github_api_request(dispatch_url, token, method="POST", data=dispatch_body)
+    return dispatch_key
+
+
 def dispatch_release(
     kernel_name: str,
     *,
@@ -194,6 +240,7 @@ def dispatch_release(
     head_sha: str = "",
     target_branch: str = "",
     upload: bool = True,
+    run_security: bool = False,
 ) -> ReleaseDispatchResult:
     """
     Dispatch the appropriate build workflows for a kernel.
@@ -212,6 +259,9 @@ def dispatch_release(
         head_sha: Optional PR head SHA for commit status reporting.
         target_branch: Target branch for upload.
         upload: Whether to upload after build.
+        run_security: Also dispatch the security-audit workflow for this PR
+            (requires pr_number). The audit runs concurrently with the build;
+            its key/failure are reported via the result's security_* fields.
 
     Returns:
         ReleaseDispatchResult with dispatched/failed/skipped lists.
@@ -336,6 +386,32 @@ def dispatch_release(
             print(f"Failed to dispatch {workflow} (HTTP {e.code}): {err_text}", file=sys.stderr)
             result.failed.append((workflow, e.code))
 
+    # Optionally fire the security audit for this PR, concurrently with the build.
+    if run_security:
+        if not pr_number:
+            print(
+                "run_security set but no pr_number provided; skipping security audit.",
+                file=sys.stderr,
+            )
+        else:
+            try:
+                result.security_dispatch_key = dispatch_security_audit(
+                    token=token,
+                    repo=repo,
+                    ref=ref,
+                    pr_number=pr_number,
+                    head_sha=head_sha,
+                    dispatch_key_prefix=dispatch_key_prefix,
+                    dry_run=dry_run,
+                )
+            except urllib.error.HTTPError as e:
+                err_text = e.read().decode("utf-8", errors="replace")
+                print(
+                    f"Failed to dispatch {SECURITY_WORKFLOW} (HTTP {e.code}): {err_text}",
+                    file=sys.stderr,
+                )
+                result.security_failed_code = e.code
+
     return result
 
 
@@ -382,6 +458,10 @@ def main() -> int:
         "--repo-prefix", default="kernels-community",
         help="Hub org prefix for uploads (default: kernels-community)",
     )
+    parser.add_argument(
+        "--security", action="store_true",
+        help="Also dispatch the security-audit workflow for the PR (requires --pr-number)",
+    )
     args = parser.parse_args()
 
     common = dict(
@@ -393,6 +473,7 @@ def main() -> int:
         head_sha=args.head_sha,
         target_branch=args.target_branch,
         upload=not args.no_upload,
+        run_security=args.security,
     )
 
     if args.dry_run:
@@ -432,6 +513,10 @@ def main() -> int:
         print(f"\nDispatched ({len(result.dispatched)}):")
         for wf, dk in result.dispatched:
             print(f"  - {wf} (key: {dk})")
+    if result.security_dispatch_key:
+        print(f"\nSecurity audit: {SECURITY_WORKFLOW} (key: {result.security_dispatch_key})")
+    if result.security_failed_code is not None:
+        print(f"\nSecurity audit failed: {SECURITY_WORKFLOW} (HTTP {result.security_failed_code})")
     if result.skipped:
         print(f"\nSkipped ({len(result.skipped)}):")
         for wf in result.skipped:
