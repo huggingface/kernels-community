@@ -3,7 +3,9 @@
 
 import torch
 
-from ._ops import ops
+# Stable alias: bare `ops` is shadowed by `from . import layers` below.
+from ._ops import ops as _compiled_ops
+from . import ops
 
 from .grouped_gemm import backend as gg_backend
 from .grouped_gemm import ops as gg_ops
@@ -136,7 +138,8 @@ def sort(
     Returns:
         The sorted values tensor
     """
-    return ops.sort(x, end_bit, x_out, iota_out)
+    _compiled_ops.sort(x, end_bit, x_out, iota_out)
+    return x_out
 
 
 # Convenience functions for common use cases
