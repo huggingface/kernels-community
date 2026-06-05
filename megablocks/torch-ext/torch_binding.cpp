@@ -2,7 +2,7 @@
 #include <optional>
 #include <vector>
 
-#if defined(CUDA_KERNEL) || defined(ROCM_KERNEL)
+#if defined(CUDA_KERNEL)
 #include "registration.h"
 #include "torch_binding.h"
 
@@ -12,11 +12,7 @@
 #include "replicate.h"
 #include "sort.h"
 
-#if defined(CUDA_KERNEL)
-// Grouped GEMM is CUTLASS-based and CUDA-only; on ROCm the grouped GEMM is
-// provided by the vendored AITER Triton kernels in Python.
 #include "grouped_gemm/grouped_gemm.h"
-#endif
 #elif defined(XPU_KERNEL)
 #include "../csrc_xpu/core/registration.h"
 #include "../csrc_xpu/moe/moe_ops.h"
@@ -28,8 +24,8 @@
 #include "../csrc_cpu/moe_dispatcher.h"
 #endif
 
-#if defined(CUDA_KERNEL) || defined(ROCM_KERNEL)
-// ==================== CUDA / ROCm Implementation =====================
+#if defined(CUDA_KERNEL)
+// ======================== CUDA Implementation ========================
 
 // void exclusive_cumsum(torch::Tensor x, int dim, torch::Tensor out) {
 torch::Tensor exclusive_cumsum_wrapper(torch::Tensor x, int64_t dim, torch::Tensor out) {
@@ -92,13 +88,11 @@ torch::Tensor sort_wrapper(torch::Tensor x, int64_t end_bit, torch::Tensor x_out
   return x_out;
 }
 
-#if defined(CUDA_KERNEL)
-// GroupedGemm operation (CUTLASS, CUDA-only).
+// GroupedGemm operation
 torch::Tensor gmm(torch::Tensor a, torch::Tensor b, torch::Tensor c, torch::Tensor batch_sizes, bool trans_a, bool trans_b) {
   grouped_gemm::GroupedGemm(a, b, c, batch_sizes, trans_a, trans_b);
   return c;
 }
-#endif
 
 // Reference implementation:
 //
@@ -132,11 +126,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("sort(Tensor x, int end_bit, Tensor x_out, Tensor iota_out) -> Tensor(x_out)");
   ops.impl("sort", torch::kCUDA, &sort_wrapper);
 
-#if defined(CUDA_KERNEL)
-  // Register the gmm GroupedGemm operation (CUTLASS, CUDA-only).
+  // Register the gmm GroupedGemm operation
   ops.def("gmm(Tensor (a!) a, Tensor (b!) b, Tensor(c!) c, Tensor batch_sizes, bool trans_a, bool trans_b) -> Tensor(c!)");
   ops.impl("gmm", torch::kCUDA, &gmm);
-#endif
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

@@ -14,14 +14,6 @@
     TORCH_CHECK(status == cudaSuccess, err);		    \
   } while (0)
 
-// __ldg (read-only cache load) is a CUDA intrinsic that hipify does not
-// translate; on AMD fall back to a plain dereference.
-#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
-  #define _LDG(arg) (*(arg))
-#else
-  #define _LDG(arg) __ldg(arg)
-#endif
-
 namespace megablocks {
 namespace replicate {
 
@@ -44,11 +36,11 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   // Load the start/end for this bin.
   int bin_idx = blockIdx.x;
   int start = 0;
-  if (bin_idx > 0) start = _LDG(bins + bin_idx - 1);
-  int end = _LDG(bins + bin_idx);
+  if (bin_idx > 0) start = __ldg(bins + bin_idx - 1);
+  int end = __ldg(bins + bin_idx);
 
   // Load the value to replicate.
-  T value = _LDG((T*)x + bin_idx);
+  T value = __ldg((T*)x + bin_idx);
 
   // Offset to this threadblocks bin and this threads
   // offset within the bin.
