@@ -8,9 +8,12 @@ import time
 import urllib.parse
 import urllib.error
 import urllib.request
-import uuid
 
-from dispatch import RELEASE_WORKFLOWS, dispatch_release as do_dispatch_release
+from dispatch import (
+    RELEASE_WORKFLOWS,
+    SECURITY_WORKFLOW,
+    dispatch_release as do_dispatch_release,
+)
 
 
 KERNEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -18,6 +21,7 @@ BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 COMMENT_CHARS_RE = re.compile(r"^/kernel-bot[ A-Za-z0-9_./-]*$")
 COMMAND_PERMISSIONS = {
     "build": {"admin", "write"},
+    "security-and-build": {"admin", "write"},
     "build-and-stage": {"admin", "write"},
     "merge-and-upload": {"admin", "write"},
     "release": {"admin"},
@@ -27,7 +31,7 @@ RUN_LOOKUP_ATTEMPTS = 10
 RUN_LOOKUP_SLEEP_SECONDS = 2
 RUN_LOOKUP_PAGE_SIZE = 100
 COMMAND_USAGE = (
-    "Invalid command. Use `/kernel-bot <build|build-and-stage|merge-and-upload|release> "
+    "Invalid command. Use `/kernel-bot <build|security-and-build|build-and-stage|merge-and-upload|release> "
     "<kernel1> [kernel2 ...] [--branch <target_branch>]`."
 )
 
@@ -183,10 +187,6 @@ def list_workflow_runs(
     return parsed.get("workflow_runs", [])
 
 
-def make_dispatch_key(issue_number: int, kernel_name: str):
-    return f"pr{issue_number}-{kernel_name}-{uuid.uuid4().hex[:12]}"
-
-
 def workflow_run_matches_dispatch(run: dict, dispatch_key: str):
     for field in ("display_title", "name"):
         value = run.get(field)
@@ -302,6 +302,8 @@ def format_pending_comment(
     mode_text: str,
     target_branch: str,
     pr_head_sha: str | None,
+    *,
+    include_security: bool = False,
 ):
     lines = comment_base_lines(
         "Build request received.",
@@ -310,6 +312,8 @@ def format_pending_comment(
         target_branch,
         pr_head_sha,
     )
+    if include_security:
+        lines.append(f"Security audit: `{SECURITY_WORKFLOW}` (running concurrently)")
     lines.extend(["", "Status: `processing`"])
     return "\n".join(lines)
 
@@ -324,6 +328,8 @@ def format_result_comment(
     dispatches: list[DispatchResult] | None = None,
     failed: list[tuple[str, int]] | None = None,
     failure_message: str | None = None,
+    security_dispatch: DispatchResult | None = None,
+    security_failure: str | None = None,
 ):
     dispatches = dispatches or []
     failed = failed or []
@@ -345,6 +351,18 @@ def format_result_comment(
         lines.extend(["", f"Merge result: {merge_result_message}"])
     if dispatches:
         lines.extend(format_dispatched_lines(dispatches))
+    if security_failure:
+        lines.extend(["", f"Security audit: {security_failure}"])
+    elif security_dispatch is not None:
+        if security_dispatch.action_url:
+            lines.extend(["", f"Security audit: {security_dispatch.action_url}"])
+        else:
+            lines.extend(
+                [
+                    "",
+                    f"Security audit: dispatched, but run URL is not available yet (`{SECURITY_WORKFLOW}`).",
+                ]
+            )
     if failed:
         failed_text = ", ".join(f"{kernel} (HTTP {code})" for kernel, code in failed)
         lines.extend(["", f"Failed ({len(failed)}): `{failed_text}`"])
@@ -360,8 +378,9 @@ def parse_command(comment: str) -> ParsedCommand:
     if tokens[0] != "/kernel-bot" or command not in COMMAND_PERMISSIONS:
         return ParsedCommand(error=COMMAND_USAGE)
 
-    branch = None
     args = tokens[2:]
+
+    branch = None
 
     if "--branch" in args:
         branch_idx = args.index("--branch")
@@ -374,7 +393,7 @@ def parse_command(comment: str) -> ParsedCommand:
 
     if not args:
         return ParsedCommand(
-            error="No kernels provided. Use `/kernel-bot <build|build-and-stage|merge-and-upload> <kernel1> [kernel2 ...]`.",
+            error="No kernels provided. Use `/kernel-bot <build|security-and-build|build-and-stage|merge-and-upload> <kernel1> [kernel2 ...]`.",
         )
 
     kernels = []
@@ -494,9 +513,9 @@ def main():
     permission = get_user_permission(api_base, token, commenter)
     allowed_permissions = COMMAND_PERMISSIONS[command]
     if permission not in allowed_permissions:
-        if command == "build":
+        if "write" in allowed_permissions:
             permission_error = (
-                "I can only run `/kernel-bot build` for users with `write` or `admin` "
+                f"I can only run `/kernel-bot {command}` for users with `write` or `admin` "
                 "repository permission."
             )
         else:
@@ -529,7 +548,9 @@ def main():
         )
         return 1
 
-    if command == "build":
+    pr_head_sha = pull_request.get("head", {}).get("sha")
+
+    if command in ("build", "security-and-build"):
         target_branch = requested_branch or f"pr-{issue_number}"
         dispatch_pr_number = str(issue_number)
         dispatch_upload = False
@@ -552,6 +573,7 @@ def main():
 
     mode_text = {
         "build": "build only",
+        "security-and-build": "security audit + build",
         "build-and-stage": "build and stage",
         "merge-and-upload": "merge, build and upload",
         "release": "release (linux + mac + windows)",
@@ -559,7 +581,8 @@ def main():
     command_summary = f"/kernel-bot {command} {' '.join(kernels)}"
     if requested_branch is not None:
         command_summary += f" --branch {requested_branch}"
-    pr_head_sha = pull_request.get("head", {}).get("sha")
+    # `/kernel-bot security-and-build` runs the security audit concurrently with the build.
+    run_security = command == "security-and-build"
     status_comment_id = comment_id_from_response(
         try_create_issue_comment(
             api_base,
@@ -570,6 +593,7 @@ def main():
                 mode_text,
                 target_branch,
                 pr_head_sha,
+                include_security=run_security,
             ),
         )
     )
@@ -642,8 +666,10 @@ def main():
             )
     dispatches = []
     failed = []
+    security_dispatch = None
+    security_failure = None
 
-    for kernel_name in kernels:
+    for index, kernel_name in enumerate(kernels):
         release_result = do_dispatch_release(
             kernel_name,
             token=token,
@@ -656,6 +682,8 @@ def main():
             head_sha=pr_head_sha or "",
             target_branch=target_branch,
             upload=dispatch_upload,
+            # The audit is per-PR, so request it only once (on the first kernel).
+            run_security=run_security and index == 0,
         )
         for wf, dk in release_result.dispatched:
             dispatches.append(
@@ -663,14 +691,26 @@ def main():
             )
         for wf, code in release_result.failed:
             failed.append((f"{kernel_name} ({wf})", code))
+        if release_result.security_dispatch_key:
+            security_dispatch = DispatchResult(
+                kernel_name="security",
+                dispatch_key=release_result.security_dispatch_key,
+            )
+        if release_result.security_failed_code is not None:
+            security_failure = (
+                f"could not dispatch `{SECURITY_WORKFLOW}` "
+                f"(HTTP {release_result.security_failed_code})."
+            )
 
     resolve_dispatch_run_urls(
         api_base,
         token,
         repository,
         default_branch,
-        dispatches,
-        workflows=RELEASE_WORKFLOWS,
+        [*dispatches, *([security_dispatch] if security_dispatch else [])],
+        workflows=[*RELEASE_WORKFLOWS, SECURITY_WORKFLOW]
+        if run_security
+        else RELEASE_WORKFLOWS,
     )
 
     comment_written = try_send_issue_comment(
@@ -685,6 +725,8 @@ def main():
             merge_result_message=merge_result_message,
             dispatches=dispatches,
             failed=failed,
+            security_dispatch=security_dispatch,
+            security_failure=security_failure,
         ),
         comment_id=status_comment_id,
     )
