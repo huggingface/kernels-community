@@ -8,9 +8,12 @@ import time
 import urllib.parse
 import urllib.error
 import urllib.request
-import uuid
 
-from dispatch import RELEASE_WORKFLOWS, dispatch_release as do_dispatch_release
+from dispatch import (
+    RELEASE_WORKFLOWS,
+    SECURITY_WORKFLOW,
+    dispatch_release as do_dispatch_release,
+)
 
 
 KERNEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -22,7 +25,6 @@ COMMAND_PERMISSIONS = {
     "merge-and-upload": {"admin", "write"},
     "release": {"admin"},
 }
-SECURITY_WORKFLOW = "security-audit.yml"
 MAX_COMMENT_LENGTH = 1024
 RUN_LOOKUP_ATTEMPTS = 10
 RUN_LOOKUP_SLEEP_SECONDS = 2
@@ -182,10 +184,6 @@ def list_workflow_runs(
     _, body = github_api_request(url, token, method="GET")
     parsed = json.loads(body)
     return parsed.get("workflow_runs", [])
-
-
-def make_dispatch_key(issue_number: int, kernel_name: str):
-    return f"pr{issue_number}-{kernel_name}-{uuid.uuid4().hex[:12]}"
 
 
 def workflow_run_matches_dispatch(run: dict, dispatch_key: str):
@@ -451,39 +449,6 @@ def comment_has_only_supported_characters(comment: str):
     return bool(COMMENT_CHARS_RE.fullmatch(comment))
 
 
-def dispatch_workflow(
-    api_base: str,
-    token: str,
-    workflow_filename: str,
-    ref: str,
-    inputs: dict,
-):
-    url = f"{api_base}/actions/workflows/{workflow_filename}/dispatches"
-    github_api_request(url, token, method="POST", data={"ref": ref, "inputs": inputs})
-
-
-def dispatch_security_audit(
-    api_base: str,
-    token: str,
-    default_branch: str,
-    issue_number: int,
-    pr_head_sha: str | None,
-):
-    dispatch_key = make_dispatch_key(issue_number, "security")
-    dispatch_workflow(
-        api_base,
-        token,
-        SECURITY_WORKFLOW,
-        default_branch,
-        {
-            "pr_number": str(issue_number),
-            "dispatch_key": dispatch_key,
-            "head_sha": pr_head_sha or "",
-        },
-    )
-    return DispatchResult(kernel_name="security", dispatch_key=dispatch_key)
-
-
 def main():
     token = os.environ.get("GITHUB_TOKEN")
     repository = os.environ.get("GITHUB_REPOSITORY")
@@ -699,8 +664,10 @@ def main():
             )
     dispatches = []
     failed = []
+    security_dispatch = None
+    security_failure = None
 
-    for kernel_name in kernels:
+    for index, kernel_name in enumerate(kernels):
         release_result = do_dispatch_release(
             kernel_name,
             token=token,
@@ -713,6 +680,8 @@ def main():
             head_sha=pr_head_sha or "",
             target_branch=target_branch,
             upload=dispatch_upload,
+            # The audit is per-PR, so request it only once (on the first kernel).
+            run_security=run_security and index == 0,
         )
         for wf, dk in release_result.dispatched:
             dispatches.append(
@@ -720,22 +689,16 @@ def main():
             )
         for wf, code in release_result.failed:
             failed.append((f"{kernel_name} ({wf})", code))
-
-    security_dispatch = None
-    security_failure = None
-    if run_security:
-        try:
-            security_dispatch = dispatch_security_audit(
-                api_base, token, default_branch, issue_number, pr_head_sha
+        if release_result.security_dispatch_key:
+            security_dispatch = DispatchResult(
+                kernel_name="security",
+                dispatch_key=release_result.security_dispatch_key,
             )
-        except urllib.error.HTTPError as e:
-            err_text = e.read().decode("utf-8", errors="replace")
-            print(
-                f"Failed to dispatch {SECURITY_WORKFLOW} (HTTP {e.code}).",
-                file=sys.stderr,
+        if release_result.security_failed_code is not None:
+            security_failure = (
+                f"could not dispatch `{SECURITY_WORKFLOW}` "
+                f"(HTTP {release_result.security_failed_code})."
             )
-            print(err_text, file=sys.stderr)
-            security_failure = f"could not dispatch `{SECURITY_WORKFLOW}` (HTTP {e.code})."
 
     resolve_dispatch_run_urls(
         api_base,
