@@ -25,9 +25,10 @@ jobs:
         id: kernel
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_KERNEL: ${{ inputs.kernel }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "kernel=${{ inputs.kernel }}" >> $GITHUB_OUTPUT
+            echo "kernel=$INPUT_KERNEL" >> $GITHUB_OUTPUT
           else
             PR_TITLE=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}" --jq '.display_title')
             if [[ "$PR_TITLE" != *:* ]]; then
@@ -52,13 +53,16 @@ jobs:
         run: pip install "kernels[benchmark] @ git+https://github.com/huggingface/kernels#subdirectory=kernels"
       - name: Benchmark kernel
         if: steps.kernel.outputs.skip != 'true'
-        run: kernels benchmark "kernels-community/${{ steps.kernel.outputs.kernel }}" --branch main --visual benches
+        env:
+          KERNEL: ${{ steps.kernel.outputs.kernel }}
+        run: kernels benchmark "kernels-community/$KERNEL" --branch main --visual benches
       - name: Ensure README has performance section
         if: steps.kernel.outputs.skip != 'true'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KERNEL: ${{ steps.kernel.outputs.kernel }}
         run: |
-          REPO="kernels-community/${{ steps.kernel.outputs.kernel }}"
+          REPO="kernels-community/$KERNEL"
           hf download "$REPO" README.md --local-dir /tmp/kernel-readme --revision main
           if ! grep -q '### Performance' /tmp/kernel-readme/README.md; then
           cat >> /tmp/kernel-readme/README.md << 'EOF'
@@ -80,4 +84,5 @@ jobs:
         if: steps.kernel.outputs.skip != 'true'
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: hf upload "kernels-community/${{ steps.kernel.outputs.kernel }}" media media --revision main
+          KERNEL: ${{ steps.kernel.outputs.kernel }}
+        run: hf upload "kernels-community/$KERNEL" media media --revision main

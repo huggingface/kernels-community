@@ -39,10 +39,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          KERNEL: ${{ steps.validate.outputs.kernel }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
           python3 .github/scripts/dispatch.py "$KERNEL" \
             --mode pr \
-            --pr-number "${{ github.event.pull_request.number }}" \
-            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --pr-number "$PR_NUMBER" \
+            --head-sha "$HEAD_SHA" \
             --no-upload
