@@ -1,0 +1,16 @@
+[general]
+name = "flash-attn-ops"
+license = "BSD-3-Clause"
+version = 1
+backends = [
+    "cuda",
+    "rocm",
+    "xpu",
+]
+
+[general.hub]
+repo-id = "kernels-community/flash-attn-ops"
+
+[torch-noarch]
+
+[kernel]
