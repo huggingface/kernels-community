@@ -1,32 +1,40 @@
-from .act_quant import fp8_act_quant
+from .utils import fp8_act_quant
 from .batched import (
-    w8a8_fp8_matmul_batched,
-    w8a8_block_fp8_matmul_batched,
-    w8a8_tensor_fp8_matmul_batched,
+    matmul_batched,
+    w4a8_block_dynamic_fp4_matmul_batched,
+    w8a8_block_dynamic_fp8_matmul_batched,
+    w8a8_tensor_dynamic_fp8_matmul_batched,
 )
 from .grouped import (
-    w8a8_fp8_matmul_grouped,
-    w8a8_block_fp8_matmul_grouped,
-    w8a8_tensor_fp8_matmul_grouped,
+    matmul_grouped,
+    w4a8_block_dynamic_fp4_matmul_grouped,
+    w8a8_block_dynamic_fp8_matmul_grouped,
+    w8a8_tensor_dynamic_fp8_matmul_grouped,
 )
 from .matmul import (
-    w8a8_fp8_matmul,
-    w8a8_block_fp8_matmul,
-    w8a8_tensor_fp8_matmul,
+    matmul,
+    w4a8_block_dynamic_fp4_matmul,
+    w8a8_block_dynamic_fp8_matmul,
+    w8a8_block_static_fp8_matmul,
+    w8a8_tensor_dynamic_fp8_matmul,
 )
 
 __all__ = [
     "fp8_act_quant",
     # Single matmul
-    "w8a8_fp8_matmul",
-    "w8a8_block_fp8_matmul",
-    "w8a8_tensor_fp8_matmul",
+    "matmul",
+    "w4a8_block_dynamic_fp4_matmul",
+    "w8a8_block_dynamic_fp8_matmul",
+    "w8a8_block_static_fp8_matmul",
+    "w8a8_tensor_dynamic_fp8_matmul",
     # Batched matmul
-    "w8a8_fp8_matmul_batched",
-    "w8a8_block_fp8_matmul_batched",
-    "w8a8_tensor_fp8_matmul_batched",
+    "matmul_batched",
+    "w4a8_block_dynamic_fp4_matmul_batched",
+    "w8a8_block_dynamic_fp8_matmul_batched",
+    "w8a8_tensor_dynamic_fp8_matmul_batched",
     # Grouped matmul
-    "w8a8_fp8_matmul_grouped",
-    "w8a8_block_fp8_matmul_grouped",
-    "w8a8_tensor_fp8_matmul_grouped",
+    "matmul_grouped",
+    "w4a8_block_dynamic_fp4_matmul_grouped",
+    "w8a8_block_dynamic_fp8_matmul_grouped",
+    "w8a8_tensor_dynamic_fp8_matmul_grouped",
 ]

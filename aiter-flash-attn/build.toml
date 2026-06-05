@@ -1,0 +1,14 @@
+[general]
+name = "aiter-flash-attn"
+license = "MIT"
+version = 1
+backends = [
+    "rocm",
+]
+
+[general.hub]
+repo-id = "kernels-community/aiter-flash-attn"
+
+[torch-noarch]
+
+[kernel]

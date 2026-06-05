@@ -6,11 +6,12 @@ from .utils import amp_custom_bwd
 from .utils import amp_custom_fwd
 from .utils import element_mul_kernel
 from .utils import is_hip
+from .utils import infer_device
 
 # The hard limit of TRITON_MAX_TENSOR_NUMEL is 1048576 https://github.com/triton-lang/triton/blob/ba42a5c68fd0505f8c42f4202d53be0f8d9a5fe0/python/triton/language/core.py#L19
 # However, setting limit as 65536 as in LayerNorm tutorial is faster because of less register spilling
 # The optimal maximum block size depends on your hardware, your kernel, and your dtype
-MAX_FUSED_SIZE = 65536 // 2
+MAX_FUSED_SIZE = 2048 if infer_device() == "npu" else 65536 // 2
 
 
 def fused_linear_cross_entropy_forward(
@@ -25,9 +26,21 @@ def fused_linear_cross_entropy_forward(
     reduction="mean",
     softcap=None,
     return_z_loss=False,
+    accum_dtype=None,
+    use_token_scaling=False,
+    return_token_accuracy=False,
+    return_predicted_tokens=False,
 ):
     assert isinstance(return_z_loss, bool), f"return_z_loss must be True or False. Got: {return_z_loss}"
+    assert isinstance(return_token_accuracy, bool), (
+        f"return_token_accuracy must be True or False. Got: {return_token_accuracy}"
+    )
+    assert isinstance(return_predicted_tokens, bool), (
+        f"return_predicted_tokens must be True or False. Got: {return_predicted_tokens}"
+    )
     device = _input.device
+
+    input_requires_grad = _input.requires_grad
 
     # inputs have shape: BT x H
     # materialized activations will have shape: BT x V
@@ -44,12 +57,24 @@ def fused_linear_cross_entropy_forward(
     chunk_size = triton.next_power_of_2(triton.cdiv(BT, inc_factor))  # (BT + inc_factor - 1) // inc_factor
     num_chunks = triton.cdiv(BT, chunk_size)  # (BT + chunk_size - 1) // chunk_size
 
-    grad_weight = torch.zeros_like(weight, device=device) if weight.requires_grad else None
     grad_input = torch.zeros_like(_input, device=device)
-    grad_bias = torch.zeros_like(bias, device=device) if bias is not None else None
-    # we use fp32 for loss accumulator
+
+    # we use fp32 for loss and gradients accumulator
+    if input_requires_grad:
+        if accum_dtype is None:
+            grad_weight = torch.zeros_like(weight, device=device) if weight.requires_grad else None
+            grad_bias = torch.zeros_like(bias, device=device) if bias is not None else None
+        else:
+            grad_weight = torch.zeros_like(weight, dtype=accum_dtype, device=device) if weight.requires_grad else None
+            grad_bias = torch.zeros_like(bias, dtype=accum_dtype, device=device) if bias is not None else None
+    else:
+        grad_weight = None
+        grad_bias = None
+
     loss_1d = torch.zeros(BT, dtype=torch.float32, device=device)
     z_loss_1d = torch.zeros(BT, dtype=_input.dtype, device=_input.device) if return_z_loss else None
+    token_accuracy_1d = torch.zeros(BT, dtype=torch.float32, device=device) if return_token_accuracy else None
+    predicted_tokens_1d = torch.full((BT,), -1, dtype=torch.int64, device=device) if return_predicted_tokens else None
 
     # TODO: evaluate how CUDA synchronization caused by .item() affects the speed
     target_mask = target != ignore_index
@@ -82,9 +107,41 @@ def fused_linear_cross_entropy_forward(
 
         n_rows = logits_chunk.shape[0]
 
+        # Compute predicted probabilities for token scaling if needed
+        if use_token_scaling:
+            # Compute softmax probabilities for scaling
+            # We need to compute this before the cross entropy kernel modifies logits_chunk
+            logits_for_softmax = logits_chunk.detach().clone()  # Detach to avoid gradient flow
+            if softcap is not None:
+                logits_for_softmax = softcap * torch.tanh(logits_for_softmax / softcap)
+
+            # Compute softmax to get predicted probabilities
+            probs = torch.softmax(logits_for_softmax, dim=-1)
+
+            # Get predicted probabilities for token scaling, handling ignored targets
+            valid_target_mask = target_chunk != ignore_index
+            valid_targets = target_chunk[valid_target_mask]
+
+            if len(valid_targets) > 0:
+                # Gather probabilities only for valid targets
+                valid_probs = probs[valid_target_mask]
+                pred_probs_valid = torch.gather(valid_probs, -1, valid_targets.unsqueeze(-1)).squeeze(-1)
+
+                # Create full tensor with zeros for ignored targets
+                pred_probs = torch.zeros_like(target_chunk, dtype=probs.dtype, device=probs.device)
+                pred_probs[valid_target_mask] = pred_probs_valid
+            else:
+                # All targets are ignored
+                pred_probs = torch.zeros_like(target_chunk, dtype=probs.dtype, device=probs.device)
+
+            # Store the scaling factors
+            scaling_factors = pred_probs.detach()  # Detach to ensure no gradient flow
+
         # unreduced loss
         loss_1d_slice = loss_1d[start_idx:end_idx]  # chunk_size,
         z_loss_1d_slice = z_loss_1d[start_idx:end_idx] if return_z_loss else None
+        token_accuracy_1d_slice = token_accuracy_1d[start_idx:end_idx] if return_token_accuracy else None
+        predicted_tokens_1d_slice = predicted_tokens_1d[start_idx:end_idx] if return_predicted_tokens else None
 
         # ensure _input and target are contiguous
         logits_chunk = logits_chunk.contiguous()
@@ -100,6 +157,14 @@ def fused_linear_cross_entropy_forward(
             loss_ptr=loss_1d_slice,
             z_loss_ptr=z_loss_1d_slice,
             loss_stride=loss_1d_slice.stride(-1),  # always 1
+            token_accuracy_ptr=token_accuracy_1d_slice,
+            token_accuracy_stride=token_accuracy_1d_slice.stride(-1)
+            if return_token_accuracy
+            else 0,  # always 1 if accuracy is enabled
+            predicted_tokens_ptr=predicted_tokens_1d_slice,
+            predicted_tokens_stride=predicted_tokens_1d_slice.stride(-1)
+            if return_predicted_tokens
+            else 0,  # always 1 if predicted tokens is enabled
             n_cols=V,
             n_non_ignore=total_n_non_ignore,
             sum_non_ignore_weight=total_sum_non_ignore_ce_weight,
@@ -110,35 +175,46 @@ def fused_linear_cross_entropy_forward(
             reduction=reduction,
             softcap=softcap,
             RETURN_Z_LOSS=return_z_loss,
+            RETURN_TOKEN_ACCURACY=return_token_accuracy,
+            RETURN_PREDICTED_TOKENS=return_predicted_tokens,
             HAS_WEIGHT=True if ce_weight is not None else False,
             HAS_SOFTCAPPING=True if softcap is not None else False,
+            HAS_GRADIENTS=input_requires_grad,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=32 if not is_hip() else 16,
         )
 
+        # Apply token scaling if requested
+        if use_token_scaling:
+            loss_1d_slice = loss_1d_slice * scaling_factors
+            if return_z_loss:
+                z_loss_1d_slice = z_loss_1d_slice * scaling_factors
+
         loss_1d[start_idx:end_idx] = loss_1d_slice
         if return_z_loss:
             z_loss_1d[start_idx:end_idx] = z_loss_1d_slice
+        if return_token_accuracy:
+            token_accuracy_1d[start_idx:end_idx] = token_accuracy_1d_slice
+        if return_predicted_tokens:
+            predicted_tokens_1d[start_idx:end_idx] = predicted_tokens_1d_slice
         grad_logits_chunk = logits_chunk  # chunk_size x V
 
-        grad_input[start_idx:end_idx] = grad_logits_chunk @ weight
+        # Apply token scaling to gradients if requested
+        if use_token_scaling:
+            # Expand scaling factors to match gradient dimensions
+            scaling_factors_expanded = scaling_factors.unsqueeze(-1)  # chunk_size x 1
+            grad_logits_chunk = grad_logits_chunk * scaling_factors_expanded
 
-        if grad_weight is not None:
-            torch.addmm(
-                input=grad_weight,
-                mat1=logits_chunk.t().to(
-                    _input_chunk.dtype
-                ),  # In an autocast scenario without bias, differing logits_chunk data types will cause an addmm operation error.
-                mat2=_input_chunk,
-                out=grad_weight,
-                alpha=1.0,
-                beta=1.0,
-            )
+        if input_requires_grad:
+            grad_input[start_idx:end_idx] = grad_logits_chunk @ weight
 
-        if bias is not None:
+        if grad_weight is not None and input_requires_grad:
+            grad_weight += torch.mm(grad_logits_chunk.t(), _input_chunk).float()
+
+        if bias is not None and input_requires_grad:
             torch.add(
                 input=grad_bias,
-                other=logits_chunk.sum(dim=0),
+                other=grad_logits_chunk.sum(dim=0),
                 out=grad_bias,
                 alpha=1.0,
             )
@@ -148,10 +224,24 @@ def fused_linear_cross_entropy_forward(
     #     loss = loss_1d
     #     z_loss = z_loss_1d if return_z_loss else None
 
+    if reduction == "none":
+        # Return per-token losses
+        loss = loss_1d
+        z_loss = z_loss_1d if return_z_loss else None
+        token_accuracy = token_accuracy_1d if return_token_accuracy else None
     else:
         loss = torch.sum(loss_1d)
         z_loss = torch.sum(z_loss_1d) if return_z_loss else None
-    return loss, z_loss, grad_input, grad_weight, grad_bias
+        # For accuracy, we compute the mean across all non-ignored tokens
+        token_accuracy = torch.sum(token_accuracy_1d) / total_n_non_ignore if return_token_accuracy else None
+
+    predicted_tokens = predicted_tokens_1d if return_predicted_tokens else None
+
+    # Cast back to original dtype
+    grad_weight = grad_weight.to(weight.dtype) if grad_weight is not None else None
+    grad_bias = grad_bias.to(bias.dtype) if grad_bias is not None else None
+
+    return loss, z_loss, token_accuracy, predicted_tokens, grad_input, grad_weight, grad_bias
 
 
 def fused_linear_cross_entropy_backward(grad_output, grad_input, grad_weight, grad_bias):
@@ -217,6 +307,10 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
         reduction="mean",
         softcap=None,
         return_z_loss: bool = False,
+        accum_dtype=None,
+        use_token_scaling: bool = False,
+        return_token_accuracy: bool = False,
+        return_predicted_tokens: bool = False,
     ):
         """
         Fusing the last linear layer with cross-entropy loss
@@ -235,35 +329,54 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
         ignore_index: the index to ignore in the target
         label_smoothing (float): The amount of smoothing when computing the loss, where 0.0 means no smoothing.
         reduction: reduction to apply
+        accum_dtype (torch.dtype): the dtype of intermediate result buffers for weight and bias gradient accumulations.
+            Recommended to set `accum_dtype` to higher precision, e.g. `torch.float32`, if the training is unstable with original dtype. Default: `None`, performing accumulations in original dtype
+        use_token_scaling (bool): whether to scale each token's loss by its predicted probability (detached).
+            When True, each token's loss is multiplied by the model's predicted probability for that token's true class.
+            Default: False.
+        return_token_accuracy (bool): When `return_token_accuracy` is `True`, computes and returns per-token accuracy without materializing logits. Default: `False`
+        return_predicted_tokens (bool): When `return_predicted_tokens` is `True`, returns per-token predicted class indices (argmax) without materializing logits. Default: `False`
         """
 
-        loss, z_loss, grad_input, grad_weight, grad_bias = fused_linear_cross_entropy_forward(
-            _input=_input,
-            weight=weight,
-            target=target,
-            bias=bias,
-            ce_weight=ce_weight,
-            ignore_index=ignore_index,
-            lse_square_scale=lse_square_scale,
-            label_smoothing=label_smoothing,
-            reduction=reduction,
-            softcap=softcap,
-            return_z_loss=return_z_loss,
+        loss, z_loss, token_accuracy, predicted_tokens, grad_input, grad_weight, grad_bias = (
+            fused_linear_cross_entropy_forward(
+                _input=_input,
+                weight=weight,
+                target=target,
+                bias=bias,
+                ce_weight=ce_weight,
+                ignore_index=ignore_index,
+                lse_square_scale=lse_square_scale,
+                label_smoothing=label_smoothing,
+                reduction=reduction,
+                softcap=softcap,
+                return_z_loss=return_z_loss,
+                accum_dtype=accum_dtype,
+                use_token_scaling=use_token_scaling,
+                return_token_accuracy=return_token_accuracy,
+                return_predicted_tokens=return_predicted_tokens,
+            )
         )
         # downcast to dtype and store for backward
         ctx.save_for_backward(
             grad_input.detach(),
             grad_weight.detach() if grad_weight is not None else None,
-            grad_bias.detach() if bias is not None else None,
+            grad_bias.detach() if grad_bias is not None else None,
         )
         ctx.return_z_loss = return_z_loss
-        return loss, z_loss
+        ctx.return_token_accuracy = return_token_accuracy
+        ctx.return_predicted_tokens = return_predicted_tokens
+        return loss, z_loss, token_accuracy, predicted_tokens
 
     @staticmethod
     @amp_custom_bwd
-    def backward(ctx, grad_output, grad_output2):
+    def backward(ctx, grad_output, grad_output2, grad_output3, grad_output4):
         if ctx.return_z_loss:
             del grad_output2  # z_loss is only for logging
+        if ctx.return_token_accuracy:
+            del grad_output3  # token_accuracy is only for metrics
+        if ctx.return_predicted_tokens:
+            del grad_output4  # predicted_tokens is only for metrics
         (grad_input, grad_weight, grad_bias) = ctx.saved_tensors
         grad_input, grad_weight, grad_bias = fused_linear_cross_entropy_backward(
             grad_output, grad_input, grad_weight, grad_bias
@@ -280,4 +393,8 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,  # use_token_scaling
+            None,  # return_token_accuracy
+            None,  # return_predicted_tokens
         )

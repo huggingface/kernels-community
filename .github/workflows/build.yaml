@@ -47,6 +47,16 @@ on:
         required: false
         type: string
         default: ""
+      head_sha:
+        description: "PR head SHA for posting commit statuses (empty = no status)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  statuses: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
@@ -60,6 +70,18 @@ jobs:
       kernel: ${{ steps.validate.outputs.kernel }}
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
+      # Post a running commit status so the PR shows the build is in progress.
+      - name: Set running status
+        if: inputs.head_sha != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state="pending" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="Build in progress" \
+            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
+
       # Guard against injection via pr_number input.
       - name: Validate PR number
         if: inputs.pr_number != ''
@@ -150,6 +172,11 @@ jobs:
       group: ${{ matrix.runner }}
     # PR builds get 10h; release builds get 20h (more variants to compile).
     timeout-minutes: ${{ inputs.mode == 'pr' && 600 || 1200 }}
+    # id-token: write is needed for cosign.
+    permissions:
+      contents: read
+      statuses: write
+      id-token: write
     steps:
       # When building for a PR, check out the PR head; otherwise use default branch.
       - name: Checkout PR branch
@@ -188,6 +215,20 @@ jobs:
           else
             ( cd "$KERNEL" && nix build -L .#backendBundle.${{ matrix.backend }} && ls -l result/ )
           fi
+          ( cd "$KERNEL" && cp -rL result build && rm result && chmod -R u+w build )
+
+      - name: Install Cosign
+        if: needs.setup.outputs.kernel == 'relu' && inputs.mode != 'pr'
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+
+      # Sign metadata.json for each built variant.
+      - name: Sign kernel metadata
+        if: needs.setup.outputs.kernel == 'relu' && inputs.mode != 'pr'
+        run: |
+          KERNEL="${{ needs.setup.outputs.kernel }}"
+          for metadata_file in "$KERNEL"/build/*/metadata.json; do
+            cosign sign-blob "$metadata_file" --bundle "${metadata_file}.sigstore" --yes
+          done
 
       # Upload built artifacts to both model and kernel Hub repos.
       - name: Upload kernel to Hub
@@ -334,3 +375,33 @@ jobs:
         run: |
           CI_TEST_PATH="${{ needs.build-ci-test.outputs.ci-test-path }}"
           "$CI_TEST_PATH/bin/ci-test"
+
+  # Report the final build/test outcome as a commit status on the PR head SHA.
+  report-status:
+    if: always() && inputs.head_sha != ''
+    needs: [build-kernel, test-kernel-gpu]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set commit status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUILD="${{ needs.build-kernel.result }}"
+          TEST="${{ needs.test-kernel-gpu.result }}"
+
+          if [ "$BUILD" = "success" ] && { [ "$TEST" = "success" ] || [ "$TEST" = "skipped" ]; }; then
+            STATE="success"
+            DESC="Build passed"
+          elif [ "$BUILD" = "failure" ] || [ "$TEST" = "failure" ]; then
+            STATE="failure"
+            DESC="Build failed (build: ${BUILD}, test: ${TEST})"
+          else
+            STATE="error"
+            DESC="Build did not complete (build: ${BUILD}, test: ${TEST})"
+          fi
+
+          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state="$STATE" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f description="$DESC" \
+            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
