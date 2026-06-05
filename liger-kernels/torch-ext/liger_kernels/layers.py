@@ -16,6 +16,7 @@ from .tiled_mlp import apply_tiled_mlp
 
 # General
 
+# TODO
 class LigerLayerNorm(nn.Module):
     weight: nn.Parameter
     bias: nn.Parameter | None
@@ -28,16 +29,16 @@ class LigerLayerNorm(nn.Module):
         return f"{self.hidden_size}, eps={self.eps}"
 
 
+# TODO: actual loss should roughly match
 def liger_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    position_ids: Optional[torch.Tensor] = None,
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply standard rotary positional embedding to ``q`` and ``k``."""
-    return LigerRopeFunction.apply(q, k, cos, sin, position_ids, unsqueeze_dim)
+    return LigerRopeFunction.apply(q, k, cos, sin, None, unsqueeze_dim)
 
 
 # Supported by transformers
@@ -62,19 +63,22 @@ class LigerRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
-# TODO: experimental --> same as tiled but generalized to one MLP
-class LigerMLP(nn.Module):
+# TODO: actual loss should roughly match
+class LigerLinear(nn.Module):
     weight: nn.Parameter
     bias: nn.Parameter | None
 
-    def _forward(self, module, x):
-        return module(x)
-
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """def _forward(module, x):
+            return module(x)"""
+
+        def _forward(module, x):
+            return nn.functional.linear(x, module.weight, module.bias)
+
         compute_params = [p for p in self.parameters() if p.requires_grad]
 
         return apply_tiled_mlp(
-            fn=self._mlp_forward,
+            fn=_forward,
             mlp_module=self,
             x=input,
             num_shards=None,
@@ -93,23 +97,25 @@ class LigerSwiGLUMLP(nn.Module):
         return self.down_proj(LigerSiLUMulFunction.apply(self.gate_proj(x), self.up_proj(x)))
 
 
+# TODO: actual loss should roughly match
 class LigerGEGLUMLP(nn.Module):
     gate_proj: nn.Linear
     up_proj: nn.Linear
     down_proj: nn.Linear
 
-    # can_torch_compile = True  # TODO: check if true
+    can_torch_compile = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(LigerGELUMulFunction.apply(self.gate_proj(x), self.up_proj(x)))
 
 
+# TODO: actual loss should roughly match
 class LigerTiledGEGLUMLP(nn.Module):
     gate_proj: nn.Linear
     up_proj: nn.Linear
     down_proj: nn.Linear
 
-    # can_torch_compile = True  # TODO: check if true
+    can_torch_compile = True
 
     def _mlp_forward(self, module, x):
         """Internal MLP forward function for tiled computation."""
@@ -118,10 +124,16 @@ class LigerTiledGEGLUMLP(nn.Module):
         return module.down_proj(LigerGELUMulFunction.apply(gate, up))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        def _mlp_forward(module, x):
+            """Internal MLP forward function for tiled computation."""
+            gate = module.gate_proj(x)
+            up = module.up_proj(x)
+            return module.down_proj(LigerGELUMulFunction.apply(gate, up))
+
         compute_params = [p for p in self.parameters() if p.requires_grad]
 
         return apply_tiled_mlp(
-            fn=self._mlp_forward,
+            fn=_mlp_forward,
             mlp_module=self,
             x=x,
             num_shards=None,
@@ -129,24 +141,25 @@ class LigerTiledGEGLUMLP(nn.Module):
         )
 
 
+# TODO: actual loss should roughly match
 class LigerTiledSwiGLUMLP(nn.Module):
     gate_proj: nn.Linear
     up_proj: nn.Linear
     down_proj: nn.Linear
 
-    # can_torch_compile = True  # TODO: check if true
-
-    def _mlp_forward(self, module, x):
-        """Internal MLP forward function for tiled computation."""
-        gate = module.gate_proj(x)
-        up = module.up_proj(x)
-        return module.down_proj(LigerSiLUMulFunction.apply(gate, up))
+    can_torch_compile = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        def _mlp_forward(module, x):
+            """Internal MLP forward function for tiled computation."""
+            gate = module.gate_proj(x)
+            up = module.up_proj(x)
+            return module.down_proj(LigerSiLUMulFunction.apply(gate, up))
+
         compute_params = [p for p in self.parameters() if p.requires_grad]
 
         return apply_tiled_mlp(
-            fn=self._mlp_forward,
+            fn=_mlp_forward,
             mlp_module=self,
             x=x,
             num_shards=None,
@@ -264,13 +277,14 @@ def LigerForCausalLMLoss(
 # Add torch compile support for functions - in this case it's to allow this to be used
 # but the function itself will not be compiled (see the note at the function)
 LigerForCausalLMLoss.can_torch_compile = True
+liger_rotary_pos_emb.can_torch_compile = True
 
 
 __all__ = [
     "LigerLayerNorm",
     "liger_rotary_pos_emb",
     "LigerRMSNorm",
-    "LigerMLP",
+    "LigerLinear",
     "LigerSwiGLUMLP",
     "LigerGEGLUMLP",
     "LigerTiledGEGLUMLP",
