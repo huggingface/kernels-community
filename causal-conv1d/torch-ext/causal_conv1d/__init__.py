@@ -1,3 +1,5 @@
+__version__ = "1.6.2.post1"
+
 from .causal_conv1d_interface import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_varlen import causal_conv1d_varlen_states
 
