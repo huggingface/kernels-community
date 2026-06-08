@@ -8,15 +8,11 @@ import torch.nn.functional as F
 
 from einops import rearrange, repeat
 
-try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-except ImportError:
-    causal_conv1d_fn, causal_conv1d_update = None, None
-
-try:
-    from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
-except ImportError:
-    causal_conv1d_varlen_states = None
+from ..utils.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+    causal_conv1d_varlen_states,
+)
 
 try:
     from ..ops.triton.selective_state_update import selective_state_update

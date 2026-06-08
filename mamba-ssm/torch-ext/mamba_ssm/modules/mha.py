@@ -17,10 +17,7 @@ try:
 except ImportError:
     RotaryEmbedding = None
 
-try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-except ImportError:
-    causal_conv1d_fn, causal_conv1d_update = None, None
+from ..utils.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
 
 def _update_kv_cache(kv, inference_params, layer_idx):

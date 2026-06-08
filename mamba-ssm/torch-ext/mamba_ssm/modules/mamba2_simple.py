@@ -7,10 +7,7 @@ import torch.nn.functional as F
 
 from einops import rearrange, repeat
 
-try:
-    from causal_conv1d import causal_conv1d_fn
-except ImportError:
-    causal_conv1d_fn = None
+from ..utils.causal_conv1d import causal_conv1d_fn
 
 try:
     from ..ops.triton.layernorm_gated import RMSNorm as RMSNormGated, LayerNorm

@@ -12,10 +12,7 @@ from einops import rearrange, repeat
 
 from ..ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
 
-try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-except ImportError:
-    causal_conv1d_fn, causal_conv1d_update = None, None
+from ..utils.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
 try:
     from ..ops.triton.selective_state_update import selective_state_update
