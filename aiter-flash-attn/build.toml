@@ -10,5 +10,6 @@ backends = [
 repo-id = "kernels-community/aiter-flash-attn"
 
 [torch-noarch]
+pyext = ["py", "pyi", "json"]
 
 [kernel]
