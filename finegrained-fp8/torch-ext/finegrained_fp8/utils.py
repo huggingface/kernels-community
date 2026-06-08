@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 from contextlib import contextmanager
 from typing import Tuple
 
@@ -30,8 +31,6 @@ FP8_DTYPE = torch.float8_e4m3fn
 # K-group of 32 elements. These are format constants, not tunables.
 FP4_VALUES_PER_BYTE = 2
 FP4_SCALE_GROUP_K = 32
-FP4_XPU_FIXED_BLOCK_SIZE_N = 128
-FP4_XPU_FIXED_BLOCK_SIZE_K = 128
 
 
 # ── Host-side helpers ─────────────────────────────────────────────────────────
@@ -80,73 +79,45 @@ def grouped_tile_layout(
     return tile_offsets, max_m_tiles
 
 
-def _is_xpu_backend() -> bool:
-    """Backend detection for single-backend Triton builds."""
-    return triton.runtime.driver.active.get_active_torch_device().type == "xpu"
+@functools.cache
+def get_active_device_type() -> str:
+    """Active torch device type for the current Triton backend (``"cuda"``, ``"xpu"``, ...)."""
+    return triton.runtime.driver.active.get_active_torch_device().type
 
 
-def get_accelerator_tuning_configs(*, for_mxfp4: bool = False):
-    """Return autotune configs for the current accelerator policy.
+def get_accelerator_autotuning_configs(*, for_mxfp4: bool = False):
+    """Return the autotune search grid for the current accelerator policy.
 
-    Non-XPU backends keep the broader search space, while XPU uses a reduced
-    num_warps sweep. MXFP4 kernels additionally sweep BLOCK_SIZE_N/K on
-    non-XPU backends and keep those constexprs fixed at launch time on XPU.
+    Always sweeps ``num_warps`` (narrower on XPU) × ``num_stages``. For MXFP4
+    kernels we also pin ``BLOCK_SIZE_N/K`` in each config — fixed on XPU, swept
+    on other backends — so launch sites never need to patch them in post-hoc.
     """
-    is_xpu = _is_xpu_backend()
+    is_xpu = get_active_device_type() == "xpu"
     num_warps = [8, 16] if is_xpu else [2, 4, 8, 16]
     num_stages = [2, 3, 4]
 
-    if not for_mxfp4 or is_xpu:
+    if for_mxfp4:
+        block_sweep = (
+            [(128, 128)]
+            if is_xpu
+            else [(bn, bk) for bn in (64, 128, 256) for bk in (64, 128, 256)]
+        )
         return [
-            triton.Config({}, num_warps=w, num_stages=s)
-            for w in num_warps
+            triton.Config(
+                {"BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk},
+                num_warps=w,
+                num_stages=s,
+            )
+            for bn, bk in block_sweep
             for s in num_stages
+            for w in num_warps
         ]
 
     return [
-        triton.Config(
-            {"BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk},
-            num_warps=w,
-            num_stages=s,
-        )
-        for bn in [64, 128, 256]
-        for bk in [64, 128, 256]
-        for w in num_warps
+        triton.Config({}, num_warps=w, num_stages=s)
         for s in num_stages
+        for w in num_warps
     ]
-
-
-def get_accelerator_tuning_grid(
-    device: torch.device, m_tiles: int, n: int, *, for_mxfp4: bool = False
-):
-    """Return an explicit launch grid for the target accelerator policy."""
-    if device.type == "xpu" and for_mxfp4:
-        return (m_tiles, triton.cdiv(n, FP4_XPU_FIXED_BLOCK_SIZE_N))
-
-    def _grid(meta):
-        return (m_tiles, triton.cdiv(n, meta["BLOCK_SIZE_N"]))
-
-    return _grid
-
-
-def get_accelerator_fp4_launch_meta(device: torch.device, launch_meta: dict):
-    """Attach accelerator-specific FP4 tile meta to a base launch-meta dict.
-
-    Keeps device policy centralized so call sites stay backend-agnostic.
-    """
-    fixed_tiles = {
-        "xpu": (FP4_XPU_FIXED_BLOCK_SIZE_N, FP4_XPU_FIXED_BLOCK_SIZE_K),
-    }
-    tile = fixed_tiles.get(device.type)
-    if tile is None:
-        return launch_meta
-
-    block_n, block_k = tile
-    return {
-        **launch_meta,
-        "BLOCK_SIZE_N": block_n,
-        "BLOCK_SIZE_K": block_k,
-    }
 
 
 # ── Triton-side helpers (inlined by ``@triton.jit`` callers) ──────────────────
