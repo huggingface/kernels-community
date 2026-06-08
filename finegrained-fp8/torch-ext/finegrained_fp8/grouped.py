@@ -26,21 +26,17 @@ from .utils import (
     fp4_act_quant_inline,
     fp8_act_quant,
     fp8_act_quant_inline,
+    get_accelerator_fp4_launch_meta,
+    get_accelerator_tuning_configs,
+    get_accelerator_tuning_grid,
     grouped_expert_lookup,
     grouped_tile_layout,
-    prune_fp4_fixed_tile_configs,
-    prune_xpu_min_num_warps_configs,
 )
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_tuning_configs(),
     key=["N", "K", "BLOCK_SIZE_M"],
-    prune_configs_by={"early_config_prune": prune_xpu_min_num_warps_configs},
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
@@ -129,13 +125,8 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_tuning_configs(),
     key=["N", "K", "BLOCK_SIZE_M"],
-    prune_configs_by={"early_config_prune": prune_xpu_min_num_warps_configs},
 )
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
@@ -221,19 +212,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk},
-            num_warps=w,
-            num_stages=s,
-        )
-        for bn in [64, 128, 256]
-        for bk in [64, 128, 256]
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_tuning_configs(for_mxfp4=True),
     key=["N", "K", "BLOCK_SIZE_M"],
-    prune_configs_by={"early_config_prune": prune_fp4_fixed_tile_configs},
 )
 @triton.jit
 def w4a8_block_dynamic_fp4_matmul_grouped_kernel(
@@ -585,8 +565,16 @@ def _w4a8_block_dynamic_fp4_matmul_grouped(
         tokens_per_expert, BLOCK_SIZE_M, S, E
     )
 
-    def grid(META):
-        return (max_m_tiles, triton.cdiv(N, META["BLOCK_SIZE_N"]))
+    grid = get_accelerator_tuning_grid(A.device, max_m_tiles, N, for_mxfp4=True)
+
+    launch_meta = {
+        "NUM_EXPERTS": E,
+        "BLOCK_SIZE_M": BLOCK_SIZE_M,
+        "NUM_EXPERTS_BIT_LENGTH": E.bit_length(),
+        "VALUES_PER_BYTE": FP4_VALUES_PER_BYTE,
+        "SCALE_GROUP_K": FP4_SCALE_GROUP_K,
+    }
+    launch_meta = get_accelerator_fp4_launch_meta(A.device, launch_meta)
 
     with device_context(A.device):
         wrap_triton(w4a8_block_dynamic_fp4_matmul_grouped_kernel)[grid](
@@ -611,12 +599,7 @@ def _w4a8_block_dynamic_fp4_matmul_grouped(
             bs_u8.stride(1),
             offsets.stride(0),
             tile_offsets.stride(0),
-            # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
-            NUM_EXPERTS=E,
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
-            VALUES_PER_BYTE=FP4_VALUES_PER_BYTE,
-            SCALE_GROUP_K=FP4_SCALE_GROUP_K,
+            **launch_meta,
         )
     return C
 

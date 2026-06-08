@@ -26,19 +26,15 @@ from .utils import (
     fp4_act_quant_inline,
     fp8_act_quant,
     fp8_act_quant_inline,
-    prune_fp4_fixed_tile_configs,
-    prune_xpu_min_num_warps_configs,
+    get_accelerator_fp4_launch_meta,
+    get_accelerator_tuning_configs,
+    get_accelerator_tuning_grid,
 )
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_tuning_configs(),
     key=["N", "K", "BLOCK_SIZE_M"],
-    prune_configs_by={"early_config_prune": prune_xpu_min_num_warps_configs},
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_kernel(
@@ -113,13 +109,8 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_tuning_configs(),
     key=["N", "K", "BLOCK_SIZE_M"],
-    prune_configs_by={"early_config_prune": prune_xpu_min_num_warps_configs},
 )
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_kernel(
@@ -190,13 +181,8 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_tuning_configs(),
     key=["N", "K", "BLOCK_SIZE_M"],
-    prune_configs_by={"early_config_prune": prune_xpu_min_num_warps_configs},
 )
 @triton.jit
 def w8a8_block_static_fp8_matmul_kernel(
@@ -275,19 +261,8 @@ def w8a8_block_static_fp8_matmul_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk},
-            num_warps=w,
-            num_stages=s,
-        )
-        for bn in [64, 128, 256]
-        for bk in [64, 128, 256]
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_tuning_configs(for_mxfp4=True),
     key=["N", "K", "BLOCK_SIZE_M"],
-    prune_configs_by={"early_config_prune": prune_fp4_fixed_tile_configs},
 )
 @triton.jit
 def w4a8_block_dynamic_fp4_matmul_kernel(
@@ -625,8 +600,17 @@ def _w4a8_block_dynamic_fp4_matmul(
     C = A.new_empty((M, N), dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m(M)
 
-    def grid(META):
-        return (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, META["BLOCK_SIZE_N"]))
+    grid = get_accelerator_tuning_grid(
+        A.device, triton.cdiv(M, BLOCK_SIZE_M), N, for_mxfp4=True
+    )
+
+    launch_meta = {
+        "BLOCK_SIZE_M": BLOCK_SIZE_M,
+        "GROUP_SIZE_M": 8,
+        "VALUES_PER_BYTE": FP4_VALUES_PER_BYTE,
+        "SCALE_GROUP_K": FP4_SCALE_GROUP_K,
+    }
+    launch_meta = get_accelerator_fp4_launch_meta(A.device, launch_meta)
 
     with device_context(A.device):
         wrap_triton(w4a8_block_dynamic_fp4_matmul_kernel)[grid](
@@ -645,11 +629,7 @@ def _w4a8_block_dynamic_fp4_matmul(
             C.stride(1),
             bs_u8.stride(1),
             bs_u8.stride(0),
-            # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            GROUP_SIZE_M=8,
-            VALUES_PER_BYTE=FP4_VALUES_PER_BYTE,
-            SCALE_GROUP_K=FP4_SCALE_GROUP_K,
+            **launch_meta,
         )
     return C
 

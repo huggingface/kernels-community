@@ -26,19 +26,14 @@ from .utils import (
     fp4_act_quant_inline,
     fp8_act_quant,
     fp8_act_quant_inline,
-    prune_fp4_fixed_tile_configs,
-    prune_xpu_min_num_warps_configs,
+    get_accelerator_fp4_launch_meta,
+    get_accelerator_tuning_configs,
+    get_accelerator_tuning_grid,
 )
 
-
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_tuning_configs(),
     key=["N", "K"],
-    prune_configs_by={"early_config_prune": prune_xpu_min_num_warps_configs},
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_batched_kernel(
@@ -122,15 +117,9 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     # mathematically identical (same A row × same B), so lane 0 holds the right value.
     tl.store(c_ptrs, c, mask=(offs_cm == 0)[:, None])
 
-
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_tuning_configs(),
     key=["N", "K"],
-    prune_configs_by={"early_config_prune": prune_xpu_min_num_warps_configs},
 )
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
@@ -206,21 +195,9 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     # mask so only lane 0 stores to avoid hardware-undefined duplicate writes on XPU.
     tl.store(c_ptrs, c, mask=(offs_cm == 0)[:, None])
 
-
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk},
-            num_warps=w,
-            num_stages=s,
-        )
-        for bn in [64, 128, 256]
-        for bk in [64, 128, 256]
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_tuning_configs(),
     key=["N", "K"],
-    prune_configs_by={"early_config_prune": prune_fp4_fixed_tile_configs},
 )
 @triton.jit
 def w4a8_block_dynamic_fp4_matmul_batched_kernel(
@@ -300,7 +277,6 @@ def w4a8_block_dynamic_fp4_matmul_batched_kernel(
     # See block-FP8 batched kernel above: BLOCK_SIZE_M lanes alias the same C row;
     # mask so only lane 0 stores to avoid hardware-undefined duplicate writes on XPU.
     tl.store(c_ptrs, accumulator.to(C.dtype.element_ty), mask=(offs_cm == 0)[:, None])
-
 
 @triton_op(
     add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_batched"), mutates_args=()
@@ -538,8 +514,15 @@ def _w4a8_block_dynamic_fp4_matmul_batched(
     # duplicate the same row computation and keep one row on store.
     BLOCK_SIZE_M = 1
 
-    def grid(META):
-        return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
+    grid = get_accelerator_tuning_grid(A.device, S, N, for_mxfp4=True)
+
+    launch_meta = {
+        "BLOCK_SIZE_M": BLOCK_SIZE_M,
+        "VALUES_PER_BYTE": FP4_VALUES_PER_BYTE,
+        "SCALE_GROUP_K": FP4_SCALE_GROUP_K,
+        "NUM_EXPERTS": E,
+    }
+    launch_meta = get_accelerator_fp4_launch_meta(A.device, launch_meta)
 
     with device_context(A.device):
         wrap_triton(w4a8_block_dynamic_fp4_matmul_batched_kernel)[grid](
@@ -562,11 +545,7 @@ def _w4a8_block_dynamic_fp4_matmul_batched(
             bs_u8.stride(2),
             bs_u8.stride(1),
             expert_ids.stride(0),
-            # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            VALUES_PER_BYTE=FP4_VALUES_PER_BYTE,
-            SCALE_GROUP_K=FP4_SCALE_GROUP_K,
-            NUM_EXPERTS=E,
+            **launch_meta,
         )
     return C
 
