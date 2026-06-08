@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 from contextlib import contextmanager
 from typing import Tuple
 
@@ -76,6 +77,47 @@ def grouped_tile_layout(
     tile_offsets = torch.cumsum(tiles_per_expert, dim=0).to(torch.int32)
     max_m_tiles = triton.cdiv(S, block_size_m) + E
     return tile_offsets, max_m_tiles
+
+
+@functools.cache
+def get_active_device_type() -> str:
+    """Active torch device type for the current Triton backend (``"cuda"``, ``"xpu"``, ...)."""
+    return triton.runtime.driver.active.get_active_torch_device().type
+
+
+def get_accelerator_autotuning_configs(*, for_mxfp4: bool = False):
+    """Return the autotune search grid for the current accelerator policy.
+
+    Always sweeps ``num_warps`` (narrower on XPU) × ``num_stages``. For MXFP4
+    kernels we also pin ``BLOCK_SIZE_N/K`` in each config — fixed on XPU, swept
+    on other backends — so launch sites never need to patch them in post-hoc.
+    """
+    is_xpu = get_active_device_type() == "xpu"
+    num_warps = [8, 16] if is_xpu else [2, 4, 8, 16]
+    num_stages = [2, 3, 4]
+
+    if for_mxfp4:
+        block_sweep = (
+            [(128, 128)]
+            if is_xpu
+            else [(bn, bk) for bn in (64, 128, 256) for bk in (64, 128, 256)]
+        )
+        return [
+            triton.Config(
+                {"BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk},
+                num_warps=w,
+                num_stages=s,
+            )
+            for bn, bk in block_sweep
+            for s in num_stages
+            for w in num_warps
+        ]
+
+    return [
+        triton.Config({}, num_warps=w, num_stages=s)
+        for s in num_stages
+        for w in num_warps
+    ]
 
 
 # ── Triton-side helpers (inlined by ``@triton.jit`` callers) ──────────────────
