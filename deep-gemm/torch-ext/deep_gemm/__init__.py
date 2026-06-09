@@ -2,7 +2,6 @@ import os
 import subprocess
 import sysconfig
 import torch
-from typing import Optional
 
 # Avoid holding a CUDA tensor in DeepGEMM's process-lifetime runtime singleton.
 # In packaged/lazy-loaded use, that can outlive PyTorch's CUDA teardown and crash
@@ -17,18 +16,16 @@ __version__ = "2.5.0"
 
 
 # ── Register fake tensor implementations for torch.compile ──────────────────
-# All GEMM ops mutate the output tensor `d` in-place and return void.
-# The fake implementations are no-ops since `d` is pre-allocated by the caller.
-#
-# Five ops are intentionally absent from this list — see the
-# ``@torch.library.custom_op`` block below. Those ops are wrapped Python-side
-# because the C++ ``Tensor! d`` mutation schema is rejected by torch's
+# All GEMM ops mutate the output tensor ``d`` (``y`` for mega_moe) in place and
+# return void. The fake implementations are no-ops since the output is
+# pre-allocated by the caller. None of the C++ schemas use a ``Tensor!`` (or
+# its modernized ``Tensor(a!)``) annotation — that form is rejected by torch's
 # functionalize pass for custom (non-ATen) ops once the call sits inside a
 # nested compile region (``@torch.compiler.nested_compile_region`` →
-# ``invoke_subgraph`` → ``auto_functionalized_v2``). The Python ``custom_op``
-# expresses the same mutation via ``mutates_args=(...)`` which functionalize
-# does accept. See the C++ ``_raw_`` rename in ``torch_binding.cpp``.
-# ``custom_op`` auto-provides their fakes, so they don't need an entry here.
+# ``invoke_subgraph``). For the five compile-path mutating ops the consuming
+# code (e.g. ``transformers/integrations/deepgemm.py``) wraps the call with
+# ``torch._dynamo.allow_in_graph`` so inductor doesn't DCE it — the mutation
+# lands at runtime on ``mark_static_address`` cache storage.
 
 
 for _op in [
@@ -36,6 +33,8 @@ for _op in [
     "fp8_fp4_gemm_nn",
     "fp8_fp4_gemm_tn",
     "fp8_fp4_gemm_tt",
+    "m_grouped_fp8_fp4_gemm_nt_contiguous",
+    "m_grouped_fp8_fp4_gemm_nn_contiguous",
     "m_grouped_fp8_fp4_gemm_nt_masked",
     "k_grouped_fp8_gemm_nt_contiguous",
     "k_grouped_fp8_gemm_tn_contiguous",
@@ -43,226 +42,16 @@ for _op in [
     "bf16_gemm_nn",
     "bf16_gemm_tn",
     "bf16_gemm_tt",
+    "m_grouped_bf16_gemm_nt_contiguous",
+    "m_grouped_bf16_gemm_nn_contiguous",
     "m_grouped_bf16_gemm_nt_masked",
     "fp8_gemm_nt_skip_head_mid",
+    "fp8_fp4_mega_moe",
 ]:
 
     @torch.library.register_fake(add_op_namespace_prefix(_op))
     def _fake(*args, **kwargs):
         pass
-
-
-# ── Functionalize-safe wrappers for the in-place mutating ops ───────────────
-# Public name → ``@torch.library.custom_op(mutates_args=(...))``. The body
-# dispatches to the C++ ``_raw_X`` torch op (same TORCH_LIBRARY namespace,
-# schema with no ``Tensor!`` annotation — see ``torch_binding.cpp``).
-#
-# Why this exists: when a mutating op is reached inside
-# ``@torch.compiler.nested_compile_region`` (or any compiled region that hits
-# functionalize), torch's functionalize pass wraps the call in
-# ``auto_functionalized_v2`` and then tries to decompose it. For custom
-# (non-ATen) ops registered with ``Tensor! d`` it has no decomposition rule
-# and the assertion ``auto_functionalized_v2 was not removed`` fires.
-# ``mutates_args=`` is the modern primitive functionalize understands — it
-# autogenerates the clone-then-mutate-on-clone rewrite at compile time.
-#
-# Public wrappers further down keep calling the unprefixed name via
-# ``ops.X(...)``; that hits the custom_op, which then hits the renamed C++ op
-# at runtime. No call-site changes needed.
-
-
-@torch.library.custom_op(
-    add_op_namespace_prefix("m_grouped_fp8_fp4_gemm_nt_contiguous"),
-    mutates_args=("d",),
-)
-def _m_grouped_fp8_fp4_gemm_nt_contiguous(
-    a_data: torch.Tensor,
-    a_sf: torch.Tensor,
-    b_data: torch.Tensor,
-    b_sf: torch.Tensor,
-    d: torch.Tensor,
-    grouped_layout: torch.Tensor,
-    recipe_0: int,
-    recipe_1: int,
-    recipe_2: int,
-    has_recipe: bool,
-    recipe_a_0: int,
-    recipe_a_1: int,
-    has_recipe_a: bool,
-    recipe_b_0: int,
-    recipe_b_1: int,
-    has_recipe_b: bool,
-    compiled_dims: str,
-    disable_ue8m0_cast: bool,
-    use_psum_layout: bool,
-    expected_m_for_psum_layout: int,
-    has_expected_m_for_psum_layout: bool,
-) -> None:
-    _ops._raw_m_grouped_fp8_fp4_gemm_nt_contiguous(
-        a_data,
-        a_sf,
-        b_data,
-        b_sf,
-        d,
-        grouped_layout,
-        recipe_0,
-        recipe_1,
-        recipe_2,
-        has_recipe,
-        recipe_a_0,
-        recipe_a_1,
-        has_recipe_a,
-        recipe_b_0,
-        recipe_b_1,
-        has_recipe_b,
-        compiled_dims,
-        disable_ue8m0_cast,
-        use_psum_layout,
-        expected_m_for_psum_layout,
-        has_expected_m_for_psum_layout,
-    )
-
-
-@torch.library.custom_op(
-    add_op_namespace_prefix("m_grouped_fp8_fp4_gemm_nn_contiguous"),
-    mutates_args=("d",),
-)
-def _m_grouped_fp8_fp4_gemm_nn_contiguous(
-    a_data: torch.Tensor,
-    a_sf: torch.Tensor,
-    b_data: torch.Tensor,
-    b_sf: torch.Tensor,
-    d: torch.Tensor,
-    grouped_layout: torch.Tensor,
-    recipe_0: int,
-    recipe_1: int,
-    recipe_2: int,
-    has_recipe: bool,
-    recipe_a_0: int,
-    recipe_a_1: int,
-    has_recipe_a: bool,
-    recipe_b_0: int,
-    recipe_b_1: int,
-    has_recipe_b: bool,
-    compiled_dims: str,
-    disable_ue8m0_cast: bool,
-    use_psum_layout: bool,
-) -> None:
-    _ops._raw_m_grouped_fp8_fp4_gemm_nn_contiguous(
-        a_data,
-        a_sf,
-        b_data,
-        b_sf,
-        d,
-        grouped_layout,
-        recipe_0,
-        recipe_1,
-        recipe_2,
-        has_recipe,
-        recipe_a_0,
-        recipe_a_1,
-        has_recipe_a,
-        recipe_b_0,
-        recipe_b_1,
-        has_recipe_b,
-        compiled_dims,
-        disable_ue8m0_cast,
-        use_psum_layout,
-    )
-
-
-@torch.library.custom_op(
-    add_op_namespace_prefix("m_grouped_bf16_gemm_nt_contiguous"),
-    mutates_args=("d",),
-)
-def _m_grouped_bf16_gemm_nt_contiguous(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    d: torch.Tensor,
-    grouped_layout: torch.Tensor,
-    compiled_dims: str,
-    use_psum_layout: bool,
-    expected_m_for_psum_layout: int,
-    has_expected_m_for_psum_layout: bool,
-) -> None:
-    _ops._raw_m_grouped_bf16_gemm_nt_contiguous(
-        a,
-        b,
-        d,
-        grouped_layout,
-        compiled_dims,
-        use_psum_layout,
-        expected_m_for_psum_layout,
-        has_expected_m_for_psum_layout,
-    )
-
-
-@torch.library.custom_op(
-    add_op_namespace_prefix("m_grouped_bf16_gemm_nn_contiguous"),
-    mutates_args=("d",),
-)
-def _m_grouped_bf16_gemm_nn_contiguous(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    d: torch.Tensor,
-    grouped_layout: torch.Tensor,
-    compiled_dims: str,
-    use_psum_layout: bool,
-) -> None:
-    _ops._raw_m_grouped_bf16_gemm_nn_contiguous(
-        a,
-        b,
-        d,
-        grouped_layout,
-        compiled_dims,
-        use_psum_layout,
-    )
-
-
-@torch.library.custom_op(
-    add_op_namespace_prefix("fp8_fp4_mega_moe"),
-    mutates_args=("y",),
-)
-def _fp8_fp4_mega_moe(
-    y: torch.Tensor,
-    l1_weights: torch.Tensor,
-    l1_weights_sf: torch.Tensor,
-    l2_weights: torch.Tensor,
-    l2_weights_sf: torch.Tensor,
-    cumulative_local_expert_recv_stats: Optional[torch.Tensor],
-    sym_buffer: torch.Tensor,
-    sym_buffer_ptrs: list[int],
-    rank_idx: int,
-    num_max_tokens_per_rank: int,
-    num_experts: int,
-    num_topk: int,
-    recipe_0: int,
-    recipe_1: int,
-    recipe_2: int,
-    activation: str,
-    activation_clamp: Optional[float],
-    fast_math: bool,
-) -> None:
-    _ops._raw_fp8_fp4_mega_moe(
-        y,
-        l1_weights,
-        l1_weights_sf,
-        l2_weights,
-        l2_weights_sf,
-        cumulative_local_expert_recv_stats,
-        sym_buffer,
-        sym_buffer_ptrs,
-        rank_idx,
-        num_max_tokens_per_rank,
-        num_experts,
-        num_topk,
-        recipe_0,
-        recipe_1,
-        recipe_2,
-        activation,
-        activation_clamp,
-        fast_math,
-    )
 
 
 # Runtime
@@ -1046,12 +835,12 @@ def _ensure_initialized():
 
 class _InitializedOps:
     def __init__(self, raw_ops):
-        self._raw_ops = raw_ops
+        self.ops = raw_ops
 
     def __getattr__(self, name):
         if name != "init":
             _ensure_initialized()
-        return getattr(self._raw_ops, name)
+        return getattr(self.ops, name)
 
 
 ops = _InitializedOps(_ops)

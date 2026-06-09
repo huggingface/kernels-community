@@ -128,15 +128,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     );
     ops.impl("fp8_fp4_gemm_tt", torch::kCUDA, &deep_gemm_fp8_fp4_gemm_tt);
 
-    // M-grouped FP8/FP4 GEMM ops (CUDA dispatch). These get registered under the
-    // `_raw_` prefix (no `Tensor!` annotation) — the public ops with the
-    // unprefixed name are registered Python-side via ``torch.library.custom_op``
-    // with ``mutates_args=("d",)`` so functionalize accepts them under
-    // ``torch.compile`` (the legacy ``Tensor! d`` schema and the modernized
-    // ``Tensor(a!) d ... -> Tensor(a!)`` form are both rejected for custom ops).
-    // The Python wrapper dispatches here at runtime.
+    // M-grouped FP8/FP4 GEMM ops (CUDA dispatch). These mutate the output
+    // tensor ``d`` in place but the schema deliberately omits the ``Tensor!``
+    // annotation — the legacy ``Tensor! d`` form and the modernized
+    // ``Tensor(a!) d ... -> Tensor(a!)`` form are both rejected by torch's
+    // functionalize pass for custom (non-ATen) ops once the call sits inside
+    // a nested compile region (``@torch.compiler.nested_compile_region`` →
+    // ``invoke_subgraph``). Consumers wrap the call with
+    // ``torch._dynamo.allow_in_graph`` to keep it opaque to inductor so it
+    // doesn't DCE the mutation. ``register_fake`` is provided in
+    // ``deep_gemm/__init__.py`` for compile compatibility.
     ops.def(
-        "_raw_m_grouped_fp8_fp4_gemm_nt_contiguous("
+        "m_grouped_fp8_fp4_gemm_nt_contiguous("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
         "Tensor d, Tensor grouped_layout, "
         "int recipe_0, int recipe_1, int recipe_2, bool has_recipe, "
@@ -146,11 +149,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
         "bool use_psum_layout, int expected_m_for_psum_layout, "
         "bool has_expected_m_for_psum_layout) -> ()"
     );
-    ops.impl("_raw_m_grouped_fp8_fp4_gemm_nt_contiguous", torch::kCUDA,
+    ops.impl("m_grouped_fp8_fp4_gemm_nt_contiguous", torch::kCUDA,
              &deep_gemm_m_grouped_fp8_fp4_gemm_nt_contiguous);
 
     ops.def(
-        "_raw_m_grouped_fp8_fp4_gemm_nn_contiguous("
+        "m_grouped_fp8_fp4_gemm_nn_contiguous("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
         "Tensor d, Tensor grouped_layout, "
         "int recipe_0, int recipe_1, int recipe_2, bool has_recipe, "
@@ -159,7 +162,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
         "str compiled_dims, bool disable_ue8m0_cast, "
         "bool use_psum_layout) -> ()"
     );
-    ops.impl("_raw_m_grouped_fp8_fp4_gemm_nn_contiguous", torch::kCUDA,
+    ops.impl("m_grouped_fp8_fp4_gemm_nn_contiguous", torch::kCUDA,
              &deep_gemm_m_grouped_fp8_fp4_gemm_nn_contiguous);
 
     ops.def(
@@ -220,23 +223,23 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     );
     ops.impl("bf16_gemm_tt", torch::kCUDA, &deep_gemm_bf16_gemm_tt);
 
-    // M-grouped BF16 GEMM ops (CUDA dispatch). See note above for the
-    // `_raw_` rename rationale — Python wraps these via custom_op.
+    // M-grouped BF16 GEMM ops (CUDA dispatch). See note above on dropping
+    // ``Tensor!`` for the FP8/FP4 grouped variants — same rationale.
     ops.def(
-        "_raw_m_grouped_bf16_gemm_nt_contiguous("
+        "m_grouped_bf16_gemm_nt_contiguous("
         "Tensor a, Tensor b, Tensor d, Tensor grouped_layout, "
         "str compiled_dims, bool use_psum_layout, "
         "int expected_m_for_psum_layout, bool has_expected_m_for_psum_layout) -> ()"
     );
-    ops.impl("_raw_m_grouped_bf16_gemm_nt_contiguous", torch::kCUDA,
+    ops.impl("m_grouped_bf16_gemm_nt_contiguous", torch::kCUDA,
              &deep_gemm_m_grouped_bf16_gemm_nt_contiguous);
 
     ops.def(
-        "_raw_m_grouped_bf16_gemm_nn_contiguous("
+        "m_grouped_bf16_gemm_nn_contiguous("
         "Tensor a, Tensor b, Tensor d, Tensor grouped_layout, "
         "str compiled_dims, bool use_psum_layout) -> ()"
     );
-    ops.impl("_raw_m_grouped_bf16_gemm_nn_contiguous", torch::kCUDA,
+    ops.impl("m_grouped_bf16_gemm_nn_contiguous", torch::kCUDA,
              &deep_gemm_m_grouped_bf16_gemm_nn_contiguous);
 
     ops.def(
@@ -356,9 +359,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.impl("get_symm_buffer_views_for_mega_moe", torch::kCUDA,
              &deep_gemm_get_symm_buffer_views_for_mega_moe);
 
-    // See note on `_raw_` prefix above — Python wraps via custom_op.
+    // See note on dropping ``Tensor!`` above — same rationale.
     ops.def(
-        "_raw_fp8_fp4_mega_moe("
+        "fp8_fp4_mega_moe("
         "Tensor y, Tensor l1_weights, Tensor l1_weights_sf, "
         "Tensor l2_weights, Tensor l2_weights_sf, "
         "Tensor? cumulative_local_expert_recv_stats, Tensor sym_buffer, "
@@ -367,7 +370,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
         "int recipe_2, str activation, float? activation_clamp, "
         "bool fast_math) -> ()"
     );
-    ops.impl("_raw_fp8_fp4_mega_moe", torch::kCUDA, &deep_gemm_fp8_fp4_mega_moe);
+    ops.impl("fp8_fp4_mega_moe", torch::kCUDA, &deep_gemm_fp8_fp4_mega_moe);
 
     // Einsum ops (CUDA dispatch)
     ops.def(
