@@ -130,21 +130,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
     // M-grouped FP8/FP4 GEMM ops (CUDA dispatch).
     //
-    // WORKAROUND: these kernels DO mutate the output tensor ``d`` in place
-    // (the schema should say ``Tensor! d``). The annotation is omitted to
-    // dodge a torch limitation: functionalize rejects ``Tensor!`` (and its
-    // modernized ``Tensor(a!) d ... -> Tensor(a!)`` form) for custom
-    // (non-ATen) ops once the call sits inside a nested compile region
-    // (``@torch.compiler.nested_compile_region`` → ``invoke_subgraph``),
-    // emitting "we only support functionalizing operators whose outputs do
-    // not have alias annotations" as of torch 2.12. The same op compiles
-    // cleanly at top level — ``auto_functionalized_v2`` isn't propagated
-    // through ``invoke_subgraph``.
-    // Upstream: https://github.com/pytorch/pytorch/issues/186807
+    // ``Tensor! d`` declares the in-place mutation so functionalize tracks
+    // it — inductor's optimizer needs the declaration to avoid reordering
+    // or caching reads around the call. Dropping the annotation makes
+    // compile succeed but yields wrong outputs (the kernel writes ``d`` but
+    // inductor doesn't see the write → downstream consumers read stale
+    // values).
+    //
+    // Caveat: when this call sits inside ``@torch.compiler.nested_compile_region``
+    // (``invoke_subgraph``), functionalize wraps it in
+    // ``auto_functionalized_v2(invoke_subgraph, …)`` and the stock inductor
+    // pass ``decompose_auto_functionalized`` fails to unwrap (the
+    // ``Match.replace_by_example`` → ``make_fx`` path doesn't handle HOP
+    // inner ops), tripping the ``auto_functionalized_v2 was not removed``
+    // assertion. Consumers (e.g. transformers) work around this with a
+    // monkey-patch on the post-grad pass — see pytorch#186807.
     ops.def(
         "m_grouped_fp8_fp4_gemm_nt_contiguous("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
-        "Tensor d, Tensor grouped_layout, "
+        "Tensor! d, Tensor grouped_layout, "
         "int recipe_0, int recipe_1, int recipe_2, bool has_recipe, "
         "int recipe_a_0, int recipe_a_1, bool has_recipe_a, "
         "int recipe_b_0, int recipe_b_1, bool has_recipe_b, "
@@ -158,7 +162,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def(
         "m_grouped_fp8_fp4_gemm_nn_contiguous("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
-        "Tensor d, Tensor grouped_layout, "
+        "Tensor! d, Tensor grouped_layout, "
         "int recipe_0, int recipe_1, int recipe_2, bool has_recipe, "
         "int recipe_a_0, int recipe_a_1, bool has_recipe_a, "
         "int recipe_b_0, int recipe_b_1, bool has_recipe_b, "
@@ -226,11 +230,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     );
     ops.impl("bf16_gemm_tt", torch::kCUDA, &deep_gemm_bf16_gemm_tt);
 
-    // M-grouped BF16 GEMM ops (CUDA dispatch). Same ``Tensor!`` workaround
-    // as the FP8/FP4 grouped variants above — see note there.
+    // M-grouped BF16 GEMM ops (CUDA dispatch). See the FP8/FP4 grouped
+    // variants above for the ``Tensor! d`` rationale.
     ops.def(
         "m_grouped_bf16_gemm_nt_contiguous("
-        "Tensor a, Tensor b, Tensor d, Tensor grouped_layout, "
+        "Tensor a, Tensor b, Tensor! d, Tensor grouped_layout, "
         "str compiled_dims, bool use_psum_layout, "
         "int expected_m_for_psum_layout, bool has_expected_m_for_psum_layout) -> ()"
     );
@@ -239,7 +243,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
     ops.def(
         "m_grouped_bf16_gemm_nn_contiguous("
-        "Tensor a, Tensor b, Tensor d, Tensor grouped_layout, "
+        "Tensor a, Tensor b, Tensor! d, Tensor grouped_layout, "
         "str compiled_dims, bool use_psum_layout) -> ()"
     );
     ops.impl("m_grouped_bf16_gemm_nn_contiguous", torch::kCUDA,
@@ -362,10 +366,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.impl("get_symm_buffer_views_for_mega_moe", torch::kCUDA,
              &deep_gemm_get_symm_buffer_views_for_mega_moe);
 
-    // Same ``Tensor!`` workaround as the grouped variants above — see note.
+    // See the FP8/FP4 grouped variants above for the ``Tensor! y`` rationale.
     ops.def(
         "fp8_fp4_mega_moe("
-        "Tensor y, Tensor l1_weights, Tensor l1_weights_sf, "
+        "Tensor! y, Tensor l1_weights, Tensor l1_weights_sf, "
         "Tensor l2_weights, Tensor l2_weights_sf, "
         "Tensor? cumulative_local_expert_recv_stats, Tensor sym_buffer, "
         "int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, "
