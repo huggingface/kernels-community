@@ -81,8 +81,18 @@ def grouped_tile_layout(
 
 @functools.cache
 def get_active_device_type() -> str:
-    """Active torch device type for the current Triton backend (``"cuda"``, ``"xpu"``, ...)."""
-    return triton.runtime.driver.active.get_active_torch_device().type
+    """Active torch device type for the current Triton backend (``"cuda"``, ``"xpu"``, ...).
+
+    Falls back to ``"cuda"`` when no driver is loaded — Triton raises
+    ``RuntimeError: 0 active drivers ([])`` on driverless build boxes, and the
+    autotune-config builder is evaluated at module-import time under the
+    ``@triton.autotune`` decorator (no kernel launches there, so the default is
+    only used to shape the config list).
+    """
+    try:
+        return triton.runtime.driver.active.get_active_torch_device().type
+    except RuntimeError:
+        return "cuda"
 
 
 def get_accelerator_autotuning_configs(*, for_mxfp4: bool = False):
