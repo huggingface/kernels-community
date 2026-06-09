@@ -265,7 +265,7 @@ std::vector<Tensor> deep_gemm_get_symm_buffer_views_for_mega_moe(
     const Tensor& buffer, int64_t num_ranks, int64_t num_experts,
     int64_t num_max_tokens_per_rank, int64_t num_topk, int64_t hidden,
     int64_t intermediate_hidden, bool use_fp8_dispatch, const std::string& activation);
-void deep_gemm_fp8_fp4_mega_moe(
+Tensor deep_gemm_fp8_fp4_mega_moe(
     const Tensor& y,
     const Tensor& l1_weights, const Tensor& l1_weights_sf,
     const Tensor& l2_weights, const Tensor& l2_weights_sf,

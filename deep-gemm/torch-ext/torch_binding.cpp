@@ -349,15 +349,24 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.impl("get_symm_buffer_views_for_mega_moe", torch::kCUDA,
              &deep_gemm_get_symm_buffer_views_for_mega_moe);
 
+    // Schema deliberately drops the ``Tensor!`` mutation marker on ``y``: the
+    // kernel writes to ``y`` at the CUDA level (via pointer, outside torch's
+    // tracking), so callers must use the returned tensor for downstream reads.
+    // ``Tensor! y, ... -> ()`` would be more accurate but inductor's
+    // functionalization pass rejects ops whose outputs carry alias annotations
+    // (``auto_functionalized_v2`` HOP can't reason about this schema shape).
+    // Returning ``y`` lets dynamo/inductor see a normal SSA value and compile
+    // through the call. Eager callers continue to work since ``y`` is the same
+    // tensor that was passed in.
     ops.def(
         "fp8_fp4_mega_moe("
-        "Tensor! y, Tensor l1_weights, Tensor l1_weights_sf, "
+        "Tensor y, Tensor l1_weights, Tensor l1_weights_sf, "
         "Tensor l2_weights, Tensor l2_weights_sf, "
         "Tensor? cumulative_local_expert_recv_stats, Tensor sym_buffer, "
         "int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, "
         "int num_experts, int num_topk, int recipe_0, int recipe_1, "
         "int recipe_2, str activation, float? activation_clamp, "
-        "bool fast_math) -> ()"
+        "bool fast_math) -> Tensor"
     );
     ops.impl("fp8_fp4_mega_moe", torch::kCUDA, &deep_gemm_fp8_fp4_mega_moe);
 
