@@ -128,14 +128,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     );
     ops.impl("fp8_fp4_gemm_tt", torch::kCUDA, &deep_gemm_fp8_fp4_gemm_tt);
 
-    // M-grouped FP8/FP4 GEMM ops (CUDA dispatch). These mutate the output
-    // tensor ``d`` in place but the schema deliberately omits the ``Tensor!``
-    // annotation — the legacy ``Tensor! d`` form and the modernized
-    // ``Tensor(a!) d ... -> Tensor(a!)`` form are both rejected by torch's
-    // functionalize pass for custom (non-ATen) ops once the call sits inside
-    // a nested compile region (``@torch.compiler.nested_compile_region`` →
-    // ``invoke_subgraph``). ``register_fake`` is provided in
-    // ``deep_gemm/__init__.py`` so compile / fake-mode dispatch is well-defined.
+    // M-grouped FP8/FP4 GEMM ops (CUDA dispatch).
+    //
+    // WORKAROUND: these kernels DO mutate the output tensor ``d`` in place
+    // (the schema should say ``Tensor! d``). The annotation is omitted to
+    // dodge a torch limitation: functionalize rejects ``Tensor!`` (and its
+    // modernized ``Tensor(a!) d ... -> Tensor(a!)`` form) for custom
+    // (non-ATen) ops once the call sits inside a nested compile region
+    // (``@torch.compiler.nested_compile_region`` → ``invoke_subgraph``),
+    // emitting "we only support functionalizing operators whose outputs do
+    // not have alias annotations" as of torch 2.12. The same op compiles
+    // cleanly at top level — ``auto_functionalized_v2`` isn't propagated
+    // through ``invoke_subgraph``.
+    // Upstream: https://github.com/pytorch/pytorch/issues/186807
     ops.def(
         "m_grouped_fp8_fp4_gemm_nt_contiguous("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
@@ -221,8 +226,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     );
     ops.impl("bf16_gemm_tt", torch::kCUDA, &deep_gemm_bf16_gemm_tt);
 
-    // M-grouped BF16 GEMM ops (CUDA dispatch). See note above on dropping
-    // ``Tensor!`` for the FP8/FP4 grouped variants — same rationale.
+    // M-grouped BF16 GEMM ops (CUDA dispatch). Same ``Tensor!`` workaround
+    // as the FP8/FP4 grouped variants above — see note there.
     ops.def(
         "m_grouped_bf16_gemm_nt_contiguous("
         "Tensor a, Tensor b, Tensor d, Tensor grouped_layout, "
@@ -357,7 +362,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.impl("get_symm_buffer_views_for_mega_moe", torch::kCUDA,
              &deep_gemm_get_symm_buffer_views_for_mega_moe);
 
-    // See note on dropping ``Tensor!`` above — same rationale.
+    // Same ``Tensor!`` workaround as the grouped variants above — see note.
     ops.def(
         "fp8_fp4_mega_moe("
         "Tensor y, Tensor l1_weights, Tensor l1_weights_sf, "

@@ -16,14 +16,8 @@ __version__ = "2.5.0"
 
 
 # ── Register fake tensor implementations for torch.compile ──────────────────
-# All GEMM ops mutate the output tensor ``d`` (``y`` for mega_moe) in place and
-# return void. The fake implementations are no-ops since the output is
-# pre-allocated by the caller. None of the C++ schemas use a ``Tensor!`` (or
-# its modernized ``Tensor(a!)``) annotation — that form is rejected by torch's
-# functionalize pass for custom (non-ATen) ops once the call sits inside a
-# nested compile region (``@torch.compiler.nested_compile_region`` →
-# ``invoke_subgraph``). The mutation lands at runtime on the caller-provided
-# (typically ``mark_static_address``) buffer.
+# All GEMM ops mutate the output tensor `d` in-place and return void.
+# The fake implementations are no-ops since `d` is pre-allocated by the caller.
 
 
 for _op in [
