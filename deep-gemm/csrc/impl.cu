@@ -523,7 +523,7 @@ std::vector<Tensor> deep_gemm_get_symm_buffer_views_for_mega_moe(
     return {x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf};
 }
 
-Tensor deep_gemm_fp8_fp4_mega_moe(
+void deep_gemm_fp8_fp4_mega_moe(
     const Tensor& y,
     const Tensor& l1_weights, const Tensor& l1_weights_sf,
     const Tensor& l2_weights, const Tensor& l2_weights_sf,
@@ -543,7 +543,6 @@ Tensor deep_gemm_fp8_fp4_mega_moe(
         cumulative_local_expert_recv_stats, sym_buffer, ptrs, static_cast<int>(rank_idx),
         static_cast<int>(num_max_tokens_per_rank), static_cast<int>(num_experts),
         static_cast<int>(num_topk), recipe, activation, clamp, fast_math);
-    return y;
 }
 
 // Einsum ops

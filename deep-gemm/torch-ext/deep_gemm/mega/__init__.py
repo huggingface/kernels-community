@@ -115,13 +115,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
-                     fast_math: bool = True) -> torch.Tensor:
-    # The op writes to ``y`` in-place at the CUDA level and also returns it; the
-    # schema reports a normal ``Tensor`` output (rather than the legacy
-    # ``Tensor!`` mutation marker) so inductor's functionalization pass accepts
-    # the op under ``torch.compile``. Eager callers can ignore the return value
-    # and keep using ``y``; compiled callers should use the returned tensor.
-    return _C.fp8_fp4_mega_moe(
+                     fast_math: bool = True):
+    _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,
         cumulative_local_expert_recv_stats,
