@@ -22,10 +22,8 @@ __version__ = "2.5.0"
 # its modernized ``Tensor(a!)``) annotation — that form is rejected by torch's
 # functionalize pass for custom (non-ATen) ops once the call sits inside a
 # nested compile region (``@torch.compiler.nested_compile_region`` →
-# ``invoke_subgraph``). For the five compile-path mutating ops the consuming
-# code (e.g. ``transformers/integrations/deepgemm.py``) wraps the call with
-# ``torch._dynamo.allow_in_graph`` so inductor doesn't DCE it — the mutation
-# lands at runtime on ``mark_static_address`` cache storage.
+# ``invoke_subgraph``). The mutation lands at runtime on the caller-provided
+# (typically ``mark_static_address``) buffer.
 
 
 for _op in [
@@ -123,7 +121,9 @@ def get_mn_major_tma_aligned_packed_ue8m0_tensor(sf):
     return ops.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
 
 
-def get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, ks_tensor, ks, gran_k):
+def get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
+    sf, ks_tensor, ks, gran_k
+):
     ks_int = torch.tensor(ks, dtype=torch.int32, device="cpu")
     return ops.get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
         sf, ks_tensor, ks_int, gran_k
@@ -835,12 +835,12 @@ def _ensure_initialized():
 
 class _InitializedOps:
     def __init__(self, raw_ops):
-        self.ops = raw_ops
+        self._raw_ops = raw_ops
 
     def __getattr__(self, name):
         if name != "init":
             _ensure_initialized()
-        return getattr(self.ops, name)
+        return getattr(self._raw_ops, name)
 
 
 ops = _InitializedOps(_ops)

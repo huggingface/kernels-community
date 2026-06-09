@@ -44,13 +44,6 @@ class SymmBuffer:
         self.group.barrier()
         torch.cuda.synchronize()
 
-        # Pre-extract the primitives the kernel call needs — keeps them as
-        # plain attributes (Tensor / int / list[int]) so dynamo can read them
-        # without modelling the ``handle`` / ``group`` objects, which it
-        # otherwise can't proxy through ``invoke_subgraph``.
-        self.buffer_ptrs = list(self.handle.buffer_ptrs)
-        self.rank_idx = self.group.rank()
-
         # Create input buffer views
         (self.x, self.x_sf,
          self.topk_idx, self.topk_weights,
@@ -67,17 +60,16 @@ class SymmBuffer:
 
 # Pytree-register ``SymmBuffer`` so dynamo can flatten it when passed as an
 # argument across ``invoke_subgraph`` (``@torch.compiler.nested_compile_region``)
-# boundaries. The leaves are just the tensor views; everything else (process
-# group, symm_mem handle, ints, list of ptrs) rides along as static context.
-# The kernel call only touches the pre-extracted primitives — see the comment
-# in ``SymmBuffer.__init__`` — so dynamo never has to model the non-tensor
-# fields beyond passing them through.
+# boundaries. The leaves are just the tensor views; ``group`` / ``handle`` /
+# ints ride along as static context. Inside the compile region, attribute
+# chains like ``sb.handle.buffer_ptrs`` and ``sb.group.rank()`` are constant-
+# folded against the context — no special pre-extraction needed.
 _SYMM_BUFFER_TENSOR_FIELDS = (
     "buffer", "x", "x_sf", "topk_idx", "topk_weights",
     "l1_acts", "l1_acts_sf", "l2_acts", "l2_acts_sf",
 )
 _SYMM_BUFFER_CONTEXT_FIELDS = (
-    "group", "handle", "buffer_ptrs", "rank_idx",
+    "group", "handle",
     "num_experts", "num_max_tokens_per_rank", "num_topk",
     "hidden", "intermediate_hidden",
 )
@@ -160,16 +152,12 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True):
-    # Read the pre-extracted primitives — see SymmBuffer dataclass comment.
-    # Touching ``sym_buffer.handle.buffer_ptrs`` / ``sym_buffer.group.rank()``
-    # here would force dynamo to model the handle/process-group objects when
-    # this call sits inside ``invoke_subgraph``.
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
-        sym_buffer.buffer_ptrs, sym_buffer.rank_idx,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,

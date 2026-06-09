@@ -134,10 +134,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     // ``Tensor(a!) d ... -> Tensor(a!)`` form are both rejected by torch's
     // functionalize pass for custom (non-ATen) ops once the call sits inside
     // a nested compile region (``@torch.compiler.nested_compile_region`` →
-    // ``invoke_subgraph``). Consumers wrap the call with
-    // ``torch._dynamo.allow_in_graph`` to keep it opaque to inductor so it
-    // doesn't DCE the mutation. ``register_fake`` is provided in
-    // ``deep_gemm/__init__.py`` for compile compatibility.
+    // ``invoke_subgraph``). ``register_fake`` is provided in
+    // ``deep_gemm/__init__.py`` so compile / fake-mode dispatch is well-defined.
     ops.def(
         "m_grouped_fp8_fp4_gemm_nt_contiguous("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
