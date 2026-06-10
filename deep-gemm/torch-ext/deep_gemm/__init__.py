@@ -48,52 +48,6 @@ for _op in _MUTATING_OPS:
         pass
 
 
-# ── Functionalize-key kernels for mutating ops ──────────────────────────────
-# Every DeepGEMM GEMM/MoE op writes its output in-place — the schemas declare
-# the destination as ``Tensor!`` (legacy alias notation). When such an op is
-# called inside ``@torch.compiler.nested_compile_region`` (i.e. an
-# ``invoke_subgraph`` HOP), the dispatcher reaches the C++
-# ``FunctionalizeFallbackKernel`` whose first action is
-# ``TORCH_CHECK(!schema.hasAnyAliasInfo(), ...)`` — rejecting any op with an
-# alias annotation. ``auto_functionalize`` (which would normally rewrite the
-# op as out-of-place) only fires when ``FunctionalTensorMode`` is the active
-# Python TorchDispatchMode, and that mode is bypassed during the speculative
-# trace of an ``invoke_subgraph`` body.
-#
-# Registering an explicit Functionalize-keyed kernel routes around the
-# fallback. The kernel mirrors the fallback's behavior minus the alias check:
-# sync + unwrap any ``FunctionalTensor`` inputs, then re-dispatch with the
-# Functionalize key excluded so the inner call doesn't recurse back here.
-#
-# The ``Library`` object is held at module scope — once it is GC'd the
-# registered kernels are torn down.
-_FUNCTIONALIZE_LIB = torch.library.Library(_ops.name, "FRAGMENT")
-_FUNCTIONALIZE_KEYSET = torch._C.DispatchKeySet(torch._C.DispatchKey.Functionalize)
-
-
-def _make_functionalize_kernel(op):
-    def _kernel(*args, **kwargs):
-        def _unwrap(x):
-            if isinstance(x, torch.Tensor) and torch._is_functional_tensor(x):
-                torch._sync(x)
-                return torch._from_functional_tensor(x)
-            return x
-
-        args = tuple(_unwrap(a) for a in args)
-        kwargs = {k: _unwrap(v) for k, v in kwargs.items()}
-        with torch._C._ExcludeDispatchKeyGuard(_FUNCTIONALIZE_KEYSET):
-            return op(*args, **kwargs)
-
-    return _kernel
-
-
-for _op_name in _MUTATING_OPS:
-    _op = getattr(_ops, _op_name, None)
-    if _op is None:
-        continue
-    _FUNCTIONALIZE_LIB.impl(_op_name, _make_functionalize_kernel(_op), "Functionalize")
-
-
 # Runtime
 
 
