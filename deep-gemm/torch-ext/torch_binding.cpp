@@ -128,23 +128,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     );
     ops.impl("fp8_fp4_gemm_tt", torch::kCUDA, &deep_gemm_fp8_fp4_gemm_tt);
 
-    // M-grouped FP8/FP4 GEMM ops (CUDA dispatch).
-    //
-    // ``Tensor! d`` declares the in-place mutation so functionalize tracks
-    // it — inductor's optimizer needs the declaration to avoid reordering
-    // or caching reads around the call. Dropping the annotation makes
-    // compile succeed but yields wrong outputs (the kernel writes ``d`` but
-    // inductor doesn't see the write → downstream consumers read stale
-    // values).
-    //
-    // Caveat: when this call sits inside ``@torch.compiler.nested_compile_region``
-    // (``invoke_subgraph``), functionalize wraps it in
-    // ``auto_functionalized_v2(invoke_subgraph, …)`` and the stock inductor
-    // pass ``decompose_auto_functionalized`` fails to unwrap (the
-    // ``Match.replace_by_example`` → ``make_fx`` path doesn't handle HOP
-    // inner ops), tripping the ``auto_functionalized_v2 was not removed``
-    // assertion. Consumers (e.g. transformers) work around this with a
-    // monkey-patch on the post-grad pass — see pytorch#186807.
+    // M-grouped FP8/FP4 GEMM ops (CUDA dispatch)
     ops.def(
         "m_grouped_fp8_fp4_gemm_nt_contiguous("
         "Tensor a_data, Tensor a_sf, Tensor b_data, Tensor b_sf, "
@@ -230,8 +214,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     );
     ops.impl("bf16_gemm_tt", torch::kCUDA, &deep_gemm_bf16_gemm_tt);
 
-    // M-grouped BF16 GEMM ops (CUDA dispatch). See the FP8/FP4 grouped
-    // variants above for the ``Tensor! d`` rationale.
+    // M-grouped BF16 GEMM ops (CUDA dispatch)
     ops.def(
         "m_grouped_bf16_gemm_nt_contiguous("
         "Tensor a, Tensor b, Tensor! d, Tensor grouped_layout, "
@@ -366,7 +349,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.impl("get_symm_buffer_views_for_mega_moe", torch::kCUDA,
              &deep_gemm_get_symm_buffer_views_for_mega_moe);
 
-    // See the FP8/FP4 grouped variants above for the ``Tensor! y`` rationale.
     ops.def(
         "fp8_fp4_mega_moe("
         "Tensor! y, Tensor l1_weights, Tensor l1_weights_sf, "

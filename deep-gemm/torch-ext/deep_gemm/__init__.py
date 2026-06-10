@@ -20,7 +20,7 @@ __version__ = "2.5.0"
 # The fake implementations are no-ops since `d` is pre-allocated by the caller.
 
 
-_MUTATING_OPS = [
+for _op in [
     "fp8_fp4_gemm_nt",
     "fp8_fp4_gemm_nn",
     "fp8_fp4_gemm_tn",
@@ -39,9 +39,7 @@ _MUTATING_OPS = [
     "m_grouped_bf16_gemm_nt_masked",
     "fp8_gemm_nt_skip_head_mid",
     "fp8_fp4_mega_moe",
-]
-
-for _op in _MUTATING_OPS:
+]:
 
     @torch.library.register_fake(add_op_namespace_prefix(_op))
     def _fake(*args, **kwargs):
