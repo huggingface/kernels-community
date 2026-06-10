@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import torch
-from torch.utils import _pytree as pytree
 from typing import Tuple, Optional
 from ..utils.math import align
 
@@ -56,41 +55,6 @@ class SymmBuffer:
         self.group = None
         self.x = None
         self.x_sf = None
-
-
-# Pytree-register ``SymmBuffer`` so dynamo can flatten it when passed as an
-# argument across ``invoke_subgraph`` (``@torch.compiler.nested_compile_region``)
-# boundaries. The leaves are just the tensor views; ``group`` / ``handle`` /
-# ints ride along as static context. Inside the compile region, attribute
-# chains like ``sb.handle.buffer_ptrs`` and ``sb.group.rank()`` are constant-
-# folded against the context — no special pre-extraction needed.
-_SYMM_BUFFER_TENSOR_FIELDS = (
-    "buffer", "x", "x_sf", "topk_idx", "topk_weights",
-    "l1_acts", "l1_acts_sf", "l2_acts", "l2_acts_sf",
-)
-_SYMM_BUFFER_CONTEXT_FIELDS = (
-    "group", "handle",
-    "num_experts", "num_max_tokens_per_rank", "num_topk",
-    "hidden", "intermediate_hidden",
-)
-
-
-def _symm_buffer_flatten(sb: SymmBuffer):
-    leaves = [getattr(sb, k) for k in _SYMM_BUFFER_TENSOR_FIELDS]
-    context = tuple(getattr(sb, k) for k in _SYMM_BUFFER_CONTEXT_FIELDS)
-    return leaves, context
-
-
-def _symm_buffer_unflatten(leaves, context) -> SymmBuffer:
-    sb = SymmBuffer.__new__(SymmBuffer)
-    for k, v in zip(_SYMM_BUFFER_TENSOR_FIELDS, leaves):
-        setattr(sb, k, v)
-    for k, v in zip(_SYMM_BUFFER_CONTEXT_FIELDS, context):
-        setattr(sb, k, v)
-    return sb
-
-
-pytree.register_pytree_node(SymmBuffer, _symm_buffer_flatten, _symm_buffer_unflatten)
 
 
 def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
