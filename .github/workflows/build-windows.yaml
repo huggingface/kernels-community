@@ -109,8 +109,10 @@ jobs:
       - name: Validate PR number
         if: inputs.pr_number != ''
         shell: pwsh
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
-          if ("${{ inputs.pr_number }}" -notmatch '^\d+$') {
+          if ("$env:PR_NUMBER" -notmatch '^\d+$') {
             Write-Error "Invalid pr_number input: must be numeric"
             exit 1
           }
@@ -130,9 +132,11 @@ jobs:
       - name: Validate kernel directory
         id: validate
         shell: pwsh
+        env:
+          KERNEL: ${{ inputs.kernel_name }}
         run: |
           $ErrorActionPreference = "Continue"
-          $KERNEL = "${{ inputs.kernel_name }}"
+          $KERNEL = $env:KERNEL
           if ((Test-Path "$KERNEL") -and (Test-Path "$KERNEL/flake.nix") -and (Test-Path "$KERNEL/build.toml")) {
             echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
             echo "skip=false" >> $env:GITHUB_OUTPUT
@@ -147,10 +151,13 @@ jobs:
         id: check-backend
         if: steps.validate.outputs.skip == 'false'
         shell: pwsh
+        env:
+          KERNEL: ${{ steps.validate.outputs.kernel }}
+          BACKENDS: ${{ inputs.backends }}
         run: |
-          $KERNEL = "${{ steps.validate.outputs.kernel }}"
+          $KERNEL = $env:KERNEL
           $BACKEND = "${{ matrix.platform.backend }}"
-          $backends = "${{ inputs.backends }}" -split ","
+          $backends = "$env:BACKENDS" -split ","
 
           if ($BACKEND -notin $backends) {
             Write-Output "Kernel '$KERNEL' does not support backend '$BACKEND' - skipping"
@@ -180,8 +187,10 @@ jobs:
       - name: Kernel Info
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
         shell: pwsh
+        env:
+          KERNEL: ${{ steps.validate.outputs.kernel }}
         run: |
-          $KERNEL = "${{ steps.validate.outputs.kernel }}"
+          $KERNEL = $env:KERNEL
           Write-Output "Building Kernel: $KERNEL"
 
       # Read the pinned kernel-builder revision from flake.lock so we build
@@ -190,8 +199,10 @@ jobs:
         id: extract-builder-version
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
         shell: pwsh
+        env:
+          KERNEL: ${{ steps.validate.outputs.kernel }}
         run: |
-          $KERNEL = "${{ steps.validate.outputs.kernel }}"
+          $KERNEL = $env:KERNEL
           $lock = Get-Content "${KERNEL}/flake.lock" | ConvertFrom-Json
           $revision = $lock.nodes."kernel-builder".locked.rev
           Write-Output "Building Kernel with revision: $revision"
@@ -317,6 +328,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
+          REPO_PREFIX: ${{ inputs.repo_prefix }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
           $KB = "$env:GITHUB_WORKSPACE\kernels\kernel-builder\target\debug\kernel-builder.exe"
@@ -327,8 +339,8 @@ jobs:
           }
 
           # Upload to both model and kernel repo types
-          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "${{ inputs.repo_prefix }}/$env:KERNEL_SOURCE" @branchArgs
-          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "${{ inputs.repo_prefix }}/$env:KERNEL_SOURCE" @branchArgs
+          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" @branchArgs
+          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" @branchArgs
 
       # v1 kernels without an explicit branch override also get uploaded to main.
       - name: Upload v1 kernels to main
@@ -337,6 +349,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
+          REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
           $KB = "$env:GITHUB_WORKSPACE\kernels\kernel-builder\target\debug\kernel-builder.exe"
 
@@ -346,8 +359,8 @@ jobs:
             $content = Get-Content $buildTomlPath -Raw
             if ($content -match '(?m)^\s*version\s*=\s*1\s*(\r)?$' -and $content -notmatch '(?m)^\s*branch\s*=') {
               Write-Host "Kernel version is 1 and no branch override, uploading to main branch..."
-              & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "${{ inputs.repo_prefix }}/$env:KERNEL_SOURCE" --branch main
-              & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "${{ inputs.repo_prefix }}/$env:KERNEL_SOURCE" --branch main
+              & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" --branch main
+              & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" --branch main
             } else {
               Write-Host "Kernel version is not 1 or branch is overridden, skipping main branch upload"
             }

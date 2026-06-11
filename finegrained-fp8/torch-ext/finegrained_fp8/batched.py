@@ -26,15 +26,12 @@ from .utils import (
     fp4_act_quant_inline,
     fp8_act_quant,
     fp8_act_quant_inline,
+    get_accelerator_autotuning_configs,
 )
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_autotuning_configs(),
     key=["N", "K"],
 )
 @triton.jit
@@ -121,11 +118,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_autotuning_configs(),
     key=["N", "K"],
 )
 @triton.jit
@@ -204,17 +197,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk},
-            num_warps=w,
-            num_stages=s,
-        )
-        for bn in [64, 128, 256]
-        for bk in [64, 128, 256]
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_autotuning_configs(for_mxfp4=True),
     key=["N", "K"],
 )
 @triton.jit

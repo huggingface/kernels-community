@@ -26,15 +26,12 @@ from .utils import (
     fp4_act_quant_inline,
     fp8_act_quant,
     fp8_act_quant_inline,
+    get_accelerator_autotuning_configs,
 )
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_autotuning_configs(),
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
@@ -110,11 +107,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_autotuning_configs(),
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
@@ -186,11 +179,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_autotuning_configs(),
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
@@ -270,17 +259,7 @@ def w8a8_block_static_fp8_matmul_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {"BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk},
-            num_warps=w,
-            num_stages=s,
-        )
-        for bn in [64, 128, 256]
-        for bk in [64, 128, 256]
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4]
-    ],
+    configs=get_accelerator_autotuning_configs(for_mxfp4=True),
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
@@ -591,8 +570,9 @@ def _w4a8_block_dynamic_fp4_matmul(
     B:  (N, K // 2) packed FP4 (E2M1) weights, two codes per int8
     Bs: (N, K // 32) UE8M0 weight scales
 
-    BLOCK_SIZE_N and BLOCK_SIZE_K are autotuned — FP4 scale granularity is fixed
-    at 32, so tile shape is purely a perf knob.
+    On CUDA and other backends, BLOCK_SIZE_N and BLOCK_SIZE_K are autotuned.
+    On XPU they are fixed to 128x128 and only num_warps/num_stages are autotuned.
+    FP4 scale granularity is fixed at 32, so tile shape is purely a perf knob.
     """
     assert A.ndim == 2 and B.ndim == 2 and Bs.ndim == 2
     assert B.dtype == torch.int8, f"B must be int8 (packed FP4), got {B.dtype}"

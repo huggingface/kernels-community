@@ -84,8 +84,10 @@ jobs:
       # Guard against injection via pr_number input.
       - name: Validate PR number
         if: inputs.pr_number != ''
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
         run: |
-          case "${{ inputs.pr_number }}" in
+          case "$PR_NUMBER" in
             ''|*[!0-9]*)
               echo "Invalid pr_number input: must be numeric"
               exit 1
@@ -121,8 +123,9 @@ jobs:
       # Ensure the kernel directory exists and has the required config files.
       - name: Validate kernel directory
         id: validate
+        env:
+          KERNEL: ${{ inputs.kernel_name }}
         run: |
-          KERNEL="${{ inputs.kernel_name }}"
           if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$KERNEL/build.toml" ]; then
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
@@ -133,8 +136,9 @@ jobs:
       # PR-only: verify the kernel has a Hub repo-id before burning CI time.
       - name: Check that repo-id is present
         if: steps.validate.outputs.skip == 'false' && inputs.mode == 'pr'
+        env:
+          KERNEL: ${{ steps.validate.outputs.kernel }}
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
           if ! cat $KERNEL/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
             echo "Mandatory repo-id is missing in $KERNEL/build.toml"
             exit 1
@@ -148,8 +152,9 @@ jobs:
       # PR mode builds the CI target (.#ci); release builds the full bundle.
       - name: Build kernel
         if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true
+        env:
+          KERNEL: ${{ steps.validate.outputs.kernel }}
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
           if [ "${{ inputs.mode }}" = "pr" ]; then
             ( cd "$KERNEL" && nix build -L .#ci && ls -l result/ )
           else
@@ -161,14 +166,15 @@ jobs:
           chmod -R u+w build
 
       - name: Install Cosign
-        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && steps.validate.outputs.kernel == 'relu' && inputs.mode != 'pr'
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr'
         uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
 
       # Sign metadata.json for each built variant.
       - name: Sign kernel metadata
-        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && steps.validate.outputs.kernel == 'relu' && inputs.mode != 'pr'
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr'
+        env:
+          KERNEL: ${{ steps.validate.outputs.kernel }}
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
           for metadata_file in "$KERNEL"/build/*/metadata.json; do
             cosign sign-blob "$metadata_file" --bundle "${metadata_file}.sigstore" --yes
           done
@@ -178,31 +184,34 @@ jobs:
         if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KERNEL: ${{ steps.validate.outputs.kernel }}
+          REPO_PREFIX: ${{ inputs.repo_prefix }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
           cd "$KERNEL"
           BRANCH_FLAG=""
-          if [ -n "${{ inputs.target_branch }}" ]; then
-            BRANCH_FLAG="--branch ${{ inputs.target_branch }}"
+          if [ -n "$TARGET_BRANCH" ]; then
+            BRANCH_FLAG="--branch $TARGET_BRANCH"
           fi
-          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "${{ inputs.repo_prefix }}/$KERNEL" $BRANCH_FLAG
-          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "${{ inputs.repo_prefix }}/$KERNEL" $BRANCH_FLAG
+          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "$REPO_PREFIX/$KERNEL" $BRANCH_FLAG
+          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "$REPO_PREFIX/$KERNEL" $BRANCH_FLAG
 
       # v1 kernels without an explicit branch override also get uploaded to main.
       - name: Upload v1 kernels to main
         if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false && inputs.target_branch == ''
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KERNEL: ${{ steps.validate.outputs.kernel }}
+          REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
-          KERNEL="${{ steps.validate.outputs.kernel }}"
           cd "$KERNEL"
 
           if [ -f "build.toml" ]; then
             VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
             BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
             if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
-              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "${{ inputs.repo_prefix }}/$KERNEL" --branch main
-              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "${{ inputs.repo_prefix }}/$KERNEL" --branch main
+              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "$REPO_PREFIX/$KERNEL" --branch main
+              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "$REPO_PREFIX/$KERNEL" --branch main
             fi
           fi
 
