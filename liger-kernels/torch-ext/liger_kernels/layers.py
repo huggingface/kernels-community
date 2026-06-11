@@ -14,8 +14,6 @@ from .swiglu import LigerSiLUMulFunction
 from .tiled_mlp import apply_tiled_mlp
 
 
-# General
-
 # TODO
 class LigerLayerNorm(nn.Module):
     weight: nn.Parameter
@@ -28,20 +26,6 @@ class LigerLayerNorm(nn.Module):
     def extra_repr(self) -> str:
         return f"{self.hidden_size}, eps={self.eps}"
 
-
-# TODO: actual loss should roughly match
-def liger_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply standard rotary positional embedding to ``q`` and ``k``."""
-    return LigerRopeFunction.apply(q, k, cos, sin, None, unsqueeze_dim)
-
-
-# Supported by transformers
 
 # NOTE: Not compile-friendly --> large deviations to the original implementation under compile
 class LigerRMSNorm(nn.Module):
@@ -63,15 +47,13 @@ class LigerRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
-# TODO: actual loss should roughly match
 class LigerLinear(nn.Module):
     weight: nn.Parameter
     bias: nn.Parameter | None
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """def _forward(module, x):
-            return module(x)"""
+    can_torch_compile = True
 
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
         def _forward(module, x):
             return nn.functional.linear(x, module.weight, module.bias)
 
@@ -109,39 +91,6 @@ class LigerGEGLUMLP(nn.Module):
         return self.down_proj(LigerGELUMulFunction.apply(self.gate_proj(x), self.up_proj(x)))
 
 
-# TODO: actual loss should roughly match
-class LigerTiledGEGLUMLP(nn.Module):
-    gate_proj: nn.Linear
-    up_proj: nn.Linear
-    down_proj: nn.Linear
-
-    can_torch_compile = True
-
-    def _mlp_forward(self, module, x):
-        """Internal MLP forward function for tiled computation."""
-        gate = module.gate_proj(x)
-        up = module.up_proj(x)
-        return module.down_proj(LigerGELUMulFunction.apply(gate, up))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        def _mlp_forward(module, x):
-            """Internal MLP forward function for tiled computation."""
-            gate = module.gate_proj(x)
-            up = module.up_proj(x)
-            return module.down_proj(LigerGELUMulFunction.apply(gate, up))
-
-        compute_params = [p for p in self.parameters() if p.requires_grad]
-
-        return apply_tiled_mlp(
-            fn=_mlp_forward,
-            mlp_module=self,
-            x=x,
-            num_shards=None,
-            compute_params=compute_params,
-        )
-
-
-# TODO: actual loss should roughly match
 class LigerTiledSwiGLUMLP(nn.Module):
     gate_proj: nn.Linear
     up_proj: nn.Linear
@@ -165,6 +114,43 @@ class LigerTiledSwiGLUMLP(nn.Module):
             num_shards=None,
             compute_params=compute_params,
         )
+
+
+# TODO: actual loss should roughly match
+class LigerTiledGEGLUMLP(nn.Module):
+    gate_proj: nn.Linear
+    up_proj: nn.Linear
+    down_proj: nn.Linear
+
+    can_torch_compile = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        def _mlp_forward(module, x):
+            """Internal MLP forward function for tiled computation."""
+            gate = module.gate_proj(x)
+            up = module.up_proj(x)
+            return module.down_proj(LigerGELUMulFunction.apply(gate, up))
+
+        compute_params = [p for p in self.parameters() if p.requires_grad]
+
+        return apply_tiled_mlp(
+            fn=_mlp_forward,
+            mlp_module=self,
+            x=x,
+            num_shards=None,
+            compute_params=compute_params,
+        )
+
+
+def liger_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply standard rotary positional embedding to ``q`` and ``k``."""
+    return LigerRopeFunction.apply(q, k, cos, sin, None, unsqueeze_dim)
 
 
 @dataclass
@@ -276,18 +262,18 @@ def LigerForCausalLMLoss(
 
 # Add torch compile support for functions - in this case it's to allow this to be used
 # but the function itself will not be compiled (see the note at the function)
-LigerForCausalLMLoss.can_torch_compile = True
 liger_rotary_pos_emb.can_torch_compile = True
+LigerForCausalLMLoss.can_torch_compile = True
 
 
 __all__ = [
     "LigerLayerNorm",
-    "liger_rotary_pos_emb",
     "LigerRMSNorm",
     "LigerLinear",
     "LigerSwiGLUMLP",
     "LigerGEGLUMLP",
-    "LigerTiledGEGLUMLP",
     "LigerTiledSwiGLUMLP",
+    "LigerTiledGEGLUMLP",
+    "liger_rotary_pos_emb",
     "LigerForCausalLMLoss",
 ]
