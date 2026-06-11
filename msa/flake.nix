@@ -2,7 +2,7 @@
   description = "Flake for MiniMax Sparse Attention (MSA) SM100 kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/torch-2.12";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
