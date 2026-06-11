@@ -2,8 +2,9 @@
 name = "msa"
 backends = ["cuda"]
 # MSA itself is MIT; the vendored quack modules
-# (torch-ext/msa/quack) are Apache-2.0.
-license = "MIT AND Apache-2.0"
+# (torch-ext/msa/quack) are Apache-2.0. The Hub only accepts a single
+# license identifier in model card metadata, so use "other".
+license = "other"
 python-depends = ["tvm-ffi"]
 upstream = "https://github.com/MiniMax-AI/MSA"
 version = 0
