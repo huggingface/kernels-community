@@ -1,7 +1,9 @@
 [general]
 name = "msa"
 backends = ["cuda"]
-license = "MIT"
+# MSA itself is MIT; the vendored quack modules
+# (torch-ext/msa/quack) are Apache-2.0.
+license = "MIT AND Apache-2.0"
 python-depends = ["tvm-ffi"]
 upstream = "https://github.com/MiniMax-AI/MSA"
 version = 0
