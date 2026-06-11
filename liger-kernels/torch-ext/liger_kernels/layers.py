@@ -7,24 +7,10 @@ import torch.nn as nn
 
 from .fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction
 from .geglu import LigerGELUMulFunction
-from .layer_norm import LigerLayerNormFunction
 from .rms_norm import LigerRMSNormFunction
 from .rope import LigerRopeFunction
 from .swiglu import LigerSiLUMulFunction
 from .tiled_mlp import apply_tiled_mlp
-
-
-# TODO
-class LigerLayerNorm(nn.Module):
-    weight: nn.Parameter
-    bias: nn.Parameter | None
-    eps: float
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return LigerLayerNormFunction.apply(input, self.weight, self.bias, self.eps)
-
-    def extra_repr(self) -> str:
-        return f"{self.hidden_size}, eps={self.eps}"
 
 
 # NOTE: Not compile-friendly --> large deviations to the original implementation under compile
@@ -79,7 +65,6 @@ class LigerSwiGLUMLP(nn.Module):
         return self.down_proj(LigerSiLUMulFunction.apply(self.gate_proj(x), self.up_proj(x)))
 
 
-# TODO: actual loss should roughly match
 class LigerGEGLUMLP(nn.Module):
     gate_proj: nn.Linear
     up_proj: nn.Linear
@@ -116,7 +101,6 @@ class LigerTiledSwiGLUMLP(nn.Module):
         )
 
 
-# TODO: actual loss should roughly match
 class LigerTiledGEGLUMLP(nn.Module):
     gate_proj: nn.Linear
     up_proj: nn.Linear
@@ -218,6 +202,7 @@ def LigerForCausalLMLoss(
     shift_labels: Optional[torch.Tensor] = None,
     hidden_states: torch.Tensor | None = None,
     lm_head_weight: torch.Tensor | None = None,
+    lm_head_bias: torch.Tensor | None = None,
     **kwargs,
 ):
     # To match signature we hide these behind the kwargs but we expect a few kwargs to exist
@@ -246,6 +231,7 @@ def LigerForCausalLMLoss(
         hidden_states,
         lm_head_weight,
         shift_labels,
+        bias=lm_head_bias,
         reduction=reduction,
         ignore_index=ignore_index,
         softcap=final_logit_softcapping,
@@ -267,7 +253,6 @@ LigerForCausalLMLoss.can_torch_compile = True
 
 
 __all__ = [
-    "LigerLayerNorm",
     "LigerRMSNorm",
     "LigerLinear",
     "LigerSwiGLUMLP",
