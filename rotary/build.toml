@@ -4,6 +4,7 @@ license = "BSD-3-Clause"
 version = 1
 backends = [
     "cuda",
+    "metal",
     "xpu",
 ]
 
@@ -26,3 +27,11 @@ src = [
 backend = "cuda"
 depends = ["torch"]
 src = ["rotary/rotary_cuda.cu"]
+
+[kernel.rotary_metal]
+backend = "metal"
+depends = ["torch"]
+src = [
+    "rotary_metal/rotary.mm",
+    "rotary_metal/rotary.metal",
+]

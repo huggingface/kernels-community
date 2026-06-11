@@ -8,7 +8,7 @@
 
 #include "registration.h"
 
-#define CHECK_DEVICE(x) TORCH_CHECK(x.device().type() == torch::kCUDA || x.device().type() == torch::kXPU, #x " must be on CUDA or XPU")
+#define CHECK_DEVICE(x) TORCH_CHECK(x.device().type() == torch::kCUDA || x.device().type() == torch::kXPU || x.device().type() == torch::kMPS, #x " must be on CUDA, XPU or MPS")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 
 void _apply_rotary(torch::Tensor const &x1, torch::Tensor const &x2,
@@ -48,6 +48,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.impl("apply_rotary", torch::kCUDA, &apply_rotary);
 #elif defined(XPU_KERNEL)
     ops.impl("apply_rotary", torch::kXPU, &apply_rotary);
+#elif defined(METAL_KERNEL)
+    ops.impl("apply_rotary", torch::kMPS, &apply_rotary);
 #endif
 }
 

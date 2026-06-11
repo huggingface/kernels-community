@@ -9,6 +9,8 @@ def infer_device():
         return "cuda"
     elif torch.xpu.is_available():
         return "xpu"
+    elif torch.backends.mps.is_available():
+        return "mps"
     else:
         return None
 
@@ -19,5 +21,7 @@ def supports_bfloat16():
         return torch.cuda.get_device_capability() >= (8, 0)  # Ampere and newer
     elif device == "xpu":
         return True
+    elif device == "mps":
+        return True  # bfloat16 is supported on Apple Silicon
     else:
         return False
