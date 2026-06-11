@@ -1,0 +1,33 @@
+[general]
+name = "msa"
+backends = ["cuda"]
+license = "MIT"
+python-depends = ["tvm-ffi"]
+upstream = "https://github.com/MiniMax-AI/MSA"
+version = 0
+
+[general.hub]
+repo-id = "kernels-community/msa"
+
+[general.cuda]
+minver = "12.8"
+python-depends = ["nvidia-cutlass-dsl"]
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+# Host-side helper kernels (CSR builder and decode scheduler). The
+# attention kernels themselves are CuTe DSL Python and are compiled at
+# runtime through nvidia-cutlass-dsl; only SM100 is supported.
+[kernel.msa]
+backend = "cuda"
+cuda-capabilities = ["10.0"]
+depends = ["torch"]
+include = ["torch-ext"]
+src = [
+  "csrc/build_k2q_csr.cu",
+  "csrc/build_decode_schedule.cu",
+]
