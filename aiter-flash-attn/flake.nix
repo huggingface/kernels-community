@@ -2,7 +2,7 @@
   description = "Flake for AITER Flash Attention (AMD ROCm Triton MHA) kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels";
+    kernel-builder.url = "github:huggingface/kernels/torch-noarch-pyext";
   };
 
   outputs =

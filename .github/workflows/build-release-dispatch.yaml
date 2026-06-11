@@ -35,9 +35,9 @@ jobs:
         id: validate
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
+          KERNEL: ${{ inputs.kernel_name }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            KERNEL="${{ inputs.kernel_name }}"
             if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$KERNEL/build.toml" ]; then
               echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
               echo "skip=false" >> $GITHUB_OUTPUT
@@ -53,9 +53,12 @@ jobs:
             fi
           fi
       - name: Print result
+        env:
+          SKIP: ${{ steps.validate.outputs.skip }}
+          KERNEL: ${{ steps.validate.outputs.kernel }}
         run: |
-          echo "skip=${{ steps.validate.outputs.skip }}"
-          echo "kernel=${{ steps.validate.outputs.kernel }}"
+          echo "skip=$SKIP"
+          echo "kernel=$KERNEL"
 
   dispatch:
     needs: validate
@@ -67,7 +70,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          KERNEL: ${{ needs.validate.outputs.kernel }}
+          REF: ${{ github.event.repository.default_branch || 'main' }}
         run: |
-          KERNEL="${{ needs.validate.outputs.kernel }}"
-          REF="${{ github.event.repository.default_branch || 'main' }}"
           python3 .github/scripts/dispatch.py "$KERNEL" --ref "$REF" --mode release
