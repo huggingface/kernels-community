@@ -3,6 +3,8 @@ name = "flash-attn4"
 backends = [ "cuda" ]
 python-depends = [ "einops", "tvm-ffi" ]
 license = "BSD-3-Clause"
+# Bump version to 1 once FA4 is out of beta and we have synced with
+# a non-beta version.
 version = 0
 
 [general.hub]
