@@ -1,19 +1,7 @@
-import torch
-
-from ._ops import ops
+from . import layers
 from .layers import apply_rotary_transformers
+from .rotary import apply_rotary
 
 
-def apply_rotary(
-    x1: torch.Tensor,
-    x2: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    out1: torch.Tensor,
-    out2: torch.Tensor,
-    conj: bool,
-) -> None:
-    ops.apply_rotary(x1, x2, cos, sin, out1, out2, conj)
-
-
-__all__ = ["apply_rotary", "apply_rotary_transformers"]
+# Keeping `apply_rotary` for BC
+__all__ = ["apply_rotary", "apply_rotary_transformers", "layers"]
