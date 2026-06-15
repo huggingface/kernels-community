@@ -12,7 +12,12 @@ from ..gated_delta_rule_utils import (
 
 
 def is_cuda():
-    return triton.runtime.driver.active.get_current_target().backend == "cuda"
+    try:
+        return triton.runtime.driver.active.get_current_target().backend == "cuda"
+    except Exception:
+        # No active Triton driver (e.g. no-GPU CI sandbox at import time).
+        # Default to False so the HIP autotune config is selected.
+        return False
 
 
 def get_cuda_autotune_config():
