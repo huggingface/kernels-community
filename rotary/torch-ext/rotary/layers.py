@@ -1,7 +1,5 @@
 import torch
 
-from .rotary import apply_rotary
-
 
 def apply_rotary_transformers(
     q: torch.Tensor,
@@ -14,6 +12,8 @@ def apply_rotary_transformers(
     Rotary kernel implementation wrapper
     Adapts rotary kernel implementation to match transformers apply_rotary_pos_emb signature
     """
+    from .rotary import apply_rotary
+
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
 
