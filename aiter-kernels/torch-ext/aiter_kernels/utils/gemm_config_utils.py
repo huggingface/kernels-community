@@ -5,8 +5,8 @@ import os
 
 import triton
 
-from aiter_kernels.utils._triton import arch_info
-from aiter_kernels.utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton import arch_info
+from ..utils.core import AITER_TRITON_CONFIGS_PATH
 
 # Standard bounds for M_LEQ_x keys (tuple for hashability with LRU cache)
 STANDARD_M_BOUNDS = (4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)

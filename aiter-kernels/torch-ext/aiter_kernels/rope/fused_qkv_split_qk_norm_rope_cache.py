@@ -1,7 +1,7 @@
 import torch
 import triton
 
-from aiter_kernels._triton_kernels.rope.fused_qkv_split_qk_norm_rope_cache import (
+from .._triton_kernels.rope.fused_qkv_split_qk_norm_rope_cache import (
     _fused_qkv_split_qk_norm_rope_cache_kernel,
 )
 

@@ -5,12 +5,12 @@ import torch
 import triton
 import triton.language as tl
 from typing import Any, Dict
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels._triton_kernels.moe.moe_op_mxfp4_silu_fused import (
+from ..utils.logger import AiterTritonLogger
+from .._triton_kernels.moe.moe_op_mxfp4_silu_fused import (
     _fused_moe_kernel_mxfp4_silu,
     get_scaled_dot_format_string,
 )
-from aiter_kernels.utils.types import torch_to_triton_dtype
+from ..utils.types import torch_to_triton_dtype
 
 _LOGGER = AiterTritonLogger()
 

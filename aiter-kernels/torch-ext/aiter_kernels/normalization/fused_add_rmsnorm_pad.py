@@ -1,6 +1,6 @@
 import torch
 import triton
-from aiter_kernels._triton_kernels.normalization.fused_add_rmsnorm_pad import (
+from .._triton_kernels.normalization.fused_add_rmsnorm_pad import (
     _fused_add_rmsnorm_pad,
 )
 

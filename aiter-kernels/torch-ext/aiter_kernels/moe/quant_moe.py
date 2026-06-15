@@ -1,14 +1,14 @@
 from enum import Enum
 import triton
 import torch
-from aiter_kernels._triton_kernels.moe.quant_moe import (
+from .._triton_kernels.moe.quant_moe import (
     _downcast_to_static_fp8,
     _downcast_to_mxfp,
     _upcast_from_mxfp,
     _smoothquant_fuse_quant_kernel,
     _smoothquant_fuse_quant_kernel_single_pass,
 )
-from aiter_kernels.utils._triton.arch_info import get_arch
+from ..utils._triton.arch_info import get_arch
 
 
 def downcast_to_static_fp8_3d(x: torch.Tensor, scale: torch.Tensor):

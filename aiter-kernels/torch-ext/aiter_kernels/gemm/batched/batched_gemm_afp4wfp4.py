@@ -4,13 +4,13 @@
 from typing import Optional
 import torch
 import triton
-import aiter_kernels.utils._triton.arch_info as arch_info
-from aiter_kernels._triton_kernels.gemm.batched.batched_gemm_afp4wfp4 import (
+from ...utils._triton import arch_info as arch_info
+from ..._triton_kernels.gemm.batched.batched_gemm_afp4wfp4 import (
     _batched_gemm_afp4_wfp4_kernel,
     _batched_gemm_afp4_wfp4_reduce_kernel,
     _get_config,
 )
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ...utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

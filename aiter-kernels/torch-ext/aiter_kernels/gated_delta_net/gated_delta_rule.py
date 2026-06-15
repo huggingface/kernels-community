@@ -19,16 +19,16 @@ Important Note:
 import torch
 import triton
 
-from aiter_kernels._triton_kernels.gated_delta_rule import (
+from .._triton_kernels.gated_delta_rule import (
     _fused_recurrent_gated_delta_rule_fwd_kernel,
     chunk_gated_delta_rule_fwd,
     chunk_gated_delta_rule_fwd_opt,
     chunk_gated_delta_rule_fwd_opt_vk,
 )
-from aiter_kernels._triton_kernels.gated_delta_rule.utils import (
+from .._triton_kernels.gated_delta_rule.utils import (
     l2norm_fwd,
 )
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ..utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

@@ -16,7 +16,7 @@ from torch import Tensor
 import triton
 
 # AITER: GMM utility functions
-from aiter_kernels.utils.gmm_common import (
+from .utils.gmm_common import (
     DTYPE,
     is_power_of_2,
     check_input_device_dtype,
@@ -31,7 +31,7 @@ from aiter_kernels.utils.gmm_common import (
 )
 
 # AITER: GMM Triton kernels
-from aiter_kernels._triton_kernels.gmm import (
+from ._triton_kernels.gmm import (
     gmm_kernel,
     tgmm_persistent_kernel,
     tgmm_non_persistent_kernel,

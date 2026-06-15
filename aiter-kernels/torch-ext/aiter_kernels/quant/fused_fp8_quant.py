@@ -2,8 +2,8 @@ from functools import cache
 from typing import Optional
 import torch
 import triton
-from aiter_kernels import _aiter_compat as aiter
-from aiter_kernels._triton_kernels.quant.fused_fp8_quant import (
+from .. import _aiter_compat as aiter
+from .._triton_kernels.quant.fused_fp8_quant import (
     _fused_rms_fp8_per_tensor_static_quant_kernel,
     _fused_rms_fp8_group_quant_kernel,
     _fused_rms_gated_fp8_group_quant_kernel,
@@ -12,11 +12,11 @@ from aiter_kernels._triton_kernels.quant.fused_fp8_quant import (
     _fused_reduce_rms_fp8_group_quant_kernel,
     _fused_silu_mul_fp8_per_tensor_static_quant_kernel,
 )
-from aiter_kernels.utils.types import get_fp8_e4m3_dtype
-from aiter_kernels._triton_kernels.activation import (
+from ..utils.types import get_fp8_e4m3_dtype
+from .._triton_kernels.activation import (
     _get_activation_from_str,
 )
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ..utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

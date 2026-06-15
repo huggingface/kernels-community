@@ -1,7 +1,7 @@
 import triton.language as tl
-from aiter_kernels.utils._triton.kernel_repr import make_kernel_repr
-from aiter_kernels.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter_kernels.utils.gemm_config_utils import (
+from ....utils._triton.kernel_repr import make_kernel_repr
+from ....utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from ....utils.gemm_config_utils import (
     compute_splitk_params,
     get_gemm_config,
 )

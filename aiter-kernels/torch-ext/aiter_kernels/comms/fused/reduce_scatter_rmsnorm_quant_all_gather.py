@@ -21,9 +21,9 @@ import logging
 from typing import Optional, TYPE_CHECKING
 
 # Import shared implementations
-from aiter_kernels.comms.reduce_scatter import _reduce_scatter_impl
-from aiter_kernels.comms.all_gather import _all_gather_impl
-from aiter_kernels._triton_kernels.normalization.rmsnorm import _rms_norm_kernel
+from ...comms.reduce_scatter import _reduce_scatter_impl
+from ...comms.all_gather import _all_gather_impl
+from ..._triton_kernels.normalization.rmsnorm import _rms_norm_kernel
 
 if TYPE_CHECKING:
     from ..iris import IrisCommContext

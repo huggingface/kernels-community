@@ -4,9 +4,9 @@
 import torch
 import triton
 from typing import Optional
-from aiter_kernels.utils.types import get_dtype_max
-from aiter_kernels.utils.device_info import get_num_sms
-from aiter_kernels._triton_kernels.normalization.rmsnorm import (
+from ..utils.types import get_dtype_max
+from ..utils.device_info import get_num_sms
+from .._triton_kernels.normalization.rmsnorm import (
     _rms_norm_kernel,
     _quant_rms_norm_kernel,
     _fused_add_rmsnorm_kernel,
@@ -15,7 +15,7 @@ from aiter_kernels._triton_kernels.normalization.rmsnorm import (
     _rmsnorm_bwd_dg_reduce_triton,
     _rmsnorm_kernel_large_m_small_n,
 )
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ..utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

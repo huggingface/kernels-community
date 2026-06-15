@@ -5,12 +5,12 @@ from typing import Tuple
 
 import torch
 import triton
-from aiter_kernels.utils._triton.arch_info import get_arch
-from aiter_kernels._aiter_compat.torch_guard import torch_compile_guard
-from aiter_kernels._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
+from ..utils._triton.arch_info import get_arch
+from .._aiter_compat.torch_guard import torch_compile_guard
+from .._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
     _gluon_fused_rms_kernel,
 )
-from aiter_kernels._triton_kernels.normalization.fused_rmsnorm_add import (
+from .._triton_kernels.normalization.fused_rmsnorm_add import (
     _triton_fused_rms_kernel,
 )
 

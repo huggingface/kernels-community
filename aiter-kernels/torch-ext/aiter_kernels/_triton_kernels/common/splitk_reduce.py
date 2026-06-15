@@ -1,7 +1,7 @@
 import triton
 import triton.language as tl
 
-from aiter_kernels.utils._triton.kernel_repr import make_kernel_repr
+from ...utils._triton.kernel_repr import make_kernel_repr
 
 _gemm_splitk_reduce_repr = make_kernel_repr(
     "_gemm_splitk_reduce_kernel",

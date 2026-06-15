@@ -15,9 +15,9 @@ import triton
 import triton.language as tl
 
 # AITER
-from aiter_kernels.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter_kernels.utils._triton import arch_info
-from aiter_kernels.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton import arch_info
+from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 # Kernel config.
 # ------------------------------------------------------------------------------

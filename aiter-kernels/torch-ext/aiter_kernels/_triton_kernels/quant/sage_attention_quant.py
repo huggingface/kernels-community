@@ -2,7 +2,7 @@ import triton
 import triton.language as tl
 
 
-from aiter_kernels.utils._triton.pid_preprocessing import pid_grid_3d
+from ...utils._triton.pid_preprocessing import pid_grid_3d
 
 ################# Sage V2 quantization kernels ####################
 

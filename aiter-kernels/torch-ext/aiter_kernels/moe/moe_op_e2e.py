@@ -5,11 +5,11 @@ import torch
 import triton
 from typing import Any, Dict, Optional
 
-from aiter_kernels.quant import dynamic_per_tensor_quant_fp8_i8
-from aiter_kernels.utils.types import torch_to_triton_dtype
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels.utils.device_info import get_num_xcds
-from aiter_kernels._triton_kernels.moe.moe_op_e2e import (
+from ..quant import dynamic_per_tensor_quant_fp8_i8
+from ..utils.types import torch_to_triton_dtype
+from ..utils.logger import AiterTritonLogger
+from ..utils.device_info import get_num_xcds
+from .._triton_kernels.moe.moe_op_e2e import (
     e2e_moe_kernel,
     e2e_moe_persistent_kernel,
 )

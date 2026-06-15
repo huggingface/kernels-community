@@ -1,12 +1,12 @@
 import torch
 import triton
 from dataclasses import dataclass, field
-from aiter_kernels._triton_kernels.moe.moe_routing.routing import (
+from ..._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
     _combined_routing_fused,
 )
-from aiter_kernels.utils._triton.arch_info import is_tdm_avail
-from aiter_kernels.moe.moe_routing.topk import grouped_topk
+from ...utils._triton.arch_info import is_tdm_avail
+from ...moe.moe_routing.topk import grouped_topk
 
 
 @dataclass

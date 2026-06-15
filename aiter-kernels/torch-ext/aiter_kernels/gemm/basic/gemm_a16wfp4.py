@@ -4,21 +4,21 @@
 from typing import Optional
 import torch
 import triton
-import aiter_kernels.utils._triton.arch_info as arch_info
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels.utils.common_utils import serialize_dict, deserialize_str
-from aiter_kernels._triton_kernels.gemm.basic.gemm_a16wfp4 import (
+from ...utils._triton import arch_info as arch_info
+from ...utils.logger import AiterTritonLogger
+from ...utils.common_utils import serialize_dict, deserialize_str
+from ..._triton_kernels.gemm.basic.gemm_a16wfp4 import (
     _gemm_a16wfp4_kernel,
     _gemm_a16wfp4_preshuffle_kernel,
     _get_config,
 )
-from aiter_kernels._triton_kernels.common.splitk_reduce import (
+from ..._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
-from aiter_kernels.gemm.basic.gemm_afp4wfp4 import (
+from ...gemm.basic.gemm_afp4wfp4 import (
     get_splitk,
 )
-from aiter_kernels._aiter_compat.torch_guard import torch_compile_guard
+from ..._aiter_compat.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 

@@ -1,6 +1,6 @@
 import torch
 import triton
-from aiter_kernels._triton_kernels.moe.moe_routing.bitmatrix import (
+from ..._triton_kernels.moe.moe_routing.bitmatrix import (
     _sum_bitmatrix_memset,
     _sum_bitmatrix_rows,
 )

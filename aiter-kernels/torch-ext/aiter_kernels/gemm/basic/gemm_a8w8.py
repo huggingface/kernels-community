@@ -4,14 +4,14 @@
 from typing import Optional
 import torch
 import triton
-from aiter_kernels._triton_kernels.gemm.basic.gemm_a8w8 import (
+from ..._triton_kernels.gemm.basic.gemm_a8w8 import (
     _gemm_a8w8_kernel,
     _get_config,
 )
-from aiter_kernels._triton_kernels.common.splitk_reduce import (
+from ..._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ...utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

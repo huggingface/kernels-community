@@ -3,7 +3,7 @@
 
 import torch
 
-from aiter_kernels._triton_kernels.gather_kv_b_proj import (
+from ._triton_kernels.gather_kv_b_proj import (
     _next_pow2,
     _triton_gather_kv_b_proj,
 )

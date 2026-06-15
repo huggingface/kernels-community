@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 import triton
 
-from aiter_kernels._triton_kernels.gated_delta_rule.decode.fused_rearrange_sigmoid_gdr import (
+from .._triton_kernels.gated_delta_rule.decode.fused_rearrange_sigmoid_gdr import (
     fused_rearrange_sigmoid_gated_delta_rule_update_kernel,
 )
 

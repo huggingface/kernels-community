@@ -4,19 +4,19 @@
 from typing import Optional
 import torch
 import triton
-import aiter_kernels.utils._triton.arch_info as arch_info
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels.utils.common_utils import serialize_dict, deserialize_str
-from aiter_kernels._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+from ...utils._triton import arch_info as arch_info
+from ...utils.logger import AiterTritonLogger
+from ...utils.common_utils import serialize_dict, deserialize_str
+from ..._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
     _gemm_afp4wfp4_kernel as _triton_gemm_afp4wfp4_kernel,
     _gemm_afp4wfp4_preshuffle_kernel as _triton_gemm_afp4wfp4_preshuffle_kernel,
     _gemm_afp4wfp4_kernel_preshuffle_scales as _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
     _get_config,
 )
-from aiter_kernels._triton_kernels.common.splitk_reduce import (
+from ..._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
-from aiter_kernels._aiter_compat.torch_guard import torch_compile_guard
+from ..._aiter_compat.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 
@@ -468,7 +468,7 @@ def gemm_afp4wfp4_preshuffle(
         ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
     if use_gluon:
-        from aiter_kernels._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
+        from ..._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
             get_gemm_afp4wfp4_preshuffle_layouts,
         )

@@ -7,19 +7,19 @@ import os
 import json
 import torch
 import triton
-from aiter_kernels.moe.moe_routing.routing import RoutingData
-from aiter_kernels._triton_kernels.moe.moe_op_gemm_a8w4 import (
+from ..moe.moe_routing.routing import RoutingData
+from .._triton_kernels.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4 as _moe_gemm_a8w4_triton,
 )
-from aiter_kernels._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
+from .._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4_decode as _moe_gemm_a8w4_decode_gluon,
     _moe_gemm_a8w4_prefill as _moe_gemm_a8w4_prefill_gluon,
 )
-from aiter_kernels.moe.reduce import reduce_grouped
-from aiter_kernels.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter_kernels.utils._triton.arch_info import get_arch
-from aiter_kernels.utils.device_info import get_num_sms
-from aiter_kernels.utils.gemm_config_utils import pick_gemm_num_stages
+from ..moe.reduce import reduce_grouped
+from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils._triton.arch_info import get_arch
+from ..utils.device_info import get_num_sms
+from ..utils.gemm_config_utils import pick_gemm_num_stages
 
 
 @functools.lru_cache

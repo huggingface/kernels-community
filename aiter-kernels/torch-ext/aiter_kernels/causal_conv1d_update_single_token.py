@@ -14,8 +14,8 @@ from __future__ import annotations
 import torch
 import triton
 
-from aiter_kernels._triton_kernels.causal_conv1d import PAD_SLOT_ID
-from aiter_kernels._triton_kernels.causal_conv1d_update_single_token import (
+from ._triton_kernels.causal_conv1d import PAD_SLOT_ID
+from ._triton_kernels.causal_conv1d_update_single_token import (
     _causal_conv1d_update_single_token_kernel,
     _reshape_causal_conv1d_update_single_token_kernel,
 )

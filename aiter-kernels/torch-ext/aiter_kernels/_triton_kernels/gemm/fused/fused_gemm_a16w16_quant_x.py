@@ -2,10 +2,10 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import triton.language as tl
-from aiter_kernels._triton_kernels.quant.quant import _mxfp8_quant_op
-from aiter_kernels.utils._triton.kernel_repr import make_kernel_repr
-from aiter_kernels.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter_kernels.utils.gemm_config_utils import (
+from ...._triton_kernels.quant.quant import _mxfp8_quant_op
+from ....utils._triton.kernel_repr import make_kernel_repr
+from ....utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from ....utils.gemm_config_utils import (
     compute_splitk_params,
     get_gemm_config,
 )

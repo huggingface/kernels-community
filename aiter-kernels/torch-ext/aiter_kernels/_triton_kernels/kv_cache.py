@@ -1,6 +1,6 @@
 import triton
 import triton.language as tl
-from aiter_kernels._triton_kernels.quant.quant import _nvfp4_quant_op
+from .._triton_kernels.quant.quant import _nvfp4_quant_op
 
 
 @triton.jit

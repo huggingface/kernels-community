@@ -8,10 +8,10 @@ from typing import Literal, Optional
 import torch
 import triton
 
-from aiter_kernels._triton_kernels.fusions.fused_clamp_act_mul import (
+from .._triton_kernels.fusions.fused_clamp_act_mul import (
     _fused_clamp_silu_mul_kernel,
 )
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ..utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

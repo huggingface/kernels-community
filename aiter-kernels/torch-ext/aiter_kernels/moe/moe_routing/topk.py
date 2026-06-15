@@ -1,11 +1,11 @@
 import triton
 import torch
-from aiter_kernels._triton_kernels.moe.moe_routing.topk import (
+from ..._triton_kernels.moe.moe_routing.topk import (
     _topk,
     _hash_routing,
     _grouped_topk,
 )
-from aiter_kernels.moe.moe_routing.bitmatrix import Bitmatrix
+from ...moe.moe_routing.bitmatrix import Bitmatrix
 
 
 def grouped_topk(

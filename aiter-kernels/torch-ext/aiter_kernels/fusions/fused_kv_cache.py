@@ -4,23 +4,23 @@
 import torch
 import triton
 from typing import Tuple
-from aiter_kernels._triton_kernels.fusions.fused_kv_cache import (
+from .._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cat_and_cache_mla_kernel as triton_fused_qk_rope_cat_and_cache_mla_kernel,
     _fused_qk_rope_reshape_and_cache_kernel,
     _fused_qk_rope_cosine_cache_llama_kernel,
 )
 
 try:
-    from aiter_kernels._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
+    from .._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
         _fused_qk_rope_cat_and_cache_mla_kernel as gluon_fused_qk_rope_cat_and_cache_mla_kernel,
     )
 except:  # noqa: E722
     gluon_fused_qk_rope_cat_and_cache_mla_kernel = None
 
-from aiter_kernels._aiter_compat.torch_guard import torch_compile_guard
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels.utils.types import e4m3_dtype
-from aiter_kernels.utils._triton import arch_info
+from .._aiter_compat.torch_guard import torch_compile_guard
+from ..utils.logger import AiterTritonLogger
+from ..utils.types import e4m3_dtype
+from ..utils._triton import arch_info
 
 _LOGGER = AiterTritonLogger()
 

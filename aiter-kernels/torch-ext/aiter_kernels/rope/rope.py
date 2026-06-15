@@ -7,7 +7,7 @@ import triton.language as tl
 from torch import autograd
 from enum import IntEnum
 from typing import Tuple, Union
-from aiter_kernels._triton_kernels.rope.rope import (
+from .._triton_kernels.rope.rope import (
     _rope_kernel_sbhd_fwd,
     _rope_kernel_sbhd_bwd,
     _rope_kernel_thd_fwd,
@@ -27,7 +27,7 @@ from aiter_kernels._triton_kernels.rope.rope import (
     _get_neox_rotated_x,
     _get_gptj_rotated_x,
 )
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ..utils.logger import AiterTritonLogger
 
 __all__ = [
     "_get_neox_rotated_x_1D",

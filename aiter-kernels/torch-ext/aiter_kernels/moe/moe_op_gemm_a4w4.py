@@ -4,14 +4,14 @@
 import itertools
 import torch
 import triton
-from aiter_kernels.moe.moe_routing.routing import RoutingData
-from aiter_kernels._triton_kernels.moe.moe_op_gemm_a4w4 import (
+from ..moe.moe_routing.routing import RoutingData
+from .._triton_kernels.moe.moe_op_gemm_a4w4 import (
     _mxfp4_quant_kernel,
     _moe_gemm_a4w4,
 )
-from aiter_kernels.moe.reduce import reduce_grouped
-from aiter_kernels.utils.gemm_config_utils import pick_gemm_num_stages
-from aiter_kernels.utils._triton.arch_info import get_arch
+from ..moe.reduce import reduce_grouped
+from ..utils.gemm_config_utils import pick_gemm_num_stages
+from ..utils._triton.arch_info import get_arch
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter

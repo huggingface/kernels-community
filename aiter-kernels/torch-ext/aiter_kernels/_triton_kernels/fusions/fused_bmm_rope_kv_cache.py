@@ -4,10 +4,10 @@
 import triton
 import triton.language as tl
 
-from aiter_kernels._triton_kernels.quant.quant import _mxfp4_quant_op
-from aiter_kernels.rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
-from aiter_kernels.utils._triton.kernel_repr import make_kernel_repr
-from aiter_kernels.utils._triton.pid_preprocessing import pid_grid
+from ..._triton_kernels.quant.quant import _mxfp4_quant_op
+from ...rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
+from ...utils._triton.kernel_repr import make_kernel_repr
+from ...utils._triton.pid_preprocessing import pid_grid
 
 _fused_fp4_bmm_rope_cat_and_cache_mla_repr = make_kernel_repr(
     "_fused_fp4_bmm_rope_cat_and_cache_mla_kernel",

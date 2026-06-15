@@ -4,13 +4,13 @@
 from typing import Optional, Union
 import torch
 import triton
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_mul_add import (
+from ...utils.logger import AiterTritonLogger
+from ..._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_mul_add import (
     _fused_gemm_a8w8_blockscale_mul_add_kernel,
     _fused_gemm_a8w8_blockscale_mul_add_reduce_kernel,
     _get_config,
 )
-from aiter_kernels.utils.gemm_config_utils import compute_splitk_params
+from ...utils.gemm_config_utils import compute_splitk_params
 
 _LOGGER = AiterTritonLogger()
 

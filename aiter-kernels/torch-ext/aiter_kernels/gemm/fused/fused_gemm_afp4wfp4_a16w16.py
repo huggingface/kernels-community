@@ -5,17 +5,17 @@ from typing import Optional
 import os
 import torch
 import triton
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_a16w16 import (
+from ...utils.logger import AiterTritonLogger
+from ..._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_a16w16 import (
     _fused_gemm_afp4wfp4_a16w16_kernel,
     _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel,
     _fused_gemm_afp4wfp4_a16w16_reduce_kernel,
     _get_config,
 )
-from aiter_kernels.gemm.basic.gemm_afp4wfp4 import get_splitk
-from aiter_kernels.utils.core import AITER_TRITON_CONFIGS_PATH
+from ...gemm.basic.gemm_afp4wfp4 import get_splitk
+from ...utils.core import AITER_TRITON_CONFIGS_PATH
 
-from aiter_kernels._aiter_compat.triton_metadata_redirect import AOTMetadataContext
+from ..._aiter_compat.triton_metadata_redirect import AOTMetadataContext
 
 _LOGGER = AiterTritonLogger()
 

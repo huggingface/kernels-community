@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels._triton_kernels.moe.moe_align_block_size import (
+from ..utils.logger import AiterTritonLogger
+from .._triton_kernels.moe.moe_align_block_size import (
     _moe_align_block_size_stage1_kernel,
     _moe_align_block_size_stage2_kernel,
     _moe_align_block_size_stage3_kernel,

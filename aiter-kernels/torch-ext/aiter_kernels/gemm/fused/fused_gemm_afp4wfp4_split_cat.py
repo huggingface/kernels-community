@@ -4,14 +4,14 @@
 from typing import Optional
 import torch
 import triton
-from aiter_kernels._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
+from ..._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
     _fused_gemm_afp4wfp4_split_cat,
     _fused_gemm_afp4wfp4_preshuffle_split_cat,
     _fused_gemm_afp4wfp4_split_cat_reduce,
 )
-from aiter_kernels._triton_kernels.gemm.basic.gemm_afp4wfp4 import _get_config
-from aiter_kernels.gemm.basic.gemm_afp4wfp4 import get_splitk
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ..._triton_kernels.gemm.basic.gemm_afp4wfp4 import _get_config
+from ...gemm.basic.gemm_afp4wfp4 import get_splitk
+from ...utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

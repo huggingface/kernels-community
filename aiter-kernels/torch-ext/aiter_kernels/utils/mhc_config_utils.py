@@ -7,9 +7,9 @@ import json
 import os
 import re
 
-from aiter_kernels.utils._triton import arch_info
-from aiter_kernels.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter_kernels.utils.gemm_config_utils import _load_config_file, USE_LRU_CACHE
+from ..utils._triton import arch_info
+from ..utils.core import AITER_TRITON_CONFIGS_PATH
+from ..utils.gemm_config_utils import _load_config_file, USE_LRU_CACHE
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)

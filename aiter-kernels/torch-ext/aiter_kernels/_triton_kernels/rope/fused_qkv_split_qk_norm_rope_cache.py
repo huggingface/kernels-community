@@ -1,6 +1,6 @@
 import triton
 import triton.language as tl
-from aiter_kernels.rope.rope import _get_gptj_rotated_x, _get_neox_rotated_x
+from ...rope.rope import _get_gptj_rotated_x, _get_neox_rotated_x
 
 
 # GAMMA rms norm

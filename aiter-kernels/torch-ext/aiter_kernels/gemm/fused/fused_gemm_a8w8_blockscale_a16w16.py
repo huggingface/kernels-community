@@ -4,12 +4,12 @@
 from typing import Optional
 import torch
 import triton
-from aiter_kernels._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
+from ..._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
     _fused_gemm_a8w8_blockscale_a16w16_kernel,
     _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel,
     _get_config,
 )
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ...utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

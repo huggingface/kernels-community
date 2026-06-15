@@ -4,7 +4,7 @@
 import torch
 import triton
 from typing import Optional
-from aiter_kernels._triton_kernels.normalization.norm import (
+from .._triton_kernels.normalization.norm import (
     _layernorm_kernel,
     _fused_add_layernorm_kernel,
     _quant_layernorm_kernel,
@@ -13,8 +13,8 @@ from aiter_kernels._triton_kernels.normalization.norm import (
     _layernorm_bwd_dwdb_triton,
     _layernorm_bwd_dwdb_triton_v2,
 )
-from aiter_kernels.utils.types import get_dtype_max
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ..utils.types import get_dtype_max
+from ..utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

@@ -25,8 +25,8 @@ tail, and optionally scatter both parts into ``swa_kv``.
 import triton
 import triton.language as tl
 
-from aiter_kernels.utils._triton.kernel_repr import make_kernel_repr
-from aiter_kernels.rope.rope import _get_neox_rotated_x, _get_gptj_rotated_x
+from ...utils._triton.kernel_repr import make_kernel_repr
+from ...rope.rope import _get_neox_rotated_x, _get_gptj_rotated_x
 
 
 @triton.jit

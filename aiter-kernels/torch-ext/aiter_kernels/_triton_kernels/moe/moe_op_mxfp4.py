@@ -3,9 +3,9 @@
 
 import triton
 import triton.language as tl
-from aiter_kernels.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter_kernels.utils._triton.moe_common import _write_zeros_to_output
-from aiter_kernels.utils._triton.kernel_repr import make_kernel_repr
+from ...utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from ...utils._triton.moe_common import _write_zeros_to_output
+from ...utils._triton.kernel_repr import make_kernel_repr
 
 
 def get_scaled_dot_format_string(dtype: tl.dtype):

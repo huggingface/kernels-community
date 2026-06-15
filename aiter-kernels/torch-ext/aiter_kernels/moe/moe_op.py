@@ -5,10 +5,10 @@ import torch
 import triton
 import triton.language as tl
 from typing import Any, Dict, Optional, List
-from aiter_kernels.quant import dynamic_per_tensor_quant_fp8_i8
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels.utils.device_info import get_num_xcds
-from aiter_kernels._triton_kernels.moe.moe_op import (
+from ..quant import dynamic_per_tensor_quant_fp8_i8
+from ..utils.logger import AiterTritonLogger
+from ..utils.device_info import get_num_xcds
+from .._triton_kernels.moe.moe_op import (
     _fused_moe_kernel_gptq_awq,
     _fused_moe_persistent_kernel_gptq_awq,
     _fused_moe_kernel,

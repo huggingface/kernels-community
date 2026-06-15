@@ -9,12 +9,12 @@ from typing import Optional, Tuple
 import torch
 import triton
 
-from aiter_kernels._triton_kernels.fusions.fused_routing_from_topk import (
+from .._triton_kernels.fusions.fused_routing_from_topk import (
     _fused_routing_from_topk_hist_kernel,
     _fused_routing_from_topk_offset_kernel,
     _fused_routing_from_topk_place_kernel,
 )
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ..utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

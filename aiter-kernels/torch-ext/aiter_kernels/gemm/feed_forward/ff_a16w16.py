@@ -3,8 +3,8 @@
 
 from typing import Optional
 import torch
-from aiter_kernels.gemm.basic.gemm_a16w16 import gemm_a16w16
-from aiter_kernels.gemm.basic.gemm_a16w16_gated import gemm_a16w16_gated
+from ...gemm.basic.gemm_a16w16 import gemm_a16w16
+from ...gemm.basic.gemm_a16w16_gated import gemm_a16w16_gated
 
 
 def ff_a16w16_nogate(

@@ -1,8 +1,8 @@
 import triton
 import triton.language as tl
-from aiter_kernels.rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
-from aiter_kernels._triton_kernels.kv_cache import _store_mla_kv_cache
-from aiter_kernels._triton_kernels.quant.quant import _nvfp4_quant_op
+from ...rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
+from ..._triton_kernels.kv_cache import _store_mla_kv_cache
+from ..._triton_kernels.quant.quant import _nvfp4_quant_op
 
 
 @triton.jit

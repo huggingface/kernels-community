@@ -155,10 +155,14 @@ carry out the following steps:
   ```
 - After mirroring, also drop `utils/_triton/tunning/` — those are upstream
   CLI tuning scripts with top-level `argparse` that crash on package import.
-- Rewrite imports to use the local namespace:
-  - `from aiter.ops.triton.<x>` → `from aiter_kernels.<x>`
+- Rewrite imports to use **relative** form. The Hub kernel loader imports the
+  package under the variant directory name (e.g. `torch-rocm/`), not
+  `aiter_kernels/`, so absolute `from aiter_kernels.X` imports break at
+  load time. Apply the global sed pass first to land on a single absolute
+  namespace, then run the depth-aware rewriter to convert to relative:
+  - `from aiter.ops.triton.<x>` → `from aiter_kernels.<x>` (intermediate)
   - `from aiter.ops.triton import <x>` → `from aiter_kernels import <x>`
-  - `import aiter.ops.triton.<x>` → `import aiter_kernels.<x>`
+  - `import aiter.ops.triton.<x> as Y` → `import aiter_kernels.<x> as Y`
   - `from aiter.jit.utils.torch_guard import ...` →
     `from aiter_kernels._aiter_compat.torch_guard import ...`
   - `from aiter.utility.triton.triton_metadata_redirect import ...` →
@@ -167,7 +171,16 @@ carry out the following steps:
     `from aiter_kernels._aiter_compat import dtypes`
   - Bare `import aiter` (with later use of `aiter.dtypes.*`) →
     `from aiter_kernels import _aiter_compat as aiter`
-  These can be applied as one global sed pass across the synced tree.
+  Then convert every absolute `aiter_kernels.X` import to relative form
+  based on the file's depth from the package root. A file at
+  `aiter_kernels/<a>/<b>/.../file.py` needs `(depth + 1)` dots — one for
+  "current package", plus one for each level climbed back to
+  `aiter_kernels/`. Patterns to handle:
+  - `from aiter_kernels.X.Y import Z` → `from <dots>X.Y import Z`
+  - `from aiter_kernels import Z` → `from <dots> import Z`
+  - `import aiter_kernels.X.Y.Z as W` → `from <dots>X.Y import Z as W`
+    (the `import ... as ...` form has no relative equivalent; rewrite as
+    `from ... import ... as ...`)
 - Replace the upstream `aiter/ops/triton/__init__.py` with the local curated
   init — do **not** copy upstream's `__init__.py` over. The local init
   imports the subpackages and exposes `apply_rotary_transformers` via

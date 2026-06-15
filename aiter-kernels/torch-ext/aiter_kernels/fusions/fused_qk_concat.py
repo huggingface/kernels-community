@@ -1,9 +1,9 @@
 import torch
-from aiter_kernels._triton_kernels.fusions.fused_qk_concat import (
+from .._triton_kernels.fusions.fused_qk_concat import (
     _qk_rope_cat_kernel,
     _qk_cat_kernel,
 )
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ..utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

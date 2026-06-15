@@ -4,7 +4,7 @@
 import math
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
-from aiter_kernels.utils._triton.kernel_repr import make_kernel_repr
+from .....utils._triton.kernel_repr import make_kernel_repr
 
 _GLUON_REPR_KEYS = [
     "BLOCK_M",

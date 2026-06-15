@@ -13,13 +13,13 @@ import triton
 import triton.language as tl
 
 
-from aiter_kernels._triton_kernels.topk import (
+from ._triton_kernels.topk import (
     _topk_kernel,
     topk_stage1_kernel,
     topk_stage2_kernel,
 )
-from aiter_kernels.utils._triton.arch_info import is_tdm_avail
-from aiter_kernels.utils.logger import AiterTritonLogger
+from .utils._triton.arch_info import is_tdm_avail
+from .utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

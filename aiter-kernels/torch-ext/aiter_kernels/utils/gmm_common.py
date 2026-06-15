@@ -9,7 +9,7 @@ import torch
 from torch import Tensor
 
 # AITER: logging
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ..utils.logger import AiterTritonLogger
 
 _LOGGER: AiterTritonLogger = AiterTritonLogger()
 

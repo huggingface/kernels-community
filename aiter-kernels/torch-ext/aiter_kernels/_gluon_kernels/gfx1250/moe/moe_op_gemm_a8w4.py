@@ -2,9 +2,9 @@ import torch
 import triton.language as tl
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
-from aiter_kernels.utils._triton.pid_preprocessing import remap_xcd, pid_grid
-from aiter_kernels._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
-from aiter_kernels._triton_kernels.moe.activations import _swiglu
+from ....utils._triton.pid_preprocessing import remap_xcd, pid_grid
+from ...._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
+from ...._triton_kernels.moe.activations import _swiglu
 
 
 def matmul_launch_metadata(grid, kernel, args):

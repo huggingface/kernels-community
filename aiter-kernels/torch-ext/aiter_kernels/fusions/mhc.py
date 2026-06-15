@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 import torch
 import triton
 
-from aiter_kernels._triton_kernels.fusions import (
+from .._triton_kernels.fusions import (
     _mhc_fused_kernel,
     _mhc_fused_split_kernel,
     _mhc_post_kernel,
@@ -13,12 +13,12 @@ from aiter_kernels._triton_kernels.fusions import (
     _mhc_reduce_apply_kernel,
     _mhc_post_pre_reduce_apply_kernel,
 )
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels.utils.mhc_config_utils import (
+from ..utils.logger import AiterTritonLogger
+from ..utils.mhc_config_utils import (
     get_mhc_config,
     get_mhc_post_config,
 )
-import aiter_kernels.utils._triton.arch_info as arch_info
+from ..utils._triton import arch_info as arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
 

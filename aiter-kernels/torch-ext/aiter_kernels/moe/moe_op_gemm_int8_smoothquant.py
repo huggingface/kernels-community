@@ -4,16 +4,16 @@
 import itertools
 import torch
 import triton
-from aiter_kernels.moe.moe_routing.routing import RoutingData
-from aiter_kernels.utils.device_info import get_num_sms
-from aiter_kernels._triton_kernels.moe.moe_op_gemm_int8_smoothquant import (
+from ..moe.moe_routing.routing import RoutingData
+from ..utils.device_info import get_num_sms
+from .._triton_kernels.moe.moe_op_gemm_int8_smoothquant import (
     _moe_gemm_int8_smoothquant,
 )
-from aiter_kernels._gluon_kernels.gfx942.moe.moe_op_gemm_int8_smoothquant import (
+from .._gluon_kernels.gfx942.moe.moe_op_gemm_int8_smoothquant import (
     _gluon_moe_gemm_int8_smoothquant,
 )
-from aiter_kernels.moe.reduce import reduce_grouped
-from aiter_kernels.utils._triton import arch_info
+from ..moe.reduce import reduce_grouped
+from ..utils._triton import arch_info
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter

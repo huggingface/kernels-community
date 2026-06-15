@@ -1,9 +1,9 @@
 from typing import Literal, Optional
 import triton
 import torch
-from aiter_kernels import _aiter_compat as aiter
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels._triton_kernels.activation import (
+from . import _aiter_compat as aiter
+from .utils.logger import AiterTritonLogger
+from ._triton_kernels.activation import (
     _act_mul_and_dynamic_mxfp4_quant_kernel,
     _act_mul_and_dynamic_fp8_group_quant_kernel,
     fused_silu_mul_kernel,

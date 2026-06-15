@@ -3,10 +3,10 @@
 
 import torch
 import triton
-from aiter_kernels._triton_kernels.kv_cache import _cat_and_cache_mla_kernel
-from aiter_kernels._aiter_compat.torch_guard import torch_compile_guard
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels.utils.types import e4m3_dtype
+from ._triton_kernels.kv_cache import _cat_and_cache_mla_kernel
+from ._aiter_compat.torch_guard import torch_compile_guard
+from .utils.logger import AiterTritonLogger
+from .utils.types import e4m3_dtype
 
 _LOGGER = AiterTritonLogger()
 

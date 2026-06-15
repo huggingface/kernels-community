@@ -5,9 +5,9 @@ import functools
 import json
 import triton
 import triton.language as tl
-from aiter_kernels.utils._triton import arch_info
-from aiter_kernels.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter_kernels.utils._triton.kernel_repr import make_kernel_repr
+from ...utils._triton import arch_info
+from ...utils.core import AITER_TRITON_CONFIGS_PATH
+from ...utils._triton.kernel_repr import make_kernel_repr
 
 _routing_sigmoid_top1_repr = make_kernel_repr(
     "_routing_sigmoid_top1_kernel",

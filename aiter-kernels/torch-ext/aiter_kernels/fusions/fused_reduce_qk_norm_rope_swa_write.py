@@ -6,10 +6,10 @@ from typing import Optional
 import torch
 import triton
 
-from aiter_kernels._triton_kernels.fusions.fused_reduce_qk_norm_rope_swa_write import (
+from .._triton_kernels.fusions.fused_reduce_qk_norm_rope_swa_write import (
     _fused_reduce_qk_norm_rope_swa_write_kernel,
 )
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ..utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

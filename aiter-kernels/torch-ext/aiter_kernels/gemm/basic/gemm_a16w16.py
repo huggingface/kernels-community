@@ -4,19 +4,19 @@
 from typing import Optional
 import torch
 import triton
-from aiter_kernels._triton_kernels.gemm.basic.gemm_a16w16 import (
+from ..._triton_kernels.gemm.basic.gemm_a16w16 import (
     _gemm_a16_w16_kernel,
     _get_config as _get_triton_config,
 )
-from aiter_kernels._triton_kernels.common.splitk_reduce import (
+from ..._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
-from aiter_kernels._triton_kernels.activation import _get_activation_from_str
-from aiter_kernels.utils.gemm_config_utils import get_gemm_config
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels.utils._triton.arch_info import get_arch
-from aiter_kernels.utils.common_utils import serialize_dict, deserialize_str
-from aiter_kernels._aiter_compat.torch_guard import torch_compile_guard
+from ..._triton_kernels.activation import _get_activation_from_str
+from ...utils.gemm_config_utils import get_gemm_config
+from ...utils.logger import AiterTritonLogger
+from ...utils._triton.arch_info import get_arch
+from ...utils.common_utils import serialize_dict, deserialize_str
+from ..._aiter_compat.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 
@@ -106,7 +106,7 @@ def gemm_a16w16_(
         assert (
             _is_gluon_available()
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
-        from aiter_kernels._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
+        from ..._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
             _KERNEL_MAP,
             create_shared_layouts,
             create_wmma_layouts,

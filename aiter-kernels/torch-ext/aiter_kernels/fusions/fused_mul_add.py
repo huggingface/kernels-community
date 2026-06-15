@@ -1,8 +1,8 @@
 import torch
 import triton
 from typing import Optional
-from aiter_kernels._triton_kernels.fusions.fused_mul_add import _fused_mul_add_kernel
-from aiter_kernels.utils.logger import AiterTritonLogger
+from .._triton_kernels.fusions.fused_mul_add import _fused_mul_add_kernel
+from ..utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

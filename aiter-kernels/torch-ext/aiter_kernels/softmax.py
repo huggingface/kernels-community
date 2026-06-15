@@ -1,7 +1,7 @@
 import torch
 import triton
-from aiter_kernels._triton_kernels.softmax import _softmax_kernel_online
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ._triton_kernels.softmax import _softmax_kernel_online
+from .utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

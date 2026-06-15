@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 
 import triton
 import torch
-from aiter_kernels._triton_kernels.quant.quant import (
+from .._triton_kernels.quant.quant import (
     _static_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_token_quant_fp8_i8_kernel,
@@ -17,8 +17,8 @@ from aiter_kernels._triton_kernels.quant.quant import (
     _dynamic_nvfp4_quant_kernel,
     _nvfp4_quant_op,
 )
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels.utils.types import e4m3_dtype
+from ..utils.logger import AiterTritonLogger
+from ..utils.types import e4m3_dtype
 
 __all__ = [
     "static_per_tensor_quant_fp8_i8",

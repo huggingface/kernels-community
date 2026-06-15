@@ -3,8 +3,8 @@
 
 from typing import Optional
 import torch
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels.gemm.batched.batched_gemm_a16wfp4 import (
+from ...utils.logger import AiterTritonLogger
+from ...gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
 

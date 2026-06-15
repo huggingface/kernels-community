@@ -4,8 +4,8 @@
 import triton
 import triton.language as tl
 import functools
-from aiter_kernels.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter_kernels.utils.gemm_config_utils import get_gemm_config
+from ....utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from ....utils.gemm_config_utils import get_gemm_config
 
 
 @triton.heuristics(

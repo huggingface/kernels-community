@@ -13,10 +13,10 @@ directly to ``out`` in its native dtype and no scales are produced.
 import triton
 import triton.language as tl
 
-from aiter_kernels._triton_kernels.activation import _apply_activation_from_str
+from ..._triton_kernels.activation import _apply_activation_from_str
 
-from aiter_kernels._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
-from aiter_kernels.utils._triton.kernel_repr import make_kernel_repr
+from ..._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
+from ...utils._triton.kernel_repr import make_kernel_repr
 
 _fused_clamp_silu_mul_repr = make_kernel_repr(
     "_fused_clamp_silu_mul_kernel",

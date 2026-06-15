@@ -4,13 +4,13 @@
 from typing import Optional
 import torch
 import triton
-from aiter_kernels._triton_kernels.gemm.basic.gemm_a16w16_atomic import (
+from ..._triton_kernels.gemm.basic.gemm_a16w16_atomic import (
     _gemm_a16_w16_atomic_kernel,
     _get_config,
 )
-from aiter_kernels.utils.logger import AiterTritonLogger
-from aiter_kernels.utils.common_utils import serialize_dict, deserialize_str
-from aiter_kernels._aiter_compat.torch_guard import torch_compile_guard
+from ...utils.logger import AiterTritonLogger
+from ...utils.common_utils import serialize_dict, deserialize_str
+from ..._aiter_compat.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 

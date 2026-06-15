@@ -1,8 +1,8 @@
 from typing import Optional
 import torch
 import triton
-from aiter_kernels._triton_kernels.moe.reduce import _reduce_grouped
-from aiter_kernels.utils._triton.arch_info import is_tdm_avail
+from .._triton_kernels.moe.reduce import _reduce_grouped
+from ..utils._triton.arch_info import is_tdm_avail
 
 
 def reduce_grouped(

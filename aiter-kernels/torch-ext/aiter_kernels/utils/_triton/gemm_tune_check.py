@@ -1,7 +1,7 @@
 import importlib
 import inspect
 from typing import Optional
-from aiter_kernels.utils.logger import AiterTritonLogger
+from ...utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -17,14 +17,14 @@ def gemm_tune_check(
     This function returns if a AITER Triton GEMM is tunned for a specific shape
 
     example 1: FP4 GEMM preshuffled weight scales for shape (16, 1280, 8192)
-        from aiter_kernels.utils._triton.gemm_tune_check import gemm_tune_check
-        from aiter_kernels.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+        from ...utils._triton.gemm_tune_check import gemm_tune_check
+        from ...gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
         is_tunned = gemm_tune_check(gemm_afp4wfp4_preshuffle, N=1280, K=8192//2, M=16, shuffle=True)
         print(is_tunned) # return True or False
 
     example 2: FP8 GEMM blockscale for shape (16, 1280, 8192)
-        from aiter_kernels.utils._triton.gemm_tune_check import gemm_tune_check
-        from aiter_kernels.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+        from ...utils._triton.gemm_tune_check import gemm_tune_check
+        from ...gemm_a8w8_blockscale import gemm_a8w8_blockscale
         is_tunned = gemm_tune_check(gemm_a8w8_blockscale, N=1024, K=8192, M=16)
         print(is_tunned) # return True or False
     """
