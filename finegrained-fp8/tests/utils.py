@@ -5,7 +5,7 @@ auto-loads it before any test module)."""
 
 import torch
 
-from finegrained_fp8.utils import FP4_SCALE_GROUP_K  # type: ignore
+from finegrained_fp8.utils import MX_SCALE_GROUP_K  # type: ignore
 
 
 # ── Device + capability ───────────────────────────────────────────────────────
@@ -173,11 +173,11 @@ _E2M1_DECODE = (
 def make_fp4_weights(out_features, in_features, device, num_experts=None):
     """Random FP4-packed (E2M1) weights with UE8M0 scales of all-ones.
     ``num_experts`` toggles between 2D (linear) and 3D (MoE experts)."""
-    assert in_features % FP4_SCALE_GROUP_K == 0, (
-        f"K ({in_features}) must be divisible by {FP4_SCALE_GROUP_K} for FP4"
+    assert in_features % MX_SCALE_GROUP_K == 0, (
+        f"K ({in_features}) must be divisible by {MX_SCALE_GROUP_K} for FP4"
     )
     packed_k = in_features // 2
-    n_groups = in_features // FP4_SCALE_GROUP_K
+    n_groups = in_features // MX_SCALE_GROUP_K
     if num_experts is None:
         w_shape = (out_features, packed_k)
         s_shape = (out_features, n_groups)
@@ -194,7 +194,7 @@ def quant_dequant_a_fp4(A: torch.Tensor) -> torch.Tensor:
     per-32-K-group UE8M0 power-of-2 scale (ceil to next pow2 of ``|amax|/448``);
     quantize and multiply back by the same pow2."""
     M, K = A.shape
-    groups = A.float().reshape(M, K // FP4_SCALE_GROUP_K, FP4_SCALE_GROUP_K)
+    groups = A.float().reshape(M, K // MX_SCALE_GROUP_K, MX_SCALE_GROUP_K)
     bits = (groups.abs().amax(dim=-1) / 448.0).contiguous().view(torch.int32)
     exp = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
     s_pow2 = (exp.clamp(1, 254) << 23).view(torch.float32)
@@ -212,7 +212,7 @@ def dequant_b_fp4(B: torch.Tensor, Bs: torch.Tensor) -> torch.Tensor:
         [lut[codes & 0x0F], lut[(codes >> 4) & 0x0F]], dim=-1
     ).reshape(N, K)
     bs_fp32 = (Bs.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
-    return decoded * bs_fp32.repeat_interleave(FP4_SCALE_GROUP_K, dim=-1)
+    return decoded * bs_fp32.repeat_interleave(MX_SCALE_GROUP_K, dim=-1)
 
 
 # ── Unified matmul reference ──────────────────────────────────────────────────

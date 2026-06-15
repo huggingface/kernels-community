@@ -27,10 +27,11 @@ from ._ops import add_op_namespace_prefix, ops
 
 # FP8 (E4M3) is the main format for weights and activations;
 FP8_DTYPE = torch.float8_e4m3fn
-# FP4 (E2M1) packs two 4-bit values per byte; scale factors are UE8M0, one per
-# K-group of 32 elements. These are format constants, not tunables.
-FP4_VALUES_PER_BYTE = 2
-FP4_SCALE_GROUP_K = 32
+# FP4 (E2M1) packs two 4-bit nibbles per byte. MX formats (MXFP4 weights, MXFP8
+# E4M3 weights/activations) share one UE8M0 scale per 32-element K-group — the OCP
+# MX block size, consumed by ``tl.dot_scaled``. Format constants, not tunables.
+NIBBLES_PER_BYTE = 2
+MX_SCALE_GROUP_K = 32
 
 
 # ── Host-side helpers ─────────────────────────────────────────────────────────
@@ -95,32 +96,44 @@ def get_active_device_type() -> str:
         return "cuda"
 
 
-def get_accelerator_autotuning_configs(*, for_mxfp4: bool = False):
+def get_accelerator_autotuning_configs(*, for_mx: bool = False):
     """Return the autotune search grid for the current accelerator policy.
 
-    Always sweeps ``num_warps`` (narrower on XPU) × ``num_stages``. For MXFP4
-    kernels we also pin ``BLOCK_SIZE_N/K`` in each config — fixed on XPU, swept
-    on other backends — so launch sites never need to patch them in post-hoc.
+    Always sweeps ``num_warps`` (narrower on XPU) × ``num_stages``. For MX
+    (``tl.dot_scaled``) kernels we also pin ``BLOCK_SIZE_N/K`` in each config —
+    fixed on XPU, swept on other backends — so launch sites never patch them in.
     """
     is_xpu = get_active_device_type() == "xpu"
     num_warps = [8, 16] if is_xpu else [2, 4, 8, 16]
     num_stages = [2, 3, 4]
 
-    if for_mxfp4:
-        block_sweep = (
-            [(128, 128)]
-            if is_xpu
-            else [(bn, bk) for bn in (64, 128, 256) for bk in (64, 128, 256)]
-        )
+    if for_mx:
+        # MX (tl.dot_scaled) kernels sweep the tile shape since there's no caller
+        # block_size. The CUDA grid is a data-driven prune (B200 sweep over dense
+        # MXFP8 + MoE MXFP4 shapes): every winner used BLOCK_SIZE_K=128 and
+        # num_stages=3, with BLOCK_SIZE_N in {128, 256} and num_warps in {4, 8, 16}
+        # — 256x256 tiles OOM on B200 and BLOCK_SIZE_K=64 never won. Keep that
+        # neighborhood plus num_stages=2 as a low-occupancy fallback (108 -> 12).
+        # XPU is left at its original (128, 128) grid — it wasn't measured.
+        if is_xpu:
+            return [
+                triton.Config(
+                    {"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128},
+                    num_warps=w,
+                    num_stages=s,
+                )
+                for s in num_stages
+                for w in num_warps
+            ]
         return [
             triton.Config(
-                {"BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk},
+                {"BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": 128},
                 num_warps=w,
                 num_stages=s,
             )
-            for bn, bk in block_sweep
-            for s in num_stages
-            for w in num_warps
+            for bn in (128, 256)
+            for w in (4, 8, 16)
+            for s in (2, 3)
         ]
 
     return [
@@ -147,13 +160,13 @@ def fp8_act_quant_inline(a_raw):
 
 
 @triton.jit
-def fp4_act_quant_inline(
+def mx_act_quant_inline(
     a_raw,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
 ):
-    """Inline FP8 (E4M3) activation quant for the W4A8 path.
+    """Inline E4M3 activation quant for the MX paths (W4A8 MXFP4 / W8A8 MXFP8).
 
     Per-row, per-K-group amax → UE8M0 scale (ceil to next power-of-2 via the
     mantissa-nonzero bump trick) → cast values to FP8. Returns ``(a_fp8,
