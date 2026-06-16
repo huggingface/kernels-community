@@ -12,11 +12,11 @@ from utils import (  # type: ignore
     DTYPE_TAG,
     DTYPE_TO_TOL,
     IS_SM90,
-    SUPPORTS_FP4,
+    MX_SCALE_GROUP_K,
     TEST_DEVICE,
     accelerator_module,
-    make_fp4_weights,
     make_fp8_weights,
+    make_fp4_weights,
 )
 
 import finegrained_fp8  # type: ignore
@@ -54,8 +54,10 @@ class Problem:
             f"{self.weight_format}_S{self.S}_E{self.E}_N{self.N}_K{self.K}"
             f"_top{self.TOP_K}"
         )
-        # FP4 ignores block_size (tile shape autotuned); always block-mode.
-        if self.weight_format == "fp4":
+        is_mx = self.weight_format in ("mxfp4", "mxfp8")
+        # MX recipes pin block_size to the 1x32 scale group, so it isn't part of
+        # the id (the kernel fixes the group at 32 and autotunes its compute tile).
+        if is_mx:
             tail = head
         # FP8 with block_size carries block dims; without it, scale_layout names
         # the tensor-mode variant.
@@ -65,7 +67,8 @@ class Problem:
             tail = f"{head}_b{self.block_size[0]}x{self.block_size[1]}"
         contig_tag = "contiguous" if self.contiguous else "noncontiguous"
         tail = f"{tail}_{contig_tag}_{DTYPE_TAG[self.dtype]}"
-        if self.weight_scale_dtype is torch.float8_e8m0fnu:
+        # UE8M0 weight scales — implied by the MX recipe name, tagged only for FP8.
+        if self.weight_scale_dtype is torch.float8_e8m0fnu and not is_mx:
             tail = f"{tail}_ue8m0"
         if self.sentinel_fraction > 0:
             tail = f"{tail}_sentinel"
@@ -229,111 +232,145 @@ PROBLEMS = [
         block_size=(128, 128),
         dtype=torch.float32,
     ),
+    # MX recipes (MXFP4 here; MXFP8 below). DeepSeek-V4-Flash MXFP4 shapes
+    # (E=256, top_k=6); first entry kept small so CI doesn't dwell on the big
+    # ones. block_size is the MX 1x32 scale group used to build the weights
+    # (the kernel fixes the group at 32 and autotunes its compute tile).
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_format="mxfp4",
+    ),
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_format="mxfp4",
+        contiguous=False,
+    ),
+    Problem(
+        S=192,
+        E=256,
+        N=4096,
+        K=4096,
+        TOP_K=6,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_format="mxfp4",
+    ),
+    Problem(
+        S=192,
+        E=256,
+        N=4096,
+        K=2048,
+        TOP_K=6,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_format="mxfp4",
+    ),
+    Problem(
+        S=1536,
+        E=256,
+        N=4096,
+        K=4096,
+        TOP_K=6,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_format="mxfp4",
+    ),
+    # EP sentinel coverage on MXFP4
+    Problem(
+        S=64,
+        E=8,
+        N=256,
+        K=512,
+        TOP_K=4,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_format="mxfp4",
+        sentinel_fraction=0.875,
+    ),
+    # torch.compile compatibility on MXFP4
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_format="mxfp4",
+        compile=True,
+    ),
+    # fp16 / fp32 dtype coverage on the smallest MXFP4 shape
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_format="mxfp4",
+        dtype=torch.float16,
+    ),
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_format="mxfp4",
+        dtype=torch.float32,
+    ),
+    # ── MXFP8 (E4M3 weights + E4M3 act, UE8M0 group-32; block_size ignored) ──
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+        weight_format="mxfp8",
+    ),
+    Problem(
+        S=64,
+        E=8,
+        N=512,
+        K=1024,
+        TOP_K=4,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+        weight_format="mxfp8",
+    ),
+    # non-contiguous indexing tensors on the MXFP8 path
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+        weight_format="mxfp8",
+        contiguous=False,
+    ),
 ]
-if SUPPORTS_FP4:
-    # DeepSeek-V4-Flash FP4 shapes (E=256, top_k=6); first entry kept small so
-    # CI doesn't spend minutes on the larger problems. ``block_size`` is ignored
-    # by the FP4 path (tile shape autotuned).
-    PROBLEMS += [
-        Problem(
-            S=32,
-            E=4,
-            N=256,
-            K=512,
-            TOP_K=2,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-        ),
-        Problem(
-            S=32,
-            E=4,
-            N=256,
-            K=512,
-            TOP_K=2,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-            contiguous=False,
-        ),
-        Problem(
-            S=192,
-            E=256,
-            N=4096,
-            K=4096,
-            TOP_K=6,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-        ),
-        Problem(
-            S=192,
-            E=256,
-            N=4096,
-            K=2048,
-            TOP_K=6,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-        ),
-        Problem(
-            S=1536,
-            E=256,
-            N=4096,
-            K=4096,
-            TOP_K=6,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-        ),
-        # EP sentinel coverage on FP4
-        Problem(
-            S=64,
-            E=8,
-            N=256,
-            K=512,
-            TOP_K=4,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-            sentinel_fraction=0.875,
-        ),
-        # torch.compile compatibility on FP4
-        Problem(
-            S=32,
-            E=4,
-            N=256,
-            K=512,
-            TOP_K=2,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-            compile=True,
-        ),
-        # fp16 / fp32 dtype coverage on the smallest FP4 shape
-        Problem(
-            S=32,
-            E=4,
-            N=256,
-            K=512,
-            TOP_K=2,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-            dtype=torch.float16,
-        ),
-        Problem(
-            S=32,
-            E=4,
-            N=256,
-            K=512,
-            TOP_K=2,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-            dtype=torch.float32,
-        ),
-    ]
 
 
 def _make_routed_inputs(S, E, K, dtype, device, top_k, sentinel_fraction=0.0):
@@ -364,23 +401,6 @@ def _make_routed_inputs(S, E, K, dtype, device, top_k, sentinel_fraction=0.0):
     return selected_hidden_states, expert_ids
 
 
-def _convert_scale_layout(Bs, layout: str):
-    if layout == "block":
-        assert Bs.ndim == 3, "block scale layout expects Bs with shape [E, nb, kb]"
-        return Bs
-
-    if Bs.ndim == 1:
-        per_tensor = Bs.contiguous()
-    else:
-        per_tensor = Bs[:, 0, 0].contiguous()
-
-    if layout == "per_tensor_1d":
-        return per_tensor
-    if layout == "per_tensor_111":
-        return per_tensor.view(-1, 1, 1).contiguous()
-    raise ValueError(f"Unsupported scale layout: {layout}")
-
-
 def _make_noncontig_1d(x: torch.Tensor) -> torch.Tensor:
     # Stride-2 view with duplicated gaps: a stride-1 read returns
     # [x[0], x[0], x[1], x[1], ...] instead of x, catching wrong-stride loads.
@@ -390,31 +410,30 @@ def _make_noncontig_1d(x: torch.Tensor) -> torch.Tensor:
     return base[:, 0]
 
 
-def _setup_problem(problem: Problem, dtype):
+def _setup_problem(problem: Problem):
     A, expert_ids = _make_routed_inputs(
         problem.S,
         problem.E,
         problem.K,
-        dtype=dtype,
+        dtype=problem.dtype,
         device=TEST_DEVICE,
         top_k=problem.TOP_K,
         sentinel_fraction=problem.sentinel_fraction,
     )
-    if problem.weight_format == "fp4":
+    if problem.weight_format.endswith("fp4"):
         B, Bs = make_fp4_weights(
-            problem.N, problem.K, TEST_DEVICE, num_experts=problem.E
+            problem.N, problem.K, TEST_DEVICE, problem.block_size, num_experts=problem.E
         )
     else:
-        B_fp8, Bs_block = make_fp8_weights(
+        B, Bs = make_fp8_weights(
             problem.N,
             problem.K,
             TEST_DEVICE,
             problem.block_size,
             num_experts=problem.E,
             scale_dtype=problem.weight_scale_dtype,
+            scale_layout=problem.scale_layout,
         )
-        Bs = _convert_scale_layout(Bs_block, problem.scale_layout)
-        B = B_fp8
     if not problem.contiguous:
         expert_ids = _make_noncontig_1d(expert_ids)
     return A, expert_ids, B, Bs
@@ -467,7 +486,7 @@ def _assert_correctness(out, ref, expert_ids, problem):
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_batched(problem):
     torch.manual_seed(0)
-    A, expert_ids, B, Bs = _setup_problem(problem, dtype=problem.dtype)
+    A, expert_ids, B, Bs = _setup_problem(problem)
     matmul_batched = finegrained_fp8.matmul_batched
     if problem.compile:
         torch.compiler.reset()
@@ -485,7 +504,7 @@ def test_batched(problem):
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_grouped(problem):
     torch.manual_seed(0)
-    A, expert_ids, B, Bs = _setup_problem(problem, dtype=problem.dtype)
+    A, expert_ids, B, Bs = _setup_problem(problem)
     A_sorted, expert_ids_sorted, offsets, tokens_per_expert = _prepare_grouped(
         A, expert_ids, problem.E, contiguous=problem.contiguous
     )

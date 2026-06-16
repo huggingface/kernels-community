@@ -27,6 +27,7 @@ from .utils import (
     fp8_act_quant_inline,
     get_accelerator_autotuning_configs,
     mx_act_quant_inline,
+    ue8m0_as_uint8,
 )
 
 
@@ -107,7 +108,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
 
 
 @triton.autotune(
-    configs=get_accelerator_autotuning_configs(),
+    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
@@ -259,7 +260,7 @@ def w8a8_block_static_fp8_matmul_kernel(
 
 
 @triton.autotune(
-    configs=get_accelerator_autotuning_configs(for_mx=True),
+    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
@@ -340,7 +341,7 @@ def w4a8_mx_dynamic_fp4_matmul_kernel(
 
 
 @triton.autotune(
-    configs=get_accelerator_autotuning_configs(for_mx=True),
+    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
@@ -456,10 +457,7 @@ def _w8a8_block_dynamic_fp8_matmul(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m(M)
-    # UE8M0 scales: pass as uint8 (Triton binder doesn't recognize
-    # float8_e8m0fnu); kernel decodes 2^(exp-127) inline.
-    if Bs.dtype == torch.float8_e8m0fnu:
-        Bs = Bs.view(torch.uint8)
+    Bs = ue8m0_as_uint8(Bs)
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
     with device_context(A.device):
         wrap_triton(w8a8_block_dynamic_fp8_matmul_kernel)[grid](
@@ -537,10 +535,7 @@ def _w8a8_block_static_fp8_matmul(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m(M)
-    # UE8M0 scales: pass as uint8 (Triton binder doesn't recognize
-    # float8_e8m0fnu); kernel decodes 2^(exp-127) inline.
-    if Bs.dtype == torch.float8_e8m0fnu:
-        Bs = Bs.view(torch.uint8)
+    Bs = ue8m0_as_uint8(Bs)
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
     with device_context(A.device):
         wrap_triton(w8a8_block_static_fp8_matmul_kernel)[grid](
@@ -602,12 +597,13 @@ def _w8a8_tensor_dynamic_fp8_matmul(
     qA, As = fp8_act_quant(A, K)
     As = As.reshape(M)
 
-    BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 128
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m(M)
-    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+    def grid(META):
+        return (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, META["BLOCK_SIZE_N"]))
+
     with device_context(A.device):
         wrap_triton(w8a8_tensor_dynamic_fp8_matmul_kernel)[grid](
             qA,
@@ -625,10 +621,8 @@ def _w8a8_tensor_dynamic_fp8_matmul(
             C.stride(-2),
             C.stride(-1),
             As.stride(0),
-            # Meta-parameters
+            # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
             BLOCK_SIZE_M=BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
             GROUP_SIZE_M=8,
         )
 
@@ -672,7 +666,7 @@ def _w4a8_mx_dynamic_fp4_matmul(
         f"Bs shape {tuple(Bs.shape)} != ({N}, {K // MX_SCALE_GROUP_K})"
     )
 
-    bs_u8 = Bs.view(torch.uint8)
+    bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty((M, N), dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m(M)
 
@@ -742,7 +736,7 @@ def _w8a8_mx_dynamic_fp8_matmul(
         f"Bs shape {tuple(Bs.shape)} != ({N}, {K // MX_SCALE_GROUP_K})"
     )
 
-    bs_u8 = Bs.view(torch.uint8)
+    bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty((M, N), dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m(M)
 

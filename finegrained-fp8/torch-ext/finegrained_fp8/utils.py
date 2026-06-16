@@ -48,6 +48,13 @@ def device_context(device: torch.device):
         yield
 
 
+def ue8m0_as_uint8(scale: torch.Tensor) -> torch.Tensor:
+    """View UE8M0 (``float8_e8m0fnu``) weight scales as ``uint8`` for the Triton
+    binder, which doesn't recognize the dtype; kernels decode ``2^(exp-127)``
+    inline. fp32 (non-UE8M0) scales pass through unchanged."""
+    return scale.view(torch.uint8) if scale.dtype == torch.float8_e8m0fnu else scale
+
+
 def adaptive_block_size_m(target_m: int) -> int:
     """Smallest power-of-2 >= ``target_m``, floored at 16 and capped at 128.
 
@@ -96,22 +103,25 @@ def get_active_device_type() -> str:
         return "cuda"
 
 
-def get_accelerator_autotuning_configs(*, for_mx: bool = False):
+def get_accelerator_autotuning_configs(*, with_block_sizes: bool = False):
     """Autotune search grid for the current accelerator.
 
     ``num_warps``, ``num_stages`` and ``blocks`` (the ``(BLOCK_SIZE_N, BLOCK_SIZE_K)``
-    tile shapes) are fixed up front from ``(is_xpu, for_mx)``, then crossed into the
-    config list. Non-MX kernels take the tile from the caller's ``block_size`` (no
-    sweep, so ``blocks`` is a single empty meta-dict); MX (``tl.dot_scaled``) kernels
-    sweep the tile since there's no caller block_size.
+    tile shapes) are fixed up front from ``(is_xpu, with_block_sizes)``, then crossed
+    into the config list.
 
-    The MX/CUDA grid is a data-driven prune of a B200 sweep across single (BM=128),
+    ``with_block_sizes=True`` sweeps the tile: used by kernels that have no caller
+    ``block_size`` to fix it — the MX ``tl.dot_scaled`` paths AND the tensor-dynamic
+    FP8 paths. ``with_block_sizes=False`` emits a single empty meta-dict (block-scaled
+    kernels take the tile from the caller's ``block_size``).
+
+    The CUDA tile set is a data-driven prune of a B200 sweep across single (BM=128),
     grouped MoE (BM=16/64) and decode (BM=1): winners only ever used these 4 tiles,
     num_warps in {4,8,16}, num_stages in {2,3} (warps=2, stages=4 and 256x256 never
-    won) — 108 → 24.
+    won) — 108 → 24. (Tuned on dot_scaled; tensor-dynamic tl.dot reuses it.)
     """
     is_xpu = get_active_device_type() == "xpu"
-    if for_mx:
+    if with_block_sizes:
         num_stages = [2, 3]
         num_warps = [8, 16] if is_xpu else [4, 8, 16]
         tiles = (
@@ -236,13 +246,20 @@ def grouped_expert_lookup(
 
 
 @triton.jit
-def _fp8_act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
+def _fp8_act_quant_kernel(
+    x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, PADDED_BLOCK: tl.constexpr
+):
+    # ``tl.arange`` needs a power-of-2 length, so iterate over PADDED_BLOCK (the next
+    # power of 2) and mask the tail — lets block_size be non-power-of-2 (e.g. a full
+    # row K=14336 in tensor-mode). Masked lanes load 0, which can't affect ``amax``.
     pid = tl.program_id(axis=0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x = tl.load(x_ptr + offs).to(tl.float32)
+    cols = tl.arange(0, PADDED_BLOCK)
+    mask = cols < BLOCK_SIZE
+    offs = pid * BLOCK_SIZE + cols
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     s = tl.max(tl.abs(x)) / 448.0  # float8_e4m3fn max
     y = (x / tl.maximum(s, 1e-12)).to(y_ptr.dtype.element_ty)
-    tl.store(y_ptr + offs, y)
+    tl.store(y_ptr + offs, y, mask=mask)
     tl.store(s_ptr + pid, s)
 
 
@@ -257,7 +274,9 @@ def _fp8_act_quant(
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
 
     with device_context(x.device):
-        wrap_triton(_fp8_act_quant_kernel)[grid](x, y, s, BLOCK_SIZE=block_size)
+        wrap_triton(_fp8_act_quant_kernel)[grid](
+            x, y, s, BLOCK_SIZE=block_size, PADDED_BLOCK=triton.next_power_of_2(block_size)
+        )
 
     return y, s
 

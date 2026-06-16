@@ -29,6 +29,7 @@ from .utils import (
     get_accelerator_autotuning_configs,
     grouped_expert_lookup,
     grouped_tile_layout,
+    ue8m0_as_uint8,
 )
 
 
@@ -123,7 +124,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
 
 
 @triton.autotune(
-    configs=get_accelerator_autotuning_configs(),
+    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
@@ -210,7 +211,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
 
 
 @triton.autotune(
-    configs=get_accelerator_autotuning_configs(for_mx=True),
+    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
@@ -308,7 +309,7 @@ def w4a8_mx_dynamic_fp4_matmul_grouped_kernel(
 
 
 @triton.autotune(
-    configs=get_accelerator_autotuning_configs(for_mx=True),
+    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
@@ -452,10 +453,7 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
     tile_offsets, max_m_tiles = grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, E
     )
-    # UE8M0 scales: pass as uint8 (Triton binder doesn't recognize
-    # float8_e8m0fnu); kernel decodes 2^(exp-127) inline.
-    if Bs.dtype == torch.float8_e8m0fnu:
-        Bs = Bs.view(torch.uint8)
+    Bs = ue8m0_as_uint8(Bs)
     grid = (max_m_tiles, triton.cdiv(N, block_n))
     with device_context(A.device):
         wrap_triton(w8a8_block_dynamic_fp8_matmul_grouped_kernel)[grid](
@@ -528,15 +526,16 @@ def _w8a8_tensor_dynamic_fp8_matmul_grouped(
             f"Bs shape {tuple(Bs.shape)} != expected ({E}, 1, 1)"
         )
 
-    BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 128
     C = A.new_empty(S, N, dtype=output_dtype)
     qA, As = fp8_act_quant(A, K)
     BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
     tile_offsets, max_m_tiles = grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, E
     )
-    grid = (max_m_tiles, triton.cdiv(N, BLOCK_SIZE_N))
+
+    def grid(META):
+        return (max_m_tiles, triton.cdiv(N, META["BLOCK_SIZE_N"]))
+
     with device_context(A.device):
         wrap_triton(w8a8_tensor_dynamic_fp8_matmul_grouped_kernel)[grid](
             qA,
@@ -560,10 +559,8 @@ def _w8a8_tensor_dynamic_fp8_matmul_grouped(
             Bs.stride(0),
             offsets.stride(0),
             tile_offsets.stride(0),
-            # Meta-parameters
+            # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
             NUM_EXPERTS=E,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
         )
@@ -653,7 +650,7 @@ def _w4a8_mx_dynamic_fp4_matmul_grouped(
         f"Bs shape {tuple(Bs.shape)} != ({E}, {N}, {K // MX_SCALE_GROUP_K})"
     )
 
-    bs_u8 = Bs.view(torch.uint8)
+    bs_u8 = ue8m0_as_uint8(Bs)
     BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
     C = A.new_empty((S, N), dtype=output_dtype)
     tile_offsets, max_m_tiles = grouped_tile_layout(
@@ -754,7 +751,7 @@ def _w8a8_mx_dynamic_fp8_matmul_grouped(
         f"Bs shape {tuple(Bs.shape)} != ({E}, {N}, {K // MX_SCALE_GROUP_K})"
     )
 
-    bs_u8 = Bs.view(torch.uint8)
+    bs_u8 = ue8m0_as_uint8(Bs)
     BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
     C = A.new_empty((S, N), dtype=output_dtype)
     tile_offsets, max_m_tiles = grouped_tile_layout(

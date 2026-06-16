@@ -21,12 +21,12 @@ from ._ops import add_op_namespace_prefix, ops
 from .utils import (
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
-    adaptive_block_size_m,
     device_context,
     mx_act_quant_inline,
     fp8_act_quant,
     fp8_act_quant_inline,
     get_accelerator_autotuning_configs,
+    ue8m0_as_uint8,
 )
 
 
@@ -118,7 +118,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 
 
 @triton.autotune(
-    configs=get_accelerator_autotuning_configs(),
+    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
     key=["N", "K"],
 )
 @triton.jit
@@ -197,7 +197,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 
 
 @triton.autotune(
-    configs=get_accelerator_autotuning_configs(for_mx=True),
+    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
     key=["N", "K"],
 )
 @triton.jit
@@ -281,7 +281,7 @@ def w4a8_mx_dynamic_fp4_matmul_batched_kernel(
 
 
 @triton.autotune(
-    configs=get_accelerator_autotuning_configs(for_mx=True),
+    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
     key=["N", "K"],
 )
 @triton.jit
@@ -405,12 +405,12 @@ def _w8a8_block_dynamic_fp8_matmul_batched(
         f"Bs shape {tuple(Bs.shape)} != expected ({E}, {N // block_n}, {K // block_k})"
     )
 
+    Bs = ue8m0_as_uint8(Bs)
+
+    # Decode handles one routed row per program; BLOCK_SIZE_M > 1 would just
+    # duplicate the same row computation and keep one row on store.
+    BLOCK_SIZE_M = 1
     C = A.new_empty(S, N, dtype=output_dtype)
-    BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
-    # UE8M0 scales: pass as uint8 (Triton binder doesn't recognize
-    # float8_e8m0fnu); kernel decodes 2^(exp-127) inline.
-    if Bs.dtype == torch.float8_e8m0fnu:
-        Bs = Bs.view(torch.uint8)
     grid = (S, triton.cdiv(N, block_n))
     with device_context(A.device):
         wrap_triton(w8a8_block_dynamic_fp8_matmul_batched_kernel)[grid](
@@ -478,12 +478,17 @@ def _w8a8_tensor_dynamic_fp8_matmul_batched(
             f"Bs shape {tuple(Bs.shape)} != expected ({E}, 1, 1)"
         )
 
-    BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 128
-    C = A.new_empty(S, N, dtype=output_dtype)
+    Bs = ue8m0_as_uint8(Bs)
+
+    # Decode handles one routed row per program; BLOCK_SIZE_M > 1 would just
+    # duplicate the same row computation and keep one row on store.
+    BLOCK_SIZE_M = 1
     qA, As = fp8_act_quant(A, K)
-    BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
-    grid = (S, triton.cdiv(N, BLOCK_SIZE_N))
+    C = A.new_empty(S, N, dtype=output_dtype)
+
+    def grid(META):
+        return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
+
     with device_context(A.device):
         wrap_triton(w8a8_tensor_dynamic_fp8_matmul_batched_kernel)[grid](
             qA,
@@ -505,8 +510,6 @@ def _w8a8_tensor_dynamic_fp8_matmul_batched(
             As.stride(0),
             Bs.stride(0),
             expert_ids.stride(0),
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             NUM_EXPERTS=E,
         )
@@ -593,7 +596,7 @@ def _w4a8_mx_dynamic_fp4_matmul_batched(
         f"Bs shape {tuple(Bs.shape)} != ({E}, {N}, {K // MX_SCALE_GROUP_K})"
     )
 
-    bs_u8 = Bs.view(torch.uint8)
+    bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty((S, N), dtype=output_dtype)
     # Decode handles one routed row per program; BLOCK_SIZE_M > 1 would just
     # duplicate the same row computation and keep one row on store.
@@ -684,9 +687,10 @@ def _w8a8_mx_dynamic_fp8_matmul_batched(
         f"Bs shape {tuple(Bs.shape)} != ({E}, {N}, {K // MX_SCALE_GROUP_K})"
     )
 
-    bs_u8 = Bs.view(torch.uint8)
+    bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty((S, N), dtype=output_dtype)
-    # One routed row per program; BLOCK_SIZE_M > 1 would duplicate the row.
+    # Decode handles one routed row per program; BLOCK_SIZE_M > 1 would just
+    # duplicate the same row computation and keep one row on store.
     BLOCK_SIZE_M = 1
 
     def grid(META):
