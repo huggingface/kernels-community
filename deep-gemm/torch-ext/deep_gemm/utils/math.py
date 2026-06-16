@@ -18,7 +18,12 @@ def ceil_to_ue8m0(x: torch.Tensor):
 
 def pack_ue8m0_to_int(x: torch.Tensor):
     assert x.dtype == torch.float and x.size(-1) % 4 == 0
-    assert (x.view(torch.int) & ((1 << 23) - 1) == 0).all()
+    # Note: the upstream debug assert ``(x.view(torch.int) & ((1 << 23) - 1) ==
+    # 0).all()`` was removed — it forces a GPU→CPU readback that kills cudagraph
+    # capture and breaks ``torch.compile(fullgraph=True)`` by introducing an
+    # unbacked symbol during fake-tensor tracing. ``ceil_to_ue8m0`` (the only
+    # caller of this in the kernel pipeline) already guarantees the mantissa is
+    # zero, so the check was debug-only on a path with no real risk.
     return (x.view(torch.int) >> 23).to(torch.uint8).view(torch.int)
 
 
