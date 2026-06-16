@@ -454,11 +454,12 @@ def _w8a8_block_dynamic_fp8_matmul(
 
     BLOCK_SIZE_K = block_k
     BLOCK_SIZE_N = block_n
-    C_shape = A.shape[:-1] + (N,)
-    C = A.new_empty(C_shape, dtype=output_dtype)
-    BLOCK_SIZE_M = adaptive_block_size_m(M)
     Bs = ue8m0_as_uint8(Bs)
+    C_shape = A.shape[:-1] + (N,)
+    BLOCK_SIZE_M = adaptive_block_size_m(M)
+    C = A.new_empty(C_shape, dtype=output_dtype)
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
     with device_context(A.device):
         wrap_triton(w8a8_block_dynamic_fp8_matmul_kernel)[grid](
             A,
@@ -529,14 +530,16 @@ def _w8a8_block_static_fp8_matmul(
         f"Bs shape {tuple(Bs.shape)} != expected ({triton.cdiv(N, block_n)}, {triton.cdiv(K, block_k)})"
     )
 
-    As = As.reshape(1).to(torch.float32)
     BLOCK_SIZE_K = block_k
     BLOCK_SIZE_N = block_n
+    BLOCK_SIZE_M = adaptive_block_size_m(M)
+    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+
+    Bs = ue8m0_as_uint8(Bs)
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
-    BLOCK_SIZE_M = adaptive_block_size_m(M)
-    Bs = ue8m0_as_uint8(Bs)
-    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+    As = As.reshape(1).to(torch.float32)
+
     with device_context(A.device):
         wrap_triton(w8a8_block_static_fp8_matmul_kernel)[grid](
             A,
@@ -589,13 +592,12 @@ def _w8a8_tensor_dynamic_fp8_matmul(
     N, K = B.shape
     M = A.numel() // A.shape[-1]
 
-    # Normalize Bs to (1,)
     assert Bs.numel() == 1, f"Bs must be scalar or (1,), got {tuple(Bs.shape)}"
-    Bs = Bs.reshape(1)
 
     # Per-row scalar activation scale (one per token).
     qA, As = fp8_act_quant(A, K)
     As = As.reshape(M)
+    Bs = Bs.reshape(1)
 
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)

@@ -448,13 +448,14 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
         f"Bs shape {tuple(Bs.shape)} != expected ({E}, {N // block_n}, {K // block_k})"
     )
 
+    Bs = ue8m0_as_uint8(Bs)
     C = A.new_empty(S, N, dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
     tile_offsets, max_m_tiles = grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, E
     )
-    Bs = ue8m0_as_uint8(Bs)
     grid = (max_m_tiles, triton.cdiv(N, block_n))
+
     with device_context(A.device):
         wrap_triton(w8a8_block_dynamic_fp8_matmul_grouped_kernel)[grid](
             A,
@@ -526,8 +527,8 @@ def _w8a8_tensor_dynamic_fp8_matmul_grouped(
             f"Bs shape {tuple(Bs.shape)} != expected ({E}, 1, 1)"
         )
 
-    C = A.new_empty(S, N, dtype=output_dtype)
     qA, As = fp8_act_quant(A, K)
+    C = A.new_empty(S, N, dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
     tile_offsets, max_m_tiles = grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, E
@@ -651,8 +652,8 @@ def _w4a8_mx_dynamic_fp4_matmul_grouped(
     )
 
     bs_u8 = ue8m0_as_uint8(Bs)
-    BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
     C = A.new_empty((S, N), dtype=output_dtype)
+    BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
     tile_offsets, max_m_tiles = grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, E
     )
@@ -752,8 +753,8 @@ def _w8a8_mx_dynamic_fp8_matmul_grouped(
     )
 
     bs_u8 = ue8m0_as_uint8(Bs)
-    BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
     C = A.new_empty((S, N), dtype=output_dtype)
+    BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
     tile_offsets, max_m_tiles = grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, E
     )

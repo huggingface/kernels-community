@@ -405,13 +405,13 @@ def _w8a8_block_dynamic_fp8_matmul_batched(
         f"Bs shape {tuple(Bs.shape)} != expected ({E}, {N // block_n}, {K // block_k})"
     )
 
-    Bs = ue8m0_as_uint8(Bs)
-
     # Decode handles one routed row per program; BLOCK_SIZE_M > 1 would just
     # duplicate the same row computation and keep one row on store.
     BLOCK_SIZE_M = 1
-    C = A.new_empty(S, N, dtype=output_dtype)
+    Bs = ue8m0_as_uint8(Bs)
     grid = (S, triton.cdiv(N, block_n))
+    C = A.new_empty(S, N, dtype=output_dtype)
+
     with device_context(A.device):
         wrap_triton(w8a8_block_dynamic_fp8_matmul_batched_kernel)[grid](
             A,
@@ -478,11 +478,10 @@ def _w8a8_tensor_dynamic_fp8_matmul_batched(
             f"Bs shape {tuple(Bs.shape)} != expected ({E}, 1, 1)"
         )
 
-    Bs = ue8m0_as_uint8(Bs)
-
     # Decode handles one routed row per program; BLOCK_SIZE_M > 1 would just
     # duplicate the same row computation and keep one row on store.
     BLOCK_SIZE_M = 1
+    Bs = ue8m0_as_uint8(Bs)
     qA, As = fp8_act_quant(A, K)
     C = A.new_empty(S, N, dtype=output_dtype)
 
@@ -596,11 +595,11 @@ def _w4a8_mx_dynamic_fp4_matmul_batched(
         f"Bs shape {tuple(Bs.shape)} != ({E}, {N}, {K // MX_SCALE_GROUP_K})"
     )
 
-    bs_u8 = ue8m0_as_uint8(Bs)
-    C = A.new_empty((S, N), dtype=output_dtype)
     # Decode handles one routed row per program; BLOCK_SIZE_M > 1 would just
     # duplicate the same row computation and keep one row on store.
     BLOCK_SIZE_M = 1
+    bs_u8 = ue8m0_as_uint8(Bs)
+    C = A.new_empty((S, N), dtype=output_dtype)
 
     def grid(META):
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
@@ -687,11 +686,11 @@ def _w8a8_mx_dynamic_fp8_matmul_batched(
         f"Bs shape {tuple(Bs.shape)} != ({E}, {N}, {K // MX_SCALE_GROUP_K})"
     )
 
-    bs_u8 = ue8m0_as_uint8(Bs)
-    C = A.new_empty((S, N), dtype=output_dtype)
     # Decode handles one routed row per program; BLOCK_SIZE_M > 1 would just
     # duplicate the same row computation and keep one row on store.
     BLOCK_SIZE_M = 1
+    bs_u8 = ue8m0_as_uint8(Bs)
+    C = A.new_empty((S, N), dtype=output_dtype)
 
     def grid(META):
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
