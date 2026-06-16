@@ -97,49 +97,37 @@ def get_active_device_type() -> str:
 
 
 def get_accelerator_autotuning_configs(*, for_mx: bool = False):
-    """Return the autotune search grid for the current accelerator policy.
+    """Autotune search grid for the current accelerator.
 
-    Always sweeps ``num_warps`` (narrower on XPU) × ``num_stages``. For MX
-    (``tl.dot_scaled``) kernels we also pin ``BLOCK_SIZE_N/K`` in each config —
-    fixed on XPU, swept on other backends — so launch sites never patch them in.
+    ``num_warps``, ``num_stages`` and ``blocks`` (the ``(BLOCK_SIZE_N, BLOCK_SIZE_K)``
+    tile shapes) are fixed up front from ``(is_xpu, for_mx)``, then crossed into the
+    config list. Non-MX kernels take the tile from the caller's ``block_size`` (no
+    sweep, so ``blocks`` is a single empty meta-dict); MX (``tl.dot_scaled``) kernels
+    sweep the tile since there's no caller block_size.
+
+    The MX/CUDA grid is a data-driven prune of a B200 sweep across single (BM=128),
+    grouped MoE (BM=16/64) and decode (BM=1): winners only ever used these 4 tiles,
+    num_warps in {4,8,16}, num_stages in {2,3} (warps=2, stages=4 and 256x256 never
+    won) — 108 → 24.
     """
     is_xpu = get_active_device_type() == "xpu"
-    num_warps = [8, 16] if is_xpu else [2, 4, 8, 16]
-    num_stages = [2, 3, 4]
-
     if for_mx:
-        # MX (tl.dot_scaled) kernels sweep the tile shape since there's no caller
-        # block_size. The CUDA grid is a data-driven prune (B200 sweep over dense
-        # MXFP8 + MoE MXFP4 shapes): every winner used BLOCK_SIZE_K=128 and
-        # num_stages=3, with BLOCK_SIZE_N in {128, 256} and num_warps in {4, 8, 16}
-        # — 256x256 tiles OOM on B200 and BLOCK_SIZE_K=64 never won. Keep that
-        # neighborhood plus num_stages=2 as a low-occupancy fallback (108 -> 12).
-        # XPU is left at its original (128, 128) grid — it wasn't measured.
-        if is_xpu:
-            return [
-                triton.Config(
-                    {"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128},
-                    num_warps=w,
-                    num_stages=s,
-                )
-                for s in num_stages
-                for w in num_warps
-            ]
-        return [
-            triton.Config(
-                {"BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": 128},
-                num_warps=w,
-                num_stages=s,
-            )
-            for bn in (128, 256)
-            for w in (4, 8, 16)
-            for s in (2, 3)
-        ]
+        num_stages = [2, 3]
+        num_warps = [8, 16] if is_xpu else [4, 8, 16]
+        tiles = (
+            [(128, 128)] if is_xpu else [(128, 128), (256, 128), (128, 64), (64, 256)]
+        )
+        blocks = [{"BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk} for bn, bk in tiles]
+    else:
+        num_stages = [2, 3, 4]
+        num_warps = [8, 16] if is_xpu else [2, 4, 8, 16]
+        blocks = [{}]
 
     return [
-        triton.Config({}, num_warps=w, num_stages=s)
-        for s in num_stages
+        triton.Config(b, num_warps=w, num_stages=s)
+        for b in blocks
         for w in num_warps
+        for s in num_stages
     ]
 
 
