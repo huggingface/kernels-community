@@ -55,6 +55,33 @@ def ue8m0_as_uint8(scale: torch.Tensor) -> torch.Tensor:
     return scale.view(torch.uint8) if scale.dtype == torch.float8_e8m0fnu else scale
 
 
+def is_mxfp8(weight: torch.Tensor, scale: torch.Tensor) -> bool:
+    """MXFP8 weight/scale pair: E4M3 weights with UE8M0 group-32 scales — last dim
+    ``scale.shape[-1] == weight.shape[-1] // MX_SCALE_GROUP_K``, matching leading dims.
+    Works for 2D ``(N, K)`` and 3D ``(E, N, K)`` weights. The group-32 layout is what
+    separates MXFP8 from 128-block FP8 (which may also carry UE8M0 scales)."""
+    return (
+        weight.dtype == torch.float8_e4m3fn
+        and scale.dtype == torch.float8_e8m0fnu
+        and scale.ndim == weight.ndim
+        and scale.shape[:-1] == weight.shape[:-1]
+        and scale.shape[-1] == weight.shape[-1] // MX_SCALE_GROUP_K
+    )
+
+
+def is_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
+    """MXFP4 weight/scale pair: packed E2M1 weights (``int8``, two codes/byte) with
+    UE8M0 group-32 scales — ``scale.shape[-1] == weight.shape[-1] * NIBBLES_PER_BYTE //
+    MX_SCALE_GROUP_K`` (unpacked K = ``2 * K_half``), matching leading dims. 2D or 3D."""
+    return (
+        weight.dtype == torch.int8
+        and scale.dtype == torch.float8_e8m0fnu
+        and scale.ndim == weight.ndim
+        and scale.shape[:-1] == weight.shape[:-1]
+        and scale.shape[-1] == weight.shape[-1] * NIBBLES_PER_BYTE // MX_SCALE_GROUP_K
+    )
+
+
 def adaptive_block_size_m(target_m: int) -> int:
     """Smallest power-of-2 >= ``target_m``, floored at 16 and capped at 128.
 

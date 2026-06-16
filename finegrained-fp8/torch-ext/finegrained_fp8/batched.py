@@ -26,6 +26,8 @@ from .utils import (
     fp8_act_quant,
     fp8_act_quant_inline,
     get_accelerator_autotuning_configs,
+    is_mxfp4,
+    is_mxfp8,
     ue8m0_as_uint8,
 )
 
@@ -754,14 +756,11 @@ def matmul_batched(
     - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_dynamic_fp8_matmul_batched``.
     - otherwise → ``w8a8_block_dynamic_fp8_matmul_batched``.
     """
-    if B.dtype == torch.int8:
+    if is_mxfp4(B, Bs):
         return w4a8_mx_dynamic_fp4_matmul_batched(A, B, Bs, expert_ids, A.dtype)
 
-    # MXFP8: E4M3 weights with UE8M0 group-32 scales (Bs shape [E, N, K//32]).
-    if B.dtype == torch.float8_e4m3fn and Bs.dtype == torch.float8_e8m0fnu:
-        E, N, K = B.shape
-        if Bs.ndim == 3 and tuple(Bs.shape) == (E, N, K // MX_SCALE_GROUP_K):
-            return w8a8_mx_dynamic_fp8_matmul_batched(A, B, Bs, expert_ids, A.dtype)
+    if is_mxfp8(B, Bs):
+        return w8a8_mx_dynamic_fp8_matmul_batched(A, B, Bs, expert_ids, A.dtype)
 
     if block_size is None or (
         block_size[0] == B.size(1) and block_size[1] == B.size(2)
