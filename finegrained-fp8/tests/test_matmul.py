@@ -11,10 +11,9 @@ from utils import (  # type: ignore
     DTYPE_TO_TOL,
     MX_SCALE_GROUP_K,
     TEST_DEVICE,
-    accelerator_module,
-    make_fp8_weights,
-    make_fp4_weights,
     make_static_activation_scale,
+    make_weights,
+    maybe_compile,
     ref_matmul,
 )
 
@@ -27,16 +26,24 @@ class Problem:
     N: int
     K: int
     block_size: Optional[Tuple[int, int]] = None
+    weight_dtype: torch.dtype = torch.float8_e4m3fn
     weight_scale_dtype: torch.dtype = torch.float32
     static_activation_scale: bool = False
     dtype: torch.dtype = torch.bfloat16
-    weight_format: str = "fp8"
     compile: bool = False
 
     @property
     def id(self) -> str:
-        head = f"{self.weight_format}_M{self.M}_N{self.N}_K{self.K}"
-        is_mx = self.weight_format in ("mxfp4", "mxfp8")
+        # Recipe label derived from the stored dtype + scale group: packed E2M1 is
+        # MXFP4; E4M3 with a 1x32 group is MXFP8; otherwise plain FP8.
+        is_mx = self.block_size == (1, MX_SCALE_GROUP_K)
+        if self.weight_dtype == torch.int8:
+            fmt = "mxfp4"
+        elif is_mx:
+            fmt = "mxfp8"
+        else:
+            fmt = "fp8"
+        head = f"{fmt}_M{self.M}_N{self.N}_K{self.K}"
         # MX recipes ignore block_size (MX group is fixed at 32; tile autotuned).
         if is_mx:
             tail = head
@@ -94,14 +101,14 @@ PROBLEMS = [
     # group at 32 and autotunes its compute tile). ``tl.dot_scaled`` runs natively
     # on Blackwell, emulated elsewhere. ──
     Problem(
-        M=32, N=256, K=512, block_size=(1, MX_SCALE_GROUP_K), weight_format="mxfp4"
+        M=32, N=256, K=512, block_size=(1, MX_SCALE_GROUP_K), weight_dtype=torch.int8
     ),
     Problem(
         M=32,
         N=256,
         K=512,
         block_size=(1, MX_SCALE_GROUP_K),
-        weight_format="mxfp4",
+        weight_dtype=torch.int8,
         dtype=torch.float16,
     ),
     Problem(
@@ -109,7 +116,7 @@ PROBLEMS = [
         N=256,
         K=512,
         block_size=(1, MX_SCALE_GROUP_K),
-        weight_format="mxfp4",
+        weight_dtype=torch.int8,
         dtype=torch.float32,
     ),
     Problem(
@@ -117,7 +124,7 @@ PROBLEMS = [
         N=256,
         K=512,
         block_size=(1, MX_SCALE_GROUP_K),
-        weight_format="mxfp4",
+        weight_dtype=torch.int8,
         compile=True,
     ),
     # ── MXFP8 (E4M3 weights + E4M3 act, UE8M0 group-32) ──
@@ -127,7 +134,6 @@ PROBLEMS = [
         K=512,
         block_size=(1, MX_SCALE_GROUP_K),
         weight_scale_dtype=torch.float8_e8m0fnu,
-        weight_format="mxfp8",
     ),
     Problem(  # non-aligned N
         M=16,
@@ -135,7 +141,6 @@ PROBLEMS = [
         K=1024,
         block_size=(1, MX_SCALE_GROUP_K),
         weight_scale_dtype=torch.float8_e8m0fnu,
-        weight_format="mxfp8",
     ),
     Problem(
         M=32,
@@ -143,7 +148,6 @@ PROBLEMS = [
         K=512,
         block_size=(1, MX_SCALE_GROUP_K),
         weight_scale_dtype=torch.float8_e8m0fnu,
-        weight_format="mxfp8",
         dtype=torch.float16,
     ),
     Problem(
@@ -152,7 +156,6 @@ PROBLEMS = [
         K=512,
         block_size=(1, MX_SCALE_GROUP_K),
         weight_scale_dtype=torch.float8_e8m0fnu,
-        weight_format="mxfp8",
         dtype=torch.float32,
     ),
     Problem(
@@ -161,7 +164,6 @@ PROBLEMS = [
         K=512,
         block_size=(1, MX_SCALE_GROUP_K),
         weight_scale_dtype=torch.float8_e8m0fnu,
-        weight_format="mxfp8",
         compile=True,
     ),
 ]
@@ -170,21 +172,14 @@ PROBLEMS = [
 def _setup_problem(problem: Problem):
     torch.manual_seed(42)
     A = torch.randn(problem.M, problem.K, dtype=problem.dtype, device=TEST_DEVICE)
-    if problem.weight_format.endswith("fp4"):
-        B, Bs = make_fp4_weights(
-            problem.N,
-            problem.K,
-            TEST_DEVICE,
-            problem.block_size,
-        )
-    else:
-        B, Bs = make_fp8_weights(
-            problem.N,
-            problem.K,
-            TEST_DEVICE,
-            problem.block_size,
-            scale_dtype=problem.weight_scale_dtype,
-        )
+    B, Bs = make_weights(
+        problem.N,
+        problem.K,
+        TEST_DEVICE,
+        problem.block_size,
+        weight_dtype=problem.weight_dtype,
+        scale_dtype=problem.weight_scale_dtype,
+    )
     a_scale = (
         make_static_activation_scale(A) if problem.static_activation_scale else None
     )
@@ -197,11 +192,7 @@ def _setup_problem(problem: Problem):
 def test_matmul(problem: Problem):
     """``matmul`` matches the pure-PyTorch dequant+matmul reference."""
     A, B, Bs, a_scale = _setup_problem(problem)
-    matmul = finegrained_fp8.matmul
-    if problem.compile:
-        torch.compiler.reset()
-        accelerator_module().empty_cache()
-        matmul = torch.compile(matmul, mode="max-autotune", fullgraph=True)
+    matmul = maybe_compile(finegrained_fp8.matmul, problem.compile)
     out = matmul(
         A,
         B,
