@@ -1,9 +1,8 @@
 [general]
 name = "quantization-gptq"
-license = "MIT"
 version = 1
+license = "MIT"
 backends = ["cpu"]
-
 
 [general.hub]
 repo-id = "kernels-community/quantization-gptq"

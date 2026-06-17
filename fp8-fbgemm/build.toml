@@ -1,7 +1,7 @@
 [general]
 name = "fp8-fbgemm"
-license = "BSD-3-Clause"
 version = 1
+license = "BSD-3-Clause"
 backends = [
     "cuda",
     "rocm",
@@ -10,3 +10,7 @@ backends = [
 
 [general.hub]
 repo-id = "kernels-community/fp8-fbgemm"
+
+[torch-noarch]
+
+[kernel]

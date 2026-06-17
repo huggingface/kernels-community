@@ -1,9 +1,8 @@
 [general]
 name = "tinygrad-rms"
-license = "MIT"
 version = 1
+license = "MIT"
 backends = ["cuda"]
-
 
 [general.hub]
 repo-id = "kernels-community/tinygrad-rms"

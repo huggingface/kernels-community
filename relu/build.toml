@@ -1,7 +1,7 @@
 [general]
 name = "relu"
-license = "Apache-2.0"
 version = 1
+license = "Apache-2.0"
 backends = [
     "cpu",
     "cuda",
@@ -9,7 +9,6 @@ backends = [
     "rocm",
     "xpu",
 ]
-
 
 [general.hub]
 repo-id = "kernels-community/relu"
@@ -20,28 +19,15 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
+[kernel.relu_cpu]
+backend = "cpu"
+depends = ["torch"]
+src = ["relu_cpu/relu_cpu.cpp"]
+
 [kernel.activation_xpu]
 backend = "xpu"
 depends = ["torch"]
-src = [
-    "relu_xpu/relu.cpp",
-]
-
-[kernel.activation_metal]
-backend = "metal"
-depends = ["torch"]
-src = [
-    "relu_metal/relu.mm",
-    "relu_metal/relu.metal",
-    "relu_metal/common.h",
-]
-
-[kernel.activation]
-backend = "cuda"
-depends = ["torch"]
-src = [
-    "relu_cuda/relu.cu",
-]
+src = ["relu_xpu/relu.cpp"]
 
 [kernel.activation_rocm]
 backend = "rocm"
@@ -57,11 +43,18 @@ rocm-archs = [
     "gfx1100",
     "gfx1101",
 ]
+src = ["relu_cuda/relu.cu"]
+
+[kernel.activation_metal]
+backend = "metal"
+depends = ["torch"]
 src = [
-    "relu_cuda/relu.cu",
+    "relu_metal/relu.mm",
+    "relu_metal/relu.metal",
+    "relu_metal/common.h",
 ]
 
-[kernel.relu_cpu]
-backend = "cpu"
+[kernel.activation]
+backend = "cuda"
 depends = ["torch"]
-src = ["relu_cpu/relu_cpu.cpp"]
+src = ["relu_cuda/relu.cu"]

@@ -1,7 +1,7 @@
 [general]
 name = "gpt-oss-metal-kernels"
-license = "MIT"
 version = 1
+license = "MIT"
 backends = ["metal"]
 
 [general.hub]
