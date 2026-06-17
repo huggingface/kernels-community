@@ -1,11 +1,11 @@
-"""Shared test helpers: FP8/FP4 weight constructors and dequant references.
+"""Shared test helpers: quantized-weight constructors and dequant references.
 
 The ``finegrained_fp8`` package is on ``sys.path`` via ``conftest.py`` (pytest
 auto-loads it before any test module)."""
 
 import torch
 
-from finegrained_fp8.utils import FP4_SCALE_GROUP_K  # type: ignore
+from finegrained_fp8.utils import MX_SCALE_GROUP_K, NIBBLES_PER_BYTE  # type: ignore
 
 
 # ── Device + capability ───────────────────────────────────────────────────────
@@ -24,9 +24,10 @@ TEST_DEVICE = (
 SUPPORTS_FP8 = TEST_DEVICE == "xpu" or (
     TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() >= (9, 0)
 )
-SUPPORTS_FP4 = TEST_DEVICE == "xpu" or (
-    TEST_DEVICE == "cuda" and torch.cuda.get_device_capability()[0] >= 10
-)
+# The MX paths (MXFP4/MXFP8) need no extra gate: ``tl.dot_scaled`` runs natively on
+# Blackwell (SM100+) and via software emulation (the DecomposeScaledBlocked pass —
+# upcast to bf16/fp16, then a standard MMA) everywhere else. Their only real
+# requirement is FP8 for the E4M3 activation quant, already covered by SUPPORTS_FP8.
 # SM90 (Hopper, e.g. H100) is the only architecture the benchmark baselines
 # are calibrated against — every other SM has its own latency profile.
 IS_SM90 = TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() == (9, 0)
@@ -50,61 +51,137 @@ def accelerator_module():
     raise RuntimeError("No supported accelerator available")
 
 
-# ── FP8 ───────────────────────────────────────────────────────────────────────
+def maybe_compile(fn, enabled):
+    """Wrap ``fn`` in ``torch.compile`` (max-autotune, fullgraph) when ``enabled``,
+    resetting the compiler and clearing the allocator cache first; otherwise return
+    ``fn`` unchanged."""
+    if not enabled:
+        return fn
+    torch.compiler.reset()
+    accelerator_module().empty_cache()
+    return torch.compile(fn, mode="max-autotune", fullgraph=True)
+
+
+# ── Quantized weights ─────────────────────────────────────────────────────────
 
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = torch.finfo(FP8_DTYPE).max
 FP8_MIN = torch.finfo(FP8_DTYPE).min
+E2M1_MAX = 6.0  # largest magnitude on the E2M1 (FP4) grid
+
+# E2M1 decode LUT indexed by raw 4-bit code: high bit is sign, low 3 bits select
+# magnitude from {0, 0.5, 1, 1.5, 2, 3, 4, 6}.
+_E2M1_DECODE = (
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)  # fmt: skip
+# Midpoints between adjacent E2M1 magnitudes: round |x| to the nearest grid index.
+_E2M1_BOUNDARIES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 
 
-def make_fp8_weights(
+def _ue8m0_exp(x):
+    """UE8M0 exponent of the next power-of-2 >= ``x``, clamped to the encodable range
+    [1, 254]; the decoded scale is ``2^(exp - 127)``."""
+    bits = x.contiguous().view(torch.int32)
+    exp = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    return exp.clamp(1, 254)
+
+
+def make_weights(
     out_features,
     in_features,
     device,
     block_size,
-    num_experts=None,
+    *,
+    weight_dtype=FP8_DTYPE,
     scale_dtype=torch.float32,
+    scale_layout="block",
+    num_experts=None,
 ):
-    """Random FP8 weights with block-wise inv-scales. ``num_experts`` toggles 2D
-    (linear) vs 3D (MoE experts). Non-aligned ``out_features``/``in_features``
-    are padded to block boundaries before quantizing, then trimmed back.
+    """Random quantized weights (+ inv-scales) for ``weight_dtype`` via one flow:
+    draw fp32 weights, take a per-block ``amax``, derive an inv-scale (optionally a
+    UE8M0 power-of-2), scale the weights into the target grid's range, and quantize.
+    ``weight_dtype`` is the stored element type — the same axis the kernel ``matmul``
+    dispatcher routes on (``B.dtype``), not the recipe label.
 
-    ``scale_dtype`` selects the inv-scale storage:
-    - ``torch.float32`` (default): standard per-block fp32 scales.
-    - ``torch.float8_e8m0fnu``: UE8M0 (DSv4-Flash style) — inv-scales snapped
-      up to the nearest power-of-2 and re-quantization done against the snapped
-      scale so dequant exactly matches storage.
+    ``num_experts`` toggles 2D (linear) vs 3D (MoE experts); non-aligned dims are
+    padded to block boundaries before quantizing, then trimmed back.
+
+    - ``torch.float8_e4m3fn`` (FP8 / MXFP8): one E4M3 byte per value; ``scale_dtype``
+      picks fp32 or UE8M0 block inv-scales, laid out per ``scale_layout`` (block /
+      per_tensor_1d / per_tensor_111, 3D only).
+    - ``torch.int8`` (packed E2M1 = FP4): two codes per byte, always with per-row
+      UE8M0 group scales — ``block_n`` must be 1, and ``scale_dtype`` / ``scale_layout``
+      are forced to UE8M0 / block.
     """
+    is_fp4 = weight_dtype == torch.int8  # packed E2M1 (FP4); else E4M3 (FP8)
     is_2d = num_experts is None
     E = 1 if is_2d else num_experts
+
+    if is_fp4:
+        block_n, block_k = block_size
+        assert block_n == 1, (
+            f"E2M1 scales are per-row; block_n must be 1, got {block_n}"
+        )
+        assert in_features % block_k == 0, (
+            f"K ({in_features}) must be divisible by block_k ({block_k})"
+        )
+        scale_dtype, scale_layout, qmax = torch.float8_e8m0fnu, "block", E2M1_MAX
+    else:
+        block_n, block_k = (
+            block_size if block_size is not None else (out_features, in_features)
+        )
+        qmax = FP8_MAX
+
     W = torch.randn(E, out_features, in_features, dtype=torch.float32, device=device)
-    block_n, block_k = (
-        block_size if block_size is not None else (out_features, in_features)
-    )
-    pad_n = (-out_features) % block_n
-    pad_k = (-in_features) % block_k
+    pad_n, pad_k = (-out_features) % block_n, (-in_features) % block_k
     W = torch.nn.functional.pad(W, [0, pad_k, 0, pad_n])
     Np, Kp = out_features + pad_n, in_features + pad_k
     R = W.reshape(E, Np // block_n, block_n, Kp // block_k, block_k)
     max_abs = R.abs().amax(dim=(-3, -1))
     safe = torch.where(max_abs > 0, max_abs, torch.ones_like(max_abs))
-    inv_scales = (safe / FP8_MAX).to(torch.float32)
+    inv_scales = (safe / qmax).to(torch.float32)
 
     if scale_dtype == torch.float8_e8m0fnu:
-        # Snap inv_scales up to next power-of-2 (UE8M0 encoding: 2^(exp-127)).
-        bits = inv_scales.contiguous().view(torch.int32)
-        exp_ceil = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
-        exp_ceil = exp_ceil.clamp(1, 254)
+        # Snap inv_scales up to the next power-of-2 (UE8M0 encoding: 2^(exp-127)).
+        exp_ceil = _ue8m0_exp(inv_scales)
         inv_scales = (exp_ceil << 23).view(torch.float32)
 
-    scale = 1.0 / inv_scales
-    Wq = (R * scale.unsqueeze(-1).unsqueeze(-3)).clamp(FP8_MIN, FP8_MAX).to(FP8_DTYPE)
-    Wq = Wq.reshape(E, Np, Kp)[:, :out_features, :in_features].contiguous()
+    # Scale weights into the grid's range, then trim padding back off.
+    scaled = (R * (1.0 / inv_scales).unsqueeze(-1).unsqueeze(-3)).reshape(E, Np, Kp)
+    scaled = scaled[:, :out_features, :in_features]
+
+    if is_fp4:
+        # Round |scaled| to the nearest E2M1 magnitude index, re-apply the sign, then
+        # pack two 4-bit codes per byte (low nibble = even K, per ``dequant_b_fp4``).
+        boundaries = torch.tensor(_E2M1_BOUNDARIES, device=device)
+        codes = torch.bucketize(scaled.abs(), boundaries).to(torch.uint8)
+        codes |= (scaled < 0).to(torch.uint8) << 3
+        Wq = (codes[..., 0::2] | (codes[..., 1::2] << 4)).view(torch.int8).contiguous()
+    else:
+        Wq = scaled.clamp(FP8_MIN, FP8_MAX).to(FP8_DTYPE).contiguous()
 
     if scale_dtype == torch.float8_e8m0fnu:
         inv_scales = exp_ceil.to(torch.uint8).view(torch.float8_e8m0fnu)
 
-    return (Wq.squeeze(0), inv_scales.squeeze(0)) if is_2d else (Wq, inv_scales)
+    if is_2d:  # linear weights always carry block-layout scales
+        return Wq.squeeze(0), inv_scales.squeeze(0)
+    return Wq, _apply_scale_layout(inv_scales, scale_layout)
+
+
+def _apply_scale_layout(Bs, layout):
+    """Reshape 3D block inv-scales ``[E, n_blocks, k_blocks]`` into the layout the
+    MoE kernels expect. ``block`` is a no-op; ``per_tensor_1d`` / ``per_tensor_111``
+    take the first block's scale per expert (problems that use these set
+    ``block_size=None``, so there is exactly one block to take)."""
+    if layout == "block":
+        return Bs
+    per_tensor = Bs[:, 0, 0].contiguous()  # [E]
+    if layout == "per_tensor_1d":
+        return per_tensor
+    if layout == "per_tensor_111":
+        return per_tensor.view(-1, 1, 1).contiguous()
+    raise ValueError(f"Unsupported scale layout: {layout}")
 
 
 def make_static_activation_scale(A: torch.Tensor) -> torch.Tensor:
@@ -113,121 +190,70 @@ def make_static_activation_scale(A: torch.Tensor) -> torch.Tensor:
     return (A.abs().amax() / 448.0).clamp(min=1e-12).to(torch.float32)
 
 
-def quant_dequant_a_fp8(
-    A: torch.Tensor, block_k: int, scale: torch.Tensor | None = None
-) -> torch.Tensor:
-    """Mirror the FP8 kernel's inline act-quant in fp32.
+# ── Dequant / activation-quant references ─────────────────────────────────────
 
-    Dynamic (``scale=None``): per-row, per-block_k fp32 scale = ``amax / 448``;
-    quantize and multiply back. Static (scalar ``scale``): use the given
-    calibration scale for the whole tensor.
+
+def quant_dequant_a(
+    A: torch.Tensor,
+    block_k: int,
+    *,
+    scale: torch.Tensor | None = None,
+    pow2_scale: bool = False,
+) -> torch.Tensor:
+    """Mirror a kernel's inline activation quant→dequant round-trip in fp32.
+
+    Static (scalar ``scale``): quantize the whole tensor against the given
+    calibration scale. Dynamic (``scale=None``): per-row, per-``block_k`` scale =
+    ``amax / 448``, snapped up to the next power of two when ``pow2_scale`` (UE8M0,
+    the MX recipe) else kept fp32; quantize to E4M3 and scale back.
     """
     if scale is not None:
         A_fp8 = (A.float() / scale).to(FP8_DTYPE)
         return A_fp8.float() * scale
     M, K = A.shape
     groups = A.float().reshape(M, K // block_k, block_k)
-    s = groups.abs().amax(dim=-1) / 448.0
-    A_fp8 = (groups / s.unsqueeze(-1).clamp(min=1e-12)).to(FP8_DTYPE)
-    return (A_fp8.float() * s.unsqueeze(-1)).reshape(M, K)
+    s = groups.abs().amax(dim=-1, keepdim=True) / 448.0
+    if pow2_scale:
+        s = (_ue8m0_exp(s) << 23).view(torch.float32)
+    A_fp8 = (groups / s.clamp(min=1e-12)).to(FP8_DTYPE)
+    return (A_fp8.float() * s).reshape(M, K)
 
 
-def dequant_b_fp8(
+def dequant_b(
     B: torch.Tensor, Bs: torch.Tensor, block_n: int, block_k: int
 ) -> torch.Tensor:
-    """Per-block FP8 weight dequant via broadcasted block scales. ``Bs`` may be
-    ``float32`` or ``float8_e8m0fnu`` (UE8M0; decoded as ``2^(exp - 127)``)."""
+    """Per-block weight dequant. ``B`` is E4M3 (one value/byte) or packed E2M1
+    (``int8``, two codes/byte = FP4); ``Bs`` is fp32 or UE8M0 (``2^(exp - 127)``)
+    block inv-scales, broadcast over ``block_n`` rows × ``block_k`` cols."""
+    if B.dtype == torch.int8:  # packed E2M1 (FP4): two codes per byte
+        N, K_half = B.shape
+        lut = torch.tensor(_E2M1_DECODE, dtype=torch.float32, device=B.device)
+        codes = B.to(torch.uint8).long()
+        B_vals = torch.stack(
+            [lut[codes & 0x0F], lut[(codes >> 4) & 0x0F]], dim=-1
+        ).reshape(N, K_half * NIBBLES_PER_BYTE)
+    else:
+        B_vals = B.float()
     if Bs.dtype == torch.float8_e8m0fnu:
         Bs = (Bs.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
-    N, K = B.shape
+    N, K = B_vals.shape
     scales_full = Bs.repeat_interleave(block_n, dim=0).repeat_interleave(
         block_k, dim=1
     )[:N, :K]
-    return B.float() * scales_full
-
-
-# ── FP4 (E2M1 + UE8M0) ────────────────────────────────────────────────────────
-
-# E2M1 decode LUT indexed by raw 4-bit code: high bit is sign, low 3 bits select
-# magnitude from {0, 0.5, 1, 1.5, 2, 3, 4, 6}.
-_E2M1_DECODE = (
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-    0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-)
-
-
-def make_fp4_weights(out_features, in_features, device, num_experts=None):
-    """Random FP4-packed (E2M1) weights with UE8M0 scales of all-ones.
-    ``num_experts`` toggles between 2D (linear) and 3D (MoE experts)."""
-    assert in_features % FP4_SCALE_GROUP_K == 0, (
-        f"K ({in_features}) must be divisible by {FP4_SCALE_GROUP_K} for FP4"
-    )
-    packed_k = in_features // 2
-    n_groups = in_features // FP4_SCALE_GROUP_K
-    if num_experts is None:
-        w_shape = (out_features, packed_k)
-        s_shape = (out_features, n_groups)
-    else:
-        w_shape = (num_experts, out_features, packed_k)
-        s_shape = (num_experts, out_features, n_groups)
-    weights = torch.randint(-8, 8, w_shape, dtype=torch.int8, device=device)
-    scales = torch.ones(s_shape, dtype=torch.float8_e8m0fnu, device=device)
-    return weights.contiguous(), scales.contiguous()
-
-
-def quant_dequant_a_fp4(A: torch.Tensor) -> torch.Tensor:
-    """Mirror the FP4 kernel's inline act-quant round-trip in fp32: per-row,
-    per-32-K-group UE8M0 power-of-2 scale (ceil to next pow2 of ``|amax|/448``);
-    quantize and multiply back by the same pow2."""
-    M, K = A.shape
-    groups = A.float().reshape(M, K // FP4_SCALE_GROUP_K, FP4_SCALE_GROUP_K)
-    bits = (groups.abs().amax(dim=-1) / 448.0).contiguous().view(torch.int32)
-    exp = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
-    s_pow2 = (exp.clamp(1, 254) << 23).view(torch.float32)
-    A_fp8 = (groups / s_pow2.unsqueeze(-1).clamp(min=1e-12)).to(FP8_DTYPE)
-    return (A_fp8.float() * s_pow2.unsqueeze(-1)).reshape(M, K)
-
-
-def dequant_b_fp4(B: torch.Tensor, Bs: torch.Tensor) -> torch.Tensor:
-    """Decode packed E2M1 ``int8`` weights, apply UE8M0 K-group scales."""
-    N, K_half = B.shape
-    K = K_half * 2
-    lut = torch.tensor(_E2M1_DECODE, dtype=torch.float32, device=B.device)
-    codes = B.to(torch.uint8).long()
-    decoded = torch.stack(
-        [lut[codes & 0x0F], lut[(codes >> 4) & 0x0F]], dim=-1
-    ).reshape(N, K)
-    bs_fp32 = (Bs.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
-    return decoded * bs_fp32.repeat_interleave(FP4_SCALE_GROUP_K, dim=-1)
+    return B_vals * scales_full
 
 
 # ── Unified matmul reference ──────────────────────────────────────────────────
 
 
 def ref_matmul(A, B, Bs, block_size, output_dtype=torch.float32, activation_scale=None):
-    """Pure-PyTorch reference for ``matmul``: quant+dequant both sides, fp32
-    matmul, cast to output. Dispatches on ``B.dtype``. ``activation_scale``
-    selects the static-quant path (single calibration scalar on FP8)."""
-    if B.dtype == torch.int8:
-        A_deq = quant_dequant_a_fp4(A)
-        B_deq = dequant_b_fp4(B, Bs)
-    else:
-        N, K = B.shape
-        block_n, block_k = block_size if block_size is not None else (N, K)
-        A_deq = quant_dequant_a_fp8(A, block_k, scale=activation_scale)
-        B_deq = dequant_b_fp8(B, Bs, block_n, block_k)
+    """Pure-PyTorch reference for ``matmul``: dequant both sides, fp32 matmul, cast.
+    ``block_size`` is the weight scale block: ``(1, 32)`` marks the MX recipes (per-row
+    UE8M0 group-32 → power-of-2 activation quant), any other shape / ``None`` is FP8.
+    ``dequant_b`` decodes E2M1 vs E4M3 weights by ``B.dtype``; ``activation_scale``
+    (FP8 only) selects static quant."""
+    is_mx = block_size == (1, MX_SCALE_GROUP_K)
+    block_n, block_k = block_size if block_size is not None else B.shape
+    A_deq = quant_dequant_a(A, block_k, scale=activation_scale, pow2_scale=is_mx)
+    B_deq = dequant_b(B, Bs, block_n, block_k)
     return (A_deq @ B_deq.T).to(output_dtype)
