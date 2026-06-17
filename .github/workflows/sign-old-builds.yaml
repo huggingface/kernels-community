@@ -61,7 +61,7 @@ jobs:
             done
 
             # Add digest to metadata.json files.
-            nix run -L github:huggingface/kernels#kernel-builder -- hash "$kernel"
+            ( cd "$kernel" && nix run -L github:huggingface/kernels#kernel-builder -- hash )
 
             # Sign metadata.json for each variant.
             for metadata_file in "$kernel"/build/*/metadata.json; do
