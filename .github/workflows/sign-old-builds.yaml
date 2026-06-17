@@ -53,6 +53,16 @@ jobs:
             snapshot_download('$REPO_PREFIX/$kernel', repo_type='kernel', local_dir='.')
             " )
 
+            # Ensure every build variant (identified by __init__.py) has a metadata.json.
+            for variant_dir in "$kernel"/build/*/; do
+              [ -d "$variant_dir" ] || continue
+              # Note: the glob above includes trailing slash in the output.
+              [ -f "${variant_dir}__init__.py" ] || continue
+              if [ ! -f "${variant_dir}metadata.json" ]; then
+                echo "{}" > "${variant_dir}metadata.json"
+              fi
+            done
+
             # Add digest to metadata.json files.
             nix run -L github:huggingface/kernels#kernel-builder -- hash "$kernel"
 
