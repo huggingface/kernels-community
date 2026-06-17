@@ -899,6 +899,8 @@ def matmul_2d(
     With ``activation_scale`` set, the kernel uses that per-tensor scalar
     (static quant); otherwise it computes its own scale from ``A`` (dynamic).
 
+    ``output_dtype`` defaults to ``A.dtype``.
+
     Routes by weight dtype and ``block_size``:
     - ``B.dtype == int8`` (packed FP4) → ``w4a8_mx_dynamic_fp4_matmul``
       (``block_size`` is ignored; FP4 scale granularity is fixed at 32 and

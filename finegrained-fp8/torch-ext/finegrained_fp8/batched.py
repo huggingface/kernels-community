@@ -740,9 +740,12 @@ def matmul_batched(
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
     block_size: list[int] | None,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Batched quantized matmul dispatcher (W8A8 FP8 or W4A8 FP4). Routes one
     routed row per program to ``B[expert_ids[s]]``.
+
+    ``output_dtype`` defaults to ``A.dtype``.
 
     Routes by weight dtype and ``block_size``:
     - ``B.dtype == int8`` (packed FP4) → ``w4a8_mx_dynamic_fp4_matmul_batched``
@@ -753,14 +756,18 @@ def matmul_batched(
     - otherwise → ``w8a8_block_dynamic_fp8_matmul_batched``.
     """
     if is_mxfp4(B, Bs):
-        return w4a8_mx_dynamic_fp4_matmul_batched(A, B, Bs, expert_ids, A.dtype)
+        return w4a8_mx_dynamic_fp4_matmul_batched(A, B, Bs, expert_ids, output_dtype)
 
     if is_mxfp8(B, Bs):
-        return w8a8_mx_dynamic_fp8_matmul_batched(A, B, Bs, expert_ids, A.dtype)
+        return w8a8_mx_dynamic_fp8_matmul_batched(A, B, Bs, expert_ids, output_dtype)
 
     if block_size is None or (
         block_size[0] == B.size(1) and block_size[1] == B.size(2)
     ):
-        return w8a8_tensor_dynamic_fp8_matmul_batched(A, B, Bs, expert_ids)
+        return w8a8_tensor_dynamic_fp8_matmul_batched(
+            A, B, Bs, expert_ids, output_dtype
+        )
 
-    return w8a8_block_dynamic_fp8_matmul_batched(A, B, Bs, expert_ids, block_size)
+    return w8a8_block_dynamic_fp8_matmul_batched(
+        A, B, Bs, expert_ids, block_size, output_dtype
+    )

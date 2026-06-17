@@ -914,9 +914,12 @@ def matmul_grouped(
     offsets: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     block_size: list[int] | None,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Grouped quantized matmul dispatcher (W8A8 FP8 or W4A8 FP4). Tokens must
     be sorted by expert; M-tiles are mapped to experts via ``offsets``.
+
+    ``output_dtype`` defaults to ``A.dtype``.
 
     Routes by weight dtype and ``block_size``:
     - ``B.dtype == int8`` (packed FP4) → ``w4a8_mx_dynamic_fp4_matmul_grouped``
@@ -928,21 +931,21 @@ def matmul_grouped(
     """
     if is_mxfp4(B, Bs):
         return w4a8_mx_dynamic_fp4_matmul_grouped(
-            A, B, Bs, offsets, tokens_per_expert, A.dtype
+            A, B, Bs, offsets, tokens_per_expert, output_dtype
         )
 
     if is_mxfp8(B, Bs):
         return w8a8_mx_dynamic_fp8_matmul_grouped(
-            A, B, Bs, offsets, tokens_per_expert, A.dtype
+            A, B, Bs, offsets, tokens_per_expert, output_dtype
         )
 
     if block_size is None or (
         block_size[0] == B.size(1) and block_size[1] == B.size(2)
     ):
         return w8a8_tensor_dynamic_fp8_matmul_grouped(
-            A, B, Bs, offsets, tokens_per_expert
+            A, B, Bs, offsets, tokens_per_expert, output_dtype
         )
 
     return w8a8_block_dynamic_fp8_matmul_grouped(
-        A, B, Bs, offsets, tokens_per_expert, block_size
+        A, B, Bs, offsets, tokens_per_expert, block_size, output_dtype
     )
