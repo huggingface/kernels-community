@@ -48,10 +48,7 @@ jobs:
             echo "::group::$kernel"
 
             # Download existing kernel artifacts from the Hub (kernel repo type).
-            ( cd "$kernel" && uvx --with huggingface_hub python3 -c "
-            from huggingface_hub import snapshot_download
-            snapshot_download('$REPO_PREFIX/$kernel', repo_type='kernel', local_dir='.')
-            " )
+            ( cd "$kernel" && uvx --with huggingface_hub python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$REPO_PREFIX/$kernel', repo_type='kernel', local_dir='.')" )
 
             # Ensure every build variant (identified by __init__.py) has a metadata.json.
             for variant_dir in "$kernel"/build/*/; do
