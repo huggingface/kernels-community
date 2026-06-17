@@ -74,6 +74,11 @@ jobs:
               cosign sign-blob "$metadata_file" --bundle "${metadata_file}.sigstore" --yes
             done
 
+
+            # Make it get the right card.
+            nix run -L github:huggingface/kernels#kernel-builder -- \
+              fill-card "$kernel" "$kernel"/build/CARD.md
+
             # Upload signed artifacts back to the Hub (kernel repo type).
             ( cd "$kernel" && nix run -L github:huggingface/kernels#kernel-builder -- \
                 upload --repo-type kernel --repo-id "$REPO_PREFIX/$kernel" )
