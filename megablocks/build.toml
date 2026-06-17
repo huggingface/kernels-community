@@ -1,14 +1,13 @@
 [general]
 name = "megablocks"
-license = "Apache-2.0"
 version = 1
+license = "Apache-2.0"
 backends = [
     "cuda",
     "rocm",
     "xpu",
     "cpu",
 ]
-
 
 [general.hub]
 repo-id = "kernels-community/megablocks"
@@ -55,26 +54,32 @@ src = [
     "csrc/grouped_gemm/grouped_gemm.h",
 ]
 
-[kernel.megablocks_rocm]
-backend = "rocm"
-rocm-archs = [
-    "gfx942",
-    "gfx950",
+[kernel.megablocks_cpu_avx512]
+backend = "cpu"
+cxx-flags = [
+    "-O3",
+    "-mfma",
+    "-fopenmp",
+    "-mf16c",
+    "-mavx512f",
+    "-mavx512bf16",
+    "-mavx512vl",
+    "-mavx512dq",
+    "-mavx512bw",
+    "-mavx512vbmi",
+    "-mamx-tile",
+    "-mamx-bf16",
+    "-mamx-int8",
 ]
-depends = [
-    "torch",
-]
+depends = ["torch"]
+include = ["csrc_cpu"]
 src = [
-    "csrc/cumsum.h",
-    "csrc/cumsum.cu",
-    "csrc/histogram.h",
-    "csrc/histogram.cu",
-    "csrc/indices.h",
-    "csrc/indices.cu",
-    "csrc/replicate.h",
-    "csrc/replicate.cu",
-    "csrc/sort.h",
-    "csrc/sort.cu",
+    "csrc_cpu/common.h",
+    "csrc_cpu/registration.h",
+    "csrc_cpu/moe_ops.h",
+    "csrc_cpu/cpu_moe_kernel.cpp",
+    "csrc_cpu/cpu_moe_fp.cpp",
+    "csrc_cpu/cpu_moe_int8.cpp",
 ]
 
 [kernel.megablocks_xpu]
@@ -110,9 +115,7 @@ src = [
 
 [kernel.megablocks_cpu]
 backend = "cpu"
-depends = [
-    "torch",
-]
+depends = ["torch"]
 include = ["csrc_cpu"]
 src = [
     "csrc_cpu/cpu_features.hpp",
@@ -122,32 +125,22 @@ src = [
     "csrc_cpu/moe_fallback.cpp",
 ]
 
-[kernel.megablocks_cpu_avx512]
-backend = "cpu"
-cxx-flags = [
-    "-O3",
-    "-mfma",
-    "-fopenmp",
-    "-mf16c",
-    "-mavx512f",
-    "-mavx512bf16",
-    "-mavx512vl",
-    "-mavx512dq",
-    "-mavx512bw",
-    "-mavx512vbmi",
-    "-mamx-tile",
-    "-mamx-bf16",
-    "-mamx-int8",
+[kernel.megablocks_rocm]
+backend = "rocm"
+depends = ["torch"]
+rocm-archs = [
+    "gfx942",
+    "gfx950",
 ]
-depends = [
-    "torch",
-]
-include = ["csrc_cpu"]
 src = [
-    "csrc_cpu/common.h",
-    "csrc_cpu/registration.h",
-    "csrc_cpu/moe_ops.h",
-    "csrc_cpu/cpu_moe_kernel.cpp",
-    "csrc_cpu/cpu_moe_fp.cpp",
-    "csrc_cpu/cpu_moe_int8.cpp",
+    "csrc/cumsum.h",
+    "csrc/cumsum.cu",
+    "csrc/histogram.h",
+    "csrc/histogram.cu",
+    "csrc/indices.h",
+    "csrc/indices.cu",
+    "csrc/replicate.h",
+    "csrc/replicate.cu",
+    "csrc/sort.h",
+    "csrc/sort.cu",
 ]

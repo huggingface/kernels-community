@@ -1,7 +1,7 @@
 [general]
 name = "gpt-oss-triton-kernels"
-license = "MIT"
 version = 1
+license = "MIT"
 backends = [
     "cuda",
     "rocm",
@@ -11,5 +11,7 @@ backends = [
 
 [general.hub]
 repo-id = "kernels-community/gpt-oss-triton-kernels"
+
+[torch-noarch]
 
 [kernel]

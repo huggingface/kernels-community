@@ -1,9 +1,8 @@
 [general]
 name = "punica-sgmv"
-license = "Apache-2.0"
 version = 1
+license = "Apache-2.0"
 backends = ["cuda"]
-
 
 [general.hub]
 repo-id = "kernels-community/punica-sgmv"
@@ -12,17 +11,6 @@ repo-id = "kernels-community/punica-sgmv"
 src = [
     "torch-ext/torch_binding.cpp",
     "torch-ext/torch_binding.h",
-]
-
-[kernel.sgmv]
-backend = "cuda"
-depends = [
-    "cutlass_3_8",
-    "torch",
-]
-src = [
-    "sgmv/sgmv_cutlass.cu",
-    "sgmv/sgmv_cutlass.cuh",
 ]
 
 [kernel.bgmv]
@@ -68,6 +56,17 @@ src = [
     "sgmv_flashinfer/sgmv_all.cu",
     "sgmv_flashinfer/sgmv_config.h",
     "sgmv_flashinfer/sgmv_flashinfer.cuh",
+]
+
+[kernel.sgmv]
+backend = "cuda"
+depends = [
+    "cutlass_3_8",
+    "torch",
+]
+src = [
+    "sgmv/sgmv_cutlass.cu",
+    "sgmv/sgmv_cutlass.cuh",
 ]
 
 [kernel.punica_kernels]

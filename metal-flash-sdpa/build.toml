@@ -1,9 +1,8 @@
 [general]
 name = "metal-flash-sdpa"
-license = "Apache-2.0"
 version = 1
+license = "Apache-2.0"
 backends = ["metal"]
-
 
 [general.hub]
 repo-id = "kernels-community/metal-flash-sdpa"

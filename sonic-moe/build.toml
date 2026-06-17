@@ -1,14 +1,18 @@
 [general]
 name = "sonic-moe"
+version = 1
 license = "Apache-2.0"
 backends = ["cuda"]
-version = 1
 python-depends = ["tvm-ffi"]
+
+[general.cuda]
+minver = "12.9"
+python-depends = ["nvidia-cutlass-dsl"]
 
 [general.hub]
 repo-id = "kernels-community/sonic-moe"
 branch = "ep-support"
 
-[general.cuda]
-minver = "12.9"
-python-depends = ["nvidia-cutlass-dsl"]
+[torch-noarch]
+
+[kernel]

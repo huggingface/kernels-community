@@ -1,7 +1,7 @@
 {
   description = "Flake for Torch kernel extension";
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/torch-2.12";
+    kernel-builder.url = "github:huggingface/kernels";
   };
   outputs =
     { self, kernel-builder }:
@@ -9,14 +9,14 @@
       inherit self;
       path = ./.;
 
-    torchVersions =
-      let
-        # For CPU builds, only x86_64-linux is currently supported.
-        cpuSupported = version: system: !(version ? "cpu") || system == "x86_64-linux";
-      in
-      allVersions:
-      builtins.map (
-        version: version // { systems = builtins.filter (cpuSupported version) version.systems; }
-      ) allVersions;
+      torchVersions =
+        let
+          # For CPU builds, only x86_64-linux is currently supported.
+          cpuSupported = version: system: !(version ? "cpu") || system == "x86_64-linux";
+        in
+        allVersions:
+        builtins.map (
+          version: version // { systems = builtins.filter (cpuSupported version) version.systems; }
+        ) allVersions;
     };
 }
