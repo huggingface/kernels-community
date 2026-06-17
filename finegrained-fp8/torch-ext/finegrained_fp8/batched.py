@@ -21,6 +21,7 @@ from ._ops import add_op_namespace_prefix, ops
 from .utils import (
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
+    decode_ue8m0_scale,
     device_context,
     mx_act_quant_inline,
     fp8_act_quant,
@@ -30,6 +31,59 @@ from .utils import (
     is_mxfp8,
     ue8m0_as_uint8,
 )
+
+
+@triton.jit
+def _expert_setup(
+    A,
+    B,
+    C,
+    Bs,
+    ExpertIds,
+    stride_am,
+    stride_be,
+    stride_cm,
+    stride_bs_e,
+    stride_eid,
+):
+    """Per-(row, expert) prologue shared by the batched kernels: read the program
+    ids, look up the routed expert, and advance the A/B/C/Bs base pointers to this
+    row's slice. Returns ``(batch_id, pid_n, expert_id, A, B, C, Bs)``.
+
+    The caller must early-return on the EP sentinel (``expert_id >= NUM_EXPERTS``)
+    before any load — the pointer arithmetic itself is harmless, only the loads on a
+    non-local expert would be out of bounds."""
+    batch_id = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    # Cast to int64 to prevent overflow on expert_id * stride_be.
+    expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
+    A = A + batch_id * stride_am
+    B = B + expert_id * stride_be
+    C = C + batch_id * stride_cm
+    Bs = Bs + expert_id * stride_bs_e
+    return batch_id, pid_n, expert_id, A, B, C, Bs
+
+
+@triton.jit
+def _store_row(
+    C,
+    accumulator,
+    pid_n,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """Output epilogue shared by the batched kernels (``C`` already advanced to the
+    row). The fake-batch trick aliases all ``BLOCK_SIZE_M`` lanes to the same C row,
+    so a plain store would issue ``BLOCK_SIZE_M`` duplicate-address writes — benign on
+    NVIDIA WGMMA (last-write-wins of identical bytes) but hardware-undefined on Intel
+    XPU, where it corrupts the output. Mask so only lane 0 stores; the accumulator
+    rows are mathematically identical (same A row × same B), so lane 0 is correct."""
+    c = accumulator.to(C.dtype.element_ty)
+    offs_cm = tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + offs_cm[:, None] * 0 + stride_cn * offs_cn[None, :]
+    tl.store(c_ptrs, c, mask=(offs_cm == 0)[:, None])
 
 
 @triton.autotune(
@@ -70,19 +124,12 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     Each program handles one routed token row and one N-tile, looks up the
     owning expert from ``ExpertIds``, and applies fused activation quantization.
     """
-    batch_id = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-
-    # Cast to int64 to prevent overflow on expert_id * stride_be.
-    expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
+    _, pid_n, expert_id, A, B, C, Bs = _expert_setup(
+        A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
+    )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
     if expert_id >= NUM_EXPERTS:
         return
-
-    A = A + batch_id * stride_am
-    B = B + expert_id * stride_be
-    C = C + batch_id * stride_cm
-    Bs = Bs + expert_id * stride_bs_e
 
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -96,27 +143,13 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         a_raw = tl.load(a_ptrs).to(tl.float32)
         a, a_s = fp8_act_quant_inline(a_raw)
         b = tl.load(b_ptrs)
-        b_s = tl.load(bs_ptrs)
-        if b_s.dtype == tl.uint8:
-            # UE8M0 decode: value = 2^(exp - 127); build the fp32 bit pattern.
-            b_s = (b_s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += stride_bs_k
 
-    c = accumulator.to(C.dtype.element_ty)
-
-    offs_cm = tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + offs_cm[:, None] * 0 + stride_cn * offs_cn[None, :]
-    # Fake-batch trick aliases all BLOCK_SIZE_M lanes to the same C row, so emitting
-    # `tl.store(c_ptrs, c)` issues BLOCK_SIZE_M duplicate-address stores. On NVIDIA
-    # WGMMA this is usually benign (last-write-wins of identical bytes), but on Intel
-    # XPU the duplicate-address store has hardware-undefined behavior and corrupts the
-    # output. Mask so only lane 0 stores — the (M, N) accumulator rows are
-    # mathematically identical (same A row × same B), so lane 0 holds the right value.
-    tl.store(c_ptrs, c, mask=(offs_cm == 0)[:, None])
+    _store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
 @triton.autotune(
@@ -157,18 +190,12 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     Activations are already quantized; the kernel applies per-token activation
     scales and per-expert tensor weight scales.
     """
-    batch_id = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-
-    expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
+    batch_id, pid_n, expert_id, A, B, C, Bs = _expert_setup(
+        A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
+    )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
     if expert_id >= NUM_EXPERTS:
         return
-
-    A = A + batch_id * stride_am
-    B = B + expert_id * stride_be
-    C = C + batch_id * stride_cm
-    Bs = Bs + expert_id * stride_bs_e
 
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -188,14 +215,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 
     accumulator = accumulator * a_s * b_s
 
-    c = accumulator.to(C.dtype.element_ty)
-
-    offs_cm = tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + offs_cm[:, None] * 0 + stride_cn * offs_cn[None, :]
-    # See block-FP8 kernel above: BLOCK_SIZE_M lanes alias the same C row;
-    # mask so only lane 0 stores to avoid hardware-undefined duplicate writes on XPU.
-    tl.store(c_ptrs, c, mask=(offs_cm == 0)[:, None])
+    _store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
 @triton.autotune(
@@ -239,19 +259,12 @@ def w4a8_mx_dynamic_fp4_matmul_batched_kernel(
     owning expert from ``ExpertIds``, quantizes ``A`` to FP8 per K-group inline
     (UE8M0 scale), then ``tl.dot_scaled`` against packed FP4 weights.
     """
-    batch_id = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-
-    # Cast to int64 to prevent overflow on expert_id * stride_be.
-    expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
+    _, pid_n, expert_id, A, B, C, Bs = _expert_setup(
+        A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
+    )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
     if expert_id >= NUM_EXPERTS:
         return
-
-    A = A + batch_id * stride_am
-    B = B + expert_id * stride_be
-    C = C + batch_id * stride_cm
-    Bs = Bs + expert_id * stride_bs_e
 
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -269,17 +282,12 @@ def w4a8_mx_dynamic_fp4_matmul_batched_kernel(
         )
         b = tl.load(b_ptrs).to(tl.uint8)
         b_s = tl.load(bs_ptrs).to(tl.uint8)
-        accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1", acc=accumulator)
+        accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1")
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // NIBBLES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
-    offs_cm = tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + offs_cm[:, None] * 0 + stride_cn * offs_cn[None, :]
-    # See block-FP8 batched kernel above: BLOCK_SIZE_M lanes alias the same C row;
-    # mask so only lane 0 stores to avoid hardware-undefined duplicate writes on XPU.
-    tl.store(c_ptrs, accumulator.to(C.dtype.element_ty), mask=(offs_cm == 0)[:, None])
+    _store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
 @triton.autotune(
@@ -323,19 +331,12 @@ def w8a8_mx_dynamic_fp8_matmul_batched_kernel(
     (UE8M0 scale), then ``tl.dot_scaled`` against E4M3 weights. Mirrors the
     batched MXFP4 kernel but with unpacked weights and ``"e4m3"`` on both operands.
     """
-    batch_id = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-
-    # Cast to int64 to prevent overflow on expert_id * stride_be.
-    expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
+    _, pid_n, expert_id, A, B, C, Bs = _expert_setup(
+        A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
+    )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
     if expert_id >= NUM_EXPERTS:
         return
-
-    A = A + batch_id * stride_am
-    B = B + expert_id * stride_be
-    C = C + batch_id * stride_cm
-    Bs = Bs + expert_id * stride_bs_e
 
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -352,17 +353,12 @@ def w8a8_mx_dynamic_fp8_matmul_batched_kernel(
         )
         b = tl.load(b_ptrs)
         b_s = tl.load(bs_ptrs).to(tl.uint8)
-        accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3", acc=accumulator)
+        accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3")
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
-    offs_cm = tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + offs_cm[:, None] * 0 + stride_cn * offs_cn[None, :]
-    # See block-FP8 batched kernel above: BLOCK_SIZE_M lanes alias the same C row;
-    # mask so only lane 0 stores to avoid hardware-undefined duplicate writes on XPU.
-    tl.store(c_ptrs, accumulator.to(C.dtype.element_ty), mask=(offs_cm == 0)[:, None])
+    _store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
 @triton_op(

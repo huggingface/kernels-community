@@ -452,7 +452,7 @@ def _prepare_grouped(A, expert_ids, num_experts, contiguous: bool = True):
 
 
 def _routed_matmul_ref(A, B, Bs, expert_ids, block_size):
-    """Per-routed-row reference that re-uses the neutral ``matmul`` dispatcher
+    """Per-routed-row reference that re-uses the neutral ``matmul_2d`` dispatcher
     (it routes by weight dtype / scale layout: MXFP4, MXFP8, or block/tensor FP8).
     Output dtype matches the batched/grouped kernels (both follow ``A.dtype``). Rows
     with ``expert_ids[i] >= num_experts`` are EP sentinels — skipped, output undefined."""
@@ -464,7 +464,7 @@ def _routed_matmul_ref(A, B, Bs, expert_ids, block_size):
         e = int(expert_ids[i])
         if e >= E:
             continue
-        out[i] = finegrained_fp8.matmul(A[i : i + 1], B[e], Bs[e], block_size)
+        out[i] = finegrained_fp8.matmul_2d(A[i : i + 1], B[e], Bs[e], block_size)
     return out
 
 

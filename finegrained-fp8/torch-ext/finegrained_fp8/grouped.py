@@ -27,12 +27,108 @@ from .utils import (
     fp8_act_quant,
     fp8_act_quant_inline,
     get_accelerator_autotuning_configs,
-    grouped_expert_lookup,
-    grouped_tile_layout,
     is_mxfp4,
     is_mxfp8,
     ue8m0_as_uint8,
+    decode_ue8m0_scale,
 )
+
+
+def grouped_tile_layout(
+    tokens_per_expert: torch.Tensor,
+    block_size_m: int,
+    S: int,
+    E: int,
+) -> tuple[torch.Tensor, int]:
+    """Compute the M-tile layout for the grouped kernels.
+
+    Returns ``(tile_offsets, max_m_tiles)``:
+    - ``tile_offsets``: int32 (E,) cumulative tile-end per expert, used by
+      ``_grouped_tile_setup`` to locate an M-tile's owning expert.
+    - ``max_m_tiles``: upper bound on total M-tiles, used as the grid axis-0
+      size. Real tile count <= this; surplus programs early-return inside the
+      kernel. Keeps the grid data-independent (cuda-graph / torch.compile safe).
+    """
+    tiles_per_expert = (tokens_per_expert + block_size_m - 1) // block_size_m
+    tile_offsets = torch.cumsum(tiles_per_expert, dim=0).to(torch.int32)
+    max_m_tiles = triton.cdiv(S, block_size_m) + E
+    return tile_offsets, max_m_tiles
+
+
+@triton.jit
+def _grouped_tile_setup(
+    pid_m,
+    pid_n,
+    Offsets,
+    TileOffsets,
+    stride_offs,
+    stride_tile,
+    NUM_EXPERTS: tl.constexpr,
+    NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """Map a grouped M-tile to its expert and build the per-tile offset vectors —
+    the prologue shared by every grouped kernel.
+
+    Returns ``(expert_id, offs_global_m, row_mask, offs_bn, offs_k)``:
+    - ``expert_id``: int64 owning expert
+    - ``offs_global_m``: ``(BLOCK_SIZE_M,)`` global row indices into A
+    - ``row_mask``: ``(BLOCK_SIZE_M,)`` validity mask within the expert's M
+    - ``offs_bn``: ``(BLOCK_SIZE_N,)`` output column offsets
+    - ``offs_k``: ``(BLOCK_SIZE_K,)`` K range
+
+    Caller must have early-returned if ``pid_m`` exceeds total_tiles
+    (``TileOffsets[(NUM_EXPERTS - 1) * stride_tile]``) — the ``Offsets`` load below
+    is out of bounds for an out-of-range tile otherwise.
+    """
+    # Binary search: upper_bound(TileOffsets, pid_m). NUM_EXPERTS_BIT_LENGTH is
+    # ceil(log2(E))+1, giving one harmless extra iteration; constexpr so the
+    # loop unrolls.
+    lo = 0
+    hi = NUM_EXPERTS
+    for _ in tl.static_range(NUM_EXPERTS_BIT_LENGTH):
+        mid = (lo + hi) >> 1
+        mid_val = tl.load(TileOffsets + mid * stride_tile)
+        is_left = mid_val <= pid_m
+        lo = tl.where(is_left, mid + 1, lo)
+        hi = tl.where(is_left, hi, mid)
+    # Cast to int64 so ``expert_id * stride_be`` doesn't overflow for large E
+    # × large weight matrices (e.g. 255 * 9_437_184 > 2^31).
+    expert_id = lo.to(tl.int64)
+
+    prev_eid = tl.maximum(expert_id - 1, 0)
+    expert_start = tl.where(
+        expert_id == 0, 0, tl.load(Offsets + prev_eid * stride_offs)
+    )
+    expert_end = tl.load(Offsets + expert_id * stride_offs)
+    M_expert = expert_end - expert_start
+
+    expert_tile_start = tl.where(
+        expert_id == 0, 0, tl.load(TileOffsets + prev_eid * stride_tile)
+    )
+    local_tile = pid_m - expert_tile_start
+    m_off = local_tile * BLOCK_SIZE_M
+
+    offs_am = m_off + tl.arange(0, BLOCK_SIZE_M)
+    row_mask = offs_am < M_expert
+    offs_global_m = expert_start + offs_am
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    return expert_id, offs_global_m, row_mask, offs_bn, offs_k
+
+
+@triton.jit
+def _store_tile(
+    C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn
+):
+    """Output epilogue shared by the grouped kernels: cast the fp32 accumulator to
+    ``C``'s dtype and store the tile at expert-sorted global rows ``offs_global_m`` ×
+    columns ``offs_bn``, masked to the expert's valid rows (``row_mask``)."""
+    c = accumulator.to(C.dtype.element_ty)
+    c_ptrs = C + stride_cm * offs_global_m[:, None] + stride_cn * offs_bn[None, :]
+    tl.store(c_ptrs, c, mask=row_mask[:, None])
 
 
 @triton.autotune(
@@ -83,8 +179,9 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     if pid_m >= total_tiles:
         return
 
-    expert_id, offs_global_m, row_mask = grouped_expert_lookup(
+    expert_id, offs_global_m, row_mask, offs_bn, offs_k = _grouped_tile_setup(
         pid_m,
+        pid_n,
         Offsets,
         TileOffsets,
         stride_offs,
@@ -92,9 +189,9 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         NUM_EXPERTS,
         NUM_EXPERTS_BIT_LENGTH,
         BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K,
     )
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = (
@@ -110,19 +207,15 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
         a, a_s = fp8_act_quant_inline(a_raw)
         b = tl.load(b_ptrs)
-        b_s = tl.load(bs_ptrs)
-        if b_s.dtype == tl.uint8:
-            # UE8M0 decode: value = 2^(exp - 127); build the fp32 bit pattern.
-            b_s = (b_s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += stride_bs_k
 
-    c = accumulator.to(C.dtype.element_ty)
-    c_ptrs = C + stride_cm * offs_global_m[:, None] + stride_cn * offs_bn[None, :]
-    c_mask = row_mask[:, None]
-    tl.store(c_ptrs, c, mask=c_mask)
+    _store_tile(
+        C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn
+    )
 
 
 @triton.autotune(
@@ -173,8 +266,9 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     if pid_m >= total_tiles:
         return
 
-    expert_id, offs_global_m, row_mask = grouped_expert_lookup(
+    expert_id, offs_global_m, row_mask, offs_bn, offs_k = _grouped_tile_setup(
         pid_m,
+        pid_n,
         Offsets,
         TileOffsets,
         stride_offs,
@@ -182,9 +276,9 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         NUM_EXPERTS,
         NUM_EXPERTS_BIT_LENGTH,
         BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K,
     )
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = (
@@ -206,10 +300,9 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
     accumulator = accumulator * a_s[:, None] * b_s
 
-    c = accumulator.to(C.dtype.element_ty)
-    c_ptrs = C + stride_cm * offs_global_m[:, None] + stride_cn * offs_bn[None, :]
-    c_mask = row_mask[:, None]
-    tl.store(c_ptrs, c, mask=c_mask)
+    _store_tile(
+        C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn
+    )
 
 
 @triton.autotune(
@@ -263,8 +356,9 @@ def w4a8_mx_dynamic_fp4_matmul_grouped_kernel(
     if pid_m >= total_tiles:
         return
 
-    expert_id, offs_global_m, row_mask = grouped_expert_lookup(
+    expert_id, offs_global_m, row_mask, offs_bn, offs_k = _grouped_tile_setup(
         pid_m,
+        pid_n,
         Offsets,
         TileOffsets,
         stride_offs,
@@ -272,9 +366,9 @@ def w4a8_mx_dynamic_fp4_matmul_grouped_kernel(
         NUM_EXPERTS,
         NUM_EXPERTS_BIT_LENGTH,
         BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K,
     )
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
     offs_k_byte = tl.arange(0, BLOCK_SIZE_K // NIBBLES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
 
@@ -300,14 +394,14 @@ def w4a8_mx_dynamic_fp4_matmul_grouped_kernel(
         )
         b = tl.load(b_ptrs).to(tl.uint8)
         b_s = tl.load(bs_ptrs).to(tl.uint8)
-        accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1", acc=accumulator)
+        accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1")
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // NIBBLES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
-    c_ptrs = C + stride_cm * offs_global_m[:, None] + stride_cn * offs_bn[None, :]
-    c_mask = row_mask[:, None]
-    tl.store(c_ptrs, accumulator.to(C.dtype.element_ty), mask=c_mask)
+    _store_tile(
+        C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn
+    )
 
 
 @triton.autotune(
@@ -361,8 +455,9 @@ def w8a8_mx_dynamic_fp8_matmul_grouped_kernel(
     if pid_m >= total_tiles:
         return
 
-    expert_id, offs_global_m, row_mask = grouped_expert_lookup(
+    expert_id, offs_global_m, row_mask, offs_bn, offs_k = _grouped_tile_setup(
         pid_m,
+        pid_n,
         Offsets,
         TileOffsets,
         stride_offs,
@@ -370,9 +465,9 @@ def w8a8_mx_dynamic_fp8_matmul_grouped_kernel(
         NUM_EXPERTS,
         NUM_EXPERTS_BIT_LENGTH,
         BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K,
     )
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
 
     a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
@@ -397,14 +492,14 @@ def w8a8_mx_dynamic_fp8_matmul_grouped_kernel(
         )
         b = tl.load(b_ptrs)
         b_s = tl.load(bs_ptrs).to(tl.uint8)
-        accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3", acc=accumulator)
+        accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3")
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
-    c_ptrs = C + stride_cm * offs_global_m[:, None] + stride_cn * offs_bn[None, :]
-    c_mask = row_mask[:, None]
-    tl.store(c_ptrs, accumulator.to(C.dtype.element_ty), mask=c_mask)
+    _store_tile(
+        C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn
+    )
 
 
 @triton_op(

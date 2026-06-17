@@ -14,7 +14,6 @@
 
 import functools
 from contextlib import contextmanager
-from typing import Tuple
 
 import torch
 import triton
@@ -91,27 +90,6 @@ def adaptive_block_size_m(target_m: int) -> int:
     ``(S + E - 1) // E`` (avg tokens per expert) for batched/grouped.
     """
     return min(max(triton.next_power_of_2(target_m), 16), 128)
-
-
-def grouped_tile_layout(
-    tokens_per_expert: torch.Tensor,
-    block_size_m: int,
-    S: int,
-    E: int,
-) -> Tuple[torch.Tensor, int]:
-    """Compute the M-tile layout for grouped kernels.
-
-    Returns ``(tile_offsets, max_m_tiles)``:
-    - ``tile_offsets``: int32 (E,) cumulative tile-end per expert, used by
-      ``grouped_expert_lookup`` to locate an M-tile's owning expert.
-    - ``max_m_tiles``: upper bound on total M-tiles, used as the grid axis-0
-      size. Real tile count <= this; surplus programs early-return inside the
-      kernel. Keeps the grid data-independent (cuda-graph / torch.compile safe).
-    """
-    tiles_per_expert = (tokens_per_expert + block_size_m - 1) // block_size_m
-    tile_offsets = torch.cumsum(tiles_per_expert, dim=0).to(torch.int32)
-    max_m_tiles = triton.cdiv(S, block_size_m) + E
-    return tile_offsets, max_m_tiles
 
 
 @functools.cache
@@ -215,58 +193,15 @@ def mx_act_quant_inline(
 
 
 @triton.jit
-def grouped_expert_lookup(
-    pid_m,
-    Offsets,
-    TileOffsets,
-    stride_offs,
-    stride_tile,
-    NUM_EXPERTS: tl.constexpr,
-    NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-):
-    """Locate the expert owning a grouped-kernel M-tile and compute row offsets.
-
-    Returns ``(expert_id, offs_global_m, row_mask)``:
-    - ``expert_id``: int64
-    - ``offs_global_m``: ``(BLOCK_SIZE_M,)`` global row indices into A
-    - ``row_mask``: ``(BLOCK_SIZE_M,)`` validity mask within the expert's M
-
-    Caller is expected to have already early-returned if ``pid_m`` exceeds
-    ``total_tiles`` (``TileOffsets[(NUM_EXPERTS - 1) * stride_tile]``).
-    """
-    # Binary search: upper_bound(TileOffsets, pid_m). NUM_EXPERTS_BIT_LENGTH is
-    # ceil(log2(E))+1, giving one harmless extra iteration; constexpr so the
-    # loop unrolls.
-    lo = 0
-    hi = NUM_EXPERTS
-    for _ in tl.static_range(NUM_EXPERTS_BIT_LENGTH):
-        mid = (lo + hi) >> 1
-        mid_val = tl.load(TileOffsets + mid * stride_tile)
-        is_left = mid_val <= pid_m
-        lo = tl.where(is_left, mid + 1, lo)
-        hi = tl.where(is_left, hi, mid)
-    # Cast to int64 so ``expert_id * stride_be`` doesn't overflow for large E
-    # × large weight matrices (e.g. 255 * 9_437_184 > 2^31).
-    expert_id = lo.to(tl.int64)
-
-    prev_eid = tl.maximum(expert_id - 1, 0)
-    expert_start = tl.where(
-        expert_id == 0, 0, tl.load(Offsets + prev_eid * stride_offs)
-    )
-    expert_end = tl.load(Offsets + expert_id * stride_offs)
-    M_expert = expert_end - expert_start
-
-    expert_tile_start = tl.where(
-        expert_id == 0, 0, tl.load(TileOffsets + prev_eid * stride_tile)
-    )
-    local_tile = pid_m - expert_tile_start
-    m_off = local_tile * BLOCK_SIZE_M
-
-    offs_am = m_off + tl.arange(0, BLOCK_SIZE_M)
-    row_mask = offs_am < M_expert
-    offs_global_m = expert_start + offs_am
-    return expert_id, offs_global_m, row_mask
+def decode_ue8m0_scale(scale):
+    """Decode a UE8M0 weight scale to fp32: when it was loaded as ``uint8`` exponent
+    bits, ``value = 2^(exp - 127)``, built directly as the fp32 bit pattern. fp32
+    scales (block-dynamic with float scales) pass through. The dtype branch is a
+    compile-time constant, so only the taken path is emitted (single return — Triton
+    requires all ``return`` statements to share a type)."""
+    if scale.dtype == tl.uint8:
+        scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    return scale
 
 
 # ── fp8_act_quant kernel (used by tensor-mode FP8 wrappers) ───────────────────
@@ -302,7 +237,11 @@ def _fp8_act_quant(
 
     with device_context(x.device):
         wrap_triton(_fp8_act_quant_kernel)[grid](
-            x, y, s, BLOCK_SIZE=block_size, PADDED_BLOCK=triton.next_power_of_2(block_size)
+            x,
+            y,
+            s,
+            BLOCK_SIZE=block_size,
+            PADDED_BLOCK=triton.next_power_of_2(block_size),
         )
 
     return y, s

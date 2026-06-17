@@ -192,7 +192,7 @@ def _setup_problem(problem: Problem):
 def test_matmul(problem: Problem):
     """``matmul`` matches the pure-PyTorch dequant+matmul reference."""
     A, B, Bs, a_scale = _setup_problem(problem)
-    matmul = maybe_compile(finegrained_fp8.matmul, problem.compile)
+    matmul = maybe_compile(finegrained_fp8.matmul_2d, problem.compile)
     out = matmul(
         A,
         B,

@@ -22,6 +22,7 @@ from .utils import (
     NIBBLES_PER_BYTE,
     MX_SCALE_GROUP_K,
     adaptive_block_size_m,
+    decode_ue8m0_scale,
     device_context,
     fp8_act_quant,
     fp8_act_quant_inline,
@@ -31,6 +32,55 @@ from .utils import (
     mx_act_quant_inline,
     ue8m0_as_uint8,
 )
+
+
+@triton.jit
+def _swizzle_offsets(
+    M,
+    N,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """2D-grid tile scheduling shared by the kernels below: swizzle the
+    ``(pid_m, pid_n)`` program ids for L2 locality on B, then build the operand
+    offset vectors. Returns ``(pid_m, pid_n, offs_am, offs_bn, offs_k)`` — the
+    swizzled ids (reused by the output store) and the ``%``-wrapped row/col offsets
+    plus the K range."""
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    return pid_m, pid_n, offs_am, offs_bn, offs_k
+
+
+@triton.jit
+def _store_masked(
+    C,
+    accumulator,
+    pid_m,
+    pid_n,
+    M,
+    N,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """Shared output epilogue of the kernels below: cast the fp32 accumulator to
+    ``C``'s dtype and store the ``(BLOCK_SIZE_M, BLOCK_SIZE_N)`` tile at the swizzled
+    ``(pid_m, pid_n)``, masked to the ``(M, N)`` bounds."""
+    c = accumulator.to(C.dtype.element_ty)
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
 
 
 @triton.autotune(
@@ -68,15 +118,9 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     inline (one scale per M-row per BLOCK_SIZE_K) and pre-quantized FP8 weights
     with per-block scales. 2D grid with swizzle for L2 cache locality on B.
     """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
-
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    pid_m, pid_n, offs_am, offs_bn, offs_k = _swizzle_offsets(
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+    )
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
@@ -91,22 +135,16 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         )
         a, a_s = fp8_act_quant_inline(a_raw)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
-        b_s = tl.load(bs_ptrs)
-        if b_s.dtype == tl.uint8:
-            # UE8M0 decode: value = 2^(exp - 127); build the fp32 bit pattern.
-            b_s = (b_s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += stride_bs_k
 
-    c = accumulator.to(C.dtype.element_ty)
-
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+    _store_masked(
+        C, accumulator, pid_m, pid_n, M, N, stride_cm, stride_cn,
+        BLOCK_SIZE_M, BLOCK_SIZE_N,
+    )
 
 
 @triton.autotune(
@@ -144,16 +182,9 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     weight scale for the full matrix.
     Uses a 2D grid with swizzle for L2 cache locality on B tiles.
     """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
-
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-
+    pid_m, pid_n, offs_am, offs_bn, offs_k = _swizzle_offsets(
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+    )
     a_ptrs = A + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = B + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
 
@@ -172,13 +203,10 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
 
     accumulator = accumulator * a_s[:, None] * b_s
 
-    c = accumulator.to(C.dtype.element_ty)
-
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+    _store_masked(
+        C, accumulator, pid_m, pid_n, M, N, stride_cm, stride_cn,
+        BLOCK_SIZE_M, BLOCK_SIZE_N,
+    )
 
 
 @triton.autotune(
@@ -218,15 +246,9 @@ def w8a8_block_static_fp8_matmul_kernel(
     accumulation; the scalar activation scale factors out of the loop and
     is applied once at the end.
     """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
-
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    pid_m, pid_n, offs_am, offs_bn, offs_k = _swizzle_offsets(
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+    )
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
@@ -242,23 +264,17 @@ def w8a8_block_static_fp8_matmul_kernel(
         )
         a = (a_raw / a_s_static).to(tl.float8e4nv)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
-        b_s = tl.load(bs_ptrs)
-        if b_s.dtype == tl.uint8:
-            # UE8M0 decode: value = 2^(exp - 127); build the fp32 bit pattern.
-            b_s = (b_s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
         accumulator += tl.dot(a, b) * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += stride_bs_k
 
     accumulator = accumulator * a_s_static
-    c = accumulator.to(C.dtype.element_ty)
-
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+    _store_masked(
+        C, accumulator, pid_m, pid_n, M, N, stride_cm, stride_cn,
+        BLOCK_SIZE_M, BLOCK_SIZE_N,
+    )
 
 
 @triton.autotune(
@@ -299,15 +315,9 @@ def w4a8_mx_dynamic_fp4_matmul_kernel(
     (E2M1) weights with their own UE8M0 scales. 2D grid with swizzle for L2
     cache locality on B tiles, ``tl.dot_scaled`` for the scaled MMA.
     """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
-
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    pid_m, pid_n, offs_am, offs_bn, offs_k = _swizzle_offsets(
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+    )
     offs_k_byte = tl.arange(0, BLOCK_SIZE_K // NIBBLES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
@@ -329,17 +339,15 @@ def w4a8_mx_dynamic_fp4_matmul_kernel(
         b_s = tl.load(
             bs_ptrs, mask=offs_sf[None, :] < k_remaining // SCALE_GROUP_K, other=0
         ).to(tl.uint8)
-        accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1", acc=accumulator)
+        accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1")
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // NIBBLES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
-    c = accumulator.to(C.dtype.element_ty)
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+    _store_masked(
+        C, accumulator, pid_m, pid_n, M, N, stride_cm, stride_cn,
+        BLOCK_SIZE_M, BLOCK_SIZE_N,
+    )
 
 
 @triton.autotune(
@@ -380,15 +388,9 @@ def w8a8_mx_dynamic_fp8_matmul_kernel(
     keeps weights unpacked (one E4M3 byte per value); ``tl.dot_scaled`` drives
     the MX scaled MMA with ``"e4m3"`` on both operands.
     """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
-
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    pid_m, pid_n, offs_am, offs_bn, offs_k = _swizzle_offsets(
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+    )
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
@@ -407,17 +409,15 @@ def w8a8_mx_dynamic_fp8_matmul_kernel(
         b_s = tl.load(
             bs_ptrs, mask=offs_sf[None, :] < k_remaining // SCALE_GROUP_K, other=0
         ).to(tl.uint8)
-        accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3", acc=accumulator)
+        accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3")
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
-    c = accumulator.to(C.dtype.element_ty)
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+    _store_masked(
+        C, accumulator, pid_m, pid_n, M, N, stride_cm, stride_cn,
+        BLOCK_SIZE_M, BLOCK_SIZE_N,
+    )
 
 
 @triton_op(add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul"), mutates_args=())
@@ -885,7 +885,7 @@ def w8a8_mx_dynamic_fp8_matmul(
     return ops.w8a8_mx_dynamic_fp8_matmul(A, B, Bs, output_dtype)
 
 
-def matmul(
+def matmul_2d(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
