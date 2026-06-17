@@ -47,8 +47,12 @@ jobs:
           for kernel in $KERNELS; do
             echo "::group::$kernel"
 
-            # Download existing kernel artifacts from the Hub (kernel repo type).
-            ( cd "$kernel" && uvx --with huggingface_hub python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$REPO_PREFIX/$kernel', repo_type='kernel', local_dir='.')" )
+            # Determine the version branch from build.toml (e.g. version = 1 -> v1).
+            VERSION=$(grep -E '^\s*version\s*=' "$kernel/build.toml" | grep -oE '[0-9]+')
+            VERSION_BRANCH="v${VERSION}"
+
+            # Download existing kernel artifacts from the version branch.
+            ( cd "$kernel" && uvx --with huggingface_hub python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$REPO_PREFIX/$kernel', repo_type='kernel', local_dir='.', revision='$VERSION_BRANCH')" )
 
             # Remove build variants that are not suitable for hashing:
             # - no __init__.py (not a Python kernel build)
@@ -76,7 +80,14 @@ jobs:
 
             # Upload signed artifacts back to the Hub (kernel repo type).
             ( cd "$kernel" && nix run -L github:huggingface/kernels#kernel-builder -- \
-                upload --repo-type kernel --repo-id "$REPO_PREFIX/$kernel" )
+                upload --repo-type kernel --repo-id "$REPO_PREFIX/$kernel" --branch "$VERSION_BRANCH" )
+
+            # v1 kernels without an explicit branch in build.toml also get uploaded to main.
+            BRANCH=$(grep -E '^\s*branch\s*=' "$kernel/build.toml" || true)
+            if [ "$VERSION" = "1" ] && [ -z "$BRANCH" ]; then
+              ( cd "$kernel" && nix run -L github:huggingface/kernels#kernel-builder -- \
+                  upload --repo-type kernel --repo-id "$REPO_PREFIX/$kernel" --branch main )
+            fi
 
             # Clean up to reclaim disk space before the next kernel.
             rm -rf "$kernel/build"
