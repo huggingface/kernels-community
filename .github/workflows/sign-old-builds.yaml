@@ -1,0 +1,83 @@
+name: Sign old builds
+run-name: Sign old builds
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # id-token: write is needed for cosign keyless signing.
+  id-token: write
+
+jobs:
+  sign-kernels:
+    runs-on:
+      group: aws-highmemory-32-plus-nix
+    timeout-minutes: 1200 # 20h
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 4
+            sandbox-fallback = false
+
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+
+      # Process each kernel sequentially to avoid Hub rate limits.
+      - name: Sign all kernels
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          REPO_PREFIX: kernels-community
+        run: |
+          KERNELS=$(find . -maxdepth 2 -name "build.toml" -exec dirname {} \; | sed 's|^\./||' | sort)
+
+          for kernel in $KERNELS; do
+            echo "::group::$kernel"
+
+            # Download existing kernel artifacts from the Hub (kernel repo type).
+            ( cd "$kernel" && uvx --with huggingface_hub python3 -c "
+            from huggingface_hub import snapshot_download
+            snapshot_download('$REPO_PREFIX/$kernel', repo_type='kernel', local_dir='.')
+            " )
+
+            # Ensure every build variant (identified by __init__.py) has a metadata.json.
+            for variant_dir in "$kernel"/build/*/; do
+              [ -d "$variant_dir" ] || continue
+              # Note: the glob above includes trailing slash in the output.
+              [ -f "${variant_dir}__init__.py" ] || continue
+              if [ ! -f "${variant_dir}metadata.json" ]; then
+                echo "{}" > "${variant_dir}metadata.json"
+              fi
+            done
+
+            # Add digest to metadata.json files.
+            nix run -L github:huggingface/kernels#kernel-builder -- hash "$kernel"
+
+            # Sign metadata.json for each variant.
+            for metadata_file in "$kernel"/build/*/metadata.json; do
+              [ -f "$metadata_file" ] || continue
+              cosign sign-blob "$metadata_file" --bundle "${metadata_file}.sigstore" --yes
+            done
+
+            # Upload signed artifacts back to the Hub (kernel repo type).
+            ( cd "$kernel" && nix run -L github:huggingface/kernels#kernel-builder -- \
+                upload --repo-type kernel --repo-id "$REPO_PREFIX/$kernel" )
+
+            # Clean up to reclaim disk space before the next kernel.
+            rm -rf "$kernel/build"
+
+            echo "::endgroup::"
+          done
