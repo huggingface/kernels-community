@@ -5,6 +5,7 @@ version = 1
 backends = [
     "cuda",
     "xpu",
+    "cpu",
 ]
 
 
@@ -26,3 +27,35 @@ src = [
 backend = "cuda"
 depends = ["torch"]
 src = ["rotary/rotary_cuda.cu"]
+
+[kernel.rotary_cpu]
+backend = "cpu"
+depends = ["torch"]
+include = ["rotary-cpu"]
+src = [
+    "rotary-cpu/rotary_cpu_torch.cpp",
+    "rotary-cpu/rotary_cpu.cpp",
+    "rotary-cpu/rotary_cpu.hpp",
+    "rotary-cpu/cpu_features.hpp",
+]
+
+[kernel.rotary_cpu_avx512]
+backend = "cpu"
+depends = ["torch"]
+include = ["rotary-cpu"]
+cxx-flags = [
+    "-O3",
+    "-fopenmp",
+    "-mf16c",
+    "-mavx512f",
+    "-mavx512bf16",
+    "-mavx512vl",
+    "-mavx512dq",
+    "-mavx512bw",
+    "-DCPU_CAPABILITY_AVX512",
+    "-DCPU_CAPABILITY=AVX512",
+]
+src = [
+    "rotary-cpu/rotary_avx512.cpp",
+    "rotary-cpu/rotary_avx512.hpp",
+]
