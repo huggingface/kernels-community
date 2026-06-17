@@ -55,8 +55,12 @@ jobs:
               [ -d "$variant_dir" ] || continue
               # Note: the glob above includes trailing slash in the output.
               [ -f "${variant_dir}__init__.py" ] || continue
-              if [ ! -f "${variant_dir}metadata.json" ]; then
-                echo "{}" > "${variant_dir}metadata.json"
+              # Remove variants with missing or incomplete metadata (no 'name' field)
+              # so that kernel-builder hash only processes sufficiently new builds.
+              if [ ! -f "${variant_dir}metadata.json" ] || \
+                 ! nix run nixpkgs#jq -- -e '.name' "${variant_dir}metadata.json" > /dev/null 2>&1; then
+                echo "Skipping variant ${variant_dir} (missing or incomplete metadata.json)"
+                rm -rf "${variant_dir}"
               fi
             done
 
