@@ -114,3 +114,101 @@ steps:
 
 If the user did not specify the version tag, stop and ask which tag to sync
 from.
+
+## aiter-kernels
+
+This package mirrors the **Triton subset** of `ROCm/aiter` upstream as a
+single Hub kernel — same idea as `liger-kernels` for `linkedin/Liger-Kernel`.
+Flash Attention is intentionally out of scope here; it lives in
+`aiter-flash-attn`. When the user asks to sync an aiter-kernels release,
+carry out the following steps:
+
+- Fetch the upstream Git repository from https://github.com/ROCm/aiter.git
+- Check out the tag the user specified (e.g. `v0.1.5`).
+- The Triton ops live under `aiter/ops/triton/` upstream. Mirror that subtree
+  into `aiter-kernels/torch-ext/aiter_kernels/`, but exclude everything
+  Flash-Attention-related:
+  - `aiter/ops/triton/attention/**`
+  - `aiter/ops/triton/_triton_kernels/attention/**`
+  - `aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/**`
+  - `aiter/ops/triton/_gluon_kernels/*/attention/**`
+  - `aiter/ops/triton/gluon/mla_decode_gluon.py`,
+    `pa_decode_gluon.py`, `pa_mqa_logits.py`
+  - `aiter/ops/triton/configs/*MHA*`, `*EXTEND_ATTENTION*`,
+    `*LEANATTN*`, `*MLA*`
+  - `aiter/ops/triton/quant/sage_attention_quant_wrappers.py` (depends on
+    excluded attention internals)
+- A clean way to mirror is:
+  ```bash
+  rsync -av \
+    --exclude='attention/' \
+    --exclude='flash_attn_triton_amd/' \
+    --exclude='mla_decode_gluon.py' \
+    --exclude='pa_decode_gluon.py' \
+    --exclude='pa_mqa_logits.py' \
+    --exclude='configs/*MHA*' \
+    --exclude='configs/*EXTEND_ATTENTION*' \
+    --exclude='configs/*LEANATTN*' \
+    --exclude='configs/*MLA*' \
+    aiter/ops/triton/ aiter-kernels/torch-ext/aiter_kernels/
+  rm -f aiter-kernels/torch-ext/aiter_kernels/quant/sage_attention_quant_wrappers.py
+  ```
+- After mirroring, also drop `utils/_triton/tunning/` — those are upstream
+  CLI tuning scripts with top-level `argparse` that crash on package import.
+- Rewrite imports to use **relative** form. The Hub kernel loader imports the
+  package under the variant directory name (e.g. `torch-rocm/`), not
+  `aiter_kernels/`, so absolute `from aiter_kernels.X` imports break at
+  load time. Apply the global sed pass first to land on a single absolute
+  namespace, then run the depth-aware rewriter to convert to relative:
+  - `from aiter.ops.triton.<x>` → `from aiter_kernels.<x>` (intermediate)
+  - `from aiter.ops.triton import <x>` → `from aiter_kernels import <x>`
+  - `import aiter.ops.triton.<x> as Y` → `import aiter_kernels.<x> as Y`
+  - `from aiter.jit.utils.torch_guard import ...` →
+    `from aiter_kernels._aiter_compat.torch_guard import ...`
+  - `from aiter.utility.triton.triton_metadata_redirect import ...` →
+    `from aiter_kernels._aiter_compat.triton_metadata_redirect import ...`
+  - `from aiter import dtypes` / `from aiter.utility import dtypes` →
+    `from aiter_kernels._aiter_compat import dtypes`
+  - Bare `import aiter` (with later use of `aiter.dtypes.*`) →
+    `from aiter_kernels import _aiter_compat as aiter`
+  Then convert every absolute `aiter_kernels.X` import to relative form
+  based on the file's depth from the package root. A file at
+  `aiter_kernels/<a>/<b>/.../file.py` needs `(depth + 1)` dots — one for
+  "current package", plus one for each level climbed back to
+  `aiter_kernels/`. Patterns to handle:
+  - `from aiter_kernels.X.Y import Z` → `from <dots>X.Y import Z`
+  - `from aiter_kernels import Z` → `from <dots> import Z`
+  - `import aiter_kernels.X.Y.Z as W` → `from <dots>X.Y import Z as W`
+    (the `import ... as ...` form has no relative equivalent; rewrite as
+    `from ... import ... as ...`)
+- Replace the upstream `aiter/ops/triton/__init__.py` with the local curated
+  init — do **not** copy upstream's `__init__.py` over. The local init
+  imports the subpackages and exposes `apply_rotary_transformers` via
+  `aiter_kernels.rope`. Upstream's `_BACKWARD_COMPAT_MAP` shim is for the
+  `aiter.ops.triton.*` namespace and is irrelevant here.
+- Ensure every directory containing `.py` files has an `__init__.py` —
+  upstream relies on Python's namespace-package behavior for some
+  subdirectories; add empty inits where missing so module discovery is
+  deterministic.
+- Do not modify `aiter-kernels/torch-ext/aiter_kernels/_aiter_compat/` —
+  this is a local shim layer for the cross-tree dependencies
+  (`dtypes`, `chip_info.get_gfx`, `torch_compile_guard`,
+  `AOTMetadataContext`). It is **not** derived from `aiter/ops/triton/` so
+  the sync should never overwrite it. If a newly-synced op imports
+  something not yet in `_aiter_compat`, add the symbol there rather than
+  importing across the tree boundary.
+- Do not modify the local `rope/__init__.py` — it carries the
+  `apply_rotary_transformers` transformers-compat shim, which is a local
+  addition that's not derived from upstream.
+- Smoke-test the sync with a recursive `pkgutil.walk_packages` import: every
+  module under `aiter_kernels.*` should import cleanly except
+  `aiter_kernels.comms` (which requires the optional `iris` package).
+- Check whether any Torch custom ops are defined in the synced files
+  (`torch.library.custom_op`, `torch.library.define`). If any are found,
+  update them to use `add_op_namespace_prefix` for the op name. Upstream's
+  Triton ops do not currently register ops via `torch.library` directly —
+  the `torch_compile_guard` decorator was the only path, and our shim makes
+  it a no-op — so this step is usually a no-op.
+
+If the user did not specify the version tag, stop and ask which tag to sync
+from.
