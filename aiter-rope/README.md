@@ -18,7 +18,7 @@ Original code: https://github.com/ROCm/aiter (MIT, © Advanced Micro Devices, In
 
 ## Functions
 
-### `apply_rotary_transformers(q, k, cos, sin, position_ids=None, unsqueeze_dim=1)`
+### `apply_rotary_transformers(q, k, cos, sin, unsqueeze_dim=1)`
 
 Apply NEOX-style RoPE to query and key tensors.
 
