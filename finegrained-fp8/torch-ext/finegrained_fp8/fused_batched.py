@@ -229,22 +229,18 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
         order=(0, 1),
     )
 
+    inter_base = Intermediate + batch_id * INTERMEDIATE_DIM
+    inter_s_base = IntermediateScale + batch_id * NUM_N_TILES
+    ws_down_base = DownScale + expert_id * stride_downs_e + pid_h * stride_downs_n
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
+
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_H), dtype=tl.float32)
 
     for n_tile in range(0, NUM_N_TILES):
-        n_offs = n_tile * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        inter_ptrs = Intermediate + batch_id * INTERMEDIATE_DIM + n_offs[None, :]
-        inter_s_ptrs = IntermediateScale + batch_id * NUM_N_TILES + n_tile
-        ws_down_ptr = (
-            DownScale
-            + expert_id * stride_downs_e
-            + pid_h * stride_downs_n
-            + n_tile * stride_downs_k
-        )
-        inter = tl.load(inter_ptrs)
+        inter = tl.load(inter_base + (n_tile * BLOCK_SIZE_N + offs_n)[None, :])
+        inter_s = tl.load(inter_s_base + n_tile)
+        ws_down = tl.load(ws_down_base + n_tile * stride_downs_k)
         w_down = tl.load(w_down_ptr)
-        ws_down = tl.load(ws_down_ptr)
-        inter_s = tl.load(inter_s_ptrs)
         acc += tl.dot(inter, w_down) * inter_s * ws_down
         w_down_ptr = tl.advance(w_down_ptr, (BLOCK_SIZE_N, 0))
 
