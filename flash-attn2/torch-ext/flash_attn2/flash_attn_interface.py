@@ -15,7 +15,9 @@ import os
 #     import flash_attn_2_cuda as flash_attn
 
 
+from . import _ops
 from ._ops import ops as flash_attn
+from ._ops import add_op_namespace_prefix
 
 # # isort: on
 
@@ -96,7 +98,7 @@ else:
     _torch_register_fake_wrapper = noop_register_fake_wrapper
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_forward", mutates_args=(), device_types=_get_device())
+@_torch_custom_op_wrapper(add_op_namespace_prefix("_flash_attn_forward"), mutates_args=(), device_types=_get_device())
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -129,7 +131,7 @@ def _flash_attn_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-@_torch_register_fake_wrapper("flash_attn::_flash_attn_forward")
+@_torch_register_fake_wrapper(add_op_namespace_prefix("_flash_attn_forward"))
 def _flash_attn_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -157,12 +159,12 @@ def _flash_attn_forward_fake(
 
 
 if torch.__version__ >= "2.4.0":
-    _wrapped_flash_attn_forward = torch.ops.flash_attn._flash_attn_forward
+    _wrapped_flash_attn_forward = _ops.ops._flash_attn_forward
 else:
     _wrapped_flash_attn_forward = _flash_attn_forward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_forward", mutates_args=(), device_types=_get_device())
+@_torch_custom_op_wrapper(add_op_namespace_prefix("_flash_attn_varlen_forward"), mutates_args=(), device_types=_get_device())
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -213,7 +215,7 @@ def _flash_attn_varlen_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-@_torch_register_fake_wrapper("flash_attn::_flash_attn_varlen_forward")
+@_torch_register_fake_wrapper(add_op_namespace_prefix("_flash_attn_varlen_forward"))
 def _flash_attn_varlen_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -252,12 +254,12 @@ def _flash_attn_varlen_forward_fake(
 
 
 if torch.__version__ >= "2.4.0":
-    _wrapped_flash_attn_varlen_forward = torch.ops.flash_attn._flash_attn_varlen_forward
+    _wrapped_flash_attn_varlen_forward = _ops.ops._flash_attn_varlen_forward
 else:
     _wrapped_flash_attn_varlen_forward = _flash_attn_varlen_forward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types=_get_device())
+@_torch_custom_op_wrapper(add_op_namespace_prefix("_flash_attn_backward"), mutates_args=("dq", "dk", "dv"), device_types=_get_device())
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -309,7 +311,7 @@ def _flash_attn_backward(
     return softmax_d
 
 
-@_torch_register_fake_wrapper("flash_attn::_flash_attn_backward")
+@_torch_register_fake_wrapper(add_op_namespace_prefix("_flash_attn_backward"))
 def _flash_attn_backward_fake(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -344,12 +346,12 @@ def _flash_attn_backward_fake(
 
 
 if torch.__version__ >= "2.4.0":
-    _wrapped_flash_attn_backward = torch.ops.flash_attn._flash_attn_backward
+    _wrapped_flash_attn_backward = _ops.ops._flash_attn_backward
 else:
     _wrapped_flash_attn_backward = _flash_attn_backward
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_backward", mutates_args=("dq", "dk", "dv"), device_types=_get_device())
+@_torch_custom_op_wrapper(add_op_namespace_prefix("_flash_attn_varlen_backward"), mutates_args=("dq", "dk", "dv"), device_types=_get_device())
 def _flash_attn_varlen_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -413,7 +415,7 @@ def _flash_attn_varlen_backward(
     return softmax_d
 
 
-@_torch_register_fake_wrapper("flash_attn::_flash_attn_varlen_backward")
+@_torch_register_fake_wrapper(add_op_namespace_prefix("_flash_attn_varlen_backward"))
 def _flash_attn_varlen_backward_fake(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -455,7 +457,7 @@ def _flash_attn_varlen_backward_fake(
 
 
 if torch.__version__ >= "2.4.0":
-    _wrapped_flash_attn_varlen_backward = torch.ops.flash_attn._flash_attn_varlen_backward
+    _wrapped_flash_attn_varlen_backward = _ops.ops._flash_attn_varlen_backward
 else:
     _wrapped_flash_attn_varlen_backward = _flash_attn_varlen_backward
 
