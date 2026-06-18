@@ -1,16 +1,16 @@
 [general]
 name = "trimul-gpumode"
-# license is best-effort, happy to update if it doesn't match the upstream license
-license = "Apache-2.0"
 version = 1
+license = "Apache-2.0"
 backends = [
     "cuda",
     "rocm",
     "xpu",
 ]
 
-
 [general.hub]
 repo-id = "kernels-community/trimul-gpumode"
+
+[torch-noarch]
 
 [kernel]

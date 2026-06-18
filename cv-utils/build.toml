@@ -1,9 +1,8 @@
 [general]
 name = "cv-utils"
-# license is best-effort, happy to update if it doesn't match the upstream license
+version = 1
 license = "Apache-2.0"
 backends = ["cuda"]
-version = 1
 
 [general.hub]
 repo-id = "kernels-community/cv-utils"

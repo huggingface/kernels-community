@@ -1,9 +1,8 @@
 [general]
 name = "layer-norm"
-license = "BSD-3-Clause"
 version = 1
+license = "BSD-3-Clause"
 backends = ["cuda"]
-
 
 [general.hub]
 repo-id = "kernels-community/layer-norm"
@@ -35,10 +34,7 @@ cuda-flags = [
     "--expt-extended-lambda",
     "--use_fast_math",
 ]
-cxx-flags = [
-    "-DFLASHATTENTION_DISABLE_PYBIND",
-    # "-mcmodel=large",
-]
+cxx-flags = ["-DFLASHATTENTION_DISABLE_PYBIND"]
 depends = ["torch"]
 include = ["."]
 src = [

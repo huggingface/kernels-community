@@ -1,10 +1,12 @@
 [general]
 name = "triton-kernels"
-# license is best-effort, happy to update if it doesn't match the upstream license
+version = 1
 license = "Apache-2.0"
-backends = [
-    "cuda",
-]
+backends = ["cuda"]
 
 [general.hub]
 repo-id = "kernels-community/triton-kernels"
+
+[torch-noarch]
+
+[kernel]

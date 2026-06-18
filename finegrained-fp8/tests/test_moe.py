@@ -12,11 +12,11 @@ from utils import (  # type: ignore
     DTYPE_TAG,
     DTYPE_TO_TOL,
     IS_SM90,
-    SUPPORTS_FP4,
+    MX_SCALE_GROUP_K,
     TEST_DEVICE,
     accelerator_module,
-    make_fp4_weights,
-    make_fp8_weights,
+    make_weights,
+    maybe_compile,
 )
 
 import finegrained_fp8  # type: ignore
@@ -39,23 +39,30 @@ class Problem:
     K: int
     TOP_K: int
     scale_layout: str
+    weight_dtype: torch.dtype = torch.float8_e4m3fn
     weight_scale_dtype: torch.dtype = torch.float32
     block_size: Optional[Tuple[int, int]] = None
     expectation: Optional[Expectations] = None
     dtype: torch.dtype = torch.bfloat16
     sentinel_fraction: float = 0.0
-    weight_format: str = "fp8"
     contiguous: bool = True
     compile: bool = False
 
     @property
     def id(self):
-        head = (
-            f"{self.weight_format}_S{self.S}_E{self.E}_N{self.N}_K{self.K}"
-            f"_top{self.TOP_K}"
-        )
-        # FP4 ignores block_size (tile shape autotuned); always block-mode.
-        if self.weight_format == "fp4":
+        # Recipe label derived from the stored dtype + scale group: packed E2M1 is
+        # MXFP4; E4M3 with a 1x32 group is MXFP8; otherwise plain FP8.
+        is_mx = self.block_size == (1, MX_SCALE_GROUP_K)
+        if self.weight_dtype == torch.int8:
+            fmt = "mxfp4"
+        elif is_mx:
+            fmt = "mxfp8"
+        else:
+            fmt = "fp8"
+        head = f"{fmt}_S{self.S}_E{self.E}_N{self.N}_K{self.K}_top{self.TOP_K}"
+        # MX recipes pin block_size to the 1x32 scale group, so it isn't part of
+        # the id (the kernel fixes the group at 32 and autotunes its compute tile).
+        if is_mx:
             tail = head
         # FP8 with block_size carries block dims; without it, scale_layout names
         # the tensor-mode variant.
@@ -65,7 +72,8 @@ class Problem:
             tail = f"{head}_b{self.block_size[0]}x{self.block_size[1]}"
         contig_tag = "contiguous" if self.contiguous else "noncontiguous"
         tail = f"{tail}_{contig_tag}_{DTYPE_TAG[self.dtype]}"
-        if self.weight_scale_dtype is torch.float8_e8m0fnu:
+        # UE8M0 weight scales — implied by the MX recipe name, tagged only for FP8.
+        if self.weight_scale_dtype is torch.float8_e8m0fnu and not is_mx:
             tail = f"{tail}_ue8m0"
         if self.sentinel_fraction > 0:
             tail = f"{tail}_sentinel"
@@ -229,111 +237,142 @@ PROBLEMS = [
         block_size=(128, 128),
         dtype=torch.float32,
     ),
+    # MX recipes (MXFP4 here; MXFP8 below). DeepSeek-V4-Flash MXFP4 shapes
+    # (E=256, top_k=6); first entry kept small so CI doesn't dwell on the big
+    # ones. block_size is the MX 1x32 scale group used to build the weights
+    # (the kernel fixes the group at 32 and autotunes its compute tile).
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_dtype=torch.int8,
+    ),
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_dtype=torch.int8,
+        contiguous=False,
+    ),
+    Problem(
+        S=192,
+        E=256,
+        N=4096,
+        K=4096,
+        TOP_K=6,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_dtype=torch.int8,
+    ),
+    Problem(
+        S=192,
+        E=256,
+        N=4096,
+        K=2048,
+        TOP_K=6,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_dtype=torch.int8,
+    ),
+    Problem(
+        S=1536,
+        E=256,
+        N=4096,
+        K=4096,
+        TOP_K=6,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_dtype=torch.int8,
+    ),
+    # EP sentinel coverage on MXFP4
+    Problem(
+        S=64,
+        E=8,
+        N=256,
+        K=512,
+        TOP_K=4,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_dtype=torch.int8,
+        sentinel_fraction=0.875,
+    ),
+    # torch.compile compatibility on MXFP4
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_dtype=torch.int8,
+        compile=True,
+    ),
+    # fp16 / fp32 dtype coverage on the smallest MXFP4 shape
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_dtype=torch.int8,
+        dtype=torch.float16,
+    ),
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_dtype=torch.int8,
+        dtype=torch.float32,
+    ),
+    # ── MXFP8 (E4M3 weights + E4M3 act, UE8M0 group-32; block_size ignored) ──
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+    ),
+    Problem(
+        S=64,
+        E=8,
+        N=512,
+        K=1024,
+        TOP_K=4,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+    ),
+    # non-contiguous indexing tensors on the MXFP8 path
+    Problem(
+        S=32,
+        E=4,
+        N=256,
+        K=512,
+        TOP_K=2,
+        scale_layout="block",
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+        contiguous=False,
+    ),
 ]
-if SUPPORTS_FP4:
-    # DeepSeek-V4-Flash FP4 shapes (E=256, top_k=6); first entry kept small so
-    # CI doesn't spend minutes on the larger problems. ``block_size`` is ignored
-    # by the FP4 path (tile shape autotuned).
-    PROBLEMS += [
-        Problem(
-            S=32,
-            E=4,
-            N=256,
-            K=512,
-            TOP_K=2,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-        ),
-        Problem(
-            S=32,
-            E=4,
-            N=256,
-            K=512,
-            TOP_K=2,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-            contiguous=False,
-        ),
-        Problem(
-            S=192,
-            E=256,
-            N=4096,
-            K=4096,
-            TOP_K=6,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-        ),
-        Problem(
-            S=192,
-            E=256,
-            N=4096,
-            K=2048,
-            TOP_K=6,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-        ),
-        Problem(
-            S=1536,
-            E=256,
-            N=4096,
-            K=4096,
-            TOP_K=6,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-        ),
-        # EP sentinel coverage on FP4
-        Problem(
-            S=64,
-            E=8,
-            N=256,
-            K=512,
-            TOP_K=4,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-            sentinel_fraction=0.875,
-        ),
-        # torch.compile compatibility on FP4
-        Problem(
-            S=32,
-            E=4,
-            N=256,
-            K=512,
-            TOP_K=2,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-            compile=True,
-        ),
-        # fp16 / fp32 dtype coverage on the smallest FP4 shape
-        Problem(
-            S=32,
-            E=4,
-            N=256,
-            K=512,
-            TOP_K=2,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-            dtype=torch.float16,
-        ),
-        Problem(
-            S=32,
-            E=4,
-            N=256,
-            K=512,
-            TOP_K=2,
-            scale_layout="block",
-            block_size=None,
-            weight_format="fp4",
-            dtype=torch.float32,
-        ),
-    ]
 
 
 def _make_routed_inputs(S, E, K, dtype, device, top_k, sentinel_fraction=0.0):
@@ -364,23 +403,6 @@ def _make_routed_inputs(S, E, K, dtype, device, top_k, sentinel_fraction=0.0):
     return selected_hidden_states, expert_ids
 
 
-def _convert_scale_layout(Bs, layout: str):
-    if layout == "block":
-        assert Bs.ndim == 3, "block scale layout expects Bs with shape [E, nb, kb]"
-        return Bs
-
-    if Bs.ndim == 1:
-        per_tensor = Bs.contiguous()
-    else:
-        per_tensor = Bs[:, 0, 0].contiguous()
-
-    if layout == "per_tensor_1d":
-        return per_tensor
-    if layout == "per_tensor_111":
-        return per_tensor.view(-1, 1, 1).contiguous()
-    raise ValueError(f"Unsupported scale layout: {layout}")
-
-
 def _make_noncontig_1d(x: torch.Tensor) -> torch.Tensor:
     # Stride-2 view with duplicated gaps: a stride-1 read returns
     # [x[0], x[0], x[1], x[1], ...] instead of x, catching wrong-stride loads.
@@ -390,31 +412,26 @@ def _make_noncontig_1d(x: torch.Tensor) -> torch.Tensor:
     return base[:, 0]
 
 
-def _setup_problem(problem: Problem, dtype):
+def _setup_problem(problem: Problem):
     A, expert_ids = _make_routed_inputs(
         problem.S,
         problem.E,
         problem.K,
-        dtype=dtype,
+        dtype=problem.dtype,
         device=TEST_DEVICE,
         top_k=problem.TOP_K,
         sentinel_fraction=problem.sentinel_fraction,
     )
-    if problem.weight_format == "fp4":
-        B, Bs = make_fp4_weights(
-            problem.N, problem.K, TEST_DEVICE, num_experts=problem.E
-        )
-    else:
-        B_fp8, Bs_block = make_fp8_weights(
-            problem.N,
-            problem.K,
-            TEST_DEVICE,
-            problem.block_size,
-            num_experts=problem.E,
-            scale_dtype=problem.weight_scale_dtype,
-        )
-        Bs = _convert_scale_layout(Bs_block, problem.scale_layout)
-        B = B_fp8
+    B, Bs = make_weights(
+        problem.N,
+        problem.K,
+        TEST_DEVICE,
+        problem.block_size,
+        weight_dtype=problem.weight_dtype,
+        scale_dtype=problem.weight_scale_dtype,
+        scale_layout=problem.scale_layout,
+        num_experts=problem.E,
+    )
     if not problem.contiguous:
         expert_ids = _make_noncontig_1d(expert_ids)
     return A, expert_ids, B, Bs
@@ -435,10 +452,10 @@ def _prepare_grouped(A, expert_ids, num_experts, contiguous: bool = True):
 
 
 def _routed_matmul_ref(A, B, Bs, expert_ids, block_size):
-    """Per-routed-row reference that re-uses the neutral ``matmul`` dispatcher
-    (routes to FP4 when ``B.dtype == int8``, else block/tensor FP8). Output dtype
-    matches the batched/grouped kernels (both follow ``A.dtype``). Rows with
-    ``expert_ids[i] >= num_experts`` are EP sentinels — skipped, output undefined."""
+    """Per-routed-row reference that re-uses the neutral ``matmul_2d`` dispatcher
+    (it routes by weight dtype / scale layout: MXFP4, MXFP8, or block/tensor FP8).
+    Output dtype matches the batched/grouped kernels (both follow ``A.dtype``). Rows
+    with ``expert_ids[i] >= num_experts`` are EP sentinels — skipped, output undefined."""
     S = A.shape[0]
     N = B.shape[1]
     E = B.shape[0]
@@ -447,7 +464,7 @@ def _routed_matmul_ref(A, B, Bs, expert_ids, block_size):
         e = int(expert_ids[i])
         if e >= E:
             continue
-        out[i] = finegrained_fp8.matmul(A[i : i + 1], B[e], Bs[e], block_size)
+        out[i] = finegrained_fp8.matmul_2d(A[i : i + 1], B[e], Bs[e], block_size)
     return out
 
 
@@ -467,14 +484,8 @@ def _assert_correctness(out, ref, expert_ids, problem):
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_batched(problem):
     torch.manual_seed(0)
-    A, expert_ids, B, Bs = _setup_problem(problem, dtype=problem.dtype)
-    matmul_batched = finegrained_fp8.matmul_batched
-    if problem.compile:
-        torch.compiler.reset()
-        accelerator_module().empty_cache()
-        matmul_batched = torch.compile(
-            matmul_batched, mode="max-autotune", fullgraph=True
-        )
+    A, expert_ids, B, Bs = _setup_problem(problem)
+    matmul_batched = maybe_compile(finegrained_fp8.matmul_batched, problem.compile)
     out = matmul_batched(A, B, Bs, expert_ids, problem.block_size)
     ref = _routed_matmul_ref(A, B, Bs, expert_ids, problem.block_size)
     _assert_correctness(out, ref, expert_ids, problem)
@@ -485,17 +496,11 @@ def test_batched(problem):
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_grouped(problem):
     torch.manual_seed(0)
-    A, expert_ids, B, Bs = _setup_problem(problem, dtype=problem.dtype)
+    A, expert_ids, B, Bs = _setup_problem(problem)
     A_sorted, expert_ids_sorted, offsets, tokens_per_expert = _prepare_grouped(
         A, expert_ids, problem.E, contiguous=problem.contiguous
     )
-    matmul_grouped = finegrained_fp8.matmul_grouped
-    if problem.compile:
-        torch.compiler.reset()
-        accelerator_module().empty_cache()
-        matmul_grouped = torch.compile(
-            matmul_grouped, mode="max-autotune", fullgraph=True
-        )
+    matmul_grouped = maybe_compile(finegrained_fp8.matmul_grouped, problem.compile)
     out = matmul_grouped(
         A_sorted, B, Bs, offsets, tokens_per_expert, problem.block_size
     )
@@ -503,25 +508,15 @@ def test_grouped(problem):
     _assert_correctness(out, ref, expert_ids_sorted, problem)
 
 
-def _bench_setup(problem: Problem, device=TEST_DEVICE):
+def _bench_setup(problem: Problem):
     accelerator_module().empty_cache()
     torch.compiler.reset()
     torch.manual_seed(0)
-    A, expert_ids = _make_routed_inputs(
-        problem.S,
-        problem.E,
-        problem.K,
-        dtype=torch.bfloat16,
-        device=device,
-        top_k=problem.TOP_K,
-    )
-    B_fp8, Bs = make_fp8_weights(
-        problem.N, problem.K, device, problem.block_size, num_experts=problem.E
-    )
+    A, expert_ids, B, Bs = _setup_problem(problem)
     A_sorted, expert_ids_sorted, offsets, tokens_per_expert = _prepare_grouped(
         A, expert_ids, problem.E
     )
-    return A_sorted, B_fp8, Bs, expert_ids_sorted, offsets, tokens_per_expert
+    return A_sorted, B, Bs, expert_ids_sorted, offsets, tokens_per_expert
 
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
@@ -540,13 +535,18 @@ def _assert_latency_with_tolerance(measured_ms: float, expected_ms: float):
         )
 
 
-def _measure_latency_over_repeats(fn, repeats: int = BENCH_REPEATS):
-    runs_ms = [triton.testing.do_bench(fn) for _ in range(repeats)]
+def _run_speedup(problem, label, call, expected_ms):
+    """Median-of-``BENCH_REPEATS`` ``do_bench`` latency for ``call``, printed with
+    spread, then asserted within the ±15% SM90 baseline band of ``expected_ms``."""
+    runs_ms = [triton.testing.do_bench(call) for _ in range(BENCH_REPEATS)]
     median_ms = statistics.median(runs_ms)
-    mean_ms = statistics.mean(runs_ms)
-    min_ms = min(runs_ms)
-    max_ms = max(runs_ms)
-    return median_ms, mean_ms, min_ms, max_ms
+    print(
+        f"\n[{label}] S={problem.S:4d} E={problem.E:4d} N={problem.N:5d} K={problem.K:5d} | "
+        f"{label} median={median_ms:.4f}ms mean={statistics.mean(runs_ms):.4f}ms "
+        f"min={min(runs_ms):.4f}ms max={max(runs_ms):.4f}ms "
+        f"(expected {expected_ms:.4f}ms ±15%) repeats={BENCH_REPEATS}"
+    )
+    _assert_latency_with_tolerance(median_ms, expected_ms)
 
 
 @pytest.mark.benchmark
@@ -557,24 +557,15 @@ def _measure_latency_over_repeats(fn, repeats: int = BENCH_REPEATS):
 def test_batched_speedup(problem):
     if problem.expectation is None:
         pytest.skip("No expected benchmark latency for this problem")
-
-    A, B_fp8, Bs, expert_ids, _, _ = _bench_setup(problem)
-
-    batched_ms, batched_mean_ms, batched_min_ms, batched_max_ms = (
-        _measure_latency_over_repeats(
-            lambda: finegrained_fp8.matmul_batched(
-                A, B_fp8, Bs, expert_ids, problem.block_size
-            )
-        )
+    A, B, Bs, expert_ids, _, _ = _bench_setup(problem)
+    _run_speedup(
+        problem,
+        "batched",
+        lambda: finegrained_fp8.matmul_batched(
+            A, B, Bs, expert_ids, problem.block_size
+        ),
+        problem.expectation.batched_ms,
     )
-    expected_ms = problem.expectation.batched_ms
-    print(
-        f"\n[batched] S={problem.S:4d} E={problem.E:4d} N={problem.N:5d} K={problem.K:5d} | "
-        f"batched median={batched_ms:.4f}ms mean={batched_mean_ms:.4f}ms "
-        f"min={batched_min_ms:.4f}ms max={batched_max_ms:.4f}ms "
-        f"(expected {expected_ms:.4f}ms ±10%) repeats={BENCH_REPEATS}"
-    )
-    _assert_latency_with_tolerance(batched_ms, expected_ms)
 
 
 @pytest.mark.benchmark
@@ -585,21 +576,12 @@ def test_batched_speedup(problem):
 def test_grouped_speedup(problem):
     if problem.expectation is None:
         pytest.skip("No expected benchmark latency for this problem")
-
-    A, B_fp8, Bs, _, offsets, tokens_per_expert = _bench_setup(problem)
-
-    grouped_ms, grouped_mean_ms, grouped_min_ms, grouped_max_ms = (
-        _measure_latency_over_repeats(
-            lambda: finegrained_fp8.matmul_grouped(
-                A, B_fp8, Bs, offsets, tokens_per_expert, problem.block_size
-            )
-        )
+    A, B, Bs, _, offsets, tokens_per_expert = _bench_setup(problem)
+    _run_speedup(
+        problem,
+        "grouped",
+        lambda: finegrained_fp8.matmul_grouped(
+            A, B, Bs, offsets, tokens_per_expert, problem.block_size
+        ),
+        problem.expectation.grouped_ms,
     )
-    expected_ms = problem.expectation.grouped_ms
-    print(
-        f"\n[grouped] S={problem.S:4d} E={problem.E:4d} N={problem.N:5d} K={problem.K:5d} | "
-        f"grouped median={grouped_ms:.4f}ms mean={grouped_mean_ms:.4f}ms "
-        f"min={grouped_min_ms:.4f}ms max={grouped_max_ms:.4f}ms "
-        f"(expected {expected_ms:.4f}ms ±10%) repeats={BENCH_REPEATS}"
-    )
-    _assert_latency_with_tolerance(grouped_ms, expected_ms)
