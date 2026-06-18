@@ -81,6 +81,41 @@ def is_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     )
 
 
+def is_mxfp(weight: torch.Tensor, scale: torch.Tensor) -> bool:
+    """Any MX weight/scale pair — MXFP8 (``float8_e4m3fn``, one value/byte) or MXFP4
+    (``int8``, two E2M1 codes/byte), both with UE8M0 group-32 scales. ``values_per_byte``
+    folds the two cases: the scale's last dim covers the unpacked K
+    (``weight.shape[-1] * values_per_byte``) in groups of ``MX_SCALE_GROUP_K``. The
+    dispatchers route on this; the op picks the format from ``weight.dtype``."""
+    if weight.dtype == torch.float8_e4m3fn:
+        values_per_byte = 1
+    elif weight.dtype == torch.int8:
+        values_per_byte = NIBBLES_PER_BYTE
+    else:
+        return False
+    return (
+        scale.dtype == torch.float8_e8m0fnu
+        and scale.ndim == weight.ndim
+        and scale.shape[:-1] == weight.shape[:-1]
+        and scale.shape[-1] == weight.shape[-1] * values_per_byte // MX_SCALE_GROUP_K
+    )
+
+
+def is_tensor_wide(block_size, weight: torch.Tensor) -> bool:
+    """True when ``block_size`` selects per-tensor (tensor-dynamic) scaling: ``None`` or
+    equal to the weight's full ``(N, K)`` — one scale block spanning the whole matrix.
+    Handles 2D ``(N, K)`` and 3D ``(E, N, K)`` weights via the last two dims."""
+    return block_size is None or (
+        block_size[0] == weight.shape[-2] and block_size[1] == weight.shape[-1]
+    )
+
+
+# The per-token batched/fused kernels are decode-shaped — one routed row per program, so
+# BLOCK_SIZE_M is 1 (a larger tile would just recompute the same row). The 2D matmul sizes
+# its M tile to the workload instead, via ``adaptive_block_size_m``.
+DECODE_BLOCK_SIZE_M = 1
+
+
 def adaptive_block_size_m(target_m: int) -> int:
     """Smallest power-of-2 >= ``target_m``, floored at 16 and capped at 128.
 
@@ -146,6 +181,31 @@ def get_accelerator_autotuning_configs(*, with_block_sizes: bool = False):
     ]
 
 
+def get_mxfp_autotuning_configs():
+    """Autotune grid for the MXFP8 ``USE_DOT_SCALED`` kernels (batched matmul + fused MoE).
+
+    ``USE_DOT_SCALED`` picks the MMA: True → ``tl.dot_scaled`` (native M=128 scaled MMA,
+    wide K — wins once the grid saturates, ~S≥32); False → fp8 ``tl.dot`` + per-group
+    software rescale, which needs exactly one scale group per K-step (``BLOCK_SIZE_K == 32``)
+    and wins at small S where the scaled MMA's M→128 pad is pure waste. The ``if`` keeps
+    only that valid pairing; ``num_warps=16`` and ``BLOCK_SIZE_K=64`` are omitted (always
+    dead at M=1 per a config sweep), and the Bayesian tuner prunes the rest per workload.
+    """
+    return [
+        triton.Config(
+            {"USE_DOT_SCALED": use_dot_scaled, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk},
+            num_warps=w,
+            num_stages=s,
+        )
+        for use_dot_scaled in [False, True]
+        for bn in [32, 64, 128, 256]
+        for bk in [32, 128, 256]
+        for s in [2, 3, 4, 5, 6]
+        for w in [2, 4, 8]
+        if (bk == 32) != use_dot_scaled
+    ]
+
+
 # ── Triton-side helpers (inlined by ``@triton.jit`` callers) ──────────────────
 
 
@@ -163,7 +223,7 @@ def fp8_act_quant_inline(a_raw):
 
 
 @triton.jit
-def mx_act_quant_inline(
+def mxfp_act_quant_inline(
     a_raw,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -202,6 +262,33 @@ def decode_ue8m0_scale(scale):
     if scale.dtype == tl.uint8:
         scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
     return scale
+
+
+@triton.jit
+def _e2m1_code_to_f32(code):
+    """One E2M1 4-bit code -> fp32. Layout ``[sign | exp(2) | mant(1)]``; the 8
+    magnitudes are ``{0, .5, 1, 1.5, 2, 3, 4, 6}`` (exp==0 is the 0/0.5 subnormal)."""
+    code = code.to(tl.int32)
+    s = (code >> 3) & 1
+    e = (code >> 1) & 3
+    m = (code & 1).to(tl.float32)
+    pow2 = tl.exp2((e - 1).to(tl.float32))  # e in 0..3 -> 0.5, 1, 2, 4
+    mag = tl.where(e == 0, 0.5 * m, (1.0 + 0.5 * m) * pow2)
+    return (1.0 - 2.0 * s.to(tl.float32)) * mag
+
+
+@triton.jit
+def mxfp4_e2m1_to_e4m3(b_packed):
+    """Unpack packed MXFP4 (E2M1, two nibbles/byte along K) to E4M3, doubling the K
+    (row) dim: ``(R, C) uint8 -> (2R, C) E4M3``. E2M1's 8 magnitudes are all exact in
+    E4M3, so this is lossless — it lets the FP8 ``tl.dot`` path stand in for
+    ``tl.dot_scaled`` at decode (avoiding its M->128 pad). K order is the low nibble
+    first: ``[byte0_lo, byte0_hi, byte1_lo, ...]``."""
+    lo = _e2m1_code_to_f32(b_packed & 0xF)
+    hi = _e2m1_code_to_f32(b_packed >> 4)
+    # interleave along the K (row) dim via trans -> interleave-last-dim -> trans back
+    unpacked = tl.trans(tl.interleave(tl.trans(lo), tl.trans(hi)))
+    return unpacked.to(tl.float8e4nv)
 
 
 # ── fp8_act_quant kernel (used by tensor-mode FP8 wrappers) ───────────────────

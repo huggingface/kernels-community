@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 import pytest
 import torch
+import torch.nn.functional as F
 import triton
 
 from utils import (  # type: ignore
@@ -20,6 +21,7 @@ from utils import (  # type: ignore
 )
 
 import finegrained_fp8  # type: ignore
+from finegrained_fp8 import fused_batched  # type: ignore
 
 
 BENCH_REPEATS = 10
@@ -49,20 +51,23 @@ class Problem:
     compile: bool = False
 
     @property
+    def is_mxfp(self):
+        return self.block_size == (1, MX_SCALE_GROUP_K)
+
+    @property
     def id(self):
         # Recipe label derived from the stored dtype + scale group: packed E2M1 is
         # MXFP4; E4M3 with a 1x32 group is MXFP8; otherwise plain FP8.
-        is_mx = self.block_size == (1, MX_SCALE_GROUP_K)
         if self.weight_dtype == torch.int8:
             fmt = "mxfp4"
-        elif is_mx:
+        elif self.is_mxfp:
             fmt = "mxfp8"
         else:
             fmt = "fp8"
         head = f"{fmt}_S{self.S}_E{self.E}_N{self.N}_K{self.K}_top{self.TOP_K}"
         # MX recipes pin block_size to the 1x32 scale group, so it isn't part of
         # the id (the kernel fixes the group at 32 and autotunes its compute tile).
-        if is_mx:
+        if self.is_mxfp:
             tail = head
         # FP8 with block_size carries block dims; without it, scale_layout names
         # the tensor-mode variant.
@@ -73,7 +78,7 @@ class Problem:
         contig_tag = "contiguous" if self.contiguous else "noncontiguous"
         tail = f"{tail}_{contig_tag}_{DTYPE_TAG[self.dtype]}"
         # UE8M0 weight scales — implied by the MX recipe name, tagged only for FP8.
-        if self.weight_scale_dtype is torch.float8_e8m0fnu and not is_mx:
+        if self.weight_scale_dtype is torch.float8_e8m0fnu and not self.is_mxfp:
             tail = f"{tail}_ue8m0"
         if self.sentinel_fraction > 0:
             tail = f"{tail}_sentinel"
@@ -506,6 +511,185 @@ def test_grouped(problem):
     )
     ref = _routed_matmul_ref(A_sorted, B, Bs, expert_ids_sorted, problem.block_size)
     _assert_correctness(out, ref, expert_ids_sorted, problem)
+
+
+# ── Fused batched MoE (two-kernel gate_up + down) vs the unfused path ────────────
+@dataclass(frozen=True)
+class MoEProblem:
+    """End-to-end fused-MoE shape: ``num_tokens`` routed ``num_top_k`` ways through
+    ``num_experts`` experts, hidden ``hidden_dim``, per-gate ``intermediate_dim``. The
+    recipe is the weight dtype + scale group: ``int8`` (packed E2M1) is MXFP4 and ``e4m3``
+    with a 1x32 group is MXFP8 (both UE8M0); ``e4m3`` with a square ``block_size`` is
+    block-dynamic FP8."""
+
+    num_tokens: int
+    num_experts: int
+    hidden_dim: int
+    intermediate_dim: int
+    num_top_k: int
+    weight_dtype: torch.dtype = torch.float8_e4m3fn
+    weight_scale_dtype: torch.dtype = torch.float32
+    block_size: Optional[Tuple[int, int]] = None
+    dtype: torch.dtype = torch.bfloat16
+
+    @property
+    def is_mxfp(self):
+        return self.block_size == (1, MX_SCALE_GROUP_K)
+
+    @property
+    def id(self):
+        if self.weight_dtype == torch.int8:
+            fmt = "mxfp4"
+        elif self.is_mxfp:
+            fmt = "mxfp8"
+        else:
+            fmt = f"fp8_b{self.block_size[0]}x{self.block_size[1]}"
+        return (
+            f"{fmt}_T{self.num_tokens}_E{self.num_experts}_H{self.hidden_dim}"
+            f"_I{self.intermediate_dim}_top{self.num_top_k}_{DTYPE_TAG[self.dtype]}"
+        )
+
+
+MOE_PROBLEMS = [
+    # ── MXFP4 (packed E2M1 + UE8M0 group-32) ──
+    MoEProblem(
+        num_tokens=1,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        weight_dtype=torch.int8,
+        block_size=(1, MX_SCALE_GROUP_K),
+    ),
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        weight_dtype=torch.int8,
+        block_size=(1, MX_SCALE_GROUP_K),
+    ),
+    # fp16 activations on the smallest MXFP4 shape
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        weight_dtype=torch.int8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        dtype=torch.float16,
+    ),
+    # ── MXFP8 (E4M3 + UE8M0 group-32) ──
+    MoEProblem(
+        num_tokens=1,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+    ),
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+    ),
+    # ── Block-dynamic FP8 (E4M3 + fp32 128x128 block scales) ──
+    MoEProblem(
+        num_tokens=1,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(128, 128),
+    ),
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(128, 128),
+    ),
+]
+
+
+def _make_moe_weights(problem: MoEProblem):
+    """gate_up ``(E, 2I, H)`` and down ``(E, H, I)`` weights + inv-scales for the recipe."""
+    bs = list(problem.block_size)
+    kw = dict(
+        weight_dtype=problem.weight_dtype,
+        scale_dtype=problem.weight_scale_dtype,  # forced to UE8M0 internally for int8
+        num_experts=problem.num_experts,
+    )
+    gate_up, gate_up_s = make_weights(
+        2 * problem.intermediate_dim, problem.hidden_dim, TEST_DEVICE, bs, **kw
+    )
+    down, down_s = make_weights(
+        problem.hidden_dim, problem.intermediate_dim, TEST_DEVICE, bs, **kw
+    )
+    return gate_up, gate_up_s, down, down_s, bs
+
+
+def _unfused_moe_ref(hidden, top_k_index, top_k_weights, weights, problem, block_size):
+    """The transformers batched-experts forward (``integrations/moe.py``) built on the
+    tested ``matmul_batched``: replicate each token to its routed slots, gate_up projection,
+    GLU ``act_fn(gate) * up``, down projection, then the routing-weighted top-k reduce."""
+    gate_up, gate_up_s, down, down_s = weights
+    num_tokens, num_top_k = hidden.shape[0], problem.num_top_k
+    expert_ids = top_k_index.reshape(-1).to(torch.int32)
+    routed = hidden.repeat_interleave(num_top_k, dim=0)
+    gate_up_out = finegrained_fp8.matmul_batched(routed, gate_up, gate_up_s, expert_ids, block_size)
+    gate, up = gate_up_out.chunk(2, dim=-1)
+    inter = F.silu(gate) * up
+    down_out = finegrained_fp8.matmul_batched(inter, down, down_s, expert_ids, block_size)
+    weighted = down_out * top_k_weights.reshape(-1, 1)
+    return weighted.view(num_tokens, num_top_k, problem.hidden_dim).sum(dim=1)
+
+
+def _assert_fused_correctness(out, ref, problem: MoEProblem):
+    """Shape, dtype, and value checks against the unfused reference."""
+    assert out.shape == (problem.num_tokens, problem.hidden_dim)
+    assert out.dtype == problem.dtype
+    atol, rtol = DTYPE_TO_TOL[problem.dtype]
+    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
+@pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
+def test_fused_batched(problem):
+    """Fused two-kernel MoE (gate_up + SiLU + FP8 requant + down + top-k reduce) via the
+    ``moe_batched`` dispatcher vs the unfused reference. ``simulate_unfused`` rounds each
+    fused step through the activation dtype so the two agree to reduce order."""
+    torch.manual_seed(0)
+    gate_up, gate_up_s, down, down_s, block_size = _make_moe_weights(problem)
+    weights = (gate_up, gate_up_s, down, down_s)
+
+    hidden = torch.randn(
+        problem.num_tokens, problem.hidden_dim, device=TEST_DEVICE, dtype=problem.dtype
+    )
+    top_k_index = torch.randint(
+        0, problem.num_experts, (problem.num_tokens, problem.num_top_k),
+        device=TEST_DEVICE, dtype=torch.int32,
+    )
+    top_k_weights = torch.rand(
+        problem.num_tokens, problem.num_top_k, device=TEST_DEVICE, dtype=problem.dtype
+    )
+
+    ref = _unfused_moe_ref(hidden, top_k_index, top_k_weights, weights, problem, block_size)
+    out = fused_batched.moe_batched(
+        hidden, top_k_index, top_k_weights, gate_up, down,
+        gate_up_s, down_s, block_size, simulate_unfused=True,
+    )
+
+    _assert_fused_correctness(out, ref, problem)
 
 
 def _bench_setup(problem: Problem):

@@ -18,17 +18,20 @@ import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
 from ._ops import add_op_namespace_prefix, ops
+from .bayesian_autotuner import bayesian_autotune
 from .utils import (
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
     adaptive_block_size_m,
     device_context,
-    mx_act_quant_inline,
+    mxfp_act_quant_inline,
+    mxfp4_e2m1_to_e4m3,
     fp8_act_quant,
     fp8_act_quant_inline,
     get_accelerator_autotuning_configs,
-    is_mxfp4,
-    is_mxfp8,
+    get_mxfp_autotuning_configs,
+    is_mxfp,
+    is_tensor_wide,
     ue8m0_as_uint8,
     decode_ue8m0_scale,
 )
@@ -38,12 +41,12 @@ def grouped_tile_layout(
     tokens_per_expert: torch.Tensor,
     block_size_m: int,
     S: int,
-    E: int,
+    num_experts: int,
 ) -> tuple[torch.Tensor, int]:
     """Compute the M-tile layout for the grouped kernels.
 
     Returns ``(tile_offsets, max_m_tiles)``:
-    - ``tile_offsets``: int32 (E,) cumulative tile-end per expert, used by
+    - ``tile_offsets``: int32 (num_experts,) cumulative tile-end per expert, used by
       ``_grouped_tile_setup`` to locate an M-tile's owning expert.
     - ``max_m_tiles``: upper bound on total M-tiles, used as the grid axis-0
       size. Real tile count <= this; surplus programs early-return inside the
@@ -51,7 +54,7 @@ def grouped_tile_layout(
     """
     tiles_per_expert = (tokens_per_expert + block_size_m - 1) // block_size_m
     tile_offsets = torch.cumsum(tiles_per_expert, dim=0).to(torch.int32)
-    max_m_tiles = triton.cdiv(S, block_size_m) + E
+    max_m_tiles = triton.cdiv(S, block_size_m) + num_experts
     return tile_offsets, max_m_tiles
 
 
@@ -63,7 +66,7 @@ def _grouped_tile_setup(
     TileOffsets,
     stride_offs,
     stride_tile,
-    NUM_EXPERTS: tl.constexpr,
+    num_experts,
     NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -80,21 +83,21 @@ def _grouped_tile_setup(
     - ``offs_k``: ``(BLOCK_SIZE_K,)`` K range
 
     Caller must have early-returned if ``pid_m`` exceeds total_tiles
-    (``TileOffsets[(NUM_EXPERTS - 1) * stride_tile]``) — the ``Offsets`` load below
+    (``TileOffsets[(num_experts - 1) * stride_tile]``) — the ``Offsets`` load below
     is out of bounds for an out-of-range tile otherwise.
     """
     # Binary search: upper_bound(TileOffsets, pid_m). NUM_EXPERTS_BIT_LENGTH is
-    # ceil(log2(E))+1, giving one harmless extra iteration; constexpr so the
+    # ceil(log2(num_experts))+1, giving one harmless extra iteration; constexpr so the
     # loop unrolls.
     lo = 0
-    hi = NUM_EXPERTS
+    hi = num_experts
     for _ in tl.static_range(NUM_EXPERTS_BIT_LENGTH):
         mid = (lo + hi) >> 1
         mid_val = tl.load(TileOffsets + mid * stride_tile)
         is_left = mid_val <= pid_m
         lo = tl.where(is_left, mid + 1, lo)
         hi = tl.where(is_left, hi, mid)
-    # Cast to int64 so ``expert_id * stride_be`` doesn't overflow for large E
+    # Cast to int64 so ``expert_id * stride_be`` doesn't overflow for large num_experts
     # × large weight matrices (e.g. 255 * 9_437_184 > 2^31).
     expert_id = lo.to(tl.int64)
 
@@ -138,11 +141,11 @@ def _store_tile(
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     A,  # (S, K) raw BF16/FP16 activations, sorted/grouped by expert id
-    B,  # (E, N, K) FP8 weight matrices
+    B,  # (num_experts, N, K) FP8 weight matrices
     C,  # (S, N) output
-    Bs,  # (E, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales
-    Offsets,  # (E,) int32 — cumulative row-end per expert
-    TileOffsets,  # (E,) int32 — cumulative tile-end per expert
+    Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales
+    Offsets,  # (num_experts,) int32 — cumulative row-end per expert
+    TileOffsets,  # (num_experts,) int32 — cumulative tile-end per expert
     # Shape
     S,
     N,
@@ -160,11 +163,11 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     stride_bs_n,
     stride_offs,
     stride_tile,
+    num_experts,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
     NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
 ):
     """Block-scale grouped FP8 expert matmul kernel.
@@ -175,7 +178,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
-    total_tiles = tl.load(TileOffsets + (NUM_EXPERTS - 1) * stride_tile)
+    total_tiles = tl.load(TileOffsets + (num_experts - 1) * stride_tile)
     if pid_m >= total_tiles:
         return
 
@@ -186,7 +189,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         TileOffsets,
         stride_offs,
         stride_tile,
-        NUM_EXPERTS,
+        num_experts,
         NUM_EXPERTS_BIT_LENGTH,
         BLOCK_SIZE_M,
         BLOCK_SIZE_N,
@@ -218,19 +221,20 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     )
 
 
-@triton.autotune(
-    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
-    key=["N", "K", "BLOCK_SIZE_M"],
+@bayesian_autotune(
+    get_accelerator_autotuning_configs(with_block_sizes=True),
+    ["N", "K", "BLOCK_SIZE_M"],
+    n_trials=60,
 )
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     A,  # (S, K) pre-quantized FP8 activations, sorted/grouped by expert id
-    B,  # (E, N, K) FP8 weight matrices
+    B,  # (num_experts, N, K) FP8 weight matrices
     C,  # (S, N) output
     As,  # (S,) per-token activation scales
-    Bs,  # (E, 1, 1) per-tensor weight scales
-    Offsets,  # (E,) int32 — cumulative row-end per expert
-    TileOffsets,  # (E,) int32 — cumulative tile-end per expert
+    Bs,  # (num_experts, 1, 1) per-tensor weight scales
+    Offsets,  # (num_experts,) int32 — cumulative row-end per expert
+    TileOffsets,  # (num_experts,) int32 — cumulative tile-end per expert
     # Shape
     S,
     N,
@@ -247,11 +251,11 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     stride_bs_e,
     stride_offs,
     stride_tile,
+    num_experts,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
     NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
 ):
     """Tensor-scale grouped FP8 expert matmul kernel.
@@ -262,7 +266,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
-    total_tiles = tl.load(TileOffsets + (NUM_EXPERTS - 1) * stride_tile)
+    total_tiles = tl.load(TileOffsets + (num_experts - 1) * stride_tile)
     if pid_m >= total_tiles:
         return
 
@@ -273,7 +277,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         TileOffsets,
         stride_offs,
         stride_tile,
-        NUM_EXPERTS,
+        num_experts,
         NUM_EXPERTS_BIT_LENGTH,
         BLOCK_SIZE_M,
         BLOCK_SIZE_N,
@@ -305,18 +309,15 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     )
 
 
-@triton.autotune(
-    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
-    key=["N", "K", "BLOCK_SIZE_M"],
-)
+@bayesian_autotune(get_mxfp_autotuning_configs(), ["N", "K", "BLOCK_SIZE_M"], n_trials=60)
 @triton.jit
-def w4a8_mx_dynamic_fp4_matmul_grouped_kernel(
+def mxfp_dynamic_matmul_grouped_kernel(
     A,  # (S, K) raw BF16/FP16 activations, sorted by expert id
-    B,  # (E, N, K // 2) packed FP4 (E2M1) expert weights as int8
+    B,  # (num_experts, N, K) E4M3 (MXFP8) or (num_experts, N, K // 2) packed E2M1 (MXFP4) expert weights
     C,  # (S, N) output
-    Bs,  # (E, N, K // SCALE_GROUP_K) UE8M0 weight scales
-    Offsets,  # (E,) int32 — cumulative row-end per expert
-    TileOffsets,  # (E,) int32 — cumulative tile-end per expert
+    Bs,  # (num_experts, N, K // SCALE_GROUP_K) UE8M0 weight scales
+    Offsets,  # (num_experts,) int32 — cumulative row-end per expert
+    TileOffsets,  # (num_experts,) int32 — cumulative tile-end per expert
     # Shape
     S,
     N,
@@ -334,25 +335,28 @@ def w4a8_mx_dynamic_fp4_matmul_grouped_kernel(
     stride_bs_n,
     stride_offs,
     stride_tile,
+    num_experts,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
+    USE_DOT_SCALED: tl.constexpr,
     NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
-    NIBBLES_PER_BYTE: tl.constexpr,
+    VALUES_PER_BYTE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
 ):
-    """Grouped MXFP4 (W4A8) expert matmul with fused activation quant.
+    """Unified grouped MXFP4/MXFP8 (W4A8/W8A8) expert matmul with fused act quant.
 
-    Tokens are assumed sorted by expert. The kernel maps each M-tile to its
-    owning expert via ``TileOffsets``, quantizes ``A`` to FP8 per K-group inline
-    (UE8M0 scale), then ``tl.dot_scaled`` against packed FP4 weights.
+    Tokens sorted by expert; each M-tile maps to its expert via ``TileOffsets``. ``A`` is
+    quantized to E4M3 per K-group inline (UE8M0 scale). ``VALUES_PER_BYTE`` picks the
+    weight format (2 = packed E2M1 / MXFP4, 1 = unpacked E4M3 / MXFP8); ``USE_DOT_SCALED``
+    picks ``tl.dot_scaled`` vs fp8 ``tl.dot`` + per-group rescale (decode; FP4 unpacks
+    E2M1->E4M3 first, lossless).
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
-    total_tiles = tl.load(TileOffsets + (NUM_EXPERTS - 1) * stride_tile)
+    total_tiles = tl.load(TileOffsets + (num_experts - 1) * stride_tile)
     if pid_m >= total_tiles:
         return
 
@@ -363,20 +367,20 @@ def w4a8_mx_dynamic_fp4_matmul_grouped_kernel(
         TileOffsets,
         stride_offs,
         stride_tile,
-        NUM_EXPERTS,
+        num_experts,
         NUM_EXPERTS_BIT_LENGTH,
         BLOCK_SIZE_M,
         BLOCK_SIZE_N,
         BLOCK_SIZE_K,
     )
-    offs_k_byte = tl.arange(0, BLOCK_SIZE_K // NIBBLES_PER_BYTE)
+    offs_kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
 
     a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = (
         B
         + expert_id * stride_be
-        + offs_k_byte[:, None] * stride_bk
+        + offs_kb[:, None] * stride_bk
         + offs_bn[None, :] * stride_bn
     )
     bs_ptrs = (
@@ -389,112 +393,28 @@ def w4a8_mx_dynamic_fp4_matmul_grouped_kernel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
-        a, a_scale = mx_act_quant_inline(
+        a, a_scale = mxfp_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
         )
-        b = tl.load(b_ptrs).to(tl.uint8)
+        if VALUES_PER_BYTE == 2:  # MXFP4: packed E2M1 bytes
+            b = tl.load(b_ptrs).to(tl.uint8)
+        else:  # MXFP8: unpacked E4M3
+            b = tl.load(b_ptrs)
         b_s = tl.load(bs_ptrs).to(tl.uint8)
-        accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1")
+        if USE_DOT_SCALED:
+            if VALUES_PER_BYTE == 2:
+                accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1")
+            else:
+                accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3")
+        else:
+            a_s = decode_ue8m0_scale(a_scale)
+            ws = tl.trans(decode_ue8m0_scale(b_s))
+            if VALUES_PER_BYTE == 2:
+                accumulator += tl.dot(a, mxfp4_e2m1_to_e4m3(b)) * a_s * ws
+            else:
+                accumulator += tl.dot(a, b) * a_s * ws
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += (BLOCK_SIZE_K // NIBBLES_PER_BYTE) * stride_bk
-        bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
-
-    _store_tile(
-        C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn
-    )
-
-
-@triton.autotune(
-    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
-    key=["N", "K", "BLOCK_SIZE_M"],
-)
-@triton.jit
-def w8a8_mx_dynamic_fp8_matmul_grouped_kernel(
-    A,  # (S, K) raw BF16/FP16 activations, sorted by expert id
-    B,  # (E, N, K) E4M3 expert weights (unpacked)
-    C,  # (S, N) output
-    Bs,  # (E, N, K // SCALE_GROUP_K) UE8M0 weight scales
-    Offsets,  # (E,) int32 — cumulative row-end per expert
-    TileOffsets,  # (E,) int32 — cumulative tile-end per expert
-    # Shape
-    S,
-    N,
-    K,
-    # Strides
-    stride_am,
-    stride_ak,
-    stride_be,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    stride_bs_e,
-    stride_bs_k,
-    stride_bs_n,
-    stride_offs,
-    stride_tile,
-    # Meta-parameters
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
-    NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
-    SCALE_GROUP_K: tl.constexpr,
-):
-    """Grouped MXFP8 (W8A8) expert matmul with fused activation quant.
-
-    Tokens are assumed sorted by expert. The kernel maps each M-tile to its
-    owning expert via ``TileOffsets``, quantizes ``A`` to E4M3 per K-group inline
-    (UE8M0 scale), then ``tl.dot_scaled`` against E4M3 weights. Mirrors the
-    grouped MXFP4 kernel but with unpacked weights and ``"e4m3"`` on both operands.
-    """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-
-    total_tiles = tl.load(TileOffsets + (NUM_EXPERTS - 1) * stride_tile)
-    if pid_m >= total_tiles:
-        return
-
-    expert_id, offs_global_m, row_mask, offs_bn, offs_k = _grouped_tile_setup(
-        pid_m,
-        pid_n,
-        Offsets,
-        TileOffsets,
-        stride_offs,
-        stride_tile,
-        NUM_EXPERTS,
-        NUM_EXPERTS_BIT_LENGTH,
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
-    )
-    offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
-
-    a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = (
-        B
-        + expert_id * stride_be
-        + offs_k[:, None] * stride_bk
-        + offs_bn[None, :] * stride_bn
-    )
-    bs_ptrs = (
-        Bs
-        + expert_id * stride_bs_e
-        + offs_bn[:, None] * stride_bs_n
-        + offs_sf[None, :] * stride_bs_k
-    )
-
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
-        a, a_scale = mx_act_quant_inline(
-            a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
-        )
-        b = tl.load(b_ptrs)
-        b_s = tl.load(bs_ptrs).to(tl.uint8)
-        accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3")
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
     _store_tile(
@@ -517,19 +437,19 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
     """Block-scale grouped FP8 matmul: C = A @ B.T per expert, with fused act quant.
 
     A:  (S, K) raw bf16/fp16 activations, sorted by expert
-    B:  (E, N, K) FP8 expert weights
-    Bs: (E, N // block_n, K // block_k) per-block weight scales
+    B:  (num_experts, N, K) FP8 expert weights
+    Bs: (num_experts, N // block_n, K // block_k) per-block weight scales
     """
     assert A.ndim == 2, f"A must be 2D (S, K), got ndim={A.ndim}"
     assert A.is_contiguous(), "A must be contiguous"
-    assert B.ndim == 3, f"B must be 3D (E, N, K), got ndim={B.ndim}"
+    assert B.ndim == 3, f"B must be 3D (num_experts, N, K), got ndim={B.ndim}"
     assert B.is_contiguous(), "B must be contiguous"
     assert A.shape[1] == B.shape[2], (
         f"K mismatch: A has K={A.shape[1]}, B has K={B.shape[2]}"
     )
 
     S, K = A.shape
-    E, N, _ = B.shape
+    num_experts, N, _ = B.shape
 
     assert len(block_size) == 2, (
         f"block_size must be [block_n, block_k], got {block_size}"
@@ -539,17 +459,17 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
     assert N % block_n == 0, f"N ({N}) must be divisible by block_n ({block_n})"
     assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
     assert Bs.ndim == 3, (
-        f"Bs must be 3D (E, N//block_n, K//block_k), got ndim={Bs.ndim}"
+        f"Bs must be 3D (num_experts, N//block_n, K//block_k), got ndim={Bs.ndim}"
     )
-    assert Bs.shape == (E, N // block_n, K // block_k), (
-        f"Bs shape {tuple(Bs.shape)} != expected ({E}, {N // block_n}, {K // block_k})"
+    assert Bs.shape == (num_experts, N // block_n, K // block_k), (
+        f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, {N // block_n}, {K // block_k})"
     )
 
     Bs = ue8m0_as_uint8(Bs)
     C = A.new_empty(S, N, dtype=output_dtype)
-    BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
+    BLOCK_SIZE_M = adaptive_block_size_m((S + num_experts - 1) // num_experts)
     tile_offsets, max_m_tiles = grouped_tile_layout(
-        tokens_per_expert, BLOCK_SIZE_M, S, E
+        tokens_per_expert, BLOCK_SIZE_M, S, num_experts
     )
     grid = (max_m_tiles, triton.cdiv(N, block_n))
 
@@ -577,11 +497,11 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
             offsets.stride(0),
             tile_offsets.stride(0),
             # Meta-parameters
-            NUM_EXPERTS=E,
+            num_experts=num_experts,
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=block_k,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
-            NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
+            NUM_EXPERTS_BIT_LENGTH=num_experts.bit_length(),
         )
 
     return C
@@ -601,34 +521,34 @@ def _w8a8_tensor_dynamic_fp8_matmul_grouped(
     """Tensor-scale grouped FP8 matmul: C = A @ B.T per expert, with fused act quant.
 
     A:  (S, K) raw bf16/fp16 activations, sorted by expert
-    B:  (E, N, K) FP8 expert weights
-    Bs: (E,) or (E, 1, 1) per-expert weight scales
+    B:  (num_experts, N, K) FP8 expert weights
+    Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales
     """
     assert A.ndim == 2, f"A must be 2D (S, K), got ndim={A.ndim}"
     assert A.is_contiguous(), "A must be contiguous"
-    assert B.ndim == 3, f"B must be 3D (E, N, K), got ndim={B.ndim}"
+    assert B.ndim == 3, f"B must be 3D (num_experts, N, K), got ndim={B.ndim}"
     assert B.is_contiguous(), "B must be contiguous"
     assert A.shape[1] == B.shape[2], (
         f"K mismatch: A has K={A.shape[1]}, B has K={B.shape[2]}"
     )
 
     S, K = A.shape
-    E, N, _ = B.shape
+    num_experts, N, _ = B.shape
 
-    # Normalize Bs to (E, 1, 1)
+    # Normalize Bs to (num_experts, 1, 1)
     if Bs.ndim == 1:
-        assert Bs.shape[0] == E, f"Bs shape {tuple(Bs.shape)} != expected ({E},)"
-        Bs = Bs.reshape(E, 1, 1)
+        assert Bs.shape[0] == num_experts, f"Bs shape {tuple(Bs.shape)} != expected ({num_experts},)"
+        Bs = Bs.reshape(num_experts, 1, 1)
     else:
-        assert Bs.shape == (E, 1, 1), (
-            f"Bs shape {tuple(Bs.shape)} != expected ({E}, 1, 1)"
+        assert Bs.shape == (num_experts, 1, 1), (
+            f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, 1, 1)"
         )
 
     qA, As = fp8_act_quant(A, K)
     C = A.new_empty(S, N, dtype=output_dtype)
-    BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
+    BLOCK_SIZE_M = adaptive_block_size_m((S + num_experts - 1) // num_experts)
     tile_offsets, max_m_tiles = grouped_tile_layout(
-        tokens_per_expert, BLOCK_SIZE_M, S, E
+        tokens_per_expert, BLOCK_SIZE_M, S, num_experts
     )
 
     def grid(META):
@@ -658,9 +578,9 @@ def _w8a8_tensor_dynamic_fp8_matmul_grouped(
             offsets.stride(0),
             tile_offsets.stride(0),
             # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
-            NUM_EXPERTS=E,
+            num_experts=num_experts,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
-            NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
+            NUM_EXPERTS_BIT_LENGTH=num_experts.bit_length(),
         )
 
     return C
@@ -678,8 +598,8 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     """Block-scale grouped FP8 matmul with fused activation quantization.
 
     A:  (S, K) raw activations sorted by expert, bf16/fp16/fp32
-    B:  (E, N, K) FP8 expert weights
-    Bs: (E, N // block_n, K // block_k) per-block weight scales
+    B:  (num_experts, N, K) FP8 expert weights
+    Bs: (num_experts, N // block_n, K // block_k) per-block weight scales
     output_dtype: defaults to ``A.dtype``
     """
     return ops.w8a8_block_dynamic_fp8_matmul_grouped(
@@ -698,8 +618,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     """Tensor-scale grouped FP8 matmul with fused activation quantization.
 
     A:  (S, K) raw activations sorted by expert, bf16/fp16/fp32
-    B:  (E, N, K) FP8 expert weights
-    Bs: (E,) or (E, 1, 1) per-expert weight scales
+    B:  (num_experts, N, K) FP8 expert weights
+    Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales
     output_dtype: defaults to ``A.dtype``
     """
     return ops.w8a8_tensor_dynamic_fp8_matmul_grouped(
@@ -708,9 +628,9 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
 
 
 @triton_op(
-    add_op_namespace_prefix("w4a8_mx_dynamic_fp4_matmul_grouped"), mutates_args=()
+    add_op_namespace_prefix("mxfp_dynamic_matmul_grouped"), mutates_args=()
 )
-def _w4a8_mx_dynamic_fp4_matmul_grouped(
+def _mxfp_dynamic_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -718,48 +638,50 @@ def _w4a8_mx_dynamic_fp4_matmul_grouped(
     tokens_per_expert: torch.Tensor,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Grouped MXFP4 (W4A8) matmul with fused activation quant.
+    """Grouped MX matmul with fused act quant — per-expert ``C[s] = A[s] @ B[e].T`` over
+    contiguous, expert-sorted rows. Weight format detected from ``B.dtype``: ``int8`` →
+    packed E2M1 (MXFP4, ``B`` is ``(num_experts, N, K//2)``); ``float8_e4m3fn`` → unpacked E4M3
+    (MXFP8, ``(num_experts, N, K)``). UE8M0 group-32 scales ``(num_experts, N, K//32)``; tile + dot autotuned.
 
-    A:  (S, K) raw activations, bf16/fp16/fp32, expert-sorted (quantized inline)
-    B:  (E, N, K // 2) packed FP4 (E2M1) expert weights, two codes per int8
-    Bs: (E, N, K // 32) UE8M0 weight scales
-    offsets: (E,) — exclusive prefix of expert token counts (cumsum)
-    tokens_per_expert: (E,) — per-expert row count
-
-    BLOCK_SIZE_N and BLOCK_SIZE_K are autotuned.
+    A:  (S, K) raw activations, bf16/fp16/fp32, expert-sorted (quantized inline to E4M3)
+    offsets: (num_experts,) — exclusive prefix of expert token counts (cumsum)
+    tokens_per_expert: (num_experts,) — per-expert row count
     """
     assert A.ndim == 2 and B.ndim == 3 and Bs.ndim == 3
     assert offsets.ndim == 1 and tokens_per_expert.ndim == 1
-    assert B.dtype == torch.int8, f"B must be int8 (packed FP4), got {B.dtype}"
+    assert B.dtype in (torch.int8, torch.float8_e4m3fn), (
+        f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
+    )
     assert Bs.dtype == torch.float8_e8m0fnu, (
         f"Bs must be float8_e8m0fnu, got {Bs.dtype}"
     )
+    VALUES_PER_BYTE = NIBBLES_PER_BYTE if B.dtype == torch.int8 else 1
 
     S, K = A.shape
-    E, N, K_half = B.shape
-    assert offsets.shape[0] == E and tokens_per_expert.shape[0] == E
-    assert K == NIBBLES_PER_BYTE * K_half, (
-        f"K (={K}) must equal {NIBBLES_PER_BYTE} * B.shape[2] (={K_half})"
+    num_experts, N, K_b = B.shape
+    assert offsets.shape[0] == num_experts and tokens_per_expert.shape[0] == num_experts
+    assert K == VALUES_PER_BYTE * K_b, (
+        f"K (={K}) must equal {VALUES_PER_BYTE} * B.shape[2] (={K_b})"
     )
     assert K % MX_SCALE_GROUP_K == 0, (
         f"K (={K}) must be a multiple of {MX_SCALE_GROUP_K}"
     )
-    assert Bs.shape == (E, N, K // MX_SCALE_GROUP_K), (
-        f"Bs shape {tuple(Bs.shape)} != ({E}, {N}, {K // MX_SCALE_GROUP_K})"
+    assert Bs.shape == (num_experts, N, K // MX_SCALE_GROUP_K), (
+        f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {N}, {K // MX_SCALE_GROUP_K})"
     )
 
     bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty((S, N), dtype=output_dtype)
-    BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
+    BLOCK_SIZE_M = adaptive_block_size_m((S + num_experts - 1) // num_experts)
     tile_offsets, max_m_tiles = grouped_tile_layout(
-        tokens_per_expert, BLOCK_SIZE_M, S, E
+        tokens_per_expert, BLOCK_SIZE_M, S, num_experts
     )
 
     def grid(META):
         return (max_m_tiles, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
-        wrap_triton(w4a8_mx_dynamic_fp4_matmul_grouped_kernel)[grid](
+        wrap_triton(mxfp_dynamic_matmul_grouped_kernel)[grid](
             A,
             B,
             C,
@@ -782,16 +704,16 @@ def _w4a8_mx_dynamic_fp4_matmul_grouped(
             offsets.stride(0),
             tile_offsets.stride(0),
             # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
-            NUM_EXPERTS=E,
+            num_experts=num_experts,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
-            NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
-            NIBBLES_PER_BYTE=NIBBLES_PER_BYTE,
+            NUM_EXPERTS_BIT_LENGTH=num_experts.bit_length(),
+            VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
         )
     return C
 
 
-def w4a8_mx_dynamic_fp4_matmul_grouped(
+def mxfp_dynamic_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -799,110 +721,10 @@ def w4a8_mx_dynamic_fp4_matmul_grouped(
     tokens_per_expert: torch.Tensor,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Grouped MXFP4 (W4A8) matmul with fused activation quant. Per-expert
-    ``C[s] = A[s] @ B[e].T`` over contiguous, expert-sorted rows. Tile shape
-    autotuned; FP4 scale granularity is fixed at 32."""
-    return ops.w4a8_mx_dynamic_fp4_matmul_grouped(
-        A, B, Bs, offsets, tokens_per_expert, output_dtype
-    )
-
-
-@triton_op(
-    add_op_namespace_prefix("w8a8_mx_dynamic_fp8_matmul_grouped"), mutates_args=()
-)
-def _w8a8_mx_dynamic_fp8_matmul_grouped(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    offsets: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Grouped MXFP8 (W8A8) matmul: ``C[s] = A[s] @ B[e].T`` (E4M3 × E4M3, UE8M0
-    group-32 scales) with fused activation quant.
-
-    A:  (S, K) raw activations, bf16/fp16/fp32, expert-sorted (quantized inline)
-    B:  (E, N, K) E4M3 expert weights (unpacked)
-    Bs: (E, N, K // 32) UE8M0 weight scales
-    offsets: (E,) — exclusive prefix of expert token counts (cumsum)
-    tokens_per_expert: (E,) — per-expert row count
-
-    BLOCK_SIZE_N and BLOCK_SIZE_K are autotuned; MX scale granularity is fixed at 32.
-    """
-    assert A.ndim == 2 and B.ndim == 3 and Bs.ndim == 3
-    assert offsets.ndim == 1 and tokens_per_expert.ndim == 1
-    assert B.dtype == torch.float8_e4m3fn, (
-        f"B must be float8_e4m3fn (E4M3 weights), got {B.dtype}"
-    )
-    assert Bs.dtype == torch.float8_e8m0fnu, (
-        f"Bs must be float8_e8m0fnu, got {Bs.dtype}"
-    )
-
-    S, K = A.shape
-    E, N, K_b = B.shape
-    assert offsets.shape[0] == E and tokens_per_expert.shape[0] == E
-    assert K == K_b, f"K mismatch: A has K={K}, B has K={K_b}"
-    assert K % MX_SCALE_GROUP_K == 0, (
-        f"K (={K}) must be a multiple of {MX_SCALE_GROUP_K}"
-    )
-    assert Bs.shape == (E, N, K // MX_SCALE_GROUP_K), (
-        f"Bs shape {tuple(Bs.shape)} != ({E}, {N}, {K // MX_SCALE_GROUP_K})"
-    )
-
-    bs_u8 = ue8m0_as_uint8(Bs)
-    C = A.new_empty((S, N), dtype=output_dtype)
-    BLOCK_SIZE_M = adaptive_block_size_m((S + E - 1) // E)
-    tile_offsets, max_m_tiles = grouped_tile_layout(
-        tokens_per_expert, BLOCK_SIZE_M, S, E
-    )
-
-    def grid(META):
-        return (max_m_tiles, triton.cdiv(N, META["BLOCK_SIZE_N"]))
-
-    with device_context(A.device):
-        wrap_triton(w8a8_mx_dynamic_fp8_matmul_grouped_kernel)[grid](
-            A,
-            B,
-            C,
-            bs_u8,
-            offsets,
-            tile_offsets,
-            S,
-            N,
-            K,
-            A.stride(0),
-            A.stride(1),
-            B.stride(0),
-            B.stride(2),
-            B.stride(1),
-            C.stride(0),
-            C.stride(1),
-            bs_u8.stride(0),
-            bs_u8.stride(2),
-            bs_u8.stride(1),
-            offsets.stride(0),
-            tile_offsets.stride(0),
-            # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
-            NUM_EXPERTS=E,
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
-            SCALE_GROUP_K=MX_SCALE_GROUP_K,
-        )
-    return C
-
-
-def w8a8_mx_dynamic_fp8_matmul_grouped(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    offsets: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Grouped MXFP8 (W8A8) matmul with fused activation quant. Per-expert
-    ``C[s] = A[s] @ B[e].T`` over contiguous, expert-sorted rows via the MX
-    scaled MMA (E4M3 × E4M3, UE8M0 group-32). Tile shape autotuned."""
-    return ops.w8a8_mx_dynamic_fp8_matmul_grouped(
+    """Grouped MX (MXFP4/MXFP8) matmul with fused act quant — per-expert
+    ``C[s] = A[s] @ B[e].T`` over expert-sorted rows; weight format detected from
+    ``B.dtype``. Tile + dot path autotuned."""
+    return ops.mxfp_dynamic_matmul_grouped(
         A, B, Bs, offsets, tokens_per_expert, output_dtype
     )
 
@@ -922,26 +744,18 @@ def matmul_grouped(
     ``output_dtype`` defaults to ``A.dtype``.
 
     Routes by weight dtype and ``block_size``:
-    - ``B.dtype == int8`` (packed FP4) → ``w4a8_mx_dynamic_fp4_matmul_grouped``
-      (``block_size`` is ignored; FP4 tile shape is autotuned).
-    - ``B.dtype == float8_e4m3fn`` with UE8M0 group-32 ``Bs`` (shape ``[E, N, K//32]``)
-      → ``w8a8_mx_dynamic_fp8_matmul_grouped`` (MX scaled MMA; ``block_size`` ignored).
+    - MX weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
+      group-32 ``Bs`` (shape ``[num_experts, N, K//32]``) → ``mxfp_dynamic_matmul_grouped``
+      (``block_size`` ignored; tile + dot path autotuned).
     - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_dynamic_fp8_matmul_grouped``.
     - otherwise → ``w8a8_block_dynamic_fp8_matmul_grouped``.
     """
-    if is_mxfp4(B, Bs):
-        return w4a8_mx_dynamic_fp4_matmul_grouped(
+    if is_mxfp(B, Bs):
+        return mxfp_dynamic_matmul_grouped(
             A, B, Bs, offsets, tokens_per_expert, output_dtype
         )
 
-    if is_mxfp8(B, Bs):
-        return w8a8_mx_dynamic_fp8_matmul_grouped(
-            A, B, Bs, offsets, tokens_per_expert, output_dtype
-        )
-
-    if block_size is None or (
-        block_size[0] == B.size(1) and block_size[1] == B.size(2)
-    ):
+    if is_tensor_wide(block_size, B):
         return w8a8_tensor_dynamic_fp8_matmul_grouped(
             A, B, Bs, offsets, tokens_per_expert, output_dtype
         )

@@ -18,17 +18,21 @@ import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
 from ._ops import add_op_namespace_prefix, ops
+from .bayesian_autotuner import bayesian_autotune
 from .utils import (
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
+    DECODE_BLOCK_SIZE_M,
     decode_ue8m0_scale,
     device_context,
-    mx_act_quant_inline,
+    mxfp_act_quant_inline,
+    mxfp4_e2m1_to_e4m3,
     fp8_act_quant,
     fp8_act_quant_inline,
     get_accelerator_autotuning_configs,
-    is_mxfp4,
-    is_mxfp8,
+    get_mxfp_autotuning_configs,
+    is_mxfp,
+    is_tensor_wide,
     ue8m0_as_uint8,
 )
 
@@ -50,7 +54,7 @@ def _expert_setup(
     ids, look up the routed expert, and advance the A/B/C/Bs base pointers to this
     row's slice. Returns ``(batch_id, pid_n, expert_id, A, B, C, Bs)``.
 
-    The caller must early-return on the EP sentinel (``expert_id >= NUM_EXPERTS``)
+    The caller must early-return on the EP sentinel (``expert_id >= num_experts``)
     before any load — the pointer arithmetic itself is harmless, only the loads on a
     non-local expert would be out of bounds."""
     batch_id = tl.program_id(axis=0)
@@ -88,14 +92,14 @@ def _store_row(
 
 @triton.autotune(
     configs=get_accelerator_autotuning_configs(),
-    key=["N", "K"],
+    key=["N", "K", "S"],
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     A,  # (S, K) raw BF16/FP16 activations
-    B,  # (E, N, K) FP8 weight matrices
+    B,  # (num_experts, N, K) FP8 weight matrices
     C,  # (S, N) output
-    Bs,  # (E, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales
+    Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales
     ExpertIds,  # (S,) — which expert each batch element routes to
     # Shape
     S,
@@ -113,11 +117,11 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     stride_bs_k,
     stride_bs_n,
     stride_eid,
+    num_experts,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
 ):
     """Block-scale batched FP8 expert matmul kernel.
 
@@ -128,7 +132,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
-    if expert_id >= NUM_EXPERTS:
+    if expert_id >= num_experts:
         return
 
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -159,10 +163,10 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     A,  # (S, K) pre-quantized FP8 activations
-    B,  # (E, N, K) FP8 weight matrices
+    B,  # (num_experts, N, K) FP8 weight matrices
     C,  # (S, N) output
     As,  # (S,) per-token activation scales
-    Bs,  # (E, 1, 1) per-tensor weight scales
+    Bs,  # (num_experts, 1, 1) per-tensor weight scales
     ExpertIds,  # (S,) — which expert each batch element routes to
     # Shape
     S,
@@ -179,11 +183,11 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     stride_as_m,
     stride_bs_e,
     stride_eid,
+    num_experts,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
 ):
     """Tensor-scale batched FP8 expert matmul kernel.
 
@@ -194,7 +198,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
         A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
-    if expert_id >= NUM_EXPERTS:
+    if expert_id >= num_experts:
         return
 
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -218,16 +222,13 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     _store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
-@triton.autotune(
-    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
-    key=["N", "K"],
-)
+@bayesian_autotune(get_mxfp_autotuning_configs(), ["N", "K", "S"], n_trials=60)
 @triton.jit
-def w4a8_mx_dynamic_fp4_matmul_batched_kernel(
+def mxfp_dynamic_matmul_batched_kernel(
     A,  # (S, K) raw BF16/FP16 activations
-    B,  # (E, N, K // 2) packed FP4 (E2M1) expert weights as int8
+    B,  # (num_experts, N, K) E4M3 (MXFP8) or (num_experts, N, K // 2) packed E2M1 (MXFP4) expert weights
     C,  # (S, N) output
-    Bs,  # (E, N, K // SCALE_GROUP_K) UE8M0 weight scales
+    Bs,  # (num_experts, N, K // SCALE_GROUP_K) UE8M0 weight scales
     ExpertIds,  # (S,) — which expert each routed row uses
     # Shape
     S,
@@ -245,117 +246,63 @@ def w4a8_mx_dynamic_fp4_matmul_batched_kernel(
     stride_bs_k,
     stride_bs_n,
     stride_eid,
+    num_experts,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    NIBBLES_PER_BYTE: tl.constexpr,
+    USE_DOT_SCALED: tl.constexpr,
+    VALUES_PER_BYTE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
 ):
-    """Batched MXFP4 (W4A8) expert matmul with fused activation quant.
+    """Unified batched MXFP4/MXFP8 (W4A8/W8A8) expert matmul with fused act quant.
 
-    Each program handles one routed token row and one N-tile, looks up the
-    owning expert from ``ExpertIds``, quantizes ``A`` to FP8 per K-group inline
-    (UE8M0 scale), then ``tl.dot_scaled`` against packed FP4 weights.
+    One routed row + one N-tile per program; expert looked up from ``ExpertIds``. ``A`` is
+    quantized to E4M3 per K-group inline (UE8M0 scale). ``VALUES_PER_BYTE`` picks the
+    weight format (2 = packed E2M1 / MXFP4, 1 = unpacked E4M3 / MXFP8); ``USE_DOT_SCALED``
+    picks ``tl.dot_scaled`` (native M=128) vs fp8 ``tl.dot`` + per-group rescale (wins at
+    decode where the scaled MMA's M→128 pad is waste; FP4 unpacks E2M1->E4M3, lossless).
     """
     _, pid_n, expert_id, A, B, C, Bs = _expert_setup(
         A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
-    if expert_id >= NUM_EXPERTS:
+    if expert_id >= num_experts:
         return
 
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    offs_k_byte = tl.arange(0, BLOCK_SIZE_K // NIBBLES_PER_BYTE)
+    offs_kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
     a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_ak
-    b_ptrs = B + (offs_k_byte[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    b_ptrs = B + (offs_kb[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
     bs_ptrs = Bs + offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a_raw = tl.load(a_ptrs).to(tl.float32)
-        a, a_scale = mx_act_quant_inline(
+        a, a_scale = mxfp_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
         )
-        b = tl.load(b_ptrs).to(tl.uint8)
+        if VALUES_PER_BYTE == 2:  # MXFP4: packed E2M1 bytes
+            b = tl.load(b_ptrs).to(tl.uint8)
+        else:  # MXFP8: unpacked E4M3
+            b = tl.load(b_ptrs)
         b_s = tl.load(bs_ptrs).to(tl.uint8)
-        accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1")
+        if USE_DOT_SCALED:
+            if VALUES_PER_BYTE == 2:
+                accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1", accumulator)
+            else:
+                accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3", accumulator)
+        else:
+            a_s = decode_ue8m0_scale(a_scale)
+            ws = tl.trans(decode_ue8m0_scale(b_s))
+            if VALUES_PER_BYTE == 2:
+                accumulator += tl.dot(a, mxfp4_e2m1_to_e4m3(b)) * a_s * ws
+            else:
+                accumulator += tl.dot(a, b) * a_s * ws
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += (BLOCK_SIZE_K // NIBBLES_PER_BYTE) * stride_bk
-        bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
-
-    _store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
-
-
-@triton.autotune(
-    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
-    key=["N", "K"],
-)
-@triton.jit
-def w8a8_mx_dynamic_fp8_matmul_batched_kernel(
-    A,  # (S, K) raw BF16/FP16 activations
-    B,  # (E, N, K) E4M3 expert weights (unpacked)
-    C,  # (S, N) output
-    Bs,  # (E, N, K // SCALE_GROUP_K) UE8M0 weight scales
-    ExpertIds,  # (S,) — which expert each routed row uses
-    # Shape
-    S,
-    N,
-    K,
-    # Strides
-    stride_am,
-    stride_ak,
-    stride_be,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    stride_bs_e,
-    stride_bs_k,
-    stride_bs_n,
-    stride_eid,
-    # Meta-parameters
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    SCALE_GROUP_K: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
-):
-    """Batched MXFP8 (W8A8) expert matmul with fused activation quant.
-
-    Each program handles one routed token row and one N-tile, looks up the
-    owning expert from ``ExpertIds``, quantizes ``A`` to E4M3 per K-group inline
-    (UE8M0 scale), then ``tl.dot_scaled`` against E4M3 weights. Mirrors the
-    batched MXFP4 kernel but with unpacked weights and ``"e4m3"`` on both operands.
-    """
-    _, pid_n, expert_id, A, B, C, Bs = _expert_setup(
-        A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
-    )
-    # EP sentinel: row routed to a non-local expert; output is left uninit.
-    if expert_id >= NUM_EXPERTS:
-        return
-
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
-    a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_ak
-    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-    bs_ptrs = Bs + offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k
-
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a_raw = tl.load(a_ptrs).to(tl.float32)
-        a, a_scale = mx_act_quant_inline(
-            a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
-        )
-        b = tl.load(b_ptrs)
-        b_s = tl.load(bs_ptrs).to(tl.uint8)
-        accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3")
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
     _store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
@@ -375,19 +322,19 @@ def _w8a8_block_dynamic_fp8_matmul_batched(
     """Block-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T, with fused act quant.
 
     A:  (S, K) raw bf16/fp16 activations
-    B:  (E, N, K) FP8 expert weights
-    Bs: (E, N // block_n, K // block_k) per-block weight scales
+    B:  (num_experts, N, K) FP8 expert weights
+    Bs: (num_experts, N // block_n, K // block_k) per-block weight scales
     """
     assert A.ndim == 2, f"A must be 2D (S, K), got ndim={A.ndim}"
     assert A.is_contiguous(), "A must be contiguous"
-    assert B.ndim == 3, f"B must be 3D (E, N, K), got ndim={B.ndim}"
+    assert B.ndim == 3, f"B must be 3D (num_experts, N, K), got ndim={B.ndim}"
     assert B.is_contiguous(), "B must be contiguous"
     assert A.shape[1] == B.shape[2], (
         f"K mismatch: A has K={A.shape[1]}, B has K={B.shape[2]}"
     )
 
     S, K = A.shape
-    E, N, _ = B.shape
+    num_experts, N, _ = B.shape
 
     assert len(block_size) == 2, (
         f"block_size must be [block_n, block_k], got {block_size}"
@@ -397,15 +344,12 @@ def _w8a8_block_dynamic_fp8_matmul_batched(
     assert N % block_n == 0, f"N ({N}) must be divisible by block_n ({block_n})"
     assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
     assert Bs.ndim == 3, (
-        f"Bs must be 3D (E, N//block_n, K//block_k), got ndim={Bs.ndim}"
+        f"Bs must be 3D (num_experts, N//block_n, K//block_k), got ndim={Bs.ndim}"
     )
-    assert Bs.shape == (E, N // block_n, K // block_k), (
-        f"Bs shape {tuple(Bs.shape)} != expected ({E}, {N // block_n}, {K // block_k})"
+    assert Bs.shape == (num_experts, N // block_n, K // block_k), (
+        f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, {N // block_n}, {K // block_k})"
     )
 
-    # Decode handles one routed row per program; BLOCK_SIZE_M > 1 would just
-    # duplicate the same row computation and keep one row on store.
-    BLOCK_SIZE_M = 1
     Bs = ue8m0_as_uint8(Bs)
     grid = (S, triton.cdiv(N, block_n))
     C = A.new_empty(S, N, dtype=output_dtype)
@@ -433,8 +377,8 @@ def _w8a8_block_dynamic_fp8_matmul_batched(
             expert_ids.stride(0),
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=block_k,
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            NUM_EXPERTS=E,
+            BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
+            num_experts=num_experts,
         )
 
     return C
@@ -453,32 +397,29 @@ def _w8a8_tensor_dynamic_fp8_matmul_batched(
     """Tensor-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T, with fused act quant.
 
     A:  (S, K) raw bf16/fp16 activations
-    B:  (E, N, K) FP8 expert weights
-    Bs: (E,) or (E, 1, 1) per-expert weight scales
+    B:  (num_experts, N, K) FP8 expert weights
+    Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales
     """
     assert A.ndim == 2, f"A must be 2D (S, K), got ndim={A.ndim}"
     assert A.is_contiguous(), "A must be contiguous"
-    assert B.ndim == 3, f"B must be 3D (E, N, K), got ndim={B.ndim}"
+    assert B.ndim == 3, f"B must be 3D (num_experts, N, K), got ndim={B.ndim}"
     assert B.is_contiguous(), "B must be contiguous"
     assert A.shape[1] == B.shape[2], (
         f"K mismatch: A has K={A.shape[1]}, B has K={B.shape[2]}"
     )
 
     S, K = A.shape
-    E, N, _ = B.shape
+    num_experts, N, _ = B.shape
 
-    # Normalize Bs to (E, 1, 1)
+    # Normalize Bs to (num_experts, 1, 1)
     if Bs.ndim == 1:
-        assert Bs.shape[0] == E, f"Bs shape {tuple(Bs.shape)} != expected ({E},)"
-        Bs = Bs.reshape(E, 1, 1)
+        assert Bs.shape[0] == num_experts, f"Bs shape {tuple(Bs.shape)} != expected ({num_experts},)"
+        Bs = Bs.reshape(num_experts, 1, 1)
     else:
-        assert Bs.shape == (E, 1, 1), (
-            f"Bs shape {tuple(Bs.shape)} != expected ({E}, 1, 1)"
+        assert Bs.shape == (num_experts, 1, 1), (
+            f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, 1, 1)"
         )
 
-    # Decode handles one routed row per program; BLOCK_SIZE_M > 1 would just
-    # duplicate the same row computation and keep one row on store.
-    BLOCK_SIZE_M = 1
     Bs = ue8m0_as_uint8(Bs)
     qA, As = fp8_act_quant(A, K)
     C = A.new_empty(S, N, dtype=output_dtype)
@@ -507,8 +448,8 @@ def _w8a8_tensor_dynamic_fp8_matmul_batched(
             As.stride(0),
             Bs.stride(0),
             expert_ids.stride(0),
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            NUM_EXPERTS=E,
+            BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
+            num_experts=num_experts,
         )
 
     return C
@@ -525,8 +466,8 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     """Block-scale batched FP8 matmul with fused activation quantization.
 
     A:  (S, K) raw activations, bf16/fp16/fp32
-    B:  (E, N, K) FP8 expert weights
-    Bs: (E, N // block_n, K // block_k) per-block weight scales
+    B:  (num_experts, N, K) FP8 expert weights
+    Bs: (num_experts, N // block_n, K // block_k) per-block weight scales
     expert_ids: (S,) — kernel loads stride-aware, any int dtype works
     output_dtype: defaults to ``A.dtype``
     """
@@ -545,8 +486,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     """Tensor-scale batched FP8 matmul with fused activation quantization.
 
     A:  (S, K) raw activations, bf16/fp16/fp32
-    B:  (E, N, K) FP8 expert weights
-    Bs: (E,) or (E, 1, 1) per-expert weight scales
+    B:  (num_experts, N, K) FP8 expert weights
+    Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales
     output_dtype: defaults to ``A.dtype``
     """
     return ops.w8a8_tensor_dynamic_fp8_matmul_batched(
@@ -554,139 +495,45 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     )
 
 
-@triton_op(
-    add_op_namespace_prefix("w4a8_mx_dynamic_fp4_matmul_batched"), mutates_args=()
-)
-def _w4a8_mx_dynamic_fp4_matmul_batched(
+@triton_op(add_op_namespace_prefix("mxfp_dynamic_matmul_batched"), mutates_args=())
+def _mxfp_dynamic_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Batched MXFP4 (W4A8) matmul with fused activation quant.
-
-    A:  (S, K) raw activations, bf16/fp16/fp32 (quantized inline to FP8)
-    B:  (E, N, K // 2) packed FP4 (E2M1) expert weights, two codes per int8
-    Bs: (E, N, K // 32) UE8M0 weight scales
-    expert_ids: (S,) which expert each routed row uses
-
-    BLOCK_SIZE_N and BLOCK_SIZE_K are autotuned.
-    """
-    assert A.ndim == 2 and B.ndim == 3 and Bs.ndim == 3
-    assert expert_ids.ndim == 1
-    assert B.dtype == torch.int8, f"B must be int8 (packed FP4), got {B.dtype}"
-    assert Bs.dtype == torch.float8_e8m0fnu, (
-        f"Bs must be float8_e8m0fnu, got {Bs.dtype}"
-    )
-
-    S, K = A.shape
-    E, N, K_half = B.shape
-    assert expert_ids.shape[0] == S
-    assert K == NIBBLES_PER_BYTE * K_half, (
-        f"K (={K}) must equal {NIBBLES_PER_BYTE} * B.shape[2] (={K_half})"
-    )
-    assert K % MX_SCALE_GROUP_K == 0, (
-        f"K (={K}) must be a multiple of {MX_SCALE_GROUP_K}"
-    )
-    assert Bs.shape == (E, N, K // MX_SCALE_GROUP_K), (
-        f"Bs shape {tuple(Bs.shape)} != ({E}, {N}, {K // MX_SCALE_GROUP_K})"
-    )
-
-    # Decode handles one routed row per program; BLOCK_SIZE_M > 1 would just
-    # duplicate the same row computation and keep one row on store.
-    BLOCK_SIZE_M = 1
-    bs_u8 = ue8m0_as_uint8(Bs)
-    C = A.new_empty((S, N), dtype=output_dtype)
-
-    def grid(META):
-        return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
-
-    with device_context(A.device):
-        wrap_triton(w4a8_mx_dynamic_fp4_matmul_batched_kernel)[grid](
-            A,
-            B,
-            C,
-            bs_u8,
-            expert_ids,
-            S,
-            N,
-            K,
-            A.stride(0),
-            A.stride(1),
-            B.stride(0),
-            B.stride(2),
-            B.stride(1),
-            C.stride(0),
-            C.stride(1),
-            bs_u8.stride(0),
-            bs_u8.stride(2),
-            bs_u8.stride(1),
-            expert_ids.stride(0),
-            # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            NIBBLES_PER_BYTE=NIBBLES_PER_BYTE,
-            SCALE_GROUP_K=MX_SCALE_GROUP_K,
-            NUM_EXPERTS=E,
-        )
-    return C
-
-
-def w4a8_mx_dynamic_fp4_matmul_batched(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    expert_ids: torch.Tensor,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Batched MXFP4 (W4A8) matmul with fused activation quant. Tile
-    shape autotuned; FP4 scale granularity is fixed at 32."""
-    return ops.w4a8_mx_dynamic_fp4_matmul_batched(A, B, Bs, expert_ids, output_dtype)
-
-
-@triton_op(
-    add_op_namespace_prefix("w8a8_mx_dynamic_fp8_matmul_batched"), mutates_args=()
-)
-def _w8a8_mx_dynamic_fp8_matmul_batched(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    expert_ids: torch.Tensor,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Batched MXFP8 (W8A8) matmul: ``C[s] = A[s] @ B[expert_ids[s]].T`` (E4M3 ×
-    E4M3, UE8M0 group-32 scales) with fused activation quant.
+    """Batched MX matmul ``C[s] = A[s] @ B[expert_ids[s]].T`` with fused act quant.
+    Weight format is detected from ``B.dtype``: ``int8`` → packed E2M1 (MXFP4, ``B`` is
+    ``(num_experts, N, K//2)``); ``float8_e4m3fn`` → unpacked E4M3 (MXFP8, ``(num_experts, N, K)``). Both use
+    UE8M0 group-32 scales ``(num_experts, N, K//32)``; tile + dot path are autotuned.
 
     A:  (S, K) raw activations, bf16/fp16/fp32 (quantized inline to E4M3)
-    B:  (E, N, K) E4M3 expert weights (unpacked)
-    Bs: (E, N, K // 32) UE8M0 weight scales
     expert_ids: (S,) which expert each routed row uses
-
-    BLOCK_SIZE_N and BLOCK_SIZE_K are autotuned.
     """
     assert A.ndim == 2 and B.ndim == 3 and Bs.ndim == 3
     assert expert_ids.ndim == 1
-    assert B.dtype == torch.float8_e4m3fn, (
-        f"B must be float8_e4m3fn (E4M3 weights), got {B.dtype}"
+    assert B.dtype in (torch.int8, torch.float8_e4m3fn), (
+        f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
     )
     assert Bs.dtype == torch.float8_e8m0fnu, (
         f"Bs must be float8_e8m0fnu, got {Bs.dtype}"
     )
+    VALUES_PER_BYTE = NIBBLES_PER_BYTE if B.dtype == torch.int8 else 1
 
     S, K = A.shape
-    E, N, K_b = B.shape
+    num_experts, N, K_b = B.shape
     assert expert_ids.shape[0] == S
-    assert K == K_b, f"K mismatch: A has K={K}, B has K={K_b}"
+    assert K == VALUES_PER_BYTE * K_b, (
+        f"K (={K}) must equal {VALUES_PER_BYTE} * B.shape[2] (={K_b})"
+    )
     assert K % MX_SCALE_GROUP_K == 0, (
         f"K (={K}) must be a multiple of {MX_SCALE_GROUP_K}"
     )
-    assert Bs.shape == (E, N, K // MX_SCALE_GROUP_K), (
-        f"Bs shape {tuple(Bs.shape)} != ({E}, {N}, {K // MX_SCALE_GROUP_K})"
+    assert Bs.shape == (num_experts, N, K // MX_SCALE_GROUP_K), (
+        f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {N}, {K // MX_SCALE_GROUP_K})"
     )
 
-    # Decode handles one routed row per program; BLOCK_SIZE_M > 1 would just
-    # duplicate the same row computation and keep one row on store.
-    BLOCK_SIZE_M = 1
     bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty((S, N), dtype=output_dtype)
 
@@ -694,7 +541,7 @@ def _w8a8_mx_dynamic_fp8_matmul_batched(
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
-        wrap_triton(w8a8_mx_dynamic_fp8_matmul_batched_kernel)[grid](
+        wrap_triton(mxfp_dynamic_matmul_batched_kernel)[grid](
             A,
             B,
             C,
@@ -715,23 +562,24 @@ def _w8a8_mx_dynamic_fp8_matmul_batched(
             bs_u8.stride(1),
             expert_ids.stride(0),
             # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
+            VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
-            NUM_EXPERTS=E,
+            num_experts=num_experts,
         )
     return C
 
 
-def w8a8_mx_dynamic_fp8_matmul_batched(
+def mxfp_dynamic_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Batched MXFP8 (W8A8) matmul with fused activation quant (E4M3 × E4M3,
-    UE8M0 group-32) via the MX scaled MMA. Tile shape autotuned."""
-    return ops.w8a8_mx_dynamic_fp8_matmul_batched(A, B, Bs, expert_ids, output_dtype)
+    """Batched MX (MXFP4/MXFP8) matmul with fused act quant; the weight format
+    (packed E2M1 vs E4M3) is detected from ``B.dtype``. Tile + dot path autotuned."""
+    return ops.mxfp_dynamic_matmul_batched(A, B, Bs, expert_ids, output_dtype)
 
 
 def matmul_batched(
@@ -748,22 +596,16 @@ def matmul_batched(
     ``output_dtype`` defaults to ``A.dtype``.
 
     Routes by weight dtype and ``block_size``:
-    - ``B.dtype == int8`` (packed FP4) → ``w4a8_mx_dynamic_fp4_matmul_batched``
-      (``block_size`` is ignored; FP4 tile shape is autotuned).
-    - ``B.dtype == float8_e4m3fn`` with UE8M0 group-32 ``Bs`` (shape ``[E, N, K//32]``)
-      → ``w8a8_mx_dynamic_fp8_matmul_batched`` (MX scaled MMA; ``block_size`` ignored).
+    - MX weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
+      group-32 ``Bs`` (shape ``[num_experts, N, K//32]``) → ``mxfp_dynamic_matmul_batched``
+      (``block_size`` ignored; tile + dot path autotuned).
     - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_dynamic_fp8_matmul_batched``.
     - otherwise → ``w8a8_block_dynamic_fp8_matmul_batched``.
     """
-    if is_mxfp4(B, Bs):
-        return w4a8_mx_dynamic_fp4_matmul_batched(A, B, Bs, expert_ids, output_dtype)
+    if is_mxfp(B, Bs):
+        return mxfp_dynamic_matmul_batched(A, B, Bs, expert_ids, output_dtype)
 
-    if is_mxfp8(B, Bs):
-        return w8a8_mx_dynamic_fp8_matmul_batched(A, B, Bs, expert_ids, output_dtype)
-
-    if block_size is None or (
-        block_size[0] == B.size(1) and block_size[1] == B.size(2)
-    ):
+    if is_tensor_wide(block_size, B):
         return w8a8_tensor_dynamic_fp8_matmul_batched(
             A, B, Bs, expert_ids, output_dtype
         )

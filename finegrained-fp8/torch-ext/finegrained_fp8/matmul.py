@@ -18,6 +18,7 @@ import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
 from ._ops import add_op_namespace_prefix, ops
+from .bayesian_autotuner import bayesian_autotune
 from .utils import (
     NIBBLES_PER_BYTE,
     MX_SCALE_GROUP_K,
@@ -27,11 +28,17 @@ from .utils import (
     fp8_act_quant,
     fp8_act_quant_inline,
     get_accelerator_autotuning_configs,
-    is_mxfp4,
-    is_mxfp8,
-    mx_act_quant_inline,
+    get_mxfp_autotuning_configs,
+    is_mxfp,
+    is_tensor_wide,
+    mxfp_act_quant_inline,
+    mxfp4_e2m1_to_e4m3,
     ue8m0_as_uint8,
 )
+
+# Swizzle group size for the 2D-grid kernels' L2-locality tiling (``_swizzle_offsets``) —
+# a perf knob passed as the ``GROUP_SIZE_M`` constexpr, not a correctness parameter.
+GROUP_SIZE_M = 8
 
 
 @triton.jit
@@ -277,14 +284,11 @@ def w8a8_block_static_fp8_matmul_kernel(
     )
 
 
-@triton.autotune(
-    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
-    key=["N", "K", "BLOCK_SIZE_M"],
-)
+@bayesian_autotune(get_mxfp_autotuning_configs(), ["N", "K", "BLOCK_SIZE_M"], n_trials=60)
 @triton.jit
-def w4a8_mx_dynamic_fp4_matmul_kernel(
+def mxfp_dynamic_matmul_kernel(
     A,  # (M, K) raw BF16/FP16 activations
-    B,  # (N, K // 2) packed FP4 (E2M1) weights as int8
+    B,  # (N, K) E4M3 (MXFP8) or (N, K // 2) packed E2M1 (MXFP4) weights
     C,  # (M, N) output
     Bs,  # (N, K // SCALE_GROUP_K) UE8M0 weight scales
     # Shape
@@ -304,24 +308,26 @@ def w4a8_mx_dynamic_fp4_matmul_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    USE_DOT_SCALED: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    NIBBLES_PER_BYTE: tl.constexpr,
+    VALUES_PER_BYTE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
 ):
-    """MXFP4 (W4A8) GEMM kernel with fused activation quantization.
+    """Unified MXFP4/MXFP8 (W4A8/W8A8) GEMM with fused activation quantization.
 
-    Computes ``C = A @ B.T`` with bf16/fp16 ``A`` quantized to FP8 (E4M3) per
-    K-group of ``SCALE_GROUP_K`` elements inline (UE8M0 scale), and packed FP4
-    (E2M1) weights with their own UE8M0 scales. 2D grid with swizzle for L2
-    cache locality on B tiles, ``tl.dot_scaled`` for the scaled MMA.
+    ``C = A @ B.T`` with bf16/fp16 ``A`` quantized to E4M3 per K-group inline (UE8M0
+    scale). ``VALUES_PER_BYTE`` picks the weight format: 2 = packed E2M1 (MXFP4),
+    1 = unpacked E4M3 (MXFP8). ``USE_DOT_SCALED`` picks the MMA: ``tl.dot_scaled``
+    (native M=128 scaled MMA) vs fp8 ``tl.dot`` + per-group software rescale (wins at
+    decode; FP4 unpacks E2M1->E4M3 first — lossless). 2D grid with swizzle for L2 reuse.
     """
     pid_m, pid_n, offs_am, offs_bn, offs_k = _swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
     )
-    offs_k_byte = tl.arange(0, BLOCK_SIZE_K // NIBBLES_PER_BYTE)
+    offs_kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = B + (offs_k_byte[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    b_ptrs = B + (offs_kb[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
     bs_ptrs = Bs + (offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -330,88 +336,32 @@ def w4a8_mx_dynamic_fp4_matmul_kernel(
         a_raw = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0).to(
             tl.float32
         )
-        a, a_scale = mx_act_quant_inline(
+        a, a_scale = mxfp_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
         )
-        b = tl.load(
-            b_ptrs, mask=offs_k_byte[:, None] < k_remaining // NIBBLES_PER_BYTE, other=0
-        ).to(tl.uint8)
+        if VALUES_PER_BYTE == 2:  # MXFP4: packed E2M1 bytes
+            b = tl.load(
+                b_ptrs, mask=offs_kb[:, None] < k_remaining // VALUES_PER_BYTE, other=0
+            ).to(tl.uint8)
+        else:  # MXFP8: unpacked E4M3
+            b = tl.load(b_ptrs, mask=offs_kb[:, None] < k_remaining, other=0.0)
         b_s = tl.load(
             bs_ptrs, mask=offs_sf[None, :] < k_remaining // SCALE_GROUP_K, other=0
         ).to(tl.uint8)
-        accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1")
+        if USE_DOT_SCALED:
+            if VALUES_PER_BYTE == 2:
+                accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1", accumulator)
+            else:
+                accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3", accumulator)
+        else:
+            a_s = decode_ue8m0_scale(a_scale)
+            ws = tl.trans(decode_ue8m0_scale(b_s))
+            if VALUES_PER_BYTE == 2:
+                accumulator += tl.dot(a, mxfp4_e2m1_to_e4m3(b)) * a_s * ws
+            else:
+                accumulator += tl.dot(a, b) * a_s * ws
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += (BLOCK_SIZE_K // NIBBLES_PER_BYTE) * stride_bk
-        bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
-
-    _store_masked(
-        C, accumulator, pid_m, pid_n, M, N, stride_cm, stride_cn,
-        BLOCK_SIZE_M, BLOCK_SIZE_N,
-    )
-
-
-@triton.autotune(
-    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
-    key=["N", "K", "BLOCK_SIZE_M"],
-)
-@triton.jit
-def w8a8_mx_dynamic_fp8_matmul_kernel(
-    A,  # (M, K) raw BF16/FP16 activations
-    B,  # (N, K) E4M3 weights (unpacked, one byte per value)
-    C,  # (M, N) output
-    Bs,  # (N, K // SCALE_GROUP_K) UE8M0 weight scales
-    # Shape
-    M,
-    N,
-    K,
-    # Strides
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    stride_bs_k,
-    stride_bs_n,
-    # Meta-parameters
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    SCALE_GROUP_K: tl.constexpr,
-):
-    """MXFP8 block-scale GEMM kernel with fused activation quantization.
-
-    Computes ``C = A @ B.T`` with bf16/fp16 ``A`` quantized to FP8 (E4M3) per
-    K-group of ``SCALE_GROUP_K`` elements inline (UE8M0 scale), against E4M3
-    weights with their own UE8M0 K-group scales. Mirrors the W4A8 FP4 kernel but
-    keeps weights unpacked (one E4M3 byte per value); ``tl.dot_scaled`` drives
-    the MX scaled MMA with ``"e4m3"`` on both operands.
-    """
-    pid_m, pid_n, offs_am, offs_bn, offs_k = _swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
-    )
-    offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
-    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-    bs_ptrs = Bs + (offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k)
-
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        k_remaining = K - k * BLOCK_SIZE_K
-        a_raw = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0).to(
-            tl.float32
-        )
-        a, a_scale = mx_act_quant_inline(
-            a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
-        )
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
-        b_s = tl.load(
-            bs_ptrs, mask=offs_sf[None, :] < k_remaining // SCALE_GROUP_K, other=0
-        ).to(tl.uint8)
-        accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3")
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
     _store_masked(
@@ -483,7 +433,7 @@ def _w8a8_block_dynamic_fp8_matmul(
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
-            GROUP_SIZE_M=8,
+            GROUP_SIZE_M=GROUP_SIZE_M,
         )
 
     return C
@@ -564,7 +514,7 @@ def _w8a8_block_static_fp8_matmul(
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
-            GROUP_SIZE_M=8,
+            GROUP_SIZE_M=GROUP_SIZE_M,
         )
 
     return C
@@ -627,112 +577,42 @@ def _w8a8_tensor_dynamic_fp8_matmul(
             As.stride(0),
             # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
             BLOCK_SIZE_M=BLOCK_SIZE_M,
-            GROUP_SIZE_M=8,
+            GROUP_SIZE_M=GROUP_SIZE_M,
         )
 
     return C
 
 
-@triton_op(add_op_namespace_prefix("w4a8_mx_dynamic_fp4_matmul"), mutates_args=())
-def _w4a8_mx_dynamic_fp4_matmul(
+@triton_op(add_op_namespace_prefix("mxfp_dynamic_matmul"), mutates_args=())
+def _mxfp_dynamic_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """MXFP4 (W4A8) matmul: ``C = A @ B.T`` with fused activation quant.
+    """MX matmul ``C = A @ B.T`` with fused activation quant. Weight format detected
+    from ``B.dtype``: ``int8`` → packed E2M1 (MXFP4, ``B`` is ``(N, K//2)``);
+    ``float8_e4m3fn`` → unpacked E4M3 (MXFP8, ``(N, K)``). Both use UE8M0 group-32 scales
+    ``(N, K//32)``; tile + dot path are autotuned (scale granularity fixed at 32).
 
-    A:  (M, K) raw activations, bf16/fp16/fp32 (quantized inline to FP8)
-    B:  (N, K // 2) packed FP4 (E2M1) weights, two codes per int8
-    Bs: (N, K // 32) UE8M0 weight scales
-
-    On CUDA and other backends, BLOCK_SIZE_N and BLOCK_SIZE_K are autotuned.
-    On XPU they are fixed to 128x128 and only num_warps/num_stages are autotuned.
-    FP4 scale granularity is fixed at 32, so tile shape is purely a perf knob.
+    A:  (M, K) raw activations, bf16/fp16/fp32 (quantized inline to E4M3)
     """
     assert A.ndim == 2 and B.ndim == 2 and Bs.ndim == 2
-    assert B.dtype == torch.int8, f"B must be int8 (packed FP4), got {B.dtype}"
-    assert Bs.dtype == torch.float8_e8m0fnu, (
-        f"Bs must be float8_e8m0fnu, got {Bs.dtype}"
-    )
-    assert A.is_contiguous(), "A must be contiguous"
-    assert B.is_contiguous(), "B must be contiguous"
-
-    M, K = A.shape
-    N, K_half = B.shape
-    assert K == NIBBLES_PER_BYTE * K_half, (
-        f"K (={K}) must equal {NIBBLES_PER_BYTE} * B.shape[1] (={K_half})"
-    )
-    assert K % MX_SCALE_GROUP_K == 0, (
-        f"K (={K}) must be a multiple of {MX_SCALE_GROUP_K}"
-    )
-    assert Bs.shape == (N, K // MX_SCALE_GROUP_K), (
-        f"Bs shape {tuple(Bs.shape)} != ({N}, {K // MX_SCALE_GROUP_K})"
-    )
-
-    bs_u8 = ue8m0_as_uint8(Bs)
-    C = A.new_empty((M, N), dtype=output_dtype)
-    BLOCK_SIZE_M = adaptive_block_size_m(M)
-
-    def grid(META):
-        return (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, META["BLOCK_SIZE_N"]))
-
-    with device_context(A.device):
-        wrap_triton(w4a8_mx_dynamic_fp4_matmul_kernel)[grid](
-            A,
-            B,
-            C,
-            bs_u8,
-            M,
-            N,
-            K,
-            A.stride(0),
-            A.stride(1),
-            B.stride(1),
-            B.stride(0),
-            C.stride(0),
-            C.stride(1),
-            bs_u8.stride(1),
-            bs_u8.stride(0),
-            # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            GROUP_SIZE_M=8,
-            NIBBLES_PER_BYTE=NIBBLES_PER_BYTE,
-            SCALE_GROUP_K=MX_SCALE_GROUP_K,
-        )
-    return C
-
-
-@triton_op(add_op_namespace_prefix("w8a8_mx_dynamic_fp8_matmul"), mutates_args=())
-def _w8a8_mx_dynamic_fp8_matmul(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """MXFP8 W8A8 matmul: ``C = A @ B.T`` (E4M3 × E4M3, UE8M0 group-32 scales).
-
-    A:  (M, K) raw activations, bf16/fp16/fp32 (quantized inline to E4M3,
-        MX group-32 UE8M0 scales)
-    B:  (N, K) E4M3 weights (unpacked)
-    Bs: (N, K // 32) UE8M0 weight scales
-
-    Tile shape (BLOCK_SIZE_N, BLOCK_SIZE_K) is autotuned; MX scale granularity is
-    fixed at 32 (the MX-format spec), so tile shape is purely a perf knob.
-    """
-    assert A.ndim == 2 and B.ndim == 2 and Bs.ndim == 2
-    assert B.dtype == torch.float8_e4m3fn, (
-        f"B must be float8_e4m3fn (E4M3 weights), got {B.dtype}"
+    assert B.dtype in (torch.int8, torch.float8_e4m3fn), (
+        f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
     )
     assert Bs.dtype == torch.float8_e8m0fnu, (
         f"Bs must be float8_e8m0fnu, got {Bs.dtype}"
     )
     assert A.is_contiguous(), "A must be contiguous"
     assert B.is_contiguous(), "B must be contiguous"
+    VALUES_PER_BYTE = NIBBLES_PER_BYTE if B.dtype == torch.int8 else 1
 
     M, K = A.shape
     N, K_b = B.shape
-    assert K == K_b, f"K mismatch: A has K={K}, B has K={K_b}"
+    assert K == VALUES_PER_BYTE * K_b, (
+        f"K (={K}) must equal {VALUES_PER_BYTE} * B.shape[1] (={K_b})"
+    )
     assert K % MX_SCALE_GROUP_K == 0, (
         f"K (={K}) must be a multiple of {MX_SCALE_GROUP_K}"
     )
@@ -748,7 +628,7 @@ def _w8a8_mx_dynamic_fp8_matmul(
         return (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
-        wrap_triton(w8a8_mx_dynamic_fp8_matmul_kernel)[grid](
+        wrap_triton(mxfp_dynamic_matmul_kernel)[grid](
             A,
             B,
             C,
@@ -766,7 +646,8 @@ def _w8a8_mx_dynamic_fp8_matmul(
             bs_u8.stride(0),
             # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
             BLOCK_SIZE_M=BLOCK_SIZE_M,
-            GROUP_SIZE_M=8,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
         )
     return C
@@ -840,49 +721,23 @@ def w8a8_tensor_dynamic_fp8_matmul(
     return ops.w8a8_tensor_dynamic_fp8_matmul(A, B, Bs, output_dtype)
 
 
-def w4a8_mx_dynamic_fp4_matmul(
+def mxfp_dynamic_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """MXFP4 (W4A8) matmul with fused activation quantization.
-
-    Computes ``C = A @ B.T`` with bf16/fp16/fp32 ``A`` quantized to FP8 (E4M3)
-    inline and packed FP4 (E2M1) weights; both scales are UE8M0 at K-group
-    granularity 32 (the MX-format spec). Tile shape (BLOCK_SIZE_N, BLOCK_SIZE_K)
-    is autotuned — FP4 has no caller-controlled quantization block.
+    """MX (MXFP4/MXFP8) matmul ``C = A @ B.T`` with fused activation quant; the weight
+    format is detected from ``B.dtype``. Tile + dot path are autotuned; MX scale
+    granularity is fixed at 32 (the MX-format spec).
 
     Args:
         A: Raw activations ``[M, K]`` in bf16/fp16/fp32.
-        B: Packed FP4 weights ``[N, K // 2]`` (``int8``, two codes per byte).
-        Bs: UE8M0 weight scales ``[N, K // 32]``.
-        output_dtype: dtype of the returned tensor (default ``bfloat16``).
-    """
-    return ops.w4a8_mx_dynamic_fp4_matmul(A, B, Bs, output_dtype)
-
-
-def w8a8_mx_dynamic_fp8_matmul(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """MXFP8 W8A8 matmul (E4M3 × E4M3, UE8M0 group-32 scales) with fused act quant.
-
-    Computes ``C = A @ B.T`` with bf16/fp16/fp32 ``A`` quantized inline to E4M3
-    against per-row, per-32-K-group UE8M0 scales, and E4M3 weights with their own
-    UE8M0 K-group scales. Both scales feed ``tl.dot_scaled`` (the MX scaled MMA),
-    unlike ``w8a8_block_dynamic_fp8_matmul`` which applies 128×128 block scales in
-    software. Tile shape is autotuned; MX scale granularity is fixed at 32.
-
-    Args:
-        A: Raw activations ``[M, K]`` in bf16/fp16/fp32.
-        B: E4M3 weights ``[N, K]`` (``float8_e4m3fn``, unpacked).
+        B: Packed E2M1 ``[N, K // 2]`` (``int8``) or E4M3 ``[N, K]`` (``float8_e4m3fn``).
         Bs: UE8M0 weight scales ``[N, K // 32]`` (``float8_e8m0fnu``).
         output_dtype: dtype of the returned tensor (default ``bfloat16``).
     """
-    return ops.w8a8_mx_dynamic_fp8_matmul(A, B, Bs, output_dtype)
+    return ops.mxfp_dynamic_matmul(A, B, Bs, output_dtype)
 
 
 def matmul_2d(
@@ -902,40 +757,22 @@ def matmul_2d(
     ``output_dtype`` defaults to ``A.dtype``.
 
     Routes by weight dtype and ``block_size``:
-    - ``B.dtype == int8`` (packed FP4) → ``w4a8_mx_dynamic_fp4_matmul``
-      (``block_size`` is ignored; FP4 scale granularity is fixed at 32 and
-      tile sizes are autotuned).
-    - ``B.dtype == float8_e4m3fn`` with UE8M0 group-32 ``Bs`` (shape ``[N, K//32]``)
-      → ``w8a8_mx_dynamic_fp8_matmul`` (MX scaled MMA; ``block_size`` ignored).
+    - MX weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
+      group-32 ``Bs`` (shape ``[N, K//32]``) → ``mxfp_dynamic_matmul`` (``block_size``
+      ignored; scale granularity fixed at 32, tile + dot path autotuned).
     - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_dynamic_fp8_matmul``.
     - otherwise → ``w8a8_block_dynamic_fp8_matmul`` (or its static variant when
       ``activation_scale`` is given).
     """
+    if is_mxfp(B, Bs):
+        return mxfp_dynamic_matmul(A, B, Bs, output_dtype)
+
+    if is_tensor_wide(block_size, B):
+        return w8a8_tensor_dynamic_fp8_matmul(A, B, Bs, output_dtype)
+
+    # Block-wise FP8: static when a per-tensor activation scale is supplied, else dynamic.
     if activation_scale is not None:
-        if B.dtype == torch.int8:
-            raise NotImplementedError(
-                "static activation_scale is not supported on the FP4 path"
-            )
-        if block_size is None or (
-            block_size[0] == B.size(0) and block_size[1] == B.size(1)
-        ):
-            raise NotImplementedError(
-                "static activation_scale requires block-wise weights, "
-                "not tensor-mode (block_size None or full [N, K])"
-            )
         return w8a8_block_static_fp8_matmul(
             A, B, Bs, activation_scale, block_size, output_dtype
         )
-
-    if is_mxfp4(B, Bs):
-        return w4a8_mx_dynamic_fp4_matmul(A, B, Bs, output_dtype)
-
-    if is_mxfp8(B, Bs):
-        return w8a8_mx_dynamic_fp8_matmul(A, B, Bs, output_dtype)
-
-    if block_size is None or (
-        block_size[0] == B.size(0) and block_size[1] == B.size(1)
-    ):
-        return w8a8_tensor_dynamic_fp8_matmul(A, B, Bs, output_dtype)
-
     return w8a8_block_dynamic_fp8_matmul(A, B, Bs, block_size, output_dtype)
