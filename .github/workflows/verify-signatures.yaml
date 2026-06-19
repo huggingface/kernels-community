@@ -41,8 +41,10 @@ jobs:
             for kernel in $KERNELS; do
               echo "::group::$kernel"
 
+              VERSION=$(awk -F'[[:space:]]*=[[:space:]]*' '/^version/ {print $2; exit}' "$kernel/build.toml")
+
               nix run -L github:huggingface/kernels#kernels -- \
-                verify-signature --all-variants "kernels-community/$kernel"
+                verify-signature --all-variants "kernels-community/$kernel" "$VERSION"
 
               # Remove the HF cache to reclaim disk space before the next kernel.
               rm -rf ~/.cache/huggingface/hub
