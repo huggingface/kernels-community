@@ -403,9 +403,9 @@ def mxfp_dynamic_matmul_grouped_kernel(
         b_s = tl.load(bs_ptrs).to(tl.uint8)
         if USE_DOT_SCALED:
             if VALUES_PER_BYTE == 2:
-                accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1")
+                accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1", accumulator)
             else:
-                accumulator += tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3")
+                accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3", accumulator)
         else:
             a_s = decode_ue8m0_scale(a_scale)
             ws = tl.trans(decode_ue8m0_scale(b_s))
