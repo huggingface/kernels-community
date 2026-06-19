@@ -19,6 +19,8 @@ import triton.language as tl
 from flash_attn.utils.torch import custom_fwd, custom_bwd
 from flash_attn.utils.library import triton_op
 
+from ..._ops import add_op_namespace_prefix
+
 
 def maybe_contiguous_lastdim(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -350,7 +352,7 @@ def _layer_norm_fwd(
 
 # [2025-04-28] torch.library.triton_op ignores the schema argument, but here we need the schema
 # since we're returning a tuple of tensors
-@triton_op("flash_attn::layer_norm_fwd_impl", mutates_args={"out", "residual_out"},
+@triton_op(add_op_namespace_prefix("layer_norm_fwd_impl"), mutates_args={"out", "residual_out"},
            schema="(Tensor x, Tensor weight, Tensor bias, float eps, Tensor(a!) out, Tensor? residual, Tensor? x1, Tensor? weight1, Tensor? bias1, float dropout_p, Tensor? rowscale, bool zero_centered_weight, bool is_rms_norm, bool return_dropout_mask, Tensor(a!)? residual_out) -> (Tensor y1, Tensor mean, Tensor rstd, Tensor seeds, Tensor dropout_mask, Tensor dropout_mask1)")
 def _layer_norm_fwd_impl(
     x: Tensor,
@@ -695,7 +697,7 @@ def _layer_norm_bwd(
 
 
 
-@triton_op("flash_attn::layer_norm_bwd_impl", mutates_args={},
+@triton_op(add_op_namespace_prefix("layer_norm_bwd_impl"), mutates_args={},
            schema="(Tensor dy, Tensor x, Tensor weight, Tensor bias, float eps, Tensor mean, Tensor rstd, Tensor? dresidual, Tensor? dy1, Tensor? weight1, Tensor? bias1, Tensor? seeds, float dropout_p, Tensor? rowscale, bool has_residual, bool has_x1, bool zero_centered_weight, bool is_rms_norm, ScalarType? x_dtype, bool recompute_output) -> (Tensor dx, Tensor dw, Tensor db, Tensor dresidual_in, Tensor dx1, Tensor dw1, Tensor db1, Tensor y)",
            allow_decomposition=False,  # Don't let torch.compile trace inside
            )
