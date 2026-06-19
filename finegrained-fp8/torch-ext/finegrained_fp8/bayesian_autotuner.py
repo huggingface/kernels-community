@@ -1,43 +1,41 @@
-"""Bayesian alternative to ``@triton.autotune``. Subclasses Triton's
-``Autotuner`` and swaps the exhaustive bench-all-configs inner loop for
-Optuna TPE over the discrete config-index space, followed by coordinate-
-descent local refinement from the TPE best.
+"""Bayesian-optimization autotuner: benches a budgeted sample of the config grid instead of
+the full grid, via a Tree-structured Parzen Estimator (TPE) over the config *dimensions*
+(``num_warps`` / ``num_stages`` / tile sizes / flags). After a short random seed phase it
+models the good (top-``GAMMA`` by measured time) vs bad per-dimension value densities and
+benches the unmeasured config that maximizes ``l(x)/g(x)`` — the Expected-Improvement proxy
+— then a coordinate-descent pass polishes the best. Subclasses Triton's ``Autotuner`` and
+uses only the Python stdlib (no external optimizer dependency).
 
-Warm-starts each new key's first trial with the most recently cached key's
-best config.
-
-Fallbacks to stock exhaustive when Optuna is missing or the grid is
-smaller than ``n_trials``.
+Each new key's search is warm-started from the most recently tuned key's best config (nearby
+workloads share tile-shape preferences). Grids smaller than ``n_trials`` defer to the stock
+exhaustive bench-all.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
+import random
 import time
+from collections import defaultdict
 from typing import Dict, List
 
 from triton.runtime.autotuner import Autotuner, Config
 
-try:
-    import optuna  # type: ignore
-
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-    _HAS_OPTUNA = True
-except ImportError:
-    _HAS_OPTUNA = False
+GAMMA = 0.25  # top fraction of measured configs treated as "good" by the TPE
 
 
 class BayesianAutotuner(Autotuner):
     """Drop-in replacement for ``triton.runtime.autotuner.Autotuner`` that
-    benches ~``n_trials`` configs per key via Optuna TPE + coordinate-descent
-    refinement, instead of the full grid."""
+    benches ~``n_trials`` configs per key via TPE Bayesian optimization +
+    coordinate-descent refinement, instead of the full grid."""
 
     def __init__(
         self,
         *args,
         n_trials: int = 80,
-        n_startup_trials: int = 10,
+        n_startup_trials: int = 12,
         refine: bool = True,
         max_refine_iters: int = 5,
         log_path: str | None = None,
@@ -53,12 +51,8 @@ class BayesianAutotuner(Autotuner):
         self.log_path = log_path or os.environ.get("FINEGRAINED_AUTOTUNE_LOG")
 
     def run(self, *args, **kwargs):
-        # Degenerate grid → defer to parent (stock exhaustive).
-        if (
-            len(self.configs) <= 1
-            or not _HAS_OPTUNA
-            or self.n_trials >= len(self.configs)
-        ):
+        # Small grid → defer to parent (stock exhaustive bench-all).
+        if len(self.configs) <= 1 or self.n_trials >= len(self.configs):
             return super().run(*args, **kwargs)
 
         self.nargs = dict(zip(self.arg_names, args))
@@ -108,24 +102,51 @@ class BayesianAutotuner(Autotuner):
             self._log_result(key, configs[idx], timings[idx])
             return timings[idx]
 
-        def objective(trial):
-            return bench_idx(trial.suggest_int("config_idx", 0, len(configs) - 1))
+        # Distinct values per config dimension, for the TPE's Laplace smoothing.
+        dim_vals: Dict = defaultdict(set)
+        for sig in sigs:
+            for d, v in sig:
+                dim_vals[d].add(v)
 
-        study = optuna.create_study(
-            direction="minimize",
-            sampler=optuna.samplers.TPESampler(
-                n_startup_trials=self.n_startup_trials,
-                seed=0,
-            ),
-        )
-
-        # Warm-start: seed TPE's first trial with the most recent cached key's
-        # best config. Nearby workloads tend to share tile-shape preferences.
+        # Seed phase: a few random configs (seeded → deterministic), warm-started from the
+        # most recent cached key's best, to give the TPE an initial good/bad split.
+        n_startup = max(2, min(self.n_startup_trials, self.n_trials))
+        order = list(range(len(configs)))
+        random.Random(0).shuffle(order)
         warm_idx = self._warm_start_index(configs)
         if warm_idx is not None:
-            study.enqueue_trial({"config_idx": warm_idx})
+            order = [warm_idx] + [i for i in order if i != warm_idx]
+        for idx in order[:n_startup]:
+            bench_idx(idx)
 
-        study.optimize(objective, n_trials=self.n_trials, show_progress_bar=False)
+        # TPE: split measured configs into good (top-GAMMA) / bad, build per-dimension value
+        # densities for each, and bench the unmeasured config maximizing log l(x) - log g(x)
+        # (Expected-Improvement proxy), updating the model after each measurement.
+        while len(timings) < self.n_trials:
+            ranked = sorted(timings, key=timings.get)
+            n_good = max(1, round(GAMMA * len(ranked)))
+            good_c: Dict = defaultdict(lambda: defaultdict(int))
+            bad_c: Dict = defaultdict(lambda: defaultdict(int))
+            for j, i in enumerate(ranked):
+                tgt = good_c if j < n_good else bad_c
+                for d, v in sigs[i]:
+                    tgt[d][v] += 1
+            n_bad = len(ranked) - n_good
+            best_i, best_score = None, -math.inf
+            for i in range(len(configs)):
+                if i in timings:
+                    continue
+                score = 0.0
+                for d, v in sigs[i]:
+                    V = len(dim_vals[d])
+                    lp = (good_c[d][v] + 1.0) / (n_good + V)  # P(v | good), Laplace-smoothed
+                    gp = (bad_c[d][v] + 1.0) / (n_bad + V)  # P(v | bad)
+                    score += math.log(lp) - math.log(gp)
+                if score > best_score:
+                    best_score, best_i = score, i
+            if best_i is None:
+                break
+            bench_idx(best_i)
 
         # Coordinate-descent refinement: try single-dim perturbations around
         # the current best until no neighbor improves.
@@ -190,7 +211,7 @@ def bayesian_autotune(
     key,
     *,
     n_trials: int = 80,
-    n_startup_trials: int = 10,
+    n_startup_trials: int = 12,
     refine: bool = True,
     max_refine_iters: int = 5,
     log_path: str | None = None,
@@ -199,9 +220,10 @@ def bayesian_autotune(
     **kwargs,
 ):
     """Decorator mirroring ``@triton.autotune``. Extra kwargs:
-    n_trials, n_startup_trials: TPE budget
-    refine, max_refine_iters:   coordinate-descent after TPE
-    log_path:                   JSONL of benched configs (or FINEGRAINED_AUTOTUNE_LOG)"""
+    n_trials:                 total configs benched per key (TPE budget)
+    n_startup_trials:         random seed configs before the TPE model kicks in
+    refine, max_refine_iters: coordinate-descent refinement after the TPE
+    log_path:                 JSONL of benched configs (or FINEGRAINED_AUTOTUNE_LOG)"""
 
     def decorator(fn):
         return BayesianAutotuner(

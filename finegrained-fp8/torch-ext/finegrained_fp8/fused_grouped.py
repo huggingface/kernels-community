@@ -232,7 +232,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
     n_scale_blocks = INTERMEDIATE_DIM // BLOCK_SIZE_N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     for tile_id in tl.range(
-        start_pid, total_m_tiles * num_n_tiles, NUM_SMS, num_stages=1
+        start_pid, total_m_tiles * num_n_tiles, NUM_SMS
     ):
         pid_m = tile_id // num_n_tiles
         pid_n = tile_id % num_n_tiles
@@ -346,7 +346,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
     num_h_tiles = tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_H)
     offs_i = tl.arange(0, BLOCK_SIZE_I)
     for tile_id in tl.range(
-        start_pid, total_m_tiles * num_h_tiles, NUM_SMS, num_stages=1
+        start_pid, total_m_tiles * num_h_tiles, NUM_SMS
     ):
         pid_m = tile_id // num_h_tiles
         pid_h = tile_id % num_h_tiles
@@ -567,7 +567,7 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
     num_n_tiles = tl.cdiv(INTERMEDIATE_DIM, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     for tile_id in tl.range(
-        start_pid, total_m_tiles * num_n_tiles, NUM_SMS, num_stages=1
+        start_pid, total_m_tiles * num_n_tiles, NUM_SMS
     ):
         pid_m = tile_id // num_n_tiles
         pid_n = tile_id % num_n_tiles
@@ -738,7 +738,7 @@ def mxfp_dynamic_moe_grouped_down_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
     for tile_id in tl.range(
-        start_pid, total_m_tiles * num_n_tiles, NUM_SMS, num_stages=1
+        start_pid, total_m_tiles * num_n_tiles, NUM_SMS
     ):
         pid_m = tile_id // num_n_tiles
         pid_n = tile_id % num_n_tiles
