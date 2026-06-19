@@ -2,7 +2,7 @@
   description = "Flake for AITER Triton kernels (AMD ROCm)";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/torch-noarch-pyext";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =

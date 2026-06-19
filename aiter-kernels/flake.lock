@@ -41,16 +41,15 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1780500085,
-        "narHash": "sha256-LLZIMYG0kR77hr1BJm5i5C2NMw7HGvYBIJrsKzr0vpM=",
+        "lastModified": 1781792974,
+        "narHash": "sha256-PQY7T+BmCHu2397yv1iQCaoTMbwllxXp2jgODci5WpQ=",
         "owner": "huggingface",
         "repo": "kernels",
-        "rev": "469e5ca0ae32698b399c6407785f73039275288b",
+        "rev": "568e5f7e8a6c9db8e629bea401057f8be1c97665",
         "type": "github"
       },
       "original": {
         "owner": "huggingface",
-        "ref": "torch-noarch-pyext",
         "repo": "kernels",
         "type": "github"
       }
