@@ -181,7 +181,7 @@ def get_accelerator_autotuning_configs(*, with_block_sizes: bool = False):
     ]
 
 
-def get_mxfp_autotuning_configs():
+def get_mxfp_autotuning_configs(pre_hook=None):
     """Autotune grid for the MXFP8 ``USE_DOT_SCALED`` kernels (batched matmul + fused MoE).
 
     ``USE_DOT_SCALED`` picks the MMA: True → ``tl.dot_scaled`` (native M=128 scaled MMA,
@@ -196,6 +196,7 @@ def get_mxfp_autotuning_configs():
             {"USE_DOT_SCALED": use_dot_scaled, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk},
             num_warps=w,
             num_stages=s,
+            pre_hook=pre_hook,
         )
         for use_dot_scaled in [False, True]
         for bn in [32, 64, 128, 256]
@@ -204,6 +205,56 @@ def get_mxfp_autotuning_configs():
         for w in [2, 4, 8]
         if (bk == 32) != use_dot_scaled
     ]
+
+
+@functools.lru_cache(maxsize=None)
+def sm_shared_memory_limit(device_index: int) -> int:
+    """Max dynamic shared memory per block (bytes) for a CUDA device — the cap Triton
+    reports as the 'Hardware limit' on an ``out of resource: shared memory`` failure
+    (~232 KB on B200, ~227 KB on H100, much less on older/consumer parts). Queried from
+    the driver so the prune adapts to the hardware instead of hardcoding one GPU."""
+    try:
+        return triton.runtime.driver.active.utils.get_device_properties(device_index)[
+            "max_shared_mem"
+        ]
+    except Exception:
+        return torch.cuda.get_device_properties(device_index).shared_memory_per_block_optin
+
+
+def smem_config_pruner(act_bytes: int, n_weight_tiles: int, weight_bytes: int = 1):
+    """Build an ``early_config_prune`` that drops configs whose pipelined operand shared
+    memory would overflow the SM — the source of ``out of resource: shared memory`` autotune
+    failures (and the wasted compiles they cause).
+
+    Per-stage estimate (bytes) = ``BK · (act_bytes·BM + weight_bytes·n_weight_tiles·BN)``:
+    one activation tile ``[BM, BK]`` plus ``n_weight_tiles`` weight tiles ``[BN, BK]``
+    (gate_up fuses 2; down has 1), times ``num_stages``. ``BM`` is the routing-derived tile,
+    read from the launch args. MXFP4 packs 2 weights/byte, so ``weight_bytes=1`` (MXFP8) is a
+    safe upper bound. The limit is read from the active device. Never returns empty — keeps
+    the smallest-footprint config as a fallback."""
+    def prune(configs, named_args, **kwargs):
+        # The estimate needs all three tile dims. Each is either an autotuned config meta
+        # (MX) or a launch arg (block-dynamic), so look in both; raise clearly if missing.
+        all_args = {**named_args, **kwargs}
+        limit = sm_shared_memory_limit(torch.cuda.current_device())
+
+        def dim(c, name):
+            v = c.kwargs.get(name, all_args.get(name))
+            if v is None:
+                raise ValueError(
+                    f"smem_config_pruner needs {name} (autotune config meta or launch arg) "
+                    "to estimate shared memory; none found."
+                )
+            return v
+
+        def smem(c):
+            BM, BN, BK = (dim(c, n) for n in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"))
+            return c.num_stages * BK * (act_bytes * BM + weight_bytes * n_weight_tiles * BN)
+
+        kept = [c for c in configs if smem(c) <= limit]
+        return kept or [min(configs, key=smem)]
+
+    return prune
 
 
 # ── Triton-side helpers (inlined by ``@triton.jit`` callers) ──────────────────

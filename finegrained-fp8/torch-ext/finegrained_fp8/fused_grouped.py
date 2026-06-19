@@ -29,6 +29,7 @@ group-32 scales, MXFP8 intermediate); ``moe_grouped`` is the neutral dispatcher.
 import torch
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
 from .grouped import _store_tile
@@ -45,6 +46,7 @@ from .utils import (
     is_mxfp4,
     mxfp_act_quant_inline,
     mxfp4_e2m1_to_e4m3,
+    smem_config_pruner,
     ue8m0_as_uint8,
 )
 
@@ -515,10 +517,24 @@ def w8a8_block_dynamic_fp8_moe_grouped(
 # ── MXFP4/MXFP8 (UE8M0 group-32, tunable tile, MXFP8 intermediate) ────────────
 
 
+def _set_gate_up_descriptor(nargs):
+    """Per-config: build the gate_up TMA descriptor with box [2 (gate|up), BLOCK_SIZE_N,
+    BK//VALUES_PER_BYTE] over the (2E, I, H/vpb) weight view. Recreated fresh (not
+    block_shape-mutated) so TMA derives the swizzle for this box — mutating one descriptor
+    across swizzle classes (e.g. 32B→128B inner) yields a misaligned tensor map."""
+    w = nargs["GateUp"]
+    w2e = w.view(2 * w.size(0), nargs["INTERMEDIATE_DIM"], w.size(2))
+    nargs["GateUpDescriptor"] = TensorDescriptor.from_tensor(
+        w2e, [2, nargs["BLOCK_SIZE_N"], nargs["BLOCK_SIZE_K"] // nargs["VALUES_PER_BYTE"]]
+    )
+
+
 @bayesian_autotune(
-    get_mxfp_autotuning_configs(),
+    get_mxfp_autotuning_configs(pre_hook=_set_gate_up_descriptor),
     ["INTERMEDIATE_DIM", "HIDDEN_DIM", "BLOCK_SIZE_M"],
     n_trials=60,
+    # bf16 activation tile + fused gate|up weight tiles
+    prune_configs_by={"early_config_prune": smem_config_pruner(act_bytes=2, n_weight_tiles=2)},
 )
 @triton.jit
 def mxfp_dynamic_moe_grouped_gate_up_kernel(
@@ -526,6 +542,7 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
     PermToken,  # (S,) int32 — sorted position -> source token id
     GateUp,  # (E, 2I, H//VALUES_PER_BYTE) MXFP4/MXFP8
     GateUpScale,  # (E, 2I, H//32) UE8M0 group-32 scales
+    GateUpDescriptor,  # TMA descriptor over the (2E, I, H//VALUES_PER_BYTE) weight view
     ExpertStart,  # (NUM_EXPERTS+1,) int32 — exclusive sorted-row start per expert (pad S)
     Inter,  # (S, I) E4M3 — MXFP8 intermediate (expert-sorted)
     InterScale,  # (S, I//32) UE8M0 group-32 scales
@@ -572,84 +589,83 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
 
         token = tl.load(PermToken + offs_global_m * stride_pt, mask=row_mask, other=0)
         a_ptrs = Hidden + token[:, None] * stride_h_t + offs_k[None, :] * stride_h_k
-        b_gate_ptr = tl.make_block_ptr(
-            base=GateUp + expert_id * stride_gu_e,
-            shape=(HIDDEN_DIM // VALUES_PER_BYTE, INTERMEDIATE_DIM * 2),
-            strides=(stride_gu_k, stride_gu_n),
-            offsets=(0, pid_n * BLOCK_SIZE_N),
-            block_shape=(BLOCK_SIZE_K // VALUES_PER_BYTE, BLOCK_SIZE_N),
-            order=(0, 1),
-        )
-        b_up_ptr = tl.make_block_ptr(
-            base=GateUp + expert_id * stride_gu_e,
-            shape=(HIDDEN_DIM // VALUES_PER_BYTE, INTERMEDIATE_DIM * 2),
-            strides=(stride_gu_k, stride_gu_n),
-            offsets=(0, INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N),
-            block_shape=(BLOCK_SIZE_K // VALUES_PER_BYTE, BLOCK_SIZE_N),
-            order=(0, 1),
-        )
-        bs_gate_ptr = tl.make_block_ptr(
-            base=GateUpScale + expert_id * stride_gus_e,
-            shape=(INTERMEDIATE_DIM * 2, HIDDEN_DIM // SCALE_GROUP_K),
-            strides=(stride_gus_n, stride_gus_k),
-            offsets=(pid_n * BLOCK_SIZE_N, 0),
-            block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_K),
-            order=(1, 0),
-        )
-        bs_up_ptr = tl.make_block_ptr(
-            base=GateUpScale + expert_id * stride_gus_e,
-            shape=(INTERMEDIATE_DIM * 2, HIDDEN_DIM // SCALE_GROUP_K),
-            strides=(stride_gus_n, stride_gus_k),
-            offsets=(INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N, 0),
-            block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_K),
-            order=(1, 0),
-        )
+        n_off = pid_n * BLOCK_SIZE_N
 
-        acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for _ in range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K)):
-            a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
-            a, a_scale = mxfp_act_quant_inline(
-                a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
-            )
-            if VALUES_PER_BYTE == 2:  # MXFP4: packed E2M1 weight bytes
-                b_gate = tl.load(b_gate_ptr).to(tl.uint8)
-                b_up = tl.load(b_up_ptr).to(tl.uint8)
-            else:  # MXFP8: unpacked E4M3 weights
-                b_gate = tl.load(b_gate_ptr)
-                b_up = tl.load(b_up_ptr)
-            bs_gate = tl.load(bs_gate_ptr).to(tl.uint8)
-            bs_up = tl.load(bs_up_ptr).to(tl.uint8)
-            if USE_DOT_SCALED:
+        if USE_DOT_SCALED:
+            # Scaled-MMA path: load gate (row 2e) + up (row 2e+1) in ONE TMA load (stride trick
+            # over the (2E, I, H) view), single fused dot over [gate|up], then split. Weight
+            # scales read from GateUpScale via the r2*I index (gate cols 0:I, up cols I:2I).
+            gu_row = expert_id * 2
+            sg = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
+            nn = tl.arange(0, BLOCK_SIZE_N)
+            r2 = tl.arange(0, 2)
+            acc = tl.zeros((BLOCK_SIZE_M, 2 * BLOCK_SIZE_N), dtype=tl.float32)
+            for k_off in tl.range(0, HIDDEN_DIM, BLOCK_SIZE_K):
+                a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+                a, a_scale = mxfp_act_quant_inline(
+                    a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
+                )
+                gu = tl.reshape(
+                    GateUpDescriptor.load([gu_row, n_off, k_off // VALUES_PER_BYTE]),
+                    [2 * BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE],
+                )
+                sk = k_off // SCALE_GROUP_K + sg
+                ws = tl.load(
+                    GateUpScale
+                    + expert_id * stride_gus_e
+                    + (r2[:, None, None] * INTERMEDIATE_DIM + (n_off + nn)[None, :, None])
+                    * stride_gus_n
+                    + sk[None, None, :] * stride_gus_k
+                )
+                ws = tl.reshape(ws, [2 * BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_K]).to(
+                    tl.uint8
+                )
+                if VALUES_PER_BYTE == 2:  # MXFP4: packed E2M1 weight bytes
+                    acc = tl.dot_scaled(a, a_scale, "e4m3", tl.trans(gu), ws, "e2m1", acc)
+                else:  # MXFP8: unpacked E4M3 weights
+                    acc = tl.dot_scaled(a, a_scale, "e4m3", tl.trans(gu), ws, "e4m3", acc)
+                a_ptrs += BLOCK_SIZE_K * stride_h_k
+            acc_3d = tl.permute(tl.reshape(acc, [BLOCK_SIZE_M, 2, BLOCK_SIZE_N]), (0, 2, 1))
+            acc_gate, acc_up = tl.split(acc_3d)
+        else:
+            # fp8 dot + per-group software rescale (BK=32); strided pointers, gate cols
+            # [0:I) and up cols [I:2I) of the (H/vpb, 2I) weight, scales likewise.
+            okv = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
+            nn = tl.arange(0, BLOCK_SIZE_N)
+            sg = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
+            w_base = GateUp + expert_id * stride_gu_e + okv[:, None] * stride_gu_k
+            gw_ptrs = w_base + (n_off + nn)[None, :] * stride_gu_n
+            uw_ptrs = w_base + (INTERMEDIATE_DIM + n_off + nn)[None, :] * stride_gu_n
+            s_base = GateUpScale + expert_id * stride_gus_e + sg[None, :] * stride_gus_k
+            gs_ptrs = s_base + (n_off + nn)[:, None] * stride_gus_n
+            us_ptrs = s_base + (INTERMEDIATE_DIM + n_off + nn)[:, None] * stride_gus_n
+            acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+            acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+            for _ in range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K)):
+                a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+                a, a_scale = mxfp_act_quant_inline(
+                    a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
+                )
                 if VALUES_PER_BYTE == 2:
-                    acc_gate = tl.dot_scaled(
-                        a, a_scale, "e4m3", b_gate, bs_gate, "e2m1", acc_gate
-                    )
-                    acc_up = tl.dot_scaled(
-                        a, a_scale, "e4m3", b_up, bs_up, "e2m1", acc_up
-                    )
+                    b_gate = tl.load(gw_ptrs).to(tl.uint8)
+                    b_up = tl.load(uw_ptrs).to(tl.uint8)
                 else:
-                    acc_gate = tl.dot_scaled(
-                        a, a_scale, "e4m3", b_gate, bs_gate, "e4m3", acc_gate
-                    )
-                    acc_up = tl.dot_scaled(
-                        a, a_scale, "e4m3", b_up, bs_up, "e4m3", acc_up
-                    )
-            else:
+                    b_gate = tl.load(gw_ptrs)
+                    b_up = tl.load(uw_ptrs)
                 a_s = decode_ue8m0_scale(a_scale)
-                wg = tl.trans(decode_ue8m0_scale(bs_gate))
-                wu = tl.trans(decode_ue8m0_scale(bs_up))
+                wg = tl.trans(decode_ue8m0_scale(tl.load(gs_ptrs).to(tl.uint8)))
+                wu = tl.trans(decode_ue8m0_scale(tl.load(us_ptrs).to(tl.uint8)))
                 if VALUES_PER_BYTE == 2:
                     acc_gate += tl.dot(a, mxfp4_e2m1_to_e4m3(b_gate)) * a_s * wg
                     acc_up += tl.dot(a, mxfp4_e2m1_to_e4m3(b_up)) * a_s * wu
                 else:
                     acc_gate += tl.dot(a, b_gate) * a_s * wg
                     acc_up += tl.dot(a, b_up) * a_s * wu
-            a_ptrs += BLOCK_SIZE_K * stride_h_k
-            b_gate_ptr = tl.advance(b_gate_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0))
-            b_up_ptr = tl.advance(b_up_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0))
-            bs_gate_ptr = tl.advance(bs_gate_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
-            bs_up_ptr = tl.advance(bs_up_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
+                a_ptrs += BLOCK_SIZE_K * stride_h_k
+                gw_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_gu_k
+                uw_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_gu_k
+                gs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_gus_k
+                us_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_gus_k
 
         if SIMULATE_UNFUSED:
             dtype = Hidden.dtype.element_ty
@@ -681,10 +697,23 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
         tl.store(sc_ptrs, inter_scale, mask=row_mask[:, None])
 
 
+def _set_down_descriptor(nargs):
+    """Per-config: build the down TMA descriptor with box [BLOCK_SIZE_N, BK//VALUES_PER_BYTE]
+    over the (E*H, I/vpb) weight view. Recreated fresh per config (see _set_gate_up_descriptor
+    for why mutating block_shape across swizzle classes misaligns the tensor map)."""
+    w = nargs["Down"]
+    w_eh = w.view(w.size(0) * nargs["HIDDEN_DIM"], w.size(2))
+    nargs["DownDescriptor"] = TensorDescriptor.from_tensor(
+        w_eh, [nargs["BLOCK_SIZE_N"], nargs["BLOCK_SIZE_K"] // nargs["VALUES_PER_BYTE"]]
+    )
+
+
 @bayesian_autotune(
-    get_mxfp_autotuning_configs(),
+    get_mxfp_autotuning_configs(pre_hook=_set_down_descriptor),
     ["INTERMEDIATE_DIM", "HIDDEN_DIM", "BLOCK_SIZE_M"],
     n_trials=60,
+    # fp8 intermediate activation tile + single down weight tile
+    prune_configs_by={"early_config_prune": smem_config_pruner(act_bytes=1, n_weight_tiles=1)},
 )
 @triton.jit
 def mxfp_dynamic_moe_grouped_down_kernel(
@@ -692,6 +721,7 @@ def mxfp_dynamic_moe_grouped_down_kernel(
     InterScale,  # (S, I//32) UE8M0 group-32 scales
     Down,  # (E, H, I//VALUES_PER_BYTE) MXFP4/MXFP8
     DownScale,  # (E, H, I//32) UE8M0 group-32 scales
+    DownDescriptor,  # TMA descriptor over the (E*H, I//VALUES_PER_BYTE) weight view
     ExpertStart,  # (NUM_EXPERTS+1,) int32 — exclusive sorted-row start per expert (pad S)
     Perm,  # (S,) int32 — sorted position -> flat (token, slot) row
     SampleWeights,  # (S,) routing weight per flat row
@@ -749,48 +779,65 @@ def mxfp_dynamic_moe_grouped_down_kernel(
             + offs_global_m[:, None] * stride_is_m
             + offs_sf[None, :] * stride_is_n
         )
-        w_down_ptr = tl.make_block_ptr(
-            base=Down + expert_id * stride_down_e,
-            shape=(INTERMEDIATE_DIM // VALUES_PER_BYTE, HIDDEN_DIM),
-            strides=(stride_down_k, stride_down_n),
-            offsets=(0, pid_n * BLOCK_SIZE_N),
-            block_shape=(BLOCK_SIZE_K // VALUES_PER_BYTE, BLOCK_SIZE_N),
-            order=(0, 1),
-        )
+        n_off = pid_n * BLOCK_SIZE_N
         ws_down_ptr = tl.make_block_ptr(
             base=DownScale + expert_id * stride_downs_e,
             shape=(HIDDEN_DIM, INTERMEDIATE_DIM // SCALE_GROUP_K),
             strides=(stride_downs_n, stride_downs_k),
-            offsets=(pid_n * BLOCK_SIZE_N, 0),
+            offsets=(n_off, 0),
             block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_K),
             order=(1, 0),
         )
 
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for _ in range(0, tl.cdiv(INTERMEDIATE_DIM, BLOCK_SIZE_K)):
-            a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
-            a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0).to(tl.uint8)
-            if VALUES_PER_BYTE == 2:  # MXFP4: packed E2M1 weight bytes
-                w = tl.load(w_down_ptr).to(tl.uint8)
-            else:  # MXFP8: unpacked E4M3 weights
-                w = tl.load(w_down_ptr)
-            ws = tl.load(ws_down_ptr).to(tl.uint8)
-            if USE_DOT_SCALED:
+        if USE_DOT_SCALED:
+            # Scaled-MMA path: down weight tile via TMA over the (E*H, I//vpb) view (one load),
+            # then trans to [K, N]. Scales stay a pointer load (TMA needs ≥16B inner; the BK//32
+            # scale row is too narrow).
+            for k_off in tl.range(0, INTERMEDIATE_DIM, BLOCK_SIZE_K):
+                a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
+                a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0).to(tl.uint8)
+                w = tl.trans(
+                    tl.reshape(
+                        DownDescriptor.load([expert_id * HIDDEN_DIM + n_off, k_off // VALUES_PER_BYTE]),
+                        [BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE],
+                    )
+                )
+                ws = tl.load(ws_down_ptr).to(tl.uint8)
                 if VALUES_PER_BYTE == 2:
                     acc = tl.dot_scaled(a, a_scale, "e4m3", w, ws, "e2m1", acc)
                 else:
                     acc = tl.dot_scaled(a, a_scale, "e4m3", w, ws, "e4m3", acc)
-            else:
+                a_ptrs += BLOCK_SIZE_K * stride_int_n
+                as_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_is_n
+                ws_down_ptr = tl.advance(ws_down_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
+        else:
+            # fp8 dot + per-group software rescale (BK=32), pointer weights.
+            w_down_ptr = tl.make_block_ptr(
+                base=Down + expert_id * stride_down_e,
+                shape=(INTERMEDIATE_DIM // VALUES_PER_BYTE, HIDDEN_DIM),
+                strides=(stride_down_k, stride_down_n),
+                offsets=(0, n_off),
+                block_shape=(BLOCK_SIZE_K // VALUES_PER_BYTE, BLOCK_SIZE_N),
+                order=(0, 1),
+            )
+            for _ in range(0, tl.cdiv(INTERMEDIATE_DIM, BLOCK_SIZE_K)):
+                a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
+                a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0).to(tl.uint8)
+                if VALUES_PER_BYTE == 2:
+                    w = tl.load(w_down_ptr).to(tl.uint8)
+                else:
+                    w = tl.load(w_down_ptr)
                 a_s = decode_ue8m0_scale(a_scale)
-                ws_d = tl.trans(decode_ue8m0_scale(ws))
+                ws_d = tl.trans(decode_ue8m0_scale(tl.load(ws_down_ptr).to(tl.uint8)))
                 if VALUES_PER_BYTE == 2:
                     acc += tl.dot(a, mxfp4_e2m1_to_e4m3(w)) * a_s * ws_d
                 else:
                     acc += tl.dot(a, w) * a_s * ws_d
-            a_ptrs += BLOCK_SIZE_K * stride_int_n
-            as_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_is_n
-            w_down_ptr = tl.advance(w_down_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0))
-            ws_down_ptr = tl.advance(ws_down_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
+                a_ptrs += BLOCK_SIZE_K * stride_int_n
+                as_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_is_n
+                w_down_ptr = tl.advance(w_down_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0))
+                ws_down_ptr = tl.advance(ws_down_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
 
         if SIMULATE_UNFUSED:
             acc = acc.to(ProjOut.dtype.element_ty).to(tl.float32)
@@ -847,12 +894,22 @@ def mxfp_dynamic_moe_grouped(
         device=device,
         dtype=torch.uint8,
     )
+    # (E, 2I, H/vpb) → (2E, I, H/vpb): gate=row 2e, up=row 2e+1, so one TMA box [2, BN, BK/vpb]
+    # loads both. A view (not reshape) — the descriptor must point at the real weight buffer,
+    # and contiguous weights make this a pure stride reinterpretation.
+    gate_up_2e = gate_up_proj.view(
+        2 * gate_up_proj.size(0), INTERMEDIATE_DIM, gate_up_proj.size(2)
+    )
+    gate_up_descriptor = TensorDescriptor.from_tensor(
+        gate_up_2e, [2, 32, 32 // values_per_byte]
+    )
     with device_context(device):
         mxfp_dynamic_moe_grouped_gate_up_kernel[(num_sms,)](
             hidden_states,
             perm_token,
             gate_up_proj,
             gate_up_scale_u8,
+            gate_up_descriptor,
             expert_start,
             inter,
             inter_scale,
@@ -884,12 +941,17 @@ def mxfp_dynamic_moe_grouped(
     proj_out = torch.empty(
         num_routed_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
     )
+    # (E, H, I/vpb) → (E*H, I/vpb): one TMA box [BN, BK/vpb] per (expert, hidden-tile). View,
+    # not reshape — same reason as gate_up: the descriptor must alias the real weight buffer.
+    down_eh = down_proj.view(down_proj.size(0) * HIDDEN_DIM, down_proj.size(2))
+    down_descriptor = TensorDescriptor.from_tensor(down_eh, [32, 32 // values_per_byte])
     with device_context(device):
         mxfp_dynamic_moe_grouped_down_kernel[(num_sms,)](
             inter,
             inter_scale,
             down_proj,
             down_scale_u8,
+            down_descriptor,
             expert_start,
             perm,
             sample_weights,

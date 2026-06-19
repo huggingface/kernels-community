@@ -37,7 +37,7 @@ from .utils import (
 )
 
 
-def grouped_tile_layout(
+def _grouped_tile_layout(
     tokens_per_expert: torch.Tensor,
     block_size_m: int,
     S: int,
@@ -468,7 +468,7 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
     Bs = ue8m0_as_uint8(Bs)
     C = A.new_empty(S, N, dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m((S + num_experts - 1) // num_experts)
-    tile_offsets, max_m_tiles = grouped_tile_layout(
+    tile_offsets, max_m_tiles = _grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, num_experts
     )
     grid = (max_m_tiles, triton.cdiv(N, block_n))
@@ -547,7 +547,7 @@ def _w8a8_tensor_dynamic_fp8_matmul_grouped(
     qA, As = fp8_act_quant(A, K)
     C = A.new_empty(S, N, dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m((S + num_experts - 1) // num_experts)
-    tile_offsets, max_m_tiles = grouped_tile_layout(
+    tile_offsets, max_m_tiles = _grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, num_experts
     )
 
@@ -673,7 +673,7 @@ def _mxfp_dynamic_matmul_grouped(
     bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty((S, N), dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m((S + num_experts - 1) // num_experts)
-    tile_offsets, max_m_tiles = grouped_tile_layout(
+    tile_offsets, max_m_tiles = _grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, num_experts
     )
 
