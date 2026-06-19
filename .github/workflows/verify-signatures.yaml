@@ -34,22 +34,7 @@ jobs:
       - name: Verify all kernels
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          KERNELS=$(find . -maxdepth 2 -name "build.toml" -exec dirname {} \; | sed 's|^\./||' | sort)
-
-          {
-            for kernel in $KERNELS; do
-              echo "::group::$kernel"
-
-              nix run -L github:huggingface/kernels#kernels -- \
-                verify-signature --all-variants "kernels-community/$kernel"
-
-              # Remove the HF cache to reclaim disk space before the next kernel.
-              rm -rf ~/.cache/huggingface/hub
-
-              echo "::endgroup::"
-            done
-          } 2>&1 | tee /tmp/verify-output.log
+        run: .github/scripts/verify-signatures.sh
 
       - name: Post results to Slack
         if: always()
