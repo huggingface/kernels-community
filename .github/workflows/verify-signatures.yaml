@@ -37,9 +37,12 @@ jobs:
         run: .github/scripts/verify-signatures.sh
 
       - name: Post results to Slack
-        if: always()
+        if: failure()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_SECURITY }}
         run: |
-          nix run nixpkgs#jq -- -Rs '{"text": .}' /tmp/verify-output.log | \
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          FAILED_KERNELS=$(sed 's/^/• /' /tmp/verify-failed)
+          MESSAGE=$(printf '❌ Kernel verification failed:\n%s\n\n%s' "$FAILED_KERNELS" "$RUN_URL")
+          nix run nixpkgs#jq -- -rn --arg text "$MESSAGE" '{"text": $text}' | \
             curl -X POST -H 'Content-type: application/json' -d @- "$SLACK_WEBHOOK_URL"

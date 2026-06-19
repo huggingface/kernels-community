@@ -36,6 +36,6 @@ FAILED_LIST=/tmp/verify-failed
   else
     echo "✅ All kernels verified successfully."
   fi
-} 2>&1 | tee /tmp/verify-output.log
+} 2>&1
 
 [ -s "$FAILED_LIST" ] && exit 1 || exit 0
