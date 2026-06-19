@@ -1,0 +1,60 @@
+name: Verify Signatures
+run-name: Verify signatures
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *" # Daily at midnight UTC
+
+permissions:
+  contents: read
+
+jobs:
+  verify-kernels:
+    runs-on:
+      group: aws-highmemory-32-plus-nix
+    timeout-minutes: 1200 # 20h
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 4
+            sandbox-fallback = false
+
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
+
+      # Verify signatures for each kernel sequentially to avoid Hub rate limits.
+      - name: Verify all kernels
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          KERNELS=$(find . -maxdepth 2 -name "build.toml" -exec dirname {} \; | sed 's|^\./||' | sort)
+
+          {
+            for kernel in $KERNELS; do
+              echo "::group::$kernel"
+
+              nix run -L github:huggingface/kernels#kernels -- \
+                verify-signature --all-variants "kernels-community/$kernel"
+
+              # Remove the HF cache to reclaim disk space before the next kernel.
+              rm -rf ~/.cache/huggingface/hub
+
+              echo "::endgroup::"
+            done
+          } 2>&1 | tee /tmp/verify-output.log
+
+      - name: Post results to Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_SECURITY }}
+        run: |
+          nix run nixpkgs#jq -- -Rs '{"text": .}' /tmp/verify-output.log | \
+            curl -X POST -H 'Content-type: application/json' -d @- "$SLACK_WEBHOOK_URL"
