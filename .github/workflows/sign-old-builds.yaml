@@ -3,6 +3,12 @@ run-name: Sign old builds
 
 on:
   workflow_dispatch:
+    inputs:
+      start_kernel:
+        description: "Kernel name to start from (inclusive, alphabetical order). Leave empty to start from the beginning."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -41,25 +47,42 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           REPO_PREFIX: kernels-community
+          START_KERNEL: ${{ inputs.start_kernel }}
         run: |
           KERNELS=$(find . -maxdepth 2 -name "build.toml" -exec dirname {} \; | sed 's|^\./||' | sort)
+          SKIP="$START_KERNEL"
 
           for kernel in $KERNELS; do
+            # Skip kernels that sort before start_kernel.
+            if [ -n "$SKIP" ]; then
+              if [ "$kernel" = "$START_KERNEL" ]; then
+                SKIP=""
+              else
+                echo "Skipping $kernel (before start_kernel)"
+                continue
+              fi
+            fi
+
             echo "::group::$kernel"
 
-            # Download existing kernel artifacts from the Hub (kernel repo type).
-            ( cd "$kernel" && uvx --with huggingface_hub python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$REPO_PREFIX/$kernel', repo_type='kernel', local_dir='.')" )
+            # Determine the version branch from build.toml (e.g. version = 1 -> v1).
+            VERSION=$(grep -E '^\s*version\s*=' "$kernel/build.toml" | grep -oE '[0-9]+')
+            VERSION_BRANCH="v${VERSION}"
 
-            # Ensure every build variant (identified by __init__.py) has a metadata.json.
+            # Download existing kernel artifacts from the version branch.
+            ( cd "$kernel" && uvx --with huggingface_hub python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$REPO_PREFIX/$kernel', repo_type='kernel', local_dir='.', revision='$VERSION_BRANCH')" )
+
+            # Remove build variants that are not suitable for hashing:
+            # - no __init__.py (not a Python kernel build)
+            # - no metadata.json or metadata.json missing the 'name' field
+            # kernel-builder hash uses metadata.json existence as its criterion,
+            # so variants without __init__.py must also be removed rather than skipped.
             for variant_dir in "$kernel"/build/*/; do
               [ -d "$variant_dir" ] || continue
-              # Note: the glob above includes trailing slash in the output.
-              [ -f "${variant_dir}__init__.py" ] || continue
-              # Remove variants with missing or incomplete metadata (no 'name' field)
-              # so that kernel-builder hash only processes sufficiently new builds.
-              if [ ! -f "${variant_dir}metadata.json" ] || \
+              if [ ! -f "${variant_dir}__init__.py" ] || \
+                 [ ! -f "${variant_dir}metadata.json" ] || \
                  ! nix run nixpkgs#jq -- -e '.name' "${variant_dir}metadata.json" > /dev/null 2>&1; then
-                echo "Skipping variant ${variant_dir} (missing or incomplete metadata.json)"
+                echo "Removing variant ${variant_dir} (not suitable for signing)"
                 rm -rf "${variant_dir}"
               fi
             done
@@ -73,9 +96,21 @@ jobs:
               cosign sign-blob "$metadata_file" --bundle "${metadata_file}.sigstore" --yes
             done
 
+
+            # Make it get the right card.
+            nix run -L github:huggingface/kernels#kernel-builder -- \
+              fill-card "$kernel" "$kernel"/build/CARD.md
+
             # Upload signed artifacts back to the Hub (kernel repo type).
             ( cd "$kernel" && nix run -L github:huggingface/kernels#kernel-builder -- \
-                upload --repo-type kernel --repo-id "$REPO_PREFIX/$kernel" )
+                upload --repo-type kernel --repo-id "$REPO_PREFIX/$kernel" --branch "$VERSION_BRANCH" )
+
+            # v1 kernels without an explicit branch in build.toml also get uploaded to main.
+            BRANCH=$(grep -E '^\s*branch\s*=' "$kernel/build.toml" || true)
+            if [ "$VERSION" = "1" ] && [ -z "$BRANCH" ]; then
+              ( cd "$kernel" && nix run -L github:huggingface/kernels#kernel-builder -- \
+                  upload --repo-type kernel --repo-id "$REPO_PREFIX/$kernel" --branch main )
+            fi
 
             # Clean up to reclaim disk space before the next kernel.
             rm -rf "$kernel/build"
