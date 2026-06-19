@@ -21,7 +21,7 @@ from utils import (  # type: ignore
 )
 
 import finegrained_fp8  # type: ignore
-from finegrained_fp8 import fused_batched  # type: ignore
+from finegrained_fp8 import fused_batched, fused_grouped  # type: ignore
 
 
 BENCH_REPEATS = 10
@@ -637,19 +637,89 @@ def _make_moe_weights(problem: MoEProblem):
     return gate_up, gate_up_s, down, down_s, bs
 
 
-def _unfused_moe_ref(hidden, top_k_index, top_k_weights, weights, problem, block_size):
+def _make_moe_inputs(problem: MoEProblem):
+    """Random ``(hidden, top_k_index, top_k_weights)`` for the fused-MoE problem shape."""
+    hidden = torch.randn(
+        problem.num_tokens, problem.hidden_dim, device=TEST_DEVICE, dtype=problem.dtype
+    )
+    top_k_index = torch.randint(
+        0,
+        problem.num_experts,
+        (problem.num_tokens, problem.num_top_k),
+        device=TEST_DEVICE,
+        dtype=torch.int32,
+    )
+    top_k_weights = torch.rand(
+        problem.num_tokens, problem.num_top_k, device=TEST_DEVICE, dtype=problem.dtype
+    )
+    return hidden, top_k_index, top_k_weights
+
+
+def _unfused_batched_ref(
+    hidden,
+    top_k_index,
+    top_k_weights,
+    gate_up,
+    gate_up_s,
+    down,
+    down_s,
+    problem,
+    block_size,
+):
     """The transformers batched-experts forward (``integrations/moe.py``) built on the
     tested ``matmul_batched``: replicate each token to its routed slots, gate_up projection,
     GLU ``act_fn(gate) * up``, down projection, then the routing-weighted top-k reduce."""
-    gate_up, gate_up_s, down, down_s = weights
     num_tokens, num_top_k = hidden.shape[0], problem.num_top_k
     expert_ids = top_k_index.reshape(-1).to(torch.int32)
     routed = hidden.repeat_interleave(num_top_k, dim=0)
-    gate_up_out = finegrained_fp8.matmul_batched(routed, gate_up, gate_up_s, expert_ids, block_size)
+    gate_up_out = finegrained_fp8.matmul_batched(
+        routed, gate_up, gate_up_s, expert_ids, block_size
+    )
     gate, up = gate_up_out.chunk(2, dim=-1)
     inter = F.silu(gate) * up
-    down_out = finegrained_fp8.matmul_batched(inter, down, down_s, expert_ids, block_size)
+    down_out = finegrained_fp8.matmul_batched(
+        inter, down, down_s, expert_ids, block_size
+    )
     weighted = down_out * top_k_weights.reshape(-1, 1)
+    return weighted.view(num_tokens, num_top_k, problem.hidden_dim).sum(dim=1)
+
+
+def _unfused_grouped_ref(
+    hidden,
+    top_k_index,
+    top_k_weights,
+    gate_up,
+    gate_up_s,
+    down,
+    down_s,
+    problem,
+    block_size,
+):
+    """The same MoE forward as ``_unfused_batched_ref`` but built on the tested
+    ``matmul_grouped`` — sort the routed tokens by expert, grouped gate_up, GLU
+    ``silu(gate) * up``, grouped down, unsort, routing-weighted top-k reduce. Using the
+    grouped GEMM (not batched) matches the fused grouped path's tiling / reduce order."""
+    num_tokens, num_top_k = hidden.shape[0], problem.num_top_k
+    expert_ids = top_k_index.reshape(-1).to(torch.int32)
+    routed = hidden.repeat_interleave(num_top_k, dim=0)
+    perm = torch.argsort(expert_ids)
+    inv_perm = torch.empty_like(perm)
+    inv_perm[perm] = torch.arange(perm.numel(), device=perm.device)
+    a_sorted = routed[perm].contiguous()
+    tokens_per_expert = torch.bincount(expert_ids, minlength=problem.num_experts).to(
+        torch.int32
+    )
+    offsets = torch.cumsum(tokens_per_expert, dim=0).to(torch.int32)
+
+    gate_up_out = finegrained_fp8.matmul_grouped(
+        a_sorted, gate_up, gate_up_s, offsets, tokens_per_expert, block_size
+    )
+    gate, up = gate_up_out.chunk(2, dim=-1)
+    inter = F.silu(gate) * up
+    down_out = finegrained_fp8.matmul_grouped(
+        inter, down, down_s, offsets, tokens_per_expert, block_size
+    )
+    weighted = down_out[inv_perm] * top_k_weights.reshape(-1, 1)
     return weighted.view(num_tokens, num_top_k, problem.hidden_dim).sum(dim=1)
 
 
@@ -670,25 +740,64 @@ def test_fused_batched(problem):
     fused step through the activation dtype so the two agree to reduce order."""
     torch.manual_seed(0)
     gate_up, gate_up_s, down, down_s, block_size = _make_moe_weights(problem)
-    weights = (gate_up, gate_up_s, down, down_s)
-
-    hidden = torch.randn(
-        problem.num_tokens, problem.hidden_dim, device=TEST_DEVICE, dtype=problem.dtype
+    hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
+    ref = _unfused_batched_ref(
+        hidden,
+        top_k_index,
+        top_k_weights,
+        gate_up,
+        gate_up_s,
+        down,
+        down_s,
+        problem,
+        block_size,
     )
-    top_k_index = torch.randint(
-        0, problem.num_experts, (problem.num_tokens, problem.num_top_k),
-        device=TEST_DEVICE, dtype=torch.int32,
-    )
-    top_k_weights = torch.rand(
-        problem.num_tokens, problem.num_top_k, device=TEST_DEVICE, dtype=problem.dtype
-    )
-
-    ref = _unfused_moe_ref(hidden, top_k_index, top_k_weights, weights, problem, block_size)
     out = fused_batched.moe_batched(
-        hidden, top_k_index, top_k_weights, gate_up, down,
-        gate_up_s, down_s, block_size, simulate_unfused=True,
+        hidden,
+        top_k_index,
+        top_k_weights,
+        gate_up,
+        down,
+        gate_up_s,
+        down_s,
+        block_size,
+        simulate_unfused=True,
     )
+    _assert_fused_correctness(out, ref, problem)
 
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
+@pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
+def test_fused_grouped(problem):
+    """Fused grouped MoE (gather gate_up + SiLU + FP8 requant + grouped down + top-k
+    reduce) via the ``moe_grouped`` dispatcher vs the same unfused reference, with
+    ``simulate_unfused`` rounding each fused step through the activation dtype."""
+    torch.manual_seed(0)
+    gate_up, gate_up_s, down, down_s, block_size = _make_moe_weights(problem)
+    hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
+    ref = _unfused_grouped_ref(
+        hidden,
+        top_k_index,
+        top_k_weights,
+        gate_up,
+        gate_up_s,
+        down,
+        down_s,
+        problem,
+        block_size,
+    )
+    out = fused_grouped.moe_grouped(
+        hidden,
+        top_k_index,
+        top_k_weights,
+        gate_up,
+        down,
+        gate_up_s,
+        down_s,
+        block_size,
+        simulate_unfused=True,
+    )
     _assert_fused_correctness(out, ref, problem)
 
 
