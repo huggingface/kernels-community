@@ -32,7 +32,7 @@ def _to_bhsd(t: torch.Tensor) -> torch.Tensor:
     return t.permute(1, 2, 0, 3)
 
 
-def apply_rotary_transformers(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def apply_rotary_transformers(q, k, cos, sin, unsqueeze_dim=1):
     """Apply NEOX-style RoPE to ``q`` and ``k``.
 
     Signature mirrors ``kernels-community/rotary``'s ``apply_rotary_transformers``
@@ -42,8 +42,8 @@ def apply_rotary_transformers(q, k, cos, sin, position_ids=None, unsqueeze_dim=1
     Args:
         q, k: ``(batch, heads, seq, head_dim)``.
         cos, sin: ``(batch, seq, head_dim // 2)`` — pre-``unsqueeze`` form.
-        position_ids, unsqueeze_dim: accepted for API parity; the kernel reads
-            positions from the already-computed ``cos`` / ``sin``.
+        unsqueeze_dim: accepted for API parity; the kernel reads positions from
+            the already-computed ``cos`` / ``sin``.
 
     Returns:
         ``(q_embed, k_embed)`` in the same shape as ``q``, ``k``.
@@ -66,6 +66,10 @@ def apply_rotary_transformers(q, k, cos, sin, position_ids=None, unsqueeze_dim=1
     k_out_sbhd = rope_cached_fwd(k_sbhd, cos_freqs, sin_freqs, **common)
 
     return _to_bhsd(q_out_sbhd), _to_bhsd(k_out_sbhd)
+
+
+# Add torch compile support for functions
+apply_rotary_transformers.can_torch_compile = True
 
 
 __all__ = [
