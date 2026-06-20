@@ -3,7 +3,7 @@
 
   inputs = {
     self.submodules = true;
-    kernel-builder.url = "github:huggingface/kernels/cxx11-abi-tag";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =

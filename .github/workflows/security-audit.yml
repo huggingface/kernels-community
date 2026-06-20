@@ -215,7 +215,7 @@ jobs:
           === DIFF ===
           PROMPT
             cat /tmp/changes.diff
-          } | claude -p --model claude-opus-4-7 > /tmp/audit_result.txt
+          } | claude -p --model claude-opus-4-8 > /tmp/audit_result.txt
 
           # Validate LLM output format before trusting it
           if grep -qE '^NO_FINDINGS$' /tmp/audit_result.txt && [ $(wc -l < /tmp/audit_result.txt) -eq 1 ]; then

@@ -1,9 +1,8 @@
 [general]
 name = "rwkv"
-license = "Apache-2.0"
 version = 1
+license = "Apache-2.0"
 backends = ["cuda"]
-
 
 [general.hub]
 repo-id = "kernels-community/rwkv"

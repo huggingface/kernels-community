@@ -55,6 +55,7 @@ KERNEL_SOURCE_MAPPING = {
     "deep-gemm": "https://github.com/deepseek-ai/DeepGEMM",
     "bitsandbytes-mps": "",
     "aiter-flash-attn": "https://github.com/ROCm/aiter",
+    "aiter-kernels": "https://github.com/ROCm/aiter",
 
 }
 

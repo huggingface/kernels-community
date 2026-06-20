@@ -2,7 +2,7 @@
   description = "Flake for fine-grained FP8 block-wise quantization kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/triton-rocm-fixes";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =

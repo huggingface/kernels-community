@@ -41,16 +41,15 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1780581528,
-        "narHash": "sha256-RH547l1jTv21mJ3ugzwMgGFS32uYhKAmwLKzfrn6gsM=",
+        "lastModified": 1781689680,
+        "narHash": "sha256-h1SSwX195HdbFHvvPl1nBVu5794YYoyXiYXJOCWGVsA=",
         "owner": "huggingface",
         "repo": "kernels",
-        "rev": "30b46cfcbb4ef12a3f1a2e80ad5e72877cdd4261",
+        "rev": "19a568f64aa291880427d4ab56ee48bfeb26234b",
         "type": "github"
       },
       "original": {
         "owner": "huggingface",
-        "ref": "triton-rocm-fixes",
         "repo": "kernels",
         "type": "github"
       }
