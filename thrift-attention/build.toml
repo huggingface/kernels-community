@@ -1,0 +1,44 @@
+[general]
+name = "thrift-attention"
+version = 1
+license = "Apache-2.0"
+backends = ["cuda"]
+
+[general.cuda]
+minver = "12.8"
+
+[general.hub]
+repo-id = "kernels-community/thrift-attention"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.thrift_attention]
+backend = "cuda"
+cuda-capabilities = ["12.0a"]
+cuda-minver = "12.8"
+cuda-flags = [
+    "-O3",
+    "-use_fast_math",
+    "--ptxas-options=--gpu-name=sm_120a",
+]
+cxx-flags = ["-O3"]
+depends = ["torch"]
+include = ["csrc/include"]
+src = [
+    "csrc/include/thriftattention/sm120/cuda_common.cuh",
+    "csrc/cuda/sm120/nvfp4/fp4_attention.cu",
+    "csrc/cuda/sm120/nvfp4/single_query_fp4_attention.cu",
+    "csrc/cuda/sm120/nvfp4/thrift_attention.cu",
+    "csrc/cuda/sm120/nvfp4/single_query_attention.cu",
+    "csrc/cuda/sm120/nvfp4/quantization.cu",
+    "csrc/cuda/sm120/mxfp4/fp4_attention.cu",
+    "csrc/cuda/sm120/mxfp4/single_query_fp4_attention.cu",
+    "csrc/cuda/sm120/mxfp4/thrift_attention.cu",
+    "csrc/cuda/sm120/mxfp4/single_query_attention.cu",
+    "csrc/cuda/sm120/mxfp4/quantization.cu",
+    "csrc/cuda/sm120/shared/block_selection.cu",
+]
