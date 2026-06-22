@@ -22,16 +22,12 @@ from __future__ import annotations
 
 import torch
 from ._triton import tl, triton
-from ._platform import CapabilityRequirement
-from ._compat import Priority, register_kernel
-from ._compat import format_signatures
 
 _FP8_DTYPES = frozenset(
     getattr(torch, name)
     for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz")
     if hasattr(torch, name)
 )
-_MLA_DECODE_DTYPES = frozenset({torch.float16, torch.bfloat16}) | _FP8_DTYPES
 
 
 @triton.jit
@@ -254,21 +250,6 @@ def mla_decode_fwd(
     )
 
 
-@register_kernel(
-    "attention",
-    "mla_decode_with_kvcache",
-    name="triton_mla_decode_with_kvcache",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(("q", "kv_cache"), "dense", _MLA_DECODE_DTYPES),
-    priority=Priority.PORTABLE,
-    traits={
-        "q_len": frozenset({1}),
-        "support_logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False, True}),
-    },
-    tags={"portability"},
-)
 def triton_mla_decode_with_kvcache(
     q: torch.Tensor,
     kv_cache: torch.Tensor,

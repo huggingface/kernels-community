@@ -32,9 +32,6 @@ from .mla_decode import (  # noqa: F401
 from .mla_prefill import (  # noqa: F401
     triton_mla_prefill,
 )
-from ._platform import CapabilityRequirement
-from ._compat import Priority, register_kernel
-from ._compat import format_signatures
 
 __version__ = "0.1.0"
 
@@ -75,24 +72,6 @@ def attn_merge_state_kernel(
     tl.store(Lse + row, merged_lse)
 
 
-@register_kernel(
-    "attention",
-    "mha_prefill",
-    name="triton_mha_prefill",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(
-        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
-    ),
-    priority=Priority.PORTABLE,
-    traits={
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False, True}),
-    },
-    tags={"portability"},
-)
 def triton_mha_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -138,25 +117,6 @@ def triton_mha_prefill(
     return out
 
 
-@register_kernel(
-    "attention",
-    "mha_extend_with_kvcache",
-    name="triton_mha_extend_with_kvcache",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(
-        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
-    ),
-    priority=Priority.PORTABLE,
-    traits={
-        "is_causal": frozenset({False, True}),
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False, True}),
-    },
-    tags={"portability"},
-)
 def triton_mha_extend_with_kvcache(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
@@ -217,24 +177,6 @@ def triton_mha_extend_with_kvcache(
     return out
 
 
-@register_kernel(
-    "attention",
-    "mha_decode_with_kvcache",
-    name="triton_mha_decode_with_kvcache_cached",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(
-        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
-    ),
-    priority=Priority.PORTABLE,
-    traits={
-        "sliding_window": frozenset({False, True}),
-        "support_sinks": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False}),
-    },
-    tags={"portability"},
-)
 def triton_mha_decode_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -292,19 +234,6 @@ def triton_mha_decode_with_kvcache(
     return out
 
 
-@register_kernel(
-    "attention",
-    "attn_merge_state",
-    name="triton_attn_merge_state",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(
-        ("out_a", "out_b"), "dense", {torch.float16, torch.bfloat16}
-    ),
-    priority=Priority.PORTABLE,
-    traits={},
-    tags={"portability"},
-)
 def triton_attn_merge_state(
     out_a: torch.Tensor,
     lse_a: torch.Tensor,

@@ -35,11 +35,6 @@ class ArchVersion:
 
 
 @dataclass(frozen=True)
-class CapabilityRequirement:
-    vendors: frozenset[str] | None = None
-
-
-@dataclass(frozen=True)
 class PlatformInfo:
     vendor: str
     arch_version: ArchVersion

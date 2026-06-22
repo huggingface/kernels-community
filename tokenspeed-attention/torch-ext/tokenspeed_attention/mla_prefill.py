@@ -22,16 +22,12 @@ from __future__ import annotations
 
 import torch
 from ._triton import tl, triton
-from ._platform import CapabilityRequirement
-from ._compat import Priority, register_kernel
-from ._compat import format_signatures
 
 _FP8_DTYPES = frozenset(
     getattr(torch, name)
     for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz")
     if hasattr(torch, name)
 )
-_MLA_PREFILL_DTYPES = frozenset({torch.float16, torch.bfloat16}) | _FP8_DTYPES
 
 
 @triton.jit
@@ -280,21 +276,6 @@ def mla_prefill_fwd(
     )
 
 
-@register_kernel(
-    "attention",
-    "mla_prefill",
-    name="triton_mla_prefill",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=format_signatures(("q", "k", "v"), "dense", _MLA_PREFILL_DTYPES),
-    priority=Priority.PORTABLE,
-    traits={
-        "is_causal": frozenset({False, True}),
-        "support_logit_cap": frozenset({False, True}),
-        "return_lse": frozenset({False, True}),
-    },
-    tags={"portability"},
-)
 def triton_mla_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
