@@ -3,7 +3,6 @@ name = "tokenspeed-attention"
 version = 1
 license = "MIT"
 backends = ["cuda", "rocm"]
-python-depends = ["triton"]
 
 [general.hub]
 repo-id = "adarshxs/tokenspeed-attention"
