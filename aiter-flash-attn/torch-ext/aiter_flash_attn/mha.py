@@ -515,7 +515,7 @@ def flash_attn_func(
     deterministic=True,
     return_lse=False,
     return_attn_probs=False,
-    sink=None,
+    s_aux=None,
     config: Optional[dict[str, any]] = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -558,7 +558,7 @@ def flash_attn_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
-        sink: (nheads,), attention sink scores (one per Q head), or None
+        s_aux: (nheads,), attention sink scores (one per Q head), or None
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
@@ -584,7 +584,7 @@ def flash_attn_func(
         deterministic,
         return_lse,
         return_attn_probs,
-        sink,
+        s_aux,
         torch.is_grad_enabled(),
         config,
     )
@@ -821,7 +821,7 @@ def flash_attn_varlen_func(
     return_attn_probs=False,
     block_table=None,
     out=None,
-    sink=None,
+    s_aux=None,
     config: Optional[dict[str, any]] = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -870,7 +870,7 @@ def flash_attn_varlen_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
-        sink: (nheads,), attention sink scores (one per Q head), or None
+        s_aux: (nheads,), attention sink scores (one per Q head), or None
     Return:
         out: (total, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -903,7 +903,7 @@ def flash_attn_varlen_func(
         return_attn_probs,
         block_table,
         out,
-        sink,
+        s_aux,
         torch.is_grad_enabled(),
         config,
     )
