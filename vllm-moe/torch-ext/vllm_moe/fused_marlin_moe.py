@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 
+from ._ops import ops
 from .fused_moe import fused_topk, moe_align_block_size, try_get_optimal_moe_config
 from .scalar_type import ScalarType, scalar_types
 

@@ -7,6 +7,9 @@ from .fused_marlin_moe import fused_marlin_moe
 from .fused_moe import fused_experts, fused_moe, fused_topk, grouped_topk
 from .scalar_type import ScalarType, scalar_types
 
+# Do not remove this import, it registers the custom ops.
+from . import fake as _
+
 
 def gptq_marlin_moe_repack(
     b_q_weight: torch.Tensor,
