@@ -43,6 +43,7 @@ KERNEL_SOURCE_MAPPING = {
     "trimul-gpumode": "https://github.com/davidberard98/gpumode-trimul",
     "triton-kernels": "https://github.com/triton-lang/triton.git",
     "vllm-flash-attn3": "https://github.com/Dao-AILab/flash-attention",
+    "vllm-quantization": "",
     "yoso": "https://github.com/mlpen/YOSO",
     "cv-utils": "",
     "liger-kernels": "https://github.com/linkedin/Liger-Kernel",
