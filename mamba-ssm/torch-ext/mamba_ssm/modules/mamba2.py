@@ -5,33 +5,25 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from einops import rearrange, repeat
 
-try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-except ImportError:
-    causal_conv1d_fn, causal_conv1d_update = None, None
-
-try:
-    from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
-except ImportError:
-    causal_conv1d_varlen_states = None
+from .._causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+from .._causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
 
 try:
     from ..ops.triton.selective_state_update import selective_state_update
 except ImportError:
     selective_state_update = None
 
-from ..ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-
-from ..distributed.tensor_parallel import ColumnParallelLinear, RowParallelLinear
-from ..distributed.distributed_utils import all_reduce, reduce_scatter
-
-from ..ops.triton.ssd_combined import mamba_chunk_scan_combined
-from ..ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
-
 from huggingface_hub import PyTorchModelHubMixin
+
+from ..distributed.distributed_utils import all_reduce, reduce_scatter
+from ..distributed.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+from ..ops.triton.layernorm_gated import RMSNorm as RMSNormGated
+from ..ops.triton.ssd_combined import (
+    mamba_chunk_scan_combined,
+    mamba_split_conv1d_scan_combined,
+)
 
 
 class Mamba2(nn.Module, PyTorchModelHubMixin):
@@ -269,21 +261,17 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
                         F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0))
                     )  # Update state (B D W)
                 else:
-                    assert (
-                        causal_conv1d_varlen_states is not None
-                    ), "varlen inference requires causal_conv1d package"
-                    assert (
-                        batch == 1
-                    ), "varlen inference only supports batch dimension 1"
+                    assert batch == 1, (
+                        "varlen inference only supports batch dimension 1"
+                    )
                     conv_varlen_states = causal_conv1d_varlen_states(
                         xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
                     )
                     conv_state.copy_(conv_varlen_states)
-            assert self.activation in ["silu", "swish"]
-            if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
-                assert (
-                    seq_idx is None
-                ), "varlen conv1d requires the causal_conv1d package"
+            if self.activation not in ["silu", "swish"]:
+                assert seq_idx is None, (
+                    "varlen conv1d requires the causal_conv1d package"
+                )
                 xBC = self.act(
                     self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[
                         :, : -(self.d_conv - 1)
@@ -347,9 +335,9 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 
     def step(self, hidden_states, conv_state, ssm_state):
         dtype = hidden_states.dtype
-        assert (
-            hidden_states.shape[1] == 1
-        ), "Only support decoding with 1 token at a time for now"
+        assert hidden_states.shape[1] == 1, (
+            "Only support decoding with 1 token at a time for now"
+        )
         zxbcdt = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
         d_mlp = (
             zxbcdt.shape[-1]
@@ -370,25 +358,13 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         )
 
         # Conv step
-        if causal_conv1d_update is None:
-            conv_state.copy_(
-                torch.roll(conv_state, shifts=-1, dims=-1)
-            )  # Update state (B D W)
-            conv_state[:, :, -1] = xBC
-            xBC = torch.sum(
-                conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
-            )  # (B D)
-            if self.conv1d.bias is not None:
-                xBC = xBC + self.conv1d.bias
-            xBC = self.act(xBC).to(dtype=dtype)
-        else:
-            xBC = causal_conv1d_update(
-                xBC,
-                conv_state,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
-                self.activation,
-            )
+        xBC = causal_conv1d_update(
+            xBC,
+            conv_state,
+            rearrange(self.conv1d.weight, "d 1 w -> d w"),
+            self.conv1d.bias,
+            self.activation,
+        )
 
         x, B, C = torch.split(
             xBC,
@@ -399,10 +375,9 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 
         # SSM step
         if selective_state_update is None:
-            assert (
-                self.ngroups == 1
-            ), "Only support ngroups=1 for this inference code path"
-            # Discretize A and B
+            assert self.ngroups == 1, (
+                "Only support ngroups=1 for this inference code path"
+            )
             dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
             dA = torch.exp(dt * A)  # (batch, nheads)
             x = rearrange(x, "b (h p) -> b h p", p=self.headdim)

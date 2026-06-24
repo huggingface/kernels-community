@@ -18,15 +18,10 @@
       # probably be more lean.
       doGetKernelCheck = false;
 
-      pythonCheckInputs =
-        ps: with ps; [
-          (causal-conv1d.overridePythonAttrs (_: {
-            stdenv = if pkgs.config.cudaSupport then pkgs.cudaPackages.backendStdenv else pkgs.stdenv;
-          }))
-          einops
-          huggingface-hub
-          transformers
-        ];
+      pythonCheckInputs = ps: with ps; [
+        einops
+        huggingface-hub
+        transformers
+      ];
     };
-
 }
