@@ -43,7 +43,7 @@ from .utils import (
     mx_scalar_reduce,
     mx_scalar_reduce_gate_up,
     mxfp4_e2m1_to_e4m3,
-    swiglu,
+    glu,
     topk_reduce_kernel,
     TOPK_REDUCE_BLOCK_H,
     e2m1_as_uint8,
@@ -98,6 +98,7 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
+    ACT_FN: tl.constexpr,
 ):
     """Batched kernel 1: per-token gate_up + SiLU + FP8 quant. Grid: (S, N-tiles)."""
     batch_id = tl.program_id(axis=0)
@@ -176,8 +177,8 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
         bs_gate_ptr = tl.advance(bs_gate_ptr, (0, 1))
         bs_up_ptr = tl.advance(bs_up_ptr, (0, 1))
 
-    intermediate = swiglu(
-        acc_gate, acc_up, SIMULATE_UNFUSED, HiddenStates.dtype.element_ty
+    intermediate = glu(
+        acc_gate, acc_up, ACT_FN, SIMULATE_UNFUSED, HiddenStates.dtype.element_ty
     )
 
     # Requant the intermediate to FP8 — the same inline per-row act quant as the inputs;
@@ -303,11 +304,12 @@ def _w8a8_block_dynamic_fp8_moe_batched(
     gate_up_proj_scale: torch.Tensor,
     down_proj: torch.Tensor,
     down_proj_scale: torch.Tensor,
-    expert_ids: torch.Tensor,
-    sample_weights: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
     block_size: list[int],
     output_dtype: torch.dtype,
     simulate_unfused: bool = False,
+    act_fn: str = "silu",
 ) -> torch.Tensor:
     """Block-dynamic FP8 batched fused MoE in ONE op: gate_up + SiLU + FP8 requant →
     grouped down → routing-weighted per-(token, expert) output. gate_up gathers each routed
@@ -316,7 +318,8 @@ def _w8a8_block_dynamic_fp8_moe_batched(
     device = hidden_states.device
     HIDDEN_DIM = hidden_states.size(1)
     NUM_EXPERTS = gate_up_proj.size(0)
-    num_routed_tokens = expert_ids.size(0)
+    num_tokens = hidden_states.size(0)
+    num_routed_tokens = top_k_index.numel()
     INTERMEDIATE_DIM = gate_up_proj.size(1) // 2
     NUM_TOP_K = num_routed_tokens // hidden_states.size(0)
     BLOCK_SIZE_N, BLOCK_SIZE_K = block_size
@@ -329,7 +332,7 @@ def _w8a8_block_dynamic_fp8_moe_batched(
     inter_scales = torch.empty(
         num_routed_tokens, NUM_N_TILES, device=device, dtype=torch.float32
     )
-    num_tokens = hidden_states.size(0)
+
     out = torch.empty(num_routed_tokens, HIDDEN_DIM, device=device, dtype=output_dtype)
     reduced = torch.empty(num_tokens, HIDDEN_DIM, device=device, dtype=output_dtype)
     with device_context(device):
@@ -341,7 +344,7 @@ def _w8a8_block_dynamic_fp8_moe_batched(
             gate_up_proj_scale,
             inter,
             inter_scales,
-            expert_ids,
+            top_k_index,
             hidden_states.stride(0),
             hidden_states.stride(1),
             gate_up_proj.stride(0),
@@ -360,6 +363,7 @@ def _w8a8_block_dynamic_fp8_moe_batched(
             BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
             NUM_N_TILES=NUM_N_TILES,
             SIMULATE_UNFUSED=simulate_unfused,
+            ACT_FN=act_fn,
         )
         wrap_triton(w8a8_block_dynamic_fp8_moe_batched_down_kernel)[
             (num_routed_tokens, NUM_H_TILES)
@@ -368,8 +372,8 @@ def _w8a8_block_dynamic_fp8_moe_batched(
             inter_scales,
             down_proj,
             down_proj_scale,
-            expert_ids,
-            sample_weights,
+            top_k_index,
+            top_k_weights,
             out,
             down_proj.stride(0),
             down_proj.stride(1),
@@ -414,14 +418,12 @@ def w8a8_block_dynamic_fp8_moe_batched(
     down_proj_scale: torch.Tensor,
     block_size: list[int],
     simulate_unfused: bool = False,
+    act_fn: str = "silu",
 ) -> torch.Tensor:
     """Batched fused MoE (deterministic, no sorting, no atomics): a single ``triton_op``
     runs gate_up + down (gathering each routed row from the unexpanded ``hidden_states``,
     source row ``s // num_top_k``, no replicated copy). The top-k reduce stays plain torch
     so ``torch.compile`` can fuse it with the surrounding model graph."""
-
-    sample_weights = top_k_weights.reshape(-1)
-    expert_ids = top_k_index.reshape(-1)
 
     out = ops.w8a8_block_dynamic_fp8_moe_batched(
         hidden_states,
@@ -429,11 +431,12 @@ def w8a8_block_dynamic_fp8_moe_batched(
         gate_up_proj_scale,
         down_proj,
         down_proj_scale,
-        expert_ids,
-        sample_weights,
+        top_k_index,
+        top_k_weights,
         block_size,
         hidden_states.dtype,
         simulate_unfused,
+        act_fn,
     )
     return out
 
@@ -479,6 +482,7 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     SCALE_GROUP_K: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
+    ACT_FN: tl.constexpr,
 ):
     """MXFP4/MXFP8 kernel 1: gate_up + SiLU + MXFP8 requant. N = intermediate
     (output) tile, K = hidden (contraction) tile — both tunable. Grid: (S, N-tiles)."""
@@ -573,8 +577,8 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
         bs_gate_ptr = tl.advance(bs_gate_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
         bs_up_ptr = tl.advance(bs_up_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
 
-    intermediate = swiglu(
-        acc_gate, acc_up, SIMULATE_UNFUSED, HiddenStates.dtype.element_ty
+    intermediate = glu(
+        acc_gate, acc_up, ACT_FN, SIMULATE_UNFUSED, HiddenStates.dtype.element_ty
     )
 
     # MXFP8 requant of the intermediate (E4M3 + UE8M0 group-32 along this N-tile).
@@ -716,10 +720,11 @@ def _mxfp_dynamic_moe_batched(
     gate_up_proj_scale: torch.Tensor,
     down_proj: torch.Tensor,
     down_proj_scale: torch.Tensor,
-    expert_ids: torch.Tensor,
-    sample_weights: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
     output_dtype: torch.dtype,
     simulate_unfused: bool = False,
+    act_fn: str = "silu",
 ) -> torch.Tensor:
     """MXFP4/MXFP8 batched fused MoE in ONE op: gate_up + SiLU + MXFP8 requant → grouped
     down → routing-weighted per-(token, expert) output. Format is picked per weight (gate_up
@@ -727,13 +732,14 @@ def _mxfp_dynamic_moe_batched(
     device = hidden_states.device
     HIDDEN_DIM = hidden_states.size(1)
     NUM_EXPERTS = gate_up_proj.size(0)
-    num_routed_tokens = expert_ids.size(0)
+    num_tokens = hidden_states.size(0)
+    num_routed_tokens = top_k_index.numel()
     INTERMEDIATE_DIM = gate_up_proj.size(1) // 2
     NUM_TOP_K = num_routed_tokens // hidden_states.size(0)
-    # MXFP4 (packed E2M1, 2 codes/byte) vs MXFP8 (E4M3, 1/byte), per weight; int8→uint8 is a
-    # zero-cost view (tl.dot_scaled wants uint8), E4M3 passes through.
-    gate_up_vpb = NIBBLES_PER_BYTE if is_mxfp4(gate_up_proj, gate_up_proj_scale) else 1
-    down_vpb = NIBBLES_PER_BYTE if is_mxfp4(down_proj, down_proj_scale) else 1
+
+    VALUES_PER_BYTE = (
+        NIBBLES_PER_BYTE if is_mxfp4(gate_up_proj, gate_up_proj_scale) else 1
+    )
     gate_up_proj_u8 = e2m1_as_uint8(gate_up_proj)
     gate_up_proj_scale_u8 = ue8m0_as_uint8(gate_up_proj_scale)
     down_proj_u8 = e2m1_as_uint8(down_proj)
@@ -748,7 +754,6 @@ def _mxfp_dynamic_moe_batched(
         device=device,
         dtype=torch.uint8,
     )
-    num_tokens = hidden_states.size(0)
     out = torch.empty(num_routed_tokens, HIDDEN_DIM, device=device, dtype=output_dtype)
     reduced = torch.empty(num_tokens, HIDDEN_DIM, device=device, dtype=output_dtype)
 
@@ -765,7 +770,7 @@ def _mxfp_dynamic_moe_batched(
             gate_up_proj_scale_u8,
             inter,
             inter_scales,
-            expert_ids,
+            top_k_index,
             hidden_states.stride(0),
             hidden_states.stride(1),
             gate_up_proj_u8.stride(0),
@@ -780,17 +785,18 @@ def _mxfp_dynamic_moe_batched(
             HIDDEN_DIM=HIDDEN_DIM,
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
             BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
-            VALUES_PER_BYTE=gate_up_vpb,
+            VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
             SIMULATE_UNFUSED=simulate_unfused,
+            ACT_FN=act_fn,
         )
         wrap_triton(mxfp_dynamic_moe_batched_down_kernel)[down_grid](
             inter,
             inter_scales,
             down_proj_u8,
             down_proj_scale_u8,
-            expert_ids,
-            sample_weights,
+            top_k_index,
+            top_k_weights,
             out,
             down_proj_u8.stride(0),
             down_proj_u8.stride(1),
@@ -803,7 +809,7 @@ def _mxfp_dynamic_moe_batched(
             HIDDEN_DIM=HIDDEN_DIM,
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
             BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
-            VALUES_PER_BYTE=down_vpb,
+            VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
             SIMULATE_UNFUSED=simulate_unfused,
         )
@@ -833,23 +839,22 @@ def mxfp_dynamic_moe_batched(
     gate_up_proj_scale: torch.Tensor,
     down_proj_scale: torch.Tensor,
     simulate_unfused: bool = False,
+    act_fn: str = "silu",
 ) -> torch.Tensor:
     """Two-kernel batched fused MX MoE — MXFP4 or MXFP8 weights (UE8M0 group-32), the
     format picked per-weight by the ops. Same structure as the block-dynamic path but
     with a tunable tile and an MXFP8 group-32 intermediate; ``block_size`` is unused."""
-    sample_weights = top_k_weights.reshape(-1)
-    expert_ids = top_k_index.reshape(-1)
-
     out = ops.mxfp_dynamic_moe_batched(
         hidden_states,
         gate_up_proj,
         gate_up_proj_scale,
         down_proj,
         down_proj_scale,
-        expert_ids,
-        sample_weights,
+        top_k_index,
+        top_k_weights,
         hidden_states.dtype,
         simulate_unfused,
+        act_fn,
     )
     return out
 
@@ -867,6 +872,7 @@ def moe_fused_batched(
     down_proj_scale_inv: torch.Tensor,
     block_size: list[int] | None,
     simulate_unfused: bool = False,
+    act_fn: str = "silu",
 ) -> torch.Tensor:
     """Fused batched-MoE dispatcher — routes to the recipe matching the weight dtype /
     scale layout, mirroring ``matmul_batched``. Implemented: block-dynamic FP8 and MXFP8
@@ -883,6 +889,7 @@ def moe_fused_batched(
             gate_up_proj_scale_inv,
             down_proj_scale_inv,
             simulate_unfused,
+            act_fn,
         )
 
     return w8a8_block_dynamic_fp8_moe_batched(
@@ -895,4 +902,5 @@ def moe_fused_batched(
         down_proj_scale_inv,
         block_size,
         simulate_unfused,
+        act_fn,
     )

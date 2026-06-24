@@ -655,6 +655,9 @@ def _make_moe_inputs(problem: MoEProblem):
     return hidden, top_k_index, top_k_weights
 
 
+_ACT_FNS = {"silu": F.silu, "gelu": F.gelu, "relu": F.relu}
+
+
 def _unfused_batched_ref(
     hidden,
     top_k_index,
@@ -665,6 +668,7 @@ def _unfused_batched_ref(
     down_s,
     problem,
     block_size,
+    act_fn,
 ):
     """The transformers batched-experts forward (``integrations/moe.py``) built on the
     tested ``matmul_batched``: replicate each token to its routed slots, gate_up projection,
@@ -676,7 +680,7 @@ def _unfused_batched_ref(
         routed, gate_up, gate_up_s, expert_ids, block_size
     )
     gate, up = gate_up_out.chunk(2, dim=-1)
-    inter = F.silu(gate) * up
+    inter = _ACT_FNS[act_fn](gate) * up
     down_out = finegrained_fp8.matmul_batched(
         inter, down, down_s, expert_ids, block_size
     )
@@ -694,6 +698,7 @@ def _unfused_grouped_ref(
     down_s,
     problem,
     block_size,
+    act_fn,
 ):
     """The same MoE forward as ``_unfused_batched_ref`` but built on the tested
     ``matmul_grouped`` — sort the routed tokens by expert, grouped gate_up, GLU
@@ -715,7 +720,7 @@ def _unfused_grouped_ref(
         a_sorted, gate_up, gate_up_s, offsets, tokens_per_expert, block_size
     )
     gate, up = gate_up_out.chunk(2, dim=-1)
-    inter = F.silu(gate) * up
+    inter = _ACT_FNS[act_fn](gate) * up
     down_out = finegrained_fp8.matmul_grouped(
         inter, down, down_s, offsets, tokens_per_expert, block_size
     )
@@ -733,8 +738,9 @@ def _assert_fused_correctness(out, ref, problem: MoEProblem):
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
+@pytest.mark.parametrize("act_fn", ["silu", "gelu", "relu"])
 @pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
-def test_fused_batched(problem):
+def test_fused_batched(problem, act_fn):
     """Fused two-kernel MoE (gate_up + SiLU + FP8 requant + down + top-k reduce) via the
     ``moe_fused_batched`` dispatcher vs the unfused reference. ``simulate_unfused`` rounds each
     fused step through the activation dtype so the two agree to reduce order."""
@@ -751,6 +757,7 @@ def test_fused_batched(problem):
         down_s,
         problem,
         block_size,
+        act_fn,
     )
     out = fused_batched.moe_fused_batched(
         hidden,
@@ -761,6 +768,7 @@ def test_fused_batched(problem):
         gate_up_s,
         down_s,
         block_size,
+        act_fn=act_fn,
         simulate_unfused=True,
     )
     _assert_fused_correctness(out, ref, problem)
@@ -768,8 +776,9 @@ def test_fused_batched(problem):
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
+@pytest.mark.parametrize("act_fn", ["silu", "gelu", "relu"])
 @pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
-def test_fused_grouped(problem):
+def test_fused_grouped(problem, act_fn):
     """Fused grouped MoE (gather gate_up + SiLU + FP8 requant + grouped down + top-k
     reduce) via the ``moe_fused_grouped`` dispatcher vs the same unfused reference, with
     ``simulate_unfused`` rounding each fused step through the activation dtype."""
@@ -786,6 +795,7 @@ def test_fused_grouped(problem):
         down_s,
         problem,
         block_size,
+        act_fn,
     )
     out = fused_grouped.moe_fused_grouped(
         hidden,
@@ -796,6 +806,7 @@ def test_fused_grouped(problem):
         gate_up_s,
         down_s,
         block_size,
+        act_fn=act_fn,
         simulate_unfused=True,
     )
     _assert_fused_correctness(out, ref, problem)

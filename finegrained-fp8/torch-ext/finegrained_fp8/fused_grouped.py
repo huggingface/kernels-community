@@ -52,7 +52,7 @@ from .utils import (
     mx_dot_scaled,
     mxfp4_e2m1_to_e4m3,
     smem_config_pruner,
-    swiglu,
+    glu,
     e2m1_as_uint8,
     ue8m0_as_uint8,
 )
@@ -248,6 +248,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
     NUM_EXPERTS: tl.constexpr,
     NUM_SMS: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
+    ACT_FN: tl.constexpr,
 ):
     """Phase 1: persistent grid-stride over (M-tile, I-tile). Gather hidden rows per expert
     M-tile, gate + up block-FP8 matmuls, SiLU-combine, FP8-requant the intermediate."""
@@ -317,8 +318,8 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
             gate_s_ptr = tl.advance(gate_s_ptr, (0, 1))
             up_s_ptr = tl.advance(up_s_ptr, (0, 1))
 
-        intermediate = swiglu(
-            acc_gate, acc_up, SIMULATE_UNFUSED, Hidden.dtype.element_ty
+        intermediate = glu(
+            acc_gate, acc_up, ACT_FN, SIMULATE_UNFUSED, Hidden.dtype.element_ty
         )
         inter, inter_s = fp8_act_quant_inline(
             intermediate
@@ -364,7 +365,6 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
     stride_po_m,
     stride_po_n,
     stride_perm,
-    stride_sw,
     tokens_per_sm_bit_length,  # autotune key only (log2 tokens-per-SM bucket); unused in body
     HIDDEN_DIM: tl.constexpr,
     INTERMEDIATE_DIM: tl.constexpr,
@@ -435,7 +435,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
         # Fused routing-weight × top-k reorder (no atomics): scale each row by its weight
         # and scatter to its flat (token, slot) row; the host then just sums over slots.
         flat = tl.load(Perm + offs_global_m * stride_perm, mask=row_mask, other=0)
-        weight = tl.load(SampleWeights + flat * stride_sw, mask=row_mask, other=0.0)
+        weight = tl.load(SampleWeights + flat, mask=row_mask, other=0.0)
         acc = acc * weight[:, None]
         store_tile(ProjOut, acc, flat, offs_h, row_mask, stride_po_m, stride_po_n)
 
@@ -450,6 +450,7 @@ def w8a8_block_dynamic_fp8_moe_grouped(
     down_proj_scale: torch.Tensor,
     block_size: list[int],
     simulate_unfused: bool = False,
+    act_fn: str = "silu",
 ) -> torch.Tensor:
     """Block-dynamic FP8 fused grouped MoE: gather gate_up+SiLU → FP8 intermediate →
     grouped down → routing-weighted top-k reduce. Returns ``(num_tokens, hidden_dim)``."""
@@ -461,10 +462,8 @@ def w8a8_block_dynamic_fp8_moe_grouped(
     BLOCK_SIZE_N, BLOCK_SIZE_K = block_size
     NUM_I_TILES = INTERMEDIATE_DIM // BLOCK_SIZE_N
 
-    expert_ids = top_k_index.reshape(-1)
-    sample_weights = top_k_weights.reshape(-1)
     perm_token, perm, expert_start, NUM_EXPERTS, num_routed_tokens = _grouped_routing(
-        expert_ids, gate_up_proj.size(0), num_top_k
+        top_k_index, gate_up_proj.size(0), num_top_k
     )
     num_sms = sm_count(device.index)
     tokens_per_sm_bit_length = (num_routed_tokens // num_sms).bit_length()
@@ -514,6 +513,7 @@ def w8a8_block_dynamic_fp8_moe_grouped(
             NUM_EXPERTS=NUM_EXPERTS,
             NUM_SMS=num_sms,
             SIMULATE_UNFUSED=simulate_unfused,
+            ACT_FN=act_fn,
         )
         w8a8_block_dynamic_fp8_moe_grouped_down_kernel[(num_sms,)](
             inter,
@@ -522,7 +522,7 @@ def w8a8_block_dynamic_fp8_moe_grouped(
             down_scale_u8,
             expert_start,
             perm,
-            sample_weights,
+            top_k_weights,
             out,
             inter.stride(0),
             inter.stride(1),
@@ -537,7 +537,6 @@ def w8a8_block_dynamic_fp8_moe_grouped(
             out.stride(0),
             out.stride(1),
             perm.stride(0),
-            sample_weights.stride(0),
             tokens_per_sm_bit_length=tokens_per_sm_bit_length,
             HIDDEN_DIM=HIDDEN_DIM,
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
@@ -636,6 +635,7 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
     SIMULATE_UNFUSED: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
     MEMORY_MODE: tl.constexpr,
+    ACT_FN: tl.constexpr,
 ):
     """MXFP4/MXFP8 phase 1 (persistent): gather hidden rows per expert M-tile, gate + up MX
     matmuls (``tl.dot_scaled`` or fp8 ``tl.dot`` + per-group rescale), SiLU, MXFP8-requant."""
@@ -755,8 +755,8 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
         acc_3d = tl.permute(tl.reshape(acc, [BLOCK_SIZE_M, 2, BLOCK_SIZE_N]), (0, 2, 1))
         acc_gate, acc_up = tl.split(acc_3d)
 
-        intermediate = swiglu(
-            acc_gate, acc_up, SIMULATE_UNFUSED, Hidden.dtype.element_ty
+        intermediate = glu(
+            acc_gate, acc_up, ACT_FN, SIMULATE_UNFUSED, Hidden.dtype.element_ty
         )
 
         # MXFP8 requant of the intermediate (E4M3 + UE8M0 group-32 along this N-tile).
@@ -830,7 +830,6 @@ def mxfp_dynamic_moe_grouped_down_kernel(
     stride_po_m,
     stride_po_n,
     stride_perm,
-    stride_sw,
     tokens_per_sm_bit_length,  # autotune key only (log2 tokens-per-SM bucket); unused in body
     HIDDEN_DIM: tl.constexpr,
     INTERMEDIATE_DIM: tl.constexpr,
@@ -944,7 +943,7 @@ def mxfp_dynamic_moe_grouped_down_kernel(
         # Fused routing-weight × top-k reorder (no atomics): scale each row by its weight
         # and scatter to its flat (token, slot) row; the host then just sums over slots.
         flat = tl.load(Perm + offs_global_m * stride_perm, mask=row_mask, other=0)
-        weight = tl.load(SampleWeights + flat * stride_sw, mask=row_mask, other=0.0)
+        weight = tl.load(SampleWeights + flat, mask=row_mask, other=0.0)
         acc = acc * weight[:, None]
         store_tile(ProjOut, acc, flat, offs_bn, row_mask, stride_po_m, stride_po_n)
 
@@ -958,6 +957,7 @@ def mxfp_dynamic_moe_grouped(
     gate_up_proj_scale: torch.Tensor,
     down_proj_scale: torch.Tensor,
     simulate_unfused: bool = False,
+    act_fn: str = "silu",
 ) -> torch.Tensor:
     """MXFP4/MXFP8 fused grouped MoE — format picked per-weight (UE8M0 group-32). Same
     structure as the block-dynamic path but with a tunable tile and an MXFP8 intermediate."""
@@ -968,15 +968,12 @@ def mxfp_dynamic_moe_grouped(
     HIDDEN_DIM = hidden_states.size(1)
     INTERMEDIATE_DIM = gate_up_proj.size(1) // 2
 
-    expert_ids = top_k_index.reshape(-1)
-    sample_weights = top_k_weights.reshape(-1)
     perm_token, perm, expert_start, NUM_EXPERTS, num_routed_tokens = _grouped_routing(
-        expert_ids, gate_up_proj.size(0), num_top_k
+        top_k_index, gate_up_proj.size(0), num_top_k
     )
     num_sms = sm_count(device.index)
     tokens_per_sm_bit_length = (num_routed_tokens // num_sms).bit_length()
-    # One MX recipe per layer, so gate_up and down share values_per_byte.
-    values_per_byte = (
+    VALUES_PER_BYTE = (
         NIBBLES_PER_BYTE if is_mxfp4(gate_up_proj, gate_up_proj_scale) else 1
     )
     gate_up_proj_u8 = e2m1_as_uint8(gate_up_proj)
@@ -1008,10 +1005,10 @@ def mxfp_dynamic_moe_grouped(
         2 * gate_up_proj_u8.size(0), INTERMEDIATE_DIM, gate_up_proj_u8.size(2)
     )
     gate_up_descriptor = TensorDescriptor.from_tensor(
-        gate_up_2e, [2, 32, 32 // values_per_byte]
+        gate_up_2e, [2, 32, 32 // VALUES_PER_BYTE]
     )
     down_eh = down_proj_u8.view(down_proj_u8.size(0) * HIDDEN_DIM, down_proj_u8.size(2))
-    down_descriptor = TensorDescriptor.from_tensor(down_eh, [32, 32 // values_per_byte])
+    down_descriptor = TensorDescriptor.from_tensor(down_eh, [32, 32 // VALUES_PER_BYTE])
     with device_context(device):
         mxfp_dynamic_moe_grouped_gate_up_kernel[(num_sms,)](
             hidden_states,
@@ -1038,11 +1035,12 @@ def mxfp_dynamic_moe_grouped(
             tokens_per_sm_bit_length=tokens_per_sm_bit_length,
             HIDDEN_DIM=HIDDEN_DIM,
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
-            VALUES_PER_BYTE=values_per_byte,
+            VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
             NUM_EXPERTS=NUM_EXPERTS,
             NUM_SMS=num_sms,
             SIMULATE_UNFUSED=simulate_unfused,
+            ACT_FN=act_fn,
         )
         mxfp_dynamic_moe_grouped_down_kernel[(num_sms,)](
             inter,
@@ -1052,7 +1050,7 @@ def mxfp_dynamic_moe_grouped(
             down_descriptor,
             expert_start,
             perm,
-            sample_weights,
+            top_k_weights,
             out,
             inter.stride(0),
             inter.stride(1),
@@ -1067,11 +1065,10 @@ def mxfp_dynamic_moe_grouped(
             out.stride(0),
             out.stride(1),
             perm.stride(0),
-            sample_weights.stride(0),
             tokens_per_sm_bit_length=tokens_per_sm_bit_length,
             HIDDEN_DIM=HIDDEN_DIM,
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
-            VALUES_PER_BYTE=values_per_byte,
+            VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
             NUM_EXPERTS=NUM_EXPERTS,
             NUM_SMS=num_sms,
@@ -1105,6 +1102,7 @@ def moe_fused_grouped(
     down_proj_scale_inv: torch.Tensor,
     block_size: list[int] | None,
     simulate_unfused: bool = False,
+    act_fn: str = "silu",
 ) -> torch.Tensor:
     """Fused grouped-MoE dispatcher — routes to the recipe matching the weight dtype /
     scale layout, mirroring ``moe_fused_batched``. Implemented: block-dynamic FP8 and MXFP8 /
@@ -1120,6 +1118,7 @@ def moe_fused_grouped(
             gate_up_proj_scale_inv,
             down_proj_scale_inv,
             simulate_unfused,
+            act_fn,
         )
 
     return w8a8_block_dynamic_fp8_moe_grouped(
@@ -1132,4 +1131,5 @@ def moe_fused_grouped(
         down_proj_scale_inv,
         block_size,
         simulate_unfused,
+        act_fn,
     )

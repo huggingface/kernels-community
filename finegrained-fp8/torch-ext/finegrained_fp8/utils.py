@@ -536,16 +536,36 @@ def mx_scalar_reduce_gate_up(
 
 
 @triton.jit
-def swiglu(acc_gate, acc_up, SIMULATE_UNFUSED: tl.constexpr, OUT_DTYPE: tl.constexpr):
-    """SwiGLU activation: silu(gate) * up. When ``SIMULATE_UNFUSED``, round each op's
-    output through ``OUT_DTYPE`` to match the numerics of the unfused (separate-kernel)
+def _activation(x, ACT_FN: tl.constexpr):
+    """Pointwise GLU gate activation. ``ACT_FN`` in ``{"silu", "gelu", "relu"}``; gelu is exact
+    (erf), matching torch's default ``F.gelu``."""
+    if ACT_FN == "silu":
+        return x * tl.sigmoid(x)
+    elif ACT_FN == "gelu":
+        return 0.5 * x * (1.0 + tl.erf(x * 0.7071067811865476))
+    elif ACT_FN == "relu":
+        return tl.maximum(x, 0.0)
+    else:
+        tl.static_assert(False, "unsupported ACT_FN; expected 'silu', 'gelu', or 'relu'")
+
+
+@triton.jit
+def glu(
+    acc_gate,
+    acc_up,
+    ACT_FN: tl.constexpr,
+    SIMULATE_UNFUSED: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+):
+    """Gated linear unit: ``ACT_FN(gate) * up`` (SwiGLU / GeGLU / ReGLU). When ``SIMULATE_UNFUSED``,
+    round each op through ``OUT_DTYPE`` to match the numerics of the unfused (separate-kernel)
     path, where every intermediate is materialized in that dtype."""
     if SIMULATE_UNFUSED:
         g = acc_gate.to(OUT_DTYPE).to(tl.float32)
         u = acc_up.to(OUT_DTYPE).to(tl.float32)
-        silu = (g * tl.sigmoid(g)).to(OUT_DTYPE).to(tl.float32)
-        return (silu * u).to(OUT_DTYPE).to(tl.float32)
-    return acc_gate * tl.sigmoid(acc_gate) * acc_up
+        act = _activation(g, ACT_FN).to(OUT_DTYPE).to(tl.float32)
+        return (act * u).to(OUT_DTYPE).to(tl.float32)
+    return _activation(acc_gate, ACT_FN) * acc_up
 
 
 @triton.jit
