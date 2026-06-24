@@ -49,9 +49,15 @@ def device_context(device: torch.device):
 
 @functools.lru_cache(maxsize=8)
 def sm_count(device_index: int) -> int:
-    """Streaming-multiprocessor (SM) count for a device (a constant) — cached so callers
-    don't re-query it each launch."""
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
+    """Processor (CUDA SM / XPU Xe-core) count for a device (a constant) — cached so callers
+    don't re-query it each launch. Read from Triton's active driver so it works on any backend,
+    with a CUDA fallback."""
+    try:
+        return triton.runtime.driver.active.utils.get_device_properties(device_index)[
+            "multiprocessor_count"
+        ]
+    except Exception:
+        return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 # H-tile each topk_reduce program reduces (one (token, tile) program per BLOCK_H span). The
@@ -340,7 +346,8 @@ def smem_config_pruner(act_bytes: int, n_weight_tiles: int, weight_bytes: int = 
         # The estimate needs all three tile dims. Each is either an autotuned config meta
         # (MX) or a launch arg (block-dynamic), so look in both; raise clearly if missing.
         all_args = {**named_args, **kwargs}
-        limit = sm_shared_memory_limit(torch.cuda.current_device())
+        dev = triton.runtime.driver.active.get_active_torch_device()
+        limit = sm_shared_memory_limit(dev.index if dev.index is not None else 0)
 
         def dim(c, name):
             v = c.kwargs.get(name, all_args.get(name))

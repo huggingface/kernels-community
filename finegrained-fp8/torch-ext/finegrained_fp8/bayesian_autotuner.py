@@ -27,6 +27,7 @@ exhaustive bench-all.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -35,7 +36,15 @@ import time
 from collections import defaultdict
 from typing import Dict, List
 
-from triton.runtime.autotuner import Autotuner, Config
+from triton.runtime.autotuner import (
+    Autotuner,
+    Config,
+    JITFunction,
+    driver,
+    get_cache_invalidating_env_vars,
+    get_cache_manager,
+    triton_key,
+)
 
 GAMMA = 0.25  # top fraction of measured configs treated as "good" by the TPE
 
@@ -221,6 +230,76 @@ class BayesianAutotuner(Autotuner):
                 return i
         return None
 
+    def check_disk_cache(self, tuning_key, configs, bench_fn):
+        """Persist the tuned best config to Triton's on-disk cache so a later run (or process)
+        skips the whole minutes-long search+compile — most of which is Triton codegen, not
+        benching. Keyed exactly like Triton's own autotune cache (triton version + backend +
+        kernel source hash + invalidating env + key + the full config grid), so any of those
+        changing re-tunes.
+
+        Unlike Triton's stock version we do NOT bail when configs carry a ``pre_hook`` (ours
+        always do): we persist each config's ``all_kwargs()`` — serializable and pre_hook-free —
+        and on a hit re-match it to the live ``Config`` object, so the pre_hook is preserved from
+        code rather than lost in (de)serialization. A hit launches only the winning config."""
+        if not tuning_key:
+            bench_fn()
+            return False
+
+        from triton.compiler.compiler import make_backend
+
+        fn = self.fn
+        while not isinstance(fn, JITFunction):
+            fn = fn.fn
+        env_vars = get_cache_invalidating_env_vars()
+        cache_key = [
+            triton_key(),
+            make_backend(driver.active.get_current_target()).hash(),
+            fn.cache_key,
+            str(sorted(env_vars.items())),
+            str(tuning_key),
+        ] + [str(c) for c in configs]  # str(Config) is pre_hook-free and process-stable
+        cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()
+        cache = get_cache_manager(cache_key)
+        file_name = f"{fn.__name__[:150]}.bayes_autotune.json"
+
+        # signature -> live Config (carries the pre_hook); used to re-match the cached winner
+        by_sig = {tuple(sorted(c.all_kwargs().items())): c for c in configs}
+        path = cache.get_file(file_name)
+        if path:
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                best = by_sig.get(tuple(sorted(data["best"].items())))
+                if best is not None:
+                    self.cache[tuning_key] = best
+                    self.configs_timings = {
+                        by_sig[s]: t
+                        for kw, t in data["timings"]
+                        for s in (tuple(sorted(kw.items())),)
+                        if s in by_sig
+                    }
+                    return True
+            except Exception:
+                pass  # corrupt/stale cache file → fall through and re-tune
+
+        bench_fn()
+        try:
+            cache.put(
+                json.dumps(
+                    {
+                        "best": self.cache[tuning_key].all_kwargs(),
+                        "timings": [
+                            (c.all_kwargs(), t) for c, t in self.configs_timings.items()
+                        ],
+                    }
+                ),
+                file_name,
+                binary=False,
+            )
+        except Exception:
+            pass
+        return False
+
 
 def bayesian_autotune(
     configs,
@@ -231,6 +310,7 @@ def bayesian_autotune(
     refine: bool = True,
     max_refine_iters: int = 5,
     log_path: str | None = None,
+    cache_results: bool = True,
     reset_to_zero=None,
     restore_value=None,
     **kwargs,
@@ -239,7 +319,9 @@ def bayesian_autotune(
     n_trials:                 total configs benched per key (TPE budget)
     n_startup_trials:         random seed configs before the TPE model kicks in
     refine, max_refine_iters: coordinate-descent refinement after the TPE
-    log_path:                 JSONL of benched configs (or FINEGRAINED_AUTOTUNE_LOG)"""
+    log_path:                 JSONL of benched configs (or FINEGRAINED_AUTOTUNE_LOG)
+    cache_results:            persist the tuned best config to disk (on by default) so later
+                              runs skip the search+compile — see BayesianAutotuner.check_disk_cache"""
 
     def decorator(fn):
         return BayesianAutotuner(
@@ -254,6 +336,7 @@ def bayesian_autotune(
             refine=refine,
             max_refine_iters=max_refine_iters,
             log_path=log_path,
+            cache_results=cache_results,
             **kwargs,
         )
 
