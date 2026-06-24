@@ -15,7 +15,7 @@
 """Bayesian-optimization autotuner: benches a budgeted sample of the config grid instead of
 the full grid, via a Tree-structured Parzen Estimator (TPE) over the config *dimensions*
 (``num_warps`` / ``num_stages`` / tile sizes / flags). After a short random seed phase it
-models the good (top-``GAMMA`` by measured time) vs bad per-dimension value densities and
+models the good (top-``gamma`` by measured time) vs bad per-dimension value densities and
 benches the unmeasured config that maximizes ``l(x)/g(x)`` — the Expected-Improvement proxy
 — then a coordinate-descent pass polishes the best. Subclasses Triton's ``Autotuner`` and
 uses only the Python stdlib (no external optimizer dependency).
@@ -43,10 +43,9 @@ from triton.runtime.autotuner import (
     driver,
     get_cache_invalidating_env_vars,
     get_cache_manager,
+    knobs,
     triton_key,
 )
-
-GAMMA = 0.25  # top fraction of measured configs treated as "good" by the TPE
 
 
 class BayesianAutotuner(Autotuner):
@@ -59,6 +58,7 @@ class BayesianAutotuner(Autotuner):
         *args,
         n_trials: int = 80,
         n_startup_trials: int = 12,
+        gamma: float = 0.25,
         refine: bool = True,
         max_refine_iters: int = 5,
         log_path: str | None = None,
@@ -67,6 +67,8 @@ class BayesianAutotuner(Autotuner):
         super().__init__(*args, **kwargs)
         self.n_trials = n_trials
         self.n_startup_trials = n_startup_trials
+        # top fraction of measured configs the TPE treats as "good"
+        self.gamma = gamma
         self.refine = refine
         self.max_refine_iters = max_refine_iters
         # JSONL log of every benched (key, config, ms) — set here or via the
@@ -92,6 +94,13 @@ class BayesianAutotuner(Autotuner):
                 t0 = time.time()
                 self.cache[key] = self._bayesian_search(pruned, args, kwargs, key)
                 self.bench_time = time.time() - t0
+                if knobs.autotuning.print:
+                    fn_name = getattr(self.fn, "__name__", str(self.fn))
+                    print(
+                        f"[bayesian-autotune] {fn_name} tuned "
+                        f"{len(self.configs_timings)} configs in {self.bench_time:.1f}s — "
+                        f"key={key}, best={self.cache[key].all_kwargs()}"
+                    )
                 full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
                 self.pre_hook(full_nargs, reset_only=True)
 
@@ -142,12 +151,12 @@ class BayesianAutotuner(Autotuner):
         for idx in order[:n_startup]:
             bench_idx(idx)
 
-        # TPE: split measured configs into good (top-GAMMA) / bad, build per-dimension value
+        # TPE: split measured configs into good (top-gamma) / bad, build per-dimension value
         # densities for each, and bench the unmeasured config maximizing log l(x) - log g(x)
         # (Expected-Improvement proxy), updating the model after each measurement.
         while len(timings) < self.n_trials:
             ranked = sorted(timings, key=timings.get)
-            n_good = max(1, round(GAMMA * len(ranked)))
+            n_good = max(1, round(self.gamma * len(ranked)))
             good_c: Dict = defaultdict(lambda: defaultdict(int))
             bad_c: Dict = defaultdict(lambda: defaultdict(int))
             for j, i in enumerate(ranked):
@@ -203,8 +212,8 @@ class BayesianAutotuner(Autotuner):
             return
         try:
             rec = {
-                "t": time.time(),
-                "fn": getattr(self.fn, "__name__", str(self.fn)),
+                "timestamp": time.time(),
+                "fn_name": getattr(self.fn, "__name__", str(self.fn)),
                 "key": list(key),
                 "kwargs": config.kwargs,
                 "num_warps": config.num_warps,
@@ -307,6 +316,7 @@ def bayesian_autotune(
     *,
     n_trials: int = 80,
     n_startup_trials: int = 12,
+    gamma: float = 0.25,
     refine: bool = True,
     max_refine_iters: int = 5,
     log_path: str | None = None,
@@ -318,6 +328,7 @@ def bayesian_autotune(
     """Decorator mirroring ``@triton.autotune``. Extra kwargs:
     n_trials:                 total configs benched per key (TPE budget)
     n_startup_trials:         random seed configs before the TPE model kicks in
+    gamma:                    top fraction of measured configs treated as "good"
     refine, max_refine_iters: coordinate-descent refinement after the TPE
     log_path:                 JSONL of benched configs (or FINEGRAINED_AUTOTUNE_LOG)
     cache_results:            persist the tuned best config to disk (on by default) so later
@@ -333,6 +344,7 @@ def bayesian_autotune(
             restore_value,
             n_trials=n_trials,
             n_startup_trials=n_startup_trials,
+            gamma=gamma,
             refine=refine,
             max_refine_iters=max_refine_iters,
             log_path=log_path,
