@@ -18,10 +18,11 @@
       # probably be more lean.
       doGetKernelCheck = false;
 
-      pythonCheckInputs = ps: with ps; [
-        einops
-        huggingface-hub
-        transformers
-      ];
+      pythonCheckInputs =
+        ps: with ps; [
+          einops
+          huggingface-hub
+          transformers
+        ];
     };
 }
