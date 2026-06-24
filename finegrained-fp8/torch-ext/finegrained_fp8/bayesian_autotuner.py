@@ -153,7 +153,9 @@ class BayesianAutotuner(Autotuner):
                 score = 0.0
                 for d, v in sigs[i]:
                     V = len(dim_vals[d])
-                    lp = (good_c[d][v] + 1.0) / (n_good + V)  # P(v | good), Laplace-smoothed
+                    lp = (good_c[d][v] + 1.0) / (
+                        n_good + V
+                    )  # P(v | good), Laplace-smoothed
                     gp = (bad_c[d][v] + 1.0) / (n_bad + V)  # P(v | bad)
                     score += math.log(lp) - math.log(gp)
                 if score > best_score:

@@ -736,7 +736,7 @@ def _assert_fused_correctness(out, ref, problem: MoEProblem):
 @pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
 def test_fused_batched(problem):
     """Fused two-kernel MoE (gate_up + SiLU + FP8 requant + down + top-k reduce) via the
-    ``moe_batched`` dispatcher vs the unfused reference. ``simulate_unfused`` rounds each
+    ``moe_fused_batched`` dispatcher vs the unfused reference. ``simulate_unfused`` rounds each
     fused step through the activation dtype so the two agree to reduce order."""
     torch.manual_seed(0)
     gate_up, gate_up_s, down, down_s, block_size = _make_moe_weights(problem)
@@ -752,7 +752,7 @@ def test_fused_batched(problem):
         problem,
         block_size,
     )
-    out = fused_batched.moe_batched(
+    out = fused_batched.moe_fused_batched(
         hidden,
         top_k_index,
         top_k_weights,
@@ -771,7 +771,7 @@ def test_fused_batched(problem):
 @pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
 def test_fused_grouped(problem):
     """Fused grouped MoE (gather gate_up + SiLU + FP8 requant + grouped down + top-k
-    reduce) via the ``moe_grouped`` dispatcher vs the same unfused reference, with
+    reduce) via the ``moe_fused_grouped`` dispatcher vs the same unfused reference, with
     ``simulate_unfused`` rounding each fused step through the activation dtype."""
     torch.manual_seed(0)
     gate_up, gate_up_s, down, down_s, block_size = _make_moe_weights(problem)
@@ -787,7 +787,7 @@ def test_fused_grouped(problem):
         problem,
         block_size,
     )
-    out = fused_grouped.moe_grouped(
+    out = fused_grouped.moe_fused_grouped(
         hidden,
         top_k_index,
         top_k_weights,

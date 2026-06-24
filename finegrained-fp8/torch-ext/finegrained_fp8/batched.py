@@ -161,7 +161,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 
 
 @triton.autotune(
-    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
+    configs=get_accelerator_autotuning_configs(tune_block_nk=True),
     key=["N", "K"],
 )
 @triton.jit
@@ -288,15 +288,27 @@ def mxfp_dynamic_matmul_batched_kernel(
         a, a_scale = mxfp_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
         )
-        b = tl.load(b_ptrs)  # uint8 (MXFP4 packed E2M1) or E4M3 (MXFP8) — dtype from the tensor
+        b = tl.load(b_ptrs)
         b_s = tl.load(bs_ptrs).to(tl.uint8)
         bq = mxfp4_e2m1_to_e4m3(b) if VALUES_PER_BYTE == 2 else b
         if COMPUTE_MODE == "dot_scaled":
-            accumulator = mx_dot_scaled(a, a_scale, b, b_s, accumulator, VALUES_PER_BYTE)
+            accumulator = mx_dot_scaled(
+                a, a_scale, b, b_s, accumulator, VALUES_PER_BYTE
+            )
         elif COMPUTE_MODE == "dot":
             accumulator = mx_dot_rescale(accumulator, a, bq, a_scale, b_s)
         else:  # scalar
-            accumulator = mx_scalar_reduce(accumulator, a, a_scale, bq, b_s, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K)
+            accumulator = mx_scalar_reduce(
+                accumulator,
+                a,
+                a_scale,
+                bq,
+                b_s,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                SCALE_GROUP_K,
+            )
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
@@ -409,7 +421,9 @@ def _w8a8_tensor_dynamic_fp8_matmul_batched(
 
     # Normalize Bs to (num_experts, 1, 1)
     if Bs.ndim == 1:
-        assert Bs.shape[0] == num_experts, f"Bs shape {tuple(Bs.shape)} != expected ({num_experts},)"
+        assert Bs.shape[0] == num_experts, (
+            f"Bs shape {tuple(Bs.shape)} != expected ({num_experts},)"
+        )
         Bs = Bs.reshape(num_experts, 1, 1)
     else:
         assert Bs.shape == (num_experts, 1, 1), (

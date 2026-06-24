@@ -221,7 +221,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(with_block_sizes=True),
+    get_accelerator_autotuning_configs(tune_block_nk=True),
     ["N", "K", "BLOCK_SIZE_M"],
     n_trials=60,
 )
@@ -307,7 +307,9 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
 
 
 @bayesian_autotune(
-    get_mxfp_autotuning_configs(modes=("dot_scaled", "dot")),  # prefill: no scalar branch
+    get_mxfp_autotuning_configs(
+        compute_modes=("dot_scaled", "dot")
+    ),  # prefill: no scalar branch
     ["N", "K", "BLOCK_SIZE_M"],
     n_trials=60,
 )
@@ -397,11 +399,13 @@ def mxfp_dynamic_matmul_grouped_kernel(
         a, a_scale = mxfp_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
         )
-        b = tl.load(b_ptrs)  # uint8 (MXFP4 packed E2M1) or E4M3 (MXFP8) — dtype from the tensor
+        b = tl.load(b_ptrs)
         b_s = tl.load(bs_ptrs).to(tl.uint8)
         bq = mxfp4_e2m1_to_e4m3(b) if VALUES_PER_BYTE == 2 else b
         if COMPUTE_MODE == "dot_scaled":
-            accumulator = mx_dot_scaled(a, a_scale, b, b_s, accumulator, VALUES_PER_BYTE)
+            accumulator = mx_dot_scaled(
+                a, a_scale, b, b_s, accumulator, VALUES_PER_BYTE
+            )
         else:  # dot
             accumulator = mx_dot_rescale(accumulator, a, bq, a_scale, b_s)
         a_ptrs += BLOCK_SIZE_K * stride_ak

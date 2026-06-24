@@ -54,10 +54,25 @@ def sm_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+# H-tile each topk_reduce program reduces (one (token, tile) program per BLOCK_H span). The
+# reduce is bandwidth-bound and saturates at BLOCK_H>=512: a sweep over {128..2048} x prefill
+# shapes put 512/1024/2048 within ~7% (mostly noise) while 128/256 lagged — not worth a tuning
+# axis for this small slice of runtime. 512 = smallest that saturates (best at low token counts,
+# where bigger tiles waste masked lanes). Power of 2 (tl.arange).
+TOPK_REDUCE_BLOCK_H = 512
+
+
 @triton.jit
 def topk_reduce_kernel(
-    ProjOut, Out, H, stride_pm, stride_ph, stride_om, stride_oh,
-    NUM_TOP_K: tl.constexpr, BLOCK_H: tl.constexpr,
+    ProjOut,
+    Out,
+    H,
+    stride_pm,
+    stride_ph,
+    stride_om,
+    stride_oh,
+    NUM_TOP_K: tl.constexpr,
+    BLOCK_H: tl.constexpr,
 ):
     """Sum the ``NUM_TOP_K`` flat ``(token, slot)`` rows of ``ProjOut`` into ``Out[token]`` —
     a tight replacement for ``proj_out.view(T, K, H).sum(1)`` (~2.8x faster than torch's
@@ -72,7 +87,11 @@ def topk_reduce_kernel(
             mask=mask,
             other=0.0,
         ).to(tl.float32)
-    tl.store(Out + t * stride_om + offs_h * stride_oh, acc.to(Out.dtype.element_ty), mask=mask)
+    tl.store(
+        Out + t * stride_om + offs_h * stride_oh,
+        acc.to(Out.dtype.element_ty),
+        mask=mask,
+    )
 
 
 def ue8m0_as_uint8(scale: torch.Tensor) -> torch.Tensor:
@@ -178,17 +197,21 @@ def get_active_device_type() -> str:
         return "cuda"
 
 
-def get_accelerator_autotuning_configs(*, with_block_sizes: bool = False, block_size_m=None):
+def get_accelerator_autotuning_configs(
+    *, tune_block_nk: bool = False, tune_block_m: bool = False
+):
     """Autotune search grid for the current accelerator.
 
     ``num_warps``, ``num_stages`` and ``blocks`` (the ``(BLOCK_SIZE_N, BLOCK_SIZE_K)``
-    tile shapes) are fixed up front from ``(is_xpu, with_block_sizes)``, then crossed
+    tile shapes) are fixed up front from ``(is_xpu, tune_block_nk)``, then crossed
     into the config list.
 
-    ``with_block_sizes=True`` sweeps the tile: used by kernels that have no caller
+    ``tune_block_nk=True`` sweeps the tile: used by kernels that have no caller
     ``block_size`` to fix it — the MX ``tl.dot_scaled`` paths AND the tensor-dynamic
-    FP8 paths. ``with_block_sizes=False`` emits a single empty meta-dict (block-scaled
-    kernels take the tile from the caller's ``block_size``).
+    FP8 paths. ``tune_block_nk=False`` emits a single empty meta-dict (block-scaled
+    kernels take the tile from the caller's ``block_size``). ``tune_block_m=True`` also crosses
+    in BLOCK_SIZE_M ∈ ``(16, 32, 64, 128)`` (fused grouped, which lets the tuner pick M instead
+    of computing it via ``adaptive_block_size_m``).
 
     The CUDA tile set is a data-driven prune of a B200 sweep across single (BM=128),
     grouped MoE (BM=16/64) and decode (BM=1): winners only ever used these 4 tiles,
@@ -196,20 +219,20 @@ def get_accelerator_autotuning_configs(*, with_block_sizes: bool = False, block_
     won) — 108 → 24. (Tuned on dot_scaled; tensor-dynamic tl.dot reuses it.)
     """
     is_xpu = get_active_device_type() == "xpu"
-    if with_block_sizes:
-        num_stages = [2, 3]
-        num_warps = [8, 16] if is_xpu else [4, 8, 16]
+    num_warps = [8, 16] if is_xpu else [2, 4, 8, 16]
+    num_stages = [2, 3, 4]
+
+    if tune_block_nk:
         tiles = (
             [(128, 128)] if is_xpu else [(128, 128), (256, 128), (128, 64), (64, 256)]
         )
         blocks = [{"BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk} for bn, bk in tiles]
     else:
-        num_stages = [2, 3, 4]
-        num_warps = [8, 16] if is_xpu else [2, 4, 8, 16]
         blocks = [{}]
 
-    if block_size_m:
-        blocks = [{**b, "BLOCK_SIZE_M": bm} for b in blocks for bm in block_size_m]
+    if tune_block_m:
+        blocks = [{**b, "BLOCK_SIZE_M": bm} for b in blocks for bm in (16, 32, 64, 128)]
+
     return [
         triton.Config(b, num_warps=w, num_stages=s)
         for b in blocks
@@ -218,7 +241,12 @@ def get_accelerator_autotuning_configs(*, with_block_sizes: bool = False, block_
     ]
 
 
-def get_mxfp_autotuning_configs(pre_hook=None, modes=("dot_scaled", "dot", "scalar"), with_tma=False, block_size_m=None):
+def get_mxfp_autotuning_configs(
+    pre_hook=None,
+    compute_modes=("dot_scaled", "dot", "scalar"),
+    memory_modes=(None,),
+    tune_block_m=False,
+):
     """Autotune grid for the MXFP8 MoE/matmul kernels. ``COMPUTE_MODE`` (a constexpr string) picks
     the multiply-accumulate, and the Bayesian tuner selects it per workload (token count is
     in the key):
@@ -234,28 +262,42 @@ def get_mxfp_autotuning_configs(pre_hook=None, modes=("dot_scaled", "dot", "scal
 
     ``num_warps=16`` and ``BLOCK_SIZE_K=64`` are omitted (dead at M=1 per a sweep).
 
-    ``with_tma=True`` (fused_grouped only) adds an orthogonal ``USE_TMA`` axis: the combined
-    gate∪up tile is loaded via the TMA descriptor (``USE_TMA=True``, ``pre_hook`` builds it) or a
-    rank-3 ``make_block_ptr`` stride-trick load (``USE_TMA=False``, no descriptor) — the tuner
-    picks per workload. The descriptor pre_hook only attaches to TMA configs."""
-    bms = block_size_m or (None,)
+    ``memory_modes`` (fused_grouped only) is the ``MEMORY_MODE`` axis for the weight load — e.g.
+    ``("host_descriptor", "block_ptr")`` on CUDA, ``("device_descriptor", "block_ptr")`` on XPU
+    (a host/device tensor descriptor — TMA on NVIDIA — vs a rank-3 ``make_block_ptr`` load); the
+    ``(None,)`` (default) emits no axis. Pass all the modes a kernel implements; this drops
+    the device-inapplicable descriptor flavor (host-side is NVIDIA-TMA-only, device-side is the
+    XPU win). a given pre_hook is attached to every config and self-guards on ``MEMORY_MODE``."""
+    drop = (
+        "host_descriptor" if get_active_device_type() == "xpu" else "device_descriptor"
+    )
+    memory_modes = tuple(m for m in memory_modes if m != drop)
+    if "device_descriptor" in memory_modes:
+        # device-side descriptors build in-kernel tensormaps that need a scratch allocator (the
+        # XPU path; CUDA keeps host-built descriptors and never reaches this).
+        triton.set_allocator(
+            lambda size, alignment, stream: torch.empty(
+                size, dtype=torch.int8, device="xpu"
+            )
+        )
+    bms = (16, 32, 64, 128) if tune_block_m else (None,)
     return [
         triton.Config(
             {
                 "COMPUTE_MODE": mode,
                 "BLOCK_SIZE_N": bn,
                 "BLOCK_SIZE_K": bk,
-                **({"USE_TMA": use_tma} if with_tma else {}),
+                **({"MEMORY_MODE": mm} if mm is not None else {}),
                 **({"BLOCK_SIZE_M": bm} if bm is not None else {}),
             },
             num_warps=w,
             num_stages=s,
-            # TMA descriptor pre_hook: attach for every config, except the block-ptr
-            # (USE_TMA=False) configs of a TMA-enabled kernel, which build no descriptor.
-            pre_hook=pre_hook if (use_tma or not with_tma) else None,
+            # Always attached when given; the hook self-guards on MEMORY_MODE (only
+            # host_descriptor configs use the host-built descriptor).
+            pre_hook=pre_hook,
         )
-        for mode in modes
-        for use_tma in ([True, False] if with_tma else [False])
+        for mode in compute_modes
+        for mm in memory_modes
         for bn in [32, 64, 128, 256]
         # only "dot" pins BK to the group (one scale group per fp8 tl.dot step); "dot_scaled"
         # and "scalar" handle multiple groups per K-chunk, so they use a wide BK.
@@ -277,7 +319,9 @@ def sm_shared_memory_limit(device_index: int) -> int:
             "max_shared_mem"
         ]
     except Exception:
-        return torch.cuda.get_device_properties(device_index).shared_memory_per_block_optin
+        return torch.cuda.get_device_properties(
+            device_index
+        ).shared_memory_per_block_optin
 
 
 def smem_config_pruner(act_bytes: int, n_weight_tiles: int, weight_bytes: int = 1):
@@ -291,6 +335,7 @@ def smem_config_pruner(act_bytes: int, n_weight_tiles: int, weight_bytes: int = 
     read from the launch args. MXFP4 packs 2 weights/byte, so ``weight_bytes=1`` (MXFP8) is a
     safe upper bound. The limit is read from the active device. Never returns empty — keeps
     the smallest-footprint config as a fallback."""
+
     def prune(configs, named_args, **kwargs):
         # The estimate needs all three tile dims. Each is either an autotuned config meta
         # (MX) or a launch arg (block-dynamic), so look in both; raise clearly if missing.
@@ -307,8 +352,14 @@ def smem_config_pruner(act_bytes: int, n_weight_tiles: int, weight_bytes: int = 
             return v
 
         def smem(c):
-            BM, BN, BK = (dim(c, n) for n in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"))
-            return c.num_stages * BK * (act_bytes * BM + weight_bytes * n_weight_tiles * BN)
+            BM, BN, BK = (
+                dim(c, n) for n in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K")
+            )
+            return (
+                c.num_stages
+                * BK
+                * (act_bytes * BM + weight_bytes * n_weight_tiles * BN)
+            )
 
         kept = [c for c in configs if smem(c) <= limit]
         return kept or [min(configs, key=smem)]
@@ -375,7 +426,9 @@ def decode_ue8m0_scale(scale):
 
 
 @triton.jit
-def expand_ue8m0_scale(scale_u8, ROWS: tl.constexpr, BK: tl.constexpr, GK: tl.constexpr):
+def expand_ue8m0_scale(
+    scale_u8, ROWS: tl.constexpr, BK: tl.constexpr, GK: tl.constexpr
+):
     """Decode a UE8M0 group scale tile ``[ROWS, BK//GK]`` and broadcast each group scale
     across its ``GK`` elements → ``[ROWS, BK]`` fp32 — one scale per K element. Used by the
     scalar (CUDA-core FMA) MX paths to dequant the whole BK chunk before the reduction."""
@@ -397,11 +450,15 @@ def mx_dot_rescale(acc, a, wq, a_scale, w_scale):
     """MX 'dot' path (BK == group): fp8 ``tl.dot`` + per-group software rescale, decoding both
     UE8M0 scales internally and accumulating into ``acc`` (returned updated). Single weight — for
     the gate∪up pair (shared activation scale) use ``mx_dot_rescale_gate_up``."""
-    return acc + tl.dot(a, wq) * decode_ue8m0_scale(a_scale) * tl.trans(decode_ue8m0_scale(w_scale))
+    return acc + tl.dot(a, wq) * decode_ue8m0_scale(a_scale) * tl.trans(
+        decode_ue8m0_scale(w_scale)
+    )
 
 
 @triton.jit
-def mx_dot_rescale_gate_up(acc_gate, acc_up, a, w_gate, w_up, a_scale, gate_scale, up_scale):
+def mx_dot_rescale_gate_up(
+    acc_gate, acc_up, a, w_gate, w_up, a_scale, gate_scale, up_scale
+):
     """Gate∪up 'dot' path: decode the SHARED activation scale once, rescale both projections
     and accumulate into ``acc_gate``/``acc_up`` (returned updated)."""
     a_s = decode_ue8m0_scale(a_scale)
@@ -411,24 +468,63 @@ def mx_dot_rescale_gate_up(acc_gate, acc_up, a, w_gate, w_up, a_scale, gate_scal
 
 
 @triton.jit
-def mx_scalar_reduce(acc, a, a_scale, wq, w_scale, BLOCK_SIZE_M: tl.constexpr, ROWS_W: tl.constexpr, BK: tl.constexpr, GK: tl.constexpr):
+def mx_scalar_reduce(
+    acc,
+    a,
+    a_scale,
+    wq,
+    w_scale,
+    BLOCK_SIZE_M: tl.constexpr,
+    ROWS_W: tl.constexpr,
+    BK: tl.constexpr,
+    GK: tl.constexpr,
+):
     """MX 'scalar' path: CUDA-core FMA GEMV, dequantizing activation + weight per-element by
     their expanded group scales internally, then reducing and accumulating into ``acc`` (returned
     updated). No tensor core (so no M→16 MMA pad) — wins for the memory-bound decode GEMV (M=1).
     Single weight — for the gate∪up pair (shared activation dequant) use ``mx_scalar_reduce_gate_up``."""
-    a_deq = tl.trans(a.to(tl.float32) * expand_ue8m0_scale(a_scale, BLOCK_SIZE_M, BK, GK))
+    a_deq = tl.trans(
+        a.to(tl.float32) * expand_ue8m0_scale(a_scale, BLOCK_SIZE_M, BK, GK)
+    )
     w_exp = tl.trans(expand_ue8m0_scale(w_scale, ROWS_W, BK, GK))
     return acc + tl.sum(a_deq * (wq.to(tl.float32) * w_exp), axis=0)[None, :]
 
 
 @triton.jit
-def mx_scalar_reduce_gate_up(acc_gate, acc_up, a, w_gate, w_up, a_scale, gate_scale, up_scale,
-                             BLOCK_SIZE_M: tl.constexpr, ROWS_W: tl.constexpr, BK: tl.constexpr, GK: tl.constexpr):
+def mx_scalar_reduce_gate_up(
+    acc_gate,
+    acc_up,
+    a,
+    w_gate,
+    w_up,
+    a_scale,
+    gate_scale,
+    up_scale,
+    BLOCK_SIZE_M: tl.constexpr,
+    ROWS_W: tl.constexpr,
+    BK: tl.constexpr,
+    GK: tl.constexpr,
+):
     """Gate∪up 'scalar' path: dequant the SHARED activation once, reduce both projections and
     accumulate into ``acc_gate``/``acc_up`` (returned updated)."""
-    a_deq = tl.trans(a.to(tl.float32) * expand_ue8m0_scale(a_scale, BLOCK_SIZE_M, BK, GK))
-    acc_gate += tl.sum(a_deq * (w_gate.to(tl.float32) * tl.trans(expand_ue8m0_scale(gate_scale, ROWS_W, BK, GK))), axis=0)[None, :]
-    acc_up += tl.sum(a_deq * (w_up.to(tl.float32) * tl.trans(expand_ue8m0_scale(up_scale, ROWS_W, BK, GK))), axis=0)[None, :]
+    a_deq = tl.trans(
+        a.to(tl.float32) * expand_ue8m0_scale(a_scale, BLOCK_SIZE_M, BK, GK)
+    )
+    acc_gate += tl.sum(
+        a_deq
+        * (
+            w_gate.to(tl.float32)
+            * tl.trans(expand_ue8m0_scale(gate_scale, ROWS_W, BK, GK))
+        ),
+        axis=0,
+    )[None, :]
+    acc_up += tl.sum(
+        a_deq
+        * (
+            w_up.to(tl.float32) * tl.trans(expand_ue8m0_scale(up_scale, ROWS_W, BK, GK))
+        ),
+        axis=0,
+    )[None, :]
     return acc_gate, acc_up
 
 

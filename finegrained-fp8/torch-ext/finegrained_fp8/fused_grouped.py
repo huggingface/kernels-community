@@ -23,7 +23,7 @@ per-tile binary search, no host-side tile-offset precompute.
 
 Recipe-named to mirror ``fused_batched``: ``w8a8_block_dynamic_fp8_moe_grouped`` (128x128
 block scales, FP8 intermediate) and ``mxfp_dynamic_moe_grouped`` (MXFP4/MXFP8, UE8M0
-group-32 scales, MXFP8 intermediate); ``moe_grouped`` is the neutral dispatcher.
+group-32 scales, MXFP8 intermediate); ``moe_fused_grouped`` is the neutral dispatcher.
 """
 
 import torch
@@ -34,6 +34,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .grouped import store_tile
 from .utils import (
+    FP8_DTYPE,
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
     decode_ue8m0_scale,
@@ -41,6 +42,7 @@ from .utils import (
     sm_count,
     fp8_act_quant_inline,
     topk_reduce_kernel,
+    TOPK_REDUCE_BLOCK_H,
     get_accelerator_autotuning_configs,
     get_mxfp_autotuning_configs,
     is_mxfp,
@@ -55,11 +57,14 @@ from .utils import (
     ue8m0_as_uint8,
 )
 
-FP8 = torch.float8_e4m3fn
-
-
 
 # ── Persistent tile scheduling (register-resident expert-tile layout) ─────────
+
+# Flat-slot tile per program for the O(S) routing kernels (count + scatter). These are small
+# latency-bound atomic kernels that want many programs: a sweep over {256..4096} x prefill shapes
+# put 256 best (or within ~1%) for both, with 1024 up to ~1.5x slower. The grid derives from it
+# so the two can't drift. Power of 2.
+_ROUTING_BLOCK_SIZE = 256
 
 
 @triton.jit
@@ -171,14 +176,20 @@ def _grouped_routing(expert_ids: torch.Tensor, num_experts: int, num_top_k: int)
     perm = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
     perm_token = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
     with device_context(device):
-        _count_kernel[(triton.cdiv(num_routed_tokens, 1024),)](
-            expert_ids, expert_freq, num_routed_tokens,
-            NUM_EXPERTS=num_experts, BLOCK_SIZE=1024,
+        _count_kernel[(triton.cdiv(num_routed_tokens, _ROUTING_BLOCK_SIZE),)](
+            expert_ids,
+            expert_freq,
+            num_routed_tokens,
+            NUM_EXPERTS=num_experts,
+            BLOCK_SIZE=_ROUTING_BLOCK_SIZE,
         )
         _exclusive_offsets_kernel[(1,)](
-            expert_freq, expert_start, counters, NUM_EXPERTS=num_experts
+            expert_freq,
+            expert_start,
+            counters,
+            NUM_EXPERTS=num_experts,
         )
-        _scatter_kernel[(triton.cdiv(num_routed_tokens, 1024),)](
+        _scatter_kernel[(triton.cdiv(num_routed_tokens, _ROUTING_BLOCK_SIZE),)](
             expert_ids,
             perm,
             perm_token,
@@ -186,21 +197,23 @@ def _grouped_routing(expert_ids: torch.Tensor, num_experts: int, num_top_k: int)
             counters,
             num_routed_tokens,
             NUM_TOP_K=num_top_k,
-            BLOCK_SIZE=1024,
+            BLOCK_SIZE=_ROUTING_BLOCK_SIZE,
         )
     return perm_token, perm, expert_start, num_experts, num_routed_tokens
 
 
-# Cross each base autotune config with BLOCK_SIZE_M candidates so the Bayesian tuner selects
-# M per tokens_per_sm_bit_length (log2 tokens-per-SM bucket), instead of adaptive_block_size_m.
-_BLOCK_M_CANDIDATES = [16, 32, 64, 128]
+# MX MoE autotune axes: the MMA flavor and the weight-load mechanism. The kernels implement all
+# three memory modes; get_mxfp_autotuning_configs drops the device-inapplicable descriptor
+# flavor (host on XPU, device on CUDA).
+_MX_COMPUTE_MODES = ("dot_scaled", "dot")
+_MX_MEMORY_MODES = ("host_descriptor", "device_descriptor", "block_ptr")
 
 
 # ── Block-dynamic FP8 ────────────────────────────────────────────────────────
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(block_size_m=_BLOCK_M_CANDIDATES),
+    get_accelerator_autotuning_configs(tune_block_m=True),
     ["INTERMEDIATE_DIM", "HIDDEN_DIM", "tokens_per_sm_bit_length"],
     n_trials=60,
 )
@@ -324,7 +337,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(block_size_m=_BLOCK_M_CANDIDATES),
+    get_accelerator_autotuning_configs(tune_block_m=True),
     ["INTERMEDIATE_DIM", "HIDDEN_DIM", "tokens_per_sm_bit_length"],
     n_trials=60,
 )
@@ -459,14 +472,18 @@ def w8a8_block_dynamic_fp8_moe_grouped(
     gate_up_scale_u8 = ue8m0_as_uint8(gate_up_proj_scale)
     down_scale_u8 = ue8m0_as_uint8(down_proj_scale)
 
-    inter = torch.empty(num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=FP8)
+    inter = torch.empty(
+        num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=FP8_DTYPE
+    )
     inter_scale = torch.empty(
         num_routed_tokens, NUM_I_TILES, device=device, dtype=torch.float32
     )
     out = torch.empty(
         num_routed_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
     )
-    reduced = torch.empty(num_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype)
+    reduced = torch.empty(
+        num_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
+    )
     with device_context(device):
         w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel[(num_sms,)](
             hidden_states,
@@ -531,10 +548,16 @@ def w8a8_block_dynamic_fp8_moe_grouped(
             NUM_SMS=num_sms,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        topk_reduce_kernel[(num_tokens, triton.cdiv(HIDDEN_DIM, 512))](
-            out, reduced, HIDDEN_DIM,
-            out.stride(0), out.stride(1), reduced.stride(0), reduced.stride(1),
-            NUM_TOP_K=num_top_k, BLOCK_H=512,
+        topk_reduce_kernel[(num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))](
+            out,
+            reduced,
+            HIDDEN_DIM,
+            out.stride(0),
+            out.stride(1),
+            reduced.stride(0),
+            reduced.stride(1),
+            NUM_TOP_K=num_top_k,
+            BLOCK_H=TOPK_REDUCE_BLOCK_H,
         )
 
     return reduced
@@ -552,7 +575,10 @@ def _set_gate_up_descriptor(nargs):
     kernel (the placeholder box survives → all but BN=32,BK=32 configs fail the reshape). An
     in-place edit of the passed object propagates to both compile-time specialization and the
     launch-time tensor-map fill. ``shape``/``strides`` are already correct from the wrapper's
-    ``from_tensor`` placeholder; only the per-config box changes."""
+    ``from_tensor`` placeholder; only the per-config box changes. No-op unless MEMORY_MODE is host_descriptor (block_ptr /
+    device_descriptor don't use the host-built descriptor)."""
+    if nargs["MEMORY_MODE"] != "host_descriptor":
+        return
     nargs["GateUpDescriptor"].block_shape = [
         2,
         nargs["BLOCK_SIZE_N"],
@@ -563,9 +589,9 @@ def _set_gate_up_descriptor(nargs):
 @bayesian_autotune(
     get_mxfp_autotuning_configs(
         pre_hook=_set_gate_up_descriptor,
-        modes=("dot_scaled", "dot"),
-        with_tma=True,
-        block_size_m=_BLOCK_M_CANDIDATES,
+        compute_modes=_MX_COMPUTE_MODES,
+        memory_modes=_MX_MEMORY_MODES,
+        tune_block_m=True,
     ),  # prefill: no scalar; combined gate∪up dot ([2*BN,K] reshape) — TMA vs block-ptr load
     ["INTERMEDIATE_DIM", "HIDDEN_DIM", "tokens_per_sm_bit_length"],
     n_trials=60,
@@ -609,7 +635,7 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
     NUM_SMS: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
-    USE_TMA: tl.constexpr,
+    MEMORY_MODE: tl.constexpr,
 ):
     """MXFP4/MXFP8 phase 1 (persistent): gather hidden rows per expert M-tile, gate + up MX
     matmuls (``tl.dot_scaled`` or fp8 ``tl.dot`` + per-group rescale), SiLU, MXFP8-requant."""
@@ -632,13 +658,15 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
         n_off = pid_n * BLOCK_SIZE_N
 
         # Load gate (row 2e) + up (row 2e+1) of the (2E, I, H) view as ONE combined tile, then
-        # split — this is the shared loop. USE_TMA picks the LOAD only (decoupled from COMPUTE_MODE):
-        # TMA descriptor vs a rank-3 make_block_ptr stride trick. COMPUTE_MODE picks the compute on the
+        # split — this is the shared loop. MEMORY_MODE picks the LOAD only (decoupled from COMPUTE_MODE):
+        # a host/device descriptor (TMA on NVIDIA) vs a rank-3 make_block_ptr stride trick. COMPUTE_MODE picks the compute on the
         # loaded tile: scaled-MMA (dot_scaled) or fp8 dot + per-group software rescale (dot).
         gu_row = expert_id * 2
-        if not USE_TMA:
+        # (E, 2I, H//vpb) reinterpreted as (2E, I, H//vpb); host_descriptor uses the passed
+        # GateUpDescriptor, device_descriptor builds one in-kernel, block_ptr a rank-3 view.
+        if MEMORY_MODE == "block_ptr":
             gu_bptr = tl.make_block_ptr(
-                base=GateUp,  # (E, 2I, H//vpb) reinterpreted as (2E, I, H//vpb)
+                base=GateUp,
                 shape=(
                     2 * NUM_EXPERTS,
                     INTERMEDIATE_DIM,
@@ -648,6 +676,17 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
                 offsets=(gu_row, n_off, 0),
                 block_shape=(2, BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE),
                 order=(2, 1, 0),
+            )
+        elif MEMORY_MODE == "device_descriptor":
+            gu_desc = tl.make_tensor_descriptor(
+                GateUp,
+                shape=(
+                    2 * NUM_EXPERTS,
+                    INTERMEDIATE_DIM,
+                    HIDDEN_DIM // VALUES_PER_BYTE,
+                ),
+                strides=(INTERMEDIATE_DIM * stride_gu_n, stride_gu_n, stride_gu_k),
+                block_shape=(2, BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE),
             )
         gu_scale_bptr = tl.make_block_ptr(
             base=GateUpScale
@@ -674,9 +713,14 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
             a, a_scale = mxfp_act_quant_inline(
                 a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
             )
-            if USE_TMA:
+            if MEMORY_MODE == "host_descriptor":
                 gu = tl.reshape(
                     GateUpDescriptor.load([gu_row, n_off, k_off // VALUES_PER_BYTE]),
+                    [2 * BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE],
+                )
+            elif MEMORY_MODE == "device_descriptor":
+                gu = tl.reshape(
+                    gu_desc.load([gu_row, n_off, k_off // VALUES_PER_BYTE]),
                     [2 * BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE],
                 )
             else:
@@ -739,7 +783,9 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
 def _set_down_descriptor(nargs):
     """Per-config pre_hook: in-place set the down TMA descriptor box to
     [BLOCK_SIZE_N, BK//VALUES_PER_BYTE] over the (E*H, I/vpb) weight view. In-place, not
-    rebind — see _set_gate_up_descriptor."""
+    rebind — see _set_gate_up_descriptor. No-op unless MEMORY_MODE is host_descriptor."""
+    if nargs["MEMORY_MODE"] != "host_descriptor":
+        return
     nargs["DownDescriptor"].block_shape = [
         nargs["BLOCK_SIZE_N"],
         nargs["BLOCK_SIZE_K"] // nargs["VALUES_PER_BYTE"],
@@ -749,9 +795,9 @@ def _set_down_descriptor(nargs):
 @bayesian_autotune(
     get_mxfp_autotuning_configs(
         pre_hook=_set_down_descriptor,
-        modes=("dot_scaled", "dot"),
-        with_tma=True,
-        block_size_m=_BLOCK_M_CANDIDATES,
+        compute_modes=_MX_COMPUTE_MODES,
+        memory_modes=_MX_MEMORY_MODES,
+        tune_block_m=True,
     ),  # prefill: no scalar; TMA vs block-ptr load
     ["INTERMEDIATE_DIM", "HIDDEN_DIM", "tokens_per_sm_bit_length"],
     n_trials=60,
@@ -797,7 +843,7 @@ def mxfp_dynamic_moe_grouped_down_kernel(
     NUM_SMS: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
-    USE_TMA: tl.constexpr,
+    MEMORY_MODE: tl.constexpr,
 ):
     """MXFP4/MXFP8 phase 2 (persistent): MXFP8 intermediate → down proj, then routing-weight
     × scatter to the flat (token, slot) row. N = hidden tile, K = intermediate tile."""
@@ -836,10 +882,11 @@ def mxfp_dynamic_moe_grouped_down_kernel(
             order=(1, 0),
         )
 
-        # Down weight tile [BK//vpb, BN] loaded once per K-chunk: USE_TMA picks the LOAD (TMA
-        # descriptor over the (E*H, I//vpb) view vs a make_block_ptr), COMPUTE_MODE picks the
-        # compute. Scales stay a pointer load (TMA needs >=16B inner; the BK//32 row is too narrow).
-        if not USE_TMA:
+        # Down weight tile [BK//vpb, BN] loaded once per K-chunk: MEMORY_MODE picks the LOAD (a
+        # host/device descriptor over the (E*H, I//vpb) view vs a make_block_ptr), COMPUTE_MODE
+        # picks the compute. Scales stay a pointer load (a descriptor needs >=16B inner; the
+        # BK//32 row is too narrow).
+        if MEMORY_MODE == "block_ptr":
             w_down_ptr = tl.make_block_ptr(
                 base=Down + expert_id * stride_down_e,
                 shape=(INTERMEDIATE_DIM // VALUES_PER_BYTE, HIDDEN_DIM),
@@ -848,14 +895,30 @@ def mxfp_dynamic_moe_grouped_down_kernel(
                 block_shape=(BLOCK_SIZE_K // VALUES_PER_BYTE, BLOCK_SIZE_N),
                 order=(0, 1),
             )
+        elif MEMORY_MODE == "device_descriptor":
+            down_desc = tl.make_tensor_descriptor(
+                Down,  # (E, H, I//vpb) flattened to the (E*H, I//vpb) view
+                shape=(NUM_EXPERTS * HIDDEN_DIM, INTERMEDIATE_DIM // VALUES_PER_BYTE),
+                strides=(stride_down_n, stride_down_k),
+                block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE),
+            )
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for k_off in tl.range(0, INTERMEDIATE_DIM, BLOCK_SIZE_K):
             a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
             a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0).to(tl.uint8)
-            if USE_TMA:
+            if MEMORY_MODE == "host_descriptor":
                 w = tl.trans(
                     tl.reshape(
                         DownDescriptor.load(
+                            [expert_id * HIDDEN_DIM + n_off, k_off // VALUES_PER_BYTE]
+                        ),
+                        [BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE],
+                    )
+                )
+            elif MEMORY_MODE == "device_descriptor":
+                w = tl.trans(
+                    tl.reshape(
+                        down_desc.load(
                             [expert_id * HIDDEN_DIM + n_off, k_off // VALUES_PER_BYTE]
                         ),
                         [BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE],
@@ -921,7 +984,9 @@ def mxfp_dynamic_moe_grouped(
     gate_up_scale_u8 = ue8m0_as_uint8(gate_up_proj_scale)
     down_scale_u8 = ue8m0_as_uint8(down_proj_scale)
 
-    inter = torch.empty(num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=FP8)
+    inter = torch.empty(
+        num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=FP8_DTYPE
+    )
     inter_scale = torch.empty(
         num_routed_tokens,
         INTERMEDIATE_DIM // MX_SCALE_GROUP_K,
@@ -931,20 +996,21 @@ def mxfp_dynamic_moe_grouped(
     out = torch.empty(
         num_routed_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
     )
-    reduced = torch.empty(num_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype)
+    reduced = torch.empty(
+        num_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
+    )
 
-    # TMA descriptors over views (not reshapes) of the real weight buffers: gate_up
-    # (E, 2I, H/vpb) → (2E, I, H/vpb) so one [2, BN, BK/vpb] box loads gate (row 2e) + up
-    # (2e+1); down (E, H, I/vpb) → (E*H, I/vpb), one [BN, BK/vpb] box per (expert, hidden-tile).
+    # Host-built descriptors for host_descriptor mode: views (not reshapes) of the weight
+    # buffers — gate_up (E, 2I, H/vpb) → (2E, I, H/vpb) so one [2, BN, BK/vpb] box loads gate
+    # (row 2e) + up (2e+1); down (E, H, I/vpb) → (E*H, I/vpb), one [BN, BK/vpb] box per (expert,
+    # hidden-tile). Cheap to build, so always created (device_descriptor/block_ptr ignore them).
     gate_up_2e = gate_up_proj_u8.view(
         2 * gate_up_proj_u8.size(0), INTERMEDIATE_DIM, gate_up_proj_u8.size(2)
     )
     gate_up_descriptor = TensorDescriptor.from_tensor(
         gate_up_2e, [2, 32, 32 // values_per_byte]
     )
-    down_eh = down_proj_u8.view(
-        down_proj_u8.size(0) * HIDDEN_DIM, down_proj_u8.size(2)
-    )
+    down_eh = down_proj_u8.view(down_proj_u8.size(0) * HIDDEN_DIM, down_proj_u8.size(2))
     down_descriptor = TensorDescriptor.from_tensor(down_eh, [32, 32 // values_per_byte])
     with device_context(device):
         mxfp_dynamic_moe_grouped_gate_up_kernel[(num_sms,)](
@@ -1011,10 +1077,16 @@ def mxfp_dynamic_moe_grouped(
             NUM_SMS=num_sms,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        topk_reduce_kernel[(num_tokens, triton.cdiv(HIDDEN_DIM, 512))](
-            out, reduced, HIDDEN_DIM,
-            out.stride(0), out.stride(1), reduced.stride(0), reduced.stride(1),
-            NUM_TOP_K=num_top_k, BLOCK_H=512,
+        topk_reduce_kernel[(num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))](
+            out,
+            reduced,
+            HIDDEN_DIM,
+            out.stride(0),
+            out.stride(1),
+            reduced.stride(0),
+            reduced.stride(1),
+            NUM_TOP_K=num_top_k,
+            BLOCK_H=TOPK_REDUCE_BLOCK_H,
         )
 
     return reduced
@@ -1023,7 +1095,7 @@ def mxfp_dynamic_moe_grouped(
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 
 
-def moe_grouped(
+def moe_fused_grouped(
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
@@ -1035,7 +1107,7 @@ def moe_grouped(
     simulate_unfused: bool = False,
 ) -> torch.Tensor:
     """Fused grouped-MoE dispatcher — routes to the recipe matching the weight dtype /
-    scale layout, mirroring ``moe_batched``. Implemented: block-dynamic FP8 and MXFP8 /
+    scale layout, mirroring ``moe_fused_batched``. Implemented: block-dynamic FP8 and MXFP8 /
     MXFP4 (UE8M0 group-32). ``simulate_unfused`` (testing) rounds each step through the
     activation dtype so the output matches the unfused reference to reduce order."""
     if is_mxfp(gate_up_proj, gate_up_proj_scale_inv):

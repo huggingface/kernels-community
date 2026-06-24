@@ -166,7 +166,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
 
 
 @triton.autotune(
-    configs=get_accelerator_autotuning_configs(with_block_sizes=True),
+    configs=get_accelerator_autotuning_configs(tune_block_nk=True),
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
@@ -312,7 +312,9 @@ def w8a8_block_static_fp8_matmul_kernel(
 
 
 @bayesian_autotune(
-    get_mxfp_autotuning_configs(modes=("dot_scaled", "dot")),  # no scalar branch here
+    get_mxfp_autotuning_configs(
+        compute_modes=("dot_scaled", "dot")
+    ),  # no scalar branch here
     ["N", "K", "BLOCK_SIZE_M"],
     n_trials=60,
 )
@@ -370,9 +372,6 @@ def mxfp_dynamic_matmul_kernel(
         a, a_scale = mxfp_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
         )
-        # uint8 (MXFP4 packed E2M1) or E4M3 (MXFP8) — dtype from the tensor (viewed in wrapper).
-        # k_remaining // VALUES_PER_BYTE is the packed bound (== k_remaining for MXFP8, vpb=1).
-        # other=0.0 (not 0): float casts to both E4M3 and uint8; int 0 can't cast to fp8.
         b = tl.load(
             b_ptrs, mask=offs_kb[:, None] < k_remaining // VALUES_PER_BYTE, other=0.0
         )
@@ -381,7 +380,9 @@ def mxfp_dynamic_matmul_kernel(
         ).to(tl.uint8)
         bq = mxfp4_e2m1_to_e4m3(b) if VALUES_PER_BYTE == 2 else b
         if COMPUTE_MODE == "dot_scaled":
-            accumulator = mx_dot_scaled(a, a_scale, b, b_s, accumulator, VALUES_PER_BYTE)
+            accumulator = mx_dot_scaled(
+                a, a_scale, b, b_s, accumulator, VALUES_PER_BYTE
+            )
         else:  # dot
             accumulator = mx_dot_rescale(accumulator, a, bq, a_scale, b_s)
         a_ptrs += BLOCK_SIZE_K * stride_ak

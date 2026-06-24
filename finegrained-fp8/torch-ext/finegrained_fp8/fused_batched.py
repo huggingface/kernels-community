@@ -17,7 +17,7 @@
   Kernel 1 (S x N-tiles): gather -> gate_up GEMM -> SiLU -> FP8 requant -> fp8 intermediate
   Kernel 2 (S x H-tiles): fp8 intermediate -> down GEMM -> routing weight -> output
 
-Recipe-named to mirror ``batched.py``; ``moe_batched`` is the neutral dispatcher.
+Recipe-named to mirror ``batched.py``; ``moe_fused_batched`` is the neutral dispatcher.
 """
 
 import torch
@@ -27,6 +27,7 @@ from torch.library import triton_op, wrap_triton
 
 from ._ops import add_op_namespace_prefix, ops
 from .utils import (
+    FP8_DTYPE,
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
     DECODE_BLOCK_SIZE_M,
@@ -44,6 +45,7 @@ from .utils import (
     mxfp4_e2m1_to_e4m3,
     swiglu,
     topk_reduce_kernel,
+    TOPK_REDUCE_BLOCK_H,
     e2m1_as_uint8,
     ue8m0_as_uint8,
 )
@@ -292,7 +294,9 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
     store_row(Out + batch_id * HIDDEN_DIM, acc, pid_h, 1, BLOCK_SIZE_M, BLOCK_SIZE_H)
 
 
-@triton_op(add_op_namespace_prefix("w8a8_block_dynamic_fp8_moe_batched"), mutates_args=())
+@triton_op(
+    add_op_namespace_prefix("w8a8_block_dynamic_fp8_moe_batched"), mutates_args=()
+)
 def _w8a8_block_dynamic_fp8_moe_batched(
     hidden_states: torch.Tensor,
     gate_up_proj: torch.Tensor,
@@ -320,7 +324,7 @@ def _w8a8_block_dynamic_fp8_moe_batched(
     NUM_H_TILES = triton.cdiv(HIDDEN_DIM, BLOCK_SIZE_N)
 
     inter = torch.empty(
-        num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=torch.float8_e4m3fn
+        num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=FP8_DTYPE
     )
     inter_scales = torch.empty(
         num_routed_tokens, NUM_N_TILES, device=device, dtype=torch.float32
@@ -383,10 +387,18 @@ def _w8a8_block_dynamic_fp8_moe_batched(
             NUM_N_TILES=NUM_N_TILES,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        wrap_triton(topk_reduce_kernel)[(num_tokens, triton.cdiv(HIDDEN_DIM, 512))](
-            out, reduced, HIDDEN_DIM,
-            out.stride(0), out.stride(1), reduced.stride(0), reduced.stride(1),
-            NUM_TOP_K=NUM_TOP_K, BLOCK_H=512,
+        wrap_triton(topk_reduce_kernel)[
+            (num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))
+        ](
+            out,
+            reduced,
+            HIDDEN_DIM,
+            out.stride(0),
+            out.stride(1),
+            reduced.stride(0),
+            reduced.stride(1),
+            NUM_TOP_K=NUM_TOP_K,
+            BLOCK_H=TOPK_REDUCE_BLOCK_H,
         )
 
     return reduced
@@ -407,10 +419,6 @@ def w8a8_block_dynamic_fp8_moe_batched(
     runs gate_up + down (gathering each routed row from the unexpanded ``hidden_states``,
     source row ``s // num_top_k``, no replicated copy). The top-k reduce stays plain torch
     so ``torch.compile`` can fuse it with the surrounding model graph."""
-
-    hidden_dim = down_proj.size(1)
-    num_top_k = top_k_index.size(-1)
-    num_tokens = hidden_states.size(0)
 
     sample_weights = top_k_weights.reshape(-1)
     expert_ids = top_k_index.reshape(-1)
@@ -732,7 +740,7 @@ def _mxfp_dynamic_moe_batched(
     down_proj_scale_u8 = ue8m0_as_uint8(down_proj_scale)
 
     inter = torch.empty(
-        num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=torch.float8_e4m3fn
+        num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=FP8_DTYPE
     )
     inter_scales = torch.empty(
         num_routed_tokens,
@@ -799,10 +807,18 @@ def _mxfp_dynamic_moe_batched(
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        wrap_triton(topk_reduce_kernel)[(num_tokens, triton.cdiv(HIDDEN_DIM, 512))](
-            out, reduced, HIDDEN_DIM,
-            out.stride(0), out.stride(1), reduced.stride(0), reduced.stride(1),
-            NUM_TOP_K=NUM_TOP_K, BLOCK_H=512,
+        wrap_triton(topk_reduce_kernel)[
+            (num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))
+        ](
+            out,
+            reduced,
+            HIDDEN_DIM,
+            out.stride(0),
+            out.stride(1),
+            reduced.stride(0),
+            reduced.stride(1),
+            NUM_TOP_K=NUM_TOP_K,
+            BLOCK_H=TOPK_REDUCE_BLOCK_H,
         )
 
     return reduced
@@ -821,10 +837,6 @@ def mxfp_dynamic_moe_batched(
     """Two-kernel batched fused MX MoE — MXFP4 or MXFP8 weights (UE8M0 group-32), the
     format picked per-weight by the ops. Same structure as the block-dynamic path but
     with a tunable tile and an MXFP8 group-32 intermediate; ``block_size`` is unused."""
-    hidden_dim = down_proj.size(1)
-    num_top_k = top_k_index.size(-1)
-    num_tokens = hidden_states.size(0)
-
     sample_weights = top_k_weights.reshape(-1)
     expert_ids = top_k_index.reshape(-1)
 
@@ -845,7 +857,7 @@ def mxfp_dynamic_moe_batched(
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 
 
-def moe_batched(
+def moe_fused_batched(
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
