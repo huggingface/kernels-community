@@ -120,13 +120,13 @@ jobs:
       # When building for a PR, check out the PR head; otherwise use default branch.
       - name: Checkout PR branch
         if: inputs.pr_number != ''
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: refs/pull/${{ inputs.pr_number }}/head
           fetch-depth: 0
       - name: Checkout default branch
         if: inputs.pr_number == ''
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Ensure the kernel directory exists and has the required config files.
       - name: Validate kernel directory
@@ -241,7 +241,7 @@ jobs:
       - name: Checkout kernels
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
         id: checkout-kernels
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: huggingface/kernels
           ref: "${{ steps.extract-builder-version.outputs.revision }}"
