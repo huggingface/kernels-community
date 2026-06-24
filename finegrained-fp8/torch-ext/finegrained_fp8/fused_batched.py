@@ -30,17 +30,24 @@ from .utils import (
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
     DECODE_BLOCK_SIZE_M,
-    decode_ue8m0_scale,
     device_context,
     fp8_act_quant_inline,
     get_mxfp_autotuning_configs,
     is_mxfp,
     is_mxfp4,
     mxfp_act_quant_inline,
+    mx_dot_rescale,
+    mx_dot_rescale_gate_up,
+    mx_dot_scaled,
+    mx_scalar_reduce,
+    mx_scalar_reduce_gate_up,
     mxfp4_e2m1_to_e4m3,
+    swiglu,
+    topk_reduce_kernel,
+    e2m1_as_uint8,
     ue8m0_as_uint8,
 )
-from .batched import _store_row
+from .batched import store_row
 from .bayesian_autotuner import bayesian_autotune
 
 
@@ -80,7 +87,7 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     stride_gus_n,
     stride_gus_k,
     num_routed_tokens,  # tuning knob: in the autotune key so decode re-tunes per batch
-    num_experts,
+    NUM_EXPERTS: tl.constexpr,
     NUM_TOP_K: tl.constexpr,
     HIDDEN_DIM: tl.constexpr,
     NUM_N_TILES: tl.constexpr,
@@ -101,11 +108,16 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     expert_id = tl.load(ExpertIds + batch_id).to(tl.int64)
     # EP sentinel: row routed to a non-local expert — skip. The intermediate row is left
     # uninit; the down kernel writes zeros for this row, so the output stays well-defined.
-    if expert_id >= num_experts:
+    if expert_id >= NUM_EXPERTS:
         return
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-
-    a_ptrs = HiddenStates + token * stride_a_m + offs_k[None, :] * stride_a_k
+    a_ptr = tl.make_block_ptr(
+        base=HiddenStates,
+        shape=(num_routed_tokens // NUM_TOP_K, HIDDEN_DIM),
+        strides=(stride_a_m, stride_a_k),
+        offsets=(token.to(tl.int32), 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+        order=(1, 0),
+    )
 
     b_gate_ptr = tl.make_block_ptr(
         base=GateUp + expert_id * stride_gu_e,
@@ -124,46 +136,52 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
         order=(0, 1),
     )
 
-    n_scale_blocks = INTERMEDIATE_DIM // BLOCK_SIZE_N
-    bs_base = GateUpScale + expert_id * stride_gus_e
-    bs_gate_ptrs = bs_base + pid_n * stride_gus_n
-    bs_up_ptrs = bs_base + (n_scale_blocks + pid_n) * stride_gus_n
+    bs_gate_ptr = tl.make_block_ptr(
+        base=GateUpScale + expert_id * stride_gus_e,
+        shape=(2 * NUM_N_TILES, HIDDEN_DIM // BLOCK_SIZE_K),
+        strides=(stride_gus_n, stride_gus_k),
+        offsets=(pid_n, 0),
+        block_shape=(1, 1),
+        order=(1, 0),
+    )
+    bs_up_ptr = tl.make_block_ptr(
+        base=GateUpScale + expert_id * stride_gus_e,
+        shape=(2 * NUM_N_TILES, HIDDEN_DIM // BLOCK_SIZE_K),
+        strides=(stride_gus_n, stride_gus_k),
+        offsets=(NUM_N_TILES + pid_n, 0),
+        block_shape=(1, 1),
+        order=(1, 0),
+    )
 
     acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    for k in range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K)):
-        a_raw = tl.load(a_ptrs).to(tl.float32)
+    for _ in range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K)):
+        a_raw = tl.load(a_ptr).to(tl.float32)
         a, a_s = fp8_act_quant_inline(a_raw)
 
-        b_gate = tl.load(b_gate_ptr)
-        b_up = tl.load(b_up_ptr)
-        bs_gate = tl.load(bs_gate_ptrs + k * stride_gus_k)
-        bs_up = tl.load(bs_up_ptrs + k * stride_gus_k)
+        w_gate = tl.load(b_gate_ptr)
+        w_up = tl.load(b_up_ptr)
+        w_s_gate = tl.load(bs_gate_ptr)
+        w_s_up = tl.load(bs_up_ptr)
 
-        acc_gate += tl.dot(a, b_gate) * a_s[:, None] * bs_gate[None, :]
-        acc_up += tl.dot(a, b_up) * a_s[:, None] * bs_up[None, :]
+        acc_gate += tl.dot(a, w_gate) * a_s[:, None] * w_s_gate
+        acc_up += tl.dot(a, w_up) * a_s[:, None] * w_s_up
 
-        a_ptrs += BLOCK_SIZE_K * stride_a_k
+        a_ptr = tl.advance(a_ptr, (0, BLOCK_SIZE_K))
         b_gate_ptr = tl.advance(b_gate_ptr, (BLOCK_SIZE_K, 0))
         b_up_ptr = tl.advance(b_up_ptr, (BLOCK_SIZE_K, 0))
+        bs_gate_ptr = tl.advance(bs_gate_ptr, (0, 1))
+        bs_up_ptr = tl.advance(bs_up_ptr, (0, 1))
 
-    if SIMULATE_UNFUSED:
-        # Round each step through the activation dtype to match the numerics of the
-        # unfused path, where every op's output is materialized in that dtype.
-        dtype = HiddenStates.dtype.element_ty
-        acc_gate = acc_gate.to(dtype).to(tl.float32)
-        acc_up = acc_up.to(dtype).to(tl.float32)
-        silu = (acc_gate * tl.sigmoid(acc_gate)).to(dtype).to(tl.float32)
-        intermediate = (silu * acc_up).to(dtype).to(tl.float32)
-    else:
-        intermediate = acc_gate * tl.sigmoid(acc_gate) * acc_up
+    intermediate = swiglu(
+        acc_gate, acc_up, SIMULATE_UNFUSED, HiddenStates.dtype.element_ty
+    )
 
     # Requant the intermediate to FP8 — the same inline per-row act quant as the inputs;
     # with BLOCK_SIZE_M=1 the per-row scale is the single per-tile scalar we store.
     inter, inter_s = fp8_act_quant_inline(intermediate)
-
-    _store_row(
+    store_row(
         Intermediate + batch_id * INTERMEDIATE_DIM,
         inter,
         pid_n,
@@ -198,7 +216,7 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
     stride_downs_n,
     stride_downs_k,
     num_routed_tokens,  # tuning knob: in the autotune key so decode re-tunes per batch
-    num_experts,
+    NUM_EXPERTS: tl.constexpr,
     HIDDEN_DIM: tl.constexpr,
     INTERMEDIATE_DIM: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -215,9 +233,9 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
     # EP sentinel: row routed to a non-local expert. The program is already launched, so
     # write its zero tile here (skipping the weight load) — cheaper than a host-side mask
     # pass, and it leaves the output fully defined for a plain top-k sum.
-    if expert_id >= num_experts:
+    if expert_id >= NUM_EXPERTS:
         z = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_H), dtype=tl.float32)
-        _store_row(Out + batch_id * HIDDEN_DIM, z, pid_h, 1, BLOCK_SIZE_M, BLOCK_SIZE_H)
+        store_row(Out + batch_id * HIDDEN_DIM, z, pid_h, 1, BLOCK_SIZE_M, BLOCK_SIZE_H)
         return
 
     w_down_ptr = tl.make_block_ptr(
@@ -229,62 +247,94 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
         order=(0, 1),
     )
 
-    inter_base = Intermediate + batch_id * INTERMEDIATE_DIM
-    inter_s_base = IntermediateScale + batch_id * NUM_N_TILES
-    ws_down_base = DownScale + expert_id * stride_downs_e + pid_h * stride_downs_n
-    offs_n = tl.arange(0, BLOCK_SIZE_N)
+    inter_ptr = tl.make_block_ptr(
+        base=Intermediate,
+        shape=(num_routed_tokens, INTERMEDIATE_DIM),
+        strides=(INTERMEDIATE_DIM, 1),
+        offsets=(batch_id, 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+        order=(1, 0),
+    )
+    inter_s_ptr = tl.make_block_ptr(
+        base=IntermediateScale,
+        shape=(num_routed_tokens, NUM_N_TILES),
+        strides=(NUM_N_TILES, 1),
+        offsets=(batch_id, 0),
+        block_shape=(BLOCK_SIZE_M, 1),
+        order=(1, 0),
+    )
+    ws_down_ptr = tl.make_block_ptr(
+        base=DownScale + expert_id * stride_downs_e,
+        shape=(HIDDEN_DIM // BLOCK_SIZE_H, NUM_N_TILES),
+        strides=(stride_downs_n, stride_downs_k),
+        offsets=(pid_h, 0),
+        block_shape=(1, 1),
+        order=(1, 0),
+    )
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_H), dtype=tl.float32)
 
-    for n_tile in range(0, NUM_N_TILES):
-        inter = tl.load(inter_base + (n_tile * BLOCK_SIZE_N + offs_n)[None, :])
-        inter_s = tl.load(inter_s_base + n_tile)
-        ws_down = tl.load(ws_down_base + n_tile * stride_downs_k)
+    for _ in range(0, NUM_N_TILES):
+        inter = tl.load(inter_ptr)
+        inter_s = tl.load(inter_s_ptr)
+        w_s_down = tl.load(ws_down_ptr)
         w_down = tl.load(w_down_ptr)
-        acc += tl.dot(inter, w_down) * inter_s * ws_down
+        acc += tl.dot(inter, w_down) * inter_s * w_s_down
+        inter_ptr = tl.advance(inter_ptr, (0, BLOCK_SIZE_N))
+        inter_s_ptr = tl.advance(inter_s_ptr, (0, 1))
+        ws_down_ptr = tl.advance(ws_down_ptr, (0, 1))
         w_down_ptr = tl.advance(w_down_ptr, (BLOCK_SIZE_N, 0))
 
     if SIMULATE_UNFUSED:
         acc = acc.to(Out.dtype.element_ty).to(tl.float32)
 
     acc = acc * tl.load(SampleWeights + batch_id)
-    _store_row(Out + batch_id * HIDDEN_DIM, acc, pid_h, 1, BLOCK_SIZE_M, BLOCK_SIZE_H)
+    store_row(Out + batch_id * HIDDEN_DIM, acc, pid_h, 1, BLOCK_SIZE_M, BLOCK_SIZE_H)
 
 
-@triton_op(add_op_namespace_prefix("moe_batched_gate_up"), mutates_args=())
-def _moe_batched_gate_up(
+@triton_op(add_op_namespace_prefix("w8a8_block_dynamic_fp8_moe_batched"), mutates_args=())
+def _w8a8_block_dynamic_fp8_moe_batched(
     hidden_states: torch.Tensor,
     gate_up_proj: torch.Tensor,
-    gate_up_proj_scale_inv: torch.Tensor,
+    gate_up_proj_scale: torch.Tensor,
+    down_proj: torch.Tensor,
+    down_proj_scale: torch.Tensor,
     expert_ids: torch.Tensor,
+    sample_weights: torch.Tensor,
     block_size: list[int],
+    output_dtype: torch.dtype,
     simulate_unfused: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Batched fused MoE kernel 1: gate_up + SiLU + FP8 quant. Gathers each routed
-    row directly from the unexpanded ``hidden_states`` (source row ``s // NUM_TOP_K``,
-    so no replicated copy is materialized), and returns the ``(fp8 intermediate,
-    per-tile scales)`` pair consumed by the down op."""
-
+) -> torch.Tensor:
+    """Block-dynamic FP8 batched fused MoE in ONE op: gate_up + SiLU + FP8 requant →
+    grouped down → routing-weighted per-(token, expert) output. gate_up gathers each routed
+    row directly from the unexpanded ``hidden_states`` (source row ``s // NUM_TOP_K``, no
+    replicated copy). ``inter``/``inter_scales`` are internal; the caller reduces over top-k."""
     device = hidden_states.device
     HIDDEN_DIM = hidden_states.size(1)
-    num_experts = gate_up_proj.size(0)
+    NUM_EXPERTS = gate_up_proj.size(0)
     num_routed_tokens = expert_ids.size(0)
-    BLOCK_SIZE_N, BLOCK_SIZE_K = block_size
     INTERMEDIATE_DIM = gate_up_proj.size(1) // 2
     NUM_TOP_K = num_routed_tokens // hidden_states.size(0)
+    BLOCK_SIZE_N, BLOCK_SIZE_K = block_size
     NUM_N_TILES = triton.cdiv(INTERMEDIATE_DIM, BLOCK_SIZE_N)
+    NUM_H_TILES = triton.cdiv(HIDDEN_DIM, BLOCK_SIZE_N)
+
     inter = torch.empty(
         num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=torch.float8_e4m3fn
     )
     inter_scales = torch.empty(
         num_routed_tokens, NUM_N_TILES, device=device, dtype=torch.float32
     )
-    grid = (num_routed_tokens, NUM_N_TILES)
+    num_tokens = hidden_states.size(0)
+    out = torch.empty(num_routed_tokens, HIDDEN_DIM, device=device, dtype=output_dtype)
+    reduced = torch.empty(num_tokens, HIDDEN_DIM, device=device, dtype=output_dtype)
     with device_context(device):
-        wrap_triton(w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel)[grid](
+        wrap_triton(w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel)[
+            (num_routed_tokens, NUM_N_TILES)
+        ](
             hidden_states,
             gate_up_proj,
-            gate_up_proj_scale_inv,
+            gate_up_proj_scale,
             inter,
             inter_scales,
             expert_ids,
@@ -293,12 +343,12 @@ def _moe_batched_gate_up(
             gate_up_proj.stride(0),
             gate_up_proj.stride(1),
             gate_up_proj.stride(2),
-            gate_up_proj_scale_inv.stride(0),
-            gate_up_proj_scale_inv.stride(1),
-            gate_up_proj_scale_inv.stride(2),
+            gate_up_proj_scale.stride(0),
+            gate_up_proj_scale.stride(1),
+            gate_up_proj_scale.stride(2),
             num_routed_tokens=num_routed_tokens,
             NUM_TOP_K=NUM_TOP_K,
-            num_experts=num_experts,
+            NUM_EXPERTS=NUM_EXPERTS,
             HIDDEN_DIM=HIDDEN_DIM,
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
@@ -307,51 +357,24 @@ def _moe_batched_gate_up(
             NUM_N_TILES=NUM_N_TILES,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-    return inter, inter_scales
-
-
-@triton_op(add_op_namespace_prefix("moe_batched_down"), mutates_args=())
-def _moe_batched_down(
-    inter: torch.Tensor,
-    inter_scales: torch.Tensor,
-    down_proj: torch.Tensor,
-    down_proj_scale_inv: torch.Tensor,
-    expert_ids: torch.Tensor,
-    sample_weights: torch.Tensor,
-    block_size: list[int],
-    output_dtype: torch.dtype,
-    simulate_unfused: bool = False,
-) -> torch.Tensor:
-    """Batched fused MoE kernel 2: fp8 intermediate → down proj → routing-weighted
-    per-(token, expert) output (the caller reduces over the top-k axis)."""
-
-    BLOCK_SIZE_N = block_size[0]
-    HIDDEN_DIM = down_proj.size(1)
-    num_experts = down_proj.size(0)
-    INTERMEDIATE_DIM = inter.size(1)
-    num_routed_tokens = inter.size(0)
-    NUM_N_TILES = inter_scales.size(1)
-    NUM_H_TILES = triton.cdiv(HIDDEN_DIM, BLOCK_SIZE_N)
-    Out = inter.new_empty(num_routed_tokens, HIDDEN_DIM, dtype=output_dtype)
-    grid = (num_routed_tokens, NUM_H_TILES)
-
-    with device_context(inter.device):
-        wrap_triton(w8a8_block_dynamic_fp8_moe_batched_down_kernel)[grid](
+        wrap_triton(w8a8_block_dynamic_fp8_moe_batched_down_kernel)[
+            (num_routed_tokens, NUM_H_TILES)
+        ](
             inter,
             inter_scales,
             down_proj,
-            down_proj_scale_inv,
+            down_proj_scale,
             expert_ids,
             sample_weights,
-            Out,
+            out,
             down_proj.stride(0),
             down_proj.stride(1),
             down_proj.stride(2),
-            down_proj_scale_inv.stride(0),
-            down_proj_scale_inv.stride(1),
-            down_proj_scale_inv.stride(2),
+            down_proj_scale.stride(0),
+            down_proj_scale.stride(1),
+            down_proj_scale.stride(2),
             num_routed_tokens=num_routed_tokens,
-            num_experts=num_experts,
+            NUM_EXPERTS=NUM_EXPERTS,
             HIDDEN_DIM=HIDDEN_DIM,
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
@@ -360,7 +383,13 @@ def _moe_batched_down(
             NUM_N_TILES=NUM_N_TILES,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-    return Out
+        wrap_triton(topk_reduce_kernel)[(num_tokens, triton.cdiv(HIDDEN_DIM, 512))](
+            out, reduced, HIDDEN_DIM,
+            out.stride(0), out.stride(1), reduced.stride(0), reduced.stride(1),
+            NUM_TOP_K=NUM_TOP_K, BLOCK_H=512,
+        )
+
+    return reduced
 
 
 def w8a8_block_dynamic_fp8_moe_batched(
@@ -369,18 +398,15 @@ def w8a8_block_dynamic_fp8_moe_batched(
     top_k_weights: torch.Tensor,
     gate_up_proj: torch.Tensor,
     down_proj: torch.Tensor,
-    gate_up_proj_scale_inv: torch.Tensor,
-    down_proj_scale_inv: torch.Tensor,
+    gate_up_proj_scale: torch.Tensor,
+    down_proj_scale: torch.Tensor,
     block_size: list[int],
     simulate_unfused: bool = False,
 ) -> torch.Tensor:
-    """Two-kernel batched fused MoE: deterministic, no sorting, no atomics.
-
-    The gate_up and down kernels are separate ``triton_op``s. The gate_up op gathers
-    each routed row directly from the unexpanded ``hidden_states`` (source row
-    ``s // num_top_k``), so no top_k-replicated copy is materialized; the top-k reduce
-    stays plain torch so ``torch.compile`` can fuse it with the surrounding model graph.
-    """
+    """Batched fused MoE (deterministic, no sorting, no atomics): a single ``triton_op``
+    runs gate_up + down (gathering each routed row from the unexpanded ``hidden_states``,
+    source row ``s // num_top_k``, no replicated copy). The top-k reduce stays plain torch
+    so ``torch.compile`` can fuse it with the surrounding model graph."""
 
     hidden_dim = down_proj.size(1)
     num_top_k = top_k_index.size(-1)
@@ -389,29 +415,19 @@ def w8a8_block_dynamic_fp8_moe_batched(
     sample_weights = top_k_weights.reshape(-1)
     expert_ids = top_k_index.reshape(-1)
 
-    inter, inter_scales = ops.moe_batched_gate_up(
+    out = ops.w8a8_block_dynamic_fp8_moe_batched(
         hidden_states,
         gate_up_proj,
-        gate_up_proj_scale_inv,
-        expert_ids,
-        block_size,
-        simulate_unfused,
-    )
-    out = ops.moe_batched_down(
-        inter,
-        inter_scales,
+        gate_up_proj_scale,
         down_proj,
-        down_proj_scale_inv,
+        down_proj_scale,
         expert_ids,
         sample_weights,
         block_size,
         hidden_states.dtype,
         simulate_unfused,
     )
-    # The down kernel already zeros EP-sentinel rows, so the top-k reduce is a plain sum.
-    return (
-        out.view(num_tokens, num_top_k, hidden_dim).sum(dim=1).to(hidden_states.dtype)
-    )
+    return out
 
 
 # ── MXFP8 fused (tl.dot_scaled, UE8M0 group-32 scales, tunable tiles) ─────────
@@ -444,17 +460,17 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     stride_gus_n,
     stride_gus_k,
     num_routed_tokens,  # tuning knob: in the autotune key so decode re-tunes per batch
-    num_experts,
+    NUM_EXPERTS: tl.constexpr,
     NUM_TOP_K: tl.constexpr,
     HIDDEN_DIM: tl.constexpr,
     INTERMEDIATE_DIM: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
-    USE_DOT_SCALED: tl.constexpr,
     VALUES_PER_BYTE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
+    COMPUTE_MODE: tl.constexpr,
 ):
     """MXFP4/MXFP8 kernel 1: gate_up + SiLU + MXFP8 requant. N = intermediate
     (output) tile, K = hidden (contraction) tile — both tunable. Grid: (S, N-tiles)."""
@@ -462,13 +478,17 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     pid_n = tl.program_id(axis=1)
     token = (batch_id // NUM_TOP_K).to(tl.int64)
     expert_id = tl.load(ExpertIds + batch_id).to(tl.int64)
-    if expert_id >= num_experts:  # EP sentinel; down kernel zeros the output row
+    if expert_id >= NUM_EXPERTS:  # EP sentinel; down kernel zeros the output row
         return
 
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = HiddenStates + token * stride_a_m + offs_k[None, :] * stride_a_k
-    # Weights via block pointers (K=H, N=2I), gate/up halves; scales stay manual (the
-    # group-32 UE8M0 layout doesn't map onto a block-ptr tile).
+    a_ptr = tl.make_block_ptr(
+        base=HiddenStates,
+        shape=(num_routed_tokens // NUM_TOP_K, HIDDEN_DIM),
+        strides=(stride_a_m, stride_a_k),
+        offsets=(token.to(tl.int32), 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+        order=(1, 0),
+    )
     b_gate_ptr = tl.make_block_ptr(
         base=GateUp + expert_id * stride_gu_e,
         shape=(HIDDEN_DIM // VALUES_PER_BYTE, INTERMEDIATE_DIM * 2),
@@ -505,59 +525,55 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for _ in range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K)):
-        a_raw = tl.load(a_ptrs).to(tl.float32)
+        a_raw = tl.load(a_ptr).to(tl.float32)
         a, a_scale = mxfp_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
         )
-        if VALUES_PER_BYTE == 2:  # MXFP4: packed E2M1 weight bytes
-            b_gate = tl.load(b_gate_ptr).to(tl.uint8)
-            b_up = tl.load(b_up_ptr).to(tl.uint8)
-        else:  # MXFP8: unpacked E4M3 weights
-            b_gate = tl.load(b_gate_ptr)
-            b_up = tl.load(b_up_ptr)
+        b_gate = tl.load(b_gate_ptr)
+        b_up = tl.load(b_up_ptr)
         bs_gate = tl.load(bs_gate_ptr).to(tl.uint8)
         bs_up = tl.load(bs_up_ptr).to(tl.uint8)
-        if USE_DOT_SCALED:
-            if VALUES_PER_BYTE == 2:
-                acc_gate = tl.dot_scaled(
-                    a, a_scale, "e4m3", b_gate, bs_gate, "e2m1", acc_gate
-                )
-                acc_up = tl.dot_scaled(a, a_scale, "e4m3", b_up, bs_up, "e2m1", acc_up)
-            else:
-                acc_gate = tl.dot_scaled(
-                    a, a_scale, "e4m3", b_gate, bs_gate, "e4m3", acc_gate
-                )
-                acc_up = tl.dot_scaled(a, a_scale, "e4m3", b_up, bs_up, "e4m3", acc_up)
-        else:
-            a_s = decode_ue8m0_scale(a_scale)
-            wg = tl.trans(decode_ue8m0_scale(bs_gate))
-            wu = tl.trans(decode_ue8m0_scale(bs_up))
-            if VALUES_PER_BYTE == 2:
-                acc_gate += tl.dot(a, mxfp4_e2m1_to_e4m3(b_gate)) * a_s * wg
-                acc_up += tl.dot(a, mxfp4_e2m1_to_e4m3(b_up)) * a_s * wu
-            else:
-                acc_gate += tl.dot(a, b_gate) * a_s * wg
-                acc_up += tl.dot(a, b_up) * a_s * wu
-        a_ptrs += BLOCK_SIZE_K * stride_a_k
+        w_gate = mxfp4_e2m1_to_e4m3(b_gate) if VALUES_PER_BYTE == 2 else b_gate
+        w_up = mxfp4_e2m1_to_e4m3(b_up) if VALUES_PER_BYTE == 2 else b_up
+        if COMPUTE_MODE == "dot_scaled":
+            acc_gate = mx_dot_scaled(
+                a, a_scale, b_gate, bs_gate, acc_gate, VALUES_PER_BYTE
+            )
+            acc_up = mx_dot_scaled(a, a_scale, b_up, bs_up, acc_up, VALUES_PER_BYTE)
+        elif COMPUTE_MODE == "dot":
+            acc_gate, acc_up = mx_dot_rescale_gate_up(
+                acc_gate, acc_up, a, w_gate, w_up, a_scale, bs_gate, bs_up
+            )
+        else:  # scalar
+            acc_gate, acc_up = mx_scalar_reduce_gate_up(
+                acc_gate,
+                acc_up,
+                a,
+                w_gate,
+                w_up,
+                a_scale,
+                bs_gate,
+                bs_up,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                SCALE_GROUP_K,
+            )
+        a_ptr = tl.advance(a_ptr, (0, BLOCK_SIZE_K))
         b_gate_ptr = tl.advance(b_gate_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0))
         b_up_ptr = tl.advance(b_up_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0))
         bs_gate_ptr = tl.advance(bs_gate_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
         bs_up_ptr = tl.advance(bs_up_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
 
-    if SIMULATE_UNFUSED:
-        dtype = HiddenStates.dtype.element_ty
-        acc_gate = acc_gate.to(dtype).to(tl.float32)
-        acc_up = acc_up.to(dtype).to(tl.float32)
-        silu = (acc_gate * tl.sigmoid(acc_gate)).to(dtype).to(tl.float32)
-        intermediate = (silu * acc_up).to(dtype).to(tl.float32)
-    else:
-        intermediate = acc_gate * tl.sigmoid(acc_gate) * acc_up
+    intermediate = swiglu(
+        acc_gate, acc_up, SIMULATE_UNFUSED, HiddenStates.dtype.element_ty
+    )
 
     # MXFP8 requant of the intermediate (E4M3 + UE8M0 group-32 along this N-tile).
     inter, inter_scale = mxfp_act_quant_inline(
         intermediate, BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K
     )
-    _store_row(
+    store_row(
         Intermediate + batch_id * INTERMEDIATE_DIM,
         inter,
         pid_n,
@@ -597,37 +613,43 @@ def mxfp_dynamic_moe_batched_down_kernel(
     stride_downs_n,
     stride_downs_k,
     num_routed_tokens,  # tuning knob: in the autotune key so decode re-tunes per batch
-    num_experts,
+    NUM_EXPERTS: tl.constexpr,
     HIDDEN_DIM: tl.constexpr,
     INTERMEDIATE_DIM: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
-    USE_DOT_SCALED: tl.constexpr,
     VALUES_PER_BYTE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
+    COMPUTE_MODE: tl.constexpr,
 ):
     """MXFP4/MXFP8 kernel 2: MXFP8 intermediate → down proj. N = hidden
     (output) tile, K = intermediate (contraction) tile. Grid: (S, H-tiles)."""
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     expert_id = tl.load(ExpertIds + batch_id).to(tl.int64)
-    if expert_id >= num_experts:  # EP sentinel: zero the output row for the top-k sum
+    if expert_id >= NUM_EXPERTS:  # EP sentinel: zero the output row for the top-k sum
         z = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        _store_row(Out + batch_id * HIDDEN_DIM, z, pid_n, 1, BLOCK_SIZE_M, BLOCK_SIZE_N)
+        store_row(Out + batch_id * HIDDEN_DIM, z, pid_n, 1, BLOCK_SIZE_M, BLOCK_SIZE_N)
         return
 
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
-    # Intermediate (the activation here) is a gathered single row → manual ptrs.
-    a_ptrs = Intermediate + batch_id * INTERMEDIATE_DIM + offs_k[None, :]
-    as_ptrs = (
-        IntermediateScale
-        + batch_id * (INTERMEDIATE_DIM // SCALE_GROUP_K)
-        + offs_sf[None, :]
+    a_ptr = tl.make_block_ptr(
+        base=Intermediate,
+        shape=(num_routed_tokens, INTERMEDIATE_DIM),
+        strides=(INTERMEDIATE_DIM, 1),
+        offsets=(batch_id, 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+        order=(1, 0),
     )
-    # Down weights + scales via block ptrs (K=I, N=H) / (N=H, K//32).
+    as_ptr = tl.make_block_ptr(
+        base=IntermediateScale,
+        shape=(num_routed_tokens, INTERMEDIATE_DIM // SCALE_GROUP_K),
+        strides=(INTERMEDIATE_DIM // SCALE_GROUP_K, 1),
+        offsets=(batch_id, 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_K),
+        order=(1, 0),
+    )
     w_down_ptr = tl.make_block_ptr(
         base=Down + expert_id * stride_down_e,
         shape=(INTERMEDIATE_DIM // VALUES_PER_BYTE, HIDDEN_DIM),
@@ -647,56 +669,68 @@ def mxfp_dynamic_moe_batched_down_kernel(
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for _ in range(0, tl.cdiv(INTERMEDIATE_DIM, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs)
-        a_scale = tl.load(as_ptrs).to(tl.uint8)
-        if VALUES_PER_BYTE == 2:  # MXFP4: packed E2M1 weight bytes
-            w = tl.load(w_down_ptr).to(tl.uint8)
-        else:  # MXFP8: unpacked E4M3 weights
-            w = tl.load(w_down_ptr)
-        ws = tl.load(ws_down_ptr).to(tl.uint8)
-        if USE_DOT_SCALED:
-            if VALUES_PER_BYTE == 2:
-                acc = tl.dot_scaled(a, a_scale, "e4m3", w, ws, "e2m1", acc)
-            else:
-                acc = tl.dot_scaled(a, a_scale, "e4m3", w, ws, "e4m3", acc)
-        else:
-            a_s = decode_ue8m0_scale(a_scale)
-            ws_d = tl.trans(decode_ue8m0_scale(ws))
-            if VALUES_PER_BYTE == 2:
-                acc += tl.dot(a, mxfp4_e2m1_to_e4m3(w)) * a_s * ws_d
-            else:
-                acc += tl.dot(a, w) * a_s * ws_d
-        a_ptrs += BLOCK_SIZE_K
-        as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
+        a = tl.load(a_ptr)
+        a_scale = tl.load(as_ptr)
+        w = tl.load(w_down_ptr)
+        w_scale = tl.load(ws_down_ptr)
+        wq = mxfp4_e2m1_to_e4m3(w) if VALUES_PER_BYTE == 2 else w
+        if COMPUTE_MODE == "dot_scaled":
+            acc = mx_dot_scaled(a, a_scale, w, w_scale, acc, VALUES_PER_BYTE)
+        elif COMPUTE_MODE == "dot":
+            acc = mx_dot_rescale(acc, a, wq, a_scale, w_scale)
+        else:  # scalar
+            acc = mx_scalar_reduce(
+                acc,
+                a,
+                a_scale,
+                wq,
+                w_scale,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                SCALE_GROUP_K,
+            )
+        a_ptr = tl.advance(a_ptr, (0, BLOCK_SIZE_K))
+        as_ptr = tl.advance(as_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
         w_down_ptr = tl.advance(w_down_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0))
         ws_down_ptr = tl.advance(ws_down_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
 
     if SIMULATE_UNFUSED:
         acc = acc.to(Out.dtype.element_ty).to(tl.float32)
     acc = acc * tl.load(SampleWeights + batch_id)
-    _store_row(Out + batch_id * HIDDEN_DIM, acc, pid_n, 1, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    store_row(Out + batch_id * HIDDEN_DIM, acc, pid_n, 1, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
-@triton_op(add_op_namespace_prefix("moe_batched_mxfp_gate_up"), mutates_args=())
-def _moe_batched_mxfp_gate_up(
+@triton_op(add_op_namespace_prefix("mxfp_dynamic_moe_batched"), mutates_args=())
+def _mxfp_dynamic_moe_batched(
     hidden_states: torch.Tensor,
     gate_up_proj: torch.Tensor,
     gate_up_proj_scale: torch.Tensor,
+    down_proj: torch.Tensor,
+    down_proj_scale: torch.Tensor,
     expert_ids: torch.Tensor,
+    sample_weights: torch.Tensor,
+    output_dtype: torch.dtype,
     simulate_unfused: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """MXFP8 fused MoE kernel 1: gate_up + SiLU + MXFP8 requant. Returns the
-    ``(E4M3 intermediate, UE8M0 group-32 scales)`` pair consumed by the down op."""
+) -> torch.Tensor:
+    """MXFP4/MXFP8 batched fused MoE in ONE op: gate_up + SiLU + MXFP8 requant → grouped
+    down → routing-weighted per-(token, expert) output. Format is picked per weight (gate_up
+    and down independently). ``inter``/``inter_scales`` are internal; caller reduces over top-k."""
     device = hidden_states.device
     HIDDEN_DIM = hidden_states.size(1)
-    num_experts = gate_up_proj.size(0)
+    NUM_EXPERTS = gate_up_proj.size(0)
     num_routed_tokens = expert_ids.size(0)
     INTERMEDIATE_DIM = gate_up_proj.size(1) // 2
     NUM_TOP_K = num_routed_tokens // hidden_states.size(0)
-    bs_u8 = ue8m0_as_uint8(gate_up_proj_scale)
-    VALUES_PER_BYTE = (
-        NIBBLES_PER_BYTE if is_mxfp4(gate_up_proj, gate_up_proj_scale) else 1
-    )
+    # MXFP4 (packed E2M1, 2 codes/byte) vs MXFP8 (E4M3, 1/byte), per weight; int8→uint8 is a
+    # zero-cost view (tl.dot_scaled wants uint8), E4M3 passes through.
+    gate_up_vpb = NIBBLES_PER_BYTE if is_mxfp4(gate_up_proj, gate_up_proj_scale) else 1
+    down_vpb = NIBBLES_PER_BYTE if is_mxfp4(down_proj, down_proj_scale) else 1
+    gate_up_proj_u8 = e2m1_as_uint8(gate_up_proj)
+    gate_up_proj_scale_u8 = ue8m0_as_uint8(gate_up_proj_scale)
+    down_proj_u8 = e2m1_as_uint8(down_proj)
+    down_proj_scale_u8 = ue8m0_as_uint8(down_proj_scale)
+
     inter = torch.empty(
         num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=torch.float8_e4m3fn
     )
@@ -706,88 +740,72 @@ def _moe_batched_mxfp_gate_up(
         device=device,
         dtype=torch.uint8,
     )
+    num_tokens = hidden_states.size(0)
+    out = torch.empty(num_routed_tokens, HIDDEN_DIM, device=device, dtype=output_dtype)
+    reduced = torch.empty(num_tokens, HIDDEN_DIM, device=device, dtype=output_dtype)
 
-    def grid(META):
+    def gate_up_grid(META):
         return (num_routed_tokens, triton.cdiv(INTERMEDIATE_DIM, META["BLOCK_SIZE_N"]))
 
+    def down_grid(META):
+        return (num_routed_tokens, triton.cdiv(HIDDEN_DIM, META["BLOCK_SIZE_N"]))
+
     with device_context(device):
-        wrap_triton(mxfp_dynamic_moe_batched_gate_up_kernel)[grid](
+        wrap_triton(mxfp_dynamic_moe_batched_gate_up_kernel)[gate_up_grid](
             hidden_states,
-            gate_up_proj,
-            bs_u8,
+            gate_up_proj_u8,
+            gate_up_proj_scale_u8,
             inter,
             inter_scales,
             expert_ids,
             hidden_states.stride(0),
             hidden_states.stride(1),
-            gate_up_proj.stride(0),
-            gate_up_proj.stride(1),
-            gate_up_proj.stride(2),
-            bs_u8.stride(0),
-            bs_u8.stride(1),
-            bs_u8.stride(2),
+            gate_up_proj_u8.stride(0),
+            gate_up_proj_u8.stride(1),
+            gate_up_proj_u8.stride(2),
+            gate_up_proj_scale_u8.stride(0),
+            gate_up_proj_scale_u8.stride(1),
+            gate_up_proj_scale_u8.stride(2),
             num_routed_tokens=num_routed_tokens,
             NUM_TOP_K=NUM_TOP_K,
-            num_experts=num_experts,
+            NUM_EXPERTS=NUM_EXPERTS,
             HIDDEN_DIM=HIDDEN_DIM,
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
             BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
-            VALUES_PER_BYTE=VALUES_PER_BYTE,
+            VALUES_PER_BYTE=gate_up_vpb,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-    return inter, inter_scales
-
-
-@triton_op(add_op_namespace_prefix("moe_batched_mxfp_down"), mutates_args=())
-def _moe_batched_mxfp_down(
-    inter: torch.Tensor,
-    inter_scales: torch.Tensor,
-    down_proj: torch.Tensor,
-    down_proj_scale: torch.Tensor,
-    expert_ids: torch.Tensor,
-    sample_weights: torch.Tensor,
-    output_dtype: torch.dtype,
-    simulate_unfused: bool = False,
-) -> torch.Tensor:
-    """MXFP8 fused MoE kernel 2: MXFP8 intermediate → down proj → routing-weighted
-    per-(token, expert) output (the caller reduces over the top-k axis)."""
-    HIDDEN_DIM = down_proj.size(1)
-    num_experts = down_proj.size(0)
-    INTERMEDIATE_DIM = inter.size(1)
-    num_routed_tokens = inter.size(0)
-    ws_u8 = ue8m0_as_uint8(down_proj_scale)
-    VALUES_PER_BYTE = NIBBLES_PER_BYTE if is_mxfp4(down_proj, down_proj_scale) else 1
-    Out = inter.new_empty(num_routed_tokens, HIDDEN_DIM, dtype=output_dtype)
-
-    def grid(META):
-        return (num_routed_tokens, triton.cdiv(HIDDEN_DIM, META["BLOCK_SIZE_N"]))
-
-    with device_context(inter.device):
-        wrap_triton(mxfp_dynamic_moe_batched_down_kernel)[grid](
+        wrap_triton(mxfp_dynamic_moe_batched_down_kernel)[down_grid](
             inter,
             inter_scales,
-            down_proj,
-            ws_u8,
+            down_proj_u8,
+            down_proj_scale_u8,
             expert_ids,
             sample_weights,
-            Out,
-            down_proj.stride(0),
-            down_proj.stride(1),
-            down_proj.stride(2),
-            ws_u8.stride(0),
-            ws_u8.stride(1),
-            ws_u8.stride(2),
+            out,
+            down_proj_u8.stride(0),
+            down_proj_u8.stride(1),
+            down_proj_u8.stride(2),
+            down_proj_scale_u8.stride(0),
+            down_proj_scale_u8.stride(1),
+            down_proj_scale_u8.stride(2),
             num_routed_tokens=num_routed_tokens,
-            num_experts=num_experts,
+            NUM_EXPERTS=NUM_EXPERTS,
             HIDDEN_DIM=HIDDEN_DIM,
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
             BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
-            VALUES_PER_BYTE=VALUES_PER_BYTE,
+            VALUES_PER_BYTE=down_vpb,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-    return Out
+        wrap_triton(topk_reduce_kernel)[(num_tokens, triton.cdiv(HIDDEN_DIM, 512))](
+            out, reduced, HIDDEN_DIM,
+            out.stride(0), out.stride(1), reduced.stride(0), reduced.stride(1),
+            NUM_TOP_K=NUM_TOP_K, BLOCK_H=512,
+        )
+
+    return reduced
 
 
 def mxfp_dynamic_moe_batched(
@@ -810,16 +828,10 @@ def mxfp_dynamic_moe_batched(
     sample_weights = top_k_weights.reshape(-1)
     expert_ids = top_k_index.reshape(-1)
 
-    inter, inter_scales = ops.moe_batched_mxfp_gate_up(
+    out = ops.mxfp_dynamic_moe_batched(
         hidden_states,
         gate_up_proj,
         gate_up_proj_scale,
-        expert_ids,
-        simulate_unfused,
-    )
-    out = ops.moe_batched_mxfp_down(
-        inter,
-        inter_scales,
         down_proj,
         down_proj_scale,
         expert_ids,
@@ -827,9 +839,7 @@ def mxfp_dynamic_moe_batched(
         hidden_states.dtype,
         simulate_unfused,
     )
-    return (
-        out.view(num_tokens, num_top_k, hidden_dim).sum(dim=1).to(hidden_states.dtype)
-    )
+    return out
 
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────

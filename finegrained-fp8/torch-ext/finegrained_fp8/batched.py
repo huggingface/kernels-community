@@ -25,6 +25,9 @@ from .utils import (
     DECODE_BLOCK_SIZE_M,
     decode_ue8m0_scale,
     device_context,
+    mx_dot_rescale,
+    mx_dot_scaled,
+    mx_scalar_reduce,
     mxfp_act_quant_inline,
     mxfp4_e2m1_to_e4m3,
     fp8_act_quant,
@@ -33,12 +36,13 @@ from .utils import (
     get_mxfp_autotuning_configs,
     is_mxfp,
     is_tensor_wide,
+    e2m1_as_uint8,
     ue8m0_as_uint8,
 )
 
 
 @triton.jit
-def _expert_setup(
+def expert_setup(
     A,
     B,
     C,
@@ -69,7 +73,7 @@ def _expert_setup(
 
 
 @triton.jit
-def _store_row(
+def store_row(
     C,
     accumulator,
     pid_n,
@@ -128,7 +132,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     Each program handles one routed token row and one N-tile, looks up the
     owning expert from ``ExpertIds``, and applies fused activation quantization.
     """
-    _, pid_n, expert_id, A, B, C, Bs = _expert_setup(
+    _, pid_n, expert_id, A, B, C, Bs = expert_setup(
         A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
@@ -153,7 +157,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += stride_bs_k
 
-    _store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
 @triton.autotune(
@@ -194,7 +198,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     Activations are already quantized; the kernel applies per-token activation
     scales and per-expert tensor weight scales.
     """
-    batch_id, pid_n, expert_id, A, B, C, Bs = _expert_setup(
+    batch_id, pid_n, expert_id, A, B, C, Bs = expert_setup(
         A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
@@ -219,7 +223,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 
     accumulator = accumulator * a_s * b_s
 
-    _store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
 @bayesian_autotune(get_mxfp_autotuning_configs(), ["N", "K", "S"], n_trials=60)
@@ -251,19 +255,19 @@ def mxfp_dynamic_matmul_batched_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    USE_DOT_SCALED: tl.constexpr,
     VALUES_PER_BYTE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
+    COMPUTE_MODE: tl.constexpr,
 ):
     """Unified batched MXFP4/MXFP8 (W4A8/W8A8) expert matmul with fused act quant.
 
     One routed row + one N-tile per program; expert looked up from ``ExpertIds``. ``A`` is
     quantized to E4M3 per K-group inline (UE8M0 scale). ``VALUES_PER_BYTE`` picks the
-    weight format (2 = packed E2M1 / MXFP4, 1 = unpacked E4M3 / MXFP8); ``USE_DOT_SCALED``
+    weight format (2 = packed E2M1 / MXFP4, 1 = unpacked E4M3 / MXFP8); ``COMPUTE_MODE``
     picks ``tl.dot_scaled`` (native M=128) vs fp8 ``tl.dot`` + per-group rescale (wins at
     decode where the scaled MMA's M→128 pad is waste; FP4 unpacks E2M1->E4M3, lossless).
     """
-    _, pid_n, expert_id, A, B, C, Bs = _expert_setup(
+    _, pid_n, expert_id, A, B, C, Bs = expert_setup(
         A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
@@ -284,28 +288,20 @@ def mxfp_dynamic_matmul_batched_kernel(
         a, a_scale = mxfp_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
         )
-        if VALUES_PER_BYTE == 2:  # MXFP4: packed E2M1 bytes
-            b = tl.load(b_ptrs).to(tl.uint8)
-        else:  # MXFP8: unpacked E4M3
-            b = tl.load(b_ptrs)
+        b = tl.load(b_ptrs)  # uint8 (MXFP4 packed E2M1) or E4M3 (MXFP8) — dtype from the tensor
         b_s = tl.load(bs_ptrs).to(tl.uint8)
-        if USE_DOT_SCALED:
-            if VALUES_PER_BYTE == 2:
-                accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1", accumulator)
-            else:
-                accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3", accumulator)
-        else:
-            a_s = decode_ue8m0_scale(a_scale)
-            ws = tl.trans(decode_ue8m0_scale(b_s))
-            if VALUES_PER_BYTE == 2:
-                accumulator += tl.dot(a, mxfp4_e2m1_to_e4m3(b)) * a_s * ws
-            else:
-                accumulator += tl.dot(a, b) * a_s * ws
+        bq = mxfp4_e2m1_to_e4m3(b) if VALUES_PER_BYTE == 2 else b
+        if COMPUTE_MODE == "dot_scaled":
+            accumulator = mx_dot_scaled(a, a_scale, b, b_s, accumulator, VALUES_PER_BYTE)
+        elif COMPUTE_MODE == "dot":
+            accumulator = mx_dot_rescale(accumulator, a, bq, a_scale, b_s)
+        else:  # scalar
+            accumulator = mx_scalar_reduce(accumulator, a, a_scale, bq, b_s, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
-    _store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
 @triton_op(
@@ -534,6 +530,7 @@ def _mxfp_dynamic_matmul_batched(
         f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {N}, {K // MX_SCALE_GROUP_K})"
     )
 
+    B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty((S, N), dtype=output_dtype)
 

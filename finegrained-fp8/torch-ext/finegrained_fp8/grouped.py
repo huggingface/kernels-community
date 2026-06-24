@@ -32,8 +32,11 @@ from .utils import (
     get_mxfp_autotuning_configs,
     is_mxfp,
     is_tensor_wide,
+    e2m1_as_uint8,
     ue8m0_as_uint8,
     decode_ue8m0_scale,
+    mx_dot_rescale,
+    mx_dot_scaled,
 )
 
 
@@ -123,9 +126,7 @@ def _grouped_tile_setup(
 
 
 @triton.jit
-def _store_tile(
-    C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn
-):
+def store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn):
     """Output epilogue shared by the grouped kernels: cast the fp32 accumulator to
     ``C``'s dtype and store the tile at expert-sorted global rows ``offs_global_m`` ×
     columns ``offs_bn``, masked to the expert's valid rows (``row_mask``)."""
@@ -216,9 +217,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += stride_bs_k
 
-    _store_tile(
-        C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn
-    )
+    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn)
 
 
 @bayesian_autotune(
@@ -304,12 +303,14 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
     accumulator = accumulator * a_s[:, None] * b_s
 
-    _store_tile(
-        C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn
-    )
+    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn)
 
 
-@bayesian_autotune(get_mxfp_autotuning_configs(), ["N", "K", "BLOCK_SIZE_M"], n_trials=60)
+@bayesian_autotune(
+    get_mxfp_autotuning_configs(modes=("dot_scaled", "dot")),  # prefill: no scalar branch
+    ["N", "K", "BLOCK_SIZE_M"],
+    n_trials=60,
+)
 @triton.jit
 def mxfp_dynamic_matmul_grouped_kernel(
     A,  # (S, K) raw BF16/FP16 activations, sorted by expert id
@@ -340,16 +341,16 @@ def mxfp_dynamic_matmul_grouped_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    USE_DOT_SCALED: tl.constexpr,
     NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
     VALUES_PER_BYTE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
+    COMPUTE_MODE: tl.constexpr,
 ):
     """Unified grouped MXFP4/MXFP8 (W4A8/W8A8) expert matmul with fused act quant.
 
     Tokens sorted by expert; each M-tile maps to its expert via ``TileOffsets``. ``A`` is
     quantized to E4M3 per K-group inline (UE8M0 scale). ``VALUES_PER_BYTE`` picks the
-    weight format (2 = packed E2M1 / MXFP4, 1 = unpacked E4M3 / MXFP8); ``USE_DOT_SCALED``
+    weight format (2 = packed E2M1 / MXFP4, 1 = unpacked E4M3 / MXFP8); ``COMPUTE_MODE``
     picks ``tl.dot_scaled`` vs fp8 ``tl.dot`` + per-group rescale (decode; FP4 unpacks
     E2M1->E4M3 first, lossless).
     """
@@ -396,30 +397,18 @@ def mxfp_dynamic_matmul_grouped_kernel(
         a, a_scale = mxfp_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
         )
-        if VALUES_PER_BYTE == 2:  # MXFP4: packed E2M1 bytes
-            b = tl.load(b_ptrs).to(tl.uint8)
-        else:  # MXFP8: unpacked E4M3
-            b = tl.load(b_ptrs)
+        b = tl.load(b_ptrs)  # uint8 (MXFP4 packed E2M1) or E4M3 (MXFP8) — dtype from the tensor
         b_s = tl.load(bs_ptrs).to(tl.uint8)
-        if USE_DOT_SCALED:
-            if VALUES_PER_BYTE == 2:
-                accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1", accumulator)
-            else:
-                accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3", accumulator)
-        else:
-            a_s = decode_ue8m0_scale(a_scale)
-            ws = tl.trans(decode_ue8m0_scale(b_s))
-            if VALUES_PER_BYTE == 2:
-                accumulator += tl.dot(a, mxfp4_e2m1_to_e4m3(b)) * a_s * ws
-            else:
-                accumulator += tl.dot(a, b) * a_s * ws
+        bq = mxfp4_e2m1_to_e4m3(b) if VALUES_PER_BYTE == 2 else b
+        if COMPUTE_MODE == "dot_scaled":
+            accumulator = mx_dot_scaled(a, a_scale, b, b_s, accumulator, VALUES_PER_BYTE)
+        else:  # dot
+            accumulator = mx_dot_rescale(accumulator, a, bq, a_scale, b_s)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
-    _store_tile(
-        C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn
-    )
+    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn)
 
 
 @triton_op(
@@ -537,7 +526,9 @@ def _w8a8_tensor_dynamic_fp8_matmul_grouped(
 
     # Normalize Bs to (num_experts, 1, 1)
     if Bs.ndim == 1:
-        assert Bs.shape[0] == num_experts, f"Bs shape {tuple(Bs.shape)} != expected ({num_experts},)"
+        assert Bs.shape[0] == num_experts, (
+            f"Bs shape {tuple(Bs.shape)} != expected ({num_experts},)"
+        )
         Bs = Bs.reshape(num_experts, 1, 1)
     else:
         assert Bs.shape == (num_experts, 1, 1), (
@@ -627,9 +618,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     )
 
 
-@triton_op(
-    add_op_namespace_prefix("mxfp_dynamic_matmul_grouped"), mutates_args=()
-)
+@triton_op(add_op_namespace_prefix("mxfp_dynamic_matmul_grouped"), mutates_args=())
 def _mxfp_dynamic_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -670,6 +659,7 @@ def _mxfp_dynamic_matmul_grouped(
         f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {N}, {K // MX_SCALE_GROUP_K})"
     )
 
+    B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty((S, N), dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m((S + num_experts - 1) // num_experts)

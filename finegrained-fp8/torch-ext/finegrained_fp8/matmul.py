@@ -24,6 +24,8 @@ from .utils import (
     MX_SCALE_GROUP_K,
     adaptive_block_size_m,
     decode_ue8m0_scale,
+    mx_dot_rescale,
+    mx_dot_scaled,
     device_context,
     fp8_act_quant,
     fp8_act_quant_inline,
@@ -33,6 +35,7 @@ from .utils import (
     is_tensor_wide,
     mxfp_act_quant_inline,
     mxfp4_e2m1_to_e4m3,
+    e2m1_as_uint8,
     ue8m0_as_uint8,
 )
 
@@ -149,8 +152,16 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         bs_ptrs += stride_bs_k
 
     _store_masked(
-        C, accumulator, pid_m, pid_n, M, N, stride_cm, stride_cn,
-        BLOCK_SIZE_M, BLOCK_SIZE_N,
+        C,
+        accumulator,
+        pid_m,
+        pid_n,
+        M,
+        N,
+        stride_cm,
+        stride_cn,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
     )
 
 
@@ -211,8 +222,16 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     accumulator = accumulator * a_s[:, None] * b_s
 
     _store_masked(
-        C, accumulator, pid_m, pid_n, M, N, stride_cm, stride_cn,
-        BLOCK_SIZE_M, BLOCK_SIZE_N,
+        C,
+        accumulator,
+        pid_m,
+        pid_n,
+        M,
+        N,
+        stride_cm,
+        stride_cn,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
     )
 
 
@@ -279,12 +298,24 @@ def w8a8_block_static_fp8_matmul_kernel(
 
     accumulator = accumulator * a_s_static
     _store_masked(
-        C, accumulator, pid_m, pid_n, M, N, stride_cm, stride_cn,
-        BLOCK_SIZE_M, BLOCK_SIZE_N,
+        C,
+        accumulator,
+        pid_m,
+        pid_n,
+        M,
+        N,
+        stride_cm,
+        stride_cn,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
     )
 
 
-@bayesian_autotune(get_mxfp_autotuning_configs(), ["N", "K", "BLOCK_SIZE_M"], n_trials=60)
+@bayesian_autotune(
+    get_mxfp_autotuning_configs(modes=("dot_scaled", "dot")),  # no scalar branch here
+    ["N", "K", "BLOCK_SIZE_M"],
+    n_trials=60,
+)
 @triton.jit
 def mxfp_dynamic_matmul_kernel(
     A,  # (M, K) raw BF16/FP16 activations
@@ -308,16 +339,16 @@ def mxfp_dynamic_matmul_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    USE_DOT_SCALED: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     VALUES_PER_BYTE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
+    COMPUTE_MODE: tl.constexpr,
 ):
     """Unified MXFP4/MXFP8 (W4A8/W8A8) GEMM with fused activation quantization.
 
     ``C = A @ B.T`` with bf16/fp16 ``A`` quantized to E4M3 per K-group inline (UE8M0
     scale). ``VALUES_PER_BYTE`` picks the weight format: 2 = packed E2M1 (MXFP4),
-    1 = unpacked E4M3 (MXFP8). ``USE_DOT_SCALED`` picks the MMA: ``tl.dot_scaled``
+    1 = unpacked E4M3 (MXFP8). ``COMPUTE_MODE`` picks the MMA: ``tl.dot_scaled``
     (native M=128 scaled MMA) vs fp8 ``tl.dot`` + per-group software rescale (wins at
     decode; FP4 unpacks E2M1->E4M3 first — lossless). 2D grid with swizzle for L2 reuse.
     """
@@ -339,34 +370,35 @@ def mxfp_dynamic_matmul_kernel(
         a, a_scale = mxfp_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
         )
-        if VALUES_PER_BYTE == 2:  # MXFP4: packed E2M1 bytes
-            b = tl.load(
-                b_ptrs, mask=offs_kb[:, None] < k_remaining // VALUES_PER_BYTE, other=0
-            ).to(tl.uint8)
-        else:  # MXFP8: unpacked E4M3
-            b = tl.load(b_ptrs, mask=offs_kb[:, None] < k_remaining, other=0.0)
+        # uint8 (MXFP4 packed E2M1) or E4M3 (MXFP8) — dtype from the tensor (viewed in wrapper).
+        # k_remaining // VALUES_PER_BYTE is the packed bound (== k_remaining for MXFP8, vpb=1).
+        # other=0.0 (not 0): float casts to both E4M3 and uint8; int 0 can't cast to fp8.
+        b = tl.load(
+            b_ptrs, mask=offs_kb[:, None] < k_remaining // VALUES_PER_BYTE, other=0.0
+        )
         b_s = tl.load(
             bs_ptrs, mask=offs_sf[None, :] < k_remaining // SCALE_GROUP_K, other=0
         ).to(tl.uint8)
-        if USE_DOT_SCALED:
-            if VALUES_PER_BYTE == 2:
-                accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e2m1", accumulator)
-            else:
-                accumulator = tl.dot_scaled(a, a_scale, "e4m3", b, b_s, "e4m3", accumulator)
-        else:
-            a_s = decode_ue8m0_scale(a_scale)
-            ws = tl.trans(decode_ue8m0_scale(b_s))
-            if VALUES_PER_BYTE == 2:
-                accumulator += tl.dot(a, mxfp4_e2m1_to_e4m3(b)) * a_s * ws
-            else:
-                accumulator += tl.dot(a, b) * a_s * ws
+        bq = mxfp4_e2m1_to_e4m3(b) if VALUES_PER_BYTE == 2 else b
+        if COMPUTE_MODE == "dot_scaled":
+            accumulator = mx_dot_scaled(a, a_scale, b, b_s, accumulator, VALUES_PER_BYTE)
+        else:  # dot
+            accumulator = mx_dot_rescale(accumulator, a, bq, a_scale, b_s)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
     _store_masked(
-        C, accumulator, pid_m, pid_n, M, N, stride_cm, stride_cn,
-        BLOCK_SIZE_M, BLOCK_SIZE_N,
+        C,
+        accumulator,
+        pid_m,
+        pid_n,
+        M,
+        N,
+        stride_cm,
+        stride_cn,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
     )
 
 
@@ -620,6 +652,7 @@ def _mxfp_dynamic_matmul(
         f"Bs shape {tuple(Bs.shape)} != ({N}, {K // MX_SCALE_GROUP_K})"
     )
 
+    B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty((M, N), dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m(M)
