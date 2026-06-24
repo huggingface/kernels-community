@@ -27,8 +27,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install uv
+        run: pip install uv
+
       - name: Check public API
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          python3 scripts/check_public_api.py --base-ref "$BASE_SHA"
+          uv run --script scripts/check_public_api.py --base-ref "$BASE_SHA"
