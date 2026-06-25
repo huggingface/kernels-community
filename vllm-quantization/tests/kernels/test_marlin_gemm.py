@@ -8,55 +8,10 @@ Run `pytest tests/kernels/marlin/test_marlin_gemm.py`.
 import pytest
 import torch
 
-import vllm_quantization
+import kernels
+vllm_quantization = kernels.get_kernel("kernels-community/vllm-quantization", version=0)
 
 from tests.kernels.utils import DEFAULT_OPCHECK_TEST_UTILS, opcheck
-
-from vllm_quantization.utils.marlin_utils import (
-    GPTQ_MARLIN_24_MAX_PARALLEL,
-    GPTQ_MARLIN_24_MIN_THREAD_N,
-    GPTQ_MARLIN_24_SUPPORTED_GROUP_SIZES,
-    GPTQ_MARLIN_24_SUPPORTED_QUANT_TYPES,
-    GPTQ_MARLIN_MAX_PARALLEL,
-    GPTQ_MARLIN_MIN_THREAD_N,
-    MARLIN_SUPPORTED_GROUP_SIZES,
-    MARLIN_QQQ_MAX_PARALLEL,
-    MARLIN_QQQ_MIN_THREAD_N,
-    MARLIN_QQQ_SUPPORTED_GROUP_SIZES,
-    MARLIN_QQQ_SUPPORTED_NUM_BITS,
-    marlin_make_workspace_new,
-    marlin_make_empty_g_idx,
-    marlin_permute_scales,
-    query_marlin_supported_quant_types,
-)
-from vllm_quantization.utils.marlin_utils_fp4 import (
-    FP4_MARLIN_SUPPORTED_GROUP_SIZES, rand_marlin_weight_fp4_like)
-from vllm_quantization.utils.marlin_utils_fp8 import (
-    pack_fp8_to_int32,
-    marlin_quant_fp8_torch,
-)
-from vllm_quantization.utils.quant_utils import (
-    awq_pack,
-    gptq_pack,
-    gptq_quantize_weights,
-    quantize_weights,
-    sort_weights,
-)
-from vllm_quantization.scalar_type import scalar_types
-
-from vllm_quantization.utils.marlin_utils_test import (
-    MarlinWorkspace,
-    awq_marlin_quantize,
-    get_weight_perm,
-    marlin_quantize,
-    marlin_weights,
-)
-from vllm_quantization.utils.marlin_utils_test_24 import (
-    marlin_24_quantize,
-)
-from vllm_quantization.utils.marlin_utils_test_qqq import (  # noqa: E501
-    marlin_qqq_quantize,
-)
 
 
 # Avoid torch._dynamo.exc.Unsupported: cache_size_limit reached
@@ -109,8 +64,8 @@ def rand_data(shape, dtype=torch.float16):
 @pytest.mark.parametrize("k_chunk", MARLIN_K_CHUNKS)
 @pytest.mark.parametrize("n_chunk", MARLIN_N_CHUNKS)
 @pytest.mark.parametrize("quant_type",
-                         query_marlin_supported_quant_types(False, False))
-@pytest.mark.parametrize("group_size", MARLIN_SUPPORTED_GROUP_SIZES)
+                         vllm_quantization.query_marlin_supported_quant_types(False, False))
+@pytest.mark.parametrize("group_size", vllm_quantization.marlin_utils.MARLIN_SUPPORTED_GROUP_SIZES)
 @pytest.mark.parametrize("act_order", ACT_ORDER_OPTS)
 @pytest.mark.parametrize("mnk_factors", MNK_FACTORS)
 def test_gptq_marlin_repack(k_chunk, n_chunk, quant_type, group_size,
@@ -136,24 +91,24 @@ def test_gptq_marlin_repack(k_chunk, n_chunk, quant_type, group_size,
     b_weight = rand_data((size_k, size_n))
 
     # Quantize (and apply act_order if provided)
-    w_ref, q_w, s, g_idx, rand_perm = gptq_quantize_weights(
+    w_ref, q_w, s, g_idx, rand_perm = vllm_quantization.gptq_quantize_weights(
         b_weight, quant_type, group_size, act_order)
 
     # Pack to GPTQ format
-    q_w_gptq = gptq_pack(q_w, quant_type.size_bits, size_k, size_n)
+    q_w_gptq = vllm_quantization.gptq_pack(q_w, quant_type.size_bits, size_k, size_n)
 
     # For act_order, sort the "weights" and "g_idx" so that group ids are
     # increasing
     sort_indices = torch.empty(0, dtype=torch.int, device=b_weight.device)
     if act_order:
-        q_w, g_idx, sort_indices = sort_weights(q_w, g_idx)
+        q_w, g_idx, sort_indices = vllm_quantization.sort_weights(q_w, g_idx)
 
     # Pack to Marlin format
-    weight_perm = get_weight_perm(quant_type.size_bits)
-    marlin_q_w_1 = marlin_weights(q_w, size_k, size_n, quant_type.size_bits,
+    weight_perm = vllm_quantization.get_weight_perm(quant_type.size_bits)
+    marlin_q_w_1 = vllm_quantization.marlin_weights(q_w, size_k, size_n, quant_type.size_bits,
                                   weight_perm)
 
-    opcheck(vllm_quantization._ops.ops.gptq_marlin_repack,
+    opcheck(vllm_quantization.ops.gptq_marlin_repack,
             (q_w_gptq, sort_indices, size_k, size_n, quant_type.size_bits))
 
     # Run Marlin repack GPU kernel
@@ -176,8 +131,8 @@ def test_gptq_marlin_repack(k_chunk, n_chunk, quant_type, group_size,
 @pytest.mark.parametrize("k_chunk", MARLIN_K_CHUNKS)
 @pytest.mark.parametrize("n_chunk", MARLIN_N_CHUNKS)
 @pytest.mark.parametrize("quant_type",
-                         query_marlin_supported_quant_types(True))
-@pytest.mark.parametrize("group_size", MARLIN_SUPPORTED_GROUP_SIZES)
+                         vllm_quantization.query_marlin_supported_quant_types(True))
+@pytest.mark.parametrize("group_size", vllm_quantization.marlin_utils.MARLIN_SUPPORTED_GROUP_SIZES)
 @pytest.mark.parametrize("mnk_factors", MNK_FACTORS)
 def test_awq_marlin_repack(k_chunk, n_chunk, quant_type, group_size,
                            mnk_factors):
@@ -195,20 +150,20 @@ def test_awq_marlin_repack(k_chunk, n_chunk, quant_type, group_size,
     b_weight = rand_data((size_k, size_n))
 
     # Quantize
-    w_ref, q_w, s, zp = quantize_weights(b_weight,
+    w_ref, q_w, s, zp = vllm_quantization.quantize_weights(b_weight,
                                          quant_type,
                                          group_size,
                                          zero_points=True)
 
     # Pack to AWQ format
-    q_w_awq = awq_pack(q_w, quant_type.size_bits, size_k, size_n)
+    q_w_awq = vllm_quantization.awq_pack(q_w, quant_type.size_bits, size_k, size_n)
 
     # Pack to Marlin format
-    weight_perm = get_weight_perm(quant_type.size_bits)
-    marlin_q_w_1 = marlin_weights(q_w, size_k, size_n, quant_type.size_bits,
+    weight_perm = vllm_quantization.get_weight_perm(quant_type.size_bits)
+    marlin_q_w_1 = vllm_quantization.marlin_weights(q_w, size_k, size_n, quant_type.size_bits,
                                   weight_perm)
 
-    opcheck(vllm_quantization._ops.ops.awq_marlin_repack,
+    opcheck(vllm_quantization.ops.awq_marlin_repack,
             (q_w_awq, size_k, size_n, quant_type.size_bits))
 
     # Run Marlin repack GPU kernel
@@ -229,10 +184,10 @@ def test_awq_marlin_repack(k_chunk, n_chunk, quant_type, group_size,
 )
 @pytest.mark.parametrize("k_chunk", MARLIN_K_CHUNKS)
 @pytest.mark.parametrize("n_chunk", MARLIN_N_CHUNKS)
-@pytest.mark.parametrize("quant_type", query_marlin_supported_quant_types())
+@pytest.mark.parametrize("quant_type", vllm_quantization.query_marlin_supported_quant_types())
 @pytest.mark.parametrize(
     "group_size",
-    set(MARLIN_SUPPORTED_GROUP_SIZES + FP4_MARLIN_SUPPORTED_GROUP_SIZES))
+    set(vllm_quantization.marlin_utils.MARLIN_SUPPORTED_GROUP_SIZES + vllm_quantization.marlin_utils_fp4.FP4_MARLIN_SUPPORTED_GROUP_SIZES))
 @pytest.mark.parametrize("mnk_factors", MNK_FACTORS)
 @pytest.mark.parametrize("act_order", ACT_ORDER_OPTS)
 @pytest.mark.parametrize("is_k_full", K_FULL_OPTS)
@@ -250,7 +205,7 @@ def test_gptq_marlin_gemm(
     use_fp32_reduce,
 ):
     m_factor, n_factor, k_factor = mnk_factors
-    has_zp = quant_type in [scalar_types.uint4, scalar_types.uint8]
+    has_zp = quant_type in [vllm_quantization.scalar_types.uint4, vllm_quantization.scalar_types.uint8]
 
     size_m = m_factor
     size_k = k_chunk * k_factor
@@ -270,20 +225,20 @@ def test_gptq_marlin_gemm(
     a_input = rand_data((size_m, size_k))
     b_weight = rand_data((size_k, size_n))
 
-    if quant_type == scalar_types.float4_e2m1f:
+    if quant_type == vllm_quantization.scalar_types.float4_e2m1f:
         if group_size != 16 or act_order:
             return
-        w_ref, marlin_q_w, marlin_s, marlin_s2 = rand_marlin_weight_fp4_like(
+        w_ref, marlin_q_w, marlin_s, marlin_s2 = vllm_quantization.rand_marlin_weight_fp4_like(
             b_weight.T, group_size)
         g_idx = None
         sort_indices = None
         marlin_zp = None
-    elif quant_type == scalar_types.float8_e4m3fn:
+    elif quant_type == vllm_quantization.scalar_types.float8_e4m3fn:
         if group_size not in [-1, 128]:
             return
         if act_order:
             return
-        w_ref, marlin_q_w, marlin_s = marlin_quant_fp8_torch(
+        w_ref, marlin_q_w, marlin_s = vllm_quantization.marlin_quant_fp8_torch(
             b_weight.T, group_size)
         g_idx = None
         sort_indices = None
@@ -292,7 +247,7 @@ def test_gptq_marlin_gemm(
     elif has_zp:
         if group_size == 16:
             return
-        w_ref, marlin_q_w, marlin_s, marlin_zp = awq_marlin_quantize(
+        w_ref, marlin_q_w, marlin_s, marlin_zp = vllm_quantization.awq_marlin_quantize(
             b_weight, quant_type, group_size)
         g_idx = None
         sort_indices = None
@@ -300,14 +255,14 @@ def test_gptq_marlin_gemm(
     else:
         if group_size == 16:
             return
-        w_ref, marlin_q_w, marlin_s, g_idx, sort_indices, _ = marlin_quantize(
+        w_ref, marlin_q_w, marlin_s, g_idx, sort_indices, _ = vllm_quantization.marlin_quantize(
             b_weight, quant_type, group_size, act_order)
         marlin_zp = None
         marlin_s2 = None
 
-    workspace = marlin_make_workspace_new(w_ref.device)
+    workspace = vllm_quantization.marlin_make_workspace_new(w_ref.device)
 
-    opcheck(vllm_quantization._ops.ops.gptq_marlin_gemm,
+    opcheck(vllm_quantization.ops.gptq_marlin_gemm,
             (a_input, None, marlin_q_w, marlin_s, marlin_s2, marlin_zp, g_idx,
              sort_indices, workspace, quant_type.id, a_input.shape[0],
              b_weight.shape[1], a_input.shape[1], is_k_full, use_atomic_add,
@@ -358,8 +313,8 @@ def marlin_24_gemm_tester(a_input, marlin_24_q_w_comp, marlin_24_meta,
 )
 @pytest.mark.parametrize("k_chunk", MARLIN_24_K_CHUNKS)
 @pytest.mark.parametrize("n_chunk", MARLIN_24_N_CHUNKS)
-@pytest.mark.parametrize("quant_type", GPTQ_MARLIN_24_SUPPORTED_QUANT_TYPES)
-@pytest.mark.parametrize("group_size", GPTQ_MARLIN_24_SUPPORTED_GROUP_SIZES)
+@pytest.mark.parametrize("quant_type", vllm_quantization.marlin_utils.GPTQ_MARLIN_24_SUPPORTED_QUANT_TYPES)
+@pytest.mark.parametrize("group_size", vllm_quantization.marlin_utils.GPTQ_MARLIN_24_SUPPORTED_GROUP_SIZES)
 @pytest.mark.parametrize("mnk_factors", MNK_FACTORS)
 def test_gptq_marlin_24_gemm(k_chunk, n_chunk, quant_type, group_size,
                              mnk_factors):
@@ -373,14 +328,14 @@ def test_gptq_marlin_24_gemm(k_chunk, n_chunk, quant_type, group_size,
     b_weight = rand_data((size_k, size_n))
 
     (w_24_ref, marlin_24_q_w_comp, marlin_24_meta,
-     marlin_24_s) = marlin_24_quantize(b_weight, quant_type, group_size)
+     marlin_24_s) = vllm_quantization.marlin_24_quantize(b_weight, quant_type, group_size)
 
-    workspace_24 = MarlinWorkspace(size_n, GPTQ_MARLIN_24_MIN_THREAD_N,
-                                   GPTQ_MARLIN_24_MAX_PARALLEL)
+    workspace_24 = vllm_quantization.MarlinWorkspace(size_n, vllm_quantization.marlin_utils.GPTQ_MARLIN_24_MIN_THREAD_N,
+                                   vllm_quantization.marlin_utils.GPTQ_MARLIN_24_MAX_PARALLEL)
 
     output_ref = torch.matmul(a_input, w_24_ref)
 
-    opcheck(vllm_quantization._ops.ops.gptq_marlin_24_gemm,
+    opcheck(vllm_quantization.ops.gptq_marlin_24_gemm,
             (a_input, marlin_24_q_w_comp, marlin_24_meta, marlin_24_s,
              workspace_24.scratch, quant_type.id, a_input.shape[0],
              b_weight.shape[1], a_input.shape[1]),
@@ -427,7 +382,7 @@ def test_hqq_marlin_gemm(
     size_k = k_chunk * k_factor
     size_n = n_chunk * n_factor
 
-    quant_type = scalar_types.uint4
+    quant_type = vllm_quantization.scalar_types.uint4
 
     a_input = rand_data((size_m, size_k))
     dev = a_input.device
@@ -439,20 +394,20 @@ def test_hqq_marlin_gemm(
     scale = rand_data((size_n, size_k // group_size))
     zero = rand_data((size_n, size_k // group_size))
 
-    gptq_w_q = gptq_pack(b_weight.transpose(1, 0), 4, size_k, size_n)
+    gptq_w_q = vllm_quantization.gptq_pack(b_weight.transpose(1, 0), 4, size_k, size_n)
 
     sort_indices = torch.empty(0, dtype=torch.int, device=dev)
     marlin_w_q = vllm_quantization.gptq_marlin_repack(gptq_w_q, sort_indices, size_k, size_n,
                                         4).to(dev)
-    marlin_s = marlin_permute_scales(scale.transpose(1, 0), size_k, size_n,
+    marlin_s = vllm_quantization.marlin_permute_scales(scale.transpose(1, 0), size_k, size_n,
                                      group_size).to(dev)
-    marlin_zp = marlin_permute_scales(zero.transpose(1, 0), size_k, size_n,
+    marlin_zp = vllm_quantization.marlin_permute_scales(zero.transpose(1, 0), size_k, size_n,
                                       group_size).to(dev)
 
-    g_idx = marlin_make_empty_g_idx(dev)
-    g_idx_sort_indices = marlin_make_empty_g_idx(dev)
+    g_idx = vllm_quantization.marlin_make_empty_g_idx(dev)
+    g_idx_sort_indices = vllm_quantization.marlin_make_empty_g_idx(dev)
 
-    workspace = marlin_make_workspace_new(b_weight.device)
+    workspace = vllm_quantization.marlin_make_workspace_new(b_weight.device)
 
     output = vllm_quantization.gptq_marlin_gemm(
         a_input,
@@ -494,8 +449,8 @@ def test_hqq_marlin_gemm(
 )
 @pytest.mark.parametrize("k_chunk", MARLIN_K_CHUNKS)
 @pytest.mark.parametrize("n_chunk", MARLIN_N_CHUNKS)
-@pytest.mark.parametrize("num_bits", MARLIN_QQQ_SUPPORTED_NUM_BITS)
-@pytest.mark.parametrize("group_size", MARLIN_QQQ_SUPPORTED_GROUP_SIZES)
+@pytest.mark.parametrize("num_bits", vllm_quantization.marlin_utils.MARLIN_QQQ_SUPPORTED_NUM_BITS)
+@pytest.mark.parametrize("group_size", vllm_quantization.marlin_utils.MARLIN_QQQ_SUPPORTED_GROUP_SIZES)
 @pytest.mark.parametrize("mnk_factors", MNK_FACTORS)
 def test_marlin_qqq_gemm(
     k_chunk,
@@ -522,12 +477,12 @@ def test_marlin_qqq_gemm(
 
     # Quantize weights
     w_ref, marlin_qqq_q_w, marlin_qqq_s_group, marlin_qqq_s_channel = \
-    marlin_qqq_quantize(b_weight, num_bits, group_size)
+    vllm_quantization.marlin_qqq_quantize(b_weight, num_bits, group_size)
 
-    workspace = MarlinWorkspace(size_n, MARLIN_QQQ_MIN_THREAD_N,
-                                MARLIN_QQQ_MAX_PARALLEL)
+    workspace = vllm_quantization.MarlinWorkspace(size_n, vllm_quantization.marlin_utils.MARLIN_QQQ_MIN_THREAD_N,
+                                vllm_quantization.marlin_utils.MARLIN_QQQ_MAX_PARALLEL)
 
-    opcheck(vllm_quantization._ops.ops.marlin_qqq_gemm,
+    opcheck(vllm_quantization.ops.marlin_qqq_gemm,
             (q_a, marlin_qqq_q_w, s_a, marlin_qqq_s_channel,
              marlin_qqq_s_group, workspace.scratch, a_input.shape[0],
              b_weight.shape[1], a_input.shape[1]))
@@ -553,7 +508,7 @@ def test_marlin_qqq_gemm(
 
 
 def test_marlin_gemm_subset_input():
-    quant_type = scalar_types.uint4b8
+    quant_type = vllm_quantization.scalar_types.uint4b8
     group_size = 128
 
     size_m, size_k, size_n = 32, 1024, 2048
@@ -563,11 +518,11 @@ def test_marlin_gemm_subset_input():
     a_input = rand_data((big_m, big_k))[8:size_m + 8, 8:size_k + 8]
     b_weight = rand_data((size_k, size_n))
 
-    w_ref, marlin_q_w, marlin_s, g_idx, sort_indices, _ = marlin_quantize(
+    w_ref, marlin_q_w, marlin_s, g_idx, sort_indices, _ = vllm_quantization.marlin_quantize(
         b_weight, quant_type, group_size, False)
 
-    marlin_zp = marlin_make_empty_g_idx(marlin_s.device)
-    workspace = marlin_make_workspace_new(a_input.device)
+    marlin_zp = vllm_quantization.marlin_make_empty_g_idx(marlin_s.device)
+    workspace = vllm_quantization.marlin_make_workspace_new(a_input.device)
 
     output = vllm_quantization.gptq_marlin_gemm(
         a_input,
@@ -604,9 +559,9 @@ def test_marlin_gemm_opcheck():
     a = torch.rand((size_m, size_n), device='cuda', dtype=torch.float16)
     w = torch.randint(-5, 5, (256, 8192), device='cuda', dtype=torch.int32)
     s = torch.full((32, size_k), 0.125, device='cuda', dtype=torch.float16)
-    wk = MarlinWorkspace(size_n, GPTQ_MARLIN_MIN_THREAD_N,
-                         GPTQ_MARLIN_MAX_PARALLEL).scratch
-    x = vllm_quantization._ops.ops.marlin_gemm(a, w, s, wk, size_m, size_n, size_k)
-    y = vllm_quantization._ops.ops.marlin_gemm(a, w, s, wk, size_m, size_n, size_k)
+    wk = vllm_quantization.MarlinWorkspace(size_n, vllm_quantization.marlin_utils.GPTQ_MARLIN_MIN_THREAD_N,
+                         vllm_quantization.marlin_utils.GPTQ_MARLIN_MAX_PARALLEL).scratch
+    x = vllm_quantization.ops.marlin_gemm(a, w, s, wk, size_m, size_n, size_k)
+    y = vllm_quantization.ops.marlin_gemm(a, w, s, wk, size_m, size_n, size_k)
     torch.testing.assert_close(x, y)
-    opcheck(vllm_quantization._ops.ops.marlin_gemm, (a, w, s, wk, size_m, size_n, size_k))
+    opcheck(vllm_quantization.ops.marlin_gemm, (a, w, s, wk, size_m, size_n, size_k))

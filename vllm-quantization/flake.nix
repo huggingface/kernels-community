@@ -2,7 +2,7 @@
   description = "Flake for vLLM quantization kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels";
+    kernel-builder.url = "github:huggingface/kernels/testing-redesign";
   };
 
   outputs =

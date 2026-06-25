@@ -10,8 +10,8 @@ import random
 import pytest
 import torch
 
-import vllm_quantization
-from vllm_quantization._ops import ops
+import kernels
+vllm_quantization = kernels.get_kernel("kernels-community/vllm-quantization", version=0)
 
 from tests.kernels.utils import baseline_scaled_mm, opcheck, to_fp8, to_int8
 
@@ -100,7 +100,7 @@ def cutlass_fp8_gemm_helper(m: int,
 
     torch.testing.assert_close(out, baseline, rtol=1e-2, atol=1.5e-1)
 
-    opcheck(ops.cutlass_scaled_mm,
+    opcheck(vllm_quantization.ops.cutlass_scaled_mm,
             (out, a, b, scale_a, scale_b, bias))
 
 
@@ -133,7 +133,7 @@ def cutlass_int8_gemm_helper(m: int,
 
     torch.testing.assert_close(out, baseline, rtol=1e-1, atol=1e0)
 
-    opcheck(ops.cutlass_scaled_mm,
+    opcheck(vllm_quantization.ops.cutlass_scaled_mm,
             (out, a, b, scale_a, scale_b, bias))
 
 
@@ -431,11 +431,11 @@ def test_cutlass_int8_azp(m: int, n: int, k: int, out_dtype: torch.dtype,
     torch.testing.assert_close(out, baseline_q, rtol=rtol, atol=atol)
 
     if azp_per_token:
-        opcheck(ops.cutlass_scaled_mm_azp,
+        opcheck(vllm_quantization.ops.cutlass_scaled_mm_azp,
                 (out, aq_i8, bq_i8, scale_a, scale_b, azp_adj_i32, azp_i32,
                  func_bias))
     else:
-        opcheck(ops.cutlass_scaled_mm_azp,
+        opcheck(vllm_quantization.ops.cutlass_scaled_mm_azp,
                 (out, aq_i8, bq_i8, scale_a, scale_b, azp_with_adj_i32, None,
                  func_bias))
 
@@ -516,6 +516,6 @@ def test_cutlass_cuda_graph(per_act_token: bool, per_out_ch: bool):
 
 
 def test_cutlass_support_opcheck():
-    opcheck(ops.cutlass_scaled_mm_supports_fp8, (capability, ))
+    opcheck(vllm_quantization.ops.cutlass_scaled_mm_supports_fp8, (capability, ))
 
 
