@@ -62,21 +62,27 @@ class LigerTiledMLPFunction(torch.autograd.Function):
         mlp_module = ctx.mlp_module
         shards = ctx.shards
 
+        grad_output = grads[0]
+
         x_requires_grad = x.requires_grad
         x = x.detach()
         # detach() unsets x.requires_grad, so restore it
         x.requires_grad_(x_requires_grad)
 
-        # x.shape could be [bs, seqlen, hidden_size] or [seqlen, hidden_size] (moe experts)
-        hidden_size = x.shape[-1]
+        # x.shape could be [bs, seqlen, in_features] or [seqlen, in_features] (moe experts)
+        in_features = x.shape[-1]
+        out_features = grad_output.shape[-1]
         x_shape_orig = x.shape
 
         # flatten bs+seqlen to avoid having stride issues when narrowing into seqlen w/ bs>1
-        x = x.view(-1, hidden_size)
-        incoming_grad = grads[0].view(-1, hidden_size)
+        # NOTE: input and output feature dimensions may differ, e.g.
+        # Linear(in_features, out_features), so flatten x and grad_output with their own last dims.
+        x = x.view(-1, in_features)
+        incoming_grad = grad_output.view(-1, out_features)
         x_grad = torch.zeros_like(x)
 
         x_shards = list(torch.chunk(x, chunks=shards, dim=0))
+        incoming_grad_shards = list(torch.chunk(incoming_grad, chunks=shards, dim=0))
 
         for i, x_shard in enumerate(x_shards):
             x_shard.requires_grad_(x_requires_grad)
@@ -86,7 +92,7 @@ class LigerTiledMLPFunction(torch.autograd.Function):
             shard_offset = i * x_shards[0].shape[0]
 
             x_shard.grad = x_grad.narrow(0, shard_offset, shard_step).view_as(x_shard)
-            incoming_grad_shard = incoming_grad.narrow(0, shard_offset, shard_step).view_as(x_shard)
+            incoming_grad_shard = incoming_grad_shards[i]
 
             with torch.enable_grad():
                 output = fn(mlp_module, x_shard)
@@ -114,9 +120,6 @@ def apply_tiled_mlp(
         x: the input tensor with shape [bs, seqlen, hidden_size] or [seqlen, hidden_size]
         num_shards: number of shards to use. If None, automatically calculated as ceil(seqlen / hidden_size)
         compute_params: list of parameters for DeepSpeed ZeRO optimization
-
-    Returns:
-        output tensor with the same shape as input
     """
     if num_shards is None:
         # x.shape could be [bs, seqlen, hidden_size] or [seqlen, hidden_size]

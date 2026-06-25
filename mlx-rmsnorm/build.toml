@@ -1,7 +1,7 @@
 [general]
 name = "mlx-rmsnorm"
-license = "MIT"
 version = 1
+license = "MIT"
 backends = ["metal"]
 
 [general.hub]

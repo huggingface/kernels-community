@@ -18,7 +18,8 @@ All kernels target Hopper (SM90) FP8 WGMMA instructions and are also compatible 
 
 Neutral entry points that route to the right kernel based on `B.dtype`, `block_size`, and an optional `activation_scale` kwarg:
 
-- `B.dtype == int8` → FP4 path (block dynamic UE8M0).
+- `B.dtype == int8` → FP4 path (`mx` dynamic, UE8M0 group-32).
+- `B.dtype == float8_e4m3fn` with UE8M0 group-32 `Bs` (shape `[..., N, K // 32]`) → MXFP8 (`mx` dynamic).
 - `activation_scale is not None` → block-static FP8 (single-matmul only).
 - `block_size is None` or `[N, K]` → tensor-mode FP8.
 - otherwise → block-dynamic FP8.
@@ -39,9 +40,13 @@ Same as `w8a8_block_dynamic_fp8_matmul` but takes an explicit per-tensor activat
 
 Tensor-scale W8A8 FP8 GEMM. Pre-quantizes `A` via `fp8_act_quant(A, K)` to get a per-row activation scale, then runs the matmul with that and a single per-tensor weight scale `Bs`.
 
-#### `w4a8_block_dynamic_fp4_matmul`
+#### `w4a8_mx_dynamic_fp4_matmul`
 
 W4A8 FP4 GEMM. `B` is packed FP4 (`int8`, two E2M1 codes per byte); `Bs` is UE8M0 with a fixed K-group of 32. `A` is raw bf16/fp16/fp32 — quantized to FP8 (E4M3) inline with its own UE8M0 K-group-32 scales. Uses `tl.dot_scaled` for the scaled MMA. Tile shape `(BLOCK_SIZE_N, BLOCK_SIZE_K)` is autotuned.
+
+#### `w8a8_mx_dynamic_fp8_matmul`
+
+MXFP8 W8A8 GEMM — the FP8 counterpart of the FP4 path. `B` is **unpacked** `float8_e4m3fn`; `Bs` is UE8M0 with a fixed K-group of 32. `A` is raw bf16/fp16/fp32 — quantized to E4M3 inline with its own UE8M0 K-group-32 scales. Both operands feed `tl.dot_scaled` (the hardware MX scaled MMA, Blackwell SM100+), unlike `w8a8_block_dynamic_fp8_matmul` which applies 128×128 scales in software. Handles arbitrary K (the tensor-mode path needs power-of-2 K). Tile shape is autotuned.
 
 ### Batched (`(S, K) + expert_ids → (S, N)`)
 
@@ -49,7 +54,8 @@ Per-row expert dispatch for MoE decode. Each program handles one routed token, r
 
 - `w8a8_block_dynamic_fp8_matmul_batched`
 - `w8a8_tensor_dynamic_fp8_matmul_batched`
-- `w4a8_block_dynamic_fp4_matmul_batched`
+- `w4a8_mx_dynamic_fp4_matmul_batched`
+- `w8a8_mx_dynamic_fp8_matmul_batched`
 
 ### Grouped (`(S, K) + offsets + tokens_per_expert → (S, N)`)
 
@@ -57,7 +63,8 @@ Grouped GEMM for MoE prefill: tokens are pre-sorted by expert. Each M-tile finds
 
 - `w8a8_block_dynamic_fp8_matmul_grouped`
 - `w8a8_tensor_dynamic_fp8_matmul_grouped`
-- `w4a8_block_dynamic_fp4_matmul_grouped`
+- `w4a8_mx_dynamic_fp4_matmul_grouped`
+- `w8a8_mx_dynamic_fp8_matmul_grouped`
 
 ## Naming convention
 
@@ -70,9 +77,9 @@ w<W>a<A>_<weight_scale_layout>_<activation_quant>_<weight_dtype>_matmul[_batched
 | Axis                    | Values                                                                                                         |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------- |
 | `w<W>` / `a<A>`         | weight / activation bit-widths (`w8a8`, `w4a8`)                                                                |
-| `<weight_scale_layout>` | `block` (per-`block_n × block_k` weight scale) or `tensor` (one scalar)                                        |
+| `<weight_scale_layout>` | `block` (per-`block_n × block_k` weight scale), `tensor` (one scalar), or `mx` (UE8M0 scale per 32-element K-group, via `tl.dot_scaled`) |
 | `<activation_quant>`    | `dynamic` (kernel computes per-K-block / per-row scale inline) or `static` (caller passes a per-tensor scalar) |
-| `<weight_dtype>`        | `fp8` (`float8_e4m3fn`) or `fp4` (packed E2M1)                                                                 |
+| `<weight_dtype>`        | `fp8` (`float8_e4m3fn`, unpacked) or `fp4` (packed E2M1)                                                       |
 
 The dispatch suffix selects the input layout:
 
@@ -84,7 +91,8 @@ Not every combination is implemented — current set:
 
 - `w8a8_block_static_fp8_matmul` (single-matmul only)
 - `w8a8_block_dynamic_fp8_matmul[_batched|_grouped]`
-- `w4a8_block_dynamic_fp4_matmul[_batched|_grouped]`
+- `w4a8_mx_dynamic_fp4_matmul[_batched|_grouped]`
+- `w8a8_mx_dynamic_fp8_matmul[_batched|_grouped]`
 - `w8a8_tensor_dynamic_fp8_matmul[_batched|_grouped]`
 
 For convenience, neutral dispatchers `matmul`, `matmul_batched`, `matmul_grouped` route to the right kernel based on `B.dtype`, `block_size`, and the optional `activation_scale` kwarg.

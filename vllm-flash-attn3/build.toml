@@ -1,14 +1,12 @@
 [general]
 name = "vllm-flash-attn3"
-license = "Apache-2.0"
 version = 1
+license = "Apache-2.0"
 backends = ["cuda"]
 
 [general.cuda]
 minver = "12.8"
-# CUDA 13.2 builds crash in ptxas, 13.0 build is compatible.
-maxver = "13.0"
-
+maxver = "13"
 
 [general.hub]
 repo-id = "kernels-community/vllm-flash-attn3"
@@ -60,9 +58,7 @@ src = [
 
 [kernel.flash_attn_sm90]
 backend = "cuda"
-cuda-capabilities = [
-    "9.0a",
-]
+cuda-capabilities = ["9.0a"]
 cuda-flags = [
     "-O3",
     "-std=c++17",
@@ -412,9 +408,7 @@ src = [
 
 [kernel.flash_attn_sm80]
 backend = "cuda"
-cuda-capabilities = [
-    "8.0",
-]
+cuda-capabilities = ["8.0"]
 cuda-flags = [
     "-O3",
     "-std=c++17",

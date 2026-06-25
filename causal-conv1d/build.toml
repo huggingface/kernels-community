@@ -1,9 +1,8 @@
 [general]
 name = "causal-conv1d"
-license = "BSD-3-Clause"
 version = 1
+license = "BSD-3-Clause"
 backends = ["cuda"]
-
 
 [general.hub]
 repo-id = "kernels-community/causal-conv1d"

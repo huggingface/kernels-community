@@ -1,18 +1,55 @@
 [general]
 name = "rotary"
-license = "BSD-3-Clause"
 version = 1
+license = "BSD-3-Clause"
 backends = [
     "cuda",
     "xpu",
+    "cpu",
 ]
-
 
 [general.hub]
 repo-id = "kernels-community/rotary"
 
 [torch]
 src = ["torch-ext/torch_binding.cpp"]
+
+[kernel.rotary_cpu_avx512]
+backend = "cpu"
+cxx-flags = [
+    "-O3",
+    "-fopenmp",
+    "-mf16c",
+    "-mavx512f",
+    "-mavx512bf16",
+    "-mavx512vl",
+    "-mavx512dq",
+    "-mavx512bw",
+    "-DCPU_CAPABILITY_AVX512",
+    "-DCPU_CAPABILITY=AVX512",
+]
+depends = ["torch"]
+include = ["rotary-cpu"]
+src = [
+    "rotary-cpu/rotary_avx512.cpp",
+    "rotary-cpu/rotary_avx512.hpp",
+]
+
+[kernel.rotary_cpu]
+backend = "cpu"
+depends = ["torch"]
+include = ["rotary-cpu"]
+src = [
+    "rotary-cpu/rotary_cpu_torch.cpp",
+    "rotary-cpu/rotary_cpu.cpp",
+    "rotary-cpu/rotary_cpu.hpp",
+    "rotary-cpu/cpu_features.hpp",
+]
+
+[kernel.activation]
+backend = "cuda"
+depends = ["torch"]
+src = ["rotary/rotary_cuda.cu"]
 
 [kernel.rotary_xpu]
 backend = "xpu"
@@ -21,8 +58,3 @@ src = [
     "rotary-xpu/rotary_xpu.cpp",
     "rotary-xpu/rotary_xpu.hpp",
 ]
-
-[kernel.activation]
-backend = "cuda"
-depends = ["torch"]
-src = ["rotary/rotary_cuda.cu"]
