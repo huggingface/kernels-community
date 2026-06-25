@@ -49,5 +49,9 @@ def apply_rotary_transformers(
     return q_rotated, k_rotated
 
 
+# Add torch compile support for functions
+apply_rotary_transformers.can_torch_compile = True
+
+
 # Keeping `apply_rotary` and `apply_rotary_transformers` for BC
 __all__ = ["apply_rotary", "apply_rotary_transformers", "layers"]
