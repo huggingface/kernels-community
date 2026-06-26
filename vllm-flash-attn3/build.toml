@@ -12,10 +12,9 @@ maxver = "13"
 repo-id = "kernels-community/vllm-flash-attn3"
 
 [torch]
+stable-abi = "2.9"
 src = [
-    "torch-ext/pytorch_shim.h",
-    "torch-ext/torch_binding.cpp",
-    "torch-ext/torch_binding.h",
+    "flash-attn/flash_api_stable.cpp",
 ]
 
 [kernel.flash_attn]
@@ -36,14 +35,13 @@ cuda-flags = [
     "--use_fast_math",
     "-DNDEBUG",
 ]
-cxx-flags = ["-DFLASHATTENTION_DISABLE_PYBIND"]
+
 depends = [
     "torch",
     "cutlass_3_9",
 ]
 src = [
     "flash-attn/cuda_check.h",
-    "flash-attn/flash_api.cpp",
     "flash-attn/flash_fwd_combine.cu",
     "flash-attn/flash_fwd_combine_kernel.h",
     "flash-attn/flash_fwd_combine_launch_template.h",
