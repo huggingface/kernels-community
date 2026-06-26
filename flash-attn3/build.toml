@@ -11,7 +11,11 @@ maxver = "13"
 [general.hub]
 repo-id = "kernels-community/flash-attn3"
 
-[torch-noarch]
+[torch]
+stable-abi = "2.9"
+src = [
+    "flash-attn/flash_api_stable.cpp",
+]
 
 [kernel.flash_attn_sm90]
 backend = "cuda"
