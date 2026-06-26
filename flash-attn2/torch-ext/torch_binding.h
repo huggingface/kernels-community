@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vector>
+
 #include <torch/torch.h>
 
 // std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
