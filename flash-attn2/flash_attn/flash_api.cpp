@@ -5,6 +5,11 @@
 // Flash-Attention 2 CUDA bindings, ported to the Torch stable ABI. Dropout is
 // unsupported here: the CUDA RNG generator is not exposed by the stable ABI.
 
+// CUDA vector types (int4, float4, ...) must be visible before cutlass headers,
+// which use them at namespace scope. flash_api.cpp is host-compiled (g++), so
+// nvcc's implicit <vector_types.h> is not available here.
+#include <cuda_runtime.h>
+
 #include <cutlass/numeric_types.h>
 
 #include "src/namespace_config.h"
@@ -530,7 +535,7 @@ mha_fwd(Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple
         run_mha_fwd(params, stream);
     } else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
-        out.zero_();
+        torch::stable::fill_(out, 0);
         torch::stable::fill_(softmax_lse, std::numeric_limits<float>::infinity());
     }
 
@@ -692,9 +697,9 @@ mha_varlen_fwd(Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{
     }
 
     if (zero_tensors) {
-        out.zero_();
+        torch::stable::fill_(out, 0);
         torch::stable::fill_(softmax_lse, -std::numeric_limits<float>::infinity());
-        if (return_softmax) {p.zero_();}
+        if (return_softmax) {torch::stable::fill_(p, 0);}
     }
 
     Flash_fwd_params params;
@@ -767,7 +772,7 @@ mha_varlen_fwd(Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{
         run_mha_fwd(params, stream, paged_KV);
     } else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
-        out.zero_();
+        torch::stable::fill_(out, 0);
         torch::stable::fill_(softmax_lse, std::numeric_limits<float>::infinity());
     }
 
@@ -980,9 +985,9 @@ mha_bwd(const Tensor &dout,  // batch_size x seqlen_q x num_heads, x multiple_of
         launch(params, stream);
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
-        dk_expanded.zero_();
-        dv_expanded.zero_();
-        softmax_d.zero_();
+        torch::stable::fill_(dk_expanded, 0);
+        torch::stable::fill_(dv_expanded, 0);
+        torch::stable::fill_(softmax_d, 0);
     }
 
     // For MQA/GQA we need to sum dK and dV across the groups
@@ -1154,10 +1159,10 @@ mha_varlen_bwd(const Tensor &dout,  // total_q x num_heads, x head_size
     }
 
     if( zero_tensors ) {
-        dq.zero_();
-        dk_expanded.zero_();
-        dv_expanded.zero_();
-        softmax_d.zero_();
+        torch::stable::fill_(dq, 0);
+        torch::stable::fill_(dk_expanded, 0);
+        torch::stable::fill_(dv_expanded, 0);
+        torch::stable::fill_(softmax_d, 0);
     }
 
     Flash_bwd_params params;
@@ -1205,9 +1210,9 @@ mha_varlen_bwd(const Tensor &dout,  // total_q x num_heads, x head_size
         launch(params, stream);
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
-        dk_expanded.zero_();
-        dv_expanded.zero_();
-        softmax_d.zero_();
+        torch::stable::fill_(dk_expanded, 0);
+        torch::stable::fill_(dv_expanded, 0);
+        torch::stable::fill_(softmax_d, 0);
     }
 
     // For MQA/GQA we need to sum dK and dV across the groups

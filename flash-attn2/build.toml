@@ -182,6 +182,7 @@ depends = [
 src = [
     "flash_attn/flash_api.cpp",
     "flash_attn/src/philox_unpack.cuh",
+    "flash_attn/src/cuda_check.h",
     "flash_attn/src/namespace_config.h",
     "flash_attn/src/hardware_info.h",
     "flash_attn/src/flash.h",

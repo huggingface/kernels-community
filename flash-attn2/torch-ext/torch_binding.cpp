@@ -1,7 +1,12 @@
+// CUDA registers via the Torch stable ABI in torch_binding_stable.cpp /
+// flash_attn/flash_api.cpp; the ATen headers below are only available (and
+// only needed) for the CPU and XPU backends.
+#if !defined(CUDA_KERNEL)
 #include <torch/library.h>
 
 #include "registration.h"
 #include "torch_binding.h"
+#endif
 
 // TODO: Add all of the functions listed
 // PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
