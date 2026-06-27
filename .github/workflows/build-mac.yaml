@@ -97,13 +97,13 @@ jobs:
       # When building for a PR, check out the PR head; otherwise use default branch.
       - name: Checkout PR branch
         if: inputs.pr_number != ''
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: refs/pull/${{ inputs.pr_number }}/head
           fetch-depth: 0
       - name: Checkout default branch
         if: inputs.pr_number == ''
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Nix toolchain + binary cache setup.
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
@@ -114,7 +114,7 @@ jobs:
             sandbox = relaxed
       - name: Nix info
         run: nix-shell -p nix-info --run "nix-info -m"
-      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: huggingface
         env:
@@ -167,7 +167,7 @@ jobs:
 
       - name: Install Cosign
         if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr'
-        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       # Sign metadata.json for each built variant.
       - name: Sign kernel metadata
