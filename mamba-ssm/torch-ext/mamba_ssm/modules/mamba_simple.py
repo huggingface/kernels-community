@@ -6,16 +6,11 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange, repeat
 from torch import Tensor
 
-from einops import rearrange, repeat
-
-from ..ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn
-
-try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-except ImportError:
-    causal_conv1d_fn, causal_conv1d_update = None, None
+from .._causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+from ..ops.selective_scan_interface import mamba_inner_fn, selective_scan_fn
 
 try:
     from ..ops.triton.selective_state_update import selective_state_update
@@ -150,9 +145,7 @@ class Mamba(nn.Module):
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
         if (
-            self.use_fast_path
-            and causal_conv1d_fn is not None
-            and inference_params is None
+            self.use_fast_path and inference_params is None
         ):  # Doesn't support outputting the states
             out = mamba_inner_fn(
                 xz,
@@ -178,10 +171,9 @@ class Mamba(nn.Module):
                 conv_state.copy_(
                     F.pad(x, (self.d_conv - x.shape[-1], 0))
                 )  # Update state (B D W)
-            if causal_conv1d_fn is None:
+            if self.activation not in ["silu", "swish"]:
                 x = self.act(self.conv1d(x)[..., :seqlen])
             else:
-                assert self.activation in ["silu", "swish"]
                 x = causal_conv1d_fn(
                     x=x,
                     weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
@@ -222,32 +214,20 @@ class Mamba(nn.Module):
 
     def step(self, hidden_states, conv_state, ssm_state):
         dtype = hidden_states.dtype
-        assert (
-            hidden_states.shape[1] == 1
-        ), "Only support decoding with 1 token at a time for now"
+        assert hidden_states.shape[1] == 1, (
+            "Only support decoding with 1 token at a time for now"
+        )
         xz = self.in_proj(hidden_states.squeeze(1))  # (B 2D)
         x, z = xz.chunk(2, dim=-1)  # (B D)
 
         # Conv step
-        if causal_conv1d_update is None:
-            conv_state.copy_(
-                torch.roll(conv_state, shifts=-1, dims=-1)
-            )  # Update state (B D W)
-            conv_state[:, :, -1] = x
-            x = torch.sum(
-                conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
-            )  # (B D)
-            if self.conv1d.bias is not None:
-                x = x + self.conv1d.bias
-            x = self.act(x).to(dtype=dtype)
-        else:
-            x = causal_conv1d_update(
-                x,
-                conv_state,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
-                self.activation,
-            )
+        x = causal_conv1d_update(
+            x,
+            conv_state,
+            rearrange(self.conv1d.weight, "d 1 w -> d w"),
+            self.conv1d.bias,
+            self.activation,
+        )
 
         x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
         dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
