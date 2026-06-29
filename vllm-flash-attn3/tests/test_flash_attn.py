@@ -13,8 +13,8 @@ try:
 except ImportError:
     apply_rotary_emb = None
 
-from padding import pad_input, unpad_input
-from test_util import (
+from .padding import pad_input, unpad_input
+from .test_util import (
     attention_ref,
     generate_qkv,
     generate_random_padding_mask,
