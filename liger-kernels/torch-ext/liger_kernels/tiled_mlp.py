@@ -44,6 +44,7 @@ class LigerTiledMLPFunction(torch.autograd.Function):
         ctx.fn = fn
         ctx.mlp_module = mlp_module
         ctx.shards = shards
+        ctx.compute_params = compute_params
         ctx.save_for_backward(x)
 
         # x.shape could be [bs, seqlen, hidden_size] or [seqlen, hidden_size] (moe experts)
@@ -61,6 +62,7 @@ class LigerTiledMLPFunction(torch.autograd.Function):
         (x,) = ctx.saved_tensors
         mlp_module = ctx.mlp_module
         shards = ctx.shards
+        compute_params = ctx.compute_params
 
         grad_output = grads[0]
 
@@ -93,6 +95,15 @@ class LigerTiledMLPFunction(torch.autograd.Function):
 
             x_shard.grad = x_grad.narrow(0, shard_offset, shard_step).view_as(x_shard)
             incoming_grad_shard = incoming_grad_shards[i]
+
+            # Under ZeRO-3 each shard's recompute would queue the same parameter for gradient reduction,
+            # so defer DeepSpeed's reduction until the last shard has accumulated into param.grad. The
+            # ds_id attribute marks a ZeRO-3 partitioned parameter, leaving other backends untouched.
+            if compute_params:
+                is_last_shard = i + 1 == len(x_shards)
+                for param in compute_params:
+                    if hasattr(param, "ds_id"):
+                        param.ds_grad_is_ready = is_last_shard
 
             with torch.enable_grad():
                 output = fn(mlp_module, x_shard)
@@ -129,6 +140,15 @@ def apply_tiled_mlp(
 
     # Ensure num_shards is at least 1
     num_shards = max(1, num_shards)
+
+    # All ranks must run the same number of shards: a sharded-parameter backend (DeepSpeed ZeRO-3, FSDP)
+    # gathers weights inside each shard's recompute, so a rank that runs fewer shards stops participating
+    # in those collectives and deadlocks the others. Harmonize on the per-rank maximum.
+    dist = torch.distributed
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        num_shards_tensor = torch.tensor(num_shards, device=x.device)
+        dist.all_reduce(num_shards_tensor, op=dist.ReduceOp.MAX)
+        num_shards = int(num_shards_tensor.item())
 
     return LigerTiledMLPFunction.apply(
         fn,
