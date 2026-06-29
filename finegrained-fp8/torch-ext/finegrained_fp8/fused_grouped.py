@@ -204,7 +204,7 @@ def _grouped_routing(expert_ids: torch.Tensor, num_experts: int, num_top_k: int)
 # three memory modes; get_mxfp_autotuning_configs drops the device-inapplicable descriptor
 # flavor (host on XPU, device on CUDA).
 _MX_COMPUTE_MODES = ("dot_scaled", "dot")
-_MX_MEMORY_MODES = ("host_descriptor", "device_descriptor", "block_ptr")
+_MX_MEMORY_MODES = ("host_descriptor", "device_descriptor", "pointer")
 
 
 # ── Block-dynamic FP8 ────────────────────────────────────────────────────────
@@ -266,37 +266,26 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
 
         token = tl.load(PermToken + offs_global_m * stride_pt, mask=row_mask, other=0)
         a_ptrs = Hidden + token[:, None] * stride_h_t + offs_k[None, :] * stride_h_k
-        gate_ptr = tl.make_block_ptr(
-            base=GateUp + expert_id * stride_gu_e,
-            shape=(HIDDEN_DIM, INTERMEDIATE_DIM * 2),
-            strides=(stride_gu_k, stride_gu_n),
-            offsets=(0, pid_n * BLOCK_SIZE_N),
-            block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
-            order=(0, 1),
+        gate_ptr = (
+            GateUp
+            + expert_id * stride_gu_e
+            + tl.arange(0, BLOCK_SIZE_K)[:, None] * stride_gu_k
+            + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :] * stride_gu_n
         )
-        up_ptr = tl.make_block_ptr(
-            base=GateUp + expert_id * stride_gu_e,
-            shape=(HIDDEN_DIM, INTERMEDIATE_DIM * 2),
-            strides=(stride_gu_k, stride_gu_n),
-            offsets=(0, INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N),
-            block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
-            order=(0, 1),
+        up_ptr = (
+            GateUp
+            + expert_id * stride_gu_e
+            + tl.arange(0, BLOCK_SIZE_K)[:, None] * stride_gu_k
+            + (INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[
+                None, :
+            ]
+            * stride_gu_n
         )
-        gate_s_ptr = tl.make_block_ptr(
-            base=GateUpScale + expert_id * stride_gus_e,
-            shape=(2 * num_n_tiles, HIDDEN_DIM // BLOCK_SIZE_K),
-            strides=(stride_gus_n, stride_gus_k),
-            offsets=(pid_n, 0),
-            block_shape=(1, 1),
-            order=(1, 0),
-        )
-        up_s_ptr = tl.make_block_ptr(
-            base=GateUpScale + expert_id * stride_gus_e,
-            shape=(2 * num_n_tiles, HIDDEN_DIM // BLOCK_SIZE_K),
-            strides=(stride_gus_n, stride_gus_k),
-            offsets=(num_n_tiles + pid_n, 0),
-            block_shape=(1, 1),
-            order=(1, 0),
+        gate_s_ptr = GateUpScale + expert_id * stride_gus_e + pid_n * stride_gus_n
+        up_s_ptr = (
+            GateUpScale
+            + expert_id * stride_gus_e
+            + (num_n_tiles + pid_n) * stride_gus_n
         )
 
         acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -311,10 +300,10 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
             acc_gate += tl.dot(a, w_gate) * a_s[:, None] * w_s_gate
             acc_up += tl.dot(a, w_up) * a_s[:, None] * w_s_up
             a_ptrs += BLOCK_SIZE_K * stride_h_k
-            gate_ptr = tl.advance(gate_ptr, (BLOCK_SIZE_K, 0))
-            up_ptr = tl.advance(up_ptr, (BLOCK_SIZE_K, 0))
-            gate_s_ptr = tl.advance(gate_s_ptr, (0, 1))
-            up_s_ptr = tl.advance(up_s_ptr, (0, 1))
+            gate_ptr += BLOCK_SIZE_K * stride_gu_k
+            up_ptr += BLOCK_SIZE_K * stride_gu_k
+            gate_s_ptr += stride_gus_k
+            up_s_ptr += stride_gus_k
 
         intermediate = glu(
             acc_gate, acc_up, ACT_FN, SIMULATE_UNFUSED, Hidden.dtype.element_ty
@@ -390,22 +379,14 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
         )
         offs_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
 
-        w_down_ptr = tl.make_block_ptr(
-            base=Down + expert_id * stride_down_e,
-            shape=(INTERMEDIATE_DIM, HIDDEN_DIM),
-            strides=(stride_down_i, stride_down_h),
-            offsets=(0, pid_h * BLOCK_SIZE_H),
-            block_shape=(BLOCK_SIZE_I, BLOCK_SIZE_H),
-            order=(0, 1),
+        w_down_ptr = (
+            Down
+            + expert_id * stride_down_e
+            + tl.arange(0, BLOCK_SIZE_I)[:, None] * stride_down_i
+            + (pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H))[None, :]
+            * stride_down_h
         )
-        ws_down_ptr = tl.make_block_ptr(
-            base=DownScale + expert_id * stride_downs_e,
-            shape=(HIDDEN_DIM // BLOCK_SIZE_H, NUM_I_TILES),
-            strides=(stride_downs_h, stride_downs_i),
-            offsets=(pid_h, 0),
-            block_shape=(1, 1),
-            order=(1, 0),
-        )
+        ws_down_ptr = DownScale + expert_id * stride_downs_e + pid_h * stride_downs_h
 
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_H), dtype=tl.float32)
         for i_tile in range(0, NUM_I_TILES):
@@ -425,8 +406,8 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
             w_s_down = decode_ue8m0_scale(tl.load(ws_down_ptr))
             w_down = tl.load(w_down_ptr)
             acc += tl.dot(inter, w_down) * inter_s[:, None] * w_s_down
-            w_down_ptr = tl.advance(w_down_ptr, (BLOCK_SIZE_I, 0))
-            ws_down_ptr = tl.advance(ws_down_ptr, (0, 1))
+            w_down_ptr += BLOCK_SIZE_I * stride_down_i
+            ws_down_ptr += stride_downs_i
 
         if SIMULATE_UNFUSED:
             acc = acc.to(ProjOut.dtype.element_ty).to(tl.float32)
@@ -572,7 +553,7 @@ def _set_gate_up_descriptor(nargs):
     kernel (the placeholder box survives → all but BN=32,BK=32 configs fail the reshape). An
     in-place edit of the passed object propagates to both compile-time specialization and the
     launch-time tensor-map fill. ``shape``/``strides`` are already correct from the wrapper's
-    ``from_tensor`` placeholder; only the per-config box changes. No-op unless MEMORY_MODE is host_descriptor (block_ptr /
+    ``from_tensor`` placeholder; only the per-config box changes. No-op unless MEMORY_MODE is host_descriptor (pointer /
     device_descriptor don't use the host-built descriptor)."""
     if nargs["MEMORY_MODE"] != "host_descriptor":
         return
@@ -657,23 +638,19 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
 
         # Load gate (row 2e) + up (row 2e+1) of the (2E, I, H) view as ONE combined tile, then
         # split — this is the shared loop. MEMORY_MODE picks the LOAD only (decoupled from COMPUTE_MODE):
-        # a host/device descriptor (TMA on NVIDIA) vs a rank-3 make_block_ptr stride trick. COMPUTE_MODE picks the compute on the
+        # a host/device descriptor (TMA on NVIDIA) vs explicit rank-3 pointers. COMPUTE_MODE picks the compute on the
         # loaded tile: scaled-MMA (dot_scaled) or fp8 dot + per-group software rescale (dot).
         gu_row = expert_id * 2
         # (E, 2I, H//vpb) reinterpreted as (2E, I, H//vpb); host_descriptor uses the passed
-        # GateUpDescriptor, device_descriptor builds one in-kernel, block_ptr a rank-3 view.
-        if MEMORY_MODE == "block_ptr":
-            gu_bptr = tl.make_block_ptr(
-                base=GateUp,
-                shape=(
-                    2 * NUM_EXPERTS,
-                    INTERMEDIATE_DIM,
-                    HIDDEN_DIM // VALUES_PER_BYTE,
-                ),
-                strides=(INTERMEDIATE_DIM * stride_gu_n, stride_gu_n, stride_gu_k),
-                offsets=(gu_row, n_off, 0),
-                block_shape=(2, BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE),
-                order=(2, 1, 0),
+        # GateUpDescriptor, device_descriptor builds one in-kernel, pointer indexes it directly.
+        if MEMORY_MODE == "pointer":
+            gu_ptr = (
+                GateUp
+                + (gu_row + tl.arange(0, 2))[:, None, None]
+                * (INTERMEDIATE_DIM * stride_gu_n)
+                + (n_off + tl.arange(0, BLOCK_SIZE_N))[None, :, None] * stride_gu_n
+                + tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)[None, None, :]
+                * stride_gu_k
             )
         elif MEMORY_MODE == "device_descriptor":
             gu_desc = tl.make_tensor_descriptor(
@@ -686,25 +663,13 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
                 strides=(INTERMEDIATE_DIM * stride_gu_n, stride_gu_n, stride_gu_k),
                 block_shape=(2, BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE),
             )
-        gu_scale_bptr = tl.make_block_ptr(
-            base=GateUpScale
-            + expert_id * stride_gus_e,  # (E, 2I, H//32) as (2, I, H//32) per expert
-            shape=(2, INTERMEDIATE_DIM, HIDDEN_DIM // SCALE_GROUP_K),
-            strides=(INTERMEDIATE_DIM * stride_gus_n, stride_gus_n, stride_gus_k),
-            offsets=(0, n_off, 0),
-            block_shape=(2, BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_K),
-            order=(2, 1, 0),
+        gu_scale_ptr = (
+            GateUpScale
+            + expert_id * stride_gus_e
+            + tl.arange(0, 2)[:, None, None] * (INTERMEDIATE_DIM * stride_gus_n)
+            + (n_off + tl.arange(0, BLOCK_SIZE_N))[None, :, None] * stride_gus_n
+            + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, None, :] * stride_gus_k
         )
-        # gate∪up loaded combined as [2, BN, K] then reshaped to [2*BN, K] for ONE dot — the
-        # fused MMA is ~1.2-1.5x faster than two separate dots. KNOWN ISSUE (unresolved): under
-        # TMA + dot_scaled this has hit a rare, non-deterministic "misaligned address" on Blackwell
-        # at large shapes (Triton #2836 / tcgen05-scaled-MMA class). It vanishes under
-        # CUDA_LAUNCH_BLOCKING + compute-sanitizer and would not reproduce across ~16 clean runs,
-        # so NO fix is verified. Unconfirmed leads (the crash never re-fired to A/B against):
-        # tl.split into two [BN,K] dots avoids the reshape but is ~1.2-1.5x slower (correct at the
-        # one deterministic BN=256 case, untested vs the flaky crash); disallow_acc_multi_buffer=True
-        # mirrors the working bf16 path (A/B was inconclusive). Autotuner falls back to notma when
-        # TMA isn't faster, so steady state is usually unaffected.
         acc = tl.zeros((BLOCK_SIZE_M, 2 * BLOCK_SIZE_N), dtype=tl.float32)
         for k_off in tl.range(0, HIDDEN_DIM, BLOCK_SIZE_K):
             a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
@@ -723,16 +688,13 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
                 )
             else:
                 gu = tl.reshape(
-                    tl.load(gu_bptr),
+                    tl.load(gu_ptr),
                     [2 * BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE],
                 )
-                gu_bptr = tl.advance(gu_bptr, (0, 0, BLOCK_SIZE_K // VALUES_PER_BYTE))
+                gu_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_gu_k
             gu_scale = tl.reshape(
-                tl.load(gu_scale_bptr),
+                tl.load(gu_scale_ptr + (k_off // SCALE_GROUP_K) * stride_gus_k),
                 [2 * BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_K],
-            )
-            gu_scale_bptr = tl.advance(
-                gu_scale_bptr, (0, 0, BLOCK_SIZE_K // SCALE_GROUP_K)
             )
             gu_t = tl.trans(
                 gu
@@ -871,27 +833,23 @@ def mxfp_dynamic_moe_grouped_down_kernel(
             + offs_sf[None, :] * stride_is_n
         )
         n_off = pid_n * BLOCK_SIZE_N
-        ws_down_ptr = tl.make_block_ptr(
-            base=DownScale + expert_id * stride_downs_e,
-            shape=(HIDDEN_DIM, INTERMEDIATE_DIM // SCALE_GROUP_K),
-            strides=(stride_downs_n, stride_downs_k),
-            offsets=(n_off, 0),
-            block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_K),
-            order=(1, 0),
+        ws_down_ptr = (
+            DownScale
+            + expert_id * stride_downs_e
+            + (n_off + tl.arange(0, BLOCK_SIZE_N))[:, None] * stride_downs_n
+            + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, :] * stride_downs_k
         )
 
         # Down weight tile [BK//vpb, BN] loaded once per K-chunk: MEMORY_MODE picks the LOAD (a
-        # host/device descriptor over the (E*H, I//vpb) view vs a make_block_ptr), COMPUTE_MODE
+        # host/device descriptor over the (E*H, I//vpb) view vs explicit pointers), COMPUTE_MODE
         # picks the compute. Scales stay a pointer load (a descriptor needs >=16B inner; the
         # BK//32 row is too narrow).
-        if MEMORY_MODE == "block_ptr":
-            w_down_ptr = tl.make_block_ptr(
-                base=Down + expert_id * stride_down_e,
-                shape=(INTERMEDIATE_DIM // VALUES_PER_BYTE, HIDDEN_DIM),
-                strides=(stride_down_k, stride_down_n),
-                offsets=(0, n_off),
-                block_shape=(BLOCK_SIZE_K // VALUES_PER_BYTE, BLOCK_SIZE_N),
-                order=(0, 1),
+        if MEMORY_MODE == "pointer":
+            w_down_ptr = (
+                Down
+                + expert_id * stride_down_e
+                + tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)[:, None] * stride_down_k
+                + (n_off + tl.arange(0, BLOCK_SIZE_N))[None, :] * stride_down_n
             )
         elif MEMORY_MODE == "device_descriptor":
             down_desc = tl.make_tensor_descriptor(
@@ -924,10 +882,8 @@ def mxfp_dynamic_moe_grouped_down_kernel(
                 )
             else:
                 w = tl.load(w_down_ptr)
-                w_down_ptr = tl.advance(
-                    w_down_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0)
-                )
-            w_scale = tl.load(ws_down_ptr)
+                w_down_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_down_k
+            w_scale = tl.load(ws_down_ptr + (k_off // SCALE_GROUP_K) * stride_downs_k)
             acc = mx_compute(
                 acc,
                 a,
@@ -943,7 +899,6 @@ def mxfp_dynamic_moe_grouped_down_kernel(
             )
             a_ptrs += BLOCK_SIZE_K * stride_int_n
             as_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_is_n
-            ws_down_ptr = tl.advance(ws_down_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
 
         if SIMULATE_UNFUSED:
             acc = acc.to(ProjOut.dtype.element_ty).to(tl.float32)
@@ -1007,7 +962,7 @@ def mxfp_dynamic_moe_grouped(
     # Host-built descriptors for host_descriptor mode: views (not reshapes) of the weight
     # buffers — gate_up (E, 2I, H/vpb) → (2E, I, H/vpb) so one [2, BN, BK/vpb] box loads gate
     # (row 2e) + up (2e+1); down (E, H, I/vpb) → (E*H, I/vpb), one [BN, BK/vpb] box per (expert,
-    # hidden-tile). Cheap to build, so always created (device_descriptor/block_ptr ignore them).
+    # hidden-tile). Cheap to build, so always created (device_descriptor/pointer ignore them).
     gate_up_2e = gate_up_proj_u8.view(
         2 * gate_up_proj_u8.size(0), INTERMEDIATE_DIM, gate_up_proj_u8.size(2)
     )

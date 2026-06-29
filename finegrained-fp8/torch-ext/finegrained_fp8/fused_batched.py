@@ -109,47 +109,29 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     # uninit; the down kernel writes zeros for this row, so the output stays well-defined.
     if expert_id >= NUM_EXPERTS:
         return
-    a_ptr = tl.make_block_ptr(
-        base=HiddenStates,
-        shape=(num_routed_tokens // NUM_TOP_K, HIDDEN_DIM),
-        strides=(stride_a_m, stride_a_k),
-        offsets=(token.to(tl.int32), 0),
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
-        order=(1, 0),
+    a_ptr = (
+        HiddenStates
+        + (token + tl.arange(0, BLOCK_SIZE_M))[:, None] * stride_a_m
+        + tl.arange(0, BLOCK_SIZE_K)[None, :] * stride_a_k
     )
-
-    b_gate_ptr = tl.make_block_ptr(
-        base=GateUp + expert_id * stride_gu_e,
-        shape=(HIDDEN_DIM, INTERMEDIATE_DIM * 2),
-        strides=(stride_gu_k, stride_gu_n),
-        offsets=(0, pid_n * BLOCK_SIZE_N),
-        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
-        order=(0, 1),
+    b_gate_ptr = (
+        GateUp
+        + expert_id * stride_gu_e
+        + tl.arange(0, BLOCK_SIZE_K)[:, None] * stride_gu_k
+        + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :] * stride_gu_n
     )
-    b_up_ptr = tl.make_block_ptr(
-        base=GateUp + expert_id * stride_gu_e,
-        shape=(HIDDEN_DIM, INTERMEDIATE_DIM * 2),
-        strides=(stride_gu_k, stride_gu_n),
-        offsets=(0, INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N),
-        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
-        order=(0, 1),
+    b_up_ptr = (
+        GateUp
+        + expert_id * stride_gu_e
+        + tl.arange(0, BLOCK_SIZE_K)[:, None] * stride_gu_k
+        + (INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[
+            None, :
+        ]
+        * stride_gu_n
     )
-
-    bs_gate_ptr = tl.make_block_ptr(
-        base=GateUpScale + expert_id * stride_gus_e,
-        shape=(2 * NUM_N_TILES, HIDDEN_DIM // BLOCK_SIZE_K),
-        strides=(stride_gus_n, stride_gus_k),
-        offsets=(pid_n, 0),
-        block_shape=(1, 1),
-        order=(1, 0),
-    )
-    bs_up_ptr = tl.make_block_ptr(
-        base=GateUpScale + expert_id * stride_gus_e,
-        shape=(2 * NUM_N_TILES, HIDDEN_DIM // BLOCK_SIZE_K),
-        strides=(stride_gus_n, stride_gus_k),
-        offsets=(NUM_N_TILES + pid_n, 0),
-        block_shape=(1, 1),
-        order=(1, 0),
+    bs_gate_ptr = GateUpScale + expert_id * stride_gus_e + pid_n * stride_gus_n
+    bs_up_ptr = (
+        GateUpScale + expert_id * stride_gus_e + (NUM_N_TILES + pid_n) * stride_gus_n
     )
 
     acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -167,11 +149,11 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
         acc_gate += tl.dot(a, w_gate) * a_s[:, None] * w_s_gate
         acc_up += tl.dot(a, w_up) * a_s[:, None] * w_s_up
 
-        a_ptr = tl.advance(a_ptr, (0, BLOCK_SIZE_K))
-        b_gate_ptr = tl.advance(b_gate_ptr, (BLOCK_SIZE_K, 0))
-        b_up_ptr = tl.advance(b_up_ptr, (BLOCK_SIZE_K, 0))
-        bs_gate_ptr = tl.advance(bs_gate_ptr, (0, 1))
-        bs_up_ptr = tl.advance(bs_up_ptr, (0, 1))
+        a_ptr += BLOCK_SIZE_K * stride_a_k
+        b_gate_ptr += BLOCK_SIZE_K * stride_gu_k
+        b_up_ptr += BLOCK_SIZE_K * stride_gu_k
+        bs_gate_ptr += stride_gus_k
+        bs_up_ptr += stride_gus_k
 
     intermediate = glu(
         acc_gate, acc_up, ACT_FN, SIMULATE_UNFUSED, HiddenStates.dtype.element_ty
@@ -237,39 +219,22 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
         store_row(Out + batch_id * HIDDEN_DIM, z, pid_h, 1, BLOCK_SIZE_M, BLOCK_SIZE_H)
         return
 
-    w_down_ptr = tl.make_block_ptr(
-        base=Down + expert_id * stride_down_e,
-        shape=(INTERMEDIATE_DIM, HIDDEN_DIM),
-        strides=(stride_down_k, stride_down_n),
-        offsets=(0, pid_h * BLOCK_SIZE_H),
-        block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_H),
-        order=(0, 1),
+    w_down_ptr = (
+        Down
+        + expert_id * stride_down_e
+        + tl.arange(0, BLOCK_SIZE_N)[:, None] * stride_down_k
+        + (pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H))[None, :] * stride_down_n
     )
-
-    inter_ptr = tl.make_block_ptr(
-        base=Intermediate,
-        shape=(num_routed_tokens, INTERMEDIATE_DIM),
-        strides=(INTERMEDIATE_DIM, 1),
-        offsets=(batch_id, 0),
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
-        order=(1, 0),
+    inter_ptr = (
+        Intermediate
+        + (batch_id + tl.arange(0, BLOCK_SIZE_M))[:, None] * INTERMEDIATE_DIM
+        + tl.arange(0, BLOCK_SIZE_N)[None, :]
     )
-    inter_s_ptr = tl.make_block_ptr(
-        base=IntermediateScale,
-        shape=(num_routed_tokens, NUM_N_TILES),
-        strides=(NUM_N_TILES, 1),
-        offsets=(batch_id, 0),
-        block_shape=(BLOCK_SIZE_M, 1),
-        order=(1, 0),
+    inter_s_ptr = (
+        IntermediateScale
+        + (batch_id + tl.arange(0, BLOCK_SIZE_M))[:, None] * NUM_N_TILES
     )
-    ws_down_ptr = tl.make_block_ptr(
-        base=DownScale + expert_id * stride_downs_e,
-        shape=(HIDDEN_DIM // BLOCK_SIZE_H, NUM_N_TILES),
-        strides=(stride_downs_n, stride_downs_k),
-        offsets=(pid_h, 0),
-        block_shape=(1, 1),
-        order=(1, 0),
-    )
+    ws_down_ptr = DownScale + expert_id * stride_downs_e + pid_h * stride_downs_n
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_H), dtype=tl.float32)
 
@@ -279,10 +244,10 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
         w_s_down = tl.load(ws_down_ptr)
         w_down = tl.load(w_down_ptr)
         acc += tl.dot(inter, w_down) * inter_s * w_s_down
-        inter_ptr = tl.advance(inter_ptr, (0, BLOCK_SIZE_N))
-        inter_s_ptr = tl.advance(inter_s_ptr, (0, 1))
-        ws_down_ptr = tl.advance(ws_down_ptr, (0, 1))
-        w_down_ptr = tl.advance(w_down_ptr, (BLOCK_SIZE_N, 0))
+        inter_ptr += BLOCK_SIZE_N
+        inter_s_ptr += 1
+        ws_down_ptr += stride_downs_k
+        w_down_ptr += BLOCK_SIZE_N * stride_down_k
 
     if SIMULATE_UNFUSED:
         acc = acc.to(Out.dtype.element_ty).to(tl.float32)
@@ -489,45 +454,40 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     if expert_id >= NUM_EXPERTS:  # EP sentinel; down kernel zeros the output row
         return
 
-    a_ptr = tl.make_block_ptr(
-        base=HiddenStates,
-        shape=(num_routed_tokens // NUM_TOP_K, HIDDEN_DIM),
-        strides=(stride_a_m, stride_a_k),
-        offsets=(token.to(tl.int32), 0),
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
-        order=(1, 0),
+    a_ptr = (
+        HiddenStates
+        + (token + tl.arange(0, BLOCK_SIZE_M))[:, None] * stride_a_m
+        + tl.arange(0, BLOCK_SIZE_K)[None, :] * stride_a_k
     )
-    b_gate_ptr = tl.make_block_ptr(
-        base=GateUp + expert_id * stride_gu_e,
-        shape=(HIDDEN_DIM // VALUES_PER_BYTE, INTERMEDIATE_DIM * 2),
-        strides=(stride_gu_k, stride_gu_n),
-        offsets=(0, pid_n * BLOCK_SIZE_N),
-        block_shape=(BLOCK_SIZE_K // VALUES_PER_BYTE, BLOCK_SIZE_N),
-        order=(0, 1),
+    b_gate_ptr = (
+        GateUp
+        + expert_id * stride_gu_e
+        + tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)[:, None] * stride_gu_k
+        + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :] * stride_gu_n
     )
-    b_up_ptr = tl.make_block_ptr(
-        base=GateUp + expert_id * stride_gu_e,
-        shape=(HIDDEN_DIM // VALUES_PER_BYTE, INTERMEDIATE_DIM * 2),
-        strides=(stride_gu_k, stride_gu_n),
-        offsets=(0, INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N),
-        block_shape=(BLOCK_SIZE_K // VALUES_PER_BYTE, BLOCK_SIZE_N),
-        order=(0, 1),
+    b_up_ptr = (
+        GateUp
+        + expert_id * stride_gu_e
+        + tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)[:, None] * stride_gu_k
+        + (INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[
+            None, :
+        ]
+        * stride_gu_n
     )
-    bs_gate_ptr = tl.make_block_ptr(
-        base=GateUpScale + expert_id * stride_gus_e,
-        shape=(INTERMEDIATE_DIM * 2, HIDDEN_DIM // SCALE_GROUP_K),
-        strides=(stride_gus_n, stride_gus_k),
-        offsets=(pid_n * BLOCK_SIZE_N, 0),
-        block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_K),
-        order=(1, 0),
+    bs_gate_ptr = (
+        GateUpScale
+        + expert_id * stride_gus_e
+        + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[:, None] * stride_gus_n
+        + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, :] * stride_gus_k
     )
-    bs_up_ptr = tl.make_block_ptr(
-        base=GateUpScale + expert_id * stride_gus_e,
-        shape=(INTERMEDIATE_DIM * 2, HIDDEN_DIM // SCALE_GROUP_K),
-        strides=(stride_gus_n, stride_gus_k),
-        offsets=(INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N, 0),
-        block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_K),
-        order=(1, 0),
+    bs_up_ptr = (
+        GateUpScale
+        + expert_id * stride_gus_e
+        + (INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[
+            :, None
+        ]
+        * stride_gus_n
+        + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, :] * stride_gus_k
     )
 
     acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -557,11 +517,11 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
             BLOCK_SIZE_K,
             SCALE_GROUP_K,
         )
-        a_ptr = tl.advance(a_ptr, (0, BLOCK_SIZE_K))
-        b_gate_ptr = tl.advance(b_gate_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0))
-        b_up_ptr = tl.advance(b_up_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0))
-        bs_gate_ptr = tl.advance(bs_gate_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
-        bs_up_ptr = tl.advance(bs_up_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
+        a_ptr += BLOCK_SIZE_K * stride_a_k
+        b_gate_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_gu_k
+        b_up_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_gu_k
+        bs_gate_ptr += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_gus_k
+        bs_up_ptr += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_gus_k
 
     intermediate = glu(
         acc_gate, acc_up, ACT_FN, SIMULATE_UNFUSED, HiddenStates.dtype.element_ty
@@ -632,37 +592,28 @@ def mxfp_dynamic_moe_batched_down_kernel(
         store_row(Out + batch_id * HIDDEN_DIM, z, pid_n, 1, BLOCK_SIZE_M, BLOCK_SIZE_N)
         return
 
-    a_ptr = tl.make_block_ptr(
-        base=Intermediate,
-        shape=(num_routed_tokens, INTERMEDIATE_DIM),
-        strides=(INTERMEDIATE_DIM, 1),
-        offsets=(batch_id, 0),
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
-        order=(1, 0),
+    a_ptr = (
+        Intermediate
+        + (batch_id + tl.arange(0, BLOCK_SIZE_M))[:, None] * INTERMEDIATE_DIM
+        + tl.arange(0, BLOCK_SIZE_K)[None, :]
     )
-    as_ptr = tl.make_block_ptr(
-        base=IntermediateScale,
-        shape=(num_routed_tokens, INTERMEDIATE_DIM // SCALE_GROUP_K),
-        strides=(INTERMEDIATE_DIM // SCALE_GROUP_K, 1),
-        offsets=(batch_id, 0),
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_K),
-        order=(1, 0),
+    as_ptr = (
+        IntermediateScale
+        + (batch_id + tl.arange(0, BLOCK_SIZE_M))[:, None]
+        * (INTERMEDIATE_DIM // SCALE_GROUP_K)
+        + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, :]
     )
-    w_down_ptr = tl.make_block_ptr(
-        base=Down + expert_id * stride_down_e,
-        shape=(INTERMEDIATE_DIM // VALUES_PER_BYTE, HIDDEN_DIM),
-        strides=(stride_down_k, stride_down_n),
-        offsets=(0, pid_n * BLOCK_SIZE_N),
-        block_shape=(BLOCK_SIZE_K // VALUES_PER_BYTE, BLOCK_SIZE_N),
-        order=(0, 1),
+    w_down_ptr = (
+        Down
+        + expert_id * stride_down_e
+        + tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)[:, None] * stride_down_k
+        + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :] * stride_down_n
     )
-    ws_down_ptr = tl.make_block_ptr(
-        base=DownScale + expert_id * stride_downs_e,
-        shape=(HIDDEN_DIM, INTERMEDIATE_DIM // SCALE_GROUP_K),
-        strides=(stride_downs_n, stride_downs_k),
-        offsets=(pid_n * BLOCK_SIZE_N, 0),
-        block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_K),
-        order=(1, 0),
+    ws_down_ptr = (
+        DownScale
+        + expert_id * stride_downs_e
+        + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[:, None] * stride_downs_n
+        + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, :] * stride_downs_k
     )
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -684,10 +635,10 @@ def mxfp_dynamic_moe_batched_down_kernel(
             BLOCK_SIZE_K,
             SCALE_GROUP_K,
         )
-        a_ptr = tl.advance(a_ptr, (0, BLOCK_SIZE_K))
-        as_ptr = tl.advance(as_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
-        w_down_ptr = tl.advance(w_down_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0))
-        ws_down_ptr = tl.advance(ws_down_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
+        a_ptr += BLOCK_SIZE_K
+        as_ptr += BLOCK_SIZE_K // SCALE_GROUP_K
+        w_down_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_down_k
+        ws_down_ptr += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_downs_k
 
     if SIMULATE_UNFUSED:
         acc = acc.to(Out.dtype.element_ty).to(tl.float32)

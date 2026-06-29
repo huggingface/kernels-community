@@ -271,8 +271,8 @@ def get_mxfp_autotuning_configs(
     ``num_warps=16`` and ``BLOCK_SIZE_K=64`` are omitted (dead at M=1 per a sweep).
 
     ``memory_modes`` (fused_grouped only) is the ``MEMORY_MODE`` axis for the weight load — e.g.
-    ``("host_descriptor", "block_ptr")`` on CUDA, ``("device_descriptor", "block_ptr")`` on XPU
-    (a host/device tensor descriptor — TMA on NVIDIA — vs a rank-3 ``make_block_ptr`` load); the
+    ``("host_descriptor", "pointer")`` on CUDA, ``("device_descriptor", "pointer")`` on XPU
+    (a host/device tensor descriptor — TMA on NVIDIA — vs explicit pointers); the
     ``(None,)`` (default) emits no axis. Pass all the modes a kernel implements; this drops
     the device-inapplicable descriptor flavor (host-side is NVIDIA-TMA-only, device-side is the
     XPU win). a given pre_hook is attached to every config and self-guards on ``MEMORY_MODE``."""
