@@ -921,23 +921,26 @@ def mxfp_dynamic_moe_grouped(
     simulate_unfused: bool = False,
     act_fn: str = "silu",
 ) -> torch.Tensor:
-    """MXFP4/MXFP8 fused grouped MoE — format picked per-weight (UE8M0 group-32). Same
-    structure as the block-dynamic path but with a tunable tile and an MXFP8 intermediate."""
+    """MXFP4/MXFP8 fused grouped MoE (UE8M0 group-32); gate_up and down must share the same MX
+    format. Same structure as the block-dynamic path but with a tunable tile and MXFP8 intermediate."""
+    gate_up_is_fp4 = is_mxfp4(gate_up_proj, gate_up_proj_scale)
+    down_is_fp4 = is_mxfp4(down_proj, down_proj_scale)
+    if gate_up_is_fp4 != down_is_fp4:
+        raise ValueError(
+            "gate_up_proj and down_proj must use the same MX format (both MXFP4 or both MXFP8)."
+        )
 
     device = hidden_states.device
-    num_tokens = hidden_states.size(0)
+    num_sms = sm_count(device.index)
     num_top_k = top_k_index.size(-1)
+    num_tokens = hidden_states.size(0)
     HIDDEN_DIM = hidden_states.size(1)
     INTERMEDIATE_DIM = gate_up_proj.size(1) // 2
-
     perm_token, perm, expert_start, NUM_EXPERTS, num_routed_tokens = _grouped_routing(
         top_k_index, gate_up_proj.size(0), num_top_k
     )
-    num_sms = sm_count(device.index)
     tokens_per_sm_bit_length = (num_routed_tokens // num_sms).bit_length()
-    VALUES_PER_BYTE = (
-        NIBBLES_PER_BYTE if is_mxfp4(gate_up_proj, gate_up_proj_scale) else 1
-    )
+    VALUES_PER_BYTE = NIBBLES_PER_BYTE if gate_up_is_fp4 else 1
     gate_up_proj_u8 = e2m1_as_uint8(gate_up_proj)
     down_proj_u8 = e2m1_as_uint8(down_proj)
     gate_up_scale_u8 = ue8m0_as_uint8(gate_up_proj_scale)
@@ -1070,7 +1073,14 @@ def moe_fused_grouped(
     scale layout, mirroring ``moe_fused_batched``. Implemented: block-dynamic FP8 and MXFP8 /
     MXFP4 (UE8M0 group-32). ``simulate_unfused`` (testing) rounds each step through the
     activation dtype so the output matches the unfused reference to reduce order."""
-    if is_mxfp(gate_up_proj, gate_up_proj_scale_inv):
+    gate_up_is_mx = is_mxfp(gate_up_proj, gate_up_proj_scale_inv)
+    down_is_mx = is_mxfp(down_proj, down_proj_scale_inv)
+    if gate_up_is_mx != down_is_mx:
+        raise ValueError(
+            "gate_up_proj and down_proj must use the same recipe (both MX or both block-dynamic FP8)."
+        )
+
+    if gate_up_is_mx:
         return mxfp_dynamic_moe_grouped(
             hidden_states,
             top_k_index,
@@ -1082,6 +1092,9 @@ def moe_fused_grouped(
             simulate_unfused,
             act_fn,
         )
+
+    if block_size is None:
+        raise ValueError("block_size is required for block-dynamic FP8 weights.")
 
     return w8a8_block_dynamic_fp8_moe_grouped(
         hidden_states,

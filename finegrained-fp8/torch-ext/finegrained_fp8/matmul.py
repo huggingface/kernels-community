@@ -793,12 +793,17 @@ def matmul_2d(
     Routes by weight dtype and ``block_size``:
     - MX weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
       group-32 ``Bs`` (shape ``[N, K//32]``) → ``mxfp_dynamic_matmul`` (``block_size``
-      ignored; scale granularity fixed at 32, tile + dot path autotuned).
+      ignored, ``activation_scale`` unsupported; scale granularity fixed at 32, autotuned).
     - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_dynamic_fp8_matmul``.
     - otherwise → ``w8a8_block_dynamic_fp8_matmul`` (or its static variant when
       ``activation_scale`` is given).
     """
     if is_mxfp(B, Bs):
+        if activation_scale is not None:
+            raise NotImplementedError(
+                "activation_scale (static activation quant) is not supported for MX weights — "
+                "the MX path quantizes activations dynamically per group. Omit activation_scale."
+            )
         return mxfp_dynamic_matmul(A, B, Bs, output_dtype)
 
     if is_tensor_wide(block_size, B):

@@ -57,7 +57,15 @@ def sm_count(device_index: int) -> int:
             "multiprocessor_count"
         ]
     except Exception:
-        return torch.cuda.get_device_properties(device_index).multi_processor_count
+        active_device = get_active_device_type()
+        if active_device == "cuda":
+            return torch.cuda.get_device_properties(device_index).multi_processor_count
+        elif active_device == "xpu":
+            return torch.xpu.get_device_properties(device_index).multi_processor_count
+        else:
+            raise RuntimeError(
+                f"Unsupported device type {active_device} for sm_count; only cuda/xpu are supported."
+            )
 
 
 # H-tile each topk_reduce program reduces (one (token, tile) program per BLOCK_H span). The
@@ -327,9 +335,18 @@ def sm_shared_memory_limit(device_index: int) -> int:
             "max_shared_mem"
         ]
     except Exception:
-        return torch.cuda.get_device_properties(
-            device_index
-        ).shared_memory_per_block_optin
+        if get_active_device_type() == "cuda":
+            return torch.cuda.get_device_properties(
+                device_index
+            ).shared_memory_per_block_optin
+        elif get_active_device_type() == "xpu":
+            return torch.xpu.get_device_properties(
+                device_index
+            ).shared_memory_per_block_optin
+        else:
+            raise RuntimeError(
+                f"Unsupported device type {get_active_device_type()} for sm_shared_memory_limit; only cuda/xpu are supported."
+            )
 
 
 def smem_config_pruner(act_bytes: int, n_weight_tiles: int, weight_bytes: int = 1):
