@@ -1,0 +1,83 @@
+[general]
+name = "vllm-moe"
+version = 0
+license = "Apache-2.0"
+upstream = "git+https://github.com/vllm-project/vllm.git"
+backends = ["cuda"]
+
+[general.hub]
+repo-id = "kernels-community/vllm-moe"
+
+[torch]
+include = ["."]
+pyext = [
+    "py",
+    "json",
+]
+src = [
+    "core/scalar_type.hpp",
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.activation]
+backend = "cuda"
+depends = ["torch"]
+src = [
+    "activation/activation_kernels.cu",
+    "activation/cuda_compat.h",
+    "activation/dispatch_utils.h",
+]
+
+[kernel.moe]
+backend = "cuda"
+depends = ["torch"]
+src = [
+    "cuda_compat.h",
+    "dispatch_utils.h",
+    "moe/moe_align_sum_kernels.cu",
+    "moe/moe_wna16.cu",
+    "moe/moe_wna16_utils.h",
+    "moe/topk_softmax_kernels.cu",
+]
+
+[kernel.fp8]
+backend = "cuda"
+depends = ["torch"]
+include = ["."]
+src = [
+    "cuda_compat.h",
+    "dispatch_utils.h",
+    "fp8/amd/hip_float8.h",
+    "fp8/amd/hip_float8_impl.h",
+    "fp8/common.cu",
+    "fp8/common.cuh",
+    "fp8/vectorization.cuh",
+]
+
+[kernel.moe-marlin]
+backend = "cuda"
+cuda-capabilities = [
+    "8.0",
+    "8.6",
+    "8.7",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.1",
+    "12.0",
+]
+depends = ["torch"]
+include = ["."]
+src = [
+    "core/exception.hpp",
+    "core/scalar_type.hpp",
+    "marlin-moe/marlin_moe_ops.cu",
+    "marlin-moe/marlin_kernels/marlin_moe_kernel_ku4.cu",
+    "marlin-moe/marlin_kernels/marlin_moe_kernel_ku8b128.cu",
+    "marlin-moe/marlin_kernels/marlin_moe_kernel.h",
+    "marlin-moe/marlin_kernels/marlin_moe_kernel_ku4.h",
+    "marlin-moe/marlin_kernels/marlin_moe_kernel_ku4b8.h",
+    "marlin-moe/marlin_kernels/marlin_moe_kernel_ku4b8.cu",
+    "marlin-moe/marlin_kernels/marlin_moe_kernel_ku8b128.h",
+]

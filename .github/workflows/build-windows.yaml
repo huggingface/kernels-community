@@ -209,7 +209,7 @@ jobs:
           echo "revision=$revision" >> $env:GITHUB_OUTPUT
 
       # Install the CUDA toolkit for CUDA backend builds.
-      - uses: Jimver/cuda-toolkit@b6fc3a9f3f15256d9d94ffe1254f9c5a2565cde6 # v0.2.30
+      - uses: huggingface/cuda-toolkit@714c97b32958862237b96401fb253a4261453c3b # v0.1.0
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && matrix.platform.backend == 'cuda'
         id: setup-cuda-toolkit
         with:

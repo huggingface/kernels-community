@@ -3,6 +3,12 @@ run-name: Sign old builds
 
 on:
   workflow_dispatch:
+    inputs:
+      start_kernel:
+        description: "Kernel name to start from (inclusive, alphabetical order). Leave empty to start from the beginning."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -41,10 +47,22 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           REPO_PREFIX: kernels-community
+          START_KERNEL: ${{ inputs.start_kernel }}
         run: |
           KERNELS=$(find . -maxdepth 2 -name "build.toml" -exec dirname {} \; | sed 's|^\./||' | sort)
+          SKIP="$START_KERNEL"
 
           for kernel in $KERNELS; do
+            # Skip kernels that sort before start_kernel.
+            if [ -n "$SKIP" ]; then
+              if [ "$kernel" = "$START_KERNEL" ]; then
+                SKIP=""
+              else
+                echo "Skipping $kernel (before start_kernel)"
+                continue
+              fi
+            fi
+
             echo "::group::$kernel"
 
             # Determine the version branch from build.toml (e.g. version = 1 -> v1).

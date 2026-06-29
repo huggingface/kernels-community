@@ -1,0 +1,48 @@
+name: Verify Signatures
+run-name: Verify signatures
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *" # Daily at midnight UTC
+
+permissions:
+  contents: read
+
+jobs:
+  verify-kernels:
+    runs-on:
+      group: aws-highmemory-32-plus-nix
+    timeout-minutes: 1200 # 20h
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            max-jobs = 2
+            cores = 4
+            sandbox-fallback = false
+
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: huggingface
+        env:
+          USER: runner
+
+      # Verify signatures for each kernel sequentially to avoid Hub rate limits.
+      - name: Verify all kernels
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: .github/scripts/verify-signatures.sh
+
+      - name: Post results to Slack
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL_SECURITY }}
+        run: |
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          FAILED_KERNELS=$(sed 's/^/• /' /tmp/verify-failed)
+          MESSAGE=$(printf '❌ Kernel verification failed:\n%s\n\n%s' "$FAILED_KERNELS" "$RUN_URL")
+          nix run nixpkgs#jq -- -rn --arg text "$MESSAGE" '{"text": $text}' | \
+            curl -X POST -H 'Content-type: application/json' -d @- "$SLACK_WEBHOOK_URL"
