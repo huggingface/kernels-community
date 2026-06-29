@@ -204,7 +204,9 @@ def get_active_device_type() -> str:
 
 
 def get_accelerator_autotuning_configs(
-    *, tune_block_nk: bool = False, tune_block_m: bool = False
+    *,
+    tune_block_m: bool = False,
+    tune_block_nk: bool = False,
 ):
     """Autotune search grid for the current accelerator.
 
@@ -536,6 +538,92 @@ def mx_scalar_reduce_gate_up(
 
 
 @triton.jit
+def mx_compute_gate_up(
+    acc_gate,
+    acc_up,
+    a,
+    a_scale,
+    b_gate,
+    b_up,
+    gate_scale,
+    up_scale,
+    COMPUTE_MODE: tl.constexpr,
+    VALUES_PER_BYTE: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+):
+    """Gate∪up MMA step dispatched on ``COMPUTE_MODE``: scaled-MMA on the raw weights
+    (``b_gate``/``b_up``), or fp8 ``tl.dot`` + per-group rescale / scalar reduce on the
+    E4M3-decoded weights. Returns the updated ``(acc_gate, acc_up)``."""
+    w_gate = mxfp4_e2m1_to_e4m3(b_gate) if VALUES_PER_BYTE == 2 else b_gate
+    w_up = mxfp4_e2m1_to_e4m3(b_up) if VALUES_PER_BYTE == 2 else b_up
+    if COMPUTE_MODE == "dot_scaled":
+        acc_gate = mx_dot_scaled(
+            a, a_scale, b_gate, gate_scale, acc_gate, VALUES_PER_BYTE
+        )
+        acc_up = mx_dot_scaled(a, a_scale, b_up, up_scale, acc_up, VALUES_PER_BYTE)
+    elif COMPUTE_MODE == "dot":
+        acc_gate, acc_up = mx_dot_rescale_gate_up(
+            acc_gate, acc_up, a, w_gate, w_up, a_scale, gate_scale, up_scale
+        )
+    else:  # scalar
+        acc_gate, acc_up = mx_scalar_reduce_gate_up(
+            acc_gate,
+            acc_up,
+            a,
+            w_gate,
+            w_up,
+            a_scale,
+            gate_scale,
+            up_scale,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            SCALE_GROUP_K,
+        )
+    return acc_gate, acc_up
+
+
+@triton.jit
+def mx_compute(
+    acc,
+    a,
+    a_scale,
+    w,
+    w_scale,
+    COMPUTE_MODE: tl.constexpr,
+    VALUES_PER_BYTE: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+):
+    """Single-projection MMA step dispatched on ``COMPUTE_MODE``: scaled-MMA on the raw weight
+    (``w``), or fp8 ``tl.dot`` + per-group rescale / scalar reduce on the E4M3-decoded weight.
+    Returns the updated ``acc``."""
+    wq = mxfp4_e2m1_to_e4m3(w) if VALUES_PER_BYTE == 2 else w
+    if COMPUTE_MODE == "dot_scaled":
+        acc = mx_dot_scaled(a, a_scale, w, w_scale, acc, VALUES_PER_BYTE)
+    elif COMPUTE_MODE == "dot":
+        acc = mx_dot_rescale(acc, a, wq, a_scale, w_scale)
+    else:  # scalar
+        acc = mx_scalar_reduce(
+            acc,
+            a,
+            a_scale,
+            wq,
+            w_scale,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            SCALE_GROUP_K,
+        )
+    return acc
+
+
+@triton.jit
 def _activation(x, ACT_FN: tl.constexpr):
     """Pointwise GLU gate activation. ``ACT_FN`` in ``{"silu", "gelu", "relu"}``; gelu is exact
     (erf), matching torch's default ``F.gelu``."""
@@ -546,7 +634,9 @@ def _activation(x, ACT_FN: tl.constexpr):
     elif ACT_FN == "relu":
         return tl.maximum(x, 0.0)
     else:
-        tl.static_assert(False, "unsupported ACT_FN; expected 'silu', 'gelu', or 'relu'")
+        tl.static_assert(
+            False, "unsupported ACT_FN; expected 'silu', 'gelu', or 'relu'"
+        )
 
 
 @triton.jit

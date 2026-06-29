@@ -37,12 +37,8 @@ from .utils import (
     is_mxfp,
     is_mxfp4,
     mxfp_act_quant_inline,
-    mx_dot_rescale,
-    mx_dot_rescale_gate_up,
-    mx_dot_scaled,
-    mx_scalar_reduce,
-    mx_scalar_reduce_gate_up,
-    mxfp4_e2m1_to_e4m3,
+    mx_compute,
+    mx_compute_gate_up,
     glu,
     topk_reduce_kernel,
     TOPK_REDUCE_BLOCK_H,
@@ -543,34 +539,24 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
         )
         b_gate = tl.load(b_gate_ptr)
         b_up = tl.load(b_up_ptr)
-        bs_gate = tl.load(bs_gate_ptr).to(tl.uint8)
-        bs_up = tl.load(bs_up_ptr).to(tl.uint8)
-        w_gate = mxfp4_e2m1_to_e4m3(b_gate) if VALUES_PER_BYTE == 2 else b_gate
-        w_up = mxfp4_e2m1_to_e4m3(b_up) if VALUES_PER_BYTE == 2 else b_up
-        if COMPUTE_MODE == "dot_scaled":
-            acc_gate = mx_dot_scaled(
-                a, a_scale, b_gate, bs_gate, acc_gate, VALUES_PER_BYTE
-            )
-            acc_up = mx_dot_scaled(a, a_scale, b_up, bs_up, acc_up, VALUES_PER_BYTE)
-        elif COMPUTE_MODE == "dot":
-            acc_gate, acc_up = mx_dot_rescale_gate_up(
-                acc_gate, acc_up, a, w_gate, w_up, a_scale, bs_gate, bs_up
-            )
-        else:  # scalar
-            acc_gate, acc_up = mx_scalar_reduce_gate_up(
-                acc_gate,
-                acc_up,
-                a,
-                w_gate,
-                w_up,
-                a_scale,
-                bs_gate,
-                bs_up,
-                BLOCK_SIZE_M,
-                BLOCK_SIZE_N,
-                BLOCK_SIZE_K,
-                SCALE_GROUP_K,
-            )
+        bs_gate = tl.load(bs_gate_ptr)
+        bs_up = tl.load(bs_up_ptr)
+        acc_gate, acc_up = mx_compute_gate_up(
+            acc_gate,
+            acc_up,
+            a,
+            a_scale,
+            b_gate,
+            b_up,
+            bs_gate,
+            bs_up,
+            COMPUTE_MODE,
+            VALUES_PER_BYTE,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            SCALE_GROUP_K,
+        )
         a_ptr = tl.advance(a_ptr, (0, BLOCK_SIZE_K))
         b_gate_ptr = tl.advance(b_gate_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0))
         b_up_ptr = tl.advance(b_up_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0))
@@ -685,23 +671,19 @@ def mxfp_dynamic_moe_batched_down_kernel(
         a_scale = tl.load(as_ptr)
         w = tl.load(w_down_ptr)
         w_scale = tl.load(ws_down_ptr)
-        wq = mxfp4_e2m1_to_e4m3(w) if VALUES_PER_BYTE == 2 else w
-        if COMPUTE_MODE == "dot_scaled":
-            acc = mx_dot_scaled(a, a_scale, w, w_scale, acc, VALUES_PER_BYTE)
-        elif COMPUTE_MODE == "dot":
-            acc = mx_dot_rescale(acc, a, wq, a_scale, w_scale)
-        else:  # scalar
-            acc = mx_scalar_reduce(
-                acc,
-                a,
-                a_scale,
-                wq,
-                w_scale,
-                BLOCK_SIZE_M,
-                BLOCK_SIZE_N,
-                BLOCK_SIZE_K,
-                SCALE_GROUP_K,
-            )
+        acc = mx_compute(
+            acc,
+            a,
+            a_scale,
+            w,
+            w_scale,
+            COMPUTE_MODE,
+            VALUES_PER_BYTE,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            SCALE_GROUP_K,
+        )
         a_ptr = tl.advance(a_ptr, (0, BLOCK_SIZE_K))
         as_ptr = tl.advance(as_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))
         w_down_ptr = tl.advance(w_down_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0))

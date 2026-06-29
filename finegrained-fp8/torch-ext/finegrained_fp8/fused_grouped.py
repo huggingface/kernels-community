@@ -48,9 +48,7 @@ from .utils import (
     is_mxfp,
     is_mxfp4,
     mxfp_act_quant_inline,
-    mx_dot_rescale,
-    mx_dot_scaled,
-    mxfp4_e2m1_to_e4m3,
+    mx_compute,
     smem_config_pruner,
     glu,
     e2m1_as_uint8,
@@ -732,25 +730,26 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
             gu_scale = tl.reshape(
                 tl.load(gu_scale_bptr),
                 [2 * BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_K],
-            ).to(tl.uint8)
+            )
             gu_scale_bptr = tl.advance(
                 gu_scale_bptr, (0, 0, BLOCK_SIZE_K // SCALE_GROUP_K)
             )
-            if COMPUTE_MODE == "dot_scaled":
-                acc = mx_dot_scaled(
-                    a, a_scale, tl.trans(gu), gu_scale, acc, VALUES_PER_BYTE
-                )
-            else:
-                guT = (
-                    mxfp4_e2m1_to_e4m3(tl.trans(gu))
-                    if VALUES_PER_BYTE == 2
-                    else tl.trans(gu)
-                )
-                acc += (
-                    tl.dot(a, guT)
-                    * decode_ue8m0_scale(a_scale)
-                    * tl.trans(decode_ue8m0_scale(gu_scale))
-                )
+            gu_t = tl.trans(
+                gu
+            )  # [BK, 2*BN] gate∪up weight; mx_compute decodes it for the fp8 path
+            acc = mx_compute(
+                acc,
+                a,
+                a_scale,
+                gu_t,
+                gu_scale,
+                COMPUTE_MODE,
+                VALUES_PER_BYTE,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                SCALE_GROUP_K,
+            )
             a_ptrs += BLOCK_SIZE_K * stride_h_k
         acc_3d = tl.permute(tl.reshape(acc, [BLOCK_SIZE_M, 2, BLOCK_SIZE_N]), (0, 2, 1))
         acc_gate, acc_up = tl.split(acc_3d)
@@ -904,7 +903,7 @@ def mxfp_dynamic_moe_grouped_down_kernel(
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for k_off in tl.range(0, INTERMEDIATE_DIM, BLOCK_SIZE_K):
             a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
-            a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0).to(tl.uint8)
+            a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0)
             if MEMORY_MODE == "host_descriptor":
                 w = tl.trans(
                     tl.reshape(
@@ -928,12 +927,20 @@ def mxfp_dynamic_moe_grouped_down_kernel(
                 w_down_ptr = tl.advance(
                     w_down_ptr, (BLOCK_SIZE_K // VALUES_PER_BYTE, 0)
                 )
-            w_scale = tl.load(ws_down_ptr).to(tl.uint8)
-            if COMPUTE_MODE == "dot_scaled":
-                acc = mx_dot_scaled(a, a_scale, w, w_scale, acc, VALUES_PER_BYTE)
-            else:
-                wq = mxfp4_e2m1_to_e4m3(w) if VALUES_PER_BYTE == 2 else w
-                acc = mx_dot_rescale(acc, a, wq, a_scale, w_scale)
+            w_scale = tl.load(ws_down_ptr)
+            acc = mx_compute(
+                acc,
+                a,
+                a_scale,
+                w,
+                w_scale,
+                COMPUTE_MODE,
+                VALUES_PER_BYTE,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                SCALE_GROUP_K,
+            )
             a_ptrs += BLOCK_SIZE_K * stride_int_n
             as_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_is_n
             ws_down_ptr = tl.advance(ws_down_ptr, (0, BLOCK_SIZE_K // SCALE_GROUP_K))

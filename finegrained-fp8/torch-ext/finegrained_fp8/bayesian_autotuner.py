@@ -65,7 +65,10 @@ class BayesianAutotuner(Autotuner):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.n_trials = n_trials
+        # Bayesian trial budget — the per-decorator default, overridable via the
+        # FINEGRAINED_AUTOTUNE_TRIALS env var (quick sweeps / exhaustive runs without touching
+        # the decorators; set it >= grid size to fall back to stock exhaustive bench-all).
+        self.n_trials = int(os.environ.get("FINEGRAINED_AUTOTUNE_TRIALS") or n_trials)
         self.n_startup_trials = n_startup_trials
         # top fraction of measured configs the TPE treats as "good"
         self.gamma = gamma
