@@ -1,0 +1,89 @@
+name: PR Auto-Label
+
+# Automatically labels pull requests using a small Claude classification plus a
+# few mechanically derived labels. The taxonomy lives in .github/pr-labels.json
+# (one source of truth for "create the labels" and "what Claude may choose") and
+# all the logic lives in .github/scripts/pr_autolabel.py.
+#
+# Setup (one-time):
+#   1. Add the ANTHROPIC_API_KEY secret (Settings -> Secrets and variables -> Actions).
+#   2. Run this workflow via the Actions tab with mode=sync-labels to create every
+#      label (colors/descriptions) from .github/pr-labels.json.
+#   3. Run it again with mode=backfill to label the currently-open PRs.
+#   After that it runs automatically on every newly opened/reopened/edited PR.
+
+on:
+  # pull_request_target runs in the BASE repo context, so it has access to
+  # ANTHROPIC_API_KEY and label-write permission even for PRs from forks (a
+  # plain `pull_request` trigger would get a read-only token with no secrets).
+  #
+  # SECURITY: this is only safe because we NEVER check out or execute PR code.
+  # We read PR metadata via the API and read our OWN script/config from the
+  # trusted base checkout. PR title/body/filenames are treated as untrusted text
+  # that is only ever fed to the classifier as data -- never run or shelled out.
+  #
+  # `synchronize` (every push to a PR) is intentionally NOT in this list: the
+  # type/backend/semantic classification rarely changes per-push and a Claude
+  # call on every push is needlessly chatty/costly. Re-open or edit a PR, or run
+  # a manual backfill, to re-classify.
+  pull_request_target:
+    types: [opened, reopened, edited]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "backfill = label all open PRs; sync-labels = create/update labels from .github/pr-labels.json"
+        type: choice
+        options:
+          - backfill
+          - sync-labels
+        default: backfill
+
+permissions:
+  contents: read # read the script + .github/pr-labels.json from the base checkout
+  pull-requests: write # add/remove labels
+  issues: write # labels are applied via the issues API
+
+concurrency:
+  # Coalesce rapid re-triggers on the same PR; don't cancel a manual backfill.
+  group: pr-autolabel-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  MODEL: claude-haiku-4-5 # override here to bump quality (e.g. claude-opus-4-8)
+
+jobs:
+  autolabel:
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout WITHOUT a ref: under pull_request_target this resolves to the
+      # base repo's branch (trusted), never the PR head. We only need the
+      # script and .github/pr-labels.json from it.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.139
+
+      # Single self-contained Python script (stdlib only, matching the repo's
+      # other .github/scripts/*.py). The workflow picks the sub-command:
+      #   - per-PR trigger     -> `label --pr <n>`
+      #   - manual backfill    -> `backfill`
+      #   - manual sync-labels -> `sync-labels`
+      - name: Classify and label
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MODEL: ${{ env.MODEL }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_MODE: ${{ github.event.inputs.mode || 'backfill' }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            python3 .github/scripts/pr_autolabel.py "$DISPATCH_MODE"
+          else
+            python3 .github/scripts/pr_autolabel.py label --pr "$PR_NUMBER"
+          fi

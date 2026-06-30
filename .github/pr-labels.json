@@ -1,0 +1,81 @@
+{
+  "_comment": "Single source of truth for the PR auto-labeler (.github/workflows/pr-autolabel.yml). Drives both label creation (sync-labels) and the set of labels Claude may choose from. The action only ever adds/removes labels listed here ('managed' labels); any other label a human applies is left untouched. Colors are hex without the leading '#'.",
+  "dimensions": {
+    "type": {
+      "select": "one",
+      "llm": true,
+      "color": "1f6feb",
+      "labels": {
+        "type: feature": "New functionality / capability",
+        "type: fix": "Bug fix",
+        "type: refactor": "Restructure with no behavior change",
+        "type: docs": "Docs, CARD.md, guides, skill text",
+        "type: ci": "Workflows, GitHub Actions, automation",
+        "type: build": "Build system: nix flakes, kernel-builder build, packaging",
+        "type: deps": "Dependency bumps (mostly dependabot)",
+        "type: security": "Code signing, audits, workflow hardening",
+        "type: chore": "Version bumps, releases, misc maintenance"
+      }
+    },
+    "area": {
+      "select": "many",
+      "llm": true,
+      "color": "0969da",
+      "labels": {
+        "area: github-actions": "GitHub Actions workflows and action versions",
+        "area: repo-automation": "Repository scripts, bots, freshness checks, and generated automation",
+        "area: build-system": "build.toml, Nix flakes, packaging, and kernel-builder integration",
+        "area: tests": "Tests, validation code, and benchmark harnesses",
+        "area: docs": "README, CARD.md, guides, and repository documentation"
+      }
+    },
+    "backend": {
+      "select": "many",
+      "llm": true,
+      "color": "2da44e",
+      "labels": {
+        "backend: cuda": "NVIDIA CUDA kernels",
+        "backend: rocm": "AMD / AITER kernels",
+        "backend: metal": "Apple Metal / MPS kernels",
+        "backend: cpu": "CPU kernels",
+        "backend: xpu": "Intel XPU kernels",
+        "backend: triton": "Vendor-neutral Triton kernels"
+      }
+    },
+    "semantic": {
+      "select": "many",
+      "llm": true,
+      "color": "bf8700",
+      "labels": {
+        "new-kernel": "A brand-new kernel package is added",
+        "new-backend": "Adds a backend to an existing kernel",
+        "new-layer": "Adds or extends a LayerRepo",
+        "abi-migration": "Torch stable ABI work",
+        "upstream-sync": "Syncing a kernel with its upstream source",
+        "vendoring": "Vendoring a dependency in-tree",
+        "performance": "Autotuning, speedups, build-speed improvements"
+      }
+    },
+    "size": {
+      "select": "one",
+      "llm": false,
+      "color": "9e9e9e",
+      "labels": {
+        "size: XS": "Diff <= 10 lines",
+        "size: S": "Diff <= 50 lines",
+        "size: M": "Diff <= 250 lines",
+        "size: L": "Diff <= 1000 lines",
+        "size: XL": "Diff > 1000 lines"
+      }
+    },
+    "status": {
+      "select": "many",
+      "llm": false,
+      "color": "d73a4a",
+      "labels": {
+        "needs-rebase": "Has merge conflicts with the base branch",
+        "stale": "No update in 30 days"
+      }
+    }
+  }
+}
