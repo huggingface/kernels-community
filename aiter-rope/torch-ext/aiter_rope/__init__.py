@@ -10,6 +10,7 @@ changes.
 
 import torch
 
+from . import layers
 from .rope import (
     RotateStyle,
     rope_cached_fwd,
@@ -76,6 +77,7 @@ __all__ = [
     "__kernel_metadata__",
     "RotateStyle",
     "apply_rotary_transformers",
+    "layers",
     "rope_cached_fwd",
     "rope_cached_fwd_inplace",
 ]
