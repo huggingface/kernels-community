@@ -16,6 +16,9 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
+[torch.stable-abi]
+cuda = "2.11"
+
 [kernel.activation_metal]
 backend = "metal"
 depends = ["torch"]
