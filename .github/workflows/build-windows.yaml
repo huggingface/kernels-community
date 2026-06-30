@@ -339,7 +339,6 @@ jobs:
           }
 
           # Upload to both model and kernel repo types
-          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" @branchArgs
           & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" @branchArgs
 
       # v1 kernels without an explicit branch override also get uploaded to main.
@@ -359,7 +358,6 @@ jobs:
             $content = Get-Content $buildTomlPath -Raw
             if ($content -match '(?m)^\s*version\s*=\s*1\s*(\r)?$' -and $content -notmatch '(?m)^\s*branch\s*=') {
               Write-Host "Kernel version is 1 and no branch override, uploading to main branch..."
-              & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" --branch main
               & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" --branch main
             } else {
               Write-Host "Kernel version is not 1 or branch is overridden, skipping main branch upload"
