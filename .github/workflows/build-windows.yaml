@@ -56,6 +56,7 @@ on:
 permissions:
   contents: read
   statuses: write
+  id-token: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -320,6 +321,25 @@ jobs:
           Push-Location "$env:KERNEL_SOURCE\build"
           cmake --build . --config Release --target local_install
           Pop-Location
+
+      - name: Install Cosign
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && inputs.mode != 'pr'
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+
+      # Sign metadata.json for each built variant.
+      - name: Sign kernel metadata
+        if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && inputs.mode != 'pr'
+        shell: pwsh
+        env:
+          KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
+        run: |
+          $buildPath = Resolve-Path "$env:KERNEL_SOURCE\build"
+          Get-ChildItem -Path $buildPath -Recurse -Filter "metadata.json" | Where-Object {
+            $relative = $_.FullName.Substring($buildPath.Path.Length).TrimStart('\')
+            $relative.Split('\').Count -eq 3
+          } | ForEach-Object {
+            cosign sign-blob $_.FullName --bundle "$($_.FullName).sigstore" --yes
+          }
 
       # Upload built artifacts to both model and kernel Hub repos.
       - name: Upload kernel to Hub
