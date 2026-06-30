@@ -120,13 +120,13 @@ jobs:
       # When building for a PR, check out the PR head; otherwise use default branch.
       - name: Checkout PR branch
         if: inputs.pr_number != ''
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: refs/pull/${{ inputs.pr_number }}/head
           fetch-depth: 0
       - name: Checkout default branch
         if: inputs.pr_number == ''
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Ensure the kernel directory exists and has the required config files.
       - name: Validate kernel directory
@@ -225,7 +225,7 @@ jobs:
       # Python is needed for PyTorch and the build toolchain.
       - name: Setup Python
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python }}
 
@@ -241,7 +241,7 @@ jobs:
       - name: Checkout kernels
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
         id: checkout-kernels
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: huggingface/kernels
           ref: "${{ steps.extract-builder-version.outputs.revision }}"
@@ -250,7 +250,7 @@ jobs:
       # Cache Rust compilation artifacts to speed up kernel-builder builds.
       - name: Cache Rust build
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             kernels/kernel-builder/target
