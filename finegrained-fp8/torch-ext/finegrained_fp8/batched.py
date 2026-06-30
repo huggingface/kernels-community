@@ -29,7 +29,6 @@ from .utils import (
     mx_dot_scaled,
     mx_scalar_reduce,
     mxfp_act_quant_inline,
-    mxfp4_e2m1_to_e4m3,
     fp8_act_quant,
     fp8_act_quant_inline,
     get_accelerator_autotuning_configs,
@@ -290,24 +289,24 @@ def mxfp_dynamic_matmul_batched_kernel(
         )
         b = tl.load(b_ptrs)
         b_s = tl.load(bs_ptrs).to(tl.uint8)
-        bq = mxfp4_e2m1_to_e4m3(b) if VALUES_PER_BYTE == 2 else b
         if COMPUTE_MODE == "dot_scaled":
             accumulator = mx_dot_scaled(
-                a, a_scale, b, b_s, accumulator, VALUES_PER_BYTE
+                accumulator, a, a_scale, b, b_s, VALUES_PER_BYTE
             )
         elif COMPUTE_MODE == "dot":
-            accumulator = mx_dot_rescale(accumulator, a, bq, a_scale, b_s)
+            accumulator = mx_dot_rescale(accumulator, a, b, a_scale, b_s, VALUES_PER_BYTE)
         else:  # scalar
             accumulator = mx_scalar_reduce(
                 accumulator,
                 a,
                 a_scale,
-                bq,
+                b,
                 b_s,
                 BLOCK_SIZE_M,
                 BLOCK_SIZE_N,
                 BLOCK_SIZE_K,
                 SCALE_GROUP_K,
+                VALUES_PER_BYTE,
             )
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk

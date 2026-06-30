@@ -531,6 +531,9 @@ class MoEProblem:
     weight_scale_dtype: torch.dtype = torch.float32
     block_size: Optional[Tuple[int, int]] = None
     dtype: torch.dtype = torch.bfloat16
+    swiglu_alpha: Optional[float] = None
+    swiglu_limit: Optional[float] = None
+    act_fn: str = "silu"
 
     @property
     def is_mxfp(self):
@@ -544,9 +547,15 @@ class MoEProblem:
             fmt = "mxfp8"
         else:
             fmt = f"fp8_b{self.block_size[0]}x{self.block_size[1]}"
+        if self.swiglu_alpha is not None:
+            act = "_swiglu"
+        elif self.act_fn != "silu":
+            act = f"_{self.act_fn}"
+        else:
+            act = ""
         return (
             f"{fmt}_T{self.num_tokens}_E{self.num_experts}_H{self.hidden_dim}"
-            f"_I{self.intermediate_dim}_top{self.num_top_k}_{DTYPE_TAG[self.dtype]}"
+            f"_I{self.intermediate_dim}_top{self.num_top_k}_{DTYPE_TAG[self.dtype]}{act}"
         )
 
 
@@ -617,6 +626,50 @@ MOE_PROBLEMS = [
         num_top_k=8,
         block_size=(128, 128),
     ),
+    # ── Clamped SwiGLU-OAI (GPT-OSS / MiniMax-M3) on MXFP4 + MXFP8 ──
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        weight_dtype=torch.int8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        swiglu_alpha=1.702,
+        swiglu_limit=7.0,
+    ),
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+        swiglu_alpha=1.702,
+        swiglu_limit=7.0,
+    ),
+    # ── GeGLU / ReGLU coverage (activation is orthogonal to recipe, so one MXFP8 shape each) ──
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+        act_fn="gelu",
+    ),
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+        act_fn="relu",
+    ),
 ]
 
 
@@ -658,6 +711,19 @@ def _make_moe_inputs(problem: MoEProblem):
 _ACT_FNS = {"silu": F.silu, "gelu": F.gelu, "relu": F.relu}
 
 
+def _glu_ref(gate, up, act_fn, swiglu_alpha=None, swiglu_limit=None):
+    """Reference GLU activation, mirroring the fused kernel's ``glu`` and the model
+    ``_apply_gate``. ``swiglu_limit`` clamps gate above / up to ``[-limit, limit]``;
+    ``swiglu_alpha`` gives clamped SwiGLU-OAI ``(up + 1) * gate * sigmoid(alpha * gate)``
+    (GPT-OSS / MiniMax-M3). Otherwise plain GLU ``act_fn(gate) * up``."""
+    if swiglu_limit is not None:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    if swiglu_alpha is not None:
+        return (up + 1.0) * (gate * torch.sigmoid(gate * swiglu_alpha))
+    return _ACT_FNS[act_fn](gate) * up
+
+
 def _unfused_batched_ref(
     hidden,
     top_k_index,
@@ -669,10 +735,13 @@ def _unfused_batched_ref(
     problem,
     block_size,
     act_fn,
+    swiglu_alpha=None,
+    swiglu_limit=None,
 ):
     """The transformers batched-experts forward (``integrations/moe.py``) built on the
     tested ``matmul_batched``: replicate each token to its routed slots, gate_up projection,
-    GLU ``act_fn(gate) * up``, down projection, then the routing-weighted top-k reduce."""
+    GLU (``act_fn(gate) * up``, or clamped SwiGLU-OAI when ``swiglu_alpha``/``swiglu_limit``
+    are set), down projection, then the routing-weighted top-k reduce."""
     num_tokens, num_top_k = hidden.shape[0], problem.num_top_k
     expert_ids = top_k_index.reshape(-1).to(torch.int32)
     routed = hidden.repeat_interleave(num_top_k, dim=0)
@@ -680,7 +749,7 @@ def _unfused_batched_ref(
         routed, gate_up, gate_up_s, expert_ids, block_size
     )
     gate, up = gate_up_out.chunk(2, dim=-1)
-    inter = _ACT_FNS[act_fn](gate) * up
+    inter = _glu_ref(gate, up, act_fn, swiglu_alpha, swiglu_limit)
     down_out = finegrained_fp8.matmul_batched(
         inter, down, down_s, expert_ids, block_size
     )
@@ -699,11 +768,14 @@ def _unfused_grouped_ref(
     problem,
     block_size,
     act_fn,
+    swiglu_alpha=None,
+    swiglu_limit=None,
 ):
     """The same MoE forward as ``_unfused_batched_ref`` but built on the tested
     ``matmul_grouped`` — sort the routed tokens by expert, grouped gate_up, GLU
-    ``silu(gate) * up``, grouped down, unsort, routing-weighted top-k reduce. Using the
-    grouped GEMM (not batched) matches the fused grouped path's tiling / reduce order."""
+    (``act_fn(gate) * up``, or clamped SwiGLU-OAI when ``swiglu_alpha``/``swiglu_limit`` are
+    set), grouped down, unsort, routing-weighted top-k reduce. Using the grouped GEMM (not
+    batched) matches the fused grouped path's tiling / reduce order."""
     num_tokens, num_top_k = hidden.shape[0], problem.num_top_k
     expert_ids = top_k_index.reshape(-1).to(torch.int32)
     routed = hidden.repeat_interleave(num_top_k, dim=0)
@@ -720,7 +792,7 @@ def _unfused_grouped_ref(
         a_sorted, gate_up, gate_up_s, offsets, tokens_per_expert, block_size
     )
     gate, up = gate_up_out.chunk(2, dim=-1)
-    inter = _ACT_FNS[act_fn](gate) * up
+    inter = _glu_ref(gate, up, act_fn, swiglu_alpha, swiglu_limit)
     down_out = finegrained_fp8.matmul_grouped(
         inter, down, down_s, offsets, tokens_per_expert, block_size
     )
@@ -738,12 +810,12 @@ def _assert_fused_correctness(out, ref, problem: MoEProblem):
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-@pytest.mark.parametrize("act_fn", ["silu", "gelu", "relu"])
 @pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
-def test_fused_batched(problem, act_fn):
-    """Fused two-kernel MoE (gate_up + SiLU + FP8 requant + down + top-k reduce) via the
+def test_fused_batched(problem):
+    """Fused two-kernel MoE (gate_up + activation + FP8 requant + down + top-k reduce) via the
     ``moe_fused_batched`` dispatcher vs the unfused reference. ``simulate_unfused`` rounds each
-    fused step through the activation dtype so the two agree to reduce order."""
+    fused step through the activation dtype so the two agree to reduce order. The activation
+    (``act_fn`` / clamped SwiGLU) is a per-problem field, not a separate axis."""
     torch.manual_seed(0)
     gate_up, gate_up_s, down, down_s, block_size = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
@@ -757,7 +829,9 @@ def test_fused_batched(problem, act_fn):
         down_s,
         problem,
         block_size,
-        act_fn,
+        problem.act_fn,
+        swiglu_alpha=problem.swiglu_alpha,
+        swiglu_limit=problem.swiglu_limit,
     )
     out = fused_batched.moe_fused_batched(
         hidden,
@@ -768,7 +842,9 @@ def test_fused_batched(problem, act_fn):
         gate_up_s,
         down_s,
         block_size,
-        act_fn=act_fn,
+        act_fn=problem.act_fn,
+        swiglu_alpha=problem.swiglu_alpha,
+        swiglu_limit=problem.swiglu_limit,
         simulate_unfused=True,
     )
     _assert_fused_correctness(out, ref, problem)
@@ -776,12 +852,12 @@ def test_fused_batched(problem, act_fn):
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-@pytest.mark.parametrize("act_fn", ["silu", "gelu", "relu"])
 @pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
-def test_fused_grouped(problem, act_fn):
-    """Fused grouped MoE (gather gate_up + SiLU + FP8 requant + grouped down + top-k
+def test_fused_grouped(problem):
+    """Fused grouped MoE (gather gate_up + activation + FP8 requant + grouped down + top-k
     reduce) via the ``moe_fused_grouped`` dispatcher vs the same unfused reference, with
-    ``simulate_unfused`` rounding each fused step through the activation dtype."""
+    ``simulate_unfused`` rounding each fused step through the activation dtype. The activation
+    (``act_fn`` / clamped SwiGLU) is a per-problem field, not a separate axis."""
     torch.manual_seed(0)
     gate_up, gate_up_s, down, down_s, block_size = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
@@ -795,7 +871,9 @@ def test_fused_grouped(problem, act_fn):
         down_s,
         problem,
         block_size,
-        act_fn,
+        problem.act_fn,
+        swiglu_alpha=problem.swiglu_alpha,
+        swiglu_limit=problem.swiglu_limit,
     )
     out = fused_grouped.moe_fused_grouped(
         hidden,
@@ -806,7 +884,9 @@ def test_fused_grouped(problem, act_fn):
         gate_up_s,
         down_s,
         block_size,
-        act_fn=act_fn,
+        act_fn=problem.act_fn,
+        swiglu_alpha=problem.swiglu_alpha,
+        swiglu_limit=problem.swiglu_limit,
         simulate_unfused=True,
     )
     _assert_fused_correctness(out, ref, problem)
