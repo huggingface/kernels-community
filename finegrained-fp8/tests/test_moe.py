@@ -630,7 +630,7 @@ MOE_PROBLEMS = [
         num_top_k=8,
         block_size=(128, 128),
     ),
-    # ── Clamped SwiGLU-OAI (GPT-OSS / MiniMax-M3), MXFP8 (glu is recipe-independent) ──
+    # ── Clamped/scaled SwiGLU (GPT-OSS / MiniMax-M3), MXFP8 (glu is recipe-independent) ──
     MoEProblem(
         num_tokens=4,
         num_experts=8,
@@ -728,7 +728,7 @@ _ACT_FNS = {"silu": F.silu, "gelu": F.gelu, "relu": F.relu}
 def _glu_ref(gate, up, act_fn, swiglu_alpha=None, swiglu_limit=None):
     """Reference GLU activation, mirroring the fused kernel's ``glu`` and the model
     ``_apply_gate``. ``swiglu_limit`` clamps gate above / up to ``[-limit, limit]``;
-    ``swiglu_alpha`` gives clamped SwiGLU-OAI ``(up + 1) * gate * sigmoid(alpha * gate)``
+    ``swiglu_alpha`` gives clamped/scaled SwiGLU ``(up + 1) * gate * sigmoid(alpha * gate)``
     (GPT-OSS / MiniMax-M3). Otherwise plain GLU ``act_fn(gate) * up``."""
     if swiglu_limit is not None:
         gate = gate.clamp(max=swiglu_limit)
@@ -754,7 +754,7 @@ def _unfused_batched_ref(
 ):
     """The transformers batched-experts forward (``integrations/moe.py``) built on the
     tested ``matmul_batched``: replicate each token to its routed slots, gate_up projection,
-    GLU (``act_fn(gate) * up``, or clamped SwiGLU-OAI when ``swiglu_alpha``/``swiglu_limit``
+    GLU (``act_fn(gate) * up``, or clamped/scaled SwiGLU when ``swiglu_alpha``/``swiglu_limit``
     are set), down projection, then the routing-weighted top-k reduce."""
     num_tokens, num_top_k = hidden.shape[0], problem.num_top_k
     expert_ids = top_k_index.reshape(-1).to(torch.int32)
@@ -787,7 +787,7 @@ def _unfused_grouped_ref(
 ):
     """The same MoE forward as ``_unfused_batched_ref`` but built on the tested
     ``matmul_grouped`` — sort the routed tokens by expert, grouped gate_up, GLU
-    (``act_fn(gate) * up``, or clamped SwiGLU-OAI when ``swiglu_alpha``/``swiglu_limit`` are
+    (``act_fn(gate) * up``, or clamped/scaled SwiGLU when ``swiglu_alpha``/``swiglu_limit`` are
     set), grouped down, unsort, routing-weighted top-k reduce. Using the grouped GEMM (not
     batched) matches the fused grouped path's tiling / reduce order."""
     num_tokens, num_top_k = hidden.shape[0], problem.num_top_k
@@ -819,7 +819,7 @@ def _assert_fused_correctness(out, ref, problem: MoEProblem):
     assert out.shape == (problem.num_tokens, problem.hidden_dim)
     assert out.dtype == problem.dtype
     atol, rtol = DTYPE_TO_TOL[problem.dtype]
-    # Clamped SwiGLU-OAI's (up + 1) makes the down-matmul outputs cancellation-prone: the few-ULP
+    # Clamped/scaled SwiGLU's (up + 1) makes the down-matmul outputs cancellation-prone: the few-ULP
     # gap between the valid MX compute modes the autotuner may pick (native dot_scaled vs cuda-core
     # dot, both correct) blows up to ~6% relative on the near-zero results. The kernel is verified
     # bit-exact vs an fp32 dequant-matmul truth, so relax rtol for that path only.
