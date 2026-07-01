@@ -34,7 +34,6 @@ from .utils import (
     is_mxfp,
     is_tensor_wide,
     mxfp_act_quant_inline,
-    mxfp4_e2m1_to_e4m3,
     e2m1_as_uint8,
     ue8m0_as_uint8,
 )
@@ -378,13 +377,12 @@ def mxfp_dynamic_matmul_kernel(
         b_s = tl.load(
             bs_ptrs, mask=offs_sf[None, :] < k_remaining // SCALE_GROUP_K, other=0
         ).to(tl.uint8)
-        bq = mxfp4_e2m1_to_e4m3(b) if VALUES_PER_BYTE == 2 else b
         if COMPUTE_MODE == "dot_scaled":
             accumulator = mx_dot_scaled(
-                a, a_scale, b, b_s, accumulator, VALUES_PER_BYTE
+                accumulator, a, a_scale, b, b_s, VALUES_PER_BYTE
             )
         else:  # dot
-            accumulator = mx_dot_rescale(accumulator, a, bq, a_scale, b_s)
+            accumulator = mx_dot_rescale(accumulator, a, b, a_scale, b_s, VALUES_PER_BYTE)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k

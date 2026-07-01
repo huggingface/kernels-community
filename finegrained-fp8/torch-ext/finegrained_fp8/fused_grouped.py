@@ -204,7 +204,7 @@ def _grouped_routing(expert_ids: torch.Tensor, num_experts: int, num_top_k: int)
 # three memory modes; get_mxfp_autotuning_configs drops the device-inapplicable descriptor
 # flavor (host on XPU, device on CUDA).
 _MX_COMPUTE_MODES = ("dot_scaled", "dot")
-_MX_MEMORY_MODES = ("host_descriptor", "device_descriptor", "pointer")
+_MX_MEMORY_MODES = ("descriptor", "pointer")
 
 
 # ── Block-dynamic FP8 ────────────────────────────────────────────────────────
@@ -245,8 +245,10 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     NUM_SMS: tl.constexpr,
-    SIMULATE_UNFUSED: tl.constexpr,
-    ACT_FN: tl.constexpr,
+    ACT_FN: tl.constexpr = "silu",
+    SWIGLU_ALPHA: tl.constexpr = None,
+    SWIGLU_LIMIT: tl.constexpr = None,
+    SIMULATE_UNFUSED: tl.constexpr = False,
 ):
     """Phase 1: persistent grid-stride over (M-tile, I-tile). Gather hidden rows per expert
     M-tile, gate + up block-FP8 matmuls, SiLU-combine, FP8-requant the intermediate."""
@@ -306,7 +308,13 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
             up_s_ptr += stride_gus_k
 
         intermediate = glu(
-            acc_gate, acc_up, ACT_FN, SIMULATE_UNFUSED, Hidden.dtype.element_ty
+            acc_gate,
+            acc_up,
+            ACT_FN,
+            SWIGLU_ALPHA,
+            SWIGLU_LIMIT,
+            Hidden.dtype.element_ty,
+            SIMULATE_UNFUSED,
         )
         inter, inter_s = fp8_act_quant_inline(
             intermediate
@@ -428,8 +436,10 @@ def w8a8_block_dynamic_fp8_moe_grouped(
     gate_up_proj_scale: torch.Tensor,
     down_proj_scale: torch.Tensor,
     block_size: list[int],
-    simulate_unfused: bool = False,
     act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
 ) -> torch.Tensor:
     """Block-dynamic FP8 fused grouped MoE: gather gate_up+SiLU → FP8 intermediate →
     grouped down → routing-weighted top-k reduce. Returns ``(num_tokens, hidden_dim)``."""
@@ -491,8 +501,10 @@ def w8a8_block_dynamic_fp8_moe_grouped(
             BLOCK_SIZE_K=BLOCK_SIZE_K,
             NUM_EXPERTS=NUM_EXPERTS,
             NUM_SMS=num_sms,
-            SIMULATE_UNFUSED=simulate_unfused,
             ACT_FN=act_fn,
+            SWIGLU_ALPHA=swiglu_alpha,
+            SWIGLU_LIMIT=swiglu_limit,
+            SIMULATE_UNFUSED=simulate_unfused,
         )
         w8a8_block_dynamic_fp8_moe_grouped_down_kernel[(num_sms,)](
             inter,
@@ -575,7 +587,9 @@ def _set_gate_up_descriptor(nargs):
     n_trials=60,
     # bf16 activation tile + fused gate|up weight tiles
     prune_configs_by={
-        "early_config_prune": smem_config_pruner(act_bytes=2, n_weight_tiles=2)
+        "early_config_prune": smem_config_pruner(
+            act_bytes=2, n_weight_tiles=2, reduction_dim="HIDDEN_DIM"
+        )
     },
 )
 @triton.jit
@@ -611,10 +625,12 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
     SCALE_GROUP_K: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     NUM_SMS: tl.constexpr,
-    SIMULATE_UNFUSED: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
     MEMORY_MODE: tl.constexpr,
-    ACT_FN: tl.constexpr,
+    ACT_FN: tl.constexpr = "silu",
+    SWIGLU_ALPHA: tl.constexpr = None,
+    SWIGLU_LIMIT: tl.constexpr = None,
+    SIMULATE_UNFUSED: tl.constexpr = False,
 ):
     """MXFP4/MXFP8 phase 1 (persistent): gather hidden rows per expert M-tile, gate + up MX
     matmuls (``tl.dot_scaled`` or fp8 ``tl.dot`` + per-group rescale), SiLU, MXFP8-requant."""
@@ -717,7 +733,13 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
         acc_gate, acc_up = tl.split(acc_3d)
 
         intermediate = glu(
-            acc_gate, acc_up, ACT_FN, SIMULATE_UNFUSED, Hidden.dtype.element_ty
+            acc_gate,
+            acc_up,
+            ACT_FN,
+            SWIGLU_ALPHA,
+            SWIGLU_LIMIT,
+            Hidden.dtype.element_ty,
+            SIMULATE_UNFUSED,
         )
 
         # MXFP8 requant of the intermediate (E4M3 + UE8M0 group-32 along this N-tile).
@@ -764,7 +786,9 @@ def _set_down_descriptor(nargs):
     n_trials=60,
     # fp8 intermediate activation tile + single down weight tile
     prune_configs_by={
-        "early_config_prune": smem_config_pruner(act_bytes=1, n_weight_tiles=1)
+        "early_config_prune": smem_config_pruner(
+            act_bytes=1, n_weight_tiles=1, reduction_dim="INTERMEDIATE_DIM"
+        )
     },
 )
 @triton.jit
@@ -918,8 +942,10 @@ def mxfp_dynamic_moe_grouped(
     down_proj: torch.Tensor,
     gate_up_proj_scale: torch.Tensor,
     down_proj_scale: torch.Tensor,
-    simulate_unfused: bool = False,
     act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
 ) -> torch.Tensor:
     """MXFP4/MXFP8 fused grouped MoE (UE8M0 group-32); gate_up and down must share the same MX
     format. Same structure as the block-dynamic path but with a tunable tile and MXFP8 intermediate."""
@@ -1004,8 +1030,10 @@ def mxfp_dynamic_moe_grouped(
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
             NUM_EXPERTS=NUM_EXPERTS,
             NUM_SMS=num_sms,
-            SIMULATE_UNFUSED=simulate_unfused,
             ACT_FN=act_fn,
+            SWIGLU_ALPHA=swiglu_alpha,
+            SWIGLU_LIMIT=swiglu_limit,
+            SIMULATE_UNFUSED=simulate_unfused,
         )
         mxfp_dynamic_moe_grouped_down_kernel[(num_sms,)](
             inter,
@@ -1066,8 +1094,10 @@ def moe_fused_grouped(
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
     block_size: list[int] | None,
-    simulate_unfused: bool = False,
     act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
 ) -> torch.Tensor:
     """Fused grouped-MoE dispatcher — routes to the recipe matching the weight dtype /
     scale layout, mirroring ``moe_fused_batched``. Implemented: block-dynamic FP8 and MXFP8 /
@@ -1089,8 +1119,10 @@ def moe_fused_grouped(
             down_proj,
             gate_up_proj_scale_inv,
             down_proj_scale_inv,
-            simulate_unfused,
             act_fn,
+            swiglu_alpha,
+            swiglu_limit,
+            simulate_unfused,
         )
 
     if block_size is None:
@@ -1105,6 +1137,8 @@ def moe_fused_grouped(
         gate_up_proj_scale_inv,
         down_proj_scale_inv,
         block_size,
-        simulate_unfused,
         act_fn,
+        swiglu_alpha,
+        swiglu_limit,
+        simulate_unfused,
     )

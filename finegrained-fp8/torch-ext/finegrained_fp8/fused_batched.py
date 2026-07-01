@@ -93,8 +93,10 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
-    SIMULATE_UNFUSED: tl.constexpr,
-    ACT_FN: tl.constexpr,
+    ACT_FN: tl.constexpr = "silu",
+    SWIGLU_ALPHA: tl.constexpr = None,
+    SWIGLU_LIMIT: tl.constexpr = None,
+    SIMULATE_UNFUSED: tl.constexpr = False,
 ):
     """Batched kernel 1: per-token gate_up + SiLU + FP8 quant. Grid: (S, N-tiles)."""
     batch_id = tl.program_id(axis=0)
@@ -156,7 +158,13 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
         bs_up_ptr += stride_gus_k
 
     intermediate = glu(
-        acc_gate, acc_up, ACT_FN, SIMULATE_UNFUSED, HiddenStates.dtype.element_ty
+        acc_gate,
+        acc_up,
+        ACT_FN,
+        SWIGLU_ALPHA,
+        SWIGLU_LIMIT,
+        HiddenStates.dtype.element_ty,
+        SIMULATE_UNFUSED,
     )
 
     # Requant the intermediate to FP8 — the same inline per-row act quant as the inputs;
@@ -268,9 +276,10 @@ def _w8a8_block_dynamic_fp8_moe_batched(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
     block_size: list[int],
-    output_dtype: torch.dtype,
-    simulate_unfused: bool = False,
     act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
 ) -> torch.Tensor:
     """Block-dynamic FP8 batched fused MoE in ONE op: gate_up + SiLU + FP8 requant →
     grouped down → routing-weighted per-(token, expert) output. gate_up gathers each routed
@@ -294,8 +303,8 @@ def _w8a8_block_dynamic_fp8_moe_batched(
         num_routed_tokens, NUM_N_TILES, device=device, dtype=torch.float32
     )
 
-    out = torch.empty(num_routed_tokens, HIDDEN_DIM, device=device, dtype=output_dtype)
-    reduced = torch.empty(num_tokens, HIDDEN_DIM, device=device, dtype=output_dtype)
+    out = torch.empty(num_routed_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype)
+    reduced = torch.empty(num_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype)
     with device_context(device):
         wrap_triton(w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel)[
             (num_routed_tokens, NUM_N_TILES)
@@ -323,8 +332,10 @@ def _w8a8_block_dynamic_fp8_moe_batched(
             BLOCK_SIZE_K=BLOCK_SIZE_K,
             BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
             NUM_N_TILES=NUM_N_TILES,
-            SIMULATE_UNFUSED=simulate_unfused,
             ACT_FN=act_fn,
+            SWIGLU_ALPHA=swiglu_alpha,
+            SWIGLU_LIMIT=swiglu_limit,
+            SIMULATE_UNFUSED=simulate_unfused,
         )
         wrap_triton(w8a8_block_dynamic_fp8_moe_batched_down_kernel)[
             (num_routed_tokens, NUM_H_TILES)
@@ -378,8 +389,10 @@ def w8a8_block_dynamic_fp8_moe_batched(
     gate_up_proj_scale: torch.Tensor,
     down_proj_scale: torch.Tensor,
     block_size: list[int],
-    simulate_unfused: bool = False,
     act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
 ) -> torch.Tensor:
     """Batched fused MoE (deterministic, no sorting, no atomics): a single ``triton_op``
     runs gate_up + down (gathering each routed row from the unexpanded ``hidden_states``,
@@ -395,9 +408,10 @@ def w8a8_block_dynamic_fp8_moe_batched(
         top_k_index,
         top_k_weights,
         block_size,
-        hidden_states.dtype,
-        simulate_unfused,
         act_fn,
+        swiglu_alpha,
+        swiglu_limit,
+        simulate_unfused,
     )
     return out
 
@@ -441,9 +455,11 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     VALUES_PER_BYTE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
-    SIMULATE_UNFUSED: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
-    ACT_FN: tl.constexpr,
+    ACT_FN: tl.constexpr = "silu",
+    SWIGLU_ALPHA: tl.constexpr = None,
+    SWIGLU_LIMIT: tl.constexpr = None,
+    SIMULATE_UNFUSED: tl.constexpr = False,
 ):
     """MXFP4/MXFP8 kernel 1: gate_up + SiLU + MXFP8 requant. N = intermediate
     (output) tile, K = hidden (contraction) tile — both tunable. Grid: (S, N-tiles)."""
@@ -524,7 +540,13 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
         bs_up_ptr += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_gus_k
 
     intermediate = glu(
-        acc_gate, acc_up, ACT_FN, SIMULATE_UNFUSED, HiddenStates.dtype.element_ty
+        acc_gate,
+        acc_up,
+        ACT_FN,
+        SWIGLU_ALPHA,
+        SWIGLU_LIMIT,
+        HiddenStates.dtype.element_ty,
+        SIMULATE_UNFUSED,
     )
 
     # MXFP8 requant of the intermediate (E4M3 + UE8M0 group-32 along this N-tile).
@@ -655,9 +677,10 @@ def _mxfp_dynamic_moe_batched(
     down_proj_scale: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
-    output_dtype: torch.dtype,
-    simulate_unfused: bool = False,
     act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
 ) -> torch.Tensor:
     """MXFP4/MXFP8 batched fused MoE in ONE op: gate_up + SiLU + MXFP8 requant → grouped
     down → routing-weighted per-(token, expert) output. gate_up and down must share the same MX
@@ -691,8 +714,8 @@ def _mxfp_dynamic_moe_batched(
         device=device,
         dtype=torch.uint8,
     )
-    out = torch.empty(num_routed_tokens, HIDDEN_DIM, device=device, dtype=output_dtype)
-    reduced = torch.empty(num_tokens, HIDDEN_DIM, device=device, dtype=output_dtype)
+    out = torch.empty(num_routed_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype)
+    reduced = torch.empty(num_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype)
 
     def gate_up_grid(META):
         return (num_routed_tokens, triton.cdiv(INTERMEDIATE_DIM, META["BLOCK_SIZE_N"]))
@@ -724,8 +747,10 @@ def _mxfp_dynamic_moe_batched(
             BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
             VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
-            SIMULATE_UNFUSED=simulate_unfused,
             ACT_FN=act_fn,
+            SWIGLU_ALPHA=swiglu_alpha,
+            SWIGLU_LIMIT=swiglu_limit,
+            SIMULATE_UNFUSED=simulate_unfused,
         )
         wrap_triton(mxfp_dynamic_moe_batched_down_kernel)[down_grid](
             inter,
@@ -775,8 +800,10 @@ def mxfp_dynamic_moe_batched(
     down_proj: torch.Tensor,
     gate_up_proj_scale: torch.Tensor,
     down_proj_scale: torch.Tensor,
-    simulate_unfused: bool = False,
     act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
 ) -> torch.Tensor:
     """Two-kernel batched fused MX MoE — MXFP4 or MXFP8 weights (UE8M0 group-32), the
     format picked per-weight by the ops. Same structure as the block-dynamic path but
@@ -789,9 +816,10 @@ def mxfp_dynamic_moe_batched(
         down_proj_scale,
         top_k_index,
         top_k_weights,
-        hidden_states.dtype,
-        simulate_unfused,
         act_fn,
+        swiglu_alpha,
+        swiglu_limit,
+        simulate_unfused,
     )
     return out
 
@@ -808,8 +836,10 @@ def moe_fused_batched(
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
     block_size: list[int] | None,
-    simulate_unfused: bool = False,
     act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
 ) -> torch.Tensor:
     """Fused batched-MoE dispatcher — routes to the recipe matching the weight dtype /
     scale layout, mirroring ``matmul_batched``. Implemented: block-dynamic FP8 and MXFP8
@@ -832,8 +862,10 @@ def moe_fused_batched(
             down_proj,
             gate_up_proj_scale_inv,
             down_proj_scale_inv,
-            simulate_unfused,
             act_fn,
+            swiglu_alpha,
+            swiglu_limit,
+            simulate_unfused,
         )
 
     if block_size is None:
@@ -848,6 +880,8 @@ def moe_fused_batched(
         gate_up_proj_scale_inv,
         down_proj_scale_inv,
         block_size,
-        simulate_unfused,
         act_fn,
+        swiglu_alpha,
+        swiglu_limit,
+        simulate_unfused,
     )
