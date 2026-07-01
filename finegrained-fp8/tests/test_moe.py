@@ -527,10 +527,11 @@ class MoEProblem:
     hidden_dim: int
     intermediate_dim: int
     num_top_k: int
+    sentinel_fraction: float = 0.0
+    dtype: torch.dtype = torch.bfloat16
     weight_dtype: torch.dtype = torch.float8_e4m3fn
     weight_scale_dtype: torch.dtype = torch.float32
     block_size: Optional[Tuple[int, int]] = None
-    dtype: torch.dtype = torch.bfloat16
     swiglu_alpha: Optional[float] = None
     swiglu_limit: Optional[float] = None
     act_fn: str = "silu"
@@ -544,7 +545,9 @@ class MoEProblem:
         if self.weight_dtype == torch.int8:
             fmt = "mxfp4"
         elif self.is_mxfp:
-            fmt = "mxfp8"
+            fmt = "mxfp8_" + (
+                "u8scale" if self.weight_scale_dtype == torch.uint8 else "e8m0scale"
+            )
         else:
             fmt = f"fp8_b{self.block_size[0]}x{self.block_size[1]}"
         if self.swiglu_alpha is not None and self.swiglu_limit is not None:
@@ -560,6 +563,7 @@ class MoEProblem:
         return (
             f"{fmt}_T{self.num_tokens}_E{self.num_experts}_H{self.hidden_dim}"
             f"_I{self.intermediate_dim}_top{self.num_top_k}_{DTYPE_TAG[self.dtype]}{act}"
+            f"{'_sentinel' if self.sentinel_fraction > 0 else ''}"
         )
 
 
@@ -613,6 +617,17 @@ MOE_PROBLEMS = [
         block_size=(1, MX_SCALE_GROUP_K),
         weight_scale_dtype=torch.float8_e8m0fnu,
     ),
+    # UE8M0 scales stored as raw uint8 (e.g. MiniMax-M3-MXFP8 checkpoints) — must still
+    # detect as MXFP8 and route to the MX path, not fall back to block-dynamic.
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.uint8,
+    ),
     # ── Block-dynamic FP8 (E4M3 + fp32 128x128 block scales) ──
     MoEProblem(
         num_tokens=1,
@@ -630,7 +645,7 @@ MOE_PROBLEMS = [
         num_top_k=8,
         block_size=(128, 128),
     ),
-    # ── Clamped SwiGLU-OAI (GPT-OSS / MiniMax-M3), MXFP8 (glu is recipe-independent) ──
+    # ── Clamped/scaled SwiGLU (GPT-OSS / MiniMax-M3), MXFP8 (glu is recipe-independent) ──
     MoEProblem(
         num_tokens=4,
         num_experts=8,
@@ -684,6 +699,27 @@ MOE_PROBLEMS = [
         weight_scale_dtype=torch.float8_e8m0fnu,
         act_fn="relu",
     ),
+    # ── Expert parallelism: non-local experts sentinel-masked (routing is orthogonal to recipe) ──
+    # MXFP8 (MiniMax-M3) + block-dynamic FP8, exercised on both the grouped and batched fused paths.
+    MoEProblem(
+        num_tokens=8,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+        sentinel_fraction=0.875,
+    ),
+    MoEProblem(
+        num_tokens=8,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(128, 128),
+        sentinel_fraction=0.875,
+    ),
 ]
 
 
@@ -716,6 +752,13 @@ def _make_moe_inputs(problem: MoEProblem):
         device=TEST_DEVICE,
         dtype=torch.int32,
     )
+    if problem.sentinel_fraction > 0:
+        # EP: mark a random subset of routed slots non-local with an out-of-range id (== num_experts),
+        # which the fused path must skip. Mirrors _make_routed_inputs.
+        flat = top_k_index.reshape(-1)
+        n_sentinel = int(round(flat.numel() * problem.sentinel_fraction))
+        idx = torch.randperm(flat.numel(), device=flat.device)[:n_sentinel]
+        flat[idx] = problem.num_experts
     top_k_weights = torch.rand(
         problem.num_tokens, problem.num_top_k, device=TEST_DEVICE, dtype=problem.dtype
     )
@@ -728,7 +771,7 @@ _ACT_FNS = {"silu": F.silu, "gelu": F.gelu, "relu": F.relu}
 def _glu_ref(gate, up, act_fn, swiglu_alpha=None, swiglu_limit=None):
     """Reference GLU activation, mirroring the fused kernel's ``glu`` and the model
     ``_apply_gate``. ``swiglu_limit`` clamps gate above / up to ``[-limit, limit]``;
-    ``swiglu_alpha`` gives clamped SwiGLU-OAI ``(up + 1) * gate * sigmoid(alpha * gate)``
+    ``swiglu_alpha`` gives clamped/scaled SwiGLU ``(up + 1) * gate * sigmoid(alpha * gate)``
     (GPT-OSS / MiniMax-M3). Otherwise plain GLU ``act_fn(gate) * up``."""
     if swiglu_limit is not None:
         gate = gate.clamp(max=swiglu_limit)
@@ -754,8 +797,14 @@ def _unfused_batched_ref(
 ):
     """The transformers batched-experts forward (``integrations/moe.py``) built on the
     tested ``matmul_batched``: replicate each token to its routed slots, gate_up projection,
-    GLU (``act_fn(gate) * up``, or clamped SwiGLU-OAI when ``swiglu_alpha``/``swiglu_limit``
+    GLU (``act_fn(gate) * up``, or clamped/scaled SwiGLU when ``swiglu_alpha``/``swiglu_limit``
     are set), down projection, then the routing-weighted top-k reduce."""
+    # EP: a non-local expert is marked with an out-of-range sentinel id; drop those slots (dummy
+    # expert, zero weight) so they contribute 0 — matching the fused path's scatter guard + reduce
+    # mask. No-op when there are no sentinels.
+    keep = top_k_index < problem.num_experts
+    top_k_index = torch.where(keep, top_k_index, torch.zeros_like(top_k_index))
+    top_k_weights = top_k_weights * keep.to(top_k_weights.dtype)
     num_tokens, num_top_k = hidden.shape[0], problem.num_top_k
     expert_ids = top_k_index.reshape(-1).to(torch.int32)
     routed = hidden.repeat_interleave(num_top_k, dim=0)
@@ -787,9 +836,15 @@ def _unfused_grouped_ref(
 ):
     """The same MoE forward as ``_unfused_batched_ref`` but built on the tested
     ``matmul_grouped`` — sort the routed tokens by expert, grouped gate_up, GLU
-    (``act_fn(gate) * up``, or clamped SwiGLU-OAI when ``swiglu_alpha``/``swiglu_limit`` are
+    (``act_fn(gate) * up``, or clamped/scaled SwiGLU when ``swiglu_alpha``/``swiglu_limit`` are
     set), grouped down, unsort, routing-weighted top-k reduce. Using the grouped GEMM (not
     batched) matches the fused grouped path's tiling / reduce order."""
+    # EP: a non-local expert is marked with an out-of-range sentinel id; drop those slots (dummy
+    # expert, zero weight) so they contribute 0 — matching the fused path's scatter guard + reduce
+    # mask. No-op when there are no sentinels.
+    keep = top_k_index < problem.num_experts
+    top_k_index = torch.where(keep, top_k_index, torch.zeros_like(top_k_index))
+    top_k_weights = top_k_weights * keep.to(top_k_weights.dtype)
     num_tokens, num_top_k = hidden.shape[0], problem.num_top_k
     expert_ids = top_k_index.reshape(-1).to(torch.int32)
     routed = hidden.repeat_interleave(num_top_k, dim=0)
@@ -819,7 +874,7 @@ def _assert_fused_correctness(out, ref, problem: MoEProblem):
     assert out.shape == (problem.num_tokens, problem.hidden_dim)
     assert out.dtype == problem.dtype
     atol, rtol = DTYPE_TO_TOL[problem.dtype]
-    # Clamped SwiGLU-OAI's (up + 1) makes the down-matmul outputs cancellation-prone: the few-ULP
+    # Clamped/scaled SwiGLU's (up + 1) makes the down-matmul outputs cancellation-prone: the few-ULP
     # gap between the valid MX compute modes the autotuner may pick (native dot_scaled vs cuda-core
     # dot, both correct) blows up to ~6% relative on the near-zero results. The kernel is verified
     # bit-exact vs an fp32 dequant-matmul truth, so relax rtol for that path only.

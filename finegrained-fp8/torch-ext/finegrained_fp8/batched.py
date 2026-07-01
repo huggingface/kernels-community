@@ -22,6 +22,7 @@ from .bayesian_autotuner import bayesian_autotune
 from .utils import (
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
+    UE8M0_SCALE_DTYPES,
     DECODE_BLOCK_SIZE_M,
     decode_ue8m0_scale,
     device_context,
@@ -525,8 +526,8 @@ def _mxfp_dynamic_matmul_batched(
     assert B.dtype in (torch.int8, torch.float8_e4m3fn), (
         f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
     )
-    assert Bs.dtype == torch.float8_e8m0fnu, (
-        f"Bs must be float8_e8m0fnu, got {Bs.dtype}"
+    assert Bs.dtype in UE8M0_SCALE_DTYPES, (
+        f"Bs must be float8_e8m0fnu or uint8 (UE8M0), got {Bs.dtype}"
     )
     VALUES_PER_BYTE = NIBBLES_PER_BYTE if B.dtype == torch.int8 else 1
 

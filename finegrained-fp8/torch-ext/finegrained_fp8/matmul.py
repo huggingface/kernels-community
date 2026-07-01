@@ -22,6 +22,7 @@ from .bayesian_autotuner import bayesian_autotune
 from .utils import (
     NIBBLES_PER_BYTE,
     MX_SCALE_GROUP_K,
+    UE8M0_SCALE_DTYPES,
     adaptive_block_size_m,
     decode_ue8m0_scale,
     mx_dot_rescale,
@@ -382,7 +383,9 @@ def mxfp_dynamic_matmul_kernel(
                 accumulator, a, a_scale, b, b_s, VALUES_PER_BYTE
             )
         else:  # dot
-            accumulator = mx_dot_rescale(accumulator, a, b, a_scale, b_s, VALUES_PER_BYTE)
+            accumulator = mx_dot_rescale(
+                accumulator, a, b, a_scale, b_s, VALUES_PER_BYTE
+            )
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
@@ -626,21 +629,23 @@ def _mxfp_dynamic_matmul(
     ``float8_e4m3fn`` → unpacked E4M3 (MXFP8, ``(N, K)``). Both use UE8M0 group-32 scales
     ``(N, K//32)``; tile + dot path are autotuned (scale granularity fixed at 32).
 
-    A:  (M, K) raw activations, bf16/fp16/fp32 (quantized inline to E4M3)
+    A:  (..., K) raw activations, bf16/fp16/fp32 (quantized inline to E4M3); leading dims are
+        flattened to (M, K) and restored on the output
     """
-    assert A.ndim == 2 and B.ndim == 2 and Bs.ndim == 2
+    assert B.ndim == 2 and Bs.ndim == 2
     assert B.dtype in (torch.int8, torch.float8_e4m3fn), (
         f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
     )
-    assert Bs.dtype == torch.float8_e8m0fnu, (
-        f"Bs must be float8_e8m0fnu, got {Bs.dtype}"
+    assert Bs.dtype in UE8M0_SCALE_DTYPES, (
+        f"Bs must be float8_e8m0fnu or uint8 (UE8M0), got {Bs.dtype}"
     )
     assert A.is_contiguous(), "A must be contiguous"
     assert B.is_contiguous(), "B must be contiguous"
     VALUES_PER_BYTE = NIBBLES_PER_BYTE if B.dtype == torch.int8 else 1
 
-    M, K = A.shape
     N, K_b = B.shape
+    K = A.shape[-1]
+    M = A.numel() // K
     assert K == VALUES_PER_BYTE * K_b, (
         f"K (={K}) must equal {VALUES_PER_BYTE} * B.shape[1] (={K_b})"
     )
@@ -653,7 +658,7 @@ def _mxfp_dynamic_matmul(
 
     B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
-    C = A.new_empty((M, N), dtype=output_dtype)
+    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
     BLOCK_SIZE_M = adaptive_block_size_m(M)
 
     def grid(META):
@@ -668,12 +673,12 @@ def _mxfp_dynamic_matmul(
             M,
             N,
             K,
-            A.stride(0),
-            A.stride(1),
+            A.stride(-2),
+            A.stride(-1),
             B.stride(1),
             B.stride(0),
-            C.stride(0),
-            C.stride(1),
+            C.stride(-2),
+            C.stride(-1),
             bs_u8.stride(1),
             bs_u8.stride(0),
             # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)

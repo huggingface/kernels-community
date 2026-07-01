@@ -368,12 +368,16 @@ def _w8a8_block_dynamic_fp8_moe_batched(
         ](
             out,
             reduced,
+            top_k_index,
             HIDDEN_DIM,
             out.stride(0),
             out.stride(1),
             reduced.stride(0),
             reduced.stride(1),
+            top_k_index.stride(0),
+            top_k_index.stride(1),
             NUM_TOP_K=NUM_TOP_K,
+            NUM_EXPERTS=NUM_EXPERTS,
             BLOCK_H=TOPK_REDUCE_BLOCK_H,
         )
 
@@ -780,12 +784,16 @@ def _mxfp_dynamic_moe_batched(
         ](
             out,
             reduced,
+            top_k_index,
             HIDDEN_DIM,
             out.stride(0),
             out.stride(1),
             reduced.stride(0),
             reduced.stride(1),
+            top_k_index.stride(0),
+            top_k_index.stride(1),
             NUM_TOP_K=NUM_TOP_K,
+            NUM_EXPERTS=NUM_EXPERTS,
             BLOCK_H=TOPK_REDUCE_BLOCK_H,
         )
 

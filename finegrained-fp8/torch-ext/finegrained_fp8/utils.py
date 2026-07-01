@@ -80,25 +80,32 @@ TOPK_REDUCE_BLOCK_H = 512
 def topk_reduce_kernel(
     ProjOut,
     Out,
+    ExpertIds,
     H,
     stride_pm,
     stride_ph,
     stride_om,
     stride_oh,
+    stride_ei_m,
+    stride_ei_k,
     NUM_TOP_K: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """Sum the ``NUM_TOP_K`` flat ``(token, slot)`` rows of ``ProjOut`` into ``Out[token]`` —
     a tight replacement for ``proj_out.view(T, K, H).sum(1)`` (~2.8x faster than torch's
-    generic reduce; fp32 accumulate, so bit-identical). Caller allocs Out and launches it."""
+    generic reduce; fp32 accumulate, so bit-identical). Slots whose expert is non-local (EP
+    sentinel id ``>= NUM_EXPERTS``) are skipped — the experts kernels never write those rows, so
+    they must contribute 0. Caller allocs Out and launches it."""
     t = tl.program_id(0)
     offs_h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = offs_h < H
     acc = tl.zeros((BLOCK_H,), tl.float32)
     for k in tl.static_range(NUM_TOP_K):
+        local = tl.load(ExpertIds + t * stride_ei_m + k * stride_ei_k) < NUM_EXPERTS
         acc += tl.load(
             ProjOut + (t * NUM_TOP_K + k) * stride_pm + offs_h * stride_ph,
-            mask=mask,
+            mask=mask & local,
             other=0.0,
         ).to(tl.float32)
     tl.store(
@@ -122,6 +129,13 @@ def e2m1_as_uint8(weight: torch.Tensor) -> torch.Tensor:
     return weight.view(torch.uint8) if weight.dtype == torch.int8 else weight
 
 
+# UE8M0 group-32 scales arrive either as ``float8_e8m0fnu`` or as raw ``uint8`` — the same 8
+# exponent bits, and a common on-disk encoding (e.g. group-32 "mxfp8" checkpoints store the
+# scale tensor as uint8). Both are valid MX scales: ``ue8m0_as_uint8`` reinterprets to uint8
+# and the kernels decode ``2^(exp-127)`` inline, so the detectors accept either dtype.
+UE8M0_SCALE_DTYPES = (torch.float8_e8m0fnu, torch.uint8)
+
+
 def is_mxfp8(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     """MXFP8 weight/scale pair: E4M3 weights with UE8M0 group-32 scales — last dim
     ``scale.shape[-1] == weight.shape[-1] // MX_SCALE_GROUP_K``, matching leading dims.
@@ -129,7 +143,7 @@ def is_mxfp8(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     separates MXFP8 from 128-block FP8 (which may also carry UE8M0 scales)."""
     return (
         weight.dtype == torch.float8_e4m3fn
-        and scale.dtype == torch.float8_e8m0fnu
+        and scale.dtype in UE8M0_SCALE_DTYPES
         and scale.ndim == weight.ndim
         and scale.shape[:-1] == weight.shape[:-1]
         and scale.shape[-1] == weight.shape[-1] // MX_SCALE_GROUP_K
@@ -142,10 +156,10 @@ def is_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     MX_SCALE_GROUP_K`` (unpacked K = ``2 * K_half``), matching leading dims. 2D or 3D."""
     return (
         weight.dtype == torch.int8
-        and scale.dtype == torch.float8_e8m0fnu
+        and scale.dtype in UE8M0_SCALE_DTYPES
         and scale.ndim == weight.ndim
         and scale.shape[:-1] == weight.shape[:-1]
-        and scale.shape[-1] == weight.shape[-1] * NIBBLES_PER_BYTE // MX_SCALE_GROUP_K
+        and scale.shape[-1] == (weight.shape[-1] * NIBBLES_PER_BYTE) // MX_SCALE_GROUP_K
     )
 
 
@@ -162,10 +176,10 @@ def is_mxfp(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     else:
         return False
     return (
-        scale.dtype == torch.float8_e8m0fnu
+        scale.dtype in UE8M0_SCALE_DTYPES
         and scale.ndim == weight.ndim
         and scale.shape[:-1] == weight.shape[:-1]
-        and scale.shape[-1] == weight.shape[-1] * values_per_byte // MX_SCALE_GROUP_K
+        and scale.shape[-1] == (weight.shape[-1] * values_per_byte) // MX_SCALE_GROUP_K
     )
 
 
@@ -349,7 +363,10 @@ def sm_shared_memory_limit(device_index: int) -> int:
 
 
 def smem_config_pruner(
-    act_bytes: int, n_weight_tiles: int, weight_bytes: int = 1, reduction_dim: str | None = None
+    act_bytes: int,
+    n_weight_tiles: int,
+    weight_bytes: int = 1,
+    reduction_dim: str | None = None,
 ):
     """Build an ``early_config_prune`` that drops configs whose pipelined operand shared
     memory would overflow the SM — the source of ``out of resource: shared memory`` autotune
@@ -401,7 +418,9 @@ def smem_config_pruner(
                 and c.kwargs.get("BLOCK_SIZE_K", 0) >= all_args[reduction_dim]
             )
 
-        kept = [c for c in configs if smem(c) <= limit and not single_trip_dot_scaled(c)]
+        kept = [
+            c for c in configs if smem(c) <= limit and not single_trip_dot_scaled(c)
+        ]
         return kept or [min(configs, key=smem)]
 
     return prune
@@ -684,7 +703,7 @@ def glu(
     SIMULATE_UNFUSED: tl.constexpr = False,
 ):
     """Gated linear unit on the gate/up matmul accumulators. ``SWIGLU_LIMIT`` clamps gate above and up
-    to ``[-LIMIT, LIMIT]``; ``SWIGLU_ALPHA`` gives the SwiGLU-OAI ``(up + 1) * gate * sigmoid(ALPHA *
+    to ``[-LIMIT, LIMIT]``; ``SWIGLU_ALPHA`` gives the clamped/scaled SwiGLU ``(up + 1) * gate * sigmoid(ALPHA *
     gate)`` (GPT-OSS / MiniMax), else ``ACT_FN(gate) * up`` (``ACT_FN`` in {silu, gelu, relu}, gelu exact
     via erf). ``SIMULATE_UNFUSED`` rounds each materialized value through ``OUT_DTYPE`` to match the
     unfused (separate-kernel) path, where every intermediate lands in that dtype."""
