@@ -544,7 +544,7 @@ class MoEProblem:
         if self.weight_dtype == torch.int8:
             fmt = "mxfp4"
         elif self.is_mxfp:
-            fmt = "mxfp8"
+            fmt = "mxfp8_" + ("u8scale" if self.weight_scale_dtype == torch.uint8 else "e8m0scale")
         else:
             fmt = f"fp8_b{self.block_size[0]}x{self.block_size[1]}"
         if self.swiglu_alpha is not None and self.swiglu_limit is not None:
@@ -612,6 +612,17 @@ MOE_PROBLEMS = [
         num_top_k=8,
         block_size=(1, MX_SCALE_GROUP_K),
         weight_scale_dtype=torch.float8_e8m0fnu,
+    ),
+    # UE8M0 scales stored as raw uint8 (e.g. MiniMax-M3-MXFP8 checkpoints) — must still
+    # detect as MXFP8 and route to the MX path, not fall back to block-dynamic.
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.uint8,
     ),
     # ── Block-dynamic FP8 (E4M3 + fp32 128x128 block scales) ──
     MoEProblem(
