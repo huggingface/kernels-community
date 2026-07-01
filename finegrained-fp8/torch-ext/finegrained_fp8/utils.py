@@ -80,25 +80,32 @@ TOPK_REDUCE_BLOCK_H = 512
 def topk_reduce_kernel(
     ProjOut,
     Out,
+    ExpertIds,
     H,
     stride_pm,
     stride_ph,
     stride_om,
     stride_oh,
+    stride_ei_m,
+    stride_ei_k,
     NUM_TOP_K: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """Sum the ``NUM_TOP_K`` flat ``(token, slot)`` rows of ``ProjOut`` into ``Out[token]`` —
     a tight replacement for ``proj_out.view(T, K, H).sum(1)`` (~2.8x faster than torch's
-    generic reduce; fp32 accumulate, so bit-identical). Caller allocs Out and launches it."""
+    generic reduce; fp32 accumulate, so bit-identical). Slots whose expert is non-local (EP
+    sentinel id ``>= NUM_EXPERTS``) are skipped — the experts kernels never write those rows, so
+    they must contribute 0. Caller allocs Out and launches it."""
     t = tl.program_id(0)
     offs_h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = offs_h < H
     acc = tl.zeros((BLOCK_H,), tl.float32)
     for k in tl.static_range(NUM_TOP_K):
+        local = tl.load(ExpertIds + t * stride_ei_m + k * stride_ei_k) < NUM_EXPERTS
         acc += tl.load(
             ProjOut + (t * NUM_TOP_K + k) * stride_pm + offs_h * stride_ph,
-            mask=mask,
+            mask=mask & local,
             other=0.0,
         ).to(tl.float32)
     tl.store(
@@ -356,7 +363,10 @@ def sm_shared_memory_limit(device_index: int) -> int:
 
 
 def smem_config_pruner(
-    act_bytes: int, n_weight_tiles: int, weight_bytes: int = 1, reduction_dim: str | None = None
+    act_bytes: int,
+    n_weight_tiles: int,
+    weight_bytes: int = 1,
+    reduction_dim: str | None = None,
 ):
     """Build an ``early_config_prune`` that drops configs whose pipelined operand shared
     memory would overflow the SM — the source of ``out of resource: shared memory`` autotune
@@ -408,7 +418,9 @@ def smem_config_pruner(
                 and c.kwargs.get("BLOCK_SIZE_K", 0) >= all_args[reduction_dim]
             )
 
-        kept = [c for c in configs if smem(c) <= limit and not single_trip_dot_scaled(c)]
+        kept = [
+            c for c in configs if smem(c) <= limit and not single_trip_dot_scaled(c)
+        ]
         return kept or [min(configs, key=smem)]
 
     return prune

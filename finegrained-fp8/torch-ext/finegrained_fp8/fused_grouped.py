@@ -130,19 +130,22 @@ def _scatter_kernel(
     Counters,
     S,
     NUM_TOP_K: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Counting-sort scatter: each flat slot atomically claims the next slot of its expert
     (``expert_start[e] + counter[e]++``). O(S), replaces an O(S·logS) argsort. Within-expert
-    order is arbitrary (atomic race) — fine, the per-token reduce is order-invariant."""
+    order is arbitrary (atomic race) — fine, the per-token reduce is order-invariant. Slots whose
+    expert is non-local (EP sentinel id ``>= NUM_EXPERTS``) are skipped — matches ``_count_kernel``,
+    and avoids the atomic/store landing at an out-of-range (invalid) global address."""
     offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offs < S
-    expert_id = tl.load(ExpertIds + offs, mask=mask, other=0)
-    dest = tl.load(ExpertStart + expert_id, mask=mask, other=0) + tl.atomic_add(
-        Counters + expert_id, 1, mask=mask
+    expert_id = tl.load(ExpertIds + offs, mask=offs < S, other=NUM_EXPERTS)
+    valid = expert_id < NUM_EXPERTS
+    dest = tl.load(ExpertStart + expert_id, mask=valid, other=0) + tl.atomic_add(
+        Counters + expert_id, 1, mask=valid
     )
-    tl.store(Perm + dest, offs, mask=mask)
-    tl.store(PermToken + dest, offs // NUM_TOP_K, mask=mask)
+    tl.store(Perm + dest, offs, mask=valid)
+    tl.store(PermToken + dest, offs // NUM_TOP_K, mask=valid)
 
 
 @triton.jit
@@ -195,6 +198,7 @@ def _grouped_routing(expert_ids: torch.Tensor, num_experts: int, num_top_k: int)
             counters,
             num_routed_tokens,
             NUM_TOP_K=num_top_k,
+            NUM_EXPERTS=num_experts,
             BLOCK_SIZE=_ROUTING_BLOCK_SIZE,
         )
     return perm_token, perm, expert_start, num_experts, num_routed_tokens
@@ -549,12 +553,16 @@ def w8a8_block_dynamic_fp8_moe_grouped(
         topk_reduce_kernel[(num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))](
             out,
             reduced,
+            top_k_index,
             HIDDEN_DIM,
             out.stride(0),
             out.stride(1),
             reduced.stride(0),
             reduced.stride(1),
+            top_k_index.stride(0),
+            top_k_index.stride(1),
             NUM_TOP_K=num_top_k,
+            NUM_EXPERTS=NUM_EXPERTS,
             BLOCK_H=TOPK_REDUCE_BLOCK_H,
         )
 
@@ -1078,12 +1086,16 @@ def mxfp_dynamic_moe_grouped(
         topk_reduce_kernel[(num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))](
             out,
             reduced,
+            top_k_index,
             HIDDEN_DIM,
             out.stride(0),
             out.stride(1),
             reduced.stride(0),
             reduced.stride(1),
+            top_k_index.stride(0),
+            top_k_index.stride(1),
             NUM_TOP_K=num_top_k,
+            NUM_EXPERTS=NUM_EXPERTS,
             BLOCK_H=TOPK_REDUCE_BLOCK_H,
         )
 
