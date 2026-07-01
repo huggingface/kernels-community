@@ -1,6 +1,11 @@
 # Copy this file to `build.toml` for testing the build without
 # waiting for hours. Produces a very minimal, no-frills version
 # of vllm-flash-attn3.
+# 
+# Disables:
+#
+# - All head sizes except 128.
+# - Split, paged KV, append KV, softcap, GQA packing, FP8, and backward.
 
 [general]
 name = "vllm-flash-attn3"
