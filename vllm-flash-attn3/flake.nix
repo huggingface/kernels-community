@@ -14,6 +14,7 @@
       inherit self;
       path = ./.;
 
+      # Use ptxas from CUDA 12.8 for CUDA 12.6, since ptxas 12.6 crashes when building FA3.
       torchVersions =
         allVersions:
         builtins.map (
