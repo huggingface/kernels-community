@@ -74,6 +74,66 @@ steps:
 If the user did not specify the version tag, stop and ask which tag to sync
 from.
 
+## msa
+
+When the user asks to sync an MSA (MiniMax Sparse Attention) release, carry
+out the following steps:
+
+- Fetch the upstream Git repository from https://github.com/MiniMax-AI/MSA.git
+- Check out the tag that the user specified.
+- Only the CuTe-DSL sparse stack in `python/fmha_sm100/cute` upstream is
+  mirrored. The dense FMHA stack (`python/fmha_sm100/csrc`, `api.py`,
+  `jit.py`) is intentionally excluded — it relies on runtime `nvcc`/jinja JIT
+  compilation, which is incompatible with kernel-builder.
+- Copy the upstream `cute` top-level modules (`interface.py`,
+  `fp4_indexer_interface.py`, `quantize.py`, `sparse_index_utils.py`) and the
+  `cute/src` tree to `msa/torch-ext/msa/`. Do not copy `example.py`,
+  `Makefile`, `pytest.ini`, or `.gitignore`.
+- The two CUDA C++ helper extensions are precompiled Torch ops in this repo
+  instead of `torch.utils.cpp_extension.load` JIT modules:
+  - `cute/src/sm100/build_k2q_csr/build_k2q_csr.cu` → `msa/csrc/build_k2q_csr.cu`
+  - `cute/src/sm100/fwd_decode/build_decode_schedule/build_decode_schedule.cu`
+    → `msa/csrc/build_decode_schedule.cu`
+  When syncing, diff the upstream `.cu` files against the local copies and
+  re-apply the local porting changes: `torch/extension.h` → `torch/all.h`,
+  no pybind11 (ops are registered in `msa/torch-ext/torch_binding.cpp`), and
+  `build_decode_schedule` returns a tuple of tensors plus a fixed-order
+  `int[]` scalar summary instead of a `py::dict`. The corresponding Python
+  wrapper `__init__.py` files under `msa/torch-ext/msa/src/sm100/` dispatch
+  through `._ops` and must keep their public signatures in sync with
+  upstream.
+- Check in `python/fmha_sm100/cute/requirements.txt` (or the upstream
+  `pyproject.toml`) which version of quack is required.
+- Get this version of quack from https://github.com/Dao-AILab/quack.git
+- Vendor only the quack modules the stack imports (currently
+  `layout_utils`, `copy_utils`, `cute_dsl_utils`, `activation`,
+  `compile_utils`) into `msa/torch-ext/msa/quack/`, with an empty
+  `__init__.py` and the quack `LICENSE`.
+- Now make all imports of the cute stack and quack in `msa/torch-ext/msa`
+  relative imports. In particular:
+  - `from src.<x> import ...` → relative import of `.src.<x>` (dots according
+    to the depth of the importing file).
+  - `from quack import ...` / `from quack.<x> import ...` → relative imports
+    of the vendored `quack` package.
+  - `import quack.activation` → `from <dots>quack import activation`, with
+    `quack.activation.` references renamed to `activation.`.
+  - `import src.common.utils as utils` → `from <dots>src.common import utils`.
+- Copy `cute/test_sparse_atten.py` and `cute/test_fp4_indexer.py` to
+  `msa/tests/` and rewrite the top-level imports (`interface`,
+  `sparse_index_utils`, `fp4_indexer_interface`, `quantize`, `src.*`,
+  `quack.*`) to import from the `msa` package.
+- Keep `msa/torch-ext/msa/__init__.py` in sync with the public API surface
+  re-exported by upstream `python/fmha_sm100/sparse.py`, and set
+  `__version__` to the upstream package version from `pyproject.toml`.
+- Check whether any Torch custom ops are defined in the synced files (look
+  for `torch.library.custom_op`, `torch.library.define`, etc.). If any are
+  found, update them to use `add_op_namespace_prefix` for the op name,
+  importing it from `._ops`. Upstream MSA does not currently define any such
+  ops, so this step is usually a no-op.
+
+If the user did not specify the version tag, stop and ask which tag to sync
+from.
+
 ## liger-kernels
 
 When the user asks to sync a Liger-Kernel release, carry out the following
