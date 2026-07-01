@@ -1,3 +1,7 @@
+// Required for Microsoft math constants and must be defined before including <cmath>
+// https://learn.microsoft.com/en-us/cpp/c-runtime-library/math-constants?view=msvc-170
+#define _USE_MATH_DEFINES
+
 #include <torch/csrc/stable/tensor.h>
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/headeronly/core/ScalarType.h>
