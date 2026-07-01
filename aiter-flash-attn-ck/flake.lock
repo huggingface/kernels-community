@@ -41,15 +41,16 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1782899908,
-        "narHash": "sha256-sBCRMseKzaj/GbArQ6Q7JOBcuU2ShLhKF3XaIdF5KYU=",
+        "lastModified": 1782917305,
+        "narHash": "sha256-RU0xy42D1SPLdGqz1imyBC/+W45ADu7GxE+QxJuejwI=",
         "owner": "huggingface",
         "repo": "kernels",
-        "rev": "1dc23d9d33bf2aebd8f34b6a3840968aa7bbaf87",
+        "rev": "73731337453e7645c605a71208bc7ec6446080b3",
         "type": "github"
       },
       "original": {
         "owner": "huggingface",
+        "ref": "rocm-archs-fix",
         "repo": "kernels",
         "type": "github"
       }

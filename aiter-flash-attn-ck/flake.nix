@@ -2,7 +2,7 @@
   description = "Flake for AITER Flash Attention (AMD ROCm Composable Kernel FMHA) kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels";
+    kernel-builder.url = "github:huggingface/kernels/rocm-archs-fix";
   };
 
   outputs =
