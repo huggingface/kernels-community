@@ -94,7 +94,7 @@ __device__ __forceinline__ T gelu_tanh_kernel(const T& x) {
   TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(                   \
       input.get_device_index(), &stream_ptr));                                 \
   const cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);           \
-  VLLM_DISPATCH_FLOATING_TYPES(                                                \
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(                                                \
       input.scalar_type(), "act_and_mul_kernel", [&] {                        \
         vllm::act_and_mul_kernel<scalar_t, KERNEL<scalar_t>, ACT_FIRST>       \
             <<<grid, block, 0, stream>>>(                                      \
@@ -169,7 +169,7 @@ __global__ void act_and_mul_kernel_with_param(
   TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(                  \
       input.get_device_index(), &stream_ptr));                                \
   const cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);          \
-  VLLM_DISPATCH_FLOATING_TYPES(                                               \
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(                                               \
       input.scalar_type(), "act_and_mul_kernel_with_param", [&] {            \
         vllm::act_and_mul_kernel_with_param<scalar_t, KERNEL<scalar_t>>      \
             <<<grid, block, 0, stream>>>(                                     \
@@ -213,7 +213,7 @@ __global__ void activation_kernel(
   TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(                 \
       input.get_device_index(), &stream_ptr));                               \
   const cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);         \
-  VLLM_DISPATCH_FLOATING_TYPES(                                              \
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(                                              \
       input.scalar_type(), "activation_kernel", [&] {                       \
         vllm::activation_kernel<scalar_t, KERNEL<scalar_t>>                 \
             <<<grid, block, 0, stream>>>(                                    \
