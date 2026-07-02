@@ -1,0 +1,15 @@
+[general]
+name = "fla"
+version = 1
+license = "MIT"
+backends = [
+  "cuda",
+]
+python-depends = ["einops"]
+
+[general.hub]
+repo-id = "AntonV/fla"
+
+[torch-noarch]
+
+[kernel]

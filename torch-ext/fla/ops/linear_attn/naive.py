@@ -1,0 +1,76 @@
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+
+import torch
+from einops import rearrange
+
+
+def naive_recurrent_linear_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float | None = None,
+    initial_state: torch.Tensor | tuple | None = None,
+    output_final_state: bool = False,
+    normalize: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    dtype = q.dtype
+    if scale is None:
+        scale = q.shape[-1] ** -0.5
+    B, T, H, K, V = *q.shape, v.shape[-1]
+    if normalize and isinstance(initial_state, tuple):
+        kv_init, z_init = initial_state
+    else:
+        kv_init, z_init = initial_state, None
+    q, k, v = map(lambda x: x.to(torch.float32), (q, k, v))
+    o = torch.empty_like(v)
+
+    S = torch.zeros((B, H, K, V), device=q.device, dtype=torch.float32)
+    if kv_init is not None:
+        S = S + kv_init
+    for t in range(T):
+        S = S + torch.einsum('b h k, b h v -> b h k v', k[:, t], v[:, t])
+        o[:, t] = torch.einsum('b h k v, b h k -> b h v', S, q[:, t] * scale)
+    if normalize:
+        k_cum = k.cumsum(1) if z_init is None else k.cumsum(1) + z_init
+        o = o / ((q * scale * k_cum).sum(-1, keepdim=True) + 1e-10)
+        if output_final_state:
+            return o.to(dtype), (S, k_cum[:, -1:])
+        return o.to(dtype), None
+    return o.to(dtype), S if output_final_state else None
+
+
+def naive_chunk_linear_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float | None = None,
+    normalize: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if scale is None:
+        scale = q.shape[-1] ** -0.5
+    chunk_size = 64
+    q = rearrange(q, 'b (n c) h d -> b h n c d', c=chunk_size) * scale
+    k = rearrange(k, 'b (n c) h d -> b h n c d', c=chunk_size)
+    v = rearrange(v, 'b (n c) h d -> b h n c d', c=chunk_size)
+    kv = k.transpose(-1, -2) @ v
+    kv = kv.cumsum(2)
+    kv = torch.cat([torch.zeros_like(kv[:, :, :1]), kv[:, :, :-1]], dim=2)
+    inter = q @ kv
+    intra = ((
+        q @ k.transpose(-1, -2)).masked_fill_(
+        torch.triu(torch.ones(chunk_size, chunk_size, dtype=bool, device=q.device), diagonal=1),
+        0,
+    )) @ v
+    o = inter + intra
+    o = rearrange(o, 'b h n c d -> b (n c) h d')
+    if normalize:
+        q = rearrange(q, 'b h n c d -> b (n c) h d')
+        k = rearrange(k, 'b h n c d -> b (n c) h d')
+        k_cum = k.cumsum(1)
+        o = o / ((q * k_cum).sum(-1, keepdim=True) + 1e-10)
+    return o
