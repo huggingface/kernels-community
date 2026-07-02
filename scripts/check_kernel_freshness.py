@@ -58,6 +58,7 @@ KERNEL_SOURCE_MAPPING = {
     "aiter-kernels": "https://github.com/ROCm/aiter",
     # Too much stuff happening in vLLM, not worth reporting as MoE freshness.
     "vllm-moe": "",
+    "fla": "github.com/fla-org/flash-linear-attention",
 }
 
 def parse_args() -> argparse.Namespace:
