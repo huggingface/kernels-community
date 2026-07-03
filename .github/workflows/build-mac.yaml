@@ -69,17 +69,34 @@ jobs:
     strategy:
       fail-fast: false
     steps:
+      # Reject kernel names outside the safe charset before any step uses them.
+      # Accepts e.g.: flash-attn3, rejects: $(myevilcommand).
+      - name: Validate kernel name
+        env:
+          KERNEL: ${{ inputs.kernel_name }}
+        run: |
+          case "$KERNEL" in
+            ''|*[!A-Za-z0-9_-]*)
+              echo "Invalid kernel_name input: must match ^[A-Za-z0-9_-]+$"
+              exit 1
+              ;;
+          esac
+
       # Post a running commit status so the PR shows the build is in progress.
       - name: Set running status
         if: inputs.head_sha != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATUS_CONTEXT: ${{ github.workflow }} / ${{ inputs.kernel_name }}
         run: |
-          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
             -f state="pending" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f target_url="$RUN_URL" \
             -f description="Build in progress" \
-            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
+            -f context="$STATUS_CONTEXT"
 
       # Guard against injection via pr_number input.
       - name: Validate PR number
@@ -154,8 +171,9 @@ jobs:
         if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true
         env:
           KERNEL: ${{ steps.validate.outputs.kernel }}
+          MODE: ${{ inputs.mode }}
         run: |
-          if [ "${{ inputs.mode }}" = "pr" ]; then
+          if [ "$MODE" = "pr" ]; then
             ( cd "$KERNEL" && nix build -L .#ci && ls -l result/ )
           else
             ( cd "$KERNEL" && nix build -L )
@@ -222,6 +240,10 @@ jobs:
       - name: Set commit status
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATUS_CONTEXT: ${{ github.workflow }} / ${{ inputs.kernel_name }}
         run: |
           BUILD="${{ needs.build-kernel.result }}"
 
@@ -236,8 +258,8 @@ jobs:
             DESC="Build did not complete (${BUILD})"
           fi
 
-          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
             -f state="$STATE" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f target_url="$RUN_URL" \
             -f description="$DESC" \
-            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
+            -f context="$STATUS_CONTEXT"
