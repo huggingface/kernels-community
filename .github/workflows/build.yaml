@@ -209,11 +209,13 @@ jobs:
       - name: Build kernel
         env:
           KERNEL: ${{ needs.setup.outputs.kernel }}
+          MODE: ${{ inputs.mode }}
+          BACKEND: ${{ matrix.backend }}
         run: |
-          if [ "${{ inputs.mode }}" = "pr" ]; then
-            ( cd "$KERNEL" && nix build -L .#backendCi.${{ matrix.backend }} && ls -l result/ )
+          if [ "$MODE" = "pr" ]; then
+            ( cd "$KERNEL" && nix build -L ".#backendCi.$BACKEND" && ls -l result/ )
           else
-            ( cd "$KERNEL" && nix build -L .#backendBundle.${{ matrix.backend }} && ls -l result/ )
+            ( cd "$KERNEL" && nix build -L ".#backendBundle.$BACKEND" && ls -l result/ )
           fi
           ( cd "$KERNEL" && cp -rL result build && rm result && chmod -R u+w build )
 
