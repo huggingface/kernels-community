@@ -44,10 +44,25 @@ jobs:
             fi
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
           fi
+
+      # Reject kernel names outside the safe charset before they are used in Hub
+      # repo paths (guards against path traversal / repo retargeting).
+      - name: Validate kernel name
+        if: steps.kernel.outputs.skip != 'true'
+        env:
+          KERNEL: ${{ steps.kernel.outputs.kernel }}
+        run: |
+          case "$KERNEL" in
+            ''|*[!A-Za-z0-9_-]*)
+              echo "Invalid kernel name '$KERNEL': must match ^[A-Za-z0-9_-]+$"
+              exit 1
+              ;;
+          esac
+
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         if: steps.kernel.outputs.skip != 'true'
         with:
-          python-version: '3.12'
+          python-version: "3.12"
       - name: Install kernels
         if: steps.kernel.outputs.skip != 'true'
         run: pip install "kernels[benchmark] @ git+https://github.com/huggingface/kernels#subdirectory=kernels"
