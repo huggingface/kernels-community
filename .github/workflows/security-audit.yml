@@ -69,6 +69,8 @@ jobs:
           REPO: ${{ github.repository }}
         run: gh pr diff "${PR_NUMBER}" --repo "${REPO}" > /tmp/changes.diff
 
+      # NOTE: in the invocation of Claude below, we restrict it to read-only
+      # local tools to avoid potential token exfiltration attacks.
       - name: Run security audit
         id: audit
         env:
@@ -215,7 +217,13 @@ jobs:
           === DIFF ===
           PROMPT
             cat /tmp/changes.diff
-          } | claude -p --model claude-opus-4-8 > /tmp/audit_result.txt
+          } | claude -p \
+                --model claude-opus-4-8 \
+                --permission-mode plan \
+                --allowedTools "Read,Grep,Glob,LS" \
+                --disallowedTools "Bash,BashOutput,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task,KillShell" \
+                --max-turns 40 \
+              > /tmp/audit_result.txt
 
           # Validate LLM output format before trusting it
           if grep -qE '^NO_FINDINGS$' /tmp/audit_result.txt && [ $(wc -l < /tmp/audit_result.txt) -eq 1 ]; then
