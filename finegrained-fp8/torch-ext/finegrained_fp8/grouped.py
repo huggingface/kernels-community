@@ -30,6 +30,9 @@ from .utils import (
     fp8_act_quant_inline,
     get_accelerator_autotuning_configs,
     get_mxfp_autotuning_configs,
+    smem_config_pruner,
+    grf_config_pruner,
+    chain_config_pruners,
     is_mxfp,
     is_tensor_wide,
     e2m1_as_uint8,
@@ -312,6 +315,13 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     ),  # prefill: no scalar branch
     ["N", "K", "BLOCK_SIZE_M"],
     n_trials=60,
+    # bf16 activation tile + single expert weight tile; K is the reduction dim
+    prune_configs_by={
+        "early_config_prune": chain_config_pruners(
+            smem_config_pruner(act_bytes=2, n_weight_tiles=1, reduction_dim="K"),
+            grf_config_pruner(n_accumulators=1, n_weight_tiles=1),
+        )
+    },
 )
 @triton.jit
 def mxfp_dynamic_matmul_grouped_kernel(

@@ -68,6 +68,25 @@ def sm_count(device_index: int) -> int:
             )
 
 
+@functools.lru_cache(maxsize=8)
+def warp_size(device_index: int = 0) -> int:
+    """SIMD sub-group width (threads per warp) of the active target — 32 on Intel PVC/Max and on
+    CUDA. Read from Triton's driver so the register estimate adapts to the device instead of
+    hardcoding one width. Note the Intel backend may override ``threads_per_warp`` per-kernel at
+    compile time; an ``early_config_prune`` runs pre-compile, so this target default is the value
+    to estimate against. Falls back to the largest supported sub-group size, then 32."""
+    try:
+        return triton.runtime.driver.active.get_current_target().warp_size
+    except Exception:
+        try:
+            props = triton.runtime.driver.active.utils.get_device_properties(
+                device_index
+            )
+            return max(props["sub_group_sizes"])
+        except Exception:
+            return 32
+
+
 # H-tile each topk_reduce program reduces (one (token, tile) program per BLOCK_H span). The
 # reduce is bandwidth-bound and saturates at BLOCK_H>=512: a sweep over {128..2048} x prefill
 # shapes put 512/1024/2048 within ~7% (mostly noise) while 128/256 lagged — not worth a tuning
@@ -233,7 +252,7 @@ def get_accelerator_autotuning_configs(
     """Autotune search grid for the current accelerator.
 
     ``num_warps``, ``num_stages`` and ``blocks`` (the ``(BLOCK_SIZE_N, BLOCK_SIZE_K)``
-    tile shapes) are fixed up front from ``(is_xpu, tune_block_nk)``, then crossed
+    tile shapes) are fixed up front from the accelerator and requested tile axes, then crossed
     into the config list.
 
     ``tune_block_nk=True`` sweeps the tile: used by kernels that have no caller
@@ -254,7 +273,9 @@ def get_accelerator_autotuning_configs(
 
     if tune_block_nk:
         tiles = (
-            [(128, 128)] if is_xpu else [(128, 128), (256, 128), (128, 64), (64, 256)]
+            [(128, 128), (128, 64), (64, 128), (64, 64)]
+            if is_xpu
+            else [(128, 128), (256, 128), (128, 64), (64, 256)]
         )
         blocks = [{"BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk} for bn, bk in tiles]
     else:
@@ -422,6 +443,115 @@ def smem_config_pruner(
             c for c in configs if smem(c) <= limit and not single_trip_dot_scaled(c)
         ]
         return kept or [min(configs, key=smem)]
+
+    return prune
+
+
+def grf_config_pruner(
+    n_accumulators: int,
+    n_weight_tiles: int,
+    output_reg_factor: float = 1.0,
+    weight_reg_factor: float = 1.0,
+    grf_regs: int = 256,
+    headroom: float = 0.82,
+):
+    """Build an ``early_config_prune`` that drops configs whose per-thread register footprint
+    would spill even after the XPU large-GRF (256) recompile — the source of the ``Detected N
+    spills ... recompiling using large GRF mode ... Kernel has now M spills`` autotune noise and
+    the slow, wasteful double-compile + bench of a spilling kernel.
+
+    XPU-only: register/GRF pressure is the Intel spill knob (``maxnreg`` is CUDA-only and ignored
+    by the Intel backend), and the estimate was fit on the Intel codegen. On every other backend
+    this is a no-op that returns the configs unchanged.
+
+    Per-thread register estimate (fp32-register-equivalents) =
+    ``(n_accumulators·BM·BN + stages·(BM·BK + n_weight_tiles·BN·BK)) / (num_warps·warp_size)``:
+    the fp32 accumulator(s) ``[BM, BN]`` (gate_up holds 2, down 1) plus the operand working set —
+    one activation tile ``[BM, BK]`` and ``n_weight_tiles`` weight tiles ``[BN, BK]`` (gate_up
+    fuses 2; down has 1) — spread across the block's threads (``num_warps·warp_size``) since on XPU
+    the operands are GRF-resident. That operand term is the same working set the shared-memory
+    estimate uses.
+
+    ``stages`` depends on the compute mode: the pipelined MMA paths (``dot``/``dot_scaled``)
+    multi-buffer the operands ``num_stages`` deep, so they use ``stages = num_stages``; the
+    ``scalar`` decode path is *not* software-pipelined, so it is single-buffered (``stages = 1``)
+    — without that distinction a healthy w8 scalar config (recovers to 0 spills) would score the
+    same as a w2/w4 one that keeps spilling. ``BM`` is the real tile (``1`` for M=1 decode); the
+    MMA pads M to 16 for the systolic array, but the padding rows don't cost real GRF, so BM is
+    *not* floored — flooring over-counts the decode configs and wrongly prunes healthy ones. A
+    config is dropped when the estimate exceeds ``grf_regs · headroom``. The default budget (~210
+    fp32-reg-equivalents) is tuned to keep every observed *healthy* config while dropping the
+    *catastrophic* spillers (estimates well above it, with 10k-80k residual spills after the
+    large-GRF recompile — the real double-compile time sink). It deliberately does NOT try to catch
+    the moderate gray zone (residual ~0.1k-8k): that estimate range overlaps healthy configs and is
+    not separable by this working-set model — observed counterexamples include two gate_up configs
+    with the *same* estimate (200) but opposite outcomes (``BK=128,s2=4`` healthy vs
+    ``BK=256,s2=2`` spilling — equal ``stages·BK`` but the wider single-stage tile spills), and a
+    cross-kernel inversion (a decode config healthy at 198 above a gate_up config spilling at 176).
+    Chasing them needs a tile-width/codegen-aware model that would overfit; those gray-zone configs
+    recompile to working kernels and don't win the tune anyway. ``warp_size`` and the GRF budget are
+    hardware assumptions; ``headroom`` trades tuning speed (prune more) against safety (keep
+    borderline configs). Never returns empty — keeps the lightest-footprint config as a fallback."""
+
+    def prune(configs, named_args, **kwargs):
+        configs = list(configs)
+        # Register/GRF spilling is an Intel-backend concern; the estimate was fit on its
+        # codegen, so leave every other backend's configs untouched.
+        if get_active_device_type() != "xpu":
+            return configs
+        all_args = {**named_args, **kwargs}
+        ws = warp_size()
+        budget = grf_regs * headroom
+
+        def dim(c, name):
+            v = c.kwargs.get(name, all_args.get(name))
+            if v is None:
+                raise ValueError(
+                    f"grf_config_pruner needs {name} (autotune config meta or launch arg) "
+                    "to estimate register pressure; none found."
+                )
+            return v
+
+        def regs(c):
+            BM, BN, BK = (
+                dim(c, n) for n in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K")
+            )
+            if c.kwargs.get("COMPUTE_MODE") in ("dot", "dot_scaled"):
+                stages = c.num_stages  # pipelined: operands multi-buffered num_stages deep
+            elif "COMPUTE_MODE" not in c.kwargs:
+                stages = c.num_stages  # no COMPUTE_MODE → always pipelined (block-dynamic FP8)
+            else:
+                stages = 1  # scalar path is not software-pipelined: single operand buffer
+            acc = output_reg_factor * n_accumulators * BM * BN
+            # The scalar path (mx_scalar_reduce) additionally materializes the *expanded*
+            # weight scale as a full [BN, BK] fp32 tile alongside the fp32 weight tile — a real
+            # ~2-3x on its BN*BK working set that this term omits. It is deliberately NOT added:
+            # it is a uniform multiplier on BN*BK, so it cancels against the num_warps divisor and
+            # cannot separate the observed scalar collision — configs with identical BN*BK/num_warps
+            # (e.g. BN128/BK256/w8 healthy vs BN128/BK128/w4 and BN32/BK256/w2 spilling ~2k) land on
+            # the same estimate regardless. Folding it in would only inflate the healthy config past
+            # budget and prune it. So the model catches the catastrophic scalar spillers (the large
+            # BN*BK/num_warps ones, ~16k-48k residual spills) and lets the borderline ~2k-spill gray
+            # zone through — cheaper than risking the decode-winning scalar config.
+            operand = stages * (BM * BK + weight_reg_factor * n_weight_tiles * BN * BK)
+            return (acc + operand) / (c.num_warps * ws)
+
+        kept = [c for c in configs if regs(c) <= budget]
+        return kept or [min(configs, key=regs)]
+
+    return prune
+
+
+def chain_config_pruners(*pruners):
+    """Compose several ``early_config_prune`` callables into one. Triton's ``prune_configs_by``
+    takes a single ``early_config_prune``, so apply each pruner in turn, feeding the survivors of
+    one into the next. Each pruner keeps its own never-empty fallback, so the chain never empties
+    the config list."""
+
+    def prune(configs, named_args, **kwargs):
+        for p in pruners:
+            configs = p(configs, named_args, **kwargs)
+        return configs
 
     return prune
 
