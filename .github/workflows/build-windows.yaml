@@ -110,6 +110,7 @@ jobs:
     runs-on: windows-2022
     steps:
       # Reject kernel names outside the safe charset before any step uses them.
+      # Accepts e.g.: flash-attn3, rejects: $(myevilcommand).
       - name: Validate kernel name
         shell: pwsh
         env:

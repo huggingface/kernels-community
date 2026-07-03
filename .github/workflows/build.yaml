@@ -71,6 +71,7 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       # Reject kernel names outside the safe charset before any step uses them.
+      # Accepts e.g.: flash-attn3, rejects: $(myevilcommand).
       - name: Validate kernel name
         env:
           KERNEL: ${{ inputs.kernel_name }}

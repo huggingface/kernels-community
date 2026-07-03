@@ -47,6 +47,7 @@ jobs:
 
       # Reject kernel names outside the safe charset before they are used in Hub
       # repo paths (guards against path traversal / repo retargeting).
+      # Accepts e.g.: flash-attn3, rejects: $(myevilcommand).
       - name: Validate kernel name
         if: steps.kernel.outputs.skip != 'true'
         env:
