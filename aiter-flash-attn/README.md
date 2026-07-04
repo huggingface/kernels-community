@@ -8,7 +8,7 @@ tags:
 Self-contained repackaging of the Triton FlashAttention MHA kernels from the
 [ROCm/aiter](https://github.com/ROCm/aiter) project, exposed as a Hugging Face
 Hub kernel. Provides FlashAttention on AMD ROCm GPUs (MI300X / gfx942,
-gfx950, gfx1250) without taking on `aiter` as a pip dependency.
+gfx950, gfx1250, gfx1150, gfx1151) without taking on `aiter` as a pip dependency.
 
 Original code: https://github.com/ROCm/aiter (MIT, © Advanced Micro Devices, Inc.).
 
@@ -37,8 +37,11 @@ learnable attention sinks (e.g. gpt-oss).
 - gfx942 (MI300X)
 - gfx950 (MI355X)
 - gfx1250
+- gfx1150 (Strix Point / RDNA3.5)
+- gfx1151 (Strix Halo / RDNA3.5)
 
-Tuning configs for these architectures ship under `torch-ext/aiter_flash_attn/configs/`.
+Tuning configs for these architectures ship under `torch-ext/aiter_flash_attn/configs/`. The gfx1150 config
+reuses the gfx1151 tuning, since both are RDNA3.5.
 
 ## Quickstart
 
