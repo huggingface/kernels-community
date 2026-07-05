@@ -6,7 +6,7 @@ from functools import partial
 
 import torch
 
-from ._ops_compat import add_quack_op_namespace_prefix
+from ._ops_compat import add_op_namespace_prefix
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -191,7 +191,7 @@ def _compile_softmax_fwd(dtype, out_dtype, N):
     )
 
 
-@torch.library.custom_op(add_quack_op_namespace_prefix("_softmax_fwd"), mutates_args={"out"})
+@torch.library.custom_op(add_op_namespace_prefix("_softmax_fwd"), mutates_args={"out"})
 def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
     """Softmax forward pass.
     Args:
@@ -388,7 +388,7 @@ def _compile_softmax_backward(dtype, y_dtype, dx_dtype, N):
     )
 
 
-@torch.library.custom_op(add_quack_op_namespace_prefix("_softmax_backward"), mutates_args={"dx"})
+@torch.library.custom_op(add_op_namespace_prefix("_softmax_backward"), mutates_args={"dx"})
 def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> None:
     """Softmax backward pass.
     Args:
