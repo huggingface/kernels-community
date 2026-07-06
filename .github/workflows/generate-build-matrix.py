@@ -19,6 +19,8 @@ import os
 import sys
 from pathlib import Path
 
+VALID_BACKENDS = frozenset({"cuda", "cpu", "rocm", "metal", "xpu"})
+
 ARCHES = [
     ("x86_64-linux", "aws-highmemory-32-plus-nix"),
     ("aarch64-linux", "aws-r8g-8xl-plus-nix"),
@@ -34,6 +36,25 @@ def load_concurrency_overrides() -> dict:
         with open(overrides_path) as f:
             return json.load(f)
     return {}
+
+
+def validate_backend(backend) -> str:
+    if backend not in VALID_BACKENDS:
+        print(
+            f"Invalid backend name: {backend!r} "
+            f"(expected one of {sorted(VALID_BACKENDS)})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return backend
+
+
+def validate_int(value, name: str) -> int:
+    # bool is a subclass of int, but we don't want to accept it either.
+    if isinstance(value, bool) or not isinstance(value, int):
+        print(f"Invalid {name} value: {value!r} (expected integer)", file=sys.stderr)
+        sys.exit(1)
+    return value
 
 
 def main():
@@ -58,13 +79,17 @@ def main():
 
     include = [
         {
-            "backend": backend,
+            "backend": validate_backend(backend),
             "arch": arch,
             "runner": runner,
-            "max_jobs": kernel_overrides.get(backend, {}).get(
-                "max-jobs", DEFAULT_MAX_JOBS
+            "max_jobs": validate_int(
+                kernel_overrides.get(backend, {}).get("max-jobs", DEFAULT_MAX_JOBS),
+                "max-jobs",
             ),
-            "cores": kernel_overrides.get(backend, {}).get("cores", DEFAULT_CORES),
+            "cores": validate_int(
+                kernel_overrides.get(backend, {}).get("cores", DEFAULT_CORES),
+                "cores",
+            ),
         }
         for arch, runner in ARCHES
         for backend in backends_by_arch[arch]

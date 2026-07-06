@@ -11,7 +11,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
 import torch
-from ._ops_compat import add_quack_op_namespace_prefix
+from ._ops_compat import add_op_namespace_prefix
 from torch import Tensor
 
 from . import utils as utils
@@ -318,7 +318,7 @@ class RMSNorm(ReductionBase):
 
 
 @torch.library.custom_op(
-    add_quack_op_namespace_prefix("_rmsnorm_fwd"),
+    add_op_namespace_prefix("_rmsnorm_fwd"),
     mutates_args=("out", "rstd", "mean", "residual_out"),
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
@@ -921,7 +921,7 @@ def _get_sm_count(N: int, device: torch.device) -> int:
 
 
 @torch.library.custom_op(
-    add_quack_op_namespace_prefix("_rmsnorm_bwd"),
+    add_op_namespace_prefix("_rmsnorm_bwd"),
     mutates_args={"dx", "dw_partial", "db_partial", "dresidual"},
     device_types="cuda",
     # We need to specify the schema manually since we're mutating an optional tensor
