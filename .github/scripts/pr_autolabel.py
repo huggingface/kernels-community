@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Auto-label pull requests using a small Claude classification plus a few
+Auto-label pull requests using a small LLM classification plus a few
 mechanically derived labels.
 
 The taxonomy lives in ``.github/pr-labels.json`` -- one source of truth for both
-"create the labels" and "what Claude may choose". This script only ever
+"create the labels" and "what the model may choose". This script only ever
 adds/removes labels listed there ("managed" labels); any other label a human
 applies is left untouched (add-only, namespace-scoped reconciliation).
 
@@ -14,13 +14,9 @@ Three entrypoints (all called from .github/workflows/pr-autolabel.yml):
   3. ``sync-labels``    create/update every label from the JSON (manual dispatch)
 
 GitHub access uses ``GITHUB_TOKEN`` (env, with ``gh auth token`` fallback) and
-the REST API over urllib -- no third-party dependencies. The classifier has two
-interchangeable backends (env ``LABELER_PROVIDER``, or auto-detected):
-  * ``hf``     -- the Hugging Face Inference Providers router (OpenAI-compatible
-                  ``/v1/chat/completions``), reading ``HF_TOKEN`` from the env.
-                  Preferred automatically when ``HF_TOKEN`` is set (dogfooding).
-  * ``claude`` -- the Claude Code CLI (``claude -p``), reading ``ANTHROPIC_API_KEY``.
-The model is ``--model`` / ``$MODEL`` (Claude) or ``$HF_MODEL`` (router).
+the REST API over urllib -- no third-party dependencies. Classification uses the
+Hugging Face Inference Providers router (OpenAI-compatible ``/v1/chat/completions``),
+reading ``HF_TOKEN`` from the env; the model is ``--model`` / ``$HF_MODEL``.
 
 SECURITY: PR title/body/filenames are untrusted contributor input. They are only
 ever passed to the classifier as data (never run, eval'd, or interpolated into a
@@ -41,7 +37,6 @@ from datetime import datetime, timezone
 from functools import lru_cache
 
 API_ROOT = "https://api.github.com"
-DEFAULT_MODEL = "claude-haiku-4-5"
 HF_ROUTER_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_DEFAULT_MODEL = "zai-org/GLM-5.2"
 CLASSIFIER_TIMEOUT = 180
@@ -73,8 +68,8 @@ def get_token() -> str | None:
 
 def github_api_request(
     url: str, token: str, method: str = "GET", data: dict | None = None
-):
-    """Perform a single GitHub REST request. Returns ``(status, body_text)``.
+) -> str:
+    """Perform a single GitHub REST request and return the response body text.
 
     Raises ``urllib.error.HTTPError`` on non-2xx (the caller catches 404 where
     a missing resource is expected, e.g. label-exists checks).
@@ -95,12 +90,11 @@ def github_api_request(
         },
     )
     with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
-        return resp.status, resp.read().decode("utf-8")
+        return resp.read().decode("utf-8")
 
 
 def github_get_json(url: str, token: str):
-    _, body = github_api_request(url, token)
-    return json.loads(body)
+    return json.loads(github_api_request(url, token))
 
 
 def github_paginate(path: str, token: str) -> list:
@@ -209,14 +203,10 @@ CONVENTIONAL_TYPES = {
     "sec": "security",
 }
 
-BACKEND_LABELS = {
-    "cuda": "cuda",
-    "rocm": "rocm",
-    "metal": "metal",
-    "cpu": "cpu",
-    "xpu": "xpu",
-    "triton": "triton",
-}
+# Backend labels are named after the backend itself; hardware backends are the
+# subset that pin a PR to specific silicon (triton is vendor-neutral).
+BACKENDS = {"cuda", "rocm", "metal", "cpu", "xpu", "triton"}
+HARDWARE_BACKENDS = BACKENDS - {"triton"}
 
 DOC_BASENAMES = {
     "README",
@@ -417,13 +407,12 @@ def infer_backend_labels(pr: dict, paths: list[str]) -> set[str]:
         if not has_cuda_specific and not has_cuda_source:
             labels.discard("cuda")
 
-    explicit_hardware = labels & {"cuda", "rocm", "metal", "cpu", "xpu"}
+    explicit_hardware = labels & HARDWARE_BACKENDS
     if not explicit_hardware:
         for root_name in roots:
             for backend in build_toml_backends(root_name):
-                label = BACKEND_LABELS.get(backend.lower())
-                if label:
-                    labels.add(label)
+                if backend.lower() in BACKENDS:
+                    labels.add(backend.lower())
 
     return labels
 
@@ -563,7 +552,7 @@ def finalize_labels(tax: Taxonomy, labels: set[str]) -> set[str]:
 
 
 # --------------------------------------------------------------------------- #
-# Claude classification
+# Classification (Hugging Face Inference Providers router)
 # --------------------------------------------------------------------------- #
 def build_prompt(tax: Taxonomy, pr: dict, files: list[dict]) -> str:
     allowed_lines = []
@@ -619,45 +608,33 @@ def build_prompt(tax: Taxonomy, pr: dict, files: list[dict]) -> str:
     )
 
 
-def extract_json_object(text: str, source: str) -> dict | None:
-    """Pull the single JSON object out of a model's free-form text response."""
+def extract_json_object(text: str | None) -> dict | None:
+    """Pull the single JSON object out of the model's free-form text response."""
+    if not isinstance(text, str):
+        print("::warning::model returned no text content", file=sys.stderr)
+        return None
     match = re.search(r"\{[\s\S]*\}", text)
     if not match:
-        print(f"::warning::No JSON in {source} output: {text[:300]}", file=sys.stderr)
+        print(f"::warning::No JSON in model output: {text[:300]}", file=sys.stderr)
         return None
     try:
         return json.loads(match.group(0))
     except json.JSONDecodeError as e:
-        print(f"::warning::Bad JSON from {source}: {e}", file=sys.stderr)
+        print(f"::warning::Bad JSON from model: {e}", file=sys.stderr)
         return None
 
 
-def run_claude(prompt: str, model: str) -> dict | None:
-    """Call ``claude -p`` and parse the single JSON object it returns."""
-    try:
-        proc = subprocess.run(
-            ["claude", "-p", "--model", model],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=CLASSIFIER_TIMEOUT,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        print(f"::warning::Claude call failed: {e}", file=sys.stderr)
-        return None
-    if proc.returncode != 0:
-        print(f"::warning::Claude exited {proc.returncode}: {proc.stderr[:300]}", file=sys.stderr)
-        return None
-    return extract_json_object(proc.stdout, "Claude")
+def classify(prompt: str, model: str) -> dict | None:
+    """Classify a PR via the Hugging Face Inference Providers router
+    (OpenAI-compatible ``/v1/chat/completions``) and return the parsed JSON.
 
-
-def run_hf_router(prompt: str, model: str, token: str) -> dict | None:
-    """Call the Hugging Face Inference Providers router (OpenAI-compatible
-    ``/v1/chat/completions``) and parse the single JSON object it returns.
-
-    Non-streaming: we want one JSON blob, not tokens. ``temperature: 0`` keeps
-    the classification stable across identical PRs.
+    Non-streaming with ``temperature: 0`` for a single, stable JSON blob.
     """
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        print("::warning::HF_TOKEN is unset; skipping classification", file=sys.stderr)
+        return None
+
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -678,51 +655,19 @@ def run_hf_router(prompt: str, model: str, token: str) -> dict | None:
     try:
         with urllib.request.urlopen(req, timeout=CLASSIFIER_TIMEOUT) as resp:
             body = json.loads(resp.read().decode("utf-8"))
+        content = body["choices"][0]["message"]["content"]
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:300] if e.fp else ""
         print(f"::warning::HF router HTTP {e.code}: {detail}", file=sys.stderr)
         return None
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+    except (urllib.error.URLError, TimeoutError, KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
         print(f"::warning::HF router call failed: {e}", file=sys.stderr)
         return None
-
-    try:
-        content = body["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        print(f"::warning::Unexpected HF router response: {json.dumps(body)[:300]}", file=sys.stderr)
-        return None
-    return extract_json_object(content, "HF router")
-
-
-def run_classifier(prompt: str, provider: str, model: str) -> dict | None:
-    """Dispatch to the configured classification backend."""
-    if provider == "hf":
-        token = os.environ.get("HF_TOKEN")
-        if not token:
-            print("::warning::provider=hf but HF_TOKEN is unset; skipping classification", file=sys.stderr)
-            return None
-        return run_hf_router(prompt, model, token)
-    return run_claude(prompt, model)
-
-
-def resolve_provider(explicit: str | None) -> str:
-    """Pick the classifier backend: explicit choice wins, else prefer HF when a
-    token is present (dogfooding), else fall back to the Claude CLI."""
-    if explicit:
-        return explicit.lower()
-    return "hf" if os.environ.get("HF_TOKEN") else "claude"
-
-
-def resolve_model(provider: str, cli_model: str | None) -> str:
-    if cli_model:
-        return cli_model
-    if provider == "hf":
-        return os.environ.get("HF_MODEL", HF_DEFAULT_MODEL)
-    return os.environ.get("MODEL", DEFAULT_MODEL)
+    return extract_json_object(content)
 
 
 def classify_labels(tax: Taxonomy, result: dict | None) -> set[str]:
-    """Validate Claude output against the allowed set."""
+    """Validate model output against the allowed set."""
     result = result or {}
     desired: set[str] = set()
 
@@ -765,7 +710,6 @@ def label_pr(
     repo: str,
     token: str,
     tax: Taxonomy,
-    provider: str,
     model: str,
     number: int,
     ensured: set[str],
@@ -785,11 +729,11 @@ def label_pr(
         desired.add("stale")
 
     # type + backend + semantic. High-confidence labels come from mechanics
-    # first; Claude is only used to fill genuinely ambiguous PRs.
+    # first; the model is only used to fill genuinely ambiguous PRs.
     heuristic = infer_labels(tax, pr, files)
     desired |= heuristic
     if not has_type_label(tax, heuristic):
-        result = run_classifier(build_prompt(tax, pr, files), provider, model)
+        result = classify(build_prompt(tax, pr, files), model)
         desired |= classify_labels(tax, result)
 
     desired = finalize_labels(tax, desired)
@@ -830,14 +774,14 @@ def label_pr(
                 raise
 
 
-def backfill(repo: str, token: str, tax: Taxonomy, provider: str, model: str, dry_run: bool = False):
+def backfill(repo: str, token: str, tax: Taxonomy, model: str, dry_run: bool = False):
     open_prs = github_paginate(f"{API_ROOT}/repos/{repo}/pulls?state=open", token)
     print(f"Backfilling {len(open_prs)} open PR(s).", flush=True)
     ensured: set[str] = set()
     for pr in open_prs:
         try:
             label_pr(
-                repo, token, tax, provider, model, pr["number"], ensured,
+                repo, token, tax, model, pr["number"], ensured,
                 dry_run=dry_run, full_reconcile=True,
             )
         except (TimeoutError, urllib.error.HTTPError, urllib.error.URLError) as e:
@@ -882,17 +826,9 @@ def main():
         help="owner/repo (defaults to $GITHUB_REPOSITORY)",
     )
     parser.add_argument(
-        "--provider",
-        choices=["hf", "claude"],
-        default=os.environ.get("LABELER_PROVIDER"),
-        help="classification backend (default: $LABELER_PROVIDER, else hf when "
-        "$HF_TOKEN is set, else claude)",
-    )
-    parser.add_argument(
         "--model",
         default=None,
-        help="classifier model (default: $HF_MODEL/"
-        f"{HF_DEFAULT_MODEL} for hf, $MODEL/{DEFAULT_MODEL} for claude)",
+        help=f"HF router model (default: $HF_MODEL or {HF_DEFAULT_MODEL})",
     )
     parser.add_argument("--labels-file", default=DEFAULT_LABELS_FILE)
     parser.add_argument(
@@ -919,17 +855,15 @@ def main():
         sys.exit(1)
 
     tax = load_taxonomy(args.labels_file)
-
-    provider = resolve_provider(args.provider)
-    model = resolve_model(provider, args.model)
+    model = args.model or os.environ.get("HF_MODEL", HF_DEFAULT_MODEL)
 
     if args.command == "sync-labels":
         sync_labels(args.repo, token, tax, dry_run=args.dry_run)
     elif args.command == "backfill":
-        print(f"Classifier: provider={provider} model={model}", flush=True)
-        backfill(args.repo, token, tax, provider, model, dry_run=args.dry_run)
+        print(f"Classifier model: {model}", flush=True)
+        backfill(args.repo, token, tax, model, dry_run=args.dry_run)
     elif args.command == "label":
-        label_pr(args.repo, token, tax, provider, model, args.pr, set(), dry_run=args.dry_run)
+        label_pr(args.repo, token, tax, model, args.pr, set(), dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
