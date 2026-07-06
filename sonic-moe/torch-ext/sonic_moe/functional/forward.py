@@ -11,7 +11,7 @@ from cutlass.cute.runtime import from_dlpack
 from ..quack.cute_dsl_utils import torch2cute_dtype_map
 from ..quack.gemm_interface import gemm, gemm_gated
 
-from .._ops_compat import add_op_namespace_prefix
+from .._ops import add_op_namespace_prefix
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 from .topk import Softmax_Over_TopK, TopK_Over_Softmax
 

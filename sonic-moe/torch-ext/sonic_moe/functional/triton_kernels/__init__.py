@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ..._ops_compat import add_op_namespace_prefix
+from ..._ops import add_op_namespace_prefix
 from .bitmatrix import _bitmatrix_metadata_compute_stage1, _bitmatrix_metadata_compute_stage2, _keyed_add
 
 

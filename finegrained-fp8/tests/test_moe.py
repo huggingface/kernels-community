@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 import pytest
 import torch
+import torch.nn.functional as F
 import triton
 
 from utils import (  # type: ignore
@@ -20,6 +21,7 @@ from utils import (  # type: ignore
 )
 
 import finegrained_fp8  # type: ignore
+from finegrained_fp8 import fused_batched, fused_grouped  # type: ignore
 
 
 BENCH_REPEATS = 10
@@ -49,20 +51,23 @@ class Problem:
     compile: bool = False
 
     @property
+    def is_mxfp(self):
+        return self.block_size == (1, MX_SCALE_GROUP_K)
+
+    @property
     def id(self):
         # Recipe label derived from the stored dtype + scale group: packed E2M1 is
         # MXFP4; E4M3 with a 1x32 group is MXFP8; otherwise plain FP8.
-        is_mx = self.block_size == (1, MX_SCALE_GROUP_K)
         if self.weight_dtype == torch.int8:
             fmt = "mxfp4"
-        elif is_mx:
+        elif self.is_mxfp:
             fmt = "mxfp8"
         else:
             fmt = "fp8"
         head = f"{fmt}_S{self.S}_E{self.E}_N{self.N}_K{self.K}_top{self.TOP_K}"
         # MX recipes pin block_size to the 1x32 scale group, so it isn't part of
         # the id (the kernel fixes the group at 32 and autotunes its compute tile).
-        if is_mx:
+        if self.is_mxfp:
             tail = head
         # FP8 with block_size carries block dims; without it, scale_layout names
         # the tensor-mode variant.
@@ -73,7 +78,7 @@ class Problem:
         contig_tag = "contiguous" if self.contiguous else "noncontiguous"
         tail = f"{tail}_{contig_tag}_{DTYPE_TAG[self.dtype]}"
         # UE8M0 weight scales — implied by the MX recipe name, tagged only for FP8.
-        if self.weight_scale_dtype is torch.float8_e8m0fnu and not is_mx:
+        if self.weight_scale_dtype is torch.float8_e8m0fnu and not self.is_mxfp:
             tail = f"{tail}_ue8m0"
         if self.sentinel_fraction > 0:
             tail = f"{tail}_sentinel"
@@ -506,6 +511,460 @@ def test_grouped(problem):
     )
     ref = _routed_matmul_ref(A_sorted, B, Bs, expert_ids_sorted, problem.block_size)
     _assert_correctness(out, ref, expert_ids_sorted, problem)
+
+
+# ── Fused batched MoE (two-kernel gate_up + down) vs the unfused path ────────────
+@dataclass(frozen=True)
+class MoEProblem:
+    """End-to-end fused-MoE shape: ``num_tokens`` routed ``num_top_k`` ways through
+    ``num_experts`` experts, hidden ``hidden_dim``, per-gate ``intermediate_dim``. The
+    recipe is the weight dtype + scale group: ``int8`` (packed E2M1) is MXFP4 and ``e4m3``
+    with a 1x32 group is MXFP8 (both UE8M0); ``e4m3`` with a square ``block_size`` is
+    block-dynamic FP8."""
+
+    num_tokens: int
+    num_experts: int
+    hidden_dim: int
+    intermediate_dim: int
+    num_top_k: int
+    sentinel_fraction: float = 0.0
+    dtype: torch.dtype = torch.bfloat16
+    weight_dtype: torch.dtype = torch.float8_e4m3fn
+    weight_scale_dtype: torch.dtype = torch.float32
+    block_size: Optional[Tuple[int, int]] = None
+    swiglu_alpha: Optional[float] = None
+    swiglu_limit: Optional[float] = None
+    act_fn: str = "silu"
+
+    @property
+    def is_mxfp(self):
+        return self.block_size == (1, MX_SCALE_GROUP_K)
+
+    @property
+    def id(self):
+        if self.weight_dtype == torch.int8:
+            fmt = "mxfp4"
+        elif self.is_mxfp:
+            fmt = "mxfp8_" + (
+                "u8scale" if self.weight_scale_dtype == torch.uint8 else "e8m0scale"
+            )
+        else:
+            fmt = f"fp8_b{self.block_size[0]}x{self.block_size[1]}"
+        if self.swiglu_alpha is not None and self.swiglu_limit is not None:
+            act = "_swiglu"
+        elif self.swiglu_alpha is not None:
+            act = "_swiglu_alpha"
+        elif self.swiglu_limit is not None:
+            act = "_swiglu_limit"
+        elif self.act_fn != "silu":
+            act = f"_{self.act_fn}"
+        else:
+            act = ""
+        return (
+            f"{fmt}_T{self.num_tokens}_E{self.num_experts}_H{self.hidden_dim}"
+            f"_I{self.intermediate_dim}_top{self.num_top_k}_{DTYPE_TAG[self.dtype]}{act}"
+            f"{'_sentinel' if self.sentinel_fraction > 0 else ''}"
+        )
+
+
+MOE_PROBLEMS = [
+    # ── MXFP4 (packed E2M1 + UE8M0 group-32) ──
+    MoEProblem(
+        num_tokens=1,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        weight_dtype=torch.int8,
+        block_size=(1, MX_SCALE_GROUP_K),
+    ),
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        weight_dtype=torch.int8,
+        block_size=(1, MX_SCALE_GROUP_K),
+    ),
+    # fp16 activations on the smallest MXFP4 shape
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        weight_dtype=torch.int8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        dtype=torch.float16,
+    ),
+    # ── MXFP8 (E4M3 + UE8M0 group-32) ──
+    MoEProblem(
+        num_tokens=1,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+    ),
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+    ),
+    # UE8M0 scales stored as raw uint8 (e.g. MiniMax-M3-MXFP8 checkpoints) — must still
+    # detect as MXFP8 and route to the MX path, not fall back to block-dynamic.
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.uint8,
+    ),
+    # ── Block-dynamic FP8 (E4M3 + fp32 128x128 block scales) ──
+    MoEProblem(
+        num_tokens=1,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(128, 128),
+    ),
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(128, 128),
+    ),
+    # ── Clamped/scaled SwiGLU (GPT-OSS / MiniMax-M3), MXFP8 (glu is recipe-independent) ──
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+        swiglu_alpha=1.702,
+        swiglu_limit=7.0,
+    ),
+    # alpha / limit are independent glu branches — cover each alone
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+        swiglu_alpha=1.702,
+    ),
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+        swiglu_limit=7.0,
+    ),
+    # ── GeGLU / ReGLU coverage (activation is orthogonal to recipe, so one MXFP8 shape each) ──
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+        act_fn="gelu",
+    ),
+    MoEProblem(
+        num_tokens=4,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+        act_fn="relu",
+    ),
+    # ── Expert parallelism: non-local experts sentinel-masked (routing is orthogonal to recipe) ──
+    # MXFP8 (MiniMax-M3) + block-dynamic FP8, exercised on both the grouped and batched fused paths.
+    MoEProblem(
+        num_tokens=8,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(1, MX_SCALE_GROUP_K),
+        weight_scale_dtype=torch.float8_e8m0fnu,
+        sentinel_fraction=0.875,
+    ),
+    MoEProblem(
+        num_tokens=8,
+        num_experts=8,
+        hidden_dim=512,
+        intermediate_dim=256,
+        num_top_k=8,
+        block_size=(128, 128),
+        sentinel_fraction=0.875,
+    ),
+]
+
+
+def _make_moe_weights(problem: MoEProblem):
+    """gate_up ``(E, 2I, H)`` and down ``(E, H, I)`` weights + inv-scales for the recipe."""
+    bs = list(problem.block_size)
+    kw = dict(
+        weight_dtype=problem.weight_dtype,
+        scale_dtype=problem.weight_scale_dtype,  # forced to UE8M0 internally for int8
+        num_experts=problem.num_experts,
+    )
+    gate_up, gate_up_s = make_weights(
+        2 * problem.intermediate_dim, problem.hidden_dim, TEST_DEVICE, bs, **kw
+    )
+    down, down_s = make_weights(
+        problem.hidden_dim, problem.intermediate_dim, TEST_DEVICE, bs, **kw
+    )
+    return gate_up, gate_up_s, down, down_s, bs
+
+
+def _make_moe_inputs(problem: MoEProblem):
+    """Random ``(hidden, top_k_index, top_k_weights)`` for the fused-MoE problem shape."""
+    hidden = torch.randn(
+        problem.num_tokens, problem.hidden_dim, device=TEST_DEVICE, dtype=problem.dtype
+    )
+    top_k_index = torch.randint(
+        0,
+        problem.num_experts,
+        (problem.num_tokens, problem.num_top_k),
+        device=TEST_DEVICE,
+        dtype=torch.int32,
+    )
+    if problem.sentinel_fraction > 0:
+        # EP: mark a random subset of routed slots non-local with an out-of-range id (== num_experts),
+        # which the fused path must skip. Mirrors _make_routed_inputs.
+        flat = top_k_index.reshape(-1)
+        n_sentinel = int(round(flat.numel() * problem.sentinel_fraction))
+        idx = torch.randperm(flat.numel(), device=flat.device)[:n_sentinel]
+        flat[idx] = problem.num_experts
+    top_k_weights = torch.rand(
+        problem.num_tokens, problem.num_top_k, device=TEST_DEVICE, dtype=problem.dtype
+    )
+    return hidden, top_k_index, top_k_weights
+
+
+_ACT_FNS = {"silu": F.silu, "gelu": F.gelu, "relu": F.relu}
+
+
+def _glu_ref(gate, up, act_fn, swiglu_alpha=None, swiglu_limit=None):
+    """Reference GLU activation, mirroring the fused kernel's ``glu`` and the model
+    ``_apply_gate``. ``swiglu_limit`` clamps gate above / up to ``[-limit, limit]``;
+    ``swiglu_alpha`` gives clamped/scaled SwiGLU ``(up + 1) * gate * sigmoid(alpha * gate)``
+    (GPT-OSS / MiniMax-M3). Otherwise plain GLU ``act_fn(gate) * up``."""
+    if swiglu_limit is not None:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    if swiglu_alpha is not None:
+        return (up + 1.0) * (gate * torch.sigmoid(gate * swiglu_alpha))
+    return _ACT_FNS[act_fn](gate) * up
+
+
+def _unfused_batched_ref(
+    hidden,
+    top_k_index,
+    top_k_weights,
+    gate_up,
+    gate_up_s,
+    down,
+    down_s,
+    problem,
+    block_size,
+    act_fn,
+    swiglu_alpha=None,
+    swiglu_limit=None,
+):
+    """The transformers batched-experts forward (``integrations/moe.py``) built on the
+    tested ``matmul_batched``: replicate each token to its routed slots, gate_up projection,
+    GLU (``act_fn(gate) * up``, or clamped/scaled SwiGLU when ``swiglu_alpha``/``swiglu_limit``
+    are set), down projection, then the routing-weighted top-k reduce."""
+    # EP: a non-local expert is marked with an out-of-range sentinel id; drop those slots (dummy
+    # expert, zero weight) so they contribute 0 — matching the fused path's scatter guard + reduce
+    # mask. No-op when there are no sentinels.
+    keep = top_k_index < problem.num_experts
+    top_k_index = torch.where(keep, top_k_index, torch.zeros_like(top_k_index))
+    top_k_weights = top_k_weights * keep.to(top_k_weights.dtype)
+    num_tokens, num_top_k = hidden.shape[0], problem.num_top_k
+    expert_ids = top_k_index.reshape(-1).to(torch.int32)
+    routed = hidden.repeat_interleave(num_top_k, dim=0)
+    gate_up_out = finegrained_fp8.matmul_batched(
+        routed, gate_up, gate_up_s, expert_ids, block_size
+    )
+    gate, up = gate_up_out.chunk(2, dim=-1)
+    inter = _glu_ref(gate, up, act_fn, swiglu_alpha, swiglu_limit)
+    down_out = finegrained_fp8.matmul_batched(
+        inter, down, down_s, expert_ids, block_size
+    )
+    weighted = down_out * top_k_weights.reshape(-1, 1)
+    return weighted.view(num_tokens, num_top_k, problem.hidden_dim).sum(dim=1)
+
+
+def _unfused_grouped_ref(
+    hidden,
+    top_k_index,
+    top_k_weights,
+    gate_up,
+    gate_up_s,
+    down,
+    down_s,
+    problem,
+    block_size,
+    act_fn,
+    swiglu_alpha=None,
+    swiglu_limit=None,
+):
+    """The same MoE forward as ``_unfused_batched_ref`` but built on the tested
+    ``matmul_grouped`` — sort the routed tokens by expert, grouped gate_up, GLU
+    (``act_fn(gate) * up``, or clamped/scaled SwiGLU when ``swiglu_alpha``/``swiglu_limit`` are
+    set), grouped down, unsort, routing-weighted top-k reduce. Using the grouped GEMM (not
+    batched) matches the fused grouped path's tiling / reduce order."""
+    # EP: a non-local expert is marked with an out-of-range sentinel id; drop those slots (dummy
+    # expert, zero weight) so they contribute 0 — matching the fused path's scatter guard + reduce
+    # mask. No-op when there are no sentinels.
+    keep = top_k_index < problem.num_experts
+    top_k_index = torch.where(keep, top_k_index, torch.zeros_like(top_k_index))
+    top_k_weights = top_k_weights * keep.to(top_k_weights.dtype)
+    num_tokens, num_top_k = hidden.shape[0], problem.num_top_k
+    expert_ids = top_k_index.reshape(-1).to(torch.int32)
+    routed = hidden.repeat_interleave(num_top_k, dim=0)
+    perm = torch.argsort(expert_ids)
+    inv_perm = torch.empty_like(perm)
+    inv_perm[perm] = torch.arange(perm.numel(), device=perm.device)
+    a_sorted = routed[perm].contiguous()
+    tokens_per_expert = torch.bincount(expert_ids, minlength=problem.num_experts).to(
+        torch.int32
+    )
+    offsets = torch.cumsum(tokens_per_expert, dim=0).to(torch.int32)
+
+    gate_up_out = finegrained_fp8.matmul_grouped(
+        a_sorted, gate_up, gate_up_s, offsets, tokens_per_expert, block_size
+    )
+    gate, up = gate_up_out.chunk(2, dim=-1)
+    inter = _glu_ref(gate, up, act_fn, swiglu_alpha, swiglu_limit)
+    down_out = finegrained_fp8.matmul_grouped(
+        inter, down, down_s, offsets, tokens_per_expert, block_size
+    )
+    weighted = down_out[inv_perm] * top_k_weights.reshape(-1, 1)
+    return weighted.view(num_tokens, num_top_k, problem.hidden_dim).sum(dim=1)
+
+
+def _assert_fused_correctness(out, ref, problem: MoEProblem):
+    """Shape, dtype, and value checks against the unfused reference."""
+    assert out.shape == (problem.num_tokens, problem.hidden_dim)
+    assert out.dtype == problem.dtype
+    atol, rtol = DTYPE_TO_TOL[problem.dtype]
+    # Clamped/scaled SwiGLU's (up + 1) makes the down-matmul outputs cancellation-prone: the few-ULP
+    # gap between the valid MX compute modes the autotuner may pick (native dot_scaled vs cuda-core
+    # dot, both correct) blows up to ~6% relative on the near-zero results. The kernel is verified
+    # bit-exact vs an fp32 dequant-matmul truth, so relax rtol for that path only.
+    if problem.swiglu_alpha is not None:
+        rtol = max(rtol, 0.1)
+    torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
+@pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
+def test_fused_batched(problem):
+    """Fused two-kernel MoE (gate_up + activation + FP8 requant + down + top-k reduce) via the
+    ``moe_fused_batched`` dispatcher vs the unfused reference. ``simulate_unfused`` rounds each
+    fused step through the activation dtype so the two agree to reduce order. The activation
+    (``act_fn`` / clamped SwiGLU) is a per-problem field, not a separate axis."""
+    torch.manual_seed(0)
+    gate_up, gate_up_s, down, down_s, block_size = _make_moe_weights(problem)
+    hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
+    ref = _unfused_batched_ref(
+        hidden,
+        top_k_index,
+        top_k_weights,
+        gate_up,
+        gate_up_s,
+        down,
+        down_s,
+        problem,
+        block_size,
+        problem.act_fn,
+        swiglu_alpha=problem.swiglu_alpha,
+        swiglu_limit=problem.swiglu_limit,
+    )
+    out = fused_batched.moe_fused_batched(
+        hidden,
+        top_k_index,
+        top_k_weights,
+        gate_up,
+        down,
+        gate_up_s,
+        down_s,
+        block_size,
+        act_fn=problem.act_fn,
+        swiglu_alpha=problem.swiglu_alpha,
+        swiglu_limit=problem.swiglu_limit,
+        simulate_unfused=True,
+    )
+    _assert_fused_correctness(out, ref, problem)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
+@pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
+def test_fused_grouped(problem):
+    """Fused grouped MoE (gather gate_up + activation + FP8 requant + grouped down + top-k
+    reduce) via the ``moe_fused_grouped`` dispatcher vs the same unfused reference, with
+    ``simulate_unfused`` rounding each fused step through the activation dtype. The activation
+    (``act_fn`` / clamped SwiGLU) is a per-problem field, not a separate axis."""
+    torch.manual_seed(0)
+    gate_up, gate_up_s, down, down_s, block_size = _make_moe_weights(problem)
+    hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
+    ref = _unfused_grouped_ref(
+        hidden,
+        top_k_index,
+        top_k_weights,
+        gate_up,
+        gate_up_s,
+        down,
+        down_s,
+        problem,
+        block_size,
+        problem.act_fn,
+        swiglu_alpha=problem.swiglu_alpha,
+        swiglu_limit=problem.swiglu_limit,
+    )
+    out = fused_grouped.moe_fused_grouped(
+        hidden,
+        top_k_index,
+        top_k_weights,
+        gate_up,
+        down,
+        gate_up_s,
+        down_s,
+        block_size,
+        act_fn=problem.act_fn,
+        swiglu_alpha=problem.swiglu_alpha,
+        swiglu_limit=problem.swiglu_limit,
+        simulate_unfused=True,
+    )
+    _assert_fused_correctness(out, ref, problem)
 
 
 def _bench_setup(problem: Problem):
