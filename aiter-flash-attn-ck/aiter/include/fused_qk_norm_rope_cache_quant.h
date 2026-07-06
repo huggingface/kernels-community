@@ -1,0 +1,113 @@
+#pragma once
+
+#include <torch/extension.h>
+
+using namespace at;
+
+namespace aiter {
+
+void fused_qk_norm_rope_cache_quant_shuffle(
+    at::Tensor& qkv, // Deprecated concatenated QKV [num_tokens, total_heads*head_dim]. May be empty
+                     // when using opt_q/opt_k/opt_v only. If both are passed, q/k/v win; qkv is ignored.
+    int64_t num_heads_q,               // Number of query heads
+    int64_t num_heads_k,               // Number of key heads
+    int64_t num_heads_v,               // Number of value heads
+    int64_t head_dim,                  // Dimension per head
+    double eps,                        // Epsilon for RMS normalization
+    at::Tensor& q_weight,              // RMSNorm weights for query [head_dim]
+    at::Tensor& k_weight,              // RMSNorm weights for key [head_dim]
+    at::Tensor& cos_sin_cache,         // Cos/sin cache [max_position, head_dim]
+    bool is_neox,                      // Whether RoPE is applied in Neox style
+    at::Tensor& position_ids,          // Position IDs for RoPE [num_tokens]
+    at::Tensor& k_cache,               // [num_blocks, num_kv_heads, head_dim//x, page_size, x]
+    at::Tensor& v_cache,               // 4D [num_blocks, num_heads_v, head_dim, page_size] or 5D shuffle
+                                       // [num_blocks, num_heads_v, page_size//x, head_dim, x]
+    at::Tensor& slot_mapping,          // slot mapping
+    const std::string& kv_cache_dtype, // kv cache data type
+    std::optional<at::Tensor> k_scale, // k scale tensor for quantized k cache
+    std::optional<at::Tensor> v_scale,  // v scale tensor for quantized v cache
+    std::optional<at::Tensor> opt_q = c10::nullopt, // 2D [T, Hq*D] or 3D [T, Hq, D]; arbitrary strides (kernel uses scalar path if dim stride != 1)
+    std::optional<at::Tensor> opt_k = c10::nullopt, // 2D [T, Hk*D] or 3D [T, Hk, D]
+    std::optional<at::Tensor> opt_v = c10::nullopt  // 2D [T, Hv*D] or 3D [T, Hv, D]
+);
+
+void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
+                                                at::Tensor& qw,
+                                                at::Tensor& kw,
+                                                at::Tensor& cos_sin,
+                                                at::Tensor& positions,
+                                                int64_t num_tokens,
+                                                int64_t num_heads_q,
+                                                int64_t num_heads_k,
+                                                int64_t num_heads_v,
+                                                int64_t head_size,
+                                                bool is_neox_style,
+                                                double eps,
+                                                at::Tensor& q_out,
+                                                at::Tensor& k_cache,
+                                                at::Tensor& v_cache,
+                                                at::Tensor& slot_mapping,
+                                                at::Tensor& per_tensor_k_scale,
+                                                at::Tensor& per_tensor_v_scale,
+                                                std::optional<at::Tensor> k_out,
+                                                std::optional<at::Tensor> v_out,
+                                                bool return_kv,
+                                                bool use_shuffle_layout,
+                                                int64_t block_size,
+                                                int64_t x,
+                                                int64_t rotary_dim = 0);
+
+void fused_qk_norm_rope_2way(at::Tensor& q0,
+                             at::Tensor& k0,
+                             at::Tensor& q1,
+                             at::Tensor& k1,
+                             at::Tensor& w_q0,
+                             at::Tensor& w_k0,
+                             at::Tensor& w_q1,
+                             at::Tensor& w_k1,
+                             at::Tensor& cos_sin0,
+                             at::Tensor& cos_sin1,
+                             int64_t batch_size,
+                             int64_t num_tokens0,
+                             int64_t num_tokens1,
+                             int64_t num_heads_q,
+                             int64_t num_heads_k,
+                             int64_t head_size,
+                             bool is_interleaved,
+                             double eps,
+                             at::Tensor& out_q01,
+                             at::Tensor& out_k01);
+
+std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm(at::Tensor& q,
+                                                    at::Tensor& q_weight,
+                                                    double q_eps,
+                                                    at::Tensor& k,
+                                                    at::Tensor& k_weight,
+                                                    double k_eps,
+                                                    std::optional<at::Tensor> q_out,
+                                                    std::optional<at::Tensor> k_out);
+
+void fused_qk_norm_rope_cache_block_quant_shuffle(
+    at::Tensor& qkv,                   // Combined QKV tensor [num_tokens,
+                                       // (num_heads_q+num_heads_k+num_heads_v)*head_dim]
+    int64_t num_heads_q,               // Number of query heads
+    int64_t num_heads_k,               // Number of key heads
+    int64_t num_heads_v,               // Number of value heads
+    int64_t head_dim,                  // Dimension per head
+    double eps,                        // Epsilon for RMS normalization
+    at::Tensor& q_weight,              // RMSNorm weights for query [head_dim]
+    at::Tensor& k_weight,              // RMSNorm weights for key [head_dim]
+    at::Tensor& cos_sin_cache,         // Cos/sin cache [max_position, head_dim]
+    bool is_neox,                      // Whether RoPE is applied in Neox style
+    at::Tensor& position_ids,          // Position IDs for RoPE [num_tokens]
+    at::Tensor& k_cache,               // k cache
+    at::Tensor& v_cache,               // v cache
+    at::Tensor& slot_mapping,          // slot mapping
+    at::Tensor& cu_q_len,              // cu q len tensor
+    const std::string& kv_cache_dtype, // kv cache data type
+    std::optional<at::Tensor> k_scale, // k scale tensor for quantized k cache
+    std::optional<at::Tensor> v_scale, // v scale tensor for quantized v cache
+    int64_t max_tokens_per_batch = 0   // max tokens in any single batch (0 = use avg)
+);
+
+} // namespace aiter
