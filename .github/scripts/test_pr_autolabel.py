@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest import mock
 
 import pr_autolabel as autolabel
 
@@ -152,6 +154,30 @@ class PrAutolabelHeuristicsTest(unittest.TestCase):
         self.assertIn("needs-rebase", labels)  # status is uncapped
         self.assertIn("new-kernel", labels)  # higher priority than performance
         self.assertNotIn("performance", labels)  # trimmed by the global cap
+
+
+class ProviderResolutionTest(unittest.TestCase):
+    def test_prefers_hf_when_token_present(self):
+        with mock.patch.dict(os.environ, {"HF_TOKEN": "x"}, clear=False):
+            self.assertEqual(autolabel.resolve_provider(None), "hf")
+
+    def test_falls_back_to_claude_without_token(self):
+        cleaned = {k: v for k, v in os.environ.items() if k != "HF_TOKEN"}
+        with mock.patch.dict(os.environ, cleaned, clear=True):
+            self.assertEqual(autolabel.resolve_provider(None), "claude")
+
+    def test_explicit_choice_overrides_autodetect(self):
+        with mock.patch.dict(os.environ, {"HF_TOKEN": "x"}, clear=False):
+            self.assertEqual(autolabel.resolve_provider("claude"), "claude")
+
+    def test_model_defaults_are_provider_specific(self):
+        cleaned = {
+            k: v for k, v in os.environ.items() if k not in ("MODEL", "HF_MODEL")
+        }
+        with mock.patch.dict(os.environ, cleaned, clear=True):
+            self.assertEqual(autolabel.resolve_model("hf", None), autolabel.HF_DEFAULT_MODEL)
+            self.assertEqual(autolabel.resolve_model("claude", None), autolabel.DEFAULT_MODEL)
+        self.assertEqual(autolabel.resolve_model("hf", "org/model"), "org/model")
 
 
 if __name__ == "__main__":

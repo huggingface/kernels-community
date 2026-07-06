@@ -1,12 +1,17 @@
 name: PR Auto-Label
 
-# Automatically labels pull requests using a small Claude classification plus a
+# Automatically labels pull requests using a small model classification plus a
 # few mechanically derived labels. The taxonomy lives in .github/pr-labels.json
-# (one source of truth for "create the labels" and "what Claude may choose") and
-# all the logic lives in .github/scripts/pr_autolabel.py.
+# (one source of truth for "create the labels" and "what the model may choose")
+# and all the logic lives in .github/scripts/pr_autolabel.py.
+#
+# The classifier prefers the Hugging Face Inference Providers router when the
+# HF_TOKEN secret is set (dogfooding an HF-hosted model); otherwise it falls back
+# to the Claude Code CLI with ANTHROPIC_API_KEY.
 #
 # Setup (one-time):
-#   1. Add the ANTHROPIC_API_KEY secret (Settings -> Secrets and variables -> Actions).
+#   1. Add a classifier secret: HF_TOKEN (preferred) and/or ANTHROPIC_API_KEY
+#      (Settings -> Secrets and variables -> Actions).
 #   2. Run this workflow via the Actions tab with mode=sync-labels to create every
 #      label (colors/descriptions) from .github/pr-labels.json.
 #   3. Run it again with mode=backfill to label the currently-open PRs.
@@ -49,22 +54,32 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  MODEL: claude-haiku-4-5 # override here to bump quality (e.g. claude-opus-4-8)
+  # Model per backend. The router (HF_TOKEN) is preferred automatically; MODEL is
+  # only used for the Claude fallback when HF_TOKEN is unset.
+  HF_MODEL: zai-org/GLM-5.2 # override to try a different HF-hosted model
+  MODEL: claude-haiku-4-5 # claude fallback model (e.g. claude-opus-4-8 for quality)
 
 jobs:
   autolabel:
     runs-on: ubuntu-latest
+    env:
+      # Surfaced as an env var so steps can gate on whether the router is used.
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       # Checkout WITHOUT a ref: under pull_request_target this resolves to the
       # base repo's branch (trusted), never the PR head. We only need the
       # script and .github/pr-labels.json from it.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      # Only needed for the Claude fallback backend; the HF router path is pure
+      # urllib and needs no Node/CLI.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: env.HF_TOKEN == ''
         with:
           node-version: "20"
 
       - name: Install Claude Code
+        if: env.HF_TOKEN == ''
         run: npm install -g @anthropic-ai/claude-code@2.1.139
 
       # Single self-contained Python script (stdlib only, matching the repo's
@@ -75,6 +90,8 @@ jobs:
       - name: Classify and label
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_MODEL: ${{ env.HF_MODEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MODEL: ${{ env.MODEL }}
           GITHUB_REPOSITORY: ${{ github.repository }}
