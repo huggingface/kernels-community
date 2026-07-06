@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Auto-label pull requests using a small LLM classification plus a few
+Auto-label pull requests with a small LLM classification plus a couple of
 mechanically derived labels.
 
 The taxonomy lives in ``.github/pr-labels.json`` -- one source of truth for both
@@ -17,6 +17,8 @@ GitHub access uses ``GITHUB_TOKEN`` (env, with ``gh auth token`` fallback) and
 the REST API over urllib -- no third-party dependencies. Classification uses the
 Hugging Face Inference Providers router (OpenAI-compatible ``/v1/chat/completions``),
 reading ``HF_TOKEN`` from the env; the model is ``--model`` / ``$HF_MODEL``.
+Obvious PRs (dependabot bumps, conventional-commit titles) are typed by a cheap
+prefilter and skip the model entirely.
 
 SECURITY: PR title/body/filenames are untrusted contributor input. They are only
 ever passed to the classifier as data (never run, eval'd, or interpolated into a
@@ -29,12 +31,10 @@ import os
 import re
 import subprocess
 import sys
-import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from functools import lru_cache
 
 API_ROOT = "https://api.github.com"
 HF_ROUTER_URL = "https://router.huggingface.co/v1/chat/completions"
@@ -43,11 +43,10 @@ CLASSIFIER_TIMEOUT = 180
 DEFAULT_LABELS_FILE = ".github/pr-labels.json"
 API_TIMEOUT = int(os.environ.get("GITHUB_API_TIMEOUT", "30"))
 STALE_DAYS = 30
-DEPENDABOT = "dependabot[bot]"
 
 
 # --------------------------------------------------------------------------- #
-# GitHub API helpers (stdlib only, matching .github/scripts/dispatch.py style)
+# GitHub API helpers (stdlib only)
 # --------------------------------------------------------------------------- #
 def get_token() -> str | None:
     """Resolve GitHub token: env var first, then ``gh auth token`` fallback."""
@@ -56,10 +55,7 @@ def get_token() -> str | None:
         return token
     try:
         result = subprocess.run(
-            ["gh", "auth", "token"],
-            capture_output=True,
-            text=True,
-            check=True,
+            ["gh", "auth", "token"], capture_output=True, text=True, check=True
         )
         return result.stdout.strip() or None
     except (FileNotFoundError, subprocess.CalledProcessError):
@@ -74,13 +70,9 @@ def github_api_request(
     Raises ``urllib.error.HTTPError`` on non-2xx (the caller catches 404 where
     a missing resource is expected, e.g. label-exists checks).
     """
-    body = None
-    if data is not None:
-        body = json.dumps(data).encode("utf-8")
-
     req = urllib.request.Request(
         url=url,
-        data=body,
+        data=json.dumps(data).encode("utf-8") if data is not None else None,
         method=method,
         headers={
             "Accept": "application/vnd.github+json",
@@ -97,18 +89,13 @@ def github_get_json(url: str, token: str):
     return json.loads(github_api_request(url, token))
 
 
-def github_paginate(path: str, token: str) -> list:
-    """Page-based pagination (per_page=100) for a list endpoint.
-
-    ``path`` is everything after ``/repos/{repo}`` is already baked into ``url``;
-    here ``path`` is a full URL minus query string.
-    """
+def github_paginate(url: str, token: str) -> list:
+    """Page-based pagination (per_page=100) for a list endpoint."""
     out: list = []
     page = 1
     while True:
-        sep = "&" if "?" in path else "?"
-        url = f"{path}{sep}per_page=100&page={page}"
-        batch = github_get_json(url, token)
+        sep = "&" if "?" in url else "?"
+        batch = github_get_json(f"{url}{sep}per_page=100&page={page}", token)
         if not isinstance(batch, list) or not batch:
             break
         out.extend(batch)
@@ -133,15 +120,11 @@ class Taxonomy:
         self.order: dict[str, list[str]] = {}  # key -> labels in priority order
         self._dim_index = {key: i for i, key in enumerate(self.dims)}
         for key, dim in self.dims.items():
-            names = list(dim["labels"].keys())
-            self.order[key] = names
-            self.by_dim[key] = set(names)
+            self.order[key] = list(dim["labels"])
+            self.by_dim[key] = set(dim["labels"])
             for name, description in dim["labels"].items():
                 self.meta[name] = {"color": dim["color"], "description": description}
                 self.managed.add(name)
-
-    def allowed(self, key: str) -> list[str]:
-        return list(self.dims[key]["labels"].keys())
 
     def dim_for(self, label: str) -> str | None:
         for key, labels in self.by_dim.items():
@@ -150,11 +133,10 @@ class Taxonomy:
         return None
 
     def rank(self, label: str) -> tuple[int, int]:
-        """Global priority key: (dimension order, position within the dimension).
+        """Priority key: (dimension order, position within it); lower sorts first.
 
-        Lower sorts first. Used to keep the highest-priority labels when a
-        per-dimension or global cap trims the set. Dimensions and the labels
-        within them are authored in priority order in pr-labels.json.
+        Used to keep the highest-priority labels when a cap trims the set;
+        dimensions and their labels are authored in priority order in the JSON.
         """
         key = self.dim_for(label)
         if key is None:
@@ -177,15 +159,7 @@ def load_taxonomy(path: str) -> Taxonomy:
 
 
 # --------------------------------------------------------------------------- #
-# Mechanical labels
-# --------------------------------------------------------------------------- #
-def is_stale(updated_at: str) -> bool:
-    ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-    return (datetime.now(timezone.utc) - ts).days > STALE_DAYS
-
-
-# --------------------------------------------------------------------------- #
-# Deterministic classification
+# Cheap prefilter + mechanical labels (no model needed)
 # --------------------------------------------------------------------------- #
 CONVENTIONAL_TYPES = {
     "feat": "feature",
@@ -203,372 +177,38 @@ CONVENTIONAL_TYPES = {
     "sec": "security",
 }
 
-# Backend labels are named after the backend itself; hardware backends are the
-# subset that pin a PR to specific silicon (triton is vendor-neutral).
-BACKENDS = {"cuda", "rocm", "metal", "cpu", "xpu", "triton"}
-HARDWARE_BACKENDS = BACKENDS - {"triton"}
 
-DOC_BASENAMES = {
-    "README",
-    "README.md",
-    "CARD.md",
-    "CONTRIBUTING.md",
-    "LICENSE",
-    "NOTICE",
-    "CHANGELOG.md",
-}
-
-BUILD_BASENAMES = {
-    "build.toml",
-    "flake.lock",
-    "flake.nix",
-    "pyproject.toml",
-    "setup.cfg",
-    "setup.py",
-    "requirements.txt",
-    "uv.lock",
-}
-
-
-def filenames(files: list[dict]) -> list[str]:
-    return [f["filename"] for f in files if f.get("filename")]
-
-
-def title_and_body(pr: dict) -> str:
-    return f"{pr.get('title') or ''}\n{pr.get('body') or ''}".lower()
-
-
-def login(pr: dict) -> str:
-    return ((pr.get("user") or {}).get("login") or "").lower()
-
-
-def basename(path: str) -> str:
-    return path.rsplit("/", 1)[-1]
-
-
-def root(path: str) -> str:
-    return path.split("/", 1)[0]
-
-
-def is_doc_path(path: str) -> bool:
-    base = basename(path)
-    return base in DOC_BASENAMES or path.endswith((".md", ".rst"))
-
-
-def is_build_path(path: str) -> bool:
-    base = basename(path)
-    return base in BUILD_BASENAMES or path == ".github/dependabot.yml"
-
-
-def is_workflow_path(path: str) -> bool:
-    return path.startswith(".github/workflows/")
-
-
-def is_repo_automation_path(path: str) -> bool:
-    return path.startswith(".github/scripts/") or path.startswith("scripts/")
-
-
-def is_security_path(path: str) -> bool:
-    lower = path.lower()
-    return (
-        "security" in lower
-        or "sign" in lower
-        or "signature" in lower
-        or lower.endswith("verify-signatures.yaml")
-    )
-
-
-def safe_local_path(path: str) -> str | None:
-    norm = os.path.normpath(path)
-    if os.path.isabs(path) or norm == ".." or norm.startswith(f"..{os.sep}"):
-        return None
-    return norm
-
-
-@lru_cache(maxsize=None)
-def local_python_file_uses_triton(path: str) -> bool:
-    if not path.endswith(".py"):
-        return False
-    local_path = safe_local_path(path)
-    if local_path is None or not os.path.isfile(local_path):
-        return False
-    try:
-        with open(local_path, "r", encoding="utf-8") as fh:
-            text = fh.read()
-    except OSError:
-        return False
-    return bool(
-        re.search(
-            r"(^|\n)\s*(import triton|from triton|@triton\.|from torch\.library import .*triton_op)",
-            text,
-        )
-    )
-
-
-def existing_kernel_root(root_name: str) -> bool:
-    return os.path.isfile(os.path.join(root_name, "build.toml"))
-
-
-def new_kernel_roots(paths: list[str]) -> set[str]:
-    roots = set()
-    for path in paths:
-        if "/" not in path:
-            continue
-        candidate = root(path)
-        if candidate in {".github", "scripts", "tests"}:
-            continue
-        if path == f"{candidate}/build.toml" and not existing_kernel_root(candidate):
-            roots.add(candidate)
-    return roots
-
-
-@lru_cache(maxsize=None)
-def build_toml_backends(root_name: str) -> tuple[str, ...]:
-    path = os.path.join(root_name, "build.toml")
-    if not os.path.isfile(path):
-        return ()
-    try:
-        with open(path, "rb") as fh:
-            data = tomllib.load(fh)
-    except (OSError, tomllib.TOMLDecodeError):
-        return ()
-
-    out: set[str] = set()
-    general_backends = data.get("general", {}).get("backends", [])
-    if isinstance(general_backends, list):
-        out.update(b for b in general_backends if isinstance(b, str))
-    for key, section in data.items():
-        if not key.startswith("kernel.") or not isinstance(section, dict):
-            continue
-        backend = section.get("backend")
-        if isinstance(backend, str):
-            out.add(backend)
-    return tuple(sorted(out))
-
-
-def conventional_type(title: str) -> str | None:
-    match = re.match(r"^\s*([a-zA-Z][\w-]*)(?:\([^)]+\))?!?:", title)
-    if not match:
-        return None
-    return CONVENTIONAL_TYPES.get(match.group(1).lower())
-
-
-def dependency_pr(pr: dict) -> bool:
-    author = login(pr)
-    title = (pr.get("title") or "").lower()
-    return author == DEPENDABOT.lower() or author.startswith("dependabot") or "build(deps" in title
-
-
-def strong_fix_intent(text: str) -> bool:
-    return bool(
-        re.search(
-            r"\b(fails? on (?:the )?original code|passes after (?:the )?fix|omits?|unactionable)\b",
-            text,
-        )
-    )
-
-
-def infer_backend_labels(pr: dict, paths: list[str]) -> set[str]:
-    labels: set[str] = set()
-    roots = {root(p) for p in paths if "/" in p and not p.startswith(".github/")}
-
-    joined_paths = "\n".join(paths).lower()
-    # Use title + paths for implementation signals. PR bodies often mention
-    # other backends only as benchmarks or comparisons.
-    title = (pr.get("title") or "").lower()
-    haystack = f"{title}\n{joined_paths}"
-
-    if re.search(r"\b(cuda|nvidia|cutlass|sm\d{2,3})\b", haystack) or any(
-        p.endswith((".cu", ".cuh")) for p in paths
-    ):
-        labels.add("cuda")
-    if re.search(r"\b(rocm|amd|hip)\b", haystack) or any(
-        p.endswith((".hip", ".ck")) for p in paths
-    ):
-        labels.add("rocm")
-    if re.search(r"\b(metal|mps|mlx)\b", haystack) or any(
-        p.endswith((".metal", ".mm")) for p in paths
-    ):
-        labels.add("metal")
-    if re.search(r"\b(cpu|avx|avx2|avx512)\b", haystack):
-        labels.add("cpu")
-    if re.search(r"\b(xpu|oneapi|sycl)\b", haystack):
-        labels.add("xpu")
-    if re.search(r"\b(triton|liger)\b", haystack):
-        labels.add("triton")
-    if any(local_python_file_uses_triton(p) for p in paths):
-        labels.add("triton")
-
-    # HIP/ROCm sources often carry .cuh helper headers. Do not infer CUDA from
-    # headers alone when every non-Python kernel signal is clearly ROCm/AITER.
-    if "rocm" in labels and "cuda" in labels:
-        has_cuda_specific = re.search(r"\b(cuda|nvidia|cutlass|sm\d{2,3})\b", haystack)
-        has_cuda_source = any(p.endswith(".cu") for p in paths)
-        if not has_cuda_specific and not has_cuda_source:
-            labels.discard("cuda")
-
-    explicit_hardware = labels & HARDWARE_BACKENDS
-    if not explicit_hardware:
-        for root_name in roots:
-            for backend in build_toml_backends(root_name):
-                if backend.lower() in BACKENDS:
-                    labels.add(backend.lower())
-
-    return labels
-
-
-def infer_semantic_labels(paths: list[str], text: str, additions: int) -> set[str]:
-    labels: set[str] = set()
-    title_and_paths = f"{text.splitlines()[0] if text else ''}\n" + "\n".join(paths).lower()
-    if new_kernel_roots(paths):
-        labels.add("new-kernel")
-    if re.search(r"\badd(?:s|ed|ing)?\b.*\bbackend\b|\bbackend\b.*\badd", text):
-        labels.add("new-backend")
-    if re.search(r"\blayer repos?\b|\badd(?:s|ed|ing)?\b.*\blayers?\b", text):
-        labels.add("new-layer")
-    if "stable abi" in text or any("stable" in basename(p).lower() for p in paths):
-        labels.add("abi-migration")
-    if re.search(r"\b(upstream|sync(?:ing|ed)?|resync)\b", title_and_paths):
-        labels.add("upstream-sync")
-    if (
-        re.search(r"\bvendor(?:ed|ing)?\b", text)
-        or any("/quack/" in p or "/cutlass" in p or "/ck/" in p for p in paths)
-        or (additions > 5000 and "new-kernel" in labels)
-    ):
-        labels.add("vendoring")
-    if re.search(
-        r"\b(perf|performance|speed|faster|autotun(?:e|ed|ing)?|optimi[sz](?:e|ed|ing|ation)?)\b",
-        text,
-    ):
-        labels.add("performance")
-    return labels
-
-
-def infer_type_label(pr: dict, paths: list[str], semantic: set[str], text: str) -> str | None:
+def prefilter_type(pr: dict) -> str | None:
+    """A cheap ``type`` for obvious PRs so they skip the model: dependabot bumps
+    -> ``deps``; otherwise a conventional-commit prefix (``feat:``, ``fix:``, ...).
+    Returns None when the PR needs the classifier."""
     title = pr.get("title") or ""
-    title_text = title.lower()
-    if dependency_pr(pr):
+    author = ((pr.get("user") or {}).get("login") or "").lower()
+    if author.startswith("dependabot") or "build(deps" in title.lower():
         return "deps"
-    if "security" in login(pr) or any(is_security_path(p) for p in paths):
-        return "security"
-
-    if "new-kernel" in semantic or "new-backend" in semantic or "new-layer" in semantic:
-        return "feature"
-    if "abi-migration" in semantic:
-        return "build"
-    if "vendoring" in semantic:
-        return "build"
-
-    conventional = conventional_type(title)
-    if conventional:
-        return conventional
-
-    if strong_fix_intent(text):
-        return "fix"
-    if re.search(r"\brefactor(?:s|ed|ing)?\b", title_text):
-        return "refactor"
-    if re.search(r"\bfix(?:es|ed|ing)?\b|\bbug\b", title_text):
-        return "fix"
-    if paths and all(is_doc_path(p) for p in paths):
-        return "docs"
-    if paths and all(is_workflow_path(p) for p in paths):
-        return "ci"
-    if paths and all(is_build_path(p) for p in paths):
-        return "build"
-    if "performance" in semantic:
-        return "build" if "build" in text else "feature"
-    if re.search(r"\b(add|adds|added|include|support|enable|expose|prefer|switch|patchable)\b", title_text):
-        return "feature"
-    if paths and all(is_repo_automation_path(p) for p in paths):
-        return "ci"
-    return None
+    match = re.match(r"^\s*([a-zA-Z][\w-]*)(?:\([^)]+\))?!?:", title)
+    return CONVENTIONAL_TYPES.get(match.group(1).lower()) if match else None
 
 
-def infer_labels(tax: Taxonomy, pr: dict, files: list[dict]) -> set[str]:
-    paths = filenames(files)
-    text = title_and_body(pr)
-    labels = set()
-    labels |= infer_backend_labels(pr, paths)
-    if dependency_pr(pr):
-        semantic = set()
-    else:
-        semantic = infer_semantic_labels(paths, text, pr.get("additions") or 0)
-    labels |= semantic
-
-    type_label = infer_type_label(pr, paths, semantic, text)
-    if type_label:
-        labels.add(type_label)
-    return {label for label in labels if label in tax.managed}
-
-
-def has_type_label(tax: Taxonomy, labels: set[str]) -> bool:
-    return bool(labels & tax.by_dim["type"])
-
-
-def finalize_labels(tax: Taxonomy, labels: set[str]) -> set[str]:
-    """Enforce single-select dimensions, apply caps, and add the type fallback.
-
-    Keeps PRs to a small, meaningful label set: exactly one ``type``, at most
-    ``max`` labels per capped dimension, and no more than ``max_labels`` total
-    across the capped (descriptive) dimensions. When a cap trims a set, the
-    highest-priority labels survive (dimension order, then order within the
-    dimension -- both authored in pr-labels.json). Operational ``status`` labels
-    are uncapped and always pass through.
-    """
-    out = set(labels)
-
-    # 1. Single-select dimensions -> keep only the top-priority label.
-    for key, dim in tax.dims.items():
-        if dim.get("select") != "one":
-            continue
-        selected = sorted(out & tax.by_dim[key], key=tax.rank)
-        if len(selected) > 1:
-            out -= tax.by_dim[key]
-            out.add(selected[0])
-
-    # 2. Safe type fallback (before caps: type is highest priority, always kept).
-    if not has_type_label(tax, out):
-        out.add("chore")
-
-    # 3. Per-dimension caps -> keep the top ``max`` labels in that dimension.
-    for key, dim in tax.dims.items():
-        cap = dim.get("max")
-        if cap is None:
-            continue
-        selected = sorted(out & tax.by_dim[key], key=tax.rank)
-        if len(selected) > cap:
-            out -= tax.by_dim[key]
-            out.update(selected[:cap])
-
-    # 4. Global cap across the capped (descriptive) dimensions. ``type`` sorts
-    #    first so it always survives; status labels are excluded entirely.
-    if tax.max_labels:
-        descriptive = [l for l in out if tax.dim_for(l) in tax.capped_dims]
-        if len(descriptive) > tax.max_labels:
-            keep = sorted(descriptive, key=tax.rank)[: tax.max_labels]
-            out = (out - set(descriptive)) | set(keep)
-
-    return out
+def is_stale(updated_at: str) -> bool:
+    ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+    return (datetime.now(timezone.utc) - ts).days > STALE_DAYS
 
 
 # --------------------------------------------------------------------------- #
-# Classification (Hugging Face Inference Providers router)
+# LLM classification (Hugging Face Inference Providers router)
 # --------------------------------------------------------------------------- #
 def build_prompt(tax: Taxonomy, pr: dict, files: list[dict]) -> str:
-    allowed_lines = []
-    output_lines = []
+    allowed_lines, output_lines = [], []
     for key, dim in tax.llm_dims:
-        rule = "pick EXACTLY ONE" if dim.get("select") == "one" else "pick ZERO OR MORE"
-        entries = "\n".join(
-            f'    - "{n}": {desc}' for n, desc in dim["labels"].items()
-        )
+        one = dim.get("select") == "one"
+        rule = "pick EXACTLY ONE" if one else "pick ZERO OR MORE"
+        entries = "\n".join(f'    - "{n}": {desc}' for n, desc in dim["labels"].items())
         allowed_lines.append(f"  {key} ({rule}):\n{entries}")
-        if dim.get("select") == "one":
-            output_lines.append(f'  "{key}": one string from the {key} set (required),')
-        else:
-            output_lines.append(f'  "{key}": array of zero or more strings from the {key} set,')
-    allowed_block = "\n".join(allowed_lines)
+        shape = "one string (required)" if one else "array of zero or more strings"
+        output_lines.append(f'  "{key}": {shape} from the {key} set,')
     output_block = "\n".join(output_lines + ['  "reasoning": one short sentence.'])
+    allowed_block = "\n".join(allowed_lines)
 
     file_list = (
         "\n".join(
@@ -608,42 +248,24 @@ def build_prompt(tax: Taxonomy, pr: dict, files: list[dict]) -> str:
     )
 
 
-def extract_json_object(text: str | None) -> dict | None:
-    """Pull the single JSON object out of the model's free-form text response."""
-    if not isinstance(text, str):
-        print("::warning::model returned no text content", file=sys.stderr)
-        return None
-    match = re.search(r"\{[\s\S]*\}", text)
-    if not match:
-        print(f"::warning::No JSON in model output: {text[:300]}", file=sys.stderr)
-        return None
-    try:
-        return json.loads(match.group(0))
-    except json.JSONDecodeError as e:
-        print(f"::warning::Bad JSON from model: {e}", file=sys.stderr)
-        return None
-
-
 def classify(prompt: str, model: str) -> dict | None:
-    """Classify a PR via the Hugging Face Inference Providers router
-    (OpenAI-compatible ``/v1/chat/completions``) and return the parsed JSON.
-
-    Non-streaming with ``temperature: 0`` for a single, stable JSON blob.
-    """
+    """Classify a PR via the HF router (OpenAI-compatible ``/v1/chat/completions``)
+    and return the parsed JSON. Non-streaming, ``temperature: 0`` for a stable blob."""
     token = os.environ.get("HF_TOKEN")
     if not token:
         print("::warning::HF_TOKEN is unset; skipping classification", file=sys.stderr)
         return None
 
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-        "temperature": 0,
-    }
     req = urllib.request.Request(
         HF_ROUTER_URL,
-        data=json.dumps(payload).encode("utf-8"),
+        data=json.dumps(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "temperature": 0,
+            }
+        ).encode("utf-8"),
         method="POST",
         headers={
             "Authorization": f"Bearer {token}",
@@ -660,33 +282,81 @@ def classify(prompt: str, model: str) -> dict | None:
         detail = e.read().decode("utf-8", "replace")[:300] if e.fp else ""
         print(f"::warning::HF router HTTP {e.code}: {detail}", file=sys.stderr)
         return None
-    except (urllib.error.URLError, TimeoutError, KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        KeyError,
+        IndexError,
+        TypeError,
+        json.JSONDecodeError,
+    ) as e:
         print(f"::warning::HF router call failed: {e}", file=sys.stderr)
         return None
-    return extract_json_object(content)
+
+    if not isinstance(content, str):
+        print("::warning::model returned no text content", file=sys.stderr)
+        return None
+    match = re.search(r"\{[\s\S]*\}", content)
+    if not match:
+        print(f"::warning::No JSON in model output: {content[:300]}", file=sys.stderr)
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError as e:
+        print(f"::warning::Bad JSON from model: {e}", file=sys.stderr)
+        return None
 
 
 def classify_labels(tax: Taxonomy, result: dict | None) -> set[str]:
-    """Validate model output against the allowed set."""
+    """Validate model output against the allowed set for each LLM dimension."""
     result = result or {}
     desired: set[str] = set()
-
     for key, dim in tax.llm_dims:
-        allowed = set(tax.allowed(key))
         values = result.get(key)
-        if dim.get("select") == "one":
-            if isinstance(values, str) and values in allowed:
-                desired.add(values)
-        elif isinstance(values, list):
-            for v in values:
-                if isinstance(v, str) and v in allowed:
-                    desired.add(v)
+        values = [values] if isinstance(values, str) else values
+        if isinstance(values, list):
+            desired |= {v for v in values if v in tax.by_dim[key]}
     return desired
 
 
 # --------------------------------------------------------------------------- #
-# Reconciliation
+# Label selection + reconciliation
 # --------------------------------------------------------------------------- #
+def finalize_labels(tax: Taxonomy, labels: set[str]) -> set[str]:
+    """Enforce single-select dimensions, apply caps, and add the type fallback.
+
+    Keeps PRs to a small set: exactly one ``type``, at most ``max`` labels per
+    capped dimension, and no more than ``max_labels`` total across the capped
+    (descriptive) dimensions. When a cap trims, the highest-priority labels
+    survive (see ``Taxonomy.rank``). Operational ``status`` labels are uncapped.
+    """
+    out = set(labels)
+
+    for key, dim in tax.dims.items():
+        if dim.get("select") == "one":  # keep only the top-priority label
+            chosen = sorted(out & tax.by_dim[key], key=tax.rank)
+            if len(chosen) > 1:
+                out = (out - tax.by_dim[key]) | {chosen[0]}
+
+    if not (out & tax.by_dim["type"]):  # safe fallback; type is always kept
+        out.add("chore")
+
+    for key, dim in tax.dims.items():
+        cap = dim.get("max")  # keep the top `max` labels in the dimension
+        if cap is not None:
+            chosen = sorted(out & tax.by_dim[key], key=tax.rank)
+            if len(chosen) > cap:
+                out = (out - tax.by_dim[key]) | set(chosen[:cap])
+
+    if tax.max_labels:  # global cap across descriptive dimensions
+        descriptive = [l for l in out if tax.dim_for(l) in tax.capped_dims]
+        if len(descriptive) > tax.max_labels:
+            keep = sorted(descriptive, key=tax.rank)[: tax.max_labels]
+            out = (out - set(descriptive)) | set(keep)
+
+    return out
+
+
 def ensure_label(repo: str, token: str, name: str, meta: dict, cache: set[str]):
     """Create the label on demand if it doesn't exist (so add never 422s)."""
     if name in cache:
@@ -701,9 +371,40 @@ def ensure_label(repo: str, token: str, name: str, meta: dict, cache: set[str]):
             f"{API_ROOT}/repos/{repo}/labels",
             token,
             method="POST",
-            data={"name": name, "color": meta["color"], "description": meta["description"]},
+            data={
+                "name": name,
+                "color": meta["color"],
+                "description": meta["description"],
+            },
         )
     cache.add(name)
+
+
+def desired_labels(
+    tax: Taxonomy, pr: dict, repo: str, token: str, model: str
+) -> set[str]:
+    """Compute the label set for a PR: mechanical status + prefilter/LLM type,
+    backend and semantic, run through the taxonomy's caps."""
+    desired: set[str] = set()
+
+    # status (mechanical). mergeable_state can be "unknown" right after open
+    # (GitHub computes it async); a later edit/backfill catches needs-rebase.
+    if pr.get("mergeable_state") == "dirty":
+        desired.add("needs-rebase")
+    if pr.get("updated_at") and is_stale(pr["updated_at"]):
+        desired.add("stale")
+
+    # Obvious PRs are typed cheaply and skip the model; the rest are classified.
+    pre_type = prefilter_type(pr)
+    if pre_type:
+        desired.add(pre_type)
+    else:
+        files = github_paginate(
+            f"{API_ROOT}/repos/{repo}/pulls/{pr['number']}/files", token
+        )
+        desired |= classify_labels(tax, classify(build_prompt(tax, pr, files), model))
+
+    return finalize_labels(tax, desired)
 
 
 def label_pr(
@@ -717,26 +418,7 @@ def label_pr(
     full_reconcile: bool = False,
 ):
     pr = github_get_json(f"{API_ROOT}/repos/{repo}/pulls/{number}", token)
-    files = github_paginate(f"{API_ROOT}/repos/{repo}/pulls/{number}/files", token)
-
-    desired: set[str] = set()
-
-    # status (mechanical). mergeable_state can be "unknown" right after open
-    # (GitHub computes it async); a later edit/backfill catches needs-rebase.
-    if pr.get("mergeable_state") == "dirty":
-        desired.add("needs-rebase")
-    if pr.get("updated_at") and is_stale(pr["updated_at"]):
-        desired.add("stale")
-
-    # type + backend + semantic. High-confidence labels come from mechanics
-    # first; the model is only used to fill genuinely ambiguous PRs.
-    heuristic = infer_labels(tax, pr, files)
-    desired |= heuristic
-    if not has_type_label(tax, heuristic):
-        result = classify(build_prompt(tax, pr, files), model)
-        desired |= classify_labels(tax, result)
-
-    desired = finalize_labels(tax, desired)
+    desired = desired_labels(tax, pr, repo, token, model)
 
     # Reconcile. The live per-PR path is namespace-scoped: it only removes
     # managed labels, leaving any human-applied label untouched. A backfill
@@ -744,16 +426,23 @@ def label_pr(
     # sweeps stale labels no longer in the taxonomy (e.g. renamed/retired ones).
     current = {
         l["name"]
-        for l in github_paginate(f"{API_ROOT}/repos/{repo}/issues/{number}/labels", token)
+        for l in github_paginate(
+            f"{API_ROOT}/repos/{repo}/issues/{number}/labels", token
+        )
     }
     to_add = sorted(desired - current)
-    removable = current if full_reconcile else (current & tax.managed)
-    to_remove = sorted(removable - desired)
+    to_remove = sorted((current if full_reconcile else current & tax.managed) - desired)
 
     prefix = "[dry-run] " if dry_run else ""
-    print(f"{prefix}PR #{number}: +[{', '.join(to_add)}] -[{', '.join(to_remove)}]", flush=True)
+    print(
+        f"{prefix}PR #{number}: +[{', '.join(to_add)}] -[{', '.join(to_remove)}]",
+        flush=True,
+    )
     if dry_run:
-        print(f"           desired={sorted(desired)} current={sorted(current)}", flush=True)
+        print(
+            f"           desired={sorted(desired)} current={sorted(current)}",
+            flush=True,
+        )
         return
 
     for name in to_add:
@@ -781,8 +470,14 @@ def backfill(repo: str, token: str, tax: Taxonomy, model: str, dry_run: bool = F
     for pr in open_prs:
         try:
             label_pr(
-                repo, token, tax, model, pr["number"], ensured,
-                dry_run=dry_run, full_reconcile=True,
+                repo,
+                token,
+                tax,
+                model,
+                pr["number"],
+                ensured,
+                dry_run=dry_run,
+                full_reconcile=True,
             )
         except (TimeoutError, urllib.error.HTTPError, urllib.error.URLError) as e:
             print(f"::warning::PR #{pr['number']} failed: {e}", file=sys.stderr)
@@ -834,7 +529,7 @@ def main():
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="read + classify but make no changes; print the planned label edits",
+        help="read + classify but make no changes; print the planned edits",
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -842,17 +537,13 @@ def main():
     p_label.add_argument("--pr", type=int, required=True)
     sub.add_parser("backfill", help="reconcile every open PR")
     sub.add_parser("sync-labels", help="create/update labels from the taxonomy")
-
     args = parser.parse_args()
 
     if not args.repo:
-        print("Error: --repo or $GITHUB_REPOSITORY is required", file=sys.stderr)
-        sys.exit(1)
-
+        sys.exit("Error: --repo or $GITHUB_REPOSITORY is required")
     token = get_token()
     if not token:
-        print("Error: no GitHub token (set GITHUB_TOKEN or run `gh auth login`)", file=sys.stderr)
-        sys.exit(1)
+        sys.exit("Error: no GitHub token (set GITHUB_TOKEN or run `gh auth login`)")
 
     tax = load_taxonomy(args.labels_file)
     model = args.model or os.environ.get("HF_MODEL", HF_DEFAULT_MODEL)
@@ -860,7 +551,6 @@ def main():
     if args.command == "sync-labels":
         sync_labels(args.repo, token, tax, dry_run=args.dry_run)
     elif args.command == "backfill":
-        print(f"Classifier model: {model}", flush=True)
         backfill(args.repo, token, tax, model, dry_run=args.dry_run)
     elif args.command == "label":
         label_pr(args.repo, token, tax, model, args.pr, set(), dry_run=args.dry_run)
