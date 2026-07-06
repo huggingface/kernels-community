@@ -42,14 +42,6 @@ API_TIMEOUT = int(os.environ.get("GITHUB_API_TIMEOUT", "30"))
 STALE_DAYS = 30
 DEPENDABOT = "dependabot[bot]"
 
-SIZE_THRESHOLDS = [
-    ("size: XS", 10),
-    ("size: S", 50),
-    ("size: M", 250),
-    ("size: L", 1000),
-]
-SIZE_XL = "size: XL"
-
 
 # --------------------------------------------------------------------------- #
 # GitHub API helpers (stdlib only, matching .github/scripts/dispatch.py style)
@@ -132,11 +124,16 @@ class Taxonomy:
 
     def __init__(self, cfg: dict):
         self.dims = cfg["dimensions"]
+        self.max_labels: int | None = cfg.get("max_labels")
         self.meta: dict[str, dict] = {}  # name -> {color, description}
         self.managed: set[str] = set()  # every label the action may touch
         self.by_dim: dict[str, set[str]] = {}
+        self.order: dict[str, list[str]] = {}  # key -> labels in priority order
+        self._dim_index = {key: i for i, key in enumerate(self.dims)}
         for key, dim in self.dims.items():
-            self.by_dim[key] = set(dim["labels"].keys())
+            names = list(dim["labels"].keys())
+            self.order[key] = names
+            self.by_dim[key] = set(names)
             for name, description in dim["labels"].items():
                 self.meta[name] = {"color": dim["color"], "description": description}
                 self.managed.add(name)
@@ -150,9 +147,26 @@ class Taxonomy:
                 return key
         return None
 
+    def rank(self, label: str) -> tuple[int, int]:
+        """Global priority key: (dimension order, position within the dimension).
+
+        Lower sorts first. Used to keep the highest-priority labels when a
+        per-dimension or global cap trims the set. Dimensions and the labels
+        within them are authored in priority order in pr-labels.json.
+        """
+        key = self.dim_for(label)
+        if key is None:
+            return (len(self.dims), 0)
+        return (self._dim_index[key], self.order[key].index(label))
+
     @property
     def llm_dims(self) -> list[tuple[str, dict]]:
         return [(k, d) for k, d in self.dims.items() if d.get("llm")]
+
+    @property
+    def capped_dims(self) -> set[str]:
+        """Descriptive dimensions that count against the global max_labels cap."""
+        return {k for k, d in self.dims.items() if d.get("capped")}
 
 
 def load_taxonomy(path: str) -> Taxonomy:
@@ -163,13 +177,6 @@ def load_taxonomy(path: str) -> Taxonomy:
 # --------------------------------------------------------------------------- #
 # Mechanical labels
 # --------------------------------------------------------------------------- #
-def size_label(total_changes: int) -> str:
-    for label, threshold in SIZE_THRESHOLDS:
-        if total_changes <= threshold:
-            return label
-    return SIZE_XL
-
-
 def is_stale(updated_at: str) -> bool:
     ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
     return (datetime.now(timezone.utc) - ts).days > STALE_DAYS
@@ -179,28 +186,28 @@ def is_stale(updated_at: str) -> bool:
 # Deterministic classification
 # --------------------------------------------------------------------------- #
 CONVENTIONAL_TYPES = {
-    "feat": "type: feature",
-    "feature": "type: feature",
-    "fix": "type: fix",
-    "bugfix": "type: fix",
-    "refactor": "type: refactor",
-    "docs": "type: docs",
-    "doc": "type: docs",
-    "ci": "type: ci",
-    "build": "type: build",
-    "deps": "type: deps",
-    "chore": "type: chore",
-    "security": "type: security",
-    "sec": "type: security",
+    "feat": "feature",
+    "feature": "feature",
+    "fix": "fix",
+    "bugfix": "fix",
+    "refactor": "refactor",
+    "docs": "docs",
+    "doc": "docs",
+    "ci": "ci",
+    "build": "build",
+    "deps": "deps",
+    "chore": "chore",
+    "security": "security",
+    "sec": "security",
 }
 
 BACKEND_LABELS = {
-    "cuda": "backend: cuda",
-    "rocm": "backend: rocm",
-    "metal": "backend: metal",
-    "cpu": "backend: cpu",
-    "xpu": "backend: xpu",
-    "triton": "backend: triton",
+    "cuda": "cuda",
+    "rocm": "rocm",
+    "metal": "metal",
+    "cpu": "cpu",
+    "xpu": "xpu",
+    "triton": "triton",
 }
 
 DOC_BASENAMES = {
@@ -253,14 +260,6 @@ def is_doc_path(path: str) -> bool:
 def is_build_path(path: str) -> bool:
     base = basename(path)
     return base in BUILD_BASENAMES or path == ".github/dependabot.yml"
-
-
-def is_test_path(path: str) -> bool:
-    if is_workflow_path(path):
-        return False
-    base = basename(path)
-    parts = path.split("/")
-    return base.startswith("test_") or "tests" in parts or path.startswith("test/")
 
 
 def is_workflow_path(path: str) -> bool:
@@ -371,21 +370,6 @@ def strong_fix_intent(text: str) -> bool:
     )
 
 
-def infer_area_labels(paths: list[str]) -> set[str]:
-    labels: set[str] = set()
-    if any(is_workflow_path(p) for p in paths):
-        labels.add("area: github-actions")
-    if any(is_repo_automation_path(p) for p in paths):
-        labels.add("area: repo-automation")
-    if any(is_build_path(p) for p in paths):
-        labels.add("area: build-system")
-    if any(is_test_path(p) for p in paths):
-        labels.add("area: tests")
-    if any(is_doc_path(p) for p in paths):
-        labels.add("area: docs")
-    return labels
-
-
 def infer_backend_labels(pr: dict, paths: list[str]) -> set[str]:
     labels: set[str] = set()
     roots = {root(p) for p in paths if "/" in p and not p.startswith(".github/")}
@@ -399,39 +383,33 @@ def infer_backend_labels(pr: dict, paths: list[str]) -> set[str]:
     if re.search(r"\b(cuda|nvidia|cutlass|sm\d{2,3})\b", haystack) or any(
         p.endswith((".cu", ".cuh")) for p in paths
     ):
-        labels.add("backend: cuda")
+        labels.add("cuda")
     if re.search(r"\b(rocm|amd|hip)\b", haystack) or any(
         p.endswith((".hip", ".ck")) for p in paths
     ):
-        labels.add("backend: rocm")
+        labels.add("rocm")
     if re.search(r"\b(metal|mps|mlx)\b", haystack) or any(
         p.endswith((".metal", ".mm")) for p in paths
     ):
-        labels.add("backend: metal")
+        labels.add("metal")
     if re.search(r"\b(cpu|avx|avx2|avx512)\b", haystack):
-        labels.add("backend: cpu")
+        labels.add("cpu")
     if re.search(r"\b(xpu|oneapi|sycl)\b", haystack):
-        labels.add("backend: xpu")
+        labels.add("xpu")
     if re.search(r"\b(triton|liger)\b", haystack):
-        labels.add("backend: triton")
+        labels.add("triton")
     if any(local_python_file_uses_triton(p) for p in paths):
-        labels.add("backend: triton")
+        labels.add("triton")
 
     # HIP/ROCm sources often carry .cuh helper headers. Do not infer CUDA from
     # headers alone when every non-Python kernel signal is clearly ROCm/AITER.
-    if "backend: rocm" in labels and "backend: cuda" in labels:
+    if "rocm" in labels and "cuda" in labels:
         has_cuda_specific = re.search(r"\b(cuda|nvidia|cutlass|sm\d{2,3})\b", haystack)
         has_cuda_source = any(p.endswith(".cu") for p in paths)
         if not has_cuda_specific and not has_cuda_source:
-            labels.discard("backend: cuda")
+            labels.discard("cuda")
 
-    explicit_hardware = labels & {
-        "backend: cuda",
-        "backend: rocm",
-        "backend: metal",
-        "backend: cpu",
-        "backend: xpu",
-    }
+    explicit_hardware = labels & {"cuda", "rocm", "metal", "cpu", "xpu"}
     if not explicit_hardware:
         for root_name in roots:
             for backend in build_toml_backends(root_name):
@@ -473,39 +451,39 @@ def infer_type_label(pr: dict, paths: list[str], semantic: set[str], text: str) 
     title = pr.get("title") or ""
     title_text = title.lower()
     if dependency_pr(pr):
-        return "type: deps"
+        return "deps"
     if "security" in login(pr) or any(is_security_path(p) for p in paths):
-        return "type: security"
+        return "security"
 
     if "new-kernel" in semantic or "new-backend" in semantic or "new-layer" in semantic:
-        return "type: feature"
+        return "feature"
     if "abi-migration" in semantic:
-        return "type: build"
+        return "build"
     if "vendoring" in semantic:
-        return "type: build"
+        return "build"
 
     conventional = conventional_type(title)
     if conventional:
         return conventional
 
     if strong_fix_intent(text):
-        return "type: fix"
+        return "fix"
     if re.search(r"\brefactor(?:s|ed|ing)?\b", title_text):
-        return "type: refactor"
+        return "refactor"
     if re.search(r"\bfix(?:es|ed|ing)?\b|\bbug\b", title_text):
-        return "type: fix"
+        return "fix"
     if paths and all(is_doc_path(p) for p in paths):
-        return "type: docs"
+        return "docs"
     if paths and all(is_workflow_path(p) for p in paths):
-        return "type: ci"
+        return "ci"
     if paths and all(is_build_path(p) for p in paths):
-        return "type: build"
+        return "build"
     if "performance" in semantic:
-        return "type: build" if "build" in text else "type: feature"
+        return "build" if "build" in text else "feature"
     if re.search(r"\b(add|adds|added|include|support|enable|expose|prefer|switch|patchable)\b", title_text):
-        return "type: feature"
+        return "feature"
     if paths and all(is_repo_automation_path(p) for p in paths):
-        return "type: ci"
+        return "ci"
     return None
 
 
@@ -513,7 +491,6 @@ def infer_labels(tax: Taxonomy, pr: dict, files: list[dict]) -> set[str]:
     paths = filenames(files)
     text = title_and_body(pr)
     labels = set()
-    labels |= infer_area_labels(paths)
     labels |= infer_backend_labels(pr, paths)
     if dependency_pr(pr):
         semantic = set()
@@ -532,21 +509,48 @@ def has_type_label(tax: Taxonomy, labels: set[str]) -> bool:
 
 
 def finalize_labels(tax: Taxonomy, labels: set[str]) -> set[str]:
-    """Enforce single-select dimensions and provide the safe type fallback."""
+    """Enforce single-select dimensions, apply caps, and add the type fallback.
+
+    Keeps PRs to a small, meaningful label set: exactly one ``type``, at most
+    ``max`` labels per capped dimension, and no more than ``max_labels`` total
+    across the capped (descriptive) dimensions. When a cap trims a set, the
+    highest-priority labels survive (dimension order, then order within the
+    dimension -- both authored in pr-labels.json). Operational ``status`` labels
+    are uncapped and always pass through.
+    """
     out = set(labels)
+
+    # 1. Single-select dimensions -> keep only the top-priority label.
     for key, dim in tax.dims.items():
         if dim.get("select") != "one":
             continue
-        selected = sorted(out & tax.by_dim[key])
-        if len(selected) <= 1:
-            continue
-        # Type is the only LLM single-select dimension today. If another is
-        # added later, keep deterministic ordering rather than applying several.
-        keep = selected[0]
-        out -= tax.by_dim[key]
-        out.add(keep)
+        selected = sorted(out & tax.by_dim[key], key=tax.rank)
+        if len(selected) > 1:
+            out -= tax.by_dim[key]
+            out.add(selected[0])
+
+    # 2. Safe type fallback (before caps: type is highest priority, always kept).
     if not has_type_label(tax, out):
-        out.add("type: chore")
+        out.add("chore")
+
+    # 3. Per-dimension caps -> keep the top ``max`` labels in that dimension.
+    for key, dim in tax.dims.items():
+        cap = dim.get("max")
+        if cap is None:
+            continue
+        selected = sorted(out & tax.by_dim[key], key=tax.rank)
+        if len(selected) > cap:
+            out -= tax.by_dim[key]
+            out.update(selected[:cap])
+
+    # 4. Global cap across the capped (descriptive) dimensions. ``type`` sorts
+    #    first so it always survives; status labels are excluded entirely.
+    if tax.max_labels:
+        descriptive = [l for l in out if tax.dim_for(l) in tax.capped_dims]
+        if len(descriptive) > tax.max_labels:
+            keep = sorted(descriptive, key=tax.rank)[: tax.max_labels]
+            out = (out - set(descriptive)) | set(keep)
+
     return out
 
 
@@ -683,15 +687,12 @@ def label_pr(
     number: int,
     ensured: set[str],
     dry_run: bool = False,
+    full_reconcile: bool = False,
 ):
     pr = github_get_json(f"{API_ROOT}/repos/{repo}/pulls/{number}", token)
     files = github_paginate(f"{API_ROOT}/repos/{repo}/pulls/{number}/files", token)
 
     desired: set[str] = set()
-
-    # size (mechanical)
-    total = (pr.get("additions") or 0) + (pr.get("deletions") or 0)
-    desired.add(size_label(total))
 
     # status (mechanical). mergeable_state can be "unknown" right after open
     # (GitHub computes it async); a later edit/backfill catches needs-rebase.
@@ -700,8 +701,8 @@ def label_pr(
     if pr.get("updated_at") and is_stale(pr["updated_at"]):
         desired.add("stale")
 
-    # type + area + backend + semantic. High-confidence labels come from
-    # mechanics first; Claude is only used to fill genuinely ambiguous PRs.
+    # type + backend + semantic. High-confidence labels come from mechanics
+    # first; Claude is only used to fill genuinely ambiguous PRs.
     heuristic = infer_labels(tax, pr, files)
     desired |= heuristic
     if not has_type_label(tax, heuristic):
@@ -710,13 +711,17 @@ def label_pr(
 
     desired = finalize_labels(tax, desired)
 
-    # Reconcile (add-only on human labels, namespace-scoped on managed labels).
+    # Reconcile. The live per-PR path is namespace-scoped: it only removes
+    # managed labels, leaving any human-applied label untouched. A backfill
+    # (full_reconcile) instead makes the PR match `desired` exactly, so it also
+    # sweeps stale labels no longer in the taxonomy (e.g. renamed/retired ones).
     current = {
         l["name"]
         for l in github_paginate(f"{API_ROOT}/repos/{repo}/issues/{number}/labels", token)
     }
     to_add = sorted(desired - current)
-    to_remove = sorted((current & tax.managed) - desired)
+    removable = current if full_reconcile else (current & tax.managed)
+    to_remove = sorted(removable - desired)
 
     prefix = "[dry-run] " if dry_run else ""
     print(f"{prefix}PR #{number}: +[{', '.join(to_add)}] -[{', '.join(to_remove)}]", flush=True)
@@ -748,7 +753,10 @@ def backfill(repo: str, token: str, tax: Taxonomy, model: str, dry_run: bool = F
     ensured: set[str] = set()
     for pr in open_prs:
         try:
-            label_pr(repo, token, tax, model, pr["number"], ensured, dry_run=dry_run)
+            label_pr(
+                repo, token, tax, model, pr["number"], ensured,
+                dry_run=dry_run, full_reconcile=True,
+            )
         except (TimeoutError, urllib.error.HTTPError, urllib.error.URLError) as e:
             print(f"::warning::PR #{pr['number']} failed: {e}", file=sys.stderr)
 

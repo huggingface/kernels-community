@@ -1,76 +1,59 @@
 {
-  "_comment": "Single source of truth for the PR auto-labeler (.github/workflows/pr-autolabel.yml). Drives both label creation (sync-labels) and the set of labels Claude may choose from. The action only ever adds/removes labels listed here ('managed' labels); any other label a human applies is left untouched. Colors are hex without the leading '#'.",
+  "_comment": "Single source of truth for the PR auto-labeler (.github/workflows/pr-autolabel.yml). Drives both label creation (sync-labels) and the set of labels Claude may choose from. The action only ever adds/removes labels listed here ('managed' labels); any other label a human applies is left untouched. Colors are hex without the leading '#'. Label names are bare (no 'type:'/'backend:' prefix): each dimension has its own color, so the color already signals which dimension a label belongs to and the shorter names stay readable. Names must therefore be unique across every dimension. The taxonomy is intentionally small so a typical PR lands 3-4 meaningful labels: exactly one 'type', up to a couple 'backend'/'semantic' highlights, and any operational 'status'. Per-dimension caps ('max') plus the global 'max_labels' budget (across the 'capped' dimensions) enforce that; within a dimension the labels are listed in priority order and caps keep the highest-priority ones. Operational 'status' labels are not 'capped' and always apply.",
+  "max_labels": 4,
   "dimensions": {
     "type": {
       "select": "one",
       "llm": true,
+      "capped": true,
       "color": "1f6feb",
       "labels": {
-        "type: feature": "New functionality / capability",
-        "type: fix": "Bug fix",
-        "type: refactor": "Restructure with no behavior change",
-        "type: docs": "Docs, CARD.md, guides, skill text",
-        "type: ci": "Workflows, GitHub Actions, automation",
-        "type: build": "Build system: nix flakes, kernel-builder build, packaging",
-        "type: deps": "Dependency bumps (mostly dependabot)",
-        "type: security": "Code signing, audits, workflow hardening",
-        "type: chore": "Version bumps, releases, misc maintenance"
-      }
-    },
-    "area": {
-      "select": "many",
-      "llm": true,
-      "color": "0969da",
-      "labels": {
-        "area: github-actions": "GitHub Actions workflows and action versions",
-        "area: repo-automation": "Repository scripts, bots, freshness checks, and generated automation",
-        "area: build-system": "build.toml, Nix flakes, packaging, and kernel-builder integration",
-        "area: tests": "Tests, validation code, and benchmark harnesses",
-        "area: docs": "README, CARD.md, guides, and repository documentation"
+        "feature": "New functionality / capability",
+        "fix": "Bug fix",
+        "refactor": "Restructure with no behavior change",
+        "docs": "Docs, CARD.md, guides, skill text",
+        "ci": "Workflows, GitHub Actions, automation",
+        "build": "Build system: nix flakes, kernel-builder build, packaging",
+        "deps": "Dependency bumps (mostly dependabot)",
+        "security": "Code signing, audits, workflow hardening",
+        "chore": "Version bumps, releases, misc maintenance"
       }
     },
     "backend": {
       "select": "many",
       "llm": true,
+      "capped": true,
+      "max": 2,
       "color": "2da44e",
       "labels": {
-        "backend: cuda": "NVIDIA CUDA kernels",
-        "backend: rocm": "AMD / AITER kernels",
-        "backend: metal": "Apple Metal / MPS kernels",
-        "backend: cpu": "CPU kernels",
-        "backend: xpu": "Intel XPU kernels",
-        "backend: triton": "Vendor-neutral Triton kernels"
+        "cuda": "NVIDIA CUDA kernels",
+        "rocm": "AMD / AITER kernels",
+        "metal": "Apple Metal / MPS kernels",
+        "cpu": "CPU kernels",
+        "xpu": "Intel XPU kernels",
+        "triton": "Vendor-neutral Triton kernels"
       }
     },
     "semantic": {
       "select": "many",
       "llm": true,
+      "capped": true,
+      "max": 2,
       "color": "bf8700",
       "labels": {
         "new-kernel": "A brand-new kernel package is added",
         "new-backend": "Adds a backend to an existing kernel",
-        "new-layer": "Adds or extends a LayerRepo",
+        "performance": "Autotuning, speedups, build-speed improvements",
         "abi-migration": "Torch stable ABI work",
+        "new-layer": "Adds or extends a LayerRepo",
         "upstream-sync": "Syncing a kernel with its upstream source",
-        "vendoring": "Vendoring a dependency in-tree",
-        "performance": "Autotuning, speedups, build-speed improvements"
-      }
-    },
-    "size": {
-      "select": "one",
-      "llm": false,
-      "color": "9e9e9e",
-      "labels": {
-        "size: XS": "Diff <= 10 lines",
-        "size: S": "Diff <= 50 lines",
-        "size: M": "Diff <= 250 lines",
-        "size: L": "Diff <= 1000 lines",
-        "size: XL": "Diff > 1000 lines"
+        "vendoring": "Vendoring a dependency in-tree"
       }
     },
     "status": {
       "select": "many",
       "llm": false,
+      "capped": false,
       "color": "d73a4a",
       "labels": {
         "needs-rebase": "Has merge conflicts with the base branch",

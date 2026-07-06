@@ -16,6 +16,10 @@ def files(*paths):
     return [{"filename": path} for path in paths]
 
 
+def backends(tax, labels):
+    return labels & tax.by_dim["backend"]
+
+
 class PrAutolabelHeuristicsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -38,9 +42,7 @@ class PrAutolabelHeuristicsTest(unittest.TestCase):
             ".github/workflows/build.yaml",
         )
 
-        self.assertIn("type: deps", labels)
-        self.assertIn("area: github-actions", labels)
-        self.assertNotIn("area: tests", labels)
+        self.assertIn("deps", labels)
         self.assertNotIn("upstream-sync", labels)
 
     def test_rocm_ck_pr_is_not_triton_from_benchmark_body(self):
@@ -56,10 +58,10 @@ class PrAutolabelHeuristicsTest(unittest.TestCase):
             "aiter-flash-attn-ck/ck/fmha/fmha_fwd.hpp",
         )
 
-        self.assertIn("type: feature", labels)
-        self.assertIn("backend: rocm", labels)
+        self.assertIn("feature", labels)
+        self.assertIn("rocm", labels)
         self.assertIn("new-kernel", labels)
-        self.assertNotIn("backend: triton", labels)
+        self.assertNotIn("triton", labels)
 
     def test_backend_specific_change_overrides_package_backend_defaults(self):
         labels = self.labels_for(
@@ -70,11 +72,11 @@ class PrAutolabelHeuristicsTest(unittest.TestCase):
             "flash-attn2/torch-ext/torch_binding_stable.cpp",
         )
 
-        self.assertIn("backend: cuda", labels)
+        self.assertIn("cuda", labels)
         self.assertIn("abi-migration", labels)
-        self.assertIn("type: build", labels)
-        self.assertNotIn("backend: cpu", labels)
-        self.assertNotIn("backend: xpu", labels)
+        self.assertIn("build", labels)
+        self.assertNotIn("cpu", labels)
+        self.assertNotIn("xpu", labels)
 
     def test_repo_automation_title_intent_beats_template_words(self):
         labels = self.labels_for(
@@ -86,9 +88,7 @@ class PrAutolabelHeuristicsTest(unittest.TestCase):
             "scripts/test_kernel_freshness_lookup.py",
         )
 
-        self.assertIn("type: fix", labels)
-        self.assertIn("area: repo-automation", labels)
-        self.assertIn("area: tests", labels)
+        self.assertIn("fix", labels)
         self.assertNotIn("upstream-sync", labels)
 
     def test_performs_does_not_imply_performance(self):
@@ -101,7 +101,7 @@ class PrAutolabelHeuristicsTest(unittest.TestCase):
             ".github/scripts/test_dispatch.py",
         )
 
-        self.assertIn("type: feature", labels)
+        self.assertIn("feature", labels)
         self.assertNotIn("performance", labels)
 
     def test_vendoring_dependency_is_build_type_without_claude(self):
@@ -112,10 +112,13 @@ class PrAutolabelHeuristicsTest(unittest.TestCase):
             "mamba-ssm/torch-ext/mamba_ssm/ops/triton/ssd_combined.py",
         )
 
-        self.assertIn("type: build", labels)
+        self.assertIn("build", labels)
         self.assertIn("vendoring", labels)
 
-    def test_existing_triton_python_files_get_triton_backend(self):
+    def test_backend_labels_are_capped_to_top_priority(self):
+        # finegrained-fp8 declares cuda/rocm/xpu in build.toml and its Python
+        # files use Triton -- four backends. The cap keeps the two highest
+        # priority (cuda, rocm) rather than flooding the PR.
         labels = self.labels_for(
             pr("finegrained-fp8: add swiglu support"),
             "finegrained-fp8/tests/test_moe.py",
@@ -124,10 +127,31 @@ class PrAutolabelHeuristicsTest(unittest.TestCase):
             "finegrained-fp8/torch-ext/finegrained_fp8/grouped.py",
         )
 
-        self.assertIn("backend: triton", labels)
-        self.assertIn("backend: cuda", labels)
-        self.assertIn("backend: rocm", labels)
-        self.assertIn("backend: xpu", labels)
+        self.assertEqual(backends(self.tax, labels), {"cuda", "rocm"})
+
+    def test_global_cap_keeps_type_and_highest_priority_and_all_status(self):
+        # A hand-built over-full set: 1 type + 2 backend + 2 semantic (5
+        # descriptive) plus a status label. The global cap trims descriptive
+        # labels to max_labels (keeping the highest priority ones) while the
+        # uncapped status label always survives.
+        labels = autolabel.finalize_labels(
+            self.tax,
+            {
+                "feature",
+                "cuda",
+                "rocm",
+                "new-kernel",
+                "performance",
+                "needs-rebase",
+            },
+        )
+
+        descriptive = {l for l in labels if self.tax.dim_for(l) in self.tax.capped_dims}
+        self.assertLessEqual(len(descriptive), self.tax.max_labels)
+        self.assertIn("feature", labels)  # type always survives the cap
+        self.assertIn("needs-rebase", labels)  # status is uncapped
+        self.assertIn("new-kernel", labels)  # higher priority than performance
+        self.assertNotIn("performance", labels)  # trimmed by the global cap
 
 
 if __name__ == "__main__":
