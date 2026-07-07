@@ -13,7 +13,7 @@ import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
 import torch
-from ._ops_compat import add_quack_op_namespace_prefix
+from ._ops_compat import add_op_namespace_prefix
 from torch import Tensor
 
 from . import copy_utils as copy_utils
@@ -136,7 +136,7 @@ def _compile_rms_final_reduce(dtype, N):
 
 
 @torch.library.custom_op(
-    add_quack_op_namespace_prefix("rms_final_reduce_out"),
+    add_op_namespace_prefix("rms_final_reduce_out"),
     mutates_args=("rstd",),
     device_types="cuda",
 )

@@ -117,6 +117,7 @@ src = [
     "flash_attn_xpu/src/flash_bwd_hdim512_fix_fp16.cpp",
     "flash_attn_xpu/src/flash_bwd_hdim512_fix_bf16.cpp",
     "flash_attn_xpu/src/fmha_utils.hpp",
+    "flash_attn_xpu/src/xe_barrier_compat.hpp",
     "flash_attn_xpu/src/collective/fmha_fusion.hpp",
     "flash_attn_xpu/src/collective/copy_block_slm.hpp",
     "flash_attn_xpu/src/collective/fmha_fwd_common.hpp",

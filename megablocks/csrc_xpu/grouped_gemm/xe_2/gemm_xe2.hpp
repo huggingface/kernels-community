@@ -52,6 +52,15 @@ namespace MoE {
 
 using namespace cute;
 
+// sycl-tla 0.9.1+ (PyTorch 2.13) passes a SPIRVScope enum to the barriers
+// instead of int; the enum lives in <cute/util/xe_split_barrier.hpp>, absent in
+// older versions, so detect it and fall back to int 2 (workgroup scope).
+#if defined(__has_include) && __has_include(<cute/util/xe_split_barrier.hpp>)
+inline constexpr auto kBarrierScope = ScopeWorkgroup;
+#else
+inline constexpr int kBarrierScope = 2;
+#endif
+
 template <
     class GmemTiledCopyA,
     class GmemTiledCopyB,
@@ -130,7 +139,7 @@ CUTE_DEVICE void xe_gemm(
 
   const int prefetch_dist = 3;
 
-  constexpr int barrier_scope = 2;
+  constexpr auto barrier_scope = kBarrierScope;
 
   int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
   int k_tile_prefetch = 0;
@@ -292,7 +301,7 @@ CUTE_DEVICE void xe_gemm_4bits(
 
   const int prefetch_dist = 3;
 
-  constexpr int barrier_scope = 2;
+  constexpr auto barrier_scope = kBarrierScope;
 
   int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
   int k_tile_prefetch = 0;

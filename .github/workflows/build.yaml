@@ -70,17 +70,34 @@ jobs:
       kernel: ${{ steps.validate.outputs.kernel }}
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
+      # Reject kernel names outside the safe charset before any step uses them.
+      # Accepts e.g.: flash-attn3, rejects: $(myevilcommand).
+      - name: Validate kernel name
+        env:
+          KERNEL: ${{ inputs.kernel_name }}
+        run: |
+          case "$KERNEL" in
+            ''|*[!A-Za-z0-9_-]*)
+              echo "Invalid kernel_name input: must match ^[A-Za-z0-9_-]+$"
+              exit 1
+              ;;
+          esac
+
       # Post a running commit status so the PR shows the build is in progress.
       - name: Set running status
         if: inputs.head_sha != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATUS_CONTEXT: ${{ github.workflow }} / ${{ inputs.kernel_name }}
         run: |
-          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
             -f state="pending" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f target_url="$RUN_URL" \
             -f description="Build in progress" \
-            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
+            -f context="$STATUS_CONTEXT"
 
       # Guard against injection via pr_number input.
       - name: Validate PR number
@@ -150,8 +167,9 @@ jobs:
         id: matrix
         env:
           KERNEL: ${{ steps.validate.outputs.kernel }}
+          MODE: ${{ inputs.mode }}
         run: |
-          if [ "${{ inputs.mode }}" = "pr" ]; then
+          if [ "$MODE" = "pr" ]; then
             NIX_TARGET="backendCi"
           else
             NIX_TARGET="backendBundle"
@@ -209,11 +227,13 @@ jobs:
       - name: Build kernel
         env:
           KERNEL: ${{ needs.setup.outputs.kernel }}
+          MODE: ${{ inputs.mode }}
+          BACKEND: ${{ matrix.backend }}
         run: |
-          if [ "${{ inputs.mode }}" = "pr" ]; then
-            ( cd "$KERNEL" && nix build -L .#backendCi.${{ matrix.backend }} && ls -l result/ )
+          if [ "$MODE" = "pr" ]; then
+            ( cd "$KERNEL" && nix build -L ".#backendCi.$BACKEND" && ls -l result/ )
           else
-            ( cd "$KERNEL" && nix build -L .#backendBundle.${{ matrix.backend }} && ls -l result/ )
+            ( cd "$KERNEL" && nix build -L ".#backendBundle.$BACKEND" && ls -l result/ )
           fi
           ( cd "$KERNEL" && cp -rL result build && rm result && chmod -R u+w build )
 
@@ -244,7 +264,6 @@ jobs:
           if [ -n "$TARGET_BRANCH" ]; then
             BRANCH_FLAG="--branch $TARGET_BRANCH"
           fi
-          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "$REPO_PREFIX/$KERNEL" $BRANCH_FLAG
           nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "$REPO_PREFIX/$KERNEL" $BRANCH_FLAG
 
       # v1 kernels without an explicit branch override also get uploaded to main.
@@ -262,7 +281,6 @@ jobs:
             VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
             BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
             if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
-              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "$REPO_PREFIX/$KERNEL" --branch main
               nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "$REPO_PREFIX/$KERNEL" --branch main
             fi
           fi
@@ -385,6 +403,10 @@ jobs:
       - name: Set commit status
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATUS_CONTEXT: ${{ github.workflow }} / ${{ inputs.kernel_name }}
         run: |
           BUILD="${{ needs.build-kernel.result }}"
           TEST="${{ needs.test-kernel-gpu.result }}"
@@ -400,8 +422,8 @@ jobs:
             DESC="Build did not complete (build: ${BUILD}, test: ${TEST})"
           fi
 
-          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
             -f state="$STATE" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f target_url="$RUN_URL" \
             -f description="$DESC" \
-            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
+            -f context="$STATUS_CONTEXT"
