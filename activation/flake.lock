@@ -50,6 +50,7 @@
       },
       "original": {
         "owner": "huggingface",
+        "ref": "backend-scoped-stable-abi",
         "repo": "kernels",
         "type": "github"
       }
