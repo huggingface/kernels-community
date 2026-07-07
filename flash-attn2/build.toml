@@ -2,6 +2,7 @@
 name = "flash-attn2"
 version = 3
 license = "BSD-3-Clause"
+edition = 5
 backends = [
     "cpu",
     "cuda",
@@ -12,12 +13,15 @@ backends = [
 repo-id = "kernels-community/flash-attn2"
 
 [torch]
-stable-abi = "2.10"
 src = [
     "torch-ext/torch_binding.cpp",
     "torch-ext/torch_binding_stable.cpp",
     "torch-ext/torch_binding.h",
 ]
+
+[torch.stable-abi]
+cuda = "2.10"
+rocm = "2.10"
 
 [kernel.flash_attn_xpu]
 backend = "xpu"
