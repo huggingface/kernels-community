@@ -8,6 +8,11 @@ backends = ["cuda"]
 [general.hub]
 repo-id = "kernels-community/vllm-moe"
 
+[general.cuda]
+# Not compatible with cub from CUDA 13.0, should work again after sync of
+# kernel with upstream.
+maxver = "12.9"
+
 [torch]
 include = ["."]
 pyext = [

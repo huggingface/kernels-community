@@ -5,7 +5,7 @@ from functools import partial
 from typing import Optional, Type, Literal
 
 import torch
-from ._ops_compat import add_quack_op_namespace_prefix
+from ._ops_compat import add_op_namespace_prefix
 from torch import Tensor
 
 import cuda.bindings.driver as cuda
@@ -287,7 +287,7 @@ def _compile_cross_entropy_fwd(
     )
 
 
-@torch.library.custom_op(add_quack_op_namespace_prefix("cross_entropy_fwd_out"), mutates_args={"loss", "lse", "dx"})
+@torch.library.custom_op(add_op_namespace_prefix("cross_entropy_fwd_out"), mutates_args={"loss", "lse", "dx"})
 def cross_entropy_fwd_out(
     x: Tensor,
     target: Tensor,
@@ -599,7 +599,7 @@ def _cross_entropy_backward(
     )
 
 
-@torch.library.custom_op(add_quack_op_namespace_prefix("cross_entropy_bwd_out"), mutates_args={"dx"})
+@torch.library.custom_op(add_op_namespace_prefix("cross_entropy_bwd_out"), mutates_args={"dx"})
 def cross_entropy_bwd_out(
     x: torch.Tensor,
     target: torch.Tensor,
