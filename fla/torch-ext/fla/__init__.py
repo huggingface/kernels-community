@@ -1,10 +1,12 @@
 from . import layers
-from .ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+from .layers import chunk_kimi_delta_attention, recurrent_kimi_delta_attention
 from .ops.kda import chunk_kda, fused_recurrent_kda
 
 
 __all__ = [
-    "layers",
-    "chunk_gated_delta_rule", "fused_recurrent_gated_delta_rule",
+    # original functions directly
     "chunk_kda", "fused_recurrent_kda",
+    # layer wrapped functions
+    "layers",
+    "chunk_kimi_delta_attention", "recurrent_kimi_delta_attention",
 ]
