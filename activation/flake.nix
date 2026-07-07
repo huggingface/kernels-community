@@ -2,7 +2,7 @@
   description = "Flake for activation kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/backend-scoped-stable-abi";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
