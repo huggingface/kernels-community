@@ -22,6 +22,7 @@ from .bayesian_autotuner import bayesian_autotune
 from .utils import (
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
+    UE8M0_SCALE_DTYPES,
     DECODE_BLOCK_SIZE_M,
     decode_ue8m0_scale,
     device_context,
@@ -29,7 +30,6 @@ from .utils import (
     mx_dot_scaled,
     mx_scalar_reduce,
     mxfp_act_quant_inline,
-    mxfp4_e2m1_to_e4m3,
     fp8_act_quant,
     fp8_act_quant_inline,
     get_accelerator_autotuning_configs,
@@ -290,24 +290,24 @@ def mxfp_dynamic_matmul_batched_kernel(
         )
         b = tl.load(b_ptrs)
         b_s = tl.load(bs_ptrs).to(tl.uint8)
-        bq = mxfp4_e2m1_to_e4m3(b) if VALUES_PER_BYTE == 2 else b
         if COMPUTE_MODE == "dot_scaled":
             accumulator = mx_dot_scaled(
-                a, a_scale, b, b_s, accumulator, VALUES_PER_BYTE
+                accumulator, a, a_scale, b, b_s, VALUES_PER_BYTE
             )
         elif COMPUTE_MODE == "dot":
-            accumulator = mx_dot_rescale(accumulator, a, bq, a_scale, b_s)
+            accumulator = mx_dot_rescale(accumulator, a, b, a_scale, b_s, VALUES_PER_BYTE)
         else:  # scalar
             accumulator = mx_scalar_reduce(
                 accumulator,
                 a,
                 a_scale,
-                bq,
+                b,
                 b_s,
                 BLOCK_SIZE_M,
                 BLOCK_SIZE_N,
                 BLOCK_SIZE_K,
                 SCALE_GROUP_K,
+                VALUES_PER_BYTE,
             )
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
@@ -526,8 +526,8 @@ def _mxfp_dynamic_matmul_batched(
     assert B.dtype in (torch.int8, torch.float8_e4m3fn), (
         f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
     )
-    assert Bs.dtype == torch.float8_e8m0fnu, (
-        f"Bs must be float8_e8m0fnu, got {Bs.dtype}"
+    assert Bs.dtype in UE8M0_SCALE_DTYPES, (
+        f"Bs must be float8_e8m0fnu or uint8 (UE8M0), got {Bs.dtype}"
     )
     VALUES_PER_BYTE = NIBBLES_PER_BYTE if B.dtype == torch.int8 else 1
 

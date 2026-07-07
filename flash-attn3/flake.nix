@@ -2,7 +2,7 @@
   description = "Flake for Hopper Flash Attention kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/make-ptxas-overridable";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
@@ -20,7 +20,11 @@
         ];
 
       torchVersions =
-        allVersions: builtins.map (version: if (version.cudaVersion or null) == "12.6" then version // { ptxasVersion = "12.8"; } else version) allVersions;
- 
+        allVersions:
+        builtins.map (
+          version:
+          if (version.cudaVersion or null) == "12.6" then version // { ptxasVersion = "12.8"; } else version
+        ) allVersions;
+
     };
 }
