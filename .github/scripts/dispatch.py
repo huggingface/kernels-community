@@ -27,6 +27,13 @@ WORKFLOWS = {
 
 KERNEL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
+# A kernel argument, optionally scoped to a subset of backends:
+#   "flash-attn2"            -> ("flash-attn2", None)     (all declared backends)
+#   "flash-attn2[xpu,cpu]"   -> ("flash-attn2", ["xpu", "cpu"])
+KERNEL_ARG_RE = re.compile(
+    r"^(?P<name>[A-Za-z0-9_-]+)(?:\[(?P<backends>[A-Za-z0-9_]+(?:,[A-Za-z0-9_]+)*)\])?$"
+)
+
 # Workflow file -> its YAML `name:`; must match the context the build reports.
 WORKFLOW_DISPLAY_NAMES = {
     "build.yaml": "Build",
@@ -95,6 +102,29 @@ class DispatchPlan:
 # Reading build.toml and selecting workflows
 
 
+def parse_kernel_arg(token: str) -> tuple[str | None, list[str] | None]:
+    """Split a ``kernel`` or ``kernel[b1,b2]`` token.
+
+    Returns ``(name, backends)`` where ``backends`` is ``None`` when no
+    backend scope was given (meaning "all declared backends"), or a list of
+    the requested backend names. Returns ``(None, None)`` if the token is not
+    a valid kernel argument.
+    """
+    match = KERNEL_ARG_RE.match(token)
+    if not match:
+        return None, None
+    name = match.group("name")
+    raw = match.group("backends")
+    if raw is None:
+        return name, None
+    return name, raw.split(",")
+
+
+# Sentinel so select_workflows can distinguish "read backends from build.toml"
+# from an explicitly-passed backend list (including None, meaning unreadable).
+_READ_FROM_TOML = object()
+
+
 def read_backends(kernel_name: str) -> list[str] | None:
     build_toml = Path(kernel_name) / "build.toml"
     if not build_toml.exists():
@@ -109,8 +139,11 @@ def read_backends(kernel_name: str) -> list[str] | None:
     return None
 
 
-def select_workflows(kernel_name: str, *, notes: list[str]) -> set[str]:
-    backends = read_backends(kernel_name)
+def select_workflows(
+    kernel_name: str, *, notes: list[str], backends=_READ_FROM_TOML
+) -> set[str]:
+    if backends is _READ_FROM_TOML:
+        backends = read_backends(kernel_name)
     if backends is None:
         notes.append(
             f"Could not read backends for {kernel_name}, dispatching all workflows"
@@ -219,6 +252,44 @@ def _windows_scoped_backends(
     return kept
 
 
+def _resolve_effective_backends(
+    kernel_name: str, requested_backends: list[str] | None, plan: DispatchPlan
+) -> list[str] | None:
+    """Combine a kernel's declared backends with an optional user filter.
+
+    Returns the list of backends to actually build. When ``requested_backends``
+    is ``None`` the declared list is returned unchanged (``None`` if
+    build.toml is unreadable, so callers fall back to all workflows). When a
+    filter is given, returns the declared backends intersected with it, or an
+    empty list if nothing matches (caller should build nothing).
+    """
+    declared = read_backends(kernel_name)
+    if requested_backends is None:
+        return declared
+
+    if declared is None:
+        # build.toml is unreadable; trust the explicit request as-is.
+        plan.notes.append(
+            f"Could not read backends for {kernel_name}; "
+            f"using requested backends {requested_backends}"
+        )
+        return list(requested_backends)
+
+    unknown = [b for b in requested_backends if b not in declared]
+    if unknown:
+        plan.notes.append(
+            f"Ignoring requested backend(s) {unknown} not declared by "
+            f"{kernel_name} (declared: {declared})"
+        )
+    effective = [b for b in declared if b in requested_backends]
+    if not effective:
+        plan.notes.append(
+            f"None of the requested backends {requested_backends} are declared "
+            f"by {kernel_name} (declared: {declared}); nothing to build"
+        )
+    return effective
+
+
 def _plan_build_actions(
     plan: DispatchPlan,
     kernel_name: str,
@@ -232,9 +303,16 @@ def _plan_build_actions(
     head_sha: str,
     target_branch: str,
     upload: bool,
+    requested_backends: list[str] | None = None,
 ) -> None:
-    backends = read_backends(kernel_name) or []
-    workflows = select_workflows(kernel_name, notes=plan.notes)
+    effective = _resolve_effective_backends(kernel_name, requested_backends, plan)
+    # A user filter that matched no declared backend -> build nothing.
+    if requested_backends is not None and effective == []:
+        plan.skipped = sorted(WORKFLOWS["build"])
+        return
+
+    backends = effective or []
+    workflows = select_workflows(kernel_name, notes=plan.notes, backends=effective)
     plan.skipped = sorted(set(WORKFLOWS["build"]) - workflows)
 
     for workflow in sorted(workflows):
@@ -294,6 +372,7 @@ def plan_dispatch(
     upload: bool = True,
     run_security: bool = False,
     security_only: bool = False,
+    requested_backends: list[str] | None = None,
 ) -> DispatchPlan:
     want_security = run_security or security_only
     plan = DispatchPlan(kernel_name=kernel_name, head_sha=head_sha)
@@ -311,6 +390,7 @@ def plan_dispatch(
             head_sha=head_sha,
             target_branch=target_branch,
             upload=upload,
+            requested_backends=requested_backends,
         )
 
     if want_security:
@@ -460,6 +540,7 @@ def dispatch(
     upload: bool = True,
     run_security: bool = False,
     security_only: bool = False,
+    requested_backends: list[str] | None = None,
 ) -> DispatchResult:
     if not security_only and (not kernel_name or not KERNEL_NAME_RE.match(kernel_name)):
         result = DispatchResult(kernel_name=kernel_name)
@@ -481,6 +562,7 @@ def dispatch(
         upload=upload,
         run_security=run_security,
         security_only=security_only,
+        requested_backends=requested_backends,
     )
     if dry_run:
         return _result_from_plan(plan)
@@ -542,7 +624,10 @@ def main() -> int:
         "kernel_name",
         nargs="?",
         default="",
-        help="Kernel directory name (not required with --security-only)",
+        help=(
+            "Kernel directory name, optionally scoped to a subset of backends "
+            "as 'kernel[backend1,backend2]' (not required with --security-only)"
+        ),
     )
     parser.add_argument(
         "--ref", default="main", help="Git ref to dispatch on (default: main)"
@@ -622,6 +707,18 @@ def main() -> int:
         )
         return 1
 
+    kernel_name = args.kernel_name
+    requested_backends = None
+    if kernel_name:
+        kernel_name, requested_backends = parse_kernel_arg(kernel_name)
+        if kernel_name is None:
+            print(
+                f"Error: invalid kernel argument {args.kernel_name!r} "
+                "(expected 'kernel' or 'kernel[backend1,backend2]').",
+                file=sys.stderr,
+            )
+            return 1
+
     common = dict(
         mode=args.mode,
         repo_prefix=args.repo_prefix,
@@ -634,11 +731,12 @@ def main() -> int:
         run_security=args.security,
         security_only=args.security_only,
         dispatch_key_prefix=args.dispatch_key_prefix,
+        requested_backends=requested_backends,
     )
 
     if args.dry_run:
         result = dispatch(
-            args.kernel_name,
+            kernel_name or "",
             token="",
             repo=args.repo or "",
             ref=args.ref,
@@ -662,7 +760,7 @@ def main() -> int:
             return 1
 
         result = dispatch(
-            args.kernel_name,
+            kernel_name or "",
             token=token,
             repo=repo,
             ref=args.ref,

@@ -30,6 +30,14 @@ def _select(backends):
         return dispatch.select_workflows("somekernel", notes=[])
 
 
+def _build_actions(plan):
+    return [a for a in plan.actions if a.kind == "build"]
+
+
+def _backends_csv(action):
+    return sorted(b for b in action.body["inputs"]["backends"].split(",") if b)
+
+
 # Fallback routing when build.toml is unreadable or declares unknown backends.
 def test_unreadable_backends_falls_back_to_all_builds():
     assert _select(None) == set(dispatch.WORKFLOWS["build"])
@@ -115,6 +123,65 @@ def test_records_http_failure():
         result = dispatch.execute_plan(plan, token="t", repo="owner/repo")
     assert result.dispatched == []
     assert [code for _, code in result.failed] == [500]
+
+
+# parse_kernel_arg: the `kernel` / `kernel[b1,b2]` argument grammar.
+@pytest.mark.parametrize(
+    "token, expected",
+    [
+        ("flash-attn2", ("flash-attn2", None)),
+        ("flash-attn2[xpu,cpu]", ("flash-attn2", ["xpu", "cpu"])),
+        ("relu[cpu]", ("relu", ["cpu"])),
+        ("bad/name", (None, None)),
+        ("kernel[]", (None, None)),  # empty scope is not valid
+        ("kernel[,]", (None, None)),  # dangling comma is not valid
+        ("kernel[cpu,]", (None, None)),
+    ],
+)
+def test_parse_kernel_arg(token, expected):
+    assert dispatch.parse_kernel_arg(token) == expected
+
+
+# requested_backends: user-supplied filter narrows workflows and the scoped CSV.
+def test_requested_backends_filter_narrows_workflows_and_scope():
+    plan = _plan(
+        backends=["cpu", "cuda", "xpu"], requested_backends=["xpu", "cpu"]
+    )
+    build = _build_actions(plan)
+    # cuda dropped -> Windows gated off for the non-allowlisted kernel -> Linux only.
+    assert _workflows(build) == ["build.yaml"]
+    assert _backends_csv(build[0]) == ["cpu", "xpu"]
+
+
+def test_requested_backends_unknown_are_ignored_with_note():
+    plan = _plan(backends=["cpu", "cuda"], requested_backends=["cpu", "rocm"])
+    build = _build_actions(plan)
+    assert _backends_csv(build[0]) == ["cpu"]  # rocm not declared -> dropped
+    assert any("Ignoring requested backend" in n for n in plan.notes)
+
+
+def test_requested_backends_none_match_skips_all_builds():
+    plan = _plan(backends=["cpu", "cuda"], requested_backends=["rocm"])
+    assert _build_actions(plan) == []
+    assert plan.skipped == sorted(dispatch.WORKFLOWS["build"])
+    assert any("nothing to build" in n for n in plan.notes)
+
+
+def test_requested_backends_thread_through_dispatch_dry_run():
+    with mock.patch.object(
+        dispatch, "read_backends", return_value=["cpu", "cuda", "xpu"]
+    ):
+        result = dispatch.dispatch(
+            "somekernel",
+            token="",
+            repo="owner/repo",
+            dry_run=True,
+            requested_backends=["xpu"],
+        )
+    csvs = [body["inputs"]["backends"] for _, body in result.dry_run_payloads]
+    assert csvs, "expected at least one dispatched build"
+    assert all("cuda" not in c.split(",") for c in csvs)
+    assert any("xpu" in c.split(",") for c in csvs)
 
 
 # select_workflows: backend-union and Windows-gate cases (single-backend rows omitted).
