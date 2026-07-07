@@ -13,9 +13,8 @@ and cores, falling back to DEFAULT_MAX_JOBS and DEFAULT_CORES respectively,
 with per-kernel/backend overrides read from build-concurrency.json at the
 repo root.
 
-The optional BACKENDS_FILTER environment variable (a comma-separated list)
-restricts the matrix to those backends. When empty or unset, every backend
-nix exposes is built. Filter names not exposed by nix are simply ignored.
+The optional BACKENDS_FILTER environment variable (comma-separated) restricts
+the matrix to those backends; empty or unset builds every backend nix exposes.
 """
 
 import json
@@ -103,20 +102,6 @@ def main():
         for backend in backends_by_arch[arch]
         if not backends_filter or backend in backends_filter
     ]
-
-    if backends_filter:
-        dropped = {
-            backend
-            for backends in backends_by_arch.values()
-            for backend in backends
-            if backend not in backends_filter
-        }
-        if dropped:
-            print(
-                f"BACKENDS_FILTER={sorted(backends_filter)} excluded backends "
-                f"{sorted(dropped)} for kernel {kernel!r}",
-                file=sys.stderr,
-            )
 
     print(json.dumps({"include": include}))
 

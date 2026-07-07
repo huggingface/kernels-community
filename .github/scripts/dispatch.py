@@ -103,25 +103,20 @@ class DispatchPlan:
 
 
 def parse_kernel_arg(token: str) -> tuple[str | None, list[str] | None]:
-    """Split a ``kernel`` or ``kernel[b1,b2]`` token.
+    """Split ``kernel`` or ``kernel[b1,b2]`` into ``(name, backends)``.
 
-    Returns ``(name, backends)`` where ``backends`` is ``None`` when no
-    backend scope was given (meaning "all declared backends"), or a list of
-    the requested backend names. Returns ``(None, None)`` if the token is not
-    a valid kernel argument.
+    ``backends`` is ``None`` when no scope was given (all declared backends).
+    Returns ``(None, None)`` for a malformed token.
     """
     match = KERNEL_ARG_RE.match(token)
     if not match:
         return None, None
-    name = match.group("name")
     raw = match.group("backends")
-    if raw is None:
-        return name, None
-    return name, raw.split(",")
+    return match.group("name"), (raw.split(",") if raw else None)
 
 
-# Sentinel so select_workflows can distinguish "read backends from build.toml"
-# from an explicitly-passed backend list (including None, meaning unreadable).
+# Sentinel: lets select_workflows() tell "read build.toml" from an explicitly
+# passed backend list (None included, meaning unreadable).
 _READ_FROM_TOML = object()
 
 
@@ -252,44 +247,6 @@ def _windows_scoped_backends(
     return kept
 
 
-def _resolve_effective_backends(
-    kernel_name: str, requested_backends: list[str] | None, plan: DispatchPlan
-) -> list[str] | None:
-    """Combine a kernel's declared backends with an optional user filter.
-
-    Returns the list of backends to actually build. When ``requested_backends``
-    is ``None`` the declared list is returned unchanged (``None`` if
-    build.toml is unreadable, so callers fall back to all workflows). When a
-    filter is given, returns the declared backends intersected with it, or an
-    empty list if nothing matches (caller should build nothing).
-    """
-    declared = read_backends(kernel_name)
-    if requested_backends is None:
-        return declared
-
-    if declared is None:
-        # build.toml is unreadable; trust the explicit request as-is.
-        plan.notes.append(
-            f"Could not read backends for {kernel_name}; "
-            f"using requested backends {requested_backends}"
-        )
-        return list(requested_backends)
-
-    unknown = [b for b in requested_backends if b not in declared]
-    if unknown:
-        plan.notes.append(
-            f"Ignoring requested backend(s) {unknown} not declared by "
-            f"{kernel_name} (declared: {declared})"
-        )
-    effective = [b for b in declared if b in requested_backends]
-    if not effective:
-        plan.notes.append(
-            f"None of the requested backends {requested_backends} are declared "
-            f"by {kernel_name} (declared: {declared}); nothing to build"
-        )
-    return effective
-
-
 def _plan_build_actions(
     plan: DispatchPlan,
     kernel_name: str,
@@ -305,15 +262,22 @@ def _plan_build_actions(
     upload: bool,
     requested_backends: list[str] | None = None,
 ) -> None:
-    effective = _resolve_effective_backends(kernel_name, requested_backends, plan)
-    # A user filter that matched no declared backend -> build nothing.
-    if requested_backends is not None and effective == []:
-        plan.skipped = sorted(WORKFLOWS["build"])
-        return
+    backends = read_backends(kernel_name)
+    # Narrow to the requested backends, so both workflow selection and the
+    # per-workflow `backends` CSV skip everything the user did not ask for.
+    if requested_backends is not None and backends is not None:
+        backends = [b for b in backends if b in requested_backends]
+        if not backends:
+            plan.notes.append(
+                f"None of the requested backends {requested_backends} are "
+                f"declared by {kernel_name}; skipping build"
+            )
+            plan.skipped = sorted(WORKFLOWS["build"])
+            return
 
-    backends = effective or []
-    workflows = select_workflows(kernel_name, notes=plan.notes, backends=effective)
+    workflows = select_workflows(kernel_name, notes=plan.notes, backends=backends)
     plan.skipped = sorted(set(WORKFLOWS["build"]) - workflows)
+    backends = backends or []
 
     for workflow in sorted(workflows):
         scoped = sorted(
@@ -625,8 +589,8 @@ def main() -> int:
         nargs="?",
         default="",
         help=(
-            "Kernel directory name, optionally scoped to a subset of backends "
-            "as 'kernel[backend1,backend2]' (not required with --security-only)"
+            "Kernel directory name, optionally scoped as "
+            "'kernel[backend1,backend2]' (not required with --security-only)"
         ),
     )
     parser.add_argument(

@@ -153,18 +153,17 @@ def test_requested_backends_filter_narrows_workflows_and_scope():
     assert _backends_csv(build[0]) == ["cpu", "xpu"]
 
 
-def test_requested_backends_unknown_are_ignored_with_note():
+def test_requested_backends_undeclared_are_dropped():
     plan = _plan(backends=["cpu", "cuda"], requested_backends=["cpu", "rocm"])
     build = _build_actions(plan)
     assert _backends_csv(build[0]) == ["cpu"]  # rocm not declared -> dropped
-    assert any("Ignoring requested backend" in n for n in plan.notes)
 
 
 def test_requested_backends_none_match_skips_all_builds():
     plan = _plan(backends=["cpu", "cuda"], requested_backends=["rocm"])
     assert _build_actions(plan) == []
     assert plan.skipped == sorted(dispatch.WORKFLOWS["build"])
-    assert any("nothing to build" in n for n in plan.notes)
+    assert any("skipping build" in n for n in plan.notes)
 
 
 def test_requested_backends_thread_through_dispatch_dry_run():
