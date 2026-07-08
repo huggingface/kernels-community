@@ -96,12 +96,6 @@ class DispatchPlan:
 
 
 def parse_kernel_arg(token: str) -> tuple[str | None, list[str] | None]:
-    """Split ``kernel`` or ``kernel[b1,b2]`` into ``(name, backends)``.
-
-    ``backends`` is ``None`` when no scope was given (all declared backends).
-    Returns ``(None, None)`` for a syntactically malformed token. Backend names
-    are not checked here; the caller warns about and drops unknown ones.
-    """
     name, bracket, rest = token.partition("[")
     if not KERNEL_NAME_RE.match(name):
         return None, None
@@ -256,8 +250,6 @@ def _plan_build_actions(
     requested_backends: list[str] | None = None,
 ) -> None:
     backends = read_backends(kernel_name)
-    # Narrow to the requested backends, so both workflow selection and the
-    # per-workflow `backends` CSV skip everything the user did not ask for.
     if requested_backends is not None and backends is not None:
         backends = [b for b in backends if b in requested_backends]
         if not backends:

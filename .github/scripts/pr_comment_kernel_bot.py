@@ -19,10 +19,7 @@ from dispatch import (
 
 KERNEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
-# Kernels may be scoped to backends, e.g. `flash-attn2[xpu,cpu]`, so the gate
-# additionally allows `[`, `]`, and `,`.
 COMMENT_CHARS_RE = re.compile(r"^/kernel-bot[ A-Za-z0-9_./,\[\]-]*$")
-# Backends a kernel may be scoped to (typos are rejected up front).
 KNOWN_BACKENDS = set(BACKEND_TO_WORKFLOWS)
 COMMAND_PERMISSIONS = {
     "build": {"admin", "write"},
@@ -50,7 +47,6 @@ COMMAND_USAGE = (
 class ParsedCommand:
     command: str | None = None
     kernels: list[str] = field(default_factory=list)
-    # Kernel name -> requested backend subset (absent means "all backends").
     backends: dict[str, list[str]] = field(default_factory=dict)
     branch: str | None = None
     error: str | None = None

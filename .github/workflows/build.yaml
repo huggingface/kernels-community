@@ -168,7 +168,6 @@ jobs:
         env:
           KERNEL: ${{ steps.validate.outputs.kernel }}
           MODE: ${{ inputs.mode }}
-          # Optional comma-separated allowlist; empty means build every backend.
           BACKENDS_FILTER: ${{ inputs.backends }}
         run: |
           if [ "$MODE" = "pr" ]; then
