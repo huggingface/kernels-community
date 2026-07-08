@@ -3,7 +3,7 @@ from typing import Optional, Tuple, Literal
 from functools import partial
 
 import torch
-from ._ops_compat import add_quack_op_namespace_prefix
+from ._ops_compat import add_op_namespace_prefix
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -455,7 +455,7 @@ def gemm(
 
 
 @torch.library.custom_op(
-    add_quack_op_namespace_prefix("gemm_out"),
+    add_op_namespace_prefix("gemm_out"),
     mutates_args=("out",),
     device_types="cuda",
     # We have to split out alpha and alpha_tensor since torch.library requires
@@ -653,7 +653,7 @@ def gemm_add(
 
 
 @torch.library.custom_op(
-    add_quack_op_namespace_prefix("gemm_add_out"),
+    add_op_namespace_prefix("gemm_add_out"),
     mutates_args=("out",),
     device_types="cuda",
     # We have to split out alpha and alpha_tensor since torch.library requires
@@ -833,7 +833,7 @@ def gemm_add_inplace(
 
 
 @torch.library.custom_op(
-    add_quack_op_namespace_prefix("gemm_add_inplace"),
+    add_op_namespace_prefix("gemm_add_inplace"),
     mutates_args=("out",),
     device_types="cuda",
     # We have to split out alpha and alpha_tensor since torch.library requires
@@ -951,7 +951,7 @@ gemm_gated = gemm_act
 
 
 @torch.library.custom_op(
-    add_quack_op_namespace_prefix("gemm_act_out"),
+    add_op_namespace_prefix("gemm_act_out"),
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
@@ -1087,7 +1087,7 @@ gemm_dgated = gemm_dact
 
 
 @torch.library.custom_op(
-    add_quack_op_namespace_prefix("gemm_dact_out"),
+    add_op_namespace_prefix("gemm_dact_out"),
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True) -> ()",
@@ -1153,7 +1153,7 @@ gemm_dgated_ref = gemm_dact_ref
 
 
 @torch.library.custom_op(
-    add_quack_op_namespace_prefix("gemm_symmetric_out"),
+    add_op_namespace_prefix("gemm_symmetric_out"),
     mutates_args=("out",),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor(a2!) out, Tensor? C=None, bool dynamic_scheduler=False, float alpha=1.0, float beta=1.0) -> ()",
@@ -1423,7 +1423,7 @@ def gemm_dgated_tuned(
 
 
 @torch.library.custom_op(
-    add_quack_op_namespace_prefix("gemm_gated_out"),
+    add_op_namespace_prefix("gemm_gated_out"),
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, str? concat_layout=None) -> ()",
@@ -1460,7 +1460,7 @@ def gemm_gated_out(
 
 
 @torch.library.custom_op(
-    add_quack_op_namespace_prefix("gemm_dgated_out"),
+    add_op_namespace_prefix("gemm_dgated_out"),
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a!) dx_out, Tensor(b!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True) -> Tensor",
@@ -1499,7 +1499,7 @@ def gemm_dgated_out(
     return result
 
 
-@torch.library.register_fake(add_quack_op_namespace_prefix("gemm_dgated_out"))
+@torch.library.register_fake(add_op_namespace_prefix("gemm_dgated_out"))
 def gemm_dgated_out_fake(
     A: Tensor,
     B: Tensor,
@@ -1763,7 +1763,7 @@ def _gemm_rms_tuned(
 
 
 @torch.library.custom_op(
-    add_quack_op_namespace_prefix("gemm_rms_out"),
+    add_op_namespace_prefix("gemm_rms_out"),
     mutates_args=("out",),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor(a!) out, Tensor? C=None, Tensor? norm_weight=None, float eps=1e-6, bool dynamic_scheduler=False, bool tuned=True) -> Tensor",
@@ -1794,7 +1794,7 @@ def _gemm_rms_out(
     )
 
 
-@torch.library.register_fake(add_quack_op_namespace_prefix("gemm_rms_out"))
+@torch.library.register_fake(add_op_namespace_prefix("gemm_rms_out"))
 def _gemm_rms_out_fake(
     A: Tensor,
     B: Tensor,
@@ -1999,7 +1999,7 @@ def gemm_norm_gated_tuned(
 
 
 @torch.library.custom_op(
-    add_quack_op_namespace_prefix("gemm_norm_act_out"),
+    add_op_namespace_prefix("gemm_norm_act_out"),
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? rstd=None, str? activation=None, bool dynamic_scheduler=False, bool tuned=True) -> ()",
@@ -2019,7 +2019,7 @@ def gemm_norm_act_out(
     fn(A, B, preact_out, postact_out, C, rstd, activation, dynamic_scheduler)
 
 
-@torch.library.register_fake(add_quack_op_namespace_prefix("gemm_norm_act_out"))
+@torch.library.register_fake(add_op_namespace_prefix("gemm_norm_act_out"))
 def _gemm_norm_act_out_fake(
     A,
     B,
@@ -2035,7 +2035,7 @@ def _gemm_norm_act_out_fake(
 
 
 @torch.library.custom_op(
-    add_quack_op_namespace_prefix("gemm_norm_gated_out"),
+    add_op_namespace_prefix("gemm_norm_gated_out"),
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
     schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? rstd=None, str activation='swiglu', bool dynamic_scheduler=False, bool tuned=True) -> ()",
@@ -2055,7 +2055,7 @@ def gemm_norm_gated_out(
     fn(A, B, preact_out, postact_out, C, rstd, activation, dynamic_scheduler)
 
 
-@torch.library.register_fake(add_quack_op_namespace_prefix("gemm_norm_gated_out"))
+@torch.library.register_fake(add_op_namespace_prefix("gemm_norm_gated_out"))
 def _gemm_norm_gated_out_fake(
     A,
     B,

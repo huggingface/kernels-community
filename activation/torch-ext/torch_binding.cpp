@@ -11,6 +11,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
 #elif defined(METAL_KERNEL)
   ops.impl("silu_and_mul", torch::kMPS, &silu_and_mul);
+#elif defined(CPU_KERNEL)
+  ops.impl("silu_and_mul", torch::kCPU, &silu_and_mul);
 #endif
 
   ops.def("mul_and_silu(Tensor! out, Tensor input) -> ()");

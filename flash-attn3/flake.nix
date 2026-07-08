@@ -2,7 +2,7 @@
   description = "Flake for Hopper Flash Attention kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/make-ptxas-overridable";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
