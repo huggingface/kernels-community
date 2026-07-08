@@ -1156,7 +1156,7 @@ def _e2m1_code_to_f32(code):
     s = (code >> 3) & 1
     e = (code >> 1) & 3
     m = (code & 1).to(tl.float32)
-    pow2 = tl.exp2((e - 1).to(tl.float32))  # e in 0..3 -> 0.5, 1, 2, 4
+    pow2 = (1 << e).to(tl.float32) * 0.5  # e in 0..3 -> 0.5, 1, 2, 4 (int shift, no exp2)
     mag = tl.where(e == 0, 0.5 * m, (1.0 + 0.5 * m) * pow2)
     return (1.0 - 2.0 * s.to(tl.float32)) * mag
 
