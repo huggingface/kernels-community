@@ -27,13 +27,6 @@ WORKFLOWS = {
 
 KERNEL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
-# A kernel argument, optionally scoped to a subset of backends:
-#   "flash-attn2"            -> ("flash-attn2", None)     (all declared backends)
-#   "flash-attn2[xpu,cpu]"   -> ("flash-attn2", ["xpu", "cpu"])
-KERNEL_ARG_RE = re.compile(
-    r"^(?P<name>[A-Za-z0-9_-]+)(?:\[(?P<backends>[A-Za-z0-9_]+(?:,[A-Za-z0-9_]+)*)\])?$"
-)
-
 # Workflow file -> its YAML `name:`; must match the context the build reports.
 WORKFLOW_DISPLAY_NAMES = {
     "build.yaml": "Build",
@@ -106,18 +99,20 @@ def parse_kernel_arg(token: str) -> tuple[str | None, list[str] | None]:
     """Split ``kernel`` or ``kernel[b1,b2]`` into ``(name, backends)``.
 
     ``backends`` is ``None`` when no scope was given (all declared backends).
-    Returns ``(None, None)`` for a malformed token.
+    Returns ``(None, None)`` for a syntactically malformed token. Backend names
+    are not checked here; the caller warns about and drops unknown ones.
     """
-    match = KERNEL_ARG_RE.match(token)
-    if not match:
+    name, bracket, rest = token.partition("[")
+    if not KERNEL_NAME_RE.match(name):
         return None, None
-    raw = match.group("backends")
-    return match.group("name"), (raw.split(",") if raw else None)
-
-
-# Sentinel: lets select_workflows() tell "read build.toml" from an explicitly
-# passed backend list (None included, meaning unreadable).
-_READ_FROM_TOML = object()
+    if not bracket:
+        return name, None
+    if not rest.endswith("]"):
+        return None, None
+    backends = rest[:-1].split(",")
+    if not all(backends):  # reject empty components: "[]", "[cpu,]", "[,]"
+        return None, None
+    return name, backends
 
 
 def read_backends(kernel_name: str) -> list[str] | None:
@@ -135,10 +130,8 @@ def read_backends(kernel_name: str) -> list[str] | None:
 
 
 def select_workflows(
-    kernel_name: str, *, notes: list[str], backends=_READ_FROM_TOML
+    kernel_name: str, backends: list[str] | None, *, notes: list[str]
 ) -> set[str]:
-    if backends is _READ_FROM_TOML:
-        backends = read_backends(kernel_name)
     if backends is None:
         notes.append(
             f"Could not read backends for {kernel_name}, dispatching all workflows"
@@ -275,7 +268,7 @@ def _plan_build_actions(
             plan.skipped = sorted(WORKFLOWS["build"])
             return
 
-    workflows = select_workflows(kernel_name, notes=plan.notes, backends=backends)
+    workflows = select_workflows(kernel_name, backends, notes=plan.notes)
     plan.skipped = sorted(set(WORKFLOWS["build"]) - workflows)
     backends = backends or []
 

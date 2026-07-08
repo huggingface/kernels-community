@@ -26,8 +26,7 @@ def _workflows(actions):
 
 
 def _select(backends):
-    with mock.patch.object(dispatch, "read_backends", return_value=backends):
-        return dispatch.select_workflows("somekernel", notes=[])
+    return dispatch.select_workflows("somekernel", backends, notes=[])
 
 
 def _build_actions(plan):
@@ -132,6 +131,8 @@ def test_records_http_failure():
         ("flash-attn2", ("flash-attn2", None)),
         ("flash-attn2[xpu,cpu]", ("flash-attn2", ["xpu", "cpu"])),
         ("relu[cpu]", ("relu", ["cpu"])),
+        # Unknown backends parse here; the caller rejects them by name.
+        ("flash-attn2[bogus]", ("flash-attn2", ["bogus"])),
         ("bad/name", (None, None)),
         ("kernel[]", (None, None)),  # empty scope is not valid
         ("kernel[,]", (None, None)),  # dangling comma is not valid
@@ -197,11 +198,8 @@ ROUTING_TRUTH_TABLE = [
 def test_truth_table(backends, windows_allowed, expected):
     kernel = "k"
     allowlist = {kernel} if windows_allowed else set()
-    with (
-        mock.patch.object(dispatch, "read_backends", return_value=backends),
-        mock.patch.object(dispatch, "WINDOWS_KERNELS", allowlist),
-    ):
-        assert dispatch.select_workflows(kernel, notes=[]) == expected
+    with mock.patch.object(dispatch, "WINDOWS_KERNELS", allowlist):
+        assert dispatch.select_workflows(kernel, backends, notes=[]) == expected
 
 
 # Invariants over every real kernel: assert properties, not exact per-kernel output.
@@ -243,7 +241,7 @@ def test_every_build_toml_parses(kernels):
 def test_every_kernel_routes_to_at_least_one_known_build(kernels):
     build_workflows = set(dispatch.WORKFLOWS["build"])
     for kernel in kernels:
-        workflows = dispatch.select_workflows(kernel, notes=[])
+        workflows = dispatch.select_workflows(kernel, dispatch.read_backends(kernel), notes=[])
         assert workflows, f"{kernel} routes to no build workflow"
         assert workflows <= build_workflows, (
             f"{kernel} routes to unknown workflow(s): {workflows - build_workflows}"
