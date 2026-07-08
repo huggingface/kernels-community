@@ -723,7 +723,7 @@ def mx_compute_gate_up(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
-    SWAP_AB: tl.constexpr,
+    SWAP_AB: tl.constexpr = False,
 ):
     """Gate∪up MMA step. Under ``SWAP_AB`` the swapped decode path runs (weight output rows in the MMA
     M dim — see ``mx_swap_compute_gate_up``); otherwise dispatch on ``COMPUTE_MODE``: scaled-MMA on the
@@ -777,7 +777,7 @@ def mx_compute(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
-    SWAP_AB: tl.constexpr,
+    SWAP_AB: tl.constexpr = False,
 ):
     """Single-projection MMA step. Under ``SWAP_AB`` the swapped decode path runs (weight output rows
     in the MMA M dim — different acc shape/finalize; see ``mx_swap_compute``); otherwise dispatch on
