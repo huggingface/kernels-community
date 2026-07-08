@@ -19,54 +19,57 @@ class FusedRMSNormGated(nn.Module):
         )
 
 
-def chunk_kimi_delta_attention(
-    query,
-    key,
-    value,
-    g,
-    beta,
-    chunk_size=64,
-    initial_state=None,
-    output_final_state=False,
-    use_qk_l2norm_in_kernel=False,
-    **kwargs,
-):
-    # Keep internal consistency between transformers and fla to allow both
-    cu_seqlens = kwargs.pop("cu_seq_lens_q", kwargs.pop("cu_seqlens", None))
-
-    return chunk_kda(
+class chunk_kimi_delta_attention(nn.Module):
+    def forward(
+        self,
         query,
         key,
         value,
-        g=g,
-        beta=beta,
-        chunk_size=chunk_size,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        cu_seqlens=cu_seqlens,
+        g,
+        beta,
+        chunk_size=64,
+        initial_state=None,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=False,
         **kwargs,
-    )
+    ):
+        # Keep internal consistency between transformers and fla to allow both
+        cu_seqlens = kwargs.pop("cu_seq_lens_q", kwargs.pop("cu_seqlens", None))
+
+        return chunk_kda(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            chunk_size=chunk_size,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
+            **kwargs,
+        )
 
 
-def recurrent_kimi_delta_attention(
-    query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False, **kwargs,
-):
-    # Keep internal consistency between transformers and fla to allow both
-    cu_seqlens = kwargs.pop("cu_seq_lens_q", kwargs.pop("cu_seqlens", None))
+class recurrent_kimi_delta_attention(nn.Module):
+    def forward(
+        self, query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False, **kwargs,
+    ):
+        # Keep internal consistency between transformers and fla to allow both
+        cu_seqlens = kwargs.pop("cu_seq_lens_q", kwargs.pop("cu_seqlens", None))
 
-    return fused_recurrent_kda(
-        query,
-        key,
-        value,
-        g=g,
-        beta=beta,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        cu_seqlens=cu_seqlens,
-        **kwargs,
-    )
+        return fused_recurrent_kda(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
+            **kwargs,
+        )
 
 
 __all__ = ["FusedRMSNormGated", "chunk_kimi_delta_attention", "recurrent_kimi_delta_attention"]
