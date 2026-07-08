@@ -192,10 +192,6 @@ def is_tensor_wide(block_size, weight: torch.Tensor) -> bool:
     )
 
 
-# The per-token batched/fused kernels are decode-shaped — one routed row per program, so
-# BLOCK_SIZE_M is 1 (a larger tile would just recompute the same row). The 2D matmul sizes
-# its M tile to the workload instead, via ``adaptive_block_size_m``.
-DECODE_BLOCK_SIZE_M = 1
 
 
 def adaptive_block_size_m(target_m: int) -> int:
@@ -225,10 +221,24 @@ def get_active_device_type() -> str:
         return "cuda"
 
 
+def decode_bm_swap_pairs(swap_ab: bool = True):
+    """The coupled decode ``(BLOCK_SIZE_M, SWAP_AB)`` pairs — the single source of the swap/BM
+    coupling. At M=1 the MMA 16-atom is filled either by replicating the token (non-swap BM=16,
+    ~40% over the degenerate BM=1 on plain tl.dot) or by putting the weight's output rows in M
+    (swap, BM=1). Swap REQUIRES BM=1 (its rhs is the single token padded to the N=16 atom), so the
+    pairs are ``{(1,no-swap), (16,no-swap), (1,swap)}`` — never ``(16, swap)``. The tuner picks."""
+    pairs = [(1, False), (16, False)]
+    if swap_ab:
+        pairs.append((1, True))
+    return pairs
+
+
 def get_accelerator_autotuning_configs(
     *,
     tune_block_m: bool = False,
     tune_block_nk: bool = False,
+    for_decode: bool = False,
+    swap_ab: bool = False,
 ):
     """Autotune search grid for the current accelerator.
 
@@ -263,6 +273,18 @@ def get_accelerator_autotuning_configs(
     if tune_block_m:
         blocks = [{**b, "BLOCK_SIZE_M": bm} for b in blocks for bm in (16, 32, 64, 128)]
 
+    # (BLOCK_SIZE_M, SWAP_AB) axis: for_decode crosses in the coupled decode pairs (see
+    # ``decode_bm_swap_pairs``); else SWAP_AB is a plain axis (BM from the launch), if swap_ab.
+    if for_decode:
+        pairs = decode_bm_swap_pairs(swap_ab)
+        blocks = [
+            {**b, "BLOCK_SIZE_M": bm, **({"SWAP_AB": sw} if swap_ab else {})}
+            for b in blocks
+            for bm, sw in pairs
+        ]
+    elif swap_ab:
+        blocks = [{**b, "SWAP_AB": sw} for b in blocks for sw in (False, True)]
+
     return [
         triton.Config(b, num_warps=w, num_stages=s)
         for b in blocks
@@ -276,6 +298,8 @@ def get_mxfp_autotuning_configs(
     compute_modes=("dot_scaled", "dot", "scalar"),
     memory_modes=(None,),
     tune_block_m=False,
+    for_decode=False,
+    swap_ab=False,
 ):
     """Autotune grid for the MXFP8 MoE/matmul kernels. ``COMPUTE_MODE`` (a constexpr string) picks
     the multiply-accumulate, and the Bayesian tuner selects it per workload (token count is
@@ -311,7 +335,17 @@ def get_mxfp_autotuning_configs(
                 size, dtype=torch.int8, device="xpu"
             )
         )
-    bms = (16, 32, 64, 128) if tune_block_m else (None,)
+    # (BLOCK_SIZE_M, SWAP_AB) axis, orthogonal to COMPUTE_MODE (swap is a low-M GEMV win that fades
+    # once the grid saturates):
+    #   - for_decode (M=1 batched/fused): the coupled decode pairs (see ``decode_bm_swap_pairs``).
+    #   - tune_block_m (grouped/prefill): BM ∈ {16,32,64,128}, crossed independently with swap.
+    #   - neither: BM from the launch; SWAP_AB a plain axis if swap_ab.
+    if for_decode:
+        bm_sw = decode_bm_swap_pairs(swap_ab)
+    else:
+        bms = (16, 32, 64, 128) if tune_block_m else (None,)
+        sws = (False, True) if swap_ab else (False,)
+        bm_sw = [(bm, sw) for bm in bms for sw in sws]
     return [
         triton.Config(
             {
@@ -320,6 +354,7 @@ def get_mxfp_autotuning_configs(
                 "BLOCK_SIZE_K": bk,
                 **({"MEMORY_MODE": mm} if mm is not None else {}),
                 **({"BLOCK_SIZE_M": bm} if bm is not None else {}),
+                **({"SWAP_AB": sw} if swap_ab else {}),
             },
             num_warps=w,
             num_stages=s,
@@ -329,11 +364,18 @@ def get_mxfp_autotuning_configs(
         for mode in compute_modes
         for bn in [32, 64, 128, 256]
         # only "dot" pins BK to the group (one scale group per fp8 tl.dot step); "dot_scaled"
-        # and "scalar" handle multiple groups per K-chunk, so they use a wide BK.
-        for bk in ([32] if mode == "dot" else [128, 256])
+        # and "scalar" handle multiple groups per K-chunk, so they use a wide BK. Decode adds
+        # BK=512: at its tiny grids (~256 blocks, memory-parallelism-bound) longer per-iteration
+        # bursts are the one in-block lever that helps (+12% measured on the dsv4 swap GEMV; deeper
+        # num_stages and split-K both measured WORSE — stages waste smem, split-K shortens loops).
+        for bk in (
+            [32] if mode == "dot" else [128, 256, 512] if for_decode else [128, 256]
+        )
         for s in [2, 3, 4, 5, 6]
         for w in [2, 4, 8]
-        for bm in bms
+        for (bm, sw) in bm_sw
+        # scalar is a true M=1 reduce — the BM=16 fill-atom is only for the tensor-core modes.
+        if not (mode == "scalar" and bm == 16)
     ]
 
 
@@ -362,11 +404,31 @@ def sm_shared_memory_limit(device_index: int) -> int:
             )
 
 
+def bk_within_k_pruner(k_arg: str):
+    """Build an ``early_config_prune`` that drops configs with ``BLOCK_SIZE_K`` larger than the
+    launch's contraction dim (``k_arg`` names it: ``"K"`` for the batched matmul, ``HIDDEN_DIM`` /
+    ``INTERMEDIATE_DIM`` for the fused gate_up / down). The decode kernels' K-loop loads are
+    unmasked (K is always a multiple of BK on real models), so an oversized BK reads past the row —
+    silently wrong results the tuner would happily time and pick (bit us when BK=512 met a K=256
+    test problem). Never returns empty — falls back to the smallest-BK configs."""
+
+    def prune(configs, named_args, **kwargs):
+        k = {**named_args, **kwargs}[k_arg]
+        kept = [c for c in configs if c.kwargs.get("BLOCK_SIZE_K", 0) <= k]
+        if kept:
+            return kept
+        min_bk = min(c.kwargs.get("BLOCK_SIZE_K", 0) for c in configs)
+        return [c for c in configs if c.kwargs.get("BLOCK_SIZE_K", 0) == min_bk]
+
+    return prune
+
+
 def smem_config_pruner(
     act_bytes: int,
     n_weight_tiles: int,
     weight_bytes: int = 1,
     reduction_dim: str | None = None,
+    double_mma: bool = False,
 ):
     """Build an ``early_config_prune`` that drops configs whose pipelined operand shared
     memory would overflow the SM — the source of ``out of resource: shared memory`` autotune
@@ -374,25 +436,47 @@ def smem_config_pruner(
 
     Per-stage estimate (bytes) = ``BK · (act_bytes·BM + weight_bytes·n_weight_tiles·BN)``:
     one activation tile ``[BM, BK]`` plus ``n_weight_tiles`` weight tiles ``[BN, BK]``
-    (gate_up fuses 2; down has 1), times ``num_stages``. ``BM`` is the routing-derived tile,
+    (gate_up loads 2; down has 1), times ``num_stages``. ``BM`` is the routing-derived tile,
     read from the launch args. MXFP4 packs 2 weights/byte, so ``weight_bytes=1`` (MXFP8) is a
     safe upper bound. The limit is read from the active device. Never returns empty — keeps
     the smallest-footprint config as a fallback.
 
-    ``reduction_dim`` (the K-loop bound arg name, e.g. ``"INTERMEDIATE_DIM"``) additionally drops
-    ``dot_scaled`` configs with ``BLOCK_SIZE_K >= reduction_dim`` — a single-trip K-loop, which on
-    sm_100 trips a Triton ``optimize-accumulator-init`` bug (uninitialized TMEM alloc must be
-    mutable) and never compiles. The autotuner discards them anyway; pruning up front just skips
-    the doomed compile and its MLIR error spam. ``None`` (default) disables the check."""
+    Two sm_10x (Blackwell-datacenter, TMEM scaled-MMA) ``dot_scaled`` compiler-bug guards, both
+    no-ops off sm_10x:
+
+    ``reduction_dim`` (the K-loop bound arg name, e.g. ``"INTERMEDIATE_DIM"``) drops ``dot_scaled``
+    configs with ``BLOCK_SIZE_K >= reduction_dim`` — a single-trip K-loop, which trips a Triton
+    ``optimize-accumulator-init`` bug (uninitialized TMEM alloc must be mutable) and never
+    compiles. ``None`` (default) disables the check.
+
+    ``double_mma`` marks a kernel that folds its ``n_weight_tiles`` into ONE wide MMA rather than
+    dotting them separately — the fused gate∪up kernel does a single ``[BM, n_weight_tiles*BN]``
+    dot (n_weight_tiles=2 → double-width N=2*BN). Its ``dot_scaled`` configs whose MMA width
+    ``n_weight_tiles * BLOCK_SIZE_N`` exceeds sm_10x's N=256 cap are dropped (Triton miscompiles
+    wider ones: packed-E2M1 rhs → sticky "misaligned address" device trap). Off by default: a
+    kernel can hold 2 weight tiles yet dot them *separately* (each ``[BM, BN]``), e.g. the batched
+    gate_up — there ``n_weight_tiles=2`` but ``double_mma=False``, so N stays BN."""
 
     def prune(configs, named_args, **kwargs):
-        # The estimate needs all three tile dims. Each is either an autotuned config meta
-        # (MX) or a launch arg (block-dynamic), so look in both; raise clearly if missing.
+        """``early_config_prune`` callback. Drops configs that (a) overflow the SM's shared memory
+        or run a ``dot_scaled`` that miscompiles on sm_100 — (b) a single-trip K-loop or (c) an
+        MMA wider than N=256. Falls back to the smallest-smem config so the autotuner is never
+        handed an empty list."""
+        # Tile dims live either in the autotuned config meta (MX) or the launch args (block-dynamic),
+        # so `dim` looks in both.
         all_args = {**named_args, **kwargs}
         dev = triton.runtime.driver.active.get_active_torch_device()
-        limit = sm_shared_memory_limit(dev.index if dev.index is not None else 0)
+        dev_index = dev.index if dev.index is not None else 0
+        limit = sm_shared_memory_limit(dev_index)
+        # The dot_scaled guards below are Blackwell-datacenter (sm_10x, TMEM scaled-MMA) compiler
+        # bugs — off on every other target, so they never over-prune there.
+        is_sm10x = (
+            dev.type == "cuda" and torch.cuda.get_device_capability(dev_index)[0] == 10
+        )
 
         def dim(c, name):
+            """A dimension for config ``c`` (a ``BLOCK_SIZE_*`` tile dim or a reduction extent like
+            ``HIDDEN_DIM``) — from its config meta or the launch args; raises if present in neither."""
             v = c.kwargs.get(name, all_args.get(name))
             if v is None:
                 raise ValueError(
@@ -402,6 +486,8 @@ def smem_config_pruner(
             return v
 
         def smem(c):
+            """Peak pipelined-operand shared memory (bytes) for ``c``: ``num_stages`` copies of one
+            ``[BM, BK]`` activation tile plus ``n_weight_tiles`` ``[BN, BK]`` weight tiles."""
             BM, BN, BK = (
                 dim(c, n) for n in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K")
             )
@@ -412,14 +498,46 @@ def smem_config_pruner(
             )
 
         def single_trip_dot_scaled(c):
+            """True if ``c`` is a ``dot_scaled`` config whose K-loop is a single trip
+            (``BLOCK_SIZE_K >= reduction_dim``) — the sm_10x accumulator-init miscompile (see the
+            ``reduction_dim`` note above). No-op when ``reduction_dim`` is None or off sm_10x."""
             return (
-                reduction_dim is not None
+                is_sm10x
+                and reduction_dim is not None
                 and c.kwargs.get("COMPUTE_MODE") == "dot_scaled"
-                and c.kwargs.get("BLOCK_SIZE_K", 0) >= all_args[reduction_dim]
+                and dim(c, "BLOCK_SIZE_K") >= dim(c, reduction_dim)
             )
 
+        def wide_dot_scaled(c):
+            """True if ``c`` is a tensor-core config whose single MMA is wider than N=256 —
+            sm_10x caps an MMA there and Triton miscompiles wider ones (sticky illegal-address
+            device trap that poisons the context mid-autotune). Hits ``dot_scaled`` AND plain
+            ``dot``: an exhaustive forced-config sweep (M3 MXFP8 gate_up, 1440 configs) trapped
+            both modes at width 512, config-dependently (BM/warps/stages decide whether the
+            compiler splits the wide MMA), so the whole width class is dropped. The MMA width is
+            ``n_weight_tiles * BLOCK_SIZE_N`` when the kernel fuses its tiles into one dot
+            (``double_mma``); otherwise each dot is N=BN and can't exceed the cap. No-op off
+            sm_10x or when ``double_mma`` is False."""
+            return (
+                is_sm10x
+                and double_mma
+                and c.kwargs.get("COMPUTE_MODE") in ("dot_scaled", "dot")
+                and n_weight_tiles * dim(c, "BLOCK_SIZE_N") > 256
+            )
+
+        # The smem estimate CANNOT classify near the limit: vs compiled ground truth (2880-config
+        # sweep) configs ran fine up to est=1.41x limit while real failures dipped to est=0.21x —
+        # the distributions overlap, so any tight threshold trims viable configs (a 1.0x cutoff
+        # measurably discarded 138 that compile and run). It only vetoes the impossible: >2x is
+        # 42% above the largest surviving over-estimate ever observed, and still skips the deep
+        # overflows (up to 5x). Everything else is left to the compiler — a config that doesn't
+        # fit fails its one benching compile and is scored inf.
         kept = [
-            c for c in configs if smem(c) <= limit and not single_trip_dot_scaled(c)
+            c
+            for c in configs
+            if smem(c) <= 2 * limit
+            and not single_trip_dot_scaled(c)
+            and not wide_dot_scaled(c)
         ]
         return kept or [min(configs, key=smem)]
 
@@ -485,25 +603,6 @@ def decode_ue8m0_scale(scale):
 
 
 @triton.jit
-def expand_ue8m0_scale(
-    scale_u8,
-    ROWS: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    SCALE_GROUP_K: tl.constexpr,
-):
-    """Decode a UE8M0 group-scale tile ``[ROWS, BLOCK_SIZE_K // SCALE_GROUP_K]`` and broadcast each
-    group scale across its ``SCALE_GROUP_K`` elements → ``[ROWS, BLOCK_SIZE_K]`` fp32 (one scale per
-    K element). Used by the scalar (CUDA-core FMA) MX paths to dequant the whole K chunk."""
-    s = decode_ue8m0_scale(scale_u8)
-    return tl.reshape(
-        tl.broadcast_to(
-            s[:, :, None], (ROWS, BLOCK_SIZE_K // SCALE_GROUP_K, SCALE_GROUP_K)
-        ),
-        (ROWS, BLOCK_SIZE_K),
-    )
-
-
-@triton.jit
 def mx_dot_scaled(acc, a, a_scale, w, w_scale, VALUES_PER_BYTE: tl.constexpr):
     """MX 'dot_scaled' path: scaled MMA folding the UE8M0 group scales into the tensor core —
     ``a`` (E4M3) @ ``w`` (packed E2M1 if MXFP4, else E4M3). The rhs format is picked from
@@ -552,14 +651,23 @@ def mx_scalar_reduce(
     """MX 'scalar' path: CUDA-core FMA GEMV, unpacking MXFP4 weights to E4M3 then dequantizing
     activation + weight per-element by their expanded group scales, reducing and accumulating into
     ``acc`` (returned updated). No tensor core (so no M→16 MMA pad) — wins for the memory-bound
-    decode GEMV (M=1). Single weight — for the gate∪up pair use ``mx_scalar_reduce_gate_up``."""
+    decode GEMV (M=1). Single weight — for the gate∪up pair use ``mx_scalar_reduce_gate_up``.
+
+    The UE8M0 scale is constant within each group of ``SCALE_GROUP_K``, so it factors out of the
+    inner sum: instead of expanding it to every K element and doing ``BLOCK_SIZE_K`` scale-muls,
+    reduce the raw products within each group, then apply ONE combined (act × weight) scale per
+    group — ``SCALE_GROUP_K``× fewer scale-muls. Measured ~18% faster on the decode reduce
+    (the per-element expand was pure overhead), bit-identical to the expanded form (rel 1e-7)."""
     wq = mxfp4_e2m1_to_e4m3(w) if VALUES_PER_BYTE == 2 else w
-    a_deq = tl.trans(
-        a.to(tl.float32)
-        * expand_ue8m0_scale(a_scale, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K)
+    NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
+    prod = tl.trans(a.to(tl.float32)) * wq.to(tl.float32)  # [BK, ROWS_W]
+    grp = tl.sum(
+        tl.reshape(prod, (NG, SCALE_GROUP_K, ROWS_W)), axis=1
+    )  # per-group partial
+    scale = tl.trans(decode_ue8m0_scale(a_scale)) * tl.trans(
+        decode_ue8m0_scale(w_scale)
     )
-    w_exp = tl.trans(expand_ue8m0_scale(w_scale, ROWS_W, BLOCK_SIZE_K, SCALE_GROUP_K))
-    return acc + tl.sum(a_deq * (wq.to(tl.float32) * w_exp), axis=0)[None, :]
+    return acc + tl.sum(grp * scale, axis=0)[None, :]
 
 
 @triton.jit
@@ -578,31 +686,24 @@ def mx_scalar_reduce_gate_up(
     SCALE_GROUP_K: tl.constexpr,
 ):
     """Gate∪up 'scalar' path: dequant the SHARED activation once, reduce both projections and
-    accumulate into ``acc_gate``/``acc_up`` (returned updated)."""
-    a_deq = tl.trans(
-        a.to(tl.float32)
-        * expand_ue8m0_scale(a_scale, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K)
+    accumulate into ``acc_gate``/``acc_up`` (returned updated). Per-group scale factored out of
+    the inner sum (see ``mx_scalar_reduce``): reduce raw products within each group of 32, then
+    one combined (act × weight) scale per group — 32× fewer scale-muls, bit-identical."""
+    NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
+    a_t = tl.trans(a.to(tl.float32))  # [BK, BM]
+    a_s = tl.trans(decode_ue8m0_scale(a_scale))  # [NG, BM]
+    grp_gate = tl.sum(
+        tl.reshape(a_t * w_gate.to(tl.float32), (NG, SCALE_GROUP_K, ROWS_W)), axis=1
     )
     acc_gate += tl.sum(
-        a_deq
-        * (
-            w_gate.to(tl.float32)
-            * tl.trans(
-                expand_ue8m0_scale(gate_scale, ROWS_W, BLOCK_SIZE_K, SCALE_GROUP_K)
-            )
-        ),
-        axis=0,
+        grp_gate * a_s * tl.trans(decode_ue8m0_scale(gate_scale)), axis=0
     )[None, :]
-    acc_up += tl.sum(
-        a_deq
-        * (
-            w_up.to(tl.float32)
-            * tl.trans(
-                expand_ue8m0_scale(up_scale, ROWS_W, BLOCK_SIZE_K, SCALE_GROUP_K)
-            )
-        ),
-        axis=0,
-    )[None, :]
+    grp_up = tl.sum(
+        tl.reshape(a_t * w_up.to(tl.float32), (NG, SCALE_GROUP_K, ROWS_W)), axis=1
+    )
+    acc_up += tl.sum(grp_up * a_s * tl.trans(decode_ue8m0_scale(up_scale)), axis=0)[
+        None, :
+    ]
     return acc_gate, acc_up
 
 
@@ -622,28 +723,36 @@ def mx_compute_gate_up(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
+    SWAP_AB: tl.constexpr,
 ):
-    """Gate∪up MMA step dispatched on ``COMPUTE_MODE``: scaled-MMA on the raw weights
-    (``b_gate``/``b_up``), or fp8 ``tl.dot`` + per-group rescale / scalar reduce on the
-    E4M3-decoded weights. Returns the updated ``(acc_gate, acc_up)``."""
-    w_gate = mxfp4_e2m1_to_e4m3(b_gate) if VALUES_PER_BYTE == 2 else b_gate
-    w_up = mxfp4_e2m1_to_e4m3(b_up) if VALUES_PER_BYTE == 2 else b_up
-    if COMPUTE_MODE == "dot_scaled":
+    """Gate∪up MMA step. Under ``SWAP_AB`` the swapped decode path runs (weight output rows in the MMA
+    M dim — see ``mx_swap_compute_gate_up``); otherwise dispatch on ``COMPUTE_MODE``: scaled-MMA on the
+    raw weights (``b_gate``/``b_up``), or fp8 ``tl.dot`` + per-group rescale / scalar reduce on the
+    E4M3-decoded weights. Returns the updated ``(acc_gate, acc_up)`` — only the taken branch compiles."""
+    if SWAP_AB:
+        acc_gate, acc_up = mx_swap_compute_gate_up(
+            acc_gate, acc_up, a, a_scale, b_gate, b_up, gate_scale, up_scale,
+            COMPUTE_MODE, VALUES_PER_BYTE, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K,
+        )
+    elif COMPUTE_MODE == "dot_scaled":
         acc_gate = mx_dot_scaled(
             acc_gate, a, a_scale, b_gate, gate_scale, VALUES_PER_BYTE
         )
         acc_up = mx_dot_scaled(acc_up, a, a_scale, b_up, up_scale, VALUES_PER_BYTE)
     elif COMPUTE_MODE == "dot":
         acc_gate, acc_up = mx_dot_rescale_gate_up(
-            acc_gate, acc_up, a, w_gate, w_up, a_scale, gate_scale, up_scale
+            acc_gate, acc_up, a,
+            mxfp4_e2m1_to_e4m3(b_gate) if VALUES_PER_BYTE == 2 else b_gate,
+            mxfp4_e2m1_to_e4m3(b_up) if VALUES_PER_BYTE == 2 else b_up,
+            a_scale, gate_scale, up_scale,
         )
     else:  # scalar
         acc_gate, acc_up = mx_scalar_reduce_gate_up(
             acc_gate,
             acc_up,
             a,
-            w_gate,
-            w_up,
+            mxfp4_e2m1_to_e4m3(b_gate) if VALUES_PER_BYTE == 2 else b_gate,
+            mxfp4_e2m1_to_e4m3(b_up) if VALUES_PER_BYTE == 2 else b_up,
             a_scale,
             gate_scale,
             up_scale,
@@ -668,11 +777,18 @@ def mx_compute(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
+    SWAP_AB: tl.constexpr,
 ):
-    """Single-projection MMA step dispatched on ``COMPUTE_MODE``: scaled-MMA on the raw weight
-    (``w``), or fp8 ``tl.dot`` + per-group rescale / scalar reduce on the E4M3-decoded weight.
-    Returns the updated ``acc``."""
-    if COMPUTE_MODE == "dot_scaled":
+    """Single-projection MMA step. Under ``SWAP_AB`` the swapped decode path runs (weight output rows
+    in the MMA M dim — different acc shape/finalize; see ``mx_swap_compute``); otherwise dispatch on
+    ``COMPUTE_MODE``: scaled-MMA on the raw weight (``w``), or fp8 ``tl.dot`` + per-group rescale /
+    scalar reduce on the E4M3-decoded weight. Single return — only the taken branch compiles."""
+    if SWAP_AB:
+        acc = mx_swap_compute(
+            acc, a, a_scale, w, w_scale, COMPUTE_MODE, VALUES_PER_BYTE,
+            BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K,
+        )
+    elif COMPUTE_MODE == "dot_scaled":
         acc = mx_dot_scaled(acc, a, a_scale, w, w_scale, VALUES_PER_BYTE)
     elif COMPUTE_MODE == "dot":
         acc = mx_dot_rescale(acc, a, w, a_scale, w_scale, VALUES_PER_BYTE)
@@ -689,6 +805,288 @@ def mx_compute(
             SCALE_GROUP_K,
             VALUES_PER_BYTE,
         )
+    return acc
+
+
+# ── swap-AB decode compute: M=1 batched GEMV with output rows in the MMA M dim ───────
+#
+# The batched (decode) kernels are structurally M=1, where the sm_100 scaled MMA pads M→128.
+# Putting the WEIGHT's output rows in M (fully used) and the single token in N cuts that pad to
+# the N-atom (16) — a ~1.5× decode win for fp4 (dot_scaled), neutral-to-worse for fp8 (scalar
+# stays memory-bound and wins, so the tuner keeps it). Weight is loaded output-rows-major
+# ``[BN, BK]`` for every mode, so the kernel does ONE load; each helper returns ``[1, BN]``.
+
+
+# The sm_100 MMA's minimum N tile (16). In the swap path the single decode token sits in the MMA's
+# N dim, so it must be padded up to this width (col 0 = the token, cols 1..15 = zero). It is NOT a
+# block size — BLOCK_SIZE_M stays 1 under swap; this is the token's *padded N extent*, fixed by the
+# hardware. Assigned via tl.constexpr(...), the only module-global form a @triton.jit fn can read.
+MMA_N_ATOM = tl.constexpr(16)
+
+
+@triton.jit
+def mx_dot_scaled_swapped_rhs(a, a_scale, BLOCK_SIZE_K: tl.constexpr):
+    """Build the swap-AB rhs (activation) + its scale: the [BK] E4M3 token becomes an
+    ``[BK, MMA_N_ATOM]`` tile with only column 0 real (the tensor core can't do N<16), and its
+    UE8M0 scale is broadcast to the same padded shape."""
+    rhs = swap_pad_rhs(a, BLOCK_SIZE_K)
+    asc = tl.trans(
+        a_scale[:, None] + tl.zeros((BLOCK_SIZE_K // 32, MMA_N_ATOM), tl.uint8)
+    )
+    return rhs, asc
+
+
+@triton.jit
+def mx_dot_scaled_swapped(
+    acc,
+    a,
+    a_scale,
+    w,
+    w_scale,
+    VALUES_PER_BYTE: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """Swapped ``dot_scaled`` decode step: weight ``w`` [BN, BK] (E2M1 packed if MXFP4 else E4M3)
+    is the MMA lhs (output rows in M); the activation is the N=16 rhs (col 0 real). ``acc`` is the
+    persistent ``[BN, MMA_N_ATOM]`` MMA accumulator (accumulated across the K-loop, then the caller
+    takes column 0) — NOT a fresh per-step init, which trips the sm_100 accumulator-init pass."""
+    fmt: tl.constexpr = "e2m1" if VALUES_PER_BYTE == 2 else "e4m3"
+    rhs, asc = mx_dot_scaled_swapped_rhs(a, a_scale, BLOCK_SIZE_K)
+    return tl.dot_scaled(w, w_scale, fmt, rhs, asc, "e4m3", acc)
+
+
+@triton.jit
+def mx_scalar_reduce_swapped(
+    acc,
+    a,
+    a_scale,
+    w,
+    w_scale,
+    ROWS_W: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+    VALUES_PER_BYTE: tl.constexpr,
+):
+    """Swapped scalar reduce: weight ``w`` output-rows-major ``[ROWS_W, BK]``, ``a`` the [BK]
+    activation. No transpose (vs ``mx_scalar_reduce``); MXFP4 unpacks along columns (K). Per-group
+    scale factored out of the reduce (grpscale). Reduces over K; returns ``acc + [1, ROWS_W]``."""
+    NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
+    if VALUES_PER_BYTE == 2:  # column-unpack E2M1 -> f32, K-order via interleave
+        wq = tl.interleave(_e2m1_code_to_f32(w & 0xF), _e2m1_code_to_f32(w >> 4))
+    else:
+        wq = w.to(tl.float32)
+    prod = a.to(tl.float32)[None, :] * wq  # [ROWS_W, BK]
+    grp = tl.sum(tl.reshape(prod, (ROWS_W, NG, SCALE_GROUP_K)), axis=2)  # [ROWS_W, NG]
+    scale = decode_ue8m0_scale(a_scale)[None, :] * decode_ue8m0_scale(w_scale)
+    return acc + tl.reshape(tl.sum(grp * scale, axis=1), (1, ROWS_W))
+
+
+@triton.jit
+def mx_dot_scaled_swapped_gate_up(
+    acc_gate,
+    acc_up,
+    a,
+    a_scale,
+    w_gate,
+    w_up,
+    gate_scale,
+    up_scale,
+    VALUES_PER_BYTE: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """Gate∪up swapped ``dot_scaled``: build the shared activation rhs once (N=16, col 0 real) and
+    run both projections with the weights (output rows) in the MMA M dim. ``acc_gate``/``acc_up``
+    are persistent ``[BN, MMA_N_ATOM]`` MMA accumulators (col 0 taken by the caller)."""
+    fmt: tl.constexpr = "e2m1" if VALUES_PER_BYTE == 2 else "e4m3"
+    rhs, asc = mx_dot_scaled_swapped_rhs(a, a_scale, BLOCK_SIZE_K)
+    acc_gate = tl.dot_scaled(w_gate, gate_scale, fmt, rhs, asc, "e4m3", acc_gate)
+    acc_up = tl.dot_scaled(w_up, up_scale, fmt, rhs, asc, "e4m3", acc_up)
+    return acc_gate, acc_up
+
+
+@triton.jit
+def mx_scalar_reduce_swapped_gate_up(
+    acc_gate,
+    acc_up,
+    a,
+    a_scale,
+    w_gate,
+    w_up,
+    gate_scale,
+    up_scale,
+    ROWS_W: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+    VALUES_PER_BYTE: tl.constexpr,
+):
+    """Gate∪up swapped scalar reduce (see ``mx_scalar_reduce_swapped``): decode the SHARED
+    activation once, reduce both projections over K with per-group scale. ``acc*`` are ``[1, ROWS_W]``."""
+    NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
+    if VALUES_PER_BYTE == 2:
+        wg = tl.interleave(
+            _e2m1_code_to_f32(w_gate & 0xF), _e2m1_code_to_f32(w_gate >> 4)
+        )
+        wu = tl.interleave(_e2m1_code_to_f32(w_up & 0xF), _e2m1_code_to_f32(w_up >> 4))
+    else:
+        wg = w_gate.to(tl.float32)
+        wu = w_up.to(tl.float32)
+    af = a.to(tl.float32)[None, :]
+    a_s = decode_ue8m0_scale(a_scale)[None, :]
+    grp_g = tl.sum(tl.reshape(af * wg, (ROWS_W, NG, SCALE_GROUP_K)), axis=2)
+    grp_u = tl.sum(tl.reshape(af * wu, (ROWS_W, NG, SCALE_GROUP_K)), axis=2)
+    acc_gate += tl.reshape(
+        tl.sum(grp_g * a_s * decode_ue8m0_scale(gate_scale), axis=1), (1, ROWS_W)
+    )
+    acc_up += tl.reshape(
+        tl.sum(grp_u * a_s * decode_ue8m0_scale(up_scale), axis=1), (1, ROWS_W)
+    )
+    return acc_gate, acc_up
+
+
+@triton.jit
+def mx_swap_compute(
+    acc,
+    a,
+    a_scale,
+    w,
+    w_scale,
+    COMPUTE_MODE: tl.constexpr,
+    VALUES_PER_BYTE: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+):
+    """Swapped-AB counterpart to ``mx_compute``: weight output-rows in the MMA M dim, the single
+    decode token flattened to the [BK] rhs. Dispatches the two swapped modes — ``dot_scaled``
+    (persistent ``[BN, MMA_N_ATOM]`` MMA acc, col 0 taken by the caller) and ``scalar`` (``[1, BN]``
+    reduce). The acc shapes diverge, but only the taken constexpr branch compiles so the single
+    return never has to unify them. Swap has no ``dot`` path (dead at M=1 decode)."""
+    a1 = tl.reshape(a, (BLOCK_SIZE_K,))
+    as1 = tl.reshape(a_scale, (BLOCK_SIZE_K // SCALE_GROUP_K,))
+    if COMPUTE_MODE == "dot_scaled":
+        acc = mx_dot_scaled_swapped(acc, a1, as1, w, w_scale, VALUES_PER_BYTE, BLOCK_SIZE_K)
+    elif COMPUTE_MODE == "scalar":
+        acc = mx_scalar_reduce_swapped(
+            acc, a1, as1, w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, VALUES_PER_BYTE
+        )
+    else:
+        tl.static_assert(False, "SWAP_AB supports only dot_scaled/scalar")
+    return acc
+
+
+@triton.jit
+def mx_swap_compute_gate_up(
+    acc_gate,
+    acc_up,
+    a,
+    a_scale,
+    w_gate,
+    w_up,
+    gate_scale,
+    up_scale,
+    COMPUTE_MODE: tl.constexpr,
+    VALUES_PER_BYTE: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+):
+    """Gate∪up swapped-AB counterpart to ``mx_compute_gate_up`` (see ``mx_swap_compute``): the shared
+    activation is flattened once, then both projections run with weight rows in the MMA M dim."""
+    a1 = tl.reshape(a, (BLOCK_SIZE_K,))
+    as1 = tl.reshape(a_scale, (BLOCK_SIZE_K // SCALE_GROUP_K,))
+    if COMPUTE_MODE == "dot_scaled":
+        acc_gate, acc_up = mx_dot_scaled_swapped_gate_up(
+            acc_gate, acc_up, a1, as1, w_gate, w_up, gate_scale, up_scale,
+            VALUES_PER_BYTE, BLOCK_SIZE_K,
+        )
+    elif COMPUTE_MODE == "scalar":
+        acc_gate, acc_up = mx_scalar_reduce_swapped_gate_up(
+            acc_gate, acc_up, a1, as1, w_gate, w_up, gate_scale, up_scale,
+            BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, VALUES_PER_BYTE,
+        )
+    else:
+        tl.static_assert(False, "SWAP_AB supports only dot_scaled/scalar")
+    return acc_gate, acc_up
+
+
+@triton.jit
+def swap_pad_rhs(a, BLOCK_SIZE_K: tl.constexpr):
+    """Pad the ``[BLOCK_SIZE_K]`` M=1 token to the ``[BLOCK_SIZE_K, MMA_N_ATOM]`` swap-AB MMA rhs —
+    only column 0 is the real token (the tensor core can't do N<16, so the pad is the N-atom). Used
+    by the M=1 batched / fused-MoE fp8 ``tl.dot`` swap paths (weight output rows in the MMA M dim);
+    the caller takes column 0 of the ``[BN, MMA_N_ATOM]`` result after the K-loop."""
+    return tl.where(
+        tl.arange(0, MMA_N_ATOM)[None, :] == 0,
+        a[:, None],
+        tl.zeros((BLOCK_SIZE_K, MMA_N_ATOM), a.dtype),
+    )
+
+
+@triton.jit
+def swap_take_col0(acc, ROWS: tl.constexpr):
+    """Extract column 0 of a ``[ROWS, MMA_N_ATOM]`` swap-AB accumulator → ``[1, ROWS]`` (the padded
+    token dim collapses back to the single real token)."""
+    return tl.reshape(
+        tl.sum(acc * (tl.arange(0, MMA_N_ATOM)[None, :] == 0), axis=1), (1, ROWS)
+    )
+
+
+@triton.jit
+def fp8_dot(a, b, SWAP_AB: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
+    """Swap-aware plain ``tl.dot`` for the fp8 (block/tensor-dynamic) paths — no scaling; the caller
+    applies its own per-block/per-tensor scales. Swap: weight ``b`` ``[N, BK]`` × the single token
+    padded to the N=16 atom → ``[N, MMA_N_ATOM]`` (col 0 real). No-swap: token ``a`` ``[M, BK]`` ×
+    weight ``b`` ``[BK, N]`` → ``[M, N]``. ``BLOCK_SIZE_K`` is the contraction tile (the down
+    projection passes its intermediate tile). Single return: only the taken branch compiles."""
+    if SWAP_AB:
+        out = tl.dot(b, swap_pad_rhs(tl.reshape(a, (BLOCK_SIZE_K,)), BLOCK_SIZE_K))
+    else:
+        out = tl.dot(a, b)
+    return out
+
+
+@triton.jit
+def oriented_weight_ptrs(base, offs_rows, offs_k, stride_rows, stride_k, SWAP_AB: tl.constexpr):
+    """Weight-tile pointers oriented by ``SWAP_AB``: output-rows-major ``[rows, K]`` when swapped
+    (output rows are the MMA M dim), else K-major ``[K, rows]``. Only the taken constexpr branch
+    compiles, so the divergent shapes never meet. The per-step K-advance is identical for both
+    layouts, so the caller advances the returned pointer the same way regardless of orientation."""
+    if SWAP_AB:
+        ptrs = base + (offs_rows[:, None] * stride_rows + offs_k[None, :] * stride_k)
+    else:
+        ptrs = base + (offs_k[:, None] * stride_k + offs_rows[None, :] * stride_rows)
+    return ptrs
+
+
+@triton.jit
+def acc_init(
+    IS_SCALAR: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    SWAP_AB: tl.constexpr,
+):
+    """Zero accumulator shaped for the layout: swapped scalar reduces into ``[1, N]``; any other
+    swapped mode keeps the persistent ``[N, MMA_N_ATOM]`` MMA acc (weight rows in M, token in the
+    padded N, col 0 taken after the K-loop); no-swap uses ``[M, N]``. ``IS_SCALAR`` matters only under
+    swap — kernels with no scalar path (fp8 ``tl.dot``) pass ``False``. ``N`` is the weight-output
+    tile (``BLOCK_SIZE_H`` for the fp8 down projection). Single return: only the taken branch compiles."""
+    if SWAP_AB and IS_SCALAR:
+        acc = tl.zeros((1, BLOCK_SIZE_N), dtype=tl.float32)
+    elif SWAP_AB:
+        acc = tl.zeros((BLOCK_SIZE_N, MMA_N_ATOM), dtype=tl.float32)
+    else:
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    return acc
+
+
+@triton.jit
+def acc_finalize(acc, IS_SCALAR: tl.constexpr, ROWS: tl.constexpr, SWAP_AB: tl.constexpr):
+    """Bookend to ``acc_init``: when the acc was built as the persistent ``[ROWS, MMA_N_ATOM]`` MMA
+    tile (any swapped non-scalar mode), collapse the padded token dim to column 0 → ``[1, ROWS]``.
+    Swapped scalar (already ``[1, ROWS]``) and no-swap pass through unchanged. ``IS_SCALAR`` matches
+    the flag given to ``acc_init`` (fp8 ``tl.dot`` kernels, which have no scalar path, pass False)."""
+    if SWAP_AB and not IS_SCALAR:
+        acc = swap_take_col0(acc, ROWS)
     return acc
 
 

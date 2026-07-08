@@ -109,6 +109,31 @@ def _resolve_tile_inline(
 
 
 @triton.jit
+def scatter_weighted_tile(
+    ProjOut,
+    acc,
+    offs_global_m,
+    offs_cols,
+    row_mask,
+    Perm,
+    SampleWeights,
+    stride_perm,
+    stride_po_m,
+    stride_po_n,
+    SIMULATE_UNFUSED: tl.constexpr,
+):
+    """Down-projection epilogue: optionally round through the output dtype (unfused parity), then
+    apply each row's routing weight and scatter to its flat (token, slot) row — the fused top-k
+    reorder (no atomics) that lets the host just sum over slots."""
+    if SIMULATE_UNFUSED:
+        acc = acc.to(ProjOut.dtype.element_ty).to(tl.float32)
+    flat = tl.load(Perm + offs_global_m * stride_perm, mask=row_mask, other=0)
+    weight = tl.load(SampleWeights + flat, mask=row_mask, other=0.0)
+    acc = acc * weight[:, None]
+    store_tile(ProjOut, acc, flat, offs_cols, row_mask, stride_po_m, stride_po_n)
+
+
+@triton.jit
 def _exclusive_offsets_kernel(
     ExpertFreq, ExpertStart, Counters, NUM_EXPERTS: tl.constexpr
 ):
@@ -217,7 +242,7 @@ _MX_MEMORY_MODES = ("descriptor", "pointer")
 @bayesian_autotune(
     get_accelerator_autotuning_configs(tune_block_m=True),
     ["INTERMEDIATE_DIM", "HIDDEN_DIM", "tokens_per_sm_bit_length"],
-    n_trials=60,
+    n_trials=100,
     # bf16 activation tile + fused gate|up weight tiles
     prune_configs_by={
         "early_config_prune": smem_config_pruner(act_bytes=2, n_weight_tiles=2)
@@ -274,27 +299,30 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
         )
         offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
+        # int64 against offset overflow: expert_id * stride_gu_e reaches E*2I*H > 2^31 at
+        # full (non-EP) expert counts on the big-model dims — int32 wraps to a garbage pointer.
+        expert_id64 = expert_id.to(tl.int64)
         token = tl.load(PermToken + offs_global_m * stride_pt, mask=row_mask, other=0)
         a_ptrs = Hidden + token[:, None] * stride_h_t + offs_k[None, :] * stride_h_k
         gate_ptr = (
             GateUp
-            + expert_id * stride_gu_e
+            + expert_id64 * stride_gu_e
             + tl.arange(0, BLOCK_SIZE_K)[:, None] * stride_gu_k
             + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :] * stride_gu_n
         )
         up_ptr = (
             GateUp
-            + expert_id * stride_gu_e
+            + expert_id64 * stride_gu_e
             + tl.arange(0, BLOCK_SIZE_K)[:, None] * stride_gu_k
             + (INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[
                 None, :
             ]
             * stride_gu_n
         )
-        gate_s_ptr = GateUpScale + expert_id * stride_gus_e + pid_n * stride_gus_n
+        gate_s_ptr = GateUpScale + expert_id64 * stride_gus_e + pid_n * stride_gus_n
         up_s_ptr = (
             GateUpScale
-            + expert_id * stride_gus_e
+            + expert_id64 * stride_gus_e
             + (num_n_tiles + pid_n) * stride_gus_n
         )
 
@@ -343,7 +371,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
 @bayesian_autotune(
     get_accelerator_autotuning_configs(tune_block_m=True),
     ["INTERMEDIATE_DIM", "HIDDEN_DIM", "tokens_per_sm_bit_length"],
-    n_trials=60,
+    n_trials=100,
     # fp8 intermediate activation tile + single down weight tile
     prune_configs_by={
         "early_config_prune": smem_config_pruner(act_bytes=1, n_weight_tiles=1)
@@ -399,14 +427,16 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
         )
         offs_h = pid_h * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
+        # int64 against offset overflow: E*H*I > 2^31 at full expert counts (see gate_up).
+        expert_id64 = expert_id.to(tl.int64)
         w_down_ptr = (
             Down
-            + expert_id * stride_down_e
+            + expert_id64 * stride_down_e
             + tl.arange(0, BLOCK_SIZE_K)[:, None] * stride_down_i
             + (pid_h * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :]
             * stride_down_h
         )
-        ws_down_ptr = DownScale + expert_id * stride_downs_e + pid_h * stride_downs_h
+        ws_down_ptr = DownScale + expert_id64 * stride_downs_e + pid_h * stride_downs_h
 
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for i_tile in range(0, NUM_I_TILES):
@@ -429,14 +459,10 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
             w_down_ptr += BLOCK_SIZE_K * stride_down_i
             ws_down_ptr += stride_downs_i
 
-        if SIMULATE_UNFUSED:
-            acc = acc.to(ProjOut.dtype.element_ty).to(tl.float32)
-        # Fused routing-weight × top-k reorder (no atomics): scale each row by its weight
-        # and scatter to its flat (token, slot) row; the host then just sums over slots.
-        flat = tl.load(Perm + offs_global_m * stride_perm, mask=row_mask, other=0)
-        weight = tl.load(SampleWeights + flat, mask=row_mask, other=0.0)
-        acc = acc * weight[:, None]
-        store_tile(ProjOut, acc, flat, offs_h, row_mask, stride_po_m, stride_po_n)
+        scatter_weighted_tile(
+            ProjOut, acc, offs_global_m, offs_h, row_mask, Perm, SampleWeights,
+            stride_perm, stride_po_m, stride_po_n, SIMULATE_UNFUSED,
+        )
 
 
 def w8a8_block_dynamic_fp8_moe_grouped(
@@ -467,7 +493,7 @@ def w8a8_block_dynamic_fp8_moe_grouped(
         top_k_index, gate_up_proj.size(0), num_top_k
     )
     num_sms = sm_count(device.index)
-    tokens_per_sm_bit_length = (num_routed_tokens // num_sms).bit_length()
+    tokens_per_sm_bit_length = int(num_routed_tokens // num_sms).bit_length()
 
     gate_up_scale_u8 = ue8m0_as_uint8(gate_up_proj_scale)
     down_scale_u8 = ue8m0_as_uint8(down_proj_scale)
@@ -598,13 +624,15 @@ def _set_gate_up_descriptor(nargs):
         compute_modes=_MX_COMPUTE_MODES,
         memory_modes=_MX_MEMORY_MODES,
         tune_block_m=True,
-    ),  # prefill: no scalar; combined gate∪up dot ([2*BN,K] reshape) — TMA vs block-ptr load
-    ["INTERMEDIATE_DIM", "HIDDEN_DIM", "tokens_per_sm_bit_length"],
-    n_trials=60,
+    ),  # prefill: no scalar; combined gate∪up dot ([2*BN,K] reshape) — TMA vs pointer load
+    # VALUES_PER_BYTE keys the MXFP4/MXFP8 split — the packing halves the weight tile bytes, so a
+    # winner is only valid for its own recipe.
+    ["INTERMEDIATE_DIM", "HIDDEN_DIM", "tokens_per_sm_bit_length", "VALUES_PER_BYTE"],
+    n_trials=100,
     # bf16 activation tile + fused gate|up weight tiles
     prune_configs_by={
         "early_config_prune": smem_config_pruner(
-            act_bytes=2, n_weight_tiles=2, reduction_dim="HIDDEN_DIM"
+            act_bytes=2, n_weight_tiles=2, reduction_dim="HIDDEN_DIM", double_mma=True
         )
     },
 )
@@ -664,21 +692,27 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
         )
         offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
+        # int64 against offset overflow: weight offsets reach 2E*I*(H//vpb) > 2^31 at full
+        # (non-EP) expert counts. Descriptor loads keep the int32 ids — TMA takes row indices
+        # (bounded by 2E), not byte offsets.
+        expert_id64 = expert_id.to(tl.int64)
         token = tl.load(PermToken + offs_global_m * stride_pt, mask=row_mask, other=0)
         a_ptrs = Hidden + token[:, None] * stride_h_t + offs_k[None, :] * stride_h_k
         n_off = pid_n * BLOCK_SIZE_N
 
-        # Load gate (row 2e) + up (row 2e+1) of the (2E, I, H) view as ONE combined tile, then
-        # split — this is the shared loop. MEMORY_MODE picks the LOAD only (decoupled from COMPUTE_MODE):
-        # a host/device descriptor (TMA on NVIDIA) vs explicit rank-3 pointers. COMPUTE_MODE picks the compute on the
-        # loaded tile: scaled-MMA (dot_scaled) or fp8 dot + per-group software rescale (dot).
+        # Load gate (row 2e) + up (row 2e+1) of the (2E, I, H) view as ONE combined tile and
+        # run ONE combined [BM, 2*BN] MMA — measured fastest form on B200 for both MX recipes
+        # (double-load and split-dot variants lose or fail to compile at the fast tile sizes).
+        # On sm_10x a scaled MMA caps at N=256 (Triton miscompiles wider: packed-E2M1 rhs → device
+        # "misaligned address" trap), so dot_scaled with 2*BN > 256 must not run there — the
+        # smem_config_pruner (n_weight_tiles=2) drops those configs on sm_10x before benching.
         gu_row = expert_id * 2
         # (E, 2I, H//vpb) reinterpreted as (2E, I, H//vpb); host_descriptor uses the passed
         # GateUpDescriptor, device_descriptor builds one in-kernel, pointer indexes it directly.
         if MEMORY_MODE == "pointer":
             gu_ptr = (
                 GateUp
-                + (gu_row + tl.arange(0, 2))[:, None, None]
+                + (expert_id64 * 2 + tl.arange(0, 2))[:, None, None]
                 * (INTERMEDIATE_DIM * stride_gu_n)
                 + (n_off + tl.arange(0, BLOCK_SIZE_N))[None, :, None] * stride_gu_n
                 + tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)[None, None, :]
@@ -697,7 +731,7 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
             )
         gu_scale_ptr = (
             GateUpScale
-            + expert_id * stride_gus_e
+            + expert_id64 * stride_gus_e
             + tl.arange(0, 2)[:, None, None] * (INTERMEDIATE_DIM * stride_gus_n)
             + (n_off + tl.arange(0, BLOCK_SIZE_N))[None, :, None] * stride_gus_n
             + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, None, :] * stride_gus_k
@@ -798,8 +832,9 @@ def _set_down_descriptor(nargs):
         memory_modes=_MX_MEMORY_MODES,
         tune_block_m=True,
     ),  # prefill: no scalar; TMA vs block-ptr load
-    ["INTERMEDIATE_DIM", "HIDDEN_DIM", "tokens_per_sm_bit_length"],
-    n_trials=60,
+    # VALUES_PER_BYTE keys the MXFP4/MXFP8 split — see the gate_up kernel's note above.
+    ["INTERMEDIATE_DIM", "HIDDEN_DIM", "tokens_per_sm_bit_length", "VALUES_PER_BYTE"],
+    n_trials=100,
     # fp8 intermediate activation tile + single down weight tile
     prune_configs_by={
         "early_config_prune": smem_config_pruner(
@@ -873,9 +908,12 @@ def mxfp_dynamic_moe_grouped_down_kernel(
             + offs_sf[None, :] * stride_is_n
         )
         n_off = pid_n * BLOCK_SIZE_N
+        # int64 against offset overflow (see gate_up); descriptor loads below keep the int32
+        # expert_id — TMA takes row indices (bounded by E*H), not byte offsets.
+        expert_id64 = expert_id.to(tl.int64)
         ws_down_ptr = (
             DownScale
-            + expert_id * stride_downs_e
+            + expert_id64 * stride_downs_e
             + (n_off + tl.arange(0, BLOCK_SIZE_N))[:, None] * stride_downs_n
             + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, :] * stride_downs_k
         )
@@ -887,7 +925,7 @@ def mxfp_dynamic_moe_grouped_down_kernel(
         if MEMORY_MODE == "pointer":
             w_down_ptr = (
                 Down
-                + expert_id * stride_down_e
+                + expert_id64 * stride_down_e
                 + tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)[:, None] * stride_down_k
                 + (n_off + tl.arange(0, BLOCK_SIZE_N))[None, :] * stride_down_n
             )
@@ -940,14 +978,10 @@ def mxfp_dynamic_moe_grouped_down_kernel(
             a_ptrs += BLOCK_SIZE_K * stride_int_n
             as_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_is_n
 
-        if SIMULATE_UNFUSED:
-            acc = acc.to(ProjOut.dtype.element_ty).to(tl.float32)
-        # Fused routing-weight × top-k reorder (no atomics): scale each row by its weight
-        # and scatter to its flat (token, slot) row; the host then just sums over slots.
-        flat = tl.load(Perm + offs_global_m * stride_perm, mask=row_mask, other=0)
-        weight = tl.load(SampleWeights + flat, mask=row_mask, other=0.0)
-        acc = acc * weight[:, None]
-        store_tile(ProjOut, acc, flat, offs_bn, row_mask, stride_po_m, stride_po_n)
+        scatter_weighted_tile(
+            ProjOut, acc, offs_global_m, offs_bn, row_mask, Perm, SampleWeights,
+            stride_perm, stride_po_m, stride_po_n, SIMULATE_UNFUSED,
+        )
 
 
 def mxfp_dynamic_moe_grouped(
@@ -981,7 +1015,7 @@ def mxfp_dynamic_moe_grouped(
     perm_token, perm, expert_start, NUM_EXPERTS, num_routed_tokens = _grouped_routing(
         top_k_index, gate_up_proj.size(0), num_top_k
     )
-    tokens_per_sm_bit_length = (num_routed_tokens // num_sms).bit_length()
+    tokens_per_sm_bit_length = int(num_routed_tokens // num_sms).bit_length()
     VALUES_PER_BYTE = NIBBLES_PER_BYTE if gate_up_is_fp4 else 1
     gate_up_proj_u8 = e2m1_as_uint8(gate_up_proj)
     down_proj_u8 = e2m1_as_uint8(down_proj)

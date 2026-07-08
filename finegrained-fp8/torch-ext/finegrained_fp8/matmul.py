@@ -312,11 +312,19 @@ def w8a8_block_static_fp8_matmul_kernel(
 
 
 @bayesian_autotune(
-    get_mxfp_autotuning_configs(
-        compute_modes=("dot_scaled", "dot")
-    ),  # no scalar branch here
-    ["N", "K", "BLOCK_SIZE_M"],
-    n_trials=60,
+    # tune_block_m: BLOCK_SIZE_M becomes a config axis (not the adaptive_block_size_m launch
+    # heuristic), so the tuner sizes the M tile per workload — small at decode, large at prefill.
+    # no scalar branch here. swap_ab intentionally OFF: an 18-cell forced-swap sweep (cudagraph,
+    # M3+dsv4 decode) showed swap losing on the single matmul (adaptive BM>=16 fills the MMA atom;
+    # M3 attn swap was −38%) while the tuner never picked it — emitting the configs only bloats
+    # the search. Swap stays on the batched/fused experts kernels, where it wins ~30% on dsv4.
+    get_mxfp_autotuning_configs(compute_modes=("dot_scaled", "dot"), tune_block_m=True),
+    # VALUES_PER_BYTE keys the MXFP4/MXFP8 split so a cached winner is only reused for its packing;
+    # m_bit_length (log2 M bucket) keys the M tile — the winner keeps shifting with M well past the
+    # BM ceiling and it is NOT noise: cross-applying configs (N=K=4096) costs +62% at M=128 and +245%
+    # at M=4096 (the thin M=128 tile can't saturate the wide GEMM), so don't collapse the buckets.
+    ["N", "K", "m_bit_length", "VALUES_PER_BYTE"],
+    n_trials=100,
 )
 @triton.jit
 def mxfp_dynamic_matmul_kernel(
@@ -328,6 +336,7 @@ def mxfp_dynamic_matmul_kernel(
     M,
     N,
     K,
+    m_bit_length,  # autotune key only (log2 M bucket); unused in body
     # Strides
     stride_am,
     stride_ak,
@@ -609,7 +618,6 @@ def _w8a8_tensor_dynamic_fp8_matmul(
             C.stride(-2),
             C.stride(-1),
             As.stride(0),
-            # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             GROUP_SIZE_M=GROUP_SIZE_M,
         )
@@ -659,10 +667,9 @@ def _mxfp_dynamic_matmul(
     B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
-    BLOCK_SIZE_M = adaptive_block_size_m(M)
 
     def grid(META):
-        return (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, META["BLOCK_SIZE_N"]))
+        return (triton.cdiv(M, META["BLOCK_SIZE_M"]), triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
         wrap_triton(mxfp_dynamic_matmul_kernel)[grid](
@@ -673,6 +680,7 @@ def _mxfp_dynamic_matmul(
             M,
             N,
             K,
+            int(M).bit_length(),  # m_bit_length key bucket; int() concretizes M (a SymInt under torch.compile has no .bit_length)
             A.stride(-2),
             A.stride(-1),
             B.stride(1),
@@ -681,8 +689,6 @@ def _mxfp_dynamic_matmul(
             C.stride(-1),
             bs_u8.stride(1),
             bs_u8.stride(0),
-            # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
             GROUP_SIZE_M=GROUP_SIZE_M,
             VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,

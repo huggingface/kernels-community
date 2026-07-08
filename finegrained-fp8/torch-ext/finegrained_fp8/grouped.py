@@ -223,7 +223,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
 @bayesian_autotune(
     get_accelerator_autotuning_configs(tune_block_nk=True),
     ["N", "K", "BLOCK_SIZE_M"],
-    n_trials=60,
+    n_trials=100,
 )
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
@@ -310,8 +310,9 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     get_mxfp_autotuning_configs(
         compute_modes=("dot_scaled", "dot")
     ),  # prefill: no scalar branch
-    ["N", "K", "BLOCK_SIZE_M"],
-    n_trials=60,
+    # VALUES_PER_BYTE keys the MXFP4/MXFP8 split so a cached winner is only reused for its packing.
+    ["N", "K", "BLOCK_SIZE_M", "VALUES_PER_BYTE"],
+    n_trials=100,
 )
 @triton.jit
 def mxfp_dynamic_matmul_grouped_kernel(
@@ -493,7 +494,7 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=block_k,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
-            NUM_EXPERTS_BIT_LENGTH=num_experts.bit_length(),
+            NUM_EXPERTS_BIT_LENGTH=int(num_experts).bit_length(),
         )
 
     return C
@@ -571,10 +572,9 @@ def _w8a8_tensor_dynamic_fp8_matmul_grouped(
             Bs.stride(0),
             offsets.stride(0),
             tile_offsets.stride(0),
-            # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
             num_experts=num_experts,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
-            NUM_EXPERTS_BIT_LENGTH=num_experts.bit_length(),
+            NUM_EXPERTS_BIT_LENGTH=int(num_experts).bit_length(),
         )
 
     return C
@@ -696,10 +696,9 @@ def _mxfp_dynamic_matmul_grouped(
             bs_u8.stride(1),
             offsets.stride(0),
             tile_offsets.stride(0),
-            # Meta-parameters (BLOCK_SIZE_N, BLOCK_SIZE_K come from autotune Config)
             num_experts=num_experts,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
-            NUM_EXPERTS_BIT_LENGTH=num_experts.bit_length(),
+            NUM_EXPERTS_BIT_LENGTH=int(num_experts).bit_length(),
             VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
         )

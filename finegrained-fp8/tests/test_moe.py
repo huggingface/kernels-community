@@ -852,10 +852,10 @@ def _unfused_grouped_ref(
     inv_perm = torch.empty_like(perm)
     inv_perm[perm] = torch.arange(perm.numel(), device=perm.device)
     a_sorted = routed[perm].contiguous()
-    tokens_per_expert = torch.bincount(expert_ids, minlength=problem.num_experts).to(
-        torch.int32
-    )
-    offsets = torch.cumsum(tokens_per_expert, dim=0).to(torch.int32)
+    tokens_per_expert = torch.histc(
+        expert_ids.float(), bins=problem.num_experts, min=0, max=problem.num_experts - 1
+    ).int()
+    offsets = torch.cumsum(tokens_per_expert, dim=0).int()
 
     gate_up_out = finegrained_fp8.matmul_grouped(
         a_sorted, gate_up, gate_up_s, offsets, tokens_per_expert, block_size

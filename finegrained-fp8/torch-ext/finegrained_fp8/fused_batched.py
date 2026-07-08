@@ -30,7 +30,8 @@ from .utils import (
     FP8_DTYPE,
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
-    DECODE_BLOCK_SIZE_M,
+    decode_bm_swap_pairs,
+    bk_within_k_pruner,
     device_context,
     fp8_act_quant_inline,
     get_mxfp_autotuning_configs,
@@ -39,6 +40,10 @@ from .utils import (
     mxfp_act_quant_inline,
     mx_compute,
     mx_compute_gate_up,
+    oriented_weight_ptrs,
+    acc_init,
+    fp8_dot,
+    acc_finalize,
     glu,
     topk_reduce_kernel,
     TOPK_REDUCE_BLOCK_H,
@@ -56,17 +61,27 @@ from .bayesian_autotuner import bayesian_autotune
 # Kernel 2: (S, H-tiles) — fp8 intermediate → down proj → output
 # No sorting needed — expert lookup is per-token via ExpertIds.
 
+# Decode (BLOCK_SIZE_M, SWAP_AB) pairs for the fp8 fused kernels: at M=1 the token is replicated to
+# fill the MMA 16-atom (non-swap BM=16, ~40% over the degenerate BM=1 on plain tl.dot) or the weight
+# output rows go in M (swap, BM=1). Swap needs BM=1, so (16, swap) is excluded. Same coupling as the
+# MXFP / matmul kernels' for_decode generators.
+_DECODE_BM_SWAP = decode_bm_swap_pairs()
+
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
+        triton.Config({"BLOCK_SIZE_M": bm, "SWAP_AB": sw}, num_warps=w, num_stages=s)
         for w in [2, 4, 8, 16]
         for s in [2, 3, 4, 5, 6]
+        for bm, sw in _DECODE_BM_SWAP
     ],
-    # num_routed_tokens (= grid axis-0, runtime) is in the key so decode re-tunes per
-    # batch size — a config tuned at S=8 is wrong at S=256 (GPU unsaturated at S=8). The
-    # constexpr dims auto-partition the cache, so they don't need to be in the key.
-    key=["num_routed_tokens"],
+    # Autotune key: num_routed_tokens (grid axis-0 — the batch varies at decode; a config tuned at
+    # S=8 is wrong at S=256, GPU unsaturated) + the problem dims. A constexpr change forces a JIT
+    # recompile but NOT a retune (the autotune config cache is keyed separately, on these names +
+    # tensor dtypes), so INTERMEDIATE_DIM/HIDDEN_DIM must be listed to partition tuning per shape.
+    # (BLOCK_SIZE_M, SWAP_AB) is the coupled fill-the-atom axis (replicate token in M, or weight
+    # rows in M) — a config axis, not a key.
+    key=["num_routed_tokens", "INTERMEDIATE_DIM", "HIDDEN_DIM"],
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
@@ -97,8 +112,13 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
+    SWAP_AB: tl.constexpr = False,
 ):
-    """Batched kernel 1: per-token gate_up + SiLU + FP8 quant. Grid: (S, N-tiles)."""
+    """Batched kernel 1: per-token gate_up + SiLU + FP8 quant. Grid: (S, N-tiles).
+
+    ``SWAP_AB`` (tuner axis, M=1 decode): load the weights output-rows-major ``[BN, BK]`` and put
+    those rows in the MMA M dim, padding the single token to the N=16 atom; column 0 of the
+    ``[BN, 16]`` accumulator is the result. No-swap keeps the token in M (padded to 16)."""
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
@@ -111,33 +131,27 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     # uninit; the down kernel writes zeros for this row, so the output stays well-defined.
     if expert_id >= NUM_EXPERTS:
         return
+    # Replicate the single token across all BLOCK_SIZE_M rows (arange*0): at BM=16 (non-swap) this
+    # fills the MMA 16-atom with copies of the same token — store_row keeps lane 0 — avoiding the
+    # degenerate M=1 lowering. BM=1 is unchanged; the swap path (coupled to BM=1) uses only row 0.
     a_ptr = (
         HiddenStates
-        + (token + tl.arange(0, BLOCK_SIZE_M))[:, None] * stride_a_m
+        + (token + tl.arange(0, BLOCK_SIZE_M) * 0)[:, None] * stride_a_m
         + tl.arange(0, BLOCK_SIZE_K)[None, :] * stride_a_k
     )
-    b_gate_ptr = (
-        GateUp
-        + expert_id * stride_gu_e
-        + tl.arange(0, BLOCK_SIZE_K)[:, None] * stride_gu_k
-        + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :] * stride_gu_n
-    )
-    b_up_ptr = (
-        GateUp
-        + expert_id * stride_gu_e
-        + tl.arange(0, BLOCK_SIZE_K)[:, None] * stride_gu_k
-        + (INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[
-            None, :
-        ]
-        * stride_gu_n
-    )
+    gate_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    up_n = INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    kk = tl.arange(0, BLOCK_SIZE_K)
+    gu_base = GateUp + expert_id * stride_gu_e
+    b_gate_ptr = oriented_weight_ptrs(gu_base, gate_n, kk, stride_gu_n, stride_gu_k, SWAP_AB)
+    b_up_ptr = oriented_weight_ptrs(gu_base, up_n, kk, stride_gu_n, stride_gu_k, SWAP_AB)
     bs_gate_ptr = GateUpScale + expert_id * stride_gus_e + pid_n * stride_gus_n
     bs_up_ptr = (
         GateUpScale + expert_id * stride_gus_e + (NUM_N_TILES + pid_n) * stride_gus_n
     )
 
-    acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    acc_gate = acc_init(False, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+    acc_up = acc_init(False, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
 
     for _ in range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K)):
         a_raw = tl.load(a_ptr).to(tl.float32)
@@ -148,14 +162,19 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
         w_s_gate = tl.load(bs_gate_ptr)
         w_s_up = tl.load(bs_up_ptr)
 
-        acc_gate += tl.dot(a, w_gate) * a_s[:, None] * w_s_gate
-        acc_up += tl.dot(a, w_up) * a_s[:, None] * w_s_up
+        # a_s is [BM], w_s_* per-block scalars; a_s[:, None] broadcasts onto the acc either way (swap
+        # BM=1 → the single token's scale), so no swap branch — the dot orientation is in fp8_dot.
+        acc_gate += fp8_dot(a, w_gate, SWAP_AB, BLOCK_SIZE_K) * a_s[:, None] * w_s_gate
+        acc_up += fp8_dot(a, w_up, SWAP_AB, BLOCK_SIZE_K) * a_s[:, None] * w_s_up
 
         a_ptr += BLOCK_SIZE_K * stride_a_k
         b_gate_ptr += BLOCK_SIZE_K * stride_gu_k
         b_up_ptr += BLOCK_SIZE_K * stride_gu_k
         bs_gate_ptr += stride_gus_k
         bs_up_ptr += stride_gus_k
+
+    acc_gate = acc_finalize(acc_gate, False, BLOCK_SIZE_N, SWAP_AB)
+    acc_up = acc_finalize(acc_up, False, BLOCK_SIZE_N, SWAP_AB)
 
     intermediate = glu(
         acc_gate,
@@ -183,11 +202,13 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=w, num_stages=s)
+        triton.Config({"BLOCK_SIZE_M": bm, "SWAP_AB": sw}, num_warps=w, num_stages=s)
         for w in [2, 4, 8, 16]
         for s in [2, 3, 4, 5, 6]
+        for bm, sw in _DECODE_BM_SWAP
     ],
-    key=["num_routed_tokens"],
+    # See the gate_up kernel: problem dims must be keyed (constexprs recompile but don't retune).
+    key=["num_routed_tokens", "INTERMEDIATE_DIM", "HIDDEN_DIM"],
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
@@ -213,8 +234,13 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     NUM_N_TILES: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
+    SWAP_AB: tl.constexpr = False,
 ):
-    """Batched kernel 2: fp8 intermediate → down proj → output. Grid: (S, H-tiles)."""
+    """Batched kernel 2: fp8 intermediate → down proj → output. Grid: (S, H-tiles).
+
+    ``SWAP_AB`` (tuner axis, M=1 decode): load the down weight output-rows-major ``[BH, BN]`` and
+    put the hidden output rows in the MMA M dim (intermediate token padded to the N=16 atom);
+    column 0 of the ``[BH, 16]`` accumulator is the result. No-swap keeps the token in M."""
     batch_id = tl.program_id(axis=0)
     pid_h = tl.program_id(axis=1)
 
@@ -227,35 +253,42 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
         store_row(Out + batch_id * HIDDEN_DIM, z, pid_h, 1, BLOCK_SIZE_M, BLOCK_SIZE_H)
         return
 
-    w_down_ptr = (
-        Down
-        + expert_id * stride_down_e
-        + tl.arange(0, BLOCK_SIZE_N)[:, None] * stride_down_k
-        + (pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H))[None, :] * stride_down_n
-    )
+    down_n = tl.arange(0, BLOCK_SIZE_N)
+    down_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
+    down_base = Down + expert_id * stride_down_e
+    # Down output rows are the hidden tile (BH); the contraction tile is BN (intermediate).
+    w_down_ptr = oriented_weight_ptrs(down_base, down_h, down_n, stride_down_n, stride_down_k, SWAP_AB)
+    # Replicate the single intermediate row across BLOCK_SIZE_M (arange*0) so BM=16 (non-swap) fills
+    # the MMA 16-atom with copies (store_row keeps lane 0); BM=1 unchanged, swap (BM=1) uses row 0.
     inter_ptr = (
         Intermediate
-        + (batch_id + tl.arange(0, BLOCK_SIZE_M))[:, None] * INTERMEDIATE_DIM
+        + (batch_id + tl.arange(0, BLOCK_SIZE_M) * 0)[:, None] * INTERMEDIATE_DIM
         + tl.arange(0, BLOCK_SIZE_N)[None, :]
     )
     inter_s_ptr = (
         IntermediateScale
-        + (batch_id + tl.arange(0, BLOCK_SIZE_M))[:, None] * NUM_N_TILES
+        + (batch_id + tl.arange(0, BLOCK_SIZE_M) * 0)[:, None] * NUM_N_TILES
     )
     ws_down_ptr = DownScale + expert_id * stride_downs_e + pid_h * stride_downs_n
 
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_H), dtype=tl.float32)
+    acc = acc_init(False, BLOCK_SIZE_M, BLOCK_SIZE_H, SWAP_AB)
 
     for _ in range(0, NUM_N_TILES):
         inter = tl.load(inter_ptr)
         inter_s = tl.load(inter_s_ptr)
         w_s_down = tl.load(ws_down_ptr)
         w_down = tl.load(w_down_ptr)
-        acc += tl.dot(inter, w_down) * inter_s * w_s_down
+        # inter_s is [BM, 1] and w_s_down a per-tile scalar, so both broadcast onto the acc in either
+        # orientation (under swap BM=1 → inter_s is the single token's scale) — no swap branch needed.
+        acc += fp8_dot(inter, w_down, SWAP_AB, BLOCK_SIZE_N) * inter_s * w_s_down
         inter_ptr += BLOCK_SIZE_N
         inter_s_ptr += 1
         ws_down_ptr += stride_downs_k
+        # contraction (intermediate) dim uses stride_down_k in both layouts (rows when [BN,BH],
+        # cols when swapped [BH,BN]), so the K-advance is identical.
         w_down_ptr += BLOCK_SIZE_N * stride_down_k
+
+    acc = acc_finalize(acc, False, BLOCK_SIZE_H, SWAP_AB)
 
     if SIMULATE_UNFUSED:
         acc = acc.to(Out.dtype.element_ty).to(tl.float32)
@@ -330,7 +363,6 @@ def _w8a8_block_dynamic_fp8_moe_batched(
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
-            BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
             NUM_N_TILES=NUM_N_TILES,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
@@ -359,7 +391,6 @@ def _w8a8_block_dynamic_fp8_moe_batched(
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
             BLOCK_SIZE_H=BLOCK_SIZE_N,
-            BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
             NUM_N_TILES=NUM_N_TILES,
             SIMULATE_UNFUSED=simulate_unfused,
         )
@@ -429,9 +460,18 @@ def w8a8_block_dynamic_fp8_moe_batched(
 
 
 @bayesian_autotune(
-    get_mxfp_autotuning_configs(),
-    ["num_routed_tokens"],
-    n_trials=60,
+    # batched = M=1 decode: dot is never competitive here (its per-group tl.dot still pays the
+    # M->16 MMA pad without dot_scaled's wide-K amortization), so only scalar + dot_scaled are
+    # emitted. SWAP_AB is orthogonal — the tuner picks {dot_scaled, scalar} x {swap, no-swap} per
+    # (expert shape, recipe): swap puts the weight's output rows in the MMA M dim (down ~1.78x,
+    # gate_up ~1.07x on the measured decode), no-swap keeps the token in M (padded to 16).
+    get_mxfp_autotuning_configs(
+        compute_modes=("dot_scaled", "scalar"), swap_ab=True, for_decode=True
+    ),
+    ["num_routed_tokens", "INTERMEDIATE_DIM", "HIDDEN_DIM", "VALUES_PER_BYTE"],
+    n_trials=100,
+    # K-loop loads are unmasked; drop configs whose BK exceeds the contraction dim (hidden).
+    prune_configs_by={"early_config_prune": bk_within_k_pruner("HIDDEN_DIM")},
 )
 @triton.jit
 def mxfp_dynamic_moe_batched_gate_up_kernel(
@@ -460,13 +500,19 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     VALUES_PER_BYTE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
+    SWAP_AB: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
 ):
     """MXFP4/MXFP8 kernel 1: gate_up + SiLU + MXFP8 requant. N = intermediate
-    (output) tile, K = hidden (contraction) tile — both tunable. Grid: (S, N-tiles)."""
+    (output) tile, K = hidden (contraction) tile — both tunable. Grid: (S, N-tiles).
+
+    ``SWAP_AB`` (tuner axis): swap loads the weight output-rows-major ``[BN, BK]`` and puts those
+    rows in the MMA M dim (token padded to the N=16 atom); no-swap loads it ``[BK, BN]`` and keeps
+    the single token in M (padded to 16 by the MMA). Only the weight-pointer orientation and the
+    compute helper differ — the scales are ``[BN, NG]`` and the epilogue is layout-agnostic."""
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     token = (batch_id // NUM_TOP_K).to(tl.int64)
@@ -474,74 +520,48 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     if expert_id >= NUM_EXPERTS:  # EP sentinel; down kernel zeros the output row
         return
 
+    # Replicate the single token across BLOCK_SIZE_M rows (arange*0): BM=16 (non-swap) fills the
+    # MMA 16-atom with copies (store keeps lane 0); BM=1 unchanged, swap (BM=1) uses row 0.
     a_ptr = (
         HiddenStates
-        + (token + tl.arange(0, BLOCK_SIZE_M))[:, None] * stride_a_m
+        + (token + tl.arange(0, BLOCK_SIZE_M) * 0)[:, None] * stride_a_m
         + tl.arange(0, BLOCK_SIZE_K)[None, :] * stride_a_k
     )
-    b_gate_ptr = (
-        GateUp
-        + expert_id * stride_gu_e
-        + tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)[:, None] * stride_gu_k
-        + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :] * stride_gu_n
-    )
-    b_up_ptr = (
-        GateUp
-        + expert_id * stride_gu_e
-        + tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)[:, None] * stride_gu_k
-        + (INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[
-            None, :
-        ]
-        * stride_gu_n
-    )
-    bs_gate_ptr = (
-        GateUpScale
-        + expert_id * stride_gus_e
-        + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[:, None] * stride_gus_n
-        + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, :] * stride_gus_k
-    )
-    bs_up_ptr = (
-        GateUpScale
-        + expert_id * stride_gus_e
-        + (INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[
-            :, None
-        ]
-        * stride_gus_n
-        + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, :] * stride_gus_k
-    )
+    # Weight pointer orientation follows SWAP_AB: output-rows-major [BN, BK] when swapped (rows are
+    # the MMA M dim), else K-major [BK, BN]. Gate rows first, up rows offset by INTERMEDIATE_DIM.
+    # The K-advance below (a scalar stride step) is identical for both orientations.
+    gate_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    up_n = INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
+    gu_base = GateUp + expert_id * stride_gu_e
+    b_gate_ptr = oriented_weight_ptrs(gu_base, gate_n, kb, stride_gu_n, stride_gu_k, SWAP_AB)
+    b_up_ptr = oriented_weight_ptrs(gu_base, up_n, kb, stride_gu_n, stride_gu_k, SWAP_AB)
+    sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
+    gus_base = GateUpScale + expert_id * stride_gus_e
+    bs_gate_ptr = gus_base + gate_n[:, None] * stride_gus_n + sf[None, :] * stride_gus_k
+    bs_up_ptr = gus_base + up_n[:, None] * stride_gus_n + sf[None, :] * stride_gus_k
 
-    acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    acc_gate = acc_init(COMPUTE_MODE == "scalar", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+    acc_up = acc_init(COMPUTE_MODE == "scalar", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+
     for _ in range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K)):
         a_raw = tl.load(a_ptr).to(tl.float32)
-        a, a_scale = mxfp_act_quant_inline(
-            a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
-        )
-        b_gate = tl.load(b_gate_ptr)
-        b_up = tl.load(b_up_ptr)
-        bs_gate = tl.load(bs_gate_ptr)
-        bs_up = tl.load(bs_up_ptr)
+        a, a_scale = mxfp_act_quant_inline(a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K)
+        b_gate, b_up = tl.load(b_gate_ptr), tl.load(b_up_ptr)
+        bs_gate, bs_up = tl.load(bs_gate_ptr), tl.load(bs_up_ptr)
         acc_gate, acc_up = mx_compute_gate_up(
-            acc_gate,
-            acc_up,
-            a,
-            a_scale,
-            b_gate,
-            b_up,
-            bs_gate,
-            bs_up,
-            COMPUTE_MODE,
-            VALUES_PER_BYTE,
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-            BLOCK_SIZE_K,
-            SCALE_GROUP_K,
+            acc_gate, acc_up, a, a_scale, b_gate, b_up, bs_gate, bs_up,
+            COMPUTE_MODE, VALUES_PER_BYTE,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, SWAP_AB,
         )
         a_ptr += BLOCK_SIZE_K * stride_a_k
         b_gate_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_gu_k
         b_up_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_gu_k
         bs_gate_ptr += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_gus_k
         bs_up_ptr += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_gus_k
+
+    acc_gate = acc_finalize(acc_gate, COMPUTE_MODE == "scalar", BLOCK_SIZE_N, SWAP_AB)
+    acc_up = acc_finalize(acc_up, COMPUTE_MODE == "scalar", BLOCK_SIZE_N, SWAP_AB)
 
     intermediate = glu(
         acc_gate,
@@ -573,13 +593,22 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
         + batch_id * (INTERMEDIATE_DIM // SCALE_GROUP_K)
         + offs_sc[None, :]
     )
-    tl.store(sc_ptrs, inter_scale)
+    # inter_scale is [BLOCK_SIZE_M, BN//G]; at BM>1 the token is replicated so all rows are
+    # identical — collapse to the single row 0 ([1, BN//G]) to match sc_ptrs (bit-identical at BM=1).
+    tl.store(sc_ptrs, tl.reshape(tl.max(inter_scale, axis=0), (1, BLOCK_SIZE_N // SCALE_GROUP_K)))
 
 
 @bayesian_autotune(
-    get_mxfp_autotuning_configs(),
-    ["num_routed_tokens"],
-    n_trials=60,
+    # batched = M=1 decode: dot is never competitive here (see the gate_up decorator). SWAP_AB is
+    # orthogonal — the tuner picks {dot_scaled, scalar} x {swap, no-swap}. Swap wins big on the
+    # down GEMV (~1.78x on the measured decode); the tuner confirms it per (expert shape, recipe).
+    get_mxfp_autotuning_configs(
+        compute_modes=("dot_scaled", "scalar"), swap_ab=True, for_decode=True
+    ),
+    ["num_routed_tokens", "INTERMEDIATE_DIM", "HIDDEN_DIM", "VALUES_PER_BYTE"],
+    n_trials=100,
+    # K-loop loads are unmasked; drop configs whose BK exceeds the contraction dim (intermediate).
+    prune_configs_by={"early_config_prune": bk_within_k_pruner("INTERMEDIATE_DIM")},
 )
 @triton.jit
 def mxfp_dynamic_moe_batched_down_kernel(
@@ -607,9 +636,13 @@ def mxfp_dynamic_moe_batched_down_kernel(
     SCALE_GROUP_K: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
+    SWAP_AB: tl.constexpr = False,
 ):
     """MXFP4/MXFP8 kernel 2: MXFP8 intermediate → down proj. N = hidden
-    (output) tile, K = intermediate (contraction) tile. Grid: (S, H-tiles)."""
+    (output) tile, K = intermediate (contraction) tile. Grid: (S, H-tiles).
+
+    ``SWAP_AB`` (tuner axis): swap loads the weight ``[BN, BK]`` and puts its output rows in the
+    MMA M dim (token padded to N=16); no-swap loads ``[BK, BN]`` and keeps the token in M."""
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     expert_id = tl.load(ExpertIds + batch_id).to(tl.int64)
@@ -618,53 +651,48 @@ def mxfp_dynamic_moe_batched_down_kernel(
         store_row(Out + batch_id * HIDDEN_DIM, z, pid_n, 1, BLOCK_SIZE_M, BLOCK_SIZE_N)
         return
 
+    # Replicate the single intermediate row across BLOCK_SIZE_M (arange*0): BM=16 (non-swap) fills
+    # the MMA 16-atom with copies (store keeps lane 0); BM=1 unchanged, swap (BM=1) uses row 0.
     a_ptr = (
         Intermediate
-        + (batch_id + tl.arange(0, BLOCK_SIZE_M))[:, None] * INTERMEDIATE_DIM
+        + (batch_id + tl.arange(0, BLOCK_SIZE_M) * 0)[:, None] * INTERMEDIATE_DIM
         + tl.arange(0, BLOCK_SIZE_K)[None, :]
     )
     as_ptr = (
         IntermediateScale
-        + (batch_id + tl.arange(0, BLOCK_SIZE_M))[:, None]
+        + (batch_id + tl.arange(0, BLOCK_SIZE_M) * 0)[:, None]
         * (INTERMEDIATE_DIM // SCALE_GROUP_K)
         + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, :]
     )
-    w_down_ptr = (
-        Down
-        + expert_id * stride_down_e
-        + tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)[:, None] * stride_down_k
-        + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :] * stride_down_n
-    )
+    # Weight pointer orientation follows SWAP_AB: [BN, BK] output-rows-major when swapped, else
+    # [BK, BN] K-major. The scale is [BN, NG] either way; the K-advance is a shared scalar step.
+    down_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
+    down_base = Down + expert_id * stride_down_e
+    w_down_ptr = oriented_weight_ptrs(down_base, down_n, kb, stride_down_n, stride_down_k, SWAP_AB)
     ws_down_ptr = (
         DownScale
         + expert_id * stride_downs_e
-        + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[:, None] * stride_downs_n
+        + down_n[:, None] * stride_downs_n
         + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, :] * stride_downs_k
     )
+    acc = acc_init(COMPUTE_MODE == "scalar", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
 
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for _ in range(0, tl.cdiv(INTERMEDIATE_DIM, BLOCK_SIZE_K)):
-        a = tl.load(a_ptr)
-        a_scale = tl.load(as_ptr)
-        w = tl.load(w_down_ptr)
-        w_scale = tl.load(ws_down_ptr)
+        inter = tl.load(a_ptr)
+        inter_s = tl.load(as_ptr)
+        w_down = tl.load(w_down_ptr)
+        ws_down = tl.load(ws_down_ptr)
         acc = mx_compute(
-            acc,
-            a,
-            a_scale,
-            w,
-            w_scale,
-            COMPUTE_MODE,
-            VALUES_PER_BYTE,
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-            BLOCK_SIZE_K,
-            SCALE_GROUP_K,
+            acc, inter, inter_s, w_down, ws_down, COMPUTE_MODE, VALUES_PER_BYTE,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, SWAP_AB,
         )
         a_ptr += BLOCK_SIZE_K
         as_ptr += BLOCK_SIZE_K // SCALE_GROUP_K
         w_down_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_down_k
         ws_down_ptr += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_downs_k
+
+    acc = acc_finalize(acc, COMPUTE_MODE == "scalar", BLOCK_SIZE_N, SWAP_AB)
 
     if SIMULATE_UNFUSED:
         acc = acc.to(Out.dtype.element_ty).to(tl.float32)
@@ -748,7 +776,6 @@ def _mxfp_dynamic_moe_batched(
             NUM_EXPERTS=NUM_EXPERTS,
             HIDDEN_DIM=HIDDEN_DIM,
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
-            BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
             VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
             ACT_FN=act_fn,
@@ -774,7 +801,6 @@ def _mxfp_dynamic_moe_batched(
             NUM_EXPERTS=NUM_EXPERTS,
             HIDDEN_DIM=HIDDEN_DIM,
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
-            BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
             VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
             SIMULATE_UNFUSED=simulate_unfused,
