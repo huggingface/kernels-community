@@ -450,7 +450,7 @@ def smem_config_pruner(
     compiles. ``None`` (default) disables the check.
 
     ``double_mma`` marks a kernel that folds its ``n_weight_tiles`` into ONE wide MMA rather than
-    dotting them separately — the fused gate∪up kernel does a single ``[BM, n_weight_tiles*BN]``
+    dotting them separately — the fused gate_up kernel does a single ``[BM, n_weight_tiles*BN]``
     dot (n_weight_tiles=2 → double-width N=2*BN). Its ``dot_scaled`` configs whose MMA width
     ``n_weight_tiles * BLOCK_SIZE_N`` exceeds sm_10x's N=256 cap are dropped (Triton miscompiles
     wider ones: packed-E2M1 rhs → sticky "misaligned address" device trap). Off by default: a
@@ -615,7 +615,7 @@ def mx_dot_scaled(acc, a, a_scale, w, w_scale, VALUES_PER_BYTE: tl.constexpr):
 def mx_dot_rescale(acc, a, w, a_scale, w_scale, VALUES_PER_BYTE: tl.constexpr):
     """MX 'dot' path (BK == group): unpack MXFP4 weights to E4M3, fp8 ``tl.dot`` + per-group
     software rescale (decoding both UE8M0 scales internally), accumulating into ``acc`` (returned
-    updated). Single weight — for the gate∪up pair (shared activation scale) use
+    updated). Single weight — for the gate_up pair (shared activation scale) use
     ``mx_dot_rescale_gate_up``."""
     wq = mxfp4_e2m1_to_e4m3(w) if VALUES_PER_BYTE == 2 else w
     return acc + tl.dot(a, wq) * decode_ue8m0_scale(a_scale) * tl.trans(
@@ -627,7 +627,7 @@ def mx_dot_rescale(acc, a, w, a_scale, w_scale, VALUES_PER_BYTE: tl.constexpr):
 def mx_dot_rescale_gate_up(
     acc_gate, acc_up, a, w_gate, w_up, a_scale, gate_scale, up_scale
 ):
-    """Gate∪up 'dot' path: decode the SHARED activation scale once, rescale both projections
+    """Gate_up 'dot' path: decode the SHARED activation scale once, rescale both projections
     and accumulate into ``acc_gate``/``acc_up`` (returned updated)."""
     a_s = decode_ue8m0_scale(a_scale)
     acc_gate += tl.dot(a, w_gate) * a_s * tl.trans(decode_ue8m0_scale(gate_scale))
@@ -651,7 +651,7 @@ def mx_scalar_reduce(
     """MX 'scalar' path: CUDA-core FMA GEMV, unpacking MXFP4 weights to E4M3 then dequantizing
     activation + weight per-element by their expanded group scales, reducing and accumulating into
     ``acc`` (returned updated). No tensor core (so no M→16 MMA pad) — wins for the memory-bound
-    decode GEMV (M=1). Single weight — for the gate∪up pair use ``mx_scalar_reduce_gate_up``.
+    decode GEMV (M=1). Single weight — for the gate_up pair use ``mx_scalar_reduce_gate_up``.
 
     The UE8M0 scale is constant within each group of ``SCALE_GROUP_K``, so it factors out of the
     inner sum: instead of expanding it to every K element and doing ``BLOCK_SIZE_K`` scale-muls,
@@ -685,7 +685,7 @@ def mx_scalar_reduce_gate_up(
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
 ):
-    """Gate∪up 'scalar' path: dequant the SHARED activation once, reduce both projections and
+    """Gate_up 'scalar' path: dequant the SHARED activation once, reduce both projections and
     accumulate into ``acc_gate``/``acc_up`` (returned updated). Per-group scale factored out of
     the inner sum (see ``mx_scalar_reduce``): reduce raw products within each group of 32, then
     one combined (act × weight) scale per group — 32× fewer scale-muls, bit-identical."""
@@ -725,7 +725,7 @@ def mx_compute_gate_up(
     SCALE_GROUP_K: tl.constexpr,
     SWAP_AB: tl.constexpr = False,
 ):
-    """Gate∪up MMA step. Under ``SWAP_AB`` the swapped decode path runs (weight output rows in the MMA
+    """Gate_up MMA step. Under ``SWAP_AB`` the swapped decode path runs (weight output rows in the MMA
     M dim — see ``mx_swap_compute_gate_up``); otherwise dispatch on ``COMPUTE_MODE``: scaled-MMA on the
     raw weights (``b_gate``/``b_up``), or fp8 ``tl.dot`` + per-group rescale / scalar reduce on the
     E4M3-decoded weights. Returns the updated ``(acc_gate, acc_up)`` — only the taken branch compiles."""
@@ -894,7 +894,7 @@ def mx_dot_scaled_swapped_gate_up(
     VALUES_PER_BYTE: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
-    """Gate∪up swapped ``dot_scaled``: build the shared activation rhs once (N=16, col 0 real) and
+    """Gate_up swapped ``dot_scaled``: build the shared activation rhs once (N=16, col 0 real) and
     run both projections with the weights (output rows) in the MMA M dim. ``acc_gate``/``acc_up``
     are persistent ``[BN, MMA_N_ATOM]`` MMA accumulators (col 0 taken by the caller)."""
     fmt: tl.constexpr = "e2m1" if VALUES_PER_BYTE == 2 else "e4m3"
@@ -919,7 +919,7 @@ def mx_scalar_reduce_swapped_gate_up(
     SCALE_GROUP_K: tl.constexpr,
     VALUES_PER_BYTE: tl.constexpr,
 ):
-    """Gate∪up swapped scalar reduce (see ``mx_scalar_reduce_swapped``): decode the SHARED
+    """Gate_up swapped scalar reduce (see ``mx_scalar_reduce_swapped``): decode the SHARED
     activation once, reduce both projections over K with per-group scale. ``acc*`` are ``[1, ROWS_W]``."""
     NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
     if VALUES_PER_BYTE == 2:
@@ -990,7 +990,7 @@ def mx_swap_compute_gate_up(
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
 ):
-    """Gate∪up swapped-AB counterpart to ``mx_compute_gate_up`` (see ``mx_swap_compute``): the shared
+    """Gate_up swapped-AB counterpart to ``mx_compute_gate_up`` (see ``mx_swap_compute``): the shared
     activation is flattened once, then both projections run with weight rows in the MMA M dim."""
     a1 = tl.reshape(a, (BLOCK_SIZE_K,))
     as1 = tl.reshape(a_scale, (BLOCK_SIZE_K // SCALE_GROUP_K,))

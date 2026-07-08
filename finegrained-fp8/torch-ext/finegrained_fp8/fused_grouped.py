@@ -624,7 +624,7 @@ def _set_gate_up_descriptor(nargs):
         compute_modes=_MX_COMPUTE_MODES,
         memory_modes=_MX_MEMORY_MODES,
         tune_block_m=True,
-    ),  # prefill: no scalar; combined gate∪up dot ([2*BN,K] reshape) — TMA vs pointer load
+    ),  # prefill: no scalar; combined gate_up dot ([2*BN,K] reshape) — TMA vs pointer load
     # VALUES_PER_BYTE keys the MXFP4/MXFP8 split — the packing halves the weight tile bytes, so a
     # winner is only valid for its own recipe.
     ["INTERMEDIATE_DIM", "HIDDEN_DIM", "tokens_per_sm_bit_length", "VALUES_PER_BYTE"],
@@ -764,7 +764,7 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
             )
             gu_t = tl.trans(
                 gu
-            )  # [BK, 2*BN] gate∪up weight; mx_compute decodes it for the fp8 path
+            )  # [BK, 2*BN] gate_up weight; mx_compute decodes it for the fp8 path
             acc = mx_compute(
                 acc,
                 a,
