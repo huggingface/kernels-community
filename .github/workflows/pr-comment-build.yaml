@@ -27,6 +27,7 @@ jobs:
           COMMENT_ID: ${{ github.event.comment.id }}
           COMMENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
           COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          COMMENT_AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}
           COMMENT_SENDER_TYPE: ${{ github.event.sender.type }}
           COMMENT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
@@ -44,6 +45,10 @@ jobs:
           esac
           if ! printf '%s' "$COMMENT_BODY" | grep -Eq '^/kernel-bot[ A-Za-z0-9_./-]*$'; then
             echo "Ignoring /kernel-bot comment with unsupported characters."
+            exit 0
+          fi
+          if [[ "$COMMENT_AUTHOR_ASSOCIATION" != "MEMBER" && "$COMMENT_AUTHOR_ASSOCIATION" != "OWNER" && "$COMMENT_AUTHOR_ASSOCIATION" != "COLLABORATOR" ]]; then
+            echo "Unauthorized: Only members, owners, and collaborators can use /kernel-bot."
             exit 0
           fi
           python3 .github/scripts/pr_comment_kernel_bot.py
