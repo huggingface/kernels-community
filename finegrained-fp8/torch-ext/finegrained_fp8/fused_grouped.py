@@ -41,6 +41,7 @@ from .utils import (
     device_context,
     sm_count,
     tl_dtype,
+    fp8_act_quant_2d,
     fp8_act_quant_inline,
     topk_reduce_kernel,
     TOPK_REDUCE_BLOCK_H,
@@ -52,6 +53,7 @@ from .utils import (
     mxfp_act_quant_inline,
     mx_compute,
     smem_config_pruner,
+    bd_grouped_gate_up_pruner,
     glu,
     e2m1_as_uint8,
     ue8m0_as_uint8,
@@ -242,17 +244,19 @@ _MX_MEMORY_MODES = ("descriptor", "pointer")
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(tune_block_m=True),
+    get_accelerator_autotuning_configs(tune_block_m=True, warp_spec=True),
     ["INTERMEDIATE_DIM", "HIDDEN_DIM", "tokens_per_sm_bit_length"],
     n_trials=100,
-    # bf16 activation tile + fused gate|up weight tiles
+    # fp8 pre-quantized activation tile + fused gate|up weight tiles; WS-race guard (the
+    # non-WS dual-dot loop races at w<8 / BM>64 on Triton 3.7.1 — see the pruner).
     prune_configs_by={
-        "early_config_prune": smem_config_pruner(act_bytes=2, n_weight_tiles=2)
+        "early_config_prune": bd_grouped_gate_up_pruner(act_bytes=1, n_weight_tiles=2)
     },
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
-    Hidden,  # (T, H) raw activations, UNSORTED
+    Hidden,  # (T, H) E4M3 activations (pre-quantized once by the wrapper), UNSORTED
+    HiddenScale,  # (T, H//BLOCK_SIZE_K) fp32 per-row, per-K-block scales
     PermToken,  # (S,) int32 — sorted position -> source token id
     GateUp,  # (E, 2I, H) FP8
     GateUpScale,  # (E, 2I//bn, H//bk) UE8M0 block scales
@@ -261,6 +265,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
     InterScale,  # (S, NUM_I_TILES) fp32 — per-row, per-I-tile activation scale
     stride_h_t,
     stride_h_k,
+    stride_hs_t,
     stride_gu_e,
     stride_gu_n,
     stride_gu_k,
@@ -284,9 +289,18 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
+    INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    WARP_SPEC: tl.constexpr = False,
 ):
-    """Phase 1: persistent grid-stride over (M-tile, I-tile). Gather hidden rows per expert
-    M-tile, gate + up block-FP8 matmuls, SiLU-combine, FP8-requant the intermediate."""
+    """Phase 1: persistent grid-stride over (M-tile, I-tile). Gather pre-quantized fp8 hidden
+    rows + per-K-block scales per expert M-tile, gate + up block-FP8 matmuls, SiLU-combine,
+    FP8-requant the intermediate.
+
+    ``WARP_SPEC`` (CUDA): warp-specialize the K-loop — +21% AND load-bearing for correctness:
+    Triton 3.7.1's default pipeliner RACES this loop's six load streams + dual dot at
+    num_warps < 8 or BM = 128 (nondeterministic output; WS's explicit producer/consumer
+    barriers are what make those configs sound). The single-dot combined form is race-free
+    but measured 20% slower."""
     start_pid = tl.program_id(axis=0)
     exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = _build_tile_layout(
         ExpertStart, NUM_EXPERTS, BLOCK_SIZE_M
@@ -306,6 +320,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
         expert_id64 = expert_id.to(tl.int64)
         token = tl.load(PermToken + offs_global_m * stride_pt, mask=row_mask, other=0)
         a_ptrs = Hidden + token[:, None] * stride_h_t + offs_k[None, :] * stride_h_k
+        as_ptrs = HiddenScale + token * stride_hs_t
         gate_ptr = (
             GateUp
             + expert_id64 * stride_gu_e
@@ -330,9 +345,9 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
 
         acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for _ in range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K)):
-            a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
-            a, a_s = fp8_act_quant_inline(a_raw)
+        for _ in tl.range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+            a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
+            a_s = tl.load(as_ptrs, mask=row_mask, other=0.0)
             w_gate = tl.load(gate_ptr)
             w_up = tl.load(up_ptr)
             w_s_gate = decode_ue8m0_scale(tl.load(gate_s_ptr))
@@ -340,6 +355,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
             acc_gate += tl.dot(a, w_gate) * a_s[:, None] * w_s_gate
             acc_up += tl.dot(a, w_up) * a_s[:, None] * w_s_up
             a_ptrs += BLOCK_SIZE_K * stride_h_k
+            as_ptrs += 1
             gate_ptr += BLOCK_SIZE_K * stride_gu_k
             up_ptr += BLOCK_SIZE_K * stride_gu_k
             gate_s_ptr += stride_gus_k
@@ -352,7 +368,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
             SWIGLU_ALPHA,
             SWIGLU_LIMIT,
             SIMULATE_UNFUSED,
-            Hidden.dtype.element_ty,
+            INTERMEDIATE_DTYPE,
         )
         inter, inter_s = fp8_act_quant_inline(
             intermediate
@@ -499,6 +515,10 @@ def w8a8_block_dynamic_fp8_moe_grouped(
 
     gate_up_scale_u8 = ue8m0_as_uint8(gate_up_proj_scale)
     down_scale_u8 = ue8m0_as_uint8(down_proj_scale)
+    # One-pass block-FP8 pre-quant of the activations (see the MX wrapper / mxfp_act_quant:
+    # the kernel used to re-run the inline quant per N-tile). Bit-exact — the quant span
+    # equals the kernel's BLOCK_SIZE_K.
+    hidden_q, hidden_scale = fp8_act_quant_2d(hidden_states, BLOCK_SIZE_K)
 
     inter = torch.empty(
         num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=FP8_DTYPE
@@ -514,15 +534,17 @@ def w8a8_block_dynamic_fp8_moe_grouped(
     )
     with device_context(device):
         w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel[(num_sms,)](
-            hidden_states,
+            hidden_q,
+            hidden_scale,
             perm_token,
             gate_up_proj,
             gate_up_scale_u8,
             expert_start,
             inter,
             inter_scale,
-            hidden_states.stride(0),
-            hidden_states.stride(1),
+            hidden_q.stride(0),
+            hidden_q.stride(1),
+            hidden_scale.stride(0),
             gate_up_proj.stride(0),
             gate_up_proj.stride(1),
             gate_up_proj.stride(2),
@@ -545,6 +567,8 @@ def w8a8_block_dynamic_fp8_moe_grouped(
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
+            # the dtype the UNFUSED path lands the GLU intermediate in
+            INTERMEDIATE_DTYPE=tl_dtype(hidden_states.dtype),
         )
         w8a8_block_dynamic_fp8_moe_grouped_down_kernel[(num_sms,)](
             inter,

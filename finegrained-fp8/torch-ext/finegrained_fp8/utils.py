@@ -244,6 +244,7 @@ def get_accelerator_autotuning_configs(
     tune_block_nk: bool = False,
     for_decode: bool = False,
     swap_ab: bool = False,
+    warp_spec: bool = False,
 ):
     """Autotune search grid for the current accelerator.
 
@@ -277,6 +278,13 @@ def get_accelerator_autotuning_configs(
 
     if tune_block_m:
         blocks = [{**b, "BLOCK_SIZE_M": bm} for b in blocks for bm in (16, 32, 64, 128)]
+
+    # WARP_SPEC axis (CUDA only): warp-specialize the K-loop. Compile support is
+    # (shape, config)-dependent on Triton 3.7.1, so it must be a tuner axis — failures
+    # score inf and self-prune; where it compiles it is both faster and (for the bd
+    # grouped gate_up) load-bearing for correctness (see bd_grouped_gate_up_pruner).
+    if warp_spec and get_active_device_type() == "cuda":
+        blocks = [{**b, "WARP_SPEC": ws} for b in blocks for ws in (False, True)]
 
     # (BLOCK_SIZE_M, SWAP_AB) axis: for_decode crosses in the coupled decode pairs (see
     # ``decode_bm_swap_pairs``); else SWAP_AB is a plain axis (BM from the launch), if swap_ab.
@@ -407,6 +415,38 @@ def sm_shared_memory_limit(device_index: int) -> int:
             raise RuntimeError(
                 f"Unsupported device type {get_active_device_type()} for sm_shared_memory_limit; only cuda/xpu are supported."
             )
+
+
+def bd_grouped_gate_up_pruner(act_bytes: int, n_weight_tiles: int):
+    """``early_config_prune`` for the bd grouped gate_up: the smem estimate (see
+    ``smem_config_pruner``) plus the Triton 3.7.1 pipeliner-race guard. The kernel's
+    six-load-stream dual-dot K-loop RACES under the default pipeliner at ``num_warps < 8``
+    or ``BLOCK_SIZE_M > 64`` (nondeterministic wrong output) — ``warp_specialize`` both
+    fixes those configs and is faster, but itself fails to compile at some (shape, config)
+    combos (benign inf to the tuner). So: WS=True configs pass (compile failures self-prune),
+    WS=False survives only in the verified-sound (w >= 8, BM <= 64) region. CUDA-only —
+    the race is a CUDA pipeliner artifact and the WS axis isn't emitted elsewhere."""
+    smem_prune = smem_config_pruner(act_bytes=act_bytes, n_weight_tiles=n_weight_tiles)
+
+    def prune(configs, named_args, **kwargs):
+        kept = smem_prune(configs, named_args, **kwargs)
+        dev = triton.runtime.driver.active.get_active_torch_device()
+        if dev.type == "cuda":
+            kept = [
+                c
+                for c in kept
+                # WS + w16 is a MEASURED compile failure — drop it to save the wasted
+                # compile; other WS compile failures are (shape, config)-dependent with no
+                # known rule and self-prune as inf at bench time.
+                if not (c.kwargs.get("WARP_SPEC") and c.num_warps >= 16)
+                and (
+                    c.kwargs.get("WARP_SPEC")
+                    or (c.num_warps >= 8 and c.kwargs.get("BLOCK_SIZE_M", 128) <= 64)
+                )
+            ] or kept
+        return kept
+
+    return prune
 
 
 def batched_mx_pruner(k_arg: str, stacked_gate_up: bool = False):
@@ -1182,6 +1222,49 @@ def mxfp_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             T.bit_length(),
             K=K,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
+        )
+    return y, s
+
+
+@triton.autotune(
+    configs=[triton.Config({}, num_warps=w) for w in (1, 2, 4)],
+    key=["K", "BLOCK_K", "t_bucket"],
+)
+@triton.jit
+def _fp8_act_quant_2d_kernel(
+    X,
+    Y,
+    S,
+    stride_x_t,
+    stride_x_k,
+    t_bucket,  # autotune key only (log2 token-count bucket); unused in body
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """One-pass block-FP8 activation quant: rows → E4M3 + one fp32 ``amax/448`` scale per
+    ``BLOCK_K`` span. Grid ``(T, K // BLOCK_K)``; the span equals the consumer's
+    ``BLOCK_SIZE_K``, so results are bit-exact with the kernels' inline quant. Arbitrary
+    input strides (no host-side copy). ``BLOCK_K`` is fixed by the scale layout — only
+    warps are tuned."""
+    t = tl.program_id(0).to(tl.int64)
+    kb = tl.program_id(1)
+    offs = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+    x = tl.load(X + t * stride_x_t + offs * stride_x_k)[None, :].to(tl.float32)
+    y, s = fp8_act_quant_inline(x)
+    tl.store(Y + t * K + offs, tl.reshape(y, (BLOCK_K,)))
+    tl.store(S + t * (K // BLOCK_K) + kb + tl.arange(0, 1), tl.reshape(s, (1,)))
+
+
+def fp8_act_quant_2d(x: torch.Tensor, block_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``(T, K)`` activations to block-FP8 once (E4M3 + fp32 per-``block_k`` scales)
+    instead of inline per weight-tile — same rationale and layout as ``mxfp_act_quant`` (a
+    GEMM re-reads its activation once per N-tile). Bit-exact with the inline form."""
+    T, K = x.shape
+    y = torch.empty(T, K, device=x.device, dtype=FP8_DTYPE)
+    s = torch.empty(T, K // block_k, device=x.device, dtype=torch.float32)
+    with device_context(x.device):
+        _fp8_act_quant_2d_kernel[(T, K // block_k)](
+            x, y, s, x.stride(0), x.stride(1), T.bit_length(), K=K, BLOCK_K=block_k
         )
     return y, s
 

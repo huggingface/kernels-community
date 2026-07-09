@@ -78,6 +78,17 @@ class BayesianAutotuner(Autotuner):
         # FINEGRAINED_AUTOTUNE_LOG env var. Analyse offline to prune bad configs.
         self.log_path = log_path or os.environ.get("FINEGRAINED_AUTOTUNE_LOG")
 
+    def _bench(self, *args, config, **meta):
+        """Score any failing config as inf instead of raising — a compile failure is data
+        for the search, not a fatal error. Stock Triton forgives only OutOfResources, but
+        e.g. Triton 3.7.1's ``warp_specialize`` raises RuntimeError at unsupported
+        (shape, config) combos; unguarded, one such config kills the whole tune when a
+        small grid falls through to the stock exhaustive path below."""
+        try:
+            return super()._bench(*args, config=config, **meta)
+        except Exception:
+            return [float("inf")] * 3
+
     def run(self, *args, **kwargs):
         # Small grid → defer to parent (stock exhaustive bench-all).
         if len(self.configs) <= 1 or self.n_trials >= len(self.configs):
