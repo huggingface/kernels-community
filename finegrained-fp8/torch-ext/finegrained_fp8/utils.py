@@ -404,21 +404,73 @@ def sm_shared_memory_limit(device_index: int) -> int:
             )
 
 
-def bk_within_k_pruner(k_arg: str):
-    """Build an ``early_config_prune`` that drops configs with ``BLOCK_SIZE_K`` larger than the
-    launch's contraction dim (``k_arg`` names it: ``"K"`` for the batched matmul, ``HIDDEN_DIM`` /
-    ``INTERMEDIATE_DIM`` for the fused gate_up / down). The decode kernels' K-loop loads are
-    unmasked (K is always a multiple of BK on real models), so an oversized BK reads past the row —
-    silently wrong results the tuner would happily time and pick (bit us when BK=512 met a K=256
-    test problem). Never returns empty — falls back to the smallest-BK configs."""
+def batched_mx_pruner(k_arg: str, stacked_gate_up: bool = False):
+    """``early_config_prune`` for the batched MX kernels: a BK-within-K veto plus two sm_10x
+    MMA-shape guards (no-ops elsewhere and for scalar configs). With ``stacked_gate_up`` the
+    kernel computes gate|up as one stacked 2*BN extent, so the swapped dot_scaled lhs has
+    ``2*BN`` rows and the no-swap combined dot is ``2*BN`` wide; the down kernel's counts are
+    just ``BN``.
+
+    - ``BLOCK_SIZE_K`` not dividing the launch's contraction dim (``k_arg`` names it: ``"K"``
+      for the batched matmul, ``HIDDEN_DIM`` / ``INTERMEDIATE_DIM`` for the fused gate_up /
+      down) → dropped: the K-loop loads are unmasked, so any non-dividing BK's last trip reads
+      past the row — silently wrong results the tuner would happily time and pick (bit us when
+      BK=512 met a K=256 test problem).
+    - MXFP4 ``scalar`` configs → dropped (sm_10x only — the 1.8x-dead evidence is B200;
+      other targets lower dot_scaled differently and keep the mode): fp4 scalar decode is ALU-bound in the E2M1 unpack
+      and measured 1.8x SLOWER than dot_scaled (twice, incl. the no-pad form) — it never wins,
+      and its swapped variants poison the TPE's per-dimension model into writing off SWAP_AB
+      (a 100-trial dsv4 down tune benched 3 swap configs — two dead-slow swap-scalar, one inf —
+      and shipped a 38.9µs no-swap winner, missing the ~24µs swap dot_scaled basin entirely).
+    - Swapped ``dot_scaled`` rows < 128 → dropped: the native mxfp scaled-MMA gates on the M
+      operand being exactly 128, so smaller rows run the bf16-upcast fallback and never win —
+      the same poison mechanism (an earlier dsv4 gate_up tune shipped 63µs missing the 43µs
+      swap winner).
+    - No-swap tensor-core width > 256 → dropped: sm_10x caps an MMA at N=256 and Triton
+      miscompiles wider ones into a sticky device trap (see ``smem_config_pruner``'s
+      ``wide_dot_scaled``).
+
+    Never returns empty — dot_scaled no-swap configs pass every guard (the ``or kept``
+    fallbacks cover the pathological cases). A contraction dim smaller than every grid BK is
+    a hard error: any config would over-read past the row and return silently wrong results."""
+    n_blocks = 2 if stacked_gate_up else 1
 
     def prune(configs, named_args, **kwargs):
-        k = {**named_args, **kwargs}[k_arg]
-        kept = [c for c in configs if c.kwargs.get("BLOCK_SIZE_K", 0) <= k]
-        if kept:
-            return kept
-        min_bk = min(c.kwargs.get("BLOCK_SIZE_K", 0) for c in configs)
-        return [c for c in configs if c.kwargs.get("BLOCK_SIZE_K", 0) == min_bk]
+        all_args = {**named_args, **kwargs}
+        k = all_args[k_arg]
+        kept = [
+            c
+            for c in configs
+            if c.kwargs.get("BLOCK_SIZE_K", 0) == 0 or k % c.kwargs["BLOCK_SIZE_K"] == 0
+        ]
+        if not kept:
+            min_bk = min(c.kwargs.get("BLOCK_SIZE_K", 0) for c in configs)
+            raise ValueError(
+                f"{k_arg}={k} is not a multiple of any BLOCK_SIZE_K in the autotune grid; "
+                f"the unmasked K-loop would read past the row. Pad the problem along "
+                f"{k_arg} (smallest grid BK: {min_bk})."
+            )
+        dev = triton.runtime.driver.active.get_active_torch_device()
+        dev_index = dev.index if dev.index is not None else 0
+        is_sm10x = (
+            dev.type == "cuda" and torch.cuda.get_device_capability(dev_index)[0] == 10
+        )
+        if is_sm10x and all_args.get("VALUES_PER_BYTE") == 2:
+            kept = [
+                c for c in kept if c.kwargs.get("COMPUTE_MODE") != "scalar"
+            ] or kept
+        if is_sm10x:
+
+            def ok(c):
+                if c.kwargs.get("COMPUTE_MODE") == "scalar":
+                    return True
+                rows = n_blocks * c.kwargs["BLOCK_SIZE_N"]
+                if c.kwargs.get("SWAP_AB"):
+                    return rows >= 128
+                return rows <= 256
+
+            kept = [c for c in kept if ok(c)] or kept
+        return kept
 
     return prune
 
@@ -615,24 +667,12 @@ def mx_dot_scaled(acc, a, a_scale, w, w_scale, VALUES_PER_BYTE: tl.constexpr):
 def mx_dot_rescale(acc, a, w, a_scale, w_scale, VALUES_PER_BYTE: tl.constexpr):
     """MX 'dot' path (BK == group): unpack MXFP4 weights to E4M3, fp8 ``tl.dot`` + per-group
     software rescale (decoding both UE8M0 scales internally), accumulating into ``acc`` (returned
-    updated). Single weight — for the gate_up pair (shared activation scale) use
-    ``mx_dot_rescale_gate_up``."""
+    updated). The batched gate_up kernel passes the stacked
+    gate|up tile (2*BN columns) — per-column independence keeps that bit-exact."""
     wq = mxfp4_e2m1_to_e4m3(w) if VALUES_PER_BYTE == 2 else w
     return acc + tl.dot(a, wq) * decode_ue8m0_scale(a_scale) * tl.trans(
         decode_ue8m0_scale(w_scale)
     )
-
-
-@triton.jit
-def mx_dot_rescale_gate_up(
-    acc_gate, acc_up, a, w_gate, w_up, a_scale, gate_scale, up_scale
-):
-    """Gate_up 'dot' path: decode the SHARED activation scale once, rescale both projections
-    and accumulate into ``acc_gate``/``acc_up`` (returned updated)."""
-    a_s = decode_ue8m0_scale(a_scale)
-    acc_gate += tl.dot(a, w_gate) * a_s * tl.trans(decode_ue8m0_scale(gate_scale))
-    acc_up += tl.dot(a, w_up) * a_s * tl.trans(decode_ue8m0_scale(up_scale))
-    return acc_gate, acc_up
 
 
 @triton.jit
@@ -651,7 +691,7 @@ def mx_scalar_reduce(
     """MX 'scalar' path: CUDA-core FMA GEMV, unpacking MXFP4 weights to E4M3 then dequantizing
     activation + weight per-element by their expanded group scales, reducing and accumulating into
     ``acc`` (returned updated). No tensor core (so no M→16 MMA pad) — wins for the memory-bound
-    decode GEMV (M=1). Single weight — for the gate_up pair use ``mx_scalar_reduce_gate_up``.
+    decode GEMV (M=1). The batched gate_up kernel passes the stacked gate|up tile (ROWS_W = 2*BN).
 
     The UE8M0 scale is constant within each group of ``SCALE_GROUP_K``, so it factors out of the
     inner sum: instead of expanding it to every K element and doing ``BLOCK_SIZE_K`` scale-muls,
@@ -668,100 +708,6 @@ def mx_scalar_reduce(
         decode_ue8m0_scale(w_scale)
     )
     return acc + tl.sum(grp * scale, axis=0)[None, :]
-
-
-@triton.jit
-def mx_scalar_reduce_gate_up(
-    acc_gate,
-    acc_up,
-    a,
-    w_gate,
-    w_up,
-    a_scale,
-    gate_scale,
-    up_scale,
-    BLOCK_SIZE_M: tl.constexpr,
-    ROWS_W: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    SCALE_GROUP_K: tl.constexpr,
-):
-    """Gate_up 'scalar' path: dequant the SHARED activation once, reduce both projections and
-    accumulate into ``acc_gate``/``acc_up`` (returned updated). Per-group scale factored out of
-    the inner sum (see ``mx_scalar_reduce``): reduce raw products within each group of 32, then
-    one combined (act × weight) scale per group — 32× fewer scale-muls, bit-identical."""
-    NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
-    a_t = tl.trans(a.to(tl.float32))  # [BK, BM]
-    a_s = tl.trans(decode_ue8m0_scale(a_scale))  # [NG, BM]
-    grp_gate = tl.sum(
-        tl.reshape(a_t * w_gate.to(tl.float32), (NG, SCALE_GROUP_K, ROWS_W)), axis=1
-    )
-    acc_gate += tl.sum(
-        grp_gate * a_s * tl.trans(decode_ue8m0_scale(gate_scale)), axis=0
-    )[None, :]
-    grp_up = tl.sum(
-        tl.reshape(a_t * w_up.to(tl.float32), (NG, SCALE_GROUP_K, ROWS_W)), axis=1
-    )
-    acc_up += tl.sum(grp_up * a_s * tl.trans(decode_ue8m0_scale(up_scale)), axis=0)[
-        None, :
-    ]
-    return acc_gate, acc_up
-
-
-@triton.jit
-def mx_compute_gate_up(
-    acc_gate,
-    acc_up,
-    a,
-    a_scale,
-    b_gate,
-    b_up,
-    gate_scale,
-    up_scale,
-    COMPUTE_MODE: tl.constexpr,
-    VALUES_PER_BYTE: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    SCALE_GROUP_K: tl.constexpr,
-    SWAP_AB: tl.constexpr = False,
-):
-    """Gate_up MMA step. Under ``SWAP_AB`` the swapped decode path runs (weight output rows in the MMA
-    M dim — see ``mx_swap_compute_gate_up``); otherwise dispatch on ``COMPUTE_MODE``: scaled-MMA on the
-    raw weights (``b_gate``/``b_up``), or fp8 ``tl.dot`` + per-group rescale / scalar reduce on the
-    E4M3-decoded weights. Returns the updated ``(acc_gate, acc_up)`` — only the taken branch compiles."""
-    if SWAP_AB:
-        acc_gate, acc_up = mx_swap_compute_gate_up(
-            acc_gate, acc_up, a, a_scale, b_gate, b_up, gate_scale, up_scale,
-            COMPUTE_MODE, VALUES_PER_BYTE, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K,
-        )
-    elif COMPUTE_MODE == "dot_scaled":
-        acc_gate = mx_dot_scaled(
-            acc_gate, a, a_scale, b_gate, gate_scale, VALUES_PER_BYTE
-        )
-        acc_up = mx_dot_scaled(acc_up, a, a_scale, b_up, up_scale, VALUES_PER_BYTE)
-    elif COMPUTE_MODE == "dot":
-        acc_gate, acc_up = mx_dot_rescale_gate_up(
-            acc_gate, acc_up, a,
-            mxfp4_e2m1_to_e4m3(b_gate) if VALUES_PER_BYTE == 2 else b_gate,
-            mxfp4_e2m1_to_e4m3(b_up) if VALUES_PER_BYTE == 2 else b_up,
-            a_scale, gate_scale, up_scale,
-        )
-    else:  # scalar
-        acc_gate, acc_up = mx_scalar_reduce_gate_up(
-            acc_gate,
-            acc_up,
-            a,
-            mxfp4_e2m1_to_e4m3(b_gate) if VALUES_PER_BYTE == 2 else b_gate,
-            mxfp4_e2m1_to_e4m3(b_up) if VALUES_PER_BYTE == 2 else b_up,
-            a_scale,
-            gate_scale,
-            up_scale,
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-            BLOCK_SIZE_K,
-            SCALE_GROUP_K,
-        )
-    return acc_gate, acc_up
 
 
 @triton.jit
@@ -882,68 +828,6 @@ def mx_scalar_reduce_swapped(
 
 
 @triton.jit
-def mx_dot_scaled_swapped_gate_up(
-    acc_gate,
-    acc_up,
-    a,
-    a_scale,
-    w_gate,
-    w_up,
-    gate_scale,
-    up_scale,
-    VALUES_PER_BYTE: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    """Gate_up swapped ``dot_scaled``: build the shared activation rhs once (N=16, col 0 real) and
-    run both projections with the weights (output rows) in the MMA M dim. ``acc_gate``/``acc_up``
-    are persistent ``[BN, MMA_N_ATOM]`` MMA accumulators (col 0 taken by the caller)."""
-    fmt: tl.constexpr = "e2m1" if VALUES_PER_BYTE == 2 else "e4m3"
-    rhs, asc = mx_dot_scaled_swapped_rhs(a, a_scale, BLOCK_SIZE_K)
-    acc_gate = tl.dot_scaled(w_gate, gate_scale, fmt, rhs, asc, "e4m3", acc_gate)
-    acc_up = tl.dot_scaled(w_up, up_scale, fmt, rhs, asc, "e4m3", acc_up)
-    return acc_gate, acc_up
-
-
-@triton.jit
-def mx_scalar_reduce_swapped_gate_up(
-    acc_gate,
-    acc_up,
-    a,
-    a_scale,
-    w_gate,
-    w_up,
-    gate_scale,
-    up_scale,
-    ROWS_W: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    SCALE_GROUP_K: tl.constexpr,
-    VALUES_PER_BYTE: tl.constexpr,
-):
-    """Gate_up swapped scalar reduce (see ``mx_scalar_reduce_swapped``): decode the SHARED
-    activation once, reduce both projections over K with per-group scale. ``acc*`` are ``[1, ROWS_W]``."""
-    NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
-    if VALUES_PER_BYTE == 2:
-        wg = tl.interleave(
-            _e2m1_code_to_f32(w_gate & 0xF), _e2m1_code_to_f32(w_gate >> 4)
-        )
-        wu = tl.interleave(_e2m1_code_to_f32(w_up & 0xF), _e2m1_code_to_f32(w_up >> 4))
-    else:
-        wg = w_gate.to(tl.float32)
-        wu = w_up.to(tl.float32)
-    af = a.to(tl.float32)[None, :]
-    a_s = decode_ue8m0_scale(a_scale)[None, :]
-    grp_g = tl.sum(tl.reshape(af * wg, (ROWS_W, NG, SCALE_GROUP_K)), axis=2)
-    grp_u = tl.sum(tl.reshape(af * wu, (ROWS_W, NG, SCALE_GROUP_K)), axis=2)
-    acc_gate += tl.reshape(
-        tl.sum(grp_g * a_s * decode_ue8m0_scale(gate_scale), axis=1), (1, ROWS_W)
-    )
-    acc_up += tl.reshape(
-        tl.sum(grp_u * a_s * decode_ue8m0_scale(up_scale), axis=1), (1, ROWS_W)
-    )
-    return acc_gate, acc_up
-
-
-@triton.jit
 def mx_swap_compute(
     acc,
     a,
@@ -958,9 +842,13 @@ def mx_swap_compute(
 ):
     """Swapped-AB counterpart to ``mx_compute``: weight output-rows in the MMA M dim, the single
     decode token flattened to the [BK] rhs. Dispatches the two swapped modes — ``dot_scaled``
-    (persistent ``[BN, MMA_N_ATOM]`` MMA acc, col 0 taken by the caller) and ``scalar`` (``[1, BN]``
-    reduce). The acc shapes diverge, but only the taken constexpr branch compiles so the single
-    return never has to unify them. Swap has no ``dot`` path (dead at M=1 decode)."""
+    (persistent ``[BLOCK_SIZE_N, MMA_N_ATOM]`` MMA acc, col 0 taken by the caller) and ``scalar``
+    (``[1, BLOCK_SIZE_N]`` reduce). The acc shapes diverge, but only the taken constexpr branch
+    compiles so the single return never has to unify them. Swap has no ``dot`` path (dead at M=1
+    decode). ``BLOCK_SIZE_N`` is the weight tile's row count — the gate_up kernel passes ``2*BN``
+    with its STACKED gate|up tile (gate rows first, split back via ``swap_split_gate_up``): one
+    load and one MMA for both projections keeps the native mxfp M=128 operand at BN=64, doubling
+    the CTAs on the parallelism-starved decode grid (dsv4 gate_up 1.34x, bit-exact)."""
     a1 = tl.reshape(a, (BLOCK_SIZE_K,))
     as1 = tl.reshape(a_scale, (BLOCK_SIZE_K // SCALE_GROUP_K,))
     if COMPUTE_MODE == "dot_scaled":
@@ -972,41 +860,6 @@ def mx_swap_compute(
     else:
         tl.static_assert(False, "SWAP_AB supports only dot_scaled/scalar")
     return acc
-
-
-@triton.jit
-def mx_swap_compute_gate_up(
-    acc_gate,
-    acc_up,
-    a,
-    a_scale,
-    w_gate,
-    w_up,
-    gate_scale,
-    up_scale,
-    COMPUTE_MODE: tl.constexpr,
-    VALUES_PER_BYTE: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    SCALE_GROUP_K: tl.constexpr,
-):
-    """Gate_up swapped-AB counterpart to ``mx_compute_gate_up`` (see ``mx_swap_compute``): the shared
-    activation is flattened once, then both projections run with weight rows in the MMA M dim."""
-    a1 = tl.reshape(a, (BLOCK_SIZE_K,))
-    as1 = tl.reshape(a_scale, (BLOCK_SIZE_K // SCALE_GROUP_K,))
-    if COMPUTE_MODE == "dot_scaled":
-        acc_gate, acc_up = mx_dot_scaled_swapped_gate_up(
-            acc_gate, acc_up, a1, as1, w_gate, w_up, gate_scale, up_scale,
-            VALUES_PER_BYTE, BLOCK_SIZE_K,
-        )
-    elif COMPUTE_MODE == "scalar":
-        acc_gate, acc_up = mx_scalar_reduce_swapped_gate_up(
-            acc_gate, acc_up, a1, as1, w_gate, w_up, gate_scale, up_scale,
-            BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, VALUES_PER_BYTE,
-        )
-    else:
-        tl.static_assert(False, "SWAP_AB supports only dot_scaled/scalar")
-    return acc_gate, acc_up
 
 
 @triton.jit
@@ -1046,6 +899,44 @@ def fp8_dot(a, b, SWAP_AB: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
 
 
 @triton.jit
+def stacked_gate_up_ptrs(
+    base, offs_n, offs_k, block_stride, stride_n, stride_k, SWAP_AB: tl.constexpr
+):
+    """Gate|up stacked 3D weight-tile pointers, oriented by ``SWAP_AB`` — the gate_up
+    counterpart of ``oriented_weight_ptrs``. One axis indexes the {gate, up} row block (up
+    offset by ``block_stride``), placed so ``stacked_gate_up_flatten``'s plain reshape yields
+    the 2D stacked tile: swap ``[2, N, K]`` (output rows in the MMA M dim), no-swap
+    ``[K, 2, N]`` (K-major, gate|up along the MMA N dim — the grouped kernel's combined form).
+    The per-step K-advance is the same scalar stride step in both orientations."""
+    blk = tl.arange(0, 2) * block_stride
+    if SWAP_AB:
+        ptrs = base + (
+            blk[:, None, None]
+            + offs_n[None, :, None] * stride_n
+            + offs_k[None, None, :] * stride_k
+        )
+    else:
+        ptrs = base + (
+            offs_k[:, None, None] * stride_k
+            + blk[None, :, None]
+            + offs_n[None, None, :] * stride_n
+        )
+    return ptrs
+
+
+@triton.jit
+def stacked_gate_up_flatten(w3, N2: tl.constexpr, KB: tl.constexpr, SWAP_AB: tl.constexpr):
+    """Flatten a loaded 3D gate|up tile (see ``stacked_gate_up_ptrs``) to the stacked 2D tile:
+    swap ``[N2, KB]`` (rows-major MMA lhs), no-swap ``[KB, N2]`` (K-major rhs). Rows/columns
+    0..N-1 are gate, N..2N-1 up — ``split_gate_up`` undoes the stacking after the K-loop."""
+    if SWAP_AB:
+        w2 = tl.reshape(w3, (N2, KB))
+    else:
+        w2 = tl.reshape(w3, (KB, N2))
+    return w2
+
+
+@triton.jit
 def oriented_weight_ptrs(base, offs_rows, offs_k, stride_rows, stride_k, SWAP_AB: tl.constexpr):
     """Weight-tile pointers oriented by ``SWAP_AB``: output-rows-major ``[rows, K]`` when swapped
     (output rows are the MMA M dim), else K-major ``[K, rows]``. Only the taken constexpr branch
@@ -1060,17 +951,17 @@ def oriented_weight_ptrs(base, offs_rows, offs_k, stride_rows, stride_k, SWAP_AB
 
 @triton.jit
 def acc_init(
-    IS_SCALAR: tl.constexpr,
+    COMPUTE_MODE: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     SWAP_AB: tl.constexpr,
 ):
     """Zero accumulator shaped for the layout: swapped scalar reduces into ``[1, N]``; any other
     swapped mode keeps the persistent ``[N, MMA_N_ATOM]`` MMA acc (weight rows in M, token in the
-    padded N, col 0 taken after the K-loop); no-swap uses ``[M, N]``. ``IS_SCALAR`` matters only under
-    swap — kernels with no scalar path (fp8 ``tl.dot``) pass ``False``. ``N`` is the weight-output
+    padded N, col 0 taken after the K-loop); no-swap uses ``[M, N]``. ``COMPUTE_MODE`` matters only
+    under swap — kernels with no mode axis (fp8 ``tl.dot``) pass ``"dot"``. ``N`` is the weight-output
     tile (``BLOCK_SIZE_H`` for the fp8 down projection). Single return: only the taken branch compiles."""
-    if SWAP_AB and IS_SCALAR:
+    if SWAP_AB and COMPUTE_MODE == "scalar":
         acc = tl.zeros((1, BLOCK_SIZE_N), dtype=tl.float32)
     elif SWAP_AB:
         acc = tl.zeros((BLOCK_SIZE_N, MMA_N_ATOM), dtype=tl.float32)
@@ -1080,14 +971,33 @@ def acc_init(
 
 
 @triton.jit
-def acc_finalize(acc, IS_SCALAR: tl.constexpr, ROWS: tl.constexpr, SWAP_AB: tl.constexpr):
+def acc_finalize(acc, COMPUTE_MODE: tl.constexpr, ROWS: tl.constexpr, SWAP_AB: tl.constexpr):
     """Bookend to ``acc_init``: when the acc was built as the persistent ``[ROWS, MMA_N_ATOM]`` MMA
     tile (any swapped non-scalar mode), collapse the padded token dim to column 0 → ``[1, ROWS]``.
-    Swapped scalar (already ``[1, ROWS]``) and no-swap pass through unchanged. ``IS_SCALAR`` matches
-    the flag given to ``acc_init`` (fp8 ``tl.dot`` kernels, which have no scalar path, pass False)."""
-    if SWAP_AB and not IS_SCALAR:
+    Swapped scalar (already ``[1, ROWS]``) and no-swap pass through unchanged. ``COMPUTE_MODE``
+    matches ``acc_init``'s (fp8 ``tl.dot`` kernels, which have no mode axis, pass ``"dot"``)."""
+    if SWAP_AB and COMPUTE_MODE != "scalar":
         acc = swap_take_col0(acc, ROWS)
     return acc
+
+
+@triton.jit
+def split_gate_up(
+    acc,
+    COMPUTE_MODE: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    SWAP_AB: tl.constexpr,
+):
+    """Bookend to the stacked gate|up accumulator: finalize it (swap MMA col-0 collapse or
+    pass-through, via ``acc_finalize``) and split the stacked N extent back into the
+    ``(gate, up)`` pair, each ``[rows, BN]`` (rows = 1 under swap, else BM). Gate was stacked
+    first (see ``stacked_gate_up_flatten``)."""
+    rows: tl.constexpr = 1 if SWAP_AB else BLOCK_SIZE_M
+    flat = acc_finalize(acc, COMPUTE_MODE, 2 * BLOCK_SIZE_N, SWAP_AB)
+    pair = tl.permute(tl.reshape(flat, (rows, 2, BLOCK_SIZE_N)), (0, 2, 1))
+    g, u = tl.split(pair)
+    return g, u
 
 
 @triton.jit

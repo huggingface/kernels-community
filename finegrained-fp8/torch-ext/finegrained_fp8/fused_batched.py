@@ -31,7 +31,7 @@ from .utils import (
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
     decode_bm_swap_pairs,
-    bk_within_k_pruner,
+    batched_mx_pruner,
     device_context,
     fp8_act_quant_inline,
     get_mxfp_autotuning_configs,
@@ -39,7 +39,9 @@ from .utils import (
     is_mxfp4,
     mxfp_act_quant_inline,
     mx_compute,
-    mx_compute_gate_up,
+    stacked_gate_up_ptrs,
+    stacked_gate_up_flatten,
+    split_gate_up,
     oriented_weight_ptrs,
     acc_init,
     fp8_dot,
@@ -150,8 +152,8 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
         GateUpScale + expert_id * stride_gus_e + (NUM_N_TILES + pid_n) * stride_gus_n
     )
 
-    acc_gate = acc_init(False, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
-    acc_up = acc_init(False, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+    acc_gate = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+    acc_up = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
 
     for _ in range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K)):
         a_raw = tl.load(a_ptr).to(tl.float32)
@@ -173,8 +175,8 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
         bs_gate_ptr += stride_gus_k
         bs_up_ptr += stride_gus_k
 
-    acc_gate = acc_finalize(acc_gate, False, BLOCK_SIZE_N, SWAP_AB)
-    acc_up = acc_finalize(acc_up, False, BLOCK_SIZE_N, SWAP_AB)
+    acc_gate = acc_finalize(acc_gate, "dot", BLOCK_SIZE_N, SWAP_AB)
+    acc_up = acc_finalize(acc_up, "dot", BLOCK_SIZE_N, SWAP_AB)
 
     intermediate = glu(
         acc_gate,
@@ -271,7 +273,7 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
     )
     ws_down_ptr = DownScale + expert_id * stride_downs_e + pid_h * stride_downs_n
 
-    acc = acc_init(False, BLOCK_SIZE_M, BLOCK_SIZE_H, SWAP_AB)
+    acc = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_H, SWAP_AB)
 
     for _ in range(0, NUM_N_TILES):
         inter = tl.load(inter_ptr)
@@ -288,7 +290,7 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
         # cols when swapped [BH,BN]), so the K-advance is identical.
         w_down_ptr += BLOCK_SIZE_N * stride_down_k
 
-    acc = acc_finalize(acc, False, BLOCK_SIZE_H, SWAP_AB)
+    acc = acc_finalize(acc, "dot", BLOCK_SIZE_H, SWAP_AB)
 
     if SIMULATE_UNFUSED:
         acc = acc.to(Out.dtype.element_ty).to(tl.float32)
@@ -433,7 +435,6 @@ def w8a8_block_dynamic_fp8_moe_batched(
     runs gate_up + down (gathering each routed row from the unexpanded ``hidden_states``,
     source row ``s // num_top_k``, no replicated copy). The top-k reduce stays plain torch
     so ``torch.compile`` can fuse it with the surrounding model graph."""
-
     out = ops.w8a8_block_dynamic_fp8_moe_batched(
         hidden_states,
         gate_up_proj,
@@ -471,7 +472,8 @@ def w8a8_block_dynamic_fp8_moe_batched(
     ["num_routed_tokens", "INTERMEDIATE_DIM", "HIDDEN_DIM", "VALUES_PER_BYTE"],
     n_trials=100,
     # K-loop loads are unmasked; drop configs whose BK exceeds the contraction dim (hidden).
-    prune_configs_by={"early_config_prune": bk_within_k_pruner("HIDDEN_DIM")},
+    # BK-within-K + the sm_10x MMA-shape guards over the stacked 2*BN gate|up extent.
+    prune_configs_by={"early_config_prune": batched_mx_pruner("HIDDEN_DIM", stacked_gate_up=True)},
 )
 @triton.jit
 def mxfp_dynamic_moe_batched_gate_up_kernel(
@@ -509,10 +511,11 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     """MXFP4/MXFP8 kernel 1: gate_up + SiLU + MXFP8 requant. N = intermediate
     (output) tile, K = hidden (contraction) tile — both tunable. Grid: (S, N-tiles).
 
-    ``SWAP_AB`` (tuner axis): swap loads the weight output-rows-major ``[BN, BK]`` and puts those
-    rows in the MMA M dim (token padded to the N=16 atom); no-swap loads it ``[BK, BN]`` and keeps
-    the single token in M (padded to 16 by the MMA). Only the weight-pointer orientation and the
-    compute helper differ — the scales are ``[BN, NG]`` and the epilogue is layout-agnostic."""
+    Gate and up are ONE stacked load and ONE compute over the stacked 2*BN extent in both
+    orientations, split back after the K-loop. ``SWAP_AB`` (tuner axis) only orients it: swap
+    puts the ``[2*BN, BK]`` weight rows in the MMA M dim (token padded to the N=16 atom —
+    native mxfp M=128 at BN=64 with 2x the CTAs); no-swap keeps the token in M against the
+    ``[BK, 2*BN]`` combined tile (MMA width 2*BN, capped at 256 on sm_10x by the pruner)."""
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     token = (batch_id // NUM_TOP_K).to(tl.int64)
@@ -527,41 +530,49 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
         + (token + tl.arange(0, BLOCK_SIZE_M) * 0)[:, None] * stride_a_m
         + tl.arange(0, BLOCK_SIZE_K)[None, :] * stride_a_k
     )
-    # Weight pointer orientation follows SWAP_AB: output-rows-major [BN, BK] when swapped (rows are
-    # the MMA M dim), else K-major [BK, BN]. Gate rows first, up rows offset by INTERMEDIATE_DIM.
-    # The K-advance below (a scalar stride step) is identical for both orientations.
+    # Gate (rows n) and up (rows I + n) are ONE stacked [2, ...] load in BOTH orientations
+    # (stacked_gate_up_ptrs) and the K-loop runs a single mx_compute over the stacked 2*BN
+    # extent — swap: [2*BN, BK] rows in the MMA M dim (native mxfp M=128 at BN=64, 2x the
+    # CTAs); no-swap: [BK, 2*BN] gate|up along N, one combined dot (the grouped kernel's
+    # form; configs with MMA width 2*BN > 256 are pruned on sm_10x). split_gate_up undoes
+    # the stacking after the loop. The scale tile is [2*BN, NG] in both orientations.
     gate_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    up_n = INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
-    gu_base = GateUp + expert_id * stride_gu_e
-    b_gate_ptr = oriented_weight_ptrs(gu_base, gate_n, kb, stride_gu_n, stride_gu_k, SWAP_AB)
-    b_up_ptr = oriented_weight_ptrs(gu_base, up_n, kb, stride_gu_n, stride_gu_k, SWAP_AB)
     sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
-    gus_base = GateUpScale + expert_id * stride_gus_e
-    bs_gate_ptr = gus_base + gate_n[:, None] * stride_gus_n + sf[None, :] * stride_gus_k
-    bs_up_ptr = gus_base + up_n[:, None] * stride_gus_n + sf[None, :] * stride_gus_k
-
-    acc_gate = acc_init(COMPUTE_MODE == "scalar", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
-    acc_up = acc_init(COMPUTE_MODE == "scalar", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+    b_gu_ptr = stacked_gate_up_ptrs(
+        GateUp + expert_id * stride_gu_e, gate_n, kb,
+        INTERMEDIATE_DIM * stride_gu_n, stride_gu_n, stride_gu_k, SWAP_AB,
+    )
+    rows2 = tl.arange(0, 2)[:, None] * INTERMEDIATE_DIM + gate_n[None, :]
+    bs_gu_ptr = (
+        GateUpScale + expert_id * stride_gus_e
+        + rows2[:, :, None] * stride_gus_n
+        + sf[None, None, :] * stride_gus_k
+    )
+    acc = acc_init(COMPUTE_MODE, BLOCK_SIZE_M, 2 * BLOCK_SIZE_N, SWAP_AB)
 
     for _ in range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K)):
         a_raw = tl.load(a_ptr).to(tl.float32)
         a, a_scale = mxfp_act_quant_inline(a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K)
-        b_gate, b_up = tl.load(b_gate_ptr), tl.load(b_up_ptr)
-        bs_gate, bs_up = tl.load(bs_gate_ptr), tl.load(bs_up_ptr)
-        acc_gate, acc_up = mx_compute_gate_up(
-            acc_gate, acc_up, a, a_scale, b_gate, b_up, bs_gate, bs_up,
-            COMPUTE_MODE, VALUES_PER_BYTE,
-            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, SWAP_AB,
+        w2 = stacked_gate_up_flatten(
+            tl.load(b_gu_ptr),
+            2 * BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE, SWAP_AB,
         )
+        ws2 = tl.reshape(
+            tl.load(bs_gu_ptr),
+            (2 * BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_K),
+        )
+        acc = mx_compute(
+            acc, a, a_scale, w2, ws2, COMPUTE_MODE, VALUES_PER_BYTE,
+            BLOCK_SIZE_M, 2 * BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, SWAP_AB,
+        )
+        b_gu_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_gu_k
+        bs_gu_ptr += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_gus_k
         a_ptr += BLOCK_SIZE_K * stride_a_k
-        b_gate_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_gu_k
-        b_up_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_gu_k
-        bs_gate_ptr += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_gus_k
-        bs_up_ptr += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_gus_k
 
-    acc_gate = acc_finalize(acc_gate, COMPUTE_MODE == "scalar", BLOCK_SIZE_N, SWAP_AB)
-    acc_up = acc_finalize(acc_up, COMPUTE_MODE == "scalar", BLOCK_SIZE_N, SWAP_AB)
+    acc_gate, acc_up = split_gate_up(
+        acc, COMPUTE_MODE, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB
+    )
 
     intermediate = glu(
         acc_gate,
@@ -607,8 +618,9 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     ),
     ["num_routed_tokens", "INTERMEDIATE_DIM", "HIDDEN_DIM", "VALUES_PER_BYTE"],
     n_trials=100,
-    # K-loop loads are unmasked; drop configs whose BK exceeds the contraction dim (intermediate).
-    prune_configs_by={"early_config_prune": bk_within_k_pruner("INTERMEDIATE_DIM")},
+    # BK-within-K + the sm_10x MMA-shape guards (swapped dot_scaled needs BN >= 128 for the
+    # native scaled-MMA; smaller-BN swap configs never win and mislead the TPE).
+    prune_configs_by={"early_config_prune": batched_mx_pruner("INTERMEDIATE_DIM")},
 )
 @triton.jit
 def mxfp_dynamic_moe_batched_down_kernel(
@@ -676,7 +688,7 @@ def mxfp_dynamic_moe_batched_down_kernel(
         + down_n[:, None] * stride_downs_n
         + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, :] * stride_downs_k
     )
-    acc = acc_init(COMPUTE_MODE == "scalar", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+    acc = acc_init(COMPUTE_MODE, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
 
     for _ in range(0, tl.cdiv(INTERMEDIATE_DIM, BLOCK_SIZE_K)):
         inter = tl.load(a_ptr)
@@ -692,7 +704,7 @@ def mxfp_dynamic_moe_batched_down_kernel(
         w_down_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_down_k
         ws_down_ptr += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_downs_k
 
-    acc = acc_finalize(acc, COMPUTE_MODE == "scalar", BLOCK_SIZE_N, SWAP_AB)
+    acc = acc_finalize(acc, COMPUTE_MODE, BLOCK_SIZE_N, SWAP_AB)
 
     if SIMULATE_UNFUSED:
         acc = acc.to(Out.dtype.element_ty).to(tl.float32)

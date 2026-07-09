@@ -29,7 +29,7 @@ from .utils import (
     oriented_weight_ptrs,
     acc_init,
     fp8_dot,
-    bk_within_k_pruner,
+    batched_mx_pruner,
     acc_finalize,
     mxfp_act_quant_inline,
     fp8_act_quant,
@@ -151,7 +151,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     b_ptrs = oriented_weight_ptrs(B, offs_bn, offs_k, stride_bn, stride_bk, SWAP_AB)
     bs_ptrs = Bs + pid_n * stride_bs_n
 
-    accumulator = acc_init(False, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+    accumulator = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a_raw = tl.load(a_ptrs).to(tl.float32)
         a, a_s = fp8_act_quant_inline(a_raw)
@@ -165,7 +165,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += stride_bs_k
 
-    accumulator = acc_finalize(accumulator, False, BLOCK_SIZE_N, SWAP_AB)
+    accumulator = acc_finalize(accumulator, "dot", BLOCK_SIZE_N, SWAP_AB)
     store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
@@ -226,7 +226,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     b_s = tl.load(Bs)
     a_s = tl.load(As + batch_id * stride_as_m)
 
-    accumulator = acc_init(False, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+    accumulator = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs)
         b = tl.load(b_ptrs)
@@ -234,7 +234,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    accumulator = acc_finalize(accumulator, False, BLOCK_SIZE_N, SWAP_AB) * a_s * b_s
+    accumulator = acc_finalize(accumulator, "dot", BLOCK_SIZE_N, SWAP_AB) * a_s * b_s
     store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
@@ -247,8 +247,9 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     ),
     ["N", "K", "S", "VALUES_PER_BYTE"],
     n_trials=100,
-    # K-loop loads are unmasked; drop configs whose BK exceeds this launch's K (BK=512 vs small K).
-    prune_configs_by={"early_config_prune": bk_within_k_pruner("K")},
+    # BK-within-K + the sm_10x MMA-shape guards (swapped dot_scaled needs BN >= 128 for the
+    # native scaled-MMA; smaller-BN swap configs never win and mislead the TPE).
+    prune_configs_by={"early_config_prune": batched_mx_pruner("K")},
 )
 @triton.jit
 def mxfp_dynamic_matmul_batched_kernel(
@@ -311,7 +312,7 @@ def mxfp_dynamic_matmul_batched_kernel(
     b_ptrs = oriented_weight_ptrs(B, offs_bn, offs_kb, stride_bn, stride_bk, SWAP_AB)
     bs_ptrs = Bs + offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k
 
-    accumulator = acc_init(COMPUTE_MODE == "scalar", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+    accumulator = acc_init(COMPUTE_MODE, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a_raw = tl.load(a_ptrs).to(tl.float32)
         a, a_scale = mxfp_act_quant_inline(a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K)
@@ -325,7 +326,7 @@ def mxfp_dynamic_matmul_batched_kernel(
         b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
-    accumulator = acc_finalize(accumulator, COMPUTE_MODE == "scalar", BLOCK_SIZE_N, SWAP_AB)
+    accumulator = acc_finalize(accumulator, COMPUTE_MODE, BLOCK_SIZE_N, SWAP_AB)
     store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
