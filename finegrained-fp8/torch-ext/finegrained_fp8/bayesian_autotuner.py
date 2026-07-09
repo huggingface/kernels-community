@@ -143,22 +143,39 @@ class BayesianAutotuner(Autotuner):
             for d, v in sig:
                 dim_vals[d].add(v)
 
-        # Seed phase: a few random configs (seeded → deterministic), warm-started from the
-        # most recent cached key's best, to give the TPE an initial good/bad split.
+        # Seed phase: one BASIN ANCHOR per (COMPUTE_MODE, SWAP_AB) group, the most recent
+        # cached key's best (warm start), then seeded-random fill. The anchors guarantee every
+        # categorical basin gets at least one real measurement — without them the TPE's
+        # per-dimension model can write off a whole axis it never saw succeed (two dsv4 tunes
+        # shipped 25-60% slow winners because their random seeds only sampled a basin's dead
+        # configs), and coordinate descent can't recover a winner two coupled flips away.
         n_startup = max(2, min(self.n_startup_trials, self.n_trials))
+        anchors = self._basin_anchor_indices(configs)
         order = list(range(len(configs)))
         random.Random(0).shuffle(order)
         warm_idx = self._warm_start_index(configs)
-        if warm_idx is not None:
-            order = [warm_idx] + [i for i in order if i != warm_idx]
-        for idx in order[:n_startup]:
+        head = anchors + ([warm_idx] if warm_idx is not None else [])
+        order = list(dict.fromkeys(head + order))
+        for idx in order[: max(n_startup, len(head))]:
             bench_idx(idx)
 
         # TPE: split measured configs into good (top-gamma) / bad, build per-dimension value
         # densities for each, and bench the unmeasured config maximizing log l(x) - log g(x)
         # (Expected-Improvement proxy), updating the model after each measurement.
+        # inf (failed-to-compile) configs are EXCLUDED from the densities: a compile failure is
+        # evidence about that one joint shape (usually shared memory), not about its dimension
+        # values — counting them as "bad" buried SWAP_AB under a wall of BN=256 smem failures
+        # and made the tuner ship a 53µs winner while the 41µs swap config sat unbenched.
         while len(timings) < self.n_trials:
-            ranked = sorted(timings, key=timings.get)
+            ranked = sorted(
+                (i for i, t in timings.items() if t != float("inf")), key=timings.get
+            )
+            if not ranked:  # nothing compiled yet — keep seeding in shuffled order
+                nxt = next((i for i in order if i not in timings), None)
+                if nxt is None:
+                    break
+                bench_idx(nxt)
+                continue
             n_good = max(1, round(self.gamma * len(ranked)))
             good_c: Dict = defaultdict(lambda: defaultdict(int))
             bad_c: Dict = defaultdict(lambda: defaultdict(int))
@@ -227,6 +244,28 @@ class BayesianAutotuner(Autotuner):
                 f.write(json.dumps(rec, default=str) + "\n")
         except Exception:
             pass
+
+    def _basin_anchor_indices(self, configs: List[Config]) -> List[int]:
+        """One representative config index per (COMPUTE_MODE, SWAP_AB) basin — the MEDIAN in
+        tile-sort order, a mid-sized tile with mid warps/stages. Not the smallest: a basin's
+        minimal corner (min BK x 2 warps) can be latency-bound pathological (a 131µs anchor in
+        a basin whose peak is 41µs re-poisons the axis it was meant to protect). Coordinate
+        descent climbs BN/BK/warps/stages from wherever the TPE lands within the basin.
+        Returns [] when the grid has no such axes (single basin)."""
+        groups: Dict = {}
+        for i, c in enumerate(configs):
+            key = (c.kwargs.get("COMPUTE_MODE"), c.kwargs.get("SWAP_AB"))
+            groups.setdefault(key, []).append(i)
+        if len(groups) <= 1:
+            return []
+        def tile_order(i):
+            return (
+                configs[i].kwargs.get("BLOCK_SIZE_N", 0),
+                configs[i].kwargs.get("BLOCK_SIZE_K", 0),
+                configs[i].num_warps,
+                configs[i].num_stages,
+            )
+        return [sorted(idxs, key=tile_order)[len(idxs) // 2] for idxs in groups.values()]
 
     def _warm_start_index(self, configs: List[Config]):
         """Return the index in ``configs`` matching the most recently cached
