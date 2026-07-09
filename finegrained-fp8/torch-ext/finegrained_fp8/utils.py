@@ -192,6 +192,11 @@ def is_tensor_wide(block_size, weight: torch.Tensor) -> bool:
     )
 
 
+def tl_dtype(dtype: torch.dtype) -> tl.dtype:
+    """The ``tl`` dtype matching a torch dtype (``torch.bfloat16`` → ``tl.bfloat16``) — the
+    attribute names line up, so no table. For passing a tensor's dtype as a kernel constexpr
+    when the kernel can't read it off a pointer argument."""
+    return getattr(tl, str(dtype).removeprefix("torch."))
 
 
 def adaptive_block_size_m(target_m: int) -> int:
@@ -456,9 +461,7 @@ def batched_mx_pruner(k_arg: str, stacked_gate_up: bool = False):
             dev.type == "cuda" and torch.cuda.get_device_capability(dev_index)[0] == 10
         )
         if is_sm10x and all_args.get("VALUES_PER_BYTE") == 2:
-            kept = [
-                c for c in kept if c.kwargs.get("COMPUTE_MODE") != "scalar"
-            ] or kept
+            kept = [c for c in kept if c.kwargs.get("COMPUTE_MODE") != "scalar"] or kept
         if is_sm10x:
 
             def ok(c):
@@ -731,8 +734,16 @@ def mx_compute(
     scalar reduce on the E4M3-decoded weight. Single return — only the taken branch compiles."""
     if SWAP_AB:
         acc = mx_swap_compute(
-            acc, a, a_scale, w, w_scale, COMPUTE_MODE, VALUES_PER_BYTE,
-            BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K,
+            acc,
+            a,
+            a_scale,
+            w,
+            w_scale,
+            COMPUTE_MODE,
+            VALUES_PER_BYTE,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            SCALE_GROUP_K,
         )
     elif COMPUTE_MODE == "dot_scaled":
         acc = mx_dot_scaled(acc, a, a_scale, w, w_scale, VALUES_PER_BYTE)
@@ -852,10 +863,20 @@ def mx_swap_compute(
     a1 = tl.reshape(a, (BLOCK_SIZE_K,))
     as1 = tl.reshape(a_scale, (BLOCK_SIZE_K // SCALE_GROUP_K,))
     if COMPUTE_MODE == "dot_scaled":
-        acc = mx_dot_scaled_swapped(acc, a1, as1, w, w_scale, VALUES_PER_BYTE, BLOCK_SIZE_K)
+        acc = mx_dot_scaled_swapped(
+            acc, a1, as1, w, w_scale, VALUES_PER_BYTE, BLOCK_SIZE_K
+        )
     elif COMPUTE_MODE == "scalar":
         acc = mx_scalar_reduce_swapped(
-            acc, a1, as1, w, w_scale, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, VALUES_PER_BYTE
+            acc,
+            a1,
+            as1,
+            w,
+            w_scale,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            SCALE_GROUP_K,
+            VALUES_PER_BYTE,
         )
     else:
         tl.static_assert(False, "SWAP_AB supports only dot_scaled/scalar")
@@ -925,7 +946,9 @@ def stacked_gate_up_ptrs(
 
 
 @triton.jit
-def stacked_gate_up_flatten(w3, N2: tl.constexpr, KB: tl.constexpr, SWAP_AB: tl.constexpr):
+def stacked_gate_up_flatten(
+    w3, N2: tl.constexpr, KB: tl.constexpr, SWAP_AB: tl.constexpr
+):
     """Flatten a loaded 3D gate|up tile (see ``stacked_gate_up_ptrs``) to the stacked 2D tile:
     swap ``[N2, KB]`` (rows-major MMA lhs), no-swap ``[KB, N2]`` (K-major rhs). Rows/columns
     0..N-1 are gate, N..2N-1 up — ``split_gate_up`` undoes the stacking after the K-loop."""
@@ -937,7 +960,9 @@ def stacked_gate_up_flatten(w3, N2: tl.constexpr, KB: tl.constexpr, SWAP_AB: tl.
 
 
 @triton.jit
-def oriented_weight_ptrs(base, offs_rows, offs_k, stride_rows, stride_k, SWAP_AB: tl.constexpr):
+def oriented_weight_ptrs(
+    base, offs_rows, offs_k, stride_rows, stride_k, SWAP_AB: tl.constexpr
+):
     """Weight-tile pointers oriented by ``SWAP_AB``: output-rows-major ``[rows, K]`` when swapped
     (output rows are the MMA M dim), else K-major ``[K, rows]``. Only the taken constexpr branch
     compiles, so the divergent shapes never meet. The per-step K-advance is identical for both
@@ -971,7 +996,9 @@ def acc_init(
 
 
 @triton.jit
-def acc_finalize(acc, COMPUTE_MODE: tl.constexpr, ROWS: tl.constexpr, SWAP_AB: tl.constexpr):
+def acc_finalize(
+    acc, COMPUTE_MODE: tl.constexpr, ROWS: tl.constexpr, SWAP_AB: tl.constexpr
+):
     """Bookend to ``acc_init``: when the acc was built as the persistent ``[ROWS, MMA_N_ATOM]`` MMA
     tile (any swapped non-scalar mode), collapse the padded token dim to column 0 → ``[1, ROWS]``.
     Swapped scalar (already ``[1, ROWS]``) and no-swap pass through unchanged. ``COMPUTE_MODE``
@@ -1007,20 +1034,20 @@ def glu(
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
-    OUT_DTYPE: tl.constexpr = tl.float32,
     SIMULATE_UNFUSED: tl.constexpr = False,
+    INTERMEDIATE_DTYPE: tl.constexpr = tl.float32,
 ):
     """Gated linear unit on the gate/up matmul accumulators. ``SWIGLU_LIMIT`` clamps gate above and up
     to ``[-LIMIT, LIMIT]``; ``SWIGLU_ALPHA`` gives the clamped/scaled SwiGLU ``(up + 1) * gate * sigmoid(ALPHA *
     gate)`` (GPT-OSS / MiniMax), else ``ACT_FN(gate) * up`` (``ACT_FN`` in {silu, gelu, relu}, gelu exact
-    via erf). ``SIMULATE_UNFUSED`` rounds each materialized value through ``OUT_DTYPE`` to match the
+    via erf). ``SIMULATE_UNFUSED`` rounds each materialized value through ``INTERMEDIATE_DTYPE`` (the dtype the unfused path lands intermediates in) to match the
     unfused (separate-kernel) path, where every intermediate lands in that dtype."""
     g = gate
     u = up
 
     if SIMULATE_UNFUSED:
-        g = g.to(OUT_DTYPE).to(tl.float32)
-        u = u.to(OUT_DTYPE).to(tl.float32)
+        g = g.to(INTERMEDIATE_DTYPE).to(tl.float32)
+        u = u.to(INTERMEDIATE_DTYPE).to(tl.float32)
 
     if SWIGLU_LIMIT is not None:
         g = tl.minimum(g, SWIGLU_LIMIT)
@@ -1029,10 +1056,10 @@ def glu(
     if SWIGLU_ALPHA is not None:
         gate_scaled = g * SWIGLU_ALPHA
         if SIMULATE_UNFUSED:
-            gate_scaled = gate_scaled.to(OUT_DTYPE).to(tl.float32)
+            gate_scaled = gate_scaled.to(INTERMEDIATE_DTYPE).to(tl.float32)
         sig = tl.sigmoid(gate_scaled)
         if SIMULATE_UNFUSED:
-            sig = sig.to(OUT_DTYPE).to(tl.float32)
+            sig = sig.to(INTERMEDIATE_DTYPE).to(tl.float32)
         act = g * sig
         u = u + 1.0
     elif ACT_FN == "silu":
@@ -1047,13 +1074,13 @@ def glu(
         )
 
     if SIMULATE_UNFUSED:
-        act = act.to(OUT_DTYPE).to(tl.float32)
-        u = u.to(OUT_DTYPE).to(tl.float32)
+        act = act.to(INTERMEDIATE_DTYPE).to(tl.float32)
+        u = u.to(INTERMEDIATE_DTYPE).to(tl.float32)
 
     gated = act * u
 
     if SIMULATE_UNFUSED:
-        gated = gated.to(OUT_DTYPE).to(tl.float32)
+        gated = gated.to(INTERMEDIATE_DTYPE).to(tl.float32)
 
     return gated
 
@@ -1066,7 +1093,9 @@ def _e2m1_code_to_f32(code):
     s = (code >> 3) & 1
     e = (code >> 1) & 3
     m = (code & 1).to(tl.float32)
-    pow2 = (1 << e).to(tl.float32) * 0.5  # e in 0..3 -> 0.5, 1, 2, 4 (int shift, no exp2)
+    pow2 = (1 << e).to(
+        tl.float32
+    ) * 0.5  # e in 0..3 -> 0.5, 1, 2, 4 (int shift, no exp2)
     mag = tl.where(e == 0, 0.5 * m, (1.0 + 0.5 * m) * pow2)
     return (1.0 - 2.0 * s.to(tl.float32)) * mag
 
@@ -1083,6 +1112,78 @@ def mxfp4_e2m1_to_e4m3(b_packed):
     # interleave along the K (row) dim via trans -> interleave-last-dim -> trans back
     unpacked = tl.trans(tl.interleave(tl.trans(lo), tl.trans(hi)))
     return unpacked.to(tl.float8e4nv)
+
+
+def _quant_block_k_pruner(configs, named_args, **kwargs):
+    """Keep configs whose BLOCK_K divides K (the quant grid is K // BLOCK_K programs per row;
+    K is always a multiple of 32, so the BLOCK_K=32 configs guarantee a non-empty list)."""
+    k = {**named_args, **kwargs}["K"]
+    return [c for c in configs if k % c.kwargs["BLOCK_K"] == 0]
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_K": bk}, num_warps=w)
+        for bk in (32, 64, 128, 256, 512, 1024)
+        for w in (2, 4, 8)
+    ],
+    # t_bucket (log2 of the token count) is in the key: the grid is (T, K // BLOCK_K), so at
+    # small T the block size is the only parallelism lever while at prefill scale it isn't —
+    # same bucketing as the grouped kernels' tokens_per_sm_bit_length (raw T would retune per
+    # unique token count).
+    key=["K", "t_bucket"],
+    prune_configs_by={"early_config_prune": _quant_block_k_pruner},
+)
+@triton.jit
+def _mxfp_act_quant_kernel(
+    X,
+    Y,
+    S,
+    stride_x_t,
+    stride_x_k,
+    t_bucket,  # autotune key only (log2 token-count bucket); unused in body
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+):
+    """One-pass MX activation quant: bf16 rows → E4M3 + UE8M0 group-32 scales. Grid
+    ``(T, K // BLOCK_K)``; group boundaries are identical to the kernels' inline quant
+    (32 | BLOCK_K | K), so consumers are bit-exact with the inline form. Arbitrary input
+    strides (no host-side copy); Triton's ==1 specialization keeps the contiguous fast path."""
+    t = tl.program_id(0).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    x = tl.load(X + t * stride_x_t + offs * stride_x_k)[None, :].to(tl.float32)
+    y, s = mxfp_act_quant_inline(x, 1, BLOCK_K, SCALE_GROUP_K)
+    tl.store(Y + t * K + offs, tl.reshape(y, (BLOCK_K,)))
+    sg = tl.program_id(1) * (BLOCK_K // SCALE_GROUP_K) + tl.arange(
+        0, BLOCK_K // SCALE_GROUP_K
+    )
+    tl.store(
+        S + t * (K // SCALE_GROUP_K) + sg, tl.reshape(s, (BLOCK_K // SCALE_GROUP_K,))
+    )
+
+
+def mxfp_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``(T, K)`` activations to MX once (E4M3 values + UE8M0 group-32 uint8 scales)
+    instead of inline per weight-tile — the fused gate_up re-ran the inline quant per N-tile
+    (16x redundant amax/convert ALU + 2x act bytes), which held it at ~380 TFLOPS while the
+    pre-quantized down kernel ran at ~1080. One pass costs ~50µs at 8k tokens. Bit-exact with
+    the inline form (same group boundaries)."""
+    T, K = x.shape
+    y = torch.empty(T, K, device=x.device, dtype=FP8_DTYPE)
+    s = torch.empty(T, K // MX_SCALE_GROUP_K, device=x.device, dtype=torch.uint8)
+    with device_context(x.device):
+        _mxfp_act_quant_kernel[lambda META: (T, K // META["BLOCK_K"])](
+            x,
+            y,
+            s,
+            x.stride(0),
+            x.stride(1),
+            T.bit_length(),
+            K=K,
+            SCALE_GROUP_K=MX_SCALE_GROUP_K,
+        )
+    return y, s
 
 
 # ── fp8_act_quant kernel (used by tensor-mode FP8 wrappers) ───────────────────

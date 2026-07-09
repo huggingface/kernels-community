@@ -40,6 +40,7 @@ from .utils import (
     decode_ue8m0_scale,
     device_context,
     sm_count,
+    tl_dtype,
     fp8_act_quant_inline,
     topk_reduce_kernel,
     TOPK_REDUCE_BLOCK_H,
@@ -47,6 +48,7 @@ from .utils import (
     get_mxfp_autotuning_configs,
     is_mxfp,
     is_mxfp4,
+    mxfp_act_quant,
     mxfp_act_quant_inline,
     mx_compute,
     smem_config_pruner,
@@ -349,8 +351,8 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
             ACT_FN,
             SWIGLU_ALPHA,
             SWIGLU_LIMIT,
-            Hidden.dtype.element_ty,
             SIMULATE_UNFUSED,
+            Hidden.dtype.element_ty,
         )
         inter, inter_s = fp8_act_quant_inline(
             intermediate
@@ -629,16 +631,17 @@ def _set_gate_up_descriptor(nargs):
     # winner is only valid for its own recipe.
     ["INTERMEDIATE_DIM", "HIDDEN_DIM", "tokens_per_sm_bit_length", "VALUES_PER_BYTE"],
     n_trials=100,
-    # bf16 activation tile + fused gate|up weight tiles
+    # fp8 pre-quantized activation tile + fused gate|up weight tiles
     prune_configs_by={
         "early_config_prune": smem_config_pruner(
-            act_bytes=2, n_weight_tiles=2, reduction_dim="HIDDEN_DIM", double_mma=True
+            act_bytes=1, n_weight_tiles=2, reduction_dim="HIDDEN_DIM", double_mma=True
         )
     },
 )
 @triton.jit
 def mxfp_dynamic_moe_grouped_gate_up_kernel(
-    Hidden,  # (T, H) raw activations, UNSORTED
+    Hidden,  # (T, H) E4M3 activations (pre-quantized once by the wrapper), UNSORTED
+    HiddenScale,  # (T, H//32) UE8M0 group-32 activation scales
     PermToken,  # (S,) int32 — sorted position -> source token id
     GateUp,  # (E, 2I, H//VALUES_PER_BYTE) MXFP4/MXFP8
     GateUpScale,  # (E, 2I, H//32) UE8M0 group-32 scales
@@ -648,6 +651,7 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
     InterScale,  # (S, I//32) UE8M0 group-32 scales
     stride_h_t,
     stride_h_k,
+    stride_hs_t,
     stride_gu_e,
     stride_gu_n,
     stride_gu_k,
@@ -675,6 +679,7 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
+    INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
 ):
     """MXFP4/MXFP8 phase 1 (persistent): gather hidden rows per expert M-tile, gate + up MX
     matmuls (``tl.dot_scaled`` or fp8 ``tl.dot`` + per-group rescale), SiLU, MXFP8-requant."""
@@ -698,6 +703,11 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
         expert_id64 = expert_id.to(tl.int64)
         token = tl.load(PermToken + offs_global_m * stride_pt, mask=row_mask, other=0)
         a_ptrs = Hidden + token[:, None] * stride_h_t + offs_k[None, :] * stride_h_k
+        as_ptrs = (
+            HiddenScale
+            + token[:, None] * stride_hs_t
+            + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, :]
+        )
         n_off = pid_n * BLOCK_SIZE_N
 
         # Load gate (row 2e) + up (row 2e+1) of the (2E, I, H) view as ONE combined tile and
@@ -738,10 +748,9 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
         )
         acc = tl.zeros((BLOCK_SIZE_M, 2 * BLOCK_SIZE_N), dtype=tl.float32)
         for k_off in tl.range(0, HIDDEN_DIM, BLOCK_SIZE_K):
-            a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
-            a, a_scale = mxfp_act_quant_inline(
-                a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
-            )
+            a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
+            a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0)
+            as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
             if MEMORY_MODE == "host_descriptor":
                 gu = tl.reshape(
                     GateUpDescriptor.load([gu_row, n_off, k_off // VALUES_PER_BYTE]),
@@ -788,8 +797,8 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
             ACT_FN,
             SWIGLU_ALPHA,
             SWIGLU_LIMIT,
-            Hidden.dtype.element_ty,
             SIMULATE_UNFUSED,
+            INTERMEDIATE_DTYPE,
         )
 
         # MXFP8 requant of the intermediate (E4M3 + UE8M0 group-32 along this N-tile).
@@ -1021,6 +1030,10 @@ def mxfp_dynamic_moe_grouped(
     down_proj_u8 = e2m1_as_uint8(down_proj)
     gate_up_scale_u8 = ue8m0_as_uint8(gate_up_proj_scale)
     down_scale_u8 = ue8m0_as_uint8(down_proj_scale)
+    # One-pass MX pre-quant of the activations: the gate_up kernel used to re-run the inline
+    # quant per N-tile (16x redundant ALU + 2x act bytes) — it held gate_up at ~380 TFLOPS
+    # while the pre-quantized down kernel ran ~1080. Bit-exact (same group-32 boundaries).
+    hidden_q, hidden_scale = mxfp_act_quant(hidden_states)
 
     inter = torch.empty(
         num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=FP8_DTYPE
@@ -1052,7 +1065,8 @@ def mxfp_dynamic_moe_grouped(
     down_descriptor = TensorDescriptor.from_tensor(down_eh, [32, 32 // VALUES_PER_BYTE])
     with device_context(device):
         mxfp_dynamic_moe_grouped_gate_up_kernel[(num_sms,)](
-            hidden_states,
+            hidden_q,
+            hidden_scale,
             perm_token,
             gate_up_proj_u8,
             gate_up_scale_u8,
@@ -1060,8 +1074,9 @@ def mxfp_dynamic_moe_grouped(
             expert_start,
             inter,
             inter_scale,
-            hidden_states.stride(0),
-            hidden_states.stride(1),
+            hidden_q.stride(0),
+            hidden_q.stride(1),
+            hidden_scale.stride(0),
             gate_up_proj_u8.stride(0),
             gate_up_proj_u8.stride(1),
             gate_up_proj_u8.stride(2),
@@ -1084,6 +1099,9 @@ def mxfp_dynamic_moe_grouped(
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
+            # the dtype the UNFUSED path lands the GLU intermediate in (the model's
+            # activation dtype) — the kernel can't read it off the fp8 activations
+            INTERMEDIATE_DTYPE=tl_dtype(hidden_states.dtype),
         )
         mxfp_dynamic_moe_grouped_down_kernel[(num_sms,)](
             inter,

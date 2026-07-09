@@ -184,8 +184,8 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
         ACT_FN,
         SWIGLU_ALPHA,
         SWIGLU_LIMIT,
-        HiddenStates.dtype.element_ty,
         SIMULATE_UNFUSED,
+        HiddenStates.dtype.element_ty,
     )
 
     # Requant the intermediate to FP8 — the same inline per-row act quant as the inputs;
@@ -580,8 +580,8 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
         ACT_FN,
         SWIGLU_ALPHA,
         SWIGLU_LIMIT,
-        HiddenStates.dtype.element_ty,
         SIMULATE_UNFUSED,
+        HiddenStates.dtype.element_ty,
     )
 
     # MXFP8 requant of the intermediate (E4M3 + UE8M0 group-32 along this N-tile).
