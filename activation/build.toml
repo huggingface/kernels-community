@@ -1,11 +1,13 @@
 [general]
 name = "activation"
 version = 1
+edition = 5
 license = "Apache-2.0"
 backends = [
     "cuda",
     "metal",
     "cpu",
+    "rocm",
 ]
 
 [general.hub]
@@ -16,6 +18,10 @@ src = [
     "torch-ext/torch_binding.cpp",
     "torch-ext/torch_binding.h",
 ]
+
+[torch.stable-abi]
+cuda = "2.10"
+rocm = "2.10"
 
 [kernel.activation_metal]
 backend = "metal"
@@ -28,6 +34,26 @@ src = [
 [kernel.activation]
 backend = "cuda"
 depends = ["torch"]
+src = [
+    "activation/activation_kernels.cu",
+    "activation/cuda_compat.h",
+    "activation/dispatch_utils.h",
+]
+
+[kernel.activation_rocm]
+backend = "rocm"
+depends = ["torch"]
+rocm-archs = [
+    "gfx906",
+    "gfx908",
+    "gfx90a",
+    "gfx940",
+    "gfx941",
+    "gfx942",
+    "gfx1030",
+    "gfx1100",
+    "gfx1101",
+]
 src = [
     "activation/activation_kernels.cu",
     "activation/cuda_compat.h",
