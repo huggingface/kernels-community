@@ -1,6 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Type, Union, Optional
+from typing import Literal, Type, Union, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -40,6 +40,38 @@ def make_smem_layout(
 
 # For compatibility with blackwell_helpers.py
 make_smem_layout_epi = make_smem_layout
+
+
+def make_tiled_mma(
+    a_dtype: Type[Numeric],
+    a_major: Literal["K", "MN"],
+    b_major: Literal["K", "MN"],
+    tiler_n: int,
+    source: Literal["SS", "RS"] = "SS",
+    atom_layout_mnk: tuple = (1, 1, 1),
+    swap_AB: bool = False,
+    b_dtype: Optional[Type[Numeric]] = None,
+    acc_dtype: Type[Numeric] = Float32,
+) -> cute.TiledMma:
+    """`b_dtype` defaults to `a_dtype`; pass it for mixed-precision MMAs (e.g. fp8).
+    `acc_dtype` defaults to Float32."""
+    if b_dtype is None:
+        b_dtype = a_dtype
+    mode = {"K": cute.nvgpu.OperandMajorMode.K, "MN": cute.nvgpu.OperandMajorMode.MN}
+    a_mode, b_mode = mode[a_major], mode[b_major]
+    if swap_AB:
+        a_mode, b_mode = b_mode, a_mode
+    a_source = warpgroup.OperandSource.RMEM if source == "RS" else warpgroup.OperandSource.SMEM
+    return sm90_utils_og.make_trivial_tiled_mma(
+        a_dtype,
+        b_dtype,
+        a_mode,
+        b_mode,
+        acc_dtype,
+        atom_layout_mnk=atom_layout_mnk,
+        tiler_mn=(64, tiler_n),
+        a_source=a_source,
+    )
 
 
 @dsl_user_op

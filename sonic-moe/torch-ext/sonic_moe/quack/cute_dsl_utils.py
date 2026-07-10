@@ -63,8 +63,23 @@ torch2cute_dtype_map = {
 
 
 @lru_cache
-def get_max_active_clusters(cluster_size):
-    return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
+def get_device_multiprocessor_count(device_id: int = 0) -> int:
+    return cutlass.utils.HardwareInfo(device_id).get_device_multiprocessor_count()
+
+
+@lru_cache
+def get_max_active_clusters(
+    cluster_size: int,
+    device_capacity: Tuple[int, int] | None = None,
+    device_id: int = 0,
+) -> int:
+    if device_capacity is None:
+        device_capacity = get_device_capacity()
+    if device_capacity[0] < 9:
+        if cluster_size != 1:
+            raise ValueError("SM8x kernels do not support CTA clusters; cluster_size must be 1")
+        return get_device_multiprocessor_count(device_id)
+    return cutlass.utils.HardwareInfo(device_id).get_max_active_clusters(cluster_size=cluster_size)
 
 
 def _parse_arch_str(arch_str: str) -> Tuple[int, int]:

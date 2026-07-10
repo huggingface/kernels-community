@@ -188,9 +188,14 @@ def compile_gemm_kernel(
     has_trace_ptr=False,
     use_tma_gather=False,
     concat_layout=None,
+    num_warps=None,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
-    if device_capacity[0] in [9, 12]:
+    if device_capacity[0] == 8:
+        sm8x_kwargs = {"is_persistent": persistent, "num_warps": num_warps}
+        sm8x_kwargs["arch"] = device_capacity[0] * 10 + device_capacity[1]
+        GemmCls = partial(GemmCls, **sm8x_kwargs)
+    elif device_capacity[0] in [9, 12]:
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
     elif device_capacity[0] in [10, 11]:
         GemmCls = partial(
@@ -209,7 +214,7 @@ def compile_gemm_kernel(
     if post_init:
         post_init(gemm_obj)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    sf_args = () if device_capacity[0] in (9, 12) else (mSFA, mSFB)
+    sf_args = () if device_capacity[0] in (8, 9, 12) else (mSFA, mSFB)
     # Trace pointer: Optional[Int64]. Compile with Int64(0) when tracing is
     # requested, None otherwise. TVM-FFI caches each variant separately.
     trace_ptr = Int64(0) if has_trace_ptr else None

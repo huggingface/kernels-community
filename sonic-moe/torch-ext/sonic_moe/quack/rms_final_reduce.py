@@ -20,8 +20,9 @@ from . import copy_utils as copy_utils
 from .compile_utils import make_fake_tensor as fake_tensor
 from .reduce import row_reduce
 from .reduction_base import ReductionBase
-from .cache_utils import jit_cache
+from .cache import jit_cache
 from .cute_dsl_utils import torch2cute_dtype_map
+from .dsl import cute_op
 
 
 class RmsFinalReduce(ReductionBase):
@@ -135,7 +136,7 @@ def _compile_rms_final_reduce(dtype, N):
     )
 
 
-@torch.library.custom_op(
+@cute_op(
     add_op_namespace_prefix("rms_final_reduce_out"),
     mutates_args=("rstd",),
     device_types="cuda",
@@ -153,15 +154,6 @@ def _rms_final_reduce_out(
     compiled_fn(x, rstd, scale, eps)
 
 
-@_rms_final_reduce_out.register_fake
-def _rms_final_reduce_out_fake(x, rstd, scale, eps):
-    from .cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(x.shape[0], torch.SymInt):
-        x_dtype = torch2cute_dtype_map[x.dtype]
-        _compile_rms_final_reduce(x_dtype, x.shape[1])
-
-
 def rms_final_reduce(
     x: Tensor,  # (M, N) partial squared sums
     scale: float,  # typically 1.0 / total_columns
@@ -171,11 +163,11 @@ def rms_final_reduce(
     assert x.ndim == 2
     M = x.shape[0]
     rstd = torch.empty(M, dtype=torch.float32, device=x.device)
-
-    from .cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY:
-        return rstd
-
+    # Dispatch unconditionally through the cute_op so register_fake fires under
+    # --compile-only / FakeTensorMode and populates the .o cache. The cute_op's
+    # register_fake handles the COMPILE_ONLY short-circuit internally AFTER
+    # invoking _compile_rms_final_reduce (which is what we want cached).
+    # jit_cache returns _noop_kernel under COMPILE_ONLY so the launch in
+    # _rms_final_reduce_out is a no-op without us gating it here.
     _rms_final_reduce_out(x, rstd, scale, eps)
     return rstd

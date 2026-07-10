@@ -317,3 +317,18 @@ def issue_clc_query_nomulticast(
         loc=loc,
         ip=ip,
     )
+
+
+@dsl_user_op
+def domain_offset_aligned(
+    coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None
+) -> cute.Tensor:
+    assert isinstance(tensor.iterator, cute.Pointer)
+    # We assume that applying the offset does not change the pointer alignment
+    new_ptr = cute.make_ptr(
+        tensor.element_type,
+        elem_pointer(tensor, coord).toint(),
+        tensor.memspace,
+        assumed_align=tensor.iterator.alignment,
+    )
+    return cute.make_tensor(new_ptr, tensor.layout)

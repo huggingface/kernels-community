@@ -1,4 +1,4 @@
-from typing import Tuple, Optional, Callable
+from typing import Dict, Tuple, Optional, Callable
 
 from torch import Tensor
 
@@ -11,6 +11,7 @@ from .compile_utils import make_fake_tensor as fake_tensor
 from .cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
 from .activation import act_fn_map
 from .gemm_act import GemmActMixin
+from .gemm_sm80 import GemmSm80
 from .gemm_sm90 import GemmSm90
 from .gemm_sm100 import GemmSm100
 from .gemm_sm120 import GemmSm120
@@ -23,11 +24,11 @@ from .gemm_tvm_ffi_utils import (
     make_fake_scheduler_args,
     compile_gemm_kernel,
 )
-from .cache_utils import jit_cache
+from .cache import jit_cache
 from .tile_scheduler import TriangularTileScheduler
 from .varlen_utils import VarlenManager
 from . import copy_utils as copy_utils
-from .rounding import RoundingMode
+from .rounding import RoundingMode, epilogue_sr_seed
 
 
 class GemmSymmetricMixin(GemmActMixin):
@@ -38,11 +39,11 @@ class GemmSymmetricMixin(GemmActMixin):
     def epilogue(
         self,
         params: GemmActMixin.EpilogueParams,
-        epi_smem_tensors: Tuple[cute.Tensor, ...],
-        epi_pipeline: cutlass.pipeline.PipelineAsync,
-        epi_store_pipeline: cutlass.pipeline.PipelineAsync,
-        epi_read_state: cutlass.pipeline.PipelineState,
-        epi_producer_state: cutlass.pipeline.PipelineState,
+        epi_smem_tensors: Dict[str, cute.Tensor],
+        epi_pipeline: Optional[cutlass.pipeline.PipelineAsync],
+        epi_store_pipeline: Optional[cutlass.pipeline.PipelineAsync],
+        epi_read_state: Optional[cutlass.pipeline.PipelineState],
+        epi_producer_state: Optional[cutlass.pipeline.PipelineState],
         epi_tile: cute.Tile,
         load_acc_subtile: Callable,
         tRS_rD: cute.Tensor,
@@ -50,7 +51,7 @@ class GemmSymmetricMixin(GemmActMixin):
         tiled_copy_t2r: Optional[cute.TiledCopy],  # Only for Sm100
         tiled_copy_r2s: cute.TiledCopy,
         tRS_sD: cute.Tensor,
-        tiled_copy_s2r: Optional[cute.TiledCopy],
+        tiled_copy_s2r: Optional[cute.ThrCopy],
         tSR_rC: Optional[cute.Tensor],
         tSR_sC: Optional[cute.Tensor],
         copy_D: Optional[Callable],
@@ -63,9 +64,19 @@ class GemmSymmetricMixin(GemmActMixin):
         is_tma_warp: Boolean,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         has_C = const_expr(tRS_rC is not None)
+        has_epi_load = const_expr(self.epi_c_stage > 0)
         has_D = const_expr(copy_D is not None)
+        use_tma_epi = const_expr(epi_store_pipeline is not None)
+        use_tma_c = const_expr(epi_pipeline is not None)
+        inline_epi_load = const_expr(copy_C is not None)
+        use_stochastic_rounding = const_expr(
+            self.rounding_mode == RoundingMode.RS
+            and self.acc_dtype == cutlass.Float32
+            and self.d_dtype == cutlass.BFloat16
+        )
 
-        tiled_copy_postact_r2s, tRS_sPostAct, copy_postact = self.epi_setup_postact(
+        # Setup aux output (returns None for default epilogue, context tuple for Act)
+        aux_out_ctx = self.epi_setup_aux_out(
             params,
             epi_smem_tensors,
             tiled_copy_r2s,
@@ -75,13 +86,19 @@ class GemmSymmetricMixin(GemmActMixin):
             tidx,
         )
 
-        # We iterate over epi tiles in the N dimension first before the M dimension
         epi_tile_shape = cute.zipped_divide(
             cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
         ).shape[1]
-        epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
+        epi_tile_layout = cute.make_ordered_layout(
+            epi_tile_shape, order=(0, 1) if const_expr(self.epi_m_major) else (1, 0)
+        )
         epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
+
+        # Symmetric guard: skip the mirrored aux write on the diagonal,
+        # otherwise we'd write the same gmem location twice.
+        square_tile_m = tile_coord_mnkl[0] // self.cluster_shape_mnk[0]
+        square_tile_n = tile_coord_mnkl[1] // self.cluster_shape_mnk[1]
 
         epi_tensors = self.epi_begin(
             params,
@@ -93,95 +110,127 @@ class GemmSymmetricMixin(GemmActMixin):
             varlen_manager,
             epilogue_barrier,
             tidx,
+            tRS_rD.layout,
         )
 
-        if const_expr(copy_C is not None):
+        if const_expr(inline_epi_load):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
-                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
-                if is_tma_warp:
-                    epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
-                    epi_pipeline.producer_commit(epi_producer_state)
-                epi_producer_state.advance()
+                epi_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
+                if const_expr(use_tma_c):
+                    if is_tma_warp:
+                        epi_pipeline.producer_acquire(epi_producer_state)
+                        copy_C(src_idx=epi_coord_C, producer_state=epi_producer_state)
+                        epi_pipeline.producer_commit(epi_producer_state)
+                    epi_producer_state.advance()
+                else:
+                    # TODO: turn this to cp.async instead of direct G2R copy
+                    copy_C(src_idx=epi_coord_C, dst_idx=epi_idx % self.epi_c_stage)
+            if const_expr(use_tma_c):
+                epilogue_barrier.arrive_and_wait()
 
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
-            # The global memory coordinate for the current epi tile
-            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
+            epi_coord = epi_tile_layout.get_hier_coord(epi_idx)  # (epi_m, epi_n)
             # Copy from acc to D registers
-            load_acc_subtile(tRS_rD, epi_idx)
-            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, gmem_coord)
-            if const_expr(has_C):
-                epi_pipeline.consumer_wait(epi_read_state)
-                cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC)
-                # Fence to make sure shared memory read is visible to TMA load
-                cute.arch.fence_view_async_shared()
-                cute.arch.sync_warp()
-                with cute.arch.elect_one():
-                    epi_pipeline.consumer_release(epi_read_state)
-                epi_read_state.advance()
-            if const_expr(copy_C is not None and epi_idx + self.epi_c_stage < epi_tile_num):
-                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
-                if is_tma_warp:
-                    epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
-                    epi_pipeline.producer_commit(epi_producer_state)
-                epi_producer_state.advance()
-            tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
-            tRS_rPostAct_out = self.epi_convert_postact(
-                tRS_rPostAct,
-                epi_loop_tensors["sr_seed"],
-                tidx,
+            load_acc_subtile(tRS_rD, epi_coord)
+            if const_expr(has_epi_load):
+                if const_expr(use_tma_c):
+                    epi_pipeline.consumer_wait(epi_read_state)
+                    if const_expr(has_C):
+                        cute.copy(
+                            tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC
+                        )
+                    self.epi_tile_load_s2r(params, epi_tensors, epi_read_state.index)
+                    cute.arch.fence_view_async_shared()
+                    cute.arch.sync_warp()
+                    with cute.arch.elect_one():
+                        epi_pipeline.consumer_release(epi_read_state)
+                    epi_read_state.advance()
+                else:
+                    c_buffer = epi_idx % self.epi_c_stage
+                    cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, c_buffer], tSR_rC)
+                    # TODO: cp.async wait once we switch to cp.async
+                    epilogue_barrier.arrive_and_wait()
+            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, epi_coord)
+            if const_expr(inline_epi_load and epi_idx + self.epi_c_stage < epi_tile_num):
+                epi_coord_C = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
+                if const_expr(use_tma_c):
+                    if is_tma_warp:
+                        epi_pipeline.producer_acquire(epi_producer_state)
+                        copy_C(src_idx=epi_coord_C, producer_state=epi_producer_state)
+                        epi_pipeline.producer_commit(epi_producer_state)
+                    epi_producer_state.advance()
+                else:
+                    epilogue_barrier.arrive_and_wait()
+                    copy_C(
+                        src_idx=epi_coord_C,
+                        dst_idx=(epi_idx + self.epi_c_stage) % self.epi_c_stage,
+                    )
+            tRS_rAuxOut = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            self.epi_end_loop(
+                params,
+                epi_tensors,
+                epi_coord,
+                epi_tile,
+                tiled_copy_t2r,
+                tiled_copy_r2s,
                 tile_coord_mnkl,
-                num_prev_subtiles,
-                epi_idx,
+                varlen_manager,
+                tidx,
             )
-            if is_tma_warp:
-                epi_store_pipeline.producer_acquire()
-            epilogue_barrier.arrive_and_wait()
-            # Copy from D registers to shared memory
+            if const_expr(aux_out_ctx is not None):
+                tRS_rAuxOut_out = self.epi_convert_aux_out(
+                    tRS_rAuxOut,
+                    epi_loop_tensors.get("sr_seed"),
+                    tidx,
+                    tile_coord_mnkl,
+                    num_prev_subtiles,
+                    epi_idx,
+                )
+            if const_expr(use_tma_epi):
+                if is_tma_warp:
+                    epi_store_pipeline.producer_acquire()
+            else:
+                epilogue_barrier.arrive_and_wait()
+            if const_expr(use_tma_epi):
+                epilogue_barrier.arrive_and_wait()
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(has_D):
-                if const_expr(
-                    self.rounding_mode == RoundingMode.RS
-                    and self.acc_dtype == cutlass.Float32
-                    and self.d_dtype == cutlass.BFloat16
-                ):
-                    seed = epi_loop_tensors["sr_seed"] + (
-                        tile_coord_mnkl[0] * 65537
-                        + tile_coord_mnkl[1] * 257
-                        + tile_coord_mnkl[3] * 17
-                        + (num_prev_subtiles + epi_idx) * 7
+                tRS_sD_cur = tRS_sD[None, None, None, epi_buffer]
+                if const_expr(use_stochastic_rounding):
+                    seed = epilogue_sr_seed(
+                        epi_loop_tensors.get("sr_seed"),
+                        tile_coord_mnkl,
+                        num_prev_subtiles + epi_idx,
                     )
-                    copy_utils.sr_cvt_copy(
-                        tiled_copy_r2s,
-                        tRS_rD,
-                        tRS_sD[None, None, None, epi_buffer],
-                        seed,
-                        tidx,
-                    )
+                    copy_utils.sr_cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur, seed, tidx)
                 else:
-                    copy_utils.cvt_copy(
-                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer]
-                    )
-            cute.copy(
-                tiled_copy_postact_r2s,
-                tiled_copy_postact_r2s.retile(tRS_rPostAct_out),
-                tRS_sPostAct[None, None, None, epi_buffer],
-            )
-            pid_m = tile_coord_mnkl[0]
-            pid_n = tile_coord_mnkl[1]
-            # Fence and barrier to make sure shared memory store is visible to TMA store
-            cute.arch.fence_view_async_shared()
-            epilogue_barrier.arrive_and_wait()
-            # Copy from shared memory to global memory
-            if is_tma_warp:
-                square_tile_m = pid_m // self.cluster_shape_mnk[0]
-                square_tile_n = pid_n // self.cluster_shape_mnk[1]
+                    copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sD_cur)
+            if const_expr(aux_out_ctx is not None):
+                tiled_copy_aux_out_r2s, tRS_sAuxOut, copy_aux_out = aux_out_ctx
+                cute.copy(
+                    tiled_copy_aux_out_r2s,
+                    # Need contiguous for Sm80 and Sm120 where acc layout is ((2, 2), MMA_M, MMA_N)
+                    copy_utils.contiguous(tiled_copy_aux_out_r2s.retile(tRS_rAuxOut_out)),
+                    tRS_sAuxOut[None, None, None, epi_buffer],
+                )
+            if const_expr(use_tma_epi):
+                cute.arch.fence_view_async_shared()
+                epilogue_barrier.arrive_and_wait()
+                if is_tma_warp:
+                    if const_expr(has_D):
+                        copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
+                    if const_expr(aux_out_ctx is not None):
+                        if square_tile_m != square_tile_n:  # don't write twice on the diagonal
+                            copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                    epi_store_pipeline.producer_commit()
+            else:
+                epilogue_barrier.arrive_and_wait()
                 if const_expr(has_D):
-                    copy_D(src_idx=epi_buffer, dst_idx=gmem_coord)
-                if square_tile_m != square_tile_n:  # don't write twice to the same tile
-                    copy_postact(src_idx=epi_buffer, dst_idx=gmem_coord)
-                epi_store_pipeline.producer_commit()
+                    copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
+                if const_expr(aux_out_ctx is not None):
+                    if square_tile_m != square_tile_n:  # don't write twice on the diagonal
+                        copy_aux_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                epilogue_barrier.arrive_and_wait()
 
         self.epi_end(
             params,
@@ -195,6 +244,10 @@ class GemmSymmetricMixin(GemmActMixin):
         )
 
         return epi_read_state, epi_producer_state
+
+
+class GemmSymmetricSm80(GemmSymmetricMixin, GemmSm80):
+    pass
 
 
 class GemmSymmetricSm90(GemmSymmetricMixin, GemmSm90):
@@ -231,6 +284,7 @@ def _compile_gemm_symmetric(
     device_capacity,
 ):
     sm_to_cls = {
+        8: GemmSymmetricSm80,
         9: GemmSymmetricSm90,
         10: GemmSymmetricSm100,
         11: GemmSymmetricSm100,
@@ -252,7 +306,7 @@ def _compile_gemm_symmetric(
     # PostAct = D.mT, so it has the opposite major from D (m↔n swapped)
     div_pa = div_for_dtype(postact_dtype)
     postact_leading = 1 if postact_major == "n" else 0
-    mPostAct = fake_tensor(
+    mAuxOut = fake_tensor(
         postact_dtype, (m, m, l), leading_dim=postact_leading, divisibility=div_pa
     )
 
@@ -267,7 +321,7 @@ def _compile_gemm_symmetric(
     activation = None  # identity
     act_fn = act_fn_map[activation]
     epi_args = GemmCls.EpilogueArguments(
-        mPostAct,
+        mAuxOut,
         act_fn,
         alpha=fake_scalar(alpha_mode),
         beta=fake_scalar(beta_mode),
@@ -306,6 +360,7 @@ def gemm_symmetric(
     tile_N: int,
     cluster_M: int,
     cluster_N: int,
+    tile_K: int | None = None,
     pingpong: bool = False,
     persistent: bool = True,
     is_dynamic_persistent: bool = False,
@@ -325,14 +380,16 @@ def gemm_symmetric(
     postact_major = "n" if PostAct_p.stride(1) == 1 else "m"
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
+    assert device_capacity[0] in [8, 9, 10, 11, 12], (
+        "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
+    )
 
-    if is_dynamic_persistent and device_capacity[0] == 9:
+    if is_dynamic_persistent and device_capacity[0] <= 9:
         assert tile_count_semaphore is not None, (
             "Dynamic persistent tile scheduler in SM90 requires a semaphore in GMEM"
         )
 
-    tile_shape_mn = (tile_M, tile_N)
+    tile_shape_mn = (tile_M, tile_N, tile_K) if tile_K is not None else (tile_M, tile_N)
     cluster_shape_mnk = (cluster_M, cluster_N, 1)
     alpha_mode = 2 if isinstance(alpha, Tensor) else (1 if alpha != 1.0 else 0)
     beta_mode = 2 if isinstance(beta, Tensor) else (1 if beta != 1.0 else 0)
@@ -358,12 +415,15 @@ def gemm_symmetric(
         device_capacity,
     )
 
-    from .cache_utils import COMPILE_ONLY
+    from .cache import is_compile_only
 
-    if COMPILE_ONLY:
+    if is_compile_only():
         return
 
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+    cluster_size = cluster_M * cluster_N
+    max_active_clusters = (
+        get_max_active_clusters(cluster_size, device_capacity=device_capacity) if persistent else 0
+    )
 
     def scalar_arg(scalar, mode):
         if mode == 0:

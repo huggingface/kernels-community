@@ -230,15 +230,16 @@ def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
         )
     else:  # Sm80
         # (4, MMA_M, MMA_N) -> (4, MMA_M, (2, MMA_N / 2))
+        assert acc_layout.shape[2] % 2 == 0
         l = cute.logical_divide(acc_layout, (None, None, 2))
         rA_mma_view = cute.make_layout(
             (
-                (l.shape[0], l.shape[2][0]),
+                (l.shape[0][0], l.shape[0][1], l.shape[2][0]),
                 l.shape[1],
                 l.shape[2][1],
             ),
             stride=(
-                (l.stride[0], l.stride[2][0]),
+                (l.stride[0][0], l.stride[0][1], l.stride[2][0]),
                 l.stride[1],
                 l.stride[2][1],
             ),

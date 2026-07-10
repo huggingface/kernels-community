@@ -10,6 +10,7 @@ instruction and is only supported on Blackwell (SM100+) GPUs.
 from enum import IntEnum
 
 import cutlass
+import cutlass.cute as cute
 from cutlass import Float32, Uint32
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import arith, llvm, vector
@@ -27,12 +28,54 @@ class RoundingMode(IntEnum):
     RS = 1
 
 
+# Odd strides used to derive distinct Philox counters across output tiles and subtiles.
+EPILOGUE_SR_SEED_M_STRIDE = 65537
+EPILOGUE_SR_SEED_N_STRIDE = 257
+EPILOGUE_SR_SEED_BATCH_STRIDE = 17
+EPILOGUE_SR_SEED_SUBTILE_STRIDE = 7
+EPILOGUE_SR_SEED_AUX_OUT_SALT = 0x9E3779B1
+
 PHILOX_N_ROUNDS_DEFAULT = 7
 
 PHILOX_ROUND_A = 0xD2511F53
 PHILOX_ROUND_B = 0xCD9E8D57
 PHILOX_KEY_A = 0x9E3779B9
 PHILOX_KEY_B = 0xBB67AE85
+
+
+@dsl_user_op
+def epilogue_sr_seed(
+    base_seed: Int32,
+    tile_coord_mnkl: cute.Coord,
+    subtile_idx,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    return base_seed + (
+        tile_coord_mnkl[0] * EPILOGUE_SR_SEED_M_STRIDE
+        + tile_coord_mnkl[1] * EPILOGUE_SR_SEED_N_STRIDE
+        + tile_coord_mnkl[3] * EPILOGUE_SR_SEED_BATCH_STRIDE
+        + subtile_idx * EPILOGUE_SR_SEED_SUBTILE_STRIDE
+    )
+
+
+@dsl_user_op
+def epilogue_aux_out_sr_seed(
+    base_seed: Int32,
+    tile_coord_mnkl: cute.Coord,
+    subtile_idx,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    return epilogue_sr_seed(
+        base_seed + EPILOGUE_SR_SEED_AUX_OUT_SALT,
+        tile_coord_mnkl,
+        subtile_idx,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op

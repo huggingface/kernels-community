@@ -8,6 +8,7 @@ from cutlass import Int32, Float32, const_expr
 from .cute_dsl_utils import mlir_namedtuple
 from .epi_composable import ComposableEpiMixin
 from .epi_ops import Scalar, RowVecLoad, ColVecLoad
+from .gemm_sm80 import GemmSm80
 from .gemm_sm90 import GemmSm90
 from .gemm_sm100 import GemmSm100
 from .gemm_sm120 import GemmSm120
@@ -41,7 +42,7 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         self.rounding_mode = args.rounding_mode
         d = self._epi_ops_to_params_dict(args)
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
-            if key in self.concat_layout and key in d and d[key] is not None:
+            if key in self.concat_layout and key in d:
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
         return self.EpilogueParams(**d)
 
@@ -53,10 +54,11 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
-        alpha = epi_loop_tensors["alpha"]
-        beta = epi_loop_tensors["beta"]
-        tDrRowVec = epi_loop_tensors["mRowVecBroadcast"]
-        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
+        # Use .get(): inactive ops are filtered out of epi_loop_tensors.
+        alpha = epi_loop_tensors.get("alpha")
+        beta = epi_loop_tensors.get("beta")
+        tDrRowVec = epi_loop_tensors.get("mRowVecBroadcast")
+        tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
         rD = tRS_rD.load()
         # Apply alpha scaling to accumulator if alpha is provided (not None)
         if const_expr(hasattr(params, "alpha") and params.alpha is not None):
@@ -79,25 +81,9 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
                 tRS_rD[i] += tDrColVec[i]
         return None
 
-    def epi_setup_postact(
-        self,
-        params,
-        epi_smem_tensors,
-        tiled_copy_r2s,
-        tiled_copy_t2r,
-        tile_coord_mnkl,
-        varlen_manager,
-        tidx,
-    ):
-        """Returns None — default epilogue has no postact output."""
-        return None
 
-    @cute.jit
-    def epi_convert_postact(
-        self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
-    ):
-        """Convert postact from acc_dtype to output dtype. Override for custom postprocessing."""
-        return tRS_rPostAct
+class GemmDefaultSm80(GemmDefaultEpiMixin, GemmSm80):
+    pass
 
 
 class GemmDefaultSm90(GemmDefaultEpiMixin, GemmSm90):

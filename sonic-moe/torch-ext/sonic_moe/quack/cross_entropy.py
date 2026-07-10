@@ -18,11 +18,12 @@ from . import utils as utils
 from . import copy_utils as copy_utils
 from . import layout_utils as layout_utils
 from .compile_utils import make_fake_tensor as fake_tensor
+from .dsl import cute_op
 from .reduce import row_reduce, online_softmax_reduce
 from .reduction_base import ReductionBase
-from .cache_utils import jit_cache
+from .cache import jit_cache
 from .cute_dsl_utils import torch2cute_dtype_map
-from cutlass.base_dsl import Arch
+from cutlass.base_dsl.arch import Arch
 
 
 class CrossEntropy(ReductionBase):
@@ -75,6 +76,7 @@ class CrossEntropy(ReductionBase):
         mLoss: cute.Tensor,  # (M,)
         mLSE: Optional[cute.Tensor],  # (M,)
         mdX: Optional[cute.Tensor],  # (M, N) - if provided, compute gradient
+        mWeight: Optional[cute.Tensor],
         ignore_index: Int32,  # Index to ignore in loss computation
         stream: cuda.CUstream,
     ):
@@ -97,6 +99,7 @@ class CrossEntropy(ReductionBase):
             mLoss,
             mLSE,
             mdX,
+            mWeight,
             ignore_index,
             tiler_mn,
             tiled_copy,
@@ -117,6 +120,7 @@ class CrossEntropy(ReductionBase):
         mLoss: cute.Tensor,  # (M,)
         mLSE: Optional[cute.Tensor],  # (M,)
         mdX: Optional[cute.Tensor],  # (M, N) - if provided, compute gradient
+        mWeight: Optional[cute.Tensor],
         ignore_index: Int32,  # Index to ignore in loss computation
         tiler_mn: cute.Shape,
         tiled_copy: cute.TiledCopy,
@@ -156,8 +160,16 @@ class CrossEntropy(ReductionBase):
 
         row = tXcX[0][0]
         target = Int32.zero
+        target_weight = Float32.zero
         if row < shape[0]:
             target = Int32(mTarget[row])
+            if const_expr(mWeight is not None):
+                # Gate on target != ignore_index: ignore_index may be negative
+                # (PyTorch default -100), and indexing mWeight at that offset is OOB.
+                if target != ignore_index:
+                    target_weight = Float32(mWeight[target])
+            else:
+                target_weight = 1.0
 
         if row < shape[0]:
             copy(tXgX, tXsX, is_async=True)
@@ -221,7 +233,7 @@ class CrossEntropy(ReductionBase):
         ):
             lse = max_x + cute.math.log(denom, fastmath=True)
             # Set loss to 0 if this index should be ignored, otherwise compute normally
-            loss_val = (lse - target_logit) if not should_ignore else Float32.zero
+            loss_val = target_weight * (lse - target_logit) if not should_ignore else Float32.zero
             mLoss[row] = mLoss.element_type(loss_val)
             if const_expr(mLSE is not None):
                 mLSE[row] = lse
@@ -248,46 +260,58 @@ class CrossEntropy(ReductionBase):
             if not should_ignore:
                 for i in cutlass.range(cute.size(tXrX), unroll_full=True):
                     tXrdX_f32[i] = tXrdX_f32[i] if tXcFull[i][1] != target else tXrdX_f32[i] - 1.0
+            if const_expr(mWeight is not None):
+                tXrdX_f32.store(tXrdX_f32.load() * target_weight)
             tXrdX.store(tXrdX_f32.load().to(tXrdX.element_type))
             if row < shape[0]:
                 copy(tXrdX, tXgdX)
 
-
-@jit_cache
-def _compile_cross_entropy_fwd(
-    dtype, target_dtype, target_logit_dtype, N, has_lse, has_dx, target_logit_ndim
-):
-    batch_sym = cute.sym_int()
-    div = math.gcd(128 // dtype.width, N)
-    x_cute = fake_tensor(dtype, (batch_sym, N), div)
-    dx_cute = fake_tensor(dtype, (batch_sym, N), div) if has_dx else None
-    target_cute = fake_tensor(target_dtype, (batch_sym,))
-    if target_logit_dtype is not None:
-        if target_logit_ndim == 2:
-            target_logit_cute = fake_tensor(target_logit_dtype, (batch_sym, cute.sym_int()), div)
+    @staticmethod
+    @jit_cache
+    def compile(
+        dtype,
+        target_dtype,
+        target_logit_dtype,
+        N,
+        has_lse,
+        has_dx,
+        weight_dtype,
+        target_logit_ndim,
+    ):
+        batch_sym = cute.sym_int()
+        div = math.gcd(128 // dtype.width, N)
+        x_cute = fake_tensor(dtype, (batch_sym, N), div)
+        dx_cute = fake_tensor(dtype, (batch_sym, N), div) if has_dx else None
+        target_cute = fake_tensor(target_dtype, (batch_sym,))
+        if target_logit_dtype is not None:
+            if target_logit_ndim == 2:
+                target_logit_cute = fake_tensor(
+                    target_logit_dtype, (batch_sym, cute.sym_int()), div
+                )
+            else:
+                target_logit_cute = fake_tensor(target_logit_dtype, (batch_sym,))
         else:
-            target_logit_cute = fake_tensor(target_logit_dtype, (batch_sym,))
-    else:
-        target_logit_cute = None
-    loss_cute = fake_tensor(Float32, (batch_sym,))
-    lse_cute = fake_tensor(Float32, (batch_sym,)) if has_lse else None
-    # If there's dx, it's faster to not use online softmax since we want the exp(x - max)
-    cross_entropy_op = CrossEntropy(dtype, N, online_softmax=not has_dx)
-    return cute.compile(
-        cross_entropy_op,
-        x_cute,
-        target_cute,
-        target_logit_cute,
-        loss_cute,
-        lse_cute,
-        dx_cute,
-        Int32(0),  # ignore_index, just for compilation
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
-    )
+            target_logit_cute = None
+        loss_cute = fake_tensor(Float32, (batch_sym,))
+        lse_cute = fake_tensor(Float32, (batch_sym,)) if has_lse else None
+        weight_cute = fake_tensor(weight_dtype, (N,)) if weight_dtype is not None else None
+        # If there's dx, it's faster to not use online softmax since we want the exp(x - max)
+        return cute.compile(
+            CrossEntropy(dtype, N, online_softmax=not has_dx),
+            x_cute,
+            target_cute,
+            target_logit_cute,
+            loss_cute,
+            lse_cute,
+            dx_cute,
+            weight_cute,
+            Int32(0),  # ignore_index, just for compilation
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
 
 
-@torch.library.custom_op(add_op_namespace_prefix("cross_entropy_fwd_out"), mutates_args={"loss", "lse", "dx"})
+@cute_op(add_op_namespace_prefix("cross_entropy_fwd_out"), mutates_args={"loss", "lse", "dx"})
 def cross_entropy_fwd_out(
     x: Tensor,
     target: Tensor,
@@ -295,6 +319,7 @@ def cross_entropy_fwd_out(
     loss: Tensor,
     lse: Optional[Tensor],
     dx: Optional[Tensor],
+    weight: Optional[Tensor],
     ignore_index: int = -100,
 ) -> None:
     """Cross entropy forward pass.
@@ -307,6 +332,7 @@ def cross_entropy_fwd_out(
         loss: Output loss tensor of shape (M,)
         lse: Optional output log-sum-exp tensor of shape (M,)
         dx: Optional output gradient tensor of shape (M, N)
+        weight: Optional weight vector of shape (N,)
         ignore_index: Index to ignore in loss computation
 
     Returns:
@@ -314,14 +340,12 @@ def cross_entropy_fwd_out(
     """
     assert x.dim() == 2, "Input must be 2D"
     assert target.dim() == 1, "Target must be 1D"
-    assert x.is_cuda and target.is_cuda, "Tensors must be on CUDA device"
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported input dtype"
     assert target.dtype in [torch.int32, torch.int64], "Target must be int32 or int64"
     if target_logit is not None:
-        assert target_logit.is_cuda, "Target logits must be on CUDA device"
         assert target_logit.dtype in [torch.float16, torch.bfloat16, torch.float32]
-    if dx is not None:
-        assert dx.is_cuda, "dx must be on CUDA device"
+    if x.size(0) == 0:
+        return
     N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
     target_dtype = torch2cute_dtype_map[target.dtype]
@@ -329,54 +353,24 @@ def cross_entropy_fwd_out(
         torch2cute_dtype_map[target_logit.dtype] if target_logit is not None else None
     )
     target_logit_ndim = target_logit.ndim if target_logit is not None else None
-    _compile_cross_entropy_fwd(
+    weight_dtype = torch2cute_dtype_map[weight.dtype] if weight is not None else None
+    CrossEntropy.compile(
         dtype,
         target_dtype,
         target_logit_dtype,
         N,
         lse is not None,
         dx is not None,
+        weight_dtype,
         target_logit_ndim,
-    )(x, target, target_logit, loss, lse, dx, Int32(ignore_index))
-
-
-@cross_entropy_fwd_out.register_fake
-def _cross_entropy_fwd_out_fake(
-    x: Tensor,
-    target: Tensor,
-    target_logit: Optional[Tensor],
-    loss: Tensor,
-    lse: Optional[Tensor],
-    dx: Optional[Tensor],
-    ignore_index: int = -100,
-) -> None:
-    # See softmax.py _softmax_fwd_fake for why register_fake is needed.
-    from .cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(x.size(1), torch.SymInt):
-        N = x.size(1)
-        dtype = torch2cute_dtype_map[x.dtype]
-        target_dtype = torch2cute_dtype_map[target.dtype]
-        target_logit_dtype = (
-            torch2cute_dtype_map[target_logit.dtype] if target_logit is not None else None
-        )
-        target_logit_ndim = target_logit.ndim if target_logit is not None else None
-        _compile_cross_entropy_fwd(
-            dtype,
-            target_dtype,
-            target_logit_dtype,
-            N,
-            lse is not None,
-            dx is not None,
-            target_logit_ndim,
-        )
-        _compile_cross_entropy_backward(dtype, target_dtype, N)
+    )(x, target, target_logit, loss, lse, dx, weight, Int32(ignore_index))
 
 
 def cross_entropy_fwd(
     x: torch.Tensor,
     target: torch.Tensor,
     target_logit: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
     ignore_index: int = -100,
     return_lse: bool = False,
     return_dx: bool = False,
@@ -387,7 +381,7 @@ def cross_entropy_fwd(
     loss = torch.empty(M, device=device, dtype=torch.float32)
     lse = torch.empty(M, device=device, dtype=torch.float32) if return_lse else None
     dx = (torch.empty_like(x) if not inplace_backward else x) if return_dx else None
-    cross_entropy_fwd_out(x, target, target_logit, loss, lse, dx, ignore_index)
+    cross_entropy_fwd_out(x, target, target_logit, loss, lse, dx, weight, ignore_index)
     if return_lse and return_dx:
         return loss, lse, dx
     elif return_lse:
@@ -432,6 +426,7 @@ class CrossEntropyBackward:
         mDLoss: cute.Tensor,
         mdX: cute.Tensor,
         mLSE: cute.Tensor,
+        mWeight: Optional[cute.Tensor],
         ignore_index: Int32,  # Index to ignore in gradient computation
         stream: cuda.CUstream,
     ):
@@ -451,6 +446,7 @@ class CrossEntropyBackward:
             mDLoss,
             mdX,
             mLSE,
+            mWeight,
             ignore_index,
             mX.shape,
             tiler_mn,
@@ -474,6 +470,7 @@ class CrossEntropyBackward:
         mDLoss: cute.Tensor,  # (M,)
         mdX: cute.Tensor,  # (M, N)
         mLSE: cute.Tensor,  # (M,)
+        mWeight: Optional[cute.Tensor],
         ignore_index: Int32,  # Index to ignore in gradient computation
         shape: cute.Shape,
         tiler_mn: cute.Shape,
@@ -507,6 +504,18 @@ class CrossEntropyBackward:
         copy = partial(copy_utils.copy, pred=tXpX)
 
         row = tXcX[0][0]
+        target = Int32.zero
+        target_weight = Float32.zero
+        if row < shape[0]:
+            target = Int32(mTarget[row])
+            if const_expr(mWeight is not None):
+                # Gate on target != ignore_index: ignore_index may be negative
+                # (PyTorch default -100), and indexing mWeight at that offset is OOB.
+                if target != ignore_index:
+                    target_weight = Float32(mWeight[target])
+            else:
+                target_weight = 1.0
+
         if row < shape[0]:
             copy(tXgX, tXsX, is_async=True)
         cute.arch.cp_async_commit_group()
@@ -516,13 +525,11 @@ class CrossEntropyBackward:
         cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(Float32)
 
-        target = Int32.zero
         dloss = Float32.zero
         lse = Float32.zero
         if row < shape[0]:
-            target = Int32(mTarget[row])
             should_ignore = Boolean(target == ignore_index)
-            # Set dloss to 0 if this index should be ignored
+            # dloss is set to 0 if this index should be ignored
             if not should_ignore:
                 dloss = Float32(mDLoss[row])
             lse = Float32(mLSE[row])
@@ -534,32 +541,36 @@ class CrossEntropyBackward:
         for i in cutlass.range(cute.size(tXcFull), unroll_full=True):
             mask[i] = tXcFull[i][1] == target
         grad = cute.where(mask.load(), prob_shifted, probs)
-        grad = grad * dloss
+        grad = grad * dloss * target_weight
 
         tXrdX.store(grad.to(tXrdX.element_type))
         if row < shape[0]:
             copy(tXrdX, tXgdX)
 
-
-@jit_cache
-def _compile_cross_entropy_backward(dtype, target_dtype, N):
-    batch_sym = cute.sym_int()
-    div = math.gcd(128 // dtype.width, N)
-    x_cute, dx_cute = [fake_tensor(dtype, (batch_sym, N), div)] * 2
-    target_cute = fake_tensor(target_dtype, (batch_sym,))
-    dloss_cute, lse_cute = [fake_tensor(Float32, (batch_sym,))] * 2
-    cross_entropy_backward_op = CrossEntropyBackward(dtype, N)
-    return cute.compile(
-        cross_entropy_backward_op,
-        x_cute,
-        target_cute,
-        dloss_cute,
-        dx_cute,
-        lse_cute,
-        Int32(0),  # ignore_index, just for compilation
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
-    )
+    @staticmethod
+    @jit_cache
+    def compile(dtype, target_dtype, N, weight_dtype):
+        batch_sym = cute.sym_int()
+        div = math.gcd(128 // dtype.width, N)
+        x_cute, dx_cute = [fake_tensor(dtype, (batch_sym, N), div)] * 2
+        target_cute = fake_tensor(target_dtype, (batch_sym,))
+        dloss_cute = cute.runtime.make_fake_tensor(
+            Float32, (batch_sym,), stride=(cute.sym_int64(),)
+        )
+        lse_cute = fake_tensor(Float32, (batch_sym,))
+        weight_cute = fake_tensor(weight_dtype, (N,)) if weight_dtype is not None else None
+        return cute.compile(
+            CrossEntropyBackward(dtype, N),
+            x_cute,
+            target_cute,
+            dloss_cute,
+            dx_cute,
+            lse_cute,
+            weight_cute,
+            Int32(0),  # ignore_index, just for compilation
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
 
 
 def _cross_entropy_backward(
@@ -568,6 +579,7 @@ def _cross_entropy_backward(
     dloss: torch.Tensor,
     lse: torch.Tensor,
     dx: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
     ignore_index=-100,
 ) -> None:
     """Cross entropy backward pass.
@@ -576,8 +588,11 @@ def _cross_entropy_backward(
         target: Target class indices tensor of shape (M,)
         dloss: Upstream gradients tensor of shape (M,)
         lse: Log-sum-exp values tensor of shape (M,)
+        dx: Output gradient tensor of shape (M, N)
+        weight: Optional per-class weight tensor of shape (N,)
+        ignore_index: Index to ignore in gradient computation
     Returns:
-        Input gradients tensor of shape (M, N)
+        None (mutates dx in-place)
     """
     assert x.dim() == 2, "Input must be 2D"
     assert target.dim() == 1, "Target must be 1D"
@@ -586,48 +601,33 @@ def _cross_entropy_backward(
     assert x.shape[0] == target.shape[0], "Batch dimensions must match"
     assert x.shape[0] == dloss.shape[0], "Batch dimensions must match"
     assert x.shape[0] == lse.shape[0], "Batch dimensions must match"
-    assert x.is_cuda and target.is_cuda and dloss.is_cuda and lse.is_cuda, (
-        "Tensors must be on CUDA device"
-    )
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported input dtype"
     assert target.dtype in [torch.int32, torch.int64], "Target must be int32 or int64"
+    if weight is not None:
+        assert weight.is_cuda, "weight must be on CUDA device"
+        assert weight.is_floating_point(), "weight must be a floating-point tensor"
+    if x.size(0) == 0:
+        return
     N = x.size(1)
     dtype = torch2cute_dtype_map[x.dtype]
     target_dtype = torch2cute_dtype_map[target.dtype]
-    _compile_cross_entropy_backward(dtype, target_dtype, N)(
-        x, target, dloss, dx, lse, Int32(ignore_index)
+    weight_dtype = torch2cute_dtype_map[weight.dtype] if weight is not None else None
+    CrossEntropyBackward.compile(dtype, target_dtype, N, weight_dtype)(
+        x, target, dloss, dx, lse, weight, Int32(ignore_index)
     )
 
 
-@torch.library.custom_op(add_op_namespace_prefix("cross_entropy_bwd_out"), mutates_args={"dx"})
+@cute_op(add_op_namespace_prefix("cross_entropy_bwd_out"), mutates_args={"dx"})
 def cross_entropy_bwd_out(
     x: torch.Tensor,
     target: torch.Tensor,
     dloss: torch.Tensor,
     lse: torch.Tensor,
     dx: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
     ignore_index: int = -100,
 ) -> None:
-    _cross_entropy_backward(x, target, dloss, lse, dx, ignore_index)
-
-
-@cross_entropy_bwd_out.register_fake
-def _cross_entropy_bwd_out_fake(
-    x: torch.Tensor,
-    target: torch.Tensor,
-    dloss: torch.Tensor,
-    lse: torch.Tensor,
-    dx: torch.Tensor,
-    ignore_index: int = -100,
-) -> None:
-    # See softmax.py _softmax_fwd_fake for why register_fake is needed.
-    from .cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(x.size(1), torch.SymInt):
-        N = x.size(1)
-        dtype = torch2cute_dtype_map[x.dtype]
-        target_dtype = torch2cute_dtype_map[target.dtype]
-        _compile_cross_entropy_backward(dtype, target_dtype, N)
+    _cross_entropy_backward(x, target, dloss, lse, dx, weight, ignore_index)
 
 
 def cross_entropy_bwd(
@@ -635,51 +635,90 @@ def cross_entropy_bwd(
     target: torch.Tensor,
     dloss: torch.Tensor,
     lse: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
     ignore_index: int = -100,
     inplace_backward: bool = False,
 ) -> None:
     if inplace_backward and not torch.compiler.is_compiling():
         dx = x
         _cross_entropy_backward(
-            x=x, target=target, dloss=dloss, lse=lse, dx=x, ignore_index=ignore_index
+            x=x,
+            target=target,
+            dloss=dloss,
+            lse=lse,
+            dx=x,
+            weight=weight,
+            ignore_index=ignore_index,
         )
     else:
         dx = torch.empty_like(x)
         cross_entropy_bwd_out(
-            x=x, target=target, dloss=dloss, lse=lse, dx=dx, ignore_index=ignore_index
+            x=x,
+            target=target,
+            dloss=dloss,
+            lse=lse,
+            dx=dx,
+            weight=weight,
+            ignore_index=ignore_index,
         )
     return dx
 
 
 class CrossEntropyFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, target, lse_partial=None, ignore_index=-100, inplace_backward=False):
+    def forward(
+        ctx,
+        x,
+        target,
+        lse_partial=None,
+        weight=None,
+        ignore_index=-100,
+        inplace_backward=False,
+    ):
         if lse_partial is None:
-            loss, lse = cross_entropy_fwd(x, target, ignore_index=ignore_index, return_lse=True)
+            loss, lse = cross_entropy_fwd(
+                x,
+                target,
+                weight=weight,
+                ignore_index=ignore_index,
+                return_lse=True,
+            )
         else:
             # if we already compute partial lse, then to compute the final lse we treat
             # @lse_partial as @x and @x as @target_logit
             loss, lse = cross_entropy_fwd(
-                lse_partial, target, target_logit=x, ignore_index=ignore_index, return_lse=True
+                lse_partial,
+                target,
+                target_logit=x,
+                weight=weight,
+                ignore_index=ignore_index,
+                return_lse=True,
             )
-        ctx.save_for_backward(x, target, lse)
+        ctx.save_for_backward(x, target, lse, weight)
         ctx.ignore_index = ignore_index
         ctx.inplace_backward = inplace_backward
         return loss
 
     @staticmethod
     def backward(ctx, dloss):
-        x, target, lse = ctx.saved_tensors
+        x, target, lse, weight = ctx.saved_tensors
         dx = cross_entropy_bwd(
-            x, target, dloss, lse, ctx.ignore_index, inplace_backward=ctx.inplace_backward
+            x,
+            target,
+            dloss,
+            lse,
+            weight=weight,
+            ignore_index=ctx.ignore_index,
+            inplace_backward=ctx.inplace_backward,
         )
-        return dx, None, None, None, None
+        return dx, None, None, None, None, None
 
 
 def cross_entropy(
     x: torch.Tensor,
     target: torch.Tensor,
     lse_partial: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
     ignore_index: int = -100,
     reduction: Literal["none", "mean", "sum"] = "mean",
     inplace_backward: bool = False,
@@ -690,12 +729,13 @@ def cross_entropy(
         x: Input logits tensor of shape (M, N)
         target: Target class indices tensor of shape (M,)
         lse_partial: Optional precomputed log-sum-exp partial results
+        weight: Optional per-class weight tensor of shape (N,)
+        ignore_index: Index to ignore in loss computation (loss will be 0 for these indices)
         reduction: Specifies the reduction to apply to the output:
             'none': no reduction will be applied (default)
             'mean': the sum of the output will be divided by the number of elements
             'sum': the output will be summed
         inplace_backward: Whether to perform backward pass in-place
-        ignore_index: Index to ignore in loss computation (loss will be 0 for these indices)
 
     Returns:
         Cross entropy loss tensor:
@@ -703,8 +743,19 @@ def cross_entropy(
             - If reduction='mean': scalar tensor with mean loss
             - If reduction='sum': scalar tensor with sum of losses
     """
-    loss = CrossEntropyFunction.apply(x, target, lse_partial, ignore_index, inplace_backward)
+    loss = CrossEntropyFunction.apply(
+        x,
+        target,
+        lse_partial,
+        weight,
+        ignore_index,
+        inplace_backward,
+    )
     if reduction == "mean":
+        if weight is not None:
+            valid = target != ignore_index
+            denom = (weight[target.clamp(min=0)] * valid).sum()
+            return loss.sum() / denom
         return loss.sum() / (target != ignore_index).sum().float()
     elif reduction == "sum":
         return loss.sum()

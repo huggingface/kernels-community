@@ -14,7 +14,7 @@ It leverages CuTe-DSL and Triton to deliver state-of-the-art performance through
 
 - Paper: [arXiv:2512.14080](https://arxiv.org/abs/2512.14080)
 - Source: [Dao-AILab/sonic-moe](https://github.com/Dao-AILab/sonic-moe)
-- Vendored dependency: [Dao-AILab/quack](https://github.com/Dao-AILab/quack) (v0.3.11)
+- Vendored dependency: [Dao-AILab/quack](https://github.com/Dao-AILab/quack) (v0.5.0)
 
 ## Requirements
 
@@ -80,7 +80,7 @@ concatenated layout directly without a pre-pass permutation.
 
 ## Vendored Dependencies
 
-This kernel vendors [QuACK](https://github.com/Dao-AILab/quack) v0.3.11 for
+This kernel vendors [QuACK](https://github.com/Dao-AILab/quack) v0.5.0 for
 CuTe-DSL grouped GEMM infrastructure (Hopper + Blackwell). The vendored copy is
 under `torch-ext/sonic_moe/quack/`. Torch operators are registered through
 `add_op_namespace_prefix`, which the build system prefixes with a kernel-unique
