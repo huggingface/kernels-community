@@ -23,10 +23,11 @@ Recipe-named to mirror ``batched.py``; ``moe_fused_batched`` is the neutral disp
 import torch
 import triton
 import triton.language as tl
-from torch.library import triton_op, wrap_triton
 
 from ._ops import add_op_namespace_prefix, ops
 from .utils import (
+    compile_time_only_triton_op,
+    compile_time_only_triton_wrap,
     FP8_DTYPE,
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
@@ -299,7 +300,7 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
     store_row(Out + batch_id * HIDDEN_DIM, acc, pid_h, 1, BLOCK_SIZE_M, BLOCK_SIZE_H)
 
 
-@triton_op(
+@compile_time_only_triton_op(
     add_op_namespace_prefix("w8a8_block_dynamic_fp8_moe_batched"), mutates_args=()
 )
 def _w8a8_block_dynamic_fp8_moe_batched(
@@ -341,7 +342,7 @@ def _w8a8_block_dynamic_fp8_moe_batched(
     out = torch.empty(num_routed_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype)
     reduced = torch.empty(num_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype)
     with device_context(device):
-        wrap_triton(w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel)[
+        compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel)[
             (num_routed_tokens, NUM_N_TILES)
         ](
             hidden_states,
@@ -371,7 +372,7 @@ def _w8a8_block_dynamic_fp8_moe_batched(
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        wrap_triton(w8a8_block_dynamic_fp8_moe_batched_down_kernel)[
+        compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_moe_batched_down_kernel)[
             (num_routed_tokens, NUM_H_TILES)
         ](
             inter,
@@ -396,7 +397,7 @@ def _w8a8_block_dynamic_fp8_moe_batched(
             NUM_N_TILES=NUM_N_TILES,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        wrap_triton(topk_reduce_kernel)[
+        compile_time_only_triton_wrap(topk_reduce_kernel)[
             (num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))
         ](
             out,
@@ -712,7 +713,7 @@ def mxfp_dynamic_moe_batched_down_kernel(
     store_row(Out + batch_id * HIDDEN_DIM, acc, pid_n, 1, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
-@triton_op(add_op_namespace_prefix("mxfp_dynamic_moe_batched"), mutates_args=())
+@compile_time_only_triton_op(add_op_namespace_prefix("mxfp_dynamic_moe_batched"), mutates_args=())
 def _mxfp_dynamic_moe_batched(
     hidden_states: torch.Tensor,
     gate_up_proj: torch.Tensor,
@@ -768,7 +769,7 @@ def _mxfp_dynamic_moe_batched(
         return (num_routed_tokens, triton.cdiv(HIDDEN_DIM, META["BLOCK_SIZE_N"]))
 
     with device_context(device):
-        wrap_triton(mxfp_dynamic_moe_batched_gate_up_kernel)[gate_up_grid](
+        compile_time_only_triton_wrap(mxfp_dynamic_moe_batched_gate_up_kernel)[gate_up_grid](
             hidden_states,
             gate_up_proj_u8,
             gate_up_proj_scale_u8,
@@ -795,7 +796,7 @@ def _mxfp_dynamic_moe_batched(
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        wrap_triton(mxfp_dynamic_moe_batched_down_kernel)[down_grid](
+        compile_time_only_triton_wrap(mxfp_dynamic_moe_batched_down_kernel)[down_grid](
             inter,
             inter_scales,
             down_proj_u8,
@@ -817,7 +818,7 @@ def _mxfp_dynamic_moe_batched(
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        wrap_triton(topk_reduce_kernel)[
+        compile_time_only_triton_wrap(topk_reduce_kernel)[
             (num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))
         ](
             out,

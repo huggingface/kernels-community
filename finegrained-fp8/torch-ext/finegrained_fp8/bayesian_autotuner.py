@@ -32,6 +32,7 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from collections import defaultdict
 from typing import Dict, List
@@ -83,16 +84,43 @@ class BayesianAutotuner(Autotuner):
         for the search, not a fatal error. Stock Triton forgives only OutOfResources, but
         e.g. Triton 3.7.1's ``warp_specialize`` raises RuntimeError at unsupported
         (shape, config) combos; unguarded, one such config kills the whole tune when a
-        small grid falls through to the stock exhaustive path below."""
+        small grid falls through to the stock exhaustive path below. Every failure is
+        recorded and ``_report_bench_failures`` reports every distinct failure —
+        inf-scoring must not silently hide a broken path behind a healthy one."""
         try:
             return super()._bench(*args, config=config, **meta)
-        except Exception:
+        except Exception as e:
+            self._failures.append((config, f"{type(e).__name__}: {str(e)[:200]}"))
             return [float("inf")] * 3
 
+    def _report_bench_failures(self):
+        """After every tune, report every UNIQUE failure — a failure is never silent:
+        inf-scoring keeps the search alive, but a human must see what broke (e.g. a code
+        change that kills one compute path would otherwise silently degrade into "the other
+        path wins"). Distinct errors are deduped with a count and an example config; the
+        JSONL autotune log has per-config detail."""
+        if not self._failures:
+            return
+        fn_name = getattr(self.fn, "__name__", str(self.fn))
+        by_err = {}
+        for c, err in self._failures:
+            by_err.setdefault(err, []).append(c)
+        for err, cfgs in by_err.items():
+            c = cfgs[0]
+            example = ", ".join(f"{k}={v}" for k, v in c.kwargs.items())
+            print(
+                f"[autotune] {fn_name}: {len(cfgs)} config(s) failed to compile/run — "
+                f"{err}  (e.g. {example}, w{c.num_warps} s{c.num_stages})",
+                file=sys.stderr,
+            )
+
     def run(self, *args, **kwargs):
+        self._failures = []
         # Small grid → defer to parent (stock exhaustive bench-all).
         if len(self.configs) <= 1 or self.n_trials >= len(self.configs):
-            return super().run(*args, **kwargs)
+            ret = super().run(*args, **kwargs)
+            self._report_bench_failures()
+            return ret
 
         self.nargs = dict(zip(self.arg_names, args))
         all_args = {**self.nargs, **kwargs}
@@ -107,6 +135,7 @@ class BayesianAutotuner(Autotuner):
             def benchmark():
                 t0 = time.time()
                 self.cache[key] = self._bayesian_search(pruned, args, kwargs, key)
+                self._report_bench_failures()
                 self.bench_time = time.time() - t0
                 if knobs.autotuning.print:
                     fn_name = getattr(self.fn, "__name__", str(self.fn))
@@ -263,10 +292,13 @@ class BayesianAutotuner(Autotuner):
         a basin whose peak is 41µs re-poisons the axis it was meant to protect). Coordinate
         descent climbs BN/BK/warps/stages from wherever the TPE lands within the basin.
         Returns [] when the grid has no such axes (single basin)."""
+        # A basin = the compute-path axes (constexprs selecting different compiled code).
         groups: Dict = {}
         for i, c in enumerate(configs):
-            key = (c.kwargs.get("COMPUTE_MODE"), c.kwargs.get("SWAP_AB"))
-            groups.setdefault(key, []).append(i)
+            basin = tuple(
+                c.kwargs.get(k) for k in ("COMPUTE_MODE", "SWAP_AB", "WARP_SPEC")
+            )
+            groups.setdefault(basin, []).append(i)
         if len(groups) <= 1:
             return []
         def tile_order(i):

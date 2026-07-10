@@ -282,7 +282,7 @@ def get_accelerator_autotuning_configs(
     # WARP_SPEC axis (CUDA only): warp-specialize the K-loop. Compile support is
     # (shape, config)-dependent on Triton 3.7.1, so it must be a tuner axis — failures
     # score inf and self-prune; where it compiles it is both faster and (for the bd
-    # grouped gate_up) load-bearing for correctness (see bd_grouped_gate_up_pruner).
+    # grouped gate_up) load-bearing for correctness (see block_dynamic_grouped_gate_up_pruner).
     if warp_spec and get_active_device_type() == "cuda":
         blocks = [{**b, "WARP_SPEC": ws} for b in blocks for ws in (False, True)]
 
@@ -417,8 +417,8 @@ def sm_shared_memory_limit(device_index: int) -> int:
             )
 
 
-def bd_grouped_gate_up_pruner(act_bytes: int, n_weight_tiles: int):
-    """``early_config_prune`` for the bd grouped gate_up: the smem estimate (see
+def block_dynamic_grouped_gate_up_pruner(act_bytes: int, n_weight_tiles: int):
+    """``early_config_prune`` for the block-dynamic grouped gate_up: the smem estimate (see
     ``smem_config_pruner``) plus the Triton 3.7.1 pipeliner-race guard. The kernel's
     six-load-stream dual-dot K-loop RACES under the default pipeliner at ``num_warps < 8``
     or ``BLOCK_SIZE_M > 64`` (nondeterministic wrong output) — ``warp_specialize`` both
@@ -445,6 +445,39 @@ def bd_grouped_gate_up_pruner(act_bytes: int, n_weight_tiles: int):
                 )
             ] or kept
         return kept
+
+    return prune
+
+
+def block_dynamic_grouped_matmul_pruner():
+    """``early_config_prune`` for the block-dynamic grouped matmul: the Triton 3.7.1 pipeliner-race
+    guard, sized to THIS kernel's four-load-stream single-dot K-loop (the fused gate_up's
+    six-stream loop has a different sound region — see ``block_dynamic_grouped_gate_up_pruner``).
+    Measured on sm_100, 15-fresh-process flake runs per cell, big and tiny shapes:
+
+    - ``warp_specialize`` compiles iff ``BLOCK_SIZE_M >= 64`` with ``num_warps`` in {4, 8}
+      (PassManager failure otherwise) and is race-free everywhere it compiles.
+    - The default pipeliner RACES at ``BLOCK_SIZE_M >= 64`` (3/15 wrong at BM64/w8) and is
+      clean at BM16/32.
+
+    The regions are disjoint, so per launch-``BLOCK_SIZE_M`` (a launch arg here, not a tuned
+    axis): BM >= 64 keeps only the compilable WS configs, BM < 64 keeps only non-WS. CUDA-only
+    — the race is a CUDA pipeliner artifact and the WS axis isn't emitted elsewhere."""
+
+    def prune(configs, named_args, **kwargs):
+        dev = triton.runtime.driver.active.get_active_torch_device()
+        if dev.type != "cuda":
+            return configs
+        bm = {**named_args, **kwargs}.get("BLOCK_SIZE_M", 128)
+        if bm >= 64:
+            kept = [
+                c
+                for c in configs
+                if c.kwargs.get("WARP_SPEC") and c.num_warps in (4, 8)
+            ]
+        else:
+            kept = [c for c in configs if not c.kwargs.get("WARP_SPEC")]
+        return kept or configs
 
     return prune
 
@@ -1161,6 +1194,44 @@ def _quant_block_k_pruner(configs, named_args, **kwargs):
     return [c for c in configs if k % c.kwargs["BLOCK_K"] == 0]
 
 
+def compile_time_only_triton_wrap(kernel):
+    """``wrap_triton`` while torch.compile is tracing (required to capture a raw Triton
+    launch into the graph), the bare kernel in eager. Every kernel launch goes through
+    this: eager skips ``wrap_triton``'s per-call dispatch overhead, and it dodges a
+    correctness trap — eager ``wrap_triton`` of a stock ``@triton.autotune`` kernel that
+    has ``prune_configs_by`` re-runs the FULL tune on every call (torch's wrapper rebuilds
+    a fresh autotuner around the pruned configs per call, ``triton_kernel_wrap.py``:
+    ``autotune(configs=pruned, key=[])``), so nothing ever lands in the original
+    ``Autotuner.cache`` (~2.3s/call for ``_mxfp_act_quant_kernel``) and the mid-capture
+    tune invalidates cudagraph capture. Pruner-less kernels and the ``bayesian_autotune``
+    kernels reuse their cache through the wrapper (measured) — but eager never needs the
+    wrapper at all."""
+    return wrap_triton(kernel) if torch.compiler.is_compiling() else kernel
+
+
+def compile_time_only_triton_op(name, mutates_args=()):
+    """``@triton_op`` under torch.compile (the registered custom op is what dynamo
+    captures), the plain function in eager: the torch.library op dispatch stack costs
+    ~160µs per eager call — the dominant decode CPU cost in the eager-breakdown probe —
+    and eager needs none of it. The op is still registered at import time, so compiled
+    callers and ``torch.ops`` introspection see it unchanged. Sibling of
+    ``compile_time_only_triton_wrap`` (same rule one level down, at the kernel launch)."""
+
+    def decorator(fn):
+        op = triton_op(name, mutates_args=mutates_args)(fn)
+
+        @functools.wraps(fn)
+        def dispatch(*args, **kwargs):
+            if torch.compiler.is_compiling():
+                return op(*args, **kwargs)
+            return fn(*args, **kwargs)
+
+        dispatch._triton_op = op
+        return dispatch
+
+    return decorator
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_K": bk}, num_warps=w)
@@ -1213,7 +1284,7 @@ def mxfp_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     y = torch.empty(T, K, device=x.device, dtype=FP8_DTYPE)
     s = torch.empty(T, K // MX_SCALE_GROUP_K, device=x.device, dtype=torch.uint8)
     with device_context(x.device):
-        _mxfp_act_quant_kernel[lambda META: (T, K // META["BLOCK_K"])](
+        compile_time_only_triton_wrap(_mxfp_act_quant_kernel)[lambda META: (T, K // META["BLOCK_K"])](
             x,
             y,
             s,
@@ -1263,7 +1334,7 @@ def fp8_act_quant_2d(x: torch.Tensor, block_k: int) -> tuple[torch.Tensor, torch
     y = torch.empty(T, K, device=x.device, dtype=FP8_DTYPE)
     s = torch.empty(T, K // block_k, device=x.device, dtype=torch.float32)
     with device_context(x.device):
-        _fp8_act_quant_2d_kernel[(T, K // block_k)](
+        compile_time_only_triton_wrap(_fp8_act_quant_2d_kernel)[(T, K // block_k)](
             x, y, s, x.stride(0), x.stride(1), T.bit_length(), K=K, BLOCK_K=block_k
         )
     return y, s
@@ -1290,7 +1361,7 @@ def _fp8_act_quant_kernel(
     tl.store(s_ptr + pid, s)
 
 
-@triton_op(add_op_namespace_prefix("fp8_act_quant"), mutates_args=())
+@compile_time_only_triton_op(add_op_namespace_prefix("fp8_act_quant"), mutates_args=())
 def _fp8_act_quant(
     x: torch.Tensor, block_size: int = 128
 ) -> tuple[torch.Tensor, torch.Tensor]:

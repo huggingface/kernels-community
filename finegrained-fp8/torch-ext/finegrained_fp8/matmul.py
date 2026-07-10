@@ -15,11 +15,12 @@
 import torch
 import triton
 import triton.language as tl
-from torch.library import triton_op, wrap_triton
 
 from ._ops import add_op_namespace_prefix, ops
 from .bayesian_autotuner import bayesian_autotune
 from .utils import (
+    compile_time_only_triton_op,
+    compile_time_only_triton_wrap,
     NIBBLES_PER_BYTE,
     MX_SCALE_GROUP_K,
     UE8M0_SCALE_DTYPES,
@@ -413,7 +414,7 @@ def mxfp_dynamic_matmul_kernel(
     )
 
 
-@triton_op(add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul"), mutates_args=())
+@compile_time_only_triton_op(add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul"), mutates_args=())
 def _w8a8_block_dynamic_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -456,7 +457,7 @@ def _w8a8_block_dynamic_fp8_matmul(
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
 
     with device_context(A.device):
-        wrap_triton(w8a8_block_dynamic_fp8_matmul_kernel)[grid](
+        compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_kernel)[grid](
             A,
             B,
             C,
@@ -482,7 +483,7 @@ def _w8a8_block_dynamic_fp8_matmul(
     return C
 
 
-@triton_op(add_op_namespace_prefix("w8a8_block_static_fp8_matmul"), mutates_args=())
+@compile_time_only_triton_op(add_op_namespace_prefix("w8a8_block_static_fp8_matmul"), mutates_args=())
 def _w8a8_block_static_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -536,7 +537,7 @@ def _w8a8_block_static_fp8_matmul(
     As = As.reshape(1).to(torch.float32)
 
     with device_context(A.device):
-        wrap_triton(w8a8_block_static_fp8_matmul_kernel)[grid](
+        compile_time_only_triton_wrap(w8a8_block_static_fp8_matmul_kernel)[grid](
             A,
             B,
             C,
@@ -563,7 +564,7 @@ def _w8a8_block_static_fp8_matmul(
     return C
 
 
-@triton_op(add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul"), mutates_args=())
+@compile_time_only_triton_op(add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul"), mutates_args=())
 def _w8a8_tensor_dynamic_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -602,7 +603,7 @@ def _w8a8_tensor_dynamic_fp8_matmul(
         return (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
-        wrap_triton(w8a8_tensor_dynamic_fp8_matmul_kernel)[grid](
+        compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_kernel)[grid](
             qA,
             B,
             C,
@@ -625,7 +626,7 @@ def _w8a8_tensor_dynamic_fp8_matmul(
     return C
 
 
-@triton_op(add_op_namespace_prefix("mxfp_dynamic_matmul"), mutates_args=())
+@compile_time_only_triton_op(add_op_namespace_prefix("mxfp_dynamic_matmul"), mutates_args=())
 def _mxfp_dynamic_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -672,7 +673,7 @@ def _mxfp_dynamic_matmul(
         return (triton.cdiv(M, META["BLOCK_SIZE_M"]), triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
-        wrap_triton(mxfp_dynamic_matmul_kernel)[grid](
+        compile_time_only_triton_wrap(mxfp_dynamic_matmul_kernel)[grid](
             A,
             B,
             C,

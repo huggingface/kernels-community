@@ -15,19 +15,21 @@
 import torch
 import triton
 import triton.language as tl
-from torch.library import triton_op, wrap_triton
 
 from ._ops import add_op_namespace_prefix, ops
 from .bayesian_autotuner import bayesian_autotune
 from .utils import (
+    compile_time_only_triton_op,
+    compile_time_only_triton_wrap,
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
     UE8M0_SCALE_DTYPES,
     adaptive_block_size_m,
+    block_dynamic_grouped_matmul_pruner,
     device_context,
-    mxfp_act_quant_inline,
+    mxfp_act_quant,
     fp8_act_quant,
-    fp8_act_quant_inline,
+    fp8_act_quant_2d,
     get_accelerator_autotuning_configs,
     get_mxfp_autotuning_configs,
     is_mxfp,
@@ -135,13 +137,17 @@ def store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stri
     tl.store(c_ptrs, c, mask=row_mask[:, None])
 
 
-@triton.autotune(
-    configs=get_accelerator_autotuning_configs(),
-    key=["N", "K", "BLOCK_SIZE_M"],
+@bayesian_autotune(
+    get_accelerator_autotuning_configs(warp_spec=True),
+    ["N", "K", "BLOCK_SIZE_M"],
+    n_trials=100,
+    # Pipeliner-race guard: per launch-BM, WS-only at BM >= 64 and non-WS below (see the pruner).
+    prune_configs_by={"early_config_prune": block_dynamic_grouped_matmul_pruner()},
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
-    A,  # (S, K) raw BF16/FP16 activations, sorted/grouped by expert id
+    A,  # (S, K) E4M3 activations (pre-quantized once by the wrapper), sorted/grouped by expert id
+    AScale,  # (S, K // BLOCK_SIZE_K) fp32 per-row, per-K-block activation scales
     B,  # (num_experts, N, K) FP8 weight matrices
     C,  # (S, N) output
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales
@@ -154,6 +160,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     # Strides
     stride_am,
     stride_ak,
+    stride_as_m,
     stride_be,
     stride_bk,
     stride_bn,
@@ -170,11 +177,13 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
+    WARP_SPEC: tl.constexpr = False,
 ):
     """Block-scale grouped FP8 expert matmul kernel.
 
-    Tokens are assumed sorted by expert. The kernel maps each M-tile to its
-    owning expert via ``TileOffsets`` and applies fused activation quantization.
+    Tokens are assumed sorted by expert; the kernel maps each M-tile to its owning expert
+    via ``TileOffsets``. Activations arrive pre-quantized (one pass in the wrapper — the
+    inline per-N-tile quant re-ran N//BN times per element; see the fused kernels' log).
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -198,6 +207,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     )
 
     a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    as_ptrs = AScale + offs_global_m * stride_as_m
     b_ptrs = (
         B
         + expert_id * stride_be
@@ -207,13 +217,14 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     bs_ptrs = Bs + expert_id * stride_bs_e + pid_n * stride_bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
-        a, a_s = fp8_act_quant_inline(a_raw)
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+        a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
+        a_s = tl.load(as_ptrs, mask=row_mask, other=0.0)
         b = tl.load(b_ptrs)
         b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
+        as_ptrs += 1
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += stride_bs_k
 
@@ -316,7 +327,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
 )
 @triton.jit
 def mxfp_dynamic_matmul_grouped_kernel(
-    A,  # (S, K) raw BF16/FP16 activations, sorted by expert id
+    A,  # (S, K) E4M3 activations (pre-quantized once by the wrapper), sorted by expert id
+    AScale,  # (S, K // 32) UE8M0 group-32 activation scales
     B,  # (num_experts, N, K) E4M3 (MXFP8) or (num_experts, N, K // 2) packed E2M1 (MXFP4) expert weights
     C,  # (S, N) output
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) UE8M0 weight scales
@@ -329,6 +341,7 @@ def mxfp_dynamic_matmul_grouped_kernel(
     # Strides
     stride_am,
     stride_ak,
+    stride_as_m,
     stride_be,
     stride_bk,
     stride_bn,
@@ -349,10 +362,11 @@ def mxfp_dynamic_matmul_grouped_kernel(
     SCALE_GROUP_K: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
 ):
-    """Unified grouped MXFP4/MXFP8 (W4A8/W8A8) expert matmul with fused act quant.
+    """Unified grouped MXFP4/MXFP8 (W4A8/W8A8) expert matmul.
 
-    Tokens sorted by expert; each M-tile maps to its expert via ``TileOffsets``. ``A`` is
-    quantized to E4M3 per K-group inline (UE8M0 scale). ``VALUES_PER_BYTE`` picks the
+    Tokens sorted by expert; each M-tile maps to its expert via ``TileOffsets``. ``A``
+    arrives pre-quantized (E4M3 + UE8M0 group-32 scales, one pass in the wrapper — the
+    inline per-N-tile quant re-ran N//BN times per element). ``VALUES_PER_BYTE`` picks the
     weight format (2 = packed E2M1 / MXFP4, 1 = unpacked E4M3 / MXFP8); ``COMPUTE_MODE``
     picks ``tl.dot_scaled`` vs fp8 ``tl.dot`` + per-group rescale (decode; FP4 unpacks
     E2M1->E4M3 first, lossless).
@@ -381,6 +395,7 @@ def mxfp_dynamic_matmul_grouped_kernel(
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
 
     a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    as_ptrs = AScale + offs_global_m[:, None] * stride_as_m + offs_sf[None, :]
     b_ptrs = (
         B
         + expert_id * stride_be
@@ -396,10 +411,9 @@ def mxfp_dynamic_matmul_grouped_kernel(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
-        a, a_scale = mxfp_act_quant_inline(
-            a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
-        )
+        a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
+        a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0)
+        as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
         b = tl.load(b_ptrs)
         b_s = tl.load(bs_ptrs).to(tl.uint8)
         if COMPUTE_MODE == "dot_scaled":
@@ -415,7 +429,7 @@ def mxfp_dynamic_matmul_grouped_kernel(
     store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn)
 
 
-@triton_op(
+@compile_time_only_triton_op(
     add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_grouped"), mutates_args=()
 )
 def _w8a8_block_dynamic_fp8_matmul_grouped(
@@ -460,6 +474,8 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
 
     Bs = ue8m0_as_uint8(Bs)
     C = A.new_empty(S, N, dtype=output_dtype)
+    # One-pass block-FP8 pre-quant (bit-exact with the old inline form: span == block_k).
+    A_q, A_s = fp8_act_quant_2d(A, block_k)
     BLOCK_SIZE_M = adaptive_block_size_m((S + num_experts - 1) // num_experts)
     tile_offsets, max_m_tiles = _grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, num_experts
@@ -467,8 +483,9 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
     grid = (max_m_tiles, triton.cdiv(N, block_n))
 
     with device_context(A.device):
-        wrap_triton(w8a8_block_dynamic_fp8_matmul_grouped_kernel)[grid](
-            A,
+        compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_grouped_kernel)[grid](
+            A_q,
+            A_s,
             B,
             C,
             Bs,
@@ -477,8 +494,9 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
             S,
             N,
             K,
-            A.stride(0),
-            A.stride(1),
+            A_q.stride(0),
+            A_q.stride(1),
+            A_s.stride(0),
             B.stride(0),
             B.stride(2),
             B.stride(1),
@@ -500,7 +518,7 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
     return C
 
 
-@triton_op(
+@compile_time_only_triton_op(
     add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul_grouped"), mutates_args=()
 )
 def _w8a8_tensor_dynamic_fp8_matmul_grouped(
@@ -550,7 +568,7 @@ def _w8a8_tensor_dynamic_fp8_matmul_grouped(
         return (max_m_tiles, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
-        wrap_triton(w8a8_tensor_dynamic_fp8_matmul_grouped_kernel)[grid](
+        compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_grouped_kernel)[grid](
             qA,
             B,
             C,
@@ -621,7 +639,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     )
 
 
-@triton_op(add_op_namespace_prefix("mxfp_dynamic_matmul_grouped"), mutates_args=())
+@compile_time_only_triton_op(add_op_namespace_prefix("mxfp_dynamic_matmul_grouped"), mutates_args=())
 def _mxfp_dynamic_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -665,6 +683,8 @@ def _mxfp_dynamic_matmul_grouped(
     B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty((S, N), dtype=output_dtype)
+    # One-pass MX pre-quant (bit-exact with the old inline form: group-32 boundaries align).
+    A_q, A_s = mxfp_act_quant(A)
     BLOCK_SIZE_M = adaptive_block_size_m((S + num_experts - 1) // num_experts)
     tile_offsets, max_m_tiles = _grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, num_experts
@@ -674,8 +694,9 @@ def _mxfp_dynamic_matmul_grouped(
         return (max_m_tiles, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
-        wrap_triton(mxfp_dynamic_matmul_grouped_kernel)[grid](
-            A,
+        compile_time_only_triton_wrap(mxfp_dynamic_matmul_grouped_kernel)[grid](
+            A_q,
+            A_s,
             B,
             C,
             bs_u8,
@@ -684,8 +705,9 @@ def _mxfp_dynamic_matmul_grouped(
             S,
             N,
             K,
-            A.stride(0),
-            A.stride(1),
+            A_q.stride(0),
+            A_q.stride(1),
+            A_s.stride(0),
             B.stride(0),
             B.stride(2),
             B.stride(1),

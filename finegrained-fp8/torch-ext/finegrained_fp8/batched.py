@@ -15,11 +15,12 @@
 import torch
 import triton
 import triton.language as tl
-from torch.library import triton_op, wrap_triton
 
 from ._ops import add_op_namespace_prefix, ops
 from .bayesian_autotuner import bayesian_autotune
 from .utils import (
+    compile_time_only_triton_op,
+    compile_time_only_triton_wrap,
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
     UE8M0_SCALE_DTYPES,
@@ -330,7 +331,7 @@ def mxfp_dynamic_matmul_batched_kernel(
     store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
-@triton_op(
+@compile_time_only_triton_op(
     add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_batched"), mutates_args=()
 )
 def _w8a8_block_dynamic_fp8_matmul_batched(
@@ -377,7 +378,7 @@ def _w8a8_block_dynamic_fp8_matmul_batched(
     C = A.new_empty(S, N, dtype=output_dtype)
 
     with device_context(A.device):
-        wrap_triton(w8a8_block_dynamic_fp8_matmul_batched_kernel)[grid](
+        compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_batched_kernel)[grid](
             A,
             B,
             C,
@@ -405,7 +406,7 @@ def _w8a8_block_dynamic_fp8_matmul_batched(
     return C
 
 
-@triton_op(
+@compile_time_only_triton_op(
     add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul_batched"), mutates_args=()
 )
 def _w8a8_tensor_dynamic_fp8_matmul_batched(
@@ -451,7 +452,7 @@ def _w8a8_tensor_dynamic_fp8_matmul_batched(
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
-        wrap_triton(w8a8_tensor_dynamic_fp8_matmul_batched_kernel)[grid](
+        compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_batched_kernel)[grid](
             qA,
             B,
             C,
@@ -517,7 +518,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     )
 
 
-@triton_op(add_op_namespace_prefix("mxfp_dynamic_matmul_batched"), mutates_args=())
+@compile_time_only_triton_op(add_op_namespace_prefix("mxfp_dynamic_matmul_batched"), mutates_args=())
 def _mxfp_dynamic_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -564,7 +565,7 @@ def _mxfp_dynamic_matmul_batched(
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
-        wrap_triton(mxfp_dynamic_matmul_batched_kernel)[grid](
+        compile_time_only_triton_wrap(mxfp_dynamic_matmul_batched_kernel)[grid](
             A,
             B,
             C,

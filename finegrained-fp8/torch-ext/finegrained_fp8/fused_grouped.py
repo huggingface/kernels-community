@@ -53,7 +53,7 @@ from .utils import (
     mxfp_act_quant_inline,
     mx_compute,
     smem_config_pruner,
-    bd_grouped_gate_up_pruner,
+    block_dynamic_grouped_gate_up_pruner,
     glu,
     e2m1_as_uint8,
     ue8m0_as_uint8,
@@ -250,7 +250,7 @@ _MX_MEMORY_MODES = ("descriptor", "pointer")
     # fp8 pre-quantized activation tile + fused gate|up weight tiles; WS-race guard (the
     # non-WS dual-dot loop races at w<8 / BM>64 on Triton 3.7.1 — see the pruner).
     prune_configs_by={
-        "early_config_prune": bd_grouped_gate_up_pruner(act_bytes=1, n_weight_tiles=2)
+        "early_config_prune": block_dynamic_grouped_gate_up_pruner(act_bytes=1, n_weight_tiles=2)
     },
 )
 @triton.jit
