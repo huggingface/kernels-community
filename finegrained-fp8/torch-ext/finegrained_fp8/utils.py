@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
-from ._ops import add_op_namespace_prefix, ops
+from ._ops import add_op_namespace_prefix
 
 # ── Format constants ──────────────────────────────────────────────────────────
 
@@ -482,6 +482,30 @@ def block_dynamic_grouped_matmul_pruner():
     return prune
 
 
+def block_dynamic_matmul_pruner():
+    """``early_config_prune`` for the single (2D) block-dynamic matmul: drop the
+    ``warp_specialize`` configs that can never compile. Measured on sm_100 (big and
+    tiny shapes, matrix probe + 15-fresh-process flake runs): WS compiles iff the
+    launch ``BLOCK_SIZE_M >= 64`` with ``num_warps`` in {4, 8} (PassManager failure
+    otherwise) — the same compile region as the grouped sibling — but unlike the
+    grouped kernel the default pipeliner is race-free at every (BM, warps) here, so
+    non-WS configs all stay and WS is purely a perf axis. CUDA-only."""
+
+    def prune(configs, named_args, **kwargs):
+        dev = triton.runtime.driver.active.get_active_torch_device()
+        if dev.type != "cuda":
+            return configs
+        bm = {**named_args, **kwargs}.get("BLOCK_SIZE_M", 128)
+        kept = [
+            c
+            for c in configs
+            if not c.kwargs.get("WARP_SPEC") or (bm >= 64 and c.num_warps in (4, 8))
+        ]
+        return kept or configs
+
+    return prune
+
+
 def batched_mx_pruner(k_arg: str, stacked_gate_up: bool = False):
     """``early_config_prune`` for the batched MX kernels: a BK-within-K veto plus two sm_10x
     MMA-shape guards (no-ops elsewhere and for scalar configs). With ``stacked_gate_up`` the
@@ -716,6 +740,39 @@ def mxfp_act_quant_inline(
         (BLOCK_SIZE_M, BLOCK_SIZE_K),
     ).to(tl.float8e4nv)
     return a_fp8, a_scale_u8
+
+
+@triton.jit
+def load_mx_act_tile(
+    a_ptrs,
+    as_ptrs,
+    row_mask,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+):
+    """Load one MX activation K-tile as ``(a_fp8, a_scale_u8)`` — the arm is picked
+    off the pointer dtype at compile time: fp8 pointers load pre-quantized values +
+    UE8M0 scales (``maybe_act_quant``'s offline arm), raw bf16/fp16 pointers load and
+    quantize inline (``as_ptrs`` then points at a dead placeholder and is never read).
+    ``row_mask`` may be ``None`` (unmasked tiles, e.g. the %-wrapped 2D matmul).
+    Callers advance both pointers unconditionally."""
+    if a_ptrs.dtype.element_ty == tl.float8e4nv:  # pre-quantized offline
+        if row_mask is None:
+            a = tl.load(a_ptrs)
+            a_scale = tl.load(as_ptrs)
+        else:
+            a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
+            a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0)
+    else:  # raw bf16/fp16 — quantize inline
+        if row_mask is None:
+            a_raw = tl.load(a_ptrs).to(tl.float32)
+        else:
+            a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+        a, a_scale = mxfp_act_quant_inline(
+            a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
+        )
+    return a, a_scale
 
 
 @triton.jit
@@ -1274,6 +1331,34 @@ def _mxfp_act_quant_kernel(
     )
 
 
+# Minimum M for offline activation pre-quant (``maybe_act_quant``); below it the
+# consumer kernel quantizes inline. From a B200 2D-matmul crossover sweep (graph-timed,
+# H=6144 MXFP8 / H=4096 MXFP4): inline wins only at M=1 (33 vs 44us / 20 vs 30us);
+# offline wins from M=16 for MXFP8 (22 vs 33us) and M=32 up for both (2-3x by M>=64).
+# MXFP4's M=16 cell marginally favors inline (15 vs 17us) — outweighed by MXFP8's win.
+ACT_PREQUANT_MIN_M = 16
+
+
+def maybe_act_quant(x, act_quant):
+    """Row-count-gated offline activation pre-quant for the MX recipes. Apply
+    ``act_quant`` (a one-pass quant kernel, e.g. ``mxfp_act_quant``) when the GEMM
+    consuming ``x`` is compute-bound (``rows >= ACT_PREQUANT_MIN_M``) — the inline form
+    re-quantizes per N-tile there. Below the threshold return ``x`` raw: the
+    weight-bandwidth-bound GEMM quantizes its one thin tile inline for free (the UE8M0
+    inline quant is exponent-only), and a separate quant kernel is pure added latency
+    (M=1 graph attn decode measured 0.66-0.85x offline). Bit-exact either way. Returns
+    ``(a, a_scale)``; the consumer kernel picks its arm off ``a``'s dtype at compile
+    time (fp8 = pre-quantized, raw bf16/fp16 = quantize inline), so in the inline arm
+    ``a_scale`` is a constexpr-dead placeholder.
+
+    The block-FP8 recipes DON'T gate: their inline form pays a real fp32 amax+div per
+    tile and offline measured strictly better at every M (M=1 graph attn decode 1.28x
+    offline), so their wrappers call ``fp8_act_quant_2d`` unconditionally."""
+    if x.shape[0] >= ACT_PREQUANT_MIN_M:
+        return act_quant(x)
+    return x, x
+
+
 def mxfp_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to MX once (E4M3 values + UE8M0 group-32 uint8 scales)
     instead of inline per weight-tile — the fused gate_up re-ran the inline quant per N-tile
@@ -1284,7 +1369,9 @@ def mxfp_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     y = torch.empty(T, K, device=x.device, dtype=FP8_DTYPE)
     s = torch.empty(T, K // MX_SCALE_GROUP_K, device=x.device, dtype=torch.uint8)
     with device_context(x.device):
-        compile_time_only_triton_wrap(_mxfp_act_quant_kernel)[lambda META: (T, K // META["BLOCK_K"])](
+        compile_time_only_triton_wrap(_mxfp_act_quant_kernel)[
+            lambda META: (T, K // META["BLOCK_K"])
+        ](
             x,
             y,
             s,
@@ -1326,7 +1413,9 @@ def _fp8_act_quant_2d_kernel(
     tl.store(S + t * (K // BLOCK_K) + kb + tl.arange(0, 1), tl.reshape(s, (1,)))
 
 
-def fp8_act_quant_2d(x: torch.Tensor, block_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+def fp8_act_quant_2d(
+    x: torch.Tensor, block_k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to block-FP8 once (E4M3 + fp32 per-``block_k`` scales)
     instead of inline per weight-tile — same rationale and layout as ``mxfp_act_quant`` (a
     GEMM re-reads its activation once per N-tile). Bit-exact with the inline form."""
@@ -1362,7 +1451,7 @@ def _fp8_act_quant_kernel(
 
 
 @compile_time_only_triton_op(add_op_namespace_prefix("fp8_act_quant"), mutates_args=())
-def _fp8_act_quant(
+def fp8_act_quant(
     x: torch.Tensor, block_size: int = 128
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert x.is_contiguous()
@@ -1381,25 +1470,3 @@ def _fp8_act_quant(
         )
 
     return y, s
-
-
-def fp8_act_quant(
-    x: torch.Tensor, block_size: int = 128
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize activations to FP8 with per-block dynamic scaling.
-
-    Splits the last dimension of ``x`` into blocks of ``block_size`` elements,
-    computes ``scale = max(|x_block|) / 448`` per block, and quantizes to
-    ``float8_e4m3fn``.
-
-    Args:
-        x: Input tensor in bf16/fp16/fp32. Last dimension must be divisible by
-            ``block_size`` and the tensor must be contiguous.
-        block_size: Number of elements per quantization block (default: 128).
-
-    Returns:
-        A tuple ``(quantized, scales)`` where ``quantized`` has dtype
-        ``float8_e4m3fn`` with the same shape as ``x``, and ``scales`` has
-        shape ``(*x.shape[:-1], x.shape[-1] // block_size)`` in float32.
-    """
-    return ops.fp8_act_quant(x, block_size)

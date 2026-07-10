@@ -49,7 +49,9 @@ from .utils import (
     get_mxfp_autotuning_configs,
     is_mxfp,
     is_mxfp4,
+    maybe_act_quant,
     mxfp_act_quant,
+    load_mx_act_tile,
     mxfp_act_quant_inline,
     mx_compute,
     smem_config_pruner,
@@ -772,8 +774,9 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
         )
         acc = tl.zeros((BLOCK_SIZE_M, 2 * BLOCK_SIZE_N), dtype=tl.float32)
         for k_off in tl.range(0, HIDDEN_DIM, BLOCK_SIZE_K):
-            a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
-            a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0)
+            a, a_scale = load_mx_act_tile(
+                a_ptrs, as_ptrs, row_mask, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
+            )
             as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
             if MEMORY_MODE == "host_descriptor":
                 gu = tl.reshape(
@@ -1057,7 +1060,7 @@ def mxfp_dynamic_moe_grouped(
     # One-pass MX pre-quant of the activations: the gate_up kernel used to re-run the inline
     # quant per N-tile (16x redundant ALU + 2x act bytes) — it held gate_up at ~380 TFLOPS
     # while the pre-quantized down kernel ran ~1080. Bit-exact (same group-32 boundaries).
-    hidden_q, hidden_scale = mxfp_act_quant(hidden_states)
+    hidden_q, hidden_scale = maybe_act_quant(hidden_states, mxfp_act_quant)
 
     inter = torch.empty(
         num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=FP8_DTYPE

@@ -24,7 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._ops import add_op_namespace_prefix, ops
+from ._ops import add_op_namespace_prefix
 from .utils import (
     compile_time_only_triton_op,
     compile_time_only_triton_wrap,
@@ -146,8 +146,12 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     up_n = INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     kk = tl.arange(0, BLOCK_SIZE_K)
     gu_base = GateUp + expert_id * stride_gu_e
-    b_gate_ptr = oriented_weight_ptrs(gu_base, gate_n, kk, stride_gu_n, stride_gu_k, SWAP_AB)
-    b_up_ptr = oriented_weight_ptrs(gu_base, up_n, kk, stride_gu_n, stride_gu_k, SWAP_AB)
+    b_gate_ptr = oriented_weight_ptrs(
+        gu_base, gate_n, kk, stride_gu_n, stride_gu_k, SWAP_AB
+    )
+    b_up_ptr = oriented_weight_ptrs(
+        gu_base, up_n, kk, stride_gu_n, stride_gu_k, SWAP_AB
+    )
     bs_gate_ptr = GateUpScale + expert_id * stride_gus_e + pid_n * stride_gus_n
     bs_up_ptr = (
         GateUpScale + expert_id * stride_gus_e + (NUM_N_TILES + pid_n) * stride_gus_n
@@ -260,7 +264,9 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
     down_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
     down_base = Down + expert_id * stride_down_e
     # Down output rows are the hidden tile (BH); the contraction tile is BN (intermediate).
-    w_down_ptr = oriented_weight_ptrs(down_base, down_h, down_n, stride_down_n, stride_down_k, SWAP_AB)
+    w_down_ptr = oriented_weight_ptrs(
+        down_base, down_h, down_n, stride_down_n, stride_down_k, SWAP_AB
+    )
     # Replicate the single intermediate row across BLOCK_SIZE_M (arange*0) so BM=16 (non-swap) fills
     # the MMA 16-atom with copies (store_row keeps lane 0); BM=1 unchanged, swap (BM=1) uses row 0.
     inter_ptr = (
@@ -339,12 +345,16 @@ def _w8a8_block_dynamic_fp8_moe_batched(
         num_routed_tokens, NUM_N_TILES, device=device, dtype=torch.float32
     )
 
-    out = torch.empty(num_routed_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype)
-    reduced = torch.empty(num_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype)
+    out = torch.empty(
+        num_routed_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
+    )
+    reduced = torch.empty(
+        num_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
+    )
     with device_context(device):
-        compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel)[
-            (num_routed_tokens, NUM_N_TILES)
-        ](
+        compile_time_only_triton_wrap(
+            w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel
+        )[(num_routed_tokens, NUM_N_TILES)](
             hidden_states,
             gate_up_proj,
             gate_up_proj_scale,
@@ -436,7 +446,7 @@ def w8a8_block_dynamic_fp8_moe_batched(
     runs gate_up + down (gathering each routed row from the unexpanded ``hidden_states``,
     source row ``s // num_top_k``, no replicated copy). The top-k reduce stays plain torch
     so ``torch.compile`` can fuse it with the surrounding model graph."""
-    out = ops.w8a8_block_dynamic_fp8_moe_batched(
+    out = _w8a8_block_dynamic_fp8_moe_batched(
         hidden_states,
         gate_up_proj,
         gate_up_proj_scale,
@@ -474,7 +484,9 @@ def w8a8_block_dynamic_fp8_moe_batched(
     n_trials=100,
     # K-loop loads are unmasked; drop configs whose BK exceeds the contraction dim (hidden).
     # BK-within-K + the sm_10x MMA-shape guards over the stacked 2*BN gate|up extent.
-    prune_configs_by={"early_config_prune": batched_mx_pruner("HIDDEN_DIM", stacked_gate_up=True)},
+    prune_configs_by={
+        "early_config_prune": batched_mx_pruner("HIDDEN_DIM", stacked_gate_up=True)
+    },
 )
 @triton.jit
 def mxfp_dynamic_moe_batched_gate_up_kernel(
@@ -541,12 +553,18 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
     sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
     b_gu_ptr = stacked_gate_up_ptrs(
-        GateUp + expert_id * stride_gu_e, gate_n, kb,
-        INTERMEDIATE_DIM * stride_gu_n, stride_gu_n, stride_gu_k, SWAP_AB,
+        GateUp + expert_id * stride_gu_e,
+        gate_n,
+        kb,
+        INTERMEDIATE_DIM * stride_gu_n,
+        stride_gu_n,
+        stride_gu_k,
+        SWAP_AB,
     )
     rows2 = tl.arange(0, 2)[:, None] * INTERMEDIATE_DIM + gate_n[None, :]
     bs_gu_ptr = (
-        GateUpScale + expert_id * stride_gus_e
+        GateUpScale
+        + expert_id * stride_gus_e
         + rows2[:, :, None] * stride_gus_n
         + sf[None, None, :] * stride_gus_k
     )
@@ -554,18 +572,32 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
 
     for _ in range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K)):
         a_raw = tl.load(a_ptr).to(tl.float32)
-        a, a_scale = mxfp_act_quant_inline(a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K)
+        a, a_scale = mxfp_act_quant_inline(
+            a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
+        )
         w2 = stacked_gate_up_flatten(
             tl.load(b_gu_ptr),
-            2 * BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE, SWAP_AB,
+            2 * BLOCK_SIZE_N,
+            BLOCK_SIZE_K // VALUES_PER_BYTE,
+            SWAP_AB,
         )
         ws2 = tl.reshape(
             tl.load(bs_gu_ptr),
             (2 * BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_K),
         )
         acc = mx_compute(
-            acc, a, a_scale, w2, ws2, COMPUTE_MODE, VALUES_PER_BYTE,
-            BLOCK_SIZE_M, 2 * BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, SWAP_AB,
+            acc,
+            a,
+            a_scale,
+            w2,
+            ws2,
+            COMPUTE_MODE,
+            VALUES_PER_BYTE,
+            BLOCK_SIZE_M,
+            2 * BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            SCALE_GROUP_K,
+            SWAP_AB,
         )
         b_gu_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_gu_k
         bs_gu_ptr += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_gus_k
@@ -607,7 +639,10 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     )
     # inter_scale is [BLOCK_SIZE_M, BN//G]; at BM>1 the token is replicated so all rows are
     # identical — collapse to the single row 0 ([1, BN//G]) to match sc_ptrs (bit-identical at BM=1).
-    tl.store(sc_ptrs, tl.reshape(tl.max(inter_scale, axis=0), (1, BLOCK_SIZE_N // SCALE_GROUP_K)))
+    tl.store(
+        sc_ptrs,
+        tl.reshape(tl.max(inter_scale, axis=0), (1, BLOCK_SIZE_N // SCALE_GROUP_K)),
+    )
 
 
 @bayesian_autotune(
@@ -682,7 +717,9 @@ def mxfp_dynamic_moe_batched_down_kernel(
     down_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
     down_base = Down + expert_id * stride_down_e
-    w_down_ptr = oriented_weight_ptrs(down_base, down_n, kb, stride_down_n, stride_down_k, SWAP_AB)
+    w_down_ptr = oriented_weight_ptrs(
+        down_base, down_n, kb, stride_down_n, stride_down_k, SWAP_AB
+    )
     ws_down_ptr = (
         DownScale
         + expert_id * stride_downs_e
@@ -697,8 +734,18 @@ def mxfp_dynamic_moe_batched_down_kernel(
         w_down = tl.load(w_down_ptr)
         ws_down = tl.load(ws_down_ptr)
         acc = mx_compute(
-            acc, inter, inter_s, w_down, ws_down, COMPUTE_MODE, VALUES_PER_BYTE,
-            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, SWAP_AB,
+            acc,
+            inter,
+            inter_s,
+            w_down,
+            ws_down,
+            COMPUTE_MODE,
+            VALUES_PER_BYTE,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            SCALE_GROUP_K,
+            SWAP_AB,
         )
         a_ptr += BLOCK_SIZE_K
         as_ptr += BLOCK_SIZE_K // SCALE_GROUP_K
@@ -713,7 +760,9 @@ def mxfp_dynamic_moe_batched_down_kernel(
     store_row(Out + batch_id * HIDDEN_DIM, acc, pid_n, 1, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
-@compile_time_only_triton_op(add_op_namespace_prefix("mxfp_dynamic_moe_batched"), mutates_args=())
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("mxfp_dynamic_moe_batched"), mutates_args=()
+)
 def _mxfp_dynamic_moe_batched(
     hidden_states: torch.Tensor,
     gate_up_proj: torch.Tensor,
@@ -759,8 +808,12 @@ def _mxfp_dynamic_moe_batched(
         device=device,
         dtype=torch.uint8,
     )
-    out = torch.empty(num_routed_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype)
-    reduced = torch.empty(num_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype)
+    out = torch.empty(
+        num_routed_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
+    )
+    reduced = torch.empty(
+        num_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
+    )
 
     def gate_up_grid(META):
         return (num_routed_tokens, triton.cdiv(INTERMEDIATE_DIM, META["BLOCK_SIZE_N"]))
@@ -769,7 +822,9 @@ def _mxfp_dynamic_moe_batched(
         return (num_routed_tokens, triton.cdiv(HIDDEN_DIM, META["BLOCK_SIZE_N"]))
 
     with device_context(device):
-        compile_time_only_triton_wrap(mxfp_dynamic_moe_batched_gate_up_kernel)[gate_up_grid](
+        compile_time_only_triton_wrap(mxfp_dynamic_moe_batched_gate_up_kernel)[
+            gate_up_grid
+        ](
             hidden_states,
             gate_up_proj_u8,
             gate_up_proj_scale_u8,
@@ -855,7 +910,7 @@ def mxfp_dynamic_moe_batched(
     """Two-kernel batched fused MX MoE — MXFP4 or MXFP8 weights (UE8M0 group-32), the
     format picked per-weight by the ops. Same structure as the block-dynamic path but
     with a tunable tile and an MXFP8 group-32 intermediate; ``block_size`` is unused."""
-    out = ops.mxfp_dynamic_moe_batched(
+    out = _mxfp_dynamic_moe_batched(
         hidden_states,
         gate_up_proj,
         gate_up_proj_scale,

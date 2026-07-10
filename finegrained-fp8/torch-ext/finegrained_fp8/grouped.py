@@ -16,7 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._ops import add_op_namespace_prefix, ops
+from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
 from .utils import (
     compile_time_only_triton_op,
@@ -27,7 +27,9 @@ from .utils import (
     adaptive_block_size_m,
     block_dynamic_grouped_matmul_pruner,
     device_context,
+    maybe_act_quant,
     mxfp_act_quant,
+    load_mx_act_tile,
     fp8_act_quant,
     fp8_act_quant_2d,
     get_accelerator_autotuning_configs,
@@ -411,8 +413,9 @@ def mxfp_dynamic_matmul_grouped_kernel(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
-        a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0)
+        a, a_scale = load_mx_act_tile(
+            a_ptrs, as_ptrs, row_mask, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
+        )
         as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
         b = tl.load(b_ptrs)
         b_s = tl.load(bs_ptrs).to(tl.uint8)
@@ -421,7 +424,9 @@ def mxfp_dynamic_matmul_grouped_kernel(
                 accumulator, a, a_scale, b, b_s, VALUES_PER_BYTE
             )
         else:  # dot
-            accumulator = mx_dot_rescale(accumulator, a, b, a_scale, b_s, VALUES_PER_BYTE)
+            accumulator = mx_dot_rescale(
+                accumulator, a, b, a_scale, b_s, VALUES_PER_BYTE
+            )
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
@@ -432,7 +437,7 @@ def mxfp_dynamic_matmul_grouped_kernel(
 @compile_time_only_triton_op(
     add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_grouped"), mutates_args=()
 )
-def _w8a8_block_dynamic_fp8_matmul_grouped(
+def w8a8_block_dynamic_fp8_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -474,7 +479,8 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
 
     Bs = ue8m0_as_uint8(Bs)
     C = A.new_empty(S, N, dtype=output_dtype)
-    # One-pass block-FP8 pre-quant (bit-exact with the old inline form: span == block_k).
+    # Offline at every M — block-FP8's inline quant pays a real fp32 amax+div per tile
+    # (see maybe_act_quant's rationale); no gate needed.
     A_q, A_s = fp8_act_quant_2d(A, block_k)
     BLOCK_SIZE_M = adaptive_block_size_m((S + num_experts - 1) // num_experts)
     tile_offsets, max_m_tiles = _grouped_tile_layout(
@@ -483,7 +489,9 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
     grid = (max_m_tiles, triton.cdiv(N, block_n))
 
     with device_context(A.device):
-        compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_grouped_kernel)[grid](
+        compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_grouped_kernel)[
+            grid
+        ](
             A_q,
             A_s,
             B,
@@ -521,7 +529,7 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
 @compile_time_only_triton_op(
     add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul_grouped"), mutates_args=()
 )
-def _w8a8_tensor_dynamic_fp8_matmul_grouped(
+def w8a8_tensor_dynamic_fp8_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -568,7 +576,9 @@ def _w8a8_tensor_dynamic_fp8_matmul_grouped(
         return (max_m_tiles, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
-        compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_grouped_kernel)[grid](
+        compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_grouped_kernel)[
+            grid
+        ](
             qA,
             B,
             C,
@@ -598,49 +608,10 @@ def _w8a8_tensor_dynamic_fp8_matmul_grouped(
     return C
 
 
-def w8a8_block_dynamic_fp8_matmul_grouped(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    offsets: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-    block_size: list[int],
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Block-scale grouped FP8 matmul with fused activation quantization.
-
-    A:  (S, K) raw activations sorted by expert, bf16/fp16/fp32
-    B:  (num_experts, N, K) FP8 expert weights
-    Bs: (num_experts, N // block_n, K // block_k) per-block weight scales
-    output_dtype: defaults to ``A.dtype``
-    """
-    return ops.w8a8_block_dynamic_fp8_matmul_grouped(
-        A, B, Bs, offsets, tokens_per_expert, block_size, output_dtype
-    )
-
-
-def w8a8_tensor_dynamic_fp8_matmul_grouped(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    offsets: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Tensor-scale grouped FP8 matmul with fused activation quantization.
-
-    A:  (S, K) raw activations sorted by expert, bf16/fp16/fp32
-    B:  (num_experts, N, K) FP8 expert weights
-    Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales
-    output_dtype: defaults to ``A.dtype``
-    """
-    return ops.w8a8_tensor_dynamic_fp8_matmul_grouped(
-        A, B, Bs, offsets, tokens_per_expert, output_dtype
-    )
-
-
-@compile_time_only_triton_op(add_op_namespace_prefix("mxfp_dynamic_matmul_grouped"), mutates_args=())
-def _mxfp_dynamic_matmul_grouped(
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("mxfp_dynamic_matmul_grouped"), mutates_args=()
+)
+def mxfp_dynamic_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -684,7 +655,7 @@ def _mxfp_dynamic_matmul_grouped(
     bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty((S, N), dtype=output_dtype)
     # One-pass MX pre-quant (bit-exact with the old inline form: group-32 boundaries align).
-    A_q, A_s = mxfp_act_quant(A)
+    A_q, A_s = maybe_act_quant(A, mxfp_act_quant)
     BLOCK_SIZE_M = adaptive_block_size_m((S + num_experts - 1) // num_experts)
     tile_offsets, max_m_tiles = _grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, num_experts
@@ -725,22 +696,6 @@ def _mxfp_dynamic_matmul_grouped(
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
         )
     return C
-
-
-def mxfp_dynamic_matmul_grouped(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    offsets: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Grouped MX (MXFP4/MXFP8) matmul with fused act quant — per-expert
-    ``C[s] = A[s] @ B[e].T`` over expert-sorted rows; weight format detected from
-    ``B.dtype``. Tile + dot path autotuned."""
-    return ops.mxfp_dynamic_matmul_grouped(
-        A, B, Bs, offsets, tokens_per_expert, output_dtype
-    )
 
 
 def matmul_grouped(

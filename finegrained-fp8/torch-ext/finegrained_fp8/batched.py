@@ -16,7 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._ops import add_op_namespace_prefix, ops
+from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
 from .utils import (
     compile_time_only_triton_op,
@@ -172,7 +172,9 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 
 @triton.autotune(
     # S (routed rows) keyed like the block-dynamic/mxfp batched siblings — decode re-tunes per batch.
-    configs=get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True, for_decode=True),
+    configs=get_accelerator_autotuning_configs(
+        tune_block_nk=True, swap_ab=True, for_decode=True
+    ),
     key=["N", "K", "S"],
 )
 @triton.jit
@@ -316,12 +318,24 @@ def mxfp_dynamic_matmul_batched_kernel(
     accumulator = acc_init(COMPUTE_MODE, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a_raw = tl.load(a_ptrs).to(tl.float32)
-        a, a_scale = mxfp_act_quant_inline(a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K)
+        a, a_scale = mxfp_act_quant_inline(
+            a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
+        )
         b = tl.load(b_ptrs)
         b_s = tl.load(bs_ptrs).to(tl.uint8)
         accumulator = mx_compute(
-            accumulator, a, a_scale, b, b_s, COMPUTE_MODE, VALUES_PER_BYTE,
-            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, SWAP_AB,
+            accumulator,
+            a,
+            a_scale,
+            b,
+            b_s,
+            COMPUTE_MODE,
+            VALUES_PER_BYTE,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            SCALE_GROUP_K,
+            SWAP_AB,
         )
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
@@ -334,7 +348,7 @@ def mxfp_dynamic_matmul_batched_kernel(
 @compile_time_only_triton_op(
     add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_batched"), mutates_args=()
 )
-def _w8a8_block_dynamic_fp8_matmul_batched(
+def w8a8_block_dynamic_fp8_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -378,7 +392,9 @@ def _w8a8_block_dynamic_fp8_matmul_batched(
     C = A.new_empty(S, N, dtype=output_dtype)
 
     with device_context(A.device):
-        compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_batched_kernel)[grid](
+        compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_batched_kernel)[
+            grid
+        ](
             A,
             B,
             C,
@@ -409,7 +425,7 @@ def _w8a8_block_dynamic_fp8_matmul_batched(
 @compile_time_only_triton_op(
     add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul_batched"), mutates_args=()
 )
-def _w8a8_tensor_dynamic_fp8_matmul_batched(
+def w8a8_tensor_dynamic_fp8_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -452,7 +468,9 @@ def _w8a8_tensor_dynamic_fp8_matmul_batched(
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
-        compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_batched_kernel)[grid](
+        compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_batched_kernel)[
+            grid
+        ](
             qA,
             B,
             C,
@@ -478,48 +496,10 @@ def _w8a8_tensor_dynamic_fp8_matmul_batched(
     return C
 
 
-def w8a8_block_dynamic_fp8_matmul_batched(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    expert_ids: torch.Tensor,
-    block_size: list[int],
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Block-scale batched FP8 matmul with fused activation quantization.
-
-    A:  (S, K) raw activations, bf16/fp16/fp32
-    B:  (num_experts, N, K) FP8 expert weights
-    Bs: (num_experts, N // block_n, K // block_k) per-block weight scales
-    expert_ids: (S,) — kernel loads stride-aware, any int dtype works
-    output_dtype: defaults to ``A.dtype``
-    """
-    return ops.w8a8_block_dynamic_fp8_matmul_batched(
-        A, B, Bs, expert_ids, block_size, output_dtype
-    )
-
-
-def w8a8_tensor_dynamic_fp8_matmul_batched(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    expert_ids: torch.Tensor,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Tensor-scale batched FP8 matmul with fused activation quantization.
-
-    A:  (S, K) raw activations, bf16/fp16/fp32
-    B:  (num_experts, N, K) FP8 expert weights
-    Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales
-    output_dtype: defaults to ``A.dtype``
-    """
-    return ops.w8a8_tensor_dynamic_fp8_matmul_batched(
-        A, B, Bs, expert_ids, output_dtype
-    )
-
-
-@compile_time_only_triton_op(add_op_namespace_prefix("mxfp_dynamic_matmul_batched"), mutates_args=())
-def _mxfp_dynamic_matmul_batched(
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("mxfp_dynamic_matmul_batched"), mutates_args=()
+)
+def mxfp_dynamic_matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -590,18 +570,6 @@ def _mxfp_dynamic_matmul_batched(
             num_experts=num_experts,
         )
     return C
-
-
-def mxfp_dynamic_matmul_batched(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    expert_ids: torch.Tensor,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Batched MX (MXFP4/MXFP8) matmul with fused act quant; the weight format
-    (packed E2M1 vs E4M3) is detected from ``B.dtype``. Tile + dot path autotuned."""
-    return ops.mxfp_dynamic_matmul_batched(A, B, Bs, expert_ids, output_dtype)
 
 
 def matmul_batched(

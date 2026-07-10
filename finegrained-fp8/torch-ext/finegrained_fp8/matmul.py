@@ -16,7 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._ops import add_op_namespace_prefix, ops
+from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
 from .utils import (
     compile_time_only_triton_op,
@@ -25,17 +25,21 @@ from .utils import (
     MX_SCALE_GROUP_K,
     UE8M0_SCALE_DTYPES,
     adaptive_block_size_m,
+    batched_mx_pruner,
+    block_dynamic_matmul_pruner,
     decode_ue8m0_scale,
     mx_dot_rescale,
     mx_dot_scaled,
     device_context,
     fp8_act_quant,
-    fp8_act_quant_inline,
+    fp8_act_quant_2d,
     get_accelerator_autotuning_configs,
     get_mxfp_autotuning_configs,
     is_mxfp,
     is_tensor_wide,
-    mxfp_act_quant_inline,
+    maybe_act_quant,
+    mxfp_act_quant,
+    load_mx_act_tile,
     e2m1_as_uint8,
     ue8m0_as_uint8,
 )
@@ -94,13 +98,17 @@ def _store_masked(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.autotune(
-    configs=get_accelerator_autotuning_configs(),
-    key=["N", "K", "BLOCK_SIZE_M"],
+@bayesian_autotune(
+    get_accelerator_autotuning_configs(warp_spec=True),
+    ["N", "K", "BLOCK_SIZE_M"],
+    n_trials=100,
+    # WS compile guard only — non-WS is race-free at every (BM, warps) here (see the pruner).
+    prune_configs_by={"early_config_prune": block_dynamic_matmul_pruner()},
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_kernel(
-    A,  # (M, K) raw BF16/FP16 activations
+    A,  # (M, K) E4M3 activations (pre-quantized once by the wrapper)
+    AScale,  # (M, K // BLOCK_SIZE_K) fp32 per-row, per-K-block activation scales
     B,  # (N, K) FP8 weights
     C,  # (M, N) output
     Bs,  # (N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (fp32 or uint8/UE8M0)
@@ -111,6 +119,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # Strides
     stride_am,
     stride_ak,
+    stride_as_m,
     stride_bk,
     stride_bn,
     stride_cm,
@@ -122,33 +131,33 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    WARP_SPEC: tl.constexpr = False,
 ):
-    """Block-scale FP8 GEMM kernel with fused activation quantization.
+    """Block-scale FP8 GEMM kernel.
 
-    Computes ``C = A @ B.T`` with bf16/fp16 ``A`` quantized to FP8 per-K-tile
-    inline (one scale per M-row per BLOCK_SIZE_K) and pre-quantized FP8 weights
-    with per-block scales. 2D grid with swizzle for L2 cache locality on B.
+    Computes ``C = A @ B.T``. Activations arrive pre-quantized (one pass in the
+    wrapper — the inline per-N-tile quant re-ran N//BN times per element; see the
+    grouped kernels). 2D grid with swizzle for L2 cache locality on B.
     """
     pid_m, pid_n, offs_am, offs_bn, offs_k = _swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
     )
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    as_ptrs = AScale + offs_am * stride_as_m
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     offs_bsn = offs_bn // BLOCK_SIZE_N
     bs_ptrs = Bs + offs_bsn * stride_bs_n
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        k_remaining = K - k * BLOCK_SIZE_K
-        a_raw = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0).to(
-            tl.float32
-        )
-        a, a_s = fp8_act_quant_inline(a_raw)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+        a = tl.load(a_ptrs)
+        a_s = tl.load(as_ptrs)
+        b = tl.load(b_ptrs)
         b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
+        as_ptrs += 1
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += stride_bs_k
 
@@ -326,10 +335,13 @@ def w8a8_block_static_fp8_matmul_kernel(
     # at M=4096 (the thin M=128 tile can't saturate the wide GEMM), so don't collapse the buckets.
     ["N", "K", "m_bit_length", "VALUES_PER_BYTE"],
     n_trials=100,
+    # BK-within-K veto (the loop loads are unmasked) + the sm_10x dot_scaled shape guards.
+    prune_configs_by={"early_config_prune": batched_mx_pruner("K")},
 )
 @triton.jit
 def mxfp_dynamic_matmul_kernel(
-    A,  # (M, K) raw BF16/FP16 activations
+    A,  # (M, K) activations: E4M3 (pre-quantized) or raw bf16/fp16 (quantized inline)
+    AScale,  # (M, K // 32) UE8M0 group-32 activation scales (pre-quantized arm only)
     B,  # (N, K) E4M3 (MXFP8) or (N, K // 2) packed E2M1 (MXFP4) weights
     C,  # (M, N) output
     Bs,  # (N, K // SCALE_GROUP_K) UE8M0 weight scales
@@ -341,6 +353,7 @@ def mxfp_dynamic_matmul_kernel(
     # Strides
     stride_am,
     stride_ak,
+    stride_as_m,
     stride_bk,
     stride_bn,
     stride_cm,
@@ -356,13 +369,18 @@ def mxfp_dynamic_matmul_kernel(
     SCALE_GROUP_K: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
 ):
-    """Unified MXFP4/MXFP8 (W4A8/W8A8) GEMM with fused activation quantization.
+    """Unified MXFP4/MXFP8 (W4A8/W8A8) GEMM.
 
-    ``C = A @ B.T`` with bf16/fp16 ``A`` quantized to E4M3 per K-group inline (UE8M0
-    scale). ``VALUES_PER_BYTE`` picks the weight format: 2 = packed E2M1 (MXFP4),
-    1 = unpacked E4M3 (MXFP8). ``COMPUTE_MODE`` picks the MMA: ``tl.dot_scaled``
-    (native M=128 scaled MMA) vs fp8 ``tl.dot`` + per-group software rescale (wins at
-    decode; FP4 unpacks E2M1->E4M3 first — lossless). 2D grid with swizzle for L2 reuse.
+    ``C = A @ B.T``. ``A``'s dtype picks the activation form (compile-time folded):
+    pre-quantized E4M3 + UE8M0 group-32 scales (one wrapper pass — the inline
+    per-N-tile quant re-ran N//BN times per element, ~2x at prefill) vs raw bf16/fp16
+    quantized inline (small M: the GEMM is weight-bandwidth-bound with idle ALU, so
+    inline is free and a separate quant kernel only adds latency; both forms are
+    bit-exact, same group-32 boundaries). ``VALUES_PER_BYTE`` picks the weight format:
+    2 = packed E2M1 (MXFP4), 1 = unpacked E4M3 (MXFP8). ``COMPUTE_MODE`` picks the MMA:
+    ``tl.dot_scaled`` (native M=128 scaled MMA) vs fp8 ``tl.dot`` + per-group software
+    rescale (wins at decode; FP4 unpacks E2M1->E4M3 first — lossless). 2D grid with
+    swizzle for L2 reuse.
     """
     pid_m, pid_n, offs_am, offs_bn, offs_k = _swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
@@ -370,24 +388,17 @@ def mxfp_dynamic_matmul_kernel(
     offs_kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    as_ptrs = AScale + offs_am[:, None] * stride_as_m + offs_sf[None, :]
     b_ptrs = B + (offs_kb[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
     bs_ptrs = Bs + (offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        k_remaining = K - k * BLOCK_SIZE_K
-        a_raw = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0).to(
-            tl.float32
+        a, a_scale = load_mx_act_tile(
+            a_ptrs, as_ptrs, None, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
         )
-        a, a_scale = mxfp_act_quant_inline(
-            a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
-        )
-        b = tl.load(
-            b_ptrs, mask=offs_kb[:, None] < k_remaining // VALUES_PER_BYTE, other=0.0
-        )
-        b_s = tl.load(
-            bs_ptrs, mask=offs_sf[None, :] < k_remaining // SCALE_GROUP_K, other=0
-        ).to(tl.uint8)
+        b = tl.load(b_ptrs)
+        b_s = tl.load(bs_ptrs).to(tl.uint8)
         if COMPUTE_MODE == "dot_scaled":
             accumulator = mx_dot_scaled(
                 accumulator, a, a_scale, b, b_s, VALUES_PER_BYTE
@@ -397,6 +408,7 @@ def mxfp_dynamic_matmul_kernel(
                 accumulator, a, b, a_scale, b_s, VALUES_PER_BYTE
             )
         a_ptrs += BLOCK_SIZE_K * stride_ak
+        as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
         b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
@@ -414,8 +426,10 @@ def mxfp_dynamic_matmul_kernel(
     )
 
 
-@compile_time_only_triton_op(add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul"), mutates_args=())
-def _w8a8_block_dynamic_fp8_matmul(
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul"), mutates_args=()
+)
+def w8a8_block_dynamic_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -424,7 +438,7 @@ def _w8a8_block_dynamic_fp8_matmul(
 ) -> torch.Tensor:
     """Block-scale FP8 matmul: ``C = A @ B.T`` with fused activation quantization.
 
-    A:  (..., K) raw activations, bf16/fp16/fp32 (quantized inline to FP8)
+    A:  (..., K) raw activations, bf16/fp16/fp32 (quantized to FP8 in one wrapper pass)
     B:  (N, K) FP8 weights
     Bs: (N // block_n, K // block_k) per-block weight scales
     """
@@ -442,10 +456,11 @@ def _w8a8_block_dynamic_fp8_matmul(
 
     N, K = B.shape
     M = A.numel() // A.shape[-1]
+    assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
 
     assert Bs.ndim == 2, f"Bs must be 2D (N//block_n, K//block_k), got ndim={Bs.ndim}"
-    assert Bs.shape == (triton.cdiv(N, block_n), triton.cdiv(K, block_k)), (
-        f"Bs shape {tuple(Bs.shape)} != expected ({triton.cdiv(N, block_n)}, {triton.cdiv(K, block_k)})"
+    assert Bs.shape == (triton.cdiv(N, block_n), K // block_k), (
+        f"Bs shape {tuple(Bs.shape)} != expected ({triton.cdiv(N, block_n)}, {K // block_k})"
     )
 
     BLOCK_SIZE_K = block_k
@@ -454,19 +469,24 @@ def _w8a8_block_dynamic_fp8_matmul(
     C_shape = A.shape[:-1] + (N,)
     BLOCK_SIZE_M = adaptive_block_size_m(M)
     C = A.new_empty(C_shape, dtype=output_dtype)
+    # Offline at every M — block-FP8's inline quant pays a real fp32 amax+div per tile
+    # (M=1 graph attn decode measured 1.28x offline); no maybe_act_quant gate needed.
+    A_q, A_s = fp8_act_quant_2d(A.view(M, K), block_k)
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
 
     with device_context(A.device):
         compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_kernel)[grid](
-            A,
+            A_q,
+            A_s,
             B,
             C,
             Bs,
             M,
             N,
             K,
-            A.stride(-2),
-            A.stride(-1),
+            A_q.stride(0),
+            A_q.stride(1),
+            A_s.stride(0),
             B.stride(1),
             B.stride(0),
             C.stride(-2),
@@ -483,8 +503,10 @@ def _w8a8_block_dynamic_fp8_matmul(
     return C
 
 
-@compile_time_only_triton_op(add_op_namespace_prefix("w8a8_block_static_fp8_matmul"), mutates_args=())
-def _w8a8_block_static_fp8_matmul(
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("w8a8_block_static_fp8_matmul"), mutates_args=()
+)
+def w8a8_block_static_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -564,8 +586,10 @@ def _w8a8_block_static_fp8_matmul(
     return C
 
 
-@compile_time_only_triton_op(add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul"), mutates_args=())
-def _w8a8_tensor_dynamic_fp8_matmul(
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul"), mutates_args=()
+)
+def w8a8_tensor_dynamic_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -626,8 +650,10 @@ def _w8a8_tensor_dynamic_fp8_matmul(
     return C
 
 
-@compile_time_only_triton_op(add_op_namespace_prefix("mxfp_dynamic_matmul"), mutates_args=())
-def _mxfp_dynamic_matmul(
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("mxfp_dynamic_matmul"), mutates_args=()
+)
+def mxfp_dynamic_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -668,22 +694,30 @@ def _mxfp_dynamic_matmul(
     B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+    A_q, A_s = maybe_act_quant(A.view(M, K), mxfp_act_quant)
 
     def grid(META):
-        return (triton.cdiv(M, META["BLOCK_SIZE_M"]), triton.cdiv(N, META["BLOCK_SIZE_N"]))
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]),
+            triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
 
     with device_context(A.device):
         compile_time_only_triton_wrap(mxfp_dynamic_matmul_kernel)[grid](
-            A,
+            A_q,
+            A_s,
             B,
             C,
             bs_u8,
             M,
             N,
             K,
-            int(M).bit_length(),  # m_bit_length key bucket; int() concretizes M (a SymInt under torch.compile has no .bit_length)
-            A.stride(-2),
-            A.stride(-1),
+            int(
+                M
+            ).bit_length(),  # m_bit_length key bucket; int() concretizes M (a SymInt under torch.compile has no .bit_length)
+            A_q.stride(0),
+            A_q.stride(1),
+            A_s.stride(0),
             B.stride(1),
             B.stride(0),
             C.stride(-2),
@@ -695,93 +729,6 @@ def _mxfp_dynamic_matmul(
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
         )
     return C
-
-
-def w8a8_block_dynamic_fp8_matmul(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    block_size: list[int],
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Block-wise W8A8 FP8 matrix multiplication with fused activation quantization.
-
-    Args:
-        A: Raw activation tensor ``[..., M, K]`` in bf16/fp16/fp32 — quantized
-            inline to ``float8_e4m3fn`` against per-K-tile per-row UE8 scales.
-        B: FP8 weight tensor ``[N, K]`` in ``float8_e4m3fn``.
-        Bs: Per-block weight scales ``[N // block_size[0], K // block_size[1]]``.
-        block_size: ``[block_n, block_k]`` weight quantization block dimensions.
-        output_dtype: dtype of the returned tensor (default: ``torch.float32``).
-
-    Returns:
-        Output tensor ``[..., M, N]`` in ``output_dtype``.
-    """
-    return ops.w8a8_block_dynamic_fp8_matmul(A, B, Bs, block_size, output_dtype)
-
-
-def w8a8_block_static_fp8_matmul(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    As: torch.Tensor,
-    block_size: list[int],
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Block-wise W8A8 FP8 matmul with static (per-tensor) activation quantization.
-
-    Args:
-        A: Raw activation tensor ``[..., M, K]`` in bf16/fp16/fp32 — quantized
-            inline against the per-tensor scalar ``As``.
-        B: FP8 weight tensor ``[N, K]`` in ``float8_e4m3fn``.
-        Bs: Per-block weight scales ``[N // block_size[0], K // block_size[1]]``.
-        As: Static per-tensor activation scale (scalar or ``[1]``).
-        block_size: ``[block_n, block_k]`` weight quantization block dimensions.
-        output_dtype: dtype of the returned tensor (default: ``torch.float32``).
-
-    Returns:
-        Output tensor ``[..., M, N]`` in ``output_dtype``.
-    """
-    return ops.w8a8_block_static_fp8_matmul(A, B, Bs, As, block_size, output_dtype)
-
-
-def w8a8_tensor_dynamic_fp8_matmul(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Tensor-scale W8A8 FP8 matmul with fused activation quantization.
-
-    Computes ``C = A @ B.T`` with raw bf16/fp16/fp32 ``A`` quantized to FP8
-    per-row (one scale per token) before the dot.
-
-    Args:
-        A: Raw activation tensor ``[M, K]`` in bf16/fp16/fp32.
-        B: FP8 weight tensor ``[N, K]`` in ``float8_e4m3fn``.
-        Bs: Single weight scale, scalar or ``[1]``.
-        output_dtype: dtype of the returned tensor.
-    """
-    return ops.w8a8_tensor_dynamic_fp8_matmul(A, B, Bs, output_dtype)
-
-
-def mxfp_dynamic_matmul(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """MX (MXFP4/MXFP8) matmul ``C = A @ B.T`` with fused activation quant; the weight
-    format is detected from ``B.dtype``. Tile + dot path are autotuned; MX scale
-    granularity is fixed at 32 (the MX-format spec).
-
-    Args:
-        A: Raw activations ``[M, K]`` in bf16/fp16/fp32.
-        B: Packed E2M1 ``[N, K // 2]`` (``int8``) or E4M3 ``[N, K]`` (``float8_e4m3fn``).
-        Bs: UE8M0 weight scales ``[N, K // 32]`` (``float8_e8m0fnu``).
-        output_dtype: dtype of the returned tensor (default ``bfloat16``).
-    """
-    return ops.mxfp_dynamic_matmul(A, B, Bs, output_dtype)
 
 
 def matmul_2d(
