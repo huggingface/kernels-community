@@ -151,6 +151,7 @@ def _build_inputs(
     head_sha: str,
     target_branch: str,
     upload: bool,
+    comment_pr_number: str,
 ) -> dict:
     inputs = {
         "kernel_name": kernel_name,
@@ -169,6 +170,11 @@ def _build_inputs(
         inputs["target_branch"] = target_branch
     if not upload:
         inputs["upload"] = "false"
+    # PR to report Hub upload pull-request links back to. Distinct from
+    # pr_number (which selects the branch to check out): release/merge uploads
+    # build from the default branch but still comment on the originating PR.
+    if comment_pr_number:
+        inputs["comment_pr_number"] = comment_pr_number
     return inputs
 
 
@@ -232,6 +238,7 @@ def _plan_build_actions(
     head_sha: str,
     target_branch: str,
     upload: bool,
+    comment_pr_number: str,
 ) -> None:
     backends = read_backends(kernel_name) or []
     workflows = select_workflows(kernel_name, notes=plan.notes)
@@ -272,6 +279,7 @@ def _plan_build_actions(
                         head_sha=head_sha,
                         target_branch=target_branch,
                         upload=upload,
+                        comment_pr_number=comment_pr_number,
                     ),
                 },
                 description=f"for kernel `{kernel_name}` on ref `{ref}`",
@@ -292,6 +300,7 @@ def plan_dispatch(
     head_sha: str = "",
     target_branch: str = "",
     upload: bool = True,
+    comment_pr_number: str = "",
     run_security: bool = False,
     security_only: bool = False,
 ) -> DispatchPlan:
@@ -311,6 +320,7 @@ def plan_dispatch(
             head_sha=head_sha,
             target_branch=target_branch,
             upload=upload,
+            comment_pr_number=comment_pr_number,
         )
 
     if want_security:
@@ -458,6 +468,7 @@ def dispatch(
     head_sha: str = "",
     target_branch: str = "",
     upload: bool = True,
+    comment_pr_number: str = "",
     run_security: bool = False,
     security_only: bool = False,
 ) -> DispatchResult:
@@ -479,6 +490,7 @@ def dispatch(
         head_sha=head_sha,
         target_branch=target_branch,
         upload=upload,
+        comment_pr_number=comment_pr_number,
         run_security=run_security,
         security_only=security_only,
     )
@@ -584,6 +596,11 @@ def main() -> int:
         help="Build only, do not upload",
     )
     parser.add_argument(
+        "--comment-pr-number",
+        default="",
+        help="PR to report Hub upload pull-request links back to (for --create-pr uploads)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the dispatch payloads without actually dispatching",
@@ -631,6 +648,7 @@ def main() -> int:
         head_sha=args.head_sha,
         target_branch=args.target_branch,
         upload=not args.no_upload,
+        comment_pr_number=args.comment_pr_number,
         run_security=args.security,
         security_only=args.security_only,
         dispatch_key_prefix=args.dispatch_key_prefix,

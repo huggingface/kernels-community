@@ -52,11 +52,18 @@ on:
         required: false
         type: string
         default: ""
+      comment_pr_number:
+        description: "PR to report Hub upload PR links back to (empty = no comment)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
   statuses: write
   id-token: write
+  # Lets the upload step comment Hub create-pr links back on the originating PR.
+  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -197,37 +204,59 @@ jobs:
             cosign sign-blob "$metadata_file" --bundle "${metadata_file}.sigstore" --yes
           done < <(find "$KERNEL/build" -mindepth 2 -maxdepth 2 -name "metadata.json")
 
-      # Upload built artifacts to both model and kernel Hub repos.
+      # Upload built artifacts to the Hub. Kernels whose build.toml repo-id lives
+      # outside kernels-community are uploaded via a pull request (--create-pr,
+      # handled inside upload_and_report.py) and the PR links are reported back
+      # on the originating PR.
       - name: Upload kernel to Hub
         if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KERNEL: ${{ steps.validate.outputs.kernel }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
+          COMMENT_PR_NUMBER: ${{ inputs.comment_pr_number }}
+          BUILD_LABEL: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          cd "$KERNEL"
-          BRANCH_FLAG=""
+          BRANCH_ARGS=()
           if [ -n "$TARGET_BRANCH" ]; then
-            BRANCH_FLAG="--branch $TARGET_BRANCH"
+            BRANCH_ARGS=(--branch "$TARGET_BRANCH")
           fi
-          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "$REPO_PREFIX/$KERNEL" $BRANCH_FLAG
+          python3 .github/scripts/upload_and_report.py \
+            --kernel "$KERNEL" \
+            --repo-prefix "$REPO_PREFIX" \
+            --comment-pr-number "$COMMENT_PR_NUMBER" \
+            --label "$BUILD_LABEL" \
+            --run-url "$RUN_URL" \
+            "${BRANCH_ARGS[@]}" \
+            --builder "nix run -L github:huggingface/kernels#kernel-builder -- upload"
 
       # v1 kernels without an explicit branch override also get uploaded to main.
       - name: Upload v1 kernels to main
         if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false && inputs.target_branch == ''
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KERNEL: ${{ steps.validate.outputs.kernel }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
+          COMMENT_PR_NUMBER: ${{ inputs.comment_pr_number }}
+          BUILD_LABEL: ${{ github.workflow }} / main
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          cd "$KERNEL"
-
-          if [ -f "build.toml" ]; then
-            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
-            BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
+          if [ -f "$KERNEL/build.toml" ]; then
+            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' "$KERNEL/build.toml" || true)
+            BRANCH=$(grep -E '^\s*branch\s*=' "$KERNEL/build.toml" || true)
             if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
-              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "$REPO_PREFIX/$KERNEL" --branch main
+              python3 .github/scripts/upload_and_report.py \
+                --kernel "$KERNEL" \
+                --repo-prefix "$REPO_PREFIX" \
+                --comment-pr-number "$COMMENT_PR_NUMBER" \
+                --label "$BUILD_LABEL" \
+                --run-url "$RUN_URL" \
+                --branch main \
+                --builder "nix run -L github:huggingface/kernels#kernel-builder -- upload"
             fi
           fi
 

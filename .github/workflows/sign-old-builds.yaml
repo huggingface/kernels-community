@@ -69,8 +69,16 @@ jobs:
             VERSION=$(grep -E '^\s*version\s*=' "$kernel/build.toml" | grep -oE '[0-9]+')
             VERSION_BRANCH="v${VERSION}"
 
+            # Resolve the Hub repo-id from build.toml. Kernels whose repo-id is
+            # outside kernels-community live in their own org (e.g. MiniMaxAI/msa),
+            # so download from and upload to that repo (uploads open a PR).
+            REPO_ID=$(grep -E '^\s*repo-id\s*=' "$kernel/build.toml" | head -1 | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
+            if [ -z "$REPO_ID" ]; then
+              REPO_ID="$REPO_PREFIX/$kernel"
+            fi
+
             # Download existing kernel artifacts from the version branch.
-            ( cd "$kernel" && uvx --with huggingface_hub python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$REPO_PREFIX/$kernel', repo_type='kernel', local_dir='.', revision='$VERSION_BRANCH')" )
+            ( cd "$kernel" && uvx --with huggingface_hub python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$REPO_ID', repo_type='kernel', local_dir='.', revision='$VERSION_BRANCH')" )
 
             # Remove build variants that are not suitable for hashing:
             # - no __init__.py (not a Python kernel build)
@@ -101,15 +109,24 @@ jobs:
             nix run -L github:huggingface/kernels#kernel-builder -- \
               fill-card "$kernel" "$kernel"/build/CARD.md
 
-            # Upload signed artifacts back to the Hub (kernel repo type).
-            ( cd "$kernel" && nix run -L github:huggingface/kernels#kernel-builder -- \
-                upload --repo-type kernel --repo-id "$REPO_PREFIX/$kernel" --branch "$VERSION_BRANCH" )
+            # Upload signed artifacts back to the Hub (kernel repo type). For
+            # external-org kernels this opens a pull request (--create-pr,
+            # handled inside upload_and_report.py); there is no PR to comment on
+            # here, so no --comment-pr-number is passed.
+            python3 .github/scripts/upload_and_report.py \
+              --kernel "$kernel" \
+              --repo-prefix "$REPO_PREFIX" \
+              --branch "$VERSION_BRANCH" \
+              --builder "nix run -L github:huggingface/kernels#kernel-builder -- upload"
 
             # v1 kernels without an explicit branch in build.toml also get uploaded to main.
             BRANCH=$(grep -E '^\s*branch\s*=' "$kernel/build.toml" || true)
             if [ "$VERSION" = "1" ] && [ -z "$BRANCH" ]; then
-              ( cd "$kernel" && nix run -L github:huggingface/kernels#kernel-builder -- \
-                  upload --repo-type kernel --repo-id "$REPO_PREFIX/$kernel" --branch main )
+              python3 .github/scripts/upload_and_report.py \
+                --kernel "$kernel" \
+                --repo-prefix "$REPO_PREFIX" \
+                --branch main \
+                --builder "nix run -L github:huggingface/kernels#kernel-builder -- upload"
             fi
 
             # Clean up to reclaim disk space before the next kernel.

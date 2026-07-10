@@ -875,6 +875,10 @@ def main(*, dry_run: bool = False):
             head_sha=pr_head_sha or "",
             target_branch=target_branch,
             upload=dispatch_upload,
+            # For uploads, report Hub create-pr links back to this PR. Only
+            # external-org kernels (repo-id outside kernels-community) actually
+            # open PRs and comment; direct uploads ignore this.
+            comment_pr_number=str(issue_number) if dispatch_upload else "",
             # The audit is per-PR, so request it only once (on the first kernel).
             run_security=run_security and index == 0,
             dry_run=dry_run,

@@ -52,10 +52,17 @@ on:
         required: false
         type: string
         default: ""
+      comment_pr_number:
+        description: "PR to report Hub upload PR links back to (empty = no comment)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
   statuses: write
+  # Lets the upload step comment Hub create-pr links back on the originating PR.
+  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -337,25 +344,30 @@ jobs:
           cmake --build . --config Release --target local_install
           Pop-Location
 
-      # Upload built artifacts to both model and kernel Hub repos.
+      # Upload built artifacts to the Hub. Kernels whose build.toml repo-id lives
+      # outside kernels-community are uploaded via a pull request (--create-pr,
+      # handled inside upload_and_report.ps1) and the PR links reported back.
       - name: Upload kernel to Hub
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false
         shell: pwsh
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
+          COMMENT_PR_NUMBER: ${{ inputs.comment_pr_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           $KB = "$env:GITHUB_WORKSPACE\kernels\kernel-builder\target\debug\kernel-builder.exe"
-
-          $branchArgs = @()
-          if ($env:TARGET_BRANCH -ne "") {
-            $branchArgs = @("--branch", $env:TARGET_BRANCH)
-          }
-
-          # Upload to both model and kernel repo types
-          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" @branchArgs
+          & "$env:GITHUB_WORKSPACE\.github\scripts\windows\upload_and_report.ps1" `
+            -KernelBuilder $KB `
+            -KernelSource $env:KERNEL_SOURCE `
+            -RepoPrefix $env:REPO_PREFIX `
+            -Branch $env:TARGET_BRANCH `
+            -CommentPrNumber $env:COMMENT_PR_NUMBER `
+            -Label "${{ github.workflow }} / ${{ matrix.platform.backend }}" `
+            -RunUrl $env:RUN_URL
 
       # v1 kernels without an explicit branch override also get uploaded to main.
       - name: Upload v1 kernels to main
@@ -363,8 +375,11 @@ jobs:
         shell: pwsh
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
+          COMMENT_PR_NUMBER: ${{ inputs.comment_pr_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           $KB = "$env:GITHUB_WORKSPACE\kernels\kernel-builder\target\debug\kernel-builder.exe"
 
@@ -374,7 +389,14 @@ jobs:
             $content = Get-Content $buildTomlPath -Raw
             if ($content -match '(?m)^\s*version\s*=\s*1\s*(\r)?$' -and $content -notmatch '(?m)^\s*branch\s*=') {
               Write-Host "Kernel version is 1 and no branch override, uploading to main branch..."
-              & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" --branch main
+              & "$env:GITHUB_WORKSPACE\.github\scripts\windows\upload_and_report.ps1" `
+                -KernelBuilder $KB `
+                -KernelSource $env:KERNEL_SOURCE `
+                -RepoPrefix $env:REPO_PREFIX `
+                -Branch "main" `
+                -CommentPrNumber $env:COMMENT_PR_NUMBER `
+                -Label "${{ github.workflow }} / ${{ matrix.platform.backend }} / main" `
+                -RunUrl $env:RUN_URL
             } else {
               Write-Host "Kernel version is not 1 or branch is overridden, skipping main branch upload"
             }
