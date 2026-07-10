@@ -52,8 +52,12 @@ on:
         required: false
         type: string
         default: ""
+      # Accepted but unused: Windows only builds kernels-community kernels
+      # (dispatch allowlist), which upload directly and never open a pull
+      # request, so there is nothing to report back. Declared so dispatches that
+      # always pass this input (see dispatch.py) are not rejected with HTTP 422.
       comment_pr_number:
-        description: "PR to report Hub upload PR links back to (empty = no comment)"
+        description: "Unused on Windows (kept for dispatch input compatibility)"
         required: false
         type: string
         default: ""
@@ -61,8 +65,6 @@ on:
 permissions:
   contents: read
   statuses: write
-  # Lets the upload step comment Hub create-pr links back on the originating PR.
-  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -344,30 +346,27 @@ jobs:
           cmake --build . --config Release --target local_install
           Pop-Location
 
-      # Upload built artifacts to the Hub. Kernels whose build.toml repo-id lives
-      # outside kernels-community are uploaded via a pull request (--create-pr,
-      # handled inside upload_and_report.ps1) and the PR links reported back.
+      # Upload built artifacts to both model and kernel Hub repos. Windows only
+      # builds kernels-community kernels, so uploads always go directly (no
+      # --create-pr); external-org kernels are handled on the linux/mac builds.
       - name: Upload kernel to Hub
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false
         shell: pwsh
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
-          COMMENT_PR_NUMBER: ${{ inputs.comment_pr_number }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           $KB = "$env:GITHUB_WORKSPACE\kernels\kernel-builder\target\debug\kernel-builder.exe"
-          & "$env:GITHUB_WORKSPACE\.github\scripts\windows\upload_and_report.ps1" `
-            -KernelBuilder $KB `
-            -KernelSource $env:KERNEL_SOURCE `
-            -RepoPrefix $env:REPO_PREFIX `
-            -Branch $env:TARGET_BRANCH `
-            -CommentPrNumber $env:COMMENT_PR_NUMBER `
-            -Label "${{ github.workflow }} / ${{ matrix.platform.backend }}" `
-            -RunUrl $env:RUN_URL
+
+          $branchArgs = @()
+          if ($env:TARGET_BRANCH -ne "") {
+            $branchArgs = @("--branch", $env:TARGET_BRANCH)
+          }
+
+          # Upload to both model and kernel repo types
+          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" @branchArgs
 
       # v1 kernels without an explicit branch override also get uploaded to main.
       - name: Upload v1 kernels to main
@@ -375,11 +374,8 @@ jobs:
         shell: pwsh
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
-          COMMENT_PR_NUMBER: ${{ inputs.comment_pr_number }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           $KB = "$env:GITHUB_WORKSPACE\kernels\kernel-builder\target\debug\kernel-builder.exe"
 
@@ -389,14 +385,7 @@ jobs:
             $content = Get-Content $buildTomlPath -Raw
             if ($content -match '(?m)^\s*version\s*=\s*1\s*(\r)?$' -and $content -notmatch '(?m)^\s*branch\s*=') {
               Write-Host "Kernel version is 1 and no branch override, uploading to main branch..."
-              & "$env:GITHUB_WORKSPACE\.github\scripts\windows\upload_and_report.ps1" `
-                -KernelBuilder $KB `
-                -KernelSource $env:KERNEL_SOURCE `
-                -RepoPrefix $env:REPO_PREFIX `
-                -Branch "main" `
-                -CommentPrNumber $env:COMMENT_PR_NUMBER `
-                -Label "${{ github.workflow }} / ${{ matrix.platform.backend }} / main" `
-                -RunUrl $env:RUN_URL
+              & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" --branch main
             } else {
               Write-Host "Kernel version is not 1 or branch is overridden, skipping main branch upload"
             }
