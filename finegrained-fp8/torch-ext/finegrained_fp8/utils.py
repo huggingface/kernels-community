@@ -165,22 +165,9 @@ def is_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
 
 def is_mxfp(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     """Any MX weight/scale pair — MXFP8 (``float8_e4m3fn``, one value/byte) or MXFP4
-    (``int8``, two E2M1 codes/byte), both with UE8M0 group-32 scales. ``values_per_byte``
-    folds the two cases: the scale's last dim covers the unpacked K
-    (``weight.shape[-1] * values_per_byte``) in groups of ``MX_SCALE_GROUP_K``. The
-    dispatchers route on this; the op picks the format from ``weight.dtype``."""
-    if weight.dtype == torch.float8_e4m3fn:
-        values_per_byte = 1
-    elif weight.dtype == torch.int8:
-        values_per_byte = NIBBLES_PER_BYTE
-    else:
-        return False
-    return (
-        scale.dtype in UE8M0_SCALE_DTYPES
-        and scale.ndim == weight.ndim
-        and scale.shape[:-1] == weight.shape[:-1]
-        and scale.shape[-1] == (weight.shape[-1] * values_per_byte) // MX_SCALE_GROUP_K
-    )
+    (``int8``, two E2M1 codes/byte), both with UE8M0 group-32 scales. The dispatchers
+    route on this; the op picks the format from ``weight.dtype``."""
+    return is_mxfp8(weight, scale) or is_mxfp4(weight, scale)
 
 
 def is_tensor_wide(block_size, weight: torch.Tensor) -> bool:
@@ -417,7 +404,7 @@ def sm_shared_memory_limit(device_index: int) -> int:
             )
 
 
-def block_dynamic_grouped_gate_up_pruner(act_bytes: int, n_weight_tiles: int):
+def block_dynamic_grouped_gate_up_pruner(n_weight_tiles: int):
     """``early_config_prune`` for the block-dynamic grouped gate_up: the smem estimate (see
     ``smem_config_pruner``) plus the Triton 3.7.1 pipeliner-race guard. The kernel's
     six-load-stream dual-dot K-loop RACES under the default pipeliner at ``num_warps < 8``
@@ -426,7 +413,7 @@ def block_dynamic_grouped_gate_up_pruner(act_bytes: int, n_weight_tiles: int):
     combos (benign inf to the tuner). So: WS=True configs pass (compile failures self-prune),
     WS=False survives only in the verified-sound (w >= 8, BM <= 64) region. CUDA-only —
     the race is a CUDA pipeliner artifact and the WS axis isn't emitted elsewhere."""
-    smem_prune = smem_config_pruner(act_bytes=act_bytes, n_weight_tiles=n_weight_tiles)
+    smem_prune = smem_config_pruner(n_weight_tiles=n_weight_tiles)
 
     def prune(configs, named_args, **kwargs):
         kept = smem_prune(configs, named_args, **kwargs)
@@ -482,26 +469,68 @@ def block_dynamic_grouped_matmul_pruner():
     return prune
 
 
-def block_dynamic_matmul_pruner():
-    """``early_config_prune`` for the single (2D) block-dynamic matmul: drop the
-    ``warp_specialize`` configs that can never compile. Measured on sm_100 (big and
-    tiny shapes, matrix probe + 15-fresh-process flake runs): WS compiles iff the
-    launch ``BLOCK_SIZE_M >= 64`` with ``num_warps`` in {4, 8} (PassManager failure
-    otherwise) — the same compile region as the grouped sibling — but unlike the
-    grouped kernel the default pipeliner is race-free at every (BM, warps) here, so
-    non-WS configs all stay and WS is purely a perf axis. CUDA-only."""
+def warp_spec_compile_guard_pruner():
+    """``early_config_prune`` dropping ``warp_specialize`` configs that can never compile.
+    Measured on sm_100 for the plain-``tl.dot`` single-dot loops (matrix probe + 15-process
+    flake runs, big and tiny shapes, on both the 2D and grouped bd matmuls): WS compiles iff
+    ``BLOCK_SIZE_M >= 64`` with ``num_warps`` in {4, 8} (PassManager failure otherwise).
+    Non-WS configs all stay — on kernels using this guard the default pipeliner is the
+    validated existing state and WS is purely a perf axis (compiling WS configs are
+    deterministic by construction; off-region survivors self-prune as inf). ``BLOCK_SIZE_M``
+    is read from the config when tuned, else from the launch args. CUDA-only."""
 
     def prune(configs, named_args, **kwargs):
         dev = triton.runtime.driver.active.get_active_torch_device()
         if dev.type != "cuda":
             return configs
-        bm = {**named_args, **kwargs}.get("BLOCK_SIZE_M", 128)
+        launch_bm = {**named_args, **kwargs}.get("BLOCK_SIZE_M", 128)
+
+        def ok(c):
+            if not c.kwargs.get("WARP_SPEC"):
+                return True
+            bm = c.kwargs.get("BLOCK_SIZE_M", launch_bm)
+            return bm >= 64 and c.num_warps in (4, 8)
+
+        return [c for c in configs if ok(c)] or configs
+
+    return prune
+
+
+def compose_pruners(*pruners):
+    """Chain ``early_config_prune`` callbacks left to right (each sees the previous
+    survivors)."""
+
+    def prune(configs, named_args, **kwargs):
+        for p in pruners:
+            configs = p(configs, named_args, **kwargs)
+        return configs
+
+    return prune
+
+
+def block_k_within_k_pruner(k_arg: str):
+    """``early_config_prune`` dropping configs whose ``BLOCK_SIZE_K`` does not divide the
+    launch's contraction dim (``k_arg`` names the launch argument): the K-loops load
+    unmasked, so a non-dividing BK's last trip reads past the row — silently wrong results
+    the tuner would happily time and pick. A contraction dim smaller than every grid BK is
+    a hard error. Used standalone by the tensor-dynamic kernels (``BLOCK_SIZE_K`` is a
+    tuned axis there) and as the first stage of ``batched_mx_pruner``."""
+
+    def prune(configs, named_args, **kwargs):
+        k = {**named_args, **kwargs}[k_arg]
         kept = [
             c
             for c in configs
-            if not c.kwargs.get("WARP_SPEC") or (bm >= 64 and c.num_warps in (4, 8))
+            if c.kwargs.get("BLOCK_SIZE_K", 0) == 0 or k % c.kwargs["BLOCK_SIZE_K"] == 0
         ]
-        return kept or configs
+        if not kept:
+            min_bk = min(c.kwargs.get("BLOCK_SIZE_K", 0) for c in configs)
+            raise ValueError(
+                f"{k_arg}={k} is not a multiple of any BLOCK_SIZE_K in the autotune grid; "
+                f"the unmasked K-loop would read past the row. Pad the problem along "
+                f"{k_arg} (smallest grid BK: {min_bk})."
+            )
+        return kept
 
     return prune
 
@@ -536,22 +565,11 @@ def batched_mx_pruner(k_arg: str, stacked_gate_up: bool = False):
     fallbacks cover the pathological cases). A contraction dim smaller than every grid BK is
     a hard error: any config would over-read past the row and return silently wrong results."""
     n_blocks = 2 if stacked_gate_up else 1
+    bk_within_k = block_k_within_k_pruner(k_arg)
 
     def prune(configs, named_args, **kwargs):
         all_args = {**named_args, **kwargs}
-        k = all_args[k_arg]
-        kept = [
-            c
-            for c in configs
-            if c.kwargs.get("BLOCK_SIZE_K", 0) == 0 or k % c.kwargs["BLOCK_SIZE_K"] == 0
-        ]
-        if not kept:
-            min_bk = min(c.kwargs.get("BLOCK_SIZE_K", 0) for c in configs)
-            raise ValueError(
-                f"{k_arg}={k} is not a multiple of any BLOCK_SIZE_K in the autotune grid; "
-                f"the unmasked K-loop would read past the row. Pad the problem along "
-                f"{k_arg} (smallest grid BK: {min_bk})."
-            )
+        kept = bk_within_k(configs, named_args, **kwargs)
         dev = triton.runtime.driver.active.get_active_torch_device()
         dev_index = dev.index if dev.index is not None else 0
         is_sm10x = (
@@ -576,7 +594,6 @@ def batched_mx_pruner(k_arg: str, stacked_gate_up: bool = False):
 
 
 def smem_config_pruner(
-    act_bytes: int,
     n_weight_tiles: int,
     weight_bytes: int = 1,
     reduction_dim: str | None = None,
@@ -588,9 +605,10 @@ def smem_config_pruner(
 
     Per-stage estimate (bytes) = ``BK · (act_bytes·BM + weight_bytes·n_weight_tiles·BN)``:
     one activation tile ``[BM, BK]`` plus ``n_weight_tiles`` weight tiles ``[BN, BK]``
-    (gate_up loads 2; down has 1), times ``num_stages``. ``BM`` is the routing-derived tile,
-    read from the launch args. MXFP4 packs 2 weights/byte, so ``weight_bytes=1`` (MXFP8) is a
-    safe upper bound. The limit is read from the active device. Never returns empty — keeps
+    (gate_up loads 2; down has 1), times ``num_stages``. ``BM`` is the routing-derived tile
+    and the act element size is read off the first launch arg (the activation tensor by
+    kernel convention), so both track the launch. MXFP4 packs 2 weights/byte, so
+    ``weight_bytes=1`` (MXFP8) is a safe upper bound. The limit is read from the active device. Never returns empty — keeps
     the smallest-footprint config as a fallback.
 
     Two sm_10x (Blackwell-datacenter, TMEM scaled-MMA) ``dot_scaled`` compiler-bug guards, both
@@ -639,10 +657,14 @@ def smem_config_pruner(
 
         def smem(c):
             """Peak pipelined-operand shared memory (bytes) for ``c``: ``num_stages`` copies of one
-            ``[BM, BK]`` activation tile plus ``n_weight_tiles`` ``[BN, BK]`` weight tiles."""
+            ``[BM, BK]`` activation tile plus ``n_weight_tiles`` ``[BN, BK]`` weight tiles.
+            The act element size is read off the FIRST launch arg — the activation tensor
+            by kernel convention — so it tracks the dtype per launch (fp8 offline arm vs
+            raw bf16 inline arm below the ``maybe_act_quant`` threshold)."""
             BM, BN, BK = (
                 dim(c, n) for n in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K")
             )
+            act_bytes = next(iter(named_args.values())).element_size()
             return (
                 c.num_stages
                 * BK
@@ -987,7 +1009,7 @@ def mx_swap_compute(
     (``[1, BLOCK_SIZE_N]`` reduce). The acc shapes diverge, but only the taken constexpr branch
     compiles so the single return never has to unify them. Swap has no ``dot`` path (dead at M=1
     decode). ``BLOCK_SIZE_N`` is the weight tile's row count — the gate_up kernel passes ``2*BN``
-    with its STACKED gate|up tile (gate rows first, split back via ``swap_split_gate_up``): one
+    with its STACKED gate|up tile (gate rows first, split back via ``split_gate_up``): one
     load and one MMA for both projections keeps the native mxfp M=128 operand at BN=64, doubling
     the CTAs on the parallelism-starved decode grid (dsv4 gate_up 1.34x, bit-exact)."""
     a1 = tl.reshape(a, (BLOCK_SIZE_K,))
@@ -1023,15 +1045,6 @@ def swap_pad_rhs(a, BLOCK_SIZE_K: tl.constexpr):
         tl.arange(0, MMA_N_ATOM)[None, :] == 0,
         a[:, None],
         tl.zeros((BLOCK_SIZE_K, MMA_N_ATOM), a.dtype),
-    )
-
-
-@triton.jit
-def swap_take_col0(acc, ROWS: tl.constexpr):
-    """Extract column 0 of a ``[ROWS, MMA_N_ATOM]`` swap-AB accumulator → ``[1, ROWS]`` (the padded
-    token dim collapses back to the single real token)."""
-    return tl.reshape(
-        tl.sum(acc * (tl.arange(0, MMA_N_ATOM)[None, :] == 0), axis=1), (1, ROWS)
     )
 
 
@@ -1134,7 +1147,10 @@ def acc_finalize(
     Swapped scalar (already ``[1, ROWS]``) and no-swap pass through unchanged. ``COMPUTE_MODE``
     matches ``acc_init``'s (fp8 ``tl.dot`` kernels, which have no mode axis, pass ``"dot"``)."""
     if SWAP_AB and COMPUTE_MODE != "scalar":
-        acc = swap_take_col0(acc, ROWS)
+        # take column 0: the padded token dim collapses back to the single real token
+        acc = tl.reshape(
+            tl.sum(acc * (tl.arange(0, MMA_N_ATOM)[None, :] == 0), axis=1), (1, ROWS)
+        )
     return acc
 
 
@@ -1331,30 +1347,20 @@ def _mxfp_act_quant_kernel(
     )
 
 
-# Minimum M for offline activation pre-quant (``maybe_act_quant``); below it the
-# consumer kernel quantizes inline. From a B200 2D-matmul crossover sweep (graph-timed,
-# H=6144 MXFP8 / H=4096 MXFP4): inline wins only at M=1 (33 vs 44us / 20 vs 30us);
-# offline wins from M=16 for MXFP8 (22 vs 33us) and M=32 up for both (2-3x by M>=64).
-# MXFP4's M=16 cell marginally favors inline (15 vs 17us) — outweighed by MXFP8's win.
-ACT_PREQUANT_MIN_M = 16
-
-
-def maybe_act_quant(x, act_quant):
-    """Row-count-gated offline activation pre-quant for the MX recipes. Apply
-    ``act_quant`` (a one-pass quant kernel, e.g. ``mxfp_act_quant``) when the GEMM
-    consuming ``x`` is compute-bound (``rows >= ACT_PREQUANT_MIN_M``) — the inline form
-    re-quantizes per N-tile there. Below the threshold return ``x`` raw: the
-    weight-bandwidth-bound GEMM quantizes its one thin tile inline for free (the UE8M0
-    inline quant is exponent-only), and a separate quant kernel is pure added latency
-    (M=1 graph attn decode measured 0.66-0.85x offline). Bit-exact either way. Returns
-    ``(a, a_scale)``; the consumer kernel picks its arm off ``a``'s dtype at compile
-    time (fp8 = pre-quantized, raw bf16/fp16 = quantize inline), so in the inline arm
-    ``a_scale`` is a constexpr-dead placeholder.
-
-    The block-FP8 recipes DON'T gate: their inline form pays a real fp32 amax+div per
-    tile and offline measured strictly better at every M (M=1 graph attn decode 1.28x
-    offline), so their wrappers call ``fp8_act_quant_2d`` unconditionally."""
-    if x.shape[0] >= ACT_PREQUANT_MIN_M:
+def maybe_act_quant(x, act_quant, min_m):
+    """Row-count-gated offline activation pre-quant. Apply ``act_quant`` (a one-pass
+    quant kernel, e.g. ``mxfp_act_quant``) when the GEMM consuming ``x`` is
+    compute-bound (``rows >= min_m``) — the inline form re-quantizes per N-tile there.
+    ``min_m`` is the consumer kernel's crossover, defined next to its wrapper with its
+    provenance (measured sweep or inherited estimate). Below the threshold return ``x``
+    raw: the weight-bandwidth-bound GEMM quantizes its
+    one thin tile inline for free (the UE8M0 inline quant is exponent-only), and a
+    separate quant kernel is pure added latency (M=1 graph attn decode measured
+    0.66-0.85x offline). Bit-exact either way. Returns ``(a, a_scale)``; the consumer
+    kernel picks its arm off ``a``'s dtype at compile time (fp8 = pre-quantized, raw
+    bf16/fp16 = quantize inline), so in the inline arm ``a_scale`` is a constexpr-dead
+    placeholder."""
+    if x.shape[0] >= min_m:
         return act_quant(x)
     return x, x
 

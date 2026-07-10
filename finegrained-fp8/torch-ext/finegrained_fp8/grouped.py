@@ -17,6 +17,7 @@ import triton
 import triton.language as tl
 
 from ._ops import add_op_namespace_prefix
+
 from .bayesian_autotuner import bayesian_autotune
 from .utils import (
     compile_time_only_triton_op,
@@ -26,6 +27,8 @@ from .utils import (
     UE8M0_SCALE_DTYPES,
     adaptive_block_size_m,
     block_dynamic_grouped_matmul_pruner,
+    block_k_within_k_pruner,
+    compose_pruners,
     device_context,
     maybe_act_quant,
     mxfp_act_quant,
@@ -33,6 +36,7 @@ from .utils import (
     fp8_act_quant,
     fp8_act_quant_2d,
     get_accelerator_autotuning_configs,
+    warp_spec_compile_guard_pruner,
     get_mxfp_autotuning_configs,
     is_mxfp,
     is_tensor_wide,
@@ -42,6 +46,13 @@ from .utils import (
     mx_dot_rescale,
     mx_dot_scaled,
 )
+
+# maybe_act_quant crossover (min rows for offline pre-quant) for the grouped MX matmul —
+# inherited from the 2D-matmul sweep (same per-N-tile redundancy physics), not re-swept.
+MXFP_GROUPED_ACT_PREQUANT_MIN_M = 16
+# Offline always: the prefill port measured offline decisively (GLM unfused prefill
+# 1.75x vs hub) and the 2D sweep shows offline winning down to M=1 for block-dynamic.
+BLOCK_DYNAMIC_GROUPED_ACT_PREQUANT_MIN_M = 0
 
 
 def _grouped_tile_layout(
@@ -234,9 +245,16 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(tune_block_nk=True),
+    get_accelerator_autotuning_configs(tune_block_nk=True, warp_spec=True),
     ["N", "K", "BLOCK_SIZE_M"],
     n_trials=100,
+    # BLOCK_SIZE_K is a tuned axis and the K-loop is maskless — veto non-dividing BKs;
+    # WS is a pure perf axis here (non-WS is the validated state), compile-guarded.
+    prune_configs_by={
+        "early_config_prune": compose_pruners(
+            block_k_within_k_pruner("K"), warp_spec_compile_guard_pruner()
+        )
+    },
 )
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
@@ -269,6 +287,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
+    WARP_SPEC: tl.constexpr = False,
 ):
     """Tensor-scale grouped FP8 expert matmul kernel.
 
@@ -308,7 +327,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     b_s = tl.load(Bs + expert_id * stride_bs_e)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for _ in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
         a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
         b = tl.load(b_ptrs)
         accumulator += tl.dot(a, b)
@@ -446,7 +465,8 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     block_size: list[int],
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Block-scale grouped FP8 matmul: C = A @ B.T per expert, with fused act quant.
+    """Block-scale grouped FP8 matmul: C = A @ B.T per expert; activations quantized
+    offline in one pass.
 
     A:  (S, K) raw bf16/fp16 activations, sorted by expert
     B:  (num_experts, N, K) FP8 expert weights
@@ -479,9 +499,11 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
 
     Bs = ue8m0_as_uint8(Bs)
     C = A.new_empty(S, N, dtype=output_dtype)
-    # Offline at every M — block-FP8's inline quant pays a real fp32 amax+div per tile
-    # (see maybe_act_quant's rationale); no gate needed.
-    A_q, A_s = fp8_act_quant_2d(A, block_k)
+    A_q, A_s = maybe_act_quant(
+        A,
+        lambda x: fp8_act_quant_2d(x, block_k),
+        BLOCK_DYNAMIC_GROUPED_ACT_PREQUANT_MIN_M,
+    )
     BLOCK_SIZE_M = adaptive_block_size_m((S + num_experts - 1) // num_experts)
     tile_offsets, max_m_tiles = _grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, num_experts
@@ -537,7 +559,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     tokens_per_expert: torch.Tensor,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Tensor-scale grouped FP8 matmul: C = A @ B.T per expert, with fused act quant.
+    """Tensor-scale grouped FP8 matmul: C = A @ B.T per expert; activations quantized
+    offline per row in the wrapper.
 
     A:  (S, K) raw bf16/fp16 activations, sorted by expert
     B:  (num_experts, N, K) FP8 expert weights
@@ -619,7 +642,8 @@ def mxfp_dynamic_matmul_grouped(
     tokens_per_expert: torch.Tensor,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Grouped MX matmul with fused act quant — per-expert ``C[s] = A[s] @ B[e].T`` over
+    """Grouped MX matmul — per-expert ``C[s] = A[s] @ B[e].T`` (activations quantized
+    offline above the ``maybe_act_quant`` threshold, inline below it) over
     contiguous, expert-sorted rows. Weight format detected from ``B.dtype``: ``int8`` →
     packed E2M1 (MXFP4, ``B`` is ``(num_experts, N, K//2)``); ``float8_e4m3fn`` → unpacked E4M3
     (MXFP8, ``(num_experts, N, K)``). UE8M0 group-32 scales ``(num_experts, N, K//32)``; tile + dot autotuned.
@@ -655,7 +679,7 @@ def mxfp_dynamic_matmul_grouped(
     bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty((S, N), dtype=output_dtype)
     # One-pass MX pre-quant (bit-exact with the old inline form: group-32 boundaries align).
-    A_q, A_s = maybe_act_quant(A, mxfp_act_quant)
+    A_q, A_s = maybe_act_quant(A, mxfp_act_quant, MXFP_GROUPED_ACT_PREQUANT_MIN_M)
     BLOCK_SIZE_M = adaptive_block_size_m((S + num_experts - 1) // num_experts)
     tile_offsets, max_m_tiles = _grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, num_experts

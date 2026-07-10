@@ -54,12 +54,19 @@ from .utils import (
     load_mx_act_tile,
     mxfp_act_quant_inline,
     mx_compute,
+    compose_pruners,
     smem_config_pruner,
+    warp_spec_compile_guard_pruner,
     block_dynamic_grouped_gate_up_pruner,
     glu,
     e2m1_as_uint8,
     ue8m0_as_uint8,
 )
+
+# maybe_act_quant crossover (min rows for offline pre-quant) for the fused MX gate_up —
+# inherited from the 2D-matmul sweep; the true crossover is LOWER (each token is gathered
+# by top_k experts, multiplying the inline re-quant redundancy), so 16 is conservative.
+MXFP_GATE_UP_ACT_PREQUANT_MIN_M = 16
 
 
 # ── Persistent tile scheduling (register-resident expert-tile layout) ─────────
@@ -252,7 +259,7 @@ _MX_MEMORY_MODES = ("descriptor", "pointer")
     # fp8 pre-quantized activation tile + fused gate|up weight tiles; WS-race guard (the
     # non-WS dual-dot loop races at w<8 / BM>64 on Triton 3.7.1 — see the pruner).
     prune_configs_by={
-        "early_config_prune": block_dynamic_grouped_gate_up_pruner(act_bytes=1, n_weight_tiles=2)
+        "early_config_prune": block_dynamic_grouped_gate_up_pruner(n_weight_tiles=2)
     },
 )
 @triton.jit
@@ -347,7 +354,9 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
 
         acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for _ in tl.range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+        for _ in tl.range(
+            0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K), warp_specialize=WARP_SPEC
+        ):
             a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
             a_s = tl.load(as_ptrs, mask=row_mask, other=0.0)
             w_gate = tl.load(gate_ptr)
@@ -389,12 +398,15 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(tune_block_m=True),
+    get_accelerator_autotuning_configs(tune_block_m=True, warp_spec=True),
     ["INTERMEDIATE_DIM", "HIDDEN_DIM", "tokens_per_sm_bit_length"],
     n_trials=100,
-    # fp8 intermediate activation tile + single down weight tile
+    # fp8 intermediate activation tile + single down weight tile; WS is a pure perf
+    # axis (non-WS is the validated state), compile-guarded.
     prune_configs_by={
-        "early_config_prune": smem_config_pruner(act_bytes=1, n_weight_tiles=1)
+        "early_config_prune": compose_pruners(
+            smem_config_pruner(n_weight_tiles=1), warp_spec_compile_guard_pruner()
+        )
     },
 )
 @triton.jit
@@ -430,6 +442,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
     NUM_EXPERTS: tl.constexpr,
     NUM_SMS: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
+    WARP_SPEC: tl.constexpr = False,
 ):
     """Phase 2: persistent grid-stride over (M-tile, H-tile). Grouped down over the FP8
     intermediate, then routing-weight × scatter to the flat (token, slot) row."""
@@ -459,7 +472,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
         ws_down_ptr = DownScale + expert_id64 * stride_downs_e + pid_h * stride_downs_h
 
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for i_tile in range(0, NUM_I_TILES):
+        for i_tile in tl.range(0, NUM_I_TILES, warp_specialize=WARP_SPEC):
             i_off = i_tile * BLOCK_SIZE_K
             inter = tl.load(
                 Inter
@@ -480,8 +493,17 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
             ws_down_ptr += stride_downs_i
 
         scatter_weighted_tile(
-            ProjOut, acc, offs_global_m, offs_h, row_mask, Perm, SampleWeights,
-            stride_perm, stride_po_m, stride_po_n, SIMULATE_UNFUSED,
+            ProjOut,
+            acc,
+            offs_global_m,
+            offs_h,
+            row_mask,
+            Perm,
+            SampleWeights,
+            stride_perm,
+            stride_po_m,
+            stride_po_n,
+            SIMULATE_UNFUSED,
         )
 
 
@@ -660,7 +682,7 @@ def _set_gate_up_descriptor(nargs):
     # fp8 pre-quantized activation tile + fused gate|up weight tiles
     prune_configs_by={
         "early_config_prune": smem_config_pruner(
-            act_bytes=1, n_weight_tiles=2, reduction_dim="HIDDEN_DIM", double_mma=True
+            n_weight_tiles=2, reduction_dim="HIDDEN_DIM", double_mma=True
         )
     },
 )
@@ -874,7 +896,7 @@ def _set_down_descriptor(nargs):
     # fp8 intermediate activation tile + single down weight tile
     prune_configs_by={
         "early_config_prune": smem_config_pruner(
-            act_bytes=1, n_weight_tiles=1, reduction_dim="INTERMEDIATE_DIM"
+            n_weight_tiles=1, reduction_dim="INTERMEDIATE_DIM"
         )
     },
 )
@@ -1015,8 +1037,17 @@ def mxfp_dynamic_moe_grouped_down_kernel(
             as_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_is_n
 
         scatter_weighted_tile(
-            ProjOut, acc, offs_global_m, offs_bn, row_mask, Perm, SampleWeights,
-            stride_perm, stride_po_m, stride_po_n, SIMULATE_UNFUSED,
+            ProjOut,
+            acc,
+            offs_global_m,
+            offs_bn,
+            row_mask,
+            Perm,
+            SampleWeights,
+            stride_perm,
+            stride_po_m,
+            stride_po_n,
+            SIMULATE_UNFUSED,
         )
 
 
@@ -1060,7 +1091,9 @@ def mxfp_dynamic_moe_grouped(
     # One-pass MX pre-quant of the activations: the gate_up kernel used to re-run the inline
     # quant per N-tile (16x redundant ALU + 2x act bytes) — it held gate_up at ~380 TFLOPS
     # while the pre-quantized down kernel ran ~1080. Bit-exact (same group-32 boundaries).
-    hidden_q, hidden_scale = maybe_act_quant(hidden_states, mxfp_act_quant)
+    hidden_q, hidden_scale = maybe_act_quant(
+        hidden_states, mxfp_act_quant, MXFP_GATE_UP_ACT_PREQUANT_MIN_M
+    )
 
     inter = torch.empty(
         num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=FP8_DTYPE

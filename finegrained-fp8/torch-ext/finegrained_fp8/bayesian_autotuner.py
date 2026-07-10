@@ -301,6 +301,7 @@ class BayesianAutotuner(Autotuner):
             groups.setdefault(basin, []).append(i)
         if len(groups) <= 1:
             return []
+
         def tile_order(i):
             return (
                 configs[i].kwargs.get("BLOCK_SIZE_N", 0),
@@ -308,7 +309,10 @@ class BayesianAutotuner(Autotuner):
                 configs[i].num_warps,
                 configs[i].num_stages,
             )
-        return [sorted(idxs, key=tile_order)[len(idxs) // 2] for idxs in groups.values()]
+
+        return [
+            sorted(idxs, key=tile_order)[len(idxs) // 2] for idxs in groups.values()
+        ]
 
     def _warm_start_index(self, configs: List[Config]):
         """Return the index in ``configs`` matching the most recently cached

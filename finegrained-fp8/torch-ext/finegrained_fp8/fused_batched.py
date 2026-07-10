@@ -25,6 +25,7 @@ import triton
 import triton.language as tl
 
 from ._ops import add_op_namespace_prefix
+
 from .utils import (
     compile_time_only_triton_op,
     compile_time_only_triton_wrap,
@@ -35,6 +36,9 @@ from .utils import (
     batched_mx_pruner,
     device_context,
     fp8_act_quant_inline,
+    maybe_act_quant,
+    tl_dtype,
+    fp8_act_quant_2d,
     get_mxfp_autotuning_configs,
     is_mxfp,
     is_mxfp4,
@@ -55,6 +59,11 @@ from .utils import (
 )
 from .batched import store_row
 from .bayesian_autotuner import bayesian_autotune
+
+# MEASURED (isolated arm A/B, graph-timed, GLM-5.2 dims): offline wins at T=1 (65.8 vs
+# 71.1us), T=4 and T=16; inline noses ahead ~2% (noise-tier) only at T=64 — outside the
+# decode regime this kernel serves. Offline always.
+BLOCK_DYNAMIC_GATE_UP_ACT_PREQUANT_MIN_M = 0
 
 
 # ── Batched fused: two-kernel approach (no sorting, no atomics) ──────────────
@@ -88,7 +97,8 @@ _DECODE_BM_SWAP = decode_bm_swap_pairs()
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
-    HiddenStates,
+    HiddenStates,  # (T, H) E4M3 activations (pre-quantized once by the wrapper), UNEXPANDED
+    HiddenScale,  # (T, H // BLOCK_SIZE_K) fp32 per-row, per-K-block activation scales
     GateUp,
     GateUpScale,
     Intermediate,
@@ -96,6 +106,7 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     ExpertIds,
     stride_a_m,
     stride_a_k,
+    stride_as_m,
     stride_gu_e,
     stride_gu_n,
     stride_gu_k,
@@ -115,9 +126,12 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
+    INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     SWAP_AB: tl.constexpr = False,
 ):
     """Batched kernel 1: per-token gate_up + SiLU + FP8 quant. Grid: (S, N-tiles).
+    Activations arrive pre-quantized (one wrapper pass — the inline quant re-ran per
+    N-tile and paid a per-tile amax reduction).
 
     ``SWAP_AB`` (tuner axis, M=1 decode): load the weights output-rows-major ``[BN, BK]`` and put
     those rows in the MMA M dim, padding the single token to the N=16 atom; column 0 of the
@@ -142,6 +156,7 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
         + (token + tl.arange(0, BLOCK_SIZE_M) * 0)[:, None] * stride_a_m
         + tl.arange(0, BLOCK_SIZE_K)[None, :] * stride_a_k
     )
+    as_ptr = HiddenScale + (token + tl.arange(0, BLOCK_SIZE_M) * 0) * stride_as_m
     gate_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     up_n = INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     kk = tl.arange(0, BLOCK_SIZE_K)
@@ -161,8 +176,11 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     acc_up = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
 
     for _ in range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K)):
-        a_raw = tl.load(a_ptr).to(tl.float32)
-        a, a_s = fp8_act_quant_inline(a_raw)
+        if HiddenStates.dtype.element_ty == tl.float8e4nv:  # pre-quantized offline
+            a = tl.load(a_ptr)
+            a_s = tl.load(as_ptr)
+        else:  # raw bf16/fp16 — quantize inline
+            a, a_s = fp8_act_quant_inline(tl.load(a_ptr).to(tl.float32))
 
         w_gate = tl.load(b_gate_ptr)
         w_up = tl.load(b_up_ptr)
@@ -175,6 +193,7 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
         acc_up += fp8_dot(a, w_up, SWAP_AB, BLOCK_SIZE_K) * a_s[:, None] * w_s_up
 
         a_ptr += BLOCK_SIZE_K * stride_a_k
+        as_ptr += 1
         b_gate_ptr += BLOCK_SIZE_K * stride_gu_k
         b_up_ptr += BLOCK_SIZE_K * stride_gu_k
         bs_gate_ptr += stride_gus_k
@@ -190,7 +209,7 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
         SWIGLU_ALPHA,
         SWIGLU_LIMIT,
         SIMULATE_UNFUSED,
-        HiddenStates.dtype.element_ty,
+        INTERMEDIATE_DTYPE,
     )
 
     # Requant the intermediate to FP8 — the same inline per-row act quant as the inputs;
@@ -352,17 +371,24 @@ def _w8a8_block_dynamic_fp8_moe_batched(
         num_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
     )
     with device_context(device):
+        hidden_q, hidden_s = maybe_act_quant(
+            hidden_states,
+            lambda x: fp8_act_quant_2d(x, BLOCK_SIZE_K),
+            BLOCK_DYNAMIC_GATE_UP_ACT_PREQUANT_MIN_M,
+        )
         compile_time_only_triton_wrap(
             w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel
         )[(num_routed_tokens, NUM_N_TILES)](
-            hidden_states,
+            hidden_q,
+            hidden_s,
             gate_up_proj,
             gate_up_proj_scale,
             inter,
             inter_scales,
             top_k_index,
-            hidden_states.stride(0),
-            hidden_states.stride(1),
+            hidden_q.stride(0),
+            hidden_q.stride(1),
+            hidden_s.stride(0),
             gate_up_proj.stride(0),
             gate_up_proj.stride(1),
             gate_up_proj.stride(2),
@@ -381,6 +407,9 @@ def _w8a8_block_dynamic_fp8_moe_batched(
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
+            # the dtype the UNFUSED path lands the GLU intermediate in (the model's
+            # activation dtype) — the kernel can't read it off the fp8 activations
+            INTERMEDIATE_DTYPE=tl_dtype(hidden_states.dtype),
         )
         compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_moe_batched_down_kernel)[
             (num_routed_tokens, NUM_H_TILES)

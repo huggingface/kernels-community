@@ -19,6 +19,7 @@ import triton.language as tl
 from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
 from .utils import (
+    FP8_DTYPE,
     compile_time_only_triton_op,
     compile_time_only_triton_wrap,
     NIBBLES_PER_BYTE,
@@ -26,14 +27,17 @@ from .utils import (
     UE8M0_SCALE_DTYPES,
     adaptive_block_size_m,
     batched_mx_pruner,
-    block_dynamic_matmul_pruner,
+    block_k_within_k_pruner,
+    compose_pruners,
     decode_ue8m0_scale,
     mx_dot_rescale,
     mx_dot_scaled,
     device_context,
     fp8_act_quant,
     fp8_act_quant_2d,
+    fp8_act_quant_inline,
     get_accelerator_autotuning_configs,
+    warp_spec_compile_guard_pruner,
     get_mxfp_autotuning_configs,
     is_mxfp,
     is_tensor_wide,
@@ -47,6 +51,18 @@ from .utils import (
 # Swizzle group size for the 2D-grid kernels' L2-locality tiling (``_swizzle_offsets``) —
 # a perf knob passed as the ``GROUP_SIZE_M`` constexpr, not a correctness parameter.
 GROUP_SIZE_M = 8
+
+# maybe_act_quant crossovers (min rows for offline pre-quant). MXFP: MEASURED — B200
+# 2D-matmul sweep, graph-timed, H=6144 MXFP8 / H=4096 MXFP4: inline wins only at M=1
+# (33 vs 44us / 20 vs 30us), offline from M=16 for MXFP8 (22 vs 33us), 2-3x by M>=64
+# (MXFP4's M=16 cell marginally favors inline — outweighed). STATIC: inherited estimate,
+# not swept — its inline arm is cheaper elementwise work, so the true crossover is at or
+# above the MXFP one; the M=1 decode case (the one that matters) is inline either way.
+MXFP_MATMUL_ACT_PREQUANT_MIN_M = 16
+STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
+# MEASURED (isolated arm A/B, graph-timed, H=6144 b128): offline wins at EVERY M incl.
+# M=1 (24.7 vs 31.0us) — the inline arm pays a per-tile fp32 amax+div.
+BLOCK_DYNAMIC_MATMUL_ACT_PREQUANT_MIN_M = 0
 
 
 @triton.jit
@@ -103,7 +119,7 @@ def _store_masked(
     ["N", "K", "BLOCK_SIZE_M"],
     n_trials=100,
     # WS compile guard only — non-WS is race-free at every (BM, warps) here (see the pruner).
-    prune_configs_by={"early_config_prune": block_dynamic_matmul_pruner()},
+    prune_configs_by={"early_config_prune": warp_spec_compile_guard_pruner()},
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_kernel(
@@ -151,8 +167,11 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-        a = tl.load(a_ptrs)
-        a_s = tl.load(as_ptrs)
+        if A.dtype.element_ty == tl.float8e4nv:  # pre-quantized offline
+            a = tl.load(a_ptrs)
+            a_s = tl.load(as_ptrs)
+        else:  # raw bf16/fp16 — quantize inline
+            a, a_s = fp8_act_quant_inline(tl.load(a_ptrs).to(tl.float32))
         b = tl.load(b_ptrs)
         b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
@@ -175,9 +194,17 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     )
 
 
-@triton.autotune(
-    configs=get_accelerator_autotuning_configs(tune_block_nk=True),
-    key=["N", "K", "BLOCK_SIZE_M"],
+@bayesian_autotune(
+    get_accelerator_autotuning_configs(tune_block_nk=True, warp_spec=True),
+    ["N", "K", "BLOCK_SIZE_M"],
+    n_trials=100,
+    # BLOCK_SIZE_K is a tuned axis and the loop below is maskless — veto non-dividing BKs;
+    # WS is a pure perf axis here (non-WS is the validated state), compile-guarded.
+    prune_configs_by={
+        "early_config_prune": compose_pruners(
+            block_k_within_k_pruner("K"), warp_spec_compile_guard_pruner()
+        )
+    },
 )
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_kernel(
@@ -203,6 +230,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    WARP_SPEC: tl.constexpr = False,
 ):
     """Tensor-scale FP8 GEMM kernel.
 
@@ -221,10 +249,9 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
 
     # Accumulate raw dot products, apply scales once after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        k_remaining = K - k * BLOCK_SIZE_K
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+        a = tl.load(a_ptrs)
+        b = tl.load(b_ptrs)
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -251,7 +278,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
 )
 @triton.jit
 def w8a8_block_static_fp8_matmul_kernel(
-    A,  # (M, K) raw BF16/FP16 activations
+    A,  # (M, K) E4M3 activations (pre-quantized against the static scale by the wrapper)
     B,  # (N, K) FP8 weights
     C,  # (M, N) output
     As,  # scalar — static per-tensor activation scale (calibration-time)
@@ -277,10 +304,10 @@ def w8a8_block_static_fp8_matmul_kernel(
 ):
     """Block-scale FP8 GEMM with static (per-tensor) activation scale.
 
-    ``A`` is raw bf16/fp16; the kernel divides by the scalar ``As`` and casts
-    to FP8 inline. Per-block weight scales apply per-K-tile during
-    accumulation; the scalar activation scale factors out of the loop and
-    is applied once at the end.
+    ``A`` arrives pre-quantized (one elementwise ``(A / As).to(fp8)`` pass in the
+    wrapper — the inline division re-ran per N-tile). Per-block weight scales apply
+    per-K-tile during accumulation; the scalar activation scale is applied once at
+    the end.
     """
     pid_m, pid_n, offs_am, offs_bn, offs_k = _swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
@@ -294,12 +321,11 @@ def w8a8_block_static_fp8_matmul_kernel(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        k_remaining = K - k * BLOCK_SIZE_K
-        a_raw = tl.load(a_ptrs, mask=offs_k[None, :] < k_remaining, other=0.0).to(
-            tl.float32
-        )
-        a = (a_raw / a_s_static).to(tl.float8e4nv)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
+        if A.dtype.element_ty == tl.float8e4nv:  # pre-quantized offline
+            a = tl.load(a_ptrs)
+        else:  # raw bf16/fp16 — quantize inline against the static scale
+            a = (tl.load(a_ptrs).to(tl.float32) / a_s_static).to(tl.float8e4nv)
+        b = tl.load(b_ptrs)
         b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
         accumulator += tl.dot(a, b) * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -436,7 +462,7 @@ def w8a8_block_dynamic_fp8_matmul(
     block_size: list[int],
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Block-scale FP8 matmul: ``C = A @ B.T`` with fused activation quantization.
+    """Block-scale FP8 matmul: ``C = A @ B.T``; activations quantized offline in one pass.
 
     A:  (..., K) raw activations, bf16/fp16/fp32 (quantized to FP8 in one wrapper pass)
     B:  (N, K) FP8 weights
@@ -469,9 +495,11 @@ def w8a8_block_dynamic_fp8_matmul(
     C_shape = A.shape[:-1] + (N,)
     BLOCK_SIZE_M = adaptive_block_size_m(M)
     C = A.new_empty(C_shape, dtype=output_dtype)
-    # Offline at every M — block-FP8's inline quant pays a real fp32 amax+div per tile
-    # (M=1 graph attn decode measured 1.28x offline); no maybe_act_quant gate needed.
-    A_q, A_s = fp8_act_quant_2d(A.view(M, K), block_k)
+    A_q, A_s = maybe_act_quant(
+        A.view(M, K),
+        lambda x: fp8_act_quant_2d(x, block_k),
+        BLOCK_DYNAMIC_MATMUL_ACT_PREQUANT_MIN_M,
+    )
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
 
     with device_context(A.device):
@@ -516,7 +544,7 @@ def w8a8_block_static_fp8_matmul(
 ) -> torch.Tensor:
     """Block-scale FP8 matmul with static (per-tensor) activation quantization.
 
-    A:  (..., K) raw bf16/fp16 activations — quantized to FP8 inline against ``As``
+    A:  (..., K) raw bf16/fp16 activations — pre-quantized against ``As`` in the wrapper
     B:  (N, K) FP8 weights
     Bs: (N // block_n, K // block_k) per-block weight scales
     As: scalar / (1,) — per-tensor static activation scale
@@ -544,8 +572,9 @@ def w8a8_block_static_fp8_matmul(
     M = A.numel() // A.shape[-1]
 
     assert Bs.ndim == 2, f"Bs must be 2D (N//block_n, K//block_k), got ndim={Bs.ndim}"
-    assert Bs.shape == (triton.cdiv(N, block_n), triton.cdiv(K, block_k)), (
-        f"Bs shape {tuple(Bs.shape)} != expected ({triton.cdiv(N, block_n)}, {triton.cdiv(K, block_k)})"
+    assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
+    assert Bs.shape == (triton.cdiv(N, block_n), K // block_k), (
+        f"Bs shape {tuple(Bs.shape)} != expected ({triton.cdiv(N, block_n)}, {K // block_k})"
     )
 
     BLOCK_SIZE_K = block_k
@@ -557,10 +586,18 @@ def w8a8_block_static_fp8_matmul(
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
     As = As.reshape(1).to(torch.float32)
+    # M-gated static pre-quant (bit-exact with the inline arm: same scalar, same cast);
+    # like MX, the inline form is cheap elementwise work — at M=1 a separate kernel is
+    # pure added latency. The kernel picks its arm off A's dtype.
+    A_q, _ = maybe_act_quant(
+        A.view(M, K),
+        lambda x: ((x.to(torch.float32) / As).to(FP8_DTYPE), As),
+        STATIC_MATMUL_ACT_PREQUANT_MIN_M,
+    )
 
     with device_context(A.device):
         compile_time_only_triton_wrap(w8a8_block_static_fp8_matmul_kernel)[grid](
-            A,
+            A_q,
             B,
             C,
             As,
@@ -568,8 +605,8 @@ def w8a8_block_static_fp8_matmul(
             M,
             N,
             K,
-            A.stride(-2),
-            A.stride(-1),
+            A_q.stride(0),
+            A_q.stride(1),
             B.stride(1),
             B.stride(0),
             C.stride(-2),
@@ -595,7 +632,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
     Bs: torch.Tensor,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Tensor-scale FP8 matmul: ``C = A @ B.T`` with fused activation quantization.
+    """Tensor-scale FP8 matmul: ``C = A @ B.T``; activations quantized offline per row.
 
     A:  (..., K) raw activations, bf16/fp16/fp32 (flattened to (M, K)
         internally) — per-row scales computed via ``fp8_act_quant(A, K)``.
@@ -659,7 +696,8 @@ def mxfp_dynamic_matmul(
     Bs: torch.Tensor,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """MX matmul ``C = A @ B.T`` with fused activation quant. Weight format detected
+    """MX matmul ``C = A @ B.T``; activations quantized offline above the
+    ``maybe_act_quant`` M threshold, inline below it. Weight format detected
     from ``B.dtype``: ``int8`` → packed E2M1 (MXFP4, ``B`` is ``(N, K//2)``);
     ``float8_e4m3fn`` → unpacked E4M3 (MXFP8, ``(N, K)``). Both use UE8M0 group-32 scales
     ``(N, K//32)``; tile + dot path are autotuned (scale granularity fixed at 32).
@@ -694,7 +732,9 @@ def mxfp_dynamic_matmul(
     B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
-    A_q, A_s = maybe_act_quant(A.view(M, K), mxfp_act_quant)
+    A_q, A_s = maybe_act_quant(
+        A.view(M, K), mxfp_act_quant, MXFP_MATMUL_ACT_PREQUANT_MIN_M
+    )
 
     def grid(META):
         return (

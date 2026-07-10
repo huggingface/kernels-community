@@ -17,6 +17,7 @@ import triton
 import triton.language as tl
 
 from ._ops import add_op_namespace_prefix
+
 from .bayesian_autotuner import bayesian_autotune
 from .utils import (
     compile_time_only_triton_op,
@@ -31,9 +32,12 @@ from .utils import (
     acc_init,
     fp8_dot,
     batched_mx_pruner,
+    block_k_within_k_pruner,
     acc_finalize,
     mxfp_act_quant_inline,
     fp8_act_quant,
+    fp8_act_quant_2d,
+    maybe_act_quant,
     fp8_act_quant_inline,
     get_accelerator_autotuning_configs,
     get_mxfp_autotuning_configs,
@@ -42,6 +46,12 @@ from .utils import (
     e2m1_as_uint8,
     ue8m0_as_uint8,
 )
+
+# maybe_act_quant crossover for the block-dynamic batched matmul: offline always —
+# inherited from the fused gate_up sweep (same per-row decode structure, fewer streams):
+# offline won at T=1/4/16 and lost only ~2% (noise-tier) at T=64, outside this kernel's
+# decode regime.
+BLOCK_DYNAMIC_BATCHED_ACT_PREQUANT_MIN_M = 0
 
 
 @triton.jit
@@ -103,7 +113,8 @@ def store_row(
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_batched_kernel(
-    A,  # (S, K) raw BF16/FP16 activations
+    A,  # (S, K) E4M3 activations (pre-quantized once by the wrapper)
+    AScale,  # (S, K // BLOCK_SIZE_K) fp32 per-row, per-K-block activation scales
     B,  # (num_experts, N, K) FP8 weight matrices
     C,  # (S, N) output
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales
@@ -115,6 +126,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     # Strides
     stride_am,
     stride_ak,
+    stride_as_m,
     stride_be,
     stride_bk,
     stride_bn,
@@ -133,13 +145,14 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 ):
     """Block-scale batched FP8 expert matmul kernel.
 
-    Each program handles one routed token row and one N-tile, looks up the
-    owning expert from ``ExpertIds``, and applies fused activation quantization.
+    Each program handles one routed token row and one N-tile, looking up the
+    owning expert from ``ExpertIds``. Activations arrive pre-quantized (one wrapper
+    pass — the inline quant re-ran per N-tile and paid a per-tile amax reduction).
 
     ``SWAP_AB`` (tuner axis, M=1 decode): load the weight output-rows-major ``[BN, BK]`` and put
     those rows in the MMA M dim, padding the single token to the N=16 atom; column 0 of the
     ``[BN, 16]`` accumulator is the result. No-swap keeps the token in M (padded to 16)."""
-    _, pid_n, expert_id, A, B, C, Bs = expert_setup(
+    batch_id, pid_n, expert_id, A, B, C, Bs = expert_setup(
         A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
@@ -149,13 +162,17 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_ak
+    as_ptrs = AScale + batch_id * stride_as_m + tl.arange(0, BLOCK_SIZE_M) * 0
     b_ptrs = oriented_weight_ptrs(B, offs_bn, offs_k, stride_bn, stride_bk, SWAP_AB)
     bs_ptrs = Bs + pid_n * stride_bs_n
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a_raw = tl.load(a_ptrs).to(tl.float32)
-        a, a_s = fp8_act_quant_inline(a_raw)
+        if A.dtype.element_ty == tl.float8e4nv:  # pre-quantized offline
+            a = tl.load(a_ptrs)
+            a_s = tl.load(as_ptrs)
+        else:  # raw bf16/fp16 — quantize inline
+            a, a_s = fp8_act_quant_inline(tl.load(a_ptrs).to(tl.float32))
         b = tl.load(b_ptrs)
         b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
         # a_s is [BM], b_s a per-block scalar; a_s[:, None] broadcasts onto the acc either way (under
@@ -163,6 +180,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         dot = fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K)
         accumulator += dot * a_s[:, None] * b_s
         a_ptrs += BLOCK_SIZE_K * stride_ak
+        as_ptrs += 1
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += stride_bs_k
 
@@ -170,12 +188,15 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
-@triton.autotune(
+@bayesian_autotune(
     # S (routed rows) keyed like the block-dynamic/mxfp batched siblings — decode re-tunes per batch.
-    configs=get_accelerator_autotuning_configs(
+    get_accelerator_autotuning_configs(
         tune_block_nk=True, swap_ab=True, for_decode=True
     ),
-    key=["N", "K", "S"],
+    ["N", "K", "S"],
+    n_trials=100,
+    # BLOCK_SIZE_K is a tuned axis and the K-loop is maskless — veto non-dividing BKs.
+    prune_configs_by={"early_config_prune": block_k_within_k_pruner("K")},
 )
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
@@ -356,7 +377,8 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     block_size: list[int],
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Block-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T, with fused act quant.
+    """Block-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T; activations
+    quantized offline in one pass.
 
     A:  (S, K) raw bf16/fp16 activations
     B:  (num_experts, N, K) FP8 expert weights
@@ -390,12 +412,18 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     Bs = ue8m0_as_uint8(Bs)
     grid = (S, triton.cdiv(N, block_n))
     C = A.new_empty(S, N, dtype=output_dtype)
+    A_q, A_s = maybe_act_quant(
+        A,
+        lambda x: fp8_act_quant_2d(x, block_k),
+        BLOCK_DYNAMIC_BATCHED_ACT_PREQUANT_MIN_M,
+    )
 
     with device_context(A.device):
         compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_batched_kernel)[
             grid
         ](
-            A,
+            A_q,
+            A_s,
             B,
             C,
             Bs,
@@ -403,8 +431,9 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             S,
             N,
             K,
-            A.stride(0),
-            A.stride(1),
+            A_q.stride(0),
+            A_q.stride(1),
+            A_s.stride(0),
             B.stride(0),
             B.stride(2),
             B.stride(1),
@@ -432,7 +461,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     expert_ids: torch.Tensor,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Tensor-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T, with fused act quant.
+    """Tensor-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T; activations
+    quantized offline per row in the wrapper.
 
     A:  (S, K) raw bf16/fp16 activations
     B:  (num_experts, N, K) FP8 expert weights
@@ -506,7 +536,8 @@ def mxfp_dynamic_matmul_batched(
     expert_ids: torch.Tensor,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Batched MX matmul ``C[s] = A[s] @ B[expert_ids[s]].T`` with fused act quant.
+    """Batched MX matmul ``C[s] = A[s] @ B[expert_ids[s]].T``; activations quantized
+    inline in the kernel (decode: one act row per program, inline is free).
     Weight format is detected from ``B.dtype``: ``int8`` → packed E2M1 (MXFP4, ``B`` is
     ``(num_experts, N, K//2)``); ``float8_e4m3fn`` → unpacked E4M3 (MXFP8, ``(num_experts, N, K)``). Both use
     UE8M0 group-32 scales ``(num_experts, N, K//32)``; tile + dot path are autotuned.
