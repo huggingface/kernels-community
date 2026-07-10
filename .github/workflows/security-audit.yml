@@ -48,12 +48,12 @@ jobs:
       # Check out the PR head so Claude can explore the actual changed code.
       # refs/pull/N/head resolves for forked PRs too.
       - name: Checkout PR head
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: refs/pull/${{ inputs.pr_number }}/head
           fetch-depth: 0
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: "20"
 
@@ -69,6 +69,8 @@ jobs:
           REPO: ${{ github.repository }}
         run: gh pr diff "${PR_NUMBER}" --repo "${REPO}" > /tmp/changes.diff
 
+      # NOTE: in the invocation of Claude below, we restrict it to read-only
+      # local tools to avoid potential token exfiltration attacks.
       - name: Run security audit
         id: audit
         env:
@@ -215,7 +217,13 @@ jobs:
           === DIFF ===
           PROMPT
             cat /tmp/changes.diff
-          } | claude -p --model claude-opus-4-8 > /tmp/audit_result.txt
+          } | claude -p \
+                --model claude-opus-4-8 \
+                --permission-mode plan \
+                --allowedTools "Read,Grep,Glob,LS" \
+                --disallowedTools "Bash,BashOutput,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task,KillShell" \
+                --max-turns 40 \
+              > /tmp/audit_result.txt
 
           # Validate LLM output format before trusting it
           if grep -qE '^NO_FINDINGS$' /tmp/audit_result.txt && [ $(wc -l < /tmp/audit_result.txt) -eq 1 ]; then

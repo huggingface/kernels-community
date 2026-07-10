@@ -70,12 +70,16 @@ jobs:
       - name: Set running status
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATUS_CONTEXT: ${{ github.workflow }} / ${{ inputs.kernel_name }}
         run: |
-          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
             -f state="pending" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f target_url="$RUN_URL" \
             -f description="Build in progress" \
-            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
+            -f context="$STATUS_CONTEXT"
 
   # Build the kernel for each CUDA/XPU variant; release mode uploads to the Hub.
   build-kernel:
@@ -105,6 +109,18 @@ jobs:
 
     runs-on: windows-2022
     steps:
+      # Reject kernel names outside the safe charset before any step uses them.
+      # Accepts e.g.: flash-attn3, rejects: $(myevilcommand).
+      - name: Validate kernel name
+        shell: pwsh
+        env:
+          KERNEL: ${{ inputs.kernel_name }}
+        run: |
+          if ("$env:KERNEL" -notmatch '^[A-Za-z0-9_-]+$') {
+            Write-Error "Invalid kernel_name input: must match ^[A-Za-z0-9_-]+$"
+            exit 1
+          }
+
       # Guard against injection via pr_number input.
       - name: Validate PR number
         if: inputs.pr_number != ''
@@ -120,13 +136,13 @@ jobs:
       # When building for a PR, check out the PR head; otherwise use default branch.
       - name: Checkout PR branch
         if: inputs.pr_number != ''
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: refs/pull/${{ inputs.pr_number }}/head
           fetch-depth: 0
       - name: Checkout default branch
         if: inputs.pr_number == ''
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Ensure the kernel directory exists and has the required config files.
       - name: Validate kernel directory
@@ -225,7 +241,7 @@ jobs:
       # Python is needed for PyTorch and the build toolchain.
       - name: Setup Python
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python }}
 
@@ -241,7 +257,7 @@ jobs:
       - name: Checkout kernels
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
         id: checkout-kernels
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: huggingface/kernels
           ref: "${{ steps.extract-builder-version.outputs.revision }}"
@@ -250,7 +266,7 @@ jobs:
       # Cache Rust compilation artifacts to speed up kernel-builder builds.
       - name: Cache Rust build
         if: steps.validate.outputs.skip == 'false' && steps.check-backend.outputs.supported == 'true' && inputs.skip_build != true
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             kernels/kernel-builder/target
@@ -339,7 +355,6 @@ jobs:
           }
 
           # Upload to both model and kernel repo types
-          & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" @branchArgs
           & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" @branchArgs
 
       # v1 kernels without an explicit branch override also get uploaded to main.
@@ -359,7 +374,6 @@ jobs:
             $content = Get-Content $buildTomlPath -Raw
             if ($content -match '(?m)^\s*version\s*=\s*1\s*(\r)?$' -and $content -notmatch '(?m)^\s*branch\s*=') {
               Write-Host "Kernel version is 1 and no branch override, uploading to main branch..."
-              & $KB upload "$env:KERNEL_SOURCE\build" --repo-type model --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" --branch main
               & $KB upload "$env:KERNEL_SOURCE\build" --repo-type kernel --repo-id "$env:REPO_PREFIX/$env:KERNEL_SOURCE" --branch main
             } else {
               Write-Host "Kernel version is not 1 or branch is overridden, skipping main branch upload"
@@ -377,6 +391,10 @@ jobs:
       - name: Set commit status
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATUS_CONTEXT: ${{ github.workflow }} / ${{ inputs.kernel_name }}
         run: |
           BUILD="${{ needs.build-kernel.result }}"
 
@@ -391,8 +409,8 @@ jobs:
             DESC="Build did not complete (${BUILD})"
           fi
 
-          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
             -f state="$STATE" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f target_url="$RUN_URL" \
             -f description="$DESC" \
-            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
+            -f context="$STATUS_CONTEXT"

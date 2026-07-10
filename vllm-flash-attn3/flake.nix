@@ -2,7 +2,7 @@
   description = "Flake for Hopper Flash Attention kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/framework-cxx-flags";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =

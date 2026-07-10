@@ -41,16 +41,15 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1781887812,
-        "narHash": "sha256-0TRF6fwI3OkqsVR992XS9GuNkYj6e4JA23camQNKcdU=",
+        "lastModified": 1783417137,
+        "narHash": "sha256-/iWe/m5ZACdb/DcXTrvXmbHS2QrzgGcGa7hPKi460tE=",
         "owner": "huggingface",
         "repo": "kernels",
-        "rev": "93919aebaa5c7ff3f74d7e7b594e529b1cc823db",
+        "rev": "81580bb92577f2f7228661ca2a221fc052375709",
         "type": "github"
       },
       "original": {
         "owner": "huggingface",
-        "ref": "make-ptxas-overridable",
         "repo": "kernels",
         "type": "github"
       }
