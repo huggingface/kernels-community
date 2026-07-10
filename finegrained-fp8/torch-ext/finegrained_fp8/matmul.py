@@ -19,6 +19,7 @@ import triton.language as tl
 from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
 from .utils import (
+    mx_compute,
     FP8_DTYPE,
     compile_time_only_triton_op,
     compile_time_only_triton_wrap,
@@ -27,15 +28,14 @@ from .utils import (
     UE8M0_SCALE_DTYPES,
     adaptive_block_size_m,
     batched_mx_pruner,
+    scalar_max_m_pruner,
     block_k_within_k_pruner,
     compose_pruners,
     decode_ue8m0_scale,
-    mx_dot_rescale,
-    mx_dot_scaled,
     device_context,
     fp8_act_quant,
     fp8_act_quant_2d,
-    fp8_act_quant_inline,
+    load_block_fp8_act_tile,
     get_accelerator_autotuning_configs,
     warp_spec_compile_guard_pruner,
     get_mxfp_autotuning_configs,
@@ -167,11 +167,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-        if A.dtype.element_ty == tl.float8e4nv:  # pre-quantized offline
-            a = tl.load(a_ptrs)
-            a_s = tl.load(as_ptrs)
-        else:  # raw bf16/fp16 — quantize inline
-            a, a_s = fp8_act_quant_inline(tl.load(a_ptrs).to(tl.float32))
+        a, a_s = load_block_fp8_act_tile(a_ptrs, as_ptrs)
         b = tl.load(b_ptrs)
         b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
@@ -272,9 +268,10 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     )
 
 
-@triton.autotune(
-    configs=get_accelerator_autotuning_configs(),
-    key=["N", "K", "BLOCK_SIZE_M"],
+@bayesian_autotune(
+    get_accelerator_autotuning_configs(),
+    ["N", "K", "BLOCK_SIZE_M"],
+    n_trials=100,
 )
 @triton.jit
 def w8a8_block_static_fp8_matmul_kernel(
@@ -350,19 +347,28 @@ def w8a8_block_static_fp8_matmul_kernel(
 @bayesian_autotune(
     # tune_block_m: BLOCK_SIZE_M becomes a config axis (not the adaptive_block_size_m launch
     # heuristic), so the tuner sizes the M tile per workload — small at decode, large at prefill.
-    # no scalar branch here. swap_ab intentionally OFF: an 18-cell forced-swap sweep (cudagraph,
+    # scalar is in the mode set for M=1 decode (attn projection): it avoids the MMA M->16 pad
+    # that held MXFP8 attn decode 35% over block-dynamic at identical weight bytes; fp4-scalar
+    # is dropped by the pruner (ALU-bound unpack). swap_ab intentionally OFF: an 18-cell forced-swap sweep (cudagraph,
     # M3+dsv4 decode) showed swap losing on the single matmul (adaptive BM>=16 fills the MMA atom;
     # M3 attn swap was −38%) while the tuner never picked it — emitting the configs only bloats
     # the search. Swap stays on the batched/fused experts kernels, where it wins ~30% on dsv4.
-    get_mxfp_autotuning_configs(compute_modes=("dot_scaled", "dot"), tune_block_m=True),
+    get_mxfp_autotuning_configs(
+        compute_modes=("dot_scaled", "dot", "scalar"), tune_block_m=True
+    ),
     # VALUES_PER_BYTE keys the MXFP4/MXFP8 split so a cached winner is only reused for its packing;
     # m_bit_length (log2 M bucket) keys the M tile — the winner keeps shifting with M well past the
     # BM ceiling and it is NOT noise: cross-applying configs (N=K=4096) costs +62% at M=128 and +245%
     # at M=4096 (the thin M=128 tile can't saturate the wide GEMM), so don't collapse the buckets.
     ["N", "K", "m_bit_length", "VALUES_PER_BYTE"],
     n_trials=100,
-    # BK-within-K veto (the loop loads are unmasked) + the sm_10x dot_scaled shape guards.
-    prune_configs_by={"early_config_prune": batched_mx_pruner("K")},
+    # BK-within-K veto (the loop loads are unmasked) + the sm_10x dot_scaled shape guards
+    # + scalar restricted to decode-sized M (a BM=1 GEVM at prefill is TPE poison).
+    prune_configs_by={
+        "early_config_prune": compose_pruners(
+            batched_mx_pruner("K"), scalar_max_m_pruner("M")
+        )
+    },
 )
 @triton.jit
 def mxfp_dynamic_matmul_kernel(
@@ -425,14 +431,19 @@ def mxfp_dynamic_matmul_kernel(
         )
         b = tl.load(b_ptrs)
         b_s = tl.load(bs_ptrs).to(tl.uint8)
-        if COMPUTE_MODE == "dot_scaled":
-            accumulator = mx_dot_scaled(
-                accumulator, a, a_scale, b, b_s, VALUES_PER_BYTE
-            )
-        else:  # dot
-            accumulator = mx_dot_rescale(
-                accumulator, a, b, a_scale, b_s, VALUES_PER_BYTE
-            )
+        accumulator = mx_compute(
+            accumulator,
+            a,
+            a_scale,
+            b,
+            b_s,
+            COMPUTE_MODE,
+            VALUES_PER_BYTE,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            SCALE_GROUP_K,
+        )
         a_ptrs += BLOCK_SIZE_K * stride_ak
         as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
         b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk

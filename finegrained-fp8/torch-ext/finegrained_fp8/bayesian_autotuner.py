@@ -28,11 +28,11 @@ exhaustive bench-all.
 from __future__ import annotations
 
 import hashlib
+import logging
 import json
 import math
 import os
 import random
-import sys
 import time
 from collections import defaultdict
 from typing import Dict, List
@@ -47,6 +47,8 @@ from triton.runtime.autotuner import (
     knobs,
     triton_key,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class BayesianAutotuner(Autotuner):
@@ -66,6 +68,7 @@ class BayesianAutotuner(Autotuner):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.fn_name = getattr(self.fn, "__name__", str(self.fn))
         # Bayesian trial budget — the per-decorator default, overridable via the
         # FINEGRAINED_AUTOTUNE_TRIALS env var (quick sweeps / exhaustive runs without touching
         # the decorators; set it >= grid size to fall back to stock exhaustive bench-all).
@@ -86,7 +89,11 @@ class BayesianAutotuner(Autotuner):
         (shape, config) combos; unguarded, one such config kills the whole tune when a
         small grid falls through to the stock exhaustive path below. Every failure is
         recorded and ``_report_bench_failures`` reports every distinct failure —
-        inf-scoring must not silently hide a broken path behind a healthy one."""
+        inf-scoring must not silently hide a broken path behind a healthy one.
+        (Stock already inf's OutOfResources / CompileTimeAssertionFailure / PTXASError
+        internally without reaching this handler — those are deliberate guard classes,
+        e.g. our own ``tl.static_assert`` fences; the reporter covers the UNEXPECTED
+        failure classes stock would otherwise let kill the tune.)"""
         try:
             return super()._bench(*args, config=config, **meta)
         except Exception as e:
@@ -101,17 +108,20 @@ class BayesianAutotuner(Autotuner):
         JSONL autotune log has per-config detail."""
         if not self._failures:
             return
-        fn_name = getattr(self.fn, "__name__", str(self.fn))
-        by_err = {}
+        by_err = defaultdict(list)
         for c, err in self._failures:
-            by_err.setdefault(err, []).append(c)
+            by_err[err].append(c)
         for err, cfgs in by_err.items():
             c = cfgs[0]
             example = ", ".join(f"{k}={v}" for k, v in c.kwargs.items())
-            print(
-                f"[autotune] {fn_name}: {len(cfgs)} config(s) failed to compile/run — "
-                f"{err}  (e.g. {example}, w{c.num_warps} s{c.num_stages})",
-                file=sys.stderr,
+            logger.warning(
+                "[autotune] %s: %d config(s) failed to compile/run — %s  (e.g. %s, w%d s%d)",
+                self.fn_name,
+                len(cfgs),
+                err,
+                example,
+                c.num_warps,
+                c.num_stages,
             )
 
     def run(self, *args, **kwargs):
@@ -292,13 +302,28 @@ class BayesianAutotuner(Autotuner):
         a basin whose peak is 41µs re-poisons the axis it was meant to protect). Coordinate
         descent climbs BN/BK/warps/stages from wherever the TPE lands within the basin.
         Returns [] when the grid has no such axes (single basin)."""
+        # Basin axes are DERIVED, not declared: a config kwarg with string or boolean
+        # values is a branch axis (different code path — compute mode, operand swap,
+        # warp specialization), which partitions the grid into disjoint performance
+        # basins. Numeric kwargs (tiles/warps/stages) are ordinal — the TPE's densities
+        # and coordinate descent handle those.
+        basin_axes = sorted(
+            {
+                k
+                for c in configs
+                for k, v in c.kwargs.items()
+                if isinstance(v, (bool, str))
+            }
+        )
+        if not basin_axes:
+            return []
+
         # A basin = the compute-path axes (constexprs selecting different compiled code).
         groups: Dict = {}
         for i, c in enumerate(configs):
-            basin = tuple(
-                c.kwargs.get(k) for k in ("COMPUTE_MODE", "SWAP_AB", "WARP_SPEC")
-            )
+            basin = tuple(c.kwargs.get(k) for k in basin_axes)
             groups.setdefault(basin, []).append(i)
+
         if len(groups) <= 1:
             return []
 

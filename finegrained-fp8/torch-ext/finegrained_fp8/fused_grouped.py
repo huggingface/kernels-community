@@ -206,6 +206,12 @@ def _grouped_routing(expert_ids: torch.Tensor, num_experts: int, num_top_k: int)
     ``(t*K + j)`` map (gate_up gathers via ``perm_token = perm // K``, down scatters via
     ``perm``); ``expert_start`` is ``(E+1,)`` padded with S so the kernels build the tile
     layout in-register (E is a power of 2)."""
+    # the scheduling kernels hold the (E,) frequency/offset vectors in one tl.arange
+    # block, which requires a power of 2 — fail here with a clear message instead of a
+    # Triton compile error from an internal kernel
+    assert num_experts & (num_experts - 1) == 0, (
+        f"num_experts ({num_experts}) must be a power of 2"
+    )
     device = expert_ids.device
     expert_ids = expert_ids.int()
     num_routed_tokens = expert_ids.numel()  # S = num_tokens * num_top_k

@@ -33,9 +33,11 @@ from .utils import (
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
     decode_bm_swap_pairs,
+    get_accelerator_autotuning_configs,
     batched_mx_pruner,
     device_context,
     fp8_act_quant_inline,
+    load_block_fp8_act_tile,
     maybe_act_quant,
     tl_dtype,
     fp8_act_quant_2d,
@@ -77,23 +79,19 @@ BLOCK_DYNAMIC_GATE_UP_ACT_PREQUANT_MIN_M = 0
 # fill the MMA 16-atom (non-swap BM=16, ~40% over the degenerate BM=1 on plain tl.dot) or the weight
 # output rows go in M (swap, BM=1). Swap needs BM=1, so (16, swap) is excluded. Same coupling as the
 # MXFP / matmul kernels' for_decode generators.
-_DECODE_BM_SWAP = decode_bm_swap_pairs()
+_DECODE_BM_SWAP = decode_bm_swap_pairs(swap_ab=True)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE_M": bm, "SWAP_AB": sw}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4, 5, 6]
-        for bm, sw in _DECODE_BM_SWAP
-    ],
+@bayesian_autotune(
+    get_accelerator_autotuning_configs(swap_ab=True, for_decode=True),
     # Autotune key: num_routed_tokens (grid axis-0 — the batch varies at decode; a config tuned at
     # S=8 is wrong at S=256, GPU unsaturated) + the problem dims. A constexpr change forces a JIT
     # recompile but NOT a retune (the autotune config cache is keyed separately, on these names +
     # tensor dtypes), so INTERMEDIATE_DIM/HIDDEN_DIM must be listed to partition tuning per shape.
     # (BLOCK_SIZE_M, SWAP_AB) is the coupled fill-the-atom axis (replicate token in M, or weight
     # rows in M) — a config axis, not a key.
-    key=["num_routed_tokens", "INTERMEDIATE_DIM", "HIDDEN_DIM"],
+    ["num_routed_tokens", "INTERMEDIATE_DIM", "HIDDEN_DIM"],
+    n_trials=100,
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
@@ -153,10 +151,10 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     # degenerate M=1 lowering. BM=1 is unchanged; the swap path (coupled to BM=1) uses only row 0.
     a_ptr = (
         HiddenStates
-        + (token + tl.arange(0, BLOCK_SIZE_M) * 0)[:, None] * stride_a_m
+        + (token + tl.zeros((BLOCK_SIZE_M,), tl.int32))[:, None] * stride_a_m
         + tl.arange(0, BLOCK_SIZE_K)[None, :] * stride_a_k
     )
-    as_ptr = HiddenScale + (token + tl.arange(0, BLOCK_SIZE_M) * 0) * stride_as_m
+    as_ptr = HiddenScale + (token + tl.zeros((BLOCK_SIZE_M,), tl.int32)) * stride_as_m
     gate_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     up_n = INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     kk = tl.arange(0, BLOCK_SIZE_K)
@@ -176,11 +174,7 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     acc_up = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
 
     for _ in range(0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K)):
-        if HiddenStates.dtype.element_ty == tl.float8e4nv:  # pre-quantized offline
-            a = tl.load(a_ptr)
-            a_s = tl.load(as_ptr)
-        else:  # raw bf16/fp16 — quantize inline
-            a, a_s = fp8_act_quant_inline(tl.load(a_ptr).to(tl.float32))
+        a, a_s = load_block_fp8_act_tile(a_ptr, as_ptr)
 
         w_gate = tl.load(b_gate_ptr)
         w_up = tl.load(b_up_ptr)
@@ -226,15 +220,11 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     tl.store(IntermediateScale + batch_id * NUM_N_TILES + pid_n, tl.max(inter_s))
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE_M": bm, "SWAP_AB": sw}, num_warps=w, num_stages=s)
-        for w in [2, 4, 8, 16]
-        for s in [2, 3, 4, 5, 6]
-        for bm, sw in _DECODE_BM_SWAP
-    ],
+@bayesian_autotune(
+    get_accelerator_autotuning_configs(swap_ab=True, for_decode=True),
     # See the gate_up kernel: problem dims must be keyed (constexprs recompile but don't retune).
-    key=["num_routed_tokens", "INTERMEDIATE_DIM", "HIDDEN_DIM"],
+    ["num_routed_tokens", "INTERMEDIATE_DIM", "HIDDEN_DIM"],
+    n_trials=100,
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
@@ -290,12 +280,12 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
     # the MMA 16-atom with copies (store_row keeps lane 0); BM=1 unchanged, swap (BM=1) uses row 0.
     inter_ptr = (
         Intermediate
-        + (batch_id + tl.arange(0, BLOCK_SIZE_M) * 0)[:, None] * INTERMEDIATE_DIM
+        + (batch_id + tl.zeros((BLOCK_SIZE_M,), tl.int32))[:, None] * INTERMEDIATE_DIM
         + tl.arange(0, BLOCK_SIZE_N)[None, :]
     )
     inter_s_ptr = (
         IntermediateScale
-        + (batch_id + tl.arange(0, BLOCK_SIZE_M) * 0)[:, None] * NUM_N_TILES
+        + (batch_id + tl.zeros((BLOCK_SIZE_M,), tl.int32))[:, None] * NUM_N_TILES
     )
     ws_down_ptr = DownScale + expert_id * stride_downs_e + pid_h * stride_downs_n
 
@@ -569,7 +559,7 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     # MMA 16-atom with copies (store keeps lane 0); BM=1 unchanged, swap (BM=1) uses row 0.
     a_ptr = (
         HiddenStates
-        + (token + tl.arange(0, BLOCK_SIZE_M) * 0)[:, None] * stride_a_m
+        + (token + tl.zeros((BLOCK_SIZE_M,), tl.int32))[:, None] * stride_a_m
         + tl.arange(0, BLOCK_SIZE_K)[None, :] * stride_a_k
     )
     # Gate (rows n) and up (rows I + n) are ONE stacked [2, ...] load in BOTH orientations
@@ -732,12 +722,12 @@ def mxfp_dynamic_moe_batched_down_kernel(
     # the MMA 16-atom with copies (store keeps lane 0); BM=1 unchanged, swap (BM=1) uses row 0.
     a_ptr = (
         Intermediate
-        + (batch_id + tl.arange(0, BLOCK_SIZE_M) * 0)[:, None] * INTERMEDIATE_DIM
+        + (batch_id + tl.zeros((BLOCK_SIZE_M,), tl.int32))[:, None] * INTERMEDIATE_DIM
         + tl.arange(0, BLOCK_SIZE_K)[None, :]
     )
     as_ptr = (
         IntermediateScale
-        + (batch_id + tl.arange(0, BLOCK_SIZE_M) * 0)[:, None]
+        + (batch_id + tl.zeros((BLOCK_SIZE_M,), tl.int32))[:, None]
         * (INTERMEDIATE_DIM // SCALE_GROUP_K)
         + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, :]
     )

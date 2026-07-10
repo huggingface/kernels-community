@@ -21,6 +21,7 @@ import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
 from ._ops import add_op_namespace_prefix
+from .bayesian_autotuner import bayesian_autotune
 
 # ── Format constants ──────────────────────────────────────────────────────────
 
@@ -346,14 +347,24 @@ def get_mxfp_autotuning_configs(
         bms = (16, 32, 64, 128) if tune_block_m else (None,)
         sws = (False, True) if swap_ab else (False,)
         bm_sw = [(bm, sw) for bm in bms for sw in sws]
-    return [
+    # dedup: the scalar->BM1 pin collapses the BM sweep onto one value, leaving identical
+    # copies that would each be benched.
+    configs = [
         triton.Config(
             {
                 "COMPUTE_MODE": mode,
                 "BLOCK_SIZE_N": bn,
                 "BLOCK_SIZE_K": bk,
                 **({"MEMORY_MODE": mm} if mm is not None else {}),
-                **({"BLOCK_SIZE_M": bm} if bm is not None else {}),
+                # scalar is a single-row GEVM (mx_scalar_reduce transposes the act tile
+                # against the weight tile) — BM MUST be 1. At BN == BM a bigger-BM scalar
+                # config even COMPILES and silently computes garbage the tuner would time
+                # and pick, so the coupling is enforced here, not left to inf-pruning.
+                **(
+                    {"BLOCK_SIZE_M": 1 if mode == "scalar" else bm}
+                    if bm is not None
+                    else {}
+                ),
                 **({"SWAP_AB": sw} if swap_ab else {}),
             },
             num_warps=w,
@@ -374,9 +385,31 @@ def get_mxfp_autotuning_configs(
         for s in [2, 3, 4, 5, 6]
         for w in [2, 4, 8]
         for (bm, sw) in bm_sw
+        # MX "dot" under swap uses mx_dot_rescale_swapped (weight rows fill the big MMA
+        # M-atom; M quantizes to 64/128, N only to 8). Its no-swap BM=1 decode form stays
+        # excluded — that is the degenerate shape the BM16 replication exists to avoid.
+        if not (mode == "dot" and for_decode and bm == 1 and not sw)
         # scalar is a true M=1 reduce — the BM=16 fill-atom is only for the tensor-core modes.
         if not (mode == "scalar" and bm == 16)
     ]
+    seen = set()
+    deduped = []
+    for c in configs:
+        k = str(c)
+        if k not in seen:
+            seen.add(k)
+            deduped.append(c)
+    return deduped
+
+
+@functools.lru_cache(maxsize=None)
+def is_sm10x(device_index: int) -> bool:
+    """Blackwell-datacenter (sm_10x, TMEM scaled-MMA) — the target the ``dot_scaled``
+    compiler-bug guards are scoped to. Cached: pruners call this per tune."""
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability(device_index)[0] == 10
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -404,32 +437,54 @@ def sm_shared_memory_limit(device_index: int) -> int:
             )
 
 
+# ── config pruners ────────────────────────────────────────────────────────────
+# Every guard exists for one of three reasons; the map (kernel -> pruner -> rule):
+#
+#   SILENTLY-WRONG configs (must be pruned, the tuner would time and pick them):
+#     block_k_within_k_pruner   BK not dividing K over-reads rows (maskless K-loops)
+#     scalar "scalar" -> BM=1   the scalar GEVM broadcasts wrong at BM>1 (config builder)
+#   COMPILER BUGS / unsupported combos on this triton+arch (benign inf, pruned to save
+#   compiles and to keep can't-win configs from poisoning the TPE densities):
+#     warp_spec_compile_guard_pruner   WS compiles iff BM>=64 & warps in {4,8} (measured
+#                                      identical on four plain-dot loops, Triton 3.7.1)
+#     batched_mx_pruner sm_10x guards  dot_scaled shape gates (fp4-scalar dead; swapped
+#                                      rows<128 = bf16 fallback; no-swap width>256 traps)
+#     smem_config_pruner               operand smem overflow; single-trip dot_scaled bug
+#   RACE guards (Triton 3.7.1 pipeliner, per-loop-structure flake maps):
+#     block_dynamic_grouped_gate_up_pruner  non-WS sound only at (w>=8, BM<=64)
+#     block_dynamic_grouped_matmul_pruner   WS-only at BM>=64, non-WS below (disjoint)
+#   TPE-POISON fences (valid configs that can't win in a regime):
+#     scalar_max_m_pruner              scalar above M=64 (prefill GEVM)
+#
+# Compose with compose_pruners; every pruner keeps a non-empty fallback.
+
+
 def block_dynamic_grouped_gate_up_pruner(n_weight_tiles: int):
     """``early_config_prune`` for the block-dynamic grouped gate_up: the smem estimate (see
-    ``smem_config_pruner``) plus the Triton 3.7.1 pipeliner-race guard. The kernel's
-    six-load-stream dual-dot K-loop RACES under the default pipeliner at ``num_warps < 8``
-    or ``BLOCK_SIZE_M > 64`` (nondeterministic wrong output) — ``warp_specialize`` both
-    fixes those configs and is faster, but itself fails to compile at some (shape, config)
-    combos (benign inf to the tuner). So: WS=True configs pass (compile failures self-prune),
-    WS=False survives only in the verified-sound (w >= 8, BM <= 64) region. CUDA-only —
-    the race is a CUDA pipeliner artifact and the WS axis isn't emitted elsewhere."""
+    ``smem_config_pruner``), the shared WS compile guard, and the Triton 3.7.1
+    pipeliner-race guard. The kernel's six-load-stream dual-dot K-loop RACES under the
+    default pipeliner at ``num_warps < 8`` or ``BLOCK_SIZE_M > 64`` (nondeterministic
+    wrong output) — ``warp_specialize`` fixes those configs and is faster. WS configs
+    outside the measured compile region (BM >= 64 with warps in {4, 8} — identical across
+    every mapped plain-dot loop, see ``warp_spec_compile_guard_pruner``) are dropped up
+    front instead of burning compiles into benign infs; WS=False survives only in the
+    flake-verified sound (w >= 8, BM <= 64) region. Configs in neither region (w < 8 at
+    BM <= 32) are correctly unrepresentable: non-WS races there and WS cannot compile.
+    CUDA-only — the race is a CUDA pipeliner artifact and the WS axis isn't emitted
+    elsewhere."""
     smem_prune = smem_config_pruner(n_weight_tiles=n_weight_tiles)
+    ws_guard = warp_spec_compile_guard_pruner()
 
     def prune(configs, named_args, **kwargs):
         kept = smem_prune(configs, named_args, **kwargs)
         dev = triton.runtime.driver.active.get_active_torch_device()
         if dev.type == "cuda":
+            kept = ws_guard(kept, named_args, **kwargs)
             kept = [
                 c
                 for c in kept
-                # WS + w16 is a MEASURED compile failure — drop it to save the wasted
-                # compile; other WS compile failures are (shape, config)-dependent with no
-                # known rule and self-prune as inf at bench time.
-                if not (c.kwargs.get("WARP_SPEC") and c.num_warps >= 16)
-                and (
-                    c.kwargs.get("WARP_SPEC")
-                    or (c.num_warps >= 8 and c.kwargs.get("BLOCK_SIZE_M", 128) <= 64)
-                )
+                if c.kwargs.get("WARP_SPEC")
+                or (c.num_warps >= 8 and c.kwargs.get("BLOCK_SIZE_M", 128) <= 64)
             ] or kept
         return kept
 
@@ -535,6 +590,23 @@ def block_k_within_k_pruner(k_arg: str):
     return prune
 
 
+def scalar_max_m_pruner(m_arg: str, max_m: int = 64):
+    """``early_config_prune`` dropping ``scalar`` configs when the launch's row count
+    (``m_arg``) exceeds ``max_m``: scalar is a BM=1 GEVM — sensible for decode-sized M,
+    hopeless at prefill, and hopeless-but-benched configs poison the TPE's per-dimension
+    densities (measured: with scalar in the M=8192 grid the 2D MX attn prefill tune
+    landed 0.48x vs hub; without it, 2.06x)."""
+
+    def prune(configs, named_args, **kwargs):
+        if {**named_args, **kwargs}[m_arg] <= max_m:
+            return configs
+        return [
+            c for c in configs if c.kwargs.get("COMPUTE_MODE") != "scalar"
+        ] or configs
+
+    return prune
+
+
 def batched_mx_pruner(k_arg: str, stacked_gate_up: bool = False):
     """``early_config_prune`` for the batched MX kernels: a BK-within-K veto plus two sm_10x
     MMA-shape guards (no-ops elsewhere and for scalar configs). With ``stacked_gate_up`` the
@@ -572,12 +644,10 @@ def batched_mx_pruner(k_arg: str, stacked_gate_up: bool = False):
         kept = bk_within_k(configs, named_args, **kwargs)
         dev = triton.runtime.driver.active.get_active_torch_device()
         dev_index = dev.index if dev.index is not None else 0
-        is_sm10x = (
-            dev.type == "cuda" and torch.cuda.get_device_capability(dev_index)[0] == 10
-        )
-        if is_sm10x and all_args.get("VALUES_PER_BYTE") == 2:
+        on_sm10x = dev.type == "cuda" and is_sm10x(dev_index)
+        if on_sm10x and all_args.get("VALUES_PER_BYTE") == 2:
             kept = [c for c in kept if c.kwargs.get("COMPUTE_MODE") != "scalar"] or kept
-        if is_sm10x:
+        if on_sm10x:
 
             def ok(c):
                 if c.kwargs.get("COMPUTE_MODE") == "scalar":
@@ -640,9 +710,7 @@ def smem_config_pruner(
         limit = sm_shared_memory_limit(dev_index)
         # The dot_scaled guards below are Blackwell-datacenter (sm_10x, TMEM scaled-MMA) compiler
         # bugs — off on every other target, so they never over-prune there.
-        is_sm10x = (
-            dev.type == "cuda" and torch.cuda.get_device_capability(dev_index)[0] == 10
-        )
+        on_sm10x = dev.type == "cuda" and is_sm10x(dev_index)
 
         def dim(c, name):
             """A dimension for config ``c`` (a ``BLOCK_SIZE_*`` tile dim or a reduction extent like
@@ -676,7 +744,7 @@ def smem_config_pruner(
             (``BLOCK_SIZE_K >= reduction_dim``) — the sm_10x accumulator-init miscompile (see the
             ``reduction_dim`` note above). No-op when ``reduction_dim`` is None or off sm_10x."""
             return (
-                is_sm10x
+                on_sm10x
                 and reduction_dim is not None
                 and c.kwargs.get("COMPUTE_MODE") == "dot_scaled"
                 and dim(c, "BLOCK_SIZE_K") >= dim(c, reduction_dim)
@@ -693,7 +761,7 @@ def smem_config_pruner(
             (``double_mma``); otherwise each dot is N=BN and can't exceed the cap. No-op off
             sm_10x or when ``double_mma`` is False."""
             return (
-                is_sm10x
+                on_sm10x
                 and double_mma
                 and c.kwargs.get("COMPUTE_MODE") in ("dot_scaled", "dot")
                 and n_weight_tiles * dim(c, "BLOCK_SIZE_N") > 256
@@ -762,6 +830,21 @@ def mxfp_act_quant_inline(
         (BLOCK_SIZE_M, BLOCK_SIZE_K),
     ).to(tl.float8e4nv)
     return a_fp8, a_scale_u8
+
+
+@triton.jit
+def load_block_fp8_act_tile(a_ptrs, as_ptrs):
+    """Block-FP8 counterpart of ``load_mx_act_tile``: load one activation K-tile as
+    ``(a_fp8, a_scale_f32)`` — the arm folds off the pointer dtype at compile time
+    (fp8 = pre-quantized offline + per-K-block scales, raw bf16/fp16 = quantize inline;
+    ``as_ptrs`` is then a constexpr-dead placeholder). Unmasked: every caller's rows are
+    %-wrapped, expert-advanced, or token-replicated."""
+    if a_ptrs.dtype.element_ty == tl.float8e4nv:  # pre-quantized offline
+        a = tl.load(a_ptrs)
+        a_s = tl.load(as_ptrs)
+    else:  # raw bf16/fp16 — quantize inline
+        a, a_s = fp8_act_quant_inline(tl.load(a_ptrs).to(tl.float32))
+    return a, a_s
 
 
 @triton.jit
@@ -965,6 +1048,35 @@ def mx_dot_scaled_swapped(
 
 
 @triton.jit
+def mx_dot_rescale_swapped(
+    acc,
+    a,
+    a_scale,
+    w,
+    w_scale,
+    VALUES_PER_BYTE: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """Swapped MX 'dot' step (BK == one scale group): weight output rows in the MMA M dim
+    (``[ROWS, BK]`` after the column-unpack for MXFP4), the [BK] token padded to the N=16
+    atom — the well-shaped fp8 MMA at M=1 (M quantizes to 64/128, N only to 8, so weight
+    rows fill the big atom). Both UE8M0 scales factor out of the single-group step: the
+    weight's per-output-row scale broadcasts down the acc columns, the token's group scale
+    is a scalar. ``acc`` is the persistent ``[ROWS, MMA_N_ATOM]`` accumulator (col 0 taken
+    by the caller's ``acc_finalize``)."""
+    if VALUES_PER_BYTE == 2:  # column-unpack E2M1 -> E4M3 (K order: low nibble first)
+        wq = tl.interleave(_e2m1_code_to_f32(w & 0xF), _e2m1_code_to_f32(w >> 4)).to(
+            tl.float8e4nv
+        )
+    else:
+        wq = w
+    rhs = swap_pad_rhs(a, BLOCK_SIZE_K)
+    a_s = decode_ue8m0_scale(a_scale)  # [1] — the single group's token scale
+    w_s = decode_ue8m0_scale(w_scale)  # [ROWS, 1] — per output row
+    return acc + tl.dot(wq, rhs) * w_s * a_s
+
+
+@triton.jit
 def mx_scalar_reduce_swapped(
     acc,
     a,
@@ -1004,11 +1116,10 @@ def mx_swap_compute(
     SCALE_GROUP_K: tl.constexpr,
 ):
     """Swapped-AB counterpart to ``mx_compute``: weight output-rows in the MMA M dim, the single
-    decode token flattened to the [BK] rhs. Dispatches the two swapped modes — ``dot_scaled``
-    (persistent ``[BLOCK_SIZE_N, MMA_N_ATOM]`` MMA acc, col 0 taken by the caller) and ``scalar``
-    (``[1, BLOCK_SIZE_N]`` reduce). The acc shapes diverge, but only the taken constexpr branch
-    compiles so the single return never has to unify them. Swap has no ``dot`` path (dead at M=1
-    decode). ``BLOCK_SIZE_N`` is the weight tile's row count — the gate_up kernel passes ``2*BN``
+    decode token flattened to the [BK] rhs. Dispatches the three swapped modes — ``dot_scaled``
+    and ``dot`` (persistent ``[BLOCK_SIZE_N, MMA_N_ATOM]`` MMA acc, col 0 taken by the caller)
+    and ``scalar`` (``[1, BLOCK_SIZE_N]`` reduce). The acc shapes diverge, but only the taken
+    constexpr branch compiles so the single return never has to unify them. ``BLOCK_SIZE_N`` is the weight tile's row count — the gate_up kernel passes ``2*BN``
     with its STACKED gate|up tile (gate rows first, split back via ``split_gate_up``): one
     load and one MMA for both projections keeps the native mxfp M=128 operand at BN=64, doubling
     the CTAs on the parallelism-starved decode grid (dsv4 gate_up 1.34x, bit-exact)."""
@@ -1016,6 +1127,10 @@ def mx_swap_compute(
     as1 = tl.reshape(a_scale, (BLOCK_SIZE_K // SCALE_GROUP_K,))
     if COMPUTE_MODE == "dot_scaled":
         acc = mx_dot_scaled_swapped(
+            acc, a1, as1, w, w_scale, VALUES_PER_BYTE, BLOCK_SIZE_K
+        )
+    elif COMPUTE_MODE == "dot":
+        acc = mx_dot_rescale_swapped(
             acc, a1, as1, w, w_scale, VALUES_PER_BYTE, BLOCK_SIZE_K
         )
     elif COMPUTE_MODE == "scalar":
@@ -1031,7 +1146,7 @@ def mx_swap_compute(
             VALUES_PER_BYTE,
         )
     else:
-        tl.static_assert(False, "SWAP_AB supports only dot_scaled/scalar")
+        tl.static_assert(False, "unknown COMPUTE_MODE under SWAP_AB")
     return acc
 
 
@@ -1305,8 +1420,8 @@ def compile_time_only_triton_op(name, mutates_args=()):
     return decorator
 
 
-@triton.autotune(
-    configs=[
+@bayesian_autotune(
+    [
         triton.Config({"BLOCK_K": bk}, num_warps=w)
         for bk in (32, 64, 128, 256, 512, 1024)
         for w in (2, 4, 8)
@@ -1315,7 +1430,8 @@ def compile_time_only_triton_op(name, mutates_args=()):
     # small T the block size is the only parallelism lever while at prefill scale it isn't —
     # same bucketing as the grouped kernels' tokens_per_sm_bit_length (raw T would retune per
     # unique token count).
-    key=["K", "t_bucket"],
+    ["K", "t_bucket"],
+    n_trials=100,
     prune_configs_by={"early_config_prune": _quant_block_k_pruner},
 )
 @triton.jit
@@ -1390,9 +1506,10 @@ def mxfp_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return y, s
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=w) for w in (1, 2, 4)],
-    key=["K", "BLOCK_K", "t_bucket"],
+@bayesian_autotune(
+    [triton.Config({}, num_warps=w) for w in (1, 2, 4)],
+    ["K", "BLOCK_K", "t_bucket"],
+    n_trials=100,
 )
 @triton.jit
 def _fp8_act_quant_2d_kernel(

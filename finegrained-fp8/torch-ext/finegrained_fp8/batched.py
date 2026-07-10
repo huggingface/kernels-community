@@ -38,7 +38,7 @@ from .utils import (
     fp8_act_quant,
     fp8_act_quant_2d,
     maybe_act_quant,
-    fp8_act_quant_inline,
+    load_block_fp8_act_tile,
     get_accelerator_autotuning_configs,
     get_mxfp_autotuning_configs,
     is_mxfp,
@@ -107,9 +107,10 @@ def store_row(
     tl.store(c_ptrs, c, mask=(offs_cm == 0)[:, None])
 
 
-@triton.autotune(
-    configs=get_accelerator_autotuning_configs(swap_ab=True, for_decode=True),
-    key=["N", "K", "S"],
+@bayesian_autotune(
+    get_accelerator_autotuning_configs(swap_ab=True, for_decode=True),
+    ["N", "K", "S"],
+    n_trials=100,
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_batched_kernel(
@@ -162,17 +163,13 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_ak
-    as_ptrs = AScale + batch_id * stride_as_m + tl.arange(0, BLOCK_SIZE_M) * 0
+    as_ptrs = AScale + batch_id * stride_as_m + tl.zeros((BLOCK_SIZE_M,), tl.int32)
     b_ptrs = oriented_weight_ptrs(B, offs_bn, offs_k, stride_bn, stride_bk, SWAP_AB)
     bs_ptrs = Bs + pid_n * stride_bs_n
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        if A.dtype.element_ty == tl.float8e4nv:  # pre-quantized offline
-            a = tl.load(a_ptrs)
-            a_s = tl.load(as_ptrs)
-        else:  # raw bf16/fp16 — quantize inline
-            a, a_s = fp8_act_quant_inline(tl.load(a_ptrs).to(tl.float32))
+        a, a_s = load_block_fp8_act_tile(a_ptrs, as_ptrs)
         b = tl.load(b_ptrs)
         b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
         # a_s is [BM], b_s a per-block scalar; a_s[:, None] broadcasts onto the acc either way (under
@@ -264,7 +261,11 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 
 # VALUES_PER_BYTE keys the MXFP4/MXFP8 split so a cached winner is only reused for its packing.
 # BLOCK_SIZE_M is always 1 here (per-token decode), so — like the fused MXFP batched kernels —
-# dot is excluded (dead at M=1) and SWAP_AB is the operand-swap axis over {dot_scaled, scalar}.
+# dot is excluded — MEASURED TWICE (2026-07-10): no-swap BM16 within noise of the
+# scalar/dot_scaled-swap champions, and fielding it WITH the swapped form
+# (mx_dot_rescale_swapped) poisoned the TPE (dsv4 +27%, M3 +12% tuner misses) — the
+# can't-win dot-swap configs skew the per-dimension densities. The swapped helper stays
+# implemented for future shapes; don't re-emit without new evidence.
 @bayesian_autotune(
     get_mxfp_autotuning_configs(
         compute_modes=("dot_scaled", "scalar"), swap_ab=True, for_decode=True
