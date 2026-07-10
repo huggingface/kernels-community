@@ -262,6 +262,10 @@ def get_accelerator_autotuning_configs(
     in BLOCK_SIZE_M ∈ ``(16, 32, 64, 128)`` (fused grouped, which lets the tuner pick M instead
     of computing it via ``adaptive_block_size_m``).
 
+    The XPU tile set is the same compact 64/128 tile family used by the Intel backend tuning
+    sweeps: it avoids the wider 256-wide tiles that drive up GRF pressure and spill/noise on
+    decode/grouped shapes, while keeping both N- and K-dominant 128x64 / 64x128 variants.
+
     The CUDA tile set is a data-driven prune of a B200 sweep across single (BM=128),
     grouped MoE (BM=16/64) and decode (BM=1): winners only ever used these 4 tiles,
     num_warps in {4,8,16}, num_stages in {2,3} (warps=2, stages=4 and 256x256 never
