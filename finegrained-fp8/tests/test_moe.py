@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 import pytest
 import torch
 import torch.nn.functional as F
+
 import triton
 
 from utils import (  # type: ignore
@@ -134,8 +135,8 @@ PROBLEMS = [
         scale_layout="per_tensor_111",
         block_size=None,
     ),
-    # Non-contig indexing tensors — exercises stride-aware loads for
-    # expert_ids (batched) and offsets / tokens_per_expert (grouped).
+    # Non-contig expert_ids — exercises stride-aware loads in the batched kernel and
+    # the contiguous-normalization inside the grouped scheduling op.
     Problem(
         S=32,
         E=4,
@@ -377,6 +378,20 @@ PROBLEMS = [
         weight_scale_dtype=torch.float8_e8m0fnu,
         contiguous=False,
     ),
+    # int32 pointer-offset overflow guard: the last experts' weight offsets exceed 2^31
+    # elements (127 * 4096 * 4224 = 2.197e9) — a regressed int64 expert-offset cast wraps
+    # them negative and corrupts every token routed high (S=512 random routing makes
+    # missing the top experts a ~1e-7 event under the fixed seed). Covers the batched
+    # expert_setup cast and the grouped tile-search cast through the standard suites.
+    Problem(
+        S=512,
+        E=128,
+        N=4096,
+        K=4224,
+        TOP_K=4,
+        scale_layout="block",
+        block_size=(128, 128),
+    ),
 ]
 
 
@@ -442,20 +457,6 @@ def _setup_problem(problem: Problem):
     return A, expert_ids, B, Bs
 
 
-def _prepare_grouped(A, expert_ids, num_experts, contiguous: bool = True):
-    perm = torch.argsort(expert_ids)
-    A_sorted = A[perm].contiguous()
-    expert_ids_sorted = expert_ids[perm]
-    tokens_per_expert = torch.histc(
-        expert_ids_sorted.float(), bins=num_experts, min=0, max=num_experts - 1
-    ).to(torch.int32)
-    offsets = torch.cumsum(tokens_per_expert, dim=0).to(torch.int32)
-    if not contiguous:
-        offsets = _make_noncontig_1d(offsets)
-        tokens_per_expert = _make_noncontig_1d(tokens_per_expert)
-    return A_sorted, expert_ids_sorted, offsets, tokens_per_expert
-
-
 def _routed_matmul_ref(A, B, Bs, expert_ids, block_size):
     """Per-routed-row reference that re-uses the neutral ``matmul_2d`` dispatcher
     (it routes by weight dtype / scale layout: MXFP4, MXFP8, or block/tensor FP8).
@@ -502,15 +503,11 @@ def test_batched(problem):
 def test_grouped(problem):
     torch.manual_seed(0)
     A, expert_ids, B, Bs = _setup_problem(problem)
-    A_sorted, expert_ids_sorted, offsets, tokens_per_expert = _prepare_grouped(
-        A, expert_ids, problem.E, contiguous=problem.contiguous
-    )
+    scheduling = finegrained_fp8.compute_grouped_scheduling(expert_ids, problem.E, 1)
     matmul_grouped = maybe_compile(finegrained_fp8.matmul_grouped, problem.compile)
-    out = matmul_grouped(
-        A_sorted, B, Bs, offsets, tokens_per_expert, problem.block_size
-    )
-    ref = _routed_matmul_ref(A_sorted, B, Bs, expert_ids_sorted, problem.block_size)
-    _assert_correctness(out, ref, expert_ids_sorted, problem)
+    out = matmul_grouped(A, B, Bs, scheduling, problem.block_size)
+    ref = _routed_matmul_ref(A, B, Bs, expert_ids, problem.block_size)
+    _assert_correctness(out, ref, expert_ids, problem)
 
 
 # ── Fused batched MoE (two-kernel gate_up + down) vs the unfused path ────────────
@@ -720,6 +717,18 @@ MOE_PROBLEMS = [
         block_size=(128, 128),
         sentinel_fraction=0.875,
     ),
+    # int32 pointer-offset overflow guard for the fused paths: the last experts'
+    # gate_up offsets exceed 2^31 elements (127 * 2*2048 * 6144 = 3.196e9); a regressed
+    # int64 cast corrupts the high-routed tokens vs the torch reference. E is a power of
+    # two (the fused-grouped scheduling kernels require it).
+    MoEProblem(
+        num_tokens=512,
+        num_experts=128,
+        hidden_dim=6144,
+        intermediate_dim=2048,
+        num_top_k=4,
+        block_size=(128, 128),
+    ),
 ]
 
 
@@ -835,9 +844,11 @@ def _unfused_grouped_ref(
     swiglu_limit=None,
 ):
     """The same MoE forward as ``_unfused_batched_ref`` but built on the tested
-    ``matmul_grouped`` — sort the routed tokens by expert, grouped gate_up, GLU
+    ``matmul_grouped`` — one scheduling pass threaded through the chain: gate_up gathers
+    straight from ``hidden`` via ``input_perm`` (no replication, no physical sort), GLU
     (``act_fn(gate) * up``, or clamped/scaled SwiGLU when ``swiglu_alpha``/``swiglu_limit`` are
-    set), grouped down, unsort, routing-weighted top-k reduce. Using the grouped GEMM (not
+    set) on the expert-sorted intermediate, down scatters to token-major routed rows via
+    ``output_perm``, routing-weighted top-k reduce. Using the grouped GEMM (not
     batched) matches the fused grouped path's tiling / reduce order."""
     # EP: a non-local expert is marked with an out-of-range sentinel id; drop those slots (dummy
     # expert, zero weight) so they contribute 0 — matching the fused path's scatter guard + reduce
@@ -847,25 +858,18 @@ def _unfused_grouped_ref(
     top_k_weights = top_k_weights * keep.to(top_k_weights.dtype)
     num_tokens, num_top_k = hidden.shape[0], problem.num_top_k
     expert_ids = top_k_index.reshape(-1).to(torch.int32)
-    routed = hidden.repeat_interleave(num_top_k, dim=0)
-    perm = torch.argsort(expert_ids)
-    inv_perm = torch.empty_like(perm)
-    inv_perm[perm] = torch.arange(perm.numel(), device=perm.device)
-    a_sorted = routed[perm].contiguous()
-    tokens_per_expert = torch.histc(
-        expert_ids.float(), bins=problem.num_experts, min=0, max=problem.num_experts - 1
-    ).int()
-    offsets = torch.cumsum(tokens_per_expert, dim=0).int()
-
+    scheduling = finegrained_fp8.compute_grouped_scheduling(
+        expert_ids, problem.num_experts, num_top_k
+    )
     gate_up_out = finegrained_fp8.matmul_grouped(
-        a_sorted, gate_up, gate_up_s, offsets, tokens_per_expert, block_size
+        hidden, gate_up, gate_up_s, scheduling, block_size, output_scatter="ordered"
     )
     gate, up = gate_up_out.chunk(2, dim=-1)
     inter = _glu_ref(gate, up, act_fn, swiglu_alpha, swiglu_limit)
     down_out = finegrained_fp8.matmul_grouped(
-        inter, down, down_s, offsets, tokens_per_expert, block_size
+        inter, down, down_s, scheduling, block_size, input_gather="ordered"
     )
-    weighted = down_out[inv_perm] * top_k_weights.reshape(-1, 1)
+    weighted = down_out * top_k_weights.reshape(-1, 1)
     return weighted.view(num_tokens, num_top_k, problem.hidden_dim).sum(dim=1)
 
 
@@ -874,18 +878,9 @@ def _assert_fused_correctness(out, ref, problem: MoEProblem):
     assert out.shape == (problem.num_tokens, problem.hidden_dim)
     assert out.dtype == problem.dtype
     atol, rtol = DTYPE_TO_TOL[problem.dtype]
-    # Clamped/scaled SwiGLU's (up + 1) makes the down-matmul outputs cancellation-prone: the few-ULP
-    # gap between the valid MX compute modes the autotuner may pick (native dot_scaled vs cuda-core
-    # dot, both correct) blows up to ~6% relative on the near-zero results. The kernel is verified
-    # bit-exact vs an fp32 dequant-matmul truth, so relax rtol for that path only.
-    if problem.swiglu_alpha is not None:
-        rtol = max(rtol, 0.1)
     torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
 
-@pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-@pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
 def test_fused_batched(problem):
     """Fused two-kernel MoE (gate_up + activation + FP8 requant + down + top-k reduce) via the
     ``moe_fused_batched`` dispatcher vs the unfused reference. ``simulate_unfused`` rounds each
@@ -972,10 +967,7 @@ def _bench_setup(problem: Problem):
     torch.compiler.reset()
     torch.manual_seed(0)
     A, expert_ids, B, Bs = _setup_problem(problem)
-    A_sorted, expert_ids_sorted, offsets, tokens_per_expert = _prepare_grouped(
-        A, expert_ids, problem.E
-    )
-    return A_sorted, B, Bs, expert_ids_sorted, offsets, tokens_per_expert
+    return A, B, Bs, expert_ids
 
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
@@ -1016,7 +1008,7 @@ def _run_speedup(problem, label, call, expected_ms):
 def test_batched_speedup(problem):
     if problem.expectation is None:
         pytest.skip("No expected benchmark latency for this problem")
-    A, B, Bs, expert_ids, _, _ = _bench_setup(problem)
+    A, B, Bs, expert_ids = _bench_setup(problem)
     _run_speedup(
         problem,
         "batched",
@@ -1035,12 +1027,13 @@ def test_batched_speedup(problem):
 def test_grouped_speedup(problem):
     if problem.expectation is None:
         pytest.skip("No expected benchmark latency for this problem")
-    A, B, Bs, _, offsets, tokens_per_expert = _bench_setup(problem)
+    A, B, Bs, expert_ids = _bench_setup(problem)
+    scheduling = finegrained_fp8.compute_grouped_scheduling(expert_ids, problem.E, 1)
     _run_speedup(
         problem,
         "grouped",
         lambda: finegrained_fp8.matmul_grouped(
-            A, B, Bs, offsets, tokens_per_expert, problem.block_size
+            A, B, Bs, scheduling, problem.block_size
         ),
         problem.expectation.grouped_ms,
     )

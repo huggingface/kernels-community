@@ -7,18 +7,18 @@
 
 Two **persistent** kernels over expert-grouped M-tiles, no ``A_sorted`` materialization:
   1. Routing (on-device): an atomic counting-sort scatter (``_scatter_kernel``, O(S)) →
-     ``perm`` / ``perm_token`` + an ``expert_start`` exclusive offset vector — the sort is
+     ``perm_routed`` / ``perm_token`` + an ``expert_start`` exclusive offset vector — the sort is
      just an index; activations stay unsorted.
   2. Phase 1 — gate_up, **gathering** each tile's hidden rows via ``perm_token``, + SiLU,
      then **FP8 requant** of the intermediate — same trick as ``fused_batched``: the down
      kernel reads FP8 directly instead of a bf16 round-trip.
   3. Phase 2 — grouped down over the FP8 intermediate, then **fuses the routing-weight ×
      reorder** (no atomics): each row is scaled by its weight and **scattered** to its flat
-     ``(token, slot)`` row via ``perm``, leaving the host only a top-k sum back to (T, H).
+     ``(token, slot)`` row via ``perm_routed``, leaving the host only a top-k sum back to (T, H).
 
 Scheduling is persistent: a fixed ``NUM_SMS`` programs grid-stride over all tiles. The
-expert-tile layout is built once into registers from ``expert_start`` (``_build_tile_layout``)
-and each tile's owner is resolved inline (``_resolve_tile_inline``) — no padded grid, no
+expert-tile layout is built once into registers from ``expert_start`` (``build_tile_layout``)
+and each tile's owner is resolved inline (``resolve_tile_inline``) — no padded grid, no
 per-tile binary search, no host-side tile-offset precompute.
 
 Recipe-named to mirror ``fused_batched``: ``w8a8_block_dynamic_fp8_moe_grouped`` (128x128
@@ -34,6 +34,10 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .grouped import store_tile
 from .utils import (
+    compute_grouped_scheduling,
+    build_tile_layout,
+    resolve_tile_inline,
+    batched_mx_pruner,
     FP8_DTYPE,
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
@@ -46,10 +50,8 @@ from .utils import (
     topk_reduce_kernel,
     TOPK_REDUCE_BLOCK_H,
     get_accelerator_autotuning_configs,
-    get_mxfp_autotuning_configs,
     is_mxfp,
     is_mxfp4,
-    maybe_act_quant,
     mxfp_act_quant,
     load_mx_act_tile,
     mxfp_act_quant_inline,
@@ -63,62 +65,8 @@ from .utils import (
     ue8m0_as_uint8,
 )
 
-# maybe_act_quant crossover (min rows for offline pre-quant) for the fused MX gate_up —
-# inherited from the 2D-matmul sweep; the true crossover is LOWER (each token is gathered
-# by top_k experts, multiplying the inline re-quant redundancy), so 16 is conservative.
-MXFP_GATE_UP_ACT_PREQUANT_MIN_M = 16
-
 
 # ── Persistent tile scheduling (register-resident expert-tile layout) ─────────
-
-# Flat-slot tile per program for the O(S) routing kernels (count + scatter). These are small
-# latency-bound atomic kernels that want many programs: a sweep over {256..4096} x prefill shapes
-# put 256 best (or within ~1%) for both, with 1024 up to ~1.5x slower. The grid derives from it
-# so the two can't drift. Power of 2.
-_ROUTING_BLOCK_SIZE = 256
-
-
-@triton.jit
-def _build_tile_layout(
-    ExpertStart, NUM_EXPERTS: tl.constexpr, BLOCK_SIZE_M: tl.constexpr
-):
-    """Load ``expert_start`` once and derive the per-BM tile layout vectors (kept in
-    registers for the whole persistent loop): per-expert first sorted row, token count,
-    exclusive tile-start cumsum, and the total M-tile count. ``ExpertStart`` is
-    ``(NUM_EXPERTS + 1,)`` with a trailing ``S`` sentinel (``expert_start[E] == S``)."""
-    e_offs = tl.arange(0, NUM_EXPERTS)
-    exp_start = tl.load(ExpertStart + e_offs)
-    exp_end = tl.load(ExpertStart + e_offs + 1)
-    freqs = exp_end - exp_start
-    tiles_per_e = (freqs + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
-    tile_start_excl = (
-        tl.cumsum(tiles_per_e, 0) - tiles_per_e
-    )  # first tile index of expert e
-    total_m_tiles = tl.sum(tiles_per_e, 0)
-    return exp_start, freqs, tile_start_excl, total_m_tiles, e_offs
-
-
-@triton.jit
-def _resolve_tile_inline(
-    pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_SIZE_M: tl.constexpr
-):
-    """Map an M-tile id to its owning expert + the tile's sorted row range, from the
-    register-resident layout (no global loads). Returns ``(expert_id, sorted_indices,
-    row_mask)``."""
-    # Bucketize via the exclusive tile cumsum: #experts whose tile-start <= pid_m, minus 1.
-    expert_id = tl.sum((tile_start_excl <= pid_m).to(tl.int32), 0) - 1
-    sel = (
-        e_offs == expert_id
-    )  # scalar-index the E-vectors via mask-sum (no dynamic index)
-    e_start = tl.sum(tl.where(sel, exp_start, 0), 0)
-    e_tile_start = tl.sum(tl.where(sel, tile_start_excl, 0), 0)
-    freq = tl.sum(tl.where(sel, freqs, 0), 0)
-    within = pid_m - e_tile_start
-    m_start = e_start + within * BLOCK_SIZE_M
-    offs = tl.arange(0, BLOCK_SIZE_M)
-    row_mask = offs < freq - within * BLOCK_SIZE_M
-    sorted_indices = tl.max_contiguous(m_start + offs, BLOCK_SIZE_M)
-    return expert_id, sorted_indices, row_mask
 
 
 @triton.jit
@@ -128,7 +76,7 @@ def scatter_weighted_tile(
     offs_global_m,
     offs_cols,
     row_mask,
-    Perm,
+    PermRouted,
     SampleWeights,
     stride_perm,
     stride_po_m,
@@ -140,116 +88,14 @@ def scatter_weighted_tile(
     reorder (no atomics) that lets the host just sum over slots."""
     if SIMULATE_UNFUSED:
         acc = acc.to(ProjOut.dtype.element_ty).to(tl.float32)
-    flat = tl.load(Perm + offs_global_m * stride_perm, mask=row_mask, other=0)
+    flat = tl.load(PermRouted + offs_global_m * stride_perm, mask=row_mask, other=0)
     weight = tl.load(SampleWeights + flat, mask=row_mask, other=0.0)
     acc = acc * weight[:, None]
     store_tile(ProjOut, acc, flat, offs_cols, row_mask, stride_po_m, stride_po_n)
 
 
-@triton.jit
-def _exclusive_offsets_kernel(
-    ExpertFreq, ExpertStart, Counters, NUM_EXPERTS: tl.constexpr
-):
-    """Exclusive cumsum of per-expert token counts → ``expert_start`` (leading 0, trailing
-    S), and zero the scatter counters — one launch."""
-    offs = tl.arange(0, NUM_EXPERTS)
-    incl = tl.cumsum(tl.load(ExpertFreq + offs), 0)
-    tl.store(ExpertStart, 0)
-    tl.store(ExpertStart + 1 + offs, incl)
-    tl.store(Counters + offs, tl.zeros([NUM_EXPERTS], tl.int32))
-
-
-@triton.jit
-def _scatter_kernel(
-    ExpertIds,
-    Perm,
-    PermToken,
-    ExpertStart,
-    Counters,
-    S,
-    NUM_TOP_K: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Counting-sort scatter: each flat slot atomically claims the next slot of its expert
-    (``expert_start[e] + counter[e]++``). O(S), replaces an O(S·logS) argsort. Within-expert
-    order is arbitrary (atomic race) — fine, the per-token reduce is order-invariant. Slots whose
-    expert is non-local (EP sentinel id ``>= NUM_EXPERTS``) are skipped — matches ``_count_kernel``,
-    and avoids the atomic/store landing at an out-of-range (invalid) global address."""
-    offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    expert_id = tl.load(ExpertIds + offs, mask=offs < S, other=NUM_EXPERTS)
-    valid = expert_id < NUM_EXPERTS
-    dest = tl.load(ExpertStart + expert_id, mask=valid, other=0) + tl.atomic_add(
-        Counters + expert_id, 1, mask=valid
-    )
-    tl.store(Perm + dest, offs, mask=valid)
-    tl.store(PermToken + dest, offs // NUM_TOP_K, mask=valid)
-
-
-@triton.jit
-def _count_kernel(
-    ExpertIds, ExpertFreq, S, NUM_EXPERTS: tl.constexpr, BLOCK_SIZE: tl.constexpr
-):
-    """Per-expert token count via atomics — replaces ``torch.histc`` (no float cast), fixed
-    ``(NUM_EXPERTS,)`` output stays CUDA-graph friendly. ``ExpertFreq`` is pre-zeroed."""
-    offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offs < S
-    expert_id = tl.load(ExpertIds + offs, mask=mask, other=NUM_EXPERTS)
-    tl.atomic_add(ExpertFreq + expert_id, 1, mask=mask & (expert_id < NUM_EXPERTS))
-
-
-def _grouped_routing(expert_ids: torch.Tensor, num_experts: int, num_top_k: int):
-    """On-device routing: expert-sorted index (no copy of the activations) via two Triton
-    launches — exclusive offsets + an atomic counting-sort scatter (replaces host
-    ``argsort``). Returns ``(perm_token, perm, expert_start, num_experts, num_routed_tokens)``.
-    ``perm`` is the sorted-position → flat
-    ``(t*K + j)`` map (gate_up gathers via ``perm_token = perm // K``, down scatters via
-    ``perm``); ``expert_start`` is ``(E+1,)`` padded with S so the kernels build the tile
-    layout in-register (E is a power of 2)."""
-    # the scheduling kernels hold the (E,) frequency/offset vectors in one tl.arange
-    # block, which requires a power of 2 — fail here with a clear message instead of a
-    # Triton compile error from an internal kernel
-    assert num_experts & (num_experts - 1) == 0, (
-        f"num_experts ({num_experts}) must be a power of 2"
-    )
-    device = expert_ids.device
-    expert_ids = expert_ids.int()
-    num_routed_tokens = expert_ids.numel()  # S = num_tokens * num_top_k
-    expert_freq = torch.zeros(num_experts, dtype=torch.int32, device=device)
-    expert_start = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
-    counters = torch.empty(num_experts, dtype=torch.int32, device=device)
-    perm = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
-    perm_token = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
-    with device_context(device):
-        _count_kernel[(triton.cdiv(num_routed_tokens, _ROUTING_BLOCK_SIZE),)](
-            expert_ids,
-            expert_freq,
-            num_routed_tokens,
-            NUM_EXPERTS=num_experts,
-            BLOCK_SIZE=_ROUTING_BLOCK_SIZE,
-        )
-        _exclusive_offsets_kernel[(1,)](
-            expert_freq,
-            expert_start,
-            counters,
-            NUM_EXPERTS=num_experts,
-        )
-        _scatter_kernel[(triton.cdiv(num_routed_tokens, _ROUTING_BLOCK_SIZE),)](
-            expert_ids,
-            perm,
-            perm_token,
-            expert_start,
-            counters,
-            num_routed_tokens,
-            NUM_TOP_K=num_top_k,
-            NUM_EXPERTS=num_experts,
-            BLOCK_SIZE=_ROUTING_BLOCK_SIZE,
-        )
-    return perm_token, perm, expert_start, num_experts, num_routed_tokens
-
-
 # MX MoE autotune axes: the MMA flavor and the weight-load mechanism. The kernels implement all
-# three memory modes; get_mxfp_autotuning_configs drops the device-inapplicable descriptor
+# three memory modes; resolve_memory_modes maps "descriptor" to the device's flavor
 # flavor (host on XPU, device on CUDA).
 _MX_COMPUTE_MODES = ("dot_scaled", "dot")
 _MX_MEMORY_MODES = ("descriptor", "pointer")
@@ -317,7 +163,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
     barriers are what make those configs sound). The single-dot combined form is race-free
     but measured 20% slower."""
     start_pid = tl.program_id(axis=0)
-    exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = _build_tile_layout(
+    exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
         ExpertStart, NUM_EXPERTS, BLOCK_SIZE_M
     )
     num_n_tiles = tl.cdiv(INTERMEDIATE_DIM, BLOCK_SIZE_N)
@@ -325,7 +171,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
         pid_m = tile_id // num_n_tiles
         pid_n = tile_id % num_n_tiles
-        expert_id, offs_global_m, row_mask = _resolve_tile_inline(
+        expert_id, offs_global_m, row_mask = resolve_tile_inline(
             pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_SIZE_M
         )
         offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -422,7 +268,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
     Down,  # (E, H, I) FP8
     DownScale,  # (E, H//bn, I//bk) UE8M0 block scales
     ExpertStart,  # (NUM_EXPERTS+1,) int32 — exclusive sorted-row start per expert (pad S)
-    Perm,  # (S,) int32 — sorted position -> flat (token, slot) row
+    PermRouted,  # (S,) int32 — sorted position -> flat (token, slot) row
     SampleWeights,  # (S,) routing weight per flat row
     ProjOut,  # (S, H) bf16, flat (token, slot) order
     stride_int_m,
@@ -453,7 +299,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
     """Phase 2: persistent grid-stride over (M-tile, H-tile). Grouped down over the FP8
     intermediate, then routing-weight × scatter to the flat (token, slot) row."""
     start_pid = tl.program_id(axis=0)
-    exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = _build_tile_layout(
+    exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
         ExpertStart, NUM_EXPERTS, BLOCK_SIZE_M
     )
     num_h_tiles = tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_N)
@@ -461,7 +307,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
     for tile_id in tl.range(start_pid, total_m_tiles * num_h_tiles, NUM_SMS):
         pid_m = tile_id // num_h_tiles
         pid_h = tile_id % num_h_tiles
-        expert_id, offs_global_m, row_mask = _resolve_tile_inline(
+        expert_id, offs_global_m, row_mask = resolve_tile_inline(
             pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_SIZE_M
         )
         offs_h = pid_h * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -504,7 +350,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
             offs_global_m,
             offs_h,
             row_mask,
-            Perm,
+            PermRouted,
             SampleWeights,
             stride_perm,
             stride_po_m,
@@ -530,18 +376,21 @@ def w8a8_block_dynamic_fp8_moe_grouped(
     """Block-dynamic FP8 fused grouped MoE: gather gate_up+SiLU → FP8 intermediate →
     grouped down → routing-weighted top-k reduce. Returns ``(num_tokens, hidden_dim)``."""
     device = hidden_states.device
-    num_tokens = hidden_states.size(0)
+    num_sms = sm_count(device.index)
     num_top_k = top_k_index.size(-1)
+    num_tokens = hidden_states.size(0)
+    num_routed_tokens = top_k_index.numel()
+    tokens_per_sm_bit_length = int(num_routed_tokens // num_sms).bit_length()
+
+    NUM_EXPERTS = gate_up_proj.size(0)
     HIDDEN_DIM = hidden_states.size(1)
     INTERMEDIATE_DIM = down_proj.size(2)
     BLOCK_SIZE_N, BLOCK_SIZE_K = block_size
     NUM_I_TILES = INTERMEDIATE_DIM // BLOCK_SIZE_N
 
-    perm_token, perm, expert_start, NUM_EXPERTS, num_routed_tokens = _grouped_routing(
-        top_k_index, gate_up_proj.size(0), num_top_k
+    perm_token, perm_routed, expert_start = compute_grouped_scheduling(
+        top_k_index, NUM_EXPERTS, num_top_k
     )
-    num_sms = sm_count(device.index)
-    tokens_per_sm_bit_length = int(num_routed_tokens // num_sms).bit_length()
 
     gate_up_scale_u8 = ue8m0_as_uint8(gate_up_proj_scale)
     down_scale_u8 = ue8m0_as_uint8(down_proj_scale)
@@ -606,7 +455,7 @@ def w8a8_block_dynamic_fp8_moe_grouped(
             down_proj,
             down_scale_u8,
             expert_start,
-            perm,
+            perm_routed,
             top_k_weights,
             out,
             inter.stride(0),
@@ -621,7 +470,7 @@ def w8a8_block_dynamic_fp8_moe_grouped(
             down_scale_u8.stride(2),
             out.stride(0),
             out.stride(1),
-            perm.stride(0),
+            perm_routed.stride(0),
             tokens_per_sm_bit_length=tokens_per_sm_bit_length,
             HIDDEN_DIM=HIDDEN_DIM,
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
@@ -675,8 +524,10 @@ def _set_gate_up_descriptor(nargs):
 
 
 @bayesian_autotune(
-    get_mxfp_autotuning_configs(
+    get_accelerator_autotuning_configs(
         pre_hook=_set_gate_up_descriptor,
+        mx=True,
+        tune_block_nk=True,
         compute_modes=_MX_COMPUTE_MODES,
         memory_modes=_MX_MEMORY_MODES,
         tune_block_m=True,
@@ -687,8 +538,11 @@ def _set_gate_up_descriptor(nargs):
     n_trials=100,
     # fp8 pre-quantized activation tile + fused gate|up weight tiles
     prune_configs_by={
-        "early_config_prune": smem_config_pruner(
-            n_weight_tiles=2, reduction_dim="HIDDEN_DIM", double_mma=True
+        "early_config_prune": compose_pruners(
+            batched_mx_pruner("HIDDEN_DIM", stacked_gate_up=True),
+            smem_config_pruner(
+                n_weight_tiles=2, reduction_dim="HIDDEN_DIM", double_mma=True
+            ),
         )
     },
 )
@@ -738,7 +592,7 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
     """MXFP4/MXFP8 phase 1 (persistent): gather hidden rows per expert M-tile, gate + up MX
     matmuls (``tl.dot_scaled`` or fp8 ``tl.dot`` + per-group rescale), SiLU, MXFP8-requant."""
     start_pid = tl.program_id(axis=0)
-    exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = _build_tile_layout(
+    exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
         ExpertStart, NUM_EXPERTS, BLOCK_SIZE_M
     )
     num_n_tiles = tl.cdiv(INTERMEDIATE_DIM, BLOCK_SIZE_N)
@@ -746,7 +600,7 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
         pid_m = tile_id // num_n_tiles
         pid_n = tile_id % num_n_tiles
-        expert_id, offs_global_m, row_mask = _resolve_tile_inline(
+        expert_id, offs_global_m, row_mask = resolve_tile_inline(
             pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_SIZE_M
         )
         offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -890,8 +744,10 @@ def _set_down_descriptor(nargs):
 
 
 @bayesian_autotune(
-    get_mxfp_autotuning_configs(
+    get_accelerator_autotuning_configs(
         pre_hook=_set_down_descriptor,
+        mx=True,
+        tune_block_nk=True,
         compute_modes=_MX_COMPUTE_MODES,
         memory_modes=_MX_MEMORY_MODES,
         tune_block_m=True,
@@ -901,8 +757,9 @@ def _set_down_descriptor(nargs):
     n_trials=100,
     # fp8 intermediate activation tile + single down weight tile
     prune_configs_by={
-        "early_config_prune": smem_config_pruner(
-            n_weight_tiles=1, reduction_dim="INTERMEDIATE_DIM"
+        "early_config_prune": compose_pruners(
+            batched_mx_pruner("INTERMEDIATE_DIM"),
+            smem_config_pruner(n_weight_tiles=1, reduction_dim="INTERMEDIATE_DIM"),
         )
     },
 )
@@ -914,7 +771,7 @@ def mxfp_dynamic_moe_grouped_down_kernel(
     DownScale,  # (E, H, I//32) UE8M0 group-32 scales
     DownDescriptor,  # TMA descriptor over the (E*H, I//VALUES_PER_BYTE) weight view
     ExpertStart,  # (NUM_EXPERTS+1,) int32 — exclusive sorted-row start per expert (pad S)
-    Perm,  # (S,) int32 — sorted position -> flat (token, slot) row
+    PermRouted,  # (S,) int32 — sorted position -> flat (token, slot) row
     SampleWeights,  # (S,) routing weight per flat row
     ProjOut,  # (S, H) bf16, flat (token, slot) order
     stride_int_m,
@@ -947,7 +804,7 @@ def mxfp_dynamic_moe_grouped_down_kernel(
     """MXFP4/MXFP8 phase 2 (persistent): MXFP8 intermediate → down proj, then routing-weight
     × scatter to the flat (token, slot) row. N = hidden tile, K = intermediate tile."""
     start_pid = tl.program_id(axis=0)
-    exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = _build_tile_layout(
+    exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
         ExpertStart, NUM_EXPERTS, BLOCK_SIZE_M
     )
     num_n_tiles = tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_N)
@@ -956,7 +813,7 @@ def mxfp_dynamic_moe_grouped_down_kernel(
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
         pid_m = tile_id // num_n_tiles
         pid_n = tile_id % num_n_tiles
-        expert_id, offs_global_m, row_mask = _resolve_tile_inline(
+        expert_id, offs_global_m, row_mask = resolve_tile_inline(
             pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_SIZE_M
         )
         offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -1048,7 +905,7 @@ def mxfp_dynamic_moe_grouped_down_kernel(
             offs_global_m,
             offs_bn,
             row_mask,
-            Perm,
+            PermRouted,
             SampleWeights,
             stride_perm,
             stride_po_m,
@@ -1083,13 +940,17 @@ def mxfp_dynamic_moe_grouped(
     num_sms = sm_count(device.index)
     num_top_k = top_k_index.size(-1)
     num_tokens = hidden_states.size(0)
+    num_routed_tokens = top_k_index.numel()
+    tokens_per_sm_bit_length = int(num_routed_tokens // num_sms).bit_length()
+
+    NUM_EXPERTS = gate_up_proj.size(0)
     HIDDEN_DIM = hidden_states.size(1)
     INTERMEDIATE_DIM = gate_up_proj.size(1) // 2
-    perm_token, perm, expert_start, NUM_EXPERTS, num_routed_tokens = _grouped_routing(
-        top_k_index, gate_up_proj.size(0), num_top_k
-    )
-    tokens_per_sm_bit_length = int(num_routed_tokens // num_sms).bit_length()
     VALUES_PER_BYTE = NIBBLES_PER_BYTE if gate_up_is_fp4 else 1
+
+    perm_token, perm_routed, expert_start = compute_grouped_scheduling(
+        top_k_index, NUM_EXPERTS, num_top_k
+    )
     gate_up_proj_u8 = e2m1_as_uint8(gate_up_proj)
     down_proj_u8 = e2m1_as_uint8(down_proj)
     gate_up_scale_u8 = ue8m0_as_uint8(gate_up_proj_scale)
@@ -1097,9 +958,7 @@ def mxfp_dynamic_moe_grouped(
     # One-pass MX pre-quant of the activations: the gate_up kernel used to re-run the inline
     # quant per N-tile (16x redundant ALU + 2x act bytes) — it held gate_up at ~380 TFLOPS
     # while the pre-quantized down kernel ran ~1080. Bit-exact (same group-32 boundaries).
-    hidden_q, hidden_scale = maybe_act_quant(
-        hidden_states, mxfp_act_quant, MXFP_GATE_UP_ACT_PREQUANT_MIN_M
-    )
+    hidden_q, hidden_scale = mxfp_act_quant(hidden_states)
 
     inter = torch.empty(
         num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=FP8_DTYPE
@@ -1176,7 +1035,7 @@ def mxfp_dynamic_moe_grouped(
             down_scale_u8,
             down_descriptor,
             expert_start,
-            perm,
+            perm_routed,
             top_k_weights,
             out,
             inter.stride(0),
@@ -1191,7 +1050,7 @@ def mxfp_dynamic_moe_grouped(
             down_scale_u8.stride(2),
             out.stride(0),
             out.stride(1),
-            perm.stride(0),
+            perm_routed.stride(0),
             tokens_per_sm_bit_length=tokens_per_sm_bit_length,
             HIDDEN_DIM=HIDDEN_DIM,
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,

@@ -26,29 +26,36 @@ from .utils import (
     NIBBLES_PER_BYTE,
     MX_SCALE_GROUP_K,
     UE8M0_SCALE_DTYPES,
-    adaptive_block_size_m,
+    acc_init,
     batched_mx_pruner,
+    block_scaled_fp8_dot,
     scalar_max_m_pruner,
     block_k_within_k_pruner,
     compose_pruners,
     decode_ue8m0_scale,
+    descriptor_config_pruner,
     device_context,
     fp8_act_quant,
     fp8_act_quant_2d,
     load_block_fp8_act_tile,
+    load_weight_tile,
+    oriented_tile_ptrs,
+    weight_tile_descriptor,
     get_accelerator_autotuning_configs,
     warp_spec_compile_guard_pruner,
-    get_mxfp_autotuning_configs,
     is_mxfp,
     is_tensor_wide,
     maybe_act_quant,
     mxfp_act_quant,
+    store_masked,
+    store_masked_oriented,
+    swizzle_offsets,
     load_mx_act_tile,
     e2m1_as_uint8,
     ue8m0_as_uint8,
 )
 
-# Swizzle group size for the 2D-grid kernels' L2-locality tiling (``_swizzle_offsets``) —
+# Swizzle group size for the 2D-grid kernels' L2-locality tiling (``swizzle_offsets``) —
 # a perf knob passed as the ``GROUP_SIZE_M`` constexpr, not a correctness parameter.
 GROUP_SIZE_M = 8
 
@@ -60,141 +67,146 @@ GROUP_SIZE_M = 8
 # above the MXFP one; the M=1 decode case (the one that matters) is inline either way.
 MXFP_MATMUL_ACT_PREQUANT_MIN_M = 16
 STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
-# MEASURED (isolated arm A/B, graph-timed, H=6144 b128): offline wins at EVERY M incl.
-# M=1 (24.7 vs 31.0us) — the inline arm pays a per-tile fp32 amax+div.
-BLOCK_DYNAMIC_MATMUL_ACT_PREQUANT_MIN_M = 0
-
-
-@triton.jit
-def _swizzle_offsets(
-    M,
-    N,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    """2D-grid tile scheduling shared by the kernels below: swizzle the
-    ``(pid_m, pid_n)`` program ids for L2 locality on B, then build the operand
-    offset vectors. Returns ``(pid_m, pid_n, offs_am, offs_bn, offs_k)`` — the
-    swizzled ids (reused by the output store) and the ``%``-wrapped row/col offsets
-    plus the K range."""
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    return pid_m, pid_n, offs_am, offs_bn, offs_k
-
-
-@triton.jit
-def _store_masked(
-    C,
-    accumulator,
-    pid_m,
-    pid_n,
-    M,
-    N,
-    stride_cm,
-    stride_cn,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-):
-    """Shared output epilogue of the kernels below: cast the fp32 accumulator to
-    ``C``'s dtype and store the ``(BLOCK_SIZE_M, BLOCK_SIZE_N)`` tile at the swizzled
-    ``(pid_m, pid_n)``, masked to the ``(M, N)`` bounds."""
-    c = accumulator.to(C.dtype.element_ty)
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+# Block-dynamic has NO gate: offline wins at EVERY M incl. M=1 (24.7 vs 31.0us, isolated
+# arm A/B, graph-timed, H=6144 b128) — the inline arm pays a per-tile fp32 amax+div. The
+# always-offline paths (bd 2D/batched/grouped, fused gate_ups, MX grouped) quantize
+# unconditionally; only the two gates above have a real M=1 inline win.
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(warp_spec=True),
-    ["N", "K", "BLOCK_SIZE_M"],
+    # tune_block_m: BLOCK_SIZE_M is a config axis (not the adaptive_block_size_m launch
+    # heuristic): pointer+WS at BM=64 is the winner at every model dim probed (H=5120/
+    # 6144/7168), −17% e2e vs the heuristic's BM=128 at M=8192. tune_block_n: the N tile
+    # is DECOUPLED from the caller's scale granularity (block_n) — a BN=256 tile
+    # over 128-wide scale columns halves activation re-reads; any BN is numerically fine
+    # (the offs_bn // block_n gather spans or splits scale columns), while BK stays
+    # pinned to block_k (activation scale groups are per block_k).
+    # The SWAP_AB/MEMORY_MODE arms below are implemented and validated but NOT emitted:
+    # logged tunes rank them measurable seconds everywhere (812us WS-pointer vs 910us
+    # pointer+swap vs 926us descriptor+swap at H=6144) and axes must earn an e2e win to
+    # grow the grid. To re-evaluate (e.g. on a Triton bump), add
+    # memory_modes=("descriptor", "pointer") and swap_ab=True — descriptor_config_pruner
+    # already fences the invalid regions.
+    get_accelerator_autotuning_configs(
+        warp_spec=True, tune_block_m=True, tune_block_n=True
+    ),
+    # m_bit_length (log2 M bucket) keys the M tile, mirroring mxfp_dynamic_matmul_kernel.
+    ["N", "K", "m_bit_length"],
     n_trials=100,
-    # WS compile guard only — non-WS is race-free at every (BM, warps) here (see the pruner).
-    prune_configs_by={"early_config_prune": warp_spec_compile_guard_pruner()},
+    # WS compile guard (non-WS is race-free at every (BM, warps) here) + the descriptor
+    # modes' measured can't-win fences.
+    prune_configs_by={
+        "early_config_prune": compose_pruners(
+            warp_spec_compile_guard_pruner(), descriptor_config_pruner()
+        )
+    },
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_kernel(
     A,  # (M, K) E4M3 activations (pre-quantized once by the wrapper)
-    AScale,  # (M, K // BLOCK_SIZE_K) fp32 per-row, per-K-block activation scales
+    AScale,  # (M, K // block_k) fp32 per-row, per-K-block activation scales
     B,  # (N, K) FP8 weights
+    BDescriptor,  # TMA descriptor over B, box (BLOCK_SIZE_N, block_k); read only under MEMORY_MODE == "host_descriptor"
     C,  # (M, N) output
-    Bs,  # (N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (fp32 or uint8/UE8M0)
+    Bs,  # (N // block_n, K // block_k) weight scales (fp32 or uint8/UE8M0)
     # Shape
     M,
     N,
     K,
+    m_bit_length,  # autotune key only (log2 M bucket); unused in body
     # Strides
-    stride_am,
-    stride_ak,
+    stride_a_m,
+    stride_a_k,
     stride_as_m,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
+    stride_b_k,
+    stride_b_n,
+    stride_c_m,
+    stride_c_n,
     stride_bs_k,
     stride_bs_n,
+    # Weight-quantization blocks (the caller's block_size); block_k is also the K tile
+    # (the activation scale groups are per block_k)
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     WARP_SPEC: tl.constexpr = False,
+    MEMORY_MODE: tl.constexpr = "pointer",
+    SWAP_AB: tl.constexpr = False,
 ):
     """Block-scale FP8 GEMM kernel.
 
     Computes ``C = A @ B.T``. Activations arrive pre-quantized (one pass in the
     wrapper — the inline per-N-tile quant re-ran N//BN times per element; see the
     grouped kernels). 2D grid with swizzle for L2 cache locality on B.
+
+    ``SWAP_AB`` is an independent orientation knob: the weight tile sits in the MMA
+    M dim and the activation tile (loaded transposed for free via strides) drops to
+    the N side. The descriptor MEMORY_MODEs REQUIRE it (enforced by
+    ``descriptor_config_pruner``): the natural orientation would need a per-iteration
+    ``tl.trans`` on the descriptor tile, which races without WS (Triton 3.7.1
+    pipeliner) and loses 2.3x with it; the swapped descriptor form is race-sound
+    (12-process flake) and −11% vs same-config pointers at prefill on B200.
     """
-    pid_m, pid_n, offs_am, offs_bn, offs_k = _swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+    pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, block_k, GROUP_SIZE_M
     )
-    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    a_ptrs = oriented_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, not SWAP_AB)
     as_ptrs = AScale + offs_am * stride_as_m
-    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    b_ptrs = oriented_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
+    b_descriptor = weight_tile_descriptor(
+        BDescriptor,
+        B,
+        N,
+        K,
+        stride_b_n,
+        stride_b_k,
+        BLOCK_SIZE_N,
+        block_k,
+        MEMORY_MODE,
+    )
+    # the (BN,) scale-index gather decouples the tile from the scale grid: a wide tile
+    # spans several scale columns, a narrow one shares a column
+    bs_ptrs = Bs + (offs_bn // block_n) * stride_bs_n
+    accumulator = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
 
-    offs_bsn = offs_bn // BLOCK_SIZE_N
-    bs_ptrs = Bs + offs_bsn * stride_bs_n
-
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-        a, a_s = load_block_fp8_act_tile(a_ptrs, as_ptrs)
-        b = tl.load(b_ptrs)
+    for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
+        a, a_s = load_block_fp8_act_tile(a_ptrs, as_ptrs, TRANSPOSED=SWAP_AB)
+        b = load_weight_tile(
+            b_ptrs, b_descriptor, pid_n * BLOCK_SIZE_N, k * block_k, MEMORY_MODE
+        )
         b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
-        a_ptrs += BLOCK_SIZE_K * stride_ak
+        accumulator += block_scaled_fp8_dot(a, a_s, b, b_s, SWAP_AB)
+        a_ptrs += block_k * stride_a_k
         as_ptrs += 1
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        b_ptrs += block_k * stride_b_k
         bs_ptrs += stride_bs_k
 
-    _store_masked(
+    store_masked_oriented(
         C,
         accumulator,
         pid_m,
         pid_n,
         M,
         N,
-        stride_cm,
-        stride_cn,
+        stride_c_m,
+        stride_c_n,
         BLOCK_SIZE_M,
         BLOCK_SIZE_N,
+        SWAP_AB,
     )
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(tune_block_nk=True, warp_spec=True),
-    ["N", "K", "BLOCK_SIZE_M"],
+    # tune_block_m mirrors the block-dynamic kernel (adaptive BM=128 cost it 17% at prefill).
+    get_accelerator_autotuning_configs(
+        tune_block_nk=True, warp_spec=True, tune_block_m=True
+    ),
+    ["N", "K", "m_bit_length"],
     n_trials=100,
-    # BLOCK_SIZE_K is a tuned axis and the loop below is maskless — veto non-dividing BKs;
+    # block_k is a tuned axis and the loop below is maskless — veto non-dividing BKs;
     # WS is a pure perf axis here (non-WS is the validated state), compile-guarded.
     prune_configs_by={
         "early_config_prune": compose_pruners(
@@ -213,13 +225,14 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     M,
     N,
     K,
+    m_bit_length,  # autotune key only (log2 M bucket); unused in body
     # Strides
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
+    stride_a_m,
+    stride_a_k,
+    stride_b_k,
+    stride_b_n,
+    stride_c_m,
+    stride_c_n,
     stride_as_m,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
@@ -234,11 +247,11 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     weight scale for the full matrix.
     Uses a 2D grid with swizzle for L2 cache locality on B tiles.
     """
-    pid_m, pid_n, offs_am, offs_bn, offs_k = _swizzle_offsets(
+    pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
     )
-    a_ptrs = A + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = B + offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    a_ptrs = A + offs_am[:, None] * stride_a_m + offs_k[None, :] * stride_a_k
+    b_ptrs = B + offs_k[:, None] * stride_b_k + offs_bn[None, :] * stride_b_n
 
     a_s = tl.load(As + offs_am * stride_as_m)
     b_s = tl.load(Bs)
@@ -249,29 +262,35 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
         a = tl.load(a_ptrs)
         b = tl.load(b_ptrs)
         accumulator += tl.dot(a, b)
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        a_ptrs += BLOCK_SIZE_K * stride_a_k
+        b_ptrs += BLOCK_SIZE_K * stride_b_k
 
     accumulator = accumulator * a_s[:, None] * b_s
 
-    _store_masked(
+    store_masked(
         C,
         accumulator,
         pid_m,
         pid_n,
         M,
         N,
-        stride_cm,
-        stride_cn,
+        stride_c_m,
+        stride_c_n,
         BLOCK_SIZE_M,
         BLOCK_SIZE_N,
     )
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(),
-    ["N", "K", "BLOCK_SIZE_M"],
+    # tune_block_m + tune_block_n + WARP_SPEC mirror the block-dynamic kernel above
+    # (same 2D swizzle loop physics: the adaptive BM=128 heuristic + missing WS cost it
+    # 2.3x at prefill, measured); the N tile is decoupled from the scale granularity.
+    get_accelerator_autotuning_configs(
+        warp_spec=True, tune_block_m=True, tune_block_n=True
+    ),
+    ["N", "K", "m_bit_length"],
     n_trials=100,
+    prune_configs_by={"early_config_prune": warp_spec_compile_guard_pruner()},
 )
 @triton.jit
 def w8a8_block_static_fp8_matmul_kernel(
@@ -279,25 +298,29 @@ def w8a8_block_static_fp8_matmul_kernel(
     B,  # (N, K) FP8 weights
     C,  # (M, N) output
     As,  # scalar — static per-tensor activation scale (calibration-time)
-    Bs,  # (N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (fp32 or uint8/UE8M0)
+    Bs,  # (N // block_n, K // block_k) weight scales (fp32 or uint8/UE8M0)
     # Shape
     M,
     N,
     K,
+    m_bit_length,  # autotune key only (log2 M bucket); unused in body
     # Strides
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
+    stride_a_m,
+    stride_a_k,
+    stride_b_k,
+    stride_b_n,
+    stride_c_m,
+    stride_c_n,
     stride_bs_k,
     stride_bs_n,
+    # Weight-quantization blocks (see the block-dynamic kernel)
+    block_n: tl.constexpr,
+    block_k: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    WARP_SPEC: tl.constexpr = False,
 ):
     """Block-scale FP8 GEMM with static (per-tensor) activation scale.
 
@@ -306,18 +329,18 @@ def w8a8_block_static_fp8_matmul_kernel(
     per-K-tile during accumulation; the scalar activation scale is applied once at
     the end.
     """
-    pid_m, pid_n, offs_am, offs_bn, offs_k = _swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+    pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, block_k, GROUP_SIZE_M
     )
-    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    a_ptrs = A + (offs_am[:, None] * stride_a_m + offs_k[None, :] * stride_a_k)
+    b_ptrs = B + (offs_k[:, None] * stride_b_k + offs_bn[None, :] * stride_b_n)
 
-    offs_bsn = offs_bn // BLOCK_SIZE_N
-    bs_ptrs = Bs + offs_bsn * stride_bs_n
+    # decoupled from the scale grid like the block-dynamic kernel above
+    bs_ptrs = Bs + (offs_bn // block_n) * stride_bs_n
     a_s_static = tl.load(As)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
         if A.dtype.element_ty == tl.float8e4nv:  # pre-quantized offline
             a = tl.load(a_ptrs)
         else:  # raw bf16/fp16 — quantize inline against the static scale
@@ -325,20 +348,20 @@ def w8a8_block_static_fp8_matmul_kernel(
         b = tl.load(b_ptrs)
         b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
         accumulator += tl.dot(a, b) * b_s[None, :]
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        a_ptrs += block_k * stride_a_k
+        b_ptrs += block_k * stride_b_k
         bs_ptrs += stride_bs_k
 
     accumulator = accumulator * a_s_static
-    _store_masked(
+    store_masked(
         C,
         accumulator,
         pid_m,
         pid_n,
         M,
         N,
-        stride_cm,
-        stride_cn,
+        stride_c_m,
+        stride_c_n,
         BLOCK_SIZE_M,
         BLOCK_SIZE_N,
     )
@@ -353,8 +376,11 @@ def w8a8_block_static_fp8_matmul_kernel(
     # M3+dsv4 decode) showed swap losing on the single matmul (adaptive BM>=16 fills the MMA atom;
     # M3 attn swap was −38%) while the tuner never picked it — emitting the configs only bloats
     # the search. Swap stays on the batched/fused experts kernels, where it wins ~30% on dsv4.
-    get_mxfp_autotuning_configs(
-        compute_modes=("dot_scaled", "dot", "scalar"), tune_block_m=True
+    get_accelerator_autotuning_configs(
+        mx=True,
+        tune_block_nk=True,
+        compute_modes=("dot_scaled", "dot", "scalar"),
+        tune_block_m=True,
     ),
     # VALUES_PER_BYTE keys the MXFP4/MXFP8 split so a cached winner is only reused for its packing;
     # m_bit_length (log2 M bucket) keys the M tile — the winner keeps shifting with M well past the
@@ -383,13 +409,13 @@ def mxfp_dynamic_matmul_kernel(
     K,
     m_bit_length,  # autotune key only (log2 M bucket); unused in body
     # Strides
-    stride_am,
-    stride_ak,
+    stride_a_m,
+    stride_a_k,
     stride_as_m,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
+    stride_b_k,
+    stride_b_n,
+    stride_c_m,
+    stride_c_n,
     stride_bs_k,
     stride_bs_n,
     # Meta-parameters
@@ -414,14 +440,14 @@ def mxfp_dynamic_matmul_kernel(
     rescale (wins at decode; FP4 unpacks E2M1->E4M3 first — lossless). 2D grid with
     swizzle for L2 reuse.
     """
-    pid_m, pid_n, offs_am, offs_bn, offs_k = _swizzle_offsets(
+    pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
     )
     offs_kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
-    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    a_ptrs = A + (offs_am[:, None] * stride_a_m + offs_k[None, :] * stride_a_k)
     as_ptrs = AScale + offs_am[:, None] * stride_as_m + offs_sf[None, :]
-    b_ptrs = B + (offs_kb[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    b_ptrs = B + (offs_kb[:, None] * stride_b_k + offs_bn[None, :] * stride_b_n)
     bs_ptrs = Bs + (offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -444,20 +470,20 @@ def mxfp_dynamic_matmul_kernel(
             BLOCK_SIZE_K,
             SCALE_GROUP_K,
         )
-        a_ptrs += BLOCK_SIZE_K * stride_ak
+        a_ptrs += BLOCK_SIZE_K * stride_a_k
         as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
-        b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
+        b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_b_k
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
-    _store_masked(
+    store_masked(
         C,
         accumulator,
         pid_m,
         pid_n,
         M,
         N,
-        stride_cm,
-        stride_cn,
+        stride_c_m,
+        stride_c_n,
         BLOCK_SIZE_M,
         BLOCK_SIZE_N,
     )
@@ -500,29 +526,36 @@ def w8a8_block_dynamic_fp8_matmul(
         f"Bs shape {tuple(Bs.shape)} != expected ({triton.cdiv(N, block_n)}, {K // block_k})"
     )
 
-    BLOCK_SIZE_K = block_k
-    BLOCK_SIZE_N = block_n
     Bs = ue8m0_as_uint8(Bs)
+    A_q, A_s = fp8_act_quant_2d(A.view(M, K), block_k)
     C_shape = A.shape[:-1] + (N,)
-    BLOCK_SIZE_M = adaptive_block_size_m(M)
     C = A.new_empty(C_shape, dtype=output_dtype)
-    A_q, A_s = maybe_act_quant(
-        A.view(M, K),
-        lambda x: fp8_act_quant_2d(x, block_k),
-        BLOCK_DYNAMIC_MATMUL_ACT_PREQUANT_MIN_M,
-    )
-    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+    # The descriptor MEMORY_MODEs are not emitted (see the tuner note), so no live
+    # TensorDescriptor is passed: the launcher encodes a tensormap for descriptor args
+    # on EVERY launch even when the kernel never reads them, and with the (BM, BN) tile
+    # now tuned the fixed box also no longer matches every config. Re-enabling the
+    # descriptor rows means passing TensorDescriptor.from_tensor(B, box) again with a
+    # per-config pre_hook setting the box (see _set_gate_up_descriptor).
+    b_descriptor = 0
+
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]),
+            triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
 
     with device_context(A.device):
         compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_kernel)[grid](
             A_q,
             A_s,
             B,
+            b_descriptor,
             C,
             Bs,
             M,
             N,
             K,
+            int(M).bit_length(),
             A_q.stride(0),
             A_q.stride(1),
             A_s.stride(0),
@@ -532,10 +565,10 @@ def w8a8_block_dynamic_fp8_matmul(
             C.stride(-1),
             Bs.stride(1),
             Bs.stride(0),
-            # Meta-parameters
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            # Meta-parameters (BM and BN come from the config; BK is the caller's
+            # block_k — the activation scale groups are per block_k)
+            block_n=block_n,
+            block_k=block_k,
             GROUP_SIZE_M=GROUP_SIZE_M,
         )
 
@@ -588,10 +621,11 @@ def w8a8_block_static_fp8_matmul(
         f"Bs shape {tuple(Bs.shape)} != expected ({triton.cdiv(N, block_n)}, {K // block_k})"
     )
 
-    BLOCK_SIZE_K = block_k
-    BLOCK_SIZE_N = block_n
-    BLOCK_SIZE_M = adaptive_block_size_m(M)
-    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]),
+            triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
 
     Bs = ue8m0_as_uint8(Bs)
     C_shape = A.shape[:-1] + (N,)
@@ -616,6 +650,7 @@ def w8a8_block_static_fp8_matmul(
             M,
             N,
             K,
+            int(M).bit_length(),  # m_bit_length key bucket
             A_q.stride(0),
             A_q.stride(1),
             B.stride(1),
@@ -624,10 +659,10 @@ def w8a8_block_static_fp8_matmul(
             C.stride(-1),
             Bs.stride(1),
             Bs.stride(0),
-            # Meta-parameters
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            # Meta-parameters (BM and BN come from the config; BK is the caller's
+            # block_k — see the block-dynamic kernel)
+            block_n=block_n,
+            block_k=block_k,
             GROUP_SIZE_M=GROUP_SIZE_M,
         )
 
@@ -669,10 +704,12 @@ def w8a8_tensor_dynamic_fp8_matmul(
 
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
-    BLOCK_SIZE_M = adaptive_block_size_m(M)
 
     def grid(META):
-        return (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, META["BLOCK_SIZE_N"]))
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]),
+            triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
 
     with device_context(A.device):
         compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_kernel)[grid](
@@ -684,6 +721,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
             M,
             N,
             K,
+            int(M).bit_length(),  # m_bit_length key bucket
             qA.stride(-2),
             qA.stride(-1),
             B.stride(1),
@@ -691,7 +729,6 @@ def w8a8_tensor_dynamic_fp8_matmul(
             C.stride(-2),
             C.stride(-1),
             As.stride(0),
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
             GROUP_SIZE_M=GROUP_SIZE_M,
         )
 
@@ -742,10 +779,10 @@ def mxfp_dynamic_matmul(
 
     B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
-    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
     A_q, A_s = maybe_act_quant(
         A.view(M, K), mxfp_act_quant, MXFP_MATMUL_ACT_PREQUANT_MIN_M
     )
+    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
 
     def grid(META):
         return (

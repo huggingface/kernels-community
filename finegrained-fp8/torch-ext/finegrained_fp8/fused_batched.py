@@ -32,16 +32,13 @@ from .utils import (
     FP8_DTYPE,
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
-    decode_bm_swap_pairs,
     get_accelerator_autotuning_configs,
     batched_mx_pruner,
     device_context,
     fp8_act_quant_inline,
     load_block_fp8_act_tile,
-    maybe_act_quant,
     tl_dtype,
     fp8_act_quant_2d,
-    get_mxfp_autotuning_configs,
     is_mxfp,
     is_mxfp4,
     mxfp_act_quant_inline,
@@ -49,7 +46,7 @@ from .utils import (
     stacked_gate_up_ptrs,
     stacked_gate_up_flatten,
     split_gate_up,
-    oriented_weight_ptrs,
+    oriented_tile_ptrs,
     acc_init,
     fp8_dot,
     acc_finalize,
@@ -62,11 +59,6 @@ from .utils import (
 from .batched import store_row
 from .bayesian_autotuner import bayesian_autotune
 
-# MEASURED (isolated arm A/B, graph-timed, GLM-5.2 dims): offline wins at T=1 (65.8 vs
-# 71.1us), T=4 and T=16; inline noses ahead ~2% (noise-tier) only at T=64 — outside the
-# decode regime this kernel serves. Offline always.
-BLOCK_DYNAMIC_GATE_UP_ACT_PREQUANT_MIN_M = 0
-
 
 # ── Batched fused: two-kernel approach (no sorting, no atomics) ──────────────
 #
@@ -75,15 +67,9 @@ BLOCK_DYNAMIC_GATE_UP_ACT_PREQUANT_MIN_M = 0
 # Kernel 2: (S, H-tiles) — fp8 intermediate → down proj → output
 # No sorting needed — expert lookup is per-token via ExpertIds.
 
-# Decode (BLOCK_SIZE_M, SWAP_AB) pairs for the fp8 fused kernels: at M=1 the token is replicated to
-# fill the MMA 16-atom (non-swap BM=16, ~40% over the degenerate BM=1 on plain tl.dot) or the weight
-# output rows go in M (swap, BM=1). Swap needs BM=1, so (16, swap) is excluded. Same coupling as the
-# MXFP / matmul kernels' for_decode generators.
-_DECODE_BM_SWAP = decode_bm_swap_pairs(swap_ab=True)
-
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(swap_ab=True, for_decode=True),
+    get_accelerator_autotuning_configs(swap_ab=True),
     # Autotune key: num_routed_tokens (grid axis-0 — the batch varies at decode; a config tuned at
     # S=8 is wrong at S=256, GPU unsaturated) + the problem dims. A constexpr change forces a JIT
     # recompile but NOT a retune (the autotune config cache is keyed separately, on these names +
@@ -159,12 +145,10 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
     up_n = INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     kk = tl.arange(0, BLOCK_SIZE_K)
     gu_base = GateUp + expert_id * stride_gu_e
-    b_gate_ptr = oriented_weight_ptrs(
+    b_gate_ptr = oriented_tile_ptrs(
         gu_base, gate_n, kk, stride_gu_n, stride_gu_k, SWAP_AB
     )
-    b_up_ptr = oriented_weight_ptrs(
-        gu_base, up_n, kk, stride_gu_n, stride_gu_k, SWAP_AB
-    )
+    b_up_ptr = oriented_tile_ptrs(gu_base, up_n, kk, stride_gu_n, stride_gu_k, SWAP_AB)
     bs_gate_ptr = GateUpScale + expert_id * stride_gus_e + pid_n * stride_gus_n
     bs_up_ptr = (
         GateUpScale + expert_id * stride_gus_e + (NUM_N_TILES + pid_n) * stride_gus_n
@@ -221,7 +205,7 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(swap_ab=True, for_decode=True),
+    get_accelerator_autotuning_configs(swap_ab=True),
     # See the gate_up kernel: problem dims must be keyed (constexprs recompile but don't retune).
     ["num_routed_tokens", "INTERMEDIATE_DIM", "HIDDEN_DIM"],
     n_trials=100,
@@ -273,7 +257,7 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
     down_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
     down_base = Down + expert_id * stride_down_e
     # Down output rows are the hidden tile (BH); the contraction tile is BN (intermediate).
-    w_down_ptr = oriented_weight_ptrs(
+    w_down_ptr = oriented_tile_ptrs(
         down_base, down_h, down_n, stride_down_n, stride_down_k, SWAP_AB
     )
     # Replicate the single intermediate row across BLOCK_SIZE_M (arange*0) so BM=16 (non-swap) fills
@@ -337,15 +321,22 @@ def _w8a8_block_dynamic_fp8_moe_batched(
     row directly from the unexpanded ``hidden_states`` (source row ``s // NUM_TOP_K``, no
     replicated copy). ``inter``/``inter_scales`` are internal; the caller reduces over top-k."""
     device = hidden_states.device
-    HIDDEN_DIM = hidden_states.size(1)
-    NUM_EXPERTS = gate_up_proj.size(0)
     num_tokens = hidden_states.size(0)
     num_routed_tokens = top_k_index.numel()
-    INTERMEDIATE_DIM = gate_up_proj.size(1) // 2
-    NUM_TOP_K = num_routed_tokens // hidden_states.size(0)
+
+    NUM_EXPERTS = gate_up_proj.size(0)
+    HIDDEN_DIM = hidden_states.size(1)
     BLOCK_SIZE_N, BLOCK_SIZE_K = block_size
-    NUM_N_TILES = triton.cdiv(INTERMEDIATE_DIM, BLOCK_SIZE_N)
+    NUM_TOP_K = num_routed_tokens // num_tokens
+    INTERMEDIATE_DIM = gate_up_proj.size(1) // 2
     NUM_H_TILES = triton.cdiv(HIDDEN_DIM, BLOCK_SIZE_N)
+    NUM_N_TILES = triton.cdiv(INTERMEDIATE_DIM, BLOCK_SIZE_N)
+
+    # Offline even at decode (measured, graph-timed, GLM dims: 65.8 vs 71.1us at T=1,
+    # offline also wins T=4/16): the (rows x N-tiles) grid re-ran the inline quant per
+    # N-tile, and block-FP8 quant is fp32 amax+div per element — unlike UE8M0 (~free),
+    # which is why the MX batched kernels DO quantize inline.
+    hidden_q, hidden_s = fp8_act_quant_2d(hidden_states, BLOCK_SIZE_K)
 
     inter = torch.empty(
         num_routed_tokens, INTERMEDIATE_DIM, device=device, dtype=FP8_DTYPE
@@ -361,11 +352,6 @@ def _w8a8_block_dynamic_fp8_moe_batched(
         num_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
     )
     with device_context(device):
-        hidden_q, hidden_s = maybe_act_quant(
-            hidden_states,
-            lambda x: fp8_act_quant_2d(x, BLOCK_SIZE_K),
-            BLOCK_DYNAMIC_GATE_UP_ACT_PREQUANT_MIN_M,
-        )
         compile_time_only_triton_wrap(
             w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel
         )[(num_routed_tokens, NUM_N_TILES)](
@@ -496,8 +482,11 @@ def w8a8_block_dynamic_fp8_moe_batched(
     # emitted. SWAP_AB is orthogonal — the tuner picks {dot_scaled, scalar} x {swap, no-swap} per
     # (expert shape, recipe): swap puts the weight's output rows in the MMA M dim (down ~1.78x,
     # gate_up ~1.07x on the measured decode), no-swap keeps the token in M (padded to 16).
-    get_mxfp_autotuning_configs(
-        compute_modes=("dot_scaled", "scalar"), swap_ab=True, for_decode=True
+    get_accelerator_autotuning_configs(
+        mx=True,
+        tune_block_nk=True,
+        compute_modes=("dot_scaled", "scalar"),
+        swap_ab=True,
     ),
     ["num_routed_tokens", "INTERMEDIATE_DIM", "HIDDEN_DIM", "VALUES_PER_BYTE"],
     n_trials=100,
@@ -668,8 +657,11 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     # batched = M=1 decode: dot is never competitive here (see the gate_up decorator). SWAP_AB is
     # orthogonal — the tuner picks {dot_scaled, scalar} x {swap, no-swap}. Swap wins big on the
     # down GEMV (~1.78x on the measured decode); the tuner confirms it per (expert shape, recipe).
-    get_mxfp_autotuning_configs(
-        compute_modes=("dot_scaled", "scalar"), swap_ab=True, for_decode=True
+    get_accelerator_autotuning_configs(
+        mx=True,
+        tune_block_nk=True,
+        compute_modes=("dot_scaled", "scalar"),
+        swap_ab=True,
     ),
     ["num_routed_tokens", "INTERMEDIATE_DIM", "HIDDEN_DIM", "VALUES_PER_BYTE"],
     n_trials=100,
@@ -736,7 +728,7 @@ def mxfp_dynamic_moe_batched_down_kernel(
     down_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
     down_base = Down + expert_id * stride_down_e
-    w_down_ptr = oriented_weight_ptrs(
+    w_down_ptr = oriented_tile_ptrs(
         down_base, down_n, kb, stride_down_n, stride_down_k, SWAP_AB
     )
     ws_down_ptr = (
@@ -806,13 +798,15 @@ def _mxfp_dynamic_moe_batched(
         )
 
     device = hidden_states.device
-    HIDDEN_DIM = hidden_states.size(1)
-    NUM_EXPERTS = gate_up_proj.size(0)
     num_tokens = hidden_states.size(0)
     num_routed_tokens = top_k_index.numel()
+
+    NUM_EXPERTS = gate_up_proj.size(0)
+    HIDDEN_DIM = hidden_states.size(1)
+    NUM_TOP_K = num_routed_tokens // num_tokens
     INTERMEDIATE_DIM = gate_up_proj.size(1) // 2
-    NUM_TOP_K = num_routed_tokens // hidden_states.size(0)
     VALUES_PER_BYTE = NIBBLES_PER_BYTE if gate_up_is_fp4 else 1
+
     gate_up_proj_u8 = e2m1_as_uint8(gate_up_proj)
     gate_up_proj_scale_u8 = ue8m0_as_uint8(gate_up_proj_scale)
     down_proj_u8 = e2m1_as_uint8(down_proj)

@@ -28,7 +28,7 @@ from .utils import (
     decode_ue8m0_scale,
     device_context,
     mx_compute,
-    oriented_weight_ptrs,
+    oriented_tile_ptrs,
     acc_init,
     fp8_dot,
     batched_mx_pruner,
@@ -37,21 +37,13 @@ from .utils import (
     mxfp_act_quant_inline,
     fp8_act_quant,
     fp8_act_quant_2d,
-    maybe_act_quant,
     load_block_fp8_act_tile,
     get_accelerator_autotuning_configs,
-    get_mxfp_autotuning_configs,
     is_mxfp,
     is_tensor_wide,
     e2m1_as_uint8,
     ue8m0_as_uint8,
 )
-
-# maybe_act_quant crossover for the block-dynamic batched matmul: offline always —
-# inherited from the fused gate_up sweep (same per-row decode structure, fewer streams):
-# offline won at T=1/4/16 and lost only ~2% (noise-tier) at T=64, outside this kernel's
-# decode regime.
-BLOCK_DYNAMIC_BATCHED_ACT_PREQUANT_MIN_M = 0
 
 
 @triton.jit
@@ -61,9 +53,9 @@ def expert_setup(
     C,
     Bs,
     ExpertIds,
-    stride_am,
-    stride_be,
-    stride_cm,
+    stride_a_m,
+    stride_b_e,
+    stride_c_m,
     stride_bs_e,
     stride_eid,
 ):
@@ -76,11 +68,11 @@ def expert_setup(
     non-local expert would be out of bounds."""
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
-    # Cast to int64 to prevent overflow on expert_id * stride_be.
+    # Cast to int64 to prevent overflow on expert_id * stride_b_e.
     expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
-    A = A + batch_id * stride_am
-    B = B + expert_id * stride_be
-    C = C + batch_id * stride_cm
+    A = A + batch_id * stride_a_m
+    B = B + expert_id * stride_b_e
+    C = C + batch_id * stride_c_m
     Bs = Bs + expert_id * stride_bs_e
     return batch_id, pid_n, expert_id, A, B, C, Bs
 
@@ -90,7 +82,7 @@ def store_row(
     C,
     accumulator,
     pid_n,
-    stride_cn,
+    stride_c_n,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
@@ -103,12 +95,12 @@ def store_row(
     c = accumulator.to(C.dtype.element_ty)
     offs_cm = tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + offs_cm[:, None] * 0 + stride_cn * offs_cn[None, :]
+    c_ptrs = C + offs_cm[:, None] * 0 + stride_c_n * offs_cn[None, :]
     tl.store(c_ptrs, c, mask=(offs_cm == 0)[:, None])
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(swap_ab=True, for_decode=True),
+    get_accelerator_autotuning_configs(swap_ab=True),
     ["N", "K", "S"],
     n_trials=100,
 )
@@ -125,14 +117,14 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     N,
     K,
     # Strides
-    stride_am,
-    stride_ak,
+    stride_a_m,
+    stride_a_k,
     stride_as_m,
-    stride_be,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
+    stride_b_e,
+    stride_b_k,
+    stride_b_n,
+    stride_c_m,
+    stride_c_n,
     stride_bs_e,
     stride_bs_k,
     stride_bs_n,
@@ -154,7 +146,16 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     those rows in the MMA M dim, padding the single token to the N=16 atom; column 0 of the
     ``[BN, 16]`` accumulator is the result. No-swap keeps the token in M (padded to 16)."""
     batch_id, pid_n, expert_id, A, B, C, Bs = expert_setup(
-        A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
+        A,
+        B,
+        C,
+        Bs,
+        ExpertIds,
+        stride_a_m,
+        stride_b_e,
+        stride_c_m,
+        stride_bs_e,
+        stride_eid,
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
     if expert_id >= num_experts:
@@ -162,9 +163,9 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_ak
+    a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_a_k
     as_ptrs = AScale + batch_id * stride_as_m + tl.zeros((BLOCK_SIZE_M,), tl.int32)
-    b_ptrs = oriented_weight_ptrs(B, offs_bn, offs_k, stride_bn, stride_bk, SWAP_AB)
+    b_ptrs = oriented_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
     bs_ptrs = Bs + pid_n * stride_bs_n
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
@@ -176,20 +177,18 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         # swap BM=1, so it is the single token's scale), so no swap branch — as in the down projection.
         dot = fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K)
         accumulator += dot * a_s[:, None] * b_s
-        a_ptrs += BLOCK_SIZE_K * stride_ak
+        a_ptrs += BLOCK_SIZE_K * stride_a_k
         as_ptrs += 1
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        b_ptrs += BLOCK_SIZE_K * stride_b_k
         bs_ptrs += stride_bs_k
 
     accumulator = acc_finalize(accumulator, "dot", BLOCK_SIZE_N, SWAP_AB)
-    store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    store_row(C, accumulator, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
 @bayesian_autotune(
     # S (routed rows) keyed like the block-dynamic/mxfp batched siblings — decode re-tunes per batch.
-    get_accelerator_autotuning_configs(
-        tune_block_nk=True, swap_ab=True, for_decode=True
-    ),
+    get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True),
     ["N", "K", "S"],
     n_trials=100,
     # BLOCK_SIZE_K is a tuned axis and the K-loop is maskless — veto non-dividing BKs.
@@ -208,13 +207,13 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     N,
     K,
     # Strides
-    stride_am,
-    stride_ak,
-    stride_be,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
+    stride_a_m,
+    stride_a_k,
+    stride_b_e,
+    stride_b_k,
+    stride_b_n,
+    stride_c_m,
+    stride_c_n,
     stride_as_m,
     stride_bs_e,
     stride_eid,
@@ -234,7 +233,16 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     single token padded to N=16); column 0 of the ``[BN, 16]`` accumulator is the result. Both
     scales are per-token/per-tensor scalars, applied once after the loop, orientation-agnostic."""
     batch_id, pid_n, expert_id, A, B, C, Bs = expert_setup(
-        A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
+        A,
+        B,
+        C,
+        Bs,
+        ExpertIds,
+        stride_a_m,
+        stride_b_e,
+        stride_c_m,
+        stride_bs_e,
+        stride_eid,
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
     if expert_id >= num_experts:
@@ -242,8 +250,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_ak
-    b_ptrs = oriented_weight_ptrs(B, offs_bn, offs_k, stride_bn, stride_bk, SWAP_AB)
+    a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_a_k
+    b_ptrs = oriented_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
     b_s = tl.load(Bs)
     a_s = tl.load(As + batch_id * stride_as_m)
 
@@ -252,11 +260,11 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
         a = tl.load(a_ptrs)
         b = tl.load(b_ptrs)
         accumulator += fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K)
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        a_ptrs += BLOCK_SIZE_K * stride_a_k
+        b_ptrs += BLOCK_SIZE_K * stride_b_k
 
     accumulator = acc_finalize(accumulator, "dot", BLOCK_SIZE_N, SWAP_AB) * a_s * b_s
-    store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    store_row(C, accumulator, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
 # VALUES_PER_BYTE keys the MXFP4/MXFP8 split so a cached winner is only reused for its packing.
@@ -267,8 +275,11 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 # can't-win dot-swap configs skew the per-dimension densities. The swapped helper stays
 # implemented for future shapes; don't re-emit without new evidence.
 @bayesian_autotune(
-    get_mxfp_autotuning_configs(
-        compute_modes=("dot_scaled", "scalar"), swap_ab=True, for_decode=True
+    get_accelerator_autotuning_configs(
+        mx=True,
+        tune_block_nk=True,
+        compute_modes=("dot_scaled", "scalar"),
+        swap_ab=True,
     ),
     ["N", "K", "S", "VALUES_PER_BYTE"],
     n_trials=100,
@@ -288,13 +299,13 @@ def mxfp_dynamic_matmul_batched_kernel(
     N,
     K,
     # Strides
-    stride_am,
-    stride_ak,
-    stride_be,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
+    stride_a_m,
+    stride_a_k,
+    stride_b_e,
+    stride_b_k,
+    stride_b_n,
+    stride_c_m,
+    stride_c_n,
     stride_bs_e,
     stride_bs_k,
     stride_bs_n,
@@ -321,7 +332,16 @@ def mxfp_dynamic_matmul_batched_kernel(
     uses the swapped scaled-MMA; scalar reduces over K with the weight output-rows-major.
     """
     _, pid_n, expert_id, A, B, C, Bs = expert_setup(
-        A, B, C, Bs, ExpertIds, stride_am, stride_be, stride_cm, stride_bs_e, stride_eid
+        A,
+        B,
+        C,
+        Bs,
+        ExpertIds,
+        stride_a_m,
+        stride_b_e,
+        stride_c_m,
+        stride_bs_e,
+        stride_eid,
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
     if expert_id >= num_experts:
@@ -331,10 +351,10 @@ def mxfp_dynamic_matmul_batched_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     offs_kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
-    a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_ak
+    a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_a_k
     # Weight [BN, BK_packed] output-rows-major when swapped, else [BK_packed, BN]; scales stay
     # [BN, NG] (output-rows-major) either way.
-    b_ptrs = oriented_weight_ptrs(B, offs_bn, offs_kb, stride_bn, stride_bk, SWAP_AB)
+    b_ptrs = oriented_tile_ptrs(B, offs_bn, offs_kb, stride_b_n, stride_b_k, SWAP_AB)
     bs_ptrs = Bs + offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k
 
     accumulator = acc_init(COMPUTE_MODE, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
@@ -359,12 +379,12 @@ def mxfp_dynamic_matmul_batched_kernel(
             SCALE_GROUP_K,
             SWAP_AB,
         )
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
+        a_ptrs += BLOCK_SIZE_K * stride_a_k
+        b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_b_k
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
     accumulator = acc_finalize(accumulator, COMPUTE_MODE, BLOCK_SIZE_N, SWAP_AB)
-    store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    store_row(C, accumulator, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
 @compile_time_only_triton_op(
@@ -411,13 +431,14 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     )
 
     Bs = ue8m0_as_uint8(Bs)
-    grid = (S, triton.cdiv(N, block_n))
+    # Offline even at decode (arm A/B, graph-timed: offline won T=1/4/16, inline ~2%
+    # ahead only at T=64): the (S x N-tiles) grid re-ran the inline quant per N-tile,
+    # and block-FP8 quant is fp32 amax+div per element — unlike UE8M0 (~free), which is
+    # why the MX kernels DO quantize inline.
+    A_q, A_s = fp8_act_quant_2d(A, block_k)
     C = A.new_empty(S, N, dtype=output_dtype)
-    A_q, A_s = maybe_act_quant(
-        A,
-        lambda x: fp8_act_quant_2d(x, block_k),
-        BLOCK_DYNAMIC_BATCHED_ACT_PREQUANT_MIN_M,
-    )
+
+    grid = (S, triton.cdiv(N, block_n))
 
     with device_context(A.device):
         compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_batched_kernel)[
