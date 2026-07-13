@@ -142,7 +142,7 @@ def make_weights(
     safe = torch.where(max_abs > 0, max_abs, torch.ones_like(max_abs))
     inv_scales = (safe / qmax).to(torch.float32)
 
-    if scale_dtype == torch.float8_e8m0fnu:
+    if scale_dtype in (torch.float8_e8m0fnu, torch.uint8):
         # Snap inv_scales up to the next power-of-2 (UE8M0 encoding: 2^(exp-127)).
         exp_ceil = _ue8m0_exp(inv_scales)
         inv_scales = (exp_ceil << 23).view(torch.float32)
@@ -161,8 +161,12 @@ def make_weights(
     else:
         Wq = scaled.clamp(FP8_MIN, FP8_MAX).to(FP8_DTYPE).contiguous()
 
-    if scale_dtype == torch.float8_e8m0fnu:
-        inv_scales = exp_ceil.to(torch.uint8).view(torch.float8_e8m0fnu)
+    if scale_dtype in (torch.float8_e8m0fnu, torch.uint8):
+        # UE8M0 exponent bytes, exposed as float8_e8m0fnu or as raw uint8 (a common on-disk
+        # encoding, e.g. MiniMax-M3-MXFP8) — both are accepted by the detectors / kernels.
+        inv_scales = exp_ceil.to(torch.uint8)
+        if scale_dtype == torch.float8_e8m0fnu:
+            inv_scales = inv_scales.view(torch.float8_e8m0fnu)
 
     if is_2d:  # linear weights always carry block-layout scales
         return Wq.squeeze(0), inv_scales.squeeze(0)

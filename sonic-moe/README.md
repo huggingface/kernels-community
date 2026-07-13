@@ -82,9 +82,9 @@ concatenated layout directly without a pre-pass permutation.
 
 This kernel vendors [QuACK](https://github.com/Dao-AILab/quack) v0.3.11 for
 CuTe-DSL grouped GEMM infrastructure (Hopper + Blackwell). The vendored copy is
-under `torch-ext/sonic_moe/quack/`. All `quack::` torch operator names are
-rewritten to the `sonicmoe::quack__*` namespace so builds don't collide with a
-user-installed `quack-kernels`.
+under `torch-ext/sonic_moe/quack/`. Torch operators are registered through
+`add_op_namespace_prefix`, which the build system prefixes with a kernel-unique
+namespace, so they cannot collide with a user-installed `quack-kernels`.
 
 ## License
 

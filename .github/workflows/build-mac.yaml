@@ -69,17 +69,34 @@ jobs:
     strategy:
       fail-fast: false
     steps:
+      # Reject kernel names outside the safe charset before any step uses them.
+      # Accepts e.g.: flash-attn3, rejects: $(myevilcommand).
+      - name: Validate kernel name
+        env:
+          KERNEL: ${{ inputs.kernel_name }}
+        run: |
+          case "$KERNEL" in
+            ''|*[!A-Za-z0-9_-]*)
+              echo "Invalid kernel_name input: must match ^[A-Za-z0-9_-]+$"
+              exit 1
+              ;;
+          esac
+
       # Post a running commit status so the PR shows the build is in progress.
       - name: Set running status
         if: inputs.head_sha != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATUS_CONTEXT: ${{ github.workflow }} / ${{ inputs.kernel_name }}
         run: |
-          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
             -f state="pending" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f target_url="$RUN_URL" \
             -f description="Build in progress" \
-            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
+            -f context="$STATUS_CONTEXT"
 
       # Guard against injection via pr_number input.
       - name: Validate PR number
@@ -97,13 +114,13 @@ jobs:
       # When building for a PR, check out the PR head; otherwise use default branch.
       - name: Checkout PR branch
         if: inputs.pr_number != ''
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: refs/pull/${{ inputs.pr_number }}/head
           fetch-depth: 0
       - name: Checkout default branch
         if: inputs.pr_number == ''
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Nix toolchain + binary cache setup.
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
@@ -114,7 +131,7 @@ jobs:
             sandbox = relaxed
       - name: Nix info
         run: nix-shell -p nix-info --run "nix-info -m"
-      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: huggingface
         env:
@@ -154,8 +171,9 @@ jobs:
         if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true
         env:
           KERNEL: ${{ steps.validate.outputs.kernel }}
+          MODE: ${{ inputs.mode }}
         run: |
-          if [ "${{ inputs.mode }}" = "pr" ]; then
+          if [ "$MODE" = "pr" ]; then
             ( cd "$KERNEL" && nix build -L .#ci && ls -l result/ )
           else
             ( cd "$KERNEL" && nix build -L )
@@ -167,7 +185,7 @@ jobs:
 
       - name: Install Cosign
         if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr'
-        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       # Sign metadata.json for each built variant.
       - name: Sign kernel metadata
@@ -193,7 +211,6 @@ jobs:
           if [ -n "$TARGET_BRANCH" ]; then
             BRANCH_FLAG="--branch $TARGET_BRANCH"
           fi
-          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "$REPO_PREFIX/$KERNEL" $BRANCH_FLAG
           nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "$REPO_PREFIX/$KERNEL" $BRANCH_FLAG
 
       # v1 kernels without an explicit branch override also get uploaded to main.
@@ -210,7 +227,6 @@ jobs:
             VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
             BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
             if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
-              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type model --repo-id "$REPO_PREFIX/$KERNEL" --branch main
               nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "$REPO_PREFIX/$KERNEL" --branch main
             fi
           fi
@@ -224,6 +240,10 @@ jobs:
       - name: Set commit status
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATUS_CONTEXT: ${{ github.workflow }} / ${{ inputs.kernel_name }}
         run: |
           BUILD="${{ needs.build-kernel.result }}"
 
@@ -238,8 +258,8 @@ jobs:
             DESC="Build did not complete (${BUILD})"
           fi
 
-          gh api repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
             -f state="$STATE" \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f target_url="$RUN_URL" \
             -f description="$DESC" \
-            -f context="${{ github.workflow }} / ${{ inputs.kernel_name }}"
+            -f context="$STATUS_CONTEXT"
