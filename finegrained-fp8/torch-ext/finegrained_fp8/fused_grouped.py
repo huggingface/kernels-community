@@ -18,8 +18,8 @@ Two **persistent** kernels over expert-grouped M-tiles, no ``A_sorted`` material
 
 Scheduling is persistent: a fixed ``NUM_SMS`` programs grid-stride over all tiles. The
 expert-tile layout is built once into registers from ``expert_start`` (``build_tile_layout``)
-and each tile's owner is resolved inline (``resolve_tile_inline``) — no padded grid, no
-per-tile binary search, no host-side tile-offset precompute.
+and each tile is resolved via ``resolve_grouped_tile`` (shared with the base grouped GEMMs)
+— no padded grid, no per-tile binary search, no host-side tile-offset precompute.
 
 Recipe-named to mirror ``fused_batched``: ``w8a8_block_dynamic_fp8_moe_grouped`` (128x128
 block scales, FP8 intermediate) and ``mxfp_dynamic_moe_grouped`` (MXFP4/MXFP8, UE8M0
@@ -36,7 +36,7 @@ from .grouped import store_tile
 from .utils import (
     compute_grouped_scheduling,
     build_tile_layout,
-    resolve_tile_inline,
+    resolve_grouped_tile,
     batched_mx_pruner,
     FP8_DTYPE,
     MX_SCALE_GROUP_K,
@@ -165,17 +165,22 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
     num_n_tiles = tl.cdiv(INTERMEDIATE_DIM, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
-        pid_m = tile_id // num_n_tiles
-        pid_n = tile_id % num_n_tiles
-        expert_id, offs_global_m, row_mask = resolve_tile_inline(
-            pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_SIZE_M
+        # gate_up gathers hidden via PermToken (input perm); Inter is written expert-ordered
+        # (no output perm).
+        pid_n, _, expert_id64, token, offs_global_m, row_mask, offs_bn = resolve_grouped_tile(
+            tile_id,
+            num_n_tiles,
+            exp_start,
+            freqs,
+            tile_start_excl,
+            e_offs,
+            PermToken,
+            ExpertStart,  # dummy OutputPerm (ordered output)
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_M,
+            True,
+            False,
         )
-        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-
-        # int64 against offset overflow: expert_id * stride_gu_e reaches E*2I*H > 2^31 at
-        # full (non-EP) expert counts on the big-model dims — int32 wraps to a garbage pointer.
-        expert_id64 = expert_id.to(tl.int64)
-        token = tl.load(PermToken + offs_global_m * stride_pt, mask=row_mask, other=0)
         a_ptrs = Hidden + token[:, None] * stride_h_t + offs_k[None, :] * stride_h_k
         as_ptrs = HiddenScale + token * stride_hs_t
         gu_ptr = (
@@ -294,15 +299,22 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
     num_h_tiles = tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_N)
     offs_i = tl.arange(0, BLOCK_SIZE_K)
     for tile_id in tl.range(start_pid, total_m_tiles * num_h_tiles, NUM_SMS):
-        pid_m = tile_id // num_h_tiles
-        pid_h = tile_id % num_h_tiles
-        expert_id, offs_global_m, row_mask = resolve_tile_inline(
-            pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_SIZE_M
+        # down reads Inter expert-ordered (no input perm) and scatters to the flat
+        # (token, slot) row via PermRouted in scatter_tile (no output perm here).
+        pid_h, _, expert_id64, offs_global_m, _, row_mask, offs_h = resolve_grouped_tile(
+            tile_id,
+            num_h_tiles,
+            exp_start,
+            freqs,
+            tile_start_excl,
+            e_offs,
+            ExpertStart,  # dummy InputPerm (Inter is expert-ordered)
+            ExpertStart,  # dummy OutputPerm (scatter via PermRouted in the epilogue)
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_M,
+            False,
+            False,
         )
-        offs_h = pid_h * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-
-        # int64 against offset overflow: E*H*I > 2^31 at full expert counts (see gate_up).
-        expert_id64 = expert_id.to(tl.int64)
         w_down_ptr = (
             Down
             + expert_id64 * stride_down_e
@@ -589,18 +601,24 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
     num_n_tiles = tl.cdiv(INTERMEDIATE_DIM, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
-        pid_m = tile_id // num_n_tiles
-        pid_n = tile_id % num_n_tiles
-        expert_id, offs_global_m, row_mask = resolve_tile_inline(
-            pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_SIZE_M
+        # gate_up gathers hidden via PermToken (input perm); Inter is written expert-ordered
+        # (no output perm).
+        pid_n, expert_id, expert_id64, token, offs_global_m, row_mask, offs_bn = (
+            resolve_grouped_tile(
+                tile_id,
+                num_n_tiles,
+                exp_start,
+                freqs,
+                tile_start_excl,
+                e_offs,
+                PermToken,
+                ExpertStart,  # dummy OutputPerm (ordered output)
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_M,
+                True,
+                False,
+            )
         )
-        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-
-        # int64 against offset overflow: weight offsets reach 2E*I*(H//vpb) > 2^31 at full
-        # (non-EP) expert counts. Descriptor loads keep the int32 ids — TMA takes row indices
-        # (bounded by 2E), not byte offsets.
-        expert_id64 = expert_id.to(tl.int64)
-        token = tl.load(PermToken + offs_global_m * stride_pt, mask=row_mask, other=0)
         a_ptrs = Hidden + token[:, None] * stride_h_t + offs_k[None, :] * stride_h_k
         as_ptrs = (
             HiddenScale
@@ -801,13 +819,24 @@ def mxfp_dynamic_moe_grouped_down_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
-        pid_m = tile_id // num_n_tiles
-        pid_n = tile_id % num_n_tiles
-        expert_id, offs_global_m, row_mask = resolve_tile_inline(
-            pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_SIZE_M
+        # down reads Inter expert-ordered (no input perm) and scatters to the flat
+        # (token, slot) row via PermRouted in scatter_tile (no output perm here).
+        pid_n, expert_id, expert_id64, offs_global_m, _, row_mask, offs_bn = (
+            resolve_grouped_tile(
+                tile_id,
+                num_n_tiles,
+                exp_start,
+                freqs,
+                tile_start_excl,
+                e_offs,
+                ExpertStart,  # dummy InputPerm (Inter is expert-ordered)
+                ExpertStart,  # dummy OutputPerm (scatter via PermRouted in the epilogue)
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_M,
+                False,
+                False,
+            )
         )
-        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-
         a_ptrs = (
             Inter
             + offs_global_m[:, None] * stride_int_m
@@ -819,9 +848,6 @@ def mxfp_dynamic_moe_grouped_down_kernel(
             + offs_sf[None, :] * stride_is_n
         )
         n_off = pid_n * BLOCK_SIZE_N
-        # int64 against offset overflow (see gate_up); descriptor loads below keep the int32
-        # expert_id — TMA takes row indices (bounded by E*H), not byte offsets.
-        expert_id64 = expert_id.to(tl.int64)
         ws_down_ptr = (
             DownScale
             + expert_id64 * stride_downs_e

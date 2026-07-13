@@ -104,11 +104,11 @@ STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_kernel(
     A,  # (M, K) E4M3 activations (pre-quantized once by the wrapper)
-    AScale,  # (M, K // block_k) fp32 per-row, per-K-block activation scales
+    As,  # (M, K // block_k) fp32 per-row, per-K-block activation scales
     B,  # (N, K) FP8 weights
     BDescriptor,  # TMA descriptor over B, box (BLOCK_SIZE_N, block_k); read only under MEMORY_MODE == "host_descriptor"
-    C,  # (M, N) output
     Bs,  # (N // block_n, K // block_k) weight scales (fp32 or uint8/UE8M0)
+    C,  # (M, N) output
     # Shape
     M,
     N,
@@ -120,10 +120,10 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     stride_as_m,
     stride_b_k,
     stride_b_n,
-    stride_c_m,
-    stride_c_n,
     stride_bs_k,
     stride_bs_n,
+    stride_c_m,
+    stride_c_n,
     # Weight-quantization blocks (the caller's block_size); block_k is also the K tile
     # (the activation scale groups are per block_k)
     block_n: tl.constexpr,
@@ -154,7 +154,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, block_k, GROUP_SIZE_M
     )
     a_ptrs = oriented_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, not SWAP_AB)
-    as_ptrs = AScale + offs_am * stride_as_m
+    as_ptrs = As + offs_am * stride_as_m
     b_ptrs = oriented_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
     b_descriptor = weight_tile_descriptor(
         BDescriptor,
@@ -217,10 +217,10 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_kernel(
     A,  # (M, K) pre-quantized FP8 activations
-    B,  # (N, K) FP8 weights
-    C,  # (M, N) output
     As,  # (M,) per-token activation scales
+    B,  # (N, K) FP8 weights
     Bs,  # scalar/(1,) per-tensor weight scale
+    C,  # (M, N) output
     # Shape
     M,
     N,
@@ -229,11 +229,11 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     # Strides
     stride_a_m,
     stride_a_k,
+    stride_as_m,
     stride_b_k,
     stride_b_n,
     stride_c_m,
     stride_c_n,
-    stride_as_m,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -295,10 +295,10 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
 @triton.jit
 def w8a8_block_static_fp8_matmul_kernel(
     A,  # (M, K) E4M3 activations (pre-quantized against the static scale by the wrapper)
-    B,  # (N, K) FP8 weights
-    C,  # (M, N) output
     As,  # scalar — static per-tensor activation scale (calibration-time)
+    B,  # (N, K) FP8 weights
     Bs,  # (N // block_n, K // block_k) weight scales (fp32 or uint8/UE8M0)
+    C,  # (M, N) output
     # Shape
     M,
     N,
@@ -309,10 +309,10 @@ def w8a8_block_static_fp8_matmul_kernel(
     stride_a_k,
     stride_b_k,
     stride_b_n,
-    stride_c_m,
-    stride_c_n,
     stride_bs_k,
     stride_bs_n,
+    stride_c_m,
+    stride_c_n,
     # Weight-quantization blocks (see the block-dynamic kernel)
     block_n: tl.constexpr,
     block_k: tl.constexpr,
@@ -399,10 +399,10 @@ def w8a8_block_static_fp8_matmul_kernel(
 @triton.jit
 def mxfp_dynamic_matmul_kernel(
     A,  # (M, K) activations: E4M3 (pre-quantized) or raw bf16/fp16 (quantized inline)
-    AScale,  # (M, K // 32) UE8M0 group-32 activation scales (pre-quantized arm only)
+    As,  # (M, K // 32) UE8M0 group-32 activation scales (pre-quantized arm only)
     B,  # (N, K) E4M3 (MXFP8) or (N, K // 2) packed E2M1 (MXFP4) weights
-    C,  # (M, N) output
     Bs,  # (N, K // SCALE_GROUP_K) UE8M0 weight scales
+    C,  # (M, N) output
     # Shape
     M,
     N,
@@ -414,10 +414,10 @@ def mxfp_dynamic_matmul_kernel(
     stride_as_m,
     stride_b_k,
     stride_b_n,
-    stride_c_m,
-    stride_c_n,
     stride_bs_k,
     stride_bs_n,
+    stride_c_m,
+    stride_c_n,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -446,7 +446,7 @@ def mxfp_dynamic_matmul_kernel(
     offs_kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
     a_ptrs = A + (offs_am[:, None] * stride_a_m + offs_k[None, :] * stride_a_k)
-    as_ptrs = AScale + offs_am[:, None] * stride_as_m + offs_sf[None, :]
+    as_ptrs = As + offs_am[:, None] * stride_as_m + offs_sf[None, :]
     b_ptrs = B + (offs_kb[:, None] * stride_b_k + offs_bn[None, :] * stride_b_n)
     bs_ptrs = Bs + (offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k)
 
@@ -550,8 +550,8 @@ def w8a8_block_dynamic_fp8_matmul(
             A_s,
             B,
             b_descriptor,
-            C,
             Bs,
+            C,
             M,
             N,
             K,
@@ -561,10 +561,10 @@ def w8a8_block_dynamic_fp8_matmul(
             A_s.stride(0),
             B.stride(1),
             B.stride(0),
-            C.stride(-2),
-            C.stride(-1),
             Bs.stride(1),
             Bs.stride(0),
+            C.stride(-2),
+            C.stride(-1),
             # Meta-parameters (BM and BN come from the config; BK is the caller's
             # block_k — the activation scale groups are per block_k)
             block_n=block_n,
@@ -643,10 +643,10 @@ def w8a8_block_static_fp8_matmul(
     with device_context(A.device):
         compile_time_only_triton_wrap(w8a8_block_static_fp8_matmul_kernel)[grid](
             A_q,
-            B,
-            C,
             As,
+            B,
             Bs,
+            C,
             M,
             N,
             K,
@@ -655,10 +655,10 @@ def w8a8_block_static_fp8_matmul(
             A_q.stride(1),
             B.stride(1),
             B.stride(0),
-            C.stride(-2),
-            C.stride(-1),
             Bs.stride(1),
             Bs.stride(0),
+            C.stride(-2),
+            C.stride(-1),
             # Meta-parameters (BM and BN come from the config; BK is the caller's
             # block_k — see the block-dynamic kernel)
             block_n=block_n,
@@ -714,21 +714,21 @@ def w8a8_tensor_dynamic_fp8_matmul(
     with device_context(A.device):
         compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_kernel)[grid](
             qA,
-            B,
-            C,
             As,
+            B,
             Bs,
+            C,
             M,
             N,
             K,
             int(M).bit_length(),  # m_bit_length key bucket
             qA.stride(-2),
             qA.stride(-1),
+            As.stride(0),
             B.stride(1),
             B.stride(0),
             C.stride(-2),
             C.stride(-1),
-            As.stride(0),
             GROUP_SIZE_M=GROUP_SIZE_M,
         )
 
@@ -795,8 +795,8 @@ def mxfp_dynamic_matmul(
             A_q,
             A_s,
             B,
-            C,
             bs_u8,
+            C,
             M,
             N,
             K,
@@ -808,10 +808,10 @@ def mxfp_dynamic_matmul(
             A_s.stride(0),
             B.stride(1),
             B.stride(0),
-            C.stride(-2),
-            C.stride(-1),
             bs_u8.stride(1),
             bs_u8.stride(0),
+            C.stride(-2),
+            C.stride(-1),
             GROUP_SIZE_M=GROUP_SIZE_M,
             VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,

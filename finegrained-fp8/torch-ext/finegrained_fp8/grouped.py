@@ -29,10 +29,11 @@ from .utils import (
     block_dynamic_grouped_matmul_pruner,
     batched_mx_pruner,
     build_tile_layout,
-    resolve_tile_inline,
+    resolve_grouped_tile,
     block_k_within_k_pruner,
     compose_pruners,
     device_context,
+    sm_count,
     mxfp_act_quant,
     load_mx_act_tile,
     store_tile,
@@ -50,55 +51,6 @@ from .utils import (
 )
 
 
-@triton.jit
-def _grouped_tile_setup(
-    pid_m,
-    pid_n,
-    InputPerm,
-    OutputPerm,
-    ExpertStart,
-    num_experts,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    HAS_INPUT_PERM: tl.constexpr,
-    HAS_OUTPUT_PERM: tl.constexpr,
-    NUM_EXPERTS_POW2: tl.constexpr,
-):
-    """Map a grouped M-tile to its expert and build the per-tile offset vectors — the
-    prologue shared by every grouped kernel, on the same register-resident tile layout
-    as the fused kernels (``build_tile_layout`` + ``resolve_tile_inline``), so
-    BLOCK_SIZE_M can be a TUNER AXIS: the host passes only the BM-independent
-    ``ExpertStart`` (pow2-padded cumulative row starts with an ``S`` sentinel; phantom
-    experts have zero rows and zero tiles).
-
-    The sort is virtual: rows load from ``in_row`` and store to ``out_row`` — the perm
-    maps when present (``InputPerm``: sorted position -> source row of A; ``OutputPerm``:
-    sorted position -> destination row of C), else the expert-sorted position itself (the
-    chained-GEMM handoff: a missing input perm means A arrives expert-sorted, a missing
-    output perm leaves C expert-sorted). Returns ``(valid, expert_id, in_row, out_row,
-    row_mask, offs_bn, offs_k)``. Callers early-return when ``valid`` is false (the grid
-    is an upper bound on tiles)."""
-    exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
-        ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
-    )
-    valid = pid_m < total_m_tiles
-    expert_id, offs_global_m, row_mask = resolve_tile_inline(
-        pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_SIZE_M
-    )
-    if HAS_INPUT_PERM:
-        in_row = tl.load(InputPerm + offs_global_m, mask=row_mask, other=0)
-    else:
-        in_row = offs_global_m
-    if HAS_OUTPUT_PERM:
-        out_row = tl.load(OutputPerm + offs_global_m, mask=row_mask, other=0)
-    else:
-        out_row = offs_global_m
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    return valid, expert_id.to(tl.int64), in_row, out_row, row_mask, offs_bn, offs_k
-
-
 @bayesian_autotune(
     # SWAP_AB/MEMORY_MODE (TMA) arms were ported here, measured, and REMOVED: at dsv4-like
     # prefill (S=8192, E=256, N=4096, K=7168) WS-pointer BM=64 w4 s4 = 1796us beats
@@ -114,10 +66,10 @@ def _grouped_tile_setup(
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     A,  # (num_tokens, K) E4M3 activations (pre-quantized once by the wrapper), any row order
-    AScale,  # (S, K // BLOCK_SIZE_K) fp32 per-row, per-K-block activation scales
+    As,  # (S, K // BLOCK_SIZE_K) fp32 per-row, per-K-block activation scales
     B,  # (num_experts, N, K) FP8 weight matrices
-    C,  # (S, N) output
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales
+    C,  # (S, N) output
     InputPerm,  # (S,) int32 — sorted position -> source row of A; read iff HAS_INPUT_PERM
     OutputPerm,  # (S,) int32 — sorted position -> destination row of C; read iff HAS_OUTPUT_PERM
     ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 — cumulative row starts, S sentinel
@@ -132,11 +84,11 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     stride_b_e,
     stride_b_k,
     stride_b_n,
-    stride_c_m,
-    stride_c_n,
     stride_bs_e,
     stride_bs_k,
     stride_bs_n,
+    stride_c_m,
+    stride_c_n,
     num_experts,
     tokens_per_expert_bit_length,  # autotune key only (log2 avg-tokens bucket); unused in body
     # Meta-parameters
@@ -146,58 +98,61 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     HAS_INPUT_PERM: tl.constexpr,
     HAS_OUTPUT_PERM: tl.constexpr,
     NUM_EXPERTS_POW2: tl.constexpr,
+    NUM_SMS: tl.constexpr,
     WARP_SPEC: tl.constexpr = False,
 ):
-    """Block-scale grouped FP8 expert matmul kernel.
+    """Block-scale grouped FP8 expert matmul kernel — persistent grid-stride over tiles.
 
     Each M-tile maps to its owning expert via ``ExpertStart`` and gathers its rows
     through ``InputPerm`` — the expert sort is virtual, ``A`` arrives in any row order.
     Activations arrive pre-quantized (one pass in the wrapper — the
     inline per-N-tile quant would repeat N//BN times per element; see the fused kernels' log).
     """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-
-    valid, expert_id, in_row, out_row, row_mask, offs_bn, offs_k = _grouped_tile_setup(
-        pid_m,
-        pid_n,
-        InputPerm,
-        OutputPerm,
-        ExpertStart,
-        num_experts,
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
-        HAS_INPUT_PERM,
-        HAS_OUTPUT_PERM,
-        NUM_EXPERTS_POW2,
+    start_pid = tl.program_id(axis=0)
+    exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
+        ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
     )
-    if not valid:
-        return
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    a_ptrs = A + in_row[:, None] * stride_a_m + offs_k[None, :] * stride_a_k
-    as_ptrs = AScale + in_row * stride_as_m
-    b_ptrs = (
-        B
-        + expert_id * stride_b_e
-        + offs_k[:, None] * stride_b_k
-        + offs_bn[None, :] * stride_b_n
-    )
-    bs_ptrs = Bs + expert_id * stride_bs_e + pid_n * stride_bs_n
+    for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = resolve_grouped_tile(
+            tile_id,
+            num_n_tiles,
+            exp_start,
+            freqs,
+            tile_start_excl,
+            e_offs,
+            InputPerm,
+            OutputPerm,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_M,
+            HAS_INPUT_PERM,
+            HAS_OUTPUT_PERM,
+        )
+        a_ptrs = A + in_row[:, None] * stride_a_m + offs_k[None, :] * stride_a_k
+        as_ptrs = As + in_row * stride_as_m
+        b_ptrs = (
+            B
+            + expert_id64 * stride_b_e
+            + offs_k[:, None] * stride_b_k
+            + offs_bn[None, :] * stride_b_n
+        )
+        bs_ptrs = Bs + expert_id64 * stride_bs_e + pid_n * stride_bs_n
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-        a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
-        a_s = tl.load(as_ptrs, mask=row_mask, other=0.0)
-        b = tl.load(b_ptrs)
-        b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
-        a_ptrs += BLOCK_SIZE_K * stride_a_k
-        as_ptrs += 1
-        b_ptrs += BLOCK_SIZE_K * stride_b_k
-        bs_ptrs += stride_bs_k
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for _ in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+            a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
+            a_s = tl.load(as_ptrs, mask=row_mask, other=0.0)
+            b = tl.load(b_ptrs)
+            b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
+            accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+            a_ptrs += BLOCK_SIZE_K * stride_a_k
+            as_ptrs += 1
+            b_ptrs += BLOCK_SIZE_K * stride_b_k
+            bs_ptrs += stride_bs_k
 
-    store_tile(C, accumulator, out_row, offs_bn, row_mask, stride_c_m, stride_c_n)
+        store_tile(C, accumulator, out_row, offs_bn, row_mask, stride_c_m, stride_c_n)
 
 
 @bayesian_autotune(
@@ -217,10 +172,10 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     A,  # (num_tokens, K) pre-quantized FP8 activations, any row order
-    B,  # (num_experts, N, K) FP8 weight matrices
-    C,  # (S, N) output
     As,  # (S,) per-token activation scales
+    B,  # (num_experts, N, K) FP8 weight matrices
     Bs,  # (num_experts, 1, 1) per-tensor weight scales
+    C,  # (S, N) output
     InputPerm,  # (S,) int32 — sorted position -> source row of A; read iff HAS_INPUT_PERM
     OutputPerm,  # (S,) int32 — sorted position -> destination row of C; read iff HAS_OUTPUT_PERM
     ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 — cumulative row starts, S sentinel
@@ -231,13 +186,13 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     # Strides
     stride_a_m,
     stride_a_k,
+    stride_as_m,
     stride_b_e,
     stride_b_k,
     stride_b_n,
+    stride_bs_e,
     stride_c_m,
     stride_c_n,
-    stride_as_m,
-    stride_bs_e,
     num_experts,
     tokens_per_expert_bit_length,  # autotune key only (log2 avg-tokens bucket); unused in body
     # Meta-parameters
@@ -247,54 +202,56 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     HAS_INPUT_PERM: tl.constexpr,
     HAS_OUTPUT_PERM: tl.constexpr,
     NUM_EXPERTS_POW2: tl.constexpr,
+    NUM_SMS: tl.constexpr,
     WARP_SPEC: tl.constexpr = False,
 ):
-    """Tensor-scale grouped FP8 expert matmul kernel.
+    """Tensor-scale grouped FP8 expert matmul kernel — persistent grid-stride over tiles.
 
     Uses grouped expert scheduling with pre-quantized activations plus
     per-token activation scales and per-expert tensor weight scales.
     """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-
-    valid, expert_id, in_row, out_row, row_mask, offs_bn, offs_k = _grouped_tile_setup(
-        pid_m,
-        pid_n,
-        InputPerm,
-        OutputPerm,
-        ExpertStart,
-        num_experts,
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
-        HAS_INPUT_PERM,
-        HAS_OUTPUT_PERM,
-        NUM_EXPERTS_POW2,
+    start_pid = tl.program_id(axis=0)
+    exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
+        ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
     )
-    if not valid:
-        return
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    a_ptrs = A + in_row[:, None] * stride_a_m + offs_k[None, :] * stride_a_k
-    b_ptrs = (
-        B
-        + expert_id * stride_b_e
-        + offs_k[:, None] * stride_b_k
-        + offs_bn[None, :] * stride_b_n
-    )
+    for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = resolve_grouped_tile(
+            tile_id,
+            num_n_tiles,
+            exp_start,
+            freqs,
+            tile_start_excl,
+            e_offs,
+            InputPerm,
+            OutputPerm,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_M,
+            HAS_INPUT_PERM,
+            HAS_OUTPUT_PERM,
+        )
+        a_ptrs = A + in_row[:, None] * stride_a_m + offs_k[None, :] * stride_a_k
+        b_ptrs = (
+            B
+            + expert_id64 * stride_b_e
+            + offs_k[:, None] * stride_b_k
+            + offs_bn[None, :] * stride_b_n
+        )
+        a_s = tl.load(As + in_row * stride_as_m, mask=row_mask, other=0.0)
+        b_s = tl.load(Bs + expert_id64 * stride_bs_e)
 
-    a_s = tl.load(As + in_row * stride_as_m, mask=row_mask, other=0.0)
-    b_s = tl.load(Bs + expert_id * stride_bs_e)
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for _ in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+            a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
+            b = tl.load(b_ptrs)
+            accumulator += tl.dot(a, b)
+            a_ptrs += BLOCK_SIZE_K * stride_a_k
+            b_ptrs += BLOCK_SIZE_K * stride_b_k
+        accumulator = accumulator * a_s[:, None] * b_s
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for _ in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-        a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
-        b = tl.load(b_ptrs)
-        accumulator += tl.dot(a, b)
-        a_ptrs += BLOCK_SIZE_K * stride_a_k
-        b_ptrs += BLOCK_SIZE_K * stride_b_k
-    accumulator = accumulator * a_s[:, None] * b_s
-
-    store_tile(C, accumulator, out_row, offs_bn, row_mask, stride_c_m, stride_c_n)
+        store_tile(C, accumulator, out_row, offs_bn, row_mask, stride_c_m, stride_c_n)
 
 
 @bayesian_autotune(
@@ -315,10 +272,10 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
 @triton.jit
 def mxfp_dynamic_matmul_grouped_kernel(
     A,  # (num_tokens, K) E4M3 activations (pre-quantized once by the wrapper), any row order
-    AScale,  # (S, K // 32) UE8M0 group-32 activation scales
+    As,  # (S, K // 32) UE8M0 group-32 activation scales
     B,  # (num_experts, N, K) E4M3 (MXFP8) or (num_experts, N, K // 2) packed E2M1 (MXFP4) expert weights
-    C,  # (S, N) output
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) UE8M0 weight scales
+    C,  # (S, N) output
     InputPerm,  # (S,) int32 — sorted position -> source row of A; read iff HAS_INPUT_PERM
     OutputPerm,  # (S,) int32 — sorted position -> destination row of C; read iff HAS_OUTPUT_PERM
     ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 — cumulative row starts, S sentinel
@@ -333,11 +290,11 @@ def mxfp_dynamic_matmul_grouped_kernel(
     stride_b_e,
     stride_b_k,
     stride_b_n,
-    stride_c_m,
-    stride_c_n,
     stride_bs_e,
     stride_bs_k,
     stride_bs_n,
+    stride_c_m,
+    stride_c_n,
     num_experts,
     tokens_per_expert_bit_length,  # autotune key only (log2 avg-tokens bucket); unused in body
     # Meta-parameters
@@ -347,11 +304,12 @@ def mxfp_dynamic_matmul_grouped_kernel(
     HAS_INPUT_PERM: tl.constexpr,
     HAS_OUTPUT_PERM: tl.constexpr,
     NUM_EXPERTS_POW2: tl.constexpr,
+    NUM_SMS: tl.constexpr,
     VALUES_PER_BYTE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
 ):
-    """Unified grouped MXFP4/MXFP8 (W4A8/W8A8) expert matmul.
+    """Unified grouped MXFP4/MXFP8 (W4A8/W8A8) expert matmul — persistent grid-stride.
 
     Each M-tile maps to its expert via ``ExpertStart`` and gathers its rows through
     ``PermToken`` (virtual sort — ``A`` in any row order). ``A``
@@ -361,69 +319,71 @@ def mxfp_dynamic_matmul_grouped_kernel(
     picks ``tl.dot_scaled`` vs fp8 ``tl.dot`` + per-group rescale (decode; FP4 unpacks
     E2M1->E4M3 first, lossless).
     """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-
-    valid, expert_id, in_row, out_row, row_mask, offs_bn, offs_k = _grouped_tile_setup(
-        pid_m,
-        pid_n,
-        InputPerm,
-        OutputPerm,
-        ExpertStart,
-        num_experts,
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
-        HAS_INPUT_PERM,
-        HAS_OUTPUT_PERM,
-        NUM_EXPERTS_POW2,
+    start_pid = tl.program_id(axis=0)
+    exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
+        ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
     )
-    if not valid:
-        return
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
     offs_kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
 
-    a_ptrs = A + in_row[:, None] * stride_a_m + offs_k[None, :] * stride_a_k
-    as_ptrs = AScale + in_row[:, None] * stride_as_m + offs_sf[None, :]
-    b_ptrs = (
-        B
-        + expert_id * stride_b_e
-        + offs_kb[:, None] * stride_b_k
-        + offs_bn[None, :] * stride_b_n
-    )
-    bs_ptrs = (
-        Bs
-        + expert_id * stride_bs_e
-        + offs_bn[:, None] * stride_bs_n
-        + offs_sf[None, :] * stride_bs_k
-    )
-
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a, a_scale = load_mx_act_tile(
-            a_ptrs, as_ptrs, row_mask, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
-        )
-        as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
-        b = tl.load(b_ptrs)
-        b_s = tl.load(bs_ptrs).to(tl.uint8)
-        accumulator = mx_compute(
-            accumulator,
-            a,
-            a_scale,
-            b,
-            b_s,
-            COMPUTE_MODE,
-            VALUES_PER_BYTE,
-            BLOCK_SIZE_M,
+    for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = resolve_grouped_tile(
+            tile_id,
+            num_n_tiles,
+            exp_start,
+            freqs,
+            tile_start_excl,
+            e_offs,
+            InputPerm,
+            OutputPerm,
             BLOCK_SIZE_N,
-            BLOCK_SIZE_K,
-            SCALE_GROUP_K,
+            BLOCK_SIZE_M,
+            HAS_INPUT_PERM,
+            HAS_OUTPUT_PERM,
         )
-        a_ptrs += BLOCK_SIZE_K * stride_a_k
-        b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_b_k
-        bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
+        a_ptrs = A + in_row[:, None] * stride_a_m + offs_k[None, :] * stride_a_k
+        as_ptrs = As + in_row[:, None] * stride_as_m + offs_sf[None, :]
+        b_ptrs = (
+            B
+            + expert_id64 * stride_b_e
+            + offs_kb[:, None] * stride_b_k
+            + offs_bn[None, :] * stride_b_n
+        )
+        bs_ptrs = (
+            Bs
+            + expert_id64 * stride_bs_e
+            + offs_bn[:, None] * stride_bs_n
+            + offs_sf[None, :] * stride_bs_k
+        )
 
-    store_tile(C, accumulator, out_row, offs_bn, row_mask, stride_c_m, stride_c_n)
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            a, a_scale = load_mx_act_tile(
+                a_ptrs, as_ptrs, row_mask, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
+            )
+            as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
+            b = tl.load(b_ptrs)
+            b_s = tl.load(bs_ptrs).to(tl.uint8)
+            accumulator = mx_compute(
+                accumulator,
+                a,
+                a_scale,
+                b,
+                b_s,
+                COMPUTE_MODE,
+                VALUES_PER_BYTE,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                SCALE_GROUP_K,
+            )
+            a_ptrs += BLOCK_SIZE_K * stride_a_k
+            b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_b_k
+            bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
+
+        store_tile(C, accumulator, out_row, offs_bn, row_mask, stride_c_m, stride_c_n)
 
 
 @compile_time_only_triton_op(
@@ -495,23 +455,17 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     Bs = ue8m0_as_uint8(Bs)
     A_q, A_s = fp8_act_quant_2d(A, block_k)
     C = A.new_empty(S, N, dtype=output_dtype)
-
-    def grid(META):
-        # tile-count upper bound: surplus programs early-return in the kernel
-        return (
-            triton.cdiv(S, META["BLOCK_SIZE_M"]) + num_experts,
-            triton.cdiv(N, block_n),
-        )
+    num_sms = sm_count(A.device.index)
 
     with device_context(A.device):
         compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_grouped_kernel)[
-            grid
+            (num_sms,)
         ](
             A_q,
             A_s,
             B,
-            C,
             Bs,
+            C,
             input_perm if input_perm is not None else expert_start,  # dummy ptr
             output_perm if output_perm is not None else expert_start,  # dummy ptr
             expert_start,
@@ -524,11 +478,11 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
             B.stride(0),
             B.stride(2),
             B.stride(1),
-            C.stride(0),
-            C.stride(1),
             Bs.stride(0),
             Bs.stride(2),
             Bs.stride(1),
+            C.stride(0),
+            C.stride(1),
             # Meta-parameters
             num_experts=num_experts,
             tokens_per_expert_bit_length=int(
@@ -539,6 +493,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
             HAS_INPUT_PERM=input_perm is not None,
             HAS_OUTPUT_PERM=output_perm is not None,
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
+            NUM_SMS=num_sms,
         )
 
     return C
@@ -606,22 +561,17 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
 
     qA, As = fp8_act_quant(A, K)
     C = A.new_empty(S, N, dtype=output_dtype)
-
-    def grid(META):
-        return (
-            triton.cdiv(S, META["BLOCK_SIZE_M"]) + num_experts,
-            triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        )
+    num_sms = sm_count(A.device.index)
 
     with device_context(A.device):
         compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_grouped_kernel)[
-            grid
+            (num_sms,)
         ](
             qA,
-            B,
-            C,
             As,
+            B,
             Bs,
+            C,
             input_perm if input_perm is not None else expert_start,  # dummy ptr
             output_perm if output_perm is not None else expert_start,  # dummy ptr
             expert_start,
@@ -630,13 +580,13 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
             K,
             qA.stride(0),
             qA.stride(1),
+            As.stride(0),
             B.stride(0),
             B.stride(2),
             B.stride(1),
+            Bs.stride(0),
             C.stride(0),
             C.stride(1),
-            As.stride(0),
-            Bs.stride(0),
             num_experts=num_experts,
             tokens_per_expert_bit_length=int(
                 (S + num_experts - 1) // num_experts
@@ -644,6 +594,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
             HAS_INPUT_PERM=input_perm is not None,
             HAS_OUTPUT_PERM=output_perm is not None,
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
+            NUM_SMS=num_sms,
         )
 
     return C
@@ -715,20 +666,15 @@ def mxfp_dynamic_matmul_grouped(
     # One-pass MX pre-quant (bit-exact with an inline quant: group-32 boundaries align).
     A_q, A_s = mxfp_act_quant(A)
     C = A.new_empty((S, N), dtype=output_dtype)
-
-    def grid(META):
-        return (
-            triton.cdiv(S, META["BLOCK_SIZE_M"]) + num_experts,
-            triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        )
+    num_sms = sm_count(A.device.index)
 
     with device_context(A.device):
-        compile_time_only_triton_wrap(mxfp_dynamic_matmul_grouped_kernel)[grid](
+        compile_time_only_triton_wrap(mxfp_dynamic_matmul_grouped_kernel)[(num_sms,)](
             A_q,
             A_s,
             B,
-            C,
             bs_u8,
+            C,
             input_perm if input_perm is not None else expert_start,  # dummy ptr
             output_perm if output_perm is not None else expert_start,  # dummy ptr
             expert_start,
@@ -741,11 +687,11 @@ def mxfp_dynamic_matmul_grouped(
             B.stride(0),
             B.stride(2),
             B.stride(1),
-            C.stride(0),
-            C.stride(1),
             bs_u8.stride(0),
             bs_u8.stride(2),
             bs_u8.stride(1),
+            C.stride(0),
+            C.stride(1),
             num_experts=num_experts,
             tokens_per_expert_bit_length=int(
                 (S + num_experts - 1) // num_experts
@@ -753,6 +699,7 @@ def mxfp_dynamic_matmul_grouped(
             HAS_INPUT_PERM=input_perm is not None,
             HAS_OUTPUT_PERM=output_perm is not None,
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
+            NUM_SMS=num_sms,
             VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
         )

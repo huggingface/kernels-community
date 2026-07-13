@@ -1558,6 +1558,49 @@ def resolve_tile_inline(
 
 
 @triton.jit
+def resolve_grouped_tile(
+    tile_id,
+    num_n_tiles,
+    exp_start,
+    freqs,
+    tile_start_excl,
+    e_offs,
+    InputPerm,
+    OutputPerm,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    HAS_INPUT_PERM: tl.constexpr,
+    HAS_OUTPUT_PERM: tl.constexpr,
+):
+    """One persistent grouped tile: split the flat ``tile_id`` into (M-tile, N-tile), map
+    the M-tile to its expert + rows via ``resolve_tile_inline`` (on the register-resident
+    layout ``build_tile_layout`` builds once per program, passed in), and apply the virtual
+    sort — rows load from ``in_row`` and store to ``out_row``, mapped by ``InputPerm`` /
+    ``OutputPerm`` when present else the expert-sorted position itself.
+
+    Returns ``(pid_n, expert_id, expert_id64, in_row, out_row, row_mask, offs_bn)`` — both
+    expert-id widths: ``expert_id`` (int32, e.g. TMA descriptor row indices, bounded by the
+    expert count) and ``expert_id64`` (int64, for byte-offset pointer arithmetic — ``expert
+    * stride`` overflows int32 at full expert counts). Shared by the base grouped GEMMs and
+    the fused kernels; callers ``_``-ignore whichever width they don't use."""
+    pid_m = tile_id // num_n_tiles
+    pid_n = tile_id % num_n_tiles
+    expert_id, offs_global_m, row_mask = resolve_tile_inline(
+        pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_SIZE_M
+    )
+    if HAS_INPUT_PERM:
+        in_row = tl.load(InputPerm + offs_global_m, mask=row_mask, other=0)
+    else:
+        in_row = offs_global_m
+    if HAS_OUTPUT_PERM:
+        out_row = tl.load(OutputPerm + offs_global_m, mask=row_mask, other=0)
+    else:
+        out_row = offs_global_m
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    return pid_n, expert_id, expert_id.to(tl.int64), in_row, out_row, row_mask, offs_bn
+
+
+@triton.jit
 def store_tile(
     C, accumulator, offs_global_m, offs_bn, row_mask, stride_c_m, stride_c_n
 ):

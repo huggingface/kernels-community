@@ -107,10 +107,10 @@ def store_row(
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     A,  # (S, K) E4M3 activations (pre-quantized once by the wrapper)
-    AScale,  # (S, K // BLOCK_SIZE_K) fp32 per-row, per-K-block activation scales
+    As,  # (S, K // BLOCK_SIZE_K) fp32 per-row, per-K-block activation scales
     B,  # (num_experts, N, K) FP8 weight matrices
-    C,  # (S, N) output
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales
+    C,  # (S, N) output
     ExpertIds,  # (S,) — which expert each batch element routes to
     # Shape
     S,
@@ -123,11 +123,11 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     stride_b_e,
     stride_b_k,
     stride_b_n,
-    stride_c_m,
-    stride_c_n,
     stride_bs_e,
     stride_bs_k,
     stride_bs_n,
+    stride_c_m,
+    stride_c_n,
     stride_eid,
     num_experts,
     # Meta-parameters
@@ -164,7 +164,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_a_k
-    as_ptrs = AScale + batch_id * stride_as_m + tl.zeros((BLOCK_SIZE_M,), tl.int32)
+    as_ptrs = As + batch_id * stride_as_m + tl.zeros((BLOCK_SIZE_M,), tl.int32)
     b_ptrs = oriented_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
     bs_ptrs = Bs + pid_n * stride_bs_n
 
@@ -197,10 +197,10 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     A,  # (S, K) pre-quantized FP8 activations
-    B,  # (num_experts, N, K) FP8 weight matrices
-    C,  # (S, N) output
     As,  # (S,) per-token activation scales
+    B,  # (num_experts, N, K) FP8 weight matrices
     Bs,  # (num_experts, 1, 1) per-tensor weight scales
+    C,  # (S, N) output
     ExpertIds,  # (S,) — which expert each batch element routes to
     # Shape
     S,
@@ -209,13 +209,13 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     # Strides
     stride_a_m,
     stride_a_k,
+    stride_as_m,
     stride_b_e,
     stride_b_k,
     stride_b_n,
+    stride_bs_e,
     stride_c_m,
     stride_c_n,
-    stride_as_m,
-    stride_bs_e,
     stride_eid,
     num_experts,
     # Meta-parameters
@@ -291,8 +291,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 def mxfp_dynamic_matmul_batched_kernel(
     A,  # (S, K) raw BF16/FP16 activations
     B,  # (num_experts, N, K) E4M3 (MXFP8) or (num_experts, N, K // 2) packed E2M1 (MXFP4) expert weights
-    C,  # (S, N) output
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) UE8M0 weight scales
+    C,  # (S, N) output
     ExpertIds,  # (S,) — which expert each routed row uses
     # Shape
     S,
@@ -304,11 +304,11 @@ def mxfp_dynamic_matmul_batched_kernel(
     stride_b_e,
     stride_b_k,
     stride_b_n,
-    stride_c_m,
-    stride_c_n,
     stride_bs_e,
     stride_bs_k,
     stride_bs_n,
+    stride_c_m,
+    stride_c_n,
     stride_eid,
     num_experts,
     # Meta-parameters
@@ -447,8 +447,8 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             A_q,
             A_s,
             B,
-            C,
             Bs,
+            C,
             expert_ids,
             S,
             N,
@@ -459,11 +459,11 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             B.stride(0),
             B.stride(2),
             B.stride(1),
-            C.stride(0),
-            C.stride(1),
             Bs.stride(0),
             Bs.stride(2),
             Bs.stride(1),
+            C.stride(0),
+            C.stride(1),
             expert_ids.stride(0),
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=block_k,
@@ -524,23 +524,23 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             grid
         ](
             qA,
-            B,
-            C,
             As,
+            B,
             Bs,
+            C,
             expert_ids,
             S,
             N,
             K,
             qA.stride(0),
             qA.stride(1),
+            As.stride(0),
             B.stride(0),
             B.stride(2),
             B.stride(1),
+            Bs.stride(0),
             C.stride(0),
             C.stride(1),
-            As.stride(0),
-            Bs.stride(0),
             expert_ids.stride(0),
             num_experts=num_experts,
         )
@@ -601,8 +601,8 @@ def mxfp_dynamic_matmul_batched(
         compile_time_only_triton_wrap(mxfp_dynamic_matmul_batched_kernel)[grid](
             A,
             B,
-            C,
             bs_u8,
+            C,
             expert_ids,
             S,
             N,
@@ -612,11 +612,11 @@ def mxfp_dynamic_matmul_batched(
             B.stride(0),
             B.stride(2),
             B.stride(1),
-            C.stride(0),
-            C.stride(1),
             bs_u8.stride(0),
             bs_u8.stride(2),
             bs_u8.stride(1),
+            C.stride(0),
+            C.stride(1),
             expert_ids.stride(0),
             VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
