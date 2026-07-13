@@ -6,7 +6,7 @@ from functools import partial
 from typing import Literal, NamedTuple, Type
 
 import torch
-from ._ops_compat import add_op_namespace_prefix
+from .._ops_compat import add_op_namespace_prefix
 from torch import Tensor
 
 import cuda.bindings.driver as cuda
