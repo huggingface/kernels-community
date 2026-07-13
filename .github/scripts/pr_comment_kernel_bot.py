@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from dataclasses import dataclass, field
 import json
 import os
@@ -8,31 +7,35 @@ import time
 import urllib.parse
 import urllib.error
 import urllib.request
+import uuid
 
 from dispatch import (
-    RELEASE_WORKFLOWS,
-    SECURITY_WORKFLOW,
-    dispatch_release as do_dispatch_release,
+    WORKFLOWS,
+    dispatch,
+    format_dry_run_payloads,
 )
-
 
 KERNEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 COMMENT_CHARS_RE = re.compile(r"^/kernel-bot[ A-Za-z0-9_./-]*$")
 COMMAND_PERMISSIONS = {
     "build": {"admin", "write"},
+    "security": {"admin", "write"},
     "security-and-build": {"admin", "write"},
     "build-and-stage": {"admin", "write"},
     "merge-and-upload": {"admin", "write"},
     "release": {"admin"},
 }
+# Commands that operate per-PR and do not require kernel names.
+KERNELLESS_COMMANDS = {"security"}
 MAX_COMMENT_LENGTH = 1024
 RUN_LOOKUP_ATTEMPTS = 10
 RUN_LOOKUP_SLEEP_SECONDS = 2
 RUN_LOOKUP_PAGE_SIZE = 100
 COMMAND_USAGE = (
-    "Invalid command. Use `/kernel-bot <build|security-and-build|build-and-stage|merge-and-upload|release> "
-    "<kernel1> [kernel2 ...] [--branch <target_branch>]`."
+    "Invalid command. Use `/kernel-bot <build|security|security-and-build|build-and-stage|merge-and-upload|release> "
+    "<kernel1> [kernel2 ...] [--branch <target_branch>]`.\n"
+    "The `security` command does not require kernel names."
 )
 
 
@@ -104,7 +107,9 @@ def try_post_issue_comment(api_base: str, token: str, issue_number: int, message
         return False
 
 
-def try_create_issue_comment(api_base: str, token: str, issue_number: int, message: str):
+def try_create_issue_comment(
+    api_base: str, token: str, issue_number: int, message: str
+):
     try:
         return create_issue_comment(api_base, token, issue_number, message)
     except urllib.error.HTTPError as e:
@@ -120,7 +125,10 @@ def try_update_issue_comment(api_base: str, token: str, comment_id: int, message
         return True
     except urllib.error.HTTPError as e:
         err_text = e.read().decode("utf-8", errors="replace")
-        print(f"Failed to update PR comment {comment_id} (HTTP {e.code}).", file=sys.stderr)
+        print(
+            f"Failed to update PR comment {comment_id} (HTTP {e.code}).",
+            file=sys.stderr,
+        )
         print(err_text, file=sys.stderr)
         return False
 
@@ -187,6 +195,19 @@ def list_workflow_runs(
     return parsed.get("workflow_runs", [])
 
 
+def emit_dispatch_diagnostics(result, *, dry_run: bool):
+    for note in result.notes:
+        print(note, file=sys.stderr)
+    if dry_run:
+        payloads = format_dry_run_payloads(result)
+        if payloads:
+            print(payloads)
+
+
+def make_dispatch_key(issue_number: int, kernel_name: str):
+    return f"pr{issue_number}-{kernel_name}-{uuid.uuid4().hex[:12]}"
+
+
 def workflow_run_matches_dispatch(run: dict, dispatch_key: str):
     for field in ("display_title", "name"):
         value = run.get(field)
@@ -220,7 +241,7 @@ def resolve_dispatch_run_urls(
         return
 
     if workflows is None:
-        workflows = RELEASE_WORKFLOWS
+        workflows = WORKFLOWS["build"]
 
     for attempt in range(RUN_LOOKUP_ATTEMPTS):
         for workflow in workflows:
@@ -273,7 +294,9 @@ def format_dispatched_lines(dispatches: list[DispatchResult]):
         if dispatch.action_url:
             lines.append(f"- `{dispatch.kernel_name}`: {dispatch.action_url}")
         else:
-            lines.append(f"- `{dispatch.kernel_name}`: dispatched, but run URL is not available yet")
+            lines.append(
+                f"- `{dispatch.kernel_name}`: dispatched, but run URL is not available yet"
+            )
     return lines
 
 
@@ -293,7 +316,7 @@ def comment_base_lines(
     ]
     if pr_head_sha:
         lines.append(f"PR head SHA: `{pr_head_sha}`")
-    lines.append(f"Workflows: `{', '.join(RELEASE_WORKFLOWS)}`")
+    lines.append(f"Workflows: `{', '.join(WORKFLOWS['build'])}`")
     return lines
 
 
@@ -313,7 +336,8 @@ def format_pending_comment(
         pr_head_sha,
     )
     if include_security:
-        lines.append(f"Security audit: `{SECURITY_WORKFLOW}` (running concurrently)")
+        wf_names = ", ".join(WORKFLOWS["security"])
+        lines.append(f"Security audit: `{wf_names}` (running concurrently)")
     lines.extend(["", "Status: `processing`"])
     return "\n".join(lines)
 
@@ -328,11 +352,13 @@ def format_result_comment(
     dispatches: list[DispatchResult] | None = None,
     failed: list[tuple[str, int]] | None = None,
     failure_message: str | None = None,
-    security_dispatch: DispatchResult | None = None,
-    security_failure: str | None = None,
+    security_dispatches: list[DispatchResult] | None = None,
+    security_failed: list[tuple[str, int]] | None = None,
 ):
     dispatches = dispatches or []
     failed = failed or []
+    security_dispatches = security_dispatches or []
+    security_failed = security_failed or []
     if failure_message is not None or (failed and not dispatches):
         title = "Build request failed."
     else:
@@ -351,18 +377,11 @@ def format_result_comment(
         lines.extend(["", f"Merge result: {merge_result_message}"])
     if dispatches:
         lines.extend(format_dispatched_lines(dispatches))
-    if security_failure:
-        lines.extend(["", f"Security audit: {security_failure}"])
-    elif security_dispatch is not None:
-        if security_dispatch.action_url:
-            lines.extend(["", f"Security audit: {security_dispatch.action_url}"])
-        else:
-            lines.extend(
-                [
-                    "",
-                    f"Security audit: dispatched, but run URL is not available yet (`{SECURITY_WORKFLOW}`).",
-                ]
-            )
+    if security_dispatches:
+        lines.extend(format_dispatched_lines(security_dispatches))
+    if security_failed:
+        failed_text = ", ".join(f"{wf} (HTTP {code})" for wf, code in security_failed)
+        lines.extend(["", f"Security audit failed: `{failed_text}`"])
     if failed:
         failed_text = ", ".join(f"{kernel} (HTTP {code})" for kernel, code in failed)
         lines.extend(["", f"Failed ({len(failed)}): `{failed_text}`"])
@@ -371,16 +390,15 @@ def format_result_comment(
 
 def parse_command(comment: str) -> ParsedCommand:
     tokens = comment.strip().split()
-    if len(tokens) < 3:
+    if len(tokens) < 2:
         return ParsedCommand(error=COMMAND_USAGE)
 
     command = tokens[1]
     if tokens[0] != "/kernel-bot" or command not in COMMAND_PERMISSIONS:
         return ParsedCommand(error=COMMAND_USAGE)
 
-    args = tokens[2:]
-
     branch = None
+    args = tokens[2:]
 
     if "--branch" in args:
         branch_idx = args.index("--branch")
@@ -391,7 +409,7 @@ def parse_command(comment: str) -> ParsedCommand:
         branch = args[branch_idx + 1]
         args = args[:branch_idx]
 
-    if not args:
+    if not args and command not in KERNELLESS_COMMANDS:
         return ParsedCommand(
             error="No kernels provided. Use `/kernel-bot <build|security-and-build|build-and-stage|merge-and-upload> <kernel1> [kernel2 ...]`.",
         )
@@ -450,13 +468,12 @@ def comment_has_only_supported_characters(comment: str):
     return bool(COMMENT_CHARS_RE.fullmatch(comment))
 
 
-def main():
-    token = os.environ.get("GITHUB_TOKEN")
-    repository = os.environ.get("GITHUB_REPOSITORY")
-
+def _resolve_context_from_env():
+    token = os.environ.get("GITHUB_TOKEN", "")
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
     if not token or not repository:
         print("Missing required environment variables.", file=sys.stderr)
-        return 1
+        return None
 
     comment = os.environ.get("COMMENT_BODY")
     comment_id = parse_numeric_id(os.environ.get("COMMENT_ID"))
@@ -472,35 +489,142 @@ def main():
         or sender_type is None
         or not default_branch
     ):
-        print("Missing required comment context environment variables.", file=sys.stderr)
-        return 1
+        print(
+            "Missing required comment context environment variables.", file=sys.stderr
+        )
+        return None
 
     if sender_type == "Bot":
         print("Ignoring bot comment.")
-        return 0
-
+        return None
     if len(comment) > MAX_COMMENT_LENGTH:
         print("Ignoring oversized comment payload.", file=sys.stderr)
-        return 0
+        return None
     if not comment.strip().startswith("/kernel-bot"):
         print("Ignoring non /kernel-bot comment.")
-        return 0
+        return None
     if not comment_has_only_supported_characters(comment.strip()):
         print("Ignoring /kernel-bot comment with unsupported characters.")
-        return 0
+        return None
+
+    return dict(
+        token=token,
+        repository=repository,
+        comment=comment,
+        comment_id=comment_id,
+        issue_number=issue_number,
+        default_branch=default_branch,
+        commenter=commenter,
+    )
+
+
+def _resolve_context_from_cli():
+    import argparse
+    import subprocess as _sp
+
+    parser = argparse.ArgumentParser(
+        description="Simulate what the comment bot would dispatch for a PR comment"
+    )
+    parser.add_argument(
+        "comment",
+        help='The comment to simulate, e.g. "/kernel-bot security-and-build activation"',
+    )
+    parser.add_argument("--pr-number", required=True, help="PR number")
+    parser.add_argument(
+        "--repo",
+        default=None,
+        help="GitHub repo in owner/repo format (default: auto-detect from git remote)",
+    )
+    parser.add_argument(
+        "--ref",
+        default="main",
+        help="Default branch (default: main)",
+    )
+    parser.add_argument(
+        "--head-sha",
+        default=None,
+        help="PR head SHA (default: fetched via `gh pr view`)",
+    )
+    args = parser.parse_args()
+
+    repository = args.repo
+    if not repository:
+        try:
+            result = _sp.run(
+                ["git", "remote", "get-url", "origin"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=5,
+            )
+            match = re.search(r"github\.com[:/](.+?)(?:\.git)?$", result.stdout.strip())
+            if match:
+                repository = match.group(1)
+        except (FileNotFoundError, _sp.CalledProcessError, _sp.TimeoutExpired):
+            pass
+    if not repository:
+        print("Error: Cannot determine repository. Use --repo.", file=sys.stderr)
+        return None
+
+    pr_head_sha = args.head_sha or ""
+    if not pr_head_sha:
+        try:
+            result = _sp.run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    args.pr_number,
+                    "--json",
+                    "headRefOid",
+                    "-q",
+                    ".headRefOid",
+                ],
+                stdin=_sp.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=15,
+            )
+            pr_head_sha = result.stdout.strip()
+        except (FileNotFoundError, _sp.CalledProcessError, _sp.TimeoutExpired) as e:
+            print(f"Warning: could not fetch PR head SHA: {e}", file=sys.stderr)
+
+    return dict(
+        token="",
+        repository=repository,
+        comment=args.comment,
+        comment_id=None,
+        issue_number=int(args.pr_number),
+        default_branch=args.ref,
+        commenter=None,
+        pr_head_sha=pr_head_sha,
+    )
+
+
+def main(*, dry_run: bool = False):
+    # Resolve inputs from env (CI) or CLI args (dry-run).
+    ctx = _resolve_context_from_cli() if dry_run else _resolve_context_from_env()
+    if ctx is None:
+        return 1 if not dry_run else 0
+
+    token = ctx["token"]
+    repository = ctx["repository"]
+    comment = ctx["comment"]
+    comment_id = ctx["comment_id"]
+    issue_number = ctx["issue_number"]
+    default_branch = ctx["default_branch"]
 
     api_base = f"https://api.github.com/repos/{repository}"
-    if comment_id is not None:
+    if not dry_run and comment_id is not None:
         try_post_issue_comment_reaction(api_base, token, comment_id, "+1")
 
     parsed_command = parse_command(comment)
     if parsed_command.error:
-        try_post_issue_comment(
-            api_base,
-            token,
-            issue_number,
-            parsed_command.error,
-        )
+        if not dry_run:
+            try_post_issue_comment(api_base, token, issue_number, parsed_command.error)
+        else:
+            print(f"Parse error: {parsed_command.error}", file=sys.stderr)
         return 0
 
     command = parsed_command.command
@@ -510,45 +634,110 @@ def main():
         print("Internal error: command parsing returned no command.", file=sys.stderr)
         return 1
 
-    permission = get_user_permission(api_base, token, commenter)
-    allowed_permissions = COMMAND_PERMISSIONS[command]
-    if permission not in allowed_permissions:
-        if "write" in allowed_permissions:
-            permission_error = (
-                f"I can only run `/kernel-bot {command}` for users with `write` or `admin` "
-                "repository permission."
-            )
-        else:
-            permission_error = (
-                f"I can only run `/kernel-bot {command}` for users with `admin` "
-                "repository permission."
-            )
-        try_post_issue_comment(
-            api_base,
-            token,
-            issue_number,
-            permission_error,
-        )
-        return 0
+    # Permission check — skip in dry-run.
+    if not dry_run:
+        commenter = ctx["commenter"]
+        permission = get_user_permission(api_base, token, commenter)
+        allowed_permissions = COMMAND_PERMISSIONS[command]
+        if permission not in allowed_permissions:
+            if "write" in allowed_permissions:
+                permission_error = (
+                    f"I can only run `/kernel-bot {command}` for users with `write` or `admin` "
+                    "repository permission."
+                )
+            else:
+                permission_error = (
+                    f"I can only run `/kernel-bot {command}` for users with `admin` "
+                    "repository permission."
+                )
+            try_post_issue_comment(api_base, token, issue_number, permission_error)
+            return 0
 
-    try:
-        pull_request = get_pull_request(api_base, token, issue_number)
-    except urllib.error.HTTPError as e:
-        err_text = e.read().decode("utf-8", errors="replace")
-        print(
-            f"Failed to fetch PR metadata for #{issue_number} (HTTP {e.code}).",
-            file=sys.stderr,
-        )
-        print(err_text, file=sys.stderr)
-        try_post_issue_comment(
-            api_base,
-            token,
-            issue_number,
-            f"Could not verify PR metadata, so `/kernel-bot {command}` was not run.",
-        )
-        return 1
+    # Fetch PR metadata — API in CI, already resolved in dry-run.
+    if dry_run:
+        pr_head_sha = ctx.get("pr_head_sha", "")
+    else:
+        try:
+            pull_request = get_pull_request(api_base, token, issue_number)
+        except urllib.error.HTTPError as e:
+            err_text = e.read().decode("utf-8", errors="replace")
+            print(
+                f"Failed to fetch PR metadata for #{issue_number} (HTTP {e.code}).",
+                file=sys.stderr,
+            )
+            print(err_text, file=sys.stderr)
+            try_post_issue_comment(
+                api_base,
+                token,
+                issue_number,
+                f"Could not verify PR metadata, so `/kernel-bot {command}` was not run.",
+            )
+            return 1
+        pr_head_sha = pull_request.get("head", {}).get("sha")
 
-    pr_head_sha = pull_request.get("head", {}).get("sha")
+    if command == "security":
+        # Security-only: dispatch the audit and return early.
+        command_summary = f"/kernel-bot {command}"
+        mode_text = "security audit only"
+        target_branch = f"pr-{issue_number}"
+        status_comment_id = None
+        if not dry_run:
+            status_comment_id = comment_id_from_response(
+                try_create_issue_comment(
+                    api_base,
+                    token,
+                    issue_number,
+                    format_pending_comment(
+                        command_summary,
+                        mode_text,
+                        target_branch,
+                        pr_head_sha,
+                        include_security=True,
+                    ),
+                )
+            )
+        release_result = dispatch(
+            token=token,
+            repo=repository,
+            ref=default_branch,
+            pr_number=str(issue_number),
+            head_sha=pr_head_sha or "",
+            dispatch_key_prefix=f"pr{issue_number}-",
+            security_only=True,
+            dry_run=dry_run,
+        )
+        emit_dispatch_diagnostics(release_result, dry_run=dry_run)
+        security_dispatches = [
+            DispatchResult(kernel_name=f"security ({wf})", dispatch_key=dk)
+            for wf, dk in release_result.security_dispatched
+        ]
+
+        if not dry_run and security_dispatches:
+            resolve_dispatch_run_urls(
+                api_base,
+                token,
+                repository,
+                default_branch,
+                security_dispatches,
+                workflows=WORKFLOWS["security"],
+            )
+
+        if not dry_run:
+            try_send_issue_comment(
+                api_base,
+                token,
+                issue_number,
+                format_result_comment(
+                    command_summary,
+                    mode_text,
+                    target_branch,
+                    pr_head_sha,
+                    security_dispatches=security_dispatches,
+                    security_failed=release_result.security_failed,
+                ),
+                comment_id=status_comment_id,
+            )
+        return 1 if release_result.security_failed else 0
 
     if command in ("build", "security-and-build"):
         target_branch = requested_branch or f"pr-{issue_number}"
@@ -583,24 +772,28 @@ def main():
         command_summary += f" --branch {requested_branch}"
     # `/kernel-bot security-and-build` runs the security audit concurrently with the build.
     run_security = command == "security-and-build"
-    status_comment_id = comment_id_from_response(
-        try_create_issue_comment(
-            api_base,
-            token,
-            issue_number,
-            format_pending_comment(
-                command_summary,
-                mode_text,
-                target_branch,
-                pr_head_sha,
-                include_security=run_security,
-            ),
+    status_comment_id = None
+    if not dry_run:
+        status_comment_id = comment_id_from_response(
+            try_create_issue_comment(
+                api_base,
+                token,
+                issue_number,
+                format_pending_comment(
+                    command_summary,
+                    mode_text,
+                    target_branch,
+                    pr_head_sha,
+                    include_security=run_security,
+                ),
+            )
         )
-    )
 
     merge_result_message = None
     if command == "merge-and-upload":
-        if pull_request.get("merged"):
+        if dry_run:
+            print("[dry-run] Would merge PR before dispatching.\n")
+        elif pull_request.get("merged"):
             merge_result_message = "PR is already merged. Continuing with build/upload."
         elif pull_request.get("state") != "open":
             try_send_issue_comment(
@@ -666,11 +859,11 @@ def main():
             )
     dispatches = []
     failed = []
-    security_dispatch = None
-    security_failure = None
+    security_dispatches = []
+    security_failed = []
 
     for index, kernel_name in enumerate(kernels):
-        release_result = do_dispatch_release(
+        release_result = dispatch(
             kernel_name,
             token=token,
             repo=repository,
@@ -684,59 +877,62 @@ def main():
             upload=dispatch_upload,
             # The audit is per-PR, so request it only once (on the first kernel).
             run_security=run_security and index == 0,
+            dry_run=dry_run,
         )
+        emit_dispatch_diagnostics(release_result, dry_run=dry_run)
         for wf, dk in release_result.dispatched:
             dispatches.append(
                 DispatchResult(kernel_name=f"{kernel_name} ({wf})", dispatch_key=dk)
             )
         for wf, code in release_result.failed:
             failed.append((f"{kernel_name} ({wf})", code))
-        if release_result.security_dispatch_key:
-            security_dispatch = DispatchResult(
-                kernel_name="security",
-                dispatch_key=release_result.security_dispatch_key,
+        for wf, dk in release_result.security_dispatched:
+            security_dispatches.append(
+                DispatchResult(kernel_name=f"security ({wf})", dispatch_key=dk)
             )
-        if release_result.security_failed_code is not None:
-            security_failure = (
-                f"could not dispatch `{SECURITY_WORKFLOW}` "
-                f"(HTTP {release_result.security_failed_code})."
-            )
+        security_failed.extend(release_result.security_failed)
 
-    resolve_dispatch_run_urls(
-        api_base,
-        token,
-        repository,
-        default_branch,
-        [*dispatches, *([security_dispatch] if security_dispatch else [])],
-        workflows=[*RELEASE_WORKFLOWS, SECURITY_WORKFLOW]
-        if run_security
-        else RELEASE_WORKFLOWS,
-    )
-
-    comment_written = try_send_issue_comment(
-        api_base,
-        token,
-        issue_number,
-        format_result_comment(
-            command_summary,
-            mode_text,
-            target_branch,
-            pr_head_sha,
-            merge_result_message=merge_result_message,
-            dispatches=dispatches,
-            failed=failed,
-            security_dispatch=security_dispatch,
-            security_failure=security_failure,
-        ),
-        comment_id=status_comment_id,
-    )
-    if not comment_written:
-        print(
-            "Bot response could not be posted. Ensure workflow token has issues/pull-requests write permission.",
-            file=sys.stderr,
+    if not dry_run:
+        resolve_dispatch_run_urls(
+            api_base,
+            token,
+            repository,
+            default_branch,
+            [*dispatches, *security_dispatches],
+            workflows=(
+                [*WORKFLOWS["build"], *WORKFLOWS["security"]]
+                if run_security
+                else WORKFLOWS["build"]
+            ),
         )
+
+        comment_written = try_send_issue_comment(
+            api_base,
+            token,
+            issue_number,
+            format_result_comment(
+                command_summary,
+                mode_text,
+                target_branch,
+                pr_head_sha,
+                merge_result_message=merge_result_message,
+                dispatches=dispatches,
+                failed=failed,
+                security_dispatches=security_dispatches,
+                security_failed=security_failed,
+            ),
+            comment_id=status_comment_id,
+        )
+        if not comment_written:
+            print(
+                "Bot response could not be posted. Ensure workflow token has issues/pull-requests write permission.",
+                file=sys.stderr,
+            )
     return 1 if failed else 0
 
 
 if __name__ == "__main__":
+    if "--dry-run" in sys.argv:
+        sys.argv.remove("--dry-run")
+        raise SystemExit(main(dry_run=True))
     raise SystemExit(main())

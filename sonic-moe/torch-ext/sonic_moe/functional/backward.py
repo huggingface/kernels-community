@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 from ..quack.gemm_interface import gemm, gemm_dgated
 
-from .._ops_compat import add_op_namespace_prefix
+from .._ops import add_op_namespace_prefix
 from ..utils import get_powers_of_2
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 

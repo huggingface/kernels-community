@@ -15,6 +15,7 @@
 #include "cute/algorithm/gemm.hpp"
 #include "cute/algorithm/subgroup_algorithms.hpp"
 #include "cute/atom/mma_atom.hpp"
+#include "../xe_barrier_compat.hpp"
 #include "./fmha_fusion.hpp"
 #include "./copy_block_slm.hpp"
 

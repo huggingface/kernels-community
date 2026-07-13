@@ -1,24 +1,24 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from einops import rearrange, repeat
 
-try:
-    from causal_conv1d import causal_conv1d_fn
-except ImportError:
-    causal_conv1d_fn = None
+from .._causal_conv1d import causal_conv1d_fn
 
 try:
-    from ..ops.triton.layernorm_gated import RMSNorm as RMSNormGated, LayerNorm
+    from ..ops.triton.layernorm_gated import LayerNorm
+    from ..ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 except ImportError:
     RMSNormGated, LayerNorm = None, None
 
-from ..ops.triton.ssd_combined import mamba_chunk_scan_combined
-from ..ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+from ..ops.triton.ssd_combined import (
+    mamba_chunk_scan_combined,
+    mamba_split_conv1d_scan_combined,
+)
 
 
 class Mamba2Simple(nn.Module):
@@ -181,10 +181,9 @@ class Mamba2Simple(nn.Module):
                 dim=-1,
             )
             dt = F.softplus(dt + self.dt_bias)  # (B, L, nheads)
-            assert self.activation in ["silu", "swish"]
 
             # 1D Convolution
-            if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
+            if self.activation not in ["silu", "swish"]:
                 xBC = self.act(
                     self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)
                 )  # (B, L, self.d_inner + 2 * ngroups * d_state)
