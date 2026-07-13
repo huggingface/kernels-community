@@ -15,7 +15,7 @@
 """Fused batched MoE: two deterministic kernels (no atomics, no sort), per routed token.
 
   Kernel 1 (S x N-tiles): gather -> gate_up GEMM -> SiLU -> FP8 requant -> fp8 intermediate
-  Kernel 2 (S x H-tiles): fp8 intermediate -> down GEMM -> routing weight -> output
+  Kernel 2 (S x H-tiles): fp8 intermediate -> down GEMM -> output (routing weight in the reduce)
 
 Recipe-named to mirror ``batched.py``; ``moe_fused_batched`` is the neutral dispatcher.
 """
@@ -51,8 +51,7 @@ from .utils import (
     fp8_dot,
     acc_finalize,
     glu,
-    topk_reduce_kernel,
-    TOPK_REDUCE_BLOCK_H,
+    weighted_reduce_kernel,
     e2m1_as_uint8,
     ue8m0_as_uint8,
 )
@@ -217,7 +216,6 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
     Down,
     DownScale,
     ExpertIds,
-    SampleWeights,
     Out,
     stride_down_e,
     stride_down_n,
@@ -295,7 +293,6 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
     if SIMULATE_UNFUSED:
         acc = acc.to(Out.dtype.element_ty).to(tl.float32)
 
-    acc = acc * tl.load(SampleWeights + batch_id)
     store_row(Out + batch_id * HIDDEN_DIM, acc, pid_h, 1, BLOCK_SIZE_M, BLOCK_SIZE_H)
 
 
@@ -332,10 +329,10 @@ def _w8a8_block_dynamic_fp8_moe_batched(
     NUM_H_TILES = triton.cdiv(HIDDEN_DIM, BLOCK_SIZE_N)
     NUM_N_TILES = triton.cdiv(INTERMEDIATE_DIM, BLOCK_SIZE_N)
 
-    # Offline even at decode (measured, graph-timed, GLM dims: 65.8 vs 71.1us at T=1,
-    # offline also wins T=4/16): the (rows x N-tiles) grid re-ran the inline quant per
-    # N-tile, and block-FP8 quant is fp32 amax+div per element — unlike UE8M0 (~free),
-    # which is why the MX batched kernels DO quantize inline.
+    # Offline quant wins here even at decode. An inline quant would rerun once per N-tile
+    # of the (rows x N-tiles) grid, and block-FP8 quant is an fp32 amax+div per element,
+    # so the redundant work outweighs the extra launch down to T=1 (~66 vs ~71us at GLM
+    # dims). UE8M0 quant is ~free per pass, which is why the MX kernels do it inline.
     hidden_q, hidden_s = fp8_act_quant_2d(hidden_states, BLOCK_SIZE_K)
 
     inter = torch.empty(
@@ -345,7 +342,7 @@ def _w8a8_block_dynamic_fp8_moe_batched(
         num_routed_tokens, NUM_N_TILES, device=device, dtype=torch.float32
     )
 
-    out = torch.empty(
+    down_out = torch.empty(
         num_routed_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
     )
     reduced = torch.empty(
@@ -395,8 +392,7 @@ def _w8a8_block_dynamic_fp8_moe_batched(
             down_proj,
             down_proj_scale,
             top_k_index,
-            top_k_weights,
-            out,
+            down_out,
             down_proj.stride(0),
             down_proj.stride(1),
             down_proj.stride(2),
@@ -412,22 +408,24 @@ def _w8a8_block_dynamic_fp8_moe_batched(
             NUM_N_TILES=NUM_N_TILES,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        compile_time_only_triton_wrap(topk_reduce_kernel)[
-            (num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))
+        compile_time_only_triton_wrap(weighted_reduce_kernel)[
+            lambda meta: (num_tokens, triton.cdiv(HIDDEN_DIM, meta["BLOCK_H"]))
         ](
-            out,
+            down_out,
             reduced,
             top_k_index,
+            top_k_weights,
             HIDDEN_DIM,
-            out.stride(0),
-            out.stride(1),
+            down_out.stride(0),
+            down_out.stride(1),
             reduced.stride(0),
             reduced.stride(1),
             top_k_index.stride(0),
             top_k_index.stride(1),
+            num_groups_bit_length=int(num_tokens).bit_length(),
             NUM_TOP_K=NUM_TOP_K,
             NUM_EXPERTS=NUM_EXPERTS,
-            BLOCK_H=TOPK_REDUCE_BLOCK_H,
+            SIMULATE_UNFUSED=simulate_unfused,
         )
 
     return reduced
@@ -676,7 +674,6 @@ def mxfp_dynamic_moe_batched_down_kernel(
     Down,
     DownScale,
     ExpertIds,
-    SampleWeights,
     Out,
     stride_down_e,
     stride_down_n,
@@ -767,7 +764,6 @@ def mxfp_dynamic_moe_batched_down_kernel(
 
     if SIMULATE_UNFUSED:
         acc = acc.to(Out.dtype.element_ty).to(tl.float32)
-    acc = acc * tl.load(SampleWeights + batch_id)
     store_row(Out + batch_id * HIDDEN_DIM, acc, pid_n, 1, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
@@ -821,7 +817,7 @@ def _mxfp_dynamic_moe_batched(
         device=device,
         dtype=torch.uint8,
     )
-    out = torch.empty(
+    down_out = torch.empty(
         num_routed_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
     )
     reduced = torch.empty(
@@ -870,8 +866,7 @@ def _mxfp_dynamic_moe_batched(
             down_proj_u8,
             down_proj_scale_u8,
             top_k_index,
-            top_k_weights,
-            out,
+            down_out,
             down_proj_u8.stride(0),
             down_proj_u8.stride(1),
             down_proj_u8.stride(2),
@@ -886,22 +881,24 @@ def _mxfp_dynamic_moe_batched(
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        compile_time_only_triton_wrap(topk_reduce_kernel)[
-            (num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))
+        compile_time_only_triton_wrap(weighted_reduce_kernel)[
+            lambda meta: (num_tokens, triton.cdiv(HIDDEN_DIM, meta["BLOCK_H"]))
         ](
-            out,
+            down_out,
             reduced,
             top_k_index,
+            top_k_weights,
             HIDDEN_DIM,
-            out.stride(0),
-            out.stride(1),
+            down_out.stride(0),
+            down_out.stride(1),
             reduced.stride(0),
             reduced.stride(1),
             top_k_index.stride(0),
             top_k_index.stride(1),
+            num_groups_bit_length=int(num_tokens).bit_length(),
             NUM_TOP_K=NUM_TOP_K,
             NUM_EXPERTS=NUM_EXPERTS,
-            BLOCK_H=TOPK_REDUCE_BLOCK_H,
+            SIMULATE_UNFUSED=simulate_unfused,
         )
 
     return reduced

@@ -139,7 +139,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     """Block-scale FP8 GEMM kernel.
 
     Computes ``C = A @ B.T``. Activations arrive pre-quantized (one pass in the
-    wrapper — the inline per-N-tile quant re-ran N//BN times per element; see the
+    wrapper — the inline per-N-tile quant would repeat N//BN times per element; see the
     grouped kernels). 2D grid with swizzle for L2 cache locality on B.
 
     ``SWAP_AB`` is an independent orientation knob: the weight tile sits in the MMA
@@ -325,7 +325,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     """Block-scale FP8 GEMM with static (per-tensor) activation scale.
 
     ``A`` arrives pre-quantized (one elementwise ``(A / As).to(fp8)`` pass in the
-    wrapper — the inline division re-ran per N-tile). Per-block weight scales apply
+    wrapper — an inline division would repeat per N-tile). Per-block weight scales apply
     per-K-tile during accumulation; the scalar activation scale is applied once at
     the end.
     """

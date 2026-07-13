@@ -140,7 +140,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 
     Each program handles one routed token row and one N-tile, looking up the
     owning expert from ``ExpertIds``. Activations arrive pre-quantized (one wrapper
-    pass — the inline quant re-ran per N-tile and paid a per-tile amax reduction).
+    pass — an inline quant would repeat per N-tile and pay a per-tile amax reduction).
 
     ``SWAP_AB`` (tuner axis, M=1 decode): load the weight output-rows-major ``[BN, BK]`` and put
     those rows in the MMA M dim, padding the single token to the N=16 atom; column 0 of the
@@ -431,10 +431,10 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     )
 
     Bs = ue8m0_as_uint8(Bs)
-    # Offline even at decode (arm A/B, graph-timed: offline won T=1/4/16, inline ~2%
-    # ahead only at T=64): the (S x N-tiles) grid re-ran the inline quant per N-tile,
-    # and block-FP8 quant is fp32 amax+div per element — unlike UE8M0 (~free), which is
-    # why the MX kernels DO quantize inline.
+    # Offline quant wins here even at decode. An inline quant would rerun once per N-tile
+    # of the (S x N-tiles) grid, and block-FP8 quant is an fp32 amax+div per element, so
+    # the redundant work outweighs the extra launch down to T=1 (inline only edges ahead
+    # near T=64). UE8M0 quant is ~free per pass, which is why the MX kernels do it inline.
     A_q, A_s = fp8_act_quant_2d(A, block_k)
     C = A.new_empty(S, N, dtype=output_dtype)
 

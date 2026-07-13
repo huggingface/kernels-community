@@ -109,48 +109,61 @@ def sm_count(device_index: int) -> int:
             )
 
 
-# H-tile each topk_reduce program reduces (one (token, tile) program per BLOCK_H span). The
-# reduce is bandwidth-bound and saturates at BLOCK_H>=512: a sweep over {128..2048} x prefill
-# shapes put 512/1024/2048 within ~7% (mostly noise) while 128/256 lagged — not worth a tuning
-# axis for this small slice of runtime. 512 = smallest that saturates (best at low token counts,
-# where bigger tiles waste masked lanes). Power of 2 (tl.arange).
-TOPK_REDUCE_BLOCK_H = 512
-
-
+@bayesian_autotune(
+    [
+        triton.Config({"BLOCK_H": block_h}, num_warps=warps)
+        for block_h in (256, 512, 1024, 2048)
+        for warps in (4, 8)
+    ],
+    # the H tile width trades off against grid occupancy: at few groups (decode) narrow
+    # tiles spread more H-blocks across SMs, at many groups (prefill) wide tiles amortize
+    # the per-row weight load — so key on H and the group-count bucket.
+    ["H", "num_groups_bit_length"],
+    n_trials=8,
+)
 @triton.jit
-def topk_reduce_kernel(
-    ProjOut,
-    Out,
-    ExpertIds,
+def weighted_reduce_kernel(
+    Rows,  # (num_groups * NUM_TOP_K, H) — rows to reduce, group-major
+    Out,  # (num_groups, H) — one reduced row per group
+    Ids,  # (num_groups, NUM_TOP_K) — per-row id; a row is skipped when its id >= NUM_EXPERTS
+    Weights,  # (num_groups * NUM_TOP_K,) — per-row scale
     H,
-    stride_po_m,
-    stride_po_h,
+    stride_rows_m,
+    stride_rows_h,
     stride_o_m,
     stride_o_h,
-    stride_ei_m,
-    stride_ei_k,
+    stride_ids_m,
+    stride_ids_k,
+    num_groups_bit_length,  # autotune key only (log2 group-count bucket); unused in body
     NUM_TOP_K: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    SIMULATE_UNFUSED: tl.constexpr = False,
 ):
-    """Sum the ``NUM_TOP_K`` flat ``(token, slot)`` rows of ``ProjOut`` into ``Out[token]`` —
-    a tight replacement for ``proj_out.view(T, K, H).sum(1)`` (~2.8x faster than torch's
-    generic reduce; fp32 accumulate, so bit-identical). Slots whose expert is non-local (EP
-    sentinel id ``>= NUM_EXPERTS``) are skipped — the experts kernels never write those rows, so
-    they must contribute 0. Caller allocs Out and launches it."""
-    t = tl.program_id(0)
+    """Per group ``g``, the weighted sum of its ``NUM_TOP_K`` rows into ``Out[g]``:
+    ``sum_k Weights[g*NUM_TOP_K + k] * Rows[g*NUM_TOP_K + k]``, skipping rows whose id is
+    ``>= NUM_EXPERTS`` (out-of-range rows are never written upstream and contribute 0).
+    fp32 accumulate; ~2.8x a generic ``view(g, k, H).sum(1)``. ``SIMULATE_UNFUSED`` rounds
+    each weighted row to ``Out``'s dtype before summing, matching a reference that weights
+    in that dtype; production leaves the accumulation in fp32."""
+    g = tl.program_id(0)
     offs_h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = offs_h < H
     acc = tl.zeros((BLOCK_H,), tl.float32)
     for k in tl.static_range(NUM_TOP_K):
-        local = tl.load(ExpertIds + t * stride_ei_m + k * stride_ei_k) < NUM_EXPERTS
-        acc += tl.load(
-            ProjOut + (t * NUM_TOP_K + k) * stride_po_m + offs_h * stride_po_h,
-            mask=mask & local,
+        flat = g * NUM_TOP_K + k
+        valid = tl.load(Ids + g * stride_ids_m + k * stride_ids_k) < NUM_EXPERTS
+        weight = tl.load(Weights + flat)
+        contrib = weight * tl.load(
+            Rows + flat * stride_rows_m + offs_h * stride_rows_h,
+            mask=mask & valid,
             other=0.0,
         ).to(tl.float32)
+        if SIMULATE_UNFUSED:
+            contrib = contrib.to(Out.dtype.element_ty).to(tl.float32)
+        acc += contrib
     tl.store(
-        Out + t * stride_o_m + offs_h * stride_o_h,
+        Out + g * stride_o_m + offs_h * stride_o_h,
         acc.to(Out.dtype.element_ty),
         mask=mask,
     )
@@ -1397,7 +1410,7 @@ def _scatter_kernel(
     expert_id = tl.load(ExpertIds + offs, mask=offs < S, other=NUM_EXPERTS)
     valid = expert_id < NUM_EXPERTS
     dest = tl.load(ExpertStart + expert_id, mask=valid, other=0) + tl.atomic_add(
-        Counters + expert_id, 1, mask=valid
+        Counters + expert_id, 1, mask=valid, sem="relaxed"
     )
     tl.store(Perm + dest, offs, mask=valid)
     tl.store(PermToken + dest, offs // NUM_TOP_K, mask=valid)
@@ -1412,7 +1425,9 @@ def _count_kernel(
     offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < S
     expert_id = tl.load(ExpertIds + offs, mask=mask, other=NUM_EXPERTS)
-    tl.atomic_add(ExpertFreq + expert_id, 1, mask=mask & (expert_id < NUM_EXPERTS))
+    tl.atomic_add(
+        ExpertFreq + expert_id, 1, mask=mask & (expert_id < NUM_EXPERTS), sem="relaxed"
+    )
 
 
 class GroupedScheduling(NamedTuple):

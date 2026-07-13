@@ -153,7 +153,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     Each M-tile maps to its owning expert via ``ExpertStart`` and gathers its rows
     through ``InputPerm`` — the expert sort is virtual, ``A`` arrives in any row order.
     Activations arrive pre-quantized (one pass in the wrapper — the
-    inline per-N-tile quant re-ran N//BN times per element; see the fused kernels' log).
+    inline per-N-tile quant would repeat N//BN times per element; see the fused kernels' log).
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -356,7 +356,7 @@ def mxfp_dynamic_matmul_grouped_kernel(
     Each M-tile maps to its expert via ``ExpertStart`` and gathers its rows through
     ``PermToken`` (virtual sort — ``A`` in any row order). ``A``
     arrives pre-quantized (E4M3 + UE8M0 group-32 scales, one pass in the wrapper — the
-    inline per-N-tile quant re-ran N//BN times per element). ``VALUES_PER_BYTE`` picks the
+    inline per-N-tile quant would repeat N//BN times per element). ``VALUES_PER_BYTE`` picks the
     weight format (2 = packed E2M1 / MXFP4, 1 = unpacked E4M3 / MXFP8); ``COMPUTE_MODE``
     picks ``tl.dot_scaled`` vs fp8 ``tl.dot`` + per-group rescale (decode; FP4 unpacks
     E2M1->E4M3 first, lossless).
@@ -712,7 +712,7 @@ def mxfp_dynamic_matmul_grouped(
 
     B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
-    # One-pass MX pre-quant (bit-exact with the old inline form: group-32 boundaries align).
+    # One-pass MX pre-quant (bit-exact with an inline quant: group-32 boundaries align).
     A_q, A_s = mxfp_act_quant(A)
     C = A.new_empty((S, N), dtype=output_dtype)
 

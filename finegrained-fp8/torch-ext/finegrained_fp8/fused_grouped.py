@@ -12,9 +12,9 @@ Two **persistent** kernels over expert-grouped M-tiles, no ``A_sorted`` material
   2. Phase 1 — gate_up, **gathering** each tile's hidden rows via ``perm_token``, + SiLU,
      then **FP8 requant** of the intermediate — same trick as ``fused_batched``: the down
      kernel reads FP8 directly instead of a bf16 round-trip.
-  3. Phase 2 — grouped down over the FP8 intermediate, then **fuses the routing-weight ×
-     reorder** (no atomics): each row is scaled by its weight and **scattered** to its flat
-     ``(token, slot)`` row via ``perm_routed``, leaving the host only a top-k sum back to (T, H).
+  3. Phase 2 — grouped down over the FP8 intermediate, then **scatters** each row to its
+     flat ``(token, slot)`` position via ``perm_routed`` (no atomics). The routing-weight
+     scale and the top-k sum back to (T, H) both happen in ``weighted_reduce_kernel``.
 
 Scheduling is persistent: a fixed ``NUM_SMS`` programs grid-stride over all tiles. The
 expert-tile layout is built once into registers from ``expert_start`` (``build_tile_layout``)
@@ -47,8 +47,7 @@ from .utils import (
     tl_dtype,
     fp8_act_quant_2d,
     fp8_act_quant_inline,
-    topk_reduce_kernel,
-    TOPK_REDUCE_BLOCK_H,
+    weighted_reduce_kernel,
     get_accelerator_autotuning_configs,
     is_mxfp,
     is_mxfp4,
@@ -70,27 +69,25 @@ from .utils import (
 
 
 @triton.jit
-def scatter_weighted_tile(
+def scatter_tile(
     ProjOut,
     acc,
     offs_global_m,
     offs_cols,
     row_mask,
     PermRouted,
-    SampleWeights,
     stride_perm,
     stride_po_m,
     stride_po_n,
     SIMULATE_UNFUSED: tl.constexpr,
 ):
-    """Down-projection epilogue: optionally round through the output dtype (unfused parity), then
-    apply each row's routing weight and scatter to its flat (token, slot) row — the fused top-k
-    reorder (no atomics) that lets the host just sum over slots."""
+    """Down-projection epilogue: optionally round through the output dtype (unfused
+    parity), then scatter each row to its flat (token, slot) position via ``PermRouted``
+    (no atomics). The routing-weight scale is applied in the top-k reduce, so the down
+    projection itself is a plain grouped GEMM."""
     if SIMULATE_UNFUSED:
         acc = acc.to(ProjOut.dtype.element_ty).to(tl.float32)
     flat = tl.load(PermRouted + offs_global_m * stride_perm, mask=row_mask, other=0)
-    weight = tl.load(SampleWeights + flat, mask=row_mask, other=0.0)
-    acc = acc * weight[:, None]
     store_tile(ProjOut, acc, flat, offs_cols, row_mask, stride_po_m, stride_po_n)
 
 
@@ -157,11 +154,10 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
     rows + per-K-block scales per expert M-tile, gate + up block-FP8 matmuls, SiLU-combine,
     FP8-requant the intermediate.
 
-    ``WARP_SPEC`` (CUDA): warp-specialize the K-loop — +21% AND load-bearing for correctness:
-    Triton 3.7.1's default pipeliner RACES this loop's six load streams + dual dot at
-    num_warps < 8 or BM = 128 (nondeterministic output; WS's explicit producer/consumer
-    barriers are what make those configs sound). The single-dot combined form is race-free
-    but measured 20% slower."""
+    Gate and up are one stacked ``[BK, 2*BN]`` dot, split after the loop. With
+    pre-quantized fp8 activations the loop carries four streams, and the single wide dot
+    runs ~18% faster e2e than separate gate/up dots (GLM-5.2 prefill). A single-dot loop
+    is race-free, so ``WARP_SPEC`` is a pure performance axis here."""
     start_pid = tl.program_id(axis=0)
     exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
         ExpertStart, NUM_EXPERTS, BLOCK_SIZE_M
@@ -182,20 +178,13 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
         token = tl.load(PermToken + offs_global_m * stride_pt, mask=row_mask, other=0)
         a_ptrs = Hidden + token[:, None] * stride_h_t + offs_k[None, :] * stride_h_k
         as_ptrs = HiddenScale + token * stride_hs_t
-        gate_ptr = (
+        gu_ptr = (
             GateUp
             + expert_id64 * stride_gu_e
-            + tl.arange(0, BLOCK_SIZE_K)[:, None] * stride_gu_k
-            + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :] * stride_gu_n
-        )
-        up_ptr = (
-            GateUp
-            + expert_id64 * stride_gu_e
-            + tl.arange(0, BLOCK_SIZE_K)[:, None] * stride_gu_k
-            + (INTERMEDIATE_DIM + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[
-                None, :
-            ]
+            + tl.arange(0, 2)[:, None, None] * (INTERMEDIATE_DIM * stride_gu_n)
+            + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :, None]
             * stride_gu_n
+            + tl.arange(0, BLOCK_SIZE_K)[None, None, :] * stride_gu_k
         )
         gate_s_ptr = GateUpScale + expert_id64 * stride_gus_e + pid_n * stride_gus_n
         up_s_ptr = (
@@ -203,26 +192,27 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
             + expert_id64 * stride_gus_e
             + (num_n_tiles + pid_n) * stride_gus_n
         )
-
-        acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_SIZE_M, 2 * BLOCK_SIZE_N), dtype=tl.float32)
         for _ in tl.range(
             0, tl.cdiv(HIDDEN_DIM, BLOCK_SIZE_K), warp_specialize=WARP_SPEC
         ):
             a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
             a_s = tl.load(as_ptrs, mask=row_mask, other=0.0)
-            w_gate = tl.load(gate_ptr)
-            w_up = tl.load(up_ptr)
+            w = tl.trans(tl.reshape(tl.load(gu_ptr), [2 * BLOCK_SIZE_N, BLOCK_SIZE_K]))
             w_s_gate = decode_ue8m0_scale(tl.load(gate_s_ptr))
             w_s_up = decode_ue8m0_scale(tl.load(up_s_ptr))
-            acc_gate += tl.dot(a, w_gate) * a_s[:, None] * w_s_gate
-            acc_up += tl.dot(a, w_up) * a_s[:, None] * w_s_up
+            # stacked tile: gate scale on the first BN columns, up scale on the rest
+            gate_cols = tl.arange(0, 2 * BLOCK_SIZE_N) < BLOCK_SIZE_N
+            w_s = tl.where(gate_cols, w_s_gate, w_s_up)
+            acc += tl.dot(a, w) * a_s[:, None] * w_s[None, :]
             a_ptrs += BLOCK_SIZE_K * stride_h_k
             as_ptrs += 1
-            gate_ptr += BLOCK_SIZE_K * stride_gu_k
-            up_ptr += BLOCK_SIZE_K * stride_gu_k
+            gu_ptr += BLOCK_SIZE_K * stride_gu_k
             gate_s_ptr += stride_gus_k
             up_s_ptr += stride_gus_k
+
+        acc_3d = tl.permute(tl.reshape(acc, [BLOCK_SIZE_M, 2, BLOCK_SIZE_N]), (0, 2, 1))
+        acc_gate, acc_up = tl.split(acc_3d)
 
         intermediate = glu(
             acc_gate,
@@ -269,7 +259,6 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
     DownScale,  # (E, H//bn, I//bk) UE8M0 block scales
     ExpertStart,  # (NUM_EXPERTS+1,) int32 — exclusive sorted-row start per expert (pad S)
     PermRouted,  # (S,) int32 — sorted position -> flat (token, slot) row
-    SampleWeights,  # (S,) routing weight per flat row
     ProjOut,  # (S, H) bf16, flat (token, slot) order
     stride_int_m,
     stride_int_n,
@@ -344,14 +333,13 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
             w_down_ptr += BLOCK_SIZE_K * stride_down_i
             ws_down_ptr += stride_downs_i
 
-        scatter_weighted_tile(
+        scatter_tile(
             ProjOut,
             acc,
             offs_global_m,
             offs_h,
             row_mask,
             PermRouted,
-            SampleWeights,
             stride_perm,
             stride_po_m,
             stride_po_n,
@@ -378,7 +366,7 @@ def w8a8_block_dynamic_fp8_moe_grouped(
     device = hidden_states.device
     num_sms = sm_count(device.index)
     num_top_k = top_k_index.size(-1)
-    num_tokens = hidden_states.size(0)
+    num_tokens = top_k_index.size(0)
     num_routed_tokens = top_k_index.numel()
     tokens_per_sm_bit_length = int(num_routed_tokens // num_sms).bit_length()
 
@@ -394,9 +382,9 @@ def w8a8_block_dynamic_fp8_moe_grouped(
 
     gate_up_scale_u8 = ue8m0_as_uint8(gate_up_proj_scale)
     down_scale_u8 = ue8m0_as_uint8(down_proj_scale)
-    # One-pass block-FP8 pre-quant of the activations (see the MX wrapper / mxfp_act_quant:
-    # the kernel used to re-run the inline quant per N-tile). Bit-exact — the quant span
-    # equals the kernel's BLOCK_SIZE_K.
+    # One-pass block-FP8 pre-quant of the activations. An inline quant would repeat per
+    # N-tile; one wrapper pass is bit-exact with it since the quant span equals the
+    # kernel's BLOCK_SIZE_K (see mxfp_act_quant).
     hidden_q, hidden_scale = fp8_act_quant_2d(hidden_states, BLOCK_SIZE_K)
 
     inter = torch.empty(
@@ -405,7 +393,7 @@ def w8a8_block_dynamic_fp8_moe_grouped(
     inter_scale = torch.empty(
         num_routed_tokens, NUM_I_TILES, device=device, dtype=torch.float32
     )
-    out = torch.empty(
+    down_out = torch.empty(
         num_routed_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
     )
     reduced = torch.empty(
@@ -456,8 +444,7 @@ def w8a8_block_dynamic_fp8_moe_grouped(
             down_scale_u8,
             expert_start,
             perm_routed,
-            top_k_weights,
-            out,
+            down_out,
             inter.stride(0),
             inter.stride(1),
             inter_scale.stride(0),
@@ -468,8 +455,8 @@ def w8a8_block_dynamic_fp8_moe_grouped(
             down_scale_u8.stride(0),
             down_scale_u8.stride(1),
             down_scale_u8.stride(2),
-            out.stride(0),
-            out.stride(1),
+            down_out.stride(0),
+            down_out.stride(1),
             perm_routed.stride(0),
             tokens_per_sm_bit_length=tokens_per_sm_bit_length,
             HIDDEN_DIM=HIDDEN_DIM,
@@ -481,20 +468,24 @@ def w8a8_block_dynamic_fp8_moe_grouped(
             NUM_SMS=num_sms,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        topk_reduce_kernel[(num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))](
-            out,
+        weighted_reduce_kernel[
+            lambda meta: (num_tokens, triton.cdiv(HIDDEN_DIM, meta["BLOCK_H"]))
+        ](
+            down_out,
             reduced,
             top_k_index,
+            top_k_weights,
             HIDDEN_DIM,
-            out.stride(0),
-            out.stride(1),
+            down_out.stride(0),
+            down_out.stride(1),
             reduced.stride(0),
             reduced.stride(1),
             top_k_index.stride(0),
             top_k_index.stride(1),
+            num_groups_bit_length=int(num_tokens).bit_length(),
             NUM_TOP_K=num_top_k,
             NUM_EXPERTS=NUM_EXPERTS,
-            BLOCK_H=TOPK_REDUCE_BLOCK_H,
+            SIMULATE_UNFUSED=simulate_unfused,
         )
 
     return reduced
@@ -772,7 +763,6 @@ def mxfp_dynamic_moe_grouped_down_kernel(
     DownDescriptor,  # TMA descriptor over the (E*H, I//VALUES_PER_BYTE) weight view
     ExpertStart,  # (NUM_EXPERTS+1,) int32 — exclusive sorted-row start per expert (pad S)
     PermRouted,  # (S,) int32 — sorted position -> flat (token, slot) row
-    SampleWeights,  # (S,) routing weight per flat row
     ProjOut,  # (S, H) bf16, flat (token, slot) order
     stride_int_m,
     stride_int_n,
@@ -899,14 +889,13 @@ def mxfp_dynamic_moe_grouped_down_kernel(
             a_ptrs += BLOCK_SIZE_K * stride_int_n
             as_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_is_n
 
-        scatter_weighted_tile(
+        scatter_tile(
             ProjOut,
             acc,
             offs_global_m,
             offs_bn,
             row_mask,
             PermRouted,
-            SampleWeights,
             stride_perm,
             stride_po_m,
             stride_po_n,
@@ -939,7 +928,7 @@ def mxfp_dynamic_moe_grouped(
     device = hidden_states.device
     num_sms = sm_count(device.index)
     num_top_k = top_k_index.size(-1)
-    num_tokens = hidden_states.size(0)
+    num_tokens = top_k_index.size(0)
     num_routed_tokens = top_k_index.numel()
     tokens_per_sm_bit_length = int(num_routed_tokens // num_sms).bit_length()
 
@@ -955,9 +944,10 @@ def mxfp_dynamic_moe_grouped(
     down_proj_u8 = e2m1_as_uint8(down_proj)
     gate_up_scale_u8 = ue8m0_as_uint8(gate_up_proj_scale)
     down_scale_u8 = ue8m0_as_uint8(down_proj_scale)
-    # One-pass MX pre-quant of the activations: the gate_up kernel used to re-run the inline
-    # quant per N-tile (16x redundant ALU + 2x act bytes) — it held gate_up at ~380 TFLOPS
-    # while the pre-quantized down kernel ran ~1080. Bit-exact (same group-32 boundaries).
+    # One-pass MX pre-quant of the activations. Quantizing inline in the gate_up kernel
+    # repeats per N-tile (16x redundant ALU + 2x act bytes) and caps it near ~380 TFLOPS
+    # vs ~1080 for the pre-quantized down; one wrapper pass is bit-exact (group-32
+    # boundaries align).
     hidden_q, hidden_scale = mxfp_act_quant(hidden_states)
 
     inter = torch.empty(
@@ -969,7 +959,7 @@ def mxfp_dynamic_moe_grouped(
         device=device,
         dtype=torch.uint8,
     )
-    out = torch.empty(
+    down_out = torch.empty(
         num_routed_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
     )
     reduced = torch.empty(
@@ -1036,8 +1026,7 @@ def mxfp_dynamic_moe_grouped(
             down_descriptor,
             expert_start,
             perm_routed,
-            top_k_weights,
-            out,
+            down_out,
             inter.stride(0),
             inter.stride(1),
             inter_scale.stride(0),
@@ -1048,8 +1037,8 @@ def mxfp_dynamic_moe_grouped(
             down_scale_u8.stride(0),
             down_scale_u8.stride(1),
             down_scale_u8.stride(2),
-            out.stride(0),
-            out.stride(1),
+            down_out.stride(0),
+            down_out.stride(1),
             perm_routed.stride(0),
             tokens_per_sm_bit_length=tokens_per_sm_bit_length,
             HIDDEN_DIM=HIDDEN_DIM,
@@ -1060,20 +1049,24 @@ def mxfp_dynamic_moe_grouped(
             NUM_SMS=num_sms,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        topk_reduce_kernel[(num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))](
-            out,
+        weighted_reduce_kernel[
+            lambda meta: (num_tokens, triton.cdiv(HIDDEN_DIM, meta["BLOCK_H"]))
+        ](
+            down_out,
             reduced,
             top_k_index,
+            top_k_weights,
             HIDDEN_DIM,
-            out.stride(0),
-            out.stride(1),
+            down_out.stride(0),
+            down_out.stride(1),
             reduced.stride(0),
             reduced.stride(1),
             top_k_index.stride(0),
             top_k_index.stride(1),
+            num_groups_bit_length=int(num_tokens).bit_length(),
             NUM_TOP_K=num_top_k,
             NUM_EXPERTS=NUM_EXPERTS,
-            BLOCK_H=TOPK_REDUCE_BLOCK_H,
+            SIMULATE_UNFUSED=simulate_unfused,
         )
 
     return reduced
