@@ -43,7 +43,7 @@ jobs:
               exit 0
               ;;
           esac
-          if ! printf '%s' "$COMMENT_BODY" | grep -Eq '^/kernel-bot[ A-Za-z0-9_./-]*$'; then
+          if ! printf '%s' "$COMMENT_BODY" | grep -Eq '^/kernel-bot[][ A-Za-z0-9_,./-]*$'; then
             echo "Ignoring /kernel-bot comment with unsupported characters."
             exit 0
           fi

@@ -10,14 +10,17 @@ import urllib.request
 import uuid
 
 from dispatch import (
+    BACKEND_TO_WORKFLOWS,
     WORKFLOWS,
     dispatch,
     format_dry_run_payloads,
+    parse_kernel_arg,
 )
 
 KERNEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
-COMMENT_CHARS_RE = re.compile(r"^/kernel-bot[ A-Za-z0-9_./-]*$")
+COMMENT_CHARS_RE = re.compile(r"^/kernel-bot[ A-Za-z0-9_./,\[\]-]*$")
+KNOWN_BACKENDS = set(BACKEND_TO_WORKFLOWS)
 COMMAND_PERMISSIONS = {
     "build": {"admin", "write"},
     "security": {"admin", "write"},
@@ -35,6 +38,7 @@ RUN_LOOKUP_PAGE_SIZE = 100
 COMMAND_USAGE = (
     "Invalid command. Use `/kernel-bot <build|security|security-and-build|build-and-stage|merge-and-upload|release> "
     "<kernel1> [kernel2 ...] [--branch <target_branch>]`.\n"
+    "A kernel may be scoped to a subset of backends, e.g. `flash-attn2[xpu,cpu]`.\n"
     "The `security` command does not require kernel names."
 )
 
@@ -43,6 +47,7 @@ COMMAND_USAGE = (
 class ParsedCommand:
     command: str | None = None
     kernels: list[str] = field(default_factory=list)
+    backends: dict[str, list[str]] = field(default_factory=dict)
     branch: str | None = None
     error: str | None = None
 
@@ -415,18 +420,37 @@ def parse_command(comment: str) -> ParsedCommand:
         )
 
     kernels = []
+    backends: dict[str, list[str]] = {}
     seen = set()
-    for kernel in args:
-        if not KERNEL_RE.match(kernel):
-            return ParsedCommand(error=f"Invalid kernel name `{kernel}`.")
-        if kernel not in seen:
-            kernels.append(kernel)
-            seen.add(kernel)
+    for token in args:
+        name, requested = parse_kernel_arg(token)
+        if name is None:
+            return ParsedCommand(error=f"Invalid kernel name `{token}`.")
+        if requested is not None:
+            unknown = [b for b in requested if b not in KNOWN_BACKENDS]
+            if unknown:
+                known = ", ".join(sorted(KNOWN_BACKENDS))
+                return ParsedCommand(
+                    error=(
+                        f"Unknown backend(s) `{', '.join(unknown)}` in `{token}`. "
+                        f"Known backends: {known}."
+                    )
+                )
+        if name not in seen:
+            kernels.append(name)
+            seen.add(name)
+        if requested is not None:
+            scoped = backends.setdefault(name, [])
+            for b in requested:
+                if b not in scoped:
+                    scoped.append(b)
 
     if branch is not None and not BRANCH_RE.match(branch):
         return ParsedCommand(error=f"Invalid target branch `{branch}`.")
 
-    return ParsedCommand(command=command, kernels=kernels, branch=branch)
+    return ParsedCommand(
+        command=command, kernels=kernels, backends=backends, branch=branch
+    )
 
 
 def parse_numeric_id(raw_value: str | None):
@@ -629,6 +653,7 @@ def main(*, dry_run: bool = False):
 
     command = parsed_command.command
     kernels = parsed_command.kernels
+    kernel_backends = parsed_command.backends
     requested_branch = parsed_command.branch
     if command is None:
         print("Internal error: command parsing returned no command.", file=sys.stderr)
@@ -767,7 +792,11 @@ def main(*, dry_run: bool = False):
         "merge-and-upload": "merge, build and upload",
         "release": "release (linux + mac + windows)",
     }[command]
-    command_summary = f"/kernel-bot {command} {' '.join(kernels)}"
+    kernel_tokens = [
+        f"{k}[{','.join(kernel_backends[k])}]" if kernel_backends.get(k) else k
+        for k in kernels
+    ]
+    command_summary = f"/kernel-bot {command} {' '.join(kernel_tokens)}"
     if requested_branch is not None:
         command_summary += f" --branch {requested_branch}"
     # `/kernel-bot security-and-build` runs the security audit concurrently with the build.
@@ -875,6 +904,7 @@ def main(*, dry_run: bool = False):
             head_sha=pr_head_sha or "",
             target_branch=target_branch,
             upload=dispatch_upload,
+            requested_backends=kernel_backends.get(kernel_name),
             # The audit is per-PR, so request it only once (on the first kernel).
             run_security=run_security and index == 0,
             dry_run=dry_run,

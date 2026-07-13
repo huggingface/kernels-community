@@ -95,6 +95,20 @@ class DispatchPlan:
 # Reading build.toml and selecting workflows
 
 
+def parse_kernel_arg(token: str) -> tuple[str | None, list[str] | None]:
+    name, bracket, rest = token.partition("[")
+    if not KERNEL_NAME_RE.match(name):
+        return None, None
+    if not bracket:
+        return name, None
+    if not rest.endswith("]"):
+        return None, None
+    backends = rest[:-1].split(",")
+    if not all(backends):  # reject empty components: "[]", "[cpu,]", "[,]"
+        return None, None
+    return name, backends
+
+
 def read_backends(kernel_name: str) -> list[str] | None:
     build_toml = Path(kernel_name) / "build.toml"
     if not build_toml.exists():
@@ -109,8 +123,9 @@ def read_backends(kernel_name: str) -> list[str] | None:
     return None
 
 
-def select_workflows(kernel_name: str, *, notes: list[str]) -> set[str]:
-    backends = read_backends(kernel_name)
+def select_workflows(
+    kernel_name: str, backends: list[str] | None, *, notes: list[str]
+) -> set[str]:
     if backends is None:
         notes.append(
             f"Could not read backends for {kernel_name}, dispatching all workflows"
@@ -232,10 +247,22 @@ def _plan_build_actions(
     head_sha: str,
     target_branch: str,
     upload: bool,
+    requested_backends: list[str] | None = None,
 ) -> None:
-    backends = read_backends(kernel_name) or []
-    workflows = select_workflows(kernel_name, notes=plan.notes)
+    backends = read_backends(kernel_name)
+    if requested_backends is not None and backends is not None:
+        backends = [b for b in backends if b in requested_backends]
+        if not backends:
+            plan.notes.append(
+                f"None of the requested backends {requested_backends} are "
+                f"declared by {kernel_name}; skipping build"
+            )
+            plan.skipped = sorted(WORKFLOWS["build"])
+            return
+
+    workflows = select_workflows(kernel_name, backends, notes=plan.notes)
     plan.skipped = sorted(set(WORKFLOWS["build"]) - workflows)
+    backends = backends or []
 
     for workflow in sorted(workflows):
         scoped = sorted(
@@ -294,6 +321,7 @@ def plan_dispatch(
     upload: bool = True,
     run_security: bool = False,
     security_only: bool = False,
+    requested_backends: list[str] | None = None,
 ) -> DispatchPlan:
     want_security = run_security or security_only
     plan = DispatchPlan(kernel_name=kernel_name, head_sha=head_sha)
@@ -311,6 +339,7 @@ def plan_dispatch(
             head_sha=head_sha,
             target_branch=target_branch,
             upload=upload,
+            requested_backends=requested_backends,
         )
 
     if want_security:
@@ -460,6 +489,7 @@ def dispatch(
     upload: bool = True,
     run_security: bool = False,
     security_only: bool = False,
+    requested_backends: list[str] | None = None,
 ) -> DispatchResult:
     if not security_only and (not kernel_name or not KERNEL_NAME_RE.match(kernel_name)):
         result = DispatchResult(kernel_name=kernel_name)
@@ -481,6 +511,7 @@ def dispatch(
         upload=upload,
         run_security=run_security,
         security_only=security_only,
+        requested_backends=requested_backends,
     )
     if dry_run:
         return _result_from_plan(plan)
@@ -542,7 +573,10 @@ def main() -> int:
         "kernel_name",
         nargs="?",
         default="",
-        help="Kernel directory name (not required with --security-only)",
+        help=(
+            "Kernel directory name, optionally scoped as "
+            "'kernel[backend1,backend2]' (not required with --security-only)"
+        ),
     )
     parser.add_argument(
         "--ref", default="main", help="Git ref to dispatch on (default: main)"
@@ -622,6 +656,18 @@ def main() -> int:
         )
         return 1
 
+    kernel_name = args.kernel_name
+    requested_backends = None
+    if kernel_name:
+        kernel_name, requested_backends = parse_kernel_arg(kernel_name)
+        if kernel_name is None:
+            print(
+                f"Error: invalid kernel argument {args.kernel_name!r} "
+                "(expected 'kernel' or 'kernel[backend1,backend2]').",
+                file=sys.stderr,
+            )
+            return 1
+
     common = dict(
         mode=args.mode,
         repo_prefix=args.repo_prefix,
@@ -634,11 +680,12 @@ def main() -> int:
         run_security=args.security,
         security_only=args.security_only,
         dispatch_key_prefix=args.dispatch_key_prefix,
+        requested_backends=requested_backends,
     )
 
     if args.dry_run:
         result = dispatch(
-            args.kernel_name,
+            kernel_name or "",
             token="",
             repo=args.repo or "",
             ref=args.ref,
@@ -662,7 +709,7 @@ def main() -> int:
             return 1
 
         result = dispatch(
-            args.kernel_name,
+            kernel_name or "",
             token=token,
             repo=repo,
             ref=args.ref,

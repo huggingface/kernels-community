@@ -168,6 +168,7 @@ jobs:
         env:
           KERNEL: ${{ steps.validate.outputs.kernel }}
           MODE: ${{ inputs.mode }}
+          BACKENDS_FILTER: ${{ inputs.backends }}
         run: |
           if [ "$MODE" = "pr" ]; then
             NIX_TARGET="backendCi"
