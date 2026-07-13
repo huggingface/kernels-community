@@ -1,0 +1,37 @@
+name: Check Public API
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - ".github/**"
+      - "scripts/**"
+      - "*.json"
+      - "*.nix"
+      - "*.lock"
+      - ".gitignore"
+      - ".gitmodules"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check-public-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Check public API
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          uv run --script scripts/check_public_api.py --base-ref "$BASE_SHA"

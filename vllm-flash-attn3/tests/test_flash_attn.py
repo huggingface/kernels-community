@@ -1,26 +1,34 @@
-import os
-import math
 import itertools
+import math
+import os
 
 import pytest
 import torch
 import torch.nn.functional as F
-
 from einops import rearrange, repeat
+
+
 try:
     from flash_attn.layers.rotary import apply_rotary_emb
 except ImportError:
     apply_rotary_emb = None
 
-from padding import pad_input, unpad_input
-from test_util import (
+from .padding import pad_input, unpad_input
+from .test_util import (
     attention_ref,
     generate_qkv,
     generate_random_padding_mask,
 )
 
-from flash_attn import flash_attn_func, flash_attn_varlen_func, flash_attn_combine
-from flash_attn import flash_attn_with_kvcache, get_scheduler_metadata
+from kernels import get_kernel
+
+vllm_flash_attn3 = get_kernel("kernels-community/vllm-flash-attn3", version=1)
+
+flash_attn_func = vllm_flash_attn3.flash_attn_func
+flash_attn_varlen_func = vllm_flash_attn3.flash_attn_varlen_func
+flash_attn_combine = vllm_flash_attn3.flash_attn_combine
+flash_attn_with_kvcache = vllm_flash_attn3.flash_attn_with_kvcache
+get_scheduler_metadata = vllm_flash_attn3.get_scheduler_metadata
 
 
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
