@@ -21,6 +21,11 @@ from utils import (  # type: ignore
 )
 
 import finegrained_fp8  # type: ignore
+from finegrained_fp8.utils import (  # type: ignore
+    fp8_act_quant_block_dynamic,
+    fp8_act_quant_tensor_wide,
+    mxfp_act_quant,
+)
 from finegrained_fp8 import moe  # type: ignore
 
 
@@ -491,7 +496,7 @@ def test_batched(problem):
     torch.manual_seed(0)
     A, expert_ids, B, Bs = _setup_problem(problem)
     matmul_batched = maybe_compile(finegrained_fp8.matmul_batched, problem.compile)
-    out = matmul_batched(A, None, B, Bs, expert_ids, problem.block_size)
+    out = matmul_batched(A, B, Bs=Bs, expert_ids=expert_ids)
     ref = _routed_matmul_ref(A, B, Bs, expert_ids, problem.block_size)
     _assert_correctness(out, ref, expert_ids, problem)
 
@@ -509,12 +514,11 @@ def test_grouped(problem):
     matmul_grouped = maybe_compile(finegrained_fp8.matmul_grouped, problem.compile)
     out = matmul_grouped(
         A_q,
-        As,
         B,
-        Bs,
-        expert_start,
-        problem.block_size,
-        epilogue=finegrained_fp8.Epilogue(output_dtype=problem.dtype),
+        As=As,
+        Bs=Bs,
+        expert_start=expert_start,
+        output_dtype=problem.dtype,
         gather_idx=gather_idx,
         scatter_idx=scatter_idx,
     )
@@ -791,10 +795,10 @@ def _quant_act(x, problem, block_size):
     ``matmul_grouped`` used to do internally, now caller-side. MX → UE8M0 group-32; tensor-wide
     (no block_size) → per-token; block-dynamic → per-``block_k`` blocks."""
     if problem.is_mxfp:
-        return finegrained_fp8.mxfp_act_quant(x)
+        return mxfp_act_quant(x)
     if block_size is None:
-        return finegrained_fp8.fp8_act_quant_tensor_wide(x, x.shape[-1])
-    return finegrained_fp8.fp8_act_quant_block_dynamic(x, block_size[1])
+        return fp8_act_quant_tensor_wide(x, x.shape[-1])
+    return fp8_act_quant_block_dynamic(x, block_size[1])
 
 
 def _assert_fused_correctness(out, ref, problem: MoEProblem):
@@ -824,7 +828,6 @@ def test_fused_batched(problem):
         down,
         gate_up_s,
         down_s,
-        block_size,
         act_fn=problem.act_fn,
         swiglu_alpha=problem.swiglu_alpha,
         swiglu_limit=problem.swiglu_limit,
@@ -837,7 +840,6 @@ def test_fused_batched(problem):
         down,
         gate_up_s,
         down_s,
-        block_size,
         act_fn=problem.act_fn,
         swiglu_alpha=problem.swiglu_alpha,
         swiglu_limit=problem.swiglu_limit,
@@ -865,7 +867,6 @@ def test_fused_grouped(problem):
         down,
         gate_up_s,
         down_s,
-        block_size,
         act_fn=problem.act_fn,
         swiglu_alpha=problem.swiglu_alpha,
         swiglu_limit=problem.swiglu_limit,
@@ -878,7 +879,6 @@ def test_fused_grouped(problem):
         down,
         gate_up_s,
         down_s,
-        block_size,
         act_fn=problem.act_fn,
         swiglu_alpha=problem.swiglu_alpha,
         swiglu_limit=problem.swiglu_limit,
@@ -938,7 +938,7 @@ def test_batched_speedup(problem):
         problem,
         "batched",
         lambda: finegrained_fp8.matmul_batched(
-            A, None, B, Bs, expert_ids, problem.block_size
+            A, B, Bs=Bs, expert_ids=expert_ids
         ),
         problem.expectation.batched_ms,
     )
@@ -962,12 +962,11 @@ def test_grouped_speedup(problem):
         "grouped",
         lambda: finegrained_fp8.matmul_grouped(
             A_q,
-            As,
             B,
-            Bs,
-            expert_start,
-            problem.block_size,
-            epilogue=finegrained_fp8.Epilogue(output_dtype=problem.dtype),
+            As=As,
+            Bs=Bs,
+            expert_start=expert_start,
+            output_dtype=problem.dtype,
             gather_idx=gather_idx,
             scatter_idx=scatter_idx,
         ),

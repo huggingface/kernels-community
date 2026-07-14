@@ -15,6 +15,7 @@
 import functools
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Literal
 
 
 import torch
@@ -264,10 +265,27 @@ def is_mxfp(weight: torch.Tensor, scale: torch.Tensor) -> bool:
 def is_tensor_wide(block_size, weight: torch.Tensor) -> bool:
     """True when ``block_size`` selects per-tensor (tensor-dynamic) scaling: ``None`` or
     equal to the weight's full ``(N, K)`` — one scale block spanning the whole matrix.
-    Handles 2D ``(N, K)`` and 3D ``(E, N, K)`` weights via the last two dims."""
+    Handles 2D ``(N, K)`` and 3D ``(E, N, K)`` weights via the last two dims. (2D path
+    only — the grouped/batched dispatchers derive the recipe from the SCALE shape via
+    ``weight_block_size``.)"""
     return block_size is None or (
         block_size[0] == weight.shape[-2] and block_size[1] == weight.shape[-1]
     )
+
+
+def weight_block_size(B: torch.Tensor, Bs: torch.Tensor) -> list[int] | None:
+    """The fp8 weight-quantization block ``[block_n, block_k]``, derived from the scale
+    tensor's shape — the data already says how it was quantized, so no ``block_size``
+    parameter exists to disagree with it. ``None`` = tensor-wide (one scalar per expert:
+    ``Bs`` ``(E,)`` or ``(E, 1, 1)`` spanning the full ``(N, K)``). Expects a 3D
+    ``(E, N, K)`` fp8 ``B``; MX weights never reach here (recipe keyed by scale dtype)."""
+    num_experts, n_rows, K = B.shape
+    if Bs.numel() == num_experts:
+        return None
+    assert Bs.ndim == 3 and n_rows % Bs.shape[1] == 0 and K % Bs.shape[2] == 0, (
+        f"Bs shape {tuple(Bs.shape)} does not tile B {tuple(B.shape)} evenly"
+    )
+    return [n_rows // Bs.shape[1], K // Bs.shape[2]]
 
 
 def tl_dtype(dtype: torch.dtype) -> tl.dtype:
@@ -313,11 +331,13 @@ def resolve_memory_modes(memory_modes):
     )
     memory_modes = tuple(descriptor if m == "descriptor" else m for m in memory_modes)
     if "device_descriptor" in memory_modes:
-        # device-side descriptors build in-kernel tensormaps that need a scratch allocator (the
-        # XPU path; CUDA keeps host-built descriptors and never reaches this).
+        # device-side descriptors build in-kernel tensormaps that need a scratch
+        # allocator — on whichever accelerator is active (XPU always; CUDA when a kernel
+        # requests "device_descriptor" explicitly to skip the host-descriptor plumbing).
+        device_type = get_active_device_type()
         triton.set_allocator(
             lambda size, alignment, stream: torch.empty(
-                size, dtype=torch.int8, device="xpu"
+                size, dtype=torch.int8, device=device_type
             )
         )
     return memory_modes
@@ -542,6 +562,11 @@ def sm_shared_memory_limit() -> int:
 #   RACE guards (Triton 3.7.1 pipeliner, per-loop-structure flake maps):
 #     block_dynamic_grouped_matmul_pruner   WS-only at BM>=64, non-WS below (disjoint)
 #                                      — bd grouped (plain and GATE arms, same loop)
+#     descriptor_gate_pruner           descriptor modes are GATE-fenced (one box = one
+#                                      projection) — fp grouped
+#     smem_pruner                      smem veto, bound picked by operand dtypes: exact
+#                                      for unquantized loops, provable floor for
+#                                      quantized — fp grouped, mx 2D/grouped/batched
 #   TPE-POISON fences (valid configs that can't win in a regime):
 #     scalar_max_m_pruner              scalar above M=64 (prefill GEVM) — mx 2D
 #     mx_config_pruner poison fences   sm_10x fp4-scalar (1.8x dead) and the whole dot
@@ -681,6 +706,12 @@ def mx_config_pruner(k_arg: str):
       miscompiles wider scaled MMAs into a sticky illegal-address device trap that poisons
       the context mid-autotune.
 
+    Packed-E2M1 activations (a ``uint8`` activation tensor, W4A4) keep only no-swap
+    ``dot_scaled`` configs on every arch — the dot/scalar arms and the swapped rhs builder
+    consume decoded/E4M3 activations, so the other arms are structurally inapplicable
+    (the native ``kind::mxf4`` W4A4 MMA was probed bit-exact: BK down to 64, single-trip,
+    and BN=256 all clean; BM<128 falls back to the correct-but-slow f16 kind).
+
     The shape gates above are scoped to ``dot_scaled`` — they are native scaled-MMA bug
     gates. The ``dot`` arm (BK structurally the UE8M0 group, 32) is CORRECT everywhere
     probed (forced-config sweep 2026-07-14, GATE and plain, MXFP4/MXFP8, incl. width-512
@@ -722,11 +753,27 @@ def mx_config_pruner(k_arg: str):
     def dot_arm_ok(c, args):
         return c.kwargs.get("COMPUTE_MODE") != "dot"
 
+    def packed_act_ok(c, args):
+        # Packed-E2M1 activations (W4A4) exist only on the no-swap dot_scaled arm: the
+        # dot/scalar arms consume decoded E4M3 (they would need an A-side unpack) and the
+        # swapped rhs builder pads an E4M3 token. Structural on every arch, not a perf fence.
+        return c.kwargs.get("COMPUTE_MODE") == "dot_scaled" and not c.kwargs.get(
+            "SWAP_AB"
+        )
+
+    def activation_is_packed(args):
+        # the activation tensor is arg0 by kernel convention; uint8 = packed E2M1 (the
+        # dtype IS the activation format — it also keys the autotune cache automatically)
+        activation = next(iter(args.values()))
+        return getattr(activation, "dtype", None) == torch.uint8
+
     return compose_pruners(
         block_k_within_k_pruner(k_arg),
+        config_filter(packed_act_ok, when=activation_is_packed),
         config_filter(
             fp4_scalar_ok,
-            when=lambda args: is_sm10x() and args.get("VALUES_PER_BYTE") == 2,
+            when=lambda args: is_sm10x()
+            and getattr(args.get("B"), "dtype", None) == torch.uint8,
         ),
         config_filter(dot_arm_ok, when=lambda args: is_sm10x()),
         config_filter(mma_shape_ok, when=lambda args: is_sm10x()),
@@ -769,6 +816,104 @@ def scalar_max_m_pruner(m_arg: str, max_m: int = 64):
         return c.kwargs.get("COMPUTE_MODE") != "scalar"
 
     return config_filter(ok, when=lambda args: args[m_arg] > max_m)
+
+
+def descriptor_gate_pruner():
+    """``early_config_prune`` fencing descriptor MEMORY_MODEs off GATE launches: one
+    descriptor box holds a single projection, and the stacked gate|up tile would need
+    two disjoint boxes (unimplemented). Pointer configs all stay."""
+
+    def ok(c, args):
+        return c.kwargs.get("MEMORY_MODE", "pointer") == "pointer" or not args.get(
+            "GATE"
+        )
+
+    return config_filter(ok)
+
+
+def smem_pruner():
+    """``early_config_prune`` dropping configs whose shared memory certainly cannot fit,
+    with the bound picked by the operand dtypes (sampled from ``metadata.shared`` across
+    every kernel family, 22 cells):
+
+    - both operands >= 2-byte floats (the unquantized loops): ``num_stages`` full
+      buffers of both tiles (exact) plus the fixed barrier terms at their sampled
+      MINIMA (+16 base; +28 warp-spec, observed up to 48 varying with warps; +32
+      host-descriptor) — minima keep the bound below the true usage, so a config is
+      only ever dropped when its operand buffers alone cannot fit.
+    - quantized ``dot_scaled`` (the only quantized arm whose tiles can reach the limit):
+      the per-allocation law, every term named by its TTGIR ``local_alloc`` and exact to
+      the allocator's alignment/packing slack (<= 16 B observed; barriers pack into
+      padding, so no fixed constant is added — the slack is keep-side) —
+      ``num_stages - 1`` buffers of operands+scales at the native M=128 staging (weights
+      full-width even when fp4-packed; GATE shifts the A tile to a full ``num_stages``),
+      or the bf16-upcast fallback below the gate (one single-buffered upcast tile,
+      packed weights, no A-scale buffers).
+    - quantized ``dot``/``scalar``: the raw-operand floor (their 32-wide K tiles cannot
+      reach the limit).
+
+    Both arms are EMPIRICAL models of this Triton's allocator, fit to and verified
+    against ``metadata.shared`` samples (not derived from a spec) — chosen so the error
+    direction under the sampled behavior is always toward KEEPING a config, which then
+    merely compiles and self-prunes as inf. Re-verify the samples on a Triton bump.
+    Non-empty fallback."""
+
+    def ok(c, args):
+        a, b = args["A"], args["B"]
+        tiles = 2 if args.get("GATE") else 1
+        bk = config_dim(c, args, "BLOCK_SIZE_K")
+        unquantized = a.element_size() >= 2 and b.element_size() >= 2
+        stages = c.num_stages if unquantized else c.num_stages - 1
+        packed = 2 if b.dtype == torch.uint8 else 1
+        bm = config_dim(c, args, "BLOCK_SIZE_M")
+        bn = config_dim(c, args, "BLOCK_SIZE_N")
+        if unquantized:
+            # sampled minima of the fixed allocations beside the operand buffers
+            # (the barrier terms vary by tens of bytes with warps; minima only ever
+            # err toward keeping a config)
+            fixed = (
+                16
+                + (28 if c.kwargs.get("WARP_SPEC") else 0)
+                + (32 if c.kwargs.get("MEMORY_MODE", "pointer") != "pointer" else 0)
+            )
+            need = fixed + stages * bk * (
+                a.element_size() * bm + b.element_size() * tiles * bn
+            )
+        elif c.kwargs.get("COMPUTE_MODE") == "dot_scaled":
+            # exact per-allocation law (every term named by its TTGIR local_alloc)
+            scale_cols = bk // 32
+
+            def scale_bufs(tile_bytes):
+                # the pipeliner multi-buffers a load only when its tile is big enough
+                # (sampled: 512 B pipelined, 256 B single; the open band is UNREACHABLE —
+                # every emitted grid's scale tiles are powers of two)
+                return stages if tile_bytes >= 512 else 1
+
+            if bm >= 128:
+                # native scaled-MMA staging: weights full-width even when fp4-packed;
+                # GATE shifts the pipeliner so the A tile gets a full num_stages buffers
+                a_bufs = c.num_stages if args.get("GATE") else c.num_stages - 1
+                need = (
+                    a_bufs * bk * bm
+                    + stages * bk * tiles * bn
+                    + scale_bufs(scale_cols * bm) * scale_cols * bm
+                    + scale_bufs(scale_cols * tiles * bn) * scale_cols * tiles * bn
+                )
+            else:
+                # bf16-upcast fallback (below the native M=128 gate): one single-buffered
+                # [BK, tiles*BN] bf16 upcast tile, weights staged packed, no A-scale buffers
+                need = (
+                    2 * bk * tiles * bn
+                    + stages * (bk * bm + (bk // packed) * tiles * bn)
+                    + scale_bufs(scale_cols * tiles * bn) * scale_cols * tiles * bn
+                )
+        else:
+            # dot (BK = the 32-group) / scalar: tiles too small to reach the limit —
+            # the raw-operand floor suffices
+            need = stages * (bk * bm + (bk // packed) * tiles * bn)
+        return need <= sm_shared_memory_limit()
+
+    return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
 
 
 def descriptor_config_pruner():
@@ -828,28 +973,55 @@ def mxfp_act_quant_inline(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
+    RECIPE: tl.constexpr = "mxfp8",
 ):
-    """Inline E4M3 activation quant for the MX paths (W4A8 MXFP4 / W8A8 MXFP8).
+    """Inline MX activation quant, one helper for both value grids. Per-row, per-K-group
+    amax → UE8M0 scale (ceil to the next power of two via the exponent-bump trick, the
+    divisor being the grid's largest magnitude) → values onto the recipe's grid:
 
-    Per-row, per-K-group amax → UE8M0 scale (ceil to next power-of-2 via the
-    mantissa-nonzero bump trick) → cast values to FP8. Returns ``(a_fp8,
-    a_scale_u8)`` with shapes ``(M, K)`` and ``(M, K // SCALE_GROUP_K)``.
-    """
+    - ``"mxfp8"``: cast to E4M3 — returns ``((M, K) fp8, (M, K // SCALE_GROUP_K) uint8)``.
+    - ``"mxfp4"``: round to E2M1 (the ``>=``-boundary sum matches ``torch.bucketize``'s
+      tie behavior in the host ``mxfp4_act_quant``, bit-for-bit) and pack nibble pairs —
+      returns ``((M, K//2) uint8, (M, K // SCALE_GROUP_K) uint8)``.
+
+    Only the taken recipe arm compiles."""
     a_groups = tl.reshape(
         a_raw, (BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_K, SCALE_GROUP_K)
     )
-    a_s_fp32 = tl.max(tl.abs(a_groups), axis=2) / 448.0
-    bits = a_s_fp32.to(tl.int32, bitcast=True)
-    # ceil_to_ue8m0: bump exponent by 1 when mantissa is non-zero.
-    exp_ceil = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-    exp_ceil = tl.minimum(tl.maximum(exp_ceil, 1), 254)
-    a_scale_u8 = exp_ceil.to(tl.uint8)
-    a_s_pow2 = (exp_ceil << 23).to(tl.float32, bitcast=True)
-    a_fp8 = tl.reshape(
-        a_groups / tl.maximum(a_s_pow2[:, :, None], 1e-12),
-        (BLOCK_SIZE_M, BLOCK_SIZE_K),
-    ).to(tl.float8e4nv)
-    return a_fp8, a_scale_u8
+    amax = tl.max(tl.abs(a_groups), axis=2)
+    if RECIPE == "mxfp4":
+        bits = (amax / 6.0).to(tl.int32, bitcast=True)
+        # ceil_to_ue8m0: bump exponent by 1 when mantissa is non-zero.
+        exp_ceil = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        exp_ceil = tl.minimum(tl.maximum(exp_ceil, 1), 254)
+        exp_ceil = tl.where(amax == 0, 127, exp_ceil)
+        a_scale_u8 = exp_ceil.to(tl.uint8)
+        a_s_pow2 = (exp_ceil << 23).to(tl.float32, bitcast=True)
+        v = tl.reshape(a_groups / a_s_pow2[:, :, None], (BLOCK_SIZE_M, BLOCK_SIZE_K))
+        av = tl.abs(v)
+        code = (
+            (av >= 0.25).to(tl.int32)
+            + (av >= 0.75).to(tl.int32)
+            + (av >= 1.25).to(tl.int32)
+            + (av >= 1.75).to(tl.int32)
+            + (av >= 2.5).to(tl.int32)
+            + (av >= 3.5).to(tl.int32)
+            + (av >= 5.0).to(tl.int32)
+        ) | ((v < 0).to(tl.int32) << 3)
+        lo, hi = tl.split(tl.reshape(code, (BLOCK_SIZE_M, BLOCK_SIZE_K // 2, 2)))
+        values = (lo | (hi << 4)).to(tl.uint8)
+    else:
+        bits = (amax / 448.0).to(tl.int32, bitcast=True)
+        # ceil_to_ue8m0: bump exponent by 1 when mantissa is non-zero.
+        exp_ceil = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        exp_ceil = tl.minimum(tl.maximum(exp_ceil, 1), 254)
+        a_scale_u8 = exp_ceil.to(tl.uint8)
+        a_s_pow2 = (exp_ceil << 23).to(tl.float32, bitcast=True)
+        values = tl.reshape(
+            a_groups / tl.maximum(a_s_pow2[:, :, None], 1e-12),
+            (BLOCK_SIZE_M, BLOCK_SIZE_K),
+        ).to(tl.float8e4nv)
+    return values, a_scale_u8
 
 
 @triton.jit
@@ -878,13 +1050,16 @@ def load_mx_act_tile(
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
 ):
-    """Load one MX activation K-tile as ``(a_fp8, a_scale_u8)`` — the arm is picked
-    off the pointer dtype at compile time: fp8 pointers load pre-quantized values +
-    UE8M0 scales (``maybe_act_quant``'s offline arm), raw bf16/fp16 pointers load and
-    quantize inline (``as_ptrs`` then points at a dead placeholder and is never read).
-    ``row_mask`` may be ``None`` (unmasked tiles, e.g. the %-wrapped 2D matmul).
-    Callers advance both pointers unconditionally."""
-    if a_ptrs.dtype.element_ty == tl.float8e4nv:  # pre-quantized offline
+    """Load one MX activation K-tile as ``(a_vals, a_scale_u8)`` — the arm is picked
+    off the pointer dtype at compile time: fp8 pointers load pre-quantized E4M3 values +
+    UE8M0 scales (``maybe_act_quant``'s offline arm), uint8 pointers load caller-provided
+    packed-E2M1 values (W4A4 — the ``a_ptrs`` tile spans ``BLOCK_SIZE_K // 2`` bytes) +
+    the same UE8M0 scales, raw bf16/fp16 pointers load and quantize inline (``as_ptrs``
+    then points at a dead placeholder and is never read). ``row_mask`` may be ``None``
+    (unmasked tiles, e.g. the %-wrapped 2D matmul). Callers advance both pointers
+    unconditionally."""
+    if a_ptrs.dtype.element_ty == tl.float8e4nv or a_ptrs.dtype.element_ty == tl.uint8:
+        # pre-quantized (E4M3 offline, or packed E2M1 handed in by the caller)
         if row_mask is None:
             a = tl.load(a_ptrs)
             a_scale = tl.load(as_ptrs)
@@ -915,21 +1090,24 @@ def decode_ue8m0_scale(scale):
 
 
 @triton.jit
-def mx_dot_scaled(acc, a, a_scale, w, w_scale, VALUES_PER_BYTE: tl.constexpr):
+def mx_dot_scaled(acc, a, a_scale, w, w_scale):
     """MX 'dot_scaled' path: scaled MMA folding the UE8M0 group scales into the tensor core —
-    ``a`` (E4M3) @ ``w`` (packed E2M1 if MXFP4, else E4M3). The rhs format is picked from
-    ``VALUES_PER_BYTE``. Caller pre-shapes ``w``/``w_scale`` (e.g. ``tl.trans(gu)``)."""
-    rhs_format: tl.constexpr = "e2m1" if VALUES_PER_BYTE == 2 else "e4m3"
-    return tl.dot_scaled(a, a_scale, "e4m3", w, w_scale, rhs_format, acc)
+    each operand's format is its loaded tile's dtype (``uint8`` = packed E2M1, else E4M3).
+    fp4 on BOTH operands lowers to the native ``kind::mxf4`` MMA (2x the fp8 rate; probed
+    bit-exact on sm_100, native iff the M operand is 128 — same gate as mxf8f6f4). Caller
+    pre-shapes ``w``/``w_scale`` (e.g. ``tl.trans(gu)``)."""
+    lhs_format: tl.constexpr = "e2m1" if a.dtype == tl.uint8 else "e4m3"
+    rhs_format: tl.constexpr = "e2m1" if w.dtype == tl.uint8 else "e4m3"
+    return tl.dot_scaled(a, a_scale, lhs_format, w, w_scale, rhs_format, acc)
 
 
 @triton.jit
-def mx_dot_rescale(acc, a, w, a_scale, w_scale, VALUES_PER_BYTE: tl.constexpr):
+def mx_dot_rescale(acc, a, w, a_scale, w_scale):
     """MX 'dot' path (BK == group): unpack MXFP4 weights to E4M3, fp8 ``tl.dot`` + per-group
     software rescale (decoding both UE8M0 scales internally), accumulating into ``acc`` (returned
     updated). The batched gate_up kernel passes the stacked
     gate|up tile (2*BN columns) — per-column independence keeps that bit-exact."""
-    wq = mxfp4_e2m1_to_e4m3(w) if VALUES_PER_BYTE == 2 else w
+    wq = mxfp4_e2m1_to_e4m3(w) if w.dtype == tl.uint8 else w
     return acc + tl.dot(a, wq) * decode_ue8m0_scale(a_scale) * tl.trans(
         decode_ue8m0_scale(w_scale)
     )
@@ -946,7 +1124,6 @@ def mx_scalar_reduce(
     ROWS_W: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
-    VALUES_PER_BYTE: tl.constexpr,
 ):
     """MX 'scalar' path: CUDA-core FMA GEMV, unpacking MXFP4 weights to E4M3 then dequantizing
     activation + weight per-element by their expanded group scales, reducing and accumulating into
@@ -958,7 +1135,7 @@ def mx_scalar_reduce(
     reduce the raw products within each group, then apply ONE combined (act × weight) scale per
     group — ``SCALE_GROUP_K``× fewer scale-muls. Measured ~18% faster on the decode reduce
     (the per-element expand was pure overhead), bit-identical to the expanded form (rel 1e-7)."""
-    wq = mxfp4_e2m1_to_e4m3(w) if VALUES_PER_BYTE == 2 else w
+    wq = mxfp4_e2m1_to_e4m3(w) if w.dtype == tl.uint8 else w
     NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
     prod = tl.trans(a.to(tl.float32)) * wq.to(tl.float32)  # [BK, ROWS_W]
     grp = tl.sum(
@@ -978,7 +1155,6 @@ def mx_compute(
     w,
     w_scale,
     COMPUTE_MODE: tl.constexpr,
-    VALUES_PER_BYTE: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -988,7 +1164,10 @@ def mx_compute(
     """Single-projection MMA step. Under ``SWAP_AB`` the swapped decode path runs (weight output rows
     in the MMA M dim — different acc shape/finalize; see ``mx_swap_compute``); otherwise dispatch on
     ``COMPUTE_MODE``: scaled-MMA on the raw weight (``w``), or fp8 ``tl.dot`` + per-group rescale /
-    scalar reduce on the E4M3-decoded weight. Single return — only the taken branch compiles."""
+    scalar reduce on the E4M3-decoded weight. Single return — only the taken branch compiles.
+    A ``uint8`` ``a`` tile is packed-E2M1 activations (W4A4, the dtype is the format) —
+    dot_scaled/no-swap only; ``mx_config_pruner`` fences the other arms (they would need an
+    A-side unpack)."""
     if SWAP_AB:
         acc = mx_swap_compute(
             acc,
@@ -997,15 +1176,14 @@ def mx_compute(
             w,
             w_scale,
             COMPUTE_MODE,
-            VALUES_PER_BYTE,
             BLOCK_SIZE_N,
             BLOCK_SIZE_K,
             SCALE_GROUP_K,
         )
     elif COMPUTE_MODE == "dot_scaled":
-        acc = mx_dot_scaled(acc, a, a_scale, w, w_scale, VALUES_PER_BYTE)
+        acc = mx_dot_scaled(acc, a, a_scale, w, w_scale)
     elif COMPUTE_MODE == "dot":
-        acc = mx_dot_rescale(acc, a, w, a_scale, w_scale, VALUES_PER_BYTE)
+        acc = mx_dot_rescale(acc, a, w, a_scale, w_scale)
     else:  # scalar
         acc = mx_scalar_reduce(
             acc,
@@ -1017,7 +1195,6 @@ def mx_compute(
             BLOCK_SIZE_N,
             BLOCK_SIZE_K,
             SCALE_GROUP_K,
-            VALUES_PER_BYTE,
         )
     return acc
 
@@ -1059,14 +1236,13 @@ def mx_dot_scaled_swapped(
     a_scale,
     w,
     w_scale,
-    VALUES_PER_BYTE: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
     """Swapped ``dot_scaled`` decode step: weight ``w`` [BN, BK] (E2M1 packed if MXFP4 else E4M3)
     is the MMA lhs (output rows in M); the activation is the N=16 rhs (col 0 real). ``acc`` is the
     persistent ``[BN, MMA_N_ATOM]`` MMA accumulator (accumulated across the K-loop, then the caller
     takes column 0) — NOT a fresh per-step init, which trips the sm_100 accumulator-init pass."""
-    fmt: tl.constexpr = "e2m1" if VALUES_PER_BYTE == 2 else "e4m3"
+    fmt: tl.constexpr = "e2m1" if w.dtype == tl.uint8 else "e4m3"
     rhs, asc = mx_dot_scaled_swapped_rhs(a, a_scale, BLOCK_SIZE_K)
     return tl.dot_scaled(w, w_scale, fmt, rhs, asc, "e4m3", acc)
 
@@ -1078,7 +1254,6 @@ def mx_dot_rescale_swapped(
     a_scale,
     w,
     w_scale,
-    VALUES_PER_BYTE: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
     """Swapped MX 'dot' step (BK == one scale group): weight output rows in the MMA M dim
@@ -1088,7 +1263,7 @@ def mx_dot_rescale_swapped(
     weight's per-output-row scale broadcasts down the acc columns, the token's group scale
     is a scalar. ``acc`` is the persistent ``[ROWS, MMA_N_ATOM]`` accumulator (col 0 taken
     by the caller's ``acc_finalize``)."""
-    if VALUES_PER_BYTE == 2:  # column-unpack E2M1 -> E4M3 (K order: low nibble first)
+    if w.dtype == tl.uint8:  # column-unpack E2M1 -> E4M3 (K order: low nibble first)
         wq = tl.interleave(_e2m1_code_to_f32(w & 0xF), _e2m1_code_to_f32(w >> 4)).to(
             tl.float8e4nv
         )
@@ -1110,13 +1285,12 @@ def mx_scalar_reduce_swapped(
     ROWS_W: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
-    VALUES_PER_BYTE: tl.constexpr,
 ):
     """Swapped scalar reduce: weight ``w`` output-rows-major ``[ROWS_W, BK]``, ``a`` the [BK]
     activation. No transpose (vs ``mx_scalar_reduce``); MXFP4 unpacks along columns (K). Per-group
     scale factored out of the reduce (grpscale). Reduces over K; returns ``acc + [1, ROWS_W]``."""
     NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
-    if VALUES_PER_BYTE == 2:  # column-unpack E2M1 -> f32, K-order via interleave
+    if w.dtype == tl.uint8:  # column-unpack E2M1 -> f32, K-order via interleave
         wq = tl.interleave(_e2m1_code_to_f32(w & 0xF), _e2m1_code_to_f32(w >> 4))
     else:
         wq = w.to(tl.float32)
@@ -1134,7 +1308,6 @@ def mx_swap_compute(
     w,
     w_scale,
     COMPUTE_MODE: tl.constexpr,
-    VALUES_PER_BYTE: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
@@ -1150,13 +1323,9 @@ def mx_swap_compute(
     a1 = tl.reshape(a, (BLOCK_SIZE_K,))
     as1 = tl.reshape(a_scale, (BLOCK_SIZE_K // SCALE_GROUP_K,))
     if COMPUTE_MODE == "dot_scaled":
-        acc = mx_dot_scaled_swapped(
-            acc, a1, as1, w, w_scale, VALUES_PER_BYTE, BLOCK_SIZE_K
-        )
+        acc = mx_dot_scaled_swapped(acc, a1, as1, w, w_scale, BLOCK_SIZE_K)
     elif COMPUTE_MODE == "dot":
-        acc = mx_dot_rescale_swapped(
-            acc, a1, as1, w, w_scale, VALUES_PER_BYTE, BLOCK_SIZE_K
-        )
+        acc = mx_dot_rescale_swapped(acc, a1, as1, w, w_scale, BLOCK_SIZE_K)
     elif COMPUTE_MODE == "scalar":
         acc = mx_scalar_reduce_swapped(
             acc,
@@ -1167,7 +1336,6 @@ def mx_swap_compute(
             BLOCK_SIZE_N,
             BLOCK_SIZE_K,
             SCALE_GROUP_K,
-            VALUES_PER_BYTE,
         )
     else:
         tl.static_assert(False, "unknown COMPUTE_MODE under SWAP_AB")
@@ -1357,40 +1525,83 @@ def _count_kernel(
 
 @dataclass(frozen=True)
 class Epilogue:
-    """Fused output transform of a grouped/batched GEMM (default = plain GEMM). ``gate`` loads
-    the weight as the stacked gate|up projection and applies the ``act_fn``/SwiGLU gated linear
-    unit; ``requant`` requantizes the intermediate, and the op then returns it plus its scale
-    tensor (a plain / ``requant=False`` op returns the single output). ``simulate_unfused``
-    rounds intermediates through the output dtype to match the separate-kernel path.
-    ``output_dtype`` is the output element type; ``None`` resolves in the op (``A.dtype`` for raw
-    activations, ``bfloat16`` when ``A`` is pre-quantized and ``A.dtype`` would be FP8). Under
-    ``requant`` the stored output is the recipe's FP8 format regardless — there ``output_dtype``
-    instead names the dtype the UNFUSED path lands intermediates in (the ``simulate_unfused``
-    rounding grid; the fused wrappers pass the hidden-states dtype, which the op could not
-    otherwise recover from an already-quantized ``A``). Row order
-    (gather/scatter) is NOT carried here — it is passed to the op as standalone
-    ``gather_idx``/``scatter_idx`` maps (``None`` = that side is already expert-ordered)."""
+    """Fused output TRANSFORM of a grouped/batched GEMM (default = plain GEMM) — pure math,
+    no quantization (that is ``Quantization``'s side). ``gate`` loads the weight as the
+    stacked gate|up projection and applies the ``act_fn``/SwiGLU gated linear unit.
+    ``simulate_unfused`` (test-only) rounds each fused intermediate through the output
+    dtype (the dispatchers' ``output_dtype`` argument, or its auto rule) to bit-match the
+    separate-kernel path. Row order (gather/scatter) is NOT carried here — it is passed
+    to the op as standalone ``gather_idx``/``scatter_idx`` maps."""
 
     gate: bool = False
     act_fn: str = "silu"
     swiglu_alpha: float | None = None
     swiglu_limit: float | None = None
-    requant: bool = False
     simulate_unfused: bool = False
-    output_dtype: torch.dtype | None = None
 
     def as_args(self) -> tuple:
-        """Flatten to the positional primitives the registered matmul ops take — torch custom
-        ops can't accept the dataclass itself."""
+        """Flatten to the transform primitives the registered matmul ops take (torch custom
+        ops can't accept the dataclass itself); the ops' bundles are ordered
+        ``(*Epilogue.as_args(), *Quantization.as_args(), output_dtype)``."""
         return (
             self.gate,
             self.act_fn,
             self.swiglu_alpha,
             self.swiglu_limit,
-            self.requant,
             self.simulate_unfused,
-            self.output_dtype,
         )
+
+
+@dataclass(frozen=True)
+class Quantization:
+    """How tensors are quantized at the op boundaries — a recipe name per side, validated
+    against the weight recipe (a mismatched name fails loudly at the op). ``None`` =
+    follow the weights: the recipe's default quant on the way in, a plain high-precision
+    store on the way out. A name means one format, identical on either side — an output
+    feeds a matching input as-is, and requantized outputs are bit-identical to quantizing
+    the same values offline. Pre-quantized activations are the ops' ``As`` parameter (its
+    dtype carries the format); the plain-store element type is the dispatchers'
+    ``output_dtype`` argument.
+
+    Support matrix (weight recipe → accepted names; default first):
+
+    ==================  =========================  =========================
+    weights             input_recipe               output_recipe
+    ==================  =========================  =========================
+    block-dynamic FP8   "fp8" (E4M3 +              "fp8" (E4M3 +
+                        per-block scales)          per-block scales)
+    tensor-wide FP8     "fp8" (E4M3 +              —
+                        per-token scales)
+    MXFP8 / MXFP4       "mxfp8" (E4M3 + UE8M0),    "mxfp8" (E4M3 + UE8M0),
+                        "mxfp4" (packed E2M1       "mxfp4" (packed E2M1
+                        + UE8M0)                   + UE8M0)
+    full-precision      —                          —
+    ==================  =========================  =========================
+
+    (—: tensor-wide's whole-row activation scale can't be formed by a tile-local
+    epilogue; the unfused path quantizes on the host between GEMMs.)"""
+
+    input_recipe: Literal["fp8", "mxfp8", "mxfp4"] | None = None
+    output_recipe: Literal["fp8", "mxfp8", "mxfp4"] | None = None
+
+    def __post_init__(self):
+        # catch typos at construction — the closest point to the user; the ops separately
+        # assert which of these THEIR recipe implements
+        assert self.input_recipe in (None, "fp8", "mxfp8", "mxfp4"), (
+            f"unknown input_recipe {self.input_recipe!r}; "
+            "expected None, 'fp8', 'mxfp8', or 'mxfp4'"
+        )
+        assert self.output_recipe in (None, "fp8", "mxfp8", "mxfp4"), (
+            f"unknown output_recipe {self.output_recipe!r}; "
+            "expected None, 'fp8', 'mxfp8', or 'mxfp4'"
+        )
+
+    def as_args(self) -> tuple:
+        """Flatten to the fields as-is — ``(input_recipe, output_recipe)``; the registered
+        ops interpret and validate them (each op knows which recipes it implements). The
+        ops' bundles are ordered ``(*Epilogue.as_args(), *Quantization.as_args(),
+        output_dtype)``."""
+        return (self.input_recipe, self.output_recipe)
 
 
 def resolve_output_dtype(
@@ -1610,6 +1821,29 @@ def weight_tile_descriptor(
     else:  # pointer
         descriptor = 0
     return descriptor
+
+
+@triton.jit
+def load_stacked_weight_tile(
+    w_ptrs,
+    w_descriptor,
+    row_off,
+    k_off,
+    N2: tl.constexpr,
+    KB: tl.constexpr,
+    GATE: tl.constexpr,
+    MEMORY_MODE: tl.constexpr,
+):
+    """One K-major weight K-tile for the plain-dot grouped loops: the explicit-pointer
+    tile (optionally the stacked gate|up form, flattened to the MMA rhs), or the
+    ``[BN, BK]`` descriptor box transposed to K-major (descriptor modes are GATE-fenced
+    — one box holds a single projection). Single return — only the taken arm compiles;
+    the caller advances ``w_ptrs`` and passes the descriptor offsets either way."""
+    if MEMORY_MODE == "pointer":
+        w = stacked_gate_up_flatten(tl.load(w_ptrs), N2, KB, GATE, False)
+    else:
+        w = tl.trans(w_descriptor.load([row_off, k_off]))
+    return w
 
 
 @triton.jit
@@ -1917,8 +2151,7 @@ def grouped_gemm_epilogue(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     GATE: tl.constexpr,
-    REQUANT: tl.constexpr,
-    REQUANT_FORMAT: tl.constexpr,
+    OUTPUT_RECIPE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     ACT_FN: tl.constexpr,
     SWIGLU_ALPHA: tl.constexpr,
@@ -1926,13 +2159,14 @@ def grouped_gemm_epilogue(
     SIMULATE_UNFUSED: tl.constexpr,
     INTERMEDIATE_DTYPE: tl.constexpr,
 ):
-    """Output epilogue of a grouped GEMM tile, gated by ``GATE``/``REQUANT``. Plain: cast +
-    scatter-store the accumulator (``store_tile``). ``GATE``: split the stacked gate|up
-    accumulator and apply the ``ACT_FN``/SwiGLU ``glu`` (``split_gate_up_glu``); ``REQUANT``
-    then requantizes the intermediate into ``C`` + ``Cs`` per ``REQUANT_FORMAT`` — ``"fp8"``
-    (per-row scale, ``Cs`` is ``[S, N//BN]``) or ``"mx"`` (UE8M0 group-``SCALE_GROUP_K`` scale,
-    ``Cs`` is ``[S, N//SCALE_GROUP_K]``) — else stores the GLU intermediate. Every arm is
-    constexpr-pruned; plain leaves the accumulator untouched."""
+    """Output epilogue of a grouped GEMM tile. Plain: cast + scatter-store the
+    accumulator (``store_tile``). ``GATE``: split the stacked gate|up accumulator and
+    apply the ``ACT_FN``/SwiGLU ``glu`` (``split_gate_up_glu``); ``OUTPUT_RECIPE`` — the
+    same vocabulary as ``Quantization`` — then requantizes the intermediate into ``C`` +
+    ``Cs``: ``"fp8"`` (per-row scale, ``Cs`` is ``[S, N//BN]``), ``"mxfp8"`` / ``"mxfp4"``
+    (UE8M0 group-``SCALE_GROUP_K`` scale, ``Cs`` is ``[S, N//SCALE_GROUP_K]``; ``"mxfp4"``
+    packs nibble pairs so ``C`` is ``[S, N//2]``); ``None`` stores the GLU intermediate.
+    Every arm is constexpr-pruned; plain leaves the accumulator untouched."""
     if GATE:
         out = split_gate_up_glu(
             acc,
@@ -1946,26 +2180,34 @@ def grouped_gemm_epilogue(
             SIMULATE_UNFUSED,
             INTERMEDIATE_DTYPE,
         )
-        if REQUANT:
+        if OUTPUT_RECIPE == "fp8":
             c_ptrs = C + out_row[:, None] * stride_c_m + offs_bn[None, :] * stride_c_n
-            if REQUANT_FORMAT == "mx":
-                q, q_s = mxfp_act_quant_inline(
-                    out, BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K
-                )
-                tl.store(c_ptrs, q, mask=row_mask[:, None])
-                offs_sc = pid_n * (BLOCK_SIZE_N // SCALE_GROUP_K) + tl.arange(
-                    0, BLOCK_SIZE_N // SCALE_GROUP_K
-                )
-                sc_ptrs = (
-                    Cs + out_row[:, None] * stride_cs_m + offs_sc[None, :] * stride_cs_n
-                )
-                tl.store(sc_ptrs, q_s, mask=row_mask[:, None])
-            else:
-                q, q_s = fp8_act_quant_inline(out)
-                tl.store(c_ptrs, q, mask=row_mask[:, None])
-                tl.store(
-                    Cs + out_row * stride_cs_m + pid_n * stride_cs_n, q_s, mask=row_mask
-                )
+            q, q_s = fp8_act_quant_inline(out)
+            tl.store(c_ptrs, q, mask=row_mask[:, None])
+            tl.store(
+                Cs + out_row * stride_cs_m + pid_n * stride_cs_n, q_s, mask=row_mask
+            )
+        elif OUTPUT_RECIPE is not None:  # "mxfp8" | "mxfp4"
+            q, q_s = mxfp_act_quant_inline(
+                out, BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_RECIPE
+            )
+            width: tl.constexpr = (
+                BLOCK_SIZE_N // 2 if OUTPUT_RECIPE == "mxfp4" else BLOCK_SIZE_N
+            )
+            offs_c = pid_n * width + tl.arange(0, width)
+            tl.store(
+                C + out_row[:, None] * stride_c_m + offs_c[None, :] * stride_c_n,
+                q,
+                mask=row_mask[:, None],
+            )
+            offs_sc = pid_n * (BLOCK_SIZE_N // SCALE_GROUP_K) + tl.arange(
+                0, BLOCK_SIZE_N // SCALE_GROUP_K
+            )
+            tl.store(
+                Cs + out_row[:, None] * stride_cs_m + offs_sc[None, :] * stride_cs_n,
+                q_s,
+                mask=row_mask[:, None],
+            )
         else:
             store_tile(C, out, out_row, offs_bn, row_mask, stride_c_m, stride_c_n)
     else:
@@ -2092,6 +2334,39 @@ def mxfp_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
         )
     return y, s
+
+
+# E2M1 (FP4) grid: magnitudes by 3-bit code, and the midpoints that round |x| onto them
+E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+E2M1_ROUND_BOUNDARIES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+
+
+def mxfp4_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``(T, K)`` activations to MXFP4: packed-E2M1 values (``(T, K//2)`` int8,
+    two codes per byte, first value in the low nibble) + UE8M0 group-32 uint8 scales
+    (``(T, K//32)``, amax/6 rounded up to a power of two — 6 is E2M1's largest magnitude).
+    The pair feeds the W4A4 arm of the MX matmul ops (``ACT_VALUES_PER_BYTE=2``, native
+    ``kind::mxf4`` MMA). Host-side torch; quantizing activations to fp4 at runtime is an
+    accuracy call the caller owns — the ops never do it implicitly."""
+    T, K = x.shape
+    assert K % (2 * MX_SCALE_GROUP_K) == 0, (
+        f"K (={K}) must be a multiple of {2 * MX_SCALE_GROUP_K} to pack E2M1 pairs"
+    )
+    groups = x.float().reshape(T, K // MX_SCALE_GROUP_K, MX_SCALE_GROUP_K)
+    amax = groups.abs().amax(dim=-1)
+    # amax/6 ceil'd to a power of two via the exponent-bump bit trick — the SAME math as
+    # ``mxfp_act_quant_inline``'s "mxfp4" arm so the fused requant and this host form are bit-identical
+    bits = (amax / 6.0).view(torch.int32)
+    exp_ceil = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    exp_ceil = exp_ceil.clamp(1, 254)
+    exp_ceil = torch.where(amax == 0, torch.full_like(exp_ceil, 127), exp_ceil)
+    scales = exp_ceil.to(torch.uint8)
+    scaled = groups / torch.pow(2.0, exp_ceil.float() - 127.0)[..., None]
+    boundaries = torch.tensor(E2M1_ROUND_BOUNDARIES, device=x.device)
+    codes = torch.bucketize(scaled.abs().reshape(T, K), boundaries).to(torch.uint8)
+    codes |= (scaled.reshape(T, K) < 0).to(torch.uint8) << 3  # sign bit
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).view(torch.int8)
+    return packed, scales
 
 
 @bayesian_autotune(

@@ -7,13 +7,7 @@ from .moe import (
     moe_unfused_batched,
     moe_unfused_grouped,
 )
-from .utils import (
-    Epilogue,
-    compute_grouped_scheduling,
-    fp8_act_quant_tensor_wide,
-    fp8_act_quant_block_dynamic,
-    mxfp_act_quant,
-)
+from .utils import Epilogue, Quantization, compute_grouped_scheduling
 
 __all__ = [
     # 2D matmul
@@ -27,9 +21,7 @@ __all__ = [
     "moe_fused_grouped",
     "moe_unfused_grouped",
     "compute_grouped_scheduling",
-    # Epilogue bundle + host GLU + caller-side activation quant
+    # Configs
     "Epilogue",
-    "fp8_act_quant_tensor_wide",
-    "fp8_act_quant_block_dynamic",
-    "mxfp_act_quant",
+    "Quantization",
 ]

@@ -28,6 +28,7 @@ from .utils import (
     UE8M0_SCALE_DTYPES,
     acc_init,
     mx_config_pruner,
+    smem_pruner,
     block_scaled_fp8_dot,
     scalar_max_m_pruner,
     block_k_within_k_pruner,
@@ -382,17 +383,20 @@ def w8a8_block_static_fp8_matmul_kernel(
         compute_modes=("dot_scaled", "dot", "scalar"),
         tune_block_m=True,
     ),
-    # VALUES_PER_BYTE keys the MXFP4/MXFP8 split so a cached winner is only reused for its packing;
+    # the MXFP4/MXFP8 split keys itself — the tuner appends every tensor arg's dtype to
+    # its cache key (memory and disk);
     # m_bit_length (log2 M bucket) keys the M tile — the winner keeps shifting with M well past the
     # BM ceiling and it is NOT noise: cross-applying configs (N=K=4096) costs +62% at M=128 and +245%
     # at M=4096 (the thin M=128 tile can't saturate the wide GEMM), so don't collapse the buckets.
-    ["N", "K", "m_bit_length", "VALUES_PER_BYTE"],
+    ["N", "K", "m_bit_length"],
     n_trials=100,
     # BK-within-K veto (the loop loads are unmasked) + the sm_10x dot_scaled shape guards
     # + scalar restricted to decode-sized M (a BM=1 GEVM at prefill is TPE poison).
     prune_configs_by={
         "early_config_prune": compose_pruners(
-            mx_config_pruner("K"), scalar_max_m_pruner("M")
+            mx_config_pruner("K"),
+            scalar_max_m_pruner("M"),
+            smem_pruner(),
         )
     },
 )
@@ -423,19 +427,18 @@ def mxfp_dynamic_matmul_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-    VALUES_PER_BYTE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
 ):
-    """Unified MXFP4/MXFP8 (W4A8/W8A8) GEMM.
+    """Unified MXFP4/MXFP8 (W4A8/W8A8; a ``uint8`` ``A`` is packed E2M1 — W4A4) GEMM.
 
     ``C = A @ B.T``. ``A``'s dtype picks the activation form (compile-time folded):
     pre-quantized E4M3 + UE8M0 group-32 scales (one wrapper pass — the inline
     per-N-tile quant re-ran N//BN times per element, ~2x at prefill) vs raw bf16/fp16
     quantized inline (small M: the GEMM is weight-bandwidth-bound with idle ALU, so
     inline is free and a separate quant kernel only adds latency; both forms are
-    bit-exact, same group-32 boundaries). ``VALUES_PER_BYTE`` picks the weight format:
-    2 = packed E2M1 (MXFP4), 1 = unpacked E4M3 (MXFP8). ``COMPUTE_MODE`` picks the MMA:
+    bit-exact, same group-32 boundaries). Each operand's format is its dtype (``uint8``
+    = packed E2M1, two values per byte; else E4M3). ``COMPUTE_MODE`` picks the MMA:
     ``tl.dot_scaled`` (native M=128 scaled MMA) vs fp8 ``tl.dot`` + per-group software
     rescale (wins at decode; FP4 unpacks E2M1->E4M3 first — lossless). 2D grid with
     swizzle for L2 reuse.
@@ -443,9 +446,14 @@ def mxfp_dynamic_matmul_kernel(
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
     )
-    offs_kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
+    # uint8 A = packed-E2M1 activations (W4A4 — the dtype IS the activation format);
+    # the 2D op currently always passes raw/E4M3, so this folds to 1 there.
+    ACT_VALUES_PER_BYTE: tl.constexpr = 2 if A.dtype.element_ty == tl.uint8 else 1
+    WEIGHT_VALUES_PER_BYTE: tl.constexpr = 2 if B.dtype.element_ty == tl.uint8 else 1
+    offs_ka = tl.arange(0, BLOCK_SIZE_K // ACT_VALUES_PER_BYTE)
+    offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
-    a_ptrs = A + (offs_am[:, None] * stride_a_m + offs_k[None, :] * stride_a_k)
+    a_ptrs = A + (offs_am[:, None] * stride_a_m + offs_ka[None, :] * stride_a_k)
     as_ptrs = As + offs_am[:, None] * stride_as_m + offs_sf[None, :]
     b_ptrs = B + (offs_kb[:, None] * stride_b_k + offs_bn[None, :] * stride_b_n)
     bs_ptrs = Bs + (offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k)
@@ -464,15 +472,14 @@ def mxfp_dynamic_matmul_kernel(
             b,
             b_s,
             COMPUTE_MODE,
-            VALUES_PER_BYTE,
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
             BLOCK_SIZE_K,
             SCALE_GROUP_K,
         )
-        a_ptrs += BLOCK_SIZE_K * stride_a_k
+        a_ptrs += (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k
         as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
-        b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_b_k
+        b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
     store_masked(
@@ -762,13 +769,13 @@ def mxfp_dynamic_matmul(
     )
     assert A.is_contiguous(), "A must be contiguous"
     assert B.is_contiguous(), "B must be contiguous"
-    VALUES_PER_BYTE = NIBBLES_PER_BYTE if B.dtype == torch.int8 else 1
+    WEIGHT_VALUES_PER_BYTE = NIBBLES_PER_BYTE if B.dtype == torch.int8 else 1
 
     N, K_b = B.shape
     K = A.shape[-1]
     M = A.numel() // K
-    assert K == VALUES_PER_BYTE * K_b, (
-        f"K (={K}) must equal {VALUES_PER_BYTE} * B.shape[1] (={K_b})"
+    assert K == WEIGHT_VALUES_PER_BYTE * K_b, (
+        f"K (={K}) must equal {WEIGHT_VALUES_PER_BYTE} * B.shape[1] (={K_b})"
     )
     assert K % MX_SCALE_GROUP_K == 0, (
         f"K (={K}) must be a multiple of {MX_SCALE_GROUP_K}"
@@ -813,7 +820,6 @@ def mxfp_dynamic_matmul(
             C.stride(-2),
             C.stride(-1),
             GROUP_SIZE_M=GROUP_SIZE_M,
-            VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
         )
     return C

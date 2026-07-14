@@ -148,6 +148,43 @@ def test_autotuner_survives_and_reports_failing_configs(caplog):
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+def test_failed_configs_do_not_consume_trial_budget():
+    """A config that fails to compile is skipped as if the trial never happened — the
+    budget counts MEASURED configs (failures already sat outside the TPE densities;
+    before this they still ate trial slots, wasting up to half the budget on grids
+    where many rows cannot fit shared memory)."""
+
+    @bayesian_autotune(
+        [
+            triton.Config({"BLOCK": 64, "BAD": True}, num_warps=4),
+            triton.Config({"BLOCK": 64, "BAD": False}, num_warps=4),
+            triton.Config({"BLOCK": 128, "BAD": False}, num_warps=4),
+            triton.Config({"BLOCK": 32, "BAD": False}, num_warps=4),
+        ],
+        ["N"],
+        n_trials=3,  # < grid size -> bayesian path; must yield 3 MEASURED configs
+        n_startup_trials=2,
+        cache_results=False,
+    )
+    @triton.jit
+    def _budget_kernel(X, Y, N, BLOCK: tl.constexpr, BAD: tl.constexpr):
+        offs = tl.arange(0, BLOCK)
+        if BAD:
+            offs = offs + tl.arange(0, 3)  # non-power-of-2 arange -> CompilationError
+        tl.store(Y + offs, tl.load(X + offs, mask=offs < N), mask=offs < N)
+
+    x = torch.randn(32, device="cuda")
+    y = torch.empty_like(x)
+    _budget_kernel[(1,)](x, y, 32)
+    torch.cuda.synchronize()
+    measured = [
+        ms for ms in _budget_kernel.configs_timings.values() if ms != float("inf")
+    ]
+    assert len(measured) == 3, _budget_kernel.configs_timings
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
 def test_act_quant_arms_are_bit_equal():
     """The inline and offline activation-quant arms must produce IDENTICAL bits — the
     dtype-branched kernels rely on it (same scale-group boundaries by construction)."""
@@ -186,9 +223,8 @@ def test_cross_process_determinism_block_dynamic_grouped():
         "eids=torch.randint(0,E,(S,),device='cuda',dtype=torch.int32)\n"
         "est,gi,si=fg.compute_grouped_scheduling(eids,E,1)\n"
         "A=torch.randn(S,K,device='cuda',dtype=torch.bfloat16)\n"
-        "Aq,As=fg.fp8_act_quant_block_dynamic(A,128)\n"
         "B,Bs=make_weights(N,K,'cuda',[128,128],num_experts=E)\n"
-        "out=fg.matmul_grouped(Aq,As,B,Bs,est,[128,128],epilogue=fg.Epilogue(output_dtype=torch.float32),gather_idx=gi,scatter_idx=si)\n"
+        "out=fg.matmul_grouped(A,B,Bs=Bs,expert_start=est,output_dtype=torch.float32,gather_idx=gi,scatter_idx=si)\n"
         "print(out.double().sum().item())\n"
     )
     sums = {

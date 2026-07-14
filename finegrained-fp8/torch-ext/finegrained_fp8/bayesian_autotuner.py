@@ -216,7 +216,10 @@ class BayesianAutotuner(Autotuner):
         # evidence about that one joint shape (usually shared memory), not about its dimension
         # values — counting them as "bad" buried SWAP_AB under a wall of BN=256 smem failures
         # and made the tuner ship a 53µs winner while the 41µs swap config sat unbenched.
-        while len(timings) < self.n_trials:
+        # They don't consume the trial budget either (n_trials = MEASURED configs; a failure
+        # stays in ``timings`` only as a skip-list entry) — the compile it burned is the one
+        # cost that can't be refunded here, which is what the smem/compile-guard pruners avoid.
+        while sum(1 for t in timings.values() if t != float("inf")) < self.n_trials:
             ranked = sorted(
                 (i for i, t in timings.items() if t != float("inf")), key=timings.get
             )
@@ -440,7 +443,8 @@ def bayesian_autotune(
     **kwargs,
 ):
     """Decorator mirroring ``@triton.autotune``. Extra kwargs:
-    n_trials:                 total configs benched per key (TPE budget)
+    n_trials:                 successfully measured configs per key (TPE budget; configs
+                              that fail to compile/run are skipped without consuming it)
     n_startup_trials:         random seed configs before the TPE model kicks in
     gamma:                    top fraction of measured configs treated as "good"
     refine, max_refine_iters: coordinate-descent refinement after the TPE

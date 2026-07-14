@@ -23,6 +23,8 @@ from .utils import (
     compile_time_only_triton_op,
     compile_time_only_triton_wrap,
     Epilogue,
+    Quantization,
+    mxfp4_act_quant,
     FP8_DTYPE,
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
@@ -36,7 +38,9 @@ from .utils import (
     acc_init,
     fp8_dot,
     mx_config_pruner,
+    smem_pruner,
     block_k_within_k_pruner,
+    compose_pruners,
     acc_finalize,
     glu,
     split_gate_up_glu,
@@ -49,7 +53,7 @@ from .utils import (
     load_block_fp8_act_tile,
     get_accelerator_autotuning_configs,
     is_mxfp,
-    is_tensor_wide,
+    weight_block_size,
     e2m1_as_uint8,
     ue8m0_as_uint8,
 )
@@ -130,8 +134,8 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     As,  # (S, K // BLOCK_SIZE_K) fp32 per-row, per-K-block activation scales
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
-    C,  # (S, N) output; under REQUANT the FP8-requantized intermediate
-    Cs,  # (S, N // BLOCK_SIZE_N) per-(row, N-tile) output scale; written iff REQUANT
+    C,  # (S, N) output; under an OUTPUT_RECIPE the FP8-requantized intermediate
+    Cs,  # (S, N // BLOCK_SIZE_N) per-(row, block) output scale; written iff OUTPUT_RECIPE
     ExpertIds,  # (S,) — which expert each batch element routes to
     GatherIdx,  # (S,) int — batch_id -> source row of A; read iff HAS_GATHER
     ScatterIdx,  # (S,) int — batch_id -> destination row of C; read iff HAS_SCATTER
@@ -167,7 +171,8 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
-    REQUANT: tl.constexpr = False,
+    # the output recipe name, same vocabulary as Quantization (None | "fp8")
+    OUTPUT_RECIPE: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
 ):
@@ -183,7 +188,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 
     ``GATE`` fuses the gate|up projection: ``B`` is the ``(E, 2N, K)`` stack (gate rows [0,N),
     up rows [N,2N)), run as two dots (the decode-validated form), SwiGLU-combined, and — under
-    ``REQUANT`` — FP8-requantized into ``C`` + a per-(row, N-tile) scalar ``Cs``. Every gate arm
+    an ``OUTPUT_RECIPE`` — FP8-requantized into ``C`` + a per-(row, block) scalar ``Cs``. Every gate arm
     folds out at compile time; ``GATE=False`` is the plain GEMM, bit-identical."""
     batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row = expert_setup(
         A,
@@ -267,7 +272,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
             SIMULATE_UNFUSED,
             INTERMEDIATE_DTYPE,
         )
-        if REQUANT:
+        if OUTPUT_RECIPE is not None:
             inter, inter_s = fp8_act_quant_inline(intermediate)
             store_row(C, inter, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
             tl.store(Cs + out_row * stride_cs_m + pid_n * stride_cs_n, tl.max(inter_s))
@@ -367,7 +372,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     store_row(C, accumulator, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
-# VALUES_PER_BYTE keys the MXFP4/MXFP8 split so a cached winner is only reused for its packing.
+# The MXFP4/MXFP8 (and packed-activation) splits key themselves — the tuner appends every
+# tensor arg's dtype to its cache key (memory and disk).
 # BLOCK_SIZE_M is always 1 here (per-token decode), so — like the fused MXFP batched kernels —
 # dot is excluded — MEASURED TWICE (2026-07-10): no-swap BM16 within noise of the
 # scalar/dot_scaled-swap champions, and fielding it WITH the swapped form
@@ -381,11 +387,15 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
         compute_modes=("dot_scaled", "scalar"),
         swap_ab=True,
     ),
-    ["N", "K", "S", "VALUES_PER_BYTE"],
+    ["N", "K", "S"],
     n_trials=100,
     # BK-within-K + the sm_10x MMA-shape guards (swapped dot_scaled needs BN >= 128 for the
     # native scaled-MMA; smaller-BN swap configs never win and mislead the TPE).
-    prune_configs_by={"early_config_prune": mx_config_pruner("K")},
+    prune_configs_by={
+        "early_config_prune": compose_pruners(
+            mx_config_pruner("K"), smem_pruner()
+        )
+    },
 )
 @triton.jit
 def mxfp_dynamic_matmul_batched_kernel(
@@ -393,8 +403,8 @@ def mxfp_dynamic_matmul_batched_kernel(
     As,  # (S, K // SCALE_GROUP_K) UE8M0 act scales; read iff PRE_QUANTIZED
     B,  # (num_experts, N, K[/2]); under GATE the (num_experts, 2N, K[/2]) gate|up stack
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) UE8M0 weight scales (2N under GATE)
-    C,  # (S, N) output; under REQUANT the MX-requantized intermediate
-    Cs,  # (S, N // SCALE_GROUP_K) UE8M0 output scale; written iff REQUANT
+    C,  # (S, N[/2]) output; under an OUTPUT_RECIPE the MX-requantized intermediate
+    Cs,  # (S, N // SCALE_GROUP_K) UE8M0 output scale; written iff OUTPUT_RECIPE
     ExpertIds,  # (S,) — which expert each routed row uses
     GatherIdx,  # (S,) int — batch_id -> source row of A; read iff HAS_GATHER
     ScatterIdx,  # (S,) int — batch_id -> destination row of C; read iff HAS_SCATTER
@@ -422,7 +432,6 @@ def mxfp_dynamic_matmul_batched_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    VALUES_PER_BYTE: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
     SWAP_AB: tl.constexpr = False,
@@ -433,7 +442,8 @@ def mxfp_dynamic_matmul_batched_kernel(
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
-    REQUANT: tl.constexpr = False,
+    # the output recipe name, same vocabulary as Quantization (None | "mxfp8" | "mxfp4")
+    OUTPUT_RECIPE: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     # PRE_QUANTIZED: A is E4M3 + As UE8M0 (the down reading a requantized intermediate); else
@@ -443,7 +453,7 @@ def mxfp_dynamic_matmul_batched_kernel(
     """Unified batched MXFP4/MXFP8 (W4A8/W8A8) expert matmul with fused act quant.
 
     One routed row + one N-tile per program; expert looked up from ``ExpertIds``. ``A`` is
-    quantized to E4M3 per K-group inline (UE8M0 scale). ``VALUES_PER_BYTE`` picks the
+    quantized to E4M3 per K-group inline (UE8M0 scale). The weight dtype picks the
     weight format (2 = packed E2M1 / MXFP4, 1 = unpacked E4M3 / MXFP8); ``COMPUTE_MODE``
     picks ``tl.dot_scaled`` (native M=128) vs the scalar CUDA-core reduce (wins at decode).
 
@@ -471,12 +481,16 @@ def mxfp_dynamic_matmul_batched_kernel(
     if expert_id >= num_experts:
         return
 
+    # each operand's format is its dtype: uint8 = packed E2M1 (two values per byte, W4A4
+    # for A / MXFP4 for B — it also keys the autotune cache), else E4M3
+    ACT_VALUES_PER_BYTE: tl.constexpr = 2 if A.dtype.element_ty == tl.uint8 else 1
+    WEIGHT_VALUES_PER_BYTE: tl.constexpr = 2 if B.dtype.element_ty == tl.uint8 else 1
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    offs_kb = tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)
+    offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
-    a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_a_k
+    offs_ka = tl.arange(0, BLOCK_SIZE_K // ACT_VALUES_PER_BYTE)
+    a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_ka[None, :] * stride_a_k
     as_ptrs = (
         As
         + in_row * stride_as_m
@@ -508,7 +522,7 @@ def mxfp_dynamic_matmul_batched_kernel(
                 a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
             )
         b = stacked_gate_up_flatten(
-            tl.load(b_ptrs), 2 * BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE, GATE, SWAP_AB
+            tl.load(b_ptrs), 2 * BLOCK_SIZE_N, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE, GATE, SWAP_AB
         )
         b_s = tl.reshape(
             tl.load(bs_ptrs), (n_width, BLOCK_SIZE_K // SCALE_GROUP_K)
@@ -520,15 +534,14 @@ def mxfp_dynamic_matmul_batched_kernel(
             b,
             b_s,
             COMPUTE_MODE,
-            VALUES_PER_BYTE,
             BLOCK_SIZE_M,
             n_width,
             BLOCK_SIZE_K,
             SCALE_GROUP_K,
             SWAP_AB,
         )
-        a_ptrs += BLOCK_SIZE_K * stride_a_k
-        b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_b_k
+        a_ptrs += (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k
+        b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
     if GATE:
@@ -544,11 +557,15 @@ def mxfp_dynamic_matmul_batched_kernel(
             SIMULATE_UNFUSED,
             INTERMEDIATE_DTYPE,
         )
-        if REQUANT:
+        if OUTPUT_RECIPE is not None:
             inter, inter_scale = mxfp_act_quant_inline(
-                intermediate, BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K
+                intermediate, BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_RECIPE
             )
-            store_row(C, inter, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
+            # "mxfp4" packs nibble pairs along N, halving the stored width
+            width: tl.constexpr = (
+                BLOCK_SIZE_N // 2 if OUTPUT_RECIPE == "mxfp4" else BLOCK_SIZE_N
+            )
+            store_row(C, inter, pid_n, stride_c_n, BLOCK_SIZE_M, width)
             offs_sc = pid_n * (BLOCK_SIZE_N // SCALE_GROUP_K) + tl.arange(
                 0, BLOCK_SIZE_N // SCALE_GROUP_K
             )
@@ -690,8 +707,9 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
-    requant: bool = False,
     simulate_unfused: bool = False,
+    input_recipe: str | None = None,
+    output_recipe: str | None = None,
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
@@ -740,6 +758,18 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     # of the (S x N-tiles) grid, and block-FP8 quant is an fp32 amax+div per element, so
     # the redundant work outweighs the extra launch down to T=1 (inline only edges ahead
     # near T=64). UE8M0 quant is ~free per pass, which is why the MX kernels do it inline.
+    assert input_recipe in (None, "fp8"), (
+        f"block-dynamic activations are E4M3 ('fp8'), got {input_recipe!r}"
+    )
+    assert output_recipe in (None, "fp8"), (
+        f"the block-dynamic recipe requantizes to 'fp8', got {output_recipe!r}"
+    )
+    requant = output_recipe is not None
+    # the requantized intermediate's scale groups follow gate_up's block_n, and the
+    # down consumes per-block_k — a non-square block recipe would misalign them
+    assert not requant or block_size[0] == block_size[1], (
+        f"the fused 'fp8' requant needs square quant blocks, got {block_size}"
+    )
     # A raw (As is None) -> quantize here (offline); else pre-quantized (As given, e.g. the
     # requantized intermediate handed to the down projection).
     if As is None:
@@ -751,7 +781,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
         Cs = torch.empty(S, N // block_n, device=A.device, dtype=torch.float32)
     else:
         C = A.new_empty(S, N, dtype=output_dtype)
-        Cs = expert_ids  # general dummy pointer; unread (REQUANT=False), strides literal
+        Cs = expert_ids  # general dummy pointer; unread (no OUTPUT_RECIPE), strides literal
 
     grid = (S, triton.cdiv(N, block_n))
 
@@ -794,7 +824,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
-            REQUANT=requant,
+            OUTPUT_RECIPE=output_recipe,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
         )
@@ -905,8 +935,9 @@ def mxfp_dynamic_matmul_batched(
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
-    requant: bool = False,
     simulate_unfused: bool = False,
+    input_recipe: str | None = None,
+    output_recipe: str | None = None,
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
@@ -928,6 +959,17 @@ def mxfp_dynamic_matmul_batched(
     # A raw (As None) -> quantized inline in the kernel (decode-free UE8M0); pre-quantized
     # (As given, e.g. the down reading a requantized intermediate) -> loaded via the kernel's
     # PRE_QUANTIZED branch.
+    assert input_recipe in (None, "mxfp8", "mxfp4"), (
+        f"MX activations are E4M3 ('mxfp8', the default) or packed E2M1 ('mxfp4'), "
+        f"got {input_recipe!r}"
+    )
+    assert output_recipe in (None, "mxfp8", "mxfp4"), (
+        f"MX recipes requantize to 'mxfp8' or packed 'mxfp4', got {output_recipe!r}"
+    )
+    requant = output_recipe is not None
+    # 'mxfp4' packs raw input to E2M1 offline — there is no inline fp4 quant arm.
+    if input_recipe == "mxfp4" and As is None:
+        A, As = mxfp4_act_quant(A)
     pre_quantized = As is not None
     assert B.dtype in (torch.int8, torch.float8_e4m3fn), (
         f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
@@ -935,16 +977,21 @@ def mxfp_dynamic_matmul_batched(
     assert Bs.dtype in UE8M0_SCALE_DTYPES, (
         f"Bs must be float8_e8m0fnu or uint8 (UE8M0), got {Bs.dtype}"
     )
-    VALUES_PER_BYTE = NIBBLES_PER_BYTE if B.dtype == torch.int8 else 1
+    WEIGHT_VALUES_PER_BYTE = NIBBLES_PER_BYTE if B.dtype == torch.int8 else 1
+    # int8 A = caller-provided packed-E2M1 activations (W4A4, native mxf4 MMA): K is two
+    # values per stored byte and the scales are mandatory (nothing left to quantize).
+    ACT_VALUES_PER_BYTE = NIBBLES_PER_BYTE if A.dtype == torch.int8 else 1
+    if ACT_VALUES_PER_BYTE == NIBBLES_PER_BYTE:
+        assert As is not None, "packed-E2M1 activations need their UE8M0 scales (As)"
 
     output_dtype = resolve_output_dtype(output_dtype, A, As)
-    K = A.shape[1]
+    K = A.shape[1] * ACT_VALUES_PER_BYTE
     S = expert_ids.shape[0]
     # Under a gate epilogue B is the (E, 2N, K) gate|up stack — N is the per-projection width.
     num_experts, n_rows, K_b = B.shape
     N = n_rows // 2 if gate else n_rows
-    assert K == VALUES_PER_BYTE * K_b, (
-        f"K (={K}) must equal {VALUES_PER_BYTE} * B.shape[2] (={K_b})"
+    assert K == WEIGHT_VALUES_PER_BYTE * K_b, (
+        f"K (={K}) must equal {WEIGHT_VALUES_PER_BYTE} * B.shape[2] (={K_b})"
     )
     assert K % MX_SCALE_GROUP_K == 0, (
         f"K (={K}) must be a multiple of {MX_SCALE_GROUP_K}"
@@ -953,14 +1000,24 @@ def mxfp_dynamic_matmul_batched(
         f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {n_rows}, {K // MX_SCALE_GROUP_K})"
     )
 
+    A = e2m1_as_uint8(A)
+    if As is not None:
+        As = ue8m0_as_uint8(As)
     B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
-    if requant:
+    if output_recipe == "mxfp4":
+        # packed E2M1 intermediate (nibble pairs along N) + UE8M0 scales — feeds a W4A4 down as-is
+        assert N % (2 * MX_SCALE_GROUP_K) == 0, (
+            f"N (={N}) must be a multiple of {2 * MX_SCALE_GROUP_K} to pack E2M1 pairs"
+        )
+        C = A.new_empty((S, N // 2), dtype=torch.int8)
+        Cs = torch.empty(S, N // MX_SCALE_GROUP_K, device=A.device, dtype=torch.uint8)
+    elif requant:
         C = A.new_empty((S, N), dtype=FP8_DTYPE)
         Cs = torch.empty(S, N // MX_SCALE_GROUP_K, device=A.device, dtype=torch.uint8)
     else:
         C = A.new_empty((S, N), dtype=output_dtype)
-        Cs = expert_ids  # general dummy pointer; unread (REQUANT=False), strides literal
+        Cs = expert_ids  # general dummy pointer; unread (no OUTPUT_RECIPE), strides literal
 
     def grid(META):
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
@@ -994,7 +1051,6 @@ def mxfp_dynamic_matmul_batched(
             Cs.stride(0) if requant else 1,
             Cs.stride(1) if requant else 1,
             expert_ids.stride(0),
-            VALUES_PER_BYTE=VALUES_PER_BYTE,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
             num_experts=num_experts,
             PRE_QUANTIZED=pre_quantized,
@@ -1004,7 +1060,7 @@ def mxfp_dynamic_matmul_batched(
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
-            REQUANT=requant,
+            OUTPUT_RECIPE=output_recipe,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
         )
@@ -1022,8 +1078,9 @@ def full_precision_matmul_batched(
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
-    requant: bool = False,
     simulate_unfused: bool = False,
+    input_recipe: str | None = None,
+    output_recipe: str | None = None,
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
@@ -1047,7 +1104,9 @@ def full_precision_matmul_batched(
     assert A.dtype == B.dtype and A.dtype in (torch.bfloat16, torch.float16), (
         f"full-precision path needs matching BF16/FP16 A and B, got {A.dtype} / {B.dtype}"
     )
-    assert not requant, "requant is meaningless on the full-precision path (no quantized recipe)"
+    assert input_recipe is None and output_recipe is None, (
+        "the full-precision path quantizes nothing — no input or output recipe applies"
+    )
 
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     K = A.shape[1]
@@ -1095,56 +1154,67 @@ def full_precision_matmul_batched(
 
 def matmul_batched(
     A: torch.Tensor,
-    As: torch.Tensor | None,
     B: torch.Tensor,
-    Bs: torch.Tensor | None,
+    As: torch.Tensor | None = None,
+    Bs: torch.Tensor | None = None,
+    *,
     expert_ids: torch.Tensor,
-    block_size: list[int] | None = None,
     epilogue: Epilogue | None = None,
+    quantization: Quantization | None = None,
+    output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Batched matmul dispatcher (W8A8 FP8, W4A8 FP4, or full-precision). Routes one program per routed
-    row (``expert_ids`` gives its expert). ``A`` may be raw (``As`` None) — the op quantizes it
-    itself (offline for bd/tensor, inline for mx) — or pre-quantized (``As`` given, e.g. a
-    requantized intermediate handed to the down projection). ``epilogue`` optionally fuses the
-    gate|up projection and carries ``output_dtype`` (see ``Epilogue``); under a requant epilogue
-    the return is the requantized output plus its scale tensor. Gate|up fusion is block-dynamic
-    and MX only. ``gather_idx``/``scatter_idx`` (each None or a ``(S,)`` map) address the source
-    row of ``A`` / destination row of ``C`` per program — None means row ``s``; the gather lets
-    the gate_up read unexpanded activations (source row ``s // num_top_k``) with no copy.
+    """Batched matmul dispatcher (W8A8 FP8, W4A8/W4A4 FP4, or full-precision). Routes one
+    program per routed row (``expert_ids`` gives its expert).
 
-    Routes by weight dtype and ``block_size``:
-    - ``Bs`` None — unquantized BF16/FP16 weights (``As`` must also be None) →
-      ``full_precision_matmul_batched`` (plain dot, no scales; GLU-only epilogue).
+    ``As`` marks ``A`` as already quantized (framework-precomputed scales, or a requantized
+    intermediate handed to the down projection); ``None`` = raw ``A``, quantized by the op per
+    ``quantization`` (see ``Quantization`` — recipe-default fp8/E4M3, offline for bd/tensor and
+    inline for MX, or packed E2M1 under ``input_recipe="mxfp4"``). ``Bs`` ``None`` =
+    unquantized BF16/FP16 weights. ``quantization.output_recipe`` requantizes the output into
+    the recipe's format — the return is then ``(C, Cs)``. ``epilogue`` is the fused output
+    transform (gate|up + GLU). ``gather_idx``/``scatter_idx`` (each None or a ``(S,)`` map)
+    address the source row of ``A`` / destination row of ``C`` per program — None means row
+    ``s``; the gather lets the gate_up read unexpanded activations (source row
+    ``s // num_top_k``) with no copy.
+
+    Routes by what the weight tensors themselves say (there is no ``block_size``
+    parameter — the quantization block is derived from the scale shape,
+    ``weight_block_size``):
+    - ``Bs`` None → ``full_precision_matmul_batched`` (plain dot, no scales anywhere).
     - MX weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
-      group-32 ``Bs`` (shape ``[num_experts, N, K//32]``) → ``mxfp_dynamic_matmul_batched``
-      (``block_size`` ignored; tile + dot path autotuned).
-    - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_dynamic_fp8_matmul_batched``.
-    - otherwise → ``w8a8_block_dynamic_fp8_matmul_batched``.
+      group-32 ``Bs`` → ``mxfp_dynamic_matmul_batched``.
+    - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) →
+      ``w8a8_tensor_dynamic_fp8_matmul_batched``.
+    - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_batched``.
     """
     ep = epilogue if epilogue is not None else Epilogue()
-    ep_args = ep.as_args()
+    q = quantization if quantization is not None else Quantization()
 
     if Bs is None:
-        assert As is None, "full-precision path (Bs=None) takes raw activations — As must be None"
+        assert As is None, "the full-precision path (Bs=None) takes no activation scales"
         out = full_precision_matmul_batched(
-            A, B, expert_ids, *ep_args, gather_idx, scatter_idx
+            A, B, expert_ids, *ep.as_args(), *q.as_args(), output_dtype, gather_idx, scatter_idx
         )
     elif is_mxfp(B, Bs):
         out = mxfp_dynamic_matmul_batched(
-            A, As, B, Bs, expert_ids, *ep_args, gather_idx, scatter_idx
+            A, As, B, Bs, expert_ids, *ep.as_args(), *q.as_args(), output_dtype, gather_idx, scatter_idx
         )
-    elif is_tensor_wide(block_size, B):
+    elif (block_size := weight_block_size(B, Bs)) is None:
         assert not ep.gate, "gate|up fusion is not supported for tensor-wide scales"
+        assert q.input_recipe is None and q.output_recipe is None, (
+            "tensor-wide supports neither packed activations nor a fused requant"
+        )
         out = w8a8_tensor_dynamic_fp8_matmul_batched(
-            A, As, B, Bs, expert_ids, ep.output_dtype, gather_idx, scatter_idx
+            A, As, B, Bs, expert_ids, output_dtype, gather_idx, scatter_idx
         )
     else:
         out = w8a8_block_dynamic_fp8_matmul_batched(
-            A, As, B, Bs, expert_ids, block_size, *ep_args, gather_idx, scatter_idx
+            A, As, B, Bs, expert_ids, block_size, *ep.as_args(), *q.as_args(),
+            output_dtype, gather_idx, scatter_idx,
         )
-    # bd/mx ops return a list ([C] or [C, Cs]); the tensor op returns a bare tensor.
+    # bd/mx/full-precision ops return a list ([C] or [C, Cs]); the tensor op returns a bare tensor.
     if isinstance(out, (list, tuple)):
         return out[0] if len(out) == 1 else tuple(out)
     return out

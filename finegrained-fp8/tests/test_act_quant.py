@@ -5,7 +5,16 @@ import torch
 
 from utils import TEST_DEVICE  # type: ignore
 
-import finegrained_fp8  # type: ignore
+import triton
+import triton.language as tl
+
+from finegrained_fp8.utils import (  # type: ignore
+    fp8_act_quant_block_dynamic,
+    fp8_act_quant_tensor_wide,
+    mxfp_act_quant,
+    mxfp_act_quant_inline,
+    mxfp4_act_quant,
+)
 
 
 _FP8_DTYPE = torch.float8_e4m3fn
@@ -45,7 +54,7 @@ def test_fp8_act_quant_tensor_wide(shape, block_size, dtype):
     torch.manual_seed(0)
     x = torch.randn(*shape, dtype=dtype, device=TEST_DEVICE)
 
-    y, s = finegrained_fp8.fp8_act_quant_tensor_wide(x, block_size)
+    y, s = fp8_act_quant_tensor_wide(x, block_size)
     y_ref, s_ref = _ref_fp8_act_quant_tensor_wide(x, block_size)
 
     assert y.dtype == _FP8_DTYPE
@@ -65,7 +74,126 @@ def test_fp8_act_quant_zero_block():
     a zero block divides by zero and produces NaN.
     """
     x = torch.zeros(2, 128, dtype=torch.bfloat16, device=TEST_DEVICE)
-    y, s = finegrained_fp8.fp8_act_quant_tensor_wide(x, block_size=128)
+    y, s = fp8_act_quant_tensor_wide(x, block_size=128)
     assert not torch.isnan(y.float()).any()
     assert (y.float() == 0).all()
     assert (s == 0).all()
+
+
+# ── inline-vs-offline arm parity (every recipe's quant has two implementations) ──────
+
+E2M1_LUT = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
+
+
+def _dequant_e2m1(packed, scales, K):
+    p = packed.view(torch.uint8)
+    lut = torch.tensor(E2M1_LUT, device=packed.device)
+    vals = torch.empty(p.shape[0], K, device=p.device)
+    vals[:, 0::2] = lut[(p & 0xF).long()]
+    vals[:, 1::2] = lut[(p >> 4).long()]
+    s = torch.pow(2.0, scales.view(torch.uint8).float() - 127.0)
+    return (vals.reshape(-1, K // 32, 32) * s[..., None]).reshape(-1, K)
+
+
+@triton.jit
+def _mx_inline_harness(X, Q, S, M: tl.constexpr, N: tl.constexpr, RECIPE: tl.constexpr):
+    x = tl.load(X + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :])
+    q, s = mxfp_act_quant_inline(x.to(tl.float32), M, N, 32, RECIPE)
+    width: tl.constexpr = N // 2 if RECIPE == "mxfp4" else N
+    tl.store(Q + tl.arange(0, M)[:, None] * width + tl.arange(0, width)[None, :], q)
+    tl.store(
+        S + tl.arange(0, M)[:, None] * (N // 32) + tl.arange(0, N // 32)[None, :], s
+    )
+
+
+def _run_mx_inline(x, recipe):
+    M, N = x.shape
+    width = N // 2 if recipe == "mxfp4" else N
+    q = torch.empty(
+        M,
+        width,
+        device=x.device,
+        dtype=torch.uint8 if recipe == "mxfp4" else torch.float8_e4m3fn,
+    )
+    s = torch.empty(M, N // 32, device=x.device, dtype=torch.uint8)
+    _mx_inline_harness[(1,)](x, q, s, M=M, N=N, RECIPE=recipe, num_warps=4)
+    torch.cuda.synchronize()
+    return q, s
+
+
+def _act_inputs(M=64, N=256, zero_rows=True):
+    torch.manual_seed(0)
+    x = torch.randn(M, N, device="cuda", dtype=torch.float32) * 8
+    if zero_rows:
+        x[0] = 0  # whole-row zero: scales must stay neutral, values must dequant to 0
+        x[1, :32] = 0  # one zero group inside a live row
+    return x
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+def test_mxfp8_inline_matches_offline():
+    """The in-kernel E4M3 quant (fused epilogues, inline decode arm) and the offline
+    ``mxfp_act_quant`` pass must be bit-identical — the dtype-branched kernels and the
+    fused/unfused parity both rely on it."""
+    x = _act_inputs()
+    q, s = _run_mx_inline(x, "mxfp8")
+    q_ref, s_ref = mxfp_act_quant(x)
+    assert torch.equal(s, s_ref)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+def test_mxfp4_inline_matches_host():
+    """The in-kernel packed-E2M1 quant (the "mxfp4" output recipe) and the host
+    ``mxfp4_act_quant`` must be bit-identical — the fused intermediate must equal
+    quantizing the same values offline."""
+    x = _act_inputs()
+    q, s = _run_mx_inline(x, "mxfp4")
+    q_ref, s_ref = mxfp4_act_quant(x)
+    assert torch.equal(s, s_ref)
+    assert torch.equal(q, q_ref.view(torch.uint8))
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+def test_mxfp4_round_trip_bound():
+    """Dequantizing a host-quantized tensor stays within one E2M1 grid step of the
+    input (half the largest gap, 1.0, times each group's scale) — and zeros round-trip
+    to exact zeros."""
+    x = _act_inputs()
+    q, s = mxfp4_act_quant(x)
+    xdq = _dequant_e2m1(q, s, x.shape[1])
+    bound = torch.pow(2.0, s.float().amax() - 127.0).item() * 1.0
+    assert (xdq - x).abs().max().item() <= bound
+    assert (xdq[0] == 0).all()
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+def test_block_dynamic_offline_zero_block():
+    """A zero block must produce a finite scale and exact-zero values (the 1e-12 floor),
+    with live blocks in the same row unaffected."""
+    x = _act_inputs()
+    q, s = fp8_act_quant_block_dynamic(x.to(torch.bfloat16), 128)
+    assert torch.isfinite(s).all()
+    assert (q[0].float() == 0).all()
+    assert (q[2:].float() != 0).any()

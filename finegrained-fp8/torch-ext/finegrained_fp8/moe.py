@@ -18,7 +18,7 @@ The base ops carry the gate|up ``Epilogue`` (SwiGLU + FP8/MX requant) and the ga
 maps, so both the fused and unfused MoE forwards are pure sequencing here — no MoE-specific
 kernels live in this module:
 
-  fused:   gate_up (``Epilogue(gate=True, requant=True)``) -> down -> ``weighted_reduce``. The
+  fused:   gate_up (``Epilogue(gate=True)`` + ``Quantization(output_recipe=...)``) -> down -> ``weighted_reduce``. The
            SwiGLU + intermediate requant happen inside the gate_up kernel epilogue.
   unfused: gate_up (plain GEMM) -> host ``apply_glu`` -> down (plain GEMM) -> ``weighted_reduce``.
            The activation + requant happen between two plain GEMMs; the GEMMs self-quantize their
@@ -38,27 +38,28 @@ from .grouped import matmul_grouped
 from .batched import matmul_batched
 from .utils import (
     Epilogue,
+    Quantization,
     apply_glu,
     compute_grouped_scheduling,
     fp8_act_quant_block_dynamic,
     mxfp_act_quant,
     weighted_reduce,
     is_mxfp,
+    weight_block_size,
     is_mxfp4,
 )
 
 
-def _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, block_size):
+def _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale):
     """gate_up and down must share the recipe (both MX or both block-dynamic FP8 — the
-    intermediate handed between them carries one quant format), and block-dynamic FP8 needs a
-    ``block_size``. Returns whether the recipe is MX (the fused dispatchers branch on it)."""
+    intermediate handed between them carries one quant format). Returns whether the recipe
+    is MX (the fused dispatchers branch on it); the fp8 quantization block is derived from
+    the scale shapes (``weight_block_size``), never passed."""
     is_mx = is_mxfp(gate_up_proj, gate_up_proj_scale)
     if is_mx != is_mxfp(down_proj, down_proj_scale):
         raise ValueError(
             "gate_up_proj and down_proj must use the same recipe (both MX or both block-dynamic FP8)."
         )
-    if not is_mx and block_size is None:
-        raise ValueError("block_size is required for block-dynamic FP8 weights.")
     return is_mx
 
 
@@ -100,7 +101,6 @@ def w8a8_block_dynamic_fp8_moe_grouped(
     down_proj: torch.Tensor,  # (E, H, I) FP8
     gate_up_proj_scale: torch.Tensor,
     down_proj_scale: torch.Tensor,
-    block_size: list[int],
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -110,44 +110,43 @@ def w8a8_block_dynamic_fp8_moe_grouped(
     grouped down → routing-weighted top-k reduce. Returns ``(num_tokens, hidden_dim)``."""
     num_top_k = top_k_index.size(-1)
     NUM_EXPERTS = gate_up_proj.size(0)
-    _, BLOCK_SIZE_K = block_size
+    # activation scale groups follow the weight's K block, read off the scale shape
+    _, block_k = weight_block_size(gate_up_proj, gate_up_proj_scale)
 
     expert_start, gather_idx, scatter_idx = compute_grouped_scheduling(
         top_k_index, NUM_EXPERTS, num_top_k
     )
-    hidden_q, hidden_scale = fp8_act_quant_block_dynamic(hidden_states, BLOCK_SIZE_K)
+    hidden_q, hidden_scale = fp8_act_quant_block_dynamic(hidden_states, block_k)
 
     # Phase 1: gate_up + SiLU + FP8 requant -> expert-ordered fp8 intermediate. Gather hidden by
     # routed row (gather_idx); leave the output expert-ordered (scatter_idx=None — the down
     # projection reads it in place, no scatter between the two GEMMs).
     inter, inter_scale = matmul_grouped(
         hidden_q,
-        hidden_scale,
         gate_up_proj,
-        gate_up_proj_scale,
-        expert_start,
-        block_size,
+        As=hidden_scale,
+        Bs=gate_up_proj_scale,
+        expert_start=expert_start,
         epilogue=Epilogue(
             gate=True,
-            requant=True,
             act_fn=act_fn,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
             simulate_unfused=simulate_unfused,
-            output_dtype=hidden_states.dtype,
         ),
+        quantization=Quantization(output_recipe="fp8"),
+        output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
     # Phase 2: grouped down over the expert-ordered intermediate (gather_idx=None), scattering to
     # routed rows (scatter_idx).
     down_out = matmul_grouped(
         inter,
-        inter_scale,
         down_proj,
-        down_proj_scale,
-        expert_start,
-        block_size,
-        epilogue=Epilogue(output_dtype=hidden_states.dtype),
+        As=inter_scale,
+        Bs=down_proj_scale,
+        expert_start=expert_start,
+        output_dtype=hidden_states.dtype,
         scatter_idx=scatter_idx,
     )
     # Phase 3: routing-weighted top-k reduce -> (num_tokens, hidden_dim). simulate_unfused
@@ -192,32 +191,30 @@ def mxfp_dynamic_moe_grouped(
     # routed row (gather_idx); leave the output expert-ordered (scatter_idx=None).
     inter, inter_scale = matmul_grouped(
         hidden_q,
-        hidden_scale,
         gate_up_proj,
-        gate_up_proj_scale,
-        expert_start,
-        None,
+        As=hidden_scale,
+        Bs=gate_up_proj_scale,
+        expert_start=expert_start,
         epilogue=Epilogue(
             gate=True,
-            requant=True,
             act_fn=act_fn,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
             simulate_unfused=simulate_unfused,
-            output_dtype=hidden_states.dtype,
         ),
+        quantization=Quantization(output_recipe="mxfp8"),
+        output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
     # Phase 2: grouped down over the expert-ordered intermediate (gather_idx=None), scattering to
     # routed rows (scatter_idx).
     down_out = matmul_grouped(
         inter,
-        inter_scale,
         down_proj,
-        down_proj_scale,
-        expert_start,
-        None,
-        epilogue=Epilogue(output_dtype=hidden_states.dtype),
+        As=inter_scale,
+        Bs=down_proj_scale,
+        expert_start=expert_start,
+        output_dtype=hidden_states.dtype,
         scatter_idx=scatter_idx,
     )
     # Phase 3: routing-weighted top-k reduce -> (num_tokens, hidden_dim). simulate_unfused
@@ -236,7 +233,6 @@ def moe_fused_grouped(
     down_proj: torch.Tensor,
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
-    block_size: list[int] | None,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -247,7 +243,7 @@ def moe_fused_grouped(
     MXFP4 (UE8M0 group-32). ``simulate_unfused`` (testing) rounds each step through the
     activation dtype so the output matches the unfused reference to reduce order."""
     if _validate_moe(
-        gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, block_size
+        gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv
     ):
         return mxfp_dynamic_moe_grouped(
             hidden_states,
@@ -271,7 +267,6 @@ def moe_fused_grouped(
         down_proj,
         gate_up_proj_scale_inv,
         down_proj_scale_inv,
-        block_size,
         act_fn,
         swiglu_alpha,
         swiglu_limit,
@@ -290,7 +285,6 @@ def w8a8_block_dynamic_fp8_moe_batched(
     down_proj: torch.Tensor,  # (E, H, I) FP8
     gate_up_proj_scale: torch.Tensor,
     down_proj_scale: torch.Tensor,
-    block_size: list[int],
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -307,31 +301,28 @@ def w8a8_block_dynamic_fp8_moe_batched(
     # (no copy); the intermediate scale is the down projection's pre-quantized As.
     inter, inter_scale = matmul_batched(
         hidden_states,
-        None,
         gate_up_proj,
-        gate_up_proj_scale,
-        expert_ids,
-        block_size,
+        Bs=gate_up_proj_scale,
+        expert_ids=expert_ids,
         epilogue=Epilogue(
             gate=True,
-            requant=True,
             act_fn=act_fn,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
             simulate_unfused=simulate_unfused,
-            output_dtype=hidden_states.dtype,
         ),
+        quantization=Quantization(output_recipe="fp8"),
+        output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
     # Phase 2: batched down over the pre-quantized intermediate (already routed-order, no gather).
     down_out = matmul_batched(
         inter,
-        inter_scale,
         down_proj,
-        down_proj_scale,
-        expert_ids,
-        block_size,
-        epilogue=Epilogue(output_dtype=hidden_states.dtype),
+        As=inter_scale,
+        Bs=down_proj_scale,
+        expert_ids=expert_ids,
+        output_dtype=hidden_states.dtype,
     )
     # Phase 3: routing-weighted top-k reduce -> (num_tokens, hidden_dim). simulate_unfused
     # rounds each weighted contrib to the activation dtype before summing, matching the unfused
@@ -370,34 +361,31 @@ def mxfp_dynamic_moe_batched(
 
     # Phase 1: gate_up + SiLU + MXFP8 requant -> per-row fp8 intermediate + UE8M0 group-32 scale
     # (the op quantizes the raw activations inline). gather_idx reads each routed row from the
-    # unexpanded hidden in-kernel (no copy); ``block_size`` is unused for MX (tile tuned).
+    # unexpanded hidden in-kernel (no copy).
     inter, inter_scale = matmul_batched(
         hidden_states,
-        None,
         gate_up_proj,
-        gate_up_proj_scale,
-        expert_ids,
-        None,
+        Bs=gate_up_proj_scale,
+        expert_ids=expert_ids,
         epilogue=Epilogue(
             gate=True,
-            requant=True,
             act_fn=act_fn,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
             simulate_unfused=simulate_unfused,
-            output_dtype=hidden_states.dtype,
         ),
+        quantization=Quantization(output_recipe="mxfp8"),
+        output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
     # Phase 2: batched down over the pre-quantized MXFP8 intermediate (routed-order, no gather).
     down_out = matmul_batched(
         inter,
-        inter_scale,
         down_proj,
-        down_proj_scale,
-        expert_ids,
-        None,
-        epilogue=Epilogue(output_dtype=hidden_states.dtype),
+        As=inter_scale,
+        Bs=down_proj_scale,
+        expert_ids=expert_ids,
+        output_dtype=hidden_states.dtype,
     )
     # Phase 3: routing-weighted top-k reduce -> (num_tokens, hidden_dim). simulate_unfused
     # rounds each weighted contrib to the activation dtype before summing, matching the unfused
@@ -415,7 +403,6 @@ def moe_fused_batched(
     down_proj: torch.Tensor,
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
-    block_size: list[int] | None,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -426,7 +413,7 @@ def moe_fused_batched(
     MXFP4 (UE8M0 group-32). ``simulate_unfused`` (testing) rounds each step through the
     activation dtype so the output matches the unfused reference to reduce order."""
     if _validate_moe(
-        gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, block_size
+        gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv
     ):
         return mxfp_dynamic_moe_batched(
             hidden_states,
@@ -450,7 +437,6 @@ def moe_fused_batched(
         down_proj,
         gate_up_proj_scale_inv,
         down_proj_scale_inv,
-        block_size,
         act_fn,
         swiglu_alpha,
         swiglu_limit,
@@ -469,7 +455,6 @@ def moe_unfused_grouped(
     down_proj: torch.Tensor,
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
-    block_size: list[int] | None,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -477,10 +462,10 @@ def moe_unfused_grouped(
     """Unfused grouped MoE: gate_up (plain grouped GEMM, gather hidden) → host ``apply_glu`` →
     down (plain grouped GEMM, scatter to routed rows) → routing-weighted reduce. Same math as
     ``moe_fused_grouped`` but the SwiGLU + intermediate requant happen between two plain GEMMs
-    rather than inside the gate_up epilogue; each GEMM self-quantizes its raw input (``As=None``).
+    rather than inside the gate_up epilogue; each GEMM self-quantizes its raw input (no ``Quantization`` given).
     Both recipes (block-dynamic FP8, MXFP4/MXFP8) route through the shared ``matmul_grouped``."""
     _validate_moe(
-        gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, block_size
+        gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv
     )
 
     num_top_k = top_k_index.size(-1)
@@ -492,11 +477,9 @@ def moe_unfused_grouped(
     # gate_up as a plain GEMM (no gate epilogue) over gathered hidden -> expert-ordered (S, 2I).
     gate_up_out = matmul_grouped(
         hidden_states,
-        None,
         gate_up_proj,
-        gate_up_proj_scale_inv,
-        expert_start,
-        block_size,
+        Bs=gate_up_proj_scale_inv,
+        expert_start=expert_start,
         gather_idx=gather_idx,
     )
     gate, up = gate_up_out.chunk(2, dim=-1)
@@ -504,11 +487,9 @@ def moe_unfused_grouped(
     # down over the expert-ordered intermediate (self-quantized), scattering to routed rows.
     down_out = matmul_grouped(
         inter,
-        None,
         down_proj,
-        down_proj_scale_inv,
-        expert_start,
-        block_size,
+        Bs=down_proj_scale_inv,
+        expert_start=expert_start,
         scatter_idx=scatter_idx,
     )
     return _torch_weighted_reduce(down_out, top_k_index, top_k_weights, NUM_EXPERTS)
@@ -522,7 +503,6 @@ def moe_unfused_batched(
     down_proj: torch.Tensor,
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
-    block_size: list[int] | None,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -532,7 +512,7 @@ def moe_unfused_batched(
     the SwiGLU + intermediate requant happen between two plain GEMMs; each GEMM self-quantizes its
     raw input (``As=None``). Both recipes route through the shared ``matmul_batched``."""
     _validate_moe(
-        gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, block_size
+        gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv
     )
 
     NUM_EXPERTS = gate_up_proj.size(0)
@@ -542,11 +522,9 @@ def moe_unfused_batched(
     # gate_up as a plain GEMM (no gate epilogue) over gathered hidden -> (S, 2I).
     gate_up_out = matmul_batched(
         hidden_states,
-        None,
         gate_up_proj,
-        gate_up_proj_scale_inv,
-        expert_ids,
-        block_size,
+        Bs=gate_up_proj_scale_inv,
+        expert_ids=expert_ids,
         gather_idx=gather_idx,
     )
     gate, up = gate_up_out.chunk(2, dim=-1)
@@ -554,10 +532,8 @@ def moe_unfused_batched(
     # down over the intermediate (self-quantized), routed-order output.
     down_out = matmul_batched(
         inter,
-        None,
         down_proj,
-        down_proj_scale_inv,
-        expert_ids,
-        block_size,
+        Bs=down_proj_scale_inv,
+        expert_ids=expert_ids,
     )
     return _torch_weighted_reduce(down_out, top_k_index, top_k_weights, NUM_EXPERTS)
