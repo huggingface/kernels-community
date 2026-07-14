@@ -72,6 +72,38 @@ def test_invalid_kernel_name_is_error():
     assert bot.parse_command("/kernel-bot build bad/name").error is not None
 
 
+def test_build_with_backend_scope():
+    parsed = bot.parse_command("/kernel-bot build flash-attn2[xpu,cpu]")
+    assert parsed.error is None
+    assert parsed.kernels == ["flash-attn2"]
+    assert parsed.backends == {"flash-attn2": ["xpu", "cpu"]}
+
+
+def test_backend_scope_mixes_with_plain_kernels():
+    parsed = bot.parse_command("/kernel-bot build activation flash-attn2[xpu]")
+    assert parsed.error is None
+    assert parsed.kernels == ["activation", "flash-attn2"]
+    assert parsed.backends == {"flash-attn2": ["xpu"]}
+
+
+def test_backend_scope_unknown_backend_is_error():
+    parsed = bot.parse_command("/kernel-bot build flash-attn2[gpu]")
+    assert parsed.error is not None
+    assert "gpu" in parsed.error
+
+
+def test_backend_scopes_union_across_repeats():
+    parsed = bot.parse_command("/kernel-bot build relu[cpu] relu[xpu]")
+    assert parsed.kernels == ["relu"]
+    assert parsed.backends == {"relu": ["cpu", "xpu"]}
+
+
+def test_supported_characters_allows_backend_scope():
+    assert bot.comment_has_only_supported_characters(
+        "/kernel-bot build flash-attn2[xpu,cpu]"
+    )
+
+
 def test_invalid_branch_name_is_error():
     parsed = bot.parse_command("/kernel-bot build foo --branch bad~branch")
     assert parsed.error is not None
