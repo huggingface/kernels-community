@@ -30,16 +30,16 @@ from utils import TEST_DEVICE, make_weights
 import finegrained_fp8  # type: ignore
 import finegrained_fp8.matmul  # type: ignore
 from finegrained_fp8.bayesian_autotuner import bayesian_autotune  # type: ignore
-from finegrained_fp8.utils import is_sm10x, smem_config_pruner  # type: ignore
+from finegrained_fp8.utils import is_sm10x, mx_config_pruner  # type: ignore
 
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(not is_sm10x(), reason="sm_10x-specific guard")
 def test_single_trip_dot_scaled_configs_are_pruned():
     """The hub-v4 crash class: a dot_scaled config whose K-loop is a single trip
-    (BLOCK_SIZE_K >= reduction dim) trips the sm_10x accumulator-init miscompile — v4
+    (BLOCK_SIZE_K >= contraction dim) trips the sm_10x accumulator-init miscompile — v4
     benched such configs during tuning and died with sticky device traps."""
-    prune = smem_config_pruner(n_weight_tiles=1, reduction_dim="INTERMEDIATE_DIM")
+    prune = mx_config_pruner("K")
     cfgs = [
         triton.Config(
             {
@@ -53,22 +53,19 @@ def test_single_trip_dot_scaled_configs_are_pruned():
         )
         for bk in (128, 256)
     ]
-    inter = torch.empty(
-        1, dtype=torch.float8_e4m3fn
-    )  # act tensor is arg0 by convention
-    kept = prune(cfgs, {"Inter": inter, "INTERMEDIATE_DIM": 256})
-    # BK=256 == I -> single trip
+    kept = prune(cfgs, {"K": 256})
+    # BK=256 == K -> single trip
     assert {c.kwargs["BLOCK_SIZE_K"] for c in kept} == {128}
 
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(not is_sm10x(), reason="sm_10x-specific guard")
-def test_wide_double_mma_dot_scaled_configs_are_pruned():
-    """The other v4 crash class: a combined gate|up dot_scaled wider than sm_10x's N=256
-    MMA cap miscompiles (packed-E2M1 rhs -> sticky "misaligned address" trap)."""
-    prune = smem_config_pruner(
-        n_weight_tiles=2, reduction_dim="HIDDEN_DIM", double_mma=True
-    )
+def test_wide_gate_dot_scaled_configs_are_pruned():
+    """The other v4 crash class: a stacked gate|up dot_scaled wider than sm_10x's N=256
+    MMA cap miscompiles (packed-E2M1 rhs -> sticky "misaligned address" trap). The MX
+    pruner reads the GATE constexpr off the launch args: the same BN=256 rows must
+    survive a plain (GATE-less) launch."""
+    prune = mx_config_pruner("K")
     cfgs = [
         triton.Config(
             {
@@ -80,14 +77,38 @@ def test_wide_double_mma_dot_scaled_configs_are_pruned():
             num_warps=4,
             num_stages=2,
         )
-        for bn in (64, 128, 256)  # double_mma width = 2*BN
+        for bn in (64, 128, 256)  # GATE width = 2*BN
     ]
-    hidden = torch.empty(
-        1, dtype=torch.float8_e4m3fn
-    )  # act tensor is arg0 by convention
-    kept = prune(cfgs, {"Hidden": hidden, "HIDDEN_DIM": 4096})
+    kept = prune(cfgs, {"K": 4096, "GATE": True})
     # 2*256 > the 256 cap
     assert {c.kwargs["BLOCK_SIZE_N"] for c in kept} == {64, 128}
+    plain = prune(cfgs, {"K": 4096, "GATE": False})
+    assert {c.kwargs["BLOCK_SIZE_N"] for c in plain} == {64, 128, 256}
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not is_sm10x(), reason="sm_10x-specific guard")
+def test_dot_arm_is_fenced_on_sm10x():
+    """The ``dot`` arm computes correctly on sm_10x (forced-config probe, 2026-07-14) but
+    is fenced as TPE poison: with dot rows in the grid a fresh 100-trial tune shipped dot
+    winners 2-3x slower than the native dot_scaled basin (A/B'd same day). The fence must
+    drop dot rows while dot_scaled survivors remain."""
+    prune = mx_config_pruner("K")
+
+    def cfg(mode, bk):
+        return triton.Config(
+            {
+                "COMPUTE_MODE": mode,
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": bk,
+            },
+            num_warps=4,
+            num_stages=2,
+        )
+
+    kept = prune([cfg("dot", 32), cfg("dot_scaled", 128)], {"K": 4096})
+    assert {c.kwargs["COMPUTE_MODE"] for c in kept} == {"dot_scaled"}
 
 
 @pytest.mark.kernels_ci
@@ -163,10 +184,11 @@ def test_cross_process_determinism_block_dynamic_grouped():
         "torch.manual_seed(0)\n"
         "E,N,K,S=8,512,1024,256\n"
         "eids=torch.randint(0,E,(S,),device='cuda',dtype=torch.int32)\n"
-        "sched=fg.compute_grouped_scheduling(eids,E,1)\n"
+        "est,gi,si=fg.compute_grouped_scheduling(eids,E,1)\n"
         "A=torch.randn(S,K,device='cuda',dtype=torch.bfloat16)\n"
+        "Aq,As=fg.fp8_act_quant_block_dynamic(A,128)\n"
         "B,Bs=make_weights(N,K,'cuda',[128,128],num_experts=E)\n"
-        "out=fg.matmul_grouped(A,B,Bs,sched,[128,128],torch.float32)\n"
+        "out=fg.matmul_grouped(Aq,As,B,Bs,est,[128,128],epilogue=fg.Epilogue(output_dtype=torch.float32),gather_idx=gi,scatter_idx=si)\n"
         "print(out.double().sum().item())\n"
     )
     sums = {

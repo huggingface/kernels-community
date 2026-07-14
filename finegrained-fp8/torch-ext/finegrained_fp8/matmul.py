@@ -27,7 +27,7 @@ from .utils import (
     MX_SCALE_GROUP_K,
     UE8M0_SCALE_DTYPES,
     acc_init,
-    batched_mx_pruner,
+    mx_config_pruner,
     block_scaled_fp8_dot,
     scalar_max_m_pruner,
     block_k_within_k_pruner,
@@ -35,8 +35,8 @@ from .utils import (
     decode_ue8m0_scale,
     descriptor_config_pruner,
     device_context,
-    fp8_act_quant,
-    fp8_act_quant_2d,
+    fp8_act_quant_tensor_wide,
+    fp8_act_quant_block_dynamic,
     load_block_fp8_act_tile,
     load_weight_tile,
     oriented_tile_ptrs,
@@ -392,7 +392,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     # + scalar restricted to decode-sized M (a BM=1 GEVM at prefill is TPE poison).
     prune_configs_by={
         "early_config_prune": compose_pruners(
-            batched_mx_pruner("K"), scalar_max_m_pruner("M")
+            mx_config_pruner("K"), scalar_max_m_pruner("M")
         )
     },
 )
@@ -527,7 +527,7 @@ def w8a8_block_dynamic_fp8_matmul(
     )
 
     Bs = ue8m0_as_uint8(Bs)
-    A_q, A_s = fp8_act_quant_2d(A.view(M, K), block_k)
+    A_q, A_s = fp8_act_quant_block_dynamic(A.view(M, K), block_k)
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
     # The descriptor MEMORY_MODEs are not emitted (see the tuner note), so no live
@@ -535,7 +535,7 @@ def w8a8_block_dynamic_fp8_matmul(
     # on EVERY launch even when the kernel never reads them, and with the (BM, BN) tile
     # now tuned the fixed box also no longer matches every config. Re-enabling the
     # descriptor rows means passing TensorDescriptor.from_tensor(B, box) again with a
-    # per-config pre_hook setting the box (see _set_gate_up_descriptor).
+    # per-config pre_hook re-binding the box to the autotuned (BM, BN) tile.
     b_descriptor = 0
 
     def grid(META):
@@ -681,7 +681,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
     """Tensor-scale FP8 matmul: ``C = A @ B.T``; activations quantized offline per row.
 
     A:  (..., K) raw activations, bf16/fp16/fp32 (flattened to (M, K)
-        internally) — per-row scales computed via ``fp8_act_quant(A, K)``.
+        internally) — per-row scales computed via ``fp8_act_quant_tensor_wide(A, K)``.
     B:  (N, K) FP8 weights.
     Bs: scalar, (1,), or (1, 1) — single tensor-scale weight scale.
     """
@@ -698,7 +698,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
     assert Bs.numel() == 1, f"Bs must be scalar or (1,), got {tuple(Bs.shape)}"
 
     # Per-row scalar activation scale (one per token).
-    qA, As = fp8_act_quant(A, K)
+    qA, As = fp8_act_quant_tensor_wide(A, K)
     As = As.reshape(M)
     Bs = Bs.reshape(1)
 

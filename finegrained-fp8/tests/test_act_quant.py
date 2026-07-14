@@ -1,4 +1,4 @@
-"""Tests for the standalone ``fp8_act_quant`` op."""
+"""Tests for the standalone ``fp8_act_quant_tensor_wide`` op."""
 
 import pytest
 import torch
@@ -11,7 +11,7 @@ import finegrained_fp8  # type: ignore
 _FP8_DTYPE = torch.float8_e4m3fn
 
 
-def _ref_fp8_act_quant(x: torch.Tensor, block_size: int):
+def _ref_fp8_act_quant_tensor_wide(x: torch.Tensor, block_size: int):
     """Pure-PyTorch reference: per-block dynamic FP8 quant.
 
     ``s = amax / 448`` (returned verbatim, can be 0 for all-zero blocks);
@@ -38,15 +38,15 @@ def _ref_fp8_act_quant(x: torch.Tensor, block_size: int):
     [torch.bfloat16, torch.float16, torch.float32],
     ids=["bf16", "fp16", "fp32"],
 )
-def test_fp8_act_quant(shape, block_size, dtype):
+def test_fp8_act_quant_tensor_wide(shape, block_size, dtype):
     """Kernel matches the pure-PyTorch reference at FP8 granularity."""
     if shape[-1] % block_size != 0:
         pytest.skip(f"shape last dim {shape[-1]} not divisible by {block_size}")
     torch.manual_seed(0)
     x = torch.randn(*shape, dtype=dtype, device=TEST_DEVICE)
 
-    y, s = finegrained_fp8.fp8_act_quant(x, block_size)
-    y_ref, s_ref = _ref_fp8_act_quant(x, block_size)
+    y, s = finegrained_fp8.fp8_act_quant_tensor_wide(x, block_size)
+    y_ref, s_ref = _ref_fp8_act_quant_tensor_wide(x, block_size)
 
     assert y.dtype == _FP8_DTYPE
     assert y.shape == x.shape
@@ -65,7 +65,7 @@ def test_fp8_act_quant_zero_block():
     a zero block divides by zero and produces NaN.
     """
     x = torch.zeros(2, 128, dtype=torch.bfloat16, device=TEST_DEVICE)
-    y, s = finegrained_fp8.fp8_act_quant(x, block_size=128)
+    y, s = finegrained_fp8.fp8_act_quant_tensor_wide(x, block_size=128)
     assert not torch.isnan(y.float()).any()
     assert (y.float() == 0).all()
     assert (s == 0).all()

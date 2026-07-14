@@ -6,7 +6,6 @@ from typing import Optional, Tuple
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 import triton
 
@@ -22,7 +21,7 @@ from utils import (  # type: ignore
 )
 
 import finegrained_fp8  # type: ignore
-from finegrained_fp8 import fused_batched, fused_grouped  # type: ignore
+from finegrained_fp8 import moe  # type: ignore
 
 
 BENCH_REPEATS = 10
@@ -492,7 +491,7 @@ def test_batched(problem):
     torch.manual_seed(0)
     A, expert_ids, B, Bs = _setup_problem(problem)
     matmul_batched = maybe_compile(finegrained_fp8.matmul_batched, problem.compile)
-    out = matmul_batched(A, B, Bs, expert_ids, problem.block_size)
+    out = matmul_batched(A, None, B, Bs, expert_ids, problem.block_size)
     ref = _routed_matmul_ref(A, B, Bs, expert_ids, problem.block_size)
     _assert_correctness(out, ref, expert_ids, problem)
 
@@ -503,9 +502,22 @@ def test_batched(problem):
 def test_grouped(problem):
     torch.manual_seed(0)
     A, expert_ids, B, Bs = _setup_problem(problem)
-    scheduling = finegrained_fp8.compute_grouped_scheduling(expert_ids, problem.E, 1)
+    expert_start, gather_idx, scatter_idx = finegrained_fp8.compute_grouped_scheduling(
+        expert_ids, problem.E, 1
+    )
+    A_q, As = _quant_act(A, problem, problem.block_size)
     matmul_grouped = maybe_compile(finegrained_fp8.matmul_grouped, problem.compile)
-    out = matmul_grouped(A, B, Bs, scheduling, problem.block_size)
+    out = matmul_grouped(
+        A_q,
+        As,
+        B,
+        Bs,
+        expert_start,
+        problem.block_size,
+        epilogue=finegrained_fp8.Epilogue(output_dtype=problem.dtype),
+        gather_idx=gather_idx,
+        scatter_idx=scatter_idx,
+    )
     ref = _routed_matmul_ref(A, B, Bs, expert_ids, problem.block_size)
     _assert_correctness(out, ref, expert_ids, problem)
 
@@ -774,103 +786,15 @@ def _make_moe_inputs(problem: MoEProblem):
     return hidden, top_k_index, top_k_weights
 
 
-_ACT_FNS = {"silu": F.silu, "gelu": F.gelu, "relu": F.relu}
-
-
-def _glu_ref(gate, up, act_fn, swiglu_alpha=None, swiglu_limit=None):
-    """Reference GLU activation, mirroring the fused kernel's ``glu`` and the model
-    ``_apply_gate``. ``swiglu_limit`` clamps gate above / up to ``[-limit, limit]``;
-    ``swiglu_alpha`` gives clamped/scaled SwiGLU ``(up + 1) * gate * sigmoid(alpha * gate)``
-    (GPT-OSS / MiniMax-M3). Otherwise plain GLU ``act_fn(gate) * up``."""
-    if swiglu_limit is not None:
-        gate = gate.clamp(max=swiglu_limit)
-        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-    if swiglu_alpha is not None:
-        return (up + 1.0) * (gate * torch.sigmoid(gate * swiglu_alpha))
-    return _ACT_FNS[act_fn](gate) * up
-
-
-def _unfused_batched_ref(
-    hidden,
-    top_k_index,
-    top_k_weights,
-    gate_up,
-    gate_up_s,
-    down,
-    down_s,
-    problem,
-    block_size,
-    act_fn,
-    swiglu_alpha=None,
-    swiglu_limit=None,
-):
-    """The transformers batched-experts forward (``integrations/moe.py``) built on the
-    tested ``matmul_batched``: replicate each token to its routed slots, gate_up projection,
-    GLU (``act_fn(gate) * up``, or clamped/scaled SwiGLU when ``swiglu_alpha``/``swiglu_limit``
-    are set), down projection, then the routing-weighted top-k reduce."""
-    # EP: a non-local expert is marked with an out-of-range sentinel id; drop those slots (dummy
-    # expert, zero weight) so they contribute 0 — matching the fused path's scatter guard + reduce
-    # mask. No-op when there are no sentinels.
-    keep = top_k_index < problem.num_experts
-    top_k_index = torch.where(keep, top_k_index, torch.zeros_like(top_k_index))
-    top_k_weights = top_k_weights * keep.to(top_k_weights.dtype)
-    num_tokens, num_top_k = hidden.shape[0], problem.num_top_k
-    expert_ids = top_k_index.reshape(-1).to(torch.int32)
-    routed = hidden.repeat_interleave(num_top_k, dim=0)
-    gate_up_out = finegrained_fp8.matmul_batched(
-        routed, gate_up, gate_up_s, expert_ids, block_size
-    )
-    gate, up = gate_up_out.chunk(2, dim=-1)
-    inter = _glu_ref(gate, up, act_fn, swiglu_alpha, swiglu_limit)
-    down_out = finegrained_fp8.matmul_batched(
-        inter, down, down_s, expert_ids, block_size
-    )
-    weighted = down_out * top_k_weights.reshape(-1, 1)
-    return weighted.view(num_tokens, num_top_k, problem.hidden_dim).sum(dim=1)
-
-
-def _unfused_grouped_ref(
-    hidden,
-    top_k_index,
-    top_k_weights,
-    gate_up,
-    gate_up_s,
-    down,
-    down_s,
-    problem,
-    block_size,
-    act_fn,
-    swiglu_alpha=None,
-    swiglu_limit=None,
-):
-    """The same MoE forward as ``_unfused_batched_ref`` but built on the tested
-    ``matmul_grouped`` — one scheduling pass threaded through the chain: gate_up gathers
-    straight from ``hidden`` via ``input_perm`` (no replication, no physical sort), GLU
-    (``act_fn(gate) * up``, or clamped/scaled SwiGLU when ``swiglu_alpha``/``swiglu_limit`` are
-    set) on the expert-sorted intermediate, down scatters to token-major routed rows via
-    ``output_perm``, routing-weighted top-k reduce. Using the grouped GEMM (not
-    batched) matches the fused grouped path's tiling / reduce order."""
-    # EP: a non-local expert is marked with an out-of-range sentinel id; drop those slots (dummy
-    # expert, zero weight) so they contribute 0 — matching the fused path's scatter guard + reduce
-    # mask. No-op when there are no sentinels.
-    keep = top_k_index < problem.num_experts
-    top_k_index = torch.where(keep, top_k_index, torch.zeros_like(top_k_index))
-    top_k_weights = top_k_weights * keep.to(top_k_weights.dtype)
-    num_tokens, num_top_k = hidden.shape[0], problem.num_top_k
-    expert_ids = top_k_index.reshape(-1).to(torch.int32)
-    scheduling = finegrained_fp8.compute_grouped_scheduling(
-        expert_ids, problem.num_experts, num_top_k
-    )
-    gate_up_out = finegrained_fp8.matmul_grouped(
-        hidden, gate_up, gate_up_s, scheduling, block_size, output_scatter="ordered"
-    )
-    gate, up = gate_up_out.chunk(2, dim=-1)
-    inter = _glu_ref(gate, up, act_fn, swiglu_alpha, swiglu_limit)
-    down_out = finegrained_fp8.matmul_grouped(
-        inter, down, down_s, scheduling, block_size, input_gather="ordered"
-    )
-    weighted = down_out * top_k_weights.reshape(-1, 1)
-    return weighted.view(num_tokens, num_top_k, problem.hidden_dim).sum(dim=1)
+def _quant_act(x, problem, block_size):
+    """Activation quant matching the recipe the grouped GEMM will consume — the same quant
+    ``matmul_grouped`` used to do internally, now caller-side. MX → UE8M0 group-32; tensor-wide
+    (no block_size) → per-token; block-dynamic → per-``block_k`` blocks."""
+    if problem.is_mxfp:
+        return finegrained_fp8.mxfp_act_quant(x)
+    if block_size is None:
+        return finegrained_fp8.fp8_act_quant_tensor_wide(x, x.shape[-1])
+    return finegrained_fp8.fp8_act_quant_block_dynamic(x, block_size[1])
 
 
 def _assert_fused_correctness(out, ref, problem: MoEProblem):
@@ -881,6 +805,9 @@ def _assert_fused_correctness(out, ref, problem: MoEProblem):
     torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
 
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
+@pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
 def test_fused_batched(problem):
     """Fused two-kernel MoE (gate_up + activation + FP8 requant + down + top-k reduce) via the
     ``moe_fused_batched`` dispatcher vs the unfused reference. ``simulate_unfused`` rounds each
@@ -889,21 +816,20 @@ def test_fused_batched(problem):
     torch.manual_seed(0)
     gate_up, gate_up_s, down, down_s, block_size = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
-    ref = _unfused_batched_ref(
+    ref = moe.moe_unfused_batched(
         hidden,
         top_k_index,
         top_k_weights,
         gate_up,
-        gate_up_s,
         down,
+        gate_up_s,
         down_s,
-        problem,
         block_size,
-        problem.act_fn,
+        act_fn=problem.act_fn,
         swiglu_alpha=problem.swiglu_alpha,
         swiglu_limit=problem.swiglu_limit,
     )
-    out = fused_batched.moe_fused_batched(
+    out = moe.moe_fused_batched(
         hidden,
         top_k_index,
         top_k_weights,
@@ -931,21 +857,20 @@ def test_fused_grouped(problem):
     torch.manual_seed(0)
     gate_up, gate_up_s, down, down_s, block_size = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
-    ref = _unfused_grouped_ref(
+    ref = moe.moe_unfused_grouped(
         hidden,
         top_k_index,
         top_k_weights,
         gate_up,
-        gate_up_s,
         down,
+        gate_up_s,
         down_s,
-        problem,
         block_size,
-        problem.act_fn,
+        act_fn=problem.act_fn,
         swiglu_alpha=problem.swiglu_alpha,
         swiglu_limit=problem.swiglu_limit,
     )
-    out = fused_grouped.moe_fused_grouped(
+    out = moe.moe_fused_grouped(
         hidden,
         top_k_index,
         top_k_weights,
@@ -1013,7 +938,7 @@ def test_batched_speedup(problem):
         problem,
         "batched",
         lambda: finegrained_fp8.matmul_batched(
-            A, B, Bs, expert_ids, problem.block_size
+            A, None, B, Bs, expert_ids, problem.block_size
         ),
         problem.expectation.batched_ms,
     )
@@ -1028,12 +953,23 @@ def test_grouped_speedup(problem):
     if problem.expectation is None:
         pytest.skip("No expected benchmark latency for this problem")
     A, B, Bs, expert_ids = _bench_setup(problem)
-    scheduling = finegrained_fp8.compute_grouped_scheduling(expert_ids, problem.E, 1)
+    expert_start, gather_idx, scatter_idx = finegrained_fp8.compute_grouped_scheduling(
+        expert_ids, problem.E, 1
+    )
+    A_q, As = _quant_act(A, problem, problem.block_size)
     _run_speedup(
         problem,
         "grouped",
         lambda: finegrained_fp8.matmul_grouped(
-            A, B, Bs, scheduling, problem.block_size
+            A_q,
+            As,
+            B,
+            Bs,
+            expert_start,
+            problem.block_size,
+            epilogue=finegrained_fp8.Epilogue(output_dtype=problem.dtype),
+            gather_idx=gather_idx,
+            scatter_idx=scatter_idx,
         ),
         problem.expectation.grouped_ms,
     )

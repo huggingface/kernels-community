@@ -14,7 +14,7 @@
 
 import functools
 from contextlib import contextmanager
-from typing import NamedTuple
+from dataclasses import dataclass
 
 
 import torch
@@ -167,6 +167,43 @@ def weighted_reduce_kernel(
         acc.to(Out.dtype.element_ty),
         mask=mask,
     )
+
+
+def weighted_reduce(
+    rows: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    num_experts: int,
+    simulate_unfused: bool = False,
+) -> torch.Tensor:
+    """Routing-weighted top-k reduce — the bookend of the fused-MoE chain. Folds each token's
+    ``num_top_k`` expert-output rows (``rows``, group-major, scaled by ``top_k_weights``, with
+    EP-sentinel rows ``id >= num_experts`` skipped) from the routed-row layout back to
+    ``(num_tokens, H)``. See ``weighted_reduce_kernel``."""
+    num_tokens, num_top_k = top_k_index.shape
+    H = rows.size(1)
+    reduced = torch.empty(num_tokens, H, device=rows.device, dtype=rows.dtype)
+    with device_context(rows.device):
+        weighted_reduce_kernel[
+            lambda meta: (num_tokens, triton.cdiv(H, meta["BLOCK_H"]))
+        ](
+            rows,
+            reduced,
+            top_k_index,
+            top_k_weights,
+            H,
+            rows.stride(0),
+            rows.stride(1),
+            reduced.stride(0),
+            reduced.stride(1),
+            top_k_index.stride(0),
+            top_k_index.stride(1),
+            num_groups_bit_length=int(num_tokens).bit_length(),
+            NUM_TOP_K=num_top_k,
+            NUM_EXPERTS=num_experts,
+            SIMULATE_UNFUSED=simulate_unfused,
+        )
+    return reduced
 
 
 def ue8m0_as_uint8(scale: torch.Tensor) -> torch.Tensor:
@@ -484,156 +521,79 @@ def sm_shared_memory_limit() -> int:
 
 
 # ── config pruners ────────────────────────────────────────────────────────────
-# Every guard exists for one of three reasons; the map (kernel -> pruner -> rule):
+# Every guard exists for one of four reasons; the map (pruner -> rule -> kernels):
 #
 #   SILENTLY-WRONG configs (must be pruned, the tuner would time and pick them):
 #     block_k_within_k_pruner   BK not dividing K over-reads rows (maskless K-loops)
+#                               — tensor 2D/batched/grouped; first stage of mx_config_pruner
 #     scalar "scalar" -> BM=1   the scalar GEVM broadcasts wrong at BM>1 (config builder)
 #   COMPILER BUGS / unsupported combos on this triton+arch (benign inf, pruned to save
 #   compiles and to keep can't-win configs from poisoning the TPE densities):
 #     warp_spec_compile_guard_pruner   WS compiles iff BM>=64 & warps in {4,8} (measured
 #                                      identical on four plain-dot loops, Triton 3.7.1);
 #                                      dot_scaled+WS never compiles (PassManager)
-#     batched_mx_pruner sm_10x guards  dot_scaled shape gates (fp4-scalar dead; swapped
-#                                      rows<128 = bf16 fallback; no-swap width>256 traps;
-#                                      BK<128 traps -> sticky 716)
-#     smem_config_pruner               operand smem overflow; single-trip dot_scaled bug
+#                                      — tensor 2D/grouped, bd 2D
+#     mx_config_pruner sm_10x guards   dot_scaled shape gates ONLY (swapped rows<128 =
+#                                      bf16 fallback; width>256 traps; BK<128 traps ->
+#                                      sticky 716; single-trip miscompiles); GATE-aware
+#                                      (the stacked gate|up doubles the width); the dot
+#                                      arm and wide plain dots are CLEAN (probed
+#                                      2026-07-14) — mx 2D/batched/grouped
 #   RACE guards (Triton 3.7.1 pipeliner, per-loop-structure flake maps):
-#     block_dynamic_grouped_gate_up_pruner  non-WS sound only at (w>=8, BM<=64)
 #     block_dynamic_grouped_matmul_pruner   WS-only at BM>=64, non-WS below (disjoint)
+#                                      — bd grouped (plain and GATE arms, same loop)
 #   TPE-POISON fences (valid configs that can't win in a regime):
-#     scalar_max_m_pruner              scalar above M=64 (prefill GEVM)
+#     scalar_max_m_pruner              scalar above M=64 (prefill GEVM) — mx 2D
+#     mx_config_pruner poison fences   sm_10x fp4-scalar (1.8x dead) and the whole dot
+#                                      arm (correct but 2-3x-poisons fresh tunes, A/B'd
+#                                      2026-07-14) — mx 2D/batched/grouped
 #     descriptor_config_pruner         orientation couplings: descriptor requires swap
 #                                      (no-swap descriptor races), swap drops WS (3-4x
 #                                      slower + unprobed loop structure), descriptor warp
-#                                      floor (warps<8 at BN>=128 = 3.6x slower)
-#
-# Compose with compose_pruners; every pruner keeps a non-empty fallback.
+#                                      floor (warps<8 at BN>=128 = 3.6x slower) — bd 2D
+# Every pruner is a ``config_filter``: a per-config ``ok(config, args)`` predicate, an
+# optional ``when(args)`` regime gate, and an empty-survivor policy (advisory guards fall
+# back to the untouched grid; the BK-within-K correctness veto raises via ``on_empty`` —
+# silence there means wrong results). Ordered below: shared infrastructure, then the four
+# categories above.
+
+# sm_10x caps a single scaled MMA (dot_scaled) at N=256; Triton miscompiles wider ones
+# into a sticky illegal-address device trap. Plain-dot MMAs have NO such cap: a forced
+# width-512 GATE sweep on the tensor grouped kernel (2026-07-14) ran bit-exact wherever
+# it fit shared memory and failed only as benign launch-time smem overflows.
+SM10X_SCALED_MMA_MAX_N = 256
 
 
-def block_dynamic_grouped_gate_up_pruner(n_weight_tiles: int):
-    """``early_config_prune`` for the block-dynamic grouped gate_up: the smem estimate (see
-    ``smem_config_pruner``), the shared WS compile guard, and the Triton 3.7.1
-    pipeliner-race guard. The kernel's six-load-stream dual-dot K-loop RACES under the
-    default pipeliner at ``num_warps < 8`` or ``BLOCK_SIZE_M > 64`` (nondeterministic
-    wrong output) — ``warp_specialize`` fixes those configs and is faster. WS configs
-    outside the measured compile region (BM >= 64 with warps in {4, 8} — identical across
-    every mapped plain-dot loop, see ``warp_spec_compile_guard_pruner``) are dropped up
-    front instead of burning compiles into benign infs; WS=False survives only in the
-    flake-verified sound (w >= 8, BM <= 64) region. Configs in neither region (w < 8 at
-    BM <= 32) are correctly unrepresentable: non-WS races there and WS cannot compile.
-    CUDA-only — the race is a CUDA pipeliner artifact and the WS axis isn't emitted
-    elsewhere."""
-    smem_prune = smem_config_pruner(n_weight_tiles=n_weight_tiles)
-    ws_guard = warp_spec_compile_guard_pruner()
-
-    def prune(configs, named_args, **kwargs):
-        kept = smem_prune(configs, named_args, **kwargs)
-        if get_active_device_type() == "cuda":
-            kept = ws_guard(kept, named_args, **kwargs)
-            kept = [
-                c
-                for c in kept
-                if c.kwargs.get("WARP_SPEC")
-                or (c.num_warps >= 8 and c.kwargs.get("BLOCK_SIZE_M", 128) <= 64)
-            ] or kept
-        return kept
-
-    return prune
+def config_dim(c, all_args, name):
+    """A tile dimension for config ``c`` — from its tuned meta, else the launch args.
+    No default: a pruner reasoning about a dimension the kernel doesn't have is a wiring
+    bug, and a made-up value would silently mis-prune."""
+    v = c.kwargs.get(name, all_args.get(name))
+    if v is None:
+        raise ValueError(
+            f"pruner needs {name} (autotune config meta or launch arg); none found"
+        )
+    return v
 
 
-def block_dynamic_grouped_matmul_pruner():
-    """``early_config_prune`` for the block-dynamic grouped matmul: the Triton 3.7.1 pipeliner-race
-    guard, sized to THIS kernel's four-load-stream single-dot K-loop (the fused gate_up's
-    six-stream loop has a different sound region — see ``block_dynamic_grouped_gate_up_pruner``).
-    Measured on sm_100, 15-fresh-process flake runs per cell, big and tiny shapes:
-
-    - ``warp_specialize`` compiles iff ``BLOCK_SIZE_M >= 64`` with ``num_warps`` in {4, 8}
-      (PassManager failure otherwise) and is race-free everywhere it compiles.
-    - The default pipeliner RACES at ``BLOCK_SIZE_M >= 64`` (3/15 wrong at BM64/w8) and is
-      clean at BM16/32.
-
-    The regions are disjoint, so per launch-``BLOCK_SIZE_M`` (a launch arg here, not a tuned
-    axis): BM >= 64 keeps only the compilable WS configs, BM < 64 keeps only non-WS. CUDA-only
-    — the race is a CUDA pipeliner artifact and the WS axis isn't emitted elsewhere."""
+def config_filter(ok, when=None, on_empty=None):
+    """Wrap a per-config predicate into an ``early_config_prune``: keeps the configs where
+    ``ok(config, all_args)`` (``all_args`` = launch args + autotune kwargs). Every pruner
+    below is one of these — the predicate is always named ``ok``, so the factories differ
+    only in their rule, not their plumbing. ``when(all_args)`` gates the whole filter —
+    hardware/launch-regime checks live there, per-config logic in ``ok``. When nothing
+    survives, the untouched grid is returned (guards are advisory) unless ``on_empty(configs,
+    all_args)`` is given — correctness vetoes pass one that raises, because falling back to
+    configs that compute wrong results must be loud."""
 
     def prune(configs, named_args, **kwargs):
-        if get_active_device_type() != "cuda":
+        all_args = {**named_args, **kwargs}
+        if when is not None and not when(all_args):
             return configs
-        launch_bm = {**named_args, **kwargs}.get("BLOCK_SIZE_M", 128)
-
-        def ok(c):
-            # BLOCK_SIZE_M is a tuner axis since the metadata port — config-first
-            bm = c.kwargs.get("BLOCK_SIZE_M", launch_bm)
-            if bm >= 64:
-                return c.kwargs.get("WARP_SPEC") and c.num_warps in (4, 8)
-            return not c.kwargs.get("WARP_SPEC")
-
-        return [c for c in configs if ok(c)] or configs
-
-    return prune
-
-
-def warp_spec_compile_guard_pruner():
-    """``early_config_prune`` dropping ``warp_specialize`` configs that can never compile.
-    Measured on sm_100 for the plain-``tl.dot`` single-dot loops (matrix probe + 15-process
-    flake runs, big and tiny shapes, on both the 2D and grouped bd matmuls): WS compiles iff
-    ``BLOCK_SIZE_M >= 64`` with ``num_warps`` in {4, 8} (PassManager failure otherwise), and
-    ``dot_scaled`` + WS never compiles at all (PassManager, probed separately — MX "dot" and
-    "scalar" rows keep the axis). Non-WS configs all stay — on kernels using this guard the default pipeliner is the
-    validated existing state and WS is purely a perf axis (compiling WS configs are
-    deterministic by construction; off-region survivors self-prune as inf). ``BLOCK_SIZE_M``
-    is read from the config when tuned, else from the launch args. CUDA-only."""
-
-    def prune(configs, named_args, **kwargs):
-        if get_active_device_type() != "cuda":
-            return configs
-        launch_bm = {**named_args, **kwargs}.get(
-            "BLOCK_SIZE_M", 128
-        )  # config-first below
-
-        def ok(c):
-            bm = c.kwargs.get("BLOCK_SIZE_M", launch_bm)
-            if not c.kwargs.get("WARP_SPEC"):
-                return True
-            if c.kwargs.get("COMPUTE_MODE") == "dot_scaled":
-                return False
-            bm = c.kwargs.get("BLOCK_SIZE_M", launch_bm)
-            return bm >= 64 and c.num_warps in (4, 8)
-
-        return [c for c in configs if ok(c)] or configs
-
-    return prune
-
-
-def descriptor_config_pruner():
-    """``early_config_prune`` coupling the (MEMORY_MODE, SWAP_AB, WARP_SPEC) orientation
-    axes to their validated regions (B200, bd 2D loop, M=8192):
-
-    - descriptor modes REQUIRE ``SWAP_AB``: the natural orientation needs a per-iteration
-      ``tl.trans`` on the descriptor tile, which RACES without WS (Triton 3.7.1 pipeliner)
-      and loses 2.3x with it.
-    - ``SWAP_AB`` drops ``WARP_SPEC``: descriptor+WS measured 3-4x slower at every
-      (BM, stages) probed, and the WS compile/race map was only measured on the
-      non-swapped plain-dot loops — the swapped loop is a different structure.
-    - descriptor modes keep a warp floor: ``num_warps < 8`` under-subscribes the swapped
-      dot's M-operand (the full BN weight tile), 3.6x slower at BN=128. Applied only at
-      ``BLOCK_SIZE_N >= 128`` (config when tuned, else launch), where it was measured."""
-
-    def prune(configs, named_args, **kwargs):
-        launch_bn = {**named_args, **kwargs}.get("BLOCK_SIZE_N", 128)
-
-        def ok(c):
-            descriptor = c.kwargs.get("MEMORY_MODE", "pointer") != "pointer"
-            swapped = c.kwargs.get("SWAP_AB", descriptor)
-            if descriptor and not swapped:
-                return False
-            if swapped and c.kwargs.get("WARP_SPEC"):
-                return False
-            bn = c.kwargs.get("BLOCK_SIZE_N", launch_bn)
-            return not descriptor or c.num_warps >= 8 or bn < 128
-
-        return [c for c in configs if ok(c)] or configs
+        kept = [c for c in configs if ok(c, all_args)]
+        if kept:
+            return kept
+        return configs if on_empty is None else on_empty(configs, all_args)
 
     return prune
 
@@ -656,25 +616,146 @@ def block_k_within_k_pruner(k_arg: str):
     unmasked, so a non-dividing BK's last trip reads past the row — silently wrong results
     the tuner would happily time and pick. A contraction dim smaller than every grid BK is
     a hard error. Used standalone by the tensor-dynamic kernels (``BLOCK_SIZE_K`` is a
-    tuned axis there) and as the first stage of ``batched_mx_pruner``."""
+    tuned axis there) and as the first stage of ``mx_config_pruner``."""
 
-    def prune(configs, named_args, **kwargs):
-        k = {**named_args, **kwargs}[k_arg]
-        kept = [
-            c
-            for c in configs
-            if c.kwargs.get("BLOCK_SIZE_K", 0) == 0 or k % c.kwargs["BLOCK_SIZE_K"] == 0
-        ]
-        if not kept:
-            min_bk = min(c.kwargs.get("BLOCK_SIZE_K", 0) for c in configs)
-            raise ValueError(
-                f"{k_arg}={k} is not a multiple of any BLOCK_SIZE_K in the autotune grid; "
-                f"the unmasked K-loop would read past the row. Pad the problem along "
-                f"{k_arg} (smallest grid BK: {min_bk})."
-            )
-        return kept
+    def ok(c, args):
+        bk = c.kwargs.get("BLOCK_SIZE_K", 0)
+        return bk == 0 or args[k_arg] % bk == 0
 
-    return prune
+    def raise_no_dividing_bk(configs, args):
+        min_bk = min(c.kwargs.get("BLOCK_SIZE_K", 0) for c in configs)
+        raise ValueError(
+            f"{k_arg}={args[k_arg]} is not a multiple of any BLOCK_SIZE_K in the autotune "
+            f"grid; the unmasked K-loop would read past the row. Pad the problem along "
+            f"{k_arg} (smallest grid BK: {min_bk})."
+        )
+
+    return config_filter(ok, on_empty=raise_no_dividing_bk)
+
+
+def warp_spec_compile_guard_pruner():
+    """``early_config_prune`` dropping ``warp_specialize`` configs that can never compile.
+    Measured on sm_100 for the plain-``tl.dot`` single-dot loops (matrix probe + 15-process
+    flake runs, big and tiny shapes, on both the 2D and grouped bd matmuls): WS compiles iff
+    ``BLOCK_SIZE_M >= 64`` with ``num_warps`` in {4, 8} (PassManager failure otherwise), and
+    ``dot_scaled`` + WS never compiles at all (PassManager, probed separately — MX "dot" and
+    "scalar" rows keep the axis). Non-WS configs all stay — on kernels using this guard the
+    default pipeliner is the validated existing state and WS is purely a perf axis (compiling
+    WS configs are deterministic by construction; off-region survivors self-prune as inf).
+    CUDA-only."""
+
+    def ok(c, args):
+        if not c.kwargs.get("WARP_SPEC"):
+            return True
+        if c.kwargs.get("COMPUTE_MODE") == "dot_scaled":
+            return False
+        return config_dim(c, args, "BLOCK_SIZE_M") >= 64 and c.num_warps in (4, 8)
+
+    return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
+
+
+def mx_config_pruner(k_arg: str):
+    """``early_config_prune`` for the MX kernels (2D, batched, grouped — their tile is always
+    tuned): a BK-within-K veto plus sm_10x MMA-shape guards (no-ops elsewhere and for scalar
+    configs). GATE-aware: under the GATE constexpr (read from the launch args) the kernel
+    computes gate|up as one stacked 2*BN extent, so the swapped dot_scaled lhs has ``2*BN``
+    rows and the no-swap combined dot is ``2*BN`` wide; a plain launch's counts are just
+    ``BN``.
+
+    - ``BLOCK_SIZE_K`` not dividing the launch's contraction dim (``k_arg`` names it) →
+      dropped: the K-loop loads are unmasked, so any non-dividing BK's last trip reads
+      past the row — silently wrong results the tuner would happily time and pick (bit us when
+      BK=512 met a K=256 test problem).
+    - MXFP4 ``scalar`` configs → dropped (sm_10x only — the 1.8x-dead evidence is B200;
+      other targets lower dot_scaled differently and keep the mode): fp4 scalar decode is
+      ALU-bound in the E2M1 unpack and measured 1.8x SLOWER than dot_scaled (twice, incl.
+      the no-pad form) — it never wins, and its swapped variants poison the TPE's
+      per-dimension model into writing off SWAP_AB (a 100-trial dsv4 down tune benched 3
+      swap configs — two dead-slow swap-scalar, one inf — and shipped a 38.9µs no-swap
+      winner, missing the ~24µs swap dot_scaled basin entirely).
+    - Swapped ``dot_scaled`` rows < 128 → dropped: the native mxfp scaled-MMA gates on the M
+      operand being exactly 128, so smaller rows run the bf16-upcast fallback and never win —
+      the same poison mechanism (an earlier dsv4 gate_up tune shipped 63µs missing the 43µs
+      swap winner).
+    - No-swap ``dot_scaled`` width > ``SM10X_SCALED_MMA_MAX_N`` → dropped: Triton
+      miscompiles wider scaled MMAs into a sticky illegal-address device trap that poisons
+      the context mid-autotune.
+
+    The shape gates above are scoped to ``dot_scaled`` — they are native scaled-MMA bug
+    gates. The ``dot`` arm (BK structurally the UE8M0 group, 32) is CORRECT everywhere
+    probed (forced-config sweep 2026-07-14, GATE and plain, MXFP4/MXFP8, incl. width-512
+    stacked dots) but is fenced on sm_10x as TPE POISON: an A/B of fresh 100-trial tunes
+    (mx grouped, S=4096 E=32 N=1024 K=2048 MXFP8) shipped dot winners 2-3x SLOWER with the
+    dot rows in the grid (gate 0.297ms vs 0.095ms, plain 0.147ms vs 0.079ms) — the ~2x
+    larger grid dilutes the trial budget and the early-sampled dot basin hijacks the TPE
+    densities, so the native scaled-MMA winner is never found. dot never wins on sm_10x
+    (native dot_scaled owns prefill, scalar owns M=1 decode); other targets keep the arm.
+    Revisit if a dot win materializes (e.g. the batched decode BM=16 observation).
+
+    Never returns empty — dot_scaled no-swap configs pass every guard (the ``config_filter``
+    fallbacks cover the pathological cases). A contraction dim smaller than every grid BK is
+    a hard error: any config would over-read past the row and return silently wrong results."""
+
+    def mma_shape_ok(c, args):
+        if c.kwargs.get("COMPUTE_MODE") != "dot_scaled":
+            return True
+        # dot_scaled BK < 128 performs MISALIGNED accesses (verified: every isolated
+        # BK=64 launch prints the cudaErrorMisalignedAddress signature; BK>=128 never
+        # does). The UB is intermittently fatal — two long tuning runs died with the
+        # sticky CUDA 716 context corruption while isolated launches survive — so the
+        # rows can't even be benched safely.
+        if c.kwargs["BLOCK_SIZE_K"] < 128:
+            return False
+        # Single-trip dot_scaled (BK >= contraction dim) trips the sm_10x
+        # accumulator-init miscompile (uninitialized TMEM alloc must be mutable).
+        # Bites only small K (e.g. a K=512 gate_up with BK=512): silently wrong results
+        # the tuner would happily time and pick (surfaced as a 35% MXFP4 fused-MoE error).
+        if c.kwargs["BLOCK_SIZE_K"] >= args[k_arg]:
+            return False
+        # stacked 2*BN extent under the GATE constexpr (the kernels serve plain and gate|up)
+        rows = (2 if args.get("GATE") else 1) * c.kwargs["BLOCK_SIZE_N"]
+        return rows >= 128 if c.kwargs.get("SWAP_AB") else rows <= SM10X_SCALED_MMA_MAX_N
+
+    def fp4_scalar_ok(c, args):
+        return c.kwargs.get("COMPUTE_MODE") != "scalar"
+
+    def dot_arm_ok(c, args):
+        return c.kwargs.get("COMPUTE_MODE") != "dot"
+
+    return compose_pruners(
+        block_k_within_k_pruner(k_arg),
+        config_filter(
+            fp4_scalar_ok,
+            when=lambda args: is_sm10x() and args.get("VALUES_PER_BYTE") == 2,
+        ),
+        config_filter(dot_arm_ok, when=lambda args: is_sm10x()),
+        config_filter(mma_shape_ok, when=lambda args: is_sm10x()),
+    )
+
+
+def block_dynamic_grouped_matmul_pruner():
+    """``early_config_prune`` for the block-dynamic grouped kernel: the Triton 3.7.1
+    pipeliner-race guard, sized to its four-load-stream single-dot K-loop. The GATE arm
+    shares the guard: post-activation-prequant it dots the stacked gate|up as the same
+    single-dot loop (one wider weight tile, not a second dot/load stream) and was
+    flake-verified race-free cross-process. Measured on sm_100, 15-fresh-process flake
+    runs per cell, big and tiny shapes:
+
+    - ``warp_specialize`` compiles iff ``BLOCK_SIZE_M >= 64`` with ``num_warps`` in {4, 8}
+      (PassManager failure otherwise) and is race-free everywhere it compiles.
+    - The default pipeliner RACES at ``BLOCK_SIZE_M >= 64`` (3/15 wrong at BM64/w8) and is
+      clean at BM16/32.
+
+    The regions are disjoint, so per ``BLOCK_SIZE_M``: BM >= 64 keeps only the compilable
+    WS configs, BM < 64 keeps only non-WS. CUDA-only — the race is a CUDA pipeliner
+    artifact and the WS axis isn't emitted elsewhere."""
+
+    def ok(c, args):
+        if config_dim(c, args, "BLOCK_SIZE_M") >= 64:
+            return c.kwargs.get("WARP_SPEC") and c.num_warps in (4, 8)
+        return not c.kwargs.get("WARP_SPEC")
+
+    return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
 
 
 def scalar_max_m_pruner(m_arg: str, max_m: int = 64):
@@ -684,196 +765,40 @@ def scalar_max_m_pruner(m_arg: str, max_m: int = 64):
     densities (measured: with scalar in the M=8192 grid the 2D MX attn prefill tune
     landed 0.48x vs hub; without it, 2.06x)."""
 
-    def prune(configs, named_args, **kwargs):
-        if {**named_args, **kwargs}[m_arg] <= max_m:
-            return configs
-        return [
-            c for c in configs if c.kwargs.get("COMPUTE_MODE") != "scalar"
-        ] or configs
+    def ok(c, args):
+        return c.kwargs.get("COMPUTE_MODE") != "scalar"
 
-    return prune
+    return config_filter(ok, when=lambda args: args[m_arg] > max_m)
 
 
-def batched_mx_pruner(k_arg: str, stacked_gate_up: bool = False):
-    """``early_config_prune`` for the batched MX kernels: a BK-within-K veto plus two sm_10x
-    MMA-shape guards (no-ops elsewhere and for scalar configs). With ``stacked_gate_up`` the
-    kernel computes gate|up as one stacked 2*BN extent, so the swapped dot_scaled lhs has
-    ``2*BN`` rows and the no-swap combined dot is ``2*BN`` wide; the down kernel's counts are
-    just ``BN``.
+def descriptor_config_pruner():
+    """``early_config_prune`` coupling the (MEMORY_MODE, SWAP_AB, WARP_SPEC) orientation
+    axes to their validated regions (B200, bd 2D loop, M=8192):
 
-    - ``BLOCK_SIZE_K`` not dividing the launch's contraction dim (``k_arg`` names it: ``"K"``
-      for the batched matmul, ``HIDDEN_DIM`` / ``INTERMEDIATE_DIM`` for the fused gate_up /
-      down) → dropped: the K-loop loads are unmasked, so any non-dividing BK's last trip reads
-      past the row — silently wrong results the tuner would happily time and pick (bit us when
-      BK=512 met a K=256 test problem).
-    - MXFP4 ``scalar`` configs → dropped (sm_10x only — the 1.8x-dead evidence is B200;
-      other targets lower dot_scaled differently and keep the mode): fp4 scalar decode is ALU-bound in the E2M1 unpack
-      and measured 1.8x SLOWER than dot_scaled (twice, incl. the no-pad form) — it never wins,
-      and its swapped variants poison the TPE's per-dimension model into writing off SWAP_AB
-      (a 100-trial dsv4 down tune benched 3 swap configs — two dead-slow swap-scalar, one inf —
-      and shipped a 38.9µs no-swap winner, missing the ~24µs swap dot_scaled basin entirely).
-    - Swapped ``dot_scaled`` rows < 128 → dropped: the native mxfp scaled-MMA gates on the M
-      operand being exactly 128, so smaller rows run the bf16-upcast fallback and never win —
-      the same poison mechanism (an earlier dsv4 gate_up tune shipped 63µs missing the 43µs
-      swap winner).
-    - No-swap tensor-core width > 256 → dropped: sm_10x caps an MMA at N=256 and Triton
-      miscompiles wider ones into a sticky device trap (see ``smem_config_pruner``'s
-      ``wide_dot_scaled``).
+    - descriptor modes REQUIRE ``SWAP_AB``: the natural orientation needs a per-iteration
+      ``tl.trans`` on the descriptor tile, which RACES without WS (Triton 3.7.1 pipeliner)
+      and loses 2.3x with it.
+    - ``SWAP_AB`` drops ``WARP_SPEC``: descriptor+WS measured 3-4x slower at every
+      (BM, stages) probed, and the WS compile/race map was only measured on the
+      non-swapped plain-dot loops — the swapped loop is a different structure.
+    - descriptor modes keep a warp floor: ``num_warps < 8`` under-subscribes the swapped
+      dot's M-operand (the full BN weight tile), 3.6x slower at BN=128. Applied only at
+      ``BLOCK_SIZE_N >= 128``, where it was measured."""
 
-    Never returns empty — dot_scaled no-swap configs pass every guard (the ``or kept``
-    fallbacks cover the pathological cases). A contraction dim smaller than every grid BK is
-    a hard error: any config would over-read past the row and return silently wrong results."""
-    n_blocks = 2 if stacked_gate_up else 1
-    bk_within_k = block_k_within_k_pruner(k_arg)
+    def ok(c, args):
+        descriptor = c.kwargs.get("MEMORY_MODE", "pointer") != "pointer"
+        swapped = c.kwargs.get("SWAP_AB", descriptor)
+        if descriptor and not swapped:
+            return False
+        if swapped and c.kwargs.get("WARP_SPEC"):
+            return False
+        return (
+            not descriptor
+            or c.num_warps >= 8
+            or config_dim(c, args, "BLOCK_SIZE_N") < 128
+        )
 
-    def prune(configs, named_args, **kwargs):
-        all_args = {**named_args, **kwargs}
-        kept = bk_within_k(configs, named_args, **kwargs)
-        on_sm10x = is_sm10x()
-        if on_sm10x and all_args.get("VALUES_PER_BYTE") == 2:
-            kept = [c for c in kept if c.kwargs.get("COMPUTE_MODE") != "scalar"] or kept
-        if on_sm10x:
-
-            def ok(c):
-                if c.kwargs.get("COMPUTE_MODE") == "scalar":
-                    return True
-                # dot_scaled BK < 128 performs MISALIGNED accesses (verified: every
-                # isolated BK=64 launch prints the cudaErrorMisalignedAddress signature;
-                # BK>=128 never does). The UB is intermittently fatal — two long tuning
-                # runs died with the sticky CUDA 716 context corruption while isolated
-                # launches survive — so the rows can't even be benched safely.
-                if c.kwargs["BLOCK_SIZE_K"] < 128:
-                    return False
-                rows = n_blocks * c.kwargs["BLOCK_SIZE_N"]
-                if c.kwargs.get("SWAP_AB"):
-                    return rows >= 128
-                return rows <= 256
-
-            kept = [c for c in kept if ok(c)] or kept
-        return kept
-
-    return prune
-
-
-def smem_config_pruner(
-    n_weight_tiles: int,
-    weight_bytes: int = 1,
-    reduction_dim: str | None = None,
-    double_mma: bool = False,
-):
-    """Build an ``early_config_prune`` that drops configs whose pipelined operand shared
-    memory would overflow the SM — the source of ``out of resource: shared memory`` autotune
-    failures (and the wasted compiles they cause).
-
-    Per-stage estimate (bytes) = ``BK · (act_bytes·BM + weight_bytes·n_weight_tiles·BN)``:
-    one activation tile ``[BM, BK]`` plus ``n_weight_tiles`` weight tiles ``[BN, BK]``
-    (gate_up loads 2; down has 1), times ``num_stages``. ``BM`` is the routing-derived tile
-    and the act element size is read off the first launch arg (the activation tensor by
-    kernel convention), so both track the launch. MXFP4 packs 2 weights/byte, so
-    ``weight_bytes=1`` (MXFP8) is a safe upper bound. The limit is read from the active device. Never returns empty — keeps
-    the smallest-footprint config as a fallback.
-
-    Two sm_10x (Blackwell-datacenter, TMEM scaled-MMA) ``dot_scaled`` compiler-bug guards, both
-    no-ops off sm_10x:
-
-    ``reduction_dim`` (the K-loop bound arg name, e.g. ``"INTERMEDIATE_DIM"``) drops ``dot_scaled``
-    configs with ``BLOCK_SIZE_K >= reduction_dim`` — a single-trip K-loop, which trips a Triton
-    ``optimize-accumulator-init`` bug (uninitialized TMEM alloc must be mutable) and never
-    compiles. ``None`` (default) disables the check.
-
-    ``double_mma`` marks a kernel that folds its ``n_weight_tiles`` into ONE wide MMA rather than
-    dotting them separately — the fused gate_up kernel does a single ``[BM, n_weight_tiles*BN]``
-    dot (n_weight_tiles=2 → double-width N=2*BN). Its ``dot_scaled`` configs whose MMA width
-    ``n_weight_tiles * BLOCK_SIZE_N`` exceeds sm_10x's N=256 cap are dropped (Triton miscompiles
-    wider ones: packed-E2M1 rhs → sticky "misaligned address" device trap). Off by default: a
-    kernel can hold 2 weight tiles yet dot them *separately* (each ``[BM, BN]``), e.g. the batched
-    gate_up — there ``n_weight_tiles=2`` but ``double_mma=False``, so N stays BN."""
-
-    def prune(configs, named_args, **kwargs):
-        """``early_config_prune`` callback. Drops configs that (a) overflow the SM's shared memory
-        or run a ``dot_scaled`` that miscompiles on sm_100 — (b) a single-trip K-loop or (c) an
-        MMA wider than N=256. Falls back to the smallest-smem config so the autotuner is never
-        handed an empty list."""
-        # Tile dims live either in the autotuned config meta (MX) or the launch args (block-dynamic),
-        # so `dim` looks in both.
-        all_args = {**named_args, **kwargs}
-        limit = sm_shared_memory_limit()
-        # The dot_scaled guards below are Blackwell-datacenter (sm_10x, TMEM scaled-MMA) compiler
-        # bugs — off on every other target, so they never over-prune there.
-        on_sm10x = is_sm10x()
-
-        def dim(c, name):
-            """A dimension for config ``c`` (a ``BLOCK_SIZE_*`` tile dim or a reduction extent like
-            ``HIDDEN_DIM``) — from its config meta or the launch args; raises if present in neither."""
-            v = c.kwargs.get(name, all_args.get(name))
-            if v is None:
-                raise ValueError(
-                    f"smem_config_pruner needs {name} (autotune config meta or launch arg) "
-                    "to estimate shared memory; none found."
-                )
-            return v
-
-        def smem(c):
-            """Peak pipelined-operand shared memory (bytes) for ``c``: ``num_stages`` copies of one
-            ``[BM, BK]`` activation tile plus ``n_weight_tiles`` ``[BN, BK]`` weight tiles.
-            The act element size is read off the FIRST launch arg — the activation tensor
-            by kernel convention — so it tracks the dtype per launch (fp8 offline arm vs
-            raw bf16 inline arm below the ``maybe_act_quant`` threshold)."""
-            BM, BN, BK = (
-                dim(c, n) for n in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K")
-            )
-            act_bytes = next(iter(named_args.values())).element_size()
-            return (
-                c.num_stages
-                * BK
-                * (act_bytes * BM + weight_bytes * n_weight_tiles * BN)
-            )
-
-        def single_trip_dot_scaled(c):
-            """True if ``c`` is a ``dot_scaled`` config whose K-loop is a single trip
-            (``BLOCK_SIZE_K >= reduction_dim``) — the sm_10x accumulator-init miscompile (see the
-            ``reduction_dim`` note above). No-op when ``reduction_dim`` is None or off sm_10x."""
-            return (
-                on_sm10x
-                and reduction_dim is not None
-                and c.kwargs.get("COMPUTE_MODE") == "dot_scaled"
-                and dim(c, "BLOCK_SIZE_K") >= dim(c, reduction_dim)
-            )
-
-        def wide_dot_scaled(c):
-            """True if ``c`` is a tensor-core config whose single MMA is wider than N=256 —
-            sm_10x caps an MMA there and Triton miscompiles wider ones (sticky illegal-address
-            device trap that poisons the context mid-autotune). Hits ``dot_scaled`` AND plain
-            ``dot``: an exhaustive forced-config sweep (M3 MXFP8 gate_up, 1440 configs) trapped
-            both modes at width 512, config-dependently (BM/warps/stages decide whether the
-            compiler splits the wide MMA), so the whole width class is dropped. The MMA width is
-            ``n_weight_tiles * BLOCK_SIZE_N`` when the kernel fuses its tiles into one dot
-            (``double_mma``); otherwise each dot is N=BN and can't exceed the cap. No-op off
-            sm_10x or when ``double_mma`` is False."""
-            return (
-                on_sm10x
-                and double_mma
-                and c.kwargs.get("COMPUTE_MODE") in ("dot_scaled", "dot")
-                and n_weight_tiles * dim(c, "BLOCK_SIZE_N") > 256
-            )
-
-        # The smem estimate CANNOT classify near the limit: vs compiled ground truth (2880-config
-        # sweep) configs ran fine up to est=1.41x limit while real failures dipped to est=0.21x —
-        # the distributions overlap, so any tight threshold trims viable configs (a 1.0x cutoff
-        # measurably discarded 138 that compile and run). It only vetoes the impossible: >2x is
-        # 42% above the largest surviving over-estimate ever observed, and still skips the deep
-        # overflows (up to 5x). Everything else is left to the compiler — a config that doesn't
-        # fit fails its one benching compile and is scored inf.
-        kept = [
-            c
-            for c in configs
-            if smem(c) <= 2 * limit
-            and not single_trip_dot_scaled(c)
-            and not wide_dot_scaled(c)
-        ]
-        return kept or [min(configs, key=smem)]
-
-    return prune
+    return config_filter(ok)
 
 
 # ── Triton-side helpers (inlined by ``@triton.jit`` callers) ──────────────────
@@ -1430,42 +1355,87 @@ def _count_kernel(
     )
 
 
-class GroupedScheduling(NamedTuple):
-    """One routing pass over ``expert_ids``, shared by every grouped GEMM of a layer.
-    ``perm_routed`` maps each expert-sorted position to its token-major routed row
-    ``(t*K + j)`` — the same ``perm = torch.sort(expert_ids)`` indices as transformers'
-    moe.py. ``perm_token`` is its row-of-hidden form ``perm_routed // num_top_k``
-    (many-to-one for
-    top_k > 1 — the gather that reads hidden without replication), NOT ``inv_perm``:
-    the inverse is never materialized here, because the kernels un-permute by
-    SCATTERING through ``perm_routed`` at store time instead of gathering through ``inv_perm``
-    on the host. ``expert_start`` is ``(E+1,)`` cumulative sorted-row starts padded with
-    S — what the kernels build their register-resident tile layout from."""
+@dataclass(frozen=True)
+class Epilogue:
+    """Fused output transform of a grouped/batched GEMM (default = plain GEMM). ``gate`` loads
+    the weight as the stacked gate|up projection and applies the ``act_fn``/SwiGLU gated linear
+    unit; ``requant`` requantizes the intermediate, and the op then returns it plus its scale
+    tensor (a plain / ``requant=False`` op returns the single output). ``simulate_unfused``
+    rounds intermediates through the output dtype to match the separate-kernel path.
+    ``output_dtype`` is the output element type; ``None`` resolves in the op (``A.dtype`` for raw
+    activations, ``bfloat16`` when ``A`` is pre-quantized and ``A.dtype`` would be FP8). Under
+    ``requant`` the stored output is the recipe's FP8 format regardless — there ``output_dtype``
+    instead names the dtype the UNFUSED path lands intermediates in (the ``simulate_unfused``
+    rounding grid; the fused wrappers pass the hidden-states dtype, which the op could not
+    otherwise recover from an already-quantized ``A``). Row order
+    (gather/scatter) is NOT carried here — it is passed to the op as standalone
+    ``gather_idx``/``scatter_idx`` maps (``None`` = that side is already expert-ordered)."""
 
-    perm_token: torch.Tensor
-    perm_routed: torch.Tensor
-    expert_start: torch.Tensor
+    gate: bool = False
+    act_fn: str = "silu"
+    swiglu_alpha: float | None = None
+    swiglu_limit: float | None = None
+    requant: bool = False
+    simulate_unfused: bool = False
+    output_dtype: torch.dtype | None = None
+
+    def as_args(self) -> tuple:
+        """Flatten to the positional primitives the registered matmul ops take — torch custom
+        ops can't accept the dataclass itself."""
+        return (
+            self.gate,
+            self.act_fn,
+            self.swiglu_alpha,
+            self.swiglu_limit,
+            self.requant,
+            self.simulate_unfused,
+            self.output_dtype,
+        )
+
+
+def resolve_output_dtype(
+    output_dtype: torch.dtype | None,
+    activation: torch.Tensor,
+    act_scale: torch.Tensor | None,
+) -> torch.dtype:
+    """Output element type for a quantized matmul: the explicit ``output_dtype`` if given, else
+    the raw activation dtype (``act_scale`` is None -> ``activation`` is high precision), else
+    ``bfloat16`` (``activation`` is pre-quantized FP8, whose dtype is not a valid output)."""
+    if output_dtype is not None:
+        return output_dtype
+    return activation.dtype if act_scale is None else torch.bfloat16
 
 
 def compute_grouped_scheduling(
     expert_ids: torch.Tensor, num_experts: int, num_top_k: int
-) -> GroupedScheduling:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """On-device routing: expert-sorted index (no copy of the activations) via two Triton
-    launches — exclusive offsets + an atomic counting-sort scatter (replaces host
-    ``argsort``). Public: run it once per layer and pass the handle to every grouped GEMM
-    of that layer (``matmul_grouped``'s ``input_ordered``/``output_ordered`` flags pick
-    the right map) and to the fused MoE ops. E must be a power of 2 (the scheduling kernels
-    hold the per-expert vectors in one ``tl.arange`` block)."""
+    launches — exclusive offsets + an atomic counting-sort scatter (replaces host ``argsort``).
+    Run it once per layer and pass the results to every grouped GEMM of that layer. Returns
+    ``(expert_start, gather_idx, scatter_idx)``:
+
+    - ``expert_start`` — ``(E+1,)`` cumulative sorted-row starts padded with S; the tiling
+      schedule the kernels build their register-resident tile layout from.
+    - ``gather_idx`` — each sorted position's source row of hidden (``perm // num_top_k``,
+      many-to-one for top_k > 1: the gather that reads hidden without replication). Pass as the
+      GEMM's input map (``None`` = ``A`` already expert-sorted, e.g. the down projection).
+    - ``scatter_idx`` — each sorted position's token-major routed destination row ``(t*K + j)``,
+      the ``perm = torch.sort(expert_ids)`` indices (kernels un-permute by SCATTERING at store
+      time, never materializing ``inv_perm``). Pass as the output map (``None`` = leave the output
+      expert-sorted, e.g. the gate_up projection's intermediate).
+
+    E must be a power of 2 (the scheduling kernels hold the per-expert vectors in one
+    ``tl.arange`` block)."""
     # the scheduling kernels hold the (E,) frequency/offset vectors in one tl.arange
     # block, which requires a power of 2 — fail here with a clear message instead of a
     # Triton compile error from an internal kernel
     assert num_experts & (num_experts - 1) == 0, (
         f"num_experts ({num_experts}) must be a power of 2"
     )
-    perm_token, perm, expert_start = _compute_grouped_scheduling(
+    gather_idx, scatter_idx, expert_start = _compute_grouped_scheduling(
         expert_ids, num_experts, num_top_k
     )
-    return GroupedScheduling(perm_token, perm, expert_start)
+    return expert_start, gather_idx, scatter_idx
 
 
 @compile_time_only_triton_op(
@@ -1565,18 +1535,18 @@ def resolve_grouped_tile(
     freqs,
     tile_start_excl,
     e_offs,
-    InputPerm,
-    OutputPerm,
+    GatherIdx,
+    ScatterIdx,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
-    HAS_INPUT_PERM: tl.constexpr,
-    HAS_OUTPUT_PERM: tl.constexpr,
+    HAS_GATHER: tl.constexpr,
+    HAS_SCATTER: tl.constexpr,
 ):
     """One persistent grouped tile: split the flat ``tile_id`` into (M-tile, N-tile), map
     the M-tile to its expert + rows via ``resolve_tile_inline`` (on the register-resident
     layout ``build_tile_layout`` builds once per program, passed in), and apply the virtual
-    sort — rows load from ``in_row`` and store to ``out_row``, mapped by ``InputPerm`` /
-    ``OutputPerm`` when present else the expert-sorted position itself.
+    sort — rows load from ``in_row`` and store to ``out_row``, mapped by ``GatherIdx`` /
+    ``ScatterIdx`` when present else the expert-sorted position itself.
 
     Returns ``(pid_n, expert_id, expert_id64, in_row, out_row, row_mask, offs_bn)`` — both
     expert-id widths: ``expert_id`` (int32, e.g. TMA descriptor row indices, bounded by the
@@ -1588,12 +1558,12 @@ def resolve_grouped_tile(
     expert_id, offs_global_m, row_mask = resolve_tile_inline(
         pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_SIZE_M
     )
-    if HAS_INPUT_PERM:
-        in_row = tl.load(InputPerm + offs_global_m, mask=row_mask, other=0)
+    if HAS_GATHER:
+        in_row = tl.load(GatherIdx + offs_global_m, mask=row_mask, other=0)
     else:
         in_row = offs_global_m
-    if HAS_OUTPUT_PERM:
-        out_row = tl.load(OutputPerm + offs_global_m, mask=row_mask, other=0)
+    if HAS_SCATTER:
+        out_row = tl.load(ScatterIdx + offs_global_m, mask=row_mask, other=0)
     else:
         out_row = offs_global_m
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -1669,41 +1639,60 @@ def block_scaled_fp8_dot(a, a_scale, w, w_scale, SWAP_AB: tl.constexpr):
 
 @triton.jit
 def stacked_gate_up_ptrs(
-    base, offs_n, offs_k, block_stride, stride_n, stride_k, SWAP_AB: tl.constexpr
+    base,
+    offs_n,
+    offs_k,
+    block_stride,
+    stride_n,
+    stride_k,
+    GATE: tl.constexpr,
+    SWAP_AB: tl.constexpr,
 ):
-    """Gate|up stacked 3D weight-tile pointers, oriented by ``SWAP_AB`` — the gate_up
-    counterpart of ``oriented_tile_ptrs``. One axis indexes the {gate, up} row block (up
-    offset by ``block_stride``), placed so ``stacked_gate_up_flatten``'s plain reshape yields
-    the 2D stacked tile: swap ``[2, N, K]`` (output rows in the MMA M dim), no-swap
-    ``[K, 2, N]`` (K-major, gate|up along the MMA N dim — the grouped kernel's combined form).
-    The per-step K-advance is the same scalar stride step in both orientations."""
-    blk = tl.arange(0, 2) * block_stride
-    if SWAP_AB:
-        ptrs = base + (
-            blk[:, None, None]
-            + offs_n[None, :, None] * stride_n
-            + offs_k[None, None, :] * stride_k
-        )
+    """Weight-tile pointers oriented by ``SWAP_AB``, gated by ``GATE`` — the gate_up
+    counterpart of ``oriented_tile_ptrs``. With ``GATE`` a leading axis indexes the
+    {gate, up} row block (up offset by ``block_stride``), placed so
+    ``stacked_gate_up_flatten``'s plain reshape yields the 2D stacked tile: swap
+    ``[2, N, K]`` (output rows in the MMA M dim), no-swap ``[K, 2, N]`` (K-major, gate|up
+    along the MMA N dim — the grouped kernel's combined form). Without ``GATE`` it is the
+    plain single 2D tile (``block_stride`` unused), identical to ``oriented_tile_ptrs``. The
+    per-step K-advance is the same scalar stride step in every orientation."""
+    if GATE:
+        blk = tl.arange(0, 2) * block_stride
+        if SWAP_AB:
+            ptrs = base + (
+                blk[:, None, None]
+                + offs_n[None, :, None] * stride_n
+                + offs_k[None, None, :] * stride_k
+            )
+        else:
+            ptrs = base + (
+                offs_k[:, None, None] * stride_k
+                + blk[None, :, None]
+                + offs_n[None, None, :] * stride_n
+            )
+    elif SWAP_AB:
+        ptrs = base + (offs_n[:, None] * stride_n + offs_k[None, :] * stride_k)
     else:
-        ptrs = base + (
-            offs_k[:, None, None] * stride_k
-            + blk[None, :, None]
-            + offs_n[None, None, :] * stride_n
-        )
+        ptrs = base + (offs_k[:, None] * stride_k + offs_n[None, :] * stride_n)
     return ptrs
 
 
 @triton.jit
 def stacked_gate_up_flatten(
-    w3, N2: tl.constexpr, KB: tl.constexpr, SWAP_AB: tl.constexpr
+    w3, N2: tl.constexpr, KB: tl.constexpr, GATE: tl.constexpr, SWAP_AB: tl.constexpr
 ):
-    """Flatten a loaded 3D gate|up tile (see ``stacked_gate_up_ptrs``) to the stacked 2D tile:
-    swap ``[N2, KB]`` (rows-major MMA lhs), no-swap ``[KB, N2]`` (K-major rhs). Rows/columns
-    0..N-1 are gate, N..2N-1 up — ``split_gate_up`` undoes the stacking after the K-loop."""
-    if SWAP_AB:
-        w2 = tl.reshape(w3, (N2, KB))
+    """Flatten a loaded gate|up tile (see ``stacked_gate_up_ptrs``) to the 2D MMA tile. With
+    ``GATE`` the stacked 3D tile collapses to the 2D stacked form: swap ``[N2, KB]`` (rows-major
+    MMA lhs), no-swap ``[KB, N2]`` (K-major rhs); columns/rows 0..N-1 are gate, N..2N-1 up
+    (``split_gate_up`` undoes it after the K-loop). Without ``GATE`` the tile is already 2D and
+    passes through unchanged (``N2``/``KB`` unused)."""
+    if GATE:
+        if SWAP_AB:
+            w2 = tl.reshape(w3, (N2, KB))
+        else:
+            w2 = tl.reshape(w3, (KB, N2))
     else:
-        w2 = tl.reshape(w3, (KB, N2))
+        w2 = w3
     return w2
 
 
@@ -1819,9 +1808,25 @@ def glu(
         act = g * sig
         u = u + 1.0
     elif ACT_FN == "silu":
-        act = g * tl.sigmoid(g)
+        sig = tl.sigmoid(g)
+        # SIMULATE_UNFUSED must be bit-exact vs the unfused ``apply_glu`` (``g * torch.sigmoid(g)``),
+        # where torch.sigmoid returns bf16 — i.e. the sigmoid is rounded before the multiply. Round
+        # it here to match (the fp32 sigmoid otherwise flips e4m3 requant bits, ~35% on MXFP4 down).
+        if SIMULATE_UNFUSED:
+            sig = sig.to(INTERMEDIATE_DTYPE).to(tl.float32)
+        act = g * sig
     elif ACT_FN == "gelu":
-        act = 0.5 * g * (1.0 + tl.erf(g * 0.7071067811865476))
+        if SIMULATE_UNFUSED:
+            # Bit-match the unfused ``apply_glu`` gelu ``0.5 * g * (1 + erf(g * c))``, which rounds
+            # to bf16 at every torch op (input to erf, erf, 1+erf, 0.5*g, final mul). Rounding only
+            # a subset diverges (~0.7 rel) on the MX requant — round each op, like torch does.
+            gc = (g * 0.7071067811865476).to(INTERMEDIATE_DTYPE).to(tl.float32)
+            e = tl.erf(gc).to(INTERMEDIATE_DTYPE).to(tl.float32)
+            one_plus = (1.0 + e).to(INTERMEDIATE_DTYPE).to(tl.float32)
+            half_g = (0.5 * g).to(INTERMEDIATE_DTYPE).to(tl.float32)
+            act = half_g * one_plus
+        else:
+            act = 0.5 * g * (1.0 + tl.erf(g * 0.7071067811865476))
     elif ACT_FN == "relu":
         act = tl.maximum(g, 0.0)
     else:
@@ -1839,6 +1844,132 @@ def glu(
         gated = gated.to(INTERMEDIATE_DTYPE).to(tl.float32)
 
     return gated
+
+
+def apply_glu(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+) -> torch.Tensor:
+    """Host-side (torch) gated linear unit — the unfused path's activation, mirroring the triton
+    ``glu``. ``swiglu_limit`` clamps gate above / up to ``[-limit, limit]``; ``swiglu_alpha`` gives
+    the clamped/scaled SwiGLU ``(up + 1) * gate * sigmoid(alpha * gate)`` (GPT-OSS / MiniMax), else
+    ``act_fn(gate) * up`` (``act_fn`` in {silu, gelu, relu}, gelu exact via erf)."""
+    if swiglu_limit is not None:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    if swiglu_alpha is not None:
+        return (up + 1.0) * (gate * torch.sigmoid(gate * swiglu_alpha))
+    if act_fn == "silu":
+        act = gate * torch.sigmoid(gate)
+    elif act_fn == "gelu":
+        act = 0.5 * gate * (1.0 + torch.erf(gate * 0.7071067811865476))
+    elif act_fn == "relu":
+        act = gate.clamp(min=0.0)
+    else:
+        raise ValueError(f"unsupported act_fn {act_fn!r}; expected 'silu', 'gelu', or 'relu'")
+    return act * up
+
+
+@triton.jit
+def split_gate_up_glu(
+    acc,
+    COMPUTE_MODE: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    SWAP_AB: tl.constexpr,
+    ACT_FN: tl.constexpr = "silu",
+    SWIGLU_ALPHA: tl.constexpr = None,
+    SWIGLU_LIMIT: tl.constexpr = None,
+    SIMULATE_UNFUSED: tl.constexpr = False,
+    INTERMEDIATE_DTYPE: tl.constexpr = tl.float32,
+):
+    """Gate|up epilogue in one step: split the stacked accumulator into its (gate, up) pair
+    (``split_gate_up``) and apply the ``ACT_FN``/SwiGLU gated linear unit (``glu``), returning
+    the combined intermediate. See those two for the orientation and activation details."""
+    gate, up = split_gate_up(acc, COMPUTE_MODE, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+    return glu(
+        gate,
+        up,
+        ACT_FN,
+        SWIGLU_ALPHA,
+        SWIGLU_LIMIT,
+        SIMULATE_UNFUSED,
+        INTERMEDIATE_DTYPE,
+    )
+
+
+@triton.jit
+def grouped_gemm_epilogue(
+    C,
+    Cs,
+    acc,
+    out_row,
+    offs_bn,
+    pid_n,
+    row_mask,
+    stride_c_m,
+    stride_c_n,
+    stride_cs_m,
+    stride_cs_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    GATE: tl.constexpr,
+    REQUANT: tl.constexpr,
+    REQUANT_FORMAT: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+    ACT_FN: tl.constexpr,
+    SWIGLU_ALPHA: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
+    SIMULATE_UNFUSED: tl.constexpr,
+    INTERMEDIATE_DTYPE: tl.constexpr,
+):
+    """Output epilogue of a grouped GEMM tile, gated by ``GATE``/``REQUANT``. Plain: cast +
+    scatter-store the accumulator (``store_tile``). ``GATE``: split the stacked gate|up
+    accumulator and apply the ``ACT_FN``/SwiGLU ``glu`` (``split_gate_up_glu``); ``REQUANT``
+    then requantizes the intermediate into ``C`` + ``Cs`` per ``REQUANT_FORMAT`` — ``"fp8"``
+    (per-row scale, ``Cs`` is ``[S, N//BN]``) or ``"mx"`` (UE8M0 group-``SCALE_GROUP_K`` scale,
+    ``Cs`` is ``[S, N//SCALE_GROUP_K]``) — else stores the GLU intermediate. Every arm is
+    constexpr-pruned; plain leaves the accumulator untouched."""
+    if GATE:
+        out = split_gate_up_glu(
+            acc,
+            "dot",
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            False,
+            ACT_FN,
+            SWIGLU_ALPHA,
+            SWIGLU_LIMIT,
+            SIMULATE_UNFUSED,
+            INTERMEDIATE_DTYPE,
+        )
+        if REQUANT:
+            c_ptrs = C + out_row[:, None] * stride_c_m + offs_bn[None, :] * stride_c_n
+            if REQUANT_FORMAT == "mx":
+                q, q_s = mxfp_act_quant_inline(
+                    out, BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K
+                )
+                tl.store(c_ptrs, q, mask=row_mask[:, None])
+                offs_sc = pid_n * (BLOCK_SIZE_N // SCALE_GROUP_K) + tl.arange(
+                    0, BLOCK_SIZE_N // SCALE_GROUP_K
+                )
+                sc_ptrs = (
+                    Cs + out_row[:, None] * stride_cs_m + offs_sc[None, :] * stride_cs_n
+                )
+                tl.store(sc_ptrs, q_s, mask=row_mask[:, None])
+            else:
+                q, q_s = fp8_act_quant_inline(out)
+                tl.store(c_ptrs, q, mask=row_mask[:, None])
+                tl.store(
+                    Cs + out_row * stride_cs_m + pid_n * stride_cs_n, q_s, mask=row_mask
+                )
+        else:
+            store_tile(C, out, out_row, offs_bn, row_mask, stride_c_m, stride_c_n)
+    else:
+        store_tile(C, acc, out_row, offs_bn, row_mask, stride_c_m, stride_c_n)
 
 
 @triton.jit
@@ -1969,7 +2100,7 @@ def mxfp_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     n_trials=100,
 )
 @triton.jit
-def _fp8_act_quant_2d_kernel(
+def _fp8_act_quant_block_dynamic_kernel(
     X,
     Y,
     S,
@@ -1993,7 +2124,7 @@ def _fp8_act_quant_2d_kernel(
     tl.store(S + t * (K // BLOCK_K) + kb + tl.arange(0, 1), tl.reshape(s, (1,)))
 
 
-def fp8_act_quant_2d(
+def fp8_act_quant_block_dynamic(
     x: torch.Tensor, block_k: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to block-FP8 once (E4M3 + fp32 per-``block_k`` scales)
@@ -2003,13 +2134,13 @@ def fp8_act_quant_2d(
     y = torch.empty(T, K, device=x.device, dtype=FP8_DTYPE)
     s = torch.empty(T, K // block_k, device=x.device, dtype=torch.float32)
     with device_context(x.device):
-        compile_time_only_triton_wrap(_fp8_act_quant_2d_kernel)[(T, K // block_k)](
-            x, y, s, x.stride(0), x.stride(1), T.bit_length(), K=K, BLOCK_K=block_k
-        )
+        compile_time_only_triton_wrap(_fp8_act_quant_block_dynamic_kernel)[
+            (T, K // block_k)
+        ](x, y, s, x.stride(0), x.stride(1), T.bit_length(), K=K, BLOCK_K=block_k)
     return y, s
 
 
-# ── fp8_act_quant kernel (used by tensor-mode FP8 wrappers) ───────────────────
+# ── fp8_act_quant_tensor_wide kernel (used by tensor-mode FP8 wrappers) ───────────────────
 
 
 @triton.jit
@@ -2030,8 +2161,10 @@ def _fp8_act_quant_kernel(
     tl.store(s_ptr + pid, s)
 
 
-@compile_time_only_triton_op(add_op_namespace_prefix("fp8_act_quant"), mutates_args=())
-def fp8_act_quant(
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("fp8_act_quant_tensor_wide"), mutates_args=()
+)
+def fp8_act_quant_tensor_wide(
     x: torch.Tensor, block_size: int = 128
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert x.is_contiguous()
