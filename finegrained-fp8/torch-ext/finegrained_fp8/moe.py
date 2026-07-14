@@ -43,7 +43,8 @@ from .utils import (
     apply_glu,
     compute_grouped_scheduling,
     weighted_reduce,
-    is_mxfp,
+    is_mx,
+    is_mxfp8,
     is_mxfp4,
     is_nvfp4,
 )
@@ -54,14 +55,12 @@ def _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale):
     intermediate handed between them carries one quant format). Returns whether the recipe
     is MX (the fused dispatchers branch on it); the fp8 quantization block is derived from
     the scale shapes (``weight_block_size``), never passed."""
-    is_mx = is_mxfp(gate_up_proj, gate_up_proj_scale) or is_nvfp4(
-        gate_up_proj, gate_up_proj_scale
-    )
-    if is_mx != (is_mxfp(down_proj, down_proj_scale) or is_nvfp4(down_proj, down_proj_scale)):
+    gate_up_is_mx = is_mx(gate_up_proj, gate_up_proj_scale)
+    if gate_up_is_mx != is_mx(down_proj, down_proj_scale):
         raise ValueError(
             "gate_up_proj and down_proj must use the same recipe (both MX or both block-dynamic FP8)."
         )
-    return is_mx
+    return gate_up_is_mx
 
 
 def _gather_idx(top_k_index: torch.Tensor) -> torch.Tensor:
@@ -100,7 +99,9 @@ def _block_recipe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, 
     mxfp4 / nvfp4 — mxfp4 weights default to mxfp4 activations, the all-fp4 W4A4
     chain)."""
     _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale)
-    if is_mxfp4(gate_up_proj, gate_up_proj_scale) != is_mxfp4(down_proj, down_proj_scale):
+    if is_mxfp4(gate_up_proj, gate_up_proj_scale) != is_mxfp4(
+        down_proj, down_proj_scale
+    ):
         raise ValueError(
             "gate_up_proj and down_proj must use the same MX format (both MXFP4 or both MXFP8)."
         )
@@ -110,7 +111,7 @@ def _block_recipe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, 
         return "nvfp4"
     if is_mxfp4(gate_up_proj, gate_up_proj_scale):
         return "mxfp4"
-    return "mxfp8" if is_mxfp(gate_up_proj, gate_up_proj_scale) else "fp8"
+    return "mxfp8" if is_mxfp8(gate_up_proj, gate_up_proj_scale) else "fp8"
 
 
 def moe_fused_grouped(
@@ -201,9 +202,8 @@ def moe_fused_batched(
     """Fused batched MoE (decode): gate_up + SiLU + requant epilogue → per-row quantized
     intermediate → batched down → routing-weighted top-k reduce. Returns
     ``(num_tokens, hidden_dim)``. The base ops dispatch on the weight dtypes / scale
-    layout (block-dynamic FP8, MXFP8/MXFP4 — NVFP4 fused-batched needs the missing NVFP4
-    batched requant arm and raises in the op; unfused batched runs NVFP4 on the software
-    decode arms); ``recipe`` names the activation
+    layout (block-dynamic FP8, MXFP8/MXFP4, NVFP4 — decode runs the software/swap arms
+    below the native mxf4nvf4 M=128 staging); ``recipe`` names the activation
     quantization for the whole block — activations and the fused intermediate requant
     carry it ("mxfp4" runs the all-fp4 W4A4 chain), ``None`` picks the weight family's
     recipe, and the ops validate the pairing. ``simulate_unfused`` (testing) rounds each

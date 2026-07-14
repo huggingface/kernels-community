@@ -35,7 +35,7 @@ from .utils import (
     mx_config_pruner,
     build_tile_layout,
     resolve_grouped_tile,
-    block_k_within_k_pruner,
+    block_within_dim_pruner,
     compose_pruners,
     device_context,
     sm_count,
@@ -52,6 +52,8 @@ from .utils import (
     mxfp4_act_quant,
     nvfp4_act_quant,
     load_mx_act_tile,
+    load_mx_weight_tile,
+    descriptor_box_pruner,
     stacked_gate_up_ptrs,
     stacked_gate_up_flatten,
     grouped_gemm_epilogue,
@@ -61,8 +63,7 @@ from .utils import (
     smem_pruner,
     weight_tile_descriptor,
     load_stacked_weight_tile,
-    is_mxfp,
-    is_nvfp4,
+    is_mx,
     weight_block_size,
     e2m1_as_uint8,
     ue8m0_as_uint8,
@@ -155,19 +156,21 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = resolve_grouped_tile(
-            tile_id,
-            num_n_tiles,
-            exp_start,
-            freqs,
-            tile_start_excl,
-            e_offs,
-            GatherIdx,
-            ScatterIdx,
-            BLOCK_SIZE_N,
-            BLOCK_SIZE_M,
-            HAS_GATHER,
-            HAS_SCATTER,
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = (
+            resolve_grouped_tile(
+                tile_id,
+                num_n_tiles,
+                exp_start,
+                freqs,
+                tile_start_excl,
+                e_offs,
+                GatherIdx,
+                ScatterIdx,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_M,
+                HAS_GATHER,
+                HAS_SCATTER,
+            )
         )
         a_ptrs = A + in_row[:, None] * stride_a_m + offs_k[None, :] * stride_a_k
         as_ptrs = As + in_row * stride_as_m
@@ -249,13 +252,16 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
-    # BLOCK_SIZE_K is a tuned axis and the K-loop is maskless — veto non-dividing BKs;
-    # WS is a pure perf axis here (non-WS is the validated state), compile-guarded.
-    # The GATE arm's stacked width-512 dots (BN=256) are clean — probed bit-exact
-    # 2026-07-14; the oversized-smem ones fail benignly at launch and self-prune as inf.
+    # BLOCK_SIZE_K/N are tuned axes; the K-loop is maskless and the N-tile store is
+    # row-masked only — veto non-dividing tiles on both. WS is a pure perf axis here
+    # (non-WS is the validated state), compile-guarded. The GATE arm's stacked width-512
+    # dots (BN=256) are clean — probed bit-exact 2026-07-14; the oversized-smem ones fail
+    # benignly at launch and self-prune as inf.
     prune_configs_by={
         "early_config_prune": compose_pruners(
-            block_k_within_k_pruner("K"), warp_spec_compile_guard_pruner()
+            block_within_dim_pruner("K"),
+            block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            warp_spec_compile_guard_pruner(),
         )
     },
 )
@@ -321,19 +327,21 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = resolve_grouped_tile(
-            tile_id,
-            num_n_tiles,
-            exp_start,
-            freqs,
-            tile_start_excl,
-            e_offs,
-            GatherIdx,
-            ScatterIdx,
-            BLOCK_SIZE_N,
-            BLOCK_SIZE_M,
-            HAS_GATHER,
-            HAS_SCATTER,
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = (
+            resolve_grouped_tile(
+                tile_id,
+                num_n_tiles,
+                exp_start,
+                freqs,
+                tile_start_excl,
+                e_offs,
+                GatherIdx,
+                ScatterIdx,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_M,
+                HAS_GATHER,
+                HAS_SCATTER,
+            )
         )
         a_ptrs = A + in_row[:, None] * stride_a_m + offs_k[None, :] * stride_a_k
         # GATE stacks gate|up into one [BK, 2*BN] tile (one per-tensor scale covers both);
@@ -389,13 +397,33 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         )
 
 
+def _rebind_mx_weight_descriptor(nargs):
+    """Per-config pre_hook: set the MX weight descriptor box to the tuned
+    ``[(2 if GATE else 1), BLOCK_SIZE_N, BLOCK_SIZE_K // values_per_byte]`` over the
+    ``(2E|E, N, K_bytes)`` weight view (one box holds both gate|up projections — the
+    fused-era TMA form). MUST mutate ``block_shape`` in place — a rebind never reaches
+    the launch. No-op for pointer configs (they never read the descriptor)."""
+    if nargs.get("MEMORY_MODE", "pointer") == "pointer" or isinstance(
+        nargs["BDescriptor"], int
+    ):
+        return
+    values_per_byte = 2 if nargs["B"].dtype == torch.uint8 else 1
+    nargs["BDescriptor"].block_shape = [
+        2 if nargs.get("GATE") else 1,
+        nargs["BLOCK_SIZE_N"],
+        nargs["BLOCK_SIZE_K"] // values_per_byte,
+    ]
+
+
 @bayesian_autotune(
     get_accelerator_autotuning_configs(
         mx=True,
         tune_block_nk=True,
         tune_block_m=True,
         compute_modes=("dot_scaled", "dot"),
-    ),  # prefill: no scalar branch
+        memory_modes=("descriptor", "pointer"),
+        pre_hook=_rebind_mx_weight_descriptor,
+    ),  # prefill: no scalar branch; TMA descriptor vs pointer weight loads (fused-era arm)
     # the MXFP4/MXFP8 (and packed-activation) splits key themselves — the tuner appends
     # every tensor arg's dtype to its cache key (memory and disk);
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a different tile optimum).
@@ -406,7 +434,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     # gates load-bearing).
     prune_configs_by={
         "early_config_prune": compose_pruners(
-            mx_config_pruner("K"), smem_pruner()
+            mx_config_pruner("K", "N"), descriptor_box_pruner(), smem_pruner()
         )
     },
 )
@@ -415,6 +443,7 @@ def mx_dynamic_matmul_grouped_kernel(
     A,  # (num_tokens, K) E4M3 activations (pre-quantized once by the wrapper), any row order
     As,  # (S, K // 32) UE8M0 group-32 activation scales
     B,  # (num_experts, N, K) E4M3 (MXFP8) or (num_experts, N, K // 2) packed E2M1 (MXFP4); 2N under GATE
+    BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K_bytes), box ((2|1), BN, BK_bytes); read iff MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) UE8M0 weight scales (2N under GATE)
     C,  # (S, N[/2]) output; under an OUTPUT_RECIPE the MX-requantized intermediate
     Cs,  # (S, N // SCALE_GROUP_K) UE8M0 output scale; written iff OUTPUT_RECIPE
@@ -451,18 +480,19 @@ def mx_dynamic_matmul_grouped_kernel(
     NUM_SMS: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
+    MEMORY_MODE: tl.constexpr = "pointer",
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM, every arm below folds out)
     GATE: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
-    # the output recipe name, same vocabulary as Quantization (None | "mxfp8" | "mxfp4")
+    # the output recipe name, same vocabulary as Quantization (None | "mxfp8" | "mxfp4" | "nvfp4")
     OUTPUT_RECIPE: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
 ):
-    """Unified grouped MXFP4/MXFP8 (W4A8/W8A8; a ``uint8`` ``A`` is caller-packed E2M1 —
-    W4A4 on the native mxf4 MMA) expert matmul — persistent grid-stride.
+    """Unified grouped microscaled expert matmul (MXFP8/MXFP4/NVFP4; a ``uint8`` ``A``
+    is caller-packed E2M1 — W4A4 on the native fp4 MMA) — persistent grid-stride.
 
     Each M-tile maps to its expert via ``ExpertStart`` and gathers its rows through
     ``PermToken`` (virtual sort — ``A`` in any row order). ``A``
@@ -486,22 +516,28 @@ def mx_dynamic_matmul_grouped_kernel(
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
 
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = resolve_grouped_tile(
-            tile_id,
-            num_n_tiles,
-            exp_start,
-            freqs,
-            tile_start_excl,
-            e_offs,
-            GatherIdx,
-            ScatterIdx,
-            BLOCK_SIZE_N,
-            BLOCK_SIZE_M,
-            HAS_GATHER,
-            HAS_SCATTER,
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = (
+            resolve_grouped_tile(
+                tile_id,
+                num_n_tiles,
+                exp_start,
+                freqs,
+                tile_start_excl,
+                e_offs,
+                GatherIdx,
+                ScatterIdx,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_M,
+                HAS_GATHER,
+                HAS_SCATTER,
+            )
         )
         a_ptrs = A + in_row[:, None] * stride_a_m + offs_ka[None, :] * stride_a_k
         as_ptrs = As + in_row[:, None] * stride_as_m + offs_sf[None, :]
+        # descriptor box coordinates: expert slab (x2 under GATE), N offset, K-byte offset
+        row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
+        n_off = pid_n * BLOCK_SIZE_N
+        kb_off = 0
         # GATE stacks gate|up into the weight (K-major) and its UE8M0 scale (N-major, SWAP_AB);
         # the up block sits N rows away. GATE=False -> the plain single tile / scale.
         b_ptrs = stacked_gate_up_ptrs(
@@ -533,12 +569,16 @@ def mx_dynamic_matmul_grouped_kernel(
                 a_ptrs, as_ptrs, row_mask, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
             )
             as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
-            b = stacked_gate_up_flatten(
-                tl.load(b_ptrs),
-                2 * BLOCK_SIZE_N,
+            b = load_mx_weight_tile(
+                b_ptrs,
+                BDescriptor,
+                row0,
+                n_off,
+                kb_off,
+                BLOCK_SIZE_N,
                 BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE,
                 GATE,
-                False,
+                MEMORY_MODE,
             )
             b_s = stacked_gate_up_flatten(
                 tl.load(bs_ptrs),
@@ -561,6 +601,7 @@ def mx_dynamic_matmul_grouped_kernel(
             )
             a_ptrs += (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k
             b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
+            kb_off += BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
             bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
         grouped_gemm_epilogue(
@@ -616,7 +657,8 @@ def _rebind_weight_descriptor(nargs):
     # BLOCK_SIZE_K is a tuned axis and the K-loop is maskless — veto non-dividing BKs.
     prune_configs_by={
         "early_config_prune": compose_pruners(
-            block_k_within_k_pruner("K"),
+            block_within_dim_pruner("K"),
+            block_within_dim_pruner("N", "BLOCK_SIZE_N"),
             warp_spec_compile_guard_pruner(),
             descriptor_gate_pruner(),
             smem_pruner(),
@@ -695,19 +737,21 @@ def full_precision_matmul_grouped_kernel(
     )
 
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = resolve_grouped_tile(
-            tile_id,
-            num_n_tiles,
-            exp_start,
-            freqs,
-            tile_start_excl,
-            e_offs,
-            GatherIdx,
-            ScatterIdx,
-            BLOCK_SIZE_N,
-            BLOCK_SIZE_M,
-            HAS_GATHER,
-            HAS_SCATTER,
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = (
+            resolve_grouped_tile(
+                tile_id,
+                num_n_tiles,
+                exp_start,
+                freqs,
+                tile_start_excl,
+                e_offs,
+                GatherIdx,
+                ScatterIdx,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_M,
+                HAS_GATHER,
+                HAS_SCATTER,
+            )
         )
         a_ptrs = A + in_row[:, None] * stride_a_m + offs_k[None, :] * stride_a_k
         # GATE stacks gate|up into one [BK, 2*BN] tile; the up block sits N rows away.
@@ -1115,19 +1159,24 @@ def mx_dynamic_matmul_grouped(
         )
     elif requant:
         C = A.new_empty((S, N), dtype=FP8_DTYPE)
-        Cs = torch.empty(
-            S, N // MX_SCALE_GROUP_K, device=A.device, dtype=torch.uint8
-        )
+        Cs = torch.empty(S, N // MX_SCALE_GROUP_K, device=A.device, dtype=torch.uint8)
     else:
         C = A.new_empty((S, N), dtype=output_dtype)
         Cs = expert_start  # general dummy pointer; unread (no OUTPUT_RECIPE), strides literal
     num_sms = sm_count(A.device.index)
+    # host TMA descriptor over the (2E|E, N, K_bytes) view — one box holds both gate|up
+    # projections; the placeholder box is re-bound per tuned config by the pre_hook
+    rows0 = 2 * num_experts if gate else num_experts
+    b_descriptor = TensorDescriptor.from_tensor(
+        B.view(rows0, N, B.shape[2]), block_shape=[1, 128, 64]
+    )
 
     with device_context(A.device):
         compile_time_only_triton_wrap(mx_dynamic_matmul_grouped_kernel)[(num_sms,)](
             A,
             As,
             B,
+            b_descriptor,
             bs_u8,
             C,
             Cs,
@@ -1298,22 +1347,58 @@ def matmul_grouped(
     q = quantization if quantization is not None else Quantization()
 
     if Bs is None:
-        assert As is None, "the full-precision path (Bs=None) takes no activation scales"
-        out = full_precision_matmul_grouped(
-            A, B, expert_start, *ep.as_args(), *q.as_args(), output_dtype, gather_idx, scatter_idx
+        assert As is None, (
+            "the full-precision path (Bs=None) takes no activation scales"
         )
-    elif is_mxfp(B, Bs) or is_nvfp4(B, Bs):
+        out = full_precision_matmul_grouped(
+            A,
+            B,
+            expert_start,
+            *ep.as_args(),
+            *q.as_args(),
+            output_dtype,
+            gather_idx,
+            scatter_idx,
+        )
+    elif is_mx(B, Bs):
         out = mx_dynamic_matmul_grouped(
-            A, As, B, Bs, expert_start, *ep.as_args(), *q.as_args(), output_dtype, gather_idx, scatter_idx
+            A,
+            As,
+            B,
+            Bs,
+            expert_start,
+            *ep.as_args(),
+            *q.as_args(),
+            output_dtype,
+            gather_idx,
+            scatter_idx,
         )
     elif (block_size := weight_block_size(B, Bs)) is None:
         out = w8a8_tensor_dynamic_fp8_matmul_grouped(
-            A, As, B, Bs, expert_start, *ep.as_args(), *q.as_args(), output_dtype, gather_idx, scatter_idx
+            A,
+            As,
+            B,
+            Bs,
+            expert_start,
+            *ep.as_args(),
+            *q.as_args(),
+            output_dtype,
+            gather_idx,
+            scatter_idx,
         )
     else:
         out = w8a8_block_dynamic_fp8_matmul_grouped(
-            A, As, B, Bs, expert_start, block_size, *ep.as_args(), *q.as_args(),
-            output_dtype, gather_idx, scatter_idx,
+            A,
+            As,
+            B,
+            Bs,
+            expert_start,
+            block_size,
+            *ep.as_args(),
+            *q.as_args(),
+            output_dtype,
+            gather_idx,
+            scatter_idx,
         )
     # The ops return a list (torch custom ops can't return a Tensor-or-tuple union): [C] plain,
     # [C, Cs] under an output_recipe. Unwrap to the documented Tensor / (Tensor, Tensor) return.

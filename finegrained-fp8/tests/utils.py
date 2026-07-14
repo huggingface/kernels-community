@@ -261,3 +261,178 @@ def ref_matmul(A, B, Bs, block_size, output_dtype=torch.float32, activation_scal
     A_deq = quant_dequant_a(A, block_k, scale=activation_scale, pow2_scale=is_mx)
     B_deq = dequant_b(B, Bs, block_n, block_k)
     return (A_deq @ B_deq.T).to(output_dtype)
+
+
+# ── shared weight-recipe registry (test_ops scenarios + test_moe fused problems) ──
+#
+# One row per support-matrix line: make(N, K, E) -> (B, Bs); dequant(B, Bs) -> fp32
+# (E, N, K); act_quant[recipe] -> the host quant fn the ops themselves call (None = the
+# family default applied to a raw A); dq_act dequantizes its output for the torch oracle.
+
+from finegrained_fp8.utils import (  # type: ignore  # noqa: E402
+    NVFP4_SCALE_GROUP_K,
+    fp8_act_quant_block_dynamic,
+    fp8_act_quant_tensor_wide,
+    mxfp4_act_quant,
+    mxfp8_act_quant,
+    nvfp4_act_quant,
+)
+
+_E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+_E2M1_LUT = _E2M1_LUT + [-v for v in _E2M1_LUT]
+
+
+def dq_scale(s: torch.Tensor) -> torch.Tensor:
+    """Group scale to fp32 by dtype: E4M3 (NVFP4) reads directly, UE8M0 (uint8 or
+    float8_e8m0fnu) is 2^(exp-127), fp32 passes through."""
+    if s.dtype == torch.float8_e4m3fn:
+        return s.float()
+    if s.dtype in (torch.uint8, torch.float8_e8m0fnu):
+        return torch.pow(2.0, s.view(torch.uint8).float() - 127)
+    return s.float()
+
+
+def dq_e2m1(q: torch.Tensor) -> torch.Tensor:
+    """Packed E2M1 (two nibbles per byte along the last dim, low first) to fp32."""
+    lut = torch.tensor(_E2M1_LUT, device=q.device)
+    u = q.view(torch.uint8)
+    lo, hi = lut[(u & 0xF).long()], lut[(u >> 4).long()]
+    return torch.stack([lo, hi], dim=-1).reshape(*q.shape[:-1], q.shape[-1] * 2)
+
+
+def dq_grouped(q: torch.Tensor, s: torch.Tensor, group: int) -> torch.Tensor:
+    """Dequantize group-scaled values (packed E2M1 or E4M3) along the last dim."""
+    v = dq_e2m1(q) if q.dtype in (torch.int8, torch.uint8) else q.float()
+    return v * torch.repeat_interleave(dq_scale(s), group, dim=-1)
+
+
+def dq_block_fp8(B, Bs, block_n: int, block_k: int) -> torch.Tensor:
+    """(E, N, K) E4M3 + (E, N//bn, K//bk) block inv-scales -> fp32."""
+    s = torch.repeat_interleave(
+        torch.repeat_interleave(dq_scale(Bs), block_n, dim=-2), block_k, dim=-1
+    )
+    return B.float() * s
+
+
+def _make_nvfp4(N, K, E):
+    w = torch.randn(E, N, K, device=TEST_DEVICE, dtype=torch.bfloat16) * 0.05
+    qs = [nvfp4_act_quant(w[e].contiguous()) for e in range(E)]
+    return (
+        torch.stack([q for q, _ in qs]).view(torch.int8),
+        torch.stack([s for _, s in qs]),
+    )
+
+
+def _make_full(dtype):
+    def make(N, K, E):
+        return torch.randn(E, N, K, device=TEST_DEVICE, dtype=dtype) * 0.05, None
+
+    return make
+
+
+def _make_mx(weight_dtype, scale_dtype):
+    def make(N, K, E):
+        return make_weights(
+            N,
+            K,
+            TEST_DEVICE,
+            [1, MX_SCALE_GROUP_K],
+            weight_dtype=weight_dtype,
+            scale_dtype=scale_dtype,
+            num_experts=E,
+        )
+
+    return make
+
+
+_MX_ACT = {None: mxfp8_act_quant, "mxfp8": mxfp8_act_quant, "mxfp4": mxfp4_act_quant}
+
+WEIGHTS = {
+    "fp8_128x128": dict(
+        make=lambda N, K, E: make_weights(N, K, TEST_DEVICE, [128, 128], num_experts=E),
+        dequant=lambda B, Bs: dq_block_fp8(B, Bs, 128, 128),
+        input_recipes=(None, "fp8"),
+        output_recipes=(None, "fp8"),
+        act_quant={
+            None: lambda A: fp8_act_quant_block_dynamic(A, 128),
+            "fp8": lambda A: fp8_act_quant_block_dynamic(A, 128),
+        },
+        dq_act=lambda q, s: q.float() * torch.repeat_interleave(s.float(), 128, dim=-1),
+    ),
+    "fp8_tensor": dict(
+        make=lambda N, K, E: make_weights(
+            N, K, TEST_DEVICE, None, scale_layout="per_tensor_111", num_experts=E
+        ),
+        dequant=lambda B, Bs: B.float() * Bs.float().reshape(-1, 1, 1),
+        input_recipes=(None, "fp8"),
+        output_recipes=(None,),
+        act_quant={
+            None: lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
+            "fp8": lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
+        },
+        dq_act=lambda q, s: q.float() * s.float().reshape(-1, 1),
+    ),
+    "mxfp8": dict(
+        make=_make_mx(torch.float8_e4m3fn, torch.float8_e8m0fnu),
+        dequant=lambda B, Bs: dq_grouped(B, Bs, MX_SCALE_GROUP_K),
+        input_recipes=(None, "mxfp8", "mxfp4"),
+        output_recipes=(None, "mxfp8", "mxfp4"),
+        act_quant=_MX_ACT,
+        dq_act=lambda q, s: dq_grouped(q, s, MX_SCALE_GROUP_K),
+    ),
+    # UE8M0 scales stored as raw uint8 (e.g. MiniMax-M3-MXFP8 checkpoints) — must still
+    # detect as MXFP8 and route to the MX path, not fall back to block-dynamic.
+    "mxfp8_u8": dict(
+        make=_make_mx(torch.float8_e4m3fn, torch.uint8),
+        dequant=lambda B, Bs: dq_grouped(B, Bs, MX_SCALE_GROUP_K),
+        input_recipes=(None,),
+        output_recipes=(None, "mxfp8"),
+        act_quant=_MX_ACT,
+        dq_act=lambda q, s: dq_grouped(q, s, MX_SCALE_GROUP_K),
+    ),
+    "mxfp4": dict(
+        make=_make_mx(torch.int8, torch.float8_e8m0fnu),
+        dequant=lambda B, Bs: dq_grouped(B, Bs, MX_SCALE_GROUP_K),
+        input_recipes=(None, "mxfp8", "mxfp4"),
+        output_recipes=(None, "mxfp8", "mxfp4"),
+        act_quant=_MX_ACT,
+        dq_act=lambda q, s: dq_grouped(q, s, MX_SCALE_GROUP_K),
+    ),
+    "nvfp4": dict(
+        make=_make_nvfp4,
+        dequant=lambda B, Bs: dq_grouped(B, Bs, NVFP4_SCALE_GROUP_K),
+        input_recipes=(None, "nvfp4"),
+        output_recipes=(None, "nvfp4"),
+        act_quant={None: nvfp4_act_quant, "nvfp4": nvfp4_act_quant},
+        dq_act=lambda q, s: dq_grouped(q, s, NVFP4_SCALE_GROUP_K),
+    ),
+    "bf16": dict(
+        make=_make_full(torch.bfloat16),
+        dequant=lambda B, Bs: B.float(),
+        input_recipes=(None,),
+        output_recipes=(None,),
+        act_quant={None: None},
+        dq_act=None,
+    ),
+    "fp16": dict(
+        make=_make_full(torch.float16),
+        dequant=lambda B, Bs: B.float(),
+        input_recipes=(None,),
+        output_recipes=(None,),
+        act_quant={None: None},
+        dq_act=None,
+    ),
+}
+
+# quant fns for requant-output verification, by output recipe name
+REQUANT_FN = {
+    "fp8": None,  # per-(row, N-block) scale — verified via dequant closeness only
+    "mxfp8": mxfp8_act_quant,
+    "mxfp4": mxfp4_act_quant,
+    "nvfp4": nvfp4_act_quant,
+}
+REQUANT_GROUP = {
+    "mxfp8": MX_SCALE_GROUP_K,
+    "mxfp4": MX_SCALE_GROUP_K,
+    "nvfp4": NVFP4_SCALE_GROUP_K,
+}

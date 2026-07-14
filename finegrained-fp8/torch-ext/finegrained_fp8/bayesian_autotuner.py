@@ -82,6 +82,17 @@ class BayesianAutotuner(Autotuner):
         # FINEGRAINED_AUTOTUNE_LOG env var. Analyse offline to prune bad configs.
         self.log_path = log_path or os.environ.get("FINEGRAINED_AUTOTUNE_LOG")
 
+    # substrings marking a COMPILE-stage failure — the only class safe to memoize on
+    # disk (a benching/CUDA error can be transient or sticky-context contamination;
+    # persisting one would permanently fence a healthy config for this source version)
+    _COMPILE_FAILURE_MARKS = (
+        "PassManager",
+        "CompilationError",
+        "MLIR",
+        "ConvertTritonGPUToLLVM",
+        "TritonGPUAccelerateMatmul",
+    )
+
     def _bench(self, *args, config, **meta):
         """Score any failing config as inf instead of raising — a compile failure is data
         for the search, not a fatal error. Stock Triton forgives only OutOfResources, but
@@ -93,12 +104,89 @@ class BayesianAutotuner(Autotuner):
         (Stock already inf's OutOfResources / CompileTimeAssertionFailure / PTXASError
         internally without reaching this handler — those are deliberate guard classes,
         e.g. our own ``tl.static_assert`` fences; the reporter covers the UNEXPECTED
-        failure classes stock would otherwise let kill the tune.)"""
+        failure classes stock would otherwise let kill the tune.)
+
+        Compile-stage failures are memoized on disk keyed by everything that determines
+        compilation (kernel source hash + config + constexpr arg values + tensor dtypes +
+        invalidating env), so the next fresh tune of ANY shape skips the doomed compile
+        outright (~40-66 wasted compiles per nvfp4 tune before this). The memo dies with
+        the kernel source (``fn.cache_key``); bench-stage errors are never persisted."""
+        sig = self._compile_signature(config)
+        memo = self._failed_compile_memo()
+        if sig is not None and sig in memo:
+            self._failures.append((config, memo[sig] + "  [memoized]"))
+            return [float("inf")] * 3
         try:
             return super()._bench(*args, config=config, **meta)
         except Exception as e:
-            self._failures.append((config, f"{type(e).__name__}: {str(e)[:200]}"))
+            err = f"{type(e).__name__}: {str(e)[:200]}"
+            self._failures.append((config, err))
+            if sig is not None and any(m in err for m in self._COMPILE_FAILURE_MARKS):
+                memo[sig] = err
+                self._persist_failed_compile_memo()
             return [float("inf")] * 3
+
+    def _compile_signature(self, config) -> str | None:
+        """Hash of the compile determinants for one config: the config itself plus the
+        constexpr argument VALUES and tensor argument dtypes from this launch (both feed
+        specialization — e.g. GATE flips arms, a uint8 A packs the loads). Source/env
+        live in the memo FILE's key, not here."""
+        nargs = getattr(self, "nargs", None)
+        if not nargs:
+            return None
+        fn = self.fn
+        while not isinstance(fn, JITFunction):
+            fn = fn.fn
+        parts = [str(sorted(config.all_kwargs().items()))]
+        for param in fn.params:
+            v = nargs.get(param.name)
+            if hasattr(v, "dtype"):
+                parts.append(f"{param.name}:{v.dtype}")
+            elif param.is_constexpr and isinstance(
+                v, (bool, int, float, str, type(None))
+            ):
+                parts.append(f"{param.name}={v}")
+        return hashlib.sha256("-".join(parts).encode("utf-8")).hexdigest()
+
+    def _failed_compile_memo(self) -> dict:
+        """The per-(kernel source, backend, env) failed-compile dict, loaded from
+        Triton's on-disk cache once per autotuner instance."""
+        if getattr(self, "_failed_memo", None) is not None:
+            return self._failed_memo
+        try:
+            from triton.compiler.compiler import make_backend
+
+            fn = self.fn
+            while not isinstance(fn, JITFunction):
+                fn = fn.fn
+            group = hashlib.sha256(
+                "-".join(
+                    [
+                        triton_key(),
+                        make_backend(driver.active.get_current_target()).hash(),
+                        fn.cache_key,
+                        str(sorted(get_cache_invalidating_env_vars().items())),
+                    ]
+                ).encode("utf-8")
+            ).hexdigest()
+            self._failed_memo_cache = get_cache_manager(group)
+            self._failed_memo_file = f"{fn.__name__[:150]}.failed_compiles.json"
+            path = self._failed_memo_cache.get_file(self._failed_memo_file)
+            self._failed_memo = json.load(open(path)) if path else {}
+        except Exception:
+            self._failed_memo_cache = None
+            self._failed_memo = {}
+        return self._failed_memo
+
+    def _persist_failed_compile_memo(self):
+        if getattr(self, "_failed_memo_cache", None) is None:
+            return
+        try:
+            self._failed_memo_cache.put(
+                json.dumps(self._failed_memo), self._failed_memo_file, binary=False
+            )
+        except Exception:
+            pass  # persistence is best-effort; the in-memory memo still holds
 
     def _report_bench_failures(self):
         """After every tune, report every UNIQUE failure — a failure is never silent:

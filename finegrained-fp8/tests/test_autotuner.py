@@ -234,3 +234,45 @@ def test_cross_process_determinism_block_dynamic_grouped():
         for _ in range(3)
     }
     assert len(sums) == 1, f"cross-process outputs diverged: {sums}"
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+def test_compile_failures_are_memoized_across_keys(caplog):
+    """A config that fails at COMPILE stage is memoized on disk keyed by its compile
+    determinants (source hash + config + constexpr values + dtypes) — a tune at a NEW
+    shape key must skip the doomed compile and report the failure as memoized. Bench
+    -stage errors are excluded by design (a sticky-context cascade must never fence
+    healthy configs)."""
+
+    @bayesian_autotune(
+        [
+            triton.Config({"BLOCK": 64, "BAD": True}, num_warps=4),
+            triton.Config({"BLOCK": 64, "BAD": False}, num_warps=4),
+            triton.Config({"BLOCK": 128, "BAD": False}, num_warps=4),
+            triton.Config({"BLOCK": 32, "BAD": False}, num_warps=4),
+        ],
+        ["N"],
+        n_trials=3,
+        n_startup_trials=2,
+        cache_results=False,
+    )
+    @triton.jit
+    def _memo_kernel(X, Y, N, BLOCK: tl.constexpr, BAD: tl.constexpr):
+        offs = tl.arange(0, BLOCK)
+        if BAD:
+            offs = offs + tl.arange(0, 3)  # non-power-of-2 arange -> CompilationError
+        tl.store(Y + offs, tl.load(X + offs, mask=offs < N), mask=offs < N)
+
+    with caplog.at_level(logging.WARNING, logger="finegrained_fp8.bayesian_autotuner"):
+        for n in (32, 64):  # two shapes -> two tuning keys, same compile signature
+            x = torch.randn(n, device="cuda")
+            y = torch.empty_like(x)
+            _memo_kernel[(1,)](x, y, n)
+            torch.cuda.synchronize()
+    msgs = [
+        r.getMessage() for r in caplog.records if "failed to compile" in r.getMessage()
+    ]
+    assert len(msgs) == 2, msgs
+    assert "[memoized]" not in msgs[0] or "[memoized]" in msgs[1]
+    assert "[memoized]" in msgs[1], msgs[1]

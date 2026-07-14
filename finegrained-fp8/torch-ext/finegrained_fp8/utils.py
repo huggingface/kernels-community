@@ -270,11 +270,12 @@ def is_nvfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     )
 
 
-def is_mxfp(weight: torch.Tensor, scale: torch.Tensor) -> bool:
-    """Any MX weight/scale pair — MXFP8 (``float8_e4m3fn``, one value/byte) or MXFP4
-    (``int8``, two E2M1 codes/byte), both with UE8M0 group-32 scales. The dispatchers
-    route on this; the op picks the format from ``weight.dtype``."""
-    return is_mxfp8(weight, scale) or is_mxfp4(weight, scale)
+def is_mx(weight: torch.Tensor, scale: torch.Tensor) -> bool:
+    """Any microscaled weight/scale pair — MXFP8 (``float8_e4m3fn`` values), MXFP4
+    (``int8``, two E2M1 codes/byte), both UE8M0 group-32, or NVFP4 (packed E2M1 + E4M3
+    group-16). The dispatchers route on this into the ``mx_*`` kernels; the op picks the
+    format from the dtypes."""
+    return is_mxfp8(weight, scale) or is_mxfp4(weight, scale) or is_nvfp4(weight, scale)
 
 
 def is_tensor_wide(block_size, weight: torch.Tensor) -> bool:
@@ -622,7 +623,7 @@ def sm_shared_memory_limit() -> int:
 # Every guard exists for one of four reasons; the map (pruner -> rule -> kernels):
 #
 #   SILENTLY-WRONG configs (must be pruned, the tuner would time and pick them):
-#     block_k_within_k_pruner   BK not dividing K over-reads rows (maskless K-loops)
+#     block_within_dim_pruner   BK not dividing K over-reads rows (maskless K-loops)
 #                               — tensor 2D/batched/grouped; first stage of mx_config_pruner
 #     scalar "scalar" -> BM=1   the scalar GEVM broadcasts wrong at BM>1 (config builder)
 #   COMPILER BUGS / unsupported combos on this triton+arch (benign inf, pruned to save
@@ -713,27 +714,28 @@ def compose_pruners(*pruners):
     return prune
 
 
-def block_k_within_k_pruner(k_arg: str):
-    """``early_config_prune`` dropping configs whose ``BLOCK_SIZE_K`` does not divide the
-    launch's contraction dim (``k_arg`` names the launch argument): the K-loops load
-    unmasked, so a non-dividing BK's last trip reads past the row — silently wrong results
-    the tuner would happily time and pick. A contraction dim smaller than every grid BK is
-    a hard error. Used standalone by the tensor-dynamic kernels (``BLOCK_SIZE_K`` is a
-    tuned axis there) and as the first stage of ``mx_config_pruner``."""
+def block_within_dim_pruner(dim_arg: str, block_key: str = "BLOCK_SIZE_K"):
+    """``early_config_prune`` dropping configs whose ``block_key`` tile does not divide the
+    launch dim named by ``dim_arg``: the K-loops load unmasked and the batched/grouped
+    N-tiles store row-masked only, so a non-dividing tile's last trip reads or writes past
+    the row — silently wrong results the tuner would happily time and pick (a BN=256
+    winner at N=128 corrupted 40/64 rows before the N veto existed). A dim smaller than
+    every grid tile is a hard error. Used standalone by the tensor-dynamic kernels and as
+    the first stages of ``mx_config_pruner``."""
 
     def ok(c, args):
-        bk = c.kwargs.get("BLOCK_SIZE_K", 0)
-        return bk == 0 or args[k_arg] % bk == 0
+        block = c.kwargs.get(block_key, 0)
+        return block == 0 or args[dim_arg] % block == 0
 
-    def raise_no_dividing_bk(configs, args):
-        min_bk = min(c.kwargs.get("BLOCK_SIZE_K", 0) for c in configs)
+    def raise_no_dividing_block(configs, args):
+        min_block = min(c.kwargs.get(block_key, 0) for c in configs)
         raise ValueError(
-            f"{k_arg}={args[k_arg]} is not a multiple of any BLOCK_SIZE_K in the autotune "
-            f"grid; the unmasked K-loop would read past the row. Pad the problem along "
-            f"{k_arg} (smallest grid BK: {min_bk})."
+            f"{dim_arg}={args[dim_arg]} is not a multiple of any {block_key} in the "
+            f"autotune grid; the unmasked tile would run past the row. Pad the problem "
+            f"along {dim_arg} (smallest grid tile: {min_block})."
         )
 
-    return config_filter(ok, on_empty=raise_no_dividing_bk)
+    return config_filter(ok, on_empty=raise_no_dividing_block)
 
 
 def warp_spec_compile_guard_pruner():
@@ -757,7 +759,7 @@ def warp_spec_compile_guard_pruner():
     return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
 
 
-def mx_config_pruner(k_arg: str):
+def mx_config_pruner(k_arg: str, n_arg: str | None = None):
     """``early_config_prune`` for the MX kernels (2D, batched, grouped — their tile is always
     tuned): a BK-within-K veto plus sm_10x MMA-shape guards (no-ops elsewhere and for scalar
     configs). GATE-aware: under the GATE constexpr (read from the launch args) the kernel
@@ -823,7 +825,9 @@ def mx_config_pruner(k_arg: str):
             return False
         # stacked 2*BN extent under the GATE constexpr (the kernels serve plain and gate|up)
         rows = (2 if args.get("GATE") else 1) * c.kwargs["BLOCK_SIZE_N"]
-        return rows >= 128 if c.kwargs.get("SWAP_AB") else rows <= SM10X_SCALED_MMA_MAX_N
+        return (
+            rows >= 128 if c.kwargs.get("SWAP_AB") else rows <= SM10X_SCALED_MMA_MAX_N
+        )
 
     def fp4_scalar_ok(c, args):
         return c.kwargs.get("COMPUTE_MODE") != "scalar"
@@ -845,8 +849,11 @@ def mx_config_pruner(k_arg: str):
     def scales_are_e4m3(args):
         return getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn
 
+    stages = [block_within_dim_pruner(k_arg)]
+    if n_arg is not None:
+        stages.append(block_within_dim_pruner(n_arg, "BLOCK_SIZE_N"))
     return compose_pruners(
-        block_k_within_k_pruner(k_arg),
+        *stages,
         config_filter(nvfp4_native_ok, when=scales_are_e4m3),
         config_filter(
             fp4_scalar_ok,
@@ -895,6 +902,26 @@ def scalar_max_m_pruner(m_arg: str, max_m: int = 64):
         return c.kwargs.get("COMPUTE_MODE") != "scalar"
 
     return config_filter(ok, when=lambda args: args[m_arg] > max_m)
+
+
+def descriptor_box_pruner():
+    """Drop descriptor configs whose TMA box exceeds the tensormap's 256-per-dim limit:
+    the weight inner dim is ``BLOCK_SIZE_K`` BYTES over values-per-byte (packed E2M1
+    halves it; E4M3 is one byte per value), so BK=512 e4m3 boxes are illegal while
+    BK=512 packed ones fit. Pointer configs pass untouched."""
+
+    def ok(c, args):
+        if c.kwargs.get("MEMORY_MODE", "pointer") == "pointer":
+            return True
+        values_per_byte = (
+            2 if getattr(args.get("B"), "dtype", None) == torch.uint8 else 1
+        )
+        return (
+            c.kwargs["BLOCK_SIZE_K"] // values_per_byte <= 256
+            and c.kwargs["BLOCK_SIZE_N"] <= 256
+        )
+
+    return config_filter(ok)
 
 
 def descriptor_gate_pruner():
@@ -1213,7 +1240,7 @@ def mx_dot_rescale(acc, a, w, a_scale, w_scale):
     software rescale (decoding both UE8M0 scales internally), accumulating into ``acc`` (returned
     updated). The batched gate_up kernel passes the stacked
     gate|up tile (2*BN columns) — per-column independence keeps that bit-exact."""
-    aq = e2m1_cols_to_f32(a).to(tl.float8e4nv) if a.dtype == tl.uint8 else a
+    aq = e2m1_cols_to_e4m3(a) if a.dtype == tl.uint8 else a
     wq = e2m1_to_e4m3(w) if w.dtype == tl.uint8 else w
     return acc + tl.dot(aq, wq) * decode_group_scale(a_scale) * tl.trans(
         decode_group_scale(w_scale)
@@ -1242,7 +1269,9 @@ def mx_scalar_reduce(
     reduce the raw products within each group, then apply ONE combined (act × weight) scale per
     group — ``SCALE_GROUP_K``× fewer scale-muls. Measured ~18% faster on the decode reduce
     (the per-element expand was pure overhead), bit-identical to the expanded form (rel 1e-7)."""
-    aq = e2m1_cols_to_f32(a) if a.dtype == tl.uint8 else a.to(tl.float32)
+    aq = (
+        e2m1_cols_to_e4m3(a).to(tl.float32) if a.dtype == tl.uint8 else a.to(tl.float32)
+    )
     wq = e2m1_to_e4m3(w) if w.dtype == tl.uint8 else w
     NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
     prod = tl.trans(aq) * wq.to(tl.float32)  # [BK, ROWS_W]
@@ -1376,10 +1405,10 @@ def mx_dot_rescale_swapped(
     is a scalar. ``acc`` is the persistent ``[ROWS, MMA_N_ATOM]`` accumulator (col 0 taken
     by the caller's ``acc_finalize``)."""
     if w.dtype == tl.uint8:  # column-unpack E2M1 -> E4M3 (K order: low nibble first)
-        wq = e2m1_cols_to_f32(w).to(tl.float8e4nv)
+        wq = e2m1_cols_to_e4m3(w)
     else:
         wq = w
-    aq = e2m1_cols_to_f32(a).to(tl.float8e4nv) if a.dtype == tl.uint8 else a
+    aq = e2m1_cols_to_e4m3(a) if a.dtype == tl.uint8 else a
     rhs = swap_pad_rhs(aq, BLOCK_SIZE_K)
     a_s = decode_group_scale(a_scale)  # [1] — the single group's token scale
     w_s = decode_group_scale(w_scale)  # [ROWS, 1] — per output row
@@ -1402,10 +1431,12 @@ def mx_scalar_reduce_swapped(
     scale factored out of the reduce (grpscale). Reduces over K; returns ``acc + [1, ROWS_W]``."""
     NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
     if w.dtype == tl.uint8:  # column-unpack E2M1 -> f32, K-order via interleave
-        wq = e2m1_cols_to_f32(w)
+        wq = e2m1_cols_to_e4m3(w).to(tl.float32)
     else:
         wq = w.to(tl.float32)
-    aq = e2m1_cols_to_f32(a) if a.dtype == tl.uint8 else a.to(tl.float32)
+    aq = (
+        e2m1_cols_to_e4m3(a).to(tl.float32) if a.dtype == tl.uint8 else a.to(tl.float32)
+    )
     prod = aq[None, :] * wq  # [ROWS_W, BK]
     grp = tl.sum(tl.reshape(prod, (ROWS_W, NG, SCALE_GROUP_K)), axis=2)  # [ROWS_W, NG]
     scale = decode_group_scale(a_scale)[None, :] * decode_group_scale(w_scale)
@@ -1441,7 +1472,9 @@ def mx_swap_compute(
         a1 = tl.reshape(a, (BLOCK_SIZE_K,))
     as1 = tl.reshape(a_scale, (BLOCK_SIZE_K // SCALE_GROUP_K,))
     if COMPUTE_MODE == "dot_scaled":
-        acc = mx_dot_scaled_swapped(acc, a1, as1, w, w_scale, BLOCK_SIZE_K, SCALE_GROUP_K)
+        acc = mx_dot_scaled_swapped(
+            acc, a1, as1, w, w_scale, BLOCK_SIZE_K, SCALE_GROUP_K
+        )
     elif COMPUTE_MODE == "dot":
         acc = mx_dot_rescale_swapped(acc, a1, as1, w, w_scale, BLOCK_SIZE_K)
     elif COMPUTE_MODE == "scalar":
@@ -1967,6 +2000,36 @@ def load_stacked_weight_tile(
 
 
 @triton.jit
+def load_mx_weight_tile(
+    w_ptrs,
+    w_descriptor,
+    row0,
+    n_off,
+    kb_off,
+    BLOCK_SIZE_N: tl.constexpr,
+    KB: tl.constexpr,
+    GATE: tl.constexpr,
+    MEMORY_MODE: tl.constexpr,
+):
+    """One K-major (optionally gate|up-stacked) MX weight K-tile for the grouped loop:
+    the explicit-pointer tile flattened to the ``[KB, (2|1)*BN]`` rhs, or the
+    ``[(2|1), BN, KB]`` descriptor box over the ``(2E|E, N, K_bytes)`` weight view,
+    reshaped and transposed to the same form (the fused-era TMA arm: natural orientation
+    + per-iteration trans). Single return — only the taken arm compiles; the caller
+    advances ``w_ptrs`` and passes the box offsets either way."""
+    if MEMORY_MODE == "pointer":
+        w = stacked_gate_up_flatten(tl.load(w_ptrs), 2 * BLOCK_SIZE_N, KB, GATE, False)
+    else:
+        w = tl.trans(
+            tl.reshape(
+                w_descriptor.load([row0, n_off, kb_off]),
+                ((2 if GATE else 1) * BLOCK_SIZE_N, KB),
+            )
+        )
+    return w
+
+
+@triton.jit
 def load_weight_tile(w_ptrs, w_descriptor, row_off, k_off, MEMORY_MODE: tl.constexpr):
     """One weight K-tile: the ``(BN, BK)`` descriptor box at ``(row_off, k_off)`` under
     the descriptor modes, else the explicit-pointer tile (whatever orientation ``w_ptrs``
@@ -2223,7 +2286,9 @@ def apply_glu(
     elif act_fn == "relu":
         act = gate.clamp(min=0.0)
     else:
-        raise ValueError(f"unsupported act_fn {act_fn!r}; expected 'silu', 'gelu', or 'relu'")
+        raise ValueError(
+            f"unsupported act_fn {act_fn!r}; expected 'silu', 'gelu', or 'relu'"
+        )
     return act * up
 
 
@@ -2336,28 +2401,28 @@ def grouped_gemm_epilogue(
 
 
 @triton.jit
-def _e2m1_code_to_f32(code):
-    """One E2M1 4-bit code -> fp32. Layout ``[sign | exp(2) | mant(1)]``; the 8
-    magnitudes are ``{0, .5, 1, 1.5, 2, 3, 4, 6}`` (exp==0 is the 0/0.5 subnormal)."""
+def _e2m1_code_to_e4m3_bits(code):
+    """One E2M1 4-bit code -> the E4M3 byte holding the same value, in pure integer
+    ops. Every E2M1 magnitude ``{0, .5, 1, 1.5, 2, 3, 4, 6}`` is exact in E4M3, and
+    above the 0.5 subnormal the mapping is affine in the code: ``bits = (mag + 12) << 2``
+    (exponent re-bias +6, mantissa bit lands at bit 2). No float math, no converts —
+    callers bitcast the byte to ``float8e4nv``."""
     code = code.to(tl.int32)
-    s = (code >> 3) & 1
-    e = (code >> 1) & 3
-    m = (code & 1).to(tl.float32)
-    pow2 = (1 << e).to(
-        tl.float32
-    ) * 0.5  # e in 0..3 -> 0.5, 1, 2, 4 (int shift, no exp2)
-    mag = tl.where(e == 0, 0.5 * m, (1.0 + 0.5 * m) * pow2)
-    return (1.0 - 2.0 * s.to(tl.float32)) * mag
+    mag = code & 7
+    bits = tl.where(mag == 0, 0, tl.where(mag == 1, 0x30, (mag + 12) << 2))
+    return bits | ((code >> 3) << 7)
 
 
 @triton.jit
-def e2m1_cols_to_f32(packed):
+def e2m1_cols_to_e4m3(packed):
     """Column-unpack packed E2M1 (two nibbles per byte along the last dim, low nibble
-    first) to fp32: ``(..., C) uint8 -> (..., 2C)`` — the column-axis counterpart of the
-    row-doubling ``e2m1_to_e4m3``; lossless for the same reason."""
-    return tl.interleave(
-        _e2m1_code_to_f32(packed & 0xF), _e2m1_code_to_f32(packed >> 4)
+    first) to E4M3: ``(..., C) uint8 -> (..., 2C)`` — the column-axis counterpart of the
+    row-doubling ``e2m1_to_e4m3``; lossless (every E2M1 value is exact in E4M3) and
+    integer-only: the bytes are built by ``_e2m1_code_to_e4m3_bits`` and bitcast once."""
+    bits = tl.interleave(
+        _e2m1_code_to_e4m3_bits(packed & 0xF), _e2m1_code_to_e4m3_bits(packed >> 4)
     )
+    return bits.to(tl.uint8).to(tl.float8e4nv, bitcast=True)
 
 
 @triton.jit
@@ -2367,11 +2432,11 @@ def e2m1_to_e4m3(b_packed):
     E4M3, so this is lossless — it lets the FP8 ``tl.dot`` path stand in for
     ``tl.dot_scaled`` at decode (avoiding its M->128 pad). K order is the low nibble
     first: ``[byte0_lo, byte0_hi, byte1_lo, ...]``."""
-    lo = _e2m1_code_to_f32(b_packed & 0xF)
-    hi = _e2m1_code_to_f32(b_packed >> 4)
+    lo = _e2m1_code_to_e4m3_bits(b_packed & 0xF)
+    hi = _e2m1_code_to_e4m3_bits(b_packed >> 4)
     # interleave along the K (row) dim via trans -> interleave-last-dim -> trans back
     unpacked = tl.trans(tl.interleave(tl.trans(lo), tl.trans(hi)))
-    return unpacked.to(tl.float8e4nv)
+    return unpacked.to(tl.uint8).to(tl.float8e4nv, bitcast=True)
 
 
 def _quant_block_k_pruner(configs, named_args, **kwargs):
@@ -2469,7 +2534,6 @@ def mxfp8_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
         )
     return y, s
-
 
 
 def mxfp4_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

@@ -24,14 +24,12 @@ from .utils import (
     compile_time_only_triton_op,
     compile_time_only_triton_wrap,
     NIBBLES_PER_BYTE,
-    MX_SCALE_GROUP_K,
-    UE8M0_SCALE_DTYPES,
     acc_init,
     mx_config_pruner,
     smem_pruner,
     block_scaled_fp8_dot,
     scalar_max_m_pruner,
-    block_k_within_k_pruner,
+    block_within_dim_pruner,
     compose_pruners,
     decode_group_scale,
     descriptor_config_pruner,
@@ -44,10 +42,12 @@ from .utils import (
     weight_tile_descriptor,
     get_accelerator_autotuning_configs,
     warp_spec_compile_guard_pruner,
-    is_mxfp,
+    is_mx,
     is_tensor_wide,
     maybe_act_quant,
     mxfp8_act_quant,
+    mx_scale_family,
+    nvfp4_act_quant,
     store_masked,
     store_masked_oriented,
     swizzle_offsets,
@@ -211,7 +211,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # WS is a pure perf axis here (non-WS is the validated state), compile-guarded.
     prune_configs_by={
         "early_config_prune": compose_pruners(
-            block_k_within_k_pruner("K"), warp_spec_compile_guard_pruner()
+            block_within_dim_pruner("K"), warp_spec_compile_guard_pruner()
         )
     },
 )
@@ -751,21 +751,19 @@ def mx_dynamic_matmul(
     Bs: torch.Tensor,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """MX matmul ``C = A @ B.T``; activations quantized offline above the
-    ``maybe_act_quant`` M threshold, inline below it. Weight format detected
-    from ``B.dtype``: ``int8`` → packed E2M1 (MXFP4, ``B`` is ``(N, K//2)``);
-    ``float8_e4m3fn`` → unpacked E4M3 (MXFP8, ``(N, K)``). Both use UE8M0 group-32 scales
-    ``(N, K//32)``; tile + dot path are autotuned (scale granularity fixed at 32).
+    """MX/NVFP4 matmul ``C = A @ B.T``; MX activations quantized offline above the
+    ``maybe_act_quant`` M threshold, inline below it; NVFP4 always offline (the inline
+    arm is UE8M0-typed). Weight format detected from ``B.dtype``: ``int8`` → packed E2M1
+    (``B`` is ``(N, K//2)``); ``float8_e4m3fn`` → unpacked E4M3. The scale dtype carries
+    the recipe: UE8M0 = MX group-32, E4M3 = NVFP4 group-16 (``Bs`` is
+    ``(N, K//group)``); tile + dot path are autotuned.
 
-    A:  (..., K) raw activations, bf16/fp16/fp32 (quantized inline to E4M3); leading dims are
-        flattened to (M, K) and restored on the output
+    A:  (..., K) raw activations, bf16/fp16/fp32 (quantized per the weight recipe);
+        leading dims are flattened to (M, K) and restored on the output
     """
     assert B.ndim == 2 and Bs.ndim == 2
     assert B.dtype in (torch.int8, torch.float8_e4m3fn), (
         f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
-    )
-    assert Bs.dtype in UE8M0_SCALE_DTYPES, (
-        f"Bs must be float8_e8m0fnu or uint8 (UE8M0), got {Bs.dtype}"
     )
     assert A.is_contiguous(), "A must be contiguous"
     assert B.is_contiguous(), "B must be contiguous"
@@ -777,18 +775,20 @@ def mx_dynamic_matmul(
     assert K == WEIGHT_VALUES_PER_BYTE * K_b, (
         f"K (={K}) must equal {WEIGHT_VALUES_PER_BYTE} * B.shape[1] (={K_b})"
     )
-    assert K % MX_SCALE_GROUP_K == 0, (
-        f"K (={K}) must be a multiple of {MX_SCALE_GROUP_K}"
-    )
-    assert Bs.shape == (N, K // MX_SCALE_GROUP_K), (
-        f"Bs shape {tuple(Bs.shape)} != ({N}, {K // MX_SCALE_GROUP_K})"
+    nvfp4, scale_group = mx_scale_family(Bs, K)
+    assert Bs.shape == (N, K // scale_group), (
+        f"Bs shape {tuple(Bs.shape)} != ({N}, {K // scale_group})"
     )
 
     B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
-    A_q, A_s = maybe_act_quant(
-        A.view(M, K), mxfp8_act_quant, MXFP8_MATMUL_ACT_PREQUANT_MIN_M
-    )
+    if nvfp4:
+        A_q, A_s = nvfp4_act_quant(A.view(M, K))
+        A_q = A_q.view(torch.uint8)
+    else:
+        A_q, A_s = maybe_act_quant(
+            A.view(M, K), mxfp8_act_quant, MXFP8_MATMUL_ACT_PREQUANT_MIN_M
+        )
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
 
     def grid(META):
@@ -820,7 +820,7 @@ def mx_dynamic_matmul(
             C.stride(-2),
             C.stride(-1),
             GROUP_SIZE_M=GROUP_SIZE_M,
-            SCALE_GROUP_K=MX_SCALE_GROUP_K,
+            SCALE_GROUP_K=scale_group,
         )
     return C
 
@@ -842,14 +842,15 @@ def matmul_2d(
     ``output_dtype`` defaults to ``A.dtype``.
 
     Routes by weight dtype and ``block_size``:
-    - MX weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
-      group-32 ``Bs`` (shape ``[N, K//32]``) → ``mx_dynamic_matmul`` (``block_size``
-      ignored, ``activation_scale`` unsupported; scale granularity fixed at 32, autotuned).
+    - MX/NVFP4 weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
+      group-32 or E4M3 group-16 ``Bs`` (shape ``[N, K//group]``) → ``mx_dynamic_matmul``
+      (``block_size`` ignored, ``activation_scale`` unsupported; the group is autotuned-
+      around, fixed by the scale dtype).
     - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_dynamic_fp8_matmul``.
     - otherwise → ``w8a8_block_dynamic_fp8_matmul`` (or its static variant when
       ``activation_scale`` is given).
     """
-    if is_mxfp(B, Bs):
+    if is_mx(B, Bs):
         if activation_scale is not None:
             raise NotImplementedError(
                 "activation_scale (static activation quant) is not supported for MX weights — "
