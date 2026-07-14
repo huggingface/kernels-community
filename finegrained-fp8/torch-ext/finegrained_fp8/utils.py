@@ -35,6 +35,7 @@ FP8_DTYPE = torch.float8_e4m3fn
 # MX block size, consumed by ``tl.dot_scaled``. Format constants, not tunables.
 NIBBLES_PER_BYTE = 2
 MX_SCALE_GROUP_K = 32
+NVFP4_SCALE_GROUP_K = 16
 
 
 # ── Host-side helpers ─────────────────────────────────────────────────────────
@@ -252,6 +253,20 @@ def is_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
         and scale.ndim == weight.ndim
         and scale.shape[:-1] == weight.shape[:-1]
         and scale.shape[-1] == (weight.shape[-1] * NIBBLES_PER_BYTE) // MX_SCALE_GROUP_K
+    )
+
+
+def is_nvfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
+    """NVFP4 weight/scale pair: packed E2M1 weights (``int8``, two codes/byte) with E4M3
+    group-16 scales — the scale DTYPE is the recipe carrier (UE8M0 = MX, E4M3 = NV), and
+    the group falls out of the shape. Per-tensor second-level scales are caller-folded."""
+    return (
+        weight.dtype == torch.int8
+        and scale.dtype == torch.float8_e4m3fn
+        and scale.ndim == weight.ndim
+        and scale.shape[:-1] == weight.shape[:-1]
+        and scale.shape[-1]
+        == (weight.shape[-1] * NIBBLES_PER_BYTE) // NVFP4_SCALE_GROUP_K
     )
 
 
@@ -761,15 +776,29 @@ def mx_config_pruner(k_arg: str):
             "SWAP_AB"
         )
 
-    def activation_is_packed(args):
-        # the activation tensor is arg0 by kernel convention; uint8 = packed E2M1 (the
-        # dtype IS the activation format — it also keys the autotune cache automatically)
+    def structurally_dot_scaled_only(args):
+        # arg0 = the activation tensor, "Bs" = the weight scales, by kernel convention.
+        # Packed-E2M1 activations (uint8 arg0) and E4M3 scales (NVFP4) both exist only
+        # on the no-swap dot_scaled arm: dot/scalar decode UE8M0 and consume unpacked
+        # E4M3 activations, and the swapped rhs builder pads UE8M0/E4M3-token tiles.
         activation = next(iter(args.values()))
-        return getattr(activation, "dtype", None) == torch.uint8
+        return (
+            getattr(activation, "dtype", None) == torch.uint8
+            or getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn
+        )
+
+    def nvfp4_native_ok(c, args):
+        # mxf4nvf4 (E4M3 scales) has NO fallback below the native M=128 staging —
+        # PassManager fails outright (charted BM {16,32,64} x BK {128,256}, 2026-07-15)
+        return config_dim(c, args, "BLOCK_SIZE_M") >= 128
+
+    def scales_are_e4m3(args):
+        return getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn
 
     return compose_pruners(
         block_k_within_k_pruner(k_arg),
-        config_filter(packed_act_ok, when=activation_is_packed),
+        config_filter(packed_act_ok, when=structurally_dot_scaled_only),
+        config_filter(nvfp4_native_ok, when=scales_are_e4m3),
         config_filter(
             fp4_scalar_ok,
             when=lambda args: is_sm10x()
@@ -989,13 +1018,31 @@ def mxfp_act_quant_inline(
         a_raw, (BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_K, SCALE_GROUP_K)
     )
     amax = tl.max(tl.abs(a_groups), axis=2)
-    if RECIPE == "mxfp4":
+    if RECIPE == "nvfp4":
+        # E4M3 scale (amax/6 rounded to E4M3, NOT a power of two); values divide by the
+        # DECODED scale before hitting the E2M1 grid — the standard NVFP4 two-step
+        scales = (amax / 6.0).to(tl.float8e4nv)
+        decoded = tl.maximum(scales.to(tl.float32), 1.1754944e-38)
+        v = tl.reshape(a_groups / decoded[:, :, None], (BLOCK_SIZE_M, BLOCK_SIZE_K))
+        av = tl.abs(v)
+        code = (
+            (av >= 0.25).to(tl.int32)
+            + (av >= 0.75).to(tl.int32)
+            + (av >= 1.25).to(tl.int32)
+            + (av >= 1.75).to(tl.int32)
+            + (av >= 2.5).to(tl.int32)
+            + (av >= 3.5).to(tl.int32)
+            + (av >= 5.0).to(tl.int32)
+        ) | ((v < 0).to(tl.int32) << 3)
+        lo, hi = tl.split(tl.reshape(code, (BLOCK_SIZE_M, BLOCK_SIZE_K // 2, 2)))
+        values = (lo | (hi << 4)).to(tl.uint8)
+    elif RECIPE == "mxfp4":
         bits = (amax / 6.0).to(tl.int32, bitcast=True)
         # ceil_to_ue8m0: bump exponent by 1 when mantissa is non-zero.
         exp_ceil = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
         exp_ceil = tl.minimum(tl.maximum(exp_ceil, 1), 254)
         exp_ceil = tl.where(amax == 0, 127, exp_ceil)
-        a_scale_u8 = exp_ceil.to(tl.uint8)
+        scales = exp_ceil.to(tl.uint8)
         a_s_pow2 = (exp_ceil << 23).to(tl.float32, bitcast=True)
         v = tl.reshape(a_groups / a_s_pow2[:, :, None], (BLOCK_SIZE_M, BLOCK_SIZE_K))
         av = tl.abs(v)
@@ -1015,13 +1062,13 @@ def mxfp_act_quant_inline(
         # ceil_to_ue8m0: bump exponent by 1 when mantissa is non-zero.
         exp_ceil = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
         exp_ceil = tl.minimum(tl.maximum(exp_ceil, 1), 254)
-        a_scale_u8 = exp_ceil.to(tl.uint8)
+        scales = exp_ceil.to(tl.uint8)
         a_s_pow2 = (exp_ceil << 23).to(tl.float32, bitcast=True)
         values = tl.reshape(
             a_groups / tl.maximum(a_s_pow2[:, :, None], 1e-12),
             (BLOCK_SIZE_M, BLOCK_SIZE_K),
         ).to(tl.float8e4nv)
-    return values, a_scale_u8
+    return values, scales
 
 
 @triton.jit
@@ -1065,7 +1112,12 @@ def load_mx_act_tile(
             a_scale = tl.load(as_ptrs)
         else:
             a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
-            a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0)
+            if as_ptrs.dtype.element_ty == tl.float8e4nv:
+                # NVFP4 scales: 0.0 encodes as byte 0 — padded rows scale to exact 0
+                a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0.0)
+            else:
+                # UE8M0 scales: byte 0 decodes to 2^-127 — padded rows can't make 0*inf
+                a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0)
     else:  # raw bf16/fp16 — quantize inline
         if row_mask is None:
             a_raw = tl.load(a_ptrs).to(tl.float32)
@@ -1575,21 +1627,23 @@ class Quantization:
     MXFP8 / MXFP4       "mxfp8" (E4M3 + UE8M0),    "mxfp8" (E4M3 + UE8M0),
                         "mxfp4" (packed E2M1       "mxfp4" (packed E2M1
                         + UE8M0)                   + UE8M0)
+    NVFP4               "nvfp4" (packed E2M1       —
+                        + E4M3 group-16)
     full-precision      —                          —
     ==================  =========================  =========================
 
     (—: tensor-wide's whole-row activation scale can't be formed by a tile-local
     epilogue; the unfused path quantizes on the host between GEMMs.)"""
 
-    input_recipe: Literal["fp8", "mxfp8", "mxfp4"] | None = None
+    input_recipe: Literal["fp8", "mxfp8", "mxfp4", "nvfp4"] | None = None
     output_recipe: Literal["fp8", "mxfp8", "mxfp4"] | None = None
 
     def __post_init__(self):
         # catch typos at construction — the closest point to the user; the ops separately
         # assert which of these THEIR recipe implements
-        assert self.input_recipe in (None, "fp8", "mxfp8", "mxfp4"), (
+        assert self.input_recipe in (None, "fp8", "mxfp8", "mxfp4", "nvfp4"), (
             f"unknown input_recipe {self.input_recipe!r}; "
-            "expected None, 'fp8', 'mxfp8', or 'mxfp4'"
+            "expected None, 'fp8', 'mxfp8', 'mxfp4', or 'nvfp4'"
         )
         assert self.output_recipe in (None, "fp8", "mxfp8", "mxfp4"), (
             f"unknown output_recipe {self.output_recipe!r}; "
@@ -2275,16 +2329,20 @@ def _mxfp_act_quant_kernel(
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
+    RECIPE: tl.constexpr = "mxfp8",
 ):
-    """One-pass MX activation quant: bf16 rows → E4M3 + UE8M0 group-32 scales. Grid
-    ``(T, K // BLOCK_K)``; group boundaries are identical to the kernels' inline quant
-    (32 | BLOCK_K | K), so consumers are bit-exact with the inline form. Arbitrary input
-    strides (no host-side copy); Triton's ==1 specialization keeps the contiguous fast path."""
+    """One-pass activation quant, one launch per recipe (``mxfp_act_quant_inline`` does
+    the math, so the offline and inline forms are bit-identical by construction): E4M3 +
+    UE8M0 ("mxfp8"), packed E2M1 + UE8M0 ("mxfp4"), or packed E2M1 + E4M3 group-16
+    ("nvfp4"). Grid ``(T, K // BLOCK_K)``; group boundaries are identical across forms
+    (SCALE_GROUP_K | BLOCK_K | K). Arbitrary input strides (no host-side copy)."""
     t = tl.program_id(0).to(tl.int64)
     offs = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
     x = tl.load(X + t * stride_x_t + offs * stride_x_k)[None, :].to(tl.float32)
-    y, s = mxfp_act_quant_inline(x, 1, BLOCK_K, SCALE_GROUP_K)
-    tl.store(Y + t * K + offs, tl.reshape(y, (BLOCK_K,)))
+    y, s = mxfp_act_quant_inline(x, 1, BLOCK_K, SCALE_GROUP_K, RECIPE)
+    width: tl.constexpr = BLOCK_K // 2 if RECIPE != "mxfp8" else BLOCK_K
+    yo = tl.program_id(1) * width + tl.arange(0, width)
+    tl.store(Y + t * (K // (BLOCK_K // width)) + yo, tl.reshape(y, (width,)))
     sg = tl.program_id(1) * (BLOCK_K // SCALE_GROUP_K) + tl.arange(
         0, BLOCK_K // SCALE_GROUP_K
     )
@@ -2336,37 +2394,47 @@ def mxfp_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return y, s
 
 
-# E2M1 (FP4) grid: magnitudes by 3-bit code, and the midpoints that round |x| onto them
-E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-E2M1_ROUND_BOUNDARIES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
-
 
 def mxfp4_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize ``(T, K)`` activations to MXFP4: packed-E2M1 values (``(T, K//2)`` int8,
-    two codes per byte, first value in the low nibble) + UE8M0 group-32 uint8 scales
-    (``(T, K//32)``, amax/6 rounded up to a power of two — 6 is E2M1's largest magnitude).
-    The pair feeds the W4A4 arm of the MX matmul ops (``ACT_VALUES_PER_BYTE=2``, native
-    ``kind::mxf4`` MMA). Host-side torch; quantizing activations to fp4 at runtime is an
+    """Quantize ``(T, K)`` activations to MXFP4 in one kernel pass: packed-E2M1 values
+    (``(T, K//2)`` int8, two codes per byte, first value in the low nibble) + UE8M0
+    group-32 uint8 scales (``(T, K//32)``, amax/6 ceil'd to a power of two). Bit-identical
+    to the fused epilogues' inline form (shared ``mxfp_act_quant_inline`` arm). Feeds the
+    W4A4 arm of the MX matmul ops; quantizing activations to fp4 at runtime is an
     accuracy call the caller owns — the ops never do it implicitly."""
+    return _launch_act_quant(x, "mxfp4", MX_SCALE_GROUP_K, torch.uint8)
+
+
+def nvfp4_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``(T, K)`` activations to NVFP4 in one kernel pass: packed-E2M1 values
+    (``(T, K//2)`` int8) + E4M3 group-16 scales (``(T, K//16)`` — ``amax/6`` rounded to
+    E4M3, NOT a power of two; values divide by the DECODED scale before the E2M1 grid,
+    the standard two-step). The per-tensor second-level scale is the caller's to fold."""
+    return _launch_act_quant(x, "nvfp4", NVFP4_SCALE_GROUP_K, torch.float8_e4m3fn)
+
+
+def _launch_act_quant(x, recipe, scale_group, scale_dtype):
     T, K = x.shape
-    assert K % (2 * MX_SCALE_GROUP_K) == 0, (
-        f"K (={K}) must be a multiple of {2 * MX_SCALE_GROUP_K} to pack E2M1 pairs"
+    assert K % (2 * scale_group) == 0, (
+        f"K (={K}) must be a multiple of {2 * scale_group} to pack E2M1 pairs"
     )
-    groups = x.float().reshape(T, K // MX_SCALE_GROUP_K, MX_SCALE_GROUP_K)
-    amax = groups.abs().amax(dim=-1)
-    # amax/6 ceil'd to a power of two via the exponent-bump bit trick — the SAME math as
-    # ``mxfp_act_quant_inline``'s "mxfp4" arm so the fused requant and this host form are bit-identical
-    bits = (amax / 6.0).view(torch.int32)
-    exp_ceil = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
-    exp_ceil = exp_ceil.clamp(1, 254)
-    exp_ceil = torch.where(amax == 0, torch.full_like(exp_ceil, 127), exp_ceil)
-    scales = exp_ceil.to(torch.uint8)
-    scaled = groups / torch.pow(2.0, exp_ceil.float() - 127.0)[..., None]
-    boundaries = torch.tensor(E2M1_ROUND_BOUNDARIES, device=x.device)
-    codes = torch.bucketize(scaled.abs().reshape(T, K), boundaries).to(torch.uint8)
-    codes |= (scaled.reshape(T, K) < 0).to(torch.uint8) << 3  # sign bit
-    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).view(torch.int8)
-    return packed, scales
+    packed = torch.empty(T, K // 2, device=x.device, dtype=torch.uint8)
+    scales = torch.empty(T, K // scale_group, device=x.device, dtype=scale_dtype)
+    with device_context(x.device):
+        compile_time_only_triton_wrap(_mxfp_act_quant_kernel)[
+            lambda META: (T, K // META["BLOCK_K"])
+        ](
+            x,
+            packed,
+            scales,
+            x.stride(0),
+            x.stride(1),
+            T.bit_length(),
+            K=K,
+            SCALE_GROUP_K=scale_group,
+            RECIPE=recipe,
+        )
+    return packed.view(torch.int8), scales
 
 
 @bayesian_autotune(

@@ -14,6 +14,7 @@ from finegrained_fp8.utils import (  # type: ignore
     mxfp_act_quant,
     mxfp_act_quant_inline,
     mxfp4_act_quant,
+    nvfp4_act_quant,
 )
 
 
@@ -112,6 +113,63 @@ def _dequant_e2m1(packed, scales, K):
     return (vals.reshape(-1, K // 32, 32) * s[..., None]).reshape(-1, K)
 
 
+def _ref_mxfp4_act_quant(x: torch.Tensor):
+    """Pure-PyTorch MXFP4 reference: UE8M0 group-32 scale (amax/6 ceil'd to a power of
+    two via the exponent-bump bit trick), E2M1 rounding via bucketize, nibble pack."""
+    T, K = x.shape
+    groups = x.float().reshape(T, K // 32, 32)
+    amax = groups.abs().amax(dim=-1)
+    bits = (amax / 6.0).view(torch.int32)
+    exp_ceil = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    exp_ceil = exp_ceil.clamp(1, 254)
+    exp_ceil = torch.where(amax == 0, torch.full_like(exp_ceil, 127), exp_ceil)
+    scaled = groups / torch.pow(2.0, exp_ceil.float() - 127.0)[..., None]
+    boundaries = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
+    codes = torch.bucketize(scaled.abs().reshape(T, K), boundaries).to(torch.uint8)
+    codes |= (scaled.reshape(T, K) < 0).to(torch.uint8) << 3
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed, exp_ceil.to(torch.uint8)
+
+
+def _ref_nvfp4_act_quant(x: torch.Tensor):
+    """Pure-PyTorch NVFP4 reference: E4M3 group-16 scale (amax/6, no power-of-two ceil),
+    values divided by the DECODED scale, E2M1 rounding, nibble pack."""
+    T, K = x.shape
+    groups = x.float().reshape(T, K // 16, 16)
+    amax = groups.abs().amax(dim=-1)
+    scales = (amax / 6.0).to(torch.float8_e4m3fn)
+    scaled = groups / scales.float().clamp(min=2.0**-127)[..., None]
+    boundaries = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
+    codes = torch.bucketize(scaled.abs().reshape(T, K), boundaries).to(torch.uint8)
+    codes |= (scaled.reshape(T, K) < 0).to(torch.uint8) << 3
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed, scales
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+def test_mxfp4_act_quant_matches_torch_reference():
+    """The Triton one-pass quant must be bit-identical to an INDEPENDENT pure-PyTorch
+    implementation (the inline/offline parity tests share kernel code, so only this
+    catches a shared bug)."""
+    x = _act_inputs()
+    q, s = mxfp4_act_quant(x)
+    q_ref, s_ref = _ref_mxfp4_act_quant(x)
+    assert torch.equal(s, s_ref)
+    assert torch.equal(q.view(torch.uint8), q_ref)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+def test_nvfp4_act_quant_matches_torch_reference():
+    """Same independent-reference check for the NVFP4 quant (E4M3 group-16 scales)."""
+    x = _act_inputs()
+    q, s = nvfp4_act_quant(x)
+    q_ref, s_ref = _ref_nvfp4_act_quant(x)
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8))
+    assert torch.equal(q.view(torch.uint8), q_ref)
+
+
 @triton.jit
 def _mx_inline_harness(X, Q, S, M: tl.constexpr, N: tl.constexpr, RECIPE: tl.constexpr):
     x = tl.load(X + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :])
@@ -171,6 +229,33 @@ def test_mxfp4_inline_matches_host():
     q_ref, s_ref = mxfp4_act_quant(x)
     assert torch.equal(s, s_ref)
     assert torch.equal(q, q_ref.view(torch.uint8))
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+def test_nvfp4_inline_matches_offline():
+    """The in-kernel NVFP4 quant and the one-pass offline kernel share
+    ``mxfp_act_quant_inline``'s arm, but exercise different tile widths — the packed
+    bytes and E4M3 scales must be bit-identical."""
+    x = _act_inputs()
+    M, N = x.shape
+    q = torch.empty(M, N // 2, device="cuda", dtype=torch.uint8)
+    s = torch.empty(M, N // 16, device="cuda", dtype=torch.float8_e4m3fn)
+    _nv_inline_harness[(1,)](x, q, s, M=M, N=N, num_warps=4)
+    torch.cuda.synchronize()
+    q_ref, s_ref = nvfp4_act_quant(x)
+    assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8))
+    assert torch.equal(q, q_ref.view(torch.uint8))
+
+
+@triton.jit
+def _nv_inline_harness(X, Q, S, M: tl.constexpr, N: tl.constexpr):
+    x = tl.load(X + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :])
+    q, s = mxfp_act_quant_inline(x.to(tl.float32), M, N, 16, "nvfp4")
+    tl.store(Q + tl.arange(0, M)[:, None] * (N // 2) + tl.arange(0, N // 2)[None, :], q)
+    tl.store(
+        S + tl.arange(0, M)[:, None] * (N // 16) + tl.arange(0, N // 16)[None, :], s
+    )
 
 
 @pytest.mark.kernels_ci

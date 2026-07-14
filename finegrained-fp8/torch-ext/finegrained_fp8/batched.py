@@ -25,9 +25,11 @@ from .utils import (
     Epilogue,
     Quantization,
     mxfp4_act_quant,
+    nvfp4_act_quant,
     FP8_DTYPE,
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
+    NVFP4_SCALE_GROUP_K,
     UE8M0_SCALE_DTYPES,
     decode_ue8m0_scale,
     device_context,
@@ -53,6 +55,7 @@ from .utils import (
     load_block_fp8_act_tile,
     get_accelerator_autotuning_configs,
     is_mxfp,
+    is_nvfp4,
     weight_block_size,
     e2m1_as_uint8,
     ue8m0_as_uint8,
@@ -514,7 +517,7 @@ def mxfp_dynamic_matmul_batched_kernel(
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         if PRE_QUANTIZED:
             a = tl.load(a_ptrs)
-            a_scale = tl.load(as_ptrs).to(tl.uint8)
+            a_scale = tl.load(as_ptrs)  # dtype carries the scale format (UE8M0 or E4M3)
             as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
         else:
             a_raw = tl.load(a_ptrs).to(tl.float32)
@@ -524,9 +527,7 @@ def mxfp_dynamic_matmul_batched_kernel(
         b = stacked_gate_up_flatten(
             tl.load(b_ptrs), 2 * BLOCK_SIZE_N, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE, GATE, SWAP_AB
         )
-        b_s = tl.reshape(
-            tl.load(bs_ptrs), (n_width, BLOCK_SIZE_K // SCALE_GROUP_K)
-        ).to(tl.uint8)
+        b_s = tl.reshape(tl.load(bs_ptrs), (n_width, BLOCK_SIZE_K // SCALE_GROUP_K))
         accumulator = mx_compute(
             accumulator,
             a,
@@ -959,23 +960,44 @@ def mxfp_dynamic_matmul_batched(
     # A raw (As None) -> quantized inline in the kernel (decode-free UE8M0); pre-quantized
     # (As given, e.g. the down reading a requantized intermediate) -> loaded via the kernel's
     # PRE_QUANTIZED branch.
-    assert input_recipe in (None, "mxfp8", "mxfp4"), (
-        f"MX activations are E4M3 ('mxfp8', the default) or packed E2M1 ('mxfp4'), "
-        f"got {input_recipe!r}"
+    nvfp4 = Bs.dtype == torch.float8_e4m3fn  # the scale dtype IS the recipe carrier
+    assert nvfp4 or Bs.dtype in UE8M0_SCALE_DTYPES, (
+        f"Bs must be UE8M0 (float8_e8m0fnu/uint8) or E4M3 (NVFP4), got {Bs.dtype}"
     )
-    assert output_recipe in (None, "mxfp8", "mxfp4"), (
-        f"MX recipes requantize to 'mxfp8' or packed 'mxfp4', got {output_recipe!r}"
-    )
+    if nvfp4:
+        # the decode grid tops out at BLOCK_SIZE_M=16 and mxf4nvf4 compiles only at
+        # M=128 on this Triton (no fallback) — grouped covers NVFP4 prefill
+        raise NotImplementedError(
+            "NVFP4 batched (decode) is unsupported: the mxf4nvf4 MMA has no "
+            "BLOCK_SIZE_M<128 lowering on Triton 3.7.1"
+        )
+    if nvfp4:
+        # matching scale formats required on both operands; no NVFP4 requant arm yet
+        assert input_recipe in (None, "nvfp4"), (
+            f"NVFP4 activations are packed E2M1 + E4M3 scales, got {input_recipe!r}"
+        )
+        assert output_recipe is None, "no NVFP4 fused-requant arm yet"
+        if As is None:  # no inline NVFP4 quant arm either — pack offline
+            A, As = nvfp4_act_quant(A)
+    else:
+        assert input_recipe in (None, "mxfp8", "mxfp4"), (
+            f"MX activations are E4M3 ('mxfp8', the default) or packed E2M1 ('mxfp4'), "
+            f"got {input_recipe!r}"
+        )
+        assert output_recipe in (None, "mxfp8", "mxfp4"), (
+            f"MX recipes requantize to 'mxfp8' or packed 'mxfp4', got {output_recipe!r}"
+        )
+        # 'mxfp4' packs raw input to E2M1 offline — there is no inline fp4 quant arm.
+        if input_recipe == "mxfp4" and As is None:
+            A, As = mxfp4_act_quant(A)
     requant = output_recipe is not None
-    # 'mxfp4' packs raw input to E2M1 offline — there is no inline fp4 quant arm.
-    if input_recipe == "mxfp4" and As is None:
-        A, As = mxfp4_act_quant(A)
+    if As is not None:
+        assert (As.dtype == torch.float8_e4m3fn) == nvfp4, (
+            f"activation scales ({As.dtype}) must match the weight scale family ({Bs.dtype})"
+        )
     pre_quantized = As is not None
     assert B.dtype in (torch.int8, torch.float8_e4m3fn), (
         f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
-    )
-    assert Bs.dtype in UE8M0_SCALE_DTYPES, (
-        f"Bs must be float8_e8m0fnu or uint8 (UE8M0), got {Bs.dtype}"
     )
     WEIGHT_VALUES_PER_BYTE = NIBBLES_PER_BYTE if B.dtype == torch.int8 else 1
     # int8 A = caller-provided packed-E2M1 activations (W4A4, native mxf4 MMA): K is two
@@ -993,11 +1015,14 @@ def mxfp_dynamic_matmul_batched(
     assert K == WEIGHT_VALUES_PER_BYTE * K_b, (
         f"K (={K}) must equal {WEIGHT_VALUES_PER_BYTE} * B.shape[2] (={K_b})"
     )
-    assert K % MX_SCALE_GROUP_K == 0, (
-        f"K (={K}) must be a multiple of {MX_SCALE_GROUP_K}"
+    # the scale group falls out of the scale shape (32 for MX/UE8M0, 16 for NVFP4/E4M3)
+    scale_group = K // Bs.shape[2]
+    assert scale_group == (NVFP4_SCALE_GROUP_K if nvfp4 else MX_SCALE_GROUP_K), (
+        f"scale group {scale_group} does not match the scale dtype {Bs.dtype}"
     )
-    assert Bs.shape == (num_experts, n_rows, K // MX_SCALE_GROUP_K), (
-        f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {n_rows}, {K // MX_SCALE_GROUP_K})"
+    assert K % scale_group == 0, f"K (={K}) must be a multiple of {scale_group}"
+    assert Bs.shape == (num_experts, n_rows, K // scale_group), (
+        f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {n_rows}, {K // scale_group})"
     )
 
     A = e2m1_as_uint8(A)
@@ -1051,7 +1076,7 @@ def mxfp_dynamic_matmul_batched(
             Cs.stride(0) if requant else 1,
             Cs.stride(1) if requant else 1,
             expert_ids.stride(0),
-            SCALE_GROUP_K=MX_SCALE_GROUP_K,
+            SCALE_GROUP_K=scale_group,
             num_experts=num_experts,
             PRE_QUANTIZED=pre_quantized,
             HAS_GATHER=gather_idx is not None,
@@ -1197,7 +1222,7 @@ def matmul_batched(
         out = full_precision_matmul_batched(
             A, B, expert_ids, *ep.as_args(), *q.as_args(), output_dtype, gather_idx, scatter_idx
         )
-    elif is_mxfp(B, Bs):
+    elif is_mxfp(B, Bs) or is_nvfp4(B, Bs):
         out = mxfp_dynamic_matmul_batched(
             A, As, B, Bs, expert_ids, *ep.as_args(), *q.as_args(), output_dtype, gather_idx, scatter_idx
         )
