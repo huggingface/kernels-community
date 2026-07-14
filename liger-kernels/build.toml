@@ -1,6 +1,6 @@
 [general]
 name = "liger-kernels"
-version = 2
+version = 3
 license = "BSD-2-Clause"
 backends = [
     "cuda",
