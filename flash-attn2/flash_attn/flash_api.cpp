@@ -1508,7 +1508,21 @@ mha_fwd_kvcache(Tensor &q,                 // batch_size x seqlen_q x num_heads 
 } // namespace FLASH_NAMESPACE
 
 // Boxed entry points for the stable ABI: unbox the stack, dispatch, box the
-// result tuple back. The `Generator? gen_` schema slot is accepted but ignored.
+// result tuple back.
+
+namespace {
+// The `Generator? gen_` slot is kept in the schema to match the non-stable
+// bindings, but the stable ABI does not expose the CUDA RNG generator, so
+// dropout (its only consumer) is unsupported here. Reject a caller-supplied
+// generator instead of silently ignoring it. An optional boxes to a
+// `StableIValue*` that is null exactly when the argument is None, so the slot
+// can be tested without naming the unavailable Generator type.
+void check_no_generator(StableIValue gen_slot) {
+    STD_TORCH_CHECK(to<StableIValue*>(gen_slot) == nullptr,
+                    "This flash attention build does not support passing a generator: "
+                    "the RNG generator is not exposed by the Torch stable ABI.");
+}
+} // namespace
 
 void boxed_mha_fwd(StableIValue* stack, uint64_t num_args, uint64_t num_outputs) {
     Tensor q = to<Tensor>(stack[0]);
@@ -1523,7 +1537,7 @@ void boxed_mha_fwd(StableIValue* stack, uint64_t num_args, uint64_t num_outputs)
     int64_t window_size_right = to<int64_t>(stack[9]);
     double softcap = to<double>(stack[10]);
     bool return_softmax = to<bool>(stack[11]);
-    // stack[12]: Generator? gen_ (ignored under the stable ABI)
+    check_no_generator(stack[12]);  // Generator? gen_
 
     auto out = FLASH_NAMESPACE::mha_fwd(
         q, k, v, out_, alibi_slopes_,
@@ -1558,7 +1572,7 @@ void boxed_mha_varlen_fwd(StableIValue* stack, uint64_t num_args, uint64_t num_o
     int64_t window_size_right = to<int64_t>(stack[17]);
     double softcap = to<double>(stack[18]);
     bool return_softmax = to<bool>(stack[19]);
-    // stack[20]: Generator? gen_ (ignored)
+    check_no_generator(stack[20]);  // Generator? gen_
 
     auto out = FLASH_NAMESPACE::mha_varlen_fwd(
         q, k, v, out_, cu_seqlens_q, cu_seqlens_k, seqused_k, leftpad_k_, block_table_,
@@ -1591,7 +1605,7 @@ void boxed_mha_bwd(StableIValue* stack, uint64_t num_args, uint64_t num_outputs)
     int64_t window_size_right = to<int64_t>(stack[14]);
     double softcap = to<double>(stack[15]);
     bool deterministic = to<bool>(stack[16]);
-    // stack[17]: Generator? gen_ (ignored)
+    check_no_generator(stack[17]);  // Generator? gen_
     std::optional<Tensor> rng_state = to<std::optional<Tensor>>(stack[18]);
 
     auto out_v = FLASH_NAMESPACE::mha_bwd(
@@ -1629,7 +1643,7 @@ void boxed_mha_varlen_bwd(StableIValue* stack, uint64_t num_args, uint64_t num_o
     int64_t window_size_right = to<int64_t>(stack[19]);
     double softcap = to<double>(stack[20]);
     bool deterministic = to<bool>(stack[21]);
-    // stack[22]: Generator? gen_ (ignored)
+    check_no_generator(stack[22]);  // Generator? gen_
     std::optional<Tensor> rng_state = to<std::optional<Tensor>>(stack[23]);
 
     auto out_v = FLASH_NAMESPACE::mha_varlen_bwd(
