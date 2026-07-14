@@ -60,7 +60,7 @@ jobs:
       # Checkout WITHOUT a ref: under pull_request_target this resolves to the
       # base repo's branch (trusted), never the PR head. We only need the
       # script and .github/pr-labels.json from it.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Single self-contained Python script (stdlib only, matching the repo's
       # other .github/scripts/*.py). The workflow picks the sub-command:
