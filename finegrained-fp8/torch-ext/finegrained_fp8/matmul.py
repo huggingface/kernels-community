@@ -33,7 +33,7 @@ from .utils import (
     scalar_max_m_pruner,
     block_k_within_k_pruner,
     compose_pruners,
-    decode_ue8m0_scale,
+    decode_group_scale,
     descriptor_config_pruner,
     device_context,
     fp8_act_quant_tensor_wide,
@@ -47,7 +47,7 @@ from .utils import (
     is_mxfp,
     is_tensor_wide,
     maybe_act_quant,
-    mxfp_act_quant,
+    mxfp8_act_quant,
     store_masked,
     store_masked_oriented,
     swizzle_offsets,
@@ -66,7 +66,7 @@ GROUP_SIZE_M = 8
 # (MXFP4's M=16 cell marginally favors inline — outweighed). STATIC: inherited estimate,
 # not swept — its inline arm is cheaper elementwise work, so the true crossover is at or
 # above the MXFP one; the M=1 decode case (the one that matters) is inline either way.
-MXFP_MATMUL_ACT_PREQUANT_MIN_M = 16
+MXFP8_MATMUL_ACT_PREQUANT_MIN_M = 16
 STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
 # Block-dynamic has NO gate: offline wins at EVERY M incl. M=1 (24.7 vs 31.0us, isolated
 # arm A/B, graph-timed, H=6144 b128) — the inline arm pays a per-tile fp32 amax+div. The
@@ -75,8 +75,8 @@ STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
 
 
 @bayesian_autotune(
-    # tune_block_m: BLOCK_SIZE_M is a config axis (not the adaptive_block_size_m launch
-    # heuristic): pointer+WS at BM=64 is the winner at every model dim probed (H=5120/
+    # tune_block_m: BLOCK_SIZE_M is a config axis (not a launch-time heuristic):
+    # pointer+WS at BM=64 is the winner at every model dim probed (H=5120/
     # 6144/7168), −17% e2e vs the heuristic's BM=128 at M=8192. tune_block_n: the N tile
     # is DECOUPLED from the caller's scale granularity (block_n) — a BN=256 tile
     # over 128-wide scale columns halves activation re-reads; any BN is numerically fine
@@ -91,7 +91,7 @@ STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
     get_accelerator_autotuning_configs(
         warp_spec=True, tune_block_m=True, tune_block_n=True
     ),
-    # m_bit_length (log2 M bucket) keys the M tile, mirroring mxfp_dynamic_matmul_kernel.
+    # m_bit_length (log2 M bucket) keys the M tile, mirroring mx_dynamic_matmul_kernel.
     ["N", "K", "m_bit_length"],
     n_trials=100,
     # WS compile guard (non-WS is race-free at every (BM, warps) here) + the descriptor
@@ -178,7 +178,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         b = load_weight_tile(
             b_ptrs, b_descriptor, pid_n * BLOCK_SIZE_N, k * block_k, MEMORY_MODE
         )
-        b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
+        b_s = decode_group_scale(tl.load(bs_ptrs))
         accumulator += block_scaled_fp8_dot(a, a_s, b, b_s, SWAP_AB)
         a_ptrs += block_k * stride_a_k
         as_ptrs += 1
@@ -347,7 +347,7 @@ def w8a8_block_static_fp8_matmul_kernel(
         else:  # raw bf16/fp16 — quantize inline against the static scale
             a = (tl.load(a_ptrs).to(tl.float32) / a_s_static).to(tl.float8e4nv)
         b = tl.load(b_ptrs)
-        b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
+        b_s = decode_group_scale(tl.load(bs_ptrs))
         accumulator += tl.dot(a, b) * b_s[None, :]
         a_ptrs += block_k * stride_a_k
         b_ptrs += block_k * stride_b_k
@@ -369,8 +369,8 @@ def w8a8_block_static_fp8_matmul_kernel(
 
 
 @bayesian_autotune(
-    # tune_block_m: BLOCK_SIZE_M becomes a config axis (not the adaptive_block_size_m launch
-    # heuristic), so the tuner sizes the M tile per workload — small at decode, large at prefill.
+    # tune_block_m: BLOCK_SIZE_M becomes a config axis, so the tuner sizes the M tile
+    # per workload — small at decode, large at prefill.
     # scalar is in the mode set for M=1 decode (attn projection): it avoids the MMA M->16 pad
     # that held MXFP8 attn decode 35% over block-dynamic at identical weight bytes; fp4-scalar
     # is dropped by the pruner (ALU-bound unpack). swap_ab intentionally OFF: an 18-cell forced-swap sweep (cudagraph,
@@ -401,7 +401,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     },
 )
 @triton.jit
-def mxfp_dynamic_matmul_kernel(
+def mx_dynamic_matmul_kernel(
     A,  # (M, K) activations: E4M3 (pre-quantized) or raw bf16/fp16 (quantized inline)
     As,  # (M, K // 32) UE8M0 group-32 activation scales (pre-quantized arm only)
     B,  # (N, K) E4M3 (MXFP8) or (N, K // 2) packed E2M1 (MXFP4) weights
@@ -743,9 +743,9 @@ def w8a8_tensor_dynamic_fp8_matmul(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("mxfp_dynamic_matmul"), mutates_args=()
+    add_op_namespace_prefix("mx_dynamic_matmul"), mutates_args=()
 )
-def mxfp_dynamic_matmul(
+def mx_dynamic_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
@@ -787,7 +787,7 @@ def mxfp_dynamic_matmul(
     B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     A_q, A_s = maybe_act_quant(
-        A.view(M, K), mxfp_act_quant, MXFP_MATMUL_ACT_PREQUANT_MIN_M
+        A.view(M, K), mxfp8_act_quant, MXFP8_MATMUL_ACT_PREQUANT_MIN_M
     )
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
 
@@ -798,7 +798,7 @@ def mxfp_dynamic_matmul(
         )
 
     with device_context(A.device):
-        compile_time_only_triton_wrap(mxfp_dynamic_matmul_kernel)[grid](
+        compile_time_only_triton_wrap(mx_dynamic_matmul_kernel)[grid](
             A_q,
             A_s,
             B,
@@ -843,7 +843,7 @@ def matmul_2d(
 
     Routes by weight dtype and ``block_size``:
     - MX weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
-      group-32 ``Bs`` (shape ``[N, K//32]``) → ``mxfp_dynamic_matmul`` (``block_size``
+      group-32 ``Bs`` (shape ``[N, K//32]``) → ``mx_dynamic_matmul`` (``block_size``
       ignored, ``activation_scale`` unsupported; scale granularity fixed at 32, autotuned).
     - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_dynamic_fp8_matmul``.
     - otherwise → ``w8a8_block_dynamic_fp8_matmul`` (or its static variant when
@@ -855,7 +855,7 @@ def matmul_2d(
                 "activation_scale (static activation quant) is not supported for MX weights — "
                 "the MX path quantizes activations dynamically per group. Omit activation_scale."
             )
-        return mxfp_dynamic_matmul(A, B, Bs, output_dtype)
+        return mx_dynamic_matmul(A, B, Bs, output_dtype)
 
     if is_tensor_wide(block_size, B):
         return w8a8_tensor_dynamic_fp8_matmul(A, B, Bs, output_dtype)

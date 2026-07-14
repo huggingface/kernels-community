@@ -49,7 +49,7 @@ def compile_time_only_triton_wrap(kernel):
     has ``prune_configs_by`` re-runs the FULL tune on every call (torch's wrapper rebuilds
     a fresh autotuner around the pruned configs per call, ``triton_kernel_wrap.py``:
     ``autotune(configs=pruned, key=[])``), so nothing ever lands in the original
-    ``Autotuner.cache`` (~2.3s/call for ``_mxfp_act_quant_kernel``) and the mid-capture
+    ``Autotuner.cache`` (~2.3s/call for ``_mx_act_quant_kernel``) and the mid-capture
     tune invalidates cudagraph capture. Pruner-less kernels and the ``bayesian_autotune``
     kernels reuse their cache through the wrapper (measured) — but eager never needs the
     wrapper at all."""
@@ -303,6 +303,81 @@ def weight_block_size(B: torch.Tensor, Bs: torch.Tensor) -> list[int] | None:
     return [n_rows // Bs.shape[1], K // Bs.shape[2]]
 
 
+def validate_dense_operands(A: torch.Tensor, B: torch.Tensor) -> None:
+    """Shared (rows, K) x (num_experts, N, K) operand checks for the unpacked recipes —
+    the packed-E2M1 ops do their own (K spans two values per stored byte)."""
+    assert A.ndim == 2, f"A must be 2D (rows, K), got ndim={A.ndim}"
+    assert A.is_contiguous(), "A must be contiguous"
+    assert B.ndim == 3, f"B must be 3D (num_experts, N, K), got ndim={B.ndim}"
+    assert B.is_contiguous(), "B must be contiguous"
+    assert A.shape[1] == B.shape[2], (
+        f"K mismatch: A has K={A.shape[1]}, B has K={B.shape[2]}"
+    )
+
+
+def expert_weight_shape(B: torch.Tensor, gate: bool) -> tuple[int, int, int]:
+    """(num_experts, n_rows, N) of an expert weight stack — under a gate epilogue B is
+    the (E, 2N, K) gate|up stack, so the per-projection width N is half the stored rows."""
+    num_experts, n_rows, _ = B.shape
+    return num_experts, n_rows, (n_rows // 2 if gate else n_rows)
+
+
+def routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts) -> int:
+    """S (routed rows) for a grouped launch, carried by the (S,) maps — A's rows are
+    gather SOURCES and under-count S whenever top_k > 1 (gate_up reading raw hidden);
+    only with no maps at all is A itself the expert-sorted (S, K) matrix. Validates the
+    maps and the ``(next_power_of_2(E) + 1,)`` ``expert_start`` schedule."""
+    if gather_idx is not None:
+        S = gather_idx.numel()
+    elif scatter_idx is not None:
+        S = scatter_idx.numel()
+    else:
+        S = A.shape[0]
+    for perm_map in (gather_idx, scatter_idx):
+        assert perm_map is None or (perm_map.numel() == S and perm_map.is_contiguous())
+    assert (
+        expert_start.is_contiguous()
+        and expert_start.numel() == triton.next_power_of_2(num_experts) + 1
+    ), "expert_start must be contiguous (next_power_of_2(num_experts) + 1,)"
+    return S
+
+
+def tokens_per_expert_bucket(S: int, num_experts: int) -> int:
+    """log2 bucket of the average routed rows per expert — the grouped kernels' autotune
+    key (raw S would retune per unique token count)."""
+    return int((S + num_experts - 1) // num_experts).bit_length()
+
+
+def normalize_per_expert_scale(Bs: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """One per-tensor scale per expert, normalized to ``(num_experts, 1, 1)`` from
+    either that or a bare ``(num_experts,)``."""
+    if Bs.ndim == 1:
+        assert Bs.shape[0] == num_experts, (
+            f"Bs shape {tuple(Bs.shape)} != expected ({num_experts},)"
+        )
+        return Bs.reshape(num_experts, 1, 1)
+    assert Bs.shape == (num_experts, 1, 1), (
+        f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, 1, 1)"
+    )
+    return Bs
+
+
+def mx_scale_family(Bs: torch.Tensor, K: int) -> tuple[bool, int]:
+    """(nvfp4, scale_group) for an MX/NV weight-scale tensor — the scale dtype IS the
+    recipe carrier (E4M3 = NVFP4, UE8M0 = MX) and the group falls out of the shape;
+    validates the pairing."""
+    nvfp4 = Bs.dtype == torch.float8_e4m3fn
+    assert nvfp4 or Bs.dtype in UE8M0_SCALE_DTYPES, (
+        f"Bs must be UE8M0 (float8_e8m0fnu/uint8) or E4M3 (NVFP4), got {Bs.dtype}"
+    )
+    scale_group = K // Bs.shape[-1]
+    assert scale_group == (NVFP4_SCALE_GROUP_K if nvfp4 else MX_SCALE_GROUP_K), (
+        f"scale group {scale_group} does not match the scale dtype {Bs.dtype}"
+    )
+    assert K % scale_group == 0, f"K (={K}) must be a multiple of {scale_group}"
+    return nvfp4, scale_group
+
+
 def tl_dtype(dtype: torch.dtype) -> tl.dtype:
     """The ``tl`` dtype matching a torch dtype (``torch.bfloat16`` → ``tl.bfloat16``) — the
     attribute names line up, so no table. For passing a tensor's dtype as a kernel constexpr
@@ -310,18 +385,6 @@ def tl_dtype(dtype: torch.dtype) -> tl.dtype:
     return getattr(tl, str(dtype).removeprefix("torch."))
 
 
-def adaptive_block_size_m(target_m: int) -> int:
-    """Smallest power-of-2 >= ``target_m``, floored at 16 and capped at 128.
-
-    Used by all matmul wrappers (single / batched / grouped) to size the M tile
-    to the workload — small per-expert M wants smaller tiles, large M caps out
-    at 128 to keep register pressure bounded. Pass ``M`` for single matmul, or
-    ``(S + E - 1) // E`` (avg tokens per expert) for batched/grouped.
-    """
-    return min(max(triton.next_power_of_2(target_m), 16), 128)
-
-
-@functools.cache
 def get_active_device_type() -> str:
     """Active torch device type for the current Triton backend (``"cuda"``, ``"xpu"``, ...).
 
@@ -388,8 +451,8 @@ def get_accelerator_autotuning_configs(
 
     Axes, crossed per flag:
 
-    - ``tune_block_m``: BLOCK_SIZE_M in {16,32,64,128} instead of the
-      ``adaptive_block_size_m`` launch heuristic.
+    - ``tune_block_m``: BLOCK_SIZE_M in {16,32,64,128} instead of a fixed
+      launch-time choice.
     - ``tune_block_n``: independent BLOCK_SIZE_N in {64,128,256} for the block-scale
       kernels whose BK is pinned by the caller (activation scale groups are per
       block_k) but whose N tile may grow past the scale granularity.
@@ -713,7 +776,7 @@ def mx_config_pruner(k_arg: str):
       per-dimension model into writing off SWAP_AB (a 100-trial dsv4 down tune benched 3
       swap configs — two dead-slow swap-scalar, one inf — and shipped a 38.9µs no-swap
       winner, missing the ~24µs swap dot_scaled basin entirely).
-    - Swapped ``dot_scaled`` rows < 128 → dropped: the native mxfp scaled-MMA gates on the M
+    - Swapped ``dot_scaled`` rows < 128 → dropped: the native microscaled MMA gates on the M
       operand being exactly 128, so smaller rows run the bf16-upcast fallback and never win —
       the same poison mechanism (an earlier dsv4 gate_up tune shipped 63µs missing the 43µs
       swap winner).
@@ -768,28 +831,15 @@ def mx_config_pruner(k_arg: str):
     def dot_arm_ok(c, args):
         return c.kwargs.get("COMPUTE_MODE") != "dot"
 
-    def packed_act_ok(c, args):
-        # Packed-E2M1 activations (W4A4) exist only on the no-swap dot_scaled arm: the
-        # dot/scalar arms consume decoded E4M3 (they would need an A-side unpack) and the
-        # swapped rhs builder pads an E4M3 token. Structural on every arch, not a perf fence.
-        return c.kwargs.get("COMPUTE_MODE") == "dot_scaled" and not c.kwargs.get(
-            "SWAP_AB"
-        )
-
-    def structurally_dot_scaled_only(args):
-        # arg0 = the activation tensor, "Bs" = the weight scales, by kernel convention.
-        # Packed-E2M1 activations (uint8 arg0) and E4M3 scales (NVFP4) both exist only
-        # on the no-swap dot_scaled arm: dot/scalar decode UE8M0 and consume unpacked
-        # E4M3 activations, and the swapped rhs builder pads UE8M0/E4M3-token tiles.
-        activation = next(iter(args.values()))
-        return (
-            getattr(activation, "dtype", None) == torch.uint8
-            or getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn
-        )
-
     def nvfp4_native_ok(c, args):
         # mxf4nvf4 (E4M3 scales) has NO fallback below the native M=128 staging —
-        # PassManager fails outright (charted BM {16,32,64} x BK {128,256}, 2026-07-15)
+        # PassManager fails outright (charted BM {16,32,64} x BK {128,256}, 2026-07-15).
+        # dot_scaled-only (dot/scalar decode E4M3 scales in software at any M); the MMA's
+        # M operand is BLOCK_SIZE_M, or the weight rows when SWAP_AB puts the token in N.
+        if c.kwargs.get("COMPUTE_MODE") != "dot_scaled":
+            return True
+        if c.kwargs.get("SWAP_AB"):
+            return (2 if args.get("GATE") else 1) * c.kwargs["BLOCK_SIZE_N"] >= 128
         return config_dim(c, args, "BLOCK_SIZE_M") >= 128
 
     def scales_are_e4m3(args):
@@ -797,12 +847,12 @@ def mx_config_pruner(k_arg: str):
 
     return compose_pruners(
         block_k_within_k_pruner(k_arg),
-        config_filter(packed_act_ok, when=structurally_dot_scaled_only),
         config_filter(nvfp4_native_ok, when=scales_are_e4m3),
         config_filter(
             fp4_scalar_ok,
             when=lambda args: is_sm10x()
-            and getattr(args.get("B"), "dtype", None) == torch.uint8,
+            and getattr(args.get("B"), "dtype", None) == torch.uint8
+            and not scales_are_e4m3(args),
         ),
         config_filter(dot_arm_ok, when=lambda args: is_sm10x()),
         config_filter(mma_shape_ok, when=lambda args: is_sm10x()),
@@ -997,7 +1047,7 @@ def fp8_act_quant_inline(a_raw, TRANSPOSED: tl.constexpr = False):
 
 
 @triton.jit
-def mxfp_act_quant_inline(
+def mx_act_quant_inline(
     a_raw,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -1012,6 +1062,8 @@ def mxfp_act_quant_inline(
     - ``"mxfp4"``: round to E2M1 (the ``>=``-boundary sum matches ``torch.bucketize``'s
       tie behavior in the host ``mxfp4_act_quant``, bit-for-bit) and pack nibble pairs —
       returns ``((M, K//2) uint8, (M, K // SCALE_GROUP_K) uint8)``.
+    - ``"nvfp4"``: E4M3 scale (amax/6, not a power of two), values divide by the DECODED
+      scale before the E2M1 grid — returns ``((M, K//2) uint8, (M, K // SCALE_GROUP_K) E4M3)``.
 
     Only the taken recipe arm compiles."""
     a_groups = tl.reshape(
@@ -1123,21 +1175,23 @@ def load_mx_act_tile(
             a_raw = tl.load(a_ptrs).to(tl.float32)
         else:
             a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
-        a, a_scale = mxfp_act_quant_inline(
+        a, a_scale = mx_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
         )
     return a, a_scale
 
 
 @triton.jit
-def decode_ue8m0_scale(scale):
-    """Decode a UE8M0 weight scale to fp32: when it was loaded as ``uint8`` exponent
-    bits, ``value = 2^(exp - 127)``, built directly as the fp32 bit pattern. fp32
-    scales (block-dynamic with float scales) pass through. The dtype branch is a
-    compile-time constant, so only the taken path is emitted (single return — Triton
-    requires all ``return`` statements to share a type)."""
+def decode_group_scale(scale):
+    """Decode a group scale to fp32 by its dtype: ``uint8`` = UE8M0 exponent bits
+    (``value = 2^(exp - 127)``, built directly as the fp32 bit pattern), E4M3 = NVFP4's
+    direct fp8 value, fp32 (block-dynamic with float scales) passes through. The dtype
+    branch is a compile-time constant, so only the taken path is emitted (single return —
+    Triton requires all ``return`` statements to share a type)."""
     if scale.dtype == tl.uint8:
         scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    elif scale.dtype == tl.float8e4nv:
+        scale = scale.to(tl.float32)
     return scale
 
 
@@ -1159,9 +1213,10 @@ def mx_dot_rescale(acc, a, w, a_scale, w_scale):
     software rescale (decoding both UE8M0 scales internally), accumulating into ``acc`` (returned
     updated). The batched gate_up kernel passes the stacked
     gate|up tile (2*BN columns) — per-column independence keeps that bit-exact."""
-    wq = mxfp4_e2m1_to_e4m3(w) if w.dtype == tl.uint8 else w
-    return acc + tl.dot(a, wq) * decode_ue8m0_scale(a_scale) * tl.trans(
-        decode_ue8m0_scale(w_scale)
+    aq = e2m1_cols_to_f32(a).to(tl.float8e4nv) if a.dtype == tl.uint8 else a
+    wq = e2m1_to_e4m3(w) if w.dtype == tl.uint8 else w
+    return acc + tl.dot(aq, wq) * decode_group_scale(a_scale) * tl.trans(
+        decode_group_scale(w_scale)
     )
 
 
@@ -1187,14 +1242,15 @@ def mx_scalar_reduce(
     reduce the raw products within each group, then apply ONE combined (act × weight) scale per
     group — ``SCALE_GROUP_K``× fewer scale-muls. Measured ~18% faster on the decode reduce
     (the per-element expand was pure overhead), bit-identical to the expanded form (rel 1e-7)."""
-    wq = mxfp4_e2m1_to_e4m3(w) if w.dtype == tl.uint8 else w
+    aq = e2m1_cols_to_f32(a) if a.dtype == tl.uint8 else a.to(tl.float32)
+    wq = e2m1_to_e4m3(w) if w.dtype == tl.uint8 else w
     NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
-    prod = tl.trans(a.to(tl.float32)) * wq.to(tl.float32)  # [BK, ROWS_W]
+    prod = tl.trans(aq) * wq.to(tl.float32)  # [BK, ROWS_W]
     grp = tl.sum(
         tl.reshape(prod, (NG, SCALE_GROUP_K, ROWS_W)), axis=1
     )  # per-group partial
-    scale = tl.trans(decode_ue8m0_scale(a_scale)) * tl.trans(
-        decode_ue8m0_scale(w_scale)
+    scale = tl.trans(decode_group_scale(a_scale)) * tl.trans(
+        decode_group_scale(w_scale)
     )
     return acc + tl.sum(grp * scale, axis=0)[None, :]
 
@@ -1217,9 +1273,9 @@ def mx_compute(
     in the MMA M dim — different acc shape/finalize; see ``mx_swap_compute``); otherwise dispatch on
     ``COMPUTE_MODE``: scaled-MMA on the raw weight (``w``), or fp8 ``tl.dot`` + per-group rescale /
     scalar reduce on the E4M3-decoded weight. Single return — only the taken branch compiles.
-    A ``uint8`` ``a`` tile is packed-E2M1 activations (W4A4, the dtype is the format) —
-    dot_scaled/no-swap only; ``mx_config_pruner`` fences the other arms (they would need an
-    A-side unpack)."""
+    A ``uint8`` ``a`` tile is packed-E2M1 activations (W4A4, the dtype is the format):
+    dot_scaled consumes it natively; the dot/scalar/swap arms column-unpack it to E4M3
+    (lossless) first."""
     if SWAP_AB:
         acc = mx_swap_compute(
             acc,
@@ -1268,20 +1324,6 @@ MMA_N_ATOM = tl.constexpr(16)
 
 
 @triton.jit
-def mx_dot_scaled_swapped_rhs(a, a_scale, BLOCK_SIZE_K: tl.constexpr):
-    """Build the swap-AB rhs (activation) + its scale: the [BK] E4M3 token becomes an
-    ``[BK, MMA_N_ATOM]`` tile with only column 0 real (16 is Triton's tcgen05-selection gate,
-    not the hardware floor: PTX shows N=8 drops dot_scaled to the bf16-upcast fallback —
-    zero tcgen05 ops — costing +30%; bare-1 was 1.83x; plain dot is indifferent), and its
-    UE8M0 scale is broadcast to the same padded shape."""
-    rhs = swap_pad_rhs(a, BLOCK_SIZE_K)
-    asc = tl.trans(
-        a_scale[:, None] + tl.zeros((BLOCK_SIZE_K // 32, MMA_N_ATOM), tl.uint8)
-    )
-    return rhs, asc
-
-
-@triton.jit
 def mx_dot_scaled_swapped(
     acc,
     a,
@@ -1289,14 +1331,32 @@ def mx_dot_scaled_swapped(
     w,
     w_scale,
     BLOCK_SIZE_K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
 ):
-    """Swapped ``dot_scaled`` decode step: weight ``w`` [BN, BK] (E2M1 packed if MXFP4 else E4M3)
+    """Swapped ``dot_scaled`` decode step: weight ``w`` [BN, BK] (E2M1 packed if fp4 else E4M3)
     is the MMA lhs (output rows in M); the activation is the N=16 rhs (col 0 real). ``acc`` is the
     persistent ``[BN, MMA_N_ATOM]`` MMA accumulator (accumulated across the K-loop, then the caller
-    takes column 0) — NOT a fresh per-step init, which trips the sm_100 accumulator-init pass."""
+    takes column 0) — NOT a fresh per-step init, which trips the sm_100 accumulator-init pass.
+    Each side's format is its dtype (a packed ``a`` stays packed — the E4M3-scaled mxf4nvf4
+    kind is fp4 x fp4 only); the token's group scale broadcasts to the rhs columns."""
     fmt: tl.constexpr = "e2m1" if w.dtype == tl.uint8 else "e4m3"
-    rhs, asc = mx_dot_scaled_swapped_rhs(a, a_scale, BLOCK_SIZE_K)
-    return tl.dot_scaled(w, w_scale, fmt, rhs, asc, "e4m3", acc)
+    rhs_fmt: tl.constexpr = "e2m1" if a.dtype == tl.uint8 else "e4m3"
+    # the token becomes a [bytes, MMA_N_ATOM] rhs with only column 0 real (16 is
+    # Triton's tcgen05-selection gate, not the hardware floor: N=8 drops to the
+    # bf16-upcast fallback, bare-1 was 1.83x)
+    rhs = swap_pad_rhs(a, BLOCK_SIZE_K // 2 if a.dtype == tl.uint8 else BLOCK_SIZE_K)
+    if a_scale.dtype == tl.uint8:  # UE8M0 broadcast via the zero-add idiom
+        asc = tl.trans(
+            a_scale[:, None]
+            + tl.zeros((BLOCK_SIZE_K // SCALE_GROUP_K, MMA_N_ATOM), tl.uint8)
+        )
+    else:  # E4M3 (NVFP4) — no fp8 arithmetic; materialize the broadcast directly
+        asc = tl.trans(
+            tl.broadcast_to(
+                a_scale[:, None], (BLOCK_SIZE_K // SCALE_GROUP_K, MMA_N_ATOM)
+            )
+        )
+    return tl.dot_scaled(w, w_scale, fmt, rhs, asc, rhs_fmt, acc)
 
 
 @triton.jit
@@ -1316,14 +1376,13 @@ def mx_dot_rescale_swapped(
     is a scalar. ``acc`` is the persistent ``[ROWS, MMA_N_ATOM]`` accumulator (col 0 taken
     by the caller's ``acc_finalize``)."""
     if w.dtype == tl.uint8:  # column-unpack E2M1 -> E4M3 (K order: low nibble first)
-        wq = tl.interleave(_e2m1_code_to_f32(w & 0xF), _e2m1_code_to_f32(w >> 4)).to(
-            tl.float8e4nv
-        )
+        wq = e2m1_cols_to_f32(w).to(tl.float8e4nv)
     else:
         wq = w
-    rhs = swap_pad_rhs(a, BLOCK_SIZE_K)
-    a_s = decode_ue8m0_scale(a_scale)  # [1] — the single group's token scale
-    w_s = decode_ue8m0_scale(w_scale)  # [ROWS, 1] — per output row
+    aq = e2m1_cols_to_f32(a).to(tl.float8e4nv) if a.dtype == tl.uint8 else a
+    rhs = swap_pad_rhs(aq, BLOCK_SIZE_K)
+    a_s = decode_group_scale(a_scale)  # [1] — the single group's token scale
+    w_s = decode_group_scale(w_scale)  # [ROWS, 1] — per output row
     return acc + tl.dot(wq, rhs) * w_s * a_s
 
 
@@ -1343,12 +1402,13 @@ def mx_scalar_reduce_swapped(
     scale factored out of the reduce (grpscale). Reduces over K; returns ``acc + [1, ROWS_W]``."""
     NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
     if w.dtype == tl.uint8:  # column-unpack E2M1 -> f32, K-order via interleave
-        wq = tl.interleave(_e2m1_code_to_f32(w & 0xF), _e2m1_code_to_f32(w >> 4))
+        wq = e2m1_cols_to_f32(w)
     else:
         wq = w.to(tl.float32)
-    prod = a.to(tl.float32)[None, :] * wq  # [ROWS_W, BK]
+    aq = e2m1_cols_to_f32(a) if a.dtype == tl.uint8 else a.to(tl.float32)
+    prod = aq[None, :] * wq  # [ROWS_W, BK]
     grp = tl.sum(tl.reshape(prod, (ROWS_W, NG, SCALE_GROUP_K)), axis=2)  # [ROWS_W, NG]
-    scale = decode_ue8m0_scale(a_scale)[None, :] * decode_ue8m0_scale(w_scale)
+    scale = decode_group_scale(a_scale)[None, :] * decode_group_scale(w_scale)
     return acc + tl.reshape(tl.sum(grp * scale, axis=1), (1, ROWS_W))
 
 
@@ -1370,12 +1430,18 @@ def mx_swap_compute(
     and ``scalar`` (``[1, BLOCK_SIZE_N]`` reduce). The acc shapes diverge, but only the taken
     constexpr branch compiles so the single return never has to unify them. ``BLOCK_SIZE_N`` is the weight tile's row count — the gate_up kernel passes ``2*BN``
     with its STACKED gate|up tile (gate rows first, split back via ``split_gate_up``): one
-    load and one MMA for both projections keeps the native mxfp M=128 operand at BN=64, doubling
+    load and one MMA for both projections keeps the native microscaled-MMA M=128 operand at BN=64, doubling
     the CTAs on the parallelism-starved decode grid (dsv4 gate_up 1.34x, bit-exact)."""
-    a1 = tl.reshape(a, (BLOCK_SIZE_K,))
+    # packed-E2M1 activations flatten to their BYTE length; the dot/scalar leaves
+    # column-unpack (lossless), dot_scaled consumes the packed rhs natively (the E4M3-scaled
+    # mxf4nvf4 kind exists only for fp4 x fp4 — unpacking would forfeit it)
+    if a.dtype == tl.uint8:
+        a1 = tl.reshape(a, (BLOCK_SIZE_K // 2,))
+    else:
+        a1 = tl.reshape(a, (BLOCK_SIZE_K,))
     as1 = tl.reshape(a_scale, (BLOCK_SIZE_K // SCALE_GROUP_K,))
     if COMPUTE_MODE == "dot_scaled":
-        acc = mx_dot_scaled_swapped(acc, a1, as1, w, w_scale, BLOCK_SIZE_K)
+        acc = mx_dot_scaled_swapped(acc, a1, as1, w, w_scale, BLOCK_SIZE_K, SCALE_GROUP_K)
     elif COMPUTE_MODE == "dot":
         acc = mx_dot_rescale_swapped(acc, a1, as1, w, w_scale, BLOCK_SIZE_K)
     elif COMPUTE_MODE == "scalar":
@@ -1627,8 +1693,8 @@ class Quantization:
     MXFP8 / MXFP4       "mxfp8" (E4M3 + UE8M0),    "mxfp8" (E4M3 + UE8M0),
                         "mxfp4" (packed E2M1       "mxfp4" (packed E2M1
                         + UE8M0)                   + UE8M0)
-    NVFP4               "nvfp4" (packed E2M1       —
-                        + E4M3 group-16)
+    NVFP4               "nvfp4" (packed E2M1       "nvfp4" (packed E2M1
+                        + E4M3 group-16)           + E4M3 group-16)
     full-precision      —                          —
     ==================  =========================  =========================
 
@@ -1636,7 +1702,7 @@ class Quantization:
     epilogue; the unfused path quantizes on the host between GEMMs.)"""
 
     input_recipe: Literal["fp8", "mxfp8", "mxfp4", "nvfp4"] | None = None
-    output_recipe: Literal["fp8", "mxfp8", "mxfp4"] | None = None
+    output_recipe: Literal["fp8", "mxfp8", "mxfp4", "nvfp4"] | None = None
 
     def __post_init__(self):
         # catch typos at construction — the closest point to the user; the ops separately
@@ -1645,9 +1711,9 @@ class Quantization:
             f"unknown input_recipe {self.input_recipe!r}; "
             "expected None, 'fp8', 'mxfp8', 'mxfp4', or 'nvfp4'"
         )
-        assert self.output_recipe in (None, "fp8", "mxfp8", "mxfp4"), (
+        assert self.output_recipe in (None, "fp8", "mxfp8", "mxfp4", "nvfp4"), (
             f"unknown output_recipe {self.output_recipe!r}; "
-            "expected None, 'fp8', 'mxfp8', or 'mxfp4'"
+            "expected None, 'fp8', 'mxfp8', 'mxfp4', or 'nvfp4'"
         )
 
     def as_args(self) -> tuple:
@@ -2217,9 +2283,10 @@ def grouped_gemm_epilogue(
     accumulator (``store_tile``). ``GATE``: split the stacked gate|up accumulator and
     apply the ``ACT_FN``/SwiGLU ``glu`` (``split_gate_up_glu``); ``OUTPUT_RECIPE`` — the
     same vocabulary as ``Quantization`` — then requantizes the intermediate into ``C`` +
-    ``Cs``: ``"fp8"`` (per-row scale, ``Cs`` is ``[S, N//BN]``), ``"mxfp8"`` / ``"mxfp4"``
-    (UE8M0 group-``SCALE_GROUP_K`` scale, ``Cs`` is ``[S, N//SCALE_GROUP_K]``; ``"mxfp4"``
-    packs nibble pairs so ``C`` is ``[S, N//2]``); ``None`` stores the GLU intermediate.
+    ``Cs``: ``"fp8"`` (per-row scale, ``Cs`` is ``[S, N//BN]``), ``"mxfp8"`` / ``"mxfp4"`` /
+    ``"nvfp4"`` (group-``SCALE_GROUP_K`` scale — UE8M0 for MX, E4M3 for NVFP4 — ``Cs`` is
+    ``[S, N//SCALE_GROUP_K]``; the fp4 recipes pack nibble pairs so ``C`` is ``[S, N//2]``);
+    ``None`` stores the GLU intermediate.
     Every arm is constexpr-pruned; plain leaves the accumulator untouched."""
     if GATE:
         out = split_gate_up_glu(
@@ -2241,12 +2308,12 @@ def grouped_gemm_epilogue(
             tl.store(
                 Cs + out_row * stride_cs_m + pid_n * stride_cs_n, q_s, mask=row_mask
             )
-        elif OUTPUT_RECIPE is not None:  # "mxfp8" | "mxfp4"
-            q, q_s = mxfp_act_quant_inline(
+        elif OUTPUT_RECIPE is not None:  # "mxfp8" | "mxfp4" | "nvfp4"
+            q, q_s = mx_act_quant_inline(
                 out, BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_RECIPE
             )
             width: tl.constexpr = (
-                BLOCK_SIZE_N // 2 if OUTPUT_RECIPE == "mxfp4" else BLOCK_SIZE_N
+                BLOCK_SIZE_N if OUTPUT_RECIPE == "mxfp8" else BLOCK_SIZE_N // 2
             )
             offs_c = pid_n * width + tl.arange(0, width)
             tl.store(
@@ -2284,7 +2351,17 @@ def _e2m1_code_to_f32(code):
 
 
 @triton.jit
-def mxfp4_e2m1_to_e4m3(b_packed):
+def e2m1_cols_to_f32(packed):
+    """Column-unpack packed E2M1 (two nibbles per byte along the last dim, low nibble
+    first) to fp32: ``(..., C) uint8 -> (..., 2C)`` — the column-axis counterpart of the
+    row-doubling ``e2m1_to_e4m3``; lossless for the same reason."""
+    return tl.interleave(
+        _e2m1_code_to_f32(packed & 0xF), _e2m1_code_to_f32(packed >> 4)
+    )
+
+
+@triton.jit
+def e2m1_to_e4m3(b_packed):
     """Unpack packed MXFP4 (E2M1, two nibbles/byte along K) to E4M3, doubling the K
     (row) dim: ``(R, C) uint8 -> (2R, C) E4M3``. E2M1's 8 magnitudes are all exact in
     E4M3, so this is lossless — it lets the FP8 ``tl.dot`` path stand in for
@@ -2319,7 +2396,7 @@ def _quant_block_k_pruner(configs, named_args, **kwargs):
     prune_configs_by={"early_config_prune": _quant_block_k_pruner},
 )
 @triton.jit
-def _mxfp_act_quant_kernel(
+def _mx_act_quant_kernel(
     X,
     Y,
     S,
@@ -2331,7 +2408,7 @@ def _mxfp_act_quant_kernel(
     SCALE_GROUP_K: tl.constexpr,
     RECIPE: tl.constexpr = "mxfp8",
 ):
-    """One-pass activation quant, one launch per recipe (``mxfp_act_quant_inline`` does
+    """One-pass activation quant, one launch per recipe (``mx_act_quant_inline`` does
     the math, so the offline and inline forms are bit-identical by construction): E4M3 +
     UE8M0 ("mxfp8"), packed E2M1 + UE8M0 ("mxfp4"), or packed E2M1 + E4M3 group-16
     ("nvfp4"). Grid ``(T, K // BLOCK_K)``; group boundaries are identical across forms
@@ -2339,7 +2416,7 @@ def _mxfp_act_quant_kernel(
     t = tl.program_id(0).to(tl.int64)
     offs = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
     x = tl.load(X + t * stride_x_t + offs * stride_x_k)[None, :].to(tl.float32)
-    y, s = mxfp_act_quant_inline(x, 1, BLOCK_K, SCALE_GROUP_K, RECIPE)
+    y, s = mx_act_quant_inline(x, 1, BLOCK_K, SCALE_GROUP_K, RECIPE)
     width: tl.constexpr = BLOCK_K // 2 if RECIPE != "mxfp8" else BLOCK_K
     yo = tl.program_id(1) * width + tl.arange(0, width)
     tl.store(Y + t * (K // (BLOCK_K // width)) + yo, tl.reshape(y, (width,)))
@@ -2353,7 +2430,7 @@ def _mxfp_act_quant_kernel(
 
 def maybe_act_quant(x, act_quant, min_m):
     """Row-count-gated offline activation pre-quant. Apply ``act_quant`` (a one-pass
-    quant kernel, e.g. ``mxfp_act_quant``) when the GEMM consuming ``x`` is
+    quant kernel, e.g. ``mxfp8_act_quant``) when the GEMM consuming ``x`` is
     compute-bound (``rows >= min_m``) — the inline form re-quantizes per N-tile there.
     ``min_m`` is the consumer kernel's crossover, defined next to its wrapper with its
     provenance (measured sweep or inherited estimate). Below the threshold return ``x``
@@ -2369,7 +2446,7 @@ def maybe_act_quant(x, act_quant, min_m):
     return x, x
 
 
-def mxfp_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def mxfp8_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to MX once (E4M3 values + UE8M0 group-32 uint8 scales)
     instead of inline per weight-tile — the fused gate_up re-ran the inline quant per N-tile
     (16x redundant amax/convert ALU + 2x act bytes), which held it at ~380 TFLOPS while the
@@ -2379,7 +2456,7 @@ def mxfp_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     y = torch.empty(T, K, device=x.device, dtype=FP8_DTYPE)
     s = torch.empty(T, K // MX_SCALE_GROUP_K, device=x.device, dtype=torch.uint8)
     with device_context(x.device):
-        compile_time_only_triton_wrap(_mxfp_act_quant_kernel)[
+        compile_time_only_triton_wrap(_mx_act_quant_kernel)[
             lambda META: (T, K // META["BLOCK_K"])
         ](
             x,
@@ -2399,7 +2476,7 @@ def mxfp4_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to MXFP4 in one kernel pass: packed-E2M1 values
     (``(T, K//2)`` int8, two codes per byte, first value in the low nibble) + UE8M0
     group-32 uint8 scales (``(T, K//32)``, amax/6 ceil'd to a power of two). Bit-identical
-    to the fused epilogues' inline form (shared ``mxfp_act_quant_inline`` arm). Feeds the
+    to the fused epilogues' inline form (shared ``mx_act_quant_inline`` arm). Feeds the
     W4A4 arm of the MX matmul ops; quantizing activations to fp4 at runtime is an
     accuracy call the caller owns — the ops never do it implicitly."""
     return _launch_act_quant(x, "mxfp4", MX_SCALE_GROUP_K, torch.uint8)
@@ -2421,7 +2498,7 @@ def _launch_act_quant(x, recipe, scale_group, scale_dtype):
     packed = torch.empty(T, K // 2, device=x.device, dtype=torch.uint8)
     scales = torch.empty(T, K // scale_group, device=x.device, dtype=scale_dtype)
     with device_context(x.device):
-        compile_time_only_triton_wrap(_mxfp_act_quant_kernel)[
+        compile_time_only_triton_wrap(_mx_act_quant_kernel)[
             lambda META: (T, K // META["BLOCK_K"])
         ](
             x,
@@ -2471,7 +2548,7 @@ def fp8_act_quant_block_dynamic(
     x: torch.Tensor, block_k: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to block-FP8 once (E4M3 + fp32 per-``block_k`` scales)
-    instead of inline per weight-tile — same rationale and layout as ``mxfp_act_quant`` (a
+    instead of inline per weight-tile — same rationale and layout as ``mxfp8_act_quant`` (a
     GEMM re-reads its activation once per N-tile). Bit-exact with the inline form."""
     T, K = x.shape
     y = torch.empty(T, K, device=x.device, dtype=FP8_DTYPE)

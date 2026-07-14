@@ -11,8 +11,8 @@ import triton.language as tl
 from finegrained_fp8.utils import (  # type: ignore
     fp8_act_quant_block_dynamic,
     fp8_act_quant_tensor_wide,
-    mxfp_act_quant,
-    mxfp_act_quant_inline,
+    mxfp8_act_quant,
+    mx_act_quant_inline,
     mxfp4_act_quant,
     nvfp4_act_quant,
 )
@@ -173,7 +173,7 @@ def test_nvfp4_act_quant_matches_torch_reference():
 @triton.jit
 def _mx_inline_harness(X, Q, S, M: tl.constexpr, N: tl.constexpr, RECIPE: tl.constexpr):
     x = tl.load(X + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :])
-    q, s = mxfp_act_quant_inline(x.to(tl.float32), M, N, 32, RECIPE)
+    q, s = mx_act_quant_inline(x.to(tl.float32), M, N, 32, RECIPE)
     width: tl.constexpr = N // 2 if RECIPE == "mxfp4" else N
     tl.store(Q + tl.arange(0, M)[:, None] * width + tl.arange(0, width)[None, :], q)
     tl.store(
@@ -209,11 +209,11 @@ def _act_inputs(M=64, N=256, zero_rows=True):
 @pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
 def test_mxfp8_inline_matches_offline():
     """The in-kernel E4M3 quant (fused epilogues, inline decode arm) and the offline
-    ``mxfp_act_quant`` pass must be bit-identical — the dtype-branched kernels and the
+    ``mxfp8_act_quant`` pass must be bit-identical — the dtype-branched kernels and the
     fused/unfused parity both rely on it."""
     x = _act_inputs()
     q, s = _run_mx_inline(x, "mxfp8")
-    q_ref, s_ref = mxfp_act_quant(x)
+    q_ref, s_ref = mxfp8_act_quant(x)
     assert torch.equal(s, s_ref)
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
 
@@ -235,7 +235,7 @@ def test_mxfp4_inline_matches_host():
 @pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
 def test_nvfp4_inline_matches_offline():
     """The in-kernel NVFP4 quant and the one-pass offline kernel share
-    ``mxfp_act_quant_inline``'s arm, but exercise different tile widths — the packed
+    ``mx_act_quant_inline``'s arm, but exercise different tile widths — the packed
     bytes and E4M3 scales must be bit-identical."""
     x = _act_inputs()
     M, N = x.shape
@@ -251,7 +251,7 @@ def test_nvfp4_inline_matches_offline():
 @triton.jit
 def _nv_inline_harness(X, Q, S, M: tl.constexpr, N: tl.constexpr):
     x = tl.load(X + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :])
-    q, s = mxfp_act_quant_inline(x.to(tl.float32), M, N, 16, "nvfp4")
+    q, s = mx_act_quant_inline(x.to(tl.float32), M, N, 16, "nvfp4")
     tl.store(Q + tl.arange(0, M)[:, None] * (N // 2) + tl.arange(0, N // 2)[None, :], q)
     tl.store(
         S + tl.arange(0, M)[:, None] * (N // 16) + tl.arange(0, N // 16)[None, :], s

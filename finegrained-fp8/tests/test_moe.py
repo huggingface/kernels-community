@@ -24,7 +24,7 @@ import finegrained_fp8  # type: ignore
 from finegrained_fp8.utils import (  # type: ignore
     fp8_act_quant_block_dynamic,
     fp8_act_quant_tensor_wide,
-    mxfp_act_quant,
+    mxfp8_act_quant,
 )
 from finegrained_fp8 import moe  # type: ignore
 
@@ -795,7 +795,7 @@ def _quant_act(x, problem, block_size):
     ``matmul_grouped`` used to do internally, now caller-side. MX → UE8M0 group-32; tensor-wide
     (no block_size) → per-token; block-dynamic → per-``block_k`` blocks."""
     if problem.is_mxfp:
-        return mxfp_act_quant(x)
+        return mxfp8_act_quant(x)
     if block_size is None:
         return fp8_act_quant_tensor_wide(x, x.shape[-1])
     return fp8_act_quant_block_dynamic(x, block_size[1])

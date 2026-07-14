@@ -29,9 +29,7 @@ from .utils import (
     FP8_DTYPE,
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
-    NVFP4_SCALE_GROUP_K,
-    UE8M0_SCALE_DTYPES,
-    decode_ue8m0_scale,
+    decode_group_scale,
     device_context,
     tl_dtype,
     resolve_output_dtype,
@@ -49,7 +47,11 @@ from .utils import (
     stacked_gate_up_ptrs,
     stacked_gate_up_flatten,
     fp8_act_quant_inline,
-    mxfp_act_quant_inline,
+    mx_act_quant_inline,
+    expert_weight_shape,
+    mx_scale_family,
+    normalize_per_expert_scale,
+    validate_dense_operands,
     fp8_act_quant_tensor_wide,
     fp8_act_quant_block_dynamic,
     load_block_fp8_act_tile,
@@ -241,12 +243,12 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
             acc_gate += (
                 fp8_dot(a, tl.load(b_gate_ptr), SWAP_AB, BLOCK_SIZE_K)
                 * a_s[:, None]
-                * decode_ue8m0_scale(tl.load(bs_gate_ptr))
+                * decode_group_scale(tl.load(bs_gate_ptr))
             )
             acc_up += (
                 fp8_dot(a, tl.load(b_up_ptr), SWAP_AB, BLOCK_SIZE_K)
                 * a_s[:, None]
-                * decode_ue8m0_scale(tl.load(bs_up_ptr))
+                * decode_group_scale(tl.load(bs_up_ptr))
             )
             b_gate_ptr += BLOCK_SIZE_K * stride_b_k
             b_up_ptr += BLOCK_SIZE_K * stride_b_k
@@ -256,7 +258,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
             accumulator += (
                 fp8_dot(a, tl.load(b_ptrs), SWAP_AB, BLOCK_SIZE_K)
                 * a_s[:, None]
-                * decode_ue8m0_scale(tl.load(bs_ptrs))
+                * decode_group_scale(tl.load(bs_ptrs))
             )
             b_ptrs += BLOCK_SIZE_K * stride_b_k
             bs_ptrs += stride_bs_k
@@ -287,7 +289,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 
 
 @bayesian_autotune(
-    # S (routed rows) keyed like the block-dynamic/mxfp batched siblings — decode re-tunes per batch.
+    # S (routed rows) keyed like the block-dynamic/mx batched siblings — decode re-tunes per batch.
     get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True),
     ["N", "K", "S"],
     n_trials=100,
@@ -401,7 +403,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     },
 )
 @triton.jit
-def mxfp_dynamic_matmul_batched_kernel(
+def mx_dynamic_matmul_batched_kernel(
     A,  # (S, K) activations: raw BF16/FP16 (inline-quant) or E4M3 (PRE_QUANTIZED)
     As,  # (S, K // SCALE_GROUP_K) UE8M0 act scales; read iff PRE_QUANTIZED
     B,  # (num_experts, N, K[/2]); under GATE the (num_experts, 2N, K[/2]) gate|up stack
@@ -521,7 +523,7 @@ def mxfp_dynamic_matmul_batched_kernel(
             as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
         else:
             a_raw = tl.load(a_ptrs).to(tl.float32)
-            a, a_scale = mxfp_act_quant_inline(
+            a, a_scale = mx_act_quant_inline(
                 a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
             )
         b = stacked_gate_up_flatten(
@@ -559,7 +561,7 @@ def mxfp_dynamic_matmul_batched_kernel(
             INTERMEDIATE_DTYPE,
         )
         if OUTPUT_RECIPE is not None:
-            inter, inter_scale = mxfp_act_quant_inline(
+            inter, inter_scale = mx_act_quant_inline(
                 intermediate, BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_RECIPE
             )
             # "mxfp4" packs nibble pairs along N, halving the stored width
@@ -726,22 +728,14 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     B:  (num_experts, N, K) FP8 weights; under ``gate`` the (num_experts, 2N, K) gate|up stack
     Bs: (num_experts, N // block_n, K // block_k) per-block weight scales (2N under gate)
     """
-    assert A.ndim == 2, f"A must be 2D (rows, K), got ndim={A.ndim}"
-    assert A.is_contiguous(), "A must be contiguous"
-    assert B.ndim == 3, f"B must be 3D (num_experts, N, K), got ndim={B.ndim}"
-    assert B.is_contiguous(), "B must be contiguous"
-    assert A.shape[1] == B.shape[2], (
-        f"K mismatch: A has K={A.shape[1]}, B has K={B.shape[2]}"
-    )
+    validate_dense_operands(A, B)
 
     output_dtype = resolve_output_dtype(output_dtype, A, As)
     # S is the routed-row count (one program per expert_id); A may hold fewer rows when
     # gather_idx maps many programs to one source row (gate_up reading unexpanded hidden).
     K = A.shape[1]
     S = expert_ids.shape[0]
-    # Under a gate epilogue B is the (E, 2N, K) gate|up stack — N is the per-projection width.
-    num_experts, n_rows, _ = B.shape
-    N = n_rows // 2 if gate else n_rows
+    num_experts, n_rows, N = expert_weight_shape(B, gate)
 
     assert len(block_size) == 2, (
         f"block_size must be [block_n, block_k], got {block_size}"
@@ -856,13 +850,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     B:  (num_experts, N, K) FP8 expert weights
     Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales
     """
-    assert A.ndim == 2, f"A must be 2D (rows, K), got ndim={A.ndim}"
-    assert A.is_contiguous(), "A must be contiguous"
-    assert B.ndim == 3, f"B must be 3D (num_experts, N, K), got ndim={B.ndim}"
-    assert B.is_contiguous(), "B must be contiguous"
-    assert A.shape[1] == B.shape[2], (
-        f"K mismatch: A has K={A.shape[1]}, B has K={B.shape[2]}"
-    )
+    validate_dense_operands(A, B)
 
     output_dtype = resolve_output_dtype(output_dtype, A, As)
     K = A.shape[1]
@@ -870,15 +858,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     num_experts, N, _ = B.shape
 
     # Normalize Bs to (num_experts, 1, 1)
-    if Bs.ndim == 1:
-        assert Bs.shape[0] == num_experts, (
-            f"Bs shape {tuple(Bs.shape)} != expected ({num_experts},)"
-        )
-        Bs = Bs.reshape(num_experts, 1, 1)
-    else:
-        assert Bs.shape == (num_experts, 1, 1), (
-            f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, 1, 1)"
-        )
+    Bs = normalize_per_expert_scale(Bs, num_experts)
 
     Bs = ue8m0_as_uint8(Bs)
     if As is None:
@@ -924,9 +904,9 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("mxfp_dynamic_matmul_batched"), mutates_args=()
+    add_op_namespace_prefix("mx_dynamic_matmul_batched"), mutates_args=()
 )
-def mxfp_dynamic_matmul_batched(
+def mx_dynamic_matmul_batched(
     A: torch.Tensor,
     As: torch.Tensor | None,
     B: torch.Tensor,
@@ -960,24 +940,18 @@ def mxfp_dynamic_matmul_batched(
     # A raw (As None) -> quantized inline in the kernel (decode-free UE8M0); pre-quantized
     # (As given, e.g. the down reading a requantized intermediate) -> loaded via the kernel's
     # PRE_QUANTIZED branch.
-    nvfp4 = Bs.dtype == torch.float8_e4m3fn  # the scale dtype IS the recipe carrier
-    assert nvfp4 or Bs.dtype in UE8M0_SCALE_DTYPES, (
-        f"Bs must be UE8M0 (float8_e8m0fnu/uint8) or E4M3 (NVFP4), got {Bs.dtype}"
-    )
+    nvfp4 = Bs.dtype == torch.float8_e4m3fn
     if nvfp4:
-        # the decode grid tops out at BLOCK_SIZE_M=16 and mxf4nvf4 compiles only at
-        # M=128 on this Triton (no fallback) — grouped covers NVFP4 prefill
-        raise NotImplementedError(
-            "NVFP4 batched (decode) is unsupported: the mxf4nvf4 MMA has no "
-            "BLOCK_SIZE_M<128 lowering on Triton 3.7.1"
-        )
-    if nvfp4:
-        # matching scale formats required on both operands; no NVFP4 requant arm yet
+        # decode grid BM <= 16 < the native mxf4nvf4 M=128 staging, so NVFP4 batched runs
+        # on the software arms (scalar / swap-scalar column-unpack + E4M3 scale decode)
         assert input_recipe in (None, "nvfp4"), (
             f"NVFP4 activations are packed E2M1 + E4M3 scales, got {input_recipe!r}"
         )
-        assert output_recipe is None, "no NVFP4 fused-requant arm yet"
-        if As is None:  # no inline NVFP4 quant arm either — pack offline
+        assert output_recipe is None, (
+            "no NVFP4 batched requant arm (the row-scale reduce is UE8M0-typed); "
+            "requantize offline between the GEMMs"
+        )
+        if As is None:  # no inline NVFP4 quant arm — pack offline
             A, As = nvfp4_act_quant(A)
     else:
         assert input_recipe in (None, "mxfp8", "mxfp4"), (
@@ -1009,18 +983,12 @@ def mxfp_dynamic_matmul_batched(
     output_dtype = resolve_output_dtype(output_dtype, A, As)
     K = A.shape[1] * ACT_VALUES_PER_BYTE
     S = expert_ids.shape[0]
-    # Under a gate epilogue B is the (E, 2N, K) gate|up stack — N is the per-projection width.
-    num_experts, n_rows, K_b = B.shape
-    N = n_rows // 2 if gate else n_rows
+    num_experts, n_rows, N = expert_weight_shape(B, gate)
+    K_b = B.shape[2]
     assert K == WEIGHT_VALUES_PER_BYTE * K_b, (
         f"K (={K}) must equal {WEIGHT_VALUES_PER_BYTE} * B.shape[2] (={K_b})"
     )
-    # the scale group falls out of the scale shape (32 for MX/UE8M0, 16 for NVFP4/E4M3)
-    scale_group = K // Bs.shape[2]
-    assert scale_group == (NVFP4_SCALE_GROUP_K if nvfp4 else MX_SCALE_GROUP_K), (
-        f"scale group {scale_group} does not match the scale dtype {Bs.dtype}"
-    )
-    assert K % scale_group == 0, f"K (={K}) must be a multiple of {scale_group}"
+    nvfp4, scale_group = mx_scale_family(Bs, K)
     assert Bs.shape == (num_experts, n_rows, K // scale_group), (
         f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {n_rows}, {K // scale_group})"
     )
@@ -1049,7 +1017,7 @@ def mxfp_dynamic_matmul_batched(
 
     As_arg = As if pre_quantized else expert_ids  # dummy when raw (unread)
     with device_context(A.device):
-        compile_time_only_triton_wrap(mxfp_dynamic_matmul_batched_kernel)[grid](
+        compile_time_only_triton_wrap(mx_dynamic_matmul_batched_kernel)[grid](
             A,
             As_arg,
             B,
@@ -1119,13 +1087,7 @@ def full_precision_matmul_batched(
     A:  (rows, K) BF16/FP16 activations — rows addressed via ``gather_idx``
     B:  (num_experts, N, K) expert weights in A's dtype; under ``gate`` the (num_experts, 2N, K) stack
     """
-    assert A.ndim == 2, f"A must be 2D (rows, K), got ndim={A.ndim}"
-    assert A.is_contiguous(), "A must be contiguous"
-    assert B.ndim == 3, f"B must be 3D (num_experts, N, K), got ndim={B.ndim}"
-    assert B.is_contiguous(), "B must be contiguous"
-    assert A.shape[1] == B.shape[2], (
-        f"K mismatch: A has K={A.shape[1]}, B has K={B.shape[2]}"
-    )
+    validate_dense_operands(A, B)
     assert A.dtype == B.dtype and A.dtype in (torch.bfloat16, torch.float16), (
         f"full-precision path needs matching BF16/FP16 A and B, got {A.dtype} / {B.dtype}"
     )
@@ -1136,9 +1098,7 @@ def full_precision_matmul_batched(
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     K = A.shape[1]
     S = expert_ids.shape[0]
-    # Under a gate epilogue B is the (E, 2N, K) gate|up stack — N is the per-projection width.
-    num_experts, n_rows, _ = B.shape
-    N = n_rows // 2 if gate else n_rows
+    num_experts, _, N = expert_weight_shape(B, gate)
     C = A.new_empty(S, N, dtype=output_dtype)
 
     def grid(META):
@@ -1209,7 +1169,7 @@ def matmul_batched(
     ``weight_block_size``):
     - ``Bs`` None → ``full_precision_matmul_batched`` (plain dot, no scales anywhere).
     - MX weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
-      group-32 ``Bs`` → ``mxfp_dynamic_matmul_batched``.
+      group-32 ``Bs`` → ``mx_dynamic_matmul_batched``.
     - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) →
       ``w8a8_tensor_dynamic_fp8_matmul_batched``.
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_batched``.
@@ -1223,7 +1183,7 @@ def matmul_batched(
             A, B, expert_ids, *ep.as_args(), *q.as_args(), output_dtype, gather_idx, scatter_idx
         )
     elif is_mxfp(B, Bs) or is_nvfp4(B, Bs):
-        out = mxfp_dynamic_matmul_batched(
+        out = mx_dynamic_matmul_batched(
             A, As, B, Bs, expert_ids, *ep.as_args(), *q.as_args(), output_dtype, gather_idx, scatter_idx
         )
     elif (block_size := weight_block_size(B, Bs)) is None:

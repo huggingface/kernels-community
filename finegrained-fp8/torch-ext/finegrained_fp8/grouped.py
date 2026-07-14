@@ -31,8 +31,6 @@ from .utils import (
     FP8_DTYPE,
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
-    NVFP4_SCALE_GROUP_K,
-    UE8M0_SCALE_DTYPES,
     block_dynamic_grouped_matmul_pruner,
     mx_config_pruner,
     build_tile_layout,
@@ -44,7 +42,13 @@ from .utils import (
     tl_dtype,
     fp8_act_quant_block_dynamic,
     fp8_act_quant_tensor_wide,
-    mxfp_act_quant,
+    mxfp8_act_quant,
+    expert_weight_shape,
+    mx_scale_family,
+    normalize_per_expert_scale,
+    validate_dense_operands,
+    routed_rows,
+    tokens_per_expert_bucket,
     mxfp4_act_quant,
     nvfp4_act_quant,
     load_mx_act_tile,
@@ -62,7 +66,7 @@ from .utils import (
     weight_block_size,
     e2m1_as_uint8,
     ue8m0_as_uint8,
-    decode_ue8m0_scale,
+    decode_group_scale,
     mx_compute,
 )
 
@@ -200,13 +204,13 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
                 # gate scale on the first BN columns, up scale on the rest
                 w_s = tl.where(
                     tl.arange(0, 2 * BLOCK_SIZE_N) < BLOCK_SIZE_N,
-                    decode_ue8m0_scale(tl.load(gate_s_ptr)),
-                    decode_ue8m0_scale(tl.load(up_s_ptr)),
+                    decode_group_scale(tl.load(gate_s_ptr)),
+                    decode_group_scale(tl.load(up_s_ptr)),
                 )
                 gate_s_ptr += stride_bs_k
                 up_s_ptr += stride_bs_k
             else:
-                w_s = decode_ue8m0_scale(tl.load(bs_ptrs))
+                w_s = decode_group_scale(tl.load(bs_ptrs))
                 bs_ptrs += stride_bs_k
             acc += tl.dot(a, w) * a_s[:, None] * w_s[None, :]
             a_ptrs += BLOCK_SIZE_K * stride_a_k
@@ -407,7 +411,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     },
 )
 @triton.jit
-def mxfp_dynamic_matmul_grouped_kernel(
+def mx_dynamic_matmul_grouped_kernel(
     A,  # (num_tokens, K) E4M3 activations (pre-quantized once by the wrapper), any row order
     As,  # (S, K // 32) UE8M0 group-32 activation scales
     B,  # (num_experts, N, K) E4M3 (MXFP8) or (num_experts, N, K // 2) packed E2M1 (MXFP4); 2N under GATE
@@ -805,35 +809,12 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     Returns the ``(S, N)`` output, or — under ``requant`` — the FP8 output plus its
     ``(S, N // block_n)`` per-row, per-N-tile scale tensor.
     """
-    assert A.ndim == 2, f"A must be 2D (S, K), got ndim={A.ndim}"
-    assert A.is_contiguous(), "A must be contiguous"
-    assert B.ndim == 3, f"B must be 3D (num_experts, N, K), got ndim={B.ndim}"
-    assert B.is_contiguous(), "B must be contiguous"
-    assert A.shape[1] == B.shape[2], (
-        f"K mismatch: A has K={A.shape[1]}, B has K={B.shape[2]}"
-    )
+    validate_dense_operands(A, B)
 
     _, K = A.shape
-    # S = routed rows (num_tokens * top_k), carried by the (S,) perms — A's rows are
-    # gather SOURCES and under-count S whenever top_k > 1 (gate_up reading raw hidden).
-    # Only with no perms at all is A itself the expert-sorted (S, K) matrix.
-    if gather_idx is not None:
-        S = gather_idx.numel()
-    elif scatter_idx is not None:
-        S = scatter_idx.numel()
-    else:
-        S = A.shape[0]
 
-    for perm_map in (gather_idx, scatter_idx):
-        assert perm_map is None or (perm_map.numel() == S and perm_map.is_contiguous())
-
-    # Under a gate epilogue B is the (E, 2N, K) gate|up stack — N is the per-projection width.
-    num_experts, n_rows, _ = B.shape
-    N = n_rows // 2 if gate else n_rows
-    assert (
-        expert_start.is_contiguous()
-        and expert_start.numel() == triton.next_power_of_2(num_experts) + 1
-    ), "expert_start must be contiguous (next_power_of_2(num_experts) + 1,)"
+    num_experts, n_rows, N = expert_weight_shape(B, gate)
+    S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
 
     assert len(block_size) == 2, (
         f"block_size must be [block_n, block_k], got {block_size}"
@@ -903,9 +884,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
             Cs.stride(1) if requant else 1,
             # Meta-parameters
             num_experts=num_experts,
-            tokens_per_expert_bit_length=int(
-                (S + num_experts - 1) // num_experts
-            ).bit_length(),
+            tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=block_k,
             HAS_GATHER=gather_idx is not None,
@@ -958,26 +937,9 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     gather_idx: optional (S,) — sorted position -> source row of A; None = A is expert-sorted
     scatter_idx: optional (S,) — sorted position -> destination row of C; None = C stays expert-sorted
     """
-    assert A.ndim == 2, f"A must be 2D (S, K), got ndim={A.ndim}"
-    assert A.is_contiguous(), "A must be contiguous"
-    assert B.ndim == 3, f"B must be 3D (num_experts, N, K), got ndim={B.ndim}"
-    assert B.is_contiguous(), "B must be contiguous"
-    assert A.shape[1] == B.shape[2], (
-        f"K mismatch: A has K={A.shape[1]}, B has K={B.shape[2]}"
-    )
+    validate_dense_operands(A, B)
 
     _, K = A.shape
-    # S = routed rows (num_tokens * top_k), carried by the (S,) perms — A's rows are
-    # gather SOURCES and under-count S whenever top_k > 1 (gate_up reading raw hidden).
-    # Only with no perms at all is A itself the expert-sorted (S, K) matrix.
-    if gather_idx is not None:
-        S = gather_idx.numel()
-    elif scatter_idx is not None:
-        S = scatter_idx.numel()
-    else:
-        S = A.shape[0]
-    for perm_map in (gather_idx, scatter_idx):
-        assert perm_map is None or (perm_map.numel() == S and perm_map.is_contiguous())
 
     # Under a gate epilogue B is the (E, 2N, K) gate|up stack — N is the per-projection width.
     assert input_recipe in (None, "fp8"), (
@@ -987,23 +949,11 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
         "requant is unsupported for tensor-wide gate_up (its down needs a per-token whole-row "
         "scale a per-tile epilogue can't form); use a plain gate epilogue + external quant"
     )
-    num_experts, n_rows, _ = B.shape
-    N = n_rows // 2 if gate else n_rows
-    assert (
-        expert_start.is_contiguous()
-        and expert_start.numel() == triton.next_power_of_2(num_experts) + 1
-    ), "expert_start must be contiguous (next_power_of_2(num_experts) + 1,)"
+    num_experts, _, N = expert_weight_shape(B, gate)
+    S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
 
     # Normalize Bs to (num_experts, 1, 1) — one per-tensor scale (covers the gate|up stack)
-    if Bs.ndim == 1:
-        assert Bs.shape[0] == num_experts, (
-            f"Bs shape {tuple(Bs.shape)} != expected ({num_experts},)"
-        )
-        Bs = Bs.reshape(num_experts, 1, 1)
-    else:
-        assert Bs.shape == (num_experts, 1, 1), (
-            f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, 1, 1)"
-        )
+    Bs = normalize_per_expert_scale(Bs, num_experts)
 
     # A raw (As is None) -> quantize here (offline, per-token); else pre-quantized.
     output_dtype = resolve_output_dtype(output_dtype, A, As)
@@ -1040,9 +990,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
             1,  # dummy Cs strides
             1,
             num_experts=num_experts,
-            tokens_per_expert_bit_length=int(
-                (S + num_experts - 1) // num_experts
-            ).bit_length(),
+            tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
             HAS_GATHER=gather_idx is not None,
             HAS_SCATTER=scatter_idx is not None,
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
@@ -1059,9 +1007,9 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("mxfp_dynamic_matmul_grouped"), mutates_args=()
+    add_op_namespace_prefix("mx_dynamic_matmul_grouped"), mutates_args=()
 )
-def mxfp_dynamic_matmul_grouped(
+def mx_dynamic_matmul_grouped(
     A: torch.Tensor,
     As: torch.Tensor | None,
     B: torch.Tensor,
@@ -1080,7 +1028,7 @@ def mxfp_dynamic_matmul_grouped(
 ) -> list[torch.Tensor]:
     """Grouped MX matmul over expert-sorted positions (per-tile gather/scatter, the
     sort is virtual — see ``compute_grouped_scheduling`` for the maps). Activations arrive
-    pre-quantized: the caller owns the act-quant (``mxfp_act_quant``). The
+    pre-quantized: the caller owns the act-quant (``mxfp8_act_quant``). The
     ``gate``/``act_fn``/``swiglu_*``/``requant``/``simulate_unfused`` flags are the flattened
     ``Epilogue`` (the dispatcher unpacks the bundle).
     Weight format detected from ``B.dtype``: ``int8`` →
@@ -1097,10 +1045,6 @@ def mxfp_dynamic_matmul_grouped(
     assert B.dtype in (torch.int8, torch.float8_e4m3fn), (
         f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
     )
-    nvfp4 = Bs.dtype == torch.float8_e4m3fn  # the scale dtype IS the recipe carrier
-    assert nvfp4 or Bs.dtype in UE8M0_SCALE_DTYPES, (
-        f"Bs must be UE8M0 (float8_e8m0fnu/uint8) or E4M3 (NVFP4), got {Bs.dtype}"
-    )
     WEIGHT_VALUES_PER_BYTE = NIBBLES_PER_BYTE if B.dtype == torch.int8 else 1
     # int8 A = caller-provided packed-E2M1 activations (native fp4 MMA): K is two values
     # per stored byte and the scales are mandatory (nothing left to quantize).
@@ -1109,33 +1053,13 @@ def mxfp_dynamic_matmul_grouped(
         assert As is not None, "packed-E2M1 activations need their group scales (As)"
 
     K = A.shape[1] * ACT_VALUES_PER_BYTE
-    # S = routed rows (num_tokens * top_k), carried by the (S,) perms — A's rows are
-    # gather SOURCES and under-count S whenever top_k > 1 (gate_up reading raw hidden).
-    # Only with no perms at all is A itself the expert-sorted (S, K) matrix.
-    if gather_idx is not None:
-        S = gather_idx.numel()
-    elif scatter_idx is not None:
-        S = scatter_idx.numel()
-    else:
-        S = A.shape[0]
-    for perm_map in (gather_idx, scatter_idx):
-        assert perm_map is None or (perm_map.numel() == S and perm_map.is_contiguous())
-    # Under a gate epilogue B is the (E, 2N, K) gate|up stack — N is the per-projection width.
-    num_experts, n_rows, K_b = B.shape
-    N = n_rows // 2 if gate else n_rows
-    assert (
-        expert_start.is_contiguous()
-        and expert_start.numel() == triton.next_power_of_2(num_experts) + 1
-    ), "expert_start must be contiguous (next_power_of_2(num_experts) + 1,)"
+    num_experts, n_rows, N = expert_weight_shape(B, gate)
+    K_b = B.shape[2]
+    S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
     assert K == WEIGHT_VALUES_PER_BYTE * K_b, (
         f"K (={K}) must equal {WEIGHT_VALUES_PER_BYTE} * B.shape[2] (={K_b})"
     )
-    # the scale group falls out of the scale shape (32 for MX/UE8M0, 16 for NVFP4/E4M3)
-    scale_group = K // Bs.shape[2]
-    assert scale_group == (NVFP4_SCALE_GROUP_K if nvfp4 else MX_SCALE_GROUP_K), (
-        f"scale group {scale_group} does not match the scale dtype {Bs.dtype}"
-    )
-    assert K % scale_group == 0, f"K (={K}) must be a multiple of {scale_group}"
+    nvfp4, scale_group = mx_scale_family(Bs, K)
     assert Bs.shape == (num_experts, n_rows, K // scale_group), (
         f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {n_rows}, {K // scale_group})"
     )
@@ -1147,7 +1071,9 @@ def mxfp_dynamic_matmul_grouped(
         assert input_recipe in (None, "nvfp4"), (
             f"NVFP4 activations are packed E2M1 + E4M3 scales, got {input_recipe!r}"
         )
-        assert output_recipe is None, "no NVFP4 fused-requant arm yet"
+        assert output_recipe in (None, "nvfp4"), (
+            f"NVFP4 requantizes to 'nvfp4' (matching scale families), got {output_recipe!r}"
+        )
     else:
         assert input_recipe in (None, "mxfp8", "mxfp4"), (
             f"MX activations are E4M3 ('mxfp8', the default) or packed E2M1 ('mxfp4'), "
@@ -1165,7 +1091,7 @@ def mxfp_dynamic_matmul_grouped(
         elif input_recipe == "mxfp4":
             A, As = mxfp4_act_quant(A)
         else:
-            A, As = mxfp_act_quant(A)
+            A, As = mxfp8_act_quant(A)
     else:
         assert (As.dtype == torch.float8_e4m3fn) == nvfp4, (
             f"activation scales ({As.dtype}) must match the weight scale family ({Bs.dtype})"
@@ -1174,13 +1100,19 @@ def mxfp_dynamic_matmul_grouped(
     A = e2m1_as_uint8(A)
     B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
-    if output_recipe == "mxfp4":
-        # packed E2M1 intermediate (nibble pairs along N) + UE8M0 scales — feeds a W4A4 down as-is
-        assert N % (2 * MX_SCALE_GROUP_K) == 0, (
-            f"N (={N}) must be a multiple of {2 * MX_SCALE_GROUP_K} to pack E2M1 pairs"
+    if output_recipe in ("mxfp4", "nvfp4"):
+        # packed E2M1 intermediate (nibble pairs along N) + group scales (UE8M0 for MX,
+        # E4M3 for NVFP4) — feeds a W4A4 down as-is
+        assert N % (2 * scale_group) == 0, (
+            f"N (={N}) must be a multiple of {2 * scale_group} to pack E2M1 pairs"
         )
         C = A.new_empty((S, N // 2), dtype=torch.int8)
-        Cs = torch.empty(S, N // MX_SCALE_GROUP_K, device=A.device, dtype=torch.uint8)
+        Cs = torch.empty(
+            S,
+            N // scale_group,
+            device=A.device,
+            dtype=torch.float8_e4m3fn if nvfp4 else torch.uint8,
+        )
     elif requant:
         C = A.new_empty((S, N), dtype=FP8_DTYPE)
         Cs = torch.empty(
@@ -1192,7 +1124,7 @@ def mxfp_dynamic_matmul_grouped(
     num_sms = sm_count(A.device.index)
 
     with device_context(A.device):
-        compile_time_only_triton_wrap(mxfp_dynamic_matmul_grouped_kernel)[(num_sms,)](
+        compile_time_only_triton_wrap(mx_dynamic_matmul_grouped_kernel)[(num_sms,)](
             A,
             As,
             B,
@@ -1219,9 +1151,7 @@ def mxfp_dynamic_matmul_grouped(
             Cs.stride(0) if requant else 1,  # dummy stride when unread
             Cs.stride(1) if requant else 1,
             num_experts=num_experts,
-            tokens_per_expert_bit_length=int(
-                (S + num_experts - 1) // num_experts
-            ).bit_length(),
+            tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
             HAS_GATHER=gather_idx is not None,
             HAS_SCATTER=scatter_idx is not None,
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
@@ -1268,13 +1198,7 @@ def full_precision_matmul_grouped(
     gather_idx: optional (S,) — sorted position -> source row of A; None = A is expert-sorted
     scatter_idx: optional (S,) — sorted position -> destination row of C; None = C stays expert-sorted
     """
-    assert A.ndim == 2, f"A must be 2D (S, K), got ndim={A.ndim}"
-    assert A.is_contiguous(), "A must be contiguous"
-    assert B.ndim == 3, f"B must be 3D (num_experts, N, K), got ndim={B.ndim}"
-    assert B.is_contiguous(), "B must be contiguous"
-    assert A.shape[1] == B.shape[2], (
-        f"K mismatch: A has K={A.shape[1]}, B has K={B.shape[2]}"
-    )
+    validate_dense_operands(A, B)
     assert A.dtype == B.dtype and A.dtype in (torch.bfloat16, torch.float16), (
         f"full-precision path needs matching BF16/FP16 A and B, got {A.dtype} / {B.dtype}"
     )
@@ -1283,25 +1207,9 @@ def full_precision_matmul_grouped(
     )
 
     _, K = A.shape
-    # S = routed rows (num_tokens * top_k), carried by the (S,) perms — A's rows are
-    # gather SOURCES and under-count S whenever top_k > 1 (gate_up reading raw hidden).
-    # Only with no perms at all is A itself the expert-sorted (S, K) matrix.
-    if gather_idx is not None:
-        S = gather_idx.numel()
-    elif scatter_idx is not None:
-        S = scatter_idx.numel()
-    else:
-        S = A.shape[0]
-    for perm_map in (gather_idx, scatter_idx):
-        assert perm_map is None or (perm_map.numel() == S and perm_map.is_contiguous())
 
-    # Under a gate epilogue B is the (E, 2N, K) gate|up stack — N is the per-projection width.
-    num_experts, n_rows, _ = B.shape
-    N = n_rows // 2 if gate else n_rows
-    assert (
-        expert_start.is_contiguous()
-        and expert_start.numel() == triton.next_power_of_2(num_experts) + 1
-    ), "expert_start must be contiguous (next_power_of_2(num_experts) + 1,)"
+    num_experts, _, N = expert_weight_shape(B, gate)
+    S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
 
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     C = A.new_empty(S, N, dtype=output_dtype)
@@ -1329,9 +1237,7 @@ def full_precision_matmul_grouped(
             C.stride(0),
             C.stride(1),
             num_experts=num_experts,
-            tokens_per_expert_bit_length=int(
-                (S + num_experts - 1) // num_experts
-            ).bit_length(),
+            tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
             HAS_GATHER=gather_idx is not None,
             HAS_SCATTER=scatter_idx is not None,
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
@@ -1383,7 +1289,7 @@ def matmul_grouped(
     ``weight_block_size``):
     - ``Bs`` None → ``full_precision_matmul_grouped`` (plain dot, no scales anywhere).
     - MX weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
-      group-32 ``Bs`` → ``mxfp_dynamic_matmul_grouped``.
+      group-32 ``Bs`` → ``mx_dynamic_matmul_grouped``.
     - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) →
       ``w8a8_tensor_dynamic_fp8_matmul_grouped``.
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_grouped``.
@@ -1397,7 +1303,7 @@ def matmul_grouped(
             A, B, expert_start, *ep.as_args(), *q.as_args(), output_dtype, gather_idx, scatter_idx
         )
     elif is_mxfp(B, Bs) or is_nvfp4(B, Bs):
-        out = mxfp_dynamic_matmul_grouped(
+        out = mx_dynamic_matmul_grouped(
             A, As, B, Bs, expert_start, *ep.as_args(), *q.as_args(), output_dtype, gather_idx, scatter_idx
         )
     elif (block_size := weight_block_size(B, Bs)) is None:
