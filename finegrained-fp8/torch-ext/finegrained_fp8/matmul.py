@@ -82,14 +82,23 @@ STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
     # over 128-wide scale columns halves activation re-reads; any BN is numerically fine
     # (the offs_bn // block_n gather spans or splits scale columns), while BK stays
     # pinned to block_k (activation scale groups are per block_k).
-    # The SWAP_AB/MEMORY_MODE arms below are implemented and validated but NOT emitted:
+    # The SWAP_AB/B_MEMORY_MODE arms below are implemented and validated but NOT emitted:
     # logged tunes rank them measurable seconds everywhere (812us WS-pointer vs 910us
     # pointer+swap vs 926us descriptor+swap at H=6144) and axes must earn an e2e win to
     # grow the grid. To re-evaluate (e.g. on a Triton bump), add
-    # memory_modes=("descriptor", "pointer") and swap_ab=True — descriptor_config_pruner
+    # b_memory_modes=("descriptor", "pointer") and swap_ab=True — descriptor_config_pruner
     # already fences the invalid regions.
     get_accelerator_autotuning_configs(
-        warp_spec=True, tune_block_m=True, tune_block_n=True
+        warp_spec=True,
+        tune_block_m=True,
+        tune_block_n=True,
+        # TMA on this 2D loop is fully charted and gives nothing (2026-07-16): the
+        # W-descriptor races without WS / loses 2.3x with it (older direct measurement),
+        # and A-load and C-store descriptor arms both measured EXACT ties at the
+        # store/load-heavy gap shape (313.3us all arms, M=8192 N=7168 K=2048) — the
+        # WS-pointer schedule already hides everything TMA would. Arms dropped.
+        # Charted on B200 (sm_100) only — re-chart on H100 or the target device
+        # before treating the null as universal.
     ),
     # m_bit_length (log2 M bucket) keys the M tile, mirroring mx_dynamic_matmul_kernel.
     ["N", "K", "m_bit_length"],
@@ -107,7 +116,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     A,  # (M, K) E4M3 activations (pre-quantized once by the wrapper)
     As,  # (M, K // block_k) fp32 per-row, per-K-block activation scales
     B,  # (N, K) FP8 weights
-    BDescriptor,  # TMA descriptor over B, box (BLOCK_SIZE_N, block_k); read only under MEMORY_MODE == "host_descriptor"
+    BDescriptor,  # TMA descriptor over B, box (BLOCK_SIZE_N, block_k); read only under B_MEMORY_MODE == "host_descriptor"
     Bs,  # (N // block_n, K // block_k) weight scales (fp32 or uint8/UE8M0)
     C,  # (M, N) output
     # Shape
@@ -134,7 +143,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     WARP_SPEC: tl.constexpr = False,
-    MEMORY_MODE: tl.constexpr = "pointer",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     SWAP_AB: tl.constexpr = False,
 ):
     """Block-scale FP8 GEMM kernel.
@@ -166,7 +175,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         stride_b_k,
         BLOCK_SIZE_N,
         block_k,
-        MEMORY_MODE,
+        B_MEMORY_MODE,
     )
     # the (BN,) scale-index gather decouples the tile from the scale grid: a wide tile
     # spans several scale columns, a narrow one shares a column
@@ -176,7 +185,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
         a, a_s = load_block_fp8_act_tile(a_ptrs, as_ptrs, TRANSPOSED=SWAP_AB)
         b = load_weight_tile(
-            b_ptrs, b_descriptor, pid_n * BLOCK_SIZE_N, k * block_k, MEMORY_MODE
+            b_ptrs, b_descriptor, pid_n * BLOCK_SIZE_N, k * block_k, B_MEMORY_MODE
         )
         b_s = decode_group_scale(tl.load(bs_ptrs))
         accumulator += block_scaled_fp8_dot(a, a_s, b, b_s, SWAP_AB)
@@ -461,10 +470,10 @@ def mx_dynamic_matmul_kernel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a, a_scale = load_mx_act_tile(
-            a_ptrs, as_ptrs, None, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
+            a_ptrs, as_ptrs, None, 0, 0, 0, 0, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
         )
         b = tl.load(b_ptrs)
-        b_s = tl.load(bs_ptrs).to(tl.uint8)
+        b_s = tl.load(bs_ptrs)
         accumulator = mx_compute(
             accumulator,
             a,
@@ -497,7 +506,9 @@ def mx_dynamic_matmul_kernel(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul"), mutates_args=()
+    add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul"),
+    mutates_args=(),
+    opaque=True,
 )
 def w8a8_block_dynamic_fp8_matmul(
     A: torch.Tensor,
@@ -583,7 +594,9 @@ def w8a8_block_dynamic_fp8_matmul(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("w8a8_block_static_fp8_matmul"), mutates_args=()
+    add_op_namespace_prefix("w8a8_block_static_fp8_matmul"),
+    mutates_args=(),
+    opaque=True,
 )
 def w8a8_block_static_fp8_matmul(
     A: torch.Tensor,
@@ -677,7 +690,9 @@ def w8a8_block_static_fp8_matmul(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul"), mutates_args=()
+    add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul"),
+    mutates_args=(),
+    opaque=True,
 )
 def w8a8_tensor_dynamic_fp8_matmul(
     A: torch.Tensor,
@@ -743,7 +758,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("mx_dynamic_matmul"), mutates_args=()
+    add_op_namespace_prefix("mx_dynamic_matmul"), mutates_args=(), opaque=True
 )
 def mx_dynamic_matmul(
     A: torch.Tensor,

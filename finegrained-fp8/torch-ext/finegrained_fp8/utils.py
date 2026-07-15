@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextvars
 import functools
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -41,6 +42,11 @@ NVFP4_SCALE_GROUP_K = 16
 # ── Host-side helpers ─────────────────────────────────────────────────────────
 
 
+# set ONLY while an opaque op's registered fake impl runs (shape inference); read by
+# compile_time_only_triton_wrap to no-op the kernel launches within
+_SKIP_LAUNCHES = contextvars.ContextVar("finegrained_fp8_skip_launches", default=False)
+
+
 def compile_time_only_triton_wrap(kernel):
     """``wrap_triton`` while torch.compile is tracing (required to capture a raw Triton
     launch into the graph), the bare kernel in eager. Every kernel launch goes through
@@ -52,11 +58,29 @@ def compile_time_only_triton_wrap(kernel):
     ``Autotuner.cache`` (~2.3s/call for ``_mx_act_quant_kernel``) and the mid-capture
     tune invalidates cudagraph capture. Pruner-less kernels and the ``bayesian_autotune``
     kernels reuse their cache through the wrapper (measured) — but eager never needs the
-    wrapper at all."""
+    wrapper at all.
+
+    Inside an OPAQUE op's fake impl (see ``compile_time_only_triton_op``) the launch is
+    skipped outright: the op function has already allocated the correctly-shaped
+    outputs, which is all fake mode needs. The skip is an EXPLICIT contextvar, never
+    ambient fake-mode detection — ``triton_op``'s capture also runs under FakeTensor
+    mode, and skipping there would compile graphs with the kernel MISSING (uninitialized
+    outputs; found as identical garbage across recipes, 2026-07-16). The skip is also
+    load-bearing in the other direction — probed: without it the opaque ops' fake impls
+    reach the launcher with FakeTensors ("RuntimeError when making fake tensor call";
+    ``is_compiling`` is still true during fake prop, so they'd take the wrap_triton
+    branch and hit the pre_hook assert that made them opaque in the first place)."""
+    if _SKIP_LAUNCHES.get():
+
+        class _NoLaunch:
+            def __getitem__(self, grid):
+                return lambda *args, **kwargs: None
+
+        return _NoLaunch()
     return wrap_triton(kernel) if torch.compiler.is_compiling() else kernel
 
 
-def compile_time_only_triton_op(name, mutates_args=()):
+def compile_time_only_triton_op(name, mutates_args=(), opaque=False):
     """``@triton_op`` under torch.compile (the registered custom op is what dynamo
     captures), the plain function in eager: the torch.library op dispatch stack costs
     ~160µs per eager call — the dominant decode CPU cost in the eager-breakdown probe —
@@ -65,7 +89,24 @@ def compile_time_only_triton_op(name, mutates_args=()):
     ``compile_time_only_triton_wrap`` (same rule one level down, at the kernel launch)."""
 
     def decorator(fn):
-        op = triton_op(name, mutates_args=mutates_args)(fn)
+        if opaque:
+            # kernels whose configs carry a pre_hook (TMA descriptor rebinders) cannot
+            # be traced by triton_op's capture; register OPAQUE instead — the fake impl
+            # is the op fn itself, whose launches no-op under FakeTensor mode (see
+            # compile_time_only_triton_wrap), leaving just the shape-correct allocations
+            op = torch.library.custom_op(name, mutates_args=mutates_args)(fn)
+
+            @functools.wraps(fn)
+            def fake_impl(*args, **kwargs):
+                token = _SKIP_LAUNCHES.set(True)
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    _SKIP_LAUNCHES.reset(token)
+
+            op.register_fake(fake_impl)
+        else:
+            op = triton_op(name, mutates_args=mutates_args)(fn)
 
         @functools.wraps(fn)
         def dispatch(*args, **kwargs):
@@ -402,7 +443,7 @@ def get_active_device_type() -> str:
 
 
 def resolve_memory_modes(memory_modes):
-    """Resolve the generic ``"descriptor"`` MEMORY_MODE to the device's flavor: host-built
+    """Resolve the generic ``"descriptor"`` B_MEMORY_MODE to the device's flavor: host-built
     (NVIDIA TMA) on CUDA, device-built in-kernel tensormap on XPU. Installs the XPU
     scratch allocator device-built tensormaps need."""
     descriptor = (
@@ -431,7 +472,8 @@ def get_accelerator_autotuning_configs(
     swap_ab: bool = False,
     warp_spec: bool = False,
     compute_modes=None,
-    memory_modes=None,
+    a_memory_modes=None,
+    b_memory_modes=None,
     pre_hook=None,
 ):
     """Autotune search grid for the current accelerator — the single generator for every
@@ -442,7 +484,7 @@ def get_accelerator_autotuning_configs(
     ``tune_block_nk`` (MX kernels have no caller block_size — the tile is always tuned).
 
     ``compute_modes`` emits the ``COMPUTE_MODE`` axis (``None`` — the default — emits no
-    axis, like ``memory_modes``), tuner-selected per workload (token count is in the
+    axis, like ``b_memory_modes``), tuner-selected per workload (token count is in the
     key): ``"dot_scaled"`` native group-32 scaled MMA (wide BK {128,256}; wins once the
     grid saturates, ~S>=32), ``"dot"`` fp8 ``tl.dot`` + per-group software rescale
     (under ``mx`` its BK is pinned to the 32-group), ``"scalar"`` CUDA-core FMA reduce
@@ -468,13 +510,16 @@ def get_accelerator_autotuning_configs(
       (shape, config)-dependent on Triton 3.7.1, so it is a tuner axis — failures score
       inf and self-prune; where it compiles it is both faster and (bd grouped gate_up)
       load-bearing for correctness.
-    - ``memory_modes``: the MEMORY_MODE weight-load axis — pass
+    - ``a_memory_modes``: the A_MEMORY_MODE activation-load axis (descriptor legal only
+      without a gather — the tile's rows are the contiguous sorted positions; the pruner
+      fences descriptor rows when GatherIdx is passed).
+    - ``b_memory_modes``: the B_MEMORY_MODE weight-load axis — pass
       ``("descriptor", "pointer")`` to let the tuner pick the device's tensor-descriptor
       flavor vs explicit pointers; ``None`` (default) emits no axis. In the plain-dot
       kernels the descriptor arm is the SWAPPED loop (see the bd 2D kernel).
 
     A given ``pre_hook`` is attached to every config and must self-guard on
-    ``MEMORY_MODE``.
+    ``B_MEMORY_MODE``.
 
     Winner census over 743 tunes (B200, all kernels/shapes), useful when reading tuner
     logs: every value wins somewhere — MX lives in stages 5/6 (69 wins) and never picked
@@ -533,11 +578,17 @@ def get_accelerator_autotuning_configs(
         blocks = [{**b, "WARP_SPEC": ws} for b in blocks for ws in (False, True)]
 
     # (avoidance of the descriptor modes' can't-win regions lives in descriptor_config_pruner)
-    if memory_modes is not None:
+    if a_memory_modes is not None:
         blocks = [
-            {**b, "MEMORY_MODE": mm}
+            {**b, "A_MEMORY_MODE": mm}
             for b in blocks
-            for mm in resolve_memory_modes(memory_modes)
+            for mm in resolve_memory_modes(a_memory_modes)
+        ]
+    if b_memory_modes is not None:
+        blocks = [
+            {**b, "B_MEMORY_MODE": mm}
+            for b in blocks
+            for mm in resolve_memory_modes(b_memory_modes)
         ]
 
     # The coupled decode (BLOCK_SIZE_M, SWAP_AB) pairs — the single source of the swap/BM
@@ -911,28 +962,26 @@ def descriptor_box_pruner():
     BK=512 packed ones fit. Pointer configs pass untouched."""
 
     def ok(c, args):
-        if c.kwargs.get("MEMORY_MODE", "pointer") == "pointer":
-            return True
-        values_per_byte = (
-            2 if getattr(args.get("B"), "dtype", None) == torch.uint8 else 1
-        )
-        return (
-            c.kwargs["BLOCK_SIZE_K"] // values_per_byte <= 256
-            and c.kwargs["BLOCK_SIZE_N"] <= 256
-        )
-
-    return config_filter(ok)
-
-
-def descriptor_gate_pruner():
-    """``early_config_prune`` fencing descriptor MEMORY_MODEs off GATE launches: one
-    descriptor box holds a single projection, and the stacked gate|up tile would need
-    two disjoint boxes (unimplemented). Pointer configs all stay."""
-
-    def ok(c, args):
-        return c.kwargs.get("MEMORY_MODE", "pointer") == "pointer" or not args.get(
-            "GATE"
-        )
+        # tiles may be tuned (config kwargs) or pinned launch args — config_dim reads both
+        bk = config_dim(c, args, "BLOCK_SIZE_K")
+        if c.kwargs.get("B_MEMORY_MODE", "pointer") != "pointer":
+            weight_vpb = (
+                2 if getattr(args.get("B"), "dtype", None) == torch.uint8 else 1
+            )
+            if bk // weight_vpb > 256 or config_dim(c, args, "BLOCK_SIZE_N") > 256:
+                return False
+        if c.kwargs.get("A_MEMORY_MODE", "pointer") != "pointer":
+            # descriptor A, both arms tuner-routed per the tokens-per-expert key:
+            # contiguous boxes (no gather) win at dense routing (-7.1/-7.4%) and lose at
+            # skew; tma gather4 (gathered rows, 1-row box, sm_100 only) is MONOTONIC in
+            # tokens/expert — 2x loss at 32/expert, parity at 1024, -5.3/-4.7% at 4096
+            # (32k tokens, 2026-07-16). Only the arch is fenced.
+            act_vpb = 2 if getattr(args.get("A"), "dtype", None) == torch.uint8 else 1
+            if args.get("HAS_GATHER") and not is_sm10x():
+                return False
+            if bk // act_vpb > 256:
+                return False
+        return True
 
     return config_filter(ok)
 
@@ -961,8 +1010,9 @@ def smem_pruner():
     Both arms are EMPIRICAL models of this Triton's allocator, fit to and verified
     against ``metadata.shared`` samples (not derived from a spec) — chosen so the error
     direction under the sampled behavior is always toward KEEPING a config, which then
-    merely compiles and self-prunes as inf. Re-verify the samples on a Triton bump.
-    Non-empty fallback."""
+    merely compiles and self-prunes as inf. All samples taken on B200 (sm_100) —
+    re-verify on a Triton bump AND on H100 or the target device (smem capacity and
+    allocator behavior are per-arch). Non-empty fallback."""
 
     def ok(c, args):
         a, b = args["A"], args["B"]
@@ -980,7 +1030,7 @@ def smem_pruner():
             fixed = (
                 16
                 + (28 if c.kwargs.get("WARP_SPEC") else 0)
-                + (32 if c.kwargs.get("MEMORY_MODE", "pointer") != "pointer" else 0)
+                + (32 if c.kwargs.get("B_MEMORY_MODE", "pointer") != "pointer" else 0)
             )
             need = fixed + stages * bk * (
                 a.element_size() * bm + b.element_size() * tiles * bn
@@ -1023,7 +1073,7 @@ def smem_pruner():
 
 
 def descriptor_config_pruner():
-    """``early_config_prune`` coupling the (MEMORY_MODE, SWAP_AB, WARP_SPEC) orientation
+    """``early_config_prune`` coupling the (B_MEMORY_MODE, SWAP_AB, WARP_SPEC) orientation
     axes to their validated regions (B200, bd 2D loop, M=8192):
 
     - descriptor modes REQUIRE ``SWAP_AB``: the natural orientation needs a per-iteration
@@ -1034,10 +1084,13 @@ def descriptor_config_pruner():
       non-swapped plain-dot loops — the swapped loop is a different structure.
     - descriptor modes keep a warp floor: ``num_warps < 8`` under-subscribes the swapped
       dot's M-operand (the full BN weight tile), 3.6x slower at BN=128. Applied only at
-      ``BLOCK_SIZE_N >= 128``, where it was measured."""
+      ``BLOCK_SIZE_N >= 128``, where it was measured.
+
+    Every rule above was measured on B200 (sm_100); re-chart on H100 or the target
+    device before trusting the fences there."""
 
     def ok(c, args):
-        descriptor = c.kwargs.get("MEMORY_MODE", "pointer") != "pointer"
+        descriptor = c.kwargs.get("B_MEMORY_MODE", "pointer") != "pointer"
         swapped = c.kwargs.get("SWAP_AB", descriptor)
         if descriptor and not swapped:
             return False
@@ -1172,9 +1225,15 @@ def load_mx_act_tile(
     a_ptrs,
     as_ptrs,
     row_mask,
+    a_descriptor,
+    m_start,
+    ka_off,
+    gather_rows,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
+    A_MEMORY_MODE: tl.constexpr = "pointer",
+    A_GATHER: tl.constexpr = False,
 ):
     """Load one MX activation K-tile as ``(a_vals, a_scale_u8)`` — the arm is picked
     off the pointer dtype at compile time: fp8 pointers load pre-quantized E4M3 values +
@@ -1185,8 +1244,22 @@ def load_mx_act_tile(
     (unmasked tiles, e.g. the %-wrapped 2D matmul). Callers advance both pointers
     unconditionally."""
     if a_ptrs.dtype.element_ty == tl.float8e4nv or a_ptrs.dtype.element_ty == tl.uint8:
-        # pre-quantized (E4M3 offline, or packed E2M1 handed in by the caller)
-        if row_mask is None:
+        # pre-quantized (E4M3 offline, or packed E2M1 handed in by the caller); under the
+        # descriptor arm the [BM, BK_bytes] box loads the tile's contiguous sorted rows
+        # (no gather — tail rows past the tensor clamp to zero and are store-masked)
+        if A_MEMORY_MODE != "pointer":
+            if A_GATHER:
+                # sm_100 tma gather4: bulk-load the tile's ARBITRARY source rows
+                a = a_descriptor.gather(gather_rows, ka_off)
+            else:
+                a = a_descriptor.load([m_start, ka_off])
+            if as_ptrs.dtype.element_ty == tl.float8e4nv:
+                # NVFP4 scales: 0.0 encodes as byte 0 — padded rows scale to exact 0
+                a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0.0)
+            else:
+                # UE8M0 scales: byte 0 decodes to 2^-127 — padded rows can't make 0*inf
+                a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0)
+        elif row_mask is None:
             a = tl.load(a_ptrs)
             a_scale = tl.load(as_ptrs)
         else:
@@ -1560,7 +1633,10 @@ def store_masked(
 ):
     """Shared output epilogue of the kernels below: cast the fp32 accumulator to
     ``C``'s dtype and store the ``(BLOCK_SIZE_M, BLOCK_SIZE_N)`` tile at the swizzled
-    ``(pid_m, pid_n)``, masked to the ``(M, N)`` bounds."""
+    ``(pid_m, pid_n)``, masked to the ``(M, N)`` bounds. (A descriptor-store arm was
+    measured an EXACT tie at the store-heavy gap shape and dropped, 2026-07-16 —
+    stores are fire-and-forget, TMA has nothing to hide there. B200-only verdict;
+    re-measure on H100 or the target device.)"""
     c = accumulator.to(C.dtype.element_ty)
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -1803,7 +1879,7 @@ def compute_grouped_scheduling(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("compute_grouped_scheduling"), mutates_args=()
+    add_op_namespace_prefix("compute_grouped_scheduling"), mutates_args=(), opaque=True
 )
 def _compute_grouped_scheduling(
     expert_ids: torch.Tensor, num_experts: int, num_top_k: int
@@ -1956,15 +2032,15 @@ def weight_tile_descriptor(
     stride_k,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    MEMORY_MODE: tl.constexpr,
+    B_MEMORY_MODE: tl.constexpr,
 ):
     """Resolve the weight-tile descriptor once per program: the host-built TMA descriptor
     as passed, a device-built in-kernel tensormap, or 0 under "pointer" (never read — the
     constexpr branch folds it out of ``load_weight_tile``). Single return — only the taken
     branch compiles."""
-    if MEMORY_MODE == "host_descriptor":
+    if B_MEMORY_MODE == "host_descriptor":
         descriptor = HostDescriptor
-    elif MEMORY_MODE == "device_descriptor":
+    elif B_MEMORY_MODE == "device_descriptor":
         descriptor = tl.make_tensor_descriptor(
             W,
             shape=(N, K),
@@ -1977,30 +2053,32 @@ def weight_tile_descriptor(
 
 
 @triton.jit
-def load_stacked_weight_tile(
-    w_ptrs,
-    w_descriptor,
-    row_off,
-    k_off,
-    N2: tl.constexpr,
-    KB: tl.constexpr,
-    GATE: tl.constexpr,
-    MEMORY_MODE: tl.constexpr,
+def load_grouped_act_tile(
+    a_ptrs,
+    a_descriptor,
+    m_start,
+    ka_off,
+    row_mask,
+    gather_rows,
+    A_MEMORY_MODE: tl.constexpr,
+    A_GATHER: tl.constexpr = False,
 ):
-    """One K-major weight K-tile for the plain-dot grouped loops: the explicit-pointer
-    tile (optionally the stacked gate|up form, flattened to the MMA rhs), or the
-    ``[BN, BK]`` descriptor box transposed to K-major (descriptor modes are GATE-fenced
-    — one box holds a single projection). Single return — only the taken arm compiles;
-    the caller advances ``w_ptrs`` and passes the descriptor offsets either way."""
-    if MEMORY_MODE == "pointer":
-        w = stacked_gate_up_flatten(tl.load(w_ptrs), N2, KB, GATE, False)
+    """A plain (scale-less) grouped activation K-tile: the masked pointer load, or —
+    under the descriptor arm — sm_100 tma gather4 over the tile's ARBITRARY source rows
+    (gathered launches; padded rows read row 0 and are store-masked) or the ``[BM, BK]``
+    box at the tile's contiguous sorted-row start (no-gather launches; tail rows past
+    the tensor clamp to zero). Single return — only the taken arm compiles."""
+    if A_MEMORY_MODE == "pointer":
+        a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
+    elif A_GATHER:
+        a = a_descriptor.gather(gather_rows, ka_off)
     else:
-        w = tl.trans(w_descriptor.load([row_off, k_off]))
-    return w
+        a = a_descriptor.load([m_start, ka_off])
+    return a
 
 
 @triton.jit
-def load_mx_weight_tile(
+def load_grouped_weight_tile(
     w_ptrs,
     w_descriptor,
     row0,
@@ -2009,7 +2087,7 @@ def load_mx_weight_tile(
     BLOCK_SIZE_N: tl.constexpr,
     KB: tl.constexpr,
     GATE: tl.constexpr,
-    MEMORY_MODE: tl.constexpr,
+    B_MEMORY_MODE: tl.constexpr,
 ):
     """One K-major (optionally gate|up-stacked) MX weight K-tile for the grouped loop:
     the explicit-pointer tile flattened to the ``[KB, (2|1)*BN]`` rhs, or the
@@ -2017,7 +2095,7 @@ def load_mx_weight_tile(
     reshaped and transposed to the same form (the fused-era TMA arm: natural orientation
     + per-iteration trans). Single return — only the taken arm compiles; the caller
     advances ``w_ptrs`` and passes the box offsets either way."""
-    if MEMORY_MODE == "pointer":
+    if B_MEMORY_MODE == "pointer":
         w = stacked_gate_up_flatten(tl.load(w_ptrs), 2 * BLOCK_SIZE_N, KB, GATE, False)
     else:
         w = tl.trans(
@@ -2030,11 +2108,11 @@ def load_mx_weight_tile(
 
 
 @triton.jit
-def load_weight_tile(w_ptrs, w_descriptor, row_off, k_off, MEMORY_MODE: tl.constexpr):
+def load_weight_tile(w_ptrs, w_descriptor, row_off, k_off, B_MEMORY_MODE: tl.constexpr):
     """One weight K-tile: the ``(BN, BK)`` descriptor box at ``(row_off, k_off)`` under
     the descriptor modes, else the explicit-pointer tile (whatever orientation ``w_ptrs``
     was built with). Single return — only the taken branch compiles."""
-    if MEMORY_MODE == "pointer":
+    if B_MEMORY_MODE == "pointer":
         w = tl.load(w_ptrs)
     else:
         w = w_descriptor.load([row_off, k_off])
@@ -2469,9 +2547,11 @@ def _mx_act_quant_kernel(
     stride_x_k,
     t_bucket,  # autotune key only (log2 token-count bucket); unused in body
     K: tl.constexpr,
-    BLOCK_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
+    # dynamo's triton wrapper appends the tuner's config kwargs after the call kwargs
+    # and requires signature order — the tuned axis stays LAST
     RECIPE: tl.constexpr = "mxfp8",
+    BLOCK_K: tl.constexpr = 32,
 ):
     """One-pass activation quant, one launch per recipe (``mx_act_quant_inline`` does
     the math, so the offline and inline forms are bit-identical by construction): E4M3 +
@@ -2532,6 +2612,7 @@ def mxfp8_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             T.bit_length(),
             K=K,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
+            RECIPE="mxfp8",
         )
     return y, s
 
@@ -2646,7 +2727,7 @@ def _fp8_act_quant_kernel(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("fp8_act_quant_tensor_wide"), mutates_args=()
+    add_op_namespace_prefix("fp8_act_quant_tensor_wide"), mutates_args=(), opaque=True
 )
 def fp8_act_quant_tensor_wide(
     x: torch.Tensor, block_size: int = 128
@@ -2658,7 +2739,7 @@ def fp8_act_quant_tensor_wide(
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
 
     with device_context(x.device):
-        wrap_triton(_fp8_act_quant_kernel)[grid](
+        compile_time_only_triton_wrap(_fp8_act_quant_kernel)[grid](
             x,
             y,
             s,

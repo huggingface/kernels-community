@@ -293,6 +293,7 @@ def moe_unfused_grouped(
         Bs=gate_up_proj_scale_inv,
         expert_start=expert_start,
         quantization=Quantization(input_recipe=recipe),
+        output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
     gate, up = gate_up_out.chunk(2, dim=-1)
@@ -305,6 +306,7 @@ def moe_unfused_grouped(
         Bs=down_proj_scale_inv,
         expert_start=expert_start,
         quantization=Quantization(input_recipe=recipe),
+        output_dtype=hidden_states.dtype,
         scatter_idx=scatter_idx,
     )
     return _torch_weighted_reduce(down_out, top_k_index, top_k_weights, NUM_EXPERTS)
@@ -343,6 +345,7 @@ def moe_unfused_batched(
         Bs=gate_up_proj_scale_inv,
         expert_ids=expert_ids,
         quantization=Quantization(input_recipe=recipe),
+        output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
     gate, up = gate_up_out.chunk(2, dim=-1)
@@ -354,5 +357,6 @@ def moe_unfused_batched(
         Bs=down_proj_scale_inv,
         expert_ids=expert_ids,
         quantization=Quantization(input_recipe=recipe),
+        output_dtype=hidden_states.dtype,
     )
     return _torch_weighted_reduce(down_out, top_k_index, top_k_weights, NUM_EXPERTS)

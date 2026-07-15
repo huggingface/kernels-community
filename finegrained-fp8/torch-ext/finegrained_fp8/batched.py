@@ -391,7 +391,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 # scalar/dot_scaled-swap champions, and fielding it WITH the swapped form
 # (mx_dot_rescale_swapped) poisoned the TPE (dsv4 +27%, M3 +12% tuner misses) — the
 # can't-win dot-swap configs skew the per-dimension densities. The swapped helper stays
-# implemented for future shapes; don't re-emit without new evidence.
+# implemented for future shapes; don't re-emit without new evidence. Measured on B200
+# (sm_100) only — re-measure on H100 or the target device before inheriting.
 @bayesian_autotune(
     get_accelerator_autotuning_configs(
         mx=True,
@@ -716,7 +717,9 @@ def full_precision_matmul_batched_kernel(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_batched"), mutates_args=()
+    add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_batched"),
+    mutates_args=(),
+    opaque=True,
 )
 def w8a8_block_dynamic_fp8_matmul_batched(
     A: torch.Tensor,
@@ -847,7 +850,9 @@ def w8a8_block_dynamic_fp8_matmul_batched(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul_batched"), mutates_args=()
+    add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul_batched"),
+    mutates_args=(),
+    opaque=True,
 )
 def w8a8_tensor_dynamic_fp8_matmul_batched(
     A: torch.Tensor,
@@ -923,7 +928,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("mx_dynamic_matmul_batched"), mutates_args=()
+    add_op_namespace_prefix("mx_dynamic_matmul_batched"), mutates_args=(), opaque=True
 )
 def mx_dynamic_matmul_batched(
     A: torch.Tensor,
@@ -1085,7 +1090,9 @@ def mx_dynamic_matmul_batched(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("full_precision_matmul_batched"), mutates_args=()
+    add_op_namespace_prefix("full_precision_matmul_batched"),
+    mutates_args=(),
+    opaque=True,
 )
 def full_precision_matmul_batched(
     A: torch.Tensor,

@@ -1,6 +1,6 @@
 [general]
 name = "finegrained-fp8"
-version = 4
+version = 5
 license = "Apache-2.0"
 backends = [
     "cuda",

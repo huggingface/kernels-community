@@ -52,17 +52,15 @@ from .utils import (
     mxfp4_act_quant,
     nvfp4_act_quant,
     load_mx_act_tile,
-    load_mx_weight_tile,
+    load_grouped_weight_tile,
+    load_grouped_act_tile,
     descriptor_box_pruner,
     stacked_gate_up_ptrs,
     stacked_gate_up_flatten,
     grouped_gemm_epilogue,
     get_accelerator_autotuning_configs,
     warp_spec_compile_guard_pruner,
-    descriptor_gate_pruner,
     smem_pruner,
-    weight_tile_descriptor,
-    load_stacked_weight_tile,
     is_mx,
     weight_block_size,
     e2m1_as_uint8,
@@ -72,24 +70,82 @@ from .utils import (
 )
 
 
+def _rebind_grouped_weight_descriptor(nargs):
+    """Per-config pre_hook: set the MX weight descriptor box to the tuned
+    ``[(2 if GATE else 1), BLOCK_SIZE_N, BLOCK_SIZE_K // values_per_byte]`` over the
+    ``(2E|E, N, K_bytes)`` weight view (one box holds both gate|up projections — the
+    fused-era TMA form). MUST mutate ``block_shape`` in place — a rebind never reaches
+    the launch. No-op for pointer configs (they never read the descriptor)."""
+    if nargs.get("B_MEMORY_MODE", "pointer") == "pointer" or isinstance(
+        nargs["BDescriptor"], int
+    ):
+        return
+    values_per_byte = 2 if nargs["B"].dtype == torch.uint8 else 1
+    nargs["BDescriptor"].block_shape = [
+        2 if nargs.get("GATE") else 1,
+        nargs["BLOCK_SIZE_N"],
+        nargs["BLOCK_SIZE_K"] // values_per_byte,
+    ]
+
+
+def _rebind_grouped_act_descriptor(nargs):
+    """Per-config pre_hook: set the activation descriptor box to the tuned
+    ``[BLOCK_SIZE_M, BLOCK_SIZE_K // act_values_per_byte]`` over the ``(rows, K_bytes)``
+    activation matrix. In-place mutate; no-op for pointer-A configs."""
+    if nargs.get("A_MEMORY_MODE", "pointer") == "pointer" or isinstance(
+        nargs["ADescriptor"], int
+    ):
+        return
+    act_values_per_byte = 2 if nargs["A"].dtype == torch.uint8 else 1
+    # tma gather4 loads N independent rows: descriptor_gather requires a 1-row box;
+    # the contiguous (no-gather) arm loads the whole [BM, BK_bytes] tile in one box
+    nargs["ADescriptor"].block_shape = [
+        1 if nargs.get("HAS_GATHER") else nargs["BLOCK_SIZE_M"],
+        nargs["BLOCK_SIZE_K"] // act_values_per_byte,
+    ]
+
+
+def _rebind_grouped_descriptors(nargs):
+    """Composite pre_hook: both weight and activation descriptor boxes."""
+    _rebind_grouped_weight_descriptor(nargs)
+    _rebind_grouped_act_descriptor(nargs)
+
+
 @bayesian_autotune(
-    # SWAP_AB/MEMORY_MODE (TMA) arms were ported here, measured, and REMOVED: at dsv4-like
-    # prefill (S=8192, E=256, N=4096, K=7168) WS-pointer BM=64 w4 s4 = 1796us beats
-    # descriptor+swap (1944us, its best) and pointer+swap (2088us); descriptor+swap was
-    # also numerically WRONG at BM=16 at large K. The dormant reference implementation
-    # lives on the 2D kernel (w8a8_block_dynamic_fp8_matmul_kernel); see OPTIMIZATION_LOG.
-    get_accelerator_autotuning_configs(warp_spec=True, tune_block_m=True),
+    # TMA history: a first descriptor port FORCED SWAP_AB alongside it (weights in the
+    # MMA M operand — a coupling inherited from the bd-2D verdict), measured a loser
+    # (1944us vs WS-pointer 1796us, dsv4 E=256, 2026-07-14) and was removed. The current
+    # form has NO swap and no SWAP_AB axis: the descriptor loads the natural-orientation
+    # ((2|1), BN, BK) gate|up box and transposes once to the same K-major tile the
+    # pointer arm builds. That form wins outright: gate_up 948->455us (-52%), down
+    # 256->212us desc/desc (-17%) at dense E=8 (2026-07-16) — the old loss was the swap
+    # coupling, not TMA. Both memory axes are emitted; the tuner routes per key.
+    # All verdicts B200 (sm_100); re-chart the swap coupling on H100 or the target
+    # device before reusing them there.
+    get_accelerator_autotuning_configs(
+        warp_spec=True,
+        tune_block_m=True,
+        a_memory_modes=("descriptor", "pointer"),
+        b_memory_modes=("descriptor", "pointer"),
+        pre_hook=_rebind_grouped_descriptors,
+    ),
     # GATE keys the gate|up arm separately: its dot is 2*BN wide, a different tile optimum.
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
     # Pipeliner-race guard: per launch-BM, WS-only at BM >= 64 and non-WS below (see the pruner).
-    prune_configs_by={"early_config_prune": block_dynamic_grouped_matmul_pruner()},
+    prune_configs_by={
+        "early_config_prune": compose_pruners(
+            block_dynamic_grouped_matmul_pruner(), descriptor_box_pruner()
+        )
+    },
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     A,  # (num_tokens, K) E4M3 activations (pre-quantized once by the wrapper), any row order
+    ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
     As,  # (S, K // BLOCK_SIZE_K) fp32 per-row, per-K-block activation scales
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
+    BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K), box ((2|1), BN, BK); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
     C,  # (S, N) output; under an OUTPUT_RECIPE the FP8-requantized intermediate
     Cs,  # (S, N // BLOCK_SIZE_N) per-row, per-block output scale; written iff OUTPUT_RECIPE
@@ -125,6 +181,8 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     NUM_EXPERTS_POW2: tl.constexpr,
     NUM_SMS: tl.constexpr,
     WARP_SPEC: tl.constexpr = False,
+    A_MEMORY_MODE: tl.constexpr = "pointer",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM, every arm below folds out)
     GATE: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
@@ -194,14 +252,37 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         else:
             bs_ptrs = Bs + expert_id64 * stride_bs_e + pid_n * stride_bs_n
 
+        # descriptor box coordinates: expert slab (x2 under GATE), N offset; without a
+        # gather the A rows are contiguous, so their min IS the box row start
+        row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
+        n_off = pid_n * BLOCK_SIZE_N
+        m_start = tl.min(in_row).to(tl.int32)
+
         acc = tl.zeros(
             (BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N), dtype=tl.float32
         )
-        for _ in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-            a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
+        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+            a = load_grouped_act_tile(
+                a_ptrs,
+                ADescriptor,
+                m_start,
+                k * BLOCK_SIZE_K,
+                row_mask,
+                in_row,
+                A_MEMORY_MODE,
+                HAS_GATHER,
+            )
             a_s = tl.load(as_ptrs, mask=row_mask, other=0.0)
-            w = stacked_gate_up_flatten(
-                tl.load(b_ptrs), 2 * BLOCK_SIZE_N, BLOCK_SIZE_K, GATE, False
+            w = load_grouped_weight_tile(
+                b_ptrs,
+                BDescriptor,
+                row0,
+                n_off,
+                k * BLOCK_SIZE_K,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                GATE,
+                B_MEMORY_MODE,
             )
             if GATE:
                 # gate scale on the first BN columns, up scale on the rest
@@ -247,7 +328,12 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
 
 @bayesian_autotune(
     get_accelerator_autotuning_configs(
-        tune_block_nk=True, warp_spec=True, tune_block_m=True
+        tune_block_nk=True,
+        warp_spec=True,
+        tune_block_m=True,
+        a_memory_modes=("descriptor", "pointer"),
+        b_memory_modes=("descriptor", "pointer"),
+        pre_hook=_rebind_grouped_descriptors,
     ),
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
@@ -262,14 +348,18 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
             warp_spec_compile_guard_pruner(),
+            descriptor_box_pruner(),
+            smem_pruner(),
         )
     },
 )
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     A,  # (num_tokens, K) pre-quantized FP8 activations, any row order
+    ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
     As,  # (S,) per-token activation scales
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
+    BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K), box ((2|1), BN, BK); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, 1, 1) per-tensor weight scales (one scalar covers the gate|up stack)
     C,  # (S, N) output; under GATE the bf16 GLU intermediate
     Cs,  # unused dummy (tensor-wide has no fused requant); kept for the shared epilogue signature
@@ -303,6 +393,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     NUM_EXPERTS_POW2: tl.constexpr,
     NUM_SMS: tl.constexpr,
     WARP_SPEC: tl.constexpr = False,
+    A_MEMORY_MODE: tl.constexpr = "pointer",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM). No fused requant here
     # (tensor-wide down needs a per-token whole-row scale a per-tile epilogue can't form).
     GATE: tl.constexpr = False,
@@ -358,14 +450,36 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         )
         a_s = tl.load(As + in_row * stride_as_m, mask=row_mask, other=0.0)
         b_s = tl.load(Bs + expert_id64 * stride_bs_e)
+        # descriptor box coordinates: expert slab (x2 under GATE), N offset; without a
+        # gather the A rows are contiguous, so their min IS the box row start
+        row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
+        n_off = pid_n * BLOCK_SIZE_N
+        m_start = tl.min(in_row).to(tl.int32)
 
         acc = tl.zeros(
             (BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N), dtype=tl.float32
         )
-        for _ in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-            a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
-            w = stacked_gate_up_flatten(
-                tl.load(b_ptrs), 2 * BLOCK_SIZE_N, BLOCK_SIZE_K, GATE, False
+        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+            a = load_grouped_act_tile(
+                a_ptrs,
+                ADescriptor,
+                m_start,
+                k * BLOCK_SIZE_K,
+                row_mask,
+                in_row,
+                A_MEMORY_MODE,
+                HAS_GATHER,
+            )
+            w = load_grouped_weight_tile(
+                b_ptrs,
+                BDescriptor,
+                row0,
+                n_off,
+                k * BLOCK_SIZE_K,
+                BLOCK_SIZE_N,
+                BLOCK_SIZE_K,
+                GATE,
+                B_MEMORY_MODE,
             )
             acc += tl.dot(a, w)
             a_ptrs += BLOCK_SIZE_K * stride_a_k
@@ -397,33 +511,16 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         )
 
 
-def _rebind_mx_weight_descriptor(nargs):
-    """Per-config pre_hook: set the MX weight descriptor box to the tuned
-    ``[(2 if GATE else 1), BLOCK_SIZE_N, BLOCK_SIZE_K // values_per_byte]`` over the
-    ``(2E|E, N, K_bytes)`` weight view (one box holds both gate|up projections — the
-    fused-era TMA form). MUST mutate ``block_shape`` in place — a rebind never reaches
-    the launch. No-op for pointer configs (they never read the descriptor)."""
-    if nargs.get("MEMORY_MODE", "pointer") == "pointer" or isinstance(
-        nargs["BDescriptor"], int
-    ):
-        return
-    values_per_byte = 2 if nargs["B"].dtype == torch.uint8 else 1
-    nargs["BDescriptor"].block_shape = [
-        2 if nargs.get("GATE") else 1,
-        nargs["BLOCK_SIZE_N"],
-        nargs["BLOCK_SIZE_K"] // values_per_byte,
-    ]
-
-
 @bayesian_autotune(
     get_accelerator_autotuning_configs(
         mx=True,
         tune_block_nk=True,
         tune_block_m=True,
         compute_modes=("dot_scaled", "dot"),
-        memory_modes=("descriptor", "pointer"),
-        pre_hook=_rebind_mx_weight_descriptor,
-    ),  # prefill: no scalar branch; TMA descriptor vs pointer weight loads (fused-era arm)
+        a_memory_modes=("descriptor", "pointer"),
+        b_memory_modes=("descriptor", "pointer"),
+        pre_hook=_rebind_grouped_descriptors,
+    ),  # prefill: no scalar branch; TMA descriptor vs pointer loads on both operands
     # the MXFP4/MXFP8 (and packed-activation) splits key themselves — the tuner appends
     # every tensor arg's dtype to its cache key (memory and disk);
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a different tile optimum).
@@ -441,9 +538,10 @@ def _rebind_mx_weight_descriptor(nargs):
 @triton.jit
 def mx_dynamic_matmul_grouped_kernel(
     A,  # (num_tokens, K) E4M3 activations (pre-quantized once by the wrapper), any row order
+    ADescriptor,  # host TMA descriptor over A (rows, K_bytes), box (BM, BK_bytes); read iff A_MEMORY_MODE != "pointer"
     As,  # (S, K // 32) UE8M0 group-32 activation scales
     B,  # (num_experts, N, K) E4M3 (MXFP8) or (num_experts, N, K // 2) packed E2M1 (MXFP4); 2N under GATE
-    BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K_bytes), box ((2|1), BN, BK_bytes); read iff MEMORY_MODE != "pointer"
+    BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K_bytes), box ((2|1), BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) UE8M0 weight scales (2N under GATE)
     C,  # (S, N[/2]) output; under an OUTPUT_RECIPE the MX-requantized intermediate
     Cs,  # (S, N // SCALE_GROUP_K) UE8M0 output scale; written iff OUTPUT_RECIPE
@@ -480,7 +578,8 @@ def mx_dynamic_matmul_grouped_kernel(
     NUM_SMS: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
-    MEMORY_MODE: tl.constexpr = "pointer",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
+    A_MEMORY_MODE: tl.constexpr = "pointer",
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM, every arm below folds out)
     GATE: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
@@ -534,10 +633,14 @@ def mx_dynamic_matmul_grouped_kernel(
         )
         a_ptrs = A + in_row[:, None] * stride_a_m + offs_ka[None, :] * stride_a_k
         as_ptrs = As + in_row[:, None] * stride_as_m + offs_sf[None, :]
-        # descriptor box coordinates: expert slab (x2 under GATE), N offset, K-byte offset
+        # descriptor box coordinates: expert slab (x2 under GATE), N offset, K-byte
+        # offsets per operand; without a gather the A rows are the contiguous sorted
+        # positions, so their min IS the box row start
         row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
         n_off = pid_n * BLOCK_SIZE_N
+        m_start = tl.min(in_row).to(tl.int32)
         kb_off = 0
+        ka_off = 0
         # GATE stacks gate|up into the weight (K-major) and its UE8M0 scale (N-major, SWAP_AB);
         # the up block sits N rows away. GATE=False -> the plain single tile / scale.
         b_ptrs = stacked_gate_up_ptrs(
@@ -566,10 +669,21 @@ def mx_dynamic_matmul_grouped_kernel(
         )
         for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
             a, a_scale = load_mx_act_tile(
-                a_ptrs, as_ptrs, row_mask, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
+                a_ptrs,
+                as_ptrs,
+                row_mask,
+                ADescriptor,
+                m_start,
+                ka_off,
+                in_row,
+                BLOCK_SIZE_M,
+                BLOCK_SIZE_K,
+                SCALE_GROUP_K,
+                A_MEMORY_MODE,
+                HAS_GATHER,
             )
             as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
-            b = load_mx_weight_tile(
+            b = load_grouped_weight_tile(
                 b_ptrs,
                 BDescriptor,
                 row0,
@@ -578,7 +692,7 @@ def mx_dynamic_matmul_grouped_kernel(
                 BLOCK_SIZE_N,
                 BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE,
                 GATE,
-                MEMORY_MODE,
+                B_MEMORY_MODE,
             )
             b_s = stacked_gate_up_flatten(
                 tl.load(bs_ptrs),
@@ -600,6 +714,7 @@ def mx_dynamic_matmul_grouped_kernel(
                 SCALE_GROUP_K,
             )
             a_ptrs += (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k
+            ka_off += BLOCK_SIZE_K // ACT_VALUES_PER_BYTE
             b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
             kb_off += BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
             bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
@@ -629,27 +744,14 @@ def mx_dynamic_matmul_grouped_kernel(
         )
 
 
-def _rebind_weight_descriptor(nargs):
-    """Per-config pre_hook: point the host TMA descriptor's box at this config's tuned
-    (BN, BK) tile — the launcher re-encodes the tensormap from the object on every
-    launch, so the in-place mutation is what the kernel sees. Self-guards on
-    MEMORY_MODE (pointer configs never read the descriptor)."""
-    if nargs.get("MEMORY_MODE", "pointer") != "pointer" and not isinstance(
-        nargs["BDescriptor"], int
-    ):
-        nargs["BDescriptor"].block_shape = [
-            nargs["BLOCK_SIZE_N"],
-            nargs["BLOCK_SIZE_K"],
-        ]
-
-
 @bayesian_autotune(
     get_accelerator_autotuning_configs(
         tune_block_nk=True,
         warp_spec=True,
         tune_block_m=True,
-        memory_modes=("descriptor", "pointer"),
-        pre_hook=_rebind_weight_descriptor,
+        a_memory_modes=("descriptor", "pointer"),
+        b_memory_modes=("descriptor", "pointer"),
+        pre_hook=_rebind_grouped_descriptors,
     ),
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
@@ -660,7 +762,7 @@ def _rebind_weight_descriptor(nargs):
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
             warp_spec_compile_guard_pruner(),
-            descriptor_gate_pruner(),
+            descriptor_box_pruner(),
             smem_pruner(),
         )
     },
@@ -668,8 +770,9 @@ def _rebind_weight_descriptor(nargs):
 @triton.jit
 def full_precision_matmul_grouped_kernel(
     A,  # (num_tokens, K) BF16/FP16 activations, any row order
+    ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
     B,  # (num_experts, N, K) weights in A's dtype; under GATE the (num_experts, 2N, K) gate|up stack
-    BDescriptor,  # host TMA descriptor over B flattened to (num_experts*N, K), box (BN, BK); read iff MEMORY_MODE == "host_descriptor"
+    BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K), box ((2|1), BN, BK); read iff B_MEMORY_MODE != "pointer"
     C,  # (S, N) output; under GATE the GLU intermediate
     GatherIdx,  # (S,) int32 — sorted position -> source row of A; read iff HAS_GATHER
     ScatterIdx,  # (S,) int32 — sorted position -> destination row of C; read iff HAS_SCATTER
@@ -699,7 +802,8 @@ def full_precision_matmul_grouped_kernel(
     WARP_SPEC: tl.constexpr = False,
     # descriptor modes (host-built TMA / in-kernel tensormap) load weight tiles via the
     # descriptor and run the swapped (weights-in-M) loop; "pointer" is the natural loop.
-    MEMORY_MODE: tl.constexpr = "pointer",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
+    A_MEMORY_MODE: tl.constexpr = "pointer",
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM). No requant arm: the
     # full-precision chain has no quantized intermediate — down consumes the GLU output as is.
     GATE: tl.constexpr = False,
@@ -721,21 +825,6 @@ def full_precision_matmul_grouped_kernel(
     )
     num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    # one flat descriptor over the (num_experts * N, K) row-major weights — expert
-    # tiles never cross an expert's row range, so a single descriptor serves all
-    # (host-built TMA, in-kernel tensormap, or 0 under "pointer" — never read there)
-    b_descriptor = weight_tile_descriptor(
-        BDescriptor,
-        B,
-        num_experts * N,
-        K,
-        stride_b_n,
-        stride_b_k,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
-        MEMORY_MODE,
-    )
-
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
         pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = (
             resolve_grouped_tile(
@@ -767,22 +856,36 @@ def full_precision_matmul_grouped_kernel(
             GATE,
             False,
         )
-        row0 = (expert_id64 * N + pid_n * BLOCK_SIZE_N).to(tl.int32)
+        # descriptor box coordinates: expert slab (x2 under GATE), N offset, K offset;
+        # without a gather the A rows are contiguous, so their min IS the box row start
+        row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
+        n_off = pid_n * BLOCK_SIZE_N
+        m_start = tl.min(in_row).to(tl.int32)
 
         acc = tl.zeros(
             (BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N), dtype=tl.float32
         )
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-            a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
-            w = load_stacked_weight_tile(
-                b_ptrs,
-                b_descriptor,
-                row0,
+            a = load_grouped_act_tile(
+                a_ptrs,
+                ADescriptor,
+                m_start,
                 k * BLOCK_SIZE_K,
-                2 * BLOCK_SIZE_N,
+                row_mask,
+                in_row,
+                A_MEMORY_MODE,
+                HAS_GATHER,
+            )
+            w = load_grouped_weight_tile(
+                b_ptrs,
+                BDescriptor,
+                row0,
+                n_off,
+                k * BLOCK_SIZE_K,
+                BLOCK_SIZE_N,
                 BLOCK_SIZE_K,
                 GATE,
-                MEMORY_MODE,
+                B_MEMORY_MODE,
             )
             acc += tl.dot(a, w)
             a_ptrs += BLOCK_SIZE_K * stride_a_k
@@ -814,7 +917,9 @@ def full_precision_matmul_grouped_kernel(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_grouped"), mutates_args=()
+    add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_grouped"),
+    mutates_args=(),
+    opaque=True,
 )
 def w8a8_block_dynamic_fp8_matmul_grouped(
     A: torch.Tensor,
@@ -902,8 +1007,13 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
             (num_sms,)
         ](
             A,
+            TensorDescriptor.from_tensor(A, block_shape=[16, 64]),
             As,
             B,
+            TensorDescriptor.from_tensor(
+                B.view(2 * num_experts if gate else num_experts, N, K),
+                block_shape=[1, 128, 64],
+            ),
             Bs,
             C,
             Cs,
@@ -948,7 +1058,9 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul_grouped"), mutates_args=()
+    add_op_namespace_prefix("w8a8_tensor_dynamic_fp8_matmul_grouped"),
+    mutates_args=(),
+    opaque=True,
 )
 def w8a8_tensor_dynamic_fp8_matmul_grouped(
     A: torch.Tensor,
@@ -1011,8 +1123,13 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
             (num_sms,)
         ](
             A,
+            TensorDescriptor.from_tensor(A, block_shape=[16, 64]),
             As,
             B,
+            TensorDescriptor.from_tensor(
+                B.view(2 * num_experts if gate else num_experts, N, K),
+                block_shape=[1, 128, 64],
+            ),
             Bs,
             C,
             expert_start,  # dummy Cs (no fused requant for tensor-wide)
@@ -1051,7 +1168,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("mx_dynamic_matmul_grouped"), mutates_args=()
+    add_op_namespace_prefix("mx_dynamic_matmul_grouped"), mutates_args=(), opaque=True
 )
 def mx_dynamic_matmul_grouped(
     A: torch.Tensor,
@@ -1170,10 +1287,12 @@ def mx_dynamic_matmul_grouped(
     b_descriptor = TensorDescriptor.from_tensor(
         B.view(rows0, N, B.shape[2]), block_shape=[1, 128, 64]
     )
+    a_descriptor = TensorDescriptor.from_tensor(A, block_shape=[16, 64])
 
     with device_context(A.device):
         compile_time_only_triton_wrap(mx_dynamic_matmul_grouped_kernel)[(num_sms,)](
             A,
+            a_descriptor,
             As,
             B,
             b_descriptor,
@@ -1218,7 +1337,9 @@ def mx_dynamic_matmul_grouped(
 
 
 @compile_time_only_triton_op(
-    add_op_namespace_prefix("full_precision_matmul_grouped"), mutates_args=()
+    add_op_namespace_prefix("full_precision_matmul_grouped"),
+    mutates_args=(),
+    opaque=True,
 )
 def full_precision_matmul_grouped(
     A: torch.Tensor,
@@ -1267,10 +1388,12 @@ def full_precision_matmul_grouped(
     with device_context(A.device):
         compile_time_only_triton_wrap(full_precision_matmul_grouped_kernel)[(num_sms,)](
             A,
+            TensorDescriptor.from_tensor(A, block_shape=[16, 64]),
             B,
             TensorDescriptor.from_tensor(
-                B.view(B.shape[0] * B.shape[1], K), block_shape=[128, 64]
-            ),  # box re-bound to the tuned (BN, BK) by _rebind_weight_descriptor
+                B.view(2 * num_experts if gate else num_experts, N, K),
+                block_shape=[1, 128, 64],
+            ),  # boxes re-bound to the tuned config by _rebind_grouped_descriptors
             C,
             gather_idx if gather_idx is not None else expert_start,  # dummy ptr
             scatter_idx if scatter_idx is not None else expert_start,  # dummy ptr
