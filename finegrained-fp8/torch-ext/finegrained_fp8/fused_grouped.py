@@ -107,7 +107,9 @@ def _resolve_tile_inline(
     offs = tl.arange(0, BLOCK_SIZE_M)
     row_mask = offs < freq - within * BLOCK_SIZE_M
     sorted_indices = tl.max_contiguous(m_start + offs, BLOCK_SIZE_M)
-    return expert_id, sorted_indices, row_mask
+    # Cast to int64 so expert_id * stride_gu_e/stride_down_e don't overflow for
+    # large num_experts (matches grouped.py/batched.py; e.g. E=256 x 2*I*H strides).
+    return expert_id.to(tl.int64), sorted_indices, row_mask
 
 
 @triton.jit
