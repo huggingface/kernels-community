@@ -30,7 +30,9 @@ import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
+from torch.library import triton_op, wrap_triton
 
+from ._ops import add_op_namespace_prefix, ops
 from .bayesian_autotuner import bayesian_autotune
 from .grouped import store_tile
 from .utils import (
@@ -177,20 +179,20 @@ def _grouped_routing(expert_ids: torch.Tensor, num_experts: int, num_top_k: int)
     perm = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
     perm_token = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
     with device_context(device):
-        _count_kernel[(triton.cdiv(num_routed_tokens, _ROUTING_BLOCK_SIZE),)](
+        wrap_triton(_count_kernel)[(triton.cdiv(num_routed_tokens, _ROUTING_BLOCK_SIZE),)](
             expert_ids,
             expert_freq,
             num_routed_tokens,
             NUM_EXPERTS=num_experts,
             BLOCK_SIZE=_ROUTING_BLOCK_SIZE,
         )
-        _exclusive_offsets_kernel[(1,)](
+        wrap_triton(_exclusive_offsets_kernel)[(1,)](
             expert_freq,
             expert_start,
             counters,
             NUM_EXPERTS=num_experts,
         )
-        _scatter_kernel[(triton.cdiv(num_routed_tokens, _ROUTING_BLOCK_SIZE),)](
+        wrap_triton(_scatter_kernel)[(triton.cdiv(num_routed_tokens, _ROUTING_BLOCK_SIZE),)](
             expert_ids,
             perm,
             perm_token,
@@ -439,22 +441,28 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
         store_tile(ProjOut, acc, flat, offs_h, row_mask, stride_po_m, stride_po_n)
 
 
-def w8a8_block_dynamic_fp8_moe_grouped(
+@triton_op(
+    add_op_namespace_prefix("w8a8_block_dynamic_fp8_moe_grouped"), mutates_args=()
+)
+def _w8a8_block_dynamic_fp8_moe_grouped(
     hidden_states: torch.Tensor,  # (T, H)
+    gate_up_proj: torch.Tensor,  # (E, 2I, H) FP8
+    gate_up_proj_scale: torch.Tensor,
+    down_proj: torch.Tensor,  # (E, H, I) FP8
+    down_proj_scale: torch.Tensor,
     top_k_index: torch.Tensor,  # (T, K) int
     top_k_weights: torch.Tensor,  # (T, K)
-    gate_up_proj: torch.Tensor,  # (E, 2I, H) FP8
-    down_proj: torch.Tensor,  # (E, H, I) FP8
-    gate_up_proj_scale: torch.Tensor,
-    down_proj_scale: torch.Tensor,
     block_size: list[int],
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
 ) -> torch.Tensor:
-    """Block-dynamic FP8 fused grouped MoE: gather gate_up+SiLU → FP8 intermediate →
-    grouped down → routing-weighted top-k reduce. Returns ``(num_tokens, hidden_dim)``."""
+    """Block-dynamic FP8 fused grouped MoE in ONE op: gather gate_up+SiLU → FP8
+    intermediate → grouped down → routing-weighted top-k reduce. The routing scatter,
+    ``sm_count`` grid sizing, and Triton launches all run inside this opaque
+    ``triton_op`` so ``torch.compile(fullgraph=True)`` never traces the untraceable
+    driver calls. Returns ``(num_tokens, hidden_dim)``."""
     device = hidden_states.device
     num_tokens = hidden_states.size(0)
     num_top_k = top_k_index.size(-1)
@@ -485,7 +493,7 @@ def w8a8_block_dynamic_fp8_moe_grouped(
         num_tokens, HIDDEN_DIM, device=device, dtype=hidden_states.dtype
     )
     with device_context(device):
-        w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel[(num_sms,)](
+        wrap_triton(w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel)[(num_sms,)](
             hidden_states,
             perm_token,
             gate_up_proj,
@@ -518,7 +526,7 @@ def w8a8_block_dynamic_fp8_moe_grouped(
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        w8a8_block_dynamic_fp8_moe_grouped_down_kernel[(num_sms,)](
+        wrap_triton(w8a8_block_dynamic_fp8_moe_grouped_down_kernel)[(num_sms,)](
             inter,
             inter_scale,
             down_proj,
@@ -550,7 +558,9 @@ def w8a8_block_dynamic_fp8_moe_grouped(
             NUM_SMS=num_sms,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        topk_reduce_kernel[(num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))](
+        wrap_triton(topk_reduce_kernel)[
+            (num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))
+        ](
             out,
             reduced,
             top_k_index,
@@ -567,6 +577,39 @@ def w8a8_block_dynamic_fp8_moe_grouped(
         )
 
     return reduced
+
+
+def w8a8_block_dynamic_fp8_moe_grouped(
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    gate_up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+    gate_up_proj_scale: torch.Tensor,
+    down_proj_scale: torch.Tensor,
+    block_size: list[int],
+    act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
+) -> torch.Tensor:
+    """Block-dynamic FP8 fused grouped MoE — the whole forward is one ``triton_op``
+    (routing + both GEMMs), so ``torch.compile`` sees a single opaque node; the top-k
+    reduce inside stays plain torch for graph fusion."""
+    return ops.w8a8_block_dynamic_fp8_moe_grouped(
+        hidden_states,
+        gate_up_proj,
+        gate_up_proj_scale,
+        down_proj,
+        down_proj_scale,
+        top_k_index,
+        top_k_weights,
+        block_size,
+        act_fn,
+        swiglu_alpha,
+        swiglu_limit,
+        simulate_unfused,
+    )
 
 
 # ── MXFP4/MXFP8 (UE8M0 group-32, tunable tile, MXFP8 intermediate) ────────────
@@ -950,21 +993,25 @@ def mxfp_dynamic_moe_grouped_down_kernel(
         store_tile(ProjOut, acc, flat, offs_bn, row_mask, stride_po_m, stride_po_n)
 
 
-def mxfp_dynamic_moe_grouped(
+@triton_op(add_op_namespace_prefix("mxfp_dynamic_moe_grouped"), mutates_args=())
+def _mxfp_dynamic_moe_grouped(
     hidden_states: torch.Tensor,
+    gate_up_proj: torch.Tensor,
+    gate_up_proj_scale: torch.Tensor,
+    down_proj: torch.Tensor,
+    down_proj_scale: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
-    gate_up_proj: torch.Tensor,
-    down_proj: torch.Tensor,
-    gate_up_proj_scale: torch.Tensor,
-    down_proj_scale: torch.Tensor,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
 ) -> torch.Tensor:
-    """MXFP4/MXFP8 fused grouped MoE (UE8M0 group-32); gate_up and down must share the same MX
-    format. Same structure as the block-dynamic path but with a tunable tile and MXFP8 intermediate."""
+    """MXFP4/MXFP8 fused grouped MoE (UE8M0 group-32) in ONE op; gate_up and down must
+    share the same MX format. Same structure as the block-dynamic path but with a
+    tunable tile, MXFP8 intermediate, and host TMA descriptors — all built inside this
+    opaque ``triton_op`` so ``torch.compile(fullgraph=True)`` never traces the routing
+    scatter, ``sm_count``, or ``TensorDescriptor`` driver calls."""
     gate_up_is_fp4 = is_mxfp4(gate_up_proj, gate_up_proj_scale)
     down_is_fp4 = is_mxfp4(down_proj, down_proj_scale)
     if gate_up_is_fp4 != down_is_fp4:
@@ -1017,7 +1064,7 @@ def mxfp_dynamic_moe_grouped(
     down_eh = down_proj_u8.view(down_proj_u8.size(0) * HIDDEN_DIM, down_proj_u8.size(2))
     down_descriptor = TensorDescriptor.from_tensor(down_eh, [32, 32 // VALUES_PER_BYTE])
     with device_context(device):
-        mxfp_dynamic_moe_grouped_gate_up_kernel[(num_sms,)](
+        wrap_triton(mxfp_dynamic_moe_grouped_gate_up_kernel)[(num_sms,)](
             hidden_states,
             perm_token,
             gate_up_proj_u8,
@@ -1051,7 +1098,7 @@ def mxfp_dynamic_moe_grouped(
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        mxfp_dynamic_moe_grouped_down_kernel[(num_sms,)](
+        wrap_triton(mxfp_dynamic_moe_grouped_down_kernel)[(num_sms,)](
             inter,
             inter_scale,
             down_proj_u8,
@@ -1083,7 +1130,9 @@ def mxfp_dynamic_moe_grouped(
             NUM_SMS=num_sms,
             SIMULATE_UNFUSED=simulate_unfused,
         )
-        topk_reduce_kernel[(num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))](
+        wrap_triton(topk_reduce_kernel)[
+            (num_tokens, triton.cdiv(HIDDEN_DIM, TOPK_REDUCE_BLOCK_H))
+        ](
             out,
             reduced,
             top_k_index,
@@ -1100,6 +1149,36 @@ def mxfp_dynamic_moe_grouped(
         )
 
     return reduced
+
+
+def mxfp_dynamic_moe_grouped(
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    gate_up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+    gate_up_proj_scale: torch.Tensor,
+    down_proj_scale: torch.Tensor,
+    act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
+) -> torch.Tensor:
+    """MXFP4/MXFP8 fused grouped MoE — the whole forward is one ``triton_op`` (routing +
+    both GEMMs + TMA descriptors), so ``torch.compile`` sees a single opaque node."""
+    return ops.mxfp_dynamic_moe_grouped(
+        hidden_states,
+        gate_up_proj,
+        gate_up_proj_scale,
+        down_proj,
+        down_proj_scale,
+        top_k_index,
+        top_k_weights,
+        act_fn,
+        swiglu_alpha,
+        swiglu_limit,
+        simulate_unfused,
+    )
 
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
