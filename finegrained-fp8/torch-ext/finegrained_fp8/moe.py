@@ -97,7 +97,8 @@ def _block_recipe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, 
     """The MoE block's activation recipe: validates the weight pairing; an explicit
     ``recipe`` is respected as-is, ``None`` follows the weight recipe (fp8 / mxfp8 /
     mxfp4 / nvfp4 — mxfp4 weights default to mxfp4 activations, the all-fp4 W4A4
-    chain)."""
+    chain; unquantized BF16/FP16 weights carry no scales and stay ``None``, the
+    full-precision path)."""
     _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale)
     if is_mxfp4(gate_up_proj, gate_up_proj_scale) != is_mxfp4(
         down_proj, down_proj_scale
@@ -107,6 +108,8 @@ def _block_recipe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, 
         )
     if recipe is not None:
         return recipe
+    if gate_up_proj_scale is None:
+        return None
     if is_nvfp4(gate_up_proj, gate_up_proj_scale):
         return "nvfp4"
     if is_mxfp4(gate_up_proj, gate_up_proj_scale):
