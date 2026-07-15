@@ -16,11 +16,12 @@ from cutlass import Int64, Float32, const_expr
 from . import utils as utils
 from . import copy_utils as copy_utils
 from .compile_utils import make_fake_tensor as fake_tensor
+from .dsl import cute_op
 from .reduce import row_reduce, online_softmax_reduce
 from .reduction_base import ReductionBase
-from .cache_utils import jit_cache
+from .cache import jit_cache
 from .cute_dsl_utils import torch2cute_dtype_map
-from cutlass.base_dsl import Arch
+from cutlass.base_dsl.arch import Arch
 
 
 class Softmax(ReductionBase):
@@ -99,7 +100,7 @@ class Softmax(ReductionBase):
         bidx, _, _ = cute.arch.block_idx()
         cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
 
-        shape = mX.shape
+        shape = (cute.size(mX, mode=[0]), self.N)
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
         gX, gO, cX = [cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) for mT in (mX, mO, idX)]
@@ -175,23 +176,22 @@ class Softmax(ReductionBase):
         if tXcX[0][0] < shape[0]:
             copy(tXrO, tXgO)
 
+    @staticmethod
+    @jit_cache
+    def compile(dtype, out_dtype, N):
+        batch_sym = cute.sym_int()
+        div = math.gcd(128 // dtype.width, N)
+        x_cute, out_cute = [fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, out_dtype]]
+        return cute.compile(
+            Softmax(dtype, N),
+            x_cute,
+            out_cute,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
 
-@jit_cache
-def _compile_softmax_fwd(dtype, out_dtype, N):
-    batch_sym = cute.sym_int()
-    div = math.gcd(128 // dtype.width, N)
-    x_cute, out_cute = [fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, out_dtype]]
-    softmax_op = Softmax(dtype, N)
-    return cute.compile(
-        softmax_op,
-        x_cute,
-        out_cute,
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
-    )
 
-
-@torch.library.custom_op(add_op_namespace_prefix("_softmax_fwd"), mutates_args={"out"})
+@cute_op(add_op_namespace_prefix("_softmax_fwd"), mutates_args={"out"})
 def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
     """Softmax forward pass.
     Args:
@@ -200,28 +200,12 @@ def _softmax_fwd(x: torch.Tensor, out: torch.Tensor) -> None:
         Softmax output tensor of same shape as x
     """
     assert x.dim() == 2, "Input must be 2D"
-    assert x.is_cuda, "Tensor must be on CUDA device"
     assert x.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
+    if x.numel() == 0:
+        return
     N = x.size(1)
     dtype, out_dtype = [torch2cute_dtype_map[t.dtype] for t in [x, out]]
-    _compile_softmax_fwd(dtype, out_dtype, N)(x, out)
-
-
-@_softmax_fwd.register_fake
-def _softmax_fwd_fake(x: torch.Tensor, out: torch.Tensor) -> None:
-    # This register_fake serves two purposes:
-    # 1. torch.compile: When dynamo traces with symbolic shapes (SymInt), we must be a no-op.
-    #    Without register_fake, dynamo would trace the real impl which calls _compile_softmax_fwd
-    #    with a SymInt N — crashing @lru_cache since SymInt isn't hashable.
-    # 2. --compile-only mode: We enter FakeTensorMode with *concrete* shapes to pre-compile
-    #    kernels without GPU memory. Here we trigger both fwd and bwd compilation.
-    from .cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(x.size(1), torch.SymInt):
-        N = x.size(1)
-        dtype, out_dtype = [torch2cute_dtype_map[t.dtype] for t in [x, out]]
-        _compile_softmax_fwd(dtype, out_dtype, N)
-        _compile_softmax_backward(dtype, out_dtype, out_dtype, N)
+    Softmax.compile(dtype, out_dtype, N)(x, out)
 
 
 def softmax_fwd(x: torch.Tensor) -> torch.Tensor:
@@ -304,7 +288,7 @@ class SoftmaxBackward(ReductionBase):
         cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
         tv_layout = tiled_copy.layout_tv_tiled
 
-        shape = mdY.shape
+        shape = (cute.size(mdY, mode=[0]), self.N)
         idX = cute.make_identity_tensor(shape)
         # slice for CTAs
         gdY, gY, gdX, cX = [
@@ -369,26 +353,25 @@ class SoftmaxBackward(ReductionBase):
         if tXcX[0][0] < shape[0]:
             copy(tdXrdX, tdXgdX)
 
+    @staticmethod
+    @jit_cache
+    def compile(dtype, y_dtype, dx_dtype, N):
+        batch_sym = cute.sym_int()
+        div = math.gcd(128 // dtype.width, N)
+        dy_cute, y_cute, dx_cute = [
+            fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, y_dtype, dx_dtype]
+        ]
+        return cute.compile(
+            SoftmaxBackward(dtype, N),
+            dy_cute,
+            y_cute,
+            dx_cute,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
 
-@jit_cache
-def _compile_softmax_backward(dtype, y_dtype, dx_dtype, N):
-    batch_sym = cute.sym_int()
-    div = math.gcd(128 // dtype.width, N)
-    dy_cute, y_cute, dx_cute = [
-        fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, y_dtype, dx_dtype]
-    ]
-    softmax_backward_op = SoftmaxBackward(dtype, N)
-    return cute.compile(
-        softmax_backward_op,
-        dy_cute,
-        y_cute,
-        dx_cute,
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
-    )
 
-
-@torch.library.custom_op(add_op_namespace_prefix("_softmax_backward"), mutates_args={"dx"})
+@cute_op(add_op_namespace_prefix("_softmax_backward"), mutates_args={"dx"})
 def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> None:
     """Softmax backward pass.
     Args:
@@ -400,23 +383,13 @@ def _softmax_backward(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> No
     assert dy.dim() == 2, "dy must be 2D"
     assert y.dim() == 2, "y must be 2D"
     assert dy.shape == y.shape, "dy and y must have same shape"
-    assert dy.is_cuda and y.is_cuda, "Tensors must be on CUDA device"
     assert dy.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported dtype"
     assert y.dtype == dy.dtype, "dy and y must have same dtype"
+    if dy.numel() == 0:
+        return
     N = dy.size(1)
     dtype, y_dtype, dx_dtype = [torch2cute_dtype_map[t.dtype] for t in [dy, y, dx]]
-    _compile_softmax_backward(dtype, y_dtype, dx_dtype, N)(dy, y, dx)
-
-
-@_softmax_backward.register_fake
-def _softmax_backward_fake(dy: torch.Tensor, y: torch.Tensor, dx: torch.Tensor) -> None:
-    # See _softmax_fwd_fake for why register_fake is needed.
-    from .cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY and not isinstance(dy.size(1), torch.SymInt):
-        N = dy.size(1)
-        dtype, y_dtype, dx_dtype = [torch2cute_dtype_map[t.dtype] for t in [dy, y, dx]]
-        _compile_softmax_backward(dtype, y_dtype, dx_dtype, N)
+    SoftmaxBackward.compile(dtype, y_dtype, dx_dtype, N)(dy, y, dx)
 
 
 def softmax_bwd(dy: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

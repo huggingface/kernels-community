@@ -26,10 +26,14 @@ from .gemm_interface import (
 
 Activation = Literal[
     "gelu_tanh_approx",
+    "silu",
+    "silu-tanh",
     "relu",
     "relu_sq",
     "swiglu",
+    "swiglu-tanh",
     "swiglu_oai",
+    "swiglu_oai-tanh",
     "reglu",
     "geglu",
     "glu",
@@ -86,7 +90,7 @@ class _MLPGatedConcatUntunedOps(_MLPGatedUntunedOps):
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("B",))
     matmul_bwd_dw1 = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("out",))
     matmul_bwd_dw1_inplace = partial(
-        gemm_add_inplace, dynamic_scheduler=True, tuned=False, concat_layout=("out",)
+        gemm_add_inplace, dynamic_scheduler=True, tuned=False, concat_layout=("C", "out")
     )
     recompute_fwd = partial(gemm, tuned=False, concat_layout=("B",))
 
