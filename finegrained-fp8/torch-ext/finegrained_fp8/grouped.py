@@ -42,15 +42,14 @@ from .utils import (
     tl_dtype,
     fp8_act_quant_block_dynamic,
     fp8_act_quant_tensor_wide,
-    mxfp8_act_quant,
+    MX_ACT_QUANT,
     expert_weight_shape,
     mx_scale_family,
     normalize_per_expert_scale,
     validate_dense_operands,
     routed_rows,
     tokens_per_expert_bucket,
-    mxfp4_act_quant,
-    nvfp4_act_quant,
+    resolve_input_recipe,
     load_mx_act_tile,
     load_grouped_weight_tile,
     load_grouped_act_tile,
@@ -1226,33 +1225,13 @@ def mx_dynamic_matmul_grouped(
     )
 
     output_dtype = resolve_output_dtype(output_dtype, A, As)
-    if nvfp4:
-        # the MMA kind needs matching scale formats on both operands, so NVFP4 weights
-        # take NVFP4 activations only (and the fused requant has no NVFP4 arm yet)
-        assert input_recipe in (None, "nvfp4"), (
-            f"NVFP4 activations are packed E2M1 + E4M3 scales, got {input_recipe!r}"
-        )
-        assert output_recipe in (None, "nvfp4"), (
-            f"NVFP4 requantizes to 'nvfp4' (matching scale families), got {output_recipe!r}"
-        )
-    else:
-        assert input_recipe in (None, "mxfp8", "mxfp4"), (
-            f"MX activations are E4M3 ('mxfp8', the default) or packed E2M1 ('mxfp4'), "
-            f"got {input_recipe!r}"
-        )
-        assert output_recipe in (None, "mxfp8", "mxfp4"), (
-            f"MX recipes requantize to 'mxfp8' or packed 'mxfp4', got {output_recipe!r}"
-        )
+    input_recipe = resolve_input_recipe(input_recipe, output_recipe, Bs)
     requant = output_recipe is not None
-    # A raw (As is None) -> quantize here per the weights' recipe; else pre-quantized
+    # A raw (As is None) -> quantize here offline (this kernel has no inline arm — the
+    # per-N-tile quant would repeat N//BN times per element); else pre-quantized
     # (As given), and the tensor dtypes already say the format.
     if As is None:
-        if nvfp4:
-            A, As = nvfp4_act_quant(A)
-        elif input_recipe == "mxfp4":
-            A, As = mxfp4_act_quant(A)
-        else:
-            A, As = mxfp8_act_quant(A)
+        A, As = MX_ACT_QUANT[input_recipe](A)
     else:
         assert (As.dtype == torch.float8_e4m3fn) == nvfp4, (
             f"activation scales ({As.dtype}) must match the weight scale family ({Bs.dtype})"

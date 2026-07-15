@@ -45,9 +45,9 @@ from .utils import (
     is_mx,
     is_tensor_wide,
     maybe_act_quant,
-    mxfp8_act_quant,
+    MX_ACT_QUANT,
     mx_scale_family,
-    nvfp4_act_quant,
+    resolve_input_recipe,
     store_masked,
     store_masked_oriented,
     swizzle_offsets,
@@ -60,13 +60,15 @@ from .utils import (
 # a perf knob passed as the ``GROUP_SIZE_M`` constexpr, not a correctness parameter.
 GROUP_SIZE_M = 8
 
-# maybe_act_quant crossovers (min rows for offline pre-quant). MXFP: MEASURED — B200
+# maybe_act_quant crossovers (min rows for offline pre-quant). MX: MEASURED — B200
 # 2D-matmul sweep, graph-timed, H=6144 MXFP8 / H=4096 MXFP4: inline wins only at M=1
 # (33 vs 44us / 20 vs 30us), offline from M=16 for MXFP8 (22 vs 33us), 2-3x by M>=64
-# (MXFP4's M=16 cell marginally favors inline — outweighed). STATIC: inherited estimate,
-# not swept — its inline arm is cheaper elementwise work, so the true crossover is at or
-# above the MXFP one; the M=1 decode case (the one that matters) is inline either way.
-MXFP8_MATMUL_ACT_PREQUANT_MIN_M = 16
+# (MXFP4's M=16 cell marginally favors inline — outweighed); NVFP4 inherits the
+# family gate (not swept — same pack/amax structure as MXFP4). STATIC: inherited
+# estimate, not swept — its inline arm is cheaper elementwise work, so the true
+# crossover is at or above the MX one; the M=1 decode case (the one that matters) is
+# inline either way.
+MX_MATMUL_ACT_PREQUANT_MIN_M = 16
 STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
 # Block-dynamic has NO gate: offline wins at EVERY M incl. M=1 (24.7 vs 31.0us, isolated
 # arm A/B, graph-timed, H=6144 b128) — the inline arm pays a per-tile fp32 amax+div. The
@@ -397,7 +399,10 @@ def w8a8_block_static_fp8_matmul_kernel(
     # m_bit_length (log2 M bucket) keys the M tile — the winner keeps shifting with M well past the
     # BM ceiling and it is NOT noise: cross-applying configs (N=K=4096) costs +62% at M=128 and +245%
     # at M=4096 (the thin M=128 tile can't saturate the wide GEMM), so don't collapse the buckets.
-    ["N", "K", "m_bit_length"],
+    # INPUT_RECIPE keys the inline act-quant grid: A stays raw bf16 under every
+    # recipe below the pre-quant M threshold, so the dtype-appended key can't
+    # split W4A8 from W4A4 itself.
+    ["N", "K", "m_bit_length", "INPUT_RECIPE"],
     n_trials=100,
     # BK-within-K veto (the loop loads are unmasked) + the sm_10x dot_scaled shape guards
     # + scalar restricted to decode-sized M (a BM=1 GEVM at prefill is TPE poison).
@@ -438,6 +443,7 @@ def mx_dynamic_matmul_kernel(
     GROUP_SIZE_M: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
+    INPUT_RECIPE: tl.constexpr = "mxfp8",
 ):
     """Unified MXFP4/MXFP8 (W4A8/W8A8; a ``uint8`` ``A`` is packed E2M1 — W4A4) GEMM.
 
@@ -455,8 +461,7 @@ def mx_dynamic_matmul_kernel(
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
     )
-    # uint8 A = packed-E2M1 activations (W4A4 — the dtype IS the activation format);
-    # the 2D op currently always passes raw/E4M3, so this folds to 1 there.
+    # uint8 A = packed-E2M1 activations (W4A4 — the dtype IS the activation format)
     ACT_VALUES_PER_BYTE: tl.constexpr = 2 if A.dtype.element_ty == tl.uint8 else 1
     WEIGHT_VALUES_PER_BYTE: tl.constexpr = 2 if B.dtype.element_ty == tl.uint8 else 1
     offs_ka = tl.arange(0, BLOCK_SIZE_K // ACT_VALUES_PER_BYTE)
@@ -470,7 +475,17 @@ def mx_dynamic_matmul_kernel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a, a_scale = load_mx_act_tile(
-            a_ptrs, as_ptrs, None, 0, 0, 0, 0, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
+            a_ptrs,
+            as_ptrs,
+            None,
+            0,
+            0,
+            0,
+            0,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_K,
+            SCALE_GROUP_K,
+            RECIPE=INPUT_RECIPE,
         )
         b = tl.load(b_ptrs)
         b_s = tl.load(bs_ptrs)
@@ -765,15 +780,17 @@ def mx_dynamic_matmul(
     B: torch.Tensor,
     Bs: torch.Tensor,
     output_dtype: torch.dtype | None = None,
+    input_recipe: str | None = None,
 ) -> torch.Tensor:
-    """MX/NVFP4 matmul ``C = A @ B.T``; MX activations quantized offline above the
-    ``maybe_act_quant`` M threshold, inline below it; NVFP4 always offline (the inline
-    arm is UE8M0-typed). Weight format detected from ``B.dtype``: ``int8`` → packed E2M1
-    (``B`` is ``(N, K//2)``); ``float8_e4m3fn`` → unpacked E4M3. The scale dtype carries
-    the recipe: UE8M0 = MX group-32, E4M3 = NVFP4 group-16 (``Bs`` is
-    ``(N, K//group)``); tile + dot path are autotuned.
+    """MX/NVFP4 matmul ``C = A @ B.T``; activations quantized offline above the
+    ``maybe_act_quant`` M threshold, inline below it. ``input_recipe`` sets the
+    activation grid — E4M3 (``"mxfp8"``, the default) or packed E2M1 (``"mxfp4"``,
+    W4A4); NVFP4 weights (E4M3 scales) pin ``"nvfp4"``. Weight format detected from
+    ``B.dtype``: ``int8`` → packed E2M1 (``B`` is ``(N, K//2)``); ``float8_e4m3fn`` →
+    unpacked E4M3. The scale dtype carries the family: UE8M0 = MX group-32, E4M3 =
+    NVFP4 group-16 (``Bs`` is ``(N, K//group)``); tile + dot path are autotuned.
 
-    A:  (..., K) raw activations, bf16/fp16/fp32 (quantized per the weight recipe);
+    A:  (..., K) raw activations, bf16/fp16/fp32;
         leading dims are flattened to (M, K) and restored on the output
     """
     assert B.ndim == 2 and Bs.ndim == 2
@@ -797,13 +814,12 @@ def mx_dynamic_matmul(
 
     B = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
-    if nvfp4:
-        A_q, A_s = nvfp4_act_quant(A.view(M, K))
-        A_q = A_q.view(torch.uint8)
-    else:
-        A_q, A_s = maybe_act_quant(
-            A.view(M, K), mxfp8_act_quant, MXFP8_MATMUL_ACT_PREQUANT_MIN_M
-        )
+    # the kernel quantizes raw A inline on this grid (fp4 recipes pack in-register)
+    input_recipe = resolve_input_recipe(input_recipe, None, Bs)
+    A_q, A_s = maybe_act_quant(
+        A.view(M, K), MX_ACT_QUANT[input_recipe], MX_MATMUL_ACT_PREQUANT_MIN_M
+    )
+    A_q = e2m1_as_uint8(A_q)
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
 
     def grid(META):
@@ -836,6 +852,7 @@ def mx_dynamic_matmul(
             C.stride(-1),
             GROUP_SIZE_M=GROUP_SIZE_M,
             SCALE_GROUP_K=scale_group,
+            INPUT_RECIPE=input_recipe,
         )
     return C
 
@@ -847,8 +864,9 @@ def matmul_2d(
     block_size: list[int] | None,
     output_dtype: torch.dtype | None = None,
     activation_scale: torch.Tensor | None = None,
+    input_recipe: str | None = None,
 ) -> torch.Tensor:
-    """Quantized matmul dispatcher (W8A8 FP8 or W4A8 FP4).
+    """Quantized matmul dispatcher (W8A8 FP8, W4A8 or W4A4 FP4).
 
     ``A`` is always raw bf16/fp16/fp32; quantization is fused into every path.
     With ``activation_scale`` set, the kernel uses that per-tensor scalar
@@ -860,7 +878,8 @@ def matmul_2d(
     - MX/NVFP4 weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
       group-32 or E4M3 group-16 ``Bs`` (shape ``[N, K//group]``) → ``mx_dynamic_matmul``
       (``block_size`` ignored, ``activation_scale`` unsupported; the group is autotuned-
-      around, fixed by the scale dtype).
+      around, fixed by the scale dtype). ``input_recipe`` sets the activation grid
+      (``"mxfp8"`` default, ``"mxfp4"`` = W4A4; NVFP4 weights pin ``"nvfp4"``).
     - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_dynamic_fp8_matmul``.
     - otherwise → ``w8a8_block_dynamic_fp8_matmul`` (or its static variant when
       ``activation_scale`` is given).
@@ -871,7 +890,10 @@ def matmul_2d(
                 "activation_scale (static activation quant) is not supported for MX weights — "
                 "the MX path quantizes activations dynamically per group. Omit activation_scale."
             )
-        return mx_dynamic_matmul(A, B, Bs, output_dtype)
+        return mx_dynamic_matmul(A, B, Bs, output_dtype, input_recipe)
+    assert input_recipe is None, (
+        f"input_recipe applies to MX/NVFP4 weights only, got {input_recipe!r}"
+    )
 
     if is_tensor_wide(block_size, B):
         return w8a8_tensor_dynamic_fp8_matmul(A, B, Bs, output_dtype)

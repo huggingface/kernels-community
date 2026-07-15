@@ -24,14 +24,13 @@ from .utils import (
     compile_time_only_triton_wrap,
     Epilogue,
     Quantization,
-    mxfp4_act_quant,
-    nvfp4_act_quant,
     FP8_DTYPE,
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
     decode_group_scale,
     device_context,
     tl_dtype,
+    resolve_input_recipe,
     resolve_output_dtype,
     mx_compute,
     oriented_tile_ptrs,
@@ -400,7 +399,9 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
         compute_modes=("dot_scaled", "scalar"),
         swap_ab=True,
     ),
-    ["N", "K", "S"],
+    # INPUT_RECIPE keys the inline act-quant grid: A stays raw bf16 under every
+    # recipe, so the tuner's dtype-appended key can't split W4A8 from W4A4 itself.
+    ["N", "K", "S", "INPUT_RECIPE"],
     n_trials=100,
     # BK-within-K + the sm_10x MMA-shape guards (swapped dot_scaled needs BN >= 128 for the
     # native scaled-MMA; smaller-BN swap configs never win and mislead the TPE).
@@ -458,8 +459,10 @@ def mx_dynamic_matmul_batched_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     # PRE_QUANTIZED: A is E4M3 + As UE8M0 (the down reading a requantized intermediate); else
-    # A is raw and quantized inline (gate_up / plain, decode-free UE8M0).
+    # A is raw and quantized inline onto INPUT_RECIPE's grid (gate_up / plain — packed
+    # E2M1 under the fp4 recipes, one act row per program so the quant is decode-free).
     PRE_QUANTIZED: tl.constexpr = False,
+    INPUT_RECIPE: tl.constexpr = "mxfp8",
 ):
     """Unified batched microscaled expert matmul (MXFP8/MXFP4/NVFP4, W4A8/W4A4) with
     fused act quant.
@@ -531,7 +534,7 @@ def mx_dynamic_matmul_batched_kernel(
         else:
             a_raw = tl.load(a_ptrs).to(tl.float32)
             a, a_scale = mx_act_quant_inline(
-                a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
+                a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, INPUT_RECIPE
             )
         b = stacked_gate_up_flatten(
             tl.load(b_ptrs),
@@ -965,28 +968,10 @@ def mx_dynamic_matmul_batched(
     # (As given, e.g. the down reading a requantized intermediate) -> loaded via the kernel's
     # PRE_QUANTIZED branch.
     nvfp4 = Bs.dtype == torch.float8_e4m3fn
-    if nvfp4:
-        # decode grid BM <= 16 < the native mxf4nvf4 M=128 staging, so NVFP4 batched runs
-        # on the software arms (scalar / swap-scalar column-unpack + E4M3 scale decode)
-        assert input_recipe in (None, "nvfp4"), (
-            f"NVFP4 activations are packed E2M1 + E4M3 scales, got {input_recipe!r}"
-        )
-        assert output_recipe in (None, "nvfp4"), (
-            f"NVFP4 requantizes to 'nvfp4' (matching scale families), got {output_recipe!r}"
-        )
-        if As is None:  # no inline NVFP4 quant arm — pack offline
-            A, As = nvfp4_act_quant(A)
-    else:
-        assert input_recipe in (None, "mxfp8", "mxfp4"), (
-            f"MX activations are E4M3 ('mxfp8', the default) or packed E2M1 ('mxfp4'), "
-            f"got {input_recipe!r}"
-        )
-        assert output_recipe in (None, "mxfp8", "mxfp4"), (
-            f"MX recipes requantize to 'mxfp8' or packed 'mxfp4', got {output_recipe!r}"
-        )
-        # 'mxfp4' packs raw input to E2M1 offline — there is no inline fp4 quant arm.
-        if input_recipe == "mxfp4" and As is None:
-            A, As = mxfp4_act_quant(A)
+    # the kernel quantizes raw A inline on this grid (fp4 recipes pack in-register);
+    # NVFP4 batched runs on the software arms — decode grid BM <= 16 < the native
+    # mxf4nvf4 M=128 staging (scalar / swap-scalar column-unpack + E4M3 scale decode)
+    input_recipe = resolve_input_recipe(input_recipe, output_recipe, Bs)
     requant = output_recipe is not None
     if As is not None:
         assert (As.dtype == torch.float8_e4m3fn) == nvfp4, (
@@ -1076,6 +1061,7 @@ def mx_dynamic_matmul_batched(
             SCALE_GROUP_K=scale_group,
             num_experts=num_experts,
             PRE_QUANTIZED=pre_quantized,
+            INPUT_RECIPE=input_recipe,
             HAS_GATHER=gather_idx is not None,
             HAS_SCATTER=scatter_idx is not None,
             GATE=gate,

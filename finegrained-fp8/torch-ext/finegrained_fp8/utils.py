@@ -270,6 +270,21 @@ def e2m1_as_uint8(weight: torch.Tensor) -> torch.Tensor:
 UE8M0_SCALE_DTYPES = (torch.float8_e8m0fnu, torch.uint8)
 
 
+def _shapes_match(weight: torch.Tensor, scale: torch.Tensor, group: int) -> bool:
+    """Shape leg of the family predicates: matching leading dims and a last dim of
+    one scale per ``group`` unpacked values. Early-return ``if``s, not an ``and``
+    chain: callers compare predicate results (``is_x(gate) != is_x(down)``), and an
+    ``and`` chain hands them a lazy SymBool under dynamo — the resulting nested
+    symbolic Eq crashes ``evaluate_expr``. Control flow forces each comparison to a
+    real bool (weight shapes are static parameters, so the guards are correct)."""
+    packed = NIBBLES_PER_BYTE if weight.dtype == torch.int8 else 1
+    if scale.shape[:-1] != weight.shape[:-1]:
+        return False
+    if scale.shape[-1] != (weight.shape[-1] * packed) // group:
+        return False
+    return True
+
+
 def is_mxfp8(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     """MXFP8 weight/scale pair: E4M3 weights with UE8M0 group-32 scales — last dim
     ``scale.shape[-1] == weight.shape[-1] // MX_SCALE_GROUP_K``, matching leading dims.
@@ -278,9 +293,7 @@ def is_mxfp8(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     return (
         weight.dtype == torch.float8_e4m3fn
         and scale.dtype in UE8M0_SCALE_DTYPES
-        and scale.ndim == weight.ndim
-        and scale.shape[:-1] == weight.shape[:-1]
-        and scale.shape[-1] == weight.shape[-1] // MX_SCALE_GROUP_K
+        and _shapes_match(weight, scale, MX_SCALE_GROUP_K)
     )
 
 
@@ -291,9 +304,7 @@ def is_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     return (
         weight.dtype == torch.int8
         and scale.dtype in UE8M0_SCALE_DTYPES
-        and scale.ndim == weight.ndim
-        and scale.shape[:-1] == weight.shape[:-1]
-        and scale.shape[-1] == (weight.shape[-1] * NIBBLES_PER_BYTE) // MX_SCALE_GROUP_K
+        and _shapes_match(weight, scale, MX_SCALE_GROUP_K)
     )
 
 
@@ -304,10 +315,7 @@ def is_nvfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     return (
         weight.dtype == torch.int8
         and scale.dtype == torch.float8_e4m3fn
-        and scale.ndim == weight.ndim
-        and scale.shape[:-1] == weight.shape[:-1]
-        and scale.shape[-1]
-        == (weight.shape[-1] * NIBBLES_PER_BYTE) // NVFP4_SCALE_GROUP_K
+        and _shapes_match(weight, scale, NVFP4_SCALE_GROUP_K)
     )
 
 
@@ -837,11 +845,12 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None):
       miscompiles wider scaled MMAs into a sticky illegal-address device trap that poisons
       the context mid-autotune.
 
-    Packed-E2M1 activations (a ``uint8`` activation tensor, W4A4) keep only no-swap
-    ``dot_scaled`` configs on every arch — the dot/scalar arms and the swapped rhs builder
-    consume decoded/E4M3 activations, so the other arms are structurally inapplicable
-    (the native ``kind::mxf4`` W4A4 MMA was probed bit-exact: BK down to 64, single-trip,
-    and BN=256 all clean; BM<128 falls back to the correct-but-slow f16 kind).
+    Packed-E2M1 activations (a ``uint8`` activation tile, W4A4 — caller-packed or
+    quantized inline from a raw tile) are consumed by EVERY arm: dot_scaled natively
+    (the ``kind::mxf4`` MMA was probed bit-exact: BK down to 64, single-trip, and
+    BN=256 all clean; BM<128 falls back to the correct-but-slow f16 kind), and the
+    dot/scalar/swap arms column-unpack them to E4M3 (lossless) first — no arm is
+    structurally packed-incompatible, so W4A4 needs no shape gate of its own.
 
     The shape gates above are scoped to ``dot_scaled`` — they are native scaled-MMA bug
     gates. The ``dot`` arm (BK structurally the UE8M0 group, 32) is CORRECT everywhere
@@ -858,15 +867,29 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None):
     fallbacks cover the pathological cases). A contraction dim smaller than every grid BK is
     a hard error: any config would over-read past the row and return silently wrong results."""
 
+    def scaled_mma_available(args):
+        # dot_scaled rows exist for this launch iff the grid's smallest BK (64)
+        # divides the contraction dim with at least two trips; off the 64 grid no
+        # row survives the shape gates, so the software arms are the only correct
+        # ones and their poison fences lift.
+        return args[k_arg] % 64 == 0 and args[k_arg] > 64
+
     def mma_shape_ok(c, args):
         if c.kwargs.get("COMPUTE_MODE") != "dot_scaled":
             return True
-        # dot_scaled BK < 128 performs MISALIGNED accesses (verified: every isolated
-        # BK=64 launch prints the cudaErrorMisalignedAddress signature; BK>=128 never
-        # does). The UB is intermittently fatal — two long tuning runs died with the
-        # sticky CUDA 716 context corruption while isolated launches survive — so the
-        # rows can't even be benched safely.
-        if c.kwargs["BLOCK_SIZE_K"] < 128:
+        # Swapped dot_scaled below BK=128 is a Triton sm_10x lowering bug — a STICKY
+        # misaligned-address device trap. Probed per-arm 2026-07-15 (fresh processes):
+        # batched W4A4 swap BK=64 traps at K=2880 AND K=2944 alike (K-alignment is NOT
+        # the variable), swap BK=128 runs clean and correct, no-swap BK=64 is
+        # compute-sanitizer-clean, and the grouped kernel (no swap axis) is clean at
+        # BK=64 in every memory mode. All probing on B200 — re-chart on H100 or the
+        # target device before trusting the fence there.
+        if c.kwargs.get("SWAP_AB") and c.kwargs["BLOCK_SIZE_K"] < 128:
+            return False
+        # No-swap BK<128 rows are CORRECT but admitted only where BK=128 can't divide
+        # the contraction dim (e.g. gpt-oss K=2880): elsewhere the BK>=128 basin owns
+        # the shape and the extra rows only dilute the TPE's trial budget.
+        if c.kwargs["BLOCK_SIZE_K"] < 128 and args[k_arg] % 128 == 0:
             return False
         # Single-trip dot_scaled (BK >= contraction dim) trips the sm_10x
         # accumulator-init miscompile (uninitialized TMEM alloc must be mutable).
@@ -909,10 +932,13 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None):
         config_filter(
             fp4_scalar_ok,
             when=lambda args: is_sm10x()
+            and scaled_mma_available(args)
             and getattr(args.get("B"), "dtype", None) == torch.uint8
             and not scales_are_e4m3(args),
         ),
-        config_filter(dot_arm_ok, when=lambda args: is_sm10x()),
+        config_filter(
+            dot_arm_ok, when=lambda args: is_sm10x() and scaled_mma_available(args)
+        ),
         config_filter(mma_shape_ok, when=lambda args: is_sm10x()),
     )
 
@@ -1234,15 +1260,17 @@ def load_mx_act_tile(
     SCALE_GROUP_K: tl.constexpr,
     A_MEMORY_MODE: tl.constexpr = "pointer",
     A_GATHER: tl.constexpr = False,
+    RECIPE: tl.constexpr = "mxfp8",
 ):
-    """Load one MX activation K-tile as ``(a_vals, a_scale_u8)`` — the arm is picked
+    """Load one MX activation K-tile as ``(a_vals, a_scale)`` — the arm is picked
     off the pointer dtype at compile time: fp8 pointers load pre-quantized E4M3 values +
     UE8M0 scales (``maybe_act_quant``'s offline arm), uint8 pointers load caller-provided
     packed-E2M1 values (W4A4 — the ``a_ptrs`` tile spans ``BLOCK_SIZE_K // 2`` bytes) +
-    the same UE8M0 scales, raw bf16/fp16 pointers load and quantize inline (``as_ptrs``
-    then points at a dead placeholder and is never read). ``row_mask`` may be ``None``
-    (unmasked tiles, e.g. the %-wrapped 2D matmul). Callers advance both pointers
-    unconditionally."""
+    the same UE8M0 scales, raw bf16/fp16 pointers load and quantize inline onto
+    ``RECIPE``'s grid (``mx_act_quant_inline`` — packed E2M1 under the fp4 recipes;
+    ``as_ptrs`` then points at a dead placeholder and is never read). ``row_mask`` may be
+    ``None`` (unmasked tiles, e.g. the %-wrapped 2D matmul). Callers advance both
+    pointers unconditionally."""
     if a_ptrs.dtype.element_ty == tl.float8e4nv or a_ptrs.dtype.element_ty == tl.uint8:
         # pre-quantized (E4M3 offline, or packed E2M1 handed in by the caller); under the
         # descriptor arm the [BM, BK_bytes] box loads the tile's contiguous sorted rows
@@ -1276,7 +1304,7 @@ def load_mx_act_tile(
         else:
             a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
         a, a_scale = mx_act_quant_inline(
-            a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
+            a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, RECIPE
         )
     return a, a_scale
 
@@ -1831,6 +1859,34 @@ class Quantization:
         ops' bundles are ordered ``(*Epilogue.as_args(), *Quantization.as_args(),
         output_dtype)``."""
         return (self.input_recipe, self.output_recipe)
+
+
+def resolve_input_recipe(
+    input_recipe: str | None, output_recipe: str | None, Bs: torch.Tensor
+) -> str:
+    """GEMM-level activation recipe, keyed off the weight scales' dtype: NVFP4 weights
+    (E4M3 scales) pin the whole family to ``"nvfp4"`` (the MMA kind needs matching
+    scale formats on both operands); MX weights take E4M3 activations (``"mxfp8"``,
+    the default) or packed E2M1 (``"mxfp4"``, W4A4). Validates both recipe names
+    against the weight scale family. The MoE-level weight-following default (mxfp4
+    weights -> mxfp4 acts) lives in ``moe._block_recipe``; the GEMM wrappers stay
+    conservative."""
+    if Bs.dtype == torch.float8_e4m3fn:
+        assert input_recipe in (None, "nvfp4"), (
+            f"NVFP4 activations are packed E2M1 + E4M3 scales, got {input_recipe!r}"
+        )
+        assert output_recipe in (None, "nvfp4"), (
+            f"NVFP4 requantizes to 'nvfp4' (matching scale families), got {output_recipe!r}"
+        )
+        return "nvfp4"
+    assert input_recipe in (None, "mxfp8", "mxfp4"), (
+        f"MX activations are E4M3 ('mxfp8', the default) or packed E2M1 ('mxfp4'), "
+        f"got {input_recipe!r}"
+    )
+    assert output_recipe in (None, "mxfp8", "mxfp4"), (
+        f"MX recipes requantize to 'mxfp8' or packed 'mxfp4', got {output_recipe!r}"
+    )
+    return input_recipe or "mxfp8"
 
 
 def resolve_output_dtype(
@@ -2633,6 +2689,14 @@ def nvfp4_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     E4M3, NOT a power of two; values divide by the DECODED scale before the E2M1 grid,
     the standard two-step). The per-tensor second-level scale is the caller's to fold."""
     return _launch_act_quant(x, "nvfp4", NVFP4_SCALE_GROUP_K, torch.float8_e4m3fn)
+
+
+# offline act-quant pass per recipe (keys = ``resolve_input_recipe`` results)
+MX_ACT_QUANT = {
+    "mxfp8": mxfp8_act_quant,
+    "mxfp4": mxfp4_act_quant,
+    "nvfp4": nvfp4_act_quant,
+}
 
 
 def _launch_act_quant(x, recipe, scale_group, scale_dtype):
