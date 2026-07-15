@@ -301,19 +301,33 @@ def test_op_scenarios(problem: Problem, layout):
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
-@pytest.mark.parametrize("weights", ["fp8_128x128", "mxfp8", "mxfp4", "nvfp4"], ids=str)
-def test_matmul_2d_vs_torch(weights):
+@pytest.mark.parametrize("m_rows", [1, 64], ids=["M1_inline", "M64_offline"])
+@pytest.mark.parametrize(
+    "weights,input_recipe",
+    [
+        ("fp8_128x128", None),
+        ("mxfp8", None),
+        ("mxfp4", None),  # W4A8, the MX default
+        ("mxfp4", "mxfp4"),  # W4A4 (packed acts)
+        ("nvfp4", None),
+    ],
+    ids=lambda v: str(v),
+)
+def test_matmul_2d_vs_torch(weights, input_recipe, m_rows):
     """matmul_2d against the pure-torch dequant oracle — it used to be the reference for
     the routed tests, so it gets its own independent check (nothing kernel-side in the
-    oracle)."""
+    oracle). ``m_rows`` spans the ``maybe_act_quant`` gate: M=1 runs the in-kernel
+    inline quant arm, M=64 the offline pre-quant pass (bit-exact pair by construction);
+    ``input_recipe`` spans the activation grids per weight family."""
     torch.manual_seed(0)
-    M, N, K = 64, 128, 256
+    M, N, K = m_rows, 128, 256
     row = WEIGHTS[weights]
     B, Bs = row["make"](N, K, 1)
     A = torch.randn(M, K, device=TEST_DEVICE, dtype=torch.bfloat16)
     block_size = [128, 128] if weights == "fp8_128x128" else None
-    out = finegrained_fp8.matmul_2d(A, B[0], Bs[0], block_size)
-    quant = row["act_quant"][None]
+    out = finegrained_fp8.matmul_2d(A, B[0], Bs[0], block_size,
+                                    input_recipe=input_recipe)
+    quant = row["act_quant"][input_recipe]
     Aq, As = (
         quant(A) if weights != "fp8_128x128" else fp8_act_quant_block_dynamic(A, 128)
     )

@@ -152,7 +152,8 @@ def moe_fused_grouped(
     # intermediate (the op quantizes the raw hidden itself). Gather hidden by routed row
     # (gather_idx); leave the output expert-ordered (scatter_idx=None — the down
     # projection reads it in place, no scatter between the two GEMMs).
-    inter, inter_scale = matmul_grouped(
+    # (C, Cs) under a requant recipe; a bare Tensor on the full-precision path
+    gate_up_out = matmul_grouped(
         hidden_states,
         gate_up_proj,
         Bs=gate_up_proj_scale_inv,
@@ -167,6 +168,9 @@ def moe_fused_grouped(
         quantization=Quantization(input_recipe=recipe, output_recipe=recipe),
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
+    )
+    inter, inter_scale = (
+        gate_up_out if isinstance(gate_up_out, tuple) else (gate_up_out, None)
     )
     # Phase 2: grouped down over the expert-ordered pre-quantized intermediate (its dtypes
     # carry the recipe; gather_idx=None), scattering to routed rows (scatter_idx).
@@ -222,7 +226,8 @@ def moe_fused_batched(
     # Phase 1: gate_up + SiLU + requant in the block recipe -> per-row quantized
     # intermediate (the op quantizes the raw activations). gather_idx reads each routed
     # row from the unexpanded hidden in-kernel (no copy).
-    inter, inter_scale = matmul_batched(
+    # (C, Cs) under a requant recipe; a bare Tensor on the full-precision path
+    gate_up_out = matmul_batched(
         hidden_states,
         gate_up_proj,
         Bs=gate_up_proj_scale_inv,
@@ -237,6 +242,9 @@ def moe_fused_batched(
         quantization=Quantization(input_recipe=recipe, output_recipe=recipe),
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
+    )
+    inter, inter_scale = (
+        gate_up_out if isinstance(gate_up_out, tuple) else (gate_up_out, None)
     )
     # Phase 2: batched down over the pre-quantized intermediate (its dtypes carry the
     # recipe; already routed-order, no gather).

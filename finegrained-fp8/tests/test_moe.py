@@ -89,6 +89,13 @@ MOE_PROBLEMS = [
     MoEProblem(weights="fp8_128x128", num_tokens=1),
     MoEProblem(weights="fp8_128x128"),
     MoEProblem(weights="nvfp4"),
+    # ── full precision: scale-less BF16 weights resolve to recipe None and the fused
+    # gate_up hands the down a bare (unscaled) intermediate ──
+    MoEProblem(weights="bf16", num_tokens=1),
+    MoEProblem(weights="bf16"),
+    # ── contraction dims on the 64 grid but off the 128 grid (gpt-oss H=I=2880): only
+    # BK=64 divides, so the W4A4 chain runs the no-swap BK=64 dot_scaled rows ──
+    MoEProblem(weights="mxfp4", hidden_dim=320, intermediate_dim=320),
     # ── explicit recipe forwarding: W4A8 chain on mxfp4 weights (default is W4A4) ──
     MoEProblem(weights="mxfp4", recipe="mxfp8"),
     # ── clamped/scaled SwiGLU (GPT-OSS / MiniMax-M3); glu is recipe-independent ──
@@ -209,3 +216,29 @@ def test_fused_grouped(problem):
     reduce) via ``moe_fused_grouped`` vs the same unfused reference, with
     ``simulate_unfused`` rounding each fused step through the activation dtype."""
     _run_pair(problem, moe.moe_fused_grouped, moe.moe_unfused_grouped)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+def test_fused_batched_compiles_across_shapes():
+    """TWO different mxfp4 problems through ONE compiled function with no compiler
+    reset in between: the recompile marks the weight shapes automatic-dynamic, and the
+    family predicates must still return real bools — a lazy SymBool reaching
+    ``is_x(gate) != is_x(down)`` builds a nested symbolic Eq that crashes dynamo's
+    ``evaluate_expr`` (the gpt-oss compile failure). ``fullgraph`` so any graph break
+    fails loud; the shape pair keeps both contraction dims on different grids."""
+    torch.compiler.reset()
+    compiled = torch.compile(moe.moe_fused_batched, fullgraph=True)
+    for problem in (
+        MoEProblem(weights="mxfp4", num_tokens=1),
+        MoEProblem(
+            weights="mxfp4", num_tokens=1, hidden_dim=320, intermediate_dim=320
+        ),
+    ):
+        torch.manual_seed(0)
+        gate_up, gate_up_s, down, down_s = _make_moe_weights(problem)
+        hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
+        out = compiled(
+            hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s
+        )
+        assert torch.isfinite(out.float()).all(), problem.id
