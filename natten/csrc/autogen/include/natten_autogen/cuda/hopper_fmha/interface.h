@@ -22,10 +22,10 @@ namespace cuda {
 namespace fmha_hopper { 
 #define DISPATCH_HOPPER_FMHA_FORWARD(dtype, dim, q_tile_size, kv_tile_size, kernel_type, ...) \
   [&] { \
-    if (dtype == torch::kFloat16) { \
+    if (dtype == at::kHalf) { \
       DISPATCH_HOPPER_FMHA_FORWARD_float16(dim, q_tile_size, kv_tile_size, kernel_type, __VA_ARGS__); \
     } \
-    else if (dtype == torch::kBFloat16) { \
+    else if (dtype == at::kBFloat16) { \
       DISPATCH_HOPPER_FMHA_FORWARD_bfloat16(dim, q_tile_size, kv_tile_size, kernel_type, __VA_ARGS__); \
     } \
     else { \

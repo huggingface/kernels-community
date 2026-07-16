@@ -21,10 +21,10 @@ namespace cuda {
 namespace fna_hopper { 
 #define DISPATCH_HOPPER_FNA_BACKWARD_1D(dtype, dim, is_causal, q_tile_shape, kv_tile_shape, ...) \
   [&] { \
-    if (dtype == torch::kFloat16) { \
+    if (dtype == at::kHalf) { \
       DISPATCH_HOPPER_FNA_BACKWARD_1D_float16(dim, is_causal, q_tile_shape, kv_tile_shape, __VA_ARGS__); \
     } \
-    else if (dtype == torch::kBFloat16) { \
+    else if (dtype == at::kBFloat16) { \
       DISPATCH_HOPPER_FNA_BACKWARD_1D_bfloat16(dim, is_causal, q_tile_shape, kv_tile_shape, __VA_ARGS__); \
     } \
     else { \
@@ -34,10 +34,10 @@ namespace fna_hopper {
 
 #define DISPATCH_HOPPER_FNA_BACKWARD_2D(dtype, dim, is_causal, q_tile_shape, kv_tile_shape, ...) \
   [&] { \
-    if (dtype == torch::kFloat16) { \
+    if (dtype == at::kHalf) { \
       DISPATCH_HOPPER_FNA_BACKWARD_2D_float16(dim, is_causal, q_tile_shape, kv_tile_shape, __VA_ARGS__); \
     } \
-    else if (dtype == torch::kBFloat16) { \
+    else if (dtype == at::kBFloat16) { \
       DISPATCH_HOPPER_FNA_BACKWARD_2D_bfloat16(dim, is_causal, q_tile_shape, kv_tile_shape, __VA_ARGS__); \
     } \
     else { \
@@ -47,10 +47,10 @@ namespace fna_hopper {
 
 #define DISPATCH_HOPPER_FNA_BACKWARD_3D(dtype, dim, is_causal, q_tile_shape, kv_tile_shape, ...) \
   [&] { \
-    if (dtype == torch::kFloat16) { \
+    if (dtype == at::kHalf) { \
       DISPATCH_HOPPER_FNA_BACKWARD_3D_float16(dim, is_causal, q_tile_shape, kv_tile_shape, __VA_ARGS__); \
     } \
-    else if (dtype == torch::kBFloat16) { \
+    else if (dtype == at::kBFloat16) { \
       DISPATCH_HOPPER_FNA_BACKWARD_3D_bfloat16(dim, is_causal, q_tile_shape, kv_tile_shape, __VA_ARGS__); \
     } \
     else { \

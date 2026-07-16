@@ -316,7 +316,7 @@ void CheckLogSumExp(const at::Tensor& output, const at::Tensor& logsumexp) {
   // Logsumexp: [batch, *, heads]
   static_assert(NaDim >= 1 && NaDim < 4);
   TORCH_CHECK(
-      logsumexp.scalar_type() == torch::kFloat,
+      logsumexp.scalar_type() == at::kFloat,
       "`logsumexp` must be stored in float32 data type, got ",
       logsumexp.scalar_type());
   TORCH_CHECK(
@@ -357,7 +357,7 @@ inline void CheckLogSumExpHeadsFirst(
   // Output: [batch, seqlen, heads, dim]
   // Logsumexp: [batch, heads, seqlen]
   TORCH_CHECK(
-      logsumexp.scalar_type() == torch::kFloat,
+      logsumexp.scalar_type() == at::kFloat,
       "`logsumexp` must be stored in float32 data type, got ",
       logsumexp.scalar_type());
   TORCH_CHECK(
@@ -416,9 +416,9 @@ inline void AssertDimsAre128BitAligned(
       ".");
 
   TORCH_CHECK(
-      query.scalar_type() == torch::kFloat ||
-          query.scalar_type() == torch::kFloat16 ||
-          query.scalar_type() == torch::kBFloat16 ||
+      query.scalar_type() == at::kFloat ||
+          query.scalar_type() == at::kHalf ||
+          query.scalar_type() == at::kBFloat16 ||
           query.scalar_type() == c10::ScalarType::Float8_e4m3fn ||
           query.scalar_type() == c10::ScalarType::Float8_e5m2,
       "This NATTEN operation only supports FP32, FP16, BF16, and FP8 data types, got ",
@@ -426,11 +426,11 @@ inline void AssertDimsAre128BitAligned(
       ".");
 
   int alignment;
-  if (query.scalar_type() == torch::kFloat) {
+  if (query.scalar_type() == at::kFloat) {
     alignment = 4;
   } else if (
-      query.scalar_type() == torch::kFloat16 ||
-      query.scalar_type() == torch::kBFloat16) {
+      query.scalar_type() == at::kHalf ||
+      query.scalar_type() == at::kBFloat16) {
     alignment = 8;
   } else if (
       query.scalar_type() == c10::ScalarType::Float8_e4m3fn ||

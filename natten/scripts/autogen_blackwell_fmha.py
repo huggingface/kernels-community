@@ -160,8 +160,8 @@ class DataType:
         self.torch_name = torch_name
 
 
-Half = DataType("cutlass::half_t", "float16", "torch::kFloat16", 16)
-BFloat = DataType("cutlass::bfloat16_t", "bfloat16", "torch::kBFloat16", 16)
+Half = DataType("cutlass::half_t", "float16", "at::kHalf", 16)
+BFloat = DataType("cutlass::bfloat16_t", "bfloat16", "at::kBFloat16", 16)
 E4M3 = DataType("cutlass::float_e4m3_t", "e4m3", "c10::ScalarType::Float8_e4m3fn", 8)
 E5M2 = DataType("cutlass::float_e5m2_t", "e5m2", "c10::ScalarType::Float8_e5m2", 8)
 

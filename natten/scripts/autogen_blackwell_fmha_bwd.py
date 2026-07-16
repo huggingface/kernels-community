@@ -114,7 +114,7 @@ void {kernel_name}(
     if constexpr (IsDeterministic) {{
       auto kBlockM = cute::get<0>(GemmShape{{}});
       int effective_seqlen_q = is_varlen ? max_seqlen_Q : seqlen_q;
-      dq_semaphore = torch::zeros(
+      dq_semaphore = at::zeros(
           {{(effective_seqlen_q + kBlockM - 1) / kBlockM, batch_size, heads_q}},
           tensor_options.dtype(at::ScalarType::Int));
       dq_semaphore_ptr = static_cast<int*>(dq_semaphore.data_ptr());
@@ -195,8 +195,8 @@ class DataType:
         self.torch_name = torch_name
 
 
-Half = DataType("cutlass::half_t", "float16", "torch::kFloat16", 16)
-BFloat = DataType("cutlass::bfloat16_t", "bfloat16", "torch::kBFloat16", 16)
+Half = DataType("cutlass::half_t", "float16", "at::kHalf", 16)
+BFloat = DataType("cutlass::bfloat16_t", "bfloat16", "at::kBFloat16", 16)
 
 
 def iterable_to_static_cute_tuple(shape_in) -> str:

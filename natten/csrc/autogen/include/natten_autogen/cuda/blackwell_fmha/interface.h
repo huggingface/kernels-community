@@ -21,10 +21,10 @@ namespace cuda {
 namespace fmha_blackwell { 
 #define DISPATCH_BLACKWELL_FMHA_FORWARD(dtype, dim, q_tile_size, kv_tile_size, persistent, ...) \
   [&] { \
-    if (dtype == torch::kFloat16) { \
+    if (dtype == at::kHalf) { \
       DISPATCH_BLACKWELL_FMHA_FORWARD_float16(dim, q_tile_size, kv_tile_size, persistent, __VA_ARGS__); \
     } \
-    else if (dtype == torch::kBFloat16) { \
+    else if (dtype == at::kBFloat16) { \
       DISPATCH_BLACKWELL_FMHA_FORWARD_bfloat16(dim, q_tile_size, kv_tile_size, persistent, __VA_ARGS__); \
     } \
     else if (dtype == c10::ScalarType::Float8_e4m3fn) { \

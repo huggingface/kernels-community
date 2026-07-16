@@ -75,7 +75,7 @@ void blackwell_fmha_backward_float16_128x128x32(
     if constexpr (IsDeterministic) {
       auto kBlockM = cute::get<0>(GemmShape{});
       int effective_seqlen_q = is_varlen ? max_seqlen_Q : seqlen_q;
-      dq_semaphore = torch::zeros(
+      dq_semaphore = at::zeros(
           {(effective_seqlen_q + kBlockM - 1) / kBlockM, batch_size, heads_q},
           tensor_options.dtype(at::ScalarType::Int));
       dq_semaphore_ptr = static_cast<int*>(dq_semaphore.data_ptr());
@@ -208,7 +208,7 @@ void blackwell_fmha_backward_float16_128x128x64(
     if constexpr (IsDeterministic) {
       auto kBlockM = cute::get<0>(GemmShape{});
       int effective_seqlen_q = is_varlen ? max_seqlen_Q : seqlen_q;
-      dq_semaphore = torch::zeros(
+      dq_semaphore = at::zeros(
           {(effective_seqlen_q + kBlockM - 1) / kBlockM, batch_size, heads_q},
           tensor_options.dtype(at::ScalarType::Int));
       dq_semaphore_ptr = static_cast<int*>(dq_semaphore.data_ptr());

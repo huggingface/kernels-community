@@ -176,9 +176,9 @@ class DataType:
         self.torch_name = torch_name
 
 
-Float = DataType("float", "float32", "torch::kFloat32", 32)
-Half = DataType("cutlass::half_t", "float16", "torch::kFloat16", 16)
-BFloat = DataType("cutlass::bfloat16_t", "bfloat16", "torch::kBFloat16", 16)
+Float = DataType("float", "float32", "at::kFloat", 32)
+Half = DataType("cutlass::half_t", "float16", "at::kHalf", 16)
+BFloat = DataType("cutlass::bfloat16_t", "bfloat16", "at::kBFloat16", 16)
 
 
 def iterable_to_static_cute_tuple(shape_in) -> str:

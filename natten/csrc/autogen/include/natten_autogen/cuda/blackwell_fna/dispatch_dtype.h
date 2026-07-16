@@ -21,10 +21,10 @@ namespace cuda {
 namespace fna_blackwell { 
 #define DISPATCH_BLACKWELL_FNA_FORWARD_1D(dtype, dim, is_causal, q_tile_shape, kv_tile_shape, persistent, ...) \
   [&] { \
-    if (dtype == torch::kFloat16) { \
+    if (dtype == at::kHalf) { \
       DISPATCH_BLACKWELL_FNA_FORWARD_1D_float16(dim, is_causal, q_tile_shape, kv_tile_shape, persistent, __VA_ARGS__); \
     } \
-    else if (dtype == torch::kBFloat16) { \
+    else if (dtype == at::kBFloat16) { \
       DISPATCH_BLACKWELL_FNA_FORWARD_1D_bfloat16(dim, is_causal, q_tile_shape, kv_tile_shape, persistent, __VA_ARGS__); \
     } \
     else if (dtype == c10::ScalarType::Float8_e4m3fn) { \
@@ -40,10 +40,10 @@ namespace fna_blackwell {
 
 #define DISPATCH_BLACKWELL_FNA_FORWARD_2D(dtype, dim, is_causal, q_tile_shape, kv_tile_shape, persistent, ...) \
   [&] { \
-    if (dtype == torch::kFloat16) { \
+    if (dtype == at::kHalf) { \
       DISPATCH_BLACKWELL_FNA_FORWARD_2D_float16(dim, is_causal, q_tile_shape, kv_tile_shape, persistent, __VA_ARGS__); \
     } \
-    else if (dtype == torch::kBFloat16) { \
+    else if (dtype == at::kBFloat16) { \
       DISPATCH_BLACKWELL_FNA_FORWARD_2D_bfloat16(dim, is_causal, q_tile_shape, kv_tile_shape, persistent, __VA_ARGS__); \
     } \
     else if (dtype == c10::ScalarType::Float8_e4m3fn) { \
@@ -59,10 +59,10 @@ namespace fna_blackwell {
 
 #define DISPATCH_BLACKWELL_FNA_FORWARD_3D(dtype, dim, is_causal, q_tile_shape, kv_tile_shape, persistent, ...) \
   [&] { \
-    if (dtype == torch::kFloat16) { \
+    if (dtype == at::kHalf) { \
       DISPATCH_BLACKWELL_FNA_FORWARD_3D_float16(dim, is_causal, q_tile_shape, kv_tile_shape, persistent, __VA_ARGS__); \
     } \
-    else if (dtype == torch::kBFloat16) { \
+    else if (dtype == at::kBFloat16) { \
       DISPATCH_BLACKWELL_FNA_FORWARD_3D_bfloat16(dim, is_causal, q_tile_shape, kv_tile_shape, persistent, __VA_ARGS__); \
     } \
     else if (dtype == c10::ScalarType::Float8_e4m3fn) { \

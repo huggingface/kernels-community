@@ -69,9 +69,9 @@ class DataType:
         self.min_sm = min_sm
 
 
-NATTEN_Float = DataType("float", "torch::kFloat32", "float32", 32, 0)
-NATTEN_Half = DataType("cutlass::half_t", "torch::kFloat16", "float16", 16, 50)
-NATTEN_BFloat = DataType("cutlass::bfloat16_t", "torch::kBFloat16", "bfloat16", 16, 80)
+NATTEN_Float = DataType("float", "at::kFloat", "float32", 32, 0)
+NATTEN_Half = DataType("cutlass::half_t", "at::kHalf", "float16", 16, 50)
+NATTEN_BFloat = DataType("cutlass::bfloat16_t", "at::kBFloat16", "bfloat16", 16, 80)
 
 
 KERNEL_DECL_TEMPLATE = """__global__ void __launch_bounds__(
