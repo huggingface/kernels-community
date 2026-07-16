@@ -15,6 +15,7 @@
 import torch
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
@@ -32,7 +33,8 @@ from .utils import (
     block_within_dim_pruner,
     compose_pruners,
     decode_group_scale,
-    descriptor_config_pruner,
+    descriptor_box_pruner,
+    matched_memory_modes_pruner,
     device_context,
     fp8_act_quant_tensor_wide,
     fp8_act_quant_block_dynamic,
@@ -56,9 +58,8 @@ from .utils import (
     ue8m0_as_uint8,
 )
 
-# Swizzle group size for the 2D-grid kernels' L2-locality tiling (``swizzle_offsets``) —
-# a perf knob passed as the ``GROUP_SIZE_M`` constexpr, not a correctness parameter.
-GROUP_SIZE_M = 8
+# The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
+# ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.
 
 # maybe_act_quant crossovers (min rows for offline pre-quant). MX: MEASURED — B200
 # 2D-matmul sweep, graph-timed, H=6144 MXFP8 / H=4096 MXFP4: inline wins only at M=1
@@ -76,49 +77,72 @@ STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
 # unconditionally; only the two gates above have a real M=1 inline win.
 
 
+def _rebind_bd_descriptors(nargs):
+    """Per-config pre_hook: set the A and B host-TMA boxes to the tuned tile over the
+    ``(rows, K)`` matrices — ``[BLOCK_SIZE_M, block_k]`` and ``[BLOCK_SIZE_N, block_k]``.
+    MUST mutate ``block_shape`` in place (a rebind never reaches the launch); no-op for
+    pointer configs, which never read the descriptor."""
+    if nargs.get("A_MEMORY_MODE", "pointer") != "pointer" and not isinstance(
+        nargs["ADescriptor"], int
+    ):
+        nargs["ADescriptor"].block_shape = [nargs["BLOCK_SIZE_M"], nargs["block_k"]]
+    if nargs.get("B_MEMORY_MODE", "pointer") != "pointer" and not isinstance(
+        nargs["BDescriptor"], int
+    ):
+        nargs["BDescriptor"].block_shape = [nargs["BLOCK_SIZE_N"], nargs["block_k"]]
+
+
 @bayesian_autotune(
-    # tune_block_m: BLOCK_SIZE_M is a config axis (not a launch-time heuristic):
-    # pointer+WS at BM=64 is the winner at every model dim probed (H=5120/
-    # 6144/7168), −17% e2e vs the heuristic's BM=128 at M=8192. tune_block_n: the N tile
-    # is DECOUPLED from the caller's scale granularity (block_n) — a BN=256 tile
-    # over 128-wide scale columns halves activation re-reads; any BN is numerically fine
-    # (the offs_bn // block_n gather spans or splits scale columns), while BK stays
-    # pinned to block_k (activation scale groups are per block_k).
-    # The SWAP_AB/B_MEMORY_MODE arms below are implemented and validated but NOT emitted:
-    # logged tunes rank them measurable seconds everywhere (812us WS-pointer vs 910us
-    # pointer+swap vs 926us descriptor+swap at H=6144) and axes must earn an e2e win to
-    # grow the grid. To re-evaluate (e.g. on a Triton bump), add
-    # b_memory_modes=("descriptor", "pointer") and swap_ab=True — descriptor_config_pruner
-    # already fences the invalid regions.
+    # tune_block_m: BLOCK_SIZE_M is a config axis. tune_block_n: the N tile is DECOUPLED
+    # from the caller's scale granularity (block_n) — a BN=256 tile over 128-wide scale
+    # columns halves activation re-reads; any BN is numerically fine (the offs_bn //
+    # block_n gather spans or splits scale columns), while BK stays pinned to block_k
+    # (activation scale groups are per block_k).
+    #
+    # Two memory regimes, tuner-routed per (N, K, M) key:
+    #  - pointer: wins decode / short-K. BM=64 + WS is the winner at every model dim
+    #    probed (H=5120/6144/7168), −17% e2e vs BM=128 at M=8192. Big tiles STARVE here —
+    #    a full pointer sweep caps ~34% MFU at the wide-N prefill shape (load-bound).
+    #  - host-TMA on BOTH operands (A_MEMORY_MODE / B_MEMORY_MODE = descriptor) in the
+    #    NATURAL orientation (no SWAP_AB — the descriptor box transposes once, in
+    #    load_weight_tile, to the pointer arm's K-major rhs): wins wide-N compute prefill.
+    #    At M=8192 N=21504 K=7168 it takes the big tiles the pointer arm cannot feed —
+    #    3502us/32% MFU -> 1681us/67% (2.08x, 90% of DeepGEMM), race-free, BM128 BN256 WS
+    #    w8 (2026-07-16). WS is load-bearing: the per-iteration trans races without it.
+    #    Identical pointer->natural-TMA transition the grouped kernel already took.
+    # The earlier "TMA gives nothing" verdict was the SHORT-K gap shape (N=7168 K=2048):
+    # there the store/load-heavy loop hides TMA behind the WS-pointer schedule and the
+    # arms tie. Emitting both axes lets the tuner route per regime. B200 (sm_100) only —
+    # re-chart on H100 or the target device.
     get_accelerator_autotuning_configs(
         warp_spec=True,
         tune_block_m=True,
         tune_block_n=True,
-        # TMA on this 2D loop is fully charted and gives nothing (2026-07-16): the
-        # W-descriptor races without WS / loses 2.3x with it (older direct measurement),
-        # and A-load and C-store descriptor arms both measured EXACT ties at the
-        # store/load-heavy gap shape (313.3us all arms, M=8192 N=7168 K=2048) — the
-        # WS-pointer schedule already hides everything TMA would. Arms dropped.
-        # Charted on B200 (sm_100) only — re-chart on H100 or the target device
-        # before treating the null as universal.
+        a_memory_modes=("descriptor", "pointer"),
+        b_memory_modes=("descriptor", "pointer"),
+        pre_hook=_rebind_bd_descriptors,
     ),
     # m_bit_length (log2 M bucket) keys the M tile, mirroring mx_dynamic_matmul_kernel.
     ["N", "K", "m_bit_length"],
     n_trials=100,
-    # WS compile guard (non-WS is race-free at every (BM, warps) here) + the descriptor
-    # modes' measured can't-win fences.
+    # WS compile guard + descriptor TMA-box limits (256/dim) + shared-memory fit (the big
+    # TMA prefill tiles reach the smem ceiling; BM256 BN256 OOMs).
     prune_configs_by={
         "early_config_prune": compose_pruners(
-            warp_spec_compile_guard_pruner(), descriptor_config_pruner()
+            warp_spec_compile_guard_pruner(),
+            matched_memory_modes_pruner(),
+            descriptor_box_pruner("block_k"),
+            smem_pruner("block_k"),
         )
     },
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_kernel(
     A,  # (M, K) E4M3 activations (pre-quantized once by the wrapper)
+    ADescriptor,  # host TMA descriptor over A (M, K), box (BLOCK_SIZE_M, block_k); read iff A_MEMORY_MODE != "pointer"
     As,  # (M, K // block_k) fp32 per-row, per-K-block activation scales
     B,  # (N, K) FP8 weights
-    BDescriptor,  # TMA descriptor over B, box (BLOCK_SIZE_N, block_k); read only under B_MEMORY_MODE == "host_descriptor"
+    BDescriptor,  # host TMA descriptor over B (N, K), box (BLOCK_SIZE_N, block_k); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (N // block_n, K // block_k) weight scales (fp32 or uint8/UE8M0)
     C,  # (M, N) output
     # Shape
@@ -143,9 +167,9 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
     WARP_SPEC: tl.constexpr = False,
     B_MEMORY_MODE: tl.constexpr = "pointer",
+    A_MEMORY_MODE: tl.constexpr = "pointer",
     SWAP_AB: tl.constexpr = False,
 ):
     """Block-scale FP8 GEMM kernel.
@@ -154,20 +178,29 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     wrapper — the inline per-N-tile quant would repeat N//BN times per element; see the
     grouped kernels). 2D grid with swizzle for L2 cache locality on B.
 
-    ``SWAP_AB`` is an independent orientation knob: the weight tile sits in the MMA
-    M dim and the activation tile (loaded transposed for free via strides) drops to
-    the N side. The descriptor MEMORY_MODEs REQUIRE it (enforced by
-    ``descriptor_config_pruner``): the natural orientation would need a per-iteration
-    ``tl.trans`` on the descriptor tile, which races without WS (Triton 3.7.1
-    pipeliner) and loses 2.3x with it; the swapped descriptor form is race-sound
-    (12-process flake) and −11% vs same-config pointers at prefill on B200.
+    Two operand-feed regimes, tuner-routed (see the decorator): explicit pointers, or
+    host-TMA descriptors on both operands. Under the descriptor modes the natural
+    orientation loads the ``(BN, BK)`` weight box and transposes it once (in
+    ``load_weight_tile``) to the same K-major rhs the pointer arm builds — no ``SWAP_AB``
+    (that trans is race-free only under ``WARP_SPEC``). ``SWAP_AB`` remains an
+    independent pointer-arm orientation knob (weight tile in the MMA M dim, activation
+    loaded transposed via strides); it is implemented but not currently emitted.
     """
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, block_k, GROUP_SIZE_M
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, block_k
     )
-    a_ptrs = oriented_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, not SWAP_AB)
-    as_ptrs = As + offs_am * stride_as_m
-    b_ptrs = oriented_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
+    # Scale pointers index off AFFINE row/col offsets + a bounds mask; the %-wrapped forms
+    # (offs_am/offs_bn from swizzle_offsets) drive ONLY the pointer arm's operand tiles
+    # (token replication at decode). Keeping scales affine avoids the non-affine gather
+    # the wrap induces (~460us / 18pp at prefill).
+    offs_am_lin = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn_lin = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    as_ptrs = As + offs_am_lin * stride_as_m
+    as_mask = offs_am_lin < M
+    bs_mask = offs_bn_lin < N
+    a_descriptor = weight_tile_descriptor(
+        ADescriptor, A, M, K, stride_a_m, stride_a_k, BLOCK_SIZE_M, block_k, A_MEMORY_MODE
+    )
     b_descriptor = weight_tile_descriptor(
         BDescriptor,
         B,
@@ -179,22 +212,46 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         block_k,
         B_MEMORY_MODE,
     )
+    # Build (and, below, advance) the explicit operand-tile pointers ONLY on the pointer
+    # arm. Under a descriptor arm they would stay live across the whole K-loop for
+    # nothing — the [BM, BK] / [BK, BN] index tensors spill registers and starve
+    # occupancy (~460us / 20pp MFU at the wide-N prefill shape), and the descriptor load
+    # reads neither. A is a cheap scalar-pointer placeholder in that case.
+    if A_MEMORY_MODE == "pointer":
+        a_ptrs = oriented_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, not SWAP_AB)
+    else:
+        a_ptrs = A
+    if B_MEMORY_MODE == "pointer":
+        b_ptrs = oriented_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
+    else:
+        b_ptrs = B
     # the (BN,) scale-index gather decouples the tile from the scale grid: a wide tile
     # spans several scale columns, a narrow one shares a column
-    bs_ptrs = Bs + (offs_bn // block_n) * stride_bs_n
+    bs_ptrs = Bs + (offs_bn_lin // block_n) * stride_bs_n
     accumulator = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
 
     for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
-        a, a_s = load_block_fp8_act_tile(a_ptrs, as_ptrs, TRANSPOSED=SWAP_AB)
-        b = load_weight_tile(
-            b_ptrs, b_descriptor, pid_n * BLOCK_SIZE_N, k * block_k, B_MEMORY_MODE
+        a, a_s = load_block_fp8_act_tile(
+            a_ptrs,
+            as_ptrs,
+            a_descriptor,
+            pid_m * BLOCK_SIZE_M,
+            k * block_k,
+            A_MEMORY_MODE,
+            as_mask,
+            TRANSPOSED=SWAP_AB,
         )
-        b_s = decode_group_scale(tl.load(bs_ptrs))
+        b = load_weight_tile(
+            b_ptrs, b_descriptor, pid_n * BLOCK_SIZE_N, k * block_k, B_MEMORY_MODE, SWAP_AB
+        )
+        b_s = decode_group_scale(tl.load(bs_ptrs, mask=bs_mask, other=0.0))
         accumulator += block_scaled_fp8_dot(a, a_s, b, b_s, SWAP_AB)
-        a_ptrs += block_k * stride_a_k
         as_ptrs += 1
-        b_ptrs += block_k * stride_b_k
         bs_ptrs += stride_bs_k
+        if A_MEMORY_MODE == "pointer":
+            a_ptrs += block_k * stride_a_k
+        if B_MEMORY_MODE == "pointer":
+            b_ptrs += block_k * stride_b_k
 
     store_masked_oriented(
         C,
@@ -250,7 +307,6 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
     WARP_SPEC: tl.constexpr = False,
 ):
     """Tensor-scale FP8 GEMM kernel.
@@ -260,7 +316,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     Uses a 2D grid with swizzle for L2 cache locality on B tiles.
     """
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
     )
     a_ptrs = A + offs_am[:, None] * stride_a_m + offs_k[None, :] * stride_a_k
     b_ptrs = B + offs_k[:, None] * stride_b_k + offs_bn[None, :] * stride_b_n
@@ -331,7 +387,6 @@ def w8a8_block_static_fp8_matmul_kernel(
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
     WARP_SPEC: tl.constexpr = False,
 ):
     """Block-scale FP8 GEMM with static (per-tensor) activation scale.
@@ -342,7 +397,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     the end.
     """
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, block_k, GROUP_SIZE_M
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, block_k
     )
     a_ptrs = A + (offs_am[:, None] * stride_a_m + offs_k[None, :] * stride_a_k)
     b_ptrs = B + (offs_k[:, None] * stride_b_k + offs_bn[None, :] * stride_b_n)
@@ -440,7 +495,6 @@ def mx_dynamic_matmul_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
     INPUT_RECIPE: tl.constexpr = "mxfp8",
@@ -458,12 +512,13 @@ def mx_dynamic_matmul_kernel(
     rescale (wins at decode; FP4 unpacks E2M1->E4M3 first — lossless). 2D grid with
     swizzle for L2 reuse.
     """
-    pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
-    )
     # uint8 A = packed-E2M1 activations (W4A4 — the dtype IS the activation format)
     ACT_VALUES_PER_BYTE: tl.constexpr = 2 if A.dtype.element_ty == tl.uint8 else 1
     WEIGHT_VALUES_PER_BYTE: tl.constexpr = 2 if B.dtype.element_ty == tl.uint8 else 1
+    # packed-fp4 weights (WEIGHT_VALUES_PER_BYTE==2) route swizzle_offsets to full grouping
+    pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WEIGHT_VALUES_PER_BYTE
+    )
     offs_ka = tl.arange(0, BLOCK_SIZE_K // ACT_VALUES_PER_BYTE)
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
@@ -563,13 +618,12 @@ def w8a8_block_dynamic_fp8_matmul(
     A_q, A_s = fp8_act_quant_block_dynamic(A.view(M, K), block_k)
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
-    # The descriptor MEMORY_MODEs are not emitted (see the tuner note), so no live
-    # TensorDescriptor is passed: the launcher encodes a tensormap for descriptor args
-    # on EVERY launch even when the kernel never reads them, and with the (BM, BN) tile
-    # now tuned the fixed box also no longer matches every config. Re-enabling the
-    # descriptor rows means passing TensorDescriptor.from_tensor(B, box) again with a
-    # per-config pre_hook re-binding the box to the autotuned (BM, BN) tile.
-    b_descriptor = 0
+    # Host TMA descriptors over the (M, K) / (N, K) matrices — the placeholder box is
+    # re-bound per tuned config by _rebind_bd_descriptors. Read only by the descriptor
+    # (host-TMA) configs the tuner picks for wide-N prefill; pointer configs never touch
+    # them (the constexpr arm folds out in the load helpers).
+    a_descriptor = TensorDescriptor.from_tensor(A_q, [1, block_k])
+    b_descriptor = TensorDescriptor.from_tensor(B, [1, block_k])
 
     def grid(META):
         return (
@@ -580,6 +634,7 @@ def w8a8_block_dynamic_fp8_matmul(
     with device_context(A.device):
         compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_kernel)[grid](
             A_q,
+            a_descriptor,
             A_s,
             B,
             b_descriptor,
@@ -598,11 +653,8 @@ def w8a8_block_dynamic_fp8_matmul(
             Bs.stride(0),
             C.stride(-2),
             C.stride(-1),
-            # Meta-parameters (BM and BN come from the config; BK is the caller's
-            # block_k — the activation scale groups are per block_k)
             block_n=block_n,
             block_k=block_k,
-            GROUP_SIZE_M=GROUP_SIZE_M,
         )
 
     return C
@@ -698,7 +750,6 @@ def w8a8_block_static_fp8_matmul(
             # block_k — see the block-dynamic kernel)
             block_n=block_n,
             block_k=block_k,
-            GROUP_SIZE_M=GROUP_SIZE_M,
         )
 
     return C
@@ -766,7 +817,6 @@ def w8a8_tensor_dynamic_fp8_matmul(
             B.stride(0),
             C.stride(-2),
             C.stride(-1),
-            GROUP_SIZE_M=GROUP_SIZE_M,
         )
 
     return C
@@ -850,7 +900,6 @@ def mx_dynamic_matmul(
             bs_u8.stride(0),
             C.stride(-2),
             C.stride(-1),
-            GROUP_SIZE_M=GROUP_SIZE_M,
             SCALE_GROUP_K=scale_group,
             INPUT_RECIPE=input_recipe,
         )

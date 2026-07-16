@@ -146,13 +146,15 @@ def _ref_nvfp4_act_quant(x: torch.Tensor):
     return packed, scales
 
 
+# M=100 does not divide the row-tile BLOCK_T {8,16,32,64} — exercises the tail mask.
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
-def test_mxfp4_act_quant_matches_torch_reference():
+@pytest.mark.parametrize("M", [64, 100], ids=["Tdiv", "Ttail"])
+def test_mxfp4_act_quant_matches_torch_reference(M):
     """The Triton one-pass quant must be bit-identical to an INDEPENDENT pure-PyTorch
     implementation (the inline/offline parity tests share kernel code, so only this
     catches a shared bug)."""
-    x = _act_inputs()
+    x = _act_inputs(M=M)
     q, s = mxfp4_act_quant(x)
     q_ref, s_ref = _ref_mxfp4_act_quant(x)
     assert torch.equal(s, s_ref)
@@ -161,9 +163,10 @@ def test_mxfp4_act_quant_matches_torch_reference():
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
-def test_nvfp4_act_quant_matches_torch_reference():
+@pytest.mark.parametrize("M", [64, 100], ids=["Tdiv", "Ttail"])
+def test_nvfp4_act_quant_matches_torch_reference(M):
     """Same independent-reference check for the NVFP4 quant (E4M3 group-16 scales)."""
-    x = _act_inputs()
+    x = _act_inputs(M=M)
     q, s = nvfp4_act_quant(x)
     q_ref, s_ref = _ref_nvfp4_act_quant(x)
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8))
@@ -282,3 +285,27 @@ def test_block_dynamic_offline_zero_block():
     assert torch.isfinite(s).all()
     assert (q[0].float() == 0).all()
     assert (q[2:].float() != 0).any()
+
+
+# T values that don't divide the row-tile BLOCK_T {8,16,32,64} cover the tail mask; the
+# one-row-per-program predecessor never had one, so this guards the row-tile rewrite.
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.parametrize(
+    "shape",
+    [(64, 256), (100, 256), (3, 128), (129, 512), (1, 384)],
+    ids=lambda s: "x".join(map(str, s)),
+)
+def test_fp8_act_quant_block_dynamic_matches_reference(shape):
+    """``fp8_act_quant_block_dynamic`` matches the pure-PyTorch per-row, per-block_k
+    reference across token counts — including ones that leave a partial row tile."""
+    T, K = shape
+    block_k = 128
+    torch.manual_seed(0)
+    x = torch.randn(T, K, device=TEST_DEVICE, dtype=torch.bfloat16)
+    y, s = fp8_act_quant_block_dynamic(x, block_k)
+    y_ref, s_ref = _ref_fp8_act_quant_tensor_wide(x, block_k)
+    assert y.shape == (T, K)
+    assert s.shape == (T, K // block_k)
+    torch.testing.assert_close(s, s_ref, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(y.float(), y_ref.float(), atol=1e-2, rtol=1e-2)

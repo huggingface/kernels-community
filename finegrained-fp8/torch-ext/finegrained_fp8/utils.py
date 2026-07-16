@@ -553,7 +553,7 @@ def get_accelerator_autotuning_configs(
     num_warps = [8, 16] if is_xpu else [2, 4, 8, 16]
     num_stages = [2, 3, 4, 5, 6]
     bn_span = (128,) if is_xpu else (32, 64, 128, 256)
-    bk_span = (128,) if is_xpu else (64, 128, 256, 512) if swap_ab else (64, 128, 256)
+    bk_span = (128,) if is_xpu else (64, 128, 256, 512)
 
     # no tuned tile -> one empty meta-dict (the tile comes from the launch kwargs)
     blocks = (
@@ -637,12 +637,11 @@ def get_accelerator_autotuning_configs(
 @functools.cache
 def is_sm10x() -> bool:
     """Whether the CURRENT device is Blackwell-datacenter (sm_10x, TMEM scaled-MMA) —
-    the target the ``dot_scaled`` compiler-bug guards are scoped to. False off-CUDA;
-    cached (pruners call this per tune, and a process is pinned to one device)."""
-    return (
-        get_active_device_type() == "cuda"
-        and torch.cuda.get_device_capability()[0] == 10
-    )
+    the target the ``dot_scaled`` compiler-bug guards are scoped to. False off-CUDA and on
+    driverless build boxes (``torch.cuda.is_available()`` short-circuits before the
+    capability query, which would otherwise raise); cached (pruners call this per tune, and
+    a process is pinned to one device)."""
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 
 
 @functools.lru_cache(maxsize=None)
@@ -981,15 +980,34 @@ def scalar_max_m_pruner(m_arg: str, max_m: int = 64):
     return config_filter(ok, when=lambda args: args[m_arg] > max_m)
 
 
-def descriptor_box_pruner():
+def matched_memory_modes_pruner():
+    """Drop configs that mix pointer and descriptor operand loads — for a DENSE 2D GEMM
+    only (contiguous A, whole M in one tile). Measured across M=1..8192 on the block-scale
+    2D matmul: mixed only ever TIES the matched combos (<1us at small M) and loses at large
+    M, so pruning it costs no win and halves the descriptor search. Do NOT use this on the
+    GROUPED kernels: there M is distributed across experts (S/E small), A is token-GATHERED,
+    and A=pointer + B=descriptor (mixed) is the dominant winner — those keep both axes free.
+    Non-empty (the matched configs remain)."""
+
+    def ok(c, args):
+        a_ptr = c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
+        b_ptr = c.kwargs.get("B_MEMORY_MODE", "pointer") == "pointer"
+        return a_ptr == b_ptr
+
+    return config_filter(ok)
+
+
+def descriptor_box_pruner(k_dim="BLOCK_SIZE_K"):
     """Drop descriptor configs whose TMA box exceeds the tensormap's 256-per-dim limit:
-    the weight inner dim is ``BLOCK_SIZE_K`` BYTES over values-per-byte (packed E2M1
+    the weight inner dim is the K tile in BYTES over values-per-byte (packed E2M1
     halves it; E4M3 is one byte per value), so BK=512 e4m3 boxes are illegal while
-    BK=512 packed ones fit. Pointer configs pass untouched."""
+    BK=512 packed ones fit. Pointer configs pass untouched. ``k_dim`` names the K-tile
+    axis — ``BLOCK_SIZE_K`` for the tune_block_nk kernels, ``block_k`` for the block-scale
+    kernels whose K tile is the caller's fixed scale block."""
 
     def ok(c, args):
         # tiles may be tuned (config kwargs) or pinned launch args — config_dim reads both
-        bk = config_dim(c, args, "BLOCK_SIZE_K")
+        bk = config_dim(c, args, k_dim)
         if c.kwargs.get("B_MEMORY_MODE", "pointer") != "pointer":
             weight_vpb = (
                 2 if getattr(args.get("B"), "dtype", None) == torch.uint8 else 1
@@ -1012,7 +1030,7 @@ def descriptor_box_pruner():
     return config_filter(ok)
 
 
-def smem_pruner():
+def smem_pruner(k_dim="BLOCK_SIZE_K"):
     """``early_config_prune`` dropping configs whose shared memory certainly cannot fit,
     with the bound picked by the operand dtypes (sampled from ``metadata.shared`` across
     every kernel family, 22 cells):
@@ -1043,7 +1061,7 @@ def smem_pruner():
     def ok(c, args):
         a, b = args["A"], args["B"]
         tiles = 2 if args.get("GATE") else 1
-        bk = config_dim(c, args, "BLOCK_SIZE_K")
+        bk = config_dim(c, args, k_dim)
         unquantized = a.element_size() >= 2 and b.element_size() >= 2
         stages = c.num_stages if unquantized else c.num_stages - 1
         packed = 2 if b.dtype == torch.uint8 else 1
@@ -1152,6 +1170,47 @@ def fp8_act_quant_inline(a_raw, TRANSPOSED: tl.constexpr = False):
     return a_fp8, a_s
 
 
+# cvt.e2m1x2.f32 (hardware FP4 pack) exists only on sm_100 (Blackwell). Resolved once at
+# import as a compile-time constexpr for the jit helper below; the ALU fallback compiles
+# everywhere else. ``is_sm10x`` is driverless-safe, so no import-time guard is needed.
+_E2M1_HW_CVT = tl.constexpr(is_sm10x())
+
+
+@triton.jit
+def _quant_e2m1_packed(v, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
+    """Pack signed, pre-scaled values on the E2M1 grid to ``(M, K//2)`` uint8 (first value
+    of each pair in the low nibble). On sm_100 the Blackwell hardware convert
+    ``cvt.rn.satfinite.e2m1x2.f32`` (two f32 → one packed byte, first operand → HIGH nibble)
+    does it in one instruction; elsewhere a ``>=``-threshold bucketize builds the code. The
+    two agree except at exact E2M1 midpoints (0.25, 0.75, …), where the hardware rounds to
+    nearest-even and the ALU form rounds half-up. Only the taken arm compiles."""
+    if _E2M1_HW_CVT:
+        lo, hi = tl.split(tl.reshape(v, (BLOCK_SIZE_M, BLOCK_SIZE_K // 2, 2)))
+        packed = tl.inline_asm_elementwise(
+            "{ .reg .b8 t8; cvt.rn.satfinite.e2m1x2.f32 t8, $1, $2; cvt.u16.u8 $0, t8; }",
+            "=h,f,f",
+            [hi, lo],
+            dtype=tl.uint16,
+            is_pure=True,
+            pack=1,
+        )
+        values = (packed & 0xFF).to(tl.uint8)
+    else:
+        av = tl.abs(v)
+        code = (
+            (av >= 0.25).to(tl.int32)
+            + (av >= 0.75).to(tl.int32)
+            + (av >= 1.25).to(tl.int32)
+            + (av >= 1.75).to(tl.int32)
+            + (av >= 2.5).to(tl.int32)
+            + (av >= 3.5).to(tl.int32)
+            + (av >= 5.0).to(tl.int32)
+        ) | ((v < 0).to(tl.int32) << 3)
+        lo, hi = tl.split(tl.reshape(code, (BLOCK_SIZE_M, BLOCK_SIZE_K // 2, 2)))
+        values = (lo | (hi << 4)).to(tl.uint8)
+    return values
+
+
 @triton.jit
 def mx_act_quant_inline(
     a_raw,
@@ -1165,9 +1224,9 @@ def mx_act_quant_inline(
     divisor being the grid's largest magnitude) → values onto the recipe's grid:
 
     - ``"mxfp8"``: cast to E4M3 — returns ``((M, K) fp8, (M, K // SCALE_GROUP_K) uint8)``.
-    - ``"mxfp4"``: round to E2M1 (the ``>=``-boundary sum matches ``torch.bucketize``'s
-      tie behavior in the host ``mxfp4_act_quant``, bit-for-bit) and pack nibble pairs —
-      returns ``((M, K//2) uint8, (M, K // SCALE_GROUP_K) uint8)``.
+    - ``"mxfp4"``: round to E2M1 and pack nibble pairs (``_quant_e2m1_packed`` — hardware
+      ``cvt.e2m1x2`` on sm_100, else a ``>=``-threshold bucketize; they agree off exact
+      midpoints) — returns ``((M, K//2) uint8, (M, K // SCALE_GROUP_K) uint8)``.
     - ``"nvfp4"``: E4M3 scale (amax/6, not a power of two), values divide by the DECODED
       scale before the E2M1 grid — returns ``((M, K//2) uint8, (M, K // SCALE_GROUP_K) E4M3)``.
 
@@ -1182,18 +1241,7 @@ def mx_act_quant_inline(
         scales = (amax / 6.0).to(tl.float8e4nv)
         decoded = tl.maximum(scales.to(tl.float32), 1.1754944e-38)
         v = tl.reshape(a_groups / decoded[:, :, None], (BLOCK_SIZE_M, BLOCK_SIZE_K))
-        av = tl.abs(v)
-        code = (
-            (av >= 0.25).to(tl.int32)
-            + (av >= 0.75).to(tl.int32)
-            + (av >= 1.25).to(tl.int32)
-            + (av >= 1.75).to(tl.int32)
-            + (av >= 2.5).to(tl.int32)
-            + (av >= 3.5).to(tl.int32)
-            + (av >= 5.0).to(tl.int32)
-        ) | ((v < 0).to(tl.int32) << 3)
-        lo, hi = tl.split(tl.reshape(code, (BLOCK_SIZE_M, BLOCK_SIZE_K // 2, 2)))
-        values = (lo | (hi << 4)).to(tl.uint8)
+        values = _quant_e2m1_packed(v, BLOCK_SIZE_M, BLOCK_SIZE_K)
     elif RECIPE == "mxfp4":
         bits = (amax / 6.0).to(tl.int32, bitcast=True)
         # ceil_to_ue8m0: bump exponent by 1 when mantissa is non-zero.
@@ -1203,18 +1251,7 @@ def mx_act_quant_inline(
         scales = exp_ceil.to(tl.uint8)
         a_s_pow2 = (exp_ceil << 23).to(tl.float32, bitcast=True)
         v = tl.reshape(a_groups / a_s_pow2[:, :, None], (BLOCK_SIZE_M, BLOCK_SIZE_K))
-        av = tl.abs(v)
-        code = (
-            (av >= 0.25).to(tl.int32)
-            + (av >= 0.75).to(tl.int32)
-            + (av >= 1.25).to(tl.int32)
-            + (av >= 1.75).to(tl.int32)
-            + (av >= 2.5).to(tl.int32)
-            + (av >= 3.5).to(tl.int32)
-            + (av >= 5.0).to(tl.int32)
-        ) | ((v < 0).to(tl.int32) << 3)
-        lo, hi = tl.split(tl.reshape(code, (BLOCK_SIZE_M, BLOCK_SIZE_K // 2, 2)))
-        values = (lo | (hi << 4)).to(tl.uint8)
+        values = _quant_e2m1_packed(v, BLOCK_SIZE_M, BLOCK_SIZE_K)
     else:
         bits = (amax / 448.0).to(tl.int32, bitcast=True)
         # ceil_to_ue8m0: bump exponent by 1 when mantissa is non-zero.
@@ -1230,17 +1267,30 @@ def mx_act_quant_inline(
 
 
 @triton.jit
-def load_block_fp8_act_tile(a_ptrs, as_ptrs, TRANSPOSED: tl.constexpr = False):
+def load_block_fp8_act_tile(
+    a_ptrs,
+    as_ptrs,
+    a_descriptor=0,
+    m_off=0,
+    k_off=0,
+    A_MEMORY_MODE: tl.constexpr = "pointer",
+    as_mask=None,
+    TRANSPOSED: tl.constexpr = False,
+):
     """Block-FP8 counterpart of ``load_mx_act_tile``: load one activation K-tile as
-    ``(a_fp8, a_scale_f32)`` — the arm folds off the pointer dtype at compile time
-    (fp8 = pre-quantized offline + per-K-block scales, raw bf16/fp16 = quantize inline;
-    ``as_ptrs`` is then a constexpr-dead placeholder). ``TRANSPOSED`` marks a ``(K, M)``
-    tile (the swapped descriptor arm) so the inline amax reduces the token axis either
-    way. Unmasked: every caller's rows are %-wrapped, expert-advanced, or
-    token-replicated."""
-    if a_ptrs.dtype.element_ty == tl.float8e4nv:  # pre-quantized offline
+    ``(a_fp8, a_scale_f32)`` — the arm folds off ``A_MEMORY_MODE`` and the pointer dtype at
+    compile time. Descriptor mode loads the pre-quantized ``(BM, BK)`` host-TMA box at
+    ``(m_off, k_off)`` (``a_ptrs`` unread); pointer fp8 loads the pre-quantized-offline tile;
+    raw bf16/fp16 pointers quantize inline (``as_ptrs`` then a constexpr-dead placeholder).
+    Either way the per-K-block scales come from ``as_ptrs``. ``TRANSPOSED`` marks a ``(K, M)``
+    tile (the swapped pointer arm) so the inline amax reduces the token axis either way.
+    Unmasked: every caller's rows are %-wrapped, expert-advanced, or token-replicated."""
+    if A_MEMORY_MODE != "pointer":  # pre-quantized, host-TMA box [BM, BK]
+        a = a_descriptor.load([m_off, k_off])
+        a_s = tl.load(as_ptrs, mask=as_mask, other=0.0)
+    elif a_ptrs.dtype.element_ty == tl.float8e4nv:  # pre-quantized offline
         a = tl.load(a_ptrs)
-        a_s = tl.load(as_ptrs)
+        a_s = tl.load(as_ptrs, mask=as_mask, other=0.0)
     else:  # raw bf16/fp16 — quantize inline
         a, a_s = fp8_act_quant_inline(tl.load(a_ptrs).to(tl.float32), TRANSPOSED)
     return a, a_s
@@ -1621,6 +1671,14 @@ def fp8_dot(a, b, SWAP_AB: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
     return out
 
 
+# A-sub-tile byte budget for the 1-byte-activation grouped-swizzle depth cap (see
+# swizzle_offsets): the co-scheduled rows' A tile per K-step (depth*BM*BK bytes) must stay
+# L2-hot to reuse, and past this it thrashes and the win collapses. ~512KB is a wave
+# reuse-window, NOT gross L2 (0.4% of the B200's 132MB) — a B200 measurement (2026-07-16), so
+# RE-MEASURE per device. Packed fp4 bypasses this (full grouping wins; see swizzle_offsets).
+SWIZZLE_GROUP_A_BYTES = tl.constexpr(524288)
+
+
 @triton.jit
 def swizzle_offsets(
     M,
@@ -1628,18 +1686,37 @@ def swizzle_offsets(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
+    WEIGHT_VALUES_PER_BYTE: tl.constexpr = 1,
 ):
-    """2D-grid tile scheduling shared by the kernels below: swizzle the
-    ``(pid_m, pid_n)`` program ids for L2 locality on B, then build the operand
-    offset vectors. Returns ``(pid_m, pid_n, offs_am, offs_bn, offs_k)`` — the
-    swizzled ids (reused by the output store) and the ``%``-wrapped row/col offsets
-    plus the K range."""
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
+    """2D-grid tile scheduling shared by the kernels below: grouped-swizzle the
+    ``(pid_m, pid_n)`` program ids for L2 locality on B, then build the operand offset
+    vectors. Returns ``(pid_m, pid_n, offs_am, offs_bn, offs_k)`` — the swizzled ids
+    (reused by the output store) and the ``%``-wrapped row/col offsets plus the K range.
+
+    The swizzle keeps the B (weight) column-tile L2-hot while the co-scheduled rows reuse it,
+    so the depth cap is set by the WEIGHT footprint, capped at ``min(num_pid_m, .)``. With
+    1-byte weights the reuse thrashes past ~512KB (a hard cliff): the growing rival is the
+    rows' A sub-tile per K-step (``depth * BM * BK`` bytes), so ``SWIZZLE_GROUP_A_BYTES //
+    (BM * BK)`` — MEASURED on B200 (2026-07-16), bd BK128->32 (cliffs at 64), MX BK256->16,
+    BM64->64 (g*BM*BK ~512KB across BM and BK; BN-independent). Packed-fp4 weights
+    (``WEIGHT_VALUES_PER_BYTE==2``) halve that hot set, so it never thrashes and full grouping
+    wins outright (monotone, no cliff — measured for both W4A4 and W4A8, i.e. weight-driven not
+    activation-driven). Uses an EXPLICIT grouped swizzle (linearize the 2D program ids, then
+    group), NOT ``tl.swizzle2d`` (which degrades with group depth, -3pp+ MFU at depth 32). Same
+    grid launch, same result set — only the program-id -> tile mapping changes."""
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
+    if WEIGHT_VALUES_PER_BYTE == 2:
+        max_group = num_pid_m
+    else:
+        max_group = SWIZZLE_GROUP_A_BYTES // (BLOCK_SIZE_M * BLOCK_SIZE_K)
+    pid = tl.program_id(axis=1) * num_pid_m + tl.program_id(axis=0)
+    num_pid_in_group = max_group * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * max_group
+    group_size_m = min(num_pid_m - first_pid_m, max_group)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -2164,14 +2241,20 @@ def load_grouped_weight_tile(
 
 
 @triton.jit
-def load_weight_tile(w_ptrs, w_descriptor, row_off, k_off, B_MEMORY_MODE: tl.constexpr):
-    """One weight K-tile: the ``(BN, BK)`` descriptor box at ``(row_off, k_off)`` under
-    the descriptor modes, else the explicit-pointer tile (whatever orientation ``w_ptrs``
-    was built with). Single return — only the taken branch compiles."""
+def load_weight_tile(
+    w_ptrs, w_descriptor, row_off, k_off, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr = False
+):
+    """One weight K-tile. Descriptor modes load the ``(BN, BK)`` box at ``(row_off, k_off)``
+    and, in the natural orientation, transpose it once to the ``(BK, BN)`` K-major rhs the
+    pointer arm builds directly (``SWAP_AB`` keeps the box as-is: the weight rows then sit in
+    the MMA M dim). Pointer mode loads the explicit tile in whatever orientation ``w_ptrs``
+    was built with. Single return — only the taken branch compiles."""
     if B_MEMORY_MODE == "pointer":
         w = tl.load(w_ptrs)
     else:
         w = w_descriptor.load([row_off, k_off])
+        if not SWAP_AB:
+            w = tl.trans(w)
     return w
 
 
@@ -2582,14 +2665,14 @@ def _quant_block_k_pruner(configs, named_args, **kwargs):
 
 @bayesian_autotune(
     [
-        triton.Config({"BLOCK_K": bk}, num_warps=w)
-        for bk in (32, 64, 128, 256, 512, 1024)
+        triton.Config({"BLOCK_K": bk, "BLOCK_T": bt}, num_warps=w)
+        for bk in (32, 64, 128, 256)
+        for bt in (8, 16, 32, 64)
         for w in (2, 4, 8)
     ],
-    # t_bucket (log2 of the token count) is in the key: the grid is (T, K // BLOCK_K), so at
-    # small T the block size is the only parallelism lever while at prefill scale it isn't —
-    # same bucketing as the grouped kernels' tokens_per_sm_bit_length (raw T would retune per
-    # unique token count).
+    # t_bucket (log2 of the token count) is in the key: at small T the tile is the only
+    # parallelism lever while at prefill scale it isn't — same bucketing as the grouped
+    # kernels (raw T would retune per unique token count).
     ["K", "t_bucket"],
     n_trials=100,
     prune_configs_by={"early_config_prune": _quant_block_k_pruner},
@@ -2601,31 +2684,42 @@ def _mx_act_quant_kernel(
     S,
     stride_x_t,
     stride_x_k,
+    T,
     t_bucket,  # autotune key only (log2 token-count bucket); unused in body
     K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     # dynamo's triton wrapper appends the tuner's config kwargs after the call kwargs
-    # and requires signature order — the tuned axis stays LAST
+    # and requires signature order — the tuned axes stay LAST
     RECIPE: tl.constexpr = "mxfp8",
     BLOCK_K: tl.constexpr = 32,
+    BLOCK_T: tl.constexpr = 32,
 ):
     """One-pass activation quant, one launch per recipe (``mx_act_quant_inline`` does
     the math, so the offline and inline forms are bit-identical by construction): E4M3 +
     UE8M0 ("mxfp8"), packed E2M1 + UE8M0 ("mxfp4"), or packed E2M1 + E4M3 group-16
-    ("nvfp4"). Grid ``(T, K // BLOCK_K)``; group boundaries are identical across forms
-    (SCALE_GROUP_K | BLOCK_K | K). Arbitrary input strides (no host-side copy)."""
-    t = tl.program_id(0).to(tl.int64)
-    offs = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
-    x = tl.load(X + t * stride_x_t + offs * stride_x_k)[None, :].to(tl.float32)
-    y, s = mx_act_quant_inline(x, 1, BLOCK_K, SCALE_GROUP_K, RECIPE)
+    ("nvfp4"). Grid ``(cdiv(T, BLOCK_T), K // BLOCK_K)`` — each program quantizes a
+    ``[BLOCK_T, BLOCK_K]`` tile. The one-row-per-program form starved memory (1.5-1.8 TB/s
+    on the packed recipes); the row tile lets the loads coalesce. Group boundaries are
+    identical across forms (SCALE_GROUP_K | BLOCK_K | K). Arbitrary input strides."""
+    pid_t = tl.program_id(0)
+    kb = tl.program_id(1)
+    rows = (pid_t * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int64)
+    offs = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+    row_mask = rows < T
+    x = tl.load(
+        X + rows[:, None] * stride_x_t + offs[None, :] * stride_x_k,
+        mask=row_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    y, s = mx_act_quant_inline(x, BLOCK_T, BLOCK_K, SCALE_GROUP_K, RECIPE)
     width: tl.constexpr = BLOCK_K // 2 if RECIPE != "mxfp8" else BLOCK_K
-    yo = tl.program_id(1) * width + tl.arange(0, width)
-    tl.store(Y + t * (K // (BLOCK_K // width)) + yo, tl.reshape(y, (width,)))
-    sg = tl.program_id(1) * (BLOCK_K // SCALE_GROUP_K) + tl.arange(
-        0, BLOCK_K // SCALE_GROUP_K
-    )
+    y_row: tl.constexpr = K // (BLOCK_K // width)  # per-row element count of Y
+    groups: tl.constexpr = BLOCK_K // SCALE_GROUP_K
+    yo = kb * width + tl.arange(0, width)
+    tl.store(Y + rows[:, None] * y_row + yo[None, :], y, mask=row_mask[:, None])
+    sg = kb * groups + tl.arange(0, groups)
     tl.store(
-        S + t * (K // SCALE_GROUP_K) + sg, tl.reshape(s, (BLOCK_K // SCALE_GROUP_K,))
+        S + rows[:, None] * (K // SCALE_GROUP_K) + sg[None, :], s, mask=row_mask[:, None]
     )
 
 
@@ -2658,13 +2752,14 @@ def mxfp8_act_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     s = torch.empty(T, K // MX_SCALE_GROUP_K, device=x.device, dtype=torch.uint8)
     with device_context(x.device):
         compile_time_only_triton_wrap(_mx_act_quant_kernel)[
-            lambda META: (T, K // META["BLOCK_K"])
+            lambda META: (triton.cdiv(T, META["BLOCK_T"]), K // META["BLOCK_K"])
         ](
             x,
             y,
             s,
             x.stride(0),
             x.stride(1),
+            T,
             T.bit_length(),
             K=K,
             SCALE_GROUP_K=MX_SCALE_GROUP_K,
@@ -2708,13 +2803,14 @@ def _launch_act_quant(x, recipe, scale_group, scale_dtype):
     scales = torch.empty(T, K // scale_group, device=x.device, dtype=scale_dtype)
     with device_context(x.device):
         compile_time_only_triton_wrap(_mx_act_quant_kernel)[
-            lambda META: (T, K // META["BLOCK_K"])
+            lambda META: (triton.cdiv(T, META["BLOCK_T"]), K // META["BLOCK_K"])
         ](
             x,
             packed,
             scales,
             x.stride(0),
             x.stride(1),
+            T,
             T.bit_length(),
             K=K,
             SCALE_GROUP_K=scale_group,
@@ -2724,7 +2820,11 @@ def _launch_act_quant(x, recipe, scale_group, scale_dtype):
 
 
 @bayesian_autotune(
-    [triton.Config({}, num_warps=w) for w in (1, 2, 4)],
+    [
+        triton.Config({"BLOCK_T": bt}, num_warps=w)
+        for bt in (16, 32, 64, 128)
+        for w in (1, 2, 4, 8)
+    ],
     ["K", "BLOCK_K", "t_bucket"],
     n_trials=100,
 )
@@ -2735,22 +2835,33 @@ def _fp8_act_quant_block_dynamic_kernel(
     S,
     stride_x_t,
     stride_x_k,
+    T,
     t_bucket,  # autotune key only (log2 token-count bucket); unused in body
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    BLOCK_T: tl.constexpr,
 ):
     """One-pass block-FP8 activation quant: rows → E4M3 + one fp32 ``amax/448`` scale per
-    ``BLOCK_K`` span. Grid ``(T, K // BLOCK_K)``; the span equals the consumer's
-    ``BLOCK_SIZE_K``, so results are bit-exact with the kernels' inline quant. Arbitrary
-    input strides (no host-side copy). ``BLOCK_K`` is fixed by the scale layout — only
-    warps are tuned."""
-    t = tl.program_id(0).to(tl.int64)
+    ``BLOCK_K`` span. Grid ``(cdiv(T, BLOCK_T), K // BLOCK_K)`` — each program quantizes a
+    ``[BLOCK_T, BLOCK_K]`` tile (``BLOCK_T`` rows over one K-block, each row its own scale).
+    The one-row-per-program form starved memory (128-byte transactions across ~T*K/BK tiny
+    programs); the row tile gives the loads something to coalesce. The span equals the
+    consumer's ``BLOCK_SIZE_K``, so results are bit-exact with the inline quant. Arbitrary
+    input strides (no host-side copy); ``BLOCK_K`` is fixed by the scale layout, ``BLOCK_T``
+    and warps are tuned."""
+    pid_t = tl.program_id(0)
     kb = tl.program_id(1)
+    rows = (pid_t * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int64)
     offs = kb * BLOCK_K + tl.arange(0, BLOCK_K)
-    x = tl.load(X + t * stride_x_t + offs * stride_x_k)[None, :].to(tl.float32)
+    row_mask = rows < T
+    x = tl.load(
+        X + rows[:, None] * stride_x_t + offs[None, :] * stride_x_k,
+        mask=row_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
     y, s = fp8_act_quant_inline(x)
-    tl.store(Y + t * K + offs, tl.reshape(y, (BLOCK_K,)))
-    tl.store(S + t * (K // BLOCK_K) + kb + tl.arange(0, 1), tl.reshape(s, (1,)))
+    tl.store(Y + rows[:, None] * K + offs[None, :], y, mask=row_mask[:, None])
+    tl.store(S + rows * (K // BLOCK_K) + kb, s, mask=row_mask)
 
 
 def fp8_act_quant_block_dynamic(
@@ -2762,10 +2873,14 @@ def fp8_act_quant_block_dynamic(
     T, K = x.shape
     y = torch.empty(T, K, device=x.device, dtype=FP8_DTYPE)
     s = torch.empty(T, K // block_k, device=x.device, dtype=torch.float32)
+
+    def grid(META):
+        return (triton.cdiv(T, META["BLOCK_T"]), K // block_k)
+
     with device_context(x.device):
-        compile_time_only_triton_wrap(_fp8_act_quant_block_dynamic_kernel)[
-            (T, K // block_k)
-        ](x, y, s, x.stride(0), x.stride(1), T.bit_length(), K=K, BLOCK_K=block_k)
+        compile_time_only_triton_wrap(_fp8_act_quant_block_dynamic_kernel)[grid](
+            x, y, s, x.stride(0), x.stride(1), T, T.bit_length(), K=K, BLOCK_K=block_k
+        )
     return y, s
 
 
