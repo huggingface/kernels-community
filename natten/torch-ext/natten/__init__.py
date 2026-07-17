@@ -75,6 +75,66 @@ from . import _types as types
 
 _sys.modules[__name__ + ".types"] = types
 
+# kernel-builder's compat shim (`natten/__init__.py` inside the build variant
+# directory) executes this package under a path-derived module name and copies
+# our globals into a `natten` module whose __path__ contains no submodules.
+# Attribute access (`natten.functional`) works there, but real submodule
+# imports (`from natten.functional import na2d`, `import natten.utils.testing`)
+# would either fail with ModuleNotFoundError or — when resolvable through a
+# parent package's __path__ — re-execute the module under a second name,
+# duplicating module state. Bridge this with a meta-path finder that resolves
+# any `natten.*` import to our already-loaded module objects. Only installed
+# when `natten` in sys.modules is *our* compat shim, so a real `natten`
+# distribution in the same environment is never hijacked.
+if __name__ != "natten":
+    from pathlib import Path as _Path
+
+    _compat = _sys.modules.get("natten")
+    _is_our_compat = (
+        _compat is not None
+        and getattr(_compat, "__file__", None) is not None
+        and _Path(_compat.__file__).resolve()
+        == _Path(__file__).resolve().parent / "natten" / "__init__.py"
+    )
+
+    if _is_our_compat:
+        import importlib as _importlib
+        from importlib.abc import Loader as _Loader
+        from importlib.abc import MetaPathFinder as _MetaPathFinder
+        from importlib.util import spec_from_loader as _spec_from_loader
+
+        _real_root = __name__
+
+        class _NattenAliasLoader(_Loader):
+            def __init__(self, module):
+                self._module = module
+                self._spec = getattr(module, "__spec__", None)
+                self._loader = getattr(module, "__loader__", None)
+
+            def create_module(self, spec):
+                return self._module
+
+            def exec_module(self, module):
+                # The import machinery stamped the alias spec onto the real
+                # module in module_from_spec; restore its original identity.
+                module.__spec__ = self._spec
+                module.__loader__ = self._loader
+
+        class _NattenAliasFinder(_MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if not fullname.startswith("natten."):
+                    return None
+                real_name = _real_root + fullname[len("natten") :]
+                try:
+                    module = _importlib.import_module(real_name)
+                except ImportError:
+                    return None
+                return _spec_from_loader(fullname, _NattenAliasLoader(module))
+
+        # Must precede PathFinder, which would otherwise re-execute
+        # submodules reachable through a real parent package's __path__.
+        _sys.meta_path.insert(0, _NattenAliasFinder())
+
 __all__ = [
     "__version__",
     "NeighborhoodAttention1D",
