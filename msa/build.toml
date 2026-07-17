@@ -10,7 +10,7 @@ upstream = "https://github.com/MiniMax-AI/MSA"
 version = 0
 
 [general.hub]
-repo-id = "kernels-community/msa"
+repo-id = "MiniMaxAI/msa"
 
 [general.cuda]
 minver = "12.8"

@@ -52,6 +52,11 @@ on:
         required: false
         type: string
         default: ""
+      bot_comment_id:
+        description: "Issue comment ID to update with Hub upload links"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read

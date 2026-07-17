@@ -166,6 +166,7 @@ def _build_inputs(
     head_sha: str,
     target_branch: str,
     upload: bool,
+    bot_comment_id: str,
 ) -> dict:
     inputs = {
         "kernel_name": kernel_name,
@@ -184,6 +185,8 @@ def _build_inputs(
         inputs["target_branch"] = target_branch
     if not upload:
         inputs["upload"] = "false"
+    if upload and bot_comment_id:
+        inputs["bot_comment_id"] = bot_comment_id
     return inputs
 
 
@@ -247,6 +250,7 @@ def _plan_build_actions(
     head_sha: str,
     target_branch: str,
     upload: bool,
+    bot_comment_id: str,
     requested_backends: list[str] | None = None,
 ) -> None:
     backends = read_backends(kernel_name)
@@ -299,6 +303,7 @@ def _plan_build_actions(
                         head_sha=head_sha,
                         target_branch=target_branch,
                         upload=upload,
+                        bot_comment_id=bot_comment_id,
                     ),
                 },
                 description=f"for kernel `{kernel_name}` on ref `{ref}`",
@@ -319,6 +324,7 @@ def plan_dispatch(
     head_sha: str = "",
     target_branch: str = "",
     upload: bool = True,
+    bot_comment_id: str = "",
     run_security: bool = False,
     security_only: bool = False,
     requested_backends: list[str] | None = None,
@@ -339,6 +345,7 @@ def plan_dispatch(
             head_sha=head_sha,
             target_branch=target_branch,
             upload=upload,
+            bot_comment_id=bot_comment_id,
             requested_backends=requested_backends,
         )
 
@@ -487,6 +494,7 @@ def dispatch(
     head_sha: str = "",
     target_branch: str = "",
     upload: bool = True,
+    bot_comment_id: str = "",
     run_security: bool = False,
     security_only: bool = False,
     requested_backends: list[str] | None = None,
@@ -509,6 +517,7 @@ def dispatch(
         head_sha=head_sha,
         target_branch=target_branch,
         upload=upload,
+        bot_comment_id=bot_comment_id,
         run_security=run_security,
         security_only=security_only,
         requested_backends=requested_backends,
@@ -608,6 +617,11 @@ def main() -> int:
         help="PR head SHA for commit status reporting",
     )
     parser.add_argument(
+        "--bot-comment-id",
+        default="",
+        help="Issue comment ID to update with Hub upload links",
+    )
+    parser.add_argument(
         "--target-branch",
         default="",
         help="Target branch for upload",
@@ -675,6 +689,7 @@ def main() -> int:
         skip_build=args.skip_build,
         pr_number=args.pr_number,
         head_sha=args.head_sha,
+        bot_comment_id=args.bot_comment_id,
         target_branch=args.target_branch,
         upload=not args.no_upload,
         run_security=args.security,

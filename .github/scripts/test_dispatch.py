@@ -184,6 +184,19 @@ def test_requested_backends_thread_through_dispatch_dry_run():
     assert any("xpu" in c.split(",") for c in csvs)
 
 
+def test_bot_comment_id_threads_to_build_inputs_only_when_set():
+    without = _build_actions(_plan(backends=["cuda"]))
+    assert all("bot_comment_id" not in a.body["inputs"] for a in without)
+
+    with_id = _build_actions(_plan(backends=["cuda"], bot_comment_id="12345"))
+    assert all(a.body["inputs"]["bot_comment_id"] == "12345" for a in with_id)
+
+    no_upload = _build_actions(
+        _plan(backends=["cuda"], upload=False, bot_comment_id="12345")
+    )
+    assert all("bot_comment_id" not in a.body["inputs"] for a in no_upload)
+
+
 # select_workflows: backend-union and Windows-gate cases (single-backend rows omitted).
 ROUTING_TRUTH_TABLE = [
     (["cuda"], False, {"build.yaml"}),
