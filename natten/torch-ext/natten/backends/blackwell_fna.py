@@ -45,7 +45,7 @@ from ..backends.configs.cutlass_blackwell import (
     check_cutlass_blackwell_fna_forward_config,
 )
 from ..token_permute import token_permute_operation, token_unpermute_operation
-from ..types import (
+from .._types import (
     CausalArg1DTypeOrDed,
     CausalArg2DTypeOrDed,
     CausalArg3DTypeOrDed,

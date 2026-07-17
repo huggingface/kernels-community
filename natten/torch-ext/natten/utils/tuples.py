@@ -21,7 +21,7 @@
 #
 #################################################################################################
 
-from ..types import CausalArgType, DimensionType
+from .._types import CausalArgType, DimensionType
 
 
 def ceil_div_int(x: int, y: int) -> int:

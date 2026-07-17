@@ -38,7 +38,7 @@ from .backends import (
     flex_fmha,
     flex_fna_generic,
 )
-from .types import (
+from ._types import (
     CausalArg1DTypeOrDed,
     CausalArg2DTypeOrDed,
     CausalArg3DTypeOrDed,

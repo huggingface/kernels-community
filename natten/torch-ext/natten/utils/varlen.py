@@ -26,7 +26,7 @@ from typing import Optional, Tuple, Union
 import torch  # noqa: F401
 from torch import Tensor
 
-from ..types import NoneType
+from .._types import NoneType
 from ..utils.environment import is_torch_compiling
 
 

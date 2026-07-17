@@ -37,7 +37,7 @@ from ..backends.configs.cutlass_blackwell import (
     check_cutlass_blackwell_fmha_backward_config,
     check_cutlass_blackwell_fmha_forward_config,
 )
-from ..types import (
+from .._types import (
     CutlassBlackwellFmhaBackwardConfigType,
     CutlassBlackwellFmhaForwardConfigType,
     NoneType,

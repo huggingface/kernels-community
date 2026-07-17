@@ -26,7 +26,7 @@ from typing import List, Optional
 import torch  # noqa: F401
 from torch import Tensor
 
-from ....types import (
+from ...._types import (
     DimensionType,
     FlexFmhaForwardConfigType,
     FlexFnaForwardConfigType,

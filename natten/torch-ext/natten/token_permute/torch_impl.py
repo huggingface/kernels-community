@@ -25,7 +25,7 @@ import math
 import torch
 from torch import Tensor
 
-from ..types import DimensionType
+from .._types import DimensionType
 from ..utils import log
 from ..utils.environment import is_torch_compiling
 from ..utils.tuples import ceil_div_tuple, mul_tuple, sub_tuple

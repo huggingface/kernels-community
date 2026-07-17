@@ -39,7 +39,7 @@ from ....context import (
     is_memory_usage_strict,
     is_memory_usage_unrestricted,
 )
-from ....types import DimensionType
+from ...._types import DimensionType
 from ....utils.checks import check_dilation_arg, check_input_size_arg
 from ....utils.tuples import ceil_div_int, ceil_div_tuple
 

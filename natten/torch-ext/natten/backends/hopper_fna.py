@@ -45,7 +45,7 @@ from ..backends.configs.cutlass_hopper import (
     check_cutlass_hopper_fna_forward_config,
 )
 from ..token_permute import token_permute_operation, token_unpermute_operation
-from ..types import (
+from .._types import (
     CausalArg1DTypeOrDed,
     CausalArg2DTypeOrDed,
     CausalArg3DTypeOrDed,

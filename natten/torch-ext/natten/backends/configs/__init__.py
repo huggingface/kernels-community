@@ -62,7 +62,7 @@ from ...backends.configs.flex import (
     get_all_tile_shapes_forward as get_all_flex_fna_forward_configs,
     get_all_tile_sizes_forward as get_all_flex_fmha_forward_configs,
 )
-from ...types import (
+from ..._types import (
     CutlassBlackwellFmhaBackwardConfigType,
     CutlassBlackwellFmhaForwardConfigType,
     CutlassBlackwellFnaBackwardConfigType,

@@ -44,7 +44,7 @@ from ..backends.configs.flex import (
     check_flex_fna_forward_config,
 )
 from ..token_permute import token_permute_operation, token_unpermute_operation
-from ..types import (
+from .._types import (
     CausalArg1DTypeOrDed,
     CausalArg2DTypeOrDed,
     CausalArg3DTypeOrDed,

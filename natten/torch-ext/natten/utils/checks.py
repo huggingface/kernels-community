@@ -28,7 +28,7 @@ from typing import Any, Optional, Tuple, Union
 import torch  # noqa: F401
 from torch import Tensor
 
-from ..types import CausalArgType, DimensionType, KernelSchedule, NoneType
+from .._types import CausalArgType, DimensionType, KernelSchedule, NoneType
 from ..utils import log
 from ..utils.environment import is_torch_compiling
 from ..utils.tuples import create_causal_arg_from_bool, create_dim_from_int

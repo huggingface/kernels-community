@@ -44,7 +44,7 @@ from ..backends.configs.cutlass import (
     check_cutlass_fna_backward_config,
     check_cutlass_fna_forward_config,
 )
-from ..types import (
+from .._types import (
     CausalArg1DTypeOrDed,
     CausalArg2DTypeOrDed,
     CausalArg3DTypeOrDed,

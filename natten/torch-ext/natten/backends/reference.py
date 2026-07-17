@@ -39,7 +39,7 @@ from .._libnatten import (
     reference_na3d_backward,
     reference_na3d_forward,
 )
-from ..types import (
+from .._types import (
     CausalArg1DTypeOrDed,
     CausalArg2DTypeOrDed,
     CausalArg3DTypeOrDed,

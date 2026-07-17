@@ -41,7 +41,7 @@ from .._libnatten import (
     token_unpermute_2d,
     token_unpermute_3d,
 )
-from ..types import DimensionType, NoneType
+from .._types import DimensionType, NoneType
 from ..utils import log
 from ..utils.device import get_device_cc, is_cuda
 

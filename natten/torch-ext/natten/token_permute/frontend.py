@@ -32,7 +32,7 @@ from ..token_permute.cutlass_impl import (
     token_unpermute_cutlass,
 )
 from ..token_permute.torch_impl import token_permute_torch, token_unpermute_torch
-from ..types import DimensionType
+from .._types import DimensionType
 from ..utils import log
 from ..utils.tuples import ceil_div_tuple, mul_tuple
 

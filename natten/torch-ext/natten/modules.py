@@ -26,7 +26,7 @@ import torch  # noqa: F401
 from torch import nn, Tensor
 
 from .functional import neighborhood_attention_generic
-from .types import (
+from ._types import (
     CausalArg1DTypeOrDed,
     CausalArg2DTypeOrDed,
     CausalArg3DTypeOrDed,

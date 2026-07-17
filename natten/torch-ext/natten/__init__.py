@@ -63,6 +63,18 @@ from .modules import (
 )
 from .version import __version__
 
+# kernel-builder port: the package contents are installed flat into the build
+# variant directory, so a module literally named `types` would shadow the
+# standard library `types` module whenever that directory is on PYTHONPATH
+# (e.g. kernel-builder test shells and CI runners), breaking interpreter
+# startup. The module therefore lives in `_types`; alias it here so
+# `natten.types` keeps working like upstream.
+import sys as _sys
+
+from . import _types as types
+
+_sys.modules[__name__ + ".types"] = types
+
 __all__ = [
     "__version__",
     "NeighborhoodAttention1D",

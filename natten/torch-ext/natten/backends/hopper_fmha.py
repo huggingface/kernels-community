@@ -37,7 +37,7 @@ from ..backends.configs.cutlass_hopper import (
     check_cutlass_hopper_fmha_backward_config,
     check_cutlass_hopper_fmha_forward_config,
 )
-from ..types import (
+from .._types import (
     CutlassHopperFmhaBackwardConfigType,
     CutlassHopperFmhaForwardConfigType,
     KernelSchedule,

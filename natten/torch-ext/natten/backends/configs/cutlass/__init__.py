@@ -54,7 +54,7 @@ from ....backends.configs.cutlass.fna_forward_64x128 import (
 from ....backends.configs.cutlass.fna_forward_64x64 import (
     _FNA_FORWARD_64x64_TILE_SIZES,
 )
-from ....types import (
+from ...._types import (
     CutlassFmhaBackwardConfigType,
     CutlassFmhaForwardConfigType,
     CutlassFnaBackwardConfigType,
