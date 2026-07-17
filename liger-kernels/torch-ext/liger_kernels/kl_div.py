@@ -7,6 +7,7 @@ import triton.language as tl
 from .utils import ensure_contiguous
 from .utils import is_hip
 from .utils import infer_device
+from .utils import device_context
 
 
 def get_num_warps(BLOCK_SIZE):
@@ -130,20 +131,21 @@ def kldiv_forward_triton(y_pred, y_true, log_target, reduction, eps):  # [BT, V]
     out_size = (BT, V) if reduction == _REDUCTION_MODE_NONE.value else (BT,)
     output_tensor = torch.zeros(out_size, device=y_pred.device, dtype=torch.float32)
 
-    _kldiv_kernel_forward[grid](
-        y_pred,
-        y_pred.stride(0),
-        y_true,
-        y_true.stride(0),
-        output_tensor,
-        output_tensor.stride(0),
-        V,
-        eps=eps,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-        log_target=log_target,
-        reduction=reduction,
-    )
+    with device_context(y_pred.device):
+        _kldiv_kernel_forward[grid](
+            y_pred,
+            y_pred.stride(0),
+            y_true,
+            y_true.stride(0),
+            output_tensor,
+            output_tensor.stride(0),
+            V,
+            eps=eps,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+            log_target=log_target,
+            reduction=reduction,
+        )
 
     # calculated according to the reduction mode same as in Pytorch. In the later versions, `mean` will be changed to the same behavior as `batchmean`
     # https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html
@@ -165,17 +167,18 @@ def kldiv_backward_triton(target, grad_output, new_grads, log_target):
 
     grid = (BT,)
 
-    # We store the gradients in-place in the input tensor
-    _kldiv_kernel_backward[grid](
-        target,
-        target.stride(0),
-        new_grads,
-        new_grads.stride(0),
-        V,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-        log_target=log_target,
-    )
+    with device_context(target.device):
+        # We store the gradients in-place in the input tensor
+        _kldiv_kernel_backward[grid](
+            target,
+            target.stride(0),
+            new_grads,
+            new_grads.stride(0),
+            V,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+            log_target=log_target,
+        )
 
     # If cross entropy is the last layer, grad_output is 1.0. Skip the mul then.
     if torch.equal(grad_output, torch.tensor(1.0, device=grad_output.device)):
