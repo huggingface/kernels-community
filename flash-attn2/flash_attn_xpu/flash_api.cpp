@@ -115,7 +115,7 @@ mha_fwd(
     }
 
     // Low-precision (FP8/FP4) inputs accumulate in float32 and produce a float32 output.
-    auto out_dtype = is_mxfp ? torch::kFloat32 : q_dtype;
+    auto out_dtype = is_mxfp ? torch::kFloat32 : c10::typeMetaToScalarType(q_dtype);
 
     at::Tensor out_padded;
     if (out_.has_value()) {
@@ -493,7 +493,7 @@ mha_varlen_fwd(
     at::Tensor k_padded = maybe_pad(k);
     at::Tensor v_padded = maybe_pad(v);
 
-    auto out_dtype = is_mxfp ? torch::kFloat32 : q_dtype;
+    auto out_dtype = is_mxfp ? torch::kFloat32 : c10::typeMetaToScalarType(q_dtype);
     at::Tensor out_padded;
     if (out_.has_value()) {
         out_padded = maybe_pad(out_.value());
