@@ -50,10 +50,9 @@ from .utils import (
     routed_rows,
     tokens_per_expert_bucket,
     resolve_input_recipe,
-    load_grouped_weight_tile,
-    load_grouped_act_tile,
-    load_mx_grouped_act,
-    load_mx_grouped_weight,
+    grouped_load_act,
+    grouped_load_weight,
+    accumulate,
     descriptor_box_pruner,
     stacked_gate_up_ptrs,
     grouped_gemm_epilogue,
@@ -64,13 +63,11 @@ from .utils import (
     weight_block_size,
     e2m1_as_uint8,
     ue8m0_as_uint8,
-    block_dynamic_dot,
     swizzle_mx_scales,
     swizzle_grouped_mx_scales,
     swizzle_gateup_weight_scales,
     mx_act_quant_swizzled_grouped,
     swizzled_scales_bm_pruner,
-    mx_compute,
 )
 
 
@@ -272,14 +269,10 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             GATE,
             False,
         )
-        if GATE:
-            gate_s_ptr = Bs + expert_id64 * stride_bs_e + pid_n * stride_bs_n
-            up_s_ptr = (
-                Bs + expert_id64 * stride_bs_e + (num_n_tiles + pid_n) * stride_bs_n
-            )
-        else:
-            bs_ptrs = Bs + expert_id64 * stride_bs_e + pid_n * stride_bs_n
-
+        # gate scale block, up scale block (N tiles away); non-GATE reads the single block
+        # (up_s_ptr dead, == gate_s_ptr).
+        gate_s_ptr = Bs + expert_id64 * stride_bs_e + pid_n * stride_bs_n
+        up_s_ptr = Bs + expert_id64 * stride_bs_e + (num_n_tiles + pid_n) * stride_bs_n
         # descriptor box coordinates: expert slab (x2 under GATE), N offset; without a
         # gather the A rows are contiguous, so their min IS the box row start
         row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
@@ -290,46 +283,21 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             (BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N), dtype=tl.float32
         )
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-            a = load_grouped_act_tile(
-                a_ptrs,
-                ADescriptor,
-                m_start,
-                k * BLOCK_SIZE_K,
-                row_mask,
-                in_row,
-                A_MEMORY_MODE,
-                HAS_GATHER,
+            a, a_s = grouped_load_act(
+                "block_dynamic", a_ptrs, ADescriptor, ADescriptor, as_ptrs, m_start,
+                k * BLOCK_SIZE_K, 0, k, row_mask, in_row, BLOCK_SIZE_M, 0, 0,
+                A_MEMORY_MODE, HAS_GATHER,
             )
-            a_s = tl.load(as_ptrs, mask=row_mask, other=0.0)
-            w = load_grouped_weight_tile(
-                b_ptrs,
-                BDescriptor,
-                row0,
-                n_off,
-                k * BLOCK_SIZE_K,
-                BLOCK_SIZE_N,
-                BLOCK_SIZE_K,
-                GATE,
-                B_MEMORY_MODE,
+            w, w_s = grouped_load_weight(
+                "block_dynamic", b_ptrs, BDescriptor, BDescriptor, gate_s_ptr, up_s_ptr, k,
+                stride_bs_k, row0, n_off, k * BLOCK_SIZE_K, 0, BLOCK_SIZE_N, BLOCK_SIZE_K, 0, 0,
+                GATE, B_MEMORY_MODE,
             )
-            if GATE:
-                # gate scale on the first BN columns, up scale on the rest (raw — the
-                # block_dynamic_dot arm decodes fp32/UE8M0 or broadcasts for dot_scaled)
-                w_s = tl.where(
-                    tl.arange(0, 2 * BLOCK_SIZE_N) < BLOCK_SIZE_N,
-                    tl.load(gate_s_ptr),
-                    tl.load(up_s_ptr),
-                )
-                gate_s_ptr += stride_bs_k
-                up_s_ptr += stride_bs_k
-            else:
-                w_s = tl.load(bs_ptrs)
-                bs_ptrs += stride_bs_k
-            acc = block_dynamic_dot(
-                acc, a, a_s, w, w_s, BLOCK_SIZE_K, False, USE_DOT_SCALED
+            acc = accumulate(
+                acc, a, a_s, w, w_s, "block_dynamic", "dot", False, USE_DOT_SCALED,
+                BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
             )
             a_ptrs += BLOCK_SIZE_K * stride_a_k
-            as_ptrs += 1
             b_ptrs += BLOCK_SIZE_K * stride_b_k
 
         grouped_gemm_epilogue(
@@ -492,30 +460,23 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             (BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N), dtype=tl.float32
         )
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-            a = load_grouped_act_tile(
-                a_ptrs,
-                ADescriptor,
-                m_start,
-                k * BLOCK_SIZE_K,
-                row_mask,
-                in_row,
-                A_MEMORY_MODE,
-                HAS_GATHER,
+            a, _as = grouped_load_act(
+                "tensor", a_ptrs, ADescriptor, ADescriptor, As, m_start,
+                k * BLOCK_SIZE_K, 0, k, row_mask, in_row, BLOCK_SIZE_M, 0, 0,
+                A_MEMORY_MODE, HAS_GATHER,
             )
-            w = load_grouped_weight_tile(
-                b_ptrs,
-                BDescriptor,
-                row0,
-                n_off,
-                k * BLOCK_SIZE_K,
-                BLOCK_SIZE_N,
-                BLOCK_SIZE_K,
-                GATE,
-                B_MEMORY_MODE,
+            w, _ws = grouped_load_weight(
+                "tensor", b_ptrs, BDescriptor, BDescriptor, Bs, Bs, k, 0,
+                row0, n_off, k * BLOCK_SIZE_K, 0, BLOCK_SIZE_N, BLOCK_SIZE_K, 0, 0,
+                GATE, B_MEMORY_MODE,
             )
-            acc += tl.dot(a, w)
+            acc = accumulate(
+                acc, a, _as, w, _ws, "tensor", "dot", False, False,
+                BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            )
             a_ptrs += BLOCK_SIZE_K * stride_a_k
             b_ptrs += BLOCK_SIZE_K * stride_b_k
+        # per-token activation scale and per-expert tensor weight scale, applied once post-loop
         acc = acc * a_s[:, None] * b_s
 
         grouped_gemm_epilogue(
@@ -705,49 +666,18 @@ def mx_dynamic_matmul_grouped_kernel(
         SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
         REP_K: tl.constexpr = SCALE_COLS // 4
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            a, a_scale = load_mx_grouped_act(
-                a_ptrs,
-                ADescriptor,
-                ASDescriptor,
-                m_start,
-                ka_off,
-                pid_m,
-                k,
-                row_mask,
-                in_row,
-                BLOCK_SIZE_M,
-                REP_K,
-                SCALE_COLS,
-                A_MEMORY_MODE,
-                HAS_GATHER,
+            a, a_s = grouped_load_act(
+                "mx", a_ptrs, ADescriptor, ASDescriptor, A, m_start, ka_off, pid_m, k,
+                row_mask, in_row, BLOCK_SIZE_M, REP_K, SCALE_COLS, A_MEMORY_MODE, HAS_GATHER,
             )
-            b, b_s = load_mx_grouped_weight(
-                b_ptrs,
-                BDescriptor,
-                BSDescriptor,
-                row0,
-                n_off,
-                kb_off,
-                weight_blk,
-                k,
-                BLOCK_SIZE_N,
-                BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE,
-                REP_K,
-                SCALE_COLS,
-                GATE,
-                B_MEMORY_MODE,
+            w, w_s = grouped_load_weight(
+                "mx", b_ptrs, BDescriptor, BSDescriptor, Bs, Bs, k, stride_bs_k,
+                row0, n_off, kb_off, weight_blk, BLOCK_SIZE_N,
+                BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE, REP_K, SCALE_COLS, GATE, B_MEMORY_MODE,
             )
-            acc = mx_compute(
-                acc,
-                a,
-                a_scale,
-                b,
-                b_s,
-                COMPUTE_MODE,
-                BLOCK_SIZE_M,
-                BLOCK_SIZE_N,
-                BLOCK_SIZE_K,
-                SCALE_GROUP_K,
+            acc = accumulate(
+                acc, a, a_s, w, w_s, "mx", COMPUTE_MODE, False, False,
+                BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K,
             )
             a_ptrs += (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k
             ka_off += BLOCK_SIZE_K // ACT_VALUES_PER_BYTE
@@ -907,28 +837,20 @@ def full_precision_matmul_grouped_kernel(
             (BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N), dtype=tl.float32
         )
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-            a = load_grouped_act_tile(
-                a_ptrs,
-                ADescriptor,
-                m_start,
-                k * BLOCK_SIZE_K,
-                row_mask,
-                in_row,
-                A_MEMORY_MODE,
-                HAS_GATHER,
+            a, _as = grouped_load_act(
+                "full_precision", a_ptrs, ADescriptor, ADescriptor, A, m_start,
+                k * BLOCK_SIZE_K, 0, k, row_mask, in_row, BLOCK_SIZE_M, 0, 0,
+                A_MEMORY_MODE, HAS_GATHER,
             )
-            w = load_grouped_weight_tile(
-                b_ptrs,
-                BDescriptor,
-                row0,
-                n_off,
-                k * BLOCK_SIZE_K,
-                BLOCK_SIZE_N,
-                BLOCK_SIZE_K,
-                GATE,
-                B_MEMORY_MODE,
+            w, _ws = grouped_load_weight(
+                "full_precision", b_ptrs, BDescriptor, BDescriptor, B, B, k, 0,
+                row0, n_off, k * BLOCK_SIZE_K, 0, BLOCK_SIZE_N, BLOCK_SIZE_K, 0, 0,
+                GATE, B_MEMORY_MODE,
             )
-            acc += tl.dot(a, w)
+            acc = accumulate(
+                acc, a, _as, w, _ws, "full_precision", "dot", False, False,
+                BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            )
             a_ptrs += BLOCK_SIZE_K * stride_a_k
             b_ptrs += BLOCK_SIZE_K * stride_b_k
 

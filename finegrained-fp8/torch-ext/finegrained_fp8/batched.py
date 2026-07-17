@@ -27,15 +27,14 @@ from .utils import (
     FP8_DTYPE,
     MX_SCALE_GROUP_K,
     NIBBLES_PER_BYTE,
-    decode_group_scale,
     device_context,
     tl_dtype,
     resolve_input_recipe,
     resolve_output_dtype,
-    mx_compute,
+    accumulate,
     oriented_tile_ptrs,
     acc_init,
-    fp8_dot,
+    block_dynamic_batched_dot,
     mx_config_pruner,
     smem_pruner,
     block_within_dim_pruner,
@@ -218,52 +217,30 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_a_k
     as_ptrs = As + in_row * stride_as_m + tl.zeros((BLOCK_SIZE_M,), tl.int32)
-    # GATE loads gate (rows [0,N)) and up (rows [N,2N)) as two oriented tiles + two dots — the
-    # decode-validated form (the swapped stacked-scale orientation is why we keep two dots here).
-    if GATE:
-        up_n = N + offs_bn
-        b_gate_ptr = oriented_tile_ptrs(
-            B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB
-        )
-        b_up_ptr = oriented_tile_ptrs(B, up_n, offs_k, stride_b_n, stride_b_k, SWAP_AB)
-        bs_gate_ptr = Bs + pid_n * stride_bs_n
-        bs_up_ptr = Bs + (num_n_tiles + pid_n) * stride_bs_n
-        acc_gate = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
-        acc_up = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
-    else:
-        b_ptrs = oriented_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
-        bs_ptrs = Bs + pid_n * stride_bs_n
-        accumulator = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+    # gate|up weight streams: gate at rows [0,N), up at [N,2N). The two-dot gate|up form is the
+    # swap-orientation, decode-validated shape (a stacked tile can't take it here). The up
+    # stream's pointers are built unconditionally (pointer arithmetic only — the up value/scale
+    # loads are constexpr-gated by GATE inside block_dynamic_batched_dot, so non-gate never
+    # dereferences them).
+    wg_ptr = oriented_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
+    bsg_ptr = Bs + pid_n * stride_bs_n
+    wu_ptr = oriented_tile_ptrs(B, N + offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
+    bsu_ptr = Bs + (num_n_tiles + pid_n) * stride_bs_n
+    acc_gate = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+    acc_up = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a, a_s = load_block_fp8_act_tile(a_ptrs, as_ptrs)
-        # a_s is [BM] (decoded: fp32 passes through, UE8M0/uint8 -> 2^(exp-127)); it broadcasts
-        # onto the acc either way (under swap BM=1, so it is the single token's scale).
-        if GATE:
-            acc_gate += (
-                fp8_dot(a, tl.load(b_gate_ptr), SWAP_AB, BLOCK_SIZE_K)
-                * decode_group_scale(a_s)[:, None]
-                * decode_group_scale(tl.load(bs_gate_ptr))
-            )
-            acc_up += (
-                fp8_dot(a, tl.load(b_up_ptr), SWAP_AB, BLOCK_SIZE_K)
-                * decode_group_scale(a_s)[:, None]
-                * decode_group_scale(tl.load(bs_up_ptr))
-            )
-            b_gate_ptr += BLOCK_SIZE_K * stride_b_k
-            b_up_ptr += BLOCK_SIZE_K * stride_b_k
-            bs_gate_ptr += stride_bs_k
-            bs_up_ptr += stride_bs_k
-        else:
-            accumulator += (
-                fp8_dot(a, tl.load(b_ptrs), SWAP_AB, BLOCK_SIZE_K)
-                * decode_group_scale(a_s)[:, None]
-                * decode_group_scale(tl.load(bs_ptrs))
-            )
-            b_ptrs += BLOCK_SIZE_K * stride_b_k
-            bs_ptrs += stride_bs_k
+        acc_gate, acc_up = block_dynamic_batched_dot(
+            acc_gate, acc_up, a, a_s, wg_ptr, wu_ptr, bsg_ptr, bsu_ptr,
+            GATE, SWAP_AB, BLOCK_SIZE_K,
+        )
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         as_ptrs += 1
+        wg_ptr += BLOCK_SIZE_K * stride_b_k
+        wu_ptr += BLOCK_SIZE_K * stride_b_k
+        bsg_ptr += stride_bs_k
+        bsu_ptr += stride_bs_k
 
     if GATE:
         acc_gate = acc_finalize(acc_gate, "dot", BLOCK_SIZE_N, SWAP_AB)
@@ -288,7 +265,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         else:
             store_row(C, intermediate, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
     else:
-        accumulator = acc_finalize(accumulator, "dot", BLOCK_SIZE_N, SWAP_AB)
+        accumulator = acc_finalize(acc_gate, "dot", BLOCK_SIZE_N, SWAP_AB)
         store_row(C, accumulator, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
@@ -379,7 +356,10 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs)
         b = tl.load(b_ptrs)
-        accumulator += fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K)
+        accumulator = accumulate(
+            accumulator, a, a, b, b, "tensor", "dot", SWAP_AB, False,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
+        )
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
 
@@ -548,18 +528,9 @@ def mx_dynamic_matmul_batched_kernel(
             SWAP_AB,
         )
         b_s = tl.reshape(tl.load(bs_ptrs), (n_width, BLOCK_SIZE_K // SCALE_GROUP_K))
-        accumulator = mx_compute(
-            accumulator,
-            a,
-            a_scale,
-            b,
-            b_s,
-            COMPUTE_MODE,
-            BLOCK_SIZE_M,
-            n_width,
-            BLOCK_SIZE_K,
-            SCALE_GROUP_K,
-            SWAP_AB,
+        accumulator = accumulate(
+            accumulator, a, a_scale, b, b_s, "mx", COMPUTE_MODE, SWAP_AB, False,
+            BLOCK_SIZE_M, n_width, BLOCK_SIZE_K, SCALE_GROUP_K,
         )
         a_ptrs += (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k
         b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
@@ -700,7 +671,10 @@ def full_precision_matmul_batched_kernel(
         w = stacked_gate_up_flatten(
             tl.load(b_ptrs), 2 * BLOCK_SIZE_N, BLOCK_SIZE_K, GATE, SWAP_AB
         )
-        accumulator += fp8_dot(a, w, SWAP_AB, BLOCK_SIZE_K)
+        accumulator = accumulate(
+            accumulator, a, a, w, w, "full_precision", "dot", SWAP_AB, False,
+            BLOCK_SIZE_M, n_width, BLOCK_SIZE_K,
+        )
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
 

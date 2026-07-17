@@ -20,7 +20,10 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
 from .utils import (
-    mx_compute,
+    matmul_load_act,
+    matmul_load_weight,
+    accumulate,
+    advance_ptrs,
     FP8_DTYPE,
     compile_time_only_triton_op,
     compile_time_only_triton_wrap,
@@ -28,20 +31,14 @@ from .utils import (
     acc_init,
     mx_config_pruner,
     smem_pruner,
-    block_dynamic_dot,
     scalar_max_m_pruner,
     block_within_dim_pruner,
     compose_pruners,
-    decode_group_scale,
     descriptor_box_pruner,
     matched_memory_modes_pruner,
     device_context,
     fp8_act_quant_tensor_wide,
     fp8_act_quant_block_dynamic,
-    load_block_fp8_act_tile,
-    load_weight_tile,
-    load_mx_2d_act,
-    load_mx_2d_weight,
     maybe_swizzle_mx_scales,
     oriented_tile_ptrs,
     weight_tile_descriptor,
@@ -271,29 +268,23 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     accumulator = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
 
     for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
-        a, a_s = load_block_fp8_act_tile(
-            a_ptrs,
-            as_ptrs,
-            a_descriptor,
-            pid_m * BLOCK_SIZE_M,
-            k * block_k,
-            A_MEMORY_MODE,
-            as_mask,
-            TRANSPOSED=SWAP_AB,
+        a, a_s = matmul_load_act(
+            "block_dynamic", a_ptrs, as_ptrs, as_mask, a_descriptor,
+            pid_m * BLOCK_SIZE_M, k * block_k, A_MEMORY_MODE, SWAP_AB,
         )
-        b = load_weight_tile(
-            b_ptrs, b_descriptor, pid_n * BLOCK_SIZE_N, k * block_k, B_MEMORY_MODE, SWAP_AB
+        b, b_s = matmul_load_weight(
+            "block_dynamic", b_ptrs, bs_ptrs, bs_mask, b_descriptor,
+            pid_n * BLOCK_SIZE_N, k * block_k, B_MEMORY_MODE, SWAP_AB,
         )
-        b_s = tl.load(bs_ptrs, mask=bs_mask, other=0.0)
-        accumulator = block_dynamic_dot(
-            accumulator, a, a_s, b, b_s, block_k, SWAP_AB, USE_DOT_SCALED
+        accumulator = accumulate(
+            accumulator, a, a_s, b, b_s, "block_dynamic", "dot", SWAP_AB, USE_DOT_SCALED,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, block_k,
         )
-        as_ptrs += 1
-        bs_ptrs += stride_bs_k
-        if A_MEMORY_MODE == "pointer":
-            a_ptrs += block_k * stride_a_k
-        if B_MEMORY_MODE == "pointer":
-            b_ptrs += block_k * stride_b_k
+        a_ptrs, b_ptrs, as_ptrs, bs_ptrs = advance_ptrs(
+            a_ptrs, b_ptrs, as_ptrs, bs_ptrs,
+            block_k * stride_a_k, block_k * stride_b_k, 1, stride_bs_k,
+            A_MEMORY_MODE, B_MEMORY_MODE, True,
+        )
 
     store_masked_oriented(
         C,
@@ -367,11 +358,14 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     b_s = tl.load(Bs)
 
     # Accumulate raw dot products, apply scales once after the loop.
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, False)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-        a = tl.load(a_ptrs)
-        b = tl.load(b_ptrs)
-        accumulator += tl.dot(a, b)
+        a, _as = matmul_load_act("tensor", a_ptrs, a_ptrs, None, a_ptrs, 0, 0, "pointer")
+        b, _bs = matmul_load_weight("tensor", b_ptrs, b_ptrs, None, b_ptrs, 0, 0, "pointer")
+        accumulator = accumulate(
+            accumulator, a, _as, b, _bs, "tensor", "dot", False, False,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
+        )
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
 
@@ -448,15 +442,16 @@ def w8a8_block_static_fp8_matmul_kernel(
     bs_ptrs = Bs + (offs_bn // block_n) * stride_bs_n
     a_s_static = tl.load(As)
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, False)
     for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
-        if A.dtype.element_ty == tl.float8e4nv:  # pre-quantized offline
-            a = tl.load(a_ptrs)
-        else:  # raw bf16/fp16 — quantize inline against the static scale
-            a = (tl.load(a_ptrs).to(tl.float32) / a_s_static).to(tl.float8e4nv)
-        b = tl.load(b_ptrs)
-        b_s = decode_group_scale(tl.load(bs_ptrs))
-        accumulator += tl.dot(a, b) * b_s[None, :]
+        a, _as = matmul_load_act(
+            "static", a_ptrs, a_ptrs, None, a_ptrs, 0, 0, "pointer", a_s_static=a_s_static
+        )
+        b, b_s = matmul_load_weight("static", b_ptrs, bs_ptrs, None, b_ptrs, 0, 0, "pointer")
+        accumulator = accumulate(
+            accumulator, a, _as, b, b_s, "static", "dot", False, False,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, block_k,
+        )
         a_ptrs += block_k * stride_a_k
         b_ptrs += block_k * stride_b_k
         bs_ptrs += stride_bs_k
@@ -609,60 +604,33 @@ def mx_dynamic_matmul_kernel(
     else:
         b_ptrs = B
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, False)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a, a_scale = load_mx_2d_act(
-            a_ptrs,
-            as_ptrs,
-            as_mask,
-            ADescriptor,
-            ASDescriptor,
-            pid_m * BLOCK_SIZE_M,
-            k * (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE),
-            pid_m,
-            k,
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_K,
-            SCALE_GROUP_K,
-            A_MEMORY_MODE,
-            SWIZZLED_SCALES,
-            INPUT_RECIPE,
+        a, a_s = matmul_load_act(
+            "mx", a_ptrs, as_ptrs, as_mask, ADescriptor, pid_m * BLOCK_SIZE_M,
+            k * (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE), A_MEMORY_MODE, False,
+            as_descriptor=ASDescriptor, pid_m=pid_m, k=k, BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_K=BLOCK_SIZE_K, SCALE_GROUP_K=SCALE_GROUP_K,
+            SWIZZLED=SWIZZLED_SCALES, INPUT_RECIPE=INPUT_RECIPE,
         )
-        b, b_s = load_mx_2d_weight(
-            b_ptrs,
-            bs_ptrs,
-            bs_mask,
-            BDescriptor,
-            BSDescriptor,
-            pid_n * BLOCK_SIZE_N,
-            k * (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
-            pid_n,
-            k,
-            BLOCK_SIZE_N,
-            BLOCK_SIZE_K,
-            SCALE_GROUP_K,
-            B_MEMORY_MODE,
-            SWIZZLED_SCALES,
+        b, b_s = matmul_load_weight(
+            "mx", b_ptrs, bs_ptrs, bs_mask, BDescriptor, pid_n * BLOCK_SIZE_N,
+            k * (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE), B_MEMORY_MODE, False,
+            bs_descriptor=BSDescriptor, pid_n=pid_n, k=k, BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K, SCALE_GROUP_K=SCALE_GROUP_K, SWIZZLED=SWIZZLED_SCALES,
         )
-        accumulator = mx_compute(
-            accumulator,
-            a,
-            a_scale,
-            b,
-            b_s,
-            COMPUTE_MODE,
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-            BLOCK_SIZE_K,
-            SCALE_GROUP_K,
+        accumulator = accumulate(
+            accumulator, a, a_s, b, b_s, "mx", COMPUTE_MODE, False, False,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K,
         )
-        if not SWIZZLED_SCALES:  # swizzled arm re-derives the scale box offset from k
-            as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
-            bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
-        if A_MEMORY_MODE == "pointer":  # descriptor arm re-derives the box K offset from k
-            a_ptrs += (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k
-        if B_MEMORY_MODE == "pointer":
-            b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
+        a_ptrs, b_ptrs, as_ptrs, bs_ptrs = advance_ptrs(
+            a_ptrs, b_ptrs, as_ptrs, bs_ptrs,
+            (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k,
+            (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k,
+            BLOCK_SIZE_K // SCALE_GROUP_K,
+            (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k,
+            A_MEMORY_MODE, B_MEMORY_MODE, not SWIZZLED_SCALES,
+        )
 
     store_masked(
         C,

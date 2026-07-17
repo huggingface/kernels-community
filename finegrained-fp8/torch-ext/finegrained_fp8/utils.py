@@ -2466,6 +2466,97 @@ def load_mx_grouped_weight(
 
 
 @triton.jit
+def grouped_load_act(
+    RECIPE: tl.constexpr,
+    a_ptrs,
+    a_descriptor,
+    as_descriptor,
+    as_ptrs,
+    m_start,
+    ka_off,
+    pid_m,
+    k,
+    row_mask,
+    gather_rows,
+    BLOCK_SIZE_M: tl.constexpr,
+    REP_K: tl.constexpr,
+    SCALE_COLS: tl.constexpr,
+    A_MEMORY_MODE: tl.constexpr,
+    A_GATHER: tl.constexpr,
+):
+    """Unified grouped activation K-tile as ``(values, scale)`` for every recipe, so the four
+    grouped loops read identically. ``mx``: values + pre-swizzled SWIZZLE_32_4_4 scale
+    (``load_mx_grouped_act``). ``block_dynamic``: values + the per-row, per-K-block scale read
+    contiguously at ``as_ptrs + k``. ``tensor``/``full_precision``: values only — the per-row/
+    per-tensor scale (if any) is applied post-loop; ``a_s`` is returned dead. Only the taken
+    recipe arm compiles."""
+    if RECIPE == "mx":
+        a, a_s = load_mx_grouped_act(
+            a_ptrs, a_descriptor, as_descriptor, m_start, ka_off, pid_m, k,
+            row_mask, gather_rows, BLOCK_SIZE_M, REP_K, SCALE_COLS, A_MEMORY_MODE, A_GATHER,
+        )
+    else:
+        a = load_grouped_act_tile(
+            a_ptrs, a_descriptor, m_start, ka_off, row_mask, gather_rows, A_MEMORY_MODE, A_GATHER
+        )
+        if RECIPE == "block_dynamic":
+            a_s = tl.load(as_ptrs + k, mask=row_mask, other=0.0)
+        else:
+            a_s = a
+    return a, a_s
+
+
+@triton.jit
+def grouped_load_weight(
+    RECIPE: tl.constexpr,
+    w_ptrs,
+    w_descriptor,
+    bs_descriptor,
+    gate_s_ptr,
+    up_s_ptr,
+    k,
+    stride_bs_k,
+    row0,
+    n_off,
+    kb_off,
+    blk_idx,
+    BLOCK_SIZE_N: tl.constexpr,
+    KB: tl.constexpr,
+    REP_K: tl.constexpr,
+    SCALE_COLS: tl.constexpr,
+    GATE: tl.constexpr,
+    B_MEMORY_MODE: tl.constexpr,
+):
+    """Unified grouped weight K-tile as ``(values, scale)`` for every recipe. ``mx``: values +
+    pre-swizzled scale (``load_mx_grouped_weight``). ``block_dynamic``: (optionally gate|up-
+    stacked) values + the per-K-block scale read at ``gate_s_ptr + k*stride`` (GATE folds gate
+    on the first ``BN`` columns, up on the rest; non-GATE reads only the gate block, ``up_s_ptr``
+    unused). ``tensor``/``full_precision``: values only — the per-tensor
+    scale is applied post-loop; ``w_s`` is returned dead. Only the taken recipe arm compiles."""
+    if RECIPE == "mx":
+        w, w_s = load_mx_grouped_weight(
+            w_ptrs, w_descriptor, bs_descriptor, row0, n_off, kb_off, blk_idx, k,
+            BLOCK_SIZE_N, KB, REP_K, SCALE_COLS, GATE, B_MEMORY_MODE,
+        )
+    else:
+        w = load_grouped_weight_tile(
+            w_ptrs, w_descriptor, row0, n_off, kb_off, BLOCK_SIZE_N, KB, GATE, B_MEMORY_MODE
+        )
+        if RECIPE == "block_dynamic":
+            if GATE:
+                w_s = tl.where(
+                    tl.arange(0, 2 * BLOCK_SIZE_N) < BLOCK_SIZE_N,
+                    tl.load(gate_s_ptr + k * stride_bs_k),
+                    tl.load(up_s_ptr + k * stride_bs_k),
+                )
+            else:
+                w_s = tl.load(gate_s_ptr + k * stride_bs_k)
+        else:
+            w_s = w
+    return w, w_s
+
+
+@triton.jit
 def load_weight_tile(
     w_ptrs, w_descriptor, row_off, k_off, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr = False
 ):
@@ -2565,6 +2656,125 @@ def load_mx_2d_weight(
 
 
 @triton.jit
+def matmul_load_act(
+    RECIPE: tl.constexpr,
+    a_ptrs,
+    as_ptrs,
+    as_mask,
+    a_descriptor,
+    m_off,
+    k_off,
+    A_MEMORY_MODE: tl.constexpr,
+    SWAP_AB: tl.constexpr = False,
+    as_descriptor=0,
+    a_s_static=0.0,
+    pid_m=0,
+    k=0,
+    BLOCK_SIZE_M: tl.constexpr = 0,
+    BLOCK_SIZE_K: tl.constexpr = 0,
+    SCALE_GROUP_K: tl.constexpr = 32,
+    SWIZZLED: tl.constexpr = False,
+    INPUT_RECIPE: tl.constexpr = "mxfp8",
+):
+    """Unified 2D activation K-tile as ``(values, scale)`` for every recipe, so the four 2D
+    loops read identically. ``mx``: ``load_mx_2d_act`` (swizzled/affine/in-register scale).
+    ``block_dynamic``: ``load_block_fp8_act_tile`` (per-row per-K-block scale, swap-aware).
+    ``static``: offline-quantized load, or inline ``(A / As).to(fp8)`` against the scalar
+    ``a_s_static``. ``tensor``: plain values. The per-tensor/row scales for static/tensor are
+    applied post-loop, so ``a_s`` is returned dead there. Only the taken recipe arm compiles."""
+    if RECIPE == "mx":
+        a, a_s = load_mx_2d_act(
+            a_ptrs, as_ptrs, as_mask, a_descriptor, as_descriptor, m_off, k_off, pid_m, k,
+            BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, A_MEMORY_MODE, SWIZZLED, INPUT_RECIPE,
+        )
+    elif RECIPE == "block_dynamic":
+        a, a_s = load_block_fp8_act_tile(
+            a_ptrs, as_ptrs, a_descriptor, m_off, k_off, A_MEMORY_MODE, as_mask, SWAP_AB
+        )
+    elif RECIPE == "static":
+        if a_ptrs.dtype.element_ty == tl.float8e4nv:
+            a = tl.load(a_ptrs)
+        else:  # raw bf16/fp16 — quantize inline against the static scale
+            a = (tl.load(a_ptrs).to(tl.float32) / a_s_static).to(tl.float8e4nv)
+        a_s = a
+    else:  # tensor
+        a = tl.load(a_ptrs)
+        a_s = a
+    return a, a_s
+
+
+@triton.jit
+def matmul_load_weight(
+    RECIPE: tl.constexpr,
+    b_ptrs,
+    bs_ptrs,
+    bs_mask,
+    b_descriptor,
+    n_off,
+    k_off,
+    B_MEMORY_MODE: tl.constexpr,
+    SWAP_AB: tl.constexpr = False,
+    bs_descriptor=0,
+    pid_n=0,
+    k=0,
+    BLOCK_SIZE_N: tl.constexpr = 0,
+    BLOCK_SIZE_K: tl.constexpr = 0,
+    SCALE_GROUP_K: tl.constexpr = 32,
+    SWIZZLED: tl.constexpr = False,
+):
+    """Unified 2D weight K-tile as ``(values, scale)`` for every recipe. ``mx``:
+    ``load_mx_2d_weight`` (swizzled/affine scale). ``block_dynamic``: ``load_weight_tile`` values
+    + the affine bounds-masked per-K-block scale. ``static``: values + the raw per-K-block scale
+    (``accumulate`` decodes it). ``tensor``: plain values, per-tensor scale applied post-loop
+    (``b_s`` dead). Only the taken recipe arm compiles."""
+    if RECIPE == "mx":
+        b, b_s = load_mx_2d_weight(
+            b_ptrs, bs_ptrs, bs_mask, b_descriptor, bs_descriptor, n_off, k_off, pid_n, k,
+            BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, B_MEMORY_MODE, SWIZZLED,
+        )
+    elif RECIPE == "block_dynamic":
+        b = load_weight_tile(b_ptrs, b_descriptor, n_off, k_off, B_MEMORY_MODE, SWAP_AB)
+        b_s = tl.load(bs_ptrs, mask=bs_mask, other=0.0)
+    elif RECIPE == "static":
+        b = tl.load(b_ptrs)
+        b_s = tl.load(bs_ptrs)
+    else:  # tensor
+        b = tl.load(b_ptrs)
+        b_s = b
+    return b, b_s
+
+
+@triton.jit
+def advance_ptrs(
+    a_ptrs,
+    b_ptrs,
+    as_ptrs,
+    bs_ptrs,
+    a_step,
+    b_step,
+    as_step,
+    bs_step,
+    A_MEMORY_MODE: tl.constexpr,
+    B_MEMORY_MODE: tl.constexpr,
+    ADVANCE_SCALES: tl.constexpr,
+):
+    """Advance the operand + scale pointers one K-step, folding the memory-mode / scale-layout
+    conditionals out of the 2D loops. Value pointers advance only on the pointer arm (a
+    descriptor arm re-derives the box K offset from ``k``, leaving its ``*_ptrs`` a dead
+    placeholder); the scale pointers advance only when read affine (``ADVANCE_SCALES`` — the
+    swizzled arm re-derives the box from ``k``; tensor scales are per-tensor/pre-loop). Pass a
+    dead pointer + step 0 for one a kernel doesn't carry. Returns the four advanced pointers."""
+    if A_MEMORY_MODE == "pointer":
+        a_ptrs += a_step
+    if B_MEMORY_MODE == "pointer":
+        b_ptrs += b_step
+    if ADVANCE_SCALES:
+        as_ptrs += as_step
+        bs_ptrs += bs_step
+    return a_ptrs, b_ptrs, as_ptrs, bs_ptrs
+
+
+@triton.jit
 def block_scaled_fp8_dot(a, a_scale, w, w_scale, SWAP_AB: tl.constexpr):
     """Plain fp8 ``tl.dot`` with the per-block scales applied, oriented: no-swap
     ``(M, N) = (a @ w) * a_s[:, None] * w_s[None, :]``; swapped the weight rows sit in the
@@ -2599,6 +2809,86 @@ def block_dynamic_dot(
     return acc + block_scaled_fp8_dot(
         a, decode_group_scale(a_s), b, decode_group_scale(b_s), SWAP_AB
     )
+
+
+@triton.jit
+def block_dynamic_batched_dot(
+    acc_gate,
+    acc_up,
+    a,
+    a_s,
+    wg_ptr,
+    wu_ptr,
+    bsg_ptr,
+    bsu_ptr,
+    GATE: tl.constexpr,
+    SWAP_AB: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """One block-dynamic batched (BM=1 decode) K-step: a single dot, or — under ``GATE`` — the
+    gate|up two-dot form (the swap-orientation, decode-validated shape) that a stacked tile can't
+    take here. Software scale decode (``decode_group_scale``: fp32 passthrough, UE8M0 ->
+    2^(exp-127)); the act scale broadcasts onto the (fake-batch BM=1) accumulator. Returns
+    ``(acc_gate, acc_up)`` — non-gate leaves ``acc_up`` untouched. Leaf helper: the GATE fork
+    lives here so the kernel loop reads as a straight-line matmul."""
+    a_sd = decode_group_scale(a_s)[:, None]
+    acc_gate += (
+        fp8_dot(a, tl.load(wg_ptr), SWAP_AB, BLOCK_SIZE_K)
+        * a_sd
+        * decode_group_scale(tl.load(bsg_ptr))
+    )
+    if GATE:
+        acc_up += (
+            fp8_dot(a, tl.load(wu_ptr), SWAP_AB, BLOCK_SIZE_K)
+            * a_sd
+            * decode_group_scale(tl.load(bsu_ptr))
+        )
+    return acc_gate, acc_up
+
+
+@triton.jit
+def accumulate(
+    acc,
+    a,
+    a_s,
+    b,
+    b_s,
+    RECIPE: tl.constexpr,
+    COMPUTE_MODE: tl.constexpr,
+    SWAP_AB: tl.constexpr,
+    USE_DOT_SCALED: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr = 32,
+):
+    """Unified K-step accumulate — the single "do math" of every matmul/grouped/batched kernel,
+    dispatched by ``RECIPE`` so the kernel loops are identical:
+
+    - ``"mx"``: microscaled MMA / dot+rescale / scalar (``mx_compute``), swap-aware.
+    - ``"block_dynamic"``: UE8M0 ``dot_scaled`` broadcast or fp8 ``tl.dot`` + software rescale
+      (``block_dynamic_dot``).
+    - ``"static"``: plain (swap-aware) dot + per-K-block weight rescale (the per-tensor act scale
+      is applied post-loop).
+    - ``"tensor"`` / ``"full_precision"``: plain (swap-aware) dot; per-row/per-tensor scale (if any)
+      is applied post-loop in the epilogue.
+
+    Single return (if/elif/else) — only the taken recipe arm compiles, so the dead arms are
+    never type-checked (e.g. the ``fp8_dot`` arms would reject packed-E2M1 activations, whose
+    reduction dim is halved vs an unpacked weight). ``a_s``/``b_s`` are dead on the recipes that
+    scale post-loop."""
+    if RECIPE == "mx":
+        acc = mx_compute(
+            acc, a, a_s, b, b_s,
+            COMPUTE_MODE, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, SWAP_AB,
+        )
+    elif RECIPE == "block_dynamic":
+        acc = block_dynamic_dot(acc, a, a_s, b, b_s, BLOCK_SIZE_K, SWAP_AB, USE_DOT_SCALED)
+    elif RECIPE == "static":
+        acc = acc + fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K) * decode_group_scale(b_s)[None, :]
+    else:  # tensor / full_precision
+        acc = acc + fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K)
+    return acc
 
 
 @triton.jit
