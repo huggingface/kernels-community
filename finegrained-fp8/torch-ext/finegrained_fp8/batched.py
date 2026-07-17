@@ -237,17 +237,17 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a, a_s = load_block_fp8_act_tile(a_ptrs, as_ptrs)
-        # a_s is [BM], the weight scales per-block scalars; a_s[:, None] broadcasts onto the acc
-        # either way (under swap BM=1, so it is the single token's scale) — no swap branch.
+        # a_s is [BM] (decoded: fp32 passes through, UE8M0/uint8 -> 2^(exp-127)); it broadcasts
+        # onto the acc either way (under swap BM=1, so it is the single token's scale).
         if GATE:
             acc_gate += (
                 fp8_dot(a, tl.load(b_gate_ptr), SWAP_AB, BLOCK_SIZE_K)
-                * a_s[:, None]
+                * decode_group_scale(a_s)[:, None]
                 * decode_group_scale(tl.load(bs_gate_ptr))
             )
             acc_up += (
                 fp8_dot(a, tl.load(b_up_ptr), SWAP_AB, BLOCK_SIZE_K)
-                * a_s[:, None]
+                * decode_group_scale(a_s)[:, None]
                 * decode_group_scale(tl.load(bs_up_ptr))
             )
             b_gate_ptr += BLOCK_SIZE_K * stride_b_k
@@ -257,7 +257,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         else:
             accumulator += (
                 fp8_dot(a, tl.load(b_ptrs), SWAP_AB, BLOCK_SIZE_K)
-                * a_s[:, None]
+                * decode_group_scale(a_s)[:, None]
                 * decode_group_scale(tl.load(bs_ptrs))
             )
             b_ptrs += BLOCK_SIZE_K * stride_b_k
@@ -278,7 +278,11 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
             INTERMEDIATE_DTYPE,
         )
         if OUTPUT_RECIPE is not None:
-            inter, inter_s = fp8_act_quant_inline(intermediate)
+            # UE8M0 intermediate under the whole-model UE8M0 contract (inferred from the
+            # scale tensor's dtype); fp32 otherwise — the down proj reads it either way.
+            inter, inter_s = fp8_act_quant_inline(
+                intermediate, UE8M0=Cs.dtype.element_ty == tl.uint8
+            )
             store_row(C, inter, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
             tl.store(Cs + out_row * stride_cs_m + pid_n * stride_cs_n, tl.max(inter_s))
         else:
@@ -773,7 +777,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
         f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, {n_rows // block_n}, {K // block_k})"
     )
 
-    Bs = ue8m0_as_uint8(Bs)
+    bs_u8 = ue8m0_as_uint8(Bs)
     # Offline quant wins here even at decode. An inline quant would rerun once per N-tile
     # of the (S x N-tiles) grid, and block-FP8 quant is an fp32 amax+div per element, so
     # the redundant work outweighs the extra launch down to T=1 (inline only edges ahead
@@ -793,12 +797,17 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     # A raw (As is None) -> quantize here (offline); else pre-quantized (As given, e.g. the
     # requantized intermediate handed to the down projection).
     if As is None:
-        A_q, A_s = fp8_act_quant_block_dynamic(A, block_k)
+        A_q, A_s = fp8_act_quant_block_dynamic(
+            A, block_k, use_ue8m0=bs_u8.dtype == torch.uint8
+        )
     else:
         A_q, A_s = A, As
     if requant:
         C = A.new_empty(S, N, dtype=FP8_DTYPE)
-        Cs = torch.empty(S, N // block_n, device=A.device, dtype=torch.float32)
+        # UE8M0 model (ue8m0 weights) -> UE8M0 intermediate scales (whole-model contract);
+        # the kernel infers the requant format from this dtype. fp32 weights keep fp32.
+        cs_dtype = bs_u8.dtype  # uint8 (UE8M0) or float32 — the whole-model scale format
+        Cs = torch.empty(S, N // block_n, device=A.device, dtype=cs_dtype)
     else:
         C = A.new_empty(S, N, dtype=output_dtype)
         Cs = expert_ids  # general dummy pointer; unread (no OUTPUT_RECIPE), strides literal
@@ -812,7 +821,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             A_q,
             A_s,
             B,
-            Bs,
+            bs_u8,
             C,
             Cs,
             expert_ids,
@@ -827,9 +836,9 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             B.stride(0),
             B.stride(2),
             B.stride(1),
-            Bs.stride(0),
-            Bs.stride(2),
-            Bs.stride(1),
+            bs_u8.stride(0),
+            bs_u8.stride(2),
+            bs_u8.stride(1),
             C.stride(0),
             C.stride(1),
             Cs.stride(0) if requant else 1,
@@ -887,7 +896,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     # Normalize Bs to (num_experts, 1, 1)
     Bs = normalize_per_expert_scale(Bs, num_experts)
 
-    Bs = ue8m0_as_uint8(Bs)
+    bs_u8 = ue8m0_as_uint8(Bs)
     if As is None:
         qA, As = fp8_act_quant_tensor_wide(A, K)
     else:
@@ -904,7 +913,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             qA,
             As,
             B,
-            Bs,
+            bs_u8,
             C,
             expert_ids,
             gather_idx if gather_idx is not None else expert_ids,
@@ -918,7 +927,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             B.stride(0),
             B.stride(2),
             B.stride(1),
-            Bs.stride(0),
+            bs_u8.stride(0),
             C.stride(0),
             C.stride(1),
             expert_ids.stride(0),
@@ -1001,10 +1010,10 @@ def mx_dynamic_matmul_batched(
         f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {n_rows}, {K // scale_group})"
     )
 
-    A = e2m1_as_uint8(A)
+    a_u8 = e2m1_as_uint8(A)
     if As is not None:
-        As = ue8m0_as_uint8(As)
-    B = e2m1_as_uint8(B)
+        as_u8 = ue8m0_as_uint8(As)
+    b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     if output_recipe in ("mxfp4", "nvfp4"):
         # packed E2M1 intermediate (nibble pairs along N) + group scales (UE8M0 for MX,
@@ -1012,29 +1021,29 @@ def mx_dynamic_matmul_batched(
         assert N % (2 * scale_group) == 0, (
             f"N (={N}) must be a multiple of {2 * scale_group} to pack E2M1 pairs"
         )
-        C = A.new_empty((S, N // 2), dtype=torch.int8)
+        C = a_u8.new_empty((S, N // 2), dtype=torch.int8)
         Cs = torch.empty(
             S,
             N // scale_group,
-            device=A.device,
+            device=a_u8.device,
             dtype=torch.float8_e4m3fn if nvfp4 else torch.uint8,
         )
     elif requant:
-        C = A.new_empty((S, N), dtype=FP8_DTYPE)
-        Cs = torch.empty(S, N // MX_SCALE_GROUP_K, device=A.device, dtype=torch.uint8)
+        C = a_u8.new_empty((S, N), dtype=FP8_DTYPE)
+        Cs = torch.empty(S, N // MX_SCALE_GROUP_K, device=a_u8.device, dtype=torch.uint8)
     else:
-        C = A.new_empty((S, N), dtype=output_dtype)
+        C = a_u8.new_empty((S, N), dtype=output_dtype)
         Cs = expert_ids  # general dummy pointer; unread (no OUTPUT_RECIPE), strides literal
 
     def grid(META):
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
-    As_arg = As if pre_quantized else expert_ids  # dummy when raw (unread)
-    with device_context(A.device):
+    As_arg = as_u8 if pre_quantized else expert_ids  # dummy when raw (unread)
+    with device_context(a_u8.device):
         compile_time_only_triton_wrap(mx_dynamic_matmul_batched_kernel)[grid](
-            A,
+            a_u8,
             As_arg,
-            B,
+            b_u8,
             bs_u8,
             C,
             Cs,
@@ -1044,12 +1053,12 @@ def mx_dynamic_matmul_batched(
             S,
             N,
             K,
-            A.stride(0),
-            A.stride(1),
+            a_u8.stride(0),
+            a_u8.stride(1),
             As_arg.stride(0) if pre_quantized else 1,
-            B.stride(0),
-            B.stride(2),
-            B.stride(1),
+            b_u8.stride(0),
+            b_u8.stride(2),
+            b_u8.stride(1),
             bs_u8.stride(0),
             bs_u8.stride(2),
             bs_u8.stride(1),

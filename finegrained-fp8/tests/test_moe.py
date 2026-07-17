@@ -88,6 +88,10 @@ MOE_PROBLEMS = [
     MoEProblem(weights="mxfp8_u8"),
     MoEProblem(weights="fp8_128x128", num_tokens=1),
     MoEProblem(weights="fp8_128x128"),
+    # block-FP8 with UE8M0 (power-of-two) scales — the whole-model UE8M0 contract: acts,
+    # weights, and the fused intermediate requant all power-of-two (DeepSeek-V4 attn / B200).
+    MoEProblem(weights="fp8_128x128_ue8m0", num_tokens=1),
+    MoEProblem(weights="fp8_128x128_ue8m0"),
     MoEProblem(weights="nvfp4"),
     # ── full precision: scale-less BF16 weights resolve to recipe None and the fused
     # gate_up hands the down a bare (unscaled) intermediate ──

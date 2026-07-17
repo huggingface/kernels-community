@@ -8,6 +8,22 @@ import torch
 from finegrained_fp8.utils import MX_SCALE_GROUP_K, NIBBLES_PER_BYTE  # type: ignore
 
 
+def unswizzle_mx_scales(swizzled: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """Inverse of ``swizzle_mx_scales`` (no ``gather_idx``): a flat/ND SWIZZLE_32_4_4 buffer
+    back to the plain ``(rows, cols)`` row-major scale grid (padding trimmed). Test-only —
+    reads a kernel-produced swizzled scale (e.g. the fused gate_up requant Cs) for comparison."""
+    n_row_blocks = -(-rows // 128)
+    n_col_blocks = -(-cols // 4)
+    plain = (
+        swizzled.reshape(n_row_blocks * n_col_blocks, 32, 4, 4)
+        .transpose(1, 2)
+        .reshape(n_row_blocks, n_col_blocks, 128, 4)
+        .permute(0, 2, 1, 3)
+        .reshape(n_row_blocks * 128, n_col_blocks * 4)
+    )
+    return plain[:rows, :cols]
+
+
 # ── Device + capability ───────────────────────────────────────────────────────
 
 TEST_DEVICE = (
@@ -358,6 +374,21 @@ WEIGHTS = {
             "fp8": lambda A: fp8_act_quant_block_dynamic(A, 128),
         },
         dq_act=lambda q, s: q.float() * torch.repeat_interleave(s.float(), 128, dim=-1),
+    ),
+    # Block-FP8 W8A8 with UE8M0 (power-of-two) block scales — the DeepSeek-V4 attn / B200
+    # deployment format that routes through the kernel's tcgen05 dot_scaled arm.
+    "fp8_128x128_ue8m0": dict(
+        make=lambda N, K, E: make_weights(
+            N, K, TEST_DEVICE, [128, 128], scale_dtype=torch.float8_e8m0fnu, num_experts=E
+        ),
+        dequant=lambda B, Bs: dq_block_fp8(B, Bs, 128, 128),
+        input_recipes=(None, "fp8"),
+        output_recipes=(None, "fp8"),
+        act_quant={
+            None: lambda A: fp8_act_quant_block_dynamic(A, 128, use_ue8m0=True),
+            "fp8": lambda A: fp8_act_quant_block_dynamic(A, 128, use_ue8m0=True),
+        },
+        dq_act=lambda q, s: q.float() * torch.repeat_interleave(dq_scale(s), 128, dim=-1),
     ),
     "fp8_tensor": dict(
         make=lambda N, K, E: make_weights(

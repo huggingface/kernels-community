@@ -28,7 +28,7 @@ from .utils import (
     acc_init,
     mx_config_pruner,
     smem_pruner,
-    block_scaled_fp8_dot,
+    block_dynamic_dot,
     scalar_max_m_pruner,
     block_within_dim_pruner,
     compose_pruners,
@@ -40,10 +40,14 @@ from .utils import (
     fp8_act_quant_block_dynamic,
     load_block_fp8_act_tile,
     load_weight_tile,
+    load_mx_2d_act,
+    load_mx_2d_weight,
+    maybe_swizzle_mx_scales,
     oriented_tile_ptrs,
     weight_tile_descriptor,
     get_accelerator_autotuning_configs,
     warp_spec_compile_guard_pruner,
+    block_dynamic_dot_scaled_ws_pruner,
     is_mx,
     is_tensor_wide,
     maybe_act_quant,
@@ -53,7 +57,6 @@ from .utils import (
     store_masked,
     store_masked_oriented,
     swizzle_offsets,
-    load_mx_act_tile,
     e2m1_as_uint8,
     ue8m0_as_uint8,
 )
@@ -90,6 +93,34 @@ def _rebind_bd_descriptors(nargs):
         nargs["BDescriptor"], int
     ):
         nargs["BDescriptor"].block_shape = [nargs["BLOCK_SIZE_N"], nargs["block_k"]]
+
+
+def _rebind_mx_descriptors(nargs):
+    """Per-config pre_hook for the MX kernel — set the A/B host-TMA boxes to the tuned tile
+    in BYTES over the (rows, K_bytes) packed matrices: ``[BM, BK // ACT_VALUES_PER_BYTE]`` and
+    ``[BN, BK // WEIGHT_VALUES_PER_BYTE]`` (values-per-byte read off the operand dtype; uint8 =
+    packed E2M1). Mutates ``block_shape`` in place; no-op for pointer configs."""
+    if nargs.get("A_MEMORY_MODE", "pointer") != "pointer" and not isinstance(
+        nargs["ADescriptor"], int
+    ):
+        avpb = 2 if nargs["A"].dtype == torch.uint8 else 1
+        nargs["ADescriptor"].block_shape = [
+            nargs["BLOCK_SIZE_M"], nargs["BLOCK_SIZE_K"] // avpb
+        ]
+    if nargs.get("B_MEMORY_MODE", "pointer") != "pointer" and not isinstance(
+        nargs["BDescriptor"], int
+    ):
+        wvpb = 2 if nargs["B"].dtype == torch.uint8 else 1
+        nargs["BDescriptor"].block_shape = [
+            nargs["BLOCK_SIZE_N"], nargs["BLOCK_SIZE_K"] // wvpb
+        ]
+    # SWIZZLE_32_4_4 scale boxes: [1, BLOCK//128, (BK // SCALE_GROUP_K) // 4, 2, 256]. Offline
+    # (pre-quantized A: E4M3 or packed-E2M1) is the swizzled path — inferred from A's dtype,
+    # matching the in-kernel SWIZZLED_SCALES constexpr.
+    if nargs["A"].dtype in (torch.float8_e4m3fn, torch.uint8):
+        rep_k = (nargs["BLOCK_SIZE_K"] // nargs["SCALE_GROUP_K"]) // 4
+        nargs["ASDescriptor"].block_shape = [1, nargs["BLOCK_SIZE_M"] // 128, rep_k, 2, 256]
+        nargs["BSDescriptor"].block_shape = [1, nargs["BLOCK_SIZE_N"] // 128, rep_k, 2, 256]
 
 
 @bayesian_autotune(
@@ -130,6 +161,7 @@ def _rebind_bd_descriptors(nargs):
     prune_configs_by={
         "early_config_prune": compose_pruners(
             warp_spec_compile_guard_pruner(),
+            block_dynamic_dot_scaled_ws_pruner(),
             matched_memory_modes_pruner(),
             descriptor_box_pruner("block_k"),
             smem_pruner("block_k"),
@@ -140,7 +172,7 @@ def _rebind_bd_descriptors(nargs):
 def w8a8_block_dynamic_fp8_matmul_kernel(
     A,  # (M, K) E4M3 activations (pre-quantized once by the wrapper)
     ADescriptor,  # host TMA descriptor over A (M, K), box (BLOCK_SIZE_M, block_k); read iff A_MEMORY_MODE != "pointer"
-    As,  # (M, K // block_k) fp32 per-row, per-K-block activation scales
+    As,  # (M, K // block_k) per-row, per-K-block activation scales (fp32 or uint8/UE8M0)
     B,  # (N, K) FP8 weights
     BDescriptor,  # host TMA descriptor over B (N, K), box (BLOCK_SIZE_N, block_k); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (N // block_n, K // block_k) weight scales (fp32 or uint8/UE8M0)
@@ -185,7 +217,15 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     (that trans is race-free only under ``WARP_SPEC``). ``SWAP_AB`` remains an
     independent pointer-arm orientation knob (weight tile in the MMA M dim, activation
     loaded transposed via strides); it is implemented but not currently emitted.
+
+    UE8M0 scales (activations quantized to power-of-two, weights UE8M0) on a native-M tile
+    (the MMA M operand is 128-wide: BLOCK_SIZE_M no-swap, BLOCK_SIZE_N swapped) fold the
+    128-group scales into a tcgen05 ``dot_scaled`` MMA — see ``block_dynamic_dot``. fp32
+    scales, or a narrow M tile (decode), keep the plain ``tl.dot`` + software rescale.
     """
+    USE_DOT_SCALED: tl.constexpr = (As.dtype.element_ty == tl.uint8) and (
+        (BLOCK_SIZE_N if SWAP_AB else BLOCK_SIZE_M) >= 128
+    )
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, block_k
     )
@@ -244,8 +284,10 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         b = load_weight_tile(
             b_ptrs, b_descriptor, pid_n * BLOCK_SIZE_N, k * block_k, B_MEMORY_MODE, SWAP_AB
         )
-        b_s = decode_group_scale(tl.load(bs_ptrs, mask=bs_mask, other=0.0))
-        accumulator += block_scaled_fp8_dot(a, a_s, b, b_s, SWAP_AB)
+        b_s = tl.load(bs_ptrs, mask=bs_mask, other=0.0)
+        accumulator = block_dynamic_dot(
+            accumulator, a, a_s, b, b_s, block_k, SWAP_AB, USE_DOT_SCALED
+        )
         as_ptrs += 1
         bs_ptrs += stride_bs_k
         if A_MEMORY_MODE == "pointer":
@@ -448,6 +490,12 @@ def w8a8_block_static_fp8_matmul_kernel(
         tune_block_nk=True,
         compute_modes=("dot_scaled", "dot", "scalar"),
         tune_block_m=True,
+        # host-TMA on both operands, tuner-picked vs pointers (measured +14-17pp: mxfp8
+        # 54->71%, W4A8 50->67% via mixed A=ptr/B=desc, W4A4 +14%). Mixed A/B modes KEPT
+        # (unlike dense bd): A=pointer + B=descriptor wins the mid-M band.
+        a_memory_modes=("descriptor", "pointer"),
+        b_memory_modes=("descriptor", "pointer"),
+        pre_hook=_rebind_mx_descriptors,
     ),
     # the MXFP4/MXFP8 split keys itself — the tuner appends every tensor arg's dtype to
     # its cache key (memory and disk);
@@ -466,15 +514,22 @@ def w8a8_block_static_fp8_matmul_kernel(
             mx_config_pruner("K"),
             scalar_max_m_pruner("M"),
             smem_pruner(),
+            # veto descriptor boxes past the 256/dim TMA limit (packed: BK//values-per-byte,
+            # so fp4 BK512 -> 256-byte box is legal and keeps TMA)
+            descriptor_box_pruner("BLOCK_SIZE_K"),
         )
     },
 )
 @triton.jit
 def mx_dynamic_matmul_kernel(
     A,  # (M, K) activations: E4M3 (pre-quantized) or raw bf16/fp16 (quantized inline)
+    ADescriptor,  # host TMA descriptor over A (M, K_bytes), box (BM, BK_bytes); read iff A_MEMORY_MODE != "pointer"
     As,  # (M, K // 32) UE8M0 group-32 activation scales (pre-quantized arm only)
+    ASDescriptor,  # host TMA descriptor over the SWIZZLE_32_4_4 A scales; read iff SWIZZLED_SCALES
     B,  # (N, K) E4M3 (MXFP8) or (N, K // 2) packed E2M1 (MXFP4) weights
+    BDescriptor,  # host TMA descriptor over B (N, K_bytes), box (BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (N, K // SCALE_GROUP_K) UE8M0 weight scales
+    BSDescriptor,  # host TMA descriptor over the SWIZZLE_32_4_4 B scales; read iff SWIZZLED_SCALES
     C,  # (M, N) output
     # Shape
     M,
@@ -497,6 +552,8 @@ def mx_dynamic_matmul_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     COMPUTE_MODE: tl.constexpr,
+    A_MEMORY_MODE: tl.constexpr = "pointer",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
     INPUT_RECIPE: tl.constexpr = "mxfp8",
 ):
     """Unified MXFP4/MXFP8 (W4A8/W8A8; a ``uint8`` ``A`` is packed E2M1 — W4A4) GEMM.
@@ -515,6 +572,12 @@ def mx_dynamic_matmul_kernel(
     # uint8 A = packed-E2M1 activations (W4A4 — the dtype IS the activation format)
     ACT_VALUES_PER_BYTE: tl.constexpr = 2 if A.dtype.element_ty == tl.uint8 else 1
     WEIGHT_VALUES_PER_BYTE: tl.constexpr = 2 if B.dtype.element_ty == tl.uint8 else 1
+    # Offline (pre-quantized A: E4M3 or packed-E2M1) => scales are swizzled by the wrapper;
+    # inline (raw bf16/fp16 A) computes scales in-register (nothing to swizzle). Inferred from
+    # A's dtype — the wrapper swizzles + builds the SA/SB descriptors on exactly this condition.
+    SWIZZLED_SCALES: tl.constexpr = (
+        A.dtype.element_ty == tl.float8e4nv or A.dtype.element_ty == tl.uint8
+    )
     # packed-fp4 weights (WEIGHT_VALUES_PER_BYTE==2) route swizzle_offsets to full grouping
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WEIGHT_VALUES_PER_BYTE
@@ -522,28 +585,65 @@ def mx_dynamic_matmul_kernel(
     offs_ka = tl.arange(0, BLOCK_SIZE_K // ACT_VALUES_PER_BYTE)
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
-    a_ptrs = A + (offs_am[:, None] * stride_a_m + offs_ka[None, :] * stride_a_k)
-    as_ptrs = As + offs_am[:, None] * stride_as_m + offs_sf[None, :]
-    b_ptrs = B + (offs_kb[:, None] * stride_b_k + offs_bn[None, :] * stride_b_n)
-    bs_ptrs = Bs + (offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k)
+    # Scales: SWIZZLED loads from the SA/BSDescriptors (SWIZZLE_32_4_4) + un-swizzles, so its
+    # as/bs pointer tiles are dead — skip building them. Else affine-offset + bounds-mask
+    # pointer loads (the %-wrapped offs drive only the operand tiles; the wrap would make the
+    # scale load a non-affine gather — mirrors the bd 2D affine-scale fix).
+    if SWIZZLED_SCALES:
+        as_ptrs, bs_ptrs, as_mask, bs_mask = As, Bs, None, None
+    else:
+        offs_am_lin = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_bn_lin = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        as_mask = offs_am_lin < M
+        bs_mask = offs_bn_lin < N
+        as_ptrs = As + offs_am_lin[:, None] * stride_as_m + offs_sf[None, :]
+        bs_ptrs = Bs + (offs_bn_lin[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k)
+    # Operand tiles are built ONLY on the pointer arm; the descriptor arm reads neither (the
+    # [BM,BK]/[BK,BN] index tensors would stay live for nothing and spill registers).
+    if A_MEMORY_MODE == "pointer":
+        a_ptrs = A + (offs_am[:, None] * stride_a_m + offs_ka[None, :] * stride_a_k)
+    else:
+        a_ptrs = A
+    if B_MEMORY_MODE == "pointer":
+        b_ptrs = B + (offs_kb[:, None] * stride_b_k + offs_bn[None, :] * stride_b_n)
+    else:
+        b_ptrs = B
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a, a_scale = load_mx_act_tile(
+        a, a_scale = load_mx_2d_act(
             a_ptrs,
             as_ptrs,
-            None,
-            0,
-            0,
-            0,
-            0,
+            as_mask,
+            ADescriptor,
+            ASDescriptor,
+            pid_m * BLOCK_SIZE_M,
+            k * (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE),
+            pid_m,
+            k,
             BLOCK_SIZE_M,
             BLOCK_SIZE_K,
             SCALE_GROUP_K,
-            RECIPE=INPUT_RECIPE,
+            A_MEMORY_MODE,
+            SWIZZLED_SCALES,
+            INPUT_RECIPE,
         )
-        b = tl.load(b_ptrs)
-        b_s = tl.load(bs_ptrs)
+        b, b_s = load_mx_2d_weight(
+            b_ptrs,
+            bs_ptrs,
+            bs_mask,
+            BDescriptor,
+            BSDescriptor,
+            pid_n * BLOCK_SIZE_N,
+            k * (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
+            pid_n,
+            k,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            SCALE_GROUP_K,
+            B_MEMORY_MODE,
+            SWIZZLED_SCALES,
+        )
         accumulator = mx_compute(
             accumulator,
             a,
@@ -556,10 +656,13 @@ def mx_dynamic_matmul_kernel(
             BLOCK_SIZE_K,
             SCALE_GROUP_K,
         )
-        a_ptrs += (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k
-        as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
-        b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
-        bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
+        if not SWIZZLED_SCALES:  # swizzled arm re-derives the scale box offset from k
+            as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
+            bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
+        if A_MEMORY_MODE == "pointer":  # descriptor arm re-derives the box K offset from k
+            a_ptrs += (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k
+        if B_MEMORY_MODE == "pointer":
+            b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
 
     store_masked(
         C,
@@ -614,8 +717,12 @@ def w8a8_block_dynamic_fp8_matmul(
         f"Bs shape {tuple(Bs.shape)} != expected ({triton.cdiv(N, block_n)}, {K // block_k})"
     )
 
-    Bs = ue8m0_as_uint8(Bs)
-    A_q, A_s = fp8_act_quant_block_dynamic(A.view(M, K), block_k)
+    bs_u8 = ue8m0_as_uint8(Bs)
+    # UE8M0 weight scales are the DeepGEMM-Blackwell recipe — quantize activations to UE8M0
+    # too so the kernel folds both group scales into the tcgen05 dot_scaled MMA (else fp32).
+    A_q, A_s = fp8_act_quant_block_dynamic(
+        A.view(M, K), block_k, use_ue8m0=bs_u8.dtype == torch.uint8
+    )
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
     # Host TMA descriptors over the (M, K) / (N, K) matrices — the placeholder box is
@@ -638,7 +745,7 @@ def w8a8_block_dynamic_fp8_matmul(
             A_s,
             B,
             b_descriptor,
-            Bs,
+            bs_u8,
             C,
             M,
             N,
@@ -649,8 +756,8 @@ def w8a8_block_dynamic_fp8_matmul(
             A_s.stride(0),
             B.stride(1),
             B.stride(0),
-            Bs.stride(1),
-            Bs.stride(0),
+            bs_u8.stride(1),
+            bs_u8.stride(0),
             C.stride(-2),
             C.stride(-1),
             block_n=block_n,
@@ -714,7 +821,7 @@ def w8a8_block_static_fp8_matmul(
             triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
-    Bs = ue8m0_as_uint8(Bs)
+    bs_u8 = ue8m0_as_uint8(Bs)
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
     As = As.reshape(1).to(torch.float32)
@@ -732,7 +839,7 @@ def w8a8_block_static_fp8_matmul(
             A_q,
             As,
             B,
-            Bs,
+            bs_u8,
             C,
             M,
             N,
@@ -742,8 +849,8 @@ def w8a8_block_static_fp8_matmul(
             A_q.stride(1),
             B.stride(1),
             B.stride(0),
-            Bs.stride(1),
-            Bs.stride(0),
+            bs_u8.stride(1),
+            bs_u8.stride(0),
             C.stride(-2),
             C.stride(-1),
             # Meta-parameters (BM and BN come from the config; BK is the caller's
@@ -862,7 +969,7 @@ def mx_dynamic_matmul(
         f"Bs shape {tuple(Bs.shape)} != ({N}, {K // scale_group})"
     )
 
-    B = e2m1_as_uint8(B)
+    b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     # the kernel quantizes raw A inline on this grid (fp4 recipes pack in-register)
     input_recipe = resolve_input_recipe(input_recipe, None, Bs)
@@ -871,6 +978,26 @@ def mx_dynamic_matmul(
     )
     A_q = e2m1_as_uint8(A_q)
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+    # Host-TMA descriptors over the packed (M, K_bytes) / (N, K_bytes) matrices — placeholder
+    # box rebound per tuned config by _rebind_mx_descriptors. Read only by the descriptor
+    # configs the tuner picks; pointer configs never touch them.
+    a_descriptor = TensorDescriptor.from_tensor(A_q, [1, 32])
+    b_descriptor = TensorDescriptor.from_tensor(b_u8, [1, 32])
+    # Swizzled (SWIZZLE_32_4_4) scale descriptors for the offline/dot_scaled path — the kernel
+    # bulk-loads + un-swizzles them (tcgen05 fast path). Only the offline arm (pre-quantized A)
+    # takes it; inline (raw-bf16 A, decode) keeps the in-register 2D scales. Placeholder boxes
+    # are rebound per config by _rebind_mx_descriptors.
+    SWIZZLED_SCALES = A_q.dtype != torch.bfloat16
+    if SWIZZLED_SCALES:
+        cb = triton.cdiv(K // scale_group, 4)
+        as_sw = maybe_swizzle_mx_scales(ue8m0_as_uint8(A_s)).reshape(
+            1, triton.cdiv(M, 128), cb, 2, 256
+        )
+        bs_sw = maybe_swizzle_mx_scales(bs_u8).reshape(1, triton.cdiv(N, 128), cb, 2, 256)
+        as_descriptor = TensorDescriptor.from_tensor(as_sw, [1, 1, 1, 2, 256])
+        bs_descriptor = TensorDescriptor.from_tensor(bs_sw, [1, 1, 1, 2, 256])
+    else:
+        as_descriptor, bs_descriptor = a_descriptor, b_descriptor  # dummy, unread
 
     def grid(META):
         return (
@@ -881,9 +1008,13 @@ def mx_dynamic_matmul(
     with device_context(A.device):
         compile_time_only_triton_wrap(mx_dynamic_matmul_kernel)[grid](
             A_q,
+            a_descriptor,
             A_s,
-            B,
+            as_descriptor,
+            b_u8,
+            b_descriptor,
             bs_u8,
+            bs_descriptor,
             C,
             M,
             N,
@@ -894,8 +1025,8 @@ def mx_dynamic_matmul(
             A_q.stride(0),
             A_q.stride(1),
             A_s.stride(0),
-            B.stride(1),
-            B.stride(0),
+            b_u8.stride(1),
+            b_u8.stride(0),
             bs_u8.stride(1),
             bs_u8.stride(0),
             C.stride(-2),

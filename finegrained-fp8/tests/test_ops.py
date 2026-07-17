@@ -35,8 +35,10 @@ from utils import (  # type: ignore
     TEST_DEVICE,
     WEIGHTS,
     dq_grouped,
+    dq_scale,
     fp8_act_quant_block_dynamic,
     maybe_compile,
+    unswizzle_mx_scales,
 )
 
 import finegrained_fp8  # type: ignore
@@ -259,13 +261,19 @@ def _check(problem: Problem, out, ref, expert_ids):
     # order differs per config).
     C, Cs = out
     if problem.output_recipe == "fp8":
-        # per-(row, N-block) scales: dequant directly against the fp32 reference
+        # per-(row, N-block) scales: dequant against the fp32 reference. dq_scale decodes the
+        # scale as its dtype dictates — fp32 passes through, UE8M0 (uint8) is 2^(exp-127) — so
+        # the ue8m0 requant (whole-model ue8m0 contract) is compared as a power-of-two exponent.
         dq = C.float() * torch.repeat_interleave(
-            Cs.float(), C.shape[1] // Cs.shape[1], dim=-1
+            dq_scale(Cs), C.shape[1] // Cs.shape[1], dim=-1
         )
         ref_cmp = ref
     else:
         group = REQUANT_GROUP[problem.output_recipe]
+        # mxfp8 requant emits Cs in the SWIZZLE_32_4_4 layout (the down proj reads it affine);
+        # un-swizzle to the row-major grid the dequant reference expects.
+        if Cs.ndim == 5:
+            Cs = unswizzle_mx_scales(Cs, C.shape[0], C.shape[1] // group)
         dq = dq_grouped(C, Cs, group)
         q_ref, s_ref = REQUANT_FN[problem.output_recipe](ref.to(problem.dtype))
         ref_cmp = dq_grouped(q_ref, s_ref, group)
@@ -301,11 +309,14 @@ def test_op_scenarios(problem: Problem, layout):
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
-@pytest.mark.parametrize("m_rows", [1, 64], ids=["M1_inline", "M64_offline"])
+@pytest.mark.parametrize(
+    "m_rows", [1, 64, 128], ids=["M1_inline", "M64_offline", "M128_native"]
+)
 @pytest.mark.parametrize(
     "weights,input_recipe",
     [
         ("fp8_128x128", None),
+        ("fp8_128x128_ue8m0", None),  # UE8M0 scales -> dot_scaled arm at M128
         ("mxfp8", None),
         ("mxfp4", None),  # W4A8, the MX default
         ("mxfp4", "mxfp4"),  # W4A4 (packed acts)
@@ -317,14 +328,15 @@ def test_matmul_2d_vs_torch(weights, input_recipe, m_rows):
     """matmul_2d against the pure-torch dequant oracle — it used to be the reference for
     the routed tests, so it gets its own independent check (nothing kernel-side in the
     oracle). ``m_rows`` spans the ``maybe_act_quant`` gate: M=1 runs the in-kernel
-    inline quant arm, M=64 the offline pre-quant pass (bit-exact pair by construction);
+    inline quant arm, M=64 the offline pre-quant pass (bit-exact pair by construction),
+    M=128 the native-M tile (block-dynamic UE8M0 takes its dot_scaled arm here);
     ``input_recipe`` spans the activation grids per weight family."""
     torch.manual_seed(0)
     M, N, K = m_rows, 128, 256
     row = WEIGHTS[weights]
     B, Bs = row["make"](N, K, 1)
     A = torch.randn(M, K, device=TEST_DEVICE, dtype=torch.bfloat16)
-    block_size = [128, 128] if weights == "fp8_128x128" else None
+    block_size = [128, 128] if weights.startswith("fp8_128x128") else None
     out = finegrained_fp8.matmul_2d(A, B[0], Bs[0], block_size,
                                     input_recipe=input_recipe)
     quant = row["act_quant"][input_recipe]
