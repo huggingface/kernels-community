@@ -17,7 +17,10 @@ mha_fwd(
     const int64_t window_size_right,
     const double softcap, 
     const bool return_softmax,
-    c10::optional<at::Generator> gen_);
+    c10::optional<at::Generator> gen_,
+    c10::optional<torch::Tensor> scale_q_ = c10::nullopt,
+    c10::optional<torch::Tensor> scale_k_ = c10::nullopt,
+    c10::optional<torch::Tensor> scale_v_ = c10::nullopt);
 
 std::vector<torch::Tensor>
 mha_varlen_fwd(
@@ -42,7 +45,12 @@ mha_varlen_fwd(
     int64_t window_size_right,
     const double softcap,
     const bool return_softmax,
-    std::optional<at::Generator> gen_); 
+    std::optional<at::Generator> gen_,
+    std::optional<torch::Tensor> scale_q_ = c10::nullopt,
+    std::optional<torch::Tensor> scale_k_ = c10::nullopt,
+    std::optional<torch::Tensor> scale_v_ = c10::nullopt,
+    std::optional<torch::Tensor> cu_scale_q_ = c10::nullopt,
+    std::optional<torch::Tensor> cu_scale_kv_ = c10::nullopt); 
 
 std::vector<torch::Tensor>
 mha_bwd(const torch::Tensor &dout,                         // batch_size x seqlen_q x num_heads, x multiple_of(head_size_og, 8)

@@ -225,7 +225,12 @@ void cutlass_fmha_fwd_varlen_impl(
     void* rng_state,
     void* s_dmask,
     int seqlen_q_rounded,
-    int seqlen_k_rounded) {
+    int seqlen_k_rounded,
+    const std::optional<at::Tensor>& scale_q,
+    const std::optional<at::Tensor>& scale_k,
+    const std::optional<at::Tensor>& scale_v,
+    const std::optional<at::Tensor>& cu_scale_q,
+    const std::optional<at::Tensor>& cu_scale_kv) {
   int batch_size, num_heads_q, num_heads_kv, head_size;
   int total_seqlen_q, total_seqlen_k;
   int num_blocks, block_size, max_blocks_per_seq;
@@ -309,6 +314,13 @@ void cutlass_fmha_fwd_varlen_impl(
       seqlen_q_rounded,
       seqlen_k_rounded};
 
+  // MXFP block-scaled scale factor tensors (only set for FP8/FP4 paths).
+  if (scale_q.has_value())    args.scale_q     = scale_q->data_ptr();
+  if (scale_k.has_value())    args.scale_k     = scale_k->data_ptr();
+  if (scale_v.has_value())    args.scale_v     = scale_v->data_ptr();
+  if (cu_scale_q.has_value()) args.cu_scale_q  = cu_scale_q->data_ptr();
+  if (cu_scale_kv.has_value())args.cu_scale_kv = cu_scale_kv->data_ptr();
+
   const CutlassType cuType = aten_to_Cutlass_dtype(query);
   if (args.max_queries == 1) {
     dispatch_fwd_varlen_decode_by_head(queue, cuType, args, args.head_size);
@@ -335,7 +347,10 @@ void cutlass_fmha_fwd_fix_impl(
     void* rng_state,
     void* s_dmask,
     int seqlen_q_rounded,
-    int seqlen_k_rounded) {
+    int seqlen_k_rounded,
+    const std::optional<at::Tensor>& scale_q,
+    const std::optional<at::Tensor>& scale_k,
+    const std::optional<at::Tensor>& scale_v) {
   const int batch_size   = query.size(0);
   const int max_seqlen_q = query.size(1);
   const int num_heads_q  = query.size(2);
@@ -383,6 +398,11 @@ void cutlass_fmha_fwd_fix_impl(
       s_dmask,
       seqlen_q_rounded,
       seqlen_k_rounded};
+
+  // MXFP block-scaled scale factor tensors (only set for FP8/FP4 paths).
+  if (scale_q.has_value()) args.scale_q = scale_q->data_ptr();
+  if (scale_k.has_value()) args.scale_k = scale_k->data_ptr();
+  if (scale_v.has_value()) args.scale_v = scale_v->data_ptr();
 
   const CutlassType cuType = aten_to_Cutlass_dtype(query);
   const int h = args.head_size;

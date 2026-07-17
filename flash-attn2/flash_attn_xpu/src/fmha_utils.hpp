@@ -11,9 +11,26 @@
   if (input.scalar_type() == torch::kBFloat16) {
     return CutlassType::bfloat16;
   }
+  if (input.scalar_type() == torch::kFloat8_e5m2) {
+    return CutlassType::mx_float_e5m2;
+  }
+  if (input.scalar_type() == torch::kFloat8_e4m3fn) {
+    return CutlassType::mx_float_e4m3;
+  }
+  if (input.scalar_type() == torch::kFloat4_e2m1fn_x2) {
+    return CutlassType::mx_float_e2m1;
+  }
   TORCH_INTERNAL_ASSERT(
-      false, "Current cutlass kernel only support half/bf16 data type.");
+      false,
+      "Current cutlass kernel only supports half/bf16/fp8_e5m2/fp8_e4m3/fp4_e2m1 data types.");
   return {};  // unreachable; silences compiler warning
+}
+
+/// Helper to detect MXFP (block-scaled) types that require scale tensors.
+[[nodiscard]] inline bool requires_scale_tensors(CutlassType cuType) {
+  return cuType == CutlassType::mx_float_e5m2 ||
+         cuType == CutlassType::mx_float_e4m3 ||
+         cuType == CutlassType::mx_float_e2m1;
 }
 
 using namespace cute;

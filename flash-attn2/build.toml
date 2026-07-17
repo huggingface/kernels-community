@@ -1,6 +1,6 @@
 [general]
 name = "flash-attn2"
-version = 2
+ version = 3
 license = "BSD-3-Clause"
 backends = [
     "cpu",
@@ -78,6 +78,22 @@ src = [
     "flash_attn_xpu/src/flash_fwd_hdim256_kvcache_paged_bf16.cpp",
     "flash_attn_xpu/src/flash_fwd_hdim512_kvcache_paged_fp16.cpp",
     "flash_attn_xpu/src/flash_fwd_hdim512_kvcache_paged_bf16.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim32_varlen_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim64_varlen_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim96_varlen_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim128_varlen_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim160_varlen_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim192_varlen_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim256_varlen_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim512_varlen_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim32_fix_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim64_fix_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim96_fix_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim128_fix_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim160_fix_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim192_fix_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim256_fix_mxfp.cpp",
+    "flash_attn_xpu/src/flash_fwd_hdim512_fix_mxfp.cpp",
     "flash_attn_xpu/src/fmha_bwd_types.hpp",
     "flash_attn_xpu/src/fmha_bwd.hpp",
     "flash_attn_xpu/src/fmha_bwd_impl.hpp",

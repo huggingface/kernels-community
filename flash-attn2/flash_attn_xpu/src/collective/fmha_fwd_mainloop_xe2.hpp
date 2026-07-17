@@ -18,6 +18,7 @@
 
 #include "../philox.hpp"
 #include "./fmha_fwd_common.hpp"
+#include "cutlass/gemm/collective/xe_common_blockscaled_mxfp.hpp"
 
 namespace cutlass::fmha {
 
@@ -48,7 +49,12 @@ template <
     class TiledCopyQ_ = void,
     class TiledCopyK_ = void,
     class TiledCopyV_ = void,
-    bool HasRotary_ = false>
+    bool HasRotary_ = false,
+    bool UseScale_ = false,       // MXFP: block-scaled MMA
+    bool F8kvF16mma_ = false,     // MXFP: F8 KV with F16 MMA (scalar scale)
+    class TensorScaleQ_ = void,   // MXFP: optional scale tensors
+    class TensorScaleK_ = void,
+    class TensorScaleV_ = void>
 struct FMHAFwdMainloopXe2 {
   static_assert(
       cutlass::detail::dependent_false<DispatchPolicy_>,
@@ -72,7 +78,12 @@ template <
     class TiledCopyQ_,
     class TiledCopyK_,
     class TiledCopyV_,
-    bool HasRotary_>
+    bool HasRotary_,
+    bool UseScale_,
+    bool F8kvF16mma_,
+    class TensorScaleQ_,
+    class TensorScaleK_,
+    class TensorScaleV_>
 struct FMHAFwdMainloopXe2<
     Xe2<Stages>,
     CausalMask_,
@@ -88,7 +99,12 @@ struct FMHAFwdMainloopXe2<
     TiledCopyQ_,
     TiledCopyK_,
     TiledCopyV_,
-    HasRotary_> {
+    HasRotary_,
+    UseScale_,
+    F8kvF16mma_,
+    TensorScaleQ_,
+    TensorScaleK_,
+    TensorScaleV_> {
 
   // Pull in common type aliases from the shared traits.
   using Traits = FMHAFwdMainloopTraits<
@@ -128,6 +144,61 @@ struct FMHAFwdMainloopXe2<
   static constexpr bool PagedKV   = PagedKV_;
   static constexpr bool HasRotary = HasRotary_;
 
+  // --- MXFP (block-scaled) support ---------------------------------------
+  using ElementQ = typename TensorQ::element_type;
+  static constexpr bool FP4Input =
+      cute::is_same_v<ElementQ, cutlass::float_e2m1_t>;
+  static constexpr bool UseScale = UseScale_;
+  static constexpr bool F8kvF16mma = F8kvF16mma_;
+
+  using TensorScaleQ = TensorScaleQ_;
+  using TensorScaleK = TensorScaleK_;
+  using TensorScaleV = TensorScaleV_;
+  using TensorScaleQ2D = conditional_t<is_void_v<TensorScaleQ_>, void,
+      decltype(TensorScaleQ_{}(append<rank_v<TensorScaleQ_>>(make_coord(_, _), 0)))>;
+  using TensorScaleK2D = conditional_t<is_void_v<TensorScaleK_>, void,
+      decltype(TensorScaleK_{}(append<rank_v<TensorScaleK_>>(make_coord(_, _), 0)))>;
+  using TensorScaleV2D = conditional_t<is_void_v<TensorScaleV_>, void,
+      decltype(TensorScaleV_{}(append<rank_v<TensorScaleV_>>(make_coord(_, _), 0)))>;
+
+  using ElementScaleQ = conditional_t<is_void_v<TensorScaleQ_>, float,
+      typename TensorScaleQ::element_type>;
+  using ElementScaleK = conditional_t<is_void_v<TensorScaleK_>, float,
+      typename TensorScaleK::element_type>;
+  using ElementScaleV = conditional_t<is_void_v<TensorScaleV_>, float,
+      typename TensorScaleV::element_type>;
+
+  // Block and MMA dimensions used for block-scale addressing.
+  static constexpr int BLK_Q = get<0>(TileShapeQK{});
+  static constexpr int BLK_K = get<1>(TileShapeQK{});
+  static constexpr int BLK_QK_D = get<2>(TileShapeQK{});
+  static constexpr int BLK_P = get<0>(TileShapePV{});
+  static constexpr int BLK_V = get<1>(TileShapePV{});
+  static constexpr int BLK_PV_D = get<2>(TileShapePV{});
+
+  static constexpr int ATOM_Q = get<1>(typename TiledMMAQK::ThrLayoutVMNK{}.shape());
+  static constexpr int ATOM_K = get<2>(typename TiledMMAQK::ThrLayoutVMNK{}.shape());
+  static constexpr int ATOM_QK_D = get<3>(typename TiledMMAQK::ThrLayoutVMNK{}.shape());
+  static constexpr int MMA_QK_D = get<2>(typename TiledMMAQK::Shape_MNK{});
+  static constexpr int ATOM_P = get<1>(typename TiledMMAPV::ThrLayoutVMNK{}.shape());
+  static constexpr int ATOM_V = get<2>(typename TiledMMAPV::ThrLayoutVMNK{}.shape());
+  static constexpr int ATOM_PV_D = get<3>(typename TiledMMAPV::ThrLayoutVMNK{}.shape());
+  static constexpr int MMA_PV_D = get<2>(typename TiledMMAPV::Shape_MNK{});
+
+  static constexpr int SG_Q = ceil_div(BLK_Q, ATOM_Q);
+  static constexpr int SG_K = ceil_div(BLK_K, ATOM_K);
+  static constexpr int SG_QK_D = ceil_div(BLK_QK_D, ATOM_QK_D);
+  static constexpr int SG_P = ceil_div(BLK_P, ATOM_P);
+  static constexpr int SG_V = ceil_div(BLK_V, ATOM_V);
+  static constexpr int SG_PV_D = ceil_div(BLK_PV_D, ATOM_PV_D);
+
+  static constexpr auto GROUP_K = 32;
+
+  using DefScaleType = cutlass::float_ue8m0_t;
+  using ElementScaleP = cute::conditional_t<UseScale, ElementScaleV, DefScaleType>;
+  // -----------------------------------------------------------------------
+
+
   // User-facing arguments
   struct Arguments {
     ElementS const scale;
@@ -150,6 +221,9 @@ struct FMHAFwdMainloopXe2<
     const typename TensorQ::element_type* rotary_sin = nullptr;
     int rotary_dim = 0;
     bool is_rotary_interleaved = true;
+    // MXFP: scalar scales for F8 KV with F16 MMA path.
+    float scale_k_scalar = 1.0f;
+    float scale_v_scalar = 1.0f;
   };
 
   struct LocalMaskFields {
@@ -192,6 +266,9 @@ struct FMHAFwdMainloopXe2<
         paged;
     [[no_unique_address]] conditional_t<HasRotary, RotaryFields, EmptyRotary>
       rotary;
+    // MXFP: scalar scales for F8 KV with F16 MMA path.
+    float scale_k_scalar = 1.0f;
+    float scale_v_scalar = 1.0f;
   };
 
   // SLM data
@@ -231,6 +308,8 @@ struct FMHAFwdMainloopXe2<
       p.rotary = {args.rotary_cos, args.rotary_sin,
                   args.rotary_dim, args.is_rotary_interleaved};
     }
+    p.scale_k_scalar = args.scale_k_scalar;
+    p.scale_v_scalar = args.scale_v_scalar;
     return p;
   }
 
@@ -260,7 +339,11 @@ struct FMHAFwdMainloopXe2<
       int head_q,
       int num_heads,
       int q_offset_sg,
-      int rotary_base) {
+      int rotary_base,
+      int l_coord = 0,
+      TensorScaleQ2D const& scaleQ_2D = TensorScaleQ2D{},
+      TensorScaleK2D const& scaleK_2D = TensorScaleK2D{},
+      TensorScaleV2D const& scaleV_2D = TensorScaleV2D{}) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     auto tile_shape_v =
@@ -444,9 +527,72 @@ struct FMHAFwdMainloopXe2<
           }
         }
         copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
-        reorder(tQrQ, tSrQ);
-        reorder(tKrK, tSrK);
-        cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+        if constexpr (FP4Input) {
+          copy(tQrQ, tSrQ);
+          copy(tKrK, tSrK);
+        } else {
+          reorder(tQrQ, tSrQ);
+          reorder(tKrK, tSrK);
+        }
+
+        if constexpr (UseScale) {
+#if defined(SYCL_INTEL_TARGET) && (SYCL_INTEL_TARGET == 35)
+          // Block-scaled MMA with scale factors for Q*K. The block-scaled
+          // (BDPAS) atom and helpers only exist on CRI (SYCL_INTEL_TARGET==35).
+          // On BMG this kernel is instantiated (host references it) but never
+          // executed, so the body is replaced by an invalid-control-path stub.
+          const int q_coord = get<0>(blk_qv) * BLK_Q +
+              ((thr_id / intel::sg_size) / ATOM_K) * SG_Q;
+          const int k_coord = K * BLK_K +
+              ((thr_id % intel::sg_size) / ATOM_K) * SG_K;
+
+          auto [tiled_copy_scaleQ, copy_iter_scaleQ, fragment_scaleQ] =
+              gemm::collective::make_scaled_copy<void, ElementScaleQ,
+                  SG_Q, SG_QK_D, GROUP_K>(scaleQ_2D, q_coord, l_coord, size<4>(tKgK));
+          auto [tiled_copy_scaleK, copy_iter_scaleK, fragment_scaleK] =
+              gemm::collective::make_scaled_copy<void, ElementScaleK,
+                  SG_K, SG_QK_D, GROUP_K>(scaleK_2D, k_coord, l_coord, size<4>(tKgK));
+          auto [gemm_qm_offsets, gemm_kn_offsets, gemm_qk_offsets, gemm_kk_offsets] =
+              gemm::collective::make_scaled_offsets<
+                  decltype(size<1>(tSrQ.shape()))::value,
+                  decltype(size<1>(tSrK.shape()))::value,
+                  decltype(size<2>(tSrK.shape()))::value,
+                  MMA_QK_D,
+                  GROUP_K,
+                  typename decltype(tiled_copy_scaleQ)::BlockShape,
+                  typename decltype(tiled_copy_scaleK)::BlockShape>();
+
+          copy(tiled_copy_scaleQ, copy_iter_scaleQ(_, _, _, D), fragment_scaleQ);
+          copy(tiled_copy_scaleK, copy_iter_scaleK(_, _, _, D), fragment_scaleK);
+
+          using scaleQSize = decltype(size(fragment_scaleQ));
+          using scaleKSize = decltype(size(fragment_scaleK));
+
+          Tensor scaleQ_view = make_tensor(
+              recast<intel::vector_t<ElementScaleQ, scaleQSize::value>>(fragment_scaleQ).data(),
+              make_layout(Shape<_1, decltype(size<1>(tSrQ.shape())), _1>{}, Stride<_1, _0, _0>{}));
+          Tensor scaleK_view = make_tensor(
+              recast<intel::vector_t<ElementScaleK, scaleKSize::value>>(fragment_scaleK).data(),
+              make_layout(Shape<_1, decltype(size<1>(tSrK.shape())), _1>{}, Stride<_1, _0, _0>{}));
+
+          auto zipped_q = make_zip_tensor(tSrQ, scaleQ_view, gemm_qm_offsets, gemm_qk_offsets);
+          auto zipped_k = make_zip_tensor(tSrK, scaleK_view, gemm_kn_offsets, gemm_kk_offsets);
+
+          cute::gemm(mma_qk, zipped_q, zipped_k, tSrS);
+#else
+          CUTE_INVALID_CONTROL_PATH(
+              "Block-scaled (MXFP) Q*K path is only available on CRI "
+              "(SYCL_INTEL_TARGET==35).");
+#endif
+        } else {
+          if constexpr (F8kvF16mma) {
+            // F8 KV with F16 MMA path - apply scalar scale to K.
+            for (int i = 0; i < tSrK.size(); i++)
+              tSrK(i) = static_cast<typename TiledMMAQK::ValTypeB>(
+                  params.scale_k_scalar * static_cast<float>(tSrK(i)));
+          }
+          cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+        }
       }
 
       auto cS_thread = thr_mma_qk.partition_C(gP_all(_, _, K));
@@ -580,7 +726,61 @@ struct FMHAFwdMainloopXe2<
       for (int VV = 0; VV < VTiles; VV++) {
         copy(copy_v, tVgV_cache(_, _, _, VV), tVrV);
         reorder(tVrV, tArV);
-        cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
+        if constexpr (UseScale && !FP4Input) {
+#if defined(SYCL_INTEL_TARGET) && (SYCL_INTEL_TARGET == 35)
+          // Block-scaled MMA with scale factors for P*V. CRI-only (BDPAS);
+          // on BMG this branch is instantiated but never runs.
+          const int v_coord = get<1>(blk_qv) * VTiles * BLK_V + VV * BLK_V +
+              ((thr_id % intel::sg_size) / ATOM_V) * SG_V;
+
+          // P is a dummy scale, the same shape as V.
+          auto [tiled_copy_scaleP, copy_iter_scaleP, fragment_scaleP] =
+              gemm::collective::make_scaled_copy<void, ElementScaleP,
+                  SG_P, SG_PV_D, GROUP_K>(scaleV_2D);
+          auto [tiled_copy_scaleV, copy_iter_scaleV, fragment_scaleV] =
+              gemm::collective::make_scaled_copy<void, ElementScaleV,
+                  SG_V, SG_PV_D, GROUP_K>(scaleV_2D, v_coord, l_coord, blk_k1);
+          auto [gemm_p_offsets, gemm_v_offsets, gemm_pk_offsets, gemm_vk_offsets] =
+              gemm::collective::make_scaled_offsets<
+                  decltype(size<1>(tArP.shape()))::value,
+                  decltype(size<1>(tArV.shape()))::value,
+                  decltype(size<2>(tArV.shape()))::value,
+                  MMA_PV_D,
+                  GROUP_K,
+                  typename decltype(tiled_copy_scaleP)::BlockShape,
+                  typename decltype(tiled_copy_scaleV)::BlockShape>();
+
+          fill(fragment_scaleP, ElementScaleV(1));
+          copy(tiled_copy_scaleV, copy_iter_scaleV(_, _, _, K), fragment_scaleV);
+
+          using scalePSize = decltype(size(fragment_scaleP));
+          using scaleVSize = decltype(size(fragment_scaleV));
+
+          Tensor scaleV_view = make_tensor(
+              recast<intel::vector_t<ElementScaleV, scaleVSize::value>>(fragment_scaleV).data(),
+              make_layout(Shape<_1, decltype(size<1>(tArV.shape())), _1>{}, Stride<_1, _0, _0>{}));
+          Tensor scaleP_view = make_tensor(
+              recast<intel::vector_t<ElementScaleV, scalePSize::value>>(fragment_scaleP).data(),
+              make_layout(Shape<_1, decltype(size<1>(tArP.shape())), _1>{}, Stride<_1, _0, _0>{}));
+
+          auto zipped_p = make_zip_tensor(tArP, scaleP_view, gemm_p_offsets, gemm_pk_offsets);
+          auto zipped_v = make_zip_tensor(tArV, scaleV_view, gemm_v_offsets, gemm_vk_offsets);
+
+          cute::gemm(mma_pv, zipped_p, zipped_v, tArA(_, _, _, VV));
+#else
+          CUTE_INVALID_CONTROL_PATH(
+              "Block-scaled (MXFP) P*V path is only available on CRI "
+              "(SYCL_INTEL_TARGET==35).");
+#endif
+        } else {
+          if constexpr (F8kvF16mma) {
+            // F8 KV with F16 MMA path - apply scalar scale to V.
+            for (int i = 0; i < tArV.size(); i++)
+              tArV(i) = static_cast<typename TiledMMAQK::ValTypeB>(
+                  params.scale_v_scalar * static_cast<float>(tArV(i)));
+          }
+          cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
+        }
       }
 
       if constexpr (PagedKV) {

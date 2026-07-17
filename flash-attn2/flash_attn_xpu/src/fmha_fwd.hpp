@@ -56,8 +56,36 @@ void policy_dispatch_bf16(
     sycl::queue& queue,
     const fmha_fwd_args_t& args);
 
-// Combined dispatch (delegates to fp16/bf16 based on cuType)
+// MXFP (block-scaled FP8/FP4) dispatch functions. Unconditional: the host pass
+// (always SYCL_INTEL_TARGET==20) must own these symbols so they are callable at
+// runtime on CRI. The block-scaled device code is gated inside FMHAConfig and
+// the mainloop; on the BMG device pass these kernels compile as unreachable
+// placeholders (they are only ever executed on CRI hardware).
+template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged,
+      bool HasRotary = false>
+void policy_dispatch_mxfp_e5m2(
+    sycl::queue& queue,
+    const fmha_fwd_args_t& args);
+
+template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged,
+      bool HasRotary = false>
+void policy_dispatch_mxfp_e4m3(
+    sycl::queue& queue,
+    const fmha_fwd_args_t& args);
+
+template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged,
+      bool HasRotary = false>
+void policy_dispatch_mxfp_e2m1(
+    sycl::queue& queue,
+    const fmha_fwd_args_t& args);
+
+// Combined dispatch (delegates to fp16/bf16/mxfp based on cuType)
 // Defined inline in header so callers (fmha_fwd.cpp) can see the template body.
+// MXFP is only supported on the varlen/fix, non-paged, non-rotary forward paths
+// (matching the CRI reference implementation). The `if constexpr` guard ensures
+// the MXFP dispatchers are only ODR-used (and therefore only instantiated) for
+// those paths, so the paged / kvcache / rotary instantiations do not pull in the
+// (expensive) MXFP kernels.
 template <typename chunk_policy, int PipelineStages, int IsVarLen, int IsPaged,
           bool HasRotary = false>
 inline void policy_dispatch(
@@ -66,9 +94,21 @@ inline void policy_dispatch(
     const fmha_fwd_args_t& args) {
   if (cuType == CutlassType::half) {
     policy_dispatch_fp16<chunk_policy, PipelineStages, IsVarLen, IsPaged, HasRotary>(queue, args);
-  } else {
-    policy_dispatch_bf16<chunk_policy, PipelineStages, IsVarLen, IsPaged, HasRotary>(queue, args);
+    return;
   }
+  if constexpr (!IsPaged && !HasRotary) {
+    if (cuType == CutlassType::mx_float_e5m2) {
+      policy_dispatch_mxfp_e5m2<chunk_policy, PipelineStages, IsVarLen, IsPaged, HasRotary>(queue, args);
+      return;
+    } else if (cuType == CutlassType::mx_float_e4m3) {
+      policy_dispatch_mxfp_e4m3<chunk_policy, PipelineStages, IsVarLen, IsPaged, HasRotary>(queue, args);
+      return;
+    } else if (cuType == CutlassType::mx_float_e2m1) {
+      policy_dispatch_mxfp_e2m1<chunk_policy, PipelineStages, IsVarLen, IsPaged, HasRotary>(queue, args);
+      return;
+    }
+  }
+  policy_dispatch_bf16<chunk_policy, PipelineStages, IsVarLen, IsPaged, HasRotary>(queue, args);
 }
 
 // Varlen prefill mode extern declarations (IsVarLen=1, IsPaged=0/1)
@@ -139,6 +179,34 @@ EXTERN_DISPATCH_KVCACHE_PAGED(256)
 EXTERN_DISPATCH_KVCACHE_PAGED(512)
 #undef EXTERN_DISPATCH_KVCACHE_PAGED
 
+// MXFP (block-scaled FP8/FP4) extern declarations. Only the varlen prefill,
+// varlen decode and fixed non-paged / non-rotary forward paths are supported
+// (matching the CRI reference). Each head dimension instantiates all three
+// MXFP element types (e5m2, e4m3, e2m1).
+#define EXTERN_DISPATCH_MXFP(HDIM) \
+  extern template void policy_dispatch_mxfp_e5m2<prefill_policy_head##HDIM, PipelineStages_Prefill, 1, 0>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_mxfp_e5m2<decode_policy_head##HDIM,  PipelineStages_Decode,  1, 0>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_mxfp_e5m2<prefill_policy_head##HDIM, PipelineStages_Prefill, 0, 0>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_mxfp_e5m2<decode_policy_head##HDIM,  PipelineStages_Decode,  0, 0>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_mxfp_e4m3<prefill_policy_head##HDIM, PipelineStages_Prefill, 1, 0>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_mxfp_e4m3<decode_policy_head##HDIM,  PipelineStages_Decode,  1, 0>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_mxfp_e4m3<prefill_policy_head##HDIM, PipelineStages_Prefill, 0, 0>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_mxfp_e4m3<decode_policy_head##HDIM,  PipelineStages_Decode,  0, 0>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_mxfp_e2m1<prefill_policy_head##HDIM, PipelineStages_Prefill, 1, 0>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_mxfp_e2m1<decode_policy_head##HDIM,  PipelineStages_Decode,  1, 0>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_mxfp_e2m1<prefill_policy_head##HDIM, PipelineStages_Prefill, 0, 0>(sycl::queue&, const fmha_fwd_args_t&); \
+  extern template void policy_dispatch_mxfp_e2m1<decode_policy_head##HDIM,  PipelineStages_Decode,  0, 0>(sycl::queue&, const fmha_fwd_args_t&);
+
+EXTERN_DISPATCH_MXFP(32)
+EXTERN_DISPATCH_MXFP(64)
+EXTERN_DISPATCH_MXFP(96)
+EXTERN_DISPATCH_MXFP(128)
+EXTERN_DISPATCH_MXFP(160)
+EXTERN_DISPATCH_MXFP(192)
+EXTERN_DISPATCH_MXFP(256)
+EXTERN_DISPATCH_MXFP(512)
+#undef EXTERN_DISPATCH_MXFP
+
 void cutlass_fmha_fwd_varlen_impl(
     sycl::queue& queue,
     const at::Tensor& query,
@@ -164,7 +232,13 @@ void cutlass_fmha_fwd_varlen_impl(
     void* rng_state = nullptr,
     void* s_dmask = nullptr,
     int seqlen_q_rounded = 0,
-    int seqlen_k_rounded = 0);
+    int seqlen_k_rounded = 0,
+    // MXFP (block-scaled) scale factor tensors (optional).
+    const std::optional<at::Tensor>& scale_q = std::nullopt,
+    const std::optional<at::Tensor>& scale_k = std::nullopt,
+    const std::optional<at::Tensor>& scale_v = std::nullopt,
+    const std::optional<at::Tensor>& cu_scale_q = std::nullopt,
+    const std::optional<at::Tensor>& cu_scale_kv = std::nullopt);
 
 void cutlass_fmha_fwd_fix_impl(
     sycl::queue& queue,
@@ -184,7 +258,11 @@ void cutlass_fmha_fwd_fix_impl(
     void* rng_state = nullptr,
     void* s_dmask = nullptr,
     int seqlen_q_rounded = 0,
-    int seqlen_k_rounded = 0);
+    int seqlen_k_rounded = 0,
+    // MXFP (block-scaled) scale factor tensors (optional).
+    const std::optional<at::Tensor>& scale_q = std::nullopt,
+    const std::optional<at::Tensor>& scale_k = std::nullopt,
+    const std::optional<at::Tensor>& scale_v = std::nullopt);
 
 void cutlass_fmha_fwd_kvcache_impl(
     sycl::queue& queue,

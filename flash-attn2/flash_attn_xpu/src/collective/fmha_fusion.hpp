@@ -40,6 +40,7 @@ using namespace cute;
 struct VariableLength {
   int max_length;
   int* cumulative_length = nullptr;
+  int* cumulative_scale_length = nullptr;  // For MXFP varlen scale indexing
 
   CUTE_HOST_DEVICE operator int() const {
     return max_length;

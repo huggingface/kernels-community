@@ -67,6 +67,13 @@ class XeFMHAFwdKernelXe2 {
   static constexpr bool HasDropout = CollectiveMainloop::HasDropout;
   static constexpr bool PagedKV    = CollectiveMainloop::PagedKV;
 
+  // MXFP (block-scaled) support.
+  static constexpr bool UseScale = CollectiveMainloop::UseScale;
+  using ElementScale = typename CollectiveMainloop::ElementScaleQ;
+  using StrideScaleQ = decltype(stride(typename CollectiveMainloop::TensorScaleQ{}));
+  using StrideScaleK = decltype(stride(typename CollectiveMainloop::TensorScaleK{}));
+  using StrideScaleV = decltype(stride(typename CollectiveMainloop::TensorScaleV{}));
+
   using MainloopSharedStorage = typename CollectiveMainloop::SharedStorage;
   using EpilogueSharedStorage = typename CollectiveEpilogue::SharedStorage;
   union SharedStorage {
@@ -112,6 +119,14 @@ class XeFMHAFwdKernelXe2 {
     int64_t vnew_head_stride = 0;
     int64_t vnew_row_stride = 0;
     int seqlen_knew = 0;
+    // MXFP (block-scaled) scale tensors.
+    const ElementScale* scaleQ = nullptr;
+    StrideScaleQ dScaleQ{};
+    const ElementScale* scaleK = nullptr;
+    StrideScaleK dScaleK{};
+    const ElementScale* scaleV = nullptr;
+    StrideScaleV dScaleV{};
+    int group_size = 32;
   };
   using KernelParams = KernelArguments;
 
@@ -482,28 +497,102 @@ class XeFMHAFwdKernelXe2 {
       int l_coord_kv = is_var_len ? 0
                        : (PagedKV ? 0 : bidx);
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
-      mainloop(
-          Q(_, _, head_q, l_coord_q),
-          K(_, _, head, l_coord_kv),
-          V(_, _, head, l_coord_kv),
-          tArA,
-          tA_max,
-          tA_sum,
-          blk_qv,
-          k_block0,
-          k_blocks,
-          total_blk,
-          thr_id,
-          seq_len,
-          seq_len_qo,
-          effective_seq_kv,
-          idx_b,
-          tile_row_idx,
-          rows_of_maxima,
-          head_q,
-          s.num_heads_q,
-          q_offset_sg,
-          p.cache_seqlens ? p.cache_seqlens[idx_b] : 0);
+      if constexpr (UseScale) {
+        // MXFP: build block-scale tensors mirroring the Q/K/V layout.
+        auto scale_q_dim = cute::ceil_div(s.head_size_qk, p.group_size);
+        auto scale_k_dim = cute::ceil_div(s.head_size_qk, p.group_size);
+        auto scale_v_dim = cute::ceil_div(total_seqlen_kv, p.group_size);
+
+        auto shape_scale_Q =
+            make_shape(seq_len_qo, scale_q_dim, s.num_heads_q, batch_dim_q);
+        auto shape_scale_K =
+            make_shape(total_seqlen_kv, scale_k_dim, s.num_heads_kv, batch_dim_kv);
+        auto shape_scale_V =
+            make_shape(s.head_size_vo, scale_v_dim, s.num_heads_kv, batch_dim_kv);
+
+        int offset_scaleQ = 0, offset_scaleK = 0, offset_scaleV = 0;
+        if constexpr (is_var_len) {
+          auto qo_cumulative = s.seq_len_qo.cumulative_length;
+          auto kv_cumulative = s.seq_len_kv.cumulative_length;
+          offset_scaleQ = s.num_heads_q * scale_q_dim * qo_cumulative[idx_b];
+          offset_scaleK = s.num_heads_kv * scale_k_dim * kv_cumulative[idx_b];
+          auto kv_scale_cumulative = s.seq_len_kv.cumulative_scale_length;
+          if (kv_scale_cumulative != nullptr) {
+            offset_scaleV =
+                s.num_heads_kv * s.head_size_vo * kv_scale_cumulative[idx_b];
+          } else {
+            offset_scaleV = s.num_heads_kv * scale_v_dim * kv_cumulative[idx_b];
+          }
+        }
+
+        auto layout_scaleQ = is_var_len
+            ? make_ordered_layout(shape_scale_Q, Step<_0, _1, _2, _3>{})
+            : make_layout(shape_scale_Q, p.dScaleQ);
+        auto layout_scaleK = is_var_len
+            ? make_ordered_layout(shape_scale_K, Step<_0, _1, _2, _3>{})
+            : make_layout(shape_scale_K, p.dScaleK);
+        auto layout_scaleV = is_var_len
+            ? make_ordered_layout(shape_scale_V, Step<_0, _1, _2, _3>{})
+            : make_layout(shape_scale_V, p.dScaleV);
+
+        auto dcScaleQ = const_cast<ElementScale*>(p.scaleQ + offset_scaleQ);
+        auto dcScaleK = const_cast<ElementScale*>(p.scaleK + offset_scaleK);
+        auto dcScaleV = const_cast<ElementScale*>(p.scaleV + offset_scaleV);
+
+        Tensor ScaleQ = make_tensor(make_gmem_ptr(dcScaleQ), layout_scaleQ);
+        Tensor ScaleK = make_tensor(make_gmem_ptr(dcScaleK), layout_scaleK);
+        Tensor ScaleV = make_tensor(make_gmem_ptr(dcScaleV), layout_scaleV);
+
+        mainloop(
+            Q(_, _, head_q, l_coord_q),
+            K(_, _, head, l_coord_kv),
+            V(_, _, head, l_coord_kv),
+            tArA,
+            tA_max,
+            tA_sum,
+            blk_qv,
+            k_block0,
+            k_blocks,
+            total_blk,
+            thr_id,
+            seq_len,
+            seq_len_qo,
+            effective_seq_kv,
+            idx_b,
+            tile_row_idx,
+            rows_of_maxima,
+            head_q,
+            s.num_heads_q,
+            q_offset_sg,
+            p.cache_seqlens ? p.cache_seqlens[idx_b] : 0,
+            l_coord_q,
+            ScaleQ(_, _, head_q, l_coord_q),
+            ScaleK(_, _, head, l_coord_kv),
+            ScaleV(_, _, head, l_coord_kv));
+      } else {
+        mainloop(
+            Q(_, _, head_q, l_coord_q),
+            K(_, _, head, l_coord_kv),
+            V(_, _, head, l_coord_kv),
+            tArA,
+            tA_max,
+            tA_sum,
+            blk_qv,
+            k_block0,
+            k_blocks,
+            total_blk,
+            thr_id,
+            seq_len,
+            seq_len_qo,
+            effective_seq_kv,
+            idx_b,
+            tile_row_idx,
+            rows_of_maxima,
+            head_q,
+            s.num_heads_q,
+            q_offset_sg,
+            p.cache_seqlens ? p.cache_seqlens[idx_b] : 0);
+      }
 
       if constexpr (
           !is_empty_v<MainloopSharedStorage> &&

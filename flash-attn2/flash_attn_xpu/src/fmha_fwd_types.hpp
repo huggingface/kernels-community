@@ -11,11 +11,20 @@ struct fmha_fwd_args_t {
   void* block_table;
   void* cu_seqlens_q;
   void* cu_seqlens_k;
+  // Scale tensors for MXFP (block-scaled) operations
+  void* scale_q = nullptr;
+  void* scale_k = nullptr;
+  void* scale_v = nullptr;
+  void* cu_scale_q = nullptr;
+  void* cu_scale_kv = nullptr;
   int max_queries;
   int max_keys;
   int total_seqlen_q;
   int total_seqlen_k;
   float sm_scale;
+  // Scalar scales for F8 KV with F16 MMA path
+  float scale_k_scalar = 1.0f;
+  float scale_v_scalar = 1.0f;
   int batch_size;
   int num_heads_q;
   int num_heads_k;
@@ -65,8 +74,14 @@ struct fmha_fwd_args_t {
 
 enum class CutlassType {
   half,
-  bfloat16
+  bfloat16,
+  mx_float_e5m2,   // MXFP8 E5M2
+  mx_float_e4m3,   // MXFP8 E4M3
+  mx_float_e2m1    // MXFP4 E2M1
 };
 
 constexpr int PipelineStages_Decode = 1;
 constexpr int PipelineStages_Prefill = 2;
+
+// Scale group size for block-scaled (MXFP) operations
+constexpr int GROUP_SIZE = 32;

@@ -27,7 +27,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     "int window_size_right, "
     "float softcap, "
     "bool return_softmax, "
-    "Generator? gen_) -> Tensor[]");
+    "Generator? gen_, "
+    "Tensor? scale_q_=None, "
+    "Tensor? scale_k_=None, "
+    "Tensor? scale_v_=None) -> Tensor[]");
 #if defined(CUDA_KERNEL)
   ops.impl("fwd", torch::kCUDA, &mha_fwd);
 #elif defined(XPU_KERNEL)
@@ -55,7 +58,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     "int window_size_right, "
     "float softcap, "
     "bool return_softmax, "
-    "Generator? gen_) -> Tensor[]");
+    "Generator? gen_, "
+    "Tensor? scale_q_=None, "
+    "Tensor? scale_k_=None, "
+    "Tensor? scale_v_=None, "
+    "Tensor? cu_scale_q_=None, "
+    "Tensor? cu_scale_kv_=None) -> Tensor[]");
 #if defined(CUDA_KERNEL)
   ops.impl("varlen_fwd", torch::kCUDA, &mha_varlen_fwd);
 #elif defined(XPU_KERNEL)
