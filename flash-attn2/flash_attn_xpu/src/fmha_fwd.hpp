@@ -1,17 +1,15 @@
 #pragma once
 
+#include "fmha_fwd_types.hpp"
+
 #include <optional>
 
-#include "fmha_fwd_types.hpp"
+#include <ATen/core/Tensor.h>
 
 namespace sycl {
   inline namespace _V1 {
     class queue;
   }
-}
-
-namespace at {
-  class Tensor;
 }
 
 struct prefill_policy_head32;
@@ -224,19 +222,19 @@ void cutlass_fmha_fwd_varlen_impl(
     bool is_paged,
     bool is_causal,
     bool is_local,
-    float p_dropout,
-    uint64_t philox_seed,
-    uint64_t philox_offset,
-    void* rng_state,
-    void* s_dmask,
-    int seqlen_q_rounded,
-    int seqlen_k_rounded,
+    float p_dropout = 0.0f,
+    uint64_t philox_seed = 0,
+    uint64_t philox_offset = 0,
+    void* rng_state = nullptr,
+    void* s_dmask = nullptr,
+    int seqlen_q_rounded = 0,
+    int seqlen_k_rounded = 0,
     // MXFP (block-scaled) scale factor tensors (optional).
-    const std::optional<at::Tensor>& scale_q,
-    const std::optional<at::Tensor>& scale_k,
-    const std::optional<at::Tensor>& scale_v,
-    const std::optional<at::Tensor>& cu_scale_q,
-    const std::optional<at::Tensor>& cu_scale_kv);
+    const std::optional<at::Tensor>& scale_q = std::nullopt,
+    const std::optional<at::Tensor>& scale_k = std::nullopt,
+    const std::optional<at::Tensor>& scale_v = std::nullopt,
+    const std::optional<at::Tensor>& cu_scale_q = std::nullopt,
+    const std::optional<at::Tensor>& cu_scale_kv = std::nullopt);
 
 void cutlass_fmha_fwd_fix_impl(
     sycl::queue& queue,
@@ -250,17 +248,17 @@ void cutlass_fmha_fwd_fix_impl(
     int window_size_right,
     bool is_causal,
     bool is_local,
-    float p_dropout,
-    uint64_t philox_seed,
-    uint64_t philox_offset,
-    void* rng_state,
-    void* s_dmask,
-    int seqlen_q_rounded,
-    int seqlen_k_rounded,
+    float p_dropout = 0.0f,
+    uint64_t philox_seed = 0,
+    uint64_t philox_offset = 0,
+    void* rng_state = nullptr,
+    void* s_dmask = nullptr,
+    int seqlen_q_rounded = 0,
+    int seqlen_k_rounded = 0,
     // MXFP (block-scaled) scale factor tensors (optional).
-    const std::optional<at::Tensor>& scale_q,
-    const std::optional<at::Tensor>& scale_k,
-    const std::optional<at::Tensor>& scale_v);
+    const std::optional<at::Tensor>& scale_q = std::nullopt,
+    const std::optional<at::Tensor>& scale_k = std::nullopt,
+    const std::optional<at::Tensor>& scale_v = std::nullopt);
 
 void cutlass_fmha_fwd_kvcache_impl(
     sycl::queue& queue,
