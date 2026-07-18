@@ -95,17 +95,20 @@ template <
 CUTE_HOST_DEVICE constexpr auto to_tiled_mma_sm100_ts(
     TiledMMA<
         MMA_Atom<
-            MMA_Traits<
-                SM100_MMA_F8F6F4_SS,
+            // CUTLASS 4.5 turned SM100_MMA_F8F6F4_SS into a class template
+            // (upstream NATTEN pins 4.4, where it was a tag type paired with
+            // a variadic MMA_Traits); match the atom directly, like the
+            // F16BF16 overload below.
+            SM100_MMA_F8F6F4_SS<
                 a_type,
                 b_type,
                 c_type,
-                cute::C<M>,
-                cute::C<N>,
-                cute::integral_constant<UMMA::Major, a_major>,
-                cute::integral_constant<UMMA::Major, b_major>,
-                cute::integral_constant<UMMA::ScaleIn, a_neg>,
-                cute::integral_constant<UMMA::ScaleIn, b_neg>>,
+                M,
+                N,
+                a_major,
+                b_major,
+                a_neg,
+                b_neg>,
             TAs...>,
         TMs...>) {
   return TiledMMA<
