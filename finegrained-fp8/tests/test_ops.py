@@ -12,21 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Op-level scenario tests: the (weight recipe x epilogue x input/output recipe)
-support matrix of ``matmul_grouped`` / ``matmul_batched``, each cell checked against an
-independent dequantize-and-matmul torch reference (``tests/utils.py``'s ``WEIGHTS``
+support matrix of ``matmul_grouped`` / ``matmul_batched`` / ``matmul_2d``, each cell checked
+against an independent dequantize-and-matmul torch reference (``tests/utils.py``'s ``WEIGHTS``
 registry — shared with ``test_moe``'s fused-vs-unfused problems).
 
 The scenario list is GENERATED from the same support matrix the ``Quantization``
 docstring documents — every weight recipe crosses its valid input and output recipes
 once, activation-function variants ride one recipe (the GLU math is recipe-independent),
-and routing variants (sentinel, noncontiguous ids, empty expert, decode and launch-scale
-shapes, torch.compile) ride one recipe each. ``matmul_2d`` gets its own torch-reference
-test here — nothing in this file uses a kernel under test as the oracle."""
+and routing variants (sentinel, noncontiguous ids, empty expert, decode / native-M / launch-scale
+shapes, torch.compile) ride one recipe each. One ``Problem`` list feeds all three ops via the
+``op`` axis (``test_op_scenarios``): the routed ops (``batched`` / ``grouped``) run
+every Problem; ``matmul`` — the single-GEMM sibling — runs each Problem it can represent (no
+expert routing, a quantized recipe it routes, requant on MX weights only), one weight matrix and
+no gather/scatter. Two orthogonal knobs ride the same list: ``static`` (per-tensor calibrated
+activation quant, all three ops) and ``swizzled`` (MX weight scales pre-swizzled into the 5D
+SWIZZLE_32_4_4 tcgen05 layout — a pure layout variant checked against the affine reference).
+Nothing in this file uses a kernel under test as the oracle."""
 
 from dataclasses import dataclass
 
 import pytest
 import torch
+import triton
 
 from utils import (  # type: ignore
     DTYPE_TO_TOL,
@@ -36,14 +43,19 @@ from utils import (  # type: ignore
     WEIGHTS,
     dq_grouped,
     dq_scale,
-    fp8_act_quant_block_dynamic,
+    make_static_activation_scale,
     maybe_compile,
+    quant_dequant_a,
     unswizzle_mx_scales,
 )
 
 import finegrained_fp8  # type: ignore
-from finegrained_fp8 import Epilogue, Quantization  # type: ignore
-from finegrained_fp8.utils import apply_glu  # type: ignore
+from finegrained_fp8 import Epilogue, Quantization, swizzle_mx_scales  # type: ignore
+from finegrained_fp8.utils import (  # type: ignore
+    apply_glu,
+    swizzle_gateup_weight_scales,
+    ue8m0_as_uint8,
+)
 
 
 # ── the scenario spec ─────────────────────────────────────────────────────────────
@@ -67,6 +79,8 @@ class Problem:
     input_recipe: str | None = None
     output_recipe: str | None = None
     prequant: bool = False  # pass As explicitly (must be bit-identical to raw A)
+    static: bool = False  # per-tensor calibrated activation scale (block-scale FP8 path)
+    swizzled: bool = False  # pass MX weight scales pre-swizzled (5D SWIZZLE_32_4_4 fast path)
     sentinel_fraction: float = 0.0
     noncontiguous: bool = False
     empty_expert: bool = False
@@ -88,6 +102,10 @@ class Problem:
             tag += f"_out{self.output_recipe}"
         if self.prequant:
             tag += "_prequant"
+        if self.static:
+            tag += "_static"
+        if self.swizzled:
+            tag += "_swizzled"
         if self.sentinel_fraction:
             tag += "_sentinel"
         if self.noncontiguous:
@@ -140,15 +158,36 @@ def scenarios() -> list[Problem]:
         Problem(weights="mxfp8", sentinel_fraction=0.25),
         Problem(weights="mxfp8", noncontiguous=True),
         Problem(weights="mxfp8", empty_expert=True),
-        Problem(weights="mxfp8", S=8),  # decode shape
-        Problem(weights="nvfp4", S=8),  # decode on the software/swap arms
+        # decode shape (small M — inline act-quant on MX, the software/scalar arms elsewhere)
+        Problem(weights="mxfp8", S=8),
+        Problem(weights="nvfp4", S=8),
         Problem(weights="fp8_128x128", S=8),
+        Problem(weights="fp8_128x128_ue8m0", S=8),
+        Problem(weights="mxfp4", S=8),
+        # native-M tile (BM>=128): the recipe matrix above rides sub-native S, so these carry the
+        # native-only compute arms — block-dynamic UE8M0 dot_scaled fold and the native mxfp/nvfp4
+        # MMA (mxfp8's is covered by the S=2048 launch-scale case below).
+        Problem(weights="fp8_128x128_ue8m0", S=128),
+        Problem(weights="mxfp4", S=128),
+        Problem(weights="mxfp4", input_recipe="mxfp4", S=128),  # W4A4 native (packed acts)
+        Problem(weights="nvfp4", S=128),
+        # swizzled MX weight scales (5D SWIZZLE_32_4_4 — the tcgen05 fast path): the same values in
+        # the swizzled layout, so results match the affine cells. One per MX family + a gate case
+        # (the (E, 2N) gate|up swizzle). Runs on all three ops; the reference stays on the affine Bs.
+        Problem(weights="mxfp8", swizzled=True),
+        Problem(weights="mxfp4", swizzled=True),
+        Problem(weights="nvfp4", swizzled=True),
+        Problem(weights="mxfp8", gate=True, swizzled=True),
         # launch-scale smoke (the matrix rides small shapes; this catches scale-dependent
         # scheduling/tiling regressions)
         Problem(weights="mxfp8", S=2048, E=16, N=512, K=1024),
         Problem(weights="fp8_128x128", compile=True),
         Problem(weights="mxfp4", compile=True),
         Problem(weights="bf16", compile=True),  # the fp kernel's pre_hook under compile
+        # static (per-tensor calibrated) activation quant — matmul_2d's block_static path,
+        # reached only with activation_scale set; the matmul op only (no MoE analogue).
+        Problem(weights="fp8_128x128", static=True),
+        Problem(weights="fp8_128x128", gate=True, static=True),
     ]
     return out
 
@@ -171,6 +210,8 @@ def _routed(problem: Problem):
             : int(problem.S * problem.sentinel_fraction)
         ]
         expert_ids[idx] = problem.E
+    if problem.noncontiguous:
+        expert_ids = _make_noncontig(expert_ids)
     return A, expert_ids
 
 
@@ -181,24 +222,56 @@ def _make_noncontig(x):
     return base[:, 0]
 
 
-def _reference(problem: Problem, A, expert_ids, B, Bs):
-    """fp32 oracle on the SAME quantized operands the op consumes: quantize A with the
-    recipe's host fn (the exact code the op calls), dequantize both sides, matmul in
-    fp32, then GLU in fp32 — the production epilogue applies it to the fp32 accumulator
-    directly (``simulate_unfused`` is the rounding-matched variant, tested at moe level).
-    Sentinel rows are zeroed (excluded from the checks). Returns
+def _static_scale(problem: Problem, A):
+    """Per-tensor calibrated activation scale for the static (block-scale FP8) path, else None —
+    deterministic in ``A``, so the reference and the op derive the identical scalar."""
+    return make_static_activation_scale(A) if problem.static else None
+
+
+def _swizzle_bs(op, gate, Bs, N, K):
+    """Reorder affine MX weight scales into the 5D SWIZZLE_32_4_4 layout the ops read on the
+    tcgen05 fast path — a pure layout change (values unchanged), so the op's result matches the
+    affine-Bs reference. ``Bs`` is 2D ``(rows, K//g)`` for matmul (one matrix), else the routed
+    ops' ``(E, rows, K//g)``. Uses the deployment's own swizzle helpers."""
+    bs_u8 = ue8m0_as_uint8(Bs)
+    g = K // Bs.shape[-1]
+    cb = triton.cdiv(K // g, 4)
+    if op == "matmul":  # single matrix (rows = N or 2N under gate)
+        return swizzle_mx_scales(bs_u8).reshape(1, triton.cdiv(Bs.shape[0], 128), cb, 2, 256)
+    E, rows, _ = Bs.shape
+    if gate:  # (E, 2N, K//g) -> the interleaved gate|up weight-scale swizzle
+        return swizzle_gateup_weight_scales(bs_u8, E, N)
+    return swizzle_mx_scales(bs_u8.reshape(E * rows, K // g)).reshape(
+        1, E * (rows // 128), cb, 2, 256
+    )
+
+
+def _reference(problem: Problem, A, expert_ids, B, Bs, op):
+    """fp32 oracle on the SAME quantized operands the op consumes: quantize A with the recipe's
+    host fn (the exact code the op calls) — or against the static per-tensor scale — dequantize
+    both sides, matmul in fp32, then GLU in fp32 (the production epilogue applies it to the fp32
+    accumulator directly; ``simulate_unfused`` is the rounding-matched variant, tested at moe
+    level). The ``matmul`` op has no routing — every row uses the single weight matrix
+    ``W[0]``; the routed ops gather ``W[expert]`` and zero sentinel rows. Returns
     ``(ref_out, (Aq, As) or None)``."""
     row = WEIGHTS[problem.weights]
-    quant = row["act_quant"][problem.input_recipe]
-    if quant is None:
-        A_dq, prequant_args = A.float(), None
+    static_scale = _static_scale(problem, A)
+    if static_scale is not None:  # static per-tensor activation quant
+        A_dq, prequant_args = quant_dequant_a(A, problem.K, scale=static_scale), None
     else:
-        Aq, As = quant(A)
-        A_dq, prequant_args = row["dq_act"](Aq, As), (Aq, As)
+        quant = row["act_quant"][problem.input_recipe]
+        if quant is None:
+            A_dq, prequant_args = A.float(), None
+        else:
+            Aq, As = quant(A)
+            A_dq, prequant_args = row["dq_act"](Aq, As), (Aq, As)
     W = row["dequant"](B, Bs)  # (E, rows, K) fp32
-    local = expert_ids.long().clamp(max=problem.E - 1)
-    ref = torch.einsum("sk,snk->sn", A_dq, W[local])
-    ref[expert_ids.long() >= problem.E] = 0
+    if op == "matmul":
+        ref = A_dq @ W[0].T  # single linear, no routing
+    else:
+        local = expert_ids.long().clamp(max=problem.E - 1)
+        ref = torch.einsum("sk,snk->sn", A_dq, W[local])
+        ref[expert_ids.long() >= problem.E] = 0
     if problem.gate:
         gate_v, up_v = ref.chunk(2, dim=-1)
         ref = apply_glu(
@@ -207,7 +280,7 @@ def _reference(problem: Problem, A, expert_ids, B, Bs):
     return ref, prequant_args
 
 
-def _run_op(problem: Problem, layout, A, expert_ids, B, Bs, As=None):
+def _run_op(problem: Problem, op, A, expert_ids, B, Bs, As=None):
     epilogue = (
         Epilogue(
             gate=True,
@@ -228,18 +301,33 @@ def _run_op(problem: Problem, layout, A, expert_ids, B, Bs, As=None):
     kw = dict(epilogue=epilogue, quantization=quantization)
     if problem.output_recipe is None:
         kw["output_dtype"] = problem.dtype
-    if layout == "batched":
-        op = maybe_compile(finegrained_fp8.matmul_batched, problem.compile)
-        return op(A, B, As, Bs, expert_ids=expert_ids, **kw)
+    if problem.static:  # fused static (per-tensor) activation quant — all three ops
+        kw["activation_scale"] = _static_scale(problem, A)
+    if op == "matmul":
+        # single-GEMM sibling: one weight matrix (expert 0), no routing maps. Bs None =
+        # full-precision (BF16/FP16) weights.
+        if Bs is None:
+            bs = None
+        elif problem.swizzled:
+            bs = _swizzle_bs("matmul", problem.gate, Bs[0], problem.N, problem.K)
+        else:
+            bs = Bs[0]
+        block_size = [128, 128] if problem.weights.startswith("fp8_128x128") else None
+        fn = maybe_compile(finegrained_fp8.matmul_2d, problem.compile)
+        return fn(A, B[0], bs, block_size, **kw)
+    bs = _swizzle_bs(op, problem.gate, Bs, problem.N, problem.K) if problem.swizzled else Bs
+    if op == "batched":
+        fn = maybe_compile(finegrained_fp8.matmul_batched, problem.compile)
+        return fn(A, B, As, bs, expert_ids=expert_ids, **kw)
     expert_start, gather_idx, scatter_idx = finegrained_fp8.compute_grouped_scheduling(
         expert_ids, problem.E, 1
     )
-    op = maybe_compile(finegrained_fp8.matmul_grouped, problem.compile)
-    return op(
+    fn = maybe_compile(finegrained_fp8.matmul_grouped, problem.compile)
+    return fn(
         A,
         B,
         As,
-        Bs,
+        bs,
         expert_start=expert_start,
         gather_idx=gather_idx,
         scatter_idx=scatter_idx,
@@ -247,8 +335,12 @@ def _run_op(problem: Problem, layout, A, expert_ids, B, Bs, As=None):
     )
 
 
-def _check(problem: Problem, out, ref, expert_ids):
-    keep = expert_ids.long() < problem.E
+def _check(problem: Problem, out, ref, expert_ids, op):
+    keep = (
+        torch.ones(ref.shape[0], dtype=torch.bool, device=ref.device)
+        if op == "matmul"  # no routing — every row is valid
+        else expert_ids.long() < problem.E
+    )
     if problem.output_recipe is None:
         atol, rtol = DTYPE_TO_TOL[problem.dtype]
         torch.testing.assert_close(
@@ -284,67 +376,37 @@ def _check(problem: Problem, out, ref, expert_ids):
     assert rel < 0.06, f"requant dequant mean-rel {rel:.4f} vs offline reference"
 
 
+def _skip_moe_only(problem: Problem, op: str) -> None:
+    """matmul_2d is the single-GEMM sibling: skip only the scenarios it can't represent — expert
+    routing (sentinel / noncontiguous / empty-expert / the MoE prequant-As check) and non-MX
+    input/output recipe knobs (its FP8 paths derive the input quant from block_size and return the
+    intermediate dense). Everything else — including full-precision (BF16/FP16) weights and static
+    activation quant — runs on all three ops."""
+    if op != "matmul":
+        return
+    if problem.sentinel_fraction or problem.noncontiguous or problem.empty_expert or problem.prequant:
+        pytest.skip("expert-routing scenario (MoE only)")
+    mx = problem.weights in ("mxfp8", "mxfp8_u8", "mxfp4", "nvfp4")
+    if not mx and (problem.input_recipe or problem.output_recipe):
+        pytest.skip("input/output recipe is MX-only for matmul_2d")
+
+
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
-@pytest.mark.parametrize("layout", ["batched", "grouped"])
+@pytest.mark.parametrize("op", ["batched", "grouped", "matmul"])
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
-def test_op_scenarios(problem: Problem, layout):
+def test_op_scenarios(problem: Problem, op):
+    _skip_moe_only(problem, op)
     A, expert_ids = _routed(problem)
-    if problem.noncontiguous:
-        expert_ids = _make_noncontig(expert_ids)
     row = WEIGHTS[problem.weights]
-    B, Bs = row["make"](
-        2 * problem.N if problem.gate else problem.N, problem.K, problem.E
-    )
-    ref, prequant_args = _reference(problem, A, expert_ids, B, Bs)
-    out = _run_op(problem, layout, A, expert_ids, B, Bs)
-    _check(problem, out, ref, expert_ids)
-    if problem.prequant:
+    E = 1 if op == "matmul" else problem.E  # matmul is a single weight matrix
+    B, Bs = row["make"](2 * problem.N if problem.gate else problem.N, problem.K, E)
+    ref, prequant_args = _reference(problem, A, expert_ids, B, Bs, op)
+    out = _run_op(problem, op, A, expert_ids, B, Bs)
+    _check(problem, out, ref, expert_ids, op)
+    if problem.prequant:  # routed ops only (_skip_moe_only excludes prequant from matmul)
         # handing the op the SAME pre-quantized (Aq, As) must be bit-identical to the
         # raw-A run (the op quantizes raw A with the same host fn)
         Aq, As = prequant_args
-        out2 = _run_op(problem, layout, Aq, expert_ids, B, Bs, As=As)
+        out2 = _run_op(problem, op, Aq, expert_ids, B, Bs, As=As)
         assert torch.equal(out, out2), "pre-quantized As path diverged from raw A"
-
-
-@pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
-@pytest.mark.parametrize(
-    "m_rows", [1, 64, 128], ids=["M1_inline", "M64_offline", "M128_native"]
-)
-@pytest.mark.parametrize(
-    "weights,input_recipe",
-    [
-        ("fp8_128x128", None),
-        ("fp8_128x128_ue8m0", None),  # UE8M0 scales -> dot_scaled arm at M128
-        ("mxfp8", None),
-        ("mxfp4", None),  # W4A8, the MX default
-        ("mxfp4", "mxfp4"),  # W4A4 (packed acts)
-        ("nvfp4", None),
-    ],
-    ids=lambda v: str(v),
-)
-def test_matmul_2d_vs_torch(weights, input_recipe, m_rows):
-    """matmul_2d against the pure-torch dequant oracle — it used to be the reference for
-    the routed tests, so it gets its own independent check (nothing kernel-side in the
-    oracle). ``m_rows`` spans the ``maybe_act_quant`` gate: M=1 runs the in-kernel
-    inline quant arm, M=64 the offline pre-quant pass (bit-exact pair by construction),
-    M=128 the native-M tile (block-dynamic UE8M0 takes its dot_scaled arm here);
-    ``input_recipe`` spans the activation grids per weight family."""
-    torch.manual_seed(0)
-    M, N, K = m_rows, 128, 256
-    row = WEIGHTS[weights]
-    B, Bs = row["make"](N, K, 1)
-    A = torch.randn(M, K, device=TEST_DEVICE, dtype=torch.bfloat16)
-    block_size = [128, 128] if weights.startswith("fp8_128x128") else None
-    out = finegrained_fp8.matmul_2d(A, B[0], Bs[0], block_size,
-                                    input_recipe=input_recipe)
-    quant = row["act_quant"][input_recipe]
-    Aq, As = (
-        quant(A) if weights != "fp8_128x128" else fp8_act_quant_block_dynamic(A, 128)
-    )
-    ref = row["dq_act"](Aq, As) @ row["dequant"](B, Bs)[0].T
-    atol, rtol = DTYPE_TO_TOL[torch.bfloat16]
-    torch.testing.assert_close(
-        out.float(), ref.to(out.dtype).float(), atol=atol, rtol=rtol
-    )

@@ -274,7 +274,12 @@ def ref_matmul(A, B, Bs, block_size, output_dtype=torch.float32, activation_scal
     (FP8 only) selects static quant."""
     is_mx = block_size == (1, MX_SCALE_GROUP_K)
     block_n, block_k = block_size if block_size is not None else B.shape
-    A_deq = quant_dequant_a(A, block_k, scale=activation_scale, pow2_scale=is_mx)
+    # UE8M0 weight scales imply the activation is also UE8M0 (power-of-2) quantized: the kernel
+    # keys its activation quant on the weight-scale dtype (``use_ue8m0 = Bs is uint8``) so both
+    # group scales fold into the same MMA — mixing UE8M0 weight with fp32 activation scales is
+    # not a supported recipe. Holds for the block-128 UE8M0 recipe, not just MX (1,32).
+    is_ue8m0 = Bs.dtype in (torch.uint8, torch.float8_e8m0fnu)
+    A_deq = quant_dequant_a(A, block_k, scale=activation_scale, pow2_scale=is_mx or is_ue8m0)
     B_deq = dequant_b(B, Bs, block_n, block_k)
     return (A_deq @ B_deq.T).to(output_dtype)
 

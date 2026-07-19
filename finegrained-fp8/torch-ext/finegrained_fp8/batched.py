@@ -18,6 +18,8 @@ import triton.language as tl
 
 from ._ops import add_op_namespace_prefix
 
+from triton.tools.tensor_descriptor import TensorDescriptor
+
 from .bayesian_autotuner import bayesian_autotune
 from .utils import (
     compile_time_only_triton_op,
@@ -33,18 +35,21 @@ from .utils import (
     resolve_output_dtype,
     accumulate,
     oriented_tile_ptrs,
+    operand_tile_ptrs,
+    advance_ptrs,
+    gemm_epilogue,
     acc_init,
     block_dynamic_batched_dot,
+    block_static_batched_dot,
     mx_config_pruner,
+    swizzled_scale_config_pruner,
     smem_pruner,
     block_within_dim_pruner,
     compose_pruners,
     acc_finalize,
-    glu,
-    split_gate_up_glu,
-    stacked_gate_up_ptrs,
-    stacked_gate_up_flatten,
-    fp8_act_quant_inline,
+    weight_tile_ptrs,
+    flatten_weight_tile,
+    load_weight_scale_tile,
     mx_act_quant_inline,
     expert_weight_shape,
     mx_scale_family,
@@ -77,10 +82,15 @@ def expert_setup(
     stride_eid,
     HAS_GATHER: tl.constexpr,
     HAS_SCATTER: tl.constexpr,
+    ADVANCE_BS: tl.constexpr = True,
 ):
     """Per-(row, expert) prologue shared by the batched kernels: read the program
     ids, look up the routed expert, and advance the A/B/C/Bs base pointers to this
-    row's slice. Returns ``(batch_id, pid_n, expert_id, A, B, C, Bs)``.
+    row's slice. Returns ``(batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row)`` — the
+    resolved source/destination rows fold the gather/scatter out of the kernel bodies.
+
+    ``ADVANCE_BS=False`` leaves ``Bs`` at the buffer base (the mx scale leaf applies the expert
+    offset itself — its swizzled path indexes by 128-row block, not the row-major expert stride).
 
     ``A``'s source row is ``GatherIdx[batch_id]`` when ``HAS_GATHER`` (the gate_up reading
     unexpanded activations, many-to-one for top_k > 1) else ``batch_id``; ``C``'s destination
@@ -99,7 +109,8 @@ def expert_setup(
     A = A + in_row * stride_a_m
     B = B + expert_id * stride_b_e
     C = C + out_row * stride_c_m
-    Bs = Bs + expert_id * stride_bs_e
+    if ADVANCE_BS:
+        Bs = Bs + expert_id * stride_bs_e
     return batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row
 
 
@@ -121,6 +132,8 @@ def store_row(
     c = accumulator.to(C.dtype.element_ty)
     offs_cm = tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    # offs_cm[:, None] * 0: broadcast to a [BM, BN] pointer tile (all rows alias the one C row)
+    # so the lane-0 mask below has a row axis to select; the M stride is deliberately 0.
     c_ptrs = C + offs_cm[:, None] * 0 + stride_c_n * offs_cn[None, :]
     tl.store(c_ptrs, c, mask=(offs_cm == 0)[:, None])
 
@@ -213,60 +226,146 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         return
 
     num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_a_k
+    a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_k, stride_a_m, stride_a_k, "pointer", True)
     as_ptrs = As + in_row * stride_as_m + tl.zeros((BLOCK_SIZE_M,), tl.int32)
-    # gate|up weight streams: gate at rows [0,N), up at [N,2N). The two-dot gate|up form is the
-    # swap-orientation, decode-validated shape (a stacked tile can't take it here). The up
-    # stream's pointers are built unconditionally (pointer arithmetic only — the up value/scale
-    # loads are constexpr-gated by GATE inside block_dynamic_batched_dot, so non-gate never
-    # dereferences them).
-    wg_ptr = oriented_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
-    bsg_ptr = Bs + pid_n * stride_bs_n
-    wu_ptr = oriented_tile_ptrs(B, N + offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
-    bsu_ptr = Bs + (num_n_tiles + pid_n) * stride_bs_n
-    acc_gate = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
-    acc_up = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+    # One stacked gate|up weight tile (gate rows [0,N), up rows [N,2N)) + one block-scale pointer,
+    # like every other kernel. The up block scale sits num_n_tiles blocks after gate; folding that
+    # into the per-weight-row load offset (tl.where) lets gate|up share a tile + a single dot.
+    b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, N * stride_b_n, stride_b_n, stride_b_k, GATE, SWAP_AB)
+    bs_ptr = Bs + pid_n * stride_bs_n
+    bs_off = tl.where(tl.arange(0, n_width) < BLOCK_SIZE_N, 0, num_n_tiles * stride_bs_n)
+    acc = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a, a_s = load_block_fp8_act_tile(a_ptrs, as_ptrs)
-        acc_gate, acc_up = block_dynamic_batched_dot(
-            acc_gate, acc_up, a, a_s, wg_ptr, wu_ptr, bsg_ptr, bsu_ptr,
-            GATE, SWAP_AB, BLOCK_SIZE_K,
+        w = flatten_weight_tile(tl.load(b_ptrs), 2 * BLOCK_SIZE_N, BLOCK_SIZE_K, GATE, SWAP_AB)
+        b_s = tl.load(bs_ptr + bs_off)
+        acc = block_dynamic_batched_dot(acc, a, a_s, w, b_s, SWAP_AB, BLOCK_SIZE_K)
+        a_ptrs, as_ptrs, b_ptrs, bs_ptr, _, _ = advance_ptrs(
+            a_ptrs, as_ptrs, b_ptrs, bs_ptr, b_ptrs, bs_ptr,
+            BLOCK_SIZE_K * stride_a_k, 1, BLOCK_SIZE_K * stride_b_k, stride_bs_k,
+            "pointer", "pointer", True, True, False,
         )
-        a_ptrs += BLOCK_SIZE_K * stride_a_k
-        as_ptrs += 1
-        wg_ptr += BLOCK_SIZE_K * stride_b_k
-        wu_ptr += BLOCK_SIZE_K * stride_b_k
-        bsg_ptr += stride_bs_k
-        bsu_ptr += stride_bs_k
 
-    if GATE:
-        acc_gate = acc_finalize(acc_gate, "dot", BLOCK_SIZE_N, SWAP_AB)
-        acc_up = acc_finalize(acc_up, "dot", BLOCK_SIZE_N, SWAP_AB)
-        intermediate = glu(
-            acc_gate,
-            acc_up,
-            ACT_FN,
-            SWIGLU_ALPHA,
-            SWIGLU_LIMIT,
-            SIMULATE_UNFUSED,
-            INTERMEDIATE_DTYPE,
+    gemm_epilogue(
+        C, Cs, acc, out_row, pid_n, 0, out_row, 1, stride_c_n, stride_cs_m, stride_cs_n,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, OUTPUT_RECIPE, BLOCK_SIZE_K,
+        ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+        COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, FAKE_BATCH=True,
+    )
+
+
+@bayesian_autotune(
+    get_accelerator_autotuning_configs(swap_ab=True),
+    ["N", "K", "S"],
+    n_trials=100,
+)
+@triton.jit
+def w8a8_block_static_fp8_matmul_batched_kernel(
+    A,  # (S, K) E4M3 activations (pre-quantized against the static scale by the wrapper)
+    As,  # scalar — static per-tensor activation scale (calibration-time)
+    B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
+    Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
+    C,  # (S, N) output; under an OUTPUT_RECIPE the FP8-requantized intermediate
+    Cs,  # (S, N // BLOCK_SIZE_N) per-(row, block) output scale; written iff OUTPUT_RECIPE
+    ExpertIds,  # (S,) — which expert each batch element routes to
+    GatherIdx,  # (S,) int — batch_id -> source row of A; read iff HAS_GATHER
+    ScatterIdx,  # (S,) int — batch_id -> destination row of C; read iff HAS_SCATTER
+    # Shape
+    S,
+    N,
+    K,
+    # Strides
+    stride_a_m,
+    stride_a_k,
+    stride_b_e,
+    stride_b_k,
+    stride_b_n,
+    stride_bs_e,
+    stride_bs_k,
+    stride_bs_n,
+    stride_c_m,
+    stride_c_n,
+    stride_cs_m,
+    stride_cs_n,
+    stride_eid,
+    num_experts,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SWAP_AB: tl.constexpr = False,
+    HAS_GATHER: tl.constexpr = False,
+    HAS_SCATTER: tl.constexpr = False,
+    # Gate|up fusion epilogue (GATE=False -> plain batched GEMM, every arm below folds out)
+    GATE: tl.constexpr = False,
+    ACT_FN: tl.constexpr = "silu",
+    SWIGLU_ALPHA: tl.constexpr = None,
+    SWIGLU_LIMIT: tl.constexpr = None,
+    OUTPUT_RECIPE: tl.constexpr = None,  # None | "fp8" (per-(row, block) requant of the intermediate)
+    SIMULATE_UNFUSED: tl.constexpr = False,
+    INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+):
+    """Block-scale batched FP8 expert matmul with a static (per-tensor) activation scale — the
+    block-dynamic batched sibling (one program per routed token + N-tile, fake-batch decode,
+    ``SWAP_AB``, ``GATE`` gate|up fusion) with the 2D ``block_static`` recipe: ``A`` arrives
+    pre-quantized against the calibrated scalar, per-block weight scales apply per-K-tile
+    (``block_static_batched_dot``), and the scalar activation scale multiplies the accumulator once
+    after the loop. bf16 GLU output only (no fused requant). GATE=False is the plain GEMM."""
+    a_s_static = tl.load(As)  # per-tensor static activation scale, applied post-loop
+    batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row = expert_setup(
+        A,
+        B,
+        C,
+        Bs,
+        ExpertIds,
+        GatherIdx,
+        ScatterIdx,
+        stride_a_m,
+        stride_b_e,
+        stride_c_m,
+        stride_bs_e,
+        stride_eid,
+        HAS_GATHER,
+        HAS_SCATTER,
+    )
+    # EP sentinel: row routed to a non-local expert; output is left uninit.
+    if expert_id >= num_experts:
+        return
+
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_k, stride_a_m, stride_a_k, "pointer", True)
+    # One stacked gate|up weight tile (gate rows [0,N), up rows [N,2N)) + one block-scale pointer;
+    # the up block scale sits num_n_tiles blocks after gate (tl.where on the load offset).
+    b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, N * stride_b_n, stride_b_n, stride_b_k, GATE, SWAP_AB)
+    bs_ptr = Bs + pid_n * stride_bs_n
+    bs_off = tl.where(tl.arange(0, n_width) < BLOCK_SIZE_N, 0, num_n_tiles * stride_bs_n)
+    acc = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs)  # pre-quantized E4M3 token (fake-batch replicated across BM lanes)
+        w = flatten_weight_tile(tl.load(b_ptrs), 2 * BLOCK_SIZE_N, BLOCK_SIZE_K, GATE, SWAP_AB)
+        b_s = tl.load(bs_ptr + bs_off)
+        acc = block_static_batched_dot(acc, a, w, b_s, SWAP_AB, BLOCK_SIZE_K)
+        a_ptrs, _, b_ptrs, bs_ptr, _, _ = advance_ptrs(
+            a_ptrs, a_ptrs, b_ptrs, bs_ptr, b_ptrs, bs_ptr,
+            BLOCK_SIZE_K * stride_a_k, 0, BLOCK_SIZE_K * stride_b_k, stride_bs_k,
+            "pointer", "pointer", False, True, False,
         )
-        if OUTPUT_RECIPE is not None:
-            # UE8M0 intermediate under the whole-model UE8M0 contract (inferred from the
-            # scale tensor's dtype); fp32 otherwise — the down proj reads it either way.
-            inter, inter_s = fp8_act_quant_inline(
-                intermediate, UE8M0=Cs.dtype.element_ty == tl.uint8
-            )
-            store_row(C, inter, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
-            tl.store(Cs + out_row * stride_cs_m + pid_n * stride_cs_n, tl.max(inter_s))
-        else:
-            store_row(C, intermediate, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
-    else:
-        accumulator = acc_finalize(acc_gate, "dot", BLOCK_SIZE_N, SWAP_AB)
-        store_row(C, accumulator, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
+
+    acc = acc * a_s_static
+    gemm_epilogue(
+        C, Cs, acc, out_row, pid_n, 0, out_row, 1, stride_c_n, stride_cs_m, stride_cs_n,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, OUTPUT_RECIPE, BLOCK_SIZE_K,
+        ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+        COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, FAKE_BATCH=True,
+    )
 
 
 @bayesian_autotune(
@@ -347,7 +446,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_a_k
+    a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_k, stride_a_m, stride_a_k, "pointer", True)
     b_ptrs = oriented_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
     b_s = tl.load(Bs)
     a_s = tl.load(As + in_row * stride_as_m)
@@ -360,37 +459,53 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
             accumulator, a, a, b, b, "tensor", "dot", SWAP_AB, False,
             BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
         )
-        a_ptrs += BLOCK_SIZE_K * stride_a_k
-        b_ptrs += BLOCK_SIZE_K * stride_b_k
+        a_ptrs, _, b_ptrs, _, _, _ = advance_ptrs(
+            a_ptrs, a_ptrs, b_ptrs, b_ptrs, b_ptrs, b_ptrs,
+            BLOCK_SIZE_K * stride_a_k, 0, BLOCK_SIZE_K * stride_b_k, 0,
+            "pointer", "pointer", False, False, False,
+        )
 
     accumulator = acc_finalize(accumulator, "dot", BLOCK_SIZE_N, SWAP_AB) * a_s * b_s
     store_row(C, accumulator, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
-# The MXFP4/MXFP8 (and packed-activation) splits key themselves — the tuner appends every
-# tensor arg's dtype to its cache key (memory and disk).
-# BLOCK_SIZE_M is always 1 here (per-token decode), so — like the fused MXFP batched kernels —
-# dot is excluded — MEASURED TWICE (2026-07-10): no-swap BM16 within noise of the
-# scalar/dot_scaled-swap champions, and fielding it WITH the swapped form
-# (mx_dot_rescale_swapped) poisoned the TPE (dsv4 +27%, M3 +12% tuner misses) — the
-# can't-win dot-swap configs skew the per-dimension densities. The swapped helper stays
-# implemented for future shapes; don't re-emit without new evidence. Measured on B200
-# (sm_100) only — re-measure on H100 or the target device before inheriting.
+# The MXFP4/MXFP8 (and packed-activation) splits key themselves — the tuner appends every tensor
+# arg's dtype to its cache key. BLOCK_SIZE_M is always 1 here (per-token decode), so plain `dot`
+# is excluded (only scalar / dot_scaled-swap are emitted); the swapped dot helper stays
+# implemented for future shapes but is not fielded. Swap verdicts are B200 (sm_100) — re-measure
+# on H100 or the target device before inheriting.
+def _rebind_batched_mx_bs_descriptor(nargs):
+    """Per-config pre_hook: size the swizzled weight-scale descriptor box to one 128-row block
+    (the BN=128 fp4 dot_scaled bulk load). BN<128 (fp8 scalar) pointer-gathers instead and never
+    reads the descriptor. Only under SWIZZLED_SCALES; the un-swizzled path keeps its dummy box."""
+    if not nargs.get("SWIZZLED_SCALES"):
+        return
+    rep = max(1, nargs["BLOCK_SIZE_N"] // 128)
+    rep_k = (nargs["BLOCK_SIZE_K"] // nargs["SCALE_GROUP_K"]) // 4
+    nargs["BSDescriptor"].block_shape = [1, rep, rep_k, 2, 256]
+
+
 @bayesian_autotune(
     get_accelerator_autotuning_configs(
         mx=True,
         tune_block_nk=True,
         compute_modes=("dot_scaled", "scalar"),
         swap_ab=True,
+        pre_hook=_rebind_batched_mx_bs_descriptor,
     ),
     # INPUT_RECIPE keys the inline act-quant grid: A stays raw bf16 under every
     # recipe, so the tuner's dtype-appended key can't split W4A8 from W4A4 itself.
-    ["N", "K", "S", "INPUT_RECIPE"],
+    # SWIZZLED_SCALES keys the weight-scale load: it constrains the config space (BK % 128 == 0)
+    # and picks a different optimum (full-block descriptor vs the pointer scale), so the swizzled
+    # and un-swizzled launches of one shape must not share a tune.
+    ["N", "K", "S", "INPUT_RECIPE", "SWIZZLED_SCALES"],
     n_trials=100,
     # BK-within-K + the sm_10x MMA-shape guards (swapped dot_scaled needs BN >= 128 for the
     # native scaled-MMA; smaller-BN swap configs never win and mislead the TPE).
     prune_configs_by={
-        "early_config_prune": compose_pruners(mx_config_pruner("K", "N"), smem_pruner())
+        "early_config_prune": compose_pruners(
+            mx_config_pruner("K", "N"), swizzled_scale_config_pruner(), smem_pruner()
+        )
     },
 )
 @triton.jit
@@ -399,6 +514,7 @@ def mx_dynamic_matmul_batched_kernel(
     As,  # (S, K // SCALE_GROUP_K) UE8M0 act scales; read iff PRE_QUANTIZED
     B,  # (num_experts, N, K[/2]); under GATE the (num_experts, 2N, K[/2]) gate|up stack
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) UE8M0 weight scales (2N under GATE)
+    BSDescriptor,  # host TMA descriptor over Bs when SWIZZLED (BN=128 bulk load); dummy otherwise
     C,  # (S, N[/2]) output; under an OUTPUT_RECIPE the MX-requantized intermediate
     Cs,  # (S, N // SCALE_GROUP_K) UE8M0 output scale; written iff OUTPUT_RECIPE
     ExpertIds,  # (S,) — which expert each routed row uses
@@ -447,6 +563,11 @@ def mx_dynamic_matmul_batched_kernel(
     # E2M1 under the fp4 recipes, one act row per program so the quant is decode-free).
     PRE_QUANTIZED: tl.constexpr = False,
     INPUT_RECIPE: tl.constexpr = "mxfp8",
+    # SWIZZLED_SCALES: Bs arrives pre-swizzled (SWIZZLE_32_4_4) — the checkpoint stores one layout,
+    # shared with the grouped (prefill) kernel. Read via load_weight_scale_tile off the single Bs
+    # pointer (+ BSDescriptor for the BN=128 bulk load); un-swizzled Bs takes the affine
+    # arm in the same leaf. The op never swizzles — a 3D caller runs un-swizzled at no penalty.
+    SWIZZLED_SCALES: tl.constexpr = False,
 ):
     """Unified batched microscaled expert matmul (MXFP8/MXFP4/NVFP4, W4A8/W4A4) with
     fused act quant.
@@ -475,6 +596,7 @@ def mx_dynamic_matmul_batched_kernel(
         stride_eid,
         HAS_GATHER,
         HAS_SCATTER,
+        ADVANCE_BS=False,  # scale leaf applies the per-expert offset (swizzled indexes by block)
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
     if expert_id >= num_experts:
@@ -489,92 +611,64 @@ def mx_dynamic_matmul_batched_kernel(
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
     offs_ka = tl.arange(0, BLOCK_SIZE_K // ACT_VALUES_PER_BYTE)
-    a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_ka[None, :] * stride_a_k
-    as_ptrs = (
-        As
-        + in_row * stride_as_m
-        + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0
-        + offs_sf[None, :]
-    )  # read iff PRE_QUANTIZED
-    # GATE stacks gate|up into one weight tile + its [2*BN, NG] scale (the up block sits N rows
-    # away). Weight [.., 2*BN or BN] oriented by SWAP_AB; scales are always N-major.
-    b_ptrs = stacked_gate_up_ptrs(
-        B, offs_bn, offs_kb, N * stride_b_n, stride_b_n, stride_b_k, GATE, SWAP_AB
-    )
-    if GATE:
-        rows2 = tl.arange(0, 2)[:, None] * N + offs_bn[None, :]
-        bs_ptrs = (
-            Bs + rows2[:, :, None] * stride_bs_n + offs_sf[None, None, :] * stride_bs_k
+    a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_ka, stride_a_m, stride_a_k, "pointer", True)
+    if PRE_QUANTIZED:  # As is None otherwise — build the scale pointers only when it is read
+        as_ptrs = (
+            As
+            + in_row * stride_as_m
+            + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0
+            + offs_sf[None, :]
         )
     else:
-        bs_ptrs = Bs + offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k
+        as_ptrs = a_ptrs  # dead placeholder so advance_ptrs can take it unconditionally
+    # GATE stacks gate|up into one weight tile (the up block sits N rows away), oriented by
+    # SWAP_AB. Weight scales are read via load_weight_scale_tile (swizzled/un-swizzled hidden).
+    b_ptrs = weight_tile_ptrs(
+        B, offs_bn, offs_kb, N * stride_b_n, stride_b_n, stride_b_k, GATE, SWAP_AB
+    )
+    SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
 
     accumulator = acc_init(COMPUTE_MODE, BLOCK_SIZE_M, n_width, SWAP_AB)
-    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         if PRE_QUANTIZED:
             a = tl.load(a_ptrs)
             a_scale = tl.load(as_ptrs)  # dtype carries the scale format (UE8M0 or E4M3)
-            as_ptrs += BLOCK_SIZE_K // SCALE_GROUP_K
         else:
             a_raw = tl.load(a_ptrs).to(tl.float32)
             a, a_scale = mx_act_quant_inline(
                 a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, INPUT_RECIPE
             )
-        b = stacked_gate_up_flatten(
+        b = flatten_weight_tile(
             tl.load(b_ptrs),
             2 * BLOCK_SIZE_N,
             BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE,
             GATE,
             SWAP_AB,
         )
-        b_s = tl.reshape(tl.load(bs_ptrs), (n_width, BLOCK_SIZE_K // SCALE_GROUP_K))
+        b_s = load_weight_scale_tile(
+            SWIZZLED_SCALES, BSDescriptor, Bs, expert_id, pid_n, k, N, K,
+            stride_bs_e, stride_bs_n, stride_bs_k,
+            BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K, GATE,
+        )
         accumulator = accumulate(
             accumulator, a, a_scale, b, b_s, "mx", COMPUTE_MODE, SWAP_AB, False,
             BLOCK_SIZE_M, n_width, BLOCK_SIZE_K, SCALE_GROUP_K,
         )
-        a_ptrs += (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k
-        b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
-        bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
-
-    if GATE:
-        intermediate = split_gate_up_glu(
-            accumulator,
-            COMPUTE_MODE,
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-            SWAP_AB,
-            ACT_FN,
-            SWIGLU_ALPHA,
-            SWIGLU_LIMIT,
-            SIMULATE_UNFUSED,
-            INTERMEDIATE_DTYPE,
+        a_ptrs, as_ptrs, b_ptrs, _, _, _ = advance_ptrs(
+            a_ptrs, as_ptrs, b_ptrs, b_ptrs, b_ptrs, b_ptrs,
+            (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k,
+            BLOCK_SIZE_K // SCALE_GROUP_K,
+            (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k,
+            0,
+            "pointer", "pointer", PRE_QUANTIZED, False, False,
         )
-        if OUTPUT_RECIPE is not None:
-            inter, inter_scale = mx_act_quant_inline(
-                intermediate, BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_RECIPE
-            )
-            # the fp4 recipes pack nibble pairs along N, halving the stored width
-            width: tl.constexpr = (
-                BLOCK_SIZE_N if OUTPUT_RECIPE == "mxfp8" else BLOCK_SIZE_N // 2
-            )
-            store_row(C, inter, pid_n, stride_c_n, BLOCK_SIZE_M, width)
-            offs_sc = pid_n * (BLOCK_SIZE_N // SCALE_GROUP_K) + tl.arange(
-                0, BLOCK_SIZE_N // SCALE_GROUP_K
-            )
-            # BM rows are token-replicated, so the row-max IS the row's scale; reduce in
-            # f32 (exact for UE8M0 exponent bytes and E4M3 values alike — fp8 has no max)
-            tl.store(
-                Cs + out_row * stride_cs_m + offs_sc[None, :] * stride_cs_n,
-                tl.reshape(
-                    tl.max(inter_scale.to(tl.float32), axis=0),
-                    (1, BLOCK_SIZE_N // SCALE_GROUP_K),
-                ),
-            )
-        else:
-            store_row(C, intermediate, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
-    else:
-        accumulator = acc_finalize(accumulator, COMPUTE_MODE, BLOCK_SIZE_N, SWAP_AB)
-        store_row(C, accumulator, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
+
+    gemm_epilogue(
+        C, Cs, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, stride_cs_m, stride_cs_n,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, OUTPUT_RECIPE, SCALE_GROUP_K,
+        ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+        COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, FAKE_BATCH=True,
+    )
 
 
 @bayesian_autotune(
@@ -658,43 +752,35 @@ def full_precision_matmul_batched_kernel(
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A + tl.arange(0, BLOCK_SIZE_M)[:, None] * 0 + offs_k[None, :] * stride_a_k
+    a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_k, stride_a_m, stride_a_k, "pointer", True)
     # GATE stacks gate|up into one weight tile (the up block sits N rows away);
     # GATE=False -> the plain oriented tile.
-    b_ptrs = stacked_gate_up_ptrs(
+    b_ptrs = weight_tile_ptrs(
         B, offs_bn, offs_k, N * stride_b_n, stride_b_n, stride_b_k, GATE, SWAP_AB
     )
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a = tl.load(a_ptrs)
-        w = stacked_gate_up_flatten(
+        w = flatten_weight_tile(
             tl.load(b_ptrs), 2 * BLOCK_SIZE_N, BLOCK_SIZE_K, GATE, SWAP_AB
         )
         accumulator = accumulate(
             accumulator, a, a, w, w, "full_precision", "dot", SWAP_AB, False,
             BLOCK_SIZE_M, n_width, BLOCK_SIZE_K,
         )
-        a_ptrs += BLOCK_SIZE_K * stride_a_k
-        b_ptrs += BLOCK_SIZE_K * stride_b_k
-
-    if GATE:
-        intermediate = split_gate_up_glu(
-            accumulator,
-            "dot",
-            BLOCK_SIZE_M,
-            BLOCK_SIZE_N,
-            SWAP_AB,
-            ACT_FN,
-            SWIGLU_ALPHA,
-            SWIGLU_LIMIT,
-            SIMULATE_UNFUSED,
-            INTERMEDIATE_DTYPE,
+        a_ptrs, _, b_ptrs, _, _, _ = advance_ptrs(
+            a_ptrs, a_ptrs, b_ptrs, b_ptrs, b_ptrs, b_ptrs,
+            BLOCK_SIZE_K * stride_a_k, 0, BLOCK_SIZE_K * stride_b_k, 0,
+            "pointer", "pointer", False, False, False,
         )
-        store_row(C, intermediate, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
-    else:
-        accumulator = acc_finalize(accumulator, "dot", BLOCK_SIZE_N, SWAP_AB)
-        store_row(C, accumulator, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
+
+    gemm_epilogue(
+        C, C, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, 1, 1,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
+        ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+        COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, FAKE_BATCH=True,
+    )
 
 
 @compile_time_only_triton_op(
@@ -799,8 +885,8 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             C,
             Cs,
             expert_ids,
-            gather_idx if gather_idx is not None else expert_ids,
-            scatter_idx if scatter_idx is not None else expert_ids,
+            gather_idx,  # None -> dummy (unread; HAS_GATHER guards the load)
+            scatter_idx,  # None -> dummy (unread; HAS_SCATTER guards the store)
             S,
             N,
             K,
@@ -821,6 +907,127 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=block_k,
             num_experts=num_experts,
+            HAS_GATHER=gather_idx is not None,
+            HAS_SCATTER=scatter_idx is not None,
+            GATE=gate,
+            ACT_FN=act_fn,
+            SWIGLU_ALPHA=swiglu_alpha,
+            SWIGLU_LIMIT=swiglu_limit,
+            OUTPUT_RECIPE=output_recipe,
+            SIMULATE_UNFUSED=simulate_unfused,
+            INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+        )
+
+    return [C, Cs] if requant else [C]
+
+
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("w8a8_block_static_fp8_matmul_batched"),
+    mutates_args=(),
+    opaque=True,
+)
+def w8a8_block_static_fp8_matmul_batched(
+    A: torch.Tensor,
+    activation_scale: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    expert_ids: torch.Tensor,
+    block_size: list[int],
+    gate: bool = False,
+    act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
+    input_recipe: str | None = None,
+    output_recipe: str | None = None,
+    output_dtype: torch.dtype | None = None,
+    gather_idx: torch.Tensor | None = None,
+    scatter_idx: torch.Tensor | None = None,
+) -> list[torch.Tensor]:
+    """Block-scale batched FP8 matmul with a static (per-tensor calibrated) activation scale — the
+    block-dynamic batched sibling with the 2D ``block_static`` recipe. ``A`` is raw here: the op
+    quantizes it against the scalar ``activation_scale`` (offline), the kernel applies the per-block
+    weight scales in the K-loop and the scalar once post-loop. Returns ``[C]``, or ``[C, Cs]`` under
+    ``output_recipe="fp8"`` (the per-row output scale is independent of the per-tensor input scale).
+
+    A:  (rows, K) raw bf16/fp16 activations — rows addressed via ``gather_idx``
+    activation_scale: scalar / (1,) — the calibrated per-tensor activation scale
+    B:  (num_experts, N, K) FP8 weights; under ``gate`` the (num_experts, 2N, K) gate|up stack
+    Bs: (num_experts, N // block_n, K // block_k) per-block weight scales (2N under gate)
+    """
+    validate_dense_operands(A, B)
+
+    output_dtype = resolve_output_dtype(output_dtype, A, None)
+    K = A.shape[1]
+    S = expert_ids.shape[0]
+    num_experts, n_rows, N = expert_weight_shape(B, gate)
+
+    assert len(block_size) == 2, (
+        f"block_size must be [block_n, block_k], got {block_size}"
+    )
+    block_n, block_k = block_size[0], block_size[1]
+    assert N % block_n == 0, f"N ({N}) must be divisible by block_n ({block_n})"
+    assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
+    assert Bs.shape == (num_experts, n_rows // block_n, K // block_k), (
+        f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, {n_rows // block_n}, {K // block_k})"
+    )
+    assert input_recipe in (None, "fp8"), (
+        f"block-static activations are E4M3 ('fp8'), got {input_recipe!r}"
+    )
+    assert output_recipe in (None, "fp8"), (
+        f"the block-static recipe requantizes to 'fp8', got {output_recipe!r}"
+    )
+    requant = output_recipe is not None
+    assert not requant or block_n == block_k, (
+        f"the fused 'fp8' requant needs square quant blocks, got {block_size}"
+    )
+
+    As = activation_scale.reshape(1).to(torch.float32)
+    bs_u8 = ue8m0_as_uint8(Bs)
+    # Pre-quantize the raw activations against the calibrated scalar (offline; the kernel folds
+    # the scalar back post-loop).
+    A_q = (A.to(torch.float32) / As).to(FP8_DTYPE)
+    if requant:
+        C = A.new_empty(S, N, dtype=FP8_DTYPE)
+        Cs = torch.empty(S, N // block_n, device=A.device, dtype=bs_u8.dtype)
+    else:
+        C = A.new_empty(S, N, dtype=output_dtype)
+        Cs = expert_ids  # dummy pointer; unread (no OUTPUT_RECIPE), strides literal
+
+    grid = (S, triton.cdiv(N, block_n))
+
+    with device_context(A.device):
+        compile_time_only_triton_wrap(w8a8_block_static_fp8_matmul_batched_kernel)[
+            grid
+        ](
+            A_q,
+            As,
+            B,
+            bs_u8,
+            C,
+            Cs,
+            expert_ids,
+            gather_idx,  # None -> dummy (unread; HAS_GATHER guards the load)
+            scatter_idx,  # None -> dummy (unread; HAS_SCATTER guards the store)
+            S,
+            N,
+            K,
+            A_q.stride(0),
+            A_q.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            bs_u8.stride(0),
+            bs_u8.stride(2),
+            bs_u8.stride(1),
+            C.stride(0),
+            C.stride(1),
+            Cs.stride(0) if requant else 1,
+            Cs.stride(1) if requant else 1,
+            expert_ids.stride(0),
+            num_experts,
+            BLOCK_SIZE_N=block_n,
+            BLOCK_SIZE_K=block_k,
             HAS_GATHER=gather_idx is not None,
             HAS_SCATTER=scatter_idx is not None,
             GATE=gate,
@@ -890,8 +1097,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             bs_u8,
             C,
             expert_ids,
-            gather_idx if gather_idx is not None else expert_ids,
-            scatter_idx if scatter_idx is not None else expert_ids,
+            gather_idx,  # None -> dummy (unread; HAS_GATHER guards the load)
+            scatter_idx,  # None -> dummy (unread; HAS_SCATTER guards the store)
             S,
             N,
             K,
@@ -945,19 +1152,18 @@ def mx_dynamic_matmul_batched(
     A:  (rows, K) activations — raw bf16/fp16/fp32 (inline-quant) or pre-quantized E4M3
     expert_ids: (S,) which expert each routed row uses
     """
-    assert A.ndim == 2 and B.ndim == 3 and Bs.ndim == 3
+    assert A.ndim == 2 and B.ndim == 3 and Bs.ndim in (3, 5)  # 5D = pre-swizzled SWIZZLE_32_4_4
     assert expert_ids.ndim == 1
     # A raw (As None) -> quantized inline in the kernel (decode-free UE8M0); pre-quantized
     # (As given, e.g. the down reading a requantized intermediate) -> loaded via the kernel's
     # PRE_QUANTIZED branch.
-    nvfp4 = Bs.dtype == torch.float8_e4m3fn
     # the kernel quantizes raw A inline on this grid (fp4 recipes pack in-register);
     # NVFP4 batched runs on the software arms — decode grid BM <= 16 < the native
     # mxf4nvf4 M=128 staging (scalar / swap-scalar column-unpack + E4M3 scale decode)
     input_recipe = resolve_input_recipe(input_recipe, output_recipe, Bs)
     requant = output_recipe is not None
     if As is not None:
-        assert (As.dtype == torch.float8_e4m3fn) == nvfp4, (
+        assert (As.dtype == torch.float8_e4m3fn) == (Bs.dtype == torch.float8_e4m3fn), (
             f"activation scales ({As.dtype}) must match the weight scale family ({Bs.dtype})"
         )
     pre_quantized = As is not None
@@ -979,16 +1185,30 @@ def mx_dynamic_matmul_batched(
     assert K == WEIGHT_VALUES_PER_BYTE * K_b, (
         f"K (={K}) must equal {WEIGHT_VALUES_PER_BYTE} * B.shape[2] (={K_b})"
     )
-    nvfp4, scale_group = mx_scale_family(Bs, K)
-    assert Bs.shape == (num_experts, n_rows, K // scale_group), (
-        f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {n_rows}, {K // scale_group})"
-    )
+    # Bs arrives either row-major (num_experts, n_rows, K // scale_group) — read affine — or
+    # already SWIZZLE_32_4_4 (5D: 1, num_experts * n_rows // 128, cols // 4, 2, 256), the shared
+    # checkpoint layout swizzled once at model load (the deployment contract, no per-call
+    # rearrange). The recipe is the scale dtype (E4M3 = NVFP4 group-16, UE8M0 = MX group-32); the
+    # swizzled cols encode (K // scale_group) // 4.
+    swizzled_scales = Bs.ndim == 5
+    scale_group = mx_scale_family(Bs, K)
+    if not swizzled_scales:
+        assert Bs.shape == (num_experts, n_rows, K // scale_group), (
+            f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {n_rows}, {K // scale_group})"
+        )
 
     a_u8 = e2m1_as_uint8(A)
-    if As is not None:
-        as_u8 = ue8m0_as_uint8(As)
+    as_u8 = ue8m0_as_uint8(As)  # None when raw (unread under PRE_QUANTIZED=False)
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
+    # The op never swizzles: Bs is read in whatever layout it arrives (recipe-agnostic — MX or
+    # NVFP4). A pre-swizzled SWIZZLE_32_4_4 Bs (5D, the shared checkpoint layout the grouped kernel
+    # also consumes) takes the fast descriptor/gather path; a row-major (3D) Bs takes the affine
+    # path at no penalty. Callers swizzle once at load (public swizzle_mx_scales) to opt into perf.
+    # The descriptor is built only on the swizzled path — the un-swizzled arm never reads it (None).
+    bs_descriptor = (
+        TensorDescriptor.from_tensor(bs_u8, [1, 1, 1, 2, 256]) if swizzled_scales else None
+    )
     if output_recipe in ("mxfp4", "nvfp4"):
         # packed E2M1 intermediate (nibble pairs along N) + group scales (UE8M0 for MX,
         # E4M3 for NVFP4) — feeds a W4A4 down as-is
@@ -1000,7 +1220,7 @@ def mx_dynamic_matmul_batched(
             S,
             N // scale_group,
             device=a_u8.device,
-            dtype=torch.float8_e4m3fn if nvfp4 else torch.uint8,
+            dtype=bs_u8.dtype,  # UE8M0 -> uint8, NVFP4 -> e4m3 (the binder-safe weight-scale dtype)
         )
     elif requant:
         C = a_u8.new_empty((S, N), dtype=FP8_DTYPE)
@@ -1012,24 +1232,24 @@ def mx_dynamic_matmul_batched(
     def grid(META):
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
-    As_arg = as_u8 if pre_quantized else expert_ids  # dummy when raw (unread)
     with device_context(a_u8.device):
         compile_time_only_triton_wrap(mx_dynamic_matmul_batched_kernel)[grid](
             a_u8,
-            As_arg,
+            as_u8,  # None when raw (unread under PRE_QUANTIZED=False)
             b_u8,
             bs_u8,
+            bs_descriptor,
             C,
             Cs,
             expert_ids,
-            gather_idx if gather_idx is not None else expert_ids,
-            scatter_idx if scatter_idx is not None else expert_ids,
+            gather_idx,  # None -> dummy (unread; HAS_GATHER guards the load)
+            scatter_idx,  # None -> dummy (unread; HAS_SCATTER guards the store)
             S,
             N,
             K,
             a_u8.stride(0),
             a_u8.stride(1),
-            As_arg.stride(0) if pre_quantized else 1,
+            as_u8.stride(0) if pre_quantized else 1,
             b_u8.stride(0),
             b_u8.stride(2),
             b_u8.stride(1),
@@ -1043,6 +1263,7 @@ def mx_dynamic_matmul_batched(
             expert_ids.stride(0),
             SCALE_GROUP_K=scale_group,
             num_experts=num_experts,
+            SWIZZLED_SCALES=swizzled_scales,
             PRE_QUANTIZED=pre_quantized,
             INPUT_RECIPE=input_recipe,
             HAS_GATHER=gather_idx is not None,
@@ -1110,8 +1331,8 @@ def full_precision_matmul_batched(
             B,
             C,
             expert_ids,
-            gather_idx if gather_idx is not None else expert_ids,
-            scatter_idx if scatter_idx is not None else expert_ids,
+            gather_idx,  # None -> dummy (unread; HAS_GATHER guards the load)
+            scatter_idx,  # None -> dummy (unread; HAS_SCATTER guards the store)
             S,
             N,
             K,
@@ -1146,6 +1367,7 @@ def matmul_batched(
     expert_ids: torch.Tensor,
     epilogue: Epilogue | None = None,
     quantization: Quantization | None = None,
+    activation_scale: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
@@ -1176,6 +1398,27 @@ def matmul_batched(
     """
     ep = epilogue if epilogue is not None else Epilogue()
     q = quantization if quantization is not None else Quantization()
+    if activation_scale is not None:
+        # static (per-tensor calibrated) activation quant — a block-scale-weights-only path,
+        # like the 2D op; the caller hands a raw A (the op quantizes it against the scalar).
+        assert As is None, "static activation quant takes a raw A, not pre-quantized As"
+        assert Bs is not None and not is_mx(B, Bs) and weight_block_size(B, Bs) is not None, (
+            "activation_scale (static quant) needs block-scale FP8 weights"
+        )
+        out = w8a8_block_static_fp8_matmul_batched(
+            A,
+            activation_scale,
+            B,
+            Bs,
+            expert_ids,
+            weight_block_size(B, Bs),
+            *ep.as_args(),
+            *q.as_args(),
+            output_dtype,
+            gather_idx,
+            scatter_idx,
+        )
+        return out[0] if len(out) == 1 else tuple(out)
 
     if Bs is None:
         assert As is None, (
