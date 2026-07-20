@@ -47,6 +47,9 @@ from .utils import (
     is_mxfp8,
     is_mxfp4,
     is_nvfp4,
+    _launch_act_quant,
+    MX_SCALE_GROUP_K,
+    NVFP4_SCALE_GROUP_K,
 )
 
 
@@ -321,6 +324,126 @@ def moe_unfused_grouped(
         scatter_idx=scatter_idx,
     )
     return _torch_weighted_reduce(down_out, top_k_index, top_k_weights, NUM_EXPERTS)
+
+
+def moe_torch_grouped(
+    hidden_states: torch.Tensor,  # (T, H)
+    top_k_index: torch.Tensor,  # (T, K) int
+    top_k_weights: torch.Tensor,  # (T, K)
+    gate_up_proj: torch.Tensor,  # (E, 2I, H) E4M3
+    down_proj: torch.Tensor,  # (E, H, I) E4M3
+    gate_up_proj_scale_inv: torch.Tensor,  # (E, 2I, H//G) row-major, or pre-swizzled 5D SWIZZLE_32_4_4
+    down_proj_scale_inv: torch.Tensor,  # (E, H, I//G) row-major, or pre-swizzled 5D
+    act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    recipe: str | None = None,
+) -> torch.Tensor:
+    """Torch-only MX grouped MoE — the fair cuBLAS baseline for ``moe_fused_grouped`` /
+    ``moe_unfused_grouped`` on the PUBLIC ``torch.nn.functional.scaled_grouped_mm``. Same weights,
+    scales, and routing as our forwards; the only difference is the machinery torch forces:
+
+    - Routing by **sort**, not our on-device gather/scatter: stable-argsort the ``T*K`` routed slots
+      by expert into contiguous groups (cumulative ``offs``).
+    - Two ``scaled_grouped_mm`` calls (per-recipe ``ScalingType``: group-32 ``BlockWise1x32`` for
+      mxfp8/mxfp4, group-16 ``BlockWise1x16`` for nvfp4; fp4 operands viewed as ``e2m1_x2``), with the
+      per-group blocked SWIZZLE_32_4_4 scales built by torchao's ``triton_mx_block_rearrange_*`` ops.
+    - Our Triton MX act-quant (so torch is timed on the same fast quant), the shared host ``apply_glu``,
+      and the shared ``_torch_weighted_reduce``. All three MX recipes."""
+    assert is_mx(gate_up_proj, gate_up_proj_scale_inv), (
+        "torch grouped baseline is MX-only"
+    )
+
+    import torch.nn.functional as F
+    from torch.nn.functional import ScalingType, SwizzleType
+
+    # torchao's blessed per-group blocked-scale builders (graph-capturable @triton_op, byte-agnostic,
+    # same S+128·E static padding + SWIZZLE_32_4_4 layout scaled_grouped_mm consumes) — no hand-rolled
+    # gather index. Values stay unpadded (S-based offs); only the scale is blocked, exactly as torchao's
+    # own mxfp8_grouped_mm does. Act scale is per-forward; weight scale is offline-equivalent.
+    from torchao.prototype.moe_training.kernels.mxfp8 import (
+        triton_mx_block_rearrange_2d_M_groups,
+        triton_mx_block_rearrange_per_group_3d,
+    )
+
+    nvfp4 = is_nvfp4(gate_up_proj, gate_up_proj_scale_inv)
+    packed = not is_mxfp8(gate_up_proj, gate_up_proj_scale_inv)  # fp4 recipes pack e2m1
+    act_recipe = recipe or ("nvfp4" if nvfp4 else "mxfp4" if packed else "mxfp8")
+    scale_group = NVFP4_SCALE_GROUP_K if nvfp4 else MX_SCALE_GROUP_K
+    scale_dtype = (
+        torch.float8_e4m3fn if nvfp4 else torch.uint8
+    )  # our act-quant/swizzle carry uint8
+    # scaled_grouped_mm dispatches on the scale dtype — view the uint8 MX scales as e8m0 for it
+    f_dtype = torch.float8_e4m3fn if nvfp4 else torch.float8_e8m0fnu
+    SWZ = SwizzleType.SWIZZLE_32_4_4
+    BW = ScalingType.BlockWise1x16 if nvfp4 else ScalingType.BlockWise1x32
+    FP4 = getattr(torch, "float4_e2m1fn_x2", None)
+    E = gate_up_proj.shape[0]
+    # NVFP4's tcgen05 MMA kind requires TWO-level scaling: the e4m3 per-16 block scale AND a
+    # per-tensor global fp32 scale. Our nvfp4 quant folds everything into the block scale
+    # (single-level amax/6), so the global is identity 1.0 — feeds torch its required two-level
+    # form with bit-identical math. MX recipes are single-level (block e8m0 only).
+    tensorwise = ScalingType.TensorWise
+    global_a = torch.ones(1, device=hidden_states.device, dtype=torch.float32)
+    global_w = torch.ones(E, device=hidden_states.device, dtype=torch.float32)
+    top_k = top_k_index.shape[1]
+    out_dtype = hidden_states.dtype
+
+    # route: stable-sort routed slots by expert into contiguous groups (torch has no gather/scatter fuse)
+    flat_e = top_k_index.reshape(-1)
+    order = torch.argsort(flat_e, stable=True)
+    counts = torch.histc(flat_e.float(), bins=E, min=0, max=E - 1).to(torch.int32)
+    offs = counts.cumsum(0).to(torch.int32)
+    tok = (order // top_k).to(torch.long)  # source token of each sorted slot
+
+    def pk(t):  # view a packed-e2m1 operand as torch's fp4 dtype for scaled_grouped_mm
+        return t.view(FP4) if packed else t
+
+    def aswz(a_s):  # (S, K//G) -> per-group blocked layout, one launch
+        return triton_mx_block_rearrange_2d_M_groups(a_s.view(torch.uint8), offs).view(
+            f_dtype
+        )
+
+    def wswz(
+        w_s,
+    ):  # (E, N, K//G) -> (E, flat) blocked; pre-swizzled 5D checkpoints just flatten
+        if w_s.ndim == 5:
+            return w_s.reshape(E, -1).view(f_dtype)
+        return triton_mx_block_rearrange_per_group_3d(w_s.view(torch.uint8)).view(
+            f_dtype
+        )
+
+    def grouped_mm(a, w_q, w_s):
+        # our Triton MX act-quant (recipe-taking launcher) — torch is timed on the same fast quant
+        aq, a_s = _launch_act_quant(a, act_recipe, scale_group, scale_dtype)
+        sa, ra = aswz(a_s), BW
+        sb, rb = wswz(w_s), BW
+        if nvfp4:  # two-level: block e4m3 + identity per-tensor global fp32
+            sa, ra = [sa, global_a], [BW, tensorwise]
+            sb, rb = [sb, global_w], [BW, tensorwise]
+        return F.scaled_grouped_mm(
+            pk(aq),
+            pk(w_q).transpose(-2, -1),
+            sa,
+            ra,
+            sb,
+            rb,
+            swizzle_a=SWZ,
+            swizzle_b=SWZ,
+            offs=offs,
+            output_dtype=out_dtype,
+        )
+
+    gate_up = grouped_mm(hidden_states[tok], gate_up_proj, gate_up_proj_scale_inv)
+    gate, up = gate_up.chunk(2, dim=-1)
+    inter = apply_glu(gate, up, act_fn, swiglu_alpha, swiglu_limit)
+    down_out = grouped_mm(inter, down_proj, down_proj_scale_inv)
+
+    # One weighted scatter-reduce: down_out is expert-sorted, so index_add_ over the source-token
+    # map fuses unroute + routing-weight + top-k sum into (T, H) directly — no separate unsort pass.
+    out = torch.zeros_like(hidden_states)
+    w = top_k_weights.reshape(-1)[order].unsqueeze(-1).to(out.dtype)
+    return out.index_add_(0, tok, down_out * w)
 
 
 def moe_unfused_batched(

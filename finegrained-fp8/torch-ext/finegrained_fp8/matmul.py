@@ -23,8 +23,8 @@ from .utils import (
     Epilogue,
     Quantization,
     resolve_output_dtype,
-    matmul_load_act,
-    matmul_load_weight,
+    load_act,
+    load_weight,
     accumulate,
     advance_ptrs,
     FP8_DTYPE,
@@ -46,8 +46,6 @@ from .utils import (
     fp8_act_quant_block_dynamic,
     operand_tile_ptrs,
     mx_2d_scale_ptrs,
-    weight_tile_ptrs,
-    flatten_weight_tile,
     gate_stacked_block_scale_ptrs,
     matmul_weight_ptrs,
     gemm_epilogue,
@@ -122,6 +120,10 @@ def _rebind_mx_descriptors(nargs):
         nargs["BSDescriptor"].block_shape = [1, nargs["BLOCK_SIZE_N"] // 128, rep_k, 2, 256]
         if nargs["A"].dtype in (torch.float8_e4m3fn, torch.uint8):
             nargs["ASDescriptor"].block_shape = [1, nargs["BLOCK_SIZE_M"] // 128, rep_k, 2, 256]
+    # swizzled requant output (Cs is a descriptor): store tile [1, 1, rep_n, 2, 256], rep_n per config
+    if nargs["CSDescriptor"] is not None:
+        rep_n = (nargs["BLOCK_SIZE_N"] // nargs["SCALE_GROUP_K"]) // 4
+        nargs["CSDescriptor"].block_shape = [1, 1, rep_n, 2, 256]
 
 
 @bayesian_autotune(
@@ -261,36 +263,32 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # Explicit operand-tile pointers on the pointer arm; a scalar placeholder on a descriptor
     # arm (which reads its box via the descriptor — the [BM,BK]/[BK,BN] index tensor would stay
     # live across the K-loop for nothing and spill registers, ~460us / 20pp MFU at wide-N prefill).
-    # Under GATE the weight is the stacked (2N, K) gate|up tile (weight_tile_ptrs; pointer-only, the
+    # Under GATE the weight is the stacked (2N, K) gate|up tile (matmul_weight_ptrs; pointer-only, the
     # descriptor box can't span the N-apart rows), and its per-weight-row block scale is a 2*BN gather
     # (gate rows [0,N), up rows offset by N//block_n scale blocks) — the block_dynamic_dot broadcast
     # then folds it per row exactly as in the dense case.
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, not SWAP_AB)
+    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, N, stride_b_n, stride_b_k, GATE, B_MEMORY_MODE, SWAP_AB)
     if GATE:
-        b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, N * stride_b_n, stride_b_n, stride_b_k, GATE, SWAP_AB)
         bs_ptrs, bs_mask = gate_stacked_block_scale_ptrs(
             Bs, pid_n, N, block_n, stride_bs_n, BLOCK_SIZE_N, n_width
         )
     else:
-        b_ptrs = operand_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
         # the (BN,) scale-index gather decouples the tile from the scale grid: a wide tile
         # spans several scale columns, a narrow one shares a column
         bs_ptrs = Bs + (offs_bn_lin // block_n) * stride_bs_n
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
-        a, a_s = matmul_load_act(
-            "block_dynamic", a_ptrs, as_ptrs, as_mask, a_descriptor,
-            pid_m * BLOCK_SIZE_M, k * block_k, A_MEMORY_MODE, SWAP_AB,
+        a, a_s = load_act(
+            "block_dynamic", a_ptrs, as_ptrs, None, as_mask, a_descriptor,
+            pid_m * BLOCK_SIZE_M, k * block_k, A_MEMORY_MODE, SWAP_AB=SWAP_AB,
         )
-        if GATE:
-            b = flatten_weight_tile(tl.load(b_ptrs), n_width, block_k, GATE, SWAP_AB)
-            b_s = tl.load(bs_ptrs, mask=bs_mask, other=0)
-        else:
-            b, b_s = matmul_load_weight(
-                "block_dynamic", b_ptrs, bs_ptrs, bs_mask, b_descriptor,
-                pid_n * BLOCK_SIZE_N, k * block_k, B_MEMORY_MODE, SWAP_AB,
-            )
+        b, b_s = load_weight(
+            "block_dynamic", b_ptrs, bs_ptrs, bs_mask, b_descriptor,
+            pid_n * BLOCK_SIZE_N, k * block_k, B_MEMORY_MODE, SWAP_AB, GATE,
+            BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=block_k,
+        )
         accumulator = accumulate(
             accumulator, a, a_s, b, b_s, "block_dynamic", "dot", SWAP_AB, USE_DOT_SCALED,
             BLOCK_SIZE_M, n_width, block_k,
@@ -389,10 +387,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, "pointer", True)
     # Under GATE the weight is the stacked (2N, K) gate|up tile; one per-tensor weight scale
     # covers both projections, applied (with the per-row act scale) before the GLU split.
-    if GATE:
-        b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, N * stride_b_n, stride_b_n, stride_b_k, GATE, False)
-    else:
-        b_ptrs = operand_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, "pointer", False)
+    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, N, stride_b_n, stride_b_k, GATE, "pointer")
 
     a_s = tl.load(As + offs_am * stride_as_m)
     b_s = tl.load(Bs)
@@ -400,11 +395,11 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     # Accumulate raw dot products, apply scales once after the loop.
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-        a, _as = matmul_load_act("tensor", a_ptrs, a_ptrs, None, a_ptrs, 0, 0, "pointer")
-        if GATE:
-            b = flatten_weight_tile(tl.load(b_ptrs), n_width, BLOCK_SIZE_K, GATE, False)
-        else:
-            b, _bs = matmul_load_weight("tensor", b_ptrs, b_ptrs, None, b_ptrs, 0, 0, "pointer")
+        a, _as = load_act("tensor", a_ptrs, a_ptrs, None, None, a_ptrs, 0, 0, "pointer")
+        b, _bs = load_weight(
+            "tensor", b_ptrs, b_ptrs, None, b_ptrs, pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K,
+            "pointer", False, GATE, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
+        )
         accumulator = accumulate(
             accumulator, a, _as, b, b_s, "tensor", "dot", False, False,
             BLOCK_SIZE_M, n_width, BLOCK_SIZE_K,
@@ -535,13 +530,12 @@ def w8a8_block_static_fp8_matmul_kernel(
     # non-affine scale read the wrap induces, matching the block-dynamic kernel above. Under GATE
     # the weight is the stacked (2N, K) gate|up tile (pointer-only) + a 2*BN per-weight-row scale
     # gather (gate rows [0,N), up rows offset by N//block_n scale blocks).
+    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, N, stride_b_n, stride_b_k, GATE, B_MEMORY_MODE)
     if GATE:
-        b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, N * stride_b_n, stride_b_n, stride_b_k, GATE, False)
         bs_ptrs, bs_mask = gate_stacked_block_scale_ptrs(
             Bs, pid_n, N, block_n, stride_bs_n, BLOCK_SIZE_N, n_width
         )
     else:
-        b_ptrs = operand_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, False)
         offs_bn_lin = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         bs_ptrs = Bs + (offs_bn_lin // block_n) * stride_bs_n
         bs_mask = offs_bn_lin < N
@@ -549,18 +543,14 @@ def w8a8_block_static_fp8_matmul_kernel(
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
-        a, _as = matmul_load_act(
-            "static", a_ptrs, a_ptrs, None, a_descriptor, pid_m * BLOCK_SIZE_M, k * block_k,
+        a, _as = load_act(
+            "static", a_ptrs, a_ptrs, None, None, a_descriptor, pid_m * BLOCK_SIZE_M, k * block_k,
             A_MEMORY_MODE, a_s_static=a_s_static,
         )
-        if GATE:
-            b = flatten_weight_tile(tl.load(b_ptrs), n_width, block_k, GATE, False)
-            b_s = tl.load(bs_ptrs, mask=bs_mask, other=0)
-        else:
-            b, b_s = matmul_load_weight(
-                "static", b_ptrs, bs_ptrs, bs_mask, b_descriptor, pid_n * BLOCK_SIZE_N, k * block_k,
-                B_MEMORY_MODE,
-            )
+        b, b_s = load_weight(
+            "static", b_ptrs, bs_ptrs, bs_mask, b_descriptor, pid_n * BLOCK_SIZE_N, k * block_k,
+            B_MEMORY_MODE, False, GATE, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=block_k,
+        )
         accumulator = accumulate(
             accumulator, a, _as, b, b_s, "static", "dot", False, False,
             BLOCK_SIZE_M, n_width, block_k,
@@ -656,7 +646,9 @@ def mx_dynamic_matmul_kernel(
     Bs,  # weight scales: SWIZZLE_32_4_4 (swizzled arm — bulk via BSDescriptor at BN=128, or this pointer for the BN<128 gather) or (N, K // SCALE_GROUP_K) affine
     BSDescriptor,  # host TMA descriptor over the SWIZZLE_32_4_4 B scales (BN=128 bulk load); read iff SWIZZLED_SCALES
     C,  # (M, N) output (the GLU intermediate under GATE)
-    Cs,  # (M, N // group) requant output scale — written iff OUTPUT_RECIPE (else a dummy, unread)
+    Cs,  # (M, N // group) row-major requant output scale — written iff OUTPUT_RECIPE and not SWIZZLED_OUT
+    CSDescriptor,  # SWIZZLE_32_4_4 requant-scale descriptor — written iff SWIZZLED_OUT (dummy else), like AS/BS
+    GlobalScale,  # (1,) fp32 NVFP4 two-level per-tensor global (g_a·g_b); read iff not None
     # Shape
     M,
     N,
@@ -684,6 +676,7 @@ def mx_dynamic_matmul_kernel(
     B_MEMORY_MODE: tl.constexpr = "pointer",
     INPUT_RECIPE: tl.constexpr = "mxfp8",
     SWIZZLED_SCALES: tl.constexpr = False,  # scales pre-swizzled (5D weight + matching acts); else affine/inline
+    SWIZZLED_OUT: tl.constexpr = False,  # requant emits Cs in SWIZZLE_32_4_4 (CSDescriptor); single source: wrapper
     # Dense gate|up fusion: B is the (2N, K) gate|up stack, C the [M, N] GLU output. Every arm
     # folds out at compile time when GATE=False (the plain dense GEMM, unchanged).
     GATE: tl.constexpr = False,
@@ -733,14 +726,14 @@ def mx_dynamic_matmul_kernel(
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-        a, a_s = matmul_load_act(
-            "mx", a_ptrs, as_ptrs, as_mask, ADescriptor, pid_m * BLOCK_SIZE_M,
-            k * (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE), A_MEMORY_MODE, False,
+        a, a_s = load_act(
+            "mx", a_ptrs, as_ptrs, None, as_mask, ADescriptor, pid_m * BLOCK_SIZE_M,
+            k * (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE), A_MEMORY_MODE,
             as_descriptor=ASDescriptor, as_ptr=As, pid_m=pid_m, k=k, M=M, K=K,
             BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_K=BLOCK_SIZE_K, SCALE_GROUP_K=SCALE_GROUP_K,
             SWIZZLED_SCALES=SWIZZLED_SCALES, INPUT_RECIPE=INPUT_RECIPE,
         )
-        b, b_s = matmul_load_weight(
+        b, b_s = load_weight(
             "mx", b_ptrs, bs_ptrs, bs_mask, BDescriptor, pid_n * BLOCK_SIZE_N,
             k * (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE), B_MEMORY_MODE, False,
             bs_descriptor=BSDescriptor, bs_ptr=Bs, pid_n=pid_n, k=k, N=N, K=K,
@@ -763,6 +756,12 @@ def mx_dynamic_matmul_kernel(
             not SWIZZLED_SCALES, (not SWIZZLED_SCALES) and not GATE, False,
         )
 
+    # NVFP4 two-level: block e4m3 scales rode through dot_scaled; fold the per-tensor global
+    # (g_a·g_b, constant over K so exact to factor out) before GLU + requant. None ptr (no global)
+    # folds the arm out at trace time.
+    if GlobalScale is not None:
+        accumulator = accumulator * tl.load(GlobalScale).to(tl.float32)
+
     # one epilogue for both arms: GATE splits+SwiGLUs (+ optional requant), plain casts+stores.
     # affine output rows (swizzle's offs_am is %-wrapped — the store scatters to real rows);
     # N_COLS masks the 2D-dense column tail.
@@ -772,7 +771,7 @@ def mx_dynamic_matmul_kernel(
         stride_c_m, stride_c_n, stride_cs_m, stride_cs_n,
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, OUTPUT_RECIPE, SCALE_GROUP_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-        COMPUTE_MODE=COMPUTE_MODE, N_COLS=N,
+        COMPUTE_MODE=COMPUTE_MODE, N_COLS=N, SWIZZLED_OUT=SWIZZLED_OUT, CSDescriptor=CSDescriptor,
     )
 
 
@@ -830,18 +829,15 @@ def full_precision_matmul_2d_kernel(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
     )
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, "pointer", True)
-    if GATE:
-        b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, N * stride_b_n, stride_b_n, stride_b_k, GATE, False)
-    else:
-        b_ptrs = operand_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, "pointer", False)
+    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, N, stride_b_n, stride_b_k, GATE, "pointer")
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
         a = tl.load(a_ptrs)
-        if GATE:
-            w = flatten_weight_tile(tl.load(b_ptrs), n_width, BLOCK_SIZE_K, GATE, False)
-        else:
-            w = tl.load(b_ptrs)
+        w, _ = load_weight(
+            "full_precision", b_ptrs, b_ptrs, None, b_ptrs, pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K,
+            "pointer", False, GATE, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
+        )
         accumulator = accumulate(
             accumulator, a, a, w, w, "full_precision", "dot", False, False,
             BLOCK_SIZE_M, n_width, BLOCK_SIZE_K,
@@ -1175,6 +1171,7 @@ def mx_dynamic_matmul(
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     output_recipe: str | None = None,
+    global_scale: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """MX/NVFP4 matmul ``C = A @ B.T``; activations quantized offline above the
     ``maybe_act_quant`` M threshold, inline below it. ``input_recipe`` sets the
@@ -1234,22 +1231,32 @@ def mx_dynamic_matmul(
     # gate|up output: the GLU intermediate [M, N] (output_dtype), or — under output_recipe —
     # requantized (mxfp8: fp8 + (M, N//32) uint8 Cs; fp4: packed (M, N//2) + (M, N//out_g) scale).
     out_recipe = output_recipe if gate else None
+    requant = out_recipe is not None
+    out_g = 16 if out_recipe == "nvfp4" else 32
+    cs_dtype = torch.float8_e4m3fn if out_recipe == "nvfp4" else torch.uint8
+    # Swizzled in -> swizzled out: a swizzled block requants Cs straight into the down's
+    # SWIZZLE_32_4_4 layout (CSDescriptor), so the fused down reads it on the fast path. 2D dense
+    # output rows are contiguous (no scatter), so it's always swizzle-able. Recipe-general — the
+    # swizzle is a byte-tiling over the N // out_g scale grid (mxfp8/mxfp4 group-32, nvfp4 group-16).
+    swizzled_out = requant and swizzled_scales
     if out_recipe in ("mxfp4", "nvfp4"):
-        out_g = 16 if out_recipe == "nvfp4" else 32
         C = A.new_empty(A.shape[:-1] + (N // 2,), dtype=torch.int8)
-        cs_ret = torch.empty(
-            M, N // out_g, device=A.device,
-            dtype=torch.float8_e4m3fn if out_recipe == "nvfp4" else torch.uint8,
-        )
     elif out_recipe == "mxfp8":
         C = A.new_empty(A.shape[:-1] + (N,), dtype=FP8_DTYPE)
-        cs_ret = torch.empty(M, N // 32, device=A.device, dtype=torch.uint8)
     else:
         C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
-        cs_ret = None
-    Cs = cs_ret if cs_ret is not None else A_q  # dummy pointer when no requant (unread)
-    stride_cs_m = cs_ret.stride(0) if cs_ret is not None else 0
-    stride_cs_n = cs_ret.stride(1) if cs_ret is not None else 0
+    if swizzled_out:
+        cb_cs = triton.cdiv(N // out_g, 4)
+        cs_ret = torch.empty(1, triton.cdiv(M, 128), cb_cs, 2, 256, device=A.device, dtype=cs_dtype)
+        CSDescriptor = TensorDescriptor.from_tensor(cs_ret, [1, 1, 1, 2, 256])
+        Cs = None  # row-major pointer unread here; CSDescriptor does the store
+    elif requant:
+        cs_ret = torch.empty(M, N // out_g, device=A.device, dtype=cs_dtype)
+        Cs, CSDescriptor = cs_ret, None
+    else:
+        cs_ret, Cs, CSDescriptor = None, None, None  # unread (no OUTPUT_RECIPE)
+    stride_cs_m = cs_ret.stride(0) if (requant and not swizzled_out) else 0
+    stride_cs_n = cs_ret.stride(1) if (requant and not swizzled_out) else 0
     # Host-TMA descriptors over the packed (M, K_bytes) / (N, K_bytes) matrices — placeholder
     # box rebound per tuned config by _rebind_mx_descriptors. Read only by the descriptor
     # configs the tuner picks; pointer configs never touch them.
@@ -1280,6 +1287,8 @@ def mx_dynamic_matmul(
             bs_descriptor,
             C,
             Cs,
+            CSDescriptor,
+            global_scale,  # (1,) fp32 NVFP4 two-level global; None ⇒ no global (arm folds out)
             M,
             N,
             K,
@@ -1300,6 +1309,7 @@ def mx_dynamic_matmul(
             SCALE_GROUP_K=scale_group,
             INPUT_RECIPE=input_recipe,
             SWIZZLED_SCALES=swizzled_scales,
+            SWIZZLED_OUT=swizzled_out,
             GATE=gate,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
@@ -1379,6 +1389,7 @@ def matmul_2d(
     epilogue: Epilogue | None = None,
     quantization: Quantization | None = None,
     output_dtype: torch.dtype | None = None,
+    global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | list[torch.Tensor]:
     """Dense (2D) quantized matmul dispatcher (W8A8 FP8, W4A8 or W4A4 FP4) — the single-GEMM
     sibling of ``matmul_grouped``/``matmul_batched``, taking the same ``Epilogue``/``Quantization``
@@ -1439,6 +1450,7 @@ def matmul_2d(
             mx_dynamic_matmul(
                 A, B, Bs, output_dtype, input_recipe,
                 gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, output_recipe,
+                global_scale,
             )
         )
     # FP8 activations are always E4M3 with the weight-implied scale granularity, so "fp8" is a

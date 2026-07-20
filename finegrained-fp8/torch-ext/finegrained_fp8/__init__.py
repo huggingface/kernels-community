@@ -6,6 +6,7 @@ from .moe import (
     moe_fused_grouped,
     moe_unfused_batched,
     moe_unfused_grouped,
+    moe_torch_grouped,
 )
 from .utils import Epilogue, Quantization, compute_grouped_scheduling, swizzle_mx_scales
 
@@ -20,6 +21,7 @@ __all__ = [
     "matmul_grouped",
     "moe_fused_grouped",
     "moe_unfused_grouped",
+    "moe_torch_grouped",
     # Grouped scheduling (for MoE and grouped matmul)
     "compute_grouped_scheduling",
     # MX/NVFP4 scale layout (apply to weight scales at load time)

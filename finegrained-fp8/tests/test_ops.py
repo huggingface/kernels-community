@@ -135,6 +135,13 @@ def scenarios() -> list[Problem]:
         for orecipe in row["output_recipes"]:
             if orecipe is not None:
                 out.append(Problem(weights=w, gate=True, output_recipe=orecipe))
+                # swizzled-in -> swizzled-out: swizzled MX weights + requant emit a swizzled (5D
+                # SWIZZLE_32_4_4) Cs — the down's fast-path input. Recipe-general (nvfp4 group-16
+                # differs only in column count). Reference un-swizzles the 5D Cs to the affine cell.
+                if w in ("mxfp8", "mxfp8_u8", "mxfp4", "nvfp4"):
+                    out.append(
+                        Problem(weights=w, gate=True, output_recipe=orecipe, swizzled=True)
+                    )
         default_in = {"fp8_128x128": "fp8", "fp8_tensor": "fp8"}.get(w)
         for irecipe in row["input_recipes"]:
             if irecipe is not None and irecipe != default_in:
@@ -362,10 +369,24 @@ def _check(problem: Problem, out, ref, expert_ids, op):
         ref_cmp = ref
     else:
         group = REQUANT_GROUP[problem.output_recipe]
-        # mxfp8 requant emits Cs in the SWIZZLE_32_4_4 layout (the down proj reads it affine);
-        # un-swizzle to the row-major grid the dequant reference expects.
+        # swizzled in -> swizzled out: a swizzled block emits a 5D SWIZZLE_32_4_4 Cs (else a silent
+        # row-major fallback would still pass the value check below) — but only when the swizzled
+        # layout survives to the output. matmul_2d always does; grouped only with scatter_idx=None
+        # (the fused gate_up pattern), and _run_op scatters, so a scattered grouped output is
+        # legitimately row-major (the swizzle can't be scattered). So require 5D only for matmul;
+        # grouped swizzled-out is covered by the fused-MoE path. Then un-swizzle for the reference.
+        expect_swizzled_out = problem.swizzled and op == "matmul"
+        assert (Cs.ndim == 5) == expect_swizzled_out, (
+            f"swizzled={problem.swizzled} op={op} but Cs.ndim={Cs.ndim} "
+            f"({'expected 5D SWIZZLE_32_4_4' if expect_swizzled_out else 'expected row-major'})"
+        )
         if Cs.ndim == 5:
-            Cs = unswizzle_mx_scales(Cs, C.shape[0], C.shape[1] // group)
+            # packed-E2M1 output (mxfp4/nvfp4) stores N/2 bytes, but the scale spans the logical N —
+            # unswizzle over N columns, not the packed byte count (nvfp4 group-16 crosses a 4-block
+            # boundary here; mxfp4 group-32 happens not to, which is why only nvfp4 exposed it).
+            packed_out = problem.output_recipe in ("mxfp4", "nvfp4")
+            n_logical = C.shape[1] * (2 if packed_out else 1)
+            Cs = unswizzle_mx_scales(Cs, C.shape[0], n_logical // group)
         dq = dq_grouped(C, Cs, group)
         q_ref, s_ref = REQUANT_FN[problem.output_recipe](ref.to(problem.dtype))
         ref_cmp = dq_grouped(q_ref, s_ref, group)
@@ -397,6 +418,11 @@ def _skip_moe_only(problem: Problem, op: str) -> None:
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_op_scenarios(problem: Problem, op):
     _skip_moe_only(problem, op)
+    if op == "batched" and problem.swizzled and problem.output_recipe:
+        pytest.skip(
+            "batched swizzled-in→swizzled-out not yet wired (no swizzled-Cs producer nor "
+            "As.ndim==5 consumer); grouped + matmul_2d enforce the swizzled-output check"
+        )
     A, expert_ids = _routed(problem)
     row = WEIGHTS[problem.weights]
     E = 1 if op == "matmul" else problem.E  # matmul is a single weight matrix
