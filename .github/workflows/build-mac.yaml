@@ -52,6 +52,11 @@ on:
         required: false
         type: string
         default: ""
+      bot_comment_id:
+        description: "Issue comment ID to update with Hub upload links"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -206,12 +211,15 @@ jobs:
           REPO_PREFIX: ${{ inputs.repo_prefix }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
-          cd "$KERNEL"
           BRANCH_FLAG=""
           if [ -n "$TARGET_BRANCH" ]; then
             BRANCH_FLAG="--branch $TARGET_BRANCH"
           fi
-          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "$REPO_PREFIX/$KERNEL" $BRANCH_FLAG
+          TARGET_FLAG=$(python3 .github/scripts/hub_pr_upload_args.py upload-args "$KERNEL" "$REPO_PREFIX")
+          cd "$KERNEL"
+          nix run -L github:huggingface/kernels#kernel-builder -- upload \
+            --repo-type kernel $TARGET_FLAG $BRANCH_FLAG \
+            --output-json "$RUNNER_TEMP/upload.json"
 
       # v1 kernels without an explicit branch override also get uploaded to main.
       - name: Upload v1 kernels to main
@@ -221,21 +229,39 @@ jobs:
           KERNEL: ${{ steps.validate.outputs.kernel }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
+          TARGET_FLAG=$(python3 .github/scripts/hub_pr_upload_args.py upload-args "$KERNEL" "$REPO_PREFIX")
           cd "$KERNEL"
 
           if [ -f "build.toml" ]; then
             VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
             BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
             if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
-              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "$REPO_PREFIX/$KERNEL" --branch main
+              nix run -L github:huggingface/kernels#kernel-builder -- upload \
+                --repo-type kernel $TARGET_FLAG --branch main \
+                --output-json "$RUNNER_TEMP/upload-main.json"
             fi
           fi
+
+      - name: Upload Hub upload summary
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hub-upload-macos
+          path: ${{ runner.temp }}/upload*.json
+          retention-days: 1
 
   # Report the final build outcome as a commit status on the PR head SHA.
   report-status:
     if: always() && inputs.head_sha != ''
     needs: [build-kernel]
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      statuses: write
+    env:
+      REPORT_HUB_UPLOAD: ${{ needs.build-kernel.result == 'success' && inputs.bot_comment_id != '' && inputs.mode != 'pr' && inputs.upload != false }}
     steps:
       - name: Set commit status
         env:
@@ -263,3 +289,28 @@ jobs:
             -f target_url="$RUN_URL" \
             -f description="$DESC" \
             -f context="$STATUS_CONTEXT"
+
+      - name: Checkout comment helpers
+        if: env.REPORT_HUB_UPLOAD == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.pr_number != '' && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+
+      - name: Download Hub upload summaries
+        if: env.REPORT_HUB_UPLOAD == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: hub-upload-*
+          path: hub-uploads
+
+      - name: Update bot comment with Hub URLs
+        if: env.REPORT_HUB_UPLOAD == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BOT_COMMENT_ID: ${{ inputs.bot_comment_id }}
+          KERNEL: ${{ inputs.kernel_name }}
+          REPO_PREFIX: ${{ inputs.repo_prefix }}
+        run: |
+          BODY=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" --jq .body)
+          BODY=$(python3 .github/scripts/format_hub_upload_comment.py --base "$BODY" "$KERNEL" "$REPO_PREFIX" hub-uploads/**/*.json)
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" -f body="$BODY"
