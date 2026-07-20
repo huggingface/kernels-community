@@ -4,6 +4,7 @@ import triton.language as tl
 
 from .utils import calculate_settings
 from .utils import ensure_contiguous
+from .utils import device_context
 
 
 @triton.jit
@@ -73,16 +74,17 @@ def swiglu_forward(a, b, gate_multiplier: float = 1.0):
 
     BLOCK_SIZE, num_warps = calculate_settings(n_cols)
 
-    _swiglu_forward_kernel[(n_rows,)](
-        a,
-        b,
-        c,
-        c.stride(-2),
-        float(gate_multiplier),
-        n_cols=n_cols,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-    )
+    with device_context(a.device):
+        _swiglu_forward_kernel[(n_rows,)](
+            a,
+            b,
+            c,
+            c.stride(-2),
+            float(gate_multiplier),
+            n_cols=n_cols,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
     return a, b, c.view(*ori_shape)
 
 
@@ -94,16 +96,17 @@ def swiglu_backward(a, b, dc, gate_multiplier: float = 1.0):
 
     BLOCK_SIZE, num_warps = calculate_settings(n_cols)
 
-    _swiglu_backward_kernel[(n_rows,)](
-        dc,
-        a,
-        b,
-        dc.stride(-2),
-        float(gate_multiplier),
-        n_cols=n_cols,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-    )
+    with device_context(a.device):
+        _swiglu_backward_kernel[(n_rows,)](
+            dc,
+            a,
+            b,
+            dc.stride(-2),
+            float(gate_multiplier),
+            n_cols=n_cols,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
     return a.view(*ori_shape), b.view(*ori_shape)
 
 
