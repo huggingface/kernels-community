@@ -21,7 +21,14 @@ jobs:
           fetch-depth: 1
       - name: Fetch PR head for metadata
         # Make the PR commit available so the bot can read its build.toml (data only).
-        run: git fetch --depth=1 origin "refs/pull/${{ github.event.issue.number }}/head"
+        env:
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          if ! printf '%s' "$PR_NUMBER" | grep -Eq '^[0-9]+$'; then
+            echo "Invalid PR number"
+            exit 1
+          fi
+          git fetch --depth=1 origin "refs/pull/${PR_NUMBER}/head"
       - name: Handle /kernel-bot command
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -37,7 +44,7 @@ jobs:
           set -eu
           if [ "${#COMMENT_BODY}" -gt 1024 ]; then
             echo "Ignoring oversized comment payload."
-            exit 0
+            exit 1
           fi
           case "$COMMENT_BODY" in
             /kernel-bot*) ;;
@@ -48,10 +55,10 @@ jobs:
           esac
           if ! printf '%s' "$COMMENT_BODY" | grep -Eq '^/kernel-bot[][ A-Za-z0-9_,./-]*$'; then
             echo "Ignoring /kernel-bot comment with unsupported characters."
-            exit 0
+            exit 1
           fi
           if [[ "$COMMENT_AUTHOR_ASSOCIATION" != "MEMBER" && "$COMMENT_AUTHOR_ASSOCIATION" != "OWNER" && "$COMMENT_AUTHOR_ASSOCIATION" != "COLLABORATOR" ]]; then
             echo "Unauthorized: Only members, owners, and collaborators can use /kernel-bot."
-            exit 0
+            exit 1
           fi
           python3 .github/scripts/pr_comment_kernel_bot.py
