@@ -95,25 +95,12 @@ class DispatchPlan:
 # Reading build.toml and selecting workflows
 
 
-def read_backends(kernel_name: str, ref: str = "") -> list[str] | None:
-    # ref reads build.toml from that revision (the PR branch), not the working tree.
-    if ref:
-        try:
-            raw = subprocess.run(
-                ["git", "show", f"{ref}:{kernel_name}/build.toml"],
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            return None
-        config = tomllib.loads(raw)
-    else:
-        build_toml = Path(kernel_name) / "build.toml"
-        if not build_toml.exists():
-            return None
-        with open(build_toml, "rb") as f:
-            config = tomllib.load(f)
+def read_backends(kernel_name: str) -> list[str] | None:
+    build_toml = Path(kernel_name) / "build.toml"
+    if not build_toml.exists():
+        return None
+    with open(build_toml, "rb") as f:
+        config = tomllib.load(f)
     backends = config.get("general", {}).get("backends")
     if backends is None:
         backends = config.get("backends")
@@ -122,10 +109,8 @@ def read_backends(kernel_name: str, ref: str = "") -> list[str] | None:
     return None
 
 
-def select_workflows(
-    kernel_name: str, *, notes: list[str], metadata_ref: str = ""
-) -> set[str]:
-    backends = read_backends(kernel_name, metadata_ref)
+def select_workflows(kernel_name: str, *, notes: list[str]) -> set[str]:
+    backends = read_backends(kernel_name)
     if backends is None:
         notes.append(
             f"Could not read backends for {kernel_name}, dispatching all workflows"
@@ -247,12 +232,9 @@ def _plan_build_actions(
     head_sha: str,
     target_branch: str,
     upload: bool,
-    metadata_ref: str,
 ) -> None:
-    backends = read_backends(kernel_name, metadata_ref) or []
-    workflows = select_workflows(
-        kernel_name, notes=plan.notes, metadata_ref=metadata_ref
-    )
+    backends = read_backends(kernel_name) or []
+    workflows = select_workflows(kernel_name, notes=plan.notes)
     plan.skipped = sorted(set(WORKFLOWS["build"]) - workflows)
 
     for workflow in sorted(workflows):
@@ -312,7 +294,6 @@ def plan_dispatch(
     upload: bool = True,
     run_security: bool = False,
     security_only: bool = False,
-    metadata_ref: str = "",
 ) -> DispatchPlan:
     want_security = run_security or security_only
     plan = DispatchPlan(kernel_name=kernel_name, head_sha=head_sha)
@@ -325,7 +306,6 @@ def plan_dispatch(
             mode=mode,
             repo_prefix=repo_prefix,
             dispatch_key_prefix=dispatch_key_prefix,
-            metadata_ref=metadata_ref,
             skip_build=skip_build,
             pr_number=pr_number,
             head_sha=head_sha,
@@ -480,7 +460,6 @@ def dispatch(
     upload: bool = True,
     run_security: bool = False,
     security_only: bool = False,
-    metadata_ref: str = "",
 ) -> DispatchResult:
     if not security_only and (not kernel_name or not KERNEL_NAME_RE.match(kernel_name)):
         result = DispatchResult(kernel_name=kernel_name)
@@ -502,7 +481,6 @@ def dispatch(
         upload=upload,
         run_security=run_security,
         security_only=security_only,
-        metadata_ref=metadata_ref,
     )
     if dry_run:
         return _result_from_plan(plan)

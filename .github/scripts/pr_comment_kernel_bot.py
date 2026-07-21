@@ -878,8 +878,6 @@ def main(*, dry_run: bool = False):
             # The audit is per-PR, so request it only once (on the first kernel).
             run_security=run_security and index == 0,
             dry_run=dry_run,
-            # Read backends from the PR commit (dry-run reads the working tree).
-            metadata_ref="" if dry_run else (pr_head_sha or ""),
         )
         emit_dispatch_diagnostics(release_result, dry_run=dry_run)
         for wf, dk in release_result.dispatched:
