@@ -402,12 +402,51 @@ def is_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
 def is_nvfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     """NVFP4 weight/scale pair: packed E2M1 weights (``int8``, two codes/byte) with E4M3
     group-16 scales — the scale DTYPE is the recipe carrier (UE8M0 = MX, E4M3 = NV), and
-    the group falls out of the shape. Per-tensor second-level scales are caller-folded."""
+    the group falls out of the shape. The per-tensor second-level global rides the scale
+    argument as a ``[block, global]`` pair (``split_scale``); this predicate takes the
+    block part."""
     return (
         weight.dtype == torch.int8
         and scale.dtype == torch.float8_e4m3fn
         and _shapes_match(weight, scale, NVFP4_SCALE_GROUP_K)
     )
+
+
+def split_scale(
+    scale,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Normalize a scale argument into ``(block, global)``. The public ops accept either a
+    bare block-scale tensor (single-level recipes) or a two-element ``[block, global]``
+    list/tuple — the canonical NVFP4 two-level form, where ``global`` is the fp32 per-tensor
+    (or per-expert, ``(E,)``) second-level scale multiplied onto the accumulator. A bare
+    tensor means no global (``None``); NVFP4 weights are always two-level
+    (``nvfp4_quantize_two_level``), so their ``Bs`` always arrives as the pair."""
+    if isinstance(scale, (list, tuple)):
+        block, glob = scale
+        assert glob is None or (
+            isinstance(glob, torch.Tensor) and glob.dtype == torch.float32
+        ), f"the second-level global scale must be an fp32 tensor, got {type(glob)}"
+        return block, (glob.reshape(-1) if glob is not None else None)
+    return scale, None
+
+
+def combine_global_scales(
+    global_a: torch.Tensor | None, global_b: torch.Tensor | None, num_experts: int
+) -> torch.Tensor | None:
+    """The single ``GlobalScale = g_a · g_b`` the MX kernels multiply onto the accumulator, broadcast
+    to ``(num_experts,)`` (grouped/batched index it per expert; the 2D op passes ``num_experts=1``
+    and reads it unindexed). Only the product matters for the acc — ``g_a`` alone is passed
+    separately for the inline-quant arm. Both operands' globals are calibrated/provided, never
+    computed here; this just multiplies them. ``None`` if neither operand has a global."""
+    if global_a is None and global_b is None:
+        return None
+    glob = global_b if global_a is None else global_a if global_b is None else global_a * global_b
+    if glob.numel() == 1 and num_experts > 1:
+        glob = glob.expand(num_experts)
+    assert glob.numel() == num_experts, (
+        f"global scale has {glob.numel()} elements, expected {num_experts} (per expert)"
+    )
+    return glob.contiguous()
 
 
 def is_preswizzled_mx(weight: torch.Tensor, scale: torch.Tensor) -> bool:
@@ -452,10 +491,15 @@ def weight_block_size(B: torch.Tensor, Bs: torch.Tensor) -> list[int] | None:
     num_experts, n_rows, K = B.shape
     if Bs.numel() == num_experts:
         return None
-    assert Bs.ndim == 3 and n_rows % Bs.shape[1] == 0 and K % Bs.shape[2] == 0, (
-        f"Bs shape {tuple(Bs.shape)} does not tile B {tuple(B.shape)} evenly"
+    assert Bs.ndim == 3 and K % Bs.shape[2] == 0, (
+        f"Bs shape {tuple(Bs.shape)} does not tile B {tuple(B.shape)} along K"
     )
-    return [n_rows // Bs.shape[1], K // Bs.shape[2]]
+    # K tiles evenly, so block_k is exact; N (n_rows) may be non-aligned (a partial last block,
+    # n_rows % Bs.shape[1] != 0) — recover block_n from the even K dim (square FP8 blocks). The
+    # routed kernels then reject the non-aligned N via ``require_moe_dims_aligned``; matmul_2d masks it.
+    block_k = K // Bs.shape[2]
+    block_n = n_rows // Bs.shape[1] if n_rows % Bs.shape[1] == 0 else block_k
+    return [block_n, block_k]
 
 
 def validate_dense_operands(A: torch.Tensor, B: torch.Tensor) -> None:
@@ -915,6 +959,19 @@ def block_within_dim_pruner(dim_arg: str, block_key: str = "BLOCK_SIZE_K"):
         )
 
     return config_filter(ok, on_empty=raise_no_dividing_block)
+
+
+def require_moe_dims_aligned(N: int, K: int, block_n: int, block_k: int) -> None:
+    """Routed MoE (grouped/batched) GEMMs tile expert dims by the quant block — N-tiles store
+    column-unmasked and K loads unmasked — so ``N`` and ``K`` must each be a multiple of the block.
+    Non-aligned dims are a dense capability: use ``matmul_2d`` (its single GEMM masks the N/K tail).
+    Raised early with a clear message rather than letting a tile run past the row."""
+    if N % block_n != 0 or K % block_k != 0:
+        raise ValueError(
+            f"routed MoE GEMM needs N ({N}) and K ({K}) each a multiple of the quant block "
+            f"(block_n={block_n}, block_k={block_k}); non-aligned dims are supported only by the "
+            f"dense matmul_2d op."
+        )
 
 
 def warp_spec_compile_guard_pruner():
@@ -1655,6 +1712,7 @@ def load_weight_scale_tile(
 def load_mx_act_tile(
     a_ptrs,
     as_ptrs,
+    as_global,  # (1,) fp32 NVFP4 act global (None off nvfp4); normalizes the raw tile pre-block-quant
     row_mask,
     a_descriptor,
     m_start,
@@ -1673,9 +1731,11 @@ def load_mx_act_tile(
     packed-E2M1 values (W4A4 — the ``a_ptrs`` tile spans ``BLOCK_SIZE_K // 2`` bytes) +
     the same UE8M0 scales, raw bf16/fp16 pointers load and quantize inline onto
     ``RECIPE``'s grid (``mx_act_quant_inline`` — packed E2M1 under the fp4 recipes;
-    ``as_ptrs`` then points at a dead placeholder and is never read). ``row_mask`` may be
-    ``None`` (unmasked tiles, e.g. the %-wrapped 2D matmul). Callers advance both
-    pointers unconditionally."""
+    ``as_ptrs`` then points at a dead placeholder and is never read). Under NVFP4
+    two-level, ``as_global`` (the calibrated activation global) normalizes the raw tile
+    before the block quant — bit-identical to the offline ``nvfp4_act_quant(x,
+    global_scale=g_a)`` pass. ``row_mask`` may be ``None`` (unmasked tiles, e.g. the
+    %-wrapped 2D matmul). Callers advance both pointers unconditionally."""
     if a_ptrs.dtype.element_ty == tl.float8e4nv or a_ptrs.dtype.element_ty == tl.uint8:
         # pre-quantized (E4M3 offline, or packed E2M1 handed in by the caller); under the
         # descriptor arm the [BM, BK_bytes] box loads the tile's contiguous sorted rows
@@ -1708,6 +1768,8 @@ def load_mx_act_tile(
             a_raw = tl.load(a_ptrs).to(tl.float32)
         else:
             a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+        if as_global is not None:  # NVFP4 two-level: normalize by the calibrated act global
+            a_raw = a_raw / tl.load(as_global).to(tl.float32)
         a, a_scale = mx_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, RECIPE
         )
@@ -2638,6 +2700,7 @@ def load_act(
     RECIPE: tl.constexpr,
     a_ptrs,
     as_ptrs,
+    as_global,  # (1,) fp32 NVFP4 act global (None off nvfp4); inline-quant normalize + acc recover
     value_mask,  # activation-value row mask (None = maskless: the %-wrapped 2D / replicated decode tile)
     scale_mask,  # affine-scale row mask (2D bounds, grouped padding); dead on the swizzled arm
     a_descriptor,
@@ -2706,8 +2769,9 @@ def load_act(
             )
         else:  # 2D / decode: inline-quant affine or in-register scale
             a, a_s = load_mx_act_tile(
-                a_ptrs, as_ptrs, scale_mask, a_descriptor, m_off, k_off, 0,
-                BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, A_MEMORY_MODE, RECIPE=INPUT_RECIPE,
+                a_ptrs, as_ptrs, as_global, scale_mask, a_descriptor, m_off, k_off, 0,
+                BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, A_MEMORY_MODE,
+                RECIPE=INPUT_RECIPE,
             )
     elif RECIPE == "block_dynamic":
         if GROUPED:  # gathered value + per-row per-K-block scale read contiguously at As + k
@@ -3394,6 +3458,7 @@ def gemm_epilogue(
     FAKE_BATCH: tl.constexpr = False,
     N_COLS: tl.constexpr = 0,  # >0 masks the column tail (2D dense N isn't BN-aligned); 0 = no mask
     CSDescriptor=0,  # SWIZZLE_32_4_4 requant-scale descriptor; read only under SWIZZLED_OUT (else dummy)
+    CsGlobal=None,  # (1,) fp32 NVFP4 output global (the NEXT proj's provided input_scale); normalizes the requant, None folds out
 ):
     """Unified output epilogue for grouped (a real scatter tile) and batched (fake-batch decode:
     one token replicated across the BM lanes) GEMMs. Plain: cast + store the accumulator. ``GATE``:
@@ -3422,6 +3487,11 @@ def gemm_epilogue(
             else:
                 tl.store(cs_ptr, q_s, mask=row_mask)
         elif OUTPUT_RECIPE is not None:  # "mxfp8" | "mxfp4" | "nvfp4"
+            if CsGlobal is not None:
+                # NVFP4 two-level requant: normalize the fp32 GLU intermediate by the NEXT proj's
+                # provided (calibrated) input_scale before the block quant — the canonical two-step.
+                # The down folds it back via its As pair ([Cs, g_out]); nothing is computed at runtime.
+                out = out / tl.load(CsGlobal).to(tl.float32)
             q, q_s = mx_act_quant_inline(out, BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_RECIPE)
             width: tl.constexpr = (
                 BLOCK_SIZE_N if OUTPUT_RECIPE == "mxfp8" else BLOCK_SIZE_N // 2
@@ -3551,6 +3621,7 @@ def _mx_act_quant_kernel(
     SOut,  # flat SWIZZLE_32_4_4 scale buffer (1, n_tiles, cb, 2, 256); dummy int on the plain path
     GatherIdx,  # (S,) int32 sorted position -> source row of X; read only when SWIZZLED and not None
     ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 cumulative sorted-row starts; read iff SWIZZLED
+    GlobalScale,  # (1,) fp32 NVFP4 second-level per-tensor global; None ⇒ single-level (arm folds out)
     stride_x_t,
     stride_x_k,
     T,
@@ -3614,6 +3685,11 @@ def _mx_act_quant_kernel(
         mask=row_mask[:, None],
         other=0.0,
     ).to(tl.float32)
+    if GlobalScale is not None:
+        # NVFP4 two-level: normalize by the calibrated per-tensor global before the block
+        # quant — block scales are then amax/6 of x/g (the canonical two-step); the GEMM
+        # folds g back onto the accumulator (g_a·g_b). None folds the arm out at trace time.
+        x = x / tl.load(GlobalScale).to(tl.float32)
     y, s = mx_act_quant_inline(x, BLOCK_T, BLOCK_K, SCALE_GROUP_K, RECIPE)
     width: tl.constexpr = BLOCK_K // 2 if RECIPE != "mxfp8" else BLOCK_K
     y_row: tl.constexpr = K // (BLOCK_K // width)  # per-row element count of Y
@@ -3660,6 +3736,7 @@ def mx_act_quant_swizzled_grouped(
     scale_dtype: torch.dtype,
     gather_idx: torch.Tensor | None,
     expert_start: torch.Tensor,
+    global_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Offline MX act-quant for a grouped GEMM that emits SWIZZLE_32_4_4 scales directly (the
     ``SWIZZLED`` arm of ``_mx_act_quant_kernel``). Returns ``(values, swizzled_scale,
@@ -3692,6 +3769,7 @@ def mx_act_quant_swizzled_grouped(
             s_sw,  # flat SWIZZLE_32_4_4 scale buffer (pointer store; no descriptor)
             gather_idx,  # None = no gather (the is-not-None guard folds the load out)
             expert_start,
+            global_scale,  # (1,) fp32 NVFP4 two-level global; None ⇒ single-level (arm folds out)
             x.stride(0),
             x.stride(1),
             T,
@@ -3869,31 +3947,40 @@ def mxfp4_act_quant(x: torch.Tensor, swizzled: bool = False) -> tuple[torch.Tens
     return _launch_act_quant(x, "mxfp4", MX_SCALE_GROUP_K, torch.uint8, swizzled)
 
 
-def nvfp4_act_quant(x: torch.Tensor, swizzled: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+def nvfp4_act_quant(
+    x: torch.Tensor, swizzled: bool = False, global_scale: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to NVFP4 in one kernel pass: packed-E2M1 values
-    (``(T, K//2)`` int8) + E4M3 group-16 scales (``(T, K//16)`` — ``amax/6`` rounded to
+    (``(T, K//2)`` int8) + E4M3 group-16 block scales (``(T, K//16)`` — ``amax/6`` rounded to
     E4M3, NOT a power of two; values divide by the DECODED scale before the E2M1 grid,
-    the standard two-step). The per-tensor second-level scale is the caller's to fold.
-    ``swizzled=True`` emits the scale directly in SWIZZLE_32_4_4 for the tcgen05 fast path."""
-    return _launch_act_quant(x, "nvfp4", NVFP4_SCALE_GROUP_K, torch.float8_e4m3fn, swizzled)
+    the standard two-step). ``global_scale`` is the CALIBRATED per-tensor second level
+    (``(1,)`` fp32, the checkpoint's ``input_scale``): values are normalized by it before
+    the block quant, so block scales stay in e4m3 range regardless of the activation's
+    dynamic range — the canonical two-level recipe. The GEMM folds ``g_a·g_b`` back onto
+    the accumulator (pass ``As = [scales, global_scale]``). ``None`` = single-level
+    (``g_a = 1``). ``swizzled=True`` emits the scale directly in SWIZZLE_32_4_4 for the
+    tcgen05 fast path."""
+    return _launch_act_quant(
+        x, "nvfp4", NVFP4_SCALE_GROUP_K, torch.float8_e4m3fn, swizzled, global_scale
+    )
 
 
 def nvfp4_quantize_two_level(
     weight: torch.Tensor, swizzled: bool = False
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Canonical two-level NVFP4 quant of a ``(N, K)`` (or ``(K,)``-last) tensor. Returns
-    ``(packed_e2m1 int8, e4m3 group-16 block scales, fp32 per-tensor global)``.
+    ``(packed_e2m1 int8, [e4m3 group-16 block scales, fp32 per-tensor global])`` — the scale
+    is the two-level ``[block, global]`` pair the matmul ops take as ``Bs`` directly.
 
     The second level is a per-tensor fp32 global = ``amax / (6 · 448)`` — the smallest global that
     keeps every e4m3 block scale in range (block ``amax/6`` after dividing by the global stays
     ``≤ 448``). Two-level quant IS single-level quant of the globally-normalized tensor, so the block
-    values + scales come straight from ``nvfp4_act_quant(weight / global)``. Pass the global to the
-    matmul's ``global_scale``; the e4m3 block scales ride ``dot_scaled`` as usual. For a matmul both
-    operands carry a global — feed the product ``g_a · g_b`` (activations single-level ⇒ ``g_a = 1``,
-    so ``global_scale = g_b``)."""
+    values + scales come straight from ``nvfp4_act_quant(weight / global)``. The kernels multiply
+    the folded ``g_a · g_b`` onto the accumulator; the e4m3 block scales ride ``dot_scaled`` as
+    usual (activations are single-level ⇒ ``g_a = 1``)."""
     global_scale = (weight.abs().amax() / (6.0 * 448.0)).clamp(min=1e-30).float()
     packed, block = nvfp4_act_quant((weight / global_scale).contiguous(), swizzled)
-    return packed.view(torch.int8), block, global_scale
+    return packed.view(torch.int8), [block, global_scale.reshape(1)]
 
 
 # offline act-quant pass per recipe (keys = ``resolve_input_recipe`` results)
@@ -3904,12 +3991,13 @@ MX_ACT_QUANT = {
 }
 
 
-def _launch_act_quant(x, recipe, scale_group, scale_dtype, swizzled=False):
+def _launch_act_quant(x, recipe, scale_group, scale_dtype, swizzled=False, global_scale=None):
     """One-pass activation quant for every recipe (``mxfp8`` = E4M3 values, else packed E2M1) and
     both scale layouts. ``swizzled=True`` writes the scale straight into the SWIZZLE_32_4_4 buffer
     ``(1, cdiv(T, 128), cb, 2, 256)`` (per-element ptr store, dense autotuned ``BLOCK_T`` — same grid
     as the affine path, just the store address flips); ``swizzled=False`` writes row-major
-    ``(T, K // scale_group)``. Returns ``(values, scales)``."""
+    ``(T, K // scale_group)``. ``global_scale`` (NVFP4 two-level, ``(1,)`` fp32) normalizes the
+    values before the block quant. Returns ``(values, scales)``."""
     T, K = x.shape
     packed = recipe != "mxfp8"
     if packed:
@@ -3937,6 +4025,7 @@ def _launch_act_quant(x, recipe, scale_group, scale_dtype, swizzled=False):
             scales if swizzled else 0,  # SOut: SWIZZLE_32_4_4 buffer (swizzled) / dummy
             values,  # dummy GatherIdx (unread on the dense grid)
             values,  # dummy ExpertStart (unread on the dense grid)
+            global_scale,  # (1,) fp32 NVFP4 two-level global; None ⇒ single-level (arm folds out)
             x.stride(0),
             x.stride(1),
             T,

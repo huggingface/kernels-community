@@ -297,6 +297,7 @@ from finegrained_fp8.utils import (  # type: ignore  # noqa: E402
     mxfp4_act_quant,
     mxfp8_act_quant,
     nvfp4_act_quant,
+    nvfp4_quantize_two_level,
 )
 
 _E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
@@ -328,20 +329,36 @@ def dq_grouped(q: torch.Tensor, s: torch.Tensor, group: int) -> torch.Tensor:
 
 
 def dq_block_fp8(B, Bs, block_n: int, block_k: int) -> torch.Tensor:
-    """(E, N, K) E4M3 + (E, N//bn, K//bk) block inv-scales -> fp32."""
+    """(E, N, K) E4M3 + (E, ceil(N/bn), ceil(K/bk)) block inv-scales -> fp32. The scale grid tiles
+    with ceil, so a non-aligned N/K leaves a partial last block — trim the expanded scale to B."""
     s = torch.repeat_interleave(
         torch.repeat_interleave(dq_scale(Bs), block_n, dim=-2), block_k, dim=-1
     )
-    return B.float() * s
+    return B.float() * s[..., : B.shape[-2], : B.shape[-1]]
 
 
 def _make_nvfp4(N, K, E):
-    w = torch.randn(E, N, K, device=TEST_DEVICE, dtype=torch.bfloat16) * 0.05
-    qs = [nvfp4_act_quant(w[e].contiguous()) for e in range(E)]
+    """Canonical TWO-LEVEL NVFP4 weights: per-expert ``nvfp4_quantize_two_level`` — the
+    scale is the ``[block e4m3 group-16, per-expert fp32 global]`` pair the ops take as
+    ``Bs`` directly. Weights are drawn wide (×40) so the global is genuinely != 1 (block
+    amax/6 would overflow e4m3 without it) — a unit-global registry would pass even if a
+    kernel ignored the global."""
+    w = torch.randn(E, N, K, device=TEST_DEVICE, dtype=torch.bfloat16) * 40.0
+    qs = [nvfp4_quantize_two_level(w[e].contiguous()) for e in range(E)]
     return (
-        torch.stack([q for q, _ in qs]).view(torch.int8),
-        torch.stack([s for _, s in qs]),
+        torch.stack([q for q, _ in qs]),
+        [
+            torch.stack([s[0] for _, s in qs]),  # (E, N, K//16) e4m3 block scales
+            torch.cat([s[1] for _, s in qs]),  # (E,) fp32 per-expert globals
+        ],
     )
+
+
+def dq_nvfp4_two_level(B, Bs):
+    """fp32 dequant of two-level NVFP4 weights: block dequant × the per-expert global.
+    ``Bs`` is the ``[block, global]`` pair the registry ``make`` returns."""
+    block, glob = Bs
+    return dq_grouped(B, block, NVFP4_SCALE_GROUP_K) * glob.reshape(-1, 1, 1)
 
 
 def _make_full(dtype):
@@ -434,9 +451,12 @@ WEIGHTS = {
         act_quant=_MX_ACT,
         dq_act=lambda q, s: dq_grouped(q, s, MX_SCALE_GROUP_K),
     ),
+    # NVFP4 is ALWAYS two-level (the canonical recipe): the registry Bs is the
+    # [block, per-expert global] pair; activations here are single-level (g_a = 1 —
+    # the calibrated-g_a arm is covered by test_ops' act-global scenarios).
     "nvfp4": dict(
         make=_make_nvfp4,
-        dequant=lambda B, Bs: dq_grouped(B, Bs, NVFP4_SCALE_GROUP_K),
+        dequant=dq_nvfp4_two_level,
         input_recipes=(None, "nvfp4"),
         output_recipes=(None, "nvfp4"),
         act_quant={None: nvfp4_act_quant, "nvfp4": nvfp4_act_quant},

@@ -43,6 +43,7 @@ from .utils import (
     swizzled_scale_config_pruner,
     smem_pruner,
     block_within_dim_pruner,
+    require_moe_dims_aligned,
     compose_pruners,
     acc_finalize,
     weight_tile_ptrs,
@@ -56,6 +57,8 @@ from .utils import (
     fp8_act_quant_block_dynamic,
     get_accelerator_autotuning_configs,
     is_mx,
+    combine_global_scales,
+    split_scale,
     weight_block_size,
     e2m1_as_uint8,
     ue8m0_as_uint8,
@@ -230,7 +233,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     acc = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a, a_s = load_act("block_dynamic", a_ptrs, as_ptrs, None, None, 0, 0, 0, "pointer")
+        a, a_s = load_act("block_dynamic", a_ptrs, as_ptrs, None, None, None, 0, 0, 0, "pointer")
         w, b_s = load_weight(
             "block_dynamic", b_ptrs, bs_ptr + bs_off, None, b_ptrs, 0, 0, "pointer", SWAP_AB, GATE,
             BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
@@ -340,7 +343,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     acc = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a, _ = load_act("static", a_ptrs, a_ptrs, None, None, 0, 0, 0, "pointer")  # pre-quantized E4M3 token (fake-batch replicated)
+        a, _ = load_act("static", a_ptrs, a_ptrs, None, None, None, 0, 0, 0, "pointer")  # pre-quantized E4M3 token (fake-batch replicated)
         w, b_s = load_weight(
             "static", b_ptrs, bs_ptr + bs_off, None, b_ptrs, 0, 0, "pointer", SWAP_AB, GATE,
             BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
@@ -445,7 +448,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a, _ = load_act("tensor", a_ptrs, a_ptrs, None, None, 0, 0, 0, "pointer")
+        a, _ = load_act("tensor", a_ptrs, a_ptrs, None, None, None, 0, 0, 0, "pointer")
         b, _ = load_weight(
             "tensor", b_ptrs, b_ptrs, None, b_ptrs, 0, 0, "pointer", SWAP_AB,
             BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
@@ -512,7 +515,9 @@ def mx_dynamic_matmul_batched_kernel(
     BSDescriptor,  # host TMA descriptor over Bs when SWIZZLED (BN=128 bulk load); dummy otherwise
     C,  # (S, N[/2]) output; under an OUTPUT_RECIPE the MX-requantized intermediate
     Cs,  # (S, N // SCALE_GROUP_K) UE8M0 output scale; written iff OUTPUT_RECIPE
-    GlobalScale,  # (num_experts,) fp32 NVFP4 two-level per-tensor global (g_a·g_b); read iff not None
+    AsGlobal,  # (1,) fp32 NVFP4 activation global g_a — SOLELY normalizes the inline raw-A quant (A/g_a); read iff not None
+    AsBsGlobal,  # (num_experts,) fp32 NVFP4 combined global g_a·g_b — recovers on the accumulator (one multiply); read iff not None
+    CsGlobal,  # (1,) fp32 NVFP4 output global (next proj's provided input_scale); normalizes the requant; read iff not None
     ExpertIds,  # (S,) — which expert each routed row uses
     GatherIdx,  # (S,) int — batch_id -> source row of A; read only when not None
     ScatterIdx,  # (S,) int — batch_id -> destination row of C; read only when not None
@@ -620,7 +625,7 @@ def mx_dynamic_matmul_batched_kernel(
     accumulator = acc_init(COMPUTE_MODE, BLOCK_SIZE_M, n_width, SWAP_AB)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a, a_scale = load_act(
-            "mx", a_ptrs, as_ptrs, None, None, 0, 0, 0, "pointer",
+            "mx", a_ptrs, as_ptrs, AsGlobal, None, None, 0, 0, 0, "pointer",
             BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_K=BLOCK_SIZE_K, SCALE_GROUP_K=SCALE_GROUP_K,
             INPUT_RECIPE=INPUT_RECIPE,
         )
@@ -644,17 +649,17 @@ def mx_dynamic_matmul_batched_kernel(
             "pointer", "pointer", As is not None, False, False,
         )
 
-    # NVFP4 two-level: block e4m3 scales rode through the reduce; fold the per-expert global
-    # (g_a·g_b, constant over K so exact to factor out) before GLU + requant. None ptr (no global)
-    # folds the arm out at trace time.
-    if GlobalScale is not None:
-        accumulator = accumulator * tl.load(GlobalScale + expert_id).to(tl.float32)
+    # NVFP4 two-level: block e4m3 scales rode through the reduce; recover the combined per-tensor
+    # global g_a·g_b on the accumulator — one multiply (only the product matters here; g_a alone is
+    # used solely by the inline-quant arm). None folds out at trace time.
+    if AsBsGlobal is not None:
+        accumulator = accumulator * tl.load(AsBsGlobal + expert_id).to(tl.float32)
 
     gemm_epilogue(
         C, Cs, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, stride_cs_m, stride_cs_n,
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, OUTPUT_RECIPE, SCALE_GROUP_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-        COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, FAKE_BATCH=True,
+        COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, FAKE_BATCH=True, CsGlobal=CsGlobal,
     )
 
 
@@ -744,7 +749,7 @@ def full_precision_matmul_batched_kernel(
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
     for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a, _ = load_act("full_precision", a_ptrs, a_ptrs, None, None, 0, 0, 0, "pointer")
+        a, _ = load_act("full_precision", a_ptrs, a_ptrs, None, None, None, 0, 0, 0, "pointer")
         w, _ = load_weight(
             "full_precision", b_ptrs, b_ptrs, None, b_ptrs, 0, 0, "pointer", SWAP_AB, GATE,
             BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
@@ -814,9 +819,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
         f"block_size must be [block_n, block_k], got {block_size}"
     )
     block_n, block_k = block_size[0], block_size[1]
-    # MoE expert dimensions must be block-aligned; non-aligned N/K is not supported.
-    assert N % block_n == 0, f"N ({N}) must be divisible by block_n ({block_n})"
-    assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
+    require_moe_dims_aligned(N, K, block_n, block_k)
     assert Bs.shape == (num_experts, n_rows // block_n, K // block_k), (
         f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, {n_rows // block_n}, {K // block_k})"
     )
@@ -948,8 +951,7 @@ def w8a8_block_static_fp8_matmul_batched(
         f"block_size must be [block_n, block_k], got {block_size}"
     )
     block_n, block_k = block_size[0], block_size[1]
-    assert N % block_n == 0, f"N ({N}) must be divisible by block_n ({block_n})"
-    assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
+    require_moe_dims_aligned(N, K, block_n, block_k)
     assert Bs.shape == (num_experts, n_rows // block_n, K // block_k), (
         f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, {n_rows // block_n}, {K // block_k})"
     )
@@ -1117,7 +1119,9 @@ def mx_dynamic_matmul_batched(
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
-    global_scale: torch.Tensor | None = None,
+    a_global_scale: torch.Tensor | None = None,
+    b_global_scale: torch.Tensor | None = None,
+    output_global_scale: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Batched MX matmul ``C[s] = A[s] @ B[expert_ids[s]].T``; activations quantized
     inline in the kernel (decode: one act row per program, inline is free). The
@@ -1218,6 +1222,8 @@ def mx_dynamic_matmul_batched(
     def grid(META):
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
+    # NVFP4 accumulator correction: the per-expert g_a·g_b product folded onto the fp32 accumulator.
+    input_global_scale = combine_global_scales(a_global_scale, b_global_scale, B.shape[0])
     with device_context(a_u8.device):
         compile_time_only_triton_wrap(mx_dynamic_matmul_batched_kernel)[grid](
             a_u8,
@@ -1227,7 +1233,9 @@ def mx_dynamic_matmul_batched(
             bs_descriptor,
             C,
             Cs,
-            global_scale,  # (num_experts,) fp32 NVFP4 two-level global; None ⇒ no global (arm folds out)
+            a_global_scale,  # AsGlobal (1,): g_a for the inline-quant arm (A/g_a)
+            input_global_scale,  # AsBsGlobal = g_a·g_b (acc)
+            output_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
             expert_ids,
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
@@ -1343,28 +1351,38 @@ def full_precision_matmul_batched(
 def matmul_batched(
     A: torch.Tensor,
     B: torch.Tensor,
-    As: torch.Tensor | None = None,
-    Bs: torch.Tensor | None = None,
+    As: torch.Tensor | list[torch.Tensor] | None = None,
+    Bs: torch.Tensor | list[torch.Tensor] | None = None,
     *,
     expert_ids: torch.Tensor,
     epilogue: Epilogue | None = None,
     quantization: Quantization | None = None,
-    activation_scale: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
-    global_scale: torch.Tensor | None = None,
+    output_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Batched matmul dispatcher (W8A8 FP8, W4A8/W4A4 FP4, or full-precision). Routes one
     program per routed row (``expert_ids`` gives its expert).
 
     ``As`` marks ``A`` as already quantized (framework-precomputed scales, or a requantized
-    intermediate handed to the down projection); ``None`` = raw ``A``, quantized by the op per
-    ``quantization`` (see ``Quantization`` — recipe-default fp8/E4M3, offline for bd/tensor and
-    inline for MX, or packed E2M1 under ``input_recipe="mxfp4"``). ``Bs`` ``None`` =
+    intermediate handed to the down projection); a per-tensor scalar ``As`` is instead the static
+    (calibrated) activation scale for block-scale FP8 weights — the op quantizes raw ``A`` against
+    it; ``None`` = raw ``A``, quantized dynamically by the op per ``quantization`` (see
+    ``Quantization`` — recipe-default fp8/E4M3, offline for bd/tensor and inline for MX, or packed
+    E2M1 under ``input_recipe="mxfp4"``). ``Bs`` ``None`` =
     unquantized BF16/FP16 weights. ``quantization.output_recipe`` requantizes the output into
     the recipe's format — the return is then ``(C, Cs)``. ``epilogue`` is the fused output
-    transform (gate|up + GLU). ``gather_idx``/``scatter_idx`` (each None or a ``(S,)`` map)
+    transform (gate|up + GLU). ``As``/``Bs`` are each a bare block-scale tensor or — for
+    two-level NVFP4 (always the canonical form, ``nvfp4_quantize_two_level``) — a
+    ``[block, global]`` pair, where ``global`` is the fp32 per-tensor (weights: per-expert
+    ``(E,)``) second-level scale; the op folds ``g_a · g_b`` onto the accumulator. The
+    activation global ``g_a`` is CALIBRATED (the checkpoint's ``input_scale``):
+    ``As = [None, g_a]`` with a raw ``A`` has the op quantize ``A / g_a`` per block;
+    ``As = [block, g_a]`` is the matching pre-quantized form. Under NVFP4 ``output_recipe`` the
+    fused requant normalizes the GLU intermediate by the PROVIDED ``output_global_scale`` (the next
+    proj's calibrated ``input_scale``) before the block quant and returns ``[C, Cs]``; the down
+    consumes it as ``As = [Cs, output_global_scale]``. ``gather_idx``/``scatter_idx`` (each None or a ``(S,)`` map)
     address the source row of ``A`` / destination row of ``C`` per program — None means row
     ``s``; the gather lets the gate_up read unexpanded activations (source row
     ``s // num_top_k``) with no copy.
@@ -1381,16 +1399,22 @@ def matmul_batched(
     """
     ep = epilogue if epilogue is not None else Epilogue()
     q = quantization if quantization is not None else Quantization()
-    if activation_scale is not None:
-        # static (per-tensor calibrated) activation quant — a block-scale-weights-only path,
-        # like the 2D op; the caller hands a raw A (the op quantizes it against the scalar).
-        assert As is None, "static activation quant takes a raw A, not pre-quantized As"
+    # scales may arrive as [block, global] pairs (two-level NVFP4); split them apart.
+    # As=[None, g_a] is the canonical raw-A form: the op quantizes A/g_a per block.
+    As, a_global_scale = split_scale(As)
+    Bs, b_global_scale = split_scale(Bs)
+    assert (a_global_scale is None and b_global_scale is None) or (Bs is not None and is_mx(B, Bs)), (
+        "a [block, global] two-level scale pair is NVFP4-only (MX weights)"
+    )
+    if As is not None and As.numel() == 1:
+        # static (per-tensor calibrated) activation quant: a per-tensor scalar As for block-scale FP8
+        # weights — the caller hands raw A, the op quantizes it against the scalar (As IS the scale).
         assert Bs is not None and not is_mx(B, Bs) and weight_block_size(B, Bs) is not None, (
-            "activation_scale (static quant) needs block-scale FP8 weights"
+            "a per-tensor scalar As (static activation scale) needs block-scale FP8 weights"
         )
         out = w8a8_block_static_fp8_matmul_batched(
             A,
-            activation_scale,
+            As,
             B,
             Bs,
             expert_ids,
@@ -1429,7 +1453,9 @@ def matmul_batched(
             output_dtype,
             gather_idx,
             scatter_idx,
-            global_scale,
+            a_global_scale,
+            b_global_scale,
+            output_global_scale,
         )
     elif (block_size := weight_block_size(B, Bs)) is None:
         assert not ep.gate, "gate|up fusion is not supported for tensor-wide scales"

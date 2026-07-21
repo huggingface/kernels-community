@@ -47,6 +47,7 @@ from .utils import (
     is_mxfp8,
     is_mxfp4,
     is_nvfp4,
+    split_scale,
     _launch_act_quant,
     MX_SCALE_GROUP_K,
     NVFP4_SCALE_GROUP_K,
@@ -57,7 +58,10 @@ def _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale):
     """gate_up and down must share the recipe (both MX or both block-dynamic FP8 — the
     intermediate handed between them carries one quant format). Returns whether the recipe
     is MX (the fused dispatchers branch on it); the fp8 quantization block is derived from
-    the scale shapes (``weight_block_size``), never passed."""
+    the scale shapes (``weight_block_size``), never passed. Two-level NVFP4 scales arrive
+    as ``[block, global]`` pairs — the predicates read the block part."""
+    gate_up_proj_scale = split_scale(gate_up_proj_scale)[0]
+    down_proj_scale = split_scale(down_proj_scale)[0]
     gate_up_is_mx = is_mx(gate_up_proj, gate_up_proj_scale)
     if gate_up_is_mx != is_mx(down_proj, down_proj_scale):
         raise ValueError(
@@ -103,6 +107,8 @@ def _block_recipe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, 
     chain; unquantized BF16/FP16 weights carry no scales and stay ``None``, the
     full-precision path)."""
     _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale)
+    gate_up_proj_scale = split_scale(gate_up_proj_scale)[0]
+    down_proj_scale = split_scale(down_proj_scale)[0]
     if is_mxfp4(gate_up_proj, gate_up_proj_scale) != is_mxfp4(
         down_proj, down_proj_scale
     ):
@@ -350,6 +356,8 @@ def moe_torch_grouped(
       per-group blocked SWIZZLE_32_4_4 scales built by torchao's ``triton_mx_block_rearrange_*`` ops.
     - Our Triton MX act-quant (so torch is timed on the same fast quant), the shared host ``apply_glu``,
       and the shared ``_torch_weighted_reduce``. All three MX recipes."""
+    gate_up_proj_scale_inv, gate_up_global = split_scale(gate_up_proj_scale_inv)
+    down_proj_scale_inv, down_global = split_scale(down_proj_scale_inv)
     assert is_mx(gate_up_proj, gate_up_proj_scale_inv), (
         "torch grouped baseline is MX-only"
     )
@@ -380,12 +388,16 @@ def moe_torch_grouped(
     FP4 = getattr(torch, "float4_e2m1fn_x2", None)
     E = gate_up_proj.shape[0]
     # NVFP4's tcgen05 MMA kind requires TWO-level scaling: the e4m3 per-16 block scale AND a
-    # per-tensor global fp32 scale. Our nvfp4 quant folds everything into the block scale
-    # (single-level amax/6), so the global is identity 1.0 — feeds torch its required two-level
-    # form with bit-identical math. MX recipes are single-level (block e8m0 only).
+    # per-tensor global fp32 scale. Weight globals come off the [block, global] scale pairs
+    # (canonical two-level weights); activations are quantized here without a calibrated
+    # input_scale, so their global is identity 1.0. MX recipes are single-level (block e8m0).
     tensorwise = ScalingType.TensorWise
     global_a = torch.ones(1, device=hidden_states.device, dtype=torch.float32)
-    global_w = torch.ones(E, device=hidden_states.device, dtype=torch.float32)
+
+    def _expert_global(g):  # (E,) fp32 weight global, identity when single-level
+        if g is None:
+            return torch.ones(E, device=hidden_states.device, dtype=torch.float32)
+        return g.reshape(-1).expand(E).contiguous() if g.numel() == 1 else g.reshape(E)
     top_k = top_k_index.shape[1]
     out_dtype = hidden_states.dtype
 
@@ -413,14 +425,14 @@ def moe_torch_grouped(
             f_dtype
         )
 
-    def grouped_mm(a, w_q, w_s):
+    def grouped_mm(a, w_q, w_s, w_g=None):
         # our Triton MX act-quant (recipe-taking launcher) — torch is timed on the same fast quant
         aq, a_s = _launch_act_quant(a, act_recipe, scale_group, scale_dtype)
         sa, ra = aswz(a_s), BW
         sb, rb = wswz(w_s), BW
-        if nvfp4:  # two-level: block e4m3 + identity per-tensor global fp32
+        if nvfp4:  # two-level: block e4m3 + the weights' per-expert global (identity acts)
             sa, ra = [sa, global_a], [BW, tensorwise]
-            sb, rb = [sb, global_w], [BW, tensorwise]
+            sb, rb = [sb, _expert_global(w_g)], [BW, tensorwise]
         return F.scaled_grouped_mm(
             pk(aq),
             pk(w_q).transpose(-2, -1),
@@ -434,10 +446,12 @@ def moe_torch_grouped(
             output_dtype=out_dtype,
         )
 
-    gate_up = grouped_mm(hidden_states[tok], gate_up_proj, gate_up_proj_scale_inv)
+    gate_up = grouped_mm(
+        hidden_states[tok], gate_up_proj, gate_up_proj_scale_inv, gate_up_global
+    )
     gate, up = gate_up.chunk(2, dim=-1)
     inter = apply_glu(gate, up, act_fn, swiglu_alpha, swiglu_limit)
-    down_out = grouped_mm(inter, down_proj, down_proj_scale_inv)
+    down_out = grouped_mm(inter, down_proj, down_proj_scale_inv, down_global)
 
     # One weighted scatter-reduce: down_out is expert-sorted, so index_add_ over the source-token
     # map fuses unroute + routing-weight + top-k sum into (T, H) directly — no separate unsort pass.

@@ -55,6 +55,8 @@ from .utils import (
     warp_spec_compile_guard_pruner,
     is_mx,
     is_tensor_wide,
+    split_scale,
+    combine_global_scales,
     maybe_act_quant,
     MX_ACT_QUANT,
     mx_scale_family,
@@ -281,7 +283,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
 
     for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
         a, a_s = load_act(
-            "block_dynamic", a_ptrs, as_ptrs, None, as_mask, a_descriptor,
+            "block_dynamic", a_ptrs, as_ptrs, None, None, as_mask, a_descriptor,
             pid_m * BLOCK_SIZE_M, k * block_k, A_MEMORY_MODE, SWAP_AB=SWAP_AB,
         )
         b, b_s = load_weight(
@@ -395,7 +397,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     # Accumulate raw dot products, apply scales once after the loop.
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-        a, _as = load_act("tensor", a_ptrs, a_ptrs, None, None, a_ptrs, 0, 0, "pointer")
+        a, _as = load_act("tensor", a_ptrs, a_ptrs, None, None, None, a_ptrs, 0, 0, "pointer")
         b, _bs = load_weight(
             "tensor", b_ptrs, b_ptrs, None, b_ptrs, pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K,
             "pointer", False, GATE, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
@@ -544,7 +546,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
         a, _as = load_act(
-            "static", a_ptrs, a_ptrs, None, None, a_descriptor, pid_m * BLOCK_SIZE_M, k * block_k,
+            "static", a_ptrs, a_ptrs, None, None, None, a_descriptor, pid_m * BLOCK_SIZE_M, k * block_k,
             A_MEMORY_MODE, a_s_static=a_s_static,
         )
         b, b_s = load_weight(
@@ -648,7 +650,9 @@ def mx_dynamic_matmul_kernel(
     C,  # (M, N) output (the GLU intermediate under GATE)
     Cs,  # (M, N // group) row-major requant output scale — written iff OUTPUT_RECIPE and not SWIZZLED_OUT
     CSDescriptor,  # SWIZZLE_32_4_4 requant-scale descriptor — written iff SWIZZLED_OUT (dummy else), like AS/BS
-    GlobalScale,  # (1,) fp32 NVFP4 two-level per-tensor global (g_a·g_b); read iff not None
+    AsGlobal,  # (1,) fp32 NVFP4 activation global g_a — SOLELY normalizes the inline raw-A quant (A/g_a); read iff not None
+    AsBsGlobal,  # (1,) fp32 NVFP4 combined global g_a·g_b — recovers on the accumulator (one multiply); read iff not None
+    CsGlobal,  # (1,) fp32 NVFP4 output global (next proj's provided input_scale); normalizes the requant; read iff not None
     # Shape
     M,
     N,
@@ -727,7 +731,7 @@ def mx_dynamic_matmul_kernel(
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
         a, a_s = load_act(
-            "mx", a_ptrs, as_ptrs, None, as_mask, ADescriptor, pid_m * BLOCK_SIZE_M,
+            "mx", a_ptrs, as_ptrs, AsGlobal, None, as_mask, ADescriptor, pid_m * BLOCK_SIZE_M,
             k * (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE), A_MEMORY_MODE,
             as_descriptor=ASDescriptor, as_ptr=As, pid_m=pid_m, k=k, M=M, K=K,
             BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_K=BLOCK_SIZE_K, SCALE_GROUP_K=SCALE_GROUP_K,
@@ -756,11 +760,11 @@ def mx_dynamic_matmul_kernel(
             not SWIZZLED_SCALES, (not SWIZZLED_SCALES) and not GATE, False,
         )
 
-    # NVFP4 two-level: block e4m3 scales rode through dot_scaled; fold the per-tensor global
-    # (g_a·g_b, constant over K so exact to factor out) before GLU + requant. None ptr (no global)
-    # folds the arm out at trace time.
-    if GlobalScale is not None:
-        accumulator = accumulator * tl.load(GlobalScale).to(tl.float32)
+    # NVFP4 two-level: block e4m3 scales rode through dot_scaled; recover the combined per-tensor
+    # global g_a·g_b on the accumulator — one multiply (g_a alone is used only by the inline-quant
+    # arm). None folds out at trace time.
+    if AsBsGlobal is not None:
+        accumulator = accumulator * tl.load(AsBsGlobal).to(tl.float32)
 
     # one epilogue for both arms: GATE splits+SwiGLUs (+ optional requant), plain casts+stores.
     # affine output rows (swizzle's offs_am is %-wrapped — the store scatters to real rows);
@@ -772,6 +776,7 @@ def mx_dynamic_matmul_kernel(
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, OUTPUT_RECIPE, SCALE_GROUP_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
         COMPUTE_MODE=COMPUTE_MODE, N_COLS=N, SWIZZLED_OUT=SWIZZLED_OUT, CSDescriptor=CSDescriptor,
+        CsGlobal=CsGlobal,
     )
 
 
@@ -1161,6 +1166,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
 )
 def mx_dynamic_matmul(
     A: torch.Tensor,
+    As: torch.Tensor | None,
     B: torch.Tensor,
     Bs: torch.Tensor,
     output_dtype: torch.dtype | None = None,
@@ -1171,7 +1177,9 @@ def mx_dynamic_matmul(
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     output_recipe: str | None = None,
-    global_scale: torch.Tensor | None = None,
+    a_global_scale: torch.Tensor | None = None,
+    b_global_scale: torch.Tensor | None = None,
+    output_global_scale: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """MX/NVFP4 matmul ``C = A @ B.T``; activations quantized offline above the
     ``maybe_act_quant`` M threshold, inline below it. ``input_recipe`` sets the
@@ -1218,12 +1226,25 @@ def mx_dynamic_matmul(
     # kernel below it (fp4 packs in-register). The offline arm writes swizzled scales directly when
     # the weight is swizzled (fused, no post-quant pass), else affine. Inline acts (small M) stay
     # affine in-register even under a swizzled weight — the dot_scaled reads the mixed layout fine.
-    act_quant = (
-        (lambda a: MX_ACT_QUANT[input_recipe](a, swizzled=True))
-        if swizzled_scales
-        else MX_ACT_QUANT[input_recipe]
-    )
-    a_vals, as_scales = maybe_act_quant(A.view(M, K), act_quant, MX_MATMUL_ACT_PREQUANT_MIN_M)
+    # NVFP4 two-level: a_global_scale (the calibrated activation global) normalizes the quant on both
+    # arms — the offline kernel divides before the block quant, the inline arm via AsGlobal.
+    if a_global_scale is not None:
+        assert input_recipe == "nvfp4", "an activation global is NVFP4-only"
+        act_quant = lambda a: MX_ACT_QUANT[input_recipe](  # noqa: E731
+            a, swizzled=swizzled_scales, global_scale=a_global_scale
+        )
+    elif swizzled_scales:
+        act_quant = lambda a: MX_ACT_QUANT[input_recipe](a, swizzled=True)  # noqa: E731
+    else:
+        act_quant = MX_ACT_QUANT[input_recipe]
+    # NVFP4 accumulator correction: the g_a·g_b product folded onto the fp32 accumulator.
+    input_global_scale = combine_global_scales(a_global_scale, b_global_scale, 1)
+    # As given ⇒ A is already quantized (the routed-op parity: a pre-quantized activation + its
+    # scales); else quantize raw A (offline above the M threshold, inline in the kernel below it).
+    if As is not None:
+        a_vals, as_scales = A.view(M, K), As
+    else:
+        a_vals, as_scales = maybe_act_quant(A.view(M, K), act_quant, MX_MATMUL_ACT_PREQUANT_MIN_M)
     A_q = e2m1_as_uint8(a_vals)
     as_u8 = ue8m0_as_uint8(as_scales)
     # acts are swizzled only when the offline arm ran (A quantized) under a swizzled weight
@@ -1288,7 +1309,9 @@ def mx_dynamic_matmul(
             C,
             Cs,
             CSDescriptor,
-            global_scale,  # (1,) fp32 NVFP4 two-level global; None ⇒ no global (arm folds out)
+            a_global_scale,  # AsGlobal: g_a for the inline-quant arm (A/g_a)
+            input_global_scale,  # AsBsGlobal = g_a·g_b (acc)
+            output_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
             M,
             N,
             K,
@@ -1318,6 +1341,8 @@ def mx_dynamic_matmul(
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(resolve_output_dtype(output_dtype, A, None)),
         )
+    # NVFP4's block scales are already normalized by the provided output global (CsGlobal =
+    # output_global_scale) at requant, so the caller pairs cs_ret with that global as the down's As.
     return [C, cs_ret] if cs_ret is not None else [C]
 
 
@@ -1382,43 +1407,39 @@ def full_precision_matmul_2d(
 def matmul_2d(
     A: torch.Tensor,
     B: torch.Tensor,
-    Bs: torch.Tensor | None,
-    block_size: list[int] | None,
+    As: torch.Tensor | list[torch.Tensor] | None = None,
+    Bs: torch.Tensor | list[torch.Tensor] | None = None,
     *,
-    activation_scale: torch.Tensor | None = None,
     epilogue: Epilogue | None = None,
     quantization: Quantization | None = None,
     output_dtype: torch.dtype | None = None,
-    global_scale: torch.Tensor | None = None,
+    output_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | list[torch.Tensor]:
-    """Dense (2D) quantized matmul dispatcher (W8A8 FP8, W4A8 or W4A4 FP4) — the single-GEMM
-    sibling of ``matmul_grouped``/``matmul_batched``, taking the same ``Epilogue``/``Quantization``
-    bundles.
+    """Dense (2D) quantized matmul dispatcher (W8A8 FP8, W4A8/W4A4 FP4) — the single-GEMM sibling of
+    ``matmul_grouped``/``matmul_batched``, taking the same ``As``/``Bs`` scale spec,
+    ``Epilogue``/``Quantization`` bundles, and inferred quant block (no ``block_size`` argument — it
+    falls out of the weight-scale shape, so the data can't disagree with a parameter).
 
-    ``A`` is always raw bf16/fp16/fp32; quantization is fused into every path.
-    With ``activation_scale`` set, the kernel uses that per-tensor scalar
-    (static quant); otherwise it computes its own scale from ``A`` (dynamic).
+    ``As`` is the activation-scale spec, same as the routed ops: ``None`` → the op quantizes raw
+    ``A`` dynamically; a per-tensor scalar → static (calibrated) FP8 activation scale; block scales →
+    pre-quantized ``A``; ``[block, global]`` (or ``[None, global]`` for raw A) → two-level NVFP4, the
+    ``global`` being the calibrated ``input_scale`` ``g_a``. ``Bs`` is the weight scale: a block
+    tensor, or ``[block, global]`` for two-level NVFP4 (``global`` = ``weight_scale_2`` ``g_b``). The
+    NVFP4 globals are provided (calibrated), never computed — the op folds ``g_a·g_b`` onto the
+    accumulator. ``output_global_scale`` (NVFP4 ``output_recipe`` only) is the NEXT proj's provided
+    ``input_scale``: the fused requant normalizes the GLU intermediate by it, returning ``[C, Cs]``
+    the down-proj consumes as ``As = [Cs, output_global_scale]``.
 
-    ``output_dtype`` defaults to ``A.dtype``.
+    ``epilogue`` is the fused output transform (``Epilogue(gate=True)`` → the ``(2N, K)`` gate|up
+    stack + SwiGLU, returning the ``[..., N]`` GLU intermediate); ``quantization.input_recipe`` sets
+    the MX activation grid (``"mxfp8"``/``"mxfp4"``/nvfp4), ``quantization.output_recipe`` (MX weights
+    only) requantizes the GLU intermediate into ``[C, Cs]``. Returns the output tensor, or ``[C, Cs]``
+    under ``output_recipe``.
 
-    ``epilogue`` is the fused output transform: with ``Epilogue(gate=True)`` the weight is the
-    ``(2N, K)`` gate|up stack (gate rows [0,N), up [N,2N)) and the op fuses the gate|up projection
-    into one stacked GEMM + SwiGLU, returning the ``[..., N]`` GLU intermediate
-    (``act_fn``/``swiglu_alpha``/``swiglu_limit`` set the activation). ``quantization.input_recipe``
-    sets the activation grid on the MX path (``"mxfp8"`` default, ``"mxfp4"`` = W4A4; NVFP4 weights
-    pin ``"nvfp4"``); ``quantization.output_recipe`` (MX weights only) requantizes the GLU
-    intermediate into a ``[C, Cs]`` pair for a chained down-proj — the FP8 paths return it dense.
-
-    Returns the output tensor, or a ``[C, Cs]`` list when ``output_recipe`` requantizes.
-
-    Routes by weight dtype and ``block_size``:
-    - MX/NVFP4 weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
-      group-32 or E4M3 group-16 ``Bs`` (shape ``[N, K//group]``) → ``mx_dynamic_matmul``
-      (``block_size`` ignored, ``activation_scale`` unsupported; the group is autotuned-
-      around, fixed by the scale dtype).
-    - ``block_size`` None or full ``[N, K]`` → ``w8a8_tensor_dynamic_fp8_matmul``.
-    - otherwise → ``w8a8_block_dynamic_fp8_matmul`` (or its static variant when
-      ``activation_scale`` is given).
+    Routes by weight dtype + inferred block: ``Bs`` None → full-precision; MX/NVFP4 (int8/E4M3 weights
+    with UE8M0 group-32 or E4M3 group-16 ``Bs``) → ``mx_dynamic_matmul``; tensor-wide FP8 (scalar
+    ``Bs``) → ``w8a8_tensor_dynamic_fp8_matmul``; block FP8 → the static variant when ``As`` is a
+    per-tensor scalar, else dynamic.
     """
     gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused = (
         epilogue if epilogue is not None else Epilogue()
@@ -1426,12 +1447,15 @@ def matmul_2d(
     input_recipe, output_recipe = (
         quantization if quantization is not None else Quantization()
     ).as_args()
+    # scales may arrive as [block/None, global] pairs (two-level NVFP4); split them apart
+    As, a_global_scale = split_scale(As)
+    Bs, b_global_scale = split_scale(Bs)
 
     def _unwrap(ret: list[torch.Tensor]) -> torch.Tensor | list[torch.Tensor]:
         return ret[0] if len(ret) == 1 else ret
 
     if Bs is None:  # unquantized BF16/FP16 weights — plain dot, no scales
-        assert activation_scale is None and input_recipe is None and output_recipe is None, (
+        assert As is None and a_global_scale is None and input_recipe is None and output_recipe is None, (
             "the full-precision path (Bs=None) takes no activation scale or quantization recipe"
         )
         return _unwrap(
@@ -1441,18 +1465,16 @@ def matmul_2d(
         )
 
     if is_mx(B, Bs):
-        if activation_scale is not None:
-            raise NotImplementedError(
-                "activation_scale (static activation quant) is not supported for MX weights — "
-                "the MX path quantizes activations dynamically per group. Omit activation_scale."
-            )
         return _unwrap(
             mx_dynamic_matmul(
-                A, B, Bs, output_dtype, input_recipe,
+                A, As, B, Bs, output_dtype, input_recipe,
                 gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, output_recipe,
-                global_scale,
+                a_global_scale, b_global_scale, output_global_scale,
             )
         )
+    assert a_global_scale is None and b_global_scale is None and output_global_scale is None, (
+        "two-level globals ([block, global] pairs / output_global_scale) are NVFP4-only (MX weights)"
+    )
     # FP8 activations are always E4M3 with the weight-implied scale granularity, so "fp8" is a
     # no-op recipe name (accepted for symmetry with the MoE ops); no other name applies here.
     assert input_recipe in (None, "fp8"), (
@@ -1461,20 +1483,29 @@ def matmul_2d(
     assert output_recipe is None, (
         f"output_recipe (fused-requant gate|up output) is MX-only, got {output_recipe!r}"
     )
-
-    if is_tensor_wide(block_size, B):
+    # Infer the FP8 quant block from the weight-scale shape (scalar Bs = tensor-wide). The contraction
+    # dim K tiles evenly, so block_k is exact; N may be non-aligned (a partial last block, so
+    # N % Bs.shape[0] != 0 and plain division would under-count) — recover block_n from the even dim,
+    # the square-block convention for these FP8 weights.
+    if Bs.numel() == 1:
+        block_size = None
+    else:
+        block_k = B.shape[1] // Bs.shape[1]
+        block_n = B.shape[0] // Bs.shape[0] if B.shape[0] % Bs.shape[0] == 0 else block_k
+        block_size = [block_n, block_k]
+    if block_size is None:  # tensor-wide (per-tensor) scale
+        assert As is None, "tensor-wide FP8 quantizes A dynamically — no As"
         return _unwrap(
             w8a8_tensor_dynamic_fp8_matmul(
-                A, B, Bs, output_dtype,
-                gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused,
+                A, B, Bs, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused
             )
         )
-
-    # Block-wise FP8: static when a per-tensor activation scale is supplied, else dynamic.
-    if activation_scale is not None:
+    # Block-wise FP8: a per-tensor scalar As is the static (calibrated) activation scale; else dynamic.
+    if As is not None:
+        assert As.numel() == 1, "block-wise FP8 As is a per-tensor static scale (scalar)"
         return _unwrap(
             w8a8_block_static_fp8_matmul(
-                A, B, Bs, activation_scale, block_size, output_dtype,
+                A, B, Bs, As, block_size, output_dtype,
                 gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused,
             )
         )

@@ -36,6 +36,7 @@ from .utils import (
     build_tile_layout,
     resolve_grouped_tile,
     block_within_dim_pruner,
+    require_moe_dims_aligned,
     compose_pruners,
     device_context,
     sm_count,
@@ -61,6 +62,8 @@ from .utils import (
     affine_scale_warp_spec_pruner,
     smem_pruner,
     is_mx,
+    combine_global_scales,
+    split_scale,
     weight_block_size,
     e2m1_as_uint8,
     ue8m0_as_uint8,
@@ -291,7 +294,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
             a, a_s = load_act(
-                "block_dynamic", a_ptrs, as_ptrs, row_mask, row_mask, ADescriptor,
+                "block_dynamic", a_ptrs, as_ptrs, None, row_mask, row_mask, ADescriptor,
                 m_start, k * BLOCK_SIZE_K, A_MEMORY_MODE, GatherIdx is not None,
                 GROUPED=True, gather_rows=in_row, k=k,
             )
@@ -455,7 +458,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
             a, a_dead = load_act(
-                "static", a_ptrs, a_ptrs, row_mask, row_mask, ADescriptor,
+                "static", a_ptrs, a_ptrs, None, row_mask, row_mask, ADescriptor,
                 m_start, k * BLOCK_SIZE_K, A_MEMORY_MODE, GatherIdx is not None,
                 GROUPED=True, gather_rows=in_row,
             )
@@ -630,7 +633,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
             a, _as = load_act(
-                "tensor", a_ptrs, As, row_mask, row_mask, ADescriptor,
+                "tensor", a_ptrs, As, None, row_mask, row_mask, ADescriptor,
                 m_start, k * BLOCK_SIZE_K, A_MEMORY_MODE, GatherIdx is not None,
                 GROUPED=True, gather_rows=in_row,
             )
@@ -718,7 +721,8 @@ def mx_dynamic_matmul_grouped_kernel(
     C,  # (S, N[/2]) output; under an OUTPUT_RECIPE the MX-requantized intermediate
     Cs,  # (S, N // SCALE_GROUP_K) row-major output scale; written iff OUTPUT_RECIPE and not SWIZZLED_OUT
     CSDescriptor,  # SWIZZLE_32_4_4 output-scale descriptor; written iff SWIZZLED_OUT (dummy else), like AS/BS
-    GlobalScale,  # (num_experts,) fp32 NVFP4 two-level per-tensor global (g_a·g_b); read iff not None
+    AsBsGlobal,  # (num_experts,) fp32 NVFP4 combined global g_a·g_b — recovers on the accumulator (grouped A is pre-quantized by the wrapper, so no in-kernel g_a); read iff not None
+    CsGlobal,  # (1,) fp32 NVFP4 output global (next proj's provided input_scale); normalizes the requant; read iff not None
     GatherIdx,  # (S,) int32 — sorted position -> source row of A; read only when not None
     ScatterIdx,  # (S,) int32 — sorted position -> destination row of C; read only when not None
     ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 — cumulative row starts, S sentinel
@@ -838,7 +842,7 @@ def mx_dynamic_matmul_grouped_kernel(
         weight_blk = (expert_id64 * num_n_tiles + pid_n).to(tl.int32)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
             a, a_s = load_act(
-                "mx", a_ptrs, As, row_mask, row_mask, ADescriptor, m_start, ka_off,
+                "mx", a_ptrs, As, None, row_mask, row_mask, ADescriptor, m_start, ka_off,
                 A_MEMORY_MODE, GatherIdx is not None, GROUPED=True,
                 as_descriptor=ASDescriptor, as_ptr=As, gather_rows=in_row, stride_as_m=stride_as_m,
                 pid_m=pid_m, k=k, M=0, K=K, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_K=BLOCK_SIZE_K,
@@ -862,11 +866,10 @@ def mx_dynamic_matmul_grouped_kernel(
             b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
             kb_off += BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
 
-        # NVFP4 two-level: the block e4m3 scales rode through dot_scaled; fold the per-expert
-        # global (g_a·g_b, constant over K so exact to factor out) before GLU + requant. None ptr
-        # (no global) folds the arm out at trace time, like GatherIdx/ScatterIdx.
-        if GlobalScale is not None:
-            acc = acc * tl.load(GlobalScale + expert_id64).to(tl.float32)
+        # NVFP4 two-level: block e4m3 scales rode through dot_scaled; recover the combined per-tensor
+        # global g_a·g_b on the accumulator — one multiply. None folds out at trace time.
+        if AsBsGlobal is not None:
+            acc = acc * tl.load(AsBsGlobal + expert_id64).to(tl.float32)
 
         gemm_epilogue(
             C,
@@ -892,6 +895,7 @@ def mx_dynamic_matmul_grouped_kernel(
             INTERMEDIATE_DTYPE,
             SWIZZLED_OUT=SWIZZLED_OUT,  # single source: the wrapper decided it and built Cs to match
             CSDescriptor=CSDescriptor,
+            CsGlobal=CsGlobal,
         )
 
 
@@ -1012,7 +1016,7 @@ def full_precision_matmul_grouped_kernel(
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
             a, _as = load_act(
-                "full_precision", a_ptrs, A, row_mask, row_mask, ADescriptor,
+                "full_precision", a_ptrs, A, None, row_mask, row_mask, ADescriptor,
                 m_start, k * BLOCK_SIZE_K, A_MEMORY_MODE, GatherIdx is not None,
                 GROUPED=True, gather_rows=in_row,
             )
@@ -1106,9 +1110,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
         f"block_size must be [block_n, block_k], got {block_size}"
     )
     block_n, block_k = block_size[0], block_size[1]
-    # MoE expert dimensions must be block-aligned; non-aligned N/K is not supported.
-    assert N % block_n == 0, f"N ({N}) must be divisible by block_n ({block_n})"
-    assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
+    require_moe_dims_aligned(N, K, block_n, block_k)
     assert Bs.shape == (num_experts, n_rows // block_n, K // block_k), (
         f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, {n_rows // block_n}, {K // block_k})"
     )
@@ -1245,8 +1247,7 @@ def w8a8_block_static_fp8_matmul_grouped(
         f"block_size must be [block_n, block_k], got {block_size}"
     )
     block_n, block_k = block_size[0], block_size[1]
-    assert N % block_n == 0, f"N ({N}) must be divisible by block_n ({block_n})"
-    assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
+    require_moe_dims_aligned(N, K, block_n, block_k)
     assert Bs.shape == (num_experts, n_rows // block_n, K // block_k), (
         f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, {n_rows // block_n}, {K // block_k})"
     )
@@ -1455,7 +1456,9 @@ def mx_dynamic_matmul_grouped(
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
-    global_scale: torch.Tensor | None = None,
+    a_global_scale: torch.Tensor | None = None,
+    b_global_scale: torch.Tensor | None = None,
+    output_global_scale: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Grouped MX matmul over expert-sorted positions (per-tile gather/scatter, the
     sort is virtual — see ``compute_grouped_scheduling`` for the maps). Activations arrive
@@ -1507,7 +1510,11 @@ def mx_dynamic_matmul_grouped(
     # SWIZZLE_32_4_4 scales — the tcgen05 scaled-MMA fast path — for the whole grouped MX
     # kernel (down projection, gate_up, and plain grouped GEMM alike). BM is pinned to 128, and
     # BN to 128 under GATE (swizzled_scales_bm_pruner), matching the 128-padded scale layouts.
-    assert N % 128 == 0, f"the grouped MX path needs N ({N}) a multiple of 128"
+    if N % 128 != 0:
+        raise ValueError(
+            f"the routed MX MoE path needs N ({N}) a multiple of 128 (its scales tile in 128-row "
+            f"blocks); non-aligned N is supported only by the dense matmul_2d op."
+        )
     scale_dtype = ue8m0_as_uint8(Bs).dtype  # UE8M0 -> uint8, NVFP4 -> e4m3 (binder-safe)
     # Activation scales track the weight layout (SWIZZLED_SCALES, one flag): swizzled weight ->
     # swizzled acts (the tcgen05 fast path); un-swizzled weight -> affine acts (no gain swizzling
@@ -1521,10 +1528,15 @@ def mx_dynamic_matmul_grouped(
         assert (As.dtype == torch.float8_e4m3fn) == (Bs.dtype == torch.float8_e4m3fn), (
             f"activation scales ({As.dtype}) must match the weight scale family ({Bs.dtype})"
         )
+    # g_a normalizes the act quant here in the wrapper (the raw-A arm below, or applied offline for a
+    # pre-quantized As); the kernel only ever sees the combined g_a·g_b via AsBsGlobal (grouped A is
+    # pre-quantized, so there's no in-kernel inline-quant that would need g_a alone).
+    if a_global_scale is not None:
+        assert input_recipe == "nvfp4", "an activation global is NVFP4-only"
     if swizzled_scales:
         if As is None:
             a_vals, act_scales, n_m_tiles = mx_act_quant_swizzled_grouped(
-                A, input_recipe, scale_group, scale_dtype, gather_idx, expert_start
+                A, input_recipe, scale_group, scale_dtype, gather_idx, expert_start, a_global_scale
             )
         elif As.ndim == 5:  # pre-swizzled by the gate_up requant epilogue (fused down) — read as is
             a_vals, act_scales, n_m_tiles = A, As, As.shape[1]
@@ -1537,7 +1549,14 @@ def mx_dynamic_matmul_grouped(
         assert As is None or As.ndim != 5, (
             "un-swizzled weights pair with affine (row-major) activation scales, got 5D As"
         )
-        a_vals, act_scales = MX_ACT_QUANT[input_recipe](A) if As is None else (A, As)
+        if As is None:
+            a_vals, act_scales = (
+                MX_ACT_QUANT[input_recipe](A, global_scale=a_global_scale)
+                if a_global_scale is not None
+                else MX_ACT_QUANT[input_recipe](A)
+            )
+        else:
+            a_vals, act_scales = A, As
         n_rows = gather_idx.numel() if gather_idx is not None else A.shape[0]
         n_m_tiles = n_rows // 128 + num_experts
     # uint8 aliases for the binder — never clobber the caller's A/B/Bs dtype/view. Each operand's
@@ -1583,6 +1602,9 @@ def mx_dynamic_matmul_grouped(
     else:
         cs_ret, Cs, CSDescriptor = None, None, None  # unread (no OUTPUT_RECIPE)
     num_sms = sm_count(A.device.index)
+    # NVFP4 accumulator correction: the per-expert g_a·g_b product folded onto the fp32 accumulator
+    # (grouped A is pre-quantized, so the kernel needs only this product, never g_a alone).
+    input_global_scale = combine_global_scales(a_global_scale, b_global_scale, B.shape[0])
     # host TMA descriptor over the (2E|E, N, K_bytes) view — one box holds both gate|up
     # projections; the placeholder box is re-bound per tuned config by the pre_hook
     rows0 = 2 * num_experts if gate else num_experts
@@ -1605,7 +1627,8 @@ def mx_dynamic_matmul_grouped(
             C,
             Cs,
             CSDescriptor,
-            global_scale,  # (num_experts,) fp32 NVFP4 two-level global; None ⇒ no global (arm folds out)
+            input_global_scale,  # AsBsGlobal = g_a·g_b (acc); grouped A pre-quantized so no in-kernel g_a
+            output_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
             expert_start,
@@ -1734,17 +1757,16 @@ def full_precision_matmul_grouped(
 def matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
-    As: torch.Tensor | None = None,
-    Bs: torch.Tensor | None = None,
+    As: torch.Tensor | list[torch.Tensor] | None = None,
+    Bs: torch.Tensor | list[torch.Tensor] | None = None,
     *,
     expert_start: torch.Tensor,
     epilogue: Epilogue | None = None,
     quantization: Quantization | None = None,
-    activation_scale: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
-    global_scale: torch.Tensor | None = None,
+    output_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Grouped matmul dispatcher (W8A8 FP8, W4A8/W4A4 FP4, or full-precision).
     ``expert_start`` is the ``(E+1,)`` tiling schedule from one ``compute_grouped_scheduling``
@@ -1752,11 +1774,22 @@ def matmul_grouped(
     physically permuted).
 
     ``As`` marks ``A`` as already quantized (framework-precomputed scales, or a requantized
-    intermediate handed to the down projection); ``None`` = raw ``A``, quantized by the op per
-    ``quantization`` (see ``Quantization`` — recipe-default fp8/E4M3, or packed E2M1 under
-    ``input_recipe="mxfp4"``). ``Bs`` ``None`` = unquantized BF16/FP16 weights.
+    intermediate handed to the down projection); a per-tensor scalar ``As`` is instead the static
+    (calibrated) activation scale for block-scale FP8 weights — the op quantizes raw ``A`` against
+    it; ``None`` = raw ``A``, quantized dynamically by the op per ``quantization`` (see
+    ``Quantization`` — recipe-default fp8/E4M3, or packed E2M1 under ``input_recipe="mxfp4"``).
+    ``Bs`` ``None`` = unquantized BF16/FP16 weights.
     ``quantization.output_recipe`` requantizes the output into the recipe's format — the
     return is then ``(C, Cs)``. ``epilogue`` is the fused output transform (gate|up + GLU).
+    ``As``/``Bs`` are each a bare block-scale tensor or — for two-level NVFP4 (always the
+    canonical form, ``nvfp4_quantize_two_level``) — a ``[block, global]`` pair, where ``global``
+    is the fp32 per-tensor (weights: per-expert ``(E,)``) second-level scale; the op folds
+    ``g_a · g_b`` onto the accumulator. The activation global ``g_a`` is CALIBRATED (the
+    checkpoint's ``input_scale``): ``As = [None, g_a]`` with a raw ``A`` has the op quantize
+    ``A / g_a`` per block; ``As = [block, g_a]`` is the matching pre-quantized form. Under NVFP4
+    ``output_recipe`` the fused requant normalizes the GLU intermediate by the PROVIDED
+    ``output_global_scale`` (the next proj's calibrated ``input_scale``) before the block quant and
+    returns ``[C, Cs]``; the down consumes it as ``As = [Cs, output_global_scale]``.
     Row order is carried by the standalone maps: ``gather_idx`` gathers ``A`` (``None`` ->
     already expert-ordered), ``scatter_idx`` scatters the output. The fused MoE chain is one
     scheduling pass: gate_up with ``scatter_idx=None`` + ``Epilogue(gate=True)`` +
@@ -1776,16 +1809,22 @@ def matmul_grouped(
     """
     ep = epilogue if epilogue is not None else Epilogue()
     q = quantization if quantization is not None else Quantization()
-    if activation_scale is not None:
-        # static (per-tensor calibrated) activation quant — a block-scale-weights-only path,
-        # like the 2D op; the caller hands a raw A (the op quantizes it against the scalar).
-        assert As is None, "static activation quant takes a raw A, not pre-quantized As"
+    # scales may arrive as [block, global] pairs (two-level NVFP4); split them apart.
+    # As=[None, g_a] is the canonical raw-A form: the op quantizes A/g_a per block.
+    As, a_global_scale = split_scale(As)
+    Bs, b_global_scale = split_scale(Bs)
+    assert (a_global_scale is None and b_global_scale is None) or (Bs is not None and is_mx(B, Bs)), (
+        "a [block, global] two-level scale pair is NVFP4-only (MX weights)"
+    )
+    if As is not None and As.numel() == 1:
+        # static (per-tensor calibrated) activation quant: a per-tensor scalar As for block-scale FP8
+        # weights — the caller hands raw A, the op quantizes it against the scalar (As IS the scale).
         assert Bs is not None and not is_mx(B, Bs) and weight_block_size(B, Bs) is not None, (
-            "activation_scale (static quant) needs block-scale FP8 weights"
+            "a per-tensor scalar As (static activation scale) needs block-scale FP8 weights"
         )
         out = w8a8_block_static_fp8_matmul_grouped(
             A,
-            activation_scale,
+            As,
             B,
             Bs,
             expert_start,
@@ -1824,7 +1863,9 @@ def matmul_grouped(
             output_dtype,
             gather_idx,
             scatter_idx,
-            global_scale,
+            a_global_scale,
+            b_global_scale,
+            output_global_scale,
         )
     elif (block_size := weight_block_size(B, Bs)) is None:
         out = w8a8_tensor_dynamic_fp8_matmul_grouped(
