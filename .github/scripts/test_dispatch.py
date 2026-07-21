@@ -1,5 +1,6 @@
 import io
 import os
+import subprocess
 import sys
 import urllib.error
 from unittest import mock
@@ -65,6 +66,31 @@ def test_security_only_plans_only_security():
         assert action.dispatch_key.startswith("pr42-security-")
         assert action.body["inputs"]["pr_number"] == "42"
         assert action.body["inputs"]["head_sha"] == "deadbeef"
+
+
+# Metadata read from a git ref (PR branch) instead of the working tree.
+class MetadataRefTest(unittest.TestCase):
+    def test_read_backends_from_ref_uses_git_show(self):
+        run = mock.Mock(return_value=mock.Mock(stdout='backends = ["cuda", "rocm"]\n'))
+        with mock.patch.object(dispatch.subprocess, "run", run):
+            backends = dispatch.read_backends("somekernel", ref="abc123")
+        self.assertEqual(backends, ["cuda", "rocm"])
+        self.assertEqual(
+            run.call_args.args[0], ["git", "show", "abc123:somekernel/build.toml"]
+        )
+
+    def test_read_backends_from_ref_missing_returns_none(self):
+        err = subprocess.CalledProcessError(128, ["git", "show"])
+        with mock.patch.object(dispatch.subprocess, "run", side_effect=err):
+            self.assertIsNone(dispatch.read_backends("missing", ref="abc123"))
+
+    def test_metadata_ref_routes_metal_less_kernel_without_mac_build(self):
+        # Regression: a cuda-only kernel read from the ref must not trigger build-mac.yaml.
+        run = mock.Mock(return_value=mock.Mock(stdout='backends = ["cuda"]\n'))
+        with mock.patch.object(dispatch.subprocess, "run", run):
+            plan = dispatch.plan_dispatch("newkernel", metadata_ref="prsha")
+        builds = _workflows([a for a in plan.actions if a.kind == "build"])
+        self.assertEqual(builds, ["build.yaml"])
 
 
 # Orchestration: kernel-name validation and the dry-run no-I/O contract.
