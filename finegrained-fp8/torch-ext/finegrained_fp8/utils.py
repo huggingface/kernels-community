@@ -401,10 +401,9 @@ def is_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
 
 def is_nvfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     """NVFP4 weight/scale pair: packed E2M1 weights (``int8``, two codes/byte) with E4M3
-    group-16 scales — the scale DTYPE is the recipe carrier (UE8M0 = MX, E4M3 = NV), and
-    the group falls out of the shape. The per-tensor second-level global rides the scale
-    argument as a ``[block, global]`` pair (``split_scale``); this predicate takes the
-    block part."""
+    group-16 block scales — the scale DTYPE is the recipe carrier (UE8M0 = MX, E4M3 = NV), and
+    the group falls out of the shape. This predicate reads the block scale; the per-tensor
+    second-level global is a separate ``b_global_scale`` argument (``nvfp4_quantize_two_level``)."""
     return (
         weight.dtype == torch.int8
         and scale.dtype == torch.float8_e4m3fn
@@ -412,35 +411,22 @@ def is_nvfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     )
 
 
-def split_scale(
-    scale,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """Normalize a scale argument into ``(block, global)``. The public ops accept either a
-    bare block-scale tensor (single-level recipes) or a two-element ``[block, global]``
-    list/tuple — the canonical NVFP4 two-level form, where ``global`` is the fp32 per-tensor
-    (or per-expert, ``(E,)``) second-level scale multiplied onto the accumulator. A bare
-    tensor means no global (``None``); NVFP4 weights are always two-level
-    (``nvfp4_quantize_two_level``), so their ``Bs`` always arrives as the pair."""
-    if isinstance(scale, (list, tuple)):
-        block, glob = scale
-        assert glob is None or (
-            isinstance(glob, torch.Tensor) and glob.dtype == torch.float32
-        ), f"the second-level global scale must be an fp32 tensor, got {type(glob)}"
-        return block, (glob.reshape(-1) if glob is not None else None)
-    return scale, None
-
-
 def combine_global_scales(
-    global_a: torch.Tensor | None, global_b: torch.Tensor | None, num_experts: int
+    a_global_scale: torch.Tensor | None, b_global_scale: torch.Tensor | None, num_experts: int
 ) -> torch.Tensor | None:
-    """The single ``GlobalScale = g_a · g_b`` the MX kernels multiply onto the accumulator, broadcast
-    to ``(num_experts,)`` (grouped/batched index it per expert; the 2D op passes ``num_experts=1``
-    and reads it unindexed). Only the product matters for the acc — ``g_a`` alone is passed
-    separately for the inline-quant arm. Both operands' globals are calibrated/provided, never
-    computed here; this just multiplies them. ``None`` if neither operand has a global."""
-    if global_a is None and global_b is None:
+    """The g_a · g_b product the MX kernels fold onto the accumulator (``AsBsGlobal`` at the kernel,
+    ``input_global_scale`` at the wrapper), broadcast to ``(num_experts,)`` (grouped/batched index it
+    per expert; the 2D op passes ``num_experts=1`` and reads it unindexed). Only the product matters
+    for the acc — ``a_global_scale`` alone is passed separately for the inline-quant arm. Both
+    operands' globals are calibrated/provided, never computed here; this just multiplies them.
+    ``None`` if neither operand has a global."""
+    if a_global_scale is None and b_global_scale is None:
         return None
-    glob = global_b if global_a is None else global_a if global_b is None else global_a * global_b
+    glob = (
+        b_global_scale if a_global_scale is None
+        else a_global_scale if b_global_scale is None
+        else a_global_scale * b_global_scale
+    )
     if glob.numel() == 1 and num_experts > 1:
         glob = glob.expand(num_experts)
     assert glob.numel() == num_experts, (
@@ -1093,6 +1079,21 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None):
         # the tuner would happily time and pick (surfaced as a 35% MXFP4 fused-MoE error).
         if c.kwargs["BLOCK_SIZE_K"] >= args[k_arg]:
             return False
+        # tcgen05 microscaled-fp4 MMA silently no-ops at the GATE stacked N=2*BN=64 shape (BN<64):
+        # the IR emits a correct tc_gen5_mma_scaled (128x64 acc, 64x2 scale) but it never writes the
+        # accumulator, which reads back its zero-init → EXACTLY-ZERO output. N-independent (probed
+        # zero at both non-aligned N=320 and aligned N=512; BN=64 / stacked N=128 is correct
+        # everywhere), so this is a LATENT poison config: any packed-fp4 gate|up whose tuner crowned
+        # BN=32 (favoured at small N) would silently return zeros — larger shapes pass only because
+        # BN>=64 wins. Same class as the gates above. (BN=32 is recoverable only by emitting gate/up
+        # as two separate BN dots instead of one stacked 2*BN dot; not worth it — a sub-64 gated tile
+        # rarely wins over BN=64.)
+        if (
+            args.get("GATE")
+            and c.kwargs["BLOCK_SIZE_N"] < 64
+            and getattr(args.get("B"), "dtype", None) == torch.uint8
+        ):
+            return False
         # stacked 2*BN extent under the GATE constexpr (the kernels serve plain and gate|up)
         rows = (2 if args.get("GATE") else 1) * c.kwargs["BLOCK_SIZE_N"]
         return (
@@ -1150,7 +1151,9 @@ def swizzled_scales_bm_pruner():
     def ok(c, args):
         if config_dim(c, args, "BLOCK_SIZE_M") != 128:
             return False
-        return not args.get("GATE") or config_dim(c, args, "BLOCK_SIZE_N") == 128
+        if args.get("GATE") and args.get("SWIZZLED_SCALES"):
+            return config_dim(c, args, "BLOCK_SIZE_N") == 128
+        return True
 
     return config_filter(ok)
 
@@ -3967,10 +3970,11 @@ def nvfp4_act_quant(
 
 def nvfp4_quantize_two_level(
     weight: torch.Tensor, swizzled: bool = False
-) -> tuple[torch.Tensor, list[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Canonical two-level NVFP4 quant of a ``(N, K)`` (or ``(K,)``-last) tensor. Returns
-    ``(packed_e2m1 int8, [e4m3 group-16 block scales, fp32 per-tensor global])`` — the scale
-    is the two-level ``[block, global]`` pair the matmul ops take as ``Bs`` directly.
+    ``(packed_e2m1 int8, e4m3 group-16 block scales, fp32 per-tensor global)`` — the block scale
+    is the op's ``Bs`` and the global its ``b_global_scale`` (the decoupled API keeps the two levels
+    as separate arguments).
 
     The second level is a per-tensor fp32 global = ``amax / (6 · 448)`` — the smallest global that
     keeps every e4m3 block scale in range (block ``amax/6`` after dividing by the global stays
@@ -3980,7 +3984,7 @@ def nvfp4_quantize_two_level(
     usual (activations are single-level ⇒ ``g_a = 1``)."""
     global_scale = (weight.abs().amax() / (6.0 * 448.0)).clamp(min=1e-30).float()
     packed, block = nvfp4_act_quant((weight / global_scale).contiguous(), swizzled)
-    return packed.view(torch.int8), [block, global_scale.reshape(1)]
+    return packed.view(torch.int8), block, global_scale.reshape(1)
 
 
 # offline act-quant pass per recipe (keys = ``resolve_input_recipe`` results)

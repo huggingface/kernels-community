@@ -129,15 +129,16 @@ MOE_PROBLEMS = [
 
 
 def _make_moe_weights(problem: MoEProblem):
-    """gate_up ``(E, 2I, H)`` and down ``(E, H, I)`` weights + inv-scales for the recipe."""
+    """gate_up ``(E, 2I, H)`` and down ``(E, H, I)`` weights + block inv-scales + per-tensor globals
+    (``None`` for single-level recipes) for the recipe."""
     make = WEIGHTS[problem.weights]["make"]
-    gate_up, gate_up_s = make(
+    gate_up, gate_up_s, gate_up_g = make(
         2 * problem.intermediate_dim, problem.hidden_dim, problem.num_experts
     )
-    down, down_s = make(
+    down, down_s, down_g = make(
         problem.hidden_dim, problem.intermediate_dim, problem.num_experts
     )
-    return gate_up, gate_up_s, down, down_s
+    return gate_up, gate_up_s, gate_up_g, down, down_s, down_g
 
 
 def _make_moe_inputs(problem: MoEProblem):
@@ -175,9 +176,13 @@ def _assert_fused_correctness(out, ref, problem: MoEProblem):
 
 def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
     torch.manual_seed(0)
-    gate_up, gate_up_s, down, down_s = _make_moe_weights(problem)
+    gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
+    # The decoupled API takes pure block scales + the per-tensor globals as separate args (nvfp4
+    # weights are two-level; other recipes have a bare block scale + None global).
     common = dict(
+        gate_up_proj_global_scale=gate_up_g,
+        down_proj_global_scale=down_g,
         act_fn=problem.act_fn,
         swiglu_alpha=problem.swiglu_alpha,
         swiglu_limit=problem.swiglu_limit,
@@ -240,9 +245,10 @@ def test_fused_batched_compiles_across_shapes():
         ),
     ):
         torch.manual_seed(0)
-        gate_up, gate_up_s, down, down_s = _make_moe_weights(problem)
+        gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
         hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
         out = compiled(
-            hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s
+            hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s,
+            gate_up_proj_global_scale=gate_up_g, down_proj_global_scale=down_g,
         )
         assert torch.isfinite(out.float()).all(), problem.id

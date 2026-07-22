@@ -47,7 +47,6 @@ from .utils import (
     is_mxfp8,
     is_mxfp4,
     is_nvfp4,
-    split_scale,
     _launch_act_quant,
     MX_SCALE_GROUP_K,
     NVFP4_SCALE_GROUP_K,
@@ -58,10 +57,9 @@ def _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale):
     """gate_up and down must share the recipe (both MX or both block-dynamic FP8 — the
     intermediate handed between them carries one quant format). Returns whether the recipe
     is MX (the fused dispatchers branch on it); the fp8 quantization block is derived from
-    the scale shapes (``weight_block_size``), never passed. Two-level NVFP4 scales arrive
-    as ``[block, global]`` pairs — the predicates read the block part."""
-    gate_up_proj_scale = split_scale(gate_up_proj_scale)[0]
-    down_proj_scale = split_scale(down_proj_scale)[0]
+    the scale shapes (``weight_block_size``), never passed. Scales are the pure block scales
+    (per the decoupled API — per-tensor globals ride as separate ``*_global_scale`` args);
+    the recipe predicates read the block scale's dtype/grouping."""
     gate_up_is_mx = is_mx(gate_up_proj, gate_up_proj_scale)
     if gate_up_is_mx != is_mx(down_proj, down_proj_scale):
         raise ValueError(
@@ -107,8 +105,6 @@ def _block_recipe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, 
     chain; unquantized BF16/FP16 weights carry no scales and stay ``None``, the
     full-precision path)."""
     _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale)
-    gate_up_proj_scale = split_scale(gate_up_proj_scale)[0]
-    down_proj_scale = split_scale(down_proj_scale)[0]
     if is_mxfp4(gate_up_proj, gate_up_proj_scale) != is_mxfp4(
         down_proj, down_proj_scale
     ):
@@ -134,6 +130,8 @@ def moe_fused_grouped(
     down_proj: torch.Tensor,  # (E, H, I)
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
+    gate_up_proj_global_scale: torch.Tensor | None = None,
+    down_proj_global_scale: torch.Tensor | None = None,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -166,6 +164,7 @@ def moe_fused_grouped(
         hidden_states,
         gate_up_proj,
         Bs=gate_up_proj_scale_inv,
+        b_global_scale=gate_up_proj_global_scale,
         expert_start=expert_start,
         epilogue=Epilogue(
             gate=True,
@@ -188,6 +187,7 @@ def moe_fused_grouped(
         down_proj,
         As=inter_scale,
         Bs=down_proj_scale_inv,
+        b_global_scale=down_proj_global_scale,
         expert_start=expert_start,
         output_dtype=hidden_states.dtype,
         scatter_idx=scatter_idx,
@@ -209,6 +209,8 @@ def moe_fused_batched(
     down_proj: torch.Tensor,  # (E, H, I)
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
+    gate_up_proj_global_scale: torch.Tensor | None = None,
+    down_proj_global_scale: torch.Tensor | None = None,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -240,6 +242,7 @@ def moe_fused_batched(
         hidden_states,
         gate_up_proj,
         Bs=gate_up_proj_scale_inv,
+        b_global_scale=gate_up_proj_global_scale,
         expert_ids=expert_ids,
         epilogue=Epilogue(
             gate=True,
@@ -262,6 +265,7 @@ def moe_fused_batched(
         down_proj,
         As=inter_scale,
         Bs=down_proj_scale_inv,
+        b_global_scale=down_proj_global_scale,
         expert_ids=expert_ids,
         output_dtype=hidden_states.dtype,
     )
@@ -285,6 +289,8 @@ def moe_unfused_grouped(
     down_proj: torch.Tensor,
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
+    gate_up_proj_global_scale: torch.Tensor | None = None,
+    down_proj_global_scale: torch.Tensor | None = None,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -311,6 +317,7 @@ def moe_unfused_grouped(
         hidden_states,
         gate_up_proj,
         Bs=gate_up_proj_scale_inv,
+        b_global_scale=gate_up_proj_global_scale,
         expert_start=expert_start,
         quantization=Quantization(input_recipe=recipe),
         output_dtype=hidden_states.dtype,
@@ -324,6 +331,7 @@ def moe_unfused_grouped(
         inter,
         down_proj,
         Bs=down_proj_scale_inv,
+        b_global_scale=down_proj_global_scale,
         expert_start=expert_start,
         quantization=Quantization(input_recipe=recipe),
         output_dtype=hidden_states.dtype,
@@ -340,6 +348,8 @@ def moe_torch_grouped(
     down_proj: torch.Tensor,  # (E, H, I) E4M3
     gate_up_proj_scale_inv: torch.Tensor,  # (E, 2I, H//G) row-major, or pre-swizzled 5D SWIZZLE_32_4_4
     down_proj_scale_inv: torch.Tensor,  # (E, H, I//G) row-major, or pre-swizzled 5D
+    gate_up_proj_global_scale: torch.Tensor | None = None,
+    down_proj_global_scale: torch.Tensor | None = None,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -356,8 +366,6 @@ def moe_torch_grouped(
       per-group blocked SWIZZLE_32_4_4 scales built by torchao's ``triton_mx_block_rearrange_*`` ops.
     - Our Triton MX act-quant (so torch is timed on the same fast quant), the shared host ``apply_glu``,
       and the shared ``_torch_weighted_reduce``. All three MX recipes."""
-    gate_up_proj_scale_inv, gate_up_global = split_scale(gate_up_proj_scale_inv)
-    down_proj_scale_inv, down_global = split_scale(down_proj_scale_inv)
     assert is_mx(gate_up_proj, gate_up_proj_scale_inv), (
         "torch grouped baseline is MX-only"
     )
@@ -388,7 +396,7 @@ def moe_torch_grouped(
     FP4 = getattr(torch, "float4_e2m1fn_x2", None)
     E = gate_up_proj.shape[0]
     # NVFP4's tcgen05 MMA kind requires TWO-level scaling: the e4m3 per-16 block scale AND a
-    # per-tensor global fp32 scale. Weight globals come off the [block, global] scale pairs
+    # per-tensor global fp32 scale. Weight globals arrive as the separate *_global_scale args
     # (canonical two-level weights); activations are quantized here without a calibrated
     # input_scale, so their global is identity 1.0. MX recipes are single-level (block e8m0).
     tensorwise = ScalingType.TensorWise
@@ -447,11 +455,11 @@ def moe_torch_grouped(
         )
 
     gate_up = grouped_mm(
-        hidden_states[tok], gate_up_proj, gate_up_proj_scale_inv, gate_up_global
+        hidden_states[tok], gate_up_proj, gate_up_proj_scale_inv, gate_up_proj_global_scale
     )
     gate, up = gate_up.chunk(2, dim=-1)
     inter = apply_glu(gate, up, act_fn, swiglu_alpha, swiglu_limit)
-    down_out = grouped_mm(inter, down_proj, down_proj_scale_inv, down_global)
+    down_out = grouped_mm(inter, down_proj, down_proj_scale_inv, down_proj_global_scale)
 
     # One weighted scatter-reduce: down_out is expert-sorted, so index_add_ over the source-token
     # map fuses unroute + routing-weight + top-k sum into (T, H) directly — no separate unsort pass.
@@ -468,6 +476,8 @@ def moe_unfused_batched(
     down_proj: torch.Tensor,
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
+    gate_up_proj_global_scale: torch.Tensor | None = None,
+    down_proj_global_scale: torch.Tensor | None = None,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -491,6 +501,7 @@ def moe_unfused_batched(
         hidden_states,
         gate_up_proj,
         Bs=gate_up_proj_scale_inv,
+        b_global_scale=gate_up_proj_global_scale,
         expert_ids=expert_ids,
         quantization=Quantization(input_recipe=recipe),
         output_dtype=hidden_states.dtype,
@@ -503,6 +514,7 @@ def moe_unfused_batched(
         inter,
         down_proj,
         Bs=down_proj_scale_inv,
+        b_global_scale=down_proj_global_scale,
         expert_ids=expert_ids,
         quantization=Quantization(input_recipe=recipe),
         output_dtype=hidden_states.dtype,

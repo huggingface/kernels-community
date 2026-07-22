@@ -54,8 +54,6 @@ from .utils import (
     get_accelerator_autotuning_configs,
     warp_spec_compile_guard_pruner,
     is_mx,
-    is_tensor_wide,
-    split_scale,
     combine_global_scales,
     maybe_act_quant,
     MX_ACT_QUANT,
@@ -977,8 +975,8 @@ def w8a8_block_dynamic_fp8_matmul(
 def w8a8_block_static_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
-    Bs: torch.Tensor,
     As: torch.Tensor,
+    Bs: torch.Tensor,
     block_size: list[int],
     output_dtype: torch.dtype | None = None,
     gate: bool = False,
@@ -991,8 +989,8 @@ def w8a8_block_static_fp8_matmul(
 
     A:  (..., K) raw bf16/fp16 activations — pre-quantized against ``As`` in the wrapper
     B:  (N, K) FP8 weights — under ``gate`` the ``(2N, K)`` gate|up stack
-    Bs: (N // block_n, K // block_k) per-block weight scales (2N rows under ``gate``)
     As: scalar / (1,) — per-tensor static activation scale
+    Bs: (N // block_n, K // block_k) per-block weight scales (2N rows under ``gate``)
 
     ``gate`` fuses the gate|up projection into one stacked GEMM + SwiGLU, returning the
     ``[..., N]`` GLU intermediate. Returns a one-element list (mirrors the MX/grouped op).
@@ -1166,8 +1164,8 @@ def w8a8_tensor_dynamic_fp8_matmul(
 )
 def mx_dynamic_matmul(
     A: torch.Tensor,
-    As: torch.Tensor | None,
     B: torch.Tensor,
+    As: torch.Tensor | None,
     Bs: torch.Tensor,
     output_dtype: torch.dtype | None = None,
     input_recipe: str | None = None,
@@ -1407,12 +1405,14 @@ def full_precision_matmul_2d(
 def matmul_2d(
     A: torch.Tensor,
     B: torch.Tensor,
-    As: torch.Tensor | list[torch.Tensor] | None = None,
-    Bs: torch.Tensor | list[torch.Tensor] | None = None,
+    As: torch.Tensor | None = None,
+    Bs: torch.Tensor | None = None,
     *,
     epilogue: Epilogue | None = None,
     quantization: Quantization | None = None,
     output_dtype: torch.dtype | None = None,
+    a_global_scale: torch.Tensor | None = None,
+    b_global_scale: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | list[torch.Tensor]:
     """Dense (2D) quantized matmul dispatcher (W8A8 FP8, W4A8/W4A4 FP4) — the single-GEMM sibling of
@@ -1420,15 +1420,15 @@ def matmul_2d(
     ``Epilogue``/``Quantization`` bundles, and inferred quant block (no ``block_size`` argument — it
     falls out of the weight-scale shape, so the data can't disagree with a parameter).
 
-    ``As`` is the activation-scale spec, same as the routed ops: ``None`` → the op quantizes raw
+    ``As`` is the activation block-scale spec, same as the routed ops: ``None`` → the op quantizes raw
     ``A`` dynamically; a per-tensor scalar → static (calibrated) FP8 activation scale; block scales →
-    pre-quantized ``A``; ``[block, global]`` (or ``[None, global]`` for raw A) → two-level NVFP4, the
-    ``global`` being the calibrated ``input_scale`` ``g_a``. ``Bs`` is the weight scale: a block
-    tensor, or ``[block, global]`` for two-level NVFP4 (``global`` = ``weight_scale_2`` ``g_b``). The
-    NVFP4 globals are provided (calibrated), never computed — the op folds ``g_a·g_b`` onto the
-    accumulator. ``output_global_scale`` (NVFP4 ``output_recipe`` only) is the NEXT proj's provided
-    ``input_scale``: the fused requant normalizes the GLU intermediate by it, returning ``[C, Cs]``
-    the down-proj consumes as ``As = [Cs, output_global_scale]``.
+    pre-quantized ``A``. ``Bs`` is the weight block scale. ``a_global_scale``/``b_global_scale`` are the
+    two-level NVFP4 per-tensor second-level scales (calibrated ``input_scale`` ``g_a`` and
+    ``weight_scale_2`` ``g_b``) — provided, never computed; the op folds ``g_a·g_b`` onto the
+    accumulator (``a_global_scale`` rides raw ``A`` or a pre-quantized ``As`` alike).
+    ``output_global_scale`` (NVFP4 ``output_recipe`` only) is the NEXT proj's provided ``input_scale``:
+    the fused requant normalizes the GLU intermediate by it, returning ``[C, Cs]`` the down-proj
+    consumes as ``As=Cs, a_global_scale=output_global_scale``.
 
     ``epilogue`` is the fused output transform (``Epilogue(gate=True)`` → the ``(2N, K)`` gate|up
     stack + SwiGLU, returning the ``[..., N]`` GLU intermediate); ``quantization.input_recipe`` sets
@@ -1447,9 +1447,6 @@ def matmul_2d(
     input_recipe, output_recipe = (
         quantization if quantization is not None else Quantization()
     ).as_args()
-    # scales may arrive as [block/None, global] pairs (two-level NVFP4); split them apart
-    As, a_global_scale = split_scale(As)
-    Bs, b_global_scale = split_scale(Bs)
 
     def _unwrap(ret: list[torch.Tensor]) -> torch.Tensor | list[torch.Tensor]:
         return ret[0] if len(ret) == 1 else ret
@@ -1467,13 +1464,13 @@ def matmul_2d(
     if is_mx(B, Bs):
         return _unwrap(
             mx_dynamic_matmul(
-                A, As, B, Bs, output_dtype, input_recipe,
+                A, B, As, Bs, output_dtype, input_recipe,
                 gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, output_recipe,
                 a_global_scale, b_global_scale, output_global_scale,
             )
         )
     assert a_global_scale is None and b_global_scale is None and output_global_scale is None, (
-        "two-level globals ([block, global] pairs / output_global_scale) are NVFP4-only (MX weights)"
+        "two-level globals (a_global_scale / b_global_scale / output_global_scale) are NVFP4-only (MX weights)"
     )
     # FP8 activations are always E4M3 with the weight-implied scale granularity, so "fp8" is a
     # no-op recipe name (accepted for symmetry with the MoE ops); no other name applies here.
@@ -1505,7 +1502,7 @@ def matmul_2d(
         assert As.numel() == 1, "block-wise FP8 As is a per-tensor static scale (scalar)"
         return _unwrap(
             w8a8_block_static_fp8_matmul(
-                A, B, Bs, As, block_size, output_dtype,
+                A, B, As, Bs, block_size, output_dtype,
                 gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused,
             )
         )

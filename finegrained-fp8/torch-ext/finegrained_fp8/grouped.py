@@ -63,7 +63,6 @@ from .utils import (
     smem_pruner,
     is_mx,
     combine_global_scales,
-    split_scale,
     weight_block_size,
     e2m1_as_uint8,
     ue8m0_as_uint8,
@@ -1064,8 +1063,8 @@ def full_precision_matmul_grouped_kernel(
 )
 def w8a8_block_dynamic_fp8_matmul_grouped(
     A: torch.Tensor,
-    As: torch.Tensor | None,
     B: torch.Tensor,
+    As: torch.Tensor | None,
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
     block_size: list[int],
@@ -1088,8 +1087,8 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     ``matmul_grouped`` dispatcher unpacks the bundle here).
 
     A:  (S, K) pre-quantized FP8 activations — rows addressed via ``gather_idx``
-    As: (S, K // block_k) per-row, per-K-block activation scales
     B:  (num_experts, N, K) FP8 weights; under ``gate`` the (num_experts, 2N, K) gate|up stack
+    As: (S, K // block_k) per-row, per-K-block activation scales
     Bs: (num_experts, N // block_n, K // block_k) per-block weight scales (2N under gate)
     expert_start: (num_experts_pow2 + 1,) int32 — cumulative sorted-row starts, S sentinel
     gate: fuse the gate|up projection (SwiGLU ``act_fn``); ``requant`` FP8-requantizes the result
@@ -1209,8 +1208,8 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
 )
 def w8a8_block_static_fp8_matmul_grouped(
     A: torch.Tensor,
-    activation_scale: torch.Tensor,
     B: torch.Tensor,
+    As: torch.Tensor,
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
     block_size: list[int],
@@ -1227,14 +1226,14 @@ def w8a8_block_static_fp8_matmul_grouped(
 ) -> list[torch.Tensor]:
     """Block-scale grouped FP8 matmul with a static (per-tensor calibrated) activation scale —
     the block-dynamic sibling with the 2D ``block_static`` recipe. ``A`` is raw here: the op
-    quantizes it against the scalar ``activation_scale`` (offline, ``(A / s).to(fp8)``), the kernel
-    applies the per-block weight scales in the K-loop and the scalar once post-loop. Returns the
-    ``[C]`` GLU intermediate, or — under ``output_recipe="fp8"`` — the FP8-requantized ``[C, Cs]``
-    (the per-row output scale is independent of the per-tensor input scale).
+    quantizes it against the scalar ``As`` (offline, ``(A / As).to(fp8)``), the kernel applies the
+    per-block weight scales in the K-loop and the scalar once post-loop. Returns the ``[C]`` GLU
+    intermediate, or — under ``output_recipe="fp8"`` — the FP8-requantized ``[C, Cs]`` (the per-row
+    output scale is independent of the per-tensor input scale).
 
     A:  (S, K) raw bf16/fp16 activations — rows addressed via ``gather_idx``
-    activation_scale: scalar / (1,) — the calibrated per-tensor activation scale
     B:  (num_experts, N, K) FP8 weights; under ``gate`` the (num_experts, 2N, K) gate|up stack
+    As: scalar / (1,) — the calibrated per-tensor (static) activation scale
     Bs: (num_experts, N // block_n, K // block_k) per-block weight scales (2N under gate)
     """
     validate_dense_operands(A, B)
@@ -1263,7 +1262,7 @@ def w8a8_block_static_fp8_matmul_grouped(
     )
 
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    As = activation_scale.reshape(1).to(torch.float32)
+    As = As.reshape(1).to(torch.float32)
     bs_u8 = ue8m0_as_uint8(Bs)
     # Pre-quantize the raw activations against the calibrated scalar (offline — MoE always
     # pre-quants; the kernel folds the scalar back post-loop).
@@ -1336,8 +1335,8 @@ def w8a8_block_static_fp8_matmul_grouped(
 )
 def w8a8_tensor_dynamic_fp8_matmul_grouped(
     A: torch.Tensor,
-    As: torch.Tensor | None,
     B: torch.Tensor,
+    As: torch.Tensor | None,
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
     gate: bool = False,
@@ -1358,8 +1357,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     ``requant`` is unsupported here — the dispatcher unpacks the bundle).
 
     A:  (S, K) pre-quantized FP8 activations — rows addressed via ``gather_idx``
-    As: (S,) per-token activation scales
     B:  (num_experts, N, K) FP8 expert weights; under ``gate`` the (num_experts, 2N, K) stack
+    As: (S,) per-token activation scales
     Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales
     expert_start: (num_experts_pow2 + 1,) int32 — cumulative sorted-row starts, S sentinel
     gather_idx: optional (S,) — sorted position -> source row of A; None = A is expert-sorted
@@ -1442,8 +1441,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
 )
 def mx_dynamic_matmul_grouped(
     A: torch.Tensor,
-    As: torch.Tensor | None,
     B: torch.Tensor,
+    As: torch.Tensor | None,
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
     gate: bool = False,
@@ -1507,13 +1506,12 @@ def mx_dynamic_matmul_grouped(
     output_dtype = resolve_output_dtype(output_dtype, A, As)
     input_recipe = resolve_input_recipe(input_recipe, output_recipe, Bs)
     requant = output_recipe is not None
-    # SWIZZLE_32_4_4 scales — the tcgen05 scaled-MMA fast path — for the whole grouped MX
-    # kernel (down projection, gate_up, and plain grouped GEMM alike). BM is pinned to 128, and
-    # BN to 128 under GATE (swizzled_scales_bm_pruner), matching the 128-padded scale layouts.
-    if N % 128 != 0:
+    # Only the swizzled arm structurally needs N%128 (128-row SWIZZLE_32_4_4 scale blocks). The
+    # affine arm tiles N by any BN | N (block_within_dim_pruner). [ISOLATION: verifying non-128 N]
+    if swizzled_scales and N % 128 != 0:
         raise ValueError(
-            f"the routed MX MoE path needs N ({N}) a multiple of 128 (its scales tile in 128-row "
-            f"blocks); non-aligned N is supported only by the dense matmul_2d op."
+            f"the swizzled routed MX path needs N ({N}) a multiple of 128 (128-row scale blocks); "
+            f"non-128 N runs on the un-swizzled arm or the dense matmul_2d op."
         )
     scale_dtype = ue8m0_as_uint8(Bs).dtype  # UE8M0 -> uint8, NVFP4 -> e4m3 (binder-safe)
     # Activation scales track the weight layout (SWIZZLED_SCALES, one flag): swizzled weight ->
@@ -1757,8 +1755,8 @@ def full_precision_matmul_grouped(
 def matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
-    As: torch.Tensor | list[torch.Tensor] | None = None,
-    Bs: torch.Tensor | list[torch.Tensor] | None = None,
+    As: torch.Tensor | None = None,
+    Bs: torch.Tensor | None = None,
     *,
     expert_start: torch.Tensor,
     epilogue: Epilogue | None = None,
@@ -1766,6 +1764,8 @@ def matmul_grouped(
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
+    a_global_scale: torch.Tensor | None = None,
+    b_global_scale: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Grouped matmul dispatcher (W8A8 FP8, W4A8/W4A4 FP4, or full-precision).
@@ -1781,15 +1781,14 @@ def matmul_grouped(
     ``Bs`` ``None`` = unquantized BF16/FP16 weights.
     ``quantization.output_recipe`` requantizes the output into the recipe's format — the
     return is then ``(C, Cs)``. ``epilogue`` is the fused output transform (gate|up + GLU).
-    ``As``/``Bs`` are each a bare block-scale tensor or — for two-level NVFP4 (always the
-    canonical form, ``nvfp4_quantize_two_level``) — a ``[block, global]`` pair, where ``global``
-    is the fp32 per-tensor (weights: per-expert ``(E,)``) second-level scale; the op folds
-    ``g_a · g_b`` onto the accumulator. The activation global ``g_a`` is CALIBRATED (the
-    checkpoint's ``input_scale``): ``As = [None, g_a]`` with a raw ``A`` has the op quantize
-    ``A / g_a`` per block; ``As = [block, g_a]`` is the matching pre-quantized form. Under NVFP4
-    ``output_recipe`` the fused requant normalizes the GLU intermediate by the PROVIDED
-    ``output_global_scale`` (the next proj's calibrated ``input_scale``) before the block quant and
-    returns ``[C, Cs]``; the down consumes it as ``As = [Cs, output_global_scale]``.
+    ``As``/``Bs`` are each a bare block-scale tensor; the two-level NVFP4 second-level scales ride
+    the separate ``a_global_scale``/``b_global_scale`` (fp32 per-tensor, weights per-expert ``(E,)``;
+    from ``nvfp4_quantize_two_level``), and the op folds ``g_a · g_b`` onto the accumulator. The
+    activation global ``g_a`` is CALIBRATED (the checkpoint's ``input_scale``): ``a_global_scale=g_a``
+    with a raw ``A`` has the op quantize ``A / g_a`` per block, and rides a pre-quantized ``As`` the
+    same way. Under NVFP4 ``output_recipe`` the fused requant normalizes the GLU intermediate by the
+    PROVIDED ``output_global_scale`` (the next proj's calibrated ``input_scale``) before the block
+    quant and returns ``[C, Cs]``; the down consumes it as ``As=Cs, a_global_scale=output_global_scale``.
     Row order is carried by the standalone maps: ``gather_idx`` gathers ``A`` (``None`` ->
     already expert-ordered), ``scatter_idx`` scatters the output. The fused MoE chain is one
     scheduling pass: gate_up with ``scatter_idx=None`` + ``Epilogue(gate=True)`` +
@@ -1809,12 +1808,8 @@ def matmul_grouped(
     """
     ep = epilogue if epilogue is not None else Epilogue()
     q = quantization if quantization is not None else Quantization()
-    # scales may arrive as [block, global] pairs (two-level NVFP4); split them apart.
-    # As=[None, g_a] is the canonical raw-A form: the op quantizes A/g_a per block.
-    As, a_global_scale = split_scale(As)
-    Bs, b_global_scale = split_scale(Bs)
     assert (a_global_scale is None and b_global_scale is None) or (Bs is not None and is_mx(B, Bs)), (
-        "a [block, global] two-level scale pair is NVFP4-only (MX weights)"
+        "two-level globals (a_global_scale / b_global_scale) are NVFP4-only (MX weights)"
     )
     if As is not None and As.numel() == 1:
         # static (per-tensor calibrated) activation quant: a per-tensor scalar As for block-scale FP8
@@ -1824,8 +1819,8 @@ def matmul_grouped(
         )
         out = w8a8_block_static_fp8_matmul_grouped(
             A,
-            As,
             B,
+            As,
             Bs,
             expert_start,
             weight_block_size(B, Bs),
@@ -1854,8 +1849,8 @@ def matmul_grouped(
     elif is_mx(B, Bs):
         out = mx_dynamic_matmul_grouped(
             A,
-            As,
             B,
+            As,
             Bs,
             expert_start,
             *ep.as_args(),
@@ -1870,8 +1865,8 @@ def matmul_grouped(
     elif (block_size := weight_block_size(B, Bs)) is None:
         out = w8a8_tensor_dynamic_fp8_matmul_grouped(
             A,
-            As,
             B,
+            As,
             Bs,
             expert_start,
             *ep.as_args(),
@@ -1883,8 +1878,8 @@ def matmul_grouped(
     else:
         out = w8a8_block_dynamic_fp8_matmul_grouped(
             A,
-            As,
             B,
+            As,
             Bs,
             expert_start,
             block_size,

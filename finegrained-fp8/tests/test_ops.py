@@ -199,11 +199,13 @@ def scenarios() -> list[Problem]:
         # As is a per-tensor scalar; runs on all three ops (2D / grouped / batched).
         Problem(weights="fp8_128x128", static=True),
         Problem(weights="fp8_128x128", gate=True, static=True),
-        # non-aligned N (a partial last block): matmul_2d ONLY — the routed MoE ops require
-        # N % 128 == 0 (experts are 128-padded). Exercises matmul_2d's block-size inference (FP8)
-        # and the MX N-tail. The MLA kv_a_proj-style dense shape.
+        # non-aligned N (64-grid, off the 128-grid — gpt-oss H=I=2880 shape). matmul_2d masks the
+        # N-tail; routed MX runs the affine arm (per-row scales, any BN|N); routed FP8 rejects it
+        # (its scales are 128-blocked along N — raises pointing to matmul_2d).
         Problem(weights="fp8_128x128", N=320, K=1024),
         Problem(weights="mxfp8", N=320, K=1024),
+        Problem(weights="mxfp4", input_recipe="mxfp4", N=320, K=320),  # W4A4 non-128 N and K
+        Problem(weights="mxfp4", gate=True, input_recipe="mxfp4", output_recipe="mxfp4", N=320, K=320),  # gated W4A4 non-128 (gpt-oss gate_up)
         # output/input dtype coverage (fp16 + fp32) across the FP8 and MX kernels — the recipe matrix
         # above rides bf16.
         Problem(weights="fp8_128x128", dtype=torch.float16),
@@ -295,10 +297,11 @@ def _dequant_a(problem: Problem, A):
         return quant_dequant_a(A, problem.K, scale=static_scale), None
     if act_global is not None:
         # nvfp4 acts are always two-level: quantize A/g_a per block (the exact host fn the op
-        # calls), dequantize × g_a; the pre-quantized form is the [block, g_a] As pair.
+        # calls), dequantize × g_a; the pre-quantized form is the bare block scale (the g_a
+        # global rides separately as As_global, computed from raw A in the caller).
         Aq, As_block = nvfp4_act_quant(A, global_scale=act_global)
         A_dq = dq_grouped(Aq.view(torch.int8), As_block, NVFP4_SCALE_GROUP_K) * act_global
-        return A_dq, (Aq, [As_block, act_global])
+        return A_dq, (Aq, As_block)
     quant = row["act_quant"][problem.input_recipe]
     if quant is None:
         return A.float(), None
@@ -307,32 +310,33 @@ def _dequant_a(problem: Problem, A):
 
 
 def _prequant_args(problem: Problem, A):
-    """The pre-quantized ``(Aq, As)`` form of ``A`` (nvfp4: ``As = [block, g_a]``) — the ``As`` half
-    of ``_dequant_a``, handed to the op (and the reference) exactly as the op would compute it."""
+    """The pre-quantized ``(Aq, As)`` form of ``A`` (``As`` = bare block scale) — the ``As`` half of
+    ``_dequant_a``, handed to the op (and the reference) exactly as the op would compute it. The nvfp4
+    activation global rides separately (``_act_global`` on the raw ``A``)."""
     return _dequant_a(problem, A)[1]
 
 
-def _act_dequant(problem: Problem, A, As=None):
+def _act_dequant(problem: Problem, A, As=None, As_global=None):
     """The fp32 activation the op multiplies by — from raw ``A`` (``As`` None: quantize+dequant on
     the recipe grid, the exact host quant the op applies) or from a pre-quantized ``(Aq, As)`` (dequant
-    it). Both land on the same values, so the reference reads whatever the op was handed."""
+    it, folding the nvfp4 ``As_global`` back). Both land on the same values, so the reference reads
+    whatever the op was handed."""
     if As is None:
         return _dequant_a(problem, A)[0]
-    if isinstance(As, list):  # nvfp4 two-level [block, g_a]
-        block, g_a = As
-        return dq_grouped(A.view(torch.int8), block, NVFP4_SCALE_GROUP_K) * g_a
+    if As_global is not None:  # nvfp4 two-level: block scale As, per-tensor global As_global
+        return dq_grouped(A.view(torch.int8), As, NVFP4_SCALE_GROUP_K) * As_global
     return WEIGHTS[problem.weights]["dq_act"](A, As)
 
 
-def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, As=None):
+def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_global=None):
     """The fp32 GLU output on the recipe-quantized operands — the pre-requant oracle, shared by the
     global calibration (``_out_global``) and the reference (``_reference``), reading the SAME ``A``/
-    ``As`` the op takes. ``matmul`` has no routing (single ``W[0]``); routed ops gather ``W[expert]``
-    and zero sentinel rows; GLU in fp32 (the production epilogue applies it to the fp32 accumulator
-    directly)."""
+    ``As`` (and their globals) the op takes. ``matmul`` has no routing (single ``W[0]``); routed ops
+    gather ``W[expert]`` and zero sentinel rows; GLU in fp32 (the production epilogue applies it to
+    the fp32 accumulator directly)."""
     row = WEIGHTS[problem.weights]
-    A_dq = _act_dequant(problem, A, As)
-    W = row["dequant"](B, Bs)  # (E, rows, K) fp32
+    A_dq = _act_dequant(problem, A, As, As_global)
+    W = row["dequant"](B, Bs, Bs_global)  # (E, rows, K) fp32
     if op == "matmul":
         ref = A_dq @ W[0].T  # single linear, no routing
     else:
@@ -347,40 +351,42 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, As=None):
     return ref
 
 
-def _out_global(problem: Problem, op, A, expert_ids, B, Bs, As=None):
+def _out_global(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_global=None):
     """The PROVIDED NVFP4 output global — the next proj's calibrated ``input_scale``. The tests
     'calibrate' it deterministically off the fp32 intermediate (``amax/(6·448)``) so the reference
     and the op share the identical scalar; None for MX / dense output (no second level)."""
     if problem.output_recipe != "nvfp4":
         return None
-    return _nvfp4_global(_fp32_intermediate(problem, op, A, expert_ids, B, Bs, As))
+    return _nvfp4_global(
+        _fp32_intermediate(problem, op, A, expert_ids, B, Bs, Bs_global, As, As_global)
+    )
 
 
-def _reference(problem: Problem, op, A, expert_ids, B, Bs, As=None, out_global=None):
-    """The op written with torch only: the SAME inputs as ``_op`` (``A``/``As``/``out_global``),
-    returning the op's OWN output format so the shared ``_dequant`` reads reference and op
-    identically. Dequant/gather the operands (``_fp32_intermediate`` reads whatever the op was
+def _reference(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_global=None, out_global=None):
+    """The op written with torch only: the SAME inputs as ``_op`` (``A``/``As``/their globals/
+    ``out_global``), returning the op's OWN output format so the shared ``_dequant`` reads reference
+    and op identically. Dequant/gather the operands (``_fp32_intermediate`` reads whatever the op was
     handed — raw ``A`` or a pre-quantized ``(Aq, As)``) → matmul → GLU, then mirror the fused requant:
     divide by the provided ``out_global`` and snap to the recipe grid, returning the ``[C, Cs]`` the
     op returns. No ``output_recipe`` → the dense fp32 intermediate. ``"fp8"`` output has no torch
     block-quant (``REQUANT_FN["fp8"]`` is None), so it stays the unsnapped oracle — the dequant-
     closeness tolerance in ``_check`` absorbs the block-fp8 rounding."""
-    inter = _fp32_intermediate(problem, op, A, expert_ids, B, Bs, As)
+    inter = _fp32_intermediate(problem, op, A, expert_ids, B, Bs, Bs_global, As, As_global)
     if problem.output_recipe in (None, "fp8"):
         return inter
     scaled = inter / out_global if out_global is not None else inter
     return list(REQUANT_FN[problem.output_recipe](scaled.to(problem.dtype)))
 
 
-def _op(problem: Problem, op, A, expert_ids, B, Bs, As=None, out_global=None):
+def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_global=None, out_global=None):
     """The op half of the symmetric ``(ref, op)`` pair — the same inputs as ``_reference`` (plus
     ``As`` for the pre-quantized-input test). Runs the kernel on the recipe's operands (swizzling
-    weight scales, threading the two-level
-    activation/weight globals via As/Bs) and returns its RAW output (dense tensor, or ``[C, Cs]``
-    under ``output_recipe``) — the shared ``_dequant`` brings it to fp32, the same call the reference
-    goes through. The NVFP4 output global ``out_global`` is PROVIDED (the calibrated ``input_scale``
-    of the next proj): it rides in as ``output_global_scale`` and the op normalizes the intermediate
-    by it before requant — the same scalar the reference uses, so the two spaces match."""
+    weight scales; the two-level per-tensor globals ride as the decoupled ``a_global_scale`` /
+    ``b_global_scale`` kwargs) and returns its RAW output (dense tensor, or ``[C, Cs]`` under
+    ``output_recipe``) — the shared ``_dequant`` brings it to fp32, the same call the reference goes
+    through. The NVFP4 output global ``out_global`` is PROVIDED (the calibrated ``input_scale`` of
+    the next proj): it rides in as ``output_global_scale`` and the op normalizes the intermediate by
+    it before requant — the same scalar the reference uses, so the two spaces match."""
     epilogue = (
         Epilogue(
             gate=True,
@@ -405,36 +411,26 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, As=None, out_global=None):
         kw["output_global_scale"] = out_global
     if problem.static:  # fused static (per-tensor) activation quant — As is the calibrated scalar
         As = _static_scale(problem, A)
-    # nvfp4 activations are always two-level: a raw A rides with its calibrated global as
-    # the As=[None, g_a] pair (a pre-quantized As already arrives as [block, g_a]).
-    if As is None and problem.weights == "nvfp4":
-        As = [None, _act_global(problem, A)]
     # matmul is the single-GEMM sibling: slice to the one weight matrix (expert 0) and drop the
-    # routing maps; the call is otherwise identical to the routed ops — the same ``As`` (None /
-    # scalar static / [None, g_a] nvfp4, split by the op itself) and the same ``Bs`` (a bare block
-    # tensor or a [block, global] pair) flowing through the shared swizzle below.
+    # routing maps; the call is otherwise identical to the routed ops.
     if op == "matmul":
         B = B[0]
-        Bs = (
-            [Bs[0][0], Bs[1][:1]] if isinstance(Bs, list)
-            else Bs[0] if Bs is not None
-            else None
-        )
+        Bs = Bs[0] if Bs is not None else None
+        Bs_global = Bs_global[:1] if Bs_global is not None else None
     # weight-scale swizzle, shared by all three ops (_swizzle_bs reshapes per op: a 2D matrix for
-    # matmul, the (E, ...) stack for the routed ops); a two-level pair keeps its global untouched.
-    if problem.swizzled:
-        if isinstance(Bs, list):  # two-level: swizzle the block part, keep the global
-            bs = [_swizzle_bs(op, problem.gate, Bs[0], problem.N, problem.K), Bs[1]]
-        else:
-            bs = _swizzle_bs(op, problem.gate, Bs, problem.N, problem.K)
-    else:
-        bs = Bs
+    # matmul, the (E, ...) stack for the routed ops).
+    bs = (
+        _swizzle_bs(op, problem.gate, Bs, problem.N, problem.K)
+        if problem.swizzled and Bs is not None
+        else Bs
+    )
+    globals_kw = dict(a_global_scale=As_global, b_global_scale=Bs_global)
     if op == "matmul":
         fn = maybe_compile(finegrained_fp8.matmul_2d, problem.compile)
-        return fn(A, B, As, bs, **kw)
+        return fn(A, B, As, bs, **globals_kw, **kw)
     if op == "batched":
         fn = maybe_compile(finegrained_fp8.matmul_batched, problem.compile)
-        return fn(A, B, As, bs, expert_ids=expert_ids, **kw)
+        return fn(A, B, As, bs, expert_ids=expert_ids, **globals_kw, **kw)
     expert_start, gather_idx, scatter_idx = finegrained_fp8.compute_grouped_scheduling(
         expert_ids, problem.E, 1
     )
@@ -447,6 +443,7 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, As=None, out_global=None):
         expert_start=expert_start,
         gather_idx=gather_idx,
         scatter_idx=scatter_idx,
+        **globals_kw,
         **kw,
     )
     return raw
@@ -543,13 +540,12 @@ def test_op_scenarios(problem: Problem, op):
     A, expert_ids = _routed(problem)
     row = WEIGHTS[problem.weights]
     E = 1 if op == "matmul" else problem.E  # matmul is a single weight matrix
-    B, Bs = row["make"](2 * problem.N if problem.gate else problem.N, problem.K, E)
-    if op != "matmul" and problem.N % 128 != 0 and (problem.weights.startswith("fp8") or op == "grouped"):
-        # non-aligned N is a dense matmul_2d capability; fp8 (block_n) and grouped-MX (128-row
-        # swizzle blocks) reject it with a clear error. batched-MX (decode, row-major, BN-tiled)
-        # tolerates it when a config tile divides N — falls through to the normal ref-vs-op run.
+    B, Bs, Bs_global = row["make"](2 * problem.N if problem.gate else problem.N, problem.K, E)
+    if op != "matmul" and problem.N % 128 != 0 and problem.weights.startswith("fp8"):
+        # fp8 weight scales are 128-blocked along N, so routed fp8 rejects non-128 N. MX (per-row
+        # scales, BN | N) handles it on the affine arm — falls through to the normal ref-vs-op run.
         with pytest.raises(ValueError, match="matmul_2d"):
-            _op(problem, op, A, expert_ids, B, Bs)
+            _op(problem, op, A, expert_ids, B, Bs, Bs_global)
         return
     # ref is the op written in torch; both take the same inputs — including the PROVIDED nvfp4 output
     # global — and return the op's own format, so _dequant reads them identically and _check compares
@@ -557,12 +553,14 @@ def test_op_scenarios(problem: Problem, op):
     # prequant scenarios hand the op its activations already quantized (As set — routed ops only,
     # _skip_moe_only excludes matmul); otherwise raw A + As=None and the op quantizes it. Reference
     # and op take the identical (A, As): pre-quantizing just hands the op the values it would
-    # otherwise compute, and _fp32_intermediate reads whichever form it's given.
+    # otherwise compute, and _fp32_intermediate reads whichever form it's given. The nvfp4 activation
+    # global comes off the RAW A (before prequant replaces it) and rides separately as As_global.
     As = None
+    As_global = _act_global(problem, A)
     if problem.prequant:
         A, As = _prequant_args(problem, A)
-    g_out = _out_global(problem, op, A, expert_ids, B, Bs, As)
-    ref = _reference(problem, op, A, expert_ids, B, Bs, As=As, out_global=g_out)
-    out = _op(problem, op, A, expert_ids, B, Bs, As=As, out_global=g_out)
+    g_out = _out_global(problem, op, A, expert_ids, B, Bs, Bs_global, As, As_global)
+    ref = _reference(problem, op, A, expert_ids, B, Bs, Bs_global, As=As, As_global=As_global, out_global=g_out)
+    out = _op(problem, op, A, expert_ids, B, Bs, Bs_global, As=As, As_global=As_global, out_global=g_out)
     _assert_op_layout(problem, op, out)
     _check(problem, _dequant(problem, out, g_out), _dequant(problem, ref, g_out), expert_ids, op)
