@@ -55,7 +55,6 @@ from finegrained_fp8.utils import (  # type: ignore
     NVFP4_SCALE_GROUP_K,
     apply_glu,
     nvfp4_act_quant,
-    swizzle_gateup_weight_scales,
     ue8m0_as_uint8,
 )
 
@@ -278,12 +277,27 @@ def _swizzle_bs(op, gate, Bs, N, K):
     cb = triton.cdiv(K // g, 4)
     if op == "matmul":  # single matrix (rows = N or 2N under gate)
         return swizzle_mx_scales(bs_u8).reshape(1, triton.cdiv(Bs.shape[0], 128), cb, 2, 256)
+    # Swizzle each expert independently so its blocks are ceil(rows/128)-aligned (swizzle_mx_scales
+    # pads the partial last block internally): a non-128 ``rows`` keeps its tail block per expert, and
+    # the reader indexes expert e at e*cdiv(rows,128). Byte-identical to a flat E*rows swizzle when
+    # rows is 128-aligned.
     E, rows, _ = Bs.shape
-    if gate:  # (E, 2N, K//g) -> the interleaved gate|up weight-scale swizzle
-        return swizzle_gateup_weight_scales(bs_u8, E, N)
-    return swizzle_mx_scales(bs_u8.reshape(E * rows, K // g)).reshape(
-        1, E * (rows // 128), cb, 2, 256
-    )
+    if gate:
+        # Gate|up ``(E, 2N, K//g)`` swizzles as a 2N-row per-expert slab (gate rows [0,N) then up
+        # [N,2N) -> blocks [g0..,u0..]); block-interleave to [g0,u0,g1,u1,...] so the kernel reads a
+        # tile's gate + up 128-blocks as one contiguous 2*(BN//128)-block descriptor load.
+        nrbN = triton.cdiv(rows // 2, 128)
+        per_expert = [
+            swizzle_mx_scales(bs_u8[e])
+            .reshape(2, nrbN, cb, 2, 256)
+            .transpose(0, 1)
+            .reshape(2 * nrbN, cb, 2, 256)
+            for e in range(E)
+        ]
+        return torch.cat(per_expert).reshape(1, E * 2 * nrbN, cb, 2, 256)
+    nrb = triton.cdiv(rows, 128)
+    per_expert = [swizzle_mx_scales(bs_u8[e]) for e in range(E)]
+    return torch.cat(per_expert).reshape(1, E * nrb, cb, 2, 256)
 
 
 def _dequant_a(problem: Problem, A):

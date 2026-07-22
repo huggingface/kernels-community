@@ -137,7 +137,11 @@ def _rebind_grouped_mx_descriptors(nargs):
     if nargs["ASDescriptor"] is not None:
         nargs["ASDescriptor"].block_shape = [1, nargs["BLOCK_SIZE_M"] // 128, rep_k, 2, 256]
     if nargs["BSDescriptor"] is not None:
-        bn_blocks = (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"] // 128
+        # One bulk-load spans (2 if GATE) * BN//128 blocks: GATE reads the block-interleaved gate|up
+        # pair ([g,u] adjacent) as one 2*BN tile. BN<128 (non-gate, non-128 N) reads via the per-row
+        # pointer gather instead — clamp the box to one block so the (unread) descriptor keeps a valid,
+        # non-degenerate shape (a 0-block box traps the descriptor-encoding pass).
+        bn_blocks = (2 if nargs.get("GATE") else 1) * max(nargs["BLOCK_SIZE_N"] // 128, 1)
         nargs["BSDescriptor"].block_shape = [1, bn_blocks, rep_k, 2, 256]
     # Swizzled requant output (Cs is a descriptor): the store tile is [1, 1, rep_n, 2, 256], and
     # rep_n = (BN // SCALE_GROUP_K) // 4 depends on the tuned BLOCK_SIZE_N and the group size — so
@@ -791,8 +795,12 @@ def mx_dynamic_matmul_grouped_kernel(
     # path, BM pinned 128, BN pinned 128 under GATE) or affine (row-major, gathered per row), per
     # SWIZZLED_SCALES — one flag for both operands (a swizzled weight is paired with swizzled acts).
     # The offline act-quant emits its scales in the matching layout; the down projection's
-    # pre-quantized As arrives in it too. Under GATE the weight scale is the stacked 2*BN block.
-    # The wrapper asserts N % 128.
+    # pre-quantized As arrives in it too.
+    #
+    # gate|up loads two whole 128-row blocks (gate + up) stacked into a 2*BN weight tile
+    # (weight_tile_ptrs' gate arm + the two-slab scale below); the dot is 2*BN wide and the epilogue
+    # splits the accumulator into its gate/up halves for SiLU*up. Only the load (which two blocks) and
+    # the epilogue (split) depend on GATE — the K-loop body is otherwise uniform.
     num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
     offs_ka = tl.arange(0, BLOCK_SIZE_K // ACT_VALUES_PER_BYTE)
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
@@ -813,15 +821,16 @@ def mx_dynamic_matmul_grouped_kernel(
             )
         )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_ka, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
-        # descriptor box coordinates: expert slab (x2 under GATE), N offset, K-byte offsets per
-        # operand; without a gather the A rows are the contiguous sorted positions, so their min
-        # IS the box row start
+        # descriptor box coordinates: expert slab (x2 under GATE — the gate + up blocks), N offset,
+        # K-byte offsets per operand; without a gather the A rows are the contiguous sorted
+        # positions, so their min IS the box row start
         row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
         n_off = pid_n * BLOCK_SIZE_N
         m_start = tl.min(in_row).to(tl.int32)
         kb_off = 0
         ka_off = 0
-        # GATE stacks gate|up into the weight (K-major); the up block sits N rows away.
+        # GATE stacks the gate + up 128-blocks (the up block sits N rows away) into a 2*BN tile; a
+        # plain tile is the single BN block.
         b_ptrs = weight_tile_ptrs(
             B + expert_id64 * stride_b_e,
             offs_bn,
@@ -833,10 +842,14 @@ def mx_dynamic_matmul_grouped_kernel(
             False,
         )
 
+        # Accumulator is 2*BN under GATE (the stacked gate|up dot), BN otherwise — split in the
+        # epilogue for GATE.
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
-        # Pre-swizzled scales (SWIZZLE_32_4_4, emitted by the offline act-quant / requant): the
-        # M tile's expert-sorted, 128-padded scale block is the flat tile index pid_m; the weight
-        # scale block is expert*(N//BN) + pid_n (num_n_tiles == N // BN).
+        # Pre-swizzled scales (SWIZZLE_32_4_4, emitted by the offline act-quant / requant): the M
+        # tile's expert-sorted, 128-padded scale block is the flat tile index pid_m; the weight scale
+        # block (descriptor bulk-load, BN=128) is expert*num_n_tiles + pid_n. Each expert's swizzled
+        # slab is num_n_tiles 128-row blocks (non-gate); under GATE it is 2*num_n_tiles, block-interleaved
+        # ([g,u] per tile adjacent) so this same block index bulk-loads the stacked gate|up scale.
         pid_m = tile_id // num_n_tiles
         weight_blk = (expert_id64 * num_n_tiles + pid_n).to(tl.int32)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
@@ -1507,7 +1520,7 @@ def mx_dynamic_matmul_grouped(
     input_recipe = resolve_input_recipe(input_recipe, output_recipe, Bs)
     requant = output_recipe is not None
     # Only the swizzled arm structurally needs N%128 (128-row SWIZZLE_32_4_4 scale blocks). The
-    # affine arm tiles N by any BN | N (block_within_dim_pruner). [ISOLATION: verifying non-128 N]
+    # affine arm tiles N by any BN | N (block_within_dim_pruner).
     if swizzled_scales and N % 128 != 0:
         raise ValueError(
             f"the swizzled routed MX path needs N ({N}) a multiple of 128 (128-row scale blocks); "

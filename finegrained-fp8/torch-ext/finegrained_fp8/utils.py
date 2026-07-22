@@ -988,9 +988,9 @@ def affine_scale_warp_spec_pruner():
     non-``SWIZZLED_SCALES``) scale path. Its per-(gathered-row, K-group) 2D pointer-gather scale
     load carries an ``other=0.0`` constant the WS partitioner cannot tag — the automatic-warp-
     specialization pass fails with ``'arith.constant' op does not have expected attribute
-    ttg.partition``. The swizzled arm loads the scale through a TMA descriptor (no such constant)
-    and WS-compiles + wins, so the fused / deployment path keeps WS. CUDA-only; a no-op where
-    ``SWIZZLED_SCALES`` isn't a kernel arg (defaults to allowing WS)."""
+    ttg.partition``. The swizzled arm (gate + non-gate) loads the scale through a TMA descriptor
+    (no such constant) and WS-compiles + wins, so the fused / deployment path keeps WS. CUDA-only;
+    a no-op where ``SWIZZLED_SCALES`` isn't a kernel arg (defaults to allowing WS)."""
 
     def ok(c, args):
         if not c.kwargs.get("WARP_SPEC"):
@@ -1144,16 +1144,19 @@ def swizzled_scales_bm_pruner():
     """``early_config_prune`` for the grouped MX pre-swizzled scale path (always on). Pin
     ``BLOCK_SIZE_M`` to 128: the offline act-quant lays each expert's scale slab out 128-padded,
     and the kernel's per-tile scale-block index (``pid_m``) only lines up when the M tile is
-    exactly 128 (``build_tile_layout`` pads experts on the same 128 granularity). Under GATE also
-    pin ``BLOCK_SIZE_N`` to 128 — the wrapper interleaves each tile's gate-128 and up-128 weight-
-    scale rows into one contiguous 2*BN block, a layout tied to BN=128."""
+    exactly 128 (``build_tile_layout`` pads experts on the same 128 granularity).
+
+    Pin ``BLOCK_SIZE_N`` to 128 on the swizzled arm (gate and non-gate): the scale is read as whole
+    128-row SWIZZLE_32_4_4 blocks off the descriptor (under GATE, the gate 128-block + the up
+    128-block stacked into the 2*BN tile). A sub-128 BN would need a partial-block read the
+    descriptor can't express. The un-swizzled (affine) arm takes any BN."""
 
     def ok(c, args):
         if config_dim(c, args, "BLOCK_SIZE_M") != 128:
             return False
-        if args.get("GATE") and args.get("SWIZZLED_SCALES"):
-            return config_dim(c, args, "BLOCK_SIZE_N") == 128
-        return True
+        if not args.get("SWIZZLED_SCALES"):
+            return True
+        return config_dim(c, args, "BLOCK_SIZE_N") == 128
 
     return config_filter(ok)
 
@@ -1631,15 +1634,20 @@ def load_swizzled_scale_tile(
       ``(blk*cols4 + col//4)*512 + (r%32)*16 + ((r%128)//32)*4 + col%4``. Reads only the needed
       bytes — no 128-block over-read, no un-swizzle transpose — the row-major fast path's cost with
       the swizzled layout, so ``scalar`` competes on merit instead of eating a TMA penalty."""
+    # Per-expert 128-row-block count is a CEIL: a non-128-multiple ``rows`` (e.g. N=2880) still
+    # occupies ceil(rows/128) blocks in the buffer (the swizzle builder pads the partial last block;
+    # its tail rows read zero-weight via the TMA OOB clamp, so they don't contribute). ``cdiv == floor``
+    # when ``rows`` is 128-aligned, so this is inert for every aligned shape.
+    nrb = (rows + 127) // 128
     if BLOCK % 128 == 0 and SCALE_COLS >= 4 and SCALE_COLS % 4 == 0:
         REP: tl.constexpr = BLOCK // 128
-        # absolute 128-block base = group_id*(rows//128) + pid*REP; load_swizzled_scale multiplies
-        # blk by REP, and rows % BLOCK == 0 makes (rows//128) divisible by REP, so this is exact.
-        blk = (group_id * (rows // 128) // REP + pid).to(tl.int32)
+        # absolute 128-block base = group_id*nrb + pid*REP; load_swizzled_scale multiplies blk by REP.
+        # Non-128 ``rows`` (odd ``nrb``) pins REP=1 (BN=128) in the pruner, so group_id*nrb//REP is exact.
+        blk = (group_id * nrb // REP + pid).to(tl.int32)
         return load_swizzled_scale(descriptor, blk, k_idx, REP, SCALE_COLS // 4, BLOCK, SCALE_COLS)
     cols4 = (K // SCALE_GROUP_K + 3) // 4  # cdiv: the buffer pads cols to whole 4-group chunks
     r = pid * BLOCK + tl.arange(0, BLOCK)
-    blk = group_id * (rows // 128) + r // 128
+    blk = group_id * nrb + r // 128
     row = r % 128
     col = k_idx * SCALE_COLS + tl.arange(0, SCALE_COLS)
     off = (
@@ -2866,10 +2874,16 @@ def load_weight(
     if RECIPE == "mx":
         SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
         if GROUPED:
-            n_blocks: tl.constexpr = (2 if GATE else 1) * BLOCK_SIZE_N
-            if SWIZZLED_SCALES:  # pre-swizzled scale at row-block blk_idx (one 2*BN block under GATE)
+            if SWIZZLED_SCALES:
+                # gate|up reads as ONE 2*BN tile: the pre-swizzled buffer block-interleaves gate/up
+                # per N-tile ([g0,u0,g1,u1,...]), so the stacked scale is 2*(BN//128) contiguous
+                # 128-blocks at the same block index (``blk_idx``) the values use — a single descriptor
+                # bulk-load, no join. GATE folds into the REP/width only, keeping this read byte-for-byte
+                # the plain path's (which warp-specialization already lowers).
+                NREP: tl.constexpr = (2 if GATE else 1) * (BLOCK_SIZE_N // 128)
+                NW: tl.constexpr = (2 if GATE else 1) * BLOCK_SIZE_N
                 b_s = load_swizzled_scale(
-                    bs_descriptor, blk_idx, k, n_blocks // 128, SCALE_COLS // 4, n_blocks, SCALE_COLS
+                    bs_descriptor, blk_idx, k, NREP, SCALE_COLS // 4, NW, SCALE_COLS
                 )
             else:  # affine per-group read off the un-swizzled 3D Bs (num_experts, n_rows, K//g).
                 # Inlined (not load_weight_scale_tile): the nested leaf breaks warp-specialization
@@ -2881,7 +2895,7 @@ def load_weight(
                     rows2 = tl.arange(0, 2)[:, None] * N + offs_bn[None, :]
                     b_s = tl.reshape(
                         tl.load(base + rows2[:, :, None] * stride_bs_n + offs_sf[None, None, :] * stride_bs_k),
-                        (n_blocks, SCALE_COLS),
+                        (2 * BLOCK_SIZE_N, SCALE_COLS),
                     )
                 else:
                     b_s = tl.load(base + offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k)
@@ -3109,11 +3123,11 @@ def weight_tile_ptrs(
 def flatten_weight_tile(
     w3, N2: tl.constexpr, KB: tl.constexpr, GATE: tl.constexpr, SWAP_AB: tl.constexpr
 ):
-    """Flatten a loaded gate|up tile (see ``weight_tile_ptrs``) to the 2D MMA tile. With
-    ``GATE`` the stacked 3D tile collapses to the 2D stacked form: swap ``[N2, KB]`` (rows-major
-    MMA lhs), no-swap ``[KB, N2]`` (K-major rhs); columns/rows 0..N-1 are gate, N..2N-1 up
-    (``split_gate_up`` undoes it after the K-loop). Without ``GATE`` the tile is already 2D and
-    passes through unchanged (``N2``/``KB`` unused)."""
+    """Flatten a loaded gate|up weight tile (see ``weight_tile_ptrs``) to the 2D MMA tile. Under
+    ``GATE`` the stacked 3D tile (gate half + up half) collapses to the 2D form: swap ``[N2, KB]``
+    (rows-major MMA lhs), no-swap ``[KB, N2]`` (K-major rhs), where ``N2 = 2*TN == BN`` — cols
+    ``0..TN-1`` gate, ``TN..2TN-1`` up (the epilogue's ``split_gate_up`` undoes it). Without ``GATE``
+    the tile is already 2D and passes through unchanged (``N2``/``KB`` unused)."""
     if GATE:
         if SWAP_AB:
             w2 = tl.reshape(w3, (N2, KB))
@@ -3858,57 +3872,6 @@ def swizzle_grouped_mx_scales(
             NUM_EXPERTS_POW2=E,
         )
     return out.view(scale.dtype), n_m_tiles
-
-
-@triton.jit
-def _swizzle_gateup_weight_scales_kernel(
-    SRC,  # (E * 2N, cols) row-major gate|up weight scales (uint8)
-    DST,  # flat SWIZZLE_32_4_4 output (1, E * 2 * (N // 128), NCB, 2, 256)
-    N,  # per-projection width
-    COLS,
-    NCB,  # cols // 4
-    NT,  # N // 128 (n weight-N tiles per projection)
-    stride_src_m,
-):
-    """Swizzle the gate|up weight scales into the layout the grouped kernel reads as one
-    contiguous 2*BN block per tile — gate-128 then up-128 interleaved per (expert, pid_n). The
-    interleave is derived in-kernel from the output block id (no torch index tensor / gather):
-    output 128-block ``b = 2*(e*NT + pid_n) + gu`` maps to source rows ``e*2N + gu*N +
-    pid_n*128 + i``."""
-    b = tl.program_id(0)
-    cb = tl.program_id(1)
-    gu = b % 2
-    enp = b // 2
-    pid_n = enp % NT
-    e = enp // NT
-    rows = e * (2 * N) + gu * N + pid_n * 128 + tl.arange(0, 128)
-    cj = cb * 4 + tl.arange(0, 4)
-    s = tl.load(
-        SRC + rows[:, None] * stride_src_m + cj[None, :],
-        mask=cj[None, :] < COLS,
-        other=0,
-    )
-    swizzle_store_block(DST, s, b, cb, NCB)
-
-
-def swizzle_gateup_weight_scales(
-    scale: torch.Tensor, num_experts: int, N: int
-) -> torch.Tensor:
-    """Fused swizzle of the ``(E, 2N, cols)`` gate|up weight scales into the grouped kernel's
-    interleaved SWIZZLE_32_4_4 layout — one launch, the gate/up interleave computed in-kernel
-    (no ``torch.arange`` index, no gather). Returns the ``(1, E * 2 * (N//128), cols//4, 2, 256)``
-    swizzled tensor; the caller builds the GEMM's scale descriptor from it."""
-    E, nt = num_experts, N // 128
-    cols = scale.shape[2]
-    ncb = triton.cdiv(cols, 4)
-    n_blocks = E * 2 * nt
-    src = scale.reshape(E * 2 * N, cols).view(torch.uint8)
-    out = torch.empty(1, n_blocks, ncb, 2, 256, device=scale.device, dtype=torch.uint8)
-    with device_context(scale.device):
-        compile_time_only_triton_wrap(_swizzle_gateup_weight_scales_kernel)[
-            (n_blocks, ncb)
-        ](src, out, N, cols, ncb, nt, src.stride(0))
-    return out.view(scale.dtype)
 
 
 def maybe_act_quant(x, act_quant, min_m):
