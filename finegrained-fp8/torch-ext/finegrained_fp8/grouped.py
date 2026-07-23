@@ -22,55 +22,15 @@ from ._ops import add_op_namespace_prefix
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
-from .utils import (
-    acc_init,
-    compile_time_only_triton_op,
-    compile_time_only_triton_wrap,
-    Epilogue,
-    Quantization,
-    resolve_output_dtype,
-    FP8_DTYPE,
-    NIBBLES_PER_BYTE,
-    block_dynamic_grouped_matmul_pruner,
-    mx_config_pruner,
-    build_tile_layout,
-    resolve_grouped_tile,
-    block_within_dim_pruner,
-    require_moe_dims_aligned,
-    compose_pruners,
-    device_context,
-    sm_count,
-    tl_dtype,
-    fp8_act_quant_block_dynamic,
-    fp8_act_quant_tensor_wide,
-    expert_weight_shape,
-    mx_scale_family,
-    normalize_per_expert_scale,
-    validate_dense_operands,
-    routed_rows,
-    tokens_per_expert_bucket,
-    resolve_input_recipe,
-    load_act,
-    load_weight,
-    accumulate,
-    descriptor_box_pruner,
-    weight_tile_ptrs,
-    operand_tile_ptrs,
-    gemm_epilogue,
-    get_accelerator_autotuning_configs,
-    warp_spec_compile_guard_pruner,
-    affine_scale_warp_spec_pruner,
-    smem_pruner,
-    is_mx,
-    combine_global_scales,
-    weight_block_size,
-    e2m1_as_uint8,
-    ue8m0_as_uint8,
-    swizzle_grouped_mx_scales,
-    mx_act_quant_swizzled_grouped,
-    MX_ACT_QUANT,
-    swizzled_scales_bm_pruner,
-)
+from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, sm_count, tl_dtype
+from .recipes import Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size
+from .tile_layout import build_tile_layout
+from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_swizzled_grouped, swizzle_grouped_mx_scales
+from .mma import accumulate
+from .scheduling import resolve_grouped_tile
+from .tiles import load_act, load_weight, operand_tile_ptrs, weight_tile_ptrs
+from .epilogue import acc_init, gemm_epilogue
+from .pruners import affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
 
 
 def _rebind_grouped_weight_descriptor(nargs):
@@ -821,6 +781,11 @@ def mx_dynamic_matmul_grouped_kernel(
             )
         )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_ka, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
+        # Non-128 N: the partial last N-tile's pointer-arm rows wrap into B (offs_bn % N) so the load
+        # never reads past the expert's N rows; the wrapped columns' output is masked off (N_COLS) in
+        # the epilogue. Inert when N % BLOCK_SIZE_N == 0. The descriptor arm uses n_off (OOB-clamped),
+        # and the scale rides blk_idx off the padded swizzled block — neither depends on offs_bn.
+        offs_bn = offs_bn % N
         # descriptor box coordinates: expert slab (x2 under GATE — the gate + up blocks), N offset,
         # K-byte offsets per operand; without a gather the A rows are the contiguous sorted
         # positions, so their min IS the box row start
@@ -908,6 +873,7 @@ def mx_dynamic_matmul_grouped_kernel(
             SWIZZLED_OUT=SWIZZLED_OUT,  # single source: the wrapper decided it and built Cs to match
             CSDescriptor=CSDescriptor,
             CsGlobal=CsGlobal,
+            N_COLS=N,  # mask the partial last N-tile's column tail (non-128 N; inert when N % BN == 0)
         )
 
 
@@ -1519,12 +1485,20 @@ def mx_dynamic_matmul_grouped(
     output_dtype = resolve_output_dtype(output_dtype, A, As)
     input_recipe = resolve_input_recipe(input_recipe, output_recipe, Bs)
     requant = output_recipe is not None
-    # Only the swizzled arm structurally needs N%128 (128-row SWIZZLE_32_4_4 scale blocks). The
-    # affine arm tiles N by any BN | N (block_within_dim_pruner).
-    if swizzled_scales and N % 128 != 0:
+    # Non-128 N on the swizzled arm (bf16, non-gate): each expert's weight-scale slab pads to
+    # cdiv(N,128) whole 128-row SWIZZLE_32_4_4 blocks, so the partial last N-tile reads a full (padded)
+    # scale block off the descriptor and a TMA-clamped (zero) weight tile; the epilogue masks the
+    # column tail (N_COLS) and %-wraps the pointer-arm rows. Two non-128 cases stay unsupported:
+    #   - GATE: the gate|up split at row N lands mid-128-block unless N % 128 == 0 (gate tail and up
+    #     head share a swizzle block), so the block-level gate/up interleave needs each projection
+    #     padded to a 128 multiple first — a weight-layout change, not done here.
+    #   - requant: the swizzled Cs store is correct per band, but the round-trip is not yet right for
+    #     a non-multiple-of-4 N-group count (N//group not a multiple of 4) — under investigation.
+    if swizzled_scales and N % 128 != 0 and (gate or requant):
         raise ValueError(
-            f"the swizzled routed MX path needs N ({N}) a multiple of 128 (128-row scale blocks); "
-            f"non-128 N runs on the un-swizzled arm or the dense matmul_2d op."
+            f"the swizzled routed MX path supports non-128 N ({N}) only for the plain (non-gate) "
+            f"bf16 GEMM; gate|up needs N a multiple of 128, requant needs the un-swizzled arm or the "
+            f"dense matmul_2d op."
         )
     scale_dtype = ue8m0_as_uint8(Bs).dtype  # UE8M0 -> uint8, NVFP4 -> e4m3 (binder-safe)
     # Activation scales track the weight layout (SWIZZLED_SCALES, one flag): swizzled weight ->

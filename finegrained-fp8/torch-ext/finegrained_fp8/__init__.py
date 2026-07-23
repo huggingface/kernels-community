@@ -8,7 +8,9 @@ from .moe import (
     moe_unfused_grouped,
     moe_torch_grouped,
 )
-from .utils import Epilogue, Quantization, compute_grouped_scheduling, swizzle_mx_scales
+from .recipes import Epilogue, Quantization
+from .swizzle import swizzle_mx_scales
+from .scheduling import compute_grouped_scheduling
 
 __all__ = [
     # 2D matmul

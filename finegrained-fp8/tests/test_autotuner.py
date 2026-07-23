@@ -30,7 +30,8 @@ from utils import TEST_DEVICE, make_weights
 import finegrained_fp8  # type: ignore
 import finegrained_fp8.matmul  # type: ignore
 from finegrained_fp8.bayesian_autotuner import bayesian_autotune  # type: ignore
-from finegrained_fp8.utils import is_sm10x, mx_config_pruner  # type: ignore
+from finegrained_fp8.compat import is_sm10x  # type: ignore
+from finegrained_fp8.pruners import mx_config_pruner  # type: ignore
 
 
 @pytest.mark.kernels_ci

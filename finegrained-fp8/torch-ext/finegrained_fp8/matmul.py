@@ -19,53 +19,14 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
-from .utils import (
-    Epilogue,
-    Quantization,
-    resolve_output_dtype,
-    load_act,
-    load_weight,
-    accumulate,
-    advance_ptrs,
-    FP8_DTYPE,
-    compile_time_only_triton_op,
-    compile_time_only_triton_wrap,
-    NIBBLES_PER_BYTE,
-    acc_init,
-    mx_config_pruner,
-    smem_pruner,
-    scalar_max_m_pruner,
-    gate_pointer_only_pruner,
-    block_within_dim_pruner,
-    compose_pruners,
-    descriptor_box_pruner,
-    descriptor_needs_prequant_pruner,
-    matched_memory_modes_pruner,
-    device_context,
-    fp8_act_quant_tensor_wide,
-    fp8_act_quant_block_dynamic,
-    operand_tile_ptrs,
-    mx_2d_scale_ptrs,
-    gate_stacked_block_scale_ptrs,
-    matmul_weight_ptrs,
-    gemm_epilogue,
-    tl_dtype,
-    operand_tile_descriptor,
-    get_accelerator_autotuning_configs,
-    warp_spec_compile_guard_pruner,
-    is_mx,
-    combine_global_scales,
-    maybe_act_quant,
-    MX_ACT_QUANT,
-    mx_scale_family,
-    resolve_input_recipe,
-    store_masked,
-    store_masked_oriented,
-    swizzle_offsets,
-    validate_dense_2d_operands,
-    e2m1_as_uint8,
-    ue8m0_as_uint8,
-)
+from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
+from .recipes import Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, is_mx, mx_scale_family, resolve_input_recipe, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands
+from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, maybe_act_quant
+from .scales import gate_stacked_block_scale_ptrs, mx_2d_scale_ptrs
+from .mma import accumulate
+from .tiles import advance_ptrs, load_act, load_weight, matmul_weight_ptrs, operand_tile_descriptor, operand_tile_ptrs, swizzle_offsets
+from .epilogue import acc_init, gemm_epilogue, store_masked, store_masked_oriented
+from .pruners import block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, gate_pointer_only_pruner, matched_memory_modes_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, warp_spec_compile_guard_pruner
 
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
 # ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.

@@ -51,12 +51,10 @@ from utils import (  # type: ignore
 
 import finegrained_fp8  # type: ignore
 from finegrained_fp8 import Epilogue, Quantization, swizzle_mx_scales  # type: ignore
-from finegrained_fp8.utils import (  # type: ignore
-    NVFP4_SCALE_GROUP_K,
-    apply_glu,
-    nvfp4_act_quant,
-    ue8m0_as_uint8,
-)
+from finegrained_fp8.compat import NVFP4_SCALE_GROUP_K  # type: ignore
+from finegrained_fp8.recipes import ue8m0_as_uint8  # type: ignore
+from finegrained_fp8.quant import nvfp4_act_quant  # type: ignore
+from finegrained_fp8.epilogue import apply_glu  # type: ignore
 
 
 # ── the scenario spec ─────────────────────────────────────────────────────────────
@@ -203,6 +201,7 @@ def scenarios() -> list[Problem]:
         # (its scales are 128-blocked along N — raises pointing to matmul_2d).
         Problem(weights="fp8_128x128", N=320, K=1024),
         Problem(weights="mxfp8", N=320, K=1024),
+        Problem(weights="mxfp8", N=320, K=1024, swizzled=True),  # non-128 N on the swizzled arm (bf16 out, all 3 ops)
         Problem(weights="mxfp4", input_recipe="mxfp4", N=320, K=320),  # W4A4 non-128 N and K
         Problem(weights="mxfp4", gate=True, input_recipe="mxfp4", output_recipe="mxfp4", N=320, K=320),  # gated W4A4 non-128 (gpt-oss gate_up)
         # output/input dtype coverage (fp16 + fp32) across the FP8 and MX kernels — the recipe matrix
@@ -285,8 +284,9 @@ def _swizzle_bs(op, gate, Bs, N, K):
     if gate:
         # Gate|up ``(E, 2N, K//g)`` swizzles as a 2N-row per-expert slab (gate rows [0,N) then up
         # [N,2N) -> blocks [g0..,u0..]); block-interleave to [g0,u0,g1,u1,...] so the kernel reads a
-        # tile's gate + up 128-blocks as one contiguous 2*(BN//128)-block descriptor load.
-        nrbN = triton.cdiv(rows // 2, 128)
+        # tile's gate + up 128-blocks as one contiguous 2*(BN//128)-block descriptor load. Requires
+        # N % 128 == 0 (else the gate/up split lands mid-block); the wrapper guards non-128 gate.
+        nrbN = triton.cdiv(N, 128)
         per_expert = [
             swizzle_mx_scales(bs_u8[e])
             .reshape(2, nrbN, cb, 2, 256)

@@ -37,20 +37,11 @@ import torch
 
 from .grouped import matmul_grouped
 from .batched import matmul_batched
-from .utils import (
-    Epilogue,
-    Quantization,
-    apply_glu,
-    compute_grouped_scheduling,
-    weighted_reduce,
-    is_mx,
-    is_mxfp8,
-    is_mxfp4,
-    is_nvfp4,
-    _launch_act_quant,
-    MX_SCALE_GROUP_K,
-    NVFP4_SCALE_GROUP_K,
-)
+from .compat import MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, weighted_reduce
+from .recipes import Epilogue, Quantization, is_mx, is_mxfp4, is_mxfp8, is_nvfp4
+from .quant import _launch_act_quant
+from .scheduling import compute_grouped_scheduling
+from .epilogue import apply_glu
 
 
 def _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale):
