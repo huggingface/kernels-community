@@ -233,6 +233,74 @@ def test_affine_qmv(K=256, N=128, group_size=128, bits=4, dtype=torch.float16):
     return ok
 
 
+def test_affine_qmm_t_batched(shape=(4, 1, 256), K=256, N=128, group_size=128, bits=4,
+                              dtype=torch.float16):
+    """Every batch element must match its own reference, not just element 0."""
+    print(f"\n--- affine_qmm_t batched (x={shape}, N={N}, gs={group_size}, bits={bits}, {dtype}) ---")
+
+    device = "mps"
+    x = torch.randn(*shape, dtype=dtype, device=device)
+
+    w_float = torch.randn(N, K, dtype=torch.float32)
+    w_packed_cpu, scales_cpu, biases_cpu = affine_quantize(w_float, group_size, bits)
+
+    w_packed = w_packed_cpu.to(device)
+    scales = scales_cpu.to(dtype).to(device)
+    biases = biases_cpu.to(dtype).to(device)
+
+    y = quantization_mlx.affine_qmm_t(x, w_packed, scales, biases, group_size, bits)
+
+    w_deq = affine_dequantize(w_packed_cpu, scales_cpu.float(), biases_cpu.float(), group_size, bits)
+    w_deq = w_deq.to(dtype).to(device)
+    y_ref = (x.reshape(-1, K) @ w_deq.T).reshape(*shape[:-1], N)
+
+    # worst row, not mean: the bug corrupts whole batch elements
+    diff = (y.float() - y_ref.float()).abs().amax(dim=-1)
+    denom = y_ref.float().abs().amax(dim=-1) + 1e-6
+    worst = (diff / denom).max().item()
+
+    print(f"  output shape:      {tuple(y.shape)}")
+    print(f"  worst row rel err: {worst:.6f}")
+
+    ok = worst < 0.1
+    print("  PASS" if ok else "  FAIL")
+    return ok
+
+
+def test_affine_qmv_batched(shape=(2, 1, 256), N=128, group_size=128, bits=4,
+                            dtype=torch.float16):
+    """Multi-row / batched qmv: every row and batch element must be computed."""
+    K = shape[-1]
+    print(f"\n--- affine_qmv batched (x={shape}, N={N}, gs={group_size}, bits={bits}, {dtype}) ---")
+
+    device = "mps"
+    x = torch.randn(*shape, dtype=dtype, device=device)
+
+    w_float = torch.randn(N, K, dtype=torch.float32)
+    w_packed_cpu, scales_cpu, biases_cpu = affine_quantize(w_float, group_size, bits)
+
+    w_packed = w_packed_cpu.to(device)
+    scales = scales_cpu.to(dtype).to(device)
+    biases = biases_cpu.to(dtype).to(device)
+
+    y = quantization_mlx.affine_qmv(x, w_packed, scales, biases, N, group_size, bits)
+
+    w_deq = affine_dequantize(w_packed_cpu, scales_cpu.float(), biases_cpu.float(), group_size, bits)
+    w_deq = w_deq.to(dtype).to(device)
+    y_ref = (x.reshape(-1, K) @ w_deq.T).reshape(*shape[:-1], N)
+
+    diff = (y.float() - y_ref.float()).abs().amax(dim=-1)
+    denom = y_ref.float().abs().amax(dim=-1) + 1e-6
+    worst = (diff / denom).max().item()
+
+    print(f"  output shape:      {tuple(y.shape)}")
+    print(f"  worst row rel err: {worst:.6f}")
+
+    ok = worst < 0.1
+    print("  PASS" if ok else "  FAIL")
+    return ok
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -258,6 +326,16 @@ if __name__ == "__main__":
     # affine_qmv tests
     results.append(test_affine_qmv(K=256, N=128, bits=4))
     results.append(test_affine_qmv(K=512, N=256, bits=4))
+
+    # batched tests
+    for bits in (4, 8):
+        for dt in (torch.float16, torch.bfloat16):
+            results.append(test_affine_qmm_t_batched(shape=(4, 1, 256), K=256, N=128, bits=bits, dtype=dt))
+            results.append(test_affine_qmm_t_batched(shape=(2, 4, 256), K=256, N=128, bits=bits, dtype=dt))
+            results.append(test_affine_qmm_t_batched(shape=(2, 2, 2, 256), K=256, N=128, bits=bits, dtype=dt))
+            results.append(test_affine_qmv_batched(shape=(4, 256), N=128, bits=bits, dtype=dt))
+            results.append(test_affine_qmv_batched(shape=(2, 1, 256), N=128, bits=bits, dtype=dt))
+            results.append(test_affine_qmv_batched(shape=(2, 4, 256), N=128, bits=bits, dtype=dt))
 
     print(f"\n{'='*50}")
     passed = sum(results)

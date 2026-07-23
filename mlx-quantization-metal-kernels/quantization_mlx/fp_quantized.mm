@@ -86,39 +86,52 @@ void set_tensor(id<MTLComputeCommandEncoder> enc,
          atIndex:index];
 }
 
-// Set batch metadata: ndim, shape, strides for the first `batch_dims` dims.
-// If tensor has no batch dims, passes ndim=1, shape={1}, strides={0}.
+// Batch metadata: batch_ndim = dim - matrix_dims (min 1); the full
+// shape/strides are sent so kernels can read shape[batch_ndim] (qmv's M).
 void set_batch_dims(id<MTLComputeCommandEncoder> enc,
                     const torch::Tensor& t,
-                    int matrix_dims,  // 2 for matmul, 1 for matvec
+                    int matrix_dims,
                     int& idx) {
   int total = t.dim();
   int batch_ndim = std::max(total - matrix_dims, 0);
-  if (batch_ndim == 0) batch_ndim = 1;
 
-  std::vector<int>     shape(batch_ndim, 1);
-  std::vector<int64_t> strides(batch_ndim, 0);
-  if (total > matrix_dims) {
-    for (int i = 0; i < total - matrix_dims; ++i) {
-      shape[i]   = static_cast<int>(t.size(i));
-      strides[i] = t.stride(i);
-    }
+  std::vector<int>     shape;
+  std::vector<int64_t> strides;
+  if (batch_ndim == 0) {
+    batch_ndim = 1;
+        shape.push_back(1);
+    strides.push_back(0);
   }
-  [enc setBytes:&batch_ndim length:sizeof(int)                        atIndex:idx++];
-  [enc setBytes:shape.data()   length:batch_ndim * sizeof(int)        atIndex:idx++];
-  [enc setBytes:strides.data() length:batch_ndim * sizeof(int64_t)    atIndex:idx++];
+  for (int i = 0; i < total; ++i) {
+    shape.push_back(static_cast<int>(t.size(i)));
+    strides.push_back(t.stride(i));
+  }
+  [enc setBytes:&batch_ndim length:sizeof(int)                       atIndex:idx++];
+  [enc setBytes:shape.data()   length:shape.size() * sizeof(int)     atIndex:idx++];
+  [enc setBytes:strides.data() length:strides.size() * sizeof(int64_t) atIndex:idx++];
 }
 
-// Set only strides for the first `batch_ndim` dimensions.
+// Batch strides only; zeros when the tensor is shared across the batch.
 void set_strides(id<MTLComputeCommandEncoder> enc,
                  const torch::Tensor& t,
+                 int matrix_dims,
                  int batch_ndim,
                  int& idx) {
   std::vector<int64_t> strides(batch_ndim, 0);
-  for (int i = 0; i < std::min(batch_ndim, (int)t.dim()); ++i) {
+  int batch_dims = std::max((int)t.dim() - matrix_dims, 0);
+  for (int i = 0; i < std::min(batch_dims, batch_ndim); ++i) {
     strides[i] = t.stride(i);
   }
   [enc setBytes:strides.data() length:batch_ndim * sizeof(int64_t) atIndex:idx++];
+}
+
+// Kernels assume row-contiguous matrix dims; only batch dims may be strided.
+torch::Tensor ensure_matrix_contiguous(const torch::Tensor& t) {
+  if (t.dim() < 2) {
+    return t.is_contiguous() ? t : t.contiguous();
+  }
+  bool ok = t.stride(-1) == 1 && t.stride(-2) == t.size(-1);
+  return ok ? t : t.contiguous();
 }
 
 } // namespace
@@ -164,7 +177,7 @@ static void mxfp4_qmm_n_dispatch(
     set_batch_dims(encoder, w, 2, idx);
 
     // scales strides (13)
-    set_strides(encoder, scales, std::max((int)w.dim() - 2, 1), idx);
+    set_strides(encoder, scales, 2, std::max((int)w.dim() - 2, 1), idx);
 
     // Grid
     int grid_x = (N + 31) / 32;
@@ -185,10 +198,12 @@ static void mxfp4_qmv_dispatch(
     const torch::Tensor& w,
     const torch::Tensor& scales,
     torch::Tensor& y) {
-  // For qmv, w is [N, K_packed], x is [..., K], y is [..., N]
-  bool batched = x.dim() > 1;
+  // For qmv, w is [N, K_packed], x is [..., M, K], y is [..., M, N].
+  // Rows are covered by grid.x (tid.x offsets), batch elements by grid.z.
+  bool batched = x.dim() > 2;
   int K = static_cast<int>(x.size(-1));
   int N = static_cast<int>(y.size(-1));
+  int M = x.dim() >= 2 ? static_cast<int>(x.size(-2)) : 1;
 
   std::stringstream ss;
   ss << "mxfp4_qmv_" << type_str(x.scalar_type())
@@ -212,18 +227,18 @@ static void mxfp4_qmv_dispatch(
     [encoder setBytes:&N length:sizeof(int) atIndex:idx++]; // 5: out_vec_size
 
     // Batch metadata (6,7,8 = x; 9,10,11 = w; 12 = s_strides)
-    set_batch_dims(encoder, x, 1, idx);
+    set_batch_dims(encoder, x, 2, idx);
     set_batch_dims(encoder, w, 2, idx);
     int w_batch_ndim = std::max((int)w.dim() - 2, 1);
-    set_strides(encoder, scales, w_batch_ndim, idx);
+    set_strides(encoder, scales, 2, w_batch_ndim, idx);
 
     // Grid: each threadgroup handles results_per_simdgroup=4 output rows,
     // with num_simdgroups=2.
     int rows_per_tg = 8; // num_simdgroups(2) * results_per_simdgroup(4)
     int grid_y = (N + rows_per_tg - 1) / rows_per_tg;
-    int grid_z = batched ? static_cast<int>(x.numel() / K) : 1;
+    int grid_z = batched ? static_cast<int>(x.numel() / (M * K)) : 1;
 
-    [encoder dispatchThreadgroups:MTLSizeMake(1, grid_y, grid_z)
+    [encoder dispatchThreadgroups:MTLSizeMake(M, grid_y, grid_z)
             threadsPerThreadgroup:MTLSizeMake(32 * 2, 1, 1)]; // 2 simdgroups
   }
 }
@@ -234,6 +249,16 @@ static void mxfp4_qmv_dispatch(
 
 at::Tensor mxfp4_qmm_n(
     at::Tensor x, at::Tensor w, at::Tensor scales, int64_t output_features) {
+  x = ensure_matrix_contiguous(x);
+  w = ensure_matrix_contiguous(w);
+  scales = ensure_matrix_contiguous(scales);
+  // Dense batches run as one 2D GEMM; the grid.z path is ~Bx slower at M=1.
+  if (x.dim() > 2 && x.is_contiguous()) {
+    auto y = mxfp4_qmm_n(x.reshape({-1, x.size(-1)}), w, scales, output_features);
+    auto out_sizes = x.sizes().vec();
+    out_sizes.back() = y.size(-1);
+    return y.view(out_sizes);
+  }
   // x: [..., M, K], y: [..., M, N]
   auto out_sizes = x.sizes().vec();
   out_sizes.back() = output_features;
@@ -244,6 +269,16 @@ at::Tensor mxfp4_qmm_n(
 
 at::Tensor mxfp4_qmv(
     at::Tensor x, at::Tensor w, at::Tensor scales, int64_t output_features) {
+  x = ensure_matrix_contiguous(x);
+  w = ensure_matrix_contiguous(w);
+  scales = ensure_matrix_contiguous(scales);
+  // Dense batches run as one 2D GEMM; the grid.z path is ~Bx slower at M=1.
+  if (x.dim() > 2 && x.is_contiguous()) {
+    auto y = mxfp4_qmv(x.reshape({-1, x.size(-1)}), w, scales, output_features);
+    auto out_sizes = x.sizes().vec();
+    out_sizes.back() = y.size(-1);
+    return y.view(out_sizes);
+  }
   // x: [..., K], y: [..., N]
   auto out_sizes = x.sizes().vec();
   out_sizes.back() = output_features;
