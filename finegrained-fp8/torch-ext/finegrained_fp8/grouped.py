@@ -26,9 +26,20 @@ from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, co
 from .recipes import Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size
 from .tile_layout import build_tile_layout
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_swizzled_grouped, swizzle_grouped_mx_scales
-from .mma import accumulate
+from .mma import block_dynamic_dot, fp8_dot, mx_compute, static_dot
 from .scheduling import resolve_grouped_tile
-from .tiles import load_act, load_weight, operand_tile_ptrs, weight_tile_ptrs
+from .tiles import (
+    load_act_block_dynamic,
+    load_act_mx,
+    load_act_plain,
+    load_act_static,
+    load_weight_block_dynamic,
+    load_weight_mx,
+    load_weight_plain,
+    load_weight_static,
+    operand_tile_ptrs,
+    weight_tile_ptrs,
+)
 from .epilogue import acc_init, gemm_epilogue
 from .pruners import affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
 
@@ -216,7 +227,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = (
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
             resolve_grouped_tile(
                 tile_id,
                 num_n_tiles,
@@ -228,6 +239,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
                 ScatterIdx,
                 BLOCK_SIZE_N,
                 BLOCK_SIZE_M,
+                GATE,
             )
         )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
@@ -248,29 +260,18 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         # (up_s_ptr dead, == gate_s_ptr).
         gate_s_ptr = Bs + expert_id64 * stride_bs_e + pid_n * stride_bs_n
         up_s_ptr = Bs + expert_id64 * stride_bs_e + (num_n_tiles + pid_n) * stride_bs_n
-        # descriptor box coordinates: expert slab (x2 under GATE), N offset; without a
-        # gather the A rows are contiguous, so their min IS the box row start
-        row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
-        n_off = pid_n * BLOCK_SIZE_N
-        m_start = tl.min(in_row).to(tl.int32)
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-            a, a_s = load_act(
-                "block_dynamic", a_ptrs, as_ptrs, None, row_mask, row_mask, ADescriptor,
-                m_start, k * BLOCK_SIZE_K, A_MEMORY_MODE, GatherIdx is not None,
-                GROUPED=True, gather_rows=in_row, k=k,
+            a, a_s = load_act_block_dynamic(
+                a_ptrs, as_ptrs, row_mask, row_mask, ADescriptor, m_start, k * BLOCK_SIZE_K,
+                in_row, k, A_MEMORY_MODE, GatherIdx is not None, True, False,
             )
-            w, w_s = load_weight(
-                "block_dynamic", b_ptrs, gate_s_ptr, None, BDescriptor,
-                n_off, k * BLOCK_SIZE_K, B_MEMORY_MODE, False, GATE, True,
-                up_s_ptr=up_s_ptr, row0=row0, k=k, stride_bs_k=stride_bs_k,
-                BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
+            w, w_s = load_weight_block_dynamic(
+                b_ptrs, BDescriptor, gate_s_ptr, None, up_s_ptr, row0, n_off, k * BLOCK_SIZE_K, k,
+                stride_bs_k, GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
             )
-            acc = accumulate(
-                acc, a, a_s, w, w_s, "block_dynamic", "dot", False, USE_DOT_SCALED,
-                BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
-            )
+            acc = block_dynamic_dot(acc, a, a_s, w, w_s, BLOCK_SIZE_K, False, USE_DOT_SCALED, False)
             a_ptrs += BLOCK_SIZE_K * stride_a_k
             b_ptrs += BLOCK_SIZE_K * stride_b_k
 
@@ -387,7 +388,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = (
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
             resolve_grouped_tile(
                 tile_id,
                 num_n_tiles,
@@ -399,6 +400,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
                 ScatterIdx,
                 BLOCK_SIZE_N,
                 BLOCK_SIZE_M,
+                GATE,
             )
         )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
@@ -414,27 +416,18 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
         )
         gate_s_ptr = Bs + expert_id64 * stride_bs_e + pid_n * stride_bs_n
         up_s_ptr = Bs + expert_id64 * stride_bs_e + (num_n_tiles + pid_n) * stride_bs_n
-        row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
-        n_off = pid_n * BLOCK_SIZE_N
-        m_start = tl.min(in_row).to(tl.int32)
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-            a, a_dead = load_act(
-                "static", a_ptrs, a_ptrs, None, row_mask, row_mask, ADescriptor,
-                m_start, k * BLOCK_SIZE_K, A_MEMORY_MODE, GatherIdx is not None,
-                GROUPED=True, gather_rows=in_row,
+            a, a_dead = load_act_static(
+                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row, 0.0,
+                A_MEMORY_MODE, GatherIdx is not None,
             )
-            w, w_s = load_weight(
-                "static", b_ptrs, gate_s_ptr, None, BDescriptor,
-                n_off, k * BLOCK_SIZE_K, B_MEMORY_MODE, False, GATE, True,
-                up_s_ptr=up_s_ptr, row0=row0, k=k, stride_bs_k=stride_bs_k,
-                BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
+            w, w_s = load_weight_static(
+                b_ptrs, BDescriptor, gate_s_ptr, None, up_s_ptr, row0, n_off, k * BLOCK_SIZE_K, k,
+                stride_bs_k, GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
             )
-            acc = accumulate(
-                acc, a, a_dead, w, w_s, "static", "dot", False, False,
-                BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
-            )
+            acc = static_dot(acc, a, w, w_s, False, BLOCK_SIZE_K, False)
             # Explicit advance like the block-dynamic grouped sibling — advance_ptrs does not
             # compile in the grouped loop (the weight block scale is read via k inside the leaf,
             # and the static act scale is a scalar; only the operand pointers move).
@@ -558,7 +551,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = (
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
             resolve_grouped_tile(
                 tile_id,
                 num_n_tiles,
@@ -570,6 +563,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
                 ScatterIdx,
                 BLOCK_SIZE_N,
                 BLOCK_SIZE_M,
+                GATE,
             )
         )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
@@ -587,28 +581,18 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         )
         a_s = tl.load(As + in_row * stride_as_m, mask=row_mask, other=0.0)
         b_s = tl.load(Bs + expert_id64 * stride_bs_e)
-        # descriptor box coordinates: expert slab (x2 under GATE), N offset; without a
-        # gather the A rows are contiguous, so their min IS the box row start
-        row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
-        n_off = pid_n * BLOCK_SIZE_N
-        m_start = tl.min(in_row).to(tl.int32)
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-            a, _as = load_act(
-                "tensor", a_ptrs, As, None, row_mask, row_mask, ADescriptor,
-                m_start, k * BLOCK_SIZE_K, A_MEMORY_MODE, GatherIdx is not None,
-                GROUPED=True, gather_rows=in_row,
+            a, _as = load_act_plain(
+                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
+                A_MEMORY_MODE, GatherIdx is not None,
             )
-            w, _ws = load_weight(
-                "tensor", b_ptrs, Bs, None, BDescriptor,
-                n_off, k * BLOCK_SIZE_K, B_MEMORY_MODE, False, GATE, True,
-                row0=row0, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
+            w, _ws = load_weight_plain(
+                b_ptrs, BDescriptor, row0, n_off, k * BLOCK_SIZE_K,
+                GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
             )
-            acc = accumulate(
-                acc, a, _as, w, _ws, "tensor", "dot", False, False,
-                BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
-            )
+            acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
             a_ptrs += BLOCK_SIZE_K * stride_a_k
             b_ptrs += BLOCK_SIZE_K * stride_b_k
         # per-token activation scale and per-expert tensor weight scale, applied once post-loop
@@ -766,7 +750,7 @@ def mx_dynamic_matmul_grouped_kernel(
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
 
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = (
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
             resolve_grouped_tile(
                 tile_id,
                 num_n_tiles,
@@ -778,6 +762,7 @@ def mx_dynamic_matmul_grouped_kernel(
                 ScatterIdx,
                 BLOCK_SIZE_N,
                 BLOCK_SIZE_M,
+                GATE,
             )
         )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_ka, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
@@ -786,12 +771,6 @@ def mx_dynamic_matmul_grouped_kernel(
         # the epilogue. Inert when N % BLOCK_SIZE_N == 0. The descriptor arm uses n_off (OOB-clamped),
         # and the scale rides blk_idx off the padded swizzled block — neither depends on offs_bn.
         offs_bn = offs_bn % N
-        # descriptor box coordinates: expert slab (x2 under GATE — the gate + up blocks), N offset,
-        # K-byte offsets per operand; without a gather the A rows are the contiguous sorted
-        # positions, so their min IS the box row start
-        row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
-        n_off = pid_n * BLOCK_SIZE_N
-        m_start = tl.min(in_row).to(tl.int32)
         kb_off = 0
         ka_off = 0
         # GATE stacks the gate + up 128-blocks (the up block sits N rows away) into a 2*BN tile; a
@@ -818,25 +797,22 @@ def mx_dynamic_matmul_grouped_kernel(
         pid_m = tile_id // num_n_tiles
         weight_blk = (expert_id64 * num_n_tiles + pid_n).to(tl.int32)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-            a, a_s = load_act(
-                "mx", a_ptrs, As, None, row_mask, row_mask, ADescriptor, m_start, ka_off,
-                A_MEMORY_MODE, GatherIdx is not None, GROUPED=True,
-                as_descriptor=ASDescriptor, as_ptr=As, gather_rows=in_row, stride_as_m=stride_as_m,
-                pid_m=pid_m, k=k, M=0, K=K, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_K=BLOCK_SIZE_K,
-                SCALE_GROUP_K=SCALE_GROUP_K, SWIZZLED_SCALES=SWIZZLED_SCALES,
+            a, a_s = load_act_mx(
+                a_ptrs, As, None, row_mask, row_mask, ADescriptor, m_start, ka_off,
+                ASDescriptor, As, in_row, stride_as_m, pid_m, k, 0, K,
+                A_MEMORY_MODE, GatherIdx is not None, True, SWIZZLED_SCALES,
+                BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, "mxfp8",
             )
-            w, w_s = load_weight(
-                "mx", b_ptrs, Bs, None, BDescriptor,
-                n_off, kb_off, B_MEMORY_MODE, False, GATE, True,
-                bs_descriptor=BSDescriptor, blk_idx=weight_blk, expert_id=expert_id64,
-                pid_n=pid_n, k=k, N=N,
-                stride_bs_e=stride_bs_e, stride_bs_n=stride_bs_n, stride_bs_k=stride_bs_k, row0=row0,
-                BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K, SCALE_GROUP_K=SCALE_GROUP_K,
-                SWIZZLED_SCALES=SWIZZLED_SCALES, WEIGHT_VALUES_PER_BYTE=WEIGHT_VALUES_PER_BYTE,
+            w, w_s = load_weight_mx(
+                b_ptrs, BDescriptor, Bs, None, BSDescriptor, 0, row0, n_off, kb_off,
+                weight_blk, expert_id64, pid_n, k, N, K,
+                stride_bs_e, stride_bs_n, stride_bs_k,
+                GATE, True, False, B_MEMORY_MODE, False, SWIZZLED_SCALES,
+                BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
             )
-            acc = accumulate(
-                acc, a, a_s, w, w_s, "mx", COMPUTE_MODE, False, False,
-                BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K,
+            acc = mx_compute(
+                acc, a, a_s, w, w_s, COMPUTE_MODE,
+                BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, False,
             )
             a_ptrs += (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k
             ka_off += BLOCK_SIZE_K // ACT_VALUES_PER_BYTE
@@ -957,7 +933,7 @@ def full_precision_matmul_grouped_kernel(
     num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
-        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn = (
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
             resolve_grouped_tile(
                 tile_id,
                 num_n_tiles,
@@ -969,6 +945,7 @@ def full_precision_matmul_grouped_kernel(
                 ScatterIdx,
                 BLOCK_SIZE_N,
                 BLOCK_SIZE_M,
+                GATE,
             )
         )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
@@ -985,28 +962,18 @@ def full_precision_matmul_grouped_kernel(
             GATE,
             False,
         )
-        # descriptor box coordinates: expert slab (x2 under GATE), N offset, K offset;
-        # without a gather the A rows are contiguous, so their min IS the box row start
-        row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
-        n_off = pid_n * BLOCK_SIZE_N
-        m_start = tl.min(in_row).to(tl.int32)
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-            a, _as = load_act(
-                "full_precision", a_ptrs, A, None, row_mask, row_mask, ADescriptor,
-                m_start, k * BLOCK_SIZE_K, A_MEMORY_MODE, GatherIdx is not None,
-                GROUPED=True, gather_rows=in_row,
+            a, _as = load_act_plain(
+                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
+                A_MEMORY_MODE, GatherIdx is not None,
             )
-            w, _ws = load_weight(
-                "full_precision", b_ptrs, B, None, BDescriptor,
-                n_off, k * BLOCK_SIZE_K, B_MEMORY_MODE, False, GATE, True,
-                row0=row0, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
+            w, _ws = load_weight_plain(
+                b_ptrs, BDescriptor, row0, n_off, k * BLOCK_SIZE_K,
+                GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
             )
-            acc = accumulate(
-                acc, a, _as, w, _ws, "full_precision", "dot", False, False,
-                BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
-            )
+            acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
             a_ptrs += BLOCK_SIZE_K * stride_a_k
             b_ptrs += BLOCK_SIZE_K * stride_b_k
 

@@ -23,8 +23,22 @@ from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, co
 from .recipes import Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, is_mx, mx_scale_family, resolve_input_recipe, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, maybe_act_quant
 from .scales import gate_stacked_block_scale_ptrs, mx_2d_scale_ptrs
-from .mma import accumulate
-from .tiles import advance_ptrs, load_act, load_weight, matmul_weight_ptrs, operand_tile_descriptor, operand_tile_ptrs, swizzle_offsets
+from .mma import block_dynamic_dot, fp8_dot, mx_compute, static_dot
+from .tiles import (
+    advance_ptrs,
+    load_act_block_dynamic,
+    load_act_mx,
+    load_act_plain,
+    load_act_static,
+    load_weight_block_dynamic,
+    load_weight_mx,
+    load_weight_plain,
+    load_weight_static,
+    matmul_weight_ptrs,
+    operand_tile_descriptor,
+    operand_tile_ptrs,
+    swizzle_offsets,
+)
 from .epilogue import acc_init, gemm_epilogue, store_masked, store_masked_oriented
 from .pruners import block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, gate_pointer_only_pruner, matched_memory_modes_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, warp_spec_compile_guard_pruner
 
@@ -241,18 +255,16 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
-        a, a_s = load_act(
-            "block_dynamic", a_ptrs, as_ptrs, None, None, as_mask, a_descriptor,
-            pid_m * BLOCK_SIZE_M, k * block_k, A_MEMORY_MODE, SWAP_AB=SWAP_AB,
+        a, a_s = load_act_block_dynamic(
+            a_ptrs, as_ptrs, None, as_mask, a_descriptor, pid_m * BLOCK_SIZE_M, k * block_k,
+            0, 0, A_MEMORY_MODE, False, False, SWAP_AB,
         )
-        b, b_s = load_weight(
-            "block_dynamic", b_ptrs, bs_ptrs, bs_mask, b_descriptor,
-            pid_n * BLOCK_SIZE_N, k * block_k, B_MEMORY_MODE, SWAP_AB, GATE,
-            BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=block_k,
+        b, b_s = load_weight_block_dynamic(
+            b_ptrs, b_descriptor, bs_ptrs, bs_mask, 0, 0, pid_n * BLOCK_SIZE_N, k * block_k, 0, 0,
+            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, block_k,
         )
-        accumulator = accumulate(
-            accumulator, a, a_s, b, b_s, "block_dynamic", "dot", SWAP_AB, USE_DOT_SCALED,
-            BLOCK_SIZE_M, n_width, block_k,
+        accumulator = block_dynamic_dot(
+            accumulator, a, a_s, b, b_s, block_k, SWAP_AB, USE_DOT_SCALED, False
         )
         a_ptrs, as_ptrs, b_ptrs, bs_ptrs, _, _ = advance_ptrs(
             a_ptrs, as_ptrs, b_ptrs, bs_ptrs, b_ptrs, bs_ptrs,
@@ -356,15 +368,12 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     # Accumulate raw dot products, apply scales once after the loop.
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-        a, _as = load_act("tensor", a_ptrs, a_ptrs, None, None, None, a_ptrs, 0, 0, "pointer")
-        b, _bs = load_weight(
-            "tensor", b_ptrs, b_ptrs, None, b_ptrs, pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K,
-            "pointer", False, GATE, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
+        a, _as = load_act_plain(a_ptrs, a_ptrs, 0, 0, None, 0, "pointer", False)
+        b, _bs = load_weight_plain(
+            b_ptrs, b_ptrs, 0, pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K,
+            GATE, False, "pointer", False, BLOCK_SIZE_N, BLOCK_SIZE_K,
         )
-        accumulator = accumulate(
-            accumulator, a, _as, b, b_s, "tensor", "dot", False, False,
-            BLOCK_SIZE_M, n_width, BLOCK_SIZE_K,
-        )
+        accumulator = accumulator + fp8_dot(a, b, False, BLOCK_SIZE_K)
         a_ptrs, _asp, b_ptrs, _bsp, _, _ = advance_ptrs(
             a_ptrs, a_ptrs, b_ptrs, b_ptrs, b_ptrs, b_ptrs,
             BLOCK_SIZE_K * stride_a_k, 0, BLOCK_SIZE_K * stride_b_k, 0,
@@ -504,18 +513,15 @@ def w8a8_block_static_fp8_matmul_kernel(
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
-        a, _as = load_act(
-            "static", a_ptrs, a_ptrs, None, None, None, a_descriptor, pid_m * BLOCK_SIZE_M, k * block_k,
-            A_MEMORY_MODE, a_s_static=a_s_static,
+        a, _as = load_act_static(
+            a_ptrs, a_descriptor, pid_m * BLOCK_SIZE_M, k * block_k, None, 0, a_s_static,
+            A_MEMORY_MODE, False,
         )
-        b, b_s = load_weight(
-            "static", b_ptrs, bs_ptrs, bs_mask, b_descriptor, pid_n * BLOCK_SIZE_N, k * block_k,
-            B_MEMORY_MODE, False, GATE, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=block_k,
+        b, b_s = load_weight_static(
+            b_ptrs, b_descriptor, bs_ptrs, bs_mask, 0, 0, pid_n * BLOCK_SIZE_N, k * block_k, 0, 0,
+            GATE, False, B_MEMORY_MODE, False, BLOCK_SIZE_N, block_k,
         )
-        accumulator = accumulate(
-            accumulator, a, _as, b, b_s, "static", "dot", False, False,
-            BLOCK_SIZE_M, n_width, block_k,
-        )
+        accumulator = static_dot(accumulator, a, b, b_s, False, block_k, False)
         a_ptrs, _asp, b_ptrs, bs_ptrs, _, _ = advance_ptrs(
             a_ptrs, a_ptrs, b_ptrs, bs_ptrs, b_ptrs, bs_ptrs,
             block_k * stride_a_k, 0, block_k * stride_b_k, stride_bs_k,
@@ -689,25 +695,22 @@ def mx_dynamic_matmul_kernel(
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-        a, a_s = load_act(
-            "mx", a_ptrs, as_ptrs, AsGlobal, None, as_mask, ADescriptor, pid_m * BLOCK_SIZE_M,
-            k * (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE), A_MEMORY_MODE,
-            as_descriptor=ASDescriptor, as_ptr=As, pid_m=pid_m, k=k, M=M, K=K,
-            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_K=BLOCK_SIZE_K, SCALE_GROUP_K=SCALE_GROUP_K,
-            SWIZZLED_SCALES=SWIZZLED_SCALES, INPUT_RECIPE=INPUT_RECIPE,
+        a, a_s = load_act_mx(
+            a_ptrs, as_ptrs, AsGlobal, None, as_mask, ADescriptor, pid_m * BLOCK_SIZE_M,
+            k * (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE), ASDescriptor, As, 0, 0, pid_m, k, M, K,
+            A_MEMORY_MODE, False, False, SWIZZLED_SCALES,
+            BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, INPUT_RECIPE,
         )
-        b, b_s = load_weight(
-            "mx", b_ptrs, bs_ptrs, bs_mask, BDescriptor, pid_n * BLOCK_SIZE_N,
-            k * (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE), B_MEMORY_MODE, False,
-            bs_descriptor=BSDescriptor, bs_ptr=Bs, pid_n=pid_n, k=k, N=N, K=K,
-            BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K, SCALE_GROUP_K=SCALE_GROUP_K,
-            SWIZZLED_SCALES=SWIZZLED_SCALES, GATE=GATE,
-            WEIGHT_VALUES_PER_BYTE=WEIGHT_VALUES_PER_BYTE,
-            stride_bs_n=stride_bs_n, stride_bs_k=stride_bs_k,
+        b, b_s = load_weight_mx(
+            b_ptrs, BDescriptor, bs_ptrs, bs_mask, BSDescriptor, Bs, 0, pid_n * BLOCK_SIZE_N,
+            k * (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE), 0, 0, pid_n, k, N, K,
+            0, stride_bs_n, stride_bs_k,
+            GATE, False, False, B_MEMORY_MODE, False, SWIZZLED_SCALES,
+            BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
         )
-        accumulator = accumulate(
-            accumulator, a, a_s, b, b_s, "mx", COMPUTE_MODE, False, False,
-            BLOCK_SIZE_M, n_width, BLOCK_SIZE_K, SCALE_GROUP_K,
+        accumulator = mx_compute(
+            accumulator, a, a_s, b, b_s, COMPUTE_MODE,
+            BLOCK_SIZE_M, n_width, BLOCK_SIZE_K, SCALE_GROUP_K, False,
         )
         a_ptrs, as_ptrs, b_ptrs, bs_ptrs, _, _ = advance_ptrs(
             a_ptrs, as_ptrs, b_ptrs, bs_ptrs, b_ptrs, bs_ptrs,
@@ -798,14 +801,11 @@ def full_precision_matmul_2d_kernel(
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
         a = tl.load(a_ptrs)
-        w, _ = load_weight(
-            "full_precision", b_ptrs, b_ptrs, None, b_ptrs, pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K,
-            "pointer", False, GATE, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
+        w, _ = load_weight_plain(
+            b_ptrs, b_ptrs, 0, pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K,
+            GATE, False, "pointer", False, BLOCK_SIZE_N, BLOCK_SIZE_K,
         )
-        accumulator = accumulate(
-            accumulator, a, a, w, w, "full_precision", "dot", False, False,
-            BLOCK_SIZE_M, n_width, BLOCK_SIZE_K,
-        )
+        accumulator = accumulator + fp8_dot(a, w, False, BLOCK_SIZE_K)
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
 

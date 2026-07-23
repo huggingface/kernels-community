@@ -36,7 +36,6 @@ from .quant import *  # noqa: F401,F403
 from .scales import *  # noqa: F401,F403
 
 
-
 @triton.jit
 def mx_dot_scaled(acc, a, a_scale, w, w_scale):
     """MX 'dot_scaled' path: scaled MMA folding the UE8M0 group scales into the tensor core —
@@ -47,7 +46,6 @@ def mx_dot_scaled(acc, a, a_scale, w, w_scale):
     lhs_format: tl.constexpr = "e2m1" if a.dtype == tl.uint8 else "e4m3"
     rhs_format: tl.constexpr = "e2m1" if w.dtype == tl.uint8 else "e4m3"
     return tl.dot_scaled(a, a_scale, lhs_format, w, w_scale, rhs_format, acc)
-
 
 
 @triton.jit
@@ -61,7 +59,6 @@ def mx_dot_rescale(acc, a, w, a_scale, w_scale):
     return acc + tl.dot(aq, wq) * decode_group_scale(a_scale) * tl.trans(
         decode_group_scale(w_scale)
     )
-
 
 
 @triton.jit
@@ -99,7 +96,6 @@ def mx_scalar_reduce(
         decode_group_scale(w_scale)
     )
     return acc + tl.sum(grp * scale, axis=0)[None, :]
-
 
 
 @triton.jit
@@ -154,7 +150,6 @@ def mx_compute(
     return acc
 
 
-
 # ── swap-AB decode compute: M=1 batched GEMV with output rows in the MMA M dim ───────
 #
 # The batched (decode) kernels are structurally M=1, where the sm_100 scaled MMA pads M→128.
@@ -169,7 +164,6 @@ def mx_compute(
 # block size — BLOCK_SIZE_M stays 1 under swap; this is the token's *padded N extent*, fixed by the
 # hardware. Assigned via tl.constexpr(...), the only module-global form a @triton.jit fn can read.
 MMA_N_ATOM = tl.constexpr(16)
-
 
 
 @triton.jit
@@ -208,7 +202,6 @@ def mx_dot_scaled_swapped(
     return tl.dot_scaled(w, w_scale, fmt, rhs, asc, rhs_fmt, acc)
 
 
-
 @triton.jit
 def mx_dot_rescale_swapped(
     acc,
@@ -234,7 +227,6 @@ def mx_dot_rescale_swapped(
     a_s = decode_group_scale(a_scale)  # [1] — the single group's token scale
     w_s = decode_group_scale(w_scale)  # [ROWS, 1] — per output row
     return acc + tl.dot(wq, rhs) * w_s * a_s
-
 
 
 @triton.jit
@@ -263,7 +255,6 @@ def mx_scalar_reduce_swapped(
     grp = tl.sum(tl.reshape(prod, (ROWS_W, NG, SCALE_GROUP_K)), axis=2)  # [ROWS_W, NG]
     scale = decode_group_scale(a_scale)[None, :] * decode_group_scale(w_scale)
     return acc + tl.reshape(tl.sum(grp * scale, axis=1), (1, ROWS_W))
-
 
 
 @triton.jit
@@ -316,7 +307,6 @@ def mx_swap_compute(
     return acc
 
 
-
 @triton.jit
 def swap_pad_rhs(a, BLOCK_SIZE_K: tl.constexpr):
     """Pad the ``[BLOCK_SIZE_K]`` M=1 token to the ``[BLOCK_SIZE_K, MMA_N_ATOM]`` swap-AB MMA rhs —
@@ -328,7 +318,6 @@ def swap_pad_rhs(a, BLOCK_SIZE_K: tl.constexpr):
         a[:, None],
         tl.zeros((BLOCK_SIZE_K, MMA_N_ATOM), a.dtype),
     )
-
 
 
 @triton.jit
@@ -343,7 +332,6 @@ def fp8_dot(a, b, SWAP_AB: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
     else:
         out = tl.dot(a, b)
     return out
-
 
 
 @triton.jit
@@ -384,56 +372,17 @@ def block_dynamic_dot(
     return acc
 
 
-
 @triton.jit
-def accumulate(
-    acc,
-    a,
-    a_s,
-    b,
-    b_s,
-    RECIPE: tl.constexpr,
-    COMPUTE_MODE: tl.constexpr,
-    SWAP_AB: tl.constexpr,
-    USE_DOT_SCALED: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    SCALE_GROUP_K: tl.constexpr = 32,
-    FAKE_BATCH: tl.constexpr = False,
-):
-    """Unified K-step accumulate — the single "do math" of every matmul/grouped/batched kernel,
-    dispatched by ``RECIPE`` so the kernel loops are identical:
-
-    - ``"mx"``: microscaled MMA / dot+rescale / scalar (``mx_compute``), swap-aware.
-    - ``"block_dynamic"``: UE8M0 ``dot_scaled`` broadcast or fp8 ``tl.dot`` + software rescale
-      (``block_dynamic_dot``).
-    - ``"static"``: plain (swap-aware) dot + per-K-block weight rescale (the per-tensor act scale
-      is applied post-loop).
-    - ``"tensor"`` / ``"full_precision"``: plain (swap-aware) dot; per-row/per-tensor scale (if any)
-      is applied post-loop in the epilogue.
-
-    ``FAKE_BATCH`` (single-token decode) routes the block_dynamic/static rescale down the weight-row
-    (M) dim — the per-weight-row block scale sits there under the swap — and pads the lone token via
-    ``fp8_dot``; the prefill tiles broadcast the weight scale across the N columns instead.
-
-    Single return (if/elif/else) — only the taken recipe arm compiles, so the dead arms are
-    never type-checked (e.g. the ``fp8_dot`` arms would reject packed-E2M1 activations, whose
-    reduction dim is halved vs an unpacked weight). ``a_s``/``b_s`` are dead on the recipes that
-    scale post-loop."""
-    if RECIPE == "mx":
-        acc = mx_compute(
-            acc, a, a_s, b, b_s,
-            COMPUTE_MODE, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, SWAP_AB,
-        )
-    elif RECIPE == "block_dynamic":
-        acc = block_dynamic_dot(acc, a, a_s, b, b_s, BLOCK_SIZE_K, SWAP_AB, USE_DOT_SCALED, FAKE_BATCH)
-    elif RECIPE == "static":
-        b_sd = decode_group_scale(b_s)
-        if FAKE_BATCH:
-            acc = acc + fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K) * b_sd[:, None]
-        else:
-            acc = acc + fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K) * b_sd[None, :]
-    else:  # tensor / full_precision
-        acc = acc + fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K)
+def static_dot(acc, a, b, b_s, SWAP_AB: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, FAKE_BATCH: tl.constexpr):
+    """static recipe K-step: plain (swap-aware) fp8 dot + per-K-block weight rescale. FAKE_BATCH
+    (single-token decode) routes the rescale down the weight-row (M) dim; else it broadcasts across
+    the N columns. The per-tensor activation scale is applied post-loop."""
+    b_sd = decode_group_scale(b_s)
+    d = fp8_dot(a, b, SWAP_AB, BLOCK_SIZE_K)
+    if FAKE_BATCH:
+        acc = acc + d * b_sd[:, None]
+    else:
+        acc = acc + d * b_sd[None, :]
     return acc
+
+

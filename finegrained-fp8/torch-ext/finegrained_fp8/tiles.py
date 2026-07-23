@@ -38,14 +38,12 @@ from .mma import *  # noqa: F401,F403
 from .scheduling import *  # noqa: F401,F403
 
 
-
 # A-sub-tile byte budget for the 1-byte-activation grouped-swizzle depth cap (see
 # swizzle_offsets): the co-scheduled rows' A tile per K-step (depth*BM*BK bytes) must stay
 # L2-hot to reuse, and past this it thrashes and the win collapses. ~512KB is a wave
 # reuse-window, NOT gross L2 (0.4% of the B200's 132MB) — a B200 measurement (2026-07-16), so
 # RE-MEASURE per device. Packed fp4 bypasses this (full grouping wins; see swizzle_offsets).
 SWIZZLE_GROUP_A_BYTES = tl.constexpr(524288)
-
 
 
 @triton.jit
@@ -92,7 +90,6 @@ def swizzle_offsets(
     return pid_m, pid_n, offs_am, offs_bn, offs_k
 
 
-
 @triton.jit
 def operand_tile_descriptor(
     HostDescriptor,
@@ -123,7 +120,6 @@ def operand_tile_descriptor(
     return descriptor
 
 
-
 @triton.jit
 def load_grouped_act_tile(
     a_ptrs,
@@ -151,7 +147,6 @@ def load_grouped_act_tile(
     else:
         a = a_descriptor.load([m_start, ka_off])
     return a
-
 
 
 @triton.jit
@@ -186,7 +181,6 @@ def load_grouped_weight_tile(
     return w
 
 
-
 @triton.jit
 def load_weight_tile(
     w_ptrs, w_descriptor, row_off, k_off, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr = False
@@ -203,7 +197,6 @@ def load_weight_tile(
         if not SWAP_AB:
             w = tl.trans(w)
     return w
-
 
 
 @triton.jit
@@ -234,7 +227,7 @@ def matmul_weight_ptrs(
 
 
 @triton.jit
-def _load_act_mx(
+def load_act_mx(
     a_ptrs, as_ptrs, as_global, value_mask, scale_mask, a_descriptor, m_off, k_off,
     as_descriptor, as_ptr, gather_rows, stride_as_m, pid_m, k, M, K,
     A_MEMORY_MODE: tl.constexpr, A_GATHER: tl.constexpr, GROUPED: tl.constexpr,
@@ -276,7 +269,7 @@ def _load_act_mx(
 
 
 @triton.jit
-def _load_act_block_dynamic(
+def load_act_block_dynamic(
     a_ptrs, as_ptrs, value_mask, scale_mask, a_descriptor, m_off, k_off, gather_rows, k,
     A_MEMORY_MODE: tl.constexpr, A_GATHER: tl.constexpr, GROUPED: tl.constexpr,
     SWAP_AB: tl.constexpr,
@@ -296,7 +289,7 @@ def _load_act_block_dynamic(
 
 
 @triton.jit
-def _load_act_static(
+def load_act_static(
     a_ptrs, a_descriptor, m_off, k_off, value_mask, gather_rows, a_s_static,
     A_MEMORY_MODE: tl.constexpr, A_GATHER: tl.constexpr,
 ):
@@ -314,67 +307,16 @@ def _load_act_static(
 
 
 @triton.jit
-def load_act(
-    RECIPE: tl.constexpr,
-    a_ptrs,
-    as_ptrs,
-    as_global,  # (1,) fp32 NVFP4 act global (None off nvfp4); inline-quant normalize + acc recover
-    value_mask,  # activation-value row mask (None = maskless: the %-wrapped 2D / replicated decode tile)
-    scale_mask,  # affine-scale row mask (2D bounds, grouped padding); dead on the swizzled arm
-    a_descriptor,
-    m_off,
-    k_off,
-    A_MEMORY_MODE: tl.constexpr,
-    A_GATHER: tl.constexpr = False,
-    GROUPED: tl.constexpr = False,  # grouped affine scale is a per-(gathered-row, K-group) gather off As
-    SWAP_AB: tl.constexpr = False,
-    # scale sources — one per recipe path: swizzled descriptor / affine pointer / static scalar
-    as_descriptor=0,
-    as_ptr=0,
-    a_s_static=0.0,
-    gather_rows=0,
-    stride_as_m=0,
-    # tile position + runtime dims (swizzled + inline-quant paths)
-    pid_m=0,
-    k=0,
-    M=0,
-    K=0,
-    # tile + scale-grid constexprs
-    BLOCK_SIZE_M: tl.constexpr = 0,
-    BLOCK_SIZE_K: tl.constexpr = 0,
-    SCALE_GROUP_K: tl.constexpr = 32,
-    SWIZZLED_SCALES: tl.constexpr = False,
-    INPUT_RECIPE: tl.constexpr = "mxfp8",
+def load_act_plain(
+    a_ptrs, a_descriptor, m_off, k_off, value_mask, gather_rows,
+    A_MEMORY_MODE: tl.constexpr, A_GATHER: tl.constexpr,
 ):
-    """Unified activation K-tile as ``(values, scale)`` for every recipe AND op-shape (2D dense,
-    grouped gather, batched decode), so all loops read identically. The op-shape is carried by the
-    access params, not a per-op function (``A_MEMORY_MODE``, ``A_GATHER``, ``value_mask`` None =
-    maskless, ``GROUPED`` affine-scale gather). Each recipe is a ``_load_act_*`` leaf returning the
-    tile + its scale; ``tensor``/``full_precision`` have no scale (``a_s`` = the values, dead
-    post-loop). Only the taken recipe arm compiles."""
-    if RECIPE == "mx":
-        a, a_s = _load_act_mx(
-            a_ptrs, as_ptrs, as_global, value_mask, scale_mask, a_descriptor, m_off, k_off,
-            as_descriptor, as_ptr, gather_rows, stride_as_m, pid_m, k, M, K,
-            A_MEMORY_MODE, A_GATHER, GROUPED, SWIZZLED_SCALES,
-            BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, INPUT_RECIPE,
-        )
-    elif RECIPE == "block_dynamic":
-        a, a_s = _load_act_block_dynamic(
-            a_ptrs, as_ptrs, value_mask, scale_mask, a_descriptor, m_off, k_off, gather_rows, k,
-            A_MEMORY_MODE, A_GATHER, GROUPED, SWAP_AB,
-        )
-    elif RECIPE == "static":
-        a, a_s = _load_act_static(
-            a_ptrs, a_descriptor, m_off, k_off, value_mask, gather_rows, a_s_static,
-            A_MEMORY_MODE, A_GATHER,
-        )
-    else:  # tensor / full_precision — plain values, per-row/tensor scale folded post-loop
-        a = load_grouped_act_tile(
-            a_ptrs, a_descriptor, m_off, k_off, value_mask, gather_rows, A_MEMORY_MODE, A_GATHER
-        )
-        a_s = a
-    return a, a_s
+    """tensor / full_precision activation: plain value tile, no scale (returns ``(a, a)`` — the
+    second slot is dead, kept for the uniform (value, scale) shape)."""
+    a = load_grouped_act_tile(
+        a_ptrs, a_descriptor, m_off, k_off, value_mask, gather_rows, A_MEMORY_MODE, A_GATHER
+    )
+    return a, a
 
 
 @triton.jit
@@ -475,73 +417,85 @@ def _weight_scale_static(
 
 
 @triton.jit
-def load_weight(
-    RECIPE: tl.constexpr,
-    b_ptrs,
-    bs_ptrs,  # 2D affine/masked scale ptr (mx-non-GATE, block_dynamic, static); grouped: gate-scale base
-    bs_mask,  # 2D bounds mask; None on grouped / GATE (both maskless)
-    b_descriptor,
-    n_off,
-    k_off,
-    B_MEMORY_MODE: tl.constexpr,
-    SWAP_AB: tl.constexpr = False,
-    GATE: tl.constexpr = False,  # stacked (2N, K) gate|up tile + 2*BN scale block
-    GROUPED: tl.constexpr = False,  # grouped scale sources: per-expert base + separate gate/up streams
-    PER_EXPERT: tl.constexpr = False,  # batched decode: mx scale via the per-expert 3D load_weight_scale_tile
-    # scale sources — one per path: swizzled descriptor / affine 3D base / grouped up-stream
-    bs_descriptor=0,
-    bs_ptr=0,  # 2D swizzled / affine-GATE 3D base
-    up_s_ptr=0,  # grouped block_dynamic/static up-stream scale base
-    row0=0,  # grouped expert row base (value descriptor 3rd index; 0 for 2D)
-    blk_idx=0,  # grouped swizzled row-block index
-    expert_id=0,  # grouped affine-scale expert
-    # tile position + runtime dims (swizzled / affine paths)
-    pid_n=0,
-    k=0,
-    N=0,
-    K=0,
-    stride_bs_e=0,
-    stride_bs_n=0,
-    stride_bs_k=0,
-    # tile + scale-grid constexprs
-    BLOCK_SIZE_N: tl.constexpr = 0,
-    BLOCK_SIZE_K: tl.constexpr = 0,
-    SCALE_GROUP_K: tl.constexpr = 32,
-    SWIZZLED_SCALES: tl.constexpr = False,
-    WEIGHT_VALUES_PER_BYTE: tl.constexpr = 1,
+def _weight_value(
+    b_ptrs, b_descriptor, row0, n_off, k_off,
+    GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr,
+    SWAP_AB: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, KB: tl.constexpr,
 ):
-    """Unified weight K-tile as ``(values, scale)`` for every recipe AND op-shape (2D dense,
-    grouped gather, batched decode), mirroring ``load_act``. The VALUE load is recipe-agnostic
-    (op-shape carried by the access params: ``GATE``/``GROUPED`` stacked or per-expert-3D box at
-    ``row0``, else the plain swap-aware tile); the SCALE is a per-recipe leaf (``_weight_scale_*``).
-    ``tensor``/``full_precision`` have no block scale (``b_s`` = the values, dead post-loop). Only
-    the taken recipe arm compiles."""
-    KB: tl.constexpr = BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
-    SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
-    if GATE or GROUPED:  # stacked / per-expert-3D box (swap-aware pointer arm for batched decode)
-        b = load_grouped_weight_tile(
+    """Recipe-agnostic weight value tile: stacked / per-expert-3D box (GATE/GROUPED) or the plain
+    swap-aware tile. Shared by every ``load_weight_<recipe>`` — the value load never depends on the
+    scale recipe. Single-exit if/else (an early return would type-check the untaken arm — the plain
+    ``load_weight_tile``'s 2D descriptor load trips the 3D grouped weight descriptor)."""
+    if GATE or GROUPED:
+        w = load_grouped_weight_tile(
             b_ptrs, b_descriptor, row0, n_off, k_off, BLOCK_SIZE_N, KB, GATE, B_MEMORY_MODE, SWAP_AB
         )
     else:
-        b = load_weight_tile(b_ptrs, b_descriptor, n_off, k_off, B_MEMORY_MODE, SWAP_AB)
-    if RECIPE == "mx":
-        b_s = _weight_scale_mx(
-            bs_ptrs, bs_mask, bs_descriptor, bs_ptr, blk_idx, expert_id, pid_n, k, N, K,
-            stride_bs_e, stride_bs_n, stride_bs_k,
-            GROUPED, GATE, PER_EXPERT, SWIZZLED_SCALES, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K,
-        )
-    elif RECIPE == "block_dynamic":
-        b_s = _weight_scale_block_dynamic(
-            bs_ptrs, up_s_ptr, bs_mask, k, stride_bs_k, GROUPED, GATE, BLOCK_SIZE_N
-        )
-    elif RECIPE == "static":
-        b_s = _weight_scale_static(
-            bs_ptrs, up_s_ptr, bs_mask, k, stride_bs_k, GROUPED, GATE, BLOCK_SIZE_N
-        )
-    else:  # tensor / full_precision — no block scale
-        b_s = b
-    return b, b_s
+        w = load_weight_tile(b_ptrs, b_descriptor, n_off, k_off, B_MEMORY_MODE, SWAP_AB)
+    return w
 
+
+@triton.jit
+def load_weight_mx(
+    b_ptrs, b_descriptor, bs_ptrs, bs_mask, bs_descriptor, bs_ptr, row0, n_off, k_off,
+    blk_idx, expert_id, pid_n, k, N, K, stride_bs_e, stride_bs_n, stride_bs_k,
+    GATE: tl.constexpr, GROUPED: tl.constexpr, PER_EXPERT: tl.constexpr,
+    B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr, SWIZZLED_SCALES: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
+    WEIGHT_VALUES_PER_BYTE: tl.constexpr,
+):
+    """The MX weight path: value tile + pre-swizzled/affine group scale."""
+    KB: tl.constexpr = BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
+    SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
+    w = _weight_value(b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB)
+    w_s = _weight_scale_mx(
+        bs_ptrs, bs_mask, bs_descriptor, bs_ptr, blk_idx, expert_id, pid_n, k, N, K,
+        stride_bs_e, stride_bs_n, stride_bs_k,
+        GROUPED, GATE, PER_EXPERT, SWIZZLED_SCALES, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K,
+    )
+    return w, w_s
+
+
+@triton.jit
+def load_weight_block_dynamic(
+    b_ptrs, b_descriptor, bs_ptrs, bs_mask, up_s_ptr, row0, n_off, k_off, k, stride_bs_k,
+    GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, WEIGHT_VALUES_PER_BYTE: tl.constexpr = 1,
+):
+    """The block_dynamic weight path: value tile + per-K-block scale (gate on the first BN, up on the
+    rest via ``up_s_ptr``)."""
+    KB: tl.constexpr = BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
+    w = _weight_value(b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB)
+    w_s = _weight_scale_block_dynamic(bs_ptrs, up_s_ptr, bs_mask, k, stride_bs_k, GROUPED, GATE, BLOCK_SIZE_N)
+    return w, w_s
+
+
+@triton.jit
+def load_weight_static(
+    b_ptrs, b_descriptor, bs_ptrs, bs_mask, up_s_ptr, row0, n_off, k_off, k, stride_bs_k,
+    GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, WEIGHT_VALUES_PER_BYTE: tl.constexpr = 1,
+):
+    """The static weight path: value tile + per-K-block scale broadcast to a per-N vector (the static
+    act scale is a scalar folded post-loop)."""
+    KB: tl.constexpr = BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
+    w = _weight_value(b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB)
+    w_s = _weight_scale_static(bs_ptrs, up_s_ptr, bs_mask, k, stride_bs_k, GROUPED, GATE, BLOCK_SIZE_N)
+    return w, w_s
+
+
+@triton.jit
+def load_weight_plain(
+    b_ptrs, b_descriptor, row0, n_off, k_off,
+    GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, WEIGHT_VALUES_PER_BYTE: tl.constexpr = 1,
+):
+    """The tensor / full_precision weight path: plain value tile, no block scale (the per-tensor
+    scale, if any, is applied post-loop). Returns ``(w, w)`` so callers keep the uniform (value,
+    scale) shape; the second slot is dead."""
+    KB: tl.constexpr = BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
+    w = _weight_value(b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB)
+    return w, w
 
 
 @triton.jit
@@ -586,7 +540,6 @@ def advance_ptrs(
     return a_ptrs, as_ptrs, w_ptrs, ws_ptrs, w_up_ptrs, ws_up_ptrs
 
 
-
 @triton.jit
 def weight_tile_ptrs(
     base,
@@ -625,7 +578,6 @@ def weight_tile_ptrs(
     return ptrs
 
 
-
 @triton.jit
 def flatten_weight_tile(
     w3, N2: tl.constexpr, KB: tl.constexpr, GATE: tl.constexpr, SWAP_AB: tl.constexpr
@@ -645,7 +597,6 @@ def flatten_weight_tile(
     return w2
 
 
-
 @triton.jit
 def oriented_tile_ptrs(
     base, offs_rows, offs_k, stride_rows, stride_k, SWAP_AB: tl.constexpr
@@ -661,7 +612,6 @@ def oriented_tile_ptrs(
     else:
         ptrs = base + (offs_k[:, None] * stride_k + offs_rows[None, :] * stride_rows)
     return ptrs
-
 
 
 @triton.jit

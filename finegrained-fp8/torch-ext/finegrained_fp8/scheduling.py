@@ -195,6 +195,7 @@ def resolve_grouped_tile(
     ScatterIdx,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
+    GATE: tl.constexpr = False,
 ):
     """One persistent grouped tile: split the flat ``tile_id`` into (M-tile, N-tile), map
     the M-tile to its expert + rows via ``resolve_tile_inline`` (on the register-resident
@@ -203,11 +204,14 @@ def resolve_grouped_tile(
     ``ScatterIdx`` when present (``None`` = expert-sorted, the position itself; the ``None``
     check folds at trace time, so no separate has-gather/has-scatter flag is needed).
 
-    Returns ``(pid_n, expert_id, expert_id64, in_row, out_row, row_mask, offs_bn)`` — both
-    expert-id widths: ``expert_id`` (int32, e.g. TMA descriptor row indices, bounded by the
-    expert count) and ``expert_id64`` (int64, for byte-offset pointer arithmetic — ``expert
-    * stride`` overflows int32 at full expert counts). Shared by the base grouped GEMMs and
-    the fused kernels; callers ``_``-ignore whichever width they don't use."""
+    Returns ``(pid_n, expert_id, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off,
+    m_start)`` — both expert-id widths (``expert_id`` int32 for TMA descriptor row indices,
+    ``expert_id64`` int64 for byte-offset pointer arithmetic that overflows int32 at full expert
+    counts), plus the tile's derived load coordinates every grouped K-loop needs: ``row0`` (the
+    weight descriptor's expert-slab row base, ×2 under GATE for the gate|up stack), ``n_off`` (the
+    N-tile byte offset), and ``m_start`` (the contiguous sorted-row box start — ``min(in_row)``,
+    exact because a no-gather tile's rows are contiguous). Shared by the base grouped GEMMs and the
+    fused kernels; callers ``_``-ignore whichever fields they don't use."""
     pid_m = tile_id // num_n_tiles
     pid_n = tile_id % num_n_tiles
     expert_id, offs_global_m, row_mask = resolve_tile_inline(
@@ -221,5 +225,9 @@ def resolve_grouped_tile(
         out_row = tl.load(ScatterIdx + offs_global_m, mask=row_mask, other=0)
     else:
         out_row = offs_global_m
+    expert_id64 = expert_id.to(tl.int64)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    return pid_n, expert_id, expert_id.to(tl.int64), in_row, out_row, row_mask, offs_bn
+    row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
+    n_off = pid_n * BLOCK_SIZE_N
+    m_start = tl.min(in_row).to(tl.int32)
+    return pid_n, expert_id, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start
