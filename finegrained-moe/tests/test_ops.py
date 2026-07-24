@@ -49,12 +49,12 @@ from utils import (  # type: ignore
     unswizzle_mx_scales,
 )
 
-import finegrained_fp8  # type: ignore
-from finegrained_fp8 import Epilogue, Quantization, swizzle_mx_scales  # type: ignore
-from finegrained_fp8.compat import NVFP4_SCALE_GROUP_K  # type: ignore
-from finegrained_fp8.recipes import ue8m0_as_uint8  # type: ignore
-from finegrained_fp8.quant import nvfp4_act_quant  # type: ignore
-from finegrained_fp8.epilogue import apply_glu  # type: ignore
+import finegrained_moe  # type: ignore
+from finegrained_moe import Epilogue, Quantization, swizzle_mx_scales  # type: ignore
+from finegrained_moe.compat import NVFP4_SCALE_GROUP_K  # type: ignore
+from finegrained_moe.recipes import ue8m0_as_uint8  # type: ignore
+from finegrained_moe.quant import nvfp4_act_quant  # type: ignore
+from finegrained_moe.epilogue import apply_glu  # type: ignore
 
 
 # ── the scenario spec ─────────────────────────────────────────────────────────────
@@ -440,15 +440,15 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
     )
     globals_kw = dict(a_global_scale=As_global, b_global_scale=Bs_global)
     if op == "matmul":
-        fn = maybe_compile(finegrained_fp8.matmul_2d, problem.compile)
+        fn = maybe_compile(finegrained_moe.matmul_2d, problem.compile)
         return fn(A, B, As, bs, **globals_kw, **kw)
     if op == "batched":
-        fn = maybe_compile(finegrained_fp8.matmul_batched, problem.compile)
+        fn = maybe_compile(finegrained_moe.matmul_batched, problem.compile)
         return fn(A, B, As, bs, expert_ids=expert_ids, **globals_kw, **kw)
-    expert_start, gather_idx, scatter_idx = finegrained_fp8.compute_grouped_scheduling(
+    expert_start, gather_idx, scatter_idx = finegrained_moe.compute_grouped_scheduling(
         expert_ids, problem.E, 1
     )
-    fn = maybe_compile(finegrained_fp8.matmul_grouped, problem.compile)
+    fn = maybe_compile(finegrained_moe.matmul_grouped, problem.compile)
     raw = fn(
         A,
         B,

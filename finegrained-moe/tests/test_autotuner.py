@@ -27,11 +27,11 @@ import triton.language as tl
 
 from utils import TEST_DEVICE, make_weights
 
-import finegrained_fp8  # type: ignore
-import finegrained_fp8.matmul  # type: ignore
-from finegrained_fp8.bayesian_autotuner import bayesian_autotune  # type: ignore
-from finegrained_fp8.compat import is_sm10x  # type: ignore
-from finegrained_fp8.pruners import mx_config_pruner  # type: ignore
+import finegrained_moe  # type: ignore
+import finegrained_moe.matmul  # type: ignore
+from finegrained_moe.bayesian_autotuner import bayesian_autotune  # type: ignore
+from finegrained_moe.compat import is_sm10x  # type: ignore
+from finegrained_moe.pruners import mx_config_pruner  # type: ignore
 
 
 @pytest.mark.kernels_ci
@@ -140,7 +140,7 @@ def test_autotuner_survives_and_reports_failing_configs(caplog):
 
     x = torch.randn(64, device="cuda")
     y = torch.empty_like(x)
-    with caplog.at_level(logging.WARNING, logger="finegrained_fp8.bayesian_autotuner"):
+    with caplog.at_level(logging.WARNING, logger="finegrained_moe.bayesian_autotuner"):
         _copy_kernel[(1,)](x, y, 64)
     torch.cuda.synchronize()
     assert torch.equal(x, y)  # the good config won
@@ -199,13 +199,13 @@ def test_act_quant_arms_are_bit_equal():
         scale_dtype=torch.float8_e8m0fnu,
     )
     A = torch.randn(4, 512, device="cuda", dtype=torch.bfloat16)  # below the M gate
-    inline_out = finegrained_fp8.matmul_2d(A, B, Bs, None, torch.bfloat16)
-    saved = finegrained_fp8.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M
+    inline_out = finegrained_moe.matmul_2d(A, B, Bs, None, torch.bfloat16)
+    saved = finegrained_moe.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M
     try:
-        finegrained_fp8.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = 1  # force offline
-        offline_out = finegrained_fp8.matmul_2d(A, B, Bs, None, torch.bfloat16)
+        finegrained_moe.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = 1  # force offline
+        offline_out = finegrained_moe.matmul_2d(A, B, Bs, None, torch.bfloat16)
     finally:
-        finegrained_fp8.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = saved
+        finegrained_moe.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = saved
     assert torch.equal(inline_out, offline_out)
 
 
@@ -218,7 +218,7 @@ def test_cross_process_determinism_block_dynamic_grouped():
     across subprocesses — a cheap CI approximation of the 15-process flake harness."""
     script = (
         "import sys; sys.path.insert(0,'torch-ext'); sys.path.insert(0,'tests');\n"
-        "import torch; from utils import make_weights; import finegrained_fp8 as fg\n"
+        "import torch; from utils import make_weights; import finegrained_moe as fg\n"
         "torch.manual_seed(0)\n"
         "E,N,K,S=8,512,1024,256\n"
         "eids=torch.randint(0,E,(S,),device='cuda',dtype=torch.int32)\n"
@@ -265,7 +265,7 @@ def test_compile_failures_are_memoized_across_keys(caplog):
             offs = offs + tl.arange(0, 3)  # non-power-of-2 arange -> CompilationError
         tl.store(Y + offs, tl.load(X + offs, mask=offs < N), mask=offs < N)
 
-    with caplog.at_level(logging.WARNING, logger="finegrained_fp8.bayesian_autotuner"):
+    with caplog.at_level(logging.WARNING, logger="finegrained_moe.bayesian_autotuner"):
         for n in (32, 64):  # two shapes -> two tuning keys, same compile signature
             x = torch.randn(n, device="cuda")
             y = torch.empty_like(x)

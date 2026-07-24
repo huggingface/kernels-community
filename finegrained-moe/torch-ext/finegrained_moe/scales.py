@@ -174,14 +174,15 @@ def load_weight_scale_tile(
       un-swizzled caller pays nothing."""
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     if SWIZZLED_SCALES and GATE:
-        # scales swizzled over the full 2N rows/expert; gate tile at row-block pid_n, up tile
-        # N/BN blocks later. Stack [gate BN; up BN] -> (2*BN, SCALE_COLS).
+        # gate|up interleaved [g0,u0,g1,u1,...] over the 2N rows/expert (BN pinned 128): tile pid_n's
+        # gate 128-block sits at buffer block 2*pid_n, its up block at 2*pid_n+1. Read each as a
+        # single BN block (the REP=1 box the batched descriptor is built for) and stack [gate; up].
         gate_s = load_swizzled_scale_tile(
-            bs_descriptor, bs_ptr, expert_id, pid_n, k_idx, 2 * N, K,
+            bs_descriptor, bs_ptr, expert_id, 2 * pid_n, k_idx, 2 * N, K,
             BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K,
         )
         up_s = load_swizzled_scale_tile(
-            bs_descriptor, bs_ptr, expert_id, N // BLOCK_SIZE_N + pid_n, k_idx, 2 * N, K,
+            bs_descriptor, bs_ptr, expert_id, 2 * pid_n + 1, k_idx, 2 * N, K,
             BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K,
         )
         b_s = tl.reshape(tl.trans(tl.join(gate_s, up_s), 2, 0, 1), (n_width, SCALE_COLS))

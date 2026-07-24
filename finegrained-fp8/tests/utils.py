@@ -5,23 +5,7 @@ auto-loads it before any test module)."""
 
 import torch
 
-from finegrained_fp8.compat import MX_SCALE_GROUP_K  # type: ignore
-
-
-def unswizzle_mx_scales(swizzled: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
-    """Inverse of ``swizzle_mx_scales`` (no ``gather_idx``): a flat/ND SWIZZLE_32_4_4 buffer
-    back to the plain ``(rows, cols)`` row-major scale grid (padding trimmed). Test-only —
-    reads a kernel-produced swizzled scale (e.g. the fused gate_up requant Cs) for comparison."""
-    n_row_blocks = -(-rows // 128)
-    n_col_blocks = -(-cols // 4)
-    plain = (
-        swizzled.reshape(n_row_blocks * n_col_blocks, 32, 4, 4)
-        .transpose(1, 2)
-        .reshape(n_row_blocks, n_col_blocks, 128, 4)
-        .permute(0, 2, 1, 3)
-        .reshape(n_row_blocks * 128, n_col_blocks * 4)
-    )
-    return plain[:rows, :cols]
+from finegrained_fp8.utils import MX_SCALE_GROUP_K, NIBBLES_PER_BYTE  # type: ignore
 
 
 # ── Device + capability ───────────────────────────────────────────────────────
@@ -85,6 +69,12 @@ FP8_MAX = torch.finfo(FP8_DTYPE).max
 FP8_MIN = torch.finfo(FP8_DTYPE).min
 E2M1_MAX = 6.0  # largest magnitude on the E2M1 (FP4) grid
 
+# E2M1 decode LUT indexed by raw 4-bit code: high bit is sign, low 3 bits select
+# magnitude from {0, 0.5, 1, 1.5, 2, 3, 4, 6}.
+_E2M1_DECODE = (
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)  # fmt: skip
 # Midpoints between adjacent E2M1 magnitudes: round |x| to the nearest grid index.
 _E2M1_BOUNDARIES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 
@@ -233,204 +223,41 @@ def quant_dequant_a(
     return (A_fp8.float() * s).reshape(M, K)
 
 
-# ── shared weight-recipe registry (test_ops scenarios + test_moe fused problems) ──
-#
-# One row per support-matrix line: make(N, K, E) -> (B, Bs); dequant(B, Bs) -> fp32
-# (E, N, K); act_quant[recipe] -> the host quant fn the ops themselves call (None = the
-# family default applied to a raw A); dq_act dequantizes its output for the torch oracle.
-
-from finegrained_fp8.compat import NVFP4_SCALE_GROUP_K  # type: ignore
-from finegrained_fp8.quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant, nvfp4_quantize_two_level  # type: ignore
-
-_E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
-_E2M1_LUT = _E2M1_LUT + [-v for v in _E2M1_LUT]
-
-
-def dq_scale(s: torch.Tensor) -> torch.Tensor:
-    """Group scale to fp32 by dtype: E4M3 (NVFP4) reads directly, UE8M0 (uint8 or
-    float8_e8m0fnu) is 2^(exp-127), fp32 passes through."""
-    if s.dtype == torch.float8_e4m3fn:
-        return s.float()
-    if s.dtype in (torch.uint8, torch.float8_e8m0fnu):
-        return torch.pow(2.0, s.view(torch.uint8).float() - 127)
-    return s.float()
-
-
-def dq_e2m1(q: torch.Tensor) -> torch.Tensor:
-    """Packed E2M1 (two nibbles per byte along the last dim, low first) to fp32."""
-    lut = torch.tensor(_E2M1_LUT, device=q.device)
-    u = q.view(torch.uint8)
-    lo, hi = lut[(u & 0xF).long()], lut[(u >> 4).long()]
-    return torch.stack([lo, hi], dim=-1).reshape(*q.shape[:-1], q.shape[-1] * 2)
+def dequant_b(
+    B: torch.Tensor, Bs: torch.Tensor, block_n: int, block_k: int
+) -> torch.Tensor:
+    """Per-block weight dequant. ``B`` is E4M3 (one value/byte) or packed E2M1
+    (``int8``, two codes/byte = FP4); ``Bs`` is fp32 or UE8M0 (``2^(exp - 127)``)
+    block inv-scales, broadcast over ``block_n`` rows × ``block_k`` cols."""
+    if B.dtype == torch.int8:  # packed E2M1 (FP4): two codes per byte
+        N, K_half = B.shape
+        lut = torch.tensor(_E2M1_DECODE, dtype=torch.float32, device=B.device)
+        codes = B.to(torch.uint8).long()
+        B_vals = torch.stack(
+            [lut[codes & 0x0F], lut[(codes >> 4) & 0x0F]], dim=-1
+        ).reshape(N, K_half * NIBBLES_PER_BYTE)
+    else:
+        B_vals = B.float()
+    if Bs.dtype == torch.float8_e8m0fnu:
+        Bs = (Bs.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
+    N, K = B_vals.shape
+    scales_full = Bs.repeat_interleave(block_n, dim=0).repeat_interleave(
+        block_k, dim=1
+    )[:N, :K]
+    return B_vals * scales_full
 
 
-def dq_grouped(q: torch.Tensor, s: torch.Tensor, group: int) -> torch.Tensor:
-    """Dequantize group-scaled values (packed E2M1 or E4M3) along the last dim."""
-    v = dq_e2m1(q) if q.dtype in (torch.int8, torch.uint8) else q.float()
-    return v * torch.repeat_interleave(dq_scale(s), group, dim=-1)
+# ── Unified matmul reference ──────────────────────────────────────────────────
 
 
-def dq_block_fp8(B, Bs, block_n: int, block_k: int) -> torch.Tensor:
-    """(E, N, K) E4M3 + (E, ceil(N/bn), ceil(K/bk)) block inv-scales -> fp32. The scale grid tiles
-    with ceil, so a non-aligned N/K leaves a partial last block — trim the expanded scale to B."""
-    s = torch.repeat_interleave(
-        torch.repeat_interleave(dq_scale(Bs), block_n, dim=-2), block_k, dim=-1
-    )
-    return B.float() * s[..., : B.shape[-2], : B.shape[-1]]
-
-
-def _make_nvfp4(N, K, E):
-    """Canonical TWO-LEVEL NVFP4 weights: per-expert ``nvfp4_quantize_two_level`` — the block
-    e4m3 group-16 scale is ``Bs``, the per-expert fp32 global the separate ``Bs_global`` (the
-    decoupled API keeps the levels apart). Weights are drawn wide (×40) so the global is genuinely
-    != 1 (block amax/6 would overflow e4m3 without it) — a unit-global registry would pass even if
-    a kernel ignored the global."""
-    w = torch.randn(E, N, K, device=TEST_DEVICE, dtype=torch.bfloat16) * 40.0
-    qs = [nvfp4_quantize_two_level(w[e].contiguous()) for e in range(E)]
-    return (
-        torch.stack([q for q, _, _ in qs]),
-        torch.stack([block for _, block, _ in qs]),  # (E, N, K//16) e4m3 block scales
-        torch.cat([g for _, _, g in qs]),  # (E,) fp32 per-expert globals
-    )
-
-
-def dq_nvfp4_two_level(B, Bs, Bs_global):
-    """fp32 dequant of two-level NVFP4 weights: block dequant × the per-expert global. ``Bs`` is the
-    e4m3 block scale, ``Bs_global`` the ``(E,)`` fp32 per-expert global (both separate, per the make)."""
-    return dq_grouped(B, Bs, NVFP4_SCALE_GROUP_K) * Bs_global.reshape(-1, 1, 1)
-
-
-def _make_full(dtype):
-    def make(N, K, E):
-        return torch.randn(E, N, K, device=TEST_DEVICE, dtype=dtype) * 0.05, None, None
-
-    return make
-
-
-def _make_mx(weight_dtype, scale_dtype):
-    def make(N, K, E):
-        return (
-            *make_weights(
-                N,
-                K,
-                TEST_DEVICE,
-                [1, MX_SCALE_GROUP_K],
-                weight_dtype=weight_dtype,
-                scale_dtype=scale_dtype,
-                num_experts=E,
-            ),
-            None,  # single-level: no weight global
-        )
-
-    return make
-
-
-_MX_ACT = {None: mxfp8_act_quant, "mxfp8": mxfp8_act_quant, "mxfp4": mxfp4_act_quant}
-
-WEIGHTS = {
-    "fp8_128x128": dict(
-        make=lambda N, K, E: (*make_weights(N, K, TEST_DEVICE, [128, 128], num_experts=E), None),
-        dequant=lambda B, Bs, g=None: dq_block_fp8(B, Bs, 128, 128),
-        input_recipes=(None, "fp8"),
-        output_recipes=(None, "fp8"),
-        act_quant={
-            None: lambda A: fp8_act_quant_block_dynamic(A, 128),
-            "fp8": lambda A: fp8_act_quant_block_dynamic(A, 128),
-        },
-        dq_act=lambda q, s: q.float() * torch.repeat_interleave(s.float(), 128, dim=-1),
-    ),
-    # Block-FP8 W8A8 with UE8M0 (power-of-two) block scales — the DeepSeek-V4 attn / B200
-    # deployment format that routes through the kernel's tcgen05 dot_scaled arm.
-    "fp8_128x128_ue8m0": dict(
-        make=lambda N, K, E: (*make_weights(
-            N, K, TEST_DEVICE, [128, 128], scale_dtype=torch.float8_e8m0fnu, num_experts=E
-        ), None),
-        dequant=lambda B, Bs, g=None: dq_block_fp8(B, Bs, 128, 128),
-        input_recipes=(None, "fp8"),
-        output_recipes=(None, "fp8"),
-        act_quant={
-            None: lambda A: fp8_act_quant_block_dynamic(A, 128, use_ue8m0=True),
-            "fp8": lambda A: fp8_act_quant_block_dynamic(A, 128, use_ue8m0=True),
-        },
-        dq_act=lambda q, s: q.float() * torch.repeat_interleave(dq_scale(s), 128, dim=-1),
-    ),
-    "fp8_tensor": dict(
-        make=lambda N, K, E: (*make_weights(
-            N, K, TEST_DEVICE, None, scale_layout="per_tensor_111", num_experts=E
-        ), None),
-        dequant=lambda B, Bs, g=None: B.float() * Bs.float().reshape(-1, 1, 1),
-        input_recipes=(None, "fp8"),
-        output_recipes=(None,),
-        act_quant={
-            None: lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
-            "fp8": lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
-        },
-        dq_act=lambda q, s: q.float() * s.float().reshape(-1, 1),
-    ),
-    "mxfp8": dict(
-        make=_make_mx(torch.float8_e4m3fn, torch.float8_e8m0fnu),
-        dequant=lambda B, Bs, g=None: dq_grouped(B, Bs, MX_SCALE_GROUP_K),
-        input_recipes=(None, "mxfp8", "mxfp4"),
-        output_recipes=(None, "mxfp8", "mxfp4"),
-        act_quant=_MX_ACT,
-        dq_act=lambda q, s: dq_grouped(q, s, MX_SCALE_GROUP_K),
-    ),
-    # UE8M0 scales stored as raw uint8 (e.g. MiniMax-M3-MXFP8 checkpoints) — must still
-    # detect as MXFP8 and route to the MX path, not fall back to block-dynamic.
-    "mxfp8_u8": dict(
-        make=_make_mx(torch.float8_e4m3fn, torch.uint8),
-        dequant=lambda B, Bs, g=None: dq_grouped(B, Bs, MX_SCALE_GROUP_K),
-        input_recipes=(None,),
-        output_recipes=(None, "mxfp8"),
-        act_quant=_MX_ACT,
-        dq_act=lambda q, s: dq_grouped(q, s, MX_SCALE_GROUP_K),
-    ),
-    "mxfp4": dict(
-        make=_make_mx(torch.int8, torch.float8_e8m0fnu),
-        dequant=lambda B, Bs, g=None: dq_grouped(B, Bs, MX_SCALE_GROUP_K),
-        input_recipes=(None, "mxfp8", "mxfp4"),
-        output_recipes=(None, "mxfp8", "mxfp4"),
-        act_quant=_MX_ACT,
-        dq_act=lambda q, s: dq_grouped(q, s, MX_SCALE_GROUP_K),
-    ),
-    # NVFP4 is ALWAYS two-level (the canonical recipe): make returns the block scale and the
-    # per-expert global separately; activations here are single-level (g_a = 1 — the
-    # calibrated-g_a arm is covered by test_ops' act-global scenarios).
-    "nvfp4": dict(
-        make=_make_nvfp4,
-        dequant=dq_nvfp4_two_level,
-        input_recipes=(None, "nvfp4"),
-        output_recipes=(None, "nvfp4"),
-        act_quant={None: nvfp4_act_quant, "nvfp4": nvfp4_act_quant},
-        dq_act=lambda q, s: dq_grouped(q, s, NVFP4_SCALE_GROUP_K),
-    ),
-    "bf16": dict(
-        make=_make_full(torch.bfloat16),
-        dequant=lambda B, Bs, g=None: B.float(),
-        input_recipes=(None,),
-        output_recipes=(None,),
-        act_quant={None: None},
-        dq_act=None,
-    ),
-    "fp16": dict(
-        make=_make_full(torch.float16),
-        dequant=lambda B, Bs, g=None: B.float(),
-        input_recipes=(None,),
-        output_recipes=(None,),
-        act_quant={None: None},
-        dq_act=None,
-    ),
-}
-
-# quant fns for requant-output verification, by output recipe name
-REQUANT_FN = {
-    "fp8": None,  # per-(row, N-block) scale — verified via dequant closeness only
-    "mxfp8": mxfp8_act_quant,
-    "mxfp4": mxfp4_act_quant,
-    "nvfp4": nvfp4_act_quant,
-}
-REQUANT_GROUP = {
-    "mxfp8": MX_SCALE_GROUP_K,
-    "mxfp4": MX_SCALE_GROUP_K,
-    "nvfp4": NVFP4_SCALE_GROUP_K,
-}
+def ref_matmul(A, B, Bs, block_size, output_dtype=torch.float32, activation_scale=None):
+    """Pure-PyTorch reference for ``matmul``: dequant both sides, fp32 matmul, cast.
+    ``block_size`` is the weight scale block: ``(1, 32)`` marks the MX recipes (per-row
+    UE8M0 group-32 → power-of-2 activation quant), any other shape / ``None`` is FP8.
+    ``dequant_b`` decodes E2M1 vs E4M3 weights by ``B.dtype``; ``activation_scale``
+    (FP8 only) selects static quant."""
+    is_mx = block_size == (1, MX_SCALE_GROUP_K)
+    block_n, block_k = block_size if block_size is not None else B.shape
+    A_deq = quant_dequant_a(A, block_k, scale=activation_scale, pow2_scale=is_mx)
+    B_deq = dequant_b(B, Bs, block_n, block_k)
+    return (A_deq @ B_deq.T).to(output_dtype)

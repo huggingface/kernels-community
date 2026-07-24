@@ -402,13 +402,16 @@ def swizzled_scale_config_pruner():
     - ``BLOCK_SIZE_N > 128``: the descriptor's TMA box is created at one 128-row block; the load
       reads that block (BN=128) or a sub-tile of it (BN<128, scalar slice). A BN>128 tile would
       need a box grown past its creation shape, which the tensormap does not honor. Decode never
-      wants BN>128 anyway (M=1 grid occupancy), so this costs no win."""
+      wants BN>128 anyway (M=1 grid occupancy), so this costs no win.
+    - under ``GATE``, ``BLOCK_SIZE_N != 128``: the gate|up scale is interleaved as whole 128-row
+      block pairs [g0,u0,g1,u1,...], read as one 2*BN tile; a sub-128 BN can't index a block pair.
+      The non-gate decode arm still slices sub-128 tiles out of a single block."""
 
     def ok(c, args):
-        return (
-            config_dim(c, args, "BLOCK_SIZE_K") % 128 == 0
-            and config_dim(c, args, "BLOCK_SIZE_N") <= 128
-        )
+        if config_dim(c, args, "BLOCK_SIZE_K") % 128 != 0:
+            return False
+        bn = config_dim(c, args, "BLOCK_SIZE_N")
+        return bn == 128 if args.get("GATE") else bn <= 128
 
     return config_filter(ok, when=lambda args: args.get("SWIZZLED_SCALES"))
 

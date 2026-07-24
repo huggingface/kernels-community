@@ -51,7 +51,7 @@ NVFP4_SCALE_GROUP_K = 16
 
 # set ONLY while an opaque op's registered fake impl runs (shape inference); read by
 # compile_time_only_triton_wrap to no-op the kernel launches within
-_SKIP_LAUNCHES = contextvars.ContextVar("finegrained_fp8_skip_launches", default=False)
+_SKIP_LAUNCHES = contextvars.ContextVar("finegrained_moe_skip_launches", default=False)
 
 
 

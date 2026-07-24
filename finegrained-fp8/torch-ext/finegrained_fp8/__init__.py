@@ -1,34 +1,20 @@
+from .utils import fp8_act_quant
 from .matmul import matmul_2d
 from .batched import matmul_batched
 from .grouped import matmul_grouped
-from .moe import (
-    moe_fused_batched,
-    moe_fused_grouped,
-    moe_unfused_batched,
-    moe_unfused_grouped,
-    moe_torch_grouped,
-)
-from .recipes import Epilogue, Quantization
-from .swizzle import swizzle_mx_scales
-from .scheduling import compute_grouped_scheduling
+from .fused_batched import moe_fused_batched
+from .fused_grouped import moe_fused_grouped
 
 __all__ = [
+    "fp8_act_quant",
     # 2D matmul
     "matmul_2d",
-    # Batched matmul + MoE forwards
+    # Batched matmul
     "matmul_batched",
-    "moe_fused_batched",
-    "moe_unfused_batched",
-    # Grouped matmul + MoE forwards
+    # Grouped matmul
     "matmul_grouped",
+    # Fused batched matmul
+    "moe_fused_batched",
+    # Fused grouped matmul
     "moe_fused_grouped",
-    "moe_unfused_grouped",
-    "moe_torch_grouped",
-    # Grouped scheduling (for MoE and grouped matmul)
-    "compute_grouped_scheduling",
-    # MX/NVFP4 scale layout (apply to weight scales at load time)
-    "swizzle_mx_scales",
-    # Epilogue and Quantization configs
-    "Epilogue",
-    "Quantization",
 ]

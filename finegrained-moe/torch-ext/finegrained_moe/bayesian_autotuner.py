@@ -28,6 +28,7 @@ exhaustive bench-all.
 from __future__ import annotations
 
 import hashlib
+import logging
 import json
 import math
 import os
@@ -47,6 +48,8 @@ from triton.runtime.autotuner import (
     triton_key,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class BayesianAutotuner(Autotuner):
     """Drop-in replacement for ``triton.runtime.autotuner.Autotuner`` that
@@ -65,6 +68,7 @@ class BayesianAutotuner(Autotuner):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.fn_name = getattr(self.fn, "__name__", str(self.fn))
         # Bayesian trial budget — the per-decorator default, overridable via the
         # FINEGRAINED_AUTOTUNE_TRIALS env var (quick sweeps / exhaustive runs without touching
         # the decorators; set it >= grid size to fall back to stock exhaustive bench-all).
@@ -78,10 +82,143 @@ class BayesianAutotuner(Autotuner):
         # FINEGRAINED_AUTOTUNE_LOG env var. Analyse offline to prune bad configs.
         self.log_path = log_path or os.environ.get("FINEGRAINED_AUTOTUNE_LOG")
 
+    # substrings marking a COMPILE-stage failure — the only class safe to memoize on
+    # disk (a benching/CUDA error can be transient or sticky-context contamination;
+    # persisting one would permanently fence a healthy config for this source version)
+    _COMPILE_FAILURE_MARKS = (
+        "PassManager",
+        "CompilationError",
+        "MLIR",
+        "ConvertTritonGPUToLLVM",
+        "TritonGPUAccelerateMatmul",
+    )
+
+    def _bench(self, *args, config, **meta):
+        """Score any failing config as inf instead of raising — a compile failure is data
+        for the search, not a fatal error. Stock Triton forgives only OutOfResources, but
+        e.g. Triton 3.7.1's ``warp_specialize`` raises RuntimeError at unsupported
+        (shape, config) combos; unguarded, one such config kills the whole tune when a
+        small grid falls through to the stock exhaustive path below. Every failure is
+        recorded and ``_report_bench_failures`` reports every distinct failure —
+        inf-scoring must not silently hide a broken path behind a healthy one.
+        (Stock already inf's OutOfResources / CompileTimeAssertionFailure / PTXASError
+        internally without reaching this handler — those are deliberate guard classes,
+        e.g. our own ``tl.static_assert`` fences; the reporter covers the UNEXPECTED
+        failure classes stock would otherwise let kill the tune.)
+
+        Compile-stage failures are memoized on disk keyed by everything that determines
+        compilation (kernel source hash + config + constexpr arg values + tensor dtypes +
+        invalidating env), so the next fresh tune of ANY shape skips the doomed compile
+        outright (~40-66 wasted compiles per nvfp4 tune before this). The memo dies with
+        the kernel source (``fn.cache_key``); bench-stage errors are never persisted."""
+        sig = self._compile_signature(config)
+        memo = self._failed_compile_memo()
+        if sig is not None and sig in memo:
+            self._failures.append((config, memo[sig] + "  [memoized]"))
+            return [float("inf")] * 3
+        try:
+            return super()._bench(*args, config=config, **meta)
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)[:200]}"
+            self._failures.append((config, err))
+            if sig is not None and any(m in err for m in self._COMPILE_FAILURE_MARKS):
+                memo[sig] = err
+                self._persist_failed_compile_memo()
+            return [float("inf")] * 3
+
+    def _compile_signature(self, config) -> str | None:
+        """Hash of the compile determinants for one config: the config itself plus the
+        constexpr argument VALUES and tensor argument dtypes from this launch (both feed
+        specialization — e.g. GATE flips arms, a uint8 A packs the loads). Source/env
+        live in the memo FILE's key, not here."""
+        nargs = getattr(self, "nargs", None)
+        if not nargs:
+            return None
+        fn = self.fn
+        while not isinstance(fn, JITFunction):
+            fn = fn.fn
+        parts = [str(sorted(config.all_kwargs().items()))]
+        for param in fn.params:
+            v = nargs.get(param.name)
+            if hasattr(v, "dtype"):
+                parts.append(f"{param.name}:{v.dtype}")
+            elif param.is_constexpr and isinstance(
+                v, (bool, int, float, str, type(None))
+            ):
+                parts.append(f"{param.name}={v}")
+        return hashlib.sha256("-".join(parts).encode("utf-8")).hexdigest()
+
+    def _failed_compile_memo(self) -> dict:
+        """The per-(kernel source, backend, env) failed-compile dict, loaded from
+        Triton's on-disk cache once per autotuner instance."""
+        if getattr(self, "_failed_memo", None) is not None:
+            return self._failed_memo
+        try:
+            from triton.compiler.compiler import make_backend
+
+            fn = self.fn
+            while not isinstance(fn, JITFunction):
+                fn = fn.fn
+            group = hashlib.sha256(
+                "-".join(
+                    [
+                        triton_key(),
+                        make_backend(driver.active.get_current_target()).hash(),
+                        fn.cache_key,
+                        str(sorted(get_cache_invalidating_env_vars().items())),
+                    ]
+                ).encode("utf-8")
+            ).hexdigest()
+            self._failed_memo_cache = get_cache_manager(group)
+            self._failed_memo_file = f"{fn.__name__[:150]}.failed_compiles.json"
+            path = self._failed_memo_cache.get_file(self._failed_memo_file)
+            self._failed_memo = json.load(open(path)) if path else {}
+        except Exception:
+            self._failed_memo_cache = None
+            self._failed_memo = {}
+        return self._failed_memo
+
+    def _persist_failed_compile_memo(self):
+        if getattr(self, "_failed_memo_cache", None) is None:
+            return
+        try:
+            self._failed_memo_cache.put(
+                json.dumps(self._failed_memo), self._failed_memo_file, binary=False
+            )
+        except Exception:
+            pass  # persistence is best-effort; the in-memory memo still holds
+
+    def _report_bench_failures(self):
+        """After every tune, report every UNIQUE failure — a failure is never silent:
+        inf-scoring keeps the search alive, but a human must see what broke (e.g. a code
+        change that kills one compute path would otherwise silently degrade into "the other
+        path wins"). Distinct errors are deduped with a count and an example config; the
+        JSONL autotune log has per-config detail."""
+        if not self._failures:
+            return
+        by_err = defaultdict(list)
+        for c, err in self._failures:
+            by_err[err].append(c)
+        for err, cfgs in by_err.items():
+            c = cfgs[0]
+            example = ", ".join(f"{k}={v}" for k, v in c.kwargs.items())
+            logger.warning(
+                "[autotune] %s: %d config(s) failed to compile/run — %s  (e.g. %s, w%d s%d)",
+                self.fn_name,
+                len(cfgs),
+                err,
+                example,
+                c.num_warps,
+                c.num_stages,
+            )
+
     def run(self, *args, **kwargs):
+        self._failures = []
         # Small grid → defer to parent (stock exhaustive bench-all).
         if len(self.configs) <= 1 or self.n_trials >= len(self.configs):
-            return super().run(*args, **kwargs)
+            ret = super().run(*args, **kwargs)
+            self._report_bench_failures()
+            return ret
 
         self.nargs = dict(zip(self.arg_names, args))
         all_args = {**self.nargs, **kwargs}
@@ -96,6 +233,7 @@ class BayesianAutotuner(Autotuner):
             def benchmark():
                 t0 = time.time()
                 self.cache[key] = self._bayesian_search(pruned, args, kwargs, key)
+                self._report_bench_failures()
                 self.bench_time = time.time() - t0
                 if knobs.autotuning.print:
                     fn_name = getattr(self.fn, "__name__", str(self.fn))
@@ -143,22 +281,42 @@ class BayesianAutotuner(Autotuner):
             for d, v in sig:
                 dim_vals[d].add(v)
 
-        # Seed phase: a few random configs (seeded → deterministic), warm-started from the
-        # most recent cached key's best, to give the TPE an initial good/bad split.
+        # Seed phase: one BASIN ANCHOR per (COMPUTE_MODE, SWAP_AB) group, the most recent
+        # cached key's best (warm start), then seeded-random fill. The anchors guarantee every
+        # categorical basin gets at least one real measurement — without them the TPE's
+        # per-dimension model can write off a whole axis it never saw succeed (two dsv4 tunes
+        # shipped 25-60% slow winners because their random seeds only sampled a basin's dead
+        # configs), and coordinate descent can't recover a winner two coupled flips away.
         n_startup = max(2, min(self.n_startup_trials, self.n_trials))
+        anchors = self._basin_anchor_indices(configs)
         order = list(range(len(configs)))
         random.Random(0).shuffle(order)
         warm_idx = self._warm_start_index(configs)
-        if warm_idx is not None:
-            order = [warm_idx] + [i for i in order if i != warm_idx]
-        for idx in order[:n_startup]:
+        head = anchors + ([warm_idx] if warm_idx is not None else [])
+        order = list(dict.fromkeys(head + order))
+        for idx in order[: max(n_startup, len(head))]:
             bench_idx(idx)
 
         # TPE: split measured configs into good (top-gamma) / bad, build per-dimension value
         # densities for each, and bench the unmeasured config maximizing log l(x) - log g(x)
         # (Expected-Improvement proxy), updating the model after each measurement.
-        while len(timings) < self.n_trials:
-            ranked = sorted(timings, key=timings.get)
+        # inf (failed-to-compile) configs are EXCLUDED from the densities: a compile failure is
+        # evidence about that one joint shape (usually shared memory), not about its dimension
+        # values — counting them as "bad" buried SWAP_AB under a wall of BN=256 smem failures
+        # and made the tuner ship a 53µs winner while the 41µs swap config sat unbenched.
+        # They don't consume the trial budget either (n_trials = MEASURED configs; a failure
+        # stays in ``timings`` only as a skip-list entry) — the compile it burned is the one
+        # cost that can't be refunded here, which is what the smem/compile-guard pruners avoid.
+        while sum(1 for t in timings.values() if t != float("inf")) < self.n_trials:
+            ranked = sorted(
+                (i for i, t in timings.items() if t != float("inf")), key=timings.get
+            )
+            if not ranked:  # nothing compiled yet — keep seeding in shuffled order
+                nxt = next((i for i in order if i not in timings), None)
+                if nxt is None:
+                    break
+                bench_idx(nxt)
+                continue
             n_good = max(1, round(self.gamma * len(ranked)))
             good_c: Dict = defaultdict(lambda: defaultdict(int))
             bad_c: Dict = defaultdict(lambda: defaultdict(int))
@@ -227,6 +385,50 @@ class BayesianAutotuner(Autotuner):
                 f.write(json.dumps(rec, default=str) + "\n")
         except Exception:
             pass
+
+    def _basin_anchor_indices(self, configs: List[Config]) -> List[int]:
+        """One representative config index per (COMPUTE_MODE, SWAP_AB) basin — the MEDIAN in
+        tile-sort order, a mid-sized tile with mid warps/stages. Not the smallest: a basin's
+        minimal corner (min BK x 2 warps) can be latency-bound pathological (a 131µs anchor in
+        a basin whose peak is 41µs re-poisons the axis it was meant to protect). Coordinate
+        descent climbs BN/BK/warps/stages from wherever the TPE lands within the basin.
+        Returns [] when the grid has no such axes (single basin)."""
+        # Basin axes are DERIVED, not declared: a config kwarg with string or boolean
+        # values is a branch axis (different code path — compute mode, operand swap,
+        # warp specialization), which partitions the grid into disjoint performance
+        # basins. Numeric kwargs (tiles/warps/stages) are ordinal — the TPE's densities
+        # and coordinate descent handle those.
+        basin_axes = sorted(
+            {
+                k
+                for c in configs
+                for k, v in c.kwargs.items()
+                if isinstance(v, (bool, str))
+            }
+        )
+        if not basin_axes:
+            return []
+
+        # A basin = the compute-path axes (constexprs selecting different compiled code).
+        groups: Dict = {}
+        for i, c in enumerate(configs):
+            basin = tuple(c.kwargs.get(k) for k in basin_axes)
+            groups.setdefault(basin, []).append(i)
+
+        if len(groups) <= 1:
+            return []
+
+        def tile_order(i):
+            return (
+                configs[i].kwargs.get("BLOCK_SIZE_N", 0),
+                configs[i].kwargs.get("BLOCK_SIZE_K", 0),
+                configs[i].num_warps,
+                configs[i].num_stages,
+            )
+
+        return [
+            sorted(idxs, key=tile_order)[len(idxs) // 2] for idxs in groups.values()
+        ]
 
     def _warm_start_index(self, configs: List[Config]):
         """Return the index in ``configs`` matching the most recently cached
@@ -329,7 +531,8 @@ def bayesian_autotune(
     **kwargs,
 ):
     """Decorator mirroring ``@triton.autotune``. Extra kwargs:
-    n_trials:                 total configs benched per key (TPE budget)
+    n_trials:                 successfully measured configs per key (TPE budget; configs
+                              that fail to compile/run are skipped without consuming it)
     n_startup_trials:         random seed configs before the TPE model kicks in
     gamma:                    top fraction of measured configs treated as "good"
     refine, max_refine_iters: coordinate-descent refinement after the TPE
