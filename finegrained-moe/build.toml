@@ -1,0 +1,16 @@
+[general]
+name = "finegrained-moe"
+version = 5
+license = "Apache-2.0"
+backends = [
+    "cuda",
+    "rocm",
+    "xpu",
+]
+
+[general.hub]
+repo-id = "kernels-community/finegrained-moe"
+
+[torch-noarch]
+
+[kernel]
