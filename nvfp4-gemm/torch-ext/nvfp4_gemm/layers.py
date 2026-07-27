@@ -41,8 +41,14 @@ class NVFP4FusedSwiGLUMLP(nn.Module):
 
     def forward(self, x):
         if _ntokens(x) <= 2 and hasattr(self, "nvfp4_fused_qweight"):
-            g, u = torch.split(_fused_gemv(self, x), self.nvfp4_fused_splits, dim=-1)
-            return self.down_proj((self.act_fn(g) * u).reshape(*x.shape[:-1], -1))
+            x2 = x.reshape(-1, x.shape[-1]).to(torch.bfloat16)
+            h = ops.nvfp4_gemv_swiglu(
+                x2,
+                self.nvfp4_fused_qweight,
+                self.nvfp4_fused_sf,
+                self.nvfp4_fused_alpha,
+            )
+            return self.down_proj(h.reshape(*x.shape[:-1], -1))
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -109,26 +115,43 @@ class NVFP4GatedAttention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         if og is None and getattr(self, "gate_proj", None) is not None:
             og = self.gate_proj(hidden_states)
+        o = self.o_proj
+        if og is not None and _ntokens(attn_output) <= 2 and _has_nvfp4(o):
+            a2 = attn_output.reshape(-1, attn_output.shape[-1])
+            og2 = og.reshape(a2.shape).contiguous()
+            alpha = (1.0 / o.weight_global_scale.float()).reshape(1)
+            y = ops.nvfp4_gemv_gated(a2, og2, o.weight, o.weight_sf_rowmajor, alpha)
+            return y.reshape(*input_shape, -1), attn_weights
         if og is not None:
             attn_output = attn_output * torch.sigmoid(og.reshape(attn_output.shape))
-        return self.o_proj(attn_output), attn_weights
+        return o(attn_output), attn_weights
 
 
 def _has_nvfp4(m):
     return m is not None and hasattr(m, "weight_sf_rowmajor")
 
 
-def _attach_fused(module, mods):
-    module.nvfp4_fused_qweight = torch.cat([m.weight for m in mods], 0).contiguous()
-    module.nvfp4_fused_sf = torch.cat(
-        [m.weight_sf_rowmajor for m in mods], 0
-    ).contiguous()
-    module.nvfp4_fused_alpha = torch.cat(
+def _is_silu(act):
+    return isinstance(act, nn.SiLU) or type(act).__name__ == "SiLUActivation"
+
+
+def _attach_fused(module, mods, interleave=False):
+    def join(ts):
+        if interleave:
+            return torch.stack(ts, 1).reshape(-1, *ts[0].shape[1:]).contiguous()
+        return torch.cat(ts, 0).contiguous()
+
+    module.nvfp4_fused_qweight = join([m.weight for m in mods])
+    module.nvfp4_fused_sf = join([m.weight_sf_rowmajor for m in mods])
+    module.nvfp4_fused_alpha = join(
         [
-            (1.0 / m.weight_global_scale.float()).reshape(1).expand(m.out_features)
+            (1.0 / m.weight_global_scale.float())
+            .reshape(1)
+            .expand(m.out_features)
+            .contiguous()
             for m in mods
         ]
-    ).contiguous()
+    )
     module.nvfp4_fused_splits = [m.out_features for m in mods]
 
 
@@ -167,17 +190,18 @@ def fuse_decode_projections(model, rope_fn=None):
             gate = getattr(mod, "gate_proj", None)
             _attach_fused(mod, qkv + ([gate] if _has_nvfp4(gate) else []))
             _capture_helpers(type(mod), rope_fn)
-            _mark(type(mod), "GatedAttention")
+            _mark(type(mod), "NVFP4GatedAttention")
             n += 1
             continue
         gu = [getattr(mod, p, None) for p in ("gate_proj", "up_proj")]
         if (
             all(_has_nvfp4(p) for p in gu)
             and hasattr(mod, "down_proj")
-            and hasattr(mod, "act_fn")
+            and _is_silu(getattr(mod, "act_fn", None))
+            and gu[0].out_features == gu[1].out_features
         ):
-            _attach_fused(mod, gu)
-            _mark(type(mod), "SwiGLUMLP")
+            _attach_fused(mod, gu, interleave=True)
+            _mark(type(mod), "NVFP4SwiGLUMLP")
             n += 1
     return n
 
@@ -191,10 +215,10 @@ def kernel_mapping():
         p for p in Path(__file__).resolve().parents if (p / "build.toml").exists()
     )
     return {
-        "GatedAttention": {
+        "NVFP4GatedAttention": {
             "cuda": LocalLayerRepository(repo_path=root, layer_name="NVFP4GatedAttention")
         },
-        "SwiGLUMLP": {
+        "NVFP4SwiGLUMLP": {
             "cuda": LocalLayerRepository(repo_path=root, layer_name="NVFP4FusedSwiGLUMLP")
         },
     }

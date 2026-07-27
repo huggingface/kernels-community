@@ -24,6 +24,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
           "Tensor b_sf, "
           "Tensor alpha) -> Tensor");
   ops.impl("nvfp4_gemv", torch::kCUDA, &nvfp4_gemv);
+
+  ops.def("nvfp4_gemv_swiglu("
+          "Tensor a, "
+          "Tensor b, "
+          "Tensor b_sf, "
+          "Tensor alpha) -> Tensor");
+  ops.impl("nvfp4_gemv_swiglu", torch::kCUDA, &nvfp4_gemv_swiglu);
+
+  ops.def("nvfp4_gemv_gated("
+          "Tensor a, "
+          "Tensor g, "
+          "Tensor b, "
+          "Tensor b_sf, "
+          "Tensor alpha) -> Tensor");
+  ops.impl("nvfp4_gemv_gated", torch::kCUDA, &nvfp4_gemv_gated);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

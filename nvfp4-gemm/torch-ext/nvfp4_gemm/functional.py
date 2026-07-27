@@ -27,6 +27,16 @@ def _gemv_fake(a, b, b_sf, alpha):
     return a.new_empty((a.size(0), b.size(0)), dtype=torch.bfloat16)
 
 
+@torch.library.register_fake(add_op_namespace_prefix("nvfp4_gemv_swiglu"))
+def _gemv_swiglu_fake(a, b, b_sf, alpha):
+    return a.new_empty((a.size(0), b.size(0) // 2), dtype=torch.bfloat16)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("nvfp4_gemv_gated"))
+def _gemv_gated_fake(a, g, b, b_sf, alpha):
+    return a.new_empty((a.size(0), b.size(0)), dtype=torch.bfloat16)
+
+
 def _as_fp8(sf: torch.Tensor) -> torch.Tensor:
     return sf.view(torch.float8_e4m3fn) if sf.dtype == torch.int32 else sf
 

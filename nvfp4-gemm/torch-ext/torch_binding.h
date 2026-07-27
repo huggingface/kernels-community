@@ -14,3 +14,12 @@ torch::Tensor cutlass_scaled_fp4_mm(torch::Tensor const& A,
 
 torch::Tensor nvfp4_gemv(torch::Tensor const& A, torch::Tensor const& B,
                          torch::Tensor const& B_sf, torch::Tensor const& alpha);
+
+torch::Tensor nvfp4_gemv_swiglu(torch::Tensor const& A, torch::Tensor const& B,
+                                torch::Tensor const& B_sf,
+                                torch::Tensor const& alpha);
+
+torch::Tensor nvfp4_gemv_gated(torch::Tensor const& A, torch::Tensor const& G,
+                               torch::Tensor const& B,
+                               torch::Tensor const& B_sf,
+                               torch::Tensor const& alpha);
