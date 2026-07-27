@@ -1,0 +1,22 @@
+[general]
+name = "quack"
+version = 0
+edition = 5
+license = "Apache-2.0"
+backends = ["cuda"]
+upstream = "https://github.com/Dao-AILab/quack"
+python-depends = [
+    "einops",
+    "tvm-ffi",
+]
+
+[general.cuda]
+minver = "12.9"
+python-depends = ["nvidia-cutlass-dsl"]
+
+[general.hub]
+repo-id = "kernels-community/quack"
+
+[torch-noarch]
+
+[kernel]
