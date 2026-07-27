@@ -1,0 +1,45 @@
+[general]
+backends = ["cuda"]
+license = "Apache-2.0"
+name = "nvfp4-gemm"
+upstream = "git+https://github.com/vllm-project/vllm.git"
+version = 1
+
+[general.cuda]
+minver = "12.8"
+
+[general.hub]
+repo-id = "kernels-community/nvfp4-gemm"
+
+[torch]
+src = [
+  "torch-ext/torch_binding.cpp",
+  "torch-ext/torch_binding.h",
+]
+
+[kernel.nvfp4_gemm]
+backend = "cuda"
+cuda-capabilities = ["10.0a", "12.0a"]
+cuda-flags = [
+  "-std=c++20",
+  "-O3",
+  "-DNDEBUG",
+  "--expt-relaxed-constexpr",
+  "--expt-extended-lambda",
+  "-DENABLE_NVFP4_SM100=1",
+  "-DENABLE_NVFP4_SM120=1",
+]
+cuda-minver = "12.8"
+depends = ["torch", "cutlass_4_0"]
+include = ["nvfp4"]
+src = [
+  "nvfp4/common.cuh",
+  "nvfp4/launch_bounds_utils.h",
+  "nvfp4/nvfp4_utils.cuh",
+  "nvfp4/cuda_vec_utils.cuh",
+  "nvfp4/nvfp4_entry.cu",
+  "nvfp4/nvfp4_quant_kernels.cu",
+  "nvfp4/nvfp4_scaled_mm_kernels.cu",
+  "nvfp4/nvfp4_gemv_kernels.cu",
+  "nvfp4/nvfp4_scaled_mm_sm120_kernels.cu",
+]
