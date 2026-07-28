@@ -366,7 +366,9 @@ CUTE_DEVICE void xe_gemm_4bits(
             scale = Scales
                 [(n_tile_start + n_sg_start + sg_local_n) * group_num +
                  group_idx];
-          } else if constexpr (std::is_same_v<TB, float_e2m1_t>) {
+          } else if constexpr (std::is_same_v<TB, float_e2m1_t> ||
+                               std::is_same_v<TB, float_e4m3_t> ||
+                               std::is_same_v<TB, float_e5m2_t>) {
             uint32_t scale_u32 =
                 Scales
                     [(n_tile_start + n_sg_start + sg_local_n) * group_num +

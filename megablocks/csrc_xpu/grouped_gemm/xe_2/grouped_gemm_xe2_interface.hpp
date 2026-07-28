@@ -50,11 +50,11 @@
 #include "cutlass/tensor_ref.h"
 #include "cutlass/util/GPU_Clock.hpp"
 #include "cutlass/util/device_memory.h"
+#include "cutlass/util/sycl_event_manager.hpp"
 #include "cutlass/util/initialize_block.hpp"
 #include "cutlass/util/reference/device/gemm_complex.h"
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/reference/host/tensor_fill.h"
-#include "cutlass/util/sycl_event_manager.hpp"
 
 #include "gemm_xe2_policy.hpp"
 #include "grouped_gemm_xe2.hpp"
@@ -173,7 +173,8 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
     int64_t K,
     int64_t num_experts,
     bool is_B_int4,
-    bool is_B_mxfp4) {
+    bool is_B_mxfp4,
+    bool is_B_mxfp8) {
   auto& dpcpp_queue =
       at::xpu::getCurrentXPUStream(ptr_A.device().index()).queue();
   auto A_dtype = ptr_A.dtype();
@@ -205,6 +206,10 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
   int B_N = ptr_B.size(2);
   if (is_B_int4 || is_B_mxfp4) {
     B_K = ptr_B.size(2) * 2;
+    B_N = ptr_B.size(1);
+  } else if (is_B_mxfp8) {
+    // MXFP8: weights stored as [E, N, K] (no packing), dtype is fp8
+    B_K = ptr_B.size(2);
     B_N = ptr_B.size(1);
   }
 
@@ -298,6 +303,59 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
       W4A16LauncherCallER(policy);
     }
 #undef W4A16LauncherCallER
+  } else if (is_B_mxfp8) {
+    // MXFP8: block-scaled FP8 with e8m0 scales
+    TORCH_CHECK(ptr_scales.has_value(), "mxfp8 grouped gemm must have scales");
+    TORCH_CHECK(ptr_scales->is_contiguous(), "ptr_scales must be contiguous");
+    TORCH_CHECK(
+        ptr_scales->dim() == 3,
+        "ptr_scales of mxfp8 must be 3D [num_experts, N, K // group_size]");
+    TORCH_CHECK(
+        ptr_scales->size(0) == num_experts,
+        "ptr_scales.size(0) of mxfp8 must match num_experts");
+    TORCH_CHECK(
+        ptr_scales->size(1) == N,
+        "ptr_scales.size(1) of mxfp8 must match N");
+    TORCH_CHECK(
+        K % ptr_scales->size(2) == 0,
+        "K must be divisible by ptr_scales.size(2) for mxfp8");
+    int group_num = ptr_scales->size(2);
+    group_size = K / group_num;
+
+    TORCH_CHECK(
+        group_size == 32 || group_size == 64 || group_size == 128,
+        "mxfp8 group_size must be 32, 64 or 128");
+
+#define MXFP8LauncherCallER(policy)                                            \
+  if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kBFloat16) {             \
+    using scalar_t = bfloat16_t;                                               \
+    MoEGEMMLauncherCallER(                                                     \
+        'R', 'C', policy, scalar_t, float_e4m3_t, uint8_t);                    \
+  } else if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kHalf) {          \
+    using scalar_t = half_t;                                                   \
+    MoEGEMMLauncherCallER(                                                     \
+        'R', 'C', policy, scalar_t, float_e4m3_t, uint8_t);                    \
+  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kBFloat16) {        \
+    using scalar_t = bfloat16_t;                                               \
+    MoEGEMMLauncherCallER(                                                     \
+        'R', 'C', policy, scalar_t, float_e5m2_t, uint8_t);                    \
+  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kHalf) {            \
+    using scalar_t = half_t;                                                   \
+    MoEGEMMLauncherCallER(                                                     \
+        'R', 'C', policy, scalar_t, float_e5m2_t, uint8_t);                    \
+  }
+
+    if (A_avg_M <= 32) {
+      using policy = w8a16_policy_m_16;
+      MXFP8LauncherCallER(policy);
+    } else if (A_avg_M <= 128) {
+      using policy = w8a16_policy_m_32;
+      MXFP8LauncherCallER(policy);
+    } else {
+      using policy = w8a16_policy;
+      MXFP8LauncherCallER(policy);
+    }
+#undef MXFP8LauncherCallER
   } else if (is_weight_fp8) {
     TORCH_CHECK(ptr_scales.has_value(), "w8a16 grouped gemm must have scales");
     TORCH_CHECK(ptr_scales->is_contiguous(), "ptr_scales must be contiguous");
