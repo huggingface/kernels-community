@@ -202,6 +202,18 @@ jobs:
             cosign sign-blob "$metadata_file" --bundle "${metadata_file}.sigstore" --yes
           done < <(find "$KERNEL/build" -mindepth 2 -maxdepth 2 -name "metadata.json")
 
+      # The upload helpers must come from the ref this workflow was dispatched
+      # from, not from the PR head: a PR branched before a helper was added would
+      # not have it, and PR-supplied code must not run while HF_TOKEN is in scope.
+      - name: Checkout upload helpers
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Pin to the dispatched commit so the helpers match this workflow file.
+          ref: ${{ github.sha }}
+          path: .ci-helpers
+          sparse-checkout: .github/scripts
+
       # Upload built artifacts to both model and kernel Hub repos.
       - name: Upload kernel to Hub
         if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false
@@ -215,7 +227,7 @@ jobs:
           if [ -n "$TARGET_BRANCH" ]; then
             BRANCH_FLAG="--branch $TARGET_BRANCH"
           fi
-          TARGET_FLAG=$(python3 .github/scripts/hub_pr_upload_args.py upload-args "$KERNEL" "$REPO_PREFIX")
+          TARGET_FLAG=$(python3 .ci-helpers/.github/scripts/hub_pr_upload_args.py upload-args "$KERNEL" "$REPO_PREFIX")
           cd "$KERNEL"
           nix run -L github:huggingface/kernels#kernel-builder -- upload \
             --repo-type kernel $TARGET_FLAG $BRANCH_FLAG \
@@ -229,7 +241,7 @@ jobs:
           KERNEL: ${{ steps.validate.outputs.kernel }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
-          TARGET_FLAG=$(python3 .github/scripts/hub_pr_upload_args.py upload-args "$KERNEL" "$REPO_PREFIX")
+          TARGET_FLAG=$(python3 .ci-helpers/.github/scripts/hub_pr_upload_args.py upload-args "$KERNEL" "$REPO_PREFIX")
           cd "$KERNEL"
 
           if [ -f "build.toml" ]; then
@@ -290,11 +302,22 @@ jobs:
             -f description="$DESC" \
             -f context="$STATUS_CONTEXT"
 
-      - name: Checkout comment helpers
+      # The kernel's build.toml (which decides the Hub repo-id) comes from the
+      # built ref; the helper that reads it comes from this workflow's ref.
+      - name: Checkout kernel metadata
         if: env.REPORT_HUB_UPLOAD == 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs.pr_number != '' && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+
+      - name: Checkout comment helpers
+        if: env.REPORT_HUB_UPLOAD == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Pin to the dispatched commit so the helpers match this workflow file.
+          ref: ${{ github.sha }}
+          path: .ci-helpers
+          sparse-checkout: .github/scripts
 
       - name: Download Hub upload summaries
         if: env.REPORT_HUB_UPLOAD == 'true'
@@ -312,5 +335,5 @@ jobs:
           REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
           BODY=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" --jq .body)
-          BODY=$(python3 .github/scripts/format_hub_upload_comment.py --base "$BODY" "$KERNEL" "$REPO_PREFIX" hub-uploads/**/*.json)
+          BODY=$(python3 .ci-helpers/.github/scripts/format_hub_upload_comment.py --base "$BODY" "$KERNEL" "$REPO_PREFIX" hub-uploads/**/*.json)
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" -f body="$BODY"
