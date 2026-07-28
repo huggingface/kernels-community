@@ -15,12 +15,13 @@ include = ["csrc/include"]
 
 [kernel.natten]
 backend = "cuda"
+# Trimmed to the flash-attn2 arch set to keep release builds inside the CI
+# job timeout. sm_86/89 run the sm_80 SASS (within-major forward compat);
+# NATTEN selects tile configs at runtime from the actual device, and as of
+# v0.21.7 large-smem tiles are limited to cc 80/90/100/103, so non-DC parts
+# never request more shared memory than they have.
 cuda-capabilities = [
-    "7.0",
-    "7.5",
     "8.0",
-    "8.6",
-    "8.9",
     "9.0",
     "10.0",
     "12.0",
