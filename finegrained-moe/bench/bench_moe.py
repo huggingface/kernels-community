@@ -73,7 +73,6 @@ if SMOKE:
     os.environ.setdefault("FINEGRAINED_AUTOTUNE_TRIALS", "3")
 
 import torch  # noqa: E402
-import torch.nn.functional as F  # noqa: E402  public scaled_mm / grouped_mm baselines
 from triton.testing import do_bench, do_bench_cudagraph  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))

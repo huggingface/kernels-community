@@ -38,7 +38,7 @@ import torch
 from .grouped import matmul_grouped
 from .batched import matmul_batched
 from .compat import MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, weighted_reduce
-from .recipes import Epilogue, Quantization, is_mx, is_mxfp4, is_mxfp8, is_nvfp4, weight_recipe
+from .recipes import Epilogue, Quantization, is_mx, is_mxfp4, weight_recipe
 from .quant import _launch_act_quant
 from .scheduling import compute_grouped_scheduling
 from .epilogue import apply_glu

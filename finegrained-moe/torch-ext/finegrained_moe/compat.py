@@ -16,8 +16,6 @@
 import contextvars
 import functools
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Literal
 
 
 import torch
@@ -25,7 +23,6 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
-from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
 
 
