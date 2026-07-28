@@ -60,6 +60,7 @@ KERNEL_SOURCE_MAPPING = {
     # Too much stuff happening in vLLM, not worth reporting as MoE freshness.
     "vllm-moe": "",
     "fla": "github.com/fla-org/flash-linear-attention",
+    "nvfp4-gemm": "",
 }
 
 def parse_args() -> argparse.Namespace:
