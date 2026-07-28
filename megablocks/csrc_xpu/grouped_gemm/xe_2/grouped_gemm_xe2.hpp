@@ -45,6 +45,7 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 namespace MoE {
+inline namespace MEGABLOCKS_XE_TARGET_NS {
 using namespace cute;
 
 template <typename T, char LayoutKind>
@@ -231,4 +232,5 @@ CUTE_DEVICE void MoEGEMM(
   }
 }
 
+}  // inline namespace MEGABLOCKS_XE_TARGET_NS
 }  // namespace MoE

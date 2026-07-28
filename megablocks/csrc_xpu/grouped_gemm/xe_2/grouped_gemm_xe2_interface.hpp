@@ -58,15 +58,18 @@
 
 #include "gemm_xe2_policy.hpp"
 #include "grouped_gemm_xe2.hpp"
+#include "xe2_target_ns.hpp"
 
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 namespace MoE {
+inline namespace MEGABLOCKS_XE_TARGET_NS {
 using namespace cute;
 
-// type tag to define a unique sycl kernel name
-template <typename, typename, typename, typename, char, char, class>
+// type tag to define a unique sycl kernel name. The trailing arch tag keeps the
+// CRI (Xe35) and generic (Xe20) device images from sharing a kernel name.
+template <typename, typename, typename, typename, char, char, class, int>
 class GemmCuteName;
 
 template <
@@ -135,7 +138,8 @@ void MoEGEMMLauncher(
         ElementD,
         layoutA,
         layoutB,
-        policy>>(
+        policy,
+        SYCL_INTEL_TARGET>>(
         sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
           MoE::MoEGEMM<
               GmemTiledCopyA,
@@ -162,19 +166,28 @@ void MoEGEMMLauncher(
   EventManager::getInstance().addEvent(event);
 }
 
-at::Tensor cutlass_grouped_gemm_xe2_impl(
-    at::Tensor& ptr_A,
-    at::Tensor& ptr_B,
+}  // inline namespace MEGABLOCKS_XE_TARGET_NS
+
+using namespace cute;
+
+// Entry point for one architecture, instantiated as <20> by the pvc/bmg
+// translation unit and as <35> by the CRI one.
+template <int Arch>
+torch::Tensor cutlass_grouped_gemm_xe2(
+    torch::Tensor ptr_A,
+    torch::Tensor ptr_B,
     const c10::optional<at::Tensor>& ptr_scales,
     const c10::optional<at::Tensor>& ptr_bias,
-    at::Tensor& ptr_D,
-    at::Tensor& expert_first_token_offset,
+    torch::Tensor ptr_D,
+    torch::Tensor expert_first_token_offset,
     int64_t N,
     int64_t K,
     int64_t num_experts,
     bool is_B_int4,
     bool is_B_mxfp4,
     bool is_B_mxfp8) {
+  // Guards against the CRI translation unit losing -D__SYCL_TARGET_INTEL_GPU_CRI__.
+  static_assert(Arch == SYCL_INTEL_TARGET, "Arch must match SYCL_INTEL_TARGET");
   auto& dpcpp_queue =
       at::xpu::getCurrentXPUStream(ptr_A.device().index()).queue();
   auto A_dtype = ptr_A.dtype();
