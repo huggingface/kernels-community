@@ -337,7 +337,7 @@ def routing(cfg, tokens):
     hidden = torch.randn(tokens, cfg["H"], device=DEV, dtype=torch.bfloat16)
     logits = torch.randn(tokens, cfg["E"], device=DEV)
     w, idx = torch.topk(torch.softmax(logits, -1), cfg["top_k"], dim=-1)
-    return hidden, idx.to(torch.int32), w
+    return hidden, idx.to(torch.int32), w, logits
 
 
 def _glu(gate, up, cfg):
@@ -377,7 +377,7 @@ class _Experts:
 # ── MoE impl arms: each returns a no-arg closure computing the full forward ──
 
 
-def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g):
+def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     """``recipe`` sets the activation precision; None follows the weight recipe
     (mxfp4/nvfp4 -> the all-fp4 W4A4 chain, bf16 -> unquantized). dsv4 deploys
     W4A8, so it pins recipe="mxfp8". Under ``PRESWIZZLE`` the MX weight scales are
@@ -392,7 +392,7 @@ def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g):
     return lambda: fn(hidden, idx, w, gu, dn, gus, dns, **kw)
 
 
-def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g):
+def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     fn = fgm.moe_unfused_grouped if grouped else fgm.moe_unfused_batched
     if _can_preswizzle(cfg):
         # unfused does gate_up as a PLAIN 2N GEMM then host-chunks, so its scale is read in plain
@@ -418,7 +418,7 @@ def _torch_preblock_weight_scale(ws):
     return triton_mx_block_rearrange_per_group_3d(ws.view(torch.uint8)).view(ws.dtype)  # keep dtype (E4M3=NVFP4)
 
 
-def torch_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g):
+def torch_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     """torch / cuBLAS reference: ``moe_torch_grouped`` over the PUBLIC ``F.scaled_grouped_mm``
     (two scaled grouped GEMMs + host GLU + weighted reduce) — the quantized-path torch baseline
     (the ``transformers`` grouped_mm arm is the BF16 one). Runs BOTH regimes: it groups routed
@@ -529,7 +529,7 @@ def deepgemm_bf16_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     return lambda: deepgemm_bf16_experts_forward(mod, hidden, idx, w)
 
 
-def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
+def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, logits):
     """OpenAI triton_kernels MXFP4 experts (transformers' GPT-OSS path): fused
     ``matmul_ogs`` gate_up+SwiGLU → down over a swizzled MXFP4 weight layout. The
     quantize+swizzle is load-time weight prep (done here, before the timed closure —
@@ -551,9 +551,17 @@ def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     experts = tfmx.Mxfp4GptOssExperts(
         SimpleNamespace(num_local_experts=E, intermediate_size=inter, hidden_size=H,
                         swiglu_limit=cfg["swiglu_limit"] or 7.0)).to(DEV)
-    torch.manual_seed(0)
-    gu_bf16 = torch.randn(E, 2 * inter, H, device=DEV, dtype=torch.bfloat16) * 0.05
-    dn_bf16 = torch.randn(E, H, inter, device=DEV, dtype=torch.bfloat16) * 0.05
+    # dequantize the SHARED mxfp4 weights to bf16 and re-quantize through their prep: the
+    # values are already on the E2M1 grid, so the round-trip is exact and both impls run
+    # bit-identical weights (drawing fresh randn here made parity meaningless).
+    dq = WEIGHTS[cfg["weights"]]["dequant"]
+    gu_stacked = dq(gu, gus).to(torch.bfloat16)  # (E, 2I, H) = [all gate rows; all up rows]
+    # GPT-OSS INTERLEAVES gate/up (modeling_gpt_oss: gate_up[..., ::2] / [..., 1::2]) while our
+    # layout stacks them — feeding stacked rows pairs the wrong halves in their SwiGLU.
+    gu_bf16 = torch.empty_like(gu_stacked)
+    gu_bf16[:, 0::2] = gu_stacked[:, :inter]
+    gu_bf16[:, 1::2] = gu_stacked[:, inter:]
+    dn_bf16 = dq(dn, dns).to(torch.bfloat16)
     for p in ("gate_up_proj", "down_proj", "gate_up_proj_bias", "down_proj_bias"):
         experts._parameters.pop(p, None)
     experts.gate_up_proj, experts.gate_up_proj_precision_config = prep(gu_bf16)
@@ -561,8 +569,11 @@ def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     experts.gate_up_proj_bias = torch.zeros(E, 2 * inter, device=DEV)
     experts.down_proj_bias = torch.zeros(E, H, device=DEV)
     _mark_static(experts.gate_up_proj_bias, experts.down_proj_bias)
-    logits = torch.randn(hidden.shape[0], E, device=DEV)
-    rd, gi, si = triton_kernels_hub.routing.routing(logits, cfg["top_k"])
+    # sm_first=True = softmax over ALL experts then top-k, matching the bench's routing().
+    # Their default top-ks first then softmaxes over the k (weights sum to 1, the GPT-OSS
+    # convention) — same experts either way (softmax is monotonic), but a per-token rescale
+    # of the combine weights that left parity at ~1.1.
+    rd, gi, si = triton_kernels_hub.routing.routing(logits, cfg["top_k"], sm_first=True)
     return lambda: experts(hidden, rd, gi, si)
 
 
@@ -649,8 +660,8 @@ def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
     for regime, tokens, grouped in (("decode", DECODE_TOKENS, False),
                                     ("prefill", PREFILL_TOKENS, True)):
         print(f"   -- {regime}")
-        hidden, idx, w = routing(cfg, tokens)
-        args = (cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g)
+        hidden, idx, w, logits = routing(cfg, tokens)
+        args = (cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, logits)
         anchor_res, anchor_out = None, None
         for name in arms:
             try:

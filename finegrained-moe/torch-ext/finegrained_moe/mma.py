@@ -32,7 +32,10 @@ def mx_dot_scaled(acc, a, a_scale, w, w_scale):
     fp4 on BOTH operands lowers to the native ``kind::mxf4`` MMA (2x the fp8 rate; probed
     bit-exact on sm_100, native iff the M operand is 128 — same gate as mxf8f6f4). Caller
     pre-shapes ``w``/``w_scale`` (e.g. ``tl.trans(gu)``)."""
-    lhs_format: tl.constexpr = "e2m1" if a.dtype == tl.uint8 else "e4m3"
+    lhs_format: tl.constexpr = (
+        "e2m1" if a.dtype == tl.uint8
+        else ("e4m3" if a.dtype == tl.float8e4nv else "bf16")
+    )
     rhs_format: tl.constexpr = "e2m1" if w.dtype == tl.uint8 else "e4m3"
     return tl.dot_scaled(a, a_scale, lhs_format, w, w_scale, rhs_format, acc)
 
@@ -74,6 +77,35 @@ def mx_weight_upcast(w, w_scale, BLOCK_SIZE_K: tl.constexpr, N: tl.constexpr, SC
     # dequant + scale happen in bf16 (exact: E2M1/E4M3 codes and power-of-two UE8M0 scales all fit),
     # then widen if the activation is wider — bf16->fp32 is lossless and keeps the multiply cheap.
     return w3.reshape(BLOCK_SIZE_K, N).to(OUT_DTYPE)
+
+
+@triton.jit
+def mx_weight_only_compute(
+    acc,
+    a,
+    w,
+    w_scale,
+    COMPUTE_MODE: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    N_WIDTH: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+):
+    """Weight-only (W4A16/W8A16) MMA step: raw bf16/fp16 activations against an MXFP4/MXFP8 weight
+    tile, dispatched on ``COMPUTE_MODE``. ``"dot_scaled"`` hands the packed weight and its UE8M0
+    group scales straight to the tcgen05 scaled MMA with an UNSCALED activation operand (the
+    ``lhs_scale=None`` / bf16-format form), so the tensor core does the fp4 decode and the group
+    rescale; ``"dot"`` upcasts the tile to the activation dtype in-loop and runs a plain
+    ``tl.dot`` (the matmul_ogs Hopper recipe). Both are correct everywhere and the tuner picks per
+    workload — the two differ by arm: measured on gpt-oss K=2880, ``dot_scaled`` wins the down
+    projection by 18.5% while the stacked gate|up tile prefers ``dot`` by 7.3%. Single return —
+    only the taken branch compiles."""
+    if COMPUTE_MODE == "dot_scaled":
+        acc = mx_dot_scaled(acc, a, None, w, w_scale)
+    else:
+        acc = acc + tl.dot(
+            a, mx_weight_upcast(w, w_scale, BLOCK_SIZE_K, N_WIDTH, SCALE_GROUP_K, a.dtype)
+        )
+    return acc
 
 
 @triton.jit

@@ -25,7 +25,7 @@ from .bayesian_autotuner import bayesian_autotune
 from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
 from .recipes import Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, ue8m0_as_uint8, validate_dense_operands, weight_block_size
 from .quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide
-from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_upcast, static_dot
+from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .tiles import (
     advance_ptrs,
     load_act_block_dynamic,
@@ -651,13 +651,16 @@ def mx_dynamic_matmul_batched_kernel(
 @bayesian_autotune(
     # weight-only plain bf16 dot (fp4/fp8 weight upcast per-group in-loop). No SWAP_AB (the swap layout
     # would need a swap-aware dequant) — a follow-up, like TMA.
-    get_accelerator_autotuning_configs(tune_block_nk=True),
+    get_accelerator_autotuning_configs(
+        tune_block_nk=True, compute_modes=("dot", "dot_scaled")
+    ),
     ["N", "K", "S", "GATE"],
     n_trials=100,
     prune_configs_by={
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            mx_config_pruner("K", "N"),  # dot_scaled shape gates
         )
     },
 )
@@ -690,6 +693,7 @@ def mx_weight_only_matmul_batched_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     WEIGHT_VALUES_PER_BYTE: tl.constexpr,
+    COMPUTE_MODE: tl.constexpr = "dot",
     GATE: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
@@ -725,8 +729,8 @@ def mx_weight_only_matmul_batched_kernel(
             GATE, False, True, "pointer", False, False,
             BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
         )
-        accumulator = accumulator + fp8_dot(
-            a, mx_weight_upcast(w, w_s, BLOCK_SIZE_K, n_width, SCALE_GROUP_K, a.dtype), False, BLOCK_SIZE_K
+        accumulator = mx_weight_only_compute(
+            accumulator, a, w, w_s, COMPUTE_MODE, BLOCK_SIZE_K, n_width, SCALE_GROUP_K
         )
         a_ptrs, _, b_ptrs, _, _, _ = advance_ptrs(
             a_ptrs, a_ptrs, b_ptrs, b_ptrs, b_ptrs, b_ptrs,

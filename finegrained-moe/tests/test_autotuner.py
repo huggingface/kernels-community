@@ -199,11 +199,11 @@ def test_act_quant_arms_are_bit_equal():
         scale_dtype=torch.float8_e8m0fnu,
     )
     A = torch.randn(4, 512, device="cuda", dtype=torch.bfloat16)  # below the M gate
-    inline_out = finegrained_moe.matmul_2d(A, B, Bs, None, torch.bfloat16)
+    inline_out = finegrained_moe.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
     saved = finegrained_moe.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M
     try:
         finegrained_moe.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = 1  # force offline
-        offline_out = finegrained_moe.matmul_2d(A, B, Bs, None, torch.bfloat16)
+        offline_out = finegrained_moe.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
     finally:
         finegrained_moe.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M = saved
     assert torch.equal(inline_out, offline_out)

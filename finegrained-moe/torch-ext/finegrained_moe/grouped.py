@@ -26,7 +26,7 @@ from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, co
 from .recipes import Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size
 from .tile_layout import build_tile_layout
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_swizzled_grouped, swizzle_grouped_mx_scales
-from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_upcast, static_dot
+from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import resolve_grouped_tile
 from .tiles import (
     load_act_block_dynamic,
@@ -41,7 +41,7 @@ from .tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, gemm_epilogue
-from .pruners import affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
+from .pruners import affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
 
 
 def _rebind_grouped_weight_descriptor(nargs):
@@ -865,6 +865,7 @@ def mx_dynamic_matmul_grouped_kernel(
         tune_block_nk=True,
         tune_block_m=True,
         warp_spec=True,
+        compute_modes=("dot", "dot_scaled"),
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=_rebind_grouped_descriptors,
@@ -875,9 +876,11 @@ def mx_dynamic_matmul_grouped_kernel(
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            mx_config_pruner("K", "N"),  # dot_scaled shape gates
             descriptor_box_pruner(),
             smem_pruner(),
             warp_spec_compile_guard_pruner(),
+            gated_pointer_weight_warp_spec_pruner(),
         )
     },
 )
@@ -916,6 +919,7 @@ def mx_weight_only_matmul_grouped_kernel(
     WEIGHT_VALUES_PER_BYTE: tl.constexpr,
     A_MEMORY_MODE: tl.constexpr = "pointer",
     B_MEMORY_MODE: tl.constexpr = "pointer",
+    COMPUTE_MODE: tl.constexpr = "dot",
     WARP_SPEC: tl.constexpr = False,
     GATE: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
@@ -962,7 +966,9 @@ def mx_weight_only_matmul_grouped_kernel(
                 GATE, True, False, B_MEMORY_MODE, False, False,
                 BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
             )
-            acc = acc + tl.dot(a, mx_weight_upcast(w, w_s, BLOCK_SIZE_K, n_width, SCALE_GROUP_K, a.dtype))
+            acc = mx_weight_only_compute(
+                acc, a, w, w_s, COMPUTE_MODE, BLOCK_SIZE_K, n_width, SCALE_GROUP_K
+            )
             a_ptrs += BLOCK_SIZE_K * stride_a_k
             b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
             kb_off += BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE

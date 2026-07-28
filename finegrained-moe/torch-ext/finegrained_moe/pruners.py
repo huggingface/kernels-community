@@ -61,7 +61,10 @@ from .epilogue import *  # noqa: F401,F403
 #     scalar_max_m_pruner              scalar above M=64 (prefill GEVM) — mx 2D
 #     mx_config_pruner poison fences   sm_10x fp4-scalar (1.8x dead) and the whole dot
 #                                      arm (correct but 2-3x-poisons fresh tunes, A/B'd
-#                                      2026-07-14) — mx 2D/batched/grouped
+#                                      2026-07-14) — mx-DYNAMIC 2D/batched/grouped only:
+#                                      the dot fence self-selects on an ``As`` operand, so
+#                                      the weight-only kernels (raw acts, no native MMA to
+#                                      lose to) keep their upcast-and-dot arm
 #     descriptor_config_pruner         orientation couplings: descriptor requires swap
 #                                      (no-swap descriptor races), swap drops WS (3-4x
 #                                      slower + unprobed loop structure), descriptor warp
@@ -194,6 +197,47 @@ def warp_spec_compile_guard_pruner():
 
 
 
+def gated_pointer_weight_warp_spec_pruner():
+    """``early_config_prune`` dropping the ``warp_specialize`` configs that cannot lower on the
+    weight-only grouped MX kernel's GATE arm, where the stacked gate|up tile doubles the weight
+    extent to ``2 * BLOCK_SIZE_N``. With a pointer-mode weight (its masked load carries the
+    ``other=0.0`` constant the WS partitioner cannot tag) the automatic-warp-specialization pass
+    fails in ``TritonGPUOptimizePartitionWarps`` with ``RuntimeError: PassManager::run failed``,
+    but only where the partitioner also has to split a descriptor-mode A, 16 warps, or a
+    sub-128 M tile — plain pointer/pointer at BM=128 and w4/w8 compiles and is often the winner.
+
+    Region measured by tuning the GPT-OSS W4A16 problem (N=K=2880) with a fresh Triton cache and
+    ``FINEGRAINED_AUTOTUNE_LOG``: of 129 WS configs, the 12 that failed are exactly the ones this
+    predicate names, and it drops none of the 117 that compiled. Every failure sat in the GATE
+    shape — the ungated shape's 63 WS configs all compiled. Unfenced these are wasted compiles per
+    new shape (the tuner memoizes them only after paying once). The ``BM < 128`` clause rests on a
+    single observation, so it is the clause to revisit if a later probe contradicts it. CUDA-only;
+    a no-op for ungated launches.
+
+    NOT covered: the later ``dot_scaled`` arm adds 4 UNGATED failures (descriptor-A +
+    pointer-B at num_warps>=8), outside this predicate's GATE scope. Left unfenced on
+    purpose — the region separates only on a GATE x COMPUTE_MODE x A-mode x warps
+    interaction, and every predicate wide enough to catch it also dropped working configs
+    across the five probes. The tuner memoizes the 4 after paying once per shape, and this
+    fence was re-checked against the two-arm grid: 0/207 working configs dropped."""
+
+    def ok(c, args):
+        if not c.kwargs.get("WARP_SPEC"):
+            return True
+        if c.kwargs.get("B_MEMORY_MODE", "pointer") != "pointer":
+            return True
+        return not (
+            c.kwargs.get("A_MEMORY_MODE", "pointer") != "pointer"
+            or c.num_warps >= 16
+            or config_dim(c, args, "BLOCK_SIZE_M") < 128
+        )
+
+    return config_filter(
+        ok, when=lambda args: args.get("GATE", False) and get_active_device_type() == "cuda"
+    )
+
+
+
 def affine_scale_warp_spec_pruner():
     """``early_config_prune`` dropping ``warp_specialize`` on the grouped MX AFFINE (row-major,
     non-``SWIZZLED_SCALES``) scale path. Its per-(gathered-row, K-group) 2D pointer-gather scale
@@ -257,6 +301,13 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None):
     (native dot_scaled owns prefill, scalar owns M=1 decode); other targets keep the arm.
     Revisit if a dot win materializes (e.g. the batched decode BM=16 observation).
 
+    The fence applies only where the kernel carries an ``As`` activation-scale operand, so
+    the weight-only (W4A16/W8A16) kernels keep their dot rows while still getting the shape
+    gates. Their ``dot`` is a weight upcast + plain ``tl.dot`` over a free BK — with raw
+    activations there is no native microscaled MMA to lose to, so both arms upcast and this
+    one WINS the stacked gate|up tile (gpt-oss K=2880: dot 4645.7us vs dot_scaled 5011.3us,
+    while the down projection goes the other way, 2348.1us vs 2882.6us).
+
     Never returns empty — dot_scaled no-swap configs pass every guard (the ``config_filter``
     fallbacks cover the pathological cases). A contraction dim smaller than every grid BK is
     a hard error: any config would over-read past the row and return silently wrong results."""
@@ -318,6 +369,16 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None):
     def dot_arm_ok(c, args):
         return c.kwargs.get("COMPUTE_MODE") != "dot"
 
+    def acts_are_scaled(args):
+        # The dot-arm poison verdict holds only where dot_scaled can reach the NATIVE
+        # microscaled MMA, which needs both operands microscaled — i.e. the kernel carries an
+        # activation-scale operand. The weight-only (W4A16/W8A16) kernels have no ``As``: their
+        # activations are raw bf16/fp16, so no native low-precision MMA exists, both arms upcast,
+        # and their "dot" (weight upcast + plain tl.dot) genuinely competes. Keyed on the operand,
+        # not A's dtype — the MX-dynamic inline-quant arm takes a raw bf16 A and still reaches the
+        # native MMA.
+        return "As" in args
+
     def nvfp4_native_ok(c, args):
         # mxf4nvf4 (E4M3 scales) has NO fallback below the native M=128 staging —
         # PassManager fails outright (charted BM {16,32,64} x BK {128,256}, 2026-07-15).
@@ -352,7 +413,10 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None):
             and not scales_are_e4m3(args),
         ),
         config_filter(
-            dot_arm_ok, when=lambda args: is_sm10x() and scaled_mma_available(args)
+            dot_arm_ok,
+            when=lambda args: is_sm10x()
+            and scaled_mma_available(args)
+            and acts_are_scaled(args),
         ),
         config_filter(mma_shape_ok, when=lambda args: is_sm10x()),
     )
