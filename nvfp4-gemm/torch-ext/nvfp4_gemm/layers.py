@@ -135,15 +135,17 @@ def _is_silu(act):
     return isinstance(act, nn.SiLU) or type(act).__name__ == "SiLUActivation"
 
 
-def _attach_fused(module, mods, interleave=False):
-    def join(ts):
-        if interleave:
-            return torch.stack(ts, 1).reshape(-1, *ts[0].shape[1:]).contiguous()
-        return torch.cat(ts, 0).contiguous()
-
-    module.nvfp4_fused_qweight = join([m.weight for m in mods])
-    module.nvfp4_fused_sf = join([m.weight_sf_rowmajor for m in mods])
-    module.nvfp4_fused_alpha = join(
+def _attach_fused(module, mods):
+    # Keep a single packed allocation and expose row views back through the
+    # original projection modules.  Previously fusion allocated concatenated
+    # weights while retaining an independent copy in every projection.
+    # Attention and SwiGLU use row-concatenated storage; the latter is handled
+    # by the GEMV kernel using the gate/up half offset.
+    fused_qweight = torch.cat([m.weight for m in mods], 0).contiguous()
+    fused_sf = torch.cat([m.weight_sf_rowmajor for m in mods], 0).contiguous()
+    module.nvfp4_fused_qweight = fused_qweight
+    module.nvfp4_fused_sf = fused_sf
+    module.nvfp4_fused_alpha = torch.cat(
         [
             (1.0 / m.weight_global_scale.float())
             .reshape(1)
@@ -153,6 +155,13 @@ def _attach_fused(module, mods, interleave=False):
         ]
     )
     module.nvfp4_fused_splits = [m.out_features for m in mods]
+
+    offset = 0
+    for m in mods:
+        end = offset + m.out_features
+        m.weight = fused_qweight[offset:end]
+        m.weight_sf_rowmajor = fused_sf[offset:end]
+        offset = end
 
 
 def _capture_helpers(cls, rope_fn):
@@ -200,29 +209,7 @@ def fuse_decode_projections(model, rope_fn=None):
             and _is_silu(getattr(mod, "act_fn", None))
             and gu[0].out_features == gu[1].out_features
         ):
-            _attach_fused(mod, gu, interleave=True)
+            _attach_fused(mod, gu)
             _mark(type(mod), "NVFP4SwiGLUMLP")
             n += 1
     return n
-
-
-def kernel_mapping():
-    from pathlib import Path
-
-    from kernels import LocalLayerRepository
-
-    root = next(
-        p for p in Path(__file__).resolve().parents if (p / "build.toml").exists()
-    )
-    return {
-        "NVFP4GatedAttention": {
-            "cuda": LocalLayerRepository(
-                repo_path=root, layer_name="NVFP4GatedAttention"
-            )
-        },
-        "NVFP4SwiGLUMLP": {
-            "cuda": LocalLayerRepository(
-                repo_path=root, layer_name="NVFP4FusedSwiGLUMLP"
-            )
-        },
-    }

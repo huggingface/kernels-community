@@ -109,15 +109,21 @@ __global__ void __launch_bounds__(THREADS) gemv_kernel(
 
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
-  const int row0 = (blockIdx.x * WARPS_PER_CTA + warp) * ROWS_PER_WARP;
-  if (row0 >= N) return;
-  const bool has2 = row0 + 1 < N;
+  // SwiGLU fused weights are row-concatenated as [gate, up].  For that mode
+  // each warp computes one output row and pairs gate row r with up row r+N/2.
+  // Plain/gated modes retain the two-rows-per-warp path.
+  const int logical_n = MODE == Mode::kSwiGLUOut ? N / 2 : N;
+  const int row0 = (blockIdx.x * WARPS_PER_CTA + warp) *
+                   (MODE == Mode::kSwiGLUOut ? 1 : ROWS_PER_WARP);
+  if (row0 >= logical_n) return;
+  const int row1 = MODE == Mode::kSwiGLUOut ? row0 + logical_n : row0 + 1;
+  const bool has2 = MODE != Mode::kSwiGLUOut && row1 < N;
 
   const int kchunks = K >> 5;  // 16B chunks per row (32 elements each)
   const uint4* brow0 = B + (size_t)row0 * kchunks;
-  const uint4* brow1 = brow0 + (has2 ? kchunks : 0);
+  const uint4* brow1 = B + (size_t)row1 * kchunks;
   const uint8_t* srow0 = Bsf + (size_t)row0 * (K >> 4);
-  const uint8_t* srow1 = srow0 + (has2 ? (K >> 4) : 0);
+  const uint8_t* srow1 = Bsf + (size_t)row1 * (K >> 4);
 
   float acc0 = 0.f, acc1 = 0.f;
   for (int c = lane; c < kchunks; c += 32) {
@@ -144,8 +150,8 @@ __global__ void __launch_bounds__(THREADS) gemv_kernel(
     // global scales are row-concatenated (alpha_per_row selects branchlessly).
     if (MODE == Mode::kSwiGLUOut) {
       const float g = acc0 * alpha[alpha_per_row * row0];
-      const float u = acc1 * alpha[alpha_per_row * (row0 + 1)];
-      D[(size_t)m * (N >> 1) + (row0 >> 1)] =
+      const float u = acc1 * alpha[alpha_per_row * row1];
+      D[(size_t)m * logical_n + row0] =
           __float2bfloat16(g / (1.f + expf(-g)) * u);
     } else {
       D[(size_t)m * N + row0] =
@@ -187,7 +193,7 @@ torch::Tensor gemv_run(torch::Tensor const& A, torch::Tensor const* G,
   TORCH_CHECK(K % 32 == 0, "K must be a multiple of 32, got ", K);
   TORCH_CHECK(A.size(1) == K, "A must have ", K, " columns, got ", A.size(1));
   if (MODE == Mode::kSwiGLUOut) {
-    TORCH_CHECK(N % 2 == 0, "interleaved gate/up weight needs even N");
+    TORCH_CHECK(N % 2 == 0, "concatenated gate/up weight needs even N");
   }
   if (MODE == Mode::kGatedIn) {
     TORCH_CHECK(G != nullptr && G->is_cuda() && G->is_contiguous() &&
@@ -215,7 +221,7 @@ torch::Tensor gemv_run(torch::Tensor const& A, torch::Tensor const* G,
     cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          smem);
   }
-  dim3 grid((unsigned)((N + vllm::nvfp4_gemv::ROWS_PER_CTA - 1) /
+  dim3 grid((unsigned)((n_out + vllm::nvfp4_gemv::ROWS_PER_CTA - 1) /
                        vllm::nvfp4_gemv::ROWS_PER_CTA),
             (unsigned)M);
   kfn<<<grid, vllm::nvfp4_gemv::THREADS, smem, stream>>>(
