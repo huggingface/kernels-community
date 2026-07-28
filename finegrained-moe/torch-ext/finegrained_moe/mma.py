@@ -62,6 +62,32 @@ def mx_dot_rescale(acc, a, w, a_scale, w_scale):
 
 
 @triton.jit
+def mx_weight_upcast(w, w_scale, BLOCK_SIZE_K: tl.constexpr, N: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
+                     OUT_DTYPE: tl.constexpr = tl.bfloat16):
+    """Upcast one MXFP4/MXFP8 weight K-tile ``[BK, N]`` to ``OUT_DTYPE`` for the weight-only path: unpack
+    E2M1 -> bf16 directly (fp8 passes through a cast) and apply each ``SCALE_GROUP_K``-row K-group's
+    UE8M0 group scale. ``w_scale`` is ``[N, BK // SCALE_GROUP_K]`` (per-N-row, per-group); transposed
+    and broadcast across each group's rows to ``[BK, N]``. Unlike the ``dot`` arm (BK == group, scale
+    folded onto the [M,N] product) this dequantizes IN the tile, so BK spans any number of groups — a
+    full-BK bf16 ``tl.dot`` (the matmul_ogs recipe: fp4 weight, bf16 acts).
+
+    The scale is applied as a plain bf16 multiply, NOT a hand-rolled exponent-add: the UE8M0 scale is
+    a power of two so a ``bf16 * 2^k`` is already an exact exponent shift (a cheap FMA), and folding it
+    into the bits as an int add + zero-mask ``tl.where`` measured ~13% SLOWER (gate_up 4.68->5.29ms) —
+    the mask + uint16<->int32 bitcast chain costs more than the multiply it replaces."""
+    ng: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
+    wq = e2m1_to_bf16(w) if w.dtype == tl.uint8 else w.to(tl.bfloat16)  # [BK, N] bf16 (direct, no E4M3)
+    # Reshape the (real, contiguous) weight to [ng, g, N] and broadcast the group scale [ng, 1, N]
+    # across each group's g rows in the multiply, then reshape back to [BK, N]. (Reshaping a
+    # broadcasted stride-0 tensor doesn't lower, so broadcast happens IN the op, not before it.)
+    ws = tl.trans(decode_group_scale(w_scale)).to(tl.bfloat16)[:, None, :]  # [ng, 1, N]
+    w3 = wq.reshape(ng, SCALE_GROUP_K, N) * ws
+    # dequant + scale happen in bf16 (exact: E2M1/E4M3 codes and power-of-two UE8M0 scales all fit),
+    # then widen if the activation is wider — bf16->fp32 is lossless and keeps the multiply cheap.
+    return w3.reshape(BLOCK_SIZE_K, N).to(OUT_DTYPE)
+
+
+@triton.jit
 def mx_scalar_reduce(
     acc,
     a,
@@ -364,7 +390,11 @@ def block_dynamic_dot(
         a_sd = decode_group_scale(a_s)
         b_sd = decode_group_scale(b_s)
         if FAKE_BATCH:
-            acc = acc + fp8_dot(a, b, SWAP_AB, block_k) * a_sd[:, None] * b_sd[:, None]
+            d = fp8_dot(a, b, SWAP_AB, block_k)
+            if SWAP_AB:  # [BN, N-atom]: weight-row scale down the M=BN dim, act scalar broadcasts
+                acc = acc + d * a_sd[:, None] * b_sd[:, None]
+            else:  # no-swap [BM, BN] GEVM: act scale down M, weight-N scale across N (upstream form)
+                acc = acc + d * a_sd[:, None] * b_sd[None, :]
         elif SWAP_AB:
             acc = acc + tl.dot(b, a) * b_sd[:, None] * a_sd[None, :]
         else:

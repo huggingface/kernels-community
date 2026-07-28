@@ -23,7 +23,7 @@ from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, co
 from .recipes import Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, is_mx, mx_scale_family, resolve_input_recipe, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, maybe_act_quant
 from .scales import gate_stacked_block_scale_ptrs, mx_2d_scale_ptrs
-from .mma import block_dynamic_dot, fp8_dot, mx_compute, static_dot
+from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_upcast, static_dot
 from .tiles import (
     advance_ptrs,
     load_act_block_dynamic,
@@ -73,6 +73,17 @@ def _rebind_bd_descriptors(nargs):
     ``(rows, K)`` matrices — ``[BLOCK_SIZE_M, block_k]`` and ``[BLOCK_SIZE_N, block_k]``."""
     _rebind_operand_box(nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], nargs["block_k"])
     _rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", nargs["BLOCK_SIZE_N"], nargs["block_k"])
+
+
+def _rebind_weight_only_descriptors(nargs):
+    """Per-config pre_hook for the weight-only kernels — set the A/B host-TMA boxes to the tuned tile:
+    ``[BM, BK]`` over the (M, K) bf16 activation and ``[BN, BK // WEIGHT_VALUES_PER_BYTE]`` over the
+    packed (N, K_bytes) weight (bytes: uint8 = packed E2M1, two values/byte). No scale boxes — weight-only
+    scales are always affine (never swizzled), read through the pointer arm."""
+    wvpb = 2 if nargs["B"].dtype == torch.uint8 else 1
+    bk = nargs["BLOCK_SIZE_K"]
+    _rebind_operand_box(nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], bk)
+    _rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", nargs["BLOCK_SIZE_N"], bk // wvpb)
 
 
 def _rebind_mx_descriptors(nargs):
@@ -744,6 +755,134 @@ def mx_dynamic_matmul_kernel(
 
 
 @bayesian_autotune(
+    # weight-only is a plain bf16 dot (the fp4/fp8 weight is upcast per-group in-loop), tuned like the
+    # full-precision kernel — tile + WS — PLUS a host-TMA memory-mode axis on both operands
+    # (tuner-routed vs pointers, like mx_dynamic): the descriptor box feeds the wide-N prefill tiles
+    # the pointer arm starves; pointer wins decode / short-K. Scales stay affine (pointer) — weight-only
+    # never swizzles — so the descriptor covers only the operand values. BK spans any number of
+    # groups (the dequant is in-tile), so no BK==group constraint.
+    get_accelerator_autotuning_configs(
+        tune_block_nk=True,
+        tune_block_m=True,
+        warp_spec=True,
+        a_memory_modes=("descriptor", "pointer"),
+        b_memory_modes=("descriptor", "pointer"),
+        pre_hook=_rebind_weight_only_descriptors,
+    ),
+    ["N", "K", "m_bit_length", "GATE"],
+    n_trials=100,
+    # WS compile guard + descriptor TMA-box limits (256/dim) + smem fit; the gate|up stack reads via
+    # the pointer arm (a contiguous box can't span the N-apart gate/up rows), so prune B-descriptor
+    # under GATE.
+    prune_configs_by={
+        "early_config_prune": compose_pruners(
+            block_within_dim_pruner("K"),
+            warp_spec_compile_guard_pruner(),
+            descriptor_box_pruner("BLOCK_SIZE_K"),
+            gate_pointer_only_pruner(),
+            smem_pruner("BLOCK_SIZE_K"),
+        )
+    },
+)
+@triton.jit
+def mx_weight_only_matmul_2d_kernel(
+    A,  # (M, K) raw BF16/FP16 activations — NOT quantized
+    ADescriptor,  # host TMA descriptor over A (M, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
+    B,  # (N, K[/2]) MXFP4 (packed E2M1) / MXFP8 (E4M3) weights; under GATE the (2N, ...) gate|up stack
+    BDescriptor,  # host TMA descriptor over B (N, K_bytes), box (BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
+    Bs,  # (N, K // SCALE_GROUP_K) UE8M0 weight group scales (2N under GATE)
+    C,  # (M, N) output (GLU intermediate under GATE)
+    M,
+    N,
+    K,
+    m_bit_length,  # autotune key only (log2 M bucket)
+    stride_a_m,
+    stride_a_k,
+    stride_b_n,
+    stride_b_k,
+    stride_bs_n,
+    stride_bs_k,
+    stride_c_m,
+    stride_c_n,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+    WEIGHT_VALUES_PER_BYTE: tl.constexpr,
+    A_MEMORY_MODE: tl.constexpr = "pointer",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
+    WARP_SPEC: tl.constexpr = False,
+    GATE: tl.constexpr = False,
+    ACT_FN: tl.constexpr = "silu",
+    SWIGLU_ALPHA: tl.constexpr = None,
+    SWIGLU_LIMIT: tl.constexpr = None,
+    SIMULATE_UNFUSED: tl.constexpr = False,
+    INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+):
+    """weight-only dense matmul: ``C = A @ B.T`` with a RAW bf16 activation and an MXFP4/MXFP8 weight
+    upcast to bf16 in-loop (unpack E2M1->E4M3, per-group group-scale multiply), then a plain bf16
+    ``tl.dot``. This is the ``matmul_ogs`` recipe (fp4/fp8 weight bytes kept in memory, bf16 acts,
+    weight upcast in-MMA) — no activation quant, no ``dot_scaled``. Pointer/affine scales only.
+    ``GATE`` loads the stacked (2N, K) gate|up weight as one ``[BK, 2*BN]`` dot + applies the GLU."""
+    n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
+    offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
+    pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WEIGHT_VALUES_PER_BYTE
+    )
+    # Only the weight scale is needed (bf16 acts carry no scale). Build it N-clamped + UNMASKED
+    # (bs_mask=None): valid columns (offs_bn_lin < N) read their real scale; the tail reads a clamped
+    # in-bounds scale that the epilogue masks off (N_COLS / store_masked). Dropping the other=0.0
+    # bounds mask is what lets the K-loop warp-specialization-lower (the masked load's fill constant
+    # is the WS partitioner blocker). GATE routes its stacked gate|up scale through the per-expert
+    # leaf, not these ptrs, so this only governs the plain dense arm.
+    offs_bn_lin = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    bs_ptrs = Bs + (
+        tl.minimum(offs_bn_lin, N - 1)[:, None] * stride_bs_n
+        + tl.arange(0, SCALE_COLS)[None, :] * stride_bs_k
+    )
+    bs_mask = None
+    a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
+    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_kb, N, stride_b_n, stride_b_k, GATE, B_MEMORY_MODE)
+
+    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+        # raw bf16 [BM, BK]: pointer tile or the host-TMA box (no scale — the second slot is dead;
+        # a distinct name, not `_`, which is already bound pre-loop by mx_2d_scale_ptrs)
+        a, a_scale_dead = load_act_plain(
+            a_ptrs, ADescriptor, pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K, None, 0, A_MEMORY_MODE, False
+        )
+        b, b_s = load_weight_mx(
+            b_ptrs, BDescriptor, bs_ptrs, bs_mask, None, Bs, 0, pid_n * BLOCK_SIZE_N,
+            k * (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE), 0, 0, pid_n, k, N, K,
+            0, stride_bs_n, stride_bs_k,
+            GATE, False, False, B_MEMORY_MODE, False, False,
+            BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
+        )
+        w_bf16 = mx_weight_upcast(b, b_s, BLOCK_SIZE_K, n_width, SCALE_GROUP_K, a.dtype)
+        accumulator = accumulator + tl.dot(a, w_bf16)
+        # descriptor arms read by absolute box offset (m/k above); the pointer arms advance here
+        a_ptrs += BLOCK_SIZE_K * stride_a_k
+        b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
+        bs_ptrs += SCALE_COLS * stride_bs_k
+
+    if GATE:
+        out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        gemm_epilogue(
+            C, C, accumulator, out_row, pid_n, pid_m, out_row < M,
+            stride_c_m, stride_c_n, 0, 0,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
+            ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+            COMPUTE_MODE="dot", N_COLS=N,
+        )
+    else:
+        store_masked(
+            C, accumulator, pid_m, pid_n, M, N, stride_c_m, stride_c_n,
+            BLOCK_SIZE_M, BLOCK_SIZE_N,
+        )
+
+
+@bayesian_autotune(
     # Same 2D-swizzle loop physics as the tensor kernel — tune the tile, WS a pure perf axis
     # (compile-guarded), no memory-mode/scale axes (unquantized, no scales anywhere).
     get_accelerator_autotuning_configs(tune_block_nk=True, warp_spec=True, tune_block_m=True),
@@ -1181,7 +1320,7 @@ def mx_dynamic_matmul(
         )
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)  # caller's layout (5D swizzled / 2D affine); the op never swizzles
-    input_recipe = resolve_input_recipe(input_recipe, None, Bs)
+    input_recipe = resolve_input_recipe(input_recipe, None, B, Bs)
     # Activation quant is always maybe_act_quant — offline above the M threshold, inline in the
     # kernel below it (fp4 packs in-register). The offline arm writes swizzled scales directly when
     # the weight is swizzled (fused, no post-quant pass), else affine. Inline acts (small M) stay
@@ -1364,6 +1503,93 @@ def full_precision_matmul_2d(
     return [C]
 
 
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("mx_weight_only_matmul_2d"),
+    mutates_args=(),
+    opaque=True,
+)
+def mx_weight_only_matmul_2d(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype | None = None,
+    gate: bool = False,
+    act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
+) -> list[torch.Tensor]:
+    """weight-only dense matmul ``C = A @ B.T``: a RAW bf16/fp16 activation (no quant) against an
+    MXFP4/MXFP8 weight upcast to bf16 in-loop — the ``matmul_ogs`` recipe (fp4/fp8 weight bytes in
+    memory, bf16 acts, weight upcast in-MMA). Affine (2D) weight scales only. ``gate`` fuses the
+    ``(2N, K)`` gate|up projection + SwiGLU, returning the ``[..., N]`` GLU intermediate. Returns a
+    one-element list (mirrors the other 2D ops). Packed-E2M1 K (B is (rows, K//2)) is handled
+    below, so this op does its own shape checks (not ``validate_dense_2d_operands``)."""
+    assert A.dtype in (torch.bfloat16, torch.float16, torch.float32), (
+        f"weight-only takes a raw bf16/fp16/fp32 activation, got {A.dtype}"
+    )
+    assert Bs.ndim == 2, f"weight-only takes affine (2D) weight scales, got ndim={Bs.ndim}"
+    WEIGHT_VALUES_PER_BYTE = 2 if B.dtype == torch.int8 else 1
+    rows, K_b = B.shape
+    K = A.shape[-1]
+    M = A.numel() // K
+    N = rows // 2 if gate else rows
+    assert K == WEIGHT_VALUES_PER_BYTE * K_b, (
+        f"K (={K}) must equal {WEIGHT_VALUES_PER_BYTE} * B.shape[1] (={K_b})"
+    )
+    scale_group = mx_scale_family(Bs, K)
+    assert Bs.shape == (rows, K // scale_group), (
+        f"Bs shape {tuple(Bs.shape)} != ({rows}, {K // scale_group})"
+    )
+    assert A.is_contiguous(), "A must be contiguous (the host-TMA descriptor arm reads its box)"
+    b_u8 = e2m1_as_uint8(B)
+    bs_u8 = ue8m0_as_uint8(Bs)
+    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+    # Host-TMA descriptors over the (M, K) bf16 A and packed (N, K_bytes) weight — placeholder box
+    # rebound per tuned config by _rebind_weight_only_descriptors, read only by the descriptor configs the
+    # tuner picks (pointer configs never touch them). Scales stay affine (no scale descriptor).
+    a_descriptor = TensorDescriptor.from_tensor(A.view(M, K), [1, 32])
+    b_descriptor = TensorDescriptor.from_tensor(b_u8, [1, 32])
+
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]),
+            triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
+
+    with device_context(A.device):
+        compile_time_only_triton_wrap(mx_weight_only_matmul_2d_kernel)[grid](
+            A,
+            a_descriptor,
+            b_u8,
+            b_descriptor,
+            bs_u8,
+            C,
+            M,
+            N,
+            K,
+            int(M).bit_length(),
+            A.stride(-2),
+            A.stride(-1),
+            b_u8.stride(0),
+            b_u8.stride(1),
+            bs_u8.stride(0),
+            bs_u8.stride(1),
+            C.stride(-2),
+            C.stride(-1),
+            SCALE_GROUP_K=scale_group,
+            WEIGHT_VALUES_PER_BYTE=WEIGHT_VALUES_PER_BYTE,
+            GATE=gate,
+            ACT_FN=act_fn,
+            SWIGLU_ALPHA=swiglu_alpha,
+            SWIGLU_LIMIT=swiglu_limit,
+            SIMULATE_UNFUSED=simulate_unfused,
+            INTERMEDIATE_DTYPE=tl_dtype(resolve_output_dtype(output_dtype, A, None)),
+        )
+
+    return [C]
+
+
 def matmul_2d(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1406,15 +1632,14 @@ def matmul_2d(
     gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused = (
         epilogue if epilogue is not None else Epilogue()
     ).as_args()
-    input_recipe, output_recipe = (
-        quantization if quantization is not None else Quantization()
-    ).as_args()
+    q = quantization if quantization is not None else Quantization()
+    input_recipe, output_recipe = q.as_args()
 
     def _unwrap(ret: list[torch.Tensor]) -> torch.Tensor | list[torch.Tensor]:
         return ret[0] if len(ret) == 1 else ret
 
     if Bs is None:  # unquantized BF16/FP16 weights — plain dot, no scales
-        assert As is None and a_global_scale is None and input_recipe is None and output_recipe is None, (
+        assert As is None and a_global_scale is None and input_recipe in (None, "weights") and output_recipe is None, (
             "the full-precision path (Bs=None) takes no activation scale or quantization recipe"
         )
         return _unwrap(
@@ -1424,6 +1649,15 @@ def matmul_2d(
         )
 
     if is_mx(B, Bs):
+        if input_recipe is None:  # weight-only: raw bf16 activation, MX weight upcast in-MMA
+            assert As is None and a_global_scale is None and output_recipe is None, (
+                "weight-only (input_recipe=None) takes a raw bf16 activation, no As/global/requant"
+            )
+            return _unwrap(
+                mx_weight_only_matmul_2d(
+                    A, B, Bs, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused
+                )
+            )
         return _unwrap(
             mx_dynamic_matmul(
                 A, B, As, Bs, output_dtype, input_recipe,
@@ -1436,7 +1670,7 @@ def matmul_2d(
     )
     # FP8 activations are always E4M3 with the weight-implied scale granularity, so "fp8" is a
     # no-op recipe name (accepted for symmetry with the MoE ops); no other name applies here.
-    assert input_recipe in (None, "fp8"), (
+    assert input_recipe in ("weights", "fp8"), (
         f"FP8-weight activations are E4M3 ('fp8'), got {input_recipe!r}"
     )
     assert output_recipe is None, (

@@ -404,7 +404,7 @@ def _epilogue_requant_mx(
 @triton.jit
 def gemm_epilogue(
     C,
-    Cs,  # row-major requant-scale pointer (dummy under SWIZZLED_OUT — CSDescriptor writes instead)
+    Cs,  # row-major requant-scale pointer (None under SWIZZLED_OUT — CSDescriptor writes instead)
     acc,
     out_row,
     pid_n,

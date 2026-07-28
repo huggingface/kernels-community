@@ -23,10 +23,10 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
 from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, sm_count, tl_dtype
-from .recipes import Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size
+from .recipes import Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size
 from .tile_layout import build_tile_layout
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_swizzled_grouped, swizzle_grouped_mx_scales
-from .mma import block_dynamic_dot, fp8_dot, mx_compute, static_dot
+from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_upcast, static_dot
 from .scheduling import resolve_grouped_tile
 from .tiles import (
     load_act_block_dynamic,
@@ -496,7 +496,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K), box ((2|1), BN, BK); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, 1, 1) per-tensor weight scales (one scalar covers the gate|up stack)
     C,  # (S, N) output; under GATE the bf16 GLU intermediate
-    Cs,  # unused dummy (tensor-wide has no fused requant); kept for the shared epilogue signature
+    Cs,  # None (tensor-wide has no fused requant); kept for the shared epilogue signature
     GatherIdx,  # (S,) int32 — sorted position -> source row of A; read only when not None
     ScatterIdx,  # (S,) int32 — sorted position -> destination row of C; read only when not None
     ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 — cumulative row starts, S sentinel
@@ -659,7 +659,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
 def mx_dynamic_matmul_grouped_kernel(
     A,  # (num_tokens, K) E4M3 activations (pre-quantized once by the wrapper), any row order
     ADescriptor,  # host TMA descriptor over A (rows, K_bytes), box (BM, BK_bytes); read iff A_MEMORY_MODE != "pointer"
-    As,  # activation scales: row-major group scales read affine (gathered per row) iff not SWIZZLED_SCALES; else dummy (swizzled via ASDescriptor)
+    As,  # activation scales: row-major group scales read affine (gathered per row) iff not SWIZZLED_SCALES; else None (swizzled via ASDescriptor)
     ASDescriptor,  # host TMA descriptor over the SWIZZLE_32_4_4, expert-sorted/128-padded A scales; read iff SWIZZLED_SCALES
     B,  # (num_experts, N, K) E4M3 (MXFP8) or (num_experts, N, K // 2) packed E2M1 (MXFP4); 2N under GATE
     BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K_bytes), box ((2|1), BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
@@ -854,6 +854,129 @@ def mx_dynamic_matmul_grouped_kernel(
 
 
 @bayesian_autotune(
+    # weight-only is a plain bf16 dot (fp4/fp8 weight upcast per-group in-loop). Host-TMA memory-mode axis
+    # on both operands + WS. weight-only uses NO swizzled scales (those are a tcgen05 dot_scaled layout;
+    # this kernel decodes the group scale in registers) — the grouped weight-scale affine load is
+    # UNMASKED, so it never blocks WS. The one WS blocker is the masked gathered/padded ACTIVATION
+    # value load (`other=0.0`); the descriptor arm's tma gather4 has no such constant, so WS pairs
+    # with A_MEMORY_MODE=descriptor. warp_spec_compile_guard_pruner owns the num_warps%4 / BM>=64
+    # WS-compile region; WS+pointer-A (masked load) is scored out.
+    get_accelerator_autotuning_configs(
+        tune_block_nk=True,
+        tune_block_m=True,
+        warp_spec=True,
+        a_memory_modes=("descriptor", "pointer"),
+        b_memory_modes=("descriptor", "pointer"),
+        pre_hook=_rebind_grouped_descriptors,
+    ),
+    ["N", "K", "tokens_per_expert_bit_length", "GATE"],
+    n_trials=100,
+    prune_configs_by={
+        "early_config_prune": compose_pruners(
+            block_within_dim_pruner("K"),
+            block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            descriptor_box_pruner(),
+            smem_pruner(),
+            warp_spec_compile_guard_pruner(),
+        )
+    },
+)
+@triton.jit
+def mx_weight_only_matmul_grouped_kernel(
+    A,  # (num_tokens, K) raw BF16/FP16 activations — NOT quantized
+    ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
+    B,  # (num_experts, N, K[/2]) MXFP4 (packed E2M1) / MXFP8 (E4M3) weights; 2N under GATE
+    BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K_bytes), box ((2|1), BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
+    Bs,  # (num_experts, N, K // SCALE_GROUP_K) UE8M0 weight group scales (2N under GATE)
+    C,
+    GatherIdx,
+    ScatterIdx,
+    ExpertStart,
+    S,
+    N,
+    K,
+    stride_a_m,
+    stride_a_k,
+    stride_b_e,
+    stride_b_k,
+    stride_b_n,
+    stride_bs_e,
+    stride_bs_n,
+    stride_bs_k,
+    stride_c_m,
+    stride_c_n,
+    num_experts,
+    tokens_per_expert_bit_length,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    NUM_EXPERTS_POW2: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+    WEIGHT_VALUES_PER_BYTE: tl.constexpr,
+    A_MEMORY_MODE: tl.constexpr = "pointer",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
+    WARP_SPEC: tl.constexpr = False,
+    GATE: tl.constexpr = False,
+    ACT_FN: tl.constexpr = "silu",
+    SWIGLU_ALPHA: tl.constexpr = None,
+    SWIGLU_LIMIT: tl.constexpr = None,
+    SIMULATE_UNFUSED: tl.constexpr = False,
+    INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+):
+    """weight-only grouped expert matmul: raw bf16 activations against MXFP4/MXFP8 weights upcast to bf16
+    in-loop (unpack + per-group group-scale), plain ``tl.dot``. The ``matmul_ogs`` recipe. Persistent
+    grid-stride; pointer or host-TMA operands, affine scales. ``GATE`` fuses the (E, 2N, K) gate|up
+    stack + SwiGLU."""
+    n_width: tl.constexpr = (2 if GATE else 1) * BLOCK_SIZE_N
+    start_pid = tl.program_id(axis=0)
+    exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
+        ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
+    )
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
+    for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
+        pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
+            resolve_grouped_tile(
+                tile_id, num_n_tiles, exp_start, freqs, tile_start_excl, e_offs,
+                GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
+            )
+        )
+        offs_bn = offs_bn % N  # non-128 N: pointer rows wrap; wrapped cols masked (N_COLS) in epilogue
+        a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
+        b_ptrs = weight_tile_ptrs(
+            B + expert_id64 * stride_b_e, offs_bn, offs_kb, N * stride_b_n,
+            stride_b_n, stride_b_k, GATE, False,
+        )
+        acc = acc_init("dot", BLOCK_SIZE_M, n_width, False)
+        kb_off = 0
+        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+            a, _as = load_act_plain(
+                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
+                A_MEMORY_MODE, GatherIdx is not None,
+            )
+            w, w_s = load_weight_mx(
+                b_ptrs, BDescriptor, Bs, None, None, 0, row0, n_off, kb_off, 0, expert_id64, pid_n, k, N, K,
+                stride_bs_e, stride_bs_n, stride_bs_k,
+                GATE, True, False, B_MEMORY_MODE, False, False,
+                BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
+            )
+            acc = acc + tl.dot(a, mx_weight_upcast(w, w_s, BLOCK_SIZE_K, n_width, SCALE_GROUP_K, a.dtype))
+            a_ptrs += BLOCK_SIZE_K * stride_a_k
+            b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
+            kb_off += BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
+
+        gemm_epilogue(
+            C, C, acc, out_row, pid_n, tile_id // num_n_tiles, row_mask,
+            stride_c_m, stride_c_n, 1, 1,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, 1,
+            ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+            N_COLS=N,
+        )
+
+
+@bayesian_autotune(
     get_accelerator_autotuning_configs(
         tune_block_nk=True,
         warp_spec=True,
@@ -979,7 +1102,7 @@ def full_precision_matmul_grouped_kernel(
 
         gemm_epilogue(
             C,
-            C,  # dummy Cs (no requant arm)
+            None,  # no requant arm here
             acc,
             out_row,
             pid_n,
@@ -987,7 +1110,7 @@ def full_precision_matmul_grouped_kernel(
             row_mask,
             stride_c_m,
             stride_c_n,
-            1,  # dummy Cs strides
+            1,  # Cs strides: unread, Cs is None
             1,
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
@@ -1061,12 +1184,13 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     )
 
     output_dtype = resolve_output_dtype(output_dtype, A, As)
-    assert input_recipe in (None, "fp8"), (
+    assert input_recipe in ("weights", "fp8"), (
         f"block-dynamic activations are E4M3 ('fp8'), got {input_recipe!r}"
     )
-    assert output_recipe in (None, "fp8"), (
+    assert output_recipe in (None, "weights", "fp8"), (
         f"the block-dynamic recipe requantizes to 'fp8', got {output_recipe!r}"
     )
+    output_recipe = "fp8" if output_recipe == "weights" else output_recipe  # this family's format
     requant = output_recipe is not None
     # the requantized intermediate's scale groups follow gate_up's block_n, and the
     # down consumes per-block_k — a non-square block recipe would misalign them
@@ -1091,7 +1215,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
         Cs = torch.empty(S, N // block_n, device=A.device, dtype=cs_dtype)
     else:
         C = A.new_empty(S, N, dtype=output_dtype)
-        Cs = expert_start  # general dummy pointer; unread (no OUTPUT_RECIPE), strides literal
+        Cs = None  # unread without an OUTPUT_RECIPE; strides literal below
     num_sms = sm_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A, B.view(2 * num_experts if gate else num_experts, N, K)
@@ -1126,7 +1250,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
             bs_u8.stride(1),
             C.stride(0),
             C.stride(1),
-            Cs.stride(0) if requant else 1,  # dummy stride when unread
+            Cs.stride(0) if requant else 1,  # literal when Cs is None
             Cs.stride(1) if requant else 1,
             # Meta-parameters
             num_experts=num_experts,
@@ -1196,12 +1320,13 @@ def w8a8_block_static_fp8_matmul_grouped(
     assert Bs.shape == (num_experts, n_rows // block_n, K // block_k), (
         f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, {n_rows // block_n}, {K // block_k})"
     )
-    assert input_recipe in (None, "fp8"), (
+    assert input_recipe in ("weights", "fp8"), (
         f"block-static activations are E4M3 ('fp8'), got {input_recipe!r}"
     )
-    assert output_recipe in (None, "fp8"), (
+    assert output_recipe in (None, "weights", "fp8"), (
         f"the block-static recipe requantizes to 'fp8', got {output_recipe!r}"
     )
+    output_recipe = "fp8" if output_recipe == "weights" else output_recipe  # this family's format
     requant = output_recipe is not None
     assert not requant or block_n == block_k, (
         f"the fused 'fp8' requant needs square quant blocks, got {block_size}"
@@ -1220,7 +1345,7 @@ def w8a8_block_static_fp8_matmul_grouped(
         Cs = torch.empty(S, N // block_n, device=A.device, dtype=bs_u8.dtype)
     else:
         C = A.new_empty(S, N, dtype=output_dtype)
-        Cs = expert_start  # dummy pointer; unread (no OUTPUT_RECIPE), strides literal
+        Cs = None  # unread without an OUTPUT_RECIPE; strides literal below
     num_sms = sm_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A_q, B.view(2 * num_experts if gate else num_experts, N, K)
@@ -1254,7 +1379,7 @@ def w8a8_block_static_fp8_matmul_grouped(
             bs_u8.stride(1),
             C.stride(0),
             C.stride(1),
-            Cs.stride(0) if requant else 1,  # dummy stride when unread
+            Cs.stride(0) if requant else 1,  # literal when Cs is None
             Cs.stride(1) if requant else 1,
             num_experts=num_experts,
             tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
@@ -1315,7 +1440,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     _, K = A.shape
 
     # Under a gate epilogue B is the (E, 2N, K) gate|up stack — N is the per-projection width.
-    assert input_recipe in (None, "fp8"), (
+    assert input_recipe in ("weights", "fp8"), (
         f"tensor-wide activations are E4M3 ('fp8'), got {input_recipe!r}"
     )
     assert output_recipe is None, (
@@ -1349,7 +1474,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
             b_descriptor,
             Bs,
             C,
-            expert_start,  # dummy Cs (no fused requant for tensor-wide)
+            None,  # tensor-wide has no fused requant
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
             expert_start,
@@ -1365,7 +1490,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
             Bs.stride(0),
             C.stride(0),
             C.stride(1),
-            1,  # dummy Cs strides
+            1,  # Cs strides: unread, Cs is None
             1,
             num_experts=num_experts,
             tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
@@ -1450,7 +1575,8 @@ def mx_dynamic_matmul_grouped(
         )
 
     output_dtype = resolve_output_dtype(output_dtype, A, As)
-    input_recipe = resolve_input_recipe(input_recipe, output_recipe, Bs)
+    input_recipe = resolve_input_recipe(input_recipe, output_recipe, B, Bs)
+    output_recipe = resolve_output_recipe(output_recipe, B, Bs)
     requant = output_recipe is not None
     # Non-128 N on the swizzled arm (bf16, non-gate): each expert's weight-scale slab pads to
     # cdiv(N,128) whole 128-row SWIZZLE_32_4_4 blocks, so the partial last N-tile reads a full (padded)
@@ -1655,7 +1781,7 @@ def full_precision_matmul_grouped(
     assert A.dtype == B.dtype and A.dtype in (torch.bfloat16, torch.float16), (
         f"full-precision path needs matching BF16/FP16 A and B, got {A.dtype} / {B.dtype}"
     )
-    assert input_recipe is None and output_recipe is None, (
+    assert input_recipe in (None, "weights") and output_recipe is None, (
         "the full-precision path quantizes nothing — no input or output recipe applies"
     )
 
@@ -1695,6 +1821,95 @@ def full_precision_matmul_grouped(
             tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
             NUM_SMS=num_sms,
+            GATE=gate,
+            ACT_FN=act_fn,
+            SWIGLU_ALPHA=swiglu_alpha,
+            SWIGLU_LIMIT=swiglu_limit,
+            SIMULATE_UNFUSED=simulate_unfused,
+            INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+        )
+
+    return [C]
+
+
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("mx_weight_only_matmul_grouped"),
+    mutates_args=(),
+    opaque=True,
+)
+def mx_weight_only_matmul_grouped(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    expert_start: torch.Tensor,
+    gate: bool = False,
+    act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
+    output_dtype: torch.dtype | None = None,
+    gather_idx: torch.Tensor | None = None,
+    scatter_idx: torch.Tensor | None = None,
+) -> list[torch.Tensor]:
+    """weight-only grouped matmul: raw bf16/fp16 activations against MXFP4/MXFP8 weights upcast to bf16
+    in-loop — the ``matmul_ogs`` recipe (fp4/fp8 weight bytes, bf16 acts, weight upcast in-MMA).
+    Affine (3D) weight scales. Same gather/scatter expert scheduling as the other grouped ops.
+    Returns ``[C]`` (no requant — the bf16 intermediate needs none)."""
+    assert A.dtype in (torch.bfloat16, torch.float16, torch.float32), (
+        f"weight-only takes a raw bf16/fp16/fp32 activation, got {A.dtype}"
+    )
+    assert Bs.ndim == 3, f"weight-only grouped takes affine (3D) weight scales, got ndim={Bs.ndim}"
+    _, K = A.shape
+    WEIGHT_VALUES_PER_BYTE = 2 if B.dtype == torch.int8 else 1
+    num_experts, rows, K_b = B.shape
+    assert K == WEIGHT_VALUES_PER_BYTE * K_b, (
+        f"K ({K}) must equal {WEIGHT_VALUES_PER_BYTE} * B.shape[2] ({K_b})"
+    )
+    N = rows // 2 if gate else rows
+    scale_group = mx_scale_family(Bs, K)
+    S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
+    output_dtype = resolve_output_dtype(output_dtype, A, None)
+    C = A.new_empty(S, N, dtype=output_dtype)
+    num_sms = sm_count(A.device.index)
+    b_u8 = e2m1_as_uint8(B)
+    bs_u8 = ue8m0_as_uint8(Bs)
+    # Operand host-TMA descriptors (A over (S, K), B over the (2E|E, N, K_bytes) weight view);
+    # placeholder boxes rebound per config by _rebind_grouped_descriptors, read only by descriptor
+    # configs the tuner picks. Scales stay affine (3D pointer) — no scale descriptor.
+    a_descriptor, b_descriptor = build_grouped_operand_descriptors(
+        A, b_u8.view(2 * num_experts if gate else num_experts, N, K_b)
+    )
+
+    with device_context(A.device):
+        compile_time_only_triton_wrap(mx_weight_only_matmul_grouped_kernel)[(num_sms,)](
+            A,
+            a_descriptor,
+            b_u8,
+            b_descriptor,
+            bs_u8,
+            C,
+            gather_idx,
+            scatter_idx,
+            expert_start,
+            S,
+            N,
+            K,
+            A.stride(0),
+            A.stride(1),
+            b_u8.stride(0),
+            b_u8.stride(2),
+            b_u8.stride(1),
+            bs_u8.stride(0),
+            bs_u8.stride(1),
+            bs_u8.stride(2),
+            C.stride(0),
+            C.stride(1),
+            num_experts=num_experts,
+            tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
+            NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
+            NUM_SMS=num_sms,
+            SCALE_GROUP_K=scale_group,
+            WEIGHT_VALUES_PER_BYTE=WEIGHT_VALUES_PER_BYTE,
             GATE=gate,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
@@ -1796,6 +2011,20 @@ def matmul_grouped(
             expert_start,
             *ep.as_args(),
             *q.as_args(),
+            output_dtype,
+            gather_idx,
+            scatter_idx,
+        )
+    elif is_mx(B, Bs) and q.input_recipe is None:  # weight-only: raw bf16 acts, MX weight upcast in-MMA
+        assert As is None and a_global_scale is None and q.output_recipe is None, (
+            "weight-only (input_recipe=None) takes a raw activation, no As/global/requant"
+        )
+        out = mx_weight_only_matmul_grouped(
+            A,
+            B,
+            Bs,
+            expert_start,
+            *ep.as_args(),
             output_dtype,
             gather_idx,
             scatter_idx,

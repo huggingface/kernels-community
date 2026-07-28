@@ -370,6 +370,35 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None):
 
 
 
+def scale_subblock_pruner():
+    """``early_config_prune`` for kernels whose compute tile (``BLOCK_SIZE_N``) may subdivide the
+    quant block (``BLOCK_N``). One scale covers the whole block, so a narrower tile just reads its
+    own block — and it multiplies the N grid, the lever once the whole-block grid no longer fills
+    the device (a gate|up fusion halves that grid again by folding both into one program).
+
+    Sub-block tiles are admitted ONLY there. A grid that already fills the device gains nothing from
+    a narrower tile, and carrying the extra tiles into every launch would spend one trial budget
+    over a 3x config space — measurably worse winners on the launches that never needed it.
+
+    A fused requant always pins the tile to the whole block: its output scale is one amax per
+    (row, ``BLOCK_N``) group, which a partial tile can't compute."""
+
+    def ok(c, args):
+        block_n = args.get("BLOCK_N")
+        if block_n is None:
+            return True
+        bn = config_dim(c, args, "BLOCK_SIZE_N")
+        starved = args["S"] * triton.cdiv(args["N"], block_n) < sm_count(
+            args["B"].device.index
+        )
+        if args.get("OUTPUT_RECIPE") is not None or not starved:
+            return bn == block_n
+        return bn <= block_n and args["N"] % bn == 0
+
+    return config_filter(ok)
+
+
+
 def swizzled_scales_bm_pruner():
     """``early_config_prune`` for the grouped MX pre-swizzled scale path (always on). Pin
     ``BLOCK_SIZE_M`` to 128: the offline act-quant lays each expert's scale slab out 128-padded,
@@ -392,7 +421,7 @@ def swizzled_scales_bm_pruner():
 
 
 
-def swizzled_scale_config_pruner():
+def swizzled_scale_config_pruner(allow_gate_subblock=False):
     """Drop pre-swizzled-scale configs the SWIZZLE_32_4_4 descriptor load can't serve, gated on
     ``SWIZZLED_SCALES`` (the un-swizzled arm loads scales per group and takes any tile):
 
@@ -404,14 +433,21 @@ def swizzled_scale_config_pruner():
       need a box grown past its creation shape, which the tensormap does not honor. Decode never
       wants BN>128 anyway (M=1 grid occupancy), so this costs no win.
     - under ``GATE``, ``BLOCK_SIZE_N != 128``: the gate|up scale is interleaved as whole 128-row
-      block pairs [g0,u0,g1,u1,...], read as one 2*BN tile; a sub-128 BN can't index a block pair.
-      The non-gate decode arm still slices sub-128 tiles out of a single block."""
+      block pairs [g0,u0,g1,u1,...], read as one 2*BN tile; a sub-128 BN can't index a block pair
+      off the descriptor. ``allow_gate_subblock`` (batched decode, 8-bit MX only) admits BN in
+      (32, 64): its scale leaf pointer-GATHERs the sub-128 gate|up tile out of the interleaved
+      buffer, which is the raw path's BN=32 gate|up tile without un-swizzling (the whole swizzled-vs-
+      raw decode gap). Packed fp4 (uint8 weight) is excluded — a sub-64 stacked gate|up fp4 tile
+      trips the fp4->bf16 lowering (``xVals.size() % 4``); fp4 keeps BN=128."""
 
     def ok(c, args):
         if config_dim(c, args, "BLOCK_SIZE_K") % 128 != 0:
             return False
         bn = config_dim(c, args, "BLOCK_SIZE_N")
-        return bn == 128 if args.get("GATE") else bn <= 128
+        if args.get("GATE"):
+            packed_fp4 = getattr(args.get("B"), "dtype", None) == torch.uint8
+            return bn == 128 or (allow_gate_subblock and not packed_fp4 and bn in (32, 64))
+        return bn <= 128
 
     return config_filter(ok, when=lambda args: args.get("SWIZZLED_SCALES"))
 

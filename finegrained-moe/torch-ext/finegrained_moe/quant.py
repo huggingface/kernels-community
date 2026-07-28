@@ -188,6 +188,36 @@ def _e2m1_code_to_e4m3_bits(code):
 
 
 @triton.jit
+def _e2m1_code_to_bf16_bits(code):
+    """One E2M1 4-bit code -> the bf16 bit pattern (uint16) holding the same value, pure int ops.
+    The 8 magnitudes ``{0,.5,1,1.5,2,3,4,6}`` are exact in bf16; above the 0.5 subnormal the mapping
+    is affine in the code: ``bits = 0x3F80 + (mag - 2) * 0x40`` (each step doubles/1.5x's cleanly on
+    the bf16 exponent/mantissa). Callers bitcast the uint16 to bf16 — no float convert, and no E4M3
+    intermediate. bf16 is the exact intermediate for every activation dtype, not the final one: the
+    caller widens the dequantized tile if the activation is wider."""
+    code = code.to(tl.int32)
+    mag = code & 7
+    bits = tl.where(mag == 0, 0, tl.where(mag == 1, 0x3F00, 0x3F80 + (mag - 2) * 0x40))
+    return bits | ((code >> 3) << 15)  # sign at bit 15
+
+
+@triton.jit
+def e2m1_to_bf16(b_packed):
+    """Unpack packed MXFP4 (E2M1, two nibbles/byte along K) straight to bf16, doubling the K (row)
+    dim: ``(R, C) uint8 -> (2R, C) bf16``. Direct (no E4M3 round-trip), and the low/high nibbles
+    interleave along K with a SINGLE 3D axis-swap (``join`` -> ``[R, C, 2]`` -> swap last two ->
+    reshape) instead of the three 2D transposes ``e2m1_to_e4m3`` needs — the weight-only unpack hot path
+    (fp4 weight upcast in-loop, the caller widening to the activation dtype). K order low-nibble-first, matching
+    ``e2m1_to_e4m3``: ``[byte0_lo, byte0_hi, byte1_lo, ...]``."""
+    lo = _e2m1_code_to_bf16_bits(b_packed & 0xF)  # [R, C] int32 (bf16 bits)
+    hi = _e2m1_code_to_bf16_bits(b_packed >> 4)   # [R, C]
+    paired = tl.join(lo, hi)                       # [R, C, 2]  (pair in last dim)
+    paired = tl.trans(paired, 0, 2, 1)             # [R, 2, C]  (pair adjacent in row dim)
+    out = tl.reshape(paired, (2 * b_packed.shape[0], b_packed.shape[1]))  # [2R, C]
+    return out.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+
+
+@triton.jit
 def e2m1_cols_to_e4m3(packed):
     """Column-unpack packed E2M1 (two nibbles per byte along the last dim, low nibble
     first) to E4M3: ``(..., C) uint8 -> (..., 2C)`` — the column-axis counterpart of the
@@ -259,8 +289,8 @@ def _quant_block_k_pruner(configs, named_args, **kwargs):
 def _mx_act_quant_kernel(
     X,
     Y,
-    S,  # (T, K // SCALE_GROUP_K) row-major scales (plain path); dummy on the swizzled path
-    SOut,  # flat SWIZZLE_32_4_4 scale buffer (1, n_tiles, cb, 2, 256); dummy int on the plain path
+    S,  # (T, K // SCALE_GROUP_K) row-major scales; None on the swizzled path
+    SOut,  # flat SWIZZLE_32_4_4 scale buffer (1, n_tiles, cb, 2, 256); None on the plain path
     GatherIdx,  # (S,) int32 sorted position -> source row of X; read only when SWIZZLED and not None
     ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 cumulative sorted-row starts; read iff SWIZZLED
     GlobalScale,  # (1,) fp32 NVFP4 second-level per-tensor global; None ⇒ single-level (arm folds out)
@@ -408,7 +438,7 @@ def mx_act_quant_swizzled_grouped(
         ](
             x,
             y,
-            expert_start,  # dummy S (row-major scales unused on the swizzled arm)
+            None,  # S: the swizzled arm writes SOut, not row-major scales
             s_sw,  # flat SWIZZLE_32_4_4 scale buffer (pointer store; no descriptor)
             gather_idx,  # None = no gather (the is-not-None guard folds the load out)
             expert_start,
@@ -623,10 +653,10 @@ def _launch_act_quant(x, recipe, scale_group, scale_dtype, swizzled=False, globa
         ](
             x,
             values,
-            values if swizzled else scales,  # S: row-major scales (plain) / dummy (swizzled)
-            scales if swizzled else 0,  # SOut: SWIZZLE_32_4_4 buffer (swizzled) / dummy
-            values,  # dummy GatherIdx (unread on the dense grid)
-            values,  # dummy ExpertStart (unread on the dense grid)
+            None if swizzled else scales,  # S: row-major scales, plain arm only
+            scales if swizzled else None,  # SOut: SWIZZLE_32_4_4 buffer, swizzled arm only
+            None,  # GatherIdx: the dense grid reads rows directly
+            None,  # ExpertStart: no expert-sorted tiles on the dense grid
             global_scale,  # (1,) fp32 NVFP4 two-level global; None ⇒ single-level (arm folds out)
             x.stride(0),
             x.stride(1),

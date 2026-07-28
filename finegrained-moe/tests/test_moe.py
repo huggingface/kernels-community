@@ -40,10 +40,10 @@ from finegrained_moe import moe  # type: ignore
 class MoEProblem:
     """End-to-end fused-MoE shape: ``num_tokens`` routed ``num_top_k`` ways through
     ``num_experts`` experts, hidden ``hidden_dim``, per-gate ``intermediate_dim``.
-    ``weights`` names a ``WEIGHTS`` registry row; ``recipe`` (optional) is forwarded to
-    both forwards — ``None`` follows the weight recipe on each side."""
+    ``weight_recipe`` names a ``WEIGHTS`` registry row; ``act_recipe`` is forwarded to both
+    forwards — ``"weights"`` follows the weight recipe, ``None`` is weight-only (bf16 acts)."""
 
-    weights: str
+    weight_recipe: str
     num_tokens: int = 4
     num_experts: int = 8
     hidden_dim: int = 512
@@ -51,7 +51,7 @@ class MoEProblem:
     num_top_k: int = 8
     sentinel_fraction: float = 0.0
     dtype: torch.dtype = torch.bfloat16
-    recipe: Optional[str] = None
+    act_recipe: Optional[str] = "weights"
     swiglu_alpha: Optional[float] = None
     swiglu_limit: Optional[float] = None
     act_fn: str = "silu"
@@ -68,9 +68,9 @@ class MoEProblem:
             act = f"_{self.act_fn}"
         else:
             act = ""
-        recipe = f"_recipe_{self.recipe}" if self.recipe else ""
+        recipe = "" if self.act_recipe == "weights" else f"_recipe_{self.act_recipe or 'bf16'}"
         return (
-            f"{self.weights}_T{self.num_tokens}_E{self.num_experts}_H{self.hidden_dim}"
+            f"{self.weight_recipe}_T{self.num_tokens}_E{self.num_experts}_H{self.hidden_dim}"
             f"_I{self.intermediate_dim}_top{self.num_top_k}_{DTYPE_TAG[self.dtype]}"
             f"{act}{recipe}{'_sentinel' if self.sentinel_fraction > 0 else ''}"
         )
@@ -78,47 +78,51 @@ class MoEProblem:
 
 MOE_PROBLEMS = [
     # ── one decode-size + one small-batch shape per weight family ──
-    MoEProblem(weights="mxfp4", num_tokens=1),
-    MoEProblem(weights="mxfp4"),
-    MoEProblem(weights="mxfp4", dtype=torch.float16),
-    MoEProblem(weights="mxfp8", num_tokens=1),
-    MoEProblem(weights="mxfp8"),
+    MoEProblem(weight_recipe="mxfp4", num_tokens=1),
+    MoEProblem(weight_recipe="mxfp4"),
+    MoEProblem(weight_recipe="mxfp4", dtype=torch.float16),
+    MoEProblem(weight_recipe="mxfp8", num_tokens=1),
+    MoEProblem(weight_recipe="mxfp8"),
     # UE8M0 scales stored as raw uint8 (e.g. MiniMax-M3-MXFP8 checkpoints) — must still
     # detect as MXFP8 and route to the MX path, not fall back to block-dynamic.
-    MoEProblem(weights="mxfp8_u8"),
-    MoEProblem(weights="fp8_128x128", num_tokens=1),
-    MoEProblem(weights="fp8_128x128"),
+    MoEProblem(weight_recipe="mxfp8_u8"),
+    MoEProblem(weight_recipe="fp8_128x128", num_tokens=1),
+    MoEProblem(weight_recipe="fp8_128x128"),
     # block-FP8 with UE8M0 (power-of-two) scales — the whole-model UE8M0 contract: acts,
     # weights, and the fused intermediate requant all power-of-two (DeepSeek-V4 attn / B200).
-    MoEProblem(weights="fp8_128x128_ue8m0", num_tokens=1),
-    MoEProblem(weights="fp8_128x128_ue8m0"),
-    MoEProblem(weights="nvfp4"),
+    MoEProblem(weight_recipe="fp8_128x128_ue8m0", num_tokens=1),
+    MoEProblem(weight_recipe="fp8_128x128_ue8m0"),
+    MoEProblem(weight_recipe="nvfp4"),
     # ── full precision: scale-less BF16 weights resolve to recipe None and the fused
     # gate_up hands the down a bare (unscaled) intermediate ──
-    MoEProblem(weights="bf16", num_tokens=1),
-    MoEProblem(weights="bf16"),
+    MoEProblem(weight_recipe="bf16", num_tokens=1),
+    MoEProblem(weight_recipe="bf16"),
     # ── contraction dims on the 64 grid but off the 128 grid (gpt-oss H=I=2880): only
     # BK=64 divides, so the W4A4 chain runs the no-swap BK=64 dot_scaled rows ──
-    MoEProblem(weights="mxfp4", hidden_dim=320, intermediate_dim=320),
+    MoEProblem(weight_recipe="mxfp4", hidden_dim=320, intermediate_dim=320),
     # ── explicit recipe forwarding: W4A8 chain on mxfp4 weights (default is W4A4) ──
-    MoEProblem(weights="mxfp4", recipe="mxfp8"),
+    MoEProblem(weight_recipe="mxfp4", act_recipe="mxfp8"),
+    # ── weight-only weight-only: bf16 acts × mxfp4 weights, dedicated dequant-then-bf16-dot
+    # kernels (the gpt-oss / matmul_ogs recipe); intermediate stays bf16 (no requant) ──
+    MoEProblem(weight_recipe="mxfp4", act_recipe=None, num_tokens=1),
+    MoEProblem(weight_recipe="mxfp4", act_recipe=None),
     # ── clamped/scaled SwiGLU (GPT-OSS / MiniMax-M3); glu is recipe-independent ──
-    MoEProblem(weights="mxfp8", swiglu_alpha=1.702, swiglu_limit=7.0),
+    MoEProblem(weight_recipe="mxfp8", swiglu_alpha=1.702, swiglu_limit=7.0),
     # alpha / limit are independent glu branches — cover each alone
-    MoEProblem(weights="mxfp8", swiglu_alpha=1.702),
-    MoEProblem(weights="mxfp8", swiglu_limit=7.0),
+    MoEProblem(weight_recipe="mxfp8", swiglu_alpha=1.702),
+    MoEProblem(weight_recipe="mxfp8", swiglu_limit=7.0),
     # ── GeGLU / ReGLU (activation orthogonal to recipe, one MXFP8 shape each) ──
-    MoEProblem(weights="mxfp8", act_fn="gelu"),
-    MoEProblem(weights="mxfp8", act_fn="relu"),
+    MoEProblem(weight_recipe="mxfp8", act_fn="gelu"),
+    MoEProblem(weight_recipe="mxfp8", act_fn="relu"),
     # ── expert parallelism: non-local experts sentinel-masked ──
-    MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
-    MoEProblem(weights="fp8_128x128", num_tokens=8, sentinel_fraction=0.875),
+    MoEProblem(weight_recipe="mxfp8", num_tokens=8, sentinel_fraction=0.875),
+    MoEProblem(weight_recipe="fp8_128x128", num_tokens=8, sentinel_fraction=0.875),
     # int32 pointer-offset overflow guard for the fused paths: the last experts'
     # gate_up offsets exceed 2^31 elements (127 * 2*2048 * 6144 = 3.196e9); a regressed
     # int64 cast corrupts the high-routed tokens vs the torch reference. E is a power of
     # two (the fused-grouped scheduling kernels require it).
     MoEProblem(
-        weights="fp8_128x128",
+        weight_recipe="fp8_128x128",
         num_tokens=512,
         num_experts=128,
         hidden_dim=6144,
@@ -131,7 +135,7 @@ MOE_PROBLEMS = [
 def _make_moe_weights(problem: MoEProblem):
     """gate_up ``(E, 2I, H)`` and down ``(E, H, I)`` weights + block inv-scales + per-tensor globals
     (``None`` for single-level recipes) for the recipe."""
-    make = WEIGHTS[problem.weights]["make"]
+    make = WEIGHTS[problem.weight_recipe]["make"]
     gate_up, gate_up_s, gate_up_g = make(
         2 * problem.intermediate_dim, problem.hidden_dim, problem.num_experts
     )
@@ -186,7 +190,7 @@ def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
         act_fn=problem.act_fn,
         swiglu_alpha=problem.swiglu_alpha,
         swiglu_limit=problem.swiglu_limit,
-        recipe=problem.recipe,
+        recipe=problem.act_recipe,
     )
     ref = unfused_fn(
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
@@ -239,9 +243,9 @@ def test_fused_batched_compiles_across_shapes():
     torch.compiler.reset()
     compiled = torch.compile(moe.moe_fused_batched, fullgraph=True)
     for problem in (
-        MoEProblem(weights="mxfp4", num_tokens=1),
+        MoEProblem(weight_recipe="mxfp4", num_tokens=1),
         MoEProblem(
-            weights="mxfp4", num_tokens=1, hidden_dim=320, intermediate_dim=320
+            weight_recipe="mxfp4", num_tokens=1, hidden_dim=320, intermediate_dim=320
         ),
     ):
         torch.manual_seed(0)

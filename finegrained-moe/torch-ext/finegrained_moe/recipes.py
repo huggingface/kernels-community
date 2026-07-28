@@ -36,7 +36,7 @@ def ue8m0_as_uint8(scale: torch.Tensor | None) -> torch.Tensor | None:
     """View UE8M0 (``float8_e8m0fnu``) weight scales as ``uint8`` for the Triton
     binder, which doesn't recognize the dtype; kernels decode ``2^(exp-127)``
     inline. fp32 (non-UE8M0) scales pass through unchanged; ``None`` (an absent
-    optional scale) passes through as ``None`` — kernels take it as a dummy pointer."""
+    optional scale) passes through as ``None`` — kernels take the arg as None."""
     if scale is None:
         return None
     return scale.view(torch.uint8) if scale.dtype == torch.float8_e8m0fnu else scale
@@ -324,19 +324,29 @@ class Epilogue:
 
 @dataclass(frozen=True)
 class Quantization:
-    """How tensors are quantized at the op boundaries — a recipe name per side, validated
-    against the weight recipe (a mismatched name fails loudly at the op). ``None`` =
-    follow the weights: the recipe's default quant on the way in, a plain high-precision
-    store on the way out. A name means one format, identical on either side — an output
-    feeds a matching input as-is, and requantized outputs are bit-identical to quantizing
-    the same values offline. Pre-quantized activations are the ops' ``As`` parameter (its
-    dtype carries the format); the plain-store element type is the dispatchers'
-    ``output_dtype`` argument.
+    """The quantization format at each op boundary — one recipe name per side (activation in,
+    result out). One rule: a recipe names the format that tensor is in at the boundary, and the
+    op bridges reality to it.
 
-    Support matrix (weight recipe → accepted names; default first):
+    - ``input_recipe`` — the activation's format *entering the MMA*. A raw high-precision ``A`` is
+      quantized to it (dynamic); an already-quantized ``A`` arrives via ``As`` (its dtype carries
+      the format), taken as-is; ``None`` leaves ``A`` high precision (no activation quant).
+    - ``output_recipe`` — the result's format *when stored*. The op requantizes the fp32
+      accumulator to it, bit-identically to quantizing the same values offline, so the output feeds
+      a matching next-op input directly. ``None`` → a plain high-precision store (the dispatchers'
+      ``output_dtype``).
+
+    The WEIGHT recipe is NOT a field — it is inferred from the weight/scale dtypes, which are
+    self-describing for every supported format (the dispatchers route on them directly).
+    ``"weights"`` — valid on either side, and the input default — means "whatever format the
+    weights are already in", so an output feeds a matching next op directly. ``None`` means NO
+    quantization on that side: a high-precision activation in, a plain store out. A mismatched
+    name fails loudly at the op.
+
+    Support matrix (weight family → accepted input/output names; default first):
 
     ==================  =========================  =========================
-    weights             input_recipe               output_recipe
+    weight family       input_recipe               output_recipe
     ==================  =========================  =========================
     block-dynamic FP8   "fp8" (E4M3 +              "fp8" (E4M3 +
                         per-block scales)          per-block scales)
@@ -344,65 +354,90 @@ class Quantization:
                         per-token scales)
     MXFP8 / MXFP4       "mxfp8" (E4M3 + UE8M0),    "mxfp8" (E4M3 + UE8M0),
                         "mxfp4" (packed E2M1       "mxfp4" (packed E2M1
-                        + UE8M0)                   + UE8M0)
+                        + UE8M0),                  + UE8M0)
+                        None
     NVFP4               "nvfp4" (packed E2M1       "nvfp4" (packed E2M1
                         + E4M3 group-16)           + E4M3 group-16)
     full-precision      —                          —
     ==================  =========================  =========================
 
-    (—: tensor-wide's whole-row activation scale can't be formed by a tile-local
-    epilogue; the unfused path quantizes on the host between GEMMs.)"""
+    (—: tensor-wide's whole-row activation scale can't be formed by a tile-local epilogue; the
+    unfused path quantizes on the host between GEMMs. An unquantized activation never
+    requantizes, so it takes no output recipe.)"""
 
-    input_recipe: Literal["fp8", "mxfp8", "mxfp4", "nvfp4"] | None = None
-    output_recipe: Literal["fp8", "mxfp8", "mxfp4", "nvfp4"] | None = None
+    input_recipe: Literal["weights", "fp8", "mxfp8", "mxfp4", "nvfp4"] | None = "weights"
+    output_recipe: Literal["weights", "fp8", "mxfp8", "mxfp4", "nvfp4"] | None = None
 
     def __post_init__(self):
-        # catch typos at construction — the closest point to the user; the ops separately
-        # assert which of these THEIR recipe implements
-        assert self.input_recipe in (None, "fp8", "mxfp8", "mxfp4", "nvfp4"), (
+        # catch typos at construction — the closest point to the user; the ops separately assert
+        # which of these THEIR recipe implements.
+        assert self.input_recipe in ("weights", "fp8", "mxfp8", "mxfp4", "nvfp4", None), (
             f"unknown input_recipe {self.input_recipe!r}; "
-            "expected None, 'fp8', 'mxfp8', 'mxfp4', or 'nvfp4'"
+            "expected 'weights', 'fp8', 'mxfp8', 'mxfp4', 'nvfp4', or None"
         )
-        assert self.output_recipe in (None, "fp8", "mxfp8", "mxfp4", "nvfp4"), (
+        assert self.output_recipe in (None, "weights", "fp8", "mxfp8", "mxfp4", "nvfp4"), (
             f"unknown output_recipe {self.output_recipe!r}; "
-            "expected None, 'fp8', 'mxfp8', 'mxfp4', or 'nvfp4'"
+            "expected None, 'weights', 'fp8', 'mxfp8', 'mxfp4', or 'nvfp4'"
         )
 
     def as_args(self) -> tuple:
-        """Flatten to the fields as-is — ``(input_recipe, output_recipe)``; the registered
-        ops interpret and validate them (each op knows which recipes it implements). The
-        ops' bundles are ordered ``(*Epilogue.as_args(), *Quantization.as_args(),
-        output_dtype)``."""
+        """Flatten to the fields the registered ops take — ``(input_recipe, output_recipe)``; each
+        op interprets and validates them (it knows which recipes it implements). The ops' bundles
+        are ordered ``(*Epilogue.as_args(), *Quantization.as_args(), output_dtype)``."""
         return (self.input_recipe, self.output_recipe)
 
 
+def weight_recipe(B: torch.Tensor, Bs: torch.Tensor) -> str:
+    """The recipe the weights are ALREADY in, read off their dtypes — the one place ``"weights"``
+    is resolved, for both sides of a ``Quantization``. E4M3 scales -> ``"nvfp4"``; else packed
+    E2M1 -> ``"mxfp4"``, MX E4M3 -> ``"mxfp8"``, block/tensor-scaled E4M3 -> ``"fp8"``."""
+    if Bs.dtype == torch.float8_e4m3fn:
+        return "nvfp4"
+    if not is_mx(B, Bs):
+        return "fp8"
+    # packed E2M1 is a WEIGHT dtype fact; is_mxfp4's shape check can't see it through a
+    # pre-swizzled (5D) scale, which would silently downgrade a W4A4 default to W4A8.
+    return "mxfp4" if B.dtype in (torch.int8, torch.uint8) else "mxfp8"
+
 
 def resolve_input_recipe(
-    input_recipe: str | None, output_recipe: str | None, Bs: torch.Tensor
+    input_recipe: str | None, output_recipe: str | None, B: torch.Tensor, Bs: torch.Tensor
 ) -> str:
-    """GEMM-level activation recipe, keyed off the weight scales' dtype: NVFP4 weights
-    (E4M3 scales) pin the whole family to ``"nvfp4"`` (the MMA kind needs matching
-    scale formats on both operands); MX weights take E4M3 activations (``"mxfp8"``,
-    the default) or packed E2M1 (``"mxfp4"``, W4A4). Validates both recipe names
-    against the weight scale family. The MoE-level weight-following default (mxfp4
-    weights -> mxfp4 acts) lives in ``moe._block_recipe``; the GEMM wrappers stay
-    conservative."""
+    """GEMM-level activation recipe. ``"weights"`` resolves to the weight family's own format
+    (``weight_recipe``): NVFP4 weights pin ``"nvfp4"`` (the MMA kind needs matching scale
+    formats on both operands), packed E2M1 -> ``"mxfp4"`` (the all-fp4 W4A4 chain), else
+    ``"mxfp8"``. An explicit name overrides (e.g. ``"mxfp8"`` on MXFP4 weights = the W4A8 chain)
+    and is validated against the family. ``None`` never reaches here — an unquantized activation
+    is routed to its own kernel by the dispatcher."""
     if Bs.dtype == torch.float8_e4m3fn:
-        assert input_recipe in (None, "nvfp4"), (
+        assert input_recipe in ("weights", "nvfp4"), (
             f"NVFP4 activations are packed E2M1 + E4M3 scales, got {input_recipe!r}"
         )
-        assert output_recipe in (None, "nvfp4"), (
+        assert output_recipe in (None, "weights", "nvfp4"), (
             f"NVFP4 requantizes to 'nvfp4' (matching scale families), got {output_recipe!r}"
         )
         return "nvfp4"
-    assert input_recipe in (None, "mxfp8", "mxfp4"), (
-        f"MX activations are E4M3 ('mxfp8', the default) or packed E2M1 ('mxfp4'), "
-        f"got {input_recipe!r}"
+    assert input_recipe in ("weights", "mxfp8", "mxfp4"), (
+        f"MX activations are E4M3 ('mxfp8') or packed E2M1 ('mxfp4'), got {input_recipe!r}"
     )
-    assert output_recipe in (None, "mxfp8", "mxfp4"), (
+    assert output_recipe in (None, "weights", "mxfp8", "mxfp4"), (
         f"MX recipes requantize to 'mxfp8' or packed 'mxfp4', got {output_recipe!r}"
     )
-    return input_recipe or "mxfp8"
+    if input_recipe != "weights":
+        return input_recipe
+    return weight_recipe(B, Bs)
+
+
+def resolve_output_recipe(
+    output_recipe: str | None, B: torch.Tensor, Bs: torch.Tensor
+) -> str | None:
+    """The stored result's format. ``None`` = no requant (a plain high-precision store);
+    ``"weights"`` = the weight family's format, so the output feeds a matching next op directly
+    (the fused MoE gate_up hands the down an intermediate the down can consume as-is). Validated
+    against the family by ``resolve_input_recipe``."""
+    if output_recipe != "weights":
+        return output_recipe
+    return weight_recipe(B, Bs)
 
 
 

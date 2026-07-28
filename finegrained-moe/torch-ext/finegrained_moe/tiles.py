@@ -361,6 +361,8 @@ def _weight_scale_mx(
         b_s = load_swizzled_scale_tile(
             bs_descriptor, bs_ptr, 0, pid_n, k, N, K, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K
         )
+    elif bs_mask is None:  # weight-only 2D: N-clamped in-bounds ptrs, UNMASKED (no other=0.0 constant
+        b_s = tl.load(bs_ptrs)  # -> the K-loop warp-specialization-lowers; tail N masked in epilogue)
     else:
         b_s = tl.load(bs_ptrs, mask=bs_mask[:, None], other=0.0)  # 0.0 casts to fp8/uint8
     return b_s

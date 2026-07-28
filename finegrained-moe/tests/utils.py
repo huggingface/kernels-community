@@ -325,16 +325,18 @@ def _make_mx(weight_dtype, scale_dtype):
     return make
 
 
-_MX_ACT = {None: mxfp8_act_quant, "mxfp8": mxfp8_act_quant, "mxfp4": mxfp4_act_quant}
+# "weights" follows the weight family, so MXFP8 and MXFP4 rows resolve it differently
+_MX8_ACT = {"weights": mxfp8_act_quant, "mxfp8": mxfp8_act_quant, "mxfp4": mxfp4_act_quant}
+_MX4_ACT = {"weights": mxfp4_act_quant, "mxfp8": mxfp8_act_quant, "mxfp4": mxfp4_act_quant}
 
 WEIGHTS = {
     "fp8_128x128": dict(
         make=lambda N, K, E: (*make_weights(N, K, TEST_DEVICE, [128, 128], num_experts=E), None),
         dequant=lambda B, Bs, g=None: dq_block_fp8(B, Bs, 128, 128),
-        input_recipes=(None, "fp8"),
+        input_recipes=("weights", "fp8"),
         output_recipes=(None, "fp8"),
         act_quant={
-            None: lambda A: fp8_act_quant_block_dynamic(A, 128),
+            "weights": lambda A: fp8_act_quant_block_dynamic(A, 128),
             "fp8": lambda A: fp8_act_quant_block_dynamic(A, 128),
         },
         dq_act=lambda q, s: q.float() * torch.repeat_interleave(s.float(), 128, dim=-1),
@@ -346,10 +348,10 @@ WEIGHTS = {
             N, K, TEST_DEVICE, [128, 128], scale_dtype=torch.float8_e8m0fnu, num_experts=E
         ), None),
         dequant=lambda B, Bs, g=None: dq_block_fp8(B, Bs, 128, 128),
-        input_recipes=(None, "fp8"),
+        input_recipes=("weights", "fp8"),
         output_recipes=(None, "fp8"),
         act_quant={
-            None: lambda A: fp8_act_quant_block_dynamic(A, 128, use_ue8m0=True),
+            "weights": lambda A: fp8_act_quant_block_dynamic(A, 128, use_ue8m0=True),
             "fp8": lambda A: fp8_act_quant_block_dynamic(A, 128, use_ue8m0=True),
         },
         dq_act=lambda q, s: q.float() * torch.repeat_interleave(dq_scale(s), 128, dim=-1),
@@ -359,10 +361,10 @@ WEIGHTS = {
             N, K, TEST_DEVICE, None, scale_layout="per_tensor_111", num_experts=E
         ), None),
         dequant=lambda B, Bs, g=None: B.float() * Bs.float().reshape(-1, 1, 1),
-        input_recipes=(None, "fp8"),
+        input_recipes=("weights", "fp8"),
         output_recipes=(None,),
         act_quant={
-            None: lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
+            "weights": lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
             "fp8": lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
         },
         dq_act=lambda q, s: q.float() * s.float().reshape(-1, 1),
@@ -370,9 +372,9 @@ WEIGHTS = {
     "mxfp8": dict(
         make=_make_mx(torch.float8_e4m3fn, torch.float8_e8m0fnu),
         dequant=lambda B, Bs, g=None: dq_grouped(B, Bs, MX_SCALE_GROUP_K),
-        input_recipes=(None, "mxfp8", "mxfp4"),
+        input_recipes=("weights", "mxfp8", "mxfp4"),
         output_recipes=(None, "mxfp8", "mxfp4"),
-        act_quant=_MX_ACT,
+        act_quant=_MX8_ACT,
         dq_act=lambda q, s: dq_grouped(q, s, MX_SCALE_GROUP_K),
     ),
     # UE8M0 scales stored as raw uint8 (e.g. MiniMax-M3-MXFP8 checkpoints) — must still
@@ -380,17 +382,17 @@ WEIGHTS = {
     "mxfp8_u8": dict(
         make=_make_mx(torch.float8_e4m3fn, torch.uint8),
         dequant=lambda B, Bs, g=None: dq_grouped(B, Bs, MX_SCALE_GROUP_K),
-        input_recipes=(None,),
+        input_recipes=("weights",),
         output_recipes=(None, "mxfp8"),
-        act_quant=_MX_ACT,
+        act_quant=_MX8_ACT,
         dq_act=lambda q, s: dq_grouped(q, s, MX_SCALE_GROUP_K),
     ),
     "mxfp4": dict(
         make=_make_mx(torch.int8, torch.float8_e8m0fnu),
         dequant=lambda B, Bs, g=None: dq_grouped(B, Bs, MX_SCALE_GROUP_K),
-        input_recipes=(None, "mxfp8", "mxfp4"),
+        input_recipes=("weights", "mxfp8", "mxfp4"),
         output_recipes=(None, "mxfp8", "mxfp4"),
-        act_quant=_MX_ACT,
+        act_quant=_MX4_ACT,
         dq_act=lambda q, s: dq_grouped(q, s, MX_SCALE_GROUP_K),
     ),
     # NVFP4 is ALWAYS two-level (the canonical recipe): make returns the block scale and the
@@ -399,25 +401,25 @@ WEIGHTS = {
     "nvfp4": dict(
         make=_make_nvfp4,
         dequant=dq_nvfp4_two_level,
-        input_recipes=(None, "nvfp4"),
+        input_recipes=("weights", "nvfp4"),
         output_recipes=(None, "nvfp4"),
-        act_quant={None: nvfp4_act_quant, "nvfp4": nvfp4_act_quant},
+        act_quant={"weights": nvfp4_act_quant, "nvfp4": nvfp4_act_quant},
         dq_act=lambda q, s: dq_grouped(q, s, NVFP4_SCALE_GROUP_K),
     ),
     "bf16": dict(
         make=_make_full(torch.bfloat16),
         dequant=lambda B, Bs, g=None: B.float(),
-        input_recipes=(None,),
+        input_recipes=("weights",),
         output_recipes=(None,),
-        act_quant={None: None},
+        act_quant={"weights": None},
         dq_act=None,
     ),
     "fp16": dict(
         make=_make_full(torch.float16),
         dequant=lambda B, Bs, g=None: B.float(),
-        input_recipes=(None,),
+        input_recipes=("weights",),
         output_recipes=(None,),
-        act_quant={None: None},
+        act_quant={"weights": None},
         dq_act=None,
     ),
 }
