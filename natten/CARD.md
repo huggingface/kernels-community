@@ -11,7 +11,7 @@ tags:
 CUDA kernels for [NATTEN](https://natten.org) (Neighborhood Attention
 Extension, [SHI-Labs/NATTEN](https://github.com/SHI-Labs/NATTEN)), packaged
 for the [kernels](https://github.com/huggingface/kernels) library. Vendored
-from NATTEN v0.21.6 (MIT license).
+from NATTEN v0.21.7 (MIT license).
 
 Neighborhood attention restricts each token's attention to a sliding local
 window over 1-D, 2-D, or 3-D token layouts, with optional stride, dilation,

@@ -239,6 +239,7 @@ struct FusedNeighborhoodAttentionBackwardKernel {
   static constexpr int NADim = NADim_;
   static_assert(NADim >= 1 && NADim < 4, "Only 1D-3D NA are implemented.");
   using Dim = typename GetDim<NADim>::type;
+  using Stride = typename GetStride<NADim>::type;
   using NAMask = NeighborhoodAttentionMask<NADim, CausalMask>;
   static constexpr bool kHasCausalDims = CausalMask::AnyCausalDims;
 
@@ -702,11 +703,11 @@ struct FusedNeighborhoodAttentionBackwardKernel {
     int32_t num_heads = -1;
     int32_t num_batches = -1;
 
-    Dim lse_strideM;
-    Dim q_strideM;
-    Dim k_strideM;
-    Dim v_strideM;
-    Dim o_strideM;
+    Stride lse_strideM;
+    Stride q_strideM;
+    Stride k_strideM;
+    Stride v_strideM;
+    Stride o_strideM;
 
     // int16_t num_splits_key = 1; // We use `gridDim.x` inside kernel
     Dim num_splits_key; // We use `gridDim.x` inside kernel
@@ -1658,9 +1659,7 @@ struct FusedNeighborhoodAttentionBackwardKernel {
               // kernels, I don't know how safe that is, so I'll just keep it
               // for all of them.
               if (accum_m >= num_keys_in_block_int ||
-#if __CUDA_ARCH__ < 800
                   accum_n >= num_queries_in_block_int ||
-#endif
                   !is_coord_within_bounds_nn(col - first_col, query_bound)) {
                 accum[idx] =
                     -cutlass::platform::numeric_limits<accum_t>::infinity();
@@ -1681,15 +1680,10 @@ struct FusedNeighborhoodAttentionBackwardKernel {
                   map_index_to_coord((int32_t)accum_n, num_queries_in_block) +
                   query_start;
 
-#if __CUDA_ARCH__ < 800
               if (accum_m >= num_keys_in_block_int ||
                   accum_n >= num_queries_in_block_int ||
                   !is_coord_less_than_or_equal_to(
                       query_coord, p.num_queries_post_partitioning)) {
-#else
-              if (!is_coord_less_than_or_equal_to(
-                      query_coord, p.num_queries_post_partitioning)) {
-#endif
                 accum[idx] =
                     -cutlass::platform::numeric_limits<accum_t>::infinity();
               } else {
@@ -1704,17 +1698,13 @@ struct FusedNeighborhoodAttentionBackwardKernel {
             lane_offset,
             [&](int accum_m) {},
             [&](int accum_m, int accum_n, int idx) {
-#if __CUDA_ARCH__ < 800
               if (accum_m >= num_keys_in_block_int ||
                   accum_n >= num_queries_in_block_int) {
                 accum[idx] =
                     -cutlass::platform::numeric_limits<accum_t>::infinity();
               } else {
-#endif
                 accum[idx] -= shared_storage.lse_i()[accum_n];
-#if __CUDA_ARCH__ < 800
               }
-#endif
             },
             [&](int accum_m) {});
       }
