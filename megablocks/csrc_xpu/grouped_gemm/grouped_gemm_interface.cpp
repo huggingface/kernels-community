@@ -13,7 +13,8 @@ torch::Tensor cutlass_grouped_gemm_interface(
     int64_t K,
     int64_t num_experts,
     bool is_B_int4,
-    bool is_B_mxfp4) {
+    bool is_B_mxfp4,
+    bool is_B_mxfp8) {
   // Use XE2 cutlass kernel
   return cutlass_grouped_gemm_xe2(
       ptr_A,
@@ -26,5 +27,6 @@ torch::Tensor cutlass_grouped_gemm_interface(
       K,
       num_experts,
       is_B_int4,
-      is_B_mxfp4);
+      is_B_mxfp4,
+      is_B_mxfp8);
 }
