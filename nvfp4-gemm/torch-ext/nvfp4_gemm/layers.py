@@ -216,9 +216,13 @@ def kernel_mapping():
     )
     return {
         "NVFP4GatedAttention": {
-            "cuda": LocalLayerRepository(repo_path=root, layer_name="NVFP4GatedAttention")
+            "cuda": LocalLayerRepository(
+                repo_path=root, layer_name="NVFP4GatedAttention"
+            )
         },
         "NVFP4SwiGLUMLP": {
-            "cuda": LocalLayerRepository(repo_path=root, layer_name="NVFP4FusedSwiGLUMLP")
+            "cuda": LocalLayerRepository(
+                repo_path=root, layer_name="NVFP4FusedSwiGLUMLP"
+            )
         },
     }
