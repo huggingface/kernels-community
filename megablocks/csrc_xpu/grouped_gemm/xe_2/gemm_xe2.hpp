@@ -44,11 +44,13 @@
 #include "cutlass/util/reference/device/gemm_complex.h"
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/reference/host/tensor_fill.h"
+#include "xe2_target_ns.hpp"
 
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 namespace MoE {
+inline namespace MEGABLOCKS_XE_TARGET_NS {
 
 using namespace cute;
 
@@ -422,4 +424,5 @@ CUTE_DEVICE void xe_gemm_4bits(
   copy(copy_c, tCrC_final_sg_tensor, tCgC);
 }
 
+}  // inline namespace MEGABLOCKS_XE_TARGET_NS
 }  // namespace MoE
