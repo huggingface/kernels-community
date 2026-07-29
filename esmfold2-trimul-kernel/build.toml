@@ -1,0 +1,12 @@
+[general]
+name = "esmfold2-trimul-kernel"
+version = 1
+license = "Apache-2.0"
+backends = ["cuda"]
+
+[general.hub]
+repo-id = "kernels-community/esmfold2-trimul-kernel"
+
+[torch-noarch]
+
+[kernel]
