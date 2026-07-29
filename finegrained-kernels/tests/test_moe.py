@@ -33,7 +33,7 @@ from utils import (  # type: ignore
     WEIGHTS,
 )
 
-from finegrained_moe import moe  # type: ignore
+from finegrained_kernels import moe  # type: ignore
 
 
 @dataclass(frozen=True)

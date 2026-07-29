@@ -1,5 +1,5 @@
 [general]
-name = "finegrained-moe"
+name = "finegrained-kernels"
 version = 5
 license = "Apache-2.0"
 backends = [
@@ -9,7 +9,7 @@ backends = [
 ]
 
 [general.hub]
-repo-id = "kernels-community/finegrained-moe"
+repo-id = "kernels-community/finegrained-kernels"
 
 [torch-noarch]
 

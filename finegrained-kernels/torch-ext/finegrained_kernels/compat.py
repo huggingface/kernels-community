@@ -48,7 +48,7 @@ NVFP4_SCALE_GROUP_K = 16
 
 # set ONLY while an opaque op's registered fake impl runs (shape inference); read by
 # compile_time_only_triton_wrap to no-op the kernel launches within
-_SKIP_LAUNCHES = contextvars.ContextVar("finegrained_moe_skip_launches", default=False)
+_SKIP_LAUNCHES = contextvars.ContextVar("finegrained_kernels_skip_launches", default=False)
 
 
 
@@ -412,6 +412,12 @@ def get_accelerator_autotuning_configs(
         ]
 
     if tune_block_m:
+        # BM=256 is OPEN, not disproven (2026-07-29). A plain fp8 GEMM at the dsv4 attn prefill
+        # shape clearly prefers BM=BN=256 (350-367us vs 420-478us at 128, 7 interleaved repeats,
+        # no overlap), so the basin is real for an unscaled loop. Our kernel measured 523us vs
+        # 495us against it — but the run-to-run spread at BM=128 on this box is 13.9%, so a 5.8%
+        # difference decides nothing. Left out because nothing has shown it WINNING here and the
+        # axis widens every tune 25%; re-add only with repeated tunes that clear the noise floor.
         blocks = [{**b, "BLOCK_SIZE_M": bm} for b in blocks for bm in (16, 32, 64, 128)]
 
     if tune_block_n:

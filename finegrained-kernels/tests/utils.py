@@ -1,11 +1,11 @@
 """Shared test helpers: quantized-weight constructors and dequant references.
 
-The ``finegrained_moe`` package is on ``sys.path`` via ``conftest.py`` (pytest
+The ``finegrained_kernels`` package is on ``sys.path`` via ``conftest.py`` (pytest
 auto-loads it before any test module)."""
 
 import torch
 
-from finegrained_moe.compat import MX_SCALE_GROUP_K  # type: ignore
+from finegrained_kernels.compat import MX_SCALE_GROUP_K  # type: ignore
 
 
 def unswizzle_mx_scales(swizzled: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
@@ -239,8 +239,8 @@ def quant_dequant_a(
 # (E, N, K); act_quant[recipe] -> the host quant fn the ops themselves call (None = the
 # family default applied to a raw A); dq_act dequantizes its output for the torch oracle.
 
-from finegrained_moe.compat import NVFP4_SCALE_GROUP_K  # type: ignore  # noqa: E402
-from finegrained_moe.quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant, nvfp4_quantize_two_level  # type: ignore  # noqa: E402
+from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore  # noqa: E402
+from finegrained_kernels.quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant, nvfp4_quantize_two_level  # type: ignore  # noqa: E402
 
 _E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 _E2M1_LUT = _E2M1_LUT + [-v for v in _E2M1_LUT]

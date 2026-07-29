@@ -8,7 +8,7 @@ from utils import TEST_DEVICE  # type: ignore
 import triton
 import triton.language as tl
 
-from finegrained_moe.quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_inline, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant  # type: ignore
+from finegrained_kernels.quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_inline, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant  # type: ignore
 
 
 _FP8_DTYPE = torch.float8_e4m3fn

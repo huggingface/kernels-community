@@ -1,6 +1,6 @@
-# finegrained-moe bench
+# finegrained-kernels bench
 
-`bench_moe.py` benchmarks the local **finegrained-moe** kernel against the upstream
+`bench_moe.py` benchmarks the local **finegrained-kernels** kernel against the upstream
 **finegrained-fp8** kernel (`kernels-community/finegrained-fp8` @ `v4`) and external
 reference implementations, on real model shapes.
 
@@ -25,12 +25,12 @@ the others still run.
 
 ## The pre-swizzled fast path
 
-By default the finegrained-moe arm feeds **pre-swizzled** (`SWIZZLE_32_4_4`) MX weight scales,
+By default the finegrained-kernels arm feeds **pre-swizzled** (`SWIZZLE_32_4_4`) MX weight scales,
 so its numbers reflect the tcgen05 fast path. Only MX weights on 128-aligned dims are swizzled
 (the routed guard rejects non-128 gate/N); block-fp8 and BF16 stay affine. Set `PRESWIZZLE=0`
 to measure the affine path instead.
 
-Correctness is cross-checked in-run: each baseline's output is compared to the finegrained-moe
+Correctness is cross-checked in-run: each baseline's output is compared to the finegrained-kernels
 anchor (`parity-vs-v5` in the log), so a wrong scale layout shows up as a large parity diff.
 
 ## Running

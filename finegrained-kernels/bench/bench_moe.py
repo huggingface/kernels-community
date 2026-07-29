@@ -1,28 +1,28 @@
-"""finegrained-moe bench — local build vs upstream finegrained-fp8 (rev v4) + reference impls.
+"""finegrained-kernels bench — local build vs upstream finegrained-fp8 (rev v4) + reference impls.
 
-The **finegrained-moe** arm is the local kernel; **finegrained-fp8** is the upstream hub
+The **finegrained-kernels** arm is the local kernel; **finegrained-fp8** is the upstream hub
 build (``kernels-community/finegrained-fp8`` @ ``v4``, which has the fused MoE + MX paths).
-By default the finegrained-moe arm feeds PRE-SWIZZLED (SWIZZLE_32_4_4) MX weight scales, so
+By default the finegrained-kernels arm feeds PRE-SWIZZLED (SWIZZLE_32_4_4) MX weight scales, so
 its numbers reflect the tcgen05 fast path (set ``PRESWIZZLE=0`` for the affine path). Writes
 ``bench/bench_moe.csv`` (all 3 modes) + ``bench/bench_moe.png`` beside this file.
 
 Rows (each row = decode | prefill subplot pair in the figure):
-  quantized           moe_fused_*    finegrained-moe vs finegrained-fp8 vs transformers@main vs DeepGEMM
+  quantized           moe_fused_*    finegrained-kernels vs finegrained-fp8 vs transformers@main vs DeepGEMM
                                      — every impl at its best: fused where it has one, and
                                      transformers@main contributes its two-GEMM experts dispatch
-  unquantized (BF16)  finegrained-moe fused vs transformers grouped_mm/batched_mm vs SonicMoE
+  unquantized (BF16)  finegrained-kernels fused vs transformers grouped_mm/batched_mm vs SonicMoE
                       vs DeepGEMM grouped BF16
   attn quantized      matmul_2d, one qkv-proj-shaped linear (N=3H, K=H) per model in
-                      its deployment format — FP8 128x128 (finegrained-moe/finegrained-fp8/DeepGEMM), MXFP4
-                      W4A4 (finegrained-moe W4A4, finegrained-fp8 W4A8, DeepGEMM FP4), NVFP4 (finegrained-moe only),
-                      MXFP8 (finegrained-moe/finegrained-fp8)
+                      its deployment format — FP8 128x128 (finegrained-kernels/finegrained-fp8/DeepGEMM), MXFP4
+                      W4A4 (finegrained-kernels W4A4, finegrained-fp8 W4A8, DeepGEMM FP4), NVFP4 (finegrained-kernels only),
+                      MXFP8 (finegrained-kernels/finegrained-fp8)
 
 MoE problems (real model shapes; one base model per format, same roster BF16'd for
 the unquantized row; baselines per problem):
   deepseek-ai/DeepSeek-V4  MXFP4 W4A8         finegrained-fp8, DeepGEMM FP4
   openai/GPT-OSS-120B      full MXFP4 (W4A4)  none — finegrained-fp8 lacks W4A4 AND its kernels
                                               can't run K=2880 (no BK-divides-K guard)
-  nvidia/GLM-5.2-NVFP4     NVFP4 (W4A4)       finegrained-moe only — no baseline supports it
+  nvidia/GLM-5.2-NVFP4     NVFP4 (W4A4)       finegrained-kernels only — no baseline supports it
   deepseek-ai/DeepSeek-V3  FP8 W8A8 (128x128) finegrained-fp8, DeepGEMM FP8 — UE8M0 block scales (the
                                               B200 deployment format; DeepGEMM SM100
                                               rejects fp32 scales by design)
@@ -80,8 +80,8 @@ _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "torch-ext"))
 sys.path.insert(0, os.path.join(_ROOT, "tests"))
 import triton  # noqa: E402
-import finegrained_moe as fgm  # noqa: E402  local branch
-from finegrained_moe.recipes import ue8m0_as_uint8  # noqa: E402  scale -> uint8 view for swizzle
+import finegrained_kernels as fgm  # noqa: E402  local branch
+from finegrained_kernels.recipes import ue8m0_as_uint8  # noqa: E402  scale -> uint8 view for swizzle
 from kernels import get_kernel  # noqa: E402
 
 # All baselines here are kernels-community repos we already trust; the publisher-trust check
@@ -93,7 +93,7 @@ import kernels.utils as _kernels_utils  # noqa: E402
 _kernels_utils._check_trust_remote_code = lambda *a, **k: None
 
 # PRESWIZZLE=0 to bench the affine (row-major) MX scale path instead of the pre-swizzled
-# SWIZZLE_32_4_4 tcgen05 fast path. Default on: the finegrained-moe arm feeds pre-swizzled
+# SWIZZLE_32_4_4 tcgen05 fast path. Default on: the finegrained-kernels arm feeds pre-swizzled
 # weight scales so the numbers reflect the max-perf path (the guard rejects non-128 gate/N,
 # so we only swizzle MX weights on 128-aligned dims; everything else stays affine).
 PRESWIZZLE = os.environ.get("PRESWIZZLE", "1") == "1"
@@ -174,7 +174,7 @@ PREFILL_TOKENS = 256 if SMOKE else 8192
 
 # fixed left-to-right model order for every figure row (matched by base-model prefix,
 # so GLM-5.2-NVFP4 and GLM-5.2 both land in the GLM-5.2 slot). Roughly most-baseline-
-# support first, finegrained-moe-only (GPT-OSS, GLM-NVFP4) last.
+# support first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last.
 CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2"]
 
 MOE_PROBLEMS = {
@@ -278,7 +278,7 @@ ATTN_PROBLEMS = {
 MODES = ["eager", "cudagraph", "compile"]
 
 IMPL_COLORS = {
-    "finegrained-moe": "#1f77b4",
+    "finegrained-kernels": "#1f77b4",
     "finegrained-fp8": "#bbbbbb",
     "deepgemm": "#2ca02c",
     "deepgemm_bf16": "#2ca02c",
@@ -294,7 +294,7 @@ def _impl_label(impl, regime):
     """Legend name. The reference forwards ARE plain torch ops — name them by the op:
     transformers batched_mm -> torch.bmm (decode) / grouped_mm -> torch._grouped_mm (bf16);
     ``torch`` -> torch.scaled_grouped_mm (the quantized cuBLAS path). Every other impl
-    (finegrained-moe, finegrained-fp8, deepgemm, ...) is its own label."""
+    (finegrained-kernels, finegrained-fp8, deepgemm, ...) is its own label."""
     if impl == "transformers":
         return "torch.bmm" if regime == "decode" else "torch._grouped_mm"
     if impl == "torch":
@@ -315,7 +315,7 @@ def _mark_static(*tensors):
 
 def build(cfg):
     """Quantized weights for one MoE problem, shared by every impl and row. The GLM-FP8
-    problem uses UE8M0 block scales (finegrained-fp8/finegrained-moe decode them natively; DeepGEMM SM100
+    problem uses UE8M0 block scales (finegrained-fp8/finegrained-kernels decode them natively; DeepGEMM SM100
     requires them)."""
     E, H, inter = cfg["E"], cfg["H"], cfg["I"]
     if cfg["weights"] == "fp8_128x128_ue8m0":
@@ -578,8 +578,8 @@ def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_
 
 
 ARMS = {
-    "finegrained-moe": moe_fused_arm,
-    "finegrained-moe_unfused": moe_unfused_arm,
+    "finegrained-kernels": moe_fused_arm,
+    "finegrained-kernels_unfused": moe_unfused_arm,
     "finegrained-fp8": fp8_fused_arm,
     "finegrained-fp8_unfused": fp8_unfused_arm,
     "transformers": transformers_arm,
@@ -615,8 +615,20 @@ def bench_modes(run, tag):
         res["cudagraph"] = None
     try:
         crun = torch.compile(run, mode="max-autotune", fullgraph=True)
-        crun()
+        cout = crun()
         torch.cuda.synchronize()
+        # Self-check the compiled graph against THIS arm's own eager output before timing it.
+        # The cross-impl parity below is computed from eager only, so without this a compiled
+        # graph that drops work (e.g. an out-param matmul DCE'd because its mutation isn't
+        # declared) posts a fast time and a clean parity. The bound catches SKIPPED WORK (zeros
+        # or garbage, ~1.0 relative) and nothing tighter: recompiling legitimately re-rounds a
+        # quantized path, and W4A8 spreads further than the cross-impl parity we already accept
+        # on it (deepgemm-vs-ours 2.3e-2, its own compile-vs-eager 2.1e-2 — a 1e-2 bound flagged
+        # the latter as a crash and put a false red X on the figure).
+        if isinstance(cout, torch.Tensor) and isinstance(out, torch.Tensor):
+            drift = rel_diff(cout, out)
+            if drift > 0.25:
+                raise RuntimeError(f"compiled output diverges from eager (rel {drift:.2e})")
         res["compile"] = do_bench(crun, return_mode="min") * 1e3
         print(f"      {tag:14s} compile    {res['compile']:9.1f}us", flush=True)
     except Exception as e:
@@ -647,7 +659,7 @@ def _mock_rows(row, pname, arms, rows_out):
 
 
 def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
-    """One (row, problem): both regimes, finegrained-moe-first (parity anchor), streaming prints."""
+    """One (row, problem): both regimes, finegrained-kernels-first (parity anchor), streaming prints."""
     print(f"== [{row}] {pname}")
     if MOCK:
         _mock_rows(row, pname, arms, rows_out)
@@ -680,8 +692,8 @@ def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
                 parity = rel_diff(anchor_out, out)
                 sp = {m: f"{res[m] / anchor_res[m]:.2f}x" for m in MODES
                       if res.get(m) and anchor_res.get(m)}
-                print(f"      {name:14s} parity-vs-finegrained-moe {parity:.1e}"
-                      f"  finegrained-moe-speedup {sp}", flush=True)
+                print(f"      {name:14s} parity-vs-finegrained-kernels {parity:.1e}"
+                      f"  finegrained-kernels-speedup {sp}", flush=True)
             rows_out.append((row, pname, regime, _impl(name), res, parity))
     print()
 
@@ -693,10 +705,10 @@ def _impl(arm_name):
 
 def bench_attn_row(row, pname, cfg, rows_out):
     """One attn linear per model, in its deployment format (same weights across
-    impls; the finegrained-moe arm's ``input_recipe`` follows the model — GPT-OSS runs W4A4)."""
+    impls; the finegrained-kernels arm's ``input_recipe`` follows the model — GPT-OSS runs W4A4)."""
     print(f"== [{row}] {pname}")
     if MOCK:
-        _mock_rows(row, pname, ("finegrained-moe",) + cfg["baselines"], rows_out)
+        _mock_rows(row, pname, ("finegrained-kernels",) + cfg["baselines"], rows_out)
         return
     torch._dynamo.reset()
     N, K, block = cfg["N"], cfg["K"], cfg["block"]
@@ -740,7 +752,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
         # Quantization (input_recipe = the activation precision); None follows the weight recipe.
         _q = fgm.Quantization(input_recipe=_recipe(cfg)) if _recipe(cfg) else None
         attn_arms = {
-            "finegrained-moe": lambda: fgm.matmul_2d(
+            "finegrained-kernels": lambda: fgm.matmul_2d(
                 x, W, None, Ws, quantization=_q, output_dtype=torch.bfloat16, b_global_scale=W_g),
         }
         if "finegrained-fp8" in cfg["baselines"]:
@@ -762,8 +774,8 @@ def bench_attn_row(row, pname, cfg, rows_out):
                 parity = rel_diff(anchor_out, out)
                 sp = {m: f"{res[m] / anchor_res[m]:.2f}x" for m in MODES
                       if res.get(m) and anchor_res.get(m)}
-                print(f"      {name:14s} parity-vs-finegrained-moe {parity:.1e}"
-                      f"  finegrained-moe-speedup {sp}", flush=True)
+                print(f"      {name:14s} parity-vs-finegrained-kernels {parity:.1e}"
+                      f"  finegrained-kernels-speedup {sp}", flush=True)
             rows_out.append((row, pname, regime, name, res, parity))
     print()
 
@@ -771,7 +783,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
 device_name = "MOCK (random values)" if MOCK else torch.cuda.get_device_name(0)
 print(f"device: {device_name}  torch {torch.__version__}"
       f"{'  [SMOKE]' if SMOKE else ''}")
-print("finegrained-moe = local build; baselines: finegrained-fp8 (upstream), DeepGEMM, "
+print("finegrained-kernels = local build; baselines: finegrained-fp8 (upstream), DeepGEMM, "
       "transformers grouped_mm/batched_mm, SonicMoE, torch.scaled_grouped_mm"
       f"{f'  |  {GPUS} GPUs' if GPUS > 1 else ''}\n")
 
@@ -786,7 +798,7 @@ def wanted(*names):
 # owning one device via CUDA_VISIBLE_DEVICES). The coordinator spawns GPUS workers, each
 # writes a shard CSV, then the coordinator merges + plots. A single GPU (GPUS=1) runs inline. ──
 _CSV = os.path.join(_HERE, "bench_moe.csv")
-_CSV_HEADER = "category,problem,regime,impl,mode,latency_us,parity_vs_finegrained_moe\n"
+_CSV_HEADER = "category,problem,regime,impl,mode,latency_us,parity_vs_finegrained_kernels\n"
 
 
 def _write_rows_csv(path, rows_out):
@@ -807,7 +819,7 @@ def _load_rows_csv(path):
     import csv
 
     def _allowed(cfg):
-        return {"finegrained-moe"} | {_impl(b) for b in cfg["baselines"]}
+        return {"finegrained-kernels"} | {_impl(b) for b in cfg["baselines"]}
 
     allowed = {}
     for pn, c in MOE_PROBLEMS.items():
@@ -820,13 +832,13 @@ def _load_rows_csv(path):
         allowed["attn quantized", pn] = _allowed(c)
     acc = {}  # (cat, problem, regime, impl) -> (res dict, parity)
     for r in csv.DictReader(open(path)):
-        if r["impl"] not in allowed.get((r["category"], r["problem"]), {"finegrained-moe"}):
+        if r["impl"] not in allowed.get((r["category"], r["problem"]), {"finegrained-kernels"}):
             continue
         key = (r["category"], r["problem"], r["regime"], r["impl"])
         res, par = acc.setdefault(key, ({}, None))
         res[r["mode"]] = float(r["latency_us"]) if r["latency_us"] else None
-        if r["parity_vs_finegrained_moe"]:
-            acc[key] = (res, float(r["parity_vs_finegrained_moe"]))
+        if r["parity_vs_finegrained_kernels"]:
+            acc[key] = (res, float(r["parity_vs_finegrained_kernels"]))
     return [(cat, p, reg, impl, res, par)
             for (cat, p, reg, impl), (res, par) in acc.items()]
 
@@ -859,12 +871,12 @@ def _run_task(kind, pname, cfg, rows_out):
         # activations (W4A16) — it always quantizes — and feeding it those faults the CUDA context.
         tfm_arm_t = (("transformers@main",)
                      if "finegrained-fp8" in cfg["baselines"] and _recipe(cfg) is not None else ())
-        quant_arms = (("finegrained-moe",) + cfg["baselines"] + cfg.get("fused_extra", ())
+        quant_arms = (("finegrained-kernels",) + cfg["baselines"] + cfg.get("fused_extra", ())
                       + tfm_arm_t + torch_arm_t)
         if wanted("quantized", pname):
             bench_problem_row("quantized", pname, cfg, quant_arms, weights, rows_out)
     elif kind == "bf16":
-        bench_problem_row("unquantized", pname, cfg, ("finegrained-moe",) + cfg["baselines"],
+        bench_problem_row("unquantized", pname, cfg, ("finegrained-kernels",) + cfg["baselines"],
                           weights, rows_out)
     else:  # attn
         bench_attn_row("attn quantized", pname, cfg, rows_out)
@@ -947,11 +959,12 @@ if not REPLOT and _SHARD is None and not _via_coordinator:
     _write_rows_csv(os.path.join(_HERE, f"bench_moe{suffix}.csv"), rows)
 
 # ONE figure, 8 panels: rows = the 4 categories, cols = (decode | prefill). Each
-# bar is colored by impl (finegrained-moe leftmost, fixed slots). DECODE superposes its two
+# bar is colored by impl (finegrained-kernels leftmost, fixed slots). DECODE superposes its two
 # graph-captured modes — cudagraph as the solid fill, compile as a black hatched
 # outline over the same slot — so the gap between them is visible per impl. PREFILL
-# is eager only (single solid). Red X = crashed (no latency). This chart is latency
-# only; parity vs finegrained-moe lives in the bench log + the CSV beside this png.
+# is eager only (single solid) — prefill is not compiled in deployment, so a compile
+# bar there would show a mode nobody ships. Red X = crashed (no latency). This chart is latency
+# only; parity vs finegrained-kernels lives in the bench log + the CSV beside this png.
 import matplotlib.patches as mpatches  # noqa: E402
 
 # (solid_mode, overlay_mode) per regime
@@ -968,7 +981,7 @@ for ri, row in enumerate(present_rows):
         problems = list(dict.fromkeys(p for p, *_ in cells))
         # ONE fixed model order across every row (was per-panel support-sort, which
         # reordered models between rows and read as confusing). Roughly most-supported
-        # first, finegrained-moe-only (GPT-OSS, GLM-NVFP4) last; keyed on the base model so the
+        # first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last; keyed on the base model so the
         # quantized/attn (GLM-5.2-NVFP4) and unquantized (GLM-5.2) rows line up.
         def _model_rank(p):
             name = p.split(" ")[0].split("/")[-1]
@@ -978,7 +991,7 @@ for ri, row in enumerate(present_rows):
             return len(CANONICAL_MODEL_ORDER)
         problems.sort(key=_model_rank)
         # FIXED impl slots: every impl keeps the same offset under every tick
-        # (finegrained-moe leftmost); unsupported impls leave their slot empty
+        # (finegrained-kernels leftmost); unsupported impls leave their slot empty
         row_impls = list(dict.fromkeys(i for _, i, *_ in cells))
         labeled = set()
         overlay_drawn = False  # any compile-beats-cudagraph overlay in this panel?
@@ -1040,7 +1053,7 @@ for ri, row in enumerate(present_rows):
             handles.append(mpatches.Patch(facecolor="none", edgecolor="black",
                                           hatch="////", label="compile (faster)"))
         ax.legend(handles=handles, loc="upper left", fontsize=8)
-fig.suptitle(f"MoE bench — finegrained-moe vs finegrained-fp8 + references  "
+fig.suptitle(f"MoE bench — finegrained-kernels vs finegrained-fp8 + references  "
              f"({device_name}, real model shapes; decode=cudagraph+compile, "
              f"prefill=eager)", y=0.9995)
 fig.tight_layout(rect=(0, 0, 1, 0.99))

@@ -4,11 +4,21 @@ tags:
   - kernels
 ---
 
-# finegrained-moe
+# finegrained-kernels
 
 Triton kernels for fine-grained block-wise FP8 quantization and expert dispatch, developed as part of the HuggingFace Transformers FP8 + MoE optimization effort.
 
 All kernels target Hopper (SM90) FP8 WGMMA instructions and are also compatible with Blackwell (SM100), ROCm, and XPU backends via Triton.
+
+## Benchmarks
+
+![MoE bench: finegrained-kernels vs references on B200](bench/bench_moe.png)
+
+Real model shapes on an NVIDIA B200, against upstream `finegrained-fp8`, DeepGEMM, transformers
+`grouped_mm`/`batched_mm`, SonicMoE, OpenAI `triton_kernels`, and `torch.scaled_grouped_mm`.
+Decode is cudagraph-captured, prefill eager; a red ✕ marks a configuration that raised. Every
+baseline's output is parity-checked against the finegrained-kernels anchor in the same run. See
+[`bench/README.md`](bench/README.md) to reproduce.
 
 ## Kernels
 
