@@ -50,6 +50,8 @@ from .utils import (
     mxfp_act_quant_inline,
     mx_compute,
     smem_config_pruner,
+    grf_config_pruner,
+    chain_config_pruners,
     glu,
     e2m1_as_uint8,
     ue8m0_as_uint8,
@@ -105,7 +107,9 @@ def _resolve_tile_inline(
     offs = tl.arange(0, BLOCK_SIZE_M)
     row_mask = offs < freq - within * BLOCK_SIZE_M
     sorted_indices = tl.max_contiguous(m_start + offs, BLOCK_SIZE_M)
-    return expert_id, sorted_indices, row_mask
+    # Cast to int64 so expert_id * stride_gu_e/stride_down_e don't overflow for
+    # large num_experts (matches grouped.py/batched.py; e.g. E=256 x 2*I*H strides).
+    return expert_id.to(tl.int64), sorted_indices, row_mask
 
 
 @triton.jit
@@ -220,7 +224,14 @@ _MX_MEMORY_MODES = ("descriptor", "pointer")
     n_trials=60,
     # bf16 activation tile + fused gate|up weight tiles
     prune_configs_by={
-        "early_config_prune": smem_config_pruner(act_bytes=2, n_weight_tiles=2)
+        "early_config_prune": chain_config_pruners(
+            smem_config_pruner(act_bytes=2, n_weight_tiles=2),
+            # gate_up holds 2 fp32 accumulators + 2 weight tiles; skip configs that spill
+            # past the XPU large-GRF recompile (XPU-only, no-op elsewhere).
+            grf_config_pruner(
+                n_accumulators=2, n_weight_tiles=2, weight_reg_factor=1.65
+            ),
+        )
     },
 )
 @triton.jit
@@ -346,7 +357,14 @@ def w8a8_block_dynamic_fp8_moe_grouped_gate_up_kernel(
     n_trials=60,
     # fp8 intermediate activation tile + single down weight tile
     prune_configs_by={
-        "early_config_prune": smem_config_pruner(act_bytes=1, n_weight_tiles=1)
+        "early_config_prune": chain_config_pruners(
+            smem_config_pruner(act_bytes=1, n_weight_tiles=1),
+            # single accumulator + single weight tile; skip configs that spill past the
+            # XPU large-GRF recompile (XPU-only, no-op elsewhere).
+            grf_config_pruner(
+                n_accumulators=1, n_weight_tiles=1, output_reg_factor=2.6
+            ),
+        )
     },
 )
 @triton.jit
@@ -603,8 +621,13 @@ def _set_gate_up_descriptor(nargs):
     n_trials=60,
     # bf16 activation tile + fused gate|up weight tiles
     prune_configs_by={
-        "early_config_prune": smem_config_pruner(
-            act_bytes=2, n_weight_tiles=2, reduction_dim="HIDDEN_DIM"
+        "early_config_prune": chain_config_pruners(
+            smem_config_pruner(
+                act_bytes=2, n_weight_tiles=2, reduction_dim="HIDDEN_DIM"
+            ),
+            # gate_up holds 2 fp32 accumulators + 2 weight tiles → ~2x the register footprint
+            # of down; the XPU large-GRF recompile can't absorb the heaviest tiles (see logs).
+            grf_config_pruner(n_accumulators=2, n_weight_tiles=2),
         )
     },
 )
@@ -802,8 +825,13 @@ def _set_down_descriptor(nargs):
     n_trials=60,
     # fp8 intermediate activation tile + single down weight tile
     prune_configs_by={
-        "early_config_prune": smem_config_pruner(
-            act_bytes=1, n_weight_tiles=1, reduction_dim="INTERMEDIATE_DIM"
+        "early_config_prune": chain_config_pruners(
+            smem_config_pruner(
+                act_bytes=1, n_weight_tiles=1, reduction_dim="INTERMEDIATE_DIM"
+            ),
+            # down holds 1 fp32 accumulator + 1 weight tile; large-BM / large-BN / low-warp
+            # dot_scaled tiles still spill after the large-GRF recompile (see logs).
+            grf_config_pruner(n_accumulators=1, n_weight_tiles=1),
         )
     },
 )

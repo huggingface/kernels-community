@@ -8,6 +8,8 @@ from .utils import calculate_settings
 from .utils import compare_version
 from .utils import ensure_contiguous
 from .utils import is_npu_available
+from .utils import device_context
+
 
 if compare_version("triton", operator.ge, "3.0.0") and not is_npu_available():
     try:
@@ -94,15 +96,16 @@ def geglu_forward(a, b):
 
     BLOCK_SIZE, num_warps = calculate_settings(n_cols)
 
-    _geglu_tanh_forward_kernel[(n_rows,)](
-        a,
-        b,
-        c,
-        c.stride(-2),
-        n_cols=n_cols,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-    )
+    with device_context(a.device):
+        _geglu_tanh_forward_kernel[(n_rows,)](
+            a,
+            b,
+            c,
+            c.stride(-2),
+            n_cols=n_cols,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
     return a, b, c.view(*ori_shape)
 
 
@@ -114,15 +117,16 @@ def geglu_backward(a, b, dc):
 
     BLOCK_SIZE, num_warps = calculate_settings(n_cols)
 
-    _geglu_tanh_backward_kernel[(n_rows,)](
-        dc,
-        a,
-        b,
-        dc.stride(-2),
-        n_cols=n_cols,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-    )
+    with device_context(a.device):
+        _geglu_tanh_backward_kernel[(n_rows,)](
+            dc,
+            a,
+            b,
+            dc.stride(-2),
+            n_cols=n_cols,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
 
     return a.view(*ori_shape), b.view(*ori_shape)
 

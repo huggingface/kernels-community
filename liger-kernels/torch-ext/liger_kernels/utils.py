@@ -21,6 +21,7 @@ import triton
 import triton.language as tl
 
 from packaging.version import Version
+from contextlib import contextmanager
 
 
 def is_npu_available() -> bool:
@@ -174,3 +175,13 @@ def set_large_grf_mode(kernel_args: dict):
     else:
         # API was changed in https://github.com/intel/intel-xpu-backend-for-triton/pull/5430
         kernel_args["grf_mode"] = "large"
+
+@contextmanager
+def device_context(device: torch.device):
+    """Context manager that sets the active device for any backend (cuda, xpu, etc.)."""
+    backend = getattr(torch, device.type, None)
+    if backend is not None and hasattr(backend, "device"):
+        with backend.device(device):
+            yield
+    else:
+        yield
