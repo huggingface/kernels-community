@@ -107,6 +107,33 @@ def test_gemv_matches_dequant(n, k, m):
     assert rel < 1e-2, f"GEMV deviates from dequant reference: {rel:.4e}"
 
 
+@requires_blackwell
+@pytest.mark.parametrize("m", [1, 2])
+def test_gemv_swiglu_matches_dequant(m):
+    """Cover the row-concatenated SwiGLU launch geometry used by Onyx."""
+    from nvfp4_gemm import global_scale_for
+    from nvfp4_gemm._ops import ops
+
+    torch.manual_seed(0)
+    n, k = 19968, 6656
+    gate = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 0.02
+    up = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 0.02
+    weight = torch.cat([gate, up], dim=0)
+    gs = global_scale_for(weight)
+    qweight, sf = ops.scaled_fp4_quant(weight, gs, False)
+    dequant = _dequant_reference(qweight, sf, gs, 2 * n, k)
+
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    alpha = (1.0 / gs).to(torch.float32).reshape(1)
+    y = ops.nvfp4_gemv_swiglu(x, qweight, sf, alpha).float()
+    gate_ref, up_ref = (x.float() @ dequant.T).chunk(2, dim=-1)
+    ref = torch.nn.functional.silu(gate_ref) * up_ref
+
+    assert y.shape == (m, n)
+    rel = ((y - ref).norm() / ref.norm().clamp(min=1e-6)).item()
+    assert rel < 1e-2, f"SwiGLU GEMV deviates from dequant reference: {rel:.4e}"
+
+
 def test_hub_layer_is_pure():
     # Contract: no constructor, no extra methods on the hub layer.
     cls = inspect.getsource(nvfp4_gemm.layers.NVFP4Linear)

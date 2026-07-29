@@ -221,8 +221,15 @@ torch::Tensor gemv_run(torch::Tensor const& A, torch::Tensor const* G,
     cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          smem);
   }
-  dim3 grid((unsigned)((n_out + vllm::nvfp4_gemv::ROWS_PER_CTA - 1) /
-                       vllm::nvfp4_gemv::ROWS_PER_CTA),
+  // SwiGLU pairs two physical weight rows into one logical output row, so
+  // each warp produces one output instead of the two produced by the plain
+  // and gated modes. Size the grid by the number of rows each CTA actually
+  // writes; using ROWS_PER_CTA here leaves half of the SwiGLU output
+  // uninitialized.
+  constexpr int rows_per_cta =
+      MODE == Mode::kSwiGLUOut ? vllm::nvfp4_gemv::WARPS_PER_CTA
+                               : vllm::nvfp4_gemv::ROWS_PER_CTA;
+  dim3 grid((unsigned)((n_out + rows_per_cta - 1) / rows_per_cta),
             (unsigned)M);
   kfn<<<grid, vllm::nvfp4_gemv::THREADS, smem, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
