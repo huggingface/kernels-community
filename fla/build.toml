@@ -1,6 +1,6 @@
 [general]
 name = "fla"
-version = 2
+version = 1
 license = "MIT"
 backends = [
   "cuda",
