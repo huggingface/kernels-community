@@ -120,6 +120,10 @@ mha_fwd(
     at::Tensor out_padded;
     if (out_.has_value()) {
         auto out_val = out_.value();
+        // The kernel writes out_dtype elements; a mismatched buffer would be
+        // overrun (MXFP writes float32 into what may be a half-width tensor).
+        TORCH_CHECK(out_val.scalar_type() == out_dtype,
+                    "out must have dtype ", out_dtype, ", got ", out_val.scalar_type());
         if (needs_padding) {
             const int pad_size = head_size_padded - head_size_actual;
             out_padded = torch::nn::functional::pad(out_val, torch::nn::functional::PadFuncOptions({0, pad_size}));
@@ -496,6 +500,10 @@ mha_varlen_fwd(
     auto out_dtype = is_mxfp ? torch::kFloat32 : c10::typeMetaToScalarType(q_dtype);
     at::Tensor out_padded;
     if (out_.has_value()) {
+        // The kernel writes out_dtype elements; a mismatched buffer would be
+        // overrun (MXFP writes float32 into what may be a half-width tensor).
+        TORCH_CHECK(out_.value().scalar_type() == out_dtype,
+                    "out must have dtype ", out_dtype, ", got ", out_.value().scalar_type());
         out_padded = maybe_pad(out_.value());
     } else if (is_mxfp) {
         out_padded = torch::zeros({total_q, num_heads, head_size_padded},
@@ -506,6 +514,11 @@ mha_varlen_fwd(
 
     const bool is_local = (window_size_left != -1) || (window_size_right != -1);
     const bool is_paged = block_table_.has_value() && block_table_->defined();
+    // policy_dispatch() only routes MXFP on the non-paged / non-rotary paths; any
+    // other combination silently falls through to the bf16 dispatcher and would
+    // reinterpret the fp8/fp4 bytes as bf16. Reject it here instead.
+    TORCH_CHECK(!(is_mxfp && is_paged),
+                "MXFP (fp8/fp4) forward does not support paged KV (block_table).");
 
     q_padded = ensure_contiguous(q_padded);
     k_padded = ensure_contiguous(k_padded);
