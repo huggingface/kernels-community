@@ -29,6 +29,7 @@ KERNEL_SOURCE_MAPPING = {
     "megablocks": "https://github.com/databricks/megablocks",
     "mra": "",
     "msa": "https://github.com/MiniMax-AI/MSA",
+    "natten": "https://github.com/SHI-Labs/NATTEN",
     "paged-attention": "",
     "punica-sgmv": "https://github.com/predibase/lorax",
     "quantization-bitsandbytes": "https://github.com/bitsandbytes-foundation/bitsandbytes",
