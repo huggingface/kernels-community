@@ -107,6 +107,7 @@ class selective_state_update(nn.Module):
         D: torch.Tensor | None = None,
         dt_bias: torch.Tensor | None = None,
         dt_softplus: bool = False,
+        z: torch.Tensor | None = None,
         **kwargs,
     ):
         return cuda_selective_state_update(
@@ -117,7 +118,7 @@ class selective_state_update(nn.Module):
             B,
             C,
             D,
-            z=None,
+            z=z,
             dt_bias=dt_bias,
             dt_softplus=dt_softplus,
         )
