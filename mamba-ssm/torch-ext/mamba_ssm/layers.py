@@ -6,6 +6,43 @@ from ._causal_conv1d import causal_conv1d_update as cuda_causal_conv1d_update
 from .ops import mamba_chunk_scan_combined as cuda_mamba_chunk_scan_combined
 from .ops import mamba_split_conv1d_scan_combined as cuda_mamba_split_conv1d_scan_combined
 from .ops import selective_state_update as cuda_selective_state_update
+from .ops.selective_scan_interface import mamba_inner_fn as cuda_mamba_inner_fn
+from .ops.selective_scan_interface import selective_scan_fn as cuda_selective_scan_fn
+
+
+class mamba_inner_fn(nn.Module):
+    def forward(
+        self,
+        xz: torch.Tensor,
+        conv1d_weight: torch.Tensor,
+        conv1d_bias: torch.Tensor | None,
+        x_proj_weight: torch.Tensor,
+        delta_proj_weight: torch.Tensor,
+        out_proj_weight: torch.Tensor,
+        out_proj_bias: torch.Tensor | None,
+        A: torch.Tensor,
+        B: torch.Tensor | None = None,
+        C: torch.Tensor | None = None,
+        D: torch.Tensor | None = None,
+        delta_bias: torch.Tensor | None = None,
+        delta_softplus: bool = True,
+        **kwargs,
+    ):
+        return cuda_mamba_inner_fn(
+            xz,
+            conv1d_weight,
+            conv1d_bias,
+            x_proj_weight,
+            delta_proj_weight,
+            out_proj_weight,
+            out_proj_bias,
+            A,
+            B,
+            C,
+            D,
+            delta_bias=delta_bias,
+            delta_softplus=delta_softplus,
+        )
 
 
 class mamba_split_conv1d_scan_combined(nn.Module):
@@ -124,6 +161,38 @@ class selective_state_update(nn.Module):
         )
 
 
+class selective_scan_fn(nn.Module):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: torch.Tensor | None = None,
+        z: torch.Tensor | None = None,
+        delta_bias: torch.Tensor | None = None,
+        delta_softplus: bool = False,
+        return_last_state: bool = False,
+        # Unused here but fallbacks for torch only paths
+        use_mambapy: bool = False,
+        use_associative_scan: bool = False,
+        **kwargs,
+    ):
+        return cuda_selective_scan_fn(
+            hidden_states,
+            dt,
+            A,
+            B,
+            C,
+            D=D,
+            z=z,
+            delta_bias=delta_bias,
+            delta_softplus=delta_softplus,
+            return_last_state=return_last_state,
+        )
+
+
 class causal_conv1d_fn(nn.Module):
     def forward(
         self,
@@ -166,7 +235,9 @@ class causal_conv1d_update(nn.Module):
 __all__ = [
     "causal_conv1d_fn",
     "causal_conv1d_update",
+    "mamba_inner_fn",
     "mamba_split_conv1d_scan_combined",
     "mamba_chunk_scan_combined",
     "selective_state_update",
+    "selective_scan_fn",
 ]
