@@ -1,7 +1,126 @@
+import torch
 import torch.nn as nn
 
 from ._causal_conv1d import causal_conv1d_fn as cuda_causal_conv1d_fn
 from ._causal_conv1d import causal_conv1d_update as cuda_causal_conv1d_update
+from .ops import mamba_chunk_scan_combined as cuda_mamba_chunk_scan_combined
+from .ops import mamba_split_conv1d_scan_combined as cuda_mamba_split_conv1d_scan_combined
+from .ops import selective_state_update as cuda_selective_state_update
+
+
+class mamba_split_conv1d_scan_combined(nn.Module):
+    def forward(
+        self,
+        zxbcdt: torch.Tensor,
+        conv1d_weight: torch.Tensor,
+        conv1d_bias: torch.Tensor | None,
+        dt_bias: torch.Tensor,
+        A: torch.Tensor,
+        D: torch.Tensor,
+        chunk_size: int,
+        initial_states: torch.Tensor | None = None,
+        dt_limit: tuple[float, float] = (0.0, float("inf")),
+        return_final_states: bool = False,
+        activation: str = "silu",
+        rmsnorm_weight: torch.Tensor | None = None,
+        rmsnorm_eps: float = 1e-6,
+        outproj_weight: torch.Tensor | None = None,
+        outproj_bias: torch.Tensor | None = None,
+        headdim: int | None = None,
+        ngroups: int = 1,
+        norm_before_gate: bool = True,
+        **kwargs,
+    ):
+        # For varlen
+        seq_idx = kwargs.pop("seq_idx", None)
+
+        return cuda_mamba_split_conv1d_scan_combined(
+            zxbcdt,
+            conv1d_weight,
+            conv1d_bias,
+            dt_bias,
+            A,
+            D=D,
+            chunk_size=chunk_size,
+            seq_idx=seq_idx,
+            activation=activation,
+            rmsnorm_weight=rmsnorm_weight,
+            rmsnorm_eps=rmsnorm_eps,
+            outproj_weight=outproj_weight,
+            outproj_bias=outproj_bias,
+            headdim=headdim,
+            ngroups=ngroups,
+            norm_before_gate=norm_before_gate,
+            return_final_states=return_final_states,
+            dt_limit=dt_limit,
+            initial_states=initial_states,
+        )
+
+
+class mamba_chunk_scan_combined(nn.Module):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        chunk_size: int,
+        D: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        initial_states: torch.Tensor | None = None,
+        dt_softplus: bool = False,
+        dt_limit: tuple[float, float] = (0.0, float("inf")),
+        return_final_states: bool = False,
+        **kwargs,
+    ):
+        # For varlen
+        seq_idx = kwargs.pop("seq_idx", None)
+
+        return cuda_mamba_chunk_scan_combined(
+            hidden_states,
+            dt,
+            A,
+            B,
+            C,
+            D=D,
+            z=None,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            chunk_size=chunk_size,
+            seq_idx=seq_idx,
+            return_final_states=return_final_states,
+            dt_limit=dt_limit,
+            initial_states=initial_states,
+        )
+
+
+class selective_state_update(nn.Module):
+    def forward(
+        self,
+        state: torch.Tensor,
+        hidden_states: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: torch.Tensor | None = None,
+        dt_bias: torch.Tensor | None = None,
+        dt_softplus: bool = False,
+        **kwargs,
+    ):
+        return cuda_selective_state_update(
+            state,
+            hidden_states,
+            dt,
+            A,
+            B,
+            C,
+            D,
+            z=None,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+        )
 
 
 class causal_conv1d_fn(nn.Module):
@@ -43,4 +162,10 @@ class causal_conv1d_update(nn.Module):
         )
 
 
-__all__ = ["causal_conv1d_fn", "causal_conv1d_update"]
+__all__ = [
+    "causal_conv1d_fn",
+    "causal_conv1d_update",
+    "mamba_split_conv1d_scan_combined",
+    "mamba_chunk_scan_combined",
+    "selective_state_update",
+]
