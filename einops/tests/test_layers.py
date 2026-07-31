@@ -38,6 +38,7 @@ rearrangement_patterns = [
 ]
 
 
+@pytest.mark.kernels_ci
 def test_rearrange_imperative():
     for backend in collect_test_backends(symbolic=False, layers=True):
         print("Test layer for ", backend.framework_name)
@@ -70,6 +71,7 @@ def test_rearrange_imperative():
             assert numpy.allclose(backend.to_numpy(variable.grad), 1)
 
 
+@pytest.mark.kernels_ci
 def test_rearrange_symbolic():
     for backend in collect_test_backends(symbolic=True, layers=True):
         print("Test layer for ", backend.framework_name)
@@ -110,6 +112,7 @@ reduction_patterns = rearrangement_patterns + [
 ]
 
 
+@pytest.mark.kernels_ci
 def test_reduce_imperative():
     for backend in collect_test_backends(symbolic=False, layers=True):
         print("Test layer for ", backend.framework_name)
@@ -151,6 +154,7 @@ def test_reduce_imperative():
                     assert numpy.sum(grad) > 0.5
 
 
+@pytest.mark.kernels_ci
 def test_reduce_symbolic():
     for backend in collect_test_backends(symbolic=True, layers=True):
         print("Test layer for ", backend.framework_name)
@@ -203,6 +207,7 @@ def create_torch_model(use_reduce=False, add_scripted_layer=False):
         )
 
 
+@pytest.mark.kernels_ci
 def test_torch_layer():
     if not is_backend_tested("torch"):
         pytest.skip()
@@ -229,6 +234,7 @@ def test_torch_layer():
         torch.testing.assert_close(model1(input + 1), model4(input + 1), atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.kernels_ci
 def test_torch_layers_scripting():
     if not is_backend_tested("torch"):
         pytest.skip()
@@ -243,6 +249,7 @@ def test_torch_layers_scripting():
             torch.testing.assert_close(model1(input), model2(input), atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.kernels_ci
 def test_keras_layer():
     if not is_backend_tested("tensorflow"):
         pytest.skip()
@@ -303,6 +310,7 @@ def test_keras_layer():
         numpy.testing.assert_allclose(model1.predict_on_batch(input), model4.predict_on_batch(input))
 
 
+@pytest.mark.kernels_ci
 def test_flax_layers():
     """
     One-off simple tests for Flax layers.
@@ -350,6 +358,7 @@ def test_flax_layers():
         _loaded = flax.serialization.from_bytes(params, fbytes)
 
 
+@pytest.mark.kernels_ci
 def test_einmix_decomposition():
     """
     Testing that einmix correctly decomposes into smaller transformations.
@@ -440,6 +449,7 @@ def test_einmix_decomposition():
     assert mixin7.saved_bias_shape == [1, 4, 2]  # (a) d b, ellipsis does not participate
 
 
+@pytest.mark.kernels_ci
 def test_einmix_restrictions():
     """
     Testing different cases

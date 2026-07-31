@@ -19,6 +19,7 @@ class AnonymousAxisPlaceholder:
         return isinstance(other, AnonymousAxis) and self.value == other.value
 
 
+@pytest.mark.kernels_ci
 def test_anonymous_axes():
     a, b = AnonymousAxis("2"), AnonymousAxis("2")
     assert a != b
@@ -28,6 +29,7 @@ def test_anonymous_axes():
     assert [a, 2, b] == [c, 2, c]
 
 
+@pytest.mark.kernels_ci
 def test_elementary_axis_name():
     for name in [
         "a",
@@ -49,6 +51,7 @@ def test_elementary_axis_name():
         assert not ParsedExpression.check_axis_name(name)
 
 
+@pytest.mark.kernels_ci
 def test_invalid_expressions():
     # double ellipsis should raise an error
     ParsedExpression("... a b c d")
@@ -82,6 +85,7 @@ def test_invalid_expressions():
         ParsedExpression("pre...")
 
 
+@pytest.mark.kernels_ci
 def test_parse_expression():
     parsed = ParsedExpression("a1  b1   c1    d1")
     assert parsed.identifiers == {"a1", "b1", "c1", "d1"}

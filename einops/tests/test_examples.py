@@ -10,6 +10,7 @@ from . import is_backend_tested
 from .test_ops import imp_op_backends
 
 
+@pytest.mark.kernels_ci
 def test_rearrange_examples():
     def test1(x):
         # transpose
@@ -195,6 +196,7 @@ def tensor_train_example_numpy():
     assert numpy.allclose(y1, y3)
 
 
+@pytest.mark.kernels_ci
 def test_pytorch_yolo_fragment():
     if not is_backend_tested("torch"):
         pytest.skip()

@@ -45,6 +45,7 @@ equivalent_reduction_patterns = [
 ]
 
 
+@pytest.mark.kernels_ci
 def test_collapsed_ellipsis_errors_out():
     x = numpy.zeros([1, 1, 1, 1, 1])
     rearrange(x, "a b c d ... ->  a b c ... d")
@@ -56,6 +57,7 @@ def test_collapsed_ellipsis_errors_out():
         rearrange(x, "(...) -> (...)")
 
 
+@pytest.mark.kernels_ci
 def test_ellipsis_ops_numpy():
     x = numpy.arange(2 * 3 * 4 * 5 * 6).reshape([2, 3, 4, 5, 6])
     for pattern in identity_patterns:
@@ -101,6 +103,7 @@ def check_op_against_numpy(backend, numpy_input, pattern, axes_lengths, reductio
     check_equal(numpy_result, backend_result)
 
 
+@pytest.mark.kernels_ci
 def test_ellipsis_ops_imperative():
     """Checking various patterns against numpy"""
     x = numpy.arange(2 * 3 * 4 * 5 * 6).reshape([2, 3, 4, 5, 6])
@@ -118,6 +121,7 @@ def test_ellipsis_ops_imperative():
                     )
 
 
+@pytest.mark.kernels_ci
 def test_rearrange_array_api():
     import numpy as xp
     AA = einops.array_api
@@ -132,6 +136,7 @@ def test_rearrange_array_api():
         assert numpy.array_equal(AA.asnumpy(result + 0), expected)
 
 
+@pytest.mark.kernels_ci
 def test_reduce_array_api():
     import numpy as xp
     AA = einops.array_api
@@ -147,6 +152,7 @@ def test_reduce_array_api():
             assert numpy.array_equal(AA.asnumpy(np.asarray(result + 0)), expected)
 
 
+@pytest.mark.kernels_ci
 def test_rearrange_consistency_numpy():
     shape = [1, 2, 3, 5, 7, 11]
     x = numpy.arange(numpy.prod(shape)).reshape(shape)
@@ -185,6 +191,7 @@ def test_rearrange_consistency_numpy():
     assert x2[0, 1, 2] == result[1, 2, 0]
 
 
+@pytest.mark.kernels_ci
 def test_rearrange_permutations_numpy():
     # tests random permutation of axes against two independent numpy ways
     for n_axes in range(1, 10):
@@ -213,6 +220,7 @@ def test_rearrange_permutations_numpy():
         assert numpy.array_equal(result, expected_result)
 
 
+@pytest.mark.kernels_ci
 def test_reduction_imperatives():
     for backend in imp_op_backends:
         print("Reduction tests for ", backend.framework_name)
@@ -249,6 +257,7 @@ def test_reduction_imperatives():
                 assert numpy.allclose(result, expected_result), f"Failed at {pattern}"
 
 
+@pytest.mark.kernels_ci
 def test_reduction_symbolic():
     for backend in sym_op_backends:
         print("Reduction tests for ", backend.framework_name)
@@ -302,6 +311,7 @@ def test_reduction_symbolic():
                     assert numpy.allclose(result, expected_numpy_result)
 
 
+@pytest.mark.kernels_ci
 def test_reduction_stress_imperatives():
     for backend in imp_op_backends:
         print("Stress-testing reduction for ", backend.framework_name)
@@ -334,6 +344,7 @@ def test_reduction_stress_imperatives():
                 check_op_against_numpy(backend, x, pattern, reduction=reduction, axes_lengths={}, is_symbolic=False)
 
 
+@pytest.mark.kernels_ci
 def test_reduction_with_callable_imperatives():
     x_numpy = numpy.arange(2 * 3 * 4 * 5 * 6).reshape([2, 3, 4, 5, 6]).astype("float32")
     x_numpy /= x_numpy.max()
@@ -388,6 +399,7 @@ def test_reduction_with_callable_imperatives():
             )
 
 
+@pytest.mark.kernels_ci
 def test_enumerating_directions():
     for backend in imp_op_backends:
         print("testing directions for", backend.framework_name)
@@ -402,6 +414,7 @@ def test_enumerating_directions():
                 assert numpy.allclose(ax1, ax2)
 
 
+@pytest.mark.kernels_ci
 def test_concatenations_and_stacking():
     for backend in imp_op_backends:
         print("testing shapes for ", backend.framework_name)
@@ -421,6 +434,7 @@ def test_concatenations_and_stacking():
                 assert numpy.array_equal(result1, backend.to_numpy(result2))
 
 
+@pytest.mark.kernels_ci
 def test_gradients_imperatives():
     # lazy - just checking reductions
     for reduction in REDUCTIONS:
@@ -448,6 +462,7 @@ def test_gradients_imperatives():
                 assert numpy.allclose(grad1, grad2), [name1, name2, "provided different gradients"]
 
 
+@pytest.mark.kernels_ci
 def test_tiling_imperatives():
     for backend in imp_op_backends:
         print("Tiling tests for ", backend.framework_name)
@@ -465,6 +480,7 @@ def test_tiling_imperatives():
             assert numpy.array_equal(result, expected)
 
 
+@pytest.mark.kernels_ci
 def test_tiling_symbolic():
     for backend in sym_op_backends:
         print("Tiling tests for ", backend.framework_name)
@@ -510,6 +526,7 @@ def check_reversion(x, repeat_pattern, **sizes):
     assert numpy.array_equal(x, reduced_max)
 
 
+@pytest.mark.kernels_ci
 def test_repeat_numpy():
     # check repeat vs reduce. Repeat works ok if reverse reduction with min and max work well
     x = numpy.arange(2 * 3 * 5).reshape([2, 3, 5])
@@ -519,6 +536,7 @@ def test_repeat_numpy():
         check_reversion(x, pattern, **axis_dimensions)
 
 
+@pytest.mark.kernels_ci
 def test_repeat_imperatives():
     x = numpy.arange(2 * 3 * 5).reshape([2, 3, 5])
     for backend in imp_op_backends:
@@ -532,6 +550,7 @@ def test_repeat_imperatives():
             assert numpy.array_equal(result, expected)
 
 
+@pytest.mark.kernels_ci
 def test_repeat_symbolic():
     x = numpy.arange(2 * 3 * 5).reshape([2, 3, 5])
 
@@ -546,6 +565,7 @@ def test_repeat_symbolic():
             assert numpy.array_equal(result, expected)
 
 
+@pytest.mark.kernels_ci
 def test_repeat_array_api():
     import numpy as xp
     AA = einops.array_api
@@ -573,12 +593,14 @@ test_cases_repeat_anonymous = [
 ]
 
 
+@pytest.mark.kernels_ci
 def test_anonymous_axes():
     x = numpy.arange(1 * 2 * 4 * 6).reshape([1, 2, 4, 6])
     for pattern, axis_dimensions in test_cases_repeat_anonymous:
         check_reversion(x, pattern, **axis_dimensions)
 
 
+@pytest.mark.kernels_ci
 def test_list_inputs():
     x = numpy.arange(2 * 3 * 4 * 5 * 6).reshape([2, 3, 4, 5, 6])
 
@@ -596,6 +618,7 @@ def test_list_inputs():
     )
 
 
+@pytest.mark.kernels_ci
 def test_torch_compile_with_dynamic_shape():
     if not is_backend_tested("torch"):
         pytest.skip()
@@ -627,6 +650,7 @@ def bit_count(x):
     return sum((x >> i) & 1 for i in range(20))
 
 
+@pytest.mark.kernels_ci
 def test_reduction_imperatives_booleans():
     """Checks that any/all reduction works in all frameworks"""
     x_np = numpy.asarray([(bit_count(x) % 2) == 0 for x in range(2**6)]).reshape([2] * 6)

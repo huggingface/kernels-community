@@ -168,6 +168,7 @@ test_functional_cases = [
 ]
 
 
+@pytest.mark.kernels_ci
 def test_layer():
     for backend in collect_test_backends(layers=True, symbolic=False):
         if backend.framework_name in ["tensorflow", "torch", "oneflow", "paddle"]:
@@ -195,6 +196,7 @@ valid_backends_functional = [
 ]
 
 
+@pytest.mark.kernels_ci
 def test_functional():
     # Functional tests:
     backends = filter(lambda x: x.framework_name in valid_backends_functional, collect_test_backends())
@@ -230,6 +232,7 @@ def test_functional():
                 np.testing.assert_array_almost_equal(predicted_out_array, true_out_array, decimal=5)
 
 
+@pytest.mark.kernels_ci
 def test_functional_symbolic():
     backends = filter(
         lambda x: x.framework_name in valid_backends_functional, collect_test_backends(symbolic=True, layers=False)
@@ -262,6 +265,7 @@ def test_functional_symbolic():
                 np.testing.assert_array_almost_equal(predicted_out_data, expected_out_data, decimal=5)
 
 
+@pytest.mark.kernels_ci
 def test_functional_errors():
     # Specific backend does not matter, as errors are raised
     # during the pattern creation.

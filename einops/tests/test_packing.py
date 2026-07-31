@@ -64,6 +64,7 @@ class CaptureException:
         return True
 
 
+@pytest.mark.kernels_ci
 def test_numpy_trivial(H=13, W=17):
     def rand(*shape):
         return np.random.random(shape)
@@ -147,6 +148,7 @@ cases = [
 ]
 
 
+@pytest.mark.kernels_ci
 def test_pack_unpack_with_numpy():
     case: UnpackTestCase
 
@@ -210,6 +212,7 @@ def test_pack_unpack_with_numpy():
         unpack_and_pack(x, [[2, -1], [1, 5]], pattern)
 
 
+@pytest.mark.kernels_ci
 def test_pack_unpack_against_numpy():
     for backend in collect_test_backends(symbolic=False, layers=False):
         print(f"test packing against numpy for {backend.framework_name}")
@@ -274,6 +277,7 @@ def test_pack_unpack_against_numpy():
                 unpack_and_pack(x, [[2, -1], [1, 5]], pattern)
 
 
+@pytest.mark.kernels_ci
 def test_pack_unpack_array_api():
     AA = einops.array_api
     import numpy as xp
