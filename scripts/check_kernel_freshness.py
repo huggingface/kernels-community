@@ -62,7 +62,7 @@ KERNEL_SOURCE_MAPPING = {
     "vllm-moe": "",
     "fla": "github.com/fla-org/flash-linear-attention",
     # Developed in-house; upstream is a Hub kernel repo, not a GitHub project.
-    "esmfold2-trimul-kernel": "",
+    "esmfold2-trimul": "",
 }
 
 def parse_args() -> argparse.Namespace:

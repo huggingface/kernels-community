@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import esmfold2_trimul_kernel
+import esmfold2_trimul
 
 
 # Channel counts the fused GEMMs support: powers of two >= 64. ESMFold2 uses 128.
@@ -85,7 +85,7 @@ def _assert_matches_reference(B, L, c_z, direction, use_mask, use_drop_mask):
     )
 
     with torch.no_grad():
-        got = esmfold2_trimul_kernel.triangle_multiplicative_update_with_residual(
+        got = esmfold2_trimul.triangle_multiplicative_update_with_residual(
             pair, direction, residual, drop_mask, mask=mask, **w
         )
     want = _reference(pair, direction, residual, drop_mask, mask=mask, **w)
@@ -146,7 +146,7 @@ def test_deterministic():
         del del_me
         with torch.no_grad():
             outs.append(
-                esmfold2_trimul_kernel.triangle_multiplicative_update_with_residual(
+                esmfold2_trimul.triangle_multiplicative_update_with_residual(
                     pair, "outgoing", residual, None, mask=None, **w
                 ).clone()
             )
@@ -160,7 +160,7 @@ def test_rejects_unsupported_channels(c_z):
     """Unsupported c_z must raise, not silently read out of bounds."""
     pair = torch.zeros(1, 4, 4, c_z, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="power of two"):
-        esmfold2_trimul_kernel.triangle_multiplicative_update_with_residual(
+        esmfold2_trimul.triangle_multiplicative_update_with_residual(
             pair,
             "outgoing",
             pair.clone(),
@@ -174,7 +174,7 @@ def test_rejects_unsupported_channels(c_z):
 def test_layer_is_exposed_for_kernels():
     """`kernels` resolves Hub layers as `<module>.layers.<layer_name>`."""
     layer = getattr(
-        esmfold2_trimul_kernel.layers, "ESMFold2TriangleMultiplication", None
+        esmfold2_trimul.layers, "ESMFold2TriangleMultiplication", None
     )
     assert layer is not None
     assert issubclass(layer, torch.nn.Module)
