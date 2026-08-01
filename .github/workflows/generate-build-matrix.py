@@ -12,6 +12,9 @@ with one entry per (backend, arch) combination. Each entry includes max_jobs
 and cores, falling back to DEFAULT_MAX_JOBS and DEFAULT_CORES respectively,
 with per-kernel/backend overrides read from build-concurrency.json at the
 repo root.
+
+The optional BACKENDS_FILTER environment variable (comma-separated) restricts
+the matrix to those backends; empty or unset builds every backend nix exposes.
 """
 
 import json
@@ -70,6 +73,10 @@ def main():
         print("KERNEL environment variable is not set or empty", file=sys.stderr)
         sys.exit(1)
 
+    backends_filter = {
+        b.strip() for b in os.environ.get("BACKENDS_FILTER", "").split(",") if b.strip()
+    }
+
     backends_by_arch = {
         "x86_64-linux": json.loads(sys.argv[1]),
         "aarch64-linux": json.loads(sys.argv[2]),
@@ -93,6 +100,7 @@ def main():
         }
         for arch, runner in ARCHES
         for backend in backends_by_arch[arch]
+        if not backends_filter or backend in backends_filter
     ]
 
     print(json.dumps({"include": include}))
