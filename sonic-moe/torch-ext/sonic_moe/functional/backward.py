@@ -237,6 +237,33 @@ def _up_projection_backward_weight(
 _up_projection_backward_weight.compile_cache = {}
 
 
+def _scatter_valid_rows(ds_scattered, s_scatter_idx, expert_frequency_offset, out):
+    """Scatter `ds_scattered` back to slot order, dropping the rows no GEMM tile ever wrote.
+
+    `cu_seqlens_m` (= `expert_frequency_offset`) stops at the number of entries routed to a local
+    expert, so under expert parallelism the rows `[sum_valid, TK)` of `ds_scattered` are read straight
+    out of an uninitialized buffer — QuACK allocates `colvec_reduce_partial` with `torch.empty` and
+    only the covered tiles write it. Dropping those rows is necessary but not sufficient on its own:
+    the tail of `s_scatter_idx` is zero-filled, so a plain `out[s_scatter_idx] = ds_scattered` aliases
+    every uninitialized row onto `out[0]` with duplicate indices, leaving the surviving value
+    unspecified. Redirecting them to a scratch slot at index `TK` keeps the write pattern
+    conflict-free, and because the scratch buffer starts zeroed and is copied over `out` in full, the
+    slots that own no row end at a defined 0 rather than at whatever `out` was allocated with.
+
+    Sync-free on purpose: the bound is compared on device, because `int(expert_frequency_offset[-1])`
+    would stall the host once per MoE layer per step.
+
+    Without EP there are no sentinels, `sum_valid == TK`, every row is valid, and this reduces to the
+    scatter it replaces.
+    """
+    TK = s_scatter_idx.numel()
+    row_valid = torch.arange(TK, device=out.device) < expert_frequency_offset[-1]
+    dest = torch.where(row_valid, s_scatter_idx.long(), TK)
+    padded = torch.zeros(TK + 1, dtype=out.dtype, device=out.device)
+    padded.index_put_((dest,), ds_scattered.to(out.dtype))
+    out.view(-1).copy_(padded[:TK])
+
+
 @torch.library.custom_op(add_op_namespace_prefix("_down_projection_backward_act"), mutates_args={"dh", "ds", "db2", "a_prime"})
 def _down_projection_backward_act(
     dout: torch.Tensor,
@@ -272,21 +299,21 @@ def _down_projection_backward_act(
         A_idx=x_gather_idx,
         dynamic_scheduler=False,
     )
-    ds[s_scatter_idx] = ds_scattered
-
     if db2 is None:
-        ds[s_scatter_idx] = ds_scattered
+        _scatter_valid_rows(ds_scattered, s_scatter_idx, expert_frequency_offset, ds)
     else:
         H = w2.size(0)
         E = expert_frequency_offset.size(0) - 1
         TK = x_gather_idx.size(0)
 
-        old_ds_partial = torch.empty(TK, 1, device=ds_scattered.device, dtype=ds_scattered.dtype)
-        old_ds_partial[s_scatter_idx, 0] = ds_scattered
+        # Same hazard as the `db2 is None` path above, same treatment. Untested: no model we run has
+        # an expert bias, so this branch is fixed for consistency rather than validated.
+        old_ds_partial = torch.zeros(TK, 1, device=ds_scattered.device, dtype=ds_scattered.dtype)
+        _scatter_valid_rows(ds_scattered, s_scatter_idx, expert_frequency_offset, old_ds_partial)
 
         BLOCK_H = min(triton.next_power_of_2(H), 2048)
         NUM_H_BLOCKS = triton.cdiv(H, BLOCK_H)
-        new_ds_partial = torch.empty(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
+        new_ds_partial = torch.zeros(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
 
         db2_and_ds_kernel[(E, NUM_H_BLOCKS)](
             dout,
