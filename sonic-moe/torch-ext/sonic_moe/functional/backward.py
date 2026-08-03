@@ -238,30 +238,14 @@ _up_projection_backward_weight.compile_cache = {}
 
 
 def _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, out):
-    """Gather the colvec-reduce rows back to slot order through the inverse permutation.
+    """Gather the colvec-reduce rows back to slot order.
 
-    `cu_seqlens_m` (= `expert_frequency_offset`) stops at the number of entries routed to a local
-    expert, so under expert parallelism the rows `[sum_valid, TK)` of `ds_scattered` are read straight
-    out of an uninitialized buffer — QuACK allocates `colvec_reduce_partial` with `torch.empty` and
-    only the covered tiles write it. Scattering with `out[s_scatter_idx] = ds_scattered` propagates
-    that: the tail of `s_scatter_idx` is zero-filled, so every uninitialized row is aliased onto
-    `out[0]` with duplicate indices, and the surviving value is unspecified.
-
-    Going through the inverse permutation removes both hazards by construction rather than masking
-    them. `s_reverse_scatter_idx` already holds `TK` at sentinel lanes (see
-    `_general_metadata_compute_stage2`), so appending one zero row makes every slot resolve to either
-    its own row or a defined 0, and a gather writes each output element exactly once — no duplicate
-    index can reach `out`, and no lane addresses the uninitialized tail.
-
-    Sync-free: no bound is read on the host, unlike an `int(expert_frequency_offset[-1])` slice, which
-    would stall once per MoE layer per step.
-
-    Without sentinels `s_reverse_scatter_idx` is a full permutation of `[0, TK)`, the appended row is
-    unreachable, and this is exactly the scatter it replaces. Note that only the general-routing
-    metadata writes the `TK` marker; the bitmatrix path (`_bitmatrix_metadata_compute_stage2`) leaves
-    sentinel lanes at their zero-init, but it cannot see sentinels either — its histogram would
-    atomically add at `expert == E`, past the end of the `[E, n_tiles]` partial-sum buffer. Adding
-    sentinel support there means writing the `TK` marker there too.
+    The GEMM only covers the rows routed to a local expert, so under EP the tail of `ds_scattered` is
+    uninitialized. `s_reverse_scatter_idx` maps every slot either to its own row or to `TK` for a
+    sentinel, so gathering off a buffer with one appended zero row gives each slot its row or a 0: the
+    uninitialized tail is never addressed, and no slot is written twice. Without sentinels it is a
+    plain permutation. Only the general-routing metadata writes the `TK` marker; the bitmatrix path
+    never sees sentinels, so add the marker there too if that changes.
     """
     TK = s_reverse_scatter_idx.numel()
     padded = torch.zeros(TK + 1, dtype=out.dtype, device=out.device)
@@ -312,16 +296,12 @@ def _down_projection_backward_act(
         E = expert_frequency_offset.size(0) - 1
         TK = x_gather_idx.size(0)
 
-        # Same hazard as the `db2 is None` path above, same treatment. Untested: no model we run has
-        # an expert bias, so this branch is fixed for consistency rather than validated.
         old_ds_partial = torch.empty(TK, 1, device=ds_scattered.device, dtype=ds_scattered.dtype)
         _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, old_ds_partial)
 
         BLOCK_H = min(triton.next_power_of_2(H), 2048)
         NUM_H_BLOCKS = triton.cdiv(H, BLOCK_H)
-        # Zero-init, unlike `old_ds_partial` above: the kernel below only walks the grouped rows each
-        # expert owns, so with sentinels the slots in `[sum_valid, TK)` are never stored to, and `ds`
-        # is copied from this buffer wholesale.
+        # Zero-init: the kernel below skips sentinel slots, and `ds` is copied from this buffer whole.
         new_ds_partial = torch.zeros(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
 
         db2_and_ds_kernel[(E, NUM_H_BLOCKS)](
