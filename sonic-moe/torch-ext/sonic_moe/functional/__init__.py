@@ -266,6 +266,7 @@ class _DownProjection(torch.autograd.Function):
             expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
+            s_reverse_scatter_idx,
         )
 
         return o
@@ -285,6 +286,7 @@ class _DownProjection(torch.autograd.Function):
             expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
+            s_reverse_scatter_idx,
         ) = ctx.saved_tensors
 
         dw2 = torch.empty_like(w2)
@@ -310,6 +312,7 @@ class _DownProjection(torch.autograd.Function):
             expert_frequency_offset=expert_frequency_offset,
             x_gather_idx=x_gather_idx,
             s_scatter_idx=s_scatter_idx,
+            s_reverse_scatter_idx=s_reverse_scatter_idx,
             activation_type=activation_type.value,
         )
 
@@ -371,7 +374,6 @@ def moe_TC_softmax_topk_layer(
     if type(activation_type) == str:
         activation_type = ActivationType(activation_type)
 
-    assert not torch.compiler.is_compiling()
     assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
     a, h = _UpProjection.apply(
@@ -471,7 +473,6 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
     )
 
-    assert not torch.compiler.is_compiling()
     assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
     a, h = _UpProjection.apply(

@@ -109,12 +109,25 @@ def parse_kernel_arg(token: str) -> tuple[str | None, list[str] | None]:
     return name, backends
 
 
-def read_backends(kernel_name: str) -> list[str] | None:
-    build_toml = Path(kernel_name) / "build.toml"
-    if not build_toml.exists():
-        return None
-    with open(build_toml, "rb") as f:
-        config = tomllib.load(f)
+def read_backends(kernel_name: str, ref: str = "") -> list[str] | None:
+    # ref reads build.toml from that revision (the PR branch), not the working tree.
+    if ref:
+        try:
+            raw = subprocess.run(
+                ["git", "show", f"{ref}:{kernel_name}/build.toml"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return None
+        config = tomllib.loads(raw)
+    else:
+        build_toml = Path(kernel_name) / "build.toml"
+        if not build_toml.exists():
+            return None
+        with open(build_toml, "rb") as f:
+            config = tomllib.load(f)
     backends = config.get("general", {}).get("backends")
     if backends is None:
         backends = config.get("backends")
@@ -251,9 +264,10 @@ def _plan_build_actions(
     target_branch: str,
     upload: bool,
     bot_comment_id: str,
+    metadata_ref: str = "",
     requested_backends: list[str] | None = None,
 ) -> None:
-    backends = read_backends(kernel_name)
+    backends = read_backends(kernel_name, metadata_ref)
     if requested_backends is not None and backends is not None:
         backends = [b for b in backends if b in requested_backends]
         if not backends:
@@ -327,6 +341,7 @@ def plan_dispatch(
     bot_comment_id: str = "",
     run_security: bool = False,
     security_only: bool = False,
+    metadata_ref: str = "",
     requested_backends: list[str] | None = None,
 ) -> DispatchPlan:
     want_security = run_security or security_only
@@ -340,6 +355,7 @@ def plan_dispatch(
             mode=mode,
             repo_prefix=repo_prefix,
             dispatch_key_prefix=dispatch_key_prefix,
+            metadata_ref=metadata_ref,
             skip_build=skip_build,
             pr_number=pr_number,
             head_sha=head_sha,
@@ -497,6 +513,7 @@ def dispatch(
     bot_comment_id: str = "",
     run_security: bool = False,
     security_only: bool = False,
+    metadata_ref: str = "",
     requested_backends: list[str] | None = None,
 ) -> DispatchResult:
     if not security_only and (not kernel_name or not KERNEL_NAME_RE.match(kernel_name)):
@@ -520,6 +537,7 @@ def dispatch(
         bot_comment_id=bot_comment_id,
         run_security=run_security,
         security_only=security_only,
+        metadata_ref=metadata_ref,
         requested_backends=requested_backends,
     )
     if dry_run:

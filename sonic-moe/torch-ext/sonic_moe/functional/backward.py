@@ -237,6 +237,22 @@ def _up_projection_backward_weight(
 _up_projection_backward_weight.compile_cache = {}
 
 
+def _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, out):
+    """Gather the colvec-reduce rows back to slot order.
+
+    The GEMM only covers the rows routed to a local expert, so under EP the tail of `ds_scattered` is
+    uninitialized. `s_reverse_scatter_idx` maps every slot either to its own row or to `TK` for a
+    sentinel, so gathering off a buffer with one appended zero row gives each slot its row or a 0: the
+    uninitialized tail is never addressed, and no slot is written twice. Without sentinels it is a
+    plain permutation. Only the general-routing metadata writes the `TK` marker; the bitmatrix path
+    never sees sentinels, so add the marker there too if that changes.
+    """
+    TK = s_reverse_scatter_idx.numel()
+    padded = torch.zeros(TK + 1, dtype=out.dtype, device=out.device)
+    padded[:TK].copy_(ds_scattered)
+    torch.index_select(padded, 0, s_reverse_scatter_idx, out=out.view(-1))
+
+
 @torch.library.custom_op(add_op_namespace_prefix("_down_projection_backward_act"), mutates_args={"dh", "ds", "db2", "a_prime"})
 def _down_projection_backward_act(
     dout: torch.Tensor,
@@ -251,6 +267,7 @@ def _down_projection_backward_act(
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
     s_scatter_idx: torch.Tensor,
+    s_reverse_scatter_idx: torch.Tensor,
     activation_type: str,
 ) -> None:
     assert activation_type in (
@@ -272,21 +289,20 @@ def _down_projection_backward_act(
         A_idx=x_gather_idx,
         dynamic_scheduler=False,
     )
-    ds[s_scatter_idx] = ds_scattered
-
     if db2 is None:
-        ds[s_scatter_idx] = ds_scattered
+        _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, ds)
     else:
         H = w2.size(0)
         E = expert_frequency_offset.size(0) - 1
         TK = x_gather_idx.size(0)
 
         old_ds_partial = torch.empty(TK, 1, device=ds_scattered.device, dtype=ds_scattered.dtype)
-        old_ds_partial[s_scatter_idx, 0] = ds_scattered
+        _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, old_ds_partial)
 
         BLOCK_H = min(triton.next_power_of_2(H), 2048)
         NUM_H_BLOCKS = triton.cdiv(H, BLOCK_H)
-        new_ds_partial = torch.empty(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
+        # Zero-init: the kernel below skips sentinel slots, and `ds` is copied from this buffer whole.
+        new_ds_partial = torch.zeros(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
 
         db2_and_ds_kernel[(E, NUM_H_BLOCKS)](
             dout,
