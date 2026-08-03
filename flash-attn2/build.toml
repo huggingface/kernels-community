@@ -133,38 +133,6 @@ src = [
     "flash_attn_xpu/src/kernel/fmha_bwd_kernel.hpp",
 ]
 
-# Block-scaled MXFP kernels are gated behind __SYCL_TARGET_INTEL_GPU_CRI__ and
-# only build for cri, so compile them spir64_gen-only with that macro. The
-# spir64_gen image is AOT-lowered to cri by the tri-target link.
-[kernel.flash_attn_xpu_mxfp]
-backend = "xpu"
-depends = [
-    "torch",
-    "sycl_tla",
-]
-sycl-flags = [
-    "-fsycl-targets=spir64_gen",
-    "-D__SYCL_TARGET_INTEL_GPU_CRI__=1",
-]
-src = [
-    "flash_attn_xpu/src/flash_fwd_hdim32_varlen_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim64_varlen_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim96_varlen_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim128_varlen_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim160_varlen_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim192_varlen_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim256_varlen_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim512_varlen_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim32_fix_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim64_fix_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim96_fix_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim128_fix_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim160_fix_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim192_fix_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim256_fix_mxfp.cpp",
-    "flash_attn_xpu/src/flash_fwd_hdim512_fix_mxfp.cpp",
-]
-
 [kernel.flash_attn_cpu_avx512]
 backend = "cpu"
 cxx-flags = [

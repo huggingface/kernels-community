@@ -77,31 +77,6 @@ def round_multiple(x, m):
     return (x + m - 1) // m * m
 
 
-# Block-scaled MXFP (FP8 e5m2/e4m3, FP4 e2m1) is selected by the Q dtype, matching
-# the `is_mxfp` check in flash_api.cpp.
-_FP4_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
-_MXFP_DTYPES = tuple(
-    d
-    for d in (
-        getattr(torch, "float8_e5m2", None),
-        getattr(torch, "float8_e4m3fn", None),
-        _FP4_DTYPE,
-    )
-    if d is not None
-)
-
-
-def is_mxfp_dtype(dtype):
-    return dtype in _MXFP_DTYPES
-
-
-def _mxfp_out_shape(q):
-    """Shape of the MXFP output: fp4_e2m1fn_x2 packs two values per byte, so the
-    kernel writes twice the head dimension that q carries."""
-    head_dim = q.shape[-1] * 2 if q.dtype is _FP4_DTYPE else q.shape[-1]
-    return q.shape[:-1] + (head_dim,)
-
-
 @torch.library.custom_op(
     add_op_namespace_prefix("_flash_attn_forward"),
     mutates_args=(),
@@ -156,13 +131,7 @@ def _flash_attn_forward_fake(
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     batch_size, seqlen_q, num_heads, head_size = q.shape
     seqlen_k = k.shape[1]
-    # MXFP accumulates in and writes float32, so it cannot reuse q's metadata.
-    if is_mxfp_dtype(q.dtype):
-        out = torch.empty(
-            _mxfp_out_shape(q), dtype=torch.float32, device=q.device, layout=q.layout
-        )
-    else:
-        out = torch.empty_like(q)
+    out = torch.empty_like(q)
     softmax_lse = torch.empty(
         (batch_size, num_heads, seqlen_q),
         dtype=torch.float32,
@@ -269,13 +238,7 @@ def _flash_attn_varlen_forward_fake(
     batch_size = cu_seqlens_q.numel() - 1
     total_q, num_heads, _ = q.shape
 
-    # MXFP accumulates in and writes float32, so it cannot reuse q's metadata.
-    if is_mxfp_dtype(q.dtype):
-        out = torch.empty(
-            _mxfp_out_shape(q), dtype=torch.float32, device=q.device, layout=q.layout
-        )
-    else:
-        out = torch.empty_like(q)
+    out = torch.empty_like(q)
     softmax_lse = torch.empty(
         (num_heads, total_q), dtype=torch.float32, device=q.device, layout=q.layout
     )

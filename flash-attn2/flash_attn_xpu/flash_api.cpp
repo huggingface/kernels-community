@@ -47,10 +47,7 @@ mha_fwd(
         int window_size_right,
         const float softcap,
         const bool return_softmax,
-        std::optional<at::Generator> gen_,
-        std::optional<at::Tensor> scale_q_ = std::nullopt,
-        std::optional<at::Tensor> scale_k_ = std::nullopt,
-        std::optional<at::Tensor> scale_v_ = std::nullopt) {
+        std::optional<at::Generator> gen_) {
 
     auto device_idx = q.device().index();
     compat::select_device(device_idx);
@@ -68,39 +65,22 @@ mha_fwd(
     const int num_heads_k = k.size(2);
 
     auto q_dtype = q.dtype();
-    const bool is_mxfp = (q_dtype == torch::kFloat8_e5m2 || q_dtype == torch::kFloat8_e4m3fn ||
-                          q_dtype == torch::kFloat4_e2m1fn_x2);
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || is_mxfp,
-                "FlashAttention only support fp16, bf16, fp8_e5m2, fp8_e4m3fn and fp4_e2m1fn_x2 data type");
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention only support fp16 and bf16 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(k.size(-1) == head_size_og, "Key head dimension must match Query head dimension");
-    if (!is_mxfp) {
-        TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
-        TORCH_CHECK(v.size(-1) == head_size_og, "Value head dimension must match Query head dimension");
-    } else if (q_dtype == torch::kFloat4_e2m1fn_x2) {
-        // MXFP4 (e2m1) consumes a BF16 value tensor; reject mismatches early
-        // instead of silently producing wrong results inside the kernel.
-        TORCH_CHECK(v.dtype() == torch::kBFloat16,
-                    "For fp4_e2m1fn_x2 query, value must be bf16");
-    } else {
-        // MXFP8 (e5m2 / e4m3fn) requires the value tensor to match the query fp8 dtype.
-        TORCH_CHECK(v.dtype() == q_dtype,
-                    "For fp8 query, value must have the same fp8 dtype as query");
-    }
-    // For FP4 (e2m1) the head dimension is packed (2 values per byte); unpack for padding math.
-    const int head_size_actual = (q_dtype == torch::kFloat4_e2m1fn_x2) ? head_size_og * 2 : head_size_og;
-    TORCH_CHECK(head_size_actual <= 256 || head_size_actual == 512,
-                "FlashAttention XPU only supports head dimension up to 256 or exactly 512. Got: " + std::to_string(head_size_actual));
+    TORCH_CHECK(v.size(-1) == head_size_og, "Value head dimension must match Query head dimension");
+    TORCH_CHECK(head_size_og <= 256 || head_size_og == 512,
+                "FlashAttention XPU only supports head dimension up to 256 or exactly 512. Got: " + std::to_string(head_size_og));
 
     CHECK_DEVICE(q);
     CHECK_DEVICE(k);
     CHECK_DEVICE(v);
 
-    // XPU requires head_size to be a multiple of 32.
-    // FP4 packed inputs are consumed in their packed layout and are not padded.
-    const int head_size_padded = round_multiple(head_size_actual, 32);
-    const bool needs_padding = (head_size_actual != head_size_padded)
-                             && (q_dtype != torch::kFloat4_e2m1fn_x2);
+    // XPU requires head_size to be a multiple of 32
+    const int head_size_padded = round_multiple(head_size_og, 32);
+    const bool needs_padding = (head_size_og != head_size_padded);
 
     at::Tensor q_padded = q;
     at::Tensor k_padded = k;
@@ -108,31 +88,21 @@ mha_fwd(
 
     // Apply padding if needed
     if (needs_padding) {
-        const int pad_size = head_size_padded - head_size_actual;
+        const int pad_size = head_size_padded - head_size_og;
         q_padded = torch::nn::functional::pad(q, torch::nn::functional::PadFuncOptions({0, pad_size}));
         k_padded = torch::nn::functional::pad(k, torch::nn::functional::PadFuncOptions({0, pad_size}));
         v_padded = torch::nn::functional::pad(v, torch::nn::functional::PadFuncOptions({0, pad_size}));
     }
 
-    // Low-precision (FP8/FP4) inputs accumulate in float32 and produce a float32 output.
-    auto out_dtype = is_mxfp ? torch::kFloat32 : c10::typeMetaToScalarType(q_dtype);
-
     at::Tensor out_padded;
     if (out_.has_value()) {
         auto out_val = out_.value();
-        // The kernel writes out_dtype elements; a mismatched buffer would be
-        // overrun (MXFP writes float32 into what may be a half-width tensor).
-        TORCH_CHECK(out_val.scalar_type() == out_dtype,
-                    "out must have dtype ", out_dtype, ", got ", out_val.scalar_type());
-        if (needs_padding) {
-            const int pad_size = head_size_padded - head_size_actual;
+        if (head_size_og != head_size_padded) {
+            const int pad_size = head_size_padded - head_size_og;
             out_padded = torch::nn::functional::pad(out_val, torch::nn::functional::PadFuncOptions({0, pad_size}));
         } else {
             out_padded = out_val;
         }
-    } else if (is_mxfp) {
-        out_padded = torch::zeros({batch_size, seqlen_q, num_heads, head_size_padded},
-                                  q_padded.options().dtype(out_dtype));
     } else {
         out_padded = torch::zeros_like(q_padded);
     }
@@ -174,7 +144,7 @@ mha_fwd(
     // seqlen_q_rounded must be >= the kernel's Q tile size, otherwise the S_dmask
     // write in the mainloop will go out of bounds for rows in the padding region
     // of the tile.  The Q tile size depends on head_size (see fmha_utils.hpp):
-    const int q_tile_size = (head_size_actual <= 32) ? 64 : (head_size_actual <= 128) ? 128 : 256;
+    const int q_tile_size = (head_size_og <= 32) ? 64 : (head_size_og <= 128) ? 128 : 256;
     const int seqlen_q_rounded = round_multiple(seqlen_q, q_tile_size);
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
     at::Tensor S_dmask;
@@ -183,18 +153,6 @@ mha_fwd(
         S_dmask = torch::empty({batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded}, q.options());
     } else {
         S_dmask = torch::empty({0}, q.options());
-    }
-
-    // MXFP (block-scaled) paths require per-tensor scale factors; contiguity is enforced.
-    std::optional<at::Tensor> scale_q = scale_q_.has_value()
-        ? std::optional<at::Tensor>(ensure_contiguous(scale_q_.value())) : std::nullopt;
-    std::optional<at::Tensor> scale_k = scale_k_.has_value()
-        ? std::optional<at::Tensor>(ensure_contiguous(scale_k_.value())) : std::nullopt;
-    std::optional<at::Tensor> scale_v = scale_v_.has_value()
-        ? std::optional<at::Tensor>(ensure_contiguous(scale_v_.value())) : std::nullopt;
-    if (is_mxfp) {
-        TORCH_CHECK(scale_q.has_value() && scale_k.has_value() && scale_v.has_value(),
-            "MXFP (fp8/fp4) forward currently requires scale_q, scale_k and scale_v tensors.");
     }
 
     cutlass_fmha_fwd_fix_impl(
@@ -206,13 +164,12 @@ mha_fwd(
         is_causal, is_local,
         p_dropout, philox_seed, philox_offset, nullptr,
         return_softmax ? S_dmask.data_ptr() : nullptr,
-        seqlen_q_rounded, seqlen_k_rounded,
-        scale_q, scale_k, scale_v);
+        seqlen_q_rounded, seqlen_k_rounded);
 
-    // Strip padding from output back to original (unpacked) head_size
+    // Strip padding from output back to original head_size
     at::Tensor out = needs_padding
         ? out_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
-                            torch::indexing::Slice(), torch::indexing::Slice(0, head_size_actual)})
+                            torch::indexing::Slice(), torch::indexing::Slice(0, head_size_og)})
                     .contiguous()
         : ensure_contiguous(out_padded);
 
@@ -429,12 +386,7 @@ mha_varlen_fwd(
               int window_size_right,
               const float softcap,
               const bool return_softmax,
-              std::optional<at::Generator> gen_,
-              std::optional<at::Tensor> scale_q_ = std::nullopt,
-              std::optional<at::Tensor> scale_k_ = std::nullopt,
-              std::optional<at::Tensor> scale_v_ = std::nullopt,
-              std::optional<at::Tensor> cu_scale_q_ = std::nullopt,
-              std::optional<at::Tensor> cu_scale_kv_ = std::nullopt) {
+              std::optional<at::Generator> gen_) {
 
     auto device_idx = q.device().index();
     compat::select_device(device_idx);
@@ -452,40 +404,23 @@ mha_varlen_fwd(
     const int batch_size = cu_seqlens_q.numel() - 1;
 
     auto q_dtype = q.dtype();
-    const bool is_mxfp = (q_dtype == torch::kFloat8_e5m2 || q_dtype == torch::kFloat8_e4m3fn ||
-                          q_dtype == torch::kFloat4_e2m1fn_x2);
-    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16 || is_mxfp,
-                "FlashAttention only support fp16, bf16, fp8_e5m2, fp8_e4m3fn and fp4_e2m1fn_x2 data type");
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention only support fp16 and bf16 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(k.size(-1) == head_size_og, "Key head dimension must match Query head dimension");
-    if (!is_mxfp) {
-        TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
-        TORCH_CHECK(v.size(-1) == head_size_og, "Value head dimension must match Query head dimension");
-    } else if (q_dtype == torch::kFloat4_e2m1fn_x2) {
-        // MXFP4 (e2m1) consumes a BF16 value tensor; reject mismatches early
-        // instead of silently producing wrong results inside the kernel.
-        TORCH_CHECK(v.dtype() == torch::kBFloat16,
-                    "For fp4_e2m1fn_x2 query, value must be bf16");
-    } else {
-        // MXFP8 (e5m2 / e4m3fn) requires the value tensor to match the query fp8 dtype.
-        TORCH_CHECK(v.dtype() == q_dtype,
-                    "For fp8 query, value must have the same fp8 dtype as query");
-    }
-    // For FP4 (e2m1) the head dimension is packed (2 values per byte); unpack for padding math.
-    const int head_size_actual = (q_dtype == torch::kFloat4_e2m1fn_x2) ? head_size_og * 2 : head_size_og;
-    TORCH_CHECK(head_size_actual <= 256 || head_size_actual == 512,
-                "FlashAttention XPU varlen only supports head dimension up to 256 or exactly 512. Got: " + std::to_string(head_size_actual));
+    TORCH_CHECK(v.size(-1) == head_size_og, "Value head dimension must match Query head dimension");
+    TORCH_CHECK(head_size_og <= 256 || head_size_og == 512,
+                "FlashAttention XPU varlen only supports head dimension up to 256 or exactly 512. Got: " + std::to_string(head_size_og));
 
     CHECK_DEVICE(q);
     CHECK_DEVICE(k);
     CHECK_DEVICE(v);
 
-    // XPU requires head_size to be a multiple of 32.
-    // FP4 packed inputs are consumed in their packed layout and are not padded.
-    const int head_size_padded = round_multiple(head_size_actual, 32);
-    const bool needs_padding = (head_size_actual != head_size_padded)
-                             && (q_dtype != torch::kFloat4_e2m1fn_x2);
-    const int pad_size = head_size_padded - head_size_actual;
+    // XPU requires head_size to be a multiple of 32
+    const int head_size_padded = round_multiple(head_size_og, 32);
+    const bool needs_padding = (head_size_og != head_size_padded);
+    const int pad_size = head_size_padded - head_size_og;
 
     auto maybe_pad = [&](const at::Tensor& t) -> at::Tensor {
         return needs_padding
@@ -497,28 +432,11 @@ mha_varlen_fwd(
     at::Tensor k_padded = maybe_pad(k);
     at::Tensor v_padded = maybe_pad(v);
 
-    auto out_dtype = is_mxfp ? torch::kFloat32 : c10::typeMetaToScalarType(q_dtype);
-    at::Tensor out_padded;
-    if (out_.has_value()) {
-        // The kernel writes out_dtype elements; a mismatched buffer would be
-        // overrun (MXFP writes float32 into what may be a half-width tensor).
-        TORCH_CHECK(out_.value().scalar_type() == out_dtype,
-                    "out must have dtype ", out_dtype, ", got ", out_.value().scalar_type());
-        out_padded = maybe_pad(out_.value());
-    } else if (is_mxfp) {
-        out_padded = torch::zeros({total_q, num_heads, head_size_padded},
-                                  q_padded.options().dtype(out_dtype));
-    } else {
-        out_padded = torch::zeros_like(q_padded);
-    }
+    at::Tensor out_padded = out_.has_value() ? maybe_pad(out_.value())
+                                             : torch::zeros_like(q_padded);
 
     const bool is_local = (window_size_left != -1) || (window_size_right != -1);
     const bool is_paged = block_table_.has_value() && block_table_->defined();
-    // policy_dispatch() only routes MXFP on the non-paged / non-rotary paths; any
-    // other combination silently falls through to the bf16 dispatcher and would
-    // reinterpret the fp8/fp4 bytes as bf16. Reject it here instead.
-    TORCH_CHECK(!(is_mxfp && is_paged),
-                "MXFP (fp8/fp4) forward does not support paged KV (block_table).");
 
     q_padded = ensure_contiguous(q_padded);
     k_padded = ensure_contiguous(k_padded);
@@ -543,7 +461,7 @@ mha_varlen_fwd(
         rng_state[1] = static_cast<int64_t>(philox_offset);
     }
 
-    const int q_tile_size = (head_size_actual <= 32) ? 64 : (head_size_actual <= 128) ? 128 : 256;
+    const int q_tile_size = (head_size_og <= 32) ? 64 : (head_size_og <= 128) ? 128 : 256;
     const int k_tile_size = (max_seqlen_q == 1 && !is_paged) ? 512 : 128;
     const int seqlen_q_rounded = round_multiple(max_seqlen_q, q_tile_size);
     const int seqlen_k_rounded = round_multiple(max_seqlen_k, k_tile_size);
@@ -553,22 +471,6 @@ mha_varlen_fwd(
         S_dmask = torch::empty({batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded}, q.options());
     } else {
         S_dmask = torch::empty({0}, q.options());
-    }
-
-    // MXFP (block-scaled) scale factor tensors (optional; required for fp8/fp4).
-    std::optional<at::Tensor> scale_q = scale_q_.has_value()
-        ? std::optional<at::Tensor>(ensure_contiguous(scale_q_.value())) : std::nullopt;
-    std::optional<at::Tensor> scale_k = scale_k_.has_value()
-        ? std::optional<at::Tensor>(ensure_contiguous(scale_k_.value())) : std::nullopt;
-    std::optional<at::Tensor> scale_v = scale_v_.has_value()
-        ? std::optional<at::Tensor>(ensure_contiguous(scale_v_.value())) : std::nullopt;
-    std::optional<at::Tensor> cu_scale_q = cu_scale_q_.has_value()
-        ? std::optional<at::Tensor>(ensure_contiguous(cu_scale_q_.value())) : std::nullopt;
-    std::optional<at::Tensor> cu_scale_kv = cu_scale_kv_.has_value()
-        ? std::optional<at::Tensor>(ensure_contiguous(cu_scale_kv_.value())) : std::nullopt;
-    if (is_mxfp) {
-        TORCH_CHECK(scale_q.has_value() && scale_k.has_value() && scale_v.has_value(),
-            "MXFP (fp8/fp4) varlen forward currently requires scale_q, scale_k and scale_v tensors.");
     }
 
     cutlass_fmha_fwd_varlen_impl(
@@ -583,13 +485,12 @@ mha_varlen_fwd(
         true, is_paged, is_causal, is_local,
         p_dropout, philox_seed, philox_offset, nullptr,
         return_softmax ? S_dmask.data_ptr() : nullptr,
-        seqlen_q_rounded, seqlen_k_rounded,
-        scale_q, scale_k, scale_v, cu_scale_q, cu_scale_kv);
+        seqlen_q_rounded, seqlen_k_rounded);
 
-    // Strip padding from output back to original (unpacked) head_size
+    // Strip padding from output back to original head_size
     at::Tensor out = needs_padding
         ? out_padded.index({torch::indexing::Slice(), torch::indexing::Slice(),
-                            torch::indexing::Slice(0, head_size_actual)})
+                            torch::indexing::Slice(0, head_size_og)})
                     .contiguous()
         : ensure_contiguous(out_padded);
 
@@ -1037,13 +938,7 @@ mha_fwd(
     const int64_t window_size_right,
     const double softcap, 
     const bool return_softmax,
-    c10::optional<at::Generator> gen_,
-    c10::optional<torch::Tensor> scale_q_,
-    c10::optional<torch::Tensor> scale_k_,
-    c10::optional<torch::Tensor> scale_v_) {
-    auto to_std = [](const c10::optional<at::Tensor>& o) -> std::optional<at::Tensor> {
-        return o.has_value() ? std::optional<at::Tensor>(o.value()) : std::nullopt;
-    };
+    c10::optional<at::Generator> gen_) {
     return FLASH_NAMESPACE::mha_fwd(
       q, 
       k, 
@@ -1057,10 +952,7 @@ mha_fwd(
       static_cast<int>(window_size_right),
       static_cast<float>(softcap), 
       return_softmax,
-      gen_,
-      to_std(scale_q_),
-      to_std(scale_k_),
-      to_std(scale_v_)
+      gen_
     );
 }
 
@@ -1149,12 +1041,7 @@ mha_varlen_fwd(
     int64_t window_size_right,
     const double softcap,
     const bool return_softmax,
-    std::optional<at::Generator> gen_,
-    std::optional<torch::Tensor> scale_q_,
-    std::optional<torch::Tensor> scale_k_,
-    std::optional<torch::Tensor> scale_v_,
-    std::optional<torch::Tensor> cu_scale_q_,
-    std::optional<torch::Tensor> cu_scale_kv_) {    
+    std::optional<at::Generator> gen_) {    
     return FLASH_NAMESPACE::mha_varlen_fwd(
         const_cast<at::Tensor &>(q), 
         k, 
@@ -1178,12 +1065,7 @@ mha_varlen_fwd(
         static_cast<int>(window_size_right),
         static_cast<float>(softcap),
         return_softmax,
-        gen_,
-        scale_q_,
-        scale_k_,
-        scale_v_,
-        cu_scale_q_,
-        cu_scale_kv_
+        gen_
     );
 }
 

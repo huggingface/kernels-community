@@ -61,28 +61,12 @@ struct fmha_fwd_args_t {
   void* rotary_sin = nullptr;
   int rotary_dim = 0;
   bool is_rotary_interleaved = true;
-
-  // Scale tensors for MXFP (block-scaled) operations
-  void* scale_q = nullptr;
-  void* scale_k = nullptr;
-  void* scale_v = nullptr;
-  void* cu_scale_q = nullptr;
-  void* cu_scale_kv = nullptr;
-  // Scalar scales for F8 KV with F16 MMA path
-  float scale_k_scalar = 1.0f;
-  float scale_v_scalar = 1.0f;
 };
 
 enum class CutlassType {
   half,
-  bfloat16,
-  mx_float_e5m2,   // MXFP8 E5M2
-  mx_float_e4m3,   // MXFP8 E4M3
-  mx_float_e2m1    // MXFP4 E2M1
+  bfloat16
 };
 
 constexpr int PipelineStages_Decode = 1;
 constexpr int PipelineStages_Prefill = 2;
-
-// Scale group size for block-scaled (MXFP) operations
-constexpr int GROUP_SIZE = 32;
