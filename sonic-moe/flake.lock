@@ -41,16 +41,15 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1785751197,
-        "narHash": "sha256-VnQJ974htbWFxn6uh/G2RQx0V4ZAmS/hIberVzdvE5c=",
+        "lastModified": 1785782967,
+        "narHash": "sha256-5Esv3PsgzKfP6I3Te1n4Ge4kQG69WQETPJoxGB9WKpk=",
         "owner": "huggingface",
         "repo": "kernels",
-        "rev": "10fb3c2a391af73810a59e865c2e9ee07f3ae113",
+        "rev": "a6564d1f481adcbd3273099c0f4432e7b833e846",
         "type": "github"
       },
       "original": {
         "owner": "huggingface",
-        "ref": "nvidia-cutlass-dsl-4.6.1",
         "repo": "kernels",
         "type": "github"
       }

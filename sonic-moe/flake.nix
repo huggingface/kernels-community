@@ -2,7 +2,7 @@
   description = "Flake for sonic-moe kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/nvidia-cutlass-dsl-4.6.1";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
