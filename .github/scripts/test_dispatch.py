@@ -1,5 +1,6 @@
 import io
 import os
+import subprocess
 import sys
 import urllib.error
 from unittest import mock
@@ -26,8 +27,15 @@ def _workflows(actions):
 
 
 def _select(backends):
-    with mock.patch.object(dispatch, "read_backends", return_value=backends):
-        return dispatch.select_workflows("somekernel", notes=[])
+    return dispatch.select_workflows("somekernel", backends, notes=[])
+
+
+def _build_actions(plan):
+    return [a for a in plan.actions if a.kind == "build"]
+
+
+def _backends_csv(action):
+    return sorted(b for b in action.body["inputs"]["backends"].split(",") if b)
 
 
 # Fallback routing when build.toml is unreadable or declares unknown backends.
@@ -65,6 +73,32 @@ def test_security_only_plans_only_security():
         assert action.dispatch_key.startswith("pr42-security-")
         assert action.body["inputs"]["pr_number"] == "42"
         assert action.body["inputs"]["head_sha"] == "deadbeef"
+
+
+# Metadata read from a git ref (PR branch) instead of the working tree.
+
+
+def test_read_backends_from_ref_uses_git_show():
+    run = mock.Mock(return_value=mock.Mock(stdout='backends = ["cuda", "rocm"]\n'))
+    with mock.patch.object(dispatch.subprocess, "run", run):
+        backends = dispatch.read_backends("somekernel", ref="abc123")
+    assert backends == ["cuda", "rocm"]
+    assert run.call_args.args[0] == ["git", "show", "abc123:somekernel/build.toml"]
+
+
+def test_read_backends_from_ref_missing_returns_none():
+    err = subprocess.CalledProcessError(128, ["git", "show"])
+    with mock.patch.object(dispatch.subprocess, "run", side_effect=err):
+        assert dispatch.read_backends("missing", ref="abc123") is None
+
+
+def test_metadata_ref_routes_metal_less_kernel_without_mac_build():
+    # Regression: a cuda-only kernel read from the ref must not trigger build-mac.yaml.
+    run = mock.Mock(return_value=mock.Mock(stdout='backends = ["cuda"]\n'))
+    with mock.patch.object(dispatch.subprocess, "run", run):
+        plan = dispatch.plan_dispatch("newkernel", metadata_ref="prsha")
+    builds = _workflows([a for a in plan.actions if a.kind == "build"])
+    assert builds == ["build.yaml"]
 
 
 # Orchestration: kernel-name validation and the dry-run no-I/O contract.
@@ -117,6 +151,79 @@ def test_records_http_failure():
     assert [code for _, code in result.failed] == [500]
 
 
+# parse_kernel_arg: the `kernel` / `kernel[b1,b2]` argument grammar.
+@pytest.mark.parametrize(
+    "token, expected",
+    [
+        ("flash-attn2", ("flash-attn2", None)),
+        ("flash-attn2[xpu,cpu]", ("flash-attn2", ["xpu", "cpu"])),
+        ("relu[cpu]", ("relu", ["cpu"])),
+        # Unknown backends parse here; the caller rejects them by name.
+        ("flash-attn2[bogus]", ("flash-attn2", ["bogus"])),
+        ("bad/name", (None, None)),
+        ("kernel[]", (None, None)),  # empty scope is not valid
+        ("kernel[,]", (None, None)),  # dangling comma is not valid
+        ("kernel[cpu,]", (None, None)),
+    ],
+)
+def test_parse_kernel_arg(token, expected):
+    assert dispatch.parse_kernel_arg(token) == expected
+
+
+# requested_backends: user-supplied filter narrows workflows and the scoped CSV.
+def test_requested_backends_filter_narrows_workflows_and_scope():
+    plan = _plan(
+        backends=["cpu", "cuda", "xpu"], requested_backends=["xpu", "cpu"]
+    )
+    build = _build_actions(plan)
+    # cuda dropped -> Windows gated off for the non-allowlisted kernel -> Linux only.
+    assert _workflows(build) == ["build.yaml"]
+    assert _backends_csv(build[0]) == ["cpu", "xpu"]
+
+
+def test_requested_backends_undeclared_are_dropped():
+    plan = _plan(backends=["cpu", "cuda"], requested_backends=["cpu", "rocm"])
+    build = _build_actions(plan)
+    assert _backends_csv(build[0]) == ["cpu"]  # rocm not declared -> dropped
+
+
+def test_requested_backends_none_match_skips_all_builds():
+    plan = _plan(backends=["cpu", "cuda"], requested_backends=["rocm"])
+    assert _build_actions(plan) == []
+    assert plan.skipped == sorted(dispatch.WORKFLOWS["build"])
+    assert any("skipping build" in n for n in plan.notes)
+
+
+def test_requested_backends_thread_through_dispatch_dry_run():
+    with mock.patch.object(
+        dispatch, "read_backends", return_value=["cpu", "cuda", "xpu"]
+    ):
+        result = dispatch.dispatch(
+            "somekernel",
+            token="",
+            repo="owner/repo",
+            dry_run=True,
+            requested_backends=["xpu"],
+        )
+    csvs = [body["inputs"]["backends"] for _, body in result.dry_run_payloads]
+    assert csvs, "expected at least one dispatched build"
+    assert all("cuda" not in c.split(",") for c in csvs)
+    assert any("xpu" in c.split(",") for c in csvs)
+
+
+def test_bot_comment_id_threads_to_build_inputs_only_when_set():
+    without = _build_actions(_plan(backends=["cuda"]))
+    assert all("bot_comment_id" not in a.body["inputs"] for a in without)
+
+    with_id = _build_actions(_plan(backends=["cuda"], bot_comment_id="12345"))
+    assert all(a.body["inputs"]["bot_comment_id"] == "12345" for a in with_id)
+
+    no_upload = _build_actions(
+        _plan(backends=["cuda"], upload=False, bot_comment_id="12345")
+    )
+    assert all("bot_comment_id" not in a.body["inputs"] for a in no_upload)
+
+
 # select_workflows: backend-union and Windows-gate cases (single-backend rows omitted).
 ROUTING_TRUTH_TABLE = [
     (["cuda"], False, {"build.yaml"}),
@@ -131,11 +238,8 @@ ROUTING_TRUTH_TABLE = [
 def test_truth_table(backends, windows_allowed, expected):
     kernel = "k"
     allowlist = {kernel} if windows_allowed else set()
-    with (
-        mock.patch.object(dispatch, "read_backends", return_value=backends),
-        mock.patch.object(dispatch, "WINDOWS_KERNELS", allowlist),
-    ):
-        assert dispatch.select_workflows(kernel, notes=[]) == expected
+    with mock.patch.object(dispatch, "WINDOWS_KERNELS", allowlist):
+        assert dispatch.select_workflows(kernel, backends, notes=[]) == expected
 
 
 # Invariants over every real kernel: assert properties, not exact per-kernel output.
@@ -177,7 +281,7 @@ def test_every_build_toml_parses(kernels):
 def test_every_kernel_routes_to_at_least_one_known_build(kernels):
     build_workflows = set(dispatch.WORKFLOWS["build"])
     for kernel in kernels:
-        workflows = dispatch.select_workflows(kernel, notes=[])
+        workflows = dispatch.select_workflows(kernel, dispatch.read_backends(kernel), notes=[])
         assert workflows, f"{kernel} routes to no build workflow"
         assert workflows <= build_workflows, (
             f"{kernel} routes to unknown workflow(s): {workflows - build_workflows}"

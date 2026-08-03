@@ -252,6 +252,82 @@ liger_rotary_pos_emb.can_torch_compile = True
 LigerForCausalLMLoss.can_torch_compile = True
 
 
+class liger_rotary_pos_emb_layer(nn.Module):
+    can_torch_compile = True
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        unsqueeze_dim: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply standard rotary positional embedding to ``q`` and ``k``."""
+        return LigerRopeFunction.apply(q, k, cos, sin, None, unsqueeze_dim)
+
+
+class LigerForCausalLMLossLayer(nn.Module):
+    can_torch_compile = True
+
+    # NOTE: We have this intentional graph break as we encounter issues such as IMAs and Cublas errors.
+    #       We know that this is an optimized kernel already so there is less ways to
+    #       fuse it either way; we rely on torch compile to go through the base model to optimize.
+    @torch.compiler.disable
+    def forward(
+        self,
+        logits: None,  # to match transformers signature
+        labels: torch.Tensor,
+        vocab_size: int,  # to match transformers signature
+        num_items_in_batch: Optional[int] = None,
+        ignore_index: int = -100,
+        shift_labels: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor | None = None,
+        lm_head_weight: torch.Tensor | None = None,
+        lm_head_bias: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        # To match signature we hide these behind the kwargs but we expect a few kwargs to exist
+        hidden_size = kwargs.pop("hidden_size", None)
+        final_logit_softcapping = kwargs.pop("final_logit_softcapping", None)
+
+        if hidden_size is None or hidden_states is None or lm_head_weight is None:
+            raise ValueError(
+                f"`LigerForCausalLMLoss` requires the LLM's weight (found `{lm_head_weight is not None}`),"
+                f"the last hidden state (found `{hidden_states is not None}`), and the `hidden_size`"
+                f"(found `{hidden_size is not None}`). Please make sure to pass the necessary kwargs."
+            )
+
+        applicable_params = inspect.signature(liger_fused_linear_cross_entropy).parameters
+        kwargs = {k: v for k, v in kwargs.items() if k in applicable_params}
+
+        if shift_labels is None:
+            labels = nn.functional.pad(labels, (0, 1), value=ignore_index)
+            shift_labels = labels[..., 1:].contiguous()
+
+        hidden_states = hidden_states.view(-1, hidden_size)
+        shift_labels = shift_labels.view(-1).to(hidden_states.device)
+
+        reduction = "sum" if num_items_in_batch is not None else "mean"
+        loss = liger_fused_linear_cross_entropy(
+            hidden_states,
+            lm_head_weight,
+            shift_labels,
+            bias=lm_head_bias,
+            reduction=reduction,
+            ignore_index=ignore_index,
+            softcap=final_logit_softcapping,
+            return_token_accuracy=False,
+            return_predicted_tokens=False,
+            **kwargs,
+        )
+
+        if reduction == "sum":
+            loss = loss / num_items_in_batch
+
+        return loss
+
+
 __all__ = [
     "LigerRMSNorm",
     "LigerLinear",
@@ -260,5 +336,7 @@ __all__ = [
     "LigerTiledSwiGLUMLP",
     "LigerTiledGEGLUMLP",
     "liger_rotary_pos_emb",
+    "liger_rotary_pos_emb_layer",
     "LigerForCausalLMLoss",
+    "LigerForCausalLMLossLayer",
 ]

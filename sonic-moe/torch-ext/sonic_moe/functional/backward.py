@@ -222,6 +222,7 @@ def _down_projection_backward_act(
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
     s_scatter_idx: torch.Tensor,
+    s_reverse_scatter_idx: torch.Tensor,
     activation_type: str,
 ) -> None:
     assert activation_type in (
@@ -243,21 +244,20 @@ def _down_projection_backward_act(
         A_idx=x_gather_idx,
         dynamic_scheduler=False,
     )
-    ds[s_scatter_idx] = ds_scattered
-
     if db2 is None:
-        ds[s_scatter_idx] = ds_scattered
+        _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, ds)
     else:
         H = w2.size(0)
         E = expert_frequency_offset.size(0) - 1
         TK = x_gather_idx.size(0)
 
         old_ds_partial = torch.empty(TK, 1, device=ds_scattered.device, dtype=ds_scattered.dtype)
-        old_ds_partial[s_scatter_idx, 0] = ds_scattered
+        _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, old_ds_partial)
 
         BLOCK_H = min(triton.next_power_of_2(H), 2048)
         NUM_H_BLOCKS = triton.cdiv(H, BLOCK_H)
-        new_ds_partial = torch.empty(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
+        # Zero-init: the kernel below skips sentinel slots, and `ds` is copied from this buffer whole.
+        new_ds_partial = torch.zeros(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
 
         db2_and_ds_kernel[(E, NUM_H_BLOCKS)](
             dout,
