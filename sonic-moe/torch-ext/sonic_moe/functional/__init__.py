@@ -266,6 +266,7 @@ class _DownProjection(torch.autograd.Function):
             expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
+            s_reverse_scatter_idx,
         )
 
         return o
@@ -285,6 +286,7 @@ class _DownProjection(torch.autograd.Function):
             expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
+            s_reverse_scatter_idx,
         ) = ctx.saved_tensors
 
         dw2 = torch.empty_like(w2)
@@ -310,6 +312,7 @@ class _DownProjection(torch.autograd.Function):
             expert_frequency_offset=expert_frequency_offset,
             x_gather_idx=x_gather_idx,
             s_scatter_idx=s_scatter_idx,
+            s_reverse_scatter_idx=s_reverse_scatter_idx,
             activation_type=activation_type.value,
         )
 
