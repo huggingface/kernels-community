@@ -26,6 +26,10 @@ class mamba_inner_fn(nn.Module):
         D: torch.Tensor | None = None,
         delta_bias: torch.Tensor | None = None,
         delta_softplus: bool = True,
+        b_rms_weight: torch.Tensor | None = None,
+        c_rms_weight: torch.Tensor | None = None,
+        dt_rms_weight: torch.Tensor | None = None,
+        b_c_dt_rms_eps: float = 1e-6,
         **kwargs,
     ):
         return cuda_mamba_inner_fn(
@@ -42,6 +46,10 @@ class mamba_inner_fn(nn.Module):
             D,
             delta_bias=delta_bias,
             delta_softplus=delta_softplus,
+            b_rms_weight=b_rms_weight,
+            c_rms_weight=c_rms_weight,
+            dt_rms_weight=dt_rms_weight,
+            b_c_dt_rms_eps=b_c_dt_rms_eps,
         )
 
 
