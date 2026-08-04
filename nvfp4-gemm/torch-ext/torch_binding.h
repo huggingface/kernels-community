@@ -1,25 +1,28 @@
 #pragma once
 
-#include <torch/torch.h>
+#include <tuple>
 
-std::tuple<torch::Tensor, torch::Tensor> scaled_fp4_quant(
-    torch::Tensor const& input, torch::Tensor const& input_global_scale,
+#include <torch/csrc/stable/tensor.h>
+
+using nvfp4_tensor = torch::stable::Tensor;
+
+std::tuple<nvfp4_tensor, nvfp4_tensor> scaled_fp4_quant(
+    nvfp4_tensor const& input, nvfp4_tensor const& input_global_scale,
     bool is_sf_swizzled_layout);
 
-torch::Tensor cutlass_scaled_fp4_mm(torch::Tensor const& A,
-                                    torch::Tensor const& B,
-                                    torch::Tensor const& A_sf,
-                                    torch::Tensor const& B_sf,
-                                    torch::Tensor const& alpha);
+nvfp4_tensor cutlass_scaled_fp4_mm(nvfp4_tensor const& A,
+                                   nvfp4_tensor const& B,
+                                   nvfp4_tensor const& A_sf,
+                                   nvfp4_tensor const& B_sf,
+                                   nvfp4_tensor const& alpha);
 
-torch::Tensor nvfp4_gemv(torch::Tensor const& A, torch::Tensor const& B,
-                         torch::Tensor const& B_sf, torch::Tensor const& alpha);
+nvfp4_tensor nvfp4_gemv(nvfp4_tensor const& A, nvfp4_tensor const& B,
+                        nvfp4_tensor const& B_sf, nvfp4_tensor const& alpha);
 
-torch::Tensor nvfp4_gemv_swiglu(torch::Tensor const& A, torch::Tensor const& B,
-                                torch::Tensor const& B_sf,
-                                torch::Tensor const& alpha);
+nvfp4_tensor nvfp4_gemv_swiglu(nvfp4_tensor const& A, nvfp4_tensor const& B,
+                               nvfp4_tensor const& B_sf,
+                               nvfp4_tensor const& alpha);
 
-torch::Tensor nvfp4_gemv_gated(torch::Tensor const& A, torch::Tensor const& G,
-                               torch::Tensor const& B,
-                               torch::Tensor const& B_sf,
-                               torch::Tensor const& alpha);
+nvfp4_tensor nvfp4_gemv_gated(nvfp4_tensor const& A, nvfp4_tensor const& G,
+                              nvfp4_tensor const& B, nvfp4_tensor const& B_sf,
+                              nvfp4_tensor const& alpha);

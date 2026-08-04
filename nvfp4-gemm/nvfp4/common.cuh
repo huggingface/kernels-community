@@ -1,23 +1,53 @@
 #pragma once
 
-// Classic-torch replacements for the vLLM `libtorch_stable` helper headers
+// Stable-ABI replacements for the vLLM `libtorch_stable` helper headers
 // (torch_utils.h, cutlass_extensions/common.hpp, core/math.hpp) used by the
 // vendored NVFP4 kernels.
 // Helper signatures mirror vLLM (https://github.com/vllm-project/vllm, Apache-2.0).
 
-#include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Exception.h>
+#include <torch/headeronly/util/Half.h>
+#include <torch/headeronly/util/shim_utils.h>
+
+// The shim's stream accessor is guarded by USE_CUDA, so declare it here.
+#include <torch/csrc/inductor/aoti_torch/c/shim.h>
+extern "C" AOTITorchError aoti_torch_get_current_cuda_stream(
+    int32_t device_index, void** ret_stream);
+
+#include <cuda_runtime.h>
 
 #include <climits>
 #include <cstdint>
 
-#define CUTLASS_CHECK(status)                                 \
-  {                                                           \
-    cutlass::Status error = status;                           \
-    TORCH_CHECK(error == cutlass::Status::kSuccess,           \
-                cutlassGetStatusString(error));               \
+using torch::headeronly::ScalarType;
+
+// Not `using torch::stable::Tensor`: the CUTLASS translation units pull in
+// `using namespace cute`, where an unqualified `Tensor` is ambiguous.
+using nvfp4_tensor = torch::stable::Tensor;
+
+namespace tsa = torch::stable::accelerator;
+
+#define CUTLASS_CHECK(status)                              \
+  {                                                        \
+    cutlass::Status error = status;                         \
+    STD_TORCH_CHECK(error == cutlass::Status::kSuccess,     \
+                    cutlassGetStatusString(error));         \
   }
+
+// Stable-ABI equivalent of `at::cuda::getCurrentCUDAStream()`: the current
+// stream of the active device. Call sites hold a DeviceGuard for the operand's
+// device, so this is that tensor's stream.
+inline cudaStream_t get_current_cuda_stream() {
+  void* stream = nullptr;
+  TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(
+      static_cast<int32_t>(tsa::getCurrentDeviceIndex()), &stream));
+  return static_cast<cudaStream_t>(stream);
+}
 
 inline int32_t get_sm_version_num() {
   int device;
@@ -48,11 +78,21 @@ inline int get_device_attribute(cudaDeviceAttr attr, int device) {
   return value;
 }
 
-// Classic-ATen replacement for vLLM's stable dispatch macro (defines
-// `scalar_t` for Half and BFloat16 cases).
-#define VLLM_STABLE_DISPATCH_HALF_TYPES(TYPE, NAME, ...)         \
-  AT_DISPATCH_SWITCH(TYPE, NAME,                                 \
-                     AT_DISPATCH_CASE(at::ScalarType::Half,      \
-                                      __VA_ARGS__)               \
-                     AT_DISPATCH_CASE(at::ScalarType::BFloat16,  \
-                                      __VA_ARGS__))
+// Dispatch over the half types without ATen's AT_DISPATCH machinery (defines
+// `scalar_t` for the Half and BFloat16 cases).
+#define VLLM_STABLE_DISPATCH_HALF_TYPES(TYPE, NAME, ...)                     \
+  [&] {                                                                      \
+    const ScalarType _st = TYPE;                                             \
+    switch (_st) {                                                           \
+      case ScalarType::Half: {                                               \
+        using scalar_t = c10::Half;                                          \
+        return __VA_ARGS__();                                                \
+      }                                                                      \
+      case ScalarType::BFloat16: {                                           \
+        using scalar_t = c10::BFloat16;                                      \
+        return __VA_ARGS__();                                                \
+      }                                                                      \
+      default:                                                               \
+        STD_TORCH_CHECK(false, NAME, " not implemented for dtype ", _st);    \
+    }                                                                        \
+  }()

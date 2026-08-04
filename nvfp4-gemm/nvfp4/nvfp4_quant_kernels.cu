@@ -1,6 +1,6 @@
 // Adapted from vLLM: csrc/libtorch_stable/quantization/fp4/nvfp4_quant_kernels.cu
-// https://github.com/vllm-project/vllm (Apache-2.0). Local changes: ported from the
-// stable-ABI torch API to classic torch; PDL intrinsics removed; dense subset only.
+// https://github.com/vllm-project/vllm (Apache-2.0). Local changes: PDL intrinsics
+// removed; dense subset only.
 /*
  * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -174,21 +174,21 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
 
 }  // namespace vllm
 
-void scaled_fp4_quant_sm1xxa(torch::Tensor const& output,
-                             torch::Tensor const& input,
-                             torch::Tensor const& output_sf,
-                             torch::Tensor const& input_sf,
+void scaled_fp4_quant_sm1xxa(nvfp4_tensor const& output,
+                             nvfp4_tensor const& input,
+                             nvfp4_tensor const& output_sf,
+                             nvfp4_tensor const& input_sf,
                              bool is_sf_swizzled_layout) {
   int32_t m = input.size(0);
   int32_t n = input.size(1);
   int32_t output_n = output.size(1) * 2;
 
-  TORCH_CHECK(n % 16 == 0, "The N dimension must be multiple of 16.");
-  TORCH_CHECK(output_n % 16 == 0,
+  STD_TORCH_CHECK(n % 16 == 0, "The N dimension must be multiple of 16.");
+  STD_TORCH_CHECK(output_n % 16 == 0,
                   "The output tensor width must be a multiple of 16.");
-  TORCH_CHECK(
-      input.scalar_type() == at::ScalarType::Half ||
-          input.scalar_type() == at::ScalarType::BFloat16,
+  STD_TORCH_CHECK(
+      input.scalar_type() == ScalarType::Half ||
+          input.scalar_type() == ScalarType::BFloat16,
       "Unsupported input data type for quantize_to_fp4.");
 
   int multiProcessorCount =
@@ -197,9 +197,8 @@ void scaled_fp4_quant_sm1xxa(torch::Tensor const& output,
   auto input_sf_ptr = static_cast<float const*>(input_sf.data_ptr());
   auto sf_out = static_cast<int32_t*>(output_sf.data_ptr());
   auto output_ptr = static_cast<int64_t*>(output.data_ptr());
-  const at::cuda::CUDAGuard device_guard(
-      input.device());
-  auto stream = at::cuda::getCurrentCUDAStream();
+  const tsa::DeviceGuard device_guard(input.get_device_index());
+  auto stream = get_current_cuda_stream();
 
   int output_sf_n_unpadded = int(output_n / CVT_FP4_SF_VEC_SIZE);
 

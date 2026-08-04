@@ -1,4 +1,4 @@
-VARIANT ?= torch213-cxx11-cu130-x86_64-linux
+VARIANT ?= torch-stable-abi210-cu130-x86_64-linux
 
 # Build only the local-hardware variant for fast iteration.
 dev:

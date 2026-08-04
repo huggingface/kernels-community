@@ -173,47 +173,49 @@ namespace {
 using vllm::nvfp4_gemv::Mode;
 
 template <Mode MODE>
-torch::Tensor gemv_run(torch::Tensor const& A, torch::Tensor const* G,
-                       torch::Tensor const& B, torch::Tensor const& B_sf,
-                       torch::Tensor const& alpha) {
-  TORCH_CHECK(A.is_cuda() && B.is_cuda() && B_sf.is_cuda(), "inputs must be CUDA");
-  TORCH_CHECK(A.dim() == 2, "A must be 2-D");
-  TORCH_CHECK(A.scalar_type() == at::ScalarType::BFloat16, "A must be bf16");
-  TORCH_CHECK(A.is_contiguous() && B.is_contiguous() && B_sf.is_contiguous(),
-              "inputs must be contiguous");
-  TORCH_CHECK(B.scalar_type() == at::ScalarType::Byte, "B must be uint8 packed");
-  TORCH_CHECK(B_sf.scalar_type() == at::ScalarType::Byte,
-              "B_sf must be uint8 (fp8-e4m3 bits, row-major [N, K/16])");
-  TORCH_CHECK(alpha.scalar_type() == at::ScalarType::Float, "alpha must be fp32");
-  TORCH_CHECK(alpha.is_contiguous(), "alpha must be contiguous");
+nvfp4_tensor gemv_run(nvfp4_tensor const& A, nvfp4_tensor const* G,
+                      nvfp4_tensor const& B, nvfp4_tensor const& B_sf,
+                      nvfp4_tensor const& alpha) {
+  STD_TORCH_CHECK(A.is_cuda() && B.is_cuda() && B_sf.is_cuda(),
+                  "inputs must be CUDA");
+  STD_TORCH_CHECK(A.dim() == 2, "A must be 2-D");
+  STD_TORCH_CHECK(A.scalar_type() == ScalarType::BFloat16, "A must be bf16");
+  STD_TORCH_CHECK(A.is_contiguous() && B.is_contiguous() && B_sf.is_contiguous(),
+                  "inputs must be contiguous");
+  STD_TORCH_CHECK(B.scalar_type() == ScalarType::Byte,
+                  "B must be uint8 packed");
+  STD_TORCH_CHECK(B_sf.scalar_type() == ScalarType::Byte,
+                  "B_sf must be uint8 (fp8-e4m3 bits, row-major [N, K/16])");
+  STD_TORCH_CHECK(alpha.scalar_type() == ScalarType::Float,
+                  "alpha must be fp32");
+  STD_TORCH_CHECK(alpha.is_contiguous(), "alpha must be contiguous");
 
   const int64_t M = A.size(0);
   const int64_t K = B.size(1) * 2;
   const int64_t N = B.size(0);
-  TORCH_CHECK(K % 32 == 0, "K must be a multiple of 32, got ", K);
-  TORCH_CHECK(A.size(1) == K, "A must have ", K, " columns, got ", A.size(1));
+  STD_TORCH_CHECK(K % 32 == 0, "K must be a multiple of 32, got ", K);
+  STD_TORCH_CHECK(A.size(1) == K, "A must have ", K, " columns, got ",
+                  A.size(1));
   if (MODE == Mode::kSwiGLUOut) {
-    TORCH_CHECK(N % 2 == 0, "concatenated gate/up weight needs even N");
+    STD_TORCH_CHECK(N % 2 == 0, "concatenated gate/up weight needs even N");
   }
   if (MODE == Mode::kGatedIn) {
-    TORCH_CHECK(G != nullptr && G->is_cuda() && G->is_contiguous() &&
-                    G->scalar_type() == at::ScalarType::BFloat16 &&
-                    G->sizes() == std::vector<int64_t>({M, K}),
-                "gate must be a contiguous bf16 [M, K] CUDA tensor");
+    STD_TORCH_CHECK(G != nullptr && G->is_cuda() && G->is_contiguous() &&
+                        G->scalar_type() == ScalarType::BFloat16 &&
+                        G->dim() == 2 && G->size(0) == M && G->size(1) == K,
+                    "gate must be a contiguous bf16 [M, K] CUDA tensor");
   }
-  TORCH_CHECK(B_sf.size(0) == N && B_sf.size(1) == K / 16,
-              "B_sf must be [N, K/16] row-major");
-  TORCH_CHECK(alpha.numel() == 1 || alpha.numel() == N,
-              "alpha must have 1 or N elements, got ", alpha.numel());
+  STD_TORCH_CHECK(B_sf.size(0) == N && B_sf.size(1) == K / 16,
+                  "B_sf must be [N, K/16] row-major");
+  STD_TORCH_CHECK(alpha.numel() == 1 || alpha.numel() == N,
+                  "alpha must have 1 or N elements, got ", alpha.numel());
   const int32_t sm = get_sm_version_num();
-  TORCH_CHECK(sm >= 100, "nvfp4_gemv requires sm100+, got sm", sm);
+  STD_TORCH_CHECK(sm >= 100, "nvfp4_gemv requires sm100+, got sm", sm);
 
-  const at::cuda::CUDAGuard device_guard(A.device());
+  const tsa::DeviceGuard device_guard(A.get_device_index());
   const int64_t n_out = MODE == Mode::kSwiGLUOut ? N / 2 : N;
-  auto D = torch::empty({M, n_out}, torch::TensorOptions()
-                                    .dtype(at::ScalarType::BFloat16)
-                                    .device(A.device()));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto D = torch::stable::new_empty(A, {M, n_out}, ScalarType::BFloat16);
+  const cudaStream_t stream = get_current_cuda_stream();
 
   auto kfn = vllm::nvfp4_gemv::gemv_kernel<MODE>;
   const int smem = (int)((K / 32) * vllm::nvfp4_gemv::XV_STRIDE * sizeof(uint4));
@@ -244,21 +246,19 @@ torch::Tensor gemv_run(torch::Tensor const& A, torch::Tensor const* G,
 
 }  // namespace
 
-torch::Tensor nvfp4_gemv(torch::Tensor const& A, torch::Tensor const& B,
-                         torch::Tensor const& B_sf,
-                         torch::Tensor const& alpha) {
+nvfp4_tensor nvfp4_gemv(nvfp4_tensor const& A, nvfp4_tensor const& B,
+                        nvfp4_tensor const& B_sf, nvfp4_tensor const& alpha) {
   return gemv_run<Mode::kPlain>(A, nullptr, B, B_sf, alpha);
 }
 
-torch::Tensor nvfp4_gemv_swiglu(torch::Tensor const& A, torch::Tensor const& B,
-                                torch::Tensor const& B_sf,
-                                torch::Tensor const& alpha) {
+nvfp4_tensor nvfp4_gemv_swiglu(nvfp4_tensor const& A, nvfp4_tensor const& B,
+                               nvfp4_tensor const& B_sf,
+                               nvfp4_tensor const& alpha) {
   return gemv_run<Mode::kSwiGLUOut>(A, nullptr, B, B_sf, alpha);
 }
 
-torch::Tensor nvfp4_gemv_gated(torch::Tensor const& A, torch::Tensor const& G,
-                               torch::Tensor const& B,
-                               torch::Tensor const& B_sf,
-                               torch::Tensor const& alpha) {
+nvfp4_tensor nvfp4_gemv_gated(nvfp4_tensor const& A, nvfp4_tensor const& G,
+                              nvfp4_tensor const& B, nvfp4_tensor const& B_sf,
+                              nvfp4_tensor const& alpha) {
   return gemv_run<Mode::kGatedIn>(A, &G, B, B_sf, alpha);
 }
