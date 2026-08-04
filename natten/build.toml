@@ -7,7 +7,7 @@ upstream = "https://github.com/SHI-Labs/NATTEN"
 backends = ["cuda"]
 
 [general.hub]
-repo-id = "shi-labs/natten"
+repo-id = "kernels-community/natten"
 
 [torch]
 src = ["torch-ext/torch_binding.cpp"]
