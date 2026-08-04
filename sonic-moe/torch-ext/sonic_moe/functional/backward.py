@@ -208,51 +208,6 @@ def _up_projection_backward_act(
 _up_projection_backward_act.compile_cache = {}
 
 
-@torch.library.custom_op(add_op_namespace_prefix("_up_projection_backward_weight"), mutates_args={"dw1"})
-def _up_projection_backward_weight(
-    x: torch.Tensor,
-    dw1: torch.Tensor,
-    dh: torch.Tensor,
-    expert_frequency_offset: torch.Tensor,
-    x_gather_idx: torch.Tensor,
-    is_glu_activation: bool,
-    concat_layout: bool = False,
-) -> None:
-    I, H, E = dw1.size()
-    if is_glu_activation:
-        I //= 2
-
-    gemm(
-        x.T,
-        dh,
-        out=dw1.permute(2, 1, 0),
-        cu_seqlens_k=expert_frequency_offset,
-        A_idx=x_gather_idx,
-        batch_idx_permute=None,
-        dynamic_scheduler=False,
-        concat_layout=(("out",) if concat_layout else None),
-    )
-
-
-_up_projection_backward_weight.compile_cache = {}
-
-
-def _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, out):
-    """Gather the colvec-reduce rows back to slot order.
-
-    The GEMM only covers the rows routed to a local expert, so under EP the tail of `ds_scattered` is
-    uninitialized. `s_reverse_scatter_idx` maps every slot either to its own row or to `TK` for a
-    sentinel, so gathering off a buffer with one appended zero row gives each slot its row or a 0: the
-    uninitialized tail is never addressed, and no slot is written twice. Without sentinels it is a
-    plain permutation. Only the general-routing metadata writes the `TK` marker; the bitmatrix path
-    never sees sentinels, so add the marker there too if that changes.
-    """
-    TK = s_reverse_scatter_idx.numel()
-    padded = torch.zeros(TK + 1, dtype=out.dtype, device=out.device)
-    padded[:TK].copy_(ds_scattered)
-    torch.index_select(padded, 0, s_reverse_scatter_idx, out=out.view(-1))
-
-
 @torch.library.custom_op(add_op_namespace_prefix("_down_projection_backward_act"), mutates_args={"dh", "ds", "db2", "a_prime"})
 def _down_projection_backward_act(
     dout: torch.Tensor,
@@ -267,7 +222,6 @@ def _down_projection_backward_act(
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
     s_scatter_idx: torch.Tensor,
-    s_reverse_scatter_idx: torch.Tensor,
     activation_type: str,
 ) -> None:
     assert activation_type in (
@@ -290,19 +244,18 @@ def _down_projection_backward_act(
         dynamic_scheduler=False,
     )
     if db2 is None:
-        _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, ds)
+        ds[s_scatter_idx] = ds_scattered
     else:
         H = w2.size(0)
         E = expert_frequency_offset.size(0) - 1
         TK = x_gather_idx.size(0)
 
         old_ds_partial = torch.empty(TK, 1, device=ds_scattered.device, dtype=ds_scattered.dtype)
-        _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, old_ds_partial)
+        old_ds_partial[s_scatter_idx, 0] = ds_scattered
 
         BLOCK_H = min(triton.next_power_of_2(H), 2048)
         NUM_H_BLOCKS = triton.cdiv(H, BLOCK_H)
-        # Zero-init: the kernel below skips sentinel slots, and `ds` is copied from this buffer whole.
-        new_ds_partial = torch.zeros(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
+        new_ds_partial = torch.empty(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
 
         db2_and_ds_kernel[(E, NUM_H_BLOCKS)](
             dout,
@@ -328,28 +281,6 @@ def _down_projection_backward_act(
 
 
 _down_projection_backward_act.compile_cache = {}
-
-
-@torch.library.custom_op(add_op_namespace_prefix("_down_projection_backward_weight"), mutates_args={"dw2"})
-def _down_projection_backward_weight(
-    dout: torch.Tensor,
-    a_prime: torch.Tensor,
-    dw2: torch.Tensor,
-    expert_frequency_offset: torch.Tensor,
-    x_gather_idx: torch.Tensor,
-) -> None:
-    gemm(
-        dout.T,
-        a_prime,
-        out=dw2.permute(2, 0, 1),
-        cu_seqlens_k=expert_frequency_offset,
-        A_idx=x_gather_idx,
-        batch_idx_permute=None,
-        dynamic_scheduler=False,
-    )
-
-
-_down_projection_backward_weight.compile_cache = {}
 
 
 @torch.library.custom_op(add_op_namespace_prefix("_token_broadcast_backward"), mutates_args={"dx_reduced"})
@@ -392,7 +323,6 @@ def _softmax_over_topk_bwd_kernel(
     stride_gk: tl.constexpr,
     stride_im: tl.constexpr,
     stride_ik: tl.constexpr,
-    E: tl.constexpr,
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     dlogits_is_none: tl.constexpr,
@@ -407,21 +337,16 @@ def _softmax_over_topk_bwd_kernel(
     s_sel = tl.load(score_ptr + row * stride_sm + k_offs * stride_sn, mask=k_mask, other=0).to(tl.float32)
     g_sel = tl.load(dscore_ptr + row * stride_gm + k_offs * stride_gk, mask=k_mask, other=0).to(tl.float32)
 
-    # Sentinel slots (idx == E) carry no gradient and must not be loaded/stored at column E
-    # of the (T, E)-shaped dlogits buffer — that address is OOB.
-    valid_mask = k_mask & (idx < E)
-    safe_idx = tl.where(valid_mask, idx, 0)
-
     # dot = sum_j g_j * y_j over selected columns
     dot = tl.sum(g_sel * s_sel, axis=0)
 
     # scatter-only: dx[idx] += y_sel * (g_sel - dot)
     add_vals = s_sel * (g_sel - dot)
 
-    indices = row * stride_dm + safe_idx * stride_dn
+    indices = row * stride_dm + idx * stride_dn
     if not dlogits_is_none:
-        add_vals += tl.load(dlogits_ptr + indices, mask=valid_mask)
-    tl.store(dlogits_full_ptr + indices, add_vals, mask=valid_mask)
+        add_vals += tl.load(dlogits_ptr + indices, mask=k_mask)
+    tl.store(dlogits_full_ptr + indices, add_vals, mask=k_mask)
 
 
 @triton.jit
@@ -473,7 +398,7 @@ def _topk_over_softmax_bwd_kernel(
     row_sum = tl.sum(exp_vals, axis=0)
     p = exp_vals / row_sum  # (BLOCK_E,)
 
-    # --- Load K selected indices, then derive the sentinel-aware mask ---
+    # --- Load K selected indices and upstream gradient ---
     k_offs = tl.arange(0, BLOCK_K)
     k_mask = k_offs < K
     idx = tl.load(
@@ -481,23 +406,16 @@ def _topk_over_softmax_bwd_kernel(
         mask=k_mask,
         other=0,
     ).to(tl.int32)
-
-    # Sentinels (idx == E) must not gather from logits[row, E] (OOB column on a (T, E) buffer)
-    # nor contribute to dp/dot. Loading every value through `valid_mask` zeros them at the source.
-    valid_mask = k_mask & (idx < E)
-    safe_idx = tl.where(valid_mask, idx, 0)
-
     g_sel = tl.load(
         dscore_ptr + row * stride_sm + k_offs * stride_sn,
-        mask=valid_mask,
+        mask=k_mask,
         other=0,
     ).to(tl.float32)
 
-    # p at selected indices: `other=-inf` makes `exp(-inf - finite) / row_sum = 0` for sentinels,
-    # so p_sel is naturally zero there — no separate masking needed.
+    # p at selected indices (gather from global mem; can't index register tensor)
     sel_logits = tl.load(
-        logits_ptr + row * stride_lm + safe_idx * stride_le,
-        mask=valid_mask,
+        logits_ptr + row * stride_lm + idx * stride_le,
+        mask=k_mask,
         other=-float("inf"),
     ).to(tl.float32)
     p_sel = tl.exp(sel_logits - row_max) / row_sum  # (BLOCK_K,)
@@ -506,15 +424,12 @@ def _topk_over_softmax_bwd_kernel(
     if norm_topk_probs:
         scores = tl.load(
             score_ptr + row * stride_scm + k_offs * stride_scn,
-            mask=valid_mask,
+            mask=k_mask,
             other=0,
         ).to(tl.float32)
         dot_s = tl.sum(g_sel * scores, axis=0)
         S = tl.sum(p_sel, axis=0)
         dp_sel = (g_sel - dot_s) / S
-        # Renorm produces nonzero `-dot_s / S` at sentinel slots even though g_sel is zero —
-        # explicitly zero them so the dp scatter below doesn't corrupt dp[0] via safe_idx=0.
-        dp_sel = tl.where(valid_mask, dp_sel, 0.0)
     else:
         dp_sel = g_sel
 
@@ -527,7 +442,7 @@ def _topk_over_softmax_bwd_kernel(
     dp = tl.zeros([BLOCK_E], dtype=tl.float32)
     for k_iter in tl.static_range(K):
         cur_dp = tl.sum(tl.where(k_offs == k_iter, dp_sel, 0.0))
-        cur_idx = tl.sum(tl.where(k_offs == k_iter, safe_idx, 0))
+        cur_idx = tl.sum(tl.where(k_offs == k_iter, idx, 0))
         dp = tl.where(e_offs == cur_idx, cur_dp, dp)
 
     # --- dlogits = p * (dp - dot) for all E ---
@@ -570,7 +485,6 @@ def _topk_softmax_bwd(
             dtopk_score.stride(1),
             topk_router_indices.stride(0),
             topk_router_indices.stride(1),
-            E,
             K,
             triton.next_power_of_2(K),
             (dlogits is None),
@@ -613,7 +527,6 @@ def _topk_bwd_scatter_small_kernel(
     stride_gk: tl.constexpr,
     stride_im: tl.constexpr,
     stride_ik: tl.constexpr,
-    E: tl.constexpr,
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -626,15 +539,11 @@ def _topk_bwd_scatter_small_kernel(
     idx = tl.load(idx_ptr + row * stride_im + k_offs * stride_ik, mask=k_mask, other=0).to(tl.int32)
     g_sel = tl.load(dscore_ptr + row * stride_gm + k_offs * stride_gk, mask=k_mask, other=0).to(tl.float32)
 
-    # Skip sentinel slots — column E is OOB on the (T, E)-shaped dlogits buffer.
-    valid_mask = k_mask & (idx < E)
-    safe_idx = tl.where(valid_mask, idx, 0)
-
     # scatter-only: dx[idx] += y_sel * (g_sel - dot)
     add_vals = g_sel
 
-    indices = row * stride_dm + safe_idx * stride_dn
-    tl.store(dlogits_full_ptr + indices, add_vals, mask=valid_mask)
+    indices = row * stride_dm + idx * stride_dn
+    tl.store(dlogits_full_ptr + indices, add_vals, mask=k_mask)
 
 
 @torch.library.custom_op(add_op_namespace_prefix("_topk_bwd"), mutates_args={"dlogits_full"})
@@ -642,7 +551,6 @@ def _topk_bwd(
     dlogits_full: torch.Tensor,
     dtopk_values: torch.Tensor,
     topk_indices: torch.Tensor,
-    E: int,
     K: int,
 ) -> None:
     T = dtopk_values.shape[0]
@@ -657,7 +565,6 @@ def _topk_bwd(
         dtopk_values.stride(1),
         topk_indices.stride(0),
         topk_indices.stride(1),
-        E,
         K,
         triton.next_power_of_2(K),
     )
