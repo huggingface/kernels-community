@@ -208,35 +208,6 @@ def _up_projection_backward_act(
 _up_projection_backward_act.compile_cache = {}
 
 
-@torch.library.custom_op(add_op_namespace_prefix("_up_projection_backward_weight"), mutates_args={"dw1"})
-def _up_projection_backward_weight(
-    x: torch.Tensor,
-    dw1: torch.Tensor,
-    dh: torch.Tensor,
-    expert_frequency_offset: torch.Tensor,
-    x_gather_idx: torch.Tensor,
-    is_glu_activation: bool,
-    concat_layout: bool = False,
-) -> None:
-    I, H, E = dw1.size()
-    if is_glu_activation:
-        I //= 2
-
-    gemm(
-        x.T,
-        dh,
-        out=dw1.permute(2, 1, 0),
-        cu_seqlens_k=expert_frequency_offset,
-        A_idx=x_gather_idx,
-        batch_idx_permute=None,
-        dynamic_scheduler=False,
-        concat_layout=(("out",) if concat_layout else None),
-    )
-
-
-_up_projection_backward_weight.compile_cache = {}
-
-
 def _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, out):
     """Gather the colvec-reduce rows back to slot order.
 
