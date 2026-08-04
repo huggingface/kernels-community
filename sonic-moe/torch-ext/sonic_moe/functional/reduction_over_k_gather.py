@@ -56,9 +56,9 @@ def token_gather_sum_kernel(
     M_offset_ptr,  # (T+1,)   int32
     out_ptr,  # (T, H)
     T,
+    Mtotal,  # int32, total rows in x. Doubles as the EP-sentinel marker: M_perm[slot] == Mtotal → skip.
     H: tl.constexpr,
     MAX_K: tl.constexpr,
-    Mtotal: tl.constexpr,  # int32, total rows in x. Doubles as the EP-sentinel marker: M_perm[slot] == Mtotal → skip.
     # strides
     stride_xM: tl.constexpr,
     stride_xH: tl.constexpr,
@@ -158,9 +158,9 @@ def token_gather_and_sum_varlen_K_triton(
         M_offset,
         out,
         T=T,
+        Mtotal=x.size(0),
         H=H,
         MAX_K=MAX_K,
-        Mtotal=x.size(0),
         stride_xM=x.stride(0),
         stride_xH=x.stride(1),
         stride_outT=out.stride(0),

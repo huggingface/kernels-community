@@ -208,20 +208,37 @@ def _up_projection_backward_act(
 _up_projection_backward_act.compile_cache = {}
 
 
+@triton.jit
+def _gather_valid_rows_kernel(src_ptr, rev_ptr, out_ptr, TK, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    slot_mask = offs < TK
+    rev = tl.load(rev_ptr + offs, mask=slot_mask, other=TK)
+    # `rev == TK` marks an EP sentinel: the slot owns no row, so it reads nothing and stores 0.
+    valid = slot_mask & (rev < TK)
+    val = tl.load(src_ptr + tl.where(valid, rev, 0), mask=valid, other=0.0)
+    tl.store(out_ptr + offs, val.to(out_ptr.dtype.element_ty), mask=slot_mask)
+
+
 def _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, out):
     """Gather the colvec-reduce rows back to slot order.
 
     The GEMM only covers the rows routed to a local expert, so under EP the tail of `ds_scattered` is
     uninitialized. `s_reverse_scatter_idx` maps every slot either to its own row or to `TK` for a
-    sentinel, so gathering off a buffer with one appended zero row gives each slot its row or a 0: the
-    uninitialized tail is never addressed, and no slot is written twice. Without sentinels it is a
-    plain permutation. Only the general-routing metadata writes the `TK` marker; the bitmatrix path
-    never sees sentinels, so add the marker there too if that changes.
+    sentinel, so each slot gets its row or a 0: the uninitialized tail is never addressed, and no slot
+    is written twice. Without sentinels it is a plain permutation. Only the general-routing metadata
+    writes the `TK` marker; the bitmatrix path never sees sentinels, so add the marker there too if
+    that changes.
+
+    One fused kernel rather than zeros + copy + `index_select`: same result, one launch instead of
+    three and no `TK + 1` scratch buffer.
     """
     TK = s_reverse_scatter_idx.numel()
-    padded = torch.zeros(TK + 1, dtype=out.dtype, device=out.device)
-    padded[:TK].copy_(ds_scattered)
-    torch.index_select(padded, 0, s_reverse_scatter_idx, out=out.view(-1))
+    # Sized from TK like `BLOCK_H` below, so small routings do not launch a block of mostly masked
+    # lanes; capped because this is a pure gather and gains nothing from a wider block.
+    BLOCK = min(triton.next_power_of_2(TK), 1024)
+    _gather_valid_rows_kernel[(triton.cdiv(TK, BLOCK),)](
+        ds_scattered, s_reverse_scatter_idx, out, TK, BLOCK=BLOCK
+    )
 
 
 @torch.library.custom_op(add_op_namespace_prefix("_down_projection_backward_act"), mutates_args={"dh", "ds", "db2", "a_prime"})
