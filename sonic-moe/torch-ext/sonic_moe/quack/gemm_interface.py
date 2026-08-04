@@ -280,6 +280,13 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
     if gather_A:
         configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
+        # cluster_m > 1 races with gather_A + varlen_m on SM100/SM110: replaying one real MoE call's
+        # exact inputs returns run-to-run differing results (rel ~0.3) whenever expert groups are
+        # uneven, and such configs often win tuning. Bisected in both directions — flipping only
+        # cluster_m repairs the broken winner and breaks the good one; CLC and use_tma_gather flips
+        # change nothing. SM90 keeps its own historical gather prunes and was not re-tested.
+        if device_capacity in (10, 11):
+            configs = [conf for conf in configs if conf.kwargs["config"].cluster_m == 1]
         if device_capacity == 9:
             configs = [conf for conf in configs if conf.kwargs["config"].tile_n != 208]
             configs = [conf for conf in configs if not conf.kwargs["config"].is_dynamic_persistent]
