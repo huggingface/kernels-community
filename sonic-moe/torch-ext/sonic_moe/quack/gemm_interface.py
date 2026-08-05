@@ -280,18 +280,6 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
     if gather_A:
         configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
-        # With gather_A + varlen_m on SM100/SM110, cluster_m > 1 is only correct as the fused 2-SM
-        # UMMA (tile_m=256): forced-config sweeps on a real racing MoE call show every tile_m=128 +
-        # cluster_m=2 variant nondeterministic (wrong results, varying run to run; CLC and
-        # use_tma_gather flips change nothing, and it reproduces with and without a preact tensor),
-        # while every tile_m=256 + cluster_m=2 variant is bit-exact against the cluster_m=1 result.
-        # The rule is scoped to varlen_m: ragged per-group M tiles are what desynchronize the paired
-        # CTAs, and varlen_k gather (wgrad) keeps peers M-symmetric. SM90 keeps its own prunes.
-        if varlen_m and device_capacity in (10, 11):
-            configs = [
-                conf for conf in configs
-                if conf.kwargs["config"].cluster_m == 1 or conf.kwargs["config"].tile_m == 256
-            ]
         if device_capacity == 9:
             configs = [conf for conf in configs if conf.kwargs["config"].tile_n != 208]
             configs = [conf for conf in configs if not conf.kwargs["config"].is_dynamic_persistent]
