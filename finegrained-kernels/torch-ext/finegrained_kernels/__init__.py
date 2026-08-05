@@ -13,6 +13,14 @@ from .moe import (
 from .recipes import Epilogue, Quantization
 from .swizzle import swizzle_mx_scales
 from .scheduling import compute_grouped_scheduling
+from .quant import (
+    fp8_act_quant_block_dynamic,
+    fp8_act_quant_tensor_wide,
+    mxfp4_act_quant,
+    mxfp8_act_quant,
+    nvfp4_act_quant,
+    nvfp4_quantize_two_level,
+)
 
 __all__ = [
     # 2D matmul
@@ -30,6 +38,13 @@ __all__ = [
     "compute_grouped_scheduling",
     # MX/NVFP4 scale layout (apply to weight scales at load time)
     "swizzle_mx_scales",
+    # Quantization helpers (weights at load time; activations offline)
+    "fp8_act_quant_block_dynamic",
+    "fp8_act_quant_tensor_wide",
+    "mxfp4_act_quant",
+    "mxfp8_act_quant",
+    "nvfp4_act_quant",
+    "nvfp4_quantize_two_level",
     # Epilogue and Quantization configs
     "Epilogue",
     "Quantization",

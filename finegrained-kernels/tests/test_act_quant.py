@@ -8,7 +8,7 @@ from utils import TEST_DEVICE  # type: ignore
 import triton
 import triton.language as tl
 
-from finegrained_kernels.quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_inline, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant  # type: ignore
+from finegrained_kernels.quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_inline, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant, nvfp4_quantize_two_level  # type: ignore
 
 
 _FP8_DTYPE = torch.float8_e4m3fn
@@ -164,6 +164,99 @@ def test_nvfp4_act_quant_matches_torch_reference(M):
     q_ref, s_ref = _ref_nvfp4_act_quant(x)
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8))
     assert torch.equal(q.view(torch.uint8), q_ref)
+
+
+def _ref_mxfp8_act_quant(x: torch.Tensor):
+    """Pure-PyTorch MXFP8 reference: UE8M0 group-32 scale (amax/448 ceil'd to a power of
+    two via the exponent-bump bit trick, exponent clamped to [1, 254] — no zero-row
+    special case, matching the kernel), values divided by the power-of-two scale and
+    RNE-cast to E4M3."""
+    T, K = x.shape
+    groups = x.float().reshape(T, K // 32, 32)
+    amax = groups.abs().amax(dim=-1)
+    bits = (amax / 448.0).view(torch.int32)
+    exp_ceil = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    exp_ceil = exp_ceil.clamp(1, 254)
+    scale = torch.pow(2.0, exp_ceil.float() - 127.0)
+    vals = (groups / scale.clamp(min=1e-12)[..., None]).reshape(T, K)
+    return vals.to(torch.float8_e4m3fn), exp_ceil.to(torch.uint8)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.parametrize("M", [64, 100], ids=["Tdiv", "Ttail"])
+def test_mxfp8_act_quant_matches_torch_reference(M):
+    """Independent pure-PyTorch check for the MXFP8 quant — the op-level tests dequantize
+    the reference through the SAME host quant, so only this catches a wrong exponent rule
+    reproducing identically on both sides."""
+    x = _act_inputs(M=M)
+    q, s = mxfp8_act_quant(x)
+    q_ref, s_ref = _ref_mxfp8_act_quant(x)
+    assert torch.equal(s.view(torch.uint8), s_ref)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+
+
+def _ref_ue8m0_block_dynamic(x: torch.Tensor, block_k: int):
+    """Pure-PyTorch reference for the UE8M0 block-dynamic quant (the DeepGEMM-Blackwell
+    recipe): denom = max(amax/448, 1e-12) rounded UP to a power of two by DeepGEMM's
+    ``ceil_to_ue8m0`` (add 0x7FFFFF, clear the mantissa); returns the exponent byte."""
+    T, K = x.shape
+    groups = x.float().reshape(T, K // block_k, block_k)
+    denom = (groups.abs().amax(dim=-1) / 448.0).clamp(min=1e-12)
+    bits = (denom.view(torch.int32) + 0x7FFFFF) & ~0x7FFFFF
+    scale = bits.view(torch.float32)
+    vals = (groups / scale[..., None]).reshape(T, K)
+    return vals.to(torch.float8_e4m3fn), ((bits >> 23) & 0xFF).to(torch.uint8)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.parametrize("M", [64, 100], ids=["Tdiv", "Ttail"])
+def test_ue8m0_block_dynamic_matches_torch_reference(M):
+    """Independent pure-PyTorch check for ``fp8_act_quant_block_dynamic(use_ue8m0=True)``
+    — the fp32-scale variant has a torch reference below, the UE8M0 deployment recipe
+    (DeepSeek-V4 on B200) previously had none."""
+    x = _act_inputs(M=M)
+    block_k = 128
+    q, s = fp8_act_quant_block_dynamic(x, block_k, use_ue8m0=True)
+    q_ref, s_ref = _ref_ue8m0_block_dynamic(x, block_k)
+    assert torch.equal(s, s_ref)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+
+
+def _dequant_nvfp4_two_level(packed, block, g, K):
+    """Independent two-level dequant: E2M1 LUT x decoded E4M3 group-16 block scale x the
+    fp32 per-tensor global."""
+    p = packed.view(torch.uint8)
+    lut = torch.tensor(E2M1_LUT, device=packed.device)
+    vals = torch.empty(p.shape[0], K, device=p.device)
+    vals[:, 0::2] = lut[(p & 0xF).long()]
+    vals[:, 1::2] = lut[(p >> 4).long()]
+    scaled = vals.reshape(-1, K // 16, 16) * block.float()[..., None]
+    return scaled.reshape(-1, K) * g
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+def test_nvfp4_quantize_two_level():
+    """The canonical two-level weight quant: the global must be ``amax / (6 * 448)``, the
+    block level must be BIT-IDENTICAL to the single-level quant of the globally-normalized
+    tensor (two-level IS that identity), and the end-to-end reconstruction error is PINNED —
+    E2M1's intrinsic floor on randn-scale weights is ~9.5e-2 norm-relerr (3-bit magnitudes;
+    quantization error, not a kernel property), and the 1.2e-1 bound fails any
+    level-composition regression (a dropped global is orders of magnitude off)."""
+    torch.manual_seed(0)
+    w = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16) * 3
+    packed, block, g = nvfp4_quantize_two_level(w)
+    assert packed.dtype == torch.int8 and g.shape == (1,) and g.dtype == torch.float32
+    g_ref = (w.abs().amax() / (6.0 * 448.0)).clamp(min=1e-30).float().reshape(1)
+    assert torch.equal(g, g_ref)
+    p_ref, b_ref = nvfp4_act_quant((w / g).contiguous())
+    assert torch.equal(packed.view(torch.uint8), p_ref.view(torch.uint8))
+    assert torch.equal(block.view(torch.uint8), b_ref.view(torch.uint8))
+    deq = _dequant_nvfp4_two_level(packed, block, g, w.shape[1])
+    rel = ((deq - w.float()).norm() / w.float().norm()).item()
+    assert rel < 1.2e-1, f"two-level nvfp4 reconstruction relerr {rel:.2e}"
 
 
 @triton.jit

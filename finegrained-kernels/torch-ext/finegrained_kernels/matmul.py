@@ -21,7 +21,8 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
 from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
-from .recipes import Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, is_mx, mx_scale_family, resolve_input_recipe, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands
+from .recipes import Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, is_mx, mx_scale_family, resolve_input_recipe, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_recipe
+from .swizzle import swizzle_mx_scales
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, maybe_act_quant
 from .scales import gate_stacked_block_scale_ptrs, mx_2d_scale_ptrs
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
@@ -41,7 +42,7 @@ from .tiles import (
     swizzle_offsets,
 )
 from .epilogue import acc_init, gemm_epilogue, store_masked, store_masked_oriented
-from .pruners import block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, gate_pointer_only_pruner, matched_memory_modes_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner
+from .pruners import block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, gate_pointer_only_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner
 
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
 # ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.
@@ -103,10 +104,15 @@ def _rebind_mx_descriptors(nargs):
     # swizzled iff SWIZZLED_SCALES; the act only when it was also offline-quantized (E4M3 / packed
     # E2M1) — inline (raw bf16 A) stays affine even under a swizzled weight.
     if nargs["SWIZZLED_SCALES"]:
-        rep_k = (nargs["BLOCK_SIZE_K"] // nargs["SCALE_GROUP_K"]) // 4
-        nargs["BSDescriptor"].block_shape = [1, nargs["BLOCK_SIZE_N"] // 128, rep_k, 2, 256]
+        # Sub-128 tiles read scales via the per-row pointer gather, leaving the descriptor
+        # unread — clamp its box to one block so it keeps a valid, non-degenerate shape
+        # (a 0-block box traps the descriptor-encoding pass; same clamp as the grouped hook).
+        rep_k = max((nargs["BLOCK_SIZE_K"] // nargs["SCALE_GROUP_K"]) // 4, 1)
+        bn_blocks = max(nargs["BLOCK_SIZE_N"] // 128, 1)
+        nargs["BSDescriptor"].block_shape = [1, bn_blocks, rep_k, 2, 256]
         if nargs["A"].dtype in (torch.float8_e4m3fn, torch.uint8):
-            nargs["ASDescriptor"].block_shape = [1, nargs["BLOCK_SIZE_M"] // 128, rep_k, 2, 256]
+            bm_blocks = max(nargs["BLOCK_SIZE_M"] // 128, 1)
+            nargs["ASDescriptor"].block_shape = [1, bm_blocks, rep_k, 2, 256]
     # swizzled requant output (Cs is a descriptor): store tile [1, 1, rep_n, 2, 256], rep_n per config
     if nargs["CSDescriptor"] is not None:
         rep_n = (nargs["BLOCK_SIZE_N"] // nargs["SCALE_GROUP_K"]) // 4
@@ -136,13 +142,16 @@ def _rebind_mx_descriptors(nargs):
         pre_hook=_rebind_bd_descriptors,
     ),
     # m_bit_length (log2 M bucket) keys the M tile, mirroring mx_dynamic_matmul_kernel; GATE keys the
-    # gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space).
-    ["N", "K", "m_bit_length", "GATE"],
+    # gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space). block_n/block_k
+    # (the launch-pinned quant block) gate descriptor-box legality and the K tile — two checkpoints
+    # at one shape with different blocks must not share a winner.
+    ["N", "K", "m_bit_length", "GATE", "block_n", "block_k"],
     n_trials=100,
     # WS compile guard + descriptor TMA-box limits (256/dim) + shared-memory fit (the big
     # TMA prefill tiles reach the smem ceiling; BM256 BN256 OOMs). The gate|up stack reads via the
     # pointer arm (a contiguous descriptor box can't span the N-apart gate/up rows), so prune the
-    # B-descriptor configs under GATE.
+    # B-descriptor configs under GATE. The implicit dot_scaled arm (UE8M0 As, native-M tile)
+    # carries the sm_10x scaled-MMA width cap — GATE at BN=256 would emit a width-512 trap.
     prune_configs_by={
         "early_config_prune": compose_pruners(
             warp_spec_compile_guard_pruner(),
@@ -150,6 +159,7 @@ def _rebind_mx_descriptors(nargs):
             descriptor_box_pruner("block_k"),
             smem_pruner("block_k"),
             gate_pointer_only_pruner(),
+            block_dynamic_mma_width_pruner(),
         )
     },
 )
@@ -286,7 +296,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
 
     if GATE:
         gemm_epilogue(
-            C, C, accumulator, offs_am_lin, pid_n, pid_m, as_mask,
+            C, None, accumulator, offs_am_lin, pid_n, pid_m, as_mask,
             stride_c_m, stride_c_n, 0, 0,
             BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, block_k,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
@@ -397,7 +407,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     if GATE:
         out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         gemm_epilogue(
-            C, C, accumulator, out_row, pid_n, pid_m, out_row < M,
+            C, None, accumulator, out_row, pid_n, pid_m, out_row < M,
             stride_c_m, stride_c_n, 0, 0,
             BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
@@ -432,8 +442,9 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=_rebind_bd_descriptors,
     ),
-    # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space).
-    ["N", "K", "m_bit_length", "GATE"],
+    # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space);
+    # block_n/block_k (the launch-pinned quant block) gate descriptor-box legality and the K tile.
+    ["N", "K", "m_bit_length", "GATE", "block_n", "block_k"],
     n_trials=100,
     # The gate|up stack reads via the pointer arm (a contiguous descriptor box can't span the
     # N-apart gate/up rows), so prune the B-descriptor configs under GATE.
@@ -544,7 +555,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     if GATE:
         out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         gemm_epilogue(
-            C, C, accumulator, out_row, pid_n, pid_m, out_row < M,
+            C, None, accumulator, out_row, pid_n, pid_m, out_row < M,
             stride_c_m, stride_c_n, 0, 0,
             BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, block_k,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
@@ -570,15 +581,17 @@ def w8a8_block_static_fp8_matmul_kernel(
     # per workload — small at decode, large at prefill.
     # scalar is in the mode set for M=1 decode (attn projection): it avoids the MMA M->16 pad
     # that held MXFP8 attn decode 35% over block-dynamic at identical weight bytes; fp4-scalar
-    # is dropped by the pruner (ALU-bound unpack). swap_ab intentionally OFF: an 18-cell forced-swap sweep (cudagraph,
-    # M3+dsv4 decode) showed swap losing on the single matmul (adaptive BM>=16 fills the MMA atom;
-    # M3 attn swap was −38%) while the tuner never picked it — emitting the configs only bloats
-    # the search. Swap stays on the batched/fused experts kernels, where it wins ~30% on dsv4.
+    # is dropped by the pruner (ALU-bound unpack). swap_ab emits the BM=1 swap decode rows,
+    # scoped by mx_2d_swap_scope_pruner to E4M3-scale (NVFP4) decode — its ONLY native M=1
+    # arm (dot_scaled has no sub-M=128 E4M3 form; scalar is unpack-bound: 60-142µs vs swap's
+    # 22-50µs on the GLM attn shape, 2026-08-05). UE8M0 recipes keep swap OFF: an 18-cell
+    # forced-swap sweep (cudagraph, M3+dsv4 decode) showed swap losing there (M3 attn −38%).
     get_accelerator_autotuning_configs(
         mx=True,
         tune_block_nk=True,
         compute_modes=("dot_scaled", "dot", "scalar"),
         tune_block_m=True,
+        swap_ab=True,
         # host-TMA on both operands, tuner-picked vs pointers (measured +14-17pp: mxfp8
         # 54->71%, W4A8 50->67% via mixed A=ptr/B=desc, W4A4 +14%). Mixed A/B modes KEPT
         # (unlike dense bd): A=pointer + B=descriptor wins the mid-M band.
@@ -596,8 +609,10 @@ def w8a8_block_static_fp8_matmul_kernel(
     # at M=4096 (the thin M=128 tile can't saturate the wide GEMM), so don't collapse the buckets.
     # INPUT_RECIPE keys the inline act-quant grid: A stays raw bf16 under every
     # recipe below the pre-quant M threshold, so the dtype-appended key can't
-    # split W4A8 from W4A4 itself.
-    ["N", "K", "m_bit_length", "INPUT_RECIPE", "SWIZZLED_SCALES", "GATE"],
+    # split W4A8 from W4A4 itself. OUTPUT_RECIPE/SWIZZLED_OUT key the requant epilogue
+    # explicitly (today the C/Cs dtypes split them incidentally; a descriptor Cs has no
+    # dtype token, so don't lean on the append).
+    ["N", "K", "m_bit_length", "INPUT_RECIPE", "SWIZZLED_SCALES", "INTERLEAVED_SCALES", "GATE", "OUTPUT_RECIPE", "SWIZZLED_OUT"],
     n_trials=100,
     # BK-within-K veto (the loop loads are unmasked) + the sm_10x dot_scaled shape guards
     # + scalar restricted to decode-sized M (a BM=1 GEVM at prefill is TPE poison) + the
@@ -606,6 +621,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     prune_configs_by={
         "early_config_prune": compose_pruners(
             mx_config_pruner("K"),
+            mx_2d_swap_scope_pruner(),
             scalar_max_m_pruner("M"),
             smem_pruner(),
             descriptor_box_pruner("BLOCK_SIZE_K"),
@@ -658,6 +674,7 @@ def mx_dynamic_matmul_kernel(
     B_MEMORY_MODE: tl.constexpr = "pointer",
     INPUT_RECIPE: tl.constexpr = "mxfp8",
     SWIZZLED_SCALES: tl.constexpr = False,  # scales pre-swizzled (5D weight + matching acts); else affine/inline
+    INTERLEAVED_SCALES: tl.constexpr = False,  # plain read of the gate|up-interleaved artifact (6D): remap blocks
     SWIZZLED_OUT: tl.constexpr = False,  # requant emits Cs in SWIZZLE_32_4_4 (CSDescriptor); single source: wrapper
     # Dense gate|up fusion: B is the (2N, K) gate|up stack, C the [M, N] GLU output. Every arm
     # folds out at compile time when GATE=False (the plain dense GEMM, unchanged).
@@ -669,6 +686,7 @@ def mx_dynamic_matmul_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     WARP_SPEC: tl.constexpr = False,  # tuner axis; +4% at prefill (guard: num_warps%4, BM>=64)
+    SWAP_AB: tl.constexpr = False,  # swapped decode orientation (BM=1); scoped by mx_2d_swap_scope_pruner
 ):
     """Unified MXFP4/MXFP8 (W4A8/W8A8; a ``uint8`` ``A`` is packed E2M1 — W4A4) GEMM.
 
@@ -702,11 +720,18 @@ def mx_dynamic_matmul_kernel(
         BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_COLS, SWIZZLED_SCALES,
     )
     # Operand tiles: activation + the (GATE-stacked-aware) weight, both single leaf calls (the
-    # descriptor-vs-pointer and gate|up-stack branches fold inside the leaves).
+    # descriptor-vs-pointer and gate|up-stack branches fold inside the leaves). The swap arm
+    # loads both naturally — mx_swap_compute reorients at the dot, flattening the token tile.
+    if SWAP_AB:
+        tl.static_assert(
+            BLOCK_SIZE_M == 1, "the mx swap arm flattens the single-token tile"
+        )
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_ka, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
-    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_kb, N, stride_b_n, stride_b_k, GATE, B_MEMORY_MODE)
+    b_ptrs = matmul_weight_ptrs(
+        B, offs_bn, offs_kb, N, stride_b_n, stride_b_k, GATE, B_MEMORY_MODE, SWAP_AB
+    )
 
-    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
+    accumulator = acc_init(COMPUTE_MODE if SWAP_AB else "dot", BLOCK_SIZE_M, n_width, SWAP_AB)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
         a, a_s = load_act_mx(
             a_ptrs, as_ptrs, AsGlobal, None, as_mask, ADescriptor, pid_m * BLOCK_SIZE_M,
@@ -718,12 +743,13 @@ def mx_dynamic_matmul_kernel(
             b_ptrs, BDescriptor, bs_ptrs, bs_mask, BSDescriptor, Bs, 0, pid_n * BLOCK_SIZE_N,
             k * (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE), 0, 0, pid_n, k, N, K,
             0, stride_bs_n, stride_bs_k,
-            GATE, False, False, B_MEMORY_MODE, False, SWIZZLED_SCALES,
+            GATE, False, False, B_MEMORY_MODE, SWAP_AB, SWIZZLED_SCALES,
             BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
+            INTERLEAVED_SCALES=INTERLEAVED_SCALES,
         )
         accumulator = mx_compute(
             accumulator, a, a_s, b, b_s, COMPUTE_MODE,
-            BLOCK_SIZE_M, n_width, BLOCK_SIZE_K, SCALE_GROUP_K, False,
+            BLOCK_SIZE_M, n_width, BLOCK_SIZE_K, SCALE_GROUP_K, SWAP_AB,
         )
         a_ptrs, as_ptrs, b_ptrs, bs_ptrs, _, _ = advance_ptrs(
             a_ptrs, as_ptrs, b_ptrs, bs_ptrs, b_ptrs, bs_ptrs,
@@ -750,8 +776,8 @@ def mx_dynamic_matmul_kernel(
         stride_c_m, stride_c_n, stride_cs_m, stride_cs_n,
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, OUTPUT_RECIPE, SCALE_GROUP_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-        COMPUTE_MODE=COMPUTE_MODE, N_COLS=N, SWIZZLED_OUT=SWIZZLED_OUT, CSDescriptor=CSDescriptor,
-        CsGlobal=CsGlobal,
+        COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, N_COLS=N, SWIZZLED_OUT=SWIZZLED_OUT,
+        CSDescriptor=CSDescriptor, CsGlobal=CsGlobal,
     )
 
 
@@ -874,7 +900,7 @@ def mx_weight_only_matmul_2d_kernel(
     if GATE:
         out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         gemm_epilogue(
-            C, C, accumulator, out_row, pid_n, pid_m, out_row < M,
+            C, None, accumulator, out_row, pid_n, pid_m, out_row < M,
             stride_c_m, stride_c_n, 0, 0,
             BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
@@ -957,7 +983,7 @@ def full_precision_matmul_2d_kernel(
     if GATE:
         out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         gemm_epilogue(
-            C, C, accumulator, out_row, pid_n, pid_m, out_row < M,
+            C, None, accumulator, out_row, pid_n, pid_m, out_row < M,
             stride_c_m, stride_c_n, 0, 0,
             BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
@@ -1296,7 +1322,7 @@ def mx_dynamic_matmul(
     A:  (..., K) raw activations, bf16/fp16/fp32;
         leading dims are flattened to (M, K) and restored on the output
     """
-    assert B.ndim == 2 and Bs.ndim in (2, 5)  # 5D Bs = pre-swizzled SWIZZLE_32_4_4 weight scales
+    assert B.ndim == 2 and Bs.ndim in (2, 5, 6)  # 5D = pre-swizzled; 6D = the gate|up artifact
     assert B.dtype in (torch.int8, torch.float8_e4m3fn), (
         f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
     )
@@ -1317,15 +1343,36 @@ def mx_dynamic_matmul(
     # the op never swizzles in the hot path. The recipe is the scale dtype (E4M3 = NVFP4 group-16,
     # UE8M0 = MX group-32). SWIZZLED_SCALES governs both operands (a swizzled weight is paired with
     # swizzled acts). Callers wanting the tcgen05 fast path pre-swizzle the weight (5D).
+    # The gate|up artifact carries its interleave in the shape (6D): GATE kernels read the
+    # block pairs natively; a plain launch remaps its block index in-kernel (the
+    # INTERLEAVED_SCALES constexpr). Gate|up fusion REQUIRES the artifact — one layout.
+    interleaved = Bs.ndim == 6
+    if interleaved:
+        Bs = Bs.reshape(Bs.shape[0], -1, *Bs.shape[3:])
     swizzled_scales = Bs.ndim == 5
+    if gate and swizzled_scales:
+        assert interleaved, (
+            "gate|up swizzled scales must be the gate-interleaved artifact "
+            "(swizzle_mx_scales(..., gate=True))"
+        )
     scale_group = mx_scale_family(Bs, K)
     if not swizzled_scales:
         assert Bs.shape == (rows, K // scale_group), (
             f"Bs shape {tuple(Bs.shape)} != ({rows}, {K // scale_group})"
         )
+    else:
+        # the artifact's row-block count must match THIS weight — a wrong-layer artifact
+        # with a matching K would otherwise dequantize with garbage scales silently
+        assert Bs.shape[1] == triton.cdiv(rows, 128), (
+            f"swizzled Bs carries {Bs.shape[1]} 128-row blocks, expected "
+            f"{triton.cdiv(rows, 128)} for this ({rows}, K) weight — wrong artifact"
+        )
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)  # caller's layout (5D swizzled / 2D affine); the op never swizzles
     input_recipe = resolve_input_recipe(input_recipe, None, B, Bs)
+    # resolve BEFORE the C alloc: with a pre-quantized A (As given) the default output is
+    # bf16, not A's storage dtype (fp8 / packed int8 are not valid output element types)
+    output_dtype = resolve_output_dtype(output_dtype, A, As)
     # Activation quant is always maybe_act_quant — offline above the M threshold, inline in the
     # kernel below it (fp4 packs in-register). The offline arm writes swizzled scales directly when
     # the weight is swizzled (fused, no post-quant pass), else affine. Inline acts (small M) stay
@@ -1346,13 +1393,24 @@ def mx_dynamic_matmul(
     # As given ⇒ A is already quantized (the routed-op parity: a pre-quantized activation + its
     # scales); else quantize raw A (offline above the M threshold, inline in the kernel below it).
     if As is not None:
+        assert (As.dtype == torch.float8_e4m3fn) == (Bs.dtype == torch.float8_e4m3fn), (
+            f"activation scales ({As.dtype}) must match the weight scale family ({Bs.dtype})"
+        )
+        assert swizzled_scales or As.ndim != 5, (
+            "un-swizzled weights pair with affine (row-major) activation scales, got 5D As"
+        )
         a_vals, as_scales = A.view(M, K), As
+        # one SWIZZLED_SCALES flag governs both operands in-kernel: row-major activation
+        # scales under a swizzled weight are swizzled here (the grouped wrapper does the same)
+        if swizzled_scales and As.ndim == 2:
+            as_scales = swizzle_mx_scales(As)
     else:
         a_vals, as_scales = maybe_act_quant(A.view(M, K), act_quant, MX_MATMUL_ACT_PREQUANT_MIN_M)
     A_q = e2m1_as_uint8(a_vals)
     as_u8 = ue8m0_as_uint8(as_scales)
-    # acts are swizzled only when the offline arm ran (A quantized) under a swizzled weight
-    act_swizzled = swizzled_scales and A_q.dtype != torch.bfloat16
+    # the act-scale layout is carried by the buffer itself: 5D = swizzled (the offline arm under
+    # a swizzled weight, or pre-swizzled As); the inline arm's raw activation stays 2D (affine)
+    act_swizzled = as_u8.ndim == 5
     # gate|up output: the GLU intermediate [M, N] (output_dtype), or — under output_recipe —
     # requantized (mxfp8: fp8 + (M, N//32) uint8 Cs; fp4: packed (M, N//2) + (M, N//out_g) scale).
     out_recipe = output_recipe if gate else None
@@ -1436,6 +1494,7 @@ def mx_dynamic_matmul(
             SCALE_GROUP_K=scale_group,
             INPUT_RECIPE=input_recipe,
             SWIZZLED_SCALES=swizzled_scales,
+            INTERLEAVED_SCALES=interleaved and not gate,
             SWIZZLED_OUT=swizzled_out,
             GATE=gate,
             ACT_FN=act_fn,
@@ -1443,7 +1502,7 @@ def mx_dynamic_matmul(
             SWIGLU_LIMIT=swiglu_limit,
             OUTPUT_RECIPE=out_recipe,
             SIMULATE_UNFUSED=simulate_unfused,
-            INTERMEDIATE_DTYPE=tl_dtype(resolve_output_dtype(output_dtype, A, None)),
+            INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
         )
     # NVFP4's block scales are already normalized by the provided output global (CsGlobal =
     # output_global_scale) at requant, so the caller pairs cs_ret with that global as the down's As.
@@ -1620,13 +1679,13 @@ def matmul_2d(
     ``weight_scale_2`` ``g_b``) — provided, never computed; the op folds ``g_a·g_b`` onto the
     accumulator (``a_global_scale`` rides raw ``A`` or a pre-quantized ``As`` alike).
     ``output_global_scale`` (NVFP4 ``output_recipe`` only) is the NEXT proj's provided ``input_scale``:
-    the fused requant normalizes the GLU intermediate by it, returning ``[C, Cs]`` the down-proj
+    the fused requant normalizes the GLU intermediate by it, returning ``(C, Cs)`` the down-proj
     consumes as ``As=Cs, a_global_scale=output_global_scale``.
 
     ``epilogue`` is the fused output transform (``Epilogue(gate=True)`` → the ``(2N, K)`` gate|up
     stack + SwiGLU, returning the ``[..., N]`` GLU intermediate); ``quantization.input_recipe`` sets
     the MX activation grid (``"mxfp8"``/``"mxfp4"``/nvfp4), ``quantization.output_recipe`` (MX weights
-    only) requantizes the GLU intermediate into ``[C, Cs]``. Returns the output tensor, or ``[C, Cs]``
+    only) requantizes the GLU intermediate into ``(C, Cs)``. Returns the output tensor, or ``(C, Cs)``
     under ``output_recipe``.
 
     Routes by weight dtype + inferred block: ``Bs`` None → full-precision; MX/NVFP4 (int8/E4M3 weights
@@ -1639,9 +1698,17 @@ def matmul_2d(
     ).as_args()
     q = quantization if quantization is not None else Quantization()
     input_recipe, output_recipe = q.as_args()
+    assert (a_global_scale is None and b_global_scale is None) or (
+        Bs is not None and weight_recipe(B, Bs) == "nvfp4"
+    ), "two-level globals (a_global_scale / b_global_scale) are NVFP4-only"
+    assert output_global_scale is None or q.output_recipe == "nvfp4", (
+        "output_global_scale is the NVFP4 requant second level — it requires output_recipe='nvfp4' "
+        "(the epilogue would otherwise normalize by it with nothing downstream to compensate)"
+    )
 
-    def _unwrap(ret: list[torch.Tensor]) -> torch.Tensor | list[torch.Tensor]:
-        return ret[0] if len(ret) == 1 else ret
+    def _unwrap(ret: list[torch.Tensor]) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        # tuple, matching the routed siblings — callers branch on isinstance(out, tuple)
+        return ret[0] if len(ret) == 1 else tuple(ret)
 
     if Bs is None:  # unquantized BF16/FP16 weights — plain dot, no scales
         assert As is None and a_global_scale is None and input_recipe in (None, "weights") and output_recipe is None, (
@@ -1658,6 +1725,10 @@ def matmul_2d(
             assert As is None and a_global_scale is None and output_recipe is None, (
                 "weight-only (input_recipe=None) takes a raw bf16 activation, no As/global/requant"
             )
+            assert b_global_scale is None and output_global_scale is None, (
+                "weight-only does not apply two-level globals (the in-MMA upcast never "
+                "multiplies g_b) — dropping one silently would scale the output wrong"
+            )
             return _unwrap(
                 mx_weight_only_matmul_2d(
                     A, B, Bs, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused
@@ -1670,9 +1741,6 @@ def matmul_2d(
                 a_global_scale, b_global_scale, output_global_scale,
             )
         )
-    assert a_global_scale is None and b_global_scale is None and output_global_scale is None, (
-        "two-level globals (a_global_scale / b_global_scale / output_global_scale) are NVFP4-only (MX weights)"
-    )
     # FP8 activations are always E4M3 with the weight-implied scale granularity, so "fp8" is a
     # no-op recipe name (accepted for symmetry with the MoE ops); no other name applies here.
     assert input_recipe in ("weights", "fp8"), (

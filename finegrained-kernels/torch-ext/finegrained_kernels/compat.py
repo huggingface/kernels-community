@@ -322,7 +322,7 @@ def get_accelerator_autotuning_configs(
     """Autotune search grid for the current accelerator — the single generator for every
     GEMM kernel. One union span serves both families: num_warps {2,4,8,16} x num_stages
     {2..6} (XPU: warps {8,16}); the tile comes from the caller's ``block_size``, or
-    ``tune_block_nk`` spans BN {32,64,128,256} x BK {64,128,256}. ``mx=True`` (group-32
+    ``tune_block_nk`` spans BN {32,64,128,256} x BK {64,128,256,512}. ``mx=True`` (group-32
     scale formats, MXFP4/MXFP8) requires ``compute_modes`` (BK is coupled per mode) and
     ``tune_block_nk`` (MX kernels have no caller block_size — the tile is always tuned).
 
@@ -343,10 +343,11 @@ def get_accelerator_autotuning_configs(
       kernels whose BK is pinned by the caller (activation scale groups are per
       block_k) but whose N tile may grow past the scale granularity.
     - ``swap_ab``: marks the single-token decode GEVM kernels — crosses in the coupled
-      decode ``(BLOCK_SIZE_M, SWAP_AB)`` pairs (see below) and, for MX, adds BK=512
-      (at decode's tiny memory-parallelism-bound grids, longer per-iteration bursts are
-      the one in-block lever that helps: +12% on the dsv4 swap GEMV; deeper num_stages
-      and split-K both measured WORSE).
+      decode ``(BLOCK_SIZE_M, SWAP_AB)`` pairs (see below). BK=512 earns its union-span
+      seat here: at decode's tiny memory-parallelism-bound grids, longer per-iteration
+      bursts are the one in-block lever that helps (+12% on the dsv4 swap GEMV; deeper
+      num_stages and split-K both measured WORSE). Prefill tunes carry the same rows as
+      trial-budget dilution (descriptor_box_pruner drops the illegal e4m3 boxes).
     - ``warp_spec`` (CUDA only): warp-specialize the K-loop, crossed over every mode —
       pair it with ``warp_spec_compile_guard_pruner``, which owns the can't-compile
       regions (including dot_scaled + WS, a PassManager failure). Compile support is
@@ -382,9 +383,16 @@ def get_accelerator_autotuning_configs(
     # one family (MX warps=16, MX BK=64; plain-dot stages 5/6 were simply never tested)
     # just never win, and can't-compile configs (smem) score inf and stay out of the
     # TPE densities. The 743-tune winner census (see docstring) maps where winners
-    # actually live per family. The decode GEVMs (swap_ab) extend BK to 512: at their
-    # tiny memory-parallelism-bound grids, longer per-iteration bursts are the one
-    # in-block lever that helps (+12% on the dsv4 swap GEMV).
+    # actually live per family. BK=512 is in the union span for every tune_block_nk
+    # kernel — its win is decode-only (see the swap_ab docstring bullet), and prefill
+    # rows are accepted trial-budget dilution.
+    #
+    # Axes measured DEAD and deliberately absent (do not re-add without fresh evidence):
+    #   num_ctas          slower everywhere + miscompiles with TMA at num_stages<=4
+    #   flatten (tl.range)  proxy +17% never survived e2e (<=1%; gate_up regressed)
+    #   persistent 2D     grid-stride 2D prototype's win was an inline-vs-helper artifact
+    #   batched WARP_SPEC  decode loops are launch/latency-bound; WS never won a batched
+    #                     cell, so the axis is not emitted at the six batched sites
     num_warps = [8, 16] if is_xpu else [2, 4, 8, 16]
     num_stages = [2, 3, 4, 5, 6]
     bn_span = (128,) if is_xpu else (32, 64, 128, 256)
@@ -426,7 +434,8 @@ def get_accelerator_autotuning_configs(
     if warp_spec and get_active_device_type() == "cuda":
         blocks = [{**b, "WARP_SPEC": ws} for b in blocks for ws in (False, True)]
 
-    # (avoidance of the descriptor modes' can't-win regions lives in descriptor_config_pruner)
+    # (descriptor-mode can't-win/can't-serve regions are fenced per kernel: descriptor_box_pruner,
+    # matched_memory_modes_pruner, gate_pointer_only_pruner, descriptor_needs_prequant_pruner)
     if a_memory_modes is not None:
         blocks = [
             {**b, "A_MEMORY_MODE": mm}
@@ -447,7 +456,13 @@ def get_accelerator_autotuning_configs(
     # padded to the N=16 atom), so (16, swap) never exists; the tuner picks. Prefill
     # kernels leave SWAP_AB unset — the prefill swap arms measured losers everywhere
     # (see the bd 2D kernel's tuner note).
-    if swap_ab:
+    if swap_ab and tune_block_m:
+        # tuned-BM kernels (the 2D mx GEMM): the prefill BM sweep keeps no-swap; the swap
+        # decode rows are APPENDED at their structural BM=1 (dedup collapses the copies)
+        blocks = [{**b, "SWAP_AB": False} for b in blocks] + [
+            {**b, "BLOCK_SIZE_M": 1, "SWAP_AB": True} for b in blocks
+        ]
+    elif swap_ab:
         blocks = [
             {**b, "BLOCK_SIZE_M": bm, "SWAP_AB": sw}
             for b in blocks

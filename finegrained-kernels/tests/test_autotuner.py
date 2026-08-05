@@ -31,7 +31,29 @@ import finegrained_kernels  # type: ignore
 import finegrained_kernels.matmul  # type: ignore
 from finegrained_kernels.bayesian_autotuner import bayesian_autotune  # type: ignore
 from finegrained_kernels.compat import is_sm10x  # type: ignore
-from finegrained_kernels.pruners import mx_config_pruner  # type: ignore
+from finegrained_kernels.pruners import block_within_dim_pruner, mx_config_pruner  # type: ignore
+
+
+@pytest.mark.kernels_ci
+def test_block_within_dim_pruner_vetoes_and_raises():
+    """The fix for the crowned-garbage incident (a tuned BN=256 winner at N=128 computed
+    wrong results on 40/64 rows): non-dividing tiles must be VETOED, an all-non-dividing
+    grid must RAISE (the advisory fallback would hand back the wrong-result configs), and
+    the ``when`` gate must scope the veto — pure config filtering, no GPU capability."""
+    cfgs = [triton.Config({"BLOCK_SIZE_N": bn}) for bn in (64, 128, 256)]
+    prune = block_within_dim_pruner("N", "BLOCK_SIZE_N")
+    kept = prune(cfgs, {"N": 128})
+    assert [c.kwargs["BLOCK_SIZE_N"] for c in kept] == [64, 128]
+    with pytest.raises(ValueError, match="not a multiple of any BLOCK_SIZE_N"):
+        prune(cfgs, {"N": 48})
+    # the mx N-stage gate: veto only the AFFINE (SWIZZLED_SCALES=False) arm — kernels
+    # without the axis (weight-only) mask their N tail and keep every BN
+    gated = block_within_dim_pruner(
+        "N", "BLOCK_SIZE_N", when=lambda args: not args.get("SWIZZLED_SCALES", True)
+    )
+    assert len(gated(cfgs, {"N": 128})) == 3  # axis absent -> tail-masked kernel, no veto
+    assert len(gated(cfgs, {"N": 128, "SWIZZLED_SCALES": True})) == 3
+    assert [c.kwargs["BLOCK_SIZE_N"] for c in gated(cfgs, {"N": 128, "SWIZZLED_SCALES": False})] == [64, 128]
 
 
 @pytest.mark.kernels_ci
@@ -108,8 +130,13 @@ def test_dot_arm_is_fenced_on_sm10x():
             num_stages=2,
         )
 
-    kept = prune([cfg("dot", 32), cfg("dot_scaled", 128)], {"K": 4096})
+    # the fence self-scopes on the As operand: mx-dynamic kernels carry the param (even
+    # None-valued — the inline-quant arm still reaches the native MMA), weight-only don't
+    kept = prune([cfg("dot", 32), cfg("dot_scaled", 128)], {"K": 4096, "As": None})
     assert {c.kwargs["COMPUTE_MODE"] for c in kept} == {"dot_scaled"}
+    # weight-only (no As param): raw-act dot genuinely competes and must survive
+    kept = prune([cfg("dot", 32), cfg("dot_scaled", 128)], {"K": 4096})
+    assert {c.kwargs["COMPUTE_MODE"] for c in kept} == {"dot", "dot_scaled"}
 
 
 @pytest.mark.kernels_ci

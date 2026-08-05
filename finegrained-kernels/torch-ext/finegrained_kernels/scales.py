@@ -91,6 +91,7 @@ def load_swizzled_scale_tile(
     BLOCK: tl.constexpr,
     SCALE_COLS: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
+    INTERLEAVED: tl.constexpr = False,
 ):
     """One swizzled-scale tile ``(BLOCK, SCALE_COLS)`` for a row-tile of ANY operand — batched
     weight (``group_id = expert``), 2D weight / 2D activation (``group_id = 0``, dense). Scales are
@@ -99,8 +100,9 @@ def load_swizzled_scale_tile(
 
     - ``BLOCK`` a multiple of 128 with whole 4-group K bands (``BK % 128 == 0``): the fast path —
       bulk-load the ``REP = BLOCK//128`` row-blocks via the TMA ``descriptor`` (box
-      ``[1, REP, rep_k, 2, 256]``), un-swizzle, feed ``dot_scaled``. This is the tutorial's
-      ``rep_m``/``rep_n`` load — BN=256 (REP=2) stays on the descriptor instead of falling to gather.
+      ``[1, REP, rep_k, 2, 256]``), un-swizzle, feed ``dot_scaled``. Today's pruners cap every
+      swizzled tile at 128 (REP=1); the REP>1 form is written for a future >128-tile descriptor
+      read, not reachable from the current grids.
     - Otherwise (sub-128 tile — fp8 ``scalar`` decode / small-M offline; or ``BK<128``): the block
       layout can't be TMA-sliced, so pointer-GATHER exactly this tile's rows. The swizzle is a fixed
       permutation: logical (row ``r``, K-group ``col``) → byte
@@ -114,13 +116,24 @@ def load_swizzled_scale_tile(
     nrb = (rows + 127) // 128
     if BLOCK % 128 == 0 and SCALE_COLS >= 4 and SCALE_COLS % 4 == 0:
         REP: tl.constexpr = BLOCK // 128
+        # INTERLEAVED: a plain (non-gate) read of the gate|up artifact — linear block j of the
+        # flat 2N rows lives at interleaved position 2j (gate half) / 2(j - nrb/2) + 1 (up half).
+        # Single-block reads only (the interleaved pair of a linear j+1 is not adjacent).
+        if INTERLEAVED:
+            tl.static_assert(REP == 1, "interleaved plain reads are single-block (BN == 128)")
+            half = nrb // 2
+            pid = tl.where(pid < half, 2 * pid, 2 * (pid - half) + 1)
         # absolute 128-block base = group_id*nrb + pid*REP; load_swizzled_scale multiplies blk by REP.
         # Non-128 ``rows`` (odd ``nrb``) pins REP=1 (BN=128) in the pruner, so group_id*nrb//REP is exact.
         blk = (group_id * nrb // REP + pid).to(tl.int32)
         return load_swizzled_scale(descriptor, blk, k_idx, REP, SCALE_COLS // 4, BLOCK, SCALE_COLS)
     cols4 = (K // SCALE_GROUP_K + 3) // 4  # cdiv: the buffer pads cols to whole 4-group chunks
     r = pid * BLOCK + tl.arange(0, BLOCK)
-    blk = group_id * nrb + r // 128
+    lin = r // 128
+    if INTERLEAVED:
+        half = nrb // 2
+        lin = tl.where(lin < half, 2 * lin, 2 * (lin - half) + 1)
+    blk = group_id * nrb + lin
     row = r % 128
     col = k_idx * SCALE_COLS + tl.arange(0, SCALE_COLS)
     off = (
@@ -150,6 +163,7 @@ def load_weight_scale_tile(
     SCALE_COLS: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     GATE: tl.constexpr,
+    INTERLEAVED: tl.constexpr = False,
 ):
     """One batched-decode weight-scale tile ``(n_width, SCALE_COLS)``, hiding the swizzled vs
     un-swizzled choice behind the ``SWIZZLED_SCALES`` flag — the kernel loop reads scales the same
@@ -182,6 +196,9 @@ def load_weight_scale_tile(
         # gate|up interleaved [g0,u0,g1,u1,...] over the 2N rows/expert (BN=128): tile pid_n's gate
         # 128-block sits at buffer block 2*pid_n, its up block at 2*pid_n+1. Read each as a single BN
         # block (the REP=1 box the batched descriptor is built for) and stack [gate; up].
+        tl.static_assert(
+            BLOCK_SIZE_N == 128, "the gate block-pair read indexes whole 128-row blocks"
+        )
         gate_s = load_swizzled_scale_tile(
             bs_descriptor, bs_ptr, expert_id, 2 * pid_n, k_idx, 2 * N, K,
             BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K,
@@ -195,11 +212,16 @@ def load_weight_scale_tile(
         b_s = load_swizzled_scale_tile(
             bs_descriptor, bs_ptr, expert_id, pid_n, k_idx, N, K,
             BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K,
+            INTERLEAVED=INTERLEAVED,
         )
     else:
-        # affine per-group load off (expert, N-tile row, K-group) from the un-advanced base
+        # affine per-group load off (expert, N-tile row, K-group) from the un-advanced base.
+        # Clamp the row in-bounds instead of masking (a masked load's other=0.0 blocks WS
+        # lowering): a partial last N-tile reads a clamped scale the epilogue masks off
+        # (N_COLS) — without the clamp the GATE arm's up rows (N + offs_bn) run past 2N.
         base = bs_ptr + expert_id * stride_bs_e
         offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        offs_bn = tl.minimum(offs_bn, N - 1)
         offs_sf = k_idx * SCALE_COLS + tl.arange(0, SCALE_COLS)
         if GATE:
             rows2 = tl.arange(0, 2)[:, None] * N + offs_bn[None, :]

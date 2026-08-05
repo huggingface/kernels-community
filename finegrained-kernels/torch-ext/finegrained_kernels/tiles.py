@@ -315,6 +315,7 @@ def _weight_scale_mx(
     GROUPED: tl.constexpr, GATE: tl.constexpr, PER_EXPERT: tl.constexpr,
     SWIZZLED_SCALES: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
     SCALE_COLS: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
+    INTERLEAVED_SCALES: tl.constexpr = False,
 ):
     """MX weight-scale K-tile ``(rows, SCALE_COLS)``. Grouped: pre-swizzled SWIZZLE_32_4_4 via the
     descriptor (``load_swizzled_scale`` — gate|up is one 2*BN tile off the block-interleaved buffer,
@@ -345,10 +346,12 @@ def _weight_scale_mx(
         b_s = load_weight_scale_tile(
             SWIZZLED_SCALES, bs_descriptor, bs_ptr, expert_id, pid_n, k, N, K,
             stride_bs_e, stride_bs_n, stride_bs_k, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K, GATE,
+            INTERLEAVED=INTERLEAVED_SCALES,
         )
     elif SWIZZLED_SCALES:  # pre-swizzled SWIZZLE_32_4_4 scale — descriptor at BN=128, gather below
         b_s = load_swizzled_scale_tile(
-            bs_descriptor, bs_ptr, 0, pid_n, k, N, K, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K
+            bs_descriptor, bs_ptr, 0, pid_n, k, N, K, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K,
+            INTERLEAVED=INTERLEAVED_SCALES,
         )
     elif bs_mask is None:  # weight-only 2D: N-clamped in-bounds ptrs, UNMASKED (no other=0.0 constant
         b_s = tl.load(bs_ptrs)  # -> the K-loop warp-specialization-lowers; tail N masked in epilogue)
@@ -434,6 +437,7 @@ def load_weight_mx(
     B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr, SWIZZLED_SCALES: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
     WEIGHT_VALUES_PER_BYTE: tl.constexpr,
+    INTERLEAVED_SCALES: tl.constexpr = False,
 ):
     """The MX weight path: value tile + pre-swizzled/affine group scale."""
     KB: tl.constexpr = BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
@@ -443,6 +447,7 @@ def load_weight_mx(
         bs_ptrs, bs_mask, bs_descriptor, bs_ptr, blk_idx, expert_id, pid_n, k, N, K,
         stride_bs_e, stride_bs_n, stride_bs_k,
         GROUPED, GATE, PER_EXPERT, SWIZZLED_SCALES, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K,
+        INTERLEAVED_SCALES=INTERLEAVED_SCALES,
     )
     return w, w_s
 

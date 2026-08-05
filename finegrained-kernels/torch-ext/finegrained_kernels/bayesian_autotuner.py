@@ -111,7 +111,7 @@ class BayesianAutotuner(Autotuner):
         invalidating env), so the next fresh tune of ANY shape skips the doomed compile
         outright (~40-66 wasted compiles per nvfp4 tune before this). The memo dies with
         the kernel source (``fn.cache_key``); bench-stage errors are never persisted."""
-        sig = self._compile_signature(config)
+        sig = self._compile_signature(config, meta)
         memo = self._failed_compile_memo()
         if sig is not None and sig in memo:
             self._failures.append((config, memo[sig] + "  [memoized]"))
@@ -126,12 +126,16 @@ class BayesianAutotuner(Autotuner):
                 self._persist_failed_compile_memo()
             return [float("inf")] * 3
 
-    def _compile_signature(self, config) -> str | None:
+    def _compile_signature(self, config, meta=None) -> str | None:
         """Hash of the compile determinants for one config: the config itself plus the
         constexpr argument VALUES and tensor argument dtypes from this launch (both feed
         specialization — e.g. GATE flips arms, a uint8 A packs the loads). Source/env
-        live in the memo FILE's key, not here."""
-        nargs = getattr(self, "nargs", None)
+        live in the memo FILE's key, not here.
+
+        ``meta`` carries the launch kwargs: every constexpr is kwarg-passed at the call
+        sites, so ``self.nargs`` (positional-only) alone would hash GATE/recipe flags as
+        None and collide memo entries across arms."""
+        nargs = {**(getattr(self, "nargs", None) or {}), **(meta or {})}
         if not nargs:
             return None
         fn = self.fn
@@ -146,6 +150,13 @@ class BayesianAutotuner(Autotuner):
                 v, (bool, int, float, str, type(None))
             ):
                 parts.append(f"{param.name}={v}")
+            elif isinstance(v, int) and not isinstance(v, bool):
+                # non-constexpr ints feed Triton's specialization (==1 / %16 divisibility),
+                # which is (shape, config)-dependent for WS lowering failures — hashing the
+                # bucket keeps one shape's PassManager failure from fencing every shape
+                parts.append(
+                    f"{param.name}:i{1 if v == 1 else (16 if v % 16 == 0 else 0)}"
+                )
         return hashlib.sha256("-".join(parts).encode("utf-8")).hexdigest()
 
     def _failed_compile_memo(self) -> dict:
@@ -224,7 +235,15 @@ class BayesianAutotuner(Autotuner):
         all_args = {**self.nargs, **kwargs}
         _args = {k: v for k, v in all_args.items() if k in self.arg_names}
         key = [_args[k] for k in self.keys if k in _args]
-        key.extend(str(v.dtype) for v in _args.values() if hasattr(v, "dtype"))
+        # name-tagged, with an explicit token for absent optional tensors: a positional
+        # dtype list lets a gather-only and a scatter-only launch alias to one entry,
+        # while descriptor-arm legality (descriptor_box_pruner) hangs off GatherIdx
+        # presence — the aliased replay would read wrong rows without ever re-pruning
+        key.extend(
+            f"{k}:{v.dtype}" if hasattr(v, "dtype") else f"{k}:None"
+            for k, v in _args.items()
+            if hasattr(v, "dtype") or v is None
+        )
         key = tuple(key)
 
         if key not in self.cache:
@@ -363,7 +382,19 @@ class BayesianAutotuner(Autotuner):
                     break
 
         self.configs_timings = {configs[i]: t for i, t in timings.items()}
-        return configs[min(timings, key=timings.get)]
+        best = min(timings, key=timings.get)
+        if timings[best] == float("inf"):
+            # crowning an arbitrary broken config would persist it as `best` on disk and
+            # every later healthy process would replay it without re-tuning — the exact
+            # sticky-contaminated-context scenario inf-forgiveness exists to survive
+            self._report_bench_failures()
+            raise RuntimeError(
+                f"[bayesian-autotune] {self.fn_name}: every benched config failed "
+                "(all-inf tune) — nothing correct to crown or persist; the context may "
+                "be trap-contaminated (retry in a fresh process) or the grid is broken "
+                "for this launch (see the failure report above)."
+            )
+        return configs[best]
 
     def _log_result(self, key, config: Config, ms: float):
         """Append one ``(key, config, ms)`` record as JSONL for offline analysis —
@@ -470,6 +501,12 @@ class BayesianAutotuner(Autotuner):
             make_backend(driver.active.get_current_target()).hash(),
             fn.cache_key,
             str(sorted(env_vars.items())),
+            # Key NAMES and the search budget are determinants too: tuning_key holds
+            # values only (renaming a key or swapping two same-typed keys would collide),
+            # and FINEGRAINED_AUTOTUNE_TRIALS is not in Triton's invalidating-env list —
+            # without n_trials a 3-trial exploratory winner gets replayed at 100 trials.
+            str(self.keys),
+            f"n_trials={self.n_trials},n_startup_trials={self.n_startup_trials},gamma={self.gamma}",
             str(tuning_key),
         ] + [str(c) for c in configs]  # str(Config) is pre_hook-free and process-stable
         cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()

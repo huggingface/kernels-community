@@ -40,9 +40,28 @@ def _pin_worker_gpu() -> None:
         idx = int(worker[2:])
     except ValueError:
         return
+    # nvidia-smi -L enumerates in PCI order; the CUDA runtime defaults to FASTEST_FIRST,
+    # so without this pin two workers can land on one physical GPU on a heterogeneous box
+    # while another sits idle. Force PCI order ONLY when the user set no
+    # CUDA_VISIBLE_DEVICES — an explicit restriction was chosen under the runtime's
+    # current order, and re-ordering would silently rename which physical GPUs it means.
+    if not os.environ.get("CUDA_VISIBLE_DEVICES", "").strip():
+        os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     pool = _visible_gpu_pool()
     if pool:
         os.environ["CUDA_VISIBLE_DEVICES"] = pool[idx % len(pool)]
+    else:
+        print(
+            "[conftest] WARNING: no GPU pool found (nvidia-smi missing/empty) — "
+            "xdist workers will all share the default device",
+            file=sys.stderr,
+        )
+    # Per-worker Triton cache: workers otherwise race on the shared
+    # *.bayes_autotune.json / *.failed_compiles.json files — a corrupt read only costs
+    # a re-tune, but it makes -n runs nondeterministic in duration and can pre-seed the
+    # memoization test from a sibling worker.
+    base = os.environ.get("TRITON_CACHE_DIR") or str(Path.home() / ".triton" / "cache")
+    os.environ["TRITON_CACHE_DIR"] = str(Path(base) / f"xdist-{worker}")
 
 
 _pin_worker_gpu()

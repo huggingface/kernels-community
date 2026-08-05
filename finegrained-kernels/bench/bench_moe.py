@@ -79,9 +79,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "torch-ext"))
 sys.path.insert(0, os.path.join(_ROOT, "tests"))
-import triton  # noqa: E402
 import finegrained_kernels as fgm  # noqa: E402  local branch
-from finegrained_kernels.recipes import ue8m0_as_uint8  # noqa: E402  scale -> uint8 view for swizzle
 from kernels import get_kernel  # noqa: E402
 
 # All baselines here are kernels-community repos we already trust; the publisher-trust check
@@ -119,27 +117,13 @@ def _recipe(cfg):
 
 
 def _preswizzle_moe_scale(scale, gate):
-    """Per-expert SWIZZLE_32_4_4 of a grouped MX weight scale ``(E, rows, K//G)`` -> the 5D
-    ``(1, E*blocks, cols//4, 2, 256)`` layout the tcgen05 fast path reads (mirrors
-    ``tests/_swizzle_bs``). ``gate``: rows = ``2*I`` (stacked gate|up), block-interleaved
-    ``[g0,u0,g1,u1,...]`` so a tile reads its gate + up 128-blocks contiguously; else plain
-    per-expert stack. Done once at arm setup (not timed)."""
-    bs_u8 = ue8m0_as_uint8(scale)
-    E, rows, kg = scale.shape
-    cb = triton.cdiv(kg, 4)
-    if gate:
-        nrbN = triton.cdiv(rows // 2, 128)
-        per = [
-            fgm.swizzle_mx_scales(bs_u8[e])
-            .reshape(2, nrbN, cb, 2, 256)
-            .transpose(0, 1)
-            .reshape(2 * nrbN, cb, 2, 256)
-            for e in range(E)
-        ]
-        return torch.cat(per).reshape(1, E * 2 * nrbN, cb, 2, 256)
-    nrb = triton.cdiv(rows, 128)
-    per = [fgm.swizzle_mx_scales(bs_u8[e]) for e in range(E)]
-    return torch.cat(per).reshape(1, E * nrb, cb, 2, 256)
+    """Per-expert SWIZZLE_32_4_4 of a grouped MX weight scale ``(E, rows, K//G)`` -> the swizzled
+    artifact the tcgen05 fast path reads (5-D; 6-D gate-interleaved under ``gate=True``; the
+    library helper owns the expert-stack, interleave, and byte-view contracts). Done once at arm
+    setup (not timed)."""
+    return fgm.swizzle_mx_scales(scale, gate=gate)
+
+
 from utils import WEIGHTS, make_weights  # noqa: E402  tests/utils.py registry
 from transformers.integrations.deepgemm import (  # noqa: E402
     deepgemm_bf16_experts_forward,
@@ -155,6 +139,7 @@ from transformers.integrations.finegrained_fp8 import (  # noqa: E402
     fp8_grouped_mm_experts_forward,
 )
 from transformers.integrations.sonicmoe import sonicmoe_experts_forward  # noqa: E402
+
 
 UPSTREAM_FP8_REV = "v4"  # the pinned hub revision; also the legend suffix
 upstream_fp8 = (None if (MOCK or REPLOT)
@@ -178,6 +163,17 @@ PREFILL_TOKENS = 256 if SMOKE else 8192
 CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2"]
 
 MOE_PROBLEMS = {
+    "deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6)": dict(
+        # config.json: fp8 e4m3, scale_fmt ue8m0, weight_block_size [128,128], dynamic acts.
+        # Same expert geometry as the MXFP4 V4 row below — the difference is the deployed
+        # recipe, so the two rows isolate W4A8 vs W8A8 on identical shapes. UE8M0 scales are
+        # what DeepGEMM's SM100 experts kernel wants, so unlike the V3 fp32 row it gets a
+        # deepgemm baseline. (Router is sqrtsoftplus upstream; the bench's shared softmax
+        # top-k feeds every arm the same weights, so it does not affect the comparison.)
+        E=256, H=4096, I=2048, top_k=6, weights="fp8_128x128_ue8m0", recipe="weights",
+        baselines=("finegrained-fp8", "deepgemm"), fp8_block=[128, 128], block_size=(128, 128),
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
     "deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6)": dict(
         E=256, H=4096, I=2048, top_k=6, weights="mxfp4", recipe="mxfp8",
         baselines=("finegrained-fp8", "deepgemm"), fp8_block=None, block_size=None,
@@ -287,6 +283,7 @@ IMPL_COLORS = {
     "sonicmoe": "#ff7f0e",
     "triton_kernels": "#8c564b",  # OpenAI mxfp4 (GPT-OSS) reference
     "torch": "#e377c2",  # torch/cuBLAS F.scaled_grouped_mm (quantized prefill reference)
+    "torch_mm": "#e377c2",  # torch/cuBLAS F.scaled_mm (the attn-row sibling)
 }
 
 
@@ -299,6 +296,8 @@ def _impl_label(impl, regime):
         return "torch.bmm" if regime == "decode" else "torch._grouped_mm"
     if impl == "torch":
         return "torch.scaled_grouped_mm"
+    if impl == "torch_mm":
+        return "torch.scaled_mm"
     if impl == "finegrained-fp8":
         return f"finegrained-fp8@{UPSTREAM_FP8_REV}"
     return impl
@@ -395,9 +394,9 @@ def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_
 def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     fn = fgm.moe_unfused_grouped if grouped else fgm.moe_unfused_batched
     if _can_preswizzle(cfg):
-        # unfused does gate_up as a PLAIN 2N GEMM then host-chunks, so its scale is read in plain
-        # 2N order (gate=False) -- NOT the fused path's interleaved [g0,u0,...] gate layout.
-        gus = _preswizzle_moe_scale(gus, gate=False)
+        # ONE checkpoint layout: gate_up scales are always the gate-interleaved artifact; the
+        # unfused plain 2N GEMM reads it via the in-kernel INTERLEAVED_SCALES block remap.
+        gus = _preswizzle_moe_scale(gus, gate=True)
         dns = _preswizzle_moe_scale(dns, gate=False)
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], recipe=_recipe(cfg),
@@ -726,6 +725,12 @@ def bench_attn_row(row, pname, cfg, rows_out):
     _mark_static(W, Ws)
     Ws_fp8 = _fp8_scales(Ws, block)
     dg_block = tuple(block) if block else None
+    # deployment layout for the LOCAL arm only (every baseline reads the raw row-major scale):
+    # dense attn weights ship pre-swizzled like the MoE arms, so the 2D op benches the tcgen05
+    # fast path (weight-only recipes stay affine — no swizzled read)
+    Ws_fgm = Ws
+    if PRESWIZZLE and cfg["weights"] in _MX_WEIGHTS and _recipe(cfg) and N % 128 == 0:
+        Ws_fgm = fgm.swizzle_mx_scales(Ws)
     # OpenAI triton_kernels dense mxfp4 matmul (matmul_ogs, no routing): the qkv linear
     # in the GPT-OSS MXFP4 format. Weight is a single (1, K, N) expert, swizzled once
     # at load (same as the fused arm); latency-only (its own weights).
@@ -738,12 +743,47 @@ def bench_attn_row(row, pname, cfg, rows_out):
             flex_ctx=triton_kernels_hub.matmul_ogs.FlexCtx(
                 rhs_data=triton_kernels_hub.matmul_ogs.InFlexData()))
         tk_ogs = triton_kernels_hub.matmul_ogs.matmul_ogs
-    # No torch bar on the attn rows. torch HAS the DeepSeek scheme (ScalingType.BlockWise1x128 +
-    # BlockWise128x128) but its CUDA impl is Hopper-only ("DeepSeek style (1x128, 128x128) scaling
-    # only supported in CUDA for SM90"), so on B200 the closest scaled_mm can execute is RowWise —
-    # a different quantization granularity, which measured ~20 relative vs every block-scaled arm.
-    # Timing unlike work on a shared axis is worse than an absent bar, so it is dropped (same rule
-    # as deepgemm on the fp32-scale row above).
+    # torch.nn.functional.scaled_mm (cuBLAS) reference on the MX-family attn rows (mxfp8 /
+    # nvfp4) — the same layouts scaled_grouped_mm consumes: torchao-blocked SWIZZLE_32_4_4
+    # scales, weight scale blocked once offline, act quant + its blocking inside the timed call
+    # (they change per call, the local arm's inline-quant rule). NVFP4 is two-level (block e4m3
+    # + TensorWise fp32 globals; dynamic acts ride identity). No torch bar on the BLOCK-FP8 attn
+    # rows: torch HAS the DeepSeek scheme (BlockWise1x128 + 128x128) but its CUDA impl is
+    # Hopper-only, and RowWise is a different quantization granularity (measured ~20 relative) —
+    # timing unlike work on a shared axis is worse than an absent bar.
+    torch_mm = None
+    if cfg["weights"] in _MX_WEIGHTS and _recipe(cfg) and not (MOCK or REPLOT):
+        from torch.nn.functional import ScalingType, SwizzleType
+        from torchao.prototype.mx_formats.utils import to_blocked
+
+        nvfp4_row = cfg["weights"] == "nvfp4"
+        FP4 = getattr(torch, "float4_e2m1fn_x2", None)
+        one = torch.ones(1, device=DEV, dtype=torch.float32)
+        if nvfp4_row:
+            sb = [to_blocked(Ws.view(torch.uint8)).view(torch.float8_e4m3fn),
+                  (W_g if W_g is not None else one).reshape(1)]
+            rb = [ScalingType.BlockWise1x16, ScalingType.TensorWise]
+            swz = [SwizzleType.SWIZZLE_32_4_4, SwizzleType.NO_SWIZZLE]
+            mat_b = W.view(FP4).t()
+
+            def torch_mm(a):
+                aq, a_s = fgm.nvfp4_act_quant(a)
+                sa = [to_blocked(a_s.view(torch.uint8)).view(torch.float8_e4m3fn), one]
+                return torch.nn.functional.scaled_mm(
+                    aq.view(FP4), mat_b, sa, rb, sb, rb,
+                    swizzle_a=swz, swizzle_b=swz, output_dtype=torch.bfloat16)
+        else:
+            sb = to_blocked(Ws.view(torch.uint8)).view(torch.float8_e8m0fnu)
+            rb = ScalingType.BlockWise1x32
+            swz = SwizzleType.SWIZZLE_32_4_4
+            mat_b = W.t()
+
+            def torch_mm(a):
+                aq, a_s = fgm.mxfp8_act_quant(a)
+                sa = to_blocked(a_s).view(torch.float8_e8m0fnu)
+                return torch.nn.functional.scaled_mm(
+                    aq, mat_b, sa, rb, sb, rb,
+                    swizzle_a=swz, swizzle_b=swz, output_dtype=torch.bfloat16)
     for regime, tokens in (("decode", DECODE_TOKENS), ("prefill", PREFILL_TOKENS)):
         print(f"   -- {regime}")
         torch.manual_seed(0)
@@ -753,8 +793,10 @@ def bench_attn_row(row, pname, cfg, rows_out):
         _q = fgm.Quantization(input_recipe=_recipe(cfg)) if _recipe(cfg) else None
         attn_arms = {
             "finegrained-kernels": lambda: fgm.matmul_2d(
-                x, W, None, Ws, quantization=_q, output_dtype=torch.bfloat16, b_global_scale=W_g),
+                x, W, None, Ws_fgm, quantization=_q, output_dtype=torch.bfloat16, b_global_scale=W_g),
         }
+        if torch_mm is not None:
+            attn_arms["torch_mm"] = lambda: torch_mm(x)
         if "finegrained-fp8" in cfg["baselines"]:
             attn_arms["finegrained-fp8"] = lambda: upstream_fp8.matmul_2d(x, W, Ws_fp8, block,
                                                        torch.bfloat16)
@@ -829,7 +871,7 @@ def _load_rows_csv(path):
     for pn, c in BF16_PROBLEMS.items():
         allowed["unquantized", pn] = _allowed(c)
     for pn, c in ATTN_PROBLEMS.items():
-        allowed["attn quantized", pn] = _allowed(c)
+        allowed["attn quantized", pn] = _allowed(c) | {"torch_mm"}
     acc = {}  # (cat, problem, regime, impl) -> (res dict, parity)
     for r in csv.DictReader(open(path)):
         if r["impl"] not in allowed.get((r["category"], r["problem"]), {"finegrained-kernels"}):
@@ -854,10 +896,18 @@ def _run_task(kind, pname, cfg, rows_out):
     if kind == "moe":
         # torch = the cuBLAS scaled_grouped_mm quantized reference (moe_torch_grouped, its own
         # sort/GLU/reduce — there's no fused-vs-unfused distinction on the torch side), so it rides
-        # BOTH rows as the same reference. Skipped for W4A16 (recipe=None): F.scaled_grouped_mm
-        # has no bf16-act × mxfp4-weight form — the triton_kernels matmul_ogs baseline is that reference.
-        # fused_extra = other fused-only baselines (single-forward impls with no unfused form).
-        torch_arm_t = () if _recipe(cfg) is None else ("torch",)
+        # BOTH rows as the same reference. MX weight families only: F.scaled_grouped_mm has no
+        # bf16-act × mxfp4-weight form (W4A16's reference is the triton_kernels matmul_ogs
+        # baseline) and no 128×128 block-FP8 form — enlisting those rows just paints a CRASH
+        # marker that reads as a baseline failure. fused_extra = other fused-only baselines
+        # (single-forward impls with no unfused form).
+        # ... and same-family only: scaled_grouped_mm has no mixed-family form (the W4A8
+        # mxfp4-weight x mxfp8-act row raises a contraction-dim mismatch on the packed rhs).
+        torch_arm_t = ("torch",) if (
+            _recipe(cfg) is not None
+            and cfg["weights"] in _MX_WEIGHTS
+            and cfg["recipe"] == "weights"
+        ) else ()
         # the status quo an fgm integration replaces: transformers@main on this checkpoint, via its
         # finegrained_fp8 experts dispatch. It belongs on the UNFUSED row — it applies the GLU in
         # Python between two GEMMs (`self._apply_gate`), so it has no fused epilogue; comparing it
@@ -876,7 +926,12 @@ def _run_task(kind, pname, cfg, rows_out):
         if wanted("quantized", pname):
             bench_problem_row("quantized", pname, cfg, quant_arms, weights, rows_out)
     elif kind == "bf16":
-        bench_problem_row("unquantized", pname, cfg, ("finegrained-kernels",) + cfg["baselines"],
+        # sonic's kernel computes plain SwiGLU only — its integration raises on the clamped/scaled
+        # variants (alpha/limit), so enlisting those rows would paint a CRASH that reads as a
+        # sonic bug rather than an unsupported activation
+        plain_glu = cfg["swiglu_alpha"] is None and cfg["swiglu_limit"] is None
+        arms = tuple(a for a in cfg["baselines"] if a != "sonicmoe" or plain_glu)
+        bench_problem_row("unquantized", pname, cfg, ("finegrained-kernels",) + arms,
                           weights, rows_out)
     else:  # attn
         bench_attn_row("attn quantized", pname, cfg, rows_out)
@@ -895,21 +950,27 @@ elif GPUS > 1 and _SHARD is None and not MOCK:
     # COORDINATOR: fan the tasks across GPUS subprocesses (one device each), merge, then plot.
     import subprocess
 
+    shard_paths = [os.path.join(_HERE, f"bench_moe.shard{g}.csv") for g in range(GPUS)]
+    for sp in shard_paths:  # a leftover shard from a prior run must never merge as fresh data
+        if os.path.exists(sp):
+            os.unlink(sp)
     procs = [subprocess.Popen(
         [sys.executable, os.path.abspath(__file__)] + FILTERS,
         env={**os.environ, "CUDA_VISIBLE_DEVICES": str(g), "BENCH_SHARD": f"{g}/{GPUS}",
              "GPUS": "1"}) for g in range(GPUS)]
     nfail = sum(p.wait() != 0 for p in procs)
-    if nfail:
-        print(f"[warning] {nfail}/{GPUS} shard worker(s) exited non-zero", flush=True)
+    missing = [g for g, sp in enumerate(shard_paths) if not os.path.exists(sp)]
+    if nfail or missing:
+        raise SystemExit(
+            f"{nfail}/{GPUS} shard worker(s) exited non-zero; shards missing: {missing} — "
+            "results are incomplete, not merging (rerun; a partial figure misreads as a full one)"
+        )
     with open(_CSV, "w") as out:  # merge shard CSVs (skip repeated headers)
         out.write(_CSV_HEADER)
-        for g in range(GPUS):
-            sp = os.path.join(_HERE, f"bench_moe.shard{g}.csv")
-            if os.path.exists(sp):
-                with open(sp) as f:
-                    next(f, None)
-                    out.writelines(f)
+        for sp in shard_paths:
+            with open(sp) as f:
+                next(f, None)
+                out.writelines(f)
     rows = _load_rows_csv(_CSV)
 else:
     # single process (GPUS=1) OR one shard worker (BENCH_SHARD="g/n")

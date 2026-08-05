@@ -97,7 +97,9 @@ def is_nvfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     """NVFP4 weight/scale pair: packed E2M1 weights (``int8``, two codes/byte) with E4M3
     group-16 block scales — the scale DTYPE is the recipe carrier (UE8M0 = MX, E4M3 = NV), and
     the group falls out of the shape. This predicate reads the block scale; the per-tensor
-    second-level global is a separate ``b_global_scale`` argument (``nvfp4_quantize_two_level``)."""
+    second-level global is a separate ``b_global_scale`` argument (``nvfp4_quantize_two_level``).
+    Layout-agnostic questions ("is this NVFP4, swizzled or not?") go through ``weight_recipe``,
+    which carries the same dtype rule without the shape check."""
     return (
         weight.dtype == torch.int8
         and scale.dtype == torch.float8_e4m3fn
@@ -136,8 +138,13 @@ def is_preswizzled_mx(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     deployment contract — the same checkpoint feeds grouped prefill and batched decode with no
     per-call rearrange). The 5D shape ``(1, groups, cols//4, 2, 256)`` is the marker; the scale is
     a 1-byte block scale (UE8M0 for MXFP8/MXFP4, E4M3 for NVFP4) against an MX weight (E4M3 or
-    packed E2M1). Recipe-agnostic — NVFP4 pre-swizzles the same way (the layout cuBLAS wants)."""
-    return weight.dtype in (torch.float8_e4m3fn, torch.int8) and scale.ndim == 5
+    packed E2M1). Recipe-agnostic — NVFP4 pre-swizzles the same way (the layout cuBLAS wants).
+    6D is the gate|up artifact: the same blocks with the gate-interleave carried in the shape."""
+    return (
+        weight.dtype in (torch.float8_e4m3fn, torch.int8)
+        and scale.ndim in (5, 6)
+        and scale.element_size() == 1
+    )
 
 
 

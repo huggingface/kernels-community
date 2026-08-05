@@ -52,7 +52,6 @@ from utils import (  # type: ignore
 import finegrained_kernels  # type: ignore
 from finegrained_kernels import Epilogue, Quantization, swizzle_mx_scales  # type: ignore
 from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore
-from finegrained_kernels.recipes import ue8m0_as_uint8  # type: ignore
 from finegrained_kernels.quant import nvfp4_act_quant  # type: ignore
 from finegrained_kernels.epilogue import apply_glu  # type: ignore
 
@@ -80,6 +79,10 @@ class Problem:
     prequant: bool = False  # pass As explicitly (must be bit-identical to raw A)
     static: bool = False  # per-tensor calibrated activation scale (block-scale FP8 path)
     swizzled: bool = False  # pass MX weight scales pre-swizzled (5D SWIZZLE_32_4_4 fast path)
+    # swizzle the weight scale as the gate-INTERLEAVED artifact but launch WITHOUT the gate
+    # epilogue — the one-layout deployment's plain read (the in-kernel INTERLEAVED_SCALES
+    # block remap). Needs swizzled=True and N % 256 == 0 (two whole 128-blocks per half).
+    interleaved: bool = False
     sentinel_fraction: float = 0.0
     noncontiguous: bool = False
     empty_expert: bool = False
@@ -105,6 +108,8 @@ class Problem:
             tag += "_static"
         if self.swizzled:
             tag += "_swizzled"
+        if self.interleaved:
+            tag += "_interleaved"
         if self.sentinel_fraction:
             tag += "_sentinel"
         if self.noncontiguous:
@@ -196,6 +201,25 @@ def scenarios() -> list[Problem]:
         # [g0,u0,g1,u1,...] diverges from a flat [g0,g1,..,u0,u1,..] slab (they coincide only at
         # N=128). Guards every op's swizzled gate reader against the two-slab layout.
         Problem(weight_recipe="mxfp8", gate=True, swizzled=True, N=256, K=512),
+        # the interleave-divergence guard per fp4 family: packed-E2M1 byte-halving and nvfp4's
+        # group-16 column count are exactly the axes the mxfp8 cell above can't cover
+        Problem(weight_recipe="mxfp4", gate=True, output_recipe="mxfp4", swizzled=True, N=256, K=512),
+        Problem(weight_recipe="nvfp4", gate=True, output_recipe="nvfp4", swizzled=True, N=256, K=512),
+        # the one-layout deployment reads the SAME gate-interleaved artifact from PLAIN
+        # (non-gate) launches — the in-kernel INTERLEAVED_SCALES block remap vs the affine
+        # oracle; N=256 makes the interleaved order diverge from the flat slab
+        Problem(weight_recipe="mxfp8", swizzled=True, interleaved=True, N=256, K=512),
+        Problem(weight_recipe="mxfp4", swizzled=True, interleaved=True, N=256, K=512),
+        Problem(weight_recipe="nvfp4", swizzled=True, interleaved=True, N=256, K=512),
+        # swizzled decode (S=8) — the bench's pre-swizzled batched decode arm per fp4 family
+        Problem(weight_recipe="mxfp4", swizzled=True, S=8),
+        Problem(weight_recipe="nvfp4", swizzled=True, S=8),
+        # NVFP4 tiny-M: the 2D kernel's SWAP_AB decode arm (BM=1 swapped dot_scaled — the
+        # only native E4M3 M=1 path) — affine and swizzled, checked against the same oracle
+        Problem(weight_recipe="nvfp4", S=2),
+        Problem(weight_recipe="nvfp4", swizzled=True, S=2),
+        Problem(weight_recipe="mxfp4", gate=True, output_recipe="mxfp4", swizzled=True, S=8),
+        Problem(weight_recipe="nvfp4", gate=True, output_recipe="nvfp4", swizzled=True, S=8),
         # launch-scale smoke (the matrix rides small shapes; this catches scale-dependent
         # scheduling/tiling regressions)
         Problem(weight_recipe="mxfp8", S=2048, E=16, N=512, K=1024),
@@ -211,6 +235,9 @@ def scenarios() -> list[Problem]:
         # (its scales are 128-blocked along N — raises pointing to matmul_2d).
         Problem(weight_recipe="fp8_128x128", N=320, K=1024),
         Problem(weight_recipe="mxfp8", N=320, K=1024),
+        # weight-only GATE at non-dividing N: the affine gate|up scale leaf must clamp its rows
+        # (the up half reads N + offs_bn — unclamped it runs past 2N on the partial last tile)
+        Problem(weight_recipe="mxfp8", gate=True, input_recipe=None, N=320, K=1024),
         Problem(weight_recipe="mxfp8", N=320, K=1024, swizzled=True),  # non-128 N on the swizzled arm (bf16 out, all 3 ops)
         Problem(weight_recipe="mxfp4", input_recipe="mxfp4", N=320, K=320),  # W4A4 non-128 N and K
         Problem(weight_recipe="mxfp4", gate=True, input_recipe="mxfp4", output_recipe="mxfp4", N=320, K=320),  # gated W4A4 non-128 (gpt-oss gate_up)
@@ -274,51 +301,6 @@ def _act_global(problem: Problem, A):
     """NVFP4 is ALWAYS two-level — every nvfp4 activation carries its calibrated global
     ``g_a`` (no single-level nvfp4 exists). Non-nvfp4 recipes have no second level (None)."""
     return _nvfp4_global(A) if problem.weight_recipe == "nvfp4" else None
-
-
-def _swizzle_bs(op, gate, Bs, N, K):
-    """Reorder affine MX weight scales into the 5D SWIZZLE_32_4_4 layout the ops read on the
-    tcgen05 fast path — a pure layout change (values unchanged), so the op's result matches the
-    affine-Bs reference. ``Bs`` is 2D ``(rows, K//g)`` for matmul (one matrix), else the routed
-    ops' ``(E, rows, K//g)``. Uses the deployment's own swizzle helpers."""
-    bs_u8 = ue8m0_as_uint8(Bs)
-    g = K // Bs.shape[-1]
-    cb = triton.cdiv(K // g, 4)
-    if op == "matmul":  # single matrix (rows = N or 2N under gate)
-        if gate:
-            # gate|up (2N, K//g): swizzle the 2N-row slab -> blocks [g0..,u0..], then block-interleave
-            # to [g0,u0,g1,u1,...] -- the one layout the shared 2D/batched reader expects (grouped
-            # reads the same interleave via its own descriptor). Requires N % 128 == 0.
-            nrbN = triton.cdiv(N, 128)
-            return (
-                swizzle_mx_scales(bs_u8)
-                .reshape(2, nrbN, cb, 2, 256)
-                .transpose(0, 1)
-                .reshape(1, 2 * nrbN, cb, 2, 256)
-            )
-        return swizzle_mx_scales(bs_u8).reshape(1, triton.cdiv(Bs.shape[0], 128), cb, 2, 256)
-    # Swizzle each expert independently so its blocks are ceil(rows/128)-aligned (swizzle_mx_scales
-    # pads the partial last block internally): a non-128 ``rows`` keeps its tail block per expert, and
-    # the reader indexes expert e at e*cdiv(rows,128). Byte-identical to a flat E*rows swizzle when
-    # rows is 128-aligned.
-    E, rows, _ = Bs.shape
-    if gate:
-        # Gate|up ``(E, 2N, K//g)`` swizzles as a 2N-row per-expert slab (gate rows [0,N) then up
-        # [N,2N) -> blocks [g0..,u0..]); block-interleave to [g0,u0,g1,u1,...] so the kernel reads a
-        # tile's gate + up 128-blocks as one contiguous 2*(BN//128)-block descriptor load. Requires
-        # N % 128 == 0 (else the gate/up split lands mid-block); the wrapper guards non-128 gate.
-        nrbN = triton.cdiv(N, 128)
-        per_expert = [
-            swizzle_mx_scales(bs_u8[e])
-            .reshape(2, nrbN, cb, 2, 256)
-            .transpose(0, 1)
-            .reshape(2 * nrbN, cb, 2, 256)
-            for e in range(E)
-        ]
-        return torch.cat(per_expert).reshape(1, E * 2 * nrbN, cb, 2, 256)
-    nrb = triton.cdiv(rows, 128)
-    per_expert = [swizzle_mx_scales(bs_u8[e]) for e in range(E)]
-    return torch.cat(per_expert).reshape(1, E * nrb, cb, 2, 256)
 
 
 def _dequant_a(problem: Problem, A):
@@ -454,10 +436,11 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
         B = B[0]
         Bs = Bs[0] if Bs is not None else None
         Bs_global = Bs_global[:1] if Bs_global is not None else None
-    # weight-scale swizzle, shared by all three ops (_swizzle_bs reshapes per op: a 2D matrix for
-    # matmul, the (E, ...) stack for the routed ops).
+    # weight-scale swizzle, shared by all three ops — a pure layout change (values unchanged),
+    # so the op's result still matches the affine-Bs reference. `interleaved` builds the
+    # gate-interleaved artifact for a PLAIN launch (the INTERLEAVED_SCALES in-kernel remap).
     bs = (
-        _swizzle_bs(op, problem.gate, Bs, problem.N, problem.K)
+        swizzle_mx_scales(Bs, gate=problem.gate or problem.interleaved)
         if problem.swizzled and Bs is not None
         else Bs
     )
@@ -549,6 +532,18 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
         / ref_cmp[keep].abs().mean().clamp(min=1e-6)
     ).item()
     assert rel < 0.06, f"requant dequant mean-rel {rel:.4f} vs offline reference"
+    # The mean bound alone is blind to a corrupted minority (one garbage row in 64 still
+    # passes it — the historical broken-winner signature). Bound the per-row error too:
+    # every kept row must individually agree with the reference within a loose factor.
+    # The bound sits above 0.5 because a SINGLE adjacent E2M1 code flip at the row amax is a
+    # legal grid-boundary difference (ref 4s vs op 6s -> exactly 0.5) — garbage rows land ~1.0.
+    row_err = (dq_out[keep] - ref_cmp[keep]).abs().amax(dim=-1)
+    row_ref = ref_cmp[keep].abs().amax(dim=-1).clamp(min=1e-6)
+    worst = (row_err / row_ref).max().item()
+    assert worst < 0.75, (
+        f"requant dequant worst-row rel {worst:.4f} (mean {rel:.4f}) — a localized "
+        f"corruption the mean bound cannot see"
+    )
 
 
 def _skip_moe_only(problem: Problem, op: str) -> None:
@@ -592,12 +587,115 @@ def test_op_scenarios(problem: Problem, op):
     # and op take the identical (A, As): pre-quantizing just hands the op the values it would
     # otherwise compute, and _fp32_intermediate reads whichever form it's given. The nvfp4 activation
     # global comes off the RAW A (before prequant replaces it) and rides separately as As_global.
-    As = None
-    As_global = _act_global(problem, A)
-    if problem.prequant:
-        A, As = _prequant_args(problem, A)
-    g_out = _out_global(problem, op, A, expert_ids, B, Bs, Bs_global, As, As_global)
-    ref = _reference(problem, op, A, expert_ids, B, Bs, Bs_global, As=As, As_global=As_global, out_global=g_out)
+    _run_ref_vs_op(problem, op, A, expert_ids, B, Bs, Bs_global)
+
+
+def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared=None):
+    """The shared ref-vs-op body: build the activation-side operands, run both sides, compare
+    through the one ``_dequant``. Factored out so the forced-config sweep runs the identical
+    check per config; ``shared`` (a dict) caches the config-independent half (operands +
+    reference) across repeated calls at identical inputs, so the sweep re-runs only the op."""
+    if not shared:
+        As = None
+        As_global = _act_global(problem, A)
+        if problem.prequant:
+            A, As = _prequant_args(problem, A)
+        g_out = _out_global(problem, op, A, expert_ids, B, Bs, Bs_global, As, As_global)
+        ref = _reference(problem, op, A, expert_ids, B, Bs, Bs_global, As=As, As_global=As_global, out_global=g_out)
+        if shared is not None:
+            shared.update(A=A, As=As, As_global=As_global, g_out=g_out, ref=ref)
+    else:
+        A, As, As_global, g_out, ref = (
+            shared["A"], shared["As"], shared["As_global"], shared["g_out"], shared["ref"]
+        )
     out = _op(problem, op, A, expert_ids, B, Bs, Bs_global, As=As, As_global=As_global, out_global=g_out)
     _assert_op_layout(problem, op, out)
     _check(problem, _dequant(problem, out, g_out), _dequant(problem, ref, g_out), expert_ids, op)
+
+
+# Cells for the forced-config sweep: one mx grouped gate|up + requant launch (the arm-dense
+# kernel: dot_scaled/dot x memory modes x WS) and one batched decode launch (the swap/scalar
+# arms — the family where a BN=256 winner at N=128 historically corrupted 40/64 rows), plus
+# the SWIZZLED_SCALES/INTERLEAVED_SCALES tune-key axes (their own pruner scopes), the 2D mx
+# kernel (the dense gate fusion and its gate_pointer_only/WS pruners), and one nvfp4 cell
+# (E4M3 scales: the nvfp4_native_ok fence + software decode arms).
+_SWEEP_CELLS = [
+    (Problem(weight_recipe="mxfp8", gate=True, output_recipe="mxfp8"), "grouped", "mx_dynamic_matmul_grouped_kernel"),
+    (Problem(weight_recipe="mxfp4", S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
+    (Problem(weight_recipe="mxfp8", gate=True, output_recipe="mxfp8", swizzled=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
+    (Problem(weight_recipe="mxfp8", gate=True, output_recipe="mxfp8", swizzled=True), "matmul", "mx_dynamic_matmul_kernel"),
+    (Problem(weight_recipe="nvfp4", gate=True, output_recipe="nvfp4", swizzled=True, S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
+]
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.parametrize(
+    "problem, op, kernel_name",
+    _SWEEP_CELLS,
+    ids=[f"{p.id}_{op}" for p, op, _ in _SWEEP_CELLS],
+)
+def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
+    """Force-run EVERY config the pruners admit for one launch and hard-check each against the
+    torch oracle. The tuner benches configs by SPEED, so a wrong-but-fast config that slips the
+    pruners gets crowned silently — the class no winner-only test can see. A forced config may
+    fail to compile/launch (the tuner's forgiven-inf path — reported, not asserted); a config
+    that RUNS must be correct."""
+    import finegrained_kernels.batched as batched_mod
+    import finegrained_kernels.grouped as grouped_mod
+    import finegrained_kernels.matmul as matmul_mod
+
+    tuner = getattr(
+        {"batched": batched_mod, "grouped": grouped_mod, "matmul": matmul_mod}[op],
+        kernel_name,
+    )
+    A, expert_ids = _routed(problem)
+    row = WEIGHTS[problem.weight_recipe]
+    B, Bs, Bs_global = row["make"](
+        2 * problem.N if problem.gate else problem.N, problem.K, problem.E
+    )
+
+    admitted: dict = {}
+    orig_prune, orig_configs = tuner.early_config_prune, tuner.configs
+
+    def spy(configs, named_args, **kwargs):
+        kept = orig_prune(configs, named_args, **kwargs) if orig_prune else configs
+        admitted["configs"] = list(kept)
+        return kept
+
+    tuner.early_config_prune = spy
+    shared: dict = {}
+    try:
+        tuner.cache.clear()
+        _run_ref_vs_op(problem, op, A, expert_ids, B, Bs, Bs_global, shared=shared)
+        assert admitted.get("configs"), "the spy never saw a prune pass — wrong kernel_name?"
+        forgiven = []
+        for cfg in admitted["configs"]:
+            tuner.configs = [cfg]
+            tuner.early_config_prune = None
+            tuner.cache.clear()
+            try:
+                _run_ref_vs_op(problem, op, A, expert_ids, B, Bs, Bs_global, shared=shared)
+            except AssertionError as e:
+                raise AssertionError(f"admitted config computes WRONG results: {cfg}") from e
+            except Exception as e:
+                err = f"{type(e).__name__}: {str(e)[:200]}"
+                # a sticky device fault poisons the context: every LATER config would raise
+                # too and be forgiven, silently gutting the rest of the sweep. Probe the
+                # context directly instead of matching error strings — Triton formats
+                # faults many ways ("Triton Error [CUDA]", "CUDA driver error", ...).
+                try:
+                    torch.ones(1, device=TEST_DEVICE).item()
+                except Exception as probe:
+                    raise AssertionError(
+                        f"config left a STICKY device fault (the context is poisoned): "
+                        f"{cfg}\n{err}\nprobe: {type(probe).__name__}: {str(probe)[:120]}"
+                    ) from e
+                forgiven.append((cfg, err[:120]))
+    finally:
+        tuner.early_config_prune, tuner.configs = orig_prune, orig_configs
+        tuner.cache.clear()
+    if forgiven:
+        print(f"\n[sweep] {len(forgiven)} admitted config(s) failed to compile/run (forgiven):")
+        for cfg, err in forgiven:
+            print(f"  {cfg}: {err}")

@@ -577,7 +577,7 @@ def nvfp4_act_quant(
     (``(1,)`` fp32, the checkpoint's ``input_scale``): values are normalized by it before
     the block quant, so block scales stay in e4m3 range regardless of the activation's
     dynamic range — the canonical two-level recipe. The GEMM folds ``g_a·g_b`` back onto
-    the accumulator (pass ``As = [scales, global_scale]``). ``None`` = single-level
+    the accumulator (pass ``As=scales`` with ``a_global_scale=global_scale``). ``None`` = single-level
     (``g_a = 1``). ``swizzled=True`` emits the scale directly in SWIZZLE_32_4_4 for the
     tcgen05 fast path."""
     return _launch_act_quant(
@@ -601,7 +601,9 @@ def nvfp4_quantize_two_level(
     the folded ``g_a · g_b`` onto the accumulator; the e4m3 block scales ride ``dot_scaled`` as
     usual (activations are single-level ⇒ ``g_a = 1``)."""
     global_scale = (weight.abs().amax() / (6.0 * 448.0)).clamp(min=1e-30).float()
-    packed, block = nvfp4_act_quant((weight / global_scale).contiguous(), swizzled)
+    # normalize in fp32: bf16 / 0-dim-fp32 stays bf16 under type promotion, and the extra
+    # rounding before the block quant flips E2M1 codes vs the exact normalized tensor
+    packed, block = nvfp4_act_quant((weight.float() / global_scale).contiguous(), swizzled)
     return packed.view(torch.int8), block, global_scale.reshape(1)
 
 
