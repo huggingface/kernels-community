@@ -19,7 +19,7 @@ src = [
 ]
 
 [torch.stable-abi]
-cuda = "2.10"
+cuda = "2.9"
 
 [kernel.nvfp4_gemm]
 backend = "cuda"
