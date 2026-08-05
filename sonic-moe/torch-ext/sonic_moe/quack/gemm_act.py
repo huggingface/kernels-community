@@ -246,6 +246,37 @@ class GemmGatedMixin(GemmActMixin):
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
         return self.EpilogueParams(**d)
 
+    def epi_make_aux_out_tiled_copy_r2s(self, params, tiled_copy_r2s, tiled_copy_t2r):
+        if self.arch != 100:
+            return GemmActMixin.epi_make_aux_out_tiled_copy_r2s(
+                self, params, tiled_copy_r2s, tiled_copy_t2r
+            )
+        # Gated aux is half of D's N, but make_tiled_copy_S inherits D's full-N tiler
+        # and over-emits 2x — harmless under the (4,1) epilogue warp shape (stride-0
+        # duplicate), corrupting under (2,2) (cta_tile_m=64 + 2-CTA, i.e. tile_m=128
+        # with cluster_m=2): the extra emission carries the warp-N stride and warp 0
+        # clobbers warp 1's smem. Retile from aux's own tile: one thread per
+        # (M row, N warp) = the tmem_load ownership of registers.
+        # Port of Dao-AILab/quack#133 (TileStore._make_tiled_copy_r2s).
+        copy_atom_aux_out_r2s = self.epi_make_aux_out_copy_atom_r2s(params, tiled_copy_t2r)
+        cta_tile_aux_m = self.cta_tile_shape_mnk[0]
+        _, num_n_warps, _ = self.epi_smem_warp_shape_mnk()
+        assert cta_tile_aux_m * num_n_warps == self.num_epi_warps * cute.arch.WARP_SIZE, (
+            f"gated aux store on SM100 needs one M row per epilogue thread, but "
+            f"cta_tile_m={cta_tile_aux_m} x num_n_warps={num_n_warps} != "
+            f"{self.num_epi_warps * cute.arch.WARP_SIZE} threads. tile_m=64 without 2-CTA "
+            f"gives 16 tmem datapaths per warp and is already wrong there without this "
+            f"branch too (pre-existing, unfixed upstream). Use tile_m=128 or 256."
+        )
+        epi_tile_aux_n = cute.size(params.epi_tile_mAuxOut[1])
+        assert epi_tile_aux_n % num_n_warps == 0, (
+            f"gated aux epi tile N={epi_tile_aux_n} must split evenly across "
+            f"{num_n_warps} N warps"
+        )
+        thr_layout = cute.make_layout((cta_tile_aux_m, num_n_warps), stride=(1, cta_tile_aux_m))
+        val_layout = cute.make_layout((1, epi_tile_aux_n // num_n_warps))
+        return cute.make_tiled_copy_tv(copy_atom_aux_out_r2s, thr_layout, val_layout)
+
     @cute.jit
     def epi_visit_subtile(
         self,
