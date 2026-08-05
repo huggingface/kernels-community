@@ -264,7 +264,9 @@ class GemmGatedMixin(GemmActMixin):
         assert cta_tile_aux_m * num_n_warps == self.num_epi_warps * cute.arch.WARP_SIZE, (
             f"gated aux store on SM100 needs one M row per epilogue thread, but "
             f"cta_tile_m={cta_tile_aux_m} x num_n_warps={num_n_warps} != "
-            f"{self.num_epi_warps * cute.arch.WARP_SIZE} threads"
+            f"{self.num_epi_warps * cute.arch.WARP_SIZE} threads. tile_m=64 without 2-CTA "
+            f"gives 16 tmem datapaths per warp and is already wrong there without this "
+            f"branch too (pre-existing, unfixed upstream). Use tile_m=128 or 256."
         )
         epi_tile_aux_n = cute.size(params.epi_tile_mAuxOut[1])
         assert epi_tile_aux_n % num_n_warps == 0, (
