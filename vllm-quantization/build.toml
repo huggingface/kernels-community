@@ -1,0 +1,269 @@
+[general]
+name = "vllm-quantization"
+version = 0
+license = "Apache-2.0"
+backends = ["cuda"]
+
+[general.hub]
+repo-id = "kernels-community/vllm-quantization"
+
+[torch]
+include = [ "." ]
+src = [
+    "core/scalar_type.hpp",
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.gptq_marlin]
+backend = "cuda"
+cuda-capabilities = [
+    "8.0",
+    "8.6",
+    "8.7",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.1",
+    "12.0",
+]
+depends = ["torch"]
+include = ["."]
+src = [
+    "core/scalar_type.hpp",
+    "gptq_marlin/awq_marlin_repack.cu",
+    "gptq_marlin/dequant.h",
+    "gptq_marlin/gptq_marlin.cu",
+    "gptq_marlin/gptq_marlin_repack.cu",
+    "gptq_marlin/kernel.h",
+    "gptq_marlin/kernel_bf16_kfe2m1f.cu",
+    "gptq_marlin/kernel_bf16_kfe4m3fn.cu",
+    "gptq_marlin/kernel_bf16_ku4.cu",
+    "gptq_marlin/kernel_bf16_ku4b8.cu",
+    "gptq_marlin/kernel_bf16_ku8b128.cu",
+    "gptq_marlin/kernel_fp16_kfe2m1f.cu",
+    "gptq_marlin/kernel_fp16_kfe4m3fn.cu",
+    "gptq_marlin/kernel_fp16_ku4.cu",
+    "gptq_marlin/kernel_fp16_ku4b8.cu",
+    "gptq_marlin/kernel_fp16_ku8b128.cu",
+    "gptq_marlin/marlin.cuh",
+    "gptq_marlin/marlin_dtypes.cuh",
+    "gptq_marlin/marlin_template.h",
+]
+
+#[kernel.fp8_common_rocm]
+#backend = "rocm"
+#depends = ["torch"]
+#rocm-archs = [
+#    "gfx906",
+#    "gfx908",
+#    "gfx90a",
+#    "gfx940",
+#    "gfx941",
+#    "gfx942",
+#    "gfx1030",
+#    "gfx1100",
+#    "gfx1101",
+#]
+#include = ["."]
+#src = [
+#    "attention/attention_dtypes.h",
+#    "attention/attention_generic.cuh",
+#    "attention/dtype_bfloat16.cuh",
+#    "attention/dtype_float16.cuh",
+#    "attention/dtype_float32.cuh",
+#    "attention/dtype_fp8.cuh",
+#    "fp8/amd/quant_utils.cuh",
+#    "fp8/common.cu",
+#    "fp8/common.cuh",
+#    "dispatch_utils.h",
+#    "utils.cuh",
+#    "vectorization.cuh",
+#]
+
+[kernel.int8_common]
+backend = "cuda"
+cuda-capabilities = [
+    "7.0",
+    "7.2",
+    "7.5",
+    "8.0",
+    "8.6",
+    "8.7",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.1",
+    "12.0",
+]
+depends = ["torch"]
+include = ["."]
+src = [
+    "compressed_tensors/int8_quant_kernels.cu",
+    "dispatch_utils.h",
+    "vectorization_utils.cuh",
+]
+
+[kernel.fp8_common]
+backend = "cuda"
+cuda-capabilities = [
+    "7.0",
+    "7.2",
+    "7.5",
+    "8.0",
+    "8.6",
+    "8.7",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.1",
+    "12.0",
+]
+depends = ["torch"]
+include = ["."]
+src = [
+    "fp8/common.cu",
+    "fp8/common.cuh",
+    "dispatch_utils.h",
+    "utils.cuh",
+    "vectorization.cuh",
+]
+
+[kernel.cutlass_w8a8_hopper]
+backend = "cuda"
+cuda-capabilities = ["9.0a"]
+cuda-minver = "12.0"
+depends = [
+    "cutlass_3_9",
+    "torch",
+]
+include = ["."]
+src = [
+    "cuda_utils.h",
+    "core/math.hpp",
+    "cutlass_w8a8/c3x/cutlass_gemm_caller.cuh",
+    "cutlass_w8a8/c3x/scaled_mm_azp_sm90_int8.cu",
+    "cutlass_w8a8/c3x/scaled_mm_blockwise_sm90_fp8.cu",
+    "cutlass_w8a8/c3x/scaled_mm_blockwise_sm90_fp8_dispatch.cuh",
+    "cutlass_w8a8/c3x/scaled_mm.cuh",
+    "cutlass_w8a8/c3x/scaled_mm_kernels.hpp",
+    "cutlass_w8a8/c3x/scaled_mm_sm90_fp8.cu",
+    "cutlass_w8a8/c3x/scaled_mm_sm90_fp8_dispatch.cuh",
+    "cutlass_w8a8/c3x/scaled_mm_sm90_int8.cu",
+    "cutlass_w8a8/c3x/scaled_mm_sm90_int8_dispatch.cuh",
+    "cutlass_w8a8/c3x/scaled_mm_helper.hpp",
+    "cutlass_w8a8/scaled_mm_c3x_sm90.cu",
+    "cutlass_extensions/common.hpp",
+    "cutlass_extensions/epilogue/scaled_mm_epilogues_c3x.hpp",
+    "cutlass_extensions/epilogue/broadcast_load_epilogue_c3x.hpp",
+    "cutlass_extensions/epilogue/broadcast_load_epilogue_array_c3x.hpp",
+    "cutlass_extensions/gemm/dispatch_policy.hpp",
+    "cutlass_extensions/gemm/collective/collective_builder.hpp",
+    "cutlass_extensions/gemm/collective/fp8_accumulation.hpp",
+    "cutlass_extensions/gemm/collective/sm90_mma_tma_gmma_ss_warpspecialized_fp8_blockwise_scaling.hpp",
+]
+
+
+
+[kernel.cutlass_w8a8_blackwell]
+backend = "cuda"
+cuda-capabilities = [
+    "10.0a",
+    "10.1a",
+    "12.0a",
+]
+cuda-minver = "12.9"
+depends = [
+    "cutlass_3_9",
+    "torch",
+]
+include = ["."]
+src = [
+    "cuda_utils.h",
+    "cutlass_w8a8/scaled_mm_c3x_sm100.cu",
+    "cutlass_w8a8/c3x/scaled_mm_blockwise_sm100_fp8.cu",
+    "cutlass_w8a8/c3x/scaled_mm_blockwise_sm100_fp8_dispatch.cuh",
+    "cutlass_w8a8/c3x/scaled_mm_helper.hpp",
+    "cutlass_w8a8/c3x/scaled_mm_kernels.hpp",
+    "cutlass_w8a8/c3x/scaled_mm_sm100_fp8.cu",
+    "cutlass_w8a8/c3x/scaled_mm_sm100_fp8_dispatch.cuh",
+]
+
+[kernel.cutlass_w8a8]
+backend = "cuda"
+cuda-capabilities = [
+    "7.5",
+    "8.0",
+    "8.6",
+    "8.7",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.1",
+    "12.0",
+]
+depends = [
+    "cutlass_3_9",
+    "torch",
+]
+include = ["."]
+src = [
+    "core/math.hpp",
+    "cutlass_w8a8/scaled_mm_c2x.cu",
+    "cutlass_w8a8/scaled_mm_c2x.cuh",
+    "cutlass_w8a8/scaled_mm_c2x_sm75_dispatch.cuh",
+    "cutlass_w8a8/scaled_mm_c2x_sm80_dispatch.cuh",
+    "cutlass_w8a8/scaled_mm_c2x_sm89_fp8_dispatch.cuh",
+    "cutlass_w8a8/scaled_mm_c2x_sm89_int8_dispatch.cuh",
+    "cutlass_w8a8/scaled_mm_entry.cu",
+    "cutlass_extensions/common.cpp",
+    "cutlass_extensions/common.hpp",
+    "cutlass_extensions/epilogue/scaled_mm_epilogues_c2x.hpp",
+    "cutlass_extensions/epilogue/broadcast_load_epilogue_c2x.hpp",
+]
+
+[kernel.marlin]
+backend = "cuda"
+cuda-capabilities = [
+    "8.0",
+    "8.6",
+    "8.7",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.1",
+    "12.0",
+]
+depends = ["torch"]
+include = ["."]
+src = [
+    "core/scalar_type.hpp",
+    "marlin/dense/common/base.h",
+    "marlin/dense/common/mem.h",
+    "marlin/dense/marlin_cuda_kernel.cu",
+    "marlin/qqq/marlin_qqq_gemm_kernel.cu",
+    "marlin/sparse/common/base.h",
+    "marlin/sparse/common/mem.h",
+    "marlin/sparse/common/mma.h",
+    "marlin/sparse/marlin_24_cuda_kernel.cu",
+]
+
+#[kernel.int8_common_rocm]
+#backend = "rocm"
+#depends = ["torch"]
+#rocm-archs = [
+#    "gfx906",
+#    "gfx908",
+#    "gfx90a",
+#    "gfx940",
+#    "gfx941",
+#    "gfx942",
+#    "gfx1030",
+#    "gfx1100",
+#    "gfx1101",
+#]
+#include = ["."]
+#src = [
+#    "compressed_tensors/int8_quant_kernels.cu",
+#    "dispatch_utils.h",
+#]
