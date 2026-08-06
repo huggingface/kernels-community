@@ -15,18 +15,18 @@ from torch.testing._internal.optests.generate_tests import (
 
 apply_rotary_emb = None
 
-# import kernels
-# flash_attn3 = kernels.get_kernel("kernels-community/flash-attn3")
-# ops = flash_attn3._ops.ops
-# add_op_namespace_prefix = flash_attn3._ops.add_op_namespace_prefix
-from flash_attn3 import (
-    flash_attn_combine,
-    flash_attn_func,
-    flash_attn_varlen_func,
-    flash_attn_with_kvcache,
-    get_scheduler_metadata,
-)
-from flash_attn3._ops import add_op_namespace_prefix, ops
+import kernels
+
+
+_flash_attn3 = kernels.get_kernel("kernels-community/flash-attn3", version=1)
+ops = _flash_attn3._ops.ops
+add_op_namespace_prefix = _flash_attn3._ops.add_op_namespace_prefix
+
+flash_attn_combine = _flash_attn3.flash_attn_combine
+flash_attn_func = _flash_attn3.flash_attn_func
+flash_attn_varlen_func = _flash_attn3.flash_attn_varlen_func
+flash_attn_with_kvcache = _flash_attn3.flash_attn_with_kvcache
+get_scheduler_metadata = _flash_attn3.get_scheduler_metadata
 
 from .padding import pad_input, unpad_input
 from .test_util import (
