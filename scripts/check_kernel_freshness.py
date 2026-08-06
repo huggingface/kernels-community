@@ -29,6 +29,7 @@ KERNEL_SOURCE_MAPPING = {
     "megablocks": "https://github.com/databricks/megablocks",
     "mra": "",
     "msa": "https://github.com/MiniMax-AI/MSA",
+    "natten": "https://github.com/SHI-Labs/NATTEN",
     "paged-attention": "",
     "punica-sgmv": "https://github.com/predibase/lorax",
     "quantization-bitsandbytes": "https://github.com/bitsandbytes-foundation/bitsandbytes",
@@ -60,6 +61,8 @@ KERNEL_SOURCE_MAPPING = {
     # Too much stuff happening in vLLM, not worth reporting as MoE freshness.
     "vllm-moe": "",
     "fla": "github.com/fla-org/flash-linear-attention",
+    # Developed in-house; upstream is a Hub kernel repo, not a GitHub project.
+    "esmfold2-trimul": "",
 }
 
 def parse_args() -> argparse.Namespace:
