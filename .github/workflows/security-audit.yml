@@ -69,6 +69,15 @@ jobs:
           REPO: ${{ github.repository }}
         run: gh pr diff "${PR_NUMBER}" --repo "${REPO}" > /tmp/changes.diff
 
+      - name: Validate diff for prompt injection patterns
+        run: |
+          # Scan for common prompt injection patterns in the diff
+          if grep -iE '(ignore (previous|all|above) (instruction|prompt|direction|rule)s?|you are now|forget (your|previous) (role|instruction|task)|disregard (previous|above|all)|new task:|system prompt|your (real|actual) (purpose|role|task) is)' /tmp/changes.diff; then
+            echo "ERROR: Diff contains potential prompt injection patterns"
+            echo "Manual security review required before AI analysis"
+            exit 1
+          fi
+
       # NOTE: in the invocation of Claude below, we restrict it to read-only
       # local tools to avoid potential token exfiltration attacks.
       - name: Run security audit
@@ -230,6 +239,12 @@ jobs:
             echo "has_findings=false" >> "$GITHUB_OUTPUT"
             echo "Security audit complete — no findings."
           else
+            # Additional validation: ensure output doesn't contain injection indicators
+            if grep -iE '(ignore (previous|all|above) (instruction|prompt|direction|rule)s?|you are now|forget (your|previous) (role|instruction|task)|as an AI|I cannot|I am unable to)' /tmp/audit_result.txt; then
+              echo "ERROR: LLM output contains potential prompt injection artifacts"
+              echo "Manual review required - possible prompt injection in diff content"
+              exit 1
+            fi
             echo "has_findings=true" >> "$GITHUB_OUTPUT"
             echo "Security audit complete — findings detected, commenting on PR."
           fi
