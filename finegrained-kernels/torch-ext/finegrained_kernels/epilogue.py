@@ -240,6 +240,67 @@ def glu(
 
 
 
+@triton.jit
+def _glu_kernel(
+    gate_up_ptr, out_ptr, n_out,
+    I: tl.constexpr, ACT_FN: tl.constexpr,
+    SWIGLU_ALPHA: tl.constexpr, SWIGLU_LIMIT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Fused GLU over a contiguous (S, 2I) [gate|up] tensor -> (S, I), covering every
+    ``apply_glu`` variant (silu/gelu/relu, ``SWIGLU_ALPHA``/``SWIGLU_LIMIT`` clamped-SwiGLU
+    — ``None`` folds the arm out, the in-kernel ``glu``'s convention). Rounds through the
+    output dtype after each op exactly where the torch chain does (each torch tensor op
+    materializes), so the two are bit-identical."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_out
+    base = (offs // I) * 2 * I + offs % I
+    dt = out_ptr.dtype.element_ty
+    g = tl.load(gate_up_ptr + base, mask=mask).to(tl.float32)
+    u = tl.load(gate_up_ptr + base + I, mask=mask).to(tl.float32)
+    if SWIGLU_LIMIT is not None:
+        g = tl.minimum(g, SWIGLU_LIMIT)
+        u = tl.clamp(u, -SWIGLU_LIMIT, SWIGLU_LIMIT)
+    if SWIGLU_ALPHA is not None:  # (up + 1) * gate * sigmoid(alpha * gate)
+        sig = tl.sigmoid((g * SWIGLU_ALPHA).to(dt).to(tl.float32)).to(dt).to(tl.float32)
+        act = (g * sig).to(dt).to(tl.float32)
+        out = ((u + 1.0).to(dt).to(tl.float32) * act).to(dt)
+    elif ACT_FN == "silu":
+        sig = tl.sigmoid(g).to(dt).to(tl.float32)
+        act = (g * sig).to(dt).to(tl.float32)
+        out = (act * u).to(dt)
+    elif ACT_FN == "gelu":  # exact via erf, torch's evaluation order
+        e = tl.erf((g * 0.7071067811865476).to(dt).to(tl.float32)).to(dt).to(tl.float32)
+        d = (1.0 + e).to(dt).to(tl.float32)
+        a = (0.5 * g).to(dt).to(tl.float32)
+        out = ((a * d).to(dt).to(tl.float32) * u).to(dt)
+    else:  # relu
+        out = (tl.maximum(g, 0.0) * u).to(dt)
+    tl.store(out_ptr + offs, out, mask=mask)
+
+
+def fused_glu(
+    gate_up: torch.Tensor,
+    act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+) -> torch.Tensor:
+    """GLU over the stacked (S, 2I) [gate|up] GEMM output — the one-kernel ``_glu_kernel``
+    on a contiguous CUDA tensor (the torch chain is three-plus strided elementwise kernels —
+    ~15µs of a ~75µs fp8 decode step), the torch ``apply_glu`` on any fallback layout.
+    Both orders are bit-identical for every variant."""
+    I = gate_up.shape[-1] // 2
+    if gate_up.is_contiguous() and act_fn in ("silu", "gelu", "relu"):
+        out = torch.empty(*gate_up.shape[:-1], I, dtype=gate_up.dtype, device=gate_up.device)
+        n = out.numel()
+        _glu_kernel[(triton.cdiv(n, 1024),)](
+            gate_up, out, n, I, act_fn, swiglu_alpha, swiglu_limit, BLOCK=1024
+        )
+        return out
+    gate, up = gate_up.chunk(2, dim=-1)
+    return apply_glu(gate, up, act_fn, swiglu_alpha, swiglu_limit)
+
+
 def apply_glu(
     gate: torch.Tensor,
     up: torch.Tensor,

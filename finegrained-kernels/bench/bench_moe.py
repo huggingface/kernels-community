@@ -140,6 +140,34 @@ from transformers.integrations.finegrained_fp8 import (  # noqa: E402
 )
 from transformers.integrations.sonicmoe import sonicmoe_experts_forward  # noqa: E402
 
+# vLLM's triton fused-MoE kernel — its bf16 serving path (DeepGEMM/CUTLASS/FlashInfer are its
+# quantized backends). Soft import off the local checkout; the arm is enlisted only when it
+# resolves. Tuned tile configs for the roster's shapes ship in bench/vllm_configs — vLLM has
+# no B200 bf16 JSONs for them and would silently fall back to heuristic defaults (measured
+# 12-23% slow at prefill).
+os.environ.setdefault("VLLM_TUNED_CONFIG_FOLDER", os.path.join(_HERE, "vllm_configs"))
+sys.path.insert(0, os.path.expanduser("~/vllm"))
+try:
+    from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts as vllm_fused_experts  # noqa: E402
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation as _VllmAct  # noqa: E402
+    from vllm.model_executor.layers.fused_moe.config import fp8_w8a8_moe_quant_config as _vllm_fp8_qc  # noqa: E402
+except ImportError:
+    vllm_fused_experts = None
+# FlashInfer TRT-LLM fused MoE (NVIDIA's Blackwell serving kernels) — installed --no-deps
+# (its PyPI pin would downgrade torch; the JIT has no torch ABI coupling). JIT needs
+# CUDA_HOME >= 12.8 at first compile; the built module is cached under ~/.cache/flashinfer.
+try:
+    # the JIT'd module dlopens libcudart.so.12 by name — preload it into global scope
+    # (torch keeps its copy private)
+    import ctypes, glob  # noqa: E402
+    _cudart = (glob.glob(os.path.join(os.environ.get("CUDA_HOME", ""), "lib64/libcudart.so.12*"))
+               or glob.glob(os.path.join(os.path.dirname(torch.__file__),
+                            "../nvidia/cuda_runtime/lib/libcudart.so.12*")))
+    ctypes.CDLL(_cudart[0], mode=ctypes.RTLD_GLOBAL)
+    from flashinfer.fused_moe import trtllm_fp8_block_scale_routed_moe  # noqa: E402
+except Exception:
+    trtllm_fp8_block_scale_routed_moe = None
+
 
 UPSTREAM_FP8_REV = "v4"  # the pinned hub revision; also the legend suffix
 upstream_fp8 = (None if (MOCK or REPLOT)
@@ -171,7 +199,7 @@ MOE_PROBLEMS = {
         # deepgemm baseline. (Router is sqrtsoftplus upstream; the bench's shared softmax
         # top-k feeds every arm the same weights, so it does not affect the comparison.)
         E=256, H=4096, I=2048, top_k=6, weights="fp8_128x128_ue8m0", recipe="weights",
-        baselines=("finegrained-fp8", "deepgemm"), fp8_block=[128, 128], block_size=(128, 128),
+        baselines=("finegrained-fp8", "deepgemm", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6)": dict(
@@ -199,7 +227,7 @@ MOE_PROBLEMS = {
         # DeepSeek-V3 experts deploy fp32 block scales (software rescale). DeepGEMM's SM100
         # experts kernel requires UE8M0 and fails loud on fp32, so no deepgemm baseline here.
         E=256, H=7168, I=2048, top_k=8, weights="fp8_128x128", recipe="weights",
-        baselines=("finegrained-fp8",), fp8_block=[128, 128], block_size=(128, 128),
+        baselines=("finegrained-fp8", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4)": dict(
@@ -212,31 +240,31 @@ MOE_PROBLEMS = {
 BF16_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6)": dict(
         E=256, H=4096, I=2048, top_k=6, weights="bf16", recipe="weights",
-        baselines=("transformers", "sonicmoe", "deepgemm_bf16"),
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
         fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4)": dict(
         E=128, H=2880, I=2880, top_k=4, weights="bf16", recipe="weights",
-        baselines=("transformers", "sonicmoe", "deepgemm_bf16"),
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
         fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
     ),
     "zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8)": dict(
         E=256, H=6144, I=2048, top_k=8, weights="bf16", recipe="weights",
-        baselines=("transformers", "sonicmoe", "deepgemm_bf16"),
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
         fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8)": dict(
         E=256, H=7168, I=2048, top_k=8, weights="bf16", recipe="weights",
-        baselines=("transformers", "sonicmoe", "deepgemm_bf16"),
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
         fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4)": dict(
         E=128, H=6144, I=3072, top_k=4, weights="bf16", recipe="weights",
-        baselines=("transformers", "sonicmoe", "deepgemm_bf16"),
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
         fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
     ),
@@ -281,6 +309,8 @@ IMPL_COLORS = {
     "transformers": "#9467bd",
     "transformers@main": "#7f7f7f",  # transformers main on a quantized checkpoint (status quo)
     "sonicmoe": "#ff7f0e",
+    "vllm": "#17becf",  # vLLM triton fused-MoE (its bf16 serving kernel)
+    "trtllm": "#76b900",  # FlashInfer TRT-LLM fused MoE (NVIDIA Blackwell serving kernels)
     "triton_kernels": "#8c564b",  # OpenAI mxfp4 (GPT-OSS) reference
     "torch": "#e377c2",  # torch/cuBLAS F.scaled_grouped_mm (quantized prefill reference)
     "torch_mm": "#e377c2",  # torch/cuBLAS F.scaled_mm (the attn-row sibling)
@@ -298,6 +328,10 @@ def _impl_label(impl, regime):
         return "torch.scaled_grouped_mm"
     if impl == "torch_mm":
         return "torch.scaled_mm"
+    if impl == "vllm":
+        return "vLLM fused_moe"
+    if impl == "trtllm":
+        return "TRT-LLM (FlashInfer)"
     if impl == "finegrained-fp8":
         return f"finegrained-fp8@{UPSTREAM_FP8_REV}"
     return impl
@@ -516,6 +550,54 @@ def sonicmoe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     return lambda: sonicmoe_experts_forward(mod, hidden, idx, w)
 
 
+def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
+    """FlashInfer TRT-LLM fp8-block routed MoE (the DeepSeek recipe on SM100). Weight prep
+    (offline): TRT-LLM's gate|up order is [up; gate] — the halves swap; UE8M0 scales ride
+    as fp32 (same values). Routing rides packed ``(expert_id << 16) | bf16-weight`` ids;
+    the activation quant (1x128, TRANSPOSED [K/128, T] scale layout) is inside the timed
+    call, the local arm's inline-quant rule. Numerics caveat (oracle-checked 2026-08-06):
+    ~4.8e-2 from the exact block recipe vs our 2.8e-3 — looser than vLLM-triton's 1.7e-2."""
+    E, I2, H = gu.shape
+    I = I2 // 2
+    g1 = torch.cat([gu[:, I:], gu[:, :I]], dim=1).contiguous()
+    gus_f = gus.float()  # UE8M0 first: cat has no e8m0 kernel
+    g1s = torch.cat([gus_f[:, I // 128:], gus_f[:, : I // 128]], dim=1).contiguous()
+    dns_f = dns.float().contiguous()
+    packed = (idx.to(torch.int32) << 16) | (
+        w.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF)
+
+    def run():
+        hq, hs = fgm.fp8_act_quant_block_dynamic(hidden, 128)
+        out = trtllm_fp8_block_scale_routed_moe(
+            packed, None, hq, hs.t().contiguous(), g1, g1s, dn, dns_f,
+            num_experts=E, top_k=idx.shape[1], n_group=None, topk_group=None,
+            intermediate_size=I, local_expert_offset=0, local_num_experts=E,
+            routed_scaling_factor=None, routing_method_type=1,
+        )
+        return out[0] if isinstance(out, (list, tuple)) else out
+
+    return run
+
+
+def vllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
+    """vLLM triton fused-MoE — the kernel its serving path runs for bf16 and for
+    block-fp8 W8A8 (the DeepSeek scheme; dynamic per-token-group act quant inside),
+    tuned tiles from bench/vllm_configs. UE8M0 weight scales ride as fp32 (same values —
+    vLLM stores block scales fp32). Plain SwiGLU only: the functional API doesn't thread
+    clamp_limit/alpha (vLLM's class-based serving path takes them from the quant config).
+    MX/NVFP4 rows are out of reach here: the functional API refuses ocp_mx_scheme
+    (emulation-only); vLLM's native paths are its class-based FlashInfer/CUTLASS/Marlin
+    backends, each with its own weight interleaving."""
+    tki = idx.to(torch.int32)
+    tkw = w.to(torch.float32)
+    qc = None
+    if cfg["fp8_block"] is not None:
+        qc = _vllm_fp8_qc(w1_scale=gus.float(), w2_scale=dns.float(),
+                          block_shape=list(cfg["fp8_block"]))
+    return lambda: vllm_fused_experts(hidden, gu, dn, tkw, tki,
+                                      activation=_VllmAct.SILU, quant_config=qc)
+
+
 def deepgemm_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     """DeepGEMM M-grouped experts (transformers integration): FP8 128-block (UE8M0
     scales on SM100) or FP4 (int8-packed weights, group-32 UE8M0) with FP8 acts."""
@@ -584,6 +666,8 @@ ARMS = {
     "transformers": transformers_arm,
     "transformers@main": transformers_main_arm,
     "sonicmoe": sonicmoe_arm,
+    "vllm": vllm_moe_arm,
+    "trtllm": trtllm_moe_arm,
     "deepgemm": deepgemm_arm,
     "deepgemm_bf16": deepgemm_bf16_arm,
     "triton_kernels": triton_kernels_arm,
@@ -923,6 +1007,10 @@ def _run_task(kind, pname, cfg, rows_out):
                      if "finegrained-fp8" in cfg["baselines"] and _recipe(cfg) is not None else ())
         quant_arms = (("finegrained-kernels",) + cfg["baselines"] + cfg.get("fused_extra", ())
                       + tfm_arm_t + torch_arm_t)
+        # soft-imported arms drop out where their package is absent
+        unavailable = (("vllm",) if vllm_fused_experts is None else ()) + (
+            ("trtllm",) if trtllm_fp8_block_scale_routed_moe is None else ())
+        quant_arms = tuple(a for a in quant_arms if a not in unavailable)
         if wanted("quantized", pname):
             bench_problem_row("quantized", pname, cfg, quant_arms, weights, rows_out)
     elif kind == "bf16":
@@ -930,7 +1018,9 @@ def _run_task(kind, pname, cfg, rows_out):
         # variants (alpha/limit), so enlisting those rows would paint a CRASH that reads as a
         # sonic bug rather than an unsupported activation
         plain_glu = cfg["swiglu_alpha"] is None and cfg["swiglu_limit"] is None
-        arms = tuple(a for a in cfg["baselines"] if a != "sonicmoe" or plain_glu)
+        arms = tuple(a for a in cfg["baselines"]
+                     if (a not in ("sonicmoe", "vllm") or plain_glu)
+                     and (a != "vllm" or vllm_fused_experts is not None))
         bench_problem_row("unquantized", pname, cfg, ("finegrained-kernels",) + arms,
                           weights, rows_out)
     else:  # attn
@@ -1051,8 +1141,7 @@ for ri, row in enumerate(present_rows):
                     return i
             return len(CANONICAL_MODEL_ORDER)
         problems.sort(key=_model_rank)
-        # FIXED impl slots: every impl keeps the same offset under every tick
-        # (finegrained-kernels leftmost); unsupported impls leave their slot empty
+        # legend order stays canonical; the BARS are speed-ranked per group below
         row_impls = list(dict.fromkeys(i for _, i, *_ in cells))
         labeled = set()
         overlay_drawn = False  # any compile-beats-cudagraph overlay in this panel?
@@ -1065,14 +1154,13 @@ for ri, row in enumerate(present_rows):
             model = model.split("/")[-1]
             rest = rest.removeprefix("attn ").removesuffix(" qkv-shaped")
             ticklabels.append(f"{model}\n{rest}" if rest else model)
-            for impl in row_impls:
-                off = (row_impls.index(impl)
-                       - (len(row_impls) - 1) / 2) * GLOBAL_WIDTH
-                cell = next(((r, par) for p, i, r, par in cells
-                             if p == pname and i == impl), None)
-                if cell is None:
-                    continue  # impl doesn't support this problem — empty slot
-                res = cell[0]
+            # bars speed-ranked within the group (fastest leftmost, crashed last),
+            # centered on the group's own arm count — colors identify the impls
+            group = [(i, r) for p, i, r, _par in cells if p == pname]
+            group.sort(key=lambda t: (t[1].get(solid_mode) is None,
+                                      t[1].get(solid_mode) or 0.0))
+            for slot, (impl, res) in enumerate(group):
+                off = (slot - (len(group) - 1) / 2) * GLOBAL_WIDTH
                 sval = res.get(solid_mode)
                 if sval is not None:
                     ax.bar(gi + off, sval, GLOBAL_WIDTH, color=IMPL_COLORS[impl],

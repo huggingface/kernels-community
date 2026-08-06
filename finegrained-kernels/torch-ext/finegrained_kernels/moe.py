@@ -41,7 +41,7 @@ from .compat import MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, weighted_reduce
 from .recipes import Epilogue, Quantization, is_mx, is_mxfp4, weight_recipe
 from .quant import _launch_act_quant
 from .scheduling import compute_grouped_scheduling
-from .epilogue import apply_glu
+from .epilogue import fused_glu
 
 
 def _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale):
@@ -352,8 +352,7 @@ def moe_unfused_grouped(
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
-    gate, up = gate_up_out.chunk(2, dim=-1)
-    inter = apply_glu(gate, up, act_fn, swiglu_alpha, swiglu_limit)
+    inter = fused_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit)
     # down over the expert-ordered intermediate (quantized in the same recipe), scattering
     # to routed rows.
     down_out = matmul_grouped(
@@ -509,8 +508,7 @@ def moe_torch_grouped(
         gate_up_proj_global_scale,
         gate_up_input_global_scale,
     )
-    gate, up = gate_up.chunk(2, dim=-1)
-    inter = apply_glu(gate, up, act_fn, swiglu_alpha, swiglu_limit)
+    inter = fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit)
     down_out = grouped_mm(
         inter, down_proj, down_proj_scale_inv, down_proj_global_scale, down_input_global_scale
     )
@@ -548,7 +546,6 @@ def moe_unfused_batched(
     recipe = _block_recipe(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, recipe
     )
-
     NUM_EXPERTS = gate_up_proj.size(0)
     expert_ids = top_k_index.reshape(-1)
     gather_idx = _gather_idx(top_k_index)
@@ -565,8 +562,7 @@ def moe_unfused_batched(
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
-    gate, up = gate_up_out.chunk(2, dim=-1)
-    inter = apply_glu(gate, up, act_fn, swiglu_alpha, swiglu_limit)
+    inter = fused_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit)
     # down over the intermediate (quantized in the same recipe), routed-order output.
     down_out = matmul_batched(
         inter,

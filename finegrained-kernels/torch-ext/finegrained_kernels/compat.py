@@ -314,6 +314,7 @@ def get_accelerator_autotuning_configs(
     tune_block_nk: bool = False,
     swap_ab: bool = False,
     warp_spec: bool = False,
+    packed_schedule: bool = False,
     compute_modes=None,
     a_memory_modes=None,
     b_memory_modes=None,
@@ -433,6 +434,12 @@ def get_accelerator_autotuning_configs(
 
     if warp_spec and get_active_device_type() == "cuda":
         blocks = [{**b, "WARP_SPEC": ws} for b in blocks for ws in (False, True)]
+
+    if packed_schedule:
+        # grouped M-tile resolution axis: packed-table loads vs the E-wide register-resident
+        # layout — pure register relief, bit-identical tiles; wins only where the inline
+        # resolve is pressure-walled (dsv4 BM128/BK256 regs 244->187, +8%), so the tuner picks
+        blocks = [{**b, "PACKED_SCHEDULE": ps} for b in blocks for ps in (False, True)]
 
     # (descriptor-mode can't-win/can't-serve regions are fenced per kernel: descriptor_box_pruner,
     # matched_memory_modes_pruner, gate_pointer_only_pruner, descriptor_needs_prequant_pruner)

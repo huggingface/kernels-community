@@ -174,6 +174,117 @@ def _compute_grouped_scheduling(
 
 
 
+# The packed schedule exists for ONE tile size: BM=128, the only region the resolve trade
+# wins (packed_schedule_scope_pruner) — so the table is a single section: header slot 0 =
+# total_m_tiles, then (expert_id, m_start, row_end) per tile.
+PACKED_SCHEDULE_BM = 128
+
+
+def packed_schedule_capacity(num_routed_tokens: int, num_experts: int) -> int:
+    """Worst-case M-tile count: every expert pads its own last tile, so
+    ``cdiv(S, BM) + E`` bounds ``sum_e(cdiv(freq_e, BM))``. Fixed shape — graph-capturable."""
+    return (num_routed_tokens + PACKED_SCHEDULE_BM - 1) // PACKED_SCHEDULE_BM + num_experts
+
+
+def build_packed_schedule(
+    expert_start: torch.Tensor, num_routed_tokens: int, num_experts: int
+) -> torch.Tensor:
+    """Allocate + fill the packed tile schedule (one launch, fixed shape — graph-safe)."""
+    schedule = torch.empty(
+        1 + 3 * packed_schedule_capacity(num_routed_tokens, num_experts),
+        dtype=torch.int32, device=expert_start.device,
+    )
+    pow2 = triton.next_power_of_2(num_experts)
+    with device_context(expert_start.device):
+        compile_time_only_triton_wrap(_packed_schedule_kernel)[(pow2,)](
+            expert_start, schedule, NUM_EXPERTS=pow2
+        )
+    return schedule
+
+
+@triton.jit
+def _packed_schedule_kernel(ExpertStart, Schedule, NUM_EXPERTS: tl.constexpr):
+    """Build the packed tile schedule in one launch: one program per expert writes its
+    tiles' ``(expert_id, m_start, row_end)`` triples (header slot 0 = total tile count,
+    written by expert 0 from the full cumsum). Replaces the kernels' O(E)
+    register-resident tile layout with O(1) loads — the packed-schedule tuner axis
+    (register relief; wins at the pressure-walled BM=128 configs)."""
+    BM: tl.constexpr = 128  # PACKED_SCHEDULE_BM
+    e = tl.program_id(0)
+    e_start = tl.load(ExpertStart + e)
+    e_end = tl.load(ExpertStart + e + 1)
+    offs = tl.arange(0, NUM_EXPERTS)
+    starts = tl.load(ExpertStart + offs)
+    ends = tl.load(ExpertStart + offs + 1)
+    tiles_per = (ends - starts + BM - 1) // BM
+    before = tl.sum(tl.where(offs < e, tiles_per, 0), 0)
+    if e == 0:
+        tl.store(Schedule, tl.sum(tiles_per, 0))  # header: total_m_tiles
+    n_tiles = (e_end - e_start + BM - 1) // BM
+    for t in range(n_tiles):
+        base = 1 + (before + t) * 3
+        tl.store(Schedule + base, e)
+        tl.store(Schedule + base + 1, e_start + t * BM)
+        tl.store(Schedule + base + 2, e_end)
+
+
+@triton.jit
+def load_packed_schedule(Schedule, BLOCK_SIZE_M: tl.constexpr):
+    """The packed counterpart of ``build_tile_layout``: read the header (total_m_tiles).
+    The schedule is built for BM=128 only — the sole region the packed resolve wins (see
+    ``packed_schedule_scope_pruner``); the static_assert is the self-fence."""
+    tl.static_assert(BLOCK_SIZE_M == 128, "the packed schedule is built for BM=128")
+    return tl.load(Schedule)
+
+
+@triton.jit
+def prefetch_packed_entry(Schedule, pid_m, total_m_tiles):
+    """Issue a future M-tile's ``(expert_id, m_start, row_end)`` loads (masked past the
+    schedule end). Consumed by ``resolve_grouped_tile_packed`` one persistent iteration
+    later, so the entry's dependent-load latency hides under the current tile's K-loop
+    instead of serializing into every tile (~300ns/tile, the packed arm's whole overhead)."""
+    m = pid_m < total_m_tiles
+    entry = Schedule + 1 + pid_m * 3
+    return (tl.load(entry, mask=m, other=0),
+            tl.load(entry + 1, mask=m, other=0),
+            tl.load(entry + 2, mask=m, other=0))
+
+
+@triton.jit
+def resolve_grouped_tile_packed(
+    tile_id,
+    num_n_tiles,
+    prefetched,
+    GatherIdx,
+    ScatterIdx,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    GATE: tl.constexpr = False,
+):
+    """``resolve_grouped_tile`` with the M-tile resolved from the packed schedule —
+    consuming the triple ``prefetch_packed_entry`` issued last iteration (zero dependent
+    loads on this tile's critical path).
+    Same return contract; bit-identical tiles."""
+    pid_n = tile_id % num_n_tiles
+    expert_id, tile_row0, row_end = prefetched
+    offs_global_m = tl.max_contiguous(tile_row0 + tl.arange(0, BLOCK_SIZE_M), BLOCK_SIZE_M)
+    row_mask = offs_global_m < row_end
+    if GatherIdx is not None:
+        in_row = tl.load(GatherIdx + offs_global_m, mask=row_mask, other=0)
+    else:
+        in_row = offs_global_m
+    if ScatterIdx is not None:
+        out_row = tl.load(ScatterIdx + offs_global_m, mask=row_mask, other=0)
+    else:
+        out_row = offs_global_m
+    expert_id64 = expert_id.to(tl.int64)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
+    n_off = pid_n * BLOCK_SIZE_N
+    m_start = tl.min(in_row).to(tl.int32)
+    return pid_n, expert_id, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start
+
+
 @triton.jit
 def resolve_grouped_tile(
     tile_id,

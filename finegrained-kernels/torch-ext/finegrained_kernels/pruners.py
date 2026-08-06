@@ -81,6 +81,8 @@ from .epilogue import *  # noqa: F401,F403
 #                               batched
 #     mx_2d_swap_scope_pruner   2D mx SWAP_AB rows only for E4M3-scale decode (BM=1,
 #                               M<=16) — swap loses everywhere else (18-cell sweep)
+#     packed_schedule_scope_pruner  PACKED_SCHEDULE rows only at BM>=128 (register relief
+#                               is the whole win) — full-precision grouped
 #     swizzled_scales_bm_pruner grouped mx swizzled arm pinned to BM=BN=128 (slab layout);
 #                               affine arm keeps every BM/BN
 #     swizzled_scale_config_pruner  swizzled-arm BK%128, BN<=128, GATE block pairs —
@@ -557,6 +559,22 @@ def scale_subblock_pruner():
 
     return config_filter(ok, on_empty=raise_no_block_tile)
 
+
+
+def packed_schedule_scope_pruner(min_bm: int = 128):
+    """``early_config_prune`` scoping ``PACKED_SCHEDULE`` rows to big-BM configs — the only
+    regime the packed resolve wins (register relief unlocking pressure-walled tiles: DSV3
+    bf16 forced pairs +10.7% at BM128 vs −12.5% at BM64/BN256 and a wash at BM32,
+    2026-08-06; both tuned crowns chose BM128). Everywhere else the inline resolve's free
+    ALU beats the packed arm's per-tile dependent loads, so those rows are tune-budget
+    dilution (the axis would double the grid; this keeps it +25%)."""
+
+    def ok(c, args):
+        if not c.kwargs.get("PACKED_SCHEDULE"):
+            return True
+        return config_dim(c, args, "BLOCK_SIZE_M") >= min_bm
+
+    return config_filter(ok)
 
 
 def mx_2d_swap_scope_pruner(max_m: int = 16):

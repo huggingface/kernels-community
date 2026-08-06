@@ -24,6 +24,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
 from .recipes import Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_recipe
+from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .tiles import (
@@ -868,6 +869,9 @@ def full_precision_matmul_batched_kernel(
     )
 
 
+GATE_UNSTACK_MAX_S = 16  # the unstacked-gate decode band (see the dispatch in the wrapper)
+
+
 @compile_time_only_triton_op(
     add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_batched"),
     mutates_args=(),
@@ -938,6 +942,31 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     assert not requant or block_size[0] == block_size[1], (
         f"the fused 'fp8' requant needs square quant blocks, got {block_size}"
     )
+    # The decode band runs the ``gate`` contract UNSTACKED: this same op without the gate
+    # (one plain GEMM over the stacked weight), then the one-kernel ``fused_glu`` — bit-
+    # identical rounding, and exactly the unfused-reference order, so ``simulate_unfused``
+    # needs no carve-out. Holding the gate AND up tiles per CTA doubles the smem footprint
+    # and halves occupancy precisely where the launch is weight-bandwidth-bound, and the
+    # fp8 ``tl.dot`` — unlike the MX/NVFP4 scaled MMA, whose wide M operand earns the
+    # native instruction — gains nothing back: DSV3 shape, same 235MB weight read, stacked
+    # 69.8µs vs unstacked 49.8µs at S=8, a wash by S=32. A requant is the same offline
+    # quant the raw activation gets below, applied to the GLU output — quantizing the bf16
+    # intermediate (the unfused-reference order) where the stacked epilogue quantizes its
+    # fp32 accumulator, a sub-quantum difference consistent with the band's semantics.
+    if gate and S <= GATE_UNSTACK_MAX_S:
+        [gate_up] = w8a8_block_dynamic_fp8_matmul_batched(
+            A, B, As, Bs, expert_ids, block_size,
+            input_recipe=input_recipe, output_dtype=output_dtype,
+            gather_idx=gather_idx, scatter_idx=scatter_idx,
+        )
+        inter = fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit)
+        if not requant:
+            return [inter]
+        return list(
+            fp8_act_quant_block_dynamic(
+                inter, block_n, use_ue8m0=bs_u8.dtype == torch.uint8
+            )
+        )
     # A raw (As is None) -> quantize here (offline); else pre-quantized (As given, e.g. the
     # requantized intermediate handed to the down projection).
     if As is None:
@@ -1496,6 +1525,18 @@ def mx_weight_only_matmul_batched(
         f"weight-only takes a raw bf16/fp16/fp32 activation, got {A.dtype}"
     )
     assert Bs.ndim == 3, f"weight-only batched takes affine (3D) weight scales, got ndim={Bs.ndim}"
+    # The ``gate`` contract runs UNSTACKED at every S: this same op without the gate (one
+    # plain GEMM over the stacked weight), then the one-kernel ``fused_glu`` — bit-identical
+    # rounding, the unfused-reference order, so ``simulate_unfused`` rides through. The
+    # upcast weight feeds a plain bf16 dot, so the stacked tile buys no native MMA and only
+    # halves occupancy on a weight-bandwidth-bound loop; unlike the block-FP8 band this
+    # never inverts (GPT-OSS shape: 48.0->39.7µs at S=4, still ahead at S=512; 2026-08-06).
+    if gate:
+        [gate_up] = mx_weight_only_matmul_batched(
+            A, B, Bs, expert_ids, output_dtype=output_dtype,
+            gather_idx=gather_idx, scatter_idx=scatter_idx,
+        )
+        return [fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit)]
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     K = A.shape[1]
     S = expert_ids.shape[0]
