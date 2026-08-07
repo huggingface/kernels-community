@@ -33,10 +33,12 @@ the base ops dispatch on the weight dtypes / scale layout (block-dynamic FP8, MX
 NVFP4), and the fused forwards take an optional ``recipe`` naming the block's activation
 quantization."""
 
+import functools
+
 import torch
 
 from .grouped import matmul_grouped
-from .batched import matmul_batched
+from .batched import GATE_UNSTACK_MAX_S, matmul_batched
 from .compat import MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, weighted_reduce
 from .recipes import Epilogue, Quantization, is_mx, is_mxfp4, weight_recipe
 from .quant import _launch_act_quant
@@ -61,12 +63,20 @@ def _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale):
 
 def _gather_idx(top_k_index: torch.Tensor) -> torch.Tensor:
     """The batched routed-row gather: routed row ``s`` (``= t*K + k``) reads token ``s // num_top_k``
-    of the unexpanded hidden. ``matmul_batched`` applies it in-kernel, so no ``(S, H)`` copy."""
-    num_tokens, num_top_k = top_k_index.shape
+    of the unexpanded hidden. ``matmul_batched`` applies it in-kernel, so no ``(S, H)`` copy.
+    The map depends only on the SHAPE, so it is cached per (tokens, top_k, device) — its two
+    elementwise launches (~3µs) were the largest non-GEMM cost of the fp8 decode chain."""
+    return _gather_idx_cached(
+        top_k_index.shape[0], top_k_index.shape[1], top_k_index.device
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _gather_idx_cached(
+    num_tokens: int, num_top_k: int, device: torch.device
+) -> torch.Tensor:
     return (
-        torch.arange(
-            num_tokens * num_top_k, device=top_k_index.device, dtype=torch.int32
-        )
+        torch.arange(num_tokens * num_top_k, device=device, dtype=torch.int32)
         // num_top_k
     )
 
@@ -263,13 +273,18 @@ def moe_fused_batched(
             simulate_unfused=simulate_unfused,
         ),
         # Decode (batched): recipe None (weight-only) leaves the intermediate bf16, no requant.
-        # Block-FP8 decode also hands the down a bf16 intermediate: the requant is latency-free here
-        # but pins the gate|up tile to the whole block scale, and that full-width tile halves this
-        # kernel's decode grid (parallelism-bound at M=1). Letting the down inline-quant instead buys
-        # the sub-block tile — far more than the down's inline-quant costs.
+        # Block-FP8: INSIDE the unstacked decode band the requant fuses into the GLU kernel
+        # (``fused_glu(quant_group=...)`` — one launch, hands the down a ready fp8+scales intermediate and
+        # kills its offline act quant); ABOVE the band the stacked epilogue's requant pins
+        # the gate|up tile to the whole block scale and halves the grid, so the bf16 handoff
+        # (down inline-quants) stays the win there.
         quantization=Quantization(
             input_recipe=recipe,
-            output_recipe=None if recipe == "fp8" else recipe,
+            output_recipe=(
+                recipe
+                if recipe != "fp8" or expert_ids.numel() <= GATE_UNSTACK_MAX_S
+                else None
+            ),
         ),
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,

@@ -959,14 +959,10 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             input_recipe=input_recipe, output_dtype=output_dtype,
             gather_idx=gather_idx, scatter_idx=scatter_idx,
         )
-        inter = fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit)
-        if not requant:
-            return [inter]
-        return list(
-            fp8_act_quant_block_dynamic(
-                inter, block_n, use_ue8m0=bs_u8.dtype == torch.uint8
-            )
-        )
+        out = fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit,
+                        quant_group=block_n if requant else None,
+                        use_ue8m0=bs_u8.dtype == torch.uint8)
+        return list(out) if requant else [out]
     # A raw (As is None) -> quantize here (offline); else pre-quantized (As given, e.g. the
     # requantized intermediate handed to the down projection).
     if As is None:
@@ -1532,11 +1528,15 @@ def mx_weight_only_matmul_batched(
     # halves occupancy on a weight-bandwidth-bound loop; unlike the block-FP8 band this
     # never inverts (GPT-OSS shape: 48.0->39.7µs at S=4, still ahead at S=512; 2026-08-06).
     if gate:
+        # fp32 intermediate = the exact GEMM accumulators, so the GLU keeps the gated
+        # epilogue's fused-order rounding (bf16 operands would drift steep-sigmoid
+        # elements past the weight-only tests' exact-ish tolerances)
         [gate_up] = mx_weight_only_matmul_batched(
-            A, B, Bs, expert_ids, output_dtype=output_dtype,
+            A, B, Bs, expert_ids, output_dtype=torch.float32,
             gather_idx=gather_idx, scatter_idx=scatter_idx,
         )
-        return [fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit)]
+        return [fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit,
+                          out_dtype=resolve_output_dtype(output_dtype, A, None))]
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     K = A.shape[1]
     S = expert_ids.shape[0]

@@ -151,6 +151,7 @@ try:
     from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts as vllm_fused_experts  # noqa: E402
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation as _VllmAct  # noqa: E402
     from vllm.model_executor.layers.fused_moe.config import fp8_w8a8_moe_quant_config as _vllm_fp8_qc  # noqa: E402
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8 as _vllm_group_quant  # noqa: E402
 except ImportError:
     vllm_fused_experts = None
 # FlashInfer TRT-LLM fused MoE (NVIDIA's Blackwell serving kernels) — installed --no-deps
@@ -555,7 +556,8 @@ def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     (offline): TRT-LLM's gate|up order is [up; gate] — the halves swap; UE8M0 scales ride
     as fp32 (same values). Routing rides packed ``(expert_id << 16) | bf16-weight`` ids;
     the activation quant (1x128, TRANSPOSED [K/128, T] scale layout) is inside the timed
-    call, the local arm's inline-quant rule. Numerics caveat (oracle-checked 2026-08-06):
+    call and is the STACK'S OWN kernel (vLLM's per_token_group_quant_fp8 — what their
+    TRT-LLM integration runs), so the bar is the integration end-to-end. Numerics caveat (oracle-checked 2026-08-06):
     ~4.8e-2 from the exact block recipe vs our 2.8e-3 — looser than vLLM-triton's 1.7e-2."""
     E, I2, H = gu.shape
     I = I2 // 2
@@ -567,7 +569,9 @@ def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
         w.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF)
 
     def run():
-        hq, hs = fgm.fp8_act_quant_block_dynamic(hidden, 128)
+        # the STACK's own act quant (vLLM's TRT-LLM integration runs this exact kernel) —
+        # the arm is the integration end-to-end, never our kernels feeding theirs
+        hq, hs = _vllm_group_quant(hidden, 128, column_major_scales=False)
         out = trtllm_fp8_block_scale_routed_moe(
             packed, None, hq, hs.t().contiguous(), g1, g1s, dn, dns_f,
             num_experts=E, top_k=idx.shape[1], n_group=None, topk_group=None,

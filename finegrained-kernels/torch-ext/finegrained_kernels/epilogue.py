@@ -242,10 +242,19 @@ def glu(
 
 @triton.jit
 def _glu_kernel(
-    gate_up_ptr, out_ptr, n_out,
-    I: tl.constexpr, ACT_FN: tl.constexpr,
-    SWIGLU_ALPHA: tl.constexpr, SWIGLU_LIMIT: tl.constexpr,
+    GateUp,  # (S, 2I) stacked [gate|up] GEMM output; fp32 = exact accumulators (fused order)
+    Out,  # (S, I) activation-dtype GLU result; the E4M3 tensor under the requant arm
+    QuantScales,  # block-FP8 requant arm (``fused_glu(quant_group=...)``): per-``QUANT_GROUP``
+    #             scales (fp32, or UE8M0 exponent bytes); ``None`` folds the arm out — the GLU
+    #             result then rounds through bf16 (the reference two-kernel order) and quantizes
+    n_out,
+    I: tl.constexpr,
+    ACT_FN: tl.constexpr,
+    SWIGLU_ALPHA: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
     BLOCK: tl.constexpr,
+    QUANT_GROUP: tl.constexpr = 128,
+    UE8M0: tl.constexpr = False,
 ):
     """Fused GLU over a contiguous (S, 2I) [gate|up] tensor -> (S, I), covering every
     ``apply_glu`` variant (silu/gelu/relu, ``SWIGLU_ALPHA``/``SWIGLU_LIMIT`` clamped-SwiGLU
@@ -255,9 +264,14 @@ def _glu_kernel(
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n_out
     base = (offs // I) * 2 * I + offs % I
-    dt = out_ptr.dtype.element_ty
-    g = tl.load(gate_up_ptr + base, mask=mask).to(tl.float32)
-    u = tl.load(gate_up_ptr + base + I, mask=mask).to(tl.float32)
+    # fp32 input = exact GEMM accumulators (the unstacked fused-order path): compute the
+    # GLU in fp32 and round ONCE at the store — the gated epilogue's math. Narrow inputs
+    # keep the torch-chain per-op rounding (bit-identical to apply_glu).
+    FUSED_ORDER: tl.constexpr = GateUp.dtype.element_ty == tl.float32
+    dt = tl.float32 if FUSED_ORDER else (
+        tl.bfloat16 if QuantScales is not None else Out.dtype.element_ty)
+    g = tl.load(GateUp + base, mask=mask).to(tl.float32)
+    u = tl.load(GateUp + base + I, mask=mask).to(tl.float32)
     if SWIGLU_LIMIT is not None:
         g = tl.minimum(g, SWIGLU_LIMIT)
         u = tl.clamp(u, -SWIGLU_LIMIT, SWIGLU_LIMIT)
@@ -276,7 +290,23 @@ def _glu_kernel(
         out = ((a * d).to(dt).to(tl.float32) * u).to(dt)
     else:  # relu
         out = (tl.maximum(g, 0.0) * u).to(dt)
-    tl.store(out_ptr + offs, out, mask=mask)
+    if QuantScales is None:
+        tl.store(Out + offs, out.to(Out.dtype.element_ty), mask=mask)
+    else:
+        grp = tl.reshape(out.to(tl.float32), (BLOCK // QUANT_GROUP, QUANT_GROUP))
+        amax = tl.max(tl.abs(grp), axis=1)
+        if UE8M0:
+            sc = tl.exp2(tl.ceil(tl.log2(tl.maximum(amax, 1e-10) / 448.0)))
+        else:
+            sc = tl.maximum(amax, 1e-10) / 448.0
+        q = tl.clamp(grp / sc[:, None], -448.0, 448.0)
+        tl.store(Out + offs, tl.reshape(q, (BLOCK,)).to(tl.float8e4nv), mask=mask)
+        soffs = tl.program_id(0) * (BLOCK // QUANT_GROUP) + tl.arange(0, BLOCK // QUANT_GROUP)
+        smask = soffs * QUANT_GROUP < n_out
+        if UE8M0:
+            tl.store(QuantScales + soffs, (tl.log2(sc) + 127.0).to(tl.uint8), mask=smask)
+        else:
+            tl.store(QuantScales + soffs, sc, mask=smask)
 
 
 def fused_glu(
@@ -284,17 +314,41 @@ def fused_glu(
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
-) -> torch.Tensor:
+    quant_group: int | None = None,
+    use_ue8m0: bool = False,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """GLU over the stacked (S, 2I) [gate|up] GEMM output — the one-kernel ``_glu_kernel``
-    on a contiguous CUDA tensor (the torch chain is three-plus strided elementwise kernels —
-    ~15µs of a ~75µs fp8 decode step), the torch ``apply_glu`` on any fallback layout.
-    Both orders are bit-identical for every variant."""
+    on a contiguous tensor, the torch ``apply_glu`` on any fallback layout; bit-identical
+    either way. ``quant_group`` additionally block-FP8-requantizes the result per group in
+    the same kernel (the unstacked decode band's handoff to the down projection) and
+    returns ``(q, scales)`` — scales fp32, or UE8M0 exponent bytes under ``use_ue8m0``;
+    non-SiLU/clamped variants take the two-step order (same bits — the fused arm rounds
+    through bf16 first for exactly this equivalence)."""
     I = gate_up.shape[-1] // 2
+    if quant_group is not None:
+        if act_fn == "silu" and swiglu_alpha is None and swiglu_limit is None and gate_up.is_contiguous():
+            S = gate_up.shape[0]
+            q = torch.empty(S, I, dtype=torch.float8_e4m3fn, device=gate_up.device)
+            sc = torch.empty(S, I // quant_group,
+                             dtype=torch.uint8 if use_ue8m0 else torch.float32,
+                             device=gate_up.device)
+            n = q.numel()
+            _glu_kernel[(triton.cdiv(n, 1024),)](
+                gate_up, q, sc, n, I, "silu", None, None, BLOCK=1024,
+                QUANT_GROUP=quant_group, UE8M0=use_ue8m0,
+            )
+            return q, sc
+        from .quant import fp8_act_quant_block_dynamic  # deferred: module import order
+
+        inter = fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit)
+        return fp8_act_quant_block_dynamic(inter, quant_group, use_ue8m0=use_ue8m0)
     if gate_up.is_contiguous() and act_fn in ("silu", "gelu", "relu"):
-        out = torch.empty(*gate_up.shape[:-1], I, dtype=gate_up.dtype, device=gate_up.device)
+        out = torch.empty(*gate_up.shape[:-1], I,
+                          dtype=out_dtype or gate_up.dtype, device=gate_up.device)
         n = out.numel()
         _glu_kernel[(triton.cdiv(n, 1024),)](
-            gate_up, out, n, I, act_fn, swiglu_alpha, swiglu_limit, BLOCK=1024
+            gate_up, out, None, n, I, act_fn, swiglu_alpha, swiglu_limit, BLOCK=1024
         )
         return out
     gate, up = gate_up.chunk(2, dim=-1)
