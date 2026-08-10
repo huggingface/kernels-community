@@ -208,33 +208,37 @@ def _up_projection_backward_act(
 _up_projection_backward_act.compile_cache = {}
 
 
-@torch.library.custom_op(add_op_namespace_prefix("_up_projection_backward_weight"), mutates_args={"dw1"})
-def _up_projection_backward_weight(
-    x: torch.Tensor,
-    dw1: torch.Tensor,
-    dh: torch.Tensor,
-    expert_frequency_offset: torch.Tensor,
-    x_gather_idx: torch.Tensor,
-    is_glu_activation: bool,
-    concat_layout: bool = False,
-) -> None:
-    I, H, E = dw1.size()
-    if is_glu_activation:
-        I //= 2
+@triton.jit
+def _gather_valid_rows_kernel(src_ptr, rev_ptr, out_ptr, TK, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    slot_mask = offs < TK
+    rev = tl.load(rev_ptr + offs, mask=slot_mask, other=TK)
+    # `rev == TK` marks an EP sentinel: the slot owns no row, so it reads nothing and stores 0.
+    valid = slot_mask & (rev < TK)
+    val = tl.load(src_ptr + tl.where(valid, rev, 0), mask=valid, other=0.0)
+    tl.store(out_ptr + offs, val.to(out_ptr.dtype.element_ty), mask=slot_mask)
 
-    gemm(
-        x.T,
-        dh,
-        out=dw1.permute(2, 1, 0),
-        cu_seqlens_k=expert_frequency_offset,
-        A_idx=x_gather_idx,
-        batch_idx_permute=None,
-        dynamic_scheduler=False,
-        concat_layout=(("out",) if concat_layout else None),
+
+def _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, out):
+    """Gather the colvec-reduce rows back to slot order.
+
+    The GEMM only covers the rows routed to a local expert, so under EP the tail of `ds_scattered` is
+    uninitialized. `s_reverse_scatter_idx` maps every slot either to its own row or to `TK` for a
+    sentinel, so each slot gets its row or a 0: the uninitialized tail is never addressed, and no slot
+    is written twice. Without sentinels it is a plain permutation. Only the general-routing metadata
+    writes the `TK` marker; the bitmatrix path never sees sentinels, so add the marker there too if
+    that changes.
+
+    One fused kernel rather than zeros + copy + `index_select`: same result, one launch instead of
+    three and no `TK + 1` scratch buffer.
+    """
+    TK = s_reverse_scatter_idx.numel()
+    # Sized from TK like `BLOCK_H` below, so small routings do not launch a block of mostly masked
+    # lanes; capped because this is a pure gather and gains nothing from a wider block.
+    BLOCK = min(triton.next_power_of_2(TK), 1024)
+    _gather_valid_rows_kernel[(triton.cdiv(TK, BLOCK),)](
+        ds_scattered, s_reverse_scatter_idx, out, TK, BLOCK=BLOCK
     )
-
-
-_up_projection_backward_weight.compile_cache = {}
 
 
 @torch.library.custom_op(add_op_namespace_prefix("_down_projection_backward_act"), mutates_args={"dh", "ds", "db2", "a_prime"})
@@ -251,6 +255,7 @@ def _down_projection_backward_act(
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
     s_scatter_idx: torch.Tensor,
+    s_reverse_scatter_idx: torch.Tensor,
     activation_type: str,
 ) -> None:
     assert activation_type in (
@@ -272,21 +277,20 @@ def _down_projection_backward_act(
         A_idx=x_gather_idx,
         dynamic_scheduler=False,
     )
-    ds[s_scatter_idx] = ds_scattered
-
     if db2 is None:
-        ds[s_scatter_idx] = ds_scattered
+        _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, ds)
     else:
         H = w2.size(0)
         E = expert_frequency_offset.size(0) - 1
         TK = x_gather_idx.size(0)
 
         old_ds_partial = torch.empty(TK, 1, device=ds_scattered.device, dtype=ds_scattered.dtype)
-        old_ds_partial[s_scatter_idx, 0] = ds_scattered
+        _gather_valid_rows(ds_scattered, s_reverse_scatter_idx, old_ds_partial)
 
         BLOCK_H = min(triton.next_power_of_2(H), 2048)
         NUM_H_BLOCKS = triton.cdiv(H, BLOCK_H)
-        new_ds_partial = torch.empty(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
+        # Zero-init: the kernel below skips sentinel slots, and `ds` is copied from this buffer whole.
+        new_ds_partial = torch.zeros(TK, NUM_H_BLOCKS, dtype=torch.float32, device=ds.device)
 
         db2_and_ds_kernel[(E, NUM_H_BLOCKS)](
             dout,
@@ -312,28 +316,6 @@ def _down_projection_backward_act(
 
 
 _down_projection_backward_act.compile_cache = {}
-
-
-@torch.library.custom_op(add_op_namespace_prefix("_down_projection_backward_weight"), mutates_args={"dw2"})
-def _down_projection_backward_weight(
-    dout: torch.Tensor,
-    a_prime: torch.Tensor,
-    dw2: torch.Tensor,
-    expert_frequency_offset: torch.Tensor,
-    x_gather_idx: torch.Tensor,
-) -> None:
-    gemm(
-        dout.T,
-        a_prime,
-        out=dw2.permute(2, 0, 1),
-        cu_seqlens_k=expert_frequency_offset,
-        A_idx=x_gather_idx,
-        batch_idx_permute=None,
-        dynamic_scheduler=False,
-    )
-
-
-_down_projection_backward_weight.compile_cache = {}
 
 
 @torch.library.custom_op(add_op_namespace_prefix("_token_broadcast_backward"), mutates_args={"dx_reduced"})

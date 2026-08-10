@@ -1,6 +1,6 @@
 [general]
 name = "sonic-moe"
-version = 1
+version = 2
 license = "Apache-2.0"
 backends = ["cuda"]
 python-depends = ["tvm-ffi"]
