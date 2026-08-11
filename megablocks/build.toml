@@ -115,11 +115,12 @@ src = [
     "csrc_xpu/grouped_gemm/xe_2/xe2_target_ns.hpp",
 ]
 
-# The Xe35 block-scaled DPAS path in sycl-tla is gated behind
-# __SYCL_TARGET_INTEL_GPU_CRI__, which the compiler never sets on its own, so
-# build a CRI-only TU with the macro forced on and spir64_gen as the sole
-# target. The link step AOT-lowers that image to cri; pvc/bmg keep the Xe20 TU
-# above and the host dispatches by device IP version at runtime.
+# The Xe35 code paths in sycl-tla (Xe35 block 2D cache controls, native fcvt for
+# e4m3 -> bf16 reorder) are gated behind SYCL_INTEL_TARGET == 35, which cutlass.h
+# only derives from __SYCL_TARGET_INTEL_GPU_CRI__. The compiler never sets that
+# macro on its own, so build a CRI-only TU with it forced on and spir64_gen as
+# the sole target. The link step AOT-lowers that image to cri; pvc/bmg keep the
+# Xe20 TU above and the host dispatches by device IP version at runtime.
 [kernel.megablocks_xpu_cri]
 backend = "xpu"
 depends = [
