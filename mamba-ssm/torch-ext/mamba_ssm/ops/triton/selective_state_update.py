@@ -12,6 +12,8 @@ import triton.language as tl
 
 from einops import rearrange, repeat
 
+from ...utils.device import device_guard
+
 from .softplus import softplus
 
 
@@ -200,7 +202,7 @@ def selective_state_update(state, x, dt, A, B, C, D=None, z=None, dt_bias=None, 
                 and (dt_bias is None or dt_bias.stride(-1) == 0))
     dt_bias_strides = ((dt_bias.stride(0), dt_bias.stride(1)) if dt_bias is not None else (0, 0))
     D_strides = ((D.stride(0), D.stride(1)) if D is not None else (0, 0))
-    with torch.cuda.device(x.device.index):
+    with device_guard(x):
         _selective_scan_update_kernel[grid](
             state, x, dt, dt_bias, A, B, C, D, z, out, state_batch_indices,
             batch, nheads, dim, dstate, nheads // ngroups,
