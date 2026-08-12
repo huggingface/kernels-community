@@ -529,6 +529,30 @@ def _get_device_mesh(model):
         return None
 
 
+def _mxfp4_expert_tensors(experts, dtype):
+    """View transformers' MXFP4 experts as the tensors the SYCL grouped GEMM expects.
+
+    Weights and scales arrive wrapped in triton tensors. On XPU both use StridedLayout,
+    whose swizzle is the identity, so `storage.data` is still the checkpoint tensor - just
+    transposed to [E, K/2, N]. Transposing back therefore restores the original contiguous
+    [E, N, K/2] weights and [E, N, K/32] E8M0 scales as plain views: `contiguous()` finds
+    them already contiguous and returns them untouched, so this costs no copy and no extra
+    memory. The experts module is left alone, which keeps the triton tensors and the
+    PrecisionConfig that `save_pretrained` needs to re-serialize the checkpoint.
+    """
+    tensors = []
+    for proj in ("gate_up_proj", "down_proj"):
+        config = getattr(experts, f"{proj}_precision_config")
+        tensors.append(getattr(experts, proj).storage.data.transpose(-1, -2).contiguous())
+        tensors.append(config.weight_scale.storage.data.transpose(-1, -2).contiguous())
+
+        # The GEMM reads the bias as ElementA; `to` is a no-op when it already matches.
+        bias = getattr(experts, f"{proj}_bias", None)
+        tensors.append(None if bias is None else bias.data.to(dtype))
+
+    return tensors
+
+
 class MegaBlocksMoeMLP(torch.nn.Module):
     can_torch_compile: bool = True
         
@@ -612,7 +636,18 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         
         w13_scales = getattr(self.experts, "gate_up_proj_scales", None)
         w2_scales = getattr(self.experts, "down_proj_scales", None)
-        
+
+        # Native MXFP4 checkpoint: derive the GEMM's view of the experts once and cache it.
+        mxfp4 = getattr(self, "_mxfp4_tensors", None)
+        if (mxfp4 is None or mxfp4[0] is not x.dtype) and getattr(
+            self.experts, "gate_up_proj_precision_config", None
+        ) is not None:
+            mxfp4 = (x.dtype, *_mxfp4_expert_tensors(self.experts, x.dtype))
+            self._mxfp4_tensors = mxfp4
+        if mxfp4 is not None:
+            _, w13, w13_scales, w13_bias, w2, w2_scales, w2_bias = mxfp4
+            is_mxfp4 = True
+
         # Store original shape
         in_shape = x.size()
         
