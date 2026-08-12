@@ -16,6 +16,7 @@ KERNEL_SOURCE_MAPPING = {
     "aiter-rope": "https://github.com/ROCm/aiter",
     "causal-conv1d": "https://github.com/Dao-AILab/causal-conv1d",
     "deformable-detr": "",
+    "einops": "https://github.com/arogozhnikov/einops",
     "finegrained-fp8": "",
     "flash-attn-ops": "https://github.com/Dao-AILab/flash-attention",
     "flash-attn2": "https://github.com/Dao-AILab/flash-attention",
