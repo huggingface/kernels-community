@@ -5,6 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ...utils.device import device_guard
+
 
 @triton.autotune(
     configs=[
@@ -55,7 +57,7 @@ def _swiglu_fwd(xy, out=None):
     assert out.stride(-1) == 1
     M, N = x.shape
     grid = lambda META: (M, triton.cdiv(N, META['BLOCK_N']))
-    with torch.cuda.device(x.device.index):
+    with device_guard(x):
         _swiglu_fwd_kernel[grid](x, y, out, x.stride(0), y.stride(0), out.stride(0), N)
     return out.reshape(*batch_shape, out.shape[-1])
 
@@ -141,7 +143,7 @@ def _swiglu_bwd(xy, dout, dxy=None, recompute_output=False, out=None):
         assert out.stride(-1) == 1
     M, N = x.shape
     grid = lambda META: (M, triton.cdiv(N, META['BLOCK_N']))
-    with torch.cuda.device(x.device.index):
+    with device_guard(x):
         _swiglu_bwd_kernel[grid](x, y, dout, out if recompute_output else None, dx, dy,
                                  x.stride(0), y.stride(0), dout.stride(0),
                                  out.stride(0) if recompute_output else 0,
