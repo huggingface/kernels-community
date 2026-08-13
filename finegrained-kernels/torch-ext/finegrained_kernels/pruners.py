@@ -45,10 +45,16 @@ from .epilogue import *  # noqa: F401,F403
 #                               descriptor mode — static 2D
 #     gate_pointer_only_pruner  one contiguous descriptor box can't span the gate|up rows
 #                               N apart — 2D kernels (bd/static/mx/weight-only), GATE-gated
+#     weight_only_swap_scope_pruner  SWAP_AB iff COMPUTE_MODE == "scalar" — the swapped dot
+#                               arms are unimplemented and a non-swapped scalar has no
+#                               accumulator shape — weight-only batched
 #     mma_trap_ok               swapped dot_scaled BK<128 (sticky 716), single-trip
 #                               accumulator-init miscompile, width > 256 (sticky trap),
 #                               packed-fp4 GATE BN<64 silent zeros — mx 2D/batched/grouped;
 #                               raises when empty (never falls back to a miscompile)
+#     gate_stacked_tmem_trap_pruner  GATE 2*BN=512 acc overflows tensor memory undetected
+#                               at exactly BN=256/BM=64 (checker gap -> sticky 716) —
+#                               weight-only grouped; raises when empty
 #     block_dynamic_mma_width_pruner  the same width trap on the bd implicit dot_scaled
 #                               arm (GATE 2*BN) — bd 2D only (grouped/batched bd pin their
 #                               N tile to the quant block, within the cap); UE8M0-As-gated
@@ -63,7 +69,14 @@ from .epilogue import *  # noqa: F401,F403
 #                               weight-only grouped
 #     affine_scale_warp_spec_pruner    affine scale gather's other=0.0 can't take
 #                               ttg.partition under WS — mx-dynamic grouped
-#     nvfp4_native_ok (mx_config_pruner)  E4M3-scale dot_scaled below M=128 PassManager-fails
+#     global_scale_warp_spec_pruner    the NVFP4 global load can't take ttg.partition
+#                               under WS — weight-only grouped, BsGlobal-gated
+#     batched_scalar_swap_packed_act_pruner  the batched mx swapped scalar arm has no
+#                               packed-act (E2M1) load — CompilationError; mx batched only,
+#                               packed-A-gated
+#     nvfp4_native_ok (mx_config_pruner)  E4M3-scale dot_scaled PassManager-fails off the
+#                               native staging: M operand < 128, num_warps outside {4, 8},
+#                               or a weight-only kernel (no As — never native)
 #     descriptor_box_pruner     TMA box > 256/dim is illegal — all descriptor-axis kernels
 #     smem_pruner               empirical smem model (B200-sampled, keep-side error) —
 #                               bd/static/mx/weight-only 2D; tensor/mx/weight-only/fp grouped;
@@ -71,9 +84,13 @@ from .epilogue import *  # noqa: F401,F403
 #   RACE guards (Triton 3.7.1 pipeliner, per-loop-structure flake maps):
 #     block_dynamic_grouped_matmul_pruner   WS-only at BM>=64, non-WS below (disjoint) —
 #                               bd + static grouped (plain and GATE arms, same loop)
+#     block_dynamic_2d_warp_spec_pruner  bd 2D WS compile-fail laws: w16+WS at any tile,
+#                               and the implicit dot_scaled arm (UE8M0 As, native-M tile)
+#                               + WS — bd 2D only (COMPILER BUG class, listed here next to
+#                               its sibling)
 #   TPE-POISON fences (valid configs that can't win in a regime):
 #     scalar_max_m_pruner       scalar above M=64 (prefill GEVM) — mx 2D
-#     mx_config_pruner poison fences   sm_10x fp4-scalar (1.8x dead), the dot arm where the
+#     mx_config_pruner poison fences   the dot arm where the
 #                               native MMA exists (A/B'd 2026-07-14; weight-only kernels
 #                               keep dot), mma_poison_ok: no-swap BK<128 where 128 divides K
 #                               (basin claim) + swapped rows<128 (bf16 fallback never wins)
@@ -100,6 +117,14 @@ from .epilogue import *  # noqa: F401,F403
 # width-512 GATE sweep on the tensor grouped kernel (2026-07-14) ran bit-exact wherever
 # it fit shared memory and failed only as benign launch-time smem overflows.
 SM10X_SCALED_MMA_MAX_N = 256
+
+# Branch axes that RELOCATE the tile optimum (compute unit / operand orientation): the
+# tuner's guaranteed max-tile anchors group by these (``path_anchor_axes`` — a declaration,
+# so the tuner itself stays independent of configuration details). Scheduling axes
+# (WARP_SPEC, PACKED_SCHEDULE, memory modes) share the tile basin shape and stay out —
+# per-basin anchors over the full branch cross starved a 100-trial budget (see
+# _basin_anchor_indices).
+PATH_ANCHOR_AXES = ("COMPUTE_MODE", "SWAP_AB")
 
 
 
@@ -177,6 +202,27 @@ def block_within_dim_pruner(dim_arg: str, block_key: str = "BLOCK_SIZE_K", when=
 
     return config_filter(ok, when=when, on_empty=raise_no_dividing_block)
 
+
+
+def block_fits_dim_pruner(dim_arg: str, block_key: str = "BLOCK_SIZE_K"):
+    """``early_config_prune`` for a loop whose tail tile SLIDES back in bounds instead of
+    running past the row (the weight-only batched K-loop): the tile need not divide the dim,
+    it only has to fit inside it, since the clamp would otherwise walk backwards off the
+    buffer. Everywhere the tail is unmasked, use ``block_within_dim_pruner`` — this one keeps
+    non-dividing tiles, and on a maskless loop those read past the row."""
+
+    def ok(c, args):
+        block = c.kwargs.get(block_key, 0)
+        return block == 0 or block <= args[dim_arg]
+
+    def raise_no_fitting_block(configs, args):
+        min_block = min(c.kwargs.get(block_key, 0) for c in configs)
+        raise ValueError(
+            f"{dim_arg}={args[dim_arg]} is smaller than every {block_key} in the autotune "
+            f"grid (smallest: {min_block}); the sliding tail tile has nowhere to sit."
+        )
+
+    return config_filter(ok, on_empty=raise_no_fitting_block)
 
 
 def require_moe_dims_aligned(N: int, K: int, block_n: int, block_k: int) -> None:
@@ -276,7 +322,7 @@ def affine_scale_warp_spec_pruner():
 
 
 
-def mx_config_pruner(k_arg: str, n_arg: str | None = None):
+def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool = True):
     """``early_config_prune`` for the MX kernels (2D, batched, grouped — their tile is always
     tuned): a BK-within-K veto plus sm_10x MMA-shape guards (no-ops elsewhere and for scalar
     configs). GATE-aware: under the GATE constexpr (read from the launch args) the kernel
@@ -284,17 +330,21 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None):
     rows and the no-swap combined dot is ``2*BN`` wide; a plain launch's counts are just
     ``BN``.
 
+    ``block_within_k=False`` drops the BK veto for a caller whose K-loop masks or slides its
+    tail (the weight-only batched kernel); the MMA-shape guards still apply.
+
     - ``BLOCK_SIZE_K`` not dividing the launch's contraction dim (``k_arg`` names it) →
       dropped: the K-loop loads are unmasked, so any non-dividing BK's last trip reads
       past the row — silently wrong results the tuner would happily time and pick (bit us when
       BK=512 met a K=256 test problem).
-    - MXFP4 ``scalar`` configs → dropped (sm_10x only — the 1.8x-dead evidence is B200;
-      other targets lower dot_scaled differently and keep the mode): fp4 scalar decode is
-      ALU-bound in the E2M1 unpack and measured 1.8x SLOWER than dot_scaled (twice, incl.
-      the no-pad form) — it never wins, and its swapped variants poison the TPE's
-      per-dimension model into writing off SWAP_AB (a 100-trial dsv4 down tune benched 3
-      swap configs — two dead-slow swap-scalar, one inf — and shipped a 38.9µs no-swap
-      winner, missing the ~24µs swap dot_scaled basin entirely).
+    - MXFP4 ``scalar`` configs are KEPT. They used to be dropped on sm_10x: fp4 scalar decode
+      was ALU-bound in the E2M1 unpack and measured 1.8x slower than dot_scaled. That verdict
+      was against the INTEGER unpack. Decoding E2M1 through the sm_100 CVT unit
+      (``_e2m1_pair_to_e4m3``) inverts it — on the dsv4 W4A8 decode, scalar+swap beats the
+      dot_scaled crown 20.7 vs 41.8us (gate_up) and 11.3 vs 22.0us (down), bit-identical —
+      because at BM=1 dot_scaled cannot reach the native microscaled MMA either (it needs an
+      M=128 operand) and emulates through the same upcast, while scalar skips the MMA
+      entirely. Re-fence only against a fresh measurement.
     - Swapped ``dot_scaled`` rows < 128 → dropped: the native microscaled MMA gates on the M
       operand being exactly 128, so smaller rows run the bf16-upcast fallback and never win —
       the same poison mechanism (an earlier dsv4 gate_up tune shipped 63µs missing the 43µs
@@ -417,9 +467,6 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None):
         rows = (2 if args.get("GATE") else 1) * config_dim(c, args, "BLOCK_SIZE_N")
         return not c.kwargs.get("SWAP_AB") or rows >= 128
 
-    def fp4_scalar_ok(c, args):
-        return c.kwargs.get("COMPUTE_MODE") != "scalar"
-
     def dot_arm_ok(c, args):
         return c.kwargs.get("COMPUTE_MODE") != "dot"
 
@@ -434,12 +481,21 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None):
         return "As" in args
 
     def nvfp4_native_ok(c, args):
-        # mxf4nvf4 (E4M3 scales) has NO fallback below the native M=128 staging —
-        # PassManager fails outright (charted BM {16,32,64} x BK {128,256}, 2026-07-15).
-        # dot_scaled-only (dot/scalar decode E4M3 scales in software at any M); the MMA's
-        # M operand is BLOCK_SIZE_M, or the weight rows when SWAP_AB puts the token in N.
+        # mxf4nvf4 (E4M3 scales) has NO fallback below the native staging — the decompose
+        # path materializes the scale through an integer-only DenseElementsAttr and
+        # PassManager fails outright (charted BM {16,32,64} x BK {128,256}, 2026-07-15;
+        # warps/operand law 2026-08-12). Native staging needs the M operand >= 128 AND
+        # num_warps in {4, 8} (2 and 16 both fail across every BN/BK/stages cell) AND
+        # both operands microscaled — the weight-only kernels (no ``As``: raw bf16 acts,
+        # in-register inline quant) never stage it, so their E4M3-scale dot_scaled fails
+        # at every tile (their dot/scalar arms compete instead). dot_scaled-only
+        # (dot/scalar decode E4M3 scales in software at any M);
+        # the MMA's M operand is BLOCK_SIZE_M, or the weight rows when SWAP_AB puts the
+        # token in N.
         if c.kwargs.get("COMPUTE_MODE") != "dot_scaled":
             return True
+        if not acts_are_scaled(args) or not 4 <= c.num_warps <= 8:
+            return False
         if c.kwargs.get("SWAP_AB"):
             return (2 if args.get("GATE") else 1) * config_dim(c, args, "BLOCK_SIZE_N") >= 128
         return config_dim(c, args, "BLOCK_SIZE_M") >= 128
@@ -447,7 +503,7 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None):
     def scales_are_e4m3(args):
         return getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn
 
-    stages = [block_within_dim_pruner(k_arg)]
+    stages = [block_within_dim_pruner(k_arg)] if block_within_k else []
     if n_arg is not None:
         # BN | N is needed only on the mx-dynamic AFFINE arm: its weight-scale gather has no
         # column wrap. The swizzled arm masks its N-tail (grouped/batched: %-wrapped value load
@@ -470,13 +526,6 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None):
             mma_trap_ok, when=lambda args: is_sm10x(), on_empty=raise_all_mma_trapped
         ),
         config_filter(
-            fp4_scalar_ok,
-            when=lambda args: is_sm10x()
-            and scaled_mma_available(args)
-            and getattr(args.get("B"), "dtype", None) == torch.uint8
-            and not scales_are_e4m3(args),
-        ),
-        config_filter(
             dot_arm_ok,
             when=lambda args: is_sm10x()
             and scaled_mma_available(args)
@@ -485,6 +534,49 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None):
         config_filter(mma_poison_ok, when=lambda args: is_sm10x()),
     )
 
+
+
+def batched_scalar_swap_packed_act_pruner():
+    """``early_config_prune`` for the batched mx kernel's swapped scalar arm, which does not
+    implement PACKED (E2M1) activations: unpacked E4M3 (mxfp8) acts compile, packed
+    mxfp4/nvfp4 acts hit a tuple-arity CompilationError in the act-load leaf at every
+    warps/stages cell (charted 2026-08-13, GLM-5.2-NVFP4 decode). Fences the arm, not the
+    shape. Open improvement, not just a fence: the scalar arm is the decode winner for fp4
+    elsewhere (see OPTIMIZATION_LOG), so implementing the packed swap-scalar load could pay."""
+
+    def ok(c, args):
+        if c.kwargs.get("COMPUTE_MODE") != "scalar" or not c.kwargs.get("SWAP_AB"):
+            return True
+        return getattr(args.get("A"), "dtype", None) not in (torch.int8, torch.uint8)
+
+    return config_filter(ok)
+
+
+def block_dynamic_2d_warp_spec_pruner():
+    """``early_config_prune`` for the block-dynamic 2D kernel's two WARP_SPEC compile-fail
+    laws (Triton 3.7.1 PassManager, TritonGPUPipeline; charted 2026-08-13 at the
+    DeepSeek-V4-Flash ue8m0 checkpoint shapes, forced-config matrices):
+      - WS + num_warps=16 fails at EVERY tile/scale-dtype (w8 compiles everywhere); the mx
+        2D and grouped kernels WS-compile w16 fine, so this is this loop's structure, not a
+        global WS law.
+      - the implicit ``dot_scaled`` arm (``USE_DOT_SCALED``: UE8M0/uint8 ``As`` on a
+        native-M tile — (BN if SWAP_AB else BM) >= 128) + WS fails at every warps/stages/
+        memory-mode cell; BM=64 and non-WS all compile. fp32-scale launches never emit the
+        scaled MMA and keep the (w<=8) WS grid.
+    2D-only: the grouped bd loop WS-compiles (compile soundness is per-loop-structure —
+    its own race guard REQUIRES WS at BM >= 64)."""
+
+    def ok(c, args):
+        if not c.kwargs.get("WARP_SPEC"):
+            return True
+        if c.num_warps > 8:
+            return False
+        if getattr(args.get("As"), "dtype", None) == torch.uint8:
+            native_m = "BLOCK_SIZE_N" if c.kwargs.get("SWAP_AB") else "BLOCK_SIZE_M"
+            return config_dim(c, args, native_m) < 128
+        return True
+
+    return config_filter(ok, when=lambda args: is_sm10x())
 
 
 def block_dynamic_mma_width_pruner():
@@ -573,6 +665,21 @@ def packed_schedule_scope_pruner(min_bm: int = 128):
         if not c.kwargs.get("PACKED_SCHEDULE"):
             return True
         return config_dim(c, args, "BLOCK_SIZE_M") >= min_bm
+
+    return config_filter(ok)
+
+
+def weight_only_swap_scope_pruner():
+    """``early_config_prune`` binding the weight-only kernel's ``SWAP_AB`` axis to its one
+    implemented arm: the CUDA-core reduce. Swap exists here to drop the MMA entirely — with
+    raw bf16 activations there is no native fp4 x bf16 MMA, so both dot arms pay an M->16 pad
+    and a full-tile upcast, and a swapped ``dot_scaled`` measured no better than the row-major
+    one (35.2 vs 38.0us, gpt-oss gate_up decode). So ``SWAP_AB`` iff ``COMPUTE_MODE`` is
+    ``"scalar"``: the swapped-dot rows would compile into an arm the compute helper does not
+    implement, and a non-swapped scalar row has no accumulator shape."""
+
+    def ok(c, args):
+        return bool(c.kwargs.get("SWAP_AB")) == (c.kwargs.get("COMPUTE_MODE") == "scalar")
 
     return config_filter(ok)
 
@@ -799,6 +906,47 @@ def descriptor_box_pruner(k_dim="BLOCK_SIZE_K"):
 
 
 
+def global_scale_warp_spec_pruner():
+    """Drop WARP_SPEC configs when the launch carries an NVFP4 global (``BsGlobal`` not None):
+    the per-expert global load cannot take ``ttg.partition`` under warp specialization — the
+    same Triton lowering gap as the affine scale gather's ``other=0.0`` — so every such config
+    is a benign compile-failure inf. Fenced to save the compiles; single-level launches
+    (``BsGlobal`` None) keep their WS rows."""
+
+    def ok(c, args):
+        return not (c.kwargs.get("WARP_SPEC") and args.get("BsGlobal") is not None)
+
+    return config_filter(ok)
+
+
+def gate_stacked_tmem_trap_pruner():
+    """Miscompile gate: drop GATE configs at exactly ``BLOCK_SIZE_N == 256, BLOCK_SIZE_M == 64``
+    — the stacked gate|up accumulator (``2*BN = 512`` columns) exceeds sm_100 tensor memory, and
+    at BM=64 Triton's resource checker misses the overflow, so the config runs and TRAPS the
+    device (sticky CUDA 716 "misaligned address"; one such trial poisons the whole tune and
+    every launch after it). Probed per-arm in fresh processes (2026-08-10, B200, weight-only
+    grouped, K=2880 and K=2048 alike — N-divisibility is NOT the variable): BM=64 traps in every
+    memory mode, WS on and off, BK 64 and 128; BM=128 fails CLEANLY (OutOfResources: tensor
+    memory 544 > 512) and self-prunes; BM=32 and BN<=128 run correct. The checker gap is the
+    only reason this needs a fence at all — drop precisely the probed trap point and let every
+    neighbor keep self-reporting."""
+
+    def ok(c, args):
+        return not (
+            args.get("GATE")
+            and config_dim(c, args, "BLOCK_SIZE_N") == 256
+            and config_dim(c, args, "BLOCK_SIZE_M") == 64
+        )
+
+    def raise_all_trap(configs, args):
+        raise ValueError(
+            "every config in the grid is the (GATE, BN=256, BM=64) tensor-memory trap point; "
+            "falling back would run configs that trap the device (sticky CUDA 716)"
+        )
+
+    return config_filter(ok, on_empty=raise_all_trap)
+
+
 def smem_pruner(k_dim="BLOCK_SIZE_K"):
     """``early_config_prune`` dropping configs whose shared memory certainly cannot fit,
     with the bound picked by the operand dtypes (sampled from ``metadata.shared`` across
@@ -849,33 +997,33 @@ def smem_pruner(k_dim="BLOCK_SIZE_K"):
                 a.element_size() * bm + b.element_size() * tiles * bn
             )
         elif c.kwargs.get("COMPUTE_MODE") == "dot_scaled":
-            # exact per-allocation law (every term named by its TTGIR local_alloc)
-            scale_cols = bk // 32
-
-            def scale_bufs(tile_bytes):
-                # the pipeliner multi-buffers a load only when its tile is big enough
-                # (sampled: 512 B pipelined, 256 B single; the open band is UNREACHABLE —
-                # every emitted grid's scale tiles are powers of two)
-                return stages if tile_bytes >= 512 else 1
-
-            if bm >= 128:
-                # native scaled-MMA staging: weights full-width even when fp4-packed;
-                # GATE shifts the pipeliner so the A tile gets a full num_stages buffers
-                a_bufs = c.num_stages if args.get("GATE") else c.num_stages - 1
-                need = (
-                    a_bufs * bk * bm
-                    + stages * bk * tiles * bn
-                    + scale_bufs(scale_cols * bm) * scale_cols * bm
-                    + scale_bufs(scale_cols * tiles * bn) * scale_cols * tiles * bn
-                )
+            # KEEP-SIDE bound = HALF of one buffer set: operands stored PACKED (fp4 = 2
+            # values/byte) plus both group scale tiles (BK/group cols; group 32 UE8M0, 16
+            # E4M3). Requested-stages models over-estimate — the pipeliner CLAMPS stages
+            # (an s3 request can compile with an s2 footprint) and the 2D nvfp4 arm can
+            # compile half a set — so any tighter bound drops configs the compiler would
+            # have rescued. Proven est<=actual on 1,099 metadata.shared samples across the
+            # family (see OPTIMIZATION_LOG: smem-keep-side-refit).
+            group = 16 if getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn else 32
+            # A's smem bytes follow its LAUNCH dtype: packed E2M1 (int8/uint8) = 2 values/byte,
+            # E4M3 = 1 B/value, raw bf16/fp16 (weight-only) = element_size B/value
+            a_dtype = a.dtype
+            if a_dtype in (torch.int8, torch.uint8):
+                a_bytes = (bk // 2) * bm
             else:
-                # bf16-upcast fallback (below the native M=128 gate): one single-buffered
-                # [BK, tiles*BN] bf16 upcast tile, weights staged packed, no A-scale buffers
-                need = (
-                    2 * bk * tiles * bn
-                    + stages * (bk * bm + (bk // packed) * tiles * bn)
-                    + scale_bufs(scale_cols * tiles * bn) * scale_cols * tiles * bn
-                )
+                a_bytes = bk * bm * a.element_size()
+            # HALF a set: the sampled lower envelope. The 2D kernel's nvfp4 arm can compile an
+            # s2 request into half a buffer set (sub-tile pipelining: BN=64/128/256 x BK=512
+            # all landed at set/2 + <=8 B), so the full set is not a lower bound; the half set
+            # is, over all 1099 samples (largest remaining margin 68 B on a 4 KB decode tile,
+            # covered by the halving). A config whose HALF set exceeds the limit cannot compile
+            # in any observed form — everything else is kept and self-reports as a benign inf.
+            need = (
+                a_bytes
+                + (bk // packed) * tiles * bn
+                + (bk // group) * bm
+                + (bk // group) * tiles * bn
+            ) // 2
         else:
             # dot (BK = the 32-group) / scalar: tiles too small to reach the limit —
             # the raw-operand floor suffices

@@ -237,7 +237,7 @@ def weighted_reduce(
     H = rows.size(1)
     reduced = torch.empty(num_tokens, H, device=rows.device, dtype=rows.dtype)
     with device_context(rows.device):
-        weighted_reduce_kernel[
+        compile_time_only_triton_wrap(weighted_reduce_kernel)[
             lambda meta: (num_tokens, triton.cdiv(H, meta["BLOCK_H"]))
         ](
             rows,

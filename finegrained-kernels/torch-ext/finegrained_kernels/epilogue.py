@@ -334,10 +334,11 @@ def fused_glu(
                              dtype=torch.uint8 if use_ue8m0 else torch.float32,
                              device=gate_up.device)
             n = q.numel()
-            _glu_kernel[(triton.cdiv(n, 1024),)](
-                gate_up, q, sc, n, I, "silu", None, None, BLOCK=1024,
-                QUANT_GROUP=quant_group, UE8M0=use_ue8m0,
-            )
+            with device_context(gate_up.device):
+                compile_time_only_triton_wrap(_glu_kernel)[(triton.cdiv(n, 1024),)](
+                    gate_up, q, sc, n, I, "silu", None, None, BLOCK=1024,
+                    QUANT_GROUP=quant_group, UE8M0=use_ue8m0,
+                )
             return q, sc
         from .quant import fp8_act_quant_block_dynamic  # deferred: module import order
 
@@ -347,9 +348,10 @@ def fused_glu(
         out = torch.empty(*gate_up.shape[:-1], I,
                           dtype=out_dtype or gate_up.dtype, device=gate_up.device)
         n = out.numel()
-        _glu_kernel[(triton.cdiv(n, 1024),)](
-            gate_up, out, None, n, I, act_fn, swiglu_alpha, swiglu_limit, BLOCK=1024
-        )
+        with device_context(gate_up.device):
+            compile_time_only_triton_wrap(_glu_kernel)[(triton.cdiv(n, 1024),)](
+                gate_up, out, None, n, I, act_fn, swiglu_alpha, swiglu_limit, BLOCK=1024
+            )
         return out
     gate, up = gate_up.chunk(2, dim=-1)
     return apply_glu(gate, up, act_fn, swiglu_alpha, swiglu_limit)
@@ -536,6 +538,8 @@ def gemm_epilogue(
     N_COLS: tl.constexpr = 0,  # >0 masks the column tail (2D dense N isn't BN-aligned); 0 = no mask
     CSDescriptor=0,  # SWIZZLE_32_4_4 requant-scale descriptor; read only under SWIZZLED_OUT (else dummy)
     CsGlobal=None,  # (1,) fp32 NVFP4 output global (the NEXT proj's provided input_scale); normalizes the requant, None folds out
+    GlobalScale=None,  # (E,)|(1,) fp32 NVFP4 accumulator global (g_a·g_b or the weight-only g_b); applied PRE-GLU, None folds out
+    global_row=0,  # index into GlobalScale (expert id; 0 for the per-tensor 2D case)
 ):
     """Unified output epilogue for grouped (a real scatter tile) and batched (fake-batch decode:
     one token replicated across the BM lanes) GEMMs. Plain: cast + store the accumulator. ``GATE``:
@@ -548,6 +552,7 @@ def gemm_epilogue(
     rows with ``tl.max``; else a real BM-row scatter (``out_row`` + ``row_mask``).
     ``COMPUTE_MODE``/``SWAP_AB`` orient the decode GLU/finalize (grouped passes ``"dot"``/no-swap,
     both no-ops there). Every arm is constexpr-pruned."""
+    acc = apply_global_scale(acc, GlobalScale, global_row)
     if GATE:
         out = split_gate_up_glu(
             acc, COMPUTE_MODE, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB,

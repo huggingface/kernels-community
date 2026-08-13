@@ -333,3 +333,32 @@ def resolve_grouped_tile(
     n_off = pid_n * BLOCK_SIZE_N
     m_start = tl.min(in_row).to(tl.int32)
     return pid_n, expert_id, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start
+
+
+def expand_gather_below_parity(vals, scales, gather_idx, num_experts):
+    """Trade an in-kernel activation gather for one contiguous copy of the (packed) rows +
+    scales, when the copy beats what gathering can offer: on sm_10x the gathered descriptor
+    arm is tma gather4, MONOTONIC in tokens/expert (2x loss at 32/expert, parity ~1024 — the
+    measured law in ``smem_pruner``'s gather clause), so expand below parity; every other
+    arch has no gather TMA and forfeits descriptor-A entirely under a gather, so any large-S
+    gather expands. Small S (decode) keeps the gather — nothing to amortize, pointer-A wins.
+    Call AFTER the activation quant: expanding packed rows costs a fraction of raw bf16 and
+    leaves the quant at (num_tokens, K) instead of top_k times that.
+    Returns ``(vals, scales, gather_idx)`` with ``gather_idx=None`` when expanded."""
+    if gather_idx is None:
+        return vals, scales, gather_idx
+    if expand_regime(gather_idx.shape[0], num_experts):
+        g = gather_idx.to(torch.long)
+        vals = vals[g].contiguous()
+        if scales is not None and scales.ndim == 2:  # row-major per-row scales follow the rows
+            scales = scales[g].contiguous()
+        gather_idx = None
+    return vals, scales, gather_idx
+
+
+def expand_regime(S_rows: int, num_experts: int) -> bool:
+    """Where one contiguous copy of the routed rows beats in-kernel gathering: prefill row
+    counts (S >= 4096 amortizes the copy) below the sm_10x tma-gather4 parity (~1024
+    tokens/expert — gather4's 1-row box is MONOTONIC in tokens/expert; every other arch has
+    no gather TMA at all, so any large-S gather expands)."""
+    return S_rows >= 4096 and (not is_sm10x() or S_rows < 1024 * num_experts)

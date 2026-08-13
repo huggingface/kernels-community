@@ -257,6 +257,19 @@ def tokens_per_expert_bucket(S: int, num_experts: int) -> int:
 
 
 
+def normalize_global_scale(
+    g: torch.Tensor | None, num_experts: int
+) -> torch.Tensor | None:
+    """Flat fp32 ``(num_experts,)`` for the kernels' ``apply_global_scale`` load — accepts
+    ``(E,)``, ``(E,1,1)``, or (``num_experts=1``) a scalar. ``None`` passes through."""
+    if g is None:
+        return None
+    if num_experts == 1:
+        assert g.numel() == 1, f"per-tensor global expected, got {tuple(g.shape)}"
+        return g.reshape(1).float()
+    return normalize_per_expert_scale(g, num_experts).reshape(-1).float()
+
+
 def normalize_per_expert_scale(Bs: torch.Tensor, num_experts: int) -> torch.Tensor:
     """One per-tensor scale per expert, normalized to ``(num_experts, 1, 1)`` from
     either that or a bare ``(num_experts,)``."""

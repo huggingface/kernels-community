@@ -35,6 +35,8 @@ import os
 import random
 import time
 from collections import defaultdict
+
+import torch
 from typing import Dict, List
 
 from triton.runtime.autotuner import (
@@ -65,6 +67,8 @@ class BayesianAutotuner(Autotuner):
         refine: bool = True,
         max_refine_iters: int = 5,
         log_path: str | None = None,
+        path_anchor_axes: tuple[str, ...] = (),
+        finite_check_args: tuple[str, ...] = (),
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -78,9 +82,32 @@ class BayesianAutotuner(Autotuner):
         self.gamma = gamma
         self.refine = refine
         self.max_refine_iters = max_refine_iters
+        # Branch axes (by kwarg name) that relocate the TILE optimum — the caller's
+        # declaration, since it is configuration knowledge (the tuner never hardcodes
+        # axis names). Each distinct value combination of these axes gets one guaranteed
+        # max-tile anchor; empty = median anchors only.
+        self.path_anchor_axes = tuple(path_anchor_axes)
+        # Output arg NAMES (a declaration — the tuner never hardcodes kernel details) whose
+        # values are checked for NaN/inf after each config's bench: a config that writes
+        # non-finite output scores inf and can never be crowned. The tuner times, it never
+        # validates — this veto closes the NaN half of the "wrong-answer configs win
+        # tunes" class at negligible cost (one isfinite pass per benched config).
+        self.finite_check_args = tuple(finite_check_args)
         # JSONL log of every benched (key, config, ms) — set here or via the
         # FINEGRAINED_AUTOTUNE_LOG env var. Analyse offline to prune bad configs.
         self.log_path = log_path or os.environ.get("FINEGRAINED_AUTOTUNE_LOG")
+        # steady-state launch support: key extraction without dict builds (eager decode
+        # is host-bound; the cache-hit path of run() is on the per-token critical path)
+        self._arg_position = {name: i for i, name in enumerate(self.arg_names)}
+        self._arg_name_set = frozenset(self.arg_names)
+        self._dtype_tag_cache: Dict[tuple, str] = {}
+        self._dtype_str_cache: Dict[torch.dtype, str] = {}
+
+    def _dtype_str(self, dtype) -> str:
+        s = self._dtype_str_cache.get(dtype)
+        if s is None:
+            s = self._dtype_str_cache[dtype] = str(dtype)
+        return s
 
     # substrings marking a COMPILE-stage failure — the only class safe to memoize on
     # disk (a benching/CUDA error can be transient or sticky-context contamination;
@@ -117,7 +144,12 @@ class BayesianAutotuner(Autotuner):
             self._failures.append((config, memo[sig] + "  [memoized]"))
             return [float("inf")] * 3
         try:
-            return super()._bench(*args, config=config, **meta)
+            timing = super()._bench(*args, config=config, **meta)
+            bad = self._nonfinite_output(meta)
+            if bad is not None:
+                self._failures.append((config, f"non-finite output in {bad} (numerics veto)"))
+                return [float("inf")] * 3
+            return timing
         except Exception as e:
             err = f"{type(e).__name__}: {str(e)[:200]}"
             self._failures.append((config, err))
@@ -125,6 +157,28 @@ class BayesianAutotuner(Autotuner):
                 memo[sig] = err
                 self._persist_failed_compile_memo()
             return [float("inf")] * 3
+
+    def _nonfinite_output(self, meta=None) -> str | None:
+        """Name of the first declared output arg holding NaN/inf after a bench, else None.
+        fp8 tensors byte-check the E4M3 NaN pattern (no ``isfinite`` kernel for fp8);
+        integer/packed outputs are skipped (every bit pattern is a value)."""
+        if not self.finite_check_args:
+            return None
+        nargs = {**(getattr(self, "nargs", None) or {}), **(meta or {})}
+        for name in self.finite_check_args:
+            v = nargs.get(name)
+            if not isinstance(v, torch.Tensor) or v.numel() == 0:
+                continue
+            if v.dtype == torch.float8_e4m3fn:
+                flat = v.reshape(-1).view(torch.uint8)
+                bad = bool((((flat & 0x7F) == 0x7F)).any())
+            elif v.is_floating_point():
+                bad = bool((~v.reshape(-1).float().isfinite()).any())
+            else:
+                continue
+            if bad:
+                return name
+        return None
 
     def _compile_signature(self, config, meta=None) -> str | None:
         """Hash of the compile determinants for one config: the config itself plus the
@@ -225,28 +279,86 @@ class BayesianAutotuner(Autotuner):
 
     def run(self, *args, **kwargs):
         self._failures = []
-        # Small grid → defer to parent (stock exhaustive bench-all).
+        # Small grid → defer to parent (stock exhaustive bench-all). Steady state
+        # still short-circuits the parent's per-call dict builds: a crowned config
+        # with no pre_hook launches directly. The lookup key must be STOCK format
+        # (key values + untagged dtype strings) — it is the parent that populates
+        # this branch's cache entries.
         if len(self.configs) <= 1 or self.n_trials >= len(self.configs):
+            config = self.configs[0] if len(self.configs) == 1 else None
+            if config is None and self.cache:
+                n_positional = len(args)
+                key = []
+                for k in self.keys:
+                    i = self._arg_position.get(k)
+                    if i is not None and i < n_positional:
+                        key.append(args[i])
+                    elif k in kwargs and k in self._arg_name_set:
+                        key.append(kwargs[k])
+                for i in range(n_positional):
+                    dtype = getattr(args[i], "dtype", None)
+                    if dtype is not None:
+                        key.append(self._dtype_str(dtype))
+                for k, v in kwargs.items():
+                    if k in self._arg_name_set and self._arg_position[k] >= n_positional:
+                        dtype = getattr(v, "dtype", None)
+                        if dtype is not None:
+                            key.append(self._dtype_str(dtype))
+                config = self.cache.get(tuple(key))
+            if config is not None and config.pre_hook is None:
+                self.best_config = config
+                config_kwargs = getattr(config, "_all_kwargs_memo", None)
+                if config_kwargs is None:
+                    config_kwargs = config._all_kwargs_memo = config.all_kwargs()
+                return self.fn.run(*args, **kwargs, **config_kwargs)
             ret = super().run(*args, **kwargs)
             self._report_bench_failures()
             return ret
 
-        self.nargs = dict(zip(self.arg_names, args))
-        all_args = {**self.nargs, **kwargs}
-        _args = {k: v for k, v in all_args.items() if k in self.arg_names}
-        key = [_args[k] for k in self.keys if k in _args]
+        # Key extraction runs on every launch and eager decode is host-bound, so it
+        # avoids dict builds: positional args by precomputed index, then kwargs —
+        # the same (arg_names-prefix, kwargs-order) iteration the dict merge gave,
+        # keeping keys byte-compatible with existing disk crown caches.
+        arg_names = self.arg_names
+        n_positional = len(args)
+        tags = self._dtype_tag_cache
+        key = []
+        for k in self.keys:
+            i = self._arg_position.get(k)
+            if i is not None and i < n_positional:
+                key.append(args[i])
+            elif k in kwargs and k in self._arg_name_set:
+                key.append(kwargs[k])
         # name-tagged, with an explicit token for absent optional tensors: a positional
         # dtype list lets a gather-only and a scatter-only launch alias to one entry,
         # while descriptor-arm legality (descriptor_box_pruner) hangs off GatherIdx
         # presence — the aliased replay would read wrong rows without ever re-pruning
-        key.extend(
-            f"{k}:{v.dtype}" if hasattr(v, "dtype") else f"{k}:None"
-            for k, v in _args.items()
-            if hasattr(v, "dtype") or v is None
-        )
+        for i in range(n_positional):
+            v = args[i]
+            dtype = getattr(v, "dtype", None) if v is not None else None
+            if v is not None and dtype is None:
+                continue
+            tag_key = (arg_names[i], dtype)
+            tag = tags.get(tag_key)
+            if tag is None:
+                tag = tags[tag_key] = f"{tag_key[0]}:{dtype}"
+            key.append(tag)
+        for k, v in kwargs.items():
+            if k not in self._arg_name_set or self._arg_position[k] < n_positional:
+                continue
+            dtype = getattr(v, "dtype", None) if v is not None else None
+            if v is not None and dtype is None:
+                continue
+            tag_key = (k, dtype)
+            tag = tags.get(tag_key)
+            if tag is None:
+                tag = tags[tag_key] = f"{tag_key[0]}:{dtype}"
+            key.append(tag)
         key = tuple(key)
 
-        if key not in self.cache:
+        first_launch = key not in self.cache
+        if first_launch:
+            self.nargs = dict(zip(self.arg_names, args))
             pruned = self.prune_configs(kwargs)
 
             def benchmark():
@@ -271,9 +383,28 @@ class BayesianAutotuner(Autotuner):
 
         config = self.cache[key]
         self.best_config = config
+        config_kwargs = getattr(config, "_all_kwargs_memo", None)
+        if config_kwargs is None:
+            config_kwargs = config._all_kwargs_memo = config.all_kwargs()
         if config.pre_hook is not None:
-            config.pre_hook({**self.nargs, **kwargs, **config.all_kwargs()})
-        ret = self.fn.run(*args, **kwargs, **config.all_kwargs())
+            if not first_launch:  # tuned path already built nargs for prune_configs
+                self.nargs = dict(zip(self.arg_names, args))
+            config.pre_hook({**self.nargs, **kwargs, **config_kwargs})
+        ret = self.fn.run(*args, **kwargs, **config_kwargs)
+        if first_launch and self.finite_check_args:
+            # First launch after a key miss: the one regime where a crowned launch has been
+            # observed returning non-finite output while every subsequent identical launch
+            # is correct (large multi-device models; root cause open — see the DSV3
+            # investigation record). Detect via the declared output args and relaunch once,
+            # loudly. Sentinel/padding rows can false-trigger (uninitialized by contract);
+            # the cost is one duplicate launch per key, never a dropped config.
+            bad = self._nonfinite_output(kwargs)
+            if bad is not None:
+                logger.warning(
+                    "[autotune] %s: non-finite %s on the FIRST launch of key=%s — relaunching once",
+                    self.fn_name, bad, key,
+                )
+                ret = self.fn.run(*args, **kwargs, **config.all_kwargs())
         self.nargs = None
         return ret
 
@@ -381,6 +512,17 @@ class BayesianAutotuner(Autotuner):
                 if not improved:
                     break
 
+        # Crown RUNOFF: the search's single-shot timings carry enough noise to flip crowns
+        # between same-code tune rolls (gpt-oss prefill grouped rolled 1727-2150us on identical
+        # grids; the tuner's one RNG site is seeded, so noise is the only roll source). Re-time
+        # the top candidates back-to-back — same warmed process, adjacent in time, so they see
+        # the same clocks — and crown the winner of THAT comparison. Costs ~3 extra benches.
+        finite = sorted((t, i) for i, t in timings.items() if t != float("inf"))
+        if len(finite) > 1:
+            for _, i in finite[:3]:
+                timings.pop(i, None)
+                bench_idx(i)  # memoizing closure: re-benches and re-records the popped entry
+
         self.configs_timings = {configs[i]: t for i, t in timings.items()}
         best = min(timings, key=timings.get)
         if timings[best] == float("inf"):
@@ -457,9 +599,34 @@ class BayesianAutotuner(Autotuner):
                 configs[i].num_stages,
             )
 
-        return [
-            sorted(idxs, key=tile_order)[len(idxs) // 2] for idxs in groups.values()
-        ]
+        # Median anchor per basin, PLUS one max-tile anchor per declared PATH-axis combo
+        # (``path_anchor_axes``). The median alone left the big-tile end unsampled: TPE
+        # densities lock onto the first-timed mid-tile region and coordinate descent cannot
+        # cross DIAGONAL ridges — dsv4 mxfp8 prefill gate_up's BN=128/BK=256 winner (840us)
+        # needs BN and warps to move together, so descent from the BN=64 crown rejects the
+        # lone BN step and n_trials 100/200/400 all missed it; one guaranteed big-tile
+        # sample fixed it (crown 958 -> 880 at the default budget). The max anchor rides
+        # the declared COARSE grouping, NOT the full branch-axis cross: per-basin max
+        # anchors on the weight-only grouped grid (32 basins: modes x WS x PS x 2 memory
+        # modes each way) put 64 forced trials into a 100-trial budget and starved the
+        # search — gpt-oss prefill regressed 3463 -> 4099us on a quiet box before this was
+        # scoped. Which axes qualify is the KERNEL's declaration (configuration knowledge);
+        # axes absent from this grid are ignored.
+        anchors = []
+        coarse_seen = set()
+        coarse_axes = [k for k in self.path_anchor_axes if k in basin_axes]
+        for basin, idxs in groups.items():
+            ordered = sorted(idxs, key=tile_order)
+            anchors.append(ordered[len(ordered) // 2])
+            if not self.path_anchor_axes:
+                continue  # no declaration -> median anchors only
+            # declared axes absent from THIS grid still coarse-group to () — one global
+            # max-tile anchor, the big-tile guarantee without per-basin anchor spam
+            coarse = tuple(basin[basin_axes.index(k)] for k in coarse_axes)
+            if coarse not in coarse_seen and ordered[-1] != anchors[-1]:
+                coarse_seen.add(coarse)
+                anchors.append(ordered[-1])
+        return anchors
 
     def _warm_start_index(self, configs: List[Config]):
         """Return the index in ``configs`` matching the most recently cached
@@ -562,6 +729,8 @@ def bayesian_autotune(
     refine: bool = True,
     max_refine_iters: int = 5,
     log_path: str | None = None,
+    path_anchor_axes: tuple[str, ...] = (),
+    finite_check_args: tuple[str, ...] = (),
     cache_results: bool = True,
     reset_to_zero=None,
     restore_value=None,
@@ -573,6 +742,10 @@ def bayesian_autotune(
     n_startup_trials:         random seed configs before the TPE model kicks in
     gamma:                    top fraction of measured configs treated as "good"
     refine, max_refine_iters: coordinate-descent refinement after the TPE
+    path_anchor_axes:         branch axes (kwarg names) whose values relocate the tile
+                              optimum — one guaranteed max-tile anchor per value combo
+                              (see _basin_anchor_indices); the kernel declares them, the
+                              tuner stays independent of configuration details
     log_path:                 JSONL of benched configs (or FINEGRAINED_AUTOTUNE_LOG)
     cache_results:            persist the tuned best config to disk (on by default) so later
                               runs skip the search+compile — see BayesianAutotuner.check_disk_cache"""
@@ -591,6 +764,8 @@ def bayesian_autotune(
             refine=refine,
             max_refine_iters=max_refine_iters,
             log_path=log_path,
+            path_anchor_axes=path_anchor_axes,
+            finite_check_args=finite_check_args,
             cache_results=cache_results,
             **kwargs,
         )

@@ -194,13 +194,43 @@ def _e2m1_code_to_bf16_bits(code):
 
 
 @triton.jit
+def _e2m1_pair_to_f16(packed):
+    """One packed E2M1 byte -> the two fp16 values it holds, as a uint32 (low half = low nibble),
+    through the sm_100 CVT unit: ONE instruction per pair against the bit-twiddle form's ~10
+    integer ops. Every E2M1 magnitude is exact in fp16, so this is a value-identical decode, and
+    the direction of the unpack is irrelevant to the cost — the arithmetic is the whole bill
+    (measured on the gpt-oss W4A16 decode weight stream: 39.6us bit-twiddle, either axis, vs
+    11.6us here, against an 8.0us load-only floor). PTX has no 8-bit asm operand, so the byte
+    rides in a 16-bit register and is narrowed inside the block."""
+    return tl.inline_asm_elementwise(
+        "{ .reg .b8 t; cvt.u8.u16 t, $1; cvt.rn.f16x2.e2m1x2 $0, t; }",
+        "=r,h",
+        [packed.to(tl.uint16)],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def e2m1_to_bf16(b_packed):
     """Unpack packed MXFP4 (E2M1, two nibbles/byte along K) straight to bf16, doubling the K (row)
     dim: ``(R, C) uint8 -> (2R, C) bf16``. Direct (no E4M3 round-trip), and the low/high nibbles
     interleave along K with a SINGLE 3D axis-swap (``join`` -> ``[R, C, 2]`` -> swap last two ->
     reshape) instead of the three 2D transposes ``e2m1_to_e4m3`` needs — the weight-only unpack hot path
     (fp4 weight upcast in-loop, the caller widening to the activation dtype). K order low-nibble-first, matching
-    ``e2m1_to_e4m3``: ``[byte0_lo, byte0_hi, byte1_lo, ...]``."""
+    ``e2m1_to_e4m3``: ``[byte0_lo, byte0_hi, byte1_lo, ...]``. On sm_100 the codes decode through
+    the hardware CVT (``_e2m1_pair_to_f16``, fp16 being exact for the grid); elsewhere the integer
+    bit-build. Only the taken arm compiles."""
+    if _E2M1_HW_CVT:
+        pair = _e2m1_pair_to_f16(b_packed)
+        lo = (pair & 0xFFFF).to(tl.uint16)
+        hi = (pair >> 16).to(tl.uint16)
+        paired = tl.trans(tl.join(lo, hi), 0, 2, 1)
+        f16 = tl.reshape(
+            paired, (2 * b_packed.shape[0], b_packed.shape[1])
+        ).to(tl.float16, bitcast=True)
+        return f16.to(tl.bfloat16)
     lo = _e2m1_code_to_bf16_bits(b_packed & 0xF)  # [R, C] int32 (bf16 bits)
     hi = _e2m1_code_to_bf16_bits(b_packed >> 4)   # [R, C]
     paired = tl.join(lo, hi)                       # [R, C, 2]  (pair in last dim)
@@ -210,16 +240,96 @@ def e2m1_to_bf16(b_packed):
 
 
 @triton.jit
+def _e2m1_pair_to_e4m3(packed):
+    """One packed E2M1 byte -> its two values as an E4M3 pair (uint16, low byte = low nibble),
+    through the CVT unit in two instructions — fp4 to fp16 to fp8 — against the bit-build's ~8
+    integer ops per value. Both hops are exact: every E2M1 magnitude is representable in fp16
+    and in E4M3, so the pair is value-identical to ``_e2m1_code_to_e4m3_bits``."""
+    return tl.inline_asm_elementwise(
+        "{ .reg .b8 t; .reg .b32 f; cvt.u8.u16 t, $1; cvt.rn.f16x2.e2m1x2 f, t; "
+        "cvt.rn.satfinite.e4m3x2.f16x2 $0, f; }",
+        "=h,h",
+        [packed.to(tl.uint16)],
+        dtype=tl.uint16,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def e2m1_cols_to_bf16(packed):
+    """Column-unpack packed E2M1 to bf16: ``(R, C) uint8 -> (R, 2C)``, low nibble first — the
+    column-axis counterpart of the row-doubling ``e2m1_to_bf16``, for the swapped weight-only
+    tile (output rows leading, K contiguous). Same sm_100 hardware decode; the pair lands in
+    adjacent columns, so ``tl.join`` alone interleaves it (no axis swap)."""
+    if _E2M1_HW_CVT:
+        pair = _e2m1_pair_to_f16(packed)
+        lo = (pair & 0xFFFF).to(tl.uint16)
+        hi = (pair >> 16).to(tl.uint16)
+        f16 = tl.reshape(
+            tl.join(lo, hi), (packed.shape[0], 2 * packed.shape[1])
+        ).to(tl.float16, bitcast=True)
+        return f16.to(tl.bfloat16)
+    bits = tl.interleave(
+        _e2m1_code_to_bf16_bits(packed & 0xF), _e2m1_code_to_bf16_bits(packed >> 4)
+    )
+    return bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+
+
+@triton.jit
+def e2m1_cols_to_f32(packed):
+    """Column-unpack packed E2M1 straight to fp32, for the CUDA-core reduces: ``(R, C) uint8 ->
+    (R, 2C)``. The narrow-float hop its siblings owe their MMA callers (bf16 for ``tl.dot``, E4M3
+    for the scaled MMA) is pure work for a reduce that widens to fp32 anyway — measured 12.6 ->
+    15.4us on the gpt-oss decode tile for the bf16 round trip alone. Bit-identical to going via
+    either: every E2M1 value is exact in f16, bf16, E4M3 and fp32."""
+    if _E2M1_HW_CVT:
+        pair = _e2m1_pair_to_f16(packed)
+        lo = (pair & 0xFFFF).to(tl.uint16)
+        hi = (pair >> 16).to(tl.uint16)
+        f16 = tl.reshape(
+            tl.join(lo, hi), (packed.shape[0], 2 * packed.shape[1])
+        ).to(tl.float16, bitcast=True)
+        return f16.to(tl.float32)
+    bits = tl.interleave(
+        _e2m1_code_to_bf16_bits(packed & 0xF), _e2m1_code_to_bf16_bits(packed >> 4)
+    )
+    return bits.to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+
+
+@triton.jit
 def e2m1_cols_to_e4m3(packed):
     """Column-unpack packed E2M1 (two nibbles per byte along the last dim, low nibble
     first) to E4M3: ``(..., C) uint8 -> (..., 2C)`` — the column-axis counterpart of the
-    row-doubling ``e2m1_to_e4m3``; lossless (every E2M1 value is exact in E4M3) and
-    integer-only: the bytes are built by ``_e2m1_code_to_e4m3_bits`` and bitcast once."""
-    bits = tl.interleave(
-        _e2m1_code_to_e4m3_bits(packed & 0xF), _e2m1_code_to_e4m3_bits(packed >> 4)
-    )
+    row-doubling ``e2m1_to_e4m3``; lossless (every E2M1 value is exact in E4M3). sm_100
+    decodes through the CVT unit (``_e2m1_pair_to_e4m3``), elsewhere the integer bit-build;
+    either way the bytes are bitcast once. Only the taken arm compiles."""
+    if _E2M1_HW_CVT:
+        pair = _e2m1_pair_to_e4m3(packed)
+        bits = tl.interleave(pair & 0xFF, pair >> 8)
+    else:
+        bits = tl.interleave(
+            _e2m1_code_to_e4m3_bits(packed & 0xF), _e2m1_code_to_e4m3_bits(packed >> 4)
+        )
     return bits.to(tl.uint8).to(tl.float8e4nv, bitcast=True)
 
+
+
+@triton.jit
+def e2m1_to_f32(b_packed):
+    """Row-doubling counterpart of ``e2m1_cols_to_f32``: ``(R, C) uint8 -> (2R, C)`` fp32, for the
+    non-swapped CUDA-core reduce. Skips the E4M3 hop ``e2m1_to_e4m3`` owes its ``tl.dot`` callers;
+    bit-identical, since every E2M1 value is exact in E4M3, f16 and fp32."""
+    if _E2M1_HW_CVT:
+        pair = _e2m1_pair_to_f16(b_packed)
+        lo = (pair & 0xFFFF).to(tl.uint16)
+        hi = (pair >> 16).to(tl.uint16)
+        unpacked = tl.trans(tl.interleave(tl.trans(lo), tl.trans(hi)))
+        return unpacked.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+    lo = _e2m1_code_to_bf16_bits(b_packed & 0xF)
+    hi = _e2m1_code_to_bf16_bits(b_packed >> 4)
+    unpacked = tl.trans(tl.interleave(tl.trans(lo), tl.trans(hi)))
+    return unpacked.to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)
 
 
 @triton.jit
@@ -228,9 +338,14 @@ def e2m1_to_e4m3(b_packed):
     (row) dim: ``(R, C) uint8 -> (2R, C) E4M3``. E2M1's 8 magnitudes are all exact in
     E4M3, so this is lossless — it lets the FP8 ``tl.dot`` path stand in for
     ``tl.dot_scaled`` at decode (avoiding its M->128 pad). K order is the low nibble
-    first: ``[byte0_lo, byte0_hi, byte1_lo, ...]``."""
-    lo = _e2m1_code_to_e4m3_bits(b_packed & 0xF)
-    hi = _e2m1_code_to_e4m3_bits(b_packed >> 4)
+    first: ``[byte0_lo, byte0_hi, byte1_lo, ...]``. sm_100 decodes through the CVT unit
+    (``_e2m1_pair_to_e4m3``); elsewhere the integer bit-build. Only the taken arm compiles."""
+    if _E2M1_HW_CVT:
+        pair = _e2m1_pair_to_e4m3(b_packed)
+        lo, hi = pair & 0xFF, pair >> 8
+    else:
+        lo = _e2m1_code_to_e4m3_bits(b_packed & 0xF)
+        hi = _e2m1_code_to_e4m3_bits(b_packed >> 4)
     # interleave along the K (row) dim via trans -> interleave-last-dim -> trans back
     unpacked = tl.trans(tl.interleave(tl.trans(lo), tl.trans(hi)))
     return unpacked.to(tl.uint8).to(tl.float8e4nv, bitcast=True)
@@ -258,6 +373,58 @@ def _quant_block_k_pruner(configs, named_args, **kwargs):
         and (not grouped or c.kwargs["BLOCK_T"] == 128)
     ]
 
+
+
+@triton.jit
+def store_mx_act_scales(
+    S,
+    SOut,
+    out_row,  # per-lane output row (any int vector: contiguous grid rows or scattered dests)
+    s,
+    row_mask,
+    kb,
+    T,
+    K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SWIZZLED: tl.constexpr,
+    MASK: tl.constexpr,  # "rows" (per-lane), "blocks" (whole 128-row blocks past T), "none"
+):
+    """Store one act-quant scale tile. Row-major (``S``, per ``out_row``) or straight into the
+    SWIZZLE_32_4_4 buffer (``SOut``) as PER-ELEMENT ptr arithmetic (no 128-row reshape): s[t, g]
+    lands at (block*cb_total + kb*REP_K + rep)*512 + r32*16 + outer4*4 + c4, where block =
+    out_row//128, r32 = out_row%32, outer4 = (out_row%128)//32, and the col-block splits g into
+    rep = g//4, c4 = g%4. Byte-identical to the old reshape form at BLOCK_T=128 (grouped grid)
+    but valid for any out_row vector, so the dense grid, the grouped-sorted grid, and the
+    scatter (quantize-once) stores all share it. Masking is the caller\'s store policy: the
+    grouped-sorted grid writes its padding rows too ("none" — quantized zeros the GEMM never
+    reads), the dense grid masks whole tiles past the real row-blocks ("blocks"), scattered
+    and row-major stores mask per lane ("rows")."""
+    groups: tl.constexpr = BLOCK_K // SCALE_GROUP_K
+    if SWIZZLED:
+        cb_total = K // SCALE_GROUP_K // 4
+        lg = tl.arange(0, groups)
+        rep = lg // 4
+        block = out_row // 128
+        off = (
+            (block[:, None] * cb_total + kb * (groups // 4) + rep[None, :]) * 512
+            + (out_row % 32)[:, None] * 16
+            + ((out_row % 128) // 32)[:, None] * 4
+            + (lg % 4)[None, :]
+        )
+        if MASK == "rows":
+            tl.store(SOut + off, s, mask=row_mask[:, None])
+        elif MASK == "blocks":
+            tl.store(SOut + off, s, mask=block[:, None] < tl.cdiv(T, 128))
+        else:
+            tl.store(SOut + off, s)
+    else:
+        sg = kb * groups + tl.arange(0, groups)
+        tl.store(
+            S + out_row.to(tl.int64)[:, None] * (K // SCALE_GROUP_K) + sg[None, :],
+            s,
+            mask=row_mask[:, None],
+        )
 
 
 @bayesian_autotune(
@@ -358,38 +525,16 @@ def _mx_act_quant_kernel(
     width: tl.constexpr = BLOCK_K // 2 if RECIPE != "mxfp8" else BLOCK_K
     y_row: tl.constexpr = K // (BLOCK_K // width)  # per-row element count of Y
     yo = kb * width + tl.arange(0, width)
-    # values -> source row order either way (the swizzled grid scatters via the gathered in_row)
+    # values -> source row order (the swizzled grid scatters via the gathered in_row)
     tl.store(Y + in_row[:, None] * y_row + yo[None, :], y, mask=row_mask[:, None])
     if SWIZZLED:
-        # scales -> SWIZZLE_32_4_4 as PER-ELEMENT ptr arithmetic (no 128-row reshape): s[t, g] lands
-        # at (block*cb_total + kb*REP_K + rep)*512 + r32*16 + outer4*4 + c4, where the output row
-        # so[t] = pid_m*BLOCK_T + t gives block = so//128, r32 = so%32, outer4 = (so%128)//32, and the
-        # col-block splits g into rep = g//4, c4 = g%4. Byte-identical to the old reshape form at
-        # BLOCK_T=128 (grouped grid), but valid for any BLOCK_T -> the dense autotuned grid reuses this
-        # exact store. Dense masks tiles past the real row-blocks; grouped over-allocates padding
-        # blocks the GEMM never reads, so it writes them all (harmless).
-        groups: tl.constexpr = BLOCK_K // SCALE_GROUP_K
-        cb_total = K // SCALE_GROUP_K // 4
-        lg = tl.arange(0, groups)
-        rep = lg // 4
-        block = so // 128
-        off = (
-            (block[:, None] * cb_total + kb * (groups // 4) + rep[None, :]) * 512
-            + (so % 32)[:, None] * 16
-            + ((so % 128) // 32)[:, None] * 4
-            + (lg % 4)[None, :]
+        store_mx_act_scales(
+            S, SOut, so, s, row_mask, kb, T, K, SCALE_GROUP_K, BLOCK_K, True,
+            "none" if GROUPED else "blocks",
         )
-        if GROUPED:
-            tl.store(SOut + off, s)
-        else:
-            tl.store(SOut + off, s, mask=block[:, None] < tl.cdiv(T, 128))
     else:
-        groups: tl.constexpr = BLOCK_K // SCALE_GROUP_K
-        sg = kb * groups + tl.arange(0, groups)
-        tl.store(
-            S + in_row[:, None] * (K // SCALE_GROUP_K) + sg[None, :],
-            s,
-            mask=row_mask[:, None],
+        store_mx_act_scales(
+            S, SOut, in_row, s, row_mask, kb, T, K, SCALE_GROUP_K, BLOCK_K, False, "rows"
         )
 
 

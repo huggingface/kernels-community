@@ -23,11 +23,11 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
 from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, sm_count, tl_dtype
-from .recipes import Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_recipe
+from .recipes import normalize_global_scale, Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_recipe
 from .tile_layout import build_tile_layout
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_swizzled_grouped, swizzle_grouped_mx_scales
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
-from .scheduling import build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
+from .scheduling import expand_gather_below_parity, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
 from .tiles import (
     load_act_block_dynamic,
     load_act_mx,
@@ -41,7 +41,7 @@ from .tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, gemm_epilogue
-from .pruners import packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
+from .pruners import PATH_ANCHOR_AXES, global_scale_warp_spec_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
 
 
 def _rebind_grouped_weight_descriptor(nargs):
@@ -143,6 +143,7 @@ def _rebind_grouped_mx_descriptors(nargs):
     # descriptor-box legality, so checkpoints with different blocks must not share a winner.
     ["N", "K", "tokens_per_expert_bit_length", "GATE", "BLOCK_SIZE_N", "BLOCK_SIZE_K"],
     n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
     # Pipeliner-race guard: per launch-BM, WS-only at BM >= 64 and non-WS below (see the pruner).
     prune_configs_by={
         "early_config_prune": compose_pruners(
@@ -339,6 +340,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     ),
     ["N", "K", "tokens_per_expert_bit_length", "GATE", "BLOCK_SIZE_N", "BLOCK_SIZE_K"],
     n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
     # Pipeliner-race WS guard (per launch-BM: forces WS where the default pipeliner races at
     # BM>=64, keeps non-WS below) + descriptor-box limits.
     prune_configs_by={
@@ -518,6 +520,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
     # BLOCK_SIZE_K/N are tuned axes; the K-loop is maskless and the N-tile store is
     # row-masked only — veto non-dividing tiles on both. WS is a pure perf axis here
     # (non-WS is the validated state), compile-guarded. The GATE arm's stacked width-512
@@ -709,6 +712,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     # splits them incidentally today; a descriptor Cs has no dtype token).
     ["N", "K", "tokens_per_expert_bit_length", "GATE", "SWIZZLED_SCALES", "INTERLEAVED_SCALES", "OUTPUT_RECIPE", "SWIZZLED_OUT"],
     n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
     # BK-within-K veto + the sm_10x dot_scaled shape/trap gates (this kernel had no
     # pruner while its BK span was {128,256} — the union span's BK=64 rows made the
     # gates load-bearing). swizzled_scale_config_pruner: the swizzled scale read needs
@@ -920,10 +924,6 @@ def mx_dynamic_matmul_grouped_kernel(
             kb_off += BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
 
         # NVFP4 two-level: block e4m3 scales rode through dot_scaled; recover the combined per-tensor
-        # global g_a·g_b on the accumulator — one multiply. None folds out at trace time.
-        if AsBsGlobal is not None:
-            acc = acc * tl.load(AsBsGlobal + expert_id64).to(tl.float32)
-
         gemm_epilogue(
             C,
             Cs,
@@ -950,6 +950,8 @@ def mx_dynamic_matmul_grouped_kernel(
             CSDescriptor=CSDescriptor,
             CsGlobal=CsGlobal,
             N_COLS=N,  # mask the partial last N-tile's column tail (non-128 N; inert when N % BN == 0)
+            GlobalScale=AsBsGlobal,
+            global_row=expert_id64,
         )
 
 
@@ -973,12 +975,18 @@ def mx_dynamic_matmul_grouped_kernel(
     ),
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
     prune_configs_by={
         "early_config_prune": compose_pruners(
             packed_schedule_scope_pruner(),
-            block_within_dim_pruner("K"),
-            block_within_dim_pruner("N", "BLOCK_SIZE_N"),
-            mx_config_pruner("K", "N"),  # dot_scaled shape gates
+            # the tail tile slides back in bounds (see the K-loop) — BK only has to fit
+            block_fits_dim_pruner("K"),
+            # no N veto: this kernel wraps its N tail (``offs_bn % N`` above the loop, wrapped
+            # columns masked by N_COLS in the epilogue), so non-dividing BN is correct — the
+            # veto belongs to the maskless-store kernels (see OPTIMIZATION_LOG: n-veto-lift)
+            mx_config_pruner("K", "N", block_within_k=False),  # dot_scaled shape gates
+            global_scale_warp_spec_pruner(),
+            gate_stacked_tmem_trap_pruner(),
             descriptor_box_pruner(),
             smem_pruner(),
             warp_spec_compile_guard_pruner(),
@@ -990,9 +998,10 @@ def mx_dynamic_matmul_grouped_kernel(
 def mx_weight_only_matmul_grouped_kernel(
     A,  # (num_tokens, K) raw BF16/FP16 activations — NOT quantized
     ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
-    B,  # (num_experts, N, K[/2]) MXFP4 (packed E2M1) / MXFP8 (E4M3) weights; 2N under GATE
+    B,  # (num_experts, N, K[/2]) MXFP4/NVFP4 (packed E2M1) / MXFP8 (E4M3) weights; 2N under GATE
     BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K_bytes), box ((2|1), BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
-    Bs,  # (num_experts, N, K // SCALE_GROUP_K) UE8M0 weight group scales (2N under GATE)
+    Bs,  # (num_experts, N, K // SCALE_GROUP_K) group scales — UE8M0 (MX) or E4M3 (NVFP4)
+    BsGlobal,  # (num_experts,) fp32 NVFP4 per-expert global — recovers on the accumulator; read iff not None
     C,
     GatherIdx,
     ScatterIdx,
@@ -1075,23 +1084,32 @@ def mx_weight_only_matmul_grouped_kernel(
         )
         acc = acc_init("dot", BLOCK_SIZE_M, n_width, False)
         kb_off = 0
+        # The tail K-tile slides back to end at K instead of running past the row, so BK need
+        # only FIT K (see the batched sibling): the overlapped lanes are re-read and cancelled
+        # by zeroing their activation. BK | K leaves every offset untouched.
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+            k_start = tl.minimum(k * BLOCK_SIZE_K, K - BLOCK_SIZE_K)
+            overlap = k * BLOCK_SIZE_K - k_start
             a, _as = load_act_plain(
-                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
+                a_ptrs, ADescriptor, m_start, k_start, row_mask, in_row,
                 A_MEMORY_MODE, GatherIdx is not None,
             )
+            if overlap > 0:  # only the slid tail trip pays the select
+                a = tl.where(tl.arange(0, BLOCK_SIZE_K)[None, :] >= overlap, a, 0.0)
             w, w_s = load_weight_mx(
                 b_ptrs, BDescriptor, Bs, None, None, 0, row0, n_off, kb_off, 0, expert_id64, pid_n, k, N, K,
                 stride_bs_e, stride_bs_n, stride_bs_k,
                 GATE, True, False, B_MEMORY_MODE, False, False,
                 BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
+                k_col_off=-(overlap // SCALE_GROUP_K),
             )
             acc = mx_weight_only_compute(
                 acc, a, w, w_s, COMPUTE_MODE, BLOCK_SIZE_K, n_width, SCALE_GROUP_K
             )
-            a_ptrs += BLOCK_SIZE_K * stride_a_k
-            b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
-            kb_off += BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
+            step = tl.minimum((k + 1) * BLOCK_SIZE_K, K - BLOCK_SIZE_K) - k_start
+            a_ptrs += step * stride_a_k
+            b_ptrs += (step // WEIGHT_VALUES_PER_BYTE) * stride_b_k
+            kb_off = tl.minimum((k + 1) * BLOCK_SIZE_K, K - BLOCK_SIZE_K) // WEIGHT_VALUES_PER_BYTE
 
         gemm_epilogue(
             C, C, acc, out_row, pid_n, tile_id // num_n_tiles, row_mask,
@@ -1099,6 +1117,8 @@ def mx_weight_only_matmul_grouped_kernel(
             BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, 1,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
             N_COLS=N,
+            GlobalScale=BsGlobal,
+            global_row=expert_id64,
         )
 
 
@@ -1115,6 +1135,7 @@ def mx_weight_only_matmul_grouped_kernel(
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
     # BLOCK_SIZE_K is a tuned axis and the K-loop is maskless — veto non-dividing BKs.
     prune_configs_by={
         "early_config_prune": compose_pruners(
@@ -1357,6 +1378,8 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
         A, As = fp8_act_quant_block_dynamic(
             A, block_k, use_ue8m0=bs_u8.dtype == torch.uint8
         )
+        # post-quant: trade the in-kernel gather for one packed-row copy where that wins
+        A, As, gather_idx = expand_gather_below_parity(A, As, gather_idx, num_experts)
     if requant:
         C = A.new_empty(S, N, dtype=FP8_DTYPE)
         # UE8M0 model (ue8m0 weights) -> UE8M0 intermediate scales so the down proj reads
@@ -1617,6 +1640,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     output_dtype = resolve_output_dtype(output_dtype, A, As)
     if As is None:
         A, As = fp8_act_quant_tensor_wide(A, K)
+        # post-quant: trade the in-kernel gather for one packed-row copy where that wins
+        A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, num_experts)
     C = A.new_empty(S, N, dtype=output_dtype)
     num_sms = sm_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
@@ -1794,6 +1819,21 @@ def mx_dynamic_matmul_grouped(
     if a_global_scale is not None:
         assert input_recipe == "nvfp4", "an activation global is NVFP4-only"
     if swizzled_scales:
+        if As is None and gather_idx is not None:
+            # Quantize ONCE at (num_tokens, K) and let the kernel gather the packed rows:
+            # the fused sorted-quant below re-reads and re-quantizes each row per routed
+            # copy (top_k times). A/B at GLM nvfp4 / dsv4 mxfp8 prefill shapes: 1697 ->
+            # 1531us / 1180 -> 1159us on the gate_up GEMM, bit-identical — the (T, K)
+            # packed buffer is L2-sized, so the descriptor gather4 reads hit cache while
+            # any materialized (S, K) layout streams DRAM (a fused quant+scatter form
+            # measured SLOWER everywhere — see OPTIMIZATION_LOG: fused-quant-scatter).
+            # The scales take the same gather+swizzle pass a caller-provided row-major
+            # As takes.
+            A, As = (
+                MX_ACT_QUANT[input_recipe](A, global_scale=a_global_scale)
+                if a_global_scale is not None
+                else MX_ACT_QUANT[input_recipe](A)
+            )
         if As is None:
             a_vals, act_scales, n_m_tiles = mx_act_quant_swizzled_grouped(
                 A, input_recipe, scale_group, scale_dtype, gather_idx, expert_start, a_global_scale
@@ -1817,7 +1857,14 @@ def mx_dynamic_matmul_grouped(
             )
         else:
             a_vals, act_scales = A, As
-        n_rows = gather_idx.numel() if gather_idx is not None else A.shape[0]
+        # post-quant: trade the in-kernel gather for one packed-row copy where that wins.
+        # Unlike the swizzled arm, the affine gather LOSES to the copy (2109 vs 1993us at
+        # GLM shape): the affine scale gather forfeits WS and the descriptor-A configs, so
+        # materialized rows keep the faster GEMM.
+        a_vals, act_scales, gather_idx = expand_gather_below_parity(
+            a_vals, act_scales, gather_idx, num_experts
+        )
+        n_rows = gather_idx.numel() if gather_idx is not None else a_vals.shape[0]
         n_m_tiles = n_rows // 128 + num_experts
     # uint8 aliases for the binder — never clobber the caller's A/B/Bs dtype/view. Each operand's
     # scale is one pointer (``*_u8``) read affine in-kernel, plus a descriptor built only on the
@@ -2041,11 +2088,14 @@ def mx_weight_only_matmul_grouped(
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
+    b_global_scale: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
-    """weight-only grouped matmul: raw bf16/fp16 activations against MXFP4/MXFP8 weights upcast to bf16
-    in-loop — the ``matmul_ogs`` recipe (fp4/fp8 weight bytes, bf16 acts, weight upcast in-MMA).
-    Affine (3D) weight scales. Same gather/scatter expert scheduling as the other grouped ops.
-    Returns ``[C]`` (no requant — the bf16 intermediate needs none)."""
+    """weight-only grouped matmul: raw bf16/fp16 activations against MXFP4/NVFP4/MXFP8 weights upcast
+    to bf16 in-loop — the ``matmul_ogs`` recipe (fp4/fp8 weight bytes, bf16 acts, weight upcast in-MMA).
+    Affine (3D) weight scales — UE8M0 group-32 (MX) or E4M3 group-16 (NVFP4, whose per-expert fp32
+    ``b_global_scale`` ``(E,)`` recovers on the accumulator; ``None`` = single-level). Same
+    gather/scatter expert scheduling as the other grouped ops. Returns ``[C]`` (no requant — the
+    bf16 intermediate needs none)."""
     assert A.dtype in (torch.bfloat16, torch.float16, torch.float32), (
         f"weight-only takes a raw bf16/fp16/fp32 activation, got {A.dtype}"
     )
@@ -2058,6 +2108,7 @@ def mx_weight_only_matmul_grouped(
     )
     N = rows // 2 if gate else rows
     scale_group = mx_scale_family(Bs, K)
+    b_global_scale = normalize_global_scale(b_global_scale, num_experts)
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     C = A.new_empty(S, N, dtype=output_dtype)
@@ -2081,6 +2132,7 @@ def mx_weight_only_matmul_grouped(
             b_u8,
             b_descriptor,
             bs_u8,
+            b_global_scale,
             C,
             gather_idx,
             scatter_idx,
@@ -2172,6 +2224,11 @@ def matmul_grouped(
     """
     ep = epilogue if epilogue is not None else Epilogue()
     q = quantization if quantization is not None else Quantization()
+    if gather_idx is not None and q.input_recipe is None and As is None:
+        # weight-only: raw bf16 rows are what the kernel consumes, so the trade is decided
+        # here; the QUANTIZED recipes decide it in their family wrappers AFTER the act quant
+        # (expanding packed rows + scales — see ``expand_gather_below_parity``).
+        A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, B.shape[0])
     assert (a_global_scale is None and b_global_scale is None) or (
         Bs is not None and weight_recipe(B, Bs) == "nvfp4"
     ), "two-level globals (a_global_scale / b_global_scale) are NVFP4-only"
@@ -2218,9 +2275,8 @@ def matmul_grouped(
         assert As is None and a_global_scale is None and q.output_recipe is None, (
             "weight-only (input_recipe=None) takes a raw activation, no As/global/requant"
         )
-        assert b_global_scale is None and output_global_scale is None, (
-            "weight-only does not apply two-level globals (the in-MMA upcast never "
-            "multiplies g_b) — dropping one silently would scale the output wrong"
+        assert output_global_scale is None, (
+            "weight-only has no requant epilogue for output_global_scale to normalize"
         )
         out = mx_weight_only_matmul_grouped(
             A,
@@ -2231,6 +2287,7 @@ def matmul_grouped(
             output_dtype,
             gather_idx,
             scatter_idx,
+            b_global_scale=b_global_scale,
         )
     elif is_mx(B, Bs):
         out = mx_dynamic_matmul_grouped(

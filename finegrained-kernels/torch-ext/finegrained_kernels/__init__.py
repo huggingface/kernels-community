@@ -13,6 +13,7 @@ from .moe import (
 from .recipes import Epilogue, Quantization
 from .swizzle import swizzle_mx_scales
 from .scheduling import compute_grouped_scheduling
+from .compat import weighted_reduce
 from .quant import (
     fp8_act_quant_block_dynamic,
     fp8_act_quant_tensor_wide,
@@ -36,6 +37,7 @@ __all__ = [
     "moe_torch_grouped",
     # Grouped scheduling (for MoE and grouped matmul)
     "compute_grouped_scheduling",
+    "weighted_reduce",
     # MX/NVFP4 scale layout (apply to weight scales at load time)
     "swizzle_mx_scales",
     # Quantization helpers (weights at load time; activations offline)

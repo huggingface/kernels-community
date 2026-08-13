@@ -160,10 +160,9 @@ def moe_fused_grouped(
     )
 
     # Phase 1: gate_up + SiLU + requant in the block recipe -> expert-ordered quantized
-    # intermediate (the op quantizes the raw hidden itself). Gather hidden by routed row
-    # (gather_idx); leave the output expert-ordered (scatter_idx=None — the down
-    # projection reads it in place, no scatter between the two GEMMs).
-    # (C, Cs) under a requant recipe; a bare Tensor on the full-precision path
+    # intermediate (the op quantizes the raw hidden itself and owns the expand-vs-gather
+    # regime policy — this forward is pure sequencing). scatter_idx=None: the down reads
+    # the intermediate in place. (C, Cs) under a requant recipe; a bare Tensor otherwise.
     gate_up_out = matmul_grouped(
         hidden_states,
         gate_up_proj,
@@ -181,7 +180,8 @@ def moe_fused_grouped(
             swiglu_limit=swiglu_limit,
             simulate_unfused=simulate_unfused,
         ),
-        # recipe is the resolved format; None (weight-only) leaves the GLU intermediate bf16, no requant.
+        # recipe is the resolved format; None (weight-only) leaves the GLU intermediate
+        # bf16, no requant.
         quantization=Quantization(input_recipe=recipe, output_recipe=recipe),
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
@@ -199,11 +199,12 @@ def moe_fused_grouped(
         a_global_scale=down_input_global_scale,
         b_global_scale=down_proj_global_scale,
         expert_start=expert_start,
-        # weight-only: the intermediate is bf16 (As is None) — route the down to the weight-only path too.
+        # weight-only: the intermediate is bf16 (As None) — the down goes weight-only too.
         quantization=Quantization(input_recipe=recipe) if recipe is None else None,
         output_dtype=hidden_states.dtype,
         scatter_idx=scatter_idx,
     )
+
     # Phase 3: routing-weighted top-k reduce -> (num_tokens, hidden_dim). simulate_unfused
     # rounds each weighted contrib to the activation dtype before summing, matching the
     # unfused path's torch reduce (which materializes bf16 contribs); production

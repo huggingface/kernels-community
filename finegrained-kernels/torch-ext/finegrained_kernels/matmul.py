@@ -21,10 +21,10 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
 from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
-from .recipes import Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, is_mx, mx_scale_family, resolve_input_recipe, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_recipe
+from .recipes import normalize_global_scale, Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, is_mx, mx_scale_family, resolve_input_recipe, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_recipe
 from .swizzle import swizzle_mx_scales
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, maybe_act_quant
-from .scales import gate_stacked_block_scale_ptrs, mx_2d_scale_ptrs
+from .scales import apply_global_scale, gate_stacked_block_scale_ptrs, mx_2d_scale_ptrs
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .tiles import (
     advance_ptrs,
@@ -42,7 +42,7 @@ from .tiles import (
     swizzle_offsets,
 )
 from .epilogue import acc_init, gemm_epilogue, store_masked, store_masked_oriented
-from .pruners import block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, gate_pointer_only_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner
+from .pruners import PATH_ANCHOR_AXES, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, gate_pointer_only_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner
 
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
 # ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.
@@ -147,6 +147,9 @@ def _rebind_mx_descriptors(nargs):
     # at one shape with different blocks must not share a winner.
     ["N", "K", "m_bit_length", "GATE", "block_n", "block_k"],
     n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
+    # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
+    finite_check_args=("C", "Cs"),
     # WS compile guard + descriptor TMA-box limits (256/dim) + shared-memory fit (the big
     # TMA prefill tiles reach the smem ceiling; BM256 BN256 OOMs). The gate|up stack reads via the
     # pointer arm (a contiguous descriptor box can't span the N-apart gate/up rows), so prune the
@@ -160,6 +163,7 @@ def _rebind_mx_descriptors(nargs):
             smem_pruner("block_k"),
             gate_pointer_only_pruner(),
             block_dynamic_mma_width_pruner(),
+            block_dynamic_2d_warp_spec_pruner(),
         )
     },
 )
@@ -326,6 +330,9 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space).
     ["N", "K", "m_bit_length", "GATE"],
     n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
+    # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
+    finite_check_args=("C", "Cs"),
     # block_k is a tuned axis and the loop below is maskless — veto non-dividing BKs;
     # WS is a pure perf axis here (non-WS is the validated state), compile-guarded.
     prune_configs_by={
@@ -446,6 +453,9 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     # block_n/block_k (the launch-pinned quant block) gate descriptor-box legality and the K tile.
     ["N", "K", "m_bit_length", "GATE", "block_n", "block_k"],
     n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
+    # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
+    finite_check_args=("C", "Cs"),
     # The gate|up stack reads via the pointer arm (a contiguous descriptor box can't span the
     # N-apart gate/up rows), so prune the B-descriptor configs under GATE.
     prune_configs_by={
@@ -614,6 +624,9 @@ def w8a8_block_static_fp8_matmul_kernel(
     # dtype token, so don't lean on the append).
     ["N", "K", "m_bit_length", "INPUT_RECIPE", "SWIZZLED_SCALES", "INTERLEAVED_SCALES", "GATE", "OUTPUT_RECIPE", "SWIZZLED_OUT"],
     n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
+    # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
+    finite_check_args=("C", "Cs"),
     # BK-within-K veto (the loop loads are unmasked) + the sm_10x dot_scaled shape guards
     # + scalar restricted to decode-sized M (a BM=1 GEVM at prefill is TPE poison) + the
     # gate|up stack reads via the pointer arm (the descriptor's one contiguous box can't span
@@ -762,11 +775,6 @@ def mx_dynamic_matmul_kernel(
         )
 
     # NVFP4 two-level: block e4m3 scales rode through dot_scaled; recover the combined per-tensor
-    # global g_a·g_b on the accumulator — one multiply (g_a alone is used only by the inline-quant
-    # arm). None folds out at trace time.
-    if AsBsGlobal is not None:
-        accumulator = accumulator * tl.load(AsBsGlobal).to(tl.float32)
-
     # one epilogue for both arms: GATE splits+SwiGLUs (+ optional requant), plain casts+stores.
     # affine output rows (swizzle's offs_am is %-wrapped — the store scatters to real rows);
     # N_COLS masks the 2D-dense column tail.
@@ -778,6 +786,8 @@ def mx_dynamic_matmul_kernel(
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
         COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, N_COLS=N, SWIZZLED_OUT=SWIZZLED_OUT,
         CSDescriptor=CSDescriptor, CsGlobal=CsGlobal,
+        GlobalScale=AsBsGlobal,
+        global_row=0,
     )
 
 
@@ -799,6 +809,9 @@ def mx_dynamic_matmul_kernel(
     ),
     ["N", "K", "m_bit_length", "GATE"],
     n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
+    # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
+    finite_check_args=("C", "Cs"),
     # WS compile guard + descriptor TMA-box limits (256/dim) + smem fit; the gate|up stack reads via
     # the pointer arm (a contiguous box can't span the N-apart gate/up rows), so prune B-descriptor
     # under GATE.
@@ -817,9 +830,10 @@ def mx_dynamic_matmul_kernel(
 def mx_weight_only_matmul_2d_kernel(
     A,  # (M, K) raw BF16/FP16 activations — NOT quantized
     ADescriptor,  # host TMA descriptor over A (M, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
-    B,  # (N, K[/2]) MXFP4 (packed E2M1) / MXFP8 (E4M3) weights; under GATE the (2N, ...) gate|up stack
+    B,  # (N, K[/2]) MXFP4/NVFP4 (packed E2M1) / MXFP8 (E4M3) weights; under GATE the (2N, ...) gate|up stack
     BDescriptor,  # host TMA descriptor over B (N, K_bytes), box (BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
-    Bs,  # (N, K // SCALE_GROUP_K) UE8M0 weight group scales (2N under GATE)
+    Bs,  # (N, K // SCALE_GROUP_K) group scales — UE8M0 (MX) or E4M3 (NVFP4)
+    BsGlobal,  # scalar fp32 NVFP4 per-tensor global — recovers on the accumulator; read iff not None
     C,  # (M, N) output (GLU intermediate under GATE)
     M,
     N,
@@ -897,6 +911,10 @@ def mx_weight_only_matmul_2d_kernel(
         b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
         bs_ptrs += SCALE_COLS * stride_bs_k
 
+    # explicit (not the epilogue fold): the non-GATE arm exits through store_masked, which
+    # has no GlobalScale slot — the multiply must precede BOTH exits
+    accumulator = apply_global_scale(accumulator, BsGlobal, 0)
+
     if GATE:
         out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         gemm_epilogue(
@@ -920,6 +938,9 @@ def mx_weight_only_matmul_2d_kernel(
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide).
     ["N", "K", "m_bit_length", "GATE"],
     n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
+    # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
+    finite_check_args=("C", "Cs"),
     prune_configs_by={
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("K"),
@@ -1582,9 +1603,11 @@ def mx_weight_only_matmul_2d(
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
+    b_global_scale: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """weight-only dense matmul ``C = A @ B.T``: a RAW bf16/fp16 activation (no quant) against an
-    MXFP4/MXFP8 weight upcast to bf16 in-loop — the ``matmul_ogs`` recipe (fp4/fp8 weight bytes in
+    MXFP4/NVFP4/MXFP8 weight upcast to bf16 in-loop (NVFP4's per-tensor fp32 ``b_global_scale``
+    recovers on the accumulator; ``None`` = single-level) — the ``matmul_ogs`` recipe (fp4/fp8 weight bytes in
     memory, bf16 acts, weight upcast in-MMA). Affine (2D) weight scales only. ``gate`` fuses the
     ``(2N, K)`` gate|up projection + SwiGLU, returning the ``[..., N]`` GLU intermediate. Returns a
     one-element list (mirrors the other 2D ops). Packed-E2M1 K (B is (rows, K//2)) is handled
@@ -1608,6 +1631,7 @@ def mx_weight_only_matmul_2d(
     assert A.is_contiguous(), "A must be contiguous (the host-TMA descriptor arm reads its box)"
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
+    b_global_scale = normalize_global_scale(b_global_scale, 1)
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
     # Host-TMA descriptors over the (M, K) bf16 A and packed (N, K_bytes) weight — placeholder box
     # rebound per tuned config by _rebind_weight_only_descriptors, read only by the descriptor configs the
@@ -1628,6 +1652,7 @@ def mx_weight_only_matmul_2d(
             b_u8,
             b_descriptor,
             bs_u8,
+            b_global_scale,
             C,
             M,
             N,
@@ -1725,13 +1750,13 @@ def matmul_2d(
             assert As is None and a_global_scale is None and output_recipe is None, (
                 "weight-only (input_recipe=None) takes a raw bf16 activation, no As/global/requant"
             )
-            assert b_global_scale is None and output_global_scale is None, (
-                "weight-only does not apply two-level globals (the in-MMA upcast never "
-                "multiplies g_b) — dropping one silently would scale the output wrong"
+            assert output_global_scale is None, (
+                "weight-only has no requant epilogue for output_global_scale to normalize"
             )
             return _unwrap(
                 mx_weight_only_matmul_2d(
-                    A, B, Bs, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused
+                    A, B, Bs, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit,
+                    simulate_unfused, b_global_scale=b_global_scale,
                 )
             )
         return _unwrap(

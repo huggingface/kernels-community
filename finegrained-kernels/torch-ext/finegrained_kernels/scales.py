@@ -164,6 +164,7 @@ def load_weight_scale_tile(
     SCALE_GROUP_K: tl.constexpr,
     GATE: tl.constexpr,
     INTERLEAVED: tl.constexpr = False,
+    k_col_off=0,
 ):
     """One batched-decode weight-scale tile ``(n_width, SCALE_COLS)``, hiding the swizzled vs
     un-swizzled choice behind the ``SWIZZLED_SCALES`` flag — the kernel loop reads scales the same
@@ -174,7 +175,9 @@ def load_weight_scale_tile(
     - ``SWIZZLED_SCALES``: SWIZZLE_32_4_4 via ``load_swizzled_scale_tile`` (descriptor bulk at BN=128, or
       pointer gather below), scales swizzled over the full ``2N`` rows/expert under GATE.
     - else: affine per-group load off ``(expert, N-tile row, K-group)`` — no in-op swizzle, so an
-      un-swizzled caller pays nothing."""
+      un-swizzled caller pays nothing. ``k_col_off`` shifts that read off the tile grid (the
+      caller's K-tile was clamped back into bounds for a BK that doesn't divide K); it is 0
+      for every aligned caller, and the swizzled layouts don't take it."""
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     if SWIZZLED_SCALES and GATE and BLOCK_SIZE_N < 128:
         # sub-128 gate|up tile (decode): the descriptor reads whole 128-row blocks, so a BN<128 tile
@@ -222,7 +225,7 @@ def load_weight_scale_tile(
         base = bs_ptr + expert_id * stride_bs_e
         offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         offs_bn = tl.minimum(offs_bn, N - 1)
-        offs_sf = k_idx * SCALE_COLS + tl.arange(0, SCALE_COLS)
+        offs_sf = k_idx * SCALE_COLS + k_col_off + tl.arange(0, SCALE_COLS)
         if GATE:
             rows2 = tl.arange(0, 2)[:, None] * N + offs_bn[None, :]
             ptrs = base + rows2[:, :, None] * stride_bs_n + offs_sf[None, None, :] * stride_bs_k
@@ -300,6 +303,16 @@ def load_mx_act_tile(
         )
     return a, a_scale
 
+
+
+@triton.jit
+def apply_global_scale(acc, GlobalScale, expert_id):
+    """Fold a per-expert (or per-tensor, ``expert_id=0``) fp32 global onto the fp32
+    accumulator — the second level of the NVFP4 two-level scales (``g_a·g_b`` for the
+    dynamic family, ``g_b`` alone for weight-only). ``None`` folds out at trace time."""
+    if GlobalScale is not None:
+        acc = acc * tl.load(GlobalScale + expert_id).to(tl.float32)
+    return acc
 
 
 @triton.jit

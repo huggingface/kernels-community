@@ -316,6 +316,7 @@ def _weight_scale_mx(
     SWIZZLED_SCALES: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
     SCALE_COLS: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
     INTERLEAVED_SCALES: tl.constexpr = False,
+    k_col_off=0,
 ):
     """MX weight-scale K-tile ``(rows, SCALE_COLS)``. Grouped: pre-swizzled SWIZZLE_32_4_4 via the
     descriptor (``load_swizzled_scale`` — gate|up is one 2*BN tile off the block-interleaved buffer,
@@ -333,7 +334,7 @@ def _weight_scale_mx(
         else:  # affine per-group read off the un-swizzled 3D Bs (num_experts, n_rows, K//g)
             base = bs_ptrs + expert_id * stride_bs_e
             offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-            offs_sf = k * SCALE_COLS + tl.arange(0, SCALE_COLS)
+            offs_sf = k * SCALE_COLS + k_col_off + tl.arange(0, SCALE_COLS)
             if GATE:
                 rows2 = tl.arange(0, 2)[:, None] * N + offs_bn[None, :]
                 b_s = tl.reshape(
@@ -346,7 +347,7 @@ def _weight_scale_mx(
         b_s = load_weight_scale_tile(
             SWIZZLED_SCALES, bs_descriptor, bs_ptr, expert_id, pid_n, k, N, K,
             stride_bs_e, stride_bs_n, stride_bs_k, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K, GATE,
-            INTERLEAVED=INTERLEAVED_SCALES,
+            INTERLEAVED=INTERLEAVED_SCALES, k_col_off=k_col_off,
         )
     elif SWIZZLED_SCALES:  # pre-swizzled SWIZZLE_32_4_4 scale — descriptor at BN=128, gather below
         b_s = load_swizzled_scale_tile(
@@ -438,8 +439,10 @@ def load_weight_mx(
     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
     WEIGHT_VALUES_PER_BYTE: tl.constexpr,
     INTERLEAVED_SCALES: tl.constexpr = False,
+    k_col_off=0,
 ):
-    """The MX weight path: value tile + pre-swizzled/affine group scale."""
+    """The MX weight path: value tile + pre-swizzled/affine group scale. ``k_col_off`` shifts the
+    affine scale read for a K-tile the caller clamped back in bounds (0 for aligned callers)."""
     KB: tl.constexpr = BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
     SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
     w = _weight_value(b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB)
@@ -447,7 +450,7 @@ def load_weight_mx(
         bs_ptrs, bs_mask, bs_descriptor, bs_ptr, blk_idx, expert_id, pid_n, k, N, K,
         stride_bs_e, stride_bs_n, stride_bs_k,
         GROUPED, GATE, PER_EXPERT, SWIZZLED_SCALES, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K,
-        INTERLEAVED_SCALES=INTERLEAVED_SCALES,
+        INTERLEAVED_SCALES=INTERLEAVED_SCALES, k_col_off=k_col_off,
     )
     return w, w_s
 

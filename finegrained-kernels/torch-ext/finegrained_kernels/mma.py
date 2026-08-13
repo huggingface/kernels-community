@@ -89,6 +89,7 @@ def mx_weight_only_compute(
     BLOCK_SIZE_K: tl.constexpr,
     N_WIDTH: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
+    SWAP_AB: tl.constexpr = False,
 ):
     """Weight-only (W4A16/W8A16) MMA step: raw bf16/fp16 activations against an MXFP4/MXFP8 weight
     tile, dispatched on ``COMPUTE_MODE``. ``"dot_scaled"`` hands the packed weight and its UE8M0
@@ -97,15 +98,49 @@ def mx_weight_only_compute(
     rescale; ``"dot"`` upcasts the tile to the activation dtype in-loop and runs a plain
     ``tl.dot`` (the matmul_ogs Hopper recipe). Both are correct everywhere and the tuner picks per
     workload — the two differ by arm: measured on gpt-oss K=2880, ``dot_scaled`` wins the down
-    projection by 18.5% while the stacked gate|up tile prefers ``dot`` by 7.3%. Single return —
-    only the taken branch compiles."""
-    if COMPUTE_MODE == "dot_scaled":
+    projection by 18.5% while the stacked gate|up tile prefers ``dot`` by 7.3``%``. ``SWAP_AB``
+    is the decode form: weight output rows lead the tile and the FMA reduce replaces the MMA
+    (both dot arms keep the token in M). Single return — only the taken branch compiles."""
+    if SWAP_AB:
+        acc = mx_weight_only_scalar_swapped(
+            acc, tl.reshape(a, (BLOCK_SIZE_K,)), w, w_scale,
+            N_WIDTH, BLOCK_SIZE_K, SCALE_GROUP_K,
+        )
+    elif COMPUTE_MODE == "dot_scaled":
         acc = mx_dot_scaled(acc, a, None, w, w_scale)
     else:
         acc = acc + tl.dot(
             a, mx_weight_upcast(w, w_scale, BLOCK_SIZE_K, N_WIDTH, SCALE_GROUP_K, a.dtype)
         )
     return acc
+
+
+@triton.jit
+def mx_weight_only_scalar_swapped(
+    acc,
+    a,
+    w,
+    w_scale,
+    ROWS_W: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr,
+):
+    """Swapped weight-only reduce: CUDA-core FMA GEVM against RAW bf16 activations (no act
+    scale — the weight-only counterpart of ``mx_scalar_reduce_swapped``). Weight
+    ``w`` is output-rows-major ``[ROWS_W, BK]``, ``a`` the ``[BK]`` token; the UE8M0 group
+    scale factors out of the inner sum, so it costs one multiply per group instead of per
+    element. Returns ``acc + [1, ROWS_W]``.
+
+    This is the decode structure for W4A16: with no MMA there is no M->16 pad to waste, and
+    the loop runs at the dequantized weight stream's own rate (gpt-oss gate_up 32.0 -> 13.7us,
+    down 19.8 -> 9.1us, against a 12.3us/6us dequant-inclusive load floor)."""
+    NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
+    wq = e2m1_cols_to_f32(w) if w.dtype == tl.uint8 else w.to(tl.float32)  # [ROWS_W, BK]
+    prod = wq * a.to(tl.float32)[None, :]
+    grp = tl.sum(tl.reshape(prod, (ROWS_W, NG, SCALE_GROUP_K)), axis=2)  # [ROWS_W, NG]
+    return acc + tl.reshape(
+        tl.sum(grp * decode_group_scale(w_scale), axis=1), (1, ROWS_W)
+    )
 
 
 @triton.jit
@@ -130,12 +165,10 @@ def mx_scalar_reduce(
     reduce the raw products within each group, then apply ONE combined (act × weight) scale per
     group — ``SCALE_GROUP_K``× fewer scale-muls. Measured ~18% faster on the decode reduce
     (the per-element expand was pure overhead), bit-identical to the expanded form (rel 1e-7)."""
-    aq = (
-        e2m1_cols_to_e4m3(a).to(tl.float32) if a.dtype == tl.uint8 else a.to(tl.float32)
-    )
-    wq = e2m1_to_e4m3(w) if w.dtype == tl.uint8 else w
+    aq = e2m1_cols_to_f32(a) if a.dtype == tl.uint8 else a.to(tl.float32)
+    wq = e2m1_to_f32(w) if w.dtype == tl.uint8 else w.to(tl.float32)
     NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
-    prod = tl.trans(aq) * wq.to(tl.float32)  # [BK, ROWS_W]
+    prod = tl.trans(aq) * wq  # [BK, ROWS_W]
     grp = tl.sum(
         tl.reshape(prod, (NG, SCALE_GROUP_K, ROWS_W)), axis=1
     )  # per-group partial
@@ -292,12 +325,10 @@ def mx_scalar_reduce_swapped(
     scale factored out of the reduce (grpscale). Reduces over K; returns ``acc + [1, ROWS_W]``."""
     NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
     if w.dtype == tl.uint8:  # column-unpack E2M1 -> f32, K-order via interleave
-        wq = e2m1_cols_to_e4m3(w).to(tl.float32)
+        wq = e2m1_cols_to_f32(w)
     else:
         wq = w.to(tl.float32)
-    aq = (
-        e2m1_cols_to_e4m3(a).to(tl.float32) if a.dtype == tl.uint8 else a.to(tl.float32)
-    )
+    aq = e2m1_cols_to_f32(a) if a.dtype == tl.uint8 else a.to(tl.float32)
     prod = aq[None, :] * wq  # [ROWS_W, BK]
     grp = tl.sum(tl.reshape(prod, (ROWS_W, NG, SCALE_GROUP_K)), axis=2)  # [ROWS_W, NG]
     scale = decode_group_scale(a_scale)[None, :] * decode_group_scale(w_scale)
