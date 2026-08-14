@@ -1,0 +1,60 @@
+name: Test CI scripts
+
+# Unit tests for the CI helper scripts in .github/scripts (dispatch.py,
+# pr_autolabel.py, pr_comment_kernel_bot.py, hub_pr_upload_args.py). These are
+# pure-Python tests: no GPU, no kernel builds, no network -- so they run on a
+# plain CPU runner in seconds.
+#
+# The helpers themselves are stdlib-only; pytest is the sole test dependency, so
+# uv provisions both the interpreter and pytest in one ephemeral env (no
+# setup-python step, no requirements file to keep in sync).
+#
+# pytest MUST run from the repository root: the tests resolve
+# .github/pr-labels.json and every kernel's build.toml relative to the cwd.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/scripts/**"
+      - ".github/pr-labels.json"
+      # test_dispatch.py sweeps every kernel's build.toml (parses it, checks the
+      # declared backends map to a known build workflow), so a kernel manifest
+      # change can break this suite too.
+      - "**/build.toml"
+      - ".github/workflows/test-ci-scripts.yaml"
+  push:
+    branches: [main]
+    paths:
+      - ".github/scripts/**"
+      - ".github/pr-labels.json"
+      - "**/build.toml"
+      - ".github/workflows/test-ci-scripts.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-ci-scripts-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest .github/scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      # --no-project: there is no pyproject.toml at the root and these tests are
+      #   not part of a package; don't let a future one drag its deps in here.
+      # --python 3.11: the floor, not a preference -- dispatch.py imports tomllib.
+      # pytest is capped below 9 so a major release can't break CI unannounced;
+      # nothing else pins it (Dependabot only tracks github-actions in this repo).
+      - name: Run tests
+        run: |
+          uv run --no-project --python 3.11 --with 'pytest>=8,<9' \
+            pytest .github/scripts -v
