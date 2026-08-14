@@ -16,6 +16,70 @@ from causal_conv1d.causal_conv1d_interface import causal_conv1d_update_ref
 from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states_ref
 
 
+DEVICE = "xpu" if torch.xpu.is_available() else "cuda"
+
+
+def _depthwise_conv1d_shift(x, weight, bias, padding):
+    """Depthwise cross-correlation expressed as shifted multiply-accumulate.
+
+    Mathematically identical to ``F.conv1d(x, weight.unsqueeze(1), bias,
+    padding=padding, groups=dim)`` but built only from pad/mul/add, so it does
+    not go through oneDNN.
+    """
+    dim, width = weight.shape
+    xpad = F.pad(x, (padding, padding))
+    n = xpad.shape[-1] - width + 1
+    out = sum(xpad[..., i : i + n] * weight[:, i].reshape(1, dim, 1) for i in range(width))
+    if bias is not None:
+        out = out + bias.reshape(1, dim, 1)
+    return out
+
+
+def causal_conv1d_ref_safe(
+    x,
+    weight,
+    bias=None,
+    initial_states=None,
+    return_final_states=False,
+    final_states_out=None,
+    activation=None,
+):
+    """``causal_conv1d_ref`` with a workaround for a PyTorch XPU bug.
+
+    Depthwise ``F.conv1d`` returns wrong gradients on XPU when the convolution
+    has a degenerate spatial extent, i.e. ``seqlen == 1``. Both ``weight.grad``
+    and (with ``initial_states``) ``x.grad``/``initial_states.grad`` are
+    affected, so this cannot be fixed by normalizing strides. Since
+    ``causal_conv1d_ref`` is built on ``F.conv1d`` it inherits the bug, which
+    would otherwise make the reference -- not the kernel under test -- wrong.
+
+    For that one case we fall back to an equivalent oneDNN-free formulation;
+    everything else uses the upstream reference unchanged.
+    """
+    if x.device.type != "xpu" or x.shape[-1] != 1:
+        return causal_conv1d_ref(
+            x, weight, bias, initial_states, return_final_states, final_states_out, activation
+        )
+    dtype_in = x.dtype
+    x = x.to(weight.dtype)
+    seqlen = x.shape[-1]
+    width = weight.shape[1]
+    if initial_states is None:
+        out = _depthwise_conv1d_shift(x, weight, bias, padding=width - 1)
+    else:
+        x = torch.cat([initial_states.to(weight.dtype), x], dim=-1)
+        out = _depthwise_conv1d_shift(x, weight, bias, padding=0)
+    out = out[..., :seqlen]
+    if return_final_states:
+        final_states = F.pad(x, (width - 1 - x.shape[-1], 0)).to(dtype_in)
+        if final_states_out is not None:
+            final_states_out.copy_(final_states)
+        else:
+            final_states_out = final_states
+    out = (out if activation is None else F.silu(out)).to(dtype=dtype_in)
+    return out if not return_final_states else (out, final_states_out)
+
+
 @pytest.mark.parametrize("return_final_states", [False, True])
 # @pytest.mark.parametrize("return_final_states", [True])
 @pytest.mark.parametrize("has_initial_states", [False, True])
@@ -40,7 +104,7 @@ from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states_ref
 def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, channel_last, has_initial_states, return_final_states):
     if not channel_last and (has_initial_states or return_final_states):
         pytest.skip("Only channel_last support initial_states or return_final_states")
-    device = "cuda"
+    device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -71,7 +135,7 @@ def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, cha
     activation = None if not silu_activation else "silu"
     out = causal_conv1d_fn(x, weight, bias, initial_states=initial_states, return_final_states=return_final_states,
                            activation=activation)
-    out_ref = causal_conv1d_ref(x_ref, weight_ref, bias_ref, initial_states=initial_states_ref, return_final_states=return_final_states, activation=activation)
+    out_ref = causal_conv1d_ref_safe(x_ref, weight_ref, bias_ref, initial_states=initial_states_ref, return_final_states=return_final_states, activation=activation)
     if return_final_states:
         out, final_states = out
         out_ref, final_states_ref = out_ref
@@ -121,7 +185,7 @@ def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, cha
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 # @pytest.mark.parametrize("dim", [2048])
 def test_causal_conv1d_update(dim, width, seqlen, has_cache_seqlens, has_bias, silu_activation, itype):
-    device = "cuda"
+    device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -166,7 +230,7 @@ def test_causal_conv1d_update(dim, width, seqlen, has_cache_seqlens, has_bias, s
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 # @pytest.mark.parametrize("dim", [2048])
 def test_causal_conv1d_update_with_batch_gather(dim, width, seqlen, has_cache_seqlens, has_bias, silu_activation, itype):
-    device = "cuda"
+    device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -207,7 +271,7 @@ def test_causal_conv1d_update_with_batch_gather(dim, width, seqlen, has_cache_se
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 # @pytest.mark.parametrize("dim", [2048])
 def test_causal_conv1d_get_states(dim, itype):
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     seqlens = torch.randint(1, 32, (100,), device=device)
@@ -237,7 +301,7 @@ def test_causal_conv1d_get_states(dim, itype):
 # @pytest.mark.parametrize('seqlen', [8, 16, 32, 64, 128, 256, 512, 784, 1024, 2048, 4096])
 # @pytest.mark.parametrize('seqlen', [128])
 def test_causal_conv1d_race_condition(seqlen, width, has_bias, silu_activation, itype, channel_last):
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     batch = 2
@@ -295,7 +359,7 @@ def test_causal_conv1d_race_condition(seqlen, width, has_bias, silu_activation, 
 @pytest.mark.parametrize('dim', [64, 4096 + 32])
 # @pytest.mark.parametrize('dim', [64])
 def test_causal_conv1d_varlen(dim, seqlen, width, has_bias, silu_activation, itype):
-    device = "cuda"
+    device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -330,7 +394,7 @@ def test_causal_conv1d_varlen(dim, seqlen, width, has_bias, silu_activation, ity
     for b in range(batch):
         out_ref_b = []
         for x_s in torch.split(x_ref[[b]], seqlens[b], dim=2):
-            out_ref_b.append(causal_conv1d_ref(x_s, weight_ref, bias_ref, activation=activation))
+            out_ref_b.append(causal_conv1d_ref_safe(x_s, weight_ref, bias_ref, activation=activation))
         out_ref.append(torch.cat(out_ref_b, dim=2))
     out_ref = torch.cat(out_ref, dim=0)
 
