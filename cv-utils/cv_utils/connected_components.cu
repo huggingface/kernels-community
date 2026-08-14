@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <vector>
 
 extern "C" AOTITorchError aoti_torch_get_current_cuda_stream(
     int32_t device_index,
@@ -242,7 +243,7 @@ __global__ void final_counting(
 
 } // namespace cc2d
 
-std::tuple<torch::stable::Tensor, torch::stable::Tensor>
+std::vector<torch::stable::Tensor>
 connected_components_labeling_2d(
     const torch::stable::Tensor& inputs,
     bool get_counts) {

@@ -2,11 +2,11 @@
 
 #include <torch/csrc/stable/tensor.h>
 
-#include <tuple>
+#include <vector>
 
 using cv_utils_tensor = torch::stable::Tensor;
 
-std::tuple<cv_utils_tensor, cv_utils_tensor>
+std::vector<cv_utils_tensor>
 connected_components_labeling_2d(const cv_utils_tensor &inputs, bool get_counts);
 
 cv_utils_tensor generic_nms(const cv_utils_tensor &dets,

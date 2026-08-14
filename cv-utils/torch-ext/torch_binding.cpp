@@ -4,7 +4,7 @@
 #include "torch_binding.h"
 
 STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
-  ops.def("cc_2d(Tensor inputs, bool get_counts) -> (Tensor, Tensor)");
+  ops.def("cc_2d(Tensor inputs, bool get_counts) -> Tensor[]");
   ops.def("generic_nms(Tensor dets, Tensor scores, float iou_threshold, bool use_iou_matrix) -> Tensor");
 }
 
