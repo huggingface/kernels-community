@@ -316,13 +316,16 @@ struct FMHAFwdEpilogueTraits {
         copy_block_s2r(sA_max(_, k_blk, kr, a_tile), rA_kmax[kr]);
       }
 
+      using RowBase = typename ReduceFragARow::Base;
       rA_max = rA_kmax[0];
       for (int kr = 1; kr < ReduceK{}; kr++)
-        cute::transform(rA_max, rA_kmax[kr], rA_max, cute::max_fn{});
+        cute::transform(rA_max.tensor(), rA_kmax[kr].tensor(),
+                        static_cast<RowBase&>(rA_max), cute::max_fn{});
 
       for (int kr = 0; kr < ReduceK{}; kr++) {
         cute::transform(
-            rA_max, rA_kmax[kr], rA_kmax[kr], [](auto gmax, auto kmax) {
+            rA_max.tensor(), rA_kmax[kr].tensor(),
+            static_cast<RowBase&>(rA_kmax[kr]), [](auto gmax, auto kmax) {
               return sycl::native::exp2(kmax - gmax);
             });
       }
