@@ -26,7 +26,7 @@ def _register_xpu_fake_kernels():
 
     _register_if_available(
         "cutlass_grouped_gemm_interface",
-        lambda ptr_A, ptr_B, ptr_scales, ptr_bias, ptr_D, expert_first_token_offset, N, K, num_experts, is_B_int4, is_B_mxfp4: ptr_D,
+        lambda ptr_A, ptr_B, ptr_scales, ptr_bias, ptr_D, expert_first_token_offset, N, K, num_experts, is_B_int4, is_B_mxfp4, is_B_mxfp8: ptr_D,
     )
 
     _register_if_available(
@@ -106,12 +106,13 @@ def cutlass_grouped_gemm(input_A, input_B, bias, output, expert_token_count, n,
         K=k,
         num_experts=num_experts,
         is_B_int4=False,
-        is_B_mxfp4=False)
+        is_B_mxfp4=False,
+        is_B_mxfp8=False)
 
 
 def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
                              num_rows_per_expert, n, k, num_experts, is_B_int4,
-                             is_B_mxfp4):
+                             is_B_mxfp4, is_B_mxfp8=False):
     expert_first_token_offset = torch.cat([
         torch.tensor([0],
                      dtype=num_rows_per_expert.dtype,
@@ -129,7 +130,8 @@ def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
         K=k,
         num_experts=num_experts,
         is_B_int4=is_B_int4,
-        is_B_mxfp4=is_B_mxfp4)
+        is_B_mxfp4=is_B_mxfp4,
+        is_B_mxfp8=is_B_mxfp8)
 
 
 def ceilDiv(a, b):
@@ -206,7 +208,8 @@ def xpu_fused_moe(hidden_states,
                   ep_size=1,
                   is_fp8=False,
                   is_int4=False,
-                  is_mxfp4=False):
+                  is_mxfp4=False,
+                  is_mxfp8=False):
     '''
     hidden_states: [num_rows, hidden_size]
     w13: [num_experts, 2*inter_size, hidden_size]
@@ -228,6 +231,7 @@ def xpu_fused_moe(hidden_states,
     num_experts: int
     is_int4: bool
     is_mxfp4: bool
+    is_mxfp8: bool
     '''
 
     # Resolve DTensors to local tensors before passing to custom ops
@@ -266,7 +270,7 @@ def xpu_fused_moe(hidden_states,
 
     # 4bits support [E, N, K]
     # other types [E, K, N]
-    if not is_int4 and not is_mxfp4:
+    if not is_int4 and not is_mxfp4 and not is_mxfp8:
         if not hasattr(w13, 'xpu_fused_moe'):
             if needs_transpose:
                 w13.data = w13.transpose(-1, -2).contiguous()
@@ -389,7 +393,7 @@ def xpu_fused_moe(hidden_states,
     ########### gemm1 ##################
     input_B = w13
 
-    if not is_fp8 and not is_int4 and not is_mxfp4:
+    if not is_fp8 and not is_int4 and not is_mxfp4 and not is_mxfp8:
         ops.cutlass_grouped_gemm_interface(
             ptr_A=gemm1_input,
             ptr_B=input_B,
@@ -401,7 +405,8 @@ def xpu_fused_moe(hidden_states,
             K=hidden_size,
             num_experts=num_experts_per_node,
             is_B_int4=is_int4,
-            is_B_mxfp4=is_mxfp4)
+            is_B_mxfp4=is_mxfp4,
+            is_B_mxfp8=is_mxfp8)
     else:
         ops.cutlass_grouped_gemm_interface(
             ptr_A=gemm1_input,
@@ -414,7 +419,8 @@ def xpu_fused_moe(hidden_states,
             K=hidden_size,
             num_experts=num_experts_per_node,
             is_B_int4=is_int4,
-            is_B_mxfp4=is_mxfp4)
+            is_B_mxfp4=is_mxfp4,
+            is_B_mxfp8=is_mxfp8)
 
     # act
     act_output = torch.empty((num_moe_inputs, inter_size),
@@ -435,7 +441,7 @@ def xpu_fused_moe(hidden_states,
     gemm2_output = torch.empty((num_moe_inputs, hidden_size),
                                dtype=hidden_states.dtype,
                                device=hidden_states.device)
-    if not is_fp8 and not is_int4 and not is_mxfp4:
+    if not is_fp8 and not is_int4 and not is_mxfp4 and not is_mxfp8:
         ops.cutlass_grouped_gemm_interface(
             ptr_A=input_A,
             ptr_B=input_B,
@@ -447,7 +453,8 @@ def xpu_fused_moe(hidden_states,
             K=inter_size,
             num_experts=num_experts_per_node,
             is_B_int4=is_int4,
-            is_B_mxfp4=is_mxfp4)
+            is_B_mxfp4=is_mxfp4,
+            is_B_mxfp8=is_mxfp8)
     else:
         ops.cutlass_grouped_gemm_interface(
             ptr_A=input_A,
@@ -460,7 +467,8 @@ def xpu_fused_moe(hidden_states,
             K=inter_size,
             num_experts=num_experts_per_node,
             is_B_int4=is_int4,
-            is_B_mxfp4=is_mxfp4)
+            is_B_mxfp4=is_mxfp4,
+            is_B_mxfp8=is_mxfp8)
 
     ops.moe_gather(output, gemm2_output, topk_weights,
                                 permuted_row_to_unpermuted_row,
@@ -609,6 +617,7 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         is_fp8 = getattr(self.experts, "is_fp8", False)
         is_int4 = getattr(self.experts, "is_int4", False)
         is_mxfp4 = getattr(self.experts, "is_mxfp4", False)
+        is_mxfp8 = getattr(self.experts, "is_mxfp8", False)
         
         w13_scales = getattr(self.experts, "gate_up_proj_scales", None)
         w2_scales = getattr(self.experts, "down_proj_scales", None)
@@ -650,6 +659,7 @@ class MegaBlocksMoeMLP(torch.nn.Module):
             is_fp8=is_fp8,
             is_int4=is_int4,
             is_mxfp4=is_mxfp4,
+            is_mxfp8=is_mxfp8,
         )
         
         # All-reduce across EP group to combine partial expert outputs
