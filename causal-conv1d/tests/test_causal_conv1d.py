@@ -16,7 +16,7 @@ from causal_conv1d.causal_conv1d_interface import causal_conv1d_update_ref
 from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states_ref
 
 
-DEVICE = "xpu" if torch.xpu.is_available() else "cuda"
+DEVICE = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else None
 
 
 @pytest.mark.parametrize("return_final_states", [False, True])
