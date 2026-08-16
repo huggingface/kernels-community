@@ -91,7 +91,6 @@ def load_swizzled_scale_tile(
     BLOCK: tl.constexpr,
     SCALE_COLS: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
-    INTERLEAVED: tl.constexpr = False,
 ):
     """One swizzled-scale tile ``(BLOCK, SCALE_COLS)`` for a row-tile of ANY operand — batched
     weight (``group_id = expert``), 2D weight / 2D activation (``group_id = 0``, dense). Scales are
@@ -116,13 +115,6 @@ def load_swizzled_scale_tile(
     nrb = (rows + 127) // 128
     if BLOCK % 128 == 0 and SCALE_COLS >= 4 and SCALE_COLS % 4 == 0:
         REP: tl.constexpr = BLOCK // 128
-        # INTERLEAVED: a plain (non-gate) read of the gate|up artifact — linear block j of the
-        # flat 2N rows lives at interleaved position 2j (gate half) / 2(j - nrb/2) + 1 (up half).
-        # Single-block reads only (the interleaved pair of a linear j+1 is not adjacent).
-        if INTERLEAVED:
-            tl.static_assert(REP == 1, "interleaved plain reads are single-block (BN == 128)")
-            half = nrb // 2
-            pid = tl.where(pid < half, 2 * pid, 2 * (pid - half) + 1)
         # absolute 128-block base = group_id*nrb + pid*REP; load_swizzled_scale multiplies blk by REP.
         # Non-128 ``rows`` (odd ``nrb``) pins REP=1 (BN=128) in the pruner, so group_id*nrb//REP is exact.
         blk = (group_id * nrb // REP + pid).to(tl.int32)
@@ -130,9 +122,6 @@ def load_swizzled_scale_tile(
     cols4 = (K // SCALE_GROUP_K + 3) // 4  # cdiv: the buffer pads cols to whole 4-group chunks
     r = pid * BLOCK + tl.arange(0, BLOCK)
     lin = r // 128
-    if INTERLEAVED:
-        half = nrb // 2
-        lin = tl.where(lin < half, 2 * lin, 2 * (lin - half) + 1)
     blk = group_id * nrb + lin
     row = r % 128
     col = k_idx * SCALE_COLS + tl.arange(0, SCALE_COLS)
@@ -163,7 +152,6 @@ def load_weight_scale_tile(
     SCALE_COLS: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     GATE: tl.constexpr,
-    INTERLEAVED: tl.constexpr = False,
     k_col_off=0,
 ):
     """One batched-decode weight-scale tile ``(n_width, SCALE_COLS)``, hiding the swizzled vs
@@ -179,43 +167,14 @@ def load_weight_scale_tile(
       caller's K-tile was clamped back into bounds for a BK that doesn't divide K); it is 0
       for every aligned caller, and the swizzled layouts don't take it."""
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
-    if SWIZZLED_SCALES and GATE and BLOCK_SIZE_N < 128:
-        # sub-128 gate|up tile (decode): the descriptor reads whole 128-row blocks, so a BN<128 tile
-        # pointer-GATHERs its rows out of the interleaved [g0,u0,g1,u1,...] buffer. Output rows gr sit
-        # in gate 128-block gr//128 -> buffer block 2*(gr//128) (up: +1); the swizzle is the same fixed
-        # permutation load_swizzled_scale_tile's gather uses. Lets decode take the raw path's BN=32
-        # tile without un-swizzling — the whole swizzled-vs-raw decode gap is this gate|up tile.
-        nrb_full = (2 * N + 127) // 128
-        cols4 = (K // SCALE_GROUP_K + 3) // 4
-        gr = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        col = k_idx * SCALE_COLS + tl.arange(0, SCALE_COLS)
-        gate_blk = (expert_id * nrb_full + 2 * (gr // 128))[:, None]
-        swz = (gr[:, None] % 32) * 16 + ((gr[:, None] % 128) // 32) * 4 + col[None, :] % 4
-        band = (col[None, :] // 4) * 512
-        gate_s = tl.load(bs_ptr + (gate_blk * cols4) * 512 + band + swz)
-        up_s = tl.load(bs_ptr + ((gate_blk + 1) * cols4) * 512 + band + swz)
-        b_s = tl.reshape(tl.trans(tl.join(gate_s, up_s), 2, 0, 1), (n_width, SCALE_COLS))
-    elif SWIZZLED_SCALES and GATE:
-        # gate|up interleaved [g0,u0,g1,u1,...] over the 2N rows/expert (BN=128): tile pid_n's gate
-        # 128-block sits at buffer block 2*pid_n, its up block at 2*pid_n+1. Read each as a single BN
-        # block (the REP=1 box the batched descriptor is built for) and stack [gate; up].
-        tl.static_assert(
-            BLOCK_SIZE_N == 128, "the gate block-pair read indexes whole 128-row blocks"
-        )
-        gate_s = load_swizzled_scale_tile(
-            bs_descriptor, bs_ptr, expert_id, 2 * pid_n, k_idx, 2 * N, K,
-            BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K,
-        )
-        up_s = load_swizzled_scale_tile(
-            bs_descriptor, bs_ptr, expert_id, 2 * pid_n + 1, k_idx, 2 * N, K,
-            BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K,
-        )
-        b_s = tl.reshape(tl.trans(tl.join(gate_s, up_s), 2, 0, 1), (n_width, SCALE_COLS))
-    elif SWIZZLED_SCALES:
+    if SWIZZLED_SCALES:
+        # gate|up needs no arm: the scale grid is row-interleaved with the weight, so the tile's
+        # gate and up rows are the contiguous n_width span at the same pid_n, i.e. the plain read
+        # over the doubled extent.
         b_s = load_swizzled_scale_tile(
-            bs_descriptor, bs_ptr, expert_id, pid_n, k_idx, N, K,
-            BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K,
-            INTERLEAVED=INTERLEAVED,
+            bs_descriptor, bs_ptr, expert_id, pid_n, k_idx,
+            2 * N if GATE else N, K,
+            n_width, SCALE_COLS, SCALE_GROUP_K,
         )
     else:
         # affine per-group load off (expert, N-tile row, K-group) from the un-advanced base.
@@ -223,15 +182,11 @@ def load_weight_scale_tile(
         # lowering): a partial last N-tile reads a clamped scale the epilogue masks off
         # (N_COLS) — without the clamp the GATE arm's up rows (N + offs_bn) run past 2N.
         base = bs_ptr + expert_id * stride_bs_e
-        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        offs_bn = tl.minimum(offs_bn, N - 1)
+        offs_bn = pid_n * n_width + tl.arange(0, n_width)
+        offs_bn = tl.minimum(offs_bn, (2 * N if GATE else N) - 1)
         offs_sf = k_idx * SCALE_COLS + k_col_off + tl.arange(0, SCALE_COLS)
-        if GATE:
-            rows2 = tl.arange(0, 2)[:, None] * N + offs_bn[None, :]
-            ptrs = base + rows2[:, :, None] * stride_bs_n + offs_sf[None, None, :] * stride_bs_k
-        else:
-            ptrs = base + offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k
-        b_s = tl.reshape(tl.load(ptrs), (n_width, SCALE_COLS))
+        ptrs = base + offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k
+        b_s = tl.load(ptrs)
     return b_s
 
 
@@ -331,24 +286,6 @@ def decode_group_scale(scale):
 
 
 @triton.jit
-def gate_stacked_block_scale_ptrs(
-    Bs, pid_n, N,
-    block_n: tl.constexpr, stride_bs_n,
-    BLOCK_SIZE_N: tl.constexpr, n_width: tl.constexpr,
-):
-    """Per-weight-row block-scale pointers for the stacked gate|up weight (``2*BN`` rows): gate
-    rows ``[0,N)`` index their own ``block_n`` scale block, up rows ``[N,2N)`` the same block
-    offset by ``N // block_n`` scale-blocks (the up projection sits ``N`` rows after gate). The
-    ``block_dynamic_dot`` / ``accumulate("static")`` broadcast then folds one scale per weight row,
-    exactly as the dense (non-gate) affine gather does. Returns ``(ptrs, mask)`` — the affine gather
-    the swizzle ``%``-wrap would otherwise turn non-affine, bounds-masked to the valid rows."""
-    proj_row = pid_n * BLOCK_SIZE_N + tl.arange(0, n_width) % BLOCK_SIZE_N
-    up = tl.where(tl.arange(0, n_width) < BLOCK_SIZE_N, 0, N // block_n)
-    return Bs + (proj_row // block_n + up) * stride_bs_n, proj_row < N
-
-
-
-@triton.jit
 def mx_2d_scale_ptrs(
     As,
     Bs,
@@ -363,6 +300,7 @@ def mx_2d_scale_ptrs(
     BLOCK_SIZE_N: tl.constexpr,
     SCALE_COLS: tl.constexpr,
     SWIZZLED_SCALES: tl.constexpr,
+    GATE: tl.constexpr = False,
 ):
     """Prologue 2D MX scale-pointer tiles + bounds masks as ``(as_ptrs, bs_ptrs, as_mask,
     bs_mask)``. Affine arm: per-(row, group) ``as``/``bs`` pointer tiles read off AFFINE
@@ -375,10 +313,11 @@ def mx_2d_scale_ptrs(
         as_ptrs, bs_ptrs, as_mask, bs_mask = As, Bs, None, None
     else:
         offs_am_lin = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        offs_bn_lin = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        ROWS: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+        offs_bn_lin = pid_n * ROWS + tl.arange(0, ROWS)
         offs_sf = tl.arange(0, SCALE_COLS)
         as_ptrs = As + offs_am_lin[:, None] * stride_as_m + offs_sf[None, :]
         bs_ptrs = Bs + (offs_bn_lin[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k)
         as_mask = offs_am_lin < M
-        bs_mask = offs_bn_lin < N
+        bs_mask = offs_bn_lin < (2 * N if GATE else N)
     return as_ptrs, bs_ptrs, as_mask, bs_mask

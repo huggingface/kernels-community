@@ -23,6 +23,23 @@ from .recipes import *  # noqa: F401,F403
 
 
 
+def interleave_gate_up_rows(t: torch.Tensor) -> torch.Tensor:
+    """A ``(..., 2N, K)`` gate|up slab held as the two halves ``[gate; up]`` -> the
+    ``[g0, u0, g1, u1, ...]`` row order the kernels read, for weights and their scale grids alike.
+
+    Row granularity makes a gate|up tile a contiguous range — tile ``pid_n`` covers rows
+    ``[2*pid_n*BN, 2*(pid_n+1)*BN)`` — so the alignment floor is ``N % 64``."""
+    n = t.shape[-2] // 2
+    return torch.stack([t[..., :n, :], t[..., n:, :]], dim=-2).reshape(t.shape)
+
+
+def deinterleave_gate_up_rows(t: torch.Tensor) -> torch.Tensor:
+    """Inverse of ``interleave_gate_up_rows``: ``[g0, u0, g1, u1, ...]`` back to the ``[gate; up]``
+    halves, for checkpoint save and for reference math that wants the two projections apart."""
+    pair = t.reshape(*t.shape[:-2], t.shape[-2] // 2, 2, t.shape[-1])
+    return torch.cat([pair[..., 0, :], pair[..., 1, :]], dim=-2)
+
+
 @triton.jit
 def swizzle_store_block(DST, s, blk, cb, NCB):
     """Pack one row-major ``(128, 4)`` scale block ``s`` into its SWIZZLE_32_4_4 ``(32, 16)`` block
@@ -69,21 +86,52 @@ def _swizzle_scales_kernel(
 
 
 
+def unswizzle_mx_scales(
+    swizzled: torch.Tensor, rows: int, cols: int, *, num_experts: int | None = None
+) -> torch.Tensor:
+    """Inverse of ``swizzle_mx_scales``: a SWIZZLE_32_4_4 artifact back to the plain row-major
+    ``(rows, cols)`` grid — or ``(num_experts, rows, cols)`` for an expert stack — with the
+    (128, 4) padding trimmed. Pure reshape/permute on the byte view (no kernel); it runs at
+    save/dequantize time, never on a forward, so the torch-level cost is irrelevant.
+
+    ``rows``/``cols`` are the LOGICAL dims of ONE matrix (for a gate|up slab, the full ``2N``); both are trimmed back out of the (128, 4) padding. An expert stack
+    needs 128-row-aligned matrices so each expert's block span is exactly ``rows // 128`` and
+    the stack splits cleanly; a single matrix takes any ``rows``."""
+    assert num_experts is None or rows % 128 == 0, (
+        f"an expert stack unswizzles per matrix, so rows must be 128-aligned (rows={rows})"
+    )
+    nrb, ncb = -(-rows // 128), -(-cols // 4)
+    dtype = swizzled.dtype
+    flat = swizzled.reshape(-1)
+    per_matrix = nrb * ncb * 512
+    n_matrices = num_experts if num_experts is not None else 1
+    assert flat.numel() == n_matrices * per_matrix, (
+        f"swizzled buffer holds {flat.numel()} elements, expected {n_matrices * per_matrix} "
+        f"for {n_matrices}x({rows}, {cols})"
+    )
+    out = []
+    for m in range(n_matrices):
+        blocks = flat[m * per_matrix : (m + 1) * per_matrix].reshape(nrb, ncb, 2, 256)
+        plain = (
+            blocks.reshape(nrb * ncb, 32, 4, 4)
+            .transpose(1, 2)
+            .reshape(nrb, ncb, 128, 4)
+            .permute(0, 2, 1, 3)
+            .reshape(nrb * 128, ncb * 4)
+        )
+        out.append(plain[:rows, :cols])
+    stacked = torch.stack(out) if num_experts is not None else out[0]
+    return stacked.contiguous().view(dtype)
+
+
+
 def _swizzle_to_blocks(
-    scale: torch.Tensor, gather_idx: torch.Tensor | None, gate: bool
+    scale: torch.Tensor, gather_idx: torch.Tensor | None
 ) -> torch.Tensor:
     """One ``(rows, cols)`` scale matrix -> its ``(row_blocks, cols//4, 2, 256)``
-    SWIZZLE_32_4_4 block stack (single kernel launch). Under ``gate`` the rows are the
-    stacked gate|up slab ``(2N, cols)``: the blocks come out ``[g0..,u0..]`` and are
-    block-interleaved to ``[g0,u0,g1,u1,...]`` so a tile reads its gate + up 128-blocks
-    as one contiguous descriptor load — which needs ``N % 128 == 0`` (else the gate/up
-    split lands mid-block)."""
+    SWIZZLE_32_4_4 block stack (single kernel launch)."""
     cols = scale.shape[1]
     rows = gather_idx.shape[0] if gather_idx is not None else scale.shape[0]
-    assert not gate or rows % 256 == 0, (
-        f"gate|up swizzle needs N % 128 == 0 (rows = 2N = {rows}); a non-128 N puts "
-        f"the gate/up split mid-block — keep those scales affine"
-    )
     nrb = triton.cdiv(rows, 128)
     ncb = triton.cdiv(cols, 4)
     # the reorder is byte-level; view as uint8 so the triton binder accepts e8m0/e4m3 scales
@@ -99,16 +147,11 @@ def _swizzle_to_blocks(
             ncb,
             src.stride(0),
         )
-    blocks = out.view(scale.dtype).reshape(nrb, ncb, 2, 256)
-    if gate:
-        blocks = (
-            blocks.reshape(2, nrb // 2, ncb, 2, 256).transpose(0, 1).reshape(nrb, ncb, 2, 256)
-        )
-    return blocks
+    return out.view(scale.dtype).reshape(nrb, ncb, 2, 256)
 
 
 def swizzle_mx_scales(
-    scale: torch.Tensor, gather_idx: torch.Tensor | None = None, *, gate: bool = False
+    scale: torch.Tensor, gather_idx: torch.Tensor | None = None
 ) -> torch.Tensor:
     """Reorder a block-scale tensor into the ``SWIZZLE_32_4_4`` layout the Blackwell tcgen05
     scaled-MMA consumes, one triton launch per matrix (``_swizzle_scales_kernel`` — no torch
@@ -126,10 +169,6 @@ def swizzle_mx_scales(
       blocks stay ``ceil(rows/128)``-aligned (the reader indexes expert ``e`` at
       ``e * ceil(rows/128)``; byte-identical to a flat swizzle when ``rows % 128 == 0``).
 
-    ``gate``: ``rows`` is the stacked gate|up slab (``2N``): per matrix the gate blocks
-    ``[0,N)`` and up blocks ``[N,2N)`` are interleaved to ``[g0,u0,g1,u1,...]`` so a tile reads
-    its gate + up 128-blocks contiguously. Requires ``N % 128 == 0``.
-
     ``gather_idx`` (2D only): a 1-D ``(padded_rows,)`` index mapping each output (sorted) row to
     its source row in ``scale`` (``-1`` = padding → zero row), folded into the kernel's load — the
     routed/expert-sorted, per-tile-padded layout a grouped GEMM reads affine per BM=128 tile.
@@ -137,25 +176,14 @@ def swizzle_mx_scales(
 
     ``rows``/``cols`` are zero-padded to (128, 4) multiples; returns the 5D
     ``(1, row_blocks, ceil(cols/4), 2, 256)`` view the ops read (``row_blocks`` sums the
-    expert stacks), or 6D ``(1, pairs, 2, ceil(cols/4), 2, 256)`` under ``gate`` — the shape
-    carries the interleave so every consumer (fused pair reads, plain remapped reads) takes
-    the SAME artifact. Bit-identical to CUTLASS's packer (verified)."""
+    expert stacks). Bit-identical to CUTLASS's packer (verified)."""
     assert gather_idx is None or gather_idx.shape[0] % 128 == 0, (
         f"gather_idx rows must be 128-padded, got {None if gather_idx is None else gather_idx.shape[0]}"
     )
     if scale.ndim == 3:
         assert gather_idx is None, "gather_idx applies to a single 2D scale, not an expert stack"
-        blocks = torch.cat([_swizzle_to_blocks(e, None, gate) for e in scale]).unsqueeze(0)
-    else:
-        assert scale.ndim == 2, (
+        return torch.cat([_swizzle_to_blocks(e, None) for e in scale]).unsqueeze(0)
+    assert scale.ndim == 2, (
             f"expected a 2D (rows, K//group) or 3D (E, rows, K//group) scale, got {tuple(scale.shape)}"
-        )
-        assert not (gate and gather_idx is not None), "gate|up interleave and gather_idx are exclusive"
-        blocks = _swizzle_to_blocks(scale, gather_idx, gate).unsqueeze(0)
-    if gate:
-        # the gate|up artifact is 6D — (1, pairs, 2, ncb, 2, 256), a pure view of the same
-        # interleaved bytes — so its layout is READABLE from the shape: the fused wrappers
-        # flatten it back for their pair-reading descriptors, and a plain (non-gate) consumer
-        # sees 6D and remaps its block index in-kernel. One artifact, every path.
-        return blocks.reshape(blocks.shape[0], -1, 2, *blocks.shape[2:])
-    return blocks
+    )
+    return _swizzle_to_blocks(scale, gather_idx).unsqueeze(0)

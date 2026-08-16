@@ -116,7 +116,16 @@ def compile_time_only_triton_op(name, mutates_args=(), opaque=False):
 
         @functools.wraps(fn)
         def dispatch(*args, **kwargs):
-            if torch.compiler.is_compiling():
+            # The op path is also the AUTOGRAD path (`register_autograd` hangs off the op, and
+            # these ops take the RAW activation, so that is where a usable gradient exists).
+            # Calling `fn` skips the dispatcher entirely, so a differentiable caller would
+            # silently get no gradient — route through the op whenever a tensor wants one.
+            # Training runs at prefill shapes where the ~160us dispatch is noise; inference
+            # runs under no_grad and keeps the bare-function fast path.
+            if torch.compiler.is_compiling() or (
+                torch.is_grad_enabled()
+                and any(getattr(a, "requires_grad", False) for a in args)
+            ):
                 return op(*args, **kwargs)
             return fn(*args, **kwargs)
 
@@ -442,7 +451,7 @@ def get_accelerator_autotuning_configs(
         blocks = [{**b, "PACKED_SCHEDULE": ps} for b in blocks for ps in (False, True)]
 
     # (descriptor-mode can't-win/can't-serve regions are fenced per kernel: descriptor_box_pruner,
-    # matched_memory_modes_pruner, gate_pointer_only_pruner, descriptor_needs_prequant_pruner)
+    # matched_memory_modes_pruner, descriptor_needs_prequant_pruner)
     if a_memory_modes is not None:
         blocks = [
             {**b, "A_MEMORY_MODE": mm}

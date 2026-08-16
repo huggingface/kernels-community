@@ -174,7 +174,6 @@ def moe_fused_grouped(
         output_global_scale=down_input_global_scale,
         expert_start=expert_start,
         epilogue=Epilogue(
-            gate=True,
             act_fn=act_fn,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
@@ -267,7 +266,6 @@ def moe_fused_batched(
         output_global_scale=down_input_global_scale,
         expert_ids=expert_ids,
         epilogue=Epilogue(
-            gate=True,
             act_fn=act_fn,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,

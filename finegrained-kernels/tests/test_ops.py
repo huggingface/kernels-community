@@ -79,10 +79,6 @@ class Problem:
     prequant: bool = False  # pass As explicitly (must be bit-identical to raw A)
     static: bool = False  # per-tensor calibrated activation scale (block-scale FP8 path)
     swizzled: bool = False  # pass MX weight scales pre-swizzled (5D SWIZZLE_32_4_4 fast path)
-    # swizzle the weight scale as the gate-INTERLEAVED artifact but launch WITHOUT the gate
-    # epilogue — the one-layout deployment's plain read (the in-kernel INTERLEAVED_SCALES
-    # block remap). Needs swizzled=True and N % 256 == 0 (two whole 128-blocks per half).
-    interleaved: bool = False
     sentinel_fraction: float = 0.0
     noncontiguous: bool = False
     empty_expert: bool = False
@@ -108,8 +104,6 @@ class Problem:
             tag += "_static"
         if self.swizzled:
             tag += "_swizzled"
-        if self.interleaved:
-            tag += "_interleaved"
         if self.sentinel_fraction:
             tag += "_sentinel"
         if self.noncontiguous:
@@ -205,12 +199,6 @@ def scenarios() -> list[Problem]:
         # group-16 column count are exactly the axes the mxfp8 cell above can't cover
         Problem(weight_recipe="mxfp4", gate=True, output_recipe="mxfp4", swizzled=True, N=256, K=512),
         Problem(weight_recipe="nvfp4", gate=True, output_recipe="nvfp4", swizzled=True, N=256, K=512),
-        # the one-layout deployment reads the SAME gate-interleaved artifact from PLAIN
-        # (non-gate) launches — the in-kernel INTERLEAVED_SCALES block remap vs the affine
-        # oracle; N=256 makes the interleaved order diverge from the flat slab
-        Problem(weight_recipe="mxfp8", swizzled=True, interleaved=True, N=256, K=512),
-        Problem(weight_recipe="mxfp4", swizzled=True, interleaved=True, N=256, K=512),
-        Problem(weight_recipe="nvfp4", swizzled=True, interleaved=True, N=256, K=512),
         # swizzled decode (S=8) — the bench's pre-swizzled batched decode arm per fp4 family
         Problem(weight_recipe="mxfp4", swizzled=True, S=8),
         Problem(weight_recipe="nvfp4", swizzled=True, S=8),
@@ -363,7 +351,7 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
         ref = torch.einsum("sk,snk->sn", A_dq, W[local])
         ref[expert_ids.long() >= problem.E] = 0
     if problem.gate:
-        gate_v, up_v = ref.chunk(2, dim=-1)
+        gate_v, up_v = ref[..., 0::2], ref[..., 1::2]
         ref = apply_glu(
             gate_v, up_v, problem.act_fn, problem.swiglu_alpha, problem.swiglu_limit
         ).float()
@@ -437,13 +425,8 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
         Bs = Bs[0] if Bs is not None else None
         Bs_global = Bs_global[:1] if Bs_global is not None else None
     # weight-scale swizzle, shared by all three ops — a pure layout change (values unchanged),
-    # so the op's result still matches the affine-Bs reference. `interleaved` builds the
-    # gate-interleaved artifact for a PLAIN launch (the INTERLEAVED_SCALES in-kernel remap).
-    bs = (
-        swizzle_mx_scales(Bs, gate=problem.gate or problem.interleaved)
-        if problem.swizzled and Bs is not None
-        else Bs
-    )
+    # so the op's result still matches the affine-Bs reference.
+    bs = swizzle_mx_scales(Bs) if problem.swizzled and Bs is not None else Bs
     globals_kw = dict(a_global_scale=As_global, b_global_scale=Bs_global)
     if op == "matmul":
         fn = maybe_compile(finegrained_kernels.matmul_2d, problem.compile)

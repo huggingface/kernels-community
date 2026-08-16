@@ -46,9 +46,8 @@ from .pruners import PATH_ANCHOR_AXES, global_scale_warp_spec_pruner, packed_sch
 
 def _rebind_grouped_weight_descriptor(nargs):
     """Per-config pre_hook: set the MX weight descriptor box to the tuned
-    ``[(2 if GATE else 1), BLOCK_SIZE_N, BLOCK_SIZE_K // values_per_byte]`` over the
-    ``(2E|E, N, K_bytes)`` weight view (one box holds both gate|up projections — the
-    fused-era TMA form). MUST mutate ``block_shape`` in place — a rebind never reaches
+    ``[1, (2 if GATE else 1) * BLOCK_SIZE_N, BLOCK_SIZE_K // values_per_byte]`` over the
+    ``(E, 2N|N, K_bytes)`` weight view. MUST mutate ``block_shape`` in place — a rebind never reaches
     the launch. No-op for pointer configs (they never read the descriptor)."""
     if nargs.get("B_MEMORY_MODE", "pointer") == "pointer" or isinstance(
         nargs["BDescriptor"], int
@@ -56,8 +55,8 @@ def _rebind_grouped_weight_descriptor(nargs):
         return
     values_per_byte = 2 if nargs["B"].dtype == torch.uint8 else 1
     nargs["BDescriptor"].block_shape = [
-        2 if nargs.get("GATE") else 1,
-        nargs["BLOCK_SIZE_N"],
+        1,
+        (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"],
         nargs["BLOCK_SIZE_K"] // values_per_byte,
     ]
 
@@ -87,7 +86,7 @@ def _rebind_grouped_descriptors(nargs):
 
 def build_grouped_operand_descriptors(a_operand, b_operand):
     """Operand host-TMA descriptors for a grouped launch: A box ``[16, 64]``, B box
-    ``[1, 128, 64]`` over the ``(2E|E, N, K_bytes)`` weight view. Placeholder boxes, re-bound to
+    ``[1, 128, 64]`` over the ``(E, 2N|N, K_bytes)`` weight view. Placeholder boxes, re-bound to
     the tuned tile per config by ``_rebind_grouped_descriptors``."""
     return (
         TensorDescriptor.from_tensor(a_operand, block_shape=[16, 64]),
@@ -115,7 +114,7 @@ def _rebind_grouped_mx_descriptors(nargs):
         # pair ([g,u] adjacent) as one 2*BN tile. BN<128 (non-gate, non-128 N) reads via the per-row
         # pointer gather instead — clamp the box to one block so the (unread) descriptor keeps a valid,
         # non-degenerate shape (a 0-block box traps the descriptor-encoding pass).
-        bn_blocks = (2 if nargs.get("GATE") else 1) * max(nargs["BLOCK_SIZE_N"] // 128, 1)
+        bn_blocks = max(1, ((2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"]) // 128)
         nargs["BSDescriptor"].block_shape = [1, bn_blocks, rep_k, 2, 256]
     # Swizzled requant output (Cs is a descriptor): the store tile is [1, 1, rep_n, 2, 256], and
     # rep_n = (BN // SCALE_GROUP_K) // 4 depends on the tuned BLOCK_SIZE_N and the group size — so
@@ -159,7 +158,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
     As,  # (S, K // BLOCK_SIZE_K) fp32 per-row, per-K-block activation scales
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
-    BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K), box ((2|1), BN, BK); read iff B_MEMORY_MODE != "pointer"
+    BDescriptor,  # host TMA descriptor over B viewed (E, 2N|N, K), box (1, (2|1)*BN, BK); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
     C,  # (S, N) output; under an OUTPUT_RECIPE the FP8-requantized intermediate
     Cs,  # (S, N // BLOCK_SIZE_N) per-row, per-block output scale; written iff OUTPUT_RECIPE
@@ -276,16 +275,14 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             B + expert_id64 * stride_b_e,
             offs_bn,
             offs_k,
-            N * stride_b_n,
             stride_b_n,
             stride_b_k,
-            GATE,
             False,
         )
-        # gate scale block, up scale block (N tiles away); non-GATE reads the single block
-        # (up_s_ptr dead, == gate_s_ptr).
-        gate_s_ptr = Bs + expert_id64 * stride_bs_e + pid_n * stride_bs_n
-        up_s_ptr = Bs + expert_id64 * stride_bs_e + (num_n_tiles + pid_n) * stride_bs_n
+        # under GATE the tile's two scale blocks are the adjacent pair at 2*pid_n; non-GATE reads
+        # the single block (up_s_ptr dead).
+        gate_s_ptr = Bs + expert_id64 * stride_bs_e + ((2 if GATE else 1) * pid_n) * stride_bs_n
+        up_s_ptr = gate_s_ptr + stride_bs_n
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
@@ -357,7 +354,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
     As,  # scalar — static per-tensor activation scale (calibration-time)
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
-    BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K), box ((2|1), BN, BK); read iff B_MEMORY_MODE != "pointer"
+    BDescriptor,  # host TMA descriptor over B viewed (E, 2N|N, K), box (1, (2|1)*BN, BK); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
     C,  # (S, N) output; under an OUTPUT_RECIPE the FP8-requantized intermediate
     Cs,  # (S, N // BLOCK_SIZE_N) per-(row, block) output scale; written iff OUTPUT_RECIPE
@@ -455,14 +452,12 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
             B + expert_id64 * stride_b_e,
             offs_bn,
             offs_k,
-            N * stride_b_n,
             stride_b_n,
             stride_b_k,
-            GATE,
             False,
         )
-        gate_s_ptr = Bs + expert_id64 * stride_bs_e + pid_n * stride_bs_n
-        up_s_ptr = Bs + expert_id64 * stride_bs_e + (num_n_tiles + pid_n) * stride_bs_n
+        gate_s_ptr = Bs + expert_id64 * stride_bs_e + ((2 if GATE else 1) * pid_n) * stride_bs_n
+        up_s_ptr = gate_s_ptr + stride_bs_n
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
@@ -543,7 +538,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
     As,  # (S,) per-token activation scales
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
-    BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K), box ((2|1), BN, BK); read iff B_MEMORY_MODE != "pointer"
+    BDescriptor,  # host TMA descriptor over B viewed (E, 2N|N, K), box (1, (2|1)*BN, BK); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, 1, 1) per-tensor weight scales (one scalar covers the gate|up stack)
     C,  # (S, N) output; under GATE the bf16 GLU intermediate
     Cs,  # None (tensor-wide has no fused requant); kept for the shared epilogue signature
@@ -641,10 +636,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             B + expert_id64 * stride_b_e,
             offs_bn,
             offs_k,
-            N * stride_b_n,
             stride_b_n,
             stride_b_k,
-            GATE,
             False,
         )
         a_s = tl.load(As + in_row * stride_as_m, mask=row_mask, other=0.0)
@@ -710,7 +703,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     # different memory-mode optima and must not share a tuned config.
     # OUTPUT_RECIPE/SWIZZLED_OUT key the requant epilogue explicitly (the C/Cs dtype append
     # splits them incidentally today; a descriptor Cs has no dtype token).
-    ["N", "K", "tokens_per_expert_bit_length", "GATE", "SWIZZLED_SCALES", "INTERLEAVED_SCALES", "OUTPUT_RECIPE", "SWIZZLED_OUT"],
+    ["N", "K", "tokens_per_expert_bit_length", "GATE", "SWIZZLED_SCALES", "OUTPUT_RECIPE", "SWIZZLED_OUT"],
     n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BK-within-K veto + the sm_10x dot_scaled shape/trap gates (this kernel had no
@@ -737,7 +730,7 @@ def mx_dynamic_matmul_grouped_kernel(
     As,  # activation scales: row-major group scales read affine (gathered per row) iff not SWIZZLED_SCALES; else None (swizzled via ASDescriptor)
     ASDescriptor,  # host TMA descriptor over the SWIZZLE_32_4_4, expert-sorted/128-padded A scales; read iff SWIZZLED_SCALES
     B,  # (num_experts, N, K) E4M3 (MXFP8) or (num_experts, N, K // 2) packed E2M1 (MXFP4); 2N under GATE
-    BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K_bytes), box ((2|1), BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
+    BDescriptor,  # host TMA descriptor over B viewed (E, 2N|N, K_bytes), box (1, (2|1)*BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) UE8M0 weight scales (2N under GATE)
     BSDescriptor,  # host TMA descriptor over the SWIZZLE_32_4_4 per-expert B scales; read iff SWIZZLED_SCALES
     C,  # (S, N[/2]) output; under an OUTPUT_RECIPE the MX-requantized intermediate
@@ -789,7 +782,6 @@ def mx_dynamic_matmul_grouped_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     SWIZZLED_SCALES: tl.constexpr = True,  # scales pre-swizzled (5D weight + matching acts); else affine
-    INTERLEAVED_SCALES: tl.constexpr = False,  # plain read of the gate|up-interleaved artifact (6D): remap blocks
     SWIZZLED_OUT: tl.constexpr = False,  # requant emits Cs in SWIZZLE_32_4_4 (descriptor); single source: the wrapper
     WARP_SPEC: tl.constexpr = False,  # tuner axis; dot_scaled+WS+TMA compiles+wins (num_warps%4, BM>=64)
     # tuner axis: resolve M-tiles from the packed schedule (3 scalar loads) instead of the
@@ -864,7 +856,7 @@ def mx_dynamic_matmul_grouped_kernel(
         # never reads past the expert's N rows; the wrapped columns' output is masked off (N_COLS) in
         # the epilogue. Inert when N % BLOCK_SIZE_N == 0. The descriptor arm uses n_off (OOB-clamped),
         # and the scale rides blk_idx off the padded swizzled block — neither depends on offs_bn.
-        offs_bn = offs_bn % N
+        offs_bn = offs_bn % (2 * N if GATE else N)
         kb_off = 0
         ka_off = 0
         # GATE stacks the gate + up 128-blocks (the up block sits N rows away) into a 2*BN tile; a
@@ -873,10 +865,8 @@ def mx_dynamic_matmul_grouped_kernel(
             B + expert_id64 * stride_b_e,
             offs_bn,
             offs_kb,
-            N * stride_b_n,
             stride_b_n,
             stride_b_k,
-            GATE,
             False,
         )
 
@@ -886,20 +876,9 @@ def mx_dynamic_matmul_grouped_kernel(
         # Pre-swizzled scales (SWIZZLE_32_4_4, emitted by the offline act-quant / requant): the M
         # tile's expert-sorted, 128-padded scale block is the flat tile index pid_m; the weight scale
         # block (descriptor bulk-load, BN=128) is expert*num_n_tiles + pid_n. Each expert's swizzled
-        # slab is num_n_tiles 128-row blocks (non-gate); under GATE it is 2*num_n_tiles, block-interleaved
-        # ([g,u] per tile adjacent) so this same block index bulk-loads the stacked gate|up scale.
+        # slab is num_n_tiles REP-blocks (REP=2 under GATE, whose tile spans both).
         pid_m = tile_id // num_n_tiles
-        # a plain read of the gate|up-interleaved artifact: linear block pid_n of the flat 2N
-        # rows lives at 2*pid_n (gate half) / 2*(pid_n - half) + 1 (up half)
-        if INTERLEAVED_SCALES:
-            tl.static_assert(
-                BLOCK_SIZE_N == 128, "the interleaved remap maps whole 128-row blocks"
-            )
-            half = num_n_tiles // 2
-            pid_n_blk = tl.where(pid_n < half, 2 * pid_n, 2 * (pid_n - half) + 1)
-        else:
-            pid_n_blk = pid_n
-        weight_blk = (expert_id64 * num_n_tiles + pid_n_blk).to(tl.int32)
+        weight_blk = (expert_id64 * num_n_tiles + pid_n).to(tl.int32)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
             a, a_s = load_act_mx(
                 a_ptrs, As, None, row_mask, row_mask, ADescriptor, m_start, ka_off,
@@ -916,7 +895,7 @@ def mx_dynamic_matmul_grouped_kernel(
             )
             acc = mx_compute(
                 acc, a, a_s, w, w_s, COMPUTE_MODE,
-                BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, False,
+                BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, False,
             )
             a_ptrs += (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k
             ka_off += BLOCK_SIZE_K // ACT_VALUES_PER_BYTE
@@ -999,7 +978,7 @@ def mx_weight_only_matmul_grouped_kernel(
     A,  # (num_tokens, K) raw BF16/FP16 activations — NOT quantized
     ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
     B,  # (num_experts, N, K[/2]) MXFP4/NVFP4 (packed E2M1) / MXFP8 (E4M3) weights; 2N under GATE
-    BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K_bytes), box ((2|1), BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
+    BDescriptor,  # host TMA descriptor over B viewed (E, 2N|N, K_bytes), box (1, (2|1)*BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) group scales — UE8M0 (MX) or E4M3 (NVFP4)
     BsGlobal,  # (num_experts,) fp32 NVFP4 per-expert global — recovers on the accumulator; read iff not None
     C,
@@ -1076,11 +1055,11 @@ def mx_weight_only_matmul_grouped_kernel(
             prefetched = prefetch_packed_entry(
                 Schedule, (tile_id + NUM_SMS) // num_n_tiles, total_m_tiles
             )
-        offs_bn = offs_bn % N  # non-128 N: pointer rows wrap; wrapped cols masked (N_COLS) in epilogue
+        offs_bn = offs_bn % (2 * N if GATE else N)  # non-128 N: pointer rows wrap; wrapped cols masked (N_COLS) in epilogue
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
         b_ptrs = weight_tile_ptrs(
-            B + expert_id64 * stride_b_e, offs_bn, offs_kb, N * stride_b_n,
-            stride_b_n, stride_b_k, GATE, False,
+            B + expert_id64 * stride_b_e, offs_bn, offs_kb,
+            stride_b_n, stride_b_k, False,
         )
         acc = acc_init("dot", BLOCK_SIZE_M, n_width, False)
         kb_off = 0
@@ -1153,7 +1132,7 @@ def full_precision_matmul_grouped_kernel(
     A,  # (num_tokens, K) BF16/FP16 activations, any row order
     ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
     B,  # (num_experts, N, K) weights in A's dtype; under GATE the (num_experts, 2N, K) gate|up stack
-    BDescriptor,  # host TMA descriptor over B viewed (2E|E, N, K), box ((2|1), BN, BK); read iff B_MEMORY_MODE != "pointer"
+    BDescriptor,  # host TMA descriptor over B viewed (E, 2N|N, K), box (1, (2|1)*BN, BK); read iff B_MEMORY_MODE != "pointer"
     C,  # (S, N) output; under GATE the GLU intermediate
     GatherIdx,  # (S,) int32 — sorted position -> source row of A; read only when not None
     ScatterIdx,  # (S,) int32 — sorted position -> destination row of C; read only when not None
@@ -1251,10 +1230,8 @@ def full_precision_matmul_grouped_kernel(
             B + expert_id64 * stride_b_e,
             offs_bn,
             offs_k,
-            N * stride_b_n,
             stride_b_n,
             stride_b_k,
-            GATE,
             False,
         )
 
@@ -1392,7 +1369,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
         Cs = None  # unread without an OUTPUT_RECIPE; strides literal below
     num_sms = sm_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
-        A, B.view(2 * num_experts if gate else num_experts, N, K)
+        A, B.view(num_experts, 2 * N if gate else N, K)
     )
 
     # one launch per call (graph-safe, ~2µs) so PACKED_SCHEDULE and inline configs share
@@ -1526,7 +1503,7 @@ def w8a8_block_static_fp8_matmul_grouped(
         Cs = None  # unread without an OUTPUT_RECIPE; strides literal below
     num_sms = sm_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
-        A_q, B.view(2 * num_experts if gate else num_experts, N, K)
+        A_q, B.view(num_experts, 2 * N if gate else N, K)
     )
 
     # one launch per call (graph-safe, ~2µs) so PACKED_SCHEDULE and inline configs share
@@ -1645,7 +1622,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     C = A.new_empty(S, N, dtype=output_dtype)
     num_sms = sm_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
-        A, B.view(2 * num_experts if gate else num_experts, N, K)
+        A, B.view(num_experts, 2 * N if gate else N, K)
     )
 
     # one launch per call (graph-safe, ~2µs) so PACKED_SCHEDULE and inline configs share
@@ -1734,7 +1711,7 @@ def mx_dynamic_matmul_grouped(
     gather_idx: optional (S,) — sorted position -> source row of A; None = A is expert-sorted
     scatter_idx: optional (S,) — sorted position -> destination row of C; None = C stays expert-sorted
     """
-    assert A.ndim == 2 and B.ndim == 3 and Bs.ndim in (3, 5, 6)  # 5D = pre-swizzled; 6D = gate|up artifact
+    assert A.ndim == 2 and B.ndim == 3 and Bs.ndim in (3, 5)  # 5D = pre-swizzled
     assert B.dtype in (torch.int8, torch.float8_e4m3fn), (
         f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
     )
@@ -1756,17 +1733,7 @@ def mx_dynamic_matmul_grouped(
     # or already SWIZZLE_32_4_4 (5D), swizzled once at model load: the deployment contract, one
     # checkpoint shared with batched decode (is_preswizzled_mx). The recipe is the scale dtype
     # (E4M3 = NVFP4 group-16, UE8M0 = MX group-32).
-    # 6D = the gate|up artifact (interleave carried in the shape): GATE reads block pairs
-    # natively, a plain launch remaps in-kernel; gate|up fusion requires the artifact.
-    interleaved = Bs.ndim == 6
-    if interleaved:
-        Bs = Bs.reshape(Bs.shape[0], -1, *Bs.shape[3:])
     swizzled_scales = Bs.ndim == 5
-    if gate and swizzled_scales:
-        assert interleaved, (
-            "gate|up swizzled scales must be the gate-interleaved artifact "
-            "(swizzle_mx_scales(..., gate=True))"
-        )
     scale_group = mx_scale_family(Bs, K)
     if not swizzled_scales:
         assert Bs.shape == (num_experts, n_rows, K // scale_group), (
@@ -1912,11 +1879,10 @@ def mx_dynamic_matmul_grouped(
     # NVFP4 accumulator correction: the per-expert g_a·g_b product folded onto the fp32 accumulator
     # (grouped A is pre-quantized, so the kernel needs only this product, never g_a alone).
     input_global_scale = combine_global_scales(a_global_scale, b_global_scale, B.shape[0])
-    # host TMA descriptor over the (2E|E, N, K_bytes) view — one box holds both gate|up
-    # projections; the placeholder box is re-bound per tuned config by the pre_hook
-    rows0 = 2 * num_experts if gate else num_experts
+    # host TMA descriptor over the (E, 2N|N, K_bytes) view — a gate tile is one contiguous
+    # 2*BN row span; the placeholder box is re-bound per tuned config by the pre_hook
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
-        a_u8, b_u8.view(rows0, N, b_u8.shape[2])
+        a_u8, b_u8.view(num_experts, 2 * N if gate else N, b_u8.shape[2])
     )
     # (the SA/SB swizzled-scale descriptors and their placeholder boxes — re-bound per tuned
     # config by _rebind_grouped_mx_descriptors — are built above with the scales.)
@@ -1973,7 +1939,6 @@ def mx_dynamic_matmul_grouped(
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
             SWIZZLED_SCALES=swizzled_scales,
-            INTERLEAVED_SCALES=interleaved and not gate,
             SWIZZLED_OUT=swizzled_out,
         )
     return [C, cs_ret] if requant else [C]
@@ -2028,7 +1993,7 @@ def full_precision_matmul_grouped(
     C = A.new_empty(S, N, dtype=output_dtype)
     num_sms = sm_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
-        A, B.view(2 * num_experts if gate else num_experts, N, K)
+        A, B.view(num_experts, 2 * N if gate else N, K)
     )
     # one launch per call (graph-safe, ~2µs) so PACKED_SCHEDULE and inline configs share
     # identical launch args during tunes
@@ -2115,11 +2080,11 @@ def mx_weight_only_matmul_grouped(
     num_sms = sm_count(A.device.index)
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
-    # Operand host-TMA descriptors (A over (S, K), B over the (2E|E, N, K_bytes) weight view);
+    # Operand host-TMA descriptors (A over (S, K), B over the (E, 2N|N, K_bytes) weight view);
     # placeholder boxes rebound per config by _rebind_grouped_descriptors, read only by descriptor
     # configs the tuner picks. Scales stay affine (3D pointer) — no scale descriptor.
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
-        A, b_u8.view(2 * num_experts if gate else num_experts, N, K_b)
+        A, b_u8.view(num_experts, 2 * N if gate else N, K_b)
     )
 
     # one launch per call (graph-safe, ~2µs) so PACKED_SCHEDULE and inline configs share

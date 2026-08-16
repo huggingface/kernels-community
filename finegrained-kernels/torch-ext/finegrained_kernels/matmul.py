@@ -24,7 +24,7 @@ from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, co
 from .recipes import normalize_global_scale, Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, is_mx, mx_scale_family, resolve_input_recipe, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_recipe
 from .swizzle import swizzle_mx_scales
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, maybe_act_quant
-from .scales import apply_global_scale, gate_stacked_block_scale_ptrs, mx_2d_scale_ptrs
+from .scales import apply_global_scale, mx_2d_scale_ptrs
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .tiles import (
     advance_ptrs,
@@ -42,7 +42,7 @@ from .tiles import (
     swizzle_offsets,
 )
 from .epilogue import acc_init, gemm_epilogue, store_masked, store_masked_oriented
-from .pruners import PATH_ANCHOR_AXES, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, gate_pointer_only_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner
+from .pruners import PATH_ANCHOR_AXES, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner
 
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
 # ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.
@@ -66,8 +66,22 @@ STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
 def _rebind_operand_box(nargs, mode_key, desc_key, rows, cols):
     """Set one operand's host-TMA box to ``[rows, cols]`` in place — MUST mutate (a rebind never
     reaches the launch). No-op for a pointer config, whose descriptor is a dead int placeholder."""
-    if nargs.get(mode_key, "pointer") != "pointer" and not isinstance(nargs[desc_key], int):
-        nargs[desc_key].block_shape = [rows, cols]
+    desc = nargs[desc_key]
+    # None = the operand's layout cannot back a descriptor (see `_maybe_descriptor`); those
+    # configs are pruned, so reaching here with one would mean a pruner gap, not a rebind target
+    if nargs.get(mode_key, "pointer") != "pointer" and not isinstance(desc, int) and desc is not None:
+        desc.block_shape = [rows, cols]
+
+
+def _maybe_descriptor(t: torch.Tensor, box: list[int]) -> TensorDescriptor | None:
+    """A host-TMA descriptor over ``t``, or None when the layout cannot back one — a TMA box
+    needs a unit-stride innermost dim, which a transposed view (as a backward pass hands in to
+    contract over the other axis) does not have. ``None`` is the same signal the pointer arms
+    already take for an unused descriptor, and ``descriptor_box_pruner`` drops the configs that
+    would read it, so the tuner is left with the pointer arms the kernel serves stride-generally."""
+    if t is None or (t.ndim >= 2 and t.stride(-1) != 1):
+        return None
+    return TensorDescriptor.from_tensor(t, box)
 
 
 def _rebind_bd_descriptors(nargs):
@@ -108,7 +122,7 @@ def _rebind_mx_descriptors(nargs):
         # unread — clamp its box to one block so it keeps a valid, non-degenerate shape
         # (a 0-block box traps the descriptor-encoding pass; same clamp as the grouped hook).
         rep_k = max((nargs["BLOCK_SIZE_K"] // nargs["SCALE_GROUP_K"]) // 4, 1)
-        bn_blocks = max(nargs["BLOCK_SIZE_N"] // 128, 1)
+        bn_blocks = max(1, ((2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"]) // 128)
         nargs["BSDescriptor"].block_shape = [1, bn_blocks, rep_k, 2, 256]
         if nargs["A"].dtype in (torch.float8_e4m3fn, torch.uint8):
             bm_blocks = max(nargs["BLOCK_SIZE_M"] // 128, 1)
@@ -161,7 +175,6 @@ def _rebind_mx_descriptors(nargs):
             matched_memory_modes_pruner(),
             descriptor_box_pruner("block_k"),
             smem_pruner("block_k"),
-            gate_pointer_only_pruner(),
             block_dynamic_mma_width_pruner(),
             block_dynamic_2d_warp_spec_pruner(),
         )
@@ -185,6 +198,9 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     stride_a_m,
     stride_a_k,
     stride_as_m,
+    stride_as_k,  # activation-scale group-axis stride: 1 for a row-major (M, K//block_k) grid,
+    # but a real stride when the caller hands in a transposed view (the weight side has carried
+    # both strides all along; this is the activation side catching up)
     stride_b_k,
     stride_b_n,
     stride_bs_k,
@@ -235,18 +251,19 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         (BLOCK_SIZE_N if SWAP_AB else BLOCK_SIZE_M) >= 128
     )
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, block_k
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, block_k, GATE=GATE
     )
     # Scale pointers index off AFFINE row/col offsets + a bounds mask; the %-wrapped forms
     # (offs_am/offs_bn from swizzle_offsets) drive ONLY the pointer arm's operand tiles
     # (token replication at decode). Keeping scales affine avoids the non-affine gather
     # the wrap induces (~460us / 18pp at prefill).
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    n_rows = 2 * N if GATE else N
     offs_am_lin = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_bn_lin = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_bn_lin = pid_n * n_width + tl.arange(0, n_width)
     as_ptrs = As + offs_am_lin * stride_as_m
     as_mask = offs_am_lin < M
-    bs_mask = offs_bn_lin < N
+    bs_mask = offs_bn_lin < n_rows
     a_descriptor = operand_tile_descriptor(
         ADescriptor, A, M, K, stride_a_m, stride_a_k, BLOCK_SIZE_M, block_k, A_MEMORY_MODE
     )
@@ -270,14 +287,9 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # then folds it per row exactly as in the dense case.
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, not SWAP_AB)
     b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, N, stride_b_n, stride_b_k, GATE, B_MEMORY_MODE, SWAP_AB)
-    if GATE:
-        bs_ptrs, bs_mask = gate_stacked_block_scale_ptrs(
-            Bs, pid_n, N, block_n, stride_bs_n, BLOCK_SIZE_N, n_width
-        )
-    else:
-        # the (BN,) scale-index gather decouples the tile from the scale grid: a wide tile
-        # spans several scale columns, a narrow one shares a column
-        bs_ptrs = Bs + (offs_bn_lin // block_n) * stride_bs_n
+    # the scale-index gather decouples the tile from the scale grid: a wide tile spans several
+    # scale columns, a narrow one shares a column
+    bs_ptrs = Bs + (offs_bn_lin // block_n) * stride_bs_n
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
@@ -294,7 +306,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         )
         a_ptrs, as_ptrs, b_ptrs, bs_ptrs, _, _ = advance_ptrs(
             a_ptrs, as_ptrs, b_ptrs, bs_ptrs, b_ptrs, bs_ptrs,
-            block_k * stride_a_k, 1, block_k * stride_b_k, stride_bs_k,
+            block_k * stride_a_k, stride_as_k, block_k * stride_b_k, stride_bs_k,
             A_MEMORY_MODE, B_MEMORY_MODE, True, True, False,
         )
 
@@ -383,8 +395,9 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     Uses a 2D grid with swizzle for L2 cache locality on B tiles.
     """
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    n_rows = 2 * N if GATE else N
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GATE=GATE
     )
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, "pointer", True)
     # Under GATE the weight is the stacked (2N, K) gate|up tile; one per-tensor weight scale
@@ -465,7 +478,6 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
             matched_memory_modes_pruner(),
             descriptor_box_pruner("block_k"),
             smem_pruner("block_k"),
-            gate_pointer_only_pruner(),
         )
     },
 )
@@ -518,8 +530,9 @@ def w8a8_block_static_fp8_matmul_kernel(
     the end.
     """
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    n_rows = 2 * N if GATE else N
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, block_k
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, block_k, GATE=GATE
     )
     a_descriptor = operand_tile_descriptor(
         ADescriptor, A, M, K, stride_a_m, stride_a_k, BLOCK_SIZE_M, block_k, A_MEMORY_MODE
@@ -530,18 +543,11 @@ def w8a8_block_static_fp8_matmul_kernel(
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
     # Weight-scale index off the AFFINE column offset + a bounds mask (the %-wrapped offs_bn
     # from swizzle_offsets drives only the pointer operand tile); an affine gather avoids the
-    # non-affine scale read the wrap induces, matching the block-dynamic kernel above. Under GATE
-    # the weight is the stacked (2N, K) gate|up tile (pointer-only) + a 2*BN per-weight-row scale
-    # gather (gate rows [0,N), up rows offset by N//block_n scale blocks).
+    # non-affine scale read the wrap induces, matching the block-dynamic kernel above.
     b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, N, stride_b_n, stride_b_k, GATE, B_MEMORY_MODE)
-    if GATE:
-        bs_ptrs, bs_mask = gate_stacked_block_scale_ptrs(
-            Bs, pid_n, N, block_n, stride_bs_n, BLOCK_SIZE_N, n_width
-        )
-    else:
-        offs_bn_lin = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        bs_ptrs = Bs + (offs_bn_lin // block_n) * stride_bs_n
-        bs_mask = offs_bn_lin < N
+    offs_bn_lin = pid_n * n_width + tl.arange(0, n_width)
+    bs_ptrs = Bs + (offs_bn_lin // block_n) * stride_bs_n
+    bs_mask = offs_bn_lin < n_rows
     a_s_static = tl.load(As)
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
@@ -622,7 +628,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     # split W4A8 from W4A4 itself. OUTPUT_RECIPE/SWIZZLED_OUT key the requant epilogue
     # explicitly (today the C/Cs dtypes split them incidentally; a descriptor Cs has no
     # dtype token, so don't lean on the append).
-    ["N", "K", "m_bit_length", "INPUT_RECIPE", "SWIZZLED_SCALES", "INTERLEAVED_SCALES", "GATE", "OUTPUT_RECIPE", "SWIZZLED_OUT"],
+    ["N", "K", "m_bit_length", "INPUT_RECIPE", "SWIZZLED_SCALES", "GATE", "OUTPUT_RECIPE", "SWIZZLED_OUT"],
     n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
@@ -638,7 +644,6 @@ def w8a8_block_static_fp8_matmul_kernel(
             scalar_max_m_pruner("M"),
             smem_pruner(),
             descriptor_box_pruner("BLOCK_SIZE_K"),
-            gate_pointer_only_pruner(),
             swizzled_scale_config_pruner(),
             warp_spec_compile_guard_pruner(),
         )
@@ -669,6 +674,9 @@ def mx_dynamic_matmul_kernel(
     stride_a_m,
     stride_a_k,
     stride_as_m,
+    stride_as_k,  # activation-scale group-axis stride, in GROUPS (see the affine advance below):
+    # 1 for the row-major (M, K // SCALE_GROUP_K) grid, a real stride under a transposed view.
+    # Dead on the swizzled arm, which re-derives its block offsets instead of walking pointers.
     stride_b_k,
     stride_b_n,
     stride_bs_k,
@@ -687,7 +695,6 @@ def mx_dynamic_matmul_kernel(
     B_MEMORY_MODE: tl.constexpr = "pointer",
     INPUT_RECIPE: tl.constexpr = "mxfp8",
     SWIZZLED_SCALES: tl.constexpr = False,  # scales pre-swizzled (5D weight + matching acts); else affine/inline
-    INTERLEAVED_SCALES: tl.constexpr = False,  # plain read of the gate|up-interleaved artifact (6D): remap blocks
     SWIZZLED_OUT: tl.constexpr = False,  # requant emits Cs in SWIZZLE_32_4_4 (CSDescriptor); single source: wrapper
     # Dense gate|up fusion: B is the (2N, K) gate|up stack, C the [M, N] GLU output. Every arm
     # folds out at compile time when GATE=False (the plain dense GEMM, unchanged).
@@ -718,19 +725,20 @@ def mx_dynamic_matmul_kernel(
     ACT_VALUES_PER_BYTE: tl.constexpr = 2 if A.dtype.element_ty == tl.uint8 else 1
     WEIGHT_VALUES_PER_BYTE: tl.constexpr = 2 if B.dtype.element_ty == tl.uint8 else 1
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    n_rows = 2 * N if GATE else N
     SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
     offs_ka = tl.arange(0, BLOCK_SIZE_K // ACT_VALUES_PER_BYTE)
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
     # packed-fp4 weights (WEIGHT_VALUES_PER_BYTE==2) route swizzle_offsets to full L2 grouping
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WEIGHT_VALUES_PER_BYTE
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WEIGHT_VALUES_PER_BYTE, GATE=GATE
     )
     # Scales read affine off row/col offsets + bounds masks (the %-wrapped operand offsets would
     # make the scale load a non-affine gather); the SWIZZLED arm reads them via the SA/BS
     # descriptors in the loop instead, so its pointer tiles are dead (base scalars + null masks).
     as_ptrs, bs_ptrs, as_mask, bs_mask = mx_2d_scale_ptrs(
         As, Bs, pid_m, pid_n, M, N, stride_as_m, stride_bs_n, stride_bs_k,
-        BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_COLS, SWIZZLED_SCALES,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_COLS, SWIZZLED_SCALES, GATE,
     )
     # Operand tiles: activation + the (GATE-stacked-aware) weight, both single leaf calls (the
     # descriptor-vs-pointer and gate|up-stack branches fold inside the leaves). The swap arm
@@ -758,7 +766,6 @@ def mx_dynamic_matmul_kernel(
             0, stride_bs_n, stride_bs_k,
             GATE, False, False, B_MEMORY_MODE, SWAP_AB, SWIZZLED_SCALES,
             BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
-            INTERLEAVED_SCALES=INTERLEAVED_SCALES,
         )
         accumulator = mx_compute(
             accumulator, a, a_s, b, b_s, COMPUTE_MODE,
@@ -767,7 +774,7 @@ def mx_dynamic_matmul_kernel(
         a_ptrs, as_ptrs, b_ptrs, bs_ptrs, _, _ = advance_ptrs(
             a_ptrs, as_ptrs, b_ptrs, bs_ptrs, b_ptrs, bs_ptrs,
             (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k,
-            BLOCK_SIZE_K // SCALE_GROUP_K,
+            (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_as_k,
             (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k,
             (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k,
             A_MEMORY_MODE, B_MEMORY_MODE,
@@ -821,7 +828,6 @@ def mx_dynamic_matmul_kernel(
             mx_config_pruner("K", "N"),  # dot_scaled shape gates
             warp_spec_compile_guard_pruner(),
             descriptor_box_pruner("BLOCK_SIZE_K"),
-            gate_pointer_only_pruner(),
             smem_pruner("BLOCK_SIZE_K"),
         )
     },
@@ -869,10 +875,11 @@ def mx_weight_only_matmul_2d_kernel(
     weight upcast in-MMA) — no activation quant, no ``dot_scaled``. Pointer/affine scales only.
     ``GATE`` loads the stacked (2N, K) gate|up weight as one ``[BK, 2*BN]`` dot + applies the GLU."""
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    n_rows = 2 * N if GATE else N
     SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WEIGHT_VALUES_PER_BYTE
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, WEIGHT_VALUES_PER_BYTE, GATE=GATE
     )
     # Only the weight scale is needed (bf16 acts carry no scale). Build it N-clamped + UNMASKED
     # (bs_mask=None): valid columns (offs_bn_lin < N) read their real scale; the tail reads a clamped
@@ -880,9 +887,9 @@ def mx_weight_only_matmul_2d_kernel(
     # bounds mask is what lets the K-loop warp-specialization-lower (the masked load's fill constant
     # is the WS partitioner blocker). GATE routes its stacked gate|up scale through the per-expert
     # leaf, not these ptrs, so this only governs the plain dense arm.
-    offs_bn_lin = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_bn_lin = pid_n * n_width + tl.arange(0, n_width)
     bs_ptrs = Bs + (
-        tl.minimum(offs_bn_lin, N - 1)[:, None] * stride_bs_n
+        tl.minimum(offs_bn_lin, n_rows - 1)[:, None] * stride_bs_n
         + tl.arange(0, SCALE_COLS)[None, :] * stride_bs_k
     )
     bs_mask = None
@@ -984,8 +991,9 @@ def full_precision_matmul_2d_kernel(
     ``GATE`` loads the stacked (2N, K) gate|up weight as one ``[BK, 2*BN]`` dot and applies the
     ``ACT_FN``/SwiGLU GLU; ``GATE=False`` is the plain dense GEMM. 2D grid with swizzle for L2 reuse."""
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    n_rows = 2 * N if GATE else N
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
-        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GATE=GATE
     )
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, "pointer", True)
     b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, N, stride_b_n, stride_b_k, GATE, "pointer")
@@ -1077,7 +1085,7 @@ def w8a8_block_dynamic_fp8_matmul(
     # (host-TMA) configs the tuner picks for wide-N prefill; pointer configs never touch
     # them (the constexpr arm folds out in the load helpers).
     a_descriptor = TensorDescriptor.from_tensor(A_q, [1, block_k])
-    b_descriptor = TensorDescriptor.from_tensor(B, [1, block_k])
+    b_descriptor = _maybe_descriptor(B, [1, block_k])
 
     def grid(META):
         return (
@@ -1101,6 +1109,7 @@ def w8a8_block_dynamic_fp8_matmul(
             A_q.stride(0),
             A_q.stride(1),
             A_s.stride(0),
+            A_s.stride(1),
             B.stride(1),
             B.stride(0),
             bs_u8.stride(1),
@@ -1197,7 +1206,7 @@ def w8a8_block_static_fp8_matmul(
     # _rebind_bd_descriptors. Read only by the descriptor configs the tuner picks for wide-N
     # prefill (offline fp8 A); pointer/inline configs never touch them.
     a_descriptor = TensorDescriptor.from_tensor(A_q, [1, block_k])
-    b_descriptor = TensorDescriptor.from_tensor(B, [1, block_k])
+    b_descriptor = _maybe_descriptor(B, [1, block_k])
 
     with device_context(A.device):
         compile_time_only_triton_wrap(w8a8_block_static_fp8_matmul_kernel)[grid](
@@ -1348,7 +1357,14 @@ def mx_dynamic_matmul(
         f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
     )
     assert A.is_contiguous(), "A must be contiguous"
-    assert B.is_contiguous(), "B must be contiguous"
+    # B may be row-major (the forward weight) or a transposed view of one: the kernel reads
+    # both of B's strides, and `descriptor_box_pruner` keeps the TMA arms — which need a
+    # unit-stride innermost dim — off the transposed form. This is what lets a backward pass
+    # contract over N by handing in `B.t()` instead of materializing a transposed copy.
+    assert B.is_contiguous() or B.t().is_contiguous(), (
+        "B must be contiguous or a transposed view of a contiguous tensor, got strides "
+        f"{tuple(B.stride())} for shape {tuple(B.shape)}"
+    )
     WEIGHT_VALUES_PER_BYTE = NIBBLES_PER_BYTE if B.dtype == torch.int8 else 1
 
     rows, K_b = B.shape
@@ -1364,18 +1380,7 @@ def mx_dynamic_matmul(
     # the op never swizzles in the hot path. The recipe is the scale dtype (E4M3 = NVFP4 group-16,
     # UE8M0 = MX group-32). SWIZZLED_SCALES governs both operands (a swizzled weight is paired with
     # swizzled acts). Callers wanting the tcgen05 fast path pre-swizzle the weight (5D).
-    # The gate|up artifact carries its interleave in the shape (6D): GATE kernels read the
-    # block pairs natively; a plain launch remaps its block index in-kernel (the
-    # INTERLEAVED_SCALES constexpr). Gate|up fusion REQUIRES the artifact — one layout.
-    interleaved = Bs.ndim == 6
-    if interleaved:
-        Bs = Bs.reshape(Bs.shape[0], -1, *Bs.shape[3:])
     swizzled_scales = Bs.ndim == 5
-    if gate and swizzled_scales:
-        assert interleaved, (
-            "gate|up swizzled scales must be the gate-interleaved artifact "
-            "(swizzle_mx_scales(..., gate=True))"
-        )
     scale_group = mx_scale_family(Bs, K)
     if not swizzled_scales:
         assert Bs.shape == (rows, K // scale_group), (
@@ -1504,6 +1509,7 @@ def mx_dynamic_matmul(
             A_q.stride(0),
             A_q.stride(1),
             as_u8.stride(0),  # As row stride (affine act-scale read; dead on the swizzled arm)
+            as_u8.stride(-1),  # As group-axis stride (1 when row-major; see stride_as_k)
             b_u8.stride(1),
             b_u8.stride(0),
             bs_u8.stride(1),
@@ -1515,7 +1521,6 @@ def mx_dynamic_matmul(
             SCALE_GROUP_K=scale_group,
             INPUT_RECIPE=input_recipe,
             SWIZZLED_SCALES=swizzled_scales,
-            INTERLEAVED_SCALES=interleaved and not gate,
             SWIZZLED_OUT=swizzled_out,
             GATE=gate,
             ACT_FN=act_fn,

@@ -278,9 +278,10 @@ def resolve_grouped_tile_packed(
     else:
         out_row = offs_global_m
     expert_id64 = expert_id.to(tl.int64)
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
-    n_off = pid_n * BLOCK_SIZE_N
+    WEIGHT_ROWS: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    offs_bn = pid_n * WEIGHT_ROWS + tl.arange(0, WEIGHT_ROWS)
+    row0 = expert_id64.to(tl.int32)
+    n_off = pid_n * WEIGHT_ROWS
     m_start = tl.min(in_row).to(tl.int32)
     return pid_n, expert_id, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start
 
@@ -328,9 +329,10 @@ def resolve_grouped_tile(
     else:
         out_row = offs_global_m
     expert_id64 = expert_id.to(tl.int64)
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    row0 = (expert_id64 * (2 if GATE else 1)).to(tl.int32)
-    n_off = pid_n * BLOCK_SIZE_N
+    WEIGHT_ROWS: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    offs_bn = pid_n * WEIGHT_ROWS + tl.arange(0, WEIGHT_ROWS)
+    row0 = expert_id64.to(tl.int32)
+    n_off = pid_n * WEIGHT_ROWS
     m_start = tl.min(in_row).to(tl.int32)
     return pid_n, expert_id, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start
 

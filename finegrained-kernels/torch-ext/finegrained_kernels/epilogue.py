@@ -153,14 +153,13 @@ def split_gate_up(
     BLOCK_SIZE_N: tl.constexpr,
     SWAP_AB: tl.constexpr,
 ):
-    """Bookend to the stacked gate|up accumulator: finalize it (swap MMA col-0 collapse or
-    pass-through, via ``acc_finalize``) and split the stacked N extent back into the
-    ``(gate, up)`` pair, each ``[rows, BN]`` (rows = 1 under swap, else BM). Gate was stacked
-    first (see ``flatten_weight_tile``)."""
+    """Bookend to the gate|up accumulator: finalize it (swap MMA col-0 collapse or pass-through,
+    via ``acc_finalize``) and de-interleave the doubled N extent into the ``(gate, up)`` pair, each
+    ``[rows, BN]`` (rows = 1 under swap, else BM). The accumulator's N axis alternates gate/up per
+    column, so this is a trailing-axis split."""
     rows: tl.constexpr = 1 if SWAP_AB else BLOCK_SIZE_M
     flat = acc_finalize(acc, COMPUTE_MODE, 2 * BLOCK_SIZE_N, SWAP_AB)
-    pair = tl.permute(tl.reshape(flat, (rows, 2, BLOCK_SIZE_N)), (0, 2, 1))
-    g, u = tl.split(pair)
+    g, u = tl.split(tl.reshape(flat, (rows, BLOCK_SIZE_N, 2)))
     return g, u
 
 
@@ -242,7 +241,7 @@ def glu(
 
 @triton.jit
 def _glu_kernel(
-    GateUp,  # (S, 2I) stacked [gate|up] GEMM output; fp32 = exact accumulators (fused order)
+    GateUp,  # (S, 2I) interleaved [g0,u0,g1,u1,...] GEMM output; fp32 = exact accumulators
     Out,  # (S, I) activation-dtype GLU result; the E4M3 tensor under the requant arm
     QuantScales,  # block-FP8 requant arm (``fused_glu(quant_group=...)``): per-``QUANT_GROUP``
     #             scales (fp32, or UE8M0 exponent bytes); ``None`` folds the arm out — the GLU
@@ -256,14 +255,15 @@ def _glu_kernel(
     QUANT_GROUP: tl.constexpr = 128,
     UE8M0: tl.constexpr = False,
 ):
-    """Fused GLU over a contiguous (S, 2I) [gate|up] tensor -> (S, I), covering every
+    """Fused GLU over a contiguous (S, 2I) interleaved gate|up tensor -> (S, I), covering every
     ``apply_glu`` variant (silu/gelu/relu, ``SWIGLU_ALPHA``/``SWIGLU_LIMIT`` clamped-SwiGLU
     — ``None`` folds the arm out, the in-kernel ``glu``'s convention). Rounds through the
     output dtype after each op exactly where the torch chain does (each torch tensor op
     materializes), so the two are bit-identical."""
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n_out
-    base = (offs // I) * 2 * I + offs % I
+    # gate|up columns alternate (gate 2j, up 2j+1) — the interleaved row order the GEMM emits
+    base = (offs // I) * 2 * I + 2 * (offs % I)
     # fp32 input = exact GEMM accumulators (the unstacked fused-order path): compute the
     # GLU in fp32 and round ONCE at the store — the gated epilogue's math. Narrow inputs
     # keep the torch-chain per-op rounding (bit-identical to apply_glu).
@@ -271,7 +271,7 @@ def _glu_kernel(
     dt = tl.float32 if FUSED_ORDER else (
         tl.bfloat16 if QuantScales is not None else Out.dtype.element_ty)
     g = tl.load(GateUp + base, mask=mask).to(tl.float32)
-    u = tl.load(GateUp + base + I, mask=mask).to(tl.float32)
+    u = tl.load(GateUp + base + 1, mask=mask).to(tl.float32)
     if SWIGLU_LIMIT is not None:
         g = tl.minimum(g, SWIGLU_LIMIT)
         u = tl.clamp(u, -SWIGLU_LIMIT, SWIGLU_LIMIT)
@@ -318,7 +318,7 @@ def fused_glu(
     use_ue8m0: bool = False,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """GLU over the stacked (S, 2I) [gate|up] GEMM output — the one-kernel ``_glu_kernel``
+    """GLU over the interleaved (S, 2I) gate|up GEMM output — the one-kernel ``_glu_kernel``
     on a contiguous tensor, the torch ``apply_glu`` on any fallback layout; bit-identical
     either way. ``quant_group`` additionally block-FP8-requantizes the result per group in
     the same kernel (the unstacked decode band's handoff to the down projection) and
@@ -353,7 +353,7 @@ def fused_glu(
                 gate_up, out, None, n, I, act_fn, swiglu_alpha, swiglu_limit, BLOCK=1024
             )
         return out
-    gate, up = gate_up.chunk(2, dim=-1)
+    gate, up = gate_up[..., 0::2], gate_up[..., 1::2]
     return apply_glu(gate, up, act_fn, swiglu_alpha, swiglu_limit)
 
 

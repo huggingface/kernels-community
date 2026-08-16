@@ -43,8 +43,6 @@ from .epilogue import *  # noqa: F401,F403
 #     scalar "scalar" -> BM=1   the scalar GEVM broadcasts wrong at BM>1 (config builder)
 #     descriptor_needs_prequant_pruner  raw-A inline-quant arm reads a_ptrs, dead under a
 #                               descriptor mode — static 2D
-#     gate_pointer_only_pruner  one contiguous descriptor box can't span the gate|up rows
-#                               N apart — 2D kernels (bd/static/mx/weight-only), GATE-gated
 #     weight_only_swap_scope_pruner  SWAP_AB iff COMPUTE_MODE == "scalar" — the swapped dot
 #                               arms are unimplemented and a non-swapped scalar has no
 #                               accumulator shape — weight-only batched
@@ -819,8 +817,6 @@ def scalar_max_m_pruner(m_arg: str, max_m: int = 64):
 
     return config_filter(ok, when=lambda args: args[m_arg] > max_m)
 
-
-
 def matched_memory_modes_pruner():
     """Drop configs that mix pointer and descriptor operand loads — for a DENSE 2D GEMM
     only (contiguous A, whole M in one tile). Measured across M=1..8192 on the block-scale
@@ -836,19 +832,6 @@ def matched_memory_modes_pruner():
         return a_ptr == b_ptr
 
     return config_filter(ok)
-
-
-
-def gate_pointer_only_pruner():
-    """Keep only pointer-mode weight configs under gate|up fusion. The stacked gate|up weight has
-    the gate rows at ``[0,N)`` and up at ``[N,2N)`` — N apart — which a single contiguous descriptor
-    box can't span; the pointer arm (``weight_tile_ptrs``) folds the N-offset in. (A ``(2,N,K)`` box
-    would let the descriptor arm span both — a perf follow-up.) Gated on the launch's ``GATE``."""
-
-    def ok(c, args):
-        return c.kwargs.get("B_MEMORY_MODE", "pointer") == "pointer"
-
-    return config_filter(ok, when=lambda args: args.get("GATE", False))
 
 
 
@@ -888,6 +871,12 @@ def descriptor_box_pruner(k_dim="BLOCK_SIZE_K"):
                 2 if getattr(args.get("B"), "dtype", None) == torch.uint8 else 1
             )
             if bk // weight_vpb > 256 or config_dim(c, args, "BLOCK_SIZE_N") > 256:
+                return False
+            # A TMA descriptor needs a unit-stride innermost dim; a transposed operand
+            # (column-major view, as a backward pass hands in) has none, so only the
+            # pointer arm can serve it. The kernel itself is stride-general.
+            b = args.get("B")
+            if b is not None and getattr(b, "ndim", 0) == 2 and b.stride(-1) != 1:
                 return False
         if c.kwargs.get("A_MEMORY_MODE", "pointer") != "pointer":
             # descriptor A, both arms tuner-routed per the tokens-per-expert key:

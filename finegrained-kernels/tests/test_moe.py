@@ -167,7 +167,7 @@ def _make_moe_weights(problem: MoEProblem):
         problem.hidden_dim, problem.intermediate_dim, problem.num_experts
     )
     if problem.swizzled:
-        gate_up_s = swizzle_mx_scales(gate_up_s, gate=True)
+        gate_up_s = swizzle_mx_scales(gate_up_s)
         down_s = swizzle_mx_scales(down_s)
     return gate_up, gate_up_s, gate_up_g, down, down_s, down_g
 

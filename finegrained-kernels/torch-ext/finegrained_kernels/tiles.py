@@ -43,11 +43,15 @@ def swizzle_offsets(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     WEIGHT_VALUES_PER_BYTE: tl.constexpr = 1,
+    GATE: tl.constexpr = False,
 ):
     """2D-grid tile scheduling shared by the kernels below: grouped-swizzle the
     ``(pid_m, pid_n)`` program ids for L2 locality on B, then build the operand offset
     vectors. Returns ``(pid_m, pid_n, offs_am, offs_bn, offs_k)`` — the swizzled ids
     (reused by the output store) and the ``%``-wrapped row/col offsets plus the K range.
+
+    ``offs_bn`` is the WEIGHT-side row range: under ``GATE`` the doubled span
+    ``[2*pid_n*BN, 2*(pid_n+1)*BN)`` wrapped at ``2N``. The grid is sized by the OUTPUT tiles.
 
     The swizzle keeps the B (weight) column-tile L2-hot while the co-scheduled rows reuse it,
     so the depth cap is set by the WEIGHT footprint, capped at ``min(num_pid_m, .)``. With
@@ -73,8 +77,9 @@ def swizzle_offsets(
     group_size_m = min(num_pid_m - first_pid_m, max_group)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
+    WEIGHT_ROWS: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_bn = (pid_n * WEIGHT_ROWS + tl.arange(0, WEIGHT_ROWS)) % (2 * N if GATE else N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     return pid_m, pid_n, offs_am, offs_bn, offs_k
 
@@ -154,7 +159,7 @@ def load_grouped_weight_tile(
     """One K-major (optionally gate|up-stacked) MX weight K-tile for the grouped / batched loop:
     the explicit-pointer tile flattened to the ``[KB, (2|1)*BN]`` rhs (or, under ``SWAP_AB``, the
     ``[(2|1)*BN, KB]`` rows-major lhs — the batched-decode orientation), or the ``[(2|1), BN, KB]``
-    descriptor box over the ``(2E|E, N, K_bytes)`` weight view, reshaped and transposed to the same
+    descriptor box over the ``(E, 2N|N, K_bytes)`` weight view, reshaped and transposed to the same
     form (the fused-era TMA arm: natural orientation + per-iteration trans; grouped/2D never swap).
     Single return — only the taken arm compiles; the caller advances ``w_ptrs`` and passes the box
     offsets either way."""
@@ -200,19 +205,9 @@ def matmul_weight_ptrs(
     B_MEMORY_MODE: tl.constexpr,
     SWAP_AB: tl.constexpr = False,
 ):
-    """Prologue weight-tile pointers, folding the gate|up-stack branch: under ``GATE`` the stacked
-    (2N, K) gate|up tile (``weight_tile_ptrs``, up block ``N`` rows away), else the plain single
-    tile via ``operand_tile_ptrs`` (which also folds the descriptor-vs-pointer arm). The
-    weight analogue of the activation's single ``operand_tile_ptrs`` call. SINGLE-EXIT (one
-    trailing return): multiple early ``if CONSTEXPR: return`` would type-check the dead arm and
-    fail under GATE (Triton 3.7.1)."""
-    if GATE:
-        ptrs = weight_tile_ptrs(
-            B, offs_n, offs_k, N * stride_b_n, stride_b_n, stride_b_k, GATE, SWAP_AB
-        )
-    else:
-        ptrs = operand_tile_ptrs(B, offs_n, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
-    return ptrs
+    """Prologue weight-tile pointers via ``operand_tile_ptrs`` (which folds the
+    descriptor-vs-pointer arm); ``offs_n`` carries the gate|up span."""
+    return operand_tile_ptrs(B, offs_n, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
 
 
 @triton.jit
@@ -315,7 +310,6 @@ def _weight_scale_mx(
     GROUPED: tl.constexpr, GATE: tl.constexpr, PER_EXPERT: tl.constexpr,
     SWIZZLED_SCALES: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
     SCALE_COLS: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
-    INTERLEAVED_SCALES: tl.constexpr = False,
     k_col_off=0,
 ):
     """MX weight-scale K-tile ``(rows, SCALE_COLS)``. Grouped: pre-swizzled SWIZZLE_32_4_4 via the
@@ -326,33 +320,32 @@ def _weight_scale_mx(
     descriptor bulk-load (BN=128) else the bounds-masked affine pointer."""
     if GROUPED:
         if SWIZZLED_SCALES:
-            NREP: tl.constexpr = (2 if GATE else 1) * (BLOCK_SIZE_N // 128)
             NW: tl.constexpr = (2 if GATE else 1) * BLOCK_SIZE_N
+            # REP counts the tile's whole 128-row blocks, so it derives from the DOUBLED extent:
+            # BN=64 under GATE is one 128-row block, not 2 * (64 // 128) == 0
+            NREP: tl.constexpr = max(1, NW // 128)
             b_s = load_swizzled_scale(
                 bs_descriptor, blk_idx, k, NREP, SCALE_COLS // 4, NW, SCALE_COLS
             )
         else:  # affine per-group read off the un-swizzled 3D Bs (num_experts, n_rows, K//g)
+            NW: tl.constexpr = (2 if GATE else 1) * BLOCK_SIZE_N
             base = bs_ptrs + expert_id * stride_bs_e
-            offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            # clamp rather than mask (a masked load's other=0.0 blocks WS lowering): a partial
+            # last N-tile reads a clamped scale the epilogue masks off via N_COLS
+            offs_bn = tl.minimum(
+                pid_n * NW + tl.arange(0, NW), ((2 if GATE else 1) * N) - 1
+            )
             offs_sf = k * SCALE_COLS + k_col_off + tl.arange(0, SCALE_COLS)
-            if GATE:
-                rows2 = tl.arange(0, 2)[:, None] * N + offs_bn[None, :]
-                b_s = tl.reshape(
-                    tl.load(base + rows2[:, :, None] * stride_bs_n + offs_sf[None, None, :] * stride_bs_k),
-                    (2 * BLOCK_SIZE_N, SCALE_COLS),
-                )
-            else:
-                b_s = tl.load(base + offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k)
+            b_s = tl.load(base + offs_bn[:, None] * stride_bs_n + offs_sf[None, :] * stride_bs_k)
     elif GATE or PER_EXPERT:  # 2D-GATE (expert 0) / batched decode: per-(expert, N, K) scale leaf
         b_s = load_weight_scale_tile(
             SWIZZLED_SCALES, bs_descriptor, bs_ptr, expert_id, pid_n, k, N, K,
             stride_bs_e, stride_bs_n, stride_bs_k, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K, GATE,
-            INTERLEAVED=INTERLEAVED_SCALES, k_col_off=k_col_off,
+            k_col_off=k_col_off,
         )
     elif SWIZZLED_SCALES:  # pre-swizzled SWIZZLE_32_4_4 scale — descriptor at BN=128, gather below
         b_s = load_swizzled_scale_tile(
             bs_descriptor, bs_ptr, 0, pid_n, k, N, K, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K,
-            INTERLEAVED=INTERLEAVED_SCALES,
         )
     elif bs_mask is None:  # weight-only 2D: N-clamped in-bounds ptrs, UNMASKED (no other=0.0 constant
         b_s = tl.load(bs_ptrs)  # -> the K-loop warp-specialization-lowers; tail N masked in epilogue)
@@ -438,7 +431,6 @@ def load_weight_mx(
     B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr, SWIZZLED_SCALES: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
     WEIGHT_VALUES_PER_BYTE: tl.constexpr,
-    INTERLEAVED_SCALES: tl.constexpr = False,
     k_col_off=0,
 ):
     """The MX weight path: value tile + pre-swizzled/affine group scale. ``k_col_off`` shifts the
@@ -449,8 +441,7 @@ def load_weight_mx(
     w_s = _weight_scale_mx(
         bs_ptrs, bs_mask, bs_descriptor, bs_ptr, blk_idx, expert_id, pid_n, k, N, K,
         stride_bs_e, stride_bs_n, stride_bs_k,
-        GROUPED, GATE, PER_EXPERT, SWIZZLED_SCALES, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K,
-        INTERLEAVED_SCALES=INTERLEAVED_SCALES, k_col_off=k_col_off,
+        GROUPED, GATE, PER_EXPERT, SWIZZLED_SCALES, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K, k_col_off=k_col_off,
     )
     return w, w_s
 
@@ -544,37 +535,13 @@ def weight_tile_ptrs(
     base,
     offs_n,
     offs_k,
-    block_stride,
     stride_n,
     stride_k,
-    GATE: tl.constexpr,
     SWAP_AB: tl.constexpr,
 ):
-    """Weight-tile pointers oriented by ``SWAP_AB``, gated by ``GATE`` — the gate_up
-    counterpart of ``oriented_tile_ptrs``. With ``GATE`` a leading axis indexes the
-    {gate, up} row block (up offset by ``block_stride``), placed so
-    ``flatten_weight_tile``'s plain reshape yields the 2D stacked tile: swap
-    ``[2, N, K]`` (output rows in the MMA M dim), no-swap ``[K, 2, N]`` (K-major, gate|up
-    along the MMA N dim — the grouped kernel's combined form). Without ``GATE`` it is the
-    plain single 2D tile (``block_stride`` unused), delegated to ``oriented_tile_ptrs``. The
-    per-step K-advance is the same scalar stride step in every orientation."""
-    if GATE:
-        blk = tl.arange(0, 2) * block_stride
-        if SWAP_AB:
-            ptrs = base + (
-                blk[:, None, None]
-                + offs_n[None, :, None] * stride_n
-                + offs_k[None, None, :] * stride_k
-            )
-        else:
-            ptrs = base + (
-                offs_k[:, None, None] * stride_k
-                + blk[None, :, None]
-                + offs_n[None, None, :] * stride_n
-            )
-    else:
-        ptrs = oriented_tile_ptrs(base, offs_n, offs_k, stride_n, stride_k, SWAP_AB)
-    return ptrs
+    """Weight-tile pointers oriented by ``SWAP_AB``. A gate|up tile is a ``2*BN`` row span
+    (``offs_n`` carries it); the epilogue splits the projections."""
+    return oriented_tile_ptrs(base, offs_n, offs_k, stride_n, stride_k, SWAP_AB)
 
 
 @triton.jit

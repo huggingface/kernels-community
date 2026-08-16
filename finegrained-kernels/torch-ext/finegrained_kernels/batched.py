@@ -213,18 +213,16 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     # One scale per quant block, broadcast over the tile, so an N tile narrower than BLOCK_N just
     # reads its own block: tile pid_n sits in block (pid_n * BLOCK_SIZE_N) // BLOCK_N, which is pid_n
     # when the tile IS the block. Narrower tiles multiply the N grid (see scale_subblock_pruner).
-    n_blocks = tl.cdiv(N, BLOCK_N)
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_bn = pid_n * n_width + tl.arange(0, n_width)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_k, stride_a_m, stride_a_k, "pointer", True)
     as_ptrs = As + in_row * stride_as_m + tl.zeros((BLOCK_SIZE_M,), tl.int32)
-    # One stacked gate|up weight tile (gate rows [0,N), up rows [N,2N)) + one block-scale pointer,
-    # like every other kernel. The up block scale sits n_blocks blocks after gate; folding that
-    # into the per-weight-row load offset (tl.where) lets gate|up share a tile + a single dot.
-    b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, N * stride_b_n, stride_b_n, stride_b_k, GATE, SWAP_AB)
-    bs_ptr = Bs + (pid_n * BLOCK_SIZE_N // BLOCK_N) * stride_bs_n
-    bs_off = tl.where(tl.arange(0, n_width) < BLOCK_SIZE_N, 0, n_blocks * stride_bs_n)
+    # One gate|up weight tile + one block-scale pointer, like every other kernel: the n_width
+    # span shares a tile + a single dot, each row's scale block following from its global row.
+    b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
+    bs_ptr = Bs + (pid_n * n_width // BLOCK_N) * stride_bs_n
+    bs_off = ((pid_n * n_width % BLOCK_N + tl.arange(0, n_width)) // BLOCK_N) * stride_bs_n
     acc = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -330,16 +328,15 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
         return
 
     # the N tile may subdivide the quant block — see the dynamic sibling / scale_subblock_pruner
-    n_blocks = tl.cdiv(N, BLOCK_N)
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_bn = pid_n * n_width + tl.arange(0, n_width)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_k, stride_a_m, stride_a_k, "pointer", True)
     # One stacked gate|up weight tile (gate rows [0,N), up rows [N,2N)) + one block-scale pointer;
-    # the up block scale sits n_blocks blocks after gate (tl.where on the load offset).
-    b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, N * stride_b_n, stride_b_n, stride_b_k, GATE, SWAP_AB)
-    bs_ptr = Bs + (pid_n * BLOCK_SIZE_N // BLOCK_N) * stride_bs_n
-    bs_off = tl.where(tl.arange(0, n_width) < BLOCK_SIZE_N, 0, n_blocks * stride_bs_n)
+    # each weight row's scale block follows from its global row.
+    b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
+    bs_ptr = Bs + (pid_n * n_width // BLOCK_N) * stride_bs_n
+    bs_off = ((pid_n * n_width % BLOCK_N + tl.arange(0, n_width)) // BLOCK_N) * stride_bs_n
     acc = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -467,12 +464,13 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 # implemented for future shapes but is not fielded. Swap verdicts are B200 (sm_100) — re-measure
 # on H100 or the target device before inheriting.
 def _rebind_batched_mx_bs_descriptor(nargs):
-    """Per-config pre_hook: size the swizzled weight-scale descriptor box to one 128-row block
-    (the BN=128 fp4 dot_scaled bulk load). BN<128 (fp8 scalar) pointer-gathers instead and never
-    reads the descriptor. Only under SWIZZLED_SCALES; the un-swizzled path keeps its dummy box."""
+    """Per-config pre_hook: size the swizzled weight-scale descriptor box to the tile's 128-row
+    blocks (doubled under GATE, whose tile spans 2*BN interleaved rows). BN<128 (fp8 scalar)
+    pointer-gathers instead and never reads the descriptor. Only under SWIZZLED_SCALES; the
+    un-swizzled path keeps its dummy box."""
     if not nargs.get("SWIZZLED_SCALES"):
         return
-    rep = max(1, nargs["BLOCK_SIZE_N"] // 128)
+    rep = max(1, ((2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"]) // 128)
     rep_k = (nargs["BLOCK_SIZE_K"] // nargs["SCALE_GROUP_K"]) // 4
     nargs["BSDescriptor"].block_shape = [1, rep, rep_k, 2, 256]
 
@@ -495,7 +493,7 @@ def _rebind_batched_mx_bs_descriptor(nargs):
     # hand its winner to a GATE=True launch at the same shape).
     # OUTPUT_RECIPE keys the requant epilogue explicitly (the C/Cs dtype append splits it
     # incidentally today; this kernel's requant Cs is always row-major — no SWIZZLED_OUT axis).
-    ["N", "K", "S", "INPUT_RECIPE", "SWIZZLED_SCALES", "INTERLEAVED_SCALES", "GATE", "OUTPUT_RECIPE"],
+    ["N", "K", "S", "INPUT_RECIPE", "SWIZZLED_SCALES", "GATE", "OUTPUT_RECIPE"],
     n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BK-within-K + the sm_10x MMA-shape guards (swapped dot_scaled needs BN >= 128 for the
@@ -564,7 +562,6 @@ def mx_dynamic_matmul_batched_kernel(
     # single Bs pointer (+ BSDescriptor for the BN=128 bulk load); un-swizzled Bs takes the affine
     # arm in the same leaf. The op never swizzles — a 3D caller runs un-swizzled at no penalty.
     SWIZZLED_SCALES: tl.constexpr = False,
-    INTERLEAVED_SCALES: tl.constexpr = False,  # plain read of the gate|up-interleaved artifact (6D): remap blocks
 ):
     """Unified batched microscaled expert matmul (MXFP8/MXFP4/NVFP4, W4A8/W4A4) with
     fused act quant.
@@ -606,7 +603,7 @@ def mx_dynamic_matmul_batched_kernel(
     # never reads past the expert's N rows; the wrapped columns' output is masked off (N_COLS)
     # in the epilogue. Inert when N % BLOCK_SIZE_N == 0 (the affine arm's BN|N veto), so it is
     # load-bearing only for the swizzled arm, whose scale rides pid_n's block index, not offs_bn.
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_bn = (pid_n * n_width + tl.arange(0, n_width)) % (2 * N if GATE else N)
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
     offs_ka = tl.arange(0, BLOCK_SIZE_K // ACT_VALUES_PER_BYTE)
@@ -626,7 +623,7 @@ def mx_dynamic_matmul_batched_kernel(
     # GATE stacks gate|up into one weight tile (the up block sits N rows away), oriented by
     # SWAP_AB; load_weight reads value + scale (swizzled/un-swizzled hidden) off these pointers.
     b_ptrs = weight_tile_ptrs(
-        B, offs_bn, offs_kb, N * stride_b_n, stride_b_n, stride_b_k, GATE, SWAP_AB
+        B, offs_bn, offs_kb, stride_b_n, stride_b_k, SWAP_AB
     )
     accumulator = acc_init(COMPUTE_MODE, BLOCK_SIZE_M, n_width, SWAP_AB)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -640,7 +637,6 @@ def mx_dynamic_matmul_batched_kernel(
             stride_bs_e, stride_bs_n, stride_bs_k,
             GATE, False, True, "pointer", SWAP_AB, SWIZZLED_SCALES,
             BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
-            INTERLEAVED_SCALES=INTERLEAVED_SCALES,
         )
         accumulator = mx_compute(
             accumulator, a, a_scale, b, b_s, COMPUTE_MODE,
@@ -739,14 +735,14 @@ def mx_weight_only_matmul_batched_kernel(
     if expert_id >= num_experts:  # EP sentinel: non-local expert, output left uninit
         return
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_bn = pid_n * n_width + tl.arange(0, n_width)
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
     a_ptrs = operand_tile_ptrs(
         A, tl.arange(0, BLOCK_SIZE_M) * 0, tl.arange(0, BLOCK_SIZE_K),
         stride_a_m, stride_a_k, "pointer", True,
     )
     b_ptrs = weight_tile_ptrs(
-        B, offs_bn, offs_kb, N * stride_b_n, stride_b_n, stride_b_k, GATE, SWAP_AB
+        B, offs_bn, offs_kb, stride_b_n, stride_b_k, SWAP_AB
     )
     accumulator = acc_init(COMPUTE_MODE, BLOCK_SIZE_M, n_width, SWAP_AB)
     # Each trip indexes off the BASE tile by the scalar ``k_start`` rather than advancing a
@@ -870,13 +866,13 @@ def full_precision_matmul_batched_kernel(
         return
 
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_bn = pid_n * n_width + tl.arange(0, n_width)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_k, stride_a_m, stride_a_k, "pointer", True)
     # GATE stacks gate|up into one weight tile (the up block sits N rows away);
     # GATE=False -> the plain oriented tile.
     b_ptrs = weight_tile_ptrs(
-        B, offs_bn, offs_k, N * stride_b_n, stride_b_n, stride_b_k, GATE, SWAP_AB
+        B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB
     )
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
@@ -1293,7 +1289,7 @@ def mx_dynamic_matmul_batched(
     A:  (rows, K) activations — raw bf16/fp16/fp32 (inline-quant) or pre-quantized E4M3
     expert_ids: (S,) which expert each routed row uses
     """
-    assert A.ndim == 2 and B.ndim == 3 and Bs.ndim in (3, 5, 6)  # 5D = pre-swizzled; 6D = gate|up artifact
+    assert A.ndim == 2 and B.ndim == 3 and Bs.ndim in (3, 5)  # 5D = pre-swizzled
     assert expert_ids.ndim == 1
     # A raw (As None) -> quantized inline in the kernel (decode-free UE8M0); pre-quantized
     # (As given, e.g. the down reading a requantized intermediate) -> loaded with its scales
@@ -1343,17 +1339,7 @@ def mx_dynamic_matmul_batched(
     # checkpoint layout swizzled once at model load (the deployment contract, no per-call
     # rearrange). The recipe is the scale dtype (E4M3 = NVFP4 group-16, UE8M0 = MX group-32); the
     # swizzled cols encode (K // scale_group) // 4.
-    # 6D = the gate|up artifact (interleave carried in the shape): GATE reads block pairs
-    # natively, a plain launch remaps in-kernel; gate|up fusion requires the artifact.
-    interleaved = Bs.ndim == 6
-    if interleaved:
-        Bs = Bs.reshape(Bs.shape[0], -1, *Bs.shape[3:])
     swizzled_scales = Bs.ndim == 5
-    if gate and swizzled_scales:
-        assert interleaved, (
-            "gate|up swizzled scales must be the gate-interleaved artifact "
-            "(swizzle_mx_scales(..., gate=True))"
-        )
     scale_group = mx_scale_family(Bs, K)
     if not swizzled_scales:
         assert Bs.shape == (num_experts, n_rows, K // scale_group), (
@@ -1447,7 +1433,6 @@ def mx_dynamic_matmul_batched(
             SCALE_GROUP_K=scale_group,
             num_experts=num_experts,
             SWIZZLED_SCALES=swizzled_scales,
-            INTERLEAVED_SCALES=interleaved and not gate,
             INPUT_RECIPE=input_recipe,
             GATE=gate,
             ACT_FN=act_fn,
