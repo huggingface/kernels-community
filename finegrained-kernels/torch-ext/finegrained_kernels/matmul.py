@@ -88,7 +88,7 @@ def _rebind_bd_descriptors(nargs):
     """Per-config pre_hook: set the A and B host-TMA boxes to the tuned tile over the
     ``(rows, K)`` matrices — ``[BLOCK_SIZE_M, block_k]`` and ``[BLOCK_SIZE_N, block_k]``."""
     _rebind_operand_box(nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], nargs["block_k"])
-    _rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", nargs["BLOCK_SIZE_N"], nargs["block_k"])
+    _rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], nargs["block_k"])
 
 
 def _rebind_weight_only_descriptors(nargs):
@@ -99,7 +99,7 @@ def _rebind_weight_only_descriptors(nargs):
     wvpb = 2 if nargs["B"].dtype == torch.uint8 else 1
     bk = nargs["BLOCK_SIZE_K"]
     _rebind_operand_box(nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], bk)
-    _rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", nargs["BLOCK_SIZE_N"], bk // wvpb)
+    _rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], bk // wvpb)
 
 
 def _rebind_mx_descriptors(nargs):
@@ -111,7 +111,7 @@ def _rebind_mx_descriptors(nargs):
     wvpb = 2 if nargs["B"].dtype == torch.uint8 else 1
     bk = nargs["BLOCK_SIZE_K"]
     _rebind_operand_box(nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], bk // avpb)
-    _rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", nargs["BLOCK_SIZE_N"], bk // wvpb)
+    _rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], bk // wvpb)
     # SWIZZLE_32_4_4 scale boxes: [1, BLOCK//128, (BK // SCALE_GROUP_K) // 4, 2, 256]. Only where the
     # scale is actually swizzled — else the SA/SB descriptor is a dummy aliased to the operand
     # descriptor, and stamping a scale box would clobber its [BM, BK] operand box. The weight is
@@ -276,7 +276,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
         stride_b_k,
         BLOCK_SIZE_N,
         block_k,
-        B_MEMORY_MODE,
+        B_MEMORY_MODE, GATE,
     )
     # Explicit operand-tile pointers on the pointer arm; a scalar placeholder on a descriptor
     # arm (which reads its box via the descriptor — the [BM,BK]/[BK,BN] index tensor would stay
@@ -286,7 +286,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # (gate rows [0,N), up rows offset by N//block_n scale blocks) — the block_dynamic_dot broadcast
     # then folds it per row exactly as in the dense case.
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, not SWAP_AB)
-    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, N, stride_b_n, stride_b_k, GATE, B_MEMORY_MODE, SWAP_AB)
+    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
     # the scale-index gather decouples the tile from the scale grid: a wide tile spans several
     # scale columns, a narrow one shares a column
     bs_ptrs = Bs + (offs_bn_lin // block_n) * stride_bs_n
@@ -298,7 +298,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
             0, 0, A_MEMORY_MODE, False, False, SWAP_AB,
         )
         b, b_s = load_weight_block_dynamic(
-            b_ptrs, b_descriptor, bs_ptrs, bs_mask, 0, 0, pid_n * BLOCK_SIZE_N, k * block_k, 0, 0,
+            b_ptrs, b_descriptor, bs_ptrs, bs_mask, 0, 0, pid_n * n_width, k * block_k, 0, 0,
             GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, block_k,
         )
         accumulator = block_dynamic_dot(
@@ -395,14 +395,13 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     Uses a 2D grid with swizzle for L2 cache locality on B tiles.
     """
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
-    n_rows = 2 * N if GATE else N
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GATE=GATE
     )
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, "pointer", True)
     # Under GATE the weight is the stacked (2N, K) gate|up tile; one per-tensor weight scale
     # covers both projections, applied (with the per-row act scale) before the GLU split.
-    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, N, stride_b_n, stride_b_k, GATE, "pointer")
+    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, "pointer")
 
     a_s = tl.load(As + offs_am * stride_as_m)
     b_s = tl.load(Bs)
@@ -412,7 +411,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
         a, _as = load_act_plain(a_ptrs, a_ptrs, 0, 0, None, 0, "pointer", False)
         b, _bs = load_weight_plain(
-            b_ptrs, b_ptrs, 0, pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K,
+            b_ptrs, b_ptrs, 0, pid_n * n_width, k * BLOCK_SIZE_K,
             GATE, False, "pointer", False, BLOCK_SIZE_N, BLOCK_SIZE_K,
         )
         accumulator = accumulator + fp8_dot(a, b, False, BLOCK_SIZE_K)
@@ -538,13 +537,13 @@ def w8a8_block_static_fp8_matmul_kernel(
         ADescriptor, A, M, K, stride_a_m, stride_a_k, BLOCK_SIZE_M, block_k, A_MEMORY_MODE
     )
     b_descriptor = operand_tile_descriptor(
-        BDescriptor, B, N, K, stride_b_n, stride_b_k, BLOCK_SIZE_N, block_k, B_MEMORY_MODE
+        BDescriptor, B, N, K, stride_b_n, stride_b_k, BLOCK_SIZE_N, block_k, B_MEMORY_MODE, GATE,
     )
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
     # Weight-scale index off the AFFINE column offset + a bounds mask (the %-wrapped offs_bn
     # from swizzle_offsets drives only the pointer operand tile); an affine gather avoids the
     # non-affine scale read the wrap induces, matching the block-dynamic kernel above.
-    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, N, stride_b_n, stride_b_k, GATE, B_MEMORY_MODE)
+    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE)
     offs_bn_lin = pid_n * n_width + tl.arange(0, n_width)
     bs_ptrs = Bs + (offs_bn_lin // block_n) * stride_bs_n
     bs_mask = offs_bn_lin < n_rows
@@ -557,7 +556,7 @@ def w8a8_block_static_fp8_matmul_kernel(
             A_MEMORY_MODE, False,
         )
         b, b_s = load_weight_static(
-            b_ptrs, b_descriptor, bs_ptrs, bs_mask, 0, 0, pid_n * BLOCK_SIZE_N, k * block_k, 0, 0,
+            b_ptrs, b_descriptor, bs_ptrs, bs_mask, 0, 0, pid_n * n_width, k * block_k, 0, 0,
             GATE, False, B_MEMORY_MODE, False, BLOCK_SIZE_N, block_k,
         )
         accumulator = static_dot(accumulator, a, b, b_s, False, block_k, False)
@@ -725,7 +724,6 @@ def mx_dynamic_matmul_kernel(
     ACT_VALUES_PER_BYTE: tl.constexpr = 2 if A.dtype.element_ty == tl.uint8 else 1
     WEIGHT_VALUES_PER_BYTE: tl.constexpr = 2 if B.dtype.element_ty == tl.uint8 else 1
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
-    n_rows = 2 * N if GATE else N
     SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
     offs_ka = tl.arange(0, BLOCK_SIZE_K // ACT_VALUES_PER_BYTE)
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
@@ -749,7 +747,7 @@ def mx_dynamic_matmul_kernel(
         )
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_ka, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
     b_ptrs = matmul_weight_ptrs(
-        B, offs_bn, offs_kb, N, stride_b_n, stride_b_k, GATE, B_MEMORY_MODE, SWAP_AB
+        B, offs_bn, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB
     )
 
     accumulator = acc_init(COMPUTE_MODE if SWAP_AB else "dot", BLOCK_SIZE_M, n_width, SWAP_AB)
@@ -761,7 +759,7 @@ def mx_dynamic_matmul_kernel(
             BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, INPUT_RECIPE,
         )
         b, b_s = load_weight_mx(
-            b_ptrs, BDescriptor, bs_ptrs, bs_mask, BSDescriptor, Bs, 0, pid_n * BLOCK_SIZE_N,
+            b_ptrs, BDescriptor, bs_ptrs, bs_mask, BSDescriptor, Bs, 0, pid_n * n_width,
             k * (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE), 0, 0, pid_n, k, N, K,
             0, stride_bs_n, stride_bs_k,
             GATE, False, False, B_MEMORY_MODE, SWAP_AB, SWIZZLED_SCALES,
@@ -894,7 +892,7 @@ def mx_weight_only_matmul_2d_kernel(
     )
     bs_mask = None
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
-    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_kb, N, stride_b_n, stride_b_k, GATE, B_MEMORY_MODE)
+    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE)
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
@@ -904,7 +902,7 @@ def mx_weight_only_matmul_2d_kernel(
             a_ptrs, ADescriptor, pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K, None, 0, A_MEMORY_MODE, False
         )
         b, b_s = load_weight_mx(
-            b_ptrs, BDescriptor, bs_ptrs, bs_mask, None, Bs, 0, pid_n * BLOCK_SIZE_N,
+            b_ptrs, BDescriptor, bs_ptrs, bs_mask, None, Bs, 0, pid_n * n_width,
             k * (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE), 0, 0, pid_n, k, N, K,
             0, stride_bs_n, stride_bs_k,
             GATE, False, False, B_MEMORY_MODE, False, False,
@@ -991,18 +989,17 @@ def full_precision_matmul_2d_kernel(
     ``GATE`` loads the stacked (2N, K) gate|up weight as one ``[BK, 2*BN]`` dot and applies the
     ``ACT_FN``/SwiGLU GLU; ``GATE=False`` is the plain dense GEMM. 2D grid with swizzle for L2 reuse."""
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
-    n_rows = 2 * N if GATE else N
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GATE=GATE
     )
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, "pointer", True)
-    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, N, stride_b_n, stride_b_k, GATE, "pointer")
+    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, "pointer")
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
         a = tl.load(a_ptrs)
         w, _ = load_weight_plain(
-            b_ptrs, b_ptrs, 0, pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K,
+            b_ptrs, b_ptrs, 0, pid_n * n_width, k * BLOCK_SIZE_K,
             GATE, False, "pointer", False, BLOCK_SIZE_N, BLOCK_SIZE_K,
         )
         accumulator = accumulator + fp8_dot(a, w, False, BLOCK_SIZE_K)

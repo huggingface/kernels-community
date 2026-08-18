@@ -49,6 +49,11 @@ NVFP4_SCALE_GROUP_K = 16
 # set ONLY while an opaque op's registered fake impl runs (shape inference); read by
 # compile_time_only_triton_wrap to no-op the kernel launches within
 _SKIP_LAUNCHES = contextvars.ContextVar("finegrained_kernels_skip_launches", default=False)
+# Plain mirror of the contextvar, read on the launch path. Dynamo cannot trace `ContextVar.get`
+# ("Unsupported method call ... method `get` of class `ContextVar`"), which broke tracing of every
+# non-opaque op; a module-level bool it can constant-fold. The contextvar stays authoritative for
+# set/reset (nesting, async isolation) — this only mirrors it for the read.
+_SKIP_LAUNCHES_MIRROR = False
 
 
 
@@ -75,7 +80,7 @@ def compile_time_only_triton_wrap(kernel):
     reach the launcher with FakeTensors ("RuntimeError when making fake tensor call";
     ``is_compiling`` is still true during fake prop, so they'd take the wrap_triton
     branch and hit the pre_hook assert that made them opaque in the first place)."""
-    if _SKIP_LAUNCHES.get():
+    if _SKIP_LAUNCHES_MIRROR:
 
         class _NoLaunch:
             def __getitem__(self, grid):
@@ -104,11 +109,14 @@ def compile_time_only_triton_op(name, mutates_args=(), opaque=False):
 
             @functools.wraps(fn)
             def fake_impl(*args, **kwargs):
+                global _SKIP_LAUNCHES_MIRROR
                 token = _SKIP_LAUNCHES.set(True)
+                prev, _SKIP_LAUNCHES_MIRROR = _SKIP_LAUNCHES_MIRROR, True
                 try:
                     return fn(*args, **kwargs)
                 finally:
                     _SKIP_LAUNCHES.reset(token)
+                    _SKIP_LAUNCHES_MIRROR = prev
 
             op.register_fake(fake_impl)
         else:

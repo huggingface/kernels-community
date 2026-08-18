@@ -270,7 +270,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
         as_ptrs = As + in_row * stride_as_m
         # GATE stacks gate (rows [0, N)) and up (rows [N, 2N)) into one [BK, 2*BN] tile — the
-        # up block sits N rows away (N = per-projection width). GATE=False -> plain [BK, BN].
+        # rows are interleaved, so the tile is one 2*BN span. GATE=False -> plain [BK, BN].
         b_ptrs = weight_tile_ptrs(
             B + expert_id64 * stride_b_e,
             offs_bn,
@@ -631,7 +631,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
         # GATE stacks gate|up into one [BK, 2*BN] tile (one per-tensor scale covers both);
-        # the up block sits N rows away. GATE=False -> the plain [BK, BN] tile.
+        # rows are interleaved, so the tile is one 2*BN span. GATE=False -> plain [BK, BN].
         b_ptrs = weight_tile_ptrs(
             B + expert_id64 * stride_b_e,
             offs_bn,
@@ -859,7 +859,7 @@ def mx_dynamic_matmul_grouped_kernel(
         offs_bn = offs_bn % (2 * N if GATE else N)
         kb_off = 0
         ka_off = 0
-        # GATE stacks the gate + up 128-blocks (the up block sits N rows away) into a 2*BN tile; a
+        # GATE reads the interleaved gate|up rows as one contiguous 2*BN tile; a
         # plain tile is the single BN block.
         b_ptrs = weight_tile_ptrs(
             B + expert_id64 * stride_b_e,
@@ -1223,7 +1223,7 @@ def full_precision_matmul_grouped_kernel(
                 Schedule, (tile_id + NUM_SMS) // num_n_tiles, total_m_tiles
             )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
-        # GATE stacks gate|up into one [BK, 2*BN] tile; the up block sits N rows away.
+        # GATE reads the interleaved gate|up rows as one [BK, 2*BN] tile.
         # GATE=False -> the plain [BK, BN] tile. Pointer arm — the descriptor modes
         # fetch the [BN, BK] box at row0 and transpose it instead.
         b_ptrs = weight_tile_ptrs(

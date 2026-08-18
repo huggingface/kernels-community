@@ -35,6 +35,7 @@ import os
 import random
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 
 import torch
 from typing import Dict, List
@@ -52,6 +53,22 @@ from triton.runtime.autotuner import (
 
 logger = logging.getLogger(__name__)
 
+# Env-gated host-execution counter (FINEGRAINED_AUTOTUNE_CALLCOUNT=<path>): every
+# BayesianAutotuner.run() call increments its kernel's tally, dumped to <path> at exit.
+# Discriminates cudagraph REPLAY (host code runs only at capture) from per-token
+# re-execution — the decode-gap forensics tool.
+_CALL_COUNTS = None
+if os.environ.get("FINEGRAINED_AUTOTUNE_CALLCOUNT"):
+    import atexit
+
+    _CALL_COUNTS = {}
+
+    def _dump_call_counts(path=os.environ["FINEGRAINED_AUTOTUNE_CALLCOUNT"]):
+        with open(path, "w") as f:
+            json.dump(_CALL_COUNTS, f, indent=1, sort_keys=True)
+
+    atexit.register(_dump_call_counts)
+
 
 class BayesianAutotuner(Autotuner):
     """Drop-in replacement for ``triton.runtime.autotuner.Autotuner`` that
@@ -62,6 +79,7 @@ class BayesianAutotuner(Autotuner):
         self,
         *args,
         n_trials: int = 80,
+        max_failures: int | None = None,
         n_startup_trials: int = 12,
         gamma: float = 0.25,
         refine: bool = True,
@@ -77,6 +95,15 @@ class BayesianAutotuner(Autotuner):
         # FINEGRAINED_AUTOTUNE_TRIALS env var (quick sweeps / exhaustive runs without touching
         # the decorators; set it >= grid size to fall back to stock exhaustive bench-all).
         self.n_trials = int(os.environ.get("FINEGRAINED_AUTOTUNE_TRIALS") or n_trials)
+        # A tune aborts once this many configs have failed to compile/run without the measured
+        # budget being met. Defaults to n_trials: a grid that cannot land its measurements without
+        # that many rejects has a pruner gap, and the fix is to fence the dead region rather than
+        # to tolerate the compiles. Its own axis so a kernel can raise it deliberately.
+        self.max_failures = int(
+            os.environ.get("FINEGRAINED_AUTOTUNE_MAX_FAILURES")
+            or max_failures
+            or self.n_trials
+        )
         self.n_startup_trials = n_startup_trials
         # top fraction of measured configs the TPE treats as "good"
         self.gamma = gamma
@@ -151,7 +178,20 @@ class BayesianAutotuner(Autotuner):
                 return [float("inf")] * 3
             return timing
         except Exception as e:
-            err = f"{type(e).__name__}: {str(e)[:200]}"
+            # triton's CompilationError carries only the location + source snippet in str(e);
+            # the actual reason lives in the chained cause, so without it every compile failure
+            # reads as an anonymous caret. Keep the head of the location and the cause verbatim.
+            msg = str(e)[:250]
+            # triton nests a CompilationError per @jit frame, each carrying only its own location
+            # and source — the actual reason is at the BOTTOM of the chain. Walk to it, else every
+            # compile failure reads as an anonymous caret and cannot be fenced.
+            root, seen = e, 0
+            while (root.__cause__ or root.__context__) is not None and seen < 12:
+                root = root.__cause__ or root.__context__
+                seen += 1
+            if root is not e:
+                msg += f" || root: {type(root).__name__}: {str(root)[-300:]}"
+            err = f"{type(e).__name__}: {msg}"
             self._failures.append((config, err))
             if sig is not None and any(m in err for m in self._COMPILE_FAILURE_MARKS):
                 memo[sig] = err
@@ -278,6 +318,8 @@ class BayesianAutotuner(Autotuner):
             )
 
     def run(self, *args, **kwargs):
+        if _CALL_COUNTS is not None:
+            _CALL_COUNTS[self.fn_name] = _CALL_COUNTS.get(self.fn_name, 0) + 1
         self._failures = []
         # Small grid → defer to parent (stock exhaustive bench-all). Steady state
         # still short-circuits the parent's per-call dict builds: a crowned config
@@ -457,7 +499,30 @@ class BayesianAutotuner(Autotuner):
         # They don't consume the trial budget either (n_trials = MEASURED configs; a failure
         # stays in ``timings`` only as a skip-list entry) — the compile it burned is the one
         # cost that can't be refunded here, which is what the smem/compile-guard pruners avoid.
+        warned_failures = False
         while sum(1 for t in timings.values() if t != float("inf")) < self.n_trials:
+            # Failures don't consume the trial budget (above), which is right for a handful of
+            # smem/regs rejects but unbounded if a launch is broadly broken: the loop keeps
+            # picking, each pick costs an O(configs) TPE rescan, and the tune degenerates into a
+            # silent multi-hour spin instead of a diagnosable error. Cap the failures at the same
+            # budget as the measurements and fail loudly.
+            if (
+                not warned_failures
+                and sum(1 for t in timings.values() if t == float("inf")) >= self.max_failures
+            ):
+                # Loud, once, and non-fatal. Aborting here would break tunes that DO find a winner
+                # after many rejects (mxfp4 W4A4 at a non-128 N burns >100), trading a silent
+                # inefficiency for a hard failure. Warning keeps the waste visible — this is how
+                # ~100 dead compiles per mx tune (an IndexError in load_act_mx's inline-quant arm)
+                # were found at all — without gating the kernel on a diagnostic.
+                warned_failures = True
+                self._report_bench_failures()
+                logger.warning(
+                    "[autotune] %s: %d configs failed to compile/run before the trial budget was "
+                    "met — that is dead compile time every tune, and a pruner gap worth closing.",
+                    self.fn_name,
+                    self.max_failures,
+                )
             ranked = sorted(
                 (i for i, t in timings.items() if t != float("inf")), key=timings.get
             )
@@ -679,44 +744,126 @@ class BayesianAutotuner(Autotuner):
         cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()
         cache = get_cache_manager(cache_key)
         file_name = f"{fn.__name__[:150]}.bayes_autotune.json"
+        keylog = os.environ.get("FINEGRAINED_AUTOTUNE_KEYLOG")
+        if keylog:
+            with open(keylog, "a") as f:
+                f.write(json.dumps({
+                    "fn": fn.__name__,
+                    "hit": cache.get_file(file_name) is not None,
+                    "tuning_key": str(tuning_key),
+                    "keys": str(self.keys),
+                    "n_configs": len(configs),
+                    "env": str(sorted(env_vars.items())),
+                    "fn_cache_key": fn.cache_key[:16],
+                    "hash": cache_key[:16],
+                }) + "\n")
 
         # signature -> live Config (carries the pre_hook); used to re-match the cached winner
         by_sig = {tuple(sorted(c.all_kwargs().items())): c for c in configs}
-        path = cache.get_file(file_name)
-        if path:
+
+        def load_crown() -> bool:
+            path = cache.get_file(file_name)
+            if not path:
+                return False
             try:
                 with open(path) as f:
                     data = json.load(f)
                 best = by_sig.get(tuple(sorted(data["best"].items())))
-                if best is not None:
-                    self.cache[tuning_key] = best
-                    self.configs_timings = {
-                        by_sig[s]: t
-                        for kw, t in data["timings"]
-                        for s in (tuple(sorted(kw.items())),)
-                        if s in by_sig
-                    }
-                    return True
+                if best is None:
+                    return False
+                self.cache[tuning_key] = best
+                self.configs_timings = {
+                    by_sig[s]: t
+                    for kw, t in data["timings"]
+                    for s in (tuple(sorted(kw.items())),)
+                    if s in by_sig
+                }
+                return True
             except Exception:
-                pass  # corrupt/stale cache file → fall through and re-tune
+                return False  # corrupt/stale cache file → re-tune
 
-        bench_fn()
-        try:
-            cache.put(
-                json.dumps(
-                    {
-                        "best": self.cache[tuning_key].all_kwargs(),
-                        "timings": [
-                            (c.all_kwargs(), t) for c, t in self.configs_timings.items()
-                        ],
-                    }
-                ),
-                file_name,
-                binary=False,
-            )
-        except Exception:
-            pass
+        if load_crown():
+            return True
+
+        # Cross-process tuning lock. Without it, TP/EP ranks sharing this cache dir all tune the
+        # same key CONCURRENTLY and each crowns its own winner: the search is seeded-random and
+        # near-ties break on measurement noise, so ranks end up on different tiles, round
+        # differently, and greedy decoding turns that into different tokens (measured: an 8-rank
+        # MXFP8 run where 3 ranks emitted a different token). Serializing means one rank tunes and
+        # the rest read the same crown — identical configs, and ~world_size less tuning wall-clock.
+        # Best-effort: any lock failure falls through to tuning locally (correct, just redundant).
+        with _tuning_lock(cache, file_name):
+            if load_crown():  # another rank tuned this key while we waited
+                return True
+            bench_fn()
+            # publish INSIDE the lock: a rank released to an empty cache would tune again
+            try:
+                cache.put(
+                    json.dumps(
+                        {
+                            "best": self.cache[tuning_key].all_kwargs(),
+                            "timings": [
+                                (c.all_kwargs(), t) for c, t in self.configs_timings.items()
+                            ],
+                        }
+                    ),
+                    file_name,
+                    binary=False,
+                )
+            except Exception:
+                pass
         return False
+
+
+@contextmanager
+def _tuning_lock(cache, file_name: str):
+    """Serialize tuning of ONE key across every process sharing the Triton cache directory.
+
+    Held while a key is tuned and its crown published, so concurrent TP/EP ranks converge on the
+    same config instead of each crowning its own (see ``check_disk_cache``). Advisory ``flock`` on
+    a sidecar file next to the crown; entirely best-effort — no cache dir, no ``fcntl``, or a lock
+    that cannot be taken within ``FINEGRAINED_TUNE_LOCK_TIMEOUT`` (default 30 min, since the holder
+    is doing a real tune) all fall through to tuning locally. Losing the lock costs redundant work,
+    never correctness."""
+    lock_file = None
+    try:
+        import fcntl
+
+        cache_dir = getattr(cache, "cache_dir", None)
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            deadline = time.time() + float(
+                os.environ.get("FINEGRAINED_TUNE_LOCK_TIMEOUT") or 1800
+            )
+            lock_file = open(os.path.join(cache_dir, f"{file_name}.lock"), "w")
+            while True:
+                try:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.time() > deadline:
+                        logger.warning(
+                            "[autotune] %s: tuning lock held elsewhere for >%.0fs — tuning locally",
+                            file_name,
+                            time.time() - (deadline - 1800),
+                        )
+                        lock_file.close()
+                        lock_file = None
+                        break
+                    time.sleep(1.0)
+    except Exception:
+        lock_file = None
+    try:
+        yield
+    finally:
+        if lock_file is not None:
+            try:
+                import fcntl
+
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            finally:
+                lock_file.close()
+
 
 
 def bayesian_autotune(
@@ -724,6 +871,7 @@ def bayesian_autotune(
     key,
     *,
     n_trials: int = 80,
+    max_failures: int | None = None,
     n_startup_trials: int = 12,
     gamma: float = 0.25,
     refine: bool = True,
@@ -746,6 +894,11 @@ def bayesian_autotune(
                               optimum — one guaranteed max-tile anchor per value combo
                               (see _basin_anchor_indices); the kernel declares them, the
                               tuner stays independent of configuration details
+    max_failures:             abort the tune once this many configs fail to compile/run before
+                              the measured budget is met (default n_trials; env override
+                              FINEGRAINED_AUTOTUNE_MAX_FAILURES). Without it a broadly broken
+                              grid spins: failures don't consume the trial budget, so the search
+                              keeps picking and each pick costs an O(configs) rescan.
     log_path:                 JSONL of benched configs (or FINEGRAINED_AUTOTUNE_LOG)
     cache_results:            persist the tuned best config to disk (on by default) so later
                               runs skip the search+compile — see BayesianAutotuner.check_disk_cache"""
@@ -759,6 +912,7 @@ def bayesian_autotune(
             reset_to_zero,
             restore_value,
             n_trials=n_trials,
+            max_failures=max_failures,
             n_startup_trials=n_startup_trials,
             gamma=gamma,
             refine=refine,

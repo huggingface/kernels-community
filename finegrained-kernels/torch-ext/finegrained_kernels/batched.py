@@ -43,7 +43,7 @@ from .tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_finalize, acc_init, gemm_epilogue
-from .pruners import batched_scalar_swap_packed_act_pruner, PATH_ANCHOR_AXES, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
+from .pruners import batched_scalar_swap_packed_act_pruner, PATH_ANCHOR_AXES, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
 
 
 @triton.jit
@@ -189,7 +189,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     ``[BN, 16]`` accumulator is the result. No-swap keeps the token in M (padded to 16).
 
     ``GATE`` fuses the gate|up projection: ``B`` is the ``(E, 2N, K)`` stack (gate rows [0,N),
-    up rows [N,2N)), run as two dots (the decode-validated form), SwiGLU-combined, and — under
+    interleaved rows), run as two dots (the decode-validated form), SwiGLU-combined, and — under
     an ``OUTPUT_RECIPE`` — FP8-requantized into ``C`` + a per-(row, block) scalar ``Cs``. Every gate arm
     folds out at compile time; ``GATE=False`` is the plain GEMM, bit-identical."""
     batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row = expert_setup(
@@ -332,7 +332,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     offs_bn = pid_n * n_width + tl.arange(0, n_width)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_k, stride_a_m, stride_a_k, "pointer", True)
-    # One stacked gate|up weight tile (gate rows [0,N), up rows [N,2N)) + one block-scale pointer;
+    # One gate|up weight tile over the interleaved rows + one block-scale pointer;
     # each weight row's scale block follows from its global row.
     b_ptrs = weight_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
     bs_ptr = Bs + (pid_n * n_width // BLOCK_N) * stride_bs_n
@@ -501,6 +501,7 @@ def _rebind_batched_mx_bs_descriptor(nargs):
     prune_configs_by={
         "early_config_prune": compose_pruners(
             mx_config_pruner("K", "N"), swizzled_scale_config_pruner(allow_gate_subblock=True), smem_pruner(),
+            dot_scaled_staging_pruner(),
             batched_scalar_swap_packed_act_pruner(),
         )
     },
@@ -620,7 +621,7 @@ def mx_dynamic_matmul_batched_kernel(
         )
     else:
         as_ptrs = a_ptrs  # dead placeholder so advance_ptrs can take it unconditionally
-    # GATE stacks gate|up into one weight tile (the up block sits N rows away), oriented by
+    # GATE reads one weight tile spanning the interleaved gate|up rows, oriented by
     # SWAP_AB; load_weight reads value + scale (swizzled/un-swizzled hidden) off these pointers.
     b_ptrs = weight_tile_ptrs(
         B, offs_bn, offs_kb, stride_b_n, stride_b_k, SWAP_AB
@@ -735,7 +736,11 @@ def mx_weight_only_matmul_batched_kernel(
     if expert_id >= num_experts:  # EP sentinel: non-local expert, output left uninit
         return
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
-    offs_bn = pid_n * n_width + tl.arange(0, n_width)
+    # non-128 N: the last N-tile's rows run past B (N=320, n_width=256 -> tile 2 wants rows
+    # 512..767 of 640), so wrap them back into the tensor. The wrapped columns are masked off by
+    # the epilogue's N_COLS. An unwrapped read is out of bounds and faults once the allocation
+    # layout puts an unmapped page there — invisible in a short run, an illegal access in a long one.
+    offs_bn = (pid_n * n_width + tl.arange(0, n_width)) % (2 * N if GATE else N)
     offs_kb = tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE)
     a_ptrs = operand_tile_ptrs(
         A, tl.arange(0, BLOCK_SIZE_M) * 0, tl.arange(0, BLOCK_SIZE_K),
@@ -869,7 +874,7 @@ def full_precision_matmul_batched_kernel(
     offs_bn = pid_n * n_width + tl.arange(0, n_width)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_k, stride_a_m, stride_a_k, "pointer", True)
-    # GATE stacks gate|up into one weight tile (the up block sits N rows away);
+    # GATE reads one weight tile spanning the interleaved gate|up rows;
     # GATE=False -> the plain oriented tile.
     b_ptrs = weight_tile_ptrs(
         B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB
@@ -1559,10 +1564,16 @@ def mx_weight_only_matmul_batched(
     # never inverts (GPT-OSS shape: 48.0->39.7µs at S=4, still ahead at S=512; 2026-08-06).
     if gate:
         # fp32 intermediate = the exact GEMM accumulators, so the GLU keeps the gated
-        # epilogue's fused-order rounding (bf16 operands would drift steep-sigmoid
-        # elements past the weight-only tests' exact-ish tolerances)
+        # epilogue's FUSED-order rounding (bf16 operands would drift steep-sigmoid elements
+        # past the weight-only tests' exact-ish tolerances). Under ``simulate_unfused`` the
+        # caller is asking for the UNFUSED order instead, where the reference lands its gate_up
+        # in the activation dtype before the GLU — carrying fp32 there leaves the two a bf16 ULP
+        # apart (256.0 absolute at magnitude 2^15), which the parity tolerance rejects.
+        inter_dtype = (
+            resolve_output_dtype(output_dtype, A, None) if simulate_unfused else torch.float32
+        )
         [gate_up] = mx_weight_only_matmul_batched(
-            A, B, Bs, expert_ids, output_dtype=torch.float32,
+            A, B, Bs, expert_ids, output_dtype=inter_dtype,
             gather_idx=gather_idx, scatter_idx=scatter_idx, b_global_scale=b_global_scale,
         )
         return [fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit,

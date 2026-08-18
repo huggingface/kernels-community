@@ -95,6 +95,7 @@ def operand_tile_descriptor(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     B_MEMORY_MODE: tl.constexpr,
+    GATE: tl.constexpr = False,
 ):
     """Resolve one operand's tile descriptor once per program (weight OR activation — the bd 2D
     kernel calls it for both): the host-built TMA descriptor as passed, a device-built in-kernel
@@ -103,11 +104,13 @@ def operand_tile_descriptor(
     if B_MEMORY_MODE == "host_descriptor":
         descriptor = HostDescriptor
     elif B_MEMORY_MODE == "device_descriptor":
+        # under GATE the operand is the (2N, K) gate|up weight and a tile is a contiguous 2*BN
+        # row span of it, so both the tensor extent and the box double
         descriptor = tl.make_tensor_descriptor(
             W,
-            shape=(N, K),
+            shape=((2 * N) if GATE else N, K),
             strides=(stride_n, stride_k),
-            block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K),
+            block_shape=((2 * BLOCK_SIZE_N) if GATE else BLOCK_SIZE_N, BLOCK_SIZE_K),
         )
     else:  # pointer
         descriptor = 0
@@ -164,7 +167,7 @@ def load_grouped_weight_tile(
     Single return — only the taken arm compiles; the caller advances ``w_ptrs`` and passes the box
     offsets either way."""
     if B_MEMORY_MODE == "pointer":
-        w = flatten_weight_tile(tl.load(w_ptrs), 2 * BLOCK_SIZE_N, KB, GATE, SWAP_AB)
+        w = tl.load(w_ptrs)
     else:
         w = tl.trans(
             tl.reshape(
@@ -198,10 +201,8 @@ def matmul_weight_ptrs(
     B,
     offs_n,
     offs_k,
-    N,
     stride_b_n,
     stride_b_k,
-    GATE: tl.constexpr,
     B_MEMORY_MODE: tl.constexpr,
     SWAP_AB: tl.constexpr = False,
 ):
@@ -410,11 +411,14 @@ def _weight_value(
     GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr,
     SWAP_AB: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, KB: tl.constexpr,
 ):
-    """Recipe-agnostic weight value tile: stacked / per-expert-3D box (GATE/GROUPED) or the plain
-    swap-aware tile. Shared by every ``load_weight_<recipe>`` — the value load never depends on the
-    scale recipe. Single-exit if/else (an early return would type-check the untaken arm — the plain
-    ``load_weight_tile``'s 2D descriptor load trips the 3D grouped weight descriptor)."""
-    if GATE or GROUPED:
+    """Recipe-agnostic weight value tile: the per-expert 3D box (GROUPED) or the plain swap-aware
+    tile. Shared by every ``load_weight_<recipe>`` — the value load never depends on the scale
+    recipe. A 2D gate|up weight takes the PLAIN arm: its rows are interleaved, so the tile is a
+    contiguous ``2*BN`` span of a 2D ``(2N, K)`` tensor and needs no 3D box — routing it through
+    the grouped loader issued a 3-offset load against a 2D descriptor ("expected 2 offsets, but
+    got 3"), unreachable only while gate was fenced to pointer mode. Single-exit if/else (an early
+    return would type-check the untaken arm)."""
+    if GROUPED:
         w = load_grouped_weight_tile(
             b_ptrs, b_descriptor, row0, n_off, k_off, BLOCK_SIZE_N, KB, GATE, B_MEMORY_MODE, SWAP_AB
         )
@@ -542,25 +546,6 @@ def weight_tile_ptrs(
     """Weight-tile pointers oriented by ``SWAP_AB``. A gate|up tile is a ``2*BN`` row span
     (``offs_n`` carries it); the epilogue splits the projections."""
     return oriented_tile_ptrs(base, offs_n, offs_k, stride_n, stride_k, SWAP_AB)
-
-
-@triton.jit
-def flatten_weight_tile(
-    w3, N2: tl.constexpr, KB: tl.constexpr, GATE: tl.constexpr, SWAP_AB: tl.constexpr
-):
-    """Flatten a loaded gate|up weight tile (see ``weight_tile_ptrs``) to the 2D MMA tile. Under
-    ``GATE`` the stacked 3D tile (gate half + up half) collapses to the 2D form: swap ``[N2, KB]``
-    (rows-major MMA lhs), no-swap ``[KB, N2]`` (K-major rhs), where ``N2 = 2*TN == BN`` — cols
-    ``0..TN-1`` gate, ``TN..2TN-1`` up (the epilogue's ``split_gate_up`` undoes it). Without ``GATE``
-    the tile is already 2D and passes through unchanged (``N2``/``KB`` unused)."""
-    if GATE:
-        if SWAP_AB:
-            w2 = tl.reshape(w3, (N2, KB))
-        else:
-            w2 = tl.reshape(w3, (KB, N2))
-    else:
-        w2 = w3
-    return w2
 
 
 @triton.jit

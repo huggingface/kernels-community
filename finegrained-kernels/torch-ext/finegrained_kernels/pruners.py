@@ -43,6 +43,8 @@ from .epilogue import *  # noqa: F401,F403
 #     scalar "scalar" -> BM=1   the scalar GEVM broadcasts wrong at BM>1 (config builder)
 #     descriptor_needs_prequant_pruner  raw-A inline-quant arm reads a_ptrs, dead under a
 #                               descriptor mode — static 2D
+#     gate_pointer_only_pruner  the 2D gate descriptor path is unwired (box not doubled to
+#                               2*BN) — 2D kernels, GATE-gated
 #     weight_only_swap_scope_pruner  SWAP_AB iff COMPUTE_MODE == "scalar" — the swapped dot
 #                               arms are unimplemented and a non-swapped scalar has no
 #                               accumulator shape — weight-only batched
@@ -534,18 +536,54 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
 
 
 
+def dot_scaled_staging_pruner():
+    """``early_config_prune`` dropping ``dot_scaled`` where the MMA's M operand degenerates to a
+    single row: ``BLOCK_SIZE_M == 1`` with no ``SWAP_AB`` to move the operand to ``BLOCK_SIZE_N``.
+    The scaled MMA has no 1-row staging and the config dies in ``PassManager::run failed`` at every
+    warps/stages cell — the decode arms that DO serve BM=1 are scalar, or dot_scaled swapped (which
+    puts the weight rows in M). Measured on the batched mx kernel: the last 6 dead compiles per
+    tune after the swapped-scalar act fence.
+
+    Two staging laws, both of which ``mx_config_pruner`` already enforces for NVFP4/E4M3 and
+    neither of which was applied to the UE8M0 half:
+
+    - ``num_warps`` outside {4, 8}: the scaled MMA has no staging for it (w16 s6 measured failing).
+    - a 1-row M operand, per above.
+
+    Measured on the batched mx kernel: 128 dead compiles per tune on HEAD, 2 after both clauses."""
+
+    def ok(c, args):
+        if c.kwargs.get("COMPUTE_MODE") != "dot_scaled":
+            return True
+        if c.num_warps not in (4, 8):
+            return False
+        if c.kwargs.get("SWAP_AB"):
+            return True
+        return config_dim(c, args, "BLOCK_SIZE_M") > 1
+
+    return config_filter(ok)
+
+
+
 def batched_scalar_swap_packed_act_pruner():
-    """``early_config_prune`` for the batched mx kernel's swapped scalar arm, which does not
-    implement PACKED (E2M1) activations: unpacked E4M3 (mxfp8) acts compile, packed
-    mxfp4/nvfp4 acts hit a tuple-arity CompilationError in the act-load leaf at every
-    warps/stages cell (charted 2026-08-13, GLM-5.2-NVFP4 decode). Fences the arm, not the
-    shape. Open improvement, not just a fence: the scalar arm is the decode winner for fp4
-    elsewhere (see OPTIMIZATION_LOG), so implementing the packed swap-scalar load could pay."""
+    """``early_config_prune`` for the batched mx kernel's swapped scalar arm, which serves ONLY
+    pre-quantized unpacked E4M3 activations. Two ways in fail:
+
+    - PACKED (E2M1) acts hit a tuple-arity CompilationError in the act-load leaf at every
+      warps/stages cell (charted 2026-08-13, GLM-5.2-NVFP4 decode).
+    - RAW bf16/fp16 acts take the inline-quant path, and ``mx_act_quant_inline`` assumes the
+      UNSWAPPED tile orientation — swapped it reshapes a transposed tile and ``tl.max(axis=2)``
+      raises ``IndexError: list index out of range``. This was ~96 dead compiles per batched mx
+      tune, invisible because the tuner inf-forgives compile failures.
+
+    Fences the arm, not the shape. Open improvement, not just a fence: the scalar arm is the
+    decode winner for fp4 elsewhere (see OPTIMIZATION_LOG), so implementing the swapped
+    packed/raw act loads could pay."""
 
     def ok(c, args):
         if c.kwargs.get("COMPUTE_MODE") != "scalar" or not c.kwargs.get("SWAP_AB"):
             return True
-        return getattr(args.get("A"), "dtype", None) not in (torch.int8, torch.uint8)
+        return getattr(args.get("A"), "dtype", None) == torch.float8_e4m3fn
 
     return config_filter(ok)
 
@@ -690,10 +728,21 @@ def mx_2d_swap_scope_pruner(max_m: int = 16):
     2026-08-05). Everywhere else swap is a proven loser (an 18-cell forced-swap sweep:
     UE8M0 recipes' scalar/dot arms win, M3 attn swap −38%), so its rows are dropped:
     UE8M0-scale launches, M above the decode band, and any non-BM=1 row (the mx swap
-    compute flattens the token tile — BM=1 is structural, enforced by a static_assert)."""
+    compute flattens the token tile — BM=1 is structural, enforced by a static_assert).
+
+    Also drops UNSWAPPED ``scalar``: the arm exists only in its swapped form here, so those
+    configs cannot build an accumulator and fail to compile."""
 
     def ok(c, args):
-        if not c.kwargs.get("SWAP_AB"):
+        swap = bool(c.kwargs.get("SWAP_AB"))
+        # Under GATE, scalar exists only as the swapped arm: unswapped it has no accumulator
+        # shape (``acc_init`` is handed "dot" when not swapped) and every such config dies in
+        # CompilationError (3 dead compiles per gated mxfp4 tune). NOT true ungated — unswapped
+        # scalar is a legitimate (and sometimes winning) W4A4 arm there, and fencing it globally
+        # crowned a wrong config at N=320.
+        if c.kwargs.get("COMPUTE_MODE") == "scalar" and not swap and args.get("GATE"):
+            return False
+        if not swap:
             return True
         return (
             config_dim(c, args, "BLOCK_SIZE_M") == 1
@@ -832,6 +881,27 @@ def matched_memory_modes_pruner():
         return a_ptr == b_ptr
 
     return config_filter(ok)
+
+
+
+def gate_pointer_only_pruner():
+    """Keep only pointer-mode weight configs under gate|up fusion on the 2D kernels.
+
+    The interleaved layout makes a gate tile a contiguous ``2*BN`` row span, so a descriptor
+    COULD express it — but the 2D descriptor path is not wired for it: ``operand_tile_descriptor``
+    builds the box at ``(BLOCK_SIZE_N, BLOCK_SIZE_K)`` rather than the doubled ``2*BN`` extent, and
+    every such config dies in compilation. Measured with the fence lifted: 97 of 100 benched
+    configs fail on an mxfp4 gated 2D tune.
+
+    It is also not worth wiring on current evidence — with the arm admitted (and its failures
+    tolerated) the crowned config stayed pointer at identical timings on B200: 4096x2048x7168
+    205.0us both ways, 4096x2880x2880 227.7us both ways, W4A16 decode within 1.6%. Remove this
+    only together with the box fix, and only if a re-measure shows the arm winning."""
+
+    def ok(c, args):
+        return c.kwargs.get("B_MEMORY_MODE", "pointer") == "pointer"
+
+    return config_filter(ok, when=lambda args: args.get("GATE", False))
 
 
 
