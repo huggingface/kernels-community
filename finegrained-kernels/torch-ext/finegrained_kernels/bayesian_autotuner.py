@@ -32,6 +32,7 @@ import logging
 import json
 import math
 import os
+import traceback
 import random
 import time
 from collections import defaultdict
@@ -192,6 +193,13 @@ class BayesianAutotuner(Autotuner):
             if root is not e:
                 msg += f" || root: {type(root).__name__}: {str(root)[-300:]}"
             err = f"{type(e).__name__}: {msg}"
+            if os.environ.get("FINEGRAINED_AUTOTUNE_TRACEBACKS"):
+                logger.warning(
+                    "[autotune] %s failed on %s:\n%s",
+                    self.fn_name,
+                    config,
+                    "".join(traceback.format_exception(type(e), e, e.__traceback__)),
+                )
             self._failures.append((config, err))
             if sig is not None and any(m in err for m in self._COMPILE_FAILURE_MARKS):
                 memo[sig] = err

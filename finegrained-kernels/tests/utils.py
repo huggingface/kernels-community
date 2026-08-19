@@ -5,23 +5,10 @@ auto-loads it before any test module)."""
 
 import torch
 
-from finegrained_kernels.compat import MX_SCALE_GROUP_K  # type: ignore
-
-
-def unswizzle_mx_scales(swizzled: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
-    """Inverse of ``swizzle_mx_scales`` (no ``gather_idx``): a flat/ND SWIZZLE_32_4_4 buffer
-    back to the plain ``(rows, cols)`` row-major scale grid (padding trimmed). Test-only —
-    reads a kernel-produced swizzled scale (e.g. the fused gate_up requant Cs) for comparison."""
-    n_row_blocks = -(-rows // 128)
-    n_col_blocks = -(-cols // 4)
-    plain = (
-        swizzled.reshape(n_row_blocks * n_col_blocks, 32, 4, 4)
-        .transpose(1, 2)
-        .reshape(n_row_blocks, n_col_blocks, 128, 4)
-        .permute(0, 2, 1, 3)
-        .reshape(n_row_blocks * 128, n_col_blocks * 4)
-    )
-    return plain[:rows, :cols]
+from finegrained_kernels.compat import (  # type: ignore
+    MX_SCALE_GROUP_K,
+    NVFP4_SCALE_GROUP_K,
+)
 
 
 # ── Device + capability ───────────────────────────────────────────────────────
@@ -239,7 +226,6 @@ def quant_dequant_a(
 # (E, N, K); act_quant[recipe] -> the host quant fn the ops themselves call (None = the
 # family default applied to a raw A); dq_act dequantizes its output for the torch oracle.
 
-from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore  # noqa: E402
 from finegrained_kernels.quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant, nvfp4_quantize_two_level  # type: ignore  # noqa: E402
 
 _E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
@@ -436,3 +422,48 @@ REQUANT_GROUP = {
     "mxfp4": MX_SCALE_GROUP_K,
     "nvfp4": NVFP4_SCALE_GROUP_K,
 }
+
+
+# ── quantized-weight reference dequantizer (test oracle) ─────────────────────────
+# Lived in the package while it WAS the MX dgrad (`dY.float() @ dequantize_weight(...)`);
+# the N-contracting kernel replaced that, leaving no production caller, so it belongs here
+# next to `dq_scale` — the other helper guarding the same UE8M0-is-an-exponent trap.
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _scale_to_fp32(s: torch.Tensor) -> torch.Tensor:
+    """Group/block scale -> fp32 by container: UE8M0 is a biased exponent (2^(e-127)), E4M3
+    (NVFP4) reads directly, fp32 passes through. Reading UE8M0 bytes as floats is off by orders
+    of magnitude — the mistake this exists to prevent."""
+    if s.dtype in (torch.uint8, torch.float8_e8m0fnu):
+        return torch.pow(2.0, s.view(torch.uint8).float() - 127)
+    return s.float()
+
+
+def dequantize_weight(
+    B: torch.Tensor, Bs: torch.Tensor, *, global_scale: torch.Tensor | None = None
+) -> torch.Tensor:
+    """A quantized weight back to fp32, for any recipe the ops accept: E4M3 or packed-E2M1
+    values, per-tensor / block / per-row-group scales, with the optional NVFP4 second-level
+    global folded in. Host-side torch — the correctness path, not the fast one."""
+    if B.dtype == torch.int8:  # packed E2M1: two codes per byte along K
+        lut = torch.tensor(_E2M1 + tuple(-v for v in _E2M1), device=B.device, dtype=torch.float32)
+        b = B.view(torch.uint8)
+        vals = torch.stack([lut[(b & 0x0F).long()], lut[(b >> 4).long()]], dim=-1)
+        values = vals.reshape(*B.shape[:-1], B.shape[-1] * 2)
+    else:
+        values = B.float()
+
+    s = _scale_to_fp32(Bs)
+    if s.numel() == 1:
+        out = values * s.reshape(1)
+    else:
+        rows, cols = values.shape[-2], values.shape[-1]
+        out = values * s.repeat_interleave(rows // s.shape[-2], dim=-2).repeat_interleave(
+            cols // s.shape[-1], dim=-1
+        )[..., :rows, :cols]
+    if global_scale is not None:
+        out = out * global_scale.float().reshape(-1)[0]
+    return out
+
+

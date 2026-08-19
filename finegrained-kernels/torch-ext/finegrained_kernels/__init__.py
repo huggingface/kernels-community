@@ -10,8 +10,11 @@ from .moe import (
     moe_unfused_grouped,
     moe_torch_grouped,
 )
+# imported for its import-time side effect: registers the dgrad formulas on the ops, so an
+# ordinary forward call differentiates. Exports nothing.
+from . import autograd  # noqa: F401
 from .recipes import Epilogue, Quantization
-from .swizzle import swizzle_mx_scales
+from .swizzle import swizzle_mx_scales, unswizzle_mx_scales
 from .scheduling import compute_grouped_scheduling
 from .compat import weighted_reduce
 from .quant import (
@@ -40,6 +43,7 @@ __all__ = [
     "weighted_reduce",
     # MX/NVFP4 scale layout (apply to weight scales at load time)
     "swizzle_mx_scales",
+    "unswizzle_mx_scales",
     # Quantization helpers (weights at load time; activations offline)
     "fp8_act_quant_block_dynamic",
     "fp8_act_quant_tensor_wide",

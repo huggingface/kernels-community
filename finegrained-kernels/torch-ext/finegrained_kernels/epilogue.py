@@ -540,6 +540,9 @@ def gemm_epilogue(
     CsGlobal=None,  # (1,) fp32 NVFP4 output global (the NEXT proj's provided input_scale); normalizes the requant, None folds out
     GlobalScale=None,  # (E,)|(1,) fp32 NVFP4 accumulator global (g_a·g_b or the weight-only g_b); applied PRE-GLU, None folds out
     global_row=0,  # index into GlobalScale (expert id; 0 for the per-tensor 2D case)
+    PreAct=None,  # (M, 2N) pre-activation buffer; written iff not None — the GLU backward's Z
+    stride_pa_m=0,
+    stride_pa_n=0,
 ):
     """Unified output epilogue for grouped (a real scatter tile) and batched (fake-batch decode:
     one token replicated across the BM lanes) GEMMs. Plain: cast + store the accumulator. ``GATE``:
@@ -554,6 +557,17 @@ def gemm_epilogue(
     both no-ops there). Every arm is constexpr-pruned."""
     acc = apply_global_scale(acc, GlobalScale, global_row)
     if GATE:
+        # SAVE_PREACT: the GLU backward needs Z, the 2*BN-wide pre-activation. Interleaved, that
+        # tile IS an ungated output tile at doubled width (pid_n * 2BN == 2 * pid_n * BN), so the
+        # ordinary store serves it — no separate path, no gated store arm.
+        if PreAct is not None:
+            _store_out(
+                PreAct,
+                acc_finalize(acc, COMPUTE_MODE, 2 * BLOCK_SIZE_N, SWAP_AB),
+                out_row, pid_n, row_mask, stride_pa_m, stride_pa_n,
+                BLOCK_SIZE_M, 2 * BLOCK_SIZE_N, FAKE_BATCH,
+                2 * N_COLS if N_COLS > 0 else 0,
+            )
         out = split_gate_up_glu(
             acc, COMPUTE_MODE, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,

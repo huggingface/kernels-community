@@ -33,7 +33,6 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-import triton
 
 from utils import (  # type: ignore
     DTYPE_TO_TOL,
@@ -46,11 +45,15 @@ from utils import (  # type: ignore
     make_static_activation_scale,
     maybe_compile,
     quant_dequant_a,
-    unswizzle_mx_scales,
 )
 
 import finegrained_kernels  # type: ignore
-from finegrained_kernels import Epilogue, Quantization, swizzle_mx_scales  # type: ignore
+from finegrained_kernels import (  # type: ignore
+    Epilogue,
+    Quantization,
+    swizzle_mx_scales,
+    unswizzle_mx_scales,
+)
 from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore
 from finegrained_kernels.quant import nvfp4_act_quant  # type: ignore
 from finegrained_kernels.epilogue import apply_glu  # type: ignore

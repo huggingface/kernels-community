@@ -258,17 +258,15 @@ def _e2m1_pair_to_e4m3(packed):
 
 @triton.jit
 def e2m1_cols_to_bf16(packed):
-    """Column-unpack packed E2M1 to bf16: ``(R, C) uint8 -> (R, 2C)``, low nibble first — the
+    """Column-unpack packed E2M1 to bf16: ``(..., C) uint8 -> (..., 2C)``, low nibble first — the
     column-axis counterpart of the row-doubling ``e2m1_to_bf16``, for the swapped weight-only
     tile (output rows leading, K contiguous). Same sm_100 hardware decode; the pair lands in
-    adjacent columns, so ``tl.join`` alone interleaves it (no axis swap)."""
+    adjacent columns, so ``tl.interleave`` places it (no axis swap)."""
     if _E2M1_HW_CVT:
         pair = _e2m1_pair_to_f16(packed)
         lo = (pair & 0xFFFF).to(tl.uint16)
         hi = (pair >> 16).to(tl.uint16)
-        f16 = tl.reshape(
-            tl.join(lo, hi), (packed.shape[0], 2 * packed.shape[1])
-        ).to(tl.float16, bitcast=True)
+        f16 = tl.interleave(lo, hi).to(tl.float16, bitcast=True)
         return f16.to(tl.bfloat16)
     bits = tl.interleave(
         _e2m1_code_to_bf16_bits(packed & 0xF), _e2m1_code_to_bf16_bits(packed >> 4)
@@ -278,8 +276,8 @@ def e2m1_cols_to_bf16(packed):
 
 @triton.jit
 def e2m1_cols_to_f32(packed):
-    """Column-unpack packed E2M1 straight to fp32, for the CUDA-core reduces: ``(R, C) uint8 ->
-    (R, 2C)``. The narrow-float hop its siblings owe their MMA callers (bf16 for ``tl.dot``, E4M3
+    """Column-unpack packed E2M1 straight to fp32, for the CUDA-core reduces: ``(..., C) uint8 ->
+    (..., 2C)``. The narrow-float hop its siblings owe their MMA callers (bf16 for ``tl.dot``, E4M3
     for the scaled MMA) is pure work for a reduce that widens to fp32 anyway — measured 12.6 ->
     15.4us on the gpt-oss decode tile for the bf16 round trip alone. Bit-identical to going via
     either: every E2M1 value is exact in f16, bf16, E4M3 and fp32."""
@@ -287,9 +285,7 @@ def e2m1_cols_to_f32(packed):
         pair = _e2m1_pair_to_f16(packed)
         lo = (pair & 0xFFFF).to(tl.uint16)
         hi = (pair >> 16).to(tl.uint16)
-        f16 = tl.reshape(
-            tl.join(lo, hi), (packed.shape[0], 2 * packed.shape[1])
-        ).to(tl.float16, bitcast=True)
+        f16 = tl.interleave(lo, hi).to(tl.float16, bitcast=True)
         return f16.to(tl.float32)
     bits = tl.interleave(
         _e2m1_code_to_bf16_bits(packed & 0xF), _e2m1_code_to_bf16_bits(packed >> 4)
@@ -927,3 +923,5 @@ def fp8_act_quant_tensor_wide(
         )
 
     return y, s
+
+

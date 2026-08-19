@@ -43,7 +43,7 @@ from .tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_finalize, acc_init, gemm_epilogue
-from .pruners import batched_scalar_swap_packed_act_pruner, PATH_ANCHOR_AXES, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
+from .pruners import PATH_ANCHOR_AXES, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
 
 
 @triton.jit
@@ -502,7 +502,6 @@ def _rebind_batched_mx_bs_descriptor(nargs):
         "early_config_prune": compose_pruners(
             mx_config_pruner("K", "N"), swizzled_scale_config_pruner(allow_gate_subblock=True), smem_pruner(),
             dot_scaled_staging_pruner(),
-            batched_scalar_swap_packed_act_pruner(),
         )
     },
 )
@@ -681,7 +680,6 @@ def mx_dynamic_matmul_batched_kernel(
             block_fits_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
             mx_config_pruner("K", "N", block_within_k=False),  # dot_scaled shape gates
-            batched_scalar_swap_packed_act_pruner(),
             weight_only_swap_scope_pruner(),
         )
     },

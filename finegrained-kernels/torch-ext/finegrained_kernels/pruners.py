@@ -43,8 +43,6 @@ from .epilogue import *  # noqa: F401,F403
 #     scalar "scalar" -> BM=1   the scalar GEVM broadcasts wrong at BM>1 (config builder)
 #     descriptor_needs_prequant_pruner  raw-A inline-quant arm reads a_ptrs, dead under a
 #                               descriptor mode — static 2D
-#     gate_pointer_only_pruner  the 2D gate descriptor path is unwired (box not doubled to
-#                               2*BN) — 2D kernels, GATE-gated
 #     weight_only_swap_scope_pruner  SWAP_AB iff COMPUTE_MODE == "scalar" — the swapped dot
 #                               arms are unimplemented and a non-swapped scalar has no
 #                               accumulator shape — weight-only batched
@@ -71,9 +69,6 @@ from .epilogue import *  # noqa: F401,F403
 #                               ttg.partition under WS — mx-dynamic grouped
 #     global_scale_warp_spec_pruner    the NVFP4 global load can't take ttg.partition
 #                               under WS — weight-only grouped, BsGlobal-gated
-#     batched_scalar_swap_packed_act_pruner  the batched mx swapped scalar arm has no
-#                               packed-act (E2M1) load — CompilationError; mx batched only,
-#                               packed-A-gated
 #     nvfp4_native_ok (mx_config_pruner)  E4M3-scale dot_scaled PassManager-fails off the
 #                               native staging: M operand < 128, num_warps outside {4, 8},
 #                               or a weight-only kernel (no As — never native)
@@ -565,29 +560,6 @@ def dot_scaled_staging_pruner():
 
 
 
-def batched_scalar_swap_packed_act_pruner():
-    """``early_config_prune`` for the batched mx kernel's swapped scalar arm, which serves ONLY
-    pre-quantized unpacked E4M3 activations. Two ways in fail:
-
-    - PACKED (E2M1) acts hit a tuple-arity CompilationError in the act-load leaf at every
-      warps/stages cell (charted 2026-08-13, GLM-5.2-NVFP4 decode).
-    - RAW bf16/fp16 acts take the inline-quant path, and ``mx_act_quant_inline`` assumes the
-      UNSWAPPED tile orientation — swapped it reshapes a transposed tile and ``tl.max(axis=2)``
-      raises ``IndexError: list index out of range``. This was ~96 dead compiles per batched mx
-      tune, invisible because the tuner inf-forgives compile failures.
-
-    Fences the arm, not the shape. Open improvement, not just a fence: the scalar arm is the
-    decode winner for fp4 elsewhere (see OPTIMIZATION_LOG), so implementing the swapped
-    packed/raw act loads could pay."""
-
-    def ok(c, args):
-        if c.kwargs.get("COMPUTE_MODE") != "scalar" or not c.kwargs.get("SWAP_AB"):
-            return True
-        return getattr(args.get("A"), "dtype", None) == torch.float8_e4m3fn
-
-    return config_filter(ok)
-
-
 def block_dynamic_2d_warp_spec_pruner():
     """``early_config_prune`` for the block-dynamic 2D kernel's two WARP_SPEC compile-fail
     laws (Triton 3.7.1 PassManager, TritonGPUPipeline; charted 2026-08-13 at the
@@ -881,27 +853,6 @@ def matched_memory_modes_pruner():
         return a_ptr == b_ptr
 
     return config_filter(ok)
-
-
-
-def gate_pointer_only_pruner():
-    """Keep only pointer-mode weight configs under gate|up fusion on the 2D kernels.
-
-    The interleaved layout makes a gate tile a contiguous ``2*BN`` row span, so a descriptor
-    COULD express it — but the 2D descriptor path is not wired for it: ``operand_tile_descriptor``
-    builds the box at ``(BLOCK_SIZE_N, BLOCK_SIZE_K)`` rather than the doubled ``2*BN`` extent, and
-    every such config dies in compilation. Measured with the fence lifted: 97 of 100 benched
-    configs fail on an mxfp4 gated 2D tune.
-
-    It is also not worth wiring on current evidence — with the arm admitted (and its failures
-    tolerated) the crowned config stayed pointer at identical timings on B200: 4096x2048x7168
-    205.0us both ways, 4096x2880x2880 227.7us both ways, W4A16 decode within 1.6%. Remove this
-    only together with the box fix, and only if a re-measure shows the arm winning."""
-
-    def ok(c, args):
-        return c.kwargs.get("B_MEMORY_MODE", "pointer") == "pointer"
-
-    return config_filter(ok, when=lambda args: args.get("GATE", False))
 
 
 
