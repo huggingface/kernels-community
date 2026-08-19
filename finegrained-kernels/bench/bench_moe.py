@@ -152,12 +152,16 @@ def _nvfp4_kwargs(cfg, hidden, gu, gus, gu_g):
     return dict(gate_up_input_global_scale=act_g, down_input_global_scale=inter_g)
 
 
-def _preswizzle_moe_scale(scale, gate):
+def _preswizzle_moe_scale(scale):
     """Per-expert SWIZZLE_32_4_4 of a grouped MX weight scale ``(E, rows, K//G)`` -> the swizzled
-    artifact the tcgen05 fast path reads (5-D; 6-D gate-interleaved under ``gate=True``; the
-    library helper owns the expert-stack, interleave, and byte-view contracts). Done once at arm
-    setup (not timed)."""
-    return fgm.swizzle_mx_scales(scale, gate=gate)
+    artifact the tcgen05 fast path reads (the library helper owns the expert-stack and byte-view
+    contracts). Done once at arm setup (not timed).
+
+    No ``gate`` argument: the interleaved gate|up layout made a gated scale slab just the ungated
+    one at doubled extent, so the 6-D gate-interleaved artifact is gone. The parameter outlived it
+    as a REQUIRED arg that two of four call sites did not pass, which took the finegrained-kernels
+    arm out of every preswizzle row with a setup TypeError."""
+    return fgm.swizzle_mx_scales(scale)
 
 
 from utils import WEIGHTS, dq_nvfp4_two_level, make_weights  # noqa: E402  tests/utils.py registry
@@ -190,6 +194,24 @@ try:
     from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8 as _vllm_group_quant  # noqa: E402
 except ImportError:
     vllm_fused_experts = None
+# kernels-community/nvfp4-gemm — the dense NVFP4 GEMM behind transformers' `NVFP4Linear`
+# (upstream #47883). Linear-only: it never sees an MoE, because experts are fused 3-D
+# parameters rather than nn.Linear. Benched here two ways — as a 2D GEMM against our
+# matmul_2d (apples to apples), and looped per expert over the routed rows, which is what
+# an MoE would cost if it were served by that integration.
+try:
+    from transformers.integrations.hub_kernels import lazy_load_kernel as _hub_kernel  # noqa: E402
+    _nvfp4_gemm = _hub_kernel("nvfp4")
+except Exception:
+    _nvfp4_gemm = None
+# megablocks dropless-MoE (dMoE) — the hub build, NOT a local pip install: megablocks pins an
+# older torch, so installing it from source downgrades the environment out from under every other
+# arm. Loaded like the rest of the roster.
+try:
+    _megablocks = get_kernel("kernels-community/megablocks", version=1)
+except Exception:
+    _megablocks = None
+
 # FlashInfer TRT-LLM fused MoE (NVIDIA's Blackwell serving kernels) — installed --no-deps
 # (its PyPI pin would downgrade torch; the JIT has no torch ABI coupling). JIT needs
 # CUDA_HOME >= 12.8 at first compile; the built module is cached under ~/.cache/flashinfer.
@@ -365,6 +387,8 @@ IMPL_COLORS = {
     "vllm": "#17becf",  # vLLM triton fused-MoE (its bf16 serving kernel)
     "trtllm": "#76b900",  # FlashInfer TRT-LLM fused MoE (NVIDIA Blackwell serving kernels)
     "triton_kernels": "#8c564b",  # OpenAI mxfp4 (GPT-OSS) reference
+    "nvfp4_gemm": "#d62728",  # transformers NVFP4Linear kernel, looped per expert
+    "megablocks": "#7f7f7f",  # databricks dropless-MoE (bf16 reference)
     "torch": "#e377c2",  # torch/cuBLAS F.scaled_grouped_mm (quantized prefill reference)
     "torch_mm": "#e377c2",  # torch/cuBLAS F.scaled_mm (the attn-row sibling)
 }
@@ -471,8 +495,8 @@ def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_
     fn = fgm.moe_fused_grouped if grouped else fgm.moe_fused_batched
     nvfp4_kw = _nvfp4_kwargs(cfg, hidden, gu, gus, gu_g)  # raw scales: before any preswizzle
     if _can_preswizzle(cfg):
-        gus = _preswizzle_moe_scale(gus, gate=True)   # fused gate GEMM reads the interleaved layout
-        dns = _preswizzle_moe_scale(dns, gate=False)
+        gus = _preswizzle_moe_scale(gus)   # fused gate GEMM reads the interleaved layout
+        dns = _preswizzle_moe_scale(dns)
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], recipe=_recipe(cfg),
               gate_up_proj_global_scale=gu_g, down_proj_global_scale=dn_g,
@@ -486,8 +510,8 @@ def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, 
     if _can_preswizzle(cfg):
         # ONE checkpoint layout: gate_up scales are always the gate-interleaved artifact; the
         # unfused plain 2N GEMM reads it via the in-kernel INTERLEAVED_SCALES block remap.
-        gus = _preswizzle_moe_scale(gus, gate=True)
-        dns = _preswizzle_moe_scale(dns, gate=False)
+        gus = _preswizzle_moe_scale(gus)
+        dns = _preswizzle_moe_scale(dns)
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], recipe=_recipe(cfg),
               gate_up_proj_global_scale=gu_g, down_proj_global_scale=dn_g,
@@ -870,6 +894,97 @@ def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_
     return lambda: experts(hidden, rd, gi, si)
 
 
+def nvfp4_gemm_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn_g=None, *_):
+    """transformers' NVFP4 path applied to an MoE: pack each expert's gate|up and down once
+    (offline, as the checkpoint conversion does), then per-expert ``gemm`` over that expert's
+    routed rows. This is NOT a fused MoE — the integration has no MoE kernel — so it measures
+    what routing through `NVFP4Linear` would cost: one dense GEMM launch per expert per
+    projection, plus the gather/scatter, with no fusion of the GLU or the intermediate requant."""
+    E, I2, H = gu.shape
+    I = I2 // 2
+    dev = hidden.device
+    # offline: the conversion op's own packer, one PackedWeight per expert per projection.
+    # Feed it the DEQUANTIZED weight — gu/dn arrive packed E2M1, and reinterpreting those bytes
+    # as bf16 would hand the packer a half-width matrix.
+    one = torch.ones(E, device=gu.device)
+    gu_bf16 = WEIGHTS["nvfp4"]["dequant"](gu, gus, gu_g if gu_g is not None else one)
+    dn_bf16 = WEIGHTS["nvfp4"]["dequant"](dn, dns, dn_g if dn_g is not None else one)
+    gu_packed = [_nvfp4_gemm.pack(gu_bf16[e].to(torch.bfloat16), device=dev) for e in range(E)]
+    dn_packed = [_nvfp4_gemm.pack(dn_bf16[e].to(torch.bfloat16), device=dev) for e in range(E)]
+
+    def run():
+        out = torch.zeros_like(hidden)
+        for e in range(E):
+            sel = (idx == e).nonzero(as_tuple=True)
+            if sel[0].numel() == 0:
+                continue
+            rows = hidden[sel[0]]
+            z = _nvfp4_gemm.gemm(gu_packed[e], rows)
+            g, u = z[..., 0::2], z[..., 1::2]
+            h = torch.nn.functional.silu(g) * u
+            y = _nvfp4_gemm.gemm(dn_packed[e], h)
+            out.index_add_(0, sel[0], (y * w[sel].unsqueeze(-1)).to(out.dtype))
+        return out
+
+    return run
+
+
+def megablocks_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
+    """megablocks dropless-MoE: block-sparse grouped GEMM over the routed rows, its own
+    permute/histogram/gather ops inside the timed call. Driven through
+    ``ParallelDroplessMLP.forward(x, scores, expert_weights, top_experts)`` so the bench's OWN
+    routing is used, matching every other arm — ``dMoE`` would run its internal router instead
+    and measure a different problem.
+
+    bf16 only: megablocks has no quantized path, so this is the unquantized MoE reference —
+    compare it against ``deepgemm_bf16`` and the bf16 row, not against the quantized arms."""
+    E, I2, H = gu.shape
+    I = I2 // 2
+    args = _megablocks.Arguments(
+        hidden_size=H, ffn_hidden_size=I, moe_num_experts=E, moe_top_k=cfg["top_k"],
+        bf16=True, fp16=False, device=hidden.device, moe_capacity_factor=0,
+        # sparse (stk block-sparse) is refused on triton >= 3.2; "grouped" is the grouped-GEMM
+        # backend, which is the path megablocks actually recommends on current stacks anyway
+        # sparse (stk block-sparse) is refused on triton >= 3.2; "grouped" is the grouped-GEMM
+        # backend megablocks recommends on current stacks. mlp_type="glu" is required for SwiGLU
+        # models — the default MLP is UNGATED and sizes w1 as [E*I, H], so a gate|up stack cannot
+        # load into it.
+        mlp_impl="grouped", mlp_type="glu",
+        # forward returns (out, bias) unless this is off, and a tuple breaks the parity check
+        return_bias=False,
+        # megablocks defaults to tanh-approx GELU; the roster's models are SiLU, and the mismatch
+        # reads as a plausible-looking 3.7e-2 parity rather than as an error
+        activation_fn=torch.nn.functional.silu,
+    )
+    mlp = _megablocks.ParallelDroplessMLP(args).to(hidden.device, torch.bfloat16)
+    # the bench's gate|up is INTERLEAVED (gate at even rows, up at odd); megablocks wants the
+    # [gate; up] halves, so de-interleave once, offline
+    with torch.no_grad():
+        # the bench's gate|up is INTERLEAVED (gate even rows, up odd); the GLU MLP holds them as
+        # separate w1 (gate) and v1 (up) tensors, so de-interleave rather than stack
+        gate, up = gu[..., 0::2, :], gu[..., 1::2, :]
+        # every megablocks GLU buffer is [E*I, H]. gate/up already are (E, I, H), but the bench's
+        # down is (E, H, I) — it must be TRANSPOSED, not reshaped: the element count matches either
+        # way, so a bare reshape silently scrambles it (parity 1.4e+00, not a crash).
+        for name, src in (("w1", gate), ("v1", up), ("w2", dn.transpose(1, 2))):
+            buf = getattr(mlp.mlp, name, None)
+            if buf is None:
+                raise RuntimeError(f"megablocks GLU MLP has no {name}; API changed")
+            if buf.numel() != src.numel():
+                raise RuntimeError(
+                    f"megablocks {name} wants {tuple(buf.shape)} ({buf.numel()} elems), "
+                    f"source has {tuple(src.shape)} ({src.numel()})")
+            buf.copy_(src.contiguous().reshape(buf.shape).to(torch.bfloat16))
+    scores = torch.zeros(hidden.shape[0], E, device=hidden.device, dtype=torch.bfloat16)
+    scores.scatter_(1, idx.long(), w.to(torch.bfloat16))
+    # belt and braces: some builds still hand back (out, bias)
+    def run():
+        out = mlp(hidden, scores, w.to(torch.bfloat16), idx.long())
+        return out[0] if isinstance(out, tuple) else out
+
+    return run
+
+
 ARMS = {
     "finegrained-kernels": moe_fused_arm,
     "finegrained-kernels_unfused": moe_unfused_arm,
@@ -884,6 +999,8 @@ ARMS = {
     "deepgemm_bf16": deepgemm_bf16_arm,
     "triton_kernels": triton_kernels_arm,
     "torch": torch_arm,
+    "nvfp4_gemm": nvfp4_gemm_arm,
+    "megablocks": megablocks_arm,
 }
 
 
@@ -1102,6 +1219,20 @@ def bench_attn_row(row, pname, cfg, rows_out):
         if "triton_kernels" in cfg["baselines"]:
             attn_arms["triton_kernels"] = lambda: tk_ogs(
                 x, tw, None, None, precision_config=tk_pc)
+        # The dense GEMM is where transformers' NVFP4 path actually lives, so this is the
+        # apples-to-apples cell: same weight, its packer, its kernel. Packing is offline (the
+        # checkpoint conversion does it), so only `gemm` is timed.
+        if _nvfp4_gemm is not None and cfg["weights"] == "nvfp4":
+            # their packer takes a bf16 weight and produces its OWN layout, so feed it the
+            # dequantized tensor — `W` is already packed E2M1 (uint8, two values per byte), and
+            # casting those bytes to bf16 hands it a K/2-wide matrix ("expected 3072 input
+            # features, got 6144"). Same underlying weight, each stack quantizing it its own way,
+            # which is how every other baseline here is treated.
+            _w_bf16 = WEIGHTS["nvfp4"]["dequant"](
+                W[None], Ws[None], (W_g if W_g is not None else torch.ones(1, device=W.device))
+            )[0].to(torch.bfloat16)
+            _pw = _nvfp4_gemm.pack(_w_bf16, device=x.device)
+            attn_arms["nvfp4_gemm"] = lambda: _nvfp4_gemm.gemm(_pw, x)
         anchor_res, anchor_out = None, None
         for name, run in attn_arms.items():
             res, out = bench_modes(run, name)
@@ -1217,8 +1348,12 @@ def _run_task(kind, pname, cfg, rows_out):
         # activations (W4A16) — it always quantizes — and feeding it those faults the CUDA context.
         tfm_arm_t = (("transformers@main",)
                      if "finegrained-fp8" in cfg["baselines"] and _recipe(cfg) is not None else ())
+        # transformers' NVFP4Linear kernel: an NVFP4 weight is the only checkpoint it can read,
+        # and it has no MoE kernel — the arm loops it per expert (see nvfp4_gemm_arm)
+        nvfp4_arm_t = (("nvfp4_gemm",)
+                       if _nvfp4_gemm is not None and cfg["weights"] == "nvfp4" else ())
         quant_arms = (("finegrained-kernels",) + cfg["baselines"] + cfg.get("fused_extra", ())
-                      + tfm_arm_t + torch_arm_t)
+                      + tfm_arm_t + torch_arm_t + nvfp4_arm_t)
         # soft-imported arms drop out where their package is absent; the TRT-LLM fp8-block
         # kernel additionally drops on clamped/scaled SwiGLU rows — passing its gemm1_alpha/
         # beta/clamp_limit there still answers a different function (measured rel 4.4e-1 vs
@@ -1239,6 +1374,9 @@ def _run_task(kind, pname, cfg, rows_out):
         arms = tuple(a for a in cfg["baselines"]
                      if (a not in ("sonicmoe", "vllm") or plain_glu)
                      and (a != "vllm" or vllm_fused_experts is not None))
+        # megablocks is bf16-only (no quantized path), so it belongs on this row and nowhere else
+        if _megablocks is not None and plain_glu:
+            arms = arms + ("megablocks",)
         bench_problem_row("unquantized", pname, cfg, ("finegrained-kernels",) + arms,
                           weights, rows_out)
     else:  # attn
