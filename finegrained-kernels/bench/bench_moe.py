@@ -387,7 +387,7 @@ IMPL_COLORS = {
     "vllm": "#17becf",  # vLLM triton fused-MoE (its bf16 serving kernel)
     "trtllm": "#76b900",  # FlashInfer TRT-LLM fused MoE (NVIDIA Blackwell serving kernels)
     "triton_kernels": "#8c564b",  # OpenAI mxfp4 (GPT-OSS) reference
-    "nvfp4_gemm": "#d62728",  # transformers NVFP4Linear kernel, looped per expert
+    "nvfp4_gemm": "#d62728",  # transformers NVFP4Linear kernel (dense 2D row only)
     "megablocks": "#7f7f7f",  # databricks dropless-MoE (bf16 reference)
     "torch": "#e377c2",  # torch/cuBLAS F.scaled_grouped_mm (quantized prefill reference)
     "torch_mm": "#e377c2",  # torch/cuBLAS F.scaled_mm (the attn-row sibling)
@@ -405,6 +405,12 @@ def _impl_label(impl, regime):
         return "torch.scaled_grouped_mm"
     if impl == "torch_mm":
         return "torch.scaled_mm"
+    # transformers' NVFP4Linear kernel (kernels-community/nvfp4-gemm). One name in both rows:
+    # this label function only sees the regime, not the row, and "(per-expert)" — true of the MoE
+    # rows, where it is looped because that integration has no MoE kernel — is wrong on the dense
+    # attn row. The per-expert framing lives in the row docs instead of a misapplied suffix.
+    if impl == "nvfp4_gemm":
+        return "nvfp4-gemm"
     if impl == "vllm":
         return "vLLM fused_moe"
     if impl == "trtllm":
@@ -894,41 +900,6 @@ def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_
     return lambda: experts(hidden, rd, gi, si)
 
 
-def nvfp4_gemm_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn_g=None, *_):
-    """transformers' NVFP4 path applied to an MoE: pack each expert's gate|up and down once
-    (offline, as the checkpoint conversion does), then per-expert ``gemm`` over that expert's
-    routed rows. This is NOT a fused MoE — the integration has no MoE kernel — so it measures
-    what routing through `NVFP4Linear` would cost: one dense GEMM launch per expert per
-    projection, plus the gather/scatter, with no fusion of the GLU or the intermediate requant."""
-    E, I2, H = gu.shape
-    I = I2 // 2
-    dev = hidden.device
-    # offline: the conversion op's own packer, one PackedWeight per expert per projection.
-    # Feed it the DEQUANTIZED weight — gu/dn arrive packed E2M1, and reinterpreting those bytes
-    # as bf16 would hand the packer a half-width matrix.
-    one = torch.ones(E, device=gu.device)
-    gu_bf16 = WEIGHTS["nvfp4"]["dequant"](gu, gus, gu_g if gu_g is not None else one)
-    dn_bf16 = WEIGHTS["nvfp4"]["dequant"](dn, dns, dn_g if dn_g is not None else one)
-    gu_packed = [_nvfp4_gemm.pack(gu_bf16[e].to(torch.bfloat16), device=dev) for e in range(E)]
-    dn_packed = [_nvfp4_gemm.pack(dn_bf16[e].to(torch.bfloat16), device=dev) for e in range(E)]
-
-    def run():
-        out = torch.zeros_like(hidden)
-        for e in range(E):
-            sel = (idx == e).nonzero(as_tuple=True)
-            if sel[0].numel() == 0:
-                continue
-            rows = hidden[sel[0]]
-            z = _nvfp4_gemm.gemm(gu_packed[e], rows)
-            g, u = z[..., 0::2], z[..., 1::2]
-            h = torch.nn.functional.silu(g) * u
-            y = _nvfp4_gemm.gemm(dn_packed[e], h)
-            out.index_add_(0, sel[0], (y * w[sel].unsqueeze(-1)).to(out.dtype))
-        return out
-
-    return run
-
-
 def megablocks_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     """megablocks dropless-MoE: block-sparse grouped GEMM over the routed rows, its own
     permute/histogram/gather ops inside the timed call. Driven through
@@ -999,7 +970,6 @@ ARMS = {
     "deepgemm_bf16": deepgemm_bf16_arm,
     "triton_kernels": triton_kernels_arm,
     "torch": torch_arm,
-    "nvfp4_gemm": nvfp4_gemm_arm,
     "megablocks": megablocks_arm,
 }
 
@@ -1253,7 +1223,8 @@ device_name = "MOCK (random values)" if MOCK else torch.cuda.get_device_name(0)
 print(f"device: {device_name}  torch {torch.__version__}"
       f"{'  [SMOKE]' if SMOKE else ''}")
 print("finegrained-kernels = local build; baselines: finegrained-fp8 (upstream), DeepGEMM, "
-      "transformers grouped_mm/batched_mm, SonicMoE, torch.scaled_grouped_mm"
+      "transformers grouped_mm/batched_mm, SonicMoE, torch.scaled_grouped_mm, "
+      "nvfp4-gemm (transformers' NVFP4Linear kernel), megablocks (bf16 dMoE)"
       f"{f'  |  {GPUS} GPUs' if GPUS > 1 else ''}\n")
 
 FILTERS = sys.argv[1:]
@@ -1290,15 +1261,19 @@ def _load_rows_csv(path):
     def _allowed(cfg):
         return {"finegrained-kernels"} | {_impl(b) for b in cfg["baselines"]}
 
+    # Arms enlisted DYNAMICALLY in _run_task (not in a problem's `baselines`) must be listed
+    # here too, or they bench, land in the CSV, and are silently dropped at plot/merge time —
+    # a bar that runs and never renders. `torch`/`torch_mm`/`transformers@main` were already
+    # special-cased for this; nvfp4_gemm and megablocks are the same shape of arm.
     allowed = {}
     for pn, c in MOE_PROBLEMS.items():
         allowed["quantized", pn] = (
             _allowed(c) | {_impl(b) for b in c.get("fused_extra", ())}
             | {"torch", "transformers@main"})
     for pn, c in BF16_PROBLEMS.items():
-        allowed["unquantized", pn] = _allowed(c)
+        allowed["unquantized", pn] = _allowed(c) | {"megablocks"}
     for pn, c in ATTN_PROBLEMS.items():
-        allowed["attn quantized", pn] = _allowed(c) | {"torch_mm"}
+        allowed["attn quantized", pn] = _allowed(c) | {"torch_mm", "nvfp4_gemm"}
     acc = {}  # (cat, problem, regime, impl) -> (res dict, parity)
     for r in csv.DictReader(open(path)):
         if r["impl"] not in allowed.get((r["category"], r["problem"]), {"finegrained-kernels"}):
@@ -1348,12 +1323,13 @@ def _run_task(kind, pname, cfg, rows_out):
         # activations (W4A16) — it always quantizes — and feeding it those faults the CUDA context.
         tfm_arm_t = (("transformers@main",)
                      if "finegrained-fp8" in cfg["baselines"] and _recipe(cfg) is not None else ())
-        # transformers' NVFP4Linear kernel: an NVFP4 weight is the only checkpoint it can read,
-        # and it has no MoE kernel — the arm loops it per expert (see nvfp4_gemm_arm)
-        nvfp4_arm_t = (("nvfp4_gemm",)
-                       if _nvfp4_gemm is not None and cfg["weights"] == "nvfp4" else ())
+        # nvfp4-gemm is NOT enlisted on the MoE rows. That integration has no MoE kernel, so the
+        # only way to run it here is a dense GEMM per expert — 8.8ms against our 47us, which is a
+        # statement about the missing kernel rather than a comparison of kernels, and one bar that
+        # tall flattens every other bar in the panel. It stays on the attn row, where the two are
+        # doing the same job.
         quant_arms = (("finegrained-kernels",) + cfg["baselines"] + cfg.get("fused_extra", ())
-                      + tfm_arm_t + torch_arm_t + nvfp4_arm_t)
+                      + tfm_arm_t + torch_arm_t)
         # soft-imported arms drop out where their package is absent; the TRT-LLM fp8-block
         # kernel additionally drops on clamped/scaled SwiGLU rows — passing its gemm1_alpha/
         # beta/clamp_limit there still answers a different function (measured rel 4.4e-1 vs
@@ -1505,6 +1481,7 @@ for ri, row in enumerate(present_rows):
         row_impls = list(dict.fromkeys(i for _, i, *_ in cells))
         labeled = set()
         overlay_drawn = False  # any compile-beats-cudagraph overlay in this panel?
+        eager_only_drawn = False  # any bar shown as eager because cudagraph is unsupported?
         ticks, ticklabels = [], []
         for gi, pname in enumerate(problems):
             ticks.append(gi)
@@ -1517,17 +1494,34 @@ for ri, row in enumerate(present_rows):
             # bars speed-ranked within the group (fastest leftmost, crashed last),
             # centered on the group's own arm count — colors identify the impls
             group = [(i, r) for p, i, r, _par in cells if p == pname]
-            group.sort(key=lambda t: (t[1].get(solid_mode) is None,
-                                      t[1].get(solid_mode) or 0.0))
+            def _drawn(res):
+                """The value this impl will actually show: its solid mode, else — on decode —
+                its eager number. An impl that cannot be graph-captured still HAS a latency,
+                and a red X hides it behind something that reads as total failure."""
+                v = res.get(solid_mode)
+                return v if v is not None else (res.get("eager") if regime == "decode" else None)
+
+            group.sort(key=lambda t: (_drawn(t[1]) is None, _drawn(t[1]) or 0.0))
             for slot, (impl, res) in enumerate(group):
                 off = (slot - (len(group) - 1) / 2) * GLOBAL_WIDTH
                 sval = res.get(solid_mode)
+                eager_fb = (res.get("eager") if sval is None and regime == "decode" else None)
                 if sval is not None:
                     ax.bar(gi + off, sval, GLOBAL_WIDTH, color=IMPL_COLORS[impl],
                            label=impl if impl not in labeled else None, zorder=2)
                     labeled.add(impl)
+                elif eager_fb is not None:
+                    # Cannot be graph-captured (megablocks' routing does a device->host copy;
+                    # nvfp4_gemm's per-expert loop has data-dependent shapes) but DOES run. Show
+                    # the eager cost, dot-hatched so it is never read as a cudagraph number —
+                    # a red X here would say "broken" about something merely 5x slower.
+                    ax.bar(gi + off, eager_fb, GLOBAL_WIDTH, color=IMPL_COLORS[impl],
+                           alpha=0.55, edgecolor="black", hatch="..", linewidth=0.7, zorder=2,
+                           label=impl if impl not in labeled else None)
+                    labeled.add(impl)
+                    eager_only_drawn = True
                 else:
-                    # solid (deployment) mode crashed -> red X at the baseline
+                    # nothing ran in any mode -> red X at the baseline
                     ax.plot(gi + off, 0, "x", color="red", markersize=9,
                             clip_on=False, zorder=4)
                 # compile overlay (decode): hatched outline — shown ONLY when compile
@@ -1561,6 +1555,9 @@ for ri, row in enumerate(present_rows):
         if overlay_drawn:
             handles.append(mpatches.Patch(facecolor="none", edgecolor="black",
                                           hatch="////", label="compile (faster)"))
+        if eager_only_drawn:
+            handles.append(mpatches.Patch(facecolor="none", edgecolor="black",
+                                          hatch="..", label="eager (no cudagraph)"))
         ax.legend(handles=handles, loc="upper left", fontsize=8)
 fig.suptitle(f"MoE bench — finegrained-kernels vs finegrained-fp8 + references  "
              f"({device_name}, real model shapes; decode=cudagraph+compile, "
