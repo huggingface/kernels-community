@@ -188,6 +188,9 @@ def _dgrad_weight_tile(
             config_filter(  # the scale row advances by BN // SCALE_ROW_DIV — must be whole
                 lambda c, a: c.kwargs["BLOCK_SIZE_N"] % max(a.get("SCALE_ROW_DIV", 1), 1) == 0
             ),
+            config_filter(  # BK below one scale group gives NG=0 -> tl.arange(0, 0)
+                lambda c, a: c.kwargs["BLOCK_SIZE_K"] % max(a.get("SCALE_GROUP_K", 1), 1) == 0
+            ),
             warp_spec_compile_guard_pruner(),
             descriptor_box_pruner("BLOCK_SIZE_K"),
             smem_pruner("BLOCK_SIZE_K"),
@@ -249,8 +252,9 @@ def dgrad_matmul_2d_kernel(
     # mask on the activation, no clamp on the weight rows, and the addresses advance by a constant
     # stride instead of being rebuilt from offsets each step — the forward's loop shape.
     offs_n0 = tl.arange(0, BLOCK_SIZE_N)
-    dy_ptrs = operand_tile_ptrs(A, offs_m, offs_n0, stride_a_m, stride_a_n, A_MEMORY_MODE, False)
-    b_ptrs = operand_tile_ptrs(B, offs_n0, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE, False)
+    # SWAP_AB is the WEIGHT's viewpoint, inverted for activations: True = rows-major [BM, BN]
+    dy_ptrs = operand_tile_ptrs(A, offs_m, offs_n0, stride_a_m, stride_a_n, A_MEMORY_MODE, True)
+    b_ptrs = operand_tile_ptrs(B, offs_n0, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE, True)
     bs_ptrs = (
         Bs + (offs_n0[:, None] // SCALE_ROW_DIV) * stride_bs_n + offs_kg[None, :] * stride_bs_k
     )
@@ -380,11 +384,18 @@ def _rebind_dgrad_grouped_descriptors(nargs):
     n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
     finite_check_args=("C",),
+    # C is ACCUMULATED into (tl.atomic_add: several routed rows share a source token), so the
+    # kernel is not idempotent. Benchmarking calls each config many times against one buffer, and
+    # without this every repetition adds again — the tune reads a correct kernel as 1.7e5x wrong.
+    reset_to_zero=("C",),
     prune_configs_by={
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("N"),  # exact N-loop: no tail mask, constant-stride advance
             config_filter(  # the scale row advances by BN // SCALE_ROW_DIV — must be whole
                 lambda c, a: c.kwargs["BLOCK_SIZE_N"] % max(a.get("SCALE_ROW_DIV", 1), 1) == 0
+            ),
+            config_filter(  # BK below one scale group gives NG=0 -> tl.arange(0, 0)
+                lambda c, a: c.kwargs["BLOCK_SIZE_K"] % max(a.get("SCALE_GROUP_K", 1), 1) == 0
             ),
             warp_spec_compile_guard_pruner(),
             descriptor_box_pruner("BLOCK_SIZE_K"),
@@ -425,13 +436,14 @@ def dgrad_matmul_grouped_kernel(
     WEIGHT_VALUES_PER_BYTE: tl.constexpr,
     # Meta-parameters
     A_MEMORY_MODE: tl.constexpr,
-    B_MEMORY_MODE: tl.constexpr,
     NUM_EXPERTS_POW2: tl.constexpr,
     NUM_SMS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     WARP_SPEC: tl.constexpr,
+    B_MEMORY_MODE: tl.constexpr,
+    ROUTED_OUT: tl.constexpr = False,
 ):
     """Grouped dgrad. The tile resolver is reused verbatim with K-tiles in its N-tile slot —
     it is generic in that second axis, so ``offs_bn`` comes back as this kernel's K offsets and
@@ -477,11 +489,15 @@ def dgrad_matmul_grouped_kernel(
 
         # exact N-loop (BLOCK_SIZE_N divides N): maskless weight, constant-stride advance
         offs_n0 = tl.arange(0, BLOCK_SIZE_N)
+        # SWAP_AB is the WEIGHT's viewpoint and activation callers pass it INVERTED: False builds
+        # [K, rows], so both of these want True to get the rows-major tiles the dot expects
+        # ([BM, BN] and [BN, BK]). Only the pointer arm is affected — the descriptor arm returns
+        # the scalar base and reads its box from the descriptor.
         dy_ptrs = operand_tile_ptrs(
-            A, out_row, offs_n0, stride_a_m, stride_a_n, A_MEMORY_MODE, False
+            A, out_row, offs_n0, stride_a_m, stride_a_n, A_MEMORY_MODE, True
         )
         b_ptrs = operand_tile_ptrs(
-            b_base, offs_n0, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE, False
+            b_base, offs_n0, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE, True
         )
         bs_ptrs = (
             bs_base
@@ -514,11 +530,38 @@ def dgrad_matmul_grouped_kernel(
             b_ptrs += BLOCK_SIZE_N * stride_b_n
             bs_ptrs += (BLOCK_SIZE_N // SCALE_ROW_DIV) * stride_bs_n
 
-        tl.store(
-            C + in_row[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
-            accumulator.to(C.dtype.element_ty),
-            mask=row_mask[:, None] & (offs_k[None, :] < K),
-        )
+        # Fallback when the rows are NOT token-major (no scatter map): accumulate straight into
+        # the source token. `in_row` is that token, and with top_k > 1 several routed rows share
+        # one, so a store would keep whichever tile landed last and drop the rest — invisible to
+        # any test whose gather map is the identity (S == M), which is how it survived one.
+        #
+        # The FORWARD reduces without atomics (`weighted_reduce`: (S, H) -> (T, H)) — but its
+        # routed-space tensor already exists, because the down GEMM's natural output IS (S, H), and
+        # its reduce also applies routing weights and skips EP sentinels, which an atomic could not
+        # express. dgrad is the transpose: its natural output is SOURCE space, so mirroring the
+        # forward would mean materializing a (S, K) buffer purely to avoid atomics.
+        #
+        # Measured and rejected: store-into-(S, K) + index_add_ ran 4038 vs 4181us at DSV3 top_k=8
+        # (-3.4%), 1278 vs 1294 at GPT-OSS top_k=4, and SLOWER at decode (411 vs 404) — to buy that
+        # you pay a top_k x fp32 intermediate, ~940MB at DSV3 shapes. top_k-way contention is not
+        # the bottleneck here; the GEMM is.
+        if ROUTED_OUT:
+            # Plain store at the TOKEN-MAJOR routed row (`out_row`), then the caller sums the
+            # top_k rows per token. This is the FORWARD's shape — it stores routed rows and
+            # reduces them with `weighted_reduce` — and it is 1.40x faster than atomics at DSV3
+            # top_k=8 (3003 vs 4215us), 1.13x at GPT-OSS top_k=4, break-even at decode. top_k-way
+            # atomic contention is the difference; the reduce itself is nearly free.
+            tl.store(
+                C + out_row[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
+                accumulator,
+                mask=row_mask[:, None] & (offs_k[None, :] < K),
+            )
+        else:
+            tl.atomic_add(
+                C + in_row[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
+                accumulator,
+                mask=row_mask[:, None] & (offs_k[None, :] < K),
+            )
 
 
 @compile_time_only_triton_op("finegrained::dgrad_matmul_grouped", mutates_args=())
@@ -532,6 +575,7 @@ def dgrad_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
+    num_input_rows: int | None = None,
 ) -> torch.Tensor:
     """Routed ``dX = dY @ W[expert]`` over expert-sorted positions — the MoE counterpart of
     ``dgrad_matmul_2d``.
@@ -550,9 +594,15 @@ def dgrad_matmul_grouped(
 
     num_experts = W.shape[0]
     num_sms = sm_count(dY.device.index)
-    # every sorted position belongs to exactly one expert and is written by its tile,
-    # so there is nothing for a memset to cover
-    dX = torch.empty(S, K, device=dY.device, dtype=output_dtype or dY.dtype)
+    # (num_input_rows, K), ZERO-initialised: the kernel accumulates each routed row's gradient
+    # into its source token, so the buffer is indexed in SOURCE space and must start empty.
+    # fp32 because that is what tl.atomic_add takes.
+    rows = S if num_input_rows is None else num_input_rows
+    # Token-major store + a top_k sum beats atomics whenever the scatter map makes the rows
+    # token-major (see the kernel). It costs a top_k x fp32 intermediate, which is why the atomic
+    # arm stays as the fallback for gather-only launches.
+    routed_out = scatter_idx is not None and rows > 0 and S % rows == 0
+    dX = torch.zeros(S if routed_out else rows, K, device=dY.device, dtype=torch.float32)
     with device_context(dY.device):
         # inside the context — see dgrad_matmul_2d; placeholder boxes, rebound by the pre_hook
         a_descriptor = _maybe_descriptor(dY, [1, 128])
@@ -586,8 +636,11 @@ def dgrad_matmul_grouped(
             WEIGHT_VALUES_PER_BYTE=values_per_byte,
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
             NUM_SMS=num_sms,
+            ROUTED_OUT=routed_out,
         )
-    return dX
+    if routed_out:
+        dX = dX.view(rows, S // rows, K).sum(1)
+    return dX.to(output_dtype or dY.dtype)
 
 
 @triton.jit
@@ -887,6 +940,7 @@ def _dgrad_grouped(ctx, dY, B, Bs, expert_start, gather_idx, scatter_idx, b_glob
         dY.contiguous(), B, Bs, expert_start,
         K // Bs.shape[-1], max(B.shape[-2] // Bs.shape[-2], 1),
         gather_idx=gather_idx, scatter_idx=scatter_idx, output_dtype=torch.float32,
+        num_input_rows=getattr(ctx, "a_rows", None),
     )
     if b_global is not None:  # per-expert NVFP4 global folds on the product
         dX = dX * b_global.float().reshape(-1)[0]
@@ -906,6 +960,9 @@ def _register(name: str, saved: tuple[int, ...], dgrad):
     def setup_context(ctx, inputs, output):
         ctx.save_for_backward(*(inputs[i] for i in saved))
         ctx.a_dtype = inputs[0].dtype
+        # routed dgrad accumulates into SOURCE tokens, which is a different row count from the
+        # routed rows the op consumed whenever a gather map is in play
+        ctx.a_rows = inputs[0].shape[0]
 
 
     def backward(ctx, *grads):
@@ -983,6 +1040,16 @@ def _dgrad_batched(ctx, dY, B, Bs, expert_ids, b_global):
 _register(
     "mx_weight_only_matmul_grouped", saved=(1, 2, 3, 10, 11, 12),
     dgrad=_dgrad_grouped,
+)
+
+# Routed MoE, block-FP8. Same product as the weight-only grouped op — a 128x128 block grid is
+# the per-row K-group layout at wider divisors, which `_dgrad_grouped` derives from `Bs.shape` —
+# but it is a DIFFERENT op, and only registering the weight-only one left the grouped block-FP8
+# path with no grad_fn at all. That is the path a PEFT LoRA on fp8 experts actually runs.
+# Positional slots: B=1, Bs=3, expert_start=4, gather_idx=14, scatter_idx=15; no global scale.
+_register(
+    "w8a8_block_dynamic_fp8_matmul_grouped", saved=(1, 3, 4, 14, 15),
+    dgrad=lambda ctx, dY, B, Bs, es, gi, si: _dgrad_grouped(ctx, dY, B, Bs, es, gi, si, None),
 )
 
 # The batched experts forward is a SELECTABLE dispatch in transformers, not a decode-only path, so

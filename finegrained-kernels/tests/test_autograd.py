@@ -298,3 +298,48 @@ def test_dgrad_batched_per_row_expert():
     )
     floor = torch.einsum("sn,snk->sk", dY.float(), Wdeq[expert_ids.long()])
     assert _rel(dX, floor) < 5e-3, f"batched dgrad diverges from its floor: {_rel(dX, floor):.2e}"
+
+
+def test_dgrad_grouped_accumulates_over_top_k():
+    """Routed dgrad with a NON-IDENTITY gather and top_k > 1: each token is routed to several
+    experts, so its gradient is a SUM over them.
+
+    This is the case an identity gather cannot express. With `gather_idx = arange(S)` every source
+    row is written exactly once, so a kernel that STORES and one that ACCUMULATES are
+    indistinguishable — which is how a store survived the suite while silently dropping all but
+    one expert's contribution per token on any real MoE."""
+    from finegrained_kernels.autograd import dgrad_matmul_grouped
+
+    torch.manual_seed(0)
+    T, tk, E, Ne, Ke = 8, 2, 4, 256, 256
+    S = T * tk
+
+    # each token -> tk DISTINCT experts, then sort the (token, expert) pairs by expert so the
+    # rows are expert-contiguous, which is the layout the grouped schedule guarantees
+    experts = torch.stack([torch.randperm(E)[:tk] for _ in range(T)])       # (T, tk)
+    pairs = [(int(e), t) for t in range(T) for e in experts[t]]
+    pairs.sort()
+    gather_idx = torch.tensor([t for _, t in pairs], device=TEST_DEVICE, dtype=torch.int32)
+    counts = torch.bincount(torch.tensor([e for e, _ in pairs]), minlength=E)
+    expert_start = torch.cat([torch.zeros(1, dtype=torch.long), counts.cumsum(0)]).to(
+        TEST_DEVICE, torch.int32)
+    assert int(expert_start[-1]) == S
+
+    dY = torch.randn(S, Ne, device=TEST_DEVICE, dtype=torch.bfloat16)
+    W = torch.randn(E, Ne, Ke, device=TEST_DEVICE, dtype=torch.bfloat16) * 0.1
+    Wq, Ws = fg.mxfp8_act_quant(W.reshape(E * Ne, Ke))
+    Wq, Ws = Wq.reshape(E, Ne, Ke), Ws.reshape(E, Ne, -1)
+
+    dX = dgrad_matmul_grouped(
+        dY, Wq, Ws, expert_start, 32, 1,
+        gather_idx=gather_idx, scatter_idx=None, output_dtype=torch.float32,
+        num_input_rows=T,
+    )
+    assert dX.shape == (T, Ke), f"gradient must be in SOURCE space {(T, Ke)}, got {tuple(dX.shape)}"
+
+    Wdeq = (Wq.float()
+            * torch.pow(2.0, Ws.view(torch.uint8).float() - 127).repeat_interleave(32, -1)[..., :Ke])
+    floor = torch.zeros(T, Ke, device=TEST_DEVICE, dtype=torch.float32)
+    for s, (e, t) in enumerate(pairs):          # the sum a store would collapse to one term
+        floor[t] += dY[s].float() @ Wdeq[e]
+    assert _rel(dX, floor) < 5e-3, f"top-k accumulation diverges: {_rel(dX, floor):.2e}"
