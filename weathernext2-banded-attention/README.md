@@ -26,8 +26,11 @@ out of the ungathered tensors, so:
 - the mask is streamed a tile at a time rather than expanded by `masking_utils`,
 - tiles the band never reaches are skipped before their two matmuls, not after.
 
-Forward only. Backward stays on the PyTorch path, so `transformers` registers it
-inference-only, and training is unaffected.
+Forward only, so it should be registered `Mode.INFERENCE`. The layer additionally refuses
+the fast path whenever autograd is live, because the kernel's output carries no `grad_fn`:
+a `loss.backward()` would still succeed, and every parameter upstream of attention would
+silently receive nothing. Fine-tuning therefore takes the differentiable fallback and is
+unaffected. A real backward would be needed to accelerate training.
 
 ## Precision
 
