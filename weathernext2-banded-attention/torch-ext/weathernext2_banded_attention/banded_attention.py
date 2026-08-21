@@ -16,6 +16,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .utils import device_context
+
 
 # How `tl.dot` should treat float32 inputs. Spelled the portable way (`input_precision`) rather than
 # `allow_tf32`, which is CUDA-flavoured: this kernel has to build for ROCm too.
@@ -204,23 +206,26 @@ def banded_attention(
     def grid(meta):
         return (triton.cdiv(block_size, meta["BLOCK_M"]), batch * num_blocks, heads)
 
-    _banded_attention_kernel[grid](
-        query,
-        key,
-        value,
-        mask,
-        out,
-        query.stride(0),
-        query.stride(1),
-        query.stride(2),
-        query.stride(3),
-        mask.stride(0),
-        mask.stride(1),
-        mask.stride(2),
-        num_blocks,
-        block_size,
-        scaling,
-        HEAD_DIM=head_dim,
-        PRECISION=_PRECISIONS[precision],
-    )
+    # Triton launches on whichever device is current, not on the one the tensors live on, so a
+    # shard placed on cuda:1 by `device_map="auto"` would otherwise be launched against cuda:0.
+    with device_context(query.device):
+        _banded_attention_kernel[grid](
+            query,
+            key,
+            value,
+            mask,
+            out,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            query.stride(3),
+            mask.stride(0),
+            mask.stride(1),
+            mask.stride(2),
+            num_blocks,
+            block_size,
+            scaling,
+            HEAD_DIM=head_dim,
+            PRECISION=_PRECISIONS[precision],
+        )
     return out.reshape(batch, num_blocks, heads, block_size, head_dim)
