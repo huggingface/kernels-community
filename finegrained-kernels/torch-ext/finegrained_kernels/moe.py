@@ -132,6 +132,8 @@ def moe_fused_grouped(
     down_proj_global_scale: torch.Tensor | None = None,
     gate_up_input_global_scale: torch.Tensor | None = None,
     down_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_bias: torch.Tensor | None = None,  # (E, 2I) pre-activation bias
+    down_proj_bias: torch.Tensor | None = None,  # (E, H)
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -180,6 +182,7 @@ def moe_fused_grouped(
             swiglu_limit=swiglu_limit,
             simulate_unfused=simulate_unfused,
         ),
+        bias=gate_up_proj_bias,
         # recipe is the resolved format; None (weight-only) leaves the GLU intermediate
         # bf16, no requant.
         quantization=Quantization(input_recipe=recipe, output_recipe=recipe),
@@ -199,6 +202,7 @@ def moe_fused_grouped(
         a_global_scale=down_input_global_scale,
         b_global_scale=down_proj_global_scale,
         expert_start=expert_start,
+        bias=down_proj_bias,
         # weight-only: the intermediate is bf16 (As None) — the down goes weight-only too.
         quantization=Quantization(input_recipe=recipe) if recipe is None else None,
         output_dtype=hidden_states.dtype,
@@ -226,6 +230,8 @@ def moe_fused_batched(
     down_proj_global_scale: torch.Tensor | None = None,
     gate_up_input_global_scale: torch.Tensor | None = None,
     down_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_bias: torch.Tensor | None = None,  # (E, 2I) pre-activation bias
+    down_proj_bias: torch.Tensor | None = None,  # (E, H)
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -273,6 +279,7 @@ def moe_fused_batched(
             swiglu_limit=swiglu_limit,
             simulate_unfused=simulate_unfused,
         ),
+        bias=gate_up_proj_bias,
         # Decode (batched): recipe None (weight-only) leaves the intermediate bf16, no requant.
         # Block-FP8: INSIDE the unstacked decode band the requant fuses into the GLU kernel
         # (``fused_glu(quant_group=...)`` — one launch, hands the down a ready fp8+scales intermediate and
@@ -303,6 +310,7 @@ def moe_fused_batched(
         a_global_scale=down_input_global_scale,
         b_global_scale=down_proj_global_scale,
         expert_ids=expert_ids,
+        bias=down_proj_bias,
         # weight-only / block-FP8: the intermediate is bf16 (As is None), so the down carries the recipe
         # and quantizes it, mirroring the unfused sibling.
         quantization=(
@@ -334,6 +342,8 @@ def moe_unfused_grouped(
     down_proj_global_scale: torch.Tensor | None = None,
     gate_up_input_global_scale: torch.Tensor | None = None,
     down_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_bias: torch.Tensor | None = None,  # (E, 2I) pre-activation bias
+    down_proj_bias: torch.Tensor | None = None,  # (E, H)
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -364,6 +374,7 @@ def moe_unfused_grouped(
         a_global_scale=gate_up_input_global_scale,
         b_global_scale=gate_up_proj_global_scale,
         expert_start=expert_start,
+        bias=gate_up_proj_bias,
         quantization=Quantization(input_recipe=recipe),
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
@@ -378,6 +389,7 @@ def moe_unfused_grouped(
         a_global_scale=down_input_global_scale,
         b_global_scale=down_proj_global_scale,
         expert_start=expert_start,
+        bias=down_proj_bias,
         quantization=Quantization(input_recipe=recipe),
         output_dtype=hidden_states.dtype,
         scatter_idx=scatter_idx,
@@ -397,6 +409,8 @@ def moe_torch_grouped(
     down_proj_global_scale: torch.Tensor | None = None,
     gate_up_input_global_scale: torch.Tensor | None = None,
     down_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_bias: torch.Tensor | None = None,  # (E, 2I) pre-activation bias
+    down_proj_bias: torch.Tensor | None = None,  # (E, H)
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -479,6 +493,7 @@ def moe_torch_grouped(
     counts = torch.histc(flat_e.float(), bins=E, min=0, max=E - 1).to(torch.int32)
     offs = counts.cumsum(0).to(torch.int32)
     tok = (order // top_k).to(torch.long)  # source token of each sorted slot
+    slot_e = flat_e[order].to(torch.long)  # expert of each sorted slot, for the per-expert biases
 
     def pk(t):  # view a packed-e2m1 operand as torch's fp4 dtype for scaled_grouped_mm
         return t.view(FP4) if packed else t
@@ -524,6 +539,10 @@ def moe_torch_grouped(
         gate_up_proj_global_scale,
         gate_up_input_global_scale,
     )
+    # torch has no fused bias, so this baseline adds both host-side; rows are expert-sorted here,
+    # so the per-expert bias indexes by the sorted expert ids
+    if gate_up_proj_bias is not None:
+        gate_up = gate_up + gate_up_proj_bias[slot_e]
     inter = fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit)
     down_out = grouped_mm(
         inter, down_proj, down_proj_scale_inv, down_proj_global_scale, down_input_global_scale
@@ -533,6 +552,8 @@ def moe_torch_grouped(
     # map fuses unroute + routing-weight + top-k sum into (T, H) directly — no separate unsort pass.
     out = torch.zeros_like(hidden_states)
     w = top_k_weights.reshape(-1)[order].unsqueeze(-1).to(out.dtype)
+    if down_proj_bias is not None:
+        down_out = down_out + down_proj_bias[slot_e]
     return out.index_add_(0, tok, down_out * w)
 
 
@@ -548,6 +569,8 @@ def moe_unfused_batched(
     down_proj_global_scale: torch.Tensor | None = None,
     gate_up_input_global_scale: torch.Tensor | None = None,
     down_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_bias: torch.Tensor | None = None,  # (E, 2I) pre-activation bias
+    down_proj_bias: torch.Tensor | None = None,  # (E, H)
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -574,6 +597,7 @@ def moe_unfused_batched(
         a_global_scale=gate_up_input_global_scale,
         b_global_scale=gate_up_proj_global_scale,
         expert_ids=expert_ids,
+        bias=gate_up_proj_bias,
         quantization=Quantization(input_recipe=recipe),
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
@@ -587,6 +611,7 @@ def moe_unfused_batched(
         a_global_scale=down_input_global_scale,
         b_global_scale=down_proj_global_scale,
         expert_ids=expert_ids,
+        bias=down_proj_bias,
         quantization=Quantization(input_recipe=recipe),
         output_dtype=hidden_states.dtype,
     )

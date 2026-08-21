@@ -41,7 +41,7 @@ from .tiles import (
     operand_tile_ptrs,
     swizzle_offsets,
 )
-from .epilogue import acc_init, gemm_epilogue, store_masked, store_masked_oriented
+from .epilogue import acc_init, add_bias, bias_strides, gemm_epilogue, store_masked, store_masked_oriented
 from .pruners import PATH_ANCHOR_AXES, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner
 
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
@@ -189,6 +189,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     BDescriptor,  # host TMA descriptor over B (N, K), box (BLOCK_SIZE_N, block_k); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (N // block_n, K // block_k) weight scales (fp32 or uint8/UE8M0)
     C,  # (M, N) output
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     # Shape
     M,
     N,
@@ -207,6 +208,8 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     stride_bs_n,
     stride_c_m,
     stride_c_n,
+    stride_bias_e,
+    stride_bias_n,
     # Weight-quantization blocks (the caller's block_size); block_k is also the K tile
     # (the activation scale groups are per block_k)
     block_n: tl.constexpr,
@@ -317,8 +320,13 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
             BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, block_k,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
             COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, N_COLS=N,
+            Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         )
     else:
+        accumulator = add_bias(
+            accumulator, Bias, stride_bias_e, stride_bias_n, 0, pid_n,
+            BLOCK_SIZE_N, N, SWAP_AB,
+        )
         store_masked_oriented(
             C,
             accumulator,
@@ -361,6 +369,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     B,  # (N, K) FP8 weights
     Bs,  # scalar/(1,) per-tensor weight scale
     C,  # (M, N) output
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     # Shape
     M,
     N,
@@ -374,6 +383,8 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     stride_b_n,
     stride_c_m,
     stride_c_n,
+    stride_bias_e,
+    stride_bias_n,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -431,8 +442,13 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
             BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
             COMPUTE_MODE="dot", N_COLS=N,
+            Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         )
     else:
+        accumulator = add_bias(
+            accumulator, Bias, stride_bias_e, stride_bias_n, 0, pid_n,
+            BLOCK_SIZE_N, N, False,
+        )
         store_masked(
             C,
             accumulator,
@@ -489,6 +505,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     BDescriptor,  # host TMA descriptor over B (N, K), box (BN, block_k); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (N // block_n, K // block_k) weight scales (fp32 or uint8/UE8M0)
     C,  # (M, N) output
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     # Shape
     M,
     N,
@@ -503,6 +520,8 @@ def w8a8_block_static_fp8_matmul_kernel(
     stride_bs_n,
     stride_c_m,
     stride_c_n,
+    stride_bias_e,
+    stride_bias_n,
     # Weight-quantization blocks (see the block-dynamic kernel)
     block_n: tl.constexpr,
     block_k: tl.constexpr,
@@ -575,8 +594,13 @@ def w8a8_block_static_fp8_matmul_kernel(
             BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, block_k,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
             COMPUTE_MODE="dot", N_COLS=N,
+            Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         )
     else:
+        accumulator = add_bias(
+            accumulator, Bias, stride_bias_e, stride_bias_n, 0, pid_n,
+            BLOCK_SIZE_N, N, False,
+        )
         store_masked(
             C,
             accumulator,
@@ -660,6 +684,7 @@ def mx_dynamic_matmul_kernel(
     BSDescriptor,  # host TMA descriptor over the SWIZZLE_32_4_4 B scales (BN=128 bulk load); read iff SWIZZLED_SCALES
     C,  # (M, N) output (the GLU intermediate under GATE)
     Cs,  # (M, N // group) row-major requant output scale — written iff OUTPUT_RECIPE and not SWIZZLED_OUT
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     CSDescriptor,  # SWIZZLE_32_4_4 requant-scale descriptor — written iff SWIZZLED_OUT (dummy else), like AS/BS
     AsGlobal,  # (1,) fp32 NVFP4 activation global g_a — SOLELY normalizes the inline raw-A quant (A/g_a); read iff not None
     AsBsGlobal,  # (1,) fp32 NVFP4 combined global g_a·g_b — recovers on the accumulator (one multiply); read iff not None
@@ -684,6 +709,8 @@ def mx_dynamic_matmul_kernel(
     stride_c_n,
     stride_cs_m,  # requant output-scale strides (dead unless OUTPUT_RECIPE)
     stride_cs_n,
+    stride_bias_e,
+    stride_bias_n,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -793,6 +820,9 @@ def mx_dynamic_matmul_kernel(
         CSDescriptor=CSDescriptor, CsGlobal=CsGlobal,
         GlobalScale=AsBsGlobal,
         global_row=0,
+        Bias=Bias,
+        stride_bias_e=stride_bias_e,
+        stride_bias_n=stride_bias_n,
     )
 
 
@@ -839,6 +869,7 @@ def mx_weight_only_matmul_2d_kernel(
     Bs,  # (N, K // SCALE_GROUP_K) group scales — UE8M0 (MX) or E4M3 (NVFP4)
     BsGlobal,  # scalar fp32 NVFP4 per-tensor global — recovers on the accumulator; read iff not None
     C,  # (M, N) output (GLU intermediate under GATE)
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     M,
     N,
     K,
@@ -851,6 +882,8 @@ def mx_weight_only_matmul_2d_kernel(
     stride_bs_k,
     stride_c_m,
     stride_c_n,
+    stride_bias_e,
+    stride_bias_n,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -928,8 +961,13 @@ def mx_weight_only_matmul_2d_kernel(
             BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
             COMPUTE_MODE="dot", N_COLS=N,
+            Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         )
     else:
+        accumulator = add_bias(
+            accumulator, Bias, stride_bias_e, stride_bias_n, 0, pid_n,
+            BLOCK_SIZE_N, N, False,
+        )
         store_masked(
             C, accumulator, pid_m, pid_n, M, N, stride_c_m, stride_c_n,
             BLOCK_SIZE_M, BLOCK_SIZE_N,
@@ -958,6 +996,7 @@ def full_precision_matmul_2d_kernel(
     A,  # (M, K) BF16/FP16 activations
     B,  # (N, K) weights in A's dtype; under GATE the (2N, K) gate|up stack
     C,  # (M, N) output; under GATE the GLU intermediate
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     # Shape
     M,
     N,
@@ -970,6 +1009,8 @@ def full_precision_matmul_2d_kernel(
     stride_b_n,
     stride_c_m,
     stride_c_n,
+    stride_bias_e,
+    stride_bias_n,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -1014,8 +1055,13 @@ def full_precision_matmul_2d_kernel(
             BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
             COMPUTE_MODE="dot", N_COLS=N,
+            Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         )
     else:
+        accumulator = add_bias(
+            accumulator, Bias, stride_bias_e, stride_bias_n, 0, pid_n,
+            BLOCK_SIZE_N, N, False,
+        )
         store_masked(
             C, accumulator, pid_m, pid_n, M, N, stride_c_m, stride_c_n,
             BLOCK_SIZE_M, BLOCK_SIZE_N,
@@ -1038,6 +1084,7 @@ def w8a8_block_dynamic_fp8_matmul(
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Block-scale FP8 matmul: ``C = A @ B.T``; activations quantized offline in one pass.
 
@@ -1091,6 +1138,7 @@ def w8a8_block_dynamic_fp8_matmul(
         )
 
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_kernel)[grid](
             A_q,
             a_descriptor,
@@ -1099,6 +1147,7 @@ def w8a8_block_dynamic_fp8_matmul(
             b_descriptor,
             bs_u8,
             C,
+            bias,
             M,
             N,
             K,
@@ -1113,6 +1162,8 @@ def w8a8_block_dynamic_fp8_matmul(
             bs_u8.stride(0),
             C.stride(-2),
             C.stride(-1),
+            bias_stride_e,
+            bias_stride_n,
             block_n=block_n,
             block_k=block_k,
             GATE=gate,
@@ -1143,6 +1194,7 @@ def w8a8_block_static_fp8_matmul(
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Block-scale FP8 matmul with static (per-tensor) activation quantization.
 
@@ -1206,6 +1258,7 @@ def w8a8_block_static_fp8_matmul(
     b_descriptor = _maybe_descriptor(B, [1, block_k])
 
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(w8a8_block_static_fp8_matmul_kernel)[grid](
             A_q,
             a_descriptor,
@@ -1214,6 +1267,7 @@ def w8a8_block_static_fp8_matmul(
             b_descriptor,
             bs_u8,
             C,
+            bias,
             M,
             N,
             K,
@@ -1226,6 +1280,8 @@ def w8a8_block_static_fp8_matmul(
             bs_u8.stride(0),
             C.stride(-2),
             C.stride(-1),
+            bias_stride_e,
+            bias_stride_n,
             # Meta-parameters (BM and BN come from the config; BK is the caller's
             # block_k — see the block-dynamic kernel)
             block_n=block_n,
@@ -1256,6 +1312,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Tensor-scale FP8 matmul: ``C = A @ B.T``; activations quantized offline per row.
 
@@ -1290,12 +1347,14 @@ def w8a8_tensor_dynamic_fp8_matmul(
         )
 
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_kernel)[grid](
             qA,
             As,
             B,
             Bs,
             C,
+            bias,
             M,
             N,
             K,
@@ -1307,6 +1366,8 @@ def w8a8_tensor_dynamic_fp8_matmul(
             B.stride(0),
             C.stride(-2),
             C.stride(-1),
+            bias_stride_e,
+            bias_stride_n,
             GATE=gate,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
@@ -1337,6 +1398,7 @@ def mx_dynamic_matmul(
     a_global_scale: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """MX/NVFP4 matmul ``C = A @ B.T``; activations quantized offline above the
     ``maybe_act_quant`` M threshold, inline below it. ``input_recipe`` sets the
@@ -1482,6 +1544,7 @@ def mx_dynamic_matmul(
         )
 
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(mx_dynamic_matmul_kernel)[grid](
             A_q,
             a_descriptor,
@@ -1493,6 +1556,7 @@ def mx_dynamic_matmul(
             bs_descriptor,
             C,
             Cs,
+            bias,
             CSDescriptor,
             a_global_scale,  # AsGlobal: g_a for the inline-quant arm (A/g_a)
             input_global_scale,  # AsBsGlobal = g_a·g_b (acc)
@@ -1515,6 +1579,8 @@ def mx_dynamic_matmul(
             C.stride(-1),
             stride_cs_m,
             stride_cs_n,
+            bias_stride_e,
+            bias_stride_n,
             SCALE_GROUP_K=scale_group,
             INPUT_RECIPE=input_recipe,
             SWIZZLED_SCALES=swizzled_scales,
@@ -1544,6 +1610,7 @@ def full_precision_matmul_2d(
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Full-precision (BF16/FP16) 2D matmul ``C = A @ B.T``; no quantization anywhere. ``gate``
     fuses the ``(2N, K)`` gate|up projection into one stacked GEMM + SwiGLU, returning the
@@ -1565,10 +1632,12 @@ def full_precision_matmul_2d(
         )
 
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(full_precision_matmul_2d_kernel)[grid](
             A,
             B,
             C,
+            bias,
             M,
             N,
             K,
@@ -1579,6 +1648,8 @@ def full_precision_matmul_2d(
             B.stride(0),
             C.stride(-2),
             C.stride(-1),
+            bias_stride_e,
+            bias_stride_n,
             GATE=gate,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
@@ -1606,6 +1677,7 @@ def mx_weight_only_matmul_2d(
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     b_global_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """weight-only dense matmul ``C = A @ B.T``: a RAW bf16/fp16 activation (no quant) against an
     MXFP4/NVFP4/MXFP8 weight upcast to bf16 in-loop (NVFP4's per-tensor fp32 ``b_global_scale``
@@ -1648,6 +1720,7 @@ def mx_weight_only_matmul_2d(
         )
 
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(mx_weight_only_matmul_2d_kernel)[grid](
             A,
             a_descriptor,
@@ -1656,6 +1729,7 @@ def mx_weight_only_matmul_2d(
             bs_u8,
             b_global_scale,
             C,
+            bias,
             M,
             N,
             K,
@@ -1668,6 +1742,8 @@ def mx_weight_only_matmul_2d(
             bs_u8.stride(1),
             C.stride(-2),
             C.stride(-1),
+            bias_stride_e,
+            bias_stride_n,
             SCALE_GROUP_K=scale_group,
             WEIGHT_VALUES_PER_BYTE=WEIGHT_VALUES_PER_BYTE,
             GATE=gate,
@@ -1687,6 +1763,7 @@ def matmul_2d(
     As: torch.Tensor | None = None,
     Bs: torch.Tensor | None = None,
     *,
+    bias: torch.Tensor | None = None,  # (E, N_out) per-expert output bias; (N_out,) for 2D
     epilogue: Epilogue | None = None,
     quantization: Quantization | None = None,
     output_dtype: torch.dtype | None = None,
@@ -1743,8 +1820,7 @@ def matmul_2d(
         )
         return _unwrap(
             full_precision_matmul_2d(
-                A, B, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused
-            )
+                A, B, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, bias=bias)
         )
 
     if is_mx(B, Bs):
@@ -1758,15 +1834,13 @@ def matmul_2d(
             return _unwrap(
                 mx_weight_only_matmul_2d(
                     A, B, Bs, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit,
-                    simulate_unfused, b_global_scale=b_global_scale,
-                )
+                    simulate_unfused, b_global_scale=b_global_scale, bias=bias)
             )
         return _unwrap(
             mx_dynamic_matmul(
                 A, B, As, Bs, output_dtype, input_recipe,
                 gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, output_recipe,
-                a_global_scale, b_global_scale, output_global_scale,
-            )
+                a_global_scale, b_global_scale, output_global_scale, bias=bias)
         )
     # FP8 activations are always E4M3 with the weight-implied scale granularity, so "fp8" is a
     # no-op recipe name (accepted for symmetry with the MoE ops); no other name applies here.
@@ -1790,8 +1864,7 @@ def matmul_2d(
         assert As is None, "tensor-wide FP8 quantizes A dynamically — no As"
         return _unwrap(
             w8a8_tensor_dynamic_fp8_matmul(
-                A, B, Bs, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused
-            )
+                A, B, Bs, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, bias=bias)
         )
     # Block-wise FP8: a per-tensor scalar As is the static (calibrated) activation scale; else dynamic.
     if As is not None:
@@ -1799,12 +1872,10 @@ def matmul_2d(
         return _unwrap(
             w8a8_block_static_fp8_matmul(
                 A, B, As, Bs, block_size, output_dtype,
-                gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused,
-            )
+                gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, bias=bias)
         )
     return _unwrap(
         w8a8_block_dynamic_fp8_matmul(
             A, B, Bs, block_size, output_dtype,
-            gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused,
-        )
+            gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, bias=bias)
     )
