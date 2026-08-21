@@ -2,8 +2,7 @@
 name = "weathernext2-banded-attention"
 version = 1
 license = "Apache-2.0"
-# Pure Triton, so the same source serves both. ROCm matters here: the fp32 attention that PyTorch
-# falls back to on CUDA is a cutlass kernel that has no ROCm equivalent.
+# Pure Triton, so the same source serves both. Tested on CUDA (H100) and ROCm (gfx1150).
 backends = ["cuda", "rocm"]
 
 [general.hub]
