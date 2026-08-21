@@ -1,4 +1,4 @@
-from typing import Optional, Dict, cast
+from typing import cast
 
 import oneflow as flow
 
@@ -9,12 +9,12 @@ __author__ = "Tianhe Ren & Depeng Liang"
 
 
 class Rearrange(RearrangeMixin, flow.nn.Module):
-    def forward(self, input):
+    def forward(self, input: flow.Tensor) -> flow.Tensor:
         return self._apply_recipe(input)
 
 
 class Reduce(ReduceMixin, flow.nn.Module):
-    def forward(self, input):
+    def forward(self, input: flow.Tensor) -> flow.Tensor:
         return self._apply_recipe(input)
 
 
@@ -30,10 +30,10 @@ class EinMix(_EinmixMixin, flow.nn.Module):
 
     def _create_rearrange_layers(
         self,
-        pre_reshape_pattern: Optional[str],
-        pre_reshape_lengths: Optional[Dict],
-        post_reshape_pattern: Optional[str],
-        post_reshape_lengths: Optional[Dict],
+        pre_reshape_pattern: str | None,
+        pre_reshape_lengths: dict | None,
+        post_reshape_pattern: str | None,
+        post_reshape_lengths: dict | None,
     ):
         self.pre_rearrange = None
         if pre_reshape_pattern is not None:
@@ -43,7 +43,7 @@ class EinMix(_EinmixMixin, flow.nn.Module):
         if post_reshape_pattern is not None:
             self.post_rearrange = Rearrange(post_reshape_pattern, **cast(dict, post_reshape_lengths))
 
-    def forward(self, input):
+    def forward(self, input: flow.Tensor) -> flow.Tensor:
         if self.pre_rearrange is not None:
             input = self.pre_rearrange(input)
         result = flow.einsum(self.einsum_pattern, input, self.weight)

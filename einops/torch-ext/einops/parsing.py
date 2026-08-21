@@ -1,24 +1,29 @@
-from . import EinopsError
 import keyword
 import warnings
-from typing import List, Optional, Set, Tuple, Union
+from typing import Literal
+
+from . import EinopsError
 
 _ellipsis: str = "…"  # NB, this is a single unicode symbol. String is used as it is not a list, but can be iterated
+_Ellipsis = Literal["…"]
 
 
-class AnonymousAxis(object):
+class AnonymousAxis:
     """Important thing: all instances of this class are not equal to each other"""
 
-    def __init__(self, value: str):
-        self.value = int(value)
+    value: int
+
+    def __init__(self, value_above_1: int):
+        # values above 1 should not be
+        self.value = value_above_1
         if self.value <= 1:
             if self.value == 1:
                 raise EinopsError("No need to create anonymous axis of length 1. Report this as an issue")
             else:
-                raise EinopsError("Anonymous axis should have positive length, not {}".format(self.value))
+                raise EinopsError(f"Anonymous axis should have positive length, not {self.value}")
 
     def __repr__(self):
-        return "{}-axis".format(str(self.value))
+        return f"{str(self.value)}-axis"
 
 
 class ParsedExpression:
@@ -29,12 +34,12 @@ class ParsedExpression:
 
     def __init__(self, expression: str, *, allow_underscore: bool = False, allow_duplicates: bool = False):
         self.has_ellipsis: bool = False
-        self.has_ellipsis_parenthesized: Optional[bool] = None
-        self.identifiers: Set[str] = set()
-        # that's axes like 2, 3, 4 or 5. Axes with size 1 are exceptional and replaced with empty composition
+        self.has_ellipsis_parenthesized: bool | None = None
+        self.identifiers: set[str | AnonymousAxis] = set()
+        # that's axes like 2, 3, 4, etc. Axes with size 1 are exceptional and replaced with empty composition
         self.has_non_unitary_anonymous_axes: bool = False
         # composition keeps structure of composite axes, see how different corner cases are handled in tests
-        self.composition: List[Union[List[str], str]] = []
+        self.composition: list[list[str | AnonymousAxis] | _Ellipsis] = []
         if "." in expression:
             if "..." not in expression:
                 raise EinopsError("Expression may contain dots only inside ellipsis (...)")
@@ -45,37 +50,39 @@ class ParsedExpression:
             expression = expression.replace("...", _ellipsis)
             self.has_ellipsis = True
 
-        bracket_group: Optional[List[str]] = None
+        bracket_group: list[str | AnonymousAxis] | None = None
 
-        def add_axis_name(x):
+        def add_axis_name(x: str) -> None:
             if x in self.identifiers:
                 if not (allow_underscore and x == "_") and not allow_duplicates:
-                    raise EinopsError('Indexing expression contains duplicate dimension "{}"'.format(x))
+                    raise EinopsError(f'Indexing expression contains duplicate dimension "{x}"')
             if x == _ellipsis:
                 self.identifiers.add(_ellipsis)
                 if bracket_group is None:
-                    self.composition.append(_ellipsis)
+                    self.composition.append(_ellipsis)  # type: ignore
                     self.has_ellipsis_parenthesized = False
                 else:
                     bracket_group.append(_ellipsis)
                     self.has_ellipsis_parenthesized = True
+            elif x == "1":
+                # anonymous axis of length 1 is handled separately
+                # outside group - represented as empty composition
+                # inside group - can be safely ignored
+                if bracket_group is None:
+                    self.composition.append([])
+            elif str.isdecimal(x):
+                y = AnonymousAxis(int(x))  # allows 0, and all non-1 shapes
+                self.has_non_unitary_anonymous_axes = True
+                self.identifiers.add(y)
+                if bracket_group is None:
+                    self.composition.append([y])
+                else:
+                    bracket_group.append(y)
             else:
-                is_number = str.isdecimal(x)
-                if is_number and int(x) == 1:
-                    # handling the case of anonymous axis of length 1
-                    if bracket_group is None:
-                        self.composition.append([])
-                    else:
-                        pass  # no need to think about 1s inside parenthesis
-                    return
                 is_axis_name, reason = self.check_axis_name_return_reason(x, allow_underscore=allow_underscore)
-                if not (is_number or is_axis_name):
-                    raise EinopsError("Invalid axis identifier: {}\n{}".format(x, reason))
-                if is_number:
-                    x = AnonymousAxis(x)
+                if not is_axis_name:
+                    raise EinopsError(f"Invalid axis identifier: {x}\n{reason}")
                 self.identifiers.add(x)
-                if is_number:
-                    self.has_non_unitary_anonymous_axes = True
                 if bracket_group is None:
                     self.composition.append([x])
                 else:
@@ -102,20 +109,12 @@ class ParsedExpression:
                 else:
                     current_identifier += char
             else:
-                raise EinopsError("Unknown character '{}'".format(char))
+                raise EinopsError(f"Unknown character '{char}'")
 
         if bracket_group is not None:
-            raise EinopsError('Imbalanced parentheses in expression: "{}"'.format(expression))
+            raise EinopsError(f'Imbalanced parentheses in expression: "{expression}"')
         if current_identifier is not None:
             add_axis_name(current_identifier)
-
-    def flat_axes_order(self) -> List:
-        result = []
-        for composed_axis in self.composition:
-            assert isinstance(composed_axis, list), "does not work with ellipsis"
-            for axis in composed_axis:
-                result.append(axis)
-        return result
 
     def has_composed_axes(self) -> bool:
         # this will ignore 1 inside brackets
@@ -125,7 +124,7 @@ class ParsedExpression:
         return False
 
     @staticmethod
-    def check_axis_name_return_reason(name: str, allow_underscore: bool = False) -> Tuple[bool, str]:
+    def check_axis_name_return_reason(name: str, allow_underscore: bool = False) -> tuple[bool, str]:
         if not str.isidentifier(name):
             return False, "not a valid python identifier"
         elif name[0] == "_" or name[-1] == "_":
@@ -134,11 +133,16 @@ class ParsedExpression:
             return False, "axis name should should not start or end with underscore"
         else:
             if keyword.iskeyword(name):
-                warnings.warn("It is discouraged to use axes names that are keywords: {}".format(name), RuntimeWarning)
+                warnings.warn(
+                    f"It is discouraged to use axes names that are keywords: {name}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             if name in ["axis"]:
                 warnings.warn(
-                    "It is discouraged to use 'axis' as an axis name " "and will raise an error in future",
+                    "It is discouraged to use 'axis' as an axis name and will raise an error in future",
                     FutureWarning,
+                    stacklevel=2,
                 )
             return True, ""
 

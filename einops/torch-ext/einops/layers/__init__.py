@@ -1,10 +1,9 @@
 __author__ = "Alex Rogozhnikov"
 
-from typing import Any, Dict
+from typing import Any
 
-
-from ..einops import TransformRecipe, _apply_recipe, _prepare_recipes_for_all_dims, get_backend
 from .. import EinopsError
+from ..einops import TransformRecipe, _apply_recipe, _prepare_recipes_for_all_dims, get_backend
 
 
 class RearrangeMixin:
@@ -17,6 +16,9 @@ class RearrangeMixin:
     See einops.rearrange for source_examples.
     """
 
+    pattern: str
+    axes_lengths: dict[str, Any]
+
     def __init__(self, pattern: str, **axes_lengths: Any) -> None:
         super().__init__()
         self.pattern = pattern
@@ -28,16 +30,16 @@ class RearrangeMixin:
     def __repr__(self) -> str:
         params = repr(self.pattern)
         for axis, length in self.axes_lengths.items():
-            params += ", {}={}".format(axis, length)
-        return "{}({})".format(self.__class__.__name__, params)
+            params += f", {axis}={length}"
+        return f"{self.__class__.__name__}({params})"
 
-    def multirecipe(self) -> Dict[int, TransformRecipe]:
+    def multirecipe(self) -> dict[int, TransformRecipe]:
         try:
             return _prepare_recipes_for_all_dims(
                 self.pattern, operation="rearrange", axes_names=tuple(self.axes_lengths)
             )
         except EinopsError as e:
-            raise EinopsError(" Error while preparing {!r}\n {}".format(self, e))
+            raise EinopsError(f" Error while preparing {self!r}\n {e}") from None
 
     def _apply_recipe(self, x):
         backend = get_backend(x)
@@ -49,11 +51,11 @@ class RearrangeMixin:
             axes_lengths=self._axes_lengths,
         )
 
-    def __getstate__(self):
+    def __getstate__(self) -> dict[str, Any]:
         return {"pattern": self.pattern, "axes_lengths": self.axes_lengths}
 
-    def __setstate__(self, state):
-        self.__init__(pattern=state["pattern"], **state["axes_lengths"])
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__init__(pattern=state["pattern"], **state["axes_lengths"])  # type: ignore[misc]
 
 
 class ReduceMixin:
@@ -67,7 +69,11 @@ class ReduceMixin:
     See einops.reduce for source_examples.
     """
 
-    def __init__(self, pattern: str, reduction: str, **axes_lengths: Any):
+    pattern: str
+    reduction: str
+    axes_lengths: dict[str, Any]
+
+    def __init__(self, pattern: str, reduction: str, **axes_lengths: Any) -> None:
         super().__init__()
         self.pattern = pattern
         self.reduction = reduction
@@ -75,19 +81,19 @@ class ReduceMixin:
         self._multirecipe = self.multirecipe()
         self._axes_lengths = tuple(self.axes_lengths.items())
 
-    def __repr__(self):
-        params = "{!r}, {!r}".format(self.pattern, self.reduction)
+    def __repr__(self) -> str:
+        params = f"{self.pattern!r}, {self.reduction!r}"
         for axis, length in self.axes_lengths.items():
-            params += ", {}={}".format(axis, length)
-        return "{}({})".format(self.__class__.__name__, params)
+            params += f", {axis}={length}"
+        return f"{self.__class__.__name__}({params})"
 
-    def multirecipe(self) -> Dict[int, TransformRecipe]:
+    def multirecipe(self) -> dict[int, TransformRecipe]:
         try:
             return _prepare_recipes_for_all_dims(
                 self.pattern, operation=self.reduction, axes_names=tuple(self.axes_lengths)
             )
         except EinopsError as e:
-            raise EinopsError(" Error while preparing {!r}\n {}".format(self, e))
+            raise EinopsError(f" Error while preparing {self!r}\n {e}") from None
 
     def _apply_recipe(self, x):
         backend = get_backend(x)
@@ -99,8 +105,8 @@ class ReduceMixin:
             axes_lengths=self._axes_lengths,
         )
 
-    def __getstate__(self):
+    def __getstate__(self) -> dict[str, Any]:
         return {"pattern": self.pattern, "reduction": self.reduction, "axes_lengths": self.axes_lengths}
 
-    def __setstate__(self, state):
-        self.__init__(pattern=state["pattern"], reduction=state["reduction"], **state["axes_lengths"])
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__init__(pattern=state["pattern"], reduction=state["reduction"], **state["axes_lengths"])  # type: ignore[misc]

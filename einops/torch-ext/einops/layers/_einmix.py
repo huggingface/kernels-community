@@ -1,10 +1,10 @@
-from typing import Any, List, Optional, Dict
+import warnings
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 from .. import EinopsError
-from ..parsing import ParsedExpression, _ellipsis
-import warnings
-import string
 from ..einops import _product
+from ..parsing import ParsedExpression, _ellipsis
 
 
 def _report_axes(axes: set, report_message: str):
@@ -12,8 +12,36 @@ def _report_axes(axes: set, report_message: str):
         raise EinopsError(report_message.format(axes))
 
 
+def assert_all_str(seq: Iterable) -> list[str]:
+    # exists more to satisfy typechecks.
+    # We don't actually need these checks, but we're fine to run them in init (and only in init!).
+    result: list[str] = []
+    for el in seq:
+        assert isinstance(el, str), type(el)
+        result.append(el)
+    return result
+
+
+def map_to_letters(identifiers: Sequence[str]) -> dict[str, str]:
+    assert len(identifiers) <= 26, f"too many identifiers: {identifiers}"
+    letter2identifier = {}
+    for identifier in sorted(identifiers, reverse=True, key=str.lower):
+        letter = "z"
+        for c in identifier.lower():
+            if "a" <= c <= "z":
+                letter = c
+                break
+        # pass
+        while letter in letter2identifier:
+            letter = "a" if letter == "z" else chr(ord(letter) + 1)
+
+        letter2identifier[letter] = identifier
+
+    return {ident: letter for letter, ident in letter2identifier.items()}
+
+
 class _EinmixMixin:
-    def __init__(self, pattern: str, weight_shape: str, bias_shape: Optional[str] = None, **axes_lengths: Any):
+    def __init__(self, pattern: str, weight_shape: str, bias_shape: str | None = None, **axes_lengths: Any):
         """
         EinMix - Einstein summation with automated tensor management and axis packing/unpacking.
 
@@ -64,7 +92,7 @@ class _EinmixMixin:
             pattern=pattern, weight_shape=weight_shape, bias_shape=bias_shape, axes_lengths=axes_lengths
         )
 
-    def initialize_einmix(self, pattern: str, weight_shape: str, bias_shape: Optional[str], axes_lengths: dict):
+    def initialize_einmix(self, pattern: str, weight_shape: str, bias_shape: str | None, axes_lengths: dict):
         left_pattern, right_pattern = pattern.split("->")
         left = ParsedExpression(left_pattern)
         right = ParsedExpression(right_pattern)
@@ -89,27 +117,27 @@ class _EinmixMixin:
         pre_reshape_lengths = None
         post_reshape_pattern = None
         if any(len(group) != 1 for group in left.composition):
-            names: List[str] = []
-            for group in left.composition:
-                names += group
-            names = [name if name != _ellipsis else "..." for name in names]
-            composition = " ".join(names)
+            names = assert_all_str(x for group in left.composition for x in group)
+
+            composition = " ".join(name if name != _ellipsis else "..." for name in names)
             pre_reshape_pattern = f"{left_pattern}-> {composition}"
             pre_reshape_lengths = {name: length for name, length in axes_lengths.items() if name in names}
 
+            assert all(isinstance(x, str) for x in names)  # FIXME
+
         if any(len(group) != 1 for group in right.composition) or right.has_ellipsis_parenthesized:
-            names = []
-            for group in right.composition:
-                names += group
-            names = [name if name != _ellipsis else "..." for name in names]
-            composition = " ".join(names)
+            names = assert_all_str(x for group in right.composition for x in group)
+
+            composition = " ".join(name if name != _ellipsis else "..." for name in names)
             post_reshape_pattern = f"{composition} ->{right_pattern}"
+
+            assert all(isinstance(x, str) for x in names)  # FIXME
 
         self._create_rearrange_layers(pre_reshape_pattern, pre_reshape_lengths, post_reshape_pattern, {})
 
         for axis in weight.identifiers:
             if axis not in axes_lengths:
-                raise EinopsError("Dimension {} of weight should be specified".format(axis))
+                raise EinopsError(f"Dimension {axis} of weight should be specified")
         _report_axes(
             set.difference(set(axes_lengths), {*left.identifiers, *weight.identifiers}),
             "Axes {} are not used in pattern",
@@ -118,11 +146,12 @@ class _EinmixMixin:
             set.difference(weight.identifiers, {*left.identifiers, *right.identifiers}), "Weight axes {} are redundant"
         )
         if len(weight.identifiers) == 0:
-            warnings.warn("EinMix: weight has no dimensions (means multiplication by a number)")
+            warnings.warn("EinMix: weight has no dimensions (means multiplication by a number)", stacklevel=2)
 
-        _weight_shape = [axes_lengths[axis] for (axis,) in weight.composition]
+        weight_composition_flat = assert_all_str(axis for [axis] in weight.composition)  # type: ignore
+        _weight_shape = [axes_lengths[axis] for axis in weight_composition_flat]
         # single output element is a combination of fan_in input elements
-        _fan_in = _product([axes_lengths[axis] for (axis,) in weight.composition if axis not in right.identifiers])
+        _fan_in = _product([axes_lengths[axis] for axis in weight_composition_flat if axis not in right.identifiers])
         if bias_shape is not None:
             # maybe I should put ellipsis in the beginning for simplicity?
             if not isinstance(bias_shape, str):
@@ -166,32 +195,30 @@ class _EinmixMixin:
         mapped_identifiers = {*left.identifiers, *right.identifiers, *weight.identifiers}
         if _ellipsis in mapped_identifiers:
             mapped_identifiers.remove(_ellipsis)
-        mapped_identifiers = list(sorted(mapped_identifiers))
-        mapping2letters = {k: letter for letter, k in zip(string.ascii_lowercase, mapped_identifiers)}
+
+        mapping2letters = map_to_letters(assert_all_str(mapped_identifiers))
         mapping2letters[_ellipsis] = "..."  # preserve ellipsis
 
         def write_flat_remapped(axes: ParsedExpression):
             result = []
             for composed_axis in axes.composition:
                 if isinstance(composed_axis, list):
-                    result.extend([mapping2letters[axis] for axis in composed_axis])
+                    result.extend([mapping2letters[axis] for axis in assert_all_str(composed_axis)])
                 else:
                     assert composed_axis == _ellipsis
                     result.append("...")
             return "".join(result)
 
-        self.einsum_pattern: str = "{},{}->{}".format(
-            write_flat_remapped(left),
-            write_flat_remapped(weight),
-            write_flat_remapped(right),
+        self.einsum_pattern: str = (
+            f"{write_flat_remapped(left)},{write_flat_remapped(weight)}->{write_flat_remapped(right)}"
         )
 
     def _create_rearrange_layers(
         self,
-        pre_reshape_pattern: Optional[str],
-        pre_reshape_lengths: Optional[Dict],
-        post_reshape_pattern: Optional[str],
-        post_reshape_lengths: Optional[Dict],
+        pre_reshape_pattern: str | None,
+        pre_reshape_lengths: dict | None,
+        post_reshape_pattern: str | None,
+        post_reshape_lengths: dict | None,
     ):
         raise NotImplementedError("Should be defined in framework implementations")
 
@@ -205,8 +232,8 @@ class _EinmixMixin:
         if self.bias_shape is not None:
             params += f", '{self.bias_shape}'"
         for axis, length in self.axes_lengths.items():
-            params += ", {}={}".format(axis, length)
-        return "{}({})".format(self.__class__.__name__, params)
+            params += f", {axis}={length}"
+        return f"{self.__class__.__name__}({params})"
 
 
 class _EinmixDebugger(_EinmixMixin):
@@ -214,10 +241,10 @@ class _EinmixDebugger(_EinmixMixin):
 
     def _create_rearrange_layers(
         self,
-        pre_reshape_pattern: Optional[str],
-        pre_reshape_lengths: Optional[Dict],
-        post_reshape_pattern: Optional[str],
-        post_reshape_lengths: Optional[Dict],
+        pre_reshape_pattern: str | None,
+        pre_reshape_lengths: dict | None,
+        post_reshape_pattern: str | None,
+        post_reshape_lengths: dict | None,
     ):
         self.pre_reshape_pattern = pre_reshape_pattern
         self.pre_reshape_lengths = pre_reshape_lengths
