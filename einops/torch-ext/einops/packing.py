@@ -1,18 +1,17 @@
+from collections.abc import Sequence
 from functools import lru_cache
-from typing import List, Union, TypeVar, Tuple, Sequence
+from typing import TypeAlias
 
 from . import EinopsError
-
 from ._backends import get_backend
+from .einops import Tensor
 from .parsing import ParsedExpression
 
-Tensor = TypeVar("Tensor")
-
-Shape = Union[Tuple[int, ...], List[int]]
+Shape: TypeAlias = Sequence[int]
 
 
 @lru_cache(maxsize=128)
-def analyze_pattern(pattern: str, opname: str) -> Tuple[int, int, int]:
+def analyze_pattern(pattern: str, opname: str) -> tuple[int, int, int]:
     # Maybe some validation of identifiers?
     axes = pattern.split()
     axes_set = set(axes)
@@ -31,7 +30,7 @@ def analyze_pattern(pattern: str, opname: str) -> Tuple[int, int, int]:
     return n_axes_before, n_axes_after, min_axes
 
 
-def pack(tensors: Sequence[Tensor], pattern: str) -> Tuple[Tensor, List[Shape]]:
+def pack(tensors: Sequence[Tensor], pattern: str) -> tuple[Tensor, list[Shape]]:
     """
     Packs several tensors into one.
     See einops tutorial for introduction into packing (and how it replaces stack and concatenation).
@@ -72,8 +71,8 @@ def pack(tensors: Sequence[Tensor], pattern: str) -> Tuple[Tensor, List[Shape]]:
     # packing zero tensors is illegal
     backend = get_backend(tensors[0])
 
-    reshaped_tensors: List[Tensor] = []
-    packed_shapes: List[Shape] = []
+    reshaped_tensors: list[Tensor] = []
+    packed_shapes: list[Shape] = []
     for i, tensor in enumerate(tensors):
         shape = backend.shape(tensor)
         if len(shape) < min_axes:
@@ -95,7 +94,7 @@ def prod(x: Shape) -> int:
     return result
 
 
-def unpack(tensor: Tensor, packed_shapes: List[Shape], pattern: str) -> List[Tensor]:
+def unpack(tensor: Tensor, packed_shapes: Sequence[Shape], pattern: str) -> list[Tensor]:
     """
     Unpacks a single tensor into several by splitting over a selected axes.
     See einops tutorial for introduction into packing (and how it replaces stack and concatenation).
@@ -145,7 +144,7 @@ def unpack(tensor: Tensor, packed_shapes: List[Shape], pattern: str) -> List[Ten
 
     unpacked_axis: int = n_axes_before
 
-    lengths_of_composed_axes: List[int] = [-1 if -1 in p_shape else prod(p_shape) for p_shape in packed_shapes]
+    lengths_of_composed_axes: list[int] = [-1 if -1 in p_shape else prod(p_shape) for p_shape in packed_shapes]
 
     n_unknown_composed_axes = sum(int(x == -1) for x in lengths_of_composed_axes)
     if n_unknown_composed_axes > 1:
@@ -182,9 +181,9 @@ def unpack(tensor: Tensor, packed_shapes: List[Shape], pattern: str) -> List[Ten
             )
             for i, element_shape in enumerate(packed_shapes)
         ]
-    except Exception:
+    except Exception as e:
         # this hits if there is an error during reshapes, which means passed shapes were incorrect
-        raise RuntimeError(
+        raise EinopsError(
             f'Error during unpack(..., "{pattern}"): could not split axis of size {split_positions[-1]}'
             f" into requested {packed_shapes}"
-        )
+        ) from e

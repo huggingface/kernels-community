@@ -11,9 +11,9 @@ but torch.compile seems to work with operations just fine.
 """
 
 import warnings
-from typing import Dict, List, Tuple
 
 import torch
+
 from .einops import TransformRecipe, _reconstruct_from_shape_uncached
 
 
@@ -24,7 +24,7 @@ class TorchJitBackend:
     """
 
     @staticmethod
-    def reduce(x: torch.Tensor, operation: str, reduced_axes: List[int]):
+    def reduce(x: torch.Tensor, operation: str, reduced_axes: list[int]):
         if operation == "min":
             return x.amin(dim=reduced_axes)
         elif operation == "max":
@@ -34,26 +34,26 @@ class TorchJitBackend:
         elif operation == "mean":
             return x.mean(dim=reduced_axes)
         elif operation == "prod":
-            for i in list(sorted(reduced_axes))[::-1]:
+            for i in sorted(reduced_axes)[::-1]:
                 x = x.prod(dim=i)
             return x
         else:
             raise NotImplementedError("Unknown reduction ", operation)
 
     @staticmethod
-    def transpose(x, axes: List[int]):
+    def transpose(x, axes: list[int]):
         return x.permute(axes)
 
     @staticmethod
-    def stack_on_zeroth_dimension(tensors: List[torch.Tensor]):
+    def stack_on_zeroth_dimension(tensors: list[torch.Tensor]):
         return torch.stack(tensors)
 
     @staticmethod
-    def tile(x, repeats: List[int]):
+    def tile(x, repeats: list[int]):
         return x.repeat(repeats)
 
     @staticmethod
-    def add_axes(x, n_axes: int, pos2len: Dict[int, int]):
+    def add_axes(x, n_axes: int, pos2len: dict[int, int]):
         repeats = [-1] * n_axes
         for axis_position, axis_length in pos2len.items():
             x = torch.unsqueeze(x, axis_position)
@@ -69,13 +69,13 @@ class TorchJitBackend:
         return x.shape
 
     @staticmethod
-    def reshape(x, shape: List[int]):
+    def reshape(x, shape: list[int]):
         return x.reshape(shape)
 
 
 # mirrors einops.einops._apply_recipe
 def apply_for_scriptable_torch(
-    recipe: TransformRecipe, tensor: torch.Tensor, reduction_type: str, axes_dims: List[Tuple[str, int]]
+    recipe: TransformRecipe, tensor: torch.Tensor, reduction_type: str, axes_dims: list[tuple[str, int]]
 ) -> torch.Tensor:
     backend = TorchJitBackend
     (
@@ -103,13 +103,20 @@ def allow_ops_in_compiled_graph():
     if hasattr(torch, "__version__") and torch.__version__[0] < "2":
         # torch._dynamo and torch.compile appear in pytorch 2.0
         return
+
+    if hasattr(torch, "__version__") and torch.__version__ >= "2.8":
+        # einops don't need to use allow_in graph for torch 2.8 and above
+        return
+
     try:
         from torch._dynamo import allow_in_graph
     except ImportError:
-        warnings.warn("allow_ops_in_compiled_graph failed to import torch: ensure pytorch >=2.0", ImportWarning)
+        warnings.warn(
+            "allow_ops_in_compiled_graph failed to import torch: ensure pytorch >=2.0", ImportWarning, stacklevel=1
+        )
         return
 
-    from .einops import rearrange, reduce, repeat, einsum
+    from .einops import einsum, rearrange, reduce, repeat
     from .packing import pack, unpack
 
     allow_in_graph(rearrange)
@@ -120,8 +127,8 @@ def allow_ops_in_compiled_graph():
     allow_in_graph(unpack)
 
     # CF: https://github.com/pytorch/pytorch/blob/2df939aacac68e9621fbd5d876c78d86e72b41e2/torch/_dynamo/__init__.py#L222
-    global _ops_were_registered_in_torchdynamo
-    _ops_were_registered_in_torchdynamo = True
+    global _ops_were_registered_in_torchdynamo  # type: ignore
+    _ops_were_registered_in_torchdynamo = True  # type: ignore
 
 
 # module import automatically registers ops in torchdynamo

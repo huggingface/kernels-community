@@ -13,7 +13,7 @@ recipe version=1
 
 source \
     repo="https://github.com/arogozhnikov/einops.git" \
-    commit="ad2c8d67d08cbebb45e1aff2be21dc88635fc695"
+    commit="e0d5eb4fd535945ff65d309206d0f1754a926821"
 
 prune keep="einops/**"
 delete in="einops/tests/**"
@@ -25,7 +25,7 @@ move \
 relativize_imports \
     in="torch-ext/einops/**" \
     package_root="torch-ext/einops" \
-    changes=7
+    changes=13
 expect \
     in="torch-ext/einops/**" \
     find="from einops" \
@@ -44,7 +44,7 @@ overlay from="overlay"
 
 expect \
     in="torch-ext/einops/**" \
-    files=18
+    files=17
 expect \
     in="tests/**" \
     files=9

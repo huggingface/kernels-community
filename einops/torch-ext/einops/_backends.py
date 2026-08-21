@@ -29,7 +29,8 @@ def get_backend(tensor) -> "AbstractBackend":
     if _result is not None:
         return _result
 
-    for framework_name, backend in list(_loaded_backends.items()):
+    previously_loaded_backends = list(_loaded_backends.items())
+    for _framework_name, backend in previously_loaded_backends:
         if backend.is_appropriate_type(tensor):
             _type2backend[_type] = backend
             return backend
@@ -42,10 +43,12 @@ def get_backend(tensor) -> "AbstractBackend":
         backends += backend.__subclasses__()
         backend_subclasses.append(backend)
 
+    # handles modification of _loaded_backends from other thread, see #391
+    prev_backend_names = [x for x, _ in previously_loaded_backends]
     for BackendSubclass in backend_subclasses:
         if _debug_importing:
             print("Testing for subclass of ", BackendSubclass)
-        if BackendSubclass.framework_name not in _loaded_backends:
+        if BackendSubclass.framework_name not in prev_backend_names:
             # check that module was already imported. Otherwise it can't be imported
             if BackendSubclass.framework_name in sys.modules:
                 if _debug_importing:
@@ -56,7 +59,7 @@ def get_backend(tensor) -> "AbstractBackend":
                     _type2backend[_type] = backend
                     return backend
 
-    raise RuntimeError("Tensor type unknown to einops {}".format(type(tensor)))
+    raise RuntimeError(f"Tensor type unknown to einops {type(tensor)}")
 
 
 class AbstractBackend:
@@ -129,7 +132,7 @@ class AbstractBackend:
         raise NotImplementedError("backend does not provide layers")
 
     def __repr__(self):
-        return "<einops backend for {}>".format(self.framework_name)
+        return f"<einops backend for {self.framework_name}>"
 
     def einsum(self, pattern, *x):
         raise NotImplementedError("backend does not support einsum")
@@ -197,7 +200,7 @@ class JaxBackend(NumpyBackend):
     framework_name = "jax"
 
     def __init__(self):
-        super(JaxBackend, self).__init__()
+        super().__init__()
         self.onp = self.np
 
         import jax.numpy
@@ -248,7 +251,7 @@ class TorchBackend(AbstractBackend):
             return x.mean(dim=reduced_axes)
         elif operation in ("any", "all", "prod"):
             # pytorch supports reducing only one operation at a time
-            for i in list(sorted(reduced_axes))[::-1]:
+            for i in sorted(reduced_axes)[::-1]:
                 x = getattr(x, operation)(dim=i)
             return x
         else:
@@ -334,8 +337,7 @@ class HashableTuple:
         self.elements = elements
 
     def __iter__(self):
-        for x in self.elements:
-            yield x
+        yield from self.elements
 
     def __len__(self):
         return len(self.elements)
@@ -700,7 +702,7 @@ class PyTensorBackend(AbstractBackend):
         # use the static shape dimensions where known
         return tuple(
             static_dim if static_dim is not None else symbolic_dim
-            for static_dim, symbolic_dim in zip(x.type.shape, x.shape)
+            for static_dim, symbolic_dim in zip(x.type.shape, x.shape, strict=True)
         )
 
     def stack_on_zeroth_dimension(self, tensors: list):
@@ -717,3 +719,48 @@ class PyTensorBackend(AbstractBackend):
 
     def einsum(self, pattern, *x):
         return self.pt.einsum(pattern, *x)
+
+
+class MLXBackend(AbstractBackend):
+    framework_name = "mlx.core"
+    # we should check for mlx.core, because
+    # there are other mlx.<submodules> that don't need mlx.core
+
+    def __init__(self):
+        import mlx.core as mx
+        import numpy as np
+
+        self.mx = mx
+        self.np = np
+
+    def is_appropriate_type(self, tensor):
+        return isinstance(tensor, self.mx.array)
+
+    def from_numpy(self, x):
+        return self.mx.array(x)
+
+    def to_numpy(self, x):
+        if x.dtype == self.mx.bfloat16:
+            x = x.astype(self.mx.float32)
+        return self.np.array(x)
+
+    def arange(self, start, stop):
+        return self.mx.arange(start, stop)
+
+    def stack_on_zeroth_dimension(self, tensors: list):
+        return self.mx.stack(tensors)
+
+    def add_axis(self, x, new_position):
+        return self.mx.expand_dims(x, new_position)
+
+    def tile(self, x, repeats):
+        return self.mx.tile(x, repeats)
+
+    def concat(self, tensors, axis: int):
+        return self.mx.concatenate(tensors, axis=axis)
+
+    def is_float_type(self, x):
+        return self.mx.issubdtype(x.dtype, self.mx.floating)
+
+    def einsum(self, pattern, *x):
+        return self.mx.einsum(pattern, *x)

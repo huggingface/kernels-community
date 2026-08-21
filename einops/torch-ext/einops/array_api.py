@@ -1,14 +1,44 @@
-from typing import List, Tuple, Sequence
-from .einops import Tensor, Reduction, EinopsError, _prepare_transformation_recipe, _apply_recipe_array_api
+from collections.abc import Sequence
+from types import ModuleType
+from typing import TYPE_CHECKING, Protocol, TypeAlias, TypeVar, cast
+
+from .einops import EinopsError, Reduction, _apply_recipe_array_api, _prepare_transformation_recipe
 from .packing import analyze_pattern, prod
 
+if TYPE_CHECKING:
+    # avoid runtime dependencies
+    import numpy as np
+    from typing_extensions import CapsuleType
 
-def reduce(tensor: Tensor, pattern: str, reduction: Reduction, **axes_lengths: int) -> Tensor:
+    class ArrayAPITensor(Protocol):
+        def __array_namespace__(self, /) -> ModuleType: ...
+        @property
+        def shape(self, /) -> tuple[int, ...]: ...
+        @property
+        def ndim(self, /) -> int: ...
+        def __getitem__(self, arg) -> "ArrayAPITensor": ...
+        # additional
+        def __dlpack__(self, /, *, stream: None = ...) -> CapsuleType: ...
+else:
+
+    class ArrayAPITensor(Protocol):
+        def __array_namespace__(self, /) -> ModuleType: ...
+        @property
+        def shape(self, /) -> tuple[int, ...]: ...
+        @property
+        def ndim(self, /) -> int: ...
+        def __getitem__(self, arg) -> "ArrayAPITensor": ...
+
+
+Tensor = TypeVar("Tensor", bound=ArrayAPITensor)
+
+
+def reduce(tensor: Tensor | list[Tensor], pattern: str, reduction: Reduction, **axes_lengths: int) -> Tensor:
     if isinstance(tensor, list):
         if len(tensor) == 0:
             raise TypeError("Einops can't be applied to an empty list")
         xp = tensor[0].__array_namespace__()
-        tensor = xp.stack(tensor)
+        tensor = cast(Tensor, xp.stack(tensor))
     else:
         xp = tensor.__array_namespace__()
     try:
@@ -22,38 +52,38 @@ def reduce(tensor: Tensor, pattern: str, reduction: Reduction, **axes_lengths: i
             axes_lengths=hashable_axes_lengths,
         )
     except EinopsError as e:
-        message = ' Error while processing {}-reduction pattern "{}".'.format(reduction, pattern)
+        message = f' Error while processing {reduction}-reduction pattern "{pattern}".'
         if not isinstance(tensor, list):
-            message += "\n Input tensor shape: {}. ".format(tensor.shape)
+            message += f"\n Input tensor shape: {tensor.shape}. "
         else:
             message += "\n Input is list. "
-        message += "Additional info: {}.".format(axes_lengths)
-        raise EinopsError(message + "\n {}".format(e))
+        message += f"Additional info: {axes_lengths}."
+        raise EinopsError(message + f"\n {e}") from None
 
 
-def repeat(tensor: Tensor, pattern: str, **axes_lengths) -> Tensor:
+def repeat(tensor: Tensor | list[Tensor], pattern: str, **axes_lengths: int) -> Tensor:
     return reduce(tensor, pattern, reduction="repeat", **axes_lengths)
 
 
-def rearrange(tensor: Tensor, pattern: str, **axes_lengths) -> Tensor:
+def rearrange(tensor: Tensor | list[Tensor], pattern: str, **axes_lengths: int) -> Tensor:
     return reduce(tensor, pattern, reduction="rearrange", **axes_lengths)
 
 
-def asnumpy(tensor: Tensor):
+def asnumpy(tensor: Tensor) -> "np.ndarray":
     import numpy as np
 
     return np.from_dlpack(tensor)
 
 
-Shape = Tuple
+Shape: TypeAlias = tuple
 
 
-def pack(tensors: Sequence[Tensor], pattern: str) -> Tuple[Tensor, List[Shape]]:
+def pack(tensors: Sequence[Tensor], pattern: str) -> tuple[Tensor, list[Shape]]:
     n_axes_before, n_axes_after, min_axes = analyze_pattern(pattern, "pack")
     xp = tensors[0].__array_namespace__()
 
-    reshaped_tensors: List[Tensor] = []
-    packed_shapes: List[Shape] = []
+    reshaped_tensors: list[Tensor] = []
+    packed_shapes: list[Shape] = []
     for i, tensor in enumerate(tensors):
         shape = tensor.shape
         if len(shape) < min_axes:
@@ -68,7 +98,7 @@ def pack(tensors: Sequence[Tensor], pattern: str) -> Tuple[Tensor, List[Shape]]:
     return xp.concat(reshaped_tensors, axis=n_axes_before), packed_shapes
 
 
-def unpack(tensor: Tensor, packed_shapes: List[Shape], pattern: str) -> List[Tensor]:
+def unpack(tensor: Tensor, packed_shapes: Sequence[Shape | list], pattern: str) -> list[Tensor]:
     xp = tensor.__array_namespace__()
     n_axes_before, n_axes_after, min_axes = analyze_pattern(pattern, opname="unpack")
 
@@ -79,7 +109,7 @@ def unpack(tensor: Tensor, packed_shapes: List[Shape], pattern: str) -> List[Ten
 
     unpacked_axis: int = n_axes_before
 
-    lengths_of_composed_axes: List[int] = [-1 if -1 in p_shape else prod(p_shape) for p_shape in packed_shapes]
+    lengths_of_composed_axes: list[int] = [-1 if -1 in p_shape else prod(p_shape) for p_shape in packed_shapes]
 
     n_unknown_composed_axes = sum(x == -1 for x in lengths_of_composed_axes)
     if n_unknown_composed_axes > 1:
@@ -116,9 +146,9 @@ def unpack(tensor: Tensor, packed_shapes: List[Shape], pattern: str) -> List[Ten
             )
             for i, element_shape in enumerate(packed_shapes)
         ]
-    except Exception:
+    except Exception as e:
         # this hits if there is an error during reshapes, which means passed shapes were incorrect
         raise RuntimeError(
             f'Error during unpack(..., "{pattern}"): could not split axis of size {split_positions[-1]}'
             f" into requested {packed_shapes}"
-        )
+        ) from e
