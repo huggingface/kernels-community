@@ -10,6 +10,7 @@ os.environ.setdefault("DG_USE_TEMP_CUBLASLT_WORKSPACE", "1")
 
 # Import the compiled extension
 from ._ops import ops as _ops, add_op_namespace_prefix
+from . import testing
 from . import utils
 
 __version__ = "2.5.0"
