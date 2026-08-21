@@ -771,9 +771,11 @@ def _find_cuda_home() -> str:
                 cuda_home = os.path.dirname(os.path.dirname(nvcc))
         except Exception:
             cuda_home = "/usr/local/cuda"
-            if not os.path.exists(cuda_home):
-                cuda_home = None
-    assert cuda_home is not None, "Could not find CUDA installation"
+    # Only the runtime JIT compiler needs a CUDA toolkit. The cuBLASLt GEMMs, the
+    # runtime configuration surface and the layout fast paths compile nothing, so
+    # a missing toolkit must not fail here -- `init()` only records the path.
+    # Return the conventional location and let the JIT compiler report the
+    # missing `nvcc` if it is ever reached.
     return cuda_home
 
 

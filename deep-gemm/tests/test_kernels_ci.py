@@ -3,14 +3,22 @@
 #
 # The rest of the suite is vendored from upstream: it sweeps hundreds of shapes
 # and benchmarks each one with `bench_kineto`, which is far too slow for CI. The
-# tests here are deliberately standalone -- one small shape per kernel family, no
-# benchmarking, no shared helpers -- so that CI runtime is dominated by
-# DeepGEMM's runtime JIT compilation rather than by the GEMMs themselves.
+# tests here are deliberately standalone -- small shapes, no benchmarking, no
+# shared helpers -- and they all run on any CUDA device.
 #
-# One test per kernel family: the cuBLASLt fallback, the layout kernels, and the
-# BF16, FP8 and grouped GEMMs that are DeepGEMM's reason to exist. Everything
-# except cuBLASLt is skipped below sm90 -- see `requires_hopper` -- so on a
-# pre-Hopper runner this file is close to a load-and-call check.
+# That last point constrains what can be covered. DeepGEMM's GEMMs are Hopper
+# and Blackwell only, on two counts: the entry points dispatch on `arch_major`
+# being 9 or 10 and assert otherwise, and the runtime JIT always compiles with
+# `-arch=sm_<cc>a`, a suffix nvcc only accepts from sm90 on ("Unsupported gpu
+# architecture 'sm_89a'"). So this file covers what is reachable without a
+# Hopper GPU and without JIT compilation:
+#
+#   - the cuBLASLt GEMMs and the cuBLASLt einsum path, which call the library
+#     directly;
+#   - the non-JIT paths of the scaling-factor layout API;
+#   - the runtime configuration surface (SM count, TC util, PDL, alignment);
+#   - the operator/fake-tensor registration of the Hopper-only GEMMs, which is
+#     checked under `FakeTensorMode` and so needs no kernel launch.
 
 import kernels
 import pytest
@@ -20,132 +28,184 @@ import torch
 # `[general] version` in `build.toml`.
 deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
 
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires a CUDA device"
-)
+pytestmark = [
+    pytest.mark.kernels_ci,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device"),
+]
 
-# DeepGEMM needs Hopper or newer on two counts: the GEMM entry points dispatch
-# on `arch_major` being 9 (Hopper) or 10 (Blackwell) and assert otherwise, and
-# the runtime JIT always compiles with `-arch=sm_<cc>a`, a suffix nvcc only
-# accepts from sm90 on ("Unsupported gpu architecture 'sm_89a'"). That leaves
-# cuBLASLt -- which calls the library directly and JITs nothing -- as the only
-# kernel this file can exercise on an older GPU.
-requires_hopper = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
-    reason="DeepGEMM requires Hopper (sm90) or newer",
-)
-
-# Small enough to keep the kernels themselves negligible, large enough to stay
-# on the block sizes the heuristics pick for real shapes.
 M, N, K = 128, 512, 512
 
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
-    """Upstream's error metric: 1 - cosine similarity, so that it is meaningful
-    for the quantized kernels too."""
+    """Upstream's error metric: 1 - cosine similarity."""
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
     return 0.0 if denominator == 0 else (1 - 2 * (x * y).sum() / denominator).item()
 
 
-def randn_ab(m: int = M, n: int = N, k: int = K):
-    """`[m, k] @ [n, k].T` operands plus the FP32 reference product."""
+def tma_aligned(mn: int, element_size: int = 4) -> int:
+    """Rounds `mn` up to a 16-byte TMA boundary.
+
+    Mirrors the kernel's `get_tma_aligned_size`, which cannot be called from
+    Python: it takes only ints but is registered for `torch::kCUDA`, so the
+    dispatcher has no tensor argument to pick a backend from and raises.
+    """
+    elems_per_16b = 16 // element_size
+    return -(-mn // elems_per_16b) * elems_per_16b
+
+
+# ── cuBLASLt GEMMs ─────────────────────────────────────────────────────────
+# `nn`/`tn`/`tt` are thin transposing wrappers around `nt`, so the operands are
+# built to make every variant compute the same `[M, K] @ [N, K].T` product.
+
+@pytest.mark.parametrize("variant", ["nt", "nn", "tn", "tt"])
+def test_cublaslt_gemm(variant: str) -> None:
     torch.manual_seed(0)
-    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
-    b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
-    d = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
-    return a, b, d, a.float() @ b.float().t()
+    a = torch.randn((M, K), device='cuda', dtype=torch.bfloat16)
+    b = torch.randn((N, K), device='cuda', dtype=torch.bfloat16)
+    d = torch.empty((M, N), device='cuda', dtype=torch.bfloat16)
+    ref_d = a.float() @ b.float().t()
 
-
-@pytest.mark.kernels_ci
-@requires_cuda
-def test_cublaslt_gemm_nt() -> None:
-    a, b, d, ref_d = randn_ab()
-
-    deep_gemm.cublaslt_gemm_nt(a, b, d)
+    operands = {
+        'nt': (a, b),
+        'nn': (a, b.t().contiguous()),
+        'tn': (a.t().contiguous(), b.t().contiguous()),
+        'tt': (a.t().contiguous(), b),
+    }[variant]
+    getattr(deep_gemm, f'cublaslt_gemm_{variant}')(*operands, d)
 
     diff = calc_diff(d, ref_d)
     assert diff < 1e-5, f'{diff:.7f}'
 
 
-@pytest.mark.kernels_ci
-@requires_cuda
-@requires_hopper
-def test_sf_layout_transpose() -> None:
-    # `get_mn_major_tma_aligned_tensor` is architecture-agnostic
-    # (`smxx_layout`) and is the cheapest kernel that goes through the runtime
-    # JIT compiler, so this doubles as a check that JIT compilation works.
+# ── einsum, cuBLASLt path ──────────────────────────────────────────────────
+# `bhr,hdr->bhd` and `bhd,hdr->bhr` check `use_cublaslt` before dispatching on
+# the architecture, so they are the only reachable einsum expressions here
+# (`bmk,bnk->mn` has no cuBLASLt path and asserts on anything below sm90).
+
+@pytest.mark.parametrize("expr", ["bhr,hdr->bhd", "bhd,hdr->bhr"])
+def test_einsum_cublaslt(expr: str) -> None:
     torch.manual_seed(0)
-    x = torch.randn((M, K), device='cuda', dtype=torch.bfloat16)
-    _, fp32_sf = deep_gemm.utils.per_token_cast_to_fp8(x, use_ue8m0=False)
+    b_, h, r, d_ = 4, 8, 512, 128
+    lhs_last, out_last = (r, d_) if expr == "bhr,hdr->bhd" else (d_, r)
 
-    transposed_sf = deep_gemm.get_mn_major_tma_aligned_tensor(fp32_sf)
+    x = torch.randn((b_, h, lhs_last), device='cuda', dtype=torch.bfloat16)
+    y = torch.randn((h, d_, r), device='cuda', dtype=torch.bfloat16)
+    z = torch.empty((b_, h, out_last), device='cuda', dtype=torch.bfloat16)
 
-    # The kernel only restrides the scaling factors into an MN-major, TMA
-    # aligned layout, so the values must come back untouched.
-    mn, sf_k = fp32_sf.shape
-    assert transposed_sf.shape == (mn, sf_k)
-    assert transposed_sf.stride() == (1, deep_gemm.get_tma_aligned_size(mn, 4))
-    assert torch.equal(fp32_sf, transposed_sf)
+    deep_gemm.einsum(expr, x, y, z, use_cublaslt=True)
 
-
-@pytest.mark.kernels_ci
-@requires_cuda
-@requires_hopper
-def test_bf16_gemm_nt() -> None:
-    a, b, d, ref_d = randn_ab()
-
-    deep_gemm.bf16_gemm_nt(a, b, d)
-
-    diff = calc_diff(d, ref_d)
+    diff = calc_diff(z, torch.einsum(expr, x, y))
     assert diff < 1e-5, f'{diff:.7f}'
 
 
-@pytest.mark.kernels_ci
-@requires_cuda
-@requires_hopper
-def test_fp8_gemm_nt() -> None:
-    a, b, d, ref_d = randn_ab()
+# ── scaling-factor layout, non-JIT paths ───────────────────────────────────
+# `get_mn_major_tma_aligned_tensor` restrides scaling factors into an MN-major,
+# TMA-aligned layout. It returns the input untouched when it already has that
+# layout, and falls back to a PyTorch copy when the input is not contiguous;
+# only the contiguous-but-unaligned case needs the JIT. `mn` is deliberately not
+# a multiple of the 4-element TMA boundary so the padding is exercised.
 
-    # Hopper runs the 1D2D kernel with FP32 scaling factors, Blackwell the 1D1D
-    # kernel with UE8M0 ones. Leaving the recipes unset lets the kernel pick the
-    # default for the scaling factor dtypes it is handed.
-    use_ue8m0 = torch.cuda.get_device_capability()[0] >= 10
-    a_fp8 = deep_gemm.utils.per_token_cast_to_fp8(a, use_ue8m0=use_ue8m0)
-    b_fp8 = deep_gemm.utils.per_block_cast_to_fp8(b, use_ue8m0=use_ue8m0)
+def test_mn_major_tma_aligned_tensor_already_aligned() -> None:
+    mn, sf_k = 129, 4
+    storage = torch.randn((sf_k, tma_aligned(mn)), device='cuda', dtype=torch.float)
+    sf = storage[:, :mn].t()
+    assert sf.stride() == (1, tma_aligned(mn))
 
-    deep_gemm.fp8_gemm_nt(a_fp8, b_fp8, d, disable_ue8m0_cast=not use_ue8m0)
+    out = deep_gemm.get_mn_major_tma_aligned_tensor(sf)
 
-    # Compared against the unquantized reference, so the tolerance has to absorb
-    # the FP8 quantization error -- same threshold the upstream sweep uses.
-    diff = calc_diff(d, ref_d)
-    assert diff < 0.001, f'{diff:.7f}'
+    assert out.data_ptr() == sf.data_ptr(), "should have been returned as-is"
+    assert torch.equal(out, sf)
 
 
-@pytest.mark.kernels_ci
-@requires_cuda
-@requires_hopper
-def test_m_grouped_bf16_gemm_nt_contiguous() -> None:
-    num_groups = 2
+@pytest.mark.parametrize("num_groups", [1, 2])
+def test_mn_major_tma_aligned_tensor_non_contiguous(num_groups: int) -> None:
+    mn, sf_k = 129, 4
+    shape = (mn, sf_k + 1) if num_groups == 1 else (num_groups, mn, sf_k + 1)
+    sf = torch.randn(shape, device='cuda', dtype=torch.float)[..., :sf_k]
+    assert not sf.is_contiguous()
 
-    # Rows of `a` are grouped in blocks of this alignment; using exactly one
-    # block per group keeps the layout free of padding rows (which would be
-    # marked with -1 in `grouped_layout`).
-    m_per_group = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
-    deep_gemm.set_mk_alignment_for_contiguous_layout(m_per_group)
+    out = deep_gemm.get_mn_major_tma_aligned_tensor(sf)
 
-    a, b, d, _ = randn_ab(m=num_groups * m_per_group)
-    b = b.unsqueeze(0).repeat(num_groups, 1, 1).contiguous()
-    b[1] = -b[1]  # so that a wrong group index cannot pass unnoticed
-    grouped_layout = torch.arange(
-        num_groups, device='cuda', dtype=torch.int32
-    ).repeat_interleave(m_per_group)
-    ref_d = torch.cat([
-        a[i * m_per_group:(i + 1) * m_per_group].float() @ b[i].float().t()
-        for i in range(num_groups)
-    ])
+    aligned_mn = tma_aligned(mn)
+    assert out.shape == sf.shape
+    assert out.stride()[-2:] == (1, aligned_mn)
+    if num_groups > 1:
+        assert out.stride(0) == aligned_mn * sf_k
+    assert torch.equal(out, sf)
 
-    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout)
 
-    diff = calc_diff(d, ref_d)
-    assert diff < 1e-5, f'{diff:.7f}'
+# ── runtime configuration ──────────────────────────────────────────────────
+
+def test_num_sms() -> None:
+    total = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    assert deep_gemm.get_num_sms() == total
+
+    deep_gemm.set_num_sms(total // 2)
+    assert deep_gemm.get_num_sms() == total // 2
+    deep_gemm.set_num_sms(total)
+
+    with pytest.raises(RuntimeError):
+        deep_gemm.set_num_sms(total + 1)
+    assert deep_gemm.get_num_sms() == total
+
+
+def test_tc_util() -> None:
+    original = deep_gemm.get_tc_util()
+    deep_gemm.set_tc_util(50)
+    assert deep_gemm.get_tc_util() == 50
+    deep_gemm.set_tc_util(original)
+
+    with pytest.raises(RuntimeError):
+        deep_gemm.set_tc_util(101)
+    assert deep_gemm.get_tc_util() == original
+
+
+def test_pdl() -> None:
+    original = deep_gemm.get_pdl()
+    deep_gemm.set_pdl(not original)
+    assert deep_gemm.get_pdl() is not original
+    deep_gemm.set_pdl(original)
+    assert deep_gemm.get_pdl() is original
+
+
+def test_mk_alignment_for_contiguous_layout() -> None:
+    alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
+    assert alignment > 0 and alignment % 8 == 0
+    assert deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout(256) > 0
+
+    deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
+    assert deep_gemm.get_mk_alignment_for_contiguous_layout() == alignment
+    # Upstream aliases, kept for backwards compatibility.
+    assert deep_gemm.get_m_alignment_for_contiguous_layout() == alignment
+    assert deep_gemm.get_k_alignment_for_contiguous_layout() == alignment
+
+
+# ── operator registration of the Hopper-only GEMMs ─────────────────────────
+# `FakeTensorMode` runs the registered fake implementations instead of the
+# kernels, so this checks the op schemas and the `register_fake` block in the
+# kernel's `__init__.py` on a GPU that could never launch them.
+
+def test_gemm_ops_registered() -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        a = torch.randn((M, K), device='cuda', dtype=torch.bfloat16)
+        b = torch.randn((N, K), device='cuda', dtype=torch.bfloat16)
+        d = torch.empty((M, N), device='cuda', dtype=torch.bfloat16)
+
+        deep_gemm.bf16_gemm_nt(a, b, d)
+        deep_gemm.bf16_gemm_nn(a, b.t(), d)
+
+        a_fp8 = (torch.empty((M, K), device='cuda', dtype=torch.float8_e4m3fn),
+                 torch.empty((M, K // 128), device='cuda', dtype=torch.float))
+        b_fp8 = (torch.empty((N, K), device='cuda', dtype=torch.float8_e4m3fn),
+                 torch.empty((N // 128, K // 128), device='cuda', dtype=torch.float))
+        deep_gemm.fp8_gemm_nt(a_fp8, b_fp8, d)
+
+        num_groups = 2
+        grouped_a = torch.randn((num_groups * M, K), device='cuda', dtype=torch.bfloat16)
+        grouped_b = torch.randn((num_groups, N, K), device='cuda', dtype=torch.bfloat16)
+        grouped_d = torch.empty((num_groups * M, N), device='cuda', dtype=torch.bfloat16)
+        layout = torch.zeros((num_groups * M,), device='cuda', dtype=torch.int32)
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(grouped_a, grouped_b, grouped_d, layout)
