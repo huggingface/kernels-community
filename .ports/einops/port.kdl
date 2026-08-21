@@ -1,0 +1,60 @@
+recipe version=1
+
+// einops
+//
+// einops as a Hub kernel: the package is pure Python, so the manifest is
+// noarch and the port is a move plus the import rewrite that lets the package
+// be imported under whatever directory name the Hub loads it from. The test
+// suite is not derived - it was rewritten to pull the kernel off the Hub - so
+// it comes from the overlay.
+//
+//   kernel-port .ports/einops/port.kdl \
+//       --dir <einops checkout> --out einops
+
+source \
+    repo="https://github.com/arogozhnikov/einops.git" \
+    commit="ad2c8d67d08cbebb45e1aff2be21dc88635fc695"
+
+prune keep="einops/**"
+delete in="einops/tests/**"
+
+move \
+    from="einops" \
+    to="torch-ext/einops"
+
+relativize_imports \
+    in="torch-ext/einops/**" \
+    package_root="torch-ext/einops" \
+    changes=7
+expect \
+    in="torch-ext/einops/**" \
+    find="from einops" \
+    count=0
+
+// array_api is a submodule upstream leaves out of the package init; the kernel
+// exposes it, since a Hub consumer cannot import einops.array_api by name.
+replace \
+    in="torch-ext/einops/__init__.py" \
+    count=1 \
+    find="from .packing import pack, unpack\n" \
+    with="from .packing import pack, unpack\nfrom . import array_api\n"
+
+// The rewritten tests and the flake.
+overlay from="overlay"
+
+expect \
+    in="torch-ext/einops/**" \
+    files=18
+expect \
+    in="tests/**" \
+    files=9
+
+manifest \
+    name="einops" \
+    version=1 \
+    edition=5 \
+    license="MIT" \
+    upstream="https://github.com/arogozhnikov/einops.git" \
+    backends="cpu,cuda,metal,rocm,xpu" \
+    repo_id="kernels-community/einops" \
+    noarch=#true
