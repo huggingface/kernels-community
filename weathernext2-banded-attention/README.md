@@ -10,7 +10,8 @@ Inference Triton kernel for **WeatherNext 2's mesh attention**, the dominant cos
 forecast step. Packaged as a [`kernels`](https://github.com/huggingface/kernels) Hub
 kernel with a pure-PyTorch fallback.
 
-Written for this repo. Builds for CUDA and ROCm from one Triton source.
+Written for this repo. One Triton source, no backend-specific code beyond the autotune sweep, so
+it builds for anything Triton targets.
 
 ## What it does
 
@@ -49,8 +50,12 @@ diagnostics. The default computes in full float32 on AMD.
 
 Queries are `[batch, blocks, heads, block_size, head_dim]` float32, keys and values the
 same and **not** gathered over neighbours, and the mask is `[blocks, block_size,
-3 * block_size]` bool. `head_dim` must be a power of two: it is a `tl.constexpr` tile
-width and the loads are not masked along it.
+3 * block_size]` bool.
+
+`head_dim` **must be a power of two and at least 16**. It is a `tl.constexpr` tile width and
+the loads along it are not masked, so anything else reads past the end of every row, and
+`tl.dot` needs 16 along its reduction dimension. Unsupported values raise `ValueError`
+rather than returning quietly wrong numbers. WeatherNext 2's released checkpoints use 128.
 
 Every mesh node must reach at least itself, or that row softmaxes over nothing. The real
 geometry guarantees this; the empty rows past the last mesh node are handled.
@@ -85,7 +90,8 @@ the shipped path sits 7.0e-04 from the JAX reference, this kernel 2.4e-03. In `"
 matches sdpa to 2e-06, so the gap is tf32 rounding rather than a different computation.
 
 **ROCm (gfx1150, torch 2.13.0+rocm7.2, triton 3.7.1):** all tests pass, matching sdpa to
-6.9e-07. Speed and memory against sdpa, sweeping block size:
+6.9e-07. The autotune sweep is backend-aware there: fewer pipeline stages, since LDS is
+smaller than Hopper's SMEM, plus `waves_per_eu`, which has no CUDA equivalent. Speed and memory against sdpa, sweeping block size:
 
 | block_size | sdpa ms / GiB | kernel ms / GiB | speed | memory |
 |---|---|---|---|---|
@@ -104,7 +110,9 @@ not be read as representative of CDNA**.
 
 - **Measure on CDNA (MI300).** The ROCm numbers above come from an integrated RDNA 3.5
   GPU at a tenth of the model's real block size. The memory trend is the interesting part
-  and wants confirming where it matters.
+  and wants confirming where it matters, and the HIP tile sweep cannot be judged without it.
+- **XPU is declared but untested.** Nothing in the source is CUDA- or ROCm-specific, and
+  unknown backends take the conservative config sweep, but no Intel GPU was available.
 - **Skip the `.contiguous()` copies.** Queries, keys and values arrive transposed and are
   copied on entry. Their strides are uniform enough to pass straight to the kernel, which
   would remove three full copies per layer.

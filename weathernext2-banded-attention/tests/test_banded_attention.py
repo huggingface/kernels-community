@@ -130,3 +130,13 @@ def test_inference_takes_the_kernel_and_training_does_not():
     assert layers._needs_grad(leaf)
     with torch.no_grad():
         assert not layers._needs_grad(leaf)
+
+
+@pytest.mark.kernels_ci
+def test_rejects_head_dimensions_it_cannot_tile():
+    """`HEAD_DIM` is an unmasked constexpr tile width, so a bad value must raise, not read past."""
+    mask = torch.zeros(2, 32, 96, dtype=torch.bool)
+    for head_dim in (8, 24, 48):
+        query = torch.zeros(1, 2, 2, 32, head_dim)
+        with pytest.raises(ValueError, match="head_dim must be a power of two"):
+            banded_attention(query, query, query, mask, head_dim**-0.5)

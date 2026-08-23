@@ -27,6 +27,7 @@ _PRECISIONS = {"default": PRECISION_DEFAULT, "ieee": PRECISION_IEEE}
 
 
 def _is_hip() -> bool:
+    """Is Triton targeting AMD? Anything else, including Intel XPU, takes the generic path."""
     try:
         return triton.runtime.driver.active.get_current_target().backend == "hip"
     except Exception:
@@ -34,14 +35,23 @@ def _is_hip() -> bool:
 
 
 def _configs():
-    """Tile shapes to sweep. AMD wants fewer stages, since LDS is smaller than Hopper's SMEM."""
+    """Tile shapes to sweep, per backend.
+
+    AMD wants fewer pipeline stages than Hopper, whose SMEM is larger than CDNA/RDNA's LDS, so the
+    HIP sweep shifts down one. Everything else, Intel XPU included, takes the same conservative
+    sweep rather than a guess.
+
+    `waves_per_eu` is deliberately absent. AMD kernels do use it, but as a launch keyword
+    (`kernel[grid](..., waves_per_eu=n)`), and `triton.Config` has no such parameter, so putting it
+    here raises `TypeError` on the very backend it is meant to help.
+    """
+    tiles = [(64, 64), (64, 128), (128, 64), (128, 128)]
     stages = (1, 2) if _is_hip() else (2, 3)
     return [
-        triton.Config({"BLOCK_M": m, "BLOCK_N": n}, num_warps=w, num_stages=s)
-        for m in (64, 128)
-        for n in (32, 64, 128)
-        for w in (4, 8)
-        for s in stages
+        triton.Config({"BLOCK_M": m, "BLOCK_N": n}, num_warps=warps, num_stages=stage)
+        for m, n in tiles
+        for warps in (4, 8)
+        for stage in stages
     ]
 
 
@@ -187,6 +197,14 @@ def banded_attention(
     if precision not in _PRECISIONS:
         raise ValueError(f"precision must be one of {sorted(_PRECISIONS)}, got {precision!r}")
     batch, num_blocks, heads, block_size, head_dim = query.shape
+    # `HEAD_DIM` is a `tl.constexpr` tile width and the loads along it are not masked, so a value
+    # Triton cannot tile reads past the end of every row. That is silent, so reject it up front.
+    # `tl.dot` also needs at least 16 along its reduction dimension.
+    if head_dim < 16 or (head_dim & (head_dim - 1)) != 0:
+        raise ValueError(
+            f"head_dim must be a power of two and at least 16, got {head_dim}. WeatherNext 2's "
+            "released checkpoints use 128."
+        )
     if mask.shape != (num_blocks, block_size, 3 * block_size):
         raise ValueError(f"mask is {tuple(mask.shape)}, expected {(num_blocks, block_size, 3 * block_size)}")
 
