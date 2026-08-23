@@ -8,8 +8,7 @@ tags:
 
 Inference Triton kernel for **WeatherNext 2's mesh attention**, the dominant cost of a
 forecast step. Packaged as a [`kernels`](https://github.com/huggingface/kernels) Hub
-kernel so `transformers` can load it on demand, with the pure-PyTorch path in
-`transformers` as the fallback.
+kernel with a pure-PyTorch fallback.
 
 Written for this repo. Builds for CUDA and ROCm from one Triton source.
 
@@ -34,38 +33,17 @@ the differentiable fallback. A real backward is what accelerating training would
 
 ## Precision
 
-The reference implementation runs this attention in float32, and float32 only reaches
-tensor cores through tf32, so `precision` selects how `tl.dot` treats it:
+The reference implementation runs this attention in float32. `precision` controls how
+`tl.dot` treats those inputs without assuming that every backend implements NVIDIA's TF32:
 
 | `precision` | what it does |
 |---|---|
-| `"tf32"` (default) | tensor cores, 10 explicit mantissa bits |
-| `"tf32x3"` | three tf32 passes, close to float32 accuracy, about a third of the throughput |
+| `"default"` (default) | Triton's backend default: TF32 on supported NVIDIA GPUs, IEEE on AMD |
 | `"ieee"` | true float32, no tensor-core path, slower than the fallback it replaces |
 
-`"ieee"` is for checking numerics rather than for running. Override with
-`WEATHERNEXT2_BANDED_ATTENTION_PRECISION`. On RDNA there is no tf32, so `"tf32"` is a
-no-op there and the kernel computes in full float32.
-
-## How transformers uses it
-
-`WeatherNext2Attention` is decorated `@use_kernel_forward_from_hub("WeatherNext2Attention")`
-and mapped to this repo in `integrations/hub_kernels.py`, inference-only. Kernels are
-opt-in:
-
-```python
-import torch
-from transformers import WeatherNext2ForWeatherForecasting
-
-model = WeatherNext2ForWeatherForecasting.from_pretrained(
-    "kashif/weathernext2-mini", device_map="cuda", use_kernels=True
-).eval()
-```
-
-`layers.WeatherNext2Attention` reimplements that module's
-`forward(hidden_states, attention_mask)` and reads its parameters directly (`q_proj`,
-`k_proj`, `v_proj`, `o_proj`, `head_dim`, `scaling`). **Those attribute names and the
-forward signature are the contract** and must stay in sync with the in-tree module.
+`"ieee"` is mainly for checking numerics on NVIDIA rather than for running. The model layer uses
+the backend default; the low-level `banded_attention` function accepts `precision="ieee"` for
+diagnostics. The default computes in full float32 on AMD.
 
 ## Supported shapes
 

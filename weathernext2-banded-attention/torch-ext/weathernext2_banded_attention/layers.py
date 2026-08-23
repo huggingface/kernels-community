@@ -4,20 +4,10 @@ Only `forward` is defined: `kernels` binds it onto the model's own module, so `s
 `self.head_dim` and the rest are the ones `transformers` built.
 """
 
-import os
-
 import torch
 from torch import nn
 
 from .banded_attention import banded_attention
-
-
-# How `tl.dot` should treat the float32 inputs. The kernel's advantage comes from tensor cores,
-# which float32 only reaches through tf32. In strict `ieee` Triton has no tensor-core path at all and
-# is slower than the fallback it replaces, so that setting is for checking numerics rather than for
-# running. `tf32x3` sits in between: tensor cores at close to float32 accuracy, for about a third of
-# the tf32 throughput. See the README.
-_PRECISION = os.environ.get("WEATHERNEXT2_BANDED_ATTENTION_PRECISION", "tf32").lower()
 
 
 def _gather_neighbouring_blocks(states: torch.Tensor) -> torch.Tensor:
@@ -91,9 +81,7 @@ class WeatherNext2Attention(nn.Module):
         if _is_banded(attention_mask, hidden_states) and not _needs_grad(query, key, value):
             # The kernel walks the three neighbouring blocks itself, so the keys and values are
             # never tripled and the mask is never expanded.
-            attn_output = banded_attention(
-                query.float(), key.float(), value.float(), attention_mask, self.scaling, precision=_PRECISION
-            )
+            attn_output = banded_attention(query.float(), key.float(), value.float(), attention_mask, self.scaling)
         else:
             attn_output = _reference_attention(query, key, value, attention_mask, self.scaling)
 

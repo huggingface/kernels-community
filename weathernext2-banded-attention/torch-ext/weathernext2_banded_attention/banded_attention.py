@@ -19,12 +19,11 @@ import triton.language as tl
 from .utils import device_context
 
 
-# How `tl.dot` should treat float32 inputs. Spelled the portable way (`input_precision`) rather than
-# `allow_tf32`, which is CUDA-flavoured: this kernel has to build for ROCm too.
-PRECISION_TF32 = 0  # tensor cores, 10 explicit mantissa bits
-PRECISION_IEEE = 1  # true float32, no tensor cores, and far slower than the cutlass fallback
-PRECISION_TF32X3 = 2  # three tf32 passes: tensor cores at close to float32 accuracy
-_PRECISIONS = {"tf32": PRECISION_TF32, "ieee": PRECISION_IEEE, "tf32x3": PRECISION_TF32X3}
+# Let Triton choose its backend default unless strict IEEE arithmetic was requested. The default is
+# TF32 on supported NVIDIA GPUs and IEEE on AMD, so the same source remains portable across both.
+PRECISION_DEFAULT = 0
+PRECISION_IEEE = 1
+_PRECISIONS = {"default": PRECISION_DEFAULT, "ieee": PRECISION_IEEE}
 
 
 def _is_hip() -> bool:
@@ -126,8 +125,6 @@ def _banded_attention_kernel(
                     )
                     if PRECISION == 0:
                         logits = tl.dot(query, tl.trans(key))
-                    elif PRECISION == 2:
-                        logits = tl.dot(query, tl.trans(key), input_precision="tf32x3")
                     else:
                         logits = tl.dot(query, tl.trans(key), input_precision="ieee")
                     logits = tl.where(keep, logits, float("-inf"))
@@ -153,8 +150,6 @@ def _banded_attention_kernel(
                     weights = weights.to(value.dtype)
                     if PRECISION == 0:
                         accumulator = tl.dot(weights, value, accumulator)
-                    elif PRECISION == 2:
-                        accumulator = tl.dot(weights, value, accumulator, input_precision="tf32x3")
                     else:
                         accumulator = tl.dot(weights, value, accumulator, input_precision="ieee")
                     running_max = new_max
@@ -174,7 +169,7 @@ def banded_attention(
     value: torch.Tensor,
     mask: torch.Tensor,
     scaling: float,
-    precision: str = "tf32",
+    precision: str = "default",
 ) -> torch.Tensor:
     """Attention over the three block-diagonals of the mesh adjacency.
 
@@ -183,9 +178,8 @@ def banded_attention(
             key and value are *not* gathered over neighbours; the kernel walks them itself.
         mask: `[num_blocks, block_size, 3 * block_size]`, bool.
         scaling: the usual `head_dim ** -0.5`.
-        precision: how `tl.dot` treats the float32 inputs. `"tf32"` for tensor cores, `"tf32x3"` for
-            tensor cores at close to float32 accuracy, `"ieee"` for true float32, which has no
-            tensor-core path and is slower than the PyTorch fallback it replaces.
+        precision: how `tl.dot` treats the float32 inputs. `"default"` uses Triton's default for the
+            active backend; `"ieee"` forces true float32 for strict numerical comparisons.
 
     Returns:
         `[batch, num_blocks, heads, block_size, head_dim]`.

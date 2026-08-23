@@ -3,7 +3,14 @@
 import pytest
 import torch
 
-from weathernext2_banded_attention import WeatherNext2Attention, banded_attention
+import kernels
+
+
+weathernext2_banded_attention = kernels.get_kernel(
+    "kernels-community/weathernext2-banded-attention", version=1
+)
+WeatherNext2Attention = weathernext2_banded_attention.WeatherNext2Attention
+banded_attention = weathernext2_banded_attention.banded_attention
 
 
 def gather_neighbouring_blocks(states):
@@ -51,11 +58,15 @@ def test_matches_scaled_dot_product_attention(blocks, density):
     mask = banded_mask(blocks, block_size, density, device, generator)
     scaling = head_dim**-0.5
 
-    ours = banded_attention(query, key, value, mask, scaling, precision="ieee")
+    # Exercise the real backend default on ROCm; use IEEE on CUDA so this remains a strict
+    # algorithmic comparison rather than a tensor-core precision comparison.
+    precision = "default" if torch.version.hip is not None else "ieee"
+    ours = banded_attention(query, key, value, mask, scaling, precision=precision)
     torch.testing.assert_close(ours, reference(query, key, value, mask, scaling), atol=2e-5, rtol=2e-5)
 
 
 @requires_cuda
+@pytest.mark.kernels_ci
 def test_rows_that_reach_only_themselves_are_finite():
     """The sparsest legal mask: a node that sees nothing but itself must not produce NaN."""
     device = torch.device("cuda")
@@ -85,6 +96,7 @@ class _StubAttention(WeatherNext2Attention):
             setattr(self, name, torch.nn.Linear(hidden_size, hidden_size, bias=name == "o_proj"))
 
 
+@pytest.mark.kernels_ci
 def test_backward_reaches_every_projection():
     """The kernel has no backward, so anything needing one must take the differentiable path.
 
@@ -105,9 +117,10 @@ def test_backward_reaches_every_projection():
     assert hidden_states.grad is not None
 
 
+@pytest.mark.kernels_ci
 def test_inference_takes_the_kernel_and_training_does_not():
     """Under `no_grad` the fast path is available; with grad it must not be."""
-    from weathernext2_banded_attention import layers
+    layers = weathernext2_banded_attention.layers
 
     hidden_states = torch.randn(1, 3, 16, 32)
     mask = torch.zeros(3, 16, 48, dtype=torch.bool)
