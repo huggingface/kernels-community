@@ -19,8 +19,10 @@ import triton.language as tl
 from .utils import device_context
 
 
-# Let Triton choose its backend default unless strict IEEE arithmetic was requested. The default is
-# TF32 on supported NVIDIA GPUs and IEEE on AMD, so the same source remains portable across both.
+# A bare `tl.dot` resolves to tf32 where the backend has it and ieee where it does not, which keeps
+# one source portable. Do not replace it with a `get_device_capability() >= 8` probe: that reports
+# False on AMD and so forces ieee on CDNA3, where tf32 is supported. `ieee` is for checking numerics;
+# it is ~100x slower here.
 PRECISION_DEFAULT = 0
 PRECISION_IEEE = 1
 _PRECISIONS = {"default": PRECISION_DEFAULT, "ieee": PRECISION_IEEE}
@@ -45,7 +47,9 @@ def _configs():
     (`kernel[grid](..., waves_per_eu=n)`), and `triton.Config` has no such parameter, so putting it
     here raises `TypeError` on the very backend it is meant to help.
     """
-    tiles = [(64, 64), (64, 128), (128, 64), (128, 128)]
+    # BLOCK_N=32 is kept: with a sparse band the narrow key tile wins often enough to matter, and
+    # dropping it cost ~35% on the mini checkpoint's shape.
+    tiles = [(m, n) for m in (64, 128) for n in (32, 64, 128)]
     stages = (1, 2) if _is_hip() else (2, 3)
     return [
         triton.Config({"BLOCK_M": m, "BLOCK_N": n}, num_warps=warps, num_stages=stage)

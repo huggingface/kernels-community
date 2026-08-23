@@ -74,19 +74,18 @@ densities, checks that a node reaching only itself returns its own value vector 
 than NaN, checks that unsupported head dimensions raise, and checks that a backward
 reaches all four projections.
 
-The device comes from `infer_device()`, following Liger-Kernel's helper of the same name, so
-the accelerator tests run wherever one is present rather than assuming CUDA. Without that a
-declared backend could pass CI having skipped every kernel launch.
+Tests pick the device with `infer_device()`, so they run on whichever accelerator is present
+rather than assuming CUDA.
 
 **CUDA (H100, `kashif/weathernext2-mini`, 1 degree: 4 blocks of 2577 nodes, 7731 keys,
 4 heads, head_dim 128, 13% band density), real initial conditions:**
 
 | path | ms/step | attention peak GiB |
 |---|---|---|
-| shipped (gather + sdpa, fp32) | 223.7 | 0.90 |
-| this kernel (tf32) | 129.1 | 0.37 |
+| shipped (gather + sdpa) | 299.6 | 0.90 |
+| this kernel | 181.8 | 0.37 |
 
-**1.73x end to end.** Whole-model peak memory is unchanged at this resolution: the
+**1.65x end to end.** Whole-model peak memory is unchanged at this resolution: the
 attention saving is real but the global peak is set elsewhere. Not measured at 0.25
 degrees, where attention dominates the footprint.
 
@@ -94,9 +93,11 @@ Accuracy in physical units, worst variable, as a fraction of that field's spatia
 the shipped path sits 7.0e-04 from the JAX reference, this kernel 2.4e-03. In `"ieee"` it
 matches sdpa to 2e-06, so the gap is tf32 rounding rather than a different computation.
 
+Timings were taken on a shared GPU where run-to-run spread is around 18%, so treat the ratio
+rather than the absolute numbers as the result.
+
 **ROCm (gfx1150, torch 2.13.0+rocm7.2, triton 3.7.1):** all tests pass, matching sdpa to
-6.9e-07. The autotune sweep is backend-aware there: fewer pipeline stages, since LDS is
-smaller than Hopper's SMEM, plus `waves_per_eu`, which has no CUDA equivalent. Speed and memory against sdpa, sweeping block size:
+6.9e-07. The autotune sweep uses fewer pipeline stages there than on CUDA. Speed and memory against sdpa, sweeping block size:
 
 | block_size | sdpa ms / GiB | kernel ms / GiB | speed | memory |
 |---|---|---|---|---|
@@ -113,17 +114,10 @@ not be read as representative of CDNA**.
 
 ## Follow-ups
 
-- **Measure on CDNA (MI300).** The ROCm numbers above come from an integrated RDNA 3.5
-  GPU at a tenth of the model's real block size. The memory trend is the interesting part
-  and wants confirming where it matters, and the HIP tile sweep cannot be judged without it.
-- **XPU is declared but untested.** Nothing in the source is CUDA- or ROCm-specific, and
-  unknown backends take the conservative config sweep, but no Intel GPU was available. The
-  tuning to try first is the warp count: Liger-Kernel found 32 where CUDA wants 4 to 8
-  (`liger_kernel/ops/kl_div.py`), so this sweep's `(4, 8)` is probably far off there. Their
-  number was measured on a reduction rather than on attention, so it is a starting point and
-  not a value to copy.
-- **NPU is not declared.** No kernel in this repo declares `npu`, so the build system's
-  support for it is unproven, and Ascend needs its own Triton plugin. `infer_device()` already
-  recognises it, so the tests would exercise it once the backend is declarable.
+- **Measure on CDNA (MI300).** The ROCm numbers come from an integrated RDNA 3.5 GPU at a
+  tenth of the model's real block size, so the HIP tile sweep is unproven.
+- **XPU is declared but untested**, with no Intel GPU available. The warp count is the first
+  thing to tune there; this sweep's `(4, 8)` is aimed at CUDA and ROCm.
+- **NPU is not declared**, since no kernel in this repo declares it yet.
 - **A backward**, if training is ever to use this rather than fall back.
 - **Autotune properly.** The current config sweep is fixed and was chosen on one device.
