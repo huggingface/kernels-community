@@ -71,7 +71,12 @@ quietly dropping the mask.
 
 `tests/` checks the kernel against an fp32 sdpa reference across block counts and band
 densities, checks that a node reaching only itself returns its own value vector rather
-than NaN, and checks that a backward reaches all four projections.
+than NaN, checks that unsupported head dimensions raise, and checks that a backward
+reaches all four projections.
+
+The device comes from `infer_device()`, following Liger-Kernel's helper of the same name, so
+the accelerator tests run wherever one is present rather than assuming CUDA. Without that a
+declared backend could pass CI having skipped every kernel launch.
 
 **CUDA (H100, `kashif/weathernext2-mini`, 1 degree: 4 blocks of 2577 nodes, 7731 keys,
 4 heads, head_dim 128, 13% band density), real initial conditions:**
@@ -112,7 +117,14 @@ not be read as representative of CDNA**.
   GPU at a tenth of the model's real block size. The memory trend is the interesting part
   and wants confirming where it matters, and the HIP tile sweep cannot be judged without it.
 - **XPU is declared but untested.** Nothing in the source is CUDA- or ROCm-specific, and
-  unknown backends take the conservative config sweep, but no Intel GPU was available.
+  unknown backends take the conservative config sweep, but no Intel GPU was available. The
+  tuning to try first is the warp count: Liger-Kernel found 32 where CUDA wants 4 to 8
+  (`liger_kernel/ops/kl_div.py`), so this sweep's `(4, 8)` is probably far off there. Their
+  number was measured on a reduction rather than on attention, so it is a starting point and
+  not a value to copy.
+- **NPU is not declared.** No kernel in this repo declares `npu`, so the build system's
+  support for it is unproven, and Ascend needs its own Triton plugin. `infer_device()` already
+  recognises it, so the tests would exercise it once the backend is declarable.
 - **Skip the `.contiguous()` copies.** Queries, keys and values arrive transposed and are
   copied on entry. Their strides are uniform enough to pass straight to the kernel, which
   would remove three full copies per layer.

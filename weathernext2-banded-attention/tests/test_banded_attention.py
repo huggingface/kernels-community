@@ -41,14 +41,18 @@ def banded_mask(blocks, block_size, density, device, generator):
     return mask
 
 
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="the kernel needs a GPU")
+# The kernel is pure Triton and the package declares cuda, rocm and xpu, so the tests have to run
+# on whichever accelerator is present rather than assuming CUDA. Otherwise XPU or NPU CI would skip
+# every kernel launch and the declared backend would go untested.
+DEVICE = weathernext2_banded_attention.infer_device()
+requires_accelerator = pytest.mark.skipif(DEVICE == "cpu", reason="the kernel needs an accelerator")
 
 
-@requires_cuda
+@requires_accelerator
 @pytest.mark.parametrize("blocks", [2, 4])
 @pytest.mark.parametrize("density", [0.05, 0.4])
 def test_matches_scaled_dot_product_attention(blocks, density):
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     generator = torch.Generator(device=device).manual_seed(0)
     batch, heads, block_size, head_dim = 1, 4, 128, 64
     shape = (batch, blocks, heads, block_size, head_dim)
@@ -58,18 +62,20 @@ def test_matches_scaled_dot_product_attention(blocks, density):
     mask = banded_mask(blocks, block_size, density, device, generator)
     scaling = head_dim**-0.5
 
-    # Exercise the real backend default on ROCm; use IEEE on CUDA so this remains a strict
-    # algorithmic comparison rather than a tensor-core precision comparison.
-    precision = "default" if torch.version.hip is not None else "ieee"
+    # On NVIDIA, force IEEE so this stays a strict algorithmic comparison rather than a tensor-core
+    # precision one. Everywhere else take the backend default: AMD has no TF32 so it is already
+    # IEEE, and `input_precision="ieee"` is not guaranteed to be implemented on other backends.
+    on_nvidia = torch.version.cuda is not None and torch.version.hip is None
+    precision = "ieee" if on_nvidia else "default"
     ours = banded_attention(query, key, value, mask, scaling, precision=precision)
     torch.testing.assert_close(ours, reference(query, key, value, mask, scaling), atol=2e-5, rtol=2e-5)
 
 
-@requires_cuda
+@requires_accelerator
 @pytest.mark.kernels_ci
 def test_rows_that_reach_only_themselves_are_finite():
     """The sparsest legal mask: a node that sees nothing but itself must not produce NaN."""
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     generator = torch.Generator(device=device).manual_seed(0)
     batch, blocks, heads, block_size, head_dim = 1, 3, 2, 64, 32
     shape = (batch, blocks, heads, block_size, head_dim)
