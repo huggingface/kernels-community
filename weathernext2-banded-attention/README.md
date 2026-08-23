@@ -125,8 +125,5 @@ not be read as representative of CDNA**.
 - **NPU is not declared.** No kernel in this repo declares `npu`, so the build system's
   support for it is unproven, and Ascend needs its own Triton plugin. `infer_device()` already
   recognises it, so the tests would exercise it once the backend is declarable.
-- **Skip the `.contiguous()` copies.** Queries, keys and values arrive transposed and are
-  copied on entry. Their strides are uniform enough to pass straight to the kernel, which
-  would remove three full copies per layer.
 - **A backward**, if training is ever to use this rather than fall back.
 - **Autotune properly.** The current config sweep is fixed and was chosen on one device.

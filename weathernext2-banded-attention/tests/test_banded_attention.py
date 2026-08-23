@@ -55,10 +55,14 @@ def test_matches_scaled_dot_product_attention(blocks, density):
     device = torch.device(DEVICE)
     generator = torch.Generator(device=device).manual_seed(0)
     batch, heads, block_size, head_dim = 1, 4, 128, 64
-    shape = (batch, blocks, heads, block_size, head_dim)
+    # The model produces this layout by splitting the hidden dimension into heads and transposing
+    # the block and head axes. Keep it non-contiguous so the kernel's stride handling is exercised.
+    source_shape = (batch, blocks, block_size, heads, head_dim)
     query, key, value = (
-        torch.randn(shape, device=device, dtype=torch.float32, generator=generator) for _ in range(3)
+        torch.randn(source_shape, device=device, dtype=torch.float32, generator=generator).transpose(2, 3)
+        for _ in range(3)
     )
+    assert not query.is_contiguous()
     mask = banded_mask(blocks, block_size, density, device, generator)
     scaling = head_dim**-0.5
 

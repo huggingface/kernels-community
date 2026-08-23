@@ -67,6 +67,18 @@ def _banded_attention_kernel(
     stride_qh,
     stride_qm,
     stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_km,
+    stride_kd,
+    stride_vb,
+    stride_vh,
+    stride_vm,
+    stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_om,
+    stride_od,
     stride_mb,
     stride_mm,
     stride_mn,
@@ -107,8 +119,8 @@ def _banded_attention_kernel(
         # on the mask being False; skipping them outright is the same answer without the traffic.
         if (source >= 0) and (source < num_blocks):
             source_flat = flat_block - block_index + source
-            key_base = key_ptr + source_flat * stride_qb + head * stride_qh
-            value_base = value_ptr + source_flat * stride_qb + head * stride_qh
+            key_base = key_ptr + source_flat * stride_kb + head * stride_kh
+            value_base = value_ptr + source_flat * stride_vb + head * stride_vh
 
             for start in range(0, block_size, BLOCK_N):
                 columns = start + tl.arange(0, BLOCK_N)
@@ -129,7 +141,7 @@ def _banded_attention_kernel(
 
                 if tl.sum(keep.to(tl.int32)) > 0:
                     key = tl.load(
-                        key_base + columns[:, None] * stride_qm + dims[None, :] * stride_qd,
+                        key_base + columns[:, None] * stride_km + dims[None, :] * stride_kd,
                         mask=column_valid[:, None],
                         other=0.0,
                     )
@@ -152,7 +164,7 @@ def _banded_attention_kernel(
                     accumulator = accumulator * rescale[:, None]
 
                     value = tl.load(
-                        value_base + columns[:, None] * stride_qm + dims[None, :] * stride_qd,
+                        value_base + columns[:, None] * stride_vm + dims[None, :] * stride_vd,
                         mask=column_valid[:, None],
                         other=0.0,
                     )
@@ -165,9 +177,9 @@ def _banded_attention_kernel(
                     running_max = new_max
 
     accumulator = accumulator / tl.where(running_sum == 0.0, 1.0, running_sum)[:, None]
-    out_base = out_ptr + flat_block * stride_qb + head * stride_qh
+    out_base = out_ptr + flat_block * stride_ob + head * stride_oh
     tl.store(
-        out_base + rows[:, None] * stride_qm + dims[None, :] * stride_qd,
+        out_base + rows[:, None] * stride_om + dims[None, :] * stride_od,
         accumulator,
         mask=row_valid[:, None],
     )
@@ -211,9 +223,8 @@ def banded_attention(
     query, key, value = (
         t.reshape(batch * num_blocks, heads, block_size, head_dim) for t in (query, key, value)
     )
-    query, key, value = (t.contiguous() for t in (query, key, value))
     mask = mask.contiguous()
-    out = torch.empty_like(query)
+    out = torch.empty(query.shape, dtype=query.dtype, device=query.device)
 
     def grid(meta):
         return (triton.cdiv(block_size, meta["BLOCK_M"]), batch * num_blocks, heads)
@@ -231,6 +242,18 @@ def banded_attention(
             query.stride(1),
             query.stride(2),
             query.stride(3),
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            key.stride(3),
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            value.stride(3),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
             mask.stride(0),
             mask.stride(1),
             mask.stride(2),
