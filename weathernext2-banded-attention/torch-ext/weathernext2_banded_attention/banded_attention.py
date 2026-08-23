@@ -19,10 +19,9 @@ import triton.language as tl
 from .utils import device_context
 
 
-# A bare `tl.dot` resolves to tf32 where the backend has it and ieee where it does not, which keeps
-# one source portable. Do not replace it with a `get_device_capability() >= 8` probe: that reports
-# False on AMD and so forces ieee on CDNA3, where tf32 is supported. `ieee` is for checking numerics;
-# it is ~100x slower here.
+# A bare `tl.dot` uses the backend default: TF32 on NVIDIA and IEEE on AMD. CDNA3 permits TF32 when
+# explicitly requested, but AMD's default remains IEEE. The explicit `ieee` mode is for checking
+# NVIDIA numerics; it was roughly 100x slower than TF32 in the H100 benchmark.
 PRECISION_DEFAULT = 0
 PRECISION_IEEE = 1
 _PRECISIONS = {"default": PRECISION_DEFAULT, "ieee": PRECISION_IEEE}
