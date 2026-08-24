@@ -379,7 +379,8 @@ def _tree(items: list) -> None:
 # keyed per module and would otherwise mark every new export as "changed".
 def _all_grew(base: str, head: str) -> bool:
     try:
-        old, new = ast.literal_eval(base), ast.literal_eval(head)
+        old = ast.literal_eval(base)
+        new = ast.literal_eval(head)
     except (ValueError, SyntaxError):
         return False
     return isinstance(old, list) and isinstance(new, list) and set(old) <= set(new)
