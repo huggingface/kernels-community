@@ -374,3 +374,76 @@ carry out the following steps:
 
 If the user did not specify the version tag, stop and ask which tag to sync
 from.
+
+## sage-attention
+
+This package mirrors the **SageAttention / SageAttention2 / SageAttention2++**
+CUDA stack from upstream. SageAttention3 (microscaling FP4 for datacenter
+Blackwell) is deliberately **not** part of this kernel — it lives in its own
+directory. When the user asks to sync a sage-attention release, carry out the
+following steps:
+
+- Fetch the upstream Git repository from https://github.com/thu-ml/SageAttention.git
+- Check out the tag or commit that the user specified. Note that upstream tags
+  lag `main` by a long way (the newest tag is `v2.2.0` while `main` carries
+  many later fixes), so syncing from `main` is usually what is wanted.
+- The mirrored upstream trees are:
+  - `csrc/` → `sage-attention/sage_attention/`
+  - `sageattention/*.py` (except `fa3_wrapper.py`) →
+    `sage-attention/torch-ext/sage_attention/`
+  - `sageattention/triton/` → `sage-attention/torch-ext/sage_attention/_triton/`
+    (**renamed**, see below)
+- The Triton modules are vendored verbatim, but the directory **must** be named
+  `_triton/`, not `triton/`. The builder flattens `torch-ext/sage_attention/*`
+  onto the top level of the build variant directory, and that directory is put
+  on `PYTHONPATH`; a top-level `triton/` there shadows the real Triton package,
+  so `import triton.language` inside the vendored kernels fails with
+  `ModuleNotFoundError`. Rewrite upstream's `from .triton.<x>` imports in
+  `core.py` to `from ._triton.<x>`. The module contents themselves need no
+  rewriting — they only import `torch`, `triton` and `math`. They back
+  `sageattn_qk_int8_pv_fp16_triton`, `sageattn_varlen` and the `sm86` dispatch
+  branch, so `torch-ext/sage_attention/core.py` should carry upstream's full set
+  of entry points. After a sync, check that the `def` list in `core.py` and the
+  `__all__` in `__init__.py` still match upstream's `core.py` and
+  `sageattention/__init__.py`.
+- Everything under `sageattention3_blackwell/` is out of scope, as are
+  `fa3_wrapper.py` (it needs an external `flash_attn_interface`), `bench/`,
+  `example/` and `setup.py`.
+- The CUDA sources otherwise track upstream byte-for-byte, so when syncing,
+  diff the upstream files against the local copies and re-apply only these
+  local porting changes:
+  - `<torch/extension.h>` and `<torch/python.h>` → `<torch/torch.h>`.
+  - Drop `PYBIND11_MODULE` blocks; ops are registered in
+    `torch-ext/torch_binding.cpp` instead.
+  - `qattn/attn_cuda_sm90.h` and `qattn/qk_int_sv_f8_cuda_sm90.cu`: rename
+    `qk_int8_sv_f8_accum_f32_attn_inst_buf` and
+    `qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf` to carry an `_sm90`
+    suffix. Upstream keeps the SM89 and SM90 kernels in separate extension
+    modules, but here every op shares one namespace and the SM89 kernels own
+    the un-suffixed names. `torch_binding.{h,cpp}` and `sm90_compile.py` must
+    use the suffixed names too.
+  - `qattn/qk_int_sv_f8_cuda_sm90.cu`: resolve `cuTensorMapEncodeTiled` at
+    runtime through `at::DynamicLibrary` rather than linking it, and include
+    `sage_attention/cuda_tensormap_shim.cuh` (a local file with no upstream
+    counterpart).
+  - `qattn/qk_int_sv_f8_cuda_sm89.cuh`: `<cuda_fp16.h>` stays commented out.
+  - `fused/fused.cu`: initialise `block_sum_val` to `0.0f`.
+- On the Python side, the modules dispatch through `._ops` instead of the
+  per-arch pybind extensions. Upstream's `@torch.library.custom_op` wrappers
+  are replaced by direct `ops.<name>` aliases plus `register_fake`
+  registrations. Never reintroduce upstream's fixed op namespaces
+  (`sageattention::`, `sageattention_sm89::`, `sageattention_sm90::`) — use
+  `add_op_namespace_prefix` from `._ops`.
+- `quant.py`: the bound `quant_per_block_int8_cuda` op takes an `sm_scale`
+  argument that upstream's `_fused` binding does not. Pass `1.0` when
+  quantizing K so no scaling is applied.
+- Keep `torch-ext/sage_attention/__init__.py` `__all__` in sync with the public
+  API surface.
+- Do not relax `[general.cuda] minver` in `build.toml`. The CUDA 12.6 toolkit
+  compiles the sm89 FP8 attention kernels but they fail at launch with
+  `cudaErrorLaunchFailure`; only the quantization ops survive. Building a
+  variant is therefore *not* enough to validate a toolkit — run
+  `nix run .#ciTests.<variant>` for each one.
+
+If the user did not specify the version tag, stop and ask which tag to sync
+from.
