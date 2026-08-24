@@ -413,8 +413,13 @@ def get_accelerator_autotuning_configs(
     #                     cell, so the axis is not emitted at the six batched sites
     num_warps = [8, 16] if is_xpu else [2, 4, 8, 16]
     num_stages = [2, 3, 4, 5, 6]
-    bn_span = (128,) if is_xpu else (32, 64, 128, 256)
-    bk_span = (128,) if is_xpu else (64, 128, 256, 512)
+    # XPU keeps a narrower span than CUDA (Xe-core tiles above 128 spill), but it must
+    # still carry 64: the grid is the ONLY source of tiles, so a single-valued span makes
+    # every N (or K) that is not a multiple of 128 unschedulable — e.g. N=320 raises
+    # "not a multiple of any BLOCK_SIZE_N in the autotune grid" before a config is ever
+    # benched. 64 divides the 320/576/1088-style shapes that 128 cannot.
+    bn_span = (64, 128) if is_xpu else (32, 64, 128, 256)
+    bk_span = (64, 128) if is_xpu else (64, 128, 256, 512)
 
     # no tuned tile -> one empty meta-dict (the tile comes from the launch kwargs)
     blocks = (
