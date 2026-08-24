@@ -253,7 +253,10 @@ if not (MOCK or REPLOT):
     triton_kernels_hub = get_kernel("kernels-community/gpt-oss-triton-kernels", version=1, trust_remote_code=True)
     _tfmx.triton_kernels_hub = triton_kernels_hub
 
-DEV = "cuda"
+DEV = "cuda" if torch.cuda.is_available() else "xpu"
+ACCEL = getattr(torch, DEV)  # torch.cuda / torch.xpu: synchronize(), get_device_name()
+# Level-Zero (Intel XPU) masks devices with ZE_AFFINITY_MASK, CUDA/ROCm with CUDA_VISIBLE_DEVICES.
+DEV_MASK_ENV = "CUDA_VISIBLE_DEVICES" if DEV == "cuda" else "ZE_AFFINITY_MASK"
 DECODE_TOKENS = 1
 PREFILL_TOKENS = 256 if SMOKE else 8192
 
@@ -983,7 +986,7 @@ def bench_modes(run, tag):
     res, out = {}, None
     try:
         out = run()
-        torch.cuda.synchronize()  # warm + tune before ANY timing/capture
+        ACCEL.synchronize()  # warm + tune before ANY timing/capture
         res["eager"] = do_bench(run, return_mode="min") * 1e3
         print(f"      {tag:14s} eager      {res['eager']:9.1f}us", flush=True)
     except Exception as e:
@@ -998,7 +1001,7 @@ def bench_modes(run, tag):
     try:
         crun = torch.compile(run, mode="max-autotune", fullgraph=True)
         cout = crun()
-        torch.cuda.synchronize()
+        ACCEL.synchronize()
         # Self-check the compiled graph against THIS arm's own eager output before timing it.
         # The cross-impl parity below is computed from eager only, so without this a compiled
         # graph that drops work (e.g. an out-param matmul DCE'd because its mutation isn't
@@ -1219,7 +1222,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
     print()
 
 
-device_name = "MOCK (random values)" if MOCK else torch.cuda.get_device_name(0)
+device_name = "MOCK (random values)" if MOCK else ACCEL.get_device_name(0)
 print(f"device: {device_name}  torch {torch.__version__}"
       f"{'  [SMOKE]' if SMOKE else ''}")
 print("finegrained-kernels = local build; baselines: finegrained-fp8 (upstream), DeepGEMM, "
@@ -1378,7 +1381,7 @@ elif GPUS > 1 and _SHARD is None and not MOCK:
             os.unlink(sp)
     procs = [subprocess.Popen(
         [sys.executable, os.path.abspath(__file__)] + FILTERS,
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": str(g), "BENCH_SHARD": f"{g}/{GPUS}",
+        env={**os.environ, DEV_MASK_ENV: str(g), "BENCH_SHARD": f"{g}/{GPUS}",
              "GPUS": "1"}) for g in range(GPUS)]
     nfail = sum(p.wait() != 0 for p in procs)
     missing = [g for g, sp in enumerate(shard_paths) if not os.path.exists(sp)]
