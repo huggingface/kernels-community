@@ -383,7 +383,7 @@ def _all_grew(base: str, head: str) -> bool:
         new = ast.literal_eval(head)
     except (ValueError, SyntaxError):
         return False
-    return isinstance(old, list) and isinstance(new, list) and set(old) <= set(new)
+    return isinstance(old, list) and isinstance(new, list) and set(old) < set(new)
 
 
 # Returns (breaking, additive): breaking covers removed and re-signed symbols,
