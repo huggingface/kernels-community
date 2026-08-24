@@ -386,8 +386,9 @@ def _all_grew(base: str, head: str) -> bool:
     return isinstance(old, list) and isinstance(new, list) and set(old) < set(new)
 
 
-# Returns (breaking, additive): breaking covers removed and re-signed symbols,
-# additive covers newly exposed ones. Both require a version bump.
+# Returns (breaking, additive). Breaking covers symbols that were removed or
+# whose signature changed, additive covers newly exposed ones. Both require a
+# version bump.
 def report(
     kernel: str, base: dict, head: dict, limit: int = 20, preview: int = 6
 ) -> tuple:
