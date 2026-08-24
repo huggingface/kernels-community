@@ -375,8 +375,11 @@ def _tree(items: list) -> None:
             print(f"     {'  ' if last else '| '} {d}")
 
 
-# An __all__ that only gains names is an addition, not a break: the entry is
-# keyed per module and would otherwise mark every new export as "changed".
+# __all__ is a single API entry per module, so exporting a new name shows up as a
+# changed entry rather than an added one. Detecting the superset case classifies
+# it as additive instead: it still needs a version bump, but it stays eligible for
+# the no-arch and stable-ABI exemptions, which removals and signature changes are
+# not.
 def _all_grew(base: str, head: str) -> bool:
     try:
         old = ast.literal_eval(base)
