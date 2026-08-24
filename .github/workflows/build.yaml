@@ -62,8 +62,16 @@ permissions:
   contents: read
   statuses: write
 
+# These build workflows are reachable only via workflow_dispatch, so `github.head_ref`
+# is always empty and the group used to collapse to `github.run_id` -- unique per run,
+# which made `cancel-in-progress` a no-op. Key off the dispatch inputs instead so a newer
+# build supersedes the one still in flight for the same PR + kernel (the platform is
+# already distinguished by `github.workflow`, so unrelated kernels/platforms on the same
+# PR are untouched). `upload` stays in the key so a cheap PR CI build cannot cancel a
+# `/kernel-bot build-and-stage` mid Hub upload. Dispatches without a `pr_number` (releases
+# off the default branch) still fall back to `run_id` and are never cancelled.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ inputs.pr_number || github.run_id }}-${{ inputs.kernel_name }}-upload-${{ inputs.upload }}
   cancel-in-progress: true
 
 jobs:
