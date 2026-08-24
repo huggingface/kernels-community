@@ -389,14 +389,17 @@ def _all_grew(base: str, head: str) -> bool:
     return isinstance(old, list) and isinstance(new, list) and set(old) < set(new)
 
 
-# Returns (breaking, additive). Breaking covers symbols that were removed or
-# whose signature changed, additive covers newly exposed ones. Both require a
-# version bump.
+# Returns {"breaking": ..., "additive": ...}. Breaking covers symbols that were
+# removed or whose signature changed, additive covers newly exposed ones. Both
+# require a version bump.
 def report(
     kernel: str, base: dict, head: dict, limit: int = 20, preview: int = 6
-) -> tuple:
+) -> dict:
+    # In the baseline, gone from the head.
     removed = sorted(k for k in base if k not in head)
+    # In both, but with a different signature.
     changed = sorted(k for k in base if k in head and base[k] != head[k])
+    # In the head only.
     added = sorted(k for k in head if k not in base)
 
     if not (removed or changed or added):
@@ -406,7 +409,7 @@ def report(
         if len(keys) > preview:
             items.append((f"... and {len(keys) - preview} more", []))
         _tree(items)
-        return False, False
+        return {"breaking": False, "additive": False}
 
     counts = ", ".join(
         f"{n} {label}"
@@ -427,10 +430,16 @@ def report(
         items = items[:limit] + [(f"... and {len(items) - limit} more", [])]
     _tree(items)
 
+    # Changed `__all__` entries that only gained names.
     grown = [
         k for k in changed if k.endswith(" __all__") and _all_grew(base[k], head[k])
     ]
-    return bool(removed or set(changed) - set(grown)), bool(added or grown)
+    # Everything else that changed is a real signature change.
+    signature_changed = set(changed) - set(grown)
+    return {
+        "breaking": bool(removed or signature_changed),
+        "additive": bool(added or grown),
+    }
 
 
 def main() -> int:
@@ -498,10 +507,8 @@ def main() -> int:
             print(f"  [new] {kernel}: not in the base tree, nothing to compare")
             continue
 
-        breaking, additive = report(
-            kernel, extract_api(base_src), extract_api(head_src)
-        )
-        if not (breaking or additive):
+        diff = report(kernel, extract_api(base_src), extract_api(head_src))
+        if not (diff["breaking"] or diff["additive"]):
             continue
 
         old_version = kernel_version(base_src)
@@ -515,7 +522,7 @@ def main() -> int:
             continue
 
         flavour = additive_safe(head_src)
-        if additive and not breaking and flavour:
+        if diff["additive"] and not diff["breaking"] and flavour:
             print(f"     => additions only on a {flavour} kernel, bump not required")
             continue
 
