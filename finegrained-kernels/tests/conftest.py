@@ -4,6 +4,7 @@ step, pins each xdist worker to its own GPU, then gates the whole suite on FP8
 hardware support."""
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,17 +12,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "torch-ext"))
 
 
-def _visible_gpu_pool() -> list[str]:
-    """The GPU ids this run may use: an explicit ``CUDA_VISIBLE_DEVICES`` restriction if
-    set, else every GPU ``nvidia-smi`` reports (counted out-of-process so we don't create a
-    CUDA context here — that would fix the parent's device before the per-worker pin)."""
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+def _visible_gpu_pool(env_var: str, list_cmd: list[str]) -> list[str]:
+    """The GPU ids this run may use: an explicit ``env_var`` restriction if set, else
+    every GPU ``list_cmd`` reports (counted out-of-process so we don't create a device
+    context here — that would fix the parent's device before the per-worker pin)."""
+    visible = os.environ.get(env_var, "").strip()
     if visible:
         return [d for d in visible.split(",") if d != ""]
     try:
-        out = subprocess.run(
-            ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10
-        )
+        out = subprocess.run(list_cmd, capture_output=True, text=True, timeout=10)
         return [str(i) for i, ln in enumerate(out.stdout.splitlines()) if ln.strip()]
     except Exception:
         return []
@@ -40,19 +39,26 @@ def _pin_worker_gpu() -> None:
         idx = int(worker[2:])
     except ValueError:
         return
+    # Which accelerator this box exposes decides the masking variable: CUDA/ROCm read
+    # CUDA_VISIBLE_DEVICES, Level-Zero (Intel XPU) reads ZE_AFFINITY_MASK. Probed by
+    # env/binary presence rather than torch, which must not be imported yet here.
+    if os.environ.get("ZE_AFFINITY_MASK", "").strip() or shutil.which("xpu-smi"):
+        env_var, list_cmd = "ZE_AFFINITY_MASK", ["xpu-smi", "discovery", "--dump", "1"]
+    else:
+        env_var, list_cmd = "CUDA_VISIBLE_DEVICES", ["nvidia-smi", "-L"]
     # nvidia-smi -L enumerates in PCI order; the CUDA runtime defaults to FASTEST_FIRST,
     # so without this pin two workers can land on one physical GPU on a heterogeneous box
     # while another sits idle. Force PCI order ONLY when the user set no
     # CUDA_VISIBLE_DEVICES — an explicit restriction was chosen under the runtime's
     # current order, and re-ordering would silently rename which physical GPUs it means.
-    if not os.environ.get("CUDA_VISIBLE_DEVICES", "").strip():
+    if env_var == "CUDA_VISIBLE_DEVICES" and not os.environ.get(env_var, "").strip():
         os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-    pool = _visible_gpu_pool()
+    pool = _visible_gpu_pool(env_var, list_cmd)
     if pool:
-        os.environ["CUDA_VISIBLE_DEVICES"] = pool[idx % len(pool)]
+        os.environ[env_var] = pool[idx % len(pool)]
     else:
         print(
-            "[conftest] WARNING: no GPU pool found (nvidia-smi missing/empty) — "
+            f"[conftest] WARNING: no GPU pool found ({list_cmd[0]} missing/empty) — "
             "xdist workers will all share the default device",
             file=sys.stderr,
         )

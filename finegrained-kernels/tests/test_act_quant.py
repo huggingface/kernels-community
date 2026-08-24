@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from utils import TEST_DEVICE  # type: ignore
+from utils import TEST_DEVICE, accelerator_module  # type: ignore
 
 import triton
 import triton.language as tl
@@ -141,7 +141,7 @@ def _ref_nvfp4_act_quant(x: torch.Tensor):
 
 # M=100 does not divide the row-tile BLOCK_T {8,16,32,64} — exercises the tail mask.
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("M", [64, 100], ids=["Tdiv", "Ttail"])
 def test_mxfp4_act_quant_matches_torch_reference(M):
     """The Triton one-pass quant must be bit-identical to an INDEPENDENT pure-PyTorch
@@ -155,7 +155,7 @@ def test_mxfp4_act_quant_matches_torch_reference(M):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("M", [64, 100], ids=["Tdiv", "Ttail"])
 def test_nvfp4_act_quant_matches_torch_reference(M):
     """Same independent-reference check for the NVFP4 quant (E4M3 group-16 scales)."""
@@ -183,7 +183,7 @@ def _ref_mxfp8_act_quant(x: torch.Tensor):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("M", [64, 100], ids=["Tdiv", "Ttail"])
 def test_mxfp8_act_quant_matches_torch_reference(M):
     """Independent pure-PyTorch check for the MXFP8 quant — the op-level tests dequantize
@@ -210,7 +210,7 @@ def _ref_ue8m0_block_dynamic(x: torch.Tensor, block_k: int):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("M", [64, 100], ids=["Tdiv", "Ttail"])
 def test_ue8m0_block_dynamic_matches_torch_reference(M):
     """Independent pure-PyTorch check for ``fp8_act_quant_block_dynamic(use_ue8m0=True)``
@@ -237,7 +237,7 @@ def _dequant_nvfp4_two_level(packed, block, g, K):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_nvfp4_quantize_two_level():
     """The canonical two-level weight quant: the global must be ``amax / (6 * 448)``, the
     block level must be BIT-IDENTICAL to the single-level quant of the globally-normalized
@@ -246,7 +246,7 @@ def test_nvfp4_quantize_two_level():
     quantization error, not a kernel property), and the 1.2e-1 bound fails any
     level-composition regression (a dropped global is orders of magnitude off)."""
     torch.manual_seed(0)
-    w = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16) * 3
+    w = torch.randn(256, 512, device=TEST_DEVICE, dtype=torch.bfloat16) * 3
     packed, block, g = nvfp4_quantize_two_level(w)
     assert packed.dtype == torch.int8 and g.shape == (1,) and g.dtype == torch.float32
     g_ref = (w.abs().amax() / (6.0 * 448.0)).clamp(min=1e-30).float().reshape(1)
@@ -281,13 +281,13 @@ def _run_mx_inline(x, recipe):
     )
     s = torch.empty(M, N // 32, device=x.device, dtype=torch.uint8)
     _mx_inline_harness[(1,)](x, q, s, M=M, N=N, RECIPE=recipe, num_warps=4)
-    torch.cuda.synchronize()
+    accelerator_module().synchronize()
     return q, s
 
 
 def _act_inputs(M=64, N=256, zero_rows=True):
     torch.manual_seed(0)
-    x = torch.randn(M, N, device="cuda", dtype=torch.float32) * 8
+    x = torch.randn(M, N, device=TEST_DEVICE, dtype=torch.float32) * 8
     if zero_rows:
         x[0] = 0  # whole-row zero: scales must stay neutral, values must dequant to 0
         x[1, :32] = 0  # one zero group inside a live row
@@ -295,7 +295,7 @@ def _act_inputs(M=64, N=256, zero_rows=True):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_mxfp8_inline_matches_offline():
     """The in-kernel E4M3 quant (fused epilogues, inline decode arm) and the offline
     ``mxfp8_act_quant`` pass must be bit-identical — the dtype-branched kernels and the
@@ -308,7 +308,7 @@ def test_mxfp8_inline_matches_offline():
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_mxfp4_inline_matches_host():
     """The in-kernel packed-E2M1 quant (the "mxfp4" output recipe) and the host
     ``mxfp4_act_quant`` must be bit-identical — the fused intermediate must equal
@@ -321,17 +321,17 @@ def test_mxfp4_inline_matches_host():
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_nvfp4_inline_matches_offline():
     """The in-kernel NVFP4 quant and the one-pass offline kernel share
     ``mx_act_quant_inline``'s arm, but exercise different tile widths — the packed
     bytes and E4M3 scales must be bit-identical."""
     x = _act_inputs()
     M, N = x.shape
-    q = torch.empty(M, N // 2, device="cuda", dtype=torch.uint8)
-    s = torch.empty(M, N // 16, device="cuda", dtype=torch.float8_e4m3fn)
+    q = torch.empty(M, N // 2, device=TEST_DEVICE, dtype=torch.uint8)
+    s = torch.empty(M, N // 16, device=TEST_DEVICE, dtype=torch.float8_e4m3fn)
     _nv_inline_harness[(1,)](x, q, s, M=M, N=N, num_warps=4)
-    torch.cuda.synchronize()
+    accelerator_module().synchronize()
     q_ref, s_ref = nvfp4_act_quant(x)
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8))
     assert torch.equal(q, q_ref.view(torch.uint8))
@@ -348,7 +348,7 @@ def _nv_inline_harness(X, Q, S, M: tl.constexpr, N: tl.constexpr):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_mxfp4_round_trip_bound():
     """Dequantizing a host-quantized tensor stays within one E2M1 grid step of the
     input (half the largest gap, 1.0, times each group's scale) — and zeros round-trip
@@ -362,7 +362,7 @@ def test_mxfp4_round_trip_bound():
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_block_dynamic_offline_zero_block():
     """A zero block must produce a finite scale and exact-zero values (the 1e-12 floor),
     with live blocks in the same row unaffected."""
@@ -376,7 +376,7 @@ def test_block_dynamic_offline_zero_block():
 # T values that don't divide the row-tile BLOCK_T {8,16,32,64} cover the tail mask; the
 # one-row-per-program predecessor never had one, so this guards the row-tile rewrite.
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize(
     "shape",
     [(64, 256), (100, 256), (3, 128), (129, 512), (1, 384)],
