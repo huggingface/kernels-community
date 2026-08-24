@@ -18,6 +18,7 @@
 # ///
 import argparse
 import ast
+import enum
 import json
 import sys
 import tomllib
@@ -336,13 +337,19 @@ def kernel_version(src: Source):
 # variants, because every variant is refreshed by the next build: no-arch
 # kernels ship a single variant, and stable-ABI kernels keep one build working
 # across Torch versions. Removals and signature changes still need a bump.
-def additive_safe(src: Source) -> str:
+class Flavour(enum.StrEnum):
+    NO_ARCH = "no-arch"
+    STABLE_ABI = "stable-ABI"
+
+
+# The flavour that exempts this kernel from a bump on additions, if any.
+def additive_safe(src: Source) -> Flavour | None:
     data = _build_toml(src)
     if "torch-noarch" in data:
-        return "no-arch"
+        return Flavour.NO_ARCH
     if "stable-abi" in data.get("torch", {}):
-        return "stable-ABI"
-    return ""
+        return Flavour.STABLE_ABI
+    return None
 
 
 # Resolve a branch/tag/SHA via libgit2.
@@ -522,7 +529,7 @@ def main() -> int:
             continue
 
         flavour = additive_safe(head_src)
-        if diff["additive"] and not diff["breaking"] and flavour:
+        if diff["additive"] and not diff["breaking"] and flavour is not None:
             print(f"     => additions only on a {flavour} kernel, bump not required")
             continue
 
