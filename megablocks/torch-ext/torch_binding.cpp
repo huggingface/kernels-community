@@ -263,7 +263,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "cutlass_grouped_gemm_interface(Tensor ptr_A, Tensor ptr_B, "
       "Tensor? ptr_scales, Tensor? ptr_bias, Tensor! ptr_D, "
       "Tensor expert_first_token_offset, int N, int K, int num_experts, "
-      "bool is_B_int4, bool is_B_mxfp4) -> Tensor");
+      "bool is_B_int4, bool is_B_mxfp4, bool is_B_mxfp8=False) -> Tensor");
   ops.impl("cutlass_grouped_gemm_interface", torch::kXPU, &cutlass_grouped_gemm_interface);
 }
 
