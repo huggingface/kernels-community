@@ -564,9 +564,10 @@ def block_dynamic_2d_warp_spec_pruner():
     """``early_config_prune`` for the block-dynamic 2D kernel's two WARP_SPEC compile-fail
     laws (Triton 3.7.1 PassManager, TritonGPUPipeline; charted 2026-08-13 at the
     DeepSeek-V4-Flash ue8m0 checkpoint shapes, forced-config matrices):
-      - WS + num_warps=16 fails at EVERY tile/scale-dtype (w8 compiles everywhere); the mx
-        2D and grouped kernels WS-compile w16 fine, so this is this loop's structure, not a
-        global WS law.
+      - WS + num_warps=16 fails at EVERY tile/scale-dtype (w8 compiles everywhere). The mx
+        2D kernel WS-compiles w16 fine; the bd GROUPED kernel does NOT on its pointer arm
+        (same law, see block_dynamic_grouped_matmul_pruner) — so this tracks the loop's
+        structure and memory mode, not a global WS law.
       - the implicit ``dot_scaled`` arm (``USE_DOT_SCALED``: UE8M0/uint8 ``As`` on a
         native-M tile — (BN if SWAP_AB else BM) >= 128) + WS fails at every warps/stages/
         memory-mode cell; BM=64 and non-WS all compile. fp32-scale launches never emit the
@@ -805,15 +806,18 @@ def block_dynamic_grouped_matmul_pruner():
     runs per cell, big and tiny shapes:
 
     - ``warp_specialize`` compiles iff ``num_warps % 4 == 0`` (its async partitions) and
-      ``BLOCK_SIZE_M >= 64``, and is race-free everywhere it compiles — EXCEPT on the
-      implicit ``dot_scaled`` arm (``USE_DOT_SCALED``: uint8/UE8M0 ``As`` on a native-M
-      ``BLOCK_SIZE_M >= 128`` tile), where it lowers only from the DESCRIPTOR loads. The
-      pointer arm's masked activation load leaves an ``other=0.0`` constant that cannot
-      take ``ttg.partition`` ("op does not have expected attribute ttg.partition"), and it
-      fails at every warps/stages cell (charted 2026-08-21, forced-config matrix: pointer
-      0/6, host_descriptor 4/6 + 2 smem). Combined with the race guard below this leaves
-      the descriptor arm as the only BM=128 route for UE8M0 grouped — which is what makes
-      the native tcgen05 tile reachable at all here.
+      ``BLOCK_SIZE_M >= 64``, and is race-free everywhere it compiles — but on the POINTER
+      arm it hits a lowering wall: that arm's masked activation load leaves an ``other=0.0``
+      constant that cannot take ``ttg.partition`` ("op does not have expected attribute
+      ttg.partition" -> PassManager::run failed). The descriptor arm has no such constant
+      and always compiles. Two INDEPENDENT legs, forced-config matrices, 2026-08-21 B200:
+        * ``num_warps >= 16`` fails at BM 64 AND 128, with fp32 scales as well as UE8M0 —
+          a property of this loop under WS, not of the scaled MMA.
+        * uint8/UE8M0 ``As`` on a native-M ``BLOCK_SIZE_M >= 128`` tile (the implicit
+          ``dot_scaled`` arm) fails at every warps/stages cell: pointer 0/6, descriptor
+          4/6 + 2 smem.
+      Combined with the race guard below, the descriptor arm is the only BM=128 route for
+      UE8M0 grouped — which is what makes the native tcgen05 tile reachable at all here.
     - The default pipeliner RACES at ``BLOCK_SIZE_M >= 64`` (3/15 wrong at BM64/w8) and is
       clean at BM16/32.
 
@@ -828,17 +832,17 @@ def block_dynamic_grouped_matmul_pruner():
     before trusting the static attachment."""
 
     def ok(c, args):
-        if config_dim(c, args, "BLOCK_SIZE_M") >= 64:
-            if not (c.kwargs.get("WARP_SPEC") and c.num_warps % 4 == 0):
+        bm = config_dim(c, args, "BLOCK_SIZE_M")
+        if bm < 64:
+            return not c.kwargs.get("WARP_SPEC")
+        if not (c.kwargs.get("WARP_SPEC") and c.num_warps % 4 == 0):
+            return False
+        if c.kwargs.get("A_MEMORY_MODE") == "pointer":
+            if c.num_warps >= 16:
                 return False
-            if (
-                getattr(args.get("As"), "dtype", None) == torch.uint8
-                and config_dim(c, args, "BLOCK_SIZE_M") >= 128
-                and c.kwargs.get("A_MEMORY_MODE") == "pointer"
-            ):
+            if getattr(args.get("As"), "dtype", None) == torch.uint8 and bm >= 128:
                 return False
-            return True
-        return not c.kwargs.get("WARP_SPEC")
+        return True
 
     return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
 
