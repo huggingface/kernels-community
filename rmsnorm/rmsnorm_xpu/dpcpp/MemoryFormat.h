@@ -58,4 +58,4 @@ inline MemoryFormat get_cl_tag_by_ndim(const int64_t ndim) {
 }
 
 } // namespace dpcpp
-} // namespace torch_ipex::xpu
+} // namespace kernels::xpu

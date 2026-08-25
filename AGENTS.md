@@ -59,6 +59,47 @@ The same applies for other registrations of ops, such as fake ops:
 @register_fake(add_op_namespace_prefix("single_marlin_gemm_moe"))
 ```
 
+## Tests
+
+Tests live in `tests/` and must load the kernel through `get_kernel` rather
+than importing the built package directly. This exercises the same code path
+that users take, so breakage in the loader, in variant resolution, or in a
+dependency version is caught by the tests:
+
+```python
+# Incorrect:
+import relu
+
+# Correct:
+import kernels
+
+relu = kernels.get_kernel("kernels-community/relu", version=1)
+```
+
+The repo id is the `repo-id` from the `[general.hub]` section of `build.toml`,
+and the version is the `version` from `[general]`. In CI (and in
+`kernel-builder devshell`/`testshell`) the `LOCAL_KERNELS` environment
+variable is set to point at the freshly built kernel, so `get_kernel` resolves
+to the local build instead of downloading from the Hub. This requires a
+`flake.lock` with a `kernel-builder` input recent enough that the `ci-test`
+derivation exports `LOCAL_KERNELS`; run `python3 scripts/update_flakes.py
+<kernel>` if the tests fail to find the kernel in CI.
+
+Running the full test suite in CI is usually too expensive, so mark a subset
+of cheap tests that together catch most error cases with the `kernels_ci`
+marker. Aim for a total runtime under 60 seconds:
+
+```python
+import pytest
+
+@pytest.mark.kernels_ci
+def test_relu():
+    ...
+```
+
+These are the tests run by `nix run .#ci-test` (`pytest -m kernels_ci`), which
+is what kernels-community CI executes on a GPU runner.
+
 # Kernel-specific instructions
 
 ## flash-attn3
