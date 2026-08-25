@@ -378,10 +378,14 @@ from.
 ## sage-attention
 
 This package mirrors the **SageAttention / SageAttention2 / SageAttention2++**
-CUDA stack from upstream. SageAttention3 (microscaling FP4 for datacenter
-Blackwell) is deliberately **not** part of this kernel — it lives in its own
-directory. When the user asks to sync a sage-attention release, carry out the
-following steps:
+CUDA stack from upstream. SageAttention3 (microscaling FP4 for consumer
+Blackwell, sm120/sm121) is deliberately **not** part of this kernel — it lives
+in its own directory. Note that SageAttention3 is *not* a datacenter-Blackwell
+kernel: its FP4 mainloop uses the warp-level `mma.sync ... kind::mxf4nvf4`
+instruction, which only exists on sm120/sm121. Datacenter Blackwell (sm100)
+drives FP4 through the unrelated CTA-level `tcgen05.mma` path instead, so it
+cannot run those kernels. When the user asks to sync a sage-attention release,
+carry out the following steps:
 
 - Fetch the upstream Git repository from https://github.com/thu-ml/SageAttention.git
 - Check out the tag or commit that the user specified. Note that upstream tags
