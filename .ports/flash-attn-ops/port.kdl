@@ -1,0 +1,122 @@
+recipe version=1
+
+// flash-attn-ops
+//
+// The general-purpose Triton ops that ship inside flash-attn under
+// flash_attn/ops/triton, plus the flash_attn.losses wrapper on top of them,
+// packaged as a self-contained noarch kernel. Nothing is compiled ahead of
+// time, so the port is a prune, three moves, and the rewrites that let the
+// package be imported under whatever directory name the Hub loads it from.
+//
+// The package __init__, the tests, the readme example and the flake are not
+// derived from upstream - they come from the overlay.
+//
+//   kernel-port .ports/flash-attn-ops/port.kdl \
+//       --dir <flash-attention checkout> --out flash-attn-ops
+
+source \
+    repo="https://github.com/Dao-AILab/flash-attention.git" \
+    commit="b02b07e1a10238fe12831b80a8937ed59b1353a5"
+
+prune keep="flash_attn/ops/triton/**,flash_attn/losses/cross_entropy.py,flash_attn/utils/{__init__,torch,library}.py"
+
+// linear.py relies on triton.ops.matmul_perf_model, removed in Triton >= 3.0,
+// and mlp.py relies on the compiled fused_dense_lib extension. Both need more
+// than an import rewrite and are tracked as a follow-up in the README.
+delete in="flash_attn/ops/triton/{linear,mlp}.py"
+
+// The upstream triton/__init__.py is empty; the package init comes from the
+// overlay, because it has to re-export the flat kernel API.
+delete in="flash_attn/ops/triton/__init__.py"
+
+move \
+    from="flash_attn/ops/triton" \
+    to="torch-ext/flash_attn_ops"
+move \
+    from="flash_attn/losses/cross_entropy.py" \
+    to="torch-ext/flash_attn_ops/losses.py"
+move \
+    from="flash_attn/utils" \
+    to="torch-ext/flash_attn_ops/utils"
+
+// flash_attn/ops/triton is now the package root and flash_attn/utils sits
+// under it, so both upstream namespaces have to be remapped onto the new
+// package before they can be made relative.
+remap_module \
+    in="torch-ext/flash_attn_ops/**" \
+    from="flash_attn.ops.triton" \
+    to="flash_attn_ops" \
+    changes=1
+remap_module \
+    in="torch-ext/flash_attn_ops/**" \
+    from="flash_attn.utils" \
+    to="flash_attn_ops.utils" \
+    changes=2
+
+relativize_imports \
+    in="torch-ext/flash_attn_ops/**" \
+    package_root="torch-ext/flash_attn_ops" \
+    changes=3
+expect \
+    in="torch-ext/flash_attn_ops/**" \
+    find="from flash_attn" \
+    count=0
+
+// The Hub loads a kernel under a build-variant directory name, so the torch op
+// namespace cannot stay hardcoded to flash_attn:: - it is derived at import
+// time from the generated _ops module instead.
+replace \
+    in="torch-ext/flash_attn_ops/layer_norm.py" \
+    count=1 \
+    find="from .utils.torch import custom_fwd, custom_bwd\n" \
+    with="from ._ops import add_op_namespace_prefix\nfrom .utils.torch import custom_fwd, custom_bwd\n"
+replace \
+    in="torch-ext/flash_attn_ops/layer_norm.py" \
+    count=1 \
+    find="@triton_op(\"flash_attn::layer_norm_fwd_impl\"" \
+    with="@triton_op(add_op_namespace_prefix(\"layer_norm_fwd_impl\")"
+replace \
+    in="torch-ext/flash_attn_ops/layer_norm.py" \
+    count=1 \
+    find="@triton_op(\"flash_attn::layer_norm_bwd_impl\"" \
+    with="@triton_op(add_op_namespace_prefix(\"layer_norm_bwd_impl\")"
+expect \
+    in="torch-ext/flash_attn_ops/**" \
+    find="flash_attn::" \
+    count=0
+
+// Importing the package must not initialize CUDA: the noarch build imports it
+// on a machine with no GPU to collect the public API.
+replace \
+    in="torch-ext/flash_attn_ops/layer_norm.py" \
+    count=1 \
+    find=#"""
+    # Default to warp size 32 if not defined by device
+    warp_size = getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "warp_size", 32)
+"""# \
+    with=#"""
+    # Default to warp size 32 if not defined by device. Guard the device query so
+    # importing this module does not trigger CUDA initialization on machines
+    # without a GPU (e.g. the noarch kernel build/import check).
+    warp_size = 32
+    if torch.cuda.is_available():
+        warp_size = getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "warp_size", 32)
+"""#
+
+// The package init, the rewritten tests, the readme example and the flake.
+overlay from="overlay"
+
+expect \
+    in="torch-ext/flash_attn_ops/**" \
+    files=9
+expect \
+    in="tests/**" \
+    files=4
+
+manifest \
+    name="flash-attn-ops" \
+    version=1 \
+    license="BSD-3-Clause" \
+    backends="cuda,rocm,xpu" \
+    repo_id="kernels-community/flash-attn-ops" \
+    noarch=#true

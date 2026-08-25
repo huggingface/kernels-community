@@ -1,7 +1,7 @@
 [general]
 name = "flash-attn-ops"
-license = "BSD-3-Clause"
 version = 1
+license = "BSD-3-Clause"
 backends = [
     "cuda",
     "rocm",
