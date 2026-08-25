@@ -16,6 +16,10 @@ build
 .*
 !.github/
 
+# Port recipes and provenance
+!.ports/
+!.port-provenance.json
+
 # Python stuff
 __pycache__/
 
