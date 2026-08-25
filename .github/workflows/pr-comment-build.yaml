@@ -25,6 +25,11 @@ jobs:
       - name: Handle /kernel-bot command
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Read-only org token, used *solely* to look up team membership so
+          # `/kernel-bot build` also works for the huggingface/transformers team.
+          # GITHUB_TOKEN is repo-scoped and cannot read team rosters. If this
+          # secret is unset the bot falls back to repo-permission checks alone.
+          TEAM_READ_TOKEN: ${{ secrets.TEAM_READ_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENT_ID: ${{ github.event.comment.id }}
