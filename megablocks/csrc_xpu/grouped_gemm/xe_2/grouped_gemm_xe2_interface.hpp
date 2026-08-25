@@ -139,7 +139,7 @@ void MoEGEMMLauncher(
         layoutA,
         layoutB,
         policy,
-        SYCL_INTEL_TARGET>>(
+        MEGABLOCKS_XE_TARGET_ARCH>>(
         sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
           MoE::MoEGEMM<
               GmemTiledCopyA,
@@ -187,7 +187,9 @@ torch::Tensor cutlass_grouped_gemm_xe2(
     bool is_B_mxfp4,
     bool is_B_mxfp8) {
   // Guards against the CRI translation unit losing -D__SYCL_TARGET_INTEL_GPU_CRI__.
-  static_assert(Arch == SYCL_INTEL_TARGET, "Arch must match SYCL_INTEL_TARGET");
+  static_assert(
+      Arch == MEGABLOCKS_XE_TARGET_ARCH,
+      "Arch must match MEGABLOCKS_XE_TARGET_ARCH");
   auto& dpcpp_queue =
       at::xpu::getCurrentXPUStream(ptr_A.device().index()).queue();
   auto A_dtype = ptr_A.dtype();
