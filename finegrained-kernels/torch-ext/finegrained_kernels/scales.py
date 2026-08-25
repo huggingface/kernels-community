@@ -247,7 +247,18 @@ def load_mx_act_tile(
                 # UE8M0 scales: byte 0 decodes to 2^-127 — padded rows can't make 0*inf
                 a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0)
     else:  # raw bf16/fp16 — quantize inline
-        if row_mask is None:
+        # the descriptor arm mirrors the pre-quantized branch above. Without it every
+        # A_MEMORY_MODE != "pointer" config fell through to `tl.load(a_ptrs)`, and under a
+        # descriptor arm `operand_tile_ptrs` hands back the bare base pointer -- so that load
+        # produced a SCALAR and mx_act_quant_inline's reshape died with "'dtype' object has no
+        # attribute 'numel'". Raw-A is exactly the inline-quant (nvfp4/mxfp4 2D) path, so it
+        # killed every descriptor config there: 321 dead compiles in one tune.
+        if A_MEMORY_MODE != "pointer":
+            if A_GATHER:
+                a_raw = a_descriptor.gather(gather_rows, ka_off).to(tl.float32)
+            else:
+                a_raw = a_descriptor.load([m_start, ka_off]).to(tl.float32)
+        elif row_mask is None:
             a_raw = tl.load(a_ptrs).to(tl.float32)
         else:
             a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
