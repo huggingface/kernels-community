@@ -14,6 +14,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: mitchellh/vouch/action/sync-codeowners@d66fa29a64600490892131ad87597c30c91fcac4 # v1.5.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           repo: ${{ github.repository }}
           pull-request: true
