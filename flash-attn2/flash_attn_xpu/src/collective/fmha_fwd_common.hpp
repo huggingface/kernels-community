@@ -177,6 +177,28 @@ CUTLASS_HOST_DEVICE constexpr auto get_sg_layout_pv(SGLayoutQK const&) {
 //
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+// sycl-tla 0.9.2 changed cute::reduce() to return a SubgroupTensor, which
+// cute::transform() does not accept; earlier releases return a plain
+// cute::Tensor. Strip the subgroup wrapper when it is present so that the same
+// source compiles against both.
+template <class T, class = void>
+struct plain_tensor {
+  using type = T;
+};
+
+template <class T>
+struct plain_tensor<T, cute::void_t<typename T::Base>> {
+  using type = typename T::Base;
+};
+
+template <class T>
+using plain_tensor_t = typename plain_tensor<cute::remove_cvref_t<T>>::type;
+
+template <class T>
+CUTLASS_DEVICE constexpr plain_tensor_t<T>& as_plain_tensor(T& t) {
+  return static_cast<plain_tensor_t<T>&>(t);
+}
+
 template <class CollectiveMainloop, class TileShapeO_, class TensorO_, class TiledCopyO_ = void>
 struct FMHAFwdEpilogueTraits {
   using TiledMMAPV = typename CollectiveMainloop::TiledMMAPV;
@@ -316,16 +338,15 @@ struct FMHAFwdEpilogueTraits {
         copy_block_s2r(sA_max(_, k_blk, kr, a_tile), rA_kmax[kr]);
       }
 
-      using RowBase = typename ReduceFragARow::Base;
       rA_max = rA_kmax[0];
       for (int kr = 1; kr < ReduceK{}; kr++)
-        cute::transform(rA_max.tensor(), rA_kmax[kr].tensor(),
-                        static_cast<RowBase&>(rA_max), cute::max_fn{});
+        cute::transform(as_plain_tensor(rA_max), as_plain_tensor(rA_kmax[kr]),
+                        as_plain_tensor(rA_max), cute::max_fn{});
 
       for (int kr = 0; kr < ReduceK{}; kr++) {
         cute::transform(
-            rA_max.tensor(), rA_kmax[kr].tensor(),
-            static_cast<RowBase&>(rA_kmax[kr]), [](auto gmax, auto kmax) {
+            as_plain_tensor(rA_max), as_plain_tensor(rA_kmax[kr]),
+            as_plain_tensor(rA_kmax[kr]), [](auto gmax, auto kmax) {
               return sycl::native::exp2(kmax - gmax);
             });
       }
