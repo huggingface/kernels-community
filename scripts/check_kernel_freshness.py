@@ -54,6 +54,7 @@ KERNEL_SOURCE_MAPPING = {
     "mlx-quantization-metal-kernels": "https://github.com/ml-explore/mlx",
     "mlx-rmsnorm": "https://github.com/ml-explore/mlx",
     "sage-attention": "https://github.com/thu-ml/SageAttention",
+    "sage-blackwell": "https://github.com/thu-ml/SageAttention",
     "deep-gemm": "https://github.com/deepseek-ai/DeepGEMM",
     "bitsandbytes-mps": "",
     "aiter-flash-attn": "https://github.com/ROCm/aiter",
