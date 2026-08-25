@@ -1,17 +1,16 @@
 [general]
 name = "vllm-moe"
 version = 0
+edition = 5
 license = "Apache-2.0"
 upstream = "git+https://github.com/vllm-project/vllm.git"
 backends = ["cuda"]
 
+[general.cuda]
+maxver = "12.9"
+
 [general.hub]
 repo-id = "kernels-community/vllm-moe"
-
-[general.cuda]
-# Not compatible with cub from CUDA 13.0, should work again after sync of
-# kernel with upstream.
-maxver = "12.9"
 
 [torch]
 include = ["."]
@@ -23,27 +22,6 @@ src = [
     "core/scalar_type.hpp",
     "torch-ext/torch_binding.cpp",
     "torch-ext/torch_binding.h",
-]
-
-[kernel.activation]
-backend = "cuda"
-depends = ["torch"]
-src = [
-    "activation/activation_kernels.cu",
-    "activation/cuda_compat.h",
-    "activation/dispatch_utils.h",
-]
-
-[kernel.moe]
-backend = "cuda"
-depends = ["torch"]
-src = [
-    "cuda_compat.h",
-    "dispatch_utils.h",
-    "moe/moe_align_sum_kernels.cu",
-    "moe/moe_wna16.cu",
-    "moe/moe_wna16_utils.h",
-    "moe/topk_softmax_kernels.cu",
 ]
 
 [kernel.fp8]
@@ -58,6 +36,18 @@ src = [
     "fp8/common.cu",
     "fp8/common.cuh",
     "fp8/vectorization.cuh",
+]
+
+[kernel.moe]
+backend = "cuda"
+depends = ["torch"]
+src = [
+    "cuda_compat.h",
+    "dispatch_utils.h",
+    "moe/moe_align_sum_kernels.cu",
+    "moe/moe_wna16.cu",
+    "moe/moe_wna16_utils.h",
+    "moe/topk_softmax_kernels.cu",
 ]
 
 [kernel.moe-marlin]
@@ -85,4 +75,13 @@ src = [
     "marlin-moe/marlin_kernels/marlin_moe_kernel_ku4b8.h",
     "marlin-moe/marlin_kernels/marlin_moe_kernel_ku4b8.cu",
     "marlin-moe/marlin_kernels/marlin_moe_kernel_ku8b128.h",
+]
+
+[kernel.activation]
+backend = "cuda"
+depends = ["torch"]
+src = [
+    "activation/activation_kernels.cu",
+    "activation/cuda_compat.h",
+    "activation/dispatch_utils.h",
 ]

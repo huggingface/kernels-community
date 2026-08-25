@@ -1,6 +1,7 @@
 [general]
 name = "aiter-rope"
 version = 2
+edition = 5
 license = "MIT"
 backends = ["rocm"]
 
