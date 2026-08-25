@@ -1,14 +1,21 @@
 import torch
 import random
-from deep_gemm.testing import bench_kineto, count_bytes, get_arch_major
-from deep_gemm.utils import (
-    align, ceil_div,
-    per_token_cast_to_fp8, per_channel_cast_to_fp8,
-    get_tma_aligned_size,
-    get_mn_major_tma_aligned_tensor,
-    get_mn_major_tma_aligned_packed_ue8m0_tensor,
-    get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor
-)
+import kernels
+
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+
+bench_kineto = deep_gemm.testing.bench_kineto
+count_bytes = deep_gemm.testing.count_bytes
+get_arch_major = deep_gemm.testing.get_arch_major
+
+align = deep_gemm.utils.align
+ceil_div = deep_gemm.utils.ceil_div
+per_token_cast_to_fp8 = deep_gemm.utils.per_token_cast_to_fp8
+per_channel_cast_to_fp8 = deep_gemm.utils.per_channel_cast_to_fp8
+get_tma_aligned_size = deep_gemm.utils.get_tma_aligned_size
+get_mn_major_tma_aligned_tensor = deep_gemm.utils.get_mn_major_tma_aligned_tensor
+get_mn_major_tma_aligned_packed_ue8m0_tensor = deep_gemm.utils.get_mn_major_tma_aligned_packed_ue8m0_tensor
+get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor = deep_gemm.utils.get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor
 
 from generators import (
     enumerate_sf_layout,
