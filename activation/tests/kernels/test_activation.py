@@ -5,13 +5,15 @@ import math
 import random
 from typing import Type
 
-import activation
+import kernels
 import pytest
 import torch
 import torch.nn.functional as F
 
 from .utils import opcheck
 from .allclose_default import get_default_atol, get_default_rtol
+
+activation = kernels.get_kernel("kernels-community/activation", version=1)
 
 DTYPES = [torch.half, torch.bfloat16, torch.float]
 NUM_TOKENS = [7, 83, 2048]  # Arbitrary values for testing
@@ -76,16 +78,10 @@ def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
 def silu(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x)
 
-@pytest.mark.parametrize(
-    "activation_name", ["silu_and_mul", "mul_and_silu", "gelu", "gelu_tanh", "fatrelu"]
-)
-@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
-@pytest.mark.parametrize("d", D)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", DEVICES)
-@torch.inference_mode()
-def test_act_and_mul(
+ACT_AND_MUL_NAMES = ["silu_and_mul", "mul_and_silu", "gelu", "gelu_tanh", "fatrelu"]
+
+
+def act_and_mul_check(
     activation_name: str,
     num_tokens: int,
     d: int,
@@ -144,54 +140,79 @@ def test_act_and_mul(
         opcheck(op, (out, x))
 
 
-@pytest.mark.parametrize(
-    "activation_fns",
-    [
-        (
-            gelu_fast,
-            activation.gelu_fast,
-            activation.ops.gelu_fast,
-            activation.layers.FastGELU,
-        ),
-        (
-            gelu_new,
-            activation.gelu_new,
-            activation.ops.gelu_new,
-            activation.layers.NewGELU,
-        ),
-        (
-            gelu_quick,
-            activation.gelu_quick,
-            activation.ops.gelu_quick,
-            activation.layers.QuickGELU,
-        ),
-        (
-            gelu_tanh,
-            activation.gelu_tanh,
-            activation.ops.gelu_tanh,
-            activation.layers.GeluTanh,
-        ),
-        (
-            silu,
-            activation.silu,
-            activation.ops.silu,
-            activation.layers.Silu,
-        ),
-        (
-            gelu, 
-            activation.gelu, 
-            activation.ops.gelu, 
-            activation.layers.Gelu
-        ),
-    ],
-)
+@pytest.mark.parametrize("activation_name", ACT_AND_MUL_NAMES)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("d", D)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", DEVICES)
 @torch.inference_mode()
-def test_activation(
+def test_act_and_mul(
+    activation_name: str,
+    num_tokens: int,
+    d: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+) -> None:
+    act_and_mul_check(activation_name, num_tokens, d, dtype, seed, device)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("activation_name", ACT_AND_MUL_NAMES)
+@torch.inference_mode()
+def test_act_and_mul_ci(activation_name: str) -> None:
+    act_and_mul_check(
+        activation_name,
+        num_tokens=7,
+        d=512,
+        dtype=torch.half,
+        seed=0,
+        device=DEVICES[0],
+    )
+
+
+ACTIVATION_FNS = [
+    (
+        gelu_fast,
+        activation.gelu_fast,
+        activation.ops.gelu_fast,
+        activation.layers.FastGELU,
+    ),
+    (
+        gelu_new,
+        activation.gelu_new,
+        activation.ops.gelu_new,
+        activation.layers.NewGELU,
+    ),
+    (
+        gelu_quick,
+        activation.gelu_quick,
+        activation.ops.gelu_quick,
+        activation.layers.QuickGELU,
+    ),
+    (
+        gelu_tanh,
+        activation.gelu_tanh,
+        activation.ops.gelu_tanh,
+        activation.layers.GeluTanh,
+    ),
+    (
+        silu,
+        activation.silu,
+        activation.ops.silu,
+        activation.layers.Silu,
+    ),
+    (
+        gelu,
+        activation.gelu,
+        activation.ops.gelu,
+        activation.layers.Gelu,
+    ),
+]
+
+
+def activation_check(
     activation_fns,
     num_tokens: int,
     d: int,
@@ -216,6 +237,38 @@ def test_activation(
 
     out = torch.empty_like(x)
     opcheck(op, (out, x))
+
+
+@pytest.mark.parametrize("activation_fns", ACTIVATION_FNS)
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("d", D)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_activation(
+    activation_fns,
+    num_tokens: int,
+    d: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+) -> None:
+    activation_check(activation_fns, num_tokens, d, dtype, seed, device)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("activation_fns", ACTIVATION_FNS)
+@torch.inference_mode()
+def test_activation_ci(activation_fns) -> None:
+    activation_check(
+        activation_fns,
+        num_tokens=7,
+        d=512,
+        dtype=torch.half,
+        seed=0,
+        device=DEVICES[0],
+    )
 
 
 # The shapes above are all vector-width multiples over naturally aligned
