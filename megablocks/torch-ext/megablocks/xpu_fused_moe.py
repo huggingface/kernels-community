@@ -26,7 +26,7 @@ def _register_xpu_fake_kernels():
 
     _register_if_available(
         "cutlass_grouped_gemm_interface",
-        lambda ptr_A, ptr_B, ptr_scales, ptr_bias, ptr_D, expert_first_token_offset, N, K, num_experts, is_B_int4, is_B_mxfp4, is_B_mxfp8: ptr_D,
+        lambda ptr_A, ptr_B, ptr_scales, ptr_bias, ptr_D, expert_first_token_offset, N, K, num_experts, is_B_int4, is_B_mxfp4, is_B_mxfp8=False: ptr_D,
     )
 
     _register_if_available(
