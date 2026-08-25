@@ -807,10 +807,14 @@ def block_dynamic_grouped_matmul_pruner():
 
     - ``warp_specialize`` compiles iff ``num_warps % 4 == 0`` (its async partitions) and
       ``BLOCK_SIZE_M >= 64``, and is race-free everywhere it compiles — but on the POINTER
-      arm it hits a lowering wall: that arm's masked activation load leaves an ``other=0.0``
-      constant that cannot take ``ttg.partition`` ("op does not have expected attribute
-      ttg.partition" -> PassManager::run failed). The descriptor arm has no such constant
-      and always compiles. Two INDEPENDENT legs, forced-config matrices, 2026-08-21 B200:
+      arm it hits a lowering wall: "'arith.constant' op does not have expected attribute
+      ttg.partition" -> PassManager::run failed (TritonGPUPipeline). The descriptor arm
+      always compiles. The obvious suspect — the masked activation load's ``other=0.0``,
+      which is the known cause of the analogous mx-grouped fence — was PROBED and is NOT
+      it: dropping the mask entirely leaves every pointer cell below still failing, so the
+      trigger is structural to the pointer arm, not that constant. Do not re-try the
+      clamp-not-mask rewrite on this basis. Two INDEPENDENT legs, forced-config matrices,
+      2026-08-21 B200:
         * ``num_warps >= 16`` fails at BM 64 AND 128, with fp32 scales as well as UE8M0 —
           a property of this loop under WS, not of the scaled MMA.
         * uint8/UE8M0 ``As`` on a native-M ``BLOCK_SIZE_M >= 128`` tile (the implicit
