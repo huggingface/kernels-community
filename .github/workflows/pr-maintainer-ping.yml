@@ -1,0 +1,42 @@
+name: Ping kernel maintainers
+
+# Tell a kernel's maintainers in Slack when a PR is opened against it. Who
+# maintains what comes from .github/kernel-maintainers.json.
+#
+# pull_request_target, not pull_request: a PR from a fork under `pull_request`
+# gets a read-only token and NO secrets, so the webhook would be empty and
+# outside contributions -- the ones maintainers most need to see -- would
+# silently never ping. It is only safe because we never check out or run PR
+# code: the checkout takes no `ref:` (so it is the trusted base branch) and PR
+# data comes from the API. That base checkout is also what keeps pings to PRs
+# against kernels that already exist.
+
+on:
+  pull_request_target:
+    # No `synchronize`: a ping is about "this PR exists", not each push to it.
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  contents: read # the script + registry, from the base checkout
+  pull-requests: read # PR metadata and changed files
+  issues: write # the notified:maintainers dedupe label
+
+concurrency:
+  group: pr-maintainer-ping-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    name: Notify maintainers
+    runs-on: ubuntu-latest
+    steps:
+      # No `ref:` -- see the security note above.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Notify maintainers of touched kernels
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SLACK_WEBHOOK_URL_MAINTAINERS: ${{ secrets.SLACK_WEBHOOK_URL_MAINTAINERS }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 .github/scripts/kernel_maintainers.py notify --pr "$PR_NUMBER"
