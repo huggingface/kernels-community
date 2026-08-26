@@ -266,6 +266,19 @@ PREFILL_TOKENS = 256 if SMOKE else 8192
 CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2"]
 
 MOE_PROBLEMS = {
+    # Scaled-down stand-in for the DeepSeek-V4 geometry (same recipe, /8 experts, /2 dims) so the
+    # MoE rows fit on a 32GB part: build() materializes the pre-quant weights in fp32, which needs
+    # ~16GB for a single E256 H4096 gate_up grid alone.
+    "small/DeepSeek-V4-shaped FP8 block-dyn W8A8 ue8m0 (E32 H2048 I1024 top6)": dict(
+        E=32, H=2048, I=1024, top_k=6, weights="fp8_128x128_ue8m0", recipe="weights",
+        baselines=("finegrained-fp8", "deepgemm"), fp8_block=[128, 128], block_size=(128, 128),
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "small/MiniMax-M3-shaped MXFP8 (E32 H2048 I1024 top4)": dict(
+        E=32, H=2048, I=1024, top_k=4, weights="mxfp8", recipe="weights",
+        baselines=("finegrained-fp8",), fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
+    ),
     "deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6)": dict(
         # config.json: fp8 e4m3, scale_fmt ue8m0, weight_block_size [128,128], dynamic acts.
         # Same expert geometry as the MXFP4 V4 row below — the difference is the deployed
@@ -316,6 +329,12 @@ MOE_PROBLEMS = {
 }
 # the same base-model roster, run as if dequantized to BF16 (one shape per model)
 BF16_PROBLEMS = {
+    "small/DeepSeek-V4-shaped BF16 (E32 H2048 I1024 top6)": dict(
+        E=32, H=2048, I=1024, top_k=6, weights="bf16", recipe="weights",
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
+        fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
     "deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6)": dict(
         E=256, H=4096, I=2048, top_k=6, weights="bf16", recipe="weights",
         baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
@@ -471,7 +490,11 @@ def _glu(gate, up, cfg):
 class _Experts:
     """Duck-typed experts module for the transformers-integration forwards
     (grouped_mm/batched_mm, SonicMoE, DeepGEMM): our (E, out, in) layout is their
-    ``is_transposed=False``; gate|up rows are stacked (concatenated), not interleaved."""
+    ``is_transposed=False``; gate|up rows are INTERLEAVED (gate on even rows, up on odd),
+    the same artifact the fused kernels read.
+
+    ``is_concatenated`` is inert here -- the integration forwards defer the split to
+    ``_apply_gate``, which this class overrides -- so the layout is expressed there."""
 
     def __init__(self, cfg, gu, dn, gus=None, dns=None):
         self.num_experts = cfg["E"]
@@ -489,7 +512,12 @@ class _Experts:
         self._cfg = cfg
 
     def _apply_gate(self, gate_up_out):
-        gate, up = gate_up_out.chunk(2, dim=-1)
+        # The gate|up weight is interleaved, so the GEMM's output columns are too: a
+        # chunk(2) split pairs the wrong halves and silently scrambles the result
+        # (parity 1.2e+00, cosine ~0 -- not a crash). Split on the stride instead.
+        # De-interleaving the weight itself is not an option: a 128-row block scale
+        # spans 64 gate and 64 up rows, so the halves cannot be separated.
+        gate, up = gate_up_out[..., 0::2], gate_up_out[..., 1::2]
         return _glu(gate, up, self._cfg).to(gate_up_out.dtype)
 
 
