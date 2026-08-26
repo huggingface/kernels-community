@@ -37,5 +37,7 @@ jobs:
       # origin URL, HEAD and cleanliness of the checkout it is handed.
       - name: Regenerate every port and compare
         env:
-          KERNEL_PORT: "nix run github:huggingface/kernels#kernel-port --"
+          # kernel-port still lives on the kernel-port-tool branch; point this at
+          # github:huggingface/kernels#kernel-port once that branch merges.
+          KERNEL_PORT: "nix run github:huggingface/kernels/kernel-port-tool#kernel-port --"
         run: python3 scripts/check_ports.py
