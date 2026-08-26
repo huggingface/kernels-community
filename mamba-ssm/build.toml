@@ -1,6 +1,7 @@
 [general]
 name = "mamba-ssm"
 version = 2
+edition = 5
 license = "Apache-2.0"
 backends = ["cuda"]
 python-depends = ["einops"]
