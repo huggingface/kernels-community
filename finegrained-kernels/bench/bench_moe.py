@@ -1008,6 +1008,23 @@ ARMS = {
 # ── timing: one warmed process, each mode measured on the same closure ──
 
 
+def _context_poisoned(tag, mode):
+    """Probe the CUDA context right after an arm ran. An async fault — e.g. an out-of-bounds
+    write that lands in a neighbouring allocation — leaves the context poisoned WITHOUT failing
+    the arm that caused it: that arm posts a normal latency and the NEXT arm dies instead. That
+    is how one kernel silently blanked 10 cells and dropped a whole problem from a run, with the
+    blame landing on an innocent baseline. One tiny launch per (arm, mode) buys the attribution."""
+    try:
+        p = torch.empty(64, 64, device=DEV, dtype=torch.float32).normal_()
+        float(p.sum())
+        torch.cuda.synchronize()
+        return False
+    except Exception as e:
+        print(f"      !! CONTEXT POISONED by [{tag} {mode}]: {type(e).__name__}: "
+              f"{str(e).splitlines()[0][:90]}", flush=True)
+        return True
+
+
 def bench_modes(run, tag):
     """{mode: latency_us | None}, plus the eager output for parity. A mode that raises
     is a red CRASH cell — the other modes still run (fresh error printed inline)."""
@@ -1020,12 +1037,14 @@ def bench_modes(run, tag):
     except Exception as e:
         print(f"      [{tag} eager crashed: {type(e).__name__}: {str(e)[:90]}]", flush=True)
         res["eager"] = None
+    _context_poisoned(tag, "eager")
     try:
         res["cudagraph"] = do_bench_cudagraph(run, return_mode="min") * 1e3
         print(f"      {tag:14s} cudagraph  {res['cudagraph']:9.1f}us", flush=True)
     except Exception as e:
         print(f"      [{tag} cudagraph crashed: {type(e).__name__}: {str(e)[:90]}]", flush=True)
         res["cudagraph"] = None
+    _context_poisoned(tag, "cudagraph")
     try:
         crun = torch.compile(run, mode="max-autotune", fullgraph=True)
         cout = crun()
@@ -1047,6 +1066,7 @@ def bench_modes(run, tag):
     except Exception as e:
         print(f"      [{tag} compile crashed: {type(e).__name__}: {str(e)[:90]}]", flush=True)
         res["compile"] = None
+    _context_poisoned(tag, "compile")
     return res, out
 
 

@@ -528,10 +528,14 @@ class BayesianAutotuner(Autotuner):
                 warned_failures = True
                 self._report_bench_failures()
                 logger.warning(
-                    "[autotune] %s: %d configs failed to compile/run before the trial budget was "
-                    "met — that is dead compile time every tune, and a pruner gap worth closing.",
+                    "[autotune] %s: %d config(s) scored inf before the trial budget was met "
+                    "(%d of them UNEXPECTED failures — the rest are deliberate guard rejections: "
+                    "OutOfResources and tl.static_assert fences, which stock inf's internally). "
+                    "The unexpected ones are dead compile time every tune, and a pruner gap "
+                    "worth closing.",
                     self.fn_name,
-                    self.max_failures,
+                    sum(1 for t in timings.values() if t == float("inf")),
+                    len(self._failures),
                 )
             ranked = sorted(
                 (i for i, t in timings.items() if t != float("inf")), key=timings.get
