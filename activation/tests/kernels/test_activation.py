@@ -19,7 +19,19 @@ DTYPES = [torch.half, torch.bfloat16, torch.float]
 NUM_TOKENS = [7, 83, 2048]  # Arbitrary values for testing
 D = [512, 13824]  # Arbitrary values for testing
 SEEDS = [0]
-CUDA_DEVICES = [f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)]
+
+
+def _devices() -> list[str]:
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        name, count = "xpu", torch.xpu.device_count()
+    elif torch.cuda.is_available():
+        name, count = "cuda", torch.cuda.device_count()
+    else:
+        return ["cpu"]
+    return [f"{name}:{i}" for i in range(1 if count == 1 else 2)]
+
+
+DEVICES = _devices()
 
 
 def gelu_fast(x: torch.Tensor) -> torch.Tensor:
@@ -133,7 +145,7 @@ def act_and_mul_check(
 @pytest.mark.parametrize("d", D)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("device", DEVICES)
 @torch.inference_mode()
 def test_act_and_mul(
     activation_name: str,
@@ -156,7 +168,7 @@ def test_act_and_mul_ci(activation_name: str) -> None:
         d=512,
         dtype=torch.half,
         seed=0,
-        device=CUDA_DEVICES[0],
+        device=DEVICES[0],
     )
 
 
@@ -232,7 +244,7 @@ def activation_check(
 @pytest.mark.parametrize("d", D)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("device", DEVICES)
 @torch.inference_mode()
 def test_activation(
     activation_fns,
@@ -255,5 +267,35 @@ def test_activation_ci(activation_fns) -> None:
         d=512,
         dtype=torch.half,
         seed=0,
-        device=CUDA_DEVICES[0],
+        device=DEVICES[0],
     )
+
+
+# The shapes above are all vector-width multiples over naturally aligned
+# storage; these are neither, so a vectorized backend must take its scalar path.
+@pytest.mark.parametrize("d", [1, 13, 4097])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_act_and_mul_unaligned(d: int, dtype: torch.dtype, device: str) -> None:
+    torch.manual_seed(0)
+    torch.set_default_device(device)
+    num_tokens = 5
+    base = torch.randn(num_tokens * 2 * d + 1, dtype=dtype)
+    x = base[1:].view(num_tokens, 2 * d)
+
+    out = torch.empty(num_tokens, d, dtype=dtype)
+    out = activation.silu_and_mul(out, x)
+
+    torch.testing.assert_close(out, silu_and_mul(x), atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_empty_input(dtype: torch.dtype, device: str) -> None:
+    torch.set_default_device(device)
+    x = torch.empty(0, 128, dtype=dtype)
+
+    assert activation.silu_and_mul(torch.empty(0, 64, dtype=dtype), x).shape == (0, 64)
+    assert activation.silu(torch.empty(0, 128, dtype=dtype), x).shape == (0, 128)

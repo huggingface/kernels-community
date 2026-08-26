@@ -444,6 +444,67 @@ following steps:
   `cudaErrorLaunchFailure`; only the quantization ops survive. Building a
   variant is therefore *not* enough to validate a toolkit — run
   `nix run .#ciTests.<variant>` for each one.
+  
+## sage-blackwell
+
+This package mirrors **SageAttention3**, the microscaling FP4 attention stack
+that lives in `sageattention3_blackwell/` upstream. It is deliberately a
+separate kernel from `sage-attention`: the two share no source files, target
+different architectures, and upstream ships them as separate Python packages
+with their own `setup.py`. When the user asks to sync a sage-blackwell
+release, carry out the following steps:
+
+- Fetch the upstream Git repository from https://github.com/thu-ml/SageAttention.git
+- Check out the tag or commit that the user specified. Upstream tags lag `main`
+  by a long way (this kernel shares its upstream repository with
+  `sage-attention`), so syncing from `main` is usually what is wanted.
+- The mirrored upstream trees are:
+  - `sageattention3_blackwell/sageattn3/blackwell/` → `sage-blackwell/sage_blackwell/blackwell/`
+  - `sageattention3_blackwell/sageattn3/quantization/` → `sage-blackwell/sage_blackwell/quantization/`
+    (only `fp4_quantization_4d.cu` and `cuda_utils.h`; the empty `__init__.py`
+    is not needed)
+  - `sageattention3_blackwell/sageattn3/api.py` → `sage-blackwell/torch-ext/sage_blackwell/api.py`
+- `setup.py` and `README.md` are out of scope. Everything under `csrc/cutlass`
+  is a build-time clone upstream performs itself; here CUTLASS comes from the
+  `cutlass_4_5` builder dependency instead.
+- The CUDA sources track upstream byte-for-byte apart from these local porting
+  changes, so diff the upstream files against the local copies and re-apply
+  only these:
+  - `blackwell/api.cu`: `<torch/python.h>` + `<torch/nn/functional.h>` →
+    `<torch/all.h>`; `c10::optional<at::Tensor> &out_` →
+    `std::optional<at::Tensor> out_` (a Torch schema `Tensor?` cannot bind to a
+    mutable reference); drop the `PYBIND11_MODULE` block.
+  - `quantization/fp4_quantization_4d.cu`: drop `<torch/python.h>` and
+    `<torch/nn/functional.h>` (it already includes `<torch/all.h>`); drop the
+    `PYBIND11_MODULE` block.
+  - Every header in `blackwell/` and `quantization/cuda_utils.h` is copied
+    verbatim — if a sync produces a diff in one of them, that is an upstream
+    change, not a porting change.
+- Ops are registered in `torch-ext/torch_binding.cpp` instead of the two pybind
+  extensions (`fp4attn_cuda`, `fp4quant_cuda`). `mha_fwd` is bound under the op
+  name `fwd` to match upstream's `fp4attn_cuda.fwd`.
+- On the Python side, `api.py` replaces `import fp4attn_cuda` / `import
+  fp4quant_cuda` with `from .sm120_compile import fwd, scaled_fp4_quant,
+  scaled_fp4_quant_permute, scaled_fp4_quant_trans`, and the call sites lose
+  their `fp4attn_cuda.` / `fp4quant_cuda.` prefixes. `sm120_compile.py` is a
+  local file with no upstream counterpart: it aliases the ops from `._ops` and
+  carries the `register_fake` registrations, which must use
+  `add_op_namespace_prefix`. Never reintroduce a fixed op namespace.
+- Keep `torch-ext/sage_blackwell/__init__.py` `__all__` in sync with upstream's
+  `sageattn3/__init__.py` (currently just `sageattn3_blackwell`).
+- Do not widen `[kernel._fp4attn] cuda-capabilities` beyond `["12.0a"]`.
+  Upstream's `setup.py` also accepts `sm_100a` and `sm_121a`, but the kernel is
+  instantiated from `cute::SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4`,
+  which CUTLASS gates behind `CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED`
+  (sm_120a/sm_121a only), and `mha_fwd` rejects any device that is not sm_120
+  or sm_121 at runtime. `12.1` is not in kernel-builder's supported capability
+  list (`kernel-builder/src/cuda_supported_archs.json`), so sm_121 cannot be
+  targeted at all.
+- Do not relax `[general.cuda] minver`; upstream requires CUDA >= 12.8 for the
+  FP4 MMA and the `cvt.rn.satfinite.e2m1x2.f32` PTX in the quantizer.
+- `sageattn3_blackwell` subtracts the key mean in place (`k -= k.mean(...)`).
+  This is upstream behaviour and is preserved; the tests pass clones and the
+  README documents it. Do not "fix" it silently during a sync.
 
 If the user did not specify the version tag, stop and ask which tag to sync
 from.
