@@ -15,7 +15,7 @@ build
 # Editor files
 .*
 !.github/
-!.gitattributes
+!/.gitattributes
 
 # Python stuff
 __pycache__/
