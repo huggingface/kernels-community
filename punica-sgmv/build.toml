@@ -24,7 +24,10 @@ cuda-capabilities = [
     "9.0",
     "10.0",
     "10.1",
+    "10.3",
+    "11.0",
     "12.0",
+    "12.1+PTX",
 ]
 depends = ["torch"]
 include = ["."]
@@ -67,7 +70,10 @@ cuda-capabilities = [
     "9.0",
     "10.0",
     "10.1",
+    "10.3",
+    "11.0",
     "12.0",
+    "12.1+PTX",
 ]
 depends = ["torch"]
 include = ["."]
