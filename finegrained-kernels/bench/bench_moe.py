@@ -52,6 +52,7 @@ is import-guarded; a missing dependency skips that baseline.
 
 Run: python bench/bench_moe.py             (all rows, single GPU)
      GPUS=8 python bench/bench_moe.py      (shard problems across 8 GPUs, one process per GPU)
+     GPUS=5 BENCH_DEVICES=3,4,5,6,7 python bench/bench_moe.py  (pin those shards to GPUs 3-7)
      SMOKE=1 python bench/bench_moe.py     (fast compile check)
      PRESWIZZLE=0 python bench/bench_moe.py (affine MX scales instead of the fast path)
      python bench/bench_moe.py gpt-oss     (substring filter on row/problem names)
@@ -215,6 +216,36 @@ except Exception:
 # FlashInfer TRT-LLM fused MoE (NVIDIA's Blackwell serving kernels) — installed --no-deps
 # (its PyPI pin would downgrade torch; the JIT has no torch ABI coupling). JIT needs
 # CUDA_HOME >= 12.8 at first compile; the built module is cached under ~/.cache/flashinfer.
+# CUDA_HOME gates two baselines that BUILD at run time (DeepGEMM JITs with nvcc, TRT-LLM/
+# flashinfer with ninja), and a bad one empties their cells silently — 68 blank cells before
+# anyone notices at plot time. Check it up front and say so. The window is narrow: DeepGEMM
+# refuses < 12.9 on SM100, and 13.0 fails TRT-LLM's ninja build + a DeepGEMM compiler assert,
+# so 12.9 is what serves both (measured 2026-08-21, B200).
+def _check_cuda_home():
+    home = os.environ.get("CUDA_HOME", "")
+    nvcc = os.path.join(home, "bin", "nvcc") if home else ""
+    if not (nvcc and os.path.exists(nvcc)):
+        print(f"[bench] WARNING: no nvcc at CUDA_HOME={home!r} — the deepgemm and trtllm arms "
+              f"cannot build and their cells will be EMPTY. Set CUDA_HOME to a 12.9 toolkit.")
+        return
+    import subprocess
+    try:
+        out = subprocess.run([nvcc, "--version"], capture_output=True, text=True, timeout=30).stdout
+        ver = tuple(int(x) for x in out.split("release ")[1].split(",")[0].split("."))
+    except Exception:
+        return
+    if ver < (12, 9):
+        print(f"[bench] WARNING: nvcc {ver[0]}.{ver[1]} at {home} — DeepGEMM needs >= 12.9 on "
+              f"SM100; its cells will be EMPTY.")
+    elif ver >= (13, 0):
+        print(f"[bench] WARNING: nvcc {ver[0]}.{ver[1]} at {home} — 13.x fails TRT-LLM's ninja "
+              f"build and DeepGEMM's compiler assert; 12.9 serves both.")
+
+
+if not (MOCK or REPLOT):
+    _check_cuda_home()
+
+
 try:
     # the JIT'd module dlopens libcudart.so.12 by name — preload it into global scope
     # (torch keeps its copy private)
@@ -1401,10 +1432,16 @@ elif GPUS > 1 and _SHARD is None and not MOCK:
     for sp in shard_paths:  # a leftover shard from a prior run must never merge as fresh data
         if os.path.exists(sp):
             os.unlink(sp)
+    # BENCH_DEVICES="3,4,5,6,7" pins the workers to specific physical GPUs (default: 0..GPUS-1).
+    # Shard g still owns tasks where i % GPUS == g; only the device it runs on changes, so a box
+    # whose low-numbered GPUs are busy can still fan out.
+    devices = [d.strip() for d in os.environ.get("BENCH_DEVICES", "").split(",") if d.strip()]
+    if devices and len(devices) != GPUS:
+        raise SystemExit(f"BENCH_DEVICES lists {len(devices)} device(s) but GPUS={GPUS}")
     procs = [subprocess.Popen(
         [sys.executable, os.path.abspath(__file__)] + FILTERS,
-        env={**os.environ, DEV_MASK_ENV: str(g), "BENCH_SHARD": f"{g}/{GPUS}",
-             "GPUS": "1"}) for g in range(GPUS)]
+        env={**os.environ, DEV_MASK_ENV: devices[g] if devices else str(g),
+             "BENCH_SHARD": f"{g}/{GPUS}", "GPUS": "1"}) for g in range(GPUS)]
     nfail = sum(p.wait() != 0 for p in procs)
     missing = [g for g, sp in enumerate(shard_paths) if not os.path.exists(sp)]
     if nfail or missing:

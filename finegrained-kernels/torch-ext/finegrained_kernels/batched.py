@@ -42,7 +42,7 @@ from .tiles import (
     oriented_tile_ptrs,
     weight_tile_ptrs,
 )
-from .epilogue import acc_finalize, acc_init, gemm_epilogue
+from .epilogue import acc_finalize, acc_init, add_bias, bias_strides, gemm_epilogue
 from .pruners import PATH_ANCHOR_AXES, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
 
 
@@ -136,6 +136,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
     C,  # (S, N) output; under an OUTPUT_RECIPE the FP8-requantized intermediate
     Cs,  # (S, N // BLOCK_SIZE_N) per-(row, block) output scale; written iff OUTPUT_RECIPE
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     ExpertIds,  # (S,) — which expert each batch element routes to
     GatherIdx,  # (S,) int — batch_id -> source row of A; read only when not None
     ScatterIdx,  # (S,) int — batch_id -> destination row of C; read only when not None
@@ -157,6 +158,8 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     stride_c_n,
     stride_cs_m,
     stride_cs_n,
+    stride_bias_e,
+    stride_bias_n,
     stride_eid,
     num_experts,
     # Meta-parameters. BLOCK_N/BLOCK_K are the QUANT block (one scale per (BLOCK_N, BLOCK_K) tile of
@@ -246,6 +249,8 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, OUTPUT_RECIPE, BLOCK_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
         COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, FAKE_BATCH=True,
+        Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
+        global_row=expert_id,
     )
 
 
@@ -265,6 +270,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
     C,  # (S, N) output; under an OUTPUT_RECIPE the FP8-requantized intermediate
     Cs,  # (S, N // BLOCK_SIZE_N) per-(row, block) output scale; written iff OUTPUT_RECIPE
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     ExpertIds,  # (S,) — which expert each batch element routes to
     GatherIdx,  # (S,) int — batch_id -> source row of A; read only when not None
     ScatterIdx,  # (S,) int — batch_id -> destination row of C; read only when not None
@@ -285,6 +291,8 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     stride_c_n,
     stride_cs_m,
     stride_cs_n,
+    stride_bias_e,
+    stride_bias_n,
     stride_eid,
     num_experts,
     # Meta-parameters
@@ -359,6 +367,8 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, OUTPUT_RECIPE, BLOCK_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
         COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, FAKE_BATCH=True,
+        Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
+        global_row=expert_id,
     )
 
 
@@ -384,6 +394,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     B,  # (num_experts, N, K) FP8 weight matrices
     Bs,  # (num_experts, 1, 1) per-tensor weight scales
     C,  # (S, N) output
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     ExpertIds,  # (S,) — which expert each batch element routes to
     GatherIdx,  # (S,) int — batch_id -> source row of A; read only when not None
     ScatterIdx,  # (S,) int — batch_id -> destination row of C; read only when not None
@@ -401,6 +412,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     stride_bs_e,
     stride_c_m,
     stride_c_n,
+    stride_bias_e,
+    stride_bias_n,
     stride_eid,
     num_experts,
     # Meta-parameters
@@ -456,6 +469,10 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
         )
 
     accumulator = acc_finalize(accumulator, "dot", BLOCK_SIZE_N, SWAP_AB) * a_s * b_s
+    # this split keeps its own store path (ungated, per-tensor dequant) but takes the same bias
+    accumulator = add_bias(
+        accumulator, Bias, stride_bias_e, stride_bias_n, expert_id, pid_n, BLOCK_SIZE_N
+    )
     store_row(C, accumulator, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
@@ -515,6 +532,7 @@ def mx_dynamic_matmul_batched_kernel(
     BSDescriptor,  # host TMA descriptor over Bs when SWIZZLED (BN=128 bulk load); dummy otherwise
     C,  # (S, N[/2]) output; under an OUTPUT_RECIPE the MX-requantized intermediate
     Cs,  # (S, N // SCALE_GROUP_K) UE8M0 output scale; written iff OUTPUT_RECIPE
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     AsGlobal,  # (1,) fp32 NVFP4 activation global g_a — SOLELY normalizes the inline raw-A quant (A/g_a); read iff not None
     AsBsGlobal,  # (num_experts,) fp32 NVFP4 combined global g_a·g_b — recovers on the accumulator (one multiply); read iff not None
     CsGlobal,  # (1,) fp32 NVFP4 output global (next proj's provided input_scale); normalizes the requant; read iff not None
@@ -539,6 +557,8 @@ def mx_dynamic_matmul_batched_kernel(
     stride_c_n,
     stride_cs_m,
     stride_cs_n,
+    stride_bias_e,
+    stride_bias_n,
     stride_eid,
     num_experts,
     # Meta-parameters
@@ -661,6 +681,9 @@ def mx_dynamic_matmul_batched_kernel(
         CsGlobal=CsGlobal,
         GlobalScale=AsBsGlobal,
         global_row=expert_id,
+        Bias=Bias,
+        stride_bias_e=stride_bias_e,
+        stride_bias_n=stride_bias_n,
     )
 
 
@@ -692,6 +715,7 @@ def mx_weight_only_matmul_batched_kernel(
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) group scales — UE8M0 (MX) or E4M3 (NVFP4)
     BsGlobal,  # (num_experts,) fp32 NVFP4 per-expert global — recovers on the accumulator; read iff not None
     C,
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     ExpertIds,
     GatherIdx,
     ScatterIdx,
@@ -708,6 +732,8 @@ def mx_weight_only_matmul_batched_kernel(
     stride_bs_k,
     stride_c_m,
     stride_c_n,
+    stride_bias_e,
+    stride_bias_n,
     stride_eid,
     num_experts,
     BLOCK_SIZE_M: tl.constexpr,
@@ -790,6 +816,9 @@ def mx_weight_only_matmul_batched_kernel(
         COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, FAKE_BATCH=True, N_COLS=N,
         GlobalScale=BsGlobal,
         global_row=expert_id,
+        Bias=Bias,
+        stride_bias_e=stride_bias_e,
+        stride_bias_n=stride_bias_n,
     )
 
 
@@ -814,6 +843,7 @@ def full_precision_matmul_batched_kernel(
     A,  # (rows, K) BF16/FP16 activations
     B,  # (num_experts, N, K) weights in A's dtype; under GATE the (num_experts, 2N, K) gate|up stack
     C,  # (S, N) output; under GATE the GLU intermediate
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     ExpertIds,  # (S,) — which expert each batch element routes to
     GatherIdx,  # (S,) int — batch_id -> source row of A; read only when not None
     ScatterIdx,  # (S,) int — batch_id -> destination row of C; read only when not None
@@ -829,6 +859,8 @@ def full_precision_matmul_batched_kernel(
     stride_b_n,
     stride_c_m,
     stride_c_n,
+    stride_bias_e,
+    stride_bias_n,
     stride_eid,
     num_experts,
     # Meta-parameters
@@ -897,6 +929,8 @@ def full_precision_matmul_batched_kernel(
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
         COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, FAKE_BATCH=True,
+        Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
+        global_row=expert_id,
     )
 
 
@@ -925,6 +959,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Block-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T; activations
     quantized offline in one pass. The ``gate``/``act_fn``/``swiglu_*``/``requant``/``output_dtype``
@@ -1016,6 +1051,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     grid = lambda meta: (S, triton.cdiv(N, meta["BLOCK_SIZE_N"]))  # noqa: E731
 
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_batched_kernel)[
             grid
         ](
@@ -1025,6 +1061,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             bs_u8,
             C,
             Cs,
+            bias,
             expert_ids,
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
@@ -1044,6 +1081,8 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             C.stride(1),
             Cs.stride(0) if requant else 1,
             Cs.stride(1) if requant else 1,
+            bias_stride_e,
+            bias_stride_n,
             expert_ids.stride(0),
             BLOCK_SIZE_K=block_k,
             BLOCK_N=block_n,
@@ -1083,6 +1122,7 @@ def w8a8_block_static_fp8_matmul_batched(
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Block-scale batched FP8 matmul with a static (per-tensor calibrated) activation scale — the
     block-dynamic batched sibling with the 2D ``block_static`` recipe. ``A`` is raw here: the op
@@ -1138,6 +1178,7 @@ def w8a8_block_static_fp8_matmul_batched(
     grid = lambda meta: (S, triton.cdiv(N, meta["BLOCK_SIZE_N"]))  # noqa: E731
 
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(w8a8_block_static_fp8_matmul_batched_kernel)[
             grid
         ](
@@ -1147,6 +1188,7 @@ def w8a8_block_static_fp8_matmul_batched(
             bs_u8,
             C,
             Cs,
+            bias,
             expert_ids,
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
@@ -1165,6 +1207,8 @@ def w8a8_block_static_fp8_matmul_batched(
             C.stride(1),
             Cs.stride(0) if requant else 1,
             Cs.stride(1) if requant else 1,
+            bias_stride_e,
+            bias_stride_n,
             expert_ids.stride(0),
             num_experts,
             BLOCK_SIZE_K=block_k,
@@ -1196,6 +1240,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Tensor-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T. ``A`` raw
     (``As`` None) -> quantized here (offline, per-token); else pre-quantized (``As`` given).
@@ -1228,6 +1273,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_batched_kernel)[
             grid
         ](
@@ -1236,6 +1282,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             B,
             bs_u8,
             C,
+            bias,
             expert_ids,
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
@@ -1251,6 +1298,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             bs_u8.stride(0),
             C.stride(0),
             C.stride(1),
+            bias_stride_e,
+            bias_stride_n,
             expert_ids.stride(0),
             num_experts=num_experts,
         )
@@ -1280,6 +1329,7 @@ def mx_dynamic_matmul_batched(
     a_global_scale: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Batched MX matmul ``C[s] = A[s] @ B[expert_ids[s]].T``; activations quantized
     inline in the kernel (decode: one act row per program, inline is free). The
@@ -1403,6 +1453,7 @@ def mx_dynamic_matmul_batched(
     # NVFP4 accumulator correction: the per-expert g_a·g_b product folded onto the fp32 accumulator.
     input_global_scale = combine_global_scales(a_global_scale, b_global_scale, B.shape[0])
     with device_context(a_u8.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(mx_dynamic_matmul_batched_kernel)[grid](
             a_u8,
             as_u8,  # None when raw (A quantized inline)
@@ -1411,6 +1462,7 @@ def mx_dynamic_matmul_batched(
             bs_descriptor,
             C,
             Cs,
+            bias,
             a_global_scale,  # AsGlobal (1,): g_a for the inline-quant arm (A/g_a)
             input_global_scale,  # AsBsGlobal = g_a·g_b (acc)
             output_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
@@ -1433,6 +1485,8 @@ def mx_dynamic_matmul_batched(
             C.stride(1),
             Cs.stride(0) if requant else 1,
             Cs.stride(1) if requant else 1,
+            bias_stride_e,
+            bias_stride_n,
             expert_ids.stride(0),
             SCALE_GROUP_K=scale_group,
             num_experts=num_experts,
@@ -1468,6 +1522,7 @@ def full_precision_matmul_batched(
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Full-precision (BF16/FP16) batched matmul: C[s] = A[s] @ B[expert_ids[s]].T — no
     quantization anywhere, fp32 accumulation. ``gate``/``act_fn``/``swiglu_*``/
@@ -1496,10 +1551,12 @@ def full_precision_matmul_batched(
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(full_precision_matmul_batched_kernel)[grid](
             A,
             B,
             C,
+            bias,
             expert_ids,
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
@@ -1513,6 +1570,8 @@ def full_precision_matmul_batched(
             B.stride(1),
             C.stride(0),
             C.stride(1),
+            bias_stride_e,
+            bias_stride_n,
             expert_ids.stride(0),
             num_experts=num_experts,
             GATE=gate,
@@ -1545,6 +1604,7 @@ def mx_weight_only_matmul_batched(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """weight-only batched (decode) matmul: ``C[s] = A[s] @ B[expert_ids[s]].T`` with raw bf16/fp16
     activations against MXFP4/NVFP4/MXFP8 weights upcast to bf16 in-loop — the ``matmul_ogs`` recipe.
@@ -1596,12 +1656,14 @@ def mx_weight_only_matmul_batched(
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(mx_weight_only_matmul_batched_kernel)[grid](
             A,
             b_u8,
             bs_u8,
             b_global_scale,
             C,
+            bias,
             expert_ids,
             gather_idx,
             scatter_idx,
@@ -1618,6 +1680,8 @@ def mx_weight_only_matmul_batched(
             bs_u8.stride(2),
             C.stride(0),
             C.stride(1),
+            bias_stride_e,
+            bias_stride_n,
             expert_ids.stride(0),
             num_experts=num_experts,
             SCALE_GROUP_K=scale_group,
@@ -1640,6 +1704,7 @@ def matmul_batched(
     Bs: torch.Tensor | None = None,
     *,
     expert_ids: torch.Tensor,
+    bias: torch.Tensor | None = None,  # (E, N_out) per-expert output bias; (N_out,) for 2D
     epilogue: Epilogue | None = None,
     quantization: Quantization | None = None,
     output_dtype: torch.dtype | None = None,
@@ -1710,6 +1775,7 @@ def matmul_batched(
             output_dtype,
             gather_idx,
             scatter_idx,
+            bias=bias,
         )
         return out[0] if len(out) == 1 else tuple(out)
 
@@ -1726,6 +1792,7 @@ def matmul_batched(
             output_dtype,
             gather_idx,
             scatter_idx,
+            bias=bias,
         )
     elif is_mx(B, Bs) and q.input_recipe is None:  # weight-only: raw bf16 acts, MX weight upcast in-MMA
         assert As is None and a_global_scale is None and q.output_recipe is None, (
@@ -1744,6 +1811,7 @@ def matmul_batched(
             gather_idx,
             scatter_idx,
             b_global_scale=b_global_scale,
+            bias=bias,
         )
     elif is_mx(B, Bs):
         out = mx_dynamic_matmul_batched(
@@ -1760,6 +1828,7 @@ def matmul_batched(
             a_global_scale,
             b_global_scale,
             output_global_scale,
+            bias=bias,
         )
     elif (block_size := weight_block_size(B, Bs)) is None:
         assert not ep.gate, (
@@ -1769,7 +1838,7 @@ def matmul_batched(
             "tensor-wide supports neither packed activations nor a fused requant"
         )
         out = w8a8_tensor_dynamic_fp8_matmul_batched(
-            A, B, As, Bs, expert_ids, output_dtype, gather_idx, scatter_idx
+            A, B, As, Bs, expert_ids, output_dtype, gather_idx, scatter_idx, bias=bias
         )
     else:
         out = w8a8_block_dynamic_fp8_matmul_batched(
@@ -1784,6 +1853,7 @@ def matmul_batched(
             output_dtype,
             gather_idx,
             scatter_idx,
+            bias=bias,
         )
     # bd/mx/full-precision ops return a list ([C] or [C, Cs]); the tensor op returns a bare tensor.
     if isinstance(out, (list, tuple)):

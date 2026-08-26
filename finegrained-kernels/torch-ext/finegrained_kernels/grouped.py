@@ -40,7 +40,7 @@ from .tiles import (
     operand_tile_ptrs,
     weight_tile_ptrs,
 )
-from .epilogue import acc_init, gemm_epilogue
+from .epilogue import acc_init, bias_strides, gemm_epilogue
 from .pruners import PATH_ANCHOR_AXES, global_scale_warp_spec_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
 
 
@@ -162,6 +162,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
     C,  # (S, N) output; under an OUTPUT_RECIPE the FP8-requantized intermediate
     Cs,  # (S, N // BLOCK_SIZE_N) per-row, per-block output scale; written iff OUTPUT_RECIPE
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     GatherIdx,  # (S,) int32 — sorted position -> source row of A; read only when not None
     ScatterIdx,  # (S,) int32 — sorted position -> destination row of C; read only when not None
     ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 — cumulative row starts, S sentinel
@@ -184,6 +185,8 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     stride_c_n,
     stride_cs_m,
     stride_cs_n,
+    stride_bias_e,
+    stride_bias_n,
     num_experts,
     tokens_per_expert_bit_length,  # autotune key only (log2 avg-tokens bucket); unused in body
     # Meta-parameters
@@ -320,6 +323,10 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             SWIGLU_LIMIT,
             SIMULATE_UNFUSED,
             INTERMEDIATE_DTYPE,
+            Bias=Bias,
+            stride_bias_e=stride_bias_e,
+            stride_bias_n=stride_bias_n,
+            global_row=expert_id64,
         )
 
 
@@ -358,6 +365,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
     C,  # (S, N) output; under an OUTPUT_RECIPE the FP8-requantized intermediate
     Cs,  # (S, N // BLOCK_SIZE_N) per-(row, block) output scale; written iff OUTPUT_RECIPE
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     GatherIdx,  # (S,) int32 — sorted position -> source row of A; read only when not None
     ScatterIdx,  # (S,) int32 — sorted position -> destination row of C; read only when not None
     ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 — cumulative row starts, S sentinel
@@ -379,6 +387,8 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     stride_c_n,
     stride_cs_m,
     stride_cs_n,
+    stride_bias_e,
+    stride_bias_n,
     num_experts,
     tokens_per_expert_bit_length,  # autotune key only (log2 avg-tokens bucket); unused in body
     # Meta-parameters
@@ -499,6 +509,10 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
             SWIGLU_LIMIT,
             SIMULATE_UNFUSED,
             INTERMEDIATE_DTYPE,
+            Bias=Bias,
+            stride_bias_e=stride_bias_e,
+            stride_bias_n=stride_bias_n,
+            global_row=expert_id64,
         )
 
 
@@ -542,6 +556,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     Bs,  # (num_experts, 1, 1) per-tensor weight scales (one scalar covers the gate|up stack)
     C,  # (S, N) output; under GATE the bf16 GLU intermediate
     Cs,  # None (tensor-wide has no fused requant); kept for the shared epilogue signature
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     GatherIdx,  # (S,) int32 — sorted position -> source row of A; read only when not None
     ScatterIdx,  # (S,) int32 — sorted position -> destination row of C; read only when not None
     ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 — cumulative row starts, S sentinel
@@ -562,6 +577,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     stride_c_n,
     stride_cs_m,
     stride_cs_n,
+    stride_bias_e,
+    stride_bias_n,
     num_experts,
     tokens_per_expert_bit_length,  # autotune key only (log2 avg-tokens bucket); unused in body
     # Meta-parameters
@@ -681,6 +698,10 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             SWIGLU_LIMIT,
             SIMULATE_UNFUSED,
             INTERMEDIATE_DTYPE,
+            Bias=Bias,
+            stride_bias_e=stride_bias_e,
+            stride_bias_n=stride_bias_n,
+            global_row=expert_id64,
         )
 
 
@@ -735,6 +756,7 @@ def mx_dynamic_matmul_grouped_kernel(
     BSDescriptor,  # host TMA descriptor over the SWIZZLE_32_4_4 per-expert B scales; read iff SWIZZLED_SCALES
     C,  # (S, N[/2]) output; under an OUTPUT_RECIPE the MX-requantized intermediate
     Cs,  # (S, N // SCALE_GROUP_K) row-major output scale; written iff OUTPUT_RECIPE and not SWIZZLED_OUT
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     CSDescriptor,  # SWIZZLE_32_4_4 output-scale descriptor; written iff SWIZZLED_OUT (dummy else), like AS/BS
     AsBsGlobal,  # (num_experts,) fp32 NVFP4 combined global g_a·g_b — recovers on the accumulator (grouped A is pre-quantized by the wrapper, so no in-kernel g_a); read iff not None
     CsGlobal,  # (1,) fp32 NVFP4 output global (next proj's provided input_scale); normalizes the requant; read iff not None
@@ -760,6 +782,8 @@ def mx_dynamic_matmul_grouped_kernel(
     stride_c_n,
     stride_cs_m,
     stride_cs_n,
+    stride_bias_e,
+    stride_bias_n,
     num_experts,
     tokens_per_expert_bit_length,  # autotune key only (log2 avg-tokens bucket); unused in body
     # Meta-parameters
@@ -931,6 +955,9 @@ def mx_dynamic_matmul_grouped_kernel(
             N_COLS=N,  # mask the partial last N-tile's column tail (non-128 N; inert when N % BN == 0)
             GlobalScale=AsBsGlobal,
             global_row=expert_id64,
+            Bias=Bias,
+            stride_bias_e=stride_bias_e,
+            stride_bias_n=stride_bias_n,
         )
 
 
@@ -982,6 +1009,7 @@ def mx_weight_only_matmul_grouped_kernel(
     Bs,  # (num_experts, N, K // SCALE_GROUP_K) group scales — UE8M0 (MX) or E4M3 (NVFP4)
     BsGlobal,  # (num_experts,) fp32 NVFP4 per-expert global — recovers on the accumulator; read iff not None
     C,
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     GatherIdx,
     ScatterIdx,
     ExpertStart,
@@ -999,6 +1027,8 @@ def mx_weight_only_matmul_grouped_kernel(
     stride_bs_k,
     stride_c_m,
     stride_c_n,
+    stride_bias_e,
+    stride_bias_n,
     num_experts,
     tokens_per_expert_bit_length,
     BLOCK_SIZE_M: tl.constexpr,
@@ -1098,6 +1128,9 @@ def mx_weight_only_matmul_grouped_kernel(
             N_COLS=N,
             GlobalScale=BsGlobal,
             global_row=expert_id64,
+            Bias=Bias,
+            stride_bias_e=stride_bias_e,
+            stride_bias_n=stride_bias_n,
         )
 
 
@@ -1134,6 +1167,7 @@ def full_precision_matmul_grouped_kernel(
     B,  # (num_experts, N, K) weights in A's dtype; under GATE the (num_experts, 2N, K) gate|up stack
     BDescriptor,  # host TMA descriptor over B viewed (E, 2N|N, K), box (1, (2|1)*BN, BK); read iff B_MEMORY_MODE != "pointer"
     C,  # (S, N) output; under GATE the GLU intermediate
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     GatherIdx,  # (S,) int32 — sorted position -> source row of A; read only when not None
     ScatterIdx,  # (S,) int32 — sorted position -> destination row of C; read only when not None
     ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 — cumulative row starts, S sentinel
@@ -1150,6 +1184,8 @@ def full_precision_matmul_grouped_kernel(
     stride_b_n,
     stride_c_m,
     stride_c_n,
+    stride_bias_e,
+    stride_bias_n,
     num_experts,
     tokens_per_expert_bit_length,  # autotune key only (log2 avg-tokens bucket); unused in body
     # Meta-parameters
@@ -1271,6 +1307,10 @@ def full_precision_matmul_grouped_kernel(
             SWIGLU_LIMIT,
             SIMULATE_UNFUSED,
             INTERMEDIATE_DTYPE,
+            Bias=Bias,
+            stride_bias_e=stride_bias_e,
+            stride_bias_n=stride_bias_n,
+            global_row=expert_id64,
         )
 
 
@@ -1296,6 +1336,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Block-scale grouped FP8 matmul over expert-sorted positions (per-tile
     gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
@@ -1376,6 +1417,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     # identical launch args during tunes
     schedule = build_packed_schedule(expert_start, S, num_experts)
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(w8a8_block_dynamic_fp8_matmul_grouped_kernel)[
             (num_sms,)
         ](
@@ -1387,6 +1429,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
             bs_u8,
             C,
             Cs,
+            bias,
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
             expert_start,
@@ -1407,6 +1450,8 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
             C.stride(1),
             Cs.stride(0) if requant else 1,  # literal when Cs is None
             Cs.stride(1) if requant else 1,
+            bias_stride_e,
+            bias_stride_n,
             # Meta-parameters
             num_experts=num_experts,
             tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
@@ -1448,6 +1493,7 @@ def w8a8_block_static_fp8_matmul_grouped(
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Block-scale grouped FP8 matmul with a static (per-tensor calibrated) activation scale —
     the block-dynamic sibling with the 2D ``block_static`` recipe. ``A`` is raw here: the op
@@ -1510,6 +1556,7 @@ def w8a8_block_static_fp8_matmul_grouped(
     # identical launch args during tunes
     schedule = build_packed_schedule(expert_start, S, num_experts)
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(w8a8_block_static_fp8_matmul_grouped_kernel)[
             (num_sms,)
         ](
@@ -1521,6 +1568,7 @@ def w8a8_block_static_fp8_matmul_grouped(
             bs_u8,
             C,
             Cs,
+            bias,
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
             expert_start,
@@ -1540,6 +1588,8 @@ def w8a8_block_static_fp8_matmul_grouped(
             C.stride(1),
             Cs.stride(0) if requant else 1,  # literal when Cs is None
             Cs.stride(1) if requant else 1,
+            bias_stride_e,
+            bias_stride_n,
             num_experts=num_experts,
             tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
             BLOCK_SIZE_N=block_n,
@@ -1579,6 +1629,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Tensor-scale grouped FP8 matmul over expert-sorted positions (per-tile
     gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
@@ -1629,6 +1680,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     # identical launch args during tunes
     schedule = build_packed_schedule(expert_start, S, num_experts)
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(w8a8_tensor_dynamic_fp8_matmul_grouped_kernel)[
             (num_sms,)
         ](
@@ -1639,7 +1691,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
             b_descriptor,
             Bs,
             C,
-            None,  # tensor-wide has no fused requant
+            None,
+            bias,  # tensor-wide has no fused requant
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
             expert_start,
@@ -1658,6 +1711,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
             C.stride(1),
             1,  # Cs strides: unread, Cs is None
             1,
+            bias_stride_e,
+            bias_stride_n,
             num_experts=num_experts,
             tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
@@ -1695,6 +1750,7 @@ def mx_dynamic_matmul_grouped(
     a_global_scale: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Grouped MX matmul over expert-sorted positions (per-tile gather/scatter, the
     sort is virtual — see ``compute_grouped_scheduling`` for the maps). Activations arrive
@@ -1891,6 +1947,7 @@ def mx_dynamic_matmul_grouped(
     # identical launch args during tunes
     schedule = build_packed_schedule(expert_start, S, num_experts)
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(mx_dynamic_matmul_grouped_kernel)[(num_sms,)](
             a_u8,
             a_descriptor,
@@ -1902,6 +1959,7 @@ def mx_dynamic_matmul_grouped(
             bs_descriptor,
             C,
             Cs,
+            bias,
             CSDescriptor,
             input_global_scale,  # AsBsGlobal = g_a·g_b (acc); grouped A pre-quantized so no in-kernel g_a
             output_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
@@ -1926,6 +1984,8 @@ def mx_dynamic_matmul_grouped(
             # a swizzled Cs is a descriptor (no strides); a row-major requant keeps pointer strides
             cs_ret.stride(0) if (requant and not swizzled_out) else 1,
             cs_ret.stride(1) if (requant and not swizzled_out) else 1,
+            bias_stride_e,
+            bias_stride_n,
             num_experts=num_experts,
             tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
@@ -1963,6 +2023,7 @@ def full_precision_matmul_grouped(
     output_dtype: torch.dtype | None = None,
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Full-precision (BF16/FP16) grouped matmul over expert-sorted positions (per-tile
     gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
@@ -2000,12 +2061,14 @@ def full_precision_matmul_grouped(
     schedule = build_packed_schedule(expert_start, S, num_experts)
 
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(full_precision_matmul_grouped_kernel)[(num_sms,)](
             A,
             a_descriptor,
             B,
             b_descriptor,
             C,
+            bias,
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
             expert_start,
@@ -2020,6 +2083,8 @@ def full_precision_matmul_grouped(
             B.stride(1),
             C.stride(0),
             C.stride(1),
+            bias_stride_e,
+            bias_stride_n,
             num_experts=num_experts,
             tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
@@ -2054,6 +2119,7 @@ def mx_weight_only_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """weight-only grouped matmul: raw bf16/fp16 activations against MXFP4/NVFP4/MXFP8 weights upcast
     to bf16 in-loop — the ``matmul_ogs`` recipe (fp4/fp8 weight bytes, bf16 acts, weight upcast in-MMA).
@@ -2091,6 +2157,7 @@ def mx_weight_only_matmul_grouped(
     # identical launch args during tunes
     schedule = build_packed_schedule(expert_start, S, num_experts)
     with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(mx_weight_only_matmul_grouped_kernel)[(num_sms,)](
             A,
             a_descriptor,
@@ -2099,6 +2166,7 @@ def mx_weight_only_matmul_grouped(
             bs_u8,
             b_global_scale,
             C,
+            bias,
             gather_idx,
             scatter_idx,
             expert_start,
@@ -2116,6 +2184,8 @@ def mx_weight_only_matmul_grouped(
             bs_u8.stride(2),
             C.stride(0),
             C.stride(1),
+            bias_stride_e,
+            bias_stride_n,
             num_experts=num_experts,
             tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
@@ -2140,6 +2210,7 @@ def matmul_grouped(
     Bs: torch.Tensor | None = None,
     *,
     expert_start: torch.Tensor,
+    bias: torch.Tensor | None = None,  # (E, N_out) per-expert output bias; (N_out,) for 2D
     epilogue: Epilogue | None = None,
     quantization: Quantization | None = None,
     output_dtype: torch.dtype | None = None,
@@ -2219,6 +2290,7 @@ def matmul_grouped(
             output_dtype,
             gather_idx,
             scatter_idx,
+            bias=bias,
         )
         return out[0] if len(out) == 1 else tuple(out)
 
@@ -2235,6 +2307,7 @@ def matmul_grouped(
             output_dtype,
             gather_idx,
             scatter_idx,
+            bias=bias,
         )
     elif is_mx(B, Bs) and q.input_recipe is None:  # weight-only: raw bf16 acts, MX weight upcast in-MMA
         assert As is None and a_global_scale is None and q.output_recipe is None, (
@@ -2253,6 +2326,7 @@ def matmul_grouped(
             gather_idx,
             scatter_idx,
             b_global_scale=b_global_scale,
+            bias=bias,
         )
     elif is_mx(B, Bs):
         out = mx_dynamic_matmul_grouped(
@@ -2269,6 +2343,7 @@ def matmul_grouped(
             a_global_scale,
             b_global_scale,
             output_global_scale,
+            bias=bias,
         )
     elif (block_size := weight_block_size(B, Bs)) is None:
         out = w8a8_tensor_dynamic_fp8_matmul_grouped(
@@ -2282,6 +2357,7 @@ def matmul_grouped(
             output_dtype,
             gather_idx,
             scatter_idx,
+            bias=bias,
         )
     else:
         out = w8a8_block_dynamic_fp8_matmul_grouped(
@@ -2296,6 +2372,7 @@ def matmul_grouped(
             output_dtype,
             gather_idx,
             scatter_idx,
+            bias=bias,
         )
     # The ops return a list (torch custom ops can't return a Tensor-or-tuple union): [C] plain,
     # [C, Cs] under an output_recipe. Unwrap to the documented Tensor / (Tensor, Tensor) return.

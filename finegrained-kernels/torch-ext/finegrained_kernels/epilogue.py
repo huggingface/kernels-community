@@ -145,20 +145,52 @@ def acc_finalize(
 
 
 
+def bias_strides(bias: torch.Tensor | None) -> tuple[int, int]:
+    """(expert, column) strides for a per-expert output bias, for ``add_bias``. A 1-D bias is the
+    single-expert 2D case, so its expert stride is 0. ``None`` gives (0, 0) — the kernel arm folds
+    out at trace time and never reads them."""
+    if bias is None:
+        return 0, 0
+    if bias.dim() == 1:
+        return 0, bias.stride(0)
+    return bias.stride(0), bias.stride(1)
+
+
 @triton.jit
-def split_gate_up(
-    acc,
-    COMPUTE_MODE: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    SWAP_AB: tl.constexpr,
-):
-    """Bookend to the gate|up accumulator: finalize it (swap MMA col-0 collapse or pass-through,
-    via ``acc_finalize``) and de-interleave the doubled N extent into the ``(gate, up)`` pair, each
-    ``[rows, BN]`` (rows = 1 under swap, else BM). The accumulator's N axis alternates gate/up per
-    column, so this is a trailing-axis split."""
+def add_bias(acc, Bias, stride_bias_e, stride_bias_n, bias_row, pid_n,
+             BLOCK_SIZE_N: tl.constexpr, N_COLS: tl.constexpr = 0,
+             SWAP_AB: tl.constexpr = False):
+    """Add this expert's slice of a per-expert output bias to an output tile. Gated callers pass
+    the doubled extent — an interleaved gate|up tile is an ungated tile of width ``2*BN``.
+    ``None`` folds out at trace time.
+
+    Two shapes reach here. Post-``acc_finalize`` tiles are ``[rows, BN]`` for every orientation
+    (``SWAP_AB=False``, what ``gemm_epilogue`` passes) — finalize is what collapses the swapped
+    MMA accumulator, so adding before it would broadcast against the wrong axis. The 2D kernels'
+    ungated arm stores straight from the accumulator with no finalize, and there ``SWAP_AB``
+    leaves it transposed as ``(BN, BM)``, so the bias varies down axis 0 instead."""
+    if Bias is not None:
+        offs_bias = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        ptrs = Bias + bias_row * stride_bias_e + offs_bias * stride_bias_n
+        if N_COLS > 0:  # dense N isn't BN-aligned; the tail columns are off the end of the bias
+            bias = tl.load(ptrs, mask=offs_bias < N_COLS, other=0.0)
+        else:
+            bias = tl.load(ptrs)
+        if SWAP_AB:
+            out = acc + bias.to(acc.dtype)[:, None]
+        else:
+            out = acc + bias.to(acc.dtype)[None, :]
+    else:
+        out = acc
+    return out
+
+
+@triton.jit
+def split_gate_up(flat, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, SWAP_AB: tl.constexpr):
+    """De-interleave a finalized ``[rows, 2*BN]`` gate|up tile into the ``(gate, up)`` pair, each
+    ``[rows, BN]`` (rows = 1 under swap, else BM). The N axis alternates gate/up per column, so
+    this is a trailing-axis split. The caller finalizes (and biases) before calling."""
     rows: tl.constexpr = 1 if SWAP_AB else BLOCK_SIZE_M
-    flat = acc_finalize(acc, COMPUTE_MODE, 2 * BLOCK_SIZE_N, SWAP_AB)
     g, u = tl.split(tl.reshape(flat, (rows, BLOCK_SIZE_N, 2)))
     return g, u
 
@@ -389,8 +421,7 @@ def apply_glu(
 
 @triton.jit
 def split_gate_up_glu(
-    acc,
-    COMPUTE_MODE: tl.constexpr,
+    flat,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     SWAP_AB: tl.constexpr,
@@ -400,10 +431,10 @@ def split_gate_up_glu(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.float32,
 ):
-    """Gate|up epilogue in one step: split the stacked accumulator into its (gate, up) pair
+    """Gate|up epilogue in one step: split the finalized stacked tile into its (gate, up) pair
     (``split_gate_up``) and apply the ``ACT_FN``/SwiGLU gated linear unit (``glu``), returning
     the combined intermediate. See those two for the orientation and activation details."""
-    gate, up = split_gate_up(acc, COMPUTE_MODE, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
+    gate, up = split_gate_up(flat, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB)
     return glu(
         gate,
         up,
@@ -543,6 +574,9 @@ def gemm_epilogue(
     PreAct=None,  # (M, 2N) pre-activation buffer; written iff not None — the GLU backward's Z
     stride_pa_m=0,
     stride_pa_n=0,
+    Bias=None,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; row is `global_row`
+    stride_bias_e=0,
+    stride_bias_n=0,
 ):
     """Unified output epilogue for grouped (a real scatter tile) and batched (fake-batch decode:
     one token replicated across the BM lanes) GEMMs. Plain: cast + store the accumulator. ``GATE``:
@@ -557,19 +591,25 @@ def gemm_epilogue(
     both no-ops there). Every arm is constexpr-pruned."""
     acc = apply_global_scale(acc, GlobalScale, global_row)
     if GATE:
+        # Finalize + bias once, up here rather than inside the split: the gate|up bias belongs to
+        # the pre-activation, so PreAct below has to see it too.
+        flat = add_bias(
+            acc_finalize(acc, COMPUTE_MODE, 2 * BLOCK_SIZE_N, SWAP_AB),
+            Bias, stride_bias_e, stride_bias_n, global_row, pid_n,
+            2 * BLOCK_SIZE_N, 2 * N_COLS if N_COLS > 0 else 0,
+        )
         # SAVE_PREACT: the GLU backward needs Z, the 2*BN-wide pre-activation. Interleaved, that
         # tile IS an ungated output tile at doubled width (pid_n * 2BN == 2 * pid_n * BN), so the
         # ordinary store serves it — no separate path, no gated store arm.
         if PreAct is not None:
             _store_out(
-                PreAct,
-                acc_finalize(acc, COMPUTE_MODE, 2 * BLOCK_SIZE_N, SWAP_AB),
+                PreAct, flat,
                 out_row, pid_n, row_mask, stride_pa_m, stride_pa_n,
                 BLOCK_SIZE_M, 2 * BLOCK_SIZE_N, FAKE_BATCH,
                 2 * N_COLS if N_COLS > 0 else 0,
             )
         out = split_gate_up_glu(
-            acc, COMPUTE_MODE, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB,
+            flat, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
         )
         if OUTPUT_RECIPE == "fp8":
@@ -586,5 +626,8 @@ def gemm_epilogue(
         else:  # bf16 (unquantized) SwiGLU output
             _store_out(C, out, out_row, pid_n, row_mask, stride_c_m, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N, FAKE_BATCH, N_COLS)
     else:  # plain GEMM: cast + store the accumulator (no fused requant on the non-gate path)
-        acc = acc_finalize(acc, COMPUTE_MODE, BLOCK_SIZE_N, SWAP_AB)
+        acc = add_bias(
+            acc_finalize(acc, COMPUTE_MODE, BLOCK_SIZE_N, SWAP_AB),
+            Bias, stride_bias_e, stride_bias_n, global_row, pid_n, BLOCK_SIZE_N, N_COLS,
+        )
         _store_out(C, acc, out_row, pid_n, row_mask, stride_c_m, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N, FAKE_BATCH, N_COLS)

@@ -460,7 +460,7 @@ def _mx_act_quant_kernel(
     RECIPE: tl.constexpr = "mxfp8",
     SWIZZLED: tl.constexpr = False,
     GROUPED: tl.constexpr = True,  # SWIZZLED grid: expert-sorted tiles (True) vs plain dense (False)
-    NUM_EXPERTS_POW2: tl.constexpr = 1,
+    NUM_EXPERTS_POW2: tl.constexpr = 1,  # always passed explicitly; see the dense launch
     BLOCK_K: tl.constexpr = 32,
     BLOCK_T: tl.constexpr = 32,
 ):
@@ -802,6 +802,10 @@ def _launch_act_quant(x, recipe, scale_group, scale_dtype, swizzled=False, globa
             RECIPE=recipe,
             SWIZZLED=swizzled,
             GROUPED=False,
+            # explicit even though the dense grid never reads it: inductor's wrap_triton path
+            # drops constexprs left to their default, and the arity mismatch that produces kills
+            # the whole torch.compile launch ("launcher() missing 1 required positional argument")
+            NUM_EXPERTS_POW2=1,
         )
     return (values.view(torch.int8) if packed else values), scales
 

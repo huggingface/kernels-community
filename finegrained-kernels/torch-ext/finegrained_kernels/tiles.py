@@ -371,7 +371,13 @@ def _weight_scale_block_dynamic(
                 tl.load(up_s_ptr + k * stride_bs_k),
             )
         else:
-            b_s = tl.load(bs_ptrs + k * stride_bs_k)
+            # One 128-block scale covers the whole BN tile, so the pointer is scalar and the load
+            # is rank-0. Broadcast to the tile's N extent so BOTH grouped arms hand back a rank-1
+            # [.., N] scale: `block_dynamic_dot`'s dot_scaled arm indexes `b_s.shape[0]`, which a
+            # rank-0 value cannot answer, and that killed every BLOCK_SIZE_M>=128 config (the only
+            # ones that take the tcgen05 arm) for the ungated grouped GEMM -- the MoE down proj.
+            # broadcast_to keeps the dtype, so decode_group_scale still sees UE8M0 as uint8.
+            b_s = tl.broadcast_to(tl.load(bs_ptrs + k * stride_bs_k)[None], [BLOCK_SIZE_N])
     elif bs_mask is None:  # batched: bs_ptrs pre-offset (gate/up folded), maskless decode tile
         b_s = tl.load(bs_ptrs)
     else:
