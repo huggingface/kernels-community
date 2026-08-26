@@ -10,7 +10,9 @@ recipe version=1
 // by name; the port rebinds those imports to the kernel loaded off the Hub and
 // marks each test for kernel CI. Everything else is upstream's.
 //
-// The flake has no upstream equivalent, so it comes from the overlay.
+// The flake is hand-written and lives at einops/, outside --out, so it
+// survives regeneration. Its `path = ./src` points kernel-builder at the
+// generated tree.
 //
 // Multi-line payloads below use KDL raw strings. KDL dedents them against the
 // closing delimiter, so every "\"\"\"# sits at column 0 and the payload keeps
@@ -262,9 +264,6 @@ replace \
     count=63 \
     find="\ndef test_" \
     with="\n@pytest.mark.kernels_ci\ndef test_"
-
-// The flake: hand-written, no upstream equivalent.
-overlay from="overlay"
 
 expect \
     in="torch-ext/einops/**" \
