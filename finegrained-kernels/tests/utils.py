@@ -130,35 +130,53 @@ def make_weights(
         )
         qmax = FP8_MAX
 
-    W = torch.randn(E, out_features, in_features, dtype=torch.float32, device=device)
     pad_n, pad_k = (-out_features) % block_n, (-in_features) % block_k
-    W = torch.nn.functional.pad(W, [0, pad_k, 0, pad_n])
     Np, Kp = out_features + pad_n, in_features + pad_k
-    R = W.reshape(E, Np // block_n, block_n, Kp // block_k, block_k)
-    max_abs = R.abs().amax(dim=(-3, -1))
-    safe = torch.where(max_abs > 0, max_abs, torch.ones_like(max_abs))
-    inv_scales = (safe / qmax).to(torch.float32)
+
+    # Build one expert at a time: the fp32 draw and its scaled copy are the peak allocation
+    # here, and at production MoE sizes (E=128, N=4096, K=6144) each is 12GiB, which OOMs a
+    # 32GB part before a single kernel launches. Per-expert keeps the peak at 2 * N * K * 4.
+    Wq_parts, inv_parts, exp_parts = [], [], []
+    for _ in range(E):
+        W = torch.randn(1, out_features, in_features, dtype=torch.float32, device=device)
+        W = torch.nn.functional.pad(W, [0, pad_k, 0, pad_n])
+        R = W.reshape(1, Np // block_n, block_n, Kp // block_k, block_k)
+        del W
+        max_abs = R.abs().amax(dim=(-3, -1))
+        safe = torch.where(max_abs > 0, max_abs, torch.ones_like(max_abs))
+        inv_e = (safe / qmax).to(torch.float32)
+
+        exp_e = None
+        if scale_dtype in (torch.float8_e8m0fnu, torch.uint8):
+            # Snap inv_scales up to the next power-of-2 (UE8M0 encoding: 2^(exp-127)).
+            exp_e = _ue8m0_exp(inv_e)
+            inv_e = (exp_e << 23).view(torch.float32)
+
+        # Scale weights into the grid's range, then trim padding back off.
+        scaled = (R * (1.0 / inv_e).unsqueeze(-1).unsqueeze(-3)).reshape(1, Np, Kp)
+        scaled = scaled[:, :out_features, :in_features]
+        del R
+
+        if is_fp4:
+            # Round |scaled| to the nearest E2M1 magnitude index, re-apply the sign, then
+            # pack two 4-bit codes per byte (low nibble = even K, per ``dequant_b_fp4``).
+            boundaries = torch.tensor(_E2M1_BOUNDARIES, device=device)
+            codes = torch.bucketize(scaled.abs(), boundaries).to(torch.uint8)
+            codes |= (scaled < 0).to(torch.uint8) << 3
+            Wq_parts.append((codes[..., 0::2] | (codes[..., 1::2] << 4)).view(torch.int8))
+        else:
+            Wq_parts.append(scaled.clamp(FP8_MIN, FP8_MAX).to(FP8_DTYPE))
+        del scaled
+        inv_parts.append(inv_e)
+        if exp_e is not None:
+            exp_parts.append(exp_e)
+
+    Wq = torch.cat(Wq_parts, dim=0).contiguous()
+    inv_scales = torch.cat(inv_parts, dim=0)
+    Wq_parts, inv_parts = [], []
 
     if scale_dtype in (torch.float8_e8m0fnu, torch.uint8):
-        # Snap inv_scales up to the next power-of-2 (UE8M0 encoding: 2^(exp-127)).
-        exp_ceil = _ue8m0_exp(inv_scales)
-        inv_scales = (exp_ceil << 23).view(torch.float32)
-
-    # Scale weights into the grid's range, then trim padding back off.
-    scaled = (R * (1.0 / inv_scales).unsqueeze(-1).unsqueeze(-3)).reshape(E, Np, Kp)
-    scaled = scaled[:, :out_features, :in_features]
-
-    if is_fp4:
-        # Round |scaled| to the nearest E2M1 magnitude index, re-apply the sign, then
-        # pack two 4-bit codes per byte (low nibble = even K, per ``dequant_b_fp4``).
-        boundaries = torch.tensor(_E2M1_BOUNDARIES, device=device)
-        codes = torch.bucketize(scaled.abs(), boundaries).to(torch.uint8)
-        codes |= (scaled < 0).to(torch.uint8) << 3
-        Wq = (codes[..., 0::2] | (codes[..., 1::2] << 4)).view(torch.int8).contiguous()
-    else:
-        Wq = scaled.clamp(FP8_MIN, FP8_MAX).to(FP8_DTYPE).contiguous()
-
-    if scale_dtype in (torch.float8_e8m0fnu, torch.uint8):
+        exp_ceil = torch.cat(exp_parts, dim=0)
         # UE8M0 exponent bytes, exposed as float8_e8m0fnu or as raw uint8 (a common on-disk
         # encoding, e.g. MiniMax-M3-MXFP8) — both are accepted by the detectors / kernels.
         inv_scales = exp_ceil.to(torch.uint8)
