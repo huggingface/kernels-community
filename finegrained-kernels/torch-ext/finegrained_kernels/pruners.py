@@ -729,6 +729,32 @@ def mx_2d_swap_scope_pruner(max_m: int = 16):
 
 
 
+def swizzled_out_bm_pruner():
+    """``early_config_prune`` pinning the SWIZZLE_32_4_4 requant OUTPUT arm (``SWIZZLED_OUT``) to
+    ``BLOCK_SIZE_M == BLOCK_SIZE_N == 128`` — the output-side twin of
+    ``swizzled_scales_bm_pruner``.
+
+    ``_epilogue_requant_mx`` writes the group scales straight into the down proj's swizzled
+    layout as ``q_s.reshape(1, 4, 32, REP_K_CS, 4)`` with ``REP_K_CS = (BN // group) // 4``.
+    ``q_s`` is ``[BM, BN // group]``, so the reshape balances only at ``BM == 128``
+    (``BM * (BN//group) == 128 * (BN//group)``); every other BM raises "reshape() cannot change
+    total number of elements". BN is pinned with it because the descriptor's block shape is the
+    tuned ``REP_K_CS``. The code comment there already said "BM/BN pinned 128" — this makes the
+    config space agree, instead of handing the tuner configs that cannot compile.
+
+    Measured 2026-08-26 on the gated fp4-requant cells: 288 dead compiles per tune, i.e. every
+    non-128 config of the swizzled-out key (``SWIZZLED_OUT`` is in the tune key, so the key is
+    entirely swizzled). Un-swizzled requant keeps every BM/BN — it stores Cs row-major."""
+
+    def ok(c, args):
+        return (
+            config_dim(c, args, "BLOCK_SIZE_M") == 128
+            and config_dim(c, args, "BLOCK_SIZE_N") == 128
+        )
+
+    return config_filter(ok, when=lambda args: args.get("SWIZZLED_OUT"))
+
+
 def swizzled_scales_bm_pruner():
     """``early_config_prune`` pinning the grouped MX pre-swizzled (``SWIZZLED_SCALES``) arm to
     ``BLOCK_SIZE_M == BLOCK_SIZE_N == 128``. BM: the offline act-quant lays each expert's scale

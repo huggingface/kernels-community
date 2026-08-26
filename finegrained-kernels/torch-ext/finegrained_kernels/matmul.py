@@ -42,7 +42,7 @@ from .tiles import (
     swizzle_offsets,
 )
 from .epilogue import acc_init, add_bias, bias_strides, gemm_epilogue, store_masked, store_masked_oriented
-from .pruners import PATH_ANCHOR_AXES, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner
+from .pruners import PATH_ANCHOR_AXES, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner
 
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
 # ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.
@@ -662,6 +662,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     # the N-apart gate/up rows — a (2,N,K) box is a follow-up), so prune descriptor under GATE.
     prune_configs_by={
         "early_config_prune": compose_pruners(
+            swizzled_out_bm_pruner(),
             mx_config_pruner("K"),
             mx_2d_swap_scope_pruner(),
             scalar_max_m_pruner("M"),
