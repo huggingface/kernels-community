@@ -249,8 +249,8 @@ def dgrad_matmul_2d_kernel(
     # mask on the activation, no clamp on the weight rows, and the addresses advance by a constant
     # stride instead of being rebuilt from offsets each step — the forward's loop shape.
     offs_n0 = tl.arange(0, BLOCK_SIZE_N)
-    dy_ptrs = operand_tile_ptrs(A, offs_m, offs_n0, stride_a_m, stride_a_n, A_MEMORY_MODE, False)
-    b_ptrs = operand_tile_ptrs(B, offs_n0, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE, False)
+    dy_ptrs = operand_tile_ptrs(A, offs_m, offs_n0, stride_a_m, stride_a_n, A_MEMORY_MODE, True)
+    b_ptrs = operand_tile_ptrs(B, offs_n0, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE, True)
     bs_ptrs = (
         Bs + (offs_n0[:, None] // SCALE_ROW_DIV) * stride_bs_n + offs_kg[None, :] * stride_bs_k
     )
@@ -478,10 +478,10 @@ def dgrad_matmul_grouped_kernel(
         # exact N-loop (BLOCK_SIZE_N divides N): maskless weight, constant-stride advance
         offs_n0 = tl.arange(0, BLOCK_SIZE_N)
         dy_ptrs = operand_tile_ptrs(
-            A, out_row, offs_n0, stride_a_m, stride_a_n, A_MEMORY_MODE, False
+            A, out_row, offs_n0, stride_a_m, stride_a_n, A_MEMORY_MODE, True
         )
         b_ptrs = operand_tile_ptrs(
-            b_base, offs_n0, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE, False
+            b_base, offs_n0, offs_kb, stride_b_n, stride_b_k, B_MEMORY_MODE, True
         )
         bs_ptrs = (
             bs_base
