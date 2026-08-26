@@ -512,11 +512,8 @@ class _Experts:
         self._cfg = cfg
 
     def _apply_gate(self, gate_up_out):
-        # The gate|up weight is interleaved, so the GEMM's output columns are too: a
-        # chunk(2) split pairs the wrong halves and silently scrambles the result
-        # (parity 1.2e+00, cosine ~0 -- not a crash). Split on the stride instead.
-        # De-interleaving the weight itself is not an option: a 128-row block scale
-        # spans 64 gate and 64 up rows, so the halves cannot be separated.
+        # gate|up is interleaved, so the output columns are too: the default chunk(2)
+        # pairs the wrong halves and silently scrambles (parity 1.2e+00, cosine ~0).
         gate, up = gate_up_out[..., 0::2], gate_up_out[..., 1::2]
         return _glu(gate, up, self._cfg).to(gate_up_out.dtype)
 
@@ -909,12 +906,9 @@ def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_
     # values are already on the E2M1 grid, so the round-trip is exact and both impls run
     # bit-identical weights (drawing fresh randn here made parity meaningless).
     dq = WEIGHTS[cfg["weights"]]["dequant"]
-    gu_stacked = dq(gu, gus).to(torch.bfloat16)  # (E, 2I, H) = [all gate rows; all up rows]
-    # GPT-OSS INTERLEAVES gate/up (modeling_gpt_oss: gate_up[..., ::2] / [..., 1::2]) while our
-    # layout stacks them — feeding stacked rows pairs the wrong halves in their SwiGLU.
-    gu_bf16 = torch.empty_like(gu_stacked)
-    gu_bf16[:, 0::2] = gu_stacked[:, :inter]
-    gu_bf16[:, 1::2] = gu_stacked[:, inter:]
+    # GPT-OSS interleaves gate/up (modeling_gpt_oss: gate_up[..., ::2] / [..., 1::2]) and so do
+    # we, so the (E, 2I, H) slab transfers as-is; remapping it here would scramble their SwiGLU.
+    gu_bf16 = dq(gu, gus).to(torch.bfloat16)
     dn_bf16 = dq(dn, dns).to(torch.bfloat16)
     for p in ("gate_up_proj", "down_proj", "gate_up_proj_bias", "down_proj_bias"):
         experts._parameters.pop(p, None)

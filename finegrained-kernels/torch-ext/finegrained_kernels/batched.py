@@ -188,8 +188,9 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     those rows in the MMA M dim, padding the single token to the N=16 atom; column 0 of the
     ``[BN, 16]`` accumulator is the result. No-swap keeps the token in M (padded to 16).
 
-    ``GATE`` fuses the gate|up projection: ``B`` is the ``(E, 2N, K)`` stack (gate rows [0,N),
-    interleaved rows), run as two dots (the decode-validated form), SwiGLU-combined, and — under
+    ``GATE`` fuses the gate|up projection: ``B`` is the ``(E, 2N, K)`` gate|up weight with the
+    two projections INTERLEAVED per row (gate even, up odd — ``split_gate_up`` is the inverse),
+    run as two dots (the decode-validated form), SwiGLU-combined, and — under
     an ``OUTPUT_RECIPE`` — FP8-requantized into ``C`` + a per-(row, block) scalar ``Cs``. Every gate arm
     folds out at compile time; ``GATE=False`` is the plain GEMM, bit-identical."""
     batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row = expert_setup(
