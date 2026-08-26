@@ -12,7 +12,7 @@
     }:
     kernel-builder.lib.genKernelFlakeOutputs {
       inherit self;
-      path = ./.;
+      path = ./src;
 
       pythonCheckInputs =
         pkgs: with pkgs; [
