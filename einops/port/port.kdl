@@ -1,0 +1,197 @@
+recipe version=1
+
+// einops
+//
+// einops as a Hub kernel: the package is pure Python, so the manifest is
+// noarch and the port is a move plus the import rewrite that lets the package
+// be imported under whatever directory name the Hub loads it from.
+//
+// The test suite is derived from upstream too. Upstream's tests import einops
+// by name; the port rebinds those imports to the kernel loaded off the Hub and
+// marks each test for kernel CI. Everything else is upstream's.
+//
+// The flake has no upstream equivalent, so it comes from the overlay.
+//
+//   kernel-port einops/port/port.kdl \
+//       --dir <einops checkout> --out einops/src
+
+source \
+    repo="https://github.com/arogozhnikov/einops.git" \
+    commit="ad2c8d67d08cbebb45e1aff2be21dc88635fc695"
+
+prune keep="einops/**"
+
+move \
+    from="einops/tests" \
+    to="tests"
+move \
+    from="einops" \
+    to="torch-ext/einops"
+
+relativize_imports \
+    in="torch-ext/einops/**" \
+    package_root="torch-ext/einops" \
+    changes=7
+expect \
+    in="torch-ext/einops/**" \
+    find="from einops" \
+    count=0
+
+// array_api is a submodule upstream leaves out of the package init; the kernel
+// exposes it, since a Hub consumer cannot import einops.array_api by name.
+replace \
+    in="torch-ext/einops/__init__.py" \
+    count=1 \
+    find="from .packing import pack, unpack\n" \
+    with="from .packing import pack, unpack\nfrom . import array_api\n"
+
+// The test suite imports the package by name; the kernel is loaded off the
+// Hub instead, so each import site is rebound to the loaded module.
+
+replace \
+    in="tests/__init__.py" \
+    count=1 \
+    find="from einops import _backends\n" \
+    with="import kernels\n_einops = kernels.get_kernel(\"kernels-community/einops\", version=1)\n_backends = _einops._backends\n"
+
+// Upstream hard-fails when EINOPS_TEST_BACKENDS is unset. In kernel CI no one
+// sets it, so fall back to whichever frameworks actually import.
+
+replace \
+    in="tests/__init__.py" \
+    count=1 \
+    find="    if ENVVAR_NAME not in os.environ:\n        raise RuntimeError(f\"Testing frameworks were not specified, env var {ENVVAR_NAME} not set\")\n    parsed_backends = os.environ[ENVVAR_NAME].split(\",\")\n    _known_backends = find_names_of_all_frameworks()\n    for backend_name in parsed_backends:\n        if backend_name not in _known_backends:\n            raise RuntimeError(f\"Unknown framework: {backend_name}\")\n\n    return parsed_backends\n" \
+    with="    if ENVVAR_NAME in os.environ:\n        parsed_backends = os.environ[ENVVAR_NAME].split(\",\")\n        _known_backends = find_names_of_all_frameworks()\n        for backend_name in parsed_backends:\n            if backend_name not in _known_backends:\n                raise RuntimeError(f\"Unknown framework: {backend_name}\")\n        return parsed_backends\n\n    # Auto-detect available frameworks.\n    available = []\n    for module, name in [(\"torch\", \"torch\"), (\"jax\", \"jax\"), (\"numpy\", \"numpy\"), (\"tensorflow\", \"tensorflow\")]:\n        try:\n            __import__(module)\n            available.append(name)\n        except ImportError:\n            pass\n    return available\n"
+
+replace \
+    in="tests/test_einsum.py" \
+    count=1 \
+    find="from einops.tests import collect_test_backends\nfrom einops.einops import _compactify_pattern_for_einsum, einsum, EinopsError\n" \
+    with="import kernels\neinops = kernels.get_kernel(\"kernels-community/einops\", version=1)\n_compactify_pattern_for_einsum = einops.einops._compactify_pattern_for_einsum\neinsum = einops.einops.einsum\nEinopsError = einops.EinopsError\nfrom . import collect_test_backends\n"
+
+replace \
+    in="tests/test_examples.py" \
+    count=1 \
+    find="from einops import rearrange, parse_shape, reduce\nfrom einops.tests import is_backend_tested\nfrom einops.tests.test_ops import imp_op_backends\n" \
+    with="import kernels\neinops = kernels.get_kernel(\"kernels-community/einops\", version=1)\nrearrange = einops.rearrange\nparse_shape = einops.parse_shape\nreduce = einops.reduce\nfrom . import is_backend_tested\nfrom .test_ops import imp_op_backends\n"
+
+replace \
+    in="tests/test_layers.py" \
+    count=1 \
+    find="from einops import rearrange, reduce, EinopsError\nfrom einops.tests import collect_test_backends, is_backend_tested, FLOAT_REDUCTIONS as REDUCTIONS\n" \
+    with="import kernels\neinops = kernels.get_kernel(\"kernels-community/einops\", version=1)\nrearrange = einops.rearrange\nreduce = einops.reduce\nEinopsError = einops.EinopsError\nfrom . import collect_test_backends, is_backend_tested\nfrom . import FLOAT_REDUCTIONS as REDUCTIONS\n"
+
+replace \
+    in="tests/test_layers.py" \
+    count=1 \
+    find="        from einops.layers.torch import Rearrange, Reduce, EinMix\n" \
+    with="        Rearrange, Reduce, EinMix = einops.layers.torch.Rearrange, einops.layers.torch.Reduce, einops.layers.torch.EinMix\n"
+
+replace \
+    in="tests/test_layers.py" \
+    count=1 \
+    find="        from einops.layers.keras import Rearrange, Reduce, EinMix, keras_custom_objects\n" \
+    with="        Rearrange, Reduce, EinMix, keras_custom_objects = einops.layers.keras.Rearrange, einops.layers.keras.Reduce, einops.layers.keras.EinMix, einops.layers.keras.keras_custom_objects\n"
+
+replace \
+    in="tests/test_layers.py" \
+    count=1 \
+    find="        from einops.layers.flax import EinMix, Reduce, Rearrange\n" \
+    with="        EinMix, Reduce, Rearrange = einops.layers.flax.EinMix, einops.layers.flax.Reduce, einops.layers.flax.Rearrange\n"
+
+replace \
+    in="tests/test_layers.py" \
+    count=2 \
+    find="    from einops.layers._einmix import _EinmixDebugger\n" \
+    with="    _EinmixDebugger = einops.layers._einmix._EinmixDebugger\n"
+
+// numpy 2 dropped in1d.
+
+replace \
+    in="tests/test_layers.py" \
+    count=1 \
+    find="numpy.in1d(grad, [0, 1])" \
+    with="numpy.isin(grad, [0, 1])"
+
+replace \
+    in="tests/test_ops.py" \
+    count=1 \
+    find="from einops import EinopsError\nfrom einops.einops import rearrange, reduce, repeat, _enumerate_directions\nfrom einops.tests import collect_test_backends, is_backend_tested, FLOAT_REDUCTIONS as REDUCTIONS\n" \
+    with="import kernels\neinops = kernels.get_kernel(\"kernels-community/einops\", version=1)\nEinopsError = einops.EinopsError\nrearrange = einops.einops.rearrange\nreduce = einops.einops.reduce\nrepeat = einops.einops.repeat\n_enumerate_directions = einops.einops._enumerate_directions\nfrom . import collect_test_backends, is_backend_tested\nfrom . import FLOAT_REDUCTIONS as REDUCTIONS\n"
+
+replace \
+    in="tests/test_ops.py" \
+    count=1 \
+    find="    from einops._backends import TorchBackend, TensorflowBackend, TFKerasBackend, NumpyBackend\n" \
+    with="    TorchBackend = einops._backends.TorchBackend\n    TensorflowBackend = einops._backends.TensorflowBackend\n    TFKerasBackend = einops._backends.TFKerasBackend\n    NumpyBackend = einops._backends.NumpyBackend\n"
+
+replace \
+    in="tests/test_other.py" \
+    count=1 \
+    find="import einops\nimport einops.layers\nimport einops.parsing\nfrom einops._backends import AbstractBackend\nfrom einops.einops import rearrange, parse_shape, _optimize_transformation\nfrom einops.tests import collect_test_backends, is_backend_tested\n" \
+    with="import kernels\neinops = kernels.get_kernel(\"kernels-community/einops\", version=1)\nAbstractBackend = einops._backends.AbstractBackend\nrearrange = einops.einops.rearrange\nparse_shape = einops.einops.parse_shape\n_optimize_transformation = einops.einops._optimize_transformation\nfrom . import collect_test_backends, is_backend_tested\n"
+
+replace \
+    in="tests/test_other.py" \
+    count=1 \
+    find="    from einops import repeat, reduce, pack, unpack, einsum\n    from einops._torch_specific import allow_ops_in_compiled_graph\n" \
+    with="    repeat, reduce, pack, unpack, einsum = einops.repeat, einops.reduce, einops.pack, einops.unpack, einops.einsum\n    allow_ops_in_compiled_graph = einops._torch_specific.allow_ops_in_compiled_graph\n"
+
+replace \
+    in="tests/test_packing.py" \
+    count=1 \
+    find="from einops import EinopsError, asnumpy, pack, unpack\nfrom einops.tests import collect_test_backends\n" \
+    with="import kernels\neinops = kernels.get_kernel(\"kernels-community/einops\", version=1)\nEinopsError = einops.EinopsError\nasnumpy = einops.asnumpy\npack = einops.pack\nunpack = einops.unpack\nfrom . import collect_test_backends\n"
+
+replace \
+    in="tests/test_parsing.py" \
+    count=1 \
+    find="from einops import EinopsError\nfrom einops.parsing import ParsedExpression, AnonymousAxis, _ellipsis\n" \
+    with="import kernels\neinops = kernels.get_kernel(\"kernels-community/einops\", version=1)\nEinopsError = einops.EinopsError\nParsedExpression = einops.parsing.ParsedExpression\nAnonymousAxis = einops.parsing.AnonymousAxis\n_ellipsis = einops.parsing._ellipsis\n"
+
+// array_api is reached as an attribute of the loaded kernel (see the
+// __init__.py edit above), not as a submodule import.
+
+replace \
+    in="tests/**" \
+    count=4 \
+    find="    from einops import array_api as AA\n" \
+    with="    AA = einops.array_api\n"
+
+// Kernel CI selects tests by marker; upstream has none.
+
+replace \
+    in="tests/**" \
+    count=63 \
+    find="\ndef test_" \
+    with="\n@pytest.mark.kernels_ci\ndef test_"
+
+// The flake: hand-written, no upstream equivalent.
+overlay from="overlay"
+
+expect \
+    in="torch-ext/einops/**" \
+    files=18
+expect \
+    in="tests/**" \
+    files=9
+// run_tests.py is upstream's standalone pip-install-and-run driver. Kernel CI
+// does not use it, so it is shipped verbatim and excluded from this check.
+expect \
+    in="tests/__init__.py" \
+    find="from einops" \
+    count=0
+expect \
+    in="tests/test_*.py" \
+    find="from einops" \
+    count=0
+
+manifest \
+    name="einops" \
+    version=1 \
+    edition=5 \
+    license="MIT" \
+    upstream="https://github.com/arogozhnikov/einops.git" \
+    backends="cpu,cuda,metal,rocm,xpu" \
+    repo_id="kernels-community/einops" \
+    noarch=#true
