@@ -1,0 +1,127 @@
+recipe version=1
+
+// causal-conv1d
+//
+// Tri Dao's causal depthwise conv1d, ported into the kernel-builder layout.
+// Upstream builds the extension with setuptools and pybind11; here the CUDA
+// sources are compiled by kernel-builder and the ops are registered by the
+// checked-in torch_binding.cpp, so the port is: move two directories, unhook
+// pybind11, point the Python at the generated `_ops` module, and declare the
+// manifest.
+//
+// The flake lives at causal-conv1d/, outside --out, so it survives
+// regeneration; its `path = ./src` points kernel-builder at the output.
+//
+//   kernel-port causal-conv1d/port/port.kdl \
+//       --dir <causal-conv1d checkout> --out causal-conv1d/src
+
+source \
+    repo="https://github.com/Dao-AILab/causal-conv1d" \
+    commit="e5d5afee76bd14971a3886d90693ab7d1260cae9"
+
+prune keep="csrc/**,causal_conv1d/**,tests/**"
+
+move \
+    from="csrc" \
+    to="causal-conv1d"
+move \
+    from="causal_conv1d" \
+    to="torch-ext/causal_conv1d"
+
+// The ops are registered by torch-ext/torch_binding.cpp under the name the Hub
+// gives this build, so upstream's pybind11 module has to go, along with the
+// torch/extension.h umbrella header that pulls pybind11 in.
+replace \
+    in="causal-conv1d/causal_conv1d.cpp" \
+    count=1 \
+    find="#include <torch/extension.h>" \
+    with="#include <torch/all.h>"
+replace \
+    in="causal-conv1d/causal_conv1d.cpp" \
+    count=1 \
+    find="#include <torch/python.h>\n" \
+    with=""
+replace \
+    in="causal-conv1d/causal_conv1d.cpp" \
+    count=1 \
+    find=#"""
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("causal_conv1d_fwd", &causal_conv1d_fwd, "Causal conv1d forward");
+    m.def("causal_conv1d_bwd", &causal_conv1d_bwd, "Causal conv1d backward");
+    m.def("causal_conv1d_update", &causal_conv1d_update, "Causal conv1d update");
+}
+"""# \
+    with=#"""
+/*
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("causal_conv1d_fwd", &causal_conv1d_fwd, "Causal conv1d forward");
+    m.def("causal_conv1d_bwd", &causal_conv1d_bwd, "Causal conv1d backward");
+    m.def("causal_conv1d_update", &causal_conv1d_update, "Causal conv1d update");
+}
+*/
+"""#
+
+// The package init is the kernel's public API: export the varlen helper too,
+// and drop the version that upstream's setup.py reads.
+replace \
+    in="torch-ext/causal_conv1d/__init__.py" \
+    count=1 \
+    find=#"""
+__version__ = "1.5.2"
+
+from causal_conv1d.causal_conv1d_interface import causal_conv1d_fn, causal_conv1d_update
+"""# \
+    with=#"""
+from .causal_conv1d_interface import causal_conv1d_fn, causal_conv1d_update
+from .causal_conv1d_varlen import causal_conv1d_varlen_states
+
+__all__ = ["causal_conv1d_fn", "causal_conv1d_update", "causal_conv1d_varlen_states"]
+"""#
+
+// The Hub loads a kernel under a build-variant directory name, so nothing
+// under torch-ext may import itself by absolute name.
+relativize_imports \
+    in="torch-ext/causal_conv1d/**" \
+    package_root="torch-ext/causal_conv1d" \
+    changes=1
+
+// The tests import the package, so they only need its public surface.
+replace \
+    in="tests/test_causal_conv1d.py" \
+    count=1 \
+    find=#"""
+from causal_conv1d.causal_conv1d_interface import causal_conv1d_fn, causal_conv1d_ref
+from causal_conv1d.causal_conv1d_interface import causal_conv1d_update, causal_conv1d_update_ref
+from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states, causal_conv1d_varlen_states_ref
+"""# \
+    with=#"""
+
+from causal_conv1d import causal_conv1d_fn, causal_conv1d_update, causal_conv1d_varlen_states
+from causal_conv1d.causal_conv1d_interface import causal_conv1d_ref
+from causal_conv1d.causal_conv1d_interface import causal_conv1d_update_ref
+from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states_ref
+"""#
+
+// Everything with no upstream equivalent: the op registration, the shim it
+// needs, the `_ops` wrappers that replace upstream's `causal_conv1d_cuda`
+// module, and the docs.
+overlay from="overlay"
+
+expect \
+    in="torch-ext/causal_conv1d/**/*.py" \
+    find="import causal_conv1d_cuda" \
+    count=0
+
+kernel \
+    name="causal_conv1d" \
+    backend="cuda" \
+    src="causal-conv1d/**" \
+    include="causal-conv1d"
+manifest \
+    name="causal-conv1d" \
+    backends="cuda" \
+    torch_src="torch-ext/*.cpp,torch-ext/*.h" \
+    version=1 \
+    edition=5 \
+    license="BSD-3-Clause" \
+    repo_id="kernels-community/causal-conv1d"

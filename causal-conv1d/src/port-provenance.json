@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "recipe": "sha256:b9968776e45a4e9e5c912f03bc0f1f93ff14e8128a725b52185be58b21b9a630",
+  "runner": "kernel-port 0.1.0",
+  "sources": {
+    "upstream": {
+      "repo": "https://github.com/Dao-AILab/causal-conv1d",
+      "commit": "e5d5afee76bd14971a3886d90693ab7d1260cae9"
+    }
+  },
+  "tree": "sha256:5c7194f7873bea3e478d937d00be6d4192e4429d57a813a9c012f4a9e6aeca25"
+}
