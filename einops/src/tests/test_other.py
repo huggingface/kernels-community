@@ -187,8 +187,8 @@ _SYMBOLIC_BACKENDS = [
 _SYMBOLIC_BACKENDS = [backend for backend in _SYMBOLIC_BACKENDS if backend.framework_name != "tensorflow.keras"]
 
 
-@pytest.mark.kernels_ci
 @pytest.mark.parametrize("backend", _SYMBOLIC_BACKENDS)
+@pytest.mark.kernels_ci
 def test_parse_shape_symbolic(backend):
     for shape in [
         [10, 20, 30, 40],
@@ -218,8 +218,8 @@ def test_parse_shape_symbolic(backend):
         assert numpy.allclose(result, 0)
 
 
-@pytest.mark.kernels_ci
 @pytest.mark.parametrize("backend", _SYMBOLIC_BACKENDS)
+@pytest.mark.kernels_ci
 def test_parse_shape_symbolic_ellipsis(backend):
     for static_shape, shape, pattern, expected in [
         ([10, 20], [None, None], "...", dict()),
