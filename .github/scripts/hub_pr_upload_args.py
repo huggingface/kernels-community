@@ -24,10 +24,17 @@ from pathlib import Path
 COMMUNITY = "kernels-community"
 
 
+# Ported kernels keep their generated tree in <kernel>/src, with flake.nix
+# staying at <kernel>. Everything else keeps build.toml beside the flake.
+def build_toml_path(kernel):
+    nested = Path(kernel) / "src" / "build.toml"
+    return nested if nested.is_file() else Path(kernel) / "build.toml"
+
+
 def external_repo_id(kernel, repo_prefix):
     if repo_prefix != COMMUNITY:
         return ""
-    build_toml = Path(kernel) / "build.toml"
+    build_toml = build_toml_path(kernel)
     if not build_toml.is_file():
         return ""
     with open(build_toml, "rb") as f:

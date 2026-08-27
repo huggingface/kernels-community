@@ -1,18 +1,20 @@
 import math
+
+import kernels
 import pytest
 import torch
 
-from sage_attention import (
-    per_block_int8,
-    per_warp_int8,
-    sub_mean,
-    per_channel_fp8,
-)
+sage_attention = kernels.get_kernel("kernels-community/sage-attention", version=3)
 
+per_block_int8 = sage_attention.per_block_int8
+per_warp_int8 = sage_attention.per_warp_int8
+sub_mean = sage_attention.sub_mean
+per_channel_fp8 = sage_attention.per_channel_fp8
 
 cuda_available = torch.cuda.is_available()
 
 
+@pytest.mark.kernels_ci
 @pytest.mark.skipif(not cuda_available, reason="CUDA is required")
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
 def test_per_block_int8_shapes_and_types(tensor_layout):
@@ -49,6 +51,7 @@ def test_per_block_int8_shapes_and_types(tensor_layout):
     assert torch.isfinite(k_scale).all()
 
 
+@pytest.mark.kernels_ci
 @pytest.mark.skipif(not cuda_available, reason="CUDA is required")
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("head_dim", [64, 128])
@@ -92,6 +95,7 @@ def test_per_warp_int8_shapes_and_types(tensor_layout, head_dim):
     assert torch.isfinite(k_scale).all()
 
 
+@pytest.mark.kernels_ci
 @pytest.mark.skipif(not cuda_available, reason="CUDA is required")
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
 def test_sub_mean_properties(tensor_layout):
@@ -117,6 +121,7 @@ def test_sub_mean_properties(tensor_layout):
     assert (mean_after.abs() < 1e-1).all()
 
 
+@pytest.mark.kernels_ci
 @pytest.mark.skipif(not cuda_available, reason="CUDA is required")
 @pytest.mark.parametrize("tensor_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("smooth_v", [True, False])
