@@ -1,0 +1,43 @@
+name: Check Ports
+
+# A ported kernel's <kernel>/src is generated from <kernel>/port/port.kdl and
+# committed. Regenerate it here and fail if it drifted, so that a stale overlay
+# silently reverting an in-tree fix, a hand-edited build.toml field the manifest
+# op drops, or an overlay file edited without its generated twin are all loud.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - "*/port/**"
+      - "*/src/**"
+      - "scripts/check_ports.py"
+      - ".github/workflows/check-ports.yaml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check-ports:
+    name: Check ports reproduce
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      # Each recipe pins its own upstream commit; the runner verifies the
+      # origin URL, HEAD and cleanliness of the checkout it is handed.
+      - name: Regenerate every port and compare
+        env:
+          # kernel-port still lives on the kernel-port-tool branch; point this at
+          # github:huggingface/kernels#kernel-port once that branch merges.
+          KERNEL_PORT: "nix run github:huggingface/kernels/kernel-port-tool#kernel-port --"
+        run: python3 scripts/check_ports.py
