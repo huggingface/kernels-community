@@ -1391,6 +1391,16 @@ def _run_task(kind, pname, cfg, rows_out):
         unavailable = (("vllm",) if vllm_fused_experts is None else ()) + (
             ("trtllm",) if trtllm_fp8_block_scale_routed_moe is None or trtllm_gated_gap else ())
         quant_arms = tuple(a for a in quant_arms if a not in unavailable)
+        # Arms whose kernel is known to TRAP asynchronously go LAST: a trap poisons the CUDA
+        # context, which is unrecoverable in-process, so every arm benched after it blanks
+        # through no fault of its own (that is how finegrained-fp8's v4 int32 expert-offset
+        # overflow — fixed in a5cf637f, awaiting the hub rebuild — took out the deepgemm/trtllm/
+        # transformers@main prefill cells on DeepSeek-V4 W4A8). Ordering does not change any
+        # measurement (each arm is benched independently in the same warmed process); it only
+        # changes who a trap can hurt. Drop an arm from this set once its fixed build ships.
+        _TRAP_RISK = ("finegrained-fp8",)
+        quant_arms = (tuple(a for a in quant_arms if a not in _TRAP_RISK)
+                      + tuple(a for a in quant_arms if a in _TRAP_RISK))
         if wanted("quantized", pname):
             bench_problem_row("quantized", pname, cfg, quant_arms, weights, rows_out)
     elif kind == "bf16":
