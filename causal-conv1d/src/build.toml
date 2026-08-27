@@ -1,8 +1,8 @@
 [general]
 name = "causal-conv1d"
 version = 1
-edition = 5
 license = "BSD-3-Clause"
+edition = 5
 backends = ["cuda"]
 
 [general.hub]
@@ -20,11 +20,11 @@ backend = "cuda"
 depends = ["torch"]
 include = ["causal-conv1d"]
 src = [
+    "causal-conv1d/causal_conv1d.cpp",
+    "causal-conv1d/causal_conv1d.h",
     "causal-conv1d/causal_conv1d_bwd.cu",
     "causal-conv1d/causal_conv1d_common.h",
-    "causal-conv1d/causal_conv1d.cpp",
     "causal-conv1d/causal_conv1d_fwd.cu",
-    "causal-conv1d/causal_conv1d.h",
     "causal-conv1d/causal_conv1d_update.cu",
     "causal-conv1d/static_switch.h",
 ]
