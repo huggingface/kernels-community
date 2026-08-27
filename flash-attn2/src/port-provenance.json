@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "recipe": "sha256:b617bd662974a1e609793b98ad1e7bf6b5b65f1ee8e0a52595d748b7a688b26a",
+  "runner": "kernel-port 0.1.0",
+  "sources": {
+    "upstream": {
+      "repo": "https://github.com/Dao-AILab/flash-attention",
+      "commit": "979702c87a8713a8e0a5e9fee122b90d2ef13be5"
+    }
+  },
+  "tree": "sha256:384ac579c3732a661e0cb6b8982bb344ab1a101bebdae15b7b49142e22734a74"
+}

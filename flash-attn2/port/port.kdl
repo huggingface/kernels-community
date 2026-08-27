@@ -1,0 +1,234 @@
+// Port Dao-AILab/flash-attention (v2.7.4) into the kernel-builder layout of
+// kernels-community/flash-attn2. The CUDA tree comes from upstream csrc/flash_attn
+// with the community's stable-ABI conversion applied mechanically: a self-contained
+// cuda_check.h replaces the c10 error macros, a philox_unpack.cuh compat header
+// replaces at::PhiloxCudaState, and the hdim160 template instantiations are dropped.
+// flash_api.cpp and philox_unpack.cuh are full community rewrites (1400/69 diff
+// lines) and ship as overlay, as do the hand-written CPU and XPU backends, the
+// torch-ext bindings, and the flash_attn2 Python package (custom_op rework).
+//
+// The flake lives at flash-attn2/, outside --out, so it survives regeneration;
+// its `path = ./src` points kernel-builder at the generated tree.
+//
+// Deviations from community: upstream LICENSE retained (community ships none);
+// build.toml src lists are sorted (community's are curated-order; the sets match).
+recipe version=1
+
+source \
+    repo="https://github.com/Dao-AILab/flash-attention" \
+    commit="979702c87a8713a8e0a5e9fee122b90d2ef13be5"
+
+prune keep="csrc/flash_attn/**,flash_attn/bert_padding.py,LICENSE"
+
+// Community drops the hdim160 instantiations (12 shards + their dispatch below).
+delete in="csrc/flash_attn/src/*hdim160*"
+
+move \
+    from="flash_attn/bert_padding.py" \
+    to="torch-ext/flash_attn2/bert_padding.py"
+move \
+    from="csrc/flash_attn" \
+    to="flash_attn"
+
+// Full community rewrites, shipped from the overlay instead of patched.
+delete in="flash_attn/flash_api.cpp"
+delete in="flash_attn/src/philox_unpack.cuh"
+
+// --- stable-ABI conversion ------------------------------------------------
+// flash.h: PhiloxCudaState comes from the compat header, not ATen.
+replace \
+    in="flash_attn/src/flash.h" \
+    find="#include <ATen/cuda/CUDAGeneratorImpl.h> // For at::Generator and at::PhiloxCudaState" \
+    with="#include \"philox_unpack.cuh\" // For FLASH_NAMESPACE::PhiloxCudaState" \
+    count=1
+replace \
+    in="flash_attn/src/flash.h" \
+    find="at::PhiloxCudaState philox_args;" \
+    with="PhiloxCudaState philox_args;" \
+    count=1
+replace \
+    in="flash_attn/src/flash_fwd_kernel.h" \
+    find="auto seed_offset = at::cuda::philox::unpack(params.philox_args);" \
+    with="auto seed_offset = FLASH_NAMESPACE::philox_compat::unpack(params.philox_args);" \
+    count=1
+// c10 error macros come from the self-contained header.
+replace \
+    in="flash_attn/src/flash_*_launch_template.h" \
+    find="#include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK" \
+    with="#include \"cuda_check.h\"  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK" \
+    count=2
+
+// --- community fixes carried in their copy --------------------------------
+// 32-bit overflow fix in dq_accum offsets.
+replace \
+    in="flash_attn/src/flash_bwd_*.h" \
+    find="? 0 : 128 * bidb" \
+    with="? 0 : 128ll * bidb" \
+    count=3
+// MSVC/typename conformance fix.
+replace \
+    in="flash_attn/src/flash_fwd_kernel.h" \
+    find="convert_layout_acc_Aregs<Kernel_traits::TiledMma>" \
+    with="convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>" \
+    count=4
+// Alibi is incompatible with the IsEvenMN/IsEvenK fast paths.
+replace \
+    in="flash_attn/src/flash_bwd_launch_template.h" \
+    find="Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Is_softcap>" \
+    with="Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !Has_alibi && Kernel_traits::kHeadDim <= 128, IsEvenKConst && !Has_alibi, Is_softcap>" \
+    count=1
+replace \
+    in="flash_attn/src/flash_fwd_launch_template.h" \
+    find="Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Is_softcap, ReturnSoftmaxConst" \
+    with="Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !Has_alibi && !ReturnSoftmaxConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst && !ReturnSoftmaxConst && !Has_alibi, Is_softcap, ReturnSoftmaxConst" \
+    count=1
+replace \
+    in="flash_attn/src/flash_fwd_launch_template.h" \
+    find="Has_alibi, IsEvenMNConst && !Append_KV && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Is_softcap, Split" \
+    with="Has_alibi, IsEvenMNConst && !Append_KV && IsEvenKConst && !Is_local && !Has_alibi && Kernel_traits::kHeadDim <= 128, IsEvenKConst && !Has_alibi, Is_softcap, Split" \
+    count=1
+
+// --- hdim160 dispatch removal ---------------------------------------------
+replace \
+    in="flash_attn/src/static_switch.h" \
+    count=1 \
+    with="" \
+    find=#"""
+    } else if (HEADDIM <= 160) {           \
+      constexpr static int kHeadDim = 160; \
+      return __VA_ARGS__();                \
+
+"""#
+replace \
+    in="flash_attn/src/flash_fwd_launch_template.h" \
+    find="    // Also for headdim 160 with block size 64 x 128 after the rotary addition.\n" \
+    with="" \
+    count=1
+replace \
+    in="flash_attn/src/flash_bwd_launch_template.h" \
+    count=1 \
+    with="" \
+    find=#"""
+template<typename T, bool Is_causal>
+void run_mha_bwd_hdim160(Flash_bwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 160;
+    int device;
+    cudaGetDevice(&device);
+    int max_smem_per_block;
+    cudaError status_ = cudaDeviceGetAttribute(
+        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != cudaSuccess) {
+      C10_CUDA_CHECK(status_);
+    }
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        if (max_smem_per_block >= 116 * 1024) {
+            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        } else {
+            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, false, true, T>, Is_dropout, Is_causal>(params, stream);
+        }
+    });
+}
+
+
+"""#
+replace \
+    in="flash_attn/src/flash_fwd_launch_template.h" \
+    count=1 \
+    with="" \
+    find=#"""
+template<typename T, bool Is_causal>
+void run_mha_fwd_hdim160(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 160;
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    bool is_sm8x = cc_major == 8 && cc_minor > 0;
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        // For A100, H100, 128 x 32 is the fastest.
+        // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
+        // and 128 x 64 with 8 warps is the fastest for non-causal.
+        if (is_sm8x) {
+            if constexpr(!Is_causal) {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            } else {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            }
+        } else {
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        }
+        // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, true, T>, Is_dropout, Is_causal>(params, stream);
+        // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, T>>(params, stream);
+        // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 128, 4, false, T>>(params, stream);
+        // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, T>>(params, stream);
+        // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, T>>(params, stream);
+        // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 8, false, T>>(params, stream);
+    });
+}
+
+
+"""#
+
+replace \
+    in="flash_attn/src/generate_kernels.py" \
+    find="HEAD_DIMENSIONS = [32, 64, 96, 128, 160, 192, 256]" \
+    with="HEAD_DIMENSIONS = [32, 64, 96, 128, 192, 256]" \
+    count=1
+
+// --- guards ----------------------------------------------------------------
+expect \
+    in="flash_attn/**" \
+    find="at::PhiloxCudaState" \
+    count=0
+expect \
+    in="flash_attn/**" \
+    find="c10/cuda" \
+    count=0
+expect \
+    in="flash_attn/**" \
+    find="hdim160" \
+    count=0
+// Contract text the overlay bindings (flash_api.cpp, torch_binding.h) rely on.
+expect \
+    in="flash_attn/src/flash.h" \
+    find="struct Flash_fwd_params : public Qkv_params" \
+    count=1
+expect \
+    in="flash_attn/src/flash.h" \
+    find="uint64_t * rng_state;" \
+    count=1
+
+// --- assembly ---------------------------------------------------------------
+overlay from="overlay"
+
+kernel \
+    name="flash_attn_xpu" \
+    backend="xpu" \
+    depends="torch,sycl_tla" \
+    src="flash_attn_xpu/flash_api.cpp,flash_attn_xpu/src/*.cpp,flash_attn_xpu/src/*.hpp,flash_attn_xpu/src/collective/*.hpp,flash_attn_xpu/src/kernel/*.hpp"
+kernel \
+    name="flash_attn_cpu_avx512" \
+    backend="cpu" \
+    cxx_flags="-fopenmp,-mavx512f,-mavx512bf16,-mavx512vl,-mavx512dq,-mavx512bw,-mamx-bf16,-mamx-int8,-mamx-tile" \
+    include="flash_attn_cpu" \
+    src="flash_attn_cpu/src/fmha_fwd_avx512.cpp,flash_attn_cpu/src/fmha_fwd_avx512.hpp,flash_attn_cpu/src/fmha_fwd_common.hpp,flash_attn_cpu/src/fmha_fwd_kernel.hpp"
+kernel \
+    name="flash_attn_cpu" \
+    backend="cpu" \
+    cxx_flags="-fopenmp" \
+    include="flash_attn_cpu" \
+    src="flash_attn_cpu/flash_api.cpp,flash_attn_cpu/src/*.hpp,flash_attn_cpu/src/fmha_fwd_dispatch.cpp,flash_attn_cpu/src/fmha_fwd_fallback.cpp"
+kernel \
+    name="flash_attn" \
+    backend="cuda" \
+    capabilities="8.0,9.0,10.0,12.0" \
+    depends="torch,cutlass_3_6" \
+    src="flash_attn/flash_api.cpp,flash_attn/src/*.h,flash_attn/src/*.cu,flash_attn/src/*.cuh"
+
+manifest \
+    name="flash-attn2" \
+    version=3 \
+    license="BSD-3-Clause" \
+    edition=5 \
+    backends="cpu,cuda,xpu" \
+    repo_id="kernels-community/flash-attn2" \
+    stable_abi="cuda=2.10,rocm=2.10" \
+    torch_src="torch-ext/torch_binding.cpp,torch-ext/torch_binding_stable.cpp,torch-ext/torch_binding.h"
