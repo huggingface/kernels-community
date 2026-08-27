@@ -28,6 +28,14 @@ import pygit2
 # Private by name but still part of the public contract.
 PUBLIC_DUNDERS = {"__init__", "__call__"}
 CPP_EXT = (".cpp", ".cc", ".cxx", ".cu", ".cuh", ".h", ".hpp", ".hh")
+# A ported kernel is generated into <kernel>/src, leaving only the flake and the
+# port recipe beside it; every other kernel keeps its manifest at the top level.
+# Resolve to whichever directory actually holds build.toml.
+def kernel_root(root: Path) -> Path:
+    nested = root / "src"
+    return nested if (nested / "build.toml").is_file() else root
+
+
 # Python package lives under a build-variant dir, e.g. torch-ext or tvm-ffi-ext.
 EXT_SUFFIX = "-ext"
 
@@ -46,6 +54,7 @@ class Source:
 
     @staticmethod
     def from_disk(root: Path) -> "Source":
+        root = kernel_root(root)
         if not root.is_dir():
             return Source({}, None)
         files = {
@@ -61,6 +70,15 @@ class Source:
             return Source({}, None)
         if not isinstance(obj, pygit2.Tree):
             return Source({}, None)
+        # Ported kernels keep the generated tree one level down; see kernel_root.
+        try:
+            nested = obj["src"]
+            obj["src/build.toml"]
+        except KeyError:
+            pass
+        else:
+            if nested.type_str == "tree":
+                obj = repo[nested.id]
         files = {}
 
         def walk(tree, prefix):
@@ -326,7 +344,10 @@ def changed_kernels(base_tree, head_tree) -> list:
     for delta in base_tree.diff_to_tree(head_tree).deltas:
         for path in (delta.old_file.path, delta.new_file.path):
             top = path.split("/", 1)[0]
-            if "/" in path and (Path(top) / "build.toml").is_file():
+            if "/" in path and (
+                (Path(top) / "build.toml").is_file()
+                or (Path(top) / "src" / "build.toml").is_file()
+            ):
                 found.add(top)
     return sorted(found)
 

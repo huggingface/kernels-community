@@ -87,7 +87,9 @@ def kernels():
         yield sorted(
             name
             for name in os.listdir(REPO_ROOT)
+            # Ported kernels keep build.toml in <kernel>/src.
             if os.path.exists(os.path.join(REPO_ROOT, name, "build.toml"))
+            or os.path.exists(os.path.join(REPO_ROOT, name, "src", "build.toml"))
         )
     finally:
         os.chdir(cwd)
