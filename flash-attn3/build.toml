@@ -1,22 +1,53 @@
 [general]
 name = "flash-attn3"
-license = "BSD-3-Clause"
 version = 1
+edition = 5
+license = "BSD-3-Clause"
 backends = ["cuda"]
 
 [general.cuda]
 minver = "12.6"
-# ptxas fails on 13.2, but the 13.0 build is backwards compatible.
 maxver = "13.0"
-
 
 [general.hub]
 repo-id = "kernels-community/flash-attn3"
 
 [torch]
+src = ["flash-attn/flash_api_stable.cpp"]
 stable-abi = "2.9"
+
+[kernel.flash_attn]
+backend = "cuda"
+cuda-capabilities = [
+    "8.0",
+    "9.0a",
+]
+cuda-flags = [
+    "-O3",
+    "-std=c++17",
+    "--ftemplate-backtrace-limit=0",
+    "--use_fast_math",
+    "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+    "-DCUTLASS_ENABLE_GDC_FOR_SM90",
+    "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
+    "-DNDEBUG",
+]
+depends = [
+    "torch",
+    "cutlass_4_0",
+]
 src = [
-    "flash-attn/flash_api_stable.cpp",
+    "flash-attn/cuda_check.h",
+    "flash-attn/flash_fwd_combine.cu",
+    "flash-attn/flash_fwd_combine_kernel.h",
+    "flash-attn/flash_fwd_combine_launch_template.h",
+    "flash-attn/flash.h",
+    "flash-attn/flash_prepare_scheduler.cu",
+    "flash-attn/heuristics.h",
+    "flash-attn/seqlen.h",
+    "flash-attn/static_switch.h",
+    "flash-attn/tile_size.h",
+    "flash-attn/utils.h",
 ]
 
 [kernel.flash_attn_sm80]
@@ -165,40 +196,6 @@ src = [
     "flash-attn/instantiations/flash_fwd_hdim96_fp16_softcap_sm80.cu",
     "flash-attn/instantiations/flash_fwd_hdim96_fp16_split_sm80.cu",
     "flash-attn/instantiations/flash_fwd_hdim96_fp16_split_softcap_sm80.cu",
-]
-
-[kernel.flash_attn]
-backend = "cuda"
-cuda-capabilities = [
-    "8.0",
-    "9.0a",
-]
-cuda-flags = [
-    "-O3",
-    "-std=c++17",
-    "--ftemplate-backtrace-limit=0",
-    "--use_fast_math",
-    "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
-    "-DCUTLASS_ENABLE_GDC_FOR_SM90",
-    "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
-    "-DNDEBUG",
-]
-depends = [
-    "torch",
-    "cutlass_4_0",
-]
-src = [
-    "flash-attn/cuda_check.h",
-    "flash-attn/flash_fwd_combine.cu",
-    "flash-attn/flash_fwd_combine_kernel.h",
-    "flash-attn/flash_fwd_combine_launch_template.h",
-    "flash-attn/flash.h",
-    "flash-attn/flash_prepare_scheduler.cu",
-    "flash-attn/heuristics.h",
-    "flash-attn/seqlen.h",
-    "flash-attn/static_switch.h",
-    "flash-attn/tile_size.h",
-    "flash-attn/utils.h",
 ]
 
 [kernel.flash_attn_sm90]

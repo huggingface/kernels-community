@@ -156,8 +156,13 @@ jobs:
         env:
           KERNEL: ${{ inputs.kernel_name }}
         run: |
-          if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$KERNEL/build.toml" ]; then
+          # Ported kernels keep build.toml in <kernel>/src; the flake stays at
+          # <kernel> and points nix at it.
+          CONFIG="$KERNEL"
+          [ -f "$KERNEL/src/build.toml" ] && CONFIG="$KERNEL/src"
+          if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$CONFIG/build.toml" ]; then
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+            echo "config=$CONFIG" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
           else
             echo "skip=true" >> $GITHUB_OUTPUT
@@ -167,10 +172,10 @@ jobs:
       - name: Check that repo-id is present
         if: steps.validate.outputs.skip == 'false' && inputs.mode == 'pr'
         env:
-          KERNEL: ${{ steps.validate.outputs.kernel }}
+          CONFIG: ${{ steps.validate.outputs.config }}
         run: |
-          if ! cat $KERNEL/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
-            echo "Mandatory repo-id is missing in $KERNEL/build.toml"
+          if ! cat $CONFIG/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
+            echo "Mandatory repo-id is missing in $CONFIG/build.toml"
             exit 1
           fi
 
@@ -235,14 +240,17 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           KERNEL: ${{ steps.validate.outputs.kernel }}
+          CONFIG: ${{ steps.validate.outputs.config }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
           TARGET_FLAG=$(python3 .github/scripts/hub_pr_upload_args.py upload-args "$KERNEL" "$REPO_PREFIX")
+          # Resolve before the cd: CONFIG is repo-root relative and may be <kernel>/src.
+          BUILD_TOML="$PWD/$CONFIG/build.toml"
           cd "$KERNEL"
 
-          if [ -f "build.toml" ]; then
-            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
-            BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
+          if [ -f "$BUILD_TOML" ]; then
+            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' "$BUILD_TOML" || true)
+            BRANCH=$(grep -E '^\s*branch\s*=' "$BUILD_TOML" || true)
             if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
               nix run -L github:huggingface/kernels#kernel-builder -- upload \
                 --repo-type kernel $TARGET_FLAG --branch main \

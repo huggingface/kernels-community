@@ -1,6 +1,7 @@
 [general]
 name = "paged-attention"
 version = 1
+edition = 5
 license = "Apache-2.0"
 backends = [
     "cuda",
@@ -15,32 +16,6 @@ repo-id = "kernels-community/paged-attention"
 src = [
     "torch-ext/torch_binding.cpp",
     "torch-ext/torch_binding.h",
-]
-
-[kernel.paged_attention]
-backend = "cuda"
-depends = ["torch"]
-include = [
-    "cuda-utils",
-    "paged-attention",
-]
-src = [
-    "cuda-utils/cuda_utils.h",
-    "paged-attention/attention/attention_dtypes.h",
-    "paged-attention/attention/attention_generic.cuh",
-    "paged-attention/attention/attention_kernels.cuh",
-    "paged-attention/attention/attention_utils.cuh",
-    "paged-attention/attention/dtype_bfloat16.cuh",
-    "paged-attention/attention/dtype_float16.cuh",
-    "paged-attention/attention/dtype_float32.cuh",
-    "paged-attention/attention/dtype_fp8.cuh",
-    "paged-attention/attention/paged_attention_v1.cu",
-    "paged-attention/attention/paged_attention_v2.cu",
-    "paged-attention/cache_kernels.cu",
-    "paged-attention/cuda_compat.h",
-    "paged-attention/dispatch_utils.h",
-    "paged-attention/quantization/fp8/amd/quant_utils.cuh",
-    "paged-attention/quantization/fp8/nvidia/quant_utils.cuh",
 ]
 
 [kernel.paged_attention_metal]
@@ -58,14 +33,6 @@ src = [
     "paged-attention-metal/cache.mm",
     "paged-attention-metal/convert_fp8.mm",
     "paged-attention-metal/device.mm",
-]
-
-[kernel.cuda_utils]
-backend = "cuda"
-depends = []
-src = [
-    "cuda-utils/cuda_utils.h",
-    "cuda-utils/cuda_utils_kernels.cu",
 ]
 
 [kernel.paged_attention_rocm]
@@ -105,6 +72,14 @@ src = [
     "paged-attention/quantization/fp8/nvidia/quant_utils.cuh",
 ]
 
+[kernel.cuda_utils]
+backend = "cuda"
+depends = []
+src = [
+    "cuda-utils/cuda_utils.h",
+    "cuda-utils/cuda_utils_kernels.cu",
+]
+
 [kernel.cuda_utils_rocm]
 backend = "rocm"
 depends = ["torch"]
@@ -122,4 +97,30 @@ rocm-archs = [
 src = [
     "cuda-utils/cuda_utils.h",
     "cuda-utils/cuda_utils_kernels.cu",
+]
+
+[kernel.paged_attention]
+backend = "cuda"
+depends = ["torch"]
+include = [
+    "cuda-utils",
+    "paged-attention",
+]
+src = [
+    "cuda-utils/cuda_utils.h",
+    "paged-attention/attention/attention_dtypes.h",
+    "paged-attention/attention/attention_generic.cuh",
+    "paged-attention/attention/attention_kernels.cuh",
+    "paged-attention/attention/attention_utils.cuh",
+    "paged-attention/attention/dtype_bfloat16.cuh",
+    "paged-attention/attention/dtype_float16.cuh",
+    "paged-attention/attention/dtype_float32.cuh",
+    "paged-attention/attention/dtype_fp8.cuh",
+    "paged-attention/attention/paged_attention_v1.cu",
+    "paged-attention/attention/paged_attention_v2.cu",
+    "paged-attention/cache_kernels.cu",
+    "paged-attention/cuda_compat.h",
+    "paged-attention/dispatch_utils.h",
+    "paged-attention/quantization/fp8/amd/quant_utils.cuh",
+    "paged-attention/quantization/fp8/nvidia/quant_utils.cuh",
 ]

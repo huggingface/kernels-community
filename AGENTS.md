@@ -374,3 +374,141 @@ carry out the following steps:
 
 If the user did not specify the version tag, stop and ask which tag to sync
 from.
+
+## sage-attention
+
+This package mirrors the **SageAttention / SageAttention2 / SageAttention2++**
+CUDA stack from upstream. SageAttention3 (microscaling FP4 for consumer
+Blackwell, sm120/sm121) is deliberately **not** part of this kernel — it lives
+in its own directory. Note that SageAttention3 is *not* a datacenter-Blackwell
+kernel: its FP4 mainloop uses the warp-level `mma.sync ... kind::mxf4nvf4`
+instruction, which only exists on sm120/sm121. Datacenter Blackwell (sm100)
+drives FP4 through the unrelated CTA-level `tcgen05.mma` path instead, so it
+cannot run those kernels. When the user asks to sync a sage-attention release,
+carry out the following steps:
+
+- Fetch the upstream Git repository from https://github.com/thu-ml/SageAttention.git
+- Check out the tag or commit that the user specified. Note that upstream tags
+  lag `main` by a long way (the newest tag is `v2.2.0` while `main` carries
+  many later fixes), so syncing from `main` is usually what is wanted.
+- The mirrored upstream trees are:
+  - `csrc/` → `sage-attention/sage_attention/`
+  - `sageattention/*.py` (except `fa3_wrapper.py`) →
+    `sage-attention/torch-ext/sage_attention/`
+  - `sageattention/triton/` → `sage-attention/torch-ext/sage_attention/_triton/`
+    (**renamed**, see below)
+- The Triton modules are vendored verbatim, but the directory **must** be named
+  `_triton/`, not `triton/`. The builder flattens `torch-ext/sage_attention/*`
+  onto the top level of the build variant directory, and that directory is put
+  on `PYTHONPATH`; a top-level `triton/` there shadows the real Triton package,
+  so `import triton.language` inside the vendored kernels fails with
+  `ModuleNotFoundError`. Rewrite upstream's `from .triton.<x>` imports in
+  `core.py` to `from ._triton.<x>`. The module contents themselves need no
+  rewriting — they only import `torch`, `triton` and `math`. They back
+  `sageattn_qk_int8_pv_fp16_triton`, `sageattn_varlen` and the `sm86` dispatch
+  branch, so `torch-ext/sage_attention/core.py` should carry upstream's full set
+  of entry points. After a sync, check that the `def` list in `core.py` and the
+  `__all__` in `__init__.py` still match upstream's `core.py` and
+  `sageattention/__init__.py`.
+- Everything under `sageattention3_blackwell/` is out of scope, as are
+  `fa3_wrapper.py` (it needs an external `flash_attn_interface`), `bench/`,
+  `example/` and `setup.py`.
+- The CUDA sources otherwise track upstream byte-for-byte, so when syncing,
+  diff the upstream files against the local copies and re-apply only these
+  local porting changes:
+  - `<torch/extension.h>` and `<torch/python.h>` → `<torch/torch.h>`.
+  - Drop `PYBIND11_MODULE` blocks; ops are registered in
+    `torch-ext/torch_binding.cpp` instead.
+  - `qattn/attn_cuda_sm90.h` and `qattn/qk_int_sv_f8_cuda_sm90.cu`: rename
+    `qk_int8_sv_f8_accum_f32_attn_inst_buf` and
+    `qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf` to carry an `_sm90`
+    suffix. Upstream keeps the SM89 and SM90 kernels in separate extension
+    modules, but here every op shares one namespace and the SM89 kernels own
+    the un-suffixed names. `torch_binding.{h,cpp}` and `sm90_compile.py` must
+    use the suffixed names too.
+  - `qattn/qk_int_sv_f8_cuda_sm90.cu`: resolve `cuTensorMapEncodeTiled` at
+    runtime through `at::DynamicLibrary` rather than linking it, and include
+    `sage_attention/cuda_tensormap_shim.cuh` (a local file with no upstream
+    counterpart).
+  - `qattn/qk_int_sv_f8_cuda_sm89.cuh`: `<cuda_fp16.h>` stays commented out.
+  - `fused/fused.cu`: initialise `block_sum_val` to `0.0f`.
+- On the Python side, the modules dispatch through `._ops` instead of the
+  per-arch pybind extensions. Upstream's `@torch.library.custom_op` wrappers
+  are replaced by direct `ops.<name>` aliases plus `register_fake`
+  registrations. Never reintroduce upstream's fixed op namespaces
+  (`sageattention::`, `sageattention_sm89::`, `sageattention_sm90::`) — use
+  `add_op_namespace_prefix` from `._ops`.
+- `quant.py`: the bound `quant_per_block_int8_cuda` op takes an `sm_scale`
+  argument that upstream's `_fused` binding does not. Pass `1.0` when
+  quantizing K so no scaling is applied.
+- Keep `torch-ext/sage_attention/__init__.py` `__all__` in sync with the public
+  API surface.
+- Do not relax `[general.cuda] minver` in `build.toml`. The CUDA 12.6 toolkit
+  compiles the sm89 FP8 attention kernels but they fail at launch with
+  `cudaErrorLaunchFailure`; only the quantization ops survive. Building a
+  variant is therefore *not* enough to validate a toolkit — run
+  `nix run .#ciTests.<variant>` for each one.
+  
+## sage-blackwell
+
+This package mirrors **SageAttention3**, the microscaling FP4 attention stack
+that lives in `sageattention3_blackwell/` upstream. It is deliberately a
+separate kernel from `sage-attention`: the two share no source files, target
+different architectures, and upstream ships them as separate Python packages
+with their own `setup.py`. When the user asks to sync a sage-blackwell
+release, carry out the following steps:
+
+- Fetch the upstream Git repository from https://github.com/thu-ml/SageAttention.git
+- Check out the tag or commit that the user specified. Upstream tags lag `main`
+  by a long way (this kernel shares its upstream repository with
+  `sage-attention`), so syncing from `main` is usually what is wanted.
+- The mirrored upstream trees are:
+  - `sageattention3_blackwell/sageattn3/blackwell/` → `sage-blackwell/sage_blackwell/blackwell/`
+  - `sageattention3_blackwell/sageattn3/quantization/` → `sage-blackwell/sage_blackwell/quantization/`
+    (only `fp4_quantization_4d.cu` and `cuda_utils.h`; the empty `__init__.py`
+    is not needed)
+  - `sageattention3_blackwell/sageattn3/api.py` → `sage-blackwell/torch-ext/sage_blackwell/api.py`
+- `setup.py` and `README.md` are out of scope. Everything under `csrc/cutlass`
+  is a build-time clone upstream performs itself; here CUTLASS comes from the
+  `cutlass_4_5` builder dependency instead.
+- The CUDA sources track upstream byte-for-byte apart from these local porting
+  changes, so diff the upstream files against the local copies and re-apply
+  only these:
+  - `blackwell/api.cu`: `<torch/python.h>` + `<torch/nn/functional.h>` →
+    `<torch/all.h>`; `c10::optional<at::Tensor> &out_` →
+    `std::optional<at::Tensor> out_` (a Torch schema `Tensor?` cannot bind to a
+    mutable reference); drop the `PYBIND11_MODULE` block.
+  - `quantization/fp4_quantization_4d.cu`: drop `<torch/python.h>` and
+    `<torch/nn/functional.h>` (it already includes `<torch/all.h>`); drop the
+    `PYBIND11_MODULE` block.
+  - Every header in `blackwell/` and `quantization/cuda_utils.h` is copied
+    verbatim — if a sync produces a diff in one of them, that is an upstream
+    change, not a porting change.
+- Ops are registered in `torch-ext/torch_binding.cpp` instead of the two pybind
+  extensions (`fp4attn_cuda`, `fp4quant_cuda`). `mha_fwd` is bound under the op
+  name `fwd` to match upstream's `fp4attn_cuda.fwd`.
+- On the Python side, `api.py` replaces `import fp4attn_cuda` / `import
+  fp4quant_cuda` with `from .sm120_compile import fwd, scaled_fp4_quant,
+  scaled_fp4_quant_permute, scaled_fp4_quant_trans`, and the call sites lose
+  their `fp4attn_cuda.` / `fp4quant_cuda.` prefixes. `sm120_compile.py` is a
+  local file with no upstream counterpart: it aliases the ops from `._ops` and
+  carries the `register_fake` registrations, which must use
+  `add_op_namespace_prefix`. Never reintroduce a fixed op namespace.
+- Keep `torch-ext/sage_blackwell/__init__.py` `__all__` in sync with upstream's
+  `sageattn3/__init__.py` (currently just `sageattn3_blackwell`).
+- Do not widen `[kernel._fp4attn] cuda-capabilities` beyond `["12.0a"]`.
+  Upstream's `setup.py` also accepts `sm_100a` and `sm_121a`, but the kernel is
+  instantiated from `cute::SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4`,
+  which CUTLASS gates behind `CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED`
+  (sm_120a/sm_121a only), and `mha_fwd` rejects any device that is not sm_120
+  or sm_121 at runtime. `12.1` is not in kernel-builder's supported capability
+  list (`kernel-builder/src/cuda_supported_archs.json`), so sm_121 cannot be
+  targeted at all.
+- Do not relax `[general.cuda] minver`; upstream requires CUDA >= 12.8 for the
+  FP4 MMA and the `cvt.rn.satfinite.e2m1x2.f32` PTX in the quantizer.
+- `sageattn3_blackwell` subtracts the key mean in place (`k -= k.mean(...)`).
+  This is upstream behaviour and is preserved; the tests pass clones and the
+  README documents it. Do not "fix" it silently during a sync.
+
+If the user did not specify the version tag, stop and ask which tag to sync
+from.

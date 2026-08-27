@@ -1,6 +1,7 @@
 [general]
 name = "tinygrad-rms"
 version = 1
+edition = 5
 license = "MIT"
 backends = ["cuda"]
 

@@ -80,10 +80,24 @@ def test_security_only_plans_only_security():
 
 
 def test_read_backends_from_ref_uses_git_show():
+    # A ported kernel keeps build.toml in <kernel>/src, so that path is tried first.
     run = mock.Mock(return_value=mock.Mock(stdout='backends = ["cuda", "rocm"]\n'))
     with mock.patch.object(dispatch.subprocess, "run", run):
         backends = dispatch.read_backends("somekernel", ref="abc123")
     assert backends == ["cuda", "rocm"]
+    assert run.call_args.args[0] == ["git", "show", "abc123:somekernel/src/build.toml"]
+
+
+def test_read_backends_from_ref_falls_back_to_flat_layout():
+    # Unported kernels have no <kernel>/src; the flat path must still resolve.
+    def fake_run(argv, **kwargs):
+        if argv[2].endswith("/src/build.toml"):
+            raise subprocess.CalledProcessError(128, argv)
+        return mock.Mock(stdout='backends = ["cuda"]\n')
+
+    run = mock.Mock(side_effect=fake_run)
+    with mock.patch.object(dispatch.subprocess, "run", run):
+        assert dispatch.read_backends("somekernel", ref="abc123") == ["cuda"]
     assert run.call_args.args[0] == ["git", "show", "abc123:somekernel/build.toml"]
 
 
@@ -252,7 +266,10 @@ def _discover_kernels():
     for name in sorted(os.listdir(REPO_ROOT)):
         if not dispatch.KERNEL_NAME_RE.match(name):
             continue
-        if os.path.exists(os.path.join(REPO_ROOT, name, "build.toml")):
+        # Ported kernels keep build.toml in <kernel>/src.
+        if os.path.exists(os.path.join(REPO_ROOT, name, "build.toml")) or os.path.exists(
+            os.path.join(REPO_ROOT, name, "src", "build.toml")
+        ):
             kernels.append(name)
     return kernels
 
