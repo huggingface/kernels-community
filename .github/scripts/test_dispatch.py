@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -314,6 +315,56 @@ def test_no_kernel_declares_an_unknown_backend(kernels):
             continue
         unknown = set(backends) - known
         assert unknown == set(), f"{kernel} declares unmapped backend(s): {unknown}"
+
+
+# Concurrency keys of the dispatch-triggered build workflows. These are workflow_dispatch
+# only, so `github.head_ref` is always empty: a group built from it collapses to
+# `github.run_id`, is unique per run, and silently disables `cancel-in-progress`.
+
+
+def _concurrency_group(workflow):
+    path = os.path.join(REPO_ROOT, ".github", "workflows", workflow)
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    for i, line in enumerate(lines):
+        if line != "concurrency:":  # top-level key, so no leading indent
+            continue
+        body = {}
+        for entry in lines[i + 1 :]:
+            if not entry.startswith("  "):
+                break
+            key, _, value = entry.strip().partition(": ")
+            body[key] = value
+        return body
+    raise AssertionError(f"{workflow} has no workflow-level concurrency block")
+
+
+def _declared_inputs(workflow):
+    path = os.path.join(REPO_ROOT, ".github", "workflows", workflow)
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    return set(re.findall(r"^      (\w+):$", text, flags=re.MULTILINE))
+
+
+@pytest.mark.parametrize("workflow", sorted(dispatch.WORKFLOWS["build"]))
+def test_build_workflow_concurrency_dedupes_per_pr_and_kernel(workflow):
+    body = _concurrency_group(workflow)
+    assert body.get("cancel-in-progress") == "true"
+
+    group = body["group"]
+    # Without the PR number the group cannot dedupe two dispatches for the same PR,
+    # and without the kernel name a build would cancel an unrelated kernel's build.
+    assert "inputs.pr_number" in group, group
+    assert "inputs.kernel_name" in group, group
+    # `head_ref` is only populated for pull_request/push events, which never reach here.
+    assert "github.head_ref" not in group, group
+
+    # A typo'd input silently renders empty, which would over-merge the group.
+    referenced = set(re.findall(r"inputs\.(\w+)", group))
+    assert referenced <= _declared_inputs(workflow), (
+        f"{workflow} concurrency group references undeclared input(s): "
+        f"{referenced - _declared_inputs(workflow)}"
+    )
 
 
 if __name__ == "__main__":
