@@ -3,7 +3,10 @@ name = "causal-conv1d"
 version = 1
 edition = 5
 license = "BSD-3-Clause"
-backends = ["cuda"]
+backends = [
+    "cuda",
+    "xpu",
+]
 
 [general.hub]
 repo-id = "kernels-community/causal-conv1d"
@@ -27,4 +30,16 @@ src = [
     "causal-conv1d/causal_conv1d.h",
     "causal-conv1d/causal_conv1d_update.cu",
     "causal-conv1d/static_switch.h",
+]
+
+[kernel.causal_conv1d_xpu]
+backend = "xpu"
+depends = ["torch"]
+include = ["causal-conv1d-xpu"]
+src = [
+    "causal-conv1d-xpu/causal_conv1d_xpu_bwd.cpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_common.hpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_fwd.cpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu.hpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_update.cpp",
 ]
