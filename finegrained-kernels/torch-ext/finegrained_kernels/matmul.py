@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -20,10 +22,10 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
-from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
+from .compat import FP8_DTYPE, is_sm10x, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
 from .recipes import normalize_global_scale, Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, is_mx, mx_scale_family, resolve_input_recipe, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_recipe
 from .swizzle import swizzle_mx_scales
-from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, maybe_act_quant
+from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant
 from .scales import apply_global_scale, mx_2d_scale_ptrs
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .tiles import (
@@ -1425,6 +1427,26 @@ def mx_dynamic_matmul(
         "B must be contiguous or a transposed view of a contiguous tensor, got strides "
         f"{tuple(B.stride())} for shape {tuple(B.shape)}"
     )
+    # cuBLAS block-scaled fast path — INSIDE the op so every caller gets it (dispatchers,
+    # direct op calls, prequantized-As callers) and so autograd keeps working: register_autograd
+    # hangs on this op and saves INPUTS, so the registered dgrad serves a scaled_mm forward
+    # unchanged. Measured 1.4-4.8x over the Triton kernel at every M (B200, 2026-08-27); a None
+    # falls through to the Triton launch exactly as before. Skipped under fake/meta propagation
+    # (the opaque op's fake impl runs this body with launches disabled — the shape-correct C
+    # allocation below is all fake mode needs).
+    from . import compat as _compat
+
+    if (
+        not gate and output_recipe is None and bias is None and not simulate_unfused
+        and not _compat._SKIP_LAUNCHES_MIRROR
+    ):
+        _smm = _torch_scaled_mm_2d(
+            A, B, As, Bs, input_recipe, a_global_scale, b_global_scale,
+            resolve_output_dtype(output_dtype, A, None),
+        )
+        if _smm is not None:
+            return [_smm]
+
     WEIGHT_VALUES_PER_BYTE = NIBBLES_PER_BYTE if B.dtype == torch.int8 else 1
 
     rows, K_b = B.shape
@@ -1756,6 +1778,116 @@ def mx_weight_only_matmul_2d(
         )
 
     return [C]
+
+
+# ── torch scaled_mm fast path (2D dense MX, Blackwell) ────────────────────────
+#
+# cuBLAS's block-scaled GEMM beats our Triton 2D kernel at EVERY measured M on the
+# quantized-activation MX recipes (B200, N=18432 K=6144, 200-trial tunes, 2026-08-27):
+#     mxfp8  M=16 3.42x   M=256 3.17x   M=1024 1.57x   M=4096 1.55x   M=8192 1.42x
+#     nvfp4  M=16 4.83x   M=256 4.15x   M=1024 2.48x   M=4096 1.81x   M=8192 1.80x
+# and its bf16 output is bit-identical to ours at every checked shape (same offline act
+# quant feeds both, fp32 accumulate). Only the M=1 swap-AB decode dispatch stays ahead
+# (18.4us vs ~33), so the route floor is M >= 2.
+#
+# Inductor refuses to lower scaled_mm with SWIZZLE_32_4_4 scales ("does not yet support
+# non-trivial swizzles" — repros/scaled_mm_swizzle_compile.py), so the call lives behind an
+# OPAQUE custom op: dynamo captures the op as a leaf and the real scaled_mm runs at runtime,
+# which serves compiled callers too. F.scaled_mm has no autograd formula while our ops carry
+# registered dgrads, so differentiating callers fall through to the Triton ops. CUDA-graph
+# capture is fine (measured under do_bench_cudagraph).
+
+_SCALED_MM_MIN_M = int(os.environ.get("FINEGRAINED_SCALED_MM_MIN_M", "2"))
+
+
+@torch.library.custom_op(add_op_namespace_prefix("scaled_mm_2d_mx"), mutates_args=())
+def _scaled_mm_2d_op(
+    Aq: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    g_a: torch.Tensor | None,
+    g_b: torch.Tensor | None,
+    recipe: str,
+) -> torch.Tensor:
+    """``F.scaled_mm`` behind an OPAQUE custom op. Inductor cannot lower scaled_mm with
+    SWIZZLE_32_4_4 scales (repros/scaled_mm_swizzle_compile.py), but it never has to: dynamo
+    captures this op as a leaf and the real call runs at runtime — so compiled callers get the
+    cuBLAS fast path too, not just eager ones."""
+    F = torch.nn.functional
+    ST, SW = F.ScalingType, F.SwizzleType
+    if recipe == "mxfp8":
+        return F.scaled_mm(
+            Aq, B.t(),
+            As.view(torch.float8_e8m0fnu), ST.BlockWise1x32,
+            Bs.view(torch.float8_e8m0fnu), ST.BlockWise1x32,
+            swizzle_a=SW.SWIZZLE_32_4_4, swizzle_b=SW.SWIZZLE_32_4_4,
+            output_dtype=torch.bfloat16,
+        )
+    one = torch.ones((), device=Aq.device, dtype=torch.float32)
+    FP4 = torch.float4_e2m1fn_x2
+    return F.scaled_mm(
+        Aq.view(FP4), B.view(FP4).t(),
+        [As.view(torch.float8_e4m3fn), one if g_a is None else g_a.reshape(()).float()],
+        [ST.BlockWise1x16, ST.TensorWise],
+        [Bs.view(torch.float8_e4m3fn), one if g_b is None else g_b.reshape(()).float()],
+        [ST.BlockWise1x16, ST.TensorWise],
+        swizzle_a=[SW.SWIZZLE_32_4_4, SW.NO_SWIZZLE],
+        swizzle_b=[SW.SWIZZLE_32_4_4, SW.NO_SWIZZLE],
+        output_dtype=torch.bfloat16,
+    )
+
+
+@_scaled_mm_2d_op.register_fake
+def _(Aq, As, B, Bs, g_a, g_b, recipe):
+    return Aq.new_empty(Aq.shape[0], B.shape[0], dtype=torch.bfloat16)
+
+
+def _smm_reject(reason):
+    if os.environ.get("FINEGRAINED_SCALED_MM_DEBUG"):
+        print(f"[scaled_mm route] rejected: {reason}", flush=True)
+    return None
+
+
+def _torch_scaled_mm_2d(A, B, As, Bs, input_recipe, a_global_scale, b_global_scale, out_dtype):
+    """The scaled_mm route, or ``None`` to take the Triton ops. Fires only where measured to
+    win AND where the semantics are identical: plain ungated GEMM, quantized activations in
+    the WEIGHT's recipe, SWIZZLE_32_4_4 weight scales (Blackwell scaled_mm rejects row-major
+    outright), bf16 out, eager, no grad."""
+    if os.environ.get("FINEGRAINED_DISABLE_SCALED_MM"):
+        return _smm_reject("env-disabled")
+    if not is_sm10x():
+        return _smm_reject("not-sm10x")
+    if not (hasattr(torch.nn.functional, "scaled_mm") and hasattr(torch.nn.functional, "ScalingType")):
+        return _smm_reject("no-F.scaled_mm")
+    recipe = weight_recipe(B, Bs)
+    if recipe not in ("mxfp8", "nvfp4") or input_recipe is None:
+        return _smm_reject("recipe/input_recipe")
+    # "weights" is the follow-the-weight sentinel; resolve it before comparing (the bench and
+    # the integrations both pass it)
+    if resolve_input_recipe(input_recipe, None, B, Bs) != recipe:
+        return _smm_reject("recipe-mismatch-after-resolve")
+    if Bs.ndim != 5:  # affine (row-major) scales: scaled_mm rejects them on Blackwell
+        return _smm_reject("affine-Bs")
+    if out_dtype is not torch.bfloat16:
+        return _smm_reject("out-dtype")
+    M = A.numel() // A.shape[-1]
+    group = 32 if recipe == "mxfp8" else 16
+    K = A.shape[-1] if As is None else (A.shape[-1] * (2 if recipe == "nvfp4" else 1))
+    if M < _SCALED_MM_MIN_M or K % group or B.shape[0] % 16:
+        return _smm_reject("shape/minM")
+    if As is not None and As.ndim != 5:
+        return _smm_reject("affine-As")  # pre-quantized activations must arrive with swizzled scales too
+    if recipe == "mxfp8":
+        Aq = A.reshape(M, K) if As is not None else None
+        if Aq is None:
+            Aq, As = mxfp8_act_quant(A.reshape(M, K), swizzled=True)
+    else:
+        Aq = A.reshape(M, K // 2) if As is not None else None
+        if Aq is None:
+            Aq, As = nvfp4_act_quant(A.reshape(M, K), swizzled=True, global_scale=a_global_scale)[:2]
+    out = _scaled_mm_2d_op(Aq, As, B, Bs, a_global_scale, b_global_scale, recipe)
+    return out.reshape(*A.shape[:-1], B.shape[0])
 
 
 def matmul_2d(
