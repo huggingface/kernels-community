@@ -7,7 +7,7 @@ backends = ["cuda"]
 
 [general.cuda]
 minver = "12.6"
-maxver = "13"
+maxver = "13.0"
 
 [general.hub]
 repo-id = "kernels-community/vllm-flash-attn3"
