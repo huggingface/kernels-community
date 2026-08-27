@@ -680,6 +680,45 @@ def packed_schedule_scope_pruner(min_bm: int = 128):
     return config_filter(ok)
 
 
+def weight_only_warp_spec_matched_mode_pruner():
+    """``early_config_prune`` for the weight-only grouped kernel's WARP_SPEC lowering wall
+    (Triton 3.7.1 ``TritonGPUOptimizePartitionWarps`` -> PassManager::run failed; the pass
+    cannot partition this loop when BOTH operand loads share a memory mode). Charted
+    2026-08-26 (48-cell forced-config matrix, BM 64 and 128 IDENTICAL — BM-independent):
+
+        CM          A/B modes   w4    w8    w16
+        dot         ptr/ptr     ok    ok    FAIL
+        dot         desc/desc   FAIL  FAIL  ok
+        dot_scaled  ptr/ptr     FAIL  FAIL  FAIL
+        dot_scaled  desc/desc   ok    FAIL  ok
+        MIXED modes (ptr/desc, desc/ptr): 24/24 ok at every warp count.
+
+    The non-monotone warp dependence (w16 rescues desc/desc dot but breaks ptr/ptr dot) marks
+    this as the pass's internal partition feasibility, not kernel source — the source is
+    identical across passing and failing cells. Two root-cause attempts on the sibling family
+    are refuted and recorded (block_dynamic_grouped_matmul_pruner); the kernel-side remedy is
+    to stop emitting configs the pass cannot lower. Cost in the wild: 19 dead compiles per
+    weight-only tune, and under inductor ONE failing config kills the whole torch.compile
+    cell instead of scoring inf — this fence is what recovers those cells."""
+
+    _BAD = {
+        ("dot", "pointer"): {16},
+        ("dot", "host_descriptor"): {4, 8},
+        ("dot_scaled", "pointer"): {4, 8, 16},
+        ("dot_scaled", "host_descriptor"): {8},
+    }
+
+    def ok(c, args):
+        if not c.kwargs.get("WARP_SPEC"):
+            return True
+        a, b = c.kwargs.get("A_MEMORY_MODE"), c.kwargs.get("B_MEMORY_MODE")
+        if a != b:  # mixed modes lower everywhere
+            return True
+        return c.num_warps not in _BAD.get((c.kwargs.get("COMPUTE_MODE"), a), set())
+
+    return config_filter(ok, when=lambda args: is_sm10x())
+
+
 def weight_only_swap_scope_pruner():
     """``early_config_prune`` binding the weight-only kernel's ``SWAP_AB`` axis to its one
     implemented arm: the CUDA-core reduce. Swap exists here to drop the MMA entirely — with
