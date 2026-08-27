@@ -174,7 +174,9 @@ def get_pull_request(api_base: str, token: str, issue_number: int):
 
 def merge_pull_request(api_base: str, token: str, issue_number: int):
     url = f"{api_base}/pulls/{issue_number}/merge"
-    _, body = github_api_request(url, token, method="PUT", data={})
+    _, body = github_api_request(
+        url, token, method="PUT", data={"merge_method": "squash"}
+    )
     return json.loads(body)
 
 
