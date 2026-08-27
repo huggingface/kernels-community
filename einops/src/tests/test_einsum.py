@@ -1,12 +1,20 @@
+__kernel_port_einops_root = None
+def __kernel_port_einops(module=""):
+    global __kernel_port_einops_root
+    if __kernel_port_einops_root is None:
+        __kernel_port_einops_root = __import__("kernels").get_kernel("kernels-community/einops", version=1)
+    root = __kernel_port_einops_root
+    if not module:
+        return root
+    return __import__("importlib").import_module(root.__name__ + "." + module)
+
 from typing import Any, Callable
-import kernels
-einops = kernels.get_kernel("kernels-community/einops", version=1)
-_compactify_pattern_for_einsum = einops.einops._compactify_pattern_for_einsum
-einsum = einops.einops.einsum
-EinopsError = einops.EinopsError
 from . import collect_test_backends
+_compactify_pattern_for_einsum, einsum, EinopsError = getattr(__kernel_port_einops("einops"), "_compactify_pattern_for_einsum"), getattr(__kernel_port_einops("einops"), "einsum"), getattr(__kernel_port_einops("einops"), "EinopsError")
 import numpy as np
 import pytest
+
+pytestmark = pytest.mark.kernels_ci
 import string
 
 
@@ -168,7 +176,6 @@ test_functional_cases = [
 ]
 
 
-@pytest.mark.kernels_ci
 def test_layer():
     for backend in collect_test_backends(layers=True, symbolic=False):
         if backend.framework_name in ["tensorflow", "torch", "oneflow", "paddle"]:
@@ -196,7 +203,6 @@ valid_backends_functional = [
 ]
 
 
-@pytest.mark.kernels_ci
 def test_functional():
     # Functional tests:
     backends = filter(lambda x: x.framework_name in valid_backends_functional, collect_test_backends())
@@ -232,7 +238,6 @@ def test_functional():
                 np.testing.assert_array_almost_equal(predicted_out_array, true_out_array, decimal=5)
 
 
-@pytest.mark.kernels_ci
 def test_functional_symbolic():
     backends = filter(
         lambda x: x.framework_name in valid_backends_functional, collect_test_backends(symbolic=True, layers=False)
@@ -265,7 +270,6 @@ def test_functional_symbolic():
                 np.testing.assert_array_almost_equal(predicted_out_data, expected_out_data, decimal=5)
 
 
-@pytest.mark.kernels_ci
 def test_functional_errors():
     # Specific backend does not matter, as errors are raised
     # during the pattern creation.

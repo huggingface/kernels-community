@@ -1,287 +1,74 @@
 recipe version=1
 
-// einops
-//
-// einops as a Hub kernel: the package is pure Python, so the manifest is
-// noarch and the port is a move plus the import rewrite that lets the package
-// be imported under whatever directory name the Hub loads it from.
-//
-// The test suite is derived from upstream too. Upstream's tests import einops
-// by name; the port rebinds those imports to the kernel loaded off the Hub and
-// marks each test for kernel CI. Everything else is upstream's.
-//
-// The flake is hand-written and lives at einops/, outside --out, so it
-// survives regeneration. Its `path = ./src` points kernel-builder at the
-// generated tree.
-//
-// Multi-line payloads below use KDL raw strings. KDL dedents them against the
-// closing delimiter, so every "\"\"\"# sits at column 0 and the payload keeps
-// the exact indentation it must match in the source.
-//
-//   kernel-port einops/port/port.kdl \
-//       --dir <einops checkout> --out einops/src
-
+// Pin the exact clean upstream tree this recipe transforms.
 source \
     repo="https://github.com/arogozhnikov/einops.git" \
     commit="ad2c8d67d08cbebb45e1aff2be21dc88635fc695"
 
+// Retain only the Python package and its upstream tests.
 prune keep="einops/**"
 
+// Lift upstream tests out of the package into the kernel test root.
 move \
     from="einops/tests" \
     to="tests"
+
+// Place the distributable package in the torch extension tree.
 move \
     from="einops" \
     to="torch-ext/einops"
 
+// Make package-internal imports work under the Hub-generated module name.
 relativize_imports \
     in="torch-ext/einops/**" \
-    package_root="torch-ext/einops" \
-    changes=7
-expect \
-    in="torch-ext/einops/**" \
-    find="from einops" \
-    count=0
+    package_root="torch-ext/einops"
 
-// array_api is a submodule upstream leaves out of the package init; the kernel
-// exposes it, since a Hub consumer cannot import einops.array_api by name.
-replace in="torch-ext/einops/__init__.py" count=1 \
-    find="from .packing import pack, unpack" \
-    with=#"""
-from .packing import pack, unpack
-from . import array_api
-"""#
+// Expose array_api because Hub consumers cannot import it by package name.
+ensure_import \
+    in="torch-ext/einops/__init__.py" \
+    from="." \
+    name="array_api"
 
-// The test suite imports the package by name; the kernel is loaded off the
-// Hub instead, so each import site is rebound to the loaded module.
+// Point imports of the former einops.tests package at the lifted tests.
+remap_module \
+    in="tests/{__init__,test_*}.py" \
+    from="einops.tests" \
+    to="tests"
 
-replace in="tests/__init__.py" count=1 \
-    find="from einops import _backends" \
-    with=#"""
-import kernels
-_einops = kernels.get_kernel("kernels-community/einops", version=1)
-_backends = _einops._backends
-"""#
+// Make imports between lifted test modules package-relative.
+relativize_imports \
+    in="tests/{__init__,test_*}.py" \
+    package_root="tests"
 
-// Upstream hard-fails when EINOPS_TEST_BACKENDS is unset. In kernel CI no one
-// sets it, so fall back to whichever frameworks actually import.
+// Resolve product imports through the locally built Hub kernel.
+kernelize_imports \
+    in="tests/{__init__,test_*}.py" \
+    package="einops" \
+    kernel="kernels-community/einops" \
+    version=1
 
-replace in="tests/__init__.py" count=1 \
-    find=#"""
-    if ENVVAR_NAME not in os.environ:
-        raise RuntimeError(f"Testing frameworks were not specified, env var {ENVVAR_NAME} not set")
-    parsed_backends = os.environ[ENVVAR_NAME].split(",")
-    _known_backends = find_names_of_all_frameworks()
-    for backend_name in parsed_backends:
-        if backend_name not in _known_backends:
-            raise RuntimeError(f"Unknown framework: {backend_name}")
+// Default to the two Kernel CI backends when upstream's env var is absent.
+replace in="tests/__init__.py" \
+    find=#"        raise RuntimeError(f"Testing frameworks were not specified, env var {ENVVAR_NAME} not set")"# \
+    with=#"        return ["torch", "numpy"]"#
 
-    return parsed_backends
-"""# \
-    with=#"""
-    if ENVVAR_NAME in os.environ:
-        parsed_backends = os.environ[ENVVAR_NAME].split(",")
-        _known_backends = find_names_of_all_frameworks()
-        for backend_name in parsed_backends:
-            if backend_name not in _known_backends:
-                raise RuntimeError(f"Unknown framework: {backend_name}")
-        return parsed_backends
-
-    # Auto-detect available frameworks.
-    available = []
-    for module, name in [("torch", "torch"), ("jax", "jax"), ("numpy", "numpy"), ("tensorflow", "tensorflow")]:
-        try:
-            __import__(module)
-            available.append(name)
-        except ImportError:
-            pass
-    return available
-"""#
-
-replace in="tests/test_einsum.py" count=1 \
-    find=#"""
-from einops.tests import collect_test_backends
-from einops.einops import _compactify_pattern_for_einsum, einsum, EinopsError
-"""# \
-    with=#"""
-import kernels
-einops = kernels.get_kernel("kernels-community/einops", version=1)
-_compactify_pattern_for_einsum = einops.einops._compactify_pattern_for_einsum
-einsum = einops.einops.einsum
-EinopsError = einops.EinopsError
-from . import collect_test_backends
-"""#
-
-replace in="tests/test_examples.py" count=1 \
-    find=#"""
-from einops import rearrange, parse_shape, reduce
-from einops.tests import is_backend_tested
-from einops.tests.test_ops import imp_op_backends
-"""# \
-    with=#"""
-import kernels
-einops = kernels.get_kernel("kernels-community/einops", version=1)
-rearrange = einops.rearrange
-parse_shape = einops.parse_shape
-reduce = einops.reduce
-from . import is_backend_tested
-from .test_ops import imp_op_backends
-"""#
-
-replace in="tests/test_layers.py" count=1 \
-    find=#"""
-from einops import rearrange, reduce, EinopsError
-from einops.tests import collect_test_backends, is_backend_tested, FLOAT_REDUCTIONS as REDUCTIONS
-"""# \
-    with=#"""
-import kernels
-einops = kernels.get_kernel("kernels-community/einops", version=1)
-rearrange = einops.rearrange
-reduce = einops.reduce
-EinopsError = einops.EinopsError
-from . import collect_test_backends, is_backend_tested
-from . import FLOAT_REDUCTIONS as REDUCTIONS
-"""#
-
-replace in="tests/test_layers.py" count=1 \
-    find="        from einops.layers.torch import Rearrange, Reduce, EinMix" \
-    with="        Rearrange, Reduce, EinMix = einops.layers.torch.Rearrange, einops.layers.torch.Reduce, einops.layers.torch.EinMix"
-
-replace in="tests/test_layers.py" count=1 \
-    find="        from einops.layers.keras import Rearrange, Reduce, EinMix, keras_custom_objects" \
-    with="        Rearrange, Reduce, EinMix, keras_custom_objects = einops.layers.keras.Rearrange, einops.layers.keras.Reduce, einops.layers.keras.EinMix, einops.layers.keras.keras_custom_objects"
-
-replace in="tests/test_layers.py" count=1 \
-    find="        from einops.layers.flax import EinMix, Reduce, Rearrange" \
-    with="        EinMix, Reduce, Rearrange = einops.layers.flax.EinMix, einops.layers.flax.Reduce, einops.layers.flax.Rearrange"
-
-replace in="tests/test_layers.py" count=2 \
-    find="    from einops.layers._einmix import _EinmixDebugger" \
-    with="    _EinmixDebugger = einops.layers._einmix._EinmixDebugger"
-
-// numpy 2 dropped in1d.
-
-replace in="tests/test_layers.py" count=1 \
+// Use the supported replacement for NumPy 2's removed in1d API.
+replace in="tests/test_layers.py" \
     find="numpy.in1d(grad, [0, 1])" \
     with="numpy.isin(grad, [0, 1])"
 
-replace in="tests/test_ops.py" count=1 \
-    find=#"""
-from einops import EinopsError
-from einops.einops import rearrange, reduce, repeat, _enumerate_directions
-from einops.tests import collect_test_backends, is_backend_tested, FLOAT_REDUCTIONS as REDUCTIONS
-"""# \
-    with=#"""
-import kernels
-einops = kernels.get_kernel("kernels-community/einops", version=1)
-EinopsError = einops.EinopsError
-rearrange = einops.einops.rearrange
-reduce = einops.einops.reduce
-repeat = einops.einops.repeat
-_enumerate_directions = einops.einops._enumerate_directions
-from . import collect_test_backends, is_backend_tested
-from . import FLOAT_REDUCTIONS as REDUCTIONS
-"""#
-
-replace in="tests/test_ops.py" count=1 \
-    find="    from einops._backends import TorchBackend, TensorflowBackend, TFKerasBackend, NumpyBackend" \
-    with=#"""
-    TorchBackend = einops._backends.TorchBackend
-    TensorflowBackend = einops._backends.TensorflowBackend
-    TFKerasBackend = einops._backends.TFKerasBackend
-    NumpyBackend = einops._backends.NumpyBackend
-"""#
-
-replace in="tests/test_other.py" count=1 \
-    find=#"""
-import einops
-import einops.layers
-import einops.parsing
-from einops._backends import AbstractBackend
-from einops.einops import rearrange, parse_shape, _optimize_transformation
-from einops.tests import collect_test_backends, is_backend_tested
-"""# \
-    with=#"""
-import kernels
-einops = kernels.get_kernel("kernels-community/einops", version=1)
-AbstractBackend = einops._backends.AbstractBackend
-rearrange = einops.einops.rearrange
-parse_shape = einops.einops.parse_shape
-_optimize_transformation = einops.einops._optimize_transformation
-from . import collect_test_backends, is_backend_tested
-"""#
-
-replace in="tests/test_other.py" count=1 \
-    find=#"""
-    from einops import repeat, reduce, pack, unpack, einsum
-    from einops._torch_specific import allow_ops_in_compiled_graph
-"""# \
-    with=#"""
-    repeat, reduce, pack, unpack, einsum = einops.repeat, einops.reduce, einops.pack, einops.unpack, einops.einsum
-    allow_ops_in_compiled_graph = einops._torch_specific.allow_ops_in_compiled_graph
-"""#
-
-replace in="tests/test_packing.py" count=1 \
-    find=#"""
-from einops import EinopsError, asnumpy, pack, unpack
-from einops.tests import collect_test_backends
-"""# \
-    with=#"""
-import kernels
-einops = kernels.get_kernel("kernels-community/einops", version=1)
-EinopsError = einops.EinopsError
-asnumpy = einops.asnumpy
-pack = einops.pack
-unpack = einops.unpack
-from . import collect_test_backends
-"""#
-
-replace in="tests/test_parsing.py" count=1 \
-    find=#"""
-from einops import EinopsError
-from einops.parsing import ParsedExpression, AnonymousAxis, _ellipsis
-"""# \
-    with=#"""
-import kernels
-einops = kernels.get_kernel("kernels-community/einops", version=1)
-EinopsError = einops.EinopsError
-ParsedExpression = einops.parsing.ParsedExpression
-AnonymousAxis = einops.parsing.AnonymousAxis
-_ellipsis = einops.parsing._ellipsis
-"""#
-
-// array_api is reached as an attribute of the loaded kernel (see the
-// __init__.py edit above), not as a submodule import.
-
-replace in="tests/**" count=4 \
-    find="    from einops import array_api as AA" \
-    with="    AA = einops.array_api"
-
-// Kernel CI selects tests by marker; upstream has none.
-
+// Select every upstream test module for the kernel CI suite.
 replace \
-    in="tests/**" \
-    count=63 \
-    find="\ndef test_" \
-    with="\n@pytest.mark.kernels_ci\ndef test_"
-
-expect \
-    in="torch-ext/einops/**" \
-    files=18
-expect \
-    in="tests/**" \
-    files=9
-// run_tests.py is upstream's standalone pip-install-and-run driver. Kernel CI
-// does not use it, so it is shipped verbatim and excluded from this check.
-expect \
-    in="tests/__init__.py" \
-    find="from einops" \
-    count=0
-expect \
     in="tests/test_*.py" \
-    find="from einops" \
-    count=0
+    find="import pytest" \
+    with="import pytest\n\npytestmark = pytest.mark.kernels_ci"
 
+// Keep pytest from collecting the imported doctest helper as a marked test.
+replace in="tests/test_other.py" \
+    find="from doctest import testmod" \
+    with="from doctest import testmod\ntestmod.__test__ = False"
+
+// Emit the noarch kernel manifest and supported runtime backends.
 manifest \
     name="einops" \
     version=1 \

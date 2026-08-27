@@ -1,27 +1,37 @@
+__kernel_port_einops_root = None
+def __kernel_port_einops(module=""):
+    global __kernel_port_einops_root
+    if __kernel_port_einops_root is None:
+        __kernel_port_einops_root = __import__("kernels").get_kernel("kernels-community/einops", version=1)
+    root = __kernel_port_einops_root
+    if not module:
+        return root
+    return __import__("importlib").import_module(root.__name__ + "." + module)
+
 from doctest import testmod
+testmod.__test__ = False
 
 import numpy
 import pytest
 
-import kernels
-einops = kernels.get_kernel("kernels-community/einops", version=1)
-AbstractBackend = einops._backends.AbstractBackend
-rearrange = einops.einops.rearrange
-parse_shape = einops.einops.parse_shape
-_optimize_transformation = einops.einops._optimize_transformation
+pytestmark = pytest.mark.kernels_ci
+
+einops = __kernel_port_einops()
+einops = __kernel_port_einops(); __kernel_port_einops("layers")
+einops = __kernel_port_einops(); __kernel_port_einops("parsing")
+AbstractBackend = getattr(__kernel_port_einops("_backends"), "AbstractBackend")
+rearrange, parse_shape, _optimize_transformation = getattr(__kernel_port_einops("einops"), "rearrange"), getattr(__kernel_port_einops("einops"), "parse_shape"), getattr(__kernel_port_einops("einops"), "_optimize_transformation")
 from . import collect_test_backends, is_backend_tested
 
 __author__ = "Alex Rogozhnikov"
 
 
-@pytest.mark.kernels_ci
 def test_doctests_examples():
     # tests docstrings, additionally
     testmod(einops.layers, raise_on_error=True, extraglobs=dict(np=numpy))
     testmod(einops.einops, raise_on_error=True, extraglobs=dict(np=numpy))
 
 
-@pytest.mark.kernels_ci
 def test_backends_installed():
     """
     This test will fail if some of backends are not installed or can't be imported
@@ -42,7 +52,6 @@ def test_backends_installed():
     assert len(errors) == 0, errors
 
 
-@pytest.mark.kernels_ci
 def test_optimize_transformations_numpy():
     print("Testing optimizations")
     shapes = [[2] * n_dimensions for n_dimensions in range(14)]
@@ -80,7 +89,6 @@ _IMPERATIVE_BACKENDS = collect_test_backends(symbolic=False, layers=False)
 x_np = numpy.zeros([10, 20, 30, 40])
 
 
-@pytest.mark.kernels_ci
 def test_parse_shape_imperative():
     for backend in _IMPERATIVE_BACKENDS:
         print("Shape parsing for ", backend.framework_name)
@@ -90,7 +98,6 @@ def test_parse_shape_imperative():
         assert parsed1 != dict(a=1, b=20, c=30, d=40) != parsed2
 
 
-@pytest.mark.kernels_ci
 def test_underscore():
     for backend in _IMPERATIVE_BACKENDS:
         parsed1 = parse_shape(x_np, "_ _ _ _")
@@ -98,7 +105,6 @@ def test_underscore():
         assert parsed1 == parsed2 == dict()
 
 
-@pytest.mark.kernels_ci
 def test_underscore_one():
     for backend in _IMPERATIVE_BACKENDS:
         parsed1 = parse_shape(x_np, "_ _ _ hello")
@@ -106,7 +112,6 @@ def test_underscore_one():
         assert parsed1 == parsed2 == dict(hello=40)
 
 
-@pytest.mark.kernels_ci
 def test_underscore_several():
     for backend in _IMPERATIVE_BACKENDS:
         parsed1 = parse_shape(x_np, "_ _ a1 a1a111a")
@@ -114,7 +119,6 @@ def test_underscore_several():
         assert parsed1 == parsed2 == dict(a1=30, a1a111a=40)
 
 
-@pytest.mark.kernels_ci
 def test_repeating():
     with pytest.raises(einops.EinopsError):
         parse_shape(x_np, "a a b b")
@@ -124,7 +128,6 @@ def test_repeating():
             parse_shape(backend.from_numpy(x_np), "a a b b")
 
 
-@pytest.mark.kernels_ci
 def test_ellipsis():
     for backend in _IMPERATIVE_BACKENDS:
         for shape, pattern, expected in [
@@ -146,7 +149,6 @@ def test_ellipsis():
             assert parsed1 == parsed2 == expected
 
 
-@pytest.mark.kernels_ci
 def test_parse_with_anonymous_axes():
     for backend in _IMPERATIVE_BACKENDS:
         for shape, pattern, expected in [
@@ -160,7 +162,6 @@ def test_parse_with_anonymous_axes():
             assert parsed1 == parsed2 == expected
 
 
-@pytest.mark.kernels_ci
 def test_failures():
     for backend in _IMPERATIVE_BACKENDS:
         # every test should fail
@@ -188,7 +189,6 @@ _SYMBOLIC_BACKENDS = [backend for backend in _SYMBOLIC_BACKENDS if backend.frame
 
 
 @pytest.mark.parametrize("backend", _SYMBOLIC_BACKENDS)
-@pytest.mark.kernels_ci
 def test_parse_shape_symbolic(backend):
     for shape in [
         [10, 20, 30, 40],
@@ -219,7 +219,6 @@ def test_parse_shape_symbolic(backend):
 
 
 @pytest.mark.parametrize("backend", _SYMBOLIC_BACKENDS)
-@pytest.mark.kernels_ci
 def test_parse_shape_symbolic_ellipsis(backend):
     for static_shape, shape, pattern, expected in [
         ([10, 20], [None, None], "...", dict()),
@@ -245,7 +244,6 @@ def test_parse_shape_symbolic_ellipsis(backend):
         assert out_shape == expected
 
 
-@pytest.mark.kernels_ci
 def test_is_float_type():
     backends = collect_test_backends(symbolic=False, layers=False)
     backends += collect_test_backends(symbolic=False, layers=True)
@@ -257,7 +255,6 @@ def test_is_float_type():
             assert backend.is_float_type(input) == is_float, (dtype, backend, input.dtype)
 
 
-@pytest.mark.kernels_ci
 def test_torch_compile():
     """
     Test ensures that allow_ops_in_compiled_graph allows compiling in a single graph
@@ -270,8 +267,8 @@ def test_torch_compile():
         pytest.skip()
     import torch
     from torch import nn
-    repeat, reduce, pack, unpack, einsum = einops.repeat, einops.reduce, einops.pack, einops.unpack, einops.einsum
-    allow_ops_in_compiled_graph = einops._torch_specific.allow_ops_in_compiled_graph
+    repeat, reduce, pack, unpack, einsum = getattr(__kernel_port_einops(), "repeat"), getattr(__kernel_port_einops(), "reduce"), getattr(__kernel_port_einops(), "pack"), getattr(__kernel_port_einops(), "unpack"), getattr(__kernel_port_einops(), "einsum")
+    allow_ops_in_compiled_graph = getattr(__kernel_port_einops("_torch_specific"), "allow_ops_in_compiled_graph")
 
     allow_ops_in_compiled_graph()
 
