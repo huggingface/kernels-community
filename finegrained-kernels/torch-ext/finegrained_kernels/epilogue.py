@@ -569,8 +569,9 @@ def gemm_epilogue(
     N_COLS: tl.constexpr = 0,  # >0 masks the column tail (2D dense N isn't BN-aligned); 0 = no mask
     CSDescriptor=0,  # SWIZZLE_32_4_4 requant-scale descriptor; read only under SWIZZLED_OUT (else dummy)
     CsGlobal=None,  # (1,) fp32 NVFP4 output global (the NEXT proj's provided input_scale); normalizes the requant, None folds out
-    GlobalScale=None,  # (E,)|(1,) fp32 NVFP4 accumulator global (g_a·g_b or the weight-only g_b); applied PRE-GLU, None folds out
+    GlobalScale=None,  # (E,)|(1,) fp32 NVFP4 weight global g_b; applied PRE-GLU, None folds out
     global_row=0,  # index into GlobalScale (expert id; 0 for the per-tensor 2D case)
+    GlobalScaleA=None,  # (1,) fp32 NVFP4 activation global g_a; multiplied in-register with GlobalScale
     PreAct=None,  # (M, 2N) pre-activation buffer; written iff not None — the GLU backward's Z
     stride_pa_m=0,
     stride_pa_n=0,
@@ -589,7 +590,7 @@ def gemm_epilogue(
     rows with ``tl.max``; else a real BM-row scatter (``out_row`` + ``row_mask``).
     ``COMPUTE_MODE``/``SWAP_AB`` orient the decode GLU/finalize (grouped passes ``"dot"``/no-swap,
     both no-ops there). Every arm is constexpr-pruned."""
-    acc = apply_global_scale(acc, GlobalScale, global_row)
+    acc = apply_global_scale(acc, GlobalScale, global_row, GlobalScaleA)
     if GATE:
         # Finalize + bias once, up here rather than inside the split: the gate|up bias belongs to
         # the pre-activation, so PreAct below has to see it too.

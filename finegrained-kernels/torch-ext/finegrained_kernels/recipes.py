@@ -107,32 +107,6 @@ def is_nvfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     )
 
 
-
-def combine_global_scales(
-    a_global_scale: torch.Tensor | None, b_global_scale: torch.Tensor | None, num_experts: int
-) -> torch.Tensor | None:
-    """The g_a · g_b product the MX kernels fold onto the accumulator (``AsBsGlobal`` at the kernel,
-    ``input_global_scale`` at the wrapper), broadcast to ``(num_experts,)`` (grouped/batched index it
-    per expert; the 2D op passes ``num_experts=1`` and reads it unindexed). Only the product matters
-    for the acc — ``a_global_scale`` alone is passed separately for the inline-quant arm. Both
-    operands' globals are calibrated/provided, never computed here; this just multiplies them.
-    ``None`` if neither operand has a global."""
-    if a_global_scale is None and b_global_scale is None:
-        return None
-    glob = (
-        b_global_scale if a_global_scale is None
-        else a_global_scale if b_global_scale is None
-        else a_global_scale * b_global_scale
-    )
-    if glob.numel() == 1 and num_experts > 1:
-        glob = glob.expand(num_experts)
-    assert glob.numel() == num_experts, (
-        f"global scale has {glob.numel()} elements, expected {num_experts} (per expert)"
-    )
-    return glob.contiguous()
-
-
-
 def is_preswizzled_mx(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     """A weight scale already in the SWIZZLE_32_4_4 layout, swizzled once at model load (the
     deployment contract — the same checkpoint feeds grouped prefill and batched decode with no
@@ -275,6 +249,8 @@ def normalize_global_scale(
     if num_experts == 1:
         assert g.numel() == 1, f"per-tensor global expected, got {tuple(g.shape)}"
         return g.reshape(1).float()
+    if g.numel() == 1:  # one per-tensor global shared by every expert: broadcast to the (E,) load
+        return g.reshape(1).float().expand(num_experts).contiguous()
     return normalize_per_expert_scale(g, num_experts).reshape(-1).float()
 
 

@@ -23,7 +23,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
 from .compat import FP8_DTYPE, is_sm10x, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
-from .recipes import normalize_global_scale, Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, is_mx, mx_scale_family, resolve_input_recipe, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_recipe
+from .recipes import normalize_global_scale, Epilogue, Quantization, e2m1_as_uint8, is_mx, mx_scale_family, resolve_input_recipe, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_recipe
 from .swizzle import swizzle_mx_scales
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant
 from .scales import apply_global_scale, mx_2d_scale_ptrs
@@ -690,7 +690,7 @@ def mx_dynamic_matmul_kernel(
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     CSDescriptor,  # SWIZZLE_32_4_4 requant-scale descriptor — written iff SWIZZLED_OUT (dummy else), like AS/BS
     AsGlobal,  # (1,) fp32 NVFP4 activation global g_a — SOLELY normalizes the inline raw-A quant (A/g_a); read iff not None
-    AsBsGlobal,  # (1,) fp32 NVFP4 combined global g_a·g_b — recovers on the accumulator (one multiply); read iff not None
+    AsBsGlobal,  # (1,) fp32 NVFP4 WEIGHT global g_b — recovers on the accumulator together with AsGlobal (in-register product); read iff not None
     CsGlobal,  # (1,) fp32 NVFP4 output global (next proj's provided input_scale); normalizes the requant; read iff not None
     # Shape
     M,
@@ -822,6 +822,7 @@ def mx_dynamic_matmul_kernel(
         COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, N_COLS=N, SWIZZLED_OUT=SWIZZLED_OUT,
         CSDescriptor=CSDescriptor, CsGlobal=CsGlobal,
         GlobalScale=AsBsGlobal,
+        GlobalScaleA=AsGlobal,
         global_row=0,
         Bias=Bias,
         stride_bias_e=stride_bias_e,
@@ -1497,7 +1498,7 @@ def mx_dynamic_matmul(
     else:
         act_quant = MX_ACT_QUANT[input_recipe]
     # NVFP4 accumulator correction: the g_a·g_b product folded onto the fp32 accumulator.
-    input_global_scale = combine_global_scales(a_global_scale, b_global_scale, 1)
+    input_global_scale = normalize_global_scale(b_global_scale, 1)  # g_b; g_a folds in-kernel
     # As given ⇒ A is already quantized (the routed-op parity: a pre-quantized activation + its
     # scales); else quantize raw A (offline above the M threshold, inline in the kernel below it).
     if As is not None:
@@ -1582,7 +1583,7 @@ def mx_dynamic_matmul(
             bias,
             CSDescriptor,
             a_global_scale,  # AsGlobal: g_a for the inline-quant arm (A/g_a)
-            input_global_scale,  # AsBsGlobal = g_a·g_b (acc)
+            input_global_scale,  # AsBsGlobal = g_b (acc; g_a folds in-kernel via AsGlobal)
             output_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
             M,
             N,

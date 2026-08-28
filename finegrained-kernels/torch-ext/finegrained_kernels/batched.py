@@ -24,7 +24,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
 from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
-from .recipes import Epilogue, Quantization, combine_global_scales, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_recipe
+from .recipes import Epilogue, Quantization, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_recipe
 from .epilogue import fused_glu
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
@@ -533,7 +533,7 @@ def mx_dynamic_matmul_batched_kernel(
     Cs,  # (S, N // SCALE_GROUP_K) UE8M0 output scale; written iff OUTPUT_RECIPE
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     AsGlobal,  # (1,) fp32 NVFP4 activation global g_a — SOLELY normalizes the inline raw-A quant (A/g_a); read iff not None
-    AsBsGlobal,  # (num_experts,) fp32 NVFP4 combined global g_a·g_b — recovers on the accumulator (one multiply); read iff not None
+    AsBsGlobal,  # (num_experts,) fp32 NVFP4 WEIGHT global g_b — recovers on the accumulator together with AsGlobal (in-register product); read iff not None
     CsGlobal,  # (1,) fp32 NVFP4 output global (next proj's provided input_scale); normalizes the requant; read iff not None
     ExpertIds,  # (S,) — which expert each routed row uses
     GatherIdx,  # (S,) int — batch_id -> source row of A; read only when not None
@@ -679,6 +679,7 @@ def mx_dynamic_matmul_batched_kernel(
         COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, FAKE_BATCH=True, N_COLS=N,
         CsGlobal=CsGlobal,
         GlobalScale=AsBsGlobal,
+        GlobalScaleA=AsGlobal,
         global_row=expert_id,
         Bias=Bias,
         stride_bias_e=stride_bias_e,
@@ -1450,7 +1451,9 @@ def mx_dynamic_matmul_batched(
         return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
 
     # NVFP4 accumulator correction: the per-expert g_a·g_b product folded onto the fp32 accumulator.
-    input_global_scale = combine_global_scales(a_global_scale, b_global_scale, B.shape[0])
+    # g_b per expert and g_a scalar go down SEPARATELY; the kernel multiplies them in-register
+    # (the old host-side g_a*g_b product was a torch launch per GEMM per call)
+    input_global_scale = normalize_global_scale(b_global_scale, B.shape[0])
     with device_context(a_u8.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(mx_dynamic_matmul_batched_kernel)[grid](
@@ -1463,7 +1466,7 @@ def mx_dynamic_matmul_batched(
             Cs,
             bias,
             a_global_scale,  # AsGlobal (1,): g_a for the inline-quant arm (A/g_a)
-            input_global_scale,  # AsBsGlobal = g_a·g_b (acc)
+            input_global_scale,  # AsBsGlobal = g_b per expert (acc; g_a folds in-kernel via AsGlobal)
             output_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
             expert_ids,
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)

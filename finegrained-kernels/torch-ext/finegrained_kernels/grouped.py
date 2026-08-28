@@ -23,7 +23,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
 from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, sm_count, tl_dtype
-from .recipes import normalize_global_scale, Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_recipe
+from .recipes import normalize_global_scale, Epilogue, Quantization, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_recipe
 from .tile_layout import build_tile_layout
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_swizzled_grouped, swizzle_grouped_mx_scales
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
@@ -759,7 +759,8 @@ def mx_dynamic_matmul_grouped_kernel(
     Cs,  # (S, N // SCALE_GROUP_K) row-major output scale; written iff OUTPUT_RECIPE and not SWIZZLED_OUT
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     CSDescriptor,  # SWIZZLE_32_4_4 output-scale descriptor; written iff SWIZZLED_OUT (dummy else), like AS/BS
-    AsBsGlobal,  # (num_experts,) fp32 NVFP4 combined global g_a·g_b — recovers on the accumulator (grouped A is pre-quantized by the wrapper, so no in-kernel g_a); read iff not None
+    AsGlobal,  # (1,) fp32 NVFP4 activation global g_a — multiplied onto the accumulator in-register (A is pre-quantized by the wrapper against it); read iff not None
+    AsBsGlobal,  # (num_experts,) fp32 NVFP4 WEIGHT global g_b — recovers on the accumulator together with AsGlobal; read iff not None
     CsGlobal,  # (1,) fp32 NVFP4 output global (next proj's provided input_scale); normalizes the requant; read iff not None
     GatherIdx,  # (S,) int32 — sorted position -> source row of A; read only when not None
     ScatterIdx,  # (S,) int32 — sorted position -> destination row of C; read only when not None
@@ -955,6 +956,7 @@ def mx_dynamic_matmul_grouped_kernel(
             CsGlobal=CsGlobal,
             N_COLS=N,  # mask the partial last N-tile's column tail (non-128 N; inert when N % BN == 0)
             GlobalScale=AsBsGlobal,
+            GlobalScaleA=AsGlobal,
             global_row=expert_id64,
             Bias=Bias,
             stride_bias_e=stride_bias_e,
@@ -1936,7 +1938,10 @@ def mx_dynamic_matmul_grouped(
     num_sms = sm_count(A.device.index)
     # NVFP4 accumulator correction: the per-expert g_a·g_b product folded onto the fp32 accumulator
     # (grouped A is pre-quantized, so the kernel needs only this product, never g_a alone).
-    input_global_scale = combine_global_scales(a_global_scale, b_global_scale, B.shape[0])
+    # g_b per expert and g_a scalar go down SEPARATELY; the kernel multiplies them in-register
+    # (the old host-side g_a*g_b product was a torch launch per GEMM per call)
+    input_global_scale = normalize_global_scale(b_global_scale, B.shape[0])
+    act_global_scale = None if a_global_scale is None else a_global_scale.reshape(1).float()
     # host TMA descriptor over the (E, 2N|N, K_bytes) view — a gate tile is one contiguous
     # 2*BN row span; the placeholder box is re-bound per tuned config by the pre_hook
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
@@ -1963,7 +1968,8 @@ def mx_dynamic_matmul_grouped(
             Cs,
             bias,
             CSDescriptor,
-            input_global_scale,  # AsBsGlobal = g_a·g_b (acc); grouped A pre-quantized so no in-kernel g_a
+            act_global_scale,  # AsGlobal = g_a (acc, in-register)
+            input_global_scale,  # AsBsGlobal = g_b per expert (acc)
             output_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)

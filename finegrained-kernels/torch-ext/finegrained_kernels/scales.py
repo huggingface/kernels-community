@@ -272,12 +272,17 @@ def load_mx_act_tile(
 
 
 @triton.jit
-def apply_global_scale(acc, GlobalScale, expert_id):
-    """Fold a per-expert (or per-tensor, ``expert_id=0``) fp32 global onto the fp32
-    accumulator — the second level of the NVFP4 two-level scales (``g_a·g_b`` for the
-    dynamic family, ``g_b`` alone for weight-only). ``None`` folds out at trace time."""
+def apply_global_scale(acc, GlobalScale, expert_id, GlobalScaleA=None):
+    """Fold the NVFP4 second-level globals onto the fp32 accumulator: ``GlobalScale`` is the
+    per-expert (or per-tensor, ``expert_id=0``) weight global ``g_b``, ``GlobalScaleA`` the
+    scalar activation global ``g_a``. Both multiply here, in-register, so the host never
+    materializes the ``g_a·g_b`` product — that product used to be a torch multiply per GEMM
+    per call (two ~2us launches on every NVFP4 two-level decode forward). Either ``None``
+    folds out at trace time."""
     if GlobalScale is not None:
         acc = acc * tl.load(GlobalScale + expert_id).to(tl.float32)
+    if GlobalScaleA is not None:
+        acc = acc * tl.load(GlobalScaleA).to(tl.float32)
     return acc
 
 
