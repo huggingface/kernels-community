@@ -1,6 +1,7 @@
 [general]
 name = "rmsnorm"
 version = 1
+edition = 5
 license = "Apache-2.0"
 backends = [
     "cpu",
@@ -12,6 +13,24 @@ repo-id = "kernels-community/rmsnorm"
 
 [torch]
 src = ["torch-ext/torch_binding.cpp"]
+
+[kernel.rmsnorm_cpu_avx512]
+backend = "cpu"
+cxx-flags = [
+    "-mfma",
+    "-fopenmp",
+    "-mf16c",
+    "-mavx512f",
+    "-mavx512bf16",
+    "-mavx512vl",
+]
+depends = ["torch"]
+include = ["rmsnorm_cpu"]
+src = [
+    "rmsnorm_cpu/rmsnorm_avx512.cpp",
+    "rmsnorm_cpu/rmsnorm_avx512.hpp",
+    "rmsnorm_cpu/cpu_types_avx512.hpp",
+]
 
 [kernel.rmsnorm_cpu]
 backend = "cpu"
@@ -81,22 +100,4 @@ src = [
     "rmsnorm_xpu/dpcpp/oneDNN/Runtime.cpp",
     "rmsnorm_xpu/dpcpp/oneDNN/Runtime.h",
     "rmsnorm_xpu/dpcpp/oneDNN/Utils.h",
-]
-
-[kernel.rmsnorm_cpu_avx512]
-backend = "cpu"
-cxx-flags = [
-    "-mfma",
-    "-fopenmp",
-    "-mf16c",
-    "-mavx512f",
-    "-mavx512bf16",
-    "-mavx512vl",
-]
-depends = ["torch"]
-include = ["rmsnorm_cpu"]
-src = [
-    "rmsnorm_cpu/rmsnorm_avx512.cpp",
-    "rmsnorm_cpu/rmsnorm_avx512.hpp",
-    "rmsnorm_cpu/cpu_types_avx512.hpp",
 ]
