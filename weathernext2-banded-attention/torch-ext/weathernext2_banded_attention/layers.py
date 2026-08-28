@@ -17,11 +17,26 @@ def _gather_neighbouring_blocks(states: torch.Tensor) -> torch.Tensor:
     return torch.cat([padded[:, :-2], padded[:, 1:-1], padded[:, 2:]], dim=3)
 
 
+def _banded_mask(attention_mask):
+    """The geometry's banded mask, as `[blocks, block, 3 * block]`, or None.
+
+    `masking_utils.create_bidirectional_mask` inserts a singleton head axis, so the mask
+    reaching the layer is `[blocks, 1, block, 3 * block]` under sdpa and eager. That is the
+    same mask, so the axis is dropped rather than treated as a different shape; without this
+    the guard rejects every mask the model actually produces and the kernel silently never
+    runs. A `BlockMask` from flex attention is not a tensor and is rejected here.
+    """
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.dtype != torch.bool:
+        return None
+    if attention_mask.ndim == 4 and attention_mask.shape[1] == 1:
+        attention_mask = attention_mask.squeeze(1)
+    return attention_mask if attention_mask.ndim == 3 else None
+
+
 def _is_banded(attention_mask, hidden_states) -> bool:
     """Is this the geometry's own banded mask, rather than one `masking_utils` expanded?"""
-    if not isinstance(attention_mask, torch.Tensor) or attention_mask.dtype != torch.bool:
-        return False
-    if attention_mask.ndim != 3:
+    attention_mask = _banded_mask(attention_mask)
+    if attention_mask is None:
         return False
     num_blocks, block_size, key_length = attention_mask.shape
     return (
@@ -78,10 +93,11 @@ class WeatherNext2Attention(nn.Module):
         key = self.k_proj(hidden_states).view(hidden_shape).transpose(2, 3)
         value = self.v_proj(hidden_states).view(hidden_shape).transpose(2, 3)
 
+        banded = _banded_mask(attention_mask)
         if _is_banded(attention_mask, hidden_states) and not _needs_grad(query, key, value):
             # The kernel walks the three neighbouring blocks itself, so the keys and values are
             # never tripled and the mask is never expanded.
-            attn_output = banded_attention(query.float(), key.float(), value.float(), attention_mask, self.scaling)
+            attn_output = banded_attention(query.float(), key.float(), value.float(), banded, self.scaling)
         else:
             attn_output = _reference_attention(query, key, value, attention_mask, self.scaling)
 
