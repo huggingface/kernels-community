@@ -524,6 +524,24 @@ class _Experts:
 # ── MoE impl arms: each returns a no-arg closure computing the full forward ──
 
 
+def _interleave_rows(t):
+    """``[gate rows; up rows]`` -> ``[g0, u0, g1, u1, ...]`` along dim -2; a scale grid follows the
+    same rule at its own row count (128x128 block scales per 128-row block, MX per row). Byte-level
+    for 1-byte float8 dtypes."""
+    if t is None:
+        return None
+    byte_view = t.element_size() == 1 and t.dtype.is_floating_point
+    src = t.view(torch.uint8) if byte_view else t
+    n = src.shape[-2] // 2
+    out = torch.stack((src[..., :n, :], src[..., n:, :]), dim=-2).reshape(src.shape)
+    return out.view(t.dtype) if byte_view else out
+
+
+def _interleave_gate_up(gu, gus):
+    """The bench's gate|up is stacked; the finegrained-kernels arms read it interleaved."""
+    return _interleave_rows(gu), _interleave_rows(gus)
+
+
 def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     """``recipe`` sets the activation precision; None follows the weight recipe
     (mxfp4/nvfp4 -> the all-fp4 W4A4 chain, bf16 -> unquantized). dsv4 deploys
@@ -531,6 +549,7 @@ def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_
     pre-swizzled into SWIZZLE_32_4_4 so the forward takes the tcgen05 fast path."""
     fn = fgm.moe_fused_grouped if grouped else fgm.moe_fused_batched
     nvfp4_kw = _nvfp4_kwargs(cfg, hidden, gu, gus, gu_g)  # raw scales: before any preswizzle
+    gu, gus = _interleave_gate_up(gu, gus)  # our kernels read gate|up interleaved
     if _can_preswizzle(cfg):
         gus = _preswizzle_moe_scale(gus)   # fused gate GEMM reads the interleaved layout
         dns = _preswizzle_moe_scale(dns)
@@ -544,6 +563,7 @@ def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_
 def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     fn = fgm.moe_unfused_grouped if grouped else fgm.moe_unfused_batched
     nvfp4_kw = _nvfp4_kwargs(cfg, hidden, gu, gus, gu_g)  # raw scales: before any preswizzle
+    gu, gus = _interleave_gate_up(gu, gus)  # our kernels read gate|up interleaved
     if _can_preswizzle(cfg):
         # ONE checkpoint layout: gate_up scales are always the gate-interleaved artifact; the
         # unfused plain 2N GEMM reads it via the in-kernel INTERLEAVED_SCALES block remap.
@@ -577,6 +597,7 @@ def torch_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     ONCE (``_torch_preblock_weight_scale``) so the timed forward doesn't re-swizzle them each call;
     the per-expert NVFP4 global rides alongside."""
     nvfp4_kw = _nvfp4_kwargs(cfg, hidden, gu, gus, gu_g)
+    gu, gus = _interleave_gate_up(gu, gus)  # moe_torch_grouped shares our interleaved convention
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], recipe=_recipe(cfg),
               gate_up_proj_global_scale=gu_g, down_proj_global_scale=dn_g,
@@ -962,9 +983,8 @@ def megablocks_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     # the bench's gate|up is INTERLEAVED (gate at even rows, up at odd); megablocks wants the
     # [gate; up] halves, so de-interleave once, offline
     with torch.no_grad():
-        # the bench's gate|up is INTERLEAVED (gate even rows, up odd); the GLU MLP holds them as
-        # separate w1 (gate) and v1 (up) tensors, so de-interleave rather than stack
-        gate, up = gu[..., 0::2, :], gu[..., 1::2, :]
+        # the GLU MLP holds gate and up as separate w1/v1 tensors: split the stacked halves
+        gate, up = gu[..., :I, :], gu[..., I:, :]
         # every megablocks GLU buffer is [E*I, H]. gate/up already are (E, I, H), but the bench's
         # down is (E, H, I) — it must be TRANSPOSED, not reshaped: the element count matches either
         # way, so a bare reshape silently scrambles it (parity 1.4e+00, not a crash).
