@@ -6,7 +6,7 @@ license = "MIT"
 backends = ["metal"]
 
 [general.hub]
-repo-id = "mlx-rmsnorm/mlx-rmsnorm"
+repo-id = "kernels-community/mlx-rmsnorm"
 
 [torch]
 src = [
