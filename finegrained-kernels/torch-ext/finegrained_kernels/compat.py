@@ -413,13 +413,17 @@ def get_accelerator_autotuning_configs(
     #                     cell, so the axis is not emitted at the six batched sites
     num_warps = [8, 16] if is_xpu else [2, 4, 8, 16]
     num_stages = [2, 3, 4, 5, 6]
-    # XPU keeps a narrower span than CUDA (Xe-core tiles above 128 spill), but it must
-    # still carry 64: the grid is the ONLY source of tiles, so a single-valued span makes
-    # every N (or K) that is not a multiple of 128 unschedulable — e.g. N=320 raises
-    # "not a multiple of any BLOCK_SIZE_N in the autotune grid" before a config is ever
-    # benched. 64 divides the 320/576/1088-style shapes that 128 cannot.
-    bn_span = (64, 128) if is_xpu else (32, 64, 128, 256)
-    bk_span = (64, 128) if is_xpu else (64, 128, 256, 512)
+    # XPU narrows N but must keep values below 128: the grid is the ONLY source of tiles, so a
+    # span of just 128 makes every N that is not a multiple of 128 unschedulable (e.g. N=320
+    # raises "not a multiple of any BLOCK_SIZE_N in the autotune grid" before anything is
+    # benched). 32 is also the measured GATE winner — see gate_tile_cap_pruner, which pins it.
+    #
+    # K is NOT narrowed. The MX weight-scale tile is (n_width, BK//32) read at stride K//32, so
+    # each scale row costs a full cache line of which only BK//32 bytes are used — 4 of 64 at
+    # BK=128. Capping XPU at 128 cost 16% of MXFP8 decode on BMG; BK=256 wins, 512 loses to its
+    # larger tile, so the span keeps every value and lets the tuner choose.
+    bn_span = (32, 64, 128) if is_xpu else (32, 64, 128, 256)
+    bk_span = (64, 128, 256, 512)
 
     # no tuned tile -> one empty meta-dict (the tile comes from the launch kwargs)
     blocks = (
