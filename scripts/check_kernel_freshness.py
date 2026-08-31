@@ -24,6 +24,7 @@ KERNEL_SOURCE_MAPPING = {
     "flash-attn4": "https://github.com/Dao-AILab/flash-attention",
     "flash-mla": "https://github.com/deepseek-ai/FlashMLA",
     "fp8-fbgemm": "https://github.com/pytorch/FBGEMM",
+    "ggml-gated-delta-net": "https://github.com/ggml-org/llama.cpp",
     "gpt-oss-metal-kernels": "https://github.com/openai/gpt-oss",
     "layer-norm": "https://github.com/Dao-AILab/flash-attention",
     "mamba-ssm": "https://github.com/state-spaces/mamba",
