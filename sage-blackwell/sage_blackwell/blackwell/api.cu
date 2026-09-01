@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#include <torch/torch.h>
-#include <torch/nn/functional.h>
+#include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -208,7 +207,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
         const at::Tensor &sfv,
         const at::Tensor &delta_s,
         int unpadded_k,
-        c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
+        std::optional<at::Tensor> out_,              // batch_size x seqlen_q x num_heads x head_size
         const float softmax_scale,
         bool is_causal, 
         bool per_block_mean,

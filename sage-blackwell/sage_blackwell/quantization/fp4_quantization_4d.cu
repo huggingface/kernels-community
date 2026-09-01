@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 #include <torch/all.h>
-#include <torch/torch.h>
-#include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime_api.h>

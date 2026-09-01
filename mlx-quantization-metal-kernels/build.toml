@@ -1,6 +1,7 @@
 [general]
 name = "mlx-quantization-metal-kernels"
 version = 1
+edition = 5
 license = "MIT"
 backends = ["metal"]
 
