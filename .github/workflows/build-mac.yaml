@@ -328,5 +328,5 @@ jobs:
           REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
           BODY=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" --jq .body)
-          BODY=$(python3 .github/scripts/format_hub_upload_comment.py --base "$BODY" "$KERNEL" "$REPO_PREFIX" hub-uploads/**/*.json)
+          BODY=$(python3 .github/scripts/format_hub_upload_comment.py --base "$BODY" "$KERNEL" "$REPO_PREFIX" hub-uploads)
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" -f body="$BODY"
