@@ -1,10 +1,17 @@
 [general]
 name = "sage-attention"
-version = 2
+version = 3
+edition = 5
 license = "Apache-2.0"
 backends = ["cuda"]
+upstream = "https://github.com/thu-ml/SageAttention.git"
 
 [general.cuda]
+# CUDA 12.6 toolkit compiles the sm89 FP8 attention kernels
+# but they die at launch with cudaErrorLaunchFailure (verified on an L4 --
+# 20/32 tests fail on cu126, all pass on cu130/cu132). This matches upstream's
+# CUDA >= 12.8 note for pv_accum_dtype="fp32+fp16", which is the path
+# sageattn() selects on sm89/sm120/sm121. Do not lower without re-testing.
 minver = "12.8"
 
 [general.hub]
@@ -16,41 +23,11 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
-[kernel._fp4quant_sm100]
-backend = "cuda"
-cuda-capabilities = ["10.0a"]
-cuda-flags = [
-    "-O3",
-    "-std=c++17",
-    "-U__CUDA_NO_HALF_OPERATORS__",
-    "-U__CUDA_NO_HALF_CONVERSIONS__",
-    "-U__CUDA_NO_BFLOAT16_OPERATORS__",
-    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-    "-U__CUDA_NO_BFLOAT162_OPERATORS__",
-    "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
-    "--expt-relaxed-constexpr",
-    "--expt-extended-lambda",
-    "--use_fast_math",
-    "-DNDEBUG",
-    "-DEXECMODE=0",
-]
-cxx-flags = [
-    "-O3",
-    "-std=c++17",
-]
-depends = ["torch"]
-include = ["sage_attention/quantization"]
-src = [
-    "sage_attention/quantization/fp4_quantization_4d.cu",
-    "sage_attention/quantization/cuda_utils.h",
-]
-
 [kernel._qattn_sm89]
 backend = "cuda"
 cuda-capabilities = ["8.9"]
 cuda-flags = [
     "-O3",
-    "-std=c++17",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "--use_fast_math",
@@ -59,11 +36,9 @@ cuda-flags = [
     "-diag-suppress=174",
 ]
 cxx-flags = [
-    "-g",
     "-O3",
     "-fopenmp",
     "-lgomp",
-    "-std=c++17",
     "-DENABLE_BF16",
 ]
 depends = ["torch"]
@@ -86,7 +61,6 @@ backend = "cuda"
 cuda-capabilities = ["8.0"]
 cuda-flags = [
     "-O3",
-    "-std=c++17",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "--use_fast_math",
@@ -95,11 +69,9 @@ cuda-flags = [
     "-diag-suppress=174",
 ]
 cxx-flags = [
-    "-g",
     "-O3",
     "-fopenmp",
     "-lgomp",
-    "-std=c++17",
     "-DENABLE_BF16",
 ]
 depends = ["torch"]
@@ -108,58 +80,6 @@ src = [
     "sage_attention/qattn/qk_int_sv_f16_cuda_sm80.cu",
     "sage_attention/qattn/attn_cuda_sm80.h",
     "sage_attention/qattn/attn_utils.cuh",
-]
-
-[kernel._fp4attn_sm100]
-backend = "cuda"
-cuda-capabilities = ["10.0a"]
-cuda-flags = [
-    "-O3",
-    "-std=c++17",
-    "-U__CUDA_NO_HALF_OPERATORS__",
-    "-U__CUDA_NO_HALF_CONVERSIONS__",
-    "-U__CUDA_NO_BFLOAT16_OPERATORS__",
-    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-    "-U__CUDA_NO_BFLOAT162_OPERATORS__",
-    "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
-    "--expt-relaxed-constexpr",
-    "--expt-extended-lambda",
-    "--use_fast_math",
-    "--ptxas-options=--verbose,--warn-on-local-memory-usage",
-    "-lineinfo",
-    "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
-    "-DNDEBUG",
-    "-DQBLKSIZE=128",
-    "-DKBLKSIZE=128",
-    "-DCTA256",
-    "-DDQINRMEM",
-    "-DEXECMODE=0",
-]
-cxx-flags = [
-    "-O3",
-    "-std=c++17",
-]
-depends = [
-    "torch",
-    "cutlass_4_0",
-]
-include = ["sage_attention/blackwell"]
-src = [
-    "sage_attention/blackwell/api.cu",
-    "sage_attention/blackwell/block_info.h",
-    "sage_attention/blackwell/blockscaled_layout.h",
-    "sage_attention/blackwell/cute_extension.h",
-    "sage_attention/blackwell/epilogue_tma_ws.h",
-    "sage_attention/blackwell/kernel_traits.h",
-    "sage_attention/blackwell/kernel_ws.h",
-    "sage_attention/blackwell/launch.h",
-    "sage_attention/blackwell/mainloop_tma_ws.h",
-    "sage_attention/blackwell/named_barrier.h",
-    "sage_attention/blackwell/params.h",
-    "sage_attention/blackwell/softmax_fused.h",
-    "sage_attention/blackwell/static_switch.h",
-    "sage_attention/blackwell/tile_scheduler.h",
-    "sage_attention/blackwell/utils.h",
 ]
 
 [kernel._qattn]
@@ -171,7 +91,6 @@ cuda-capabilities = [
 ]
 cuda-flags = [
     "-O3",
-    "-std=c++17",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "--use_fast_math",
@@ -180,11 +99,9 @@ cuda-flags = [
     "-diag-suppress=174",
 ]
 cxx-flags = [
-    "-g",
     "-O3",
     "-fopenmp",
     "-lgomp",
-    "-std=c++17",
     "-DENABLE_BF16",
 ]
 depends = ["torch"]
@@ -210,7 +127,6 @@ cuda-capabilities = [
 ]
 cuda-flags = [
     "-O3",
-    "-std=c++17",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "--use_fast_math",
@@ -219,11 +135,9 @@ cuda-flags = [
     "-diag-suppress=174",
 ]
 cxx-flags = [
-    "-g",
     "-O3",
     "-fopenmp",
     "-lgomp",
-    "-std=c++17",
     "-DENABLE_BF16",
 ]
 depends = ["torch"]
@@ -238,7 +152,6 @@ backend = "cuda"
 cuda-capabilities = ["9.0a"]
 cuda-flags = [
     "-O3",
-    "-std=c++17",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "--use_fast_math",
@@ -247,11 +160,9 @@ cuda-flags = [
     "-diag-suppress=174",
 ]
 cxx-flags = [
-    "-g",
     "-O3",
     "-fopenmp",
     "-lgomp",
-    "-std=c++17",
     "-DENABLE_BF16",
 ]
 depends = ["torch"]
