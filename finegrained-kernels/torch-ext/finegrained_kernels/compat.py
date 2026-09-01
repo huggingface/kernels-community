@@ -167,14 +167,51 @@ def sm_count(device_index: int) -> int:
         ]
     except Exception:
         active_device = get_active_device_type()
+        if device_index is None:
+            # the triton path rejects a None index outright, so callers holding a bare
+            # torch.device (index None) land here; resolve it the way torch would
+            device_index = getattr(torch, active_device).current_device()
         if active_device == "cuda":
             return torch.cuda.get_device_properties(device_index).multi_processor_count
         elif active_device == "xpu":
-            return torch.xpu.get_device_properties(device_index).multi_processor_count
+            return torch.xpu.get_device_properties(device_index).gpu_subslice_count
         else:
             raise RuntimeError(
                 f"Unsupported device type {active_device} for sm_count; only cuda/xpu are supported."
             )
+
+
+@functools.lru_cache(maxsize=8)
+def persistent_program_count(device_index: int) -> int:
+    """Grid for the persistent grouped GEMMs, whose tile loop strides by a matching NUM_SMS
+    constexpr — the program count is a free parameter, not a shape.
+
+    One program per processor is CUDA sizing: an SM runs the whole CTA and hides latency
+    within it. An Xe-core does not — it holds several hardware threads per vector engine and
+    needs more than one work-group to fill them. Measured on Xe, BF16 MoE prefill: 2x is
+    1.6x faster than 1x (bit-identical output), and 4x and beyond give the win back."""
+    n = sm_count(device_index)
+    return n * 2 if get_active_device_type() == "xpu" else n
+
+
+@functools.cache
+def prefer_affine_mx_scales() -> bool:
+    """Whether the GROUPED MX GEMM should un-swizzle a pre-swizzled weight scale and read it
+    affine instead of taking the SWIZZLE_32_4_4 descriptor arm.
+
+    The swizzled arm is the tcgen05 fast path, but its layout pins the tile: BM == BN == 128
+    (``swizzled_scales_bm_pruner``) and BK a whole 4-group band, i.e. BK >= 128 for MX
+    (``swizzled_scale_config_pruner``). That corner is the tuner's ONLY option there, and on Xe
+    it is the wrong one -- a 128x128 tile at that BK already wants more operand staging than the
+    SLM has, where the CUDA parts the layout was designed for have substantially more. Measured
+    on Xe at BM=BN=128, prefill, with num_stages making no difference: BK 64 -> 128 costs 2.6x in
+    the grouped GEMMs and BK=256 costs 6x. Reading the scale affine gives BM/BN/BK back to the
+    tuner and is worth 2.77x on MXFP8 MoE prefill.
+
+    Decode is not affected: it goes through the batched kernel, whose scale leaf pointer-gathers
+    a sub-128 tile straight out of the swizzled buffer, so it keeps its small tiles (and the
+    swizzled layout is worth ~4% there). Only the grouped arm pays the pin."""
+    return get_active_device_type() == "xpu"
 
 
 
@@ -413,8 +450,17 @@ def get_accelerator_autotuning_configs(
     #                     cell, so the axis is not emitted at the six batched sites
     num_warps = [8, 16] if is_xpu else [2, 4, 8, 16]
     num_stages = [2, 3, 4, 5, 6]
-    bn_span = (128,) if is_xpu else (32, 64, 128, 256)
-    bk_span = (128,) if is_xpu else (64, 128, 256, 512)
+    # XPU narrows N but must keep values below 128: the grid is the ONLY source of tiles, so a
+    # span of just 128 makes every N that is not a multiple of 128 unschedulable (e.g. N=320
+    # raises "not a multiple of any BLOCK_SIZE_N in the autotune grid" before anything is
+    # benched). 32 is also the measured GATE winner — see gate_tile_cap_pruner, which pins it.
+    #
+    # K is NOT narrowed. The MX weight-scale tile is (n_width, BK//32) read at stride K//32, so
+    # each scale row costs a full cache line of which only BK//32 bytes are used — 4 of 64 at
+    # BK=128. Capping XPU at 128 cost 16% of MXFP8 decode on BMG; BK=256 wins, 512 loses to its
+    # larger tile, so the span keeps every value and lets the tuner choose.
+    bn_span = (32, 64, 128) if is_xpu else (32, 64, 128, 256)
+    bk_span = (64, 128, 256, 512)
 
     # no tuned tile -> one empty meta-dict (the tile comes from the launch kwargs)
     blocks = (
@@ -551,9 +597,8 @@ def sm_shared_memory_limit() -> int:
                 device_index
             ).shared_memory_per_block_optin
         elif dev == "xpu":
-            return torch.xpu.get_device_properties(
-                device_index
-            ).shared_memory_per_block_optin
+            # the SLM per work-group; what triton reports as max_shared_mem (verified equal)
+            return torch.xpu.get_device_properties(device_index).local_mem_size
         else:
             raise RuntimeError(
                 f"Unsupported device type {dev} for sm_shared_memory_limit; only cuda/xpu are supported."

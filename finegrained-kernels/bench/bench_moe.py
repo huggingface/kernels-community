@@ -284,7 +284,10 @@ if not (MOCK or REPLOT):
     triton_kernels_hub = get_kernel("kernels-community/gpt-oss-triton-kernels", version=1, trust_remote_code=True)
     _tfmx.triton_kernels_hub = triton_kernels_hub
 
-DEV = "cuda"
+DEV = "cuda" if torch.cuda.is_available() else "xpu"
+ACCEL = getattr(torch, DEV)  # torch.cuda / torch.xpu: synchronize(), get_device_name()
+# Level-Zero (Intel XPU) masks devices with ZE_AFFINITY_MASK, CUDA/ROCm with CUDA_VISIBLE_DEVICES.
+DEV_MASK_ENV = "CUDA_VISIBLE_DEVICES" if DEV == "cuda" else "ZE_AFFINITY_MASK"
 DECODE_TOKENS = 1
 PREFILL_TOKENS = 256 if SMOKE else 8192
 
@@ -294,6 +297,19 @@ PREFILL_TOKENS = 256 if SMOKE else 8192
 CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2"]
 
 MOE_PROBLEMS = {
+    # Scaled-down stand-in for the DeepSeek-V4 geometry (same recipe, /8 experts, /2 dims) so the
+    # MoE rows fit on a 32GB part: build() materializes the pre-quant weights in fp32, which needs
+    # ~16GB for a single E256 H4096 gate_up grid alone.
+    "small/DeepSeek-V4-shaped FP8 block-dyn W8A8 ue8m0 (E32 H2048 I1024 top6)": dict(
+        E=32, H=2048, I=1024, top_k=6, weights="fp8_128x128_ue8m0", recipe="weights",
+        baselines=("finegrained-fp8", "deepgemm"), fp8_block=[128, 128], block_size=(128, 128),
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "small/MiniMax-M3-shaped MXFP8 (E32 H2048 I1024 top4)": dict(
+        E=32, H=2048, I=1024, top_k=4, weights="mxfp8", recipe="weights",
+        baselines=("finegrained-fp8",), fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
+    ),
     "deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6)": dict(
         # config.json: fp8 e4m3, scale_fmt ue8m0, weight_block_size [128,128], dynamic acts.
         # Same expert geometry as the MXFP4 V4 row below — the difference is the deployed
@@ -344,6 +360,12 @@ MOE_PROBLEMS = {
 }
 # the same base-model roster, run as if dequantized to BF16 (one shape per model)
 BF16_PROBLEMS = {
+    "small/DeepSeek-V4-shaped BF16 (E32 H2048 I1024 top6)": dict(
+        E=32, H=2048, I=1024, top_k=6, weights="bf16", recipe="weights",
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
+        fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
     "deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6)": dict(
         E=256, H=4096, I=2048, top_k=6, weights="bf16", recipe="weights",
         baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
@@ -499,7 +521,11 @@ def _glu(gate, up, cfg):
 class _Experts:
     """Duck-typed experts module for the transformers-integration forwards
     (grouped_mm/batched_mm, SonicMoE, DeepGEMM): our (E, out, in) layout is their
-    ``is_transposed=False``; gate|up rows are stacked (concatenated), not interleaved."""
+    ``is_transposed=False``; gate|up rows are INTERLEAVED (gate on even rows, up on odd),
+    the same artifact the fused kernels read.
+
+    ``is_concatenated`` is inert here -- the integration forwards defer the split to
+    ``_apply_gate``, which this class overrides -- so the layout is expressed there."""
 
     def __init__(self, cfg, gu, dn, gus=None, dns=None):
         self.num_experts = cfg["E"]
@@ -517,7 +543,9 @@ class _Experts:
         self._cfg = cfg
 
     def _apply_gate(self, gate_up_out):
-        gate, up = gate_up_out.chunk(2, dim=-1)
+        # gate|up is interleaved, so the output columns are too: the default chunk(2)
+        # pairs the wrong halves and silently scrambles (parity 1.2e+00, cosine ~0).
+        gate, up = gate_up_out[..., 0::2], gate_up_out[..., 1::2]
         return _glu(gate, up, self._cfg).to(gate_up_out.dtype)
 
 
@@ -909,12 +937,9 @@ def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_
     # values are already on the E2M1 grid, so the round-trip is exact and both impls run
     # bit-identical weights (drawing fresh randn here made parity meaningless).
     dq = WEIGHTS[cfg["weights"]]["dequant"]
-    gu_stacked = dq(gu, gus).to(torch.bfloat16)  # (E, 2I, H) = [all gate rows; all up rows]
-    # GPT-OSS INTERLEAVES gate/up (modeling_gpt_oss: gate_up[..., ::2] / [..., 1::2]) while our
-    # layout stacks them — feeding stacked rows pairs the wrong halves in their SwiGLU.
-    gu_bf16 = torch.empty_like(gu_stacked)
-    gu_bf16[:, 0::2] = gu_stacked[:, :inter]
-    gu_bf16[:, 1::2] = gu_stacked[:, inter:]
+    # GPT-OSS interleaves gate/up (modeling_gpt_oss: gate_up[..., ::2] / [..., 1::2]) and so do
+    # we, so the (E, 2I, H) slab transfers as-is; remapping it here would scramble their SwiGLU.
+    gu_bf16 = dq(gu, gus).to(torch.bfloat16)
     dn_bf16 = dq(dn, dns).to(torch.bfloat16)
     for p in ("gate_up_proj", "down_proj", "gate_up_proj_bias", "down_proj_bias"):
         experts._parameters.pop(p, None)
@@ -1014,7 +1039,7 @@ def bench_modes(run, tag):
     res, out = {}, None
     try:
         out = run()
-        torch.cuda.synchronize()  # warm + tune before ANY timing/capture
+        ACCEL.synchronize()  # warm + tune before ANY timing/capture
         res["eager"] = do_bench(run, return_mode="min") * 1e3
         print(f"      {tag:14s} eager      {res['eager']:9.1f}us", flush=True)
     except Exception as e:
@@ -1029,7 +1054,7 @@ def bench_modes(run, tag):
     try:
         crun = torch.compile(run, mode="max-autotune", fullgraph=True)
         cout = crun()
-        torch.cuda.synchronize()
+        ACCEL.synchronize()
         # Self-check the compiled graph against THIS arm's own eager output before timing it.
         # The cross-impl parity below is computed from eager only, so without this a compiled
         # graph that drops work (e.g. an out-param matmul DCE'd because its mutation isn't
@@ -1250,7 +1275,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
     print()
 
 
-device_name = "MOCK (random values)" if MOCK else torch.cuda.get_device_name(0)
+device_name = "MOCK (random values)" if MOCK else ACCEL.get_device_name(0)
 print(f"device: {device_name}  torch {torch.__version__}"
       f"{'  [SMOKE]' if SMOKE else ''}")
 print("finegrained-kernels = local build; baselines: finegrained-fp8 (upstream), DeepGEMM, "
@@ -1415,7 +1440,7 @@ elif GPUS > 1 and _SHARD is None and not MOCK:
         raise SystemExit(f"BENCH_DEVICES lists {len(devices)} device(s) but GPUS={GPUS}")
     procs = [subprocess.Popen(
         [sys.executable, os.path.abspath(__file__)] + FILTERS,
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": devices[g] if devices else str(g),
+        env={**os.environ, DEV_MASK_ENV: devices[g] if devices else str(g),
              "BENCH_SHARD": f"{g}/{GPUS}", "GPUS": "1"}) for g in range(GPUS)]
     nfail = sum(p.wait() != 0 for p in procs)
     missing = [g for g, sp in enumerate(shard_paths) if not os.path.exists(sp)]

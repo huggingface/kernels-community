@@ -43,7 +43,7 @@ from .tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_finalize, acc_init, add_bias, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
+from .pruners import PATH_ANCHOR_AXES, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, gate_tile_cap_pruner, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
 
 
 @triton.jit
@@ -191,8 +191,9 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     those rows in the MMA M dim, padding the single token to the N=16 atom; column 0 of the
     ``[BN, 16]`` accumulator is the result. No-swap keeps the token in M (padded to 16).
 
-    ``GATE`` fuses the gate|up projection: ``B`` is the ``(E, 2N, K)`` stack (gate rows [0,N),
-    interleaved rows), run as two dots (the decode-validated form), SwiGLU-combined, and — under
+    ``GATE`` fuses the gate|up projection: ``B`` is the ``(E, 2N, K)`` gate|up weight with the
+    two projections INTERLEAVED per row (gate even, up odd — ``split_gate_up`` is the inverse),
+    run as two dots (the decode-validated form), SwiGLU-combined, and — under
     an ``OUTPUT_RECIPE`` — FP8-requantized into ``C`` + a per-(row, block) scalar ``Cs``. Every gate arm
     folds out at compile time; ``GATE=False`` is the plain GEMM, bit-identical."""
     batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row = expert_setup(
@@ -518,6 +519,7 @@ def _rebind_batched_mx_bs_descriptor(nargs):
     prune_configs_by={
         "early_config_prune": compose_pruners(
             mx_config_pruner("K", "N"), swizzled_scale_config_pruner(allow_gate_subblock=True), smem_pruner(),
+            gate_tile_cap_pruner(),
             dot_scaled_staging_pruner(),
         )
     },

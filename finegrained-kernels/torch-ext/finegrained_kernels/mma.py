@@ -44,7 +44,7 @@ def mx_dot_scaled(acc, a, a_scale, w, w_scale):
 def mx_dot_rescale(acc, a, w, a_scale, w_scale):
     """MX 'dot' path (BK == group): unpack MXFP4 weights to E4M3, fp8 ``tl.dot`` + per-group
     software rescale (decoding both UE8M0 scales internally), accumulating into ``acc`` (returned
-    updated). The batched gate_up kernel passes the stacked
+    updated). The batched gate_up kernel passes the interleaved
     gate|up tile (2*BN columns) — per-column independence keeps that bit-exact."""
     aq = e2m1_cols_to_e4m3(a) if a.dtype == tl.uint8 else a
     wq = e2m1_to_e4m3(w) if w.dtype == tl.uint8 else w
@@ -158,7 +158,7 @@ def mx_scalar_reduce(
     """MX 'scalar' path: CUDA-core FMA GEMV, unpacking MXFP4 weights to E4M3 then dequantizing
     activation + weight per-element by their expanded group scales, reducing and accumulating into
     ``acc`` (returned updated). No tensor core (so no M→16 MMA pad) — wins for the memory-bound
-    decode GEMV (M=1). The batched gate_up kernel passes the stacked gate|up tile (ROWS_W = 2*BN).
+    decode GEMV (M=1). The batched gate_up kernel passes the interleaved gate|up tile (ROWS_W = 2*BN).
 
     The UE8M0 scale is constant within each group of ``SCALE_GROUP_K``, so it factors out of the
     inner sum: instead of expanding it to every K element and doing ``BLOCK_SIZE_K`` scale-muls,
@@ -352,7 +352,7 @@ def mx_swap_compute(
     and ``dot`` (persistent ``[BLOCK_SIZE_N, MMA_N_ATOM]`` MMA acc, col 0 taken by the caller)
     and ``scalar`` (``[1, BLOCK_SIZE_N]`` reduce). The acc shapes diverge, but only the taken
     constexpr branch compiles so the single return never has to unify them. ``BLOCK_SIZE_N`` is the weight tile's row count — the gate_up kernel passes ``2*BN``
-    with its STACKED gate|up tile (gate rows first, split back via ``split_gate_up``): one
+    with its INTERLEAVED gate|up tile (gate on even rows, up on odd; split back via ``split_gate_up``): one
     load and one MMA for both projections keeps the native microscaled-MMA M=128 operand at BN=64, doubling
     the CTAs on the parallelism-starved decode grid (dsv4 gate_up 1.34x, bit-exact)."""
     # packed-E2M1 activations flatten to their BYTE length; the dot/scalar leaves
