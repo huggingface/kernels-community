@@ -254,7 +254,7 @@ def parallel_attn_bwd_tilelang(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
 
     # reuse Triton preprocess for delta (works with unpadded tensors)
-    from ...ops.attn.parallel import parallel_attn_bwd_preprocess
+    from .....ops.attn.parallel import parallel_attn_bwd_preprocess
     delta = parallel_attn_bwd_preprocess(o, do)
 
     # No padding on the last dim: TileLang T.copy auto-zero-fills OOB columns
