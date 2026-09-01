@@ -22,10 +22,11 @@ from ._ops import add_op_namespace_prefix
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
-from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, sm_count, tl_dtype
+from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, prefer_affine_mx_scales, tl_dtype
 from .recipes import normalize_global_scale, Epilogue, Quantization, combine_global_scales, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_recipe
 from .tile_layout import build_tile_layout
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_swizzled_grouped, swizzle_grouped_mx_scales
+from .swizzle import unswizzle_mx_scales_cached
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import expand_gather_below_parity, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
 from .tiles import (
@@ -1408,7 +1409,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     else:
         C = A.new_empty(S, N, dtype=output_dtype)
         Cs = None  # unread without an OUTPUT_RECIPE; strides literal below
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A, B.view(num_experts, 2 * N if gate else N, K)
     )
@@ -1547,7 +1548,7 @@ def w8a8_block_static_fp8_matmul_grouped(
     else:
         C = A.new_empty(S, N, dtype=output_dtype)
         Cs = None  # unread without an OUTPUT_RECIPE; strides literal below
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A_q, B.view(num_experts, 2 * N if gate else N, K)
     )
@@ -1671,7 +1672,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
         # post-quant: trade the in-kernel gather for one packed-row copy where that wins
         A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, num_experts)
     C = A.new_empty(S, N, dtype=output_dtype)
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A, B.view(num_experts, 2 * N if gate else N, K)
     )
@@ -1791,6 +1792,22 @@ def mx_dynamic_matmul_grouped(
     # (E4M3 = NVFP4 group-16, UE8M0 = MX group-32).
     swizzled_scales = Bs.ndim == 5
     scale_group = mx_scale_family(Bs, K)
+    # Backends where the swizzled arm's BM/BN/BK pin costs more than the layout saves read the
+    # scale affine instead: un-swizzle the artifact once (cached on the weight) and fall through
+    # as if the caller had passed row-major scales. One flag governs both operands, so the acts
+    # follow into the affine arm below -- which is why a caller-supplied 5D As (the fused down
+    # reading gate_up's swizzled requant output) has to keep the swizzled path. An expert stack
+    # un-swizzles per matrix, so it needs 128-row-aligned experts to split cleanly.
+    if (
+        swizzled_scales
+        and prefer_affine_mx_scales()
+        and n_rows % 128 == 0
+        and (As is None or As.ndim != 5)
+    ):
+        Bs = unswizzle_mx_scales_cached(
+            Bs, n_rows, K // scale_group, num_experts=num_experts
+        )
+        swizzled_scales = False
     if not swizzled_scales:
         assert Bs.shape == (num_experts, n_rows, K // scale_group), (
             f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {n_rows}, {K // scale_group})"
@@ -1931,7 +1948,7 @@ def mx_dynamic_matmul_grouped(
         Cs, CSDescriptor = cs_ret, None
     else:
         cs_ret, Cs, CSDescriptor = None, None, None  # unread (no OUTPUT_RECIPE)
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     # NVFP4 accumulator correction: the per-expert g_a·g_b product folded onto the fp32 accumulator
     # (grouped A is pre-quantized, so the kernel needs only this product, never g_a alone).
     input_global_scale = combine_global_scales(a_global_scale, b_global_scale, B.shape[0])
@@ -2052,7 +2069,7 @@ def full_precision_matmul_grouped(
 
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     C = A.new_empty(S, N, dtype=output_dtype)
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A, B.view(num_experts, 2 * N if gate else N, K)
     )
@@ -2143,7 +2160,7 @@ def mx_weight_only_matmul_grouped(
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     C = A.new_empty(S, N, dtype=output_dtype)
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     # Operand host-TMA descriptors (A over (S, K), B over the (E, 2N|N, K_bytes) weight view);
