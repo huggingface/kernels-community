@@ -1,11 +1,12 @@
 [general]
 name = "mlx-rmsnorm"
 version = 1
+edition = 5
 license = "MIT"
 backends = ["metal"]
 
 [general.hub]
-repo-id = "mlx-rmsnorm/mlx-rmsnorm"
+repo-id = "kernels-community/mlx-rmsnorm"
 
 [torch]
 src = [
