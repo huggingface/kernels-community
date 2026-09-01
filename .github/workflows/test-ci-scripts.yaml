@@ -22,6 +22,9 @@ on:
       # declared backends map to a known build workflow), so a kernel manifest
       # change can break this suite too.
       - "**/build.toml"
+      # test_dispatch.py asserts the concurrency keys of the build workflows, so a
+      # change to one of them can break this suite too.
+      - ".github/workflows/build*.yaml"
       - ".github/workflows/test-ci-scripts.yaml"
   push:
     branches: [main]
@@ -29,6 +32,7 @@ on:
       - ".github/scripts/**"
       - ".github/pr-labels.json"
       - "**/build.toml"
+      - ".github/workflows/build*.yaml"
       - ".github/workflows/test-ci-scripts.yaml"
   workflow_dispatch:
 

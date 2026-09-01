@@ -1,6 +1,7 @@
 [general]
 name = "deep-gemm"
 version = 2
+edition = 5
 license = "MIT"
 backends = ["cuda"]
 
