@@ -167,10 +167,14 @@ def sm_count(device_index: int) -> int:
         ]
     except Exception:
         active_device = get_active_device_type()
+        if device_index is None:
+            # the triton path rejects a None index outright, so callers holding a bare
+            # torch.device (index None) land here; resolve it the way torch would
+            device_index = getattr(torch, active_device).current_device()
         if active_device == "cuda":
             return torch.cuda.get_device_properties(device_index).multi_processor_count
         elif active_device == "xpu":
-            return torch.xpu.get_device_properties(device_index).multi_processor_count
+            return torch.xpu.get_device_properties(device_index).gpu_subslice_count
         else:
             raise RuntimeError(
                 f"Unsupported device type {active_device} for sm_count; only cuda/xpu are supported."
@@ -206,10 +210,7 @@ def prefer_affine_mx_scales() -> bool:
 
     Decode is not affected: it goes through the batched kernel, whose scale leaf pointer-gathers
     a sub-128 tile straight out of the swizzled buffer, so it keeps its small tiles (and the
-    swizzled layout is worth ~4% there). Only the grouped arm pays the pin.
-
-    Cached: the device type is fixed for the process, and this is read on the host path of
-    every grouped MX call — including on CUDA, where it always answers False."""
+    swizzled layout is worth ~4% there). Only the grouped arm pays the pin."""
     return get_active_device_type() == "xpu"
 
 
@@ -596,9 +597,8 @@ def sm_shared_memory_limit() -> int:
                 device_index
             ).shared_memory_per_block_optin
         elif dev == "xpu":
-            return torch.xpu.get_device_properties(
-                device_index
-            ).shared_memory_per_block_optin
+            # the SLM per work-group; what triton reports as max_shared_mem (verified equal)
+            return torch.xpu.get_device_properties(device_index).local_mem_size
         else:
             raise RuntimeError(
                 f"Unsupported device type {dev} for sm_shared_memory_limit; only cuda/xpu are supported."
