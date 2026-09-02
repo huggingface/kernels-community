@@ -21,9 +21,11 @@ import triton.language as tl
 from ._ops import add_op_namespace_prefix
 
 from triton.tools.tensor_descriptor import TensorDescriptor
+from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
-from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
+
+from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, decode_pdl
 from .recipes import Epilogue, Quantization, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_recipe
 from .epilogue import fused_glu
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide
@@ -180,6 +182,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     OUTPUT_RECIPE: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    PDL: tl.constexpr = False,
 ):
     """Block-scale batched FP8 expert matmul kernel.
 
@@ -195,6 +198,8 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     interleaved rows), run as two dots (the decode-validated form), SwiGLU-combined, and — under
     an ``OUTPUT_RECIPE`` — FP8-requantized into ``C`` + a per-(row, block) scalar ``Cs``. Every gate arm
     folds out at compile time; ``GATE=False`` is the plain GEMM, bit-identical."""
+    if PDL:
+        gdc_wait()
     batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row = expert_setup(
         A,
         B,
@@ -243,6 +248,8 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
             "pointer", "pointer", True, True, False,
         )
 
+    if PDL:
+        gdc_launch_dependents()
     gemm_epilogue(
         C, Cs, acc, out_row, pid_n, 0, out_row, 1, stride_c_n, stride_cs_m, stride_cs_n,
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, OUTPUT_RECIPE, BLOCK_K,
@@ -309,6 +316,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     OUTPUT_RECIPE: tl.constexpr = None,  # None | "fp8" (per-(row, block) requant of the intermediate)
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    PDL: tl.constexpr = False,
 ):
     """Block-scale batched FP8 expert matmul with a static (per-tensor) activation scale — the
     block-dynamic batched sibling (one program per routed token + N-tile, fake-batch decode,
@@ -317,6 +325,8 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     (``accumulate`` ``"static"``, ``FAKE_BATCH``), and the scalar activation scale multiplies the
     accumulator once after the loop. bf16 GLU output only (no fused requant). GATE=False is the plain GEMM."""
     a_s_static = tl.load(As)  # per-tensor static activation scale, applied post-loop
+    if PDL:
+        gdc_wait()
     batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row = expert_setup(
         A,
         B,
@@ -361,6 +371,8 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
         )
 
     acc = acc * a_s_static
+    if PDL:
+        gdc_launch_dependents()
     gemm_epilogue(
         C, Cs, acc, out_row, pid_n, 0, out_row, 1, stride_c_n, stride_cs_m, stride_cs_n,
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, OUTPUT_RECIPE, BLOCK_K,
@@ -420,6 +432,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SWAP_AB: tl.constexpr = False,
+    PDL: tl.constexpr = False,
 ):
     """Tensor-scale batched FP8 expert matmul kernel.
 
@@ -429,6 +442,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     ``SWAP_AB`` (tuner axis, M=1 decode): weight output rows in the MMA M dim (``B`` as ``[BN, BK]``,
     single token padded to N=16); column 0 of the ``[BN, 16]`` accumulator is the result. Both
     scales are per-token/per-tensor scalars, applied once after the loop, orientation-agnostic."""
+    if PDL:
+        gdc_wait()
     batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row = expert_setup(
         A,
         B,
@@ -472,6 +487,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     accumulator = add_bias(
         accumulator, Bias, stride_bias_e, stride_bias_n, expert_id, pid_n, BLOCK_SIZE_N
     )
+    if PDL:
+        gdc_launch_dependents()
     store_row(C, accumulator, pid_n, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
@@ -582,6 +599,7 @@ def mx_dynamic_matmul_batched_kernel(
     # single Bs pointer (+ BSDescriptor for the BN=128 bulk load); un-swizzled Bs takes the affine
     # arm in the same leaf. The op never swizzles — a 3D caller runs un-swizzled at no penalty.
     SWIZZLED_SCALES: tl.constexpr = False,
+    PDL: tl.constexpr = False,
 ):
     """Unified batched microscaled expert matmul (MXFP8/MXFP4/NVFP4, W4A8/W4A4) with
     fused act quant.
@@ -595,6 +613,8 @@ def mx_dynamic_matmul_batched_kernel(
     single token padded to N=16); column 0 of the ``[BN, 16]`` accumulator is the result. dot_scaled
     uses the swapped scaled-MMA; scalar reduces over K with the weight output-rows-major.
     """
+    if PDL:
+        gdc_wait()
     batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row = expert_setup(
         A,
         B,
@@ -672,6 +692,8 @@ def mx_dynamic_matmul_batched_kernel(
         )
 
     # NVFP4 two-level: block e4m3 scales rode through the reduce; recover the combined per-tensor
+    if PDL:
+        gdc_launch_dependents()
     gemm_epilogue(
         C, Cs, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, stride_cs_m, stride_cs_n,
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, OUTPUT_RECIPE, SCALE_GROUP_K,
@@ -749,11 +771,14 @@ def mx_weight_only_matmul_batched_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    PDL: tl.constexpr = False,
 ):
     """weight-only batched (decode) expert matmul: raw bf16 activations against MXFP4/MXFP8 weights upcast
     to bf16 in-loop (unpack + per-group group-scale), plain ``tl.dot``. One routed row + one N-tile
     per program (expert from ``ExpertIds``). Pointer/affine. ``SWAP_AB`` (tuner axis, M=1 decode):
     weight output rows lead the tile and the CUDA-core reduce replaces the MMA. ``GATE`` fuses gate|up."""
+    if PDL:
+        gdc_wait()
     batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row = expert_setup(
         A, B, C, Bs, ExpertIds, GatherIdx, ScatterIdx,
         stride_a_m, stride_b_e, stride_c_m, stride_bs_e, stride_eid, ADVANCE_BS=False,
@@ -809,6 +834,8 @@ def mx_weight_only_matmul_batched_kernel(
             SWAP_AB,
         )
 
+    if PDL:
+        gdc_launch_dependents()
     gemm_epilogue(
         C, None, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, 1, 1,
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
@@ -876,12 +903,15 @@ def full_precision_matmul_batched_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    PDL: tl.constexpr = False,
 ):
     """Full-precision batched expert matmul kernel: plain ``tl.dot`` over unquantized
     BF16/FP16 activations and weights, fp32 accumulation, no scales anywhere. ``GATE``
     computes gate|up as ONE stacked tile + dot (straight-line, both orientations) and
     applies the ``ACT_FN``/SwiGLU ``glu``. ``SWAP_AB`` (tuner axis, M=1 decode): weight
     output rows in the MMA M dim, the single token padded to the N=16 atom."""
+    if PDL:
+        gdc_wait()
     batch_id, pid_n, expert_id, A, B, C, _, in_row, out_row = expert_setup(
         A,
         B,
@@ -924,6 +954,8 @@ def full_precision_matmul_batched_kernel(
             "pointer", "pointer", False, False, False,
         )
 
+    if PDL:
+        gdc_launch_dependents()
     gemm_epilogue(
         C, None, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, 1, 1,
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
@@ -1095,6 +1127,8 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             OUTPUT_RECIPE=output_recipe,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+            PDL=decode_pdl(),
+            launch_pdl=decode_pdl(),
         )
 
     return [C, Cs] if requant else [C]
@@ -1221,6 +1255,8 @@ def w8a8_block_static_fp8_matmul_batched(
             OUTPUT_RECIPE=output_recipe,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+            PDL=decode_pdl(),
+            launch_pdl=decode_pdl(),
         )
 
     return [C, Cs] if requant else [C]
@@ -1302,6 +1338,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             bias_stride_n,
             expert_ids.stride(0),
             num_experts=num_experts,
+            PDL=decode_pdl(),
+            launch_pdl=decode_pdl(),
         )
 
     return C
@@ -1501,6 +1539,8 @@ def mx_dynamic_matmul_batched(
             OUTPUT_RECIPE=output_recipe,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+            PDL=decode_pdl(),
+            launch_pdl=decode_pdl(),
         )
     return [C, Cs] if requant else [C]
 
@@ -1582,6 +1622,8 @@ def full_precision_matmul_batched(
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+            PDL=decode_pdl(),
+            launch_pdl=decode_pdl(),
         )
 
     return [C]
@@ -1694,6 +1736,8 @@ def mx_weight_only_matmul_batched(
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+            PDL=decode_pdl(),
+            launch_pdl=decode_pdl(),
         )
 
     return [C]

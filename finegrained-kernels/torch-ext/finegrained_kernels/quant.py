@@ -16,6 +16,8 @@
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
+
 
 from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
@@ -463,6 +465,7 @@ def _mx_act_quant_kernel(
     NUM_EXPERTS_POW2: tl.constexpr = 1,  # always passed explicitly; see the dense launch
     BLOCK_K: tl.constexpr = 32,
     BLOCK_T: tl.constexpr = 32,
+    PDL: tl.constexpr = False,
 ):
     """One-pass activation quant, one launch per recipe (``mx_act_quant_inline`` does
     the math, so the offline and inline forms are bit-identical by construction): E4M3 +
@@ -482,6 +485,8 @@ def _mx_act_quant_kernel(
     SWIZZLE_32_4_4 layout the grouped GEMM reads affine (the inverse of ``load_swizzled_scale``)
     — no post-quant gather/swizzle pass. Padding-row scales are quantized zeros (harmless: the
     GEMM masks those rows' values to 0)."""
+    if PDL:
+        gdc_wait()
     kb = tl.program_id(1)
     if SWIZZLED:
         pid_m = tl.program_id(0)
@@ -522,6 +527,8 @@ def _mx_act_quant_kernel(
     y_row: tl.constexpr = K // (BLOCK_K // width)  # per-row element count of Y
     yo = kb * width + tl.arange(0, width)
     # values -> source row order (the swizzled grid scatters via the gathered in_row)
+    if PDL:
+        gdc_launch_dependents()
     tl.store(Y + in_row[:, None] * y_row + yo[None, :], y, mask=row_mask[:, None])
     if SWIZZLED:
         store_mx_act_scales(
@@ -586,6 +593,8 @@ def mx_act_quant_swizzled_grouped(
             SWIZZLED=True,
             GROUPED=True,
             NUM_EXPERTS_POW2=E,
+            PDL=decode_pdl(),
+            launch_pdl=decode_pdl(),
         )
     return y, s_sw, n_m_tiles
 
@@ -806,6 +815,8 @@ def _launch_act_quant(x, recipe, scale_group, scale_dtype, swizzled=False, globa
             # drops constexprs left to their default, and the arity mismatch that produces kills
             # the whole torch.compile launch ("launcher() missing 1 required positional argument")
             NUM_EXPERTS_POW2=1,
+            PDL=decode_pdl(),
+            launch_pdl=decode_pdl(),
         )
     return (values.view(torch.int8) if packed else values), scales
 
@@ -833,6 +844,7 @@ def _fp8_act_quant_block_dynamic_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_T: tl.constexpr,
     UE8M0: tl.constexpr = False,
+    PDL: tl.constexpr = False,
 ):
     """One-pass block-FP8 activation quant: rows → E4M3 + one ``amax/448`` scale per
     ``BLOCK_K`` span (fp32, or a UE8M0 exponent byte under ``UE8M0``). Grid
@@ -842,6 +854,8 @@ def _fp8_act_quant_block_dynamic_kernel(
     gives the loads something to coalesce. The span equals the consumer's ``BLOCK_SIZE_K``,
     so results are bit-exact with the inline quant. Arbitrary input strides (no host-side
     copy); ``BLOCK_K`` is fixed by the scale layout, ``BLOCK_T`` and warps are tuned."""
+    if PDL:
+        gdc_wait()
     pid_t = tl.program_id(0)
     kb = tl.program_id(1)
     rows = (pid_t * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int64)
@@ -854,6 +868,8 @@ def _fp8_act_quant_block_dynamic_kernel(
     ).to(tl.float32)
     y, s = fp8_act_quant_inline(x, UE8M0=UE8M0)
     tl.store(Y + rows[:, None] * K + offs[None, :], y, mask=row_mask[:, None])
+    if PDL:
+        gdc_launch_dependents()
     tl.store(S + rows * (K // BLOCK_K) + kb, s, mask=row_mask)
 
 
@@ -878,6 +894,8 @@ def fp8_act_quant_block_dynamic(
         compile_time_only_triton_wrap(_fp8_act_quant_block_dynamic_kernel)[grid](
             x, y, s, x.stride(0), x.stride(1), T, T.bit_length(),
             K=K, BLOCK_K=block_k, UE8M0=use_ue8m0,
+            PDL=decode_pdl(),
+            launch_pdl=decode_pdl(),
         )
     return y, s
 
@@ -888,8 +906,11 @@ def fp8_act_quant_block_dynamic(
 
 @triton.jit
 def _fp8_act_quant_kernel(
-    x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, PADDED_BLOCK: tl.constexpr
+    x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, PADDED_BLOCK: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
+    if PDL:
+        gdc_wait()
     # ``tl.arange`` needs a power-of-2 length, so iterate over PADDED_BLOCK (the next
     # power of 2) and mask the tail — lets block_size be non-power-of-2 (e.g. a full
     # row K=14336 in tensor-mode). Masked lanes load 0, which can't affect ``amax``.
@@ -901,6 +922,8 @@ def _fp8_act_quant_kernel(
     s = tl.max(tl.abs(x)) / 448.0  # float8_e4m3fn max
     y = (x / tl.maximum(s, 1e-12)).to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y, mask=mask)
+    if PDL:
+        gdc_launch_dependents()
     tl.store(s_ptr + pid, s)
 
 
@@ -924,6 +947,8 @@ def fp8_act_quant_tensor_wide(
             s,
             BLOCK_SIZE=block_size,
             PADDED_BLOCK=triton.next_power_of_2(block_size),
+            PDL=decode_pdl(),
+            launch_pdl=decode_pdl(),
         )
 
     return y, s

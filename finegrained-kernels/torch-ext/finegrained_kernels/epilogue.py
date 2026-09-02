@@ -16,6 +16,7 @@
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 
 from .compat import *  # noqa: F401,F403
@@ -286,12 +287,15 @@ def _glu_kernel(
     BLOCK: tl.constexpr,
     QUANT_GROUP: tl.constexpr = 128,
     UE8M0: tl.constexpr = False,
+    PDL: tl.constexpr = False,
 ):
     """Fused GLU over a contiguous (S, 2I) interleaved gate|up tensor -> (S, I), covering every
     ``apply_glu`` variant (silu/gelu/relu, ``SWIGLU_ALPHA``/``SWIGLU_LIMIT`` clamped-SwiGLU
     — ``None`` folds the arm out, the in-kernel ``glu``'s convention). Rounds through the
     output dtype after each op exactly where the torch chain does (each torch tensor op
     materializes), so the two are bit-identical."""
+    if PDL:
+        gdc_wait()
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n_out
     # gate|up columns alternate (gate 2j, up 2j+1) — the interleaved row order the GEMM emits
@@ -338,6 +342,8 @@ def _glu_kernel(
         if UE8M0:
             tl.store(QuantScales + soffs, (tl.log2(sc) + 127.0).to(tl.uint8), mask=smask)
         else:
+            if PDL:
+                gdc_launch_dependents()
             tl.store(QuantScales + soffs, sc, mask=smask)
 
 
@@ -370,6 +376,8 @@ def fused_glu(
                 compile_time_only_triton_wrap(_glu_kernel)[(triton.cdiv(n, 1024),)](
                     gate_up, q, sc, n, I, "silu", None, None, BLOCK=1024,
                     QUANT_GROUP=quant_group, UE8M0=use_ue8m0,
+                    PDL=decode_pdl(),
+                    launch_pdl=decode_pdl(),
                 )
             return q, sc
         from .quant import fp8_act_quant_block_dynamic  # deferred: module import order
@@ -382,7 +390,9 @@ def fused_glu(
         n = out.numel()
         with device_context(gate_up.device):
             compile_time_only_triton_wrap(_glu_kernel)[(triton.cdiv(n, 1024),)](
-                gate_up, out, None, n, I, act_fn, swiglu_alpha, swiglu_limit, BLOCK=1024
+                gate_up, out, None, n, I, act_fn, swiglu_alpha, swiglu_limit, BLOCK=1024,
+                PDL=decode_pdl(),
+                launch_pdl=decode_pdl(),
             )
         return out
     gate, up = gate_up[..., 0::2], gate_up[..., 1::2]
