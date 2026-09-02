@@ -553,6 +553,7 @@ def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_
     if _can_preswizzle(cfg):
         gus = _preswizzle_moe_scale(gus)   # fused gate GEMM reads the interleaved layout
         dns = _preswizzle_moe_scale(dns)
+    _mark_static(gu, gus, dns)  # derived closure tensors: unmarked, cudagraph trees re-copy them every compiled call
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], recipe=_recipe(cfg),
               gate_up_proj_global_scale=gu_g, down_proj_global_scale=dn_g,
@@ -569,6 +570,7 @@ def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, 
         # unfused plain 2N GEMM reads it via the in-kernel INTERLEAVED_SCALES block remap.
         gus = _preswizzle_moe_scale(gus)
         dns = _preswizzle_moe_scale(dns)
+    _mark_static(gu, gus, dns)  # derived closure tensors: unmarked, cudagraph trees re-copy them every compiled call
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], recipe=_recipe(cfg),
               gate_up_proj_global_scale=gu_g, down_proj_global_scale=dn_g,
