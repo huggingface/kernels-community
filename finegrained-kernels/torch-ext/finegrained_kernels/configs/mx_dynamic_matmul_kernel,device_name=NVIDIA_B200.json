@@ -1,0 +1,28 @@
+{
+ "[18432, 6144, 1, \"mxfp8\", true, false, null, false, \"A:torch.bfloat16\", \"As:torch.bfloat16\", \"B:torch.float8_e4m3fn\", \"Bs:torch.uint8\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"CSDescriptor:None\", \"AsGlobal:None\", \"AsBsGlobal:None\", \"CsGlobal:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_RECIPE:None\"]": {
+  "A_MEMORY_MODE": "pointer",
+  "BLOCK_SIZE_K": 512,
+  "BLOCK_SIZE_M": 1,
+  "BLOCK_SIZE_N": 32,
+  "B_MEMORY_MODE": "pointer",
+  "COMPUTE_MODE": "scalar",
+  "SWAP_AB": false,
+  "WARP_SPEC": false,
+  "num_ctas": 1,
+  "num_stages": 5,
+  "num_warps": 4
+ },
+ "[18432, 6144, 1, \"nvfp4\", true, false, null, false, \"A:torch.bfloat16\", \"As:torch.bfloat16\", \"B:torch.uint8\", \"Bs:torch.float8_e4m3fn\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"CSDescriptor:None\", \"AsGlobal:None\", \"AsBsGlobal:torch.float32\", \"CsGlobal:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_RECIPE:None\"]": {
+  "A_MEMORY_MODE": "pointer",
+  "BLOCK_SIZE_K": 512,
+  "BLOCK_SIZE_M": 1,
+  "BLOCK_SIZE_N": 32,
+  "B_MEMORY_MODE": "pointer",
+  "COMPUTE_MODE": "scalar",
+  "SWAP_AB": true,
+  "WARP_SPEC": false,
+  "num_ctas": 1,
+  "num_stages": 6,
+  "num_warps": 4
+ }
+}

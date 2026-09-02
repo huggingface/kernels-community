@@ -1,0 +1,26 @@
+{
+ "[4096, 128, 1, \"torch.bfloat16\", \"torch.float8_e4m3fn\", \"torch.uint8\"]": {
+  "BLOCK_T": 16,
+  "num_ctas": 1,
+  "num_stages": 3,
+  "num_warps": 2
+ },
+ "[4096, 128, 14, \"torch.bfloat16\", \"torch.float8_e4m3fn\", \"torch.uint8\"]": {
+  "BLOCK_T": 16,
+  "num_ctas": 1,
+  "num_stages": 3,
+  "num_warps": 4
+ },
+ "[7168, 128, 1, \"torch.bfloat16\", \"torch.float8_e4m3fn\", \"torch.float32\"]": {
+  "BLOCK_T": 16,
+  "num_ctas": 1,
+  "num_stages": 3,
+  "num_warps": 1
+ },
+ "[7168, 128, 14, \"torch.bfloat16\", \"torch.float8_e4m3fn\", \"torch.float32\"]": {
+  "BLOCK_T": 128,
+  "num_ctas": 1,
+  "num_stages": 3,
+  "num_warps": 8
+ }
+}

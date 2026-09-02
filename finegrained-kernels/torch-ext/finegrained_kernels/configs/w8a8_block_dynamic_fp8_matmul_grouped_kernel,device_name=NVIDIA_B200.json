@@ -1,0 +1,42 @@
+{
+ "[2048, 4096, 8, true, 128, 128, \"A:torch.float8_e4m3fn\", \"As:torch.uint8\", \"B:torch.float8_e4m3fn\", \"Bs:torch.uint8\", \"C:torch.float8_e4m3fn\", \"Cs:torch.uint8\", \"Bias:None\", \"GatherIdx:None\", \"ScatterIdx:None\", \"ExpertStart:torch.int32\", \"Schedule:torch.int32\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\"]": {
+  "A_MEMORY_MODE": "host_descriptor",
+  "BLOCK_SIZE_M": 128,
+  "B_MEMORY_MODE": "host_descriptor",
+  "PACKED_SCHEDULE": true,
+  "WARP_SPEC": true,
+  "num_ctas": 1,
+  "num_stages": 3,
+  "num_warps": 8
+ },
+ "[2048, 7168, 9, true, 128, 128, \"A:torch.float8_e4m3fn\", \"As:torch.float32\", \"B:torch.float8_e4m3fn\", \"Bs:torch.float32\", \"C:torch.float8_e4m3fn\", \"Cs:torch.float32\", \"Bias:None\", \"GatherIdx:None\", \"ScatterIdx:None\", \"ExpertStart:torch.int32\", \"Schedule:torch.int32\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\"]": {
+  "A_MEMORY_MODE": "host_descriptor",
+  "BLOCK_SIZE_M": 128,
+  "B_MEMORY_MODE": "host_descriptor",
+  "PACKED_SCHEDULE": true,
+  "WARP_SPEC": true,
+  "num_ctas": 1,
+  "num_stages": 4,
+  "num_warps": 8
+ },
+ "[4096, 2048, 8, false, 128, 128, \"A:torch.float8_e4m3fn\", \"As:torch.uint8\", \"B:torch.float8_e4m3fn\", \"Bs:torch.uint8\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"GatherIdx:None\", \"ScatterIdx:torch.int32\", \"ExpertStart:torch.int32\", \"Schedule:torch.int32\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_RECIPE:None\"]": {
+  "A_MEMORY_MODE": "host_descriptor",
+  "BLOCK_SIZE_M": 128,
+  "B_MEMORY_MODE": "host_descriptor",
+  "PACKED_SCHEDULE": true,
+  "WARP_SPEC": true,
+  "num_ctas": 1,
+  "num_stages": 4,
+  "num_warps": 8
+ },
+ "[7168, 2048, 9, false, 128, 128, \"A:torch.float8_e4m3fn\", \"As:torch.float32\", \"B:torch.float8_e4m3fn\", \"Bs:torch.float32\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"GatherIdx:None\", \"ScatterIdx:torch.int32\", \"ExpertStart:torch.int32\", \"Schedule:torch.int32\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_RECIPE:None\"]": {
+  "A_MEMORY_MODE": "host_descriptor",
+  "BLOCK_SIZE_M": 128,
+  "B_MEMORY_MODE": "host_descriptor",
+  "PACKED_SCHEDULE": true,
+  "WARP_SPEC": true,
+  "num_ctas": 1,
+  "num_stages": 4,
+  "num_warps": 8
+ }
+}
