@@ -70,6 +70,8 @@ KERNEL_SOURCE_MAPPING = {
     "nvfp4-gemm": "",
     # Developed in-house; upstream is a Hub kernel repo, not a GitHub project.
     "esmfold2-trimul": "",
+    # Written for this repo, so there is no upstream to track.
+    "weathernext2-banded-attention": "",
 }
 
 def parse_args() -> argparse.Namespace:
