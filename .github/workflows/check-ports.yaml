@@ -1,9 +1,14 @@
 name: Check Ports
 
 # A ported kernel's <kernel>/src is generated from <kernel>/port/port.kdl and
-# committed. Regenerate it here and fail if it drifted, so that a stale overlay
-# silently reverting an in-tree fix, a hand-edited build.toml field the manifest
-# op drops, or an overlay file edited without its generated twin are all loud.
+# committed. Regenerate it here and fail if the two disagree: a stale overlay
+# reverting an in-tree fix, a hand-edited build.toml field the manifest op
+# drops, an overlay file edited without its generated twin, or a recipe edited
+# without rerunning the port (src/port-provenance.json records the recipe hash,
+# so that case shows up as a diff in the provenance file).
+#
+# Pull requests only check the ports they touch; pushes to main and manual
+# runs check every port.
 on:
   push:
     branches: [main]
@@ -30,6 +35,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
@@ -37,7 +44,14 @@ jobs:
       # origin URL, HEAD and cleanliness of the checkout it is handed.
       - name: Regenerate every port and compare
         env:
-          # kernel-port still lives on the kernel-port-tool branch; point this at
-          # github:huggingface/kernels#kernel-port once that branch merges.
-          KERNEL_PORT: "nix run github:huggingface/kernels/kernel-port-tool#kernel-port --"
-        run: python3 scripts/check_ports.py
+          # TODO: kernel-port still lives on the kernel-port-tool branch, pinned
+          # to a rev so a push there cannot break every open PR. Point this at
+          # github:huggingface/kernels#kernel-port once the branch merges.
+          KERNEL_PORT: "nix run github:huggingface/kernels/c29a6751b5c699de555c98060fb26b4ef0e6b520#kernel-port --"
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            python3 scripts/check_ports.py --changed-since "$BASE_REF"
+          else
+            python3 scripts/check_ports.py
+          fi

@@ -6,17 +6,22 @@ A ported kernel is a directory holding `port/port.kdl`. The recipe generates
 script re-runs the port against a fresh upstream checkout at the pinned commit
 and fails if the result differs from what is committed.
 
-Without this, three failure modes are silent:
+Without this, four failure modes are silent:
 
   - an overlay file goes stale, so regenerating reverts a fix made in-tree
   - a build.toml field is edited by hand, and the manifest op drops it
   - an overlay file and its generated twin are edited independently and drift
+  - the recipe is edited without rerunning the port; src/port-provenance.json
+    records the recipe hash, so this shows up as a diff in that file
 
 Usage:
     python3 scripts/check_ports.py [kernel ...]
+    python3 scripts/check_ports.py --changed-since <ref>
 
-Defaults to every port found. Set KERNEL_PORT to override the runner command
-(e.g. "nix run github:huggingface/kernels#kernel-port --").
+Defaults to every port found. --changed-since limits the check to ports whose
+port/ or src/ tree differs from <ref>, which is what CI uses for pull requests.
+Set KERNEL_PORT to override the runner command (e.g. "nix run
+github:huggingface/kernels#kernel-port --").
 """
 
 import filecmp
@@ -45,6 +50,22 @@ def runner_cmd() -> list:
 
 def find_ports(root: Path) -> list:
     return sorted(p.parent.parent.name for p in root.glob("*/port/port.kdl"))
+
+
+def changed_ports(root: Path, ref: str) -> list:
+    """Ports whose port/ or src/ tree differs from `ref`."""
+    out = subprocess.run(
+        ["git", "diff", "--name-only", f"{ref}...HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    touched = set()
+    for line in out.splitlines():
+        parts = line.split("/")
+        if len(parts) >= 3 and parts[1] in ("port", "src"):
+            touched.add(parts[0])
+    return sorted(k for k in find_ports(root) if k in touched)
 
 
 def parse_source(recipe: Path) -> tuple:
@@ -96,7 +117,7 @@ def check(kernel: str, root: Path, workdir: Path) -> list:
     print(f"  {kernel}: {repo} @ {commit[:12]}")
 
     # One checkout per (repo, commit): two kernels may share an upstream.
-    src = workdir / f"upstream-{abs(hash((repo, commit)))}"
+    src = workdir / f"upstream-{commit[:12]}"
     if not src.exists():
         checkout(repo, commit, src)
 
@@ -116,7 +137,16 @@ def check(kernel: str, root: Path, workdir: Path) -> list:
 
 def main() -> int:
     root = Path.cwd()
-    kernels = sys.argv[1:] or find_ports(root)
+    args = sys.argv[1:]
+    if args[:1] == ["--changed-since"]:
+        if len(args) != 2:
+            raise SystemExit("usage: check_ports.py --changed-since <ref>")
+        kernels = changed_ports(root, args[1])
+        if not kernels:
+            print(f"No ported kernels changed since {args[1]}.")
+            return 0
+    else:
+        kernels = args or find_ports(root)
     if not kernels:
         print("No ported kernels found (no */port/port.kdl).")
         return 0
@@ -144,7 +174,9 @@ def main() -> int:
         print(
             "\nRegenerate with:\n"
             "  kernel-port <kernel>/port/port.kdl --dir <upstream> --out <kernel>/src\n"
-            "If an overlay file went stale, refresh it from <kernel>/src first.",
+            "If an overlay file went stale, refresh it from <kernel>/src first.\n"
+            "If only port-provenance.json differs, the recipe changed and the\n"
+            "port was not rerun.",
             file=sys.stderr,
         )
         return 1
