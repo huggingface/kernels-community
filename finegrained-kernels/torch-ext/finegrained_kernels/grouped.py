@@ -739,7 +739,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             swizzled_scales_bm_pruner(),
             swizzled_scale_config_pruner(),
             descriptor_box_pruner(),
-            smem_pruner(),
+            smem_pruner(min_sets=2),  # two full buffer sets: the grouped pipeline's floor (see smem_pruner)
             warp_spec_compile_guard_pruner(),
             affine_scale_warp_spec_pruner(),
         )
