@@ -1,3 +1,4 @@
+import importlib
 import itertools
 import math
 import os
@@ -24,8 +25,9 @@ from .test_util import (
 apply_rotary_emb = None
 
 flash_attn3 = kernels.get_kernel("kernels-community/flash-attn3", version=1)
-ops = flash_attn3._ops.ops
-add_op_namespace_prefix = flash_attn3._ops.add_op_namespace_prefix
+flash_attn3_ops = importlib.import_module("._ops", package=flash_attn3.__name__)
+ops = flash_attn3_ops.ops
+add_op_namespace_prefix = flash_attn3_ops.add_op_namespace_prefix
 
 flash_attn_combine = flash_attn3.flash_attn_combine
 flash_attn_func = flash_attn3.flash_attn_func
