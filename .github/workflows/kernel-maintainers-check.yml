@@ -1,32 +1,13 @@
 name: Kernel maintainers check
 
-# Every kernel directory must be listed in .github/kernel-maintainers.json --
-# under "kernels" (someone maintains it, and they get pinged when a PR touches
-# it) or under "unowned" (deliberately bare). The sweep is repo-wide, so a kernel
-# added by this PR is covered like any other.
-
-on:
-  pull_request:
-    paths:
-      - "**/build.toml"
-      - ".github/kernel-maintainers.json"
-      - ".github/scripts/kernel_maintainers.py"
-      - ".github/workflows/kernel-maintainers-check.yml"
+on: pull_request
 
 permissions:
   contents: read
 
-concurrency:
-  group: kernel-maintainers-check-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
   check:
-    name: Every kernel has maintainers or is explicitly unowned
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # Stdlib-only, needs 3.10+; the runner's python3 is enough.
-      - name: Check kernel ownership
-        run: python3 .github/scripts/kernel_maintainers.py check
+      - run: python3 .github/scripts/kernel_maintainers.py check
