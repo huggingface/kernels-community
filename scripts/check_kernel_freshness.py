@@ -26,6 +26,7 @@ KERNEL_SOURCE_MAPPING = {
     "fp8-fbgemm": "https://github.com/pytorch/FBGEMM",
     "ggml-attn": "https://github.com/ggml-org/llama.cpp",
     "ggml-gated-delta-net": "https://github.com/ggml-org/llama.cpp",
+    "ggml-norm": "https://github.com/ggml-org/llama.cpp",
     "ggml-quantization": "https://github.com/ggml-org/llama.cpp",
     "gpt-oss-metal-kernels": "https://github.com/openai/gpt-oss",
     "layer-norm": "https://github.com/Dao-AILab/flash-attention",
