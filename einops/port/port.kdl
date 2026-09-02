@@ -8,6 +8,9 @@ source \
 // Retain only the Python package and its upstream tests.
 prune keep="einops/**"
 
+// Drop upstream's pip-install test runner; it is not a test.
+delete in="einops/tests/run_tests.py"
+
 // Lift upstream tests out of the package into the kernel test root.
 move \
     from="einops/tests" \
