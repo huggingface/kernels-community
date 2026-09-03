@@ -1,0 +1,14 @@
+[general]
+name = "weathernext2-banded-attention"
+version = 1
+license = "Apache-2.0"
+# Pure Triton with no backend-specific code beyond the autotune sweep, so it builds for anything
+# Triton targets. Tested on CUDA (H100) and ROCm (gfx1150); XPU is untested.
+backends = ["cuda", "rocm", "xpu"]
+
+[general.hub]
+repo-id = "kernels-community/weathernext2-banded-attention"
+
+[torch-noarch]
+
+[kernel]
