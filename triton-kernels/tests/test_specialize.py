@@ -1,8 +1,14 @@
-import torch
 import importlib
-from triton_kernels.specialize import cacheable, specialize
+
+import kernels
+import torch
 import triton
 import triton.language as tl
+
+triton_kernels = kernels.get_kernel("kernels-community/triton-kernels", version=1)
+
+cacheable = triton_kernels.specialize.cacheable
+specialize = triton_kernels.specialize.specialize
 
 
 @triton.jit
