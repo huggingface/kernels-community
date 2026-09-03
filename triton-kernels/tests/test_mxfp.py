@@ -1,15 +1,18 @@
 import pytest
 import torch
 
-from triton_kernels.numerics_details.mxfp import (
-    DequantScaleRoundingMode,
-    downcast_to_mxfp,
-    downcast_to_mxfp_torch,
-    get_max_quant_val,
-    upcast_from_mxfp,
-    upcast_from_mxfp_torch,
-)
-from triton_kernels.testing import assert_close, assert_equal
+import kernels
+
+triton_kernels = kernels.get_kernel("kernels-community/triton-kernels", version=1)
+
+DequantScaleRoundingMode = triton_kernels.numerics_details.mxfp.DequantScaleRoundingMode
+downcast_to_mxfp = triton_kernels.numerics_details.mxfp.downcast_to_mxfp
+downcast_to_mxfp_torch = triton_kernels.numerics_details.mxfp.downcast_to_mxfp_torch
+get_max_quant_val = triton_kernels.numerics_details.mxfp.get_max_quant_val
+upcast_from_mxfp = triton_kernels.numerics_details.mxfp.upcast_from_mxfp
+upcast_from_mxfp_torch = triton_kernels.numerics_details.mxfp.upcast_from_mxfp_torch
+
+from .testing import assert_close, assert_equal
 
 
 def dtype_str_to_torch(dtype_str: str) -> torch.dtype:
