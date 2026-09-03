@@ -1,6 +1,11 @@
 import pytest
 import torch
-from triton_kernels.tensor_details.layout import BlackwellMXScaleLayout
+
+import kernels
+
+triton_kernels = kernels.get_kernel("kernels-community/triton-kernels", version=1)
+
+BlackwellMXScaleLayout = triton_kernels.tensor_details.layout.BlackwellMXScaleLayout
 
 # ------------------------------------------------------------
 # Torch tests

@@ -24,6 +24,10 @@ KERNEL_SOURCE_MAPPING = {
     "flash-attn4": "https://github.com/Dao-AILab/flash-attention",
     "flash-mla": "https://github.com/deepseek-ai/FlashMLA",
     "fp8-fbgemm": "https://github.com/pytorch/FBGEMM",
+    "ggml-attn": "https://github.com/ggml-org/llama.cpp",
+    "ggml-gated-delta-net": "https://github.com/ggml-org/llama.cpp",
+    "ggml-norm": "https://github.com/ggml-org/llama.cpp",
+    "ggml-quantization": "https://github.com/ggml-org/llama.cpp",
     "gpt-oss-metal-kernels": "https://github.com/openai/gpt-oss",
     "layer-norm": "https://github.com/Dao-AILab/flash-attention",
     "mamba-ssm": "https://github.com/state-spaces/mamba",
@@ -66,6 +70,8 @@ KERNEL_SOURCE_MAPPING = {
     "nvfp4-gemm": "",
     # Developed in-house; upstream is a Hub kernel repo, not a GitHub project.
     "esmfold2-trimul": "",
+    # Written for this repo, so there is no upstream to track.
+    "weathernext2-banded-attention": "",
 }
 
 def parse_args() -> argparse.Namespace:

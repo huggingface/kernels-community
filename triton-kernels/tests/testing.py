@@ -4,7 +4,14 @@ import os
 import subprocess
 import sys
 import torch
-from .numerics import MAX_FINITE_FLOAT8E4B8, MAX_FINITE_FLOAT8E4NV, MAX_FINITE_FLOAT8E5
+
+import kernels
+
+triton_kernels = kernels.get_kernel("kernels-community/triton-kernels", version=1)
+
+MAX_FINITE_FLOAT8E4B8 = triton_kernels.numerics.MAX_FINITE_FLOAT8E4B8
+MAX_FINITE_FLOAT8E4NV = triton_kernels.numerics.MAX_FINITE_FLOAT8E4NV
+MAX_FINITE_FLOAT8E5 = triton_kernels.numerics.MAX_FINITE_FLOAT8E5
 
 
 def assert_equal(ref, tri):
