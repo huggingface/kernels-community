@@ -891,6 +891,9 @@ def main(*, dry_run: bool = False):
         dispatch_upload = True
         dispatch_repo_prefix = "kernels-community"
 
+    # Commands that don't upload are PR-only.
+    dispatch_mode = "release" if dispatch_upload else "pr"
+
     mode_text = {
         "build": "build only",
         "security-and-build": "security audit + build",
@@ -1003,7 +1006,7 @@ def main(*, dry_run: bool = False):
             token=token,
             repo=repository,
             ref=default_branch,
-            mode="release",
+            mode=dispatch_mode,
             repo_prefix=dispatch_repo_prefix,
             dispatch_key_prefix=f"pr{issue_number}-",
             pr_number=dispatch_pr_number,
