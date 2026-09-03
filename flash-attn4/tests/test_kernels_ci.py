@@ -1,29 +1,3 @@
-# Smoke tests for the kernels-community CI runner (`nix run .#ci-test`, which
-# runs `pytest -m kernels_ci`).
-#
-# The rest of the suite is vendored from upstream: it sweeps thousands of shapes
-# under `tests/cute` and is written for Hopper and Blackwell. CI runs on an
-# `aws-g6-12xlarge-plus` runner -- an L4, compute capability 8.9 -- and
-# `_flash_attn_fwd` dispatches every `arch // 10 == 8` device to
-# `FlashAttentionForwardSm80`. That kernel is the only one reachable here, and
-# it covers a narrow slice of the interface:
-#
-#   - the backward pass asserts `arch // 10 in [9, 10, 11, 12]`;
-#   - SplitKV (`num_splits > 1`) and `learnable_sink` assert on SM 8.x;
-#   - `softcap` is lowered to a score_mod, which `FlashAttentionForwardSm80`
-#     does not implement;
-#   - GQA and sliding windows fail before the kernel launches.
-#
-# What is left -- and what this file covers -- is the plain forward pass: MHA in
-# fp16 and bf16, head dim 64 and 128, causal and non-causal, varlen, and the
-# log-sum-exp output. Each distinct case is one CuTe DSL compilation of roughly
-# two seconds. The compile cache key ignores batch size and sequence length, so
-# shapes vary freely between cases while the feature matrix stays small.
-#
-# The tests are deliberately standalone: the reference is plain PyTorch rather
-# than `flash_attn4.testing`, so a regression in the kernel's own helpers cannot
-# hide a regression in the kernel.
-
 import itertools
 import math
 
