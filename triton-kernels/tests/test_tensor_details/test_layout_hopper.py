@@ -28,8 +28,8 @@ cuda_capability_geq = triton_kernels.target_info.cuda_capability_geq
 @pytest.mark.parametrize("trans", [False, True])
 @pytest.mark.parametrize("mx_axis", [0, 1])
 @pytest.mark.parametrize("mma_version", [2, 3])
-def test_mxfp4_value_roundtrip(shape, trans, mx_axis, mma_version):
-    x = torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda")
+def test_mxfp4_value_roundtrip(shape, trans, mx_axis, mma_version, device):
+    x = torch.randint(0, 256, shape, dtype=torch.uint8, device=device)
     if trans:
         x = x.mT
     if x.shape[1 - mx_axis] < 32:
@@ -42,8 +42,8 @@ def test_mxfp4_value_roundtrip(shape, trans, mx_axis, mma_version):
 @pytest.mark.parametrize("mx_axis", [0, 1])
 @pytest.mark.parametrize("num_warps", [4, 8])
 @pytest.mark.parametrize("shape", [(256, 64), (256, 128), (256, 256)])
-def test_mxfp4_scale_roundtrip(shape, mx_axis, num_warps):
-    x = torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda")
+def test_mxfp4_scale_roundtrip(shape, mx_axis, num_warps, device):
+    x = torch.randint(0, 256, shape, dtype=torch.uint8, device=device)
     layout = HopperMXScaleLayout(x.shape, mx_axis=mx_axis, num_warps=num_warps)
     res = layout.unswizzle_data(layout.swizzle_data(x))
     assert (res[:shape[0], :shape[1]] == x).all()
