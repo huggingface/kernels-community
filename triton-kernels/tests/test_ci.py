@@ -67,30 +67,30 @@ def test_compaction_ci(n_tokens, n_cols, k, p, device):
 
 
 @pytest.mark.kernels_ci
-def test_mxfp_rounding_ci():
-    test_mxfp.test_mxfp4_rounding_cases("bfloat16")
+def test_mxfp_rounding_ci(device):
+    test_mxfp.test_mxfp4_rounding_cases("bfloat16", device)
 
 
 @pytest.mark.kernels_ci
-def test_mxfp_quant_dequant_ci():
-    test_mxfp.test_mxfp_quant_dequant("float4_e2m1", "bfloat16")
+def test_mxfp_quant_dequant_ci(device):
+    test_mxfp.test_mxfp_quant_dequant("float4_e2m1", "bfloat16", device)
 
 
 @pytest.mark.kernels_ci
-def test_mxfp_casting_ci():
+def test_mxfp_casting_ci(device):
     test_mxfp.test_mxfp_casting((10, 254, 60), 0, "float4_e2m1", "bfloat16",
-                                test_mxfp.DequantScaleRoundingMode.ROUND_DOWN)
+                                test_mxfp.DequantScaleRoundingMode.ROUND_DOWN, device)
 
 
 @pytest.mark.kernels_ci
-def test_layout_blackwell_ci():
-    test_layout_blackwell.test_mxfp4_scale_roundtrip((10, 254, 60))
+def test_layout_blackwell_ci(device):
+    test_layout_blackwell.test_mxfp4_scale_roundtrip((10, 254, 60), device)
 
 
 @pytest.mark.kernels_ci
-def test_layout_hopper_ci():
-    test_layout_hopper.test_mxfp4_value_roundtrip((16, 32), False, 0, 2)
-    test_layout_hopper.test_mxfp4_scale_roundtrip((256, 64), 0, 4)
+def test_layout_hopper_ci(device):
+    test_layout_hopper.test_mxfp4_value_roundtrip((16, 32), False, 0, 2, device)
+    test_layout_hopper.test_mxfp4_scale_roundtrip((256, 64), 0, 4, device)
 
 
 @pytest.mark.kernels_ci
