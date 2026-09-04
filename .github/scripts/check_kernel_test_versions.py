@@ -92,7 +92,12 @@ def check_test_file(path: Path, kernel: Kernel) -> tuple[list[Problem], int]:
 
         checked += 1
         expected = f'get_kernel("{kernel.repo_id}", version={kernel.version})'
-        if expected not in (ast.get_source_segment(source, node) or ""):
+        version = next(
+            (keyword.value for keyword in node.keywords if keyword.arg == "version"),
+            None,
+        )
+        version_value = _literal(version)
+        if type(version_value) is not int or version_value != kernel.version:
             problems.append(
                 Problem(
                     path,

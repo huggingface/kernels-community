@@ -46,6 +46,19 @@ def test_matching_import_with_nested_manifest(tmp_path):
     assert checker.check_repository(tmp_path) == ([], 1, 1)
 
 
+def test_matching_call_is_formatting_agnostic(tmp_path):
+    kernel = write_kernel(tmp_path)
+    (kernel / "tests" / "test_example.py").write_text(
+        "import kernels\n"
+        "example = kernels.get_kernel(\n"
+        "    'kernels-community/example',\n"
+        "    version = 2,\n"
+        ")\n"
+    )
+
+    assert checker.check_repository(tmp_path) == ([], 1, 1)
+
+
 def test_reports_stale_version(tmp_path):
     kernel = write_kernel(tmp_path, version=3)
     test = kernel / "tests" / "test_example.py"
@@ -75,6 +88,20 @@ def test_reports_missing_version(tmp_path):
     assert (checked, suites) == (1, 1)
     assert len(problems) == 1
     assert 'get_kernel("kernels-community/example", version=2)' in problems[0].message
+
+
+def test_rejects_non_integer_version(tmp_path):
+    kernel = write_kernel(tmp_path, version=1)
+    (kernel / "tests" / "test_example.py").write_text(
+        "import kernels\n"
+        'example = kernels.get_kernel("kernels-community/example", version=True)\n'
+    )
+
+    problems, checked, suites = checker.check_repository(tmp_path)
+
+    assert (checked, suites) == (1, 1)
+    assert len(problems) == 1
+    assert 'version=1' in problems[0].message
 
 
 def test_ignores_comments_unrelated_methods_and_suites_without_calls(tmp_path):
