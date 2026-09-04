@@ -100,6 +100,34 @@ def test_relu():
 These are the tests run by `nix run .#ci-test` (`pytest -m kernels_ci`), which
 is what kernels-community CI executes on a GPU runner.
 
+## Kernel versions
+
+Any change to a kernel's public API needs the `version` in the `[general]`
+section of its `build.toml` incremented. This covers *additions* — a new
+function, layer, or Torch operator — just as much as it covers removals and
+signature changes.
+
+Additions matter because only the last two Torch versions are rebuilt. Say
+`mykernel` version 1 exposes `a` and has builds for Torch 2.9 through 2.13.
+Adding `b` without a bump leaves version 1 advertising `b` while the 2.9-2.11
+variants, which are not rebuilt, still only carry `a`. Downstream code that
+starts calling `b` then fails on those Torch versions with a symbol that
+cannot be found. Bumping to version 2 instead means `kernels` simply reports
+that no build variant exists for the user's system.
+
+No bump is needed where every published variant gets refreshed anyway:
+
+- No-arch kernels (a `[torch-noarch]` build).
+- Torch stable-ABI kernels, as long as the CUDA versions built overlap with
+  the current build variants.
+- AoT-compiled kernels where a build replaces all variants.
+- Brand-new kernels, which only have builds for the latest two Torch versions.
+
+The `Check Public API` workflow enforces this via
+`scripts/check_public_api.py`, which recognises the no-arch, stable-ABI, and
+brand-new cases on its own. The AoT case is not visible from the repo, so bump
+the version there anyway - a bump is never wrong.
+
 # Kernel-specific instructions
 
 ## flash-attn3
