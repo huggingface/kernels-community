@@ -1,14 +1,23 @@
 import pytest
-from triton._internal_testing import is_cuda
-from triton_kernels.tensor import wrap_torch_tensor, convert_layout, FP4
-from triton_kernels.tensor_details.layout import HopperMXScaleLayout, HopperMXValueLayout
-from triton_kernels.numerics_details.mxfp import downcast_to_mxfp, upcast_from_mxfp
-from triton_kernels.tensor_details.layout_details.hopper_value import mxfp4_to_bf16_triton
-from triton_kernels.tensor_details.layout_details.hopper_scale import unswizzle_mxfp4_scale_hopper
-from triton_kernels.target_info import cuda_capability_geq
-import triton.language as tl
-import triton
 import torch
+import triton
+import triton.language as tl
+from triton._internal_testing import is_cuda
+
+import kernels
+
+triton_kernels = kernels.get_kernel("kernels-community/triton-kernels", version=1)
+
+wrap_torch_tensor = triton_kernels.tensor.wrap_torch_tensor
+convert_layout = triton_kernels.tensor.convert_layout
+FP4 = triton_kernels.tensor.FP4
+HopperMXScaleLayout = triton_kernels.tensor_details.layout.HopperMXScaleLayout
+HopperMXValueLayout = triton_kernels.tensor_details.layout.HopperMXValueLayout
+downcast_to_mxfp = triton_kernels.numerics_details.mxfp.downcast_to_mxfp
+upcast_from_mxfp = triton_kernels.numerics_details.mxfp.upcast_from_mxfp
+mxfp4_to_bf16_triton = triton_kernels.tensor_details.layout_details.hopper_value.mxfp4_to_bf16_triton
+unswizzle_mxfp4_scale_hopper = triton_kernels.tensor_details.layout_details.hopper_scale.unswizzle_mxfp4_scale_hopper
+cuda_capability_geq = triton_kernels.target_info.cuda_capability_geq
 
 # ------------------------------------------------------------
 # Torch tests
@@ -19,8 +28,8 @@ import torch
 @pytest.mark.parametrize("trans", [False, True])
 @pytest.mark.parametrize("mx_axis", [0, 1])
 @pytest.mark.parametrize("mma_version", [2, 3])
-def test_mxfp4_value_roundtrip(shape, trans, mx_axis, mma_version):
-    x = torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda")
+def test_mxfp4_value_roundtrip(shape, trans, mx_axis, mma_version, device):
+    x = torch.randint(0, 256, shape, dtype=torch.uint8, device=device)
     if trans:
         x = x.mT
     if x.shape[1 - mx_axis] < 32:
@@ -33,8 +42,8 @@ def test_mxfp4_value_roundtrip(shape, trans, mx_axis, mma_version):
 @pytest.mark.parametrize("mx_axis", [0, 1])
 @pytest.mark.parametrize("num_warps", [4, 8])
 @pytest.mark.parametrize("shape", [(256, 64), (256, 128), (256, 256)])
-def test_mxfp4_scale_roundtrip(shape, mx_axis, num_warps):
-    x = torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda")
+def test_mxfp4_scale_roundtrip(shape, mx_axis, num_warps, device):
+    x = torch.randint(0, 256, shape, dtype=torch.uint8, device=device)
     layout = HopperMXScaleLayout(x.shape, mx_axis=mx_axis, num_warps=num_warps)
     res = layout.unswizzle_data(layout.swizzle_data(x))
     assert (res[:shape[0], :shape[1]] == x).all()

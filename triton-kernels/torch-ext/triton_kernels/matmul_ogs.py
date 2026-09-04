@@ -602,18 +602,20 @@ def matmul_ogs_torch(x, w, bias,
                  betas = None,
                  gammas = None,
                  round_x = None, round_y = None,
-                 device: str = "cuda",
+                 device: str | torch.device | None = None,
                  ):
     is_input_batched = x.ndim == 3
     assert x.dtype.itemsize > 1
     assert w.dtype.itemsize > 1
+    if device is None:
+        device = x.device
     if is_input_batched:
         assert gather_indx is None, "gather not supported in batched mode"
         assert scatter_indx is None, "scatter not supported in batched mode"
         assert routing_data is None, "routing not supported in batched mode"
         assert w.ndim == 3 and w.shape[0] == x.shape[0]
     if round_x is None:
-        round_x = lambda x: x
+        round_x = lambda x, idx: x
     if round_y is None:
         round_y = lambda x: x
     if bias.ndim == 1:
