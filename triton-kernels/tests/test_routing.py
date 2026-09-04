@@ -1,8 +1,14 @@
 import pytest
 import torch
-from triton_kernels.routing import routing, routing_torch
-from triton_kernels.testing import assert_close
-from triton_kernels.testing import assert_equal
+
+import kernels
+
+triton_kernels = kernels.get_kernel("kernels-community/triton-kernels", version=1)
+
+routing = triton_kernels.routing.routing
+routing_torch = triton_kernels.routing.routing_torch
+
+from .testing import assert_close, assert_equal
 
 
 def init_data(n_tokens, n_expts_tot, dtype=torch.float16, device="cuda"):
