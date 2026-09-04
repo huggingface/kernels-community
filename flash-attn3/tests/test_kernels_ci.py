@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 
-flash_attn3 = kernels.get_kernel("kernels-community/flash-attn3", version=1)
+flash_attn3 = kernels.get_kernel("kernels-community/flash-attn3", version=2)
 
 cuda_major = (
     torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else None
@@ -163,4 +163,30 @@ def test_flash_attn_with_kvcache():
 
     assert out.shape == q.shape
     assert out.dtype == q.dtype
+    assert_close(out, out_ref)
+
+
+def test_ops_fwd():
+    """Exercise the raw op through the packaged ``ops`` namespace."""
+    torch.manual_seed(3)
+    batch, seqlen, num_heads, head_dim = 2, 64, 4, 64
+
+    q, k, v = [
+        torch.randn(
+            batch,
+            seqlen,
+            num_heads,
+            head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        for _ in range(3)
+    ]
+
+    out, softmax_lse, _, _ = flash_attn3.ops.fwd(q, k, v, is_causal=True)
+    out_ref = reference_attention(q, k, v, causal=True)
+
+    assert out.shape == q.shape
+    assert out.dtype == q.dtype
+    assert softmax_lse.shape == (batch, num_heads, seqlen)
     assert_close(out, out_ref)
