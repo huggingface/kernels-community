@@ -2,15 +2,23 @@
 Common utils for testing.
 These functions allow testing only some frameworks, not all.
 """
+__kernel_port_einops_root = None
+def __kernel_port_einops(module=""):
+    global __kernel_port_einops_root
+    if __kernel_port_einops_root is None:
+        __kernel_port_einops_root = __import__("kernels").get_kernel("kernels-community/einops", version=1)
+    root = __kernel_port_einops_root
+    if not module:
+        return root
+    return __import__("importlib").import_module(root.__name__ + "." + module)
+
 
 import logging
 import os
 from functools import lru_cache
 from typing import List, Tuple
 
-import kernels
-_einops = kernels.get_kernel("kernels-community/einops", version=1)
-_backends = _einops._backends
+_backends = getattr(__kernel_port_einops(), "_backends")
 import warnings
 
 __author__ = "Alex Rogozhnikov"
@@ -46,23 +54,15 @@ def unparse_backends(backend_names: List[str]) -> Tuple[str, str]:
 
 @lru_cache(maxsize=1)
 def parse_backends_to_test() -> List[str]:
-    if ENVVAR_NAME in os.environ:
-        parsed_backends = os.environ[ENVVAR_NAME].split(",")
-        _known_backends = find_names_of_all_frameworks()
-        for backend_name in parsed_backends:
-            if backend_name not in _known_backends:
-                raise RuntimeError(f"Unknown framework: {backend_name}")
-        return parsed_backends
+    if ENVVAR_NAME not in os.environ:
+        return ["torch", "numpy"]
+    parsed_backends = os.environ[ENVVAR_NAME].split(",")
+    _known_backends = find_names_of_all_frameworks()
+    for backend_name in parsed_backends:
+        if backend_name not in _known_backends:
+            raise RuntimeError(f"Unknown framework: {backend_name}")
 
-    # Auto-detect available frameworks.
-    available = []
-    for module, name in [("torch", "torch"), ("jax", "jax"), ("numpy", "numpy"), ("tensorflow", "tensorflow")]:
-        try:
-            __import__(module)
-            available.append(name)
-        except ImportError:
-            pass
-    return available
+    return parsed_backends
 
 
 def is_backend_tested(backend: str) -> bool:

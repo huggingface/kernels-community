@@ -1,11 +1,19 @@
+__kernel_port_einops_root = None
+def __kernel_port_einops(module=""):
+    global __kernel_port_einops_root
+    if __kernel_port_einops_root is None:
+        __kernel_port_einops_root = __import__("kernels").get_kernel("kernels-community/einops", version=1)
+    root = __kernel_port_einops_root
+    if not module:
+        return root
+    return __import__("importlib").import_module(root.__name__ + "." + module)
+
 import pytest
 
-import kernels
-einops = kernels.get_kernel("kernels-community/einops", version=1)
-EinopsError = einops.EinopsError
-ParsedExpression = einops.parsing.ParsedExpression
-AnonymousAxis = einops.parsing.AnonymousAxis
-_ellipsis = einops.parsing._ellipsis
+pytestmark = pytest.mark.kernels_ci
+
+EinopsError = getattr(__kernel_port_einops(), "EinopsError")
+ParsedExpression, AnonymousAxis, _ellipsis = getattr(__kernel_port_einops("parsing"), "ParsedExpression"), getattr(__kernel_port_einops("parsing"), "AnonymousAxis"), getattr(__kernel_port_einops("parsing"), "_ellipsis")
 
 __author__ = "Alex Rogozhnikov"
 
@@ -19,7 +27,6 @@ class AnonymousAxisPlaceholder:
         return isinstance(other, AnonymousAxis) and self.value == other.value
 
 
-@pytest.mark.kernels_ci
 def test_anonymous_axes():
     a, b = AnonymousAxis("2"), AnonymousAxis("2")
     assert a != b
@@ -29,7 +36,6 @@ def test_anonymous_axes():
     assert [a, 2, b] == [c, 2, c]
 
 
-@pytest.mark.kernels_ci
 def test_elementary_axis_name():
     for name in [
         "a",
@@ -51,7 +57,6 @@ def test_elementary_axis_name():
         assert not ParsedExpression.check_axis_name(name)
 
 
-@pytest.mark.kernels_ci
 def test_invalid_expressions():
     # double ellipsis should raise an error
     ParsedExpression("... a b c d")
@@ -85,7 +90,6 @@ def test_invalid_expressions():
         ParsedExpression("pre...")
 
 
-@pytest.mark.kernels_ci
 def test_parse_expression():
     parsed = ParsedExpression("a1  b1   c1    d1")
     assert parsed.identifiers == {"a1", "b1", "c1", "d1"}
