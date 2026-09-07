@@ -31,6 +31,14 @@ COMMAND_PERMISSIONS = {
 }
 # Commands that operate per-PR and do not require kernel names.
 KERNELLESS_COMMANDS = {"security"}
+# Org teams whose members may run TEAM_AUTHORIZED_COMMANDS without holding
+# `write` on this repo, as (org, team_slug) pairs. Rosters are read with
+# TEAM_READ_TOKEN: the workflow's default GITHUB_TOKEN is repo-scoped and has no
+# `read:org`, so it cannot see team membership at all.
+AUTHORIZED_TEAMS = (("huggingface", "transformers"),)
+# What team membership alone unlocks. Deliberately narrow -- staging, merging
+# and releasing still require `write`/`admin` on this repo.
+TEAM_AUTHORIZED_COMMANDS = {"build"}
 MAX_COMMENT_LENGTH = 1024
 RUN_LOOKUP_ATTEMPTS = 10
 RUN_LOOKUP_SLEEP_SECONDS = 2
@@ -166,6 +174,92 @@ def get_user_permission(api_base: str, token: str, username: str):
         raise
 
 
+def get_team_membership_state(org: str, team_slug: str, username: str, token: str):
+    """Return the user's state in an org team ("active"/"pending"), or None.
+
+    None covers both "not a member" and "this token cannot see the team": GitHub
+    answers 404 for either, so they are indistinguishable here.
+    """
+    url = f"https://api.github.com/orgs/{org}/teams/{team_slug}/memberships/{username}"
+    try:
+        _, body = github_api_request(url, token, method="GET")
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            print(
+                f"TEAM_READ_TOKEN cannot read {org}/{team_slug} membership (HTTP 403); "
+                "it needs the `read:org` scope.",
+                file=sys.stderr,
+            )
+            return None
+        if e.code == 404:
+            return None
+        raise
+    return json.loads(body).get("state")
+
+
+def is_authorized_team_member(username: str, token: str):
+    """True when `username` is an active member of any team in AUTHORIZED_TEAMS."""
+    if not username or not token:
+        return False
+    for org, team_slug in AUTHORIZED_TEAMS:
+        try:
+            state = get_team_membership_state(org, team_slug, username, token)
+        except urllib.error.HTTPError as e:
+            print(
+                f"Team membership lookup for {username} in {org}/{team_slug} failed "
+                f"(HTTP {e.code}).",
+                file=sys.stderr,
+            )
+            continue
+        # "pending" is an unaccepted invitation -- not yet a member.
+        if state == "active":
+            return True
+    return False
+
+
+def team_grants_access(
+    api_base: str, token: str, command: str, commenter: str, issue_number: int
+):
+    """Authorize `command` when the commenter or the PR author is on an authorized team.
+
+    Every failure path returns False, so a missing or under-scoped
+    TEAM_READ_TOKEN can only ever deny -- it never widens access.
+    """
+    if command not in TEAM_AUTHORIZED_COMMANDS:
+        return False
+    team_token = os.environ.get("TEAM_READ_TOKEN", "")
+    if not team_token:
+        print(
+            "TEAM_READ_TOKEN is not set; skipping team-membership authorization.",
+            file=sys.stderr,
+        )
+        return False
+
+    if is_authorized_team_member(commenter, team_token):
+        print(f"Authorizing `{command}`: {commenter} is on an authorized team.")
+        return True
+
+    try:
+        pull_request = get_pull_request(api_base, token, issue_number)
+    except urllib.error.HTTPError as e:
+        print(
+            f"Could not read PR #{issue_number} to check its author (HTTP {e.code}).",
+            file=sys.stderr,
+        )
+        return False
+    pr_author = (pull_request.get("user") or {}).get("login", "")
+    # The commenter was just checked; re-querying the same login is waste.
+    if not pr_author or pr_author == commenter:
+        return False
+    if is_authorized_team_member(pr_author, team_token):
+        print(
+            f"Authorizing `{command}` for {commenter}: PR author {pr_author} "
+            "is on an authorized team."
+        )
+        return True
+    return False
+
+
 def get_pull_request(api_base: str, token: str, issue_number: int):
     url = f"{api_base}/pulls/{issue_number}"
     _, body = github_api_request(url, token, method="GET")
@@ -174,7 +268,9 @@ def get_pull_request(api_base: str, token: str, issue_number: int):
 
 def merge_pull_request(api_base: str, token: str, issue_number: int):
     url = f"{api_base}/pulls/{issue_number}/merge"
-    _, body = github_api_request(url, token, method="PUT", data={})
+    _, body = github_api_request(
+        url, token, method="PUT", data={"merge_method": "squash"}
+    )
     return json.loads(body)
 
 
@@ -664,12 +760,22 @@ def main(*, dry_run: bool = False):
         commenter = ctx["commenter"]
         permission = get_user_permission(api_base, token, commenter)
         allowed_permissions = COMMAND_PERMISSIONS[command]
-        if permission not in allowed_permissions:
+        # Repo permission is the primary gate; team membership is a fallback.
+        authorized = permission in allowed_permissions or team_grants_access(
+            api_base, token, command, commenter, issue_number
+        )
+        if not authorized:
             if "write" in allowed_permissions:
                 permission_error = (
                     f"I can only run `/kernel-bot {command}` for users with `write` or `admin` "
                     "repository permission."
                 )
+                if command in TEAM_AUTHORIZED_COMMANDS:
+                    teams = ", ".join(f"`{o}/{t}`" for o, t in AUTHORIZED_TEAMS)
+                    permission_error += (
+                        f" Members of {teams} can run it too, as can anyone "
+                        "commenting on a PR opened by one."
+                    )
             else:
                 permission_error = (
                     f"I can only run `/kernel-bot {command}` for users with `admin` "
@@ -785,6 +891,9 @@ def main(*, dry_run: bool = False):
         dispatch_upload = True
         dispatch_repo_prefix = "kernels-community"
 
+    # Commands that don't upload are PR-only.
+    dispatch_mode = "release" if dispatch_upload else "pr"
+
     mode_text = {
         "build": "build only",
         "security-and-build": "security audit + build",
@@ -897,7 +1006,7 @@ def main(*, dry_run: bool = False):
             token=token,
             repo=repository,
             ref=default_branch,
-            mode="release",
+            mode=dispatch_mode,
             repo_prefix=dispatch_repo_prefix,
             dispatch_key_prefix=f"pr{issue_number}-",
             pr_number=dispatch_pr_number,

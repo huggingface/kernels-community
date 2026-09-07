@@ -45,7 +45,7 @@ def make_default_opt_flags_intel(
     epilogue_effective_itemsize,
     constraints,
 ):
-    constraints_supported = ["block_m", "block_k", "split_k", "is_persistent", "fused_scatter", "epilogue_subtile", "num_stages"]
+    constraints_supported = ["block_m", "block_n", "block_k", "split_k", "is_persistent", "fused_scatter", "epilogue_subtile", "num_stages"]
     assert not any([c not in constraints_supported for c in constraints]), constraints.keys()
     # tokens per expert
     if routing_data is None:
@@ -65,14 +65,17 @@ def make_default_opt_flags_intel(
     else:
         block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
     # block n
-    block_n = opt_flags_intel.compute_block_n(n)
+    if constraints.get("block_n", None) is not None:
+        block_n = constraints["block_n"]
+    else:
+        block_n = opt_flags_intel.compute_block_n(n)
     # is_persistent
     is_persistent = constraints.get("is_persistent", False)
     # block k
     if constraints.get("block_k", None) is not None:
         block_k = constraints["block_k"]
     else:
-        block_k = opt_flags_intel.compute_block_k(k, is_persistent, precision_config)
+        block_k = opt_flags_intel.compute_block_k(k, is_persistent, precision_config, lhs_dtype, rhs_dtype)
     # split_k
     if constraints.get("split_k", None) is not None:
         split_k = constraints["split_k"]

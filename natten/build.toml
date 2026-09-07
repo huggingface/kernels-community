@@ -28,7 +28,6 @@ cuda-capabilities = [
 ]
 cuda-flags = [
     "-O3",
-    "-std=c++17",
     "--expt-relaxed-constexpr",
     "--extended-lambda",
     "--use_fast_math",
@@ -295,7 +294,6 @@ cuda-capabilities = [
 ]
 cuda-flags = [
     "-O3",
-    "-std=c++17",
     "--expt-relaxed-constexpr",
     "--extended-lambda",
     "--use_fast_math",
@@ -367,7 +365,6 @@ cuda-capabilities = [
 ]
 cuda-flags = [
     "-O3",
-    "-std=c++17",
     "--expt-relaxed-constexpr",
     "--extended-lambda",
     "--use_fast_math",

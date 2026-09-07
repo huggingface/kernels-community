@@ -1,6 +1,7 @@
 [general]
 name = "aiter-kernels"
 version = 2
+edition = 5
 license = "MIT"
 backends = ["rocm"]
 
@@ -8,6 +9,10 @@ backends = ["rocm"]
 repo-id = "kernels-community/aiter-kernels"
 
 [torch-noarch]
-pyext = ["py", "pyi", "json"]
+pyext = [
+    "py",
+    "pyi",
+    "json",
+]
 
 [kernel]

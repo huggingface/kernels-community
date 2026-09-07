@@ -30,6 +30,7 @@ extern "C" AOTITorchError aoti_torch_get_current_cuda_stream(int32_t device_inde
 #include <torch/headeronly/util/Exception.h>
 
 #include <cuda_runtime.h>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -992,8 +993,12 @@ mha_bwd(const Tensor &dout,  // batch_size x seqlen_q x num_heads, x multiple_of
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
-        torch::stable::sum_out(dk, torch::stable::reshape(dk_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
-        torch::stable::sum_out(dv, torch::stable::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
+        // sum_out takes its dim as `std::optional<IntHeaderOnlyArrayRef>`. A braced
+        // `{3}` ends up as a dangling pointer due to an internal automatic conversion
+        // from `int` to `int64_t`.
+        const std::array<int64_t, 1> sum_dim{3};
+        torch::stable::sum_out(dk, torch::stable::reshape(dk_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), sum_dim);
+        torch::stable::sum_out(dv, torch::stable::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), sum_dim);
     }
 
     return { dq, dk, dv, softmax_d };
@@ -1217,8 +1222,10 @@ mha_varlen_bwd(const Tensor &dout,  // total_q x num_heads, x head_size
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
-        torch::stable::sum_out(dk, torch::stable::reshape(dk_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
-        torch::stable::sum_out(dv, torch::stable::reshape(dv_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
+        // See the note in mha_bwd: the dim must outlive the sum_out call.
+        const std::array<int64_t, 1> sum_dim{2};
+        torch::stable::sum_out(dk, torch::stable::reshape(dk_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), sum_dim);
+        torch::stable::sum_out(dv, torch::stable::reshape(dv_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), sum_dim);
     }
 
     return { dq, dk, dv, softmax_d };

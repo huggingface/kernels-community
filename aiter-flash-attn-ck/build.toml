@@ -1,10 +1,9 @@
 [general]
 name = "aiter-flash-attn-ck"
-license = "MIT"
 version = 1
-backends = [
-    "rocm",
-]
+edition = 5
+license = "MIT"
+backends = ["rocm"]
 
 [general.hub]
 repo-id = "kernels-community/aiter-flash-attn-ck"
@@ -17,21 +16,14 @@ src = [
 
 [kernel.aiter_flash_attn_ck]
 backend = "rocm"
-rocm-archs = [
-    "gfx942",
-    "gfx950",
-]
-depends = [
-    "torch",
-]
-include = [
-    "aiter/include",
-    "ck/include",
-    "ck/fmha",
-]
 cxx-flags = [
     "-DENABLE_CK=1",
     "-DFAV2_ON=1",
+]
+depends = ["torch"]
+rocm-archs = [
+    "gfx942",
+    "gfx950",
 ]
 hip-flags = [
     "-DENABLE_CK=1",
@@ -40,6 +32,11 @@ hip-flags = [
     "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
     "-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=2",
     "-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT=0",
+]
+include = [
+    "aiter/include",
+    "ck/include",
+    "ck/fmha",
 ]
 src = [
     "aiter/cpp_itfs/mha_fwd.hip",

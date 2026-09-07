@@ -26,7 +26,7 @@ def _register_xpu_fake_kernels():
 
     _register_if_available(
         "cutlass_grouped_gemm_interface",
-        lambda ptr_A, ptr_B, ptr_scales, ptr_bias, ptr_D, expert_first_token_offset, N, K, num_experts, is_B_int4, is_B_mxfp4: ptr_D,
+        lambda ptr_A, ptr_B, ptr_scales, ptr_bias, ptr_D, expert_first_token_offset, N, K, num_experts, is_B_int4, is_B_mxfp4, is_B_mxfp8=False: ptr_D,
     )
 
     _register_if_available(
@@ -106,12 +106,13 @@ def cutlass_grouped_gemm(input_A, input_B, bias, output, expert_token_count, n,
         K=k,
         num_experts=num_experts,
         is_B_int4=False,
-        is_B_mxfp4=False)
+        is_B_mxfp4=False,
+        is_B_mxfp8=False)
 
 
 def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
                              num_rows_per_expert, n, k, num_experts, is_B_int4,
-                             is_B_mxfp4):
+                             is_B_mxfp4, is_B_mxfp8=False):
     expert_first_token_offset = torch.cat([
         torch.tensor([0],
                      dtype=num_rows_per_expert.dtype,
@@ -129,7 +130,8 @@ def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
         K=k,
         num_experts=num_experts,
         is_B_int4=is_B_int4,
-        is_B_mxfp4=is_B_mxfp4)
+        is_B_mxfp4=is_B_mxfp4,
+        is_B_mxfp8=is_B_mxfp8)
 
 
 def ceilDiv(a, b):
@@ -206,7 +208,8 @@ def xpu_fused_moe(hidden_states,
                   ep_size=1,
                   is_fp8=False,
                   is_int4=False,
-                  is_mxfp4=False):
+                  is_mxfp4=False,
+                  is_mxfp8=False):
     '''
     hidden_states: [num_rows, hidden_size]
     w13: [num_experts, 2*inter_size, hidden_size]
@@ -228,6 +231,7 @@ def xpu_fused_moe(hidden_states,
     num_experts: int
     is_int4: bool
     is_mxfp4: bool
+    is_mxfp8: bool
     '''
 
     # Resolve DTensors to local tensors before passing to custom ops
@@ -266,7 +270,7 @@ def xpu_fused_moe(hidden_states,
 
     # 4bits support [E, N, K]
     # other types [E, K, N]
-    if not is_int4 and not is_mxfp4:
+    if not is_int4 and not is_mxfp4 and not is_mxfp8:
         if not hasattr(w13, 'xpu_fused_moe'):
             if needs_transpose:
                 w13.data = w13.transpose(-1, -2).contiguous()
@@ -389,7 +393,7 @@ def xpu_fused_moe(hidden_states,
     ########### gemm1 ##################
     input_B = w13
 
-    if not is_fp8 and not is_int4 and not is_mxfp4:
+    if not is_fp8 and not is_int4 and not is_mxfp4 and not is_mxfp8:
         ops.cutlass_grouped_gemm_interface(
             ptr_A=gemm1_input,
             ptr_B=input_B,
@@ -401,7 +405,8 @@ def xpu_fused_moe(hidden_states,
             K=hidden_size,
             num_experts=num_experts_per_node,
             is_B_int4=is_int4,
-            is_B_mxfp4=is_mxfp4)
+            is_B_mxfp4=is_mxfp4,
+            is_B_mxfp8=is_mxfp8)
     else:
         ops.cutlass_grouped_gemm_interface(
             ptr_A=gemm1_input,
@@ -414,7 +419,8 @@ def xpu_fused_moe(hidden_states,
             K=hidden_size,
             num_experts=num_experts_per_node,
             is_B_int4=is_int4,
-            is_B_mxfp4=is_mxfp4)
+            is_B_mxfp4=is_mxfp4,
+            is_B_mxfp8=is_mxfp8)
 
     # act
     act_output = torch.empty((num_moe_inputs, inter_size),
@@ -435,7 +441,7 @@ def xpu_fused_moe(hidden_states,
     gemm2_output = torch.empty((num_moe_inputs, hidden_size),
                                dtype=hidden_states.dtype,
                                device=hidden_states.device)
-    if not is_fp8 and not is_int4 and not is_mxfp4:
+    if not is_fp8 and not is_int4 and not is_mxfp4 and not is_mxfp8:
         ops.cutlass_grouped_gemm_interface(
             ptr_A=input_A,
             ptr_B=input_B,
@@ -447,7 +453,8 @@ def xpu_fused_moe(hidden_states,
             K=inter_size,
             num_experts=num_experts_per_node,
             is_B_int4=is_int4,
-            is_B_mxfp4=is_mxfp4)
+            is_B_mxfp4=is_mxfp4,
+            is_B_mxfp8=is_mxfp8)
     else:
         ops.cutlass_grouped_gemm_interface(
             ptr_A=input_A,
@@ -460,7 +467,8 @@ def xpu_fused_moe(hidden_states,
             K=inter_size,
             num_experts=num_experts_per_node,
             is_B_int4=is_int4,
-            is_B_mxfp4=is_mxfp4)
+            is_B_mxfp4=is_mxfp4,
+            is_B_mxfp8=is_mxfp8)
 
     ops.moe_gather(output, gemm2_output, topk_weights,
                                 permuted_row_to_unpermuted_row,
@@ -527,6 +535,30 @@ def _get_device_mesh(model):
         ].cell_contents
     except Exception:
         return None
+
+
+def _mxfp4_expert_tensors(experts, dtype):
+    """View transformers' MXFP4 experts as the tensors the SYCL grouped GEMM expects.
+
+    Weights and scales arrive wrapped in triton tensors. On XPU both use StridedLayout,
+    whose swizzle is the identity, so `storage.data` is still the checkpoint tensor - just
+    transposed to [E, K/2, N]. Transposing back therefore restores the original contiguous
+    [E, N, K/2] weights and [E, N, K/32] E8M0 scales as plain views: `contiguous()` finds
+    them already contiguous and returns them untouched, so this costs no copy and no extra
+    memory. The experts module is left alone, which keeps the triton tensors and the
+    PrecisionConfig that `save_pretrained` needs to re-serialize the checkpoint.
+    """
+    tensors = []
+    for proj in ("gate_up_proj", "down_proj"):
+        config = getattr(experts, f"{proj}_precision_config")
+        tensors.append(getattr(experts, proj).storage.data.transpose(-1, -2).contiguous())
+        tensors.append(config.weight_scale.storage.data.transpose(-1, -2).contiguous())
+
+        # The GEMM reads the bias as ElementA; `to` is a no-op when it already matches.
+        bias = getattr(experts, f"{proj}_bias", None)
+        tensors.append(None if bias is None else bias.data.to(dtype))
+
+    return tensors
 
 
 class MegaBlocksMoeMLP(torch.nn.Module):
@@ -609,10 +641,22 @@ class MegaBlocksMoeMLP(torch.nn.Module):
         is_fp8 = getattr(self.experts, "is_fp8", False)
         is_int4 = getattr(self.experts, "is_int4", False)
         is_mxfp4 = getattr(self.experts, "is_mxfp4", False)
+        is_mxfp8 = getattr(self.experts, "is_mxfp8", False)
         
         w13_scales = getattr(self.experts, "gate_up_proj_scales", None)
         w2_scales = getattr(self.experts, "down_proj_scales", None)
-        
+
+        # Native MXFP4 checkpoint: derive the GEMM's view of the experts once and cache it.
+        mxfp4 = getattr(self, "_mxfp4_tensors", None)
+        if (mxfp4 is None or mxfp4[0] is not x.dtype) and getattr(
+            self.experts, "gate_up_proj_precision_config", None
+        ) is not None:
+            mxfp4 = (x.dtype, *_mxfp4_expert_tensors(self.experts, x.dtype))
+            self._mxfp4_tensors = mxfp4
+        if mxfp4 is not None:
+            _, w13, w13_scales, w13_bias, w2, w2_scales, w2_bias = mxfp4
+            is_mxfp4 = True
+
         # Store original shape
         in_shape = x.size()
         
@@ -650,6 +694,7 @@ class MegaBlocksMoeMLP(torch.nn.Module):
             is_fp8=is_fp8,
             is_int4=is_int4,
             is_mxfp4=is_mxfp4,
+            is_mxfp8=is_mxfp8,
         )
         
         # All-reduce across EP group to combine partial expert outputs

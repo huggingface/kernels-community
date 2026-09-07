@@ -8,6 +8,7 @@ backends = [
     "metal",
     "cpu",
     "rocm",
+    "xpu",
 ]
 
 [general.hub]
@@ -29,6 +30,16 @@ depends = ["torch"]
 src = [
     "activation_metal/activation.mm",
     "activation_metal/activation.metal",
+]
+
+[kernel.activation_xpu]
+backend = "xpu"
+depends = ["torch"]
+include = ["activation_xpu"]
+src = [
+    "activation_xpu/activation_kernels.cpp",
+    "activation_xpu/activation_xpu_torch.cpp",
+    "activation_xpu/activation_xpu.hpp",
 ]
 
 [kernel.activation]

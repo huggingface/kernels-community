@@ -1,10 +1,18 @@
-from triton_kernels.routing import routing_torch
-from triton_kernels.swiglu import swiglu, swiglu_torch, PrecisionConfig
-from triton_kernels.testing import assert_close
 import torch
 import pytest
 
+import kernels
+
 from .test_routing import init_data as init_routing_data
+
+triton_kernels = kernels.get_kernel("kernels-community/triton-kernels", version=1)
+
+routing_torch = triton_kernels.routing.routing_torch
+swiglu = triton_kernels.swiglu.swiglu
+swiglu_torch = triton_kernels.swiglu.swiglu_torch
+PrecisionConfig = triton_kernels.swiglu.PrecisionConfig
+
+from .testing import assert_close
 
 # ---------------
 # initialize data
@@ -30,7 +38,7 @@ def test_op(M, N, limit, device, alpha=0.5):
     # initialize expert data
     n_expts_tot = 6
     n_expts_act = 2
-    logits = init_routing_data(M, n_expts_tot).detach()
+    logits = init_routing_data(M, n_expts_tot, device).detach()
     routing_data, _, _ = routing_torch(logits, n_expts_act)
     n_tokens = routing_data.expt_hist.sum()
 

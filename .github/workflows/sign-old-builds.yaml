@@ -54,7 +54,14 @@ jobs:
           REPO_PREFIX: kernels-community
           START_KERNEL: ${{ inputs.start_kernel }}
         run: |
-          KERNELS=$(find . -maxdepth 2 -name "build.toml" -exec dirname {} \; | sed 's|^\./||' | sort)
+          # Ported kernels keep build.toml in <kernel>/src; normalize back to the
+          # kernel dir, which is what the flake and the Hub repo-id key off.
+          KERNELS=$(
+            {
+              find . -maxdepth 2 -name "build.toml"
+              find . -mindepth 3 -maxdepth 3 -path "*/src/build.toml"
+            } | xargs -n1 dirname | sed 's|^\./||; s|/src$||' | sort -u
+          )
           SKIP="$START_KERNEL"
 
           for kernel in $KERNELS; do
@@ -71,7 +78,9 @@ jobs:
             echo "::group::$kernel"
 
             # Determine the version branch from build.toml (e.g. version = 1 -> v1).
-            VERSION=$(grep -E '^\s*version\s*=' "$kernel/build.toml" | grep -oE '[0-9]+')
+            BUILD_TOML="$kernel/build.toml"
+            [ -f "$kernel/src/build.toml" ] && BUILD_TOML="$kernel/src/build.toml"
+            VERSION=$(grep -E '^\s*version\s*=' "$BUILD_TOML" | grep -oE '[0-9]+')
             VERSION_BRANCH="v${VERSION}"
 
             REPO_ID=$(python3 .github/scripts/hub_pr_upload_args.py repo-id "$kernel" "$REPO_PREFIX")
@@ -114,7 +123,7 @@ jobs:
                 upload --repo-type kernel $TARGET_FLAG --branch "$VERSION_BRANCH" )
 
             # v1 kernels without an explicit branch in build.toml also get uploaded to main.
-            BRANCH=$(grep -E '^\s*branch\s*=' "$kernel/build.toml" || true)
+            BRANCH=$(grep -E '^\s*branch\s*=' "$BUILD_TOML" || true)
             if [ "$VERSION" = "1" ] && [ -z "$BRANCH" ]; then
               ( cd "$kernel" && nix run -L github:huggingface/kernels#kernel-builder -- \
                   upload --repo-type kernel $TARGET_FLAG --branch main )

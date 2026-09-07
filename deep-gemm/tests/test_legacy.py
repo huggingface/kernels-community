@@ -1,11 +1,14 @@
 import torch
 import random
 
-import deep_gemm
-from deep_gemm.testing import (
-    bench_kineto,
-    calc_diff, count_bytes
-)
+import kernels
+
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+
+bench_kineto = deep_gemm.testing.bench_kineto
+calc_diff = deep_gemm.testing.calc_diff
+count_bytes = deep_gemm.testing.count_bytes
+
 from generators import (
     enumerate_m_grouped_contiguous, enumerate_k_grouped_contiguous,
     generate_m_grouped_contiguous, generate_k_grouped_contiguous,

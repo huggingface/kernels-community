@@ -62,8 +62,16 @@ permissions:
   contents: read
   statuses: write
 
+# These build workflows are reachable only via workflow_dispatch, so `github.head_ref`
+# is always empty and the group used to collapse to `github.run_id` -- unique per run,
+# which made `cancel-in-progress` a no-op. Key off the dispatch inputs instead so a newer
+# build supersedes the one still in flight for the same PR + kernel (the platform is
+# already distinguished by `github.workflow`, so unrelated kernels/platforms on the same
+# PR are untouched). `upload` stays in the key so a cheap PR CI build cannot cancel a
+# `/kernel-bot build-and-stage` mid Hub upload. Dispatches without a `pr_number` (releases
+# off the default branch) still fall back to `run_id` and are never cancelled.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ inputs.pr_number || github.run_id }}-${{ inputs.kernel_name }}-upload-${{ inputs.upload }}
   cancel-in-progress: true
 
 jobs:
@@ -158,8 +166,12 @@ jobs:
         run: |
           $ErrorActionPreference = "Continue"
           $KERNEL = $env:KERNEL
-          if ((Test-Path "$KERNEL") -and (Test-Path "$KERNEL/flake.nix") -and (Test-Path "$KERNEL/build.toml")) {
+          # Ported kernels keep build.toml in <kernel>/src; the flake stays at
+          # <kernel> and points nix at it.
+          $CONFIG = if (Test-Path "$KERNEL/src/build.toml") { "$KERNEL/src" } else { "$KERNEL" }
+          if ((Test-Path "$KERNEL") -and (Test-Path "$KERNEL/flake.nix") -and (Test-Path "$CONFIG/build.toml")) {
             echo "kernel=$KERNEL" >> $env:GITHUB_OUTPUT
+            echo "config=$CONFIG" >> $env:GITHUB_OUTPUT
             echo "skip=false" >> $env:GITHUB_OUTPUT
           } else {
             echo "skip=true" >> $env:GITHUB_OUTPUT
@@ -174,9 +186,11 @@ jobs:
         shell: pwsh
         env:
           KERNEL: ${{ steps.validate.outputs.kernel }}
+          CONFIG: ${{ steps.validate.outputs.config }}
           BACKENDS: ${{ inputs.backends }}
         run: |
           $KERNEL = $env:KERNEL
+          $CONFIG = $env:CONFIG
           $BACKEND = "${{ matrix.platform.backend }}"
           $backends = "$env:BACKENDS" -split ","
 
@@ -189,7 +203,7 @@ jobs:
           # Check CUDA minimum version requirement from build.toml [general.cuda] minver
           if ($BACKEND -eq "cuda") {
             $CUDA_VERSION = "${{ matrix.platform.cuda }}"
-            $buildToml = Get-Content "${KERNEL}/build.toml" -Raw
+            $buildToml = Get-Content "${CONFIG}/build.toml" -Raw
             if ($buildToml -match 'minver\s*=\s*"([^"]+)"') {
               $minver = $matches[1]
               $cudaMajorMinor = ($CUDA_VERSION -split '\.')[0..1] -join '.'
@@ -369,12 +383,13 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           KERNEL_SOURCE: ${{ steps.validate.outputs.kernel }}
+          KERNEL_CONFIG: ${{ steps.validate.outputs.config }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
           $KB = "$env:GITHUB_WORKSPACE\kernels\kernel-builder\target\debug\kernel-builder.exe"
 
           # Check if build.toml exists and has version = 1
-          $buildTomlPath = "$env:KERNEL_SOURCE\build.toml"
+          $buildTomlPath = "$env:KERNEL_CONFIG\build.toml"
           if (Test-Path $buildTomlPath) {
             $content = Get-Content $buildTomlPath -Raw
             if ($content -match '(?m)^\s*version\s*=\s*1\s*(\r)?$' -and $content -notmatch '(?m)^\s*branch\s*=') {

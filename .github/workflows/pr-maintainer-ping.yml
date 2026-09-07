@@ -1,0 +1,29 @@
+name: Ping kernel maintainers
+
+on:
+  # This safely exposes the webhook to fork PRs because only the base branch is checked out.
+  pull_request_target:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-maintainer-ping-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    name: Notify maintainers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Notify maintainers of touched kernels
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SLACK_WEBHOOK_URL_MAINTAINERS: ${{ secrets.SLACK_WEBHOOK_URL_MAINTAINERS }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 .github/scripts/kernel_maintainers.py notify --pr "$PR_NUMBER"

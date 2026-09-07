@@ -1,6 +1,7 @@
 [general]
 name = "megablocks"
 version = 1
+edition = 5
 license = "Apache-2.0"
 backends = [
     "cuda",
@@ -18,22 +19,93 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
+[kernel.megablocks_xpu]
+backend = "xpu"
+depends = [
+    "torch",
+    "sycl_tla",
+]
+src = [
+    "csrc_xpu/utils.h",
+    "csrc_xpu/dispatch_utils.h",
+    "csrc_xpu/xpu_features.hpp",
+    "csrc_xpu/core/registration.h",
+    "csrc_xpu/activation.cpp",
+    "csrc_xpu/activation.h",
+    "csrc_xpu/moe/moe_ops.h",
+    "csrc_xpu/moe/moe_align_sum_kernels.cpp",
+    "csrc_xpu/moe/moe_lora_align_sum_kernels.cpp",
+    "csrc_xpu/moe/moe_gather.cpp",
+    "csrc_xpu/moe/topk_softmax.cpp",
+    "csrc_xpu/moe/grouped_topk.cpp",
+    "csrc_xpu/moe/fused_grouped_topk.cpp",
+    "csrc_xpu/moe/fused_moe_prologue.cpp",
+    "csrc_xpu/moe/fused_moe_prologue.hpp",
+    "csrc_xpu/grouped_gemm/grouped_gemm_interface.cpp",
+    "csrc_xpu/grouped_gemm/grouped_gemm_interface.h",
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.cpp",
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.h",
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/gemm_xe2.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/gemm_xe2_policy.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/xe2_target_ns.hpp",
+]
+
+[kernel.megablocks_rocm]
+backend = "rocm"
+depends = ["torch"]
+rocm-archs = [
+    "gfx942",
+    "gfx950",
+]
+src = [
+    "csrc/cumsum.h",
+    "csrc/cumsum.cu",
+    "csrc/histogram.h",
+    "csrc/histogram.cu",
+    "csrc/indices.h",
+    "csrc/indices.cu",
+    "csrc/replicate.h",
+    "csrc/replicate.cu",
+    "csrc/sort.h",
+    "csrc/sort.cu",
+]
+
+[kernel.megablocks_cpu]
+backend = "cpu"
+depends = ["torch"]
+include = ["csrc_cpu"]
+src = [
+    "csrc_cpu/cpu_features.hpp",
+    "csrc_cpu/moe_dispatcher.h",
+    "csrc_cpu/moe_dispatcher.cpp",
+    "csrc_cpu/moe_fallback.h",
+    "csrc_cpu/moe_fallback.cpp",
+]
+
+[kernel.megablocks_xpu_cri]
+backend = "xpu"
+depends = [
+    "torch",
+    "sycl_tla",
+]
+sycl-flags = [
+    "-fsycl-targets=spir64_gen",
+    "-D__SYCL_TARGET_INTEL_GPU_CRI__=1",
+]
+src = [
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2_cri.cpp",
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.h",
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/gemm_xe2.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/gemm_xe2_policy.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/xe2_target_ns.hpp",
+]
+
 [kernel.megablocks]
 backend = "cuda"
-cuda-capabilities = [
-    "7.0",
-    "7.2",
-    "7.5",
-    "8.0",
-    "8.6",
-    "8.7",
-    "8.9",
-    "9.0",
-    "10.0",
-    "10.1",
-    "11.8",
-    "12.0",
-]
 depends = [
     "torch",
     "cutlass_3_8",
@@ -80,67 +152,4 @@ src = [
     "csrc_cpu/cpu_moe_kernel.cpp",
     "csrc_cpu/cpu_moe_fp.cpp",
     "csrc_cpu/cpu_moe_int8.cpp",
-]
-
-[kernel.megablocks_xpu]
-backend = "xpu"
-depends = [
-    "torch",
-    "sycl_tla",
-]
-src = [
-    "csrc_xpu/utils.h",
-    "csrc_xpu/dispatch_utils.h",
-    "csrc_xpu/core/registration.h",
-    "csrc_xpu/activation.cpp",
-    "csrc_xpu/activation.h",
-    "csrc_xpu/moe/moe_ops.h",
-    "csrc_xpu/moe/moe_align_sum_kernels.cpp",
-    "csrc_xpu/moe/moe_lora_align_sum_kernels.cpp",
-    "csrc_xpu/moe/moe_gather.cpp",
-    "csrc_xpu/moe/topk_softmax.cpp",
-    "csrc_xpu/moe/grouped_topk.cpp",
-    "csrc_xpu/moe/fused_grouped_topk.cpp",
-    "csrc_xpu/moe/fused_moe_prologue.cpp",
-    "csrc_xpu/moe/fused_moe_prologue.hpp",
-    "csrc_xpu/grouped_gemm/grouped_gemm_interface.cpp",
-    "csrc_xpu/grouped_gemm/grouped_gemm_interface.h",
-    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.cpp",
-    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.h",
-    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp",
-    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp",
-    "csrc_xpu/grouped_gemm/xe_2/gemm_xe2.hpp",
-    "csrc_xpu/grouped_gemm/xe_2/gemm_xe2_policy.hpp",
-]
-
-[kernel.megablocks_cpu]
-backend = "cpu"
-depends = ["torch"]
-include = ["csrc_cpu"]
-src = [
-    "csrc_cpu/cpu_features.hpp",
-    "csrc_cpu/moe_dispatcher.h",
-    "csrc_cpu/moe_dispatcher.cpp",
-    "csrc_cpu/moe_fallback.h",
-    "csrc_cpu/moe_fallback.cpp",
-]
-
-[kernel.megablocks_rocm]
-backend = "rocm"
-depends = ["torch"]
-rocm-archs = [
-    "gfx942",
-    "gfx950",
-]
-src = [
-    "csrc/cumsum.h",
-    "csrc/cumsum.cu",
-    "csrc/histogram.h",
-    "csrc/histogram.cu",
-    "csrc/indices.h",
-    "csrc/indices.cu",
-    "csrc/replicate.h",
-    "csrc/replicate.cu",
-    "csrc/sort.h",
-    "csrc/sort.cu",
 ]

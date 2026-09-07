@@ -71,7 +71,10 @@ def main():
         sys.exit(1)
 
     flake_nix = kernel_path / "flake.nix"
-    build_toml = kernel_path / "build.toml"
+    # Ported kernels keep build.toml in <kernel>/src; the flake stays at <kernel>.
+    build_toml = kernel_path / "src" / "build.toml"
+    if not build_toml.is_file():
+        build_toml = kernel_path / "build.toml"
 
     if not flake_nix.exists() or not build_toml.exists():
         print(

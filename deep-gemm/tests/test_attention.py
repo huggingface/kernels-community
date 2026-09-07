@@ -3,14 +3,21 @@ import random
 import torch
 from typing import Tuple, List
 
-import deep_gemm
-from deep_gemm.testing import (
-    bench_kineto,
-    calc_diff, count_bytes,
-    ignore_env, get_arch_major,
-    test_filter
-)
-from deep_gemm.utils import ceil_div, per_custom_dims_cast_to_fp8, per_token_cast_to_fp4, cast_back_from_fp4
+import kernels
+
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+
+bench_kineto = deep_gemm.testing.bench_kineto
+calc_diff = deep_gemm.testing.calc_diff
+count_bytes = deep_gemm.testing.count_bytes
+ignore_env = deep_gemm.testing.ignore_env
+get_arch_major = deep_gemm.testing.get_arch_major
+test_filter = deep_gemm.testing.test_filter
+
+ceil_div = deep_gemm.utils.ceil_div
+per_custom_dims_cast_to_fp8 = deep_gemm.utils.per_custom_dims_cast_to_fp8
+per_token_cast_to_fp4 = deep_gemm.utils.per_token_cast_to_fp4
+cast_back_from_fp4 = deep_gemm.utils.cast_back_from_fp4
 
 from generators import get_arch_major, generate_normal, get_ue8m0_usage, get_kernel_types, reset_seed, MajorTypeAB
 

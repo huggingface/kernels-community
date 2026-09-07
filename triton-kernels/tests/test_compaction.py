@@ -1,6 +1,12 @@
 import pytest
 import torch
-from triton_kernels.compaction import compaction, compaction_torch
+
+import kernels
+
+triton_kernels = kernels.get_kernel("kernels-community/triton-kernels", version=1)
+
+compaction = triton_kernels.compaction.compaction
+compaction_torch = triton_kernels.compaction.compaction_torch
 
 
 @pytest.mark.parametrize("n_tokens, n_cols, k, p", [

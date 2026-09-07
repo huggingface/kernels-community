@@ -63,8 +63,16 @@ permissions:
   statuses: write
   id-token: write
 
+# These build workflows are reachable only via workflow_dispatch, so `github.head_ref`
+# is always empty and the group used to collapse to `github.run_id` -- unique per run,
+# which made `cancel-in-progress` a no-op. Key off the dispatch inputs instead so a newer
+# build supersedes the one still in flight for the same PR + kernel (the platform is
+# already distinguished by `github.workflow`, so unrelated kernels/platforms on the same
+# PR are untouched). `upload` stays in the key so a cheap PR CI build cannot cancel a
+# `/kernel-bot build-and-stage` mid Hub upload. Dispatches without a `pr_number` (releases
+# off the default branch) still fall back to `run_id` and are never cancelled.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ inputs.pr_number || github.run_id }}-${{ inputs.kernel_name }}-upload-${{ inputs.upload }}
   cancel-in-progress: true
 
 jobs:
@@ -148,8 +156,13 @@ jobs:
         env:
           KERNEL: ${{ inputs.kernel_name }}
         run: |
-          if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$KERNEL/build.toml" ]; then
+          # Ported kernels keep build.toml in <kernel>/src; the flake stays at
+          # <kernel> and points nix at it.
+          CONFIG="$KERNEL"
+          [ -f "$KERNEL/src/build.toml" ] && CONFIG="$KERNEL/src"
+          if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$CONFIG/build.toml" ]; then
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+            echo "config=$CONFIG" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
           else
             echo "skip=true" >> $GITHUB_OUTPUT
@@ -159,10 +172,10 @@ jobs:
       - name: Check that repo-id is present
         if: steps.validate.outputs.skip == 'false' && inputs.mode == 'pr'
         env:
-          KERNEL: ${{ steps.validate.outputs.kernel }}
+          CONFIG: ${{ steps.validate.outputs.config }}
         run: |
-          if ! cat $KERNEL/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
-            echo "Mandatory repo-id is missing in $KERNEL/build.toml"
+          if ! cat $CONFIG/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
+            echo "Mandatory repo-id is missing in $CONFIG/build.toml"
             exit 1
           fi
 
@@ -227,14 +240,17 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           KERNEL: ${{ steps.validate.outputs.kernel }}
+          CONFIG: ${{ steps.validate.outputs.config }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
           TARGET_FLAG=$(python3 .github/scripts/hub_pr_upload_args.py upload-args "$KERNEL" "$REPO_PREFIX")
+          # Resolve before the cd: CONFIG is repo-root relative and may be <kernel>/src.
+          BUILD_TOML="$PWD/$CONFIG/build.toml"
           cd "$KERNEL"
 
-          if [ -f "build.toml" ]; then
-            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
-            BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
+          if [ -f "$BUILD_TOML" ]; then
+            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' "$BUILD_TOML" || true)
+            BRANCH=$(grep -E '^\s*branch\s*=' "$BUILD_TOML" || true)
             if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
               nix run -L github:huggingface/kernels#kernel-builder -- upload \
                 --repo-type kernel $TARGET_FLAG --branch main \
@@ -312,5 +328,5 @@ jobs:
           REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
           BODY=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" --jq .body)
-          BODY=$(python3 .github/scripts/format_hub_upload_comment.py --base "$BODY" "$KERNEL" "$REPO_PREFIX" hub-uploads/**/*.json)
+          BODY=$(python3 .github/scripts/format_hub_upload_comment.py --base "$BODY" "$KERNEL" "$REPO_PREFIX" hub-uploads)
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" -f body="$BODY"
