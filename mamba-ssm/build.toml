@@ -1,9 +1,12 @@
 [general]
 name = "mamba-ssm"
-version = 2
+version = 3
 edition = 5
 license = "Apache-2.0"
-backends = ["cuda"]
+backends = [
+    "cuda",
+    "xpu",
+]
 python-depends = ["einops"]
 
 [general.hub]
@@ -50,4 +53,16 @@ src = [
     "causal-conv1d/causal_conv1d.h",
     "causal-conv1d/causal_conv1d_update.cu",
     "causal-conv1d/static_switch.h",
+]
+
+[kernel.causal_conv1d_xpu]
+backend = "xpu"
+depends = ["torch"]
+include = ["causal-conv1d-xpu"]
+src = [
+    "causal-conv1d-xpu/causal_conv1d_xpu_bwd.cpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_common.hpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_fwd.cpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu.hpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_update.cpp",
 ]
