@@ -284,10 +284,15 @@ if not (MOCK or REPLOT):
     triton_kernels_hub = get_kernel("kernels-community/gpt-oss-triton-kernels", version=1, trust_remote_code=True)
     _tfmx.triton_kernels_hub = triton_kernels_hub
 
-DEV = "cuda" if torch.cuda.is_available() else "xpu"
+if torch.cuda.is_available():
+    DEV = "cuda"
+    DEV_MASK_ENV = "CUDA_VISIBLE_DEVICES"
+elif torch.xpu.is_available():
+    DEV = "xpu"
+    DEV_MASK_ENV = "ZE_AFFINITY_MASK"
+else:
+    raise RuntimeError("no usable accelerator found (tried cuda, xpu); this benchmark needs a GPU")
 ACCEL = getattr(torch, DEV)  # torch.cuda / torch.xpu: synchronize(), get_device_name()
-# Level-Zero (Intel XPU) masks devices with ZE_AFFINITY_MASK, CUDA/ROCm with CUDA_VISIBLE_DEVICES.
-DEV_MASK_ENV = "CUDA_VISIBLE_DEVICES" if DEV == "cuda" else "ZE_AFFINITY_MASK"
 DECODE_TOKENS = 1
 PREFILL_TOKENS = 256 if SMOKE else 8192
 
