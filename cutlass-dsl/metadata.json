@@ -1,0 +1,12 @@
+{
+  "name": "cutlass-dsl",
+  "id": "_cutlass_dsl_89d4054",
+  "version": 3,
+  "kernels-minver": "0.14.0",
+  "license": "BSD-3-Clause",
+  "python-depends": [],
+  "kernel-depends": [],
+  "backend": {
+    "type": "cuda"
+  }
+}
