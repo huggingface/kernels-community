@@ -128,3 +128,50 @@ def test_rotary_equivalence(batch_size, nheads, seqlen, headdim, rotary_dim, qk_
         assert torch.equal(
             k_kernel[..., 2 * rotary_dim:], k_orig[..., 2 * rotary_dim:]
         ), "Non-rotated part of K should be unchanged"
+
+
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb_transformers_ref(q, k, cos, sin, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    rotary_dim = cos.shape[-1]
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    q_embed = torch.cat([q_embed, q_pass], dim=-1)
+    k_embed = torch.cat([k_embed, k_pass], dim=-1)
+    return q_embed, k_embed
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("nheads", [8, 16])
+@pytest.mark.parametrize("seqlen", [128, 256])
+@pytest.mark.parametrize("headdim, rotary_dim", [(128, 128), (128, 32), (64, 32), (64, 16), (80, 20)])
+@pytest.mark.parametrize("dtype, atol, rtol", [(torch.float32, 1e-5, 1e-5)])
+def test_apply_rotary_transformers(batch_size, nheads, seqlen, headdim, rotary_dim, dtype, atol, rtol):
+    device = infer_device()
+    if device is None:
+        pytest.skip("No suitable device found for testing")
+
+    q = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
+
+    freqs = torch.randn(batch_size, seqlen, rotary_dim // 2, device=device, dtype=torch.float32)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos().to(dtype)
+    sin = emb.sin().to(dtype)
+
+    ref_q, ref_k = apply_rotary_pos_emb_transformers_ref(q, k, cos, sin, unsqueeze_dim=1)
+
+    layer = rotary.layers.apply_rotary_transformers()
+    out_q, out_k = layer(q, k, cos, sin, unsqueeze_dim=1)
+
+    assert torch.allclose(ref_q, out_q, atol=atol, rtol=rtol)
+    assert torch.allclose(ref_k, out_k, atol=atol, rtol=rtol)
+
