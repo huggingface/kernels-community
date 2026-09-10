@@ -1,6 +1,6 @@
 [general]
 name = "causal-conv1d"
-version = 1
+version = 2
 edition = 5
 license = "BSD-3-Clause"
 backends = [
