@@ -53,7 +53,9 @@ def device_name(device=None) -> str:
     """The GPU's name as it appears in a config filename (spaces to underscores), e.g.
     ``NVIDIA_B200``. Configs never cross devices, so a file tuned for a bigger GPU is inert
     rather than harmful on a smaller one."""
-    return torch.cuda.get_device_name(device).replace(" ", "_").replace("/", "_")
+    # ``get_device_module()`` resolves to the active accelerator (torch.cuda, torch.xpu, ...);
+    # ``torch.accelerator`` itself has no ``get_device_name``.
+    return torch.get_device_module().get_device_name(device).replace(" ", "_").replace("/", "_")
 
 
 def config_file_name(fn_name: str, device: str | None = None) -> str:

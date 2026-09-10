@@ -25,7 +25,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
 
-from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, decode_pdl
+from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, decode_pdl, pdl_launch_kwargs
 from .recipes import Epilogue, Quantization, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_recipe
 from .epilogue import fused_glu
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide
@@ -45,7 +45,7 @@ from .tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_finalize, acc_init, add_bias, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
+from .pruners import PATH_ANCHOR_AXES, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, gate_tile_cap_pruner, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
 
 
 @triton.jit
@@ -194,8 +194,9 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     those rows in the MMA M dim, padding the single token to the N=16 atom; column 0 of the
     ``[BN, 16]`` accumulator is the result. No-swap keeps the token in M (padded to 16).
 
-    ``GATE`` fuses the gate|up projection: ``B`` is the ``(E, 2N, K)`` stack (gate rows [0,N),
-    interleaved rows), run as two dots (the decode-validated form), SwiGLU-combined, and — under
+    ``GATE`` fuses the gate|up projection: ``B`` is the ``(E, 2N, K)`` gate|up weight with the
+    two projections INTERLEAVED per row (gate even, up odd — ``split_gate_up`` is the inverse),
+    run as two dots (the decode-validated form), SwiGLU-combined, and — under
     an ``OUTPUT_RECIPE`` — FP8-requantized into ``C`` + a per-(row, block) scalar ``Cs``. Every gate arm
     folds out at compile time; ``GATE=False`` is the plain GEMM, bit-identical."""
     if PDL:
@@ -535,6 +536,7 @@ def _rebind_batched_mx_bs_descriptor(nargs):
     prune_configs_by={
         "early_config_prune": compose_pruners(
             mx_config_pruner("K", "N"), swizzled_scale_config_pruner(allow_gate_subblock=True), smem_pruner(),
+            gate_tile_cap_pruner(),
             dot_scaled_staging_pruner(),
         )
     },
@@ -1128,7 +1130,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
 
     return [C, Cs] if requant else [C]
@@ -1256,7 +1258,7 @@ def w8a8_block_static_fp8_matmul_batched(
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
 
     return [C, Cs] if requant else [C]
@@ -1339,7 +1341,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             expert_ids.stride(0),
             num_experts=num_experts,
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
 
     return C
@@ -1540,7 +1542,7 @@ def mx_dynamic_matmul_batched(
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
     return [C, Cs] if requant else [C]
 
@@ -1623,7 +1625,7 @@ def full_precision_matmul_batched(
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
 
     return [C]
@@ -1737,7 +1739,7 @@ def mx_weight_only_matmul_batched(
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
 
     return [C]
