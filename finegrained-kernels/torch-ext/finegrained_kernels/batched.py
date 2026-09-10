@@ -25,7 +25,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
 
-from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, decode_pdl
+from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, decode_pdl, pdl_launch_kwargs
 from .recipes import Epilogue, Quantization, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_recipe
 from .epilogue import fused_glu
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide
@@ -1130,7 +1130,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
 
     return [C, Cs] if requant else [C]
@@ -1258,7 +1258,7 @@ def w8a8_block_static_fp8_matmul_batched(
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
 
     return [C, Cs] if requant else [C]
@@ -1341,7 +1341,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             expert_ids.stride(0),
             num_experts=num_experts,
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
 
     return C
@@ -1542,7 +1542,7 @@ def mx_dynamic_matmul_batched(
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
     return [C, Cs] if requant else [C]
 
@@ -1625,7 +1625,7 @@ def full_precision_matmul_batched(
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
 
     return [C]
@@ -1739,7 +1739,7 @@ def mx_weight_only_matmul_batched(
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
 
     return [C]

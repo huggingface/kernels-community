@@ -14,10 +14,8 @@ from finegrained_kernels.compat import (  # type: ignore
 # ── Device + capability ───────────────────────────────────────────────────────
 
 TEST_DEVICE = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "xpu"
-    if hasattr(torch, "xpu") and torch.xpu.is_available()
+    torch.accelerator.current_accelerator().type
+    if torch.accelerator.is_available()
     else None
 )
 # FP8 kernels require Hopper (SM90) or newer on CUDA. SM89 (Ada Lovelace) can
@@ -47,11 +45,11 @@ DTYPE_TO_TOL = {
 
 
 def accelerator_module():
-    if TEST_DEVICE == "cuda":
-        return torch.cuda
-    if TEST_DEVICE == "xpu":
-        return torch.xpu
-    raise RuntimeError("No supported accelerator available")
+    """The backend module (torch.cuda / torch.xpu) for the active accelerator, for the few
+    calls ``torch.accelerator`` does not expose (e.g. ``get_device_name``)."""
+    if TEST_DEVICE is None:
+        raise RuntimeError("No supported accelerator available")
+    return torch.get_device_module(TEST_DEVICE)
 
 
 def maybe_compile(fn, enabled):

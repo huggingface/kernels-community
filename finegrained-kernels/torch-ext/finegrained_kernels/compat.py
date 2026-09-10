@@ -35,10 +35,21 @@ DECODE_PDL = os.environ.get("FINEGRAINED_PDL", "1") == "1"
 
 
 def decode_pdl() -> bool:
-    """PDL for this launch: the flag, and not under torch.compile — dynamo's TTIR access analysis
-    cannot read the ``griddepcontrol`` inline asm and would mark every input mutated (extra copies,
-    no fusion). Deployment decode runs eager launches under cudagraphs, where PDL applies."""
-    return DECODE_PDL and not torch.compiler.is_compiling()
+    """PDL for this launch: the flag, a CUDA backend, and not under torch.compile — dynamo's TTIR
+    access analysis cannot read the ``griddepcontrol`` inline asm and would mark every input mutated
+    (extra copies, no fusion). Deployment decode runs eager launches under cudagraphs, where PDL
+    applies. ``griddepcontrol`` is an NVIDIA primitive, so every other backend reads False and the
+    ``gdc_*`` intrinsics stay behind their ``PDL`` constexpr."""
+    return DECODE_PDL and get_active_device_type() == "cuda" and not torch.compiler.is_compiling()
+
+
+def pdl_launch_kwargs() -> dict:
+    """``launch_pdl=`` as launch kwargs, or nothing on backends that do not know the option.
+
+    The value is not the issue — Triton rejects the *keyword* it does not recognise
+    (``KeyError: Keyword argument launch_pdl was specified but unrecognised``), which fails every
+    autotune config on the XPU backend. So the kwarg has to be absent, not False."""
+    return {"launch_pdl": True} if decode_pdl() else {}
 from torch.library import triton_op, wrap_triton
 
 from .bayesian_autotuner import bayesian_autotune
@@ -333,7 +344,7 @@ def weighted_reduce(
             NUM_EXPERTS=num_experts,
             SIMULATE_UNFUSED=simulate_unfused,
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
     return reduced
 

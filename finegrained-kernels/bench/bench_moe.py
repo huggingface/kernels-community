@@ -291,6 +291,7 @@ DEV_MASK_ENV = {"cuda": "CUDA_VISIBLE_DEVICES", "xpu": "ZE_AFFINITY_MASK"}.get(D
 if DEV_MASK_ENV is None:
     raise RuntimeError(f"unsupported accelerator {DEV!r}; this benchmark needs cuda or xpu")
 ACCEL = torch.get_device_module(DEV)
+SUPPORTS_CUDAGRAPH = DEV == "cuda"
 DECODE_TOKENS = 1
 PREFILL_TOKENS = 256 if SMOKE else 8192
 
@@ -1059,7 +1060,7 @@ ARMS = {
 
 
 def _context_poisoned(tag, mode):
-    """Probe the CUDA context right after an arm ran. An async fault — e.g. an out-of-bounds
+    """Probe the accelerator context right after an arm ran. An async fault — e.g. an out-of-bounds
     write that lands in a neighbouring allocation — leaves the context poisoned WITHOUT failing
     the arm that caused it: that arm posts a normal latency and the NEXT arm dies instead. That
     is how one kernel silently blanked 10 cells and dropped a whole problem from a run, with the
@@ -1067,7 +1068,7 @@ def _context_poisoned(tag, mode):
     try:
         p = torch.empty(64, 64, device=DEV, dtype=torch.float32).normal_()
         float(p.sum())
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         return False
     except Exception as e:
         print(f"      !! CONTEXT POISONED by [{tag} {mode}]: {type(e).__name__}: "
