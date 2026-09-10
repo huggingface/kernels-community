@@ -291,7 +291,6 @@ DEV_MASK_ENV = {"cuda": "CUDA_VISIBLE_DEVICES", "xpu": "ZE_AFFINITY_MASK"}.get(D
 if DEV_MASK_ENV is None:
     raise RuntimeError(f"unsupported accelerator {DEV!r}; this benchmark needs cuda or xpu")
 ACCEL = torch.get_device_module(DEV)
-SUPPORTS_CUDAGRAPH = DEV == "cuda"
 DECODE_TOKENS = 1
 PREFILL_TOKENS = 256 if SMOKE else 8192
 
