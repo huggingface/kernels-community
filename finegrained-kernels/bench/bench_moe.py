@@ -284,15 +284,13 @@ if not (MOCK or REPLOT):
     triton_kernels_hub = get_kernel("kernels-community/gpt-oss-triton-kernels", version=1, trust_remote_code=True)
     _tfmx.triton_kernels_hub = triton_kernels_hub
 
-if torch.cuda.is_available():
-    DEV = "cuda"
-    DEV_MASK_ENV = "CUDA_VISIBLE_DEVICES"
-elif torch.xpu.is_available():
-    DEV = "xpu"
-    DEV_MASK_ENV = "ZE_AFFINITY_MASK"
-else:
-    raise RuntimeError("no usable accelerator found (tried cuda, xpu); this benchmark needs a GPU")
-ACCEL = getattr(torch, DEV)  # torch.cuda / torch.xpu: synchronize(), get_device_name()
+DEV = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+# Only the device-visibility knob for the sharded runner is backend-specific; every other
+# accelerator call goes through torch.accelerator.
+DEV_MASK_ENV = {"cuda": "CUDA_VISIBLE_DEVICES", "xpu": "ZE_AFFINITY_MASK"}.get(DEV)
+if DEV_MASK_ENV is None:
+    raise RuntimeError(f"unsupported accelerator {DEV!r}; this benchmark needs cuda or xpu")
+ACCEL = torch.get_device_module(DEV)
 DECODE_TOKENS = 1
 PREFILL_TOKENS = 256 if SMOKE else 8192
 
@@ -1083,7 +1081,7 @@ def bench_modes(run, tag):
     res, out = {}, None
     try:
         out = run()
-        ACCEL.synchronize()  # warm + tune before ANY timing/capture
+        torch.accelerator.synchronize()  # warm + tune before ANY timing/capture
         res["eager"] = do_bench(run, return_mode="min") * 1e3
         print(f"      {tag:14s} eager      {res['eager']:9.1f}us", flush=True)
     except Exception as e:
@@ -1100,7 +1098,7 @@ def bench_modes(run, tag):
     try:
         crun = torch.compile(run, mode="max-autotune", fullgraph=True)
         cout = crun()
-        ACCEL.synchronize()
+        torch.accelerator.synchronize()
         # Self-check the compiled graph against THIS arm's own eager output before timing it.
         # The cross-impl parity below is computed from eager only, so without this a compiled
         # graph that drops work (e.g. an out-param matmul DCE'd because its mutation isn't
