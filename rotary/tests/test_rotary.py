@@ -28,30 +28,8 @@ def apply_rotary_torch(x1: torch.Tensor, x2: torch.Tensor, cos: torch.Tensor, si
     return out1, out2
 
 
-def apply_rotary_torch_wrapper(
-    q, k, cos, sin, conj: bool = False, transformers_style: bool = False, unsqueeze_dim: int = 1
-):
-    """the wrapper for apply_rotary_torch.
-
-    If transformers_style is True, implements the HuggingFace transformers RoPE convention
-    (rotate_half with duplicated frequencies), supporting partial RoPE where cos.shape[-1] <= q.shape[-1].
-    """
-    if transformers_style:
-        cos = cos.unsqueeze(unsqueeze_dim)
-        sin = sin.unsqueeze(unsqueeze_dim)
-        rotary_dim = min(cos.shape[-1], q.shape[-1])
-        q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-        k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-
-        def rotate_half(x):
-            x1 = x[..., : x.shape[-1] // 2]
-            x2 = x[..., x.shape[-1] // 2 :]
-            return torch.cat((-x2, x1), dim=-1)
-
-        q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-        k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
-        return torch.cat([q_embed, q_pass], dim=-1), torch.cat([k_embed, k_pass], dim=-1)
-
+def apply_rotary_torch_wrapper(q, k, cos, sin, conj: bool = False):
+    """the wrapper for apply_rotary_torch"""
     rotary_dim = cos.shape[-1]
 
     # apply rotation encoding to Q
@@ -69,16 +47,8 @@ def apply_rotary_torch_wrapper(
     return q_out, k_out
 
 
-def apply_rotary_kernel_wrapper(
-    q, k, cos, sin, conj: bool = False, transformers_style: bool = False, unsqueeze_dim: int = 1, as_module: bool = False
-):
+def apply_rotary_kernel_wrapper(q, k, cos, sin, conj: bool = False):
     """the wrapper for apply_rotary_kernel"""
-    if transformers_style:
-        if as_module:
-            layer = rotary.layers.apply_rotary_transformers()
-            return layer(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-        return rotary.apply_rotary_transformers(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
-
     rotary_dim = cos.shape[-1]
 
     # apply rotation encoding to Q
@@ -92,11 +62,10 @@ def apply_rotary_kernel_wrapper(
     rotary.apply_rotary(k1, k2, cos, sin, k1, k2, conj)
 
 
-
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("nheads", [8, 16])
 @pytest.mark.parametrize("seqlen", [128, 256])
-@pytest.mark.parametrize("headdim, rotary_dim", [(64, 32), (128, 64), (64, 30), (128, 32)])
+@pytest.mark.parametrize("headdim, rotary_dim", [(64, 32), (128, 64), (64, 30), (128, 32), (64, 16), (80, 20)])
 @pytest.mark.parametrize("qk_dim", [3, 4])
 @pytest.mark.parametrize(
     "dtype, atol, rtol",
@@ -160,56 +129,28 @@ def test_rotary_equivalence(batch_size, nheads, seqlen, headdim, rotary_dim, qk_
             k_kernel[..., 2 * rotary_dim:], k_orig[..., 2 * rotary_dim:]
         ), "Non-rotated part of K should be unchanged"
 
+    # verify transformers layer and functional APIs match when not conjugated
+    if not conj and qk_dim == 4:
+        rot_dim_total = 2 * rotary_dim
+        q_trans = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
+        k_trans = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
+        freqs = torch.randn(batch_size, seqlen, rot_dim_total // 2, device=device, dtype=torch.float32)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos_trans = emb.cos().to(dtype)
+        sin_trans = emb.sin().to(dtype)
 
-def apply_rotary_transformers_torch_wrapper(q, k, cos, sin, unsqueeze_dim=1):
-    """Convenience alias delegating to apply_rotary_torch_wrapper with transformers_style=True."""
-    return apply_rotary_torch_wrapper(q, k, cos, sin, transformers_style=True, unsqueeze_dim=unsqueeze_dim)
+        out_q_fn, out_k_fn = rotary.apply_rotary_transformers(q_trans, k_trans, cos_trans, sin_trans, unsqueeze_dim=1)
+        layer = rotary.layers.apply_rotary_transformers()
+        out_q_mod, out_k_mod = layer(q_trans, k_trans, cos_trans, sin_trans, unsqueeze_dim=1)
 
+        assert torch.equal(out_q_fn, out_q_mod), "Functional and module outputs should be identical"
+        assert torch.equal(out_k_fn, out_k_mod), "Functional and module outputs should be identical"
+        if rot_dim_total < headdim:
+            assert torch.equal(
+                out_q_fn[..., rot_dim_total:], q_trans[..., rot_dim_total:]
+            ), "Non-rotated part of Q should be unchanged in transformers wrapper"
+            assert torch.equal(
+                out_k_fn[..., rot_dim_total:], k_trans[..., rot_dim_total:]
+            ), "Non-rotated part of K should be unchanged in transformers wrapper"
 
-@pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("nheads", [8, 16])
-@pytest.mark.parametrize("seqlen", [128, 256])
-@pytest.mark.parametrize("headdim, rotary_dim", [(128, 128), (128, 32), (64, 32), (64, 16), (80, 20)])
-@pytest.mark.parametrize(
-    "dtype, atol, rtol",
-    [
-        (torch.float32, 1e-5, 1e-5),
-        pytest.param(
-            torch.bfloat16,
-            1e-1,
-            1e-5,
-            marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
-        ),
-    ],
-)
-@pytest.mark.parametrize("as_module", [False, True])
-def test_apply_rotary_transformers(batch_size, nheads, seqlen, headdim, rotary_dim, dtype, atol, rtol, as_module):
-    device = infer_device()
-    if device is None:
-        pytest.skip("No suitable device found for testing")
-
-    q = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
-    k = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
-
-    freqs = torch.randn(batch_size, seqlen, rotary_dim // 2, device=device, dtype=torch.float32)
-    emb = torch.cat((freqs, freqs), dim=-1)
-    cos = emb.cos().to(dtype)
-    sin = emb.sin().to(dtype)
-
-    ref_q, ref_k = apply_rotary_transformers_torch_wrapper(q, k, cos, sin, unsqueeze_dim=1)
-    out_q, out_k = apply_rotary_kernel_wrapper(
-        q.clone(), k.clone(), cos, sin, transformers_style=True, unsqueeze_dim=1, as_module=as_module
-    )
-
-    assert torch.allclose(ref_q, out_q, atol=atol, rtol=rtol), "Rotary transformation results for Q do not match"
-    assert torch.allclose(ref_k, out_k, atol=atol, rtol=rtol), "Rotary transformation results for K do not match"
-
-    # verify the non-rotated part of Q and K remains unchanged
-    if rotary_dim < headdim:
-        assert torch.equal(
-            out_q[..., rotary_dim:], q[..., rotary_dim:]
-        ), "Non-rotated part of Q should be unchanged"
-        assert torch.equal(
-            out_k[..., rotary_dim:], k[..., rotary_dim:]
-        ), "Non-rotated part of K should be unchanged"
 
