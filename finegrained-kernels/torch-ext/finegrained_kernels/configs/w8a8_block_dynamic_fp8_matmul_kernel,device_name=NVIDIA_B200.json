@@ -1,0 +1,42 @@
+{
+ "[12288, 4096, 1, false, 128, 128, \"A:torch.float8_e4m3fn\", \"As:torch.uint8\", \"B:torch.float8_e4m3fn\", \"Bs:torch.uint8\", \"C:torch.bfloat16\", \"Bias:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\"]": {
+  "A_MEMORY_MODE": "host_descriptor",
+  "BLOCK_SIZE_M": 16,
+  "BLOCK_SIZE_N": 64,
+  "B_MEMORY_MODE": "host_descriptor",
+  "WARP_SPEC": false,
+  "num_ctas": 1,
+  "num_stages": 6,
+  "num_warps": 4
+ },
+ "[12288, 4096, 14, false, 128, 128, \"A:torch.float8_e4m3fn\", \"As:torch.uint8\", \"B:torch.float8_e4m3fn\", \"Bs:torch.uint8\", \"C:torch.bfloat16\", \"Bias:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\"]": {
+  "A_MEMORY_MODE": "host_descriptor",
+  "BLOCK_SIZE_M": 128,
+  "BLOCK_SIZE_N": 128,
+  "B_MEMORY_MODE": "host_descriptor",
+  "WARP_SPEC": false,
+  "num_ctas": 1,
+  "num_stages": 4,
+  "num_warps": 4
+ },
+ "[21504, 7168, 1, false, 128, 128, \"A:torch.float8_e4m3fn\", \"As:torch.float32\", \"B:torch.float8_e4m3fn\", \"Bs:torch.float32\", \"C:torch.bfloat16\", \"Bias:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\"]": {
+  "A_MEMORY_MODE": "host_descriptor",
+  "BLOCK_SIZE_M": 16,
+  "BLOCK_SIZE_N": 64,
+  "B_MEMORY_MODE": "host_descriptor",
+  "WARP_SPEC": false,
+  "num_ctas": 1,
+  "num_stages": 5,
+  "num_warps": 4
+ },
+ "[21504, 7168, 14, false, 128, 128, \"A:torch.float8_e4m3fn\", \"As:torch.float32\", \"B:torch.float8_e4m3fn\", \"Bs:torch.float32\", \"C:torch.bfloat16\", \"Bias:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\"]": {
+  "A_MEMORY_MODE": "host_descriptor",
+  "BLOCK_SIZE_M": 128,
+  "BLOCK_SIZE_N": 128,
+  "B_MEMORY_MODE": "host_descriptor",
+  "WARP_SPEC": true,
+  "num_ctas": 1,
+  "num_stages": 5,
+  "num_warps": 8
+ }
+}

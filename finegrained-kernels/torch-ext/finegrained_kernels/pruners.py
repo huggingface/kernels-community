@@ -583,9 +583,10 @@ def block_dynamic_2d_warp_spec_pruner():
     """``early_config_prune`` for the block-dynamic 2D kernel's two WARP_SPEC compile-fail
     laws (Triton 3.7.1 PassManager, TritonGPUPipeline; charted 2026-08-13 at the
     DeepSeek-V4-Flash ue8m0 checkpoint shapes, forced-config matrices):
-      - WS + num_warps=16 fails at EVERY tile/scale-dtype (w8 compiles everywhere); the mx
-        2D and grouped kernels WS-compile w16 fine, so this is this loop's structure, not a
-        global WS law.
+      - WS + num_warps=16 fails at EVERY tile/scale-dtype (w8 compiles everywhere). The mx
+        2D kernel WS-compiles w16 fine; the bd GROUPED kernel does NOT on its pointer arm
+        (same law, see block_dynamic_grouped_matmul_pruner) — so this tracks the loop's
+        structure and memory mode, not a global WS law.
       - the implicit ``dot_scaled`` arm (``USE_DOT_SCALED``: UE8M0/uint8 ``As`` on a
         native-M tile — (BN if SWAP_AB else BM) >= 128) + WS fails at every warps/stages/
         memory-mode cell; BM=64 and non-WS all compile. fp32-scale launches never emit the
@@ -642,15 +643,19 @@ def block_dynamic_mma_width_pruner():
 
 
 
-def scale_subblock_pruner():
+def scale_subblock_pruner(min_ctas_per_sm: int = 4):
     """``early_config_prune`` for kernels whose compute tile (``BLOCK_SIZE_N``) may subdivide the
     quant block (``BLOCK_N``). One scale covers the whole block, so a narrower tile just reads its
-    own block — and it multiplies the N grid, the lever once the whole-block grid no longer fills
-    the device (a gate|up fusion halves that grid again by folding both into one program).
+    own block — and it multiplies the N grid, the lever while the whole-block grid is too thin to
+    hide the loop's latency (a gate|up fusion halves that grid again by folding both into one program).
 
-    Sub-block tiles are admitted ONLY there. A grid that already fills the device gains nothing from
-    a narrower tile, and carrying the extra tiles into every launch would spend one trial budget
-    over a 3x config space — measurably worse winners on the launches that never needed it.
+    Sub-block tiles are admitted ONLY there: below ``min_ctas_per_sm`` whole-block programs per SM.
+    "Fills the device" (one program per SM) is NOT enough at decode — the loop is latency-bound, so
+    a 192-448-program grid still gains from more, narrower tiles: forced BN=64 vs the BN=128 crown,
+    bit-identical, DSV4 fp8 decode gate 24.9 -> 23.4us and down 13.4 -> 12.2, DSV3 down 22.3 -> 21.7
+    but DSV3 gate 0.88x (2026-08-29) — a tuner call, so the fence only trims prefill, where a
+    thousands-of-programs grid never wants the 3x wider config space (measurably worse winners
+    when it carried it).
 
     A fused requant always pins the tile to the whole block: its output scale is one amax per
     (row, ``BLOCK_N``) group, which a partial tile can't compute. Raises when nothing
@@ -663,7 +668,7 @@ def scale_subblock_pruner():
         if block_n is None:
             return True
         bn = config_dim(c, args, "BLOCK_SIZE_N")
-        starved = args["S"] * triton.cdiv(args["N"], block_n) < sm_count(
+        starved = args["S"] * triton.cdiv(args["N"], block_n) < min_ctas_per_sm * sm_count(
             args["B"].device.index
         )
         if args.get("OUTPUT_RECIPE") is not None or not starved:
@@ -696,6 +701,53 @@ def packed_schedule_scope_pruner(min_bm: int = 128):
         return config_dim(c, args, "BLOCK_SIZE_M") >= min_bm
 
     return config_filter(ok)
+
+
+def weight_only_warp_spec_matched_mode_pruner():
+    """``early_config_prune`` for the weight-only grouped kernel's WARP_SPEC lowering wall
+    (Triton 3.7.1 ``TritonGPUOptimizePartitionWarps`` -> PassManager::run failed; the pass
+    cannot partition this loop when BOTH operand loads share a memory mode). Charted
+    2026-08-26 (48-cell forced-config matrix, BM 64 and 128 IDENTICAL — BM-independent):
+
+        CM          A/B modes   w4    w8    w16
+        dot         ptr/ptr     ok    ok    FAIL
+        dot         desc/desc   ok    ok    ok      (was charted FAIL/FAIL — refuted, see _BAD)
+        dot_scaled  ptr/ptr     FAIL  FAIL  FAIL
+        dot_scaled  desc/desc   ok    ok    ok      (w8 was charted FAIL — refuted)
+        MIXED modes (ptr/desc, desc/ptr): 24/24 ok at every warp count.
+        BN=32 + WS: FAIL in every cell (the tile law, fenced here).
+
+    The non-monotone warp dependence (w16 rescues desc/desc dot but breaks ptr/ptr dot) marks
+    this as the pass's internal partition feasibility, not kernel source — the source is
+    identical across passing and failing cells. Two root-cause attempts on the sibling family
+    are refuted and recorded (block_dynamic_grouped_matmul_pruner); the kernel-side remedy is
+    to stop emitting configs the pass cannot lower. Cost in the wild: 19 dead compiles per
+    weight-only tune, and under inductor ONE failing config kills the whole torch.compile
+    cell instead of scoring inf — this fence is what recovers those cells."""
+
+    # desc/desc rows REMOVED 2026-08-29: forced through the tuner's own Config objects (pre_hook
+    # intact) at the charted GPT-OSS shape, (dot, desc/desc) w4 AND w8 and (dot_scaled, desc/desc) w8
+    # all compile and run bit-identical — dot+WS+BK=128 is the gate_up's best config (2128 vs 2235us).
+    # The original matrix was charted with hand-built Configs, which skip the descriptor pre_hooks
+    # and fail every descriptor cell for the wrong reason. The pointer rows stand unrefuted.
+    _BAD = {
+        ("dot", "pointer"): {16},
+        ("dot_scaled", "pointer"): {4, 8, 16},
+    }
+
+    def ok(c, args):
+        if not c.kwargs.get("WARP_SPEC"):
+            return True
+        # BN=32 + WS fails to lower in every memory mode / warp count / compute mode probed
+        # (9/9 cells, GPT-OSS N=K=2880, 2026-08-29) — the tile law the matrix never encoded
+        if config_dim(c, args, "BLOCK_SIZE_N") == 32:
+            return False
+        a, b = c.kwargs.get("A_MEMORY_MODE"), c.kwargs.get("B_MEMORY_MODE")
+        if a != b:  # mixed modes lower everywhere
+            return True
+        return c.num_warps not in _BAD.get((c.kwargs.get("COMPUTE_MODE"), a), set())
+
+    return config_filter(ok, when=lambda args: is_sm10x())
 
 
 def weight_only_swap_scope_pruner():
@@ -747,14 +799,42 @@ def mx_2d_swap_scope_pruner(max_m: int = 16):
 
 
 
+def swizzled_out_bm_pruner():
+    """``early_config_prune`` pinning the SWIZZLE_32_4_4 requant OUTPUT arm (``SWIZZLED_OUT``) to
+    ``BLOCK_SIZE_M == BLOCK_SIZE_N == 128`` — the output-side twin of
+    ``swizzled_scales_bm_pruner``.
+
+    ``_epilogue_requant_mx`` writes the group scales straight into the down proj's swizzled
+    layout as ``q_s.reshape(1, 4, 32, REP_K_CS, 4)`` with ``REP_K_CS = (BN // group) // 4``.
+    ``q_s`` is ``[BM, BN // group]``, so the reshape balances only at ``BM == 128``
+    (``BM * (BN//group) == 128 * (BN//group)``); every other BM raises "reshape() cannot change
+    total number of elements". BN is pinned with it because the descriptor's block shape is the
+    tuned ``REP_K_CS``. The code comment there already said "BM/BN pinned 128" — this makes the
+    config space agree, instead of handing the tuner configs that cannot compile.
+
+    Measured 2026-08-26 on the gated fp4-requant cells: 288 dead compiles per tune, i.e. every
+    non-128 config of the swizzled-out key (``SWIZZLED_OUT`` is in the tune key, so the key is
+    entirely swizzled). Un-swizzled requant keeps every BM/BN — it stores Cs row-major."""
+
+    def ok(c, args):
+        return (
+            config_dim(c, args, "BLOCK_SIZE_M") == 128
+            and config_dim(c, args, "BLOCK_SIZE_N") == 128
+        )
+
+    return config_filter(ok, when=lambda args: args.get("SWIZZLED_OUT"))
+
+
 def swizzled_scales_bm_pruner():
     """``early_config_prune`` pinning the grouped MX pre-swizzled (``SWIZZLED_SCALES``) arm to
-    ``BLOCK_SIZE_M == BLOCK_SIZE_N == 128``. BM: the offline act-quant lays each expert's scale
+    ``BLOCK_SIZE_M == 128`` and a whole-128-block ``BLOCK_SIZE_N``. BM: the offline act-quant lays each expert's scale
     slab out 128-padded, and the kernel's per-tile scale-block index (``pid_m``) only lines up
     when the M tile is exactly 128 (``build_tile_layout`` pads experts on the same granularity).
     BN: the scale is read as whole 128-row SWIZZLE_32_4_4 blocks off the descriptor (under GATE,
     the gate 128-block + the up 128-block stacked into the 2*BN tile); a sub-128 BN would need a
-    partial-block read the descriptor can't express.
+    partial-block read the descriptor can't express, while any whole multiple is a multi-block bulk
+    load the pre_hook sizes per config — BN=256 wins the down GEMM (665 -> 576us at DSV4 prefill,
+    bit-identical; GATE at 256 is the scaled-MMA width cap's veto, ``mx_config_pruner``).
 
     Both pins are swizzled-slab properties, so the un-swizzled (affine) arm keeps every BM and
     BN: ``build_tile_layout`` tiles any BM with a row mask, and the affine act-scale read is
@@ -763,7 +843,7 @@ def swizzled_scales_bm_pruner():
     def ok(c, args):
         return (
             config_dim(c, args, "BLOCK_SIZE_M") == 128
-            and config_dim(c, args, "BLOCK_SIZE_N") == 128
+            and config_dim(c, args, "BLOCK_SIZE_N") % 128 == 0
         )
 
     return config_filter(ok, when=lambda args: args.get("SWIZZLED_SCALES"))
@@ -778,10 +858,11 @@ def swizzled_scale_config_pruner(allow_gate_subblock=False):
       (``REP_K = (BK // SCALE_GROUP_K) // 4``), so a smaller BK collapses ``REP_K`` to 0 and the
       reshape traps — 128 for group-32 (MX), 64 for group-16 (NVFP4). BK must also tile whole
       bands (``BK % (4 * group) == 0``).
-    - ``BLOCK_SIZE_N > 128``: the descriptor's TMA box is created at one 128-row block; the load
-      reads that block (BN=128) or a sub-tile of it (BN<128, scalar slice). A BN>128 tile would
-      need a box grown past its creation shape, which the tensormap does not honor. Decode never
-      wants BN>128 anyway (M=1 grid occupancy), so this costs no win.
+    - ``BLOCK_SIZE_N > 128`` not a whole-block multiple: the descriptor arm bulk-loads
+      ``BN // 128`` swizzled blocks (each kernel's pre_hook sizes the box per config), a sub-128 BN
+      reads a scalar slice of one block; a BN between is neither. BN=256 is a legal two-block load
+      (the GATE tile has always read one) and wins at prefill — grouped down 665 -> 576us, dense 2D
+      703 -> 552us at M=49152, bit-identical; the scaled-MMA width cap is ``mx_config_pruner``'s.
     - under ``GATE``, ``BLOCK_SIZE_N != 128``: the gate|up scale is interleaved as whole 128-row
       block pairs [g0,u0,g1,u1,...], read as one 2*BN tile; a sub-128 BN can't index a block pair
       off the descriptor. ``allow_gate_subblock`` (batched decode) admits BN in (32, 64): its
@@ -799,12 +880,17 @@ def swizzled_scale_config_pruner(allow_gate_subblock=False):
         bn = config_dim(c, args, "BLOCK_SIZE_N")
         if args.get("GATE"):
             return bn == 128 or (allow_gate_subblock and bn in (32, 64))
-        return bn <= 128
+        # BN=256 pipelines OOM smem at num_stages >= 5 (253 KB at s5, 304 KB at s6 for the fp8 x fp4
+        # and fp8 x fp8 dot_scaled tiles, BK=128; s4 fits) — below smem_pruner's keep-side bound, so
+        # without this the TPE burns whole 200-trial budgets on dead compiles (observed 2026-08-29).
+        if bn > 128 and c.num_stages >= 5:
+            return False
+        return bn <= 128 or bn % 128 == 0
 
     def raise_no_swizzled_tile(configs, args):
         raise ValueError(
             "no autotune config can serve pre-swizzled scales for this launch (the "
-            "SWIZZLE_32_4_4 read needs BLOCK_SIZE_K % 128 == 0 and a <=128-row N tile; "
+            "SWIZZLE_32_4_4 read needs BLOCK_SIZE_K % 128 == 0 and a <=128-row or 128-multiple N tile; "
             f"GATE={bool(args.get('GATE'))}) — the contraction dim likely has no "
             "128-dividing tile; pass affine (row-major) scales for this shape."
         )
@@ -824,15 +910,22 @@ def block_dynamic_grouped_matmul_pruner():
     runs per cell, big and tiny shapes:
 
     - ``warp_specialize`` compiles iff ``num_warps % 4 == 0`` (its async partitions) and
-      ``BLOCK_SIZE_M >= 64``, and is race-free everywhere it compiles — EXCEPT on the
-      implicit ``dot_scaled`` arm (``USE_DOT_SCALED``: uint8/UE8M0 ``As`` on a native-M
-      ``BLOCK_SIZE_M >= 128`` tile), where it lowers only from the DESCRIPTOR loads. The
-      pointer arm's masked activation load leaves an ``other=0.0`` constant that cannot
-      take ``ttg.partition`` ("op does not have expected attribute ttg.partition"), and it
-      fails at every warps/stages cell (charted 2026-08-21, forced-config matrix: pointer
-      0/6, host_descriptor 4/6 + 2 smem). Combined with the race guard below this leaves
-      the descriptor arm as the only BM=128 route for UE8M0 grouped — which is what makes
-      the native tcgen05 tile reachable at all here.
+      ``BLOCK_SIZE_M >= 64``, and is race-free everywhere it compiles — but on the POINTER
+      arm it hits a lowering wall: "'arith.constant' op does not have expected attribute
+      ttg.partition" -> PassManager::run failed (TritonGPUPipeline). The descriptor arm
+      always compiles. The obvious suspect — the masked activation load's ``other=0.0``,
+      which is the known cause of the analogous mx-grouped fence — was PROBED and is NOT
+      it: dropping the mask entirely leaves every pointer cell below still failing, so the
+      trigger is structural to the pointer arm, not that constant. Do not re-try the
+      clamp-not-mask rewrite on this basis. Two INDEPENDENT legs, forced-config matrices,
+      2026-08-21 B200:
+        * ``num_warps >= 16`` fails at BM 64 AND 128, with fp32 scales as well as UE8M0 —
+          a property of this loop under WS, not of the scaled MMA.
+        * uint8/UE8M0 ``As`` on a native-M ``BLOCK_SIZE_M >= 128`` tile (the implicit
+          ``dot_scaled`` arm) fails at every warps/stages cell: pointer 0/6, descriptor
+          4/6 + 2 smem.
+      Combined with the race guard below, the descriptor arm is the only BM=128 route for
+      UE8M0 grouped — which is what makes the native tcgen05 tile reachable at all here.
     - The default pipeliner RACES at ``BLOCK_SIZE_M >= 64`` (3/15 wrong at BM64/w8) and is
       clean at BM16/32.
 
@@ -847,17 +940,17 @@ def block_dynamic_grouped_matmul_pruner():
     before trusting the static attachment."""
 
     def ok(c, args):
-        if config_dim(c, args, "BLOCK_SIZE_M") >= 64:
-            if not (c.kwargs.get("WARP_SPEC") and c.num_warps % 4 == 0):
+        bm = config_dim(c, args, "BLOCK_SIZE_M")
+        if bm < 64:
+            return not c.kwargs.get("WARP_SPEC")
+        if not (c.kwargs.get("WARP_SPEC") and c.num_warps % 4 == 0):
+            return False
+        if c.kwargs.get("A_MEMORY_MODE") == "pointer":
+            if c.num_warps >= 16:
                 return False
-            if (
-                getattr(args.get("As"), "dtype", None) == torch.uint8
-                and config_dim(c, args, "BLOCK_SIZE_M") >= 128
-                and c.kwargs.get("A_MEMORY_MODE") == "pointer"
-            ):
+            if getattr(args.get("As"), "dtype", None) == torch.uint8 and bm >= 128:
                 return False
-            return True
-        return not c.kwargs.get("WARP_SPEC")
+        return True
 
     return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
 
@@ -994,7 +1087,7 @@ def gate_stacked_tmem_trap_pruner():
     return config_filter(ok, on_empty=raise_all_trap)
 
 
-def smem_pruner(k_dim="BLOCK_SIZE_K"):
+def smem_pruner(k_dim="BLOCK_SIZE_K", min_sets: float = 0.5):
     """``early_config_prune`` dropping configs whose shared memory certainly cannot fit,
     with the bound picked by the operand dtypes (sampled from ``metadata.shared`` across
     every kernel family, 22 cells):
@@ -1014,6 +1107,13 @@ def smem_pruner(k_dim="BLOCK_SIZE_K"):
       packed weights, no A-scale buffers).
     - quantized ``dot``/``scalar``: the raw-operand floor (their 32-wide K tiles cannot
       reach the limit).
+
+    ``min_sets`` scales the quantized ``dot_scaled`` bound: the default HALF a set is the
+    family-wide keep-side envelope (the 2D nvfp4 arm sub-tiles a request into half a set);
+    the GROUPED kernel never compiles below TWO full sets — fresh-tune logs at the DSV4 W4A8
+    gate_up key (244 trials, 2026-08-29): 0 of 82 compiling configs had 2*set > smem, while
+    120 of 162 dead ones did (every BK=512 request, 59/59), so ``min_sets=2`` there halves the
+    dead compiles a 100-trial tune pays without dropping a single compiling config.
 
     Both arms are EMPIRICAL models of this Triton's allocator, fit to and verified
     against ``metadata.shared`` samples (not derived from a spec) — chosen so the error
@@ -1065,12 +1165,13 @@ def smem_pruner(k_dim="BLOCK_SIZE_K"):
             # is, over all 1099 samples (largest remaining margin 68 B on a 4 KB decode tile,
             # covered by the halving). A config whose HALF set exceeds the limit cannot compile
             # in any observed form — everything else is kept and self-reports as a benign inf.
-            need = (
-                a_bytes
-                + (bk // packed) * tiles * bn
-                + (bk // group) * bm
-                + (bk // group) * tiles * bn
-            ) // 2
+            # The family-wide keep-side model counts fp4 weights PACKED; the grouped pipeline stages
+            # them at full E4M3 width (BN=256, BK=128, s5 OOMs at 253 KB = 5 x 50 KB sets, which only
+            # a full-width B tile adds up to), so the whole-set bound (min_sets >= 1) uses full width.
+            b_bytes = bk * tiles * bn if min_sets >= 1 else (bk // packed) * tiles * bn
+            need = int(
+                (a_bytes + b_bytes + (bk // group) * bm + (bk // group) * tiles * bn) * min_sets
+            )
         else:
             # dot (BK = the 32-group) / scalar: tiles too small to reach the limit —
             # the raw-operand floor suffices

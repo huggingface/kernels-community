@@ -12,5 +12,8 @@ backends = [
 repo-id = "kernels-community/finegrained-kernels"
 
 [torch-noarch]
+# ship the tuned autotune tables in configs/ (see torch-ext/finegrained_kernels/tuned_configs.py);
+# only py/pyi are picked up by default
+pyext = ["json", "py"]
 
 [kernel]

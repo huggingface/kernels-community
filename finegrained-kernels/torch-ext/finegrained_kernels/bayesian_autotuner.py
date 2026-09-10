@@ -39,6 +39,8 @@ from collections import defaultdict
 from contextlib import contextmanager
 
 import torch
+
+from . import tuned_configs
 from typing import Dict, List
 
 from triton.runtime.autotuner import (
@@ -526,10 +528,14 @@ class BayesianAutotuner(Autotuner):
                 warned_failures = True
                 self._report_bench_failures()
                 logger.warning(
-                    "[autotune] %s: %d configs failed to compile/run before the trial budget was "
-                    "met — that is dead compile time every tune, and a pruner gap worth closing.",
+                    "[autotune] %s: %d config(s) scored inf before the trial budget was met "
+                    "(%d of them UNEXPECTED failures — the rest are deliberate guard rejections: "
+                    "OutOfResources and tl.static_assert fences, which stock inf's internally). "
+                    "The unexpected ones are dead compile time every tune, and a pruner gap "
+                    "worth closing.",
                     self.fn_name,
-                    self.max_failures,
+                    sum(1 for t in timings.values() if t == float("inf")),
+                    len(self._failures),
                 )
             ranked = sorted(
                 (i for i, t in timings.items() if t != float("inf")), key=timings.get
@@ -769,6 +775,17 @@ class BayesianAutotuner(Autotuner):
         # signature -> live Config (carries the pre_hook); used to re-match the cached winner
         by_sig = {tuple(sorted(c.all_kwargs().items())): c for c in configs}
 
+        # SHIPPED configs first: the durable, source-hash-free layer that travels with the build
+        # (tuned_configs). `configs` here is already PRUNED, so re-matching through by_sig also
+        # enforces this launch's prune laws — a shipped config that is illegal for these shapes
+        # simply misses and we tune. A hit skips the search entirely.
+        shipped = tuned_configs.lookup(fn.__name__, tuning_key)
+        if shipped is not None:
+            best = by_sig.get(tuple(sorted(shipped.items())))
+            if best is not None:
+                self.cache[tuning_key] = best
+                return True
+
         def load_crown() -> bool:
             path = cache.get_file(file_name)
             if not path:
@@ -804,6 +821,9 @@ class BayesianAutotuner(Autotuner):
             if load_crown():  # another rank tuned this key while we waited
                 return True
             bench_fn()
+            tuned_configs.record(
+                fn.__name__, tuning_key, self.cache[tuning_key].all_kwargs()
+            )
             # publish INSIDE the lock: a rank released to an empty cache would tune again
             try:
                 cache.put(

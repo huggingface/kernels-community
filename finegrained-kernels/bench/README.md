@@ -31,7 +31,11 @@ so its numbers reflect the tcgen05 fast path. Only MX weights on 128-aligned dim
 to measure the affine path instead.
 
 Correctness is cross-checked in-run: each baseline's output is compared to the finegrained-kernels
-anchor (`parity-vs-v5` in the log), so a wrong scale layout shows up as a large parity diff.
+anchor (`parity-vs-finegrained-kernels`). Arms sharing our activation quant read fp8 ~3e-3 / MX ~1e-2
+/ fp4 ~5e-2; stacks with their own act-quant kernels (TRT-LLM, vLLM, finegrained-fp8, NVFP4Linear)
+read up to ~1e-1. A parity around 1 is a layout bug. The bench's gate|up weights are STACKED (`[gate; up]`); the finegrained-kernels
+arms are fed the row-interleaved view (`_interleave_gate_up`) because the kernels read gate|up
+interleaved.
 
 ## Running
 

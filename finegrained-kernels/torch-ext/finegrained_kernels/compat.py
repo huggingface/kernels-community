@@ -18,9 +18,27 @@ import functools
 from contextlib import contextmanager
 
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
+
+# Programmatic dependent launch for the decode chain (batched GEMMs, GLU, act quant, reduce): each
+# kernel waits on its grid dependency at the top and releases its dependents just before the
+# epilogue. The LATE trigger is load-bearing: released early, the next kernel's CTAs co-reside and
+# steal issue slots (-15us on a single-wave chain); released late they only hide launch latency
+# (GLM/DSV4/GPT-OSS decode -4.5..-4.9%, bit-identical). Prefill grids are multi-wave and never
+# take it. FINEGRAINED_PDL=0 disables.
+DECODE_PDL = os.environ.get("FINEGRAINED_PDL", "1") == "1"
+
+
+def decode_pdl() -> bool:
+    """PDL for this launch: the flag, and not under torch.compile — dynamo's TTIR access analysis
+    cannot read the ``griddepcontrol`` inline asm and would mark every input mutated (extra copies,
+    no fusion). Deployment decode runs eager launches under cudagraphs, where PDL applies."""
+    return DECODE_PDL and not torch.compiler.is_compiling()
 from torch.library import triton_op, wrap_triton
 
 from .bayesian_autotuner import bayesian_autotune
@@ -245,6 +263,7 @@ def weighted_reduce_kernel(
     NUM_EXPERTS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr = False,
+    PDL: tl.constexpr = False,
 ):
     """Per group ``g``, the weighted sum of its ``NUM_TOP_K`` rows into ``Out[g]``:
     ``sum_k Weights[g*NUM_TOP_K + k] * Rows[g*NUM_TOP_K + k]``, skipping rows whose id is
@@ -252,6 +271,8 @@ def weighted_reduce_kernel(
     fp32 accumulate; ~2.8x a generic ``view(g, k, H).sum(1)``. ``SIMULATE_UNFUSED`` rounds
     each weighted row to ``Out``'s dtype before summing, matching a reference that weights
     in that dtype; production leaves the accumulation in fp32."""
+    if PDL:
+        gdc_wait()
     g = tl.program_id(0)
     offs_h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = offs_h < H
@@ -268,6 +289,8 @@ def weighted_reduce_kernel(
         if SIMULATE_UNFUSED:
             contrib = contrib.to(Out.dtype.element_ty).to(tl.float32)
         acc += contrib
+    if PDL:
+        gdc_launch_dependents()
     tl.store(
         Out + g * stride_o_m + offs_h * stride_o_h,
         acc.to(Out.dtype.element_ty),
@@ -309,6 +332,8 @@ def weighted_reduce(
             NUM_TOP_K=num_top_k,
             NUM_EXPERTS=num_experts,
             SIMULATE_UNFUSED=simulate_unfused,
+            PDL=decode_pdl(),
+            launch_pdl=decode_pdl(),
         )
     return reduced
 

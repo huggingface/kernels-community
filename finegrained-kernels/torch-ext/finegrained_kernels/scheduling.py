@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -362,5 +364,14 @@ def expand_regime(S_rows: int, num_experts: int) -> bool:
     """Where one contiguous copy of the routed rows beats in-kernel gathering: prefill row
     counts (S >= 4096 amortizes the copy) below the sm_10x tma-gather4 parity (~1024
     tokens/expert — gather4's 1-row box is MONOTONIC in tokens/expert; every other arch has
-    no gather TMA at all, so any large-S gather expands)."""
+    no gather TMA at all, so any large-S gather expands).
+
+    Raw bf16 activations (the full-precision grouped path) were A/B'd against keeping the
+    in-kernel gather, 200-trial tunes each side, 2026-08-28: DeepSeek-V4 3455 -> 3344us (-3.2%),
+    DeepSeek-V3 7267 -> 7290 (wash), GLM-5.2 6039 -> 6439 (+6.6%). The copy (150-370us) is
+    offset by what the gather costs the GEMM, and which side wins is shape-specific within the
+    tune's roll variance — so the law is NOT split on ``act_itemsize``; it stays as measured.
+    ``FINEGRAINED_FORCE_GATHER=1`` is the A/B knob (never expand)."""
+    if os.environ.get("FINEGRAINED_FORCE_GATHER"):
+        return False
     return S_rows >= 4096 and (not is_sm10x() or S_rows < 1024 * num_experts)
