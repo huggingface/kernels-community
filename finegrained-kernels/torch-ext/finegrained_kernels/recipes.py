@@ -110,7 +110,7 @@ def is_nvfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
 def is_preswizzled_mx(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     """A weight scale already in the SWIZZLE_32_4_4 layout, swizzled once at model load (the
     deployment contract — the same checkpoint feeds grouped prefill and batched decode with no
-    per-call rearrange). The 5D shape ``(1, groups, cols//4, 2, 256)`` is the marker; the scale is
+    per-call rearrange). The 5D shape ``(G, row_blocks, cols//4, 2, 256)`` is the marker; the scale is
     a 1-byte block scale (UE8M0 for MXFP8/MXFP4, E4M3 for NVFP4) against an MX weight (E4M3 or
     packed E2M1). Recipe-agnostic — NVFP4 pre-swizzles the same way (the layout cuBLAS wants).
     6D is the gate|up artifact: the same blocks with the gate-interleave carried in the shape."""
@@ -272,7 +272,7 @@ def normalize_per_expert_scale(Bs: torch.Tensor, num_experts: int) -> torch.Tens
 def mx_scale_family(Bs: torch.Tensor, K: int) -> int:
     """The group size of an MX/NV weight-scale tensor, in either layout — the wrapper hands ``Bs``
     as-is and this reads the group off its shape. Row-major (2D/3D): ``K // Bs.shape[-1]``.
-    SWIZZLE_32_4_4 (5D ``(1, blocks, cols // 4, 2, 256)``): ``K // (Bs.shape[2] * 4)``. The scale
+    SWIZZLE_32_4_4 (5D ``(G, row_blocks, cols // 4, 2, 256)``): ``K // (Bs.shape[2] * 4)``. The scale
     dtype IS the recipe carrier (E4M3 = NVFP4 group-16, UE8M0 = MX group-32) and the pairing is
     validated; callers that need the recipe read it off ``Bs.dtype`` (``== torch.float8_e4m3fn``
     is NVFP4)."""
@@ -287,6 +287,12 @@ def mx_scale_family(Bs: torch.Tensor, K: int) -> int:
     assert K % scale_group == 0, f"K (={K}) must be a multiple of {scale_group}"
     return scale_group
 
+
+
+def get_supported_act_fns() -> tuple[str, ...]:
+    """The activation names the gate|up epilogue fuses in-kernel; any other activation is applied
+    on the host by the MoE forwards (``act_fn`` as a callable)."""
+    return ("silu", "gelu", "relu")
 
 
 @dataclass(frozen=True)

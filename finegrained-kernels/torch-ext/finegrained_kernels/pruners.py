@@ -841,9 +841,11 @@ def swizzled_scale_config_pruner(allow_gate_subblock=False):
       bands (``BK % (4 * group) == 0``).
     - ``BLOCK_SIZE_N > 128`` not a whole-block multiple: the descriptor arm bulk-loads
       ``BN // 128`` swizzled blocks (each kernel's pre_hook sizes the box per config), a sub-128 BN
-      reads a scalar slice of one block; a BN between is neither. BN=256 is a legal two-block load
-      (the GATE tile has always read one) and wins at prefill — grouped down 665 -> 576us, dense 2D
-      703 -> 552us at M=49152, bit-identical; the scaled-MMA width cap is ``mx_config_pruner``'s.
+      reads a scalar slice of one block; a BN between is neither, and a multi-block BN whose
+      last tile passes the 128-padded N extent zero-fills (see the fit bound below). BN=256 is
+      a legal two-block load where it fits (the GATE tile has always read one) and wins at
+      prefill — grouped down 665 -> 576us, dense 2D 703 -> 552us at M=49152, bit-identical; the
+      scaled-MMA width cap is ``mx_config_pruner``'s.
     - under ``GATE``, ``BLOCK_SIZE_N != 128``: the gate|up scale is interleaved as whole 128-row
       block pairs [g0,u0,g1,u1,...], read as one 2*BN tile; a sub-128 BN can't index a block pair
       off the descriptor. ``allow_gate_subblock`` (batched decode) admits BN in (32, 64): its
@@ -861,11 +863,21 @@ def swizzled_scale_config_pruner(allow_gate_subblock=False):
         bn = config_dim(c, args, "BLOCK_SIZE_N")
         if args.get("GATE"):
             return bn == 128 or (allow_gate_subblock and bn in (32, 64))
-        # BN=256 pipelines OOM smem at num_stages >= 5 (253 KB at s5, 304 KB at s6 for the fp8 x fp4
-        # and fp8 x fp8 dot_scaled tiles, BK=128; s4 fits) — below smem_pruner's keep-side bound, so
-        # without this the TPE burns whole 200-trial budgets on dead compiles (observed 2026-08-29).
-        if bn > 128 and c.num_stages >= 5:
-            return False
+        if bn > 128:
+            # BN=256 pipelines OOM smem at num_stages >= 5 (253 KB at s5, 304 KB at s6 for the
+            # fp8 x fp4 and fp8 x fp8 dot_scaled tiles, BK=128; s4 fits) — below smem_pruner's
+            # keep-side bound, so without this the TPE burns whole 200-trial budgets on dead
+            # compiles (observed 2026-08-29).
+            if c.num_stages >= 5:
+                return False
+            # A multi-block tile must FIT the swizzled grid: the bulk load reads BN // 128 whole
+            # blocks with no row mask, and the grid is padded to 128 rows — a tile whose blocks
+            # pass the padded extent TMA-zero-fills the scales: silent garbage, never a trap
+            # (mxfp4_swizzled N=128 forced at BN=256 fails parity on triton 3.7.1 and 3.8 alike;
+            # the BN=256 prefill wins were measured at N % 256 == 0 shapes).
+            n = args.get("N")
+            if n is not None and -(-n // bn) * bn > -(-n // 128) * 128:
+                return False
         return bn <= 128 or bn % 128 == 0
 
     def raise_no_swizzled_tile(configs, args):

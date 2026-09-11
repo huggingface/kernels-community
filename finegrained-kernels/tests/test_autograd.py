@@ -343,3 +343,74 @@ def test_dgrad_grouped_accumulates_over_top_k():
     for s, (e, t) in enumerate(pairs):          # the sum a store would collapse to one term
         floor[t] += dY[s].float() @ Wdeq[e]
     assert _rel(dX, floor) < 5e-3, f"top-k accumulation diverges: {_rel(dX, floor):.2e}"
+
+
+@pytest.mark.slow
+def test_dgrad_grouped_every_admitted_config_accumulates():
+    """Force-run EVERY admitted config on the top-k ACCUMULATE launch (non-identity gather,
+    duplicate targets, no scatter) and hard-check each against the torch floor sum. The tuner
+    benches configs by speed, so an arm that is wrong ONLY under these launch semantics gets
+    crowned whenever it wins a near-tied tune — the descriptor-anchor bug this guards against
+    read the wrong dY rows on exactly this launch while passing every identity-gather test."""
+    from finegrained_kernels import autograd as autograd_module
+    from finegrained_kernels.autograd import dgrad_matmul_grouped
+
+    torch.manual_seed(0)
+    T, tk, E, Ne, Ke = 8, 2, 4, 256, 256
+    S = T * tk
+    experts = torch.stack([torch.randperm(E)[:tk] for _ in range(T)])
+    pairs = sorted((int(e), t) for t in range(T) for e in experts[t])
+    gather_idx = torch.tensor([t for _, t in pairs], device=TEST_DEVICE, dtype=torch.int32)
+    counts = torch.bincount(torch.tensor([e for e, _ in pairs]), minlength=E)
+    expert_start = torch.cat([torch.zeros(1, dtype=torch.long), counts.cumsum(0)]).to(
+        TEST_DEVICE, torch.int32)
+    dY = torch.randn(S, Ne, device=TEST_DEVICE, dtype=torch.bfloat16)
+    W = torch.randn(E, Ne, Ke, device=TEST_DEVICE, dtype=torch.bfloat16) * 0.1
+    Wq, Ws = fg.mxfp8_act_quant(W.reshape(E * Ne, Ke))
+    Wq, Ws = Wq.reshape(E, Ne, Ke), Ws.reshape(E, Ne, -1)
+    Wdeq = (Wq.float()
+            * torch.pow(2.0, Ws.view(torch.uint8).float() - 127).repeat_interleave(32, -1)[..., :Ke])
+    floor = torch.zeros(T, Ke, device=TEST_DEVICE, dtype=torch.float32)
+    for s, (e, t) in enumerate(pairs):
+        floor[t] += dY[s].float() @ Wdeq[e]
+
+    def launch():
+        return dgrad_matmul_grouped(
+            dY, Wq, Ws, expert_start, 32, 1,
+            gather_idx=gather_idx, scatter_idx=None, output_dtype=torch.float32,
+            num_input_rows=T,
+        )
+
+    tuner = autograd_module.dgrad_matmul_grouped_kernel
+    admitted = {}
+    original_prune, original_configs = tuner.early_config_prune, tuner.configs
+
+    def spy(configs, named_args, **kwargs):
+        kept = original_prune(configs, named_args, **kwargs) if original_prune else configs
+        admitted["configs"] = list(kept)
+        return kept
+
+    tuner.early_config_prune = spy
+    tuner.cache.clear()  # an earlier test's crown takes the fast path and prune (the spy) never runs
+    try:
+        launch()
+    finally:
+        tuner.early_config_prune = original_prune
+
+    wrong = []
+    try:
+        for config in admitted["configs"]:
+            tuner.configs = [config]
+            tuner.cache.clear()
+            try:
+                dX = launch()
+                torch.cuda.synchronize()
+            except Exception:
+                continue  # the tuner's forgiven-inf path: a config may decline, never lie
+            rel = _rel(dX, floor)
+            if rel > 5e-3:
+                wrong.append((rel, config.all_kwargs()))
+    finally:
+        tuner.configs = original_configs
+        tuner.cache.clear()
+    assert not wrong, f"{len(wrong)} config(s) break top-k accumulation, e.g. {wrong[0]}"

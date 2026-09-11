@@ -26,6 +26,7 @@ from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, co
 from .recipes import normalize_global_scale, Epilogue, Quantization, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_recipe
 from .tile_layout import build_tile_layout
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_swizzled_grouped, swizzle_grouped_mx_scales
+from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import expand_gather_below_parity, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
 from .tiles import (
@@ -1800,12 +1801,11 @@ def mx_dynamic_matmul_grouped(
             f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {n_rows}, {K // scale_group})"
         )
     else:
-        # the artifact's row-block count must match THIS weight stack — a wrong-layer
-        # artifact with a matching K would otherwise dequantize with garbage scales silently
-        expected_blocks = num_experts * triton.cdiv(n_rows, 128)
-        assert Bs.shape[1] == expected_blocks, (
-            f"swizzled Bs carries {Bs.shape[1]} 128-row blocks, expected {expected_blocks} "
-            f"for {num_experts} experts x ({n_rows}, K) — wrong artifact"
+        # the artifact's expert count and per-expert row blocks must match THIS weight stack — a
+        # wrong-layer artifact with a matching K would otherwise dequantize with garbage scales silently
+        assert Bs.shape[:2] == (num_experts, triton.cdiv(n_rows, 128)), (
+            f"swizzled Bs carries {tuple(Bs.shape[:2])} (experts, 128-row blocks), expected "
+            f"{(num_experts, triton.cdiv(n_rows, 128))} for ({n_rows}, K) weights — wrong artifact"
         )
 
     output_dtype = resolve_output_dtype(output_dtype, A, As)
@@ -1901,9 +1901,8 @@ def mx_dynamic_matmul_grouped(
     b_u8 = e2m1_as_uint8(B)
     as_u8 = ue8m0_as_uint8(act_scales)
     bs_u8 = ue8m0_as_uint8(Bs)
-    box = [1, 1, 1, 2, 256]
-    as_descriptor = TensorDescriptor.from_tensor(as_u8, box) if swizzled_scales else None
-    bs_descriptor = TensorDescriptor.from_tensor(bs_u8, box) if swizzled_scales else None
+    as_descriptor = swizzled_scale_descriptor(as_u8) if swizzled_scales else None
+    bs_descriptor = swizzled_scale_descriptor(bs_u8) if swizzled_scales else None
     # mxfp8 requant writes Cs straight into the down proj's SWIZZLE_32_4_4 layout (the epilogue
     # gets a descriptor, not a pointer) — the down reads it affine, no post-requant swizzle pass.
     # Only when the output stays expert-sorted (scatter_idx None, the fused gate_up convention):

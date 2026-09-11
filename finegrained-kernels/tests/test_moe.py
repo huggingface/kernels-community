@@ -21,7 +21,7 @@ epilogues, requant, routing variants against an independent torch oracle) lives 
 ``test_ops.py``; the weight recipes come from the shared ``WEIGHTS`` registry."""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional, Union
 
 import pytest
 import torch
@@ -34,6 +34,7 @@ from utils import (  # type: ignore
 )
 
 from finegrained_kernels import moe, swizzle_mx_scales  # type: ignore
+from finegrained_kernels.epilogue import fused_glu  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -54,7 +55,7 @@ class MoEProblem:
     act_recipe: Optional[str] = "weights"
     swiglu_alpha: Optional[float] = None
     swiglu_limit: Optional[float] = None
-    act_fn: str = "silu"
+    act_fn: Union[str, Callable] = "silu"  # a callable runs on the host between the GEMMs
     swizzled: bool = False  # pre-swizzled (5D SWIZZLE_32_4_4) weight scales — the deployment layout
     input_globals: bool = False  # calibrated NVFP4 activation input_scale per projection
 
@@ -66,8 +67,8 @@ class MoEProblem:
             act = "_swiglu_alpha"
         elif self.swiglu_limit is not None:
             act = "_swiglu_limit"
-        elif self.act_fn != "silu":
-            act = f"_{self.act_fn}"
+        elif (act_name := getattr(self.act_fn, "__name__", self.act_fn)) != "silu":
+            act = f"_{act_name}"
         else:
             act = ""
         recipe = "" if self.act_recipe == "weights" else f"_recipe_{self.act_recipe or 'bf16'}"
@@ -116,6 +117,10 @@ MOE_PROBLEMS = [
     MoEProblem(weight_recipe="nvfp4", num_tokens=1, swizzled=True, input_globals=True),
     # ── full precision: scale-less BF16 weights resolve to recipe None and the fused
     # gate_up hands the down a bare (unscaled) intermediate ──
+    # a caller-provided activation (the torch GLU itself) runs on the host between the GEMMs — the
+    # path any activation outside ``get_supported_act_fns()`` takes
+    MoEProblem(weight_recipe="mxfp8", act_fn=fused_glu),
+    MoEProblem(weight_recipe="mxfp4", act_recipe=None, act_fn=fused_glu),  # weight-only bf16 hand-off
     MoEProblem(weight_recipe="bf16", num_tokens=1),
     MoEProblem(weight_recipe="bf16"),
     # ── contraction dims on the 64 grid but off the 128 grid (gpt-oss H=I=2880): only
@@ -421,3 +426,4 @@ def test_fused_grouped_compiles_across_shapes():
     additionally puts ``compute_grouped_scheduling`` (an opaque custom op) inside the
     graph, which the batched sibling never exercises."""
     _run_compiled_across_shapes(moe.moe_fused_grouped)
+

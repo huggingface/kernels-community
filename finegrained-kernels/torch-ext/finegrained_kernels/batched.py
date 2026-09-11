@@ -29,6 +29,7 @@ from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_
 from .recipes import Epilogue, Quantization, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_input_recipe, resolve_output_dtype, resolve_output_recipe, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_recipe
 from .epilogue import fused_glu
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide
+from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .tiles import (
     advance_ptrs,
@@ -1438,12 +1439,11 @@ def mx_dynamic_matmul_batched(
             f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {n_rows}, {K // scale_group})"
         )
     else:
-        # the artifact's row-block count must match THIS weight stack — a wrong-layer
-        # artifact with a matching K would otherwise dequantize with garbage scales silently
-        expected_blocks = num_experts * triton.cdiv(n_rows, 128)
-        assert Bs.shape[1] == expected_blocks, (
-            f"swizzled Bs carries {Bs.shape[1]} 128-row blocks, expected {expected_blocks} "
-            f"for {num_experts} experts x ({n_rows}, K) — wrong artifact"
+        # the artifact's expert count and per-expert row blocks must match THIS weight stack — a
+        # wrong-layer artifact with a matching K would otherwise dequantize with garbage scales silently
+        assert Bs.shape[:2] == (num_experts, triton.cdiv(n_rows, 128)), (
+            f"swizzled Bs carries {tuple(Bs.shape[:2])} (experts, 128-row blocks), expected "
+            f"{(num_experts, triton.cdiv(n_rows, 128))} for ({n_rows}, K) weights — wrong artifact"
         )
 
     a_u8 = e2m1_as_uint8(A)
@@ -1455,9 +1455,7 @@ def mx_dynamic_matmul_batched(
     # also consumes) takes the fast descriptor/gather path; a row-major (3D) Bs takes the affine
     # path at no penalty. Callers swizzle once at load (public swizzle_mx_scales) to opt into perf.
     # The descriptor is built only on the swizzled path — the un-swizzled arm never reads it (None).
-    bs_descriptor = (
-        TensorDescriptor.from_tensor(bs_u8, [1, 1, 1, 2, 256]) if swizzled_scales else None
-    )
+    bs_descriptor = swizzled_scale_descriptor(bs_u8) if swizzled_scales else None
     # Requant scales are written ROW-MAJOR (never SWIZZLE_32_4_4), unlike the grouped/2D
     # requant which fuse the swizzle in-epilogue. This is deliberate, not a gap: batched is the
     # decode kernel — one distinct routed row per program (FAKE_BATCH replicates it across the BM

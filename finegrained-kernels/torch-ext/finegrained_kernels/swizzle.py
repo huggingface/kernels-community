@@ -16,6 +16,7 @@
 import torch
 import triton
 import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 
 from .compat import *  # noqa: F401,F403
@@ -94,34 +95,37 @@ def unswizzle_mx_scales(
     (128, 4) padding trimmed. Pure reshape/permute on the byte view (no kernel); it runs at
     save/dequantize time, never on a forward, so the torch-level cost is irrelevant.
 
-    ``rows``/``cols`` are the LOGICAL dims of ONE matrix (for a gate|up slab, the full ``2N``); both are trimmed back out of the (128, 4) padding. An expert stack
-    needs 128-row-aligned matrices so each expert's block span is exactly ``rows // 128`` and
-    the stack splits cleanly; a single matrix takes any ``rows``."""
-    assert num_experts is None or rows % 128 == 0, (
-        f"an expert stack unswizzles per matrix, so rows must be 128-aligned (rows={rows})"
-    )
+    ``rows``/``cols`` are the LOGICAL dims of ONE matrix (for a gate|up slab, the full ``2N``);
+    both are trimmed back out of the (128, 4) padding. ``num_experts`` selects the stacked
+    ``(E, rows, cols)`` result and must match the artifact's leading dim."""
     nrb, ncb = -(-rows // 128), -(-cols // 4)
-    dtype = swizzled.dtype
-    flat = swizzled.reshape(-1)
-    per_matrix = nrb * ncb * 512
     n_matrices = num_experts if num_experts is not None else 1
-    assert flat.numel() == n_matrices * per_matrix, (
-        f"swizzled buffer holds {flat.numel()} elements, expected {n_matrices * per_matrix} "
+    assert swizzled.shape == (n_matrices, nrb, ncb, 2, 256), (
+        f"swizzled artifact is {tuple(swizzled.shape)}, expected {(n_matrices, nrb, ncb, 2, 256)} "
         f"for {n_matrices}x({rows}, {cols})"
     )
-    out = []
-    for m in range(n_matrices):
-        blocks = flat[m * per_matrix : (m + 1) * per_matrix].reshape(nrb, ncb, 2, 256)
-        plain = (
-            blocks.reshape(nrb * ncb, 32, 4, 4)
-            .transpose(1, 2)
-            .reshape(nrb, ncb, 128, 4)
-            .permute(0, 2, 1, 3)
-            .reshape(nrb * 128, ncb * 4)
-        )
-        out.append(plain[:rows, :cols])
-    stacked = torch.stack(out) if num_experts is not None else out[0]
-    return stacked.contiguous().view(dtype)
+    plain = (
+        swizzled.reshape(n_matrices, nrb * ncb, 32, 4, 4)
+        .transpose(2, 3)
+        .reshape(n_matrices, nrb, ncb, 128, 4)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(n_matrices, nrb * 128, ncb * 4)[:, :rows, :cols]
+    )
+    return (plain if num_experts is not None else plain[0]).contiguous()
+
+
+def swizzled_scale_descriptor(scale_u8: torch.Tensor) -> TensorDescriptor:
+    """TMA descriptor over a SWIZZLE_32_4_4 artifact ``(G, row_blocks, cols // 4, 2, 256)`` addressed
+    as ``(1, G * row_blocks, cols // 4, 2, 256)``: the kernels index 128-row blocks flat
+    (``group * row_blocks + block``), so the expert axis folds into the block axis."""
+    assert scale_u8.ndim == 5 and scale_u8.is_contiguous(), (
+        f"swizzled scale must be a contiguous 5D artifact, got {tuple(scale_u8.shape)}"
+    )
+    groups, row_blocks, cols4 = scale_u8.shape[:3]
+    blocks = groups * row_blocks
+    return TensorDescriptor(
+        scale_u8, [1, blocks, cols4, 2, 256], [blocks * cols4 * 512, cols4 * 512, 512, 256, 1], [1, 1, 1, 2, 256]
+    )
 
 
 
@@ -175,14 +179,15 @@ def swizzle_mx_scales(
     ``padded_rows`` must be a multiple of 128.
 
     ``rows``/``cols`` are zero-padded to (128, 4) multiples; returns the 5D
-    ``(1, row_blocks, ceil(cols/4), 2, 256)`` view the ops read (``row_blocks`` sums the
-    expert stacks). Bit-identical to CUTLASS's packer (verified)."""
+    ``(G, row_blocks, ceil(cols/4), 2, 256)`` artifact the ops read — ``G`` the expert count (1 for
+    a matrix), so an expert stack shards/gathers on its leading dim. Bit-identical to CUTLASS's
+    packer (verified)."""
     assert gather_idx is None or gather_idx.shape[0] % 128 == 0, (
         f"gather_idx rows must be 128-padded, got {None if gather_idx is None else gather_idx.shape[0]}"
     )
     if scale.ndim == 3:
         assert gather_idx is None, "gather_idx applies to a single 2D scale, not an expert stack"
-        return torch.cat([_swizzle_to_blocks(e, None) for e in scale]).unsqueeze(0)
+        return torch.stack([_swizzle_to_blocks(e, None) for e in scale])
     assert scale.ndim == 2, (
             f"expected a 2D (rows, K//group) or 3D (E, rows, K//group) scale, got {tuple(scale.shape)}"
     )

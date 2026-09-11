@@ -13,7 +13,7 @@ from .moe import (
 # imported for its import-time side effect: registers the dgrad formulas on the ops, so an
 # ordinary forward call differentiates. Exports nothing.
 from . import autograd  # noqa: F401
-from .recipes import Epilogue, Quantization
+from .recipes import Epilogue, Quantization, get_supported_act_fns
 from .swizzle import swizzle_mx_scales, unswizzle_mx_scales
 from .scheduling import compute_grouped_scheduling
 from .compat import weighted_reduce
@@ -54,4 +54,5 @@ __all__ = [
     # Epilogue and Quantization configs
     "Epilogue",
     "Quantization",
+    "get_supported_act_fns",
 ]
