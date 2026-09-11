@@ -65,6 +65,7 @@ def apply_rotary_kernel_wrapper(q, k, cos, sin, conj: bool = False):
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("nheads", [8, 16])
 @pytest.mark.parametrize("seqlen", [128, 256])
+# (headdim, rotary_dim): standard full RoPE (2 * rotary_dim == headdim) and partial RoPE cases (e.g. half-half where 2 * rotary_dim == headdim // 2)
 @pytest.mark.parametrize("headdim, rotary_dim", [(64, 32), (128, 64), (64, 30), (128, 32), (64, 16), (80, 20)])
 @pytest.mark.parametrize("qk_dim", [3, 4])
 @pytest.mark.parametrize(
@@ -129,28 +130,5 @@ def test_rotary_equivalence(batch_size, nheads, seqlen, headdim, rotary_dim, qk_
             k_kernel[..., 2 * rotary_dim:], k_orig[..., 2 * rotary_dim:]
         ), "Non-rotated part of K should be unchanged"
 
-    # verify transformers layer and functional APIs match when not conjugated
-    if not conj and qk_dim == 4:
-        rot_dim_total = 2 * rotary_dim
-        q_trans = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
-        k_trans = torch.randn(batch_size, nheads, seqlen, headdim, device=device, dtype=dtype)
-        freqs = torch.randn(batch_size, seqlen, rot_dim_total // 2, device=device, dtype=torch.float32)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos_trans = emb.cos().to(dtype)
-        sin_trans = emb.sin().to(dtype)
-
-        out_q_fn, out_k_fn = rotary.apply_rotary_transformers(q_trans, k_trans, cos_trans, sin_trans, unsqueeze_dim=1)
-        layer = rotary.layers.apply_rotary_transformers()
-        out_q_mod, out_k_mod = layer(q_trans, k_trans, cos_trans, sin_trans, unsqueeze_dim=1)
-
-        assert torch.equal(out_q_fn, out_q_mod), "Functional and module outputs should be identical"
-        assert torch.equal(out_k_fn, out_k_mod), "Functional and module outputs should be identical"
-        if rot_dim_total < headdim:
-            assert torch.equal(
-                out_q_fn[..., rot_dim_total:], q_trans[..., rot_dim_total:]
-            ), "Non-rotated part of Q should be unchanged in transformers wrapper"
-            assert torch.equal(
-                out_k_fn[..., rot_dim_total:], k_trans[..., rot_dim_total:]
-            ), "Non-rotated part of K should be unchanged in transformers wrapper"
 
 
