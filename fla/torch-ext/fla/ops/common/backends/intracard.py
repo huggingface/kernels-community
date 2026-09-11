@@ -82,7 +82,7 @@ class IntraCardCPBackend(BaseBackend):
         chunk_indices: torch.LongTensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Intra-card CP implementation of chunk_gated_delta_rule_fwd_h."""
-        from ...ops.common.intracard_cp import intracard_fwd_h
+        from ....ops.common.intracard_cp import intracard_fwd_h
 
         return intracard_fwd_h(
             k=k, w=w, u=u, g=g, gk=gk,

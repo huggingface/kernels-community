@@ -96,7 +96,7 @@ class TileLangBackend(BaseBackend):
         chunk_size: int = 64,
         chunk_indices: torch.LongTensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        from ...ops.common.backends.tilelang.chunk_bwd import (
+        from .....ops.common.backends.tilelang.chunk_bwd import (
             chunk_bwd_dqkwg_tilelang,
         )
         return chunk_bwd_dqkwg_tilelang(
@@ -145,7 +145,7 @@ class TileLangBackend(BaseBackend):
         cu_seqlens: torch.LongTensor | None = None,
         chunk_indices: torch.LongTensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        from ...ops.common.backends.tilelang.parallel_attn_fwd import (
+        from .....ops.common.backends.tilelang.parallel_attn_fwd import (
             parallel_attn_fwd_tilelang,
         )
         return parallel_attn_fwd_tilelang(
@@ -190,7 +190,7 @@ class TileLangBackend(BaseBackend):
         cu_seqlens: torch.LongTensor | None = None,
         chunk_indices: torch.LongTensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        from ...ops.common.backends.tilelang.parallel_attn_bwd import (
+        from .....ops.common.backends.tilelang.parallel_attn_bwd import (
             parallel_attn_bwd_tilelang,
         )
         return parallel_attn_bwd_tilelang(
