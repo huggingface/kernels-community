@@ -884,7 +884,7 @@ def dgrad_matmul_batched(
 
 
 # ── gradient products, per recipe family ─────────────────────────────────────────
-# What each recipe's dgrad actually computes. ``autograd.py`` holds only the table saying which
+# What each recipe's dgrad actually computes. ``backward.py`` holds only the table saying which
 # op gets which of these — compute lives here, attachment lives there.
 
 def _dgrad_mx(dY, B, Bs, b_global, out_dtype):

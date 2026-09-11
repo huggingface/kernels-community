@@ -1,3 +1,16 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """finegrained-kernels bench — local build vs upstream finegrained-fp8 (rev v4) + reference impls.
 
 The **finegrained-kernels** arm is the local kernel; **finegrained-fp8** is the upstream hub
@@ -542,6 +555,9 @@ def _interleave_gate_up(gu, gus):
     return _interleave_rows(gu), _interleave_rows(gus)
 
 
+# Arm signature lexicon: `hidden` (T, H) tokens, `idx`/`w` (T, top_k) routing; `gu`/`gus`/`gu_g` the
+# gate|up weight stack (E, 2I, H), its block-scale grid and its NVFP4 per-expert global; `dn`/`dns`/
+# `dn_g` the same for down (E, H, I). Scales are None for BF16, globals None outside NVFP4.
 def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     """``recipe`` sets the activation precision; None follows the weight recipe
     (mxfp4/nvfp4 -> the all-fp4 W4A4 chain, bf16 -> unquantized). dsv4 deploys

@@ -1,3 +1,16 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Backward for the quantized ops — dgrad only, kernels and end-to-end.
 
 Two levels in one file, because they fail differently. The KERNEL tests hand-build operands, never
@@ -28,7 +41,7 @@ from utils import (
 )
 
 import finegrained_kernels as fg
-from finegrained_kernels.autograd import (
+from finegrained_kernels.backward import (
     dgrad_matmul_2d,
     dgrad_matmul_batched,
     dgrad_matmul_grouped,
@@ -308,7 +321,7 @@ def test_dgrad_grouped_accumulates_over_top_k():
     row is written exactly once, so a kernel that STORES and one that ACCUMULATES are
     indistinguishable — which is how a store survived the suite while silently dropping all but
     one expert's contribution per token on any real MoE."""
-    from finegrained_kernels.autograd import dgrad_matmul_grouped
+    from finegrained_kernels.backward import dgrad_matmul_grouped
 
     torch.manual_seed(0)
     T, tk, E, Ne, Ke = 8, 2, 4, 256, 256
@@ -352,8 +365,8 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
     benches configs by speed, so an arm that is wrong ONLY under these launch semantics gets
     crowned whenever it wins a near-tied tune — the descriptor-anchor bug this guards against
     read the wrong dY rows on exactly this launch while passing every identity-gather test."""
-    from finegrained_kernels import autograd as autograd_module
-    from finegrained_kernels.autograd import dgrad_matmul_grouped
+    from finegrained_kernels import backward as backward_module
+    from finegrained_kernels.backward import dgrad_matmul_grouped
 
     torch.manual_seed(0)
     T, tk, E, Ne, Ke = 8, 2, 4, 256, 256
@@ -381,7 +394,7 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
             num_input_rows=T,
         )
 
-    tuner = autograd_module.dgrad_matmul_grouped_kernel
+    tuner = backward_module.dgrad_matmul_grouped_kernel
     admitted = {}
     original_prune, original_configs = tuner.early_config_prune, tuner.configs
 

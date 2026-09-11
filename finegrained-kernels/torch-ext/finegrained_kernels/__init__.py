@@ -1,9 +1,23 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 
 from .matmul import matmul_2d
 from .batched import matmul_batched
 from .grouped import matmul_grouped
 from .moe import (
+    weighted_reduce,
     moe_fused_batched,
     moe_fused_grouped,
     moe_unfused_batched,
@@ -12,11 +26,10 @@ from .moe import (
 )
 # imported for its import-time side effect: registers the dgrad formulas on the ops, so an
 # ordinary forward call differentiates. Exports nothing.
-from . import autograd  # noqa: F401
+from . import backward  # noqa: F401
 from .recipes import Epilogue, Quantization, get_supported_act_fns
 from .swizzle import swizzle_mx_scales, unswizzle_mx_scales
 from .scheduling import compute_grouped_scheduling
-from .compat import weighted_reduce
 from .quant import (
     fp8_act_quant_block_dynamic,
     fp8_act_quant_tensor_wide,

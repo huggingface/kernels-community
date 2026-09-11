@@ -692,7 +692,7 @@ def weight_only_warp_spec_matched_mode_pruner():
 
         CM          A/B modes   w4    w8    w16
         dot         ptr/ptr     ok    ok    FAIL
-        dot         desc/desc   ok    ok    ok      (was charted FAIL/FAIL — refuted, see _BAD)
+        dot         desc/desc   ok    ok    ok      (was charted FAIL/FAIL — refuted, see _TRAPPING_NUM_WARPS)
         dot_scaled  ptr/ptr     FAIL  FAIL  FAIL
         dot_scaled  desc/desc   ok    ok    ok      (w8 was charted FAIL — refuted)
         MIXED modes (ptr/desc, desc/ptr): 24/24 ok at every warp count.
@@ -711,7 +711,7 @@ def weight_only_warp_spec_matched_mode_pruner():
     # all compile and run bit-identical — dot+WS+BK=128 is the gate_up's best config (2128 vs 2235us).
     # The original matrix was charted with hand-built Configs, which skip the descriptor pre_hooks
     # and fail every descriptor cell for the wrong reason. The pointer rows stand unrefuted.
-    _BAD = {
+    _TRAPPING_NUM_WARPS = {
         ("dot", "pointer"): {16},
         ("dot_scaled", "pointer"): {4, 8, 16},
     }
@@ -726,7 +726,7 @@ def weight_only_warp_spec_matched_mode_pruner():
         a, b = c.kwargs.get("A_MEMORY_MODE"), c.kwargs.get("B_MEMORY_MODE")
         if a != b:  # mixed modes lower everywhere
             return True
-        return c.num_warps not in _BAD.get((c.kwargs.get("COMPUTE_MODE"), a), set())
+        return c.num_warps not in _TRAPPING_NUM_WARPS.get((c.kwargs.get("COMPUTE_MODE"), a), set())
 
     return config_filter(ok, when=lambda args: is_sm10x())
 

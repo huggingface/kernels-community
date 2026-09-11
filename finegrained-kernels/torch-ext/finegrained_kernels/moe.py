@@ -38,14 +38,123 @@ from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
+from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .grouped import matmul_grouped
 from .batched import GATE_UNSTACK_MAX_S, matmul_batched
-from .compat import MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, weighted_reduce
+from .bayesian_autotuner import bayesian_autotune
+from .compat import MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, decode_pdl, device_context
 from .recipes import Epilogue, get_supported_act_fns, Quantization, is_mx, is_mxfp4, weight_recipe
 from .quant import _launch_act_quant
 from .scheduling import compute_grouped_scheduling
 from .epilogue import fused_glu
+
+
+@bayesian_autotune(
+    [
+        triton.Config({"BLOCK_H": block_h}, num_warps=warps)
+        for block_h in (256, 512, 1024, 2048)
+        for warps in (4, 8)
+    ],
+    # the H tile width trades off against grid occupancy: at few groups (decode) narrow
+    # tiles spread more H-blocks across SMs, at many groups (prefill) wide tiles amortize
+    # the per-row weight load — so key on H and the group-count bucket.
+    ["H", "num_groups_bit_length"],
+    n_trials=8,
+)
+@triton.jit
+def weighted_reduce_kernel(
+    Rows,  # (num_groups * NUM_TOP_K, H) — rows to reduce, group-major
+    Out,  # (num_groups, H) — one reduced row per group
+    Ids,  # (num_groups, NUM_TOP_K) — per-row id; a row is skipped when its id >= NUM_EXPERTS
+    Weights,  # (num_groups * NUM_TOP_K,) — per-row scale
+    H,
+    stride_rows_m,
+    stride_rows_h,
+    stride_o_m,
+    stride_o_h,
+    stride_ids_m,
+    stride_ids_k,
+    num_groups_bit_length,  # autotune key only (log2 group-count bucket); unused in body
+    NUM_TOP_K: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    SIMULATE_UNFUSED: tl.constexpr = False,
+    PDL: tl.constexpr = False,
+):
+    """Per group ``g``, the weighted sum of its ``NUM_TOP_K`` rows into ``Out[g]``:
+    ``sum_k Weights[g*NUM_TOP_K + k] * Rows[g*NUM_TOP_K + k]``, skipping rows whose id is
+    ``>= NUM_EXPERTS`` (out-of-range rows are never written upstream and contribute 0).
+    fp32 accumulate; ~2.8x a generic ``view(g, k, H).sum(1)``. ``SIMULATE_UNFUSED`` rounds
+    each weighted row to ``Out``'s dtype before summing, matching a reference that weights
+    in that dtype; production leaves the accumulation in fp32."""
+    if PDL:
+        gdc_wait()
+    g = tl.program_id(0)
+    offs_h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs_h < H
+    acc = tl.zeros((BLOCK_H,), tl.float32)
+    for k in tl.static_range(NUM_TOP_K):
+        flat = g * NUM_TOP_K + k
+        valid = tl.load(Ids + g * stride_ids_m + k * stride_ids_k) < NUM_EXPERTS
+        weight = tl.load(Weights + flat)
+        contrib = weight * tl.load(
+            Rows + flat * stride_rows_m + offs_h * stride_rows_h,
+            mask=mask & valid,
+            other=0.0,
+        ).to(tl.float32)
+        if SIMULATE_UNFUSED:
+            contrib = contrib.to(Out.dtype.element_ty).to(tl.float32)
+        acc += contrib
+    if PDL:
+        gdc_launch_dependents()
+    tl.store(
+        Out + g * stride_o_m + offs_h * stride_o_h,
+        acc.to(Out.dtype.element_ty),
+        mask=mask,
+    )
+
+
+
+def weighted_reduce(
+    rows: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    num_experts: int,
+    simulate_unfused: bool = False,
+) -> torch.Tensor:
+    """Routing-weighted top-k reduce — the bookend of the fused-MoE chain. Folds each token's
+    ``num_top_k`` expert-output rows (``rows``, group-major, scaled by ``top_k_weights``, with
+    EP-sentinel rows ``id >= num_experts`` skipped) from the routed-row layout back to
+    ``(num_tokens, H)``. See ``weighted_reduce_kernel``."""
+    num_tokens, num_top_k = top_k_index.shape
+    H = rows.size(1)
+    reduced = torch.empty(num_tokens, H, device=rows.device, dtype=rows.dtype)
+    with device_context(rows.device):
+        compile_time_only_triton_wrap(weighted_reduce_kernel)[
+            lambda meta: (num_tokens, triton.cdiv(H, meta["BLOCK_H"]))
+        ](
+            rows,
+            reduced,
+            top_k_index,
+            top_k_weights,
+            H,
+            rows.stride(0),
+            rows.stride(1),
+            reduced.stride(0),
+            reduced.stride(1),
+            top_k_index.stride(0),
+            top_k_index.stride(1),
+            num_groups_bit_length=int(num_tokens).bit_length(),
+            NUM_TOP_K=num_top_k,
+            NUM_EXPERTS=num_experts,
+            SIMULATE_UNFUSED=simulate_unfused,
+            PDL=decode_pdl(),
+            launch_pdl=decode_pdl(),
+        )
+    return reduced
 
 
 def _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale):
@@ -60,6 +169,8 @@ def _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale):
         raise ValueError(
             "gate_up_proj and down_proj must use the same recipe (both MX or both block-dynamic FP8)."
         )
+    if is_mxfp4(gate_up_proj, gate_up_proj_scale) != is_mxfp4(down_proj, down_proj_scale):
+        raise ValueError("gate_up_proj and down_proj must use the same MX format (both MXFP4 or both MXFP8).")
     return gate_up_is_mx
 
 
@@ -137,12 +248,6 @@ def _block_recipe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, 
     chain; unquantized BF16/FP16 weights carry no scales and stay ``None``, the
     full-precision path)."""
     _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale)
-    if is_mxfp4(gate_up_proj, gate_up_proj_scale) != is_mxfp4(
-        down_proj, down_proj_scale
-    ):
-        raise ValueError(
-            "gate_up_proj and down_proj must use the same MX format (both MXFP4 or both MXFP8)."
-        )
     if recipe != "weights":  # None (weight-only) or an explicit format — respected as-is
         return recipe
     if gate_up_proj_scale is None:

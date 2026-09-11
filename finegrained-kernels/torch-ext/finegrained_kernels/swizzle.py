@@ -24,23 +24,6 @@ from .recipes import *  # noqa: F401,F403
 
 
 
-def interleave_gate_up_rows(t: torch.Tensor) -> torch.Tensor:
-    """A ``(..., 2N, K)`` gate|up slab held as the two halves ``[gate; up]`` -> the
-    ``[g0, u0, g1, u1, ...]`` row order the kernels read, for weights and their scale grids alike.
-
-    Row granularity makes a gate|up tile a contiguous range — tile ``pid_n`` covers rows
-    ``[2*pid_n*BN, 2*(pid_n+1)*BN)`` — so the alignment floor is ``N % 64``."""
-    n = t.shape[-2] // 2
-    return torch.stack([t[..., :n, :], t[..., n:, :]], dim=-2).reshape(t.shape)
-
-
-def deinterleave_gate_up_rows(t: torch.Tensor) -> torch.Tensor:
-    """Inverse of ``interleave_gate_up_rows``: ``[g0, u0, g1, u1, ...]`` back to the ``[gate; up]``
-    halves, for checkpoint save and for reference math that wants the two projections apart."""
-    pair = t.reshape(*t.shape[:-2], t.shape[-2] // 2, 2, t.shape[-1])
-    return torch.cat([pair[..., 0, :], pair[..., 1, :]], dim=-2)
-
-
 @triton.jit
 def swizzle_store_block(DST, s, blk, cb, NCB):
     """Pack one row-major ``(128, 4)`` scale block ``s`` into its SWIZZLE_32_4_4 ``(32, 16)`` block
