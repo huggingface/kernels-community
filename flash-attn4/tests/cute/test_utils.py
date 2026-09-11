@@ -2,8 +2,14 @@
 
 import functools
 
-from flash_attn4 import utils as cute_utils
-from flash_attn4.utils import hash_callable
+import pytest
+
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+cute_utils = flash_attn4.utils
+hash_callable = flash_attn4.utils.hash_callable
 
 
 def with_positional_default(value):
@@ -67,6 +73,7 @@ class TestHashCallable:
         result = hash_callable(wrapper_func)
         assert result == "wrapper-hash"
 
+    @pytest.mark.kernels_ci
     def test_fallback_to_source_hashing(self):
         """hash_callable should fall back to source hashing when no __cute_hash__."""
 
@@ -78,6 +85,7 @@ class TestHashCallable:
         assert isinstance(result, str)
         assert len(result) == 64  # SHA256 produces 64 hex chars
 
+    @pytest.mark.kernels_ci
     def test_same_function_produces_same_hash(self):
         """Same function should produce consistent hash."""
 

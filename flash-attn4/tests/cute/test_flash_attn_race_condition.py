@@ -14,19 +14,19 @@ try:
 except ImportError:
     apply_rotary_emb = None
 
-from flash_attn4.testing import (
-    attention_ref,
-    generate_qkv,
-    generate_random_padding_mask,
-    pad_input,
-    unpad_input,
-)
-from flash_attn4.interface import (
-    flash_attn_func,
-    flash_attn_varlen_func,
-    flash_attn_combine,
-    _flash_attn_bwd,
-)
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+attention_ref = flash_attn4.testing.attention_ref
+generate_qkv = flash_attn4.testing.generate_qkv
+generate_random_padding_mask = flash_attn4.testing.generate_random_padding_mask
+pad_input = flash_attn4.testing.pad_input
+unpad_input = flash_attn4.testing.unpad_input
+flash_attn_func = flash_attn4.interface.flash_attn_func
+flash_attn_varlen_func = flash_attn4.interface.flash_attn_varlen_func
+flash_attn_combine = flash_attn4.interface.flash_attn_combine
+_flash_attn_bwd = flash_attn4.interface._flash_attn_bwd
 
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"

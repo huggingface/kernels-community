@@ -7,17 +7,17 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-import flash_attn4.interface as interface
-from flash_attn4.cache_utils import JITCache
-from flash_attn4.testing import (
-    maybe_fake_tensor_mode,
-    is_fake_mode,
-)
-from flash_attn4.interface import (
-    _flash_attn_fwd,
-    _flash_attn_fwd_combine,
-    flash_attn_combine,
-)
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+interface = flash_attn4.interface
+JITCache = flash_attn4.cache_utils.JITCache
+maybe_fake_tensor_mode = flash_attn4.testing.maybe_fake_tensor_mode
+is_fake_mode = flash_attn4.testing.is_fake_mode
+_flash_attn_fwd = flash_attn4.interface._flash_attn_fwd
+_flash_attn_fwd_combine = flash_attn4.interface._flash_attn_fwd_combine
+flash_attn_combine = flash_attn4.interface.flash_attn_combine
 
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 

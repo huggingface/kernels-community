@@ -1,11 +1,13 @@
 import pytest
 import torch
 from torch.nn.attention.flex_attention import flex_attention
-from flash_attn4.interface import (
-    _flash_attn_fwd,
-    _flash_attn_bwd,
-    flash_attn_varlen_func,
-)
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+_flash_attn_fwd = flash_attn4.interface._flash_attn_fwd
+_flash_attn_bwd = flash_attn4.interface._flash_attn_bwd
+flash_attn_varlen_func = flash_attn4.interface.flash_attn_varlen_func
 from test_score_mod import _generate_block_kvcache
 from score_mod_definitions import (
     # TensorSSA-based score mods

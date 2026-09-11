@@ -3,7 +3,11 @@ import pytest
 
 import torch
 import torch.nn.functional as F
-from flash_attn4 import flash_attn_varlen_func
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+flash_attn_varlen_func = flash_attn4.flash_attn_varlen_func
 
 @pytest.mark.parametrize("B", [1, 7, 20])
 @pytest.mark.parametrize("H", [1, 4, 6])

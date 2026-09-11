@@ -1,10 +1,17 @@
 import logging
 from types import SimpleNamespace
 
-import flash_attn4.cache_utils as cache_utils
-from flash_attn4 import fa_logging
+import pytest
+
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+cache_utils = flash_attn4.cache_utils
+fa_logging = flash_attn4.fa_logging
 
 
+@pytest.mark.kernels_ci
 def test_persistent_cache_hit_logs_at_host_level_only(tmp_path, monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger="flash_attn")
     original_level = fa_logging.get_fa_log_level()

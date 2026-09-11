@@ -7,14 +7,16 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import math as mlir_math
 import operator
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-from flash_attn4.cache_utils import JITCache
-from flash_attn4.interface import (
-    flash_attn_func,
-    _flash_attn_fwd,
-    _flash_attn_bwd,
-    _tile_size_bwd_sm90,
-)
-from flash_attn4.block_sparsity import BlockSparseTensorsTorch
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+JITCache = flash_attn4.cache_utils.JITCache
+flash_attn_func = flash_attn4.interface.flash_attn_func
+_flash_attn_fwd = flash_attn4.interface._flash_attn_fwd
+_flash_attn_bwd = flash_attn4.interface._flash_attn_bwd
+_tile_size_bwd_sm90 = flash_attn4.interface._tile_size_bwd_sm90
+BlockSparseTensorsTorch = flash_attn4.block_sparsity.BlockSparseTensorsTorch
 
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 

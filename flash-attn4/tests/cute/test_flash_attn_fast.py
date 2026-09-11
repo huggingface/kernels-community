@@ -9,20 +9,20 @@ import pytest
 import torch
 from einops import rearrange
 
-from flash_attn4.cache_utils import JITCache
-from flash_attn4.interface import (
-    _flash_attn_fwd,
-    flash_attn_combine,
-    flash_attn_func,
-    flash_attn_varlen_func,
-)
-from flash_attn4.testing import (
-    attention_ref,
-    generate_qkv,
-    generate_random_padding_mask,
-    is_fake_mode,
-    maybe_fake_tensor_mode,
-)
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+JITCache = flash_attn4.cache_utils.JITCache
+_flash_attn_fwd = flash_attn4.interface._flash_attn_fwd
+flash_attn_combine = flash_attn4.interface.flash_attn_combine
+flash_attn_func = flash_attn4.interface.flash_attn_func
+flash_attn_varlen_func = flash_attn4.interface.flash_attn_varlen_func
+attention_ref = flash_attn4.testing.attention_ref
+generate_qkv = flash_attn4.testing.generate_qkv
+generate_random_padding_mask = flash_attn4.testing.generate_random_padding_mask
+is_fake_mode = flash_attn4.testing.is_fake_mode
+maybe_fake_tensor_mode = flash_attn4.testing.maybe_fake_tensor_mode
 
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
@@ -111,6 +111,7 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, 
 
 
 @pytest.mark.skipif(USE_FAKE_TENSOR, reason="requires a data-dependent CUDA max")
+@pytest.mark.kernels_ci
 def test_flash_attn_varlen_tensor_max_seqlen_reuses_fwd_cache():
     """A fresh CUDA scalar max_seqlen must not create a new compile key."""
     device = "cuda"

@@ -22,23 +22,25 @@ import cutlass.cute as cute
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import torch.nn.functional as F
 
-from flash_attn4.interface import (
-    _flash_attn_fwd,
-    _flash_attn_bwd,
-    flash_attn_func,
-)
-from flash_attn4.block_sparsity import (
-    BlockSparseTensorsTorch,
-    block_sparse_bwd_supports_2cta,
-    fast_sampling,
-    get_kv_subtile_factor,
-    normalize_block_sparse_config_bwd,
-    compute_dq_write_order,
-    compute_dq_write_order_from_block_mask,
-)
-from flash_attn4.cache_utils import get_jit_cache
-from flash_attn4.compute_block_sparsity import compute_block_sparsity
-from flash_attn4 import utils
+import importlib
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+_flash_attn_fwd = flash_attn4.interface._flash_attn_fwd
+_flash_attn_bwd = flash_attn4.interface._flash_attn_bwd
+flash_attn_func = flash_attn4.interface.flash_attn_func
+BlockSparseTensorsTorch = flash_attn4.block_sparsity.BlockSparseTensorsTorch
+block_sparse_bwd_supports_2cta = flash_attn4.block_sparsity.block_sparse_bwd_supports_2cta
+fast_sampling = flash_attn4.block_sparsity.fast_sampling
+get_kv_subtile_factor = flash_attn4.block_sparsity.get_kv_subtile_factor
+normalize_block_sparse_config_bwd = flash_attn4.block_sparsity.normalize_block_sparse_config_bwd
+compute_dq_write_order = flash_attn4.block_sparsity.compute_dq_write_order
+compute_dq_write_order_from_block_mask = flash_attn4.block_sparsity.compute_dq_write_order_from_block_mask
+get_jit_cache = flash_attn4.cache_utils.get_jit_cache
+importlib.import_module(f"{flash_attn4.__name__}.compute_block_sparsity")
+compute_block_sparsity = flash_attn4.compute_block_sparsity.compute_block_sparsity
+utils = flash_attn4.utils
 from mask_mod_definitions import (
     get_mask_pair,
     get_vec_mask,
@@ -1092,7 +1094,7 @@ def test_sm100_block_sparse_bwd_kv_subtile_actual_kernel(
     sparse_tile_n,
     expected_use_2cta,
 ):
-    from flash_attn4 import flash_bwd_sm100
+    flash_bwd_sm100 = flash_attn4.flash_bwd_sm100
 
     torch.manual_seed(124)
     batch_size = 1
@@ -1167,7 +1169,7 @@ def test_sm100_block_sparse_bwd_kv_subtile_actual_kernel(
         with (
             mock.patch.object(flash_bwd_sm100.FlashAttentionBackwardSm100, "__init__", wrapped_init),
             mock.patch(
-                "flash_attn4.interface.normalize_block_sparse_config_bwd",
+                f"{flash_attn4.__name__}.interface.normalize_block_sparse_config_bwd",
                 side_effect=wrapped_normalize,
             ),
         ):
@@ -1221,8 +1223,8 @@ def test_sm100_block_sparse_bwd_kv_subtile_actual_kernel(
 
 @pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
 def test_sm100_block_sparse_q_stage1():
-    from flash_attn4 import flash_fwd_sm100
-    from flash_attn4.interface import _flash_attn_fwd
+    flash_fwd_sm100 = flash_attn4.flash_fwd_sm100
+    _flash_attn_fwd = flash_attn4.interface._flash_attn_fwd
 
     observed = {}
     original_init = flash_fwd_sm100.FlashAttentionForwardSm100.__init__

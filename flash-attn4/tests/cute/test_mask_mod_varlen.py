@@ -18,9 +18,15 @@ import cutlass
 import cutlass.cute as cute
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
-from flash_attn4.interface import _flash_attn_fwd
-from flash_attn4 import utils
-from flash_attn4.compute_block_sparsity import compute_block_sparsity
+import importlib
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+_flash_attn_fwd = flash_attn4.interface._flash_attn_fwd
+utils = flash_attn4.utils
+importlib.import_module(f"{flash_attn4.__name__}.compute_block_sparsity")
+compute_block_sparsity = flash_attn4.compute_block_sparsity.compute_block_sparsity
 from mask_mod_definitions import (
     get_mask_pair,
     get_vec_mask,

@@ -7,8 +7,12 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-from flash_attn4 import utils
-from flash_attn4.block_sparsity import fast_sampling
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+utils = flash_attn4.utils
+fast_sampling = flash_attn4.block_sparsity.fast_sampling
 
 
 # =============================================================================

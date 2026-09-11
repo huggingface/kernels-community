@@ -20,13 +20,15 @@ if "flash_attn" not in sys.modules:
     package.__path__ = [str(Path(__file__).resolve().parents[2] / "flash_attn")]
     sys.modules["flash_attn"] = package
 
-from flash_attn4.cute_dsl_utils import (
-    get_aux_tensor_metadata,
-    get_num_sms_for_selection,
-    maybe_contiguous,
-    to_cute_aux_tensor,
-    validate_output_layout,
-)
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+get_aux_tensor_metadata = flash_attn4.cute_dsl_utils.get_aux_tensor_metadata
+get_num_sms_for_selection = flash_attn4.cute_dsl_utils.get_num_sms_for_selection
+maybe_contiguous = flash_attn4.cute_dsl_utils.maybe_contiguous
+to_cute_aux_tensor = flash_attn4.cute_dsl_utils.to_cute_aux_tensor
+validate_output_layout = flash_attn4.cute_dsl_utils.validate_output_layout
 
 
 def _tagged(tensor: torch.Tensor, leading_dim: int) -> torch.Tensor:
@@ -68,6 +70,7 @@ def test_fake_target_num_sms(monkeypatch):
         get_num_sms_for_selection(0, 103)
 
 
+@pytest.mark.kernels_ci
 def test_layout_validation_uses_pointer_and_rejects_broadcast_output():
     storage = bytearray(256)
     base = torch.frombuffer(storage, dtype=torch.uint8)

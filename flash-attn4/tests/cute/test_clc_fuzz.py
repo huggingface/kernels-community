@@ -13,17 +13,20 @@ from unittest import mock
 import pytest
 import torch
 
-from flash_attn4 import utils as cute_utils
-from flash_attn4.flash_fwd_sm100 import FlashAttentionForwardSm100
-from flash_attn4.interface import flash_attn_func, flash_attn_varlen_func
-from flash_attn4.testing import attention_ref
-from flash_attn4.tile_scheduler import (
-    DynamicPersistentVarlenScheduler,
-    SchedulingMode,
-    SingleTileLPTScheduler,
-    SingleTileVarlenScheduler,
-    StaticPersistentTileScheduler,
-)
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+cute_utils = flash_attn4.utils
+FlashAttentionForwardSm100 = flash_attn4.flash_fwd_sm100.FlashAttentionForwardSm100
+flash_attn_func = flash_attn4.interface.flash_attn_func
+flash_attn_varlen_func = flash_attn4.interface.flash_attn_varlen_func
+attention_ref = flash_attn4.testing.attention_ref
+DynamicPersistentVarlenScheduler = flash_attn4.tile_scheduler.DynamicPersistentVarlenScheduler
+SchedulingMode = flash_attn4.tile_scheduler.SchedulingMode
+SingleTileLPTScheduler = flash_attn4.tile_scheduler.SingleTileLPTScheduler
+SingleTileVarlenScheduler = flash_attn4.tile_scheduler.SingleTileVarlenScheduler
+StaticPersistentTileScheduler = flash_attn4.tile_scheduler.StaticPersistentTileScheduler
 
 
 if torch.cuda.is_available():
