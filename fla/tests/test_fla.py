@@ -343,7 +343,7 @@ def test_gated_delta_rule():
         .requires_grad_()
     )
 
-    ref, _ = naive_recurrent_gated_delta_rule(
+    ref, _ = naive_chunk_gated_delta_rule(
         q=F.normalize(q, p=2, dim=-1),
         k=F.normalize(k, p=2, dim=-1),
         v=v,
@@ -411,7 +411,7 @@ def test_kimi_delta_attention():
         .requires_grad_()
     )
 
-    ref, _ = naive_recurrent_kda(
+    ref, _ = naive_chunk_kda(
         q=F.normalize(q, p=2, dim=-1),
         k=F.normalize(k, p=2, dim=-1),
         v=v,
