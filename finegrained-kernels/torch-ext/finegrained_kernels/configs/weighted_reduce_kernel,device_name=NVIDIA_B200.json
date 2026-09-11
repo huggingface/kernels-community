@@ -1,0 +1,50 @@
+{
+ "[2880, 1, \"torch.bfloat16\", \"torch.bfloat16\", \"torch.int32\", \"torch.float32\"]": {
+  "BLOCK_H": 256,
+  "num_ctas": 1,
+  "num_stages": 3,
+  "num_warps": 8
+ },
+ "[2880, 14, \"torch.bfloat16\", \"torch.bfloat16\", \"torch.int32\", \"torch.float32\"]": {
+  "BLOCK_H": 1024,
+  "num_ctas": 1,
+  "num_stages": 3,
+  "num_warps": 4
+ },
+ "[4096, 1, \"torch.bfloat16\", \"torch.bfloat16\", \"torch.int32\", \"torch.float32\"]": {
+  "BLOCK_H": 1024,
+  "num_ctas": 1,
+  "num_stages": 3,
+  "num_warps": 8
+ },
+ "[4096, 14, \"torch.bfloat16\", \"torch.bfloat16\", \"torch.int32\", \"torch.float32\"]": {
+  "BLOCK_H": 2048,
+  "num_ctas": 1,
+  "num_stages": 3,
+  "num_warps": 4
+ },
+ "[6144, 1, \"torch.bfloat16\", \"torch.bfloat16\", \"torch.int32\", \"torch.float32\"]": {
+  "BLOCK_H": 1024,
+  "num_ctas": 1,
+  "num_stages": 3,
+  "num_warps": 8
+ },
+ "[6144, 14, \"torch.bfloat16\", \"torch.bfloat16\", \"torch.int32\", \"torch.float32\"]": {
+  "BLOCK_H": 2048,
+  "num_ctas": 1,
+  "num_stages": 3,
+  "num_warps": 4
+ },
+ "[7168, 1, \"torch.bfloat16\", \"torch.bfloat16\", \"torch.int32\", \"torch.float32\"]": {
+  "BLOCK_H": 256,
+  "num_ctas": 1,
+  "num_stages": 3,
+  "num_warps": 4
+ },
+ "[7168, 14, \"torch.bfloat16\", \"torch.bfloat16\", \"torch.int32\", \"torch.float32\"]": {
+  "BLOCK_H": 512,
+  "num_ctas": 1,
+  "num_stages": 3,
+  "num_warps": 4
+ }
+}

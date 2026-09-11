@@ -1,0 +1,19 @@
+[general]
+name = "finegrained-kernels"
+version = 5
+license = "Apache-2.0"
+backends = [
+    "cuda",
+    "rocm",
+    "xpu",
+]
+
+[general.hub]
+repo-id = "kernels-community/finegrained-kernels"
+
+[torch-noarch]
+# ship the tuned autotune tables in configs/ (see torch-ext/finegrained_kernels/tuned_configs.py);
+# only py/pyi are picked up by default
+pyext = ["json", "py"]
+
+[kernel]

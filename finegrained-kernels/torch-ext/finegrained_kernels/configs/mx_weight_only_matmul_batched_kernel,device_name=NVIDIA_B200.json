@@ -1,0 +1,22 @@
+{
+ "[2880, 2880, 4, false, \"A:torch.bfloat16\", \"B:torch.uint8\", \"Bs:torch.uint8\", \"BsGlobal:None\", \"C:torch.bfloat16\", \"Bias:None\", \"ExpertIds:torch.int32\", \"GatherIdx:None\", \"ScatterIdx:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\"]": {
+  "BLOCK_SIZE_K": 512,
+  "BLOCK_SIZE_M": 1,
+  "BLOCK_SIZE_N": 32,
+  "COMPUTE_MODE": "scalar",
+  "SWAP_AB": true,
+  "num_ctas": 1,
+  "num_stages": 5,
+  "num_warps": 8
+ },
+ "[5760, 2880, 4, false, \"A:torch.bfloat16\", \"B:torch.uint8\", \"Bs:torch.uint8\", \"BsGlobal:None\", \"C:torch.float32\", \"Bias:None\", \"ExpertIds:torch.int32\", \"GatherIdx:torch.int32\", \"ScatterIdx:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\"]": {
+  "BLOCK_SIZE_K": 256,
+  "BLOCK_SIZE_M": 1,
+  "BLOCK_SIZE_N": 32,
+  "COMPUTE_MODE": "scalar",
+  "SWAP_AB": true,
+  "num_ctas": 1,
+  "num_stages": 5,
+  "num_warps": 4
+ }
+}
