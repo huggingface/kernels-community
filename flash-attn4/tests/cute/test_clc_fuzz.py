@@ -17,7 +17,13 @@ from flash_attn4 import utils as cute_utils
 from flash_attn4.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn4.interface import flash_attn_func, flash_attn_varlen_func
 from flash_attn4.testing import attention_ref
-from flash_attn4.tile_scheduler import SchedulingMode, SingleTileLPTScheduler, SingleTileVarlenScheduler
+from flash_attn4.tile_scheduler import (
+    DynamicPersistentVarlenScheduler,
+    SchedulingMode,
+    SingleTileLPTScheduler,
+    SingleTileVarlenScheduler,
+    StaticPersistentTileScheduler,
+)
 
 
 if torch.cuda.is_available():
@@ -60,10 +66,19 @@ def check_output(q, k, v, *, causal=False, window_size=(None, None), num_splits=
     torch.cuda.synchronize()
     if assert_clc and _captured_schedulers:
         sched_cls, sched_mode, use_2cta = _captured_schedulers[-1]
-        assert sched_cls is SingleTileLPTScheduler, f"Expected SingleTileLPTScheduler, got {sched_cls.__name__}"
-        assert sched_mode == SchedulingMode.CLC, f"Expected CLC scheduling mode, got {sched_mode!r}"
-        if assert_2cta:
-            assert use_2cta, "Expected use_2cta_instrs=True but got False"
+        is_local = window_size != (None, None)
+        if causal or is_local:
+            assert sched_cls is SingleTileLPTScheduler, f"Expected SingleTileLPTScheduler, got {sched_cls.__name__}"
+            assert sched_mode == SchedulingMode.CLC, f"Expected CLC scheduling mode, got {sched_mode!r}"
+            if assert_2cta:
+                assert use_2cta, "Expected use_2cta_instrs=True but got False"
+        else:
+            assert sched_cls is StaticPersistentTileScheduler, (
+                f"Expected StaticPersistentTileScheduler for dense noncausal, got {sched_cls.__name__}"
+            )
+            assert sched_mode == SchedulingMode.STATIC, (
+                f"Expected STATIC scheduling mode for dense noncausal, got {sched_mode!r}"
+            )
     out_ref, _ = attention_ref(q, k, v, causal=causal, window_size=window_size)
     out_pt, _ = attention_ref(q, k, v, causal=causal, window_size=window_size, upcast=False, reorder_ops=True)
     fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
@@ -86,6 +101,31 @@ def expected_total_tiles_mha(batch, seqlen_q, heads):
     q_stage = 2 if COMPUTE_CAPABILITY == 10 and seqlen_q > 128 else 1
     num_block = (seqlen_q + q_stage * 128 - 1) // (q_stage * 128)
     return num_block * heads * batch
+
+
+def assert_varlen_scheduler(sched_cls, sched_mode, *, heads, kv_heads, num_splits):
+    expected_mode = (
+        SchedulingMode.CLC
+        if heads != kv_heads
+        else SchedulingMode.DYNAMIC
+        if num_splits > 1
+        else SchedulingMode.STATIC
+    )
+    assert sched_mode == expected_mode, (
+        f"Expected {expected_mode.name} scheduling mode, got {sched_mode!r}"
+    )
+    expected_classes = {
+        SchedulingMode.CLC: (SingleTileVarlenScheduler,),
+        SchedulingMode.DYNAMIC: (DynamicPersistentVarlenScheduler,),
+        SchedulingMode.STATIC: (
+            SingleTileVarlenScheduler,
+            StaticPersistentTileScheduler,
+        ),
+    }[expected_mode]
+    assert sched_cls in expected_classes, (
+        f"Expected one of {[cls.__name__ for cls in expected_classes]}, "
+        f"got {sched_cls.__name__}"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -237,19 +277,19 @@ class TestCLCHeadDim:
         check_output(randn(4, sq, 4, d), randn(4, sk, 4, d), randn(4, sk, 4, dv))
 
     def test_overlap_sO_sQ_fallback(self):
-        from flash_attn4.tile_scheduler import SingleTileScheduler
-
         _captured_schedulers.clear()
         check_output(randn(4, 128, 4, 192), randn(4, 257, 4, 192), randn(4, 257, 4, 128), assert_clc=False)
         assert _captured_schedulers, "No scheduler was captured"
         sched_cls, sched_mode, *_ = _captured_schedulers[-1]
-        assert sched_cls is SingleTileScheduler, f"Expected SingleTileScheduler fallback, got {sched_cls.__name__}"
+        assert sched_cls is StaticPersistentTileScheduler, (
+            f"Expected StaticPersistentTileScheduler fallback, got {sched_cls.__name__}"
+        )
         assert sched_mode == SchedulingMode.STATIC, f"Expected STATIC fallback, got {sched_mode!r}"
 
 
 class TestCLCFallback:
 
-    def test_varlen_uses_clc(self):
+    def test_varlen_mha_uses_static(self):
         _captured_schedulers.clear()
         batch, seqlen, heads, d = 4, 256, 4, 128
         lens = torch.tensor([64, 128, 32, 32], dtype=torch.int32)
@@ -268,10 +308,10 @@ class TestCLCFallback:
         torch.cuda.synchronize()
         assert _captured_schedulers, "No scheduler was captured"
         sched_cls, sched_mode, *_ = _captured_schedulers[-1]
-        assert sched_cls is SingleTileVarlenScheduler, (
-            f"Expected SingleTileVarlenScheduler for varlen, got {sched_cls.__name__}"
+        assert sched_cls is StaticPersistentTileScheduler, (
+            f"Expected StaticPersistentTileScheduler for varlen, got {sched_cls.__name__}"
         )
-        assert sched_mode == SchedulingMode.CLC, f"Expected CLC scheduling mode, got {sched_mode!r}"
+        assert sched_mode == SchedulingMode.STATIC, f"Expected STATIC scheduling mode, got {sched_mode!r}"
 
     @pytest.mark.parametrize("sq,sk,wl,wr", [
         (512, 512, 128, 128),
@@ -310,8 +350,13 @@ def check_varlen_output(seqlens, heads, d, *, causal=False, kv_heads=None, num_s
     torch.cuda.synchronize()
     if _captured_schedulers:
         sched_cls, sched_mode, *_ = _captured_schedulers[-1]
-        assert sched_cls is SingleTileVarlenScheduler, f"Expected SingleTileVarlenScheduler, got {sched_cls.__name__}"
-        assert sched_mode == SchedulingMode.CLC, f"Expected CLC scheduling mode, got {sched_mode!r}"
+        assert_varlen_scheduler(
+            sched_cls,
+            sched_mode,
+            heads=heads,
+            kv_heads=kv_heads,
+            num_splits=num_splits,
+        )
 
     for i in range(len(seqlens)):
         s = slice(cu_seqlens[i], cu_seqlens[i + 1])
@@ -354,8 +399,13 @@ def check_varlen_output_seqused(seqlens, heads, d, *, causal=False, kv_heads=Non
     torch.cuda.synchronize()
     if _captured_schedulers:
         sched_cls, sched_mode, *_ = _captured_schedulers[-1]
-        assert sched_cls is SingleTileVarlenScheduler, f"Expected SingleTileVarlenScheduler, got {sched_cls.__name__}"
-        assert sched_mode == SchedulingMode.CLC, f"Expected CLC scheduling mode, got {sched_mode!r}"
+        assert_varlen_scheduler(
+            sched_cls,
+            sched_mode,
+            heads=heads,
+            kv_heads=kv_heads,
+            num_splits=num_splits,
+        )
 
     out_ref, _ = attention_ref(q, k, v, q_mask, k_mask, causal=causal)
     out_pt, _ = attention_ref(q, k, v, q_mask, k_mask, causal=causal, upcast=False, reorder_ops=True)

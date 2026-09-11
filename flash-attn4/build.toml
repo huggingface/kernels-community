@@ -3,6 +3,7 @@ name = "flash-attn4"
 version = 0
 edition = 5
 license = "BSD-3-Clause"
+upstream = "https://github.com/Dao-AILab/flash-attention.git"
 backends = ["cuda"]
 python-depends = [
     "einops",
