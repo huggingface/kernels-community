@@ -6,9 +6,13 @@ tags:
 
 # finegrained-kernels
 
-Triton kernels for fine-grained block-wise FP8 quantization and expert dispatch, developed as part of the HuggingFace Transformers FP8 + MoE optimization effort.
+Triton GEMM + MoE kernels for fine-grained quantization — block/tensor FP8, MXFP8, MXFP4, and
+two-level NVFP4 weights, with fused gate|up GLU epilogues, fused intermediate requantization, and
+expert routing — developed as part of the HuggingFace Transformers FP8 + MoE optimization effort.
 
-All kernels target Hopper (SM90) FP8 WGMMA instructions and are also compatible with Blackwell (SM100), ROCm, and XPU backends via Triton.
+All tuning and validation is on NVIDIA Blackwell (SM100 / B200), whose tcgen05 scaled-MMA the MX
+paths target; Hopper (SM90) runs the same Triton paths, and ROCm / XPU backends are built but
+unvalidated.
 
 ## Benchmarks
 
@@ -20,89 +24,124 @@ Decode is cudagraph-captured, prefill eager; a red ✕ marks a configuration tha
 baseline's output is parity-checked against the finegrained-kernels anchor in the same run. See
 [`bench/README.md`](bench/README.md) to reproduce.
 
-## Kernels
+## Public API
 
-### Dispatchers
+Three GEMM dispatchers, five MoE forwards, and the load-time helpers:
 
-#### `matmul`, `matmul_batched`, `matmul_grouped`
-
-Neutral entry points that route to the right kernel based on `B.dtype`, `block_size`, and an optional `activation_scale` kwarg:
-
-- `B.dtype == int8` → FP4 path (`mx` dynamic, UE8M0 group-32).
-- `B.dtype == float8_e4m3fn` with UE8M0 group-32 `Bs` (shape `[..., N, K // 32]`) → MXFP8 (`mx` dynamic).
-- `activation_scale is not None` → block-static FP8 (single-matmul only).
-- `block_size is None` or `[N, K]` → tensor-mode FP8.
-- otherwise → block-dynamic FP8.
-
-This is the recommended public surface — call `matmul(A, B, Bs, block_size, output_dtype, activation_scale=...)` and let the dispatcher pick the kernel.
-
-### Single matmul (`(M, K) @ (N, K).T → (M, N)`)
-
-#### `w8a8_block_dynamic_fp8_matmul`
-
-Block-wise W8A8 FP8 GEMM with **inline** activation quant. `A` is raw bf16/fp16/fp32; the kernel computes per-K-tile per-row scales and casts to `float8_e4m3fn` inside the K-loop. `Bs` accepts fp32 or `float8_e8m0fnu` (UE8M0) — the kernel decodes UE8M0 inline. `BLOCK_SIZE_M` adapts to `M` (16 for decode, up to 128 for prefill).
-
-#### `w8a8_block_static_fp8_matmul`
-
-Same as `w8a8_block_dynamic_fp8_matmul` but takes an explicit per-tensor activation scalar `As`. `A` is still raw bf16/fp16/fp32; the kernel divides by the static scalar before casting to FP8. The scalar factors out of the K-loop and applies once at the end. Useful for calibration-based static activation quant.
-
-#### `w8a8_tensor_dynamic_fp8_matmul`
-
-Tensor-scale W8A8 FP8 GEMM. Pre-quantizes `A` via `fp8_act_quant(A, K)` to get a per-row activation scale, then runs the matmul with that and a single per-tensor weight scale `Bs`.
-
-#### `w4a8_mx_dynamic_fp4_matmul`
-
-W4A8 FP4 GEMM. `B` is packed FP4 (`int8`, two E2M1 codes per byte); `Bs` is UE8M0 with a fixed K-group of 32. `A` is raw bf16/fp16/fp32 — quantized to FP8 (E4M3) inline with its own UE8M0 K-group-32 scales. Uses `tl.dot_scaled` for the scaled MMA. Tile shape `(BLOCK_SIZE_N, BLOCK_SIZE_K)` is autotuned.
-
-#### `w8a8_mx_dynamic_fp8_matmul`
-
-MXFP8 W8A8 GEMM — the FP8 counterpart of the FP4 path. `B` is **unpacked** `float8_e4m3fn`; `Bs` is UE8M0 with a fixed K-group of 32. `A` is raw bf16/fp16/fp32 — quantized to E4M3 inline with its own UE8M0 K-group-32 scales. Both operands feed `tl.dot_scaled` (the hardware MX scaled MMA, Blackwell SM100+), unlike `w8a8_block_dynamic_fp8_matmul` which applies 128×128 scales in software. Handles arbitrary K (the tensor-mode path needs power-of-2 K). Tile shape is autotuned.
-
-### Batched (`(S, K) + expert_ids → (S, N)`)
-
-Per-row expert dispatch for MoE decode. Each program handles one routed token, reads its expert id, strides into the matching slice of `(E, N, K)` weights, and writes one output row. EP-sentinel safe (rows with `expert_ids[i] >= num_experts` are skipped). Variants:
-
-- `w8a8_block_dynamic_fp8_matmul_batched`
-- `w8a8_tensor_dynamic_fp8_matmul_batched`
-- `w4a8_mx_dynamic_fp4_matmul_batched`
-- `w8a8_mx_dynamic_fp8_matmul_batched`
-
-### Grouped (`(S, K) + offsets + tokens_per_expert → (S, N)`)
-
-Grouped GEMM for MoE prefill: tokens are pre-sorted by expert. Each M-tile finds its owning expert via an O(log E) binary search over `tile_offsets` (unrolled at compile time), then loads the right `(N, K)` weight slice. Grid size is data-independent and CUDA-graph safe. Sentinel rows (`offsets[-1] < S`) are skipped by the early-return guard. Variants:
-
-- `w8a8_block_dynamic_fp8_matmul_grouped`
-- `w8a8_tensor_dynamic_fp8_matmul_grouped`
-- `w4a8_mx_dynamic_fp4_matmul_grouped`
-- `w8a8_mx_dynamic_fp8_matmul_grouped`
-
-## Naming convention
-
-Every matmul kernel name spells out four axes:
-
-```
-w<W>a<A>_<weight_scale_layout>_<activation_quant>_<weight_dtype>_matmul[_batched|_grouped]
+```python
+from finegrained_kernels import (
+    matmul_2d, matmul_batched, matmul_grouped,           # GEMM dispatchers
+    moe_fused_batched, moe_fused_grouped,                # fused MoE forwards
+    moe_unfused_batched, moe_unfused_grouped,            # unfused (two-GEMM) references
+    moe_torch_grouped,                                   # cuBLAS scaled_grouped_mm baseline
+    compute_grouped_scheduling,                          # routing -> grouped launch maps
+    swizzle_mx_scales,                                   # weight scales -> tcgen05 layout, at load
+    nvfp4_quantize_two_level,                            # (N, K) weight -> packed + block + global
+    mxfp8_act_quant, mxfp4_act_quant, nvfp4_act_quant,   # offline MX activation quant
+    fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide,
+    Epilogue, Quantization,                              # per-call recipe bundles
+)
 ```
 
-| Axis                    | Values                                                                                                         |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `w<W>` / `a<A>`         | weight / activation bit-widths (`w8a8`, `w4a8`)                                                                |
-| `<weight_scale_layout>` | `block` (per-`block_n × block_k` weight scale), `tensor` (one scalar), or `mx` (UE8M0 scale per 32-element K-group, via `tl.dot_scaled`) |
-| `<activation_quant>`    | `dynamic` (kernel computes per-K-block / per-row scale inline) or `static` (caller passes a per-tensor scalar) |
-| `<weight_dtype>`        | `fp8` (`float8_e4m3fn`, unpacked) or `fp4` (packed E2M1)                                                       |
+### GEMM dispatchers
 
-The dispatch suffix selects the input layout:
+Every op takes the same operand spec and routes to the right kernel **from the weight dtype and
+scale shape** — the recipe falls out of the data, so it can never disagree with a parameter:
 
-- _no suffix_: single matmul `(M, K) @ (N, K).T → (M, N)`
-- `_batched`: per-row expert dispatch `(S, K) + expert_ids → (S, N)`
-- `_grouped`: expert-sorted grouped GEMM `(S, K) + offsets + tokens_per_expert → (S, N)`
+```python
+matmul_2d(A, B, As=None, Bs=None, *, epilogue=None, quantization=None, output_dtype=None,
+          a_global_scale=None, b_global_scale=None, output_global_scale=None)
+matmul_batched(A, B, As, Bs, *, expert_ids, gather_idx=None, scatter_idx=None, ...same keywords...)
+matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None, ...same keywords...)
+```
 
-Not every combination is implemented — current set:
+- `A` `(M, K)` activations — raw bf16/fp16/fp32 (the op quantizes inline or offline as the recipe
+  needs) or pre-quantized with `As`.
+- `B` weights — `(N, K)` for `matmul_2d`, `(E, N, K)` for the routed ops. `Bs` selects the recipe
+  (see the format matrix below).
+- `epilogue=Epilogue(gate=True, act_fn="silu", swiglu_alpha=..., swiglu_limit=...)` fuses the
+  gate|up GLU: `B` holds the stacked `(2N, K)` gate|up rows and the op returns the activated
+  `(M, N)` intermediate.
+- `quantization=Quantization(input_recipe=..., output_recipe=...)` picks the activation-side quant
+  (e.g. `"mxfp8"` for a W4A8 chain, `None` for weight-only/bf16 activations) and a fused output
+  requant (a `(C, Cs)` tuple is returned instead of a dense tensor).
+- `a_global_scale` / `b_global_scale` / `output_global_scale` are the NVFP4 second level —
+  per-tensor (2D) or per-expert `(E,)` fp32 globals folded onto the accumulator.
+- Routing: `matmul_batched` reads one expert id per row (`expert_ids`, EP sentinels
+  `>= num_experts` skipped); `matmul_grouped` takes the launch maps from
+  `compute_grouped_scheduling(expert_ids, num_experts, top_k)` — no pre-sorted input required.
 
-- `w8a8_block_static_fp8_matmul` (single-matmul only)
-- `w8a8_block_dynamic_fp8_matmul[_batched|_grouped]`
-- `w4a8_mx_dynamic_fp4_matmul[_batched|_grouped]`
-- `w8a8_mx_dynamic_fp8_matmul[_batched|_grouped]`
-- `w8a8_tensor_dynamic_fp8_matmul[_batched|_grouped]`
+### Weight format matrix
 
-For convenience, neutral dispatchers `matmul`, `matmul_batched`, `matmul_grouped` route to the right kernel based on `B.dtype`, `block_size`, and the optional `activation_scale` kwarg.
+| recipe | `B` dtype | `Bs` | second level |
+| --- | --- | --- | --- |
+| full precision | bf16 / fp16 | `None` | — |
+| block FP8 (128×128) | `float8_e4m3fn` | fp32 or UE8M0 `(⌈N/128⌉, K/128)` (the block is derived from the K dim, so K must divide) | — |
+| tensor FP8 | `float8_e4m3fn` | one scalar | — |
+| MXFP8 | `float8_e4m3fn` | UE8M0 `(N, K/32)` (raw `uint8` accepted) | — |
+| MXFP4 | packed E2M1 (`int8`, 2/byte) | UE8M0 `(N, K/32)` | — |
+| NVFP4 | packed E2M1 (`int8`, 2/byte) | E4M3 `(N, K/16)` | fp32 global(s) |
+
+Routed ops carry the expert dim in front (`(E, ...)` weights and scales). MX scales may instead be
+passed **pre-swizzled** — the 5D output of `swizzle_mx_scales` — which is the deployment contract:
+
+```python
+Bs5d = swizzle_mx_scales(Bs)                 # (N, K/g) or (E, N, K/g) -> the tcgen05 layout
+gate_up_s = swizzle_mx_scales(gate_up_s, gate=True)   # stacked (E, 2I, H/g) gate|up slabs
+```
+
+Swizzle once at model load; the ops read the SWIZZLE_32_4_4 descriptor fast path directly (plain
+row-major scales work everywhere but gather per group, capping the scaled dot below peak). A
+pre-swizzled gate_up scale is ONE artifact — gate-interleaved (``gate=True``), returned 6-D so the
+shape carries the layout — and every path consumes it directly: the fused kernels read a tile's
+gate + up block pair off the descriptor, and a plain (unfused) GEMM remaps its block index
+in-kernel. No de-interleaving, no per-path copies. One exception: the weight-only ops
+(`recipe=None`, W4A16/W8A16) read affine scales only — keep the row-major scale around if that
+path must run.
+
+### MoE forwards
+
+```python
+out = moe_fused_grouped(          # prefill; moe_fused_batched is the decode sibling
+    hidden_states,                # (T, H)
+    top_k_index, top_k_weights,   # (T, K) routing (EP sentinels >= num_experts skipped)
+    gate_up_proj,                 # (E, 2I, H)
+    down_proj,                    # (E, H, I)
+    gate_up_proj_scale_inv, down_proj_scale_inv,
+    gate_up_proj_global_scale=None, down_proj_global_scale=None,   # NVFP4 weight second level
+    gate_up_input_global_scale=None, down_input_global_scale=None, # calibrated activation input_scale
+    act_fn="silu", swiglu_alpha=None, swiglu_limit=None,
+    recipe="weights",             # activation quant for the whole block; None = bf16 acts
+)
+```
+
+The fused forwards run gate_up + GLU + intermediate requant + down + routing-weighted top-k reduce
+in two GEMM launches; `moe_unfused_*` are the two-GEMM + host-GLU references (bit-comparable via
+`simulate_unfused=True`), and `moe_torch_grouped` is the `torch.scaled_grouped_mm` (cuBLAS)
+baseline. `recipe="weights"` follows the weight format; `"mxfp8"` on MXFP4 weights gives the W4A8
+chain; `None` keeps activations bf16 (weight-only W4A16/W8A16). For calibrated NVFP4 checkpoints the
+per-projection `input_scale` rides as `*_input_global_scale`: the gate_up quantizes hidden against
+its own, requants the intermediate against the down's, and the down consumes it — leave them `None`
+for dynamic quant.
+
+### Load-time quantization helpers
+
+`nvfp4_quantize_two_level(weight)` returns `(packed_e2m1, e4m3_block_scales, fp32_global)` — the
+canonical two-level NVFP4 weight quant (`global = amax / (6·448)`). The `*_act_quant` helpers are
+the offline activation quants the ops use internally, exposed for pre-quantized (`As`) pipelines;
+`fp8_act_quant_block_dynamic` / `fp8_act_quant_tensor_wide` are their block-FP8 siblings.
+
+## Autotuning
+
+Every kernel is tuned by a TPE (Bayesian) autotuner with per-shape disk caching, config pruners
+that fence compiler bugs and can't-win regions per (arch, recipe), and failed-compile memoization.
+`FINEGRAINED_AUTOTUNE_TRIALS` overrides the trial budget; `FINEGRAINED_AUTOTUNE_LOG=<path>` appends
+per-config timings as JSONL to `<path>`.
+
+## Tests
+
+`pytest tests/` — op-level scenarios against an independent dequantize-and-matmul torch oracle
+(`tests/test_ops.py`), fused-vs-unfused MoE parity (`tests/test_moe.py`), quant-helper references
+(`tests/test_act_quant.py`), and autotuner/pruner guards (`tests/test_autotuner.py`). `pytest -n 8`
+pins one GPU per xdist worker. `-m "not slow"` skips the multi-process determinism and
+forced-config sweep tests.
