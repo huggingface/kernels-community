@@ -31,7 +31,7 @@ def apply_rotary_torch(x1: torch.Tensor, x2: torch.Tensor, cos: torch.Tensor, si
 def apply_rotary_torch_wrapper(q, k, cos, sin, conj: bool = False):
     """the wrapper for apply_rotary_torch"""
     rotary_dim = cos.shape[-1]
-    
+
     # apply rotation encoding to Q
     q1 = q[..., :rotary_dim]
     q2 = q[..., rotary_dim : 2 * rotary_dim]
@@ -50,7 +50,7 @@ def apply_rotary_torch_wrapper(q, k, cos, sin, conj: bool = False):
 def apply_rotary_kernel_wrapper(q, k, cos, sin, conj: bool = False):
     """the wrapper for apply_rotary_kernel"""
     rotary_dim = cos.shape[-1]
-    
+
     # apply rotation encoding to Q
     q1 = q[..., :rotary_dim]
     q2 = q[..., rotary_dim : 2 * rotary_dim]
@@ -65,7 +65,8 @@ def apply_rotary_kernel_wrapper(q, k, cos, sin, conj: bool = False):
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("nheads", [8, 16])
 @pytest.mark.parametrize("seqlen", [128, 256])
-@pytest.mark.parametrize("headdim, rotary_dim", [(64, 32), (128, 64), (64, 30)])
+# (headdim, rotary_dim): standard full RoPE (2 * rotary_dim == headdim) and partial RoPE cases (e.g. half-half where 2 * rotary_dim == headdim // 2)
+@pytest.mark.parametrize("headdim, rotary_dim", [(64, 32), (128, 64), (64, 30), (128, 32), (64, 16), (80, 20)])
 @pytest.mark.parametrize("qk_dim", [3, 4])
 @pytest.mark.parametrize(
     "dtype, atol, rtol",
@@ -128,3 +129,6 @@ def test_rotary_equivalence(batch_size, nheads, seqlen, headdim, rotary_dim, qk_
         assert torch.equal(
             k_kernel[..., 2 * rotary_dim:], k_orig[..., 2 * rotary_dim:]
         ), "Non-rotated part of K should be unchanged"
+
+
+
