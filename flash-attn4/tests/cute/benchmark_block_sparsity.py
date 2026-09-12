@@ -12,8 +12,14 @@ import itertools
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.testing import benchmark as cute_benchmark
 import cutlass.cute as cute
-from flash_attn4.compute_block_sparsity import BlockSparsityKernel
-from flash_attn4.block_sparsity import BlockSparseTensors
+import importlib
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+importlib.import_module(f"{flash_attn4.__name__}.compute_block_sparsity")
+BlockSparsityKernel = flash_attn4.compute_block_sparsity.BlockSparsityKernel
+BlockSparseTensors = flash_attn4.block_sparsity.BlockSparseTensors
 from mask_mod_definitions import (
     get_mask_pair,
     random_doc_id_tensor,
@@ -39,7 +45,7 @@ class BenchmarkConfig:
     mask_name: str
     tile_m: int = 128
     tile_n: int = 128
-    use_fast_sampling: bool = False
+    use_fast_sampling: bool = True
     aux_tensors_cute: Optional[list] = None
 
 
@@ -162,7 +168,7 @@ def benchmark_cute_block_sparsity(
             blocksparse_tensors,
             config.seqlen_q,
             config.seqlen_k,
-            config.aux_tensors_cute,
+            aux_tensors=config.aux_tensors_cute,
         )
 
         def generate_tensors():
@@ -336,7 +342,7 @@ def main():
                     mask_name=config.mask_name,
                     tile_m=config.tile_m,
                     tile_n=config.tile_n,
-                    use_fast_sampling=False,
+                    use_fast_sampling=True,
                     aux_tensors_cute=[doc_ids_cute],
                 )
             )

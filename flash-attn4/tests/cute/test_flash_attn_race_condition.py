@@ -14,19 +14,19 @@ try:
 except ImportError:
     apply_rotary_emb = None
 
-from flash_attn4.testing import (
-    attention_ref,
-    generate_qkv,
-    generate_random_padding_mask,
-    pad_input,
-    unpad_input,
-)
-from flash_attn4.interface import (
-    flash_attn_func,
-    flash_attn_varlen_func,
-    flash_attn_combine,
-    _flash_attn_bwd,
-)
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+attention_ref = flash_attn4.testing.attention_ref
+generate_qkv = flash_attn4.testing.generate_qkv
+generate_random_padding_mask = flash_attn4.testing.generate_random_padding_mask
+pad_input = flash_attn4.testing.pad_input
+unpad_input = flash_attn4.testing.unpad_input
+flash_attn_func = flash_attn4.interface.flash_attn_func
+flash_attn_varlen_func = flash_attn4.interface.flash_attn_varlen_func
+flash_attn_combine = flash_attn4.interface.flash_attn_combine
+_flash_attn_bwd = flash_attn4.interface._flash_attn_bwd
 
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
@@ -43,8 +43,8 @@ INCREASED_TRIALS = False
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [True])
-# @pytest.mark.parametrize("softcap", [0.0, 15.0])
-@pytest.mark.parametrize("softcap", [0.0])
+@pytest.mark.parametrize("softcap", [0.0, 15.0])
+# @pytest.mark.parametrize("softcap", [0.0])
 # @pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
 @pytest.mark.parametrize("local_enum", [0, 1])
 @pytest.mark.parametrize("causal", [False, True])
@@ -251,8 +251,6 @@ def test_flash_attn_output(
             and learnable_sink is None
             # and False
         ):
-            if IS_SM90 and mha_type != "mha":
-                pytest.xfail("SM90 backward: GQA/MQA has tensor layout issue (qhead_per_kvhead > 1)")
             if IS_SM90 and local:
                 pytest.xfail("SM90 backward: local attention not supported yet")
             g = torch.randn_like(out)
@@ -356,8 +354,8 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [True])
-# @pytest.mark.parametrize("softcap", [0.0, 15.0])
-@pytest.mark.parametrize("softcap", [0.0])
+@pytest.mark.parametrize("softcap", [0.0, 15.0])
+# @pytest.mark.parametrize("softcap", [0.0])
 # @pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
 @pytest.mark.parametrize("local_enum", [0, 1])
 @pytest.mark.parametrize("causal", [False, True])

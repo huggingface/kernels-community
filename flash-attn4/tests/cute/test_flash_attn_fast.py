@@ -7,24 +7,26 @@ import random
 
 import pytest
 import torch
-
 from einops import rearrange
 
-from flash_attn4.testing import (
-    attention_ref,
-    generate_random_padding_mask,
-    generate_qkv,
-    maybe_fake_tensor_mode,
-    is_fake_mode,
-)
-from flash_attn4.interface import (
-    flash_attn_func,
-    flash_attn_varlen_func,
-    flash_attn_combine,
-)
+import kernels
+
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+
+JITCache = flash_attn4.cache_utils.JITCache
+_flash_attn_fwd = flash_attn4.interface._flash_attn_fwd
+flash_attn_combine = flash_attn4.interface.flash_attn_combine
+flash_attn_func = flash_attn4.interface.flash_attn_func
+flash_attn_varlen_func = flash_attn4.interface.flash_attn_varlen_func
+attention_ref = flash_attn4.testing.attention_ref
+generate_qkv = flash_attn4.testing.generate_qkv
+generate_random_padding_mask = flash_attn4.testing.generate_random_padding_mask
+is_fake_mode = flash_attn4.testing.is_fake_mode
+maybe_fake_tensor_mode = flash_attn4.testing.maybe_fake_tensor_mode
 
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
+IS_SM120 = torch.cuda.get_device_capability()[0] == 12
 
 
 # ---------------------------------------------------------------------------
@@ -47,8 +49,8 @@ IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, dtype):
-    if IS_SM90 and num_splits > 1:
-        pytest.skip("SM90 fwd doens't support num_splits > 1")
+    if (IS_SM90 or IS_SM120) and num_splits > 1:
+        pytest.skip("SM90/SM120 fwd doesn't support num_splits > 1")
     device = "cuda"
     torch.random.manual_seed(0)
     random.seed(0)
@@ -107,6 +109,54 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, 
 # Forward + backward (varlen with cu_seqlens)
 # ---------------------------------------------------------------------------
 
+
+@pytest.mark.skipif(USE_FAKE_TENSOR, reason="requires a data-dependent CUDA max")
+def test_flash_attn_varlen_tensor_max_seqlen_reuses_fwd_cache():
+    """A fresh CUDA scalar max_seqlen must not create a new compile key."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    seqlens = torch.tensor([384, 320], dtype=torch.int32, device=device)
+    cu_seqlens = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=device),
+            seqlens.cumsum(0, dtype=torch.int32),
+        ]
+    )
+    total = int(cu_seqlens[-1].item())
+    q = torch.randn(total, 2, 64, device=device, dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    original_cache = _flash_attn_fwd.compile_cache
+    test_cache = JITCache()
+    _flash_attn_fwd.compile_cache = test_cache
+    try:
+        outputs = []
+        for _ in range(2):
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            out, _ = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+            )
+            outputs.append(out)
+
+        assert torch.equal(outputs[0], outputs[1])
+        assert len(test_cache.cache) == 1
+        assert all(
+            not torch.is_tensor(value)
+            for key in test_cache.cache
+            for value in key
+        )
+    finally:
+        test_cache.clear()
+        _flash_attn_fwd.compile_cache = original_cache
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("causal", [False, True])
@@ -139,8 +189,8 @@ def test_flash_attn_varlen_output(seqlen, d, causal, mha_type, dtype):
 
     out_varlen, lse = flash_attn_varlen_func(
         q_varlen, k_varlen, v_varlen,
-        cu_seqlens, cu_seqlens,
-        seqlen, seqlen,
+        cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=seqlen, max_seqlen_k=seqlen,
         causal=causal,
     )
 
