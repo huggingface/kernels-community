@@ -111,7 +111,6 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, 
 
 
 @pytest.mark.skipif(USE_FAKE_TENSOR, reason="requires a data-dependent CUDA max")
-@pytest.mark.kernels_ci
 def test_flash_attn_varlen_tensor_max_seqlen_reuses_fwd_cache():
     """A fresh CUDA scalar max_seqlen must not create a new compile key."""
     device = "cuda"

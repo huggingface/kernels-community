@@ -15,6 +15,8 @@ Coverage is bounded by the CI runner, which is an sm89 (L4) device:
   smoke-tested until CI gains a Hopper or Blackwell runner.
 """
 
+import inspect
+
 import kernels
 import pytest
 import torch
@@ -28,11 +30,44 @@ cuda_major = (
 )
 forward_supported = cuda_major in (8, 9, 10, 11, 12)
 
+
+def _tvm_ffi_matches_cutlass() -> bool:
+    """Whether the installed apache-tvm-ffi is new enough for cutlass-dsl.
+
+    Every flash-attn4 kernel is compiled with ``--enable-tvm-ffi``. For a jit
+    signature carrying keyword-only parameters, defaults, or a top-level
+    dataclass argument -- which all of them do -- cutlass-dsl routes through
+    ``tvm_ffi.utils.kwargs_wrapper.make_kwargs_wrapper`` and passes
+    ``map_dataclass_to_tuple``. That parameter landed in apache-tvm-ffi 0.1.11,
+    and cutlass-dsl itself asks for ``>=0.1.11``.
+
+    kernel-builder currently pins apache-tvm-ffi 0.1.9 alongside
+    nvidia-cutlass-dsl 4.6.1, so in that environment every call raises
+    ``TypeError: make_kwargs_wrapper() got an unexpected keyword argument
+    'map_dataclass_to_tuple'`` before reaching kernel code. Detect that pairing
+    and skip, rather than reporting an environment gap as a kernel failure.
+    Once the pin is bumped these tests start running again on their own.
+    """
+    try:
+        from tvm_ffi.utils import kwargs_wrapper
+    except ImportError:
+        return False
+    params = inspect.signature(kwargs_wrapper.make_kwargs_wrapper).parameters
+    return "map_dataclass_to_tuple" in params
+
+
 pytestmark = [
     pytest.mark.kernels_ci,
     pytest.mark.skipif(
         not forward_supported,
         reason="flash-attn4 requires an sm80 or later CUDA device",
+    ),
+    pytest.mark.skipif(
+        not _tvm_ffi_matches_cutlass(),
+        reason=(
+            "apache-tvm-ffi is too old for the installed nvidia-cutlass-dsl "
+            "(needs >=0.1.11); every kernel call fails before reaching kernel code"
+        ),
     ),
 ]
 
