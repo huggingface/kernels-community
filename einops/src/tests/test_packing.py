@@ -1,15 +1,22 @@
+__kernel_port_einops_root = None
+def __kernel_port_einops(module=""):
+    global __kernel_port_einops_root
+    if __kernel_port_einops_root is None:
+        __kernel_port_einops_root = __import__("kernels").get_kernel("kernels-community/einops", version=1)
+    root = __kernel_port_einops_root
+    if not module:
+        return root
+    return __import__("importlib").import_module(root.__name__ + "." + module)
+
 import dataclasses
 import typing
 
 import numpy as np
 import pytest
 
-import kernels
-einops = kernels.get_kernel("kernels-community/einops", version=1)
-EinopsError = einops.EinopsError
-asnumpy = einops.asnumpy
-pack = einops.pack
-unpack = einops.unpack
+pytestmark = pytest.mark.kernels_ci
+
+EinopsError, asnumpy, pack, unpack = getattr(__kernel_port_einops(), "EinopsError"), getattr(__kernel_port_einops(), "asnumpy"), getattr(__kernel_port_einops(), "pack"), getattr(__kernel_port_einops(), "unpack")
 from . import collect_test_backends
 
 
@@ -64,7 +71,6 @@ class CaptureException:
         return True
 
 
-@pytest.mark.kernels_ci
 def test_numpy_trivial(H=13, W=17):
     def rand(*shape):
         return np.random.random(shape)
@@ -148,7 +154,6 @@ cases = [
 ]
 
 
-@pytest.mark.kernels_ci
 def test_pack_unpack_with_numpy():
     case: UnpackTestCase
 
@@ -212,7 +217,6 @@ def test_pack_unpack_with_numpy():
         unpack_and_pack(x, [[2, -1], [1, 5]], pattern)
 
 
-@pytest.mark.kernels_ci
 def test_pack_unpack_against_numpy():
     for backend in collect_test_backends(symbolic=False, layers=False):
         print(f"test packing against numpy for {backend.framework_name}")
@@ -277,9 +281,8 @@ def test_pack_unpack_against_numpy():
                 unpack_and_pack(x, [[2, -1], [1, 5]], pattern)
 
 
-@pytest.mark.kernels_ci
 def test_pack_unpack_array_api():
-    AA = einops.array_api
+    AA = getattr(__kernel_port_einops(), "array_api")
     import numpy as xp
 
     if xp.__version__ < "2.0.0":

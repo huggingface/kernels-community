@@ -1,5 +1,5 @@
 {
-  description = "Flake for eigen kernel";
+  description = "Flake for einops kernel";
 
   inputs = {
     kernel-builder.url = "github:huggingface/kernels";
@@ -12,6 +12,6 @@
     }:
     kernel-builder.lib.genKernelFlakeOutputs {
       inherit self;
-      path = ./.;
+      path = ./src;
     };
 }

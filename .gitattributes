@@ -1,0 +1,8 @@
+# Ported kernels are generated: <kernel>/port/port.kdl plus <kernel>/port/overlay
+# are the inputs, and <kernel>/src is kernel-port's output, committed so that
+# what ships stays reviewable and auditable.
+#
+# Collapse the generated tree in diffs so review lands on the inputs. The output
+# is not taken on trust: .github/workflows/check-ports.yaml regenerates every
+# port and fails if <kernel>/src does not match byte for byte.
+*/src/** linguist-generated=true

@@ -1,16 +1,23 @@
+__kernel_port_einops_root = None
+def __kernel_port_einops(module=""):
+    global __kernel_port_einops_root
+    if __kernel_port_einops_root is None:
+        __kernel_port_einops_root = __import__("kernels").get_kernel("kernels-community/einops", version=1)
+    root = __kernel_port_einops_root
+    if not module:
+        return root
+    return __import__("importlib").import_module(root.__name__ + "." + module)
+
 import numpy
 import pytest
 
-import kernels
-einops = kernels.get_kernel("kernels-community/einops", version=1)
-rearrange = einops.rearrange
-parse_shape = einops.parse_shape
-reduce = einops.reduce
+pytestmark = pytest.mark.kernels_ci
+
+rearrange, parse_shape, reduce = getattr(__kernel_port_einops(), "rearrange"), getattr(__kernel_port_einops(), "parse_shape"), getattr(__kernel_port_einops(), "reduce")
 from . import is_backend_tested
 from .test_ops import imp_op_backends
 
 
-@pytest.mark.kernels_ci
 def test_rearrange_examples():
     def test1(x):
         # transpose
@@ -196,7 +203,6 @@ def tensor_train_example_numpy():
     assert numpy.allclose(y1, y3)
 
 
-@pytest.mark.kernels_ci
 def test_pytorch_yolo_fragment():
     if not is_backend_tested("torch"):
         pytest.skip()
