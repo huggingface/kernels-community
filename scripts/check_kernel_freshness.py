@@ -19,6 +19,7 @@ KERNEL_SOURCE_MAPPING = {
     "einops": "https://github.com/arogozhnikov/einops",
     "finegrained-fp8": "",
     "flash-attn-ops": "https://github.com/Dao-AILab/flash-attention",
+    "topk": "",
     "flash-attn2": "https://github.com/Dao-AILab/flash-attention",
     "flash-attn3": "https://github.com/Dao-AILab/flash-attention",
     "flash-attn4": "https://github.com/Dao-AILab/flash-attention",
