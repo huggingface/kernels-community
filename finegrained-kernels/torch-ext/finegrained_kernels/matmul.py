@@ -24,7 +24,7 @@ from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
 from .compat import FP8_DTYPE, is_sm10x, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
 from .recipes import normalize_global_scale, Epilogue, Quantization, e2m1_as_uint8, is_mx, mx_scale_family, resolve_input_recipe, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_recipe
-from .swizzle import swizzle_mx_scales
+from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant
 from .scales import apply_global_scale, mx_2d_scale_ptrs
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
@@ -1470,11 +1470,11 @@ def mx_dynamic_matmul(
             f"Bs shape {tuple(Bs.shape)} != ({rows}, {K // scale_group})"
         )
     else:
-        # the artifact's row-block count must match THIS weight — a wrong-layer artifact
-        # with a matching K would otherwise dequantize with garbage scales silently
-        assert Bs.shape[1] == triton.cdiv(rows, 128), (
-            f"swizzled Bs carries {Bs.shape[1]} 128-row blocks, expected "
-            f"{triton.cdiv(rows, 128)} for this ({rows}, K) weight — wrong artifact"
+        # the artifact's row blocks must match THIS weight (one matrix: leading dim 1) — a
+        # wrong-layer artifact with a matching K would otherwise dequantize with garbage scales silently
+        assert Bs.shape[:2] == (1, triton.cdiv(rows, 128)), (
+            f"swizzled Bs carries {tuple(Bs.shape[:2])} (matrices, 128-row blocks), expected "
+            f"{(1, triton.cdiv(rows, 128))} for this ({rows}, K) weight — wrong artifact"
         )
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)  # caller's layout (5D swizzled / 2D affine); the op never swizzles
@@ -1557,9 +1557,8 @@ def mx_dynamic_matmul(
     # One scale pointer per operand (as_u8/bs_u8) — the swizzled buffer on the fast path (also the
     # base for the BM<128 / BN<128 scalar gather), the affine scale otherwise — plus its descriptor,
     # built only on the swizzled path (dummy off the operand descriptor when un-swizzled, unread).
-    box5 = [1, 1, 1, 2, 256]
-    as_descriptor = TensorDescriptor.from_tensor(as_u8, box5) if act_swizzled else a_descriptor
-    bs_descriptor = TensorDescriptor.from_tensor(bs_u8, box5) if swizzled_scales else b_descriptor
+    as_descriptor = swizzled_scale_descriptor(as_u8) if act_swizzled else a_descriptor
+    bs_descriptor = swizzled_scale_descriptor(bs_u8) if swizzled_scales else b_descriptor
 
     def grid(META):
         return (

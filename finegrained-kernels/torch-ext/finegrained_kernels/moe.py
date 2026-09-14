@@ -34,13 +34,15 @@ NVFP4), and the fused forwards take an optional ``recipe`` naming the block's ac
 quantization."""
 
 import functools
+from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
 
 from .grouped import matmul_grouped
 from .batched import GATE_UNSTACK_MAX_S, matmul_batched
 from .compat import MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, weighted_reduce
-from .recipes import Epilogue, Quantization, is_mx, is_mxfp4, weight_recipe
+from .recipes import Epilogue, get_supported_act_fns, Quantization, is_mx, is_mxfp4, weight_recipe
 from .quant import _launch_act_quant
 from .scheduling import compute_grouped_scheduling
 from .epilogue import fused_glu
@@ -97,6 +99,34 @@ def _torch_weighted_reduce(down_out, top_k_index, top_k_weights, num_experts):
     return contrib.view(num_tokens, num_top_k, down_out.size(1)).sum(dim=1)
 
 
+def _host_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit, gate):
+    """The activation on the host, for the arms the epilogue does not fuse: a callable takes the
+    raw GEMM output (interleaved gate|up columns when ``gate``) and returns the intermediate —
+    the caller owns its semantics, so any activation runs without a kernel change; a name from
+    ``get_supported_act_fns()`` runs the torch GLU (``gate``) or the bare activation."""
+    if callable(act_fn):
+        return act_fn(gate_up_out)
+    if act_fn not in get_supported_act_fns():
+        raise ValueError(f"act_fn must be one of {get_supported_act_fns()} or a callable, got {act_fn!r}")
+    if gate:
+        return fused_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit)
+    return {"silu": F.silu, "gelu": F.gelu, "relu": F.relu}[act_fn](gate_up_out)
+
+
+def _fused_epilogue(act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, gate):
+    """The gate_up epilogue when the activation is a fusable name; ``None`` sends a callable
+    (or an unfusable name — rejected in ``_host_glu``) to the host."""
+    if not isinstance(act_fn, str) or act_fn not in get_supported_act_fns():
+        return None
+    return Epilogue(
+        gate=gate,
+        act_fn=act_fn,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
+        simulate_unfused=simulate_unfused,
+    )
+
+
 # ── Fused (gate_up epilogue owns SwiGLU + intermediate requant) ──────────────
 
 
@@ -134,11 +164,12 @@ def moe_fused_grouped(
     down_input_global_scale: torch.Tensor | None = None,
     gate_up_proj_bias: torch.Tensor | None = None,  # (E, 2I) pre-activation bias
     down_proj_bias: torch.Tensor | None = None,  # (E, H)
-    act_fn: str = "silu",
+    act_fn: str | Callable = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     recipe: str | None = "weights",
+    gate: bool = True,
 ) -> torch.Tensor:
     """Fused grouped MoE (prefill): gather gate_up + SiLU + requant epilogue → quantized
     expert-ordered intermediate → grouped down → routing-weighted top-k reduce. Returns
@@ -151,11 +182,16 @@ def moe_fused_grouped(
     the gate_up quantizes hidden against its input global, requants the intermediate against
     the down's, and the down consumes it as its activation global — ``None`` (dynamic quant)
     everywhere else. ``simulate_unfused`` (testing) rounds each step through
-    the activation dtype so the output matches the unfused reference to reduce order."""
+    the activation dtype so the output matches the unfused reference to reduce order. ``act_fn`` is a
+    ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
+    callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
+    projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
+    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine."""
     recipe = _block_recipe(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, recipe
     )
     num_top_k = top_k_index.size(-1)
+    epilogue = _fused_epilogue(act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, gate)
     NUM_EXPERTS = gate_up_proj.size(0)
     expert_start, gather_idx, scatter_idx = compute_grouped_scheduling(
         top_k_index, NUM_EXPERTS, num_top_k
@@ -175,23 +211,19 @@ def moe_fused_grouped(
         # which the down then consumes as its activation global — the two-level handoff
         output_global_scale=down_input_global_scale,
         expert_start=expert_start,
-        epilogue=Epilogue(
-            gate=True,
-            act_fn=act_fn,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_limit=swiglu_limit,
-            simulate_unfused=simulate_unfused,
-        ),
+        epilogue=epilogue,
         bias=gate_up_proj_bias,
         # recipe is the resolved format; None (weight-only) leaves the GLU intermediate
         # bf16, no requant.
-        quantization=Quantization(input_recipe=recipe, output_recipe=recipe),
+        quantization=Quantization(input_recipe=recipe, output_recipe=recipe if epilogue else None),
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
     inter, inter_scale = (
         gate_up_out if isinstance(gate_up_out, tuple) else (gate_up_out, None)
     )
+    if epilogue is None:
+        inter = _host_glu(inter, act_fn, swiglu_alpha, swiglu_limit, gate)
     # Phase 2: grouped down over the expert-ordered pre-quantized intermediate (its dtypes
     # carry the recipe; gather_idx=None), scattering to routed rows (scatter_idx).
     down_out = matmul_grouped(
@@ -204,7 +236,7 @@ def moe_fused_grouped(
         expert_start=expert_start,
         bias=down_proj_bias,
         # weight-only: the intermediate is bf16 (As None) — the down goes weight-only too.
-        quantization=Quantization(input_recipe=recipe) if recipe is None else None,
+        quantization=Quantization(input_recipe=recipe) if inter_scale is None else None,
         output_dtype=hidden_states.dtype,
         scatter_idx=scatter_idx,
     )
@@ -232,11 +264,12 @@ def moe_fused_batched(
     down_input_global_scale: torch.Tensor | None = None,
     gate_up_proj_bias: torch.Tensor | None = None,  # (E, 2I) pre-activation bias
     down_proj_bias: torch.Tensor | None = None,  # (E, H)
-    act_fn: str = "silu",
+    act_fn: str | Callable = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     recipe: str | None = "weights",
+    gate: bool = True,
 ) -> torch.Tensor:
     """Fused batched MoE (decode): gate_up + SiLU + requant epilogue → per-row quantized
     intermediate → batched down → routing-weighted top-k reduce. Returns
@@ -251,10 +284,15 @@ def moe_fused_batched(
     the down's, and the down consumes it as its activation global — ``None`` (dynamic quant)
     everywhere else. ``simulate_unfused`` (testing) rounds each
     step through the activation dtype so the output matches the unfused reference to
-    reduce order."""
+    reduce order. ``act_fn`` is a
+    ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
+    callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
+    projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
+    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine."""
     recipe = _block_recipe(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, recipe
     )
+    epilogue = _fused_epilogue(act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, gate)
     NUM_EXPERTS = gate_up_proj.size(0)
     expert_ids = top_k_index.reshape(-1)
     gather_idx = _gather_idx(top_k_index)
@@ -272,13 +310,7 @@ def moe_fused_batched(
         # the two-level handoff, as in the grouped sibling
         output_global_scale=down_input_global_scale,
         expert_ids=expert_ids,
-        epilogue=Epilogue(
-            gate=True,
-            act_fn=act_fn,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_limit=swiglu_limit,
-            simulate_unfused=simulate_unfused,
-        ),
+        epilogue=epilogue,
         bias=gate_up_proj_bias,
         # Decode (batched): recipe None (weight-only) leaves the intermediate bf16, no requant.
         # Block-FP8: INSIDE the unstacked decode band the requant fuses into the GLU kernel
@@ -290,7 +322,7 @@ def moe_fused_batched(
             input_recipe=recipe,
             output_recipe=(
                 recipe
-                if recipe != "fp8" or expert_ids.numel() <= GATE_UNSTACK_MAX_S
+                if epilogue and (recipe != "fp8" or expert_ids.numel() <= GATE_UNSTACK_MAX_S)
                 else None
             ),
         ),
@@ -300,6 +332,8 @@ def moe_fused_batched(
     inter, inter_scale = (
         gate_up_out if isinstance(gate_up_out, tuple) else (gate_up_out, None)
     )
+    if epilogue is None:
+        inter = _host_glu(inter, act_fn, swiglu_alpha, swiglu_limit, gate)
     # Phase 2: batched down over the intermediate (its dtypes carry the recipe; already
     # routed-order, no gather).
     down_out = matmul_batched(
@@ -314,7 +348,7 @@ def moe_fused_batched(
         # weight-only / block-FP8: the intermediate is bf16 (As is None), so the down carries the recipe
         # and quantizes it, mirroring the unfused sibling.
         quantization=(
-            Quantization(input_recipe=recipe) if recipe in (None, "fp8") else None
+            Quantization(input_recipe=recipe) if inter_scale is None or recipe == "fp8" else None
         ),
         output_dtype=hidden_states.dtype,
     )
@@ -344,10 +378,11 @@ def moe_unfused_grouped(
     down_input_global_scale: torch.Tensor | None = None,
     gate_up_proj_bias: torch.Tensor | None = None,  # (E, 2I) pre-activation bias
     down_proj_bias: torch.Tensor | None = None,  # (E, H)
-    act_fn: str = "silu",
+    act_fn: str | Callable = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     recipe: str | None = "weights",
+    gate: bool = True,
 ) -> torch.Tensor:
     """Unfused grouped MoE: gate_up (plain grouped GEMM, gather hidden) → host ``apply_glu`` →
     down (plain grouped GEMM, scatter to routed rows) → routing-weighted reduce. Same math as
@@ -355,7 +390,11 @@ def moe_unfused_grouped(
     rather than inside the gate_up epilogue; each GEMM quantizes its raw input in ``recipe``
     (``"weights"`` follows the weight recipe, mirroring the fused forward — mxfp4 weights run the
     all-fp4 W4A4 chain). All recipes route through the shared ``matmul_grouped``. The NVFP4 activation globals thread the same way as the fused sibling:
-    each GEMM quantizes its raw input against its ``*_input_global_scale``."""
+    each GEMM quantizes its raw input against its ``*_input_global_scale``. ``act_fn`` is a
+    ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
+    callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
+    projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
+    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine."""
     recipe = _block_recipe(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, recipe
     )
@@ -379,7 +418,7 @@ def moe_unfused_grouped(
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
-    inter = fused_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit)
+    inter = _host_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit, gate)
     # down over the expert-ordered intermediate (quantized in the same recipe), scattering
     # to routed rows.
     down_out = matmul_grouped(
@@ -571,17 +610,22 @@ def moe_unfused_batched(
     down_input_global_scale: torch.Tensor | None = None,
     gate_up_proj_bias: torch.Tensor | None = None,  # (E, 2I) pre-activation bias
     down_proj_bias: torch.Tensor | None = None,  # (E, H)
-    act_fn: str = "silu",
+    act_fn: str | Callable = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     recipe: str | None = "weights",
+    gate: bool = True,
 ) -> torch.Tensor:
     """Unfused batched MoE: gate_up (plain batched GEMM, gather hidden) → host ``apply_glu`` →
     down (plain batched GEMM) → routing-weighted reduce. Same math as ``moe_fused_batched`` but
     the SwiGLU + intermediate quant happen between two plain GEMMs; each GEMM quantizes its raw
     input in ``recipe`` (``"weights"`` follows the weight recipe, ``None`` is weight-only). All
     recipes route through the shared ``matmul_batched``. The NVFP4 activation globals thread the same way as the fused sibling:
-    each GEMM quantizes its raw input against its ``*_input_global_scale``."""
+    each GEMM quantizes its raw input against its ``*_input_global_scale``. ``act_fn`` is a
+    ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
+    callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
+    projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
+    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine."""
     recipe = _block_recipe(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, recipe
     )
@@ -602,7 +646,7 @@ def moe_unfused_batched(
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
-    inter = fused_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit)
+    inter = _host_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit, gate)
     # down over the intermediate (quantized in the same recipe), routed-order output.
     down_out = matmul_batched(
         inter,

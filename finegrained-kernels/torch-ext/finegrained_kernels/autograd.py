@@ -509,9 +509,12 @@ def dgrad_matmul_grouped_kernel(
         for n in tl.range(0, tl.cdiv(N, BLOCK_SIZE_N), warp_specialize=WARP_SPEC):
             n_off = n * BLOCK_SIZE_N
             # the forward gathered A at in_row and scattered C to out_row, so its gradient READS
-            # at out_row — ScatterIdx is this pass's gather map
+            # at out_row — ScatterIdx is this pass's gather map. The box anchor must be out_row's
+            # tile start too: the resolver's `m_start` is min(in_row) — the FORWARD's read side —
+            # and with a gather-only launch (ScatterIdx None, in_row = the accumulation targets)
+            # it anchors the box at a TOKEN id, reading the wrong dY rows.
             dy = load_grouped_act_tile(
-                dy_ptrs, ADescriptor, m_start, n_off, row_mask, out_row,
+                dy_ptrs, ADescriptor, tl.min(out_row).to(tl.int32), n_off, row_mask, out_row,
                 A_MEMORY_MODE, ScatterIdx is not None,
             )
             w = _dgrad_load_weight(
