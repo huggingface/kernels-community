@@ -20,19 +20,19 @@ class TritonAscendUtilsBackend(BaseBackend):
 
     @classmethod
     def is_available(cls) -> bool:
-        from ...utils import IS_NPU
+        from .....utils import IS_NPU
         return IS_NPU
 
     def chunk_global_cumsum_verifier(self, *args, **kwargs):
         return True, None
 
     def chunk_global_cumsum(self, *args, **kwargs):
-        from ...ops.utils.backends.triton_ascend.cumsum import chunk_global_cumsum_npu
+        from .cumsum import chunk_global_cumsum_npu
         return chunk_global_cumsum_npu(*args, **kwargs)
 
     def chunk_local_cumsum_verifier(self, *args, **kwargs):
         return True, None
 
     def chunk_local_cumsum(self, *args, **kwargs):
-        from ...ops.utils.backends.triton_ascend.cumsum import chunk_local_cumsum_npu
+        from .cumsum import chunk_local_cumsum_npu
         return chunk_local_cumsum_npu(*args, **kwargs)

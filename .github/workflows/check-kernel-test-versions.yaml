@@ -1,0 +1,33 @@
+name: Check kernel test versions
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/build.toml"
+      - "**/tests/**"
+      - ".github/scripts/check_kernel_test_versions.py"
+      - ".github/workflows/check-kernel-test-versions.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-kernel-test-versions-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check versions used by tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Check kernel versions used by tests
+        run: python .github/scripts/check_kernel_test_versions.py

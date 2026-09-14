@@ -1,0 +1,39 @@
+# One backend per `[kernel.*]` section, all implementing the entry points declared in
+# torch-ext/torch_binding.h. Adding CUDA means adding a section and a `ggml_norm_cuda/` directory —
+# no change to the bindings' schema or to the Python API.
+#
+# `vendor/` is a pinned subset of llama.cpp (revision in vendor/UPSTREAM); refresh it with
+# `python vendor.py --rev <sha>`.
+
+[general]
+name = "ggml-norm"
+version = 1
+license = "MIT"
+backends = ["metal"]
+
+[general.hub]
+repo-id = "kernels-community/ggml-norm"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.ggml_norm_metal]
+backend = "metal"
+depends = ["torch"]
+# norm.metal includes "ggml-common.h" from vendor/src, so the shader compile needs it on its include
+# path; `torch-ext` is here because the backend source includes torch_binding.h.
+include = ["ggml_norm_metal", "torch-ext", "vendor/src", "vendor/src/ggml-metal", "vendor/src/ggml-metal/kernels"]
+src = [
+    "ggml_norm_metal/ggml_norm_metal.cpp",
+    "ggml_norm_metal/ggml_dispatch.mm",
+    "ggml_norm_metal/common.h",
+    # Upstream's Metal kernels, compiled as they ship: one file per operation, so a package
+    # lists the ones it dispatches.
+    "vendor/src/ggml-metal/kernels/norm.metal",
+    "vendor/src/ggml-metal/kernels/common.h",
+    "vendor/src/ggml-metal/ggml-metal-impl.h",
+    "vendor/src/ggml-common.h",
+]

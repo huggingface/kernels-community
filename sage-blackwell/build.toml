@@ -1,0 +1,82 @@
+[general]
+name = "sage-blackwell"
+version = 1
+edition = 5
+license = "Apache-2.0"
+backends = ["cuda"]
+upstream = "https://github.com/thu-ml/SageAttention.git"
+
+[general.cuda]
+# SageAttention3 requires CUDA >= 12.8: the FP4 attention kernel targets
+# sm_120a (consumer Blackwell) and uses the SM120 blockscaled NVFP4 MMA,
+# which older toolkits cannot compile.
+minver = "12.8"
+
+[general.hub]
+repo-id = "kernels-community/sage-blackwell"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel._fp4attn]
+backend = "cuda"
+cuda-capabilities = ["12.0a"]
+cuda-flags = [
+    "-O3",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--use_fast_math",
+    "--threads=1",
+    # Important, otherwise performance is severely impacted (upstream note).
+    "-DNDEBUG",
+]
+depends = ["torch", "cutlass_4_5"]
+include = ["."]
+src = [
+    "sage_blackwell/blackwell/api.cu",
+    "sage_blackwell/blackwell/block_info.h",
+    "sage_blackwell/blackwell/blockscaled_layout.h",
+    "sage_blackwell/blackwell/cute_extension.h",
+    "sage_blackwell/blackwell/epilogue_tma_ws.h",
+    "sage_blackwell/blackwell/kernel_traits.h",
+    "sage_blackwell/blackwell/kernel_ws.h",
+    "sage_blackwell/blackwell/launch.h",
+    "sage_blackwell/blackwell/mainloop_tma_ws.h",
+    "sage_blackwell/blackwell/named_barrier.h",
+    "sage_blackwell/blackwell/params.h",
+    "sage_blackwell/blackwell/softmax_fused.h",
+    "sage_blackwell/blackwell/static_switch.h",
+    "sage_blackwell/blackwell/tile_scheduler.h",
+    "sage_blackwell/blackwell/utils.h",
+]
+
+[kernel._fp4quant]
+backend = "cuda"
+cuda-capabilities = ["12.0a"]
+cuda-flags = [
+    "-O3",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--use_fast_math",
+    "--threads=1",
+    "-DNDEBUG",
+]
+depends = ["torch"]
+include = ["."]
+src = [
+    "sage_blackwell/quantization/fp4_quantization_4d.cu",
+    "sage_blackwell/quantization/cuda_utils.h",
+]

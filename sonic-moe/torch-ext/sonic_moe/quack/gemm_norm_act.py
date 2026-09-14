@@ -18,13 +18,14 @@ from .cute_dsl_utils import (
     get_device_capacity,
     get_max_active_clusters,
 )
+from .gemm_sm80 import GemmSm80
 from .gemm_sm90 import GemmSm90
 from .gemm_sm100 import GemmSm100
 from .gemm_sm120 import GemmSm120
-from .gemm_act import GemmActMixin, GemmGatedMixin
+from .gemm_act import GemmActMixin, GemmGatedMixin, GemmGatedSm120Mixin
 from .epi_ops import vec_multiply
 from .activation import act_fn_map, gate_fn_map
-from .cache_utils import jit_cache
+from .cache import jit_cache
 from .rounding import RoundingMode
 from .gemm_tvm_ffi_utils import (
     get_major,
@@ -54,9 +55,9 @@ class GemmNormActMixin(GemmActMixin):
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
-        tDrRowVec = epi_loop_tensors["mRowVecBroadcast"]
-        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
+    ) -> Tuple[cute.Tensor, ...]:
+        tDrRowVec = epi_loop_tensors.get("mRowVecBroadcast")
+        tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
         # Load accumulator and apply alpha/beta/C
         rD = tRS_rD.load()
         if const_expr(hasattr(params, "alpha") and params.alpha is not None):
@@ -73,21 +74,25 @@ class GemmNormActMixin(GemmActMixin):
         vec_multiply(self, tRS_rD, tDrColVec, tDrRowVec)
         # Apply activation
         if const_expr(params.act_fn is not None):
-            tRS_rPostAct = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
-            if const_expr(self.arch < 100):
-                for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
-                    tRS_rPostAct[i] = params.act_fn(tRS_rD[i])
+            tRS_rAuxOut = cute.make_rmem_tensor(tRS_rD.layout.shape, self.acc_dtype)
+            if const_expr(self.arch != 100):
+                for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
+                    tRS_rAuxOut[i] = params.act_fn(tRS_rD[i])
             else:
-                for i in cutlass.range(cute.size(tRS_rPostAct) // 2, unroll_full=True):
-                    tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(
+                for i in cutlass.range(cute.size(tRS_rAuxOut) // 2, unroll_full=True):
+                    tRS_rAuxOut[2 * i], tRS_rAuxOut[2 * i + 1] = params.act_fn(
                         (tRS_rD[2 * i], tRS_rD[2 * i + 1])
                     )
         else:
-            tRS_rPostAct = tRS_rD
-        return tRS_rPostAct
+            tRS_rAuxOut = tRS_rD
+        return (tRS_rAuxOut,)
 
 
 class GemmNormActSm90(GemmNormActMixin, GemmSm90):
+    pass
+
+
+class GemmNormActSm80(GemmNormActMixin, GemmSm80):
     pass
 
 
@@ -109,9 +114,9 @@ class GemmNormGatedMixin(GemmGatedMixin):
         epi_loop_tensors: Tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
-        tDrRowVec = epi_loop_tensors["mRowVecBroadcast"]
-        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
+    ) -> Tuple[cute.Tensor, ...]:
+        tDrRowVec = epi_loop_tensors.get("mRowVecBroadcast")
+        tDrColVec = epi_loop_tensors.get("mColVecBroadcast")
         # Load accumulator and apply alpha/beta/C
         rD = tRS_rD.load()
         if const_expr(hasattr(params, "alpha") and params.alpha is not None):
@@ -127,21 +132,22 @@ class GemmNormGatedMixin(GemmGatedMixin):
         # Multiply by colvec (rstd) and rowvec (norm_weight)
         vec_multiply(self, tRS_rD, tDrColVec, tDrRowVec)
         # Gated activation on normalized D
-        tRS_rPostAct_layout = cute.recast_layout(2, 1, tRS_rD.layout)
-        tRS_rPostAct = cute.make_rmem_tensor(tRS_rPostAct_layout.shape, self.acc_dtype)
-        if const_expr(self.arch < 100):
-            for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
-                tRS_rPostAct[i] = params.act_fn(tRS_rD[2 * i], tRS_rD[2 * i + 1])
-        else:
-            for i in cutlass.range(cute.size(tRS_rPostAct) // 2, unroll_full=True):
-                tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(
-                    (tRS_rD[4 * i], tRS_rD[4 * i + 2]),
-                    (tRS_rD[4 * i + 1], tRS_rD[4 * i + 3]),
-                )
-        return tRS_rPostAct
+        tRS_rAuxOut_layout = cute.recast_layout(2, 1, tRS_rD.layout)
+        tRS_rAuxOut = cute.make_rmem_tensor(tRS_rAuxOut_layout.shape, self.acc_dtype)
+        tRS_rD_pair = cute.flat_divide(tRS_rD, cute.make_layout(2))
+        tRS_rGate = tRS_rD_pair[0, ...]
+        tRS_rUp = tRS_rD_pair[1, ...]
+        vectorize = const_expr(self.arch == 100)
+        for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True, vectorize=vectorize):
+            tRS_rAuxOut[i] = params.act_fn(tRS_rGate[i], tRS_rUp[i])
+        return (tRS_rAuxOut,)
 
 
 class GemmNormGatedSm90(GemmNormGatedMixin, GemmSm90):
+    pass
+
+
+class GemmNormGatedSm80(GemmNormGatedMixin, GemmSm80):
     pass
 
 
@@ -149,7 +155,7 @@ class GemmNormGatedSm100(GemmNormGatedMixin, GemmSm100):
     pass
 
 
-class GemmNormGatedSm120(GemmNormGatedMixin, GemmSm120):
+class GemmNormGatedSm120(GemmGatedSm120Mixin, GemmNormGatedMixin, GemmSm120):
     pass
 
 
@@ -183,12 +189,14 @@ def _compile_gemm_norm_act(
 ):
     sm_to_cls = {
         "norm_act": {
+            8: GemmNormActSm80,
             9: GemmNormActSm90,
             10: GemmNormActSm100,
             11: GemmNormActSm100,
             12: GemmNormActSm120,
         },
         "norm_gated": {
+            8: GemmNormGatedSm80,
             9: GemmNormGatedSm90,
             10: GemmNormGatedSm100,
             11: GemmNormGatedSm100,
@@ -213,7 +221,7 @@ def _compile_gemm_norm_act(
     pa_n = cute.sym_int() if gemm_cls_name == "norm_gated" else n
     pa_leading_dim = 1 if gemm_cls_name == "norm_gated" else pa_leading
     pa_shape = (m, pa_n) if varlen_m else (m, pa_n, l)
-    mPostAct = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading_dim, divisibility=div_pa)
+    mAuxOut = fake_tensor(postact_dtype, pa_shape, leading_dim=pa_leading_dim, divisibility=div_pa)
 
     mRowVec = fake_tensor(rowvec_dtype, (l, n), leading_dim=1, divisibility=4)
     if colvec_ndim == 2:
@@ -234,7 +242,7 @@ def _compile_gemm_norm_act(
             return make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=4)
 
     epi_args = GemmCls.EpilogueArguments(
-        mPostAct,
+        mAuxOut,
         act_fn,
         mRowVecBroadcast=mRowVec,
         mColVecBroadcast=mColVec,
@@ -277,6 +285,7 @@ def gemm_norm_act_fn(
     tile_N: int,
     cluster_M: int,
     cluster_N: int,
+    tile_K: int | None = None,
     pingpong: bool = False,
     persistent: bool = True,
     is_dynamic_persistent: bool = False,
@@ -326,7 +335,9 @@ def gemm_norm_act_fn(
     colvec_ndim = colvec.ndim if colvec is not None else 0
 
     device_capacity = get_device_capacity(A.device)
-    assert device_capacity[0] in [9, 10, 11, 12], "Only SM90, SM100, SM110, and SM120 are supported"
+    assert device_capacity[0] in [8, 9, 10, 11, 12], (
+        "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
+    )
     if rounding_mode == RoundingMode.RS:
         assert device_capacity[0] == 10, "Stochastic rounding requires SM100"
 
@@ -349,7 +360,7 @@ def gemm_norm_act_fn(
         d_major,
         c_major,
         postact_major,
-        (tile_M, tile_N),
+        (tile_M, tile_N, tile_K) if tile_K is not None else (tile_M, tile_N),
         (cluster_M, cluster_N, 1),
         pingpong,
         persistent,
@@ -365,11 +376,6 @@ def gemm_norm_act_fn(
         rounding_mode=rounding_mode,
         sr_seed_mode=sr_seed_mode,
     )
-
-    from .cache_utils import COMPILE_ONLY
-
-    if COMPILE_ONLY:
-        return
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
 
@@ -395,6 +401,6 @@ def gemm_norm_act_fn(
     varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
 
     if device_capacity[0] in [10, 11]:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, None)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
     else:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None)
+        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)

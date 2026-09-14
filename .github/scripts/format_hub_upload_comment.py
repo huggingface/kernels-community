@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # Input:
-#   [--base <comment-body>] <kernel> <repo-prefix> <upload-json-or-path>...
+#   [--base <comment-body>] <kernel> <repo-prefix>
+#   <upload-json-or-path-or-directory>...
 #
 # Output:
 #   A Hub upload section, or <comment-body> with that section updated.
 #
 # Example:
-#   python3 .github/scripts/format_hub_upload_comment.py msa kernels-community "$RUNNER_TEMP"/upload*.json
-#   python3 .github/scripts/format_hub_upload_comment.py --base "$BODY" msa kernels-community "$RUNNER_TEMP"/upload*.json
+#   python3 .github/scripts/format_hub_upload_comment.py msa kernels-community "$RUNNER_TEMP"
+#   python3 .github/scripts/format_hub_upload_comment.py --base "$BODY" msa kernels-community "$RUNNER_TEMP"
 #   python3 .github/scripts/format_hub_upload_comment.py msa kernels-community '{"pull_requests":[{"url":"https://hf.co/kernels/MiniMaxAI/msa/discussions/1"}]}'
 import argparse
 import json
@@ -27,6 +28,23 @@ def load_json(value):
     return json.loads(value)
 
 
+def expand_uploads(values):
+    for value in values:
+        if value.lstrip().startswith(("{", "[")):
+            yield value
+            continue
+
+        path = Path(value)
+        if path.is_dir():
+            yield from (
+                str(upload)
+                for upload in sorted(path.rglob("*.json"))
+                if upload.is_file()
+            )
+        else:
+            yield value
+
+
 def dedupe(lines):
     return list(dict.fromkeys(lines))
 
@@ -34,7 +52,7 @@ def dedupe(lines):
 def upload_lines(kernel, repo_prefix, uploads):
     urls = [
         pr["url"]
-        for upload in uploads
+        for upload in expand_uploads(uploads)
         for pr in load_json(upload).get("pull_requests", [])
     ]
     lines = [

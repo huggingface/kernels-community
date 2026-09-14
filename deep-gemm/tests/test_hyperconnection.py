@@ -1,13 +1,17 @@
 import torch
 import random
 
-import deep_gemm
-from deep_gemm.testing import (
-    test_filter,
-    bench_kineto,
-    calc_diff, count_bytes
-)
-from deep_gemm.utils import align
+import kernels
+
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+
+test_filter = deep_gemm.testing.test_filter
+bench_kineto = deep_gemm.testing.bench_kineto
+calc_diff = deep_gemm.testing.calc_diff
+count_bytes = deep_gemm.testing.count_bytes
+
+align = deep_gemm.utils.align
+
 from generators import get_arch_major
 
 

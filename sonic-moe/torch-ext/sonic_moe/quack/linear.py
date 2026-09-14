@@ -48,7 +48,7 @@ def linear_bwd_compute_input_grad(ctx, dout, weight, matmul_fn):
 def linear_bwd_compute_weight_grad(ctx, dout, x, weight_og, matmul_fn, matmul_inplace_fn):
     if ctx.needs_input_grad[1]:
         assert x is not None
-        x = x.reshape(-1, x.shape[-1])
+        x = x.flatten(0, -2)
         # fuse_grad_accum is not compatible with torch.compile
         if not ctx.fuse_grad_accum or weight_og.grad is None or torch.compiler.is_compiling():
             dweight = matmul_fn(dout.T, x, out_dtype=ctx.weight_dtype)
@@ -88,6 +88,7 @@ class _LinearUntunedOps(_LinearOps):
     matmul_fwd_fn = partial(gemm, tuned=False)
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
 
 
 class _LinearActOps(_LinearOps):
@@ -167,7 +168,7 @@ class LinearFunc(torch.autograd.Function):
             ctx.ops = ops
             weight_og = weight
             batch_shape = x.shape[:-1]
-            x = x.reshape(-1, x.shape[-1])
+            x = x.flatten(0, -2)
             out = ops.matmul_fwd_fn(x, weight.T, bias=bias)
             linear_fwd_postprocess(
                 ctx, x, weight, weight_og, needs_x_w_grad=ctx.needs_input_grad[:2]
@@ -185,7 +186,7 @@ class LinearFunc(torch.autograd.Function):
             ops = ctx.ops
             x, weight, weight_og = ctx.saved_tensors  # weight_og is None if not ctx.fuse_grad_accum
             batch_shape = dout.shape[:-1]
-            dout = _ensure_contiguous(dout.reshape(-1, dout.shape[-1]))
+            dout = _ensure_contiguous(dout.flatten(0, -2))
             dbias = dout.sum(0, dtype=ctx.bias_dtype) if ctx.compute_dbias else None
             dx = linear_bwd_compute_input_grad(ctx, dout, weight, ops.matmul_bwd_dx)
             dx = dx.reshape(*batch_shape, dx.shape[-1]) if dx is not None else None
@@ -217,7 +218,7 @@ class LinearActFunc(torch.autograd.Function):
             ctx.ops = ops
             weight_og = weight
             batch_shape = x.shape[:-1]
-            x = x.reshape(-1, x.shape[-1])
+            x = x.flatten(0, -2)
             out, postact = ops.matmul_fwd_fn(
                 x, weight.T, bias=bias, activation=activation, store_preact=store_preact
             )
@@ -238,7 +239,7 @@ class LinearActFunc(torch.autograd.Function):
             ops = ctx.ops
             x, weight, weight_og = ctx.saved_tensors
             batch_shape = dout.shape[:-1]
-            dout = _ensure_contiguous(dout.reshape(-1, dout.shape[-1]))
+            dout = _ensure_contiguous(dout.flatten(0, -2))
             dbias = dout.sum(0, dtype=ctx.bias_dtype) if ctx.compute_dbias else None
             dx = linear_bwd_compute_input_grad(ctx, dout, weight, ops.matmul_bwd_dx)
             dx = dx.reshape(*batch_shape, dx.shape[-1]) if dx is not None else None
@@ -289,7 +290,7 @@ class DActLinearFunc(torch.autograd.Function):
             ctx.ops = ops
             weight_og = weight
             batch_shape = x.shape[:-1]
-            x = x.reshape(-1, x.shape[-1])
+            x = x.flatten(0, -2)
             out = ops.matmul_fwd_fn(x, weight.T, bias=bias)
             # Store preact instead of x, we will recompute x (postact) in backward.
             # dpreact needs gemm_dact(dout, weight, preact) → needs both weight and preact.
@@ -315,16 +316,16 @@ class DActLinearFunc(torch.autograd.Function):
             # weight_og is None if not ctx.fuse_grad_accum
             preact, weight, weight_og = ctx.saved_tensors
             batch_shape = dout.shape[:-1]
-            dout = _ensure_contiguous(dout.reshape(-1, dout.shape[-1]))
+            dout = _ensure_contiguous(dout.flatten(0, -2))
             dbias = dout.sum(0, dtype=ctx.bias_dtype) if ctx.compute_dbias else None
             if ctx.needs_input_grad[0]:
                 # Need dpreact: gemm_dact(dout, weight, preact) → (dpreact, postact)
-                preact = preact.reshape(-1, preact.shape[-1])
+                preact = preact.flatten(0, -2)
                 assert weight is not None
                 dpreact, x = ops.matmul_bwd_dx(dout, weight, preact, activation=ctx.activation)
             elif ctx.needs_input_grad[1]:
                 # Only need dweight: recompute postact from preact cheaply (no GEMM needed)
-                preact = preact.reshape(-1, preact.shape[-1])
+                preact = preact.flatten(0, -2)
                 x = ops.recompute_postact(preact, ctx.activation)
                 dpreact = None
             else:

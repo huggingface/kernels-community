@@ -5,7 +5,7 @@ on:
     types: [created]
 
 permissions:
-  contents: read
+  contents: write
   actions: write
   issues: write
   pull-requests: write
@@ -15,7 +15,7 @@ jobs:
     if: ${{ github.event.issue.pull_request }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 1
@@ -25,6 +25,11 @@ jobs:
       - name: Handle /kernel-bot command
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Read-only org token, used *solely* to look up team membership so
+          # `/kernel-bot build` also works for the huggingface/transformers team.
+          # GITHUB_TOKEN is repo-scoped and cannot read team rosters. If this
+          # secret is unset the bot falls back to repo-permission checks alone.
+          TEAM_READ_TOKEN: ${{ secrets.TEAM_READ_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENT_ID: ${{ github.event.comment.id }}
@@ -52,6 +57,6 @@ jobs:
           fi
           if [[ "$COMMENT_AUTHOR_ASSOCIATION" != "MEMBER" && "$COMMENT_AUTHOR_ASSOCIATION" != "OWNER" && "$COMMENT_AUTHOR_ASSOCIATION" != "COLLABORATOR" ]]; then
             echo "Unauthorized: Only members, owners, and collaborators can use /kernel-bot."
-            exit 0
+            exit 1
           fi
           python3 .github/scripts/pr_comment_kernel_bot.py

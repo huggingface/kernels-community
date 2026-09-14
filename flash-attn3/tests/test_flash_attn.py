@@ -2,6 +2,7 @@ import itertools
 import math
 import os
 
+import kernels
 import pytest
 import torch
 import torch.nn.functional as F
@@ -13,27 +14,25 @@ from torch.testing._internal.optests.generate_tests import (
     safe_schema_check,
 )
 
-apply_rotary_emb = None
-
-# import kernels
-# flash_attn3 = kernels.get_kernel("kernels-community/flash-attn3")
-# ops = flash_attn3._ops.ops
-# add_op_namespace_prefix = flash_attn3._ops.add_op_namespace_prefix
-from flash_attn3 import (
-    flash_attn_combine,
-    flash_attn_func,
-    flash_attn_varlen_func,
-    flash_attn_with_kvcache,
-    get_scheduler_metadata,
-)
-from flash_attn3._ops import add_op_namespace_prefix, ops
-
 from .padding import pad_input, unpad_input
 from .test_util import (
     attention_ref,
     generate_qkv,
     generate_random_padding_mask,
 )
+
+apply_rotary_emb = None
+
+flash_attn3 = kernels.get_kernel("kernels-community/flash-attn3", version=2)
+
+add_op_namespace_prefix = flash_attn3.add_op_namespace_prefix
+ops = flash_attn3.ops
+
+flash_attn_combine = flash_attn3.flash_attn_combine
+flash_attn_func = flash_attn3.flash_attn_func
+flash_attn_varlen_func = flash_attn3.flash_attn_varlen_func
+flash_attn_with_kvcache = flash_attn3.flash_attn_with_kvcache
+get_scheduler_metadata = flash_attn3.get_scheduler_metadata
 
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
@@ -1576,6 +1575,7 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     # pytorch_profiler(torch.sum, out_partial)
 
 
+@pytest.mark.kernels_ci
 def test_flash3_bw_compatibility() -> None:
     # Let's try to always stay backward compatible! This will make life easier
     # for downstream libaries, users, and exported models.

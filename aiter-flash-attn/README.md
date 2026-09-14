@@ -61,10 +61,29 @@ out = flash_attn.flash_attn_func(q, k, v, causal=True)
 ## Origin
 
 Code is taken from `aiter/ops/triton/attention/mha.py` and its transitive
-imports, with the `dao_ai` impl path stripped (it depended on a separate
-`flash_attn_triton_amd` subpackage we don't need here). All `from aiter.*`
-absolute imports have been rewritten to package-relative form per the
-[Hub kernel requirements](https://huggingface.co/docs/kernels/kernel-requirements).
+imports (including the `flash_attn_triton_amd` / `dao_ai` backend), vendored at
+[`ROCm/aiter@8a9186d`](https://github.com/ROCm/aiter/commit/8a9186d983ed34ece2f68fe039e07f1b0abe147b).
+All `from aiter.*` absolute imports have been rewritten to package-relative form
+per the [Hub kernel requirements](https://huggingface.co/docs/kernels/kernel-requirements).
+
+Two intentional local deviations from upstream:
+
+- `utils/_triton/arch_info.py` detects the GPU arch lazily (on first `get_arch()`
+  call) so the module imports in the kernel-builder Nix sandbox, which has no
+  active GPU driver.
+- `mha.py` resolves sliding-window attention per call so it works through the
+  plain `flash_attn_func` / `flash_attn_varlen_func` entry points without an
+  explicit `mha_set_impl`:
+    - Under `causal=True` a right window (`window_size[1] >= 0`) is a no-op — the
+      causal edge already bounds the right side — so it is normalized to `-1` and
+      the call stays on the default kernel, which supports a left window together
+      with attention sinks. This keeps causal sliding-window models on the tuned
+      default path, **including sink models such as gpt-oss** (Gemma3, Mistral,
+      Qwen2 SWA also land here).
+    - A non-causal right window (which the default kernel cannot express) auto-
+      selects the `dao_ai` backend, but only when the workload is compatible with
+      it (no attention sink, no positional-encoding head split, not FP8).
+      Sink/PE/FP8 workloads stay on the default kernel.
 
 ## License
 

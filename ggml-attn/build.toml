@@ -1,0 +1,46 @@
+# One backend per `[kernel.*]` section, all implementing the same two entry points declared in
+# torch-ext/torch_binding.h. Adding a backend is a section and a directory — no change to the
+# bindings' schema or to the Python API.
+#
+# `vendor/` is a pinned subset of llama.cpp (revision in vendor/UPSTREAM); refresh it with
+# `python vendor.py --rev <sha>`.
+
+[general]
+name = "ggml-attn"
+version = 1
+license = "MIT"
+# Metal only. The cuda scaffolding that used to sit here was never compiled -- `git log -- ggml_attn_cuda`
+# has it, and `vendor/` still carries ggml's cuda sources.
+backends = ["metal"]
+
+# Where `nix run .#build-and-upload` publishes the built variants. A personal repo while the package is
+# unreleased; `kernels-community/ggml-attn` is what `transformers` recognises, so moving it there is a
+# rename here plus a re-upload.
+[general.hub]
+repo-id = "kernels-community/ggml-attn"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.ggml_attn_metal]
+backend = "metal"
+depends = ["torch"]
+# ggml-metal.metal includes "ggml-common.h" from vendor/src, so the shader compile needs it on its
+# include path; `torch-ext` is here because the backend source includes torch_binding.h.
+include = ["ggml_attn_metal", "torch-ext", "vendor/src", "vendor/src/ggml-metal", "vendor/src/ggml-metal/kernels"]
+src = [
+    "ggml_attn_metal/ggml_attn_metal.cpp",
+    "ggml_attn_metal/ggml_dispatch.mm",
+    "ggml_attn_metal/common.h",
+    # Upstream's Metal kernels, compiled as they ship: one file per operation, so a package
+    # lists the ones it dispatches.
+    "vendor/src/ggml-metal/kernels/fa.metal",
+    "vendor/src/ggml-metal/kernels/common.h",
+    "vendor/src/ggml-metal/kernels/dequantize.h",
+    "vendor/src/ggml-metal/ggml-metal-impl.h",
+    "vendor/src/ggml-common.h",
+]
+

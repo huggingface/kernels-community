@@ -2,8 +2,10 @@
 
 #include "cute/atom/mma_atom.hpp"
 #include "cutlass/numeric_types.h"
+#include "xe2_target_ns.hpp"
 
 namespace MoE {
+inline namespace MEGABLOCKS_XE_TARGET_NS {
 using namespace cute;
 
 class xe_gemm_policy_base {
@@ -85,4 +87,5 @@ class w4a16_policy_m_32 : public xe_gemm_policy_base {
   using SGLayout = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
 };
 
+}  // inline namespace MEGABLOCKS_XE_TARGET_NS
 }  // namespace MoE

@@ -1,0 +1,48 @@
+# One backend per `[kernel.*]` section, all implementing the same entry points declared in
+# torch-ext/torch_binding.h. Adding CUDA means adding a section and a `ggml_attn_cuda/` directory —
+# no change to the bindings' schema or to the Python API. ggml has `gated_delta_net.cu` upstream, so
+# the port is there when it is wanted.
+#
+# `vendor/` is a pinned subset of llama.cpp (revision in vendor/UPSTREAM); refresh it with
+# `python vendor.py --rev <sha>`.
+
+[general]
+name = "ggml-gated-delta-net"
+version = 1
+license = "MIT"
+backends = ["metal"]
+
+[general.hub]
+repo-id = "kernels-community/ggml-gated-delta-net"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.ggml_gdn_metal]
+backend = "metal"
+depends = ["torch"]
+# ggml-metal.metal includes "ggml-common.h" from vendor/src, so the shader compile needs it on its
+# include path; `torch-ext` is here because the backend source includes torch_binding.h.
+include = ["ggml_gdn_metal", "torch-ext", "vendor/src", "vendor/src/ggml-metal", "vendor/src/ggml-metal/kernels"]
+src = [
+    "ggml_gdn_metal/ggml_gdn_metal.cpp",
+    "ggml_gdn_metal/ggml_dispatch.mm",
+    "ggml_gdn_metal/common.h",
+    # kernels down to 6, and a metallib of 6.8 MB down to 0.05. `vendor/` keeps the untouched copy the cut
+    # is generated from; regenerate after `vendor.py`, which does it itself.
+    # ours, linked into the same metallib so one library load covers them: the gate preprocessing the
+    # delta rule needs, and the gated RMS norm that follows it.
+    "ggml_gdn_metal/delta_gates.metal",
+    "ggml_gdn_metal/rms_norm_gate.metal",
+    "ggml_gdn_metal/causal_conv.metal",
+    # Upstream's Metal kernels, compiled as they ship: one file per operation, so a package
+    # lists the ones it dispatches.
+    "vendor/src/ggml-metal/kernels/gated_delta_net.metal",
+    "vendor/src/ggml-metal/kernels/norm.metal",
+    "vendor/src/ggml-metal/kernels/common.h",
+    "vendor/src/ggml-metal/ggml-metal-impl.h",
+    "vendor/src/ggml-common.h",
+]

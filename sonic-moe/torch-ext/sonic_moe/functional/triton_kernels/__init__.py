@@ -1,10 +1,13 @@
+# ********************************************************************************
+# Copyright (c) 2026, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
+# ********************************************************************************
 import math
 
 import torch
+from ..._ops import add_op_namespace_prefix
 import triton
 import triton.language as tl
 
-from ..._ops import add_op_namespace_prefix
 from .bitmatrix import _bitmatrix_metadata_compute_stage1, _bitmatrix_metadata_compute_stage2, _keyed_add
 
 

@@ -6,10 +6,16 @@ import torch
 import torch.distributed as dist
 from typing import Tuple
 
-import deep_gemm
-from deep_gemm.utils import per_token_cast_to_fp4, per_token_cast_to_fp8
-from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
-from deep_gemm.testing import bench_kineto
+import kernels
+
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+
+per_token_cast_to_fp4 = deep_gemm.utils.per_token_cast_to_fp4
+per_token_cast_to_fp8 = deep_gemm.utils.per_token_cast_to_fp8
+dist_print = deep_gemm.utils.dist.dist_print
+init_dist = deep_gemm.utils.dist.init_dist
+uneven_all_gather = deep_gemm.utils.dist.uneven_all_gather
+bench_kineto = deep_gemm.testing.bench_kineto
 
 
 def import_baseline():

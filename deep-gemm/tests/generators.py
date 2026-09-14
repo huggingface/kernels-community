@@ -3,14 +3,21 @@ import random
 import torch
 from typing import Generator, List, Optional, Tuple
 
-from deep_gemm.testing import get_arch_major
-from deep_gemm.utils import (
-    align, ceil_div,
-    per_token_cast_to_fp8, per_channel_cast_to_fp8, per_block_cast_to_fp8,
-    per_token_cast_to_fp4, transpose_packed_fp4,
-    get_mk_alignment_for_contiguous_layout,
-    set_mk_alignment_for_contiguous_layout
-)
+import kernels
+
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+
+get_arch_major = deep_gemm.testing.get_arch_major
+
+align = deep_gemm.utils.align
+ceil_div = deep_gemm.utils.ceil_div
+per_token_cast_to_fp8 = deep_gemm.utils.per_token_cast_to_fp8
+per_channel_cast_to_fp8 = deep_gemm.utils.per_channel_cast_to_fp8
+per_block_cast_to_fp8 = deep_gemm.utils.per_block_cast_to_fp8
+per_token_cast_to_fp4 = deep_gemm.utils.per_token_cast_to_fp4
+transpose_packed_fp4 = deep_gemm.utils.transpose_packed_fp4
+get_mk_alignment_for_contiguous_layout = deep_gemm.utils.get_mk_alignment_for_contiguous_layout
+set_mk_alignment_for_contiguous_layout = deep_gemm.utils.set_mk_alignment_for_contiguous_layout
 
 
 class KernelType(enum.Enum):

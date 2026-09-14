@@ -123,7 +123,7 @@ class VarlenManager:
         return mAIdx_mk
 
     def offset_batch_SFA(self, mSFA_mkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
-        """Offset SFA by padded per-expert offset (dQaccum-style).
+        """Offset SFA to this batch's tile-aligned region of the padded SF buffer.
 
         The padded offset, in tile units (128 source-M or source-K per tile),
         is simply `cu_seqlens[b] // 128 + b`. (Algebraically identical to

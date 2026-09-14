@@ -1,22 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Literal, Optional, Tuple, Union
+from typing import Literal
+
 import torch
 import triton
 import triton.language as tl
 
-from .utils import types
-from .mha_onekernel_bwd import flash_attn_onekernel_backward
-from .mha_fused_bwd import flash_attn_fused_backward
-from .utils.logger import AiterTritonLogger
-from .utils.device_info import get_num_xcds
 from ._kernels.mha import _attn_fwd, _get_config
 from ._kernels.flash_attn_triton_amd import flash_attn_2
+from .mha_fused_bwd import flash_attn_fused_backward
+from .mha_onekernel_bwd import flash_attn_onekernel_backward
+from .utils import types
+from .utils.device_info import get_num_xcds
+from .utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_FUSED_BWD_KERNEL
 _USE_FUSED_BWD_KERNEL = False
 
 
@@ -47,8 +47,44 @@ def mha_set_use_int64_strides(value: bool):
     _USE_INT64_STRIDES = value
 
 
-def _get_sliding_window_size(window_size: Tuple[int, int]) -> int:
-    return int(window_size[0]) if int(window_size[0]) >= 0 else 0
+def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
+    return max(int(window_size[0]), 0)
+
+
+def _resolve_mha_impl(
+    window_size_right: int,
+    sink: torch.Tensor | None,
+    pe_head_dim: int,
+    is_fp8: bool,
+) -> Literal["default", "dao_ai"]:
+    """Pick the effective MHA implementation for a single call.
+
+    The default kernel (_attn_fwd) does not implement a right-side sliding
+    window, but the dao_ai backend (flash_attn_triton_amd) does. When the
+    caller leaves the impl on "default" and requests a right window
+    (window_size_right != -1), auto-select dao_ai so sliding-window models work
+    through the plain flash_attn_func / flash_attn_varlen_func entry points that
+    transformers uses, without an explicit mha_set_impl("dao_ai").
+
+    dao_ai does not support attention sinks, positional-encoding head splits or
+    FP8, so those workloads stay on the default kernel (and hit the
+    window_size_right guard if they also ask for a right window). An explicit
+    mha_set_impl choice is always respected.
+
+    NOTE: this is a deliberate deviation from upstream aiter, which never
+    auto-switches impl. Keep the decision inputs in sync between the forward and
+    backward passes so both use the same backend for a given call.
+    """
+    impl = _MHA_IMPL
+    if (
+        impl == "default"
+        and window_size_right != -1
+        and sink is None
+        and pe_head_dim == 0
+        and not is_fp8
+    ):
+        impl = "dao_ai"
+    return impl
 
 
 def _flash_attn_forward(
@@ -60,35 +96,54 @@ def _flash_attn_forward(
     causal: bool,
     window_size_left: int,
     window_size_right: int,
-    bias: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
     return_lse: bool,  # Not used
     return_softmax: bool,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    sink: Optional[torch.Tensor] = None,
-    config: Optional[dict[str, any]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int, int]:
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    descale_q: torch.Tensor | None = None,
+    descale_k: torch.Tensor | None = None,
+    descale_v: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+    config: dict[str, any] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int, int]:
 
     if bias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
-    if window_size_right != -1:
+
+    # Under causal masking a right-side window is a no-op: the causal edge
+    # (key <= query) is always at or inside the window's right edge when
+    # window_size_right >= 0. Normalize it away so causal sliding-window models
+    # stay on the default kernel, which supports a left window together with
+    # attention sinks (e.g. gpt-oss). Without this, the guard below would reject
+    # them, and dao_ai (which the guard would otherwise require) has no sink
+    # support.
+    if causal and window_size_right >= 0:
+        window_size_right = -1
+
+    # Resolve the effective implementation before the feature guards below. The
+    # default kernel has no right-side sliding window, but the dao_ai backend
+    # does, so a (non-causal) right window auto-selects dao_ai for compatible
+    # workloads (see _resolve_mha_impl). IS_FP8 / pe_head_dim are needed for that
+    # decision and reused further down.
+    IS_FP8 = types._is_fp8(q)
+    pe_head_dim = q.shape[-1] - v.shape[-1]
+    impl = _resolve_mha_impl(window_size_right, sink, pe_head_dim, IS_FP8)
+
+    if impl != "dao_ai" and window_size_right != -1:
         raise ValueError("window_size_right is not supported yet in the Triton Backend")
-    sliding_window = window_size_left if window_size_left >= 0 else 0
+    sliding_window = max(window_size_left, 0)
 
     # Triton cannot specialize on numpy scalar types; ensure native Python int
     max_seqlen_q = int(max_seqlen_q)
     max_seqlen_k = int(max_seqlen_k)
 
     # FP8
-    IS_FP8 = types._is_fp8(q)
     FP8_MAX: tl.constexpr = torch.finfo(q.dtype).max
-    is_varlen = True if cu_seqlens_q is not None else False
+    is_varlen = cu_seqlens_q is not None
 
     if IS_FP8:
         o = torch.zeros(
@@ -121,9 +176,7 @@ def _flash_attn_forward(
         v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
         o_strides = (o.stride(0), o.stride(2), o.stride(1), o.stride(3))
 
-    qk_head_dim = q.shape[-1]
     v_head_dim = v.shape[-1]
-    pe_head_dim = qk_head_dim - v_head_dim
     # padding for head_dim. Power of 2 or 16
     BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(v_head_dim), 16)
     BLOCK_DMODEL_PE_POW2 = (
@@ -183,7 +236,7 @@ def _flash_attn_forward(
         s_dmask = None
         dropout_mask = None
 
-    if _MHA_IMPL == "dao_ai":
+    if impl == "dao_ai":
         assert sink is None, "dao_ai impl does not support attention sink."
         assert (
             pe_head_dim == 0
@@ -191,9 +244,6 @@ def _flash_attn_forward(
         assert (
             not IS_FP8
         ), "dao_ai impl does not support FP8. Use the default impl or FA3 path."
-        assert (
-            window_size_left == -1 and window_size_right == -1
-        ), "dao_ai impl does not support sliding window attention."
         if is_varlen:
             o, softmax_lse, s_dmask, _ = flash_attn_2.varlen_fwd(
                 q,
@@ -212,8 +262,8 @@ def _flash_attn_forward(
                 softmax_scale=softmax_scale,
                 zero_tensors=False,
                 causal=causal,
-                window_size_left=-1,
-                window_size_right=-1,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
                 softcap=0.0,
                 return_softmax=return_softmax,
             )
@@ -227,8 +277,8 @@ def _flash_attn_forward(
                 dropout_p,
                 softmax_scale,
                 causal,
-                window_size_left=-1,
-                window_size_right=-1,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
                 softcap=0.0,
                 return_softmax=return_softmax,
             )
@@ -248,7 +298,7 @@ def _flash_attn_forward(
         if config is None:
             config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
 
-        grid = lambda META: (  # noqa: E731
+        grid = lambda META: (
             batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
         )
 
@@ -305,6 +355,15 @@ def _flash_attn_forward(
             USE_INT64_STRIDES=_USE_INT64_STRIDES,
             ENABLE_SINK=sink is not None,
             SLIDING_WINDOW=sliding_window,
+            # Soundness precondition: only set when every Q/K/V head-axis
+            # stride is a multiple of 8 elements. q_strides[1]/k_strides[1]/
+            # v_strides[1] are the head-axis strides in both thd and bshd
+            # layouts (see q_strides assembly above).
+            HEAD_STRIDE_ALIGNED_8=(
+                q_strides[1] % 8 == 0
+                and k_strides[1] % 8 == 0
+                and v_strides[1] % 8 == 0
+            ),
             **config,
         )
 
@@ -397,8 +456,16 @@ class _FlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
         sliding_window = _get_sliding_window_size(ctx.window_size)
+        # Mirror the forward impl decision (including the causal right-window
+        # normalization) so the backward runs on the same backend as the forward.
+        window_size_right = int(ctx.window_size[1])
+        if ctx.causal and window_size_right >= 0:
+            window_size_right = -1
+        impl = _resolve_mha_impl(
+            window_size_right, sink, q.shape[-1] - v.shape[-1], types._is_fp8(q)
+        )
 
-        if _MHA_IMPL == "dao_ai":
+        if impl == "dao_ai":
             assert sink is None, "dao_ai impl does not support attention sink."
             flash_attn_2.bwd(
                 do_padded,
@@ -414,8 +481,8 @@ class _FlashAttnFunc(torch.autograd.Function):
                 ctx.dropout_p,
                 ctx.softmax_scale,
                 ctx.causal,
-                window_size_left=-1,
-                window_size_right=-1,
+                window_size_left=ctx.window_size[0],
+                window_size_right=window_size_right,
                 softcap=0.0,
                 deterministic=ctx.deterministic,
             )
@@ -516,7 +583,7 @@ def flash_attn_func(
     return_lse=False,
     return_attn_probs=False,
     sink=None,
-    config: Optional[dict[str, any]] = None,
+    config: dict[str, any] | None = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -686,8 +753,16 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         if head_size_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_og % 8])
         sliding_window = _get_sliding_window_size(ctx.window_size)
+        # Mirror the forward impl decision (including the causal right-window
+        # normalization) so the backward runs on the same backend as the forward.
+        window_size_right = int(ctx.window_size[1])
+        if ctx.causal and window_size_right >= 0:
+            window_size_right = -1
+        impl = _resolve_mha_impl(
+            window_size_right, sink, q.shape[-1] - v.shape[-1], types._is_fp8(q)
+        )
 
-        if _MHA_IMPL == "dao_ai":
+        if impl == "dao_ai":
             assert sink is None, "dao_ai impl does not support attention sink."
             flash_attn_2.varlen_bwd(
                 do_padded,
@@ -708,8 +783,8 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 softmax_scale=ctx.softmax_scale,
                 zero_tensors=False,
                 causal=ctx.causal,
-                window_size_left=-1,
-                window_size_right=-1,
+                window_size_left=ctx.window_size[0],
+                window_size_right=window_size_right,
                 softcap=0.0,
                 deterministic=False,
             )
@@ -822,7 +897,7 @@ def flash_attn_varlen_func(
     block_table=None,
     out=None,
     sink=None,
-    config: Optional[dict[str, any]] = None,
+    config: dict[str, any] | None = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -913,20 +988,20 @@ def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    k: Optional[torch.Tensor] = None,
-    v: Optional[torch.Tensor] = None,
-    cache_seqlens: Optional[Union[torch.Tensor, int]] = None,
-    softmax_scale: Optional[float] = None,
+    k: torch.Tensor | None = None,
+    v: torch.Tensor | None = None,
+    cache_seqlens: torch.Tensor | int | None = None,
+    softmax_scale: float | None = None,
     causal: bool = True,
     window_size: tuple[int, int] = (-1, -1),
     softcap: float = 0.0,
     num_splits: int = 0,
-    rotary_cos: Optional[torch.Tensor] = None,
-    rotary_sin: Optional[torch.Tensor] = None,
-    cache_batch_idx: Optional[torch.Tensor] = None,
-    cache_leftpad: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
+    cache_batch_idx: torch.Tensor | None = None,
+    cache_leftpad: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
     rotary_interleaved: bool = True,
     return_softmax_lse: bool = False,
 ):

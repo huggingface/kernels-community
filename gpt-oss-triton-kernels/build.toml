@@ -1,6 +1,7 @@
 [general]
 name = "gpt-oss-triton-kernels"
 version = 1
+edition = 5
 license = "MIT"
 backends = [
     "cuda",

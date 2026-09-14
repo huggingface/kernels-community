@@ -10,9 +10,10 @@ instruction and is only supported on Blackwell (SM100+) GPUs.
 from enum import IntEnum
 
 import cutlass
+import cutlass.cute as cute
 from cutlass import Float32, Uint32
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import arith, llvm, vector
+from cutlass._mlir.dialects import llvm, vector
 from cutlass.cutlass_dsl import dsl_user_op, Int32, T
 
 
@@ -27,6 +28,13 @@ class RoundingMode(IntEnum):
     RS = 1
 
 
+# Odd strides used to derive distinct Philox counters across output tiles and subtiles.
+EPILOGUE_SR_SEED_M_STRIDE = 65537
+EPILOGUE_SR_SEED_N_STRIDE = 257
+EPILOGUE_SR_SEED_BATCH_STRIDE = 17
+EPILOGUE_SR_SEED_SUBTILE_STRIDE = 7
+EPILOGUE_SR_SEED_AUX_OUT_SALT = 0x9E3779B1
+
 PHILOX_N_ROUNDS_DEFAULT = 7
 
 PHILOX_ROUND_A = 0xD2511F53
@@ -36,26 +44,51 @@ PHILOX_KEY_B = 0xBB67AE85
 
 
 @dsl_user_op
+def epilogue_sr_seed(
+    base_seed: Int32,
+    tile_coord_mnkl: cute.Coord,
+    subtile_idx,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    return base_seed + (
+        tile_coord_mnkl[0] * EPILOGUE_SR_SEED_M_STRIDE
+        + tile_coord_mnkl[1] * EPILOGUE_SR_SEED_N_STRIDE
+        + tile_coord_mnkl[3] * EPILOGUE_SR_SEED_BATCH_STRIDE
+        + subtile_idx * EPILOGUE_SR_SEED_SUBTILE_STRIDE
+    )
+
+
+@dsl_user_op
+def epilogue_aux_out_sr_seed(
+    base_seed: Int32,
+    tile_coord_mnkl: cute.Coord,
+    subtile_idx,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    return epilogue_sr_seed(
+        base_seed + EPILOGUE_SR_SEED_AUX_OUT_SALT,
+        tile_coord_mnkl,
+        subtile_idx,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def mul_wide_u32(a: Uint32, b: Uint32, *, loc=None, ip=None) -> tuple:
     """Unsigned 32b x 32b -> 64 wide multiply via PTX `mul.wide.u32`.
 
     Returns (hi, lo) as a pair of Uint32 values.
     """
-    struct_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
-    result = llvm.inline_asm(
-        struct_ty,
-        [
-            Uint32(a).ir_value(loc=loc, ip=ip),
-            Uint32(b).ir_value(loc=loc, ip=ip),
-        ],
-        "{\n  .reg .u64 prod;\n  mul.wide.u32 prod, $2, $3;\n  mov.b64 {$1, $0}, prod;\n}",
-        "=r,=r,r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-    )
-    i32_ty = T.i32()
-    hi = cutlass.Uint32(llvm.extractvalue(i32_ty, result, [0], loc=loc, ip=ip))
-    lo = cutlass.Uint32(llvm.extractvalue(i32_ty, result, [1], loc=loc, ip=ip))
+    prod = cute.arch.mul_wide(Uint32(a), Uint32(b), loc=loc, ip=ip)
+    # ptxas folds the shift and to(Uint32) into the same IMAD.WIDE.U32 register pair
+    # that the previous inline PTX mov.b64 split produced.
+    hi = (prod >> 32).to(Uint32, loc=loc, ip=ip)
+    lo = prod.to(Uint32, loc=loc, ip=ip)
     return hi, lo
 
 
@@ -160,15 +193,17 @@ def convert_f32_to_bf16_sr(
         lo_idx = pair_idx * 2
         hi_idx = pair_idx * 2 + 1
 
-        src_lo = vector.extractelement(
+        src_lo = vector.extract(
             src_vec,
-            position=arith.constant(Int32.mlir_type, lo_idx, loc=loc, ip=ip),
+            dynamic_position=[],
+            static_position=[lo_idx],
             loc=loc,
             ip=ip,
         )
-        src_hi = vector.extractelement(
+        src_hi = vector.extract(
             src_vec,
-            position=arith.constant(Int32.mlir_type, hi_idx, loc=loc, ip=ip),
+            dynamic_position=[],
+            static_position=[hi_idx],
             loc=loc,
             ip=ip,
         )
@@ -183,10 +218,11 @@ def convert_f32_to_bf16_sr(
         packed_i32 = cvt_f32x2_bf16x2_rs(Float32(src_lo), Float32(src_hi), entropy, loc=loc, ip=ip)
 
         packed_i32_val = cutlass.Int32(packed_i32).ir_value(loc=loc, ip=ip)
-        i32_vec = vector.insertelement(
+        i32_vec = vector.insert(
             packed_i32_val,
             i32_vec,
-            position=arith.constant(Int32.mlir_type, pair_idx, loc=loc, ip=ip),
+            dynamic_position=[],
+            static_position=[pair_idx],
             loc=loc,
             ip=ip,
         )

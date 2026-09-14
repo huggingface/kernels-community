@@ -151,6 +151,75 @@ def test_result_comment_renders_security_dispatch_and_failure():
     assert "security-audit.yml (HTTP 500)" in text
 
 
+def _patch_membership(monkeypatch, states):
+    """Route get_team_membership_state through a dict of {username: state}.
+
+    An int value raises an HTTPError with that status instead.
+    """
+
+    def fake(org, team_slug, username, token):
+        state = states.get(username)
+        if isinstance(state, int):
+            raise bot.urllib.error.HTTPError("url", state, "boom", None, None)
+        return state
+
+    monkeypatch.setattr(bot, "get_team_membership_state", fake)
+
+
+def _patch_pr_author(monkeypatch, login):
+    monkeypatch.setattr(
+        bot, "get_pull_request", lambda *a, **k: {"user": {"login": login}}
+    )
+
+
+def test_active_team_member_is_authorized(monkeypatch):
+    _patch_membership(monkeypatch, {"alice": "active"})
+    assert bot.is_authorized_team_member("alice", "tok")
+
+
+def test_pending_and_unknown_members_are_not_authorized(monkeypatch):
+    _patch_membership(monkeypatch, {"bob": "pending"})
+    assert not bot.is_authorized_team_member("bob", "tok")
+    assert not bot.is_authorized_team_member("carol", "tok")
+
+
+def test_membership_lookup_error_denies(monkeypatch):
+    _patch_membership(monkeypatch, {"dave": 500})
+    assert not bot.is_authorized_team_member("dave", "tok")
+
+
+def test_membership_without_a_token_denies(monkeypatch):
+    _patch_membership(monkeypatch, {"alice": "active"})
+    assert not bot.is_authorized_team_member("alice", "")
+
+
+def test_team_member_is_authorized_for_build(monkeypatch):
+    monkeypatch.setenv("TEAM_READ_TOKEN", "tok")
+    _patch_membership(monkeypatch, {"alice": "active"})
+    assert bot.team_grants_access("api", "t", "build", "alice", 42)
+
+
+def test_team_membership_does_not_unlock_other_commands(monkeypatch):
+    monkeypatch.setenv("TEAM_READ_TOKEN", "tok")
+    _patch_membership(monkeypatch, {"alice": "active"})
+    for command in ("release", "merge-and-upload", "build-and-stage", "security"):
+        assert not bot.team_grants_access("api", "t", command, "alice", 42)
+
+
+def test_missing_team_read_token_denies(monkeypatch):
+    monkeypatch.delenv("TEAM_READ_TOKEN", raising=False)
+    _patch_membership(monkeypatch, {"alice": "active"})
+    assert not bot.team_grants_access("api", "t", "build", "alice", 42)
+
+
+def test_authorized_via_pr_author_membership(monkeypatch):
+    monkeypatch.setenv("TEAM_READ_TOKEN", "tok")
+    _patch_membership(monkeypatch, {"alice": "active"})
+    _patch_pr_author(monkeypatch, "alice")
+    # Commenter is not on the team; the PR author is.
+    assert bot.team_grants_access("api", "t", "build", "outsider", 42)
+
+
 def _run_dry(comment, *extra):
     return subprocess.run(
         [
@@ -182,6 +251,34 @@ def test_parse_error_dry_run_does_not_crash():
     proc = _run_dry("/kernel-bot frobnicate")
     assert proc.returncode == 0, proc.stderr
     assert "Parse error" in proc.stderr
+
+
+def _assert_dry_run_mode(comment, expected):
+    proc = _run_dry(comment)
+    assert proc.returncode == 0, proc.stderr
+    assert f'"mode": "{expected}"' in proc.stdout
+    other = {"pr", "release"} - {expected}
+    assert all(f'"mode": "{m}"' not in proc.stdout for m in other)
+
+
+def test_build_dispatches_pr_mode():
+    _assert_dry_run_mode("/kernel-bot build relu", "pr")
+
+
+def test_security_and_build_dispatches_pr_mode():
+    _assert_dry_run_mode("/kernel-bot security-and-build relu", "pr")
+
+
+def test_build_and_stage_dispatches_release_mode():
+    _assert_dry_run_mode("/kernel-bot build-and-stage relu", "release")
+
+
+def test_release_dispatches_release_mode():
+    _assert_dry_run_mode("/kernel-bot release relu", "release")
+
+
+def test_merge_and_upload_dispatches_release_mode():
+    _assert_dry_run_mode("/kernel-bot merge-and-upload relu", "release")
 
 
 if __name__ == "__main__":

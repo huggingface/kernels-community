@@ -63,4 +63,4 @@ class DeviceAllocator final : public at::Allocator {
 void recordStreamInDevAlloc(const at::DataPtr& ptr, at::xpu::XPUStream stream);
 
 } // namespace dpcpp
-} // namespace torch_ipex::xpu
+} // namespace kernels::xpu

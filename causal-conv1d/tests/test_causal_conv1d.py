@@ -16,6 +16,9 @@ from causal_conv1d.causal_conv1d_interface import causal_conv1d_update_ref
 from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states_ref
 
 
+DEVICE = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else None
+
+
 @pytest.mark.parametrize("return_final_states", [False, True])
 # @pytest.mark.parametrize("return_final_states", [True])
 @pytest.mark.parametrize("has_initial_states", [False, True])
@@ -40,7 +43,7 @@ from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states_ref
 def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, channel_last, has_initial_states, return_final_states):
     if not channel_last and (has_initial_states or return_final_states):
         pytest.skip("Only channel_last support initial_states or return_final_states")
-    device = "cuda"
+    device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -121,7 +124,7 @@ def test_causal_conv1d(dim, seqlen, width, has_bias, silu_activation, itype, cha
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 # @pytest.mark.parametrize("dim", [2048])
 def test_causal_conv1d_update(dim, width, seqlen, has_cache_seqlens, has_bias, silu_activation, itype):
-    device = "cuda"
+    device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -166,7 +169,7 @@ def test_causal_conv1d_update(dim, width, seqlen, has_cache_seqlens, has_bias, s
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 # @pytest.mark.parametrize("dim", [2048])
 def test_causal_conv1d_update_with_batch_gather(dim, width, seqlen, has_cache_seqlens, has_bias, silu_activation, itype):
-    device = "cuda"
+    device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
@@ -207,7 +210,7 @@ def test_causal_conv1d_update_with_batch_gather(dim, width, seqlen, has_cache_se
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 # @pytest.mark.parametrize("dim", [2048])
 def test_causal_conv1d_get_states(dim, itype):
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     seqlens = torch.randint(1, 32, (100,), device=device)
@@ -237,7 +240,7 @@ def test_causal_conv1d_get_states(dim, itype):
 # @pytest.mark.parametrize('seqlen', [8, 16, 32, 64, 128, 256, 512, 784, 1024, 2048, 4096])
 # @pytest.mark.parametrize('seqlen', [128])
 def test_causal_conv1d_race_condition(seqlen, width, has_bias, silu_activation, itype, channel_last):
-    device = "cuda"
+    device = DEVICE
     # set seed
     torch.random.manual_seed(0)
     batch = 2
@@ -295,7 +298,7 @@ def test_causal_conv1d_race_condition(seqlen, width, has_bias, silu_activation, 
 @pytest.mark.parametrize('dim', [64, 4096 + 32])
 # @pytest.mark.parametrize('dim', [64])
 def test_causal_conv1d_varlen(dim, seqlen, width, has_bias, silu_activation, itype):
-    device = "cuda"
+    device = DEVICE
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
         rtol, atol = 1e-2, 5e-2
