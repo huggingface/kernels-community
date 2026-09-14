@@ -40,7 +40,6 @@ from contextlib import contextmanager
 
 import torch
 
-from . import tuned_configs
 from typing import Dict, List
 
 from triton.runtime.autotuner import (
@@ -774,17 +773,6 @@ class BayesianAutotuner(Autotuner):
 
         # signature -> live Config (carries the pre_hook); used to re-match the cached winner
         by_sig = {tuple(sorted(c.all_kwargs().items())): c for c in configs}
-
-        # SHIPPED configs first: the durable, source-hash-free layer that travels with the build
-        # (tuned_configs). `configs` here is already PRUNED, so re-matching through by_sig also
-        # enforces this launch's prune laws — a shipped config that is illegal for these shapes
-        # simply misses and we tune. A hit skips the search entirely.
-        shipped = tuned_configs.lookup(fn.__name__, tuning_key)
-        if shipped is not None:
-            best = by_sig.get(tuple(sorted(shipped.items())))
-            if best is not None:
-                self.cache[tuning_key] = best
-                return True
 
         def load_crown() -> bool:
             path = cache.get_file(file_name)
