@@ -594,7 +594,7 @@ def mx_act_quant_swizzled_grouped(
             GROUPED=True,
             NUM_EXPERTS_POW2=E,
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
     return y, s_sw, n_m_tiles
 
@@ -816,7 +816,7 @@ def _launch_act_quant(x, recipe, scale_group, scale_dtype, swizzled=False, globa
             # the whole torch.compile launch ("launcher() missing 1 required positional argument")
             NUM_EXPERTS_POW2=1,
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
     return (values.view(torch.int8) if packed else values), scales
 
@@ -895,7 +895,7 @@ def fp8_act_quant_block_dynamic(
             x, y, s, x.stride(0), x.stride(1), T, T.bit_length(),
             K=K, BLOCK_K=block_k, UE8M0=use_ue8m0,
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
     return y, s
 
@@ -948,7 +948,7 @@ def fp8_act_quant_tensor_wide(
             BLOCK_SIZE=block_size,
             PADDED_BLOCK=triton.next_power_of_2(block_size),
             PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
 
     return y, s

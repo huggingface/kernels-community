@@ -16,6 +16,7 @@
 import torch
 import triton
 import triton.language as tl
+from torch.utils.weak import WeakTensorKeyDictionary
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 
@@ -126,6 +127,26 @@ def swizzled_scale_descriptor(scale_u8: torch.Tensor) -> TensorDescriptor:
     return TensorDescriptor(
         scale_u8, [1, blocks, cols4, 2, 256], [blocks * cols4 * 512, cols4 * 512, 512, 256, 1], [1, 1, 1, 2, 256]
     )
+
+
+# Un-swizzled weight scales, keyed weakly on the swizzled artifact so the entry dies with the
+# checkpoint tensor. Weights are constants, so the (torch-level, per-expert) un-swizzle runs once
+# per layer and is amortized over every forward; see ``prefer_affine_mx_scales``.
+_UNSWIZZLED_MX_SCALES = 
+
+()
+
+
+def unswizzle_mx_scales_cached(
+    swizzled: torch.Tensor, rows: int, cols: int, *, num_experts: int | None = None
+) -> torch.Tensor:
+    """``unswizzle_mx_scales`` memoized on the input tensor's identity. For weight scales only —
+    an activation scale is a fresh tensor every call and would only fill the cache."""
+    plain = _UNSWIZZLED_MX_SCALES.get(swizzled)
+    if plain is None:
+        plain = unswizzle_mx_scales(swizzled, rows, cols, num_experts=num_experts)
+        _UNSWIZZLED_MX_SCALES[swizzled] = plain
+    return plain
 
 
 

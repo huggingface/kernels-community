@@ -377,7 +377,7 @@ def fused_glu(
                     gate_up, q, sc, n, I, "silu", None, None, BLOCK=1024,
                     QUANT_GROUP=quant_group, UE8M0=use_ue8m0,
                     PDL=decode_pdl(),
-                    launch_pdl=decode_pdl(),
+                    **pdl_launch_kwargs(),
                 )
             return q, sc
         from .quant import fp8_act_quant_block_dynamic  # deferred: module import order
@@ -392,7 +392,7 @@ def fused_glu(
             compile_time_only_triton_wrap(_glu_kernel)[(triton.cdiv(n, 1024),)](
                 gate_up, out, None, n, I, act_fn, swiglu_alpha, swiglu_limit, BLOCK=1024,
                 PDL=decode_pdl(),
-                launch_pdl=decode_pdl(),
+                **pdl_launch_kwargs(),
             )
         return out
     gate, up = gate_up[..., 0::2], gate_up[..., 1::2]

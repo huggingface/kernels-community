@@ -25,7 +25,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import TEST_DEVICE, make_weights
+from utils import TEST_DEVICE, accelerator_module, make_weights
 
 import finegrained_kernels  # type: ignore
 import finegrained_kernels.matmul  # type: ignore
@@ -140,7 +140,7 @@ def test_dot_arm_is_fenced_on_sm10x():
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_autotuner_survives_and_reports_failing_configs(caplog):
     """A config that cannot compile must score inf (not kill the tune), the tune must
     still pick a working config, and the failure must be REPORTED — inf-scoring must
@@ -165,17 +165,17 @@ def test_autotuner_survives_and_reports_failing_configs(caplog):
             offs = offs + tl.arange(0, 3)
         tl.store(Y + offs, tl.load(X + offs, mask=offs < N), mask=offs < N)
 
-    x = torch.randn(64, device="cuda")
+    x = torch.randn(64, device=TEST_DEVICE)
     y = torch.empty_like(x)
     with caplog.at_level(logging.WARNING, logger="finegrained_kernels.bayesian_autotuner"):
         _copy_kernel[(1,)](x, y, 64)
-    torch.cuda.synchronize()
+    accelerator_module().synchronize()
     assert torch.equal(x, y)  # the good config won
     assert any("failed to compile" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_failed_configs_do_not_consume_trial_budget():
     """A config that fails to compile is skipped as if the trial never happened — the
     budget counts MEASURED configs (failures already sat outside the TPE densities;
@@ -201,10 +201,10 @@ def test_failed_configs_do_not_consume_trial_budget():
             offs = offs + tl.arange(0, 3)  # non-power-of-2 arange -> CompilationError
         tl.store(Y + offs, tl.load(X + offs, mask=offs < N), mask=offs < N)
 
-    x = torch.randn(32, device="cuda")
+    x = torch.randn(32, device=TEST_DEVICE)
     y = torch.empty_like(x)
     _budget_kernel[(1,)](x, y, 32)
-    torch.cuda.synchronize()
+    accelerator_module().synchronize()
     measured = [
         ms for ms in _budget_kernel.configs_timings.values() if ms != float("inf")
     ]
@@ -212,7 +212,7 @@ def test_failed_configs_do_not_consume_trial_budget():
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_act_quant_arms_are_bit_equal():
     """The inline and offline activation-quant arms must produce IDENTICAL bits — the
     dtype-branched kernels rely on it (same scale-group boundaries by construction)."""
@@ -220,12 +220,12 @@ def test_act_quant_arms_are_bit_equal():
     B, Bs = make_weights(
         256,
         512,
-        "cuda",
+        TEST_DEVICE,
         [1, 32],
         weight_dtype=torch.float8_e4m3fn,
         scale_dtype=torch.float8_e8m0fnu,
     )
-    A = torch.randn(4, 512, device="cuda", dtype=torch.bfloat16)  # below the M gate
+    A = torch.randn(4, 512, device=TEST_DEVICE, dtype=torch.bfloat16)  # below the M gate
     inline_out = finegrained_kernels.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
     saved = finegrained_kernels.matmul.MX_MATMUL_ACT_PREQUANT_MIN_M
     try:
@@ -238,20 +238,20 @@ def test_act_quant_arms_are_bit_equal():
 
 @pytest.mark.kernels_ci
 @pytest.mark.slow
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_cross_process_determinism_block_dynamic_grouped():
     """The Triton pipeliner race class is PER-PROCESS (compile-time scheduling): repeats
     within one process agree, fresh processes can disagree. Compare an output checksum
     across subprocesses — a cheap CI approximation of the 15-process flake harness."""
     script = (
         "import sys; sys.path.insert(0,'torch-ext'); sys.path.insert(0,'tests');\n"
-        "import torch; from utils import make_weights; import finegrained_kernels as fg\n"
+        "import torch; from utils import TEST_DEVICE, make_weights; import finegrained_kernels as fg\n"
         "torch.manual_seed(0)\n"
         "E,N,K,S=8,512,1024,256\n"
-        "eids=torch.randint(0,E,(S,),device='cuda',dtype=torch.int32)\n"
+        "eids=torch.randint(0,E,(S,),device=TEST_DEVICE,dtype=torch.int32)\n"
         "est,gi,si=fg.compute_grouped_scheduling(eids,E,1)\n"
-        "A=torch.randn(S,K,device='cuda',dtype=torch.bfloat16)\n"
-        "B,Bs=make_weights(N,K,'cuda',[128,128],num_experts=E)\n"
+        "A=torch.randn(S,K,device=TEST_DEVICE,dtype=torch.bfloat16)\n"
+        "B,Bs=make_weights(N,K,TEST_DEVICE,[128,128],num_experts=E)\n"
         "out=fg.matmul_grouped(A,B,Bs=Bs,expert_start=est,output_dtype=torch.float32,gather_idx=gi,scatter_idx=si)\n"
         "print(out.double().sum().item())\n"
     )
@@ -265,7 +265,7 @@ def test_cross_process_determinism_block_dynamic_grouped():
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_compile_failures_are_memoized_across_keys(caplog):
     """A config that fails at COMPILE stage is memoized on disk keyed by its compile
     determinants (source hash + config + constexpr values + dtypes) — a tune at a NEW
@@ -294,10 +294,10 @@ def test_compile_failures_are_memoized_across_keys(caplog):
 
     with caplog.at_level(logging.WARNING, logger="finegrained_kernels.bayesian_autotuner"):
         for n in (32, 64):  # two shapes -> two tuning keys, same compile signature
-            x = torch.randn(n, device="cuda")
+            x = torch.randn(n, device=TEST_DEVICE)
             y = torch.empty_like(x)
             _memo_kernel[(1,)](x, y, n)
-            torch.cuda.synchronize()
+            accelerator_module().synchronize()
     msgs = [
         r.getMessage() for r in caplog.records if "failed to compile" in r.getMessage()
     ]
