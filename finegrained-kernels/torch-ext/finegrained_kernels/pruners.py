@@ -12,23 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import torch
 import triton
 
-
-from .compat import *  # noqa: F401,F403
-from .recipes import *  # noqa: F401,F403
-from .swizzle import *  # noqa: F401,F403
-from .tile_layout import *  # noqa: F401,F403
-from .quant import *  # noqa: F401,F403
-from .scales import *  # noqa: F401,F403
-from .mma import *  # noqa: F401,F403
-from .scheduling import *  # noqa: F401,F403
-from .tiles import *  # noqa: F401,F403
-from .epilogue import *  # noqa: F401,F403
-
-
+from .compat import get_active_device_type, is_sm10x, sm_count, sm_shared_memory_limit
 
 # ── config pruners ────────────────────────────────────────────────────────────
 # Every guard exists for one of four reasons; the map (pruner -> rule -> attached to):
@@ -122,7 +109,6 @@ SM10X_SCALED_MMA_MAX_N = 256
 PATH_ANCHOR_AXES = ("COMPUTE_MODE", "SWAP_AB")
 
 
-
 def config_dim(c, all_args, name):
     """A tile dimension for config ``c`` — from its tuned meta, else the launch args.
     No default: a pruner reasoning about a dimension the kernel doesn't have is a wiring
@@ -133,7 +119,6 @@ def config_dim(c, all_args, name):
             f"pruner needs {name} (autotune config meta or launch arg); none found"
         )
     return v
-
 
 
 def config_filter(ok, when=None, on_empty=None):
@@ -158,7 +143,6 @@ def config_filter(ok, when=None, on_empty=None):
     return prune
 
 
-
 def compose_pruners(*pruners):
     """Chain ``early_config_prune`` callbacks left to right (each sees the previous
     survivors)."""
@@ -169,7 +153,6 @@ def compose_pruners(*pruners):
         return configs
 
     return prune
-
 
 
 def block_within_dim_pruner(dim_arg: str, block_key: str = "BLOCK_SIZE_K", when=None):
@@ -196,7 +179,6 @@ def block_within_dim_pruner(dim_arg: str, block_key: str = "BLOCK_SIZE_K", when=
         )
 
     return config_filter(ok, when=when, on_empty=raise_no_dividing_block)
-
 
 
 def block_fits_dim_pruner(dim_arg: str, block_key: str = "BLOCK_SIZE_K"):
@@ -233,7 +215,6 @@ def require_moe_dims_aligned(N: int, K: int, block_n: int, block_k: int) -> None
         )
 
 
-
 def warp_spec_compile_guard_pruner():
     """``early_config_prune`` dropping ``warp_specialize`` configs that can never compile: WS needs
     ``num_warps % 4 == 0`` (its async producer/consumer partitions) and enough M work — the MMA's M
@@ -255,7 +236,6 @@ def warp_spec_compile_guard_pruner():
         return config_dim(c, args, mma_m) >= 64 and c.num_warps % 4 == 0
 
     return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
-
 
 
 def gated_pointer_weight_warp_spec_pruner():
@@ -298,7 +278,6 @@ def gated_pointer_weight_warp_spec_pruner():
     )
 
 
-
 def affine_scale_warp_spec_pruner():
     """``early_config_prune`` dropping ``warp_specialize`` on the grouped MX AFFINE (row-major,
     non-``SWIZZLED_SCALES``) scale path. Its per-(gathered-row, K-group) 2D pointer-gather scale
@@ -314,7 +293,6 @@ def affine_scale_warp_spec_pruner():
         return args.get("SWIZZLED_SCALES", True)
 
     return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
-
 
 
 def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool = True):
@@ -530,7 +508,6 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
     )
 
 
-
 def dot_scaled_staging_pruner():
     """``early_config_prune`` dropping ``dot_scaled`` where the MMA's M operand degenerates to a
     single row: ``BLOCK_SIZE_M == 1`` with no ``SWAP_AB`` to move the operand to ``BLOCK_SIZE_N``.
@@ -557,7 +534,6 @@ def dot_scaled_staging_pruner():
         return config_dim(c, args, "BLOCK_SIZE_M") > 1
 
     return config_filter(ok)
-
 
 
 def block_dynamic_2d_warp_spec_pruner():
@@ -623,7 +599,6 @@ def block_dynamic_mma_width_pruner():
     )
 
 
-
 def scale_subblock_pruner(min_ctas_per_sm: int = 4):
     """``early_config_prune`` for kernels whose compute tile (``BLOCK_SIZE_N``) may subdivide the
     quant block (``BLOCK_N``). One scale covers the whole block, so a narrower tile just reads its
@@ -652,7 +627,7 @@ def scale_subblock_pruner(min_ctas_per_sm: int = 4):
         starved = args["S"] * triton.cdiv(args["N"], block_n) < min_ctas_per_sm * sm_count(
             args["B"].device.index
         )
-        if args.get("OUTPUT_RECIPE") is not None or not starved:
+        if args.get("OUTPUT_FORMAT") is not None or not starved:
             return bn == block_n
         return bn <= block_n and args["N"] % bn == 0
 
@@ -665,7 +640,6 @@ def scale_subblock_pruner(min_ctas_per_sm: int = 4):
         )
 
     return config_filter(ok, on_empty=raise_no_block_tile)
-
 
 
 def packed_schedule_scope_pruner(min_bm: int = 128):
@@ -752,7 +726,7 @@ def mx_2d_swap_scope_pruner(max_m: int = 16):
     arm — ``dot_scaled`` has no sub-M=128 form for E4M3 scales (PassManager) and scalar is
     E2M1-unpack-bound (measured 60-142µs vs swap's 22-50µs on the GLM attn shape,
     2026-08-05). Everywhere else swap is a proven loser (an 18-cell forced-swap sweep:
-    UE8M0 recipes' scalar/dot arms win, M3 attn swap −38%), so its rows are dropped:
+    UE8M0 formats' scalar/dot arms win, M3 attn swap −38%), so its rows are dropped:
     UE8M0-scale launches, M above the decode band, and any non-BM=1 row (the mx swap
     compute flattens the token tile — BM=1 is structural, enforced by a static_assert).
 
@@ -777,7 +751,6 @@ def mx_2d_swap_scope_pruner(max_m: int = 16):
         )
 
     return config_filter(ok)
-
 
 
 def swizzled_out_bm_pruner():
@@ -828,7 +801,6 @@ def swizzled_scales_bm_pruner():
         )
 
     return config_filter(ok, when=lambda args: args.get("SWIZZLED_SCALES"))
-
 
 
 def swizzled_scale_config_pruner(allow_gate_subblock=False):
@@ -893,7 +865,6 @@ def swizzled_scale_config_pruner(allow_gate_subblock=False):
     )
 
 
-
 def block_dynamic_grouped_matmul_pruner():
     """``early_config_prune`` for the block-dynamic grouped kernel: the Triton 3.7.1
     pipeliner-race guard, sized to its four-load-stream single-dot K-loop. The GATE arm
@@ -948,7 +919,6 @@ def block_dynamic_grouped_matmul_pruner():
     return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
 
 
-
 def scalar_max_m_pruner(m_arg: str, max_m: int = 64):
     """``early_config_prune`` dropping ``scalar`` configs when the launch's row count
     (``m_arg``) exceeds ``max_m``: scalar is a BM=1 GEVM — sensible for decode-sized M,
@@ -978,7 +948,6 @@ def matched_memory_modes_pruner():
     return config_filter(ok)
 
 
-
 def descriptor_needs_prequant_pruner():
     """Keep only pointer-mode configs when ``A`` is raw (bf16/fp16 — the ``maybe_act_quant``
     M<threshold inline-quant arm). A descriptor operand load needs a pre-quantized fp8 ``A``: the
@@ -996,7 +965,6 @@ def descriptor_needs_prequant_pruner():
     return config_filter(
         ok, when=lambda args: args["A"].dtype not in (torch.float8_e4m3fn, torch.int8, torch.uint8)
     )
-
 
 
 def descriptor_box_pruner(k_dim="BLOCK_SIZE_K"):
@@ -1036,7 +1004,6 @@ def descriptor_box_pruner(k_dim="BLOCK_SIZE_K"):
         return True
 
     return config_filter(ok)
-
 
 
 def global_scale_warp_spec_pruner():

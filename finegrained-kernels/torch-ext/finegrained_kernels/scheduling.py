@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import os
 
 import torch
@@ -20,23 +19,14 @@ import triton
 import triton.language as tl
 
 from ._ops import add_op_namespace_prefix
-
-from .compat import *  # noqa: F401,F403
-from .recipes import *  # noqa: F401,F403
-from .swizzle import *  # noqa: F401,F403
-from .tile_layout import *  # noqa: F401,F403
-from .quant import *  # noqa: F401,F403
-from .scales import *  # noqa: F401,F403
-from .mma import *  # noqa: F401,F403
-
-
+from .compat import compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, is_sm10x
+from .tile_layout import resolve_tile_inline
 
 # Flat-slot tile per program for the O(S) routing kernels (count + scatter). These are small
 # latency-bound atomic kernels that want many programs: a sweep over {256..4096} x prefill shapes
 # put 256 best (or within ~1%) for both, with 1024 up to ~1.5x slower. The grid derives from it
 # so the two can't drift. Power of 2.
 _ROUTING_BLOCK_SIZE = 256
-
 
 
 @triton.jit
@@ -50,7 +40,6 @@ def _exclusive_offsets_kernel(
     tl.store(ExpertStart, 0)
     tl.store(ExpertStart + 1 + offs, incl)
     tl.store(Counters + offs, tl.zeros([NUM_EXPERTS], tl.int32))
-
 
 
 @triton.jit
@@ -80,7 +69,6 @@ def _scatter_kernel(
     tl.store(PermToken + dest, offs // NUM_TOP_K, mask=valid)
 
 
-
 @triton.jit
 def _count_kernel(
     ExpertIds, ExpertFreq, S, NUM_EXPERTS: tl.constexpr, BLOCK_SIZE: tl.constexpr
@@ -93,7 +81,6 @@ def _count_kernel(
     tl.atomic_add(
         ExpertFreq + expert_id, 1, mask=mask & (expert_id < NUM_EXPERTS), sem="relaxed"
     )
-
 
 
 def compute_grouped_scheduling(
@@ -126,7 +113,6 @@ def compute_grouped_scheduling(
         expert_ids, num_experts, num_top_k
     )
     return expert_start, gather_idx, scatter_idx
-
 
 
 @compile_time_only_triton_op(
@@ -173,7 +159,6 @@ def _compute_grouped_scheduling(
             BLOCK_SIZE=_ROUTING_BLOCK_SIZE,
         )
     return perm_token, perm, expert_start
-
 
 
 # The packed schedule exists for ONE tile size: BM=128, the only region the resolve trade

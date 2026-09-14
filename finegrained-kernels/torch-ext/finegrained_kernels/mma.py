@@ -12,17 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import triton
 import triton.language as tl
 
-
-from .compat import *  # noqa: F401,F403
-from .recipes import *  # noqa: F401,F403
-from .swizzle import *  # noqa: F401,F403
-from .tile_layout import *  # noqa: F401,F403
-from .quant import *  # noqa: F401,F403
-from .scales import *  # noqa: F401,F403
+from .quant import e2m1_cols_to_e4m3, e2m1_cols_to_f32, e2m1_to_bf16, e2m1_to_e4m3, e2m1_to_f32
+from .scales import decode_group_scale
 
 
 @triton.jit
@@ -61,7 +55,7 @@ def mx_weight_upcast(w, w_scale, BLOCK_SIZE_K: tl.constexpr, N: tl.constexpr, SC
     UE8M0 group scale. ``w_scale`` is ``[N, BK // SCALE_GROUP_K]`` (per-N-row, per-group); transposed
     and broadcast across each group's rows to ``[BK, N]``. Unlike the ``dot`` arm (BK == group, scale
     folded onto the [M,N] product) this dequantizes IN the tile, so BK spans any number of groups — a
-    full-BK bf16 ``tl.dot`` (the matmul_ogs recipe: fp4 weight, bf16 acts).
+    full-BK bf16 ``tl.dot`` (the matmul_ogs format: fp4 weight, bf16 acts).
 
     The scale is applied as a plain bf16 multiply, NOT a hand-rolled exponent-add: the UE8M0 scale is
     a power of two so a ``bf16 * 2^k`` is already an exact exponent shift (a cheap FMA), and folding it
@@ -96,7 +90,7 @@ def mx_weight_only_compute(
     group scales straight to the tcgen05 scaled MMA with an UNSCALED activation operand (the
     ``lhs_scale=None`` / bf16-format form), so the tensor core does the fp4 decode and the group
     rescale; ``"dot"`` upcasts the tile to the activation dtype in-loop and runs a plain
-    ``tl.dot`` (the matmul_ogs Hopper recipe). Both are correct everywhere and the tuner picks per
+    ``tl.dot`` (the matmul_ogs Hopper format). Both are correct everywhere and the tuner picks per
     workload — the two differ by arm: measured on gpt-oss K=2880, ``dot_scaled`` wins the down
     projection by 18.5% while the stacked gate|up tile prefers ``dot`` by 7.3``%``. ``SWAP_AB``
     is the decode form: weight output rows lead the tile and the FMA reduce replaces the MMA
@@ -456,7 +450,7 @@ def block_dynamic_dot(
 
 @triton.jit
 def static_dot(acc, a, b, b_s, SWAP_AB: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, FAKE_BATCH: tl.constexpr):
-    """static recipe K-step: plain (swap-aware) fp8 dot + per-K-block weight rescale. FAKE_BATCH
+    """static format K-step: plain (swap-aware) fp8 dot + per-K-block weight rescale. FAKE_BATCH
     (single-token decode) routes the rescale down the weight-row (M) dim; else it broadcasts across
     the N columns. The per-tensor activation scale is applied post-loop."""
     b_sd = decode_group_scale(b_s)

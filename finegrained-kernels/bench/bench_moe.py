@@ -126,14 +126,17 @@ def _can_preswizzle(cfg):
             and cfg["H"] % 128 == 0 and cfg["I"] % 128 == 0)
 
 
-# the activation recipe fed to the MoE forwards. Explicit cfg["recipe"] wins (e.g. DeepSeek-V4
-# W4A8 pins "mxfp8"); recipe="weights" follows the weight family, and recipe=None is weight-only
-# (raw bf16 activations). Weight families with no entry below resolve to None.
-def _recipe(cfg):
-    """Pass the cfg recipe straight through: ``"weights"`` (the op resolves it off the weight
-    dtypes), ``None`` (raw bf16 activations), or an explicit format (e.g. dsv4 pins "mxfp8" for
-    W4A8). No weight-family table here — ``weight_recipe`` in the op is the single resolver."""
-    return cfg["recipe"]
+# the activation format fed to the forwards, in the kernels' public vocabulary: None follows the
+# weight family (the op resolves it off the weight dtypes), "bf16" is weight-only (raw bf16
+# activations), an explicit format pins a chain (DeepSeek-V4 W4A8 pins "mxfp8").
+def _activation_format(cfg):
+    return cfg["activation_format"]
+
+
+def _quantized_acts(cfg):
+    """Whether the activations are quantized at all (weight-only chains read affine scales and
+    have no quantized-activation baselines)."""
+    return cfg["activation_format"] != "bf16"
 
 
 _NVFP4_GLOBALS = {}
@@ -285,7 +288,13 @@ except Exception:
     trtllm_fp8_block_scale_routed_moe = None
 
 
-UPSTREAM_FP8_REV = "v4"  # the pinned hub revision; also the legend suffix
+UPSTREAM_FP8_LABEL = "v4"  # the legend suffix: the hub tag the pinned snapshot was published under
+# The `v4` tag was rebuilt on 2026-09-13 with a new op-namespace id (same kernel source). That
+# re-keys the upstream tuner's caches, and its cold search on the MX grouped rows (DeepSeek-V4
+# W4A8, MiniMax-M3 MXFP8) hits a config that traps with a misaligned address on this stack; the
+# upstream tuner has no trap fences, so the fault poisons the shard's CUDA context and blanks every
+# later cell. Pin the snapshot the committed figure measured (identical source, warm crowns).
+UPSTREAM_FP8_REV = "29083040812e244b390757d6198e2889fe551d13"
 upstream_fp8 = (None if (MOCK or REPLOT)
           else get_kernel("kernels-community/finegrained-fp8", revision=UPSTREAM_FP8_REV,
                           trust_remote_code=True))
@@ -310,39 +319,39 @@ MOE_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6)": dict(
         # config.json: fp8 e4m3, scale_fmt ue8m0, weight_block_size [128,128], dynamic acts.
         # Same expert geometry as the MXFP4 V4 row below — the difference is the deployed
-        # recipe, so the two rows isolate W4A8 vs W8A8 on identical shapes. UE8M0 scales are
+        # format, so the two rows isolate W4A8 vs W8A8 on identical shapes. UE8M0 scales are
         # what DeepGEMM's SM100 experts kernel wants, so unlike the V3 fp32 row it gets a
         # deepgemm baseline. (Router is sqrtsoftplus upstream; the bench's shared softmax
         # top-k feeds every arm the same weights, so it does not affect the comparison.)
-        E=256, H=4096, I=2048, top_k=6, weights="fp8_128x128_ue8m0", recipe="weights",
+        E=256, H=4096, I=2048, top_k=6, weights="fp8_128x128_ue8m0", activation_format=None,
         baselines=("finegrained-fp8", "deepgemm", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E256 H4096 I2048 top6)": dict(
-        E=256, H=4096, I=2048, top_k=6, weights="mxfp4", recipe="mxfp8",
+        E=256, H=4096, I=2048, top_k=6, weights="mxfp4", activation_format="mxfp8",
         baselines=("finegrained-fp8", "deepgemm", "trtllm"), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "openai/GPT-OSS-120B MXFP4 W4A16 (E128 H2880 I2880 top4)": dict(
         # GPT-OSS deploys mxfp4 WEIGHTS with BF16 activations (W4A16) — transformers' matmul_ogs does
-        # a bf16-act x mxfp4-weight matmul (fp4 weight upcast in-MMA). fgm runs the SAME recipe via the
-        # dedicated weight-only kernels (recipe=None: raw bf16 acts, mxfp4 weight upcast to bf16
+        # a bf16-act x mxfp4-weight matmul (fp4 weight upcast in-MMA). fgm runs the SAME format via the
+        # dedicated weight-only kernels (activation_format="bf16": raw bf16 acts, mxfp4 weight upcast to bf16
         # per-group in-loop, plain bf16 dot). The triton_kernels baseline is the reference W4A16.
         # (finegrained-fp8 lacks W4A16 AND its MX kernels have no BK-divides-K guard — BK {128,256}
         # doesn't divide 2880 -> NaN.)
-        E=128, H=2880, I=2880, top_k=4, weights="mxfp4", recipe=None,
+        E=128, H=2880, I=2880, top_k=4, weights="mxfp4", activation_format="bf16",
         baselines=("trtllm",), fused_extra=("triton_kernels",), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
     ),
     "nvidia/GLM-5.2-NVFP4 W4A4 (E256 H6144 I2048 top8)": dict(
-        E=256, H=6144, I=2048, top_k=8, weights="nvfp4", recipe="weights",
+        E=256, H=6144, I=2048, top_k=8, weights="nvfp4", activation_format=None,
         baselines=("trtllm",), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E256 H7168 I2048 top8)": dict(
         # DeepSeek-V3 experts deploy fp32 block scales (software rescale). DeepGEMM's SM100
         # experts kernel requires UE8M0 and fails loud on fp32, so no deepgemm baseline here.
-        E=256, H=7168, I=2048, top_k=8, weights="fp8_128x128", recipe="weights",
+        E=256, H=7168, I=2048, top_k=8, weights="fp8_128x128", activation_format=None,
         baselines=("finegrained-fp8", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
@@ -350,7 +359,7 @@ MOE_PROBLEMS = {
         # No TRT-LLM arm: this row's activation is the clamped/scaled SwiGLU (alpha 1.702,
         # limit 7.0) and their fp8-block kernel answers a different function with those scalars
         # (see the gate in _run_task) — their fp4 kernel implements them, so GPT-OSS keeps its arm.
-        E=128, H=6144, I=3072, top_k=4, weights="mxfp8", recipe="weights",
+        E=128, H=6144, I=3072, top_k=4, weights="mxfp8", activation_format=None,
         baselines=("finegrained-fp8",), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
     ),
@@ -358,31 +367,31 @@ MOE_PROBLEMS = {
 # the same base-model roster, run as if dequantized to BF16 (one shape per model)
 BF16_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6)": dict(
-        E=256, H=4096, I=2048, top_k=6, weights="bf16", recipe="weights",
+        E=256, H=4096, I=2048, top_k=6, weights="bf16", activation_format=None,
         baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
         fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "openai/GPT-OSS-120B BF16 (E128 H2880 I2880 top4)": dict(
-        E=128, H=2880, I=2880, top_k=4, weights="bf16", recipe="weights",
+        E=128, H=2880, I=2880, top_k=4, weights="bf16", activation_format=None,
         baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
         fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
     ),
     "zai-org/GLM-5.2 BF16 (E256 H6144 I2048 top8)": dict(
-        E=256, H=6144, I=2048, top_k=8, weights="bf16", recipe="weights",
+        E=256, H=6144, I=2048, top_k=8, weights="bf16", activation_format=None,
         baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
         fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "deepseek-ai/DeepSeek-V3 BF16 (E256 H7168 I2048 top8)": dict(
-        E=256, H=7168, I=2048, top_k=8, weights="bf16", recipe="weights",
+        E=256, H=7168, I=2048, top_k=8, weights="bf16", activation_format=None,
         baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
         fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "MiniMaxAI/MiniMax-M3 BF16 (E128 H6144 I3072 top4)": dict(
-        E=128, H=6144, I=3072, top_k=4, weights="bf16", recipe="weights",
+        E=128, H=6144, I=3072, top_k=4, weights="bf16", activation_format=None,
         baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
         fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
@@ -393,14 +402,14 @@ ATTN_PROBLEMS = {
         # DeepSeek-V4's attention deploys block-FP8 W8A8 with UE8M0 (power-of-two) scales
         # (only the EXPERTS are mixed W4A8) — routes through the tcgen05 dot_scaled arm.
         # K=4096 is on the 128 grid, so finegrained-fp8 (block-dyn) and DeepGEMM FP8 both run it.
-        N=12288, K=4096, weights="fp8_128x128_ue8m0", recipe="weights",
+        N=12288, K=4096, weights="fp8_128x128_ue8m0", activation_format=None,
         block=[128, 128], baselines=("finegrained-fp8", "deepgemm"),
     ),
     # (No standalone dense 2D W4A16 row: no prominent model ships dense mxfp4 — gpt-oss's only mxfp4
     # is its experts (benchmarked as the MoE W4A16 row), and dense 4-bit-weight LLMs deploy GPTQ/AWQ
     # int4, not mxfp4. The 2D weight-only kernel stays covered by test_ops + the unfused MoE path.)
     "nvidia/GLM-5.2-NVFP4 attn W4A4 qkv-shaped (N=18432 K=6144)": dict(
-        N=18432, K=6144, weights="nvfp4", recipe="weights",
+        N=18432, K=6144, weights="nvfp4", activation_format=None,
         block=None, baselines=(),  # no baseline supports NVFP4
     ),
     "deepseek-ai/DeepSeek-V3 attn FP8 W8A8 fp32 128x128 qkv-shaped (N=21504 K=7168)": dict(
@@ -410,11 +419,11 @@ ATTN_PROBLEMS = {
         # 2x per block, measured 0.53 relative vs every other arm (0.001 on the UE8M0 row below).
         # That is a different computation, so timing it here would compare unlike work; the honest
         # UE8M0 deepgemm comparison is the DeepSeek-V4 attn row.
-        N=21504, K=7168, weights="fp8_128x128", recipe="weights",
+        N=21504, K=7168, weights="fp8_128x128", activation_format=None,
         block=[128, 128], baselines=("finegrained-fp8",),
     ),
     "MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144)": dict(
-        N=18432, K=6144, weights="mxfp8", recipe="weights",
+        N=18432, K=6144, weights="mxfp8", activation_format=None,
         block=None, baselines=("finegrained-fp8",),  # DeepGEMM FP8 is 128-block, not group-32 MX
     ),
 }
@@ -460,7 +469,7 @@ def _impl_label(impl, regime):
     if impl == "trtllm":
         return "TRT-LLM (FlashInfer)"
     if impl == "finegrained-fp8":
-        return f"finegrained-fp8@{UPSTREAM_FP8_REV}"
+        return f"finegrained-fp8@{UPSTREAM_FP8_LABEL}"
     return impl
 
 
@@ -485,7 +494,7 @@ def build(cfg):
     else:
         make = WEIGHTS[cfg["weights"]]["make"]
     # NVFP4 is two-level: make() returns the per-expert fp32 global as its 3rd value (None for the
-    # single-level FP8/MX recipes). Thread it through — dropping it silently ran nvfp4 at global=1.
+    # single-level FP8/MX formats). Thread it through — dropping it silently ran nvfp4 at global=1.
     gu, gus, gu_g = make(2 * inter, H, E)
     dn, dns, dn_g = make(H, inter, E)
     _mark_static(gu, gus, dn, dns)
@@ -559,9 +568,9 @@ def _interleave_gate_up(gu, gus):
 # gate|up weight stack (E, 2I, H), its block-scale grid and its NVFP4 per-expert global; `dn`/`dns`/
 # `dn_g` the same for down (E, H, I). Scales are None for BF16, globals None outside NVFP4.
 def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
-    """``recipe`` sets the activation precision; None follows the weight recipe
-    (mxfp4/nvfp4 -> the all-fp4 W4A4 chain, bf16 -> unquantized). dsv4 deploys
-    W4A8, so it pins recipe="mxfp8". Under ``PRESWIZZLE`` the MX weight scales are
+    """``activation_format`` sets the activation precision; None follows the weight format
+    (mxfp4/nvfp4 -> the all-fp4 W4A4 chain, bf16 weights -> unquantized). dsv4 deploys
+    W4A8, so it pins activation_format="mxfp8". Under ``PRESWIZZLE`` the MX weight scales are
     pre-swizzled into SWIZZLE_32_4_4 so the forward takes the tcgen05 fast path."""
     fn = fgm.moe_fused_grouped if grouped else fgm.moe_fused_batched
     nvfp4_kw = _nvfp4_kwargs(cfg, hidden, gu, gus, gu_g)  # raw scales: before any preswizzle
@@ -571,14 +580,14 @@ def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_
         dns = _preswizzle_moe_scale(dns)
     _mark_static(gu, gus, dns)  # derived closure tensors: unmarked, cudagraph trees re-copy them every compiled call
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
-              swiglu_limit=cfg["swiglu_limit"], recipe=_recipe(cfg),
+              swiglu_limit=cfg["swiglu_limit"], activation_format=_activation_format(cfg),
               gate_up_proj_global_scale=gu_g, down_proj_global_scale=dn_g,
               **nvfp4_kw)
     return lambda: fn(hidden, idx, w, gu, dn, gus, dns, **kw)
 
 
 def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
-    fn = fgm.moe_unfused_grouped if grouped else fgm.moe_unfused_batched
+    fn = fgm.moe.moe_unfused_grouped if grouped else fgm.moe.moe_unfused_batched
     nvfp4_kw = _nvfp4_kwargs(cfg, hidden, gu, gus, gu_g)  # raw scales: before any preswizzle
     gu, gus = _interleave_gate_up(gu, gus)  # our kernels read gate|up interleaved
     if _can_preswizzle(cfg):
@@ -588,7 +597,7 @@ def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, 
         dns = _preswizzle_moe_scale(dns)
     _mark_static(gu, gus, dns)  # derived closure tensors: unmarked, cudagraph trees re-copy them every compiled call
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
-              swiglu_limit=cfg["swiglu_limit"], recipe=_recipe(cfg),
+              swiglu_limit=cfg["swiglu_limit"], activation_format=_activation_format(cfg),
               gate_up_proj_global_scale=gu_g, down_proj_global_scale=dn_g,
               **nvfp4_kw)
     return lambda: fn(hidden, idx, w, gu, dn, gus, dns, **kw)
@@ -617,11 +626,11 @@ def torch_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     nvfp4_kw = _nvfp4_kwargs(cfg, hidden, gu, gus, gu_g)
     gu, gus = _interleave_gate_up(gu, gus)  # moe_torch_grouped shares our interleaved convention
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
-              swiglu_limit=cfg["swiglu_limit"], recipe=_recipe(cfg),
+              swiglu_limit=cfg["swiglu_limit"], activation_format=_activation_format(cfg),
               gate_up_proj_global_scale=gu_g, down_proj_global_scale=dn_g,
               **nvfp4_kw)
     gus_b, dns_b = _torch_preblock_weight_scale(gus), _torch_preblock_weight_scale(dns)
-    return lambda: fgm.moe_torch_grouped(hidden, idx, w, gu, dn, gus_b, dns_b, **kw)
+    return lambda: fgm.moe.moe_torch_grouped(hidden, idx, w, gu, dn, gus_b, dns_b, **kw)
 
 
 def _fp8_scales(t, block):
@@ -812,14 +821,14 @@ def _trtllm_fp4_arm(cfg, hidden, idx, packed, gu, gus, dn, dns, gu_g, dn_g):
         hidden_g = None
         scale_c1 = scale_gate1 = scale_c2 = ones
     alpha, beta, limit = _trtllm_gated_scalars(cfg, E, hidden.device)
-    act_recipe = _recipe(cfg)
+    act_format = _activation_format(cfg)
 
     def run():
         x = torch.nn.functional.pad(hidden, (0, Hp - H)) if Hp != H else hidden
         # the activation quant is THEIR kernel, inside the timed call
         if nvfp4:
             hq, hsf = _fi_fp4_quantize(x, hidden_g, 16, False, False)
-        elif act_recipe == "mxfp8":
+        elif act_format == "mxfp8":
             hq, hsf = _fi_mxfp8_quantize(x, False)
         else:
             hq, hsf = x, None
@@ -839,13 +848,13 @@ def _trtllm_fp4_arm(cfg, hidden, idx, packed, gu, gus, dn, dns, gu_g, dn_g):
 
 
 def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn_g=None, *_):
-    """FlashInfer TRT-LLM fp8-block routed MoE (the DeepSeek recipe on SM100). Weight prep
+    """FlashInfer TRT-LLM fp8-block routed MoE (the DeepSeek format on SM100). Weight prep
     (offline): TRT-LLM's gate|up order is [up; gate] — the halves swap; UE8M0 scales ride
     as fp32 (same values). Routing rides packed ``(expert_id << 16) | bf16-weight`` ids;
     the activation quant (1x128, TRANSPOSED [K/128, T] scale layout) is inside the timed
     call and is the STACK'S OWN kernel (vLLM's per_token_group_quant_fp8 — what their
     TRT-LLM integration runs), so the bar is the integration end-to-end. Numerics caveat (oracle-checked 2026-08-06):
-    ~4.8e-2 from the exact block recipe vs our 2.8e-3 — looser than vLLM-triton's 1.7e-2."""
+    ~4.8e-2 from the exact block format vs our 2.8e-3 — looser than vLLM-triton's 1.7e-2."""
     E, I2, H = gu.shape
     I = I2 // 2
     packed = (idx.to(torch.int32) << 16) | (
@@ -1176,7 +1185,7 @@ def _impl(arm_name):
 
 def bench_attn_row(row, pname, cfg, rows_out):
     """One attn linear per model, in its deployment format (same weights across
-    impls; the finegrained-kernels arm's ``input_recipe`` follows the model — GPT-OSS runs W4A4)."""
+    impls; the finegrained-kernels arm's ``activation_format`` follows the model — GPT-OSS runs W4A4)."""
     print(f"== [{row}] {pname}")
     if MOCK:
         _mock_rows(row, pname, ("finegrained-kernels",) + cfg["baselines"], rows_out)
@@ -1199,9 +1208,9 @@ def bench_attn_row(row, pname, cfg, rows_out):
     dg_block = tuple(block) if block else None
     # deployment layout for the LOCAL arm only (every baseline reads the raw row-major scale):
     # dense attn weights ship pre-swizzled like the MoE arms, so the 2D op benches the tcgen05
-    # fast path (weight-only recipes stay affine — no swizzled read)
+    # fast path (weight-only formats stay affine — no swizzled read)
     Ws_fgm = Ws
-    if PRESWIZZLE and cfg["weights"] in _MX_WEIGHTS and _recipe(cfg) and N % 128 == 0:
+    if PRESWIZZLE and cfg["weights"] in _MX_WEIGHTS and _quantized_acts(cfg) and N % 128 == 0:
         Ws_fgm = fgm.swizzle_mx_scales(Ws)
     # OpenAI triton_kernels dense mxfp4 matmul (matmul_ogs, no routing): the qkv linear
     # in the GPT-OSS MXFP4 format. Weight is a single (1, K, N) expert, swizzled once
@@ -1224,7 +1233,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
     # Hopper-only, and RowWise is a different quantization granularity (measured ~20 relative) —
     # timing unlike work on a shared axis is worse than an absent bar.
     torch_mm = None
-    if cfg["weights"] in _MX_WEIGHTS and _recipe(cfg) and not (MOCK or REPLOT):
+    if cfg["weights"] in _MX_WEIGHTS and _quantized_acts(cfg) and not (MOCK or REPLOT):
         from torch.nn.functional import ScalingType, SwizzleType
         from torchao.prototype.mx_formats.utils import to_blocked
 
@@ -1260,12 +1269,12 @@ def bench_attn_row(row, pname, cfg, rows_out):
         print(f"   -- {regime}")
         torch.manual_seed(0)
         x = torch.randn(tokens, K, device=DEV, dtype=torch.bfloat16)
-        # act is inline-quantized (As=None); Ws is the weight scale (Bs). The recipe rides a
-        # Quantization (input_recipe = the activation precision); None follows the weight recipe.
-        _q = fgm.Quantization(input_recipe=_recipe(cfg)) if _recipe(cfg) else None
+        # act is inline-quantized (As=None); Ws is the weight scale (Bs); activation_format is the
+        # activation precision (None follows the weight format).
         attn_arms = {
             "finegrained-kernels": lambda: fgm.matmul_2d(
-                x, W, None, Ws_fgm, quantization=_q, output_dtype=torch.bfloat16, b_global_scale=W_g),
+                x, W, None, Ws_fgm, activation_format=_activation_format(cfg), output_dtype=torch.bfloat16,
+                b_global_scale=W_g),
         }
         if torch_mm is not None:
             attn_arms["torch_mm"] = lambda: torch_mm(x)
@@ -1395,9 +1404,9 @@ def _run_task(kind, pname, cfg, rows_out):
         # ... and same-family only: scaled_grouped_mm has no mixed-family form (the W4A8
         # mxfp4-weight x mxfp8-act row raises a contraction-dim mismatch on the packed rhs).
         torch_arm_t = ("torch",) if (
-            _recipe(cfg) is not None
+            _quantized_acts(cfg)
             and cfg["weights"] in _MX_WEIGHTS
-            and cfg["recipe"] == "weights"
+            and cfg["activation_format"] is None
         ) else ()
         # the status quo an fgm integration replaces: transformers@main on this checkpoint, via its
         # finegrained_fp8 experts dispatch. It belongs on the UNFUSED row — it applies the GLU in
@@ -1411,7 +1420,7 @@ def _run_task(kind, pname, cfg, rows_out):
         # MXFP4/MXFP8 checkpoints work, not just block-scale FP8. It cannot express bf16
         # activations (W4A16) — it always quantizes — and feeding it those faults the CUDA context.
         tfm_arm_t = (("transformers@main",)
-                     if "finegrained-fp8" in cfg["baselines"] and _recipe(cfg) is not None else ())
+                     if "finegrained-fp8" in cfg["baselines"] and _quantized_acts(cfg) else ())
         # nvfp4-gemm is NOT enlisted on the MoE rows. That integration has no MoE kernel, so the
         # only way to run it here is a dense GEMM per expert — 8.8ms against our 47us, which is a
         # statement about the missing kernel rather than a comparison of kernels, and one bar that

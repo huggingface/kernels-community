@@ -12,15 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import triton
 import triton.language as tl
-
-
-from .compat import *  # noqa: F401,F403
-from .recipes import *  # noqa: F401,F403
-from .swizzle import *  # noqa: F401,F403
-
 
 
 @triton.jit
@@ -41,7 +34,6 @@ def build_tile_layout(
     )  # first tile index of expert e
     total_m_tiles = tl.sum(tiles_per_e, 0)
     return exp_start, freqs, tile_start_excl, total_m_tiles, e_offs
-
 
 
 @triton.jit

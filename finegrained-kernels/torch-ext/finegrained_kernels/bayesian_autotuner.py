@@ -237,7 +237,7 @@ class BayesianAutotuner(Autotuner):
         live in the memo FILE's key, not here.
 
         ``meta`` carries the launch kwargs: every constexpr is kwarg-passed at the call
-        sites, so ``self.nargs`` (positional-only) alone would hash GATE/recipe flags as
+        sites, so ``self.nargs`` (positional-only) alone would hash GATE/format flags as
         None and collide memo entries across arms."""
         nargs = {**(getattr(self, "nargs", None) or {}), **(meta or {})}
         if not nargs:
@@ -821,9 +821,6 @@ class BayesianAutotuner(Autotuner):
             if load_crown():  # another rank tuned this key while we waited
                 return True
             bench_fn()
-            tuned_configs.record(
-                fn.__name__, tuning_key, self.cache[tuning_key].all_kwargs()
-            )
             # publish INSIDE the lock: a rank released to an empty cache would tune again
             try:
                 cache.put(

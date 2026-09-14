@@ -112,7 +112,7 @@ def make_weights(
     draw fp32 weights, take a per-block ``amax``, derive an inv-scale (optionally a
     UE8M0 power-of-2), scale the weights into the target grid's range, and quantize.
     ``weight_dtype`` is the stored element type — the same axis the kernel ``matmul``
-    dispatcher routes on (``B.dtype``), not the recipe label.
+    dispatcher routes on (``B.dtype``), not the format label.
 
     ``num_experts`` toggles 2D (linear) vs 3D (MoE experts); non-aligned dims are
     padded to block boundaries before quantizing, then trimmed back.
@@ -219,7 +219,7 @@ def quant_dequant_a(
     Static (scalar ``scale``): quantize the whole tensor against the given
     calibration scale. Dynamic (``scale=None``): per-row, per-``block_k`` scale =
     ``amax / 448``, snapped up to the next power of two when ``pow2_scale`` (UE8M0,
-    the MX recipe) else kept fp32; quantize to E4M3 and scale back.
+    the MX format) else kept fp32; quantize to E4M3 and scale back.
     """
     if scale is not None:
         A_fp8 = (A.float() / scale).to(FP8_DTYPE)
@@ -233,10 +233,10 @@ def quant_dequant_a(
     return (A_fp8.float() * s).reshape(M, K)
 
 
-# ── shared weight-recipe registry (test_ops scenarios + test_moe fused problems) ──
+# ── shared weight-format registry (test_ops scenarios + test_moe fused problems) ──
 #
 # One row per support-matrix line: make(N, K, E) -> (B, Bs); dequant(B, Bs) -> fp32
-# (E, N, K); act_quant[recipe] -> the host quant fn the ops themselves call (None = the
+# (E, N, K); act_quant[activation_format] -> the host quant fn the ops themselves call (None = the
 # family default applied to a raw A); dq_act dequantizes its output for the torch oracle.
 
 from finegrained_kernels.quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant, nvfp4_quantize_two_level  # type: ignore  # noqa: E402
@@ -324,18 +324,18 @@ def _make_mx(weight_dtype, scale_dtype):
     return make
 
 
-# "weights" follows the weight family, so MXFP8 and MXFP4 rows resolve it differently
-_MX8_ACT = {"weights": mxfp8_act_quant, "mxfp8": mxfp8_act_quant, "mxfp4": mxfp4_act_quant}
-_MX4_ACT = {"weights": mxfp4_act_quant, "mxfp8": mxfp8_act_quant, "mxfp4": mxfp4_act_quant}
+# None follows the weight family, so MXFP8 and MXFP4 rows resolve it differently
+_MX8_ACT = {None: mxfp8_act_quant, "mxfp8": mxfp8_act_quant, "mxfp4": mxfp4_act_quant}
+_MX4_ACT = {None: mxfp4_act_quant, "mxfp8": mxfp8_act_quant, "mxfp4": mxfp4_act_quant}
 
 WEIGHTS = {
     "fp8_128x128": dict(
         make=lambda N, K, E: (*make_weights(N, K, TEST_DEVICE, [128, 128], num_experts=E), None),
         dequant=lambda B, Bs, g=None: dq_block_fp8(B, Bs, 128, 128),
-        input_recipes=("weights", "fp8"),
-        output_recipes=(None, "fp8"),
+        activation_formats=("fp8",),
+        requant_formats=("fp8",),
         act_quant={
-            "weights": lambda A: fp8_act_quant_block_dynamic(A, 128),
+            None: lambda A: fp8_act_quant_block_dynamic(A, 128),
             "fp8": lambda A: fp8_act_quant_block_dynamic(A, 128),
         },
         dq_act=lambda q, s: q.float() * torch.repeat_interleave(s.float(), 128, dim=-1),
@@ -347,10 +347,10 @@ WEIGHTS = {
             N, K, TEST_DEVICE, [128, 128], scale_dtype=torch.float8_e8m0fnu, num_experts=E
         ), None),
         dequant=lambda B, Bs, g=None: dq_block_fp8(B, Bs, 128, 128),
-        input_recipes=("weights", "fp8"),
-        output_recipes=(None, "fp8"),
+        activation_formats=("fp8",),
+        requant_formats=("fp8",),
         act_quant={
-            "weights": lambda A: fp8_act_quant_block_dynamic(A, 128, use_ue8m0=True),
+            None: lambda A: fp8_act_quant_block_dynamic(A, 128, use_ue8m0=True),
             "fp8": lambda A: fp8_act_quant_block_dynamic(A, 128, use_ue8m0=True),
         },
         dq_act=lambda q, s: q.float() * torch.repeat_interleave(dq_scale(s), 128, dim=-1),
@@ -360,10 +360,10 @@ WEIGHTS = {
             N, K, TEST_DEVICE, None, scale_layout="per_tensor_111", num_experts=E
         ), None),
         dequant=lambda B, Bs, g=None: B.float() * Bs.float().reshape(-1, 1, 1),
-        input_recipes=("weights", "fp8"),
-        output_recipes=(None,),
+        activation_formats=("fp8",),
+        requant_formats=(),
         act_quant={
-            "weights": lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
+            None: lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
             "fp8": lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
         },
         dq_act=lambda q, s: q.float() * s.float().reshape(-1, 1),
@@ -371,8 +371,8 @@ WEIGHTS = {
     "mxfp8": dict(
         make=_make_mx(torch.float8_e4m3fn, torch.float8_e8m0fnu),
         dequant=lambda B, Bs, g=None: dq_grouped(B, Bs, MX_SCALE_GROUP_K),
-        input_recipes=("weights", "mxfp8", "mxfp4"),
-        output_recipes=(None, "mxfp8", "mxfp4"),
+        activation_formats=("mxfp8", "mxfp4"),
+        requant_formats=("mxfp8", "mxfp4"),
         act_quant=_MX8_ACT,
         dq_act=lambda q, s: dq_grouped(q, s, MX_SCALE_GROUP_K),
     ),
@@ -381,49 +381,49 @@ WEIGHTS = {
     "mxfp8_u8": dict(
         make=_make_mx(torch.float8_e4m3fn, torch.uint8),
         dequant=lambda B, Bs, g=None: dq_grouped(B, Bs, MX_SCALE_GROUP_K),
-        input_recipes=("weights",),
-        output_recipes=(None, "mxfp8"),
+        activation_formats=(),
+        requant_formats=("mxfp8",),
         act_quant=_MX8_ACT,
         dq_act=lambda q, s: dq_grouped(q, s, MX_SCALE_GROUP_K),
     ),
     "mxfp4": dict(
         make=_make_mx(torch.int8, torch.float8_e8m0fnu),
         dequant=lambda B, Bs, g=None: dq_grouped(B, Bs, MX_SCALE_GROUP_K),
-        input_recipes=("weights", "mxfp8", "mxfp4"),
-        output_recipes=(None, "mxfp8", "mxfp4"),
+        activation_formats=("mxfp8", "mxfp4"),
+        requant_formats=("mxfp8", "mxfp4"),
         act_quant=_MX4_ACT,
         dq_act=lambda q, s: dq_grouped(q, s, MX_SCALE_GROUP_K),
     ),
-    # NVFP4 is ALWAYS two-level (the canonical recipe): make returns the block scale and the
+    # NVFP4 is ALWAYS two-level (the canonical format): make returns the block scale and the
     # per-expert global separately; activations here are single-level (g_a = 1 — the
     # calibrated-g_a arm is covered by test_ops' act-global scenarios).
     "nvfp4": dict(
         make=_make_nvfp4,
         dequant=dq_nvfp4_two_level,
-        input_recipes=("weights", "nvfp4"),
-        output_recipes=(None, "nvfp4"),
-        act_quant={"weights": nvfp4_act_quant, "nvfp4": nvfp4_act_quant},
+        activation_formats=("nvfp4",),
+        requant_formats=("nvfp4",),
+        act_quant={None: nvfp4_act_quant, "nvfp4": nvfp4_act_quant},
         dq_act=lambda q, s: dq_grouped(q, s, NVFP4_SCALE_GROUP_K),
     ),
     "bf16": dict(
         make=_make_full(torch.bfloat16),
         dequant=lambda B, Bs, g=None: B.float(),
-        input_recipes=("weights",),
-        output_recipes=(None,),
-        act_quant={"weights": None},
+        activation_formats=(),
+        requant_formats=(),
+        act_quant={None: None},
         dq_act=None,
     ),
     "fp16": dict(
         make=_make_full(torch.float16),
         dequant=lambda B, Bs, g=None: B.float(),
-        input_recipes=("weights",),
-        output_recipes=(None,),
-        act_quant={"weights": None},
+        activation_formats=(),
+        requant_formats=(),
+        act_quant={None: None},
         dq_act=None,
     ),
 }
 
-# quant fns for requant-output verification, by output recipe name
+# quant fns for requant-output verification, by activation format name
 REQUANT_FN = {
     "fp8": None,  # per-(row, N-block) scale — verified via dequant closeness only
     "mxfp8": mxfp8_act_quant,
@@ -456,7 +456,7 @@ def _scale_to_fp32(s: torch.Tensor) -> torch.Tensor:
 def dequantize_weight(
     B: torch.Tensor, Bs: torch.Tensor, *, global_scale: torch.Tensor | None = None
 ) -> torch.Tensor:
-    """A quantized weight back to fp32, for any recipe the ops accept: E4M3 or packed-E2M1
+    """A quantized weight back to fp32, for any format the ops accept: E4M3 or packed-E2M1
     values, per-tensor / block / per-row-group scales, with the optional NVFP4 second-level
     global folded in. Host-side torch — the correctness path, not the fast one."""
     if B.dtype == torch.int8:  # packed E2M1: two codes per byte along K

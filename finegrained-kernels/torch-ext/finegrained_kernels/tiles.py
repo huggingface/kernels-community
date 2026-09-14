@@ -12,20 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import triton
 import triton.language as tl
 
-
-from .compat import *  # noqa: F401,F403
-from .recipes import *  # noqa: F401,F403
-from .swizzle import *  # noqa: F401,F403
-from .tile_layout import *  # noqa: F401,F403
-from .quant import *  # noqa: F401,F403
-from .scales import *  # noqa: F401,F403
-from .mma import *  # noqa: F401,F403
-from .scheduling import *  # noqa: F401,F403
-
+from .scales import load_block_fp8_act_tile, load_mx_act_tile, load_swizzled_scale, load_swizzled_scale_tile, load_weight_scale_tile
 
 # A-sub-tile byte budget for the 1-byte-activation grouped-swizzle depth cap (see
 # swizzle_offsets): the co-scheduled rows' A tile per K-step (depth*BM*BK bytes) must stay
@@ -217,7 +207,7 @@ def load_act_mx(
     as_descriptor, as_ptr, gather_rows, stride_as_m, pid_m, k, M, K,
     A_MEMORY_MODE: tl.constexpr, A_GATHER: tl.constexpr, GROUPED: tl.constexpr,
     SWIZZLED_SCALES: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    SCALE_GROUP_K: tl.constexpr, INPUT_RECIPE: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr, ACTIVATION_FORMAT: tl.constexpr,
 ):
     """MX activation tile + scale. Offline-quantized A under a swizzled weight -> pre-swizzled
     SWIZZLE_32_4_4 scale (tcgen05 fast path); grouped -> gathered per-(row, K-group) affine scale off
@@ -248,7 +238,7 @@ def load_act_mx(
         a, a_s = load_mx_act_tile(
             a_ptrs, as_ptrs, as_global, scale_mask, a_descriptor, m_off, k_off, 0,
             BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, A_MEMORY_MODE,
-            RECIPE=INPUT_RECIPE,
+            FORMAT=ACTIVATION_FORMAT,
         )
     return a, a_s
 
@@ -417,9 +407,9 @@ def _weight_value(
     GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr,
     SWAP_AB: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, KB: tl.constexpr,
 ):
-    """Recipe-agnostic weight value tile: the per-expert 3D box (GROUPED) or the plain swap-aware
-    tile. Shared by every ``load_weight_<recipe>`` — the value load never depends on the scale
-    recipe. A 2D gate|up weight takes the PLAIN arm: its rows are interleaved, so the tile is a
+    """Format-agnostic weight value tile: the per-expert 3D box (GROUPED) or the plain swap-aware
+    tile. Shared by every ``load_weight_<format>`` — the value load never depends on the scale
+    format. A 2D gate|up weight takes the PLAIN arm: its rows are interleaved, so the tile is a
     contiguous ``2*BN`` span of a 2D ``(2N, K)`` tensor and needs no 3D box — routing it through
     the grouped loader issued a 3-offset load against a 2D descriptor ("expected 2 offsets, but
     got 3"), unreachable only while gate was fenced to pointer mode. Single-exit if/else (an early

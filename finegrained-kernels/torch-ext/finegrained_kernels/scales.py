@@ -12,17 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import triton
 import triton.language as tl
 
-
-from .compat import *  # noqa: F401,F403
-from .recipes import *  # noqa: F401,F403
-from .swizzle import *  # noqa: F401,F403
-from .tile_layout import *  # noqa: F401,F403
-from .quant import *  # noqa: F401,F403
-
+from .quant import fp8_act_quant_inline, mx_act_quant_inline
 
 
 @triton.jit
@@ -64,7 +57,6 @@ def load_block_fp8_act_tile(
     return a, a_s
 
 
-
 @triton.jit
 def load_swizzled_scale(
     desc, blk_idx, k_idx,
@@ -76,7 +68,6 @@ def load_swizzled_scale(
     Descriptor is over the swizzled scale viewed ``(1, rows//128, cols//4, 2, 256)``."""
     s = desc.load([0, blk_idx * REP, k_idx * REP_K, 0, 0])
     return s.reshape(REP, REP_K, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK, SCALE_COLS)
-
 
 
 @triton.jit
@@ -134,7 +125,6 @@ def load_swizzled_scale_tile(
     return tl.load(ptr + off)
 
 
-
 @triton.jit
 def load_weight_scale_tile(
     SWIZZLED_SCALES: tl.constexpr,
@@ -190,7 +180,6 @@ def load_weight_scale_tile(
     return b_s
 
 
-
 @triton.jit
 def load_mx_act_tile(
     a_ptrs,
@@ -206,14 +195,14 @@ def load_mx_act_tile(
     SCALE_GROUP_K: tl.constexpr,
     A_MEMORY_MODE: tl.constexpr = "pointer",
     A_GATHER: tl.constexpr = False,
-    RECIPE: tl.constexpr = "mxfp8",
+    FORMAT: tl.constexpr = "mxfp8",
 ):
     """Load one MX activation K-tile as ``(a_vals, a_scale)`` — the arm is picked
     off the pointer dtype at compile time: fp8 pointers load pre-quantized E4M3 values +
     UE8M0 scales (``maybe_act_quant``'s offline arm), uint8 pointers load caller-provided
     packed-E2M1 values (W4A4 — the ``a_ptrs`` tile spans ``BLOCK_SIZE_K // 2`` bytes) +
     the same UE8M0 scales, raw bf16/fp16 pointers load and quantize inline onto
-    ``RECIPE``'s grid (``mx_act_quant_inline`` — packed E2M1 under the fp4 recipes;
+    ``FORMAT``'s grid (``mx_act_quant_inline`` — packed E2M1 under the fp4 formats;
     ``as_ptrs`` then points at a dead placeholder and is never read). Under NVFP4
     two-level, ``as_global`` (the calibrated activation global) normalizes the raw tile
     before the block quant — bit-identical to the offline ``nvfp4_act_quant(x,
@@ -265,10 +254,9 @@ def load_mx_act_tile(
         if as_global is not None:  # NVFP4 two-level: normalize by the calibrated act global
             a_raw = a_raw / tl.load(as_global).to(tl.float32)
         a, a_scale = mx_act_quant_inline(
-            a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, RECIPE
+            a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, FORMAT
         )
     return a, a_scale
-
 
 
 @triton.jit
@@ -298,7 +286,6 @@ def decode_group_scale(scale):
     elif scale.dtype == tl.float8e4nv:
         scale = scale.to(tl.float32)
     return scale
-
 
 
 @triton.jit

@@ -22,8 +22,7 @@ shipped.
 This is the durable layer: plain JSON under ``configs/``, keyed on what a deployment actually
 shares — the device and the tuner's own key — and read before the search runs. A hit skips the
 whole minutes-long tune; a miss falls through to tuning exactly as before, so a partial or absent
-config set is never a correctness or availability problem. Written by a tuning run
-(``FINEGRAINED_AUTOTUNE_EXPORT``) and collated by ``scripts/collect_tuned_configs.py``.
+config set is never a correctness or availability problem.
 
 Layout mirrors the kernel-builder convention (one file per kernel and GPU, device in the name so
 configs never cross devices)::
@@ -94,24 +93,3 @@ def lookup(fn_name: str, key) -> dict | None:
     except RuntimeError:  # no CUDA context (CPU-only import): nothing to look up
         return None
     return table.get(serialize_key(key))
-
-
-def record(fn_name: str, key, config_kwargs: dict) -> None:
-    """Append one crown to the export log named by ``FINEGRAINED_AUTOTUNE_EXPORT`` (no-op when
-    unset). One JSON object per line, opened per call in append mode: a tuning sweep fans out
-    over several processes (one per GPU), and short ``O_APPEND`` writes do not interleave.
-    ``scripts/collect_tuned_configs.py`` collates the log into ``configs/``."""
-    path = os.environ.get("FINEGRAINED_AUTOTUNE_EXPORT")
-    if not path:
-        return
-    record = {
-        "fn": fn_name,
-        "device": device_name(),
-        "key": list(key),
-        "config": {k: v for k, v in config_kwargs.items() if v is not None},
-    }
-    try:
-        with open(path, "a") as f:
-            f.write(json.dumps(record) + "\n")
-    except OSError:
-        pass  # exporting is best-effort; never fail a tune over the log

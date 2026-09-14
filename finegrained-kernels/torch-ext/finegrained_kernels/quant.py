@@ -12,22 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
-
 from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
-
-from .compat import *  # noqa: F401,F403
-from .recipes import *  # noqa: F401,F403
-from .swizzle import *  # noqa: F401,F403
-from .tile_layout import *  # noqa: F401,F403
-
-
+from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_op, compile_time_only_triton_wrap, decode_pdl, device_context, is_sm10x
+from .swizzle import swizzle_store_block
+from .tile_layout import build_tile_layout, resolve_tile_inline
 
 # ── Triton-side helpers (inlined by ``@triton.jit`` callers) ──────────────────
 
@@ -67,12 +61,10 @@ def fp8_act_quant_inline(
     return a_fp8, a_scale
 
 
-
 # cvt.e2m1x2.f32 (hardware FP4 pack) exists only on sm_100 (Blackwell). Resolved once at
 # import as a compile-time constexpr for the jit helper below; the ALU fallback compiles
 # everywhere else. ``is_sm10x`` is driverless-safe, so no import-time guard is needed.
 _E2M1_HW_CVT = tl.constexpr(is_sm10x())
-
 
 
 @triton.jit
@@ -110,18 +102,17 @@ def _quant_e2m1_packed(v, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr
     return values
 
 
-
 @triton.jit
 def mx_act_quant_inline(
     a_raw,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
-    RECIPE: tl.constexpr = "mxfp8",
+    FORMAT: tl.constexpr = "mxfp8",
 ):
     """Inline MX activation quant, one helper for both value grids. Per-row, per-K-group
     amax → UE8M0 scale (ceil to the next power of two via the exponent-bump trick, the
-    divisor being the grid's largest magnitude) → values onto the recipe's grid:
+    divisor being the grid's largest magnitude) → values onto the format's grid:
 
     - ``"mxfp8"``: cast to E4M3 — returns ``((M, K) fp8, (M, K // SCALE_GROUP_K) uint8)``.
     - ``"mxfp4"``: round to E2M1 and pack nibble pairs (``_quant_e2m1_packed`` — hardware
@@ -130,19 +121,19 @@ def mx_act_quant_inline(
     - ``"nvfp4"``: E4M3 scale (amax/6, not a power of two), values divide by the DECODED
       scale before the E2M1 grid — returns ``((M, K//2) uint8, (M, K // SCALE_GROUP_K) E4M3)``.
 
-    Only the taken recipe arm compiles."""
+    Only the taken format arm compiles."""
     a_groups = tl.reshape(
         a_raw, (BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_K, SCALE_GROUP_K)
     )
     amax = tl.max(tl.abs(a_groups), axis=2)
-    if RECIPE == "nvfp4":
+    if FORMAT == "nvfp4":
         # E4M3 scale (amax/6 rounded to E4M3, NOT a power of two); values divide by the
         # DECODED scale before hitting the E2M1 grid — the standard NVFP4 two-step
         scales = (amax / 6.0).to(tl.float8e4nv)
         decoded = tl.maximum(scales.to(tl.float32), 1.1754944e-38)
         v = tl.reshape(a_groups / decoded[:, :, None], (BLOCK_SIZE_M, BLOCK_SIZE_K))
         values = _quant_e2m1_packed(v, BLOCK_SIZE_M, BLOCK_SIZE_K)
-    elif RECIPE == "mxfp4":
+    elif FORMAT == "mxfp4":
         bits = (amax / 6.0).to(tl.int32, bitcast=True)
         # ceil_to_ue8m0: bump exponent by 1 when mantissa is non-zero.
         exp_ceil = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
@@ -166,7 +157,6 @@ def mx_act_quant_inline(
     return values, scales
 
 
-
 @triton.jit
 def _e2m1_code_to_e4m3_bits(code):
     """One E2M1 4-bit code -> the E4M3 byte holding the same value, in pure integer
@@ -178,7 +168,6 @@ def _e2m1_code_to_e4m3_bits(code):
     mag = code & 7
     bits = tl.where(mag == 0, 0, tl.where(mag == 1, 0x30, (mag + 12) << 2))
     return bits | ((code >> 3) << 7)
-
 
 
 @triton.jit
@@ -312,7 +301,6 @@ def e2m1_cols_to_e4m3(packed):
     return bits.to(tl.uint8).to(tl.float8e4nv, bitcast=True)
 
 
-
 @triton.jit
 def e2m1_to_f32(b_packed):
     """Row-doubling counterpart of ``e2m1_cols_to_f32``: ``(R, C) uint8 -> (2R, C)`` fp32, for the
@@ -349,7 +337,6 @@ def e2m1_to_e4m3(b_packed):
     return unpacked.to(tl.uint8).to(tl.float8e4nv, bitcast=True)
 
 
-
 def _quant_block_k_pruner(configs, named_args, **kwargs):
     """Keep configs whose BLOCK_K divides K (the quant grid is K // BLOCK_K programs per row;
     K is always a multiple of 32, so the BLOCK_K=32 configs guarantee a non-empty list). On the
@@ -370,7 +357,6 @@ def _quant_block_k_pruner(configs, named_args, **kwargs):
         and c.kwargs["BLOCK_K"] % (4 * g) == 0
         and (not grouped or c.kwargs["BLOCK_T"] == 128)
     ]
-
 
 
 @triton.jit
@@ -435,10 +421,10 @@ def store_mx_act_scales(
     # t_bucket (log2 of the token count) is in the key: at small T the tile is the only
     # parallelism lever while at prefill scale it isn't — same bucketing as the grouped
     # kernels (raw T would retune per unique token count). SWIZZLED keys the swizzled-scale
-    # store separately (a disjoint config basin). RECIPE keys the value dtype/packing (E4M3 vs
+    # store separately (a disjoint config basin). FORMAT keys the value dtype/packing (E4M3 vs
     # packed E2M1, and SCALE_GROUP_K 32 vs 16) — a dtype-blind key hands packed MXFP4 the E4M3
     # config and mistunes it.
-    ["K", "t_bucket", "SWIZZLED", "RECIPE"],
+    ["K", "t_bucket", "SWIZZLED", "FORMAT"],
     n_trials=100,
     prune_configs_by={"early_config_prune": _quant_block_k_pruner},
 )
@@ -459,7 +445,7 @@ def _mx_act_quant_kernel(
     SCALE_GROUP_K: tl.constexpr,
     # dynamo's triton wrapper appends the tuner's config kwargs after the call kwargs
     # and requires signature order — the tuned axes stay LAST
-    RECIPE: tl.constexpr = "mxfp8",
+    FORMAT: tl.constexpr = "mxfp8",
     SWIZZLED: tl.constexpr = False,
     GROUPED: tl.constexpr = True,  # SWIZZLED grid: expert-sorted tiles (True) vs plain dense (False)
     NUM_EXPERTS_POW2: tl.constexpr = 1,  # always passed explicitly; see the dense launch
@@ -467,7 +453,7 @@ def _mx_act_quant_kernel(
     BLOCK_T: tl.constexpr = 32,
     PDL: tl.constexpr = False,
 ):
-    """One-pass activation quant, one launch per recipe (``mx_act_quant_inline`` does
+    """One-pass activation quant, one launch per format (``mx_act_quant_inline`` does
     the math, so the offline and inline forms are bit-identical by construction): E4M3 +
     UE8M0 ("mxfp8"), packed E2M1 + UE8M0 ("mxfp4"), or packed E2M1 + E4M3 group-16
     ("nvfp4"). Group boundaries are identical across forms (SCALE_GROUP_K | BLOCK_K | K).
@@ -475,7 +461,7 @@ def _mx_act_quant_kernel(
 
     Plain path (``SWIZZLED=False``): grid ``(cdiv(T, BLOCK_T), K // BLOCK_K)`` — each program
     quantizes a ``[BLOCK_T, BLOCK_K]`` tile and writes ``S`` row-major (the one-row-per-program
-    form starved memory at 1.5-1.8 TB/s on the packed recipes; the row tile coalesces).
+    form starved memory at 1.5-1.8 TB/s on the packed formats; the row tile coalesces).
 
     Swizzled grouped path (``SWIZZLED=True``, BLOCK_T pinned 128): grid ``(n_m_tiles,
     K // BLOCK_K)`` over the expert-sorted, 128-padded tile layout (``build_tile_layout``). Each
@@ -522,8 +508,8 @@ def _mx_act_quant_kernel(
         # quant — block scales are then amax/6 of x/g (the canonical two-step); the GEMM
         # folds g back onto the accumulator (g_a·g_b). None folds the arm out at trace time.
         x = x / tl.load(GlobalScale).to(tl.float32)
-    y, s = mx_act_quant_inline(x, BLOCK_T, BLOCK_K, SCALE_GROUP_K, RECIPE)
-    width: tl.constexpr = BLOCK_K // 2 if RECIPE != "mxfp8" else BLOCK_K
+    y, s = mx_act_quant_inline(x, BLOCK_T, BLOCK_K, SCALE_GROUP_K, FORMAT)
+    width: tl.constexpr = BLOCK_K // 2 if FORMAT != "mxfp8" else BLOCK_K
     y_row: tl.constexpr = K // (BLOCK_K // width)  # per-row element count of Y
     yo = kb * width + tl.arange(0, width)
     # values -> source row order (the swizzled grid scatters via the gathered in_row)
@@ -541,10 +527,9 @@ def _mx_act_quant_kernel(
         )
 
 
-
 def mx_act_quant_swizzled_grouped(
     x: torch.Tensor,
-    recipe: str,
+    activation_format: str,
     scale_group: int,
     scale_dtype: torch.dtype,
     gather_idx: torch.Tensor | None,
@@ -553,7 +538,7 @@ def mx_act_quant_swizzled_grouped(
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Offline MX act-quant for a grouped GEMM that emits SWIZZLE_32_4_4 scales directly (the
     ``SWIZZLED`` arm of ``_mx_act_quant_kernel``). Returns ``(values, swizzled_scale,
-    num_m_tiles)`` — the values in source order (E4M3, or packed E2M1 uint8 for the fp4 recipes)
+    num_m_tiles)`` — the values in source order (E4M3, or packed E2M1 uint8 for the fp4 formats)
     and the scales as the ``(1, num_m_tiles, cb, 2, 256)`` swizzled tensor (the caller builds the
     GEMM's scale descriptor from it, like every other operand). Only the ``expert_start[-1]``
     scheduled rows are laid out; expert padding is per 128 (the ``BLOCK_T`` pin).
@@ -566,7 +551,7 @@ def mx_act_quant_swizzled_grouped(
     E = expert_start.numel() - 1
     S = gather_idx.numel() if gather_idx is not None else T
     n_m_tiles = S // 128 + E
-    packed = recipe != "mxfp8"
+    packed = activation_format != "mxfp8"
     y = torch.empty(
         T, K // 2 if packed else K, device=x.device, dtype=torch.uint8 if packed else FP8_DTYPE
     )
@@ -589,7 +574,7 @@ def mx_act_quant_swizzled_grouped(
             T.bit_length(),
             K=K,
             SCALE_GROUP_K=scale_group,
-            RECIPE=recipe,
+            FORMAT=activation_format,
             SWIZZLED=True,
             GROUPED=True,
             NUM_EXPERTS_POW2=E,
@@ -597,7 +582,6 @@ def mx_act_quant_swizzled_grouped(
             launch_pdl=decode_pdl(),
         )
     return y, s_sw, n_m_tiles
-
 
 
 @triton.jit
@@ -637,7 +621,6 @@ def _swizzle_grouped_scales_kernel(
     swizzle_store_block(DST, s, pid_m, cb, NCB)
 
 
-
 def swizzle_grouped_mx_scales(
     scale: torch.Tensor,
     expert_start: torch.Tensor,
@@ -674,7 +657,6 @@ def swizzle_grouped_mx_scales(
     return out.view(scale.dtype), n_m_tiles
 
 
-
 def maybe_act_quant(x, act_quant, min_m):
     """Row-count-gated offline activation pre-quant. Apply ``act_quant`` (a one-pass
     quant kernel, e.g. ``mxfp8_act_quant``) when the GEMM consuming ``x`` is
@@ -693,7 +675,6 @@ def maybe_act_quant(x, act_quant, min_m):
     return x, x
 
 
-
 def mxfp8_act_quant(x: torch.Tensor, swizzled: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to MX once (E4M3 values + UE8M0 group-32 uint8 scales)
     instead of inline per weight-tile — the fused gate_up re-ran the inline quant per N-tile
@@ -702,7 +683,6 @@ def mxfp8_act_quant(x: torch.Tensor, swizzled: bool = False) -> tuple[torch.Tens
     the inline form (same group boundaries). ``swizzled=True`` emits the scale directly in
     SWIZZLE_32_4_4 for the tcgen05 fast path (same dense grid, per-element store)."""
     return _launch_act_quant(x, "mxfp8", MX_SCALE_GROUP_K, torch.uint8, swizzled)
-
 
 
 def mxfp4_act_quant(x: torch.Tensor, swizzled: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
@@ -716,7 +696,6 @@ def mxfp4_act_quant(x: torch.Tensor, swizzled: bool = False) -> tuple[torch.Tens
     return _launch_act_quant(x, "mxfp4", MX_SCALE_GROUP_K, torch.uint8, swizzled)
 
 
-
 def nvfp4_act_quant(
     x: torch.Tensor, swizzled: bool = False, global_scale: torch.Tensor | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -726,14 +705,13 @@ def nvfp4_act_quant(
     the standard two-step). ``global_scale`` is the CALIBRATED per-tensor second level
     (``(1,)`` fp32, the checkpoint's ``input_scale``): values are normalized by it before
     the block quant, so block scales stay in e4m3 range regardless of the activation's
-    dynamic range — the canonical two-level recipe. The GEMM folds ``g_a·g_b`` back onto
+    dynamic range — the canonical two-level format. The GEMM folds ``g_a·g_b`` back onto
     the accumulator (pass ``As=scales`` with ``a_global_scale=global_scale``). ``None`` = single-level
     (``g_a = 1``). ``swizzled=True`` emits the scale directly in SWIZZLE_32_4_4 for the
     tcgen05 fast path."""
     return _launch_act_quant(
         x, "nvfp4", NVFP4_SCALE_GROUP_K, torch.float8_e4m3fn, swizzled, global_scale
     )
-
 
 
 def nvfp4_quantize_two_level(
@@ -757,8 +735,7 @@ def nvfp4_quantize_two_level(
     return packed.view(torch.int8), block, global_scale.reshape(1)
 
 
-
-# offline act-quant pass per recipe (keys = ``resolve_input_recipe`` results)
+# offline act-quant pass per activation format (keys = ``resolve_activation_format`` results)
 MX_ACT_QUANT = {
     "mxfp8": mxfp8_act_quant,
     "mxfp4": mxfp4_act_quant,
@@ -766,16 +743,15 @@ MX_ACT_QUANT = {
 }
 
 
-
-def _launch_act_quant(x, recipe, scale_group, scale_dtype, swizzled=False, global_scale=None):
-    """One-pass activation quant for every recipe (``mxfp8`` = E4M3 values, else packed E2M1) and
+def _launch_act_quant(x, activation_format, scale_group, scale_dtype, swizzled=False, global_scale=None):
+    """One-pass activation quant for every format (``mxfp8`` = E4M3 values, else packed E2M1) and
     both scale layouts. ``swizzled=True`` writes the scale straight into the SWIZZLE_32_4_4 buffer
     ``(1, cdiv(T, 128), cb, 2, 256)`` (per-element ptr store, dense autotuned ``BLOCK_T`` — same grid
     as the affine path, just the store address flips); ``swizzled=False`` writes row-major
     ``(T, K // scale_group)``. ``global_scale`` (NVFP4 two-level, ``(1,)`` fp32) normalizes the
     values before the block quant. Returns ``(values, scales)``."""
     T, K = x.shape
-    packed = recipe != "mxfp8"
+    packed = activation_format != "mxfp8"
     if packed:
         assert K % (2 * scale_group) == 0, (
             f"K (={K}) must be a multiple of {2 * scale_group} to pack E2M1 pairs"
@@ -808,7 +784,7 @@ def _launch_act_quant(x, recipe, scale_group, scale_dtype, swizzled=False, globa
             T.bit_length(),
             K=K,
             SCALE_GROUP_K=scale_group,
-            RECIPE=recipe,
+            FORMAT=activation_format,
             SWIZZLED=swizzled,
             GROUPED=False,
             # explicit even though the dense grid never reads it: inductor's wrap_triton path
@@ -819,7 +795,6 @@ def _launch_act_quant(x, recipe, scale_group, scale_dtype, swizzled=False, globa
             launch_pdl=decode_pdl(),
         )
     return (values.view(torch.int8) if packed else values), scales
-
 
 
 @bayesian_autotune(
@@ -873,7 +848,6 @@ def _fp8_act_quant_block_dynamic_kernel(
     tl.store(S + rows * (K // BLOCK_K) + kb, s, mask=row_mask)
 
 
-
 def fp8_act_quant_block_dynamic(
     x: torch.Tensor, block_k: int, use_ue8m0: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -881,7 +855,7 @@ def fp8_act_quant_block_dynamic(
     instead of inline per weight-tile — same rationale and layout as ``mxfp8_act_quant`` (a
     GEMM re-reads its activation once per N-tile). Bit-exact with the inline form. Scales are
     fp32 (``amax/448``) or, under ``use_ue8m0``, UE8M0 exponent bytes (power-of-two scales)
-    for the tcgen05 ``dot_scaled`` path — the DeepGEMM-Blackwell recipe."""
+    for the tcgen05 ``dot_scaled`` path — the DeepGEMM-Blackwell format."""
     T, K = x.shape
     y = torch.empty(T, K, device=x.device, dtype=FP8_DTYPE)
     s_dtype = torch.uint8 if use_ue8m0 else torch.float32
@@ -898,7 +872,6 @@ def fp8_act_quant_block_dynamic(
             launch_pdl=decode_pdl(),
         )
     return y, s
-
 
 
 # ── fp8_act_quant_tensor_wide kernel (used by tensor-mode FP8 wrappers) ───────────────────
@@ -925,7 +898,6 @@ def _fp8_act_quant_kernel(
     if PDL:
         gdc_launch_dependents()
     tl.store(s_ptr + pid, s)
-
 
 
 @compile_time_only_triton_op(

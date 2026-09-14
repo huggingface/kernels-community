@@ -11,19 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Op-level scenario tests: the (weight recipe x epilogue x input/output recipe)
+"""Op-level scenario tests: the (weight format x epilogue x input/output format)
 support matrix of ``matmul_grouped`` / ``matmul_batched`` / ``matmul_2d``, each cell checked
 against an independent dequantize-and-matmul torch reference (``tests/utils.py``'s ``WEIGHTS``
 registry — shared with ``test_moe``'s fused-vs-unfused problems).
 
-The scenario list is GENERATED from the same support matrix the ``Quantization``
-docstring documents — every weight recipe crosses its valid input and output recipes
-once, activation-function variants ride one recipe (the GLU math is recipe-independent),
+The scenario list is GENERATED from the same support matrix the ``check_activation_format``
+docstring documents — every weight format crosses its valid input and output formats
+once, activation-function variants ride one format (the GLU math is format-independent),
 and routing variants (sentinel, noncontiguous ids, empty expert, decode / native-M / launch-scale
-shapes, torch.compile) ride one recipe each. One ``Problem`` list feeds all three ops via the
+shapes, torch.compile) ride one format each. One ``Problem`` list feeds all three ops via the
 ``op`` axis (``test_op_scenarios``): the routed ops (``batched`` / ``grouped``) run
 every Problem; ``matmul`` — the single-GEMM sibling — runs each Problem it can represent (no
-expert routing, a quantized recipe it routes, requant on MX weights only), one weight matrix and
+expert routing, a quantized format it routes, requant on MX weights only), one weight matrix and
 no gather/scatter. Two orthogonal knobs ride the same list: ``static`` (per-tensor calibrated
 activation quant, all three ops) and ``swizzled`` (MX weight scales pre-swizzled into the 5D
 SWIZZLE_32_4_4 tcgen05 layout — a pure layout variant checked against the affine reference).
@@ -48,12 +48,7 @@ from utils import (  # type: ignore
 )
 
 import finegrained_kernels  # type: ignore
-from finegrained_kernels import (  # type: ignore
-    Epilogue,
-    Quantization,
-    swizzle_mx_scales,
-    unswizzle_mx_scales,
-)
+from finegrained_kernels import swizzle_mx_scales, unswizzle_mx_scales  # type: ignore
 from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore
 from finegrained_kernels.quant import nvfp4_act_quant  # type: ignore
 from finegrained_kernels.epilogue import apply_glu  # type: ignore
@@ -64,11 +59,11 @@ from finegrained_kernels.epilogue import apply_glu  # type: ignore
 
 @dataclass(frozen=True)
 class Problem:
-    """One op-level scenario: a weight recipe (a ``WEIGHTS`` registry row) plus the
-    transform and routing knobs the public ops expose. Validity of the recipe fields
+    """One op-level scenario: a weight format (a ``WEIGHTS`` registry row) plus the
+    transform and routing knobs the public ops expose. Validity of the format fields
     against the registry row is enforced at generation, not runtime."""
 
-    weight_recipe: str
+    weights: str
     S: int = 64
     E: int = 4
     N: int = 128
@@ -77,8 +72,8 @@ class Problem:
     act_fn: str = "silu"
     swiglu_alpha: float | None = None
     swiglu_limit: float | None = None
-    input_recipe: str | None = "weights"
-    output_recipe: str | None = None
+    activation_format: str | None = None
+    quantize_output: bool = False
     prequant: bool = False  # pass As explicitly (must be bit-identical to raw A)
     static: bool = False  # per-tensor calibrated activation scale (block-scale FP8 path)
     swizzled: bool = False  # pass MX weight scales pre-swizzled (5D SWIZZLE_32_4_4 fast path)
@@ -90,17 +85,17 @@ class Problem:
 
     @property
     def id(self):
-        tag = self.weight_recipe
+        tag = self.weights
         if self.gate:
             tag += f"_gate_{self.act_fn}"
             if self.swiglu_alpha is not None:
                 tag += "_alpha"
             if self.swiglu_limit is not None:
                 tag += "_limit"
-        if self.input_recipe != "weights":
-            tag += f"_in{self.input_recipe or 'bf16'}"
-        if self.output_recipe:
-            tag += f"_out{self.output_recipe}"
+        if self.quantize_output:
+            tag += f"_out{self.activation_format}"
+        elif self.activation_format is not None:
+            tag += f"_in{self.activation_format}"
         if self.prequant:
             tag += "_prequant"
         if self.static:
@@ -122,124 +117,124 @@ class Problem:
 
 def scenarios() -> list[Problem]:
     """The curated matrix. Coverage rules:
-    - every weight recipe: one plain GEMM cell;
-    - every valid (weight_recipe, output_recipe) pair: one gate cell (requant lives under gate);
-    - every non-default input recipe: one cell (the W4A4 chains);
+    - every weight format: one plain GEMM cell;
+    - every requant format of a weight family: one gate cell with ``quantize_output`` in that
+      activation format (requant lives under gate);
+    - every non-default activation format: one cell (the W4A4 chains);
     - one prequant mirror per quantized family (raw-vs-As bit-equality);
-    - GLU variants (gelu, swiglu alpha+limit) on one recipe — the math is recipe-blind;
+    - GLU variants (gelu, swiglu alpha+limit) on one format — the math is format-blind;
     - routing/launch variants (sentinel, noncontiguous, empty expert, decode shape,
-      launch-scale shape, torch.compile) one recipe each."""
+      launch-scale shape, torch.compile) one format each."""
     out: list[Problem] = []
     for w, row in WEIGHTS.items():
         if w == "fp16":
             # emitted explicitly below with fp16 activations (matching dtypes required)
             continue
-        out.append(Problem(weight_recipe=w))
-        for orecipe in row["output_recipes"]:
-            if orecipe is not None:
-                out.append(Problem(weight_recipe=w, gate=True, output_recipe=orecipe))
+        out.append(Problem(weights=w))
+        for fmt in row["requant_formats"]:
+            out.append(Problem(weights=w, gate=True, activation_format=fmt, quantize_output=True))
                 # swizzled-in -> swizzled-out: swizzled MX weights + requant emit a swizzled (5D
-                # SWIZZLE_32_4_4) Cs — the down's fast-path input. Recipe-general (nvfp4 group-16
+                # SWIZZLE_32_4_4) Cs — the down's fast-path input. Format-general (nvfp4 group-16
                 # differs only in column count). Reference un-swizzles the 5D Cs to the affine cell.
-                if w in ("mxfp8", "mxfp8_u8", "mxfp4", "nvfp4"):
-                    out.append(
-                        Problem(weight_recipe=w, gate=True, output_recipe=orecipe, swizzled=True)
-                    )
+            if w in ("mxfp8", "mxfp8_u8", "mxfp4", "nvfp4"):
+                out.append(
+                    Problem(weights=w, gate=True, activation_format=fmt, quantize_output=True, swizzled=True)
+                )
         default_in = {"fp8_128x128": "fp8", "fp8_tensor": "fp8"}.get(w)
-        for irecipe in row["input_recipes"]:
-            if irecipe != "weights" and irecipe != default_in:
-                out.append(Problem(weight_recipe=w, input_recipe=irecipe))
+        for fmt in row["activation_formats"]:
+            if fmt != default_in:
+                out.append(Problem(weights=w, activation_format=fmt))
     out += [
-        Problem(weight_recipe="fp16", dtype=torch.float16),
-        # gate WITHOUT requant (raw GLU intermediate) — one quantized + one full recipe
-        Problem(weight_recipe="mxfp8", gate=True),
-        Problem(weight_recipe="bf16", gate=True),
-        Problem(weight_recipe="mxfp8", gate=True, act_fn="gelu", output_recipe="mxfp8"),
+        Problem(weights="fp16", dtype=torch.float16),
+        # gate WITHOUT requant (raw GLU intermediate) — one quantized + one full format
+        Problem(weights="mxfp8", gate=True),
+        Problem(weights="bf16", gate=True),
+        Problem(weights="mxfp8", gate=True, act_fn="gelu", activation_format="mxfp8", quantize_output=True),
         Problem(
-            weight_recipe="mxfp8",
+            weights="mxfp8",
             gate=True,
             swiglu_alpha=1.702,
             swiglu_limit=7.0,
-            output_recipe="mxfp8",
+            activation_format="mxfp8", quantize_output=True,
         ),
-        Problem(weight_recipe="fp8_128x128", prequant=True),
-        Problem(weight_recipe="mxfp8", prequant=True),
-        Problem(weight_recipe="nvfp4", prequant=True),
-        Problem(weight_recipe="mxfp8", sentinel_fraction=0.25),
-        Problem(weight_recipe="mxfp8", noncontiguous=True),
-        Problem(weight_recipe="mxfp8", empty_expert=True),
+        Problem(weights="fp8_128x128", prequant=True),
+        Problem(weights="mxfp8", prequant=True),
+        Problem(weights="nvfp4", prequant=True),
+        Problem(weights="mxfp8", sentinel_fraction=0.25),
+        Problem(weights="mxfp8", noncontiguous=True),
+        Problem(weights="mxfp8", empty_expert=True),
         # decode shape (small M — inline act-quant on MX, the software/scalar arms elsewhere)
-        Problem(weight_recipe="mxfp8", S=8),
-        Problem(weight_recipe="nvfp4", S=8),
-        Problem(weight_recipe="fp8_128x128", S=8),
-        Problem(weight_recipe="fp8_128x128_ue8m0", S=8),
-        Problem(weight_recipe="mxfp4", S=8),
-        # native-M tile (BM>=128): the recipe matrix above rides sub-native S, so these carry the
+        Problem(weights="mxfp8", S=8),
+        Problem(weights="nvfp4", S=8),
+        Problem(weights="fp8_128x128", S=8),
+        Problem(weights="fp8_128x128_ue8m0", S=8),
+        Problem(weights="mxfp4", S=8),
+        # native-M tile (BM>=128): the format matrix above rides sub-native S, so these carry the
         # native-only compute arms — block-dynamic UE8M0 dot_scaled fold and the native mxfp/nvfp4
         # MMA (mxfp8's is covered by the S=2048 launch-scale case below).
-        Problem(weight_recipe="fp8_128x128_ue8m0", S=128),
-        Problem(weight_recipe="mxfp4", S=128),
-        Problem(weight_recipe="mxfp4", input_recipe="mxfp4", S=128),  # W4A4 native (packed acts)
-        Problem(weight_recipe="mxfp4", input_recipe=None, S=128),  # W4A16 prefill (TMA arm reachable)
+        Problem(weights="fp8_128x128_ue8m0", S=128),
+        Problem(weights="mxfp4", S=128),
+        Problem(weights="mxfp4", activation_format="mxfp4", S=128),  # W4A4 native (packed acts)
+        Problem(weights="mxfp4", activation_format="bf16", S=128),  # W4A16 prefill (TMA arm reachable)
         # W4A16 at prefill scale — enough tokens/expert for BM>=64, so the grouped WS+descriptor arm
         # (tma-gather A, no other=0.0) is reachable/tuned (the matmul_ogs-style fast path).
-        Problem(weight_recipe="mxfp4", input_recipe=None, S=2048, E=16, N=512, K=1024),
-        Problem(weight_recipe="mxfp8", input_recipe=None, S=128),  # W8A16 prefill
-        Problem(weight_recipe="mxfp4", input_recipe=None, S=8),  # W4A16 decode
-        Problem(weight_recipe="nvfp4", S=128),
+        Problem(weights="mxfp4", activation_format="bf16", S=2048, E=16, N=512, K=1024),
+        Problem(weights="mxfp8", activation_format="bf16", S=128),  # W8A16 prefill
+        Problem(weights="mxfp4", activation_format="bf16", S=8),  # W4A16 decode
+        Problem(weights="nvfp4", S=128),
         # swizzled MX weight scales (5D SWIZZLE_32_4_4 — the tcgen05 fast path): the same values in
         # the swizzled layout, so results match the affine cells. One per MX family + a gate case
         # (the (E, 2N) gate|up swizzle). Runs on all three ops; the reference stays on the affine Bs.
-        Problem(weight_recipe="mxfp8", swizzled=True),
-        Problem(weight_recipe="mxfp4", swizzled=True),
-        Problem(weight_recipe="nvfp4", swizzled=True),
-        Problem(weight_recipe="mxfp8", gate=True, swizzled=True),
+        Problem(weights="mxfp8", swizzled=True),
+        Problem(weights="mxfp4", swizzled=True),
+        Problem(weights="nvfp4", swizzled=True),
+        Problem(weights="mxfp8", gate=True, swizzled=True),
         # N>128 gate: 2N/expert spans >1 128-block/projection, so the gate|up interleave
         # [g0,u0,g1,u1,...] diverges from a flat [g0,g1,..,u0,u1,..] slab (they coincide only at
         # N=128). Guards every op's swizzled gate reader against the two-slab layout.
-        Problem(weight_recipe="mxfp8", gate=True, swizzled=True, N=256, K=512),
+        Problem(weights="mxfp8", gate=True, swizzled=True, N=256, K=512),
         # the interleave-divergence guard per fp4 family: packed-E2M1 byte-halving and nvfp4's
         # group-16 column count are exactly the axes the mxfp8 cell above can't cover
-        Problem(weight_recipe="mxfp4", gate=True, output_recipe="mxfp4", swizzled=True, N=256, K=512),
-        Problem(weight_recipe="nvfp4", gate=True, output_recipe="nvfp4", swizzled=True, N=256, K=512),
+        Problem(weights="mxfp4", gate=True, activation_format="mxfp4", quantize_output=True, swizzled=True, N=256, K=512),
+        Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, N=256, K=512),
         # swizzled decode (S=8) — the bench's pre-swizzled batched decode arm per fp4 family
-        Problem(weight_recipe="mxfp4", swizzled=True, S=8),
-        Problem(weight_recipe="nvfp4", swizzled=True, S=8),
+        Problem(weights="mxfp4", swizzled=True, S=8),
+        Problem(weights="nvfp4", swizzled=True, S=8),
         # NVFP4 tiny-M: the 2D kernel's SWAP_AB decode arm (BM=1 swapped dot_scaled — the
         # only native E4M3 M=1 path) — affine and swizzled, checked against the same oracle
-        Problem(weight_recipe="nvfp4", S=2),
-        Problem(weight_recipe="nvfp4", swizzled=True, S=2),
-        Problem(weight_recipe="mxfp4", gate=True, output_recipe="mxfp4", swizzled=True, S=8),
-        Problem(weight_recipe="nvfp4", gate=True, output_recipe="nvfp4", swizzled=True, S=8),
+        Problem(weights="nvfp4", S=2),
+        Problem(weights="nvfp4", swizzled=True, S=2),
+        Problem(weights="mxfp4", gate=True, activation_format="mxfp4", quantize_output=True, swizzled=True, S=8),
+        Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8),
         # launch-scale smoke (the matrix rides small shapes; this catches scale-dependent
         # scheduling/tiling regressions)
-        Problem(weight_recipe="mxfp8", S=2048, E=16, N=512, K=1024),
-        Problem(weight_recipe="fp8_128x128", compile=True),
-        Problem(weight_recipe="mxfp4", compile=True),
-        Problem(weight_recipe="bf16", compile=True),  # the fp kernel's pre_hook under compile
+        Problem(weights="mxfp8", S=2048, E=16, N=512, K=1024),
+        Problem(weights="fp8_128x128", compile=True),
+        Problem(weights="mxfp4", compile=True),
+        Problem(weights="bf16", compile=True),  # the fp kernel's pre_hook under compile
         # static (per-tensor calibrated) activation quant — the block_static path, reached when
         # As is a per-tensor scalar; runs on all three ops (2D / grouped / batched).
-        Problem(weight_recipe="fp8_128x128", static=True),
-        Problem(weight_recipe="fp8_128x128", gate=True, static=True),
+        Problem(weights="fp8_128x128", static=True),
+        Problem(weights="fp8_128x128", gate=True, static=True),
         # non-aligned N (64-grid, off the 128-grid — gpt-oss H=I=2880 shape). matmul_2d masks the
         # N-tail; routed MX runs the affine arm (per-row scales, any BN|N); routed FP8 rejects it
         # (its scales are 128-blocked along N — raises pointing to matmul_2d).
-        Problem(weight_recipe="fp8_128x128", N=320, K=1024),
-        Problem(weight_recipe="mxfp8", N=320, K=1024),
+        Problem(weights="fp8_128x128", N=320, K=1024),
+        Problem(weights="mxfp8", N=320, K=1024),
         # weight-only GATE at non-dividing N: the affine gate|up scale leaf must clamp its rows
         # (the up half reads N + offs_bn — unclamped it runs past 2N on the partial last tile)
-        Problem(weight_recipe="mxfp8", gate=True, input_recipe=None, N=320, K=1024),
-        Problem(weight_recipe="mxfp8", N=320, K=1024, swizzled=True),  # non-128 N on the swizzled arm (bf16 out, all 3 ops)
-        Problem(weight_recipe="mxfp4", input_recipe="mxfp4", N=320, K=320),  # W4A4 non-128 N and K
-        Problem(weight_recipe="mxfp4", gate=True, input_recipe="mxfp4", output_recipe="mxfp4", N=320, K=320),  # gated W4A4 non-128 (gpt-oss gate_up)
-        # output/input dtype coverage (fp16 + fp32) across the FP8 and MX kernels — the recipe matrix
+        Problem(weights="mxfp8", gate=True, activation_format="bf16", N=320, K=1024),
+        Problem(weights="mxfp8", N=320, K=1024, swizzled=True),  # non-128 N on the swizzled arm (bf16 out, all 3 ops)
+        Problem(weights="mxfp4", activation_format="mxfp4", N=320, K=320),  # W4A4 non-128 N and K
+        Problem(weights="mxfp4", gate=True, activation_format="mxfp4", quantize_output=True, N=320, K=320),  # gated W4A4 non-128 (gpt-oss gate_up)
+        # output/input dtype coverage (fp16 + fp32) across the FP8 and MX kernels — the format matrix
         # above rides bf16.
-        Problem(weight_recipe="fp8_128x128", dtype=torch.float16),
-        Problem(weight_recipe="fp8_128x128", dtype=torch.float32),
-        Problem(weight_recipe="mxfp4", dtype=torch.float16),
-        Problem(weight_recipe="mxfp4", dtype=torch.float32),
-        Problem(weight_recipe="mxfp8", dtype=torch.float16),
-        Problem(weight_recipe="mxfp8", dtype=torch.float32),
+        Problem(weights="fp8_128x128", dtype=torch.float16),
+        Problem(weights="fp8_128x128", dtype=torch.float32),
+        Problem(weights="mxfp4", dtype=torch.float16),
+        Problem(weights="mxfp4", dtype=torch.float32),
+        Problem(weights="mxfp8", dtype=torch.float16),
+        Problem(weights="mxfp8", dtype=torch.float32),
     ]
     return out
 
@@ -290,15 +285,15 @@ def _nvfp4_global(x):
 
 def _act_global(problem: Problem, A):
     """NVFP4 is ALWAYS two-level — every nvfp4 activation carries its calibrated global
-    ``g_a`` (no single-level nvfp4 exists). Non-nvfp4 recipes have no second level (None)."""
-    return _nvfp4_global(A) if problem.weight_recipe == "nvfp4" else None
+    ``g_a`` (no single-level nvfp4 exists). Non-nvfp4 formats have no second level (None)."""
+    return _nvfp4_global(A) if problem.weights == "nvfp4" else None
 
 
 def _dequant_a(problem: Problem, A):
-    """``A`` dequantized to fp32 on the recipe's grid (the exact host quant the op calls, or the
+    """``A`` dequantized to fp32 on the format's grid (the exact host quant the op calls, or the
     static per-tensor scale), plus the pre-quantized ``(Aq, As)`` form for the prequant round-trip
     check (``None`` where ``A`` stays raw)."""
-    row = WEIGHTS[problem.weight_recipe]
+    row = WEIGHTS[problem.weights]
     static_scale = _static_scale(problem, A)
     act_global = _act_global(problem, A)
     if static_scale is not None:  # static per-tensor activation quant
@@ -310,9 +305,9 @@ def _dequant_a(problem: Problem, A):
         Aq, As_block = nvfp4_act_quant(A, global_scale=act_global)
         A_dq = dq_grouped(Aq.view(torch.int8), As_block, NVFP4_SCALE_GROUP_K) * act_global
         return A_dq, (Aq, As_block)
-    if problem.input_recipe is None:  # weight-only: raw bf16/fp16 activation, never quantized
+    if problem.activation_format == "bf16":  # weight-only: raw bf16/fp16 activation, never quantized
         return A.float(), None
-    quant = row["act_quant"][problem.input_recipe]
+    quant = row["act_quant"][problem.activation_format]
     if quant is None:
         return A.float(), None
     Aq, As = quant(A)
@@ -328,23 +323,23 @@ def _prequant_args(problem: Problem, A):
 
 def _act_dequant(problem: Problem, A, As=None, As_global=None):
     """The fp32 activation the op multiplies by — from raw ``A`` (``As`` None: quantize+dequant on
-    the recipe grid, the exact host quant the op applies) or from a pre-quantized ``(Aq, As)`` (dequant
+    the format grid, the exact host quant the op applies) or from a pre-quantized ``(Aq, As)`` (dequant
     it, folding the nvfp4 ``As_global`` back). Both land on the same values, so the reference reads
     whatever the op was handed."""
     if As is None:
         return _dequant_a(problem, A)[0]
     if As_global is not None:  # nvfp4 two-level: block scale As, per-tensor global As_global
         return dq_grouped(A.view(torch.int8), As, NVFP4_SCALE_GROUP_K) * As_global
-    return WEIGHTS[problem.weight_recipe]["dq_act"](A, As)
+    return WEIGHTS[problem.weights]["dq_act"](A, As)
 
 
 def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_global=None):
-    """The fp32 GLU output on the recipe-quantized operands — the pre-requant oracle, shared by the
+    """The fp32 GLU output on the format-quantized operands — the pre-requant oracle, shared by the
     global calibration (``_out_global``) and the reference (``_reference``), reading the SAME ``A``/
     ``As`` (and their globals) the op takes. ``matmul`` has no routing (single ``W[0]``); routed ops
     gather ``W[expert]`` and zero sentinel rows; GLU in fp32 (the production epilogue applies it to
     the fp32 accumulator directly)."""
-    row = WEIGHTS[problem.weight_recipe]
+    row = WEIGHTS[problem.weights]
     A_dq = _act_dequant(problem, A, As, As_global)
     W = row["dequant"](B, Bs, Bs_global)  # (E, rows, K) fp32
     if op == "matmul":
@@ -365,7 +360,7 @@ def _out_global(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, 
     """The PROVIDED NVFP4 output global — the next proj's calibrated ``input_scale``. The tests
     'calibrate' it deterministically off the fp32 intermediate (``amax/(6·448)``) so the reference
     and the op share the identical scalar; None for MX / dense output (no second level)."""
-    if problem.output_recipe != "nvfp4":
+    if not (problem.quantize_output and problem.activation_format == "nvfp4"):
         return None
     return _nvfp4_global(
         _fp32_intermediate(problem, op, A, expert_ids, B, Bs, Bs_global, As, As_global)
@@ -377,45 +372,37 @@ def _reference(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, A
     ``out_global``), returning the op's OWN output format so the shared ``_dequant`` reads reference
     and op identically. Dequant/gather the operands (``_fp32_intermediate`` reads whatever the op was
     handed — raw ``A`` or a pre-quantized ``(Aq, As)``) → matmul → GLU, then mirror the fused requant:
-    divide by the provided ``out_global`` and snap to the recipe grid, returning the ``[C, Cs]`` the
-    op returns. No ``output_recipe`` → the dense fp32 intermediate. ``"fp8"`` output has no torch
+    divide by the provided ``out_global`` and snap to the format grid, returning the ``[C, Cs]`` the
+    op returns. No ``quantize_output`` → the dense fp32 intermediate. ``"fp8"`` output has no torch
     block-quant (``REQUANT_FN["fp8"]`` is None), so it stays the unsnapped oracle — the dequant-
     closeness tolerance in ``_check`` absorbs the block-fp8 rounding."""
     inter = _fp32_intermediate(problem, op, A, expert_ids, B, Bs, Bs_global, As, As_global)
-    if problem.output_recipe in (None, "fp8"):
+    if not problem.quantize_output or problem.activation_format == "fp8":
         return inter
     scaled = inter / out_global if out_global is not None else inter
-    return list(REQUANT_FN[problem.output_recipe](scaled.to(problem.dtype)))
+    return list(REQUANT_FN[problem.activation_format](scaled.to(problem.dtype)))
 
 
 def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_global=None, out_global=None):
     """The op half of the symmetric ``(ref, op)`` pair — the same inputs as ``_reference`` (plus
-    ``As`` for the pre-quantized-input test). Runs the kernel on the recipe's operands (swizzling
+    ``As`` for the pre-quantized-input test). Runs the kernel on the format's operands (swizzling
     weight scales; the two-level per-tensor globals ride as the decoupled ``a_global_scale`` /
     ``b_global_scale`` kwargs) and returns its RAW output (dense tensor, or ``[C, Cs]`` under
-    ``output_recipe``) — the shared ``_dequant`` brings it to fp32, the same call the reference goes
+    ``quantize_output``) — the shared ``_dequant`` brings it to fp32, the same call the reference goes
     through. The NVFP4 output global ``out_global`` is PROVIDED (the calibrated ``input_scale`` of
     the next proj): it rides in as ``output_global_scale`` and the op normalizes the intermediate by
     it before requant — the same scalar the reference uses, so the two spaces match."""
-    epilogue = (
-        Epilogue(
+    # a requant cell names its format explicitly (the reference snaps to that grid)
+    assert not problem.quantize_output or problem.activation_format not in (None, "bf16")
+    kw = dict(activation_format=problem.activation_format, quantize_output=problem.quantize_output)
+    if problem.gate:
+        kw.update(
             gate=True,
             act_fn=problem.act_fn,
             swiglu_alpha=problem.swiglu_alpha,
             swiglu_limit=problem.swiglu_limit,
         )
-        if problem.gate
-        else None
-    )
-    quantization = (
-        Quantization(
-            input_recipe=problem.input_recipe, output_recipe=problem.output_recipe
-        )
-        if (problem.input_recipe != "weights" or problem.output_recipe is not None)
-        else None
-    )
-    kw = dict(epilogue=epilogue, quantization=quantization)
-    if problem.output_recipe is None:
+    if not problem.quantize_output:
         kw["output_dtype"] = problem.dtype
     if out_global is not None:  # provided NVFP4 output global (next proj's input_scale)
         kw["output_global_scale"] = out_global
@@ -437,7 +424,7 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
     if op == "batched":
         fn = maybe_compile(finegrained_kernels.matmul_batched, problem.compile)
         return fn(A, B, As, bs, expert_ids=expert_ids, **globals_kw, **kw)
-    expert_start, gather_idx, scatter_idx = finegrained_kernels.compute_grouped_scheduling(
+    expert_start, gather_idx, scatter_idx = finegrained_kernels.scheduling.compute_grouped_scheduling(
         expert_ids, problem.E, 1
     )
     fn = maybe_compile(finegrained_kernels.matmul_grouped, problem.compile)
@@ -457,7 +444,7 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
 
 def _dequant(problem: Problem, out, out_global=None):
     """Bring a raw op-format output — reference OR kernel — back to fp32; the one function both sides
-    go through. Dense (no ``output_recipe``, or the fp8-output oracle) → ``.float()``. ``"fp8"`` op
+    go through. Dense (no ``quantize_output``, or the fp8-output oracle) → ``.float()``. ``"fp8"`` op
     output → dequant the per-(row, N-block) scale. MX/NVFP4 → un-swizzle a 5D SWIZZLE_32_4_4 Cs (the
     kernel's tcgen05 fast-path layout; the torch reference is always row-major) and dequant the group
     scales, folding the provided ``out_global`` back (``dq(q, Cs)·g_out ≈ intermediate``; None = MX,
@@ -465,17 +452,17 @@ def _dequant(problem: Problem, out, out_global=None):
     if not isinstance(out, (list, tuple)):  # dense intermediate (or the fp8-output oracle)
         return out.float()
     C, Cs = out
-    if problem.output_recipe == "fp8":
+    if problem.activation_format == "fp8":
         # dq_scale decodes by dtype — fp32 passes through, UE8M0 (uint8) is 2^(exp-127).
         return C.float() * torch.repeat_interleave(
             dq_scale(Cs), C.shape[1] // Cs.shape[1], dim=-1
         )
-    group = REQUANT_GROUP[problem.output_recipe]
+    group = REQUANT_GROUP[problem.activation_format]
     if Cs.ndim == 5:
         # packed-E2M1 output (mxfp4/nvfp4) stores N/2 bytes, but the scale spans the logical N —
         # unswizzle over N columns, not the packed byte count (nvfp4 group-16 crosses a 4-block
         # boundary here; mxfp4 group-32 happens not to, which is why only nvfp4 exposed it).
-        packed_out = problem.output_recipe in ("mxfp4", "nvfp4")
+        packed_out = problem.activation_format in ("mxfp4", "nvfp4")
         n_logical = C.shape[1] * (2 if packed_out else 1)
         Cs = unswizzle_mx_scales(Cs, C.shape[0], n_logical // group)
     dq = dq_grouped(C, Cs, group)
@@ -487,7 +474,7 @@ def _assert_op_layout(problem: Problem, op, out):
     a swizzled MX/NVFP4 block MUST emit a 5D SWIZZLE_32_4_4 Cs, else a silent row-major fallback would
     still pass the value check — but only where the layout survives to the output (matmul_2d always;
     grouped only with scatter_idx=None, so a scattered grouped output is legitimately row-major)."""
-    if problem.output_recipe in (None, "fp8"):
+    if not problem.quantize_output or problem.activation_format == "fp8":
         return
     _, Cs = out
     expect = problem.swizzled and op == "matmul"
@@ -507,7 +494,7 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
         if op == "matmul"  # no routing — every row is valid
         else expert_ids.long() < problem.E
     )
-    if problem.output_recipe is None:
+    if not problem.quantize_output:
         atol, rtol = DTYPE_TO_TOL[problem.dtype]
         torch.testing.assert_close(
             dq_out[keep], ref_cmp[keep].to(problem.dtype).float(), atol=atol, rtol=rtol
@@ -535,16 +522,16 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
 def _skip_moe_only(problem: Problem, op: str) -> None:
     """matmul_2d is the single-GEMM sibling: skip only the scenarios it can't represent — expert
     routing (sentinel / noncontiguous / empty-expert / the MoE prequant-As check) and non-MX
-    input/output recipe knobs (its FP8 paths infer the quant from the scale shape and return the
+    input/output format knobs (its FP8 paths infer the quant from the scale shape and return the
     intermediate dense). Everything else — including full-precision (BF16/FP16) weights and static
     activation quant — runs on all three ops."""
     if op != "matmul":
         return
     if problem.sentinel_fraction or problem.noncontiguous or problem.empty_expert or problem.prequant:
         pytest.skip("expert-routing scenario (MoE only)")
-    mx = problem.weight_recipe in ("mxfp8", "mxfp8_u8", "mxfp4", "nvfp4")
-    if not mx and (problem.input_recipe != "weights" or problem.output_recipe is not None):
-        pytest.skip("input/output recipe is MX-only for matmul_2d")
+    mx = problem.weights in ("mxfp8", "mxfp8_u8", "mxfp4", "nvfp4")
+    if not mx and (problem.activation_format is not None or problem.quantize_output):
+        pytest.skip("an explicit activation format / requant is MX-only for matmul_2d")
 
 
 @pytest.mark.kernels_ci
@@ -556,10 +543,10 @@ def test_op_scenarios(problem: Problem, op):
     own output format, compared once through the shared ``_dequant``."""
     _skip_moe_only(problem, op)
     A, expert_ids = _routed(problem)
-    row = WEIGHTS[problem.weight_recipe]
+    row = WEIGHTS[problem.weights]
     E = 1 if op == "matmul" else problem.E  # matmul is a single weight matrix
     B, Bs, Bs_global = row["make"](2 * problem.N if problem.gate else problem.N, problem.K, E)
-    if op != "matmul" and problem.N % 128 != 0 and problem.weight_recipe.startswith("fp8"):
+    if op != "matmul" and problem.N % 128 != 0 and problem.weights.startswith("fp8"):
         # fp8 weight scales are 128-blocked along N, so routed fp8 rejects non-128 N. MX (per-row
         # scales, BN | N) handles it on the affine arm — falls through to the normal ref-vs-op run.
         with pytest.raises(ValueError, match="matmul_2d"):
@@ -606,11 +593,11 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
 # kernel (the dense gate fusion and its gate_pointer_only/WS pruners), and one nvfp4 cell
 # (E4M3 scales: the nvfp4_native_ok fence + software decode arms).
 _SWEEP_CELLS = [
-    (Problem(weight_recipe="mxfp8", gate=True, output_recipe="mxfp8"), "grouped", "mx_dynamic_matmul_grouped_kernel"),
-    (Problem(weight_recipe="mxfp4", S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
-    (Problem(weight_recipe="mxfp8", gate=True, output_recipe="mxfp8", swizzled=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
-    (Problem(weight_recipe="mxfp8", gate=True, output_recipe="mxfp8", swizzled=True), "matmul", "mx_dynamic_matmul_kernel"),
-    (Problem(weight_recipe="nvfp4", gate=True, output_recipe="nvfp4", swizzled=True, S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
+    (Problem(weights="mxfp4", S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", "mx_dynamic_matmul_kernel"),
+    (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
 ]
 
 
@@ -636,7 +623,7 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
         kernel_name,
     )
     A, expert_ids = _routed(problem)
-    row = WEIGHTS[problem.weight_recipe]
+    row = WEIGHTS[problem.weights]
     B, Bs, Bs_global = row["make"](
         2 * problem.N if problem.gate else problem.N, problem.K, problem.E
     )

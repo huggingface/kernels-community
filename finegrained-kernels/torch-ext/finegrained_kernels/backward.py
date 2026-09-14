@@ -27,7 +27,7 @@ parameter at all. A frozen quantized base with trainable high-precision adapters
 (QLoRA) is therefore the shape this serves, and the only gradient it needs is the one that flows
 THROUGH the weight to whatever precedes it.
 
-Block-FP8 and per-tensor recipes reach that product on the forward kernel via transposed views
+Block-FP8 and per-tensor formats reach that product on the forward kernel via transposed views
 (their scale grids subdivide both axes). MX/NVFP4 cannot be reoriented by a view — group scales
 bind to K and packed E2M1 packs along K — so they contract N against the weight's natural (N, K)
 tile, dequantized per-tile in-register; see ``backward.py``. Either way the FORWARD-oriented
@@ -50,7 +50,7 @@ why ``dot_scaled`` cannot serve this pass — the tensor core's scaled MMA requi
 to be the one it reduces over — so dgrad is plain-dot only. The tuner already prefers ``dot`` over
 ``dot_scaled`` on the gate|up tile, so little is given up.
 
-Recipe genericity lives in ``_dgrad_weight_tile`` alone. A recipe is fully described to this
+Format genericity lives in ``_dgrad_weight_tile`` alone. A format is fully described to this
 kernel by three numbers plus the value dtype:
 
     SCALE_GROUP_K    scale extent along K   32 (MX)   128 (block-FP8)
@@ -58,7 +58,7 @@ kernel by three numbers plus the value dtype:
     WEIGHT_VALUES_PER_BYTE  2 for packed E2M1, else 1
 
 so MX (per-row K-groups) and block-FP8 (128x128 blocks) are the same code path at different
-divisors, and no new arm is needed to add a recipe whose scales tile the same way.
+divisors, and no new arm is needed to add a format whose scales tile the same way.
 """
 
 import torch
@@ -219,7 +219,7 @@ def dgrad_matmul_2d_kernel(
     stride_bs_k,
     stride_c_m,
     stride_c_k,
-    # Recipe
+    # Format
     SCALE_GROUP_K: tl.constexpr,
     SCALE_ROW_DIV: tl.constexpr,
     WEIGHT_VALUES_PER_BYTE: tl.constexpr,
@@ -304,7 +304,7 @@ def dgrad_matmul_2d(
 
     ``W`` is ``(N, K)`` exactly as the forward holds it; nothing is transposed or re-quantized.
     ``scale_group_k``/``scale_row_div`` describe the scale grid (MX: ``32, 1``; block-FP8:
-    ``128, 128``), which is the only thing that differs between recipes."""
+    ``128, 128``), which is the only thing that differs between formats."""
     assert dY.ndim == 2 and W.ndim == 2, f"expected 2D operands, got {dY.ndim}D and {W.ndim}D"
     M, N = dY.shape
     values_per_byte = 2 if W.dtype == torch.uint8 else 1
@@ -430,7 +430,7 @@ def dgrad_matmul_grouped_kernel(
     stride_bs_k,
     stride_c_m,
     stride_c_k,
-    # Recipe
+    # Format
     SCALE_GROUP_K: tl.constexpr,
     SCALE_ROW_DIV: tl.constexpr,
     WEIGHT_VALUES_PER_BYTE: tl.constexpr,
@@ -784,7 +784,7 @@ def dgrad_matmul_batched_kernel(
     stride_bs_k,
     stride_c_m,
     stride_c_k,
-    # Recipe
+    # Format
     SCALE_GROUP_K: tl.constexpr,
     SCALE_ROW_DIV: tl.constexpr,
     WEIGHT_VALUES_PER_BYTE: tl.constexpr,
@@ -883,17 +883,17 @@ def dgrad_matmul_batched(
 
 
 
-# ── gradient products, per recipe family ─────────────────────────────────────────
-# What each recipe's dgrad actually computes. ``backward.py`` holds only the table saying which
+# ── gradient products, per format family ─────────────────────────────────────────
+# What each format's dgrad actually computes. ``backward.py`` holds only the table saying which
 # op gets which of these — compute lives here, attachment lives there.
 
 def _dgrad_mx(dY, B, Bs, b_global, out_dtype):
     """dA for an MX/NVFP4 weight: contract N on the forward-oriented weight (see backward.py).
 
-    The scale grid is DERIVED FROM SHAPES, not from a recipe constant — ``Bs`` is
+    The scale grid is DERIVED FROM SHAPES, not from a format constant — ``Bs`` is
     ``(N // row_div, K // group)``, so the divisors read straight off it. That covers group-32
     UE8M0 (MX) and group-16 E4M3 (NVFP4) without either being named here, and cannot drift when a
-    recipe's block changes.
+    format's block changes.
 
     Containers are normalized, not reinterpreted: packed E2M1 reaches the kernel as ``int8`` or
     ``uint8`` depending on the producer, and UE8M0 as ``float8_e8m0fnu`` or ``uint8``. The kernel
@@ -977,7 +977,7 @@ def _register(name: str, saved: tuple[int, ...], dgrad):
         n_grads = len(ctx.needs_input_grad)
         if not ctx.needs_input_grad[0]:
             return (None,) * n_grads
-        # the ops return list[Tensor] (a second entry under output_recipe), so autograd hands the
+        # the ops return list[Tensor] (a second entry under output_format), so autograd hands the
         # gradient back in that shape — unwrap to the gradient of the primary output
         dY = grads[0]
         while isinstance(dY, (list, tuple)):
@@ -1011,7 +1011,7 @@ _register(
     dgrad=lambda ctx, dY, B, Bs, b_global: _dgrad_mx(dY, B, Bs, b_global, ctx.a_dtype),
 )
 
-# Weight-only (W4A16 / W8A16) — the QLoRA recipe: a frozen 4-bit base weight with raw bf16
+# Weight-only (W4A16 / W8A16) — the QLoRA format: a frozen 4-bit base weight with raw bf16
 # activations. Same route; the weight takes no gradient, so nothing here needs a master copy.
 _register(
     "mx_weight_only_matmul_2d", saved=(1, 2, 9),

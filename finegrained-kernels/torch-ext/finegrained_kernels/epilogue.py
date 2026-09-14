@@ -12,23 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
-
-from .compat import *  # noqa: F401,F403
-from .recipes import *  # noqa: F401,F403
-from .swizzle import *  # noqa: F401,F403
-from .tile_layout import *  # noqa: F401,F403
-from .quant import *  # noqa: F401,F403
-from .scales import *  # noqa: F401,F403
-from .mma import *  # noqa: F401,F403
-from .scheduling import *  # noqa: F401,F403
-from .tiles import *  # noqa: F401,F403
-
+from .compat import compile_time_only_triton_wrap, decode_pdl, device_context
+from .mma import MMA_N_ATOM
+from .quant import fp8_act_quant_inline, mx_act_quant_inline
+from .scales import apply_global_scale
 
 
 @triton.jit
@@ -56,7 +48,6 @@ def store_masked(
     c_ptrs = C + stride_c_m * offs_cm[:, None] + stride_c_n * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
-
 
 
 @triton.jit
@@ -103,7 +94,6 @@ def store_masked_oriented(
         )
 
 
-
 @triton.jit
 def acc_init(
     COMPUTE_MODE: tl.constexpr,
@@ -128,7 +118,6 @@ def acc_init(
     return acc
 
 
-
 @triton.jit
 def acc_finalize(
     acc, COMPUTE_MODE: tl.constexpr, ROWS: tl.constexpr, SWAP_AB: tl.constexpr
@@ -143,7 +132,6 @@ def acc_finalize(
             tl.sum(acc * (tl.arange(0, MMA_N_ATOM)[None, :] == 0), axis=1), (1, ROWS)
         )
     return acc
-
 
 
 def bias_strides(bias: torch.Tensor | None) -> tuple[int, int]:
@@ -194,7 +182,6 @@ def split_gate_up(flat, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, 
     rows: tl.constexpr = 1 if SWAP_AB else BLOCK_SIZE_M
     g, u = tl.split(tl.reshape(flat, (rows, BLOCK_SIZE_N, 2)))
     return g, u
-
 
 
 @triton.jit
@@ -269,7 +256,6 @@ def glu(
         gated = gated.to(INTERMEDIATE_DTYPE).to(tl.float32)
 
     return gated
-
 
 
 @triton.jit
@@ -428,7 +414,6 @@ def apply_glu(
     return act * up
 
 
-
 @triton.jit
 def split_gate_up_glu(
     flat,
@@ -456,14 +441,13 @@ def split_gate_up_glu(
     )
 
 
-
 @triton.jit
 def _store_out(
     C, acc, out_row, pid_n, row_mask, stride_c_m, stride_c_n,
     BLOCK_SIZE_M: tl.constexpr, WIDTH: tl.constexpr, FAKE_BATCH: tl.constexpr,
     N_COLS: tl.constexpr = 0,
 ):
-    """Cast + store one output tile of N-width ``WIDTH`` (halved when the recipe packs nibble
+    """Cast + store one output tile of N-width ``WIDTH`` (halved when the format packs nibble
     pairs). ``FAKE_BATCH`` (batched decode): the BM lanes alias one C row (``C`` pre-advanced), so
     a plain store would duplicate-write the same bytes (hardware-undefined on Intel XPU) — mask to
     lane 0 (the replicated rows are identical). Else a real scatter to global rows ``out_row`` under
@@ -505,11 +489,11 @@ def _epilogue_requant_mx(
     C, Cs, out, out_row, pid_n, pid_m, row_mask, stride_c_m, stride_c_n, stride_cs_m, stride_cs_n,
     CSDescriptor, CsGlobal,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
-    OUTPUT_RECIPE: tl.constexpr, SWIZZLED_OUT: tl.constexpr, FAKE_BATCH: tl.constexpr,
+    OUTPUT_FORMAT: tl.constexpr, SWIZZLED_OUT: tl.constexpr, FAKE_BATCH: tl.constexpr,
     N_COLS: tl.constexpr,
 ):
     """Requantize the SwiGLU intermediate to MX group-``SCALE_GROUP_K`` (mxfp8 UE8M0 / mxfp4 / nvfp4
-    E4M3 — the fp4 recipes pack nibble pairs so ``C`` halves). ``SWIZZLED_OUT`` writes ``Cs`` straight
+    E4M3 — the fp4 formats pack nibble pairs so ``C`` halves). ``SWIZZLED_OUT`` writes ``Cs`` straight
     into the down proj's SWIZZLE_32_4_4 descriptor at block ``(pid_m, pid_n)`` (BM/BN pinned 128), else
     a row-major affine store. NVFP4 two-level: normalize by the next proj's provided input_scale
     (``CsGlobal``) before the block quant. FAKE_BATCH collapses replicated rows via the row-max."""
@@ -518,10 +502,10 @@ def _epilogue_requant_mx(
         # (calibrated) input_scale before the block quant — the canonical two-step. The down folds it
         # back via its As pair ([Cs, g_out]); nothing is computed at runtime.
         out = out / tl.load(CsGlobal).to(tl.float32)
-    q, q_s = mx_act_quant_inline(out, BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_RECIPE)
-    width: tl.constexpr = BLOCK_SIZE_N if OUTPUT_RECIPE == "mxfp8" else BLOCK_SIZE_N // 2
+    q, q_s = mx_act_quant_inline(out, BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_FORMAT)
+    width: tl.constexpr = BLOCK_SIZE_N if OUTPUT_FORMAT == "mxfp8" else BLOCK_SIZE_N // 2
     _store_out(C, q, out_row, pid_n, row_mask, stride_c_m, stride_c_n, BLOCK_SIZE_M, width, FAKE_BATCH,
-               N_COLS if OUTPUT_RECIPE == "mxfp8" else N_COLS // 2)
+               N_COLS if OUTPUT_FORMAT == "mxfp8" else N_COLS // 2)
     if SWIZZLED_OUT:
         # group scales straight into the down proj's SWIZZLE_32_4_4 layout (inverse of
         # load_swizzled_scale) at block (pid_m, pid_n) — BM/BN pinned 128.
@@ -565,7 +549,7 @@ def gemm_epilogue(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     GATE: tl.constexpr,
-    OUTPUT_RECIPE: tl.constexpr,
+    OUTPUT_FORMAT: tl.constexpr,
     SCALE_GROUP_K: tl.constexpr,
     ACT_FN: tl.constexpr,
     SWIGLU_ALPHA: tl.constexpr,
@@ -591,9 +575,9 @@ def gemm_epilogue(
 ):
     """Unified output epilogue for grouped (a real scatter tile) and batched (fake-batch decode:
     one token replicated across the BM lanes) GEMMs. Plain: cast + store the accumulator. ``GATE``:
-    split the stacked gate|up accumulator + SwiGLU (``split_gate_up_glu``); ``OUTPUT_RECIPE`` — the
-    ``Quantization`` vocabulary — then requantizes into ``C`` + ``Cs``: ``"fp8"`` (per-(row, N-tile)
-    scalar), or MX group-``SCALE_GROUP_K`` (UE8M0/E4M3 — the fp4 recipes pack nibble pairs so ``C``
+    split the stacked gate|up accumulator + SwiGLU (``split_gate_up_glu``); ``OUTPUT_FORMAT`` — the
+    ``activation_format`` vocabulary — then requantizes into ``C`` + ``Cs``: ``"fp8"`` (per-(row, N-tile)
+    scalar), or MX group-``SCALE_GROUP_K`` (UE8M0/E4M3 — the fp4 formats pack nibble pairs so ``C``
     halves), with ``SWIZZLED_OUT`` writing the MX ``Cs`` straight into the down proj's SWIZZLE_32_4_4
     descriptor at block ``(pid_m, pid_n)`` (the tcgen05 fast path, BM/BN pinned 128). ``FAKE_BATCH``
     shims the store: value masks to lane 0 (``C`` pre-advanced), the scale collapses the replicated
@@ -623,16 +607,16 @@ def gemm_epilogue(
             flat, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
         )
-        if OUTPUT_RECIPE == "fp8":
+        if OUTPUT_FORMAT == "fp8":
             _epilogue_requant_fp8(
                 C, Cs, out, out_row, pid_n, row_mask, stride_c_m, stride_c_n, stride_cs_m, stride_cs_n,
                 BLOCK_SIZE_M, BLOCK_SIZE_N, FAKE_BATCH, N_COLS,
             )
-        elif OUTPUT_RECIPE is not None:  # "mxfp8" | "mxfp4" | "nvfp4"
+        elif OUTPUT_FORMAT is not None:  # "mxfp8" | "mxfp4" | "nvfp4"
             _epilogue_requant_mx(
                 C, Cs, out, out_row, pid_n, pid_m, row_mask, stride_c_m, stride_c_n, stride_cs_m,
                 stride_cs_n, CSDescriptor, CsGlobal,
-                BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_RECIPE, SWIZZLED_OUT, FAKE_BATCH, N_COLS,
+                BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_FORMAT, SWIZZLED_OUT, FAKE_BATCH, N_COLS,
             )
         else:  # bf16 (unquantized) SwiGLU output
             _store_out(C, out, out_row, pid_n, row_mask, stride_c_m, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N, FAKE_BATCH, N_COLS)

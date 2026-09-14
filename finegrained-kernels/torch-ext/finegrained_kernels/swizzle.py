@@ -12,16 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-
-from .compat import *  # noqa: F401,F403
-from .recipes import *  # noqa: F401,F403
-
+from .compat import compile_time_only_triton_wrap, device_context
 
 
 @triton.jit
@@ -33,7 +29,6 @@ def swizzle_store_block(DST, s, blk, cb, NCB):
     r = tl.arange(0, 32)
     c = tl.arange(0, 16)
     tl.store(DST + (blk * NCB + cb) * 512 + r[:, None] * 16 + c[None, :], sw)
-
 
 
 @triton.jit
@@ -67,7 +62,6 @@ def _swizzle_scales_kernel(
         other=0,
     )
     swizzle_store_block(DST, s, rb, cb, NCB)
-
 
 
 def unswizzle_mx_scales(
@@ -109,7 +103,6 @@ def swizzled_scale_descriptor(scale_u8: torch.Tensor) -> TensorDescriptor:
     return TensorDescriptor(
         scale_u8, [1, blocks, cols4, 2, 256], [blocks * cols4 * 512, cols4 * 512, 512, 256, 1], [1, 1, 1, 2, 256]
     )
-
 
 
 def _swizzle_to_blocks(

@@ -29,7 +29,7 @@
   "num_stages": 2,
   "num_warps": 4
  },
- "[4096, 2048, 6, \"mxfp4\", true, false, null, \"A:torch.float8_e4m3fn\", \"As:torch.uint8\", \"B:torch.uint8\", \"Bs:torch.uint8\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"AsGlobal:None\", \"AsBsGlobal:None\", \"CsGlobal:None\", \"ExpertIds:torch.int32\", \"GatherIdx:None\", \"ScatterIdx:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_RECIPE:None\"]": {
+ "[4096, 2048, 6, \"mxfp4\", true, false, null, \"A:torch.float8_e4m3fn\", \"As:torch.uint8\", \"B:torch.uint8\", \"Bs:torch.uint8\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"AsGlobal:None\", \"AsBsGlobal:None\", \"CsGlobal:None\", \"ExpertIds:torch.int32\", \"GatherIdx:None\", \"ScatterIdx:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_FORMAT:None\"]": {
   "BLOCK_SIZE_K": 512,
   "BLOCK_SIZE_M": 1,
   "BLOCK_SIZE_N": 32,
@@ -39,7 +39,7 @@
   "num_stages": 3,
   "num_warps": 4
  },
- "[6144, 2048, 8, \"nvfp4\", true, false, null, \"A:torch.uint8\", \"As:torch.float8_e4m3fn\", \"B:torch.uint8\", \"Bs:torch.float8_e4m3fn\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"AsGlobal:torch.float32\", \"AsBsGlobal:torch.float32\", \"CsGlobal:None\", \"ExpertIds:torch.int32\", \"GatherIdx:None\", \"ScatterIdx:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_RECIPE:None\"]": {
+ "[6144, 2048, 8, \"nvfp4\", true, false, null, \"A:torch.uint8\", \"As:torch.float8_e4m3fn\", \"B:torch.uint8\", \"Bs:torch.float8_e4m3fn\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"AsGlobal:torch.float32\", \"AsBsGlobal:torch.float32\", \"CsGlobal:None\", \"ExpertIds:torch.int32\", \"GatherIdx:None\", \"ScatterIdx:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_FORMAT:None\"]": {
   "BLOCK_SIZE_K": 512,
   "BLOCK_SIZE_M": 1,
   "BLOCK_SIZE_N": 128,
@@ -49,7 +49,7 @@
   "num_stages": 2,
   "num_warps": 4
  },
- "[6144, 3072, 4, \"mxfp8\", true, false, null, \"A:torch.float8_e4m3fn\", \"As:torch.uint8\", \"B:torch.float8_e4m3fn\", \"Bs:torch.uint8\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"AsGlobal:None\", \"AsBsGlobal:None\", \"CsGlobal:None\", \"ExpertIds:torch.int32\", \"GatherIdx:None\", \"ScatterIdx:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_RECIPE:None\"]": {
+ "[6144, 3072, 4, \"mxfp8\", true, false, null, \"A:torch.float8_e4m3fn\", \"As:torch.uint8\", \"B:torch.float8_e4m3fn\", \"Bs:torch.uint8\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"AsGlobal:None\", \"AsBsGlobal:None\", \"CsGlobal:None\", \"ExpertIds:torch.int32\", \"GatherIdx:None\", \"ScatterIdx:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_FORMAT:None\"]": {
   "BLOCK_SIZE_K": 512,
   "BLOCK_SIZE_M": 1,
   "BLOCK_SIZE_N": 32,

@@ -19,11 +19,11 @@ kernel read, contract in fp32): that isolates "is this contracting the right axi
 is lossy", which for a 4-bit weight is ~100x the thing under test. The END-TO-END tests call the
 public op and ``.backward()``.
 
-Registration is never asserted directly — it is implied: a recipe whose op lost its formula fails
-``out.requires_grad`` in the parametrized e2e test, across every recipe in ``WEIGHTS`` rather than
+Registration is never asserted directly — it is implied: a format whose op lost its formula fails
+``out.requires_grad`` in the parametrized e2e test, across every format in ``WEIGHTS`` rather than
 against a hand-kept list of op names that goes stale.
 
-``dX = dY @ W`` contracting N. No recipe needs its own arm: a weight reaches the kernel as three
+``dX = dY @ W`` contracting N. No format needs its own arm: a weight reaches the kernel as three
 numbers — ``(scale_group_k, scale_row_div, values_per_byte)`` — so MX (per-row K-groups) and
 block-FP8 (128x128 blocks) are one code path at different divisors. Only dgrad exists; the
 quantized weight takes no gradient, because an fp8/fp4 tensor cannot be an autograd leaf.
@@ -51,7 +51,7 @@ from finegrained_kernels.backward import (
 
 pytestmark = pytest.mark.skipif(not SUPPORTS_FP8, reason="FP8 kernels require SM90+")
 
-M, N, K = 512, 1024, 768  # 128-aligned on every axis so every recipe's blocks divide evenly
+M, N, K = 512, 1024, 768  # 128-aligned on every axis so every format's blocks divide evenly
 
 
 def _rel(x: torch.Tensor, ref: torch.Tensor) -> float:
@@ -102,9 +102,9 @@ def test_dgrad_mxfp4_packed_weight():
     assert _rel(dX, floor) < 5e-3, f"dgrad diverges from its own floor: {_rel(dX, floor):.2e}"
 
 
-def test_dgrad_recipe_is_only_divisors():
+def test_dgrad_format_is_only_divisors():
     """block-FP8 reaches the same kernel at scale_group_k=128, scale_row_div=128 — a 128x128
-    block grid is the per-row K-group layout with both divisors widened, so adding a recipe whose
+    block grid is the per-row K-group layout with both divisors widened, so adding a format whose
     scales tile this way needs no new arm."""
     torch.manual_seed(0)
     dY = torch.randn(M, N, device=TEST_DEVICE, dtype=torch.bfloat16)
@@ -259,35 +259,35 @@ def test_inference_path_is_untouched():
     assert not out.requires_grad and torch.isfinite(out.float()).all()
 
 
-QUANT_RECIPES = [r for r in WEIGHTS if r not in ("bf16", "fp16")]
+QUANT_WEIGHTS = [r for r in WEIGHTS if r not in ("bf16", "fp16")]
 
 
-@pytest.mark.parametrize("recipe", QUANT_RECIPES)
-def test_dgrad_every_quant_recipe(recipe):
-    """Every quantized recipe must produce a usable activation gradient. Recipes whose scale grid
+@pytest.mark.parametrize("weights", QUANT_WEIGHTS)
+def test_dgrad_every_quant_format(weights):
+    """Every quantized format must produce a usable activation gradient. Formats whose scale grid
     can be reoriented (per-tensor, block) take the quantized transposed-view route on the forward
     kernel; the per-row-group and packed-E2M1 ones contract N against the weight's natural tile
-    (``backward.py``). Both must land near the bf16 reference — this pins COVERAGE, so a recipe
+    (``backward.py``). Both must land near the bf16 reference — this pins COVERAGE, so a format
     can never silently lose its backward."""
     torch.manual_seed(0)
     try:
-        B, Bs, g = WEIGHTS[recipe]["make"](N, K, None)
+        B, Bs, g = WEIGHTS[weights]["make"](N, K, None)
     except TypeError:  # a few makes only build the expert-stacked form; take one expert
-        B, Bs, g = WEIGHTS[recipe]["make"](N, K, 1)
+        B, Bs, g = WEIGHTS[weights]["make"](N, K, 1)
         B, Bs = B[0], Bs[0]
     A = torch.randn(M, K, device=TEST_DEVICE, dtype=torch.bfloat16, requires_grad=True)
     grad_out = torch.randn(M, N, device=TEST_DEVICE, dtype=torch.bfloat16)
 
     out = fg.matmul_2d(A, B, Bs=Bs, output_dtype=torch.bfloat16, b_global_scale=g)
-    assert out.requires_grad, f"{recipe}: output not attached to the graph"
+    assert out.requires_grad, f"{weights}: output not attached to the graph"
     out.backward(grad_out)
     assert A.grad is not None and A.grad.shape == (M, K)
-    assert torch.isfinite(A.grad.float()).all(), f"{recipe}: non-finite dA"
+    assert torch.isfinite(A.grad.float()).all(), f"{weights}: non-finite dA"
 
     # reference: the same product against the dequantized weight
     W = dequantize_weight(B, Bs, global_scale=g).reshape(N, K)
     ref = grad_out.float() @ W
-    assert _rel(A.grad, ref) < 2e-1, f"{recipe}: dA vs dequantized reference {_rel(A.grad, ref):.2e}"
+    assert _rel(A.grad, ref) < 2e-1, f"{weights}: dA vs dequantized reference {_rel(A.grad, ref):.2e}"
 
 
 def test_dgrad_batched_per_row_expert():

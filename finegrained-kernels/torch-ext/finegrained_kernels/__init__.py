@@ -16,56 +16,29 @@
 from .matmul import matmul_2d
 from .batched import matmul_batched
 from .grouped import matmul_grouped
-from .moe import (
-    weighted_reduce,
-    moe_fused_batched,
-    moe_fused_grouped,
-    moe_unfused_batched,
-    moe_unfused_grouped,
-    moe_torch_grouped,
-)
-# imported for its import-time side effect: registers the dgrad formulas on the ops, so an
-# ordinary forward call differentiates. Exports nothing.
-from . import backward  # noqa: F401
-from .recipes import Epilogue, Quantization, get_supported_act_fns
+from .moe import moe_fused_batched, moe_fused_grouped
+from . import backward
+from .formats import get_supported_act_fns
 from .swizzle import swizzle_mx_scales, unswizzle_mx_scales
-from .scheduling import compute_grouped_scheduling
-from .quant import (
-    fp8_act_quant_block_dynamic,
-    fp8_act_quant_tensor_wide,
-    mxfp4_act_quant,
-    mxfp8_act_quant,
-    nvfp4_act_quant,
-    nvfp4_quantize_two_level,
-)
+from .quant import mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant
 
 __all__ = [
-    # 2D matmul
+    # the three GEMM dispatchers (the weight format is read off the tensors; `activation_format`
+    # names the activations', the gate|up fusion rides as kwargs)
     "matmul_2d",
-    # Batched matmul + MoE forwards
     "matmul_batched",
-    "moe_fused_batched",
-    "moe_unfused_batched",
-    # Grouped matmul + MoE forwards
     "matmul_grouped",
+    # the fused MoE forwards over them
+    "moe_fused_batched",
     "moe_fused_grouped",
-    "moe_unfused_grouped",
-    "moe_torch_grouped",
-    # Grouped scheduling (for MoE and grouped matmul)
-    "compute_grouped_scheduling",
-    "weighted_reduce",
-    # MX/NVFP4 scale layout (apply to weight scales at load time)
+    # importing it registers the dgrad formulas on the ops, so a forward call differentiates
+    "backward",
+    "get_supported_act_fns",
+    # load-time helpers: the swizzled scale layout the SM100 scaled-MMA reads, and the row-wise
+    # quantizers a loader uses to quantize weights into the group formats
     "swizzle_mx_scales",
     "unswizzle_mx_scales",
-    # Quantization helpers (weights at load time; activations offline)
-    "fp8_act_quant_block_dynamic",
-    "fp8_act_quant_tensor_wide",
-    "mxfp4_act_quant",
     "mxfp8_act_quant",
+    "mxfp4_act_quant",
     "nvfp4_act_quant",
-    "nvfp4_quantize_two_level",
-    # Epilogue and Quantization configs
-    "Epilogue",
-    "Quantization",
-    "get_supported_act_fns",
 ]

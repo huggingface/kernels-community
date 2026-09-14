@@ -91,7 +91,7 @@ def compile_time_only_triton_wrap(kernel):
     outputs, which is all fake mode needs. The skip is an EXPLICIT contextvar, never
     ambient fake-mode detection — ``triton_op``'s capture also runs under FakeTensor
     mode, and skipping there would compile graphs with the kernel MISSING (uninitialized
-    outputs; found as identical garbage across recipes, 2026-07-16). The skip is also
+    outputs; found as identical garbage across formats, 2026-07-16). The skip is also
     load-bearing in the other direction — probed: without it the opaque ops' fake impls
     reach the launcher with FakeTensors ("RuntimeError when making fake tensor call";
     ``is_compiling`` is still true during fake prop, so they'd take the wrap_triton

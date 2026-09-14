@@ -77,7 +77,7 @@
   "num_stages": 4,
   "num_warps": 8
  },
- "[4096, 2048, 8, false, true, null, false, \"A:torch.float8_e4m3fn\", \"As:torch.uint8\", \"B:torch.uint8\", \"Bs:torch.uint8\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"CSDescriptor:None\", \"AsBsGlobal:None\", \"CsGlobal:None\", \"GatherIdx:None\", \"ScatterIdx:torch.int32\", \"ExpertStart:torch.int32\", \"Schedule:torch.int32\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_RECIPE:None\"]": {
+ "[4096, 2048, 8, false, true, null, false, \"A:torch.float8_e4m3fn\", \"As:torch.uint8\", \"B:torch.uint8\", \"Bs:torch.uint8\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"CSDescriptor:None\", \"AsBsGlobal:None\", \"CsGlobal:None\", \"GatherIdx:None\", \"ScatterIdx:torch.int32\", \"ExpertStart:torch.int32\", \"Schedule:torch.int32\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_FORMAT:None\"]": {
   "A_MEMORY_MODE": "host_descriptor",
   "BLOCK_SIZE_K": 128,
   "BLOCK_SIZE_M": 128,
@@ -90,7 +90,7 @@
   "num_stages": 4,
   "num_warps": 8
  },
- "[4096, 2048, 8, false, true, null, false, \"A:torch.float8_e4m3fn\", \"As:torch.uint8\", \"B:torch.uint8\", \"Bs:torch.uint8\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"CSDescriptor:None\", \"AsGlobal:None\", \"AsBsGlobal:None\", \"CsGlobal:None\", \"GatherIdx:None\", \"ScatterIdx:torch.int32\", \"ExpertStart:torch.int32\", \"Schedule:torch.int32\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_RECIPE:None\"]": {
+ "[4096, 2048, 8, false, true, null, false, \"A:torch.float8_e4m3fn\", \"As:torch.uint8\", \"B:torch.uint8\", \"Bs:torch.uint8\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"CSDescriptor:None\", \"AsGlobal:None\", \"AsBsGlobal:None\", \"CsGlobal:None\", \"GatherIdx:None\", \"ScatterIdx:torch.int32\", \"ExpertStart:torch.int32\", \"Schedule:torch.int32\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_FORMAT:None\"]": {
   "A_MEMORY_MODE": "host_descriptor",
   "BLOCK_SIZE_K": 128,
   "BLOCK_SIZE_M": 128,
@@ -103,7 +103,7 @@
   "num_stages": 4,
   "num_warps": 8
  },
- "[6144, 2048, 9, false, true, null, false, \"A:torch.uint8\", \"As:torch.float8_e4m3fn\", \"B:torch.uint8\", \"Bs:torch.float8_e4m3fn\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"CSDescriptor:None\", \"AsGlobal:torch.float32\", \"AsBsGlobal:torch.float32\", \"CsGlobal:None\", \"GatherIdx:None\", \"ScatterIdx:torch.int32\", \"ExpertStart:torch.int32\", \"Schedule:torch.int32\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_RECIPE:None\"]": {
+ "[6144, 2048, 9, false, true, null, false, \"A:torch.uint8\", \"As:torch.float8_e4m3fn\", \"B:torch.uint8\", \"Bs:torch.float8_e4m3fn\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"CSDescriptor:None\", \"AsGlobal:torch.float32\", \"AsBsGlobal:torch.float32\", \"CsGlobal:None\", \"GatherIdx:None\", \"ScatterIdx:torch.int32\", \"ExpertStart:torch.int32\", \"Schedule:torch.int32\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_FORMAT:None\"]": {
   "A_MEMORY_MODE": "host_descriptor",
   "BLOCK_SIZE_K": 256,
   "BLOCK_SIZE_M": 128,
@@ -116,7 +116,7 @@
   "num_stages": 4,
   "num_warps": 8
  },
- "[6144, 3072, 9, false, true, null, false, \"A:torch.float8_e4m3fn\", \"As:torch.uint8\", \"B:torch.float8_e4m3fn\", \"Bs:torch.uint8\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"CSDescriptor:None\", \"AsGlobal:None\", \"AsBsGlobal:None\", \"CsGlobal:None\", \"GatherIdx:None\", \"ScatterIdx:torch.int32\", \"ExpertStart:torch.int32\", \"Schedule:torch.int32\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_RECIPE:None\"]": {
+ "[6144, 3072, 9, false, true, null, false, \"A:torch.float8_e4m3fn\", \"As:torch.uint8\", \"B:torch.float8_e4m3fn\", \"Bs:torch.uint8\", \"C:torch.bfloat16\", \"Cs:None\", \"Bias:None\", \"CSDescriptor:None\", \"AsGlobal:None\", \"AsBsGlobal:None\", \"CsGlobal:None\", \"GatherIdx:None\", \"ScatterIdx:torch.int32\", \"ExpertStart:torch.int32\", \"Schedule:torch.int32\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\", \"OUTPUT_FORMAT:None\"]": {
   "A_MEMORY_MODE": "host_descriptor",
   "BLOCK_SIZE_K": 128,
   "BLOCK_SIZE_M": 128,

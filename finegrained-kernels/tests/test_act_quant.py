@@ -87,7 +87,7 @@ def test_fp8_act_quant_zero_block():
     assert (s == 0).all()
 
 
-# ── inline-vs-offline arm parity (every recipe's quant has two implementations) ──────
+# ── inline-vs-offline arm parity (every format's quant has two implementations) ──────
 
 E2M1_LUT = [
     0.0,
@@ -211,7 +211,7 @@ def test_mxfp8_act_quant_matches_torch_reference(M):
 
 def _ref_ue8m0_block_dynamic(x: torch.Tensor, block_k: int):
     """Pure-PyTorch reference for the UE8M0 block-dynamic quant (the DeepGEMM-Blackwell
-    recipe): denom = max(amax/448, 1e-12) rounded UP to a power of two by DeepGEMM's
+    format): denom = max(amax/448, 1e-12) rounded UP to a power of two by DeepGEMM's
     ``ceil_to_ue8m0`` (add 0x7FFFFF, clear the mantissa); returns the exponent byte."""
     T, K = x.shape
     groups = x.float().reshape(T, K // block_k, block_k)
@@ -227,7 +227,7 @@ def _ref_ue8m0_block_dynamic(x: torch.Tensor, block_k: int):
 @pytest.mark.parametrize("M", [64, 100], ids=["Tdiv", "Ttail"])
 def test_ue8m0_block_dynamic_matches_torch_reference(M):
     """Independent pure-PyTorch check for ``fp8_act_quant_block_dynamic(use_ue8m0=True)``
-    — the fp32-scale variant has a torch reference below, the UE8M0 deployment recipe
+    — the fp32-scale variant has a torch reference below, the UE8M0 deployment format
     (DeepSeek-V4 on B200) previously had none."""
     x = _act_inputs(M=M)
     block_k = 128
@@ -273,27 +273,27 @@ def test_nvfp4_quantize_two_level():
 
 
 @triton.jit
-def _mx_inline_harness(X, Q, S, M: tl.constexpr, N: tl.constexpr, RECIPE: tl.constexpr):
+def _mx_inline_harness(X, Q, S, M: tl.constexpr, N: tl.constexpr, FORMAT: tl.constexpr):
     x = tl.load(X + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :])
-    q, s = mx_act_quant_inline(x.to(tl.float32), M, N, 32, RECIPE)
-    width: tl.constexpr = N // 2 if RECIPE == "mxfp4" else N
+    q, s = mx_act_quant_inline(x.to(tl.float32), M, N, 32, FORMAT)
+    width: tl.constexpr = N // 2 if FORMAT == "mxfp4" else N
     tl.store(Q + tl.arange(0, M)[:, None] * width + tl.arange(0, width)[None, :], q)
     tl.store(
         S + tl.arange(0, M)[:, None] * (N // 32) + tl.arange(0, N // 32)[None, :], s
     )
 
 
-def _run_mx_inline(x, recipe):
+def _run_mx_inline(x, fmt):
     M, N = x.shape
-    width = N // 2 if recipe == "mxfp4" else N
+    width = N // 2 if fmt == "mxfp4" else N
     q = torch.empty(
         M,
         width,
         device=x.device,
-        dtype=torch.uint8 if recipe == "mxfp4" else torch.float8_e4m3fn,
+        dtype=torch.uint8 if fmt == "mxfp4" else torch.float8_e4m3fn,
     )
     s = torch.empty(M, N // 32, device=x.device, dtype=torch.uint8)
-    _mx_inline_harness[(1,)](x, q, s, M=M, N=N, RECIPE=recipe, num_warps=4)
+    _mx_inline_harness[(1,)](x, q, s, M=M, N=N, FORMAT=fmt, num_warps=4)
     torch.cuda.synchronize()
     return q, s
 
@@ -323,7 +323,7 @@ def test_mxfp8_inline_matches_offline():
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
 def test_mxfp4_inline_matches_host():
-    """The in-kernel packed-E2M1 quant (the "mxfp4" output recipe) and the host
+    """The in-kernel packed-E2M1 quant (the "mxfp4" output format) and the host
     ``mxfp4_act_quant`` must be bit-identical — the fused intermediate must equal
     quantizing the same values offline."""
     x = _act_inputs()
