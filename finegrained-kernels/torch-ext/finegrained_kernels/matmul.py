@@ -23,12 +23,13 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
 from .compat import FP8_DTYPE, is_sm10x, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
+from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_weight_only_descriptors
 from .formats import check_activation_format, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant
-from .scales import apply_global_scale, mx_2d_scale_ptrs
+from .loading.scales import apply_global_scale, mx_2d_scale_ptrs
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
-from .tiles import (
+from .loading.tiles import (
     advance_ptrs,
     load_act_block_dynamic,
     load_act_mx,
@@ -65,76 +66,6 @@ STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
 # unconditionally; only the two gates above have a real M=1 inline win.
 
 
-def _rebind_operand_box(nargs, mode_key, desc_key, rows, cols):
-    """Set one operand's host-TMA box to ``[rows, cols]`` in place — MUST mutate (a rebind never
-    reaches the launch). No-op for a pointer config, whose descriptor is a dead int placeholder."""
-    desc = nargs[desc_key]
-    # None = the operand's layout cannot back a descriptor (see `_maybe_descriptor`); those
-    # configs are pruned, so reaching here with one would mean a pruner gap, not a rebind target
-    if nargs.get(mode_key, "pointer") != "pointer" and not isinstance(desc, int) and desc is not None:
-        desc.block_shape = [rows, cols]
-
-
-def _maybe_descriptor(t: torch.Tensor, box: list[int]) -> TensorDescriptor | None:
-    """A host-TMA descriptor over ``t``, or None when the layout cannot back one — a TMA box
-    needs a unit-stride innermost dim, which a transposed view (as a backward pass hands in to
-    contract over the other axis) does not have. ``None`` is the same signal the pointer arms
-    already take for an unused descriptor, and ``descriptor_box_pruner`` drops the configs that
-    would read it, so the tuner is left with the pointer arms the kernel serves stride-generally."""
-    if t is None or (t.ndim >= 2 and t.stride(-1) != 1):
-        return None
-    return TensorDescriptor.from_tensor(t, box)
-
-
-def _rebind_bd_descriptors(nargs):
-    """Per-config pre_hook: set the A and B host-TMA boxes to the tuned tile over the
-    ``(rows, K)`` matrices — ``[BLOCK_SIZE_M, block_k]`` and ``[BLOCK_SIZE_N, block_k]``."""
-    _rebind_operand_box(nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], nargs["block_k"])
-    _rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], nargs["block_k"])
-
-
-def _rebind_weight_only_descriptors(nargs):
-    """Per-config pre_hook for the weight-only kernels — set the A/B host-TMA boxes to the tuned tile:
-    ``[BM, BK]`` over the (M, K) bf16 activation and ``[BN, BK // WEIGHT_VALUES_PER_BYTE]`` over the
-    packed (N, K_bytes) weight (bytes: uint8 = packed E2M1, two values/byte). No scale boxes — weight-only
-    scales are always affine (never swizzled), read through the pointer arm."""
-    wvpb = 2 if nargs["B"].dtype == torch.uint8 else 1
-    bk = nargs["BLOCK_SIZE_K"]
-    _rebind_operand_box(nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], bk)
-    _rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], bk // wvpb)
-
-
-def _rebind_mx_descriptors(nargs):
-    """Per-config pre_hook for the MX kernel — set the A/B host-TMA boxes to the tuned tile
-    in BYTES over the (rows, K_bytes) packed matrices: ``[BM, BK // ACT_VALUES_PER_BYTE]`` and
-    ``[BN, BK // WEIGHT_VALUES_PER_BYTE]`` (values-per-byte read off the operand dtype; uint8 =
-    packed E2M1), plus the SWIZZLE_32_4_4 scale boxes on the offline (pre-quantized A) path."""
-    avpb = 2 if nargs["A"].dtype == torch.uint8 else 1
-    wvpb = 2 if nargs["B"].dtype == torch.uint8 else 1
-    bk = nargs["BLOCK_SIZE_K"]
-    _rebind_operand_box(nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], bk // avpb)
-    _rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], bk // wvpb)
-    # SWIZZLE_32_4_4 scale boxes: [1, BLOCK//128, (BK // SCALE_GROUP_K) // 4, 2, 256]. Only where the
-    # scale is actually swizzled — else the SA/SB descriptor is a dummy aliased to the operand
-    # descriptor, and stamping a scale box would clobber its [BM, BK] operand box. The weight is
-    # swizzled iff SWIZZLED_SCALES; the act only when it was also offline-quantized (E4M3 / packed
-    # E2M1) — inline (raw bf16 A) stays affine even under a swizzled weight.
-    if nargs["SWIZZLED_SCALES"]:
-        # Sub-128 tiles read scales via the per-row pointer gather, leaving the descriptor
-        # unread — clamp its box to one block so it keeps a valid, non-degenerate shape
-        # (a 0-block box traps the descriptor-encoding pass; same clamp as the grouped hook).
-        rep_k = max((nargs["BLOCK_SIZE_K"] // nargs["SCALE_GROUP_K"]) // 4, 1)
-        bn_blocks = max(1, ((2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"]) // 128)
-        nargs["BSDescriptor"].block_shape = [1, bn_blocks, rep_k, 2, 256]
-        if nargs["A"].dtype in (torch.float8_e4m3fn, torch.uint8):
-            bm_blocks = max(nargs["BLOCK_SIZE_M"] // 128, 1)
-            nargs["ASDescriptor"].block_shape = [1, bm_blocks, rep_k, 2, 256]
-    # swizzled requant output (Cs is a descriptor): store tile [1, 1, rep_n, 2, 256], rep_n per config
-    if nargs["CSDescriptor"] is not None:
-        rep_n = (nargs["BLOCK_SIZE_N"] // nargs["SCALE_GROUP_K"]) // 4
-        nargs["CSDescriptor"].block_shape = [1, 1, rep_n, 2, 256]
-
-
 @bayesian_autotune(
     # tune_block_m: BLOCK_SIZE_M is a config axis. tune_block_n: the N tile is DECOUPLED
     # from the caller's scale granularity (block_n) — a BN=256 tile over 128-wide scale
@@ -155,7 +86,7 @@ def _rebind_mx_descriptors(nargs):
         tune_block_n=True,
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=_rebind_bd_descriptors,
+        pre_hook=rebind_bd_descriptors,
     ),
     # m_bit_length (log2 M bucket) keys the M tile, mirroring mx_dynamic_matmul_kernel; GATE keys the
     # gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space). block_n/block_k
@@ -477,7 +408,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
         tune_block_n=True,
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=_rebind_bd_descriptors,
+        pre_hook=rebind_bd_descriptors,
     ),
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space);
     # block_n/block_k (the launch-pinned quant block) gate descriptor-box legality and the K tile.
@@ -638,7 +569,7 @@ def w8a8_block_static_fp8_matmul_kernel(
         # (unlike dense bd): A=pointer + B=descriptor wins the mid-M band.
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=_rebind_mx_descriptors,
+        pre_hook=rebind_mx_descriptors,
         # WS tuner axis: dot_scaled + WS + TMA compiles + wins at prefill (1918 -> ~1995 @M=4k);
         # warp_spec_compile_guard_pruner keeps it to num_warps%4==0, BM>=64.
         warp_spec=True,
@@ -770,7 +701,7 @@ def mx_dynamic_matmul_kernel(
     )
     # Operand tiles: activation + the (GATE-stacked-aware) weight, both single leaf calls (the
     # descriptor-vs-pointer and gate|up-stack branches fold inside the leaves). The swap arm
-    # loads both naturally — mx_swap_compute reorients at the dot, flattening the token tile.
+    # loads both naturally — mx_compute reorients at the dot under SWAP_AB, flattening the token tile.
     if SWAP_AB:
         tl.static_assert(
             BLOCK_SIZE_M == 1, "the mx swap arm flattens the single-token tile"
@@ -797,7 +728,7 @@ def mx_dynamic_matmul_kernel(
         )
         accumulator = mx_compute(
             accumulator, a, a_s, b, b_s, COMPUTE_MODE,
-            BLOCK_SIZE_M, n_width, BLOCK_SIZE_K, SCALE_GROUP_K, SWAP_AB,
+            n_width, BLOCK_SIZE_K, SCALE_GROUP_K, SWAP_AB,
         )
         a_ptrs, as_ptrs, b_ptrs, bs_ptrs, _, _ = advance_ptrs(
             a_ptrs, as_ptrs, b_ptrs, bs_ptrs, b_ptrs, bs_ptrs,
@@ -844,7 +775,7 @@ def mx_dynamic_matmul_kernel(
         compute_modes=("dot", "dot_scaled"),
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=_rebind_weight_only_descriptors,
+        pre_hook=rebind_weight_only_descriptors,
     ),
     ["N", "K", "m_bit_length", "GATE"],
     n_trials=100,
@@ -1129,11 +1060,11 @@ def w8a8_block_dynamic_fp8_matmul(
     )
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
     # Host TMA descriptors over the (M, K) / (N, K) matrices — the placeholder box is
-    # re-bound per tuned config by _rebind_bd_descriptors. Read only by the descriptor
+    # re-bound per tuned config by rebind_bd_descriptors. Read only by the descriptor
     # (host-TMA) configs the tuner picks for wide-N prefill; pointer configs never touch
     # them (the constexpr arm folds out in the load helpers).
     a_descriptor = TensorDescriptor.from_tensor(A_q, [1, block_k])
-    b_descriptor = _maybe_descriptor(B, [1, block_k])
+    b_descriptor = maybe_descriptor(B, [1, block_k])
 
     def grid(META):
         return (
@@ -1256,10 +1187,10 @@ def w8a8_block_static_fp8_matmul(
         STATIC_MATMUL_ACT_PREQUANT_MIN_M,
     )
     # Host-TMA descriptors over (M, K)/(N, K); placeholder boxes re-bound per config by
-    # _rebind_bd_descriptors. Read only by the descriptor configs the tuner picks for wide-N
+    # rebind_bd_descriptors. Read only by the descriptor configs the tuner picks for wide-N
     # prefill (offline fp8 A); pointer/inline configs never touch them.
     a_descriptor = TensorDescriptor.from_tensor(A_q, [1, block_k])
-    b_descriptor = _maybe_descriptor(B, [1, block_k])
+    b_descriptor = maybe_descriptor(B, [1, block_k])
 
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
@@ -1550,7 +1481,7 @@ def mx_dynamic_matmul(
     stride_cs_m = cs_ret.stride(0) if (requant and not swizzled_out) else 0
     stride_cs_n = cs_ret.stride(1) if (requant and not swizzled_out) else 0
     # Host-TMA descriptors over the packed (M, K_bytes) / (N, K_bytes) matrices — placeholder
-    # box rebound per tuned config by _rebind_mx_descriptors. Read only by the descriptor
+    # box rebound per tuned config by rebind_mx_descriptors. Read only by the descriptor
     # configs the tuner picks; pointer configs never touch them.
     a_descriptor = TensorDescriptor.from_tensor(A_q, [1, 32])
     b_descriptor = TensorDescriptor.from_tensor(b_u8, [1, 32])
@@ -1731,7 +1662,7 @@ def mx_weight_only_matmul_2d(
     b_global_scale = normalize_global_scale(b_global_scale, 1)
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
     # Host-TMA descriptors over the (M, K) bf16 A and packed (N, K_bytes) weight — placeholder box
-    # rebound per tuned config by _rebind_weight_only_descriptors, read only by the descriptor configs the
+    # rebound per tuned config by rebind_weight_only_descriptors, read only by the descriptor configs the
     # tuner picks (pointer configs never touch them). Scales stay affine (no scale descriptor).
     a_descriptor = TensorDescriptor.from_tensor(A.view(M, K), [1, 32])
     b_descriptor = TensorDescriptor.from_tensor(b_u8, [1, 32])

@@ -54,41 +54,66 @@ Every (row, problem, regime, impl) cell runs in THREE modes:
 
 Regimes: decode T=1 and prefill T=8192 (routed through top_k experts; attn row: M=T).
 
-SMOKE=1 env: fast everything-compiles pass — 3-trial tunes (via
-FINEGRAINED_AUTOTUNE_TRIALS, which must be set before the package import) and a
-256-token prefill.
+--smoke: fast everything-compiles pass — 3-trial tunes (via FINEGRAINED_AUTOTUNE_TRIALS, set
+before the package import) and a 256-token prefill.
 
 Baselines ("all kinds"): finegrained-fp8 (upstream), DeepGEMM (fp8/fp4/bf16), transformers
 grouped_mm/batched_mm (torch._grouped_mm / torch.bmm, the BF16 torch path), SonicMoE, OpenAI
 triton_kernels (MXFP4), and torch.scaled_grouped_mm (the cuBLAS quantized-prefill path). Each
 is import-guarded; a missing dependency skips that baseline.
 
-Run: python bench/bench_moe.py             (all rows, single GPU)
-     GPUS=8 python bench/bench_moe.py      (shard problems across 8 GPUs, one process per GPU)
-     GPUS=5 BENCH_DEVICES=3,4,5,6,7 python bench/bench_moe.py  (pin those shards to GPUs 3-7)
-     SMOKE=1 python bench/bench_moe.py     (fast compile check)
-     PRESWIZZLE=0 python bench/bench_moe.py (affine MX scales instead of the fast path)
-     python bench/bench_moe.py gpt-oss     (substring filter on row/problem names)
-     REPLOT=1 python bench/bench_moe.py    (rebuild the figure from bench_moe.csv)
+Run: python bench/bench_moe.py                         (all rows, single GPU)
+     python bench/bench_moe.py --gpus 8                (shard problems across 8 GPUs, one process per GPU)
+     python bench/bench_moe.py --gpus 5 --devices 3,4,5,6,7  (pin those shards to GPUs 3-7)
+     python bench/bench_moe.py --smoke                 (fast compile check)
+     python bench/bench_moe.py --no-preswizzle         (affine MX scales instead of the fast path)
+     python bench/bench_moe.py gpt-oss                 (substring filter on row/problem names)
+     python bench/bench_moe.py --replot                (rebuild the figure from bench_moe.csv)
+     python bench/bench_moe.py --mock                  (no GPU: random latencies, validates the figure layout)
+     python bench/bench_moe.py --help
 """
 
 import os
 import sys
 from types import SimpleNamespace
 
-# GPUS>1 shards the per-problem tasks across that many GPUs (one process per GPU, coordinator
-# merges + plots). BENCH_SHARD="g/n" marks a worker subprocess (owns tasks where i % n == g).
-GPUS = int(os.environ.get("GPUS", "1"))
+import argparse
+
+_parser = argparse.ArgumentParser(
+    description="MoE bench: finegrained-kernels vs finegrained-fp8 + references, on real model shapes.",
+    epilog="Outputs land beside the script: bench_moe.csv + bench_moe.png (a filtered run writes "
+           "bench_moe_partial.*; --mock writes bench_moe_mock.*).",
+)
+_parser.add_argument("filters", nargs="*", metavar="FILTER",
+                     help="substring filter(s) on row/problem names (e.g. gpt-oss, 'attn quantized')")
+_parser.add_argument("--gpus", type=int, default=1,
+                     help="shard the problems across this many GPUs, one process per GPU; the "
+                          "coordinator merges the shard CSVs and plots (default 1: run inline)")
+_parser.add_argument("--devices", default="",
+                     help="comma-separated physical GPUs for the shards (default 0..gpus-1); shard g "
+                          "still owns tasks where i %% gpus == g, only the device it runs on changes")
+_parser.add_argument("--smoke", action="store_true",
+                     help="fast everything-compiles pass: 3-trial tunes and a 256-token prefill")
+_parser.add_argument("--mock", action="store_true",
+                     help="no GPU, no kernels: random-but-plausible latencies and parity so the figure "
+                          "(layout, crash markers, hatching) can be validated in seconds")
+_parser.add_argument("--replot", action="store_true",
+                     help="skip benching, rebuild the figure from the existing bench_moe.csv")
+_parser.add_argument("--no-preswizzle", dest="preswizzle", action="store_false",
+                     help="bench the affine (row-major) MX scale path instead of the pre-swizzled "
+                          "SWIZZLE_32_4_4 tcgen05 fast path")
+_parser.add_argument("--suffix", default=None,
+                     help="output-name suffix (bench_moe<suffix>.csv/png) so filtered rows can run "
+                          "concurrently on separate GPUs without racing for the same partial files")
+ARGS = _parser.parse_args()
+FILTERS = ARGS.filters
+GPUS = ARGS.gpus
+SMOKE = ARGS.smoke
+MOCK = ARGS.mock
+REPLOT = ARGS.replot
+# BENCH_SHARD="g/n" marks a worker subprocess spawned by the --gpus coordinator (owns tasks where
+# i % n == g); it is the one switch that stays in the environment because the coordinator sets it.
 _SHARD = os.environ.get("BENCH_SHARD")
-SMOKE = os.environ.get("SMOKE") == "1"
-# MOCK=1: no GPU, no kernels — every cell gets a random-but-plausible latency and
-# parity so the FIGURE (layout, crash markers, parity hatching) can be validated in
-# seconds. Writes bench_moe_mock.png.
-MOCK = os.environ.get("MOCK") == "1"
-# REPLOT=1: skip all benching, rebuild the figure from an existing bench_moe.csv.
-# Lets the layout/config (model order, which baselines are shown) be re-rendered in
-# seconds without re-running the multi-hour sweep.
-REPLOT = os.environ.get("REPLOT") == "1"
 if SMOKE:
     os.environ.setdefault("FINEGRAINED_AUTOTUNE_TRIALS", "3")
 
@@ -110,11 +135,11 @@ import kernels.utils as _kernels_utils  # noqa: E402
 
 _kernels_utils._check_trust_remote_code = lambda *a, **k: None
 
-# PRESWIZZLE=0 to bench the affine (row-major) MX scale path instead of the pre-swizzled
+# --no-preswizzle benches the affine (row-major) MX scale path instead of the pre-swizzled
 # SWIZZLE_32_4_4 tcgen05 fast path. Default on: the finegrained-kernels arm feeds pre-swizzled
 # weight scales so the numbers reflect the max-perf path (the guard rejects non-128 gate/N,
 # so we only swizzle MX weights on 128-aligned dims; everything else stays affine).
-PRESWIZZLE = os.environ.get("PRESWIZZLE", "1") == "1"
+PRESWIZZLE = ARGS.preswizzle
 _MX_WEIGHTS = {"mxfp8", "mxfp8_u8", "mxfp4", "nvfp4"}
 
 
@@ -1325,9 +1350,6 @@ print("finegrained-kernels = local build; baselines: finegrained-fp8 (upstream),
       "nvfp4-gemm (transformers' NVFP4Linear kernel), megablocks (bf16 dMoE)"
       f"{f'  |  {GPUS} GPUs' if GPUS > 1 else ''}\n")
 
-FILTERS = sys.argv[1:]
-
-
 def wanted(*names):
     return not FILTERS or any(f in n for f in FILTERS for n in names)
 
@@ -1484,16 +1506,16 @@ elif GPUS > 1 and _SHARD is None and not MOCK:
     for sp in shard_paths:  # a leftover shard from a prior run must never merge as fresh data
         if os.path.exists(sp):
             os.unlink(sp)
-    # BENCH_DEVICES="3,4,5,6,7" pins the workers to specific physical GPUs (default: 0..GPUS-1).
-    # Shard g still owns tasks where i % GPUS == g; only the device it runs on changes, so a box
-    # whose low-numbered GPUs are busy can still fan out.
-    devices = [d.strip() for d in os.environ.get("BENCH_DEVICES", "").split(",") if d.strip()]
+    # --devices pins the workers to specific physical GPUs (default: 0..GPUS-1); a box whose
+    # low-numbered GPUs are busy can still fan out.
+    devices = [d.strip() for d in ARGS.devices.split(",") if d.strip()]
     if devices and len(devices) != GPUS:
-        raise SystemExit(f"BENCH_DEVICES lists {len(devices)} device(s) but GPUS={GPUS}")
+        raise SystemExit(f"--devices lists {len(devices)} device(s) but --gpus is {GPUS}")
+    worker_flags = (["--smoke"] if SMOKE else []) + ([] if PRESWIZZLE else ["--no-preswizzle"])
     procs = [subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__)] + FILTERS,
+        [sys.executable, os.path.abspath(__file__), "--gpus", "1", *worker_flags, *FILTERS],
         env={**os.environ, "CUDA_VISIBLE_DEVICES": devices[g] if devices else str(g),
-             "BENCH_SHARD": f"{g}/{GPUS}", "GPUS": "1"}) for g in range(GPUS)]
+             "BENCH_SHARD": f"{g}/{GPUS}"}) for g in range(GPUS)]
     nfail = sum(p.wait() != 0 for p in procs)
     missing = [g for g, sp in enumerate(shard_paths) if not os.path.exists(sp)]
     if nfail or missing:
@@ -1550,9 +1572,9 @@ GLOBAL_SPAN = max(
 # though the figure shows one deployment mode per regime. REPLOT reads this CSV as its source
 # (no write), and the multi-GPU coordinator already merged the shard CSVs into it — so only the
 # single-process run writes here.
-# BENCH_SUFFIX lets filtered rows run concurrently on separate GPUs without racing for
-# the same partial CSV/PNG (splice the pieces into bench_moe.csv afterwards)
-suffix = os.environ.get("BENCH_SUFFIX") or (
+# --suffix lets filtered rows run concurrently on separate GPUs without racing for the same
+# partial CSV/PNG (splice the pieces into bench_moe.csv afterwards)
+suffix = ARGS.suffix if ARGS.suffix is not None else (
     "_mock" if MOCK else ("_partial" if FILTERS else "")
 )
 _via_coordinator = GPUS > 1 and _SHARD is None and not MOCK  # merged the CSV already

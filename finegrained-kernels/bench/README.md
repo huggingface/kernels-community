@@ -27,7 +27,7 @@ the others still run.
 
 By default the finegrained-kernels arm feeds **pre-swizzled** (`SWIZZLE_32_4_4`) MX weight scales,
 so its numbers reflect the tcgen05 fast path. Only MX weights on 128-aligned dims are swizzled
-(the routed guard rejects non-128 gate/N); block-fp8 and BF16 stay affine. Set `PRESWIZZLE=0`
+(the routed guard rejects non-128 gate/N); block-fp8 and BF16 stay affine. Pass `--no-preswizzle`
 to measure the affine path instead.
 
 Correctness is cross-checked in-run: each baseline's output is compared to the finegrained-kernels
@@ -51,13 +51,14 @@ row-interleaved view (`_interleave_gate_up`) because the kernels read gate|up in
 ## Running
 
 ```bash
-python bench/bench_moe.py                 # full grid, single GPU -> bench_moe.csv + bench_moe.png
-GPUS=8 python bench/bench_moe.py           # shard problems across 8 GPUs (one process per GPU), then merge + plot
-SMOKE=1 python bench/bench_moe.py          # fast everything-compiles pass (3-trial tunes, 256-tok prefill)
-PRESWIZZLE=0 python bench/bench_moe.py     # affine MX scales instead of the fast path
-python bench/bench_moe.py gpt-oss          # substring filter on row/problem names
-REPLOT=1 python bench/bench_moe.py         # rebuild the figure from an existing bench_moe.csv
-MOCK=1 python bench/bench_moe.py           # no GPU: random latencies to validate the figure layout
+python bench/bench_moe.py                    # full grid, single GPU -> bench_moe.csv + bench_moe.png
+python bench/bench_moe.py --gpus 8           # shard problems across 8 GPUs (one process per GPU), then merge + plot
+python bench/bench_moe.py --gpus 5 --devices 3,4,5,6,7   # pin the shards to GPUs 3-7
+python bench/bench_moe.py --smoke            # fast everything-compiles pass (3-trial tunes, 256-tok prefill)
+python bench/bench_moe.py --no-preswizzle    # affine MX scales instead of the fast path
+python bench/bench_moe.py gpt-oss            # substring filter on row/problem names
+python bench/bench_moe.py --replot           # rebuild the figure from an existing bench_moe.csv
+python bench/bench_moe.py --mock             # no GPU: random latencies to validate the figure layout
 ```
 
 Outputs land beside the script (`bench/bench_moe.csv`, `bench/bench_moe.png`). The figure is

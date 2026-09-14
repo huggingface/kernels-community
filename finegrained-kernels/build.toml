@@ -11,4 +11,6 @@ backends = [
 [general.hub]
 repo-id = "kernels-community/finegrained-kernels"
 
+[torch-noarch]
+
 [kernel]

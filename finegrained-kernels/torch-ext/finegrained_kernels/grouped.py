@@ -23,13 +23,13 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
 from .compat import FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, sm_count, tl_dtype
+from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import check_activation_format, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
-from .tile_layout import build_tile_layout
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_swizzled_grouped, swizzle_grouped_mx_scales
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
-from .scheduling import expand_gather_below_parity, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
-from .tiles import (
+from .scheduling import build_tile_layout, expand_gather_below_parity, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
+from .loading.tiles import (
     load_act_block_dynamic,
     load_act_mx,
     load_act_plain,
@@ -45,86 +45,6 @@ from .epilogue import acc_init, bias_strides, gemm_epilogue
 from .pruners import PATH_ANCHOR_AXES, global_scale_warp_spec_pruner, weight_only_warp_spec_matched_mode_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
 
 
-def _rebind_grouped_weight_descriptor(nargs):
-    """Per-config pre_hook: set the MX weight descriptor box to the tuned
-    ``[1, (2 if GATE else 1) * BLOCK_SIZE_N, BLOCK_SIZE_K // values_per_byte]`` over the
-    ``(E, 2N|N, K_bytes)`` weight view. MUST mutate ``block_shape`` in place — a rebind never reaches
-    the launch. No-op for pointer configs (they never read the descriptor)."""
-    if nargs.get("B_MEMORY_MODE", "pointer") == "pointer" or isinstance(
-        nargs["BDescriptor"], int
-    ):
-        return
-    values_per_byte = 2 if nargs["B"].dtype == torch.uint8 else 1
-    nargs["BDescriptor"].block_shape = [
-        1,
-        (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"],
-        nargs["BLOCK_SIZE_K"] // values_per_byte,
-    ]
-
-
-def _rebind_grouped_act_descriptor(nargs):
-    """Per-config pre_hook: set the activation descriptor box to the tuned
-    ``[BLOCK_SIZE_M, BLOCK_SIZE_K // act_values_per_byte]`` over the ``(rows, K_bytes)``
-    activation matrix. In-place mutate; no-op for pointer-A configs."""
-    if nargs.get("A_MEMORY_MODE", "pointer") == "pointer" or isinstance(
-        nargs["ADescriptor"], int
-    ):
-        return
-    act_values_per_byte = 2 if nargs["A"].dtype == torch.uint8 else 1
-    # tma gather4 loads N independent rows: descriptor_gather requires a 1-row box;
-    # the contiguous (no-gather) arm loads the whole [BM, BK_bytes] tile in one box
-    nargs["ADescriptor"].block_shape = [
-        1 if nargs.get("GatherIdx") is not None else nargs["BLOCK_SIZE_M"],
-        nargs["BLOCK_SIZE_K"] // act_values_per_byte,
-    ]
-
-
-def _rebind_grouped_descriptors(nargs):
-    """Composite pre_hook: both weight and activation descriptor boxes."""
-    _rebind_grouped_weight_descriptor(nargs)
-    _rebind_grouped_act_descriptor(nargs)
-
-
-def build_grouped_operand_descriptors(a_operand, b_operand):
-    """Operand host-TMA descriptors for a grouped launch: A box ``[16, 64]``, B box
-    ``[1, 128, 64]`` over the ``(E, 2N|N, K_bytes)`` weight view. Placeholder boxes, re-bound to
-    the tuned tile per config by ``_rebind_grouped_descriptors``."""
-    return (
-        TensorDescriptor.from_tensor(a_operand, block_shape=[16, 64]),
-        TensorDescriptor.from_tensor(b_operand, block_shape=[1, 128, 64]),
-    )
-
-
-def _rebind_grouped_mx_descriptors(nargs):
-    """MX composite pre_hook: the operand boxes plus the two SWIZZLE_32_4_4 scale boxes
-    ``[1, BLOCK // 128, (BK // SCALE_GROUP_K) // 4, 2, 256]`` over the swizzled
-    ``(1, rows // 128, cols // 4, 2, 256)`` views. Activation box is BM // 128 (BM pinned 128);
-    the weight box is ``(2 if GATE else 1) * BN // 128`` — the stacked gate|up tile is one 2*BN
-    block (BN pinned 128 under GATE by ``swizzled_scales_bm_pruner``). Mutate in place. Both scale
-    descriptors are None on the un-swizzled arm (affine read — one SWIZZLED_SCALES flag governs both
-    operands), so their boxes are skipped."""
-    _rebind_grouped_descriptors(nargs)
-    # BK below 4 scale groups (BK=64 rows the pruner rejects) still passes through here when a
-    # descriptor is unread — clamp like bn_blocks below so it keeps a valid, non-degenerate
-    # shape (a 0-block box traps the descriptor-encoding pass).
-    rep_k = max((nargs["BLOCK_SIZE_K"] // nargs["SCALE_GROUP_K"]) // 4, 1)
-    if nargs["ASDescriptor"] is not None:
-        nargs["ASDescriptor"].block_shape = [1, nargs["BLOCK_SIZE_M"] // 128, rep_k, 2, 256]
-    if nargs["BSDescriptor"] is not None:
-        # One bulk-load spans (2 if GATE) * BN//128 blocks: GATE reads the block-interleaved gate|up
-        # pair ([g,u] adjacent) as one 2*BN tile. BN<128 (non-gate, non-128 N) reads via the per-row
-        # pointer gather instead — clamp the box to one block so the (unread) descriptor keeps a valid,
-        # non-degenerate shape (a 0-block box traps the descriptor-encoding pass).
-        bn_blocks = max(1, ((2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"]) // 128)
-        nargs["BSDescriptor"].block_shape = [1, bn_blocks, rep_k, 2, 256]
-    # Swizzled requant output (Cs is a descriptor): the store tile is [1, 1, rep_n, 2, 256], and
-    # rep_n = (BN // SCALE_GROUP_K) // 4 depends on the tuned BLOCK_SIZE_N and the group size — so
-    # rebind per config, else nvfp4 (group-16 -> rep_n=2) mismatches the [.,.,1,.,.] build default.
-    if nargs["CSDescriptor"] is not None:
-        rep_n = (nargs["BLOCK_SIZE_N"] // nargs["SCALE_GROUP_K"]) // 4
-        nargs["CSDescriptor"].block_shape = [1, 1, rep_n, 2, 256]
-
-
 @bayesian_autotune(
     # No SWAP_AB axis: the descriptor loads the natural-orientation ((2|1), BN, BK) gate|up box
     # and transposes once to the same K-major tile the pointer arm builds. Both memory axes are
@@ -136,7 +56,7 @@ def _rebind_grouped_mx_descriptors(nargs):
         tune_block_m=True,
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=_rebind_grouped_descriptors,
+        pre_hook=rebind_grouped_descriptors,
     ),
     # GATE keys the gate|up arm separately: its dot is 2*BN wide, a different tile optimum.
     # BLOCK_SIZE_N/BLOCK_SIZE_K here are the launch-pinned quant block (not tuned) — they gate
@@ -341,7 +261,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         tune_block_m=True,
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=_rebind_grouped_descriptors,
+        pre_hook=rebind_grouped_descriptors,
     ),
     ["N", "K", "tokens_per_expert_bit_length", "GATE", "BLOCK_SIZE_N", "BLOCK_SIZE_K"],
     n_trials=100,
@@ -525,7 +445,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
         tune_block_m=True,
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=_rebind_grouped_descriptors,
+        pre_hook=rebind_grouped_descriptors,
     ),
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
@@ -715,7 +635,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         compute_modes=("dot_scaled", "dot"),
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=_rebind_grouped_mx_descriptors,
+        pre_hook=rebind_grouped_mx_descriptors,
         warp_spec=True,  # dot_scaled+WS+TMA compiles+wins on a clean context (was a num_warps=2 misread)
     ),  # prefill: no scalar branch; TMA descriptor vs pointer loads on both operands
     # the MXFP4/MXFP8 (and packed-activation) splits key themselves — the tuner appends
@@ -922,7 +842,7 @@ def mx_dynamic_matmul_grouped_kernel(
             )
             acc = mx_compute(
                 acc, a, a_s, w, w_s, COMPUTE_MODE,
-                BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, False,
+                (2 if GATE else 1) * BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, False,
             )
             a_ptrs += (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE) * stride_a_k
             ka_off += BLOCK_SIZE_K // ACT_VALUES_PER_BYTE
@@ -981,7 +901,7 @@ def mx_dynamic_matmul_grouped_kernel(
         compute_modes=("dot", "dot_scaled"),
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=_rebind_grouped_descriptors,
+        pre_hook=rebind_grouped_descriptors,
     ),
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
@@ -1147,7 +1067,7 @@ def mx_weight_only_matmul_grouped_kernel(
         packed_schedule=True,
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=_rebind_grouped_descriptors,
+        pre_hook=rebind_grouped_descriptors,
     ),
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
@@ -1941,7 +1861,7 @@ def mx_dynamic_matmul_grouped(
         a_u8, b_u8.view(num_experts, 2 * N if gate else N, b_u8.shape[2])
     )
     # (the SA/SB swizzled-scale descriptors and their placeholder boxes — re-bound per tuned
-    # config by _rebind_grouped_mx_descriptors — are built above with the scales.)
+    # config by rebind_grouped_mx_descriptors — are built above with the scales.)
 
     # one launch per call (graph-safe, ~2µs) so PACKED_SCHEDULE and inline configs share
     # identical launch args during tunes
@@ -2148,7 +2068,7 @@ def mx_weight_only_matmul_grouped(
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     # Operand host-TMA descriptors (A over (S, K), B over the (E, 2N|N, K_bytes) weight view);
-    # placeholder boxes rebound per config by _rebind_grouped_descriptors, read only by descriptor
+    # placeholder boxes rebound per config by rebind_grouped_descriptors, read only by descriptor
     # configs the tuner picks. Scales stay affine (3D pointer) — no scale descriptor.
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A, b_u8.view(num_experts, 2 * N if gate else N, K_b)

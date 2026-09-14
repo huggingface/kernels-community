@@ -74,7 +74,8 @@ from .compat import (
     get_accelerator_autotuning_configs,
     sm_count,
 )
-from .matmul import _maybe_descriptor, _rebind_operand_box, matmul_2d
+from .descriptors import maybe_descriptor, rebind_dgrad_descriptors, rebind_dgrad_grouped_descriptors
+from .matmul import matmul_2d
 from .pruners import (
     PATH_ANCHOR_AXES,
     block_within_dim_pruner,
@@ -85,32 +86,15 @@ from .pruners import (
     warp_spec_compile_guard_pruner,
 )
 from .quant import e2m1_cols_to_bf16, e2m1_cols_to_f32
-from .scales import decode_group_scale
-from .tiles import load_grouped_act_tile, operand_tile_ptrs
-from .scheduling import resolve_grouped_tile
-from .tile_layout import build_tile_layout
+from .loading.scales import decode_group_scale
+from .loading.tiles import load_grouped_act_tile, operand_tile_ptrs
+from .scheduling import build_tile_layout, resolve_grouped_tile
 
 
 # Internal: these are the gradient PRODUCTS, not API. Backward hangs off the forward ops via
 # ``register_autograd`` (the table at the bottom of this file), so an ordinary forward call
 # differentiates and there is
 # no second entry point to keep in sync. Nothing here is re-exported from the package root.
-
-
-def _rebind_dgrad_descriptors(nargs):
-    """Per-config pre_hook: set the dgrad boxes to the tuned tile — ``[BM, BN]`` over the (M, N)
-    gradient and ``[BN, BK // WEIGHT_VALUES_PER_BYTE]`` over the (N, K_bytes) weight. Both are
-    natural contiguous windows in the FORWARD-oriented operands, which is why dgrad can take a
-    descriptor at all: a transposed view has no unit-stride innermost dim (see
-    ``_maybe_descriptor``). Scales stay affine on the pointer arm, as weight-only does."""
-    wvpb = 2 if nargs["B"].dtype == torch.uint8 else 1
-    _rebind_operand_box(
-        nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], nargs["BLOCK_SIZE_N"]
-    )
-    _rebind_operand_box(
-        nargs, "B_MEMORY_MODE", "BDescriptor",
-        nargs["BLOCK_SIZE_N"], nargs["BLOCK_SIZE_K"] // wvpb,
-    )
 
 
 @triton.jit
@@ -176,7 +160,7 @@ def _dgrad_weight_tile(
         warp_spec=True,
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=_rebind_dgrad_descriptors,
+        pre_hook=rebind_dgrad_descriptors,
     ),
     ["N", "K", "m_bit_length"],
     n_trials=100,
@@ -324,8 +308,8 @@ def dgrad_matmul_2d(
         # so constructing it before the switch fails as "invalid device context" whenever the
         # caller's device is not the active one. Boxes are placeholders; the pre_hook rebinds
         # them to the tuned tile per config.
-        a_descriptor = _maybe_descriptor(dY, [1, 128])
-        b_descriptor = _maybe_descriptor(W, [1, 128])
+        a_descriptor = maybe_descriptor(dY, [1, 128])
+        b_descriptor = maybe_descriptor(W, [1, 128])
         compile_time_only_triton_wrap(dgrad_matmul_2d_kernel)[grid](
             dY,
             a_descriptor,
@@ -352,22 +336,6 @@ def dgrad_matmul_2d(
     return dX
 
 
-def _rebind_dgrad_grouped_descriptors(nargs):
-    """Grouped dgrad boxes. The activation box is 1 row when the pass gathers (tma gather4 needs a
-    1-row box) and ``[BM, BN]`` otherwise — ScatterIdx is the gather map here, since dgrad reads
-    dY at the forward's SCATTER destination. The weight box is ``[1, BN, BK_bytes]`` over
-    (E, N, K_bytes): the expert leads, so this descriptor takes THREE offsets."""
-    wvpb = 2 if nargs["B"].dtype == torch.uint8 else 1
-    gathering = nargs.get("ScatterIdx") is not None
-    _rebind_operand_box(
-        nargs, "A_MEMORY_MODE", "ADescriptor",
-        1 if gathering else nargs["BLOCK_SIZE_M"], nargs["BLOCK_SIZE_N"],
-    )
-    desc = nargs["BDescriptor"]
-    if nargs.get("B_MEMORY_MODE", "pointer") != "pointer" and not isinstance(desc, int) and desc is not None:
-        desc.block_shape = [1, nargs["BLOCK_SIZE_N"], nargs["BLOCK_SIZE_K"] // wvpb]
-
-
 @bayesian_autotune(
     # Persistent grouped loop, plain dot over the N reduction. No memory-mode axis (the
     # dequantize is in-tile, so both operands read through pointers) and no COMPUTE_MODE axis
@@ -378,7 +346,7 @@ def _rebind_dgrad_grouped_descriptors(nargs):
         warp_spec=True,
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
-        pre_hook=_rebind_dgrad_grouped_descriptors,
+        pre_hook=rebind_dgrad_grouped_descriptors,
     ),
     ["N", "K", "tokens_per_expert_bit_length"],
     n_trials=100,
@@ -608,8 +576,8 @@ def dgrad_matmul_grouped(
     dX = torch.zeros(S if routed_out else rows, K, device=dY.device, dtype=torch.float32)
     with device_context(dY.device):
         # inside the context — see dgrad_matmul_2d; placeholder boxes, rebound by the pre_hook
-        a_descriptor = _maybe_descriptor(dY, [1, 128])
-        b_descriptor = _maybe_descriptor(W, [1, 1, 128])
+        a_descriptor = maybe_descriptor(dY, [1, 128])
+        b_descriptor = maybe_descriptor(W, [1, 1, 128])
         compile_time_only_triton_wrap(dgrad_matmul_grouped_kernel)[(num_sms,)](
             dY,
             a_descriptor,

@@ -25,12 +25,13 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 from .bayesian_autotuner import bayesian_autotune
 
 from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, decode_pdl
+from .descriptors import rebind_batched_mx_bs_descriptor
 from .formats import check_activation_format, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .epilogue import fused_glu
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
-from .tiles import (
+from .loading.tiles import (
     advance_ptrs,
     load_act_block_dynamic,
     load_act_mx,
@@ -497,25 +498,13 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
 # is excluded (only scalar / dot_scaled-swap are emitted); the swapped dot helper stays
 # implemented for future shapes but is not fielded. Swap verdicts are B200 (sm_100) — re-measure
 # on H100 or the target device before inheriting.
-def _rebind_batched_mx_bs_descriptor(nargs):
-    """Per-config pre_hook: size the swizzled weight-scale descriptor box to the tile's 128-row
-    blocks (doubled under GATE, whose tile spans 2*BN interleaved rows). BN<128 (fp8 scalar)
-    pointer-gathers instead and never reads the descriptor. Only under SWIZZLED_SCALES; the
-    un-swizzled path keeps its dummy box."""
-    if not nargs.get("SWIZZLED_SCALES"):
-        return
-    rep = max(1, ((2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"]) // 128)
-    rep_k = (nargs["BLOCK_SIZE_K"] // nargs["SCALE_GROUP_K"]) // 4
-    nargs["BSDescriptor"].block_shape = [1, rep, rep_k, 2, 256]
-
-
 @bayesian_autotune(
     get_accelerator_autotuning_configs(
         mx=True,
         tune_block_nk=True,
         compute_modes=("dot_scaled", "scalar"),
         swap_ab=True,
-        pre_hook=_rebind_batched_mx_bs_descriptor,
+        pre_hook=rebind_batched_mx_bs_descriptor,
     ),
     # ACTIVATION_FORMAT keys the inline act-quant grid: A stays raw bf16 under every
     # format, so the tuner's dtype-appended key can't split W4A8 from W4A4 itself.
@@ -680,7 +669,7 @@ def mx_dynamic_matmul_batched_kernel(
         )
         accumulator = mx_compute(
             accumulator, a, a_scale, b, b_s, COMPUTE_MODE,
-            BLOCK_SIZE_M, n_width, BLOCK_SIZE_K, SCALE_GROUP_K, SWAP_AB,
+            n_width, BLOCK_SIZE_K, SCALE_GROUP_K, SWAP_AB,
         )
         a_ptrs, as_ptrs, b_ptrs, _, _, _ = advance_ptrs(
             a_ptrs, as_ptrs, b_ptrs, b_ptrs, b_ptrs, b_ptrs,

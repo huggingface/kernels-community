@@ -20,7 +20,49 @@ import triton.language as tl
 
 from ._ops import add_op_namespace_prefix
 from .compat import compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, is_sm10x
-from .tile_layout import resolve_tile_inline
+
+
+@triton.jit
+def build_tile_layout(
+    ExpertStart, NUM_EXPERTS: tl.constexpr, BLOCK_SIZE_M: tl.constexpr
+):
+    """Load ``expert_start`` once and derive the per-BM tile layout vectors (kept in
+    registers for the whole persistent loop): per-expert first sorted row, token count,
+    exclusive tile-start cumsum, and the total M-tile count. ``ExpertStart`` is
+    ``(NUM_EXPERTS + 1,)`` with a trailing ``S`` sentinel (``expert_start[E] == S``)."""
+    e_offs = tl.arange(0, NUM_EXPERTS)
+    exp_start = tl.load(ExpertStart + e_offs)
+    exp_end = tl.load(ExpertStart + e_offs + 1)
+    freqs = exp_end - exp_start
+    tiles_per_e = (freqs + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    tile_start_excl = (
+        tl.cumsum(tiles_per_e, 0) - tiles_per_e
+    )  # first tile index of expert e
+    total_m_tiles = tl.sum(tiles_per_e, 0)
+    return exp_start, freqs, tile_start_excl, total_m_tiles, e_offs
+
+
+@triton.jit
+def resolve_tile_inline(
+    pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_SIZE_M: tl.constexpr
+):
+    """Map an M-tile id to its owning expert + the tile's sorted row range, from the
+    register-resident layout (no global loads). Returns ``(expert_id, sorted_indices,
+    row_mask)``."""
+    # Bucketize via the exclusive tile cumsum: #experts whose tile-start <= pid_m, minus 1.
+    expert_id = tl.sum((tile_start_excl <= pid_m).to(tl.int32), 0) - 1
+    sel = (
+        e_offs == expert_id
+    )  # scalar-index the E-vectors via mask-sum (no dynamic index)
+    e_start = tl.sum(tl.where(sel, exp_start, 0), 0)
+    e_tile_start = tl.sum(tl.where(sel, tile_start_excl, 0), 0)
+    freq = tl.sum(tl.where(sel, freqs, 0), 0)
+    within = pid_m - e_tile_start
+    m_start = e_start + within * BLOCK_SIZE_M
+    offs = tl.arange(0, BLOCK_SIZE_M)
+    row_mask = offs < freq - within * BLOCK_SIZE_M
+    sorted_indices = tl.max_contiguous(m_start + offs, BLOCK_SIZE_M)
+    return expert_id, sorted_indices, row_mask
 
 # Flat-slot tile per program for the O(S) routing kernels (count + scatter). These are small
 # latency-bound atomic kernels that want many programs: a sweep over {256..4096} x prefill shapes

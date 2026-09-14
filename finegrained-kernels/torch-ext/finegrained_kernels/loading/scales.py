@@ -15,7 +15,7 @@
 import triton
 import triton.language as tl
 
-from .quant import fp8_act_quant_inline, mx_act_quant_inline
+from ..quant import fp8_act_quant_inline, mx_act_quant_inline
 
 
 @triton.jit

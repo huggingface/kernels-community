@@ -20,7 +20,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 from .compat import compile_time_only_triton_wrap, decode_pdl, device_context
 from .mma import MMA_N_ATOM
 from .quant import fp8_act_quant_inline, mx_act_quant_inline
-from .scales import apply_global_scale
+from .loading.scales import apply_global_scale
 
 
 @triton.jit
