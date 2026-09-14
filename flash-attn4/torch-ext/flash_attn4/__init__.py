@@ -1,20 +1,18 @@
 """Flash Attention CUTE (CUDA Template Engine) implementation."""
 
-__version__ = "4.0.0.beta8"
+__version__ = "4.0.0.beta30"
 
-import cutlass.cute as cute
-
-from .cute_dsl_utils import cute_compile_patched
 from .interface import (
     flash_attn_func,
     flash_attn_varlen_func,
 )
 
-# Patch cute.compile to optionally dump SASS
-cute.compile = cute_compile_patched
-
+# Nothing else in the kernel imports this module, so it is not reachable as
+# `<kernel>.compute_block_sparsity` unless it is imported here.
+from . import compute_block_sparsity  # noqa: F401
 
 __all__ = [
+    "compute_block_sparsity",
     "flash_attn_func",
     "flash_attn_varlen_func",
 ]
