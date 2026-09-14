@@ -12,6 +12,7 @@
   "einops": [],
   "esmfold2-trimul": ["U01TU8GA59R"],
   "finegrained-fp8": ["U08Q42K8MGW"],
+  "finegrained-kernels": ["U08Q42K8MGW"],
   "fla": ["U08Q42K8MGW"],
   "flash-attn-ops": [],
   "flash-attn2": [],

@@ -18,6 +18,7 @@ KERNEL_SOURCE_MAPPING = {
     "deformable-detr": "",
     "einops": "https://github.com/arogozhnikov/einops",
     "finegrained-fp8": "",
+    "finegrained-kernels": "",
     "flash-attn-ops": "https://github.com/Dao-AILab/flash-attention",
     "flash-attn2": "https://github.com/Dao-AILab/flash-attention",
     "flash-attn3": "https://github.com/Dao-AILab/flash-attention",
