@@ -6,7 +6,7 @@
   "SWAP_AB": false,
   "num_ctas": 1,
   "num_stages": 2,
-  "num_warps": 4
+  "num_warps": 8
  },
  "[2048, 6144, 8, true, \"A:torch.bfloat16\", \"B:torch.bfloat16\", \"C:torch.bfloat16\", \"Bias:None\", \"ExpertIds:torch.int32\", \"GatherIdx:torch.int32\", \"ScatterIdx:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\"]": {
   "BLOCK_SIZE_K": 256,
@@ -50,7 +50,7 @@
   "BLOCK_SIZE_N": 32,
   "SWAP_AB": false,
   "num_ctas": 1,
-  "num_stages": 3,
+  "num_stages": 2,
   "num_warps": 4
  },
  "[4096, 2048, 6, false, \"A:torch.bfloat16\", \"B:torch.bfloat16\", \"C:torch.bfloat16\", \"Bias:None\", \"ExpertIds:torch.int32\", \"GatherIdx:None\", \"ScatterIdx:None\", \"SWIGLU_ALPHA:None\", \"SWIGLU_LIMIT:None\"]": {

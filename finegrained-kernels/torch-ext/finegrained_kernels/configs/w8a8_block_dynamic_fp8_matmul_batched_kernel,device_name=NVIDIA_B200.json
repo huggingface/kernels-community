@@ -4,7 +4,7 @@
   "BLOCK_SIZE_N": 64,
   "SWAP_AB": false,
   "num_ctas": 1,
-  "num_stages": 4,
+  "num_stages": 5,
   "num_warps": 4
  },
  "[4096, 4096, 6, null, false, 128, 128, \"torch.float8_e4m3fn\", \"torch.uint8\", \"torch.float8_e4m3fn\", \"torch.uint8\", \"torch.bfloat16\", \"torch.int32\", \"torch.int32\"]": {

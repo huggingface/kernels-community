@@ -3,7 +3,7 @@
   "A_MEMORY_MODE": "host_descriptor",
   "BLOCK_SIZE_M": 128,
   "B_MEMORY_MODE": "host_descriptor",
-  "PACKED_SCHEDULE": true,
+  "PACKED_SCHEDULE": false,
   "WARP_SPEC": true,
   "num_ctas": 1,
   "num_stages": 3,

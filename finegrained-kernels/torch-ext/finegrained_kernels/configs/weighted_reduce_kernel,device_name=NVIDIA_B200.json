@@ -12,7 +12,7 @@
   "num_warps": 4
  },
  "[4096, 1, \"torch.bfloat16\", \"torch.bfloat16\", \"torch.int32\", \"torch.float32\"]": {
-  "BLOCK_H": 1024,
+  "BLOCK_H": 512,
   "num_ctas": 1,
   "num_stages": 3,
   "num_warps": 8
@@ -30,7 +30,7 @@
   "num_warps": 8
  },
  "[6144, 14, \"torch.bfloat16\", \"torch.bfloat16\", \"torch.int32\", \"torch.float32\"]": {
-  "BLOCK_H": 2048,
+  "BLOCK_H": 1024,
   "num_ctas": 1,
   "num_stages": 3,
   "num_warps": 4
