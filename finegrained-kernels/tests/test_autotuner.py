@@ -249,7 +249,7 @@ def test_cross_process_determinism_block_dynamic_grouped():
         "torch.manual_seed(0)\n"
         "E,N,K,S=8,512,1024,256\n"
         "eids=torch.randint(0,E,(S,),device='cuda',dtype=torch.int32)\n"
-        "est,gi,si=fg.compute_grouped_scheduling(eids,E,1)\n"
+        "est,gi,si=fg.scheduling.compute_grouped_scheduling(eids,E,1)\n"
         "A=torch.randn(S,K,device='cuda',dtype=torch.bfloat16)\n"
         "B,Bs=make_weights(N,K,'cuda',[128,128],num_experts=E)\n"
         "out=fg.matmul_grouped(A,B,Bs=Bs,expert_start=est,output_dtype=torch.float32,gather_idx=gi,scatter_idx=si)\n"
