@@ -65,9 +65,9 @@ import torch
 import triton
 import triton.language as tl
 
-from ._ops import add_op_namespace_prefix
 from .bayesian_autotuner import bayesian_autotune
 from .compat import (
+    add_op_namespace_prefix,
     compile_time_only_triton_op,
     compile_time_only_triton_wrap,
     device_context,

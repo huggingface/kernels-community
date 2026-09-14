@@ -40,6 +40,17 @@ def decode_pdl() -> bool:
     return DECODE_PDL and not torch.compiler.is_compiling()
 from torch.library import triton_op, wrap_triton
 
+# kernel-builder generates ``_ops.py`` into the built variant (the op namespace carries the build's
+# unique id) and refuses to build over a tracked one, so the source tree has none: an unbuilt
+# checkout (tests, bench, FINEGRAINED_KERNELS_PATH) registers its ops under the plain package name.
+try:
+    from ._ops import add_op_namespace_prefix
+except ImportError:
+
+    def add_op_namespace_prefix(name: str) -> str:
+        return f"finegrained_kernels::{name}"
+
+
 
 
 
