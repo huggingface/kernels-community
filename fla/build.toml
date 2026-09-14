@@ -3,7 +3,7 @@ name = "fla"
 version = 1
 edition = 5
 license = "MIT"
-backends = ["cuda"]
+backends = ["cuda", "xpu"]
 python-depends = ["einops"]
 
 [general.hub]
