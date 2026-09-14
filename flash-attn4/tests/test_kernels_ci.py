@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
 cuda_major = (
     torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else None

@@ -22,7 +22,7 @@ if "flash_attn" not in sys.modules:
 
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
 get_aux_tensor_metadata = flash_attn4.cute_dsl_utils.get_aux_tensor_metadata
 get_num_sms_for_selection = flash_attn4.cute_dsl_utils.get_num_sms_for_selection

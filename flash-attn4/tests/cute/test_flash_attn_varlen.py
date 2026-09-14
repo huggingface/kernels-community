@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
 flash_attn_varlen_func = flash_attn4.flash_attn_varlen_func
 

@@ -3,7 +3,7 @@ import torch
 from torch.nn.attention.flex_attention import flex_attention
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
 _flash_attn_fwd = flash_attn4.interface._flash_attn_fwd
 _flash_attn_bwd = flash_attn4.interface._flash_attn_bwd

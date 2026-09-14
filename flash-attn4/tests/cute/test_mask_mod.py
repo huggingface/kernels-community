@@ -22,10 +22,9 @@ import cutlass.cute as cute
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import torch.nn.functional as F
 
-import importlib
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
 _flash_attn_fwd = flash_attn4.interface._flash_attn_fwd
 _flash_attn_bwd = flash_attn4.interface._flash_attn_bwd
@@ -38,7 +37,6 @@ normalize_block_sparse_config_bwd = flash_attn4.block_sparsity.normalize_block_s
 compute_dq_write_order = flash_attn4.block_sparsity.compute_dq_write_order
 compute_dq_write_order_from_block_mask = flash_attn4.block_sparsity.compute_dq_write_order_from_block_mask
 get_jit_cache = flash_attn4.cache_utils.get_jit_cache
-importlib.import_module(f"{flash_attn4.__name__}.compute_block_sparsity")
 compute_block_sparsity = flash_attn4.compute_block_sparsity.compute_block_sparsity
 utils = flash_attn4.utils
 from mask_mod_definitions import (

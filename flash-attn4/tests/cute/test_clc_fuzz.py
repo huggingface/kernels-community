@@ -15,7 +15,7 @@ import torch
 
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
 cute_utils = flash_attn4.utils
 FlashAttentionForwardSm100 = flash_attn4.flash_fwd_sm100.FlashAttentionForwardSm100

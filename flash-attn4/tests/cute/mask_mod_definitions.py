@@ -9,7 +9,7 @@ import torch
 
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
 utils = flash_attn4.utils
 fast_sampling = flash_attn4.block_sparsity.fast_sampling

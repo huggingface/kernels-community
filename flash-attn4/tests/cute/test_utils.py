@@ -6,7 +6,7 @@ import pytest
 
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
 cute_utils = flash_attn4.utils
 hash_callable = flash_attn4.utils.hash_callable

@@ -5,7 +5,7 @@ import pytest
 
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
 cache_utils = flash_attn4.cache_utils
 fa_logging = flash_attn4.fa_logging

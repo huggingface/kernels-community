@@ -9,7 +9,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
 interface = flash_attn4.interface
 JITCache = flash_attn4.cache_utils.JITCache

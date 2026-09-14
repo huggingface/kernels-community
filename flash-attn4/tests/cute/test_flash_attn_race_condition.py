@@ -16,7 +16,7 @@ except ImportError:
 
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
 attention_ref = flash_attn4.testing.attention_ref
 generate_qkv = flash_attn4.testing.generate_qkv

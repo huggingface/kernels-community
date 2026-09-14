@@ -5,12 +5,10 @@ import torch
 from torch.nn.attention.flex_attention import create_block_mask
 
 from mask_mod_definitions import get_mask_pair
-import importlib
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
-importlib.import_module(f"{flash_attn4.__name__}.compute_block_sparsity")
 compute_block_sparsity = flash_attn4.compute_block_sparsity.compute_block_sparsity
 
 

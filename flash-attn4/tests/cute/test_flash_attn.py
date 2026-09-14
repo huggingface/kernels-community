@@ -20,7 +20,7 @@ except ImportError:
 
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
 JITCache = flash_attn4.cache_utils.JITCache
 attention_ref = flash_attn4.testing.attention_ref

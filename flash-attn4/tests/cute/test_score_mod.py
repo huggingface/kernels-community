@@ -9,7 +9,7 @@ import operator
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import kernels
 
-flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=0)
+flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
 JITCache = flash_attn4.cache_utils.JITCache
 flash_attn_func = flash_attn4.interface.flash_attn_func
