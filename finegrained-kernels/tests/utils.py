@@ -294,9 +294,9 @@ def _make_nvfp4(N, K, E):
 
 
 def dq_nvfp4_two_level(B, Bs, Bs_global):
-    """fp32 dequant of two-level NVFP4 weights: block dequant × the per-expert global. ``Bs`` is the
-    e4m3 block scale, ``Bs_global`` the ``(E,)`` fp32 per-expert global (both separate, per the make)."""
-    return dq_grouped(B, Bs, NVFP4_SCALE_GROUP_K) * Bs_global.reshape(-1, 1, 1)
+    """fp32 dequant of two-level NVFP4 weights: block dequant × the per-expert fp32 global (kept
+    separate, per the make). ``Bs`` is the e4m3 block scale."""
+    return dq_grouped(B, Bs, NVFP4_SCALE_GROUP_K) * Bs_global.float().reshape(-1, 1, 1)
 
 
 def _make_full(dtype):

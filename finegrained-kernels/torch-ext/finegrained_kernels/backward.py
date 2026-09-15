@@ -85,6 +85,7 @@ from .pruners import (
     smem_pruner,
     warp_spec_compile_guard_pruner,
 )
+from .formats import global_scale_stride, normalize_global_scale
 from .quant import e2m1_cols_to_bf16, e2m1_cols_to_f32
 from .loading.scales import decode_group_scale
 from .loading.tiles import load_grouped_act_tile, operand_tile_ptrs
@@ -188,6 +189,7 @@ def dgrad_matmul_2d_kernel(
     B,  # (N, K) quantized weight, K-contiguous — read in its FORWARD orientation
     BDescriptor,  # host TMA descriptor over B, box (BN, BK_bytes); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (N // SCALE_ROW_DIV, K // SCALE_GROUP_K) weight scales
+    BsGlobal,  # fp32 NVFP4 second-level weight global; folded on the accumulator, None folds out
     C,  # (M, K) output gradient
     # Shape
     M,
@@ -266,6 +268,9 @@ def dgrad_matmul_2d_kernel(
         b_ptrs += BLOCK_SIZE_N * stride_b_n
         bs_ptrs += (BLOCK_SIZE_N // SCALE_ROW_DIV) * stride_bs_n
 
+    if BsGlobal is not None:  # NVFP4's second level — one matrix, so one value
+        accumulator = accumulator * tl.load(BsGlobal)
+
     tl.store(
         C + offs_m[:, None] * stride_c_m + offs_k[None, :] * stride_c_k,
         accumulator.to(C.dtype.element_ty),
@@ -281,6 +286,7 @@ def dgrad_matmul_2d(
     scale_group_k: int,
     scale_row_div: int,
     output_dtype: torch.dtype | None = None,
+    w_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``dX = dY @ W`` against the FORWARD-oriented quantized weight — the gradient a frozen
     quantized base weight passes to whatever trains in front of it (LoRA adapters, earlier
@@ -316,6 +322,7 @@ def dgrad_matmul_2d(
             W,
             b_descriptor,
             Ws,
+            w_global_scale,
             dX,
             M,
             N,
@@ -378,6 +385,8 @@ def dgrad_matmul_grouped_kernel(
     B,  # (E, N, K) quantized weights, K-contiguous — the forward orientation
     BDescriptor,  # host TMA descriptor over B, box (1, BN, BK_bytes)
     Bs,  # (E, N // SCALE_ROW_DIV, K // SCALE_GROUP_K) weight scales
+    BsGlobal,  # fp32 NVFP4 weight global, per tensor or per expert; folded on the accumulator
+    stride_bs_global,  # expert stride of BsGlobal (0 broadcasts a scalar)
     C,  # (S, K) output gradient, written in the forward's INPUT row order
     GatherIdx,  # (S,) sorted position -> source row of the forward's A
     ScatterIdx,  # (S,) sorted position -> destination row of the forward's C
@@ -516,6 +525,9 @@ def dgrad_matmul_grouped_kernel(
         # (-3.4%), 1278 vs 1294 at GPT-OSS top_k=4, and SLOWER at decode (411 vs 404) — to buy that
         # you pay a top_k x fp32 intermediate, ~940MB at DSV3 shapes. top_k-way contention is not
         # the bottleneck here; the GEMM is.
+        if BsGlobal is not None:  # NVFP4's second level, this tile's expert
+            accumulator = accumulator * tl.load(BsGlobal + expert_id64 * stride_bs_global)
+
         if ROUTED_OUT:
             # Plain store at the TOKEN-MAJOR routed row (`out_row`), then the caller sums the
             # top_k rows per token. This is the FORWARD's shape — it stores routed rows and
@@ -547,6 +559,7 @@ def dgrad_matmul_grouped(
     scatter_idx: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
     num_input_rows: int | None = None,
+    w_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Routed ``dX = dY @ W[expert]`` over expert-sorted positions — the MoE counterpart of
     ``dgrad_matmul_2d``.
@@ -584,6 +597,8 @@ def dgrad_matmul_grouped(
             W,
             b_descriptor,
             Ws,
+            w_global_scale,
+            global_scale_stride(w_global_scale),
             dX,
             gather_idx,
             scatter_idx,
@@ -735,6 +750,8 @@ def dgrad_matmul_batched_kernel(
     A,  # (S, N) upstream gradient
     B,  # (E, N, K) quantized weights, K-contiguous — the forward orientation
     Bs,  # (E, N // SCALE_ROW_DIV, K // SCALE_GROUP_K) weight scales
+    BsGlobal,  # fp32 NVFP4 weight global, per tensor or per expert; folded on the accumulator
+    stride_bs_global,  # expert stride of BsGlobal (0 broadcasts a scalar)
     C,  # (S, K) output gradient
     ExpertIds,  # (S,) which expert each row routed to
     # Shape
@@ -807,6 +824,9 @@ def dgrad_matmul_batched_kernel(
         )
         accumulator += tl.sum(dy[:, None] * wdeq, axis=0)
 
+    if BsGlobal is not None:  # NVFP4's second level, this row's expert
+        accumulator = accumulator * tl.load(BsGlobal + expert_id * stride_bs_global)
+
     tl.store(
         C + pid_m * stride_c_m + offs_k * stride_c_k,
         accumulator.to(C.dtype.element_ty),
@@ -823,6 +843,7 @@ def dgrad_matmul_batched(
     scale_group_k: int,
     scale_row_div: int,
     output_dtype: torch.dtype | None = None,
+    w_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``dX[s] = dY[s] @ W[expert_ids[s]]`` — the batched (per-row expert) counterpart of
     ``dgrad_matmul_grouped``. Registered because the batched experts forward is a SELECTABLE
@@ -838,7 +859,7 @@ def dgrad_matmul_batched(
     grid = lambda META: (S, triton.cdiv(K, META["BLOCK_SIZE_K"]))  # noqa: E731
     with device_context(dY.device):
         compile_time_only_triton_wrap(dgrad_matmul_batched_kernel)[grid](
-            dY, W, Ws, dX, expert_ids, S, N, K,
+            dY, W, Ws, w_global_scale, global_scale_stride(w_global_scale), dX, expert_ids, S, N, K,
             dY.stride(0), dY.stride(1),
             W.stride(0), W.stride(1), W.stride(2),
             Ws.stride(0), Ws.stride(1), Ws.stride(2),
@@ -869,7 +890,8 @@ def _dgrad_mx(dY, B, Bs, b_global, out_dtype):
     magnitude — the failure mode is a non-finite dX, which the tuner's numerics veto turns into an
     all-inf tune rather than a wrong answer.
 
-    The NVFP4 second-level global is a scalar on the product, so it folds afterwards."""
+    The NVFP4 second-level global rides into the kernel, which folds it on the accumulator —
+    one value here, a 2D weight being one matrix."""
     if B.dtype == torch.int8:
         B = B.view(torch.uint8)
     if Bs.dtype == torch.float8_e8m0fnu:
@@ -879,10 +901,9 @@ def _dgrad_mx(dY, B, Bs, b_global, out_dtype):
     group = K // Bs.shape[-1]
     row_div = max(B.shape[-2] // Bs.shape[-2], 1)
     dX = dgrad_matmul_2d(
-        dY.contiguous(), B, Bs, group, row_div, output_dtype=torch.float32
+        dY.contiguous(), B, Bs, group, row_div, output_dtype=torch.float32,
+        w_global_scale=normalize_global_scale(b_global, 1),
     )
-    if b_global is not None:
-        dX = dX * b_global.float().reshape(-1)[0]
     return dX.to(out_dtype)
 
 def _dgrad_transposed_weight(dY, B, Bs, out_dtype):
@@ -900,7 +921,8 @@ def _dgrad_transposed_weight(dY, B, Bs, out_dtype):
 def _dgrad_grouped(ctx, dY, B, Bs, expert_start, gather_idx, scatter_idx, b_global):
     """Routed dgrad. GATE is not a case to handle: the gradient of a gate|up GEMM is an UNGATED
     product at the doubled N extent, which is what a 2N-row weight already is. The forward's two
-    row maps are passed through unchanged — the kernel swaps their roles itself."""
+    row maps are passed through unchanged — the kernel swaps their roles itself. The NVFP4
+    global folds in the kernel, which already resolves each tile's expert."""
     if B.dtype == torch.int8:
         B = B.view(torch.uint8)
     if Bs.dtype == torch.float8_e8m0fnu:
@@ -912,9 +934,8 @@ def _dgrad_grouped(ctx, dY, B, Bs, expert_start, gather_idx, scatter_idx, b_glob
         K // Bs.shape[-1], max(B.shape[-2] // Bs.shape[-2], 1),
         gather_idx=gather_idx, scatter_idx=scatter_idx, output_dtype=torch.float32,
         num_input_rows=getattr(ctx, "a_rows", None),
+        w_global_scale=normalize_global_scale(b_global, B.shape[0]),
     )
-    if b_global is not None:  # per-expert NVFP4 global folds on the product
-        dX = dX * b_global.float().reshape(-1)[0]
     return dX.to(ctx.a_dtype)
 
 
@@ -1000,9 +1021,8 @@ def _dgrad_batched(ctx, dY, B, Bs, expert_ids, b_global):
         dY.contiguous(), B, Bs, expert_ids,
         K // Bs.shape[-1], max(B.shape[-2] // Bs.shape[-2], 1),
         output_dtype=torch.float32,
+        w_global_scale=normalize_global_scale(b_global, B.shape[0]),
     )
-    if b_global is not None:
-        dX = dX * b_global.float().reshape(-1)[0]
     return dX.to(ctx.a_dtype)
 
 

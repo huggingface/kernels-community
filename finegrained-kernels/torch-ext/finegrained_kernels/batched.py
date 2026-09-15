@@ -25,7 +25,7 @@ from .bayesian_autotuner import bayesian_autotune
 
 from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, decode_pdl
 from .descriptors import rebind_batched_mx_bs_descriptor
-from .formats import check_activation_format, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
+from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .epilogue import fused_glu
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide
 from .swizzle import swizzled_scale_descriptor
@@ -563,6 +563,9 @@ def mx_dynamic_matmul_batched_kernel(
     stride_cs_n,
     stride_bias_e,
     stride_bias_n,
+    stride_as_global,  # expert stride of AsGlobal (0 broadcasts a shared scalar)
+    stride_bs_global,  # expert stride of AsBsGlobal (``global_scale_stride``)
+    stride_cs_global,  # expert stride of CsGlobal (0 broadcasts a shared scalar)
     stride_eid,
     num_experts,
     # Meta-parameters
@@ -656,7 +659,7 @@ def mx_dynamic_matmul_batched_kernel(
     accumulator = acc_init(COMPUTE_MODE, BLOCK_SIZE_M, n_width, SWAP_AB)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a, a_scale = load_act_mx(
-            a_ptrs, as_ptrs, AsGlobal, None, None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            a_ptrs, as_ptrs, AsGlobal, expert_id * stride_as_global, None, None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             "pointer", False, False, False,
             BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, ACTIVATION_FORMAT,
         )
@@ -688,8 +691,11 @@ def mx_dynamic_matmul_batched_kernel(
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
         COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, FAKE_BATCH=True, N_COLS=N,
         CsGlobal=CsGlobal,
+        stride_cs_global=stride_cs_global,
         GlobalScale=AsBsGlobal,
+        stride_global_e=stride_bs_global,
         GlobalScaleA=AsGlobal,
+        stride_global_a=stride_as_global,
         global_row=expert_id,
         Bias=Bias,
         stride_bias_e=stride_bias_e,
@@ -744,6 +750,7 @@ def mx_weight_only_matmul_batched_kernel(
     stride_c_n,
     stride_bias_e,
     stride_bias_n,
+    stride_bs_global,  # expert stride of BsGlobal (``global_scale_stride``)
     stride_eid,
     num_experts,
     BLOCK_SIZE_M: tl.constexpr,
@@ -830,6 +837,7 @@ def mx_weight_only_matmul_batched_kernel(
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
         COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, FAKE_BATCH=True, N_COLS=N,
         GlobalScale=BsGlobal,
+        stride_global_e=stride_bs_global,
         global_row=expert_id,
         Bias=Bias,
         stride_bias_e=stride_bias_e,
@@ -1392,7 +1400,13 @@ def mx_dynamic_matmul_batched(
     # The act scale stays affine under a swizzled weight: load_act_mx reads it off as_ptrs
     # row-major, SWIZZLED_SCALES governs only the weight side.
     if As is None and activation_format == "nvfp4" and A.dtype not in (torch.int8, torch.float8_e4m3fn):
-        A, As = MX_ACT_QUANT["nvfp4"](A, global_scale=a_global_scale)
+        # a per-expert g_a quantizes each routed row against ITS expert's global; the rows are
+        # routed slots, so the row -> expert map is this op's own `expert_ids`
+        A, As = MX_ACT_QUANT["nvfp4"](
+            A,
+            global_scale=normalize_global_scale(a_global_scale, B.shape[0]),
+            expert_index=expert_ids,
+        )
         pre_quantized = True
     # int8 A = caller-provided packed-E2M1 activations (W4A4, native mxf4 MMA): K is two
     # values per stored byte and the scales are mandatory (nothing left to quantize).
@@ -1471,6 +1485,8 @@ def mx_dynamic_matmul_batched(
     # g_b per expert and g_a scalar go down SEPARATELY; the kernel multiplies them in-register
     # (the old host-side g_a*g_b product was a torch launch per GEMM per call)
     input_global_scale = normalize_global_scale(b_global_scale, B.shape[0])
+    act_global_scale = normalize_global_scale(a_global_scale, B.shape[0])
+    out_global_scale = normalize_global_scale(output_global_scale, B.shape[0])
     with device_context(a_u8.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(mx_dynamic_matmul_batched_kernel)[grid](
@@ -1482,9 +1498,9 @@ def mx_dynamic_matmul_batched(
             C,
             Cs,
             bias,
-            a_global_scale,  # AsGlobal (1,): g_a for the inline-quant arm (A/g_a)
+            act_global_scale,  # AsGlobal: g_a per tensor or per expert (acc, and the inline-quant arm's A/g_a)
             input_global_scale,  # AsBsGlobal = g_b per expert (acc; g_a folds in-kernel via AsGlobal)
-            output_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
+            out_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
             expert_ids,
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
@@ -1506,6 +1522,9 @@ def mx_dynamic_matmul_batched(
             Cs.stride(1) if requant else 1,
             bias_stride_e,
             bias_stride_n,
+            global_scale_stride(act_global_scale),
+            global_scale_stride(input_global_scale),
+            global_scale_stride(out_global_scale),
             expert_ids.stride(0),
             SCALE_GROUP_K=scale_group,
             num_experts=num_experts,
@@ -1705,6 +1724,7 @@ def mx_weight_only_matmul_batched(
             C.stride(1),
             bias_stride_e,
             bias_stride_n,
+            global_scale_stride(b_global_scale),
             expert_ids.stride(0),
             num_experts=num_experts,
             SCALE_GROUP_K=scale_group,

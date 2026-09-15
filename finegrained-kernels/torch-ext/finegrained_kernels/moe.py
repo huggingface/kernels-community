@@ -19,7 +19,8 @@ maps, so both the fused and unfused MoE forwards are pure sequencing here — no
 kernels live in this module:
 
   fused:   gate_up (``gate=True`` + ``quantize_output=True``) -> down -> ``weighted_reduce``. The
-           SwiGLU + intermediate requant happen inside the gate_up kernel epilogue.
+           SwiGLU + intermediate requant happen inside the gate_up kernel epilogue. A model's
+           ``post_expert_norm`` runs on the down's routed rows, before the reduce.
   unfused: gate_up (plain GEMM) -> host ``apply_glu`` -> down (plain GEMM) -> ``weighted_reduce``.
            The activation + requant happen between two plain GEMMs; the GEMMs self-quantize their
            raw inputs (``As=None``). Same math as the fused path, split across kernels.
@@ -48,6 +49,7 @@ from .batched import GATE_UNSTACK_MAX_S, matmul_batched
 from .bayesian_autotuner import bayesian_autotune
 from .compat import MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, decode_pdl, device_context
 from .formats import get_supported_act_fns, is_mx, is_mxfp4, weight_format
+from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
 from .quant import _launch_act_quant
 from .scheduling import compute_grouped_scheduling
 from .epilogue import fused_glu
@@ -62,7 +64,7 @@ from .epilogue import fused_glu
     # the H tile width trades off against grid occupancy: at few groups (decode) narrow
     # tiles spread more H-blocks across SMs, at many groups (prefill) wide tiles amortize
     # the per-row weight load — so key on H and the group-count bucket.
-    ["H", "num_groups_bit_length"],
+    ["H", "num_groups_bit_length", "NORM"],
     n_trials=8,
 )
 @triton.jit
@@ -71,6 +73,8 @@ def weighted_reduce_kernel(
     Out,  # (num_groups, H) — one reduced row per group
     Ids,  # (num_groups, NUM_TOP_K) — per-row id; a row is skipped when its id >= NUM_EXPERTS
     Weights,  # (num_groups * NUM_TOP_K,) — per-row scale
+    NormWeight,  # (H,) fused post-expert norm weight; None (with NormInv) folds the arm out
+    NormInv,  # (num_groups * NUM_TOP_K,) fp32 per-row rsqrt from rms_inv_rows
     H,
     stride_rows_m,
     stride_rows_h,
@@ -82,6 +86,7 @@ def weighted_reduce_kernel(
     NUM_TOP_K: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    NORM: tl.constexpr = None,  # a get_supported_norms() name folded into the reduce
     SIMULATE_UNFUSED: tl.constexpr = False,
     PDL: tl.constexpr = False,
 ):
@@ -90,22 +95,35 @@ def weighted_reduce_kernel(
     ``>= NUM_EXPERTS`` (out-of-range rows are never written upstream and contribute 0).
     fp32 accumulate; ~2.8x a generic ``view(g, k, H).sum(1)``. ``SIMULATE_UNFUSED`` rounds
     each weighted row to ``Out``'s dtype before summing, matching a reference that weights
-    in that dtype; production leaves the accumulation in fp32."""
+    in that dtype; production leaves the accumulation in fp32.
+
+    ``NORM`` folds a per-expert output norm into the pass: each row is scaled by its
+    ``NormInv`` (``rms_inv_rows``, one pass ahead of this one) and the norm's column factor
+    before the routing weight, so the normalized rows are never written or re-read."""
     if PDL:
         gdc_wait()
     g = tl.program_id(0)
     offs_h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = offs_h < H
     acc = tl.zeros((BLOCK_H,), tl.float32)
+    if NORM is not None:  # the tile's column factor is row-independent — load it once
+        factor = norm_column_factor(NormWeight, offs_h, mask, NORM)
     for k in tl.static_range(NUM_TOP_K):
         flat = g * NUM_TOP_K + k
         valid = tl.load(Ids + g * stride_ids_m + k * stride_ids_k) < NUM_EXPERTS
         weight = tl.load(Weights + flat)
-        contrib = weight * tl.load(
+        row = tl.load(
             Rows + flat * stride_rows_m + offs_h * stride_rows_h,
             mask=mask & valid,
             other=0.0,
         ).to(tl.float32)
+        if NORM is not None:
+            # masked like the value load: a sentinel row's rsqrt comes off uninitialized memory,
+            # and 0 * NaN would poison the sum
+            row = row * factor * tl.load(NormInv + flat, mask=valid, other=0.0)
+            if SIMULATE_UNFUSED:  # the reference materializes the normalized row in Out's dtype
+                row = row.to(Out.dtype.element_ty).to(tl.float32)
+        contrib = weight * row
         if SIMULATE_UNFUSED:
             contrib = contrib.to(Out.dtype.element_ty).to(tl.float32)
         acc += contrib
@@ -125,11 +143,17 @@ def weighted_reduce(
     top_k_weights: torch.Tensor,
     num_experts: int,
     simulate_unfused: bool = False,
+    norm: str | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_inv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Routing-weighted top-k reduce — the bookend of the fused-MoE chain. Folds each token's
     ``num_top_k`` expert-output rows (``rows``, group-major, scaled by ``top_k_weights``, with
     EP-sentinel rows ``id >= num_experts`` skipped) from the routed-row layout back to
-    ``(num_tokens, H)``. See ``weighted_reduce_kernel``."""
+    ``(num_tokens, H)``. See ``weighted_reduce_kernel``. ``norm`` (a ``get_supported_norms()``
+    name, with ``norm_weight`` and the ``rms_inv_rows`` ``norm_inv``) folds a per-expert output
+    norm into this pass rather than normalizing the rows in one of their own."""
+    assert (norm is None) == (norm_inv is None), "a fused norm needs its per-row rsqrt"
     num_tokens, num_top_k = top_k_index.shape
     H = rows.size(1)
     reduced = torch.empty(num_tokens, H, device=rows.device, dtype=rows.dtype)
@@ -141,6 +165,8 @@ def weighted_reduce(
             reduced,
             top_k_index,
             top_k_weights,
+            norm_weight,
+            norm_inv,
             H,
             rows.stride(0),
             rows.stride(1),
@@ -151,6 +177,7 @@ def weighted_reduce(
             num_groups_bit_length=int(num_tokens).bit_length(),
             NUM_TOP_K=num_top_k,
             NUM_EXPERTS=num_experts,
+            NORM=norm,
             SIMULATE_UNFUSED=simulate_unfused,
             PDL=decode_pdl(),
             launch_pdl=decode_pdl(),
@@ -256,6 +283,31 @@ def _block_format(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale, 
     return weight_format(gate_up_proj, gate_up_proj_scale)
 
 
+def _post_expert_norm(down_out, post_expert_norm, weight, eps):
+    """A model's per-expert output norm applied to the down projection's routed rows — one row
+    per (token, expert) application, which is what such a norm is defined over. ``None`` passes
+    through; a ``get_supported_norms()`` name runs ``rms_norm_rows`` against ``weight``; anything
+    else is a host callable, like ``act_fn``'s."""
+    if post_expert_norm is None:
+        return down_out
+    if isinstance(post_expert_norm, str):
+        return rms_norm_rows(down_out, weight, eps, post_expert_norm)
+    return post_expert_norm(down_out)
+
+
+def _fused_post_expert_norm(down_out, post_expert_norm, weight, eps):
+    """``(rows, weighted_reduce kwargs)`` for a fused forward: a named norm rides INTO the reduce
+    — one pass for the row's ``rsqrt``, then the reduce it already runs applies that and the
+    column factor — so the normalized rows are never materialized. A callable has to run first."""
+    if isinstance(post_expert_norm, str):
+        return down_out, {
+            "norm": post_expert_norm,
+            "norm_weight": weight,
+            "norm_inv": rms_inv_rows(down_out, weight, eps, post_expert_norm),
+        }
+    return _post_expert_norm(down_out, post_expert_norm, weight, eps), {}
+
+
 def moe_fused_grouped(
     hidden_states: torch.Tensor,  # (T, H)
     top_k_index: torch.Tensor,  # (T, K) int
@@ -264,10 +316,14 @@ def moe_fused_grouped(
     down_proj: torch.Tensor,  # (E, H, I)
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
-    gate_up_proj_global_scale: torch.Tensor | None = None,
-    down_proj_global_scale: torch.Tensor | None = None,
-    gate_up_input_global_scale: torch.Tensor | None = None,
-    down_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_weight_global_scale: torch.Tensor | None = None,
+    down_proj_weight_global_scale: torch.Tensor | None = None,
+    gate_up_proj_input_global_scale: torch.Tensor | None = None,
+    down_proj_input_global_scale: torch.Tensor | None = None,
+    post_expert_norm=None,  # the model's per-expert output norm on the routed rows: a
+    # get_supported_norms() name (fused into the reduce) or a host callable
+    post_expert_norm_weight: torch.Tensor | None = None,  # (H,) weight of a named norm
+    post_expert_norm_eps: float = 1e-6,
     gate_up_proj_bias: torch.Tensor | None = None,  # (E, 2I) pre-activation bias
     down_proj_bias: torch.Tensor | None = None,  # (E, H)
     act_fn: str | Callable = "silu",
@@ -283,11 +339,11 @@ def moe_fused_grouped(
     layout (block-dynamic FP8, MXFP8/MXFP4, NVFP4); ``activation_format`` names the activation
     quantization for the whole block — activations and the fused intermediate requant
     carry it (``"mxfp4"``/``"nvfp4"`` run all-fp4 W4A4 chains, ``"bf16"`` is weight-only);
-    ``None`` follows the weight format, and the ops validate the pairing. ``gate_up_input_global_scale`` / ``down_input_global_scale`` are the
-    NVFP4 activation second level (a checkpoint's calibrated per-projection ``input_scale``):
-    the gate_up quantizes hidden against its input global, requants the intermediate against
-    the down's, and the down consumes it as its activation global — ``None`` (dynamic quant)
-    everywhere else. ``simulate_unfused`` (testing) rounds each step through
+    ``None`` follows the weight format, and the ops validate the pairing. The
+    ``*_proj_input_global_scale`` pair is the NVFP4 activation second level (a checkpoint's
+    calibrated per-projection ``input_scale``): the gate_up quantizes hidden against its own,
+    requants the intermediate against the down's, and the down consumes that as its activation
+    global. ``None`` is dynamic quant everywhere else. ``simulate_unfused`` (testing) rounds each step through
     the activation dtype so the output matches the unfused reference to reduce order. ``act_fn`` is a
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
     callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
@@ -311,11 +367,11 @@ def moe_fused_grouped(
         hidden_states,
         gate_up_proj,
         Bs=gate_up_proj_scale_inv,
-        a_global_scale=gate_up_input_global_scale,
-        b_global_scale=gate_up_proj_global_scale,
+        a_global_scale=gate_up_proj_input_global_scale,
+        b_global_scale=gate_up_proj_weight_global_scale,
         # the intermediate requant normalizes against the DOWN's calibrated input global,
         # which the down then consumes as its activation global — the two-level handoff
-        output_global_scale=down_input_global_scale,
+        output_global_scale=down_proj_input_global_scale,
         expert_start=expert_start,
         **glu,
         bias=gate_up_proj_bias,
@@ -338,8 +394,8 @@ def moe_fused_grouped(
         down_proj,
         As=inter_scale,
         Bs=down_proj_scale_inv,
-        a_global_scale=down_input_global_scale,
-        b_global_scale=down_proj_global_scale,
+        a_global_scale=down_proj_input_global_scale,
+        b_global_scale=down_proj_weight_global_scale,
         expert_start=expert_start,
         bias=down_proj_bias,
         # weight-only: the intermediate is bf16 (As None) — the down goes weight-only too; a
@@ -353,8 +409,11 @@ def moe_fused_grouped(
     # rounds each weighted contrib to the activation dtype before summing, matching the
     # unfused path's torch reduce (which materializes bf16 contribs); production
     # accumulates in fp32.
+    rows, norm_kwargs = _fused_post_expert_norm(
+        down_out, post_expert_norm, post_expert_norm_weight, post_expert_norm_eps
+    )
     return weighted_reduce(
-        down_out, top_k_index, top_k_weights, NUM_EXPERTS, simulate_unfused
+        rows, top_k_index, top_k_weights, NUM_EXPERTS, simulate_unfused, **norm_kwargs
     )
 
 
@@ -366,10 +425,14 @@ def moe_fused_batched(
     down_proj: torch.Tensor,  # (E, H, I)
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
-    gate_up_proj_global_scale: torch.Tensor | None = None,
-    down_proj_global_scale: torch.Tensor | None = None,
-    gate_up_input_global_scale: torch.Tensor | None = None,
-    down_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_weight_global_scale: torch.Tensor | None = None,
+    down_proj_weight_global_scale: torch.Tensor | None = None,
+    gate_up_proj_input_global_scale: torch.Tensor | None = None,
+    down_proj_input_global_scale: torch.Tensor | None = None,
+    post_expert_norm=None,  # the model's per-expert output norm on the routed rows: a
+    # get_supported_norms() name (fused into the reduce) or a host callable
+    post_expert_norm_weight: torch.Tensor | None = None,  # (H,) weight of a named norm
+    post_expert_norm_eps: float = 1e-6,
     gate_up_proj_bias: torch.Tensor | None = None,  # (E, 2I) pre-activation bias
     down_proj_bias: torch.Tensor | None = None,  # (E, H)
     act_fn: str | Callable = "silu",
@@ -386,11 +449,11 @@ def moe_fused_batched(
     below the native mxf4nvf4 M=128 staging); ``activation_format`` names the activation
     quantization for the whole block — activations and the fused intermediate requant
     carry it (``"mxfp4"`` runs the all-fp4 W4A4 chain, ``"bf16"`` is weight-only); ``None``
-    follows the weight format, and the ops validate the pairing. ``gate_up_input_global_scale`` / ``down_input_global_scale`` are the
-    NVFP4 activation second level (a checkpoint's calibrated per-projection ``input_scale``):
-    the gate_up quantizes hidden against its input global, requants the intermediate against
-    the down's, and the down consumes it as its activation global — ``None`` (dynamic quant)
-    everywhere else. ``simulate_unfused`` (testing) rounds each
+    follows the weight format, and the ops validate the pairing. The
+    ``*_proj_input_global_scale`` pair is the NVFP4 activation second level (a checkpoint's
+    calibrated per-projection ``input_scale``): the gate_up quantizes hidden against its own,
+    requants the intermediate against the down's, and the down consumes that as its activation
+    global. ``None`` is dynamic quant everywhere else. ``simulate_unfused`` (testing) rounds each
     step through the activation dtype so the output matches the unfused reference to
     reduce order. ``act_fn`` is a
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
@@ -413,10 +476,10 @@ def moe_fused_batched(
         hidden_states,
         gate_up_proj,
         Bs=gate_up_proj_scale_inv,
-        a_global_scale=gate_up_input_global_scale,
-        b_global_scale=gate_up_proj_global_scale,
+        a_global_scale=gate_up_proj_input_global_scale,
+        b_global_scale=gate_up_proj_weight_global_scale,
         # the two-level handoff, as in the grouped sibling
-        output_global_scale=down_input_global_scale,
+        output_global_scale=down_proj_input_global_scale,
         expert_ids=expert_ids,
         **glu,
         bias=gate_up_proj_bias,
@@ -445,8 +508,8 @@ def moe_fused_batched(
         down_proj,
         As=inter_scale,
         Bs=down_proj_scale_inv,
-        a_global_scale=down_input_global_scale,
-        b_global_scale=down_proj_global_scale,
+        a_global_scale=down_proj_input_global_scale,
+        b_global_scale=down_proj_weight_global_scale,
         expert_ids=expert_ids,
         bias=down_proj_bias,
         # weight-only / block-FP8: the intermediate is bf16 (As is None), so the down carries the
@@ -459,8 +522,11 @@ def moe_fused_batched(
     # rounds each weighted contrib to the activation dtype before summing, matching the
     # unfused path's torch reduce (which materializes bf16 contribs); production
     # accumulates in fp32.
+    rows, norm_kwargs = _fused_post_expert_norm(
+        down_out, post_expert_norm, post_expert_norm_weight, post_expert_norm_eps
+    )
     return weighted_reduce(
-        down_out, top_k_index, top_k_weights, NUM_EXPERTS, simulate_unfused
+        rows, top_k_index, top_k_weights, NUM_EXPERTS, simulate_unfused, **norm_kwargs
     )
 
 
@@ -475,10 +541,14 @@ def moe_unfused_grouped(
     down_proj: torch.Tensor,
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
-    gate_up_proj_global_scale: torch.Tensor | None = None,
-    down_proj_global_scale: torch.Tensor | None = None,
-    gate_up_input_global_scale: torch.Tensor | None = None,
-    down_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_weight_global_scale: torch.Tensor | None = None,
+    down_proj_weight_global_scale: torch.Tensor | None = None,
+    gate_up_proj_input_global_scale: torch.Tensor | None = None,
+    down_proj_input_global_scale: torch.Tensor | None = None,
+    post_expert_norm=None,  # the model's per-expert output norm on the routed rows: a
+    # get_supported_norms() name (fused into the reduce) or a host callable
+    post_expert_norm_weight: torch.Tensor | None = None,  # (H,) weight of a named norm
+    post_expert_norm_eps: float = 1e-6,
     gate_up_proj_bias: torch.Tensor | None = None,  # (E, 2I) pre-activation bias
     down_proj_bias: torch.Tensor | None = None,  # (E, H)
     act_fn: str | Callable = "silu",
@@ -513,8 +583,8 @@ def moe_unfused_grouped(
         hidden_states,
         gate_up_proj,
         Bs=gate_up_proj_scale_inv,
-        a_global_scale=gate_up_input_global_scale,
-        b_global_scale=gate_up_proj_global_scale,
+        a_global_scale=gate_up_proj_input_global_scale,
+        b_global_scale=gate_up_proj_weight_global_scale,
         expert_start=expert_start,
         bias=gate_up_proj_bias,
         activation_format=fmt,
@@ -528,15 +598,18 @@ def moe_unfused_grouped(
         inter,
         down_proj,
         Bs=down_proj_scale_inv,
-        a_global_scale=down_input_global_scale,
-        b_global_scale=down_proj_global_scale,
+        a_global_scale=down_proj_input_global_scale,
+        b_global_scale=down_proj_weight_global_scale,
         expert_start=expert_start,
         bias=down_proj_bias,
         activation_format=fmt,
         output_dtype=hidden_states.dtype,
         scatter_idx=scatter_idx,
     )
-    return _torch_weighted_reduce(down_out, top_k_index, top_k_weights, NUM_EXPERTS)
+    return _torch_weighted_reduce(
+        _post_expert_norm(down_out, post_expert_norm, post_expert_norm_weight, post_expert_norm_eps),
+        top_k_index, top_k_weights, NUM_EXPERTS,
+    )
 
 
 def moe_torch_grouped(
@@ -547,10 +620,14 @@ def moe_torch_grouped(
     down_proj: torch.Tensor,  # (E, H, I) E4M3
     gate_up_proj_scale_inv: torch.Tensor,  # gate_up scale through torchao's triton_mx_block_rearrange_per_group_3d (NOT swizzle_mx_scales)
     down_proj_scale_inv: torch.Tensor,  # down scale through the same torchao rearrange
-    gate_up_proj_global_scale: torch.Tensor | None = None,
-    down_proj_global_scale: torch.Tensor | None = None,
-    gate_up_input_global_scale: torch.Tensor | None = None,
-    down_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_weight_global_scale: torch.Tensor | None = None,
+    down_proj_weight_global_scale: torch.Tensor | None = None,
+    gate_up_proj_input_global_scale: torch.Tensor | None = None,
+    down_proj_input_global_scale: torch.Tensor | None = None,
+    post_expert_norm=None,  # the model's per-expert output norm on the routed rows: a
+    # get_supported_norms() name (fused into the reduce) or a host callable
+    post_expert_norm_weight: torch.Tensor | None = None,  # (H,) weight of a named norm
+    post_expert_norm_eps: float = 1e-6,
     gate_up_proj_bias: torch.Tensor | None = None,  # (E, 2I) pre-activation bias
     down_proj_bias: torch.Tensor | None = None,  # (E, H)
     act_fn: str = "silu",
@@ -624,7 +701,14 @@ def moe_torch_grouped(
     def _tensorwise_global(g, n):  # (n,) fp32 TensorWise operand, identity when uncalibrated
         if g is None:
             return torch.ones(n, device=hidden_states.device, dtype=torch.float32)
-        return g.reshape(-1).expand(n).contiguous() if g.numel() == 1 else g.reshape(n)
+        if g.numel() == 1:
+            return g.reshape(-1).float().expand(n).contiguous()
+        assert g.shape == (n,), (
+            f"torch's scaled_grouped_mm takes ONE TensorWise global per expert, got "
+            f"{tuple(g.shape)} — a per-expert activation global has no slot in this baseline "
+            "(the Triton ops take one)"
+        )
+        return g.float()
 
     top_k = top_k_index.shape[1]
     out_dtype = hidden_states.dtype
@@ -652,6 +736,10 @@ def moe_torch_grouped(
 
     def grouped_mm(a, w_q, w_s, w_g=None, a_g=None):
         assert a_g is None or nvfp4, "an activation global is NVFP4-only"  # match the ops
+        assert a_g is None or a_g.numel() == 1, (
+            "this baseline quantizes the routed rows in one pass, so the activation global is "
+            "per tensor; per-expert activation globals are a Triton-op path"
+        )
         # our Triton MX act-quant (format-taking launcher) — torch is timed on the same fast quant
         aq, a_s = _launch_act_quant(
             a, act_format, scale_group, scale_dtype, global_scale=a_g
@@ -678,8 +766,8 @@ def moe_torch_grouped(
         hidden_states[tok],
         gate_up_proj,
         gate_up_proj_scale_inv,
-        gate_up_proj_global_scale,
-        gate_up_input_global_scale,
+        gate_up_proj_weight_global_scale,
+        gate_up_proj_input_global_scale,
     )
     # torch has no fused bias, so this baseline adds both host-side; rows are expert-sorted here,
     # so the per-expert bias indexes by the sorted expert ids
@@ -687,7 +775,8 @@ def moe_torch_grouped(
         gate_up = gate_up + gate_up_proj_bias[slot_e]
     inter = fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit)
     down_out = grouped_mm(
-        inter, down_proj, down_proj_scale_inv, down_proj_global_scale, down_input_global_scale
+        inter, down_proj, down_proj_scale_inv,
+        down_proj_weight_global_scale, down_proj_input_global_scale,
     )
 
     # One weighted scatter-reduce: down_out is expert-sorted, so index_add_ over the source-token
@@ -696,6 +785,9 @@ def moe_torch_grouped(
     w = top_k_weights.reshape(-1)[order].unsqueeze(-1).to(out.dtype)
     if down_proj_bias is not None:
         down_out = down_out + down_proj_bias[slot_e]
+    down_out = _post_expert_norm(
+        down_out, post_expert_norm, post_expert_norm_weight, post_expert_norm_eps
+    )
     return out.index_add_(0, tok, down_out * w)
 
 
@@ -707,10 +799,14 @@ def moe_unfused_batched(
     down_proj: torch.Tensor,
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
-    gate_up_proj_global_scale: torch.Tensor | None = None,
-    down_proj_global_scale: torch.Tensor | None = None,
-    gate_up_input_global_scale: torch.Tensor | None = None,
-    down_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_weight_global_scale: torch.Tensor | None = None,
+    down_proj_weight_global_scale: torch.Tensor | None = None,
+    gate_up_proj_input_global_scale: torch.Tensor | None = None,
+    down_proj_input_global_scale: torch.Tensor | None = None,
+    post_expert_norm=None,  # the model's per-expert output norm on the routed rows: a
+    # get_supported_norms() name (fused into the reduce) or a host callable
+    post_expert_norm_weight: torch.Tensor | None = None,  # (H,) weight of a named norm
+    post_expert_norm_eps: float = 1e-6,
     gate_up_proj_bias: torch.Tensor | None = None,  # (E, 2I) pre-activation bias
     down_proj_bias: torch.Tensor | None = None,  # (E, H)
     act_fn: str | Callable = "silu",
@@ -741,8 +837,8 @@ def moe_unfused_batched(
         hidden_states,
         gate_up_proj,
         Bs=gate_up_proj_scale_inv,
-        a_global_scale=gate_up_input_global_scale,
-        b_global_scale=gate_up_proj_global_scale,
+        a_global_scale=gate_up_proj_input_global_scale,
+        b_global_scale=gate_up_proj_weight_global_scale,
         expert_ids=expert_ids,
         bias=gate_up_proj_bias,
         activation_format=fmt,
@@ -755,11 +851,14 @@ def moe_unfused_batched(
         inter,
         down_proj,
         Bs=down_proj_scale_inv,
-        a_global_scale=down_input_global_scale,
-        b_global_scale=down_proj_global_scale,
+        a_global_scale=down_proj_input_global_scale,
+        b_global_scale=down_proj_weight_global_scale,
         expert_ids=expert_ids,
         bias=down_proj_bias,
         activation_format=fmt,
         output_dtype=hidden_states.dtype,
     )
-    return _torch_weighted_reduce(down_out, top_k_index, top_k_weights, NUM_EXPERTS)
+    return _torch_weighted_reduce(
+        _post_expert_norm(down_out, post_expert_norm, post_expert_norm_weight, post_expert_norm_eps),
+        top_k_index, top_k_weights, NUM_EXPERTS,
+    )

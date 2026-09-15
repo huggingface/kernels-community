@@ -203,7 +203,7 @@ def matmul_weight_ptrs(
 
 @triton.jit
 def load_act_mx(
-    a_ptrs, as_ptrs, as_global, value_mask, scale_mask, a_descriptor, m_off, k_off,
+    a_ptrs, as_ptrs, as_global, as_global_row, value_mask, scale_mask, a_descriptor, m_off, k_off,
     as_descriptor, as_ptr, gather_rows, stride_as_m, pid_m, k, M, K,
     A_MEMORY_MODE: tl.constexpr, A_GATHER: tl.constexpr, GROUPED: tl.constexpr,
     SWIZZLED_SCALES: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
@@ -236,7 +236,7 @@ def load_act_mx(
         )
     else:  # 2D / decode: inline-quant affine or in-register scale
         a, a_s = load_mx_act_tile(
-            a_ptrs, as_ptrs, as_global, scale_mask, a_descriptor, m_off, k_off, 0,
+            a_ptrs, as_ptrs, as_global, as_global_row, scale_mask, a_descriptor, m_off, k_off, 0,
             BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, A_MEMORY_MODE,
             FORMAT=ACTIVATION_FORMAT,
         )

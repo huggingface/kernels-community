@@ -191,7 +191,7 @@ def _nvfp4_kwargs(cfg, hidden, gu, gus, gu_g):
     if cfg["weights"] != "nvfp4":
         return {}
     act_g, inter_g = _nvfp4_input_globals(cfg, hidden, gu, gus, gu_g)
-    return dict(gate_up_input_global_scale=act_g, down_input_global_scale=inter_g)
+    return dict(gate_up_proj_input_global_scale=act_g, down_proj_input_global_scale=inter_g)
 
 
 def _preswizzle_moe_scale(scale):
@@ -606,7 +606,7 @@ def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_
     _mark_static(gu, gus, dns)  # derived closure tensors: unmarked, cudagraph trees re-copy them every compiled call
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], activation_format=_activation_format(cfg),
-              gate_up_proj_global_scale=gu_g, down_proj_global_scale=dn_g,
+              gate_up_proj_weight_global_scale=gu_g, down_proj_weight_global_scale=dn_g,
               **nvfp4_kw)
     return lambda: fn(hidden, idx, w, gu, dn, gus, dns, **kw)
 
@@ -623,7 +623,7 @@ def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, 
     _mark_static(gu, gus, dns)  # derived closure tensors: unmarked, cudagraph trees re-copy them every compiled call
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], activation_format=_activation_format(cfg),
-              gate_up_proj_global_scale=gu_g, down_proj_global_scale=dn_g,
+              gate_up_proj_weight_global_scale=gu_g, down_proj_weight_global_scale=dn_g,
               **nvfp4_kw)
     return lambda: fn(hidden, idx, w, gu, dn, gus, dns, **kw)
 
@@ -652,7 +652,7 @@ def torch_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     gu, gus = _interleave_gate_up(gu, gus)  # moe_torch_grouped shares our interleaved convention
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], activation_format=_activation_format(cfg),
-              gate_up_proj_global_scale=gu_g, down_proj_global_scale=dn_g,
+              gate_up_proj_weight_global_scale=gu_g, down_proj_weight_global_scale=dn_g,
               **nvfp4_kw)
     gus_b, dns_b = _torch_preblock_weight_scale(gus), _torch_preblock_weight_scale(dns)
     return lambda: fgm.moe.moe_torch_grouped(hidden, idx, w, gu, dn, gus_b, dns_b, **kw)

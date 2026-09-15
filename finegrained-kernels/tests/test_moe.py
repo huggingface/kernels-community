@@ -58,6 +58,8 @@ class MoEProblem:
     act_fn: Union[str, Callable] = "silu"  # a callable runs on the host between the GEMMs
     swizzled: bool = False  # pre-swizzled (5D SWIZZLE_32_4_4) weight scales — the deployment layout
     input_globals: bool = False  # calibrated NVFP4 activation input_scale per projection
+    expert_globals: bool = False  # the down's calibrated input_scale differs per expert
+    post_expert_norm: Optional[str] = None  # a model's per-expert output norm, by name
 
     @property
     def id(self):
@@ -77,6 +79,8 @@ class MoEProblem:
             f"_I{self.intermediate_dim}_top{self.num_top_k}_{DTYPE_TAG[self.dtype]}"
             f"{act}{fmt}{'_swizzled' if self.swizzled else ''}"
             f"{'_inputglobals' if self.input_globals else ''}"
+            f"{'_expertglobals' if self.expert_globals else ''}"
+            f"{'_' + self.post_expert_norm if self.post_expert_norm else ''}"
             f"{'_sentinel' if self.sentinel_fraction > 0 else ''}"
         )
 
@@ -115,6 +119,21 @@ MOE_PROBLEMS = [
     # the full deployment stack for a calibrated NVFP4 checkpoint: pre-swizzled artifact +
     # per-projection input globals, at decode batch (the bench's GLM-NVFP4 decode cell)
     MoEProblem(weights="nvfp4", num_tokens=1, swizzled=True, input_globals=True),
+    # ── input_scale per expert (the modelopt layout, once the gate|up stack's two calibrated
+    # halves are merged into one global per expert at load): the requant epilogue normalizes each
+    # row by its expert's down global and the down folds the same one back ──
+    MoEProblem(weights="nvfp4", input_globals=True, expert_globals=True),
+    MoEProblem(weights="nvfp4", num_tokens=1, input_globals=True, expert_globals=True),
+    MoEProblem(weights="nvfp4", swizzled=True, input_globals=True, expert_globals=True),
+    # ── a model's per-expert output norm, folded into the reduce: one cell per normalization
+    # form (the form decides what the row's mean square is taken on) plus a decode shape ──
+    MoEProblem(weights="mxfp8", post_expert_norm="input_scaled_rms_norm"),
+    MoEProblem(weights="mxfp8", num_tokens=1, post_expert_norm="input_scaled_rms_norm"),
+    MoEProblem(weights="nvfp4", input_globals=True, post_expert_norm="rms_norm"),
+    MoEProblem(weights="mxfp4", post_expert_norm="centered_rms_norm"),
+    # with EP sentinels: those rows are never written, so the fused reduce has to mask their
+    # rsqrt the way it masks their values (0 * NaN is NaN)
+    MoEProblem(weights="mxfp8", sentinel_fraction=0.25, post_expert_norm="rms_norm"),
     # ── full precision: scale-less BF16 weights resolve to format None and the fused
     # gate_up hands the down a bare (unscaled) intermediate ──
     # a caller-provided activation (the torch GLU itself) runs on the host between the GEMMs — the
@@ -202,6 +221,52 @@ def _make_moe_inputs(problem: MoEProblem):
     return hidden, top_k_index, top_k_weights
 
 
+def _input_globals(problem: MoEProblem, hidden):
+    """The calibrated NVFP4 activation globals per projection, as a checkpoint provides them:
+    the gate_up's is the hidden's own amax rule (one value — the hidden is quantized once, before
+    routing), the down's a fixed plausible value (the intermediate's amax isn't known pre-run; any
+    positive one is self-consistent) sitting above its calibrated amax/(6·448) for these shapes so
+    the normalized values only SHRINK — real two-level math rather than a saturated regime. Both
+    forwards get the same pair, so a one-sided thread breaks parity. ``expert_globals`` fans the
+    down's out per expert (what modelopt writes): the gate_up requant normalizes each row by ITS
+    expert's value and the down folds the same one back."""
+    if not problem.input_globals:
+        return None, None
+    gate_up_in_g = (hidden.abs().amax() / (6.0 * 448.0)).clamp(min=1e-30).float().reshape(1)
+    down_in_g = torch.full((1,), 1e3, device=hidden.device, dtype=torch.float32)
+    if problem.expert_globals:
+        fan = torch.linspace(
+            0.5, 2.0, problem.num_experts, device=hidden.device, dtype=torch.float32
+        )
+        down_in_g = (down_in_g * fan).contiguous()
+    return gate_up_in_g, down_in_g
+
+
+def _common_kwargs(problem: MoEProblem, hidden, gate_up_g, down_g):
+    """The kwargs every forward takes: the weights' second-level globals, the calibrated
+    activation globals, the GLU knobs, and a model's per-expert output norm. The fused chain
+    folds a named norm into its reduce while the unfused reference normalizes the routed rows in
+    a pass of their own, so handing both the same weight is what makes that a parity check."""
+    gate_up_in_g, down_in_g = _input_globals(problem, hidden)
+    norm_weight = (
+        torch.randn(problem.hidden_dim, device=TEST_DEVICE, dtype=problem.dtype) * 0.3
+        if problem.post_expert_norm
+        else None
+    )
+    return dict(
+        gate_up_proj_weight_global_scale=gate_up_g,
+        down_proj_weight_global_scale=down_g,
+        gate_up_proj_input_global_scale=gate_up_in_g,
+        down_proj_input_global_scale=down_in_g,
+        act_fn=problem.act_fn,
+        swiglu_alpha=problem.swiglu_alpha,
+        swiglu_limit=problem.swiglu_limit,
+        activation_format=problem.activation_format,
+        post_expert_norm=problem.post_expert_norm,
+        post_expert_norm_weight=norm_weight,
+    )
+
+
 def _assert_fused_correctness(out, ref, problem: MoEProblem):
     """Shape, dtype, and value checks against the unfused reference."""
     assert out.shape == (problem.num_tokens, problem.hidden_dim)
@@ -214,28 +279,9 @@ def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
     torch.manual_seed(0)
     gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
-    # The decoupled API takes pure block scales + the per-tensor globals as separate args (nvfp4
-    # weights are two-level; other formats have a bare block scale + None global). The activation
-    # input globals are a calibrated value for the gate_up (hidden's own amax rule) and a fixed
-    # plausible one for the down (the intermediate's amax isn't known pre-run; any positive value
-    # is self-consistent) — both forwards get the same pair, so a one-sided thread breaks parity.
-    gate_up_in_g = down_in_g = None
-    if problem.input_globals:
-        gate_up_in_g = (hidden.abs().amax() / (6.0 * 448.0)).clamp(min=1e-30).float().reshape(1)
-        # above the intermediate's calibrated amax/(6*448) for these shapes, so the normalized
-        # values only SHRINK (no e4m3 block-scale clipping) and the cell exercises real two-level
-        # math rather than a saturated regime
-        down_in_g = torch.full((1,), 1e3, device=hidden.device, dtype=torch.float32)
-    common = dict(
-        gate_up_proj_global_scale=gate_up_g,
-        down_proj_global_scale=down_g,
-        gate_up_input_global_scale=gate_up_in_g,
-        down_input_global_scale=down_in_g,
-        act_fn=problem.act_fn,
-        swiglu_alpha=problem.swiglu_alpha,
-        swiglu_limit=problem.swiglu_limit,
-        activation_format=problem.activation_format,
-    )
+    # The decoupled API takes pure block scales + the globals as separate args (nvfp4 weights are
+    # two-level; other formats have a bare block scale + None global).
+    common = _common_kwargs(problem, hidden, gate_up_g, down_g)
     ref = unfused_fn(
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
     )
@@ -299,20 +345,7 @@ def test_fused_production_arm(problem, fused_fn, unfused_fn):
     torch.manual_seed(0)
     gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
-    gate_up_in_g = down_in_g = None
-    if problem.input_globals:
-        gate_up_in_g = (hidden.abs().amax() / (6.0 * 448.0)).clamp(min=1e-30).float().reshape(1)
-        down_in_g = torch.full((1,), 1e3, device=hidden.device, dtype=torch.float32)
-    common = dict(
-        gate_up_proj_global_scale=gate_up_g,
-        down_proj_global_scale=down_g,
-        gate_up_input_global_scale=gate_up_in_g,
-        down_input_global_scale=down_in_g,
-        act_fn=problem.act_fn,
-        swiglu_alpha=problem.swiglu_alpha,
-        swiglu_limit=problem.swiglu_limit,
-        activation_format=problem.activation_format,
-    )
+    common = _common_kwargs(problem, hidden, gate_up_g, down_g)
     ref = unfused_fn(
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
     )
@@ -349,20 +382,7 @@ def test_torch_grouped_baseline(problem):
     torch.manual_seed(0)
     gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
-    gate_up_in_g = down_in_g = None
-    if problem.input_globals:
-        gate_up_in_g = (hidden.abs().amax() / (6.0 * 448.0)).clamp(min=1e-30).float().reshape(1)
-        down_in_g = torch.full((1,), 1e3, device=hidden.device, dtype=torch.float32)
-    common = dict(
-        gate_up_proj_global_scale=gate_up_g,
-        down_proj_global_scale=down_g,
-        gate_up_input_global_scale=gate_up_in_g,
-        down_input_global_scale=down_in_g,
-        act_fn=problem.act_fn,
-        swiglu_alpha=problem.swiglu_alpha,
-        swiglu_limit=problem.swiglu_limit,
-        activation_format=problem.activation_format,
-    )
+    common = _common_kwargs(problem, hidden, gate_up_g, down_g)
     ref = moe.moe_unfused_grouped(
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
     )
@@ -400,7 +420,7 @@ def _run_compiled_across_shapes(fused_fn):
         torch.manual_seed(0)
         gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
         hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
-        kw = dict(gate_up_proj_global_scale=gate_up_g, down_proj_global_scale=down_g)
+        kw = dict(gate_up_proj_weight_global_scale=gate_up_g, down_proj_weight_global_scale=down_g)
         out = compiled(
             hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **kw
         )

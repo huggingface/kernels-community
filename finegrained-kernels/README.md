@@ -67,8 +67,13 @@ matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None,
   the stacked `(2N, K)` gate|up rows and the op returns the activated `(M, N)` intermediate;
   `quantize_output=True` stores it in `activation_format` for the next op (a `(C, Cs)` tuple is
   returned instead of a dense tensor).
-- `a_global_scale` / `b_global_scale` / `output_global_scale` are the NVFP4 second level —
-  per-tensor (2D) or per-expert `(E,)` fp32 globals folded onto the accumulator.
+- `a_global_scale` / `b_global_scale` / `output_global_scale` are the NVFP4 second level, fp32
+  globals folded onto the accumulator: one value for the tensor, or `(E,)` per expert. A
+  per-expert `a_global_scale` needs rows that belong to one expert each: `matmul_batched` reads
+  the row's expert id, and `matmul_grouped` requires expert-sorted rows (`gather_idx=None`). A
+  gate|up stack whose halves a checkpoint calibrated separately carries one global per half; the
+  loader merges those into one per expert (the up half's folds into the down projection's global,
+  SwiGLU being linear in it) rather than the ops taking a second layout.
 - Routing: `matmul_batched` reads one expert id per row (`expert_ids`, EP sentinels
   `>= num_experts` skipped); `matmul_grouped` takes the launch maps from
   `compute_grouped_scheduling(expert_ids, num_experts, top_k)` — no pre-sorted input required.
@@ -110,9 +115,13 @@ out = moe_fused_grouped(          # prefill; moe_fused_batched is the decode sib
     gate_up_proj,                 # (E, 2I, H)
     down_proj,                    # (E, H, I)
     gate_up_proj_scale_inv, down_proj_scale_inv,
-    gate_up_proj_global_scale=None, down_proj_global_scale=None,   # NVFP4 weight second level
-    gate_up_input_global_scale=None, down_input_global_scale=None, # calibrated activation input_scale
+    gate_up_proj_weight_global_scale=None,    # NVFP4 weight second level, per expert
+    down_proj_weight_global_scale=None,
+    gate_up_proj_input_global_scale=None,     # the checkpoint's calibrated activation input_scale
+    down_proj_input_global_scale=None,
     act_fn="silu", swiglu_alpha=None, swiglu_limit=None,
+    post_expert_norm=None,        # per-expert output norm: a get_supported_norms() name, or a callable
+    post_expert_norm_weight=None, post_expert_norm_eps=1e-6,
     activation_format=None,       # activation quant for the whole block; None = the weights' format, "bf16" = bf16 acts
 )
 ```
@@ -124,7 +133,16 @@ baseline. `activation_format=None` follows the weight format; `"mxfp8"` on MXFP4
 W4A8 chain; `"bf16"` keeps activations bf16 (weight-only W4A16/W8A16). For calibrated NVFP4 checkpoints the
 per-projection `input_scale` rides as `*_input_global_scale`: the gate_up quantizes hidden against
 its own, requants the intermediate against the down's, and the down consumes it — leave them `None`
-for dynamic quant.
+for dynamic quant. The gate_up's is one value (its rows are the hidden states, quantized once
+before routing); the down's may be per expert, since its rows are.
+
+`post_expert_norm` covers models that norm the down output before the routing weights. It runs on
+the routed rows — one row per expert application, where such a norm is defined. A
+`get_supported_norms()` name (`"rms_norm"`, `"centered_rms_norm"` scaling by `1 + weight`, or
+`"input_scaled_rms_norm"` scaling before normalizing) plus `post_expert_norm_weight` is FUSED: one
+pass computes each row's `rsqrt` and the reduce the chain already runs applies it with the column
+factor, so the normalized rows are never materialized. Anything else is a host callable applied to
+the rows. `rms_norm_rows` exposes the standalone kernel.
 
 ### Load-time quantization helpers
 

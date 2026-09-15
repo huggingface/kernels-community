@@ -487,7 +487,7 @@ def _epilogue_requant_fp8(
 @triton.jit
 def _epilogue_requant_mx(
     C, Cs, out, out_row, pid_n, pid_m, row_mask, stride_c_m, stride_c_n, stride_cs_m, stride_cs_n,
-    CSDescriptor, CsGlobal,
+    CSDescriptor, CsGlobal, cs_global_row,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
     OUTPUT_FORMAT: tl.constexpr, SWIZZLED_OUT: tl.constexpr, FAKE_BATCH: tl.constexpr,
     N_COLS: tl.constexpr,
@@ -496,12 +496,13 @@ def _epilogue_requant_mx(
     E4M3 — the fp4 formats pack nibble pairs so ``C`` halves). ``SWIZZLED_OUT`` writes ``Cs`` straight
     into the down proj's SWIZZLE_32_4_4 descriptor at block ``(pid_m, pid_n)`` (BM/BN pinned 128), else
     a row-major affine store. NVFP4 two-level: normalize by the next proj's provided input_scale
-    (``CsGlobal``) before the block quant. FAKE_BATCH collapses replicated rows via the row-max."""
+    (``CsGlobal[cs_global_row]`` — per tensor or this expert's) before the block quant. FAKE_BATCH
+    collapses replicated rows via the row-max."""
     if CsGlobal is not None:
         # NVFP4 two-level requant: normalize the fp32 GLU intermediate by the NEXT proj's provided
         # (calibrated) input_scale before the block quant — the canonical two-step. The down folds it
         # back via its As pair ([Cs, g_out]); nothing is computed at runtime.
-        out = out / tl.load(CsGlobal).to(tl.float32)
+        out = out / tl.load(CsGlobal + cs_global_row).to(tl.float32)
     q, q_s = mx_act_quant_inline(out, BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_FORMAT)
     width: tl.constexpr = BLOCK_SIZE_N if OUTPUT_FORMAT == "mxfp8" else BLOCK_SIZE_N // 2
     _store_out(C, q, out_row, pid_n, row_mask, stride_c_m, stride_c_n, BLOCK_SIZE_M, width, FAKE_BATCH,
@@ -562,10 +563,13 @@ def gemm_epilogue(
     FAKE_BATCH: tl.constexpr = False,
     N_COLS: tl.constexpr = 0,  # >0 masks the column tail (2D dense N isn't BN-aligned); 0 = no mask
     CSDescriptor=0,  # SWIZZLE_32_4_4 requant-scale descriptor; read only under SWIZZLED_OUT (else dummy)
-    CsGlobal=None,  # (1,) fp32 NVFP4 output global (the NEXT proj's provided input_scale); normalizes the requant, None folds out
-    GlobalScale=None,  # (E,)|(1,) fp32 NVFP4 weight global g_b; applied PRE-GLU, None folds out
-    global_row=0,  # index into GlobalScale (expert id; 0 for the per-tensor 2D case)
-    GlobalScaleA=None,  # (1,) fp32 NVFP4 activation global g_a; multiplied in-register with GlobalScale
+    CsGlobal=None,  # fp32 NVFP4 output global (the NEXT proj's provided input_scale), per tensor or per expert; normalizes the requant, None folds out
+    stride_cs_global=0,  # expert stride of CsGlobal (0 broadcasts a scalar)
+    GlobalScale=None,  # fp32 NVFP4 weight global g_b, per tensor or per expert; applied PRE-GLU, None folds out
+    stride_global_e=0,  # expert stride of GlobalScale (global_scale_stride; 0 broadcasts a scalar)
+    global_row=0,  # expert id indexing the globals and the bias (0 for the 2D case)
+    GlobalScaleA=None,  # fp32 NVFP4 activation global g_a, per tensor or per expert; multiplied in-register with GlobalScale
+    stride_global_a=0,  # expert stride of GlobalScaleA (0 broadcasts a scalar)
     PreAct=None,  # (M, 2N) pre-activation buffer; written iff not None — the GLU backward's Z
     stride_pa_m=0,
     stride_pa_n=0,
@@ -584,12 +588,16 @@ def gemm_epilogue(
     rows with ``tl.max``; else a real BM-row scatter (``out_row`` + ``row_mask``).
     ``COMPUTE_MODE``/``SWAP_AB`` orient the decode GLU/finalize (grouped passes ``"dot"``/no-swap,
     both no-ops there). Every arm is constexpr-pruned."""
-    acc = apply_global_scale(acc, GlobalScale, global_row, GlobalScaleA)
+    # The globals fold on the FINALIZED tile: a swapped accumulator still carries the token dim
+    # padded to the MMA atom, so folding before the collapse costs 16x the multiplies.
     if GATE:
         # Finalize + bias once, up here rather than inside the split: the gate|up bias belongs to
         # the pre-activation, so PreAct below has to see it too.
         flat = add_bias(
-            acc_finalize(acc, COMPUTE_MODE, 2 * BLOCK_SIZE_N, SWAP_AB),
+            apply_global_scale(
+                acc_finalize(acc, COMPUTE_MODE, 2 * BLOCK_SIZE_N, SWAP_AB),
+                GlobalScale, stride_global_e, GlobalScaleA, stride_global_a, global_row,
+            ),
             Bias, stride_bias_e, stride_bias_n, global_row, pid_n,
             2 * BLOCK_SIZE_N, 2 * N_COLS if N_COLS > 0 else 0,
         )
@@ -615,14 +623,17 @@ def gemm_epilogue(
         elif OUTPUT_FORMAT is not None:  # "mxfp8" | "mxfp4" | "nvfp4"
             _epilogue_requant_mx(
                 C, Cs, out, out_row, pid_n, pid_m, row_mask, stride_c_m, stride_c_n, stride_cs_m,
-                stride_cs_n, CSDescriptor, CsGlobal,
+                stride_cs_n, CSDescriptor, CsGlobal, global_row * stride_cs_global,
                 BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_FORMAT, SWIZZLED_OUT, FAKE_BATCH, N_COLS,
             )
         else:  # bf16 (unquantized) SwiGLU output
             _store_out(C, out, out_row, pid_n, row_mask, stride_c_m, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N, FAKE_BATCH, N_COLS)
     else:  # plain GEMM: cast + store the accumulator (no fused requant on the non-gate path)
         acc = add_bias(
-            acc_finalize(acc, COMPUTE_MODE, BLOCK_SIZE_N, SWAP_AB),
+            apply_global_scale(
+                acc_finalize(acc, COMPUTE_MODE, BLOCK_SIZE_N, SWAP_AB),
+                GlobalScale, stride_global_e, GlobalScaleA, stride_global_a, global_row,
+            ),
             Bias, stride_bias_e, stride_bias_n, global_row, pid_n, BLOCK_SIZE_N, N_COLS,
         )
         _store_out(C, acc, out_row, pid_n, row_mask, stride_c_m, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N, FAKE_BATCH, N_COLS)

@@ -23,7 +23,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_weight_only_descriptors
-from .formats import check_activation_format, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
+from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant
 from .loading.scales import apply_global_scale, mx_2d_scale_ptrs
@@ -644,6 +644,9 @@ def mx_dynamic_matmul_kernel(
     stride_cs_n,
     stride_bias_e,
     stride_bias_n,
+    stride_as_global,  # expert stride of AsGlobal (0 broadcasts a shared scalar)
+    stride_bs_global,  # expert stride of AsBsGlobal (``global_scale_stride``)
+    stride_cs_global,  # expert stride of CsGlobal (0 broadcasts a shared scalar)
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -713,7 +716,7 @@ def mx_dynamic_matmul_kernel(
     accumulator = acc_init(COMPUTE_MODE if SWAP_AB else "dot", BLOCK_SIZE_M, n_width, SWAP_AB)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
         a, a_s = load_act_mx(
-            a_ptrs, as_ptrs, AsGlobal, None, as_mask, ADescriptor, pid_m * BLOCK_SIZE_M,
+            a_ptrs, as_ptrs, AsGlobal, 0, None, as_mask, ADescriptor, pid_m * BLOCK_SIZE_M,
             k * (BLOCK_SIZE_K // ACT_VALUES_PER_BYTE), ASDescriptor, As, 0, 0, pid_m, k, M, K,
             A_MEMORY_MODE, False, False, SWIZZLED_SCALES,
             BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, ACTIVATION_FORMAT,
@@ -750,9 +753,11 @@ def mx_dynamic_matmul_kernel(
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, OUTPUT_FORMAT, SCALE_GROUP_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
         COMPUTE_MODE=COMPUTE_MODE, SWAP_AB=SWAP_AB, N_COLS=N, SWIZZLED_OUT=SWIZZLED_OUT,
-        CSDescriptor=CSDescriptor, CsGlobal=CsGlobal,
+        CSDescriptor=CSDescriptor, CsGlobal=CsGlobal, stride_cs_global=stride_cs_global,
         GlobalScale=AsBsGlobal,
+        stride_global_e=stride_bs_global,
         GlobalScaleA=AsGlobal,
+        stride_global_a=stride_as_global,
         global_row=0,
         Bias=Bias,
         stride_bias_e=stride_bias_e,
@@ -818,6 +823,7 @@ def mx_weight_only_matmul_2d_kernel(
     stride_c_n,
     stride_bias_e,
     stride_bias_n,
+    stride_bs_global,  # expert stride of BsGlobal (``global_scale_stride``)
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -883,10 +889,6 @@ def mx_weight_only_matmul_2d_kernel(
         b_ptrs += (BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE) * stride_b_k
         bs_ptrs += SCALE_COLS * stride_bs_k
 
-    # explicit (not the epilogue fold): the non-GATE arm exits through store_masked, which
-    # has no GlobalScale slot — the multiply must precede BOTH exits
-    accumulator = apply_global_scale(accumulator, BsGlobal, 0)
-
     if GATE:
         out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         gemm_epilogue(
@@ -895,9 +897,15 @@ def mx_weight_only_matmul_2d_kernel(
             BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
             COMPUTE_MODE="dot", N_COLS=N,
+            GlobalScale=BsGlobal, stride_global_e=stride_bs_global,
             Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         )
     else:
+        # explicit (not the epilogue fold): this arm exits through store_masked, which has no
+        # GlobalScale slot
+        accumulator = apply_global_scale(
+            accumulator, BsGlobal, stride_bs_global, None, 0, 0
+        )
         accumulator = add_bias(
             accumulator, Bias, stride_bias_e, stride_bias_n, 0, pid_n,
             BLOCK_SIZE_N, N, False,
@@ -1418,17 +1426,19 @@ def mx_dynamic_matmul(
     # affine in-register even under a swizzled weight — the dot_scaled reads the mixed layout fine.
     # NVFP4 two-level: a_global_scale (the calibrated activation global) normalizes the quant on both
     # arms — the offline kernel divides before the block quant, the inline arm via AsGlobal.
-    if a_global_scale is not None:
+    act_global_scale = normalize_global_scale(a_global_scale, 1)  # g_a; folds in-kernel
+    if act_global_scale is not None:
         assert activation_format == "nvfp4", "an activation global is NVFP4-only"
         act_quant = lambda a: MX_ACT_QUANT[activation_format](  # noqa: E731
-            a, swizzled=swizzled_scales, global_scale=a_global_scale
+            a, swizzled=swizzled_scales, global_scale=act_global_scale
         )
     elif swizzled_scales:
         act_quant = lambda a: MX_ACT_QUANT[activation_format](a, swizzled=True)  # noqa: E731
     else:
         act_quant = MX_ACT_QUANT[activation_format]
-    # NVFP4 accumulator correction: the g_a·g_b product folded onto the fp32 accumulator.
-    input_global_scale = normalize_global_scale(b_global_scale, 1)  # g_b; g_a folds in-kernel
+    # NVFP4 accumulator correction: the g_a·g_b product folded onto the fp32 accumulator
+    input_global_scale = normalize_global_scale(b_global_scale, 1)  # g_b
+    out_global_scale = normalize_global_scale(output_global_scale, 1)
     # As given ⇒ A is already quantized (the routed-op parity: a pre-quantized activation + its
     # scales); else quantize raw A (offline above the M threshold, inline in the kernel below it).
     if As is not None:
@@ -1511,9 +1521,9 @@ def mx_dynamic_matmul(
             Cs,
             bias,
             CSDescriptor,
-            a_global_scale,  # AsGlobal: g_a for the inline-quant arm (A/g_a)
+            act_global_scale,  # AsGlobal: g_a for the inline-quant arm (A/g_a)
             input_global_scale,  # AsBsGlobal = g_b (acc; g_a folds in-kernel via AsGlobal)
-            output_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
+            out_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
             M,
             N,
             K,
@@ -1534,6 +1544,9 @@ def mx_dynamic_matmul(
             stride_cs_n,
             bias_stride_e,
             bias_stride_n,
+            global_scale_stride(act_global_scale),
+            global_scale_stride(input_global_scale),
+            global_scale_stride(out_global_scale),
             SCALE_GROUP_K=scale_group,
             ACTIVATION_FORMAT=activation_format,
             SWIZZLED_SCALES=swizzled_scales,
@@ -1697,6 +1710,7 @@ def mx_weight_only_matmul_2d(
             C.stride(-1),
             bias_stride_e,
             bias_stride_n,
+            global_scale_stride(b_global_scale),
             SCALE_GROUP_K=scale_group,
             WEIGHT_VALUES_PER_BYTE=WEIGHT_VALUES_PER_BYTE,
             GATE=gate,
@@ -1793,6 +1807,12 @@ def _torch_scaled_mm_2d(A, B, As, Bs, activation_format, a_global_scale, b_globa
     fmt = weight_format(B, Bs)
     if fmt not in ("mxfp8", "nvfp4") or activation_format == "bf16":
         return _smm_reject("format/activation_format")
+    if (a_global_scale is not None and a_global_scale.numel() > 1) or (
+        b_global_scale is not None and b_global_scale.numel() > 1
+    ):
+        # scaled_mm's second level is one TensorWise value per operand, so a gate|up stack whose
+        # halves carry their own global has no form here — the Triton kernels fold it by column
+        return _smm_reject("multi-valued global")
     # None follows the weights; resolve it before comparing (the bench and the integrations pass it)
     if resolve_activation_format(activation_format, B, Bs) != fmt:
         return _smm_reject("format-mismatch-after-resolve")

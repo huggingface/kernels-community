@@ -184,7 +184,8 @@ def load_weight_scale_tile(
 def load_mx_act_tile(
     a_ptrs,
     as_ptrs,
-    as_global,  # (1,) fp32 NVFP4 act global (None off nvfp4); normalizes the raw tile pre-block-quant
+    as_global,  # fp32 NVFP4 act global (None off nvfp4); normalizes the raw tile pre-block-quant
+    as_global_row,  # element offset into ``as_global`` (the expert's entry; 0 for a shared scalar)
     row_mask,
     a_descriptor,
     m_start,
@@ -204,10 +205,11 @@ def load_mx_act_tile(
     the same UE8M0 scales, raw bf16/fp16 pointers load and quantize inline onto
     ``FORMAT``'s grid (``mx_act_quant_inline`` — packed E2M1 under the fp4 formats;
     ``as_ptrs`` then points at a dead placeholder and is never read). Under NVFP4
-    two-level, ``as_global`` (the calibrated activation global) normalizes the raw tile
-    before the block quant — bit-identical to the offline ``nvfp4_act_quant(x,
-    global_scale=g_a)`` pass. ``row_mask`` may be ``None`` (unmasked tiles, e.g. the
-    %-wrapped 2D matmul). Callers advance both pointers unconditionally."""
+    two-level, ``as_global[as_global_row]`` (the calibrated activation global — per tensor
+    or this expert's) normalizes the raw tile before the block quant — bit-identical to the
+    offline ``nvfp4_act_quant(x, global_scale=g_a)`` pass. ``row_mask`` may be ``None``
+    (unmasked tiles, e.g. the %-wrapped 2D matmul). Callers advance both pointers
+    unconditionally."""
     if a_ptrs.dtype.element_ty == tl.float8e4nv or a_ptrs.dtype.element_ty == tl.uint8:
         # pre-quantized (E4M3 offline, or packed E2M1 handed in by the caller); under the
         # descriptor arm the [BM, BK_bytes] box loads the tile's contiguous sorted rows
@@ -252,7 +254,7 @@ def load_mx_act_tile(
         else:
             a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
         if as_global is not None:  # NVFP4 two-level: normalize by the calibrated act global
-            a_raw = a_raw / tl.load(as_global).to(tl.float32)
+            a_raw = a_raw / tl.load(as_global + as_global_row).to(tl.float32)
         a, a_scale = mx_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, FORMAT
         )
@@ -260,17 +262,14 @@ def load_mx_act_tile(
 
 
 @triton.jit
-def apply_global_scale(acc, GlobalScale, expert_id, GlobalScaleA=None):
-    """Fold the NVFP4 second-level globals onto the fp32 accumulator: ``GlobalScale`` is the
-    per-expert (or per-tensor, ``expert_id=0``) weight global ``g_b``, ``GlobalScaleA`` the
-    scalar activation global ``g_a``. Both multiply here, in-register, so the host never
-    materializes the ``g_a·g_b`` product — that product used to be a torch multiply per GEMM
-    per call (two ~2us launches on every NVFP4 two-level decode forward). Either ``None``
-    folds out at trace time."""
+def apply_global_scale(acc, GlobalScale, stride_gs_e, GlobalScaleA, stride_gsa_e, expert_id):
+    """Fold the NVFP4 second-level globals onto the fp32 accumulator: the weight global ``g_b``
+    and the activation global ``g_a``, each per tensor (stride 0, broadcast) or per expert.
+    ``None`` folds the arm out."""
     if GlobalScale is not None:
-        acc = acc * tl.load(GlobalScale + expert_id).to(tl.float32)
+        acc = acc * tl.load(GlobalScale + expert_id * stride_gs_e).to(tl.float32)
     if GlobalScaleA is not None:
-        acc = acc * tl.load(GlobalScaleA).to(tl.float32)
+        acc = acc * tl.load(GlobalScaleA + expert_id * stride_gsa_e).to(tl.float32)
     return acc
 
 

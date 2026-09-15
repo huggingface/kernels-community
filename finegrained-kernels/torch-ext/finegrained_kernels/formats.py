@@ -203,16 +203,34 @@ def tokens_per_expert_bucket(S: int, num_experts: int) -> int:
 def normalize_global_scale(
     g: torch.Tensor | None, num_experts: int
 ) -> torch.Tensor | None:
-    """Flat fp32 ``(num_experts,)`` for the kernels' ``apply_global_scale`` load — accepts
-    ``(E,)``, ``(E,1,1)``, or (``num_experts=1``) a scalar. ``None`` passes through."""
+    """An NVFP4 second-level global in one of the kernels' fp32 load layouts: ``(1,)`` per tensor
+    or ``(num_experts,)`` per expert (``(E, 1, 1)`` accepted for the latter). The kernels index it
+    through ``global_scale_stride``, so a shared value broadcasts by stride and nothing is
+    materialized per call. ``None`` passes through.
+
+    A gate|up stack calibrated per half (modelopt's ``(E, 2)`` ``weight_scale_2``) is merged to one
+    global per expert at load — SwiGLU is linear in the up half, so its global folds into the down
+    projection's — never here: the ops take one global per matrix."""
     if g is None:
         return None
-    if num_experts == 1:
-        assert g.numel() == 1, f"per-tensor global expected, got {tuple(g.shape)}"
-        return g.reshape(1).float()
-    if g.numel() == 1:  # one per-tensor global shared by every expert: broadcast to the (E,) load
-        return g.reshape(1).float().expand(num_experts).contiguous()
-    return normalize_per_expert_scale(g, num_experts).reshape(-1).float()
+    g = g.float()
+    if g.numel() == 1:
+        return g.reshape(1)
+    assert g.numel() == num_experts, (
+        f"global scale of shape {tuple(g.shape)}: expected a scalar or ({num_experts},)"
+    )
+    return g.reshape(num_experts).contiguous()
+
+def is_per_expert_global(g: torch.Tensor | None) -> bool:
+    """Whether an NVFP4 second-level global carries one value per expert rather than one for the
+    whole tensor. The activation quant branches on it: a per-expert global has to be applied by
+    each quantized row's own expert, which is what decides the grid that quant runs on."""
+    return g is not None and g.numel() > 1
+
+def global_scale_stride(g: torch.Tensor | None) -> int:
+    """The expert stride of a ``normalize_global_scale`` layout: 0 for a scalar (or ``None``),
+    which broadcasts it to every expert, else 1."""
+    return 0 if g is None or g.numel() == 1 else 1
 
 def normalize_per_expert_scale(Bs: torch.Tensor, num_experts: int) -> torch.Tensor:
     """One per-tensor scale per expert, normalized to ``(num_experts, 1, 1)`` from

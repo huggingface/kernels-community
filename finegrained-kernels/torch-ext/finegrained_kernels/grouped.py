@@ -23,8 +23,8 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, sm_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
-from .formats import check_activation_format, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
-from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_swizzled_grouped, swizzle_grouped_mx_scales
+from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
+from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_grouped, swizzle_grouped_mx_scales
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import build_tile_layout, expand_gather_below_parity, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
@@ -706,6 +706,9 @@ def mx_dynamic_matmul_grouped_kernel(
     stride_cs_n,
     stride_bias_e,
     stride_bias_n,
+    stride_as_global,  # expert stride of AsGlobal (0 broadcasts a shared scalar)
+    stride_bs_global,  # expert stride of AsBsGlobal (``global_scale_stride``)
+    stride_cs_global,  # expert stride of CsGlobal (0 broadcasts a shared scalar)
     num_experts,
     tokens_per_expert_bit_length,  # autotune key only (log2 avg-tokens bucket); unused in body
     # Meta-parameters
@@ -827,7 +830,7 @@ def mx_dynamic_matmul_grouped_kernel(
         weight_blk = (expert_id64 * num_n_tiles + pid_n).to(tl.int32)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
             a, a_s = load_act_mx(
-                a_ptrs, As, None, row_mask, row_mask, ADescriptor, m_start, ka_off,
+                a_ptrs, As, None, 0, row_mask, row_mask, ADescriptor, m_start, ka_off,
                 ASDescriptor, As, in_row, stride_as_m, pid_m, k, 0, K,
                 A_MEMORY_MODE, GatherIdx is not None, True, SWIZZLED_SCALES,
                 BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K, "mxfp8",
@@ -874,9 +877,12 @@ def mx_dynamic_matmul_grouped_kernel(
             SWIZZLED_OUT=SWIZZLED_OUT,  # single source: the wrapper decided it and built Cs to match
             CSDescriptor=CSDescriptor,
             CsGlobal=CsGlobal,
+            stride_cs_global=stride_cs_global,
             N_COLS=N,  # mask the partial last N-tile's column tail (non-128 N; inert when N % BN == 0)
             GlobalScale=AsBsGlobal,
+                stride_global_e=stride_bs_global,
             GlobalScaleA=AsGlobal,
+            stride_global_a=stride_as_global,
             global_row=expert_id64,
             Bias=Bias,
             stride_bias_e=stride_bias_e,
@@ -953,6 +959,7 @@ def mx_weight_only_matmul_grouped_kernel(
     stride_c_n,
     stride_bias_e,
     stride_bias_n,
+    stride_bs_global,  # expert stride of BsGlobal (``global_scale_stride``)
     num_experts,
     tokens_per_expert_bit_length,
     BLOCK_SIZE_M: tl.constexpr,
@@ -1051,6 +1058,7 @@ def mx_weight_only_matmul_grouped_kernel(
             ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
             N_COLS=N,
             GlobalScale=BsGlobal,
+                stride_global_e=stride_bs_global,
             global_row=expert_id64,
             Bias=Bias,
             stride_bias_e=stride_bias_e,
@@ -1753,11 +1761,23 @@ def mx_dynamic_matmul_grouped(
         assert (As.dtype == torch.float8_e4m3fn) == (Bs.dtype == torch.float8_e4m3fn), (
             f"activation scales ({As.dtype}) must match the weight scale family ({Bs.dtype})"
         )
-    # g_a normalizes the act quant here in the wrapper (the raw-A arm below, or applied offline for a
-    # pre-quantized As); the kernel only ever sees the combined g_a·g_b via AsBsGlobal (grouped A is
-    # pre-quantized, so there's no in-kernel inline-quant that would need g_a alone).
+    # g_a normalizes the act quant here in the wrapper (the raw-A arms below, or offline for a
+    # pre-quantized As) and rides down as AsGlobal for the accumulator to multiply back — grouped A
+    # is always quantized before the GEMM, so no in-kernel inline quant reads it.
+    act_global_scale = normalize_global_scale(a_global_scale, num_experts)
     if a_global_scale is not None:
         assert activation_format == "nvfp4", "an activation global is NVFP4-only"
+        # A per-expert g_a quantizes each row against ITS expert's global, so every row must
+        # belong to one expert — i.e. A is expert-sorted (``gather_idx`` None: the down of both
+        # MoE chains, raw or pre-quantized). Under a gather, A is one row per SOURCE token routed
+        # to top_k experts at once and no single quant can serve per-expert globals, so that call
+        # takes one global for the tensor (the global is a split of the block scale, not a value
+        # the GEMM loses: the accumulator multiplies back whatever the quant divided by).
+        assert not is_per_expert_global(a_global_scale) or gather_idx is None, (
+            "a per-expert a_global_scale needs an expert-sorted A (gather_idx None) — a gathered "
+            "A holds one row per source token, routed to several experts at once, so pass one "
+            "global for the tensor"
+        )
     if swizzled_scales:
         if As is None and gather_idx is not None:
             # Quantize ONCE at (num_tokens, K) and let the kernel gather the packed rows:
@@ -1770,13 +1790,14 @@ def mx_dynamic_matmul_grouped(
             # The scales take the same gather+swizzle pass a caller-provided row-major
             # As takes.
             A, As = (
-                MX_ACT_QUANT[activation_format](A, global_scale=a_global_scale)
+                MX_ACT_QUANT[activation_format](A, global_scale=act_global_scale)
                 if a_global_scale is not None
                 else MX_ACT_QUANT[activation_format](A)
             )
         if As is None:
-            a_vals, act_scales, n_m_tiles = mx_act_quant_swizzled_grouped(
-                A, activation_format, scale_group, scale_dtype, gather_idx, expert_start, a_global_scale
+            a_vals, act_scales, n_m_tiles = mx_act_quant_grouped(
+                A, activation_format, scale_group, scale_dtype, gather_idx, expert_start,
+                act_global_scale,
             )
         elif As.ndim == 5:  # pre-swizzled by the gate_up requant epilogue (fused down) — read as is
             a_vals, act_scales, n_m_tiles = A, As, As.shape[1]
@@ -1789,9 +1810,16 @@ def mx_dynamic_matmul_grouped(
         assert As is None or As.ndim != 5, (
             "un-swizzled weights pair with affine (row-major) activation scales, got 5D As"
         )
-        if As is None:
+        if As is None and is_per_expert_global(act_global_scale):
+            # each row divides by ITS expert's global, so quantize on the expert-sorted grid,
+            # whose tiles carry an expert — the dense grid would need that map as a tensor
+            a_vals, act_scales, _ = mx_act_quant_grouped(
+                A, activation_format, scale_group, scale_dtype, gather_idx, expert_start,
+                act_global_scale, swizzled=False,
+            )
+        elif As is None:
             a_vals, act_scales = (
-                MX_ACT_QUANT[activation_format](A, global_scale=a_global_scale)
+                MX_ACT_QUANT[activation_format](A, global_scale=act_global_scale)
                 if a_global_scale is not None
                 else MX_ACT_QUANT[activation_format](A)
             )
@@ -1853,7 +1881,7 @@ def mx_dynamic_matmul_grouped(
     # g_b per expert and g_a scalar go down SEPARATELY; the kernel multiplies them in-register
     # (the old host-side g_a*g_b product was a torch launch per GEMM per call)
     input_global_scale = normalize_global_scale(b_global_scale, B.shape[0])
-    act_global_scale = None if a_global_scale is None else a_global_scale.reshape(1).float()
+    out_global_scale = normalize_global_scale(output_global_scale, num_experts)
     # host TMA descriptor over the (E, 2N|N, K_bytes) view — a gate tile is one contiguous
     # 2*BN row span; the placeholder box is re-bound per tuned config by the pre_hook
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
@@ -1882,7 +1910,7 @@ def mx_dynamic_matmul_grouped(
             CSDescriptor,
             act_global_scale,  # AsGlobal = g_a (acc, in-register)
             input_global_scale,  # AsBsGlobal = g_b per expert (acc)
-            output_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
+            out_global_scale,  # CsGlobal: requant output normalization (next proj's provided input_scale); None folds out
             gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
             scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
             expert_start,
@@ -1906,6 +1934,9 @@ def mx_dynamic_matmul_grouped(
             cs_ret.stride(1) if (requant and not swizzled_out) else 1,
             bias_stride_e,
             bias_stride_n,
+            global_scale_stride(act_global_scale),
+            global_scale_stride(input_global_scale),
+            global_scale_stride(out_global_scale),
             num_experts=num_experts,
             tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
@@ -2106,6 +2137,7 @@ def mx_weight_only_matmul_grouped(
             C.stride(1),
             bias_stride_e,
             bias_stride_n,
+            global_scale_stride(b_global_scale),
             num_experts=num_experts,
             tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),

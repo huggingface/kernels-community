@@ -19,6 +19,7 @@ from .grouped import matmul_grouped
 from .moe import moe_fused_batched, moe_fused_grouped
 from . import backward
 from .formats import get_supported_act_fns
+from .norm import get_supported_norms, rms_norm_rows
 from .swizzle import swizzle_mx_scales, unswizzle_mx_scales
 from .quant import mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant
 
@@ -34,6 +35,9 @@ __all__ = [
     # importing it registers the dgrad formulas on the ops, so a forward call differentiates
     "backward",
     "get_supported_act_fns",
+    # the per-expert output norm a model can hand the forwards by name, and its standalone op
+    "get_supported_norms",
+    "rms_norm_rows",
     # load-time helpers: the swizzled scale layout the SM100 scaled-MMA reads, and the row-wise
     # quantizers a loader uses to quantize weights into the group formats
     "swizzle_mx_scales",

@@ -18,6 +18,7 @@ import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
+from .formats import global_scale_stride, is_per_expert_global
 from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_op, compile_time_only_triton_wrap, decode_pdl, device_context, is_sm10x
 from .swizzle import swizzle_store_block
 from .scheduling import build_tile_layout, resolve_tile_inline
@@ -344,16 +345,13 @@ def _quant_block_k_pruner(configs, named_args, **kwargs):
     grid (the per-element store handles any tile height) but pinned to 128 on the GROUPED grid,
     where one program == one 128-row expert-sorted tile (``build_tile_layout``'s pad granularity)."""
     args = {**named_args, **kwargs}
-    k = args["K"]
-    if not args.get("SWIZZLED"):
-        return [c for c in configs if k % c.kwargs["BLOCK_K"] == 0]
-    g = args["SCALE_GROUP_K"]
-    grouped = args.get("GROUPED", True)  # grouped grid is one program per 128-row block
+    k, g = args["K"], args["SCALE_GROUP_K"]
+    swizzled, grouped = args.get("SWIZZLED", False), args.get("GROUPED", True)
     return [
         c
         for c in configs
         if k % c.kwargs["BLOCK_K"] == 0
-        and c.kwargs["BLOCK_K"] % (4 * g) == 0
+        and (not swizzled or c.kwargs["BLOCK_K"] % (4 * g) == 0)
         and (not grouped or c.kwargs["BLOCK_T"] == 128)
     ]
 
@@ -420,10 +418,11 @@ def store_mx_act_scales(
     # t_bucket (log2 of the token count) is in the key: at small T the tile is the only
     # parallelism lever while at prefill scale it isn't — same bucketing as the grouped
     # kernels (raw T would retune per unique token count). SWIZZLED keys the swizzled-scale
-    # store separately (a disjoint config basin). FORMAT keys the value dtype/packing (E4M3 vs
-    # packed E2M1, and SCALE_GROUP_K 32 vs 16) — a dtype-blind key hands packed MXFP4 the E4M3
-    # config and mistunes it.
-    ["K", "t_bucket", "SWIZZLED", "FORMAT"],
+    # store separately (a disjoint config basin), GROUPED the grid — its 128-row expert tiles
+    # pin BLOCK_T, so its crowns cannot be shared with the dense grid's. FORMAT keys the value
+    # dtype/packing (E4M3 vs packed E2M1, and SCALE_GROUP_K 32 vs 16) — a dtype-blind key hands
+    # packed MXFP4 the E4M3 config and mistunes it.
+    ["K", "t_bucket", "SWIZZLED", "GROUPED", "FORMAT"],
     n_trials=100,
     prune_configs_by={"early_config_prune": _quant_block_k_pruner},
 )
@@ -433,9 +432,12 @@ def _mx_act_quant_kernel(
     Y,
     S,  # (T, K // SCALE_GROUP_K) row-major scales; None on the swizzled path
     SOut,  # flat SWIZZLE_32_4_4 scale buffer (1, n_tiles, cb, 2, 256); None on the plain path
-    GatherIdx,  # (S,) int32 sorted position -> source row of X; read only when SWIZZLED and not None
-    ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 cumulative sorted-row starts; read iff SWIZZLED
-    GlobalScale,  # (1,) fp32 NVFP4 second-level per-tensor global; None ⇒ single-level (arm folds out)
+    GatherIdx,  # (S,) int32 sorted position -> source row of X; read only when GROUPED and not None
+    ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 cumulative sorted-row starts; read iff GROUPED
+    GlobalScale,  # fp32 NVFP4 second-level global, per tensor or per expert; None ⇒ single-level (arm folds out)
+    GlobalIdx,  # (T,) row -> expert map, for a per-expert global on the DENSE grid (the batched op's own expert_ids); None on the grouped grid, whose tiles carry an expert
+    stride_global,  # expert stride of GlobalScale (0 broadcasts a scalar)
+    last_global,  # index of GlobalScale's last entry — clamps GlobalIdx, whose EP sentinel rows name an out-of-range expert (they are masked out of the GEMM, so any in-range global serves them)
     stride_x_t,
     stride_x_k,
     T,
@@ -446,7 +448,7 @@ def _mx_act_quant_kernel(
     # and requires signature order — the tuned axes stay LAST
     FORMAT: tl.constexpr = "mxfp8",
     SWIZZLED: tl.constexpr = False,
-    GROUPED: tl.constexpr = True,  # SWIZZLED grid: expert-sorted tiles (True) vs plain dense (False)
+    GROUPED: tl.constexpr = True,  # grid: expert-sorted tiles (True) vs plain dense rows (False)
     NUM_EXPERTS_POW2: tl.constexpr = 1,  # always passed explicitly; see the dense launch
     BLOCK_K: tl.constexpr = 32,
     BLOCK_T: tl.constexpr = 32,
@@ -458,18 +460,19 @@ def _mx_act_quant_kernel(
     ("nvfp4"). Group boundaries are identical across forms (SCALE_GROUP_K | BLOCK_K | K).
     Arbitrary input strides.
 
-    Plain path (``SWIZZLED=False``): grid ``(cdiv(T, BLOCK_T), K // BLOCK_K)`` — each program
-    quantizes a ``[BLOCK_T, BLOCK_K]`` tile and writes ``S`` row-major (the one-row-per-program
-    form starved memory at 1.5-1.8 TB/s on the packed formats; the row tile coalesces).
+    Two independent axes. ``GROUPED`` picks the GRID: dense ``(cdiv(T, BLOCK_T), K // BLOCK_K)``
+    over plain row tiles (the one-row-per-program form starved memory at 1.5-1.8 TB/s on the
+    packed formats; the row tile coalesces), or ``(n_m_tiles, K // BLOCK_K)`` over the
+    expert-sorted, 128-padded tile layout (``build_tile_layout``, so BLOCK_T is pinned there).
+    A grouped program gathers its tile's source rows through ``GatherIdx`` (padding masked) and
+    scatters the VALUES back to source row order — the GEMM still TMA-gathers them, and duplicate
+    sorted->source writes store identical bytes — and its tile carries the expert a per-expert
+    NVFP4 global is indexed by, which is why only the dense grid needs a row map for that.
 
-    Swizzled grouped path (``SWIZZLED=True``, BLOCK_T pinned 128): grid ``(n_m_tiles,
-    K // BLOCK_K)`` over the expert-sorted, 128-padded tile layout (``build_tile_layout``). Each
-    program gathers its tile's source rows through ``GatherIdx`` (padding masked), quantizes,
-    scatters the VALUES back to source row order (the GEMM still TMA-gathers them; duplicate
-    sorted->source writes store identical bytes), and writes the SCALES straight into the
-    SWIZZLE_32_4_4 layout the grouped GEMM reads affine (the inverse of ``load_swizzled_scale``)
-    — no post-quant gather/swizzle pass. Padding-row scales are quantized zeros (harmless: the
-    GEMM masks those rows' values to 0)."""
+    ``SWIZZLED`` picks the SCALE STORE: straight into the SWIZZLE_32_4_4 layout the grouped GEMM
+    reads affine (the inverse of ``load_swizzled_scale``), so no post-quant gather/swizzle pass,
+    or row-major ``S``. Padding-row scales are quantized zeros (harmless: the GEMM masks those
+    rows' values to 0)."""
     if PDL:
         gdc_wait()
     kb = tl.program_id(1)
@@ -478,24 +481,22 @@ def _mx_act_quant_kernel(
         # scale output-row position (== source row on the dense path); the swizzled block index is
         # so // 128, valid for ANY BLOCK_T (no 128-row pin) so the dense grid autotunes BLOCK_T.
         so = pid_m * BLOCK_T + tl.arange(0, BLOCK_T)
-        if GROUPED:
-            exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
-                ExpertStart, NUM_EXPERTS_POW2, BLOCK_T
-            )
-            _, sorted_idx, row_mask = resolve_tile_inline(
-                pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_T
-            )
-            if GatherIdx is not None:
-                in_row = tl.load(GatherIdx + sorted_idx, mask=row_mask, other=0).to(tl.int64)
-            else:
-                in_row = sorted_idx.to(tl.int64)
+    if GROUPED:
+        exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
+            ExpertStart, NUM_EXPERTS_POW2, BLOCK_T
+        )
+        expert_id, sorted_idx, row_mask = resolve_tile_inline(
+            tl.program_id(0), exp_start, freqs, tile_start_excl, e_offs, BLOCK_T
+        )
+        if GatherIdx is not None:
+            in_row = tl.load(GatherIdx + sorted_idx, mask=row_mask, other=0).to(tl.int64)
         else:
-            in_row = so.to(tl.int64)
-            row_mask = so < T
+            in_row = sorted_idx.to(tl.int64)
     else:
-        pid_t = tl.program_id(0)
-        in_row = (pid_t * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int64)
-        row_mask = in_row < T
+        expert_id = 0
+        rows = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+        in_row = rows.to(tl.int64)
+        row_mask = rows < T
     offs = kb * BLOCK_K + tl.arange(0, BLOCK_K)
     x = tl.load(
         X + in_row[:, None] * stride_x_t + offs[None, :] * stride_x_k,
@@ -503,10 +504,16 @@ def _mx_act_quant_kernel(
         other=0.0,
     ).to(tl.float32)
     if GlobalScale is not None:
-        # NVFP4 two-level: normalize by the calibrated per-tensor global before the block
-        # quant — block scales are then amax/6 of x/g (the canonical two-step); the GEMM
-        # folds g back onto the accumulator (g_a·g_b). None folds the arm out at trace time.
-        x = x / tl.load(GlobalScale).to(tl.float32)
+        # NVFP4 two-level: normalize by the calibrated global before the block quant — block
+        # scales are then amax/6 of x/g (the canonical two-step); the GEMM folds g back onto the
+        # accumulator (g_a·g_b). A per-expert global is indexed by the tile's OWN expert, which
+        # the grouped grid resolved for free — the rows of a tile belong to one expert; the dense
+        # grid has no such layout and takes the caller's row map. None folds the arm out.
+        if GlobalIdx is not None:
+            e = tl.minimum(tl.load(GlobalIdx + in_row, mask=row_mask, other=0), last_global)
+            x = x / tl.load(GlobalScale + e * stride_global).to(tl.float32)[:, None]
+        else:
+            x = x / tl.load(GlobalScale + expert_id * stride_global).to(tl.float32)
     y, s = mx_act_quant_inline(x, BLOCK_T, BLOCK_K, SCALE_GROUP_K, FORMAT)
     width: tl.constexpr = BLOCK_K // 2 if FORMAT != "mxfp8" else BLOCK_K
     y_row: tl.constexpr = K // (BLOCK_K // width)  # per-row element count of Y
@@ -526,7 +533,7 @@ def _mx_act_quant_kernel(
         )
 
 
-def mx_act_quant_swizzled_grouped(
+def mx_act_quant_grouped(
     x: torch.Tensor,
     activation_format: str,
     scale_group: int,
@@ -534,12 +541,14 @@ def mx_act_quant_swizzled_grouped(
     gather_idx: torch.Tensor | None,
     expert_start: torch.Tensor,
     global_scale: torch.Tensor | None = None,
+    swizzled: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Offline MX act-quant for a grouped GEMM that emits SWIZZLE_32_4_4 scales directly (the
-    ``SWIZZLED`` arm of ``_mx_act_quant_kernel``). Returns ``(values, swizzled_scale,
-    num_m_tiles)`` — the values in source order (E4M3, or packed E2M1 uint8 for the fp4 formats)
-    and the scales as the ``(1, num_m_tiles, cb, 2, 256)`` swizzled tensor (the caller builds the
-    GEMM's scale descriptor from it, like every other operand). Only the ``expert_start[-1]``
+    """Offline MX act-quant on the GROUPED grid of ``_mx_act_quant_kernel``: one program per
+    expert-sorted tile, so each tile knows its own expert and a per-expert NVFP4 global needs no
+    per-row index. Returns ``(values, scales, num_m_tiles)`` — the values in source order (E4M3,
+    or packed E2M1 uint8 for the fp4 formats) and the scales either as the ``(1, num_m_tiles, cb,
+    2, 256)`` SWIZZLE_32_4_4 tensor the GEMM reads through a descriptor (``swizzled``) or
+    row-major ``(T, K // scale_group)`` for the affine arm. Only the ``expert_start[-1]``
     scheduled rows are laid out; expert padding is per 128 (the ``BLOCK_T`` pin).
 
     ``n_m_tiles`` is a STATIC host-side upper bound (``S//128 + E``) on the padded tile count —
@@ -554,19 +563,25 @@ def mx_act_quant_swizzled_grouped(
     y = torch.empty(
         T, K // 2 if packed else K, device=x.device, dtype=torch.uint8 if packed else FP8_DTYPE
     )
-    cb = triton.cdiv(K // scale_group, 4)
-    s_sw = torch.empty(1, n_m_tiles, cb, 2, 256, device=x.device, dtype=scale_dtype)
+    if swizzled:
+        cb = triton.cdiv(K // scale_group, 4)
+        scales = torch.empty(1, n_m_tiles, cb, 2, 256, device=x.device, dtype=scale_dtype)
+    else:
+        scales = torch.empty(T, K // scale_group, device=x.device, dtype=scale_dtype)
     with device_context(x.device):
         compile_time_only_triton_wrap(_mx_act_quant_kernel)[
             lambda META: (n_m_tiles, K // META["BLOCK_K"])
         ](
             x,
             y,
-            None,  # S: the swizzled arm writes SOut, not row-major scales
-            s_sw,  # flat SWIZZLE_32_4_4 scale buffer (pointer store; no descriptor)
+            None if swizzled else scales,  # S: row-major scales, affine arm only
+            scales if swizzled else None,  # SOut: SWIZZLE_32_4_4 buffer, swizzled arm only
             gather_idx,  # None = no gather (the is-not-None guard folds the load out)
             expert_start,
-            global_scale,  # (1,) fp32 NVFP4 two-level global; None ⇒ single-level (arm folds out)
+            global_scale,  # fp32 NVFP4 two-level global; None ⇒ single-level (arm folds out)
+            None,  # GlobalIdx: the grouped tiles carry their own expert
+            global_scale_stride(global_scale),
+            0,  # last_global: unread without a row map
             x.stride(0),
             x.stride(1),
             T,
@@ -574,13 +589,13 @@ def mx_act_quant_swizzled_grouped(
             K=K,
             SCALE_GROUP_K=scale_group,
             FORMAT=activation_format,
-            SWIZZLED=True,
+            SWIZZLED=swizzled,
             GROUPED=True,
             NUM_EXPERTS_POW2=E,
             PDL=decode_pdl(),
             launch_pdl=decode_pdl(),
         )
-    return y, s_sw, n_m_tiles
+    return y, scales, n_m_tiles
 
 
 @triton.jit
@@ -696,20 +711,26 @@ def mxfp4_act_quant(x: torch.Tensor, swizzled: bool = False) -> tuple[torch.Tens
 
 
 def nvfp4_act_quant(
-    x: torch.Tensor, swizzled: bool = False, global_scale: torch.Tensor | None = None
+    x: torch.Tensor,
+    swizzled: bool = False,
+    global_scale: torch.Tensor | None = None,
+    expert_index: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to NVFP4 in one kernel pass: packed-E2M1 values
     (``(T, K//2)`` int8) + E4M3 group-16 block scales (``(T, K//16)`` — ``amax/6`` rounded to
     E4M3, NOT a power of two; values divide by the DECODED scale before the E2M1 grid,
     the standard two-step). ``global_scale`` is the CALIBRATED per-tensor second level
-    (``(1,)`` fp32, the checkpoint's ``input_scale``): values are normalized by it before
+    (fp32, the checkpoint's ``input_scale``): values are normalized by it before
     the block quant, so block scales stay in e4m3 range regardless of the activation's
     dynamic range — the canonical two-level format. The GEMM folds ``g_a·g_b`` back onto
-    the accumulator (pass ``As=scales`` with ``a_global_scale=global_scale``). ``None`` = single-level
-    (``g_a = 1``). ``swizzled=True`` emits the scale directly in SWIZZLE_32_4_4 for the
-    tcgen05 fast path."""
+    the accumulator (pass ``As=scales`` with ``a_global_scale=global_scale``). Per-expert globals
+    need each row's expert, which ``expert_index`` gives where the caller already holds that map
+    (the batched op's ``expert_ids``, sentinels and all) — it is read only when the globals are
+    per expert, and ``mx_act_quant_grouped`` needs none at all, its tiles carrying an expert.
+    ``None`` = single-level (``g_a = 1``). ``swizzled=True`` emits the scale directly in
+    SWIZZLE_32_4_4 for the tcgen05 fast path."""
     return _launch_act_quant(
-        x, "nvfp4", NVFP4_SCALE_GROUP_K, torch.float8_e4m3fn, swizzled, global_scale
+        x, "nvfp4", NVFP4_SCALE_GROUP_K, torch.float8_e4m3fn, swizzled, global_scale, expert_index
     )
 
 
@@ -742,7 +763,10 @@ MX_ACT_QUANT = {
 }
 
 
-def _launch_act_quant(x, activation_format, scale_group, scale_dtype, swizzled=False, global_scale=None):
+def _launch_act_quant(
+    x, activation_format, scale_group, scale_dtype, swizzled=False, global_scale=None,
+    expert_index=None,
+):
     """One-pass activation quant for every format (``mxfp8`` = E4M3 values, else packed E2M1) and
     both scale layouts. ``swizzled=True`` writes the scale straight into the SWIZZLE_32_4_4 buffer
     ``(1, cdiv(T, 128), cb, 2, 256)`` (per-element ptr store, dense autotuned ``BLOCK_T`` — same grid
@@ -751,6 +775,7 @@ def _launch_act_quant(x, activation_format, scale_group, scale_dtype, swizzled=F
     values before the block quant. Returns ``(values, scales)``."""
     T, K = x.shape
     packed = activation_format != "mxfp8"
+    per_expert = is_per_expert_global(global_scale)
     if packed:
         assert K % (2 * scale_group) == 0, (
             f"K (={K}) must be a multiple of {2 * scale_group} to pack E2M1 pairs"
@@ -776,7 +801,10 @@ def _launch_act_quant(x, activation_format, scale_group, scale_dtype, swizzled=F
             scales if swizzled else None,  # SOut: SWIZZLE_32_4_4 buffer, swizzled arm only
             None,  # GatherIdx: the dense grid reads rows directly
             None,  # ExpertStart: no expert-sorted tiles on the dense grid
-            global_scale,  # (1,) fp32 NVFP4 two-level global; None ⇒ single-level (arm folds out)
+            global_scale,  # fp32 NVFP4 two-level global; None ⇒ single-level (arm folds out)
+            expert_index if per_expert else None,  # row -> expert map, read iff the globals are per expert
+            global_scale_stride(global_scale),
+            (global_scale.numel() - 1) if per_expert else 0,
             x.stride(0),
             x.stride(1),
             T,
