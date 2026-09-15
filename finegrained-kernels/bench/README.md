@@ -11,7 +11,7 @@ Four figure rows, each a **decode | prefill** subplot pair:
 - **fused quantized** — `moe_fused_*` vs v4 vs DeepGEMM
 - **unfused quantized** — `moe_unfused_*` (two GEMMs + host GLU) vs v4 vs DeepGEMM
 - **unquantized (BF16)** — fused vs transformers `grouped_mm`/`batched_mm`, SonicMoE, DeepGEMM BF16
-- **attn quantized** — one qkv-shaped `matmul_2d` linear per model, in its deployment format
+- **linear quantized** — one qkv-shaped `matmul_2d` linear per model, in its deployment format
 
 Baselines per problem ("all kinds"): upstream **finegrained-fp8** (`@ v4`), **DeepGEMM**
 (fp8/fp4/bf16), **transformers** `grouped_mm`/`batched_mm` (= `torch._grouped_mm` / `torch.bmm`,

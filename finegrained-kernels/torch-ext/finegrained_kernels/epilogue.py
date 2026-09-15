@@ -275,7 +275,7 @@ def _glu_kernel(
     UE8M0: tl.constexpr = False,
     PDL: tl.constexpr = False,
 ):
-    """Fused GLU over a contiguous (S, 2I) interleaved gate|up tensor -> (S, I), covering every
+    """Fused GLU over a contiguous (S, 2*INTER) interleaved gate|up tensor -> (S, INTER), covering every
     ``apply_glu`` variant (silu/gelu/relu, ``SWIGLU_ALPHA``/``SWIGLU_LIMIT`` clamped-SwiGLU
     — ``None`` folds the arm out, the in-kernel ``glu``'s convention). Rounds through the
     output dtype after each op exactly where the torch chain does (each torch tensor op
@@ -285,7 +285,7 @@ def _glu_kernel(
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n_out
     # gate|up columns alternate (gate 2j, up 2j+1) — the interleaved row order the GEMM emits
-    base = (offs // I) * 2 * I + 2 * (offs % I)
+    base = (offs // INTER) * 2 * INTER + 2 * (offs % INTER)
     # fp32 input = exact GEMM accumulators (the unstacked fused-order path): compute the
     # GLU in fp32 and round ONCE at the store — the gated epilogue's math. Narrow inputs
     # keep the torch-chain per-op rounding (bit-identical to apply_glu).
@@ -342,25 +342,25 @@ def fused_glu(
     use_ue8m0: bool = False,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """GLU over the interleaved (S, 2I) gate|up GEMM output — the one-kernel ``_glu_kernel``
+    """GLU over the interleaved (S, 2*INTER) gate|up GEMM output — the one-kernel ``_glu_kernel``
     on a contiguous tensor, the torch ``apply_glu`` on any fallback layout; bit-identical
     either way. ``quant_group`` additionally block-FP8-requantizes the result per group in
     the same kernel (the unstacked decode band's handoff to the down projection) and
     returns ``(q, scales)`` — scales fp32, or UE8M0 exponent bytes under ``use_ue8m0``;
     non-SiLU/clamped variants take the two-step order (same bits — the fused arm rounds
     through bf16 first for exactly this equivalence)."""
-    I = gate_up.shape[-1] // 2
+    inter_dim = gate_up.shape[-1] // 2
     if quant_group is not None:
         if act_fn == "silu" and swiglu_alpha is None and swiglu_limit is None and gate_up.is_contiguous():
             S = gate_up.shape[0]
-            q = torch.empty(S, I, dtype=torch.float8_e4m3fn, device=gate_up.device)
-            sc = torch.empty(S, I // quant_group,
+            q = torch.empty(S, inter_dim, dtype=torch.float8_e4m3fn, device=gate_up.device)
+            sc = torch.empty(S, inter_dim // quant_group,
                              dtype=torch.uint8 if use_ue8m0 else torch.float32,
                              device=gate_up.device)
             n = q.numel()
             with device_context(gate_up.device):
                 compile_time_only_triton_wrap(_glu_kernel)[(triton.cdiv(n, 1024),)](
-                    gate_up, q, sc, n, I, "silu", None, None, BLOCK=1024,
+                    gate_up, q, sc, n, inter_dim, "silu", None, None, BLOCK=1024,
                     QUANT_GROUP=quant_group, UE8M0=use_ue8m0,
                     PDL=decode_pdl(),
                     launch_pdl=decode_pdl(),
@@ -371,12 +371,12 @@ def fused_glu(
         inter = fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit)
         return fp8_act_quant_block_dynamic(inter, quant_group, use_ue8m0=use_ue8m0)
     if gate_up.is_contiguous() and act_fn in ("silu", "gelu", "relu"):
-        out = torch.empty(*gate_up.shape[:-1], I,
+        out = torch.empty(*gate_up.shape[:-1], inter_dim,
                           dtype=out_dtype or gate_up.dtype, device=gate_up.device)
         n = out.numel()
         with device_context(gate_up.device):
             compile_time_only_triton_wrap(_glu_kernel)[(triton.cdiv(n, 1024),)](
-                gate_up, out, None, n, I, act_fn, swiglu_alpha, swiglu_limit, BLOCK=1024,
+                gate_up, out, None, n, inter_dim, act_fn, swiglu_alpha, swiglu_limit, BLOCK=1024,
                 PDL=decode_pdl(),
                 launch_pdl=decode_pdl(),
             )

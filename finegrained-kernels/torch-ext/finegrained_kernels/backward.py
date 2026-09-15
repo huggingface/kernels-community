@@ -682,7 +682,7 @@ def _glu_backward_kernel(
     back the same way — no split, no concatenate, no materialized halves."""
     offs_m = tl.program_id(0) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_i = tl.program_id(1) * BLOCK_SIZE_I + tl.arange(0, BLOCK_SIZE_I)
-    mask = (offs_m[:, None] < M) & (offs_i[None, :] < I)
+    mask = (offs_m[:, None] < M) & (offs_i[None, :] < INTER)
 
     z_gate = Z + offs_m[:, None] * stride_z_m + (2 * offs_i[None, :]) * stride_z_n
     g = tl.load(z_gate, mask=mask, other=0.0).to(tl.float32)
@@ -713,16 +713,16 @@ def glu_backward(
     product at the doubled N extent — the forward kernel with no gate flag, because
     ``pid_n * 2BN == 2 * pid_n * BN`` — so no gated backward kernel exists or is needed."""
     assert dH.ndim == 2 and Z.ndim == 2, f"expected 2D, got {dH.shape}, {Z.shape}"
-    M, I = dH.shape
-    assert Z.shape == (M, 2 * I), f"Z must be (M, 2I) = {(M, 2 * I)}, got {tuple(Z.shape)}"
+    M, INTER = dH.shape
+    assert Z.shape == (M, 2 * INTER), f"Z must be (M, 2I) = {(M, 2 * INTER)}, got {tuple(Z.shape)}"
     dZ = torch.empty_like(Z)
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
-        triton.cdiv(I, META["BLOCK_SIZE_I"]),
+        triton.cdiv(INTER, META["BLOCK_SIZE_I"]),
     )
     with device_context(Z.device):
         compile_time_only_triton_wrap(_glu_backward_kernel)[grid](
-            Z, dH, dZ, M, I,
+            Z, dH, dZ, M, INTER,
             Z.stride(0), Z.stride(1), dH.stride(0), dH.stride(1), dZ.stride(0), dZ.stride(1),
             ACT_FN=act_fn, SWIGLU_ALPHA=swiglu_alpha, SWIGLU_LIMIT=swiglu_limit,
             BLOCK_SIZE_M=32, BLOCK_SIZE_I=64, num_warps=4,

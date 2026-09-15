@@ -18,8 +18,9 @@ unvalidated.
 
 ![MoE bench: finegrained-kernels vs references on B200](bench/bench_moe.png)
 
-Real model shapes on an NVIDIA B200, against upstream `finegrained-fp8`, DeepGEMM, transformers
-`grouped_mm`/`batched_mm`, SonicMoE, OpenAI `triton_kernels`, and `torch.scaled_grouped_mm`.
+Real model shapes on an NVIDIA B200, against upstream `finegrained-fp8`, DeepGEMM, vLLM's fused
+MoE, FlashInfer's TRT-LLM routed-MoE kernels, transformers `grouped_mm`/`batched_mm`, SonicMoE,
+OpenAI `triton_kernels`, and `torch.scaled_grouped_mm`.
 Decode is cudagraph-captured, prefill eager; a red ✕ marks a configuration that raised. Every
 baseline's output is parity-checked against the finegrained-kernels anchor in the same run. See
 [`bench/README.md`](bench/README.md) to reproduce.
@@ -153,7 +154,8 @@ the offline activation quants the ops use internally, exposed for pre-quantized 
 
 ## Autotuning
 
-Every kernel is tuned by a TPE (Bayesian) autotuner with per-shape disk caching, config pruners
+Every kernel is tuned by a Tree-structured Parzen Estimator (TPE, the Bayesian search Optuna
+uses) autotuner with per-shape disk caching, config pruners
 that fence compiler bugs and can't-win regions per (arch, format), and failed-compile memoization.
 `FINEGRAINED_AUTOTUNE_TRIALS` overrides the trial budget; `FINEGRAINED_AUTOTUNE_LOG=<path>` appends
 per-config timings as JSONL to `<path>`.

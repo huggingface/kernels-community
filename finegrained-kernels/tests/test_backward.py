@@ -132,9 +132,9 @@ def test_glu_backward_matches_autograd():
     way the kernels do — gate at even columns, up at odd — so this also pins the interleaved
     convention, not just the derivative."""
     torch.manual_seed(0)
-    I = 128
-    Z = torch.randn(64, 2 * I, device=TEST_DEVICE, dtype=torch.float32, requires_grad=True)
-    dH = torch.randn(64, I, device=TEST_DEVICE, dtype=torch.float32)
+    inter = 128
+    Z = torch.randn(64, 2 * inter, device=TEST_DEVICE, dtype=torch.float32, requires_grad=True)
+    dH = torch.randn(64, inter, device=TEST_DEVICE, dtype=torch.float32)
 
     H = torch.nn.functional.silu(Z[..., 0::2]) * Z[..., 1::2]
     H.backward(dH)
@@ -187,10 +187,10 @@ def test_glu_backward_arms_match_autograd(act_fn, alpha, limit):
     ``+1`` still matches on every OTHER arm, so this parametrization is what catches it.
     ``limit`` saturates the forward, which must pass zero gradient."""
     torch.manual_seed(0)
-    I = 128
-    Z = torch.randn(64, 2 * I, device=TEST_DEVICE, dtype=torch.float32) * 3.0
+    inter = 128
+    Z = torch.randn(64, 2 * inter, device=TEST_DEVICE, dtype=torch.float32) * 3.0
     Z.requires_grad_(True)
-    dH = torch.randn(64, I, device=TEST_DEVICE, dtype=torch.float32)
+    dH = torch.randn(64, inter, device=TEST_DEVICE, dtype=torch.float32)
 
     g, u = Z[..., 0::2], Z[..., 1::2]
     if limit is not None:

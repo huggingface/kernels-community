@@ -23,6 +23,7 @@ import os
 import torch
 import triton
 import triton.language as tl
+from torch.library import triton_op, wrap_triton
 
 # Programmatic dependent launch for the decode chain (batched GEMMs, GLU, act quant, reduce): each
 # kernel waits on its grid dependency at the top and releases its dependents just before the
@@ -38,7 +39,6 @@ def decode_pdl() -> bool:
     cannot read the ``griddepcontrol`` inline asm and would mark every input mutated (extra copies,
     no fusion). Deployment decode runs eager launches under cudagraphs, where PDL applies."""
     return DECODE_PDL and not torch.compiler.is_compiling()
-from torch.library import triton_op, wrap_triton
 
 # kernel-builder generates ``_ops.py`` into the built variant (the op namespace carries the build's
 # unique id) and refuses to build over a tracked one, so the source tree has none: an unbuilt

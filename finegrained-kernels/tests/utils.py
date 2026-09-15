@@ -119,7 +119,7 @@ def make_weights(
 
     - ``torch.float8_e4m3fn`` (FP8 / MXFP8): one E4M3 byte per value; ``scale_dtype``
       picks fp32 or UE8M0 block inv-scales, laid out per ``scale_layout`` (block /
-      per_tensor_1d / per_tensor_111, 3D only).
+      per_tensor_1d / per_tensor_3d, 3D only).
     - ``torch.int8`` (packed E2M1 = FP4): two codes per byte, always with per-row
       UE8M0 group scales — ``block_n`` must be 1, and ``scale_dtype`` / ``scale_layout``
       are forced to UE8M0 / block.
@@ -185,7 +185,7 @@ def make_weights(
 
 def _apply_scale_layout(Bs, layout):
     """Reshape 3D block inv-scales ``[E, n_blocks, k_blocks]`` into the layout the
-    MoE kernels expect. ``block`` is a no-op; ``per_tensor_1d`` / ``per_tensor_111``
+    MoE kernels expect. ``block`` is a no-op; ``per_tensor_1d`` / ``per_tensor_3d``
     take the first block's scale per expert (problems that use these set
     ``block_size=None``, so there is exactly one block to take)."""
     if layout == "block":
@@ -193,7 +193,7 @@ def _apply_scale_layout(Bs, layout):
     per_tensor = Bs[:, 0, 0].contiguous()  # [E]
     if layout == "per_tensor_1d":
         return per_tensor
-    if layout == "per_tensor_111":
+    if layout == "per_tensor_3d":
         return per_tensor.view(-1, 1, 1).contiguous()
     raise ValueError(f"Unsupported scale layout: {layout}")
 
@@ -357,7 +357,7 @@ WEIGHTS = {
     ),
     "fp8_tensor": dict(
         make=lambda N, K, E: (*make_weights(
-            N, K, TEST_DEVICE, None, scale_layout="per_tensor_111", num_experts=E
+            N, K, TEST_DEVICE, None, scale_layout="per_tensor_3d", num_experts=E
         ), None),
         dequant=lambda B, Bs, g=None: B.float() * Bs.float().reshape(-1, 1, 1),
         activation_formats=("fp8",),
