@@ -461,8 +461,11 @@ def main() -> int:
         if not Path(kernel).is_dir():
             print(f"  [skip] {kernel}: directory not found")
             continue
-        base_api = extract_api(Source.from_tree(repo, base_tree, kernel))
         head_api = extract_api(Source.from_disk(Path(kernel)))
+        if kernel not in base_tree:  # a kernel added by this change has no API to have changed
+            print(f"  [new] {kernel}: {len(head_api)} symbols")
+            continue
+        base_api = extract_api(Source.from_tree(repo, base_tree, kernel))
         if report(kernel, base_api, head_api):
             changed = True
 
