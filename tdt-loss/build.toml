@@ -1,0 +1,30 @@
+[general]
+name = "tdt-loss"
+license = "Apache-2.0"
+version = 1
+backends = ["cuda"]
+
+[general.hub]
+repo-id = "kernels-community/tdt-loss"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.tdt_loss]
+backend = "cuda"
+cuda-capabilities = [
+    "8.0",
+    "8.9",
+    "9.0",
+    "10.0",
+    "12.0",
+]
+depends = ["torch"]
+include = ["."]
+src = [
+    # TODO: add CUDA source files here, e.g.:
+    # "csrc/tdt_loss.cu",
+]
