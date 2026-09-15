@@ -1,0 +1,35 @@
+# One backend per `[kernel.*]` section, all implementing the entry points declared in
+# torch-ext/torch_binding.h.
+#
+# The backend lives in `topk_metal/` while the package is just `topk`: a CUDA port would be a
+# `topk_cuda/` section beside it, with no change to the bindings' schema or the Python API.
+#
+# Unlike the `ggml-*` packages there is no `vendor/`: this kernel is not a port of anything upstream.
+# ggml has no top-k of its own -- `GGML_OP_TOP_K` dispatches `kernel_argsort_f32_i32_desc`, a full
+# bitonic sort -- so there was nothing to vendor and this is written against `metal_stdlib` alone.
+
+[general]
+name = "topk"
+version = 1
+license = "MIT"
+backends = ["metal"]
+
+[general.hub]
+repo-id = "kernels-community/topk"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[kernel.topk_metal]
+backend = "metal"
+depends = ["torch"]
+include = ["topk_metal", "torch-ext"]
+src = [
+    "topk_metal/topk_metal.cpp",
+    "topk_metal/dispatch.mm",
+    "topk_metal/common.h",
+    "topk_metal/top_k.metal",
+]
