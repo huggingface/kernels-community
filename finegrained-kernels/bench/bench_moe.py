@@ -555,6 +555,9 @@ class _Experts:
         self.num_experts = cfg["E"]
         self.has_gate, self.has_bias = True, False
         self.is_transposed, self.is_concatenated = False, True
+        # the reference forwards read this like `act_fn`: a name when the model normalizes each
+        # expert application before the routing weights, None when it does not
+        self.post_expert_norm_name = None
         self.gate_up_proj, self.down_proj = gu, dn
         self.gate_up_proj_scale_inv, self.down_proj_scale_inv = gus, dns
         self.block_size = cfg["block_size"]
@@ -1351,7 +1354,8 @@ device_name = "MOCK (random values)" if MOCK else torch.cuda.get_device_name(0)
 print(f"device: {device_name}  torch {torch.__version__}"
       f"{'  [SMOKE]' if SMOKE else ''}")
 print("finegrained-kernels = local build; baselines: finegrained-fp8 (upstream), DeepGEMM, "
-      "transformers grouped_mm/batched_mm, SonicMoE, torch.scaled_grouped_mm, "
+      "vLLM fused MoE, FlashInfer's TRT-LLM routed MoE, transformers grouped_mm/batched_mm, "
+      "SonicMoE, OpenAI triton_kernels, torch.scaled_grouped_mm, "
       "nvfp4-gemm (transformers' NVFP4Linear kernel), megablocks (bf16 dMoE)"
       f"{f'  |  {GPUS} GPUs' if GPUS > 1 else ''}\n")
 

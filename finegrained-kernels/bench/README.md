@@ -6,17 +6,24 @@ reference implementations, on real model shapes.
 
 ## What it compares
 
-Four figure rows, each a **decode | prefill** subplot pair:
+Three figure rows, each a **decode | prefill** subplot pair:
 
-- **fused quantized** — `moe_fused_*` vs v4 vs DeepGEMM
-- **unfused quantized** — `moe_unfused_*` (two GEMMs + host GLU) vs v4 vs DeepGEMM
-- **unquantized (BF16)** — fused vs transformers `grouped_mm`/`batched_mm`, SonicMoE, DeepGEMM BF16
+- **quantized** — the MoE at every impl's best: `moe_fused_*` against finegrained-fp8, DeepGEMM,
+  vLLM, TRT-LLM, `transformers@main` and `triton_kernels`. Each impl contributes the shape it has —
+  fused where there is one, the two-GEMM shape for `transformers@main`, which has only that. There
+  is no fused/unfused split in the figure: it is an internal distinction of ours that most of these
+  baselines do not have. The unfused arms (`moe_unfused_*`) stay in `ARMS`, but no problem's
+  baseline set enlists them, so they do not run by default.
 - **linear quantized** — one qkv-shaped `matmul_2d` linear per model, in its deployment format
+- **unquantized (BF16)** — fused vs transformers `grouped_mm`/`batched_mm`, SonicMoE, vLLM,
+  DeepGEMM BF16 and megablocks
 
 Baselines per problem ("all kinds"): upstream **finegrained-fp8** (`@ v4`), **DeepGEMM**
-(fp8/fp4/bf16), **transformers** `grouped_mm`/`batched_mm` (= `torch._grouped_mm` / `torch.bmm`,
-the BF16 torch/cuBLAS path), **SonicMoE**, the OpenAI **triton_kernels** MXFP4 path (GPT-OSS),
-and **`torch.scaled_grouped_mm`** (the quantized-prefill cuBLAS reference). Each is
+(fp8/fp4/bf16), **vLLM**'s fused MoE, **FlashInfer**'s TRT-LLM routed-MoE kernels,
+**transformers** `grouped_mm`/`batched_mm` (= `torch._grouped_mm` / `torch.bmm`, the BF16
+torch/cuBLAS path), **SonicMoE**, the OpenAI **triton_kernels** MXFP4 path (GPT-OSS),
+**megablocks** (BF16 dMoE), **nvfp4-gemm** (the kernel behind transformers' `NVFP4Linear`) and
+**`torch.scaled_grouped_mm`** / **`torch.scaled_mm`** (the cuBLAS references). Each is
 import-guarded — a missing dependency skips that baseline instead of failing the run.
 
 Every cell runs in three modes: `eager`, `cudagraph` (decode's deployment mode), and
