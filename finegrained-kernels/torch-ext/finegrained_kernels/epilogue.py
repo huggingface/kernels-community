@@ -260,13 +260,13 @@ def glu(
 
 @triton.jit
 def _glu_kernel(
-    GateUp,  # (S, 2I) interleaved [g0,u0,g1,u1,...] GEMM output; fp32 = exact accumulators
-    Out,  # (S, I) activation-dtype GLU result; the E4M3 tensor under the requant arm
+    GateUp,  # (S, 2*INTER) interleaved [g0,u0,g1,u1,...] GEMM output; fp32 = exact accumulators
+    Out,  # (S, INTER) activation-dtype GLU result; the E4M3 tensor under the requant arm
     QuantScales,  # block-FP8 requant arm (``fused_glu(quant_group=...)``): per-``QUANT_GROUP``
     #             scales (fp32, or UE8M0 exponent bytes); ``None`` folds the arm out — the GLU
     #             result then rounds through bf16 (the reference two-kernel order) and quantizes
     n_out,
-    I: tl.constexpr,
+    INTER: tl.constexpr,
     ACT_FN: tl.constexpr,
     SWIGLU_ALPHA: tl.constexpr,
     SWIGLU_LIMIT: tl.constexpr,
