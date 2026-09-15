@@ -558,6 +558,7 @@ class _Experts:
         # the reference forwards read this like `act_fn`: a name when the model normalizes each
         # expert application before the routing weights, None when it does not
         self.post_expert_norm_name = None
+        self._is_expert_parallel = False
         self.gate_up_proj, self.down_proj = gu, dn
         self.gate_up_proj_scale_inv, self.down_proj_scale_inv = gus, dns
         self.block_size = cfg["block_size"]
