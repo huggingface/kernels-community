@@ -1,20 +1,10 @@
+import kernels
 import pytest
 import torch
 
 from tests.utils import infer_device, supports_bfloat16
-from pathlib import Path
 
-# import rotary
-# from transformers.trainer_utils import set_seed
-# set_seed(42)
-
-# Set the local repo path, relative path
-try:
-    import rotary
-except ImportError:
-    from kernels import get_local_kernel
-    repo_path = Path(__file__).parent.parent
-    rotary = get_local_kernel(repo_path=repo_path, package_name="rotary")
+rotary = kernels.get_kernel("kernels-community/rotary", version=3)
 
 def apply_rotary_torch(x1: torch.Tensor, x2: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, conj: bool = False):
     assert x1.shape == x2.shape, "x1 and x2 must have the same shape"
@@ -129,6 +119,28 @@ def test_rotary_equivalence(batch_size, nheads, seqlen, headdim, rotary_dim, qk_
         assert torch.equal(
             k_kernel[..., 2 * rotary_dim:], k_orig[..., 2 * rotary_dim:]
         ), "Non-rotated part of K should be unchanged"
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("headdim, rotary_dim", [(128, 64), (128, 32)])
+def test_rotary_ci(headdim, rotary_dim):
+    """Fast smoke test for nix run .#ci-test (FA2/activation pattern)."""
+    device = infer_device()
+    if device is None:
+        pytest.skip("No suitable device found for testing")
+    test_rotary_equivalence(
+        batch_size=1,
+        nheads=8,
+        seqlen=128,
+        headdim=headdim,
+        rotary_dim=rotary_dim,
+        qk_dim=4,
+        dtype=torch.float32,
+        atol=1e-5,
+        rtol=1e-5,
+        conj=False,
+    )
+
 
 
 
