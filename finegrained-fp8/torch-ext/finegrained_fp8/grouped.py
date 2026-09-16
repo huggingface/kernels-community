@@ -129,13 +129,13 @@ def _grouped_tile_setup(
 
 
 @triton.jit
-def store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn):
+def store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn, N):
     """Output epilogue shared by the grouped kernels: cast the fp32 accumulator to
     ``C``'s dtype and store the tile at expert-sorted global rows ``offs_global_m`` ×
-    columns ``offs_bn``, masked to the expert's valid rows (``row_mask``)."""
+    columns ``offs_bn``, masked to the expert's valid rows and output width."""
     c = accumulator.to(C.dtype.element_ty)
     c_ptrs = C + stride_cm * offs_global_m[:, None] + stride_cn * offs_bn[None, :]
-    tl.store(c_ptrs, c, mask=row_mask[:, None])
+    tl.store(c_ptrs, c, mask=row_mask[:, None] & (offs_bn[None, :] < N))
 
 
 @triton.autotune(
@@ -220,7 +220,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += stride_bs_k
 
-    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn)
+    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn, N)
 
 
 @bayesian_autotune(
@@ -298,15 +298,16 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     b_s = tl.load(Bs + expert_id * stride_bs_e)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
-        b = tl.load(b_ptrs)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_mask = offs_k + k * BLOCK_SIZE_K < K
+        a = tl.load(a_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask[:, None] & (offs_bn[None, :] < N), other=0.0)
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
     accumulator = accumulator * a_s[:, None] * b_s
 
-    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn)
+    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn, N)
 
 
 @bayesian_autotune(
@@ -390,12 +391,12 @@ def mxfp_dynamic_matmul_grouped_kernel(
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
 
     a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = (
-        B
-        + expert_id * stride_be
-        + offs_kb[:, None] * stride_bk
-        + offs_bn[None, :] * stride_bn
-    )
+    # Clamp the weight indices instead of masking with `other=`: a typed fill value
+    # cannot be written for both packed-uint8 (MXFP4) and fp8 (MXFP8) weights. The
+    # clamped columns/bytes are real in-bounds data that the `a` K-mask multiplies by
+    # zero and the store's N-mask discards.
+    b_cols = tl.minimum(offs_bn, N - 1)
+    b_base = B + expert_id * stride_be + b_cols[None, :] * stride_bn
     bs_ptrs = (
         Bs
         + expert_id * stride_bs_e
@@ -404,13 +405,18 @@ def mxfp_dynamic_matmul_grouped_kernel(
     )
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        k_mask = offs_k + k * BLOCK_SIZE_K < K
+        a_raw = tl.load(a_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
         a, a_scale = mxfp_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
         )
-        b = tl.load(b_ptrs)
-        b_s = tl.load(bs_ptrs).to(tl.uint8)
+        kb = tl.minimum(
+            offs_kb + k * (BLOCK_SIZE_K // VALUES_PER_BYTE), K // VALUES_PER_BYTE - 1
+        )
+        b = tl.load(b_base + kb[:, None] * stride_bk)
+        sf_mask = offs_sf + k * (BLOCK_SIZE_K // SCALE_GROUP_K) < K // SCALE_GROUP_K
+        b_s = tl.load(bs_ptrs, mask=(offs_bn[:, None] < N) & sf_mask[None, :], other=127).to(tl.uint8)
         if COMPUTE_MODE == "dot_scaled":
             accumulator = mx_dot_scaled(
                 accumulator, a, a_scale, b, b_s, VALUES_PER_BYTE
@@ -418,10 +424,9 @@ def mxfp_dynamic_matmul_grouped_kernel(
         else:  # dot
             accumulator = mx_dot_rescale(accumulator, a, b, a_scale, b_s, VALUES_PER_BYTE)
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
 
-    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn)
+    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn, N)
 
 
 @triton_op(
