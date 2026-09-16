@@ -15,7 +15,8 @@
 import torch
 import triton
 
-from .compat import get_active_device_type, is_sm10x, sm_count, sm_shared_memory_limit
+from .compat import get_active_device_type, is_sm10x, is_sm90, sm_count, sm_shared_memory_limit
+from .mma import MMA_N_ATOM_WIDTH
 
 # ── config pruners ────────────────────────────────────────────────────────────
 # Every guard exists for one of four reasons; the map (pruner -> rule -> attached to):
@@ -599,6 +600,61 @@ def block_dynamic_mma_width_pruner():
     )
 
 
+def fp8_dot_warp_pruner():
+    """SILENTLY-WRONG fence: the fp8 ``tl.dot`` paths lose accuracy above ``num_warps=2`` at both
+    ends of the M-tile range, on sm_90. Two clauses, one phenomenon.
+
+    (1) The single-token swapped GEVM. ``swap_pad_rhs`` pads the lone token to the ``MMA_N_ATOM``
+        rhs and the epilogue takes column 0 after the K-loop (``acc_init``'s ``[BN, MMA_N_ATOM]``
+        accumulator). Above 2 warps that column comes back wrong.
+
+    (2) Large M tiles, ``BLOCK_SIZE_M >= 64``, in the grouped and 2D kernels.
+
+    Measured on H100 (sm_90), triton 3.6 AND 3.8, by forcing every admitted config against the
+    torch oracle and scoring error in bf16-ULP units (the floor — what perfect bf16 output
+    storage costs — is 0.49 mean / 1.00 max; the torch reference itself sits exactly there)::
+
+        BLOCK_SIZE_M 16 / 32, any num_warps   0.49 mean / 1.0 max ULP   bit-optimal
+        BLOCK_SIZE_M 64 / 128, num_warps 8    0.58 mean / 52.1 max ULP  WRONG   (grouped)
+        BLOCK_SIZE_M 64 / 128, num_warps >2   280 of 578 configs WRONG          (2D)
+        SWAP_AB + BLOCK_SIZE_M=1, num_warps >2                         WRONG   (batched)
+
+    The tuner benches by SPEED, so these get crowned silently: block-static crowned a wrong one
+    outright, while block-dynamic / tensor-dynamic (batched) and the grouped kernel carried
+    30-90 wrong configs each behind a GREEN test, because the winner happened to be correct.
+
+    In the grouped kernel ``BLOCK_SIZE_M >= 64`` is admitted only at ``num_warps=8``, so those two
+    axes are confounded there and the data cannot separate them; the 2D kernel does separate them
+    (BM=64 at num_warps=2 is clean), which is why the rule is written on num_warps.
+
+    Scoped by a POSITIVE ``is_sm90()`` test, not by ``not is_sm10x()``: the latter is also true on
+    XPU, ROCm and driverless build boxes, which do not run the NVIDIA codegen this was probed
+    against, and restricting them on sm_90 evidence would be a guess. sm_10x is likewise untouched
+    — it is where this repo's tuning and validation were done and its tcgen05 MMA lowers these
+    paths differently. Other CUDA arches (sm_89, sm_120) are unmeasured and so unfenced; each
+    needs its own probe. The sm_90 cost is real — the grouped kernel is the prefill path, where
+    the large-M tiles are the throughput — and is accepted: the alternative is a crowned config
+    that returns wrong results."""
+
+    def ok(c, args):
+        bm = c.kwargs.get("BLOCK_SIZE_M", 1)
+        if c.num_warps <= 2:
+            return True
+        if bm >= 64:  # (2) large-M tile
+            return False
+        # (1) swapped single-token GEVM; native-M tiles need no pad/column-extract
+        return not (c.kwargs.get("SWAP_AB") and bm < MMA_N_ATOM_WIDTH)
+
+    def raise_all_wrong(configs, args):
+        raise ValueError(
+            "every autotune config is an fp8 tl.dot at num_warps>2 with a BLOCK_SIZE_M that "
+            "returns WRONG results off sm_10x; no correct config exists in this grid — extend it "
+            "with a num_warps=2 or a 16/32-row M tile rather than lifting the fence."
+        )
+
+    return config_filter(ok, when=lambda args: is_sm90(), on_empty=raise_all_wrong)
+
+
 def scale_subblock_pruner(min_ctas_per_sm: int = 4):
     """``early_config_prune`` for kernels whose compute tile (``BLOCK_SIZE_N``) may subdivide the
     quant block (``BLOCK_N``). One scale covers the whole block, so a narrower tile just reads its
@@ -1029,14 +1085,29 @@ def gate_stacked_tmem_trap_pruner():
     memory mode, WS on and off, BK 64 and 128; BM=128 fails CLEANLY (OutOfResources: tensor
     memory 544 > 512) and self-prunes; BM=32 and BN<=128 run correct. The checker gap is the
     only reason this needs a fence at all — drop precisely the probed trap point and let every
-    neighbor keep self-reporting."""
+    neighbor keep self-reporting.
+
+    ON sm_90 the whole ``2*BN = 512`` stacked tile goes, not just the BM=64 point. The
+    self-pruning above is a TENSOR-MEMORY overflow, and sm_90 has no tensor memory to overflow:
+    nothing raises OutOfResources, so the config runs and returns garbage instead. Measured on
+    H100, triton 3.8, nvfp4 gate|silu with fused requant through the 2D kernel — sampling the
+    admitted grid, ``BLOCK_SIZE_N`` splits cleanly::
+
+        BN 32 / 64 / 128   60 correct, 0 wrong
+        BN 256             0 correct, 9 wrong   (BM=128; the crowned config varies per tune,
+                                                 so the scenario test passes or fails by luck)
+
+    The mechanism is the stacked accumulator width, which is format-independent, so this fences
+    every GATE config at BN=256 rather than only the nvfp4 cell that exposed it. The BM=64 trap
+    point stays fenced on every arch (it was probed on B200); the wider sm_90 clause is scoped by
+    a positive arch test so XPU/ROCm, which never ran this codegen, keep their full grid."""
 
     def ok(c, args):
-        return not (
-            args.get("GATE")
-            and config_dim(c, args, "BLOCK_SIZE_N") == 256
-            and config_dim(c, args, "BLOCK_SIZE_M") == 64
-        )
+        if not args.get("GATE") or config_dim(c, args, "BLOCK_SIZE_N") != 256:
+            return True
+        if config_dim(c, args, "BLOCK_SIZE_M") == 64:
+            return False  # the probed sm_100 trap point — fenced on every arch
+        return not is_sm90()  # sm_90 has no tensor memory, so nothing self-reports the overflow
 
     def raise_all_trap(configs, args):
         raise ValueError(

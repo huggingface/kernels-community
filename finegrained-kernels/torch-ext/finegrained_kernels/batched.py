@@ -45,7 +45,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_finalize, acc_init, add_bias, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
+from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
 
 
 @triton.jit
@@ -128,7 +128,12 @@ def store_row(
     ["N", "K", "S", "OUTPUT_FORMAT", "GATE", "BLOCK_N", "BLOCK_K"],
     n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
-    prune_configs_by={"early_config_prune": scale_subblock_pruner()},
+    prune_configs_by={
+        "early_config_prune": compose_pruners(
+            scale_subblock_pruner(),
+            fp8_dot_warp_pruner(),
+        )
+    },
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_batched_kernel(
@@ -266,7 +271,12 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
     ["N", "K", "S", "OUTPUT_FORMAT", "GATE", "BLOCK_N", "BLOCK_K"],
     n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
-    prune_configs_by={"early_config_prune": scale_subblock_pruner()},
+    prune_configs_by={
+        "early_config_prune": compose_pruners(
+            scale_subblock_pruner(),
+            fp8_dot_warp_pruner(),
+        )
+    },
 )
 @triton.jit
 def w8a8_block_static_fp8_matmul_batched_kernel(
@@ -393,6 +403,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     # row-masked only — veto non-dividing tiles on both.
     prune_configs_by={
         "early_config_prune": compose_pruners(
+            fp8_dot_warp_pruner(),
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
         )

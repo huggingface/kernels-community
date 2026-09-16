@@ -453,6 +453,16 @@ def is_sm10x() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 
 
+@functools.cache
+def is_sm90() -> bool:
+    """Whether the CURRENT device is Hopper (sm_90) — the target the measured NVIDIA-backend
+    MMA-lowering guards are scoped to. A POSITIVE arch test on purpose: ``not is_sm10x()`` is
+    also true on XPU, ROCm and driverless build boxes, none of which run the CUDA codegen those
+    guards were probed against, so scoping by negation would restrict backends no one measured.
+    Same driverless-safe short-circuit and caching as ``is_sm10x``."""
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
+
+
 
 @functools.lru_cache(maxsize=None)
 def sm_shared_memory_limit() -> int:

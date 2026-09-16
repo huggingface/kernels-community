@@ -275,8 +275,11 @@ def mx_compute(
 # The sm_100 MMA's minimum N tile (16). In the swap path the single decode token sits in the MMA's
 # N dim, so it must be padded up to this width (col 0 = the token, cols 1..15 = zero). It is NOT a
 # block size — BLOCK_SIZE_M stays 1 under swap; this is the token's *padded N extent*, fixed by the
-# hardware. Assigned via tl.constexpr(...), the only module-global form a @triton.jit fn can read.
-MMA_N_ATOM = tl.constexpr(16)
+# hardware. The plain int is the source of truth: host-side consumers (the autotune pruners, which
+# filter configs in ordinary Python) compare against it directly, while kernels read the
+# tl.constexpr view derived from it — the only module-global form a @triton.jit fn can read.
+MMA_N_ATOM_WIDTH = 16
+MMA_N_ATOM = tl.constexpr(MMA_N_ATOM_WIDTH)
 
 
 @triton.jit

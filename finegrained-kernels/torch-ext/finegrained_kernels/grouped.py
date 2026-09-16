@@ -41,7 +41,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, global_scale_warp_spec_pruner, weight_only_warp_spec_matched_mode_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
+from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, global_scale_warp_spec_pruner, weight_only_warp_spec_matched_mode_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
 
 
 @bayesian_autotune(
@@ -66,6 +66,7 @@ from .pruners import PATH_ANCHOR_AXES, global_scale_warp_spec_pruner, weight_onl
     # Pipeliner-race guard: per launch-BM, WS-only at BM >= 64 and non-WS below (see the pruner).
     prune_configs_by={
         "early_config_prune": compose_pruners(
+            fp8_dot_warp_pruner(),
             packed_schedule_scope_pruner(),
             block_dynamic_grouped_matmul_pruner(),
             descriptor_box_pruner(),
@@ -269,6 +270,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     # BM>=64, keeps non-WS below) + descriptor-box limits.
     prune_configs_by={
         "early_config_prune": compose_pruners(
+            fp8_dot_warp_pruner(),
             packed_schedule_scope_pruner(),
             block_dynamic_grouped_matmul_pruner(),
             descriptor_box_pruner(),
@@ -457,6 +459,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     # benignly at launch and self-prune as inf.
     prune_configs_by={
         "early_config_prune": compose_pruners(
+            fp8_dot_warp_pruner(),
             packed_schedule_scope_pruner(),
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
