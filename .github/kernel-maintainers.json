@@ -51,6 +51,7 @@
   "sgl-flash-attn3": [],
   "sonic-moe": ["U08Q42K8MGW"],
   "tinygrad-rms": [],
+  "topk": ["U0586KAH2E9"],
   "trimul-gpumode": [],
   "triton-kernels": [],
   "vllm-flash-attn3": [],
