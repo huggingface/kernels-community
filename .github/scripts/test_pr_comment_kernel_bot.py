@@ -253,5 +253,33 @@ def test_parse_error_dry_run_does_not_crash():
     assert "Parse error" in proc.stderr
 
 
+def _assert_dry_run_mode(comment, expected):
+    proc = _run_dry(comment)
+    assert proc.returncode == 0, proc.stderr
+    assert f'"mode": "{expected}"' in proc.stdout
+    other = {"pr", "release"} - {expected}
+    assert all(f'"mode": "{m}"' not in proc.stdout for m in other)
+
+
+def test_build_dispatches_pr_mode():
+    _assert_dry_run_mode("/kernel-bot build relu", "pr")
+
+
+def test_security_and_build_dispatches_pr_mode():
+    _assert_dry_run_mode("/kernel-bot security-and-build relu", "pr")
+
+
+def test_build_and_stage_dispatches_release_mode():
+    _assert_dry_run_mode("/kernel-bot build-and-stage relu", "release")
+
+
+def test_release_dispatches_release_mode():
+    _assert_dry_run_mode("/kernel-bot release relu", "release")
+
+
+def test_merge_and_upload_dispatches_release_mode():
+    _assert_dry_run_mode("/kernel-bot merge-and-upload relu", "release")
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

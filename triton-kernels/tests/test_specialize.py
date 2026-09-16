@@ -1,8 +1,15 @@
-import torch
 import importlib
-from triton_kernels.specialize import cacheable, specialize
+
+import kernels
+import pytest
+import torch
 import triton
 import triton.language as tl
+
+triton_kernels = kernels.get_kernel("kernels-community/triton-kernels", version=1)
+
+cacheable = triton_kernels.specialize.cacheable
+specialize = triton_kernels.specialize.specialize
 
 
 @triton.jit
@@ -38,6 +45,10 @@ def cacheable_kernel():
     return get_specialized_kernel()
 
 
+# NOTE: not reentrant — the specialized kernel is cached in a module global, so
+# this test can only run once per session. Marked here instead of being wrapped
+# in test_ci.py for that reason.
+@pytest.mark.kernels_ci
 def test_cacheable(device, fresh_knobs):
     specialized_kernel = get_specialized_kernel()
 

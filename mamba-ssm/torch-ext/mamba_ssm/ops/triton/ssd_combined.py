@@ -13,8 +13,14 @@ from einops import rearrange, repeat
 from packaging import version
 from torch import Tensor
 
-from ..._causal_conv1d import causal_conv1d_cuda, causal_conv1d_fn
+try:
+    from ..._causal_conv1d import causal_conv1d_cuda, causal_conv1d_fn
+except ImportError:
+    # Compiled extension, only needed by mamba_split_conv1d_scan_combined. Without
+    # it the pure-Triton SSD path stays importable instead of failing at module scope.
+    causal_conv1d_cuda = causal_conv1d_fn = None
 from ...utils.torch import custom_bwd, custom_fwd
+from ...utils.device import device_guard
 from .k_activations import _swiglu_bwd, _swiglu_fwd
 from .layernorm_gated import _layer_norm_bwd, _layer_norm_fwd, rmsnorm_fn
 from .ssd_bmm import _bmm_chunk_bwd, _bmm_chunk_fwd
@@ -494,7 +500,7 @@ def _chunk_scan_chunk_state_bwd_dx(
         batch * nchunks,
         nheads,
     )
-    with torch.cuda.device(x.device.index):
+    with device_guard(x):
         _chunk_scan_chunk_state_bwd_dx_kernel[grid_dx](
             x,
             CB,

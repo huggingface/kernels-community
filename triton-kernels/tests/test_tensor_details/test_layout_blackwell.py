@@ -1,6 +1,11 @@
 import pytest
 import torch
-from triton_kernels.tensor_details.layout import BlackwellMXScaleLayout
+
+import kernels
+
+triton_kernels = kernels.get_kernel("kernels-community/triton-kernels", version=1)
+
+BlackwellMXScaleLayout = triton_kernels.tensor_details.layout.BlackwellMXScaleLayout
 
 # ------------------------------------------------------------
 # Torch tests
@@ -17,8 +22,8 @@ from triton_kernels.tensor_details.layout import BlackwellMXScaleLayout
         (3, 2, 36),
     ],
 )
-def test_mxfp4_scale_roundtrip(shape):
-    x = torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda")
+def test_mxfp4_scale_roundtrip(shape, device):
+    x = torch.randint(0, 256, shape, dtype=torch.uint8, device=device)
     layout = BlackwellMXScaleLayout(x.shape)
     res = layout.unswizzle_data(layout.swizzle_data(x))
     assert (res == x).all()

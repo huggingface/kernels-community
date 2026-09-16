@@ -4,6 +4,8 @@ from torch import Tensor
 import triton
 import triton.language as tl
 
+from ..utils.device import device_guard
+
 
 @triton.jit
 def _causal_conv1d_varlen_states(
@@ -50,7 +52,7 @@ def causal_conv1d_varlen_states(x: Tensor, cu_seqlens: Tensor, state_len: int) -
     BLOCK_M = min(triton.next_power_of_2(state_len), 16)
     BLOCK_N = min(triton.next_power_of_2(dim), 256)
     grid = (triton.cdiv(dim, BLOCK_N), triton.cdiv(state_len, BLOCK_M), batch)
-    with torch.cuda.device(x.device.index):
+    with device_guard(x):
         _causal_conv1d_varlen_states[grid](
             x,
             cu_seqlens,
