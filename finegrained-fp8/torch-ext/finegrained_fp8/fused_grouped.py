@@ -479,7 +479,14 @@ def w8a8_block_dynamic_fp8_moe_grouped(
     HIDDEN_DIM = hidden_states.size(1)
     INTERMEDIATE_DIM = down_proj.size(2)
     BLOCK_SIZE_N, BLOCK_SIZE_K = block_size
-    NUM_I_TILES = INTERMEDIATE_DIM // BLOCK_SIZE_N
+    # Block-scale weights carry one scale per (block_n x block_k) block, so a partial
+    # tile has no scale to apply — same contract as the standalone block-scale route:
+    # assert rather than mask. (The kernels' N/K loops are unmasked and rely on this.)
+    for dim_name, dim in (("hidden", HIDDEN_DIM), ("intermediate", INTERMEDIATE_DIM)):
+        assert dim % BLOCK_SIZE_N == 0 and dim % BLOCK_SIZE_K == 0, (
+            f"{dim_name} dim ({dim}) must be a multiple of block_size {block_size}"
+        )
+    NUM_I_TILES = INTERMEDIATE_DIM // BLOCK_SIZE_K
 
     perm_token, perm, expert_start, NUM_EXPERTS, num_routed_tokens = _grouped_routing(
         top_k_index, gate_up_proj.size(0), num_top_k
@@ -686,6 +693,15 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
             pid_m, exp_start, freqs, tile_start_excl, e_offs, BLOCK_SIZE_M
         )
         offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        # Pointer-mode weight/scale column index: wrap the N tail in-bounds. The wrapped
+        # rows are real data whose products land in accumulator columns the store mask
+        # below discards. Constexpr-folded to a no-op when BLOCK_SIZE_N divides
+        # INTERMEDIATE_DIM, so aligned shapes compile to the same code as before.
+        # Descriptor modes need nothing: TMA zero-fills out-of-bounds boxes.
+        if INTERMEDIATE_DIM % BLOCK_SIZE_N != 0:
+            w_cols = offs_bn % INTERMEDIATE_DIM
+        else:
+            w_cols = offs_bn
 
         token = tl.load(PermToken + offs_global_m * stride_pt, mask=row_mask, other=0)
         a_ptrs = Hidden + token[:, None] * stride_h_t + offs_k[None, :] * stride_h_k
@@ -696,14 +712,21 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
         # a host/device descriptor (TMA on NVIDIA) vs explicit rank-3 pointers. COMPUTE_MODE picks the compute on the
         # loaded tile: scaled-MMA (dot_scaled) or fp8 dot + per-group software rescale (dot).
         gu_row = expert_id * 2
+        # Descriptor coordinates must be int32 (Triton rejects 64-bit block-pointer
+        # offsets at compile time — and the tuner then silently drops every descriptor
+        # config). 2E rows always fit; keep the int64 expert_id for pointer arithmetic.
+        gu_row32 = gu_row.to(tl.int32)
         # (E, 2I, H//vpb) reinterpreted as (2E, I, H//vpb); host_descriptor uses the passed
         # GateUpDescriptor, device_descriptor builds one in-kernel, pointer indexes it directly.
         if MEMORY_MODE == "pointer":
-            gu_ptr = (
+            gu_base = (
                 GateUp
                 + (gu_row + tl.arange(0, 2))[:, None, None]
                 * (INTERMEDIATE_DIM * stride_gu_n)
-                + (n_off + tl.arange(0, BLOCK_SIZE_N))[None, :, None] * stride_gu_n
+                + w_cols[None, :, None] * stride_gu_n
+            )
+            gu_ptr = (
+                gu_base
                 + tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)[None, None, :]
                 * stride_gu_k
             )
@@ -718,27 +741,47 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
                 strides=(INTERMEDIATE_DIM * stride_gu_n, stride_gu_n, stride_gu_k),
                 block_shape=(2, BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE),
             )
-        gu_scale_ptr = (
+        gu_scale_base = (
             GateUpScale
             + expert_id * stride_gus_e
             + tl.arange(0, 2)[:, None, None] * (INTERMEDIATE_DIM * stride_gus_n)
-            + (n_off + tl.arange(0, BLOCK_SIZE_N))[None, :, None] * stride_gus_n
-            + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, None, :] * stride_gus_k
+            + w_cols[None, :, None] * stride_gus_n
         )
+        offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
         acc = tl.zeros((BLOCK_SIZE_M, 2 * BLOCK_SIZE_N), dtype=tl.float32)
         for k_off in tl.range(0, HIDDEN_DIM, BLOCK_SIZE_K):
-            a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+            # K tail (BLOCK_SIZE_K not dividing HIDDEN_DIM): zero the activation tail so
+            # the weight/scale reads there — clamped in-bounds in pointer mode, TMA
+            # zero-filled in descriptor modes — cannot contribute. Constexpr-folded away
+            # for aligned shapes.
+            if HIDDEN_DIM % BLOCK_SIZE_K != 0:
+                k_mask = (k_off + offs_k) < HIDDEN_DIM
+                a_raw = tl.load(
+                    a_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0
+                ).to(tl.float32)
+            else:
+                a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
             a, a_scale = mxfp_act_quant_inline(
                 a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
             )
             if MEMORY_MODE == "host_descriptor":
                 gu = tl.reshape(
-                    GateUpDescriptor.load([gu_row, n_off, k_off // VALUES_PER_BYTE]),
+                    GateUpDescriptor.load([gu_row32, n_off, k_off // VALUES_PER_BYTE]),
                     [2 * BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE],
                 )
             elif MEMORY_MODE == "device_descriptor":
                 gu = tl.reshape(
-                    gu_desc.load([gu_row, n_off, k_off // VALUES_PER_BYTE]),
+                    gu_desc.load([gu_row32, n_off, k_off // VALUES_PER_BYTE]),
+                    [2 * BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE],
+                )
+            elif HIDDEN_DIM % BLOCK_SIZE_K != 0:
+                kb = tl.minimum(
+                    k_off // VALUES_PER_BYTE
+                    + tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE),
+                    HIDDEN_DIM // VALUES_PER_BYTE - 1,
+                )
+                gu = tl.reshape(
+                    tl.load(gu_base + kb[None, None, :] * stride_gu_k),
                     [2 * BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE],
                 )
             else:
@@ -747,8 +790,14 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
                     [2 * BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE],
                 )
                 gu_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_gu_k
+            if HIDDEN_DIM % BLOCK_SIZE_K != 0:
+                sf = tl.minimum(
+                    k_off // SCALE_GROUP_K + offs_sf, HIDDEN_DIM // SCALE_GROUP_K - 1
+                )
+            else:
+                sf = k_off // SCALE_GROUP_K + offs_sf
             gu_scale = tl.reshape(
-                tl.load(gu_scale_ptr + (k_off // SCALE_GROUP_K) * stride_gus_k),
+                tl.load(gu_scale_base + sf[None, None, :] * stride_gus_k),
                 [2 * BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_K],
             )
             gu_t = tl.trans(
@@ -790,7 +839,6 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
             + offs_global_m[:, None] * stride_int_m
             + offs_bn[None, :] * stride_int_n
         )
-        tl.store(int_ptrs, inter, mask=row_mask[:, None])
         offs_sc = pid_n * (BLOCK_SIZE_N // SCALE_GROUP_K) + tl.arange(
             0, BLOCK_SIZE_N // SCALE_GROUP_K
         )
@@ -799,7 +847,21 @@ def mxfp_dynamic_moe_grouped_gate_up_kernel(
             + offs_global_m[:, None] * stride_is_m
             + offs_sc[None, :] * stride_is_n
         )
-        tl.store(sc_ptrs, inter_scale, mask=row_mask[:, None])
+        # `Inter` is contiguous (S, I): an unmasked N overhang would land in the NEXT
+        # token's intermediate, not in slack. Mask it (folded away when aligned).
+        if INTERMEDIATE_DIM % BLOCK_SIZE_N != 0:
+            tl.store(
+                int_ptrs, inter, mask=row_mask[:, None] & (offs_bn[None, :] < INTERMEDIATE_DIM)
+            )
+            tl.store(
+                sc_ptrs,
+                inter_scale,
+                mask=row_mask[:, None]
+                & (offs_sc[None, :] < INTERMEDIATE_DIM // SCALE_GROUP_K),
+            )
+        else:
+            tl.store(int_ptrs, inter, mask=row_mask[:, None])
+            tl.store(sc_ptrs, inter_scale, mask=row_mask[:, None])
 
 
 def _set_down_descriptor(nargs):
@@ -901,11 +963,18 @@ def mxfp_dynamic_moe_grouped_down_kernel(
             + offs_sf[None, :] * stride_is_n
         )
         n_off = pid_n * BLOCK_SIZE_N
-        ws_down_ptr = (
+        # int32 descriptor coordinate over the (E*H, I//vpb) view — see the gate_up kernel.
+        desc_row = (expert_id * HIDDEN_DIM + n_off).to(tl.int32)
+        # Pointer-mode weight/scale row index: wrap the N tail in-bounds (see the gate_up
+        # kernel); folded away when BLOCK_SIZE_N divides HIDDEN_DIM.
+        if HIDDEN_DIM % BLOCK_SIZE_N != 0:
+            w_rows = offs_bn % HIDDEN_DIM
+        else:
+            w_rows = offs_bn
+        ws_down_base = (
             DownScale
             + expert_id * stride_downs_e
-            + (n_off + tl.arange(0, BLOCK_SIZE_N))[:, None] * stride_downs_n
-            + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)[None, :] * stride_downs_k
+            + w_rows[:, None] * stride_downs_n
         )
 
         # Down weight tile [BK//vpb, BN] loaded once per K-chunk: MEMORY_MODE picks the LOAD (a
@@ -913,11 +982,12 @@ def mxfp_dynamic_moe_grouped_down_kernel(
         # picks the compute. Scales stay a pointer load (a descriptor needs >=16B inner; the
         # BK//32 row is too narrow).
         if MEMORY_MODE == "pointer":
+            w_down_base = (
+                Down + expert_id * stride_down_e + w_rows[None, :] * stride_down_n
+            )
             w_down_ptr = (
-                Down
-                + expert_id * stride_down_e
+                w_down_base
                 + tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE)[:, None] * stride_down_k
-                + (n_off + tl.arange(0, BLOCK_SIZE_N))[None, :] * stride_down_n
             )
         elif MEMORY_MODE == "device_descriptor":
             down_desc = tl.make_tensor_descriptor(
@@ -928,13 +998,25 @@ def mxfp_dynamic_moe_grouped_down_kernel(
             )
         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for k_off in tl.range(0, INTERMEDIATE_DIM, BLOCK_SIZE_K):
-            a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
-            a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0)
+            # K tail (BLOCK_SIZE_K not dividing INTERMEDIATE_DIM): the intermediate is
+            # contiguous (S, I), so an unmasked tail reads the NEXT token's values —
+            # nonzero, and multiplied into VALID output columns. Zero it; the clamped /
+            # TMA-zero-filled weight reads then cannot contribute. Folded away when aligned.
+            if INTERMEDIATE_DIM % BLOCK_SIZE_K != 0:
+                k_mask = (k_off + offs_k) < INTERMEDIATE_DIM
+                a = tl.load(a_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+                sf_mask = (k_off // SCALE_GROUP_K + offs_sf) < INTERMEDIATE_DIM // SCALE_GROUP_K
+                a_scale = tl.load(
+                    as_ptrs, mask=row_mask[:, None] & sf_mask[None, :], other=0
+                )
+            else:
+                a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
+                a_scale = tl.load(as_ptrs, mask=row_mask[:, None], other=0)
             if MEMORY_MODE == "host_descriptor":
                 w = tl.trans(
                     tl.reshape(
                         DownDescriptor.load(
-                            [expert_id * HIDDEN_DIM + n_off, k_off // VALUES_PER_BYTE]
+                            [desc_row, k_off // VALUES_PER_BYTE]
                         ),
                         [BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE],
                     )
@@ -943,15 +1025,29 @@ def mxfp_dynamic_moe_grouped_down_kernel(
                 w = tl.trans(
                     tl.reshape(
                         down_desc.load(
-                            [expert_id * HIDDEN_DIM + n_off, k_off // VALUES_PER_BYTE]
+                            [desc_row, k_off // VALUES_PER_BYTE]
                         ),
                         [BLOCK_SIZE_N, BLOCK_SIZE_K // VALUES_PER_BYTE],
                     )
                 )
+            elif INTERMEDIATE_DIM % BLOCK_SIZE_K != 0:
+                kb = tl.minimum(
+                    k_off // VALUES_PER_BYTE
+                    + tl.arange(0, BLOCK_SIZE_K // VALUES_PER_BYTE),
+                    INTERMEDIATE_DIM // VALUES_PER_BYTE - 1,
+                )
+                w = tl.load(w_down_base + kb[:, None] * stride_down_k)
             else:
                 w = tl.load(w_down_ptr)
                 w_down_ptr += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_down_k
-            w_scale = tl.load(ws_down_ptr + (k_off // SCALE_GROUP_K) * stride_downs_k)
+            if INTERMEDIATE_DIM % BLOCK_SIZE_K != 0:
+                wsf = tl.minimum(
+                    k_off // SCALE_GROUP_K + offs_sf,
+                    INTERMEDIATE_DIM // SCALE_GROUP_K - 1,
+                )
+            else:
+                wsf = k_off // SCALE_GROUP_K + offs_sf
+            w_scale = tl.load(ws_down_base + wsf[None, :] * stride_downs_k)
             acc = mx_compute(
                 acc,
                 a,
@@ -1006,6 +1102,13 @@ def mxfp_dynamic_moe_grouped(
     num_tokens = hidden_states.size(0)
     HIDDEN_DIM = hidden_states.size(1)
     INTERMEDIATE_DIM = gate_up_proj.size(1) // 2
+    # UE8M0 scales are per 32-wide K group and the MXFP8 intermediate is requantized the
+    # same way, so both dims must be group-aligned; the tile sizes themselves are
+    # autotuned and need NOT divide them (the kernels bound their N/K tails).
+    assert HIDDEN_DIM % MX_SCALE_GROUP_K == 0 and INTERMEDIATE_DIM % MX_SCALE_GROUP_K == 0, (
+        f"hidden ({HIDDEN_DIM}) and intermediate ({INTERMEDIATE_DIM}) dims must be "
+        f"multiples of {MX_SCALE_GROUP_K}"
+    )
     perm_token, perm, expert_start, NUM_EXPERTS, num_routed_tokens = _grouped_routing(
         top_k_index, gate_up_proj.size(0), num_top_k
     )
