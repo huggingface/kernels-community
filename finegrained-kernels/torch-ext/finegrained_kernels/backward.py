@@ -669,10 +669,10 @@ def _glu_grad(g, u, dh, ACT_FN: tl.constexpr, SWIGLU_ALPHA: tl.constexpr,
 
 @triton.jit
 def _glu_backward_kernel(
-    Z,  # (M, 2I) pre-activation, gate at even columns / up at odd
-    DH,  # (M, I) gradient w.r.t. the GLU output
-    DZ,  # (M, 2I) output, interleaved to match Z
-    M, I,
+    Z,  # (M, 2*INTER) pre-activation, gate at even columns / up at odd
+    DH,  # (M, INTER) gradient w.r.t. the GLU output
+    DZ,  # (M, 2*INTER) output, interleaved to match Z
+    M, INTER,
     stride_z_m, stride_z_n, stride_dh_m, stride_dh_n, stride_dz_m, stride_dz_n,
     ACT_FN: tl.constexpr, SWIGLU_ALPHA: tl.constexpr, SWIGLU_LIMIT: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_I: tl.constexpr,
