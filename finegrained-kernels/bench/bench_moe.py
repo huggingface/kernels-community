@@ -574,7 +574,11 @@ def _glu(gate, up, cfg):
 class _Experts:
     """Duck-typed experts module for the transformers-integration forwards
     (grouped_mm/batched_mm, SonicMoE, DeepGEMM): our (E, out, in) layout is their
-    ``is_transposed=False``; gate|up rows are stacked (concatenated), not interleaved."""
+    ``is_transposed=False``; gate|up rows are INTERLEAVED (gate on even rows, up on odd),
+    the same artifact the fused kernels read.
+
+    ``is_concatenated`` is inert here -- the integration forwards defer the split to
+    ``_apply_gate``, which this class overrides -- so the layout is expressed there."""
 
     def __init__(self, cfg, gu, dn, gus=None, dns=None):
         self.num_experts = cfg["E"]
@@ -596,7 +600,9 @@ class _Experts:
         self._cfg = cfg
 
     def _apply_gate(self, gate_up_out):
-        gate, up = gate_up_out.chunk(2, dim=-1)
+        # gate|up is interleaved, so the output columns are too: the default chunk(2)
+        # pairs the wrong halves and silently scrambles (parity 1.2e+00, cosine ~0).
+        gate, up = gate_up_out[..., 0::2], gate_up_out[..., 1::2]
         return _glu(gate, up, self._cfg).to(gate_up_out.dtype)
 
 
@@ -1016,12 +1022,9 @@ def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_
     # values are already on the E2M1 grid, so the round-trip is exact and both impls run
     # bit-identical weights (drawing fresh randn here made parity meaningless).
     dq = WEIGHTS[cfg["weights"]]["dequant"]
-    gu_stacked = dq(gu, gus).to(torch.bfloat16)  # (E, 2I, H) = [all gate rows; all up rows]
-    # GPT-OSS INTERLEAVES gate/up (modeling_gpt_oss: gate_up[..., ::2] / [..., 1::2]) while our
-    # layout stacks them — feeding stacked rows pairs the wrong halves in their SwiGLU.
-    gu_bf16 = torch.empty_like(gu_stacked)
-    gu_bf16[:, 0::2] = gu_stacked[:, :inter]
-    gu_bf16[:, 1::2] = gu_stacked[:, inter:]
+    # GPT-OSS interleaves gate/up (modeling_gpt_oss: gate_up[..., ::2] / [..., 1::2]) and so do
+    # we, so the (E, 2I, H) slab transfers as-is; remapping it here would scramble their SwiGLU.
+    gu_bf16 = dq(gu, gus).to(torch.bfloat16)
     dn_bf16 = dq(dn, dns).to(torch.bfloat16)
     for p in ("gate_up_proj", "down_proj", "gate_up_proj_bias", "down_proj_bias"):
         experts._parameters.pop(p, None)
