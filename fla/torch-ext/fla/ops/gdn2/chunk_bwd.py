@@ -36,6 +36,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ...ops.backends import dispatch
 from ...ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
 from ...ops.cp.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu_pre_process, expand_h0
 from ...ops.gdn2.chunk_intra import chunk_gdn2_bwd_intra
@@ -254,6 +255,7 @@ def chunk_gdn2_bwd_kernel_wy_dqkg_fused(
     tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), mask=m_dA)
 
 
+@dispatch('gdn2')
 def chunk_gdn2_bwd_wy_dqkg_fused(
     q: torch.Tensor,
     k: torch.Tensor,
