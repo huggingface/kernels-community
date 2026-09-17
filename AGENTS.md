@@ -148,7 +148,21 @@ steps:
 - Fetch the upstream Git repository from https://github.com/Dao-AILab/flash-attention.git
 - Check out the tag that the user specified.
 - Flash Attention 4 is in the directory `flash_attn/cute` of the upstream repo.
-- Copy Flash Attention 4 upstream files to `flash-attn4/torch-ext/flash_attn4`.
+- Copy Flash Attention 4 upstream files to `flash-attn4/torch-ext/flash_attn4`,
+  except the benchmarking and tuning scripts, which are deliberately not
+  vendored:
+  - `benchmark.py`
+  - `benchmark_flash_attention_fp8.py`
+  - `bench_utils.py`
+  - `sm90_config_search.py`
+
+  Nothing in the kernel imports these, and every `.py` in this directory is
+  shipped in the build, so vendoring them just adds dead weight to what users
+  download. They are also standalone `argparse` CLIs meant to be run as
+  `python -m flash_attn.cute.<name>`, which cannot work for a Hub kernel since
+  it is loaded under a hashed module name. Do not re-add them. After a sync,
+  check that no newly added upstream file is unreachable from `__init__.py`
+  for the same reason.
 - Copy tests from the tests from the upstream directory `tests/cute` to
   `flash-attn4/tests/cute`.
 - Check in `flash_attn/cute/pyproject.toml` upstream what version of quack is

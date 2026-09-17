@@ -24,7 +24,7 @@ flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
 _flash_attn_fwd = flash_attn4.interface._flash_attn_fwd
 utils = flash_attn4.utils
-compute_block_sparsity = flash_attn4.compute_block_sparsity.compute_block_sparsity
+compute_block_sparsity = flash_attn4._private_for_testing.compute_block_sparsity.compute_block_sparsity
 from mask_mod_definitions import (
     get_mask_pair,
     get_vec_mask,

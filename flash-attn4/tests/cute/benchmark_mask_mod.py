@@ -25,7 +25,7 @@ from mask_mod_definitions import (
 )
 BlockSparseTensorsTorch = flash_attn4.block_sparsity.BlockSparseTensorsTorch
 to_cute_block_sparse_tensors = flash_attn4.block_sparsity.to_cute_block_sparse_tensors
-compute_block_sparsity = flash_attn4.compute_block_sparsity.compute_block_sparsity
+compute_block_sparsity = flash_attn4._private_for_testing.compute_block_sparsity.compute_block_sparsity
 
 
 @dataclass

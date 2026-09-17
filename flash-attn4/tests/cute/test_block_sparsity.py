@@ -9,7 +9,7 @@ import kernels
 
 flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
-compute_block_sparsity = flash_attn4.compute_block_sparsity.compute_block_sparsity
+compute_block_sparsity = flash_attn4._private_for_testing.compute_block_sparsity.compute_block_sparsity
 
 
 def _call_compute_block_sparsity(

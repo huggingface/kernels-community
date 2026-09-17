@@ -37,7 +37,7 @@ normalize_block_sparse_config_bwd = flash_attn4.block_sparsity.normalize_block_s
 compute_dq_write_order = flash_attn4.block_sparsity.compute_dq_write_order
 compute_dq_write_order_from_block_mask = flash_attn4.block_sparsity.compute_dq_write_order_from_block_mask
 get_jit_cache = flash_attn4.cache_utils.get_jit_cache
-compute_block_sparsity = flash_attn4.compute_block_sparsity.compute_block_sparsity
+compute_block_sparsity = flash_attn4._private_for_testing.compute_block_sparsity.compute_block_sparsity
 utils = flash_attn4.utils
 from mask_mod_definitions import (
     get_mask_pair,

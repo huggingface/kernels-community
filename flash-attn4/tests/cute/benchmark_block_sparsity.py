@@ -16,7 +16,7 @@ import kernels
 
 flash_attn4 = kernels.get_kernel("kernels-community/flash-attn4", version=1)
 
-BlockSparsityKernel = flash_attn4.compute_block_sparsity.BlockSparsityKernel
+BlockSparsityKernel = flash_attn4._private_for_testing.compute_block_sparsity.BlockSparsityKernel
 BlockSparseTensors = flash_attn4.block_sparsity.BlockSparseTensors
 from mask_mod_definitions import (
     get_mask_pair,
