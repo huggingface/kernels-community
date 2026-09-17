@@ -173,6 +173,19 @@ steps:
   `flash-attn4/torch-ext/flash_attn4` and `flash-attn4/torch-ext/flash_attn4/quack`
   relative imports.
 - Remove all quack files in `flash-attn4/torch-ext/flash_attn4/quack` that are not used.
+  Decide this by following imports, but note that an import graph does **not**
+  capture modules whose only job is an import-time side effect. In particular,
+  keep `quack/dsl/cute_tensor_indexing.py` and have `quack/__init__.py` do
+  `from . import dsl`, mirroring upstream's `quack/__init__.py`. That module
+  monkey-patches CuTe's tensor classes so that `...` and `:` work in
+  `__getitem__`/`__setitem__`; `quack/copy_utils.py` relies on the sugar
+  (`tRS_sC[..., dst_idx]`), as do `softmax.py` and `testing.py`. Without it the
+  sm90 backward kernel dies with
+  `ValueError: Expected Coord, whose leaves are integers or None, but got (Ellipsis, ...)`.
+  Nothing catches this locally: the CI runner is sm89, where the whole sm90
+  backward path is unreachable, and sm100 does not use it either. Upstream's
+  `quack/__init__.py` cannot be copied verbatim, since it also imports
+  `rmsnorm`/`softmax`/`cross_entropy`, which are not vendored.
 - Update imports of `flash_attn.cute` in `flash-attn4/tests/cute` to `flash_attn4`.
 - Set `__version__` in `flash-attn4/torch-ext/flash_attn4/__init__.py` to the
   version from the tag (e.g. for tag `fa4-v4.0.0.beta8` set it to
