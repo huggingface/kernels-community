@@ -364,7 +364,7 @@ def chunk_mesa_net(
         >>> import torch
         >>> import torch.nn.functional as F
         >>> from einops import rearrange
-        >>> from ...ops.mesa_net import chunk_mesa_net
+        >>> from fla.ops.mesa_net import chunk_mesa_net
         # inputs with equal lengths
         >>> B, T, H, K, V = 4, 2048, 16, 128, 128
         >>> q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device='cuda')
