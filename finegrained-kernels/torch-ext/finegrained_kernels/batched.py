@@ -281,7 +281,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
 @triton.jit
 def w8a8_block_static_fp8_matmul_batched_kernel(
     A,  # (S, K) E4M3 activations (pre-quantized against the static scale by the wrapper)
-    As,  # scalar — static per-tensor activation scale (calibration-time)
+    As,  # calibrated (static) activation scale: one value, or one per expert
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
     C,  # (S, N) output; under an OUTPUT_FORMAT the FP8-requantized intermediate
@@ -300,6 +300,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     stride_b_e,
     stride_b_k,
     stride_b_n,
+    stride_as_e,  # 0 = one calibrated scale shared by every expert
     stride_bs_e,
     stride_bs_k,
     stride_bs_n,
@@ -334,7 +335,6 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     pre-quantized against the calibrated scalar, per-block weight scales apply per-K-tile
     (``accumulate`` ``"static"``, ``FAKE_BATCH``), and the scalar activation scale multiplies the
     accumulator once after the loop. bf16 GLU output only (no fused requant). GATE=False is the plain GEMM."""
-    a_s_static = tl.load(As)  # per-tensor static activation scale, applied post-loop
     if PDL:
         gdc_wait()
     batch_id, pid_n, expert_id, A, B, C, Bs, in_row, out_row = expert_setup(
@@ -355,6 +355,10 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     if expert_id >= num_experts:
         return
 
+    # this batch's expert scale: stride 0 means one calibrated scale for every expert. It feeds
+    # the inline quant arm and folds back onto the accumulator post-loop.
+    a_s_static = tl.load(As + expert_id.to(tl.int32) * stride_as_e)
+
     # the N tile may subdivide the quant block — see the dynamic sibling / scale_subblock_pruner
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     offs_bn = pid_n * n_width + tl.arange(0, n_width)
@@ -368,7 +372,9 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
     acc = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a, _ = load_act_static(a_ptrs, 0, 0, 0, None, 0, 0.0, "pointer", False)  # pre-quantized E4M3 token (fake-batch replicated)
+        # raw A quantizes in register against this expert's scale; a pre-quantized E4M3 token
+        # (fake-batch replicated) takes the other arm and ignores it
+        a, _ = load_act_static(a_ptrs, 0, 0, 0, None, 0, a_s_static, "pointer", False)
         w, b_s = load_weight_static(
             b_ptrs, b_ptrs, bs_ptr + bs_off, None, 0, 0, 0, 0, 0, 0,
             GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
@@ -1170,7 +1176,8 @@ def w8a8_block_static_fp8_matmul_batched(
 
     A:  (rows, K) raw bf16/fp16 activations — rows addressed via ``gather_idx``
     B:  (num_experts, N, K) FP8 weights; under ``gate`` the (num_experts, 2N, K) gate|up stack
-    As: scalar / (1,) — the calibrated per-tensor (static) activation scale
+    As: scalar / (1,) for one calibrated scale, or (num_experts,) for a MoE that
+        calibrates each expert separately
     Bs: (num_experts, N // block_n, K // block_k) per-block weight scales (2N under gate)
     """
     validate_dense_operands(A, B)
@@ -1197,11 +1204,15 @@ def w8a8_block_static_fp8_matmul_batched(
         f"the fused 'fp8' requant needs square quant blocks, got {block_size}"
     )
 
-    As = As.reshape(1).to(torch.float32)
+    # One calibrated scale for the whole matmul, or one per expert -- a MoE calibrates each
+    # separately. Per expert the kernel quantizes in register against the tile's own scale,
+    # because one token routes to several experts whose scales differ and so has no single
+    # pre-quantized form; one scale for all of them pre-quantizes once here instead.
+    As = As.reshape(-1).to(torch.float32)
+    # stride 0 makes every expert read the one calibrated scale; 1 gives each its own
+    as_stride = int(As.numel() == num_experts)
     bs_u8 = ue8m0_as_uint8(Bs)
-    # Pre-quantize the raw activations against the calibrated scalar (offline; the kernel folds
-    # the scalar back post-loop).
-    A_q = (A.to(torch.float32) / As).to(FP8_DTYPE)
+    A_q = A if as_stride else (A.to(torch.float32) / As).to(FP8_DTYPE)
     if requant:
         C = A.new_empty(S, N, dtype=FP8_DTYPE)
         Cs = torch.empty(S, N // block_n, device=A.device, dtype=bs_u8.dtype)
@@ -1235,6 +1246,7 @@ def w8a8_block_static_fp8_matmul_batched(
             B.stride(0),
             B.stride(2),
             B.stride(1),
+            as_stride,
             bs_u8.stride(0),
             bs_u8.stride(2),
             bs_u8.stride(1),
@@ -1819,7 +1831,7 @@ def matmul_batched(
         "output_global_scale is the NVFP4 requant second level — it requires quantize_output=True on NVFP4 "
         "(the epilogue would otherwise normalize by it with nothing downstream to compensate)"
     )
-    if As is not None and As.numel() == 1:
+    if As is not None and As.ndim <= 1 and As.numel() in (1, B.shape[0]):
         # static (per-tensor calibrated) activation quant: a per-tensor scalar As for block-scale FP8
         # weights — the caller hands raw A, the op quantizes it against the scalar (As IS the scale).
         assert Bs is not None and not is_mx(B, Bs) and weight_block_size(B, Bs) is not None, (

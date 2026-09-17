@@ -269,13 +269,22 @@ def load_act_static(
     A_MEMORY_MODE: tl.constexpr, A_GATHER: tl.constexpr,
 ):
     """static activation tile. Pre-quantized fp8 A loads as the rows-major MMA lhs; raw bf16/fp16
-    (inline arm, small M, pointer-only) is quantized against the scalar ``a_s_static``. ``a_s`` = the
-    values (the static scale is a scalar folded post-loop)."""
+    is quantized in register against ``a_s_static`` — behind a gather through the same tile load
+    the fp8 arm uses, pointer-only otherwise. The gathered raw arm is what a PER-EXPERT scale
+    needs: one row can be routed to several experts whose calibrated scales differ, so it has no
+    single pre-quantized form. ``a_s`` = the values (the scale is folded post-loop)."""
     if a_ptrs.dtype.element_ty == tl.float8e4nv:  # pre-quantized fp8 A (MMA lhs, rows-major)
         a = load_grouped_act_tile(
             a_ptrs, a_descriptor, m_off, k_off, value_mask, gather_rows, A_MEMORY_MODE, A_GATHER
         )
-    else:  # raw bf16/fp16 (inline arm, M<threshold, pointer-only) — quantize vs the static scale
+    elif A_GATHER:  # raw rows behind a gather (grouped MoE) -> same tile load, then quantize
+        a = (
+            load_grouped_act_tile(
+                a_ptrs, a_descriptor, m_off, k_off, value_mask, gather_rows, A_MEMORY_MODE, A_GATHER
+            ).to(tl.float32)
+            / a_s_static
+        ).to(tl.float8e4nv)
+    else:  # raw bf16/fp16, pointer-only (2D / batched decode)
         a = (tl.load(a_ptrs).to(tl.float32) / a_s_static).to(tl.float8e4nv)
     a_s = a
     return a, a_s

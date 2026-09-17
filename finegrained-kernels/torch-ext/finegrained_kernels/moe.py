@@ -320,6 +320,12 @@ def moe_fused_grouped(
     down_proj_weight_global_scale: torch.Tensor | None = None,
     gate_up_proj_input_global_scale: torch.Tensor | None = None,
     down_proj_input_global_scale: torch.Tensor | None = None,
+    # STATIC (calibrated) activation quant: one scale per expert per projection, handed to each
+    # phase as ``As`` -- the kernel quantizes in register against the tile's own expert scale.
+    # The intermediate then stays bf16 rather than being requantized in the epilogue, which
+    # cannot emit a calibrated scale; the down quantizes it against its own scales instead.
+    gate_up_proj_activation_scale: torch.Tensor | None = None,
+    down_proj_activation_scale: torch.Tensor | None = None,
     post_expert_norm=None,  # the model's per-expert output norm on the routed rows: a
     # get_supported_norms() name (fused into the reduce) or a host callable
     post_expert_norm_weight: torch.Tensor | None = None,  # (H,) weight of a named norm
@@ -363,9 +369,11 @@ def moe_fused_grouped(
     # intermediate (the op quantizes the raw hidden itself and owns the expand-vs-gather
     # regime policy — this forward is pure sequencing). scatter_idx=None: the down reads
     # the intermediate in place. (C, Cs) under a requant format; a bare Tensor otherwise.
+    static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
     gate_up_out = matmul_grouped(
         hidden_states,
         gate_up_proj,
+        As=gate_up_proj_activation_scale,
         Bs=gate_up_proj_scale_inv,
         a_global_scale=gate_up_proj_input_global_scale,
         b_global_scale=gate_up_proj_weight_global_scale,
@@ -378,7 +386,7 @@ def moe_fused_grouped(
         # fmt is the resolved format; "bf16" (weight-only) leaves the GLU intermediate bf16,
         # no requant.
         activation_format=fmt,
-        quantize_output=bool(glu) and fmt != "bf16",
+        quantize_output=bool(glu) and fmt != "bf16" and not static_act,
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
@@ -392,7 +400,7 @@ def moe_fused_grouped(
     down_out = matmul_grouped(
         inter,
         down_proj,
-        As=inter_scale,
+        As=down_proj_activation_scale if static_act else inter_scale,
         Bs=down_proj_scale_inv,
         a_global_scale=down_proj_input_global_scale,
         b_global_scale=down_proj_weight_global_scale,
@@ -429,6 +437,12 @@ def moe_fused_batched(
     down_proj_weight_global_scale: torch.Tensor | None = None,
     gate_up_proj_input_global_scale: torch.Tensor | None = None,
     down_proj_input_global_scale: torch.Tensor | None = None,
+    # STATIC (calibrated) activation quant: one scale per expert per projection, handed to each
+    # phase as ``As`` -- the kernel quantizes in register against the tile's own expert scale.
+    # The intermediate then stays bf16 rather than being requantized in the epilogue, which
+    # cannot emit a calibrated scale; the down quantizes it against its own scales instead.
+    gate_up_proj_activation_scale: torch.Tensor | None = None,
+    down_proj_activation_scale: torch.Tensor | None = None,
     post_expert_norm=None,  # the model's per-expert output norm on the routed rows: a
     # get_supported_norms() name (fused into the reduce) or a host callable
     post_expert_norm_weight: torch.Tensor | None = None,  # (H,) weight of a named norm
@@ -472,9 +486,11 @@ def moe_fused_batched(
     # intermediate (the op quantizes the raw activations). gather_idx reads each routed
     # row from the unexpanded hidden in-kernel (no copy).
     # (C, Cs) under a requant format; a bare Tensor on the full-precision path
+    static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
     gate_up_out = matmul_batched(
         hidden_states,
         gate_up_proj,
+        As=gate_up_proj_activation_scale,
         Bs=gate_up_proj_scale_inv,
         a_global_scale=gate_up_proj_input_global_scale,
         b_global_scale=gate_up_proj_weight_global_scale,
@@ -491,7 +507,10 @@ def moe_fused_batched(
         # (down inline-quants) stays the win there.
         activation_format=fmt,
         quantize_output=(
-            bool(glu) and fmt != "bf16" and (fmt != "fp8" or expert_ids.numel() <= GATE_UNSTACK_MAX_S)
+            bool(glu)
+            and fmt != "bf16"
+            and (fmt != "fp8" or expert_ids.numel() <= GATE_UNSTACK_MAX_S)
+            and not static_act
         ),
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
@@ -506,7 +525,7 @@ def moe_fused_batched(
     down_out = matmul_batched(
         inter,
         down_proj,
-        As=inter_scale,
+        As=down_proj_activation_scale if static_act else inter_scale,
         Bs=down_proj_scale_inv,
         a_global_scale=down_proj_input_global_scale,
         b_global_scale=down_proj_weight_global_scale,

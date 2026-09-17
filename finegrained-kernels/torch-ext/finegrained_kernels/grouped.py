@@ -41,7 +41,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, global_scale_warp_spec_pruner, weight_only_warp_spec_matched_mode_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
+from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, global_scale_warp_spec_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
 
 
 @bayesian_autotune(
@@ -69,6 +69,7 @@ from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, global_scale_warp_sp
             fp8_dot_warp_pruner(),
             packed_schedule_scope_pruner(),
             block_dynamic_grouped_matmul_pruner(),
+            warp_spec_memory_mode_pruner(),
             descriptor_box_pruner(),
         )
     },
@@ -281,7 +282,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
 def w8a8_block_static_fp8_matmul_grouped_kernel(
     A,  # (num_tokens, K) E4M3 activations (pre-quantized against the static scale by the wrapper)
     ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
-    As,  # scalar — static per-tensor activation scale (calibration-time)
+    As,  # calibrated (static) activation scale: one value, or one per expert
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
     BDescriptor,  # host TMA descriptor over B viewed (E, 2N|N, K), box (1, (2|1)*BN, BK); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales (2N under GATE)
@@ -302,6 +303,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     stride_b_e,
     stride_b_k,
     stride_b_n,
+    stride_as_e,  # 0 = one calibrated scale shared by every expert
     stride_bs_e,
     stride_bs_k,
     stride_bs_n,
@@ -342,7 +344,6 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     weight scales apply per-K-tile (plain ``tl.dot`` + software rescale, ``accumulate("static")``),
     and the scalar activation scale multiplies the accumulator once after the loop. GATE=False is
     the plain grouped GEMM (down projection), bit-identical."""
-    a_s_static = tl.load(As)  # per-tensor static activation scale, applied post-loop
     start_pid = tl.program_id(axis=0)
     if PACKED_SCHEDULE:
         total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
@@ -391,10 +392,13 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
         gate_s_ptr = Bs + expert_id64 * stride_bs_e + ((2 if GATE else 1) * pid_n) * stride_bs_n
         up_s_ptr = gate_s_ptr + stride_bs_n
 
+        # this tile's expert scale: stride 0 means one calibrated scale for every expert.
+        # It feeds the inline quant arm (raw A) and folds back onto the accumulator post-loop.
+        a_s_static = tl.load(As + expert_id64.to(tl.int32) * stride_as_e)
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
             a, a_dead = load_act_static(
-                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row, 0.0,
+                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row, a_s_static,
                 A_MEMORY_MODE, GatherIdx is not None,
             )
             w, w_s = load_weight_static(
@@ -665,6 +669,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             smem_pruner(min_sets=2),  # two full buffer sets: the grouped pipeline's floor (see smem_pruner)
             warp_spec_compile_guard_pruner(),
             affine_scale_warp_spec_pruner(),
+            warp_spec_memory_mode_pruner(),
         )
     },
 )
@@ -916,7 +921,7 @@ def mx_dynamic_matmul_grouped_kernel(
     path_anchor_axes=PATH_ANCHOR_AXES,
     prune_configs_by={
         "early_config_prune": compose_pruners(
-            weight_only_warp_spec_matched_mode_pruner(),
+            warp_spec_memory_mode_pruner(weight_only=True),
             packed_schedule_scope_pruner(),
             # the tail tile slides back in bounds (see the K-loop) — BK only has to fit
             block_fits_dim_pruner("K"),
@@ -1436,7 +1441,8 @@ def w8a8_block_static_fp8_matmul_grouped(
 
     A:  (S, K) raw bf16/fp16 activations — rows addressed via ``gather_idx``
     B:  (num_experts, N, K) FP8 weights; under ``gate`` the (num_experts, 2N, K) gate|up stack
-    As: scalar / (1,) — the calibrated per-tensor (static) activation scale
+    As: scalar / (1,) for one calibrated scale, or (num_experts,) for a MoE that
+        calibrates each expert separately
     Bs: (num_experts, N // block_n, K // block_k) per-block weight scales (2N under gate)
     """
     validate_dense_operands(A, B)
@@ -1463,11 +1469,15 @@ def w8a8_block_static_fp8_matmul_grouped(
     )
 
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    As = As.reshape(1).to(torch.float32)
+    # One calibrated scale for the whole matmul, or one per expert -- a MoE calibrates each
+    # separately. Per expert the kernel quantizes in register against the tile's own scale,
+    # because one token routes to several experts whose scales differ and so has no single
+    # pre-quantized form; one scale for all of them pre-quantizes once here instead.
+    As = As.reshape(-1).to(torch.float32)
+    # stride 0 makes every expert read the one calibrated scale; 1 gives each its own
+    as_stride = int(As.numel() == num_experts)
     bs_u8 = ue8m0_as_uint8(Bs)
-    # Pre-quantize the raw activations against the calibrated scalar (offline — MoE always
-    # pre-quants; the kernel folds the scalar back post-loop).
-    A_q = (A.to(torch.float32) / As).to(FP8_DTYPE)
+    A_q = A if as_stride else (A.to(torch.float32) / As).to(FP8_DTYPE)
     if requant:
         C = A.new_empty(S, N, dtype=FP8_DTYPE)
         # UE8M0 model (ue8m0 weights) -> UE8M0 intermediate scales; the epilogue infers the format
@@ -1510,6 +1520,7 @@ def w8a8_block_static_fp8_matmul_grouped(
             B.stride(0),
             B.stride(2),
             B.stride(1),
+            as_stride,
             bs_u8.stride(0),
             bs_u8.stride(2),
             bs_u8.stride(1),
@@ -2234,11 +2245,13 @@ def matmul_grouped(
         "output_global_scale is the NVFP4 requant second level — it requires quantize_output=True on NVFP4 "
         "(the epilogue would otherwise normalize by it with nothing downstream to compensate)"
     )
-    if As is not None and As.numel() == 1:
-        # static (per-tensor calibrated) activation quant: a per-tensor scalar As for block-scale FP8
-        # weights — the caller hands raw A, the op quantizes it against the scalar (As IS the scale).
+    if As is not None and As.ndim <= 1 and As.numel() in (1, B.shape[0]):
+        # static (calibrated) activation quant for block-scale FP8 weights: the caller hands raw
+        # A and As IS the scale — one value for the whole matmul, or one per expert for a MoE,
+        # which calibrates each expert separately. Per-block activation scales are 2-D and take
+        # the dynamic arms below.
         assert Bs is not None and not is_mx(B, Bs) and weight_block_size(B, Bs) is not None, (
-            "a per-tensor scalar As (static activation scale) needs block-scale FP8 weights"
+            "a calibrated (static) activation scale needs block-scale FP8 weights"
         )
         out = w8a8_block_static_fp8_matmul_grouped(
             A,

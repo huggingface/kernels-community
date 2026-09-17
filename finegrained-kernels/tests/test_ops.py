@@ -729,3 +729,61 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
         print(f"\n[sweep] {len(forgiven)} admitted config(s) failed to compile/run (forgiven):")
         for cfg, err in forgiven:
             print(f"  {cfg}: {err}")
+
+
+def _static_reference(A, B, Bs, As, block, rows_of):
+    """Per-expert static reference: each expert's rows quantize against ITS calibrated scale,
+    the weight dequantizes by its per-block scales, and the scale folds back on the product."""
+    E, N, K = B.shape[0], B.shape[1], B.shape[2]
+    bn, bk = block
+    out = torch.empty(sum(len(rows_of(e)) for e in range(E)), N, device=A.device, dtype=torch.bfloat16)
+    at = 0
+    for e in range(E):
+        rows = rows_of(e)
+        s = As[0] if As.numel() == 1 else As[e]
+        a_q = (A[rows].float() / s).to(torch.float8_e4m3fn).float()
+        w = B[e].float().reshape(N // bn, bn, K // bk, bk) * Bs[e][:, None, :, None]
+        out[at : at + len(rows)] = (a_q @ w.reshape(N, K).T * s).to(out.dtype)
+        at += len(rows)
+    return out
+
+
+@pytest.mark.parametrize("per_expert", [False, True], ids=["scalar", "per_expert"])
+@pytest.mark.parametrize("gathered", [False, True], ids=["sorted", "gathered"])
+def test_static_activation_scale_is_per_expert_or_shared(per_expert, gathered):
+    """A MoE calibrates each expert separately, so the static activation scale is one value per
+    expert, not one per matmul. The kernel then quantizes in register against the tile's own
+    expert: a host pre-quant cannot serve a GATHERED A, where top-k routes one row to several
+    experts whose scales differ, so that combination is the one this must cover.
+
+    The scalar case rides the same code with ``stride_as_e = 0`` and must stay unchanged.
+    """
+    from finegrained_kernels.grouped import matmul_grouped  # type: ignore
+
+    torch.manual_seed(0)
+    E, N, K, blk = 4, 256, 256, 128
+    rows_per_expert = 64
+    S = E * rows_per_expert
+    A = torch.randn(S, K, device=TEST_DEVICE, dtype=torch.bfloat16)
+    B = (torch.randn(E, N, K, device=TEST_DEVICE) / 8).to(torch.float8_e4m3fn)
+    Bs = torch.rand(E, N // blk, K // blk, device=TEST_DEVICE) + 0.5
+    expert_start = torch.tensor(
+        [e * rows_per_expert for e in range(E + 1)], device=TEST_DEVICE, dtype=torch.int32
+    ).contiguous()
+    # scales deliberately far apart, so reading the wrong expert's is visible rather than lucky
+    As = (
+        torch.tensor([0.02, 0.05, 0.08, 0.11], device=TEST_DEVICE)
+        if per_expert
+        else torch.tensor([0.05], device=TEST_DEVICE)
+    )
+    order = torch.randperm(S, device=TEST_DEVICE).to(torch.int32) if gathered else None
+
+    out = matmul_grouped(
+        A, B, As=As, Bs=Bs, expert_start=expert_start, gather_idx=order, output_dtype=torch.bfloat16
+    )
+    sorted_rows = order.long() if gathered else torch.arange(S, device=TEST_DEVICE)
+    reference = _static_reference(
+        A, B, Bs, As, (blk, blk),
+        lambda e: sorted_rows[e * rows_per_expert : (e + 1) * rows_per_expert],
+    )
+    torch.testing.assert_close(out.float(), reference.float(), rtol=2e-2, atol=2e-2)
