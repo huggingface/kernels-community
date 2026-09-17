@@ -583,7 +583,7 @@ def _skip_moe_only(problem: Problem, op: str) -> None:
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("op", ["batched", "grouped", "matmul"])
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_op_scenarios(problem: Problem, op):
@@ -661,7 +661,7 @@ _SWEEP_CELLS = [
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize(
     "problem, op, kernel_name",
     _SWEEP_CELLS,
