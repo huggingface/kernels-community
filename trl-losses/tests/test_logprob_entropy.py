@@ -43,9 +43,9 @@ def test_forward_and_backward(dtype, logprob_weight, entropy_weight):
     # Exercise online normalization across blocks with sharply different maxima.
     base_logits[..., 1024:2048].sub_(20)
     base_logits.requires_grad_()
-    # TRL slices sequence logits without making them contiguous.
+    # TRL slices sequence logits and token IDs without making them contiguous.
     logits = base_logits[:, 1:4]
-    index = torch.randint(vocab_size, (2, 3), device=DEVICE)
+    index = torch.randint(vocab_size, (2, 5), device=DEVICE)[:, 1:4]
     index[0, 0] = vocab_size - 1  # select a target from the partial block
 
     logprobs, entropy = trl_losses.selective_log_softmax_and_entropy(logits, index)
