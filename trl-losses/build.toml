@@ -1,0 +1,13 @@
+[general]
+name = "trl-losses"
+version = 1
+license = "Apache-2.0"
+# Pure Triton: the same source is used on every supported accelerator backend.
+backends = ["cuda", "rocm", "xpu"]
+
+[general.hub]
+repo-id = "kernels-community/trl-losses"
+
+[torch-noarch]
+
+[kernel]
