@@ -21,7 +21,7 @@ than quietly falling back to torch; ask `supports_flash_attn`.
 import torch
 from kernels import get_kernel
 
-attn = get_kernel("kernels-community/ggml-attn", version=1)
+attn = get_kernel("transformers-community/ggml-attn", version=1)
 
 q = torch.randn(1, 16, 1, 128, device="mps")    # (n_seqs, n_heads, n_q, head_dim)
 k = torch.randn(1, 4, 512, 128, device="mps")   # 4 kv heads, left unexpanded
@@ -34,6 +34,6 @@ Or as a model's attention implementation:
 
 ```python
 model = AutoModelForCausalLM.from_pretrained(
-    ..., attn_implementation="kernels-community/ggml-attn"
+    ..., attn_implementation="transformers-community/ggml-attn"
 )
 ```
