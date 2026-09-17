@@ -291,7 +291,7 @@ def gate_tile_cap_pruner(max_bn: int = 32):
     it too (down is ~25% faster at BN=64). The win is grid-, not register-bound — BN=32 still
     spills under ``IGC_ShaderDumpEnable``, more than BN=64 does.
 
-    Probed on BMG (Xe2) only — re-probe on other Xe parts before taking this as a Xe-wide law."""
+    Probed on BMG (Xe2) only — best to re-probe on other Xe parts before taking this as a Xe-wide law."""
 
     def ok(c, args):
         return config_dim(c, args, "BLOCK_SIZE_N") <= max_bn
