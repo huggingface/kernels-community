@@ -59,6 +59,7 @@ class MoEProblem:
     swizzled: bool = False  # pre-swizzled (5D SWIZZLE_32_4_4) weight scales — the deployment layout
     input_globals: bool = False  # calibrated NVFP4 activation input_scale per projection
     expert_globals: bool = False  # the down's calibrated input_scale differs per expert
+    static: Optional[str] = None  # calibrated activation scale: shared | per_expert
     post_expert_norm: Optional[str] = None  # a model's per-expert output norm, by name
 
     @property
@@ -80,6 +81,7 @@ class MoEProblem:
             f"{act}{fmt}{'_swizzled' if self.swizzled else ''}"
             f"{'_inputglobals' if self.input_globals else ''}"
             f"{'_expertglobals' if self.expert_globals else ''}"
+            f"{'_static_' + self.static if self.static else ''}"
             f"{'_' + self.post_expert_norm if self.post_expert_norm else ''}"
             f"{'_sentinel' if self.sentinel_fraction > 0 else ''}"
         )
@@ -97,6 +99,11 @@ MOE_PROBLEMS = [
     MoEProblem(weights="mxfp8_u8"),
     MoEProblem(weights="fp8_128x128", num_tokens=1),
     MoEProblem(weights="fp8_128x128"),
+    # calibrated (static) activation quant: the scales replace the runtime ones in both GEMMs of
+    # both chains, and the intermediate stays bf16 — an epilogue requant has no calibrated scale
+    # to emit. ``num_top_k`` below ``num_experts`` so each expert calibrates on its own tokens.
+    MoEProblem(weights="fp8_128x128", num_tokens=64, num_top_k=2, static="shared"),
+    MoEProblem(weights="fp8_128x128", num_tokens=64, num_top_k=2, static="per_expert"),
     # block-FP8 with UE8M0 (power-of-two) scales — the whole-model UE8M0 contract: acts,
     # weights, and the fused intermediate requant all power-of-two (DeepSeek-V4 attn / B200).
     MoEProblem(weights="fp8_128x128_ue8m0", num_tokens=1),
@@ -242,12 +249,38 @@ def _input_globals(problem: MoEProblem, hidden):
     return gate_up_in_g, down_in_g
 
 
-def _common_kwargs(problem: MoEProblem, hidden, gate_up_g, down_g):
-    """The kwargs every forward takes: the weights' second-level globals, the calibrated
-    activation globals, the GLU knobs, and a model's per-expert output norm. The fused chain
+def _static_scales(problem: MoEProblem, hidden, gate_up, gate_up_s, top_k_index):
+    """The calibrated activation scales, derived the way a calibration pass derives them: ``amax /
+    448`` of what each GEMM actually sees — the routed hidden states for gate_up, the GLU
+    intermediate for down — per expert over the tokens routed to it, or reduced to the one value a
+    shared calibration keeps. ``None`` on a dynamic problem, which quantizes at runtime instead."""
+    if not problem.static:
+        return None, None
+    weight = WEIGHTS[problem.weights]["dequant"](gate_up, gate_up_s).float()
+    inter = fused_glu(
+        torch.einsum("th,enh->etn", hidden.float(), weight),
+        problem.act_fn,
+        problem.swiglu_alpha,
+        problem.swiglu_limit,
+    )
+    routed = torch.stack([(top_k_index == e).any(dim=1) for e in range(problem.num_experts)])
+
+    def calibrate(seen):  # (E, T, C) over every token -> (E,) over the ones each expert sees
+        return (seen.abs() * routed[..., None]).amax(dim=(1, 2)).div(448.0).clamp(min=1e-12).float()
+
+    scales = [calibrate(hidden.float().expand(problem.num_experts, -1, -1)), calibrate(inter)]
+    if problem.static == "shared":
+        scales = [scale.amax().reshape(1) for scale in scales]
+    return tuple(scale.contiguous() for scale in scales)
+
+
+def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s, gate_up_g, down_g):
+    """The kwargs every forward takes: the weights' second-level globals, the calibrated activation
+    globals and scales, the GLU knobs, and a model's per-expert output norm. The fused chain
     folds a named norm into its reduce while the unfused reference normalizes the routed rows in
     a pass of their own, so handing both the same weight is what makes that a parity check."""
     gate_up_in_g, down_in_g = _input_globals(problem, hidden)
+    gate_up_act_s, down_act_s = _static_scales(problem, hidden, gate_up, gate_up_s, top_k_index)
     norm_weight = (
         torch.randn(problem.hidden_dim, device=TEST_DEVICE, dtype=problem.dtype) * 0.3
         if problem.post_expert_norm
@@ -258,6 +291,8 @@ def _common_kwargs(problem: MoEProblem, hidden, gate_up_g, down_g):
         down_proj_weight_global_scale=down_g,
         gate_up_proj_input_global_scale=gate_up_in_g,
         down_proj_input_global_scale=down_in_g,
+        gate_up_proj_activation_scale=gate_up_act_s,
+        down_proj_activation_scale=down_act_s,
         act_fn=problem.act_fn,
         swiglu_alpha=problem.swiglu_alpha,
         swiglu_limit=problem.swiglu_limit,
@@ -281,7 +316,7 @@ def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
     # The decoupled API takes pure block scales + the globals as separate args (nvfp4 weights are
     # two-level; other formats have a bare block scale + None global).
-    common = _common_kwargs(problem, hidden, gate_up_g, down_g)
+    common = _common_kwargs(problem, hidden, top_k_index, gate_up, gate_up_s, gate_up_g, down_g)
     ref = unfused_fn(
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
     )
@@ -345,7 +380,7 @@ def test_fused_production_arm(problem, fused_fn, unfused_fn):
     torch.manual_seed(0)
     gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
-    common = _common_kwargs(problem, hidden, gate_up_g, down_g)
+    common = _common_kwargs(problem, hidden, top_k_index, gate_up, gate_up_s, gate_up_g, down_g)
     ref = unfused_fn(
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
     )
@@ -382,7 +417,7 @@ def test_torch_grouped_baseline(problem):
     torch.manual_seed(0)
     gate_up, gate_up_s, gate_up_g, down, down_s, down_g = _make_moe_weights(problem)
     hidden, top_k_index, top_k_weights = _make_moe_inputs(problem)
-    common = _common_kwargs(problem, hidden, gate_up_g, down_g)
+    common = _common_kwargs(problem, hidden, top_k_index, gate_up, gate_up_s, gate_up_g, down_g)
     ref = moe.moe_unfused_grouped(
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
     )
