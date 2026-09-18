@@ -24,9 +24,10 @@ shapes, torch.compile) ride one format each. One ``Problem`` list feeds all thre
 ``op`` axis (``test_op_scenarios``): the routed ops (``batched`` / ``grouped``) run
 every Problem; ``matmul`` — the single-GEMM sibling — runs each Problem it can represent (no
 expert routing, a quantized format it routes, requant on MX weights only), one weight matrix and
-no gather/scatter. Two orthogonal knobs ride the same list: ``static`` (per-tensor calibrated
-activation quant, all three ops) and ``swizzled`` (MX weight scales pre-swizzled into the 5D
-SWIZZLE_32_4_4 tcgen05 layout — a pure layout variant checked against the affine reference).
+no gather/scatter. Two orthogonal knobs ride the same list: ``static`` (calibrated activation
+quant — a shared scale on all three ops, one per expert on the routed pair) and ``swizzled`` (MX
+weight scales pre-swizzled into the 5D SWIZZLE_32_4_4 tcgen05 layout — a pure layout variant
+checked against the affine reference).
 Nothing in this file uses a kernel under test as the oracle."""
 
 from dataclasses import dataclass
@@ -76,7 +77,7 @@ class Problem:
     quantize_output: bool = False
     per_expert_globals: bool = False  # activation (and requant output) globals calibrated per expert
     prequant: bool = False  # pass As explicitly (must be bit-identical to raw A)
-    static: bool = False  # per-tensor calibrated activation scale (block-scale FP8 path)
+    static: str | None = None  # calibrated activation scale (block-scale FP8): shared | per_expert
     swizzled: bool = False  # pass MX weight scales pre-swizzled (5D SWIZZLE_32_4_4 fast path)
     sentinel_fraction: float = 0.0
     noncontiguous: bool = False
@@ -102,7 +103,7 @@ class Problem:
         if self.prequant:
             tag += "_prequant"
         if self.static:
-            tag += "_static"
+            tag += f"_static_{self.static}"
         if self.swizzled:
             tag += "_swizzled"
         if self.sentinel_fraction:
@@ -221,10 +222,14 @@ def scenarios() -> list[Problem]:
         Problem(weights="fp8_128x128", compile=True),
         Problem(weights="mxfp4", compile=True),
         Problem(weights="bf16", compile=True),  # the fp kernel's pre_hook under compile
-        # static (per-tensor calibrated) activation quant — the block_static path, reached when
-        # As is a per-tensor scalar; runs on all three ops (2D / grouped / batched).
-        Problem(weights="fp8_128x128", static=True),
-        Problem(weights="fp8_128x128", gate=True, static=True),
+        # static (calibrated) activation quant — the block_static path, reached when As is a
+        # calibrated scale rather than per-block; runs on all three ops (2D / grouped / batched).
+        Problem(weights="fp8_128x128", static="shared"),
+        Problem(weights="fp8_128x128", gate=True, static="shared"),
+        # one scale per expert, applied in register against the tile's own expert — the form a
+        # host pre-quant cannot serve, since grouped gathers rows whose experts differ
+        Problem(weights="fp8_128x128", static="per_expert"),
+        Problem(weights="fp8_128x128", gate=True, static="per_expert"),
         # non-aligned N (64-grid, off the 128-grid — gpt-oss H=I=2880 shape). matmul_2d masks the
         # N-tail; routed MX runs the affine arm (per-row scales, any BN|N); routed FP8 rejects it
         # (its scales are 128-blocked along N — raises pointing to matmul_2d).
@@ -279,9 +284,17 @@ def _make_noncontig(x):
 
 
 def _static_scale(problem: Problem, A):
-    """Per-tensor calibrated activation scale for the static (block-scale FP8) path, else None —
-    deterministic in ``A``, so the reference and the op derive the identical scalar."""
-    return make_static_activation_scale(A) if problem.static else None
+    """The calibrated activation scale of the static (block-scale FP8) path, else None. One value
+    shared by the whole matmul, or — what a MoE checkpoint carries, each expert calibrated
+    separately — one per expert, fanned around the per-tensor value so an ignored entry shows up.
+    Deterministic in ``A``, so the reference and the op derive identical numbers."""
+    if not problem.static:
+        return None
+    scale = make_static_activation_scale(A)
+    if problem.static == "shared":
+        return scale
+    fan = torch.linspace(0.5, 2.0, problem.E, device=A.device, dtype=torch.float32)
+    return (scale * fan).contiguous()
 
 
 def _nvfp4_global(x):
@@ -317,13 +330,13 @@ def _rowwise(problem: Problem, g, expert_ids):
 
 def _dequant_a(problem: Problem, A, expert_ids=None):
     """``A`` dequantized to fp32 on the format's grid (the exact host quant the op calls, or the
-    static per-tensor scale), plus the pre-quantized ``(Aq, As)`` form for the prequant round-trip
+    calibrated static scale of each row's expert), plus the pre-quantized ``(Aq, As)`` form for the prequant round-trip
     check (``None`` where ``A`` stays raw)."""
     row = WEIGHTS[problem.weights]
     static_scale = _static_scale(problem, A)
     act_global = _act_global(problem, A, expert_ids)
-    if static_scale is not None:  # static per-tensor activation quant
-        return quant_dequant_a(A, problem.K, scale=static_scale), None
+    if static_scale is not None:  # static (calibrated) activation quant
+        return quant_dequant_a(A, problem.K, scale=_rowwise(problem, static_scale, expert_ids)), None
     if act_global is not None:
         # nvfp4 acts are always two-level: quantize A/g_a per block (the exact host fn the op
         # calls), dequantize × g_a; the pre-quantized form is the bare block scale (the g_a
@@ -445,7 +458,7 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
         kw["output_dtype"] = problem.dtype
     if out_global is not None:  # provided NVFP4 output global (next proj's input_scale)
         kw["output_global_scale"] = out_global
-    if problem.static:  # fused static (per-tensor) activation quant — As is the calibrated scalar
+    if problem.static:  # fused static activation quant — As is the calibrated scale
         As = _static_scale(problem, A)
     # matmul is the single-GEMM sibling: slice to the one weight matrix (expert 0) and drop the
     # routing maps; the call is otherwise identical to the routed ops.
@@ -568,14 +581,14 @@ def _skip_moe_only(problem: Problem, op: str) -> None:
     """matmul_2d is the single-GEMM sibling: skip only the scenarios it can't represent — expert
     routing (sentinel / noncontiguous / empty-expert / the MoE prequant-As check) and non-MX
     input/output format knobs (its FP8 paths infer the quant from the scale shape and return the
-    intermediate dense). Everything else — including full-precision (BF16/FP16) weights and static
-    activation quant — runs on all three ops."""
+    intermediate dense). Everything else — including full-precision (BF16/FP16) weights and a
+    shared static activation scale — runs on all three ops."""
     if op != "matmul":
         return
     if problem.sentinel_fraction or problem.noncontiguous or problem.empty_expert or problem.prequant:
         pytest.skip("expert-routing scenario (MoE only)")
-    if problem.per_expert_globals:
-        pytest.skip("per-expert globals need routing (MoE only)")
+    if problem.per_expert_globals or problem.static == "per_expert":
+        pytest.skip("per-expert scales need routing (MoE only)")
 
     mx = problem.weights in ("mxfp8", "mxfp8_u8", "mxfp4", "nvfp4")
     if not mx and (problem.activation_format is not None or problem.quantize_output):
@@ -729,61 +742,3 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
         print(f"\n[sweep] {len(forgiven)} admitted config(s) failed to compile/run (forgiven):")
         for cfg, err in forgiven:
             print(f"  {cfg}: {err}")
-
-
-def _static_reference(A, B, Bs, As, block, rows_of):
-    """Per-expert static reference: each expert's rows quantize against ITS calibrated scale,
-    the weight dequantizes by its per-block scales, and the scale folds back on the product."""
-    E, N, K = B.shape[0], B.shape[1], B.shape[2]
-    bn, bk = block
-    out = torch.empty(sum(len(rows_of(e)) for e in range(E)), N, device=A.device, dtype=torch.bfloat16)
-    at = 0
-    for e in range(E):
-        rows = rows_of(e)
-        s = As[0] if As.numel() == 1 else As[e]
-        a_q = (A[rows].float() / s).to(torch.float8_e4m3fn).float()
-        w = B[e].float().reshape(N // bn, bn, K // bk, bk) * Bs[e][:, None, :, None]
-        out[at : at + len(rows)] = (a_q @ w.reshape(N, K).T * s).to(out.dtype)
-        at += len(rows)
-    return out
-
-
-@pytest.mark.parametrize("per_expert", [False, True], ids=["scalar", "per_expert"])
-@pytest.mark.parametrize("gathered", [False, True], ids=["sorted", "gathered"])
-def test_static_activation_scale_is_per_expert_or_shared(per_expert, gathered):
-    """A MoE calibrates each expert separately, so the static activation scale is one value per
-    expert, not one per matmul. The kernel then quantizes in register against the tile's own
-    expert: a host pre-quant cannot serve a GATHERED A, where top-k routes one row to several
-    experts whose scales differ, so that combination is the one this must cover.
-
-    The scalar case rides the same code with ``stride_as_e = 0`` and must stay unchanged.
-    """
-    from finegrained_kernels.grouped import matmul_grouped  # type: ignore
-
-    torch.manual_seed(0)
-    E, N, K, blk = 4, 256, 256, 128
-    rows_per_expert = 64
-    S = E * rows_per_expert
-    A = torch.randn(S, K, device=TEST_DEVICE, dtype=torch.bfloat16)
-    B = (torch.randn(E, N, K, device=TEST_DEVICE) / 8).to(torch.float8_e4m3fn)
-    Bs = torch.rand(E, N // blk, K // blk, device=TEST_DEVICE) + 0.5
-    expert_start = torch.tensor(
-        [e * rows_per_expert for e in range(E + 1)], device=TEST_DEVICE, dtype=torch.int32
-    ).contiguous()
-    # scales deliberately far apart, so reading the wrong expert's is visible rather than lucky
-    As = (
-        torch.tensor([0.02, 0.05, 0.08, 0.11], device=TEST_DEVICE)
-        if per_expert
-        else torch.tensor([0.05], device=TEST_DEVICE)
-    )
-    order = torch.randperm(S, device=TEST_DEVICE).to(torch.int32) if gathered else None
-
-    out = matmul_grouped(
-        A, B, As=As, Bs=Bs, expert_start=expert_start, gather_idx=order, output_dtype=torch.bfloat16
-    )
-    sorted_rows = order.long() if gathered else torch.arange(S, device=TEST_DEVICE)
-    reference = _static_reference(
-        A, B, Bs, As, (blk, blk),
-        lambda e: sorted_rows[e * rows_per_expert : (e + 1) * rows_per_expert],
-    )
-    torch.testing.assert_close(out.float(), reference.float(), rtol=2e-2, atol=2e-2)
