@@ -320,10 +320,6 @@ def moe_fused_grouped(
     down_proj_weight_global_scale: torch.Tensor | None = None,
     gate_up_proj_input_global_scale: torch.Tensor | None = None,
     down_proj_input_global_scale: torch.Tensor | None = None,
-    # STATIC (calibrated) activation quant: one scale per expert per projection, handed to each
-    # phase as ``As`` -- the kernel quantizes in register against the tile's own expert scale.
-    # The intermediate then stays bf16 rather than being requantized in the epilogue, which
-    # cannot emit a calibrated scale; the down quantizes it against its own scales instead.
     gate_up_proj_activation_scale: torch.Tensor | None = None,
     down_proj_activation_scale: torch.Tensor | None = None,
     post_expert_norm=None,  # the model's per-expert output norm on the routed rows: a
@@ -384,7 +380,7 @@ def moe_fused_grouped(
         **glu,
         bias=gate_up_proj_bias,
         # fmt is the resolved format; "bf16" (weight-only) leaves the GLU intermediate bf16,
-        # no requant.
+        # no requant. So does static, whose epilogue has no calibrated scale to requant against.
         activation_format=fmt,
         quantize_output=bool(glu) and fmt != "bf16" and not static_act,
         output_dtype=hidden_states.dtype,
@@ -437,10 +433,6 @@ def moe_fused_batched(
     down_proj_weight_global_scale: torch.Tensor | None = None,
     gate_up_proj_input_global_scale: torch.Tensor | None = None,
     down_proj_input_global_scale: torch.Tensor | None = None,
-    # STATIC (calibrated) activation quant: one scale per expert per projection, handed to each
-    # phase as ``As`` -- the kernel quantizes in register against the tile's own expert scale.
-    # The intermediate then stays bf16 rather than being requantized in the epilogue, which
-    # cannot emit a calibrated scale; the down quantizes it against its own scales instead.
     gate_up_proj_activation_scale: torch.Tensor | None = None,
     down_proj_activation_scale: torch.Tensor | None = None,
     post_expert_norm=None,  # the model's per-expert output norm on the routed rows: a
@@ -504,7 +496,8 @@ def moe_fused_batched(
         # (``fused_glu(quant_group=...)`` — one launch, hands the down a ready fp8+scales intermediate and
         # kills its offline act quant); ABOVE the band the stacked epilogue's requant pins
         # the gate|up tile to the whole block scale and halves the grid, so the bf16 handoff
-        # (down inline-quants) stays the win there.
+        # (down inline-quants) stays the win there. Static keeps bf16 either way, its epilogue
+        # having no calibrated scale to requant against.
         activation_format=fmt,
         quantize_output=(
             bool(glu)
