@@ -15,7 +15,7 @@
 import torch
 import triton
 
-from .compat import get_active_device_type, is_sm10x, is_sm90, sm_count, sm_shared_memory_limit
+from .compat import FP8_DTYPE, get_active_device_type, is_sm10x, is_sm90, sm_count, sm_shared_memory_limit
 from .mma import MMA_N_ATOM_WIDTH
 
 # ── config pruners ────────────────────────────────────────────────────────────
@@ -792,6 +792,23 @@ def weight_only_swap_scope_pruner():
     return config_filter(ok)
 
 
+def raw_activation_pointer_pruner():
+    """``early_config_prune`` keeping a RAW activation on the pointer arm. A calibrated scale
+    held per expert leaves ``A`` unquantized for the kernel to quantize per tile (a gathered row
+    serves several experts, so there is no single pre-quantized form), and a raw tile cannot ride
+    the TMA gather: ``async_tma_gather`` wants at least 4 contiguous elements per thread and the
+    lowering fails outright, which at a deployment shape left the tuner no config at all. A
+    pre-quantized ``A`` is unaffected and keeps every memory mode."""
+
+    def ok(c, args):
+        a = args.get("A")
+        if getattr(a, "dtype", None) == FP8_DTYPE or args.get("As") is None:
+            return True
+        return c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
+
+    return config_filter(ok)
+
+
 def mx_2d_swap_scope_pruner(max_m: int = 16):
     """``early_config_prune`` scoping the 2D mx kernel's ``SWAP_AB`` rows to the ONE regime
     they exist for: E4M3-scale (NVFP4) single-token decode. NVFP4 has no other native M=1
@@ -820,6 +837,14 @@ def mx_2d_swap_scope_pruner(max_m: int = 16):
             config_dim(c, args, "BLOCK_SIZE_M") == 1
             and getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn
             and args["M"] <= max_m
+            # An A-side TMA descriptor under SWAP_AB traps the device on Triton 3.8 — a sticky
+            # misaligned address, after which every later launch reports it wherever it came
+            # from. Observed on B200 in a GLM-5.2-NVFP4 forward (16 tokens; clean at 4) at
+            # dot_scaled, BM=1, BN ∈ {128, 256}, BK ∈ {64, 128}: the tile WIDTH is not the
+            # variable (BN=128 traps too), the A descriptor is. Narrowed by probe — fencing the
+            # B side as well was NOT needed, so the weight descriptor stays available to the
+            # crown, and pointer-mode A keeps the decode arm this pruner exists for.
+            and c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
         )
 
     return config_filter(ok)

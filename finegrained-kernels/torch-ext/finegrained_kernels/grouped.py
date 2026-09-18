@@ -41,7 +41,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, global_scale_warp_spec_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
+from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, raw_activation_pointer_pruner, global_scale_warp_spec_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
 
 
 @bayesian_autotune(
@@ -275,6 +275,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             packed_schedule_scope_pruner(),
             block_dynamic_grouped_matmul_pruner(),
             descriptor_box_pruner(),
+            raw_activation_pointer_pruner(),
         )
     },
 )
@@ -470,6 +471,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
             warp_spec_compile_guard_pruner(),
             descriptor_box_pruner(),
             smem_pruner(),
+            raw_activation_pointer_pruner(),
         )
     },
 )

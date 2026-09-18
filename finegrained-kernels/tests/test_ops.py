@@ -170,6 +170,10 @@ def scenarios() -> list[Problem]:
         # decode shape (small M — inline act-quant on MX, the software/scalar arms elsewhere)
         Problem(weights="mxfp8", S=8),
         Problem(weights="nvfp4", S=8),
+        # the TOP of the 2D swap decode band (mx_2d_swap_scope_pruner scopes SWAP_AB to M <= 16):
+        # the arm's tile choices differ across the band, and an A-descriptor trap that is clean at
+        # S=4 fires by S=16, so the edge is the cell that sees it
+        Problem(weights="nvfp4", S=16),
         Problem(weights="fp8_128x128", S=8),
         Problem(weights="fp8_128x128_ue8m0", S=8),
         Problem(weights="mxfp4", S=8),
@@ -671,6 +675,10 @@ _SWEEP_CELLS = [
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", "mx_dynamic_matmul_kernel"),
     (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
+    # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize
+    # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is
+    # the one a memory-mode fence gets wrong (silently — the tuner forgives what will not lower)
+    (Problem(weights="fp8_tensor", static=True), "grouped", "w8a8_tensor_dynamic_fp8_matmul_grouped_kernel"),
 ]
 
 

@@ -74,7 +74,6 @@ Run: python bench/bench_moe.py                         (all rows, single GPU)
 """
 
 import csv
-import importlib
 import os
 import random
 import subprocess
@@ -129,27 +128,13 @@ _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "torch-ext"))
 sys.path.insert(0, os.path.join(_ROOT, "tests"))
 import finegrained_kernels as fgm  # noqa: E402  local branch
-import kernels  # noqa: E402
 from kernels import get_kernel  # noqa: E402
 
-# All baselines here are kernels-community repos we already trust; the publisher-trust check
-# hits a rate-limited org-overview API (429 under the 8-way shard fan-out) and can't be reached
-# for sonic-moe (loaded via transformers' lazy_load_kernel, no trust_remote_code hook). Neutralize
-# the check process-wide so every get_kernel — ours, sonic, deepgemm, gpt-oss — loads from cache.
-# the check lives in `kernels.utils` up to 0.16 and in `kernels.hf_hub` from 0.17; patch
-# whichever module this install has, and say so rather than silently leaving it in place
-_patched = []  # noqa: E402
-for _mod in ("kernels.utils", "kernels.hf_hub"):  # noqa: E402
-    try:
-        _kernels_mod = importlib.import_module(_mod)
-    except ModuleNotFoundError:
-        continue
-    if hasattr(_kernels_mod, "_check_trust_remote_code"):
-        _kernels_mod._check_trust_remote_code = lambda *a, **k: None
-        _patched.append(_mod)
-if not _patched:
-    print(f"[bench] no _check_trust_remote_code in kernels {kernels.__version__}: "
-          "baseline loads may hit the rate-limited publisher-trust API")
+# kernels-community IS a trusted publisher, so the check passes whenever it can reach the Hub
+# — but it verifies by calling get_organization_overview once per load and turns ANY exception
+# from that call into a hard failure, and eight shards starting at once get 429ed. The flag
+# skips the round-trip; it is not a claim about the repos, which the Hub already vouches for.
+TRUSTED = True  # `get_kernel(..., trust_remote_code=)`: True, or an allowlist of repo ids
 
 # --no-preswizzle benches the affine (row-major) MX scale path instead of the pre-swizzled
 # SWIZZLE_32_4_4 tcgen05 fast path. Default on: the finegrained-kernels arm feeds pre-swizzled
@@ -267,7 +252,7 @@ except Exception:
 # older torch, so installing it from source downgrades the environment out from under every other
 # arm. Loaded like the rest of the roster.
 try:
-    _megablocks = get_kernel("kernels-community/megablocks", version=1)
+    _megablocks = get_kernel("kernels-community/megablocks", version=1, trust_remote_code=TRUSTED)
 except Exception:
     _megablocks = None
 
@@ -338,13 +323,13 @@ UPSTREAM_FP8_LABEL = "v4"  # the legend suffix: the hub tag the pinned snapshot 
 # later cell. Pin the snapshot the committed figure measured (identical source, warm crowns).
 UPSTREAM_FP8_REV = "29083040812e244b390757d6198e2889fe551d13"
 upstream_fp8 = (None if (MOCK or REPLOT)
-          else get_kernel("kernels-community/finegrained-fp8", revision=UPSTREAM_FP8_REV))
+          else get_kernel("kernels-community/finegrained-fp8", revision=UPSTREAM_FP8_REV, trust_remote_code=TRUSTED))
 
 # OpenAI triton_kernels (matmul_ogs) — the MXFP4 experts path transformers uses for
 # GPT-OSS. Loaded like finegrained-fp8; its module-level handle drives the mxfp4 swizzle helpers.
 if not (MOCK or REPLOT):
     import transformers.integrations.mxfp4 as _tfmx
-    triton_kernels_hub = get_kernel("kernels-community/gpt-oss-triton-kernels", version=1)
+    triton_kernels_hub = get_kernel("kernels-community/gpt-oss-triton-kernels", version=1, trust_remote_code=TRUSTED)
     _tfmx.triton_kernels_hub = triton_kernels_hub
 
 DEV = "cuda"
