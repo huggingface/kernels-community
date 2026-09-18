@@ -74,6 +74,7 @@ Run: python bench/bench_moe.py                         (all rows, single GPU)
 """
 
 import csv
+import importlib
 import os
 import random
 import subprocess
@@ -128,15 +129,27 @@ _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "torch-ext"))
 sys.path.insert(0, os.path.join(_ROOT, "tests"))
 import finegrained_kernels as fgm  # noqa: E402  local branch
+import kernels  # noqa: E402
 from kernels import get_kernel  # noqa: E402
 
 # All baselines here are kernels-community repos we already trust; the publisher-trust check
 # hits a rate-limited org-overview API (429 under the 8-way shard fan-out) and can't be reached
 # for sonic-moe (loaded via transformers' lazy_load_kernel, no trust_remote_code hook). Neutralize
 # the check process-wide so every get_kernel — ours, sonic, deepgemm, gpt-oss — loads from cache.
-import kernels.utils as _kernels_utils  # noqa: E402
-
-_kernels_utils._check_trust_remote_code = lambda *a, **k: None
+# the check lives in `kernels.utils` up to 0.16 and in `kernels.hf_hub` from 0.17; patch
+# whichever module this install has, and say so rather than silently leaving it in place
+_patched = []  # noqa: E402
+for _mod in ("kernels.utils", "kernels.hf_hub"):  # noqa: E402
+    try:
+        _kernels_mod = importlib.import_module(_mod)
+    except ModuleNotFoundError:
+        continue
+    if hasattr(_kernels_mod, "_check_trust_remote_code"):
+        _kernels_mod._check_trust_remote_code = lambda *a, **k: None
+        _patched.append(_mod)
+if not _patched:
+    print(f"[bench] no _check_trust_remote_code in kernels {kernels.__version__}: "
+          "baseline loads may hit the rate-limited publisher-trust API")
 
 # --no-preswizzle benches the affine (row-major) MX scale path instead of the pre-swizzled
 # SWIZZLE_32_4_4 tcgen05 fast path. Default on: the finegrained-kernels arm feeds pre-swizzled
@@ -341,7 +354,7 @@ PREFILL_TOKENS = 256 if SMOKE else 8192
 # fixed left-to-right model order for every figure row (matched by base-model prefix,
 # so GLM-5.2-NVFP4 and GLM-5.2 both land in the GLM-5.2 slot). Roughly most-baseline-
 # support first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last.
-CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2"]
+CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2", "Mistral-4"]
 
 MOE_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6)": dict(
@@ -381,6 +394,15 @@ MOE_PROBLEMS = {
         # experts kernel requires UE8M0 and fails loud on fp32, so no deepgemm baseline here.
         E=256, H=7168, I=2048, top_k=8, weights="fp8_128x128", activation_format=None,
         baselines=("finegrained-fp8", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4)": dict(
+        # The only shipped STATIC scheme: its conversion script asserts qscheme_act == "TENSOR"
+        # and writes weight_block_size None, so both levels are per tensor — per-expert weight
+        # scales and a calibrated activation scale per expert in place of the runtime one. No
+        # external arm: finegrained-fp8 has no static path and the others take block scales.
+        E=128, H=4096, I=2048, top_k=4, weights="fp8_tensor", activation_format=None, static=True,
+        baselines=(), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4)": dict(
@@ -582,8 +604,9 @@ def _interleave_rows(t):
     """``[gate rows; up rows]`` -> ``[g0, u0, g1, u1, ...]`` along dim -2; a scale grid follows the
     same rule at its own row count (128x128 block scales per 128-row block, MX per row). Byte-level
     for 1-byte float8 dtypes."""
-    if t is None:
-        return None
+    if t is None or t.shape[-2] < 2:
+        # a per-tensor scale is ONE value covering the whole gate|up stack: no rows to reorder
+        return t
     byte_view = t.element_size() == 1 and t.dtype.is_floating_point
     src = t.view(torch.uint8) if byte_view else t
     n = src.shape[-2] // 2
@@ -599,6 +622,20 @@ def _interleave_gate_up(gu, gus):
 # Arm signature lexicon: `hidden` (T, H) tokens, `idx`/`w` (T, top_k) routing; `gu`/`gus`/`gu_g` the
 # gate|up weight stack (E, 2I, H), its block-scale grid and its NVFP4 per-expert global; `dn`/`dns`/
 # `dn_g` the same for down (E, H, I). Scales are None for BF16, globals None outside NVFP4.
+def _static_act_kwargs(cfg, hidden):
+    """The calibrated activation scales a static row runs with: one per expert, the shape a
+    static MoE checkpoint carries (each expert is its own quantized module). The VALUES only set
+    the quantization grid — timing does not depend on them — and both arms get the same ones, so
+    the parity print stays meaningful. ``{}`` on a dynamic row, which quantizes per call."""
+    if not cfg.get("static"):
+        return {}
+    scale = (hidden.float().abs().amax() / 448.0).clamp(min=1e-12)
+    fan = torch.linspace(0.5, 2.0, cfg["E"], device=hidden.device, dtype=torch.float32)
+    per_expert = (scale * fan).contiguous()
+    _mark_static(per_expert)
+    return {"gate_up_proj_activation_scale": per_expert, "down_proj_activation_scale": per_expert}
+
+
 def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     """``activation_format`` sets the activation precision; None follows the weight format
     (mxfp4/nvfp4 -> the all-fp4 W4A4 chain, bf16 weights -> unquantized). dsv4 deploys
@@ -606,6 +643,7 @@ def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_
     pre-swizzled into SWIZZLE_32_4_4 so the forward takes the tcgen05 fast path."""
     fn = fgm.moe_fused_grouped if grouped else fgm.moe_fused_batched
     nvfp4_kw = _nvfp4_kwargs(cfg, hidden, gu, gus, gu_g)  # raw scales: before any preswizzle
+    static_kw = _static_act_kwargs(cfg, hidden)
     gu, gus = _interleave_gate_up(gu, gus)  # our kernels read gate|up interleaved
     if _can_preswizzle(cfg):
         gus = _preswizzle_moe_scale(gus)   # fused gate GEMM reads the interleaved layout
@@ -614,13 +652,14 @@ def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], activation_format=_activation_format(cfg),
               gate_up_proj_weight_global_scale=gu_g, down_proj_weight_global_scale=dn_g,
-              **nvfp4_kw)
+              **nvfp4_kw, **static_kw)
     return lambda: fn(hidden, idx, w, gu, dn, gus, dns, **kw)
 
 
 def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     fn = fgm.moe.moe_unfused_grouped if grouped else fgm.moe.moe_unfused_batched
     nvfp4_kw = _nvfp4_kwargs(cfg, hidden, gu, gus, gu_g)  # raw scales: before any preswizzle
+    static_kw = _static_act_kwargs(cfg, hidden)
     gu, gus = _interleave_gate_up(gu, gus)  # our kernels read gate|up interleaved
     if _can_preswizzle(cfg):
         # ONE checkpoint layout: gate_up scales are always the gate-interleaved artifact; the
@@ -631,7 +670,7 @@ def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, 
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], activation_format=_activation_format(cfg),
               gate_up_proj_weight_global_scale=gu_g, down_proj_weight_global_scale=dn_g,
-              **nvfp4_kw)
+              **nvfp4_kw, **static_kw)
     return lambda: fn(hidden, idx, w, gu, dn, gus, dns, **kw)
 
 

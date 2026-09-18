@@ -268,24 +268,18 @@ def load_act_static(
     a_ptrs, a_descriptor, m_off, k_off, value_mask, gather_rows, a_s_static,
     A_MEMORY_MODE: tl.constexpr, A_GATHER: tl.constexpr,
 ):
-    """static activation tile. Pre-quantized fp8 A loads as the rows-major MMA lhs; raw bf16/fp16
-    is quantized in register against ``a_s_static`` — behind a gather through the same tile load
-    the fp8 arm uses, pointer-only otherwise. The gathered raw arm is what a PER-EXPERT scale
-    needs: one row can be routed to several experts whose calibrated scales differ, so it has no
-    single pre-quantized form. ``a_s`` = the values (the scale is folded post-loop)."""
-    if a_ptrs.dtype.element_ty == tl.float8e4nv:  # pre-quantized fp8 A (MMA lhs, rows-major)
-        a = load_grouped_act_tile(
-            a_ptrs, a_descriptor, m_off, k_off, value_mask, gather_rows, A_MEMORY_MODE, A_GATHER
-        )
-    elif A_GATHER:  # raw rows behind a gather (grouped MoE) -> same tile load, then quantize
-        a = (
-            load_grouped_act_tile(
-                a_ptrs, a_descriptor, m_off, k_off, value_mask, gather_rows, A_MEMORY_MODE, A_GATHER
-            ).to(tl.float32)
-            / a_s_static
-        ).to(tl.float8e4nv)
-    else:  # raw bf16/fp16, pointer-only (2D / batched decode)
-        a = (tl.load(a_ptrs).to(tl.float32) / a_s_static).to(tl.float8e4nv)
+    """static activation tile, through the same tile load in every memory mode: a pre-quantized
+    fp8 A is the rows-major MMA lhs as-is, raw bf16/fp16 is quantized in register against
+    ``a_s_static``. The raw arm is what a PER-EXPERT scale needs: one row can be routed to
+    several experts whose calibrated scales differ, so it has no single pre-quantized form. Its
+    own load would have to repeat the tile loader's masking and descriptor arms — a bare
+    pointer load reads past the tensor on a grouped tail tile. ``a_s`` = the values (the scale
+    is folded post-loop)."""
+    a = load_grouped_act_tile(
+        a_ptrs, a_descriptor, m_off, k_off, value_mask, gather_rows, A_MEMORY_MODE, A_GATHER
+    )
+    if a_ptrs.dtype.element_ty != tl.float8e4nv:  # raw rows: quantize against the tile's scale
+        a = (a.to(tl.float32) / a_s_static).to(tl.float8e4nv)
     a_s = a
     return a, a_s
 

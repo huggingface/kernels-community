@@ -24,7 +24,7 @@ from .bayesian_autotuner import bayesian_autotune
 from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, sm_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
-from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_grouped, swizzle_grouped_mx_scales
+from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, mx_act_quant_grouped, swizzle_grouped_mx_scales, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import build_tile_layout, expand_gather_below_parity, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
@@ -477,7 +477,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
 def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     A,  # (num_tokens, K) pre-quantized FP8 activations, any row order
     ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
-    As,  # (S,) per-token activation scales
+    As,  # per-token activation scales (S,), or a calibrated (static) one: shared, or per expert
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
     BDescriptor,  # host TMA descriptor over B viewed (E, 2N|N, K), box (1, (2|1)*BN, BK); read iff B_MEMORY_MODE != "pointer"
     Bs,  # (num_experts, 1, 1) per-tensor weight scales (one scalar covers the gate|up stack)
@@ -496,6 +496,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     stride_a_m,
     stride_a_k,
     stride_as_m,
+    stride_as_e,  # 0 = the scale is per token; 1 = one calibrated scale per expert
     stride_b_e,
     stride_b_k,
     stride_b_n,
@@ -584,13 +585,17 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             stride_b_k,
             False,
         )
-        a_s = tl.load(As + in_row * stride_as_m, mask=row_mask, other=0.0)
+        # per token, or the tile's own expert under a calibrated scale (stride_as_m 0); 1.0 on
+        # the masked rows so the static arm's in-register divide never sees a zero
+        a_s = tl.load(
+            As + in_row * stride_as_m + expert_id64.to(tl.int32) * stride_as_e, mask=row_mask, other=1.0
+        )
         b_s = tl.load(Bs + expert_id64 * stride_bs_e)
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-            a, _as = load_act_plain(
-                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
+            a, _as = load_act_static(
+                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row, a_s[:, None],
                 A_MEMORY_MODE, GatherIdx is not None,
             )
             w, _ws = load_weight_plain(
@@ -1580,7 +1585,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
 
     A:  (S, K) pre-quantized FP8 activations — rows addressed via ``gather_idx``
     B:  (num_experts, N, K) FP8 expert weights; under ``gate`` the (num_experts, 2N, K) stack
-    As: (S,) per-token activation scales
+    As: (S,) per-token scales alongside a pre-quantized A, or — on a raw A — the calibrated
+        (static) activation scale: one value, or one per expert
     Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales
     expert_start: (num_experts_pow2 + 1,) int32 — cumulative sorted-row starts, S sentinel
     gather_idx: optional (S,) — sorted position -> source row of A; None = A is expert-sorted
@@ -1604,10 +1610,10 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     # Normalize Bs to (num_experts, 1, 1) — one per-tensor scale (covers the gate|up stack)
     Bs = normalize_per_expert_scale(Bs, num_experts)
 
-    # A raw (As is None) -> quantize here (offline, per-token); else pre-quantized.
     output_dtype = resolve_output_dtype(output_dtype, A, As)
-    if As is None:
-        A, As = fp8_act_quant_tensor_wide(A, K)
+    raw = As is None
+    A, As, as_stride_m, as_stride_e = tensor_wide_act_operands(A, As, num_experts)
+    if raw:
         # post-quant: trade the in-kernel gather for one packed-row copy where that wins
         A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, num_experts)
     C = A.new_empty(S, N, dtype=output_dtype)
@@ -1642,7 +1648,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
             K,
             A.stride(0),
             A.stride(1),
-            As.stride(0),
+            as_stride_m,
+            as_stride_e,
             B.stride(0),
             B.stride(2),
             B.stride(1),
@@ -2245,14 +2252,18 @@ def matmul_grouped(
         "output_global_scale is the NVFP4 requant second level — it requires quantize_output=True on NVFP4 "
         "(the epilogue would otherwise normalize by it with nothing downstream to compensate)"
     )
-    if As is not None and As.ndim <= 1 and As.numel() in (1, B.shape[0]):
-        # static (calibrated) activation quant for block-scale FP8 weights: the caller hands raw
-        # A and As IS the scale — one value for the whole matmul, or one per expert for a MoE,
-        # which calibrates each expert separately. Per-block activation scales are 2-D and take
-        # the dynamic arms below.
-        assert Bs is not None and not is_mx(B, Bs) and weight_block_size(B, Bs) is not None, (
-            "a calibrated (static) activation scale needs block-scale FP8 weights"
+    # static (calibrated) activation quant: the caller hands raw A and As IS the scale — one value
+    # for the whole matmul, or one per expert for a MoE, which calibrates each expert separately.
+    # A pre-quantized A carries per-token scales instead, and per-block ones are 2-D; both take the
+    # dynamic arms below. Block-scale weights have a dedicated static kernel, per-tensor ones read
+    # the same As on the tensor-wide arm.
+    static_act = As is not None and As.ndim <= 1 and As.numel() in (1, B.shape[0]) and A.dtype != FP8_DTYPE
+    if static_act:
+        assert Bs is not None and not is_mx(B, Bs), (
+            "a calibrated (static) activation scale is an FP8 form — MX activations carry a scale "
+            "per group, derived per call"
         )
+    if static_act and weight_block_size(B, Bs) is not None:
         out = w8a8_block_static_fp8_matmul_grouped(
             A,
             B,

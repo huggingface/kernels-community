@@ -59,7 +59,7 @@ class MoEProblem:
     swizzled: bool = False  # pre-swizzled (5D SWIZZLE_32_4_4) weight scales — the deployment layout
     input_globals: bool = False  # calibrated NVFP4 activation input_scale per projection
     expert_globals: bool = False  # the down's calibrated input_scale differs per expert
-    static: Optional[str] = None  # calibrated activation scale: shared | per_expert
+    static: bool = False  # calibrated (static) activation scale, one per expert
     post_expert_norm: Optional[str] = None  # a model's per-expert output norm, by name
 
     @property
@@ -81,7 +81,7 @@ class MoEProblem:
             f"{act}{fmt}{'_swizzled' if self.swizzled else ''}"
             f"{'_inputglobals' if self.input_globals else ''}"
             f"{'_expertglobals' if self.expert_globals else ''}"
-            f"{'_static_' + self.static if self.static else ''}"
+            f"{'_static' if self.static else ''}"
             f"{'_' + self.post_expert_norm if self.post_expert_norm else ''}"
             f"{'_sentinel' if self.sentinel_fraction > 0 else ''}"
         )
@@ -101,9 +101,12 @@ MOE_PROBLEMS = [
     MoEProblem(weights="fp8_128x128"),
     # calibrated (static) activation quant: the scales replace the runtime ones in both GEMMs of
     # both chains, and the intermediate stays bf16 — an epilogue requant has no calibrated scale
-    # to emit. ``num_top_k`` below ``num_experts`` so each expert calibrates on its own tokens.
-    MoEProblem(weights="fp8_128x128", num_tokens=64, num_top_k=2, static="shared"),
-    MoEProblem(weights="fp8_128x128", num_tokens=64, num_top_k=2, static="per_expert"),
+    # to emit. Each expert is its own quantized module, so each carries its own scale, and
+    # ``num_top_k`` stays below ``num_experts`` so each calibrates on its own tokens.
+    MoEProblem(weights="fp8_128x128", num_tokens=64, num_top_k=2, static=True),
+    # per-TENSOR weights under the same scheme: what Mistral-4 carries (qscheme_act="TENSOR",
+    # weight_block_size None, top-4). Ministral-3 is its dense counterpart, on the 2D op.
+    MoEProblem(weights="fp8_tensor", num_tokens=64, num_top_k=4, static=True),
     # block-FP8 with UE8M0 (power-of-two) scales — the whole-model UE8M0 contract: acts,
     # weights, and the fused intermediate requant all power-of-two (DeepSeek-V4 attn / B200).
     MoEProblem(weights="fp8_128x128_ue8m0", num_tokens=1),
@@ -252,8 +255,8 @@ def _input_globals(problem: MoEProblem, hidden):
 def _static_scales(problem: MoEProblem, hidden, gate_up, gate_up_s, top_k_index):
     """The calibrated activation scales, derived the way a calibration pass derives them: ``amax /
     448`` of what each GEMM actually sees — the routed hidden states for gate_up, the GLU
-    intermediate for down — per expert over the tokens routed to it, or reduced to the one value a
-    shared calibration keeps. ``None`` on a dynamic problem, which quantizes at runtime instead."""
+    intermediate for down — one per expert, each being its own quantized module, over the tokens
+    routed to it. ``None`` on a dynamic problem, which quantizes at runtime instead."""
     if not problem.static:
         return None, None
     weight = WEIGHTS[problem.weights]["dequant"](gate_up, gate_up_s).float()
@@ -269,8 +272,6 @@ def _static_scales(problem: MoEProblem, hidden, gate_up, gate_up_s, top_k_index)
         return (seen.abs() * routed[..., None]).amax(dim=(1, 2)).div(448.0).clamp(min=1e-12).float()
 
     scales = [calibrate(hidden.float().expand(problem.num_experts, -1, -1)), calibrate(inter)]
-    if problem.static == "shared":
-        scales = [scale.amax().reshape(1) for scale in scales]
     return tuple(scale.contiguous() for scale in scales)
 
 
