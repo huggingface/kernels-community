@@ -422,7 +422,7 @@ def _assert_dry_run_mode(comment, expected):
     proc = _run_dry(comment)
     assert proc.returncode == 0, proc.stderr
     assert f'"mode": "{expected}"' in proc.stdout
-    other = {"pr", "release"} - {expected}
+    other = {"pr", "stage", "release"} - {expected}
     assert all(f'"mode": "{m}"' not in proc.stdout for m in other)
 
 
@@ -434,8 +434,8 @@ def test_security_and_build_dispatches_pr_mode():
     _assert_dry_run_mode("/kernel-bot security-and-build relu", "pr")
 
 
-def test_build_and_stage_dispatches_release_mode():
-    _assert_dry_run_mode("/kernel-bot build-and-stage relu", "release")
+def test_build_and_stage_dispatches_stage_mode():
+    _assert_dry_run_mode("/kernel-bot build-and-stage relu", "stage")
 
 
 def test_release_dispatches_release_mode():

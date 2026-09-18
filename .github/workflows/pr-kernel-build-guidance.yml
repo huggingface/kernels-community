@@ -32,4 +32,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: python3 .github/scripts/pr_kernel_build_guidance.py
+        run: |
+          # Validate PR_NUMBER is numeric to prevent injection
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "Error: Invalid PR number"
+            exit 1
+          fi
+          python3 .github/scripts/pr_kernel_build_guidance.py

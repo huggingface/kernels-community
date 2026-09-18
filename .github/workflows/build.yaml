@@ -13,7 +13,7 @@ on:
         required: false
         type: string
       mode:
-        description: "Build mode: pr (CI only) or release (build + upload)"
+        description: "Build mode: pr (CI only), stage (build + upload + test), or release (build + upload)"
         required: false
         type: string
         default: "release"
@@ -331,9 +331,10 @@ jobs:
 
   # Build the ci-test derivation and export its Nix closure as an artifact
   # so the GPU test job can import it on a GPU-enabled runner.
+  # `stage` uploads like `release` but tests too, so the tests run post-upload.
   build-ci-test:
     needs: setup
-    if: needs.setup.outputs.skip == 'false' && inputs.mode == 'pr'
+    if: needs.setup.outputs.skip == 'false' && (inputs.mode == 'pr' || inputs.mode == 'stage')
     runs-on:
       group: aws-highmemory-32-plus-nix
     timeout-minutes: 600 # 10h
@@ -396,7 +397,7 @@ jobs:
   # Runs after both build-kernel and build-ci-test complete.
   test-kernel-gpu:
     needs: [setup, build-kernel, build-ci-test]
-    if: needs.setup.outputs.skip == 'false' && inputs.mode == 'pr'
+    if: needs.setup.outputs.skip == 'false' && (inputs.mode == 'pr' || inputs.mode == 'stage')
     runs-on:
       group: aws-g6-12xlarge-plus
     steps:

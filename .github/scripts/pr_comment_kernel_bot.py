@@ -980,29 +980,31 @@ def main(*, dry_run: bool = False):
             )
         return 1 if release_result.security_failed else 0
 
+    # `pr` tests without uploading, `release` uploads without testing, `stage` both.
     if command in ("build", "security-and-build"):
         target_branch = requested_branch or f"pr-{issue_number}"
         dispatch_pr_number = str(issue_number)
         dispatch_upload = False
         dispatch_repo_prefix = "kernels-community"
+        dispatch_mode = "pr"
     elif command == "build-and-stage":
         target_branch = requested_branch or f"pr-{issue_number}"
         dispatch_pr_number = str(issue_number)
         dispatch_upload = True
         dispatch_repo_prefix = "kernels-staging"
+        dispatch_mode = "stage"
     elif command == "release":
         target_branch = requested_branch or ""
         dispatch_pr_number = ""
         dispatch_upload = True
         dispatch_repo_prefix = "kernels-community"
+        dispatch_mode = "release"
     else:  # merge-and-upload
         target_branch = requested_branch or ""
         dispatch_pr_number = ""
         dispatch_upload = True
         dispatch_repo_prefix = "kernels-community"
-
-    # Commands that don't upload are PR-only.
-    dispatch_mode = "release" if dispatch_upload else "pr"
+        dispatch_mode = "release"
 
     mode_text = {
         "build": "build only",
