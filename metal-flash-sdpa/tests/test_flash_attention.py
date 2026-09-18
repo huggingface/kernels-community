@@ -478,3 +478,34 @@ def test_flash_attn_varlen_func():
     
     assert out_causal.shape == q.shape
     assert out_causal.abs().max().item() > 0
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Requires MPS")
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attention_after_mps_operation(causal):
+    torch.manual_seed(42)
+    q_cpu, k_cpu, v_cpu = [torch.randn(20, 4, 64, device="cpu") for _ in range(3)]
+    expected = []
+    for start, end in ((0, 8), (8, 20)):
+        expected.append(
+            torch.nn.functional.scaled_dot_product_attention(
+                q_cpu[start:end].sin().transpose(0, 1),
+                k_cpu[start:end].transpose(0, 1),
+                v_cpu[start:end].transpose(0, 1),
+                is_causal=causal,
+            ).transpose(0, 1)
+        )
+    expected = torch.cat(expected)
+
+    q, k, v = [tensor.to("mps") for tensor in (q_cpu, k_cpu, v_cpu)]
+    cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32, device="mps")
+    out = torch.empty_like(q)
+    torch.mps.synchronize()
+
+    # Leave PyTorch's compute encoder active immediately before the kernel.
+    q = q.sin()
+    metal_flash_sdpa.flash_attention_varlen(
+        out, q, k, v, cu_seqlens, cu_seqlens, 12, 12, causal, 64**-0.5, 1.0
+    )
+    torch.testing.assert_close(out.tanh().cpu(), expected.tanh(), atol=5e-4, rtol=5e-4)
