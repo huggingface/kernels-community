@@ -16,9 +16,8 @@ import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
-from torch.utils.weak import WeakTensorKeyDictionary
 
-from .compat import compile_time_only_triton_wrap, device_context
+from .compat import compile_time_only_triton_wrap, device_context, get_active_device_type
 
 
 @triton.jit
@@ -106,25 +105,6 @@ def swizzled_scale_descriptor(scale_u8: torch.Tensor) -> TensorDescriptor:
     )
 
 
-# Un-swizzled weight scales, keyed weakly on the swizzled artifact so the entry dies with the
-# checkpoint tensor. Weights are constants, so the (torch-level, per-expert) un-swizzle runs once
-# per layer and is amortized over every forward; see ``prefer_affine_mx_scales``.
-_UNSWIZZLED_MX_SCALES = WeakTensorKeyDictionary()
-
-
-def unswizzle_mx_scales_cached(
-    swizzled: torch.Tensor, rows: int, cols: int, *, num_experts: int | None = None
-) -> torch.Tensor:
-    """``unswizzle_mx_scales`` memoized on the input tensor's identity. For weight scales only —
-    an activation scale is a fresh tensor every call and would only fill the cache."""
-    plain = _UNSWIZZLED_MX_SCALES.get(swizzled)
-    if plain is None:
-        plain = unswizzle_mx_scales(swizzled, rows, cols, num_experts=num_experts)
-        _UNSWIZZLED_MX_SCALES[swizzled] = plain
-    return plain
-
-
-
 def _swizzle_to_blocks(
     scale: torch.Tensor, gather_idx: torch.Tensor | None
 ) -> torch.Tensor:
@@ -178,6 +158,10 @@ def swizzle_mx_scales(
     ``(G, row_blocks, ceil(cols/4), 2, 256)`` artifact the ops read — ``G`` the expert count (1 for
     a matrix), so an expert stack shards/gathers on its leading dim. Bit-identical to CUTLASS's
     packer (verified)."""
+
+    # XPU returns ``scale`` untouched, so the ops take their row-major (affine) scale arms.
+    if get_active_device_type() == "xpu":
+        return scale
     assert gather_idx is None or gather_idx.shape[0] % 128 == 0, (
         f"gather_idx rows must be 128-padded, got {None if gather_idx is None else gather_idx.shape[0]}"
     )

@@ -228,26 +228,6 @@ def persistent_program_count(device_index: int) -> int:
     return n * 2 if get_active_device_type() == "xpu" else n
 
 
-@functools.cache
-def prefer_affine_mx_scales() -> bool:
-    """Whether the GROUPED MX GEMM should un-swizzle a pre-swizzled weight scale and read it
-    affine instead of taking the SWIZZLE_32_4_4 descriptor arm.
-
-    The swizzled arm is the tcgen05 fast path, but its layout pins the tile: BM == BN == 128
-    (``swizzled_scales_bm_pruner``) and BK a whole 4-group band, i.e. BK >= 128 for MX
-    (``swizzled_scale_config_pruner``). That corner is the tuner's ONLY option there, and on Xe
-    it is the wrong one -- a 128x128 tile at that BK already wants more operand staging than the
-    SLM has, where the CUDA parts the layout was designed for have substantially more. Measured
-    on Xe at BM=BN=128, prefill, with num_stages making no difference: BK 64 -> 128 costs 2.6x in
-    the grouped GEMMs and BK=256 costs 6x. Reading the scale affine gives BM/BN/BK back to the
-    tuner and is worth 2.77x on MXFP8 MoE prefill.
-
-    Decode is not affected: it goes through the batched kernel, whose scale leaf pointer-gathers
-    a sub-128 tile straight out of the swizzled buffer, so it keeps its small tiles (and the
-    swizzled layout is worth ~4% there). Only the grouped arm pays the pin."""
-    return get_active_device_type() == "xpu"
-
-
 
 def tl_dtype(dtype: torch.dtype) -> tl.dtype:
     """The ``tl`` dtype matching a torch dtype (``torch.bfloat16`` → ``tl.bfloat16``) — the

@@ -21,11 +21,11 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
-from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, get_active_device_type, persistent_program_count, prefer_affine_mx_scales, sm_count, tl_dtype
+from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, get_active_device_type, persistent_program_count, sm_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_grouped, swizzle_grouped_mx_scales
-from .swizzle import swizzled_scale_descriptor, unswizzle_mx_scales_cached
+from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import build_tile_layout, expand_gather_below_parity, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
 from .loading.tiles import (
@@ -1755,22 +1755,6 @@ def mx_dynamic_matmul_grouped(
     # (E4M3 = NVFP4 group-16, UE8M0 = MX group-32).
     swizzled_scales = Bs.ndim == 5
     scale_group = mx_scale_family(Bs, K)
-    # Backends where the swizzled arm's BM/BN/BK pin costs more than the layout saves read the
-    # scale affine instead: un-swizzle the artifact once (cached on the weight) and fall through
-    # as if the caller had passed row-major scales. One flag governs both operands, so the acts
-    # follow into the affine arm below -- which is why a caller-supplied 5D As (the fused down
-    # reading gate_up's swizzled requant output) has to keep the swizzled path. An expert stack
-    # un-swizzles per matrix, so it needs 128-row-aligned experts to split cleanly.
-    if (
-        swizzled_scales
-        and prefer_affine_mx_scales()
-        and n_rows % 128 == 0
-        and (As is None or As.ndim != 5)
-    ):
-        Bs = unswizzle_mx_scales_cached(
-            Bs, n_rows, K // scale_group, num_experts=num_experts
-        )
-        swizzled_scales = False
     if not swizzled_scales:
         assert Bs.shape == (num_experts, n_rows, K // scale_group), (
             f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {n_rows}, {K // scale_group})"
