@@ -1,12 +1,14 @@
 import random
 from typing import List, Tuple
 
-import paged_attention as ops
+import kernels
 import pytest
 import torch
-from paged_attention.platforms import current_platform
 
 from .utils import DEFAULT_OPCHECK_TEST_UTILS, opcheck
+
+ops = kernels.get_kernel("kernels-community/paged-attention", version=1)
+current_platform = ops.platforms.current_platform
 
 COPYING_DIRECTION = [("gpu", "cpu"), ("gpu", "gpu"), ("cpu", "gpu")]
 DTYPES = [torch.half, torch.bfloat16, torch.float]

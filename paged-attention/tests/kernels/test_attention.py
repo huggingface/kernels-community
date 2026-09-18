@@ -1,13 +1,15 @@
 import random
 from typing import List, Optional, Tuple
 
-import paged_attention as ops
+import kernels
 import pytest
 import torch
-from paged_attention.platforms import current_platform
 
 from .allclose_default import get_default_atol, get_default_rtol
 from .utils import get_max_shared_memory_bytes, opcheck
+
+ops = kernels.get_kernel("kernels-community/paged-attention", version=1)
+current_platform = ops.platforms.current_platform
 
 FLOAT32_BYTES = torch.finfo(torch.float).bits // 8
 # This will change depending on the compute capability.

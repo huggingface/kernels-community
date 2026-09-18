@@ -1,8 +1,11 @@
 from typing import List, Optional, Tuple, Union
 
-import paged_attention as ops
+import kernels
 import pytest
 import torch
+
+ops = kernels.get_kernel("kernels-community/paged-attention", version=1)
+current_platform = ops.platforms.current_platform
 
 
 @pytest.fixture()
@@ -40,8 +43,6 @@ def create_kv_caches_with_random(
         raise ValueError(
             f"Does not support key cache of type fp8 with head_size {head_size}"
         )
-    from paged_attention.platforms import current_platform
-
     current_platform.seed_everything(seed)
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
@@ -87,8 +88,6 @@ def create_kv_caches_with_random_flash(
     seed: int = 0,
     device: Optional[str] = "cuda",
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    from paged_attention.platforms import current_platform
-
     current_platform.seed_everything(seed)
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
