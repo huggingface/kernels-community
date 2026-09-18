@@ -22,7 +22,7 @@ the packed blocks of a quantized checkpoint rather than on a dense copy of its w
 import torch
 from kernels import get_kernel
 
-k = get_kernel("kernels-community/ggml-quantization", version=1)
+k = get_kernel("transformers-community/ggml-quantization", version=1)
 
 Q4_K = 12                          # ggml type id; `k.GEMV_TYPES` lists what this build covers
 out_features = in_features = 4096

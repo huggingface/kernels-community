@@ -15,7 +15,7 @@ license = "MIT"
 backends = ["metal"]
 
 [general.hub]
-repo-id = "kernels-community/topk"
+repo-id = "transformers-community/topk"
 
 [torch]
 src = [
