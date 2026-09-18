@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -8,6 +9,170 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 import pr_comment_kernel_bot as bot  # noqa: E402
+
+
+def write_build_toml(
+    root: Path,
+    kernel: str,
+    *,
+    repo_id: str,
+    version: int = 1,
+    branch: str | None = None,
+):
+    kernel_dir = root / kernel
+    kernel_dir.mkdir()
+    branch_line = f'branch = "{branch}"\n' if branch is not None else ""
+    (kernel_dir / "build.toml").write_text(
+        f"""[general]
+name = "{kernel}"
+version = {version}
+
+[general.hub]
+repo-id = "{repo_id}"
+{branch_line}"""
+    )
+
+
+def test_external_upload_target_uses_version_branch(tmp_path, monkeypatch):
+    write_build_toml(tmp_path, "example", repo_id="vendor/example", version=3)
+    monkeypatch.chdir(tmp_path)
+
+    target = bot.external_upload_target("example")
+
+    assert target == bot.ExternalUploadTarget("example", "vendor/example", "v3")
+
+
+def test_external_upload_target_prefers_requested_branch(tmp_path, monkeypatch):
+    write_build_toml(
+        tmp_path,
+        "example",
+        repo_id="vendor/example",
+        version=3,
+        branch="stable",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    target = bot.external_upload_target("example", requested_branch="candidate")
+
+    assert target == bot.ExternalUploadTarget("example", "vendor/example", "candidate")
+
+
+def test_external_upload_target_uses_configured_branch(tmp_path, monkeypatch):
+    write_build_toml(
+        tmp_path,
+        "example",
+        repo_id="vendor/example",
+        version=3,
+        branch="stable",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    target = bot.external_upload_target("example")
+
+    assert target == bot.ExternalUploadTarget("example", "vendor/example", "stable")
+
+
+def test_community_upload_does_not_need_branch_preflight(tmp_path, monkeypatch):
+    write_build_toml(
+        tmp_path, "example", repo_id="kernels-community/example", version=3
+    )
+    monkeypatch.chdir(tmp_path)
+
+    def unexpected_lookup(repo_id):
+        raise AssertionError(f"unexpected Hub lookup for {repo_id}")
+
+    assert (
+        bot.preflight_external_uploads(["example"], branch_lookup=unexpected_lookup)
+        == []
+    )
+
+
+def test_external_upload_preflight_accepts_existing_branch(tmp_path, monkeypatch):
+    write_build_toml(tmp_path, "example", repo_id="vendor/example", version=3)
+    monkeypatch.chdir(tmp_path)
+
+    assert (
+        bot.preflight_external_uploads(
+            ["example"], branch_lookup=lambda repo_id: {"main", "v3"}
+        )
+        == []
+    )
+
+
+def test_external_upload_preflight_rejects_missing_branch(tmp_path, monkeypatch):
+    write_build_toml(tmp_path, "example", repo_id="vendor/example", version=3)
+    monkeypatch.chdir(tmp_path)
+
+    failures = bot.preflight_external_uploads(
+        ["example"], branch_lookup=lambda repo_id: {"main", "v2"}
+    )
+
+    assert len(failures) == 1
+    assert "branch `v3` does not exist" in failures[0]
+    assert "`vendor/example`" in failures[0]
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_ref"),
+    [("release", "main"), ("merge-and-upload", "abc123")],
+)
+def test_upload_preflight_failure_stops_before_merge_and_dispatch(
+    monkeypatch, command, expected_ref
+):
+    monkeypatch.setattr(
+        bot,
+        "_resolve_context_from_env",
+        lambda: {
+            "token": "token",
+            "repository": "owner/repo",
+            "comment": f"/kernel-bot {command} example",
+            "comment_id": 7,
+            "issue_number": 42,
+            "default_branch": "main",
+            "commenter": "maintainer",
+        },
+    )
+    monkeypatch.setattr(bot, "try_post_issue_comment_reaction", lambda *a, **k: True)
+    monkeypatch.setattr(bot, "get_user_permission", lambda *a, **k: "admin")
+    monkeypatch.setattr(
+        bot,
+        "get_pull_request",
+        lambda *a, **k: {
+            "head": {"sha": "abc123"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+
+    checked = {}
+
+    def fail_preflight(kernels, **kwargs):
+        checked["kernels"] = kernels
+        checked.update(kwargs)
+        return ["missing external branch"]
+
+    monkeypatch.setattr(bot, "preflight_external_uploads", fail_preflight)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("merge or dispatch must not run after preflight failure")
+
+    monkeypatch.setattr(bot, "merge_pull_request", unexpected)
+    monkeypatch.setattr(bot, "dispatch", unexpected)
+    comments = []
+    monkeypatch.setattr(
+        bot,
+        "try_post_issue_comment",
+        lambda api_base, token, issue_number, message: comments.append(message),
+    )
+
+    assert bot.main() == 1
+    assert checked == {
+        "kernels": ["example"],
+        "requested_branch": None,
+        "ref": expected_ref,
+    }
+    assert len(comments) == 1
+    assert "no merge or build was started" in comments[0]
 
 
 def test_build_with_kernels():
