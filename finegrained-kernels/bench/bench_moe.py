@@ -334,7 +334,13 @@ if not (MOCK or REPLOT):
     triton_kernels_hub = get_kernel("kernels-community/gpt-oss-triton-kernels", version=1)
     _tfmx.triton_kernels_hub = triton_kernels_hub
 
-DEV = "cuda"
+DEV = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+# Only the device-visibility knob for the sharded runner is backend-specific; every other
+# accelerator call goes through torch.accelerator.
+DEV_MASK_ENV = {"cuda": "CUDA_VISIBLE_DEVICES", "xpu": "ZE_AFFINITY_MASK"}.get(DEV)
+if DEV_MASK_ENV is None:
+    raise RuntimeError(f"unsupported accelerator {DEV!r}; this benchmark needs cuda or xpu")
+ACCEL = torch.get_device_module(DEV)
 DECODE_TOKENS = 1
 PREFILL_TOKENS = 256 if SMOKE else 8192
 
@@ -344,6 +350,19 @@ PREFILL_TOKENS = 256 if SMOKE else 8192
 CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2"]
 
 MOE_PROBLEMS = {
+    # Scaled-down stand-in for the DeepSeek-V4 geometry (same recipe, /8 experts, /2 dims) so the
+    # MoE rows fit on a 32GB part: build() materializes the pre-quant weights in fp32, which needs
+    # ~16GB for a single E256 H4096 gate_up grid alone.
+    "small/DeepSeek-V4-shaped FP8 block-dyn W8A8 ue8m0 (E32 H2048 I1024 top6)": dict(
+        E=32, H=2048, I=1024, top_k=6, weights="fp8_128x128_ue8m0", activation_format=None,
+        baselines=("finegrained-fp8", "deepgemm"), fp8_block=[128, 128], block_size=(128, 128),
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "small/MiniMax-M3-shaped MXFP8 (E32 H2048 I1024 top4)": dict(
+        E=32, H=2048, I=1024, top_k=4, weights="mxfp8", activation_format=None,
+        baselines=("finegrained-fp8",), fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
+    ),
     "deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6)": dict(
         # config.json: fp8 e4m3, scale_fmt ue8m0, weight_block_size [128,128], dynamic acts.
         # Same expert geometry as the MXFP4 V4 row below — the difference is the deployed
@@ -394,6 +413,12 @@ MOE_PROBLEMS = {
 }
 # the same base-model roster, run as if dequantized to BF16 (one shape per model)
 BF16_PROBLEMS = {
+    "small/DeepSeek-V4-shaped BF16 (E32 H2048 I1024 top6)": dict(
+        E=32, H=2048, I=1024, top_k=6, weights="bf16", activation_format=None,
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
+        fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
     "deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6)": dict(
         E=256, H=4096, I=2048, top_k=6, weights="bf16", activation_format=None,
         baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
@@ -1090,7 +1115,7 @@ ARMS = {
 
 
 def _context_poisoned(tag, mode):
-    """Probe the CUDA context right after an arm ran. An async fault — e.g. an out-of-bounds
+    """Probe the accelerator context right after an arm ran. An async fault — e.g. an out-of-bounds
     write that lands in a neighbouring allocation — leaves the context poisoned WITHOUT failing
     the arm that caused it: that arm posts a normal latency and the NEXT arm dies instead. That
     is how one kernel silently blanked 10 cells and dropped a whole problem from a run, with the
@@ -1098,7 +1123,7 @@ def _context_poisoned(tag, mode):
     try:
         p = torch.empty(64, 64, device=DEV, dtype=torch.float32).normal_()
         float(p.sum())
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         return False
     except Exception as e:
         print(f"      !! CONTEXT POISONED by [{tag} {mode}]: {type(e).__name__}: "
@@ -1112,7 +1137,7 @@ def bench_modes(run, tag):
     res, out = {}, None
     try:
         out = run()
-        torch.cuda.synchronize()  # warm + tune before ANY timing/capture
+        torch.accelerator.synchronize()  # warm + tune before ANY timing/capture
         res["eager"] = do_bench(run, return_mode="min") * 1e3
         print(f"      {tag:14s} eager      {res['eager']:9.1f}us", flush=True)
     except Exception as e:
@@ -1129,7 +1154,7 @@ def bench_modes(run, tag):
     try:
         crun = torch.compile(run, mode="max-autotune", fullgraph=True)
         cout = crun()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         # Self-check the compiled graph against THIS arm's own eager output before timing it.
         # The cross-impl parity below is computed from eager only, so without this a compiled
         # graph that drops work (e.g. an out-param matmul DCE'd because its mutation isn't
@@ -1351,7 +1376,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
     print()
 
 
-device_name = "MOCK (random values)" if MOCK else torch.cuda.get_device_name(0)
+device_name = "MOCK (random values)" if MOCK else ACCEL.get_device_name(0)
 print(f"device: {device_name}  torch {torch.__version__}"
       f"{'  [SMOKE]' if SMOKE else ''}")
 print("finegrained-kernels = local build; baselines: finegrained-fp8 (upstream), DeepGEMM, "
@@ -1521,7 +1546,7 @@ elif GPUS > 1 and _SHARD is None and not MOCK:
     worker_flags = (["--smoke"] if SMOKE else []) + ([] if PRESWIZZLE else ["--no-preswizzle"])
     procs = [subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--gpus", "1", *worker_flags, *FILTERS],
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": devices[g] if devices else str(g),
+        env={**os.environ, DEV_MASK_ENV: devices[g] if devices else str(g),
              "BENCH_SHARD": f"{g}/{GPUS}"}) for g in range(GPUS)]
     nfail = sum(p.wait() != 0 for p in procs)
     missing = [g for g, sp in enumerate(shard_paths) if not os.path.exists(sp)]

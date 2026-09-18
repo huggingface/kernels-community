@@ -47,7 +47,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 from .grouped import matmul_grouped
 from .batched import GATE_UNSTACK_MAX_S, matmul_batched
 from .bayesian_autotuner import bayesian_autotune
-from .compat import MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, decode_pdl, device_context
+from .compat import MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, device_context, pdl_launch_kwargs
 from .formats import get_supported_act_fns, is_mx, is_mxfp4, weight_format
 from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
 from .quant import _launch_act_quant
@@ -179,8 +179,7 @@ def weighted_reduce(
             NUM_EXPERTS=num_experts,
             NORM=norm,
             SIMULATE_UNFUSED=simulate_unfused,
-            PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
     return reduced
 

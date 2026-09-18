@@ -17,7 +17,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from .compat import compile_time_only_triton_wrap, device_context
+from .compat import compile_time_only_triton_wrap, device_context, get_active_device_type
 
 
 @triton.jit
@@ -158,6 +158,10 @@ def swizzle_mx_scales(
     ``(G, row_blocks, ceil(cols/4), 2, 256)`` artifact the ops read — ``G`` the expert count (1 for
     a matrix), so an expert stack shards/gathers on its leading dim. Bit-identical to CUTLASS's
     packer (verified)."""
+
+    # XPU returns ``scale`` untouched, so the ops take their row-major (affine) scale arms.
+    if get_active_device_type() == "xpu":
+        return scale
     assert gather_idx is None or gather_idx.shape[0] % 128 == 0, (
         f"gather_idx rows must be 128-padded, got {None if gather_idx is None else gather_idx.shape[0]}"
     )
