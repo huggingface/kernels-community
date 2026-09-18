@@ -107,6 +107,9 @@ MOE_PROBLEMS = [
     # per-TENSOR weights under the same scheme: what Mistral-4 carries (qscheme_act="TENSOR",
     # weight_block_size None, top-4). Ministral-3 is its dense counterpart, on the 2D op.
     MoEProblem(weights="fp8_tensor", num_tokens=64, num_top_k=4, static=True),
+    # and at decode, where the batched op runs BLOCK_SIZE_M=1 and the tuner's swap arm reshapes
+    # the single token — the gate|up span doubles there, which the prefill cell above never sees
+    MoEProblem(weights="fp8_tensor", num_tokens=1, num_top_k=4, static=True),
     # block-FP8 with UE8M0 (power-of-two) scales — the whole-model UE8M0 contract: acts,
     # weights, and the fused intermediate requant all power-of-two (DeepSeek-V4 attn / B200).
     MoEProblem(weights="fp8_128x128_ue8m0", num_tokens=1),
