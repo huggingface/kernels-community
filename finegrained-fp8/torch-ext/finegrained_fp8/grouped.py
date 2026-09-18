@@ -129,13 +129,13 @@ def _grouped_tile_setup(
 
 
 @triton.jit
-def store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn):
+def store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn, N):
     """Output epilogue shared by the grouped kernels: cast the fp32 accumulator to
     ``C``'s dtype and store the tile at expert-sorted global rows ``offs_global_m`` ×
-    columns ``offs_bn``, masked to the expert's valid rows (``row_mask``)."""
+    columns ``offs_bn``, masked to the expert's valid rows and output width."""
     c = accumulator.to(C.dtype.element_ty)
     c_ptrs = C + stride_cm * offs_global_m[:, None] + stride_cn * offs_bn[None, :]
-    tl.store(c_ptrs, c, mask=row_mask[:, None])
+    tl.store(c_ptrs, c, mask=row_mask[:, None] & (offs_bn[None, :] < N))
 
 
 @triton.autotune(
@@ -220,7 +220,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
         bs_ptrs += stride_bs_k
 
-    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn)
+    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn, N)
 
 
 @bayesian_autotune(
@@ -287,26 +287,40 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     )
 
     a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    # Wrap the N tail in-bounds instead of masking the `b` load every K iteration
+    # (inert whenever BLOCK_SIZE_N divides N): the wrapped columns read real weight
+    # data whose contribution lands in accumulator columns that the store's N-mask
+    # discards. The loop below then carries only the pre-existing `row_mask` load,
+    # exactly as before this fix; the K-tail masks are peeled out of it.
     b_ptrs = (
         B
         + expert_id * stride_be
         + offs_k[:, None] * stride_bk
-        + offs_bn[None, :] * stride_bn
+        + (offs_bn % N)[None, :] * stride_bn
     )
 
     a_s = tl.load(As + offs_global_m * stride_as_m, mask=row_mask, other=0.0)
     b_s = tl.load(Bs + expert_id * stride_bs_e)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    # Full K tiles: loop body identical to the pre-tail-fix stock code.
+    for _ in range(0, K // BLOCK_SIZE_K):
         a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
         b = tl.load(b_ptrs)
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+    # Peeled K tail — runs only when BLOCK_SIZE_K does not divide K, so the K-tail
+    # masks stay out of the loop above. `a` must be masked to zero (its tail would
+    # read the next token's row); `b` likewise, with `other=0.0`.
+    if K % BLOCK_SIZE_K != 0:
+        k_tail = offs_k + (K // BLOCK_SIZE_K) * BLOCK_SIZE_K < K
+        a = tl.load(a_ptrs, mask=row_mask[:, None] & k_tail[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=k_tail[:, None], other=0.0)
+        accumulator += tl.dot(a, b)
     accumulator = accumulator * a_s[:, None] * b_s
 
-    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn)
+    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn, N)
 
 
 @bayesian_autotune(
@@ -390,21 +404,29 @@ def mxfp_dynamic_matmul_grouped_kernel(
     offs_sf = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K)
 
     a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    # Wrap the N tail in-bounds rather than masking `b`/`Bs` every K iteration: the
+    # fill value would have to suit both packed-uint8 (MXFP4) and fp8 (MXFP8)
+    # weights (`other=0` was rejected here as `cannot cast int32 to fp8e4nv`), and
+    # an in-loop mask taxes every aligned shape. The wrapped columns/rows read real
+    # in-bounds data whose contribution lands in accumulator columns the store's
+    # N-mask discards.
     b_ptrs = (
         B
         + expert_id * stride_be
+        + (offs_bn % N)[None, :] * stride_bn
         + offs_kb[:, None] * stride_bk
-        + offs_bn[None, :] * stride_bn
     )
     bs_ptrs = (
         Bs
         + expert_id * stride_bs_e
-        + offs_bn[:, None] * stride_bs_n
+        + (offs_bn % N)[:, None] * stride_bs_n
         + offs_sf[None, :] * stride_bs_k
     )
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    # Full K tiles: only the pre-existing `row_mask` activation mask, as before this
+    # fix; the K-tail bounds are peeled out below.
+    for _ in range(0, K // BLOCK_SIZE_K):
         a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
         a, a_scale = mxfp_act_quant_inline(
             a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
@@ -420,9 +442,44 @@ def mxfp_dynamic_matmul_grouped_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // VALUES_PER_BYTE) * stride_bk
         bs_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_K) * stride_bs_k
+    # Peeled K tail — only when BLOCK_SIZE_K does not divide K. `a` is masked to
+    # zero on the tail, so the clamped `b`/`Bs` reads (real in-bounds data, no
+    # typed `other=` needed) cannot contribute; the store's N-mask drops their
+    # wrapped-column products.
+    if K % BLOCK_SIZE_K != 0:
+        k_tail = offs_k + (K // BLOCK_SIZE_K) * BLOCK_SIZE_K < K
+        a_raw = tl.load(a_ptrs, mask=row_mask[:, None] & k_tail[None, :], other=0.0).to(tl.float32)
+        a, a_scale = mxfp_act_quant_inline(
+            a_raw, BLOCK_SIZE_M, BLOCK_SIZE_K, SCALE_GROUP_K
+        )
+        kb = tl.minimum(
+            offs_kb + (K // BLOCK_SIZE_K) * (BLOCK_SIZE_K // VALUES_PER_BYTE),
+            K // VALUES_PER_BYTE - 1,
+        )
+        b = tl.load(
+            B
+            + expert_id * stride_be
+            + (offs_bn % N)[None, :] * stride_bn
+            + kb[:, None] * stride_bk
+        )
+        sf = tl.minimum(
+            offs_sf + (K // BLOCK_SIZE_K) * (BLOCK_SIZE_K // SCALE_GROUP_K),
+            K // SCALE_GROUP_K - 1,
+        )
+        b_s = tl.load(
+            Bs
+            + expert_id * stride_bs_e
+            + (offs_bn % N)[:, None] * stride_bs_n
+            + sf[None, :] * stride_bs_k
+        ).to(tl.uint8)
+        if COMPUTE_MODE == "dot_scaled":
+            accumulator = mx_dot_scaled(
+                accumulator, a, a_scale, b, b_s, VALUES_PER_BYTE
+            )
+        else:  # dot
+            accumulator = mx_dot_rescale(accumulator, a, b, a_scale, b_s, VALUES_PER_BYTE)
 
-    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn)
-
+    store_tile(C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn, N)
 
 @triton_op(
     add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_grouped"), mutates_args=()
@@ -457,7 +514,11 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
         f"block_size must be [block_n, block_k], got {block_size}"
     )
     block_n, block_k = block_size[0], block_size[1]
-    # MoE expert dimensions must be block-aligned; non-aligned N/K is not supported.
+    # MoE expert dimensions must be block-aligned; non-aligned N/K is not
+    # supported: a partial N/K tile has no scale for its incomplete block, so a
+    # load/store mask would hide the missing-scale error, not fix it — assert
+    # instead (the kernel pins BLOCK_SIZE_N/K to the block size, so the store's
+    # N-mask is inert here).
     assert N % block_n == 0, f"N ({N}) must be divisible by block_n ({block_n})"
     assert K % block_k == 0, f"K ({K}) must be divisible by block_k ({block_k})"
     assert Bs.ndim == 3, (
