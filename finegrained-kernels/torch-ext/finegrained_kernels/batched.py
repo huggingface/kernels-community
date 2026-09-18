@@ -1834,11 +1834,8 @@ def matmul_batched(
         "output_global_scale is the NVFP4 requant second level — it requires quantize_output=True on NVFP4 "
         "(the epilogue would otherwise normalize by it with nothing downstream to compensate)"
     )
-    # static (calibrated) activation quant: the caller hands raw A and As IS the scale — one value,
-    # or one per expert for a MoE, which calibrates each expert separately. A pre-quantized A
-    # carries per-token scales instead, and per-block ones are 2-D; both take the dynamic arms
-    # below. Block-scale weights have a dedicated static kernel, per-tensor ones read the same As
-    # on the tensor-wide arm.
+    # a calibrated (static) scale on a raw A (see `tensor_wide_act_operands`): block-scale weights
+    # have a dedicated static kernel, per-tensor ones read the same As on the tensor-wide arm
     static_act = As is not None and As.ndim <= 1 and As.numel() in (1, B.shape[0]) and A.dtype != FP8_DTYPE
     if static_act:
         assert Bs is not None and not is_mx(B, Bs), (
