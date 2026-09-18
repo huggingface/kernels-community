@@ -19,7 +19,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
 from .formats import global_scale_stride, is_per_expert_global
-from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_op, compile_time_only_triton_wrap, decode_pdl, device_context, is_sm10x, pdl_launch_kwargs
+from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, is_sm10x, pdl_launch_kwargs
 from .swizzle import swizzle_store_block
 from .scheduling import build_tile_layout, resolve_tile_inline
 
@@ -592,7 +592,6 @@ def mx_act_quant_grouped(
             SWIZZLED=swizzled,
             GROUPED=True,
             NUM_EXPERTS_POW2=E,
-            PDL=decode_pdl(),
             **pdl_launch_kwargs(),
         )
     return y, scales, n_m_tiles
@@ -818,7 +817,6 @@ def _launch_act_quant(
             # drops constexprs left to their default, and the arity mismatch that produces kills
             # the whole torch.compile launch ("launcher() missing 1 required positional argument")
             NUM_EXPERTS_POW2=1,
-            PDL=decode_pdl(),
             **pdl_launch_kwargs(),
         )
     return (values.view(torch.int8) if packed else values), scales
@@ -895,7 +893,6 @@ def fp8_act_quant_block_dynamic(
         compile_time_only_triton_wrap(_fp8_act_quant_block_dynamic_kernel)[grid](
             x, y, s, x.stride(0), x.stride(1), T, T.bit_length(),
             K=K, BLOCK_K=block_k, UE8M0=use_ue8m0,
-            PDL=decode_pdl(),
             **pdl_launch_kwargs(),
         )
     return y, s
@@ -946,7 +943,6 @@ def fp8_act_quant_tensor_wide(
             s,
             BLOCK_SIZE=block_size,
             PADDED_BLOCK=triton.next_power_of_2(block_size),
-            PDL=decode_pdl(),
             **pdl_launch_kwargs(),
         )
 

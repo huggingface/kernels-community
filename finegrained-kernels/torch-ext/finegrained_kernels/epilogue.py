@@ -17,7 +17,7 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
-from .compat import compile_time_only_triton_wrap, decode_pdl, device_context, pdl_launch_kwargs
+from .compat import compile_time_only_triton_wrap, device_context, pdl_launch_kwargs
 from .mma import MMA_N_ATOM
 from .quant import fp8_act_quant_inline, mx_act_quant_inline
 from .loading.scales import apply_global_scale
@@ -362,7 +362,6 @@ def fused_glu(
                 compile_time_only_triton_wrap(_glu_kernel)[(triton.cdiv(n, 1024),)](
                     gate_up, q, sc, n, inter_dim, "silu", None, None, BLOCK=1024,
                     QUANT_GROUP=quant_group, UE8M0=use_ue8m0,
-                    PDL=decode_pdl(),
                     **pdl_launch_kwargs(),
                 )
             return q, sc
@@ -377,7 +376,6 @@ def fused_glu(
         with device_context(gate_up.device):
             compile_time_only_triton_wrap(_glu_kernel)[(triton.cdiv(n, 1024),)](
                 gate_up, out, None, n, inter_dim, act_fn, swiglu_alpha, swiglu_limit, BLOCK=1024,
-                PDL=decode_pdl(),
                 **pdl_launch_kwargs(),
             )
         return out

@@ -44,12 +44,8 @@ def decode_pdl() -> bool:
 
 
 def pdl_launch_kwargs() -> dict:
-    """``launch_pdl=`` as launch kwargs, or nothing on backends that do not know the option.
-
-    The value is not the issue — Triton rejects the *keyword* it does not recognise
-    (``KeyError: Keyword argument launch_pdl was specified but unrecognised``), which fails every
-    autotune config on the XPU backend. So the kwarg has to be absent, not False."""
-    return {"launch_pdl": True} if decode_pdl() else {}
+    """Only works on CUDA, and not under torch.compile (Dynamo cannot read the inline asm)."""
+    return {"PDL": True, "launch_pdl": True} if decode_pdl() else {"PDL": False}
 
 # kernel-builder generates ``_ops.py`` into the built variant (the op namespace carries the build's
 # unique id) and refuses to build over a tracked one, so the source tree has none: an unbuilt
