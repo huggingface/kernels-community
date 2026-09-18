@@ -40,7 +40,7 @@ def decode_pdl() -> bool:
     (extra copies, no fusion). Deployment decode runs eager launches under cudagraphs, where PDL
     applies. ``griddepcontrol`` is an NVIDIA primitive, so every other backend reads False and the
     ``gdc_*`` intrinsics stay behind their ``PDL`` constexpr."""
-    return DECODE_PDL and get_active_device_type() == "cuda" and not torch.compiler.is_compiling()
+    return DECODE_PDL and not torch.compiler.is_compiling() and get_active_device_type() == "cuda"
 
 
 def pdl_launch_kwargs() -> dict:
