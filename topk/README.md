@@ -24,7 +24,7 @@ costs no cast.
 import torch
 from kernels import get_kernel
 
-topk = get_kernel("kernels-community/topk", version=1)
+topk = get_kernel("transformers-community/topk", version=1)
 
 logits = torch.randn(1, 256, device="mps")          # one row of router logits
 

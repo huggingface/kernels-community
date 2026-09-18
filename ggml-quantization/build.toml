@@ -15,7 +15,7 @@ license = "MIT"
 backends = ["metal"]
 
 [general.hub]
-repo-id = "kernels-community/ggml-quantization"
+repo-id = "transformers-community/ggml-quantization"
 
 [torch]
 src = [

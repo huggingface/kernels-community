@@ -13,11 +13,9 @@ license = "MIT"
 # has it, and `vendor/` still carries ggml's cuda sources.
 backends = ["metal"]
 
-# Where `nix run .#build-and-upload` publishes the built variants. A personal repo while the package is
-# unreleased; `kernels-community/ggml-attn` is what `transformers` recognises, so moving it there is a
-# rename here plus a re-upload.
+# Where `nix run .#build-and-upload` publishes the built variants.
 [general.hub]
-repo-id = "kernels-community/ggml-attn"
+repo-id = "transformers-community/ggml-attn"
 
 [torch]
 src = [
