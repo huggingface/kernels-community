@@ -21,7 +21,7 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
-from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, prefer_affine_mx_scales, sm_count, tl_dtype
+from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, get_active_device_type, persistent_program_count, prefer_affine_mx_scales, sm_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_grouped, swizzle_grouped_mx_scales
@@ -1138,6 +1138,9 @@ def full_precision_matmul_grouped_kernel(
     # descriptor and run the swapped (weights-in-M) loop; "pointer" is the natural loop.
     B_MEMORY_MODE: tl.constexpr = "pointer",
     A_MEMORY_MODE: tl.constexpr = "pointer",
+    # XPU: address both operand tiles as block pointers so the backend can emit 2D block loads,
+    # the only loads that keep DPAS fed (the launcher owns the gate). Always False on CUDA
+    BLOCK_PTR: tl.constexpr = False,
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM). No requant arm: the
     # full-precision chain has no quantized intermediate — down consumes the GLU output as is.
     GATE: tl.constexpr = False,
@@ -1207,18 +1210,56 @@ def full_precision_matmul_grouped_kernel(
         )
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
-        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-            a, _as = load_act_plain(
-                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
-                A_MEMORY_MODE, GatherIdx is not None,
+        # A descriptor operand loads through its own box, so this arm needs BOTH operands on
+        # the pointer arm; otherwise it folds off and the affine loop below is what compiles.
+        BLOCK_PTR_ARM: tl.constexpr = (
+            BLOCK_PTR and A_MEMORY_MODE == "pointer" and B_MEMORY_MODE == "pointer"
+        )
+        if BLOCK_PTR_ARM:
+            # No gather here (the launcher's precondition), so the rows are the contiguous span
+            # [m_start, m_start + BM) and A has a real 2D extent. boundary_check zero-fills the
+            # tail past S/K like the affine arm's mask; rows outside the expert are dropped by
+            # the epilogue's row_mask, as on the descriptor arm.
+            a_blk = tl.make_block_ptr(
+                base=A,
+                shape=(S, K),
+                strides=(stride_a_m, stride_a_k),
+                offsets=(m_start, 0),
+                block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+                order=(1, 0),  # K is the contiguous dim of (S, K)
             )
-            w, _ws = load_weight_plain(
-                b_ptrs, BDescriptor, row0, n_off, k * BLOCK_SIZE_K,
-                GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            # The (E, N, K) slab is K-contiguous, so the tile is described in the slab's OWN
+            # axes as a row-major (BN, BK) box and transposed in registers. This orientation is
+            # the whole win: the Xe 2D block load only reaches rate when the innermost described
+            # axis is unit-stride, and a (K, N) view -- what the pointer arm effectively does --
+            # falls off it. Measured dense, bit-identical: 59.9 -> 133.7 TFLOP/s.
+            b_blk = tl.make_block_ptr(
+                base=B + expert_id64 * stride_b_e,
+                shape=((2 * N) if GATE else N, K),
+                strides=(stride_b_n, stride_b_k),
+                offsets=(n_off, 0),
+                block_shape=((2 if GATE else 1) * BLOCK_SIZE_N, BLOCK_SIZE_K),
+                order=(1, 0),
             )
-            acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
-            a_ptrs += BLOCK_SIZE_K * stride_a_k
-            b_ptrs += BLOCK_SIZE_K * stride_b_k
+            for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+                a = tl.load(a_blk, boundary_check=(0, 1))
+                w = tl.trans(tl.load(b_blk, boundary_check=(0, 1)))
+                acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
+                a_blk = tl.advance(a_blk, (0, BLOCK_SIZE_K))
+                b_blk = tl.advance(b_blk, (0, BLOCK_SIZE_K))
+        else:
+            for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+                a, _as = load_act_plain(
+                    a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
+                    A_MEMORY_MODE, GatherIdx is not None,
+                )
+                w, _ws = load_weight_plain(
+                    b_ptrs, BDescriptor, row0, n_off, k * BLOCK_SIZE_K,
+                    GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+                )
+                acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
+                a_ptrs += BLOCK_SIZE_K * stride_a_k
+                b_ptrs += BLOCK_SIZE_K * stride_b_k
 
         gemm_epilogue(
             C,
@@ -2059,6 +2100,9 @@ def full_precision_matmul_grouped(
             tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
             NUM_SMS=num_sms,
+            # XPU only: block-pointer operands let the backend emit the 2D block loads that keep
+            # DPAS fed; CUDA stays on the pointer arm
+            BLOCK_PTR=get_active_device_type() == "xpu" and gather_idx is None,
             GATE=gate,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
