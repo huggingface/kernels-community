@@ -15,7 +15,7 @@
 import torch
 import triton
 
-from .compat import get_active_device_type, is_sm10x, is_sm90, sm_count, sm_shared_memory_limit
+from .compat import FP8_DTYPE, get_active_device_type, is_sm10x, is_sm90, sm_count, sm_shared_memory_limit
 from .mma import MMA_N_ATOM_WIDTH
 
 # ── config pruners ────────────────────────────────────────────────────────────
@@ -714,49 +714,65 @@ def packed_schedule_scope_pruner(min_bm: int = 128):
     return config_filter(ok)
 
 
-def weight_only_warp_spec_matched_mode_pruner():
-    """``early_config_prune`` for the weight-only grouped kernel's WARP_SPEC lowering wall
-    (Triton 3.7.1 ``TritonGPUOptimizePartitionWarps`` -> PassManager::run failed; the pass
-    cannot partition this loop when BOTH operand loads share a memory mode). Charted
-    2026-08-26 (48-cell forced-config matrix, BM 64 and 128 IDENTICAL — BM-independent):
+# Pointer/pointer warp counts that trap on the WEIGHT-ONLY kernel under Triton < 3.8. Charted
+# 2026-08-26 and REPRODUCED on 3.7.1 by the 2026-09-17 two-version sweep, so these rows are real
+# measurements of that compiler, not the mis-chart the descriptor rows turned out to be. Triton
+# 3.8 fixes every one of them, which is why `warp_spec_memory_mode_pruner` only consults the
+# table below that version.
+_WEIGHT_ONLY_POINTER_TRAPS = {
+    ("dot", "pointer"): {16},
+    ("dot_scaled", "pointer"): {4, 8, 16},
+}
 
-        CM          A/B modes   w4    w8    w16
-        dot         ptr/ptr     ok    ok    FAIL
-        dot         desc/desc   ok    ok    ok      (was charted FAIL/FAIL — refuted, see _TRAPPING_NUM_WARPS)
-        dot_scaled  ptr/ptr     FAIL  FAIL  FAIL
-        dot_scaled  desc/desc   ok    ok    ok      (w8 was charted FAIL — refuted)
-        MIXED modes (ptr/desc, desc/ptr): 24/24 ok at every warp count.
-        BN=32 + WS: FAIL in every cell (the tile law, fenced here).
 
-    The non-monotone warp dependence (w16 rescues desc/desc dot but breaks ptr/ptr dot) marks
-    this as the pass's internal partition feasibility, not kernel source — the source is
-    identical across passing and failing cells. Two root-cause attempts on the sibling family
-    are refuted and recorded (block_dynamic_grouped_matmul_pruner); the kernel-side remedy is
-    to stop emitting configs the pass cannot lower. Cost in the wild: 19 dead compiles per
-    weight-only tune, and under inductor ONE failing config kills the whole torch.compile
-    cell instead of scoring inf — this fence is what recovers those cells."""
+def _warp_spec_needs_descriptor_tile() -> bool:
+    """Triton >= 3.8, where a TMA-descriptor operand narrows WS to one tile (see the pruner)."""
+    return tuple(int(n) for n in triton.__version__.split(".")[:2]) >= (3, 8)
 
-    # desc/desc rows REMOVED 2026-08-29: forced through the tuner's own Config objects (pre_hook
-    # intact) at the charted GPT-OSS shape, (dot, desc/desc) w4 AND w8 and (dot_scaled, desc/desc) w8
-    # all compile and run bit-identical — dot+WS+BK=128 is the gate_up's best config (2128 vs 2235us).
-    # The original matrix was charted with hand-built Configs, which skip the descriptor pre_hooks
-    # and fail every descriptor cell for the wrong reason. The pointer rows stand unrefuted.
-    _TRAPPING_NUM_WARPS = {
-        ("dot", "pointer"): {16},
-        ("dot_scaled", "pointer"): {4, 8, 16},
-    }
+
+def warp_spec_memory_mode_pruner(weight_only: bool = False):
+    """``early_config_prune`` dropping ``warp_specialize`` configs the WS passes cannot lower
+    (``TritonGPUOptimizePartitionWarps`` / ``RelayoutTritonGPU`` -> ``PassManager::run failed``).
+
+    The rule is COMPILER-DEPENDENT, and the two versions are near mirror images. Charted
+    2026-09-17 on B200 by filtering each kernel's OWN tuner configs (never hand-built — that skips
+    the descriptor pre_hooks and fails every descriptor cell for the wrong reason), BN held at 128,
+    BM and ``num_warps`` both axes, gpt-oss 2048x2048, on three kernels across two families:
+    grouped MX weight-only, grouped MX dynamic, and block-dynamic FP8.
+
+        operands          triton 3.8.0              triton 3.7.1
+        pointer/pointer   every warp count and BM   mostly FAILS (see the table above)
+        desc/desc         ONLY w4 AND BM == 128     most cells lower; w2 never does
+        mixed             identical to desc/desc    identical to desc/desc
+
+    Cell for cell across all three kernels, 3.8 rescues NO descriptor cell that 3.7.1 lowered
+    (0 of 96) and 3.7.1 rescues NO pointer cell that 3.8 lowered (0 of 80): descriptor+WS
+    REGRESSED in 3.8 and pointer+WS was FIXED. So each version gets the rule its own sweep
+    measured, rather than an intersection that would fence off a whole memory mode on both.
+
+    ``weight_only`` adds the rows that kernel charted for itself and the sweep did not re-probe:
+    ``BN == 32`` with WS, which failed 9/9 cells there, and (below 3.8) its trapping
+    pointer/pointer warp counts.
+
+    NOT covered here, deliberately: ``mx_dynamic``'s ``dot`` arm dies with a descriptor operand on
+    BOTH versions, and it is not a WS failure at all — it raises ``descriptor gather of uint8 must
+    have at least 32 columns, but got 16`` with ``warp_specialize`` on AND off. That is a gather
+    width law and belongs wherever gather width is decided."""
 
     def ok(c, args):
         if not c.kwargs.get("WARP_SPEC"):
             return True
-        # BN=32 + WS fails to lower in every memory mode / warp count / compute mode probed
-        # (9/9 cells, GPT-OSS N=K=2880, 2026-08-29) — the tile law the matrix never encoded
-        if config_dim(c, args, "BLOCK_SIZE_N") == 32:
+        if weight_only and config_dim(c, args, "BLOCK_SIZE_N") == 32:
             return False
         a, b = c.kwargs.get("A_MEMORY_MODE"), c.kwargs.get("B_MEMORY_MODE")
-        if a != b:  # mixed modes lower everywhere
+        descriptor = a != "pointer" or b != "pointer"
+        if _warp_spec_needs_descriptor_tile():
+            # 3.8: one surviving descriptor cell, and pointer/pointer is wide open
+            return not descriptor or (c.num_warps == 4 and config_dim(c, args, "BLOCK_SIZE_M") == 128)
+        if descriptor:
             return True
-        return c.num_warps not in _TRAPPING_NUM_WARPS.get((c.kwargs.get("COMPUTE_MODE"), a), set())
+        traps = _WEIGHT_ONLY_POINTER_TRAPS if weight_only else {}
+        return c.num_warps not in traps.get((c.kwargs.get("COMPUTE_MODE"), a), set())
 
     return config_filter(ok, when=lambda args: is_sm10x())
 
@@ -772,6 +788,23 @@ def weight_only_swap_scope_pruner():
 
     def ok(c, args):
         return bool(c.kwargs.get("SWAP_AB")) == (c.kwargs.get("COMPUTE_MODE") == "scalar")
+
+    return config_filter(ok)
+
+
+def raw_activation_pointer_pruner():
+    """``early_config_prune`` keeping a RAW activation on the pointer arm. A calibrated scale
+    held per expert leaves ``A`` unquantized for the kernel to quantize per tile (a gathered row
+    serves several experts, so there is no single pre-quantized form), and a raw tile cannot ride
+    the TMA gather: ``async_tma_gather`` wants at least 4 contiguous elements per thread and the
+    lowering fails outright, which at a deployment shape left the tuner no config at all. A
+    pre-quantized ``A`` is unaffected and keeps every memory mode."""
+
+    def ok(c, args):
+        a = args.get("A")
+        if getattr(a, "dtype", None) == FP8_DTYPE or args.get("As") is None:
+            return True
+        return c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
 
     return config_filter(ok)
 
@@ -804,6 +837,14 @@ def mx_2d_swap_scope_pruner(max_m: int = 16):
             config_dim(c, args, "BLOCK_SIZE_M") == 1
             and getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn
             and args["M"] <= max_m
+            # An A-side TMA descriptor under SWAP_AB traps the device on Triton 3.8 — a sticky
+            # misaligned address, after which every later launch reports it wherever it came
+            # from. Observed on B200 in a GLM-5.2-NVFP4 forward (16 tokens; clean at 4) at
+            # dot_scaled, BM=1, BN ∈ {128, 256}, BK ∈ {64, 128}: the tile WIDTH is not the
+            # variable (BN=128 traps too), the A descriptor is. Narrowed by probe — fencing the
+            # B side as well was NOT needed, so the weight descriptor stays available to the
+            # crown, and pointer-mode A keeps the decode arm this pruner exists for.
+            and c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
         )
 
     return config_filter(ok)

@@ -40,6 +40,14 @@ def decode_pdl() -> bool:
     no fusion). Deployment decode runs eager launches under cudagraphs, where PDL applies."""
     return DECODE_PDL and not torch.compiler.is_compiling()
 
+# The scaled_grouped_mm scaling enums the torch MoE baseline hands its scale operands. Older
+# torch has neither them nor the op, and only that one baseline reads them, so a missing pair is
+# ``None`` here and the baseline refuses on it rather than the whole package failing to import.
+try:
+    from torch.nn.functional import ScalingType, SwizzleType
+except ImportError:
+    ScalingType = SwizzleType = None
+
 # kernel-builder generates ``_ops.py`` into the built variant (the op namespace carries the build's
 # unique id) and refuses to build over a tracked one, so the source tree has none: an unbuilt
 # checkout (tests, bench, FINEGRAINED_KERNELS_PATH) registers its ops under the plain package name.

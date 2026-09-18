@@ -930,6 +930,34 @@ def _fp8_act_quant_kernel(
 @compile_time_only_triton_op(
     add_op_namespace_prefix("fp8_act_quant_tensor_wide"), mutates_args=(), opaque=True
 )
+def tensor_wide_act_operands(
+    A: torch.Tensor, As: torch.Tensor | None, num_experts: int | None = None
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Activation operands of the tensor-scale FP8 arms: ``(A, As, stride_m, stride_e)``.
+
+    No ``As`` derives one scale per row here; a pre-quantized (E4M3) ``A`` brings its own. An
+    ``As`` on a raw ``A`` is the CALIBRATED (static) scale that replaces them: one value, which
+    ``A`` quantizes against here so every row reads the one entry, or — where the op routes —
+    one per expert, which stays raw for the kernel to quantize each tile against its own expert,
+    the form a gathered row has no host equivalent for (one row, several experts, one scale
+    each). ``num_experts`` ``None`` on the 2D op, whose rows belong to no expert.
+    """
+    if As is None:
+        A, As = fp8_act_quant_tensor_wide(A, A.shape[-1])
+        As = As.reshape(-1)
+        return A, As, As.stride(0), 0
+    if A.dtype == FP8_DTYPE:
+        return A, As, As.stride(0), 0
+    As = As.reshape(-1).float()
+    assert As.numel() in (1, num_experts), (
+        f"a calibrated activation scale is one value, or one per expert where the op routes; "
+        f"got {As.numel()}"
+    )
+    if As.numel() == 1:
+        return (A.float() / As).to(FP8_DTYPE), As, 0, 0
+    return A, As, 0, 1
+
+
 def fp8_act_quant_tensor_wide(
     x: torch.Tensor, block_size: int = 128
 ) -> tuple[torch.Tensor, torch.Tensor]:

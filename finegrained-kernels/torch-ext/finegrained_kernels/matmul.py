@@ -25,7 +25,7 @@ from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, NIBBLES_PER_BY
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_weight_only_descriptors
 from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
-from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant
+from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, tensor_wide_act_operands
 from .loading.scales import apply_global_scale, mx_2d_scale_ptrs
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .loading.tiles import (
@@ -299,7 +299,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
 @triton.jit
 def w8a8_tensor_dynamic_fp8_matmul_kernel(
     A,  # (M, K) pre-quantized FP8 activations
-    As,  # (M,) per-token activation scales
+    As,  # (M,) per-token activation scales, or one calibrated (static) scale (stride_as_m 0)
     B,  # (N, K) FP8 weights
     Bs,  # scalar/(1,) per-tensor weight scale
     C,  # (M, N) output
@@ -1252,6 +1252,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
+    As: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
     gate: bool = False,
     act_fn: str = "silu",
@@ -1263,9 +1264,12 @@ def w8a8_tensor_dynamic_fp8_matmul(
     """Tensor-scale FP8 matmul: ``C = A @ B.T``; activations quantized offline per row.
 
     A:  (..., K) raw activations, bf16/fp16/fp32 (flattened to (M, K)
-        internally) — per-row scales computed via ``fp8_act_quant_tensor_wide(A, K)``.
+        internally) — per-row scales computed via ``fp8_act_quant_tensor_wide(A, K)``, or
+        quantized against ``As`` when a calibrated (static) one is given.
     B:  (N, K) FP8 weights — under ``gate`` the ``(2N, K)`` gate|up stack (one per-tensor scale).
     Bs: scalar, (1,), or (1, 1) — single tensor-scale weight scale.
+    As: the calibrated (static) activation scale, one value for the whole matmul; ``None``
+        derives one per row from the data.
 
     ``gate`` fuses the gate|up projection into one stacked GEMM + SwiGLU, returning the
     ``[..., N]`` GLU intermediate. Returns a one-element list (mirrors the MX/grouped op).
@@ -1279,9 +1283,8 @@ def w8a8_tensor_dynamic_fp8_matmul(
 
     assert Bs.numel() == 1, f"Bs must be scalar or (1,), got {tuple(Bs.shape)}"
 
-    # Per-row scalar activation scale (one per token).
-    qA, As = fp8_act_quant_tensor_wide(A, K)
-    As = As.reshape(M)
+    # one scale per row (derived here), or the calibrated one every row reads (stride 0)
+    qA, As, as_stride_m, _ = tensor_wide_act_operands(A, As)
     Bs = Bs.reshape(1)
 
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
@@ -1307,7 +1310,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
             int(M).bit_length(),  # m_bit_length key bucket
             qA.stride(-2),
             qA.stride(-1),
-            As.stride(0),
+            as_stride_m,
             B.stride(1),
             B.stride(0),
             C.stride(-2),
@@ -1950,10 +1953,9 @@ def matmul_2d(
         block_n = B.shape[0] // Bs.shape[0] if B.shape[0] % Bs.shape[0] == 0 else block_k
         block_size = [block_n, block_k]
     if block_size is None:  # tensor-wide (per-tensor) scale
-        assert As is None, "tensor-wide FP8 quantizes A dynamically — no As"
         return _unwrap(
             w8a8_tensor_dynamic_fp8_matmul(
-                A, B, Bs, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, bias=bias)
+                A, B, Bs, As, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, bias=bias)
         )
     # Block-wise FP8: a per-tensor scalar As is the static (calibrated) activation scale; else dynamic.
     if As is not None:

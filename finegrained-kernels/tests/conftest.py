@@ -23,6 +23,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "torch-ext"))
 
+# Under test, a config the tuner cannot compile or run is a PRUNER GAP, not something to
+# tolerate: forgiving it leaves the suite green while the arm silently drops out of the search
+# (how a descriptor arm that could not lower, and a swapped gate tile that could not type-check,
+# both stayed invisible until a bench came back with empty cells). 0 aborts the tune on the
+# first reject so a test reports it. Deployment keeps the default, where forgiveness is what
+# lets a crowned config survive one unrelated bad neighbour.
+os.environ.setdefault("FINEGRAINED_AUTOTUNE_MAX_FAILURES", "0")
+
 
 def _visible_gpu_pool() -> list[str]:
     """The GPU ids this run may use: an explicit ``CUDA_VISIBLE_DEVICES`` restriction if
