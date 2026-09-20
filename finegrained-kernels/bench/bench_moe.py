@@ -334,13 +334,13 @@ if not (MOCK or REPLOT):
     triton_kernels_hub = get_kernel("kernels-community/gpt-oss-triton-kernels", version=1)
     _tfmx.triton_kernels_hub = triton_kernels_hub
 
-DEV = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+DEVICE = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+if DEVICE not in ("cuda", "xpu"):
+    raise RuntimeError(f"unsupported accelerator {DEVICE!r}; this benchmark needs cuda or xpu")
 # Only the device-visibility knob for the sharded runner is backend-specific; every other
 # accelerator call goes through torch.accelerator.
-DEV_MASK_ENV = {"cuda": "CUDA_VISIBLE_DEVICES", "xpu": "ZE_AFFINITY_MASK"}.get(DEV)
-if DEV_MASK_ENV is None:
-    raise RuntimeError(f"unsupported accelerator {DEV!r}; this benchmark needs cuda or xpu")
-ACCEL = torch.get_device_module(DEV)
+DEVICE_MASK_ENV = {"cuda": "CUDA_VISIBLE_DEVICES", "xpu": "ZE_AFFINITY_MASK"}[DEVICE]
+ACCELERATOR = torch.get_device_module(DEVICE)
 DECODE_TOKENS = 1
 PREFILL_TOKENS = 256 if SMOKE else 8192
 
@@ -542,7 +542,7 @@ def build(cfg):
     E, H, inter = cfg["E"], cfg["H"], cfg["I"]
     if cfg["weights"] == "fp8_128x128_ue8m0":
         def make(n, k, e):
-            return (*make_weights(n, k, DEV, [128, 128],
+            return (*make_weights(n, k, DEVICE, [128, 128],
                                   scale_dtype=torch.float8_e8m0fnu, num_experts=e), None)
     else:
         make = WEIGHTS[cfg["weights"]]["make"]
@@ -556,8 +556,8 @@ def build(cfg):
 
 def routing(cfg, tokens):
     torch.manual_seed(0)
-    hidden = torch.randn(tokens, cfg["H"], device=DEV, dtype=torch.bfloat16)
-    logits = torch.randn(tokens, cfg["E"], device=DEV)
+    hidden = torch.randn(tokens, cfg["H"], device=DEVICE, dtype=torch.bfloat16)
+    logits = torch.randn(tokens, cfg["E"], device=DEVICE)
     w, idx = torch.topk(torch.softmax(logits, -1), cfg["top_k"], dim=-1)
     return hidden, idx.to(torch.int32), w, logits
 
@@ -1011,7 +1011,7 @@ def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_
 
     experts = tfmx.Mxfp4GptOssExperts(
         SimpleNamespace(num_local_experts=E, intermediate_size=inter, hidden_size=H,
-                        swiglu_limit=cfg["swiglu_limit"] or 7.0)).to(DEV)
+                        swiglu_limit=cfg["swiglu_limit"] or 7.0)).to(DEVICE)
     # dequantize the SHARED mxfp4 weights to bf16 and re-quantize through their prep: the
     # values are already on the E2M1 grid, so the round-trip is exact and both impls run
     # bit-identical weights (drawing fresh randn here made parity meaningless).
@@ -1027,8 +1027,8 @@ def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_
         experts._parameters.pop(p, None)
     experts.gate_up_proj, experts.gate_up_proj_precision_config = prep(gu_bf16)
     experts.down_proj, experts.down_proj_precision_config = prep(dn_bf16)
-    experts.gate_up_proj_bias = torch.zeros(E, 2 * inter, device=DEV)
-    experts.down_proj_bias = torch.zeros(E, H, device=DEV)
+    experts.gate_up_proj_bias = torch.zeros(E, 2 * inter, device=DEVICE)
+    experts.down_proj_bias = torch.zeros(E, H, device=DEVICE)
     _mark_static(experts.gate_up_proj_bias, experts.down_proj_bias)
     # sm_first=True = softmax over ALL experts then top-k, matching the bench's routing().
     # Their default top-ks first then softmaxes over the k (weights sum to 1, the GPT-OSS
@@ -1121,7 +1121,7 @@ def _context_poisoned(tag, mode):
     is how one kernel silently blanked 10 cells and dropped a whole problem from a run, with the
     blame landing on an innocent baseline. One tiny launch per (arm, mode) buys the attribution."""
     try:
-        p = torch.empty(64, 64, device=DEV, dtype=torch.float32).normal_()
+        p = torch.empty(64, 64, device=DEVICE, dtype=torch.float32).normal_()
         float(p.sum())
         torch.accelerator.synchronize()
         return False
@@ -1251,7 +1251,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
     N, K, block = cfg["N"], cfg["K"], cfg["block"]
     W_g = None
     if cfg["weights"] == "fp8_128x128_ue8m0":
-        W, Ws = make_weights(N, K, DEV, [128, 128],
+        W, Ws = make_weights(N, K, DEVICE, [128, 128],
                              scale_dtype=torch.float8_e8m0fnu)
     else:
         # registry makers are expert-batched; build E=1 and index the slab off. NVFP4 returns a
@@ -1273,7 +1273,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
     # in the GPT-OSS MXFP4 format. Weight is a single (1, K, N) expert, swizzled once
     # at load (same as the fused arm); latency-only (its own weights).
     if "triton_kernels" in cfg["baselines"]:
-        tw_bf = torch.randn(1, K, N, device=DEV, dtype=torch.bfloat16) * 0.05
+        tw_bf = torch.randn(1, K, N, device=DEVICE, dtype=torch.bfloat16) * 0.05
         tw, tws = _tfmx.quantize_to_mxfp4(tw_bf, triton_kernels_hub)
         tw, tws = _tfmx.swizzle_mxfp4(tw, tws, triton_kernels_hub)
         tk_pc = triton_kernels_hub.matmul_ogs.PrecisionConfig(
@@ -1298,7 +1298,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
 
         nvfp4_row = cfg["weights"] == "nvfp4"
         FP4 = getattr(torch, "float4_e2m1fn_x2", None)
-        one = torch.ones(1, device=DEV, dtype=torch.float32)
+        one = torch.ones(1, device=DEVICE, dtype=torch.float32)
         if nvfp4_row:
             sb = [to_blocked(Ws.view(torch.uint8)).view(torch.float8_e4m3fn),
                   (W_g if W_g is not None else one).reshape(1)]
@@ -1327,7 +1327,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
     for regime, tokens in (("decode", DECODE_TOKENS), ("prefill", PREFILL_TOKENS)):
         print(f"   -- {regime}")
         torch.manual_seed(0)
-        x = torch.randn(tokens, K, device=DEV, dtype=torch.bfloat16)
+        x = torch.randn(tokens, K, device=DEVICE, dtype=torch.bfloat16)
         # act is inline-quantized (As=None); Ws is the weight scale (Bs); activation_format is the
         # activation precision (None follows the weight format).
         attn_arms = {
@@ -1376,7 +1376,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
     print()
 
 
-device_name = "MOCK (random values)" if MOCK else ACCEL.get_device_name(0)
+device_name = "MOCK (random values)" if MOCK else ACCELERATOR.get_device_name(0)
 print(f"device: {device_name}  torch {torch.__version__}"
       f"{'  [SMOKE]' if SMOKE else ''}")
 print("finegrained-kernels = local build; baselines: finegrained-fp8 (upstream), DeepGEMM, "
@@ -1546,7 +1546,7 @@ elif GPUS > 1 and _SHARD is None and not MOCK:
     worker_flags = (["--smoke"] if SMOKE else []) + ([] if PRESWIZZLE else ["--no-preswizzle"])
     procs = [subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--gpus", "1", *worker_flags, *FILTERS],
-        env={**os.environ, DEV_MASK_ENV: devices[g] if devices else str(g),
+        env={**os.environ, DEVICE_MASK_ENV: devices[g] if devices else str(g),
              "BENCH_SHARD": f"{g}/{GPUS}"}) for g in range(GPUS)]
     nfail = sum(p.wait() != 0 for p in procs)
     missing = [g for g, sp in enumerate(shard_paths) if not os.path.exists(sp)]

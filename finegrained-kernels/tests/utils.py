@@ -57,14 +57,6 @@ DTYPE_TO_TOL = {
 }
 
 
-def accelerator_module():
-    """The backend module (torch.cuda / torch.xpu) for the active accelerator, for the few
-    calls ``torch.accelerator`` does not expose (e.g. ``get_device_name``)."""
-    if TEST_DEVICE is None:
-        raise RuntimeError("No supported accelerator available")
-    return torch.get_device_module(TEST_DEVICE)
-
-
 def maybe_compile(fn, enabled):
     """Wrap ``fn`` in ``torch.compile`` (max-autotune, fullgraph) when ``enabled``,
     resetting the compiler and clearing the allocator cache first; otherwise return
@@ -72,7 +64,7 @@ def maybe_compile(fn, enabled):
     if not enabled:
         return fn
     torch.compiler.reset()
-    accelerator_module().empty_cache()
+    torch.accelerator.empty_cache()
     return torch.compile(fn, mode="max-autotune", fullgraph=True)
 
 
