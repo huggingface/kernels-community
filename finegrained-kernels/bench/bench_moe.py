@@ -149,8 +149,10 @@ _MX_WEIGHTS = {"mxfp8", "mxfp8_u8", "mxfp4", "nvfp4"}
 def _can_preswizzle(cfg):
     # Deployment feeds ONE pre-swizzled checkpoint to both prefill (grouped) and decode (batched):
     # the interleaved gate|up + non-gate swizzle round-trips bit-exact on every fused op. Only MX
-    # weights on 128-aligned dims swizzle (the descriptor reads whole 128-row blocks).
-    return (PRESWIZZLE and cfg["weights"] in _MX_WEIGHTS
+    # weights on 128-aligned dims swizzle (the descriptor reads whole 128-row blocks), and only on
+    # CUDA — SWIZZLE_32_4_4 is the tcgen05 layout, so elsewhere the arms take their affine path.
+    return (PRESWIZZLE and torch.accelerator.current_accelerator().type == "cuda"
+            and cfg["weights"] in _MX_WEIGHTS
             and cfg["H"] % 128 == 0 and cfg["I"] % 128 == 0)
 
 
@@ -436,8 +438,8 @@ FULL_BF16_PROBLEMS = {
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
     ),
 }
-# Every row above at /8 experts and /2 dims, one for one: same weight format, same baselines,
-# same activation. Only the geometry shrinks, so a low-VRAM part still covers every recipe.
+# Every row above at /8 experts and /2 dims: same weight format, same baselines,
+# same activation. Only the geometry shrinks, so a low-VRAM part can cover most of the recipes.
 SMALL_MOE_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E32 H2048 I1024 top6)": dict(
         E=32, H=2048, I=1024, top_k=6, weights="fp8_128x128_ue8m0", activation_format=None,
@@ -449,8 +451,11 @@ SMALL_MOE_PROBLEMS = {
         baselines=("finegrained-fp8", "deepgemm", "trtllm"), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
-    "openai/GPT-OSS-120B MXFP4 W4A16 (E16 H1440 I1440 top4)": dict(
-        E=16, H=1440, I=1440, top_k=4, weights="mxfp4", activation_format="bf16",
+    # H/I stay at full size: 2880/2 = 1440 is not a multiple of any BLOCK_SIZE_K in the BF16
+    # autotune grid, so halving them takes the row out of the kernel's legal K set entirely.
+    # Only the expert count shrinks here.
+    "openai/GPT-OSS-120B MXFP4 W4A16 (E16 H2880 I2880 top4)": dict(
+        E=16, H=2880, I=2880, top_k=4, weights="mxfp4", activation_format="bf16",
         baselines=("trtllm",), fused_extra=("triton_kernels",), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
     ),
@@ -475,8 +480,8 @@ SMALL_BF16_PROBLEMS = {
         fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
-    "openai/GPT-OSS-120B BF16 (E16 H1440 I1440 top4)": dict(
-        E=16, H=1440, I=1440, top_k=4, weights="bf16", activation_format=None,
+    "openai/GPT-OSS-120B BF16 (E16 H2880 I2880 top4)": dict(
+        E=16, H=2880, I=2880, top_k=4, weights="bf16", activation_format=None,
         baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
         fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
@@ -1321,7 +1326,8 @@ def bench_attn_row(row, pname, cfg, rows_out):
     # dense attn weights ship pre-swizzled like the MoE arms, so the 2D op benches the tcgen05
     # fast path (weight-only formats stay affine — no swizzled read)
     Ws_fgm = Ws
-    if PRESWIZZLE and cfg["weights"] in _MX_WEIGHTS and _quantized_acts(cfg) and N % 128 == 0:
+    if (PRESWIZZLE and DEVICE == "cuda" and cfg["weights"] in _MX_WEIGHTS
+            and _quantized_acts(cfg) and N % 128 == 0):
         Ws_fgm = fgm.swizzle_mx_scales(Ws)
     # OpenAI triton_kernels dense mxfp4 matmul (matmul_ogs, no routing): the qkv linear
     # in the GPT-OSS MXFP4 format. Weight is a single (1, K, N) expert, swizzled once
