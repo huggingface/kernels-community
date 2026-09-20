@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 
-fla = kernels.get_kernel("kernels-community/fla", version=1)
+fla = kernels.get_kernel("kernels-community/fla", version=2)
 
 
 def naive_chunk_gated_delta_rule(
