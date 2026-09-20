@@ -16,7 +16,7 @@
 import pytest
 import torch
 
-from utils import TEST_DEVICE, accelerator_module  # type: ignore
+from utils import TEST_DEVICE  # type: ignore
 
 import triton
 import triton.language as tl
@@ -293,13 +293,8 @@ def _run_mx_inline(x, fmt):
         dtype=torch.uint8 if fmt == "mxfp4" else torch.float8_e4m3fn,
     )
     s = torch.empty(M, N // 32, device=x.device, dtype=torch.uint8)
-<<<<<<< HEAD
     _mx_inline_harness[(1,)](x, q, s, M=M, N=N, FORMAT=fmt, num_warps=4)
-    torch.cuda.synchronize()
-=======
-    _mx_inline_harness[(1,)](x, q, s, M=M, N=N, RECIPE=recipe, num_warps=4)
-    accelerator_module().synchronize()
->>>>>>> c3776dda (tests: remove CUDA hardcoding so the suite runs on any accelerator)
+    torch.accelerator.synchronize()
     return q, s
 
 
@@ -349,7 +344,7 @@ def test_nvfp4_inline_matches_offline():
     q = torch.empty(M, N // 2, device=TEST_DEVICE, dtype=torch.uint8)
     s = torch.empty(M, N // 16, device=TEST_DEVICE, dtype=torch.float8_e4m3fn)
     _nv_inline_harness[(1,)](x, q, s, M=M, N=N, num_warps=4)
-    accelerator_module().synchronize()
+    torch.accelerator.synchronize()
     q_ref, s_ref = nvfp4_act_quant(x)
     assert torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8))
     assert torch.equal(q, q_ref.view(torch.uint8))

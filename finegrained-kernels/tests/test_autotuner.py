@@ -25,7 +25,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import TEST_DEVICE, accelerator_module, make_weights
+from utils import TEST_DEVICE, make_weights
 
 import finegrained_kernels  # type: ignore
 import finegrained_kernels.matmul  # type: ignore
@@ -169,7 +169,7 @@ def test_autotuner_survives_and_reports_failing_configs(caplog):
     y = torch.empty_like(x)
     with caplog.at_level(logging.WARNING, logger="finegrained_kernels.bayesian_autotuner"):
         _copy_kernel[(1,)](x, y, 64)
-    accelerator_module().synchronize()
+    torch.accelerator.synchronize()
     assert torch.equal(x, y)  # the good config won
     assert any("failed to compile" in r.getMessage() for r in caplog.records)
 
@@ -204,7 +204,7 @@ def test_failed_configs_do_not_consume_trial_budget():
     x = torch.randn(32, device=TEST_DEVICE)
     y = torch.empty_like(x)
     _budget_kernel[(1,)](x, y, 32)
-    accelerator_module().synchronize()
+    torch.accelerator.synchronize()
     measured = [
         ms for ms in _budget_kernel.configs_timings.values() if ms != float("inf")
     ]
@@ -297,7 +297,7 @@ def test_compile_failures_are_memoized_across_keys(caplog):
             x = torch.randn(n, device=TEST_DEVICE)
             y = torch.empty_like(x)
             _memo_kernel[(1,)](x, y, n)
-            accelerator_module().synchronize()
+            torch.accelerator.synchronize()
     msgs = [
         r.getMessage() for r in caplog.records if "failed to compile" in r.getMessage()
     ]
