@@ -1,12 +1,14 @@
 import random
 from typing import List, Tuple
 
-import paged_attention as ops
+import kernels
 import pytest
 import torch
-from paged_attention.platforms import current_platform
 
 from .utils import DEFAULT_OPCHECK_TEST_UTILS, opcheck
+
+ops = kernels.get_kernel("kernels-community/paged-attention", version=1)
+current_platform = ops.platforms.current_platform
 
 COPYING_DIRECTION = [("gpu", "cpu"), ("gpu", "gpu"), ("cpu", "gpu")]
 DTYPES = [torch.half, torch.bfloat16, torch.float]
@@ -498,3 +500,91 @@ def test_fp8_e4m3_conversion(
     ops.convert_fp8(converted_cache, cache_fp8)
 
     torch.testing.assert_close(cache, converted_cache, atol=0.02, rtol=0.2)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Requires MPS")
+def test_swap_blocks_after_mps_operation():
+    src_cpu = torch.arange(128, dtype=torch.float32, device="cpu").reshape(4, 32)
+    src = src_cpu.to("mps")
+    dst = torch.zeros_like(src)
+    mapping = torch.tensor([[0, 2], [1, 3]], dtype=torch.int64, device="cpu")
+    expected = torch.zeros_like(src_cpu)
+    expected[2:4] = src_cpu[:2].sin()
+    torch.mps.synchronize()
+
+    src = src.sin()
+    ops.swap_blocks(src, dst, mapping)
+    torch.testing.assert_close(dst.tanh().cpu(), expected.tanh())
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Requires MPS")
+def test_copy_blocks_after_mps_operation():
+    torch.manual_seed(42)
+    originals = [torch.randn(4, 32, device="cpu") for _ in range(4)]
+    caches = [tensor.to("mps") for tensor in originals]
+    # CPU mappings avoid a device-to-host copy that would end the active encoder.
+    mapping = torch.tensor([[0, 2], [1, 3]], dtype=torch.int64, device="cpu")
+    expected = [tensor.sin() for tensor in originals]
+    for tensor in expected:
+        tensor[2:4] = tensor[:2]
+    torch.mps.synchronize()
+
+    caches = [tensor.sin() for tensor in caches]
+    ops.copy_blocks(caches[:2], caches[2:], mapping)
+    for actual, reference in zip(caches, expected):
+        torch.testing.assert_close(actual.tanh().cpu(), reference.tanh())
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Requires MPS")
+@pytest.mark.parametrize("flash", [False, True])
+def test_reshape_and_cache_after_mps_operation(flash):
+    torch.manual_seed(42)
+    key_cpu, value_cpu = [torch.randn(3, 2, 64, device="cpu") for _ in range(2)]
+    key, value = [tensor.to("mps") for tensor in (key_cpu, value_cpu)]
+    slots = torch.tensor([0, 17, -1], dtype=torch.int64, device="cpu")
+    scale = torch.ones(1, device="mps")
+    key_shape = (2, 16, 2, 64) if flash else (2, 2, 16, 16, 4)
+    value_shape = (2, 16, 2, 64) if flash else (2, 2, 64, 16)
+    key_cache = torch.zeros(key_shape, device="mps")
+    value_cache = torch.zeros(value_shape, device="mps")
+    expected_key = torch.zeros(key_shape, device="cpu")
+    expected_value = torch.zeros(value_shape, device="cpu")
+    for i, (block, offset) in enumerate(((0, 0), (1, 1))):
+        if flash:
+            expected_key[block, offset] = key_cpu[i].sin()
+            expected_value[block, offset] = value_cpu[i].sin()
+        else:
+            expected_key[block, :, :, offset, :] = key_cpu[i].sin().reshape(2, 16, 4)
+            expected_value[block, :, :, offset] = value_cpu[i].sin()
+    op = ops.reshape_and_cache_flash if flash else ops.reshape_and_cache
+    torch.mps.synchronize()
+
+    key, value = key.sin(), value.sin()
+    op(key, value, key_cache, value_cache, slots, "auto", scale, scale)
+    torch.testing.assert_close(key_cache.tanh().cpu(), expected_key.tanh())
+    torch.testing.assert_close(value_cache.tanh().cpu(), expected_value.tanh())
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Requires MPS")
+@pytest.mark.parametrize("quantize", [False, True])
+def test_convert_fp8_after_mps_operation(quantize):
+    values = torch.tensor([-1.0, 0.0, 1.0] * 32, device="cpu")
+    packed = values.to(torch.float8_e4m3fn).view(torch.uint8)
+    angles = torch.tensor([-torch.pi / 2, 0.0, torch.pi / 2] * 32, device="mps")
+    src = angles if quantize else packed.to("mps")
+    dst = torch.empty(96, dtype=torch.uint8 if quantize else torch.float32, device="mps")
+    torch.mps.synchronize()
+
+    # The decode input is uint8, so use a separate tensor to open the encoder.
+    angles = angles.sin()
+    if quantize:
+        src = angles
+    ops.convert_fp8(dst, src, 1.0, "fp8")
+    if quantize:
+        torch.testing.assert_close(dst.cpu(), packed)
+    else:
+        torch.testing.assert_close(dst.tanh().cpu(), values.tanh())

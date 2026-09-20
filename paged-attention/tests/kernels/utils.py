@@ -7,9 +7,12 @@ from functools import lru_cache
 from numbers import Number
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
+import kernels
 import pytest
 import torch
 from torch._prims_common import TensorLikeType
+
+paged_attention = kernels.get_kernel("kernels-community/paged-attention", version=1)
 
 # For now, disable "test_aot_dispatch_dynamic" since there are some
 # bugs related to this test in PyTorch 2.4.
@@ -90,9 +93,7 @@ def opcheck(
 @lru_cache(maxsize=None)
 def get_max_shared_memory_bytes(gpu: int = 0) -> int:
     """Returns the maximum shared memory per thread block in bytes."""
-    from paged_attention import ops
-
-    max_shared_mem = ops.get_max_shared_memory_per_block_device_attribute(gpu)
+    max_shared_mem = paged_attention.ops.get_max_shared_memory_per_block_device_attribute(gpu)
     # value 0 will cause MAX_SEQ_LEN become negative and test_attention.py
     # will fail
     assert max_shared_mem > 0, "max_shared_mem can not be zero"

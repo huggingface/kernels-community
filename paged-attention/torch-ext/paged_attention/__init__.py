@@ -1,3 +1,4 @@
+from . import platforms
 from ._custom_ops import (
     convert_fp8,
     copy_blocks,
