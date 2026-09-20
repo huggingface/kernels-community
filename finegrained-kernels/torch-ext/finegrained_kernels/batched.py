@@ -44,7 +44,7 @@ from .loading.tiles import (
     oriented_tile_ptrs,
     weight_tile_ptrs,
 )
-from .epilogue import acc_finalize, acc_init, bias_strides, gemm_epilogue
+from .epilogue import acc_init, bias_strides, gemm_epilogue
 from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
 
 
@@ -488,7 +488,11 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
             "pointer", "pointer", False, False, False,
         )
 
-    accumulator = acc_finalize(accumulator, "dot", n_width, SWAP_AB) * a_s * b_s
+    # per-tensor scales fold on the raw accumulator; `gemm_epilogue` owns the finalize.
+    # Finalizing here too was invisible under no-swap (a pass-through) and collapsed the
+    # swapped tile twice, so every SWAP_AB config failed to compile and the tuner quietly
+    # dropped the whole swap arm at this shape.
+    accumulator = accumulator * a_s * b_s
     if PDL:
         gdc_launch_dependents()
     gemm_epilogue(

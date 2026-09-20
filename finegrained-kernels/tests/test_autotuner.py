@@ -266,12 +266,18 @@ def test_cross_process_determinism_block_dynamic_grouped():
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
-def test_compile_failures_are_memoized_across_keys(caplog):
+def test_compile_failures_are_memoized_across_keys(caplog, monkeypatch):
     """A config that fails at COMPILE stage is memoized on disk keyed by its compile
     determinants (source hash + config + constexpr values + dtypes) — a tune at a NEW
     shape key must skip the doomed compile and report the failure as memoized. Bench
     -stage errors are excluded by design (a sticky-context cascade must never fence
-    healthy configs)."""
+    healthy configs).
+
+    The suite pins ``FINEGRAINED_AUTOTUNE_MAX_FAILURES=0`` so a config the tuner cannot compile
+    fails loudly instead of being forgiven (conftest). This test IS that machinery and compiles
+    a deliberately doomed config, so it restores the deployment default for its own tune —
+    otherwise the first reject aborts the tune before there is anything to memoize."""
+    monkeypatch.setenv("FINEGRAINED_AUTOTUNE_MAX_FAILURES", "3")
 
     @bayesian_autotune(
         [

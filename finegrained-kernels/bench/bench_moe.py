@@ -236,6 +236,7 @@ try:
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation as _VllmAct  # noqa: E402
     from vllm.model_executor.layers.fused_moe.config import fp8_w8a8_moe_quant_config as _vllm_fp8_qc  # noqa: E402
     from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8 as _vllm_group_quant  # noqa: E402
+    from vllm._custom_ops import scaled_fp8_quant as _vllm_tensor_quant  # noqa: E402
 except ImportError:
     vllm_fused_experts = None
 # kernels-community/nvfp4-gemm — the dense NVFP4 GEMM behind transformers' `NVFP4Linear`
@@ -299,7 +300,9 @@ try:
     ctypes.CDLL(_cudart[0], mode=ctypes.RTLD_GLOBAL)
     from flashinfer.fused_moe import Fp8QuantizationType as _FiQuantType  # noqa: E402
     from flashinfer.fused_moe import WeightLayout as _FiWeightLayout  # noqa: E402
+    from flashinfer.fused_moe import RoutingMethodType as _FiRouting  # noqa: E402
     from flashinfer.fused_moe import trtllm_fp8_block_scale_routed_moe  # noqa: E402
+    from flashinfer.fused_moe import trtllm_fp8_per_tensor_scale_moe  # noqa: E402
     from flashinfer import mxfp8_quantize as _fi_mxfp8_quantize  # noqa: E402
     from flashinfer import reorder_rows_for_gated_act_gemm as _fi_reorder  # noqa: E402
     from flashinfer import shuffle_matrix_a as _fi_shuffle_a  # noqa: E402
@@ -384,10 +387,15 @@ MOE_PROBLEMS = {
     "mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4)": dict(
         # The only shipped STATIC scheme: its conversion script asserts qscheme_act == "TENSOR"
         # and writes weight_block_size None, so both levels are per tensor — per-expert weight
-        # scales and a calibrated activation scale per expert in place of the runtime one. No
-        # external arm: finegrained-fp8 has no static path and the others take block scales.
+        # scales and a calibrated activation scale per expert in place of the runtime one.
+        # finegrained-fp8 has no static path and the rest take block scales, so vLLM is the one
+        # comparable arm (parity 4e-3 against us).
         E=128, H=4096, I=2048, top_k=4, weights="fp8_tensor", activation_format=None, static=True,
-        baselines=(), fp8_block=None, block_size=None,
+        # trtllm rides their per_tensor entry point (`trtllm_fp8_per_tensor_scale_moe`), which
+        # routes internally — it rejects the packed precomputed routing the block-scale arms
+        # pass (it asserts routing_logits dim1 == num_experts), so it takes the logits and
+        # Default routing to match the bench's.
+        baselines=("vllm", "trtllm"), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4)": dict(
@@ -456,6 +464,15 @@ ATTN_PROBLEMS = {
         # UE8M0 deepgemm comparison is the DeepSeek-V4 attn row.
         N=21504, K=7168, weights="fp8_128x128", activation_format=None,
         block=[128, 128], baselines=("finegrained-fp8",),
+    ),
+    # the dense half of the same per-tensor STATIC export as the Mistral-4 MoE row: its attn
+    # linears carry per-tensor weights and a calibrated activation scale, on the 2D op. N is the
+    # fused qkv width from the model config (32 q heads + 32 kv heads, all 128-wide, hidden 4096).
+    # No baseline: finegrained-fp8 has no static path, DeepGEMM/torch's fp8 arms here are
+    # block/MX-scaled, and a per-tensor bar timed against block-scaled work is unlike work.
+    "mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096)": dict(
+        N=12288, K=4096, weights="fp8_tensor", activation_format=None,
+        block=None, baselines=(), static=True,
     ),
     "MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144)": dict(
         N=18432, K=6144, weights="mxfp8", activation_format=None,
@@ -615,8 +632,9 @@ def _static_act_kwargs(cfg, hidden):
     if not cfg.get("static"):
         return {}
     scale = (hidden.float().abs().amax() / 448.0).clamp(min=1e-12)
-    fan = torch.linspace(0.5, 2.0, cfg["E"], device=hidden.device, dtype=torch.float32)
-    per_expert = (scale * fan).contiguous()
+    # one calibrated value, held per expert: the shape the kernels index, and the only form a
+    # row with a TRT-LLM per-tensor baseline can use (their API quantizes the hidden once)
+    per_expert = scale.expand(cfg["E"]).contiguous()
     _mark_static(per_expert)
     return {"gate_up_proj_activation_scale": per_expert, "down_proj_activation_scale": per_expert}
 
@@ -905,7 +923,55 @@ def _trtllm_fp4_arm(cfg, hidden, idx, packed, gu, gus, dn, dns, gu_g, dn_g):
     return run
 
 
-def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn_g=None, *_):
+def trtllm_per_tensor_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, logits):
+    """TRT-LLM (FlashInfer) ``trtllm_fp8_per_tensor_scale_moe`` — the entry point their serving
+    path uses for the W8A8 scheme Mistral-4 ships: one FP8 scale per expert on each weight, one
+    calibrated activation scale. Their gate|up order is [up; gate], so the halves swap offline.
+
+    The three per-expert scalars fold the dequant of each GEMM into the next stage's input
+    scale, which is how TRT-LLM keeps the chain in FP8: gemm1's output carries ``a1 * w1``
+    divided by the intermediate's own scale, and gemm2's carries ``a2 * w2`` out to BF16 —
+    the fold vLLM's `TrtLlmFp8ExpertsMonolithic` builds. The bench's parity column is what says
+    whether that folding matches ours — a wrong convention here is fast and silently wrong, so
+    the row is only worth reading while parity holds."""
+    E, inter = cfg["E"], cfg["I"]
+    a1 = (hidden.float().abs().amax() / 448.0).clamp(min=1e-12)
+    # TRT-LLM's own weight prep, as vLLM's `rotate_weights_for_fi_trtllm_fp8_per_tensor_moe`
+    # does it: `reorder_rows_for_gated_act_gemm` interleaves the halves for their fused gated
+    # act and `shuffle_matrix_a` lays the rows out for their GEMM. Their stack is [up; gate],
+    # so the halves swap FIRST — their reorder interleaves, it does not reorder the halves, and
+    # feeding it ours lands at rel 0.97 (cos 0.53): fast, and a different function.
+    fp8 = torch.float8_e4m3fn
+    gu_upgate = torch.cat([gu[:, inter:], gu[:, :inter]], dim=1).contiguous()
+    w13 = torch.stack([_fi_shuffle_a(_fi_reorder(gu_upgate.view(torch.uint8)[i]), 128) for i in range(E)]).view(fp8)
+    w2 = torch.stack([_fi_shuffle_a(dn.view(torch.uint8)[i], 128) for i in range(E)]).view(fp8)
+    w1s = gus.reshape(E).float()
+    w2s = dns.reshape(E).float()
+    a2 = a1.expand(E).contiguous()  # the intermediate's calibrated scale (same fixture value)
+    # the UP half is requantized for gemm2 (divide by the intermediate's scale); the GATE half is
+    # dequantized so SiLU sees real magnitudes — the same scalar for both is what put parity at 1.0
+    out1 = (a1 * w1s / a2).contiguous()
+    out1_gate = (a1 * w1s).contiguous()
+    out2 = (a2 * w2s).contiguous()
+    _mark_static(w13, w2, out1, out1_gate, out2, a1)
+    # Default = softmax over ALL experts then top-k, matching the bench's routing(). Their
+    # Renormalize rescales the top-k weights to sum to 1 (rel 4.17, exactly 1/sum(w) off) —
+    # same experts, a per-token rescale of the combine weights.
+    def run():
+        # the act quant is INSIDE the timed call and is the STACK'S OWN kernel, as on the
+        # block-scale arm: a static scheme still quantizes the hidden every forward, and every
+        # other arm here (ours, vLLM's) is charged for it
+        hq, _ = _vllm_tensor_quant(hidden, scale=a1)
+        return trtllm_fp8_per_tensor_scale_moe(
+            logits, None, hq, w13, out1, out1_gate, w2, out2,
+            E, cfg["top_k"], None, None, inter, 0, E, None, False,
+            routing_method_type=int(_FiRouting.Default),
+        )
+
+    return run
+
+
+def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn_g=None, logits=None, *_):
     """FlashInfer TRT-LLM fp8-block routed MoE (the DeepSeek format on SM100). Weight prep
     (offline): TRT-LLM's gate|up order is [up; gate] — the halves swap; UE8M0 scales ride
     as fp32 (same values). Routing rides packed ``(expert_id << 16) | bf16-weight`` ids;
@@ -919,6 +985,8 @@ def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn
         w.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF)
     if cfg["weights"] in ("mxfp4", "nvfp4"):
         return _trtllm_fp4_arm(cfg, hidden, idx, packed, gu, gus, dn, dns, gu_g, dn_g)
+    if cfg["fp8_block"] is None:  # per-tensor W8A8: their per_tensor entry point, not the block one
+        return trtllm_per_tensor_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, logits)
     if cfg["weights"] == "mxfp8":
         g1, g1s, dn_s, d1s = _trtllm_mxfp8_prep(gu, gus, dn, dns)
         alpha, beta, limit = _trtllm_gated_scalars(cfg, E, hidden.device)
@@ -959,8 +1027,9 @@ def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn
 
 
 def vllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
-    """vLLM triton fused-MoE — the kernel its serving path runs for bf16 and for
-    block-fp8 W8A8 (the DeepSeek scheme; dynamic per-token-group act quant inside),
+    """vLLM triton fused-MoE — the kernel its serving path runs for bf16, for
+    block-fp8 W8A8 (the DeepSeek scheme; dynamic per-token-group act quant inside) and for
+    per-tensor W8A8 against calibrated scales (the static scheme Mistral-4 ships),
     tuned tiles from bench/vllm_configs. UE8M0 weight scales ride as fp32 (same values —
     vLLM stores block scales fp32). Plain SwiGLU only: the functional API doesn't thread
     clamp_limit/alpha (vLLM's class-based serving path takes them from the quant config).
@@ -973,6 +1042,18 @@ def vllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     if cfg["fp8_block"] is not None:
         qc = _vllm_fp8_qc(w1_scale=gus.float(), w2_scale=dns.float(),
                           block_shape=list(cfg["fp8_block"]))
+    elif cfg.get("static"):
+        # per-tensor W8A8 against CALIBRATED activation scales: no block_shape, no per-token
+        # quant. vLLM takes ONE activation scale per projection, so the row's per-expert scales
+        # collapse to their max — a scale only sets the quantization grid, and this row's are
+        # one calibrated value held per expert anyway.
+        a = _static_act_kwargs(cfg, hidden)
+        qc = _vllm_fp8_qc(
+            w1_scale=gus.reshape(cfg["E"]).float(), w2_scale=dns.reshape(cfg["E"]).float(),
+            a1_scale=a["gate_up_proj_activation_scale"].max().reshape(1).float(),
+            a2_scale=a["down_proj_activation_scale"].max().reshape(1).float(),
+            per_act_token_quant=False, block_shape=None,
+        )
     return lambda: vllm_fused_experts(hidden, gu, dn, tkw, tki,
                                       activation=_VllmAct.SILU, quant_config=qc)
 
@@ -1100,6 +1181,7 @@ ARMS = {
     "transformers": transformers_arm,
     "transformers@main": transformers_main_arm,
     "sonicmoe": sonicmoe_arm,
+    "trtllm_per_tensor": trtllm_per_tensor_arm,
     "vllm": vllm_moe_arm,
     "trtllm": trtllm_moe_arm,
     "deepgemm": deepgemm_arm,
@@ -1327,11 +1409,19 @@ def bench_attn_row(row, pname, cfg, rows_out):
         print(f"   -- {regime}")
         torch.manual_seed(0)
         x = torch.randn(tokens, K, device=DEV, dtype=torch.bfloat16)
-        # act is inline-quantized (As=None); Ws is the weight scale (Bs); activation_format is the
+        # a STATIC row's calibrated activation scale replaces the inline quant: one value, since a
+        # dense module is one quantized module (the MoE's per-expert form has no dense analogue)
+        attn_act_scale = (
+            (x.float().abs().amax() / 448.0).clamp(min=1e-12).reshape(1)
+            if cfg.get("static") else None
+        )
+        if attn_act_scale is not None:
+            _mark_static(attn_act_scale)
+        # act is inline-quantized (As=None) unless the row is static; Ws is the weight scale (Bs); activation_format is the
         # activation precision (None follows the weight format).
         attn_arms = {
             "finegrained-kernels": lambda: fgm.matmul_2d(
-                x, W, None, Ws_fgm, activation_format=_activation_format(cfg), output_dtype=torch.bfloat16,
+                x, W, attn_act_scale, Ws_fgm, activation_format=_activation_format(cfg), output_dtype=torch.bfloat16,
                 b_global_scale=W_g),
         }
         if torch_mm is not None:
@@ -1420,7 +1510,8 @@ def _load_rows_csv(path):
     allowed = {}
     for pn, c in MOE_PROBLEMS.items():
         allowed["quantized", pn] = (
-            _allowed(c) | {_impl(b) for b in c.get("fused_extra", ())}
+            _allowed(c)
+            | {_impl(b) for b in c.get("fused_extra", ())}
             | {"torch", "transformers@main"})
     for pn, c in BF16_PROBLEMS.items():
         allowed["unquantized", pn] = _allowed(c) | {"megablocks"}

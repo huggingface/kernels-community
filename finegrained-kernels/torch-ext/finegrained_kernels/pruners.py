@@ -101,6 +101,10 @@ from .mma import MMA_N_ATOM_WIDTH
 # it fit shared memory and failed only as benign launch-time smem overflows.
 SM10X_SCALED_MMA_MAX_N = 256
 
+# Widest N tile the raw-activation (per-expert calibrated) arm survives; see
+# raw_activation_pointer_pruner for the bisect.
+RAW_ACT_MAX_BN = 128
+
 # Branch axes that RELOCATE the tile optimum (compute unit / operand orientation): the
 # tuner's guaranteed max-tile anchors group by these (``path_anchor_axes`` — a declaration,
 # so the tuner itself stays independent of configuration details). Scheduling axes
@@ -793,18 +797,32 @@ def weight_only_swap_scope_pruner():
 
 
 def raw_activation_pointer_pruner():
-    """``early_config_prune`` keeping a RAW activation on the pointer arm. A calibrated scale
-    held per expert leaves ``A`` unquantized for the kernel to quantize per tile (a gathered row
-    serves several experts, so there is no single pre-quantized form), and a raw tile cannot ride
-    the TMA gather: ``async_tma_gather`` wants at least 4 contiguous elements per thread and the
-    lowering fails outright, which at a deployment shape left the tuner no config at all. A
-    pre-quantized ``A`` is unaffected and keeps every memory mode."""
+    """``early_config_prune`` scoping the RAW-activation arm to the pointer load and away from
+    warp specialization. A calibrated scale held per expert leaves ``A`` unquantized for the
+    kernel to quantize per tile (a gathered row serves several experts, so there is no single
+    pre-quantized form), which puts a quantize INSIDE the K-loop and changes its structure:
+
+    - the TMA gather cannot serve it at all (``async_tma_gather`` wants 4 contiguous elements
+      per thread and the lowering fails), which at a deployment shape left the tuner no config;
+    - ``BLOCK_SIZE_N`` above 128 traps the device at prefill scale — a sticky misaligned
+      address. Bisected on B200 / Triton 3.8 with a COLD tune cache (a warm one replays a safe
+      crown and hides it): holding BN <= 128 runs clean, while fencing warp specialization, the
+      packed schedule, or BK < 128 each still trap. So the tile width is the variable, not the
+      schedule, the memory mode or WS.
+
+    A pre-quantized ``A`` keeps the full grid, unchanged — which is what the grouped prefill
+    now hands it (``quantize_routed_rows_per_expert`` lays the routed rows out quantized once
+    the row count pays for the copy), so the raw arm is reached below that regime, or above it
+    when ``FINEGRAINED_FORCE_GATHER`` holds the gather. The BN fence is load-bearing there."""
 
     def ok(c, args):
         a = args.get("A")
         if getattr(a, "dtype", None) == FP8_DTYPE or args.get("As") is None:
             return True
-        return c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
+        return (
+            c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
+            and config_dim(c, args, "BLOCK_SIZE_N") <= RAW_ACT_MAX_BN
+        )
 
     return config_filter(ok)
 
@@ -952,9 +970,9 @@ def swizzled_scale_config_pruner(allow_gate_subblock=False):
     def raise_no_swizzled_tile(configs, args):
         raise ValueError(
             "no autotune config can serve pre-swizzled scales for this launch (the "
-            "SWIZZLE_32_4_4 read needs BLOCK_SIZE_K % 128 == 0 and a <=128-row or 128-multiple N tile; "
-            f"GATE={bool(args.get('GATE'))}) — the contraction dim likely has no "
-            "128-dividing tile; pass affine (row-major) scales for this shape."
+            "SWIZZLE_32_4_4 read needs BLOCK_SIZE_K % 128 == 0 and a <=128-row or 128-multiple N "
+            f"tile; N={args.get('N')}, K={args.get('K')}, GATE={bool(args.get('GATE'))}) — say "
+            "which dim is short rather than guessing: pass affine (row-major) scales for it."
         )
 
     return config_filter(
