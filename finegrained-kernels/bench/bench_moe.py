@@ -349,20 +349,12 @@ PREFILL_TOKENS = 256 if SMOKE else 8192
 # support first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last.
 CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2"]
 
-MOE_PROBLEMS = {
-    # Scaled-down stand-in for the DeepSeek-V4 geometry (same recipe, /8 experts, /2 dims) so the
-    # MoE rows fit on a 32GB part: build() materializes the pre-quant weights in fp32, which needs
-    # ~16GB for a single E256 H4096 gate_up grid alone.
-    "small/DeepSeek-V4-shaped FP8 block-dyn W8A8 ue8m0 (E32 H2048 I1024 top6)": dict(
-        E=32, H=2048, I=1024, top_k=6, weights="fp8_128x128_ue8m0", activation_format=None,
-        baselines=("finegrained-fp8", "deepgemm"), fp8_block=[128, 128], block_size=(128, 128),
-        act="silu", swiglu_alpha=None, swiglu_limit=None,
-    ),
-    "small/MiniMax-M3-shaped MXFP8 (E32 H2048 I1024 top4)": dict(
-        E=32, H=2048, I=1024, top_k=4, weights="mxfp8", activation_format=None,
-        baselines=("finegrained-fp8",), fp8_block=None, block_size=None,
-        act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
-    ),
+# Opt-in for low-VRAM parts: the same recipes and baselines at /8 experts, /2 dims, run
+# INSTEAD OF the full roster rather than alongside it. Off by default.
+SMALL_GEOMETRY = os.environ.get("FGK_BENCH_SMALL_GEOMETRY", "0") == "1"
+
+
+FULL_MOE_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6)": dict(
         # config.json: fp8 e4m3, scale_fmt ue8m0, weight_block_size [128,128], dynamic acts.
         # Same expert geometry as the MXFP4 V4 row below — the difference is the deployed
@@ -412,13 +404,7 @@ MOE_PROBLEMS = {
     ),
 }
 # the same base-model roster, run as if dequantized to BF16 (one shape per model)
-BF16_PROBLEMS = {
-    "small/DeepSeek-V4-shaped BF16 (E32 H2048 I1024 top6)": dict(
-        E=32, H=2048, I=1024, top_k=6, weights="bf16", activation_format=None,
-        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
-        fp8_block=None, block_size=None,
-        act="silu", swiglu_alpha=None, swiglu_limit=None,
-    ),
+FULL_BF16_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6)": dict(
         E=256, H=4096, I=2048, top_k=6, weights="bf16", activation_format=None,
         baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
@@ -450,6 +436,74 @@ BF16_PROBLEMS = {
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
     ),
 }
+# Every row above at /8 experts and /2 dims, one for one: same weight format, same baselines,
+# same activation. Only the geometry shrinks, so a low-VRAM part still covers every recipe.
+SMALL_MOE_PROBLEMS = {
+    "deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E32 H2048 I1024 top6)": dict(
+        E=32, H=2048, I=1024, top_k=6, weights="fp8_128x128_ue8m0", activation_format=None,
+        baselines=("finegrained-fp8", "deepgemm", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E32 H2048 I1024 top6)": dict(
+        E=32, H=2048, I=1024, top_k=6, weights="mxfp4", activation_format="mxfp8",
+        baselines=("finegrained-fp8", "deepgemm", "trtllm"), fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "openai/GPT-OSS-120B MXFP4 W4A16 (E16 H1440 I1440 top4)": dict(
+        E=16, H=1440, I=1440, top_k=4, weights="mxfp4", activation_format="bf16",
+        baselines=("trtllm",), fused_extra=("triton_kernels",), fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
+    ),
+    # No NVFP4 row: the format's scales are the SWIZZLE_32_4_4 tcgen05 layout, so it is a
+    # CUDA-only path — a small-geometry stand-in would only ever record a crash. GLM-5.2 stays
+    # covered here through its BF16 row.
+    "deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E32 H3584 I1024 top8)": dict(
+        E=32, H=3584, I=1024, top_k=8, weights="fp8_128x128", activation_format=None,
+        baselines=("finegrained-fp8", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "MiniMaxAI/MiniMax-M3 MXFP8 (E16 H3072 I1536 top4)": dict(
+        E=16, H=3072, I=1536, top_k=4, weights="mxfp8", activation_format=None,
+        baselines=("finegrained-fp8",), fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
+    ),
+}
+SMALL_BF16_PROBLEMS = {
+    "deepseek-ai/DeepSeek-V4 BF16 (E32 H2048 I1024 top6)": dict(
+        E=32, H=2048, I=1024, top_k=6, weights="bf16", activation_format=None,
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
+        fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "openai/GPT-OSS-120B BF16 (E16 H1440 I1440 top4)": dict(
+        E=16, H=1440, I=1440, top_k=4, weights="bf16", activation_format=None,
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
+        fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
+    ),
+    "zai-org/GLM-5.2 BF16 (E32 H3072 I1024 top8)": dict(
+        E=32, H=3072, I=1024, top_k=8, weights="bf16", activation_format=None,
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
+        fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "deepseek-ai/DeepSeek-V3 BF16 (E32 H3584 I1024 top8)": dict(
+        E=32, H=3584, I=1024, top_k=8, weights="bf16", activation_format=None,
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
+        fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "MiniMaxAI/MiniMax-M3 BF16 (E16 H3072 I1536 top4)": dict(
+        E=16, H=3072, I=1536, top_k=4, weights="bf16", activation_format=None,
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
+        fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
+    ),
+}
+
+MOE_PROBLEMS = SMALL_MOE_PROBLEMS if SMALL_GEOMETRY else FULL_MOE_PROBLEMS
+BF16_PROBLEMS = SMALL_BF16_PROBLEMS if SMALL_GEOMETRY else FULL_BF16_PROBLEMS
+
 ATTN_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096)": dict(
         # DeepSeek-V4's attention deploys block-FP8 W8A8 with UE8M0 (power-of-two) scales
