@@ -140,6 +140,39 @@ def test_dot_arm_is_fenced_on_sm10x():
 
 
 @pytest.mark.kernels_ci
+def test_dot_scaled_is_fenced_off_fp32_weight_only_activations():
+    """`tl.dot_scaled` takes a bf16/fp16 lhs, and a WEIGHT-ONLY launch hands it the raw
+    activation — so an fp32 one cannot compile the arm at all. It used to reach the tuner and
+    fail there (87 of 107 configs on one grouped launch, 97 and 503 on 2D ones), which books a
+    whole arm as compile failures instead of a declared fence; a model loaded in fp32 reaches
+    it through the transformers integration. The kernels' own suite never built fp32 operands,
+    which is why it went unseen. Pure config filtering, no GPU."""
+    prune = mx_config_pruner("K")
+
+    def cfg(mode):
+        return triton.Config(
+            {"COMPUTE_MODE": mode, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128},
+            num_warps=4,
+            num_stages=2,
+        )
+
+    configs = [cfg("dot_scaled"), cfg("dot"), cfg("scalar")]
+    fp32 = torch.empty(0, dtype=torch.float32)
+    bf16 = torch.empty(0, dtype=torch.bfloat16)
+    # weight-only (no `As`): the raw fp32 activation reaches the MMA, so the arm is dropped and
+    # the software arms serve the launch
+    kept = prune(configs, {"K": 4096, "A": fp32})
+    assert {c.kwargs["COMPUTE_MODE"] for c in kept} == {"dot", "scalar"}
+    # same launch in the deployment dtype keeps every arm
+    kept = prune(configs, {"K": 4096, "A": bf16})
+    assert "dot_scaled" in {c.kwargs["COMPUTE_MODE"] for c in kept}
+    # an `As` operand means the activation is quantized before the MMA sees it — A's own dtype
+    # is not what reaches `dot_scaled`, so fp32 must NOT fence it there
+    kept = prune(configs, {"K": 4096, "A": fp32, "As": None})
+    assert "dot_scaled" in {c.kwargs["COMPUTE_MODE"] for c in kept}
+
+
+@pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
 def test_autotuner_survives_and_reports_failing_configs(caplog):
     """A config that cannot compile must score inf (not kill the tune), the tune must

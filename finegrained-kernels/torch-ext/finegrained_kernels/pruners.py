@@ -338,6 +338,10 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
     dot/scalar/swap arms column-unpack them to E4M3 (lossless) first — no arm is
     structurally packed-incompatible, so W4A4 needs no shape gate of its own.
 
+    A weight-only launch whose raw activation is fp32 drops ``dot_scaled`` outright: the op's
+    lhs must be bf16/fp16, so the arm cannot compile at all there (arch-independent, unlike the
+    shape gates below).
+
     The shape gates above are scoped to ``dot_scaled`` — they are native scaled-MMA bug
     gates. The ``dot`` arm (BK structurally the UE8M0 group, 32) is CORRECT everywhere
     probed (forced-config sweep 2026-07-14, GATE and plain, MXFP4/MXFP8, incl. width-512
@@ -478,6 +482,18 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
             return (2 if args.get("GATE") else 1) * config_dim(c, args, "BLOCK_SIZE_N") >= 128
         return config_dim(c, args, "BLOCK_SIZE_M") >= 128
 
+    def dot_scaled_act_dtype_ok(c, args):
+        # `tl.dot_scaled` takes a bf16/fp16 lhs. A weight-only launch hands it the RAW
+        # activation, so an fp32 one cannot reach the arm at all: every dot_scaled config dies
+        # in "Unexpected dtype for bf16. Got fp32" and the tuner books the whole arm as compile
+        # FAILURES rather than as a declared fence (87 of them on one grouped launch). A model
+        # running in fp32 reaches this through the transformers integration. The dot and scalar
+        # arms upcast the weight and take any float lhs, so they serve the launch — drop rather
+        # than raise. Not arch-gated: the lhs dtype is the op's contract, not an sm_10x quirk.
+        if c.kwargs.get("COMPUTE_MODE") != "dot_scaled" or acts_are_scaled(args):
+            return True
+        return getattr(args.get("A"), "dtype", None) != torch.float32
+
     def scales_are_e4m3(args):
         return getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn
 
@@ -499,6 +515,7 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
     # re-admitting the single-trip/width traps it existed to remove).
     return compose_pruners(
         *stages,
+        config_filter(dot_scaled_act_dtype_ok),
         config_filter(nvfp4_native_ok, when=scales_are_e4m3),
         config_filter(
             mma_trap_ok, when=lambda args: is_sm10x(), on_empty=raise_all_mma_trapped
