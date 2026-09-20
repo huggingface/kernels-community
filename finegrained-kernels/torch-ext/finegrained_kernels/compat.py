@@ -318,12 +318,13 @@ def get_accelerator_autotuning_configs(
       bursts are the one in-block lever that helps (+12% on the dsv4 swap GEMV; deeper
       num_stages and split-K both measured WORSE). Prefill tunes carry the same rows as
       trial-budget dilution (descriptor_box_pruner drops the illegal e4m3 boxes).
-    - ``warp_spec`` (CUDA only): warp-specialize the K-loop, crossed over every mode —
+    - ``warp_spec``: warp-specialize the K-loop, crossed over every mode —
       pair it with ``warp_spec_compile_guard_pruner``, which owns the can't-compile
       regions (including dot_scaled + WS, a PassManager failure). Compile support is
       (shape, config)-dependent on Triton 3.7.1, so it is a tuner axis — failures score
       inf and self-prune; where it compiles it is both faster and (bd grouped gate_up)
-      load-bearing for correctness.
+      load-bearing for correctness. Off CUDA the axis collapses to the single value
+      False (no warp specialization), but it is still emitted.
     - ``a_memory_modes``: the A_MEMORY_MODE activation-load axis (descriptor legal only
       without a gather — the tile's rows are the contiguous sorted positions; the pruner
       fences descriptor rows when GatherIdx is passed).
@@ -410,8 +411,10 @@ def get_accelerator_autotuning_configs(
     if tune_block_n:
         blocks = [{**b, "BLOCK_SIZE_N": bn} for b in blocks for bn in (64, 128, 256)]
 
-    if warp_spec and get_active_device_type() == "cuda":
-        blocks = [{**b, "WARP_SPEC": ws} for b in blocks for ws in (False, True)]
+    if warp_spec:
+        # The axis is always EMITTED, pinned to False where warp specialization does not exist
+        ws_values = (False, True) if get_active_device_type() == "cuda" else (False,)
+        blocks = [{**b, "WARP_SPEC": ws} for b in blocks for ws in ws_values]
 
     if packed_schedule:
         # grouped M-tile resolution axis: packed-table loads vs the E-wide register-resident

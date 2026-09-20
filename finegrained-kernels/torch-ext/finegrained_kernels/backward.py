@@ -215,7 +215,7 @@ def dgrad_matmul_2d_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    WARP_SPEC: tl.constexpr = False,  # tuner axis on CUDA only; off-CUDA grids never emit it
+    WARP_SPEC: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -419,7 +419,7 @@ def dgrad_matmul_grouped_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     B_MEMORY_MODE: tl.constexpr,
-    WARP_SPEC: tl.constexpr = False,  # tuner axis on CUDA only; off-CUDA grids never emit it
+    WARP_SPEC: tl.constexpr,
     ROUTED_OUT: tl.constexpr = False,
 ):
     """Grouped dgrad. The tile resolver is reused verbatim with K-tiles in its N-tile slot —
