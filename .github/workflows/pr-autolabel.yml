@@ -12,7 +12,8 @@ name: PR Auto-Label
 #   2. Run this workflow via the Actions tab with mode=sync-labels to create every
 #      label (colors/descriptions) from .github/pr-labels.json.
 #   3. Run it again with mode=backfill to label the currently-open PRs.
-#   After that it runs automatically on every newly opened/reopened/edited PR.
+#   After that it runs automatically when a PR is opened, reopened, edited, or
+#   receives new commits.
 
 on:
   # pull_request_target runs in the BASE repo context, so it has access to
@@ -24,12 +25,11 @@ on:
   # trusted base checkout. PR title/body/filenames are treated as untrusted text
   # that is only ever fed to the classifier as data -- never run or shelled out.
   #
-  # `synchronize` (every push to a PR) is intentionally NOT in this list: the
-  # type/backend/semantic classification rarely changes per-push and a model
-  # call on every push is needlessly chatty/costly. Re-open or edit a PR, or run
-  # a manual backfill, to re-classify.
+  # `synchronize` runs after every push to a PR so all managed labels are
+  # reconciled. In particular, this removes `needs-rebase` after conflicts are
+  # resolved and adds it when a new commit introduces conflicts.
   pull_request_target:
-    types: [opened, reopened, edited]
+    types: [opened, reopened, edited, synchronize]
   workflow_dispatch:
     inputs:
       mode:

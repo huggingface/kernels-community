@@ -25,6 +25,9 @@ on:
       # test_dispatch.py asserts the concurrency keys of the build workflows, so a
       # change to one of them can break this suite too.
       - ".github/workflows/build*.yaml"
+      # test_pr_autolabel.py verifies that pushes to an open PR retrigger label
+      # reconciliation.
+      - ".github/workflows/pr-autolabel.yml"
       - ".github/workflows/test-ci-scripts.yaml"
   push:
     branches: [main]
@@ -33,6 +36,7 @@ on:
       - ".github/pr-labels.json"
       - "**/build.toml"
       - ".github/workflows/build*.yaml"
+      - ".github/workflows/pr-autolabel.yml"
       - ".github/workflows/test-ci-scripts.yaml"
   workflow_dispatch:
 
