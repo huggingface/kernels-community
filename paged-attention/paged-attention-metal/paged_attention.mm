@@ -212,16 +212,13 @@ void paged_attention_v1(
                 error ? error.localizedDescription.UTF8String
                       : "unknown error");
 
-    // Setup command buffer and encoder
+    // Get the current MPS stream
     at::mps::MPSStream *stream = at::mps::getCurrentMPSStream();
     TORCH_CHECK(stream, "Failed to get current MPS stream");
 
-    id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
-    TORCH_CHECK(cmdBuf, "Failed to get MPS command buffer");
-
     dispatch_queue_t q = stream->queue();
     dispatch_sync(q, ^{
-      id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+      id<MTLComputeCommandEncoder> enc = stream->commandEncoder();
       TORCH_CHECK(enc, "Failed to create compute command encoder");
 
       [enc setComputePipelineState:pso];
@@ -327,7 +324,6 @@ void paged_attention_v1(
       MTLSize threadgroup = MTLSizeMake(num_threads, 1, 1);
 
       [enc dispatchThreadgroups:grid threadsPerThreadgroup:threadgroup];
-      [enc endEncoding];
 
       stream->synchronize(at::mps::SyncType::COMMIT);
     });
@@ -443,12 +439,9 @@ void paged_attention_v2(
     TORCH_CHECK(lib, "Failed to create Metal library from embedded data: ",
                 error.localizedDescription.UTF8String);
 
-    // Setup command buffer and queue
+    // Get the current MPS stream
     at::mps::MPSStream *stream = at::mps::getCurrentMPSStream();
     TORCH_CHECK(stream, "Failed to get current MPS stream");
-
-    id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
-    TORCH_CHECK(cmdBuf, "Failed to get MPS command buffer");
 
     dispatch_queue_t q = stream->queue();
     dispatch_sync(q, ^{
@@ -489,7 +482,7 @@ void paged_attention_v2(
                   psoError ? psoError.localizedDescription.UTF8String
                            : "unknown error");
 
-      id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+      id<MTLComputeCommandEncoder> enc = stream->commandEncoder();
       TORCH_CHECK(enc, "Failed to create compute command encoder");
 
       [enc setComputePipelineState:mainPso];
@@ -601,7 +594,6 @@ void paged_attention_v2(
       MTLSize mainThreadgroup = MTLSizeMake(num_threads, 1, 1);
 
       [enc dispatchThreadgroups:mainGrid threadsPerThreadgroup:mainThreadgroup];
-      [enc endEncoding];
 
       // ==================================================================
       // Phase 2: Reduction kernel to combine partitions
@@ -627,7 +619,7 @@ void paged_attention_v2(
       size_t reduce_shared_memory_size =
           max_num_partitions * sizeof(float) * 2; // max_logits + exp_sums
 
-      id<MTLComputeCommandEncoder> reduceEnc = [cmdBuf computeCommandEncoder];
+      id<MTLComputeCommandEncoder> reduceEnc = stream->commandEncoder();
       TORCH_CHECK(reduceEnc,
                   "Failed to create compute command encoder for reduction");
 
@@ -678,7 +670,6 @@ void paged_attention_v2(
 
       [reduceEnc dispatchThreadgroups:reduceGrid
                 threadsPerThreadgroup:reduceThreadgroup];
-      [reduceEnc endEncoding];
 
       stream->synchronize(at::mps::SyncType::COMMIT);
     });
