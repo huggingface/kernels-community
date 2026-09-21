@@ -351,9 +351,19 @@ PREFILL_TOKENS = 256 if SMOKE else 8192
 # support first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last.
 CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2"]
 
-# Opt-in for low-VRAM parts: the same recipes and baselines at /8 experts, /2 dims, run
-# INSTEAD OF the full roster rather than alongside it. Off by default.
-SMALL_GEOMETRY = os.environ.get("FGK_BENCH_SMALL_GEOMETRY", "0") == "1"
+# Low-VRAM parts run the same recipes and baselines at /8 experts, /2 dims, INSTEAD OF the
+# full roster rather than alongside it. Selected off the device, not a knob, so a small part
+# can't silently be benched on the full roster (or vice versa).
+#
+# The threshold is set by the largest row's BUILD peak, not by its steady-state footprint:
+# build() materializes the pre-quant weights in fp32, and the E256 H4096 I2048 gate_up grid
+# alone is 256 * 2I * H * 4B = 17.2 GiB, with the quantize step live at roughly twice that
+# before the fp32 copy is freed. 64 GiB keeps a margin over that peak and puts every 32/48 GiB
+# part on the small roster while 80 GiB+ datacenter parts (where these kernels are tested)
+# keep the full one.
+FULL_ROSTER_MIN_VRAM = 64 * 1024**3
+_TOTAL_VRAM = ACCELERATOR.get_device_properties(0).total_memory
+SMALL_GEOMETRY = _TOTAL_VRAM < FULL_ROSTER_MIN_VRAM
 
 
 FULL_MOE_PROBLEMS = {
@@ -508,6 +518,11 @@ SMALL_BF16_PROBLEMS = {
 
 MOE_PROBLEMS = SMALL_MOE_PROBLEMS if SMALL_GEOMETRY else FULL_MOE_PROBLEMS
 BF16_PROBLEMS = SMALL_BF16_PROBLEMS if SMALL_GEOMETRY else FULL_BF16_PROBLEMS
+# the roster is picked off the device, so say which one ran: the two are not comparable, and a
+# figure carrying the small geometry must not be read as the full roster's numbers
+print(f"[bench] {DEVICE} has {_TOTAL_VRAM / 1024**3:.1f} GiB -> "
+      f"{'small' if SMALL_GEOMETRY else 'full'} roster "
+      f"({len(MOE_PROBLEMS)} quantized + {len(BF16_PROBLEMS)} bf16 rows)")
 
 ATTN_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096)": dict(
