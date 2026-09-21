@@ -226,6 +226,7 @@ def scenarios() -> list[Problem]:
         Problem(weights="fp8_128x128", compile=True),
         Problem(weights="mxfp4", compile=True),
         Problem(weights="bf16", compile=True),  # the fp kernel's pre_hook under compile
+        Problem(weights="fp8_tensor", static=True, compile=True),  # the static arm's operand marshalling
         # calibrated (static) activation quant, reached when As is a calibrated scale rather than
         # per-block. One value per quantized module, so the OP fixes the shape: a dense linear
         # calibrates once, a MoE calibrates each expert separately. Runs on all three ops.

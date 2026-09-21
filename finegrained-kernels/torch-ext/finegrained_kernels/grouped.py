@@ -24,7 +24,7 @@ from .bayesian_autotuner import bayesian_autotune
 from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, sm_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
-from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, mx_act_quant_grouped, quantize_routed_rows_per_expert, swizzle_grouped_mx_scales, tensor_wide_act_operands
+from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
@@ -1476,15 +1476,8 @@ def w8a8_block_static_fp8_matmul_grouped(
     )
 
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    # One calibrated scale for the whole matmul, or one per expert -- a MoE calibrates each
-    # separately. Per expert the kernel quantizes in register against the tile's own scale,
-    # because one token routes to several experts whose scales differ and so has no single
-    # pre-quantized form; one scale for all of them pre-quantizes once here instead.
-    As = As.reshape(-1).to(torch.float32)
-    # stride 0 makes every expert read the one calibrated scale; 1 gives each its own
-    as_stride = int(As.numel() == num_experts)
+    A_q, As, as_stride = static_expert_act_operands(A, As, num_experts)
     bs_u8 = ue8m0_as_uint8(Bs)
-    A_q = A if as_stride else (A.to(torch.float32) / As).to(FP8_DTYPE)
     if requant:
         C = A.new_empty(S, N, dtype=FP8_DTYPE)
         # UE8M0 model (ue8m0 weights) -> UE8M0 intermediate scales; the epilogue infers the format
@@ -1617,7 +1610,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     if as_stride_e and expand_regime(S, num_experts):
         # a per-expert calibrated scale: lay the routed rows out quantized rather than read
         # them raw through every N-tile — the same copy-amortizes-at-prefill law below
-        A, gather_idx = quantize_routed_rows_per_expert(A, As, gather_idx, expert_start, num_experts)
+        A = quantize_routed_rows_per_expert(A, As, gather_idx, expert_start, num_experts)
+        gather_idx = None  # spent: the rows are laid out now
     if A.dtype == FP8_DTYPE:
         # post-quant: trade the in-kernel gather for one packed-row copy where that wins. Keyed
         # on A being quantized, which the dynamic quant, a shared calibrated scale and the

@@ -27,7 +27,7 @@ from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLE
 from .descriptors import rebind_batched_mx_bs_descriptor
 from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .epilogue import fused_glu
-from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, tensor_wide_act_operands
+from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .loading.tiles import (
@@ -1200,15 +1200,8 @@ def w8a8_block_static_fp8_matmul_batched(
         f"the fused 'fp8' requant needs square quant blocks, got {block_size}"
     )
 
-    # One calibrated scale for the whole matmul, or one per expert -- a MoE calibrates each
-    # separately. Per expert the kernel quantizes in register against the tile's own scale,
-    # because one token routes to several experts whose scales differ and so has no single
-    # pre-quantized form; one scale for all of them pre-quantizes once here instead.
-    As = As.reshape(-1).to(torch.float32)
-    # stride 0 makes every expert read the one calibrated scale; 1 gives each its own
-    as_stride = int(As.numel() == num_experts)
+    A_q, As, as_stride = static_expert_act_operands(A, As, num_experts)
     bs_u8 = ue8m0_as_uint8(Bs)
-    A_q = A if as_stride else (A.to(torch.float32) / As).to(FP8_DTYPE)
     if requant:
         C = A.new_empty(S, N, dtype=FP8_DTYPE)
         Cs = torch.empty(S, N // block_n, device=A.device, dtype=bs_u8.dtype)

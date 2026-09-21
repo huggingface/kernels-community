@@ -19,7 +19,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
 from .formats import global_scale_stride, is_per_expert_global
-from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_op, compile_time_only_triton_wrap, decode_pdl, device_context, is_sm10x
+from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, decode_pdl, device_context, is_sm10x
 from .swizzle import swizzle_store_block
 from .scheduling import build_tile_layout, resolve_tile_inline
 
@@ -927,9 +927,25 @@ def _fp8_act_quant_kernel(
     tl.store(s_ptr + pid, s)
 
 
-@compile_time_only_triton_op(
-    add_op_namespace_prefix("fp8_act_quant_tensor_wide"), mutates_args=(), opaque=True
-)
+def static_expert_act_operands(A, As, num_experts):
+    """Activation operands of the per-expert STATIC arms: ``(A_q, As, as_stride)``.
+
+    One calibrated scale for the whole matmul, or one per expert — a MoE calibrates each
+    separately. ``as_stride`` 0 makes every expert read the one scale, 1 gives each its own.
+    Per expert the kernel quantizes in register against the tile's own scale, because one token
+    routes to several experts whose scales differ and so has no single pre-quantized form; one
+    scale for all of them pre-quantizes once here instead.
+    """
+    As = As.reshape(-1).to(torch.float32)
+    as_stride = int(As.numel() == num_experts)
+    A_q = A if as_stride else (A.to(torch.float32) / As).to(FP8_DTYPE)
+    return A_q, As, as_stride
+
+
+# Host-side operand marshalling, NOT a custom op: it returns its inputs unchanged on the
+# pre-quantized and per-expert branches, which `torch.library.custom_op` forbids (the output may
+# not alias an input), and it hands back Python strides. The quant kernels it calls carry their
+# own compile handling.
 def tensor_wide_act_operands(
     A: torch.Tensor, As: torch.Tensor | None, num_experts: int | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
@@ -1021,9 +1037,9 @@ def quantize_routed_rows_per_expert(A, As, gather_idx, expert_start, num_experts
     intermediate already is. ``As`` is untouched: the kernel dequantizes per expert whichever
     form ``A`` arrives in.
 
-    Returns ``(A, gather_idx)``, ``gather_idx`` ``None`` once the rows are laid out.
+    Returns the laid-out rows; the caller's ``gather_idx`` is spent by that layout.
     """
-    return quantize_rows_static(A, As, gather_idx, expert_start, num_experts), None
+    return quantize_rows_static(A, As, gather_idx, expert_start, num_experts)
 
 
 def fp8_act_quant_tensor_wide(
