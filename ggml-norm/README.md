@@ -21,7 +21,7 @@ overhead rather than arithmetic.
 import torch
 from kernels import get_kernel
 
-norm = get_kernel("kernels-community/ggml-norm", version=1)
+norm = get_kernel("transformers-community/ggml-norm", version=1)
 
 x = torch.randn(1, 2048, device="mps")
 weight = torch.randn(2048, device="mps")

@@ -1,13 +1,15 @@
 import random
 from typing import List, Optional, Tuple
 
-import paged_attention as ops
+import kernels
 import pytest
 import torch
-from paged_attention.platforms import current_platform
 
 from .allclose_default import get_default_atol, get_default_rtol
 from .utils import get_max_shared_memory_bytes, opcheck
+
+ops = kernels.get_kernel("kernels-community/paged-attention", version=1)
+current_platform = ops.platforms.current_platform
 
 FLOAT32_BYTES = torch.finfo(torch.float).bits // 8
 # This will change depending on the compute capability.
@@ -437,3 +439,48 @@ def ref_multi_query_kv_attention(
         ref_outputs.append(ref_output)
 
     return torch.cat(ref_outputs, dim=0)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="Requires MPS")
+@pytest.mark.parametrize("version", [1, 2])
+def test_paged_attention_after_mps_operation(version):
+    torch.manual_seed(42)
+    context, block_size, head_size, num_heads = 1024, 16, 64, 2
+    num_blocks = context // block_size
+    q_cpu = torch.randn(1, num_heads, head_size, device="cpu")
+    k_cpu, v_cpu = [torch.randn(context, head_size, device="cpu") for _ in range(2)]
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q_cpu.sin().unsqueeze(2),
+        k_cpu.expand(1, num_heads, -1, -1),
+        v_cpu.expand(1, num_heads, -1, -1),
+    ).squeeze(2)
+    query = q_cpu.to("mps")
+    key_cache = (
+        k_cpu.reshape(num_blocks, block_size, head_size // 4, 4)
+        .permute(0, 2, 1, 3).unsqueeze(1).contiguous().to("mps")
+    )
+    value_cache = (
+        v_cpu.reshape(num_blocks, block_size, head_size)
+        .transpose(1, 2).unsqueeze(1).contiguous().to("mps")
+    )
+    blocks = torch.arange(num_blocks, dtype=torch.int32, device="mps").unsqueeze(0)
+    lengths = torch.tensor([context], dtype=torch.int32, device="mps")
+    scale = torch.ones(1, device="mps")
+    out = torch.empty_like(query)
+    # Exercise both v2 passes with two nontrivial partitions.
+    exp_sums = torch.empty(1, num_heads, 2, device="mps")
+    max_logits = torch.empty_like(exp_sums)
+    tmp_out = torch.empty(1, num_heads, 2, head_size, device="mps")
+    torch.mps.synchronize()
+
+    query = query.sin()
+    args = (
+        query, key_cache, value_cache, 1, head_size**-0.5,
+        blocks, lengths, block_size, context, None, "auto", scale, scale,
+    )
+    if version == 1:
+        ops.paged_attention_v1(out, *args)
+    else:
+        ops.paged_attention_v2(out, exp_sums, max_logits, tmp_out, *args)
+    torch.testing.assert_close(out.tanh().cpu(), expected.tanh(), atol=5e-4, rtol=5e-4)
