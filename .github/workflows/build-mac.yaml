@@ -58,10 +58,6 @@ on:
         type: string
         default: ""
 
-permissions:
-  contents: read
-  statuses: write
-  id-token: write
 
 # These build workflows are reachable only via workflow_dispatch, so `github.head_ref`
 # is always empty and the group used to collapse to `github.run_id` -- unique per run,
@@ -75,9 +71,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ inputs.pr_number || github.run_id }}-${{ inputs.kernel_name }}-upload-${{ inputs.upload }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   # Build the Metal kernel; PR mode builds .#ci, release builds the full bundle and uploads.
   build-kernel:
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
     runs-on: macos-26
     strategy:
       fail-fast: false
