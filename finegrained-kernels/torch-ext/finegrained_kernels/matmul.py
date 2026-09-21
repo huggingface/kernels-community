@@ -25,7 +25,7 @@ from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, NIBBLES_PER_BY
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_weight_only_descriptors
 from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
-from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, tensor_wide_act_operands
+from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands
 from .loading.scales import apply_global_scale, mx_2d_scale_ptrs
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .loading.tiles import (
@@ -1276,6 +1276,15 @@ def w8a8_tensor_dynamic_fp8_matmul(
     """
     validate_dense_2d_operands(A, B)
 
+    # cuBLAS per-tensor fast path, INSIDE the op for the same reasons as the MX one below:
+    # every caller gets it, and a None falls through to the Triton launch unchanged.
+    if not gate and not simulate_unfused and bias is None:
+        _smm = _torch_scaled_mm_2d_tensor_wise(
+            A, B, As, Bs, None, resolve_output_dtype(output_dtype, A, None)
+        )
+        if _smm is not None:
+            return [_smm]
+
     rows, K = B.shape
     # Under gate|up fusion B is the (2N, K) gate|up stack; N is the per-projection output width.
     N = rows // 2 if gate else rows
@@ -1377,15 +1386,8 @@ def mx_dynamic_matmul(
     # direct op calls, prequantized-As callers) and so autograd keeps working: register_autograd
     # hangs on this op and saves INPUTS, so the registered dgrad serves a scaled_mm forward
     # unchanged. Measured 1.4-4.8x over the Triton kernel at every M (B200, 2026-08-27); a None
-    # falls through to the Triton launch exactly as before. Skipped under fake/meta propagation
-    # (the opaque op's fake impl runs this body with launches disabled — the shape-correct C
-    # allocation below is all fake mode needs).
-    from . import compat as _compat
-
-    if (
-        not gate and not quantize_output and bias is None and not simulate_unfused
-        and not _compat._SKIP_LAUNCHES_MIRROR
-    ):
+    # falls through to the Triton launch exactly as before.
+    if not gate and not quantize_output and bias is None and not simulate_unfused:
         _smm = _torch_scaled_mm_2d(
             A, B, As, Bs, activation_format, a_global_scale, b_global_scale,
             resolve_output_dtype(output_dtype, A, None),
@@ -1731,7 +1733,7 @@ def mx_weight_only_matmul_2d(
     return [C]
 
 
-# ── torch scaled_mm fast path (2D dense MX, Blackwell) ────────────────────────
+# ── torch scaled_mm fast path (2D dense, Blackwell) ──────────────────────────
 #
 # cuBLAS's block-scaled GEMM beats our Triton 2D kernel at EVERY measured M on the
 # quantized-activation MX formats (B200, N=18432 K=6144, 200-trial tunes, 2026-08-27):
@@ -1740,6 +1742,14 @@ def mx_weight_only_matmul_2d(
 # and its bf16 output is bit-identical to ours at every checked shape (same offline act
 # quant feeds both, fp32 accumulate). Only the M=1 swap-AB decode dispatch stays ahead
 # (18.4us vs ~33), so the route floor is M >= 2.
+#
+# Per-tensor static FP8 wins at EVERY M, decode included, so that arm has no floor (B200,
+# N=12288 K=4096, `quantize_rows_static` feeding both arms, cudagraph):
+#     M=1 12.2us vs 14.0   M=8 9.8 vs 13.0   M=64 8.9 vs 12.0   M=512 23.2 vs 34.1
+#     M=8192 320.5us vs 413.0
+# GEMM alone that is 2807 TFLOP/s against our 1993, and cuBLAS lands within 1.4% of its own
+# big-square best case (2846) — the 2-CTA + TMA warp-specialized architecture we cannot reach
+# from Triton, not a tuning gap. Relerr 1.2e-5 against the Triton arm.
 #
 # Inductor refuses to lower scaled_mm with SWIZZLE_32_4_4 scales ("does not yet support
 # non-trivial swizzles" — repros/scaled_mm_swizzle_compile.py), so the call lives behind an
@@ -1751,7 +1761,7 @@ def mx_weight_only_matmul_2d(
 _SCALED_MM_MIN_M = int(os.environ.get("FINEGRAINED_SCALED_MM_MIN_M", "2"))
 
 
-@torch.library.custom_op(add_op_namespace_prefix("scaled_mm_2d_mx"), mutates_args=())
+@torch.library.custom_op(add_op_namespace_prefix("scaled_mm_2d"), mutates_args=())
 def _scaled_mm_2d_op(
     Aq: torch.Tensor,
     As: torch.Tensor,
@@ -1767,6 +1777,13 @@ def _scaled_mm_2d_op(
     cuBLAS fast path too, not just eager ones."""
     F = torch.nn.functional
     ST, SW = F.ScalingType, F.SwizzleType
+    if fmt == "fp8":
+        return F.scaled_mm(
+            Aq, B.t(),
+            As.reshape(()), ST.TensorWise,
+            Bs.reshape(()), ST.TensorWise,
+            output_dtype=torch.bfloat16,
+        )
     if fmt == "mxfp8":
         return F.scaled_mm(
             Aq, B.t(),
@@ -1798,6 +1815,38 @@ def _smm_reject(reason):
     if os.environ.get("FINEGRAINED_SCALED_MM_DEBUG"):
         print(f"[scaled_mm route] rejected: {reason}", flush=True)
     return None
+
+
+def _torch_scaled_mm_2d_tensor_wise(A, B, As, Bs, activation_format, out_dtype):
+    """The scaled_mm route for per-tensor static FP8, or ``None`` to take the Triton ops.
+
+    One fp32 value per operand IS scaled_mm's ``TensorWise``, so this arm needs neither swizzled
+    scales nor a block-aligned K — only a STATIC activation scale, since a dynamic one would cost
+    the amax pass the Triton kernel fuses into its own loop.
+    """
+    if os.environ.get("FINEGRAINED_DISABLE_SCALED_MM"):
+        return _smm_reject("env-disabled")
+    if not is_sm10x():
+        return _smm_reject("not-sm10x")
+    if not (hasattr(torch.nn.functional, "scaled_mm") and hasattr(torch.nn.functional, "ScalingType")):
+        return _smm_reject("no-F.scaled_mm")
+    if activation_format not in (None, "fp8"):
+        return _smm_reject("activation_format")
+    if out_dtype is not torch.bfloat16:
+        return _smm_reject("out-dtype")
+    if As is None or As.numel() != 1:
+        return _smm_reject("not-static-per-tensor")
+    if As.dtype is not torch.float32 or Bs.dtype is not torch.float32:
+        # a UE8M0 container's scalar is an EXPONENT, which TensorWise would read as a multiplier
+        return _smm_reject("non-fp32 scale")
+    K = A.shape[-1]
+    if K % 16 or B.shape[0] % 16:
+        return _smm_reject("shape")
+    M = A.numel() // K
+    As = As.reshape(-1).float()
+    Aq = A.reshape(M, K) if A.dtype == FP8_DTYPE else quantize_rows_static(A.reshape(M, K), As)
+    out = _scaled_mm_2d_op(Aq, As, B, Bs.reshape(-1).float(), None, None, "fp8")
+    return out.reshape(*A.shape[:-1], B.shape[0])
 
 
 def _torch_scaled_mm_2d(A, B, As, Bs, activation_format, a_global_scale, b_global_scale, out_dtype):

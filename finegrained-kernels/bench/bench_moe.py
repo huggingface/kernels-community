@@ -468,8 +468,10 @@ ATTN_PROBLEMS = {
     # the dense half of the same per-tensor STATIC export as the Mistral-4 MoE row: its attn
     # linears carry per-tensor weights and a calibrated activation scale, on the 2D op. N is the
     # fused qkv width from the model config (32 q heads + 32 kv heads, all 128-wide, hidden 4096).
-    # No baseline: finegrained-fp8 has no static path, DeepGEMM/torch's fp8 arms here are
-    # block/MX-scaled, and a per-tensor bar timed against block-scaled work is unlike work.
+    # finegrained-fp8 has no static path and DeepGEMM's fp8 arms here are block-scaled, but
+    # torch's TensorWise scaled_mm is exactly this quantization granularity, so `torch_mm` bars
+    # it. The local arm ROUTES to that same cuBLAS call, so the two are expected to coincide —
+    # their diverging is the regression signal.
     "mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096)": dict(
         N=12288, K=4096, weights="fp8_tensor", activation_format=None,
         block=None, baselines=(), static=True,
@@ -1366,7 +1368,8 @@ def bench_attn_row(row, pname, cfg, rows_out):
     # nvfp4) — the same layouts scaled_grouped_mm consumes: torchao-blocked SWIZZLE_32_4_4
     # scales, weight scale blocked once offline, act quant + its blocking inside the timed call
     # (they change per call, the local arm's inline-quant rule). NVFP4 is two-level (block e4m3
-    # + TensorWise fp32 globals; dynamic acts ride identity). No torch bar on the BLOCK-FP8 attn
+    # + TensorWise fp32 globals; dynamic acts ride identity).
+    # Per-tensor static FP8 gets a TensorWise bar. No torch bar on the BLOCK-FP8 attn
     # rows: torch HAS the DeepSeek scheme (BlockWise1x128 + 128x128) but its CUDA impl is
     # Hopper-only, and RowWise is a different quantization granularity (measured ~20 relative) —
     # timing unlike work on a shared axis is worse than an absent bar.
@@ -1387,7 +1390,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
             swz = [SwizzleType.SWIZZLE_32_4_4, SwizzleType.NO_SWIZZLE]
             mat_b = W.view(FP4).t()
 
-            def torch_mm(a):
+            def torch_mm(a, a_scale=None):
                 aq, a_s = fgm.nvfp4_act_quant(a)
                 sa = [to_blocked(a_s.view(torch.uint8)).view(torch.float8_e4m3fn), one]
                 return torch.nn.functional.scaled_mm(
@@ -1399,12 +1402,28 @@ def bench_attn_row(row, pname, cfg, rows_out):
             swz = SwizzleType.SWIZZLE_32_4_4
             mat_b = W.t()
 
-            def torch_mm(a):
+            def torch_mm(a, a_scale=None):
                 aq, a_s = fgm.mxfp8_act_quant(a)
                 sa = to_blocked(a_s).view(torch.float8_e8m0fnu)
                 return torch.nn.functional.scaled_mm(
                     aq, mat_b, sa, rb, sb, rb,
                     swizzle_a=swz, swizzle_b=swz, output_dtype=torch.bfloat16)
+    elif cfg["weights"] == "fp8_tensor" and cfg.get("static") and not (MOCK or REPLOT):
+        # per-tensor static: one fp32 scale per operand IS scaled_mm's TensorWise, so this row
+        # has a like-for-like cuBLAS bar after all. The calibrated activation scale is passed in
+        # rather than derived, so neither arm pays an amax pass the other doesn't.
+        from finegrained_kernels.quant import quantize_rows_static
+        from torch.nn.functional import ScalingType
+
+        mat_b = W.t()
+
+        def torch_mm(a, a_scale):
+            return torch.nn.functional.scaled_mm(
+                quantize_rows_static(a, a_scale), mat_b,
+                a_scale.reshape(()), ScalingType.TensorWise,
+                Ws.reshape(()), ScalingType.TensorWise,
+                output_dtype=torch.bfloat16)
+
     for regime, tokens in (("decode", DECODE_TOKENS), ("prefill", PREFILL_TOKENS)):
         print(f"   -- {regime}")
         torch.manual_seed(0)
@@ -1425,7 +1444,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
                 b_global_scale=W_g),
         }
         if torch_mm is not None:
-            attn_arms["torch_mm"] = lambda: torch_mm(x)
+            attn_arms["torch_mm"] = lambda: torch_mm(x, attn_act_scale)
         if "finegrained-fp8" in cfg["baselines"]:
             attn_arms["finegrained-fp8"] = lambda: upstream_fp8.matmul_2d(x, W, Ws_fp8, block,
                                                        torch.bfloat16)
