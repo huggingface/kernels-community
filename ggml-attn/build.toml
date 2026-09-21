@@ -15,7 +15,7 @@ backends = ["metal"]
 
 # Where `nix run .#build-and-upload` publishes the built variants.
 [general.hub]
-repo-id = "transformers-community/ggml-attn"
+repo-id = "ggml-org/ggml-attn"
 
 [torch]
 src = [

@@ -13,7 +13,7 @@ license = "MIT"
 backends = ["metal"]
 
 [general.hub]
-repo-id = "transformers-community/ggml-gated-delta-net"
+repo-id = "ggml-org/ggml-gated-delta-net"
 
 [torch]
 src = [

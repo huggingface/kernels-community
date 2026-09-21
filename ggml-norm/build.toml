@@ -12,7 +12,7 @@ license = "MIT"
 backends = ["metal"]
 
 [general.hub]
-repo-id = "transformers-community/ggml-norm"
+repo-id = "ggml-org/ggml-norm"
 
 [torch]
 src = [
