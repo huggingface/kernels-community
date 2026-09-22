@@ -9,6 +9,7 @@
 [general]
 name = "ggml-quantization"
 version = 1
+edition = 5
 license = "MIT"
 # Metal only for now. The cuda kernel and its build section were dropped rather than kept building
 # untested -- `git log -- gguf_cuda` has them, and `vendor/` still carries ggml's cuda sources.
