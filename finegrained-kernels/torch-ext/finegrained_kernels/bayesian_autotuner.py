@@ -101,11 +101,12 @@ class BayesianAutotuner(Autotuner):
         # budget being met. Defaults to n_trials: a grid that cannot land its measurements without
         # that many rejects has a pruner gap, and the fix is to fence the dead region rather than
         # to tolerate the compiles. Its own axis so a kernel can raise it deliberately.
-        self.max_failures = int(
-            os.environ.get("FINEGRAINED_AUTOTUNE_MAX_FAILURES")
-            or max_failures
-            or self.n_trials
-        )
+        # an explicit argument wins over the env override, which wins over the default; `or`
+        # would drop a deliberate `max_failures=0`, the strictest setting there is
+        if max_failures is None:
+            env_max_failures = os.environ.get("FINEGRAINED_AUTOTUNE_MAX_FAILURES")
+            max_failures = env_max_failures if env_max_failures is not None else self.n_trials
+        self.max_failures = int(max_failures)
         self.n_startup_trials = n_startup_trials
         # top fraction of measured configs the TPE treats as "good"
         self.gamma = gamma

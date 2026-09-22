@@ -176,7 +176,21 @@ steps:
 - Fetch the upstream Git repository from https://github.com/Dao-AILab/flash-attention.git
 - Check out the tag that the user specified.
 - Flash Attention 4 is in the directory `flash_attn/cute` of the upstream repo.
-- Copy Flash Attention 4 upstream files to `flash-attn4/torch-ext/flash_attn4`.
+- Copy Flash Attention 4 upstream files to `flash-attn4/torch-ext/flash_attn4`,
+  except the benchmarking and tuning scripts, which are deliberately not
+  vendored:
+  - `benchmark.py`
+  - `benchmark_flash_attention_fp8.py`
+  - `bench_utils.py`
+  - `sm90_config_search.py`
+
+  Nothing in the kernel imports these, and every `.py` in this directory is
+  shipped in the build, so vendoring them just adds dead weight to what users
+  download. They are also standalone `argparse` CLIs meant to be run as
+  `python -m flash_attn.cute.<name>`, which cannot work for a Hub kernel since
+  it is loaded under a hashed module name. Do not re-add them. After a sync,
+  check that no newly added upstream file is unreachable from `__init__.py`
+  for the same reason.
 - Copy tests from the tests from the upstream directory `tests/cute` to
   `flash-attn4/tests/cute`.
 - Check in `flash_attn/cute/pyproject.toml` upstream what version of quack is
@@ -187,6 +201,19 @@ steps:
   `flash-attn4/torch-ext/flash_attn4` and `flash-attn4/torch-ext/flash_attn4/quack`
   relative imports.
 - Remove all quack files in `flash-attn4/torch-ext/flash_attn4/quack` that are not used.
+  Decide this by following imports, but note that an import graph does **not**
+  capture modules whose only job is an import-time side effect. In particular,
+  keep `quack/dsl/cute_tensor_indexing.py` and have `quack/__init__.py` do
+  `from . import dsl`, mirroring upstream's `quack/__init__.py`. That module
+  monkey-patches CuTe's tensor classes so that `...` and `:` work in
+  `__getitem__`/`__setitem__`; `quack/copy_utils.py` relies on the sugar
+  (`tRS_sC[..., dst_idx]`), as do `softmax.py` and `testing.py`. Without it the
+  sm90 backward kernel dies with
+  `ValueError: Expected Coord, whose leaves are integers or None, but got (Ellipsis, ...)`.
+  Nothing catches this locally: the CI runner is sm89, where the whole sm90
+  backward path is unreachable, and sm100 does not use it either. Upstream's
+  `quack/__init__.py` cannot be copied verbatim, since it also imports
+  `rmsnorm`/`softmax`/`cross_entropy`, which are not vendored.
 - Update imports of `flash_attn.cute` in `flash-attn4/tests/cute` to `flash_attn4`.
 - Set `__version__` in `flash-attn4/torch-ext/flash_attn4/__init__.py` to the
   version from the tag (e.g. for tag `fa4-v4.0.0.beta8` set it to
