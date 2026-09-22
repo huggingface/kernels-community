@@ -19,6 +19,10 @@ class BlockInfo:
     window_size_left: Optional[Int32] = None
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+    num_splits: Int32 = 1
+    # If True, the scheduler packs num_splits into the top 16 bits of split_idx
+    pack_split_idx: cutlass.Constexpr[bool] = False
+    num_n_blocks_per_split: Optional[cutlass.Constexpr[Int32]] = None
 
     @cute.jit
     def get_n_block_min_max(
@@ -45,11 +49,20 @@ class BlockInfo:
             n_idx_left = n_idx - self.window_size_left
             n_block_min = cutlass.max(n_idx_left // self.tile_n, 0)
         if cutlass.const_expr(self.is_split_kv):
-            num_n_blocks_per_split = (
-                Int32(0)
-                if n_block_max <= n_block_min
-                else (n_block_max - n_block_min + num_splits - 1) // num_splits
-            )
+            if const_expr(self.pack_split_idx):
+                # Unpack num_splits from top 16 bits of split_idx (packed by scheduler)
+                num_splits = split_idx >> 16
+                split_idx = split_idx & 0xFFFF
+            else:
+                num_splits = self.num_splits
+            if const_expr(self.num_n_blocks_per_split is not None):
+                num_n_blocks_per_split = self.num_n_blocks_per_split
+            else:
+                num_n_blocks_per_split = (
+                    Int32(0)
+                    if n_block_max <= n_block_min
+                    else (n_block_max - n_block_min + num_splits - 1) // num_splits
+                )
             n_block_min = n_block_min + split_idx * num_n_blocks_per_split
             n_block_max = cutlass.min(n_block_min + num_n_blocks_per_split, n_block_max)
         return n_block_min, n_block_max
@@ -137,3 +150,20 @@ class BlockInfo:
             n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
             n_idx_left = n_idx - self.window_size_left
             return cutlass.max(n_block_min, cute.ceil_div(n_idx_left, self.tile_n))
+
+    @cute.jit
+    def get_n_block_max_for_m_block(
+        self,
+        seqlen_info: SeqlenInfoQK,
+        m_block: Int32,
+    ) -> Int32:
+        n_block_max = cute.ceil_div(seqlen_info.seqlen_k, self.tile_n)
+        if const_expr(self.is_causal or self.window_size_right is not None):
+            m_idx_max = (m_block + 1) * self.tile_m
+            if const_expr(self.qhead_per_kvhead_packgqa > 1):
+                m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
+            n_idx_right = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
+            if const_expr(self.window_size_right is not None):
+                n_idx_right += self.window_size_right
+            n_block_max = min(n_block_max, cute.ceil_div(n_idx_right, self.tile_n))
+        return n_block_max
