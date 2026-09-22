@@ -1,17 +1,19 @@
-# Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+# Copyright (c) 2025-2026, QuACK team.
 
-from typing import Optional, Type, Tuple, Callable, Sequence
+from typing import Any, Optional, Type, Tuple, Callable, Sequence
 from functools import partial
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils.blackwell_helpers as sm100_utils
 
 from cutlass import Int32, Int16, Boolean, const_expr
-from cutlass.cute.nvgpu import cpasync, warp, warpgroup
+from cutlass.base_dsl.arch import Arch
+from cutlass.cute.nvgpu import cpasync, tcgen05, warp
 from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
 from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.utils import LayoutEnum
 import cutlass.pipeline
-from cutlass._mlir.dialects import llvm
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
 
@@ -20,6 +22,97 @@ from .utils import make_vector
 
 
 Sm100MmaPeerBitMask = 0xFEFFFFFF
+_TCGEN05_TMEM_OPS = (
+    tcgen05.Ld16x128bOp,
+    tcgen05.Ld16x256bOp,
+    tcgen05.Ld16x32bx2Op,
+    tcgen05.Ld16x64bOp,
+    tcgen05.Ld32x32bOp,
+    tcgen05.LdRed16x32bx2Op,
+    tcgen05.LdRed32x32bOp,
+    tcgen05.St16x128bOp,
+    tcgen05.St16x256bOp,
+    tcgen05.St16x32bx2Op,
+    tcgen05.St16x64bOp,
+    tcgen05.St32x32bOp,
+)
+_TCGEN05_TMEM_STORE_OPS = (
+    tcgen05.St16x128bOp,
+    tcgen05.St16x256bOp,
+    tcgen05.St16x32bx2Op,
+    tcgen05.St16x64bOp,
+    tcgen05.St32x32bOp,
+)
+
+
+def tmem_store_atom_from_load_atom(
+    copy_atom_t2r: Any,
+    src_dtype: Type[cutlass.Numeric],
+    dst_dtype: Type[cutlass.Numeric],
+) -> cute.CopyAtom:
+    """Return the matching tcgen05 R2T store atom for a selected T2R load atom.
+
+    `src_dtype` is the register fragment dtype loaded by T2R; `dst_dtype` is
+    the TMEM element dtype to store. Ratio 1 uses CUTLASS's operation-family
+    mapping directly. Ratio 2 is intentionally narrow: we allow the current
+    Ld32x32b path by halving repeat, and the widest 16dp path by halving the
+    vector width. Narrower 16dp cross-family mappings are not mirrored by
+    CUTLASS's same-family helper, so they assert until validated.
+
+    C++ CuTe's operation-family mapping is `cute::TMEM::tmem_load_to_store`:
+    https://github.com/NVIDIA/cutlass/blob/main/include/cute/atom/copy_traits_sm100.hpp#L3274
+    """
+    load_op = copy_atom_t2r.op if const_expr(hasattr(copy_atom_t2r, "op")) else copy_atom_t2r
+    if const_expr(hasattr(load_op, "op")):
+        load_op = load_op.op
+    assert src_dtype.width >= dst_dtype.width, "TMEM R2T helper only supports narrowing stores"
+    assert src_dtype.width % dst_dtype.width == 0, "TMEM source/destination widths must divide"
+    ratio = src_dtype.width // dst_dtype.width
+    assert ratio in (1, 2), "TMEM R2T helper only supports src/dst width ratio 1 or 2"
+    repeat = load_op.repeat
+    unpack = tcgen05.Unpack.NONE
+    if const_expr(getattr(load_op, "pack", None) == tcgen05.Pack.PACK_16b_IN_32b):
+        unpack = tcgen05.Unpack.UNPACK_32b_IN_16b
+    if const_expr(isinstance(load_op, tcgen05.Ld16x64bOp)):
+        assert ratio == 1, "No validated ratio-2 store mapping for Ld16x64bOp"
+        store_op = tcgen05.St16x64bOp(repeat, unpack)
+    elif const_expr(isinstance(load_op, tcgen05.Ld16x128bOp)):
+        assert ratio == 1, "No validated ratio-2 store mapping for Ld16x128bOp"
+        store_op = tcgen05.St16x128bOp(repeat, unpack)
+    elif const_expr(isinstance(load_op, tcgen05.Ld16x256bOp)):
+        store_op = (
+            tcgen05.St16x256bOp(repeat, unpack)
+            if const_expr(ratio == 1)
+            else tcgen05.St16x128bOp(repeat, unpack)
+        )
+    elif const_expr(isinstance(load_op, tcgen05.Ld16x32bx2Op)):
+        assert ratio == 1, "No validated ratio-2 store mapping for Ld16x32bx2Op"
+        store_op = tcgen05.St16x32bx2Op(repeat, unpack)
+    elif const_expr(isinstance(load_op, tcgen05.Ld32x32bOp)):
+        if const_expr(ratio == 2):
+            assert repeat.value % 2 == 0, "Ld32x32b ratio-2 store needs even repeat"
+            repeat = tcgen05.Repetition(repeat.value // 2)
+        store_op = tcgen05.St32x32bOp(repeat, unpack)
+    else:
+        raise TypeError(f"Unsupported TMEM load op for store conversion: {type(load_op)}")
+    return cute.make_copy_atom(store_op, dst_dtype)
+
+
+def _tmem_copy_reg_tv_layout(tiled_copy: cute.TiledCopy):
+    """Return the register-side TV layout for a tcgen05 tmem copy."""
+    op = tiled_copy.op
+    if const_expr(hasattr(op, "op")):
+        op = op.op
+    if const_expr(isinstance(op, _TCGEN05_TMEM_OPS)):
+        # TMEM stores read from registers; all other TMEM copy ops here write
+        # registers, including LdRed* reductions that upstream is_tmem_load
+        # intentionally does not classify as plain loads.
+        return (
+            tiled_copy.layout_src_tv_tiled
+            if const_expr(isinstance(op, _TCGEN05_TMEM_STORE_OPS))
+            else tiled_copy.layout_dst_tv_tiled
+        )
+    raise TypeError(f"Cannot infer tmem copy direction from tiled_copy.op={op}")
 
 
 @dsl_user_op
@@ -76,6 +169,13 @@ def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
 
 
 @dsl_user_op
+def contiguous(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    dst = cute.make_rmem_tensor(src.shape, src.element_type, loc=loc, ip=ip)
+    cute.autovec_copy(src, dst, loc=loc, ip=ip)
+    return dst
+
+
+@dsl_user_op
 def load_s2r_retile(
     tiled_copy: cute.TiledCopy,
     src: cute.Tensor,
@@ -95,11 +195,19 @@ def load_s2r_retile(
 
 @dsl_user_op
 def load_t2r(
-    thr_copy: cute.ThrCopy, shape: cute.Shape, src: cute.Tensor, *, loc=None, ip=None
+    tiled_copy: cute.TiledCopy,
+    src: cute.Tensor,
+    *,
+    loc=None,
+    ip=None,
 ) -> cute.Tensor:
-    cDst = cute.make_identity_tensor(shape)
-    dst = cute.make_rmem_tensor(thr_copy.partition_D(cDst).shape, src.element_type, loc=loc, ip=ip)
-    cute.copy(thr_copy, src, dst, loc=loc, ip=ip)
+    """Load one tmem tile partition into rmem, deriving the rmem shape from `src`.
+
+    `src` should already be indexed to the tile being copied, with any
+    stage/subtile modes removed.
+    """
+    dst = tmem_reg_frag(tiled_copy, src, loc=loc, ip=ip)
+    cute.copy(tiled_copy, src, dst, loc=loc, ip=ip)
     return dst
 
 
@@ -321,18 +429,14 @@ def as_position_independent_swizzle_tensor(tensor: cute.Tensor) -> cute.Tensor:
     return cute.make_tensor(cute.recast_ptr(tensor.iterator, dtype=tensor.element_type), new_layout)
 
 
-def partition_D_position_independent(
-    thr_copy: cute.core.ThrCopy, tensor: cute.Tensor
-) -> cute.Tensor:
+def partition_D_position_independent(thr_copy: cute.ThrCopy, tensor: cute.Tensor) -> cute.Tensor:
     return cute.make_tensor(
         swizzle_ptr(thr_copy.partition_D(tensor).iterator),
         thr_copy.partition_D(as_position_independent_swizzle_tensor(tensor)).layout,
     )
 
 
-def partition_S_position_independent(
-    thr_copy: cute.core.ThrCopy, tensor: cute.Tensor
-) -> cute.Tensor:
+def partition_S_position_independent(thr_copy: cute.ThrCopy, tensor: cute.Tensor) -> cute.Tensor:
     return cute.make_tensor(
         swizzle_ptr(thr_copy.partition_S(tensor).iterator),
         thr_copy.partition_S(as_position_independent_swizzle_tensor(tensor)).layout,
@@ -373,12 +477,12 @@ def sm90_get_smem_load_op(
 
 
 def get_smem_store_atom(
-    arch: cutlass.Constexpr[int],
     element_type: Type[cute.Numeric],
     transpose: bool = False,
     major_mode_size: Optional[int] = None,
 ) -> cute.CopyAtom:
-    if const_expr(arch < 90 or element_type.width != 16):
+    arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+    if const_expr(arch < Arch.sm_90 or element_type.width != 16):
         return cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             element_type,
@@ -397,12 +501,12 @@ def get_smem_store_atom(
 
 
 def get_smem_load_atom(
-    arch: cutlass.Constexpr[int],
     element_type: Type[cute.Numeric],
     transpose: bool = False,
     major_mode_size: Optional[int] = None,
 ) -> cute.CopyAtom:
-    if const_expr(arch < 90 or element_type.width != 16):
+    arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+    if const_expr(arch < Arch.sm_90 or element_type.width != 16):
         return cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             element_type,
@@ -421,26 +525,35 @@ def get_smem_load_atom(
 
 
 def get_smem_store_C(
-    tiled_mma: cute.TiledMma,
+    tiled_mma: cute.TiledMma | cute.TiledCopy,
     sC: cute.Tensor,
     tidx: Int32,
-    arch: int,
     transpose: bool = False,
     position_independent=False,
     major_mode_size: Optional[int] = None,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sC.element_type
-    copy_atom = get_smem_store_atom(arch, dtype, transpose, major_mode_size=major_mode_size)
-    tiled_copy = cute.make_tiled_copy_C(copy_atom, tiled_mma)
+    if const_expr(isinstance(tiled_mma, cute.TiledCopy)):
+        tiled_copy_t2r = tiled_mma
+        layout = LayoutEnum.COL_MAJOR if const_expr(transpose) else LayoutEnum.ROW_MAJOR
+        copy_atom = sm100_utils.get_smem_store_op(
+            layout, dtype, tiled_copy_t2r.value_type, tiled_copy_t2r
+        )
+        tiled_copy = cute.make_tiled_copy_D(copy_atom, tiled_copy_t2r)
+    else:
+        copy_atom = get_smem_store_atom(dtype, transpose, major_mode_size=major_mode_size)
+        tiled_copy = cute.make_tiled_copy_C(copy_atom, tiled_mma)
     thr_copy = tiled_copy.get_slice(tidx)
     if const_expr(not position_independent):
         tRS_sC = thr_copy.partition_D(sC)
     else:
         tRS_sC = partition_D_position_independent(thr_copy, sC)
 
-    def copy_fn(src: cute.Tensor, dst_idx: Optional[Int32] = None, **new_kwargs):
-        dst_tensor = tRS_sC if const_expr(dst_idx is None) else tRS_sC[None, None, None, dst_idx]
+    def copy_fn(src: cute.Tensor, dst_idx: Optional[Int32] = None, fence=False, **new_kwargs):
+        dst_tensor = tRS_sC if const_expr(dst_idx is None) else tRS_sC[..., dst_idx]
         cvt_copy(tiled_copy, src, dst_tensor, retile=True, **new_kwargs)
+        if const_expr(fence):
+            cute.arch.fence_view_async_shared()
 
     return copy_fn, thr_copy, tRS_sC
 
@@ -449,19 +562,18 @@ def get_smem_load_C(
     tiled_mma: cute.TiledMma,
     sC: cute.Tensor,
     tidx: Int32,
-    arch: int,
     transpose: bool = False,
     position_independent=False,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sC.element_type
-    copy_atom = get_smem_load_atom(arch, dtype, transpose)
+    copy_atom = get_smem_load_atom(dtype, transpose)
     tiled_copy = cute.make_tiled_copy_C(copy_atom, tiled_mma)
     thr_copy = tiled_copy.get_slice(tidx)
     if const_expr(not position_independent):
         tSR_sC = thr_copy.partition_S(sC)
     else:
         tSR_sC = partition_S_position_independent(thr_copy, sC)
-    copy_atom_RS = get_smem_store_atom(arch, dtype, transpose)
+    copy_atom_RS = get_smem_store_atom(dtype, transpose)
     thr_copy_RS = cute.make_tiled_copy_C(copy_atom_RS, tiled_mma).get_slice(tidx)
     tRS_shape = thr_copy_RS.partition_S(cute.make_identity_tensor(sC.shape[:2])).shape
 
@@ -475,10 +587,18 @@ def get_smem_load_C(
 def epilog_smem_copy_atom(
     tiled_mma: cute.TiledMma, epi_tile: cute.Shape, transpose: bool = False
 ) -> cute.TiledCopy:
-    copy_atom_C = cute.make_copy_atom(
-        warp.StMatrix8x8x16bOp(transpose, num_matrices=4 if epi_tile[1] % 16 == 0 else 2),
-        cutlass.Float16,  # this is just to get the right source layout
-    )
+    arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+    if const_expr(arch < Arch.sm_90):
+        copy_atom_C = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            cutlass.Float16,  # this is just to get the right source layout
+            num_bits_per_copy=(2 if not transpose else 1) * cutlass.Float16.width,
+        )
+    else:
+        copy_atom_C = cute.make_copy_atom(
+            warp.StMatrix8x8x16bOp(transpose, num_matrices=4 if epi_tile[1] % 16 == 0 else 2),
+            cutlass.Float16,  # this is just to get the right source layout
+        )
     tiled_copy_C_atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
     return tiled_copy_C_atom
 
@@ -488,13 +608,12 @@ def get_smem_store_epi(
     epi_tile: cute.Shape,
     sC: Optional[cute.Tensor],
     tidx: Int32,
-    arch: int,
     transpose: bool = False,
     position_independent=False,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor, cute.Tensor]:
     dtype = sC.element_type if const_expr(sC is not None) else cutlass.Float16
+    copy_atom = get_smem_store_atom(dtype, transpose)
     tiled_copy_C_atom = epilog_smem_copy_atom(tiled_mma, epi_tile)
-    copy_atom = get_smem_store_atom(arch, dtype, transpose)
     tiled_copy = cute.make_tiled_copy_S(copy_atom, tiled_copy_C_atom)
     thr_copy = tiled_copy.get_slice(tidx)
     tRS_sC = None
@@ -515,11 +634,11 @@ def get_smem_store_epi(
 
 
 def get_smem_store_A(
-    tiled_mma: cute.TiledMma, sA: cute.Tensor, tidx: Int32, arch: int, position_independent=False
+    tiled_mma: cute.TiledMma, sA: cute.Tensor, tidx: Int32, position_independent=False
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sA.element_type
-    transpose = tiled_mma.op.a_major_mode == warpgroup.OperandMajorMode.MN
-    copy_atom = get_smem_store_atom(arch, dtype, transpose)
+    transpose = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.MN
+    copy_atom = get_smem_store_atom(dtype, transpose)
     tiled_copy = cute.make_tiled_copy_A(copy_atom, tiled_mma)
     thr_copy = tiled_copy.get_slice(tidx)
     if const_expr(not position_independent):
@@ -537,13 +656,12 @@ def get_smem_load_A(
     tiled_mma: cute.TiledMma,
     sA: cute.Tensor,
     tidx: Int32,
-    arch: int,
     with_dst_tensor: bool = False,
     position_independent=False,
 ) -> Tuple[Callable, cute.TiledCopy, cute.Tensor]:
     dtype = sA.element_type
-    transpose = tiled_mma.op.a_major_mode == warpgroup.OperandMajorMode.MN
-    copy_atom = get_smem_load_atom(arch, dtype, transpose)
+    transpose = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.MN
+    copy_atom = get_smem_load_atom(dtype, transpose)
     tiled_copy = cute.make_tiled_copy_A(copy_atom, tiled_mma)
     thr_copy = tiled_copy.get_slice(tidx)
     if const_expr(not position_independent):
@@ -572,19 +690,16 @@ def cpasync_reduce_bulk_add_f32(
     loc=None,
     ip=None,
 ):
-    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip)
     # cache_hint = cutlass.Int64(0x14F0000000000000)  # EVICT_LAST
-    llvm.inline_asm(
-        None,
-        [gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes).ir_value()],
-        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;",
-        "l,r,r",
+    cute.arch.inline_ptx(
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [{$r0}], [{$r1}], {$r2};",
+        read_only_args=[gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes)],
         # [gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes).ir_value(), cache_hint.ir_value()],
         # "cp.reduce.async.bulk.global.shared::cta.bulk_group.L2::cache_hint.add.f32 [$0], [$1], $2, $3;",
         # "l,r,r,l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -675,33 +790,34 @@ def tma_gather4_load(
     """
     if len(row_indices) != 4:
         raise ValueError(f"gather4 requires exactly 4 row indices, got {len(row_indices)}")
-    col_val = Int32(col_idx).ir_value()
-    row_vals = [Int32(row_idx).ir_value() for row_idx in row_indices]
+    col_val = Int32(col_idx)
+    row_vals = [Int32(row_idx) for row_idx in row_indices]
     # Convert pointers to integer addresses
-    desc_addr = tma_desc_ptr.toint(loc=loc, ip=ip).ir_value()
-    dst_addr = dst_smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    desc_addr = tma_desc_ptr.toint(loc=loc, ip=ip)
+    dst_addr = dst_smem_ptr.toint(loc=loc, ip=ip)
     mbar_addr = mbarrier_ptr.toint(loc=loc, ip=ip)
     if num_cta > 1:
         # Executed by both CTAs. Set peer bit to 0 so that the
         # transaction bytes will update CTA0's barrier.
         mbar_addr = mbar_addr & Sm100MmaPeerBitMask
-    mbar_addr = mbar_addr.ir_value()
+    mbar_addr = Int32(mbar_addr)
     # Handle multicast_mask - may already be ir.Value or Python int
     multicast_mask_val = None
     if multicast_mask is not None:
-        multicast_mask_val = Int16(multicast_mask).ir_value()
+        multicast_mask_val = Int16(multicast_mask)
     assert multicast_mask_val is None, "multicast is not supported yet"
     # Emit inline PTX for TMA gather4
     # PTX: cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes
     #      [dstMem], [tensorMap, {col, row0, row1, row2, row3}], [smem_bar];
     ptx = (
-        f"cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.cta_group::{num_cta} "
-        "[$0], [$1, {$2, $3, $4, $5, $6}], [$7];"
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes."
+        f"cta_group::{num_cta} "
+        "[{$r0}], [{$r1}, {{$r2}, {$r3}, {$r4}, {$r5}, {$r6}}], [{$r7}];"
     )
 
-    llvm.inline_asm(
-        None,
-        [
+    cute.arch.inline_ptx(
+        ptx,
+        read_only_args=[
             dst_addr,
             desc_addr,
             col_val,
@@ -711,11 +827,6 @@ def tma_gather4_load(
             row_vals[3],
             mbar_addr,
         ],
-        ptx,
-        "r,l,r,r,r,r,r,r",  # constraints: register, long, 6x register
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
     )
@@ -802,6 +913,161 @@ def tma_get_copy_fn(
     return (copy_tma if const_expr(not single_stage) else copy_tma_single_stage), s, g
 
 
+def s2t_get_copy_fn(
+    src_tensor: cute.Tensor,
+    dst_tensor: cute.Tensor,
+    cta_group: tcgen05.CtaGroup,
+) -> Callable:
+    """
+    Make tiledCopy for smem to tmem load, then return a copy function over stages.
+
+    :param src_tensor: The source tensor in smem
+    :param dst_tensor: The destination tensor in tmem
+    """
+    assert src_tensor.element_type == dst_tensor.element_type
+    # (MMA, MMA_MN, MMA_K, STAGE)
+    src_compact = cute.filter_zeros(src_tensor)
+    # (MMA, MMA_MN, MMA_K)
+    dst_compact = cute.filter_zeros(dst_tensor)
+    # Make S2T CopyAtom and tiledCopy.
+    copy_atom = cute.make_copy_atom(tcgen05.Cp4x32x128bOp(cta_group), dst_tensor.element_type)
+    tiled_copy = tcgen05.make_s2t_copy(copy_atom, dst_compact)
+    thr_copy = tiled_copy.get_slice(0)
+    # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K, STAGE)
+    src_partition = tcgen05.get_s2t_smem_desc_tensor(tiled_copy, thr_copy.partition_S(src_compact))
+    # ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K)
+    dst_partition = thr_copy.partition_D(dst_compact)
+
+    @dsl_user_op
+    def copy_s2t(stage_idx, *, loc=None, ip=None, **new_kwargs):
+        # Stage slice of partitioned source tensor: ((ATOM_V, REST_V), Rest_Tiler, MMA_MN, MMA_K)
+        stage_coord = (None, None, None, None, stage_idx)
+        cute.copy(
+            tiled_copy, src_partition[stage_coord], dst_partition, loc=loc, ip=ip, **new_kwargs
+        )
+
+    return copy_s2t
+
+
+# tcgen05 TMEM <-> RMEM helpers (t2r loads / r2t stores).
+#
+# The register-side fragment of a tmem copy is derivable by layout algebra,
+# with no reference to the original (pre-partition) tile tensor:
+# - the per-thread register VALUE shape is mode 1 of the tiled copy's
+#   register-side TV layout (`layout_dst_tv_tiled` for loads,
+#   `layout_src_tv_tiled` for stores). The tmem-side partition can't supply
+#   it: tmem partitioning is warp-collective, so its value mode counts tmem
+#   cells across the whole warp, not per-thread register elements.
+# - the tile-iteration modes are shared between partition_S and partition_D
+#   (same tiler over the same tile extent), so they can be read off whichever
+#   side was already partitioned.
+# This kills the make-a-fake/identity-tensor-and-partition_D dance previously
+# needed at every t2r site.
+
+
+def tmem_reg_frag(
+    tiled_copy: cute.TiledCopy,
+    partitioned: cute.Tensor,
+    num_extra_modes: int = 0,
+    dtype: Optional[Type[cutlass.Numeric]] = None,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Tensor:
+    """Allocate the per-thread register fragment for ONE tile of a tcgen05
+    tmem copy, given any partitioned view of it (tmem or otherwise).
+
+    `partitioned` is (V, iter..., extra...) as produced by partition_S/_D;
+    the trailing `num_extra_modes` modes (stage, epi-subtile, ...) are
+    excluded from the fragment and indexed at copy time instead. `dtype`
+    defaults to `partitioned.element_type`.
+    The register side is inferred from the tcgen05 load/store op: destination
+    for t2r loads, source for r2t stores."""
+    tv = _tmem_copy_reg_tv_layout(tiled_copy)
+    val_shape = tv.shape[1]
+    rank = cute.rank(partitioned.shape)
+    iters = tuple(partitioned.shape[i] for i in range(1, rank - num_extra_modes))
+    frag_dtype = partitioned.element_type if const_expr(dtype is None) else dtype
+    return cute.make_rmem_tensor((val_shape, *iters), frag_dtype, loc=loc, ip=ip)
+
+
+def r2s_partition_from_t2r(
+    tiled_copy_t2r: cute.TiledCopy,
+    s: cute.Tensor,
+    tidx: Int32,
+    transpose: bool = False,
+    position_independent=False,
+) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+    """SMEM-store (r2s) side chained off a tmem-load tiled copy: the r2s copy
+    inherits the t2r copy's per-thread value ownership via make_tiled_copy_D,
+    so the loaded fragment can be stored (post-conversion) without a shuffle.
+    By default the store atom is selected like SM100 GEMM epilogues:
+    `get_smem_store_op(layout, dst_dtype, tiled_copy_t2r.value_type, tiled_copy_t2r)`,
+    so the stmatrix shape follows the tmem-load atom. `transpose=True` maps to
+    COL_MAJOR, otherwise ROW_MAJOR.
+
+    `s` is the staged SMEM tile; its trailing stage mode is excluded from the
+    register fragment. `position_independent=True` partitions through a
+    position-independent swizzle view, matching `get_smem_store_C`.
+    Returns `(tiled_copy, tRS_r, tRS_s)`; store via
+    `cute.copy(tiled_copy, tRS_r, tRS_s[..., idx])`."""
+    dtype = s.element_type
+    layout = LayoutEnum.COL_MAJOR if const_expr(transpose) else LayoutEnum.ROW_MAJOR
+    copy_atom = sm100_utils.get_smem_store_op(
+        layout, dtype, tiled_copy_t2r.value_type, tiled_copy_t2r
+    )
+    tiled_copy = cute.make_tiled_copy_D(copy_atom, tiled_copy_t2r)
+    thr_copy = tiled_copy.get_slice(tidx)
+    if const_expr(not position_independent):
+        tRS_s = thr_copy.partition_D(s)
+    else:
+        tRS_s = partition_D_position_independent(thr_copy, s)
+    rank = cute.rank(tRS_s.shape)
+    frag_shape = tuple(tRS_s.shape[i] for i in range(rank - 1))
+    tRS_r = cute.make_rmem_tensor(frag_shape, dtype)
+    return tiled_copy, tRS_r, tRS_s
+
+
+def s2r_partition_from_t2r(
+    tiled_copy_t2r: cute.TiledCopy,
+    s: cute.Tensor,
+    tidx: Int32,
+    r_layout: cute.Layout,
+    copy_atom: Optional[cute.CopyAtom] = None,
+    transpose: bool = False,
+    position_independent=False,
+) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor, cute.Tensor]:
+    """SMEM-load (s2r) counterpart of `r2s_partition_from_t2r` (ldmatrix vs
+    stmatrix), for reading an epilogue input that was TMA-staged into an
+    epi-tile SMEM buffer (e.g. C in gemm, z in ssd) into registers
+    element-aligned with the t2r fragments. The register fragment is
+    allocated with `r_layout` (pass the r2s fragment's layout) so its linear
+    element order matches the t2r/r2s fragments; `tSR_r` is its retiled view
+    for the collective copy. Per-warp SMEM footprints of this load and the
+    chained r2s store coincide, so reusing one buffer for input then output
+    is warp-local (no inter-warp hazard).
+
+    `position_independent=True` partitions through a position-independent
+    swizzle view, matching `get_smem_load_C`.
+
+    Returns `(tiled_copy, tRS_r, tSR_r, tSR_s)`; load via
+    `cute.copy(tiled_copy, tSR_s[..., idx], tSR_r)` then read `tRS_r`."""
+    dtype = s.element_type
+    if const_expr(copy_atom is None):
+        copy_atom = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=transpose, num_matrices=4), dtype
+        )
+    tiled_copy = cute.make_tiled_copy_D(copy_atom, tiled_copy_t2r)
+    thr_copy = tiled_copy.get_slice(tidx)
+    if const_expr(not position_independent):
+        tSR_s = thr_copy.partition_S(s)
+    else:
+        tSR_s = partition_S_position_independent(thr_copy, s)
+    tRS_r = cute.make_rmem_tensor(r_layout, dtype)
+    tSR_r = tiled_copy.retile(tRS_r)
+    return tiled_copy, tRS_r, tSR_r, tSR_s
+
+
 def tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsync):
     def copy_fn(src_idx, producer_state: cutlass.pipeline.PipelineState, **new_kwargs):
         copy(
@@ -810,6 +1076,18 @@ def tma_producer_copy_fn(copy: Callable, pipeline: cutlass.pipeline.PipelineAsyn
             tma_bar_ptr=pipeline.producer_get_barrier(producer_state),
             **new_kwargs,
         )
+
+    return copy_fn
+
+
+def chain_tma_producer_copy_fns(copy_fns: Sequence[Optional[Callable]]):
+    if not any(fn is not None for fn in copy_fns):
+        return None
+
+    def copy_fn(src_idx, producer_state: cutlass.pipeline.PipelineState, **new_kwargs):
+        for fn in copy_fns:
+            if const_expr(fn is not None):
+                fn(src_idx=src_idx, producer_state=producer_state, **new_kwargs)
 
     return copy_fn
 
@@ -857,7 +1135,7 @@ def gather_m_get_copy_fn(
 
     mA_k = cute.logical_divide(mA, (None, tile_K))
 
-    def copy_fn(src_idx, dst_idx, pred: bool = False):
+    def copy_fn(src_idx, dst_idx, pred: cutlass.Constexpr[bool] = False):
         tApA_k = None
         if const_expr(pred):
             tApA_k = cute.make_rmem_tensor(cols_per_thread, Boolean)
