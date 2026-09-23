@@ -22,6 +22,7 @@ import enum
 import json
 import sys
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 import pygit2
@@ -417,12 +418,17 @@ def _all_grew(base: str, head: str) -> bool:
     return isinstance(old, list) and isinstance(new, list) and set(old) < set(new)
 
 
-# Returns {"breaking": ..., "additive": ...}. Breaking covers symbols that were
-# removed or whose signature changed, additive covers newly exposed ones. Both
-# require a version bump.
+@dataclass(frozen=True)
+class ApiDiff:
+    breaking: bool
+    additive: bool
+
+
+# Breaking covers symbols that were removed or whose signature changed;
+# additive covers newly exposed ones. Both require a version bump.
 def report(
     kernel: str, base: dict, head: dict, limit: int = 20, preview: int = 6
-) -> dict:
+) -> ApiDiff:
     # In the baseline, gone from the head.
     removed = sorted(k for k in base if k not in head)
     # In both, but with a different signature.
@@ -437,7 +443,7 @@ def report(
         if len(keys) > preview:
             items.append((f"... and {len(keys) - preview} more", []))
         _tree(items)
-        return {"breaking": False, "additive": False}
+        return ApiDiff(breaking=False, additive=False)
 
     counts = ", ".join(
         f"{n} {label}"
@@ -464,10 +470,10 @@ def report(
     ]
     # Everything else that changed is a real signature change.
     signature_changed = set(changed) - set(grown)
-    return {
-        "breaking": bool(removed or signature_changed),
-        "additive": bool(added or grown),
-    }
+    return ApiDiff(
+        breaking=bool(removed or signature_changed),
+        additive=bool(added or grown),
+    )
 
 
 def main() -> int:
@@ -536,7 +542,7 @@ def main() -> int:
             continue
 
         diff = report(kernel, extract_api(base_src), extract_api(head_src))
-        if not (diff["breaking"] or diff["additive"]):
+        if not (diff.breaking or diff.additive):
             continue
 
         old_version = kernel_version(base_src)
@@ -550,7 +556,7 @@ def main() -> int:
             continue
 
         flavour = additive_safe(head_src)
-        if diff["additive"] and not diff["breaking"] and flavour is not None:
+        if diff.additive and not diff.breaking and flavour is not None:
             print(f"     => additions only on a {flavour} kernel, bump not required")
             continue
 
