@@ -47,7 +47,15 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 from .grouped import matmul_grouped
 from .batched import GATE_UNSTACK_MAX_S, matmul_batched
 from .bayesian_autotuner import bayesian_autotune
-from .compat import MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, device_context, pdl_launch_kwargs
+from .compat import (
+    MX_SCALE_GROUP_K,
+    NVFP4_SCALE_GROUP_K,
+    ScalingType,
+    SwizzleType,
+    compile_time_only_triton_wrap,
+    device_context,
+    pdl_launch_kwargs,
+)
 from .formats import get_supported_act_fns, is_mx, is_mxfp4, weight_format
 from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
 from .quant import _launch_act_quant
@@ -319,6 +327,8 @@ def moe_fused_grouped(
     down_proj_weight_global_scale: torch.Tensor | None = None,
     gate_up_proj_input_global_scale: torch.Tensor | None = None,
     down_proj_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_activation_scale: torch.Tensor | None = None,
+    down_proj_activation_scale: torch.Tensor | None = None,
     post_expert_norm=None,  # the model's per-expert output norm on the routed rows: a
     # get_supported_norms() name (fused into the reduce) or a host callable
     post_expert_norm_weight: torch.Tensor | None = None,  # (H,) weight of a named norm
@@ -362,9 +372,11 @@ def moe_fused_grouped(
     # intermediate (the op quantizes the raw hidden itself and owns the expand-vs-gather
     # regime policy — this forward is pure sequencing). scatter_idx=None: the down reads
     # the intermediate in place. (C, Cs) under a requant format; a bare Tensor otherwise.
+    static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
     gate_up_out = matmul_grouped(
         hidden_states,
         gate_up_proj,
+        As=gate_up_proj_activation_scale,
         Bs=gate_up_proj_scale_inv,
         a_global_scale=gate_up_proj_input_global_scale,
         b_global_scale=gate_up_proj_weight_global_scale,
@@ -375,9 +387,9 @@ def moe_fused_grouped(
         **glu,
         bias=gate_up_proj_bias,
         # fmt is the resolved format; "bf16" (weight-only) leaves the GLU intermediate bf16,
-        # no requant.
+        # no requant. So does static, whose epilogue has no calibrated scale to requant against.
         activation_format=fmt,
-        quantize_output=bool(glu) and fmt != "bf16",
+        quantize_output=bool(glu) and fmt != "bf16" and not static_act,
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
@@ -391,7 +403,7 @@ def moe_fused_grouped(
     down_out = matmul_grouped(
         inter,
         down_proj,
-        As=inter_scale,
+        As=down_proj_activation_scale if static_act else inter_scale,
         Bs=down_proj_scale_inv,
         a_global_scale=down_proj_input_global_scale,
         b_global_scale=down_proj_weight_global_scale,
@@ -428,6 +440,8 @@ def moe_fused_batched(
     down_proj_weight_global_scale: torch.Tensor | None = None,
     gate_up_proj_input_global_scale: torch.Tensor | None = None,
     down_proj_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_activation_scale: torch.Tensor | None = None,
+    down_proj_activation_scale: torch.Tensor | None = None,
     post_expert_norm=None,  # the model's per-expert output norm on the routed rows: a
     # get_supported_norms() name (fused into the reduce) or a host callable
     post_expert_norm_weight: torch.Tensor | None = None,  # (H,) weight of a named norm
@@ -471,9 +485,11 @@ def moe_fused_batched(
     # intermediate (the op quantizes the raw activations). gather_idx reads each routed
     # row from the unexpanded hidden in-kernel (no copy).
     # (C, Cs) under a requant format; a bare Tensor on the full-precision path
+    static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
     gate_up_out = matmul_batched(
         hidden_states,
         gate_up_proj,
+        As=gate_up_proj_activation_scale,
         Bs=gate_up_proj_scale_inv,
         a_global_scale=gate_up_proj_input_global_scale,
         b_global_scale=gate_up_proj_weight_global_scale,
@@ -487,10 +503,14 @@ def moe_fused_batched(
         # (``fused_glu(quant_group=...)`` — one launch, hands the down a ready fp8+scales intermediate and
         # kills its offline act quant); ABOVE the band the stacked epilogue's requant pins
         # the gate|up tile to the whole block scale and halves the grid, so the bf16 handoff
-        # (down inline-quants) stays the win there.
+        # (down inline-quants) stays the win there. Static keeps bf16 either way, its epilogue
+        # having no calibrated scale to requant against.
         activation_format=fmt,
         quantize_output=(
-            bool(glu) and fmt != "bf16" and (fmt != "fp8" or expert_ids.numel() <= GATE_UNSTACK_MAX_S)
+            bool(glu)
+            and fmt != "bf16"
+            and (fmt != "fp8" or expert_ids.numel() <= GATE_UNSTACK_MAX_S)
+            and not static_act
         ),
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
@@ -505,7 +525,7 @@ def moe_fused_batched(
     down_out = matmul_batched(
         inter,
         down_proj,
-        As=inter_scale,
+        As=down_proj_activation_scale if static_act else inter_scale,
         Bs=down_proj_scale_inv,
         a_global_scale=down_proj_input_global_scale,
         b_global_scale=down_proj_weight_global_scale,
@@ -544,6 +564,8 @@ def moe_unfused_grouped(
     down_proj_weight_global_scale: torch.Tensor | None = None,
     gate_up_proj_input_global_scale: torch.Tensor | None = None,
     down_proj_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_activation_scale: torch.Tensor | None = None,
+    down_proj_activation_scale: torch.Tensor | None = None,
     post_expert_norm=None,  # the model's per-expert output norm on the routed rows: a
     # get_supported_norms() name (fused into the reduce) or a host callable
     post_expert_norm_weight: torch.Tensor | None = None,  # (H,) weight of a named norm
@@ -561,8 +583,10 @@ def moe_unfused_grouped(
     ``moe_fused_grouped`` but the SwiGLU + intermediate quant happen between two plain GEMMs
     rather than inside the gate_up epilogue; each GEMM quantizes its raw input in
     ``activation_format`` (``None`` follows the weight format, mirroring the fused forward — mxfp4
-    weights run the all-fp4 W4A4 chain). All formats route through the shared ``matmul_grouped``. The NVFP4 activation globals thread the same way as the fused sibling:
-    each GEMM quantizes its raw input against its ``*_input_global_scale``. ``act_fn`` is a
+    weights run the all-fp4 W4A4 chain). All formats route through the shared ``matmul_grouped``.
+    The NVFP4 activation globals thread the same way as the fused sibling: each GEMM quantizes its
+    raw input against its ``*_input_global_scale``, and a ``*_activation_scale`` quantizes it
+    against that calibrated scale instead of a runtime one. ``act_fn`` is a
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
     callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
     projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
@@ -581,6 +605,7 @@ def moe_unfused_grouped(
     gate_up_out = matmul_grouped(
         hidden_states,
         gate_up_proj,
+        As=gate_up_proj_activation_scale,
         Bs=gate_up_proj_scale_inv,
         a_global_scale=gate_up_proj_input_global_scale,
         b_global_scale=gate_up_proj_weight_global_scale,
@@ -596,6 +621,7 @@ def moe_unfused_grouped(
     down_out = matmul_grouped(
         inter,
         down_proj,
+        As=down_proj_activation_scale,
         Bs=down_proj_scale_inv,
         a_global_scale=down_proj_input_global_scale,
         b_global_scale=down_proj_weight_global_scale,
@@ -623,6 +649,8 @@ def moe_torch_grouped(
     down_proj_weight_global_scale: torch.Tensor | None = None,
     gate_up_proj_input_global_scale: torch.Tensor | None = None,
     down_proj_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_activation_scale: torch.Tensor | None = None,
+    down_proj_activation_scale: torch.Tensor | None = None,
     post_expert_norm=None,  # the model's per-expert output norm on the routed rows: a
     # get_supported_norms() name (fused into the reduce) or a host callable
     post_expert_norm_weight: torch.Tensor | None = None,  # (H,) weight of a named norm
@@ -652,6 +680,10 @@ def moe_torch_grouped(
     ACTIVATION scale (which changes each call). The format is read off the dtypes (the block
     preserves them: E4M3 scale = NVFP4, uint8 = MX; packed-E2M1 weight = int8) since the blocked
     shape no longer matches the group-shape detectors."""
+    assert ScalingType is not None, (
+        "this torch has no torch.nn.functional.ScalingType — the baseline's scaled_grouped_mm "
+        "scaling enums arrived with the op itself, so an older torch cannot run it"
+    )
     assert gate_up_proj.dtype in (torch.int8, torch.float8_e4m3fn), (
         "torch grouped baseline is MX-only (packed E2M1 or E4M3 weights)"
     )
@@ -663,9 +695,10 @@ def moe_torch_grouped(
         "the torch baseline always quantizes activations (scaled_grouped_mm has no bf16-act x "
         "MX-weight form) — activation_format='bf16' (W4A16/W8A16) is not representable here"
     )
-
-    import torch.nn.functional as F
-    from torch.nn.functional import ScalingType, SwizzleType
+    assert gate_up_proj_activation_scale is None and down_proj_activation_scale is None, (
+        "the torch baseline quantizes each activation against a scale it derives per call — a "
+        "calibrated (static) scale is not representable here"
+    )
 
     # torchao >= 0.18 required with cutlass-dsl >= 4.6 (0.17 imports a helper path 4.6
     # removed; fixed upstream in pytorch/ao).
@@ -802,6 +835,8 @@ def moe_unfused_batched(
     down_proj_weight_global_scale: torch.Tensor | None = None,
     gate_up_proj_input_global_scale: torch.Tensor | None = None,
     down_proj_input_global_scale: torch.Tensor | None = None,
+    gate_up_proj_activation_scale: torch.Tensor | None = None,
+    down_proj_activation_scale: torch.Tensor | None = None,
     post_expert_norm=None,  # the model's per-expert output norm on the routed rows: a
     # get_supported_norms() name (fused into the reduce) or a host callable
     post_expert_norm_weight: torch.Tensor | None = None,  # (H,) weight of a named norm
@@ -818,8 +853,10 @@ def moe_unfused_batched(
     down (plain batched GEMM) → routing-weighted reduce. Same math as ``moe_fused_batched`` but
     the SwiGLU + intermediate quant happen between two plain GEMMs; each GEMM quantizes its raw
     input in ``activation_format`` (``None`` follows the weight format, ``"bf16"`` is weight-only). All
-    formats route through the shared ``matmul_batched``. The NVFP4 activation globals thread the same way as the fused sibling:
-    each GEMM quantizes its raw input against its ``*_input_global_scale``. ``act_fn`` is a
+    formats route through the shared ``matmul_batched``. The NVFP4 activation globals thread the
+    same way as the fused sibling: each GEMM quantizes its raw input against its
+    ``*_input_global_scale``, and a ``*_activation_scale`` quantizes it against that calibrated
+    scale instead of a runtime one. ``act_fn`` is a
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
     callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
     projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
@@ -835,6 +872,7 @@ def moe_unfused_batched(
     gate_up_out = matmul_batched(
         hidden_states,
         gate_up_proj,
+        As=gate_up_proj_activation_scale,
         Bs=gate_up_proj_scale_inv,
         a_global_scale=gate_up_proj_input_global_scale,
         b_global_scale=gate_up_proj_weight_global_scale,
@@ -849,6 +887,7 @@ def moe_unfused_batched(
     down_out = matmul_batched(
         inter,
         down_proj,
+        As=down_proj_activation_scale,
         Bs=down_proj_scale_inv,
         a_global_scale=down_proj_input_global_scale,
         b_global_scale=down_proj_weight_global_scale,

@@ -19,7 +19,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
 from .formats import global_scale_stride, is_per_expert_global
-from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, is_sm10x, pdl_launch_kwargs
+from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, device_context, is_sm10x, pdl_launch_kwargs
 from .swizzle import swizzle_store_block
 from .scheduling import build_tile_layout, resolve_tile_inline
 
@@ -924,9 +924,121 @@ def _fp8_act_quant_kernel(
     tl.store(s_ptr + pid, s)
 
 
-@compile_time_only_triton_op(
-    add_op_namespace_prefix("fp8_act_quant_tensor_wide"), mutates_args=(), opaque=True
-)
+def static_expert_act_operands(A, As, num_experts):
+    """Activation operands of the per-expert STATIC arms: ``(A_q, As, as_stride)``.
+
+    One calibrated scale for the whole matmul, or one per expert — a MoE calibrates each
+    separately. ``as_stride`` 0 makes every expert read the one scale, 1 gives each its own.
+    Per expert the kernel quantizes in register against the tile's own scale, because one token
+    routes to several experts whose scales differ and so has no single pre-quantized form; one
+    scale for all of them pre-quantizes once here instead.
+    """
+    As = As.reshape(-1).to(torch.float32)
+    as_stride = int(As.numel() == num_experts)
+    A_q = A if as_stride else (A.to(torch.float32) / As).to(FP8_DTYPE)
+    return A_q, As, as_stride
+
+
+# Host-side operand marshalling, NOT a custom op: it returns its inputs unchanged on the
+# pre-quantized and per-expert branches, which `torch.library.custom_op` forbids (the output may
+# not alias an input), and it hands back Python strides. The quant kernels it calls carry their
+# own compile handling.
+def tensor_wide_act_operands(
+    A: torch.Tensor, As: torch.Tensor | None, num_experts: int | None = None
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Activation operands of the tensor-scale FP8 arms: ``(A, As, stride_m, stride_e)``.
+
+    No ``As`` derives one scale per row here; a pre-quantized (E4M3) ``A`` brings its own. An
+    ``As`` on a raw ``A`` is the CALIBRATED (static) scale that replaces them: one value, which
+    ``A`` quantizes against here so every row reads the one entry, or — where the op routes —
+    one per expert, which stays raw for the kernel to quantize each tile against its own expert
+    — a gathered row serves several experts, so it has no single pre-quantized form until the
+    routed rows are laid out (``quantize_routed_rows_per_expert``). ``num_experts`` ``None`` on
+    the 2D op, whose rows belong to no expert.
+    """
+    if As is None:
+        A, As = fp8_act_quant_tensor_wide(A, A.shape[-1])
+        As = As.reshape(-1)
+        return A, As, As.stride(0), 0
+    if A.dtype == FP8_DTYPE:
+        return A, As, As.stride(0), 0
+    As = As.reshape(-1).float()
+    assert As.numel() in (1, num_experts), (
+        f"a calibrated activation scale is one value, or one per expert where the op routes; "
+        f"got {As.numel()}"
+    )
+    if As.numel() == 1:
+        return quantize_rows_static(A, As), As, 0, 0
+    return A, As, 0, 1
+
+
+@triton.jit
+def _static_row_scale(S, ExpertStart, row, stride_s, NUM_EXPERTS: tl.constexpr, PER_EXPERT: tl.constexpr):
+    """This row's calibrated scale. ``PER_EXPERT`` resolves it from the routing itself — the
+    rows are expert-sorted, so the count of expert ends at or below the row IS its expert,
+    which costs one ``(NUM_EXPERTS,)`` compare and spares the host materializing a per-row
+    vector (a gather or a repeat_interleave, either of which outweighs this whole kernel)."""
+    if PER_EXPERT:
+        ends = tl.load(ExpertStart + 1 + tl.arange(0, NUM_EXPERTS))
+        s = tl.load(S + tl.sum((ends <= row).to(tl.int32)))
+    else:
+        s = tl.load(S + row * stride_s)
+    return s
+
+
+@triton.jit
+def _fp8_quant_static_kernel(
+    X, Y, S, GatherIdx, ExpertStart, stride_x_m, stride_y_m, stride_s, K,
+    NUM_EXPERTS: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    GATHER: tl.constexpr, PER_EXPERT: tl.constexpr,
+):
+    """One row tile against a PROVIDED scale: gather, divide in fp32, store E4M3. The fp32
+    divide is the in-register static arm's arithmetic, so both forms of ``A`` round alike.
+    ``stride_s`` 0 broadcasts one scale over every row; ``GATHER`` reads ``X`` through
+    ``GatherIdx`` so the routed rows land laid out."""
+    row = tl.program_id(0)
+    src = tl.load(GatherIdx + row) if GATHER else row
+    offs = tl.program_id(1) * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    mask = offs < K
+    x = tl.load(X + src.to(tl.int64) * stride_x_m + offs, mask=mask, other=0.0)
+    y = (x.to(tl.float32) / _static_row_scale(S, ExpertStart, row, stride_s, NUM_EXPERTS, PER_EXPERT)).to(tl.float8e4nv)
+    tl.store(Y + row * stride_y_m + offs, y, mask=mask)
+
+
+def quantize_rows_static(A, scales, gather_idx=None, expert_start=None, num_experts=None):
+    """``A`` as E4M3 against ``scales`` — one per row, one for all of them, or (with
+    ``expert_start``) one per expert resolved from the routing. ``gather_idx`` lays the routed
+    rows out in the same pass. One read and one write, where the torch spelling costs four."""
+    assert A.stride(-1) == 1, "the static row quant reads K contiguous"
+    rows = gather_idx.shape[0] if gather_idx is not None else A.shape[0]
+    K = A.shape[-1]
+    y = A.new_empty(rows, K, dtype=FP8_DTYPE)
+    block_k = min(triton.next_power_of_2(K), 1024)
+    with device_context(A.device):
+        compile_time_only_triton_wrap(_fp8_quant_static_kernel)[(rows, triton.cdiv(K, block_k))](
+            A, y, scales, gather_idx, expert_start,
+            A.stride(0), y.stride(0), 0 if scales.numel() == 1 else scales.stride(0), K,
+            NUM_EXPERTS=num_experts or 1, BLOCK_SIZE_K=block_k,
+            GATHER=gather_idx is not None, PER_EXPERT=expert_start is not None,
+        )
+    return y
+
+
+def quantize_routed_rows_per_expert(A, As, gather_idx, expert_start, num_experts):
+    """The routed rows as E4M3, each quantized against its own expert's calibrated scale.
+
+    A per-expert scale otherwise hands the kernel raw rows to quantize per tile, which reads
+    ``A`` at bf16 width through every N-tile and holds the tile at ``RAW_ACT_MAX_BN``. Laying
+    the rows out once buys back both, at the rounding the in-register arm produces, because a
+    row's expert is known once the rows are expert-sorted — ``gather_idx`` orders them, or the
+    intermediate already is. ``As`` is untouched: the kernel dequantizes per expert whichever
+    form ``A`` arrives in.
+
+    Returns the laid-out rows; the caller's ``gather_idx`` is spent by that layout.
+    """
+    return quantize_rows_static(A, As, gather_idx, expert_start, num_experts)
+
+
 def fp8_act_quant_tensor_wide(
     x: torch.Tensor, block_size: int = 128
 ) -> tuple[torch.Tensor, torch.Tensor]:

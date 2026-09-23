@@ -130,13 +130,11 @@ sys.path.insert(0, os.path.join(_ROOT, "tests"))
 import finegrained_kernels as fgm  # noqa: E402  local branch
 from kernels import get_kernel  # noqa: E402
 
-# All baselines here are kernels-community repos we already trust; the publisher-trust check
-# hits a rate-limited org-overview API (429 under the 8-way shard fan-out) and can't be reached
-# for sonic-moe (loaded via transformers' lazy_load_kernel, no trust_remote_code hook). Neutralize
-# the check process-wide so every get_kernel — ours, sonic, deepgemm, gpt-oss — loads from cache.
-import kernels.utils as _kernels_utils  # noqa: E402
-
-_kernels_utils._check_trust_remote_code = lambda *a, **k: None
+# kernels-community IS a trusted publisher, so the check passes whenever it can reach the Hub
+# — but it verifies by calling get_organization_overview once per load and turns ANY exception
+# from that call into a hard failure, and eight shards starting at once get 429ed. The flag
+# skips the round-trip; it is not a claim about the repos, which the Hub already vouches for.
+TRUSTED = True  # `get_kernel(..., trust_remote_code=)`: True, or an allowlist of repo ids
 
 # --no-preswizzle benches the affine (row-major) MX scale path instead of the pre-swizzled
 # SWIZZLE_32_4_4 tcgen05 fast path. Default on: the finegrained-kernels arm feeds pre-swizzled
@@ -240,6 +238,7 @@ try:
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation as _VllmAct  # noqa: E402
     from vllm.model_executor.layers.fused_moe.config import fp8_w8a8_moe_quant_config as _vllm_fp8_qc  # noqa: E402
     from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8 as _vllm_group_quant  # noqa: E402
+    from vllm._custom_ops import scaled_fp8_quant as _vllm_tensor_quant  # noqa: E402
 except ImportError:
     vllm_fused_experts = None
 # kernels-community/nvfp4-gemm — the dense NVFP4 GEMM behind transformers' `NVFP4Linear`
@@ -256,7 +255,7 @@ except Exception:
 # older torch, so installing it from source downgrades the environment out from under every other
 # arm. Loaded like the rest of the roster.
 try:
-    _megablocks = get_kernel("kernels-community/megablocks", version=1)
+    _megablocks = get_kernel("kernels-community/megablocks", version=1, trust_remote_code=TRUSTED)
 except Exception:
     _megablocks = None
 
@@ -303,7 +302,9 @@ try:
     ctypes.CDLL(_cudart[0], mode=ctypes.RTLD_GLOBAL)
     from flashinfer.fused_moe import Fp8QuantizationType as _FiQuantType  # noqa: E402
     from flashinfer.fused_moe import WeightLayout as _FiWeightLayout  # noqa: E402
+    from flashinfer.fused_moe import RoutingMethodType as _FiRouting  # noqa: E402
     from flashinfer.fused_moe import trtllm_fp8_block_scale_routed_moe  # noqa: E402
+    from flashinfer.fused_moe import trtllm_fp8_per_tensor_scale_moe  # noqa: E402
     from flashinfer import mxfp8_quantize as _fi_mxfp8_quantize  # noqa: E402
     from flashinfer import reorder_rows_for_gated_act_gemm as _fi_reorder  # noqa: E402
     from flashinfer import shuffle_matrix_a as _fi_shuffle_a  # noqa: E402
@@ -327,13 +328,13 @@ UPSTREAM_FP8_LABEL = "v4"  # the legend suffix: the hub tag the pinned snapshot 
 # later cell. Pin the snapshot the committed figure measured (identical source, warm crowns).
 UPSTREAM_FP8_REV = "29083040812e244b390757d6198e2889fe551d13"
 upstream_fp8 = (None if (MOCK or REPLOT)
-          else get_kernel("kernels-community/finegrained-fp8", revision=UPSTREAM_FP8_REV))
+          else get_kernel("kernels-community/finegrained-fp8", revision=UPSTREAM_FP8_REV, trust_remote_code=TRUSTED))
 
 # OpenAI triton_kernels (matmul_ogs) — the MXFP4 experts path transformers uses for
 # GPT-OSS. Loaded like finegrained-fp8; its module-level handle drives the mxfp4 swizzle helpers.
 if not (MOCK or REPLOT):
     import transformers.integrations.mxfp4 as _tfmx
-    triton_kernels_hub = get_kernel("kernels-community/gpt-oss-triton-kernels", version=1)
+    triton_kernels_hub = get_kernel("kernels-community/gpt-oss-triton-kernels", version=1, trust_remote_code=TRUSTED)
     _tfmx.triton_kernels_hub = triton_kernels_hub
 
 DEVICE = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
@@ -349,7 +350,7 @@ PREFILL_TOKENS = 256 if SMOKE else 8192
 # fixed left-to-right model order for every figure row (matched by base-model prefix,
 # so GLM-5.2-NVFP4 and GLM-5.2 both land in the GLM-5.2 slot). Roughly most-baseline-
 # support first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last.
-CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2"]
+CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2", "Mistral-4"]
 
 # Low-VRAM parts run the same recipes and baselines at /8 experts, /2 dims, INSTEAD OF the
 # full roster rather than alongside it. Selected off the device, not a knob, so a small part
@@ -404,6 +405,20 @@ FULL_MOE_PROBLEMS = {
         # experts kernel requires UE8M0 and fails loud on fp32, so no deepgemm baseline here.
         E=256, H=7168, I=2048, top_k=8, weights="fp8_128x128", activation_format=None,
         baselines=("finegrained-fp8", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "mistralai/Mistral-4 FP8 per-tensor W8A8 static (E128 H4096 I2048 top4)": dict(
+        # The only shipped STATIC scheme: its conversion script asserts qscheme_act == "TENSOR"
+        # and writes weight_block_size None, so both levels are per tensor — per-expert weight
+        # scales and a calibrated activation scale per expert in place of the runtime one.
+        # finegrained-fp8 has no static path and the rest take block scales, so vLLM is the one
+        # comparable arm (parity 4e-3 against us).
+        E=128, H=4096, I=2048, top_k=4, weights="fp8_tensor", activation_format=None, static=True,
+        # trtllm rides their per_tensor entry point (`trtllm_fp8_per_tensor_scale_moe`), which
+        # routes internally — it rejects the packed precomputed routing the block-scale arms
+        # pass (it asserts routing_logits dim1 == num_experts), so it takes the logits and
+        # Default routing to match the bench's.
+        baselines=("vllm", "trtllm"), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None,
     ),
     "MiniMaxAI/MiniMax-M3 MXFP8 (E128 H6144 I3072 top4)": dict(
@@ -549,6 +564,17 @@ ATTN_PROBLEMS = {
         N=21504, K=7168, weights="fp8_128x128", activation_format=None,
         block=[128, 128], baselines=("finegrained-fp8",),
     ),
+    # the dense half of the same per-tensor STATIC export as the Mistral-4 MoE row: its attn
+    # linears carry per-tensor weights and a calibrated activation scale, on the 2D op. N is the
+    # fused qkv width from the model config (32 q heads + 32 kv heads, all 128-wide, hidden 4096).
+    # finegrained-fp8 has no static path and DeepGEMM's fp8 arms here are block-scaled, but
+    # torch's TensorWise scaled_mm is exactly this quantization granularity, so `torch_mm` bars
+    # it. The local arm ROUTES to that same cuBLAS call, so the two are expected to coincide —
+    # their diverging is the regression signal.
+    "mistralai/Mistral-4 attn FP8 per-tensor W8A8 static qkv-shaped (N=12288 K=4096)": dict(
+        N=12288, K=4096, weights="fp8_tensor", activation_format=None,
+        block=None, baselines=(), static=True,
+    ),
     "MiniMaxAI/MiniMax-M3 attn MXFP8 W8A8 qkv-shaped (N=18432 K=6144)": dict(
         N=18432, K=6144, weights="mxfp8", activation_format=None,
         block=None, baselines=("finegrained-fp8",),  # DeepGEMM FP8 is 128-block, not group-32 MX
@@ -681,8 +707,9 @@ def _interleave_rows(t):
     """``[gate rows; up rows]`` -> ``[g0, u0, g1, u1, ...]`` along dim -2; a scale grid follows the
     same rule at its own row count (128x128 block scales per 128-row block, MX per row). Byte-level
     for 1-byte float8 dtypes."""
-    if t is None:
-        return None
+    if t is None or t.shape[-2] < 2:
+        # a per-tensor scale is ONE value covering the whole gate|up stack: no rows to reorder
+        return t
     byte_view = t.element_size() == 1 and t.dtype.is_floating_point
     src = t.view(torch.uint8) if byte_view else t
     n = src.shape[-2] // 2
@@ -698,6 +725,21 @@ def _interleave_gate_up(gu, gus):
 # Arm signature lexicon: `hidden` (T, H) tokens, `idx`/`w` (T, top_k) routing; `gu`/`gus`/`gu_g` the
 # gate|up weight stack (E, 2I, H), its block-scale grid and its NVFP4 per-expert global; `dn`/`dns`/
 # `dn_g` the same for down (E, H, I). Scales are None for BF16, globals None outside NVFP4.
+def _static_act_kwargs(cfg, hidden):
+    """The calibrated activation scales a static row runs with: one per expert, the shape a
+    static MoE checkpoint carries (each expert is its own quantized module). The VALUES only set
+    the quantization grid — timing does not depend on them — and both arms get the same ones, so
+    the parity print stays meaningful. ``{}`` on a dynamic row, which quantizes per call."""
+    if not cfg.get("static"):
+        return {}
+    scale = (hidden.float().abs().amax() / 448.0).clamp(min=1e-12)
+    # one calibrated value, held per expert: the shape the kernels index, and the only form a
+    # row with a TRT-LLM per-tensor baseline can use (their API quantizes the hidden once)
+    per_expert = scale.expand(cfg["E"]).contiguous()
+    _mark_static(per_expert)
+    return {"gate_up_proj_activation_scale": per_expert, "down_proj_activation_scale": per_expert}
+
+
 def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     """``activation_format`` sets the activation precision; None follows the weight format
     (mxfp4/nvfp4 -> the all-fp4 W4A4 chain, bf16 weights -> unquantized). dsv4 deploys
@@ -705,6 +747,7 @@ def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_
     pre-swizzled into SWIZZLE_32_4_4 so the forward takes the tcgen05 fast path."""
     fn = fgm.moe_fused_grouped if grouped else fgm.moe_fused_batched
     nvfp4_kw = _nvfp4_kwargs(cfg, hidden, gu, gus, gu_g)  # raw scales: before any preswizzle
+    static_kw = _static_act_kwargs(cfg, hidden)
     gu, gus = _interleave_gate_up(gu, gus)  # our kernels read gate|up interleaved
     if _can_preswizzle(cfg):
         gus = _preswizzle_moe_scale(gus)   # fused gate GEMM reads the interleaved layout
@@ -713,13 +756,14 @@ def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], activation_format=_activation_format(cfg),
               gate_up_proj_weight_global_scale=gu_g, down_proj_weight_global_scale=dn_g,
-              **nvfp4_kw)
+              **nvfp4_kw, **static_kw)
     return lambda: fn(hidden, idx, w, gu, dn, gus, dns, **kw)
 
 
 def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_):
     fn = fgm.moe.moe_unfused_grouped if grouped else fgm.moe.moe_unfused_batched
     nvfp4_kw = _nvfp4_kwargs(cfg, hidden, gu, gus, gu_g)  # raw scales: before any preswizzle
+    static_kw = _static_act_kwargs(cfg, hidden)
     gu, gus = _interleave_gate_up(gu, gus)  # our kernels read gate|up interleaved
     if _can_preswizzle(cfg):
         # ONE checkpoint layout: gate_up scales are always the gate-interleaved artifact; the
@@ -730,7 +774,7 @@ def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, 
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], activation_format=_activation_format(cfg),
               gate_up_proj_weight_global_scale=gu_g, down_proj_weight_global_scale=dn_g,
-              **nvfp4_kw)
+              **nvfp4_kw, **static_kw)
     return lambda: fn(hidden, idx, w, gu, dn, gus, dns, **kw)
 
 
@@ -980,7 +1024,55 @@ def _trtllm_fp4_arm(cfg, hidden, idx, packed, gu, gus, dn, dns, gu_g, dn_g):
     return run
 
 
-def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn_g=None, *_):
+def trtllm_per_tensor_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, logits):
+    """TRT-LLM (FlashInfer) ``trtllm_fp8_per_tensor_scale_moe`` — the entry point their serving
+    path uses for the W8A8 scheme Mistral-4 ships: one FP8 scale per expert on each weight, one
+    calibrated activation scale. Their gate|up order is [up; gate], so the halves swap offline.
+
+    The three per-expert scalars fold the dequant of each GEMM into the next stage's input
+    scale, which is how TRT-LLM keeps the chain in FP8: gemm1's output carries ``a1 * w1``
+    divided by the intermediate's own scale, and gemm2's carries ``a2 * w2`` out to BF16 —
+    the fold vLLM's `TrtLlmFp8ExpertsMonolithic` builds. The bench's parity column is what says
+    whether that folding matches ours — a wrong convention here is fast and silently wrong, so
+    the row is only worth reading while parity holds."""
+    E, inter = cfg["E"], cfg["I"]
+    a1 = (hidden.float().abs().amax() / 448.0).clamp(min=1e-12)
+    # TRT-LLM's own weight prep, as vLLM's `rotate_weights_for_fi_trtllm_fp8_per_tensor_moe`
+    # does it: `reorder_rows_for_gated_act_gemm` interleaves the halves for their fused gated
+    # act and `shuffle_matrix_a` lays the rows out for their GEMM. Their stack is [up; gate],
+    # so the halves swap FIRST — their reorder interleaves, it does not reorder the halves, and
+    # feeding it ours lands at rel 0.97 (cos 0.53): fast, and a different function.
+    fp8 = torch.float8_e4m3fn
+    gu_upgate = torch.cat([gu[:, inter:], gu[:, :inter]], dim=1).contiguous()
+    w13 = torch.stack([_fi_shuffle_a(_fi_reorder(gu_upgate.view(torch.uint8)[i]), 128) for i in range(E)]).view(fp8)
+    w2 = torch.stack([_fi_shuffle_a(dn.view(torch.uint8)[i], 128) for i in range(E)]).view(fp8)
+    w1s = gus.reshape(E).float()
+    w2s = dns.reshape(E).float()
+    a2 = a1.expand(E).contiguous()  # the intermediate's calibrated scale (same fixture value)
+    # the UP half is requantized for gemm2 (divide by the intermediate's scale); the GATE half is
+    # dequantized so SiLU sees real magnitudes — the same scalar for both is what put parity at 1.0
+    out1 = (a1 * w1s / a2).contiguous()
+    out1_gate = (a1 * w1s).contiguous()
+    out2 = (a2 * w2s).contiguous()
+    _mark_static(w13, w2, out1, out1_gate, out2, a1)
+    # Default = softmax over ALL experts then top-k, matching the bench's routing(). Their
+    # Renormalize rescales the top-k weights to sum to 1 (rel 4.17, exactly 1/sum(w) off) —
+    # same experts, a per-token rescale of the combine weights.
+    def run():
+        # the act quant is INSIDE the timed call and is the STACK'S OWN kernel, as on the
+        # block-scale arm: a static scheme still quantizes the hidden every forward, and every
+        # other arm here (ours, vLLM's) is charged for it
+        hq, _ = _vllm_tensor_quant(hidden, scale=a1)
+        return trtllm_fp8_per_tensor_scale_moe(
+            logits, None, hq, w13, out1, out1_gate, w2, out2,
+            E, cfg["top_k"], None, None, inter, 0, E, None, False,
+            routing_method_type=int(_FiRouting.Default),
+        )
+
+    return run
+
+
+def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn_g=None, logits=None, *_):
     """FlashInfer TRT-LLM fp8-block routed MoE (the DeepSeek format on SM100). Weight prep
     (offline): TRT-LLM's gate|up order is [up; gate] — the halves swap; UE8M0 scales ride
     as fp32 (same values). Routing rides packed ``(expert_id << 16) | bf16-weight`` ids;
@@ -994,6 +1086,8 @@ def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn
         w.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF)
     if cfg["weights"] in ("mxfp4", "nvfp4"):
         return _trtllm_fp4_arm(cfg, hidden, idx, packed, gu, gus, dn, dns, gu_g, dn_g)
+    if cfg["fp8_block"] is None:  # per-tensor W8A8: their per_tensor entry point, not the block one
+        return trtllm_per_tensor_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, logits)
     if cfg["weights"] == "mxfp8":
         g1, g1s, dn_s, d1s = _trtllm_mxfp8_prep(gu, gus, dn, dns)
         alpha, beta, limit = _trtllm_gated_scalars(cfg, E, hidden.device)
@@ -1034,8 +1128,9 @@ def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn
 
 
 def vllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
-    """vLLM triton fused-MoE — the kernel its serving path runs for bf16 and for
-    block-fp8 W8A8 (the DeepSeek scheme; dynamic per-token-group act quant inside),
+    """vLLM triton fused-MoE — the kernel its serving path runs for bf16, for
+    block-fp8 W8A8 (the DeepSeek scheme; dynamic per-token-group act quant inside) and for
+    per-tensor W8A8 against calibrated scales (the static scheme Mistral-4 ships),
     tuned tiles from bench/vllm_configs. UE8M0 weight scales ride as fp32 (same values —
     vLLM stores block scales fp32). Plain SwiGLU only: the functional API doesn't thread
     clamp_limit/alpha (vLLM's class-based serving path takes them from the quant config).
@@ -1048,6 +1143,18 @@ def vllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     if cfg["fp8_block"] is not None:
         qc = _vllm_fp8_qc(w1_scale=gus.float(), w2_scale=dns.float(),
                           block_shape=list(cfg["fp8_block"]))
+    elif cfg.get("static"):
+        # per-tensor W8A8 against CALIBRATED activation scales: no block_shape, no per-token
+        # quant. vLLM takes ONE activation scale per projection, so the row's per-expert scales
+        # collapse to their max — a scale only sets the quantization grid, and this row's are
+        # one calibrated value held per expert anyway.
+        a = _static_act_kwargs(cfg, hidden)
+        qc = _vllm_fp8_qc(
+            w1_scale=gus.reshape(cfg["E"]).float(), w2_scale=dns.reshape(cfg["E"]).float(),
+            a1_scale=a["gate_up_proj_activation_scale"].max().reshape(1).float(),
+            a2_scale=a["down_proj_activation_scale"].max().reshape(1).float(),
+            per_act_token_quant=False, block_shape=None,
+        )
     return lambda: vllm_fused_experts(hidden, gu, dn, tkw, tki,
                                       activation=_VllmAct.SILU, quant_config=qc)
 
@@ -1175,6 +1282,7 @@ ARMS = {
     "transformers": transformers_arm,
     "transformers@main": transformers_main_arm,
     "sonicmoe": sonicmoe_arm,
+    "trtllm_per_tensor": trtllm_per_tensor_arm,
     "vllm": vllm_moe_arm,
     "trtllm": trtllm_moe_arm,
     "deepgemm": deepgemm_arm,
@@ -1360,7 +1468,8 @@ def bench_attn_row(row, pname, cfg, rows_out):
     # nvfp4) — the same layouts scaled_grouped_mm consumes: torchao-blocked SWIZZLE_32_4_4
     # scales, weight scale blocked once offline, act quant + its blocking inside the timed call
     # (they change per call, the local arm's inline-quant rule). NVFP4 is two-level (block e4m3
-    # + TensorWise fp32 globals; dynamic acts ride identity). No torch bar on the BLOCK-FP8 attn
+    # + TensorWise fp32 globals; dynamic acts ride identity).
+    # Per-tensor static FP8 gets a TensorWise bar. No torch bar on the BLOCK-FP8 attn
     # rows: torch HAS the DeepSeek scheme (BlockWise1x128 + 128x128) but its CUDA impl is
     # Hopper-only, and RowWise is a different quantization granularity (measured ~20 relative) —
     # timing unlike work on a shared axis is worse than an absent bar.
@@ -1381,7 +1490,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
             swz = [SwizzleType.SWIZZLE_32_4_4, SwizzleType.NO_SWIZZLE]
             mat_b = W.view(FP4).t()
 
-            def torch_mm(a):
+            def torch_mm(a, a_scale=None):
                 aq, a_s = fgm.nvfp4_act_quant(a)
                 sa = [to_blocked(a_s.view(torch.uint8)).view(torch.float8_e4m3fn), one]
                 return torch.nn.functional.scaled_mm(
@@ -1393,25 +1502,49 @@ def bench_attn_row(row, pname, cfg, rows_out):
             swz = SwizzleType.SWIZZLE_32_4_4
             mat_b = W.t()
 
-            def torch_mm(a):
+            def torch_mm(a, a_scale=None):
                 aq, a_s = fgm.mxfp8_act_quant(a)
                 sa = to_blocked(a_s).view(torch.float8_e8m0fnu)
                 return torch.nn.functional.scaled_mm(
                     aq, mat_b, sa, rb, sb, rb,
                     swizzle_a=swz, swizzle_b=swz, output_dtype=torch.bfloat16)
+    elif cfg["weights"] == "fp8_tensor" and cfg.get("static") and not (MOCK or REPLOT):
+        # per-tensor static: one fp32 scale per operand IS scaled_mm's TensorWise, so this row
+        # has a like-for-like cuBLAS bar after all. The calibrated activation scale is passed in
+        # rather than derived, so neither arm pays an amax pass the other doesn't.
+        from finegrained_kernels.quant import quantize_rows_static
+        from torch.nn.functional import ScalingType
+
+        mat_b = W.t()
+
+        def torch_mm(a, a_scale):
+            return torch.nn.functional.scaled_mm(
+                quantize_rows_static(a, a_scale), mat_b,
+                a_scale.reshape(()), ScalingType.TensorWise,
+                Ws.reshape(()), ScalingType.TensorWise,
+                output_dtype=torch.bfloat16)
+
     for regime, tokens in (("decode", DECODE_TOKENS), ("prefill", PREFILL_TOKENS)):
         print(f"   -- {regime}")
         torch.manual_seed(0)
         x = torch.randn(tokens, K, device=DEVICE, dtype=torch.bfloat16)
-        # act is inline-quantized (As=None); Ws is the weight scale (Bs); activation_format is the
+        # a STATIC row's calibrated activation scale replaces the inline quant: one value, since a
+        # dense module is one quantized module (the MoE's per-expert form has no dense analogue)
+        attn_act_scale = (
+            (x.float().abs().amax() / 448.0).clamp(min=1e-12).reshape(1)
+            if cfg.get("static") else None
+        )
+        if attn_act_scale is not None:
+            _mark_static(attn_act_scale)
+        # act is inline-quantized (As=None) unless the row is static; Ws is the weight scale (Bs); activation_format is the
         # activation precision (None follows the weight format).
         attn_arms = {
             "finegrained-kernels": lambda: fgm.matmul_2d(
-                x, W, None, Ws_fgm, activation_format=_activation_format(cfg), output_dtype=torch.bfloat16,
+                x, W, attn_act_scale, Ws_fgm, activation_format=_activation_format(cfg), output_dtype=torch.bfloat16,
                 b_global_scale=W_g),
         }
         if torch_mm is not None:
-            attn_arms["torch_mm"] = lambda: torch_mm(x)
+            attn_arms["torch_mm"] = lambda: torch_mm(x, attn_act_scale)
         if "finegrained-fp8" in cfg["baselines"]:
             attn_arms["finegrained-fp8"] = lambda: upstream_fp8.matmul_2d(x, W, Ws_fp8, block,
                                                        torch.bfloat16)
@@ -1496,7 +1629,8 @@ def _load_rows_csv(path):
     allowed = {}
     for pn, c in MOE_PROBLEMS.items():
         allowed["quantized", pn] = (
-            _allowed(c) | {_impl(b) for b in c.get("fused_extra", ())}
+            _allowed(c)
+            | {_impl(b) for b in c.get("fused_extra", ())}
             | {"torch", "transformers@main"})
     for pn, c in BF16_PROBLEMS.items():
         allowed["unquantized", pn] = _allowed(c) | {"megablocks"}

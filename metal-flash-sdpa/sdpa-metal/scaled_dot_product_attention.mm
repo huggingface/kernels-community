@@ -74,7 +74,6 @@ struct AttnParams {
 // Forward declarations for kernel implementations
 void call_flash_attention_varlen(
     id<MTLDevice> device,
-    id<MTLCommandBuffer> cmdBuf,
     id<MTLLibrary> lib,
     torch::Tensor &out,
     torch::Tensor &query,
@@ -135,14 +134,10 @@ void flash_attention_varlen(
                 error.localizedDescription.UTF8String);
   }
 
-  // Get command buffer
-  id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
-  TORCH_CHECK(cmdBuf, "Failed to get MPS command buffer");
-
   // For variable-length Flash Attention, always use the full attention kernel
   
   // Call the Flash Attention kernel
-  call_flash_attention_varlen(device, cmdBuf, lib, out, query, key, value, 
+  call_flash_attention_varlen(device, lib, out, query, key, value,
                               cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                               do_causal, scale, softcapping);
   } catch (const std::exception& e) {
@@ -155,7 +150,6 @@ void flash_attention_varlen(
 // Implementation of Flash Attention variable-length kernel
 void call_flash_attention_varlen(
     id<MTLDevice> device,
-    id<MTLCommandBuffer> cmdBuf,
     id<MTLLibrary> lib,
     torch::Tensor &out,
     torch::Tensor &query,
@@ -259,8 +253,9 @@ void call_flash_attention_varlen(
   at::mps::MPSStream *stream = at::mps::getCurrentMPSStream();
   dispatch_queue_t q = stream->queue();
   dispatch_sync(q, ^{
-    id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
-    TORCH_CHECK(encoder, "Failed to create compute encoder");
+    // Reuse PyTorch's encoder; the stream owns its lifetime.
+    id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
+    TORCH_CHECK(encoder, "Failed to get MPS compute encoder");
 
     [encoder setComputePipelineState:pipeline];
     
@@ -309,8 +304,6 @@ void call_flash_attention_varlen(
     MTLSize threadgroupSize = MTLSizeMake(32, WM, WN);
     
     [encoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadgroupSize];
-    [encoder endEncoding];
-    
     stream->synchronize(at::mps::SyncType::COMMIT);
   });
 }
