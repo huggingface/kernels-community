@@ -6,17 +6,19 @@ on:
   pull_request_target:
     types: [opened, reopened, ready_for_review, synchronize]
 
-permissions:
-  contents: read
-  pull-requests: read
-  issues: write
 
 concurrency:
   group: pr-kernel-build-guidance-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   comment:
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
     name: Comment with build instructions
     if: >-
       github.event.pull_request.author_association != 'OWNER' &&

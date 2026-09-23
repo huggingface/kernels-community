@@ -36,15 +36,17 @@ on:
       - ".github/workflows/test-ci-scripts.yaml"
   workflow_dispatch:
 
-permissions:
-  contents: read
 
 concurrency:
   group: test-ci-scripts-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   pytest:
+    permissions:
+      contents: read
     name: pytest .github/scripts
     runs-on: ubuntu-latest
     steps:
