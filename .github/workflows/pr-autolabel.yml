@@ -40,10 +40,6 @@ on:
           - sync-labels
         default: backfill
 
-permissions:
-  contents: read # read the script + .github/pr-labels.json from the base checkout
-  pull-requests: write # add/remove labels
-  issues: write # labels are applied via the issues API
 
 concurrency:
   # Coalesce rapid re-triggers on the same PR; don't cancel a manual backfill.
@@ -53,8 +49,14 @@ concurrency:
 env:
   HF_MODEL: zai-org/GLM-5.2 # override to try a different HF-hosted model
 
+permissions: {}
+
 jobs:
   autolabel:
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     runs-on: ubuntu-latest
     steps:
       # Checkout WITHOUT a ref: under pull_request_target this resolves to the
