@@ -11,6 +11,7 @@
 [general]
 name = "topk"
 version = 1
+edition = 5
 license = "MIT"
 backends = ["metal"]
 

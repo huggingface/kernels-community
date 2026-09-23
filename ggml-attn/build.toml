@@ -8,6 +8,7 @@
 [general]
 name = "ggml-attn"
 version = 1
+edition = 5
 license = "MIT"
 # Metal only. The cuda scaffolding that used to sit here was never compiled -- `git log -- ggml_attn_cuda`
 # has it, and `vendor/` still carries ggml's cuda sources.
@@ -15,7 +16,7 @@ backends = ["metal"]
 
 # Where `nix run .#build-and-upload` publishes the built variants.
 [general.hub]
-repo-id = "transformers-community/ggml-attn"
+repo-id = "ggml-org/ggml-attn"
 
 [torch]
 src = [
