@@ -21,7 +21,7 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
-from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, get_active_device_type, persistent_program_count, sm_count, tl_dtype
+from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, sm_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands
@@ -41,7 +41,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, raw_activation_pointer_pruner, global_scale_warp_spec_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
+from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, raw_activation_pointer_pruner, global_scale_warp_spec_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, paired_device_descriptor_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
 
 
 @bayesian_autotune(
@@ -1103,6 +1103,7 @@ def mx_weight_only_matmul_grouped_kernel(
             warp_spec_compile_guard_pruner(),
             packed_schedule_scope_pruner(),
             descriptor_box_pruner(),
+            paired_device_descriptor_pruner(),
             smem_pruner(),
         )
     },
@@ -1150,9 +1151,6 @@ def full_precision_matmul_grouped_kernel(
     # descriptor and run the swapped (weights-in-M) loop; "pointer" is the natural loop.
     B_MEMORY_MODE: tl.constexpr = "pointer",
     A_MEMORY_MODE: tl.constexpr = "pointer",
-    # XPU: build both operand boxes in-kernel so the backend can emit 2D block loads, the only
-    # loads that keep DPAS fed (the launcher owns the gate). Always False on CUDA
-    DEVICE_DESC: tl.constexpr = False,
     # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM). No requant arm: the
     # full-precision chain has no quantized intermediate — down consumes the GLU output as is.
     GATE: tl.constexpr = False,
@@ -1223,9 +1221,12 @@ def full_precision_matmul_grouped_kernel(
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         # The stock descriptor arms read host-built (``TensorDescriptor.from_tensor``) boxes.
-        # That is a TMA descriptor, and Xe has no TMA, it builds the descriptors on the device.
+        # That is a TMA descriptor, and Xe has no TMA, so it builds the descriptors on the
+        # device instead: the config generator resolves the generic "descriptor" mode to
+        # "device_descriptor" on XPU (see resolve_memory_modes), which selects this arm.
+        # paired_device_descriptor_pruner guarantees the two modes agree.
         DEVICE_DESC_ARM: tl.constexpr = (
-            DEVICE_DESC and A_MEMORY_MODE == "pointer" and B_MEMORY_MODE == "pointer"
+            A_MEMORY_MODE == "device_descriptor" and B_MEMORY_MODE == "device_descriptor"
         )
         if DEVICE_DESC_ARM:
             # No gather here (the launcher's precondition), so the rows are the contiguous span
@@ -2097,9 +2098,6 @@ def full_precision_matmul_grouped(
             tokens_per_expert_bit_length=tokens_per_expert_bucket(S, num_experts),
             NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
             NUM_SMS=num_sms,
-            # XPU only: device-built operand descriptors let the backend emit the 2D block loads
-            # that keep DPAS fed.
-            DEVICE_DESC=get_active_device_type() == "xpu" and gather_idx is None,
             GATE=gate,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,

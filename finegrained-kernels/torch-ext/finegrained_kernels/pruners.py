@@ -1099,6 +1099,23 @@ def matched_memory_modes_pruner():
         b_ptr = c.kwargs.get("B_MEMORY_MODE", "pointer") == "pointer"
         return a_ptr == b_ptr
 
+
+def paired_device_descriptor_pruner():
+    """Drop configs where exactly ONE operand is ``"device_descriptor"``. The in-kernel
+    tensormap arm is a JOINT rewrite of the K-loop — both boxes are built together so the
+    backend can emit a 2D block load for each — so a half-descriptor config has no arm to
+    run and would silently fall back to the pointer loop, wasting a tuner trial on a
+    duplicate of the pointer config. Unlike ``matched_memory_modes_pruner`` this leaves the
+    CUDA grouped kernels' mixed pointer/host_descriptor winner alone: it only looks at the
+    device flavor, which ``resolve_memory_modes`` emits on XPU."""
+
+    def ok(c, args):
+        a_dev = c.kwargs.get("A_MEMORY_MODE", "pointer") == "device_descriptor"
+        b_dev = c.kwargs.get("B_MEMORY_MODE", "pointer") == "device_descriptor"
+        return a_dev == b_dev
+
+    return config_filter(ok)
+
     return config_filter(ok)
 
 
