@@ -10,8 +10,9 @@
 // - Optional tanh softcapping.
 // - Attention sinks are float32 and also supported by the GQA read-once
 //   variant.
-// - Causal masking is aligned to the bottom-right, like the steel kernel.
-//   Query rows that see no keys produce zeros.
+// - Causal masking and the optional sliding window are aligned to the
+//   bottom-right, like the steel kernel. Each query only iterates over the
+//   keys it can see; rows that see no keys produce zeros.
 // - No array masks.
 
 #include <metal_simdgroup>
@@ -26,6 +27,7 @@ constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
 constant bool has_softcap [[function_constant(303)]];
 constant int blocks [[function_constant(304)]];
+constant bool has_window [[function_constant(305)]];
 
 template <typename U>
 METAL_FUNC U apply_softcap(U score, const constant VarlenAttnParams* params) {
@@ -84,12 +86,16 @@ template <typename T, int D>
   const int v_seq_stride = int(params->v_strides[0]);
   const int inner_k_stride = BN * k_seq_stride;
   const int inner_v_stride = BN * v_seq_stride;
+  const int2 key_range =
+      visible_keys(N - qL + q_seq_idx, N, do_causal, has_window, params);
 
   queries += q_row * params->q_strides[0] + head_idx * params->q_strides[1] +
       simd_lid * qk_per_thread;
-  keys += (int64_t(k_seq_start) + simd_gid) * params->k_strides[0] +
+  keys += (int64_t(k_seq_start) + key_range.x + simd_gid) *
+          params->k_strides[0] +
       kv_head_idx * params->k_strides[1] + simd_lid * qk_per_thread;
-  values += (int64_t(k_seq_start) + simd_gid) * params->v_strides[0] +
+  values += (int64_t(k_seq_start) + key_range.x + simd_gid) *
+          params->v_strides[0] +
       kv_head_idx * params->v_strides[1] + simd_lid * v_per_thread;
   out += q_row * params->o_strides[0] + head_idx * params->o_strides[1] +
       simd_gid * v_per_thread;
@@ -109,37 +115,31 @@ template <typename T, int D>
     sum_exp_score = 1;
   }
 
-  // For each key
-  for (int i = simd_gid; i < N; i += BN) {
-    bool use_key = true;
-    if (do_causal) {
-      use_key = i <= (N - qL + q_seq_idx);
+  // For each visible key
+  for (int i = key_range.x + simd_gid; i <= key_range.y; i += BN) {
+    // Read the key
+    for (int j = 0; j < qk_per_thread; j++) {
+      k[j] = keys[j];
     }
-    if (use_key) {
-      // Read the key
-      for (int j = 0; j < qk_per_thread; j++) {
-        k[j] = keys[j];
-      }
 
-      // Compute the i-th score
-      U score = 0;
-      for (int j = 0; j < qk_per_thread; j++) {
-        score += q[j] * k[j];
-      }
-      score = apply_softcap(simd_sum(score), params);
+    // Compute the i-th score
+    U score = 0;
+    for (int j = 0; j < qk_per_thread; j++) {
+      score += q[j] * k[j];
+    }
+    score = apply_softcap(simd_sum(score), params);
 
-      // Update the accumulators
-      U new_max = max(max_score, score);
-      U factor = fast::exp(max_score - new_max);
-      U exp_score = fast::exp(score - new_max);
+    // Update the accumulators
+    U new_max = max(max_score, score);
+    U factor = fast::exp(max_score - new_max);
+    U exp_score = fast::exp(score - new_max);
 
-      max_score = new_max;
-      sum_exp_score = sum_exp_score * factor + exp_score;
+    max_score = new_max;
+    sum_exp_score = sum_exp_score * factor + exp_score;
 
-      // Update the output accumulator
-      for (int j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * values[j];
-      }
+    // Update the output accumulator
+    for (int j = 0; j < v_per_thread; j++) {
+      o[j] = o[j] * factor + exp_score * values[j];
     }
 
     // Move the pointers to the next kv
@@ -229,12 +229,16 @@ template <typename T, int D>
   const int64_t o_offset = q_row * params->H + q_head_idx;
   const int k_seq_stride = int(params->k_strides[0]);
   const int v_seq_stride = int(params->v_strides[0]);
+  const int2 key_range =
+      visible_keys(N - qL + q_seq_idx, N, do_causal, has_window, params);
 
   queries += q_row * params->q_strides[0] + q_head_idx * params->q_strides[1] +
       simd_lid * qk_per_thread;
-  keys += (int64_t(k_seq_start) + block_idx) * params->k_strides[0] +
+  keys += (int64_t(k_seq_start) + key_range.x + block_idx) *
+          params->k_strides[0] +
       kv_head_idx * params->k_strides[1] + simd_lid * qk_per_thread;
-  values += (int64_t(k_seq_start) + block_idx) * params->v_strides[0] +
+  values += (int64_t(k_seq_start) + key_range.x + block_idx) *
+          params->v_strides[0] +
       kv_head_idx * params->v_strides[1] + simd_lid * v_per_thread;
   out += o_offset * blocks * D + block_idx * D + simd_lid * v_per_thread;
   sums += o_offset * blocks + block_idx;
@@ -252,32 +256,26 @@ template <typename T, int D>
     sum_exp_score = 1;
   }
 
-  // For each key
-  for (int i = block_idx; i < N; i += blocks) {
-    bool use_key = true;
-    if (do_causal) {
-      use_key = i <= (N - qL + q_seq_idx);
+  // For each visible key
+  for (int i = key_range.x + block_idx; i <= key_range.y; i += blocks) {
+    // Compute the i-th score
+    U score = 0;
+    for (int j = 0; j < qk_per_thread; j++) {
+      score += q[j] * keys[j];
     }
-    if (use_key) {
-      // Compute the i-th score
-      U score = 0;
-      for (int j = 0; j < qk_per_thread; j++) {
-        score += q[j] * keys[j];
-      }
-      score = apply_softcap(simd_sum(score), params);
+    score = apply_softcap(simd_sum(score), params);
 
-      // Update the accumulators
-      U new_max = max(max_score, score);
-      U factor = fast::exp(max_score - new_max);
-      U exp_score = fast::exp(score - new_max);
+    // Update the accumulators
+    U new_max = max(max_score, score);
+    U factor = fast::exp(max_score - new_max);
+    U exp_score = fast::exp(score - new_max);
 
-      max_score = new_max;
-      sum_exp_score = sum_exp_score * factor + exp_score;
+    max_score = new_max;
+    sum_exp_score = sum_exp_score * factor + exp_score;
 
-      // Update the output accumulator
-      for (int j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * values[j];
-      }
+    // Update the output accumulator
+    for (int j = 0; j < v_per_thread; j++) {
+      o[j] = o[j] * factor + exp_score * values[j];
     }
 
     // Move the pointers to the next kv
@@ -346,9 +344,12 @@ template <typename T, int D, int G, int HPT>
   const int k_seq_stride = int(params->k_strides[0]);
   const int v_seq_stride = int(params->v_strides[0]);
 
-  const int chunk = (N + num_blocks - 1) / num_blocks;
-  const int kstart = block_idx * chunk;
-  const int kend = min(N, kstart + chunk);
+  // A single query token: it sits at the end of the key sequence.
+  const int2 key_range = visible_keys(N - 1, N, do_causal, has_window, params);
+  const int num_keys = max(0, key_range.y - key_range.x + 1);
+  const int chunk = (num_keys + num_blocks - 1) / num_blocks;
+  const int kstart = key_range.x + block_idx * chunk;
+  const int kend = min(key_range.y + 1, kstart + chunk);
   const int sub = (chunk + HPT - 1) / HPT;
   const int s0 = kstart + cchunk * sub;
   const int s1 = min(kend, s0 + sub);

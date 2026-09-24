@@ -27,8 +27,10 @@ struct VarlenAttnParams {
   int32_t H_kv;
   float scale;
   float softcap;
+  int32_t window_left;
+  int32_t window_right;
 };
-static_assert(sizeof(VarlenAttnParams) == 80, "VarlenAttnParams layout");
+static_assert(sizeof(VarlenAttnParams) == 88, "VarlenAttnParams layout");
 
 // Function constants shared by scaled_dot_product_attention.metal and
 // sdpa_vector.metal.
@@ -37,11 +39,13 @@ struct FunctionConstants {
   bool has_sinks;
   bool has_softcap;
   int blocks; // Number of key blocks of the 2-pass vector kernel.
+  bool has_window;
 };
 constexpr NSUInteger kFcDoCausal = 301;
 constexpr NSUInteger kFcHasSinks = 302;
 constexpr NSUInteger kFcHasSoftcap = 303;
 constexpr NSUInteger kFcBlocks = 304;
+constexpr NSUInteger kFcHasWindow = 305;
 
 struct TileConfig {
   int bq;
@@ -85,7 +89,8 @@ id<MTLComputePipelineState> getPipeline(const std::string &kernel_name,
 
   std::string key = kernel_name + (fc.do_causal ? "_causal" : "") +
                     (fc.has_sinks ? "_sinks" : "") +
-                    (fc.has_softcap ? "_softcap" : "") + "_blocks" +
+                    (fc.has_softcap ? "_softcap" : "") +
+                    (fc.has_window ? "_window" : "") + "_blocks" +
                     std::to_string(fc.blocks);
 
   std::lock_guard<std::mutex> lock(mutex);
@@ -114,6 +119,9 @@ id<MTLComputePipelineState> getPipeline(const std::string &kernel_name,
                          type:MTLDataTypeBool
                       atIndex:kFcHasSoftcap];
   [constants setConstantValue:&fc.blocks type:MTLDataTypeInt atIndex:kFcBlocks];
+  [constants setConstantValue:&fc.has_window
+                         type:MTLDataTypeBool
+                      atIndex:kFcHasWindow];
 
   id<MTLFunction> function =
       [lib newFunctionWithName:[NSString stringWithUTF8String:kernel_name.c_str()]
@@ -253,7 +261,9 @@ void flash_attention_varlen(
     bool do_causal,              // Whether to use causal mask
     double scale,                // Attention scale
     double softcapping,          // Softcap value, <= 0 disables softcapping
-    const std::optional<torch::Tensor> &s_aux) { // [num_heads] sinks
+    const std::optional<torch::Tensor> &s_aux, // [num_heads] sinks
+    int64_t window_left,         // Sliding window, -1 for unbounded
+    int64_t window_right) {
   const auto dtype = query.scalar_type();
   checkAttentionTensor(query, "query", dtype);
   checkAttentionTensor(key, "key", dtype);
@@ -287,6 +297,8 @@ void flash_attention_varlen(
               "cu_seqlens_q and cu_seqlens_k must have the same size");
   TORCH_CHECK(max_seqlen_q >= 0 && max_seqlen_k >= 0,
               "max_seqlen_q and max_seqlen_k must be non-negative");
+  TORCH_CHECK(window_left >= -1 && window_right >= -1,
+              "window sizes must be non-negative, or -1 for unbounded");
 
   // The kernels read sinks as float32. The conversion is cheap: one value
   // per head.
@@ -306,7 +318,9 @@ void flash_attention_varlen(
   }
 
   const bool has_softcap = softcapping > 0.0;
-  FunctionConstants fc = {do_causal, sinks.defined(), has_softcap, 0};
+  const bool has_window = window_left >= 0 || window_right >= 0;
+  FunctionConstants fc = {do_causal, sinks.defined(), has_softcap, 0,
+                          has_window};
 
   VarlenAttnParams params = {};
   params.q_strides[0] = query.stride(0);
@@ -321,14 +335,25 @@ void flash_attention_varlen(
   params.H_kv = static_cast<int32_t>(num_heads_kv);
   params.scale = static_cast<float>(scale);
   params.softcap = has_softcap ? static_cast<float>(softcapping) : 1.0f;
+  params.window_left = static_cast<int32_t>(std::min<int64_t>(
+      window_left, std::numeric_limits<int32_t>::max()));
+  params.window_right = static_cast<int32_t>(std::min<int64_t>(
+      window_right, std::numeric_limits<int32_t>::max()));
 
   const std::string dtype_name = getKernelDtypeString(dtype);
   const int64_t gqa_factor = num_heads / num_heads_kv;
 
   // Pick the kernels. Decode (a few query tokens per sequence) uses the
   // vector kernels, everything else the tiled steel kernel.
+  // A sliding window bounds the keys each decode query reads, which is what
+  // the vector kernel heuristics care about.
+  int64_t visible_seqlen_k = max_seqlen_k;
+  if (window_left >= 0 && (do_causal || window_right >= 0)) {
+    visible_seqlen_k = std::min(
+        max_seqlen_k, window_left + 1 + (do_causal ? 0 : window_right));
+  }
   VectorKernel vector_kernel =
-      chooseVectorKernel(head_dim, gqa_factor, max_seqlen_q, max_seqlen_k);
+      chooseVectorKernel(head_dim, gqa_factor, max_seqlen_q, visible_seqlen_k);
   id<MTLComputePipelineState> pipeline = nil;
   id<MTLComputePipelineState> reduce_pipeline = nil;
   MTLSize grid_size;
@@ -343,7 +368,7 @@ void flash_attention_varlen(
     threadgroup_size = MTLSizeMake(1024, 1, 1);
   } else if (vector_kernel != VectorKernel::None) {
     const bool gqa_variant = vector_kernel == VectorKernel::TwoPassGqa;
-    fc.blocks = twoPassBlocks(gqa_factor * max_seqlen_q, max_seqlen_k);
+    fc.blocks = twoPassBlocks(gqa_factor * max_seqlen_q, visible_seqlen_k);
     const std::string suffix =
         "varlen_" + dtype_name + "_" + std::to_string(head_dim);
     pipeline = getPipeline(

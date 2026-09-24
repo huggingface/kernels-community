@@ -18,6 +18,7 @@ Some components of these kernels are from [mlx](https://github.com/ml-explore/ml
 - Grouped Query Attention (GQA) and Multi-Query Attention (MQA)
 - Softcapping support for attention score regularization
 - Attention sinks (`s_aux`, one logit per query head)
+- Sliding window attention (`window_size`, as in Flash Attention)
 - Data types: `float32`, `float16`, `bfloat16`
 - Head dimensions: `32`, `64`, `72`, `80`, `96`, `128`, `192`, `256`
 - Strided inputs (e.g. views into a packed QKV tensor), as long as `head_dim` is contiguous
@@ -39,7 +40,8 @@ metal_flash_sdpa.flash_attention_varlen(
     do_causal: bool,
     scale: float,
     softcapping: float,
-    s_aux: Optional[torch.Tensor] = None
+    s_aux: Optional[torch.Tensor] = None,
+    window_size: Tuple[int, int] = (-1, -1)
 ) -> None
 ```
 
@@ -51,6 +53,7 @@ metal_flash_sdpa.flash_attention_varlen(
 - **scale**: Attention score scaling factor (e.g., `1/sqrt(head_dim)`).
 - **softcapping**: Softcapping value for score regularization (use `1.0` for no softcapping).
 - **s_aux**: Optional attention sinks `[num_heads]`. Each sink adds a logit to the softmax of its head without attending to a value, as used by gpt-oss.
+- **window_size**: Sliding window `(left, right)` as in Flash Attention: each query sees `left` keys before and `right` keys after its position (aligned like causal masking). `-1` means unbounded.
 
 ### flash_attn_varlen_func
 

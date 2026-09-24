@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -18,6 +18,7 @@ def flash_attention_varlen(
     scale: Optional[float] = None,
     softcapping: float = 1.0,
     s_aux: Optional[torch.Tensor] = None,
+    window_size: Tuple[int, int] = (-1, -1),
 ) -> None:
     """
     Flash Attention with variable-length sequences.
@@ -39,6 +40,8 @@ def flash_attention_varlen(
         softcapping: Softcap value. 1.0 (the default) disables softcapping.
         s_aux: Optional attention sinks, shape [num_heads]. Each sink adds a logit
             to the softmax of its head that does not attend to any value.
+        window_size: Sliding window `(left, right)` as in flash-attn: query `i` sees keys
+            `i - left` to `i + right` (aligned like causal masking). -1 means unbounded.
 
     Note:
         - Supported head dimensions: 32, 64, 72, 80, 96, 128, 192, 256
@@ -63,6 +66,8 @@ def flash_attention_varlen(
         # The op uses flash-attn's convention, where <= 0 disables softcapping.
         0.0 if softcapping == 1.0 else softcapping,
         s_aux,
+        window_size[0],
+        window_size[1],
     )
 
 
@@ -92,14 +97,11 @@ def flash_attn_varlen_func(
 
     Note: This implementation does not support:
     - dropout
-    - window attention
     - alibi slopes
     - returning attention probabilities
     """
     if dropout_p > 0:
         raise NotImplementedError("Dropout is not supported in this implementation")
-    if tuple(window_size) != (-1, -1):
-        raise NotImplementedError("Window attention is not supported")
     if alibi_slopes is not None:
         raise NotImplementedError("ALiBi is not supported")
     if return_attn_probs:
@@ -125,6 +127,8 @@ def flash_attn_varlen_func(
         softmax_scale,
         softcap,
         s_aux,
+        window_size[0],
+        window_size[1],
     )
 
     return out

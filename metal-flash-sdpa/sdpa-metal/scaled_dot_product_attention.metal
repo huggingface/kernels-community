@@ -9,6 +9,8 @@
 //   detected per sequence instead of through align_Q/align_K.
 // - Inputs are addressed by (token, head) strides; head_dim must be contiguous.
 // - Optional tanh softcapping, applied before any masking.
+// - Optional sliding window (flash-attn's window_size), aligned like causal
+//   masking. Key blocks outside every row's window are skipped.
 // - Causal masking is aligned to the bottom-right when q_len != k_len, like
 //   flash-attn. Query rows that see no keys (and sequences with k_len == 0)
 //   produce zeros.
@@ -29,6 +31,7 @@ using namespace mlx::steel;
 constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
 constant bool has_softcap [[function_constant(303)]];
+constant bool has_window [[function_constant(305)]];
 
 struct MaxOp {
   template <typename T>
@@ -104,14 +107,24 @@ template <
   // Offset of the query rows in the key sequence (bottom-right alignment).
   const int qL_off = kL - qL;
 
+  // Key blocks that any row of this query block can see.
+  const int first_row = q_block * BQ + qL_off;
+  const int last_row = first_row + q_block_size - 1;
+  const int kb_first =
+      max(0, visible_keys(first_row, kL, do_causal, has_window, params).x) /
+      BK;
+  const int kb_lim = min(
+      NK,
+      (visible_keys(last_row, kL, do_causal, has_window, params).y + BK) / BK);
+
   // Move to correct block
   const int kv_head_idx = head_idx / (params->H / params->H_kv);
   const int64_t q_row = int64_t(q_seq_start) + q_block * BQ;
 
   Q += q_row * params->q_strides[0] + head_idx * params->q_strides[1];
-  K += int64_t(k_seq_start) * params->k_strides[0] +
+  K += (int64_t(k_seq_start) + kb_first * BK) * params->k_strides[0] +
       kv_head_idx * params->k_strides[1];
-  V += int64_t(k_seq_start) * params->v_strides[0] +
+  V += (int64_t(k_seq_start) + kb_first * BK) * params->v_strides[0] +
       kv_head_idx * params->v_strides[1];
   O += q_row * params->o_strides[0] + head_idx * params->o_strides[1];
 
@@ -245,21 +258,14 @@ template <
     }
   }
 
-  int kb_lim = NK;
+  // Blocks from here on may contain keys to the right of some row.
   int kb_min_causal = NK;
-
   if (do_causal) {
-    int q_max = q_block * BQ + q_block_size + qL_off;
-    kb_lim = (q_max + BK - 1) / BK;
-    kb_lim = max(0, min(NK, kb_lim));
-
-    int q_min = q_block * BQ + qL_off;
-    q_min = max(0, q_min);
-    kb_min_causal = (q_min / BK);
+    kb_min_causal = max(0, first_row) / BK;
   }
 
   // Loop over KV seq length
-  for (int kb = 0; kb < kb_lim; kb++) {
+  for (int kb = kb_first; kb < kb_lim; kb++) {
     const bool k_partial = kb == NK - 1 && kL_rem < BK;
 
     // Load K block and apply scale
@@ -337,6 +343,31 @@ template <
           STEEL_PRAGMA_UNROLL
           for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
             if (row_pos < (col_pos + jj)) {
+              Stile.frag_at(i, j)[jj] = neg_inf;
+            }
+          }
+        }
+      }
+    }
+
+    // Mask out keys outside the sliding window
+    if (has_window) {
+      using stile_t = decltype(Stile);
+      using selem_t = typename stile_t::elem_type;
+      constexpr auto neg_inf = Limits<selem_t>::finite_min;
+
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < stile_t::kTileRows; i++) {
+        const int row_pos =
+            q_block * BQ + qL_off + tm + sm + (i * stile_t::kFragRows);
+        const int2 keys =
+            visible_keys(row_pos, kL, do_causal, has_window, params);
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < stile_t::kTileCols; j++) {
+          const int col_pos = kb * BK + sn + (j * stile_t::kFragCols);
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
+            if (col_pos + jj < keys.x || col_pos + jj > keys.y) {
               Stile.frag_at(i, j)[jj] = neg_inf;
             }
           }
@@ -437,7 +468,8 @@ template <
   for (short i = 0; i < kRowsPT; ++i) {
     const int row_pos = q_block * BQ + qL_off + tm + sm +
         (i * decltype(Stile)::kFragRows);
-    const bool has_keys = kL > 0 && (!do_causal || row_pos >= 0);
+    const int2 keys = visible_keys(row_pos, kL, do_causal, has_window, params);
+    const bool has_keys = keys.x <= keys.y;
     inv_sum[i] = has_keys ? AccumType(1) / sum_score[i] : AccumType(0);
   }
   Otile.template row_bin_op<MulOp>(inv_sum);

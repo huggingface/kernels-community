@@ -18,7 +18,9 @@ def create_cu_seqlens(seq_lengths):
     return torch.tensor(cu_seqlens, dtype=torch.int32, device="mps")
 
 
-def reference_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, scale=None, causal=False, softcap=0.0, sinks=None):
+def reference_attention(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, scale=None, causal=False, softcap=0.0, sinks=None, window_size=(-1, -1)
+):
     """Per-sequence attention in float64 on the CPU.
 
     The causal mask is aligned to the bottom-right corner, as in flash-attn. Rows
@@ -40,10 +42,15 @@ def reference_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, scale=None, causal=
         scores = qb @ kb.transpose(-1, -2) * scale
         if softcap > 0:
             scores = softcap * torch.tanh(scores / softcap)
+        row = torch.arange(q_len)[:, None] + (k_len - q_len)
+        col = torch.arange(k_len)[None, :]
         if causal:
-            row = torch.arange(q_len)[:, None] + (k_len - q_len)
-            col = torch.arange(k_len)[None, :]
             scores = scores.masked_fill(col > row, float("-inf"))
+        left, right = window_size
+        if left >= 0:
+            scores = scores.masked_fill(col < row - left, float("-inf"))
+        if right >= 0:
+            scores = scores.masked_fill(col > row + right, float("-inf"))
         if sinks is not None:
             sink_logits = sinks.cpu().double()[:, None, None].expand(-1, q_len, 1)
             probs = torch.softmax(torch.cat([scores, sink_logits], dim=-1), dim=-1)[..., :-1]
@@ -64,6 +71,7 @@ def run_varlen(
     softcap=0.0,
     input_scale=1.0,
     sinks=False,
+    window_size=(-1, -1),
 ):
     num_heads_kv = num_heads if num_heads_kv is None else num_heads_kv
     cu_seqlens_q = create_cu_seqlens(q_lens)
@@ -84,9 +92,10 @@ def run_varlen(
         causal=causal,
         softcap=softcap,
         s_aux=s_aux,
+        window_size=window_size,
     )
     expected = reference_attention(
-        q, k, v, cu_seqlens_q, cu_seqlens_k, causal=causal, softcap=softcap, sinks=s_aux
+        q, k, v, cu_seqlens_q, cu_seqlens_k, causal=causal, softcap=softcap, sinks=s_aux, window_size=window_size
     )
     torch.testing.assert_close(out.cpu().double(), expected, atol=ATOL[dtype], rtol=0)
 
@@ -194,7 +203,7 @@ DECODE_CONFIGS = {
 }
 
 
-def run_decode(config, dtype, head_dim, causal, softcap=0.0, sinks=False):
+def run_decode(config, dtype, head_dim, causal, softcap=0.0, sinks=False, window_size=(-1, -1)):
     q_lens, k_lens, num_heads, num_heads_kv = DECODE_CONFIGS[config]
     run_varlen(
         q_lens,
@@ -206,6 +215,7 @@ def run_decode(config, dtype, head_dim, causal, softcap=0.0, sinks=False):
         causal=causal,
         softcap=softcap,
         sinks=sinks,
+        window_size=window_size,
     )
 
 
@@ -242,6 +252,50 @@ def test_decode_ci(dtype, config, head_dim):
 def test_decode_softcap(config):
     torch.manual_seed(42)
     run_decode(config, torch.float32, 128, causal=True, softcap=5.0, sinks=True)
+
+
+# (left, right) windows; (127, 127) with causal is what transformers passes for a
+# sliding window of 128 (e.g. gpt-oss).
+WINDOWS = [(127, 127), (16, 0), (5, 3), (-1, 8), (40, -1)]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("window_size", WINDOWS)
+def test_sliding_window(dtype, head_dim, causal, window_size):
+    torch.manual_seed(42)
+    # Prefill, chunked prefill (q_len < k_len), q_len > k_len and an empty sequence.
+    run_varlen(
+        [300, 64, 50, 7],
+        [300, 500, 20, 0],
+        dtype=dtype,
+        head_dim=head_dim,
+        num_heads=8,
+        num_heads_kv=2,
+        causal=causal,
+        window_size=window_size,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("config", ["1pass", "2pass", "2pass_gqa8"])
+@pytest.mark.parametrize("window_size", WINDOWS)
+@pytest.mark.parametrize("sinks", [False, True])
+def test_sliding_window_decode(dtype, config, window_size, sinks):
+    torch.manual_seed(42)
+    run_decode(config, dtype, 64, causal=True, sinks=sinks, window_size=window_size)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("config", [None, "1pass", "2pass_gqa8"])
+def test_sliding_window_ci(config):
+    torch.manual_seed(42)
+    if config is None:
+        run_varlen([300, 7], [300, 700], dtype=torch.bfloat16, head_dim=64, num_heads=8, num_heads_kv=2,
+                   causal=True, sinks=True, window_size=(127, 127))
+    else:
+        run_decode(config, torch.bfloat16, 64, causal=True, sinks=True, window_size=(127, 127))
 
 
 def test_legacy_softcapping_disabled():
@@ -340,8 +394,6 @@ def test_flash_attn_varlen_func_unsupported():
     cu_seqlens = create_cu_seqlens([16])
     with pytest.raises(NotImplementedError):
         metal_flash_sdpa.flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, 16, 16, dropout_p=0.1)
-    with pytest.raises(NotImplementedError):
-        metal_flash_sdpa.flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, 16, 16, window_size=(4, 0))
     # A list with the default value is accepted.
     metal_flash_sdpa.flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, 16, 16, window_size=[-1, -1])
 

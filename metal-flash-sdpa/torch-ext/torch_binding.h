@@ -14,4 +14,6 @@ void flash_attention_varlen(
     bool do_causal,
     double scale,
     double softcapping,
-    const std::optional<torch::Tensor> &s_aux);
+    const std::optional<torch::Tensor> &s_aux,
+    int64_t window_left,
+    int64_t window_right);
