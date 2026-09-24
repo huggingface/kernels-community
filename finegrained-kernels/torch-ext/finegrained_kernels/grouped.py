@@ -41,7 +41,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, raw_activation_pointer_pruner, global_scale_warp_spec_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, paired_device_descriptor_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
+from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, raw_activation_pointer_pruner, global_scale_warp_spec_pruner, warp_spec_memory_mode_pruner, packed_schedule_scope_pruner, affine_scale_warp_spec_pruner, block_dynamic_grouped_matmul_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, gate_stacked_tmem_trap_pruner, gated_pointer_weight_warp_spec_pruner, mx_config_pruner, require_moe_dims_aligned, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, swizzled_scales_bm_pruner, warp_spec_compile_guard_pruner
 
 
 @bayesian_autotune(
@@ -1103,7 +1103,6 @@ def mx_weight_only_matmul_grouped_kernel(
             warp_spec_compile_guard_pruner(),
             packed_schedule_scope_pruner(),
             descriptor_box_pruner(),
-            paired_device_descriptor_pruner(),
             smem_pruner(),
         )
     },
@@ -1221,10 +1220,8 @@ def full_precision_matmul_grouped_kernel(
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         # The stock descriptor arms read host-built (``TensorDescriptor.from_tensor``) boxes.
-        # That is a TMA descriptor, and Xe has no TMA, so it builds the descriptors on the
-        # device instead: the config generator resolves the generic "descriptor" mode to
-        # "device_descriptor" on XPU (see resolve_memory_modes), which selects this arm.
-        # paired_device_descriptor_pruner guarantees the two modes agree.
+        # That is a TMA descriptor, and Xe has no TMA, so this arm builds both boxes in-kernel
+        # instead.
         DEVICE_DESC_ARM: tl.constexpr = (
             A_MEMORY_MODE == "device_descriptor" and B_MEMORY_MODE == "device_descriptor"
         )
