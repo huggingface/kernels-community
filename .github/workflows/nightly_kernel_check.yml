@@ -5,8 +5,12 @@ on:
     - cron: "0 2 * * *"
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   kernels-check:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
