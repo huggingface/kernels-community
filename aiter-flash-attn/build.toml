@@ -1,6 +1,6 @@
 [general]
 name = "aiter-flash-attn"
-version = 1
+version = 2
 edition = 5
 license = "MIT"
 backends = ["rocm"]
