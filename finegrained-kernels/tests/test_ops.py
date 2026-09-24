@@ -24,9 +24,10 @@ shapes, torch.compile) ride one format each. One ``Problem`` list feeds all thre
 ``op`` axis (``test_op_scenarios``): the routed ops (``batched`` / ``grouped``) run
 every Problem; ``matmul`` — the single-GEMM sibling — runs each Problem it can represent (no
 expert routing, a quantized format it routes, requant on MX weights only), one weight matrix and
-no gather/scatter. Two orthogonal knobs ride the same list: ``static`` (per-tensor calibrated
-activation quant, all three ops) and ``swizzled`` (MX weight scales pre-swizzled into the 5D
-SWIZZLE_32_4_4 tcgen05 layout — a pure layout variant checked against the affine reference).
+no gather/scatter. Two orthogonal knobs ride the same list: ``static`` (calibrated activation
+quant — a shared scale on all three ops, one per expert on the routed pair) and ``swizzled`` (MX
+weight scales pre-swizzled into the 5D SWIZZLE_32_4_4 tcgen05 layout — a pure layout variant
+checked against the affine reference).
 Nothing in this file uses a kernel under test as the oracle."""
 
 from dataclasses import dataclass
@@ -76,7 +77,7 @@ class Problem:
     quantize_output: bool = False
     per_expert_globals: bool = False  # activation (and requant output) globals calibrated per expert
     prequant: bool = False  # pass As explicitly (must be bit-identical to raw A)
-    static: bool = False  # per-tensor calibrated activation scale (block-scale FP8 path)
+    static: bool = False  # calibrated (static) activation scale instead of a runtime one
     swizzled: bool = False  # pass MX weight scales pre-swizzled (5D SWIZZLE_32_4_4 fast path)
     sentinel_fraction: float = 0.0
     noncontiguous: bool = False
@@ -169,6 +170,10 @@ def scenarios() -> list[Problem]:
         # decode shape (small M — inline act-quant on MX, the software/scalar arms elsewhere)
         Problem(weights="mxfp8", S=8),
         Problem(weights="nvfp4", S=8),
+        # the TOP of the 2D swap decode band (mx_2d_swap_scope_pruner scopes SWAP_AB to M <= 16):
+        # the arm's tile choices differ across the band, and an A-descriptor trap that is clean at
+        # S=4 fires by S=16, so the edge is the cell that sees it
+        Problem(weights="nvfp4", S=16),
         Problem(weights="fp8_128x128", S=8),
         Problem(weights="fp8_128x128_ue8m0", S=8),
         Problem(weights="mxfp4", S=8),
@@ -221,10 +226,15 @@ def scenarios() -> list[Problem]:
         Problem(weights="fp8_128x128", compile=True),
         Problem(weights="mxfp4", compile=True),
         Problem(weights="bf16", compile=True),  # the fp kernel's pre_hook under compile
-        # static (per-tensor calibrated) activation quant — the block_static path, reached when
-        # As is a per-tensor scalar; runs on all three ops (2D / grouped / batched).
+        Problem(weights="fp8_tensor", static=True, compile=True),  # the static arm's operand marshalling
+        # calibrated (static) activation quant, reached when As is a calibrated scale rather than
+        # per-block. One value per quantized module, so the OP fixes the shape: a dense linear
+        # calibrates once, a MoE calibrates each expert separately. Runs on all three ops.
         Problem(weights="fp8_128x128", static=True),
         Problem(weights="fp8_128x128", gate=True, static=True),
+        # per-TENSOR weights: the shipped static form (Ministral-3 dense, Mistral-4 MoE — both
+        # write qscheme_act="TENSOR" with weight_block_size=None)
+        Problem(weights="fp8_tensor", static=True),
         # non-aligned N (64-grid, off the 128-grid — gpt-oss H=I=2880 shape). matmul_2d masks the
         # N-tail; routed MX runs the affine arm (per-row scales, any BN|N); routed FP8 rejects it
         # (its scales are 128-blocked along N — raises pointing to matmul_2d).
@@ -278,10 +288,19 @@ def _make_noncontig(x):
     return base[:, 0]
 
 
-def _static_scale(problem: Problem, A):
-    """Per-tensor calibrated activation scale for the static (block-scale FP8) path, else None —
-    deterministic in ``A``, so the reference and the op derive the identical scalar."""
-    return make_static_activation_scale(A) if problem.static else None
+def _static_scale(problem: Problem, op, A):
+    """The calibrated activation scale, else None. A checkpoint calibrates one per quantized
+    module, so the op fixes the shape: one value for ``matmul``, the single linear, and one per
+    expert for the routed ops, whose experts are each their own module — fanned around the
+    per-tensor value so an entry read against the wrong expert shows up. Deterministic in ``A``,
+    so the reference and the op derive identical numbers."""
+    if not problem.static:
+        return None
+    scale = make_static_activation_scale(A)
+    if op == "matmul":
+        return scale
+    fan = torch.linspace(0.5, 2.0, problem.E, device=A.device, dtype=torch.float32)
+    return (scale * fan).contiguous()
 
 
 def _nvfp4_global(x):
@@ -315,15 +334,15 @@ def _rowwise(problem: Problem, g, expert_ids):
     return g[expert_ids.to(torch.long).clamp(max=problem.E - 1)].reshape(-1, 1)
 
 
-def _dequant_a(problem: Problem, A, expert_ids=None):
+def _dequant_a(problem: Problem, op, A, expert_ids=None):
     """``A`` dequantized to fp32 on the format's grid (the exact host quant the op calls, or the
-    static per-tensor scale), plus the pre-quantized ``(Aq, As)`` form for the prequant round-trip
+    calibrated static scale of each row's expert), plus the pre-quantized ``(Aq, As)`` form for the prequant round-trip
     check (``None`` where ``A`` stays raw)."""
     row = WEIGHTS[problem.weights]
-    static_scale = _static_scale(problem, A)
+    static_scale = _static_scale(problem, op, A)
     act_global = _act_global(problem, A, expert_ids)
-    if static_scale is not None:  # static per-tensor activation quant
-        return quant_dequant_a(A, problem.K, scale=static_scale), None
+    if static_scale is not None:  # static (calibrated) activation quant
+        return quant_dequant_a(A, problem.K, scale=_rowwise(problem, static_scale, expert_ids)), None
     if act_global is not None:
         # nvfp4 acts are always two-level: quantize A/g_a per block (the exact host fn the op
         # calls), dequantize × g_a; the pre-quantized form is the bare block scale (the g_a
@@ -344,20 +363,20 @@ def _dequant_a(problem: Problem, A, expert_ids=None):
     return row["dq_act"](Aq, As), (Aq, As)
 
 
-def _prequant_args(problem: Problem, A, expert_ids=None):
+def _prequant_args(problem: Problem, op, A, expert_ids=None):
     """The pre-quantized ``(Aq, As)`` form of ``A`` (``As`` = bare block scale) — the ``As`` half of
     ``_dequant_a``, handed to the op (and the reference) exactly as the op would compute it. The nvfp4
     activation global rides separately (``_act_global`` on the raw ``A``)."""
-    return _dequant_a(problem, A, expert_ids)[1]
+    return _dequant_a(problem, op, A, expert_ids)[1]
 
 
-def _act_dequant(problem: Problem, A, As=None, As_global=None, expert_ids=None):
+def _act_dequant(problem: Problem, op, A, As=None, As_global=None, expert_ids=None):
     """The fp32 activation the op multiplies by — from raw ``A`` (``As`` None: quantize+dequant on
     the format grid, the exact host quant the op applies) or from a pre-quantized ``(Aq, As)`` (dequant
     it, folding the nvfp4 ``As_global`` back). Both land on the same values, so the reference reads
     whatever the op was handed."""
     if As is None:
-        return _dequant_a(problem, A, expert_ids)[0]
+        return _dequant_a(problem, op, A, expert_ids)[0]
     if As_global is not None:  # nvfp4 two-level: block scale As, global As_global
         return dq_grouped(A.view(torch.int8), As, NVFP4_SCALE_GROUP_K) * _rowwise(
             problem, As_global, expert_ids
@@ -372,7 +391,7 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
     gather ``W[expert]`` and zero sentinel rows; GLU in fp32 (the production epilogue applies it to
     the fp32 accumulator directly)."""
     row = WEIGHTS[problem.weights]
-    A_dq = _act_dequant(problem, A, As, As_global, expert_ids)
+    A_dq = _act_dequant(problem, op, A, As, As_global, expert_ids)
     W = row["dequant"](B, Bs, Bs_global)  # (E, rows, K) fp32
     if op == "matmul":
         ref = A_dq @ W[0].T  # single linear, no routing
@@ -445,8 +464,8 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
         kw["output_dtype"] = problem.dtype
     if out_global is not None:  # provided NVFP4 output global (next proj's input_scale)
         kw["output_global_scale"] = out_global
-    if problem.static:  # fused static (per-tensor) activation quant — As is the calibrated scalar
-        As = _static_scale(problem, A)
+    if problem.static:  # fused static activation quant — As is the calibrated scale
+        As = _static_scale(problem, op, A)
     # matmul is the single-GEMM sibling: slice to the one weight matrix (expert 0) and drop the
     # routing maps; the call is otherwise identical to the routed ops.
     if op == "matmul":
@@ -568,8 +587,8 @@ def _skip_moe_only(problem: Problem, op: str) -> None:
     """matmul_2d is the single-GEMM sibling: skip only the scenarios it can't represent — expert
     routing (sentinel / noncontiguous / empty-expert / the MoE prequant-As check) and non-MX
     input/output format knobs (its FP8 paths infer the quant from the scale shape and return the
-    intermediate dense). Everything else — including full-precision (BF16/FP16) weights and static
-    activation quant — runs on all three ops."""
+    intermediate dense). Everything else — including full-precision (BF16/FP16) weights and a
+    shared static activation scale — runs on all three ops."""
     if op != "matmul":
         return
     if problem.sentinel_fraction or problem.noncontiguous or problem.empty_expert or problem.prequant:
@@ -625,7 +644,7 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
         As = None
         As_global = _act_global(problem, A, expert_ids)
         if problem.prequant:
-            A, As = _prequant_args(problem, A, expert_ids)
+            A, As = _prequant_args(problem, op, A, expert_ids)
         g_out = _out_global(problem, op, A, expert_ids, B, Bs, Bs_global, As, As_global)
         ref = _reference(problem, op, A, expert_ids, B, Bs, Bs_global, As=As, As_global=As_global, out_global=g_out)
         if shared is not None:
@@ -657,6 +676,10 @@ _SWEEP_CELLS = [
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", "mx_dynamic_matmul_kernel"),
     (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
+    # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize
+    # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is
+    # the one a memory-mode fence gets wrong (silently — the tuner forgives what will not lower)
+    (Problem(weights="fp8_tensor", static=True), "grouped", "w8a8_tensor_dynamic_fp8_matmul_grouped_kernel"),
 ]
 
 

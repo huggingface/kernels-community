@@ -10,13 +10,14 @@ on:
         type: string
         default: ""
 
-permissions:
-  contents: read
-  # id-token: write is needed for cosign keyless signing.
-  id-token: write
+
+permissions: {}
 
 jobs:
   sign-kernels:
+    permissions:
+      contents: read
+      id-token: write
     runs-on:
       group: aws-highmemory-32-plus-nix
     timeout-minutes: 1200 # 20h

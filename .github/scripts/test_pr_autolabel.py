@@ -1,6 +1,10 @@
 import unittest
+from pathlib import Path
 
 import pr_autolabel as autolabel
+
+
+WORKFLOW = Path(".github/workflows/pr-autolabel.yml")
 
 
 def pr(title, user="contributor"):
@@ -93,6 +97,15 @@ class FinalizeLabelsTest(unittest.TestCase):
         self.assertIn("needs-rebase", out)  # status is uncapped
         self.assertIn("new-kernel", out)  # higher priority than performance
         self.assertNotIn("performance", out)  # trimmed by the global cap
+
+
+class WorkflowTriggerTest(unittest.TestCase):
+    def test_new_pr_commits_trigger_label_reconciliation(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertRegex(
+            workflow,
+            r"pull_request_target:\s+types:\s*\[[^]]*\bsynchronize\b[^]]*\]",
+        )
 
 
 if __name__ == "__main__":

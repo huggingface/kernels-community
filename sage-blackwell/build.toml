@@ -13,7 +13,7 @@ upstream = "https://github.com/thu-ml/SageAttention.git"
 minver = "12.8"
 
 [general.hub]
-repo-id = "kernels-community/sage-blackwell"
+repo-id = "SageAttention/sage-blackwell"
 
 [torch]
 src = [

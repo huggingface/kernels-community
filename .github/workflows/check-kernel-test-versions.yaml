@@ -10,15 +10,17 @@ on:
       - ".github/workflows/check-kernel-test-versions.yaml"
   workflow_dispatch:
 
-permissions:
-  contents: read
 
 concurrency:
   group: check-kernel-test-versions-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   check:
+    permissions:
+      contents: read
     name: Check versions used by tests
     runs-on: ubuntu-latest
     steps:

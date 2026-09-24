@@ -211,7 +211,7 @@ def test_flash_attn_causal_sliding_window_with_sink(window_right):
     sink = torch.randn(H, device="cuda", dtype=torch.float16)
 
     out = flash_attn_func(
-        q, k, v, causal=True, window_size=(left, window_right), sink=sink
+        q, k, v, causal=True, window_size=(left, window_right), s_aux=sink
     )
     ref = _sdpa_reference(
         q, k, v, causal=True, window_size=(left, -1), sink=sink
