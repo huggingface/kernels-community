@@ -13,4 +13,5 @@ void flash_attention_varlen(
     int64_t max_seqlen_k,
     bool do_causal,
     double scale,
-    double softcapping);
+    double softcapping,
+    const std::optional<torch::Tensor> &s_aux);

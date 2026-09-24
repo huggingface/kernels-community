@@ -8,7 +8,7 @@ import numpy as np
 from typing import List
 import kernels
 
-metal_flash_sdpa = kernels.get_kernel("kernels-community/metal-flash-sdpa")
+metal_flash_sdpa = kernels.get_kernel("kernels-community/metal-flash-sdpa", version=1)
 
 
 def create_cu_seqlens(seq_lengths: List[int]) -> torch.Tensor:

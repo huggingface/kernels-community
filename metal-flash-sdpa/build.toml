@@ -17,8 +17,24 @@ src = [
 [kernel.sdpa_metal]
 backend = "metal"
 depends = ["torch"]
+include = ["sdpa-metal"]
 src = [
     "sdpa-metal/scaled_dot_product_attention.mm",
     "sdpa-metal/scaled_dot_product_attention.metal",
-    "sdpa-metal/common.h",
+    "sdpa-metal/bf16.h",
+    "sdpa-metal/bf16_math.h",
+    "sdpa-metal/complex.h",
+    "sdpa-metal/defines.h",
+    "sdpa-metal/logging.h",
+    "sdpa-metal/utils.h",
+    "sdpa-metal/steel/defines.h",
+    "sdpa-metal/steel/utils.h",
+    "sdpa-metal/steel/utils/integral_constant.h",
+    "sdpa-metal/steel/utils/type_traits.h",
+    "sdpa-metal/steel/gemm/params.h",
+    "sdpa-metal/steel/attn/attn.h",
+    "sdpa-metal/steel/attn/loader.h",
+    "sdpa-metal/steel/attn/mma.h",
+    "sdpa-metal/steel/attn/params.h",
+    "sdpa-metal/steel/attn/transforms.h",
 ]
