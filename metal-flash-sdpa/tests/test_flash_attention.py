@@ -180,6 +180,70 @@ def test_sinks_validation():
         metal_flash_sdpa.flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, 16, 16, s_aux=torch.zeros(4))
 
 
+# Decode shapes (at most 8 query tokens per sequence) use the vector kernels.
+# The key lengths pick the kernel independently of the GPU: the 1-pass kernel
+# below 1024 keys, the 2-pass kernel for GQA from 4096 keys, and its GQA
+# read-once variant for single query tokens with GQA 8/12/16 from 8192 keys.
+DECODE_CONFIGS = {
+    # name: (q lengths, k lengths, num_heads, num_heads_kv)
+    "1pass": ([1, 3, 8, 0, 1], [50, 3, 200, 10, 0], 8, 2),
+    "2pass": ([1, 4, 2, 1], [4100, 5000, 30, 0], 8, 2),
+    "2pass_gqa8": ([1, 1, 0, 1], [8200, 100, 50, 0], 16, 2),
+    "2pass_gqa12": ([1, 1], [9000, 17], 12, 1),
+    "2pass_gqa16": ([1, 1], [8192, 1], 16, 1),
+}
+
+
+def run_decode(config, dtype, head_dim, causal, softcap=0.0, sinks=False):
+    q_lens, k_lens, num_heads, num_heads_kv = DECODE_CONFIGS[config]
+    run_varlen(
+        q_lens,
+        k_lens,
+        dtype=dtype,
+        head_dim=head_dim,
+        num_heads=num_heads,
+        num_heads_kv=num_heads_kv,
+        causal=causal,
+        softcap=softcap,
+        sinks=sinks,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [32, 64, 96, 128, 192, 256])
+@pytest.mark.parametrize("config", ["1pass", "2pass"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("sinks", [False, True])
+def test_decode(dtype, head_dim, config, causal, sinks):
+    torch.manual_seed(42)
+    run_decode(config, dtype, head_dim, causal, sinks=sinks)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "config,head_dim",
+    [("2pass_gqa8", 64), ("2pass_gqa8", 128), ("2pass_gqa12", 128), ("2pass_gqa16", 128)],
+)
+@pytest.mark.parametrize("sinks", [False, True])
+def test_decode_gqa(dtype, config, head_dim, sinks):
+    torch.manual_seed(42)
+    run_decode(config, dtype, head_dim, causal=True, sinks=sinks)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("config,head_dim", [("1pass", 128), ("2pass", 64), ("2pass_gqa8", 128)])
+def test_decode_ci(dtype, config, head_dim):
+    torch.manual_seed(42)
+    run_decode(config, dtype, head_dim, causal=True, sinks=True)
+
+
+@pytest.mark.parametrize("config", ["1pass", "2pass", "2pass_gqa8"])
+def test_decode_softcap(config):
+    torch.manual_seed(42)
+    run_decode(config, torch.float32, 128, causal=True, softcap=5.0, sinks=True)
+
+
 def test_legacy_softcapping_disabled():
     # flash_attention_varlen keeps its original convention: 1.0 disables softcapping.
     torch.manual_seed(42)

@@ -13,6 +13,7 @@ Some components of these kernels are from [mlx](https://github.com/ml-explore/ml
 ## Supported Features
 
 - Variable-length sequences without padding
+- Decode kernels for sequences with up to 8 query tokens (MLX's vector kernels), tiled kernels otherwise
 - Causal masking
 - Grouped Query Attention (GQA) and Multi-Query Attention (MQA)
 - Softcapping support for attention score regularization

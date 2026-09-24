@@ -21,6 +21,8 @@ include = ["sdpa-metal"]
 src = [
     "sdpa-metal/scaled_dot_product_attention.mm",
     "sdpa-metal/scaled_dot_product_attention.metal",
+    "sdpa-metal/sdpa_vector.metal",
+    "sdpa-metal/varlen_params.h",
     "sdpa-metal/bf16.h",
     "sdpa-metal/bf16_math.h",
     "sdpa-metal/complex.h",

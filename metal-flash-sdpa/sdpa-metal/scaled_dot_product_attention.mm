@@ -17,7 +17,7 @@
 
 namespace {
 
-// Must match VarlenAttnParams in scaled_dot_product_attention.metal.
+// Must match VarlenAttnParams in varlen_params.h.
 struct VarlenAttnParams {
   int64_t q_strides[2]; // (token, head)
   int64_t k_strides[2];
@@ -30,10 +30,18 @@ struct VarlenAttnParams {
 };
 static_assert(sizeof(VarlenAttnParams) == 80, "VarlenAttnParams layout");
 
-// Function constant indices, see scaled_dot_product_attention.metal.
+// Function constants shared by scaled_dot_product_attention.metal and
+// sdpa_vector.metal.
+struct FunctionConstants {
+  bool do_causal;
+  bool has_sinks;
+  bool has_softcap;
+  int blocks; // Number of key blocks of the 2-pass vector kernel.
+};
 constexpr NSUInteger kFcDoCausal = 301;
 constexpr NSUInteger kFcHasSinks = 302;
 constexpr NSUInteger kFcHasSoftcap = 303;
+constexpr NSUInteger kFcBlocks = 304;
 
 struct TileConfig {
   int bq;
@@ -70,15 +78,15 @@ id<MTLBuffer> getMTLBufferStorage(const torch::Tensor &tensor) {
 }
 
 id<MTLComputePipelineState> getPipeline(const std::string &kernel_name,
-                                        bool do_causal, bool has_sinks,
-                                        bool has_softcap) {
+                                        FunctionConstants fc) {
   static std::mutex mutex;
   static std::unordered_map<std::string, id<MTLComputePipelineState>> cache;
   static id<MTLLibrary> lib = nil;
 
-  std::string key = kernel_name + (do_causal ? "_causal" : "") +
-                    (has_sinks ? "_sinks" : "") +
-                    (has_softcap ? "_softcap" : "");
+  std::string key = kernel_name + (fc.do_causal ? "_causal" : "") +
+                    (fc.has_sinks ? "_sinks" : "") +
+                    (fc.has_softcap ? "_softcap" : "") + "_blocks" +
+                    std::to_string(fc.blocks);
 
   std::lock_guard<std::mutex> lock(mutex);
   auto it = cache.find(key);
@@ -94,16 +102,18 @@ id<MTLComputePipelineState> getPipeline(const std::string &kernel_name,
                 error ? error.localizedDescription.UTF8String : "unknown");
   }
 
+  // Constants that a function does not use are ignored.
   MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
-  [constants setConstantValue:&do_causal
+  [constants setConstantValue:&fc.do_causal
                          type:MTLDataTypeBool
                       atIndex:kFcDoCausal];
-  [constants setConstantValue:&has_sinks
+  [constants setConstantValue:&fc.has_sinks
                          type:MTLDataTypeBool
                       atIndex:kFcHasSinks];
-  [constants setConstantValue:&has_softcap
+  [constants setConstantValue:&fc.has_softcap
                          type:MTLDataTypeBool
                       atIndex:kFcHasSoftcap];
+  [constants setConstantValue:&fc.blocks type:MTLDataTypeInt atIndex:kFcBlocks];
 
   id<MTLFunction> function =
       [lib newFunctionWithName:[NSString stringWithUTF8String:kernel_name.c_str()]
@@ -120,6 +130,92 @@ id<MTLComputePipelineState> getPipeline(const std::string &kernel_name,
 
   cache.emplace(key, pipeline);
   return pipeline;
+}
+
+// The last character of the GPU architecture name, e.g. 's' for
+// applegpu_g15s. MLX uses it to pick the number of blocks of the 2-pass
+// vector kernel: 'p' phone, 'g' base/Pro, 's' Max, 'd' Ultra.
+char getArchitectureSuffix() {
+  static const char suffix = [] {
+    id<MTLDevice> device = at::mps::MPSDevice::getInstance()->device();
+    NSString *name = device.architecture.name;
+    return name.length > 0 ? static_cast<char>([name characterAtIndex:name.length - 1])
+                           : 'g';
+  }();
+  return suffix;
+}
+
+// Decode kernels, following MLX's dispatch in
+// mlx/backend/metal/scaled_dot_product_attention.cpp.
+enum class VectorKernel { None, OnePass, TwoPass, TwoPassGqa };
+
+VectorKernel chooseVectorKernel(int64_t head_dim, int64_t gqa_factor,
+                                int64_t max_seqlen_q, int64_t max_seqlen_k) {
+  const bool supported_head_dim = head_dim == 32 || head_dim == 64 ||
+                                  head_dim == 96 || head_dim == 128 ||
+                                  head_dim == 192 || head_dim == 256;
+  if (!supported_head_dim || max_seqlen_q > 8 ||
+      gqa_factor * max_seqlen_q > 32) {
+    return VectorKernel::None;
+  }
+
+  const char arch = getArchitectureSuffix();
+  const bool two_pass =
+      ((arch == 'd' || arch == 's') && max_seqlen_k >= 1024) ||
+      (gqa_factor > 1 && max_seqlen_k >= 4096);
+  if (!two_pass) {
+    return VectorKernel::OnePass;
+  }
+
+  const bool gqa_dims =
+      (gqa_factor == 8 && (head_dim == 64 || head_dim == 128)) ||
+      ((gqa_factor == 12 || gqa_factor == 16) && head_dim == 128);
+  if (gqa_dims && max_seqlen_q == 1 && max_seqlen_k >= 8192) {
+    return VectorKernel::TwoPassGqa;
+  }
+  return VectorKernel::TwoPass;
+}
+
+int twoPassBlocks(int64_t n_simds, int64_t max_seqlen_k) {
+  const char arch = getArchitectureSuffix();
+  const int64_t N = max_seqlen_k;
+  int blocks;
+  if (arch == 's') {
+    blocks = 64;
+    if (N > 1024 && n_simds > 4) {
+      if (N <= 8192) {
+        blocks = 128;
+      } else if (N <= 32768) {
+        blocks = 256;
+      } else if (N <= 65536) {
+        blocks = 512;
+      } else {
+        blocks = 1024;
+      }
+    }
+  } else if (arch == 'd') {
+    blocks = 128;
+    if (n_simds <= 2 && N > 8192) {
+      blocks = 256;
+    } else if (n_simds >= 6) {
+      if (N >= 16384 && N < 65536) {
+        blocks = 512;
+      } else if (N >= 65536) {
+        blocks = 1024;
+      }
+    }
+  } else {
+    blocks = n_simds >= 4 ? 64 : 32;
+  }
+  // All counts are multiples of 32, which the second pass requires.
+  return blocks;
+}
+
+void setTensor(id<MTLComputeCommandEncoder> encoder, const torch::Tensor &t,
+               NSUInteger index) {
+  [encoder setBuffer:getMTLBufferStorage(t)
+              offset:t.storage_offset() * t.element_size()
+             atIndex:index];
 }
 
 void checkAttentionTensor(const torch::Tensor &t, const char *name,
@@ -158,8 +254,6 @@ void flash_attention_varlen(
     double scale,                // Attention scale
     double softcapping,          // Softcap value, <= 0 disables softcapping
     const std::optional<torch::Tensor> &s_aux) { // [num_heads] sinks
-  (void)max_seqlen_k;
-
   const auto dtype = query.scalar_type();
   checkAttentionTensor(query, "query", dtype);
   checkAttentionTensor(key, "key", dtype);
@@ -168,6 +262,7 @@ void flash_attention_varlen(
   checkCuSeqlens(cu_seqlens_q, "cu_seqlens_q");
   checkCuSeqlens(cu_seqlens_k, "cu_seqlens_k");
 
+  const int64_t total_q_tokens = query.size(0);
   const int64_t num_heads = query.size(1);
   const int64_t head_dim = query.size(2);
   const int64_t num_heads_kv = key.size(1);
@@ -190,9 +285,10 @@ void flash_attention_varlen(
               ") must be divisible by num_heads_kv (", num_heads_kv, ")");
   TORCH_CHECK(cu_seqlens_k.size(0) == cu_seqlens_q.size(0),
               "cu_seqlens_q and cu_seqlens_k must have the same size");
-  TORCH_CHECK(max_seqlen_q >= 0, "max_seqlen_q must be non-negative");
+  TORCH_CHECK(max_seqlen_q >= 0 && max_seqlen_k >= 0,
+              "max_seqlen_q and max_seqlen_k must be non-negative");
 
-  // The kernel reads sinks as float32. The conversion is cheap: one value
+  // The kernels read sinks as float32. The conversion is cheap: one value
   // per head.
   torch::Tensor sinks;
   if (s_aux.has_value()) {
@@ -203,15 +299,14 @@ void flash_attention_varlen(
                 "s_aux must have shape [num_heads]");
     sinks = s_aux->to(torch::kFloat).contiguous();
   }
-  const bool has_sinks = sinks.defined();
 
-  const TileConfig tiles = getTileConfig(dtype, head_dim);
-  const int64_t num_q_blocks = (max_seqlen_q + tiles.bq - 1) / tiles.bq;
-  if (batch_size == 0 || num_q_blocks == 0 || num_heads == 0) {
+  if (batch_size == 0 || max_seqlen_q == 0 || total_q_tokens == 0 ||
+      num_heads == 0) {
     return;
   }
 
   const bool has_softcap = softcapping > 0.0;
+  FunctionConstants fc = {do_causal, sinks.defined(), has_softcap, 0};
 
   VarlenAttnParams params = {};
   params.q_strides[0] = query.stride(0);
@@ -227,13 +322,71 @@ void flash_attention_varlen(
   params.scale = static_cast<float>(scale);
   params.softcap = has_softcap ? static_cast<float>(softcapping) : 1.0f;
 
-  const std::string kernel_name =
-      "attention_varlen_" + getKernelDtypeString(dtype) + "_bq" +
-      std::to_string(tiles.bq) + "_bk" + std::to_string(tiles.bk) + "_bd" +
-      std::to_string(head_dim) + "_wm" + std::to_string(tiles.wm) + "_wn" +
-      std::to_string(tiles.wn);
-  id<MTLComputePipelineState> pipeline =
-      getPipeline(kernel_name, do_causal, has_sinks, has_softcap);
+  const std::string dtype_name = getKernelDtypeString(dtype);
+  const int64_t gqa_factor = num_heads / num_heads_kv;
+
+  // Pick the kernels. Decode (a few query tokens per sequence) uses the
+  // vector kernels, everything else the tiled steel kernel.
+  VectorKernel vector_kernel =
+      chooseVectorKernel(head_dim, gqa_factor, max_seqlen_q, max_seqlen_k);
+  id<MTLComputePipelineState> pipeline = nil;
+  id<MTLComputePipelineState> reduce_pipeline = nil;
+  MTLSize grid_size;
+  MTLSize threadgroup_size;
+  torch::Tensor partials, sums, maxs;
+
+  if (vector_kernel == VectorKernel::OnePass) {
+    pipeline = getPipeline("sdpa_vector_varlen_" + dtype_name + "_" +
+                               std::to_string(head_dim),
+                           fc);
+    grid_size = MTLSizeMake(num_heads, max_seqlen_q, batch_size);
+    threadgroup_size = MTLSizeMake(1024, 1, 1);
+  } else if (vector_kernel != VectorKernel::None) {
+    const bool gqa_variant = vector_kernel == VectorKernel::TwoPassGqa;
+    fc.blocks = twoPassBlocks(gqa_factor * max_seqlen_q, max_seqlen_k);
+    const std::string suffix =
+        "varlen_" + dtype_name + "_" + std::to_string(head_dim);
+    pipeline = getPipeline(
+        gqa_variant ? "sdpa_vector_2pass_1_gqa_" + std::to_string(gqa_factor) +
+                          "_" + suffix
+                    : "sdpa_vector_2pass_1_" + suffix,
+        fc);
+    reduce_pipeline = getPipeline("sdpa_vector_2pass_2_" + suffix, fc);
+    grid_size = MTLSizeMake(num_heads_kv, batch_size, fc.blocks);
+    threadgroup_size =
+        MTLSizeMake(32, gqa_factor, gqa_variant ? 1 : max_seqlen_q);
+
+    partials = torch::empty({total_q_tokens, num_heads, fc.blocks, head_dim},
+                            query.options());
+    sums = torch::empty({total_q_tokens, num_heads, fc.blocks},
+                        query.options().dtype(torch::kFloat));
+    maxs = torch::empty_like(sums);
+  }
+
+  // Register pressure can lower the maximum threadgroup size of the vector
+  // kernels, e.g. on older GPUs. Fall back to the steel kernel then.
+  if (pipeline != nil &&
+      (pipeline.maxTotalThreadsPerThreadgroup <
+           threadgroup_size.width * threadgroup_size.height *
+               threadgroup_size.depth ||
+       (reduce_pipeline != nil &&
+        reduce_pipeline.maxTotalThreadsPerThreadgroup < 1024))) {
+    pipeline = nil;
+    reduce_pipeline = nil;
+  }
+
+  if (pipeline == nil) {
+    const TileConfig tiles = getTileConfig(dtype, head_dim);
+    pipeline = getPipeline(
+        "attention_varlen_" + dtype_name + "_bq" + std::to_string(tiles.bq) +
+            "_bk" + std::to_string(tiles.bk) + "_bd" +
+            std::to_string(head_dim) + "_wm" + std::to_string(tiles.wm) +
+            "_wn" + std::to_string(tiles.wn),
+        fc);
+    grid_size = MTLSizeMake((max_seqlen_q + tiles.bq - 1) / tiles.bq, num_heads,
+                            batch_size);
+    threadgroup_size = MTLSizeMake(32, tiles.wm, tiles.wn);
+  }
 
   at::mps::MPSStream *stream = at::mps::getCurrentMPSStream();
   TORCH_CHECK(stream, "Failed to get current MPS stream");
@@ -245,28 +398,35 @@ void flash_attention_varlen(
     id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
     [encoder setComputePipelineState:pipeline];
-
-    const torch::Tensor *tensors[] = {&query,  &key,          &value,
-                                      &out,    &cu_seqlens_q, &cu_seqlens_k};
-    const NSUInteger indices[] = {0, 1, 2, 3, 5, 6};
-    for (int i = 0; i < 6; ++i) {
-      const torch::Tensor &t = *tensors[i];
-      [encoder setBuffer:getMTLBufferStorage(t)
-                  offset:t.storage_offset() * t.element_size()
-                 atIndex:indices[i]];
-    }
+    setTensor(encoder, query, 0);
+    setTensor(encoder, key, 1);
+    setTensor(encoder, value, 2);
+    setTensor(encoder, reduce_pipeline != nil ? partials : out, 3);
     [encoder setBytes:&params length:sizeof(VarlenAttnParams) atIndex:4];
-    if (has_sinks) {
-      [encoder setBuffer:getMTLBufferStorage(sinks)
-                  offset:sinks.storage_offset() * sinks.element_size()
-                 atIndex:7];
+    setTensor(encoder, cu_seqlens_q, 5);
+    setTensor(encoder, cu_seqlens_k, 6);
+    if (sinks.defined()) {
+      setTensor(encoder, sinks, 7);
     }
+    if (reduce_pipeline != nil) {
+      setTensor(encoder, sums, 8);
+      setTensor(encoder, maxs, 9);
+    }
+    [encoder dispatchThreadgroups:grid_size
+            threadsPerThreadgroup:threadgroup_size];
 
-    MTLSize gridSize = MTLSizeMake(num_q_blocks, num_heads, batch_size);
-    MTLSize threadgroupSize = MTLSizeMake(32, tiles.wm, tiles.wn);
-
-    [encoder dispatchThreadgroups:gridSize
-            threadsPerThreadgroup:threadgroupSize];
+    if (reduce_pipeline != nil) {
+      const int32_t num_blocks = fc.blocks;
+      [encoder setComputePipelineState:reduce_pipeline];
+      setTensor(encoder, partials, 0);
+      setTensor(encoder, sums, 1);
+      setTensor(encoder, maxs, 2);
+      setTensor(encoder, out, 3);
+      [encoder setBytes:&params length:sizeof(VarlenAttnParams) atIndex:4];
+      [encoder setBytes:&num_blocks length:sizeof(int32_t) atIndex:5];
+      [encoder dispatchThreadgroups:MTLSizeMake(num_heads, total_q_tokens, 1)
+              threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+    }
     stream->synchronize(at::mps::SyncType::COMMIT);
   });
 }
