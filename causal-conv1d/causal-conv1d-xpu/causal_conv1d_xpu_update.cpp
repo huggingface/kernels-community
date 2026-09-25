@@ -131,24 +131,24 @@ struct CausalConv1dUpdateKernel {
 
 } // namespace
 
-void causal_conv1d_update(const at::Tensor &x, const at::Tensor &conv_state,
-                          const at::Tensor &weight,
-                          const c10::optional<at::Tensor> &bias_,
-                          at::Tensor &out, bool silu_activation,
-                          const c10::optional<at::Tensor> &cache_seqlens_,
-                          const c10::optional<at::Tensor> &conv_state_indices_) {
+void causal_conv1d_update(const Tensor &x, const Tensor &conv_state,
+                          const Tensor &weight,
+                          std::optional<Tensor> bias_,
+                          Tensor &out, bool silu_activation,
+                          std::optional<Tensor> cache_seqlens_,
+                          std::optional<Tensor> conv_state_indices_) {
   const auto input_type = x.scalar_type();
   const auto weight_type = weight.scalar_type();
-  TORCH_CHECK(input_type == at::ScalarType::Float ||
-              input_type == at::ScalarType::Half ||
-              input_type == at::ScalarType::BFloat16);
-  TORCH_CHECK(weight_type == at::ScalarType::Float ||
-              weight_type == at::ScalarType::Half ||
-              weight_type == at::ScalarType::BFloat16);
-  TORCH_CHECK(conv_state.scalar_type() == input_type);
-  TORCH_CHECK(x.is_xpu());
-  TORCH_CHECK(conv_state.is_xpu());
-  TORCH_CHECK(weight.is_xpu());
+  STD_TORCH_CHECK(input_type == ScalarType::Float ||
+              input_type == ScalarType::Half ||
+              input_type == ScalarType::BFloat16);
+  STD_TORCH_CHECK(weight_type == ScalarType::Float ||
+              weight_type == ScalarType::Half ||
+              weight_type == ScalarType::BFloat16);
+  STD_TORCH_CHECK(conv_state.scalar_type() == input_type);
+  STD_TORCH_CHECK(is_xpu(x));
+  STD_TORCH_CHECK(is_xpu(conv_state));
+  STD_TORCH_CHECK(is_xpu(weight));
 
   const auto sizes = x.sizes();
   const int batch_size = sizes[0];
@@ -156,25 +156,25 @@ void causal_conv1d_update(const at::Tensor &x, const at::Tensor &conv_state,
   const int seqlen = sizes[2];
   const int width = weight.size(-1);
   const int conv_state_len = conv_state.size(2);
-  TORCH_CHECK(conv_state_len >= width - 1);
+  STD_TORCH_CHECK(conv_state_len >= width - 1);
 
   CHECK_SHAPE(x, batch_size, dim, seqlen);
   CHECK_SHAPE(weight, dim, width);
-  TORCH_CHECK(width >= 2 && width <= kMaxWidth,
+  STD_TORCH_CHECK(width >= 2 && width <= kMaxWidth,
               "causal_conv1d only supports width between 2 and 4");
 
   if (bias_.has_value()) {
     const auto &bias = bias_.value();
-    TORCH_CHECK(bias.scalar_type() == weight_type);
-    TORCH_CHECK(bias.is_xpu());
-    TORCH_CHECK(bias.stride(-1) == 1);
+    STD_TORCH_CHECK(bias.scalar_type() == weight_type);
+    STD_TORCH_CHECK(is_xpu(bias));
+    STD_TORCH_CHECK(bias.stride(-1) == 1);
     CHECK_SHAPE(bias, dim);
   }
   if (conv_state_indices_.has_value()) {
     const auto &conv_state_indices = conv_state_indices_.value();
-    TORCH_CHECK(conv_state_indices.scalar_type() == torch::kInt32);
-    TORCH_CHECK(conv_state_indices.is_xpu());
-    TORCH_CHECK(conv_state_indices.stride(0) == 1);
+    STD_TORCH_CHECK(conv_state_indices.scalar_type() == ScalarType::Int);
+    STD_TORCH_CHECK(is_xpu(conv_state_indices));
+    STD_TORCH_CHECK(conv_state_indices.stride(0) == 1);
     CHECK_SHAPE(conv_state_indices, batch_size);
     CHECK_SHAPE(conv_state, conv_state.size(0), dim, conv_state_len);
   } else {
@@ -182,14 +182,14 @@ void causal_conv1d_update(const at::Tensor &x, const at::Tensor &conv_state,
   }
   if (cache_seqlens_.has_value()) {
     const auto &cache_seqlens = cache_seqlens_.value();
-    TORCH_CHECK(cache_seqlens.scalar_type() == torch::kInt32);
-    TORCH_CHECK(cache_seqlens.is_xpu());
-    TORCH_CHECK(cache_seqlens.stride(-1) == 1);
+    STD_TORCH_CHECK(cache_seqlens.scalar_type() == ScalarType::Int);
+    STD_TORCH_CHECK(is_xpu(cache_seqlens));
+    STD_TORCH_CHECK(cache_seqlens.stride(-1) == 1);
     CHECK_SHAPE(cache_seqlens, batch_size);
   }
 
-  const c10::DeviceGuard device_guard(x.device());
-  sycl::queue &q = at::xpu::getCurrentXPUStream().queue();
+  const torch::stable::accelerator::DeviceGuard device_guard(x.get_device_index());
+  sycl::queue &q = current_queue(x);
 
   const ConvStrides p = make_conv_strides(x, weight, out, batch_size, dim,
                                           seqlen, silu_activation);
@@ -199,21 +199,21 @@ void causal_conv1d_update(const at::Tensor &x, const at::Tensor &conv_state,
       DISPATCH_WIDTH(width, "causal_conv1d_update", [&] {
       CausalConv1dUpdateKernel<kWidth, input_t, weight_t> kernel{};
       kernel.p = p;
-      kernel.x_ptr = x.data_ptr<input_t>();
-      kernel.weight_ptr = weight.data_ptr<weight_t>();
+      kernel.x_ptr = x.mutable_data_ptr<input_t>();
+      kernel.weight_ptr = weight.mutable_data_ptr<weight_t>();
       kernel.bias_ptr =
-          bias_.has_value() ? bias_.value().data_ptr<weight_t>() : nullptr;
-      kernel.out_ptr = out.data_ptr<input_t>();
-      kernel.conv_state_ptr = conv_state.data_ptr<input_t>();
+          bias_.has_value() ? bias_.value().mutable_data_ptr<weight_t>() : nullptr;
+      kernel.out_ptr = out.mutable_data_ptr<input_t>();
+      kernel.conv_state_ptr = conv_state.mutable_data_ptr<input_t>();
       kernel.conv_state_strides = make_state_strides(conv_state);
       kernel.conv_state_len = conv_state_len;
       kernel.cache_seqlens_ptr =
           cache_seqlens_.has_value()
-              ? cache_seqlens_.value().data_ptr<int32_t>()
+              ? cache_seqlens_.value().mutable_data_ptr<int32_t>()
               : nullptr;
       kernel.conv_state_indices_ptr =
           conv_state_indices_.has_value()
-              ? conv_state_indices_.value().data_ptr<int32_t>()
+              ? conv_state_indices_.value().mutable_data_ptr<int32_t>()
               : nullptr;
       launch_1d(q, static_cast<int64_t>(batch_size) * dim, kernel);
       });

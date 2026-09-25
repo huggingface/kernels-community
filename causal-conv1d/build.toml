@@ -13,10 +13,15 @@ repo-id = "kernels-community/causal-conv1d"
 
 [torch]
 src = [
-    "torch-ext/pytorch_shim.h",
     "torch-ext/torch_binding.cpp",
     "torch-ext/torch_binding.h",
 ]
+
+[torch.stable-abi]
+cuda = "2.10"
+# `torch_stream_native_handle`, which we need to get the SYCL queue is only
+# available in Torch 2.13 and later.
+xpu = "2.13"
 
 [kernel.causal_conv1d]
 backend = "cuda"

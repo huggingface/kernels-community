@@ -5,20 +5,47 @@
 
 #pragma once
 
-#include <torch/all.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/DeviceType.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Exception.h>
+#include <torch/headeronly/util/Half.h>
+#include <torch/headeronly/util/HeaderOnlyArrayRef.h>
 
-#include <ATen/ATen.h>
-#include <c10/xpu/XPUStream.h>
 #include <sycl/sycl.hpp>
 
+#include <cstdint>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 #define CHECK_SHAPE(x, ...)                                                    \
-  TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}),                  \
-              #x " must have shape (" #__VA_ARGS__ ")")
+  STD_TORCH_CHECK(                                                             \
+      x.sizes() == torch::headeronly::IntHeaderOnlyArrayRef({__VA_ARGS__}),    \
+      #x " must have shape (" #__VA_ARGS__ ")")
 
 namespace causal_conv1d_xpu {
+
+using torch::headeronly::ScalarType;
+using torch::stable::Tensor;
+
+inline bool is_xpu(const Tensor &t) {
+  return t.device().type() == torch::headeronly::DeviceType::XPU;
+}
+
+// The SYCL queue backing Torch's current XPU stream on the tensor's device.
+// For XPU streams, the stable stream's native handle is a `sycl::queue*`
+// (requires Torch >= 2.13). The queue is owned by Torch's stream pool, so the
+// reference outlives the temporary stream handle.
+inline sycl::queue &current_queue(const Tensor &t) {
+  void *handle =
+      torch::stable::accelerator::getCurrentStream(t.get_device_index())
+          .nativeHandle();
+  STD_TORCH_CHECK(handle != nullptr, "could not get the current XPU queue");
+  return *static_cast<sycl::queue *>(handle);
+}
 
 // The CUDA backend only supports widths 2..4; keep the same limit so that the
 // unrolled register buffers below have a compile-time bound.
@@ -119,7 +146,7 @@ struct StateStrides {
 // Dispatch helpers
 ////////////////////////////////////////////////////////////////////////////////
 
-inline StateStrides make_state_strides(const at::Tensor &t) {
+inline StateStrides make_state_strides(const Tensor &t) {
   return StateStrides{t.stride(0), t.stride(1), t.stride(2)};
 }
 
@@ -153,32 +180,33 @@ void launch_groups(sycl::queue &q, int64_t n_groups, int wg_size,
 }
 
 #define DISPATCH_ITYPE(ITYPE, NAME, ...)                                       \
-  if (ITYPE == at::ScalarType::Half) {                                         \
-    using input_t = at::Half;                                                  \
+  if (ITYPE == ScalarType::Half) {                                             \
+    using input_t = torch::headeronly::Half;                                   \
     __VA_ARGS__();                                                             \
-  } else if (ITYPE == at::ScalarType::BFloat16) {                              \
-    using input_t = at::BFloat16;                                              \
+  } else if (ITYPE == ScalarType::BFloat16) {                                  \
+    using input_t = torch::headeronly::BFloat16;                               \
     __VA_ARGS__();                                                             \
-  } else if (ITYPE == at::ScalarType::Float) {                                 \
+  } else if (ITYPE == ScalarType::Float) {                                     \
     using input_t = float;                                                     \
     __VA_ARGS__();                                                             \
   } else {                                                                     \
-    AT_ERROR(#NAME, " not implemented for input type '", toString(ITYPE), "'"); \
+    STD_TORCH_CHECK(false, NAME, " not implemented for input type '",          \
+                    torch::headeronly::toString(ITYPE), "'");                  \
   }
 
 #define DISPATCH_WTYPE(WTYPE, NAME, ...)                                       \
-  if (WTYPE == at::ScalarType::Half) {                                         \
-    using weight_t = at::Half;                                                 \
+  if (WTYPE == ScalarType::Half) {                                             \
+    using weight_t = torch::headeronly::Half;                                  \
     __VA_ARGS__();                                                             \
-  } else if (WTYPE == at::ScalarType::BFloat16) {                              \
-    using weight_t = at::BFloat16;                                             \
+  } else if (WTYPE == ScalarType::BFloat16) {                                  \
+    using weight_t = torch::headeronly::BFloat16;                              \
     __VA_ARGS__();                                                             \
-  } else if (WTYPE == at::ScalarType::Float) {                                 \
+  } else if (WTYPE == ScalarType::Float) {                                     \
     using weight_t = float;                                                    \
     __VA_ARGS__();                                                             \
   } else {                                                                     \
-    AT_ERROR(#NAME, " not implemented for weight type '", toString(WTYPE),     \
-             "'");                                                             \
+    STD_TORCH_CHECK(false, NAME, " not implemented for weight type '",         \
+                    torch::headeronly::toString(WTYPE), "'");                  \
   }
 
 // Turning the filter width into a compile-time constant lets the compiler fully
@@ -194,11 +222,11 @@ void launch_groups(sycl::queue &q, int64_t n_groups, int wg_size,
     constexpr int kWidth = 4;                                                  \
     __VA_ARGS__();                                                             \
   } else {                                                                     \
-    AT_ERROR(#NAME, " not implemented for width ", (WIDTH));                   \
+    STD_TORCH_CHECK(false, NAME, " not implemented for width ", (WIDTH));      \
   }
 
-inline ConvStrides make_conv_strides(const at::Tensor &x, const at::Tensor &weight,
-                              const at::Tensor &out, int batch, int dim,
+inline ConvStrides make_conv_strides(const Tensor &x, const Tensor &weight,
+                              const Tensor &out, int batch, int dim,
                               int seqlen, bool silu_activation) {
   ConvStrides p{};
   p.batch = batch;
