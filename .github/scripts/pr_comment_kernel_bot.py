@@ -38,7 +38,7 @@ KERNELLESS_COMMANDS = {"security"}
 # `write` on this repo, as (org, team_slug) pairs. Rosters are read with
 # TEAM_READ_TOKEN: the workflow's default GITHUB_TOKEN is repo-scoped and has no
 # `read:org`, so it cannot see team membership at all.
-AUTHORIZED_TEAMS = (("huggingface", "transformers"),)
+AUTHORIZED_TEAMS = (("huggingface", "transformers"), ("huggingface", "eric-hf-team"))
 # What team membership alone unlocks. Deliberately narrow -- staging, merging
 # and releasing still require `write`/`admin` on this repo.
 TEAM_AUTHORIZED_COMMANDS = {"build"}
