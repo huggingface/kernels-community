@@ -1,4 +1,6 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/torch.h>
@@ -251,6 +253,12 @@ std::vector<torch::Tensor> connected_components_labeling_2d(
   AT_ASSERTM((H % 2) == 0, "height must be a even number");
   AT_ASSERTM((W % 2) == 0, "width must be a even number");
 
+  // Otherwise the kernels would be launched on the current device.
+  const at::cuda::CUDAGuard device_guard(inputs.device());
+
+  // The kernels index the input as a dense [N, 1, H, W] buffer.
+  const torch::Tensor img = inputs.contiguous();
+
   // label must be uint32_t
   auto label_options =
       torch::TensorOptions().dtype(torch::kInt32).device(inputs.device());
@@ -279,22 +287,28 @@ std::vector<torch::Tensor> connected_components_labeling_2d(
 
   cc2d::init_labeling<<<grid, block, 0, stream>>>(
       labels.data_ptr<int32_t>(), W, H);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   cc2d::merge<<<grid, block, 0, stream>>>(
-      inputs.data_ptr<uint8_t>(), labels.data_ptr<int32_t>(), W, H);
+      img.data_ptr<uint8_t>(), labels.data_ptr<int32_t>(), W, H);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   cc2d::compression<<<grid, block, 0, stream>>>(
       labels.data_ptr<int32_t>(), W, H);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   cc2d::final_labeling<<<grid, block, 0, stream>>>(
-      inputs.data_ptr<uint8_t>(), labels.data_ptr<int32_t>(), W, H);
+      img.data_ptr<uint8_t>(), labels.data_ptr<int32_t>(), W, H);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   if (get_counts) {
     cc2d::init_counting<<<grid_count, block_count, 0, stream>>>(
         labels.data_ptr<int32_t>(), counts_init.data_ptr<int32_t>(), W, H);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     cc2d::final_counting<<<grid_count, block_count, 0, stream>>>(
         labels.data_ptr<int32_t>(),
         counts_init.data_ptr<int32_t>(),
         counts_final.data_ptr<int32_t>(),
         W,
         H);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
   // returned values are [labels, counts]
