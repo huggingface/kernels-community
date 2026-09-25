@@ -4,8 +4,7 @@ import triton.language as tl
 
 from ._resize import (
     VERTICAL_TILE,
-    _as_tensor,
-    _filter_table,
+    _as_tensors,
     _horizontal_pass,
     _normalization,
     _round,
@@ -110,8 +109,17 @@ def resize_normalize_patchify(
     cubic = resample == "bicubic"
     out_heights = [height for height, _ in target_sizes]
     out_widths = [width for _, width in target_sizes]
-    intermediate, intermediate_offsets, heights = _horizontal_pass(
-        frames, out_widths, [0] * len(frames), out_widths, cubic, antialias, round_to_uint8
+    intermediate, intermediate_offsets, heights, _, vertical_table = _horizontal_pass(
+        frames,
+        out_widths,
+        [0] * len(frames),
+        out_widths,
+        out_heights,
+        [0] * len(frames),
+        out_heights,
+        cubic,
+        antialias,
+        round_to_uint8,
     )
 
     patch_dim = channels * temporal_patch_size * patch_size * patch_size
@@ -134,12 +142,12 @@ def resize_normalize_patchify(
         grid_thw.append((grid_t, grid_h, grid_w))
         total_patches += grid_t * grid_h * grid_w
 
-    weights, first_taps, table_offsets, taps_stride = _filter_table(
-        [frame.shape[1] for frame in frames], out_heights, [0] * len(frames), out_heights, cubic, antialias, device
-    )
-    means, stds = _normalization(image_mean, image_std, rescale_factor, device)
+    means, stds = _normalization(tuple(image_mean), tuple(image_std), rescale_factor, device)
     output = torch.empty((total_patches, patch_dim), device=device, dtype=torch.float32)
     slot_frames, slot_temporal_starts, slot_temporal_counts, slot_groups, slot_output_offsets = zip(*slots)
+    metadata = _as_tensors(
+        device, torch.int32, out_heights, out_widths, slot_frames, slot_temporal_starts, slot_temporal_counts, slot_groups
+    )
     block_rows, block_columns = _tile(VERTICAL_TILE, max(out_widths))
     grid = (len(slots), triton.cdiv(max(out_heights), block_rows), triton.cdiv(max(out_widths), block_columns))
     _vertical_patchify_kernel[grid](
@@ -147,17 +155,9 @@ def resize_normalize_patchify(
         output,
         intermediate_offsets,
         heights,
-        _as_tensor(out_heights, device),
-        _as_tensor(out_widths, device),
-        _as_tensor(slot_frames, device),
-        _as_tensor(slot_temporal_starts, device),
-        _as_tensor(slot_temporal_counts, device),
-        _as_tensor(slot_groups, device),
-        _as_tensor(slot_output_offsets, device, torch.int64),
-        weights,
-        first_taps,
-        table_offsets,
-        taps_stride,
+        *metadata,
+        *_as_tensors(device, torch.int64, slot_output_offsets),
+        *vertical_table,
         means,
         stds,
         CHANNELS=channels,

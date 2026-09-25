@@ -1,4 +1,5 @@
 import math
+from functools import lru_cache
 from itertools import accumulate
 
 import torch
@@ -164,8 +165,11 @@ def _vertical_kernel(
         tl.store(output + (plane + rows)[:, None] * out_width + columns[None, :], total, mask=active)
 
 
-def _as_tensor(values, device, dtype=torch.int32):
-    return torch.tensor(list(values), device=device, dtype=dtype)
+def _as_tensors(device, dtype, *lists):
+    """Copy several lists to `device` in one transfer, and return one tensor view per list."""
+    lists = [list(values) for values in lists]
+    packed = torch.tensor([value for values in lists for value in values], dtype=dtype, device=device)
+    return packed.split([len(values) for values in lists])
 
 
 def _tile(tile, out_width):
@@ -175,29 +179,67 @@ def _tile(tile, out_width):
     return rows * columns // capped_columns, capped_columns
 
 
+@lru_cache
 def _normalization(mean, std, rescale, device):
     """Mean and std divided by `rescale`, so that `(x - mean') / std' == (x * rescale - mean) / std`."""
-    return _as_tensor([value / rescale for value in mean], device, torch.float32), _as_tensor(
-        [value / rescale for value in std], device, torch.float32
-    )
+    return _as_tensors(device, torch.float32, [value / rescale for value in mean], [value / rescale for value in std])
 
 
-def _filter_table(in_sizes, resize_sizes, crop_starts, out_sizes, cubic, antialias, device):
-    """Normalized filter weights and first tap of every output position of every item, along one axis."""
+def _horizontal_pass(
+    frames, resize_widths, crop_lefts, out_widths, resize_heights, crop_tops, out_heights, cubic, antialias, round_to_uint8
+):
+    """Resize the width of every frame into one packed buffer of `(C, H, out_width)` planes, uint8 when rounding.
+
+    Also returns the filter table of the vertical pass, built in the same launch as the horizontal one.
+    """
+    device = frames[0].device
+    channels = frames[0].shape[0]
+    frames = [frame.contiguous() for frame in frames]
+    heights = [frame.shape[1] for frame in frames]
+    widths = [frame.shape[2] for frame in frames]
+    in_sizes, resize_sizes, out_sizes = widths + heights, resize_widths + resize_heights, out_widths + out_heights
     taps_stride = max(
         math.ceil((2 if cubic else 1) * (max(in_size / resize_size, 1.0) if antialias else 1.0)) * 2 + 1
         for in_size, resize_size in zip(in_sizes, resize_sizes)
     )
+    (
+        heights_tensor,
+        widths_tensor,
+        resize_widths_tensor,
+        out_widths_tensor,
+        resize_heights_tensor,
+        in_sizes_tensor,
+        resize_sizes_tensor,
+        crop_starts_tensor,
+        out_sizes_tensor,
+        table_offsets,
+    ) = _as_tensors(
+        device,
+        torch.int32,
+        heights,
+        widths,
+        resize_widths,
+        out_widths,
+        resize_heights,
+        in_sizes,
+        resize_sizes,
+        crop_lefts + crop_tops,
+        out_sizes,
+        accumulate([0] + out_sizes[:-1]),
+    )
+    intermediate_sizes = [channels * height * out_width for height, out_width in zip(heights, out_widths)]
+    frame_pointers, intermediate_offsets = _as_tensors(
+        device, torch.int64, [frame.data_ptr() for frame in frames], accumulate([0] + intermediate_sizes[:-1])
+    )
     weights = torch.empty(sum(out_sizes) * taps_stride, device=device, dtype=torch.float32)
     first_taps = torch.empty(sum(out_sizes), device=device, dtype=torch.int32)
-    table_offsets = _as_tensor(accumulate([0] + list(out_sizes[:-1])), device)
     _filter_table_kernel[(len(in_sizes), triton.cdiv(max(out_sizes), TABLE_BLOCK))](
         weights,
         first_taps,
-        _as_tensor(in_sizes, device),
-        _as_tensor(resize_sizes, device),
-        _as_tensor(crop_starts, device),
-        _as_tensor(out_sizes, device),
+        in_sizes_tensor,
+        resize_sizes_tensor,
+        crop_starts_tensor,
+        out_sizes_tensor,
         table_offsets,
         taps_stride,
         -0.5 if antialias else -0.75,
@@ -205,34 +247,18 @@ def _filter_table(in_sizes, resize_sizes, crop_starts, out_sizes, cubic, antiali
         CUBIC=cubic,
         ANTIALIAS=antialias,
     )
-    return weights, first_taps, table_offsets, taps_stride
-
-
-def _horizontal_pass(frames, resize_widths, crop_lefts, out_widths, cubic, antialias, round_to_uint8):
-    """Resize the width of every frame into one packed buffer of `(C, H, out_width)` planes, uint8 when rounding."""
-    device = frames[0].device
-    channels = frames[0].shape[0]
-    frames = [frame.contiguous() for frame in frames]
-    heights = [frame.shape[1] for frame in frames]
-    widths = [frame.shape[2] for frame in frames]
-    weights, first_taps, table_offsets, taps_stride = _filter_table(
-        widths, resize_widths, crop_lefts, out_widths, cubic, antialias, device
-    )
-    intermediate_sizes = [channels * height * out_width for height, out_width in zip(heights, out_widths)]
-    intermediate_offsets = _as_tensor(accumulate([0] + intermediate_sizes[:-1]), device, torch.int64)
     intermediate_dtype = torch.uint8 if round_to_uint8 else torch.float32
     intermediate = torch.empty(sum(intermediate_sizes), device=device, dtype=intermediate_dtype)
-    heights_tensor = _as_tensor(heights, device)
     block_rows, block_columns = _tile(HORIZONTAL_TILE, max(out_widths))
     grid = (len(frames), triton.cdiv(channels * max(heights), block_rows), triton.cdiv(max(out_widths), block_columns))
     _horizontal_kernel[grid](
-        _as_tensor([frame.data_ptr() for frame in frames], device, torch.int64),
+        frame_pointers,
         intermediate,
         intermediate_offsets,
         heights_tensor,
-        _as_tensor(widths, device),
-        _as_tensor(resize_widths, device),
-        _as_tensor(out_widths, device),
+        widths_tensor,
+        resize_widths_tensor,
+        out_widths_tensor,
         weights,
         first_taps,
         table_offsets,
@@ -244,7 +270,8 @@ def _horizontal_pass(frames, resize_widths, crop_lefts, out_widths, cubic, antia
         ANTIALIAS=antialias,
         ROUND_TO_UINT8=round_to_uint8,
     )
-    return intermediate, intermediate_offsets, heights_tensor
+    vertical_table = (weights, first_taps, table_offsets[len(frames) :], taps_stride)
+    return intermediate, intermediate_offsets, heights_tensor, resize_heights_tensor, vertical_table
 
 
 def resize_normalize(
@@ -274,28 +301,22 @@ def resize_normalize(
         resize_sizes = [tuple(size)] * len(images)
     out_height, out_width = crop_size if crop_size is not None else size
     cubic = resample == "bicubic"
-    intermediate, intermediate_offsets, heights = _horizontal_pass(
+    resize_heights = [height for height, _ in resize_sizes]
+    intermediate, intermediate_offsets, heights, resize_heights_tensor, vertical_table = _horizontal_pass(
         images,
         [width for _, width in resize_sizes],
         [(width - out_width) // 2 for _, width in resize_sizes],
         [out_width] * len(images),
+        resize_heights,
+        [(height - out_height) // 2 for height in resize_heights],
+        [out_height] * len(images),
         cubic,
         antialias,
         round_to_uint8,
     )
     device = images[0].device
     channels = images[0].shape[0]
-    resize_heights = [height for height, _ in resize_sizes]
-    weights, first_taps, table_offsets, taps_stride = _filter_table(
-        [shape[0] for shape in shapes],
-        resize_heights,
-        [(height - out_height) // 2 for height in resize_heights],
-        [out_height] * len(images),
-        cubic,
-        antialias,
-        device,
-    )
-    means, stds = _normalization(image_mean, image_std, rescale_factor, device)
+    means, stds = _normalization(tuple(image_mean), tuple(image_std), rescale_factor, device)
     output = torch.empty((len(images), channels, out_height, out_width), device=device, dtype=torch.float32)
     block_rows, block_columns = _tile(VERTICAL_TILE, out_width)
     _vertical_kernel[(len(images), triton.cdiv(out_height, block_rows), triton.cdiv(out_width, block_columns))](
@@ -303,11 +324,8 @@ def resize_normalize(
         output,
         intermediate_offsets,
         heights,
-        _as_tensor(resize_heights, device),
-        weights,
-        first_taps,
-        table_offsets,
-        taps_stride,
+        resize_heights_tensor,
+        *vertical_table,
         means,
         stds,
         out_height,
