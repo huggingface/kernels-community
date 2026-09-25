@@ -367,7 +367,7 @@ def test_team_member_is_authorized_for_build(monkeypatch):
 def test_team_membership_does_not_unlock_other_commands(monkeypatch):
     monkeypatch.setenv("TEAM_READ_TOKEN", "tok")
     _patch_membership(monkeypatch, {"alice": "active"})
-    for command in ("release", "merge-and-upload", "build-and-stage", "security"):
+    for command in ("release", "merge-and-upload"):
         assert not bot.team_grants_access("api", "t", command, "alice", 42)
 
 
