@@ -18,6 +18,9 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
+[torch.stable-abi]
+cuda = "2.10"
+
 [kernel.causal_conv1d]
 backend = "cuda"
 depends = ["torch"]
