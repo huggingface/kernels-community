@@ -4,7 +4,7 @@ import kernels
 import pytest
 import torch
 
-metal_flash_sdpa = kernels.get_kernel("kernels-community/metal-flash-sdpa", version=1)
+metal_flash_sdpa = kernels.get_kernel("kernels-community/metal-flash-sdpa", version=2)
 
 HEAD_DIMS = [32, 64, 72, 80, 96, 128, 192, 256]
 
