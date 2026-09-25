@@ -12,10 +12,7 @@ import torch
 
 cv_utils = kernels.get_kernel("kernels-community/cv-utils", version=1)
 
-pytestmark = [
-    pytest.mark.kernels_ci,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="cv-utils requires CUDA"),
-]
+pytestmark = pytest.mark.kernels_ci
 
 DEVICE = "cuda"
 

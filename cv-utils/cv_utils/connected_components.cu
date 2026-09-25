@@ -1,11 +1,20 @@
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/macros.h>
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
+
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <torch/torch.h>
-#include <torch/script.h>
+
+#include <cstdint>
 #include <vector>
+
+#include "stable_utils.h"
+
+using torch::headeronly::ScalarType;
+using torch::stable::Tensor;
 
 // 2d
 #define BLOCK_ROWS 16
@@ -236,40 +245,41 @@ __global__ void final_counting(
 
 } // namespace cc2d
 
-std::vector<torch::Tensor> connected_components_labeling_2d(
-    const torch::Tensor& inputs,
+std::vector<Tensor> connected_components_labeling_2d(
+    const Tensor& inputs,
     bool get_counts) {
-  AT_ASSERTM(inputs.is_cuda(), "inputs must be a CUDA tensor");
-  AT_ASSERTM(inputs.ndimension() == 4, "inputs must be [N, 1, H, W] shape");
-  AT_ASSERTM(
-      inputs.scalar_type() == torch::kUInt8, "inputs must be a uint8 type");
+  STD_TORCH_CHECK(inputs.is_cuda(), "inputs must be a CUDA tensor");
+  STD_TORCH_CHECK(inputs.dim() == 4, "inputs must be [N, 1, H, W] shape");
+  STD_TORCH_CHECK(
+      inputs.scalar_type() == ScalarType::Byte, "inputs must be a uint8 type");
 
   const uint32_t N = inputs.size(0);
   const uint32_t C = inputs.size(1);
   const uint32_t H = inputs.size(2);
   const uint32_t W = inputs.size(3);
 
-  AT_ASSERTM(C == 1, "inputs must be [N, 1, H, W] shape");
-  AT_ASSERTM((H % 2) == 0, "height must be a even number");
-  AT_ASSERTM((W % 2) == 0, "width must be a even number");
+  STD_TORCH_CHECK(C == 1, "inputs must be [N, 1, H, W] shape");
+  STD_TORCH_CHECK((H % 2) == 0, "height must be a even number");
+  STD_TORCH_CHECK((W % 2) == 0, "width must be a even number");
 
   // Otherwise the kernels would be launched on the current device.
-  const at::cuda::CUDAGuard device_guard(inputs.device());
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      inputs.get_device_index());
 
   // The kernels index the input as a dense [N, 1, H, W] buffer.
-  const torch::Tensor img = inputs.contiguous();
+  const Tensor img = torch::stable::contiguous(inputs);
 
   // label must be uint32_t
-  auto label_options =
-      torch::TensorOptions().dtype(torch::kInt32).device(inputs.device());
-  torch::Tensor labels = torch::zeros({N, C, H, W}, label_options);
-  torch::Tensor counts_init = torch::zeros({N, C, H, W}, label_options);
-  torch::Tensor counts_final = torch::zeros({N, C, H, W}, label_options);
+  const std::vector<int64_t> sizes = {N, C, H, W};
+  Tensor labels = torch::stable::new_zeros(inputs, sizes, ScalarType::Int);
+  Tensor counts_init = torch::stable::new_zeros(inputs, sizes, ScalarType::Int);
+  Tensor counts_final =
+      torch::stable::new_zeros(inputs, sizes, ScalarType::Int);
 
   if (N == 0 || H == 0 || W == 0) {
     // empty input masks, return an empty label and count tensor
     // returned values are [labels, counts]
-    std::vector<torch::Tensor> outputs;
+    std::vector<Tensor> outputs;
     outputs.push_back(labels);
     outputs.push_back(counts_final);
     return outputs;
@@ -283,36 +293,39 @@ std::vector<torch::Tensor> connected_components_labeling_2d(
   dim3 grid_count =
       dim3((W + BLOCK_COLS) / BLOCK_COLS, (H + BLOCK_ROWS) / BLOCK_ROWS, N);
   dim3 block_count = dim3(BLOCK_COLS, BLOCK_ROWS);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  cudaStream_t stream = get_current_cuda_stream(inputs);
 
   cc2d::init_labeling<<<grid, block, 0, stream>>>(
-      labels.data_ptr<int32_t>(), W, H);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      labels.mutable_data_ptr<int32_t>(), W, H);
+  STD_CUDA_KERNEL_LAUNCH_CHECK();
   cc2d::merge<<<grid, block, 0, stream>>>(
-      img.data_ptr<uint8_t>(), labels.data_ptr<int32_t>(), W, H);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      img.mutable_data_ptr<uint8_t>(), labels.mutable_data_ptr<int32_t>(), W, H);
+  STD_CUDA_KERNEL_LAUNCH_CHECK();
   cc2d::compression<<<grid, block, 0, stream>>>(
-      labels.data_ptr<int32_t>(), W, H);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      labels.mutable_data_ptr<int32_t>(), W, H);
+  STD_CUDA_KERNEL_LAUNCH_CHECK();
   cc2d::final_labeling<<<grid, block, 0, stream>>>(
-      img.data_ptr<uint8_t>(), labels.data_ptr<int32_t>(), W, H);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      img.const_data_ptr<uint8_t>(), labels.mutable_data_ptr<int32_t>(), W, H);
+  STD_CUDA_KERNEL_LAUNCH_CHECK();
 
   if (get_counts) {
     cc2d::init_counting<<<grid_count, block_count, 0, stream>>>(
-        labels.data_ptr<int32_t>(), counts_init.data_ptr<int32_t>(), W, H);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    cc2d::final_counting<<<grid_count, block_count, 0, stream>>>(
-        labels.data_ptr<int32_t>(),
-        counts_init.data_ptr<int32_t>(),
-        counts_final.data_ptr<int32_t>(),
+        labels.const_data_ptr<int32_t>(),
+        counts_init.mutable_data_ptr<int32_t>(),
         W,
         H);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    STD_CUDA_KERNEL_LAUNCH_CHECK();
+    cc2d::final_counting<<<grid_count, block_count, 0, stream>>>(
+        labels.const_data_ptr<int32_t>(),
+        counts_init.const_data_ptr<int32_t>(),
+        counts_final.mutable_data_ptr<int32_t>(),
+        W,
+        H);
+    STD_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
   // returned values are [labels, counts]
-  std::vector<torch::Tensor> outputs;
+  std::vector<Tensor> outputs;
   outputs.push_back(labels);
   outputs.push_back(counts_final);
   return outputs;
