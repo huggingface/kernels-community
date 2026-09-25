@@ -39,9 +39,9 @@ KERNELLESS_COMMANDS = {"security"}
 # TEAM_READ_TOKEN: the workflow's default GITHUB_TOKEN is repo-scoped and has no
 # `read:org`, so it cannot see team membership at all.
 AUTHORIZED_TEAMS = (("huggingface", "transformers"), ("huggingface", "eric-hf-team"))
-# What team membership alone unlocks. Deliberately narrow -- staging, merging
-# and releasing still require `write`/`admin` on this repo.
-TEAM_AUTHORIZED_COMMANDS = {"build"}
+# What team membership alone unlocks. Deliberately narrow -- merging and
+# releasing require `write`/`admin` on this repo.
+TEAM_AUTHORIZED_COMMANDS = {"build", "build-and-stage", "security", "security-and-build"}
 MAX_COMMENT_LENGTH = 1024
 RUN_LOOKUP_ATTEMPTS = 10
 RUN_LOOKUP_SLEEP_SECONDS = 2
