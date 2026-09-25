@@ -186,7 +186,16 @@ def _normalization(mean, std, rescale, device):
 
 
 def _horizontal_pass(
-    frames, resize_widths, crop_lefts, out_widths, resize_heights, crop_tops, out_heights, cubic, antialias, round_to_uint8
+    frames,
+    resize_widths,
+    crop_lefts,
+    out_widths,
+    resize_heights,
+    crop_tops,
+    out_heights,
+    cubic,
+    antialias,
+    round_to_uint8,
 ):
     """Resize the width of every frame into one packed buffer of `(C, H, out_width)` planes, uint8 when rounding.
 

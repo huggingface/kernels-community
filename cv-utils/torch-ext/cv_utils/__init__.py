@@ -2,8 +2,8 @@ import torch
 from typing import List
 
 from ._ops import ops
-from ._patchify import resize_normalize_patchify
-from ._resize import resize_normalize
+from .patchify import resize_normalize_patchify
+from .resize import resize_normalize
 
 def cc_2d(inputs: torch.Tensor, get_counts: bool) -> List[torch.Tensor]:
     return ops.cc_2d(inputs, get_counts)

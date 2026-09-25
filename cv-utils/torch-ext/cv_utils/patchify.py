@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._resize import (
+from .resize import (
     VERTICAL_TILE,
     _as_tensors,
     _horizontal_pass,
@@ -146,7 +146,14 @@ def resize_normalize_patchify(
     output = torch.empty((total_patches, patch_dim), device=device, dtype=torch.float32)
     slot_frames, slot_temporal_starts, slot_temporal_counts, slot_groups, slot_output_offsets = zip(*slots)
     metadata = _as_tensors(
-        device, torch.int32, out_heights, out_widths, slot_frames, slot_temporal_starts, slot_temporal_counts, slot_groups
+        device,
+        torch.int32,
+        out_heights,
+        out_widths,
+        slot_frames,
+        slot_temporal_starts,
+        slot_temporal_counts,
+        slot_groups,
     )
     block_rows, block_columns = _tile(VERTICAL_TILE, max(out_widths))
     grid = (len(slots), triton.cdiv(max(out_heights), block_rows), triton.cdiv(max(out_widths), block_columns))

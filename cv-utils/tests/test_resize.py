@@ -1,13 +1,19 @@
+"""Tests for the cv-utils resize kernels, checked against `torch.nn.functional.interpolate`.
+
+The whole suite is small and fast, so every test is part of the CI subset.
+"""
+
 import kernels
 import pytest
 import torch
 import torch.nn.functional as F
 
 
-cv_utils = kernels.get_kernel("kernels-community/cv-utils", version=1)
+cv_utils = kernels.get_kernel("kernels-community/cv-utils", version=2)
 
+pytestmark = pytest.mark.kernels_ci
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels need CUDA")
+DEVICE = "cuda"
 
 MEAN = [0.48145466, 0.4578275, 0.40821073]
 STD = [0.26862954, 0.26130258, 0.27577711]
@@ -16,7 +22,7 @@ STD = [0.26862954, 0.26130258, 0.27577711]
 def random_images(sizes):
     generator = torch.Generator().manual_seed(0)
     return [
-        torch.randint(0, 256, (3, height, width), generator=generator, dtype=torch.uint8).cuda()
+        torch.randint(0, 256, (3, height, width), generator=generator, dtype=torch.uint8).to(DEVICE)
         for height, width in sizes
     ]
 
@@ -28,7 +34,6 @@ def reference(image, size, resample):
     )[:, None, None]
 
 
-@pytest.mark.kernels_ci
 @pytest.mark.parametrize("resample", ["bilinear", "bicubic"])
 @pytest.mark.parametrize(
     "resize_mode, size, crop_size",
@@ -55,7 +60,6 @@ def test_resize_normalize_matches_interpolate(resample, resize_mode, size, crop_
         )
 
 
-@pytest.mark.kernels_ci
 def test_resize_normalize_patchify_matches_reference():
     frames = random_images([(280, 420), (140, 140), (140, 140), (140, 140)])
     target_sizes = [(224, 336), (112, 112), (112, 112), (112, 112)]
@@ -76,3 +80,18 @@ def test_resize_normalize_patchify_matches_reference():
         expected.append(patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8).reshape(-1, 3 * temporal * patch * patch))
     assert grid_thw == [(1, 16, 24), (2, 8, 8)]
     torch.testing.assert_close(pixel_values, torch.cat(expected), atol=2e-3, rtol=0)
+
+
+@pytest.mark.parametrize("resample", ["bilinear", "bicubic"])
+def test_resize_normalize_rounds_like_two_uint8_passes(resample):
+    images = random_images([(480, 640), (1024, 768)])
+    output = cv_utils.resize_normalize(images, (224, 224), MEAN, STD, 1 / 255, resample, True, round_to_uint8=True)
+    for image, result in zip(images, output):
+        wide = F.interpolate(image[None].float(), size=(image.shape[1], 224), mode=resample, antialias=True)
+        wide = wide.round().clamp(0, 255)
+        resized = F.interpolate(wide, size=(224, 224), mode=resample, antialias=True).round().clamp(0, 255)[0]
+        mean = torch.tensor(MEAN, device=image.device)[:, None, None]
+        std = torch.tensor(STD, device=image.device)[:, None, None]
+        levels = ((result * std + mean) * 255 - resized).abs()
+        assert levels.max().item() <= 1.01
+        assert (levels > 0.5).float().mean().item() < 0.05
