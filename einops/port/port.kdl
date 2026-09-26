@@ -1,0 +1,83 @@
+recipe version=1
+
+// Pin the exact clean upstream tree this recipe transforms.
+source \
+    repo="https://github.com/arogozhnikov/einops.git" \
+    commit="ad2c8d67d08cbebb45e1aff2be21dc88635fc695"
+
+// Retain only the Python package and its upstream tests.
+prune keep="einops/**"
+
+// Drop upstream's pip-install test runner; it is not a test.
+delete in="einops/tests/run_tests.py"
+
+// Lift upstream tests out of the package into the kernel test root.
+move \
+    from="einops/tests" \
+    to="tests"
+
+// Place the distributable package in the torch extension tree.
+move \
+    from="einops" \
+    to="torch-ext/einops"
+
+// Make package-internal imports work under the Hub-generated module name.
+relativize_imports \
+    in="torch-ext/einops/**" \
+    package_root="torch-ext/einops"
+
+// Expose array_api because Hub consumers cannot import it by package name.
+ensure_import \
+    in="torch-ext/einops/__init__.py" \
+    from="." \
+    name="array_api"
+
+// Point imports of the former einops.tests package at the lifted tests.
+remap_module \
+    in="tests/{__init__,test_*}.py" \
+    from="einops.tests" \
+    to="tests"
+
+// Make imports between lifted test modules package-relative.
+relativize_imports \
+    in="tests/{__init__,test_*}.py" \
+    package_root="tests"
+
+// Resolve product imports through the locally built Hub kernel.
+kernelize_imports \
+    in="tests/{__init__,test_*}.py" \
+    package="einops" \
+    kernel="kernels-community/einops" \
+    version=1
+
+// Default to the two Kernel CI backends when upstream's env var is absent.
+replace in="tests/__init__.py" \
+    find=#"        raise RuntimeError(f"Testing frameworks were not specified, env var {ENVVAR_NAME} not set")"# \
+    with=#"        return ["torch", "numpy"]"#
+
+// Use the supported replacement for NumPy 2's removed in1d API.
+replace in="tests/test_layers.py" \
+    find="numpy.in1d(grad, [0, 1])" \
+    with="numpy.isin(grad, [0, 1])"
+
+// Select every upstream test module for the kernel CI suite.
+replace \
+    in="tests/test_*.py" \
+    find="import pytest" \
+    with="import pytest\n\npytestmark = pytest.mark.kernels_ci"
+
+// Keep pytest from collecting the imported doctest helper as a marked test.
+replace in="tests/test_other.py" \
+    find="from doctest import testmod" \
+    with="from doctest import testmod\ntestmod.__test__ = False"
+
+// Emit the noarch kernel manifest and supported runtime backends.
+manifest \
+    name="einops" \
+    version=1 \
+    edition=5 \
+    license="MIT" \
+    upstream="https://github.com/arogozhnikov/einops.git" \
+    backends="cpu,cuda,metal,rocm,xpu" \
+    repo_id="kernels-community/einops" \
+    noarch=#true
