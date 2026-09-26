@@ -29,6 +29,7 @@ import torch
 from utils import (  # type: ignore
     DTYPE_TAG,
     DTYPE_TO_TOL,
+    SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
 )
@@ -208,6 +209,8 @@ def _make_moe_weights(problem: MoEProblem):
         problem.hidden_dim, problem.intermediate_dim, problem.num_experts
     )
     if problem.swizzled:
+        if not SUPPORTS_SWIZZLED_SCALES:
+            pytest.skip("the SWIZZLE_32_4_4 scale layout is the tcgen05 fast path (CUDA-only)")
         gate_up_s = swizzle_mx_scales(gate_up_s)
         down_s = swizzle_mx_scales(down_s)
     return gate_up, gate_up_s, gate_up_g, down, down_s, down_g
@@ -410,7 +413,7 @@ _TORCH_BASELINE_PROBLEMS = [
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("problem", _TORCH_BASELINE_PROBLEMS, ids=lambda p: p.id)
 def test_torch_grouped_baseline(problem):
     """``moe_torch_grouped`` (the cuBLAS ``scaled_grouped_mm`` baseline the bench compares
@@ -475,7 +478,7 @@ def _run_compiled_across_shapes(fused_fn):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_fused_batched_compiles_across_shapes():
     """``moe_fused_batched`` through the shared two-shape compile check (see
     ``_run_compiled_across_shapes`` for the dynamo failure class it guards)."""
@@ -483,7 +486,7 @@ def test_fused_batched_compiles_across_shapes():
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 def test_fused_grouped_compiles_across_shapes():
     """``moe_fused_grouped`` through the same two-shape compile check — the grouped chain
     additionally puts ``compute_grouped_scheduling`` (an opaque custom op) inside the
