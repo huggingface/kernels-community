@@ -8,9 +8,7 @@
 """Utils op backends."""
 
 from ....ops.backends import BackendRegistry, dispatch
-from ....ops.utils.backends.triton_ascend import TritonAscendUtilsBackend
 
 utils_registry = BackendRegistry('utils')
-utils_registry.register(TritonAscendUtilsBackend())
 
 __all__ = ['dispatch', 'utils_registry']

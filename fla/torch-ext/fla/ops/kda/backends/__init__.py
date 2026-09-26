@@ -8,12 +8,10 @@
 """KDA backends."""
 
 from ....ops.backends import BackendRegistry, dispatch
-from ....ops.kda.backends.flashkda import FlashKDABackend
-from ....ops.kda.backends.tilelang import KDATileLangBackend
+from ....ops.kda.backends.flash_kda import FlashKDABackend
 
 kda_registry = BackendRegistry("kda")
 kda_registry.register(FlashKDABackend())
-kda_registry.register(KDATileLangBackend())
 
 
 __all__ = ['dispatch', 'kda_registry']
