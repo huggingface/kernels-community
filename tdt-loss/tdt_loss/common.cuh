@@ -13,11 +13,26 @@ constexpr int kMaxDurations = 64;
 
 __device__ __forceinline__ float neg_inf() { return -INFINITY; }
 
-// log(exp(a) + exp(b)), safe when either argument is -inf.
+// log(exp(a) + exp(b)), safe when either argument is -inf. The arguments are
+// float64 to keep large log-likelihoods exact, but the correction term only
+// depends on |a - b| and is computed in float32.
 __device__ __forceinline__ double log_add(double a, double b) {
   if (a == -INFINITY) return b;
   if (b == -INFINITY) return a;
-  return fmax(a, b) + log1p(exp(-fabs(a - b)));
+  return fmax(a, b) + log1pf(expf(-fabsf(static_cast<float>(a - b))));
+}
+
+// log(sum(exp(v))) over the values produced by `for_each(f)`, which calls f(v)
+// for every value. Two passes (max, then sum) keep the exponentials
+// independent of each other instead of chaining log_add calls.
+template <typename ForEach>
+__device__ __forceinline__ double log_sum_exp(ForEach for_each) {
+  double m = -INFINITY;
+  for_each([&](double v) { m = fmax(m, v); });
+  if (m == -INFINITY) return m;
+  float s = 0.f;
+  for_each([&](double v) { s += expf(static_cast<float>(v - m)); });
+  return m + logf(s);
 }
 
 // Merge two partial (max, sum(exp(x - max))) pairs of an online softmax.

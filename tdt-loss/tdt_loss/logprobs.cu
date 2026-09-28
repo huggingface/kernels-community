@@ -153,7 +153,7 @@ __global__ void tdt_logits_grad_kernel(
         beta_next = 0.0;  // terminal arc
       }
       if (beta_next != -INFINITY) {
-        p_blank = static_cast<float>(exp(alpha + blank + lp_dur + beta_next - ll));
+        p_blank = expf(static_cast<float>(alpha + blank + lp_dur + beta_next - ll));
       }
     }
 
@@ -161,7 +161,7 @@ __global__ void tdt_logits_grad_kernel(
     if (u < U && t_next < T) {
       const double beta_next =
           betas[sample + static_cast<int64_t>(t_next) * max_U + u + 1];
-      p_label = static_cast<float>(exp(alpha + label + lp_dur + beta_next - ll));
+      p_label = expf(static_cast<float>(alpha + label + lp_dur + beta_next - ll));
     }
 
     shm_blank[i] = p_blank;

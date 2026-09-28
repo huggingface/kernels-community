@@ -58,20 +58,23 @@ __global__ void tdt_alpha_kernel(const float *__restrict__ blank_lp,
     const int u_max = min(n, U);
     for (int u = u_min + threadIdx.x; u <= u_max; u += blockDim.x) {
       const int t = n - u;
-      double a = n == 0 ? 0.0 : -INFINITY;
-      for (int i = 0; i < D && n > 0; ++i) {
-        const int d = shm_durations[i];
-        const int t_prev = t - d;
-        if (t_prev < 0) continue;
-        if (d > 0) {
-          const int64_t src = static_cast<int64_t>(t_prev) * max_U + u;
-          a = log_add(a, alpha[src] + blank[src] + dur[src * D + i]);
-        }
-        if (u > 0) {
-          const int64_t src = static_cast<int64_t>(t_prev) * max_U + u - 1;
-          a = log_add(a, alpha[src] + label[src] + dur[src * D + i]);
-        }
-      }
+      const double a =
+          n == 0 ? 0.0 : log_sum_exp([&](auto &&f) {
+            for (int i = 0; i < D; ++i) {
+              const int d = shm_durations[i];
+              const int t_prev = t - d;
+              if (t_prev < 0) continue;
+              if (d > 0) {
+                const int64_t src = static_cast<int64_t>(t_prev) * max_U + u;
+                f(alpha[src] + blank[src] + dur[src * D + i]);
+              }
+              if (u > 0) {
+                const int64_t src =
+                    static_cast<int64_t>(t_prev) * max_U + u - 1;
+                f(alpha[src] + label[src] + dur[src * D + i]);
+              }
+            }
+          });
       alpha[static_cast<int64_t>(t) * max_U + u] = a;
     }
     __syncthreads();
@@ -117,24 +120,25 @@ __global__ void tdt_beta_kernel(const float *__restrict__ blank_lp,
     for (int u = u_min + threadIdx.x; u <= u_max; u += blockDim.x) {
       const int t = n - u;
       const int64_t node = static_cast<int64_t>(t) * max_U + u;
-      double bt = -INFINITY;
-      for (int i = 0; i < D; ++i) {
-        const int d = shm_durations[i];
-        const int t_next = t + d;
-        const double lp_dur = dur[node * D + i];
-        if (d > 0) {
-          if (t_next < T) {
-            const int64_t dst = static_cast<int64_t>(t_next) * max_U + u;
-            bt = log_add(bt, beta[dst] + blank[node] + lp_dur);
-          } else if (t_next == T && u == U) {
-            bt = log_add(bt, static_cast<double>(blank[node]) + lp_dur);
+      const double bt = log_sum_exp([&](auto &&f) {
+        for (int i = 0; i < D; ++i) {
+          const int d = shm_durations[i];
+          const int t_next = t + d;
+          const double lp_dur = dur[node * D + i];
+          if (d > 0) {
+            if (t_next < T) {
+              const int64_t dst = static_cast<int64_t>(t_next) * max_U + u;
+              f(beta[dst] + blank[node] + lp_dur);
+            } else if (t_next == T && u == U) {
+              f(blank[node] + lp_dur);  // terminal arc
+            }
+          }
+          if (u < U && t_next < T) {
+            const int64_t dst = static_cast<int64_t>(t_next) * max_U + u + 1;
+            f(beta[dst] + label[node] + lp_dur);
           }
         }
-        if (u < U && t_next < T) {
-          const int64_t dst = static_cast<int64_t>(t_next) * max_U + u + 1;
-          bt = log_add(bt, beta[dst] + label[node] + lp_dur);
-        }
-      }
+      });
       beta[node] = bt;
     }
     __syncthreads();
