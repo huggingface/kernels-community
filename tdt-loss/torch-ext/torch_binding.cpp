@@ -20,7 +20,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "tdt_loss_bwd(Tensor blank_lp, Tensor label_lp, Tensor dur_lp, "
       "Tensor source_lengths, Tensor target_lengths, Tensor durations, "
-      "Tensor! betas, Tensor! log_ll) -> ()");
+      "Tensor! betas) -> ()");
   ops.impl("tdt_loss_bwd", torch::kCUDA, &tdt_loss_bwd);
 
   ops.def(

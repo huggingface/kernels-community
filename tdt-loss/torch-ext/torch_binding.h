@@ -22,13 +22,12 @@ void tdt_loss_fwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
                   torch::Tensor const &durations, torch::Tensor &alphas,
                   torch::Tensor &log_ll);
 
-// Backward recursion over the lattice (betas) and per-sample log-likelihood.
+// Backward recursion over the lattice (betas).
 void tdt_loss_bwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
                   torch::Tensor const &dur_lp,
                   torch::Tensor const &source_lengths,
                   torch::Tensor const &target_lengths,
-                  torch::Tensor const &durations, torch::Tensor &betas,
-                  torch::Tensor &log_ll);
+                  torch::Tensor const &durations, torch::Tensor &betas);
 
 // Gradient of the per-sample losses (scaled by grad_loss) w.r.t. the token
 // and duration logits.

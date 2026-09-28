@@ -1,6 +1,6 @@
 """TDT (Token-and-Duration Transducer) loss CUDA kernel."""
 
-from typing import Sequence, Union
+from typing import Dict, Sequence, Tuple, Union
 
 import torch
 
@@ -9,6 +9,21 @@ from ._ops import ops
 __all__ = ["tdt_loss"]
 
 _REDUCTIONS = ("mean_volume", "mean_batch", "mean", "sum", "none")
+
+
+_DURATIONS_CACHE: Dict[Tuple[Tuple[int, ...], torch.device], torch.Tensor] = {}
+
+
+def _durations_tensor(durations: Union[Sequence[int], torch.Tensor], device: torch.device) -> torch.Tensor:
+    """Validated int32 tensor of durations on `device`, cached since the durations are fixed for a model."""
+    if isinstance(durations, torch.Tensor):
+        durations = durations.tolist()
+    key = (tuple(int(d) for d in durations), device)
+    if key not in _DURATIONS_CACHE:
+        if any(d < 0 for d in key[0]):
+            raise ValueError(f"Durations must be non-negative, got {list(key[0])}.")
+        _DURATIONS_CACHE[key] = torch.tensor(key[0], device=device, dtype=torch.int32)
+    return _DURATIONS_CACHE[key]
 
 
 def _last_dim_contiguous(x: torch.Tensor) -> torch.Tensor:
@@ -100,8 +115,7 @@ class TDTLoss(torch.autograd.Function):
             return (None,) * 8
 
         betas = torch.empty_like(alphas)
-        log_ll_bwd = torch.empty_like(log_ll)
-        ops.tdt_loss_bwd(blank_lp, label_lp, dur_lp, source_lengths, target_lengths, durations, betas, log_ll_bwd)
+        ops.tdt_loss_bwd(blank_lp, label_lp, dur_lp, source_lengths, target_lengths, durations, betas)
 
         grad_token_logits = torch.empty(token_logits.shape, device=token_logits.device, dtype=token_logits.dtype)
         grad_duration_logits = torch.empty(ctx.duration_shape, device=token_logits.device, dtype=ctx.duration_dtype)
@@ -146,7 +160,7 @@ def tdt_loss(
         targets: Target labels of shape `(batch, U)`.
         source_lengths: Encoder output lengths of shape `(batch,)`.
         target_lengths: Target lengths of shape `(batch,)`.
-        durations: Duration values, e.g. `[0, 1, 2, 3, 4]`.
+        durations: Non-negative duration values, e.g. `[0, 1, 2, 3, 4]`.
         blank_id: Blank token id.
         sigma: Logit undernormalization constant (see TDT paper). Defaults to `0.0`.
         reduction: One of `"mean_volume"`, `"mean_batch"`, `"mean"`, `"sum"` or `"none"`, mirroring NeMo's
@@ -162,10 +176,7 @@ def tdt_loss(
         )
 
     device = token_logits.device
-    if isinstance(durations, torch.Tensor):
-        durations = durations.to(device=device, dtype=torch.int32).contiguous()
-    else:
-        durations = torch.tensor(list(durations), device=device, dtype=torch.int32)
+    durations = _durations_tensor(durations, device)
     targets = targets.to(device=device, dtype=torch.int32).contiguous()
     source_lengths = source_lengths.to(device=device, dtype=torch.int32).contiguous()
     target_lengths = target_lengths.to(device=device, dtype=torch.int32).contiguous()

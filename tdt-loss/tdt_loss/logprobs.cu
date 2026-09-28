@@ -18,7 +18,7 @@ namespace tdt_loss {
 namespace {
 
 template <typename scalar_t>
-__global__ void tdt_logprobs_fwd_kernel(
+__global__ void __launch_bounds__(kMaxRowThreads) tdt_logprobs_fwd_kernel(
     const scalar_t *__restrict__ token_logits, int64_t tok_sb, int64_t tok_st,
     int64_t tok_su, const scalar_t *__restrict__ duration_logits,
     int64_t dur_sb, int64_t dur_st, int64_t dur_su,
@@ -75,6 +75,7 @@ __global__ void tdt_logprobs_fwd_kernel(
     float label = neg_inf();
     if (u < U) {
       const int target = targets[b * targets_stride + u];
+      CUDA_KERNEL_ASSERT(target >= 0 && target < V && "target out of range");
       if (target >= 0 && target < V) {
         label = static_cast<float>(x[target]) - lse - sigma;
       }
@@ -97,7 +98,7 @@ __global__ void tdt_logprobs_fwd_kernel(
 }
 
 template <typename scalar_t>
-__global__ void tdt_logits_grad_kernel(
+__global__ void __launch_bounds__(kMaxRowThreads) tdt_logits_grad_kernel(
     const scalar_t *__restrict__ token_logits, int64_t tok_sb, int64_t tok_st,
     int64_t tok_su, const int *__restrict__ targets, int64_t targets_stride,
     const int *__restrict__ source_lengths,
@@ -206,7 +207,7 @@ __global__ void tdt_logits_grad_kernel(
 
 int row_block_size(int64_t V) {
   int threads = 32;
-  while (threads < 256 && threads < V) threads *= 2;
+  while (threads < kMaxRowThreads && threads < V) threads *= 2;
   return threads;
 }
 

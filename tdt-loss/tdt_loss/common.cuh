@@ -1,5 +1,6 @@
 #pragma once
 
+#include <c10/macros/Macros.h>
 #include <cuda_runtime.h>
 
 #include <cfloat>
@@ -10,6 +11,11 @@ namespace tdt_loss {
 constexpr int kWarpSize = 32;
 // Upper bound on the number of durations, only used to size shared memory.
 constexpr int kMaxDurations = 64;
+// Block sizes of the per-node kernels and of the lattice recursions. The
+// kernels are compiled with matching __launch_bounds__ so that register
+// allocation always allows launching the largest block.
+constexpr int kMaxRowThreads = 256;
+constexpr int kMaxLatticeThreads = 1024;
 
 __device__ __forceinline__ float neg_inf() { return -INFINITY; }
 
@@ -87,15 +93,21 @@ __device__ __forceinline__ void block_reduce_max_sum(float &m, float &s,
   s = shm_s[0];
 }
 
-// Clamp the per-sample lengths to the padded lattice so that malformed inputs
-// cannot cause out-of-bounds accesses. Returns T (frames) and U (labels); the
-// lattice for the sample spans t in [0, T) and u in [0, U].
+// Per-sample lengths: T (frames) and U (labels); the lattice for the sample
+// spans t in [0, T) and u in [0, U]. Lengths outside of the padded lattice
+// trigger a device-side assert, like out-of-range indexing does in PyTorch;
+// they are also clamped so that no out-of-bounds access happens when asserts
+// are compiled out.
 __device__ __forceinline__ void sample_lengths(const int *source_lengths,
                                                const int *target_lengths,
                                                int b, int max_T, int max_U,
                                                int &T, int &U) {
-  T = min(max(source_lengths[b], 0), max_T);
-  U = min(max(target_lengths[b], 0), max_U - 1);
+  T = source_lengths[b];
+  U = target_lengths[b];
+  CUDA_KERNEL_ASSERT(T >= 0 && T <= max_T && "source_lengths out of range");
+  CUDA_KERNEL_ASSERT(U >= 0 && U < max_U && "target_lengths out of range");
+  T = min(max(T, 0), max_T);
+  U = min(max(U, 0), max_U - 1);
 }
 
 }  // namespace tdt_loss
