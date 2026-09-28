@@ -47,8 +47,8 @@ loss = tdt.tdt_loss(
     targets,
     logit_lengths,
     target_lengths,
-    durations,
     blank_id,
+    durations,
     sigma=0.0,
     reduction="mean",  # or "mean_volume", "mean_batch", "sum", "none"
 )
@@ -56,6 +56,9 @@ loss.backward()
 ```
 
 Samples without a valid alignment get an infinite loss and a zero gradient.
+
+The `layers.TDTLoss` layer has the same signature as `transformers.loss.loss_tdt.tdt_loss`, so 🤗 Transformers
+swaps it in for Parakeet TDT models loaded with `use_kernels=True`.
 
 ## Benchmarks
 

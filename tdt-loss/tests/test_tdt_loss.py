@@ -106,8 +106,8 @@ def run_kernel(token_logits, duration_logits, targets, logit_lengths, target_len
         targets,
         logit_lengths,
         target_lengths,
-        durations,
         0,
+        durations,
         sigma=sigma,
         reduction=reduction,
     )
@@ -302,3 +302,37 @@ def test_negative_durations():
     inputs = make_inputs(1, 5, 2, 4, [0, 1])
     with pytest.raises(ValueError, match="non-negative"):
         run_kernel(*inputs, [-1, 1], 0.0, "mean")
+
+
+@pytest.mark.kernels_ci
+def test_layer():
+    """The `TDTLoss` layer matches the functional API and mirrors the `transformers` `tdt_loss` signature."""
+    import inspect
+
+    params = list(inspect.signature(tdt_loss_kernel.layers.TDTLoss.forward).parameters)
+    assert params == [
+        "self",
+        "token_logits",
+        "duration_logits",
+        "targets",
+        "logit_lengths",
+        "target_lengths",
+        "blank_token_id",
+        "durations",
+        "sigma",
+        "reduction",
+    ]
+
+    token_logits, duration_logits, targets, logit_lengths, target_lengths = make_inputs(2, 12, 4, 16, DURATIONS)
+    kwargs = dict(
+        token_logits=token_logits,
+        duration_logits=duration_logits,
+        targets=targets,
+        logit_lengths=logit_lengths,
+        target_lengths=target_lengths,
+        blank_token_id=0,
+        durations=DURATIONS,
+        sigma=0.05,
+        reduction="none",
+    )
+    torch.testing.assert_close(tdt_loss_kernel.layers.TDTLoss()(**kwargs), tdt_loss_kernel.tdt_loss(**kwargs))

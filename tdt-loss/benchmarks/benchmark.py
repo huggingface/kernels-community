@@ -31,8 +31,8 @@ class TDTLossBenchmark(Benchmark):
             self.targets,
             self.logit_lengths,
             self.target_lengths,
-            DURATIONS,
             0,
+            DURATIONS,
             reduction="none",
         )
         losses.sum().backward()
