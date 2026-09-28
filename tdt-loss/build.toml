@@ -15,16 +15,9 @@ src = [
 
 [kernel.tdt_loss]
 backend = "cuda"
-cuda-capabilities = [
-    "8.0",
-    "8.9",
-    "9.0",
-    "10.0",
-    "12.0",
-]
 depends = ["torch"]
-include = ["."]
 src = [
-    # TODO: add CUDA source files here, e.g.:
-    # "csrc/tdt_loss.cu",
+    "tdt_loss/common.cuh",
+    "tdt_loss/lattice.cu",
+    "tdt_loss/logprobs.cu",
 ]
