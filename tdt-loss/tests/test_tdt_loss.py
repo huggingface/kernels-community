@@ -24,6 +24,8 @@ except ImportError:
 DEVICE = torch.device("cuda")
 DURATIONS = [0, 1, 2, 3, 4]
 REDUCTIONS = ["mean_volume", "mean_batch", "mean", "sum", "none"]
+# float32 lattice sums over ~1000 labels lose a few digits.
+GRAD_ATOL_LONG = 1e-2
 
 
 def reduce(losses, target_lengths, reduction):
@@ -40,16 +42,24 @@ def reduce(losses, target_lengths, reduction):
 
 
 def tdt_loss_reference(
-    token_logits, duration_logits, targets, logit_lengths, target_lengths, blank_id, durations, sigma=0.0
+    token_logits,
+    duration_logits,
+    targets,
+    logit_lengths,
+    target_lengths,
+    blank_id,
+    durations,
+    sigma=0.0,
+    dtype=torch.float32,
 ):
-    """Per-sample TDT loss, as implemented in `transformers.loss.loss_tdt.tdt_loss`."""
+    """Per-sample TDT loss, as implemented in `transformers.loss.loss_tdt.tdt_loss` (computed in `dtype`)."""
     device = token_logits.device
     batch_size, max_t, max_u, _ = token_logits.shape
 
-    token_log_probs = torch.log_softmax(token_logits.float(), dim=-1) - sigma
-    duration_log_probs = torch.log_softmax(duration_logits.float(), dim=-1)
+    token_log_probs = torch.log_softmax(token_logits.to(dtype), dim=-1) - sigma
+    duration_log_probs = torch.log_softmax(duration_logits.to(dtype), dim=-1)
 
-    log_alpha = torch.full((batch_size, max_t, max_u), float("-inf"), device=device)
+    log_alpha = torch.full((batch_size, max_t, max_u), float("-inf"), device=device, dtype=dtype)
     log_alpha[:, 0, 0] = 0.0
     blank_log_probs = token_log_probs[:, :, :, blank_id]
     if max_u > 1:
@@ -58,7 +68,7 @@ def tdt_loss_reference(
             token_log_probs[:, :, : max_u - 1, :], dim=3, index=targets_expanded.unsqueeze(-1)
         ).squeeze(-1)
 
-    neg_inf = torch.tensor(float("-inf"), device=device)
+    neg_inf = torch.tensor(float("-inf"), device=device, dtype=dtype)
     for n in range(1, max_t + max_u - 1):
         u_indices = torch.arange(max(0, n - max_t + 1), min(n + 1, max_u), device=device)
         t_indices = n - u_indices
@@ -91,7 +101,7 @@ def tdt_loss_reference(
 
     batch_idx = torch.arange(batch_size, device=device)
     target_lengths = target_lengths.long()
-    log_probs = torch.full((batch_size,), float("-inf"), device=device)
+    log_probs = torch.full((batch_size,), float("-inf"), device=device, dtype=dtype)
     for i, dur in enumerate(durations):
         if dur == 0:
             continue
@@ -146,6 +156,12 @@ def tdt_loss_naive(token_logits, duration_logits, targets, logit_lengths, target
                 log_ll = log_add(log_ll, alpha[t_src][U] + token_lp[b][t_src][U][blank_id] + dur_lp[b][t_src][U][i])
         losses.append(-log_ll)
     return torch.tensor(losses, dtype=torch.float64)
+
+
+def assert_grad_close(actual, expected, **kwargs):
+    # The reference gets NaN gradients on lattice nodes that cannot be reached (e.g. u > t when there is no
+    # zero duration), from the backward of a logsumexp over only -inf. The true gradient there is zero.
+    torch.testing.assert_close(actual.to(expected.dtype), expected.nan_to_num(nan=0.0), **kwargs)
 
 
 def make_inputs(B, T, U, V, durations, dtype=torch.float32, seed=0, joint=False):
@@ -210,8 +226,8 @@ def test_forward_backward_match_reference(durations, sigma, reduction):
     loss.sum().backward()
 
     torch.testing.assert_close(loss, expected, atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(tok.grad, ref_tok.grad, atol=1e-5, rtol=1e-4)
-    torch.testing.assert_close(dur.grad, ref_dur.grad, atol=1e-5, rtol=1e-4)
+    assert_grad_close(tok.grad, ref_tok.grad, atol=1e-5, rtol=1e-4)
+    assert_grad_close(dur.grad, ref_dur.grad, atol=1e-5, rtol=1e-4)
 
 
 def test_joint_logits_slices():
@@ -239,7 +255,7 @@ def test_joint_logits_slices():
     expected.backward()
 
     torch.testing.assert_close(loss, expected, atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(joint.grad, ref_joint.grad, atol=1e-5, rtol=1e-4)
+    assert_grad_close(joint.grad, ref_joint.grad, atol=1e-5, rtol=1e-4)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -268,8 +284,8 @@ def test_half_precision(dtype):
     expected.backward()
 
     torch.testing.assert_close(loss, expected, atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(tok.grad.float(), ref_tok.grad, atol=1e-3, rtol=1e-2)
-    torch.testing.assert_close(dur.grad.float(), ref_dur.grad, atol=1e-3, rtol=1e-2)
+    assert_grad_close(tok.grad, ref_tok.grad, atol=1e-3, rtol=1e-2)
+    assert_grad_close(dur.grad, ref_dur.grad, atol=1e-3, rtol=1e-2)
 
 
 def test_parakeet_like_shapes():
@@ -288,8 +304,8 @@ def test_parakeet_like_shapes():
     expected.sum().backward()
 
     torch.testing.assert_close(losses, expected, atol=1e-3, rtol=1e-4)
-    torch.testing.assert_close(tok.grad, ref_tok.grad, atol=1e-5, rtol=1e-4)
-    torch.testing.assert_close(dur.grad, ref_dur.grad, atol=1e-5, rtol=1e-4)
+    assert_grad_close(tok.grad, ref_tok.grad, atol=1e-5, rtol=1e-4)
+    assert_grad_close(dur.grad, ref_dur.grad, atol=1e-5, rtol=1e-4)
 
 
 def test_long_targets():
@@ -300,12 +316,15 @@ def test_long_targets():
     loss = run_kernel(tok, duration_logits, targets, logit_lengths, target_lengths, DURATIONS, 0.0, "sum")
     loss.backward()
 
-    ref_tok = token_logits.clone().requires_grad_(True)
-    expected = tdt_loss_reference(ref_tok, duration_logits, targets, logit_lengths, target_lengths, 0, DURATIONS)
-    expected.sum().backward()
+    # The log-likelihood is in the thousands, so compare against a float64 reference.
+    ref_tok = token_logits.double().requires_grad_(True)
+    expected = tdt_loss_reference(
+        ref_tok, duration_logits, targets, logit_lengths, target_lengths, 0, DURATIONS, dtype=torch.float64
+    ).sum()
+    expected.backward()
 
-    torch.testing.assert_close(loss, expected.sum(), atol=1e-2, rtol=1e-4)
-    torch.testing.assert_close(tok.grad, ref_tok.grad, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(loss.double(), expected, atol=1e-2, rtol=1e-5)
+    assert_grad_close(tok.grad, ref_tok.grad, atol=GRAD_ATOL_LONG, rtol=0)
 
 
 def test_empty_targets():
