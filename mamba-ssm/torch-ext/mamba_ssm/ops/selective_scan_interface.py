@@ -260,14 +260,14 @@ class MambaInnerFn(torch.autograd.Function):
         L = xz.shape[-1]
         delta_rank = delta_proj_weight.shape[1]
         d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
-        if torch.is_autocast_enabled():
-            x_proj_weight = x_proj_weight.to(dtype=torch.get_autocast_gpu_dtype(x_proj_weight.device.type))
-            delta_proj_weight = delta_proj_weight.to(
-                dtype=torch.get_autocast_gpu_dtype()
-            )
-            out_proj_weight = out_proj_weight.to(dtype=torch.get_autocast_gpu_dtype(out_proj_weight.device.type))
+        device_type = x_proj_weight.device.type
+        if torch.is_autocast_enabled(device_type):
+            dtype = torch.get_autocast_dtype(device_type)
+            x_proj_weight = x_proj_weight.to(dtype=dtype)
+            delta_proj_weight = delta_proj_weight.to(dtype=dtype)
+            out_proj_weight = out_proj_weight.to(dtype=dtype)
             out_proj_bias = (
-                out_proj_bias.to(dtype=torch.get_autocast_gpu_dtype(out_proj_bias.device.type))
+                out_proj_bias.to(dtype=dtype)
                 if out_proj_bias is not None
                 else None
             )

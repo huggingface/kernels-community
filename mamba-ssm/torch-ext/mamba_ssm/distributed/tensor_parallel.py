@@ -32,8 +32,9 @@ class ParallelLinearFunc(torch.autograd.Function):
         ctx.process_group = process_group
         ctx.sequence_parallel = sequence_parallel
 
-        if torch.is_autocast_enabled():
-            x = x.to(dtype=torch.get_autocast_gpu_dtype(x.device.type))
+        device_type = x.device.type
+        if torch.is_autocast_enabled(device_type):
+            x = x.to(dtype=torch.get_autocast_dtype(device_type))
         x = x.contiguous()
         if process_group is not None and sequence_parallel:
             # We want to kick off the all_gather early, before weight dtype conversion
@@ -41,9 +42,9 @@ class ParallelLinearFunc(torch.autograd.Function):
         else:
             total_x = x
 
-        if torch.is_autocast_enabled():
-            weight = weight.to(dtype=torch.get_autocast_gpu_dtype(weight.device.type))
-            bias = bias.to(dtype=torch.get_autocast_gpu_dtype(bias.device.type)) if bias is not None else None
+        if torch.is_autocast_enabled(device_type):
+            weight = weight.to(dtype=torch.get_autocast_dtype(device_type))
+            bias = bias.to(dtype=torch.get_autocast_dtype(device_type)) if bias is not None else None
         weight = weight.contiguous()
         if process_group is not None and sequence_parallel:
             handle_x.wait()
