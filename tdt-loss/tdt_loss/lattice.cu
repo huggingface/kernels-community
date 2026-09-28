@@ -9,6 +9,10 @@
 // Every arc strictly increases t + u, so all nodes of an anti-diagonal
 // t + u = n are independent. One thread block handles one sample and sweeps
 // the anti-diagonals, with the threads striding over u.
+//
+// The recursions accumulate in float64: they are a small fraction of the total
+// cost, and the gradient combines alpha + beta - log_likelihood, which cancels
+// catastrophically in float32 when the log-likelihood is large (long targets).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -34,8 +38,8 @@ __global__ void tdt_alpha_kernel(const float *__restrict__ blank_lp,
                                  const int *__restrict__ source_lengths,
                                  const int *__restrict__ target_lengths,
                                  const int *__restrict__ durations, int max_T,
-                                 int max_U, int D, float *__restrict__ alphas,
-                                 float *__restrict__ log_ll) {
+                                 int max_U, int D, double *__restrict__ alphas,
+                                 double *__restrict__ log_ll) {
   __shared__ int shm_durations[kMaxDurations];
 
   const int b = blockIdx.x;
@@ -47,14 +51,14 @@ __global__ void tdt_alpha_kernel(const float *__restrict__ blank_lp,
   const float *blank = blank_lp + sample;
   const float *label = label_lp + sample;
   const float *dur = dur_lp + sample * D;
-  float *alpha = alphas + sample;
+  double *alpha = alphas + sample;
 
   for (int n = 0; n < T + U; ++n) {
     const int u_min = max(0, n - T + 1);
     const int u_max = min(n, U);
     for (int u = u_min + threadIdx.x; u <= u_max; u += blockDim.x) {
       const int t = n - u;
-      float a = n == 0 ? 0.f : neg_inf();
+      double a = n == 0 ? 0.0 : -INFINITY;
       for (int i = 0; i < D && n > 0; ++i) {
         const int d = shm_durations[i];
         const int t_prev = t - d;
@@ -74,7 +78,7 @@ __global__ void tdt_alpha_kernel(const float *__restrict__ blank_lp,
   }
 
   if (threadIdx.x == 0) {
-    float ll = neg_inf();
+    double ll = -INFINITY;
     for (int i = 0; i < D; ++i) {
       const int d = shm_durations[i];
       const int t_prev = T - d;
@@ -92,8 +96,8 @@ __global__ void tdt_beta_kernel(const float *__restrict__ blank_lp,
                                 const int *__restrict__ source_lengths,
                                 const int *__restrict__ target_lengths,
                                 const int *__restrict__ durations, int max_T,
-                                int max_U, int D, float *__restrict__ betas,
-                                float *__restrict__ log_ll) {
+                                int max_U, int D, double *__restrict__ betas,
+                                double *__restrict__ log_ll) {
   __shared__ int shm_durations[kMaxDurations];
 
   const int b = blockIdx.x;
@@ -105,7 +109,7 @@ __global__ void tdt_beta_kernel(const float *__restrict__ blank_lp,
   const float *blank = blank_lp + sample;
   const float *label = label_lp + sample;
   const float *dur = dur_lp + sample * D;
-  float *beta = betas + sample;
+  double *beta = betas + sample;
 
   for (int n = T + U - 1; n >= 0; --n) {
     const int u_min = max(0, n - T + 1);
@@ -113,17 +117,17 @@ __global__ void tdt_beta_kernel(const float *__restrict__ blank_lp,
     for (int u = u_min + threadIdx.x; u <= u_max; u += blockDim.x) {
       const int t = n - u;
       const int64_t node = static_cast<int64_t>(t) * max_U + u;
-      float bt = neg_inf();
+      double bt = -INFINITY;
       for (int i = 0; i < D; ++i) {
         const int d = shm_durations[i];
         const int t_next = t + d;
-        const float lp_dur = dur[node * D + i];
+        const double lp_dur = dur[node * D + i];
         if (d > 0) {
           if (t_next < T) {
             const int64_t dst = static_cast<int64_t>(t_next) * max_U + u;
             bt = log_add(bt, beta[dst] + blank[node] + lp_dur);
           } else if (t_next == T && u == U) {
-            bt = log_add(bt, blank[node] + lp_dur);
+            bt = log_add(bt, static_cast<double>(blank[node]) + lp_dur);
           }
         }
         if (u < U && t_next < T) {
@@ -137,7 +141,7 @@ __global__ void tdt_beta_kernel(const float *__restrict__ blank_lp,
   }
 
   if (threadIdx.x == 0) {
-    log_ll[b] = T > 0 ? beta[0] : neg_inf();
+    log_ll[b] = T > 0 ? beta[0] : -INFINITY;
   }
 }
 
@@ -159,10 +163,15 @@ void check_lattice_args(torch::Tensor const &blank_lp,
   for (auto const *x : {&blank_lp, &label_lp, &dur_lp, &out, &log_ll}) {
     TORCH_CHECK(x->device() == blank_lp.device(),
                 "all tensors must be on the same device");
-    TORCH_CHECK(x->scalar_type() == torch::kFloat32,
-                "lattice tensors must be float32");
     TORCH_CHECK(x->is_contiguous(), "lattice tensors must be contiguous");
   }
+  for (auto const *x : {&blank_lp, &label_lp, &dur_lp}) {
+    TORCH_CHECK(x->scalar_type() == torch::kFloat32,
+                "log-prob tensors must be float32");
+  }
+  TORCH_CHECK(out.scalar_type() == torch::kFloat64 &&
+                  log_ll.scalar_type() == torch::kFloat64,
+              "alphas/betas and log_ll must be float64");
   for (auto const *x : {&source_lengths, &target_lengths, &durations}) {
     TORCH_CHECK(x->device() == blank_lp.device(),
                 "all tensors must be on the same device");
@@ -206,7 +215,7 @@ void tdt_loss_fwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
       dur_lp.data_ptr<float>(), source_lengths.data_ptr<int>(),
       target_lengths.data_ptr<int>(), durations.data_ptr<int>(),
       blank_lp.size(1), blank_lp.size(2), durations.numel(),
-      alphas.data_ptr<float>(), log_ll.data_ptr<float>());
+      alphas.data_ptr<double>(), log_ll.data_ptr<double>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -229,6 +238,6 @@ void tdt_loss_bwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
       dur_lp.data_ptr<float>(), source_lengths.data_ptr<int>(),
       target_lengths.data_ptr<int>(), durations.data_ptr<int>(),
       blank_lp.size(1), blank_lp.size(2), durations.numel(),
-      betas.data_ptr<float>(), log_ll.data_ptr<float>());
+      betas.data_ptr<double>(), log_ll.data_ptr<double>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

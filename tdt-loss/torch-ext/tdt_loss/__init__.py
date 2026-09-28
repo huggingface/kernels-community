@@ -57,8 +57,10 @@ class TDTLoss(torch.autograd.Function):
             token_lse,
         )
 
-        alphas = torch.empty(B, max_T, max_U, **f32)
-        log_ll = torch.empty(B, **f32)
+        # The lattice recursions run in float64, see lattice.cu.
+        f64 = dict(device=token_logits.device, dtype=torch.float64)
+        alphas = torch.empty(B, max_T, max_U, **f64)
+        log_ll = torch.empty(B, **f64)
         ops.tdt_loss_fwd(blank_lp, label_lp, dur_lp, source_lengths, target_lengths, durations, alphas, log_ll)
 
         ctx.save_for_backward(
@@ -77,7 +79,7 @@ class TDTLoss(torch.autograd.Function):
         ctx.blank_id = blank_id
         ctx.duration_shape = duration_logits.shape
         ctx.duration_dtype = duration_logits.dtype
-        return -log_ll
+        return -log_ll.float()
 
     @staticmethod
     def backward(ctx, grad_loss: torch.Tensor):

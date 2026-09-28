@@ -24,8 +24,8 @@ except ImportError:
 DEVICE = torch.device("cuda")
 DURATIONS = [0, 1, 2, 3, 4]
 REDUCTIONS = ["mean_volume", "mean_batch", "mean", "sum", "none"]
-# float32 lattice sums over ~1000 labels lose a few digits.
-GRAD_ATOL_LONG = 1e-2
+# Gradient tolerance against a float64 reference for ~1000 labels (float32 log-probs, float64 lattice).
+GRAD_ATOL_LONG = 1e-3
 
 
 def reduce(losses, target_lengths, reduction):

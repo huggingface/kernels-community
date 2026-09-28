@@ -14,11 +14,10 @@ constexpr int kMaxDurations = 64;
 __device__ __forceinline__ float neg_inf() { return -INFINITY; }
 
 // log(exp(a) + exp(b)), safe when either argument is -inf.
-__device__ __forceinline__ float log_add(float a, float b) {
+__device__ __forceinline__ double log_add(double a, double b) {
   if (a == -INFINITY) return b;
   if (b == -INFINITY) return a;
-  const float m = fmaxf(a, b);
-  return m + log1pf(expf(-fabsf(a - b)));
+  return fmax(a, b) + log1p(exp(-fabs(a - b)));
 }
 
 // Merge two partial (max, sum(exp(x - max))) pairs of an online softmax.

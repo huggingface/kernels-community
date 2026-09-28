@@ -104,8 +104,8 @@ __global__ void tdt_logits_grad_kernel(
     const int *__restrict__ target_lengths, const int *__restrict__ durations,
     const float *__restrict__ blank_lp, const float *__restrict__ label_lp,
     const float *__restrict__ dur_lp, const float *__restrict__ token_lse,
-    const float *__restrict__ alphas, const float *__restrict__ betas,
-    const float *__restrict__ log_ll, const float *__restrict__ grad_loss,
+    const double *__restrict__ alphas, const double *__restrict__ betas,
+    const double *__restrict__ log_ll, const float *__restrict__ grad_loss,
     int max_T, int max_U, int V, int D, int blank_id,
     scalar_t *__restrict__ grad_token_logits,
     scalar_t *__restrict__ grad_duration_logits) {
@@ -126,7 +126,7 @@ __global__ void tdt_logits_grad_kernel(
   scalar_t *gd = grad_duration_logits + row * D;
   const scalar_t zero = static_cast<scalar_t>(0.f);
 
-  const float ll = log_ll[b];
+  const double ll = log_ll[b];
   // Infeasible samples (infinite loss) get a zero gradient instead of NaNs.
   if (t >= T || u > U || !isfinite(ll)) {
     for (int v = threadIdx.x; v < V; v += blockDim.x) gx[v] = zero;
@@ -135,33 +135,33 @@ __global__ void tdt_logits_grad_kernel(
   }
 
   const int64_t sample = static_cast<int64_t>(b) * max_T * max_U;
-  const float alpha = alphas[row];
-  const float blank = blank_lp[row];
-  const float label = label_lp[row];
+  const double alpha = alphas[row];
+  const double blank = blank_lp[row];
+  const double label = label_lp[row];
 
   for (int i = threadIdx.x; i < D; i += blockDim.x) {
     const int d = durations[i];
     const int t_next = t + d;
-    const float lp_dur = dur_lp[row * D + i];
+    const double lp_dur = dur_lp[row * D + i];
 
     float p_blank = 0.f;
     if (d > 0) {
-      float beta_next = neg_inf();
+      double beta_next = -INFINITY;
       if (t_next < T) {
         beta_next = betas[sample + static_cast<int64_t>(t_next) * max_U + u];
       } else if (t_next == T && u == U) {
-        beta_next = 0.f;  // terminal arc
+        beta_next = 0.0;  // terminal arc
       }
       if (beta_next != -INFINITY) {
-        p_blank = expf(alpha + blank + lp_dur + beta_next - ll);
+        p_blank = static_cast<float>(exp(alpha + blank + lp_dur + beta_next - ll));
       }
     }
 
     float p_label = 0.f;
     if (u < U && t_next < T) {
-      const float beta_next =
+      const double beta_next =
           betas[sample + static_cast<int64_t>(t_next) * max_U + u + 1];
-      p_label = expf(alpha + label + lp_dur + beta_next - ll);
+      p_label = static_cast<float>(exp(alpha + label + lp_dur + beta_next - ll));
     }
 
     shm_blank[i] = p_blank;
@@ -341,13 +341,23 @@ void tdt_logits_grad(
   check_int_tensor(source_lengths, "source_lengths", token_logits);
   check_int_tensor(target_lengths, "target_lengths", token_logits);
   check_int_tensor(durations, "durations", token_logits);
-  for (auto *in : {&blank_lp, &label_lp, &token_lse, &alphas, &betas}) {
-    check_float_out(*in, "lattice tensor", token_logits);
+  for (auto *in : {&blank_lp, &label_lp, &token_lse}) {
+    check_float_out(*in, "log-prob tensor", token_logits);
     TORCH_CHECK(in->numel() == B * max_T * max_U,
-                "lattice tensors must have shape (batch, T, U+1)");
+                "log-prob tensors must have shape (batch, T, U+1)");
+  }
+  for (auto *in : {&alphas, &betas}) {
+    TORCH_CHECK(in->device() == token_logits.device() &&
+                    in->scalar_type() == torch::kFloat64 &&
+                    in->is_contiguous() && in->numel() == B * max_T * max_U,
+                "alphas and betas must be contiguous float64 tensors of shape "
+                "(batch, T, U+1)");
   }
   check_float_out(dur_lp, "dur_lp", token_logits);
-  check_float_out(log_ll, "log_ll", token_logits);
+  TORCH_CHECK(log_ll.device() == token_logits.device() &&
+                  log_ll.scalar_type() == torch::kFloat64 &&
+                  log_ll.is_contiguous(),
+              "log_ll must be a contiguous float64 tensor");
   check_float_out(grad_loss, "grad_loss", token_logits);
   TORCH_CHECK(log_ll.numel() == B && grad_loss.numel() == B,
               "log_ll and grad_loss must have shape (batch,)");
@@ -381,8 +391,8 @@ void tdt_logits_grad(
             source_lengths.data_ptr<int>(), target_lengths.data_ptr<int>(),
             durations.data_ptr<int>(), blank_lp.data_ptr<float>(),
             label_lp.data_ptr<float>(), dur_lp.data_ptr<float>(),
-            token_lse.data_ptr<float>(), alphas.data_ptr<float>(),
-            betas.data_ptr<float>(), log_ll.data_ptr<float>(),
+            token_lse.data_ptr<float>(), alphas.data_ptr<double>(),
+            betas.data_ptr<double>(), log_ll.data_ptr<double>(),
             grad_loss.data_ptr<float>(), max_T, max_U, V, D, blank_id,
             grad_token_logits.data_ptr<scalar_t>(),
             grad_duration_logits.data_ptr<scalar_t>());
