@@ -21,6 +21,7 @@ import torch
 from finegrained_kernels.compat import (  # type: ignore
     MX_SCALE_GROUP_K,
     NVFP4_SCALE_GROUP_K,
+    is_sm10x,
 )
 
 
@@ -46,9 +47,10 @@ SUPPORTS_FP8 = TEST_DEVICE == "xpu" or (
 # are calibrated against — every other SM has its own latency profile.
 IS_SM90 = TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() == (9, 0)
 # The SWIZZLE_32_4_4 scale layout exists to feed tcgen05, so the ops only grow a
-# swizzled arm on CUDA. Elsewhere the scales stay row-major (affine) and the
-# pre-swizzled variants of each problem are skipped rather than run unswizzled.
-SUPPORTS_SWIZZLED_SCALES = TEST_DEVICE == "cuda"
+# swizzled arm where that instruction is: sm_10x. Elsewhere the scales stay row-major
+# (affine) and the pre-swizzled variants of each problem are skipped rather than run
+# unswizzled.
+SUPPORTS_SWIZZLED_SCALES = is_sm10x()
 DTYPE_TAG = {
     torch.bfloat16: "bf16",
     torch.float16: "fp16",

@@ -37,6 +37,7 @@ from .loading.tiles import (
     load_weight_mx,
     load_weight_plain,
     load_weight_static,
+    operand_tile_descriptor,
     operand_tile_ptrs,
     weight_tile_ptrs,
 )
@@ -1219,50 +1220,40 @@ def full_precision_matmul_grouped_kernel(
         )
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
-        # The stock descriptor arms read host-built (``TensorDescriptor.from_tensor``) boxes.
-        # That is a TMA descriptor, and Xe has no TMA, so this arm builds both boxes in-kernel
-        # instead.
-        DEVICE_DESC_ARM: tl.constexpr = (
-            A_MEMORY_MODE == "device_descriptor" and B_MEMORY_MODE == "device_descriptor"
+        # Resolve each descriptor operand once per tile: the host-built box as passed, or an
+        # in-kernel tensormap where the host cannot build one (a host descriptor IS a TMA
+        # descriptor, and Xe has no TMA). The weight box is 2D over THIS expert's slab rather
+        # than 3D over the stack, for two reasons: a device-built 3D box silently drops its
+        # outermost offset on Xe (measured — every expert reads expert 0), and the slab's own
+        # K-contiguous axes are the orientation the Xe 2D block load needs to reach rate (a
+        # (K, N) view, what the pointer arm effectively does, falls well off it). A needs no
+        # such care — its box is 2D either way, and no gather reaches the descriptor arm here
+        # (``descriptor_box_pruner`` fences gathered descriptor A to sm_100), so the rows are
+        # the contiguous span at ``m_start``, tails zero-fill like the affine arm's mask, and
+        # rows outside the expert are dropped by the epilogue's row_mask.
+        a_desc = operand_tile_descriptor(
+            ADescriptor, A, S, K, stride_a_m, 1,  # K is the contiguous dim of (S, K)
+            BLOCK_SIZE_M, BLOCK_SIZE_K, A_MEMORY_MODE,
         )
-        if DEVICE_DESC_ARM:
-            # No gather here (the launcher's precondition), so the rows are the contiguous span
-            # [m_start, m_start + BM) and A has a real 2D extent. A descriptor zero-fills the
-            # tail past S/K like the affine arm's mask; rows outside the expert are dropped by
-            # the epilogue's row_mask, as on the host-descriptor arm.
-            a_d = tl.make_tensor_descriptor(
-                A,
-                shape=(S, K),
-                strides=(stride_a_m, 1),  # K is the contiguous dim of (S, K)
-                block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+        b_desc = operand_tile_descriptor(
+            BDescriptor, B + expert_id64 * stride_b_e, N, K, stride_b_n, 1,  # and of the slab
+            BLOCK_SIZE_N, BLOCK_SIZE_K, B_MEMORY_MODE, GATE,
+        )
+        SLAB_DESCRIPTOR: tl.constexpr = B_MEMORY_MODE == "device_descriptor"
+        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+            a, _as = load_act_plain(
+                a_ptrs, a_desc, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
+                A_MEMORY_MODE, GatherIdx is not None,
             )
-            # The (E, N, K) slab is K-contiguous, so the tile is described in the slab's OWN
-            # axes as a row-major (BN, BK) box and transposed in registers. This orientation is
-            # the whole win: the Xe 2D block load only reaches rate when the innermost described
-            # axis is unit-stride, and a (K, N) view -- what the pointer arm effectively does --
-            # falls off it. Measured dense, bit-identical: 59.9 -> 133.7 TFLOP/s.
-            b_d = tl.make_tensor_descriptor(
-                B + expert_id64 * stride_b_e,
-                shape=((2 * N) if GATE else N, K),
-                strides=(stride_b_n, 1),
-                block_shape=((2 if GATE else 1) * BLOCK_SIZE_N, BLOCK_SIZE_K),
+            w, _ws = load_weight_plain(
+                b_ptrs, b_desc, row0, n_off, k * BLOCK_SIZE_K,
+                GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+                SLAB_DESCRIPTOR=SLAB_DESCRIPTOR,
             )
-            for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-                a = a_d.load([m_start, k * BLOCK_SIZE_K])
-                w = tl.trans(b_d.load([n_off, k * BLOCK_SIZE_K]))
-                acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
-        else:
-            for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
-                a, _as = load_act_plain(
-                    a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
-                    A_MEMORY_MODE, GatherIdx is not None,
-                )
-                w, _ws = load_weight_plain(
-                    b_ptrs, BDescriptor, row0, n_off, k * BLOCK_SIZE_K,
-                    GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
-                )
-                acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
+            acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
+            if A_MEMORY_MODE == "pointer":
                 a_ptrs += BLOCK_SIZE_K * stride_a_k
+            if B_MEMORY_MODE == "pointer":
                 b_ptrs += BLOCK_SIZE_K * stride_b_k
 
         gemm_epilogue(
