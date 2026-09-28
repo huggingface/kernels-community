@@ -1021,12 +1021,12 @@ class LayerNormLinearFn(torch.autograd.Function):
             norm_bias,
             eps,
             residual,
-            out_dtype=None if not torch.is_autocast_enabled() else torch.get_autocast_gpu_dtype(),
+            out_dtype=None if not torch.is_autocast_enabled() else torch.get_autocast_gpu_dtype(x.device.type),
             residual_dtype=residual_dtype,
             is_rms_norm=is_rms_norm,
         )
         y = y.reshape(x_shape_og)
-        dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else y.dtype
+        dtype = torch.get_autocast_gpu_dtype(y.device.type) if torch.is_autocast_enabled() else y.dtype
         linear_weight = linear_weight.to(dtype)
         linear_bias = linear_bias.to(dtype) if linear_bias is not None else None
         out = F.linear(y.to(linear_weight.dtype), linear_weight, linear_bias)
