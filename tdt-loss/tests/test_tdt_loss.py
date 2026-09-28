@@ -6,20 +6,15 @@ The kernel is checked against two pure PyTorch references:
 - `tdt_loss_naive`: a loop-based implementation that is easy to verify by hand.
 """
 
-from pathlib import Path
-
 import pytest
 import torch
+
+import kernels
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA not available", allow_module_level=True)
 
-try:
-    import tdt_loss as tdt_loss_kernel
-except ImportError:
-    from kernels import get_local_kernel
-
-    tdt_loss_kernel = get_local_kernel(repo_path=Path(__file__).parent.parent, package_name="tdt_loss")
+tdt_loss_kernel = kernels.get_kernel("kernels-community/tdt-loss", version=1)
 
 DEVICE = torch.device("cuda")
 DURATIONS = [0, 1, 2, 3, 4]
@@ -194,6 +189,7 @@ def run_kernel(token_logits, duration_logits, targets, logit_lengths, target_len
     )
 
 
+@pytest.mark.kernels_ci
 @pytest.mark.parametrize("sigma", [0.0, 0.05])
 def test_matches_naive(sigma):
     token_logits, duration_logits, targets, logit_lengths, target_lengths = make_inputs(3, 12, 5, 16, DURATIONS)
@@ -206,6 +202,7 @@ def test_matches_naive(sigma):
     torch.testing.assert_close(losses.double().cpu(), expected, atol=1e-4, rtol=1e-5)
 
 
+@pytest.mark.kernels_ci
 @pytest.mark.parametrize("reduction", REDUCTIONS)
 @pytest.mark.parametrize("sigma", [0.0, 0.05])
 @pytest.mark.parametrize("durations", [DURATIONS, [1, 2], [0, 1, 3, 5]])
@@ -230,6 +227,7 @@ def test_forward_backward_match_reference(durations, sigma, reduction):
     assert_grad_close(dur.grad, ref_dur.grad, atol=1e-5, rtol=1e-4)
 
 
+@pytest.mark.kernels_ci
 def test_joint_logits_slices():
     """Non-contiguous slices of a joint output (as in ParakeetForTDT) are handled without a copy."""
     V = 128
@@ -258,6 +256,7 @@ def test_joint_logits_slices():
     assert_grad_close(joint.grad, ref_joint.grad, atol=1e-5, rtol=1e-4)
 
 
+@pytest.mark.kernels_ci
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_half_precision(dtype):
     """Half-precision logits are read directly and gradients come back in the input dtype."""
@@ -327,6 +326,7 @@ def test_long_targets():
     assert_grad_close(tok.grad, ref_tok.grad, atol=GRAD_ATOL_LONG, rtol=0)
 
 
+@pytest.mark.kernels_ci
 def test_empty_targets():
     """Samples without labels: the only path is a sequence of blanks."""
     token_logits, duration_logits, _, logit_lengths, _ = make_inputs(2, 10, 0, 16, DURATIONS)
@@ -338,6 +338,7 @@ def test_empty_targets():
     torch.testing.assert_close(losses.double().cpu(), expected, atol=1e-4, rtol=1e-5)
 
 
+@pytest.mark.kernels_ci
 def test_infeasible_alignment():
     """No valid path: the loss is infinite and the gradient is zero rather than NaN."""
     durations = [0, 4]
@@ -354,6 +355,7 @@ def test_infeasible_alignment():
     assert (tok.grad[1] == 0).all()
 
 
+@pytest.mark.kernels_ci
 def test_deterministic():
     inputs = make_inputs(4, 30, 8, 64, DURATIONS)
     grads = []
@@ -364,6 +366,7 @@ def test_deterministic():
     assert torch.equal(grads[0], grads[1])
 
 
+@pytest.mark.kernels_ci
 def test_invalid_reduction():
     inputs = make_inputs(1, 5, 2, 4, [0, 1])
     with pytest.raises(ValueError, match="Invalid reduction"):
