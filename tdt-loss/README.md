@@ -59,14 +59,22 @@ Samples without a valid alignment get an infinite loss and a zero gradient.
 
 ## Benchmarks
 
-Forward + backward on an NVIDIA L4, with the logits given as slices of a joint output, compared with the vectorized
+Forward + backward of the loss, with the logits given as slices of a joint output, compared with the vectorized
 PyTorch implementation from `transformers.loss.loss_tdt`. Run `benchmarks/benchmark.py` with `kernels benchmark`.
 
-| batch, frames, labels, vocab | dtype | PyTorch | kernel | speedup |
-|---|---|---:|---:|---:|
-| 8, 100, 20, 1025 | float32 | 536 ms | 4.3 ms | 125x |
-| 4, 200, 40, 8193 | float32 | 1252 ms | 53 ms | 24x |
-| 4, 200, 40, 8193 | bfloat16 | 1242 ms | 39 ms | 32x |
+| batch, frames, labels, vocab | dtype | GPU | PyTorch | kernel | speedup |
+|---|---|---|---:|---:|---:|
+| 8, 100, 20, 1025 | float32 | L4 | 536 ms | 4.3 ms | 125x |
+| 4, 200, 40, 8193 | float32 | L4 | 1252 ms | 53 ms | 24x |
+| 4, 200, 40, 8193 | bfloat16 | L4 | 1242 ms | 39 ms | 32x |
+| 8, 100, 20, 1025 | float32 | A100 | 624 ms | 1.5 ms | 410x |
+| 4, 200, 40, 8193 | float32 | A100 | 1259 ms | 9.5 ms | 133x |
+| 4, 200, 40, 8193 | bfloat16 | A100 | 1267 ms | 8.6 ms | 148x |
+| 8, 100, 20, 1025 | float32 | H200 | 488 ms | 1.0 ms | 480x |
+| 4, 200, 40, 8193 | float32 | H200 | 993 ms | 5.0 ms | 199x |
+| 4, 200, 40, 8193 | bfloat16 | H200 | 896 ms | 4.9 ms | 183x |
 
-The kernels run close to the memory bandwidth of the GPU; most of the remaining time is spent by PyTorch
-materializing the gradient of the two logits slices.
+Fine-tuning [nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) on LibriSpeech
+(batch size 8, bfloat16 autocast, 300 steps, same data order and seed) on an H200 gives the same loss curve as the
+PyTorch loss (identical first-step loss, median per-step difference of 0.0015), with a full training step going from
+1305 ms to 144 ms (9x) and peak memory from 33.2 GiB to 21.5 GiB.
