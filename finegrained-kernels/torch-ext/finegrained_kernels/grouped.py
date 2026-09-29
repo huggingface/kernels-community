@@ -21,7 +21,7 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
-from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, sm_count, tl_dtype
+from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, sm_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands
@@ -37,6 +37,7 @@ from .loading.tiles import (
     load_weight_mx,
     load_weight_plain,
     load_weight_static,
+    operand_tile_descriptor,
     operand_tile_ptrs,
     weight_tile_ptrs,
 )
@@ -1219,18 +1220,43 @@ def full_precision_matmul_grouped_kernel(
         )
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
+        # Resolve each descriptor operand once per tile: the host-built box as passed, or an
+        # in-kernel tensormap where the host cannot build one (a host descriptor IS a TMA
+        # descriptor, and Xe has no TMA). The weight box is 2D over THIS expert's slab rather
+        # than 3D over the stack, for two reasons: a device-built 3D box silently drops its
+        # outermost offset on Xe (measured — every expert reads expert 0), and the slab's own
+        # K-contiguous axes are the orientation the Xe 2D block load needs to reach rate (a
+        # (K, N) view, what the pointer arm effectively does, falls well off it). A needs no
+        # such care — its box is 2D either way, and no gather reaches the descriptor arm here
+        # (``descriptor_box_pruner`` fences gathered descriptor A to sm_100), so the rows are
+        # the contiguous span at ``m_start``, tails zero-fill like the affine arm's mask, and
+        # rows outside the expert are dropped by the epilogue's row_mask.
+        a_desc = operand_tile_descriptor(
+            ADescriptor, A, S, K, stride_a_m, 1,  # K is the contiguous dim of (S, K)
+            BLOCK_SIZE_M, BLOCK_SIZE_K, A_MEMORY_MODE,
+        )
+        b_desc = operand_tile_descriptor(
+            BDescriptor, B + expert_id64 * stride_b_e, N, K, stride_b_n, 1,  # and of the slab
+            BLOCK_SIZE_N, BLOCK_SIZE_K, B_MEMORY_MODE, GATE,
+        )
+        # The box's rank, not the backend: only this kernel resolves its own 2D per-expert box
+        # (above). The other grouped kernels run the same mode on Xe against host-built 3D boxes.
+        B_DESCRIPTOR_IS_2D: tl.constexpr = B_MEMORY_MODE == "device_descriptor"
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
             a, _as = load_act_plain(
-                a_ptrs, ADescriptor, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
+                a_ptrs, a_desc, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
                 A_MEMORY_MODE, GatherIdx is not None,
             )
             w, _ws = load_weight_plain(
-                b_ptrs, BDescriptor, row0, n_off, k * BLOCK_SIZE_K,
+                b_ptrs, b_desc, row0, n_off, k * BLOCK_SIZE_K,
                 GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+                B_DESCRIPTOR_IS_2D=B_DESCRIPTOR_IS_2D,
             )
             acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
-            a_ptrs += BLOCK_SIZE_K * stride_a_k
-            b_ptrs += BLOCK_SIZE_K * stride_b_k
+            if A_MEMORY_MODE == "pointer":
+                a_ptrs += BLOCK_SIZE_K * stride_a_k
+            if B_MEMORY_MODE == "pointer":
+                b_ptrs += BLOCK_SIZE_K * stride_b_k
 
         gemm_epilogue(
             C,
@@ -1352,7 +1378,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     else:
         C = A.new_empty(S, N, dtype=output_dtype)
         Cs = None  # unread without an OUTPUT_FORMAT; strides literal below
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A, B.view(num_experts, 2 * N if gate else N, K)
     )
@@ -1486,7 +1512,7 @@ def w8a8_block_static_fp8_matmul_grouped(
     else:
         C = A.new_empty(S, N, dtype=output_dtype)
         Cs = None  # unread without an OUTPUT_FORMAT; strides literal below
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A_q, B.view(num_experts, 2 * N if gate else N, K)
     )
@@ -1618,7 +1644,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
         # per-expert layout above all reach; raw rows (decode) keep the gather.
         A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, num_experts)
     C = A.new_empty(S, N, dtype=output_dtype)
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A, B.view(num_experts, 2 * N if gate else N, K)
     )
@@ -1897,7 +1923,7 @@ def mx_dynamic_matmul_grouped(
         Cs, CSDescriptor = cs_ret, None
     else:
         cs_ret, Cs, CSDescriptor = None, None, None  # unread (no OUTPUT_FORMAT)
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     # NVFP4 accumulator correction: the per-expert g_a·g_b product folded onto the fp32 accumulator
     # (grouped A is pre-quantized, so the kernel needs only this product, never g_a alone).
     # g_b per expert and g_a scalar go down SEPARATELY; the kernel multiplies them in-register
@@ -2025,7 +2051,7 @@ def full_precision_matmul_grouped(
 
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     C = A.new_empty(S, N, dtype=output_dtype)
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A, B.view(num_experts, 2 * N if gate else N, K)
     )
@@ -2116,7 +2142,7 @@ def mx_weight_only_matmul_grouped(
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
     output_dtype = resolve_output_dtype(output_dtype, A, None)
     C = A.new_empty(S, N, dtype=output_dtype)
-    num_sms = sm_count(A.device.index)
+    num_sms = persistent_program_count(A.device.index)
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     # Operand host-TMA descriptors (A over (S, K), B over the (E, 2N|N, K_bytes) weight view);
