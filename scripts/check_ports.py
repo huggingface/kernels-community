@@ -19,7 +19,8 @@ Usage:
     python3 scripts/check_ports.py --changed-since <ref>
 
 Defaults to every port found. --changed-since limits the check to ports whose
-port/ or src/ tree differs from <ref>, which is what CI uses for pull requests.
+port/ or src/ tree differs from <ref> (or every port, if the checker itself
+changed), which is what CI uses for pull requests.
 Set KERNEL_PORT to override the runner command (e.g. "nix run
 github:huggingface/kernels#kernel-port --").
 """
@@ -43,6 +44,8 @@ ARG_RE = re.compile(r'(\w+)="([^"]*)"')
 
 DEFAULT_RUNNER = "kernel-port"
 
+CHECKER_FILES = {"scripts/check_ports.py", ".github/workflows/check-ports.yaml"}
+
 
 def runner_cmd() -> list:
     return shlex.split(os.environ.get("KERNEL_PORT", DEFAULT_RUNNER))
@@ -53,7 +56,11 @@ def find_ports(root: Path) -> list:
 
 
 def changed_ports(root: Path, ref: str) -> list:
-    """Ports whose port/ or src/ tree differs from `ref`."""
+    """Ports whose port/ or src/ tree differs from `ref`.
+
+    A change to the checker itself (this script, or the workflow that pins the
+    runner) can break any port, so it selects all of them.
+    """
     out = subprocess.run(
         ["git", "diff", "--name-only", f"{ref}...HEAD"],
         capture_output=True,
@@ -62,6 +69,8 @@ def changed_ports(root: Path, ref: str) -> list:
     ).stdout
     touched = set()
     for line in out.splitlines():
+        if line in CHECKER_FILES:
+            return find_ports(root)
         parts = line.split("/")
         if len(parts) >= 3 and parts[1] in ("port", "src"):
             touched.add(parts[0])
