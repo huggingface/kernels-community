@@ -6,10 +6,15 @@ import torch
 import torch.nn.functional as F
 import pytest
 
+import kernels
 from einops import rearrange
 
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
-from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn, mamba_inner_ref
+mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=3)
+
+selective_scan_fn = mamba_ssm.ops.selective_scan_interface.selective_scan_fn
+selective_scan_ref = mamba_ssm.ops.selective_scan_interface.selective_scan_ref
+mamba_inner_fn = mamba_ssm.ops.selective_scan_interface.mamba_inner_fn
+mamba_inner_ref = mamba_ssm.ops.selective_scan_interface.mamba_inner_ref
 
 
 # @pytest.mark.parametrize('wtype', [torch.float32, torch.complex64])
@@ -157,7 +162,8 @@ def test_selective_scan(is_variable_B, is_variable_C, varBC_groups, has_D, has_z
 # @pytest.mark.parametrize("is_variable_C", [False])
 @pytest.mark.parametrize("is_variable_B", [False, True])
 # @pytest.mark.parametrize("is_variable_B", [True])
-def test_mamba_inner_fn(is_variable_B, is_variable_C, seqlen, itype, wtype):
+@pytest.mark.parametrize("has_out_proj_bias", [False, True])
+def test_mamba_inner_fn(is_variable_B, is_variable_C, seqlen, itype, wtype, has_out_proj_bias):
     device = 'cuda'
     rtol, atol = (6e-4, 2e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
@@ -181,7 +187,8 @@ def test_mamba_inner_fn(is_variable_B, is_variable_C, seqlen, itype, wtype):
                                 dim, device=device, dtype=itype, requires_grad=True)
     delta_proj_weight = torch.randn(dim, dt_rank, device=device, dtype=itype, requires_grad=True)
     out_proj_weight = torch.randn(dim // 2, dim, device=device, dtype=itype, requires_grad=True)
-    out_proj_bias = None
+    out_proj_bias = (torch.randn(dim // 2, device=device, dtype=itype, requires_grad=True)
+                     if has_out_proj_bias else None)
     A = (-0.5 * torch.rand(dim, dstate, device=device, dtype=wtype)).requires_grad_()
     B = (torch.randn(dim, dstate, device=device, dtype=wtype, requires_grad=True)
          if not is_variable_B else None)
@@ -235,6 +242,9 @@ def test_mamba_inner_fn(is_variable_B, is_variable_C, seqlen, itype, wtype):
     print(f'dx_proj_weight max diff: {(x_proj_weight.grad - x_proj_weight_ref.grad).abs().max().item()}')
     print(f'dconv1d_weight max diff: {(conv1d_weight.grad - conv1d_weight_ref.grad).abs().max().item()}')
     print(f'dconv1d_bias max diff: {(conv1d_bias.grad - conv1d_bias_ref.grad).abs().max().item()}')
+    if has_out_proj_bias:
+        print(f'dout_proj_bias max diff: {(out_proj_bias.grad - out_proj_bias_ref.grad).abs().max().item()}')
+        assert torch.allclose(out_proj_bias.grad, out_proj_bias_ref.grad, rtol=rtolw, atol=atolw)
 
     # assert torch.allclose(xz.grad, xz_ref.grad.to(dtype=itype), rtol=rtol * 2, atol=atol * 2)
     # assert torch.allclose(delta.grad, delta_ref.grad.to(dtype=itype), rtol=rtol * 5, atol=atol * 10)

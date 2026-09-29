@@ -459,7 +459,7 @@ class MambaInnerFn(torch.autograd.Function):
         dout_proj_weight = torch.einsum(
             "eB,dB->ed", dout, rearrange(out_z, "b d l -> d (b l)")
         )
-        dout_proj_bias = dout.sum(dim=(0, 1)) if not ctx.out_proj_bias_is_None else None
+        dout_proj_bias = dout.sum(dim=1) if not ctx.out_proj_bias_is_None else None
         dD = dD if D is not None else None
         dx_dbl = torch.empty_like(x_dbl)
         dB_proj_bias = None
