@@ -14,6 +14,7 @@ dacorvo
 danieldk
 drbh
 ebezzam
+EricLBuehler
 eustlb
 githubnemo
 guarin
@@ -38,6 +39,7 @@ molbap
 NielsRogge
 paulinebm
 pcuenca
+pculliton
 qgallouedec
 regisss
 remi-or
@@ -59,4 +61,3 @@ xenova
 YangKai0616
 ydshieh
 zucchini-nlp
-EricLBuehler
