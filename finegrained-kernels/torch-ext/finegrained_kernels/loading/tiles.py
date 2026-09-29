@@ -91,8 +91,8 @@ def operand_tile_descriptor(
     and grouped kernels call it for both): the host-built TMA descriptor as passed, a device-built
     in-kernel tensormap, or 0 under "pointer" (never read — the constexpr branch folds it out of
     ``load_weight_tile``). The box is always 2D, so a grouped caller passes ``W`` already advanced
-    to one expert's slab and loads it as ``SLAB_DESCRIPTOR``. Single return — only the taken branch
-    compiles."""
+    to one expert's slab and loads it as ``B_DESCRIPTOR_IS_2D``. Single return — only the taken
+    branch compiles."""
     if B_MEMORY_MODE == "host_descriptor":
         descriptor = HostDescriptor
     elif B_MEMORY_MODE == "device_descriptor":
@@ -150,22 +150,23 @@ def load_grouped_weight_tile(
     GATE: tl.constexpr,
     B_MEMORY_MODE: tl.constexpr,
     SWAP_AB: tl.constexpr = False,
-    SLAB_DESCRIPTOR: tl.constexpr = False,
+    B_DESCRIPTOR_IS_2D: tl.constexpr = False,
 ):
     """One K-major (optionally gate|up-stacked) MX weight K-tile for the grouped / batched loop:
     the explicit-pointer tile flattened to the ``[KB, (2|1)*BN]`` rhs (or, under ``SWAP_AB``, the
     ``[(2|1)*BN, KB]`` rows-major lhs — the batched-decode orientation), or the ``[(2|1), BN, KB]``
     descriptor box over the ``(E, 2N|N, K_bytes)`` weight view, reshaped and transposed to the same
     form (the fused-era TMA arm: natural orientation + per-iteration trans; grouped/2D never swap).
-    ``SLAB_DESCRIPTOR`` says the caller resolved a 2D box over ONE expert's slab (base already
-    advanced by the expert stride) rather than a 3D box over the stack, so the expert axis is
-    gone from both the shape and the offsets and no reshape is needed — the in-kernel descriptor
-    build the TMA-less backends take, since a device-built 3D box silently drops its outermost
-    offset there. Single return — only the taken arm compiles; the caller advances ``w_ptrs`` and
-    passes the box offsets either way."""
+    ``B_DESCRIPTOR_IS_2D`` is the box's RANK, which ``B_MEMORY_MODE`` does not imply: it says the
+    caller resolved a 2D box over ONE expert's slab (base already advanced by the expert stride)
+    rather than a 3D box over the stack, so the expert axis is gone from both the shape and the
+    offsets and no reshape is needed — the in-kernel descriptor build the TMA-less backends take,
+    since a device-built 3D box silently drops its outermost offset there. The other grouped
+    callers still hand in host-built 3D boxes under that same mode. Single return — only the taken
+    arm compiles; the caller advances ``w_ptrs`` and passes the box offsets either way."""
     if B_MEMORY_MODE == "pointer":
         w = tl.load(w_ptrs)
-    elif SLAB_DESCRIPTOR:
+    elif B_DESCRIPTOR_IS_2D:
         w = tl.trans(w_descriptor.load([n_off, kb_off]))
     else:
         w = tl.trans(
@@ -418,7 +419,7 @@ def _weight_value(
     b_ptrs, b_descriptor, row0, n_off, k_off,
     GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr,
     SWAP_AB: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, KB: tl.constexpr,
-    SLAB_DESCRIPTOR: tl.constexpr = False,
+    B_DESCRIPTOR_IS_2D: tl.constexpr = False,
 ):
     """Format-agnostic weight value tile: the per-expert 3D box (GROUPED) or the plain swap-aware
     tile. Shared by every ``load_weight_<format>`` — the value load never depends on the scale
@@ -430,7 +431,7 @@ def _weight_value(
     if GROUPED:
         w = load_grouped_weight_tile(
             b_ptrs, b_descriptor, row0, n_off, k_off, BLOCK_SIZE_N, KB, GATE, B_MEMORY_MODE,
-            SWAP_AB, SLAB_DESCRIPTOR,
+            SWAP_AB, B_DESCRIPTOR_IS_2D,
         )
     else:
         w = load_weight_tile(b_ptrs, b_descriptor, n_off, k_off, B_MEMORY_MODE, SWAP_AB)
@@ -493,13 +494,13 @@ def load_weight_plain(
     b_ptrs, b_descriptor, row0, n_off, k_off,
     GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, WEIGHT_VALUES_PER_BYTE: tl.constexpr = 1,
-    SLAB_DESCRIPTOR: tl.constexpr = False,
+    B_DESCRIPTOR_IS_2D: tl.constexpr = False,
 ):
     """The tensor / full_precision weight path: plain value tile, no block scale (the per-tensor
     scale, if any, is applied post-loop). Returns ``(w, w)`` so callers keep the uniform (value,
     scale) shape; the second slot is dead."""
     KB: tl.constexpr = BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
-    w = _weight_value(b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB, SLAB_DESCRIPTOR)
+    w = _weight_value(b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB, B_DESCRIPTOR_IS_2D)
     return w, w
 
 

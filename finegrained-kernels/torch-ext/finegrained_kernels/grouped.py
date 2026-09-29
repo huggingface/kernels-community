@@ -1239,7 +1239,9 @@ def full_precision_matmul_grouped_kernel(
             BDescriptor, B + expert_id64 * stride_b_e, N, K, stride_b_n, 1,  # and of the slab
             BLOCK_SIZE_N, BLOCK_SIZE_K, B_MEMORY_MODE, GATE,
         )
-        SLAB_DESCRIPTOR: tl.constexpr = B_MEMORY_MODE == "device_descriptor"
+        # The box's rank, not the backend: only this kernel resolves its own 2D per-expert box
+        # (above). The other grouped kernels run the same mode on Xe against host-built 3D boxes.
+        B_DESCRIPTOR_IS_2D: tl.constexpr = B_MEMORY_MODE == "device_descriptor"
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
             a, _as = load_act_plain(
                 a_ptrs, a_desc, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
@@ -1248,7 +1250,7 @@ def full_precision_matmul_grouped_kernel(
             w, _ws = load_weight_plain(
                 b_ptrs, b_desc, row0, n_off, k * BLOCK_SIZE_K,
                 GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
-                SLAB_DESCRIPTOR=SLAB_DESCRIPTOR,
+                B_DESCRIPTOR_IS_2D=B_DESCRIPTOR_IS_2D,
             )
             acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
             if A_MEMORY_MODE == "pointer":
