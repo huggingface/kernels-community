@@ -44,10 +44,11 @@ jobs:
       # origin URL, HEAD and cleanliness of the checkout it is handed.
       - name: Regenerate every port and compare
         env:
-          # TODO: kernel-port still lives on the kernel-port-tool branch, pinned
-          # to a rev so a push there cannot break every open PR. Point this at
-          # github:huggingface/kernels#kernel-port once the branch merges.
-          KERNEL_PORT: "nix run github:huggingface/kernels/c29a6751b5c699de555c98060fb26b4ef0e6b520#kernel-port --"
+          # kernel-port is experimental upstream (no CLI or op stability
+          # guarantee), so pin a huggingface/kernels main rev rather than
+          # tracking the branch: a push there cannot break every open PR, and
+          # bumping the pin is an explicit PR that re-checks every port.
+          KERNEL_PORT: "nix run github:huggingface/kernels/ca9095966486b76168115a34e2027c6c98805919#kernel-port --"
           BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
         run: |
           if [ -n "$BASE_REF" ]; then
