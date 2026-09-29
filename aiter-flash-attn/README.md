@@ -29,7 +29,7 @@ Variable-length / packed FlashAttention. `q` shape: `(total_q, nheads, headdim)`
 `cu_seqlens_*` are int32 cumulative offsets.
 
 Both entry points accept the standard FA2 kwargs (`dropout_p`, `softmax_scale`,
-`causal`, `window_size`, `alibi_slopes`, ...) plus a `sink` argument for
+`causal`, `window_size`, `alibi_slopes`, ...) plus an `s_aux` argument for
 learnable attention sinks (e.g. gpt-oss).
 
 ## Supported hardware

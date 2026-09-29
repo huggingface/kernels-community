@@ -453,27 +453,27 @@ struct CausalConv1dBwdInitialStatesKernel {
 
 } // namespace
 
-void causal_conv1d_bwd(const at::Tensor &x, const at::Tensor &weight,
-                       const c10::optional<at::Tensor> &bias_, at::Tensor &dout,
-                       const c10::optional<at::Tensor> &seq_idx_,
-                       const c10::optional<at::Tensor> &initial_states_,
-                       const c10::optional<at::Tensor> &dfinal_states_,
-                       at::Tensor &dx, at::Tensor &dweight,
-                       c10::optional<at::Tensor> &dbias_,
-                       c10::optional<at::Tensor> &dinitial_states_,
+void causal_conv1d_bwd(const Tensor &x, const Tensor &weight,
+                       std::optional<Tensor> bias_, Tensor dout,
+                       std::optional<Tensor> seq_idx_,
+                       std::optional<Tensor> initial_states_,
+                       std::optional<Tensor> dfinal_states_,
+                       Tensor &dx, Tensor &dweight,
+                       std::optional<Tensor> dbias_,
+                       std::optional<Tensor> dinitial_states_,
                        bool silu_activation) {
   const auto input_type = x.scalar_type();
   const auto weight_type = weight.scalar_type();
-  TORCH_CHECK(input_type == at::ScalarType::Float ||
-              input_type == at::ScalarType::Half ||
-              input_type == at::ScalarType::BFloat16);
-  TORCH_CHECK(weight_type == at::ScalarType::Float ||
-              weight_type == at::ScalarType::Half ||
-              weight_type == at::ScalarType::BFloat16);
-  TORCH_CHECK(x.is_xpu());
-  TORCH_CHECK(weight.is_xpu());
-  TORCH_CHECK(dout.is_xpu());
-  TORCH_CHECK(bias_.has_value() == dbias_.has_value());
+  STD_TORCH_CHECK(input_type == ScalarType::Float ||
+              input_type == ScalarType::Half ||
+              input_type == ScalarType::BFloat16);
+  STD_TORCH_CHECK(weight_type == ScalarType::Float ||
+              weight_type == ScalarType::Half ||
+              weight_type == ScalarType::BFloat16);
+  STD_TORCH_CHECK(is_xpu(x));
+  STD_TORCH_CHECK(is_xpu(weight));
+  STD_TORCH_CHECK(is_xpu(dout));
+  STD_TORCH_CHECK(bias_.has_value() == dbias_.has_value());
 
   const auto sizes = x.sizes();
   const int batch_size = sizes[0];
@@ -481,7 +481,7 @@ void causal_conv1d_bwd(const at::Tensor &x, const at::Tensor &weight,
   const int seqlen = sizes[2];
   const int width = weight.size(-1);
 
-  TORCH_CHECK(width >= 2 && width <= kMaxWidth,
+  STD_TORCH_CHECK(width >= 2 && width <= kMaxWidth,
               "causal_conv1d only supports width between 2 and 4");
   CHECK_SHAPE(x, batch_size, dim, seqlen);
   CHECK_SHAPE(weight, dim, width);
@@ -490,19 +490,19 @@ void causal_conv1d_bwd(const at::Tensor &x, const at::Tensor &weight,
 
   // dweight/dbias are accumulated with atomics, so they must be fp32 and
   // zero-initialised by the caller (the Python wrapper does this).
-  TORCH_CHECK(dweight.scalar_type() == at::ScalarType::Float,
+  STD_TORCH_CHECK(dweight.scalar_type() == ScalarType::Float,
               "dweight must be float32 on XPU");
-  TORCH_CHECK(dweight.is_xpu());
+  STD_TORCH_CHECK(is_xpu(dweight));
   if (dbias_.has_value()) {
-    TORCH_CHECK(dbias_.value().scalar_type() == at::ScalarType::Float,
+    STD_TORCH_CHECK(dbias_.value().scalar_type() == ScalarType::Float,
                 "dbias must be float32 on XPU");
-    TORCH_CHECK(dbias_.value().stride(-1) == 1);
+    STD_TORCH_CHECK(dbias_.value().stride(-1) == 1);
     CHECK_SHAPE(dbias_.value(), dim);
   }
   if (seq_idx_.has_value()) {
     const auto &seq_idx = seq_idx_.value();
-    TORCH_CHECK(seq_idx.scalar_type() == torch::kInt32);
-    TORCH_CHECK(seq_idx.is_contiguous());
+    STD_TORCH_CHECK(seq_idx.scalar_type() == ScalarType::Int);
+    STD_TORCH_CHECK(seq_idx.is_contiguous());
     CHECK_SHAPE(seq_idx, batch_size, seqlen);
   }
   if (initial_states_.has_value()) {
@@ -515,8 +515,8 @@ void causal_conv1d_bwd(const at::Tensor &x, const at::Tensor &weight,
     CHECK_SHAPE(dinitial_states_.value(), batch_size, dim, width - 1);
   }
 
-  const c10::DeviceGuard device_guard(x.device());
-  sycl::queue &q = at::xpu::getCurrentXPUStream().queue();
+  const torch::stable::accelerator::DeviceGuard device_guard(x.get_device_index());
+  sycl::queue &q = current_queue(x);
 
   // `dout` plays the role of `out` for stride bookkeeping.
   const ConvStrides p = make_conv_strides(x, weight, dout, batch_size, dim,
@@ -559,20 +559,20 @@ void causal_conv1d_bwd(const at::Tensor &x, const at::Tensor &weight,
       DISPATCH_WIDTH(width, "causal_conv1d_bwd", [&] {
       BwdCommon<kWidth, input_t, weight_t> common{};
       common.p = p;
-      common.x_ptr = x.data_ptr<input_t>();
-      common.weight_ptr = weight.data_ptr<weight_t>();
+      common.x_ptr = x.mutable_data_ptr<input_t>();
+      common.weight_ptr = weight.mutable_data_ptr<weight_t>();
       common.bias_ptr =
-          bias_.has_value() ? bias_.value().data_ptr<weight_t>() : nullptr;
-      common.dout_ptr = dout.data_ptr<input_t>();
+          bias_.has_value() ? bias_.value().mutable_data_ptr<weight_t>() : nullptr;
+      common.dout_ptr = dout.mutable_data_ptr<input_t>();
       common.dout_batch_stride = dout.stride(0);
       common.dout_c_stride = dout.stride(1);
       common.dout_l_stride = dout.stride(2);
       common.seq_idx_ptr = seq_idx_.has_value()
-                               ? seq_idx_.value().data_ptr<int32_t>()
+                               ? seq_idx_.value().mutable_data_ptr<int32_t>()
                                : nullptr;
       common.initial_states_ptr =
           initial_states_.has_value()
-              ? initial_states_.value().data_ptr<input_t>()
+              ? initial_states_.value().mutable_data_ptr<input_t>()
               : nullptr;
       common.initial_states_strides =
           initial_states_.has_value()
@@ -581,7 +581,7 @@ void causal_conv1d_bwd(const at::Tensor &x, const at::Tensor &weight,
 
       const input_t *dfinal_states_ptr =
           dfinal_states_.has_value()
-              ? dfinal_states_.value().data_ptr<input_t>()
+              ? dfinal_states_.value().mutable_data_ptr<input_t>()
               : nullptr;
       const StateStrides dfinal_states_strides =
           dfinal_states_.has_value()
@@ -590,15 +590,15 @@ void causal_conv1d_bwd(const at::Tensor &x, const at::Tensor &weight,
 
       CausalConv1dBwdKernel<kWidth, input_t, weight_t> kernel{};
       kernel.common = common;
-      kernel.dx_ptr = dx.data_ptr<input_t>();
+      kernel.dx_ptr = dx.mutable_data_ptr<input_t>();
       kernel.dx_batch_stride = dx.stride(0);
       kernel.dx_c_stride = dx.stride(1);
       kernel.dx_l_stride = dx.stride(2);
-      kernel.dweight_ptr = dweight.data_ptr<float>();
+      kernel.dweight_ptr = dweight.mutable_data_ptr<float>();
       kernel.dweight_c_stride = dweight.stride(0);
       kernel.dweight_width_stride = dweight.stride(1);
       kernel.dbias_ptr =
-          dbias_.has_value() ? dbias_.value().data_ptr<float>() : nullptr;
+          dbias_.has_value() ? dbias_.value().mutable_data_ptr<float>() : nullptr;
       kernel.dfinal_states_ptr = dfinal_states_ptr;
       kernel.dfinal_states_strides = dfinal_states_strides;
 
@@ -628,10 +628,10 @@ void causal_conv1d_bwd(const at::Tensor &x, const at::Tensor &weight,
       }
 
       if (dinitial_states_.has_value()) {
-        const at::Tensor &dinitial_states = dinitial_states_.value();
+        const Tensor &dinitial_states = dinitial_states_.value();
         CausalConv1dBwdInitialStatesKernel<kWidth, input_t, weight_t> init_kernel{};
         init_kernel.common = common;
-        init_kernel.dinitial_states_ptr = dinitial_states.data_ptr<input_t>();
+        init_kernel.dinitial_states_ptr = dinitial_states.mutable_data_ptr<input_t>();
         init_kernel.dinitial_states_strides =
             make_state_strides(dinitial_states);
         init_kernel.dfinal_states_ptr = dfinal_states_ptr;

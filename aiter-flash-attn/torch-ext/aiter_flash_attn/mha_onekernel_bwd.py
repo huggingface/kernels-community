@@ -51,8 +51,8 @@ def flash_attn_onekernel_backward(
     descale_v: torch.Tensor | None = None,
     descale_do: torch.Tensor | None = None,
     USE_INT64_STRIDES: bool | None = False,
-    sink: torch.Tensor | None = None,
-    dsink: torch.Tensor | None = None,
+    s_aux: torch.Tensor | None = None,
+    ds_aux: torch.Tensor | None = None,
     config: dict[str, any] | None = None,
     sliding_window: int = 0,
 ):
@@ -92,8 +92,8 @@ def flash_attn_onekernel_backward(
         descale_v (Optional[torch.Tensor]): FP8 descaling factor for v.
         descale_do (Optional[torch.Tensor]): FP8 descaling factor for do.
         USE_INT64_STRIDES (Optional[bool]): Use 64-bit stride indexing for large tensors.
-        sink (Optional[torch.Tensor]): Attention sink scores (one per Q head). Shape (num_q_heads,).
-        dsink (Optional[torch.Tensor]): Pre-allocated sink gradient with same shape as sink.
+        s_aux (Optional[torch.Tensor]): Attention sink scores (one per Q head). Shape (num_q_heads,).
+        ds_aux (Optional[torch.Tensor]): Pre-allocated gradient of s_aux with same shape as s_aux.
         config (Optional[Dict[str, any]]): Kernel tuning parameters (preprocess_kernel,
             onekernel, onekernel_pe).
 
@@ -185,14 +185,14 @@ def flash_attn_onekernel_backward(
         IS_FP8 and pe_head_dim == 0
     ), "Positional encoding doesn't support FP8."
 
-    assert (sink is None) or (
-        sink is not None and sink.dim() == 1 and sink.shape[0] == num_q_heads
+    assert (s_aux is None) or (
+        s_aux is not None and s_aux.dim() == 1 and s_aux.shape[0] == num_q_heads
     ), "Sink must be 1D and have one element per query head."
-    assert (dsink is None) or (
-        dsink is not None and dsink.dim() == 1 and dsink.shape[0] == num_q_heads
+    assert (ds_aux is None) or (
+        ds_aux is not None and ds_aux.dim() == 1 and ds_aux.shape[0] == num_q_heads
     ), "Sink gradient must be 1D and have one element per query head."
-    assert (sink is None) == (
-        dsink is None
+    assert (s_aux is None) == (
+        ds_aux is None
     ), "Sink and its gradient must be both present or absent."
 
     # Configs
@@ -266,13 +266,13 @@ def flash_attn_onekernel_backward(
             q,
             k,
             v,
-            sink,
+            s_aux,
             sm_scale,
             do,
             dq,
             dk,
             dv,
-            dsink,
+            ds_aux,
             softmax_lse,
             delta,
             *q_strides,
@@ -314,7 +314,7 @@ def flash_attn_onekernel_backward(
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
-            ENABLE_SINK=sink is not None,
+            ENABLE_SINK=s_aux is not None,
             SLIDING_WINDOW=sliding_window,
             **config_onekernel,
         )
@@ -323,13 +323,13 @@ def flash_attn_onekernel_backward(
             q,
             k,
             v,
-            sink,
+            s_aux,
             sm_scale,
             do,
             dq,
             dk,
             dv,
-            dsink,
+            ds_aux,
             softmax_lse,
             delta,
             *q_strides,
@@ -371,7 +371,7 @@ def flash_attn_onekernel_backward(
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
-            ENABLE_SINK=sink is not None,
+            ENABLE_SINK=s_aux is not None,
             SLIDING_WINDOW=sliding_window,
             **config_onekernel,
         )
