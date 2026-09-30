@@ -2,7 +2,7 @@
   description = "Flake for attention kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/build-non-stable-abi-versions";
+    kernel-builder.url = "github:huggingface/kernels";
   };
 
   outputs =
