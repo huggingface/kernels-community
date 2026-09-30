@@ -78,8 +78,8 @@ def mx_dot_rescale(
     """MX 'dot' step (BK == one scale group): fp8 ``tl.dot`` on E4M3-decoded operands + per-group
     software rescale (both UE8M0 scales decoded here), accumulating into ``acc``. Plain: ``a``
     [BM, BK] x ``w`` [BK, BN] with the weight's per-column scale transposed onto the product (the
-    batched gate_up kernel passes the stacked 2*BN tile — per-column independence keeps that
-    bit-exact). ``SWAP_AB`` (decode): the weight ``w`` [ROWS, BK] is the lhs (E2M1 column-unpacked,
+    batched gate_up kernel passes the INTERLEAVED gate|up 2*BN tile — per-column independence keeps
+    that bit-exact). ``SWAP_AB`` (decode): the weight ``w`` [ROWS, BK] is the lhs (E2M1 column-unpacked,
     K order low nibble first) and the [BK] token padded to the N=16 atom is the rhs — the
     well-shaped fp8 MMA at M=1 (M quantizes to 64/128, N only to 8, so weight rows fill the big
     atom); the weight's per-output-row scale broadcasts down the acc columns and the token's single
@@ -200,8 +200,9 @@ def mx_scalar_reduce(
 ):
     """MX 'scalar' step: CUDA-core FMA GEMV, unpacking MXFP4 to fp32 and dequantizing activation +
     weight by their group scales, reducing over K into ``acc``. No tensor core (so no M->16 MMA
-    pad) — wins the memory-bound decode GEMV (M=1). The gate_up kernels pass the stacked gate|up
-    tile (ROWS_W = 2*BN). The UE8M0 scale is constant within each ``SCALE_GROUP_K`` group, so it
+    pad) — wins the memory-bound decode GEMV (M=1). The gate_up kernels pass the INTERLEAVED
+    gate|up tile (gate even, up odd; ROWS_W = 2*BN). The UE8M0 scale is constant within each
+    ``SCALE_GROUP_K`` group, so it
     factors out of the inner sum: reduce the raw products per group, then apply ONE combined
     (act x weight) scale per group — ``SCALE_GROUP_K``x fewer scale-muls (~18% faster, bit-identical
     to the expanded form). Plain: ``a`` [BM, BK] against ``w`` [BK, ROWS_W]. ``SWAP_AB`` (decode):
@@ -242,7 +243,7 @@ def mx_compute(
     column-unpack it losslessly). The acc shapes diverge across modes and orientations, but only
     the taken constexpr branch compiles, so the single return never has to unify them.
     ``BLOCK_SIZE_N`` is the weight tile's row count — the gate_up kernels pass ``2*BN`` with the
-    stacked gate|up tile (split back via ``split_gate_up``): one load and one MMA for both
+    INTERLEAVED gate|up tile (gate on even rows, up on odd; split back via ``split_gate_up``): one load and one MMA for both
     projections keeps the native microscaled-MMA M=128 operand at BN=64, doubling the CTAs on the
     parallelism-starved decode grid (dsv4 gate_up 1.34x, bit-exact)."""
     if SWAP_AB:

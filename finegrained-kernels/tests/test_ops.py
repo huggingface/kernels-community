@@ -39,6 +39,7 @@ from utils import (  # type: ignore
     DTYPE_TO_TOL,
     REQUANT_FN,
     REQUANT_GROUP,
+    SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
     dq_grouped,
@@ -474,6 +475,8 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
         Bs_global = Bs_global[:1] if Bs_global is not None else None
     # weight-scale swizzle, shared by all three ops — a pure layout change (values unchanged),
     # so the op's result still matches the affine-Bs reference.
+    if problem.swizzled and not SUPPORTS_SWIZZLED_SCALES:
+        pytest.skip("the SWIZZLE_32_4_4 scale layout is the tcgen05 fast path (CUDA-only)")
     bs = swizzle_mx_scales(Bs) if problem.swizzled and Bs is not None else Bs
     globals_kw = dict(a_global_scale=As_global, b_global_scale=Bs_global)
     if op == "matmul":
@@ -602,7 +605,7 @@ def _skip_moe_only(problem: Problem, op: str) -> None:
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("op", ["batched", "grouped", "matmul"])
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_op_scenarios(problem: Problem, op):
@@ -684,7 +687,7 @@ _SWEEP_CELLS = [
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize(
     "problem, op, kernel_name",
     _SWEEP_CELLS,
