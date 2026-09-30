@@ -9,8 +9,12 @@ on:
       - main
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   test-mapping:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository

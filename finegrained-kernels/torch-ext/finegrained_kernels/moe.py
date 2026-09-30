@@ -53,8 +53,8 @@ from .compat import (
     ScalingType,
     SwizzleType,
     compile_time_only_triton_wrap,
-    decode_pdl,
     device_context,
+    pdl_launch_kwargs,
 )
 from .formats import get_supported_act_fns, is_mx, is_mxfp4, weight_format
 from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
@@ -187,8 +187,7 @@ def weighted_reduce(
             NUM_EXPERTS=num_experts,
             NORM=norm,
             SIMULATE_UNFUSED=simulate_unfused,
-            PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
     return reduced
 

@@ -15,15 +15,17 @@ on:
         required: false
         type: string
 
-permissions:
-  actions: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   validate:
+    permissions:
+      contents: read
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     outputs:
@@ -61,6 +63,9 @@ jobs:
           echo "kernel=$KERNEL"
 
   dispatch:
+    permissions:
+      actions: write
+      contents: read
     needs: validate
     if: needs.validate.outputs.skip == 'false'
     runs-on: ubuntu-latest

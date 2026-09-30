@@ -5,16 +5,18 @@ on:
   pull_request_target:
     types: [opened, reopened, ready_for_review]
 
-permissions:
-  contents: read
-  pull-requests: read
 
 concurrency:
   group: pr-maintainer-ping-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
+permissions: {}
+
 jobs:
   ping:
+    permissions:
+      contents: read
+      pull-requests: read
     name: Notify maintainers
     runs-on: ubuntu-latest
     steps:

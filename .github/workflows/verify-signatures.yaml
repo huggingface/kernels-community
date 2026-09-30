@@ -6,11 +6,13 @@ on:
   schedule:
     - cron: "0 0 * * *" # Daily at midnight UTC
 
-permissions:
-  contents: read
+
+permissions: {}
 
 jobs:
   verify-kernels:
+    permissions:
+      contents: read
     runs-on:
       group: aws-highmemory-32-plus-nix
     timeout-minutes: 1200 # 20h

@@ -14,8 +14,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.workflow_run.id || github.run_id }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   benchmark:
+    permissions:
+      actions: read
+      contents: read
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on:
       group: aws-g6-12xlarge-plus

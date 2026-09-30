@@ -58,9 +58,6 @@ on:
         type: string
         default: ""
 
-permissions:
-  contents: read
-  statuses: write
 
 # These build workflows are reachable only via workflow_dispatch, so `github.head_ref`
 # is always empty and the group used to collapse to `github.run_id` -- unique per run,
@@ -74,9 +71,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ inputs.pr_number || github.run_id }}-${{ inputs.kernel_name }}-upload-${{ inputs.upload }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   # Validate inputs, resolve the kernel directory, and generate the build matrix.
   setup:
+    permissions:
+      contents: read
+      statuses: write
     runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.validate.outputs.skip }}
@@ -333,6 +335,8 @@ jobs:
   # so the GPU test job can import it on a GPU-enabled runner.
   # `stage` uploads like `release` but tests too, so the tests run post-upload.
   build-ci-test:
+    permissions:
+      contents: read
     needs: setup
     if: needs.setup.outputs.skip == 'false' && (inputs.mode == 'pr' || inputs.mode == 'stage')
     runs-on:
@@ -396,6 +400,7 @@ jobs:
   # Import the ci-test closure onto a GPU runner and execute the test suite.
   # Runs after both build-kernel and build-ci-test complete.
   test-kernel-gpu:
+    permissions: {}
     needs: [setup, build-kernel, build-ci-test]
     if: needs.setup.outputs.skip == 'false' && (inputs.mode == 'pr' || inputs.mode == 'stage')
     runs-on:
