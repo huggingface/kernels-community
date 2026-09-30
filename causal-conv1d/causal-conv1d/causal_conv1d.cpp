@@ -26,7 +26,7 @@ extern "C" AOTITorchError aoti_torch_get_current_cuda_stream(
 using torch::stable::Tensor;
 using torch::headeronly::ScalarType;
 
-#define CHECK_SHAPE(x, ...) STD_TORCH_CHECK(x.sizes() == torch::headeronly::IntHeaderOnlyArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+#define CHECK_SHAPE(x, ...) STD_TORCH_CHECK(x.sizes().equals(torch::headeronly::IntHeaderOnlyArrayRef({__VA_ARGS__})), #x " must have shape (" #__VA_ARGS__ ")")
 
 #define DISPATCH_ITYPE_FLOAT_AND_HALF_AND_BF16(ITYPE, NAME, ...)                     \
     THO_DISPATCH_SWITCH(ITYPE, NAME,                                                 \
