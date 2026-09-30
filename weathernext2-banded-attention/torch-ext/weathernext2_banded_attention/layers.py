@@ -8,7 +8,6 @@ import torch
 from torch import nn
 
 from .banded_attention import banded_attention
-from .graph import WeatherNext2BipartiteGraphNetwork as WeatherNext2BipartiteGraphNetwork
 from .grid import WeatherNext2ForecastHead as WeatherNext2ForecastHead
 from .grid import WeatherNext2GridEncoder as WeatherNext2GridEncoder
 
