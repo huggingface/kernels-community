@@ -17,10 +17,15 @@
  * limitations under the License.
  */
 
-#include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
 #include <algorithm>
+#include <optional>
+#include <string>
+
+#include "../stable_utils.h"
 
 #include "attention_dtypes.h"
 #include "attention_utils.cuh"
