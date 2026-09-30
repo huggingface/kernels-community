@@ -213,7 +213,7 @@ def test_paged_attention(
         )
 
         opcheck(
-            ops.ops.paged_attention_v1,
+            ops._private_for_testing.ops.paged_attention_v1,
             (
                 output,
                 query,
@@ -277,7 +277,7 @@ def test_paged_attention(
             )
 
             opcheck(
-                ops.ops.paged_attention_v2,
+                ops._private_for_testing.ops.paged_attention_v2,
                 (
                     output,
                     exp_sums,

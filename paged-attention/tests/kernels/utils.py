@@ -93,7 +93,7 @@ def opcheck(
 @lru_cache(maxsize=None)
 def get_max_shared_memory_bytes(gpu: int = 0) -> int:
     """Returns the maximum shared memory per thread block in bytes."""
-    max_shared_mem = paged_attention.ops.get_max_shared_memory_per_block_device_attribute(gpu)
+    max_shared_mem = paged_attention._private_for_testing.ops.get_max_shared_memory_per_block_device_attribute(gpu)
     # value 0 will cause MAX_SEQ_LEN become negative and test_attention.py
     # will fail
     assert max_shared_mem > 0, "max_shared_mem can not be zero"

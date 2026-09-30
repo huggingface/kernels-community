@@ -102,7 +102,7 @@ def test_copy_blocks(
     ).view(-1, 2)
 
     opcheck(
-        ops.ops.copy_blocks,
+        ops._private_for_testing.ops.copy_blocks,
         (key_caches, value_caches, block_mapping_tensor),
         test_utils=DEFAULT_OPCHECK_TEST_UTILS,
         cond=(head_size == HEAD_SIZES[0]),
@@ -188,7 +188,7 @@ def test_reshape_and_cache(
 
     # Call the reshape_and_cache kernel.
     opcheck(
-        ops.ops.reshape_and_cache,
+        ops._private_for_testing.ops.reshape_and_cache,
         (
             key,
             value,
@@ -310,7 +310,7 @@ def test_reshape_and_cache_flash(
 
     # Call the reshape_and_cache kernel.
     opcheck(
-        ops.ops.reshape_and_cache_flash,
+        ops._private_for_testing.ops.reshape_and_cache_flash,
         (
             key,
             value,
@@ -446,12 +446,12 @@ def test_swap_blocks(
     # Call the swap_blocks kernel.
     do_opcheck = head_size == HEAD_SIZES[0]
     opcheck(
-        ops.ops.swap_blocks,
+        ops._private_for_testing.ops.swap_blocks,
         (src_key_caches[0], dist_key_caches[0], block_mapping_tensor),
         cond=do_opcheck,
     )
     opcheck(
-        ops.ops.swap_blocks,
+        ops._private_for_testing.ops.swap_blocks,
         (src_value_caches[0], dist_value_caches[0], block_mapping_tensor),
         cond=do_opcheck,
     )
