@@ -8,7 +8,7 @@ import torch
 from .allclose_default import get_default_atol, get_default_rtol
 from .utils import get_max_shared_memory_bytes, opcheck
 
-ops = kernels.get_kernel("kernels-community/paged-attention", version=1)
+ops = kernels.get_kernel("kernels-community/paged-attention", version=2)
 current_platform = ops.platforms.current_platform
 
 FLOAT32_BYTES = torch.finfo(torch.float).bits // 8

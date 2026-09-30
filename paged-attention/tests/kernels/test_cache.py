@@ -7,7 +7,7 @@ import torch
 
 from .utils import DEFAULT_OPCHECK_TEST_UTILS, opcheck
 
-ops = kernels.get_kernel("kernels-community/paged-attention", version=1)
+ops = kernels.get_kernel("kernels-community/paged-attention", version=2)
 current_platform = ops.platforms.current_platform
 
 COPYING_DIRECTION = [("gpu", "cpu"), ("gpu", "gpu"), ("cpu", "gpu")]

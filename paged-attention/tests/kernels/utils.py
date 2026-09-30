@@ -12,7 +12,7 @@ import pytest
 import torch
 from torch._prims_common import TensorLikeType
 
-paged_attention = kernels.get_kernel("kernels-community/paged-attention", version=1)
+paged_attention = kernels.get_kernel("kernels-community/paged-attention", version=2)
 
 # For now, disable "test_aot_dispatch_dynamic" since there are some
 # bugs related to this test in PyTorch 2.4.
