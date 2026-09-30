@@ -67,6 +67,31 @@ wrong, only unaccelerated. `attn_implementation="flex_attention"` is unsupported
 hands the layer a `BlockMask`, which neither path can read, so it raises rather than
 quietly dropping the mask.
 
+## Blocked grid and graph networks
+
+The graph chunking approach is inspired by
+[Faster-WeatherNext](https://github.com/Raymondlol/Faster-WeatherNext),
+with an independent PyTorch implementation here.
+
+Version 2 also exports `WeatherNext2BipartiteGraphNetwork`, an inference forward
+replacement that reuses the layer's weights. Mesh-to-grid processes 32,768 grid
+points at a time; grid-to-mesh streams 65,536 edges at a time into an fp32 mesh
+accumulator and normalizes only after all edges. Both avoid the all-edge message
+allocation. This is PyTorch graph blocking, not a new fused Triton operator.
+
+The optimized paths require fp32 inputs. Mesh-to-grid additionally requires three
+consecutive incoming edges per grid point; other decoder layouts retain the
+original class forward. Training, autocast and lower precision also retain the
+original forward. This replacement must be bound to an existing graph layer
+rather than instantiated as a standalone module.
+
+`WeatherNext2GridEncoder` and `WeatherNext2ForecastHead` also process grid points
+in blocks of 32,768. The encoder constructs inputs per block and fuses conditioning
+and output writes in Triton; the head fuses shifted-sigmoid selection and output
+writes. Matrix multiplications and LayerNorm use PyTorch's backend. These inference
+replacements retain the original forwards for training, autocast and
+lower-precision weights, and use PyTorch epilogues on CPU.
+
 ## Validation
 
 `tests/` checks the kernel against an fp32 sdpa reference across block counts and band

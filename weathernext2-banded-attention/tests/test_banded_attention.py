@@ -7,7 +7,7 @@ import kernels
 
 
 weathernext2_banded_attention = kernels.get_kernel(
-    "kernels-community/weathernext2-banded-attention", version=1
+    "kernels-community/weathernext2-banded-attention", version=2
 )
 WeatherNext2Attention = weathernext2_banded_attention.WeatherNext2Attention
 banded_attention = weathernext2_banded_attention.banded_attention
