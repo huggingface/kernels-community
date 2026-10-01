@@ -373,6 +373,9 @@ def banded_attention(
         )
     if mask.shape != (num_blocks, block_size, 3 * block_size):
         raise ValueError(f"mask is {tuple(mask.shape)}, expected {(num_blocks, block_size, 3 * block_size)}")
+    if isinstance(mask, PreparedMask) and mask.packed is None:
+        # Without the packed words there is no mask left to read: the dense one was not kept.
+        raise ValueError("a PreparedMask needs its packed mask; build it with `packed_mask=True`")
 
     query, key, value = (t.reshape(batch * num_blocks, heads, block_size, head_dim) for t in (query, key, value))
     out = torch.empty(query.shape, dtype=query.dtype, device=query.device)
@@ -386,7 +389,7 @@ def banded_attention(
         tiles, counts, offsets = None, None, None
         if isinstance(mask, PreparedMask):
             prepared = mask
-            sparse_tiles, packed_mask = True, prepared.packed is not None
+            sparse_tiles, packed_mask = True, True
             mask = prepared.packed
         elif sparse_tiles or packed_mask:
             prepared = _prepare_mask(mask, sparse_tiles or packed_mask, packed_mask)
