@@ -20,6 +20,7 @@
   "flash-attn4": [],
   "flash-mla": [],
   "fp8-fbgemm": [],
+  "gemma-quant-kernels": [],
   "ggml-gated-delta-net": ["U0586KAH2E9"],
   "ggml-attn": ["U0586KAH2E9"],
   "ggml-norm": ["U0586KAH2E9"],
