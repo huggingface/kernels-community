@@ -3,9 +3,11 @@
 
 import numpy as np
 import pytest
+import kernels
 import torch
 
-from megablocks import ops
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=2)
+ops = megablocks._private_for_testing.ops
 
 TOPOLOGY_TESTS = (
     (1024, 1536, 2),

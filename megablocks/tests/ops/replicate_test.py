@@ -5,12 +5,11 @@ import numpy as np
 import pytest
 import torch
 
-try:
-    from megablocks._ops import ops as backend  # type: ignore
-except ModuleNotFoundError as e:
-    raise ModuleNotFoundError("No module named 'megablocks_ops'.") from e
+import kernels
 
-from megablocks import ops
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=2)
+backend = megablocks._private_for_testing.compiled_ops
+ops = megablocks._private_for_testing.ops
 
 
 def promote_scalar(x: torch.Tensor) -> torch.Tensor:

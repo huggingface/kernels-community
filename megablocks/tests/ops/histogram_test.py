@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
+import kernels
 import torch
 
-from megablocks import ops
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=2)
+ops = megablocks._private_for_testing.ops
 
 _HISTOGRAM_TESTS = (
     (1, 32, torch.int16, 128),

@@ -1,10 +1,12 @@
 # Copyright 2024 Databricks
 # SPDX-License-Identifier: Apache-2.0
 
+import kernels
 import torch
 import torch.nn.functional as F
 
-from megablocks._layers.arguments import Arguments
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=2)
+Arguments = megablocks.Arguments
 
 
 class FFN(torch.nn.Module):
