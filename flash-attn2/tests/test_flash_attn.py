@@ -1,20 +1,23 @@
 import math
 
+import kernels
 import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from flash_attn2 import (
-    flash_attn_func,
-    flash_attn_kvpacked_func,
-    flash_attn_qkvpacked_func,
-    flash_attn_varlen_func,
-    flash_attn_varlen_kvpacked_func,
-    flash_attn_varlen_qkvpacked_func,
-    flash_attn_with_kvcache,
-)
-from flash_attn2.bert_padding import pad_input, unpad_input
-from flash_attn2.flash_attn_interface import _get_block_size_n
+
+from .bert_padding import pad_input, unpad_input
+
+flash_attn2 = kernels.get_kernel("kernels-community/flash-attn2", version=3)
+
+flash_attn_func = flash_attn2.flash_attn_func
+flash_attn_kvpacked_func = flash_attn2.flash_attn_kvpacked_func
+flash_attn_qkvpacked_func = flash_attn2.flash_attn_qkvpacked_func
+flash_attn_varlen_func = flash_attn2.flash_attn_varlen_func
+flash_attn_varlen_kvpacked_func = flash_attn2.flash_attn_varlen_kvpacked_func
+flash_attn_varlen_qkvpacked_func = flash_attn2.flash_attn_varlen_qkvpacked_func
+flash_attn_with_kvcache = flash_attn2.flash_attn_with_kvcache
+_get_block_size_n = flash_attn2.flash_attn_interface._get_block_size_n
 
 
 MAX_HEADDIM_SM8x = 192

@@ -1,19 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Dict
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
-from .utils.types import _is_fp8
-from .utils.logger import AiterTritonLogger
 
 from ._kernels.mha_onekernel_bwd import (
     _bwd_preprocess,
+    _get_config,
     bwd_kernel_causal,
     bwd_kernel_noncausal,
-    _get_config,
 )
+from .utils.logger import AiterTritonLogger
+from .utils.types import _is_fp8
 
 _LOGGER = AiterTritonLogger()
 
@@ -38,23 +37,23 @@ def flash_attn_onekernel_backward(
     dv: torch.Tensor,
     dbias: torch.Tensor,
     sm_scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     causal: bool,
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
-    philox_seed: Optional[int] = 0,
-    philox_offset: Optional[int] = 0,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
-    USE_INT64_STRIDES: Optional[bool] = False,
-    sink: Optional[torch.Tensor] = None,
-    dsink: Optional[torch.Tensor] = None,
-    config: Optional[Dict[str, any]] = None,
+    philox_seed: int | None = 0,
+    philox_offset: int | None = 0,
+    descale_q: torch.Tensor | None = None,
+    descale_k: torch.Tensor | None = None,
+    descale_v: torch.Tensor | None = None,
+    descale_do: torch.Tensor | None = None,
+    USE_INT64_STRIDES: bool | None = False,
+    s_aux: torch.Tensor | None = None,
+    ds_aux: torch.Tensor | None = None,
+    config: dict[str, any] | None = None,
     sliding_window: int = 0,
 ):
     """
@@ -93,8 +92,8 @@ def flash_attn_onekernel_backward(
         descale_v (Optional[torch.Tensor]): FP8 descaling factor for v.
         descale_do (Optional[torch.Tensor]): FP8 descaling factor for do.
         USE_INT64_STRIDES (Optional[bool]): Use 64-bit stride indexing for large tensors.
-        sink (Optional[torch.Tensor]): Attention sink scores (one per Q head). Shape (num_q_heads,).
-        dsink (Optional[torch.Tensor]): Pre-allocated sink gradient with same shape as sink.
+        s_aux (Optional[torch.Tensor]): Attention sink scores (one per Q head). Shape (num_q_heads,).
+        ds_aux (Optional[torch.Tensor]): Pre-allocated gradient of s_aux with same shape as s_aux.
         config (Optional[Dict[str, any]]): Kernel tuning parameters (preprocess_kernel,
             onekernel, onekernel_pe).
 
@@ -133,14 +132,14 @@ def flash_attn_onekernel_backward(
             stride_descale_do_z,
         )
 
-    IS_VARLEN = True if cu_seqlens_q is not None else False
+    IS_VARLEN = cu_seqlens_q is not None
 
     # get strides and shape
     if IS_VARLEN:
         # Layout is thd.
         # q and k are [total_tokens, num_head, head_dim_qk].
         # v is [total_tokens, num_head, head_dim_v].
-        batch, seqlen_q, num_q_heads = (
+        batch, _seqlen_q, num_q_heads = (
             len(cu_seqlens_q) - 1,
             max_seqlen_q,
             q.shape[1],
@@ -159,7 +158,7 @@ def flash_attn_onekernel_backward(
         # Layout is bshd.
         # q and k are [batch, seq_len, num_head, head_dim_qk].
         # v is [batch, seq_len, num_head, head_dim_v]
-        batch, seqlen_q, num_q_heads = q.shape[:-1]
+        batch, _seqlen_q, num_q_heads = q.shape[:-1]
         _, num_k_heads = k.shape[1], k.shape[2]
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
         k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
@@ -186,14 +185,14 @@ def flash_attn_onekernel_backward(
         IS_FP8 and pe_head_dim == 0
     ), "Positional encoding doesn't support FP8."
 
-    assert (sink is None) or (
-        sink is not None and sink.dim() == 1 and sink.shape[0] == num_q_heads
+    assert (s_aux is None) or (
+        s_aux is not None and s_aux.dim() == 1 and s_aux.shape[0] == num_q_heads
     ), "Sink must be 1D and have one element per query head."
-    assert (dsink is None) or (
-        dsink is not None and dsink.dim() == 1 and dsink.shape[0] == num_q_heads
+    assert (ds_aux is None) or (
+        ds_aux is not None and ds_aux.dim() == 1 and ds_aux.shape[0] == num_q_heads
     ), "Sink gradient must be 1D and have one element per query head."
-    assert (sink is None) == (
-        dsink is None
+    assert (s_aux is None) == (
+        ds_aux is None
     ), "Sink and its gradient must be both present or absent."
 
     # Configs
@@ -267,13 +266,13 @@ def flash_attn_onekernel_backward(
             q,
             k,
             v,
-            sink,
+            s_aux,
             sm_scale,
             do,
             dq,
             dk,
             dv,
-            dsink,
+            ds_aux,
             softmax_lse,
             delta,
             *q_strides,
@@ -315,7 +314,7 @@ def flash_attn_onekernel_backward(
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
-            ENABLE_SINK=sink is not None,
+            ENABLE_SINK=s_aux is not None,
             SLIDING_WINDOW=sliding_window,
             **config_onekernel,
         )
@@ -324,13 +323,13 @@ def flash_attn_onekernel_backward(
             q,
             k,
             v,
-            sink,
+            s_aux,
             sm_scale,
             do,
             dq,
             dk,
             dv,
-            dsink,
+            ds_aux,
             softmax_lse,
             delta,
             *q_strides,
@@ -372,7 +371,7 @@ def flash_attn_onekernel_backward(
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
-            ENABLE_SINK=sink is not None,
+            ENABLE_SINK=s_aux is not None,
             SLIDING_WINDOW=sliding_window,
             **config_onekernel,
         )

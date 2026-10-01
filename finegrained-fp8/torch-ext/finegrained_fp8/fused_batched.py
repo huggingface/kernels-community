@@ -34,6 +34,7 @@ from .utils import (
     device_context,
     fp8_act_quant_inline,
     get_mxfp_autotuning_configs,
+    grf_config_pruner,
     is_mxfp,
     is_mxfp4,
     mxfp_act_quant_inline,
@@ -67,6 +68,13 @@ from .bayesian_autotuner import bayesian_autotune
     # batch size — a config tuned at S=8 is wrong at S=256 (GPU unsaturated at S=8). The
     # constexpr dims auto-partition the cache, so they don't need to be in the key.
     key=["num_routed_tokens"],
+    # gate_up holds 2 fp32 accumulators + 2 weight tiles; skip configs that spill past
+    # the XPU large-GRF recompile (XPU-only, no-op elsewhere).
+    prune_configs_by={
+        "early_config_prune": grf_config_pruner(
+            n_accumulators=2, n_weight_tiles=2, weight_reg_factor=1.65
+        )
+    },
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
@@ -188,6 +196,11 @@ def w8a8_block_dynamic_fp8_moe_batched_gate_up_kernel(
         for s in [2, 3, 4, 5, 6]
     ],
     key=["num_routed_tokens"],
+    # single accumulator + single weight tile; prunes configs that spill past the
+    # XPU large-GRF recompile (XPU-only, no-op elsewhere).
+    prune_configs_by={
+        "early_config_prune": grf_config_pruner(n_accumulators=1, n_weight_tiles=1)
+    },
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
@@ -208,43 +221,43 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
     NUM_EXPERTS: tl.constexpr,
     HIDDEN_DIM: tl.constexpr,
     INTERMEDIATE_DIM: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,  # intermediate (contraction) tile
+    BLOCK_SIZE_N: tl.constexpr,  # hidden output tile
     BLOCK_SIZE_M: tl.constexpr,
     NUM_N_TILES: tl.constexpr,
     SIMULATE_UNFUSED: tl.constexpr,
 ):
-    """Batched kernel 2: fp8 intermediate → down proj → output. Grid: (S, H-tiles)."""
+    """Batched kernel 2: fp8 intermediate → down proj → output. Grid: (S, N-tiles)."""
     batch_id = tl.program_id(axis=0)
-    pid_h = tl.program_id(axis=1)
+    pid_n = tl.program_id(axis=1)
 
     expert_id = tl.load(ExpertIds + batch_id).to(tl.int64)
     # EP sentinel: row routed to a non-local expert. The program is already launched, so
     # write its zero tile here (skipping the weight load) — cheaper than a host-side mask
     # pass, and it leaves the output fully defined for a plain top-k sum.
     if expert_id >= NUM_EXPERTS:
-        z = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_H), dtype=tl.float32)
-        store_row(Out + batch_id * HIDDEN_DIM, z, pid_h, 1, BLOCK_SIZE_M, BLOCK_SIZE_H)
+        z = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        store_row(Out + batch_id * HIDDEN_DIM, z, pid_n, 1, BLOCK_SIZE_M, BLOCK_SIZE_N)
         return
 
     w_down_ptr = (
         Down
         + expert_id * stride_down_e
-        + tl.arange(0, BLOCK_SIZE_N)[:, None] * stride_down_k
-        + (pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H))[None, :] * stride_down_n
+        + tl.arange(0, BLOCK_SIZE_K)[:, None] * stride_down_k
+        + (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))[None, :] * stride_down_n
     )
     inter_ptr = (
         Intermediate
         + (batch_id + tl.arange(0, BLOCK_SIZE_M))[:, None] * INTERMEDIATE_DIM
-        + tl.arange(0, BLOCK_SIZE_N)[None, :]
+        + tl.arange(0, BLOCK_SIZE_K)[None, :]
     )
     inter_s_ptr = (
         IntermediateScale
         + (batch_id + tl.arange(0, BLOCK_SIZE_M))[:, None] * NUM_N_TILES
     )
-    ws_down_ptr = DownScale + expert_id * stride_downs_e + pid_h * stride_downs_n
+    ws_down_ptr = DownScale + expert_id * stride_downs_e + pid_n * stride_downs_n
 
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_H), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     for _ in range(0, NUM_N_TILES):
         inter = tl.load(inter_ptr)
@@ -252,16 +265,16 @@ def w8a8_block_dynamic_fp8_moe_batched_down_kernel(
         w_s_down = tl.load(ws_down_ptr)
         w_down = tl.load(w_down_ptr)
         acc += tl.dot(inter, w_down) * inter_s * w_s_down
-        inter_ptr += BLOCK_SIZE_N
+        inter_ptr += BLOCK_SIZE_K
         inter_s_ptr += 1
         ws_down_ptr += stride_downs_k
-        w_down_ptr += BLOCK_SIZE_N * stride_down_k
+        w_down_ptr += BLOCK_SIZE_K * stride_down_k
 
     if SIMULATE_UNFUSED:
         acc = acc.to(Out.dtype.element_ty).to(tl.float32)
 
     acc = acc * tl.load(SampleWeights + batch_id)
-    store_row(Out + batch_id * HIDDEN_DIM, acc, pid_h, 1, BLOCK_SIZE_M, BLOCK_SIZE_H)
+    store_row(Out + batch_id * HIDDEN_DIM, acc, pid_n, 1, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
 @triton_op(
@@ -357,8 +370,8 @@ def _w8a8_block_dynamic_fp8_moe_batched(
             NUM_EXPERTS=NUM_EXPERTS,
             HIDDEN_DIM=HIDDEN_DIM,
             INTERMEDIATE_DIM=INTERMEDIATE_DIM,
+            BLOCK_SIZE_K=BLOCK_SIZE_N,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_H=BLOCK_SIZE_N,
             BLOCK_SIZE_M=DECODE_BLOCK_SIZE_M,
             NUM_N_TILES=NUM_N_TILES,
             SIMULATE_UNFUSED=simulate_unfused,
@@ -432,6 +445,11 @@ def w8a8_block_dynamic_fp8_moe_batched(
     get_mxfp_autotuning_configs(),
     ["num_routed_tokens"],
     n_trials=60,
+    # gate_up holds 2 fp32 accumulators + 2 weight tiles; skip the dot_scaled tiles that spill
+    # even after the XPU large-GRF recompile (XPU-only, no-op elsewhere).
+    prune_configs_by={
+        "early_config_prune": grf_config_pruner(n_accumulators=2, n_weight_tiles=2)
+    },
 )
 @triton.jit
 def mxfp_dynamic_moe_batched_gate_up_kernel(
@@ -580,6 +598,11 @@ def mxfp_dynamic_moe_batched_gate_up_kernel(
     get_mxfp_autotuning_configs(),
     ["num_routed_tokens"],
     n_trials=60,
+    # down holds 1 fp32 accumulator + 1 weight tile; skip the dot_scaled tiles that spill even
+    # after the XPU large-GRF recompile (XPU-only, no-op elsewhere).
+    prune_configs_by={
+        "early_config_prune": grf_config_pruner(n_accumulators=1, n_weight_tiles=1)
+    },
 )
 @triton.jit
 def mxfp_dynamic_moe_batched_down_kernel(

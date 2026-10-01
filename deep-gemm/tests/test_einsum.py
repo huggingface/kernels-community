@@ -1,16 +1,20 @@
 import random
 import torch
 
-import deep_gemm
-from deep_gemm.testing import (
-    bench_kineto,
-    calc_diff, count_bytes,
-    get_arch_major, test_filter
-)
-from deep_gemm.utils.math import (
-    ceil_div,
-    per_block_cast_to_fp8, per_channel_cast_to_fp8, per_token_cast_to_fp8
-)
+import kernels
+
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+
+bench_kineto = deep_gemm.testing.bench_kineto
+calc_diff = deep_gemm.testing.calc_diff
+count_bytes = deep_gemm.testing.count_bytes
+get_arch_major = deep_gemm.testing.get_arch_major
+test_filter = deep_gemm.testing.test_filter
+
+ceil_div = deep_gemm.utils.math.ceil_div
+per_block_cast_to_fp8 = deep_gemm.utils.math.per_block_cast_to_fp8
+per_channel_cast_to_fp8 = deep_gemm.utils.math.per_channel_cast_to_fp8
+per_token_cast_to_fp8 = deep_gemm.utils.math.per_token_cast_to_fp8
 
 
 def test_bmk_bnk_mn() -> None:

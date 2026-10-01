@@ -1,18 +1,27 @@
 [general]
 name = "causal-conv1d"
-version = 1
+version = 2
+edition = 5
 license = "BSD-3-Clause"
-backends = ["cuda"]
+backends = [
+    "cuda",
+    "xpu",
+]
 
 [general.hub]
 repo-id = "kernels-community/causal-conv1d"
 
 [torch]
 src = [
-    "torch-ext/pytorch_shim.h",
     "torch-ext/torch_binding.cpp",
     "torch-ext/torch_binding.h",
 ]
+
+[torch.stable-abi]
+cuda = "2.10"
+# `torch_stream_native_handle`, which we need to get the SYCL queue is only
+# available in Torch 2.13 and later.
+xpu = "2.13"
 
 [kernel.causal_conv1d]
 backend = "cuda"
@@ -26,4 +35,16 @@ src = [
     "causal-conv1d/causal_conv1d.h",
     "causal-conv1d/causal_conv1d_update.cu",
     "causal-conv1d/static_switch.h",
+]
+
+[kernel.causal_conv1d_xpu]
+backend = "xpu"
+depends = ["torch"]
+include = ["causal-conv1d-xpu"]
+src = [
+    "causal-conv1d-xpu/causal_conv1d_xpu_bwd.cpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_common.hpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_fwd.cpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu.hpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_update.cpp",
 ]

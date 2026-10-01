@@ -15,22 +15,24 @@ on:
         required: false
         type: string
 
-permissions:
-  actions: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   validate:
+    permissions:
+      contents: read
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.validate.outputs.skip }}
       kernel: ${{ steps.validate.outputs.kernel }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Validate kernel directory
         id: validate
         env:
@@ -61,11 +63,14 @@ jobs:
           echo "kernel=$KERNEL"
 
   dispatch:
+    permissions:
+      actions: write
+      contents: read
     needs: validate
     if: needs.validate.outputs.skip == 'false'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Dispatch release workflows
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

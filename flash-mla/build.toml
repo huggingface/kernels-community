@@ -1,6 +1,7 @@
 [general]
 name = "flash-mla"
 version = 1
+edition = 5
 license = "MIT"
 backends = ["cuda"]
 

@@ -34,6 +34,7 @@ from .utils import (
     fp8_act_quant_inline,
     get_accelerator_autotuning_configs,
     get_mxfp_autotuning_configs,
+    grf_config_pruner,
     is_mxfp,
     is_tensor_wide,
     e2m1_as_uint8,
@@ -97,6 +98,9 @@ def store_row(
 @triton.autotune(
     configs=get_accelerator_autotuning_configs(),
     key=["N", "K", "S"],
+    prune_configs_by={
+        "early_config_prune": grf_config_pruner(n_accumulators=1, n_weight_tiles=1)
+    },
 )
 @triton.jit
 def w8a8_block_dynamic_fp8_matmul_batched_kernel(
@@ -226,7 +230,16 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     store_row(C, accumulator, pid_n, stride_cn, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
-@bayesian_autotune(get_mxfp_autotuning_configs(), ["N", "K", "S"], n_trials=60)
+@bayesian_autotune(
+    get_mxfp_autotuning_configs(),
+    ["N", "K", "S"],
+    n_trials=60,
+    # single accumulator + single expert weight tile; prunes dot/dot_scaled/scalar configs
+    # whose per-thread register footprint spills past the large-GRF recompile
+    prune_configs_by={
+        "early_config_prune": grf_config_pruner(n_accumulators=1, n_weight_tiles=1)
+    },
+)
 @triton.jit
 def mxfp_dynamic_matmul_batched_kernel(
     A,  # (S, K) raw BF16/FP16 activations

@@ -66,7 +66,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kNWarps = Kernel_traits::kNWarps;
 
-    auto seed_offset = at::cuda::philox::unpack(params.philox_args);
+    auto seed_offset = FLASH_NAMESPACE::philox_compat::unpack(params.philox_args);
     FLASH_NAMESPACE::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
                            bidb, bidh, tidx, params.h);
 

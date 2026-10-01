@@ -5,7 +5,7 @@ import math
 import random
 from typing import Type
 
-import activation
+import kernels
 import pytest
 import torch
 import torch.nn.functional as F
@@ -13,11 +13,25 @@ import torch.nn.functional as F
 from .utils import opcheck
 from .allclose_default import get_default_atol, get_default_rtol
 
+activation = kernels.get_kernel("kernels-community/activation", version=1)
+
 DTYPES = [torch.half, torch.bfloat16, torch.float]
 NUM_TOKENS = [7, 83, 2048]  # Arbitrary values for testing
 D = [512, 13824]  # Arbitrary values for testing
 SEEDS = [0]
-CUDA_DEVICES = [f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)]
+
+
+def _devices() -> list[str]:
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        name, count = "xpu", torch.xpu.device_count()
+    elif torch.cuda.is_available():
+        name, count = "cuda", torch.cuda.device_count()
+    else:
+        return ["cpu"]
+    return [f"{name}:{i}" for i in range(1 if count == 1 else 2)]
+
+
+DEVICES = _devices()
 
 
 def gelu_fast(x: torch.Tensor) -> torch.Tensor:
@@ -64,16 +78,10 @@ def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
 def silu(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x)
 
-@pytest.mark.parametrize(
-    "activation_name", ["silu_and_mul", "mul_and_silu", "gelu", "gelu_tanh", "fatrelu"]
-)
-@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
-@pytest.mark.parametrize("d", D)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
-@torch.inference_mode()
-def test_act_and_mul(
+ACT_AND_MUL_NAMES = ["silu_and_mul", "mul_and_silu", "gelu", "gelu_tanh", "fatrelu"]
+
+
+def act_and_mul_check(
     activation_name: str,
     num_tokens: int,
     d: int,
@@ -132,54 +140,79 @@ def test_act_and_mul(
         opcheck(op, (out, x))
 
 
-@pytest.mark.parametrize(
-    "activation_fns",
-    [
-        (
-            gelu_fast,
-            activation.gelu_fast,
-            activation.ops.gelu_fast,
-            activation.layers.FastGELU,
-        ),
-        (
-            gelu_new,
-            activation.gelu_new,
-            activation.ops.gelu_new,
-            activation.layers.NewGELU,
-        ),
-        (
-            gelu_quick,
-            activation.gelu_quick,
-            activation.ops.gelu_quick,
-            activation.layers.QuickGELU,
-        ),
-        (
-            gelu_tanh,
-            activation.gelu_tanh,
-            activation.ops.gelu_tanh,
-            activation.layers.GeluTanh,
-        ),
-        (
-            silu,
-            activation.silu,
-            activation.ops.silu,
-            activation.layers.Silu,
-        ),
-        (
-            gelu, 
-            activation.gelu, 
-            activation.ops.gelu, 
-            activation.layers.Gelu
-        ),
-    ],
-)
+@pytest.mark.parametrize("activation_name", ACT_AND_MUL_NAMES)
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("d", D)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("device", DEVICES)
 @torch.inference_mode()
-def test_activation(
+def test_act_and_mul(
+    activation_name: str,
+    num_tokens: int,
+    d: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+) -> None:
+    act_and_mul_check(activation_name, num_tokens, d, dtype, seed, device)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("activation_name", ACT_AND_MUL_NAMES)
+@torch.inference_mode()
+def test_act_and_mul_ci(activation_name: str) -> None:
+    act_and_mul_check(
+        activation_name,
+        num_tokens=7,
+        d=512,
+        dtype=torch.half,
+        seed=0,
+        device=DEVICES[0],
+    )
+
+
+ACTIVATION_FNS = [
+    (
+        gelu_fast,
+        activation.gelu_fast,
+        activation.ops.gelu_fast,
+        activation.layers.FastGELU,
+    ),
+    (
+        gelu_new,
+        activation.gelu_new,
+        activation.ops.gelu_new,
+        activation.layers.NewGELU,
+    ),
+    (
+        gelu_quick,
+        activation.gelu_quick,
+        activation.ops.gelu_quick,
+        activation.layers.QuickGELU,
+    ),
+    (
+        gelu_tanh,
+        activation.gelu_tanh,
+        activation.ops.gelu_tanh,
+        activation.layers.GeluTanh,
+    ),
+    (
+        silu,
+        activation.silu,
+        activation.ops.silu,
+        activation.layers.Silu,
+    ),
+    (
+        gelu,
+        activation.gelu,
+        activation.ops.gelu,
+        activation.layers.Gelu,
+    ),
+]
+
+
+def activation_check(
     activation_fns,
     num_tokens: int,
     d: int,
@@ -204,3 +237,65 @@ def test_activation(
 
     out = torch.empty_like(x)
     opcheck(op, (out, x))
+
+
+@pytest.mark.parametrize("activation_fns", ACTIVATION_FNS)
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("d", D)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_activation(
+    activation_fns,
+    num_tokens: int,
+    d: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+) -> None:
+    activation_check(activation_fns, num_tokens, d, dtype, seed, device)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("activation_fns", ACTIVATION_FNS)
+@torch.inference_mode()
+def test_activation_ci(activation_fns) -> None:
+    activation_check(
+        activation_fns,
+        num_tokens=7,
+        d=512,
+        dtype=torch.half,
+        seed=0,
+        device=DEVICES[0],
+    )
+
+
+# The shapes above are all vector-width multiples over naturally aligned
+# storage; these are neither, so a vectorized backend must take its scalar path.
+@pytest.mark.parametrize("d", [1, 13, 4097])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_act_and_mul_unaligned(d: int, dtype: torch.dtype, device: str) -> None:
+    torch.manual_seed(0)
+    torch.set_default_device(device)
+    num_tokens = 5
+    base = torch.randn(num_tokens * 2 * d + 1, dtype=dtype)
+    x = base[1:].view(num_tokens, 2 * d)
+
+    out = torch.empty(num_tokens, d, dtype=dtype)
+    out = activation.silu_and_mul(out, x)
+
+    torch.testing.assert_close(out, silu_and_mul(x), atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", DEVICES)
+@torch.inference_mode()
+def test_empty_input(dtype: torch.dtype, device: str) -> None:
+    torch.set_default_device(device)
+    x = torch.empty(0, 128, dtype=dtype)
+
+    assert activation.silu_and_mul(torch.empty(0, 64, dtype=dtype), x).shape == (0, 64)
+    assert activation.silu(torch.empty(0, 128, dtype=dtype), x).shape == (0, 128)

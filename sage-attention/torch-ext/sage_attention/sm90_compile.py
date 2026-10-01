@@ -16,8 +16,8 @@ def _lse_fake_impl(query, tensor_layout, return_lse):
     return torch.empty((0))
 
 
-@torch.library.register_fake(add_op_namespace_prefix("qk_int8_sv_f8_accum_f32_attn_inst_buf"))
-def qk_int8_sv_f8_accum_f32_attn_inst_buf_fake(
+@torch.library.register_fake(add_op_namespace_prefix("qk_int8_sv_f8_accum_f32_attn_inst_buf_sm90"))
+def qk_int8_sv_f8_accum_f32_attn_inst_buf_sm90_fake(
     query, key, value, output, query_scale, key_scale,
     tensor_layout, is_causal, qk_quant_gran, sm_scale, return_lse,
 ):
@@ -32,5 +32,5 @@ def qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90_fake(
     return _lse_fake_impl(query, tensor_layout, return_lse)
 
 
-qk_int8_sv_f8_accum_f32_attn_inst_buf = ops.qk_int8_sv_f8_accum_f32_attn_inst_buf
+qk_int8_sv_f8_accum_f32_attn_inst_buf_sm90 = ops.qk_int8_sv_f8_accum_f32_attn_inst_buf_sm90
 qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90 = ops.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf_sm90

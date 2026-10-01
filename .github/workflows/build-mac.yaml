@@ -52,19 +52,34 @@ on:
         required: false
         type: string
         default: ""
+      bot_comment_id:
+        description: "Issue comment ID to update with Hub upload links"
+        required: false
+        type: string
+        default: ""
 
-permissions:
-  contents: read
-  statuses: write
-  id-token: write
 
+# These build workflows are reachable only via workflow_dispatch, so `github.head_ref`
+# is always empty and the group used to collapse to `github.run_id` -- unique per run,
+# which made `cancel-in-progress` a no-op. Key off the dispatch inputs instead so a newer
+# build supersedes the one still in flight for the same PR + kernel (the platform is
+# already distinguished by `github.workflow`, so unrelated kernels/platforms on the same
+# PR are untouched). `upload` stays in the key so a cheap PR CI build cannot cancel a
+# `/kernel-bot build-and-stage` mid Hub upload. Dispatches without a `pr_number` (releases
+# off the default branch) still fall back to `run_id` and are never cancelled.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ inputs.pr_number || github.run_id }}-${{ inputs.kernel_name }}-upload-${{ inputs.upload }}
   cancel-in-progress: true
+
+permissions: {}
 
 jobs:
   # Build the Metal kernel; PR mode builds .#ci, release builds the full bundle and uploads.
   build-kernel:
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
     runs-on: macos-26
     strategy:
       fail-fast: false
@@ -114,13 +129,13 @@ jobs:
       # When building for a PR, check out the PR head; otherwise use default branch.
       - name: Checkout PR branch
         if: inputs.pr_number != ''
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/pull/${{ inputs.pr_number }}/head
           fetch-depth: 0
       - name: Checkout default branch
         if: inputs.pr_number == ''
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Nix toolchain + binary cache setup.
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
@@ -131,7 +146,7 @@ jobs:
             sandbox = relaxed
       - name: Nix info
         run: nix-shell -p nix-info --run "nix-info -m"
-      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: huggingface
         env:
@@ -143,8 +158,13 @@ jobs:
         env:
           KERNEL: ${{ inputs.kernel_name }}
         run: |
-          if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$KERNEL/build.toml" ]; then
+          # Ported kernels keep build.toml in <kernel>/src; the flake stays at
+          # <kernel> and points nix at it.
+          CONFIG="$KERNEL"
+          [ -f "$KERNEL/src/build.toml" ] && CONFIG="$KERNEL/src"
+          if [ -d "$KERNEL" ] && [ -f "$KERNEL/flake.nix" ] && [ -f "$CONFIG/build.toml" ]; then
             echo "kernel=$KERNEL" >> $GITHUB_OUTPUT
+            echo "config=$CONFIG" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
           else
             echo "skip=true" >> $GITHUB_OUTPUT
@@ -154,10 +174,10 @@ jobs:
       - name: Check that repo-id is present
         if: steps.validate.outputs.skip == 'false' && inputs.mode == 'pr'
         env:
-          KERNEL: ${{ steps.validate.outputs.kernel }}
+          CONFIG: ${{ steps.validate.outputs.config }}
         run: |
-          if ! cat $KERNEL/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
-            echo "Mandatory repo-id is missing in $KERNEL/build.toml"
+          if ! cat $CONFIG/build.toml | nix run nixpkgs#dasel -- -i toml '$root.general.hub.get("repo-id")' &> /dev/null ; then
+            echo "Mandatory repo-id is missing in $CONFIG/build.toml"
             exit 1
           fi
 
@@ -185,7 +205,7 @@ jobs:
 
       - name: Install Cosign
         if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr'
-        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       # Sign metadata.json for each built variant.
       - name: Sign kernel metadata
@@ -206,12 +226,15 @@ jobs:
           REPO_PREFIX: ${{ inputs.repo_prefix }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
         run: |
-          cd "$KERNEL"
           BRANCH_FLAG=""
           if [ -n "$TARGET_BRANCH" ]; then
             BRANCH_FLAG="--branch $TARGET_BRANCH"
           fi
-          nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "$REPO_PREFIX/$KERNEL" $BRANCH_FLAG
+          TARGET_FLAG=$(python3 .github/scripts/hub_pr_upload_args.py upload-args "$KERNEL" "$REPO_PREFIX")
+          cd "$KERNEL"
+          nix run -L github:huggingface/kernels#kernel-builder -- upload \
+            --repo-type kernel $TARGET_FLAG $BRANCH_FLAG \
+            --output-json "$RUNNER_TEMP/upload.json"
 
       # v1 kernels without an explicit branch override also get uploaded to main.
       - name: Upload v1 kernels to main
@@ -219,23 +242,44 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           KERNEL: ${{ steps.validate.outputs.kernel }}
+          CONFIG: ${{ steps.validate.outputs.config }}
           REPO_PREFIX: ${{ inputs.repo_prefix }}
         run: |
+          TARGET_FLAG=$(python3 .github/scripts/hub_pr_upload_args.py upload-args "$KERNEL" "$REPO_PREFIX")
+          # Resolve before the cd: CONFIG is repo-root relative and may be <kernel>/src.
+          BUILD_TOML="$PWD/$CONFIG/build.toml"
           cd "$KERNEL"
 
-          if [ -f "build.toml" ]; then
-            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' build.toml || true)
-            BRANCH=$(grep -E '^\s*branch\s*=' build.toml || true)
+          if [ -f "$BUILD_TOML" ]; then
+            VERSION=$(grep -E '^\s*version\s*=\s*1\s*$' "$BUILD_TOML" || true)
+            BRANCH=$(grep -E '^\s*branch\s*=' "$BUILD_TOML" || true)
             if [ -n "$VERSION" ] && [ -z "$BRANCH" ]; then
-              nix run -L github:huggingface/kernels#kernel-builder -- upload --repo-type kernel --repo-id "$REPO_PREFIX/$KERNEL" --branch main
+              nix run -L github:huggingface/kernels#kernel-builder -- upload \
+                --repo-type kernel $TARGET_FLAG --branch main \
+                --output-json "$RUNNER_TEMP/upload-main.json"
             fi
           fi
+
+      - name: Upload Hub upload summary
+        if: steps.validate.outputs.skip == 'false' && inputs.skip_build != true && inputs.mode != 'pr' && inputs.upload != false
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hub-upload-macos
+          path: ${{ runner.temp }}/upload*.json
+          retention-days: 1
 
   # Report the final build outcome as a commit status on the PR head SHA.
   report-status:
     if: always() && inputs.head_sha != ''
     needs: [build-kernel]
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      statuses: write
+    env:
+      REPORT_HUB_UPLOAD: ${{ needs.build-kernel.result == 'success' && inputs.bot_comment_id != '' && inputs.mode != 'pr' && inputs.upload != false }}
     steps:
       - name: Set commit status
         env:
@@ -263,3 +307,28 @@ jobs:
             -f target_url="$RUN_URL" \
             -f description="$DESC" \
             -f context="$STATUS_CONTEXT"
+
+      - name: Checkout comment helpers
+        if: env.REPORT_HUB_UPLOAD == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.pr_number != '' && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+
+      - name: Download Hub upload summaries
+        if: env.REPORT_HUB_UPLOAD == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: hub-upload-*
+          path: hub-uploads
+
+      - name: Update bot comment with Hub URLs
+        if: env.REPORT_HUB_UPLOAD == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BOT_COMMENT_ID: ${{ inputs.bot_comment_id }}
+          KERNEL: ${{ inputs.kernel_name }}
+          REPO_PREFIX: ${{ inputs.repo_prefix }}
+        run: |
+          BODY=$(gh api "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" --jq .body)
+          BODY=$(python3 .github/scripts/format_hub_upload_comment.py --base "$BODY" "$KERNEL" "$REPO_PREFIX" hub-uploads)
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$BOT_COMMENT_ID" -f body="$BODY"

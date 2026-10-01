@@ -38,22 +38,24 @@ jobs:
       # Guard against injection via the pr_number input.
       - name: Validate PR number
         run: |
-          case "${{ inputs.pr_number }}" in
+          case "${INPUTS_PR_NUMBER}" in
             ''|*[!0-9]*)
               echo "Invalid pr_number input: must be numeric"
               exit 1
               ;;
           esac
+        env:
+          INPUTS_PR_NUMBER: ${{ inputs.pr_number }}
 
       # Check out the PR head so Claude can explore the actual changed code.
       # refs/pull/N/head resolves for forked PRs too.
       - name: Checkout PR head
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/pull/${{ inputs.pr_number }}/head
           fetch-depth: 0
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "20"
 

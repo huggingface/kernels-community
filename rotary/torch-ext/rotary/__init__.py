@@ -1,6 +1,6 @@
-from typing import Optional, Tuple
 import torch
 
+from . import layers
 from ._ops import ops
 
 
@@ -22,7 +22,7 @@ def apply_rotary_transformers(
     cos: torch.Tensor,
     sin: torch.Tensor,
     unsqueeze_dim: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Rotary kernel implementation wrapper
     Adapts rotary kernel implementation to match transformers apply_rotary_pos_emb signature
@@ -53,4 +53,5 @@ def apply_rotary_transformers(
 apply_rotary_transformers.can_torch_compile = True
 
 
-__all__ = ["apply_rotary", "apply_rotary_transformers"]
+# Keeping `apply_rotary` and `apply_rotary_transformers` for BC
+__all__ = ["apply_rotary", "apply_rotary_transformers", "layers"]

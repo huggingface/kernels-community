@@ -72,8 +72,6 @@ void convert_fp8(torch::Tensor &dst_cache, torch::Tensor &src_cache,
     TORCH_CHECK(stream, "Failed to get current MPS stream");
 
     id<MTLDevice> device = stream->device();
-    id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
-    TORCH_CHECK(cmdBuf, "Failed to get command buffer");
 
     // Load the embedded Metal library from memory
     NSError *error = nil;
@@ -96,7 +94,7 @@ void convert_fp8(torch::Tensor &dst_cache, torch::Tensor &src_cache,
 
     dispatch_queue_t q = stream->queue();
     dispatch_sync(q, ^{
-      id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+      id<MTLComputeCommandEncoder> enc = stream->commandEncoder();
       TORCH_CHECK(enc, "Failed to create compute encoder");
 
       [enc setComputePipelineState:pso];
@@ -137,9 +135,7 @@ void convert_fp8(torch::Tensor &dst_cache, torch::Tensor &src_cache,
 
       [enc dispatchThreadgroups:threadgroupsPerGrid
           threadsPerThreadgroup:threadsPerThreadgroup];
-      [enc endEncoding];
+      stream->synchronize(at::mps::SyncType::COMMIT);
     });
-
-    stream->synchronize(at::mps::SyncType::COMMIT);
   }
 }

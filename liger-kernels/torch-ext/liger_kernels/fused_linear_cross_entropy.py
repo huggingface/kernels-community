@@ -7,6 +7,7 @@ from .utils import amp_custom_fwd
 from .utils import element_mul_kernel
 from .utils import is_hip
 from .utils import infer_device
+from .utils import device_context
 
 # The hard limit of TRITON_MAX_TENSOR_NUMEL is 1048576 https://github.com/triton-lang/triton/blob/ba42a5c68fd0505f8c42f4202d53be0f8d9a5fe0/python/triton/language/core.py#L19
 # However, setting limit as 65536 as in LayerNorm tutorial is faster because of less register spilling
@@ -147,42 +148,43 @@ def fused_linear_cross_entropy_forward(
         logits_chunk = logits_chunk.contiguous()
         target_chunk = target_chunk.contiguous()
 
-        # Here we calculate the gradient of logits_chunk in place so we can save memory.
-        liger_cross_entropy_kernel[(n_rows,)](
-            X_ptr=logits_chunk,
-            X_stride=logits_chunk.stride(-2),
-            Y_ptr=target_chunk,
-            Y_stride=target_chunk.stride(-1),  # always 1
-            weight_ptr=ce_weight,
-            loss_ptr=loss_1d_slice,
-            z_loss_ptr=z_loss_1d_slice,
-            loss_stride=loss_1d_slice.stride(-1),  # always 1
-            token_accuracy_ptr=token_accuracy_1d_slice,
-            token_accuracy_stride=token_accuracy_1d_slice.stride(-1)
-            if return_token_accuracy
-            else 0,  # always 1 if accuracy is enabled
-            predicted_tokens_ptr=predicted_tokens_1d_slice,
-            predicted_tokens_stride=predicted_tokens_1d_slice.stride(-1)
-            if return_predicted_tokens
-            else 0,  # always 1 if predicted tokens is enabled
-            n_cols=V,
-            n_non_ignore=total_n_non_ignore,
-            sum_non_ignore_weight=total_sum_non_ignore_ce_weight,
-            weight_sum=ce_weight_sum,
-            ignore_index=ignore_index,
-            lse_square_scale=lse_square_scale,
-            label_smoothing=label_smoothing,
-            reduction=reduction,
-            softcap=softcap,
-            RETURN_Z_LOSS=return_z_loss,
-            RETURN_TOKEN_ACCURACY=return_token_accuracy,
-            RETURN_PREDICTED_TOKENS=return_predicted_tokens,
-            HAS_WEIGHT=True if ce_weight is not None else False,
-            HAS_SOFTCAPPING=True if softcap is not None else False,
-            HAS_GRADIENTS=input_requires_grad,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=32 if not is_hip() else 16,
-        )
+        with device_context(device):
+            # Here we calculate the gradient of logits_chunk in place so we can save memory.
+            liger_cross_entropy_kernel[(n_rows,)](
+                X_ptr=logits_chunk,
+                X_stride=logits_chunk.stride(-2),
+                Y_ptr=target_chunk,
+                Y_stride=target_chunk.stride(-1),  # always 1
+                weight_ptr=ce_weight,
+                loss_ptr=loss_1d_slice,
+                z_loss_ptr=z_loss_1d_slice,
+                loss_stride=loss_1d_slice.stride(-1),  # always 1
+                token_accuracy_ptr=token_accuracy_1d_slice,
+                token_accuracy_stride=token_accuracy_1d_slice.stride(-1)
+                if return_token_accuracy
+                else 0,  # always 1 if accuracy is enabled
+                predicted_tokens_ptr=predicted_tokens_1d_slice,
+                predicted_tokens_stride=predicted_tokens_1d_slice.stride(-1)
+                if return_predicted_tokens
+                else 0,  # always 1 if predicted tokens is enabled
+                n_cols=V,
+                n_non_ignore=total_n_non_ignore,
+                sum_non_ignore_weight=total_sum_non_ignore_ce_weight,
+                weight_sum=ce_weight_sum,
+                ignore_index=ignore_index,
+                lse_square_scale=lse_square_scale,
+                label_smoothing=label_smoothing,
+                reduction=reduction,
+                softcap=softcap,
+                RETURN_Z_LOSS=return_z_loss,
+                RETURN_TOKEN_ACCURACY=return_token_accuracy,
+                RETURN_PREDICTED_TOKENS=return_predicted_tokens,
+                HAS_WEIGHT=True if ce_weight is not None else False,
+                HAS_SOFTCAPPING=True if softcap is not None else False,
+                HAS_GRADIENTS=input_requires_grad,
+                BLOCK_SIZE=BLOCK_SIZE,
+                num_warps=32 if not is_hip() else 16,
+            )
 
         # Apply token scaling if requested
         if use_token_scaling:
@@ -247,47 +249,48 @@ def fused_linear_cross_entropy_forward(
 def fused_linear_cross_entropy_backward(grad_output, grad_input, grad_weight, grad_bias):
     # If cross entropy is the last layer, grad_output is 1.0. Skip the mul to save time
     if not torch.equal(grad_output, torch.tensor(1.0, device=grad_output.device)):
-        # We use a Triton kernel instead of a PyTorch operation because modifying inputs in-place
-        # for gradient storage and backward multiple times causes anomalies with PyTorch but not with Triton.
-        BT, H = grad_input.shape
-        n_rows = BT
-        BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(H))
-
-        element_mul_kernel[(n_rows,)](
-            grad_input,
-            grad_input.stride(-2),
-            grad_output,
-            H,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=32 if not is_hip() else 16,
-        )
-
-        # handle grad_weight
-        if grad_weight is not None:
-            V, H = grad_weight.shape
-            n_rows = V
+        with device_context(grad_input.device):
+            # We use a Triton kernel instead of a PyTorch operation because modifying inputs in-place
+            # for gradient storage and backward multiple times causes anomalies with PyTorch but not with Triton.
+            BT, H = grad_input.shape
+            n_rows = BT
+            BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(H))
 
             element_mul_kernel[(n_rows,)](
-                grad_weight,
-                grad_weight.stride(-2),
+                grad_input,
+                grad_input.stride(-2),
                 grad_output,
                 H,
                 BLOCK_SIZE=BLOCK_SIZE,
                 num_warps=32 if not is_hip() else 16,
             )
 
-        if grad_bias is not None:
-            V = grad_bias.shape[0]
-            n_rows = V
+            # handle grad_weight
+            if grad_weight is not None:
+                V, H = grad_weight.shape
+                n_rows = V
 
-            element_mul_kernel[(n_rows,)](
-                grad_bias,
-                grad_bias.stride(-1),
-                grad_output,
-                1,
-                BLOCK_SIZE=BLOCK_SIZE,
-                num_warps=32 if not is_hip() else 16,
-            )
+                element_mul_kernel[(n_rows,)](
+                    grad_weight,
+                    grad_weight.stride(-2),
+                    grad_output,
+                    H,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    num_warps=32 if not is_hip() else 16,
+                )
+
+            if grad_bias is not None:
+                V = grad_bias.shape[0]
+                n_rows = V
+
+                element_mul_kernel[(n_rows,)](
+                    grad_bias,
+                    grad_bias.stride(-1),
+                    grad_output,
+                    1,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    num_warps=32 if not is_hip() else 16,
+                )
     return grad_input, grad_weight, grad_bias
 
 

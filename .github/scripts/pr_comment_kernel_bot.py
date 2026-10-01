@@ -1,23 +1,29 @@
 from dataclasses import dataclass, field
 import json
 import os
+from pathlib import Path
 import re
+import subprocess
 import sys
 import time
+import tomllib
 import urllib.parse
 import urllib.error
 import urllib.request
 import uuid
 
 from dispatch import (
+    BACKEND_TO_WORKFLOWS,
     WORKFLOWS,
     dispatch,
     format_dry_run_payloads,
+    parse_kernel_arg,
 )
 
 KERNEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
-COMMENT_CHARS_RE = re.compile(r"^/kernel-bot[ A-Za-z0-9_./-]*$")
+COMMENT_CHARS_RE = re.compile(r"^/kernel-bot[ A-Za-z0-9_./,\[\]-]*$")
+KNOWN_BACKENDS = set(BACKEND_TO_WORKFLOWS)
 COMMAND_PERMISSIONS = {
     "build": {"admin", "write"},
     "security": {"admin", "write"},
@@ -28,13 +34,24 @@ COMMAND_PERMISSIONS = {
 }
 # Commands that operate per-PR and do not require kernel names.
 KERNELLESS_COMMANDS = {"security"}
+# Org teams whose members may run TEAM_AUTHORIZED_COMMANDS without holding
+# `write` on this repo, as (org, team_slug) pairs. Rosters are read with
+# TEAM_READ_TOKEN: the workflow's default GITHUB_TOKEN is repo-scoped and has no
+# `read:org`, so it cannot see team membership at all.
+AUTHORIZED_TEAMS = (("huggingface", "transformers"), ("huggingface", "eric-hf-team"))
+# What team membership alone unlocks. Deliberately narrow -- merging and
+# releasing require `write`/`admin` on this repo.
+TEAM_AUTHORIZED_COMMANDS = {"build", "build-and-stage", "security", "security-and-build"}
 MAX_COMMENT_LENGTH = 1024
 RUN_LOOKUP_ATTEMPTS = 10
 RUN_LOOKUP_SLEEP_SECONDS = 2
 RUN_LOOKUP_PAGE_SIZE = 100
+HUB_API_ROOT = "https://huggingface.co/api"
+HUB_API_TIMEOUT_SECONDS = 30
 COMMAND_USAGE = (
     "Invalid command. Use `/kernel-bot <build|security|security-and-build|build-and-stage|merge-and-upload|release> "
     "<kernel1> [kernel2 ...] [--branch <target_branch>]`.\n"
+    "A kernel may be scoped to a subset of backends, e.g. `flash-attn2[xpu,cpu]`.\n"
     "The `security` command does not require kernel names."
 )
 
@@ -43,6 +60,7 @@ COMMAND_USAGE = (
 class ParsedCommand:
     command: str | None = None
     kernels: list[str] = field(default_factory=list)
+    backends: dict[str, list[str]] = field(default_factory=dict)
     branch: str | None = None
     error: str | None = None
 
@@ -52,6 +70,111 @@ class DispatchResult:
     kernel_name: str
     dispatch_key: str
     action_url: str | None = None
+
+
+@dataclass(frozen=True)
+class ExternalUploadTarget:
+    kernel: str
+    repo_id: str
+    branch: str
+
+
+def read_kernel_build_config(kernel: str, ref: str = "") -> dict:
+    candidates = [Path(kernel) / "src" / "build.toml", Path(kernel) / "build.toml"]
+    if ref:
+        for candidate in candidates:
+            result = subprocess.run(
+                ["git", "show", f"{ref}:{candidate.as_posix()}"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                return tomllib.loads(result.stdout)
+        raise ValueError(f"cannot read build.toml for `{kernel}` at `{ref}`")
+
+    build_toml = next((path for path in candidates if path.is_file()), None)
+    if build_toml is None:
+        raise ValueError(f"cannot find build.toml for `{kernel}`")
+    with open(build_toml, "rb") as f:
+        return tomllib.load(f)
+
+
+def external_upload_target(
+    kernel: str, *, requested_branch: str | None = None, ref: str = ""
+) -> ExternalUploadTarget | None:
+    config = read_kernel_build_config(kernel, ref)
+    general = config.get("general", {})
+    hub = general.get("hub", {})
+    repo_id = hub.get("repo-id")
+    if not isinstance(repo_id, str) or not repo_id:
+        raise ValueError(f"`{kernel}` has no [general.hub].repo-id")
+    if repo_id.startswith("kernels-community/"):
+        return None
+
+    branch = requested_branch or hub.get("branch")
+    if branch is None:
+        version = general.get("version")
+        if not isinstance(version, int):
+            raise ValueError(f"`{kernel}` has no integer [general].version")
+        branch = f"v{version}"
+    if not isinstance(branch, str) or not branch:
+        raise ValueError(f"`{kernel}` has an invalid Hub branch")
+
+    return ExternalUploadTarget(kernel=kernel, repo_id=repo_id, branch=branch)
+
+
+def hub_kernel_branches(repo_id: str) -> set[str]:
+    encoded_repo_id = urllib.parse.quote(repo_id, safe="/")
+    request = urllib.request.Request(
+        f"{HUB_API_ROOT}/kernels/{encoded_repo_id}/refs",
+        headers={"User-Agent": "kernels-community-kernel-bot"},
+    )
+    with urllib.request.urlopen(request, timeout=HUB_API_TIMEOUT_SECONDS) as response:
+        refs = json.load(response)
+    return {
+        branch["name"]
+        for branch in refs.get("branches", [])
+        if isinstance(branch, dict) and isinstance(branch.get("name"), str)
+    }
+
+
+def preflight_external_uploads(
+    kernels: list[str],
+    *,
+    requested_branch: str | None = None,
+    ref: str = "",
+    branch_lookup=None,
+) -> list[str]:
+    branch_lookup = branch_lookup or hub_kernel_branches
+    failures = []
+    for kernel in kernels:
+        try:
+            target = external_upload_target(
+                kernel, requested_branch=requested_branch, ref=ref
+            )
+            if target is None:
+                continue
+            branches = branch_lookup(target.repo_id)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                failures.append(
+                    f"`{kernel}`: external Hub kernel repository was not found or is not public."
+                )
+            else:
+                failures.append(
+                    f"`{kernel}`: could not check the external Hub repository (HTTP {e.code})."
+                )
+            continue
+        except (OSError, ValueError, tomllib.TOMLDecodeError) as e:
+            failures.append(f"`{kernel}`: could not resolve its upload target: {e}.")
+            continue
+
+        if target.branch not in branches:
+            failures.append(
+                f"`{kernel}`: branch `{target.branch}` does not exist in external Hub "
+                f"repository `{target.repo_id}`. Ask a repository maintainer to create it first."
+            )
+    return failures
 
 
 def github_api_request(
@@ -161,6 +284,92 @@ def get_user_permission(api_base: str, token: str, username: str):
         raise
 
 
+def get_team_membership_state(org: str, team_slug: str, username: str, token: str):
+    """Return the user's state in an org team ("active"/"pending"), or None.
+
+    None covers both "not a member" and "this token cannot see the team": GitHub
+    answers 404 for either, so they are indistinguishable here.
+    """
+    url = f"https://api.github.com/orgs/{org}/teams/{team_slug}/memberships/{username}"
+    try:
+        _, body = github_api_request(url, token, method="GET")
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            print(
+                f"TEAM_READ_TOKEN cannot read {org}/{team_slug} membership (HTTP 403); "
+                "it needs the `read:org` scope.",
+                file=sys.stderr,
+            )
+            return None
+        if e.code == 404:
+            return None
+        raise
+    return json.loads(body).get("state")
+
+
+def is_authorized_team_member(username: str, token: str):
+    """True when `username` is an active member of any team in AUTHORIZED_TEAMS."""
+    if not username or not token:
+        return False
+    for org, team_slug in AUTHORIZED_TEAMS:
+        try:
+            state = get_team_membership_state(org, team_slug, username, token)
+        except urllib.error.HTTPError as e:
+            print(
+                f"Team membership lookup for {username} in {org}/{team_slug} failed "
+                f"(HTTP {e.code}).",
+                file=sys.stderr,
+            )
+            continue
+        # "pending" is an unaccepted invitation -- not yet a member.
+        if state == "active":
+            return True
+    return False
+
+
+def team_grants_access(
+    api_base: str, token: str, command: str, commenter: str, issue_number: int
+):
+    """Authorize `command` when the commenter or the PR author is on an authorized team.
+
+    Every failure path returns False, so a missing or under-scoped
+    TEAM_READ_TOKEN can only ever deny -- it never widens access.
+    """
+    if command not in TEAM_AUTHORIZED_COMMANDS:
+        return False
+    team_token = os.environ.get("TEAM_READ_TOKEN", "")
+    if not team_token:
+        print(
+            "TEAM_READ_TOKEN is not set; skipping team-membership authorization.",
+            file=sys.stderr,
+        )
+        return False
+
+    if is_authorized_team_member(commenter, team_token):
+        print(f"Authorizing `{command}`: {commenter} is on an authorized team.")
+        return True
+
+    try:
+        pull_request = get_pull_request(api_base, token, issue_number)
+    except urllib.error.HTTPError as e:
+        print(
+            f"Could not read PR #{issue_number} to check its author (HTTP {e.code}).",
+            file=sys.stderr,
+        )
+        return False
+    pr_author = (pull_request.get("user") or {}).get("login", "")
+    # The commenter was just checked; re-querying the same login is waste.
+    if not pr_author or pr_author == commenter:
+        return False
+    if is_authorized_team_member(pr_author, team_token):
+        print(
+            f"Authorizing `{command}` for {commenter}: PR author {pr_author} "
+            "is on an authorized team."
+        )
+        return True
+    return False
+
+
 def get_pull_request(api_base: str, token: str, issue_number: int):
     url = f"{api_base}/pulls/{issue_number}"
     _, body = github_api_request(url, token, method="GET")
@@ -169,7 +378,9 @@ def get_pull_request(api_base: str, token: str, issue_number: int):
 
 def merge_pull_request(api_base: str, token: str, issue_number: int):
     url = f"{api_base}/pulls/{issue_number}/merge"
-    _, body = github_api_request(url, token, method="PUT", data={})
+    _, body = github_api_request(
+        url, token, method="PUT", data={"merge_method": "squash"}
+    )
     return json.loads(body)
 
 
@@ -415,18 +626,37 @@ def parse_command(comment: str) -> ParsedCommand:
         )
 
     kernels = []
+    backends: dict[str, list[str]] = {}
     seen = set()
-    for kernel in args:
-        if not KERNEL_RE.match(kernel):
-            return ParsedCommand(error=f"Invalid kernel name `{kernel}`.")
-        if kernel not in seen:
-            kernels.append(kernel)
-            seen.add(kernel)
+    for token in args:
+        name, requested = parse_kernel_arg(token)
+        if name is None:
+            return ParsedCommand(error=f"Invalid kernel name `{token}`.")
+        if requested is not None:
+            unknown = [b for b in requested if b not in KNOWN_BACKENDS]
+            if unknown:
+                known = ", ".join(sorted(KNOWN_BACKENDS))
+                return ParsedCommand(
+                    error=(
+                        f"Unknown backend(s) `{', '.join(unknown)}` in `{token}`. "
+                        f"Known backends: {known}."
+                    )
+                )
+        if name not in seen:
+            kernels.append(name)
+            seen.add(name)
+        if requested is not None:
+            scoped = backends.setdefault(name, [])
+            for b in requested:
+                if b not in scoped:
+                    scoped.append(b)
 
     if branch is not None and not BRANCH_RE.match(branch):
         return ParsedCommand(error=f"Invalid target branch `{branch}`.")
 
-    return ParsedCommand(command=command, kernels=kernels, branch=branch)
+    return ParsedCommand(
+        command=command, kernels=kernels, backends=backends, branch=branch
+    )
 
 
 def parse_numeric_id(raw_value: str | None):
@@ -629,6 +859,7 @@ def main(*, dry_run: bool = False):
 
     command = parsed_command.command
     kernels = parsed_command.kernels
+    kernel_backends = parsed_command.backends
     requested_branch = parsed_command.branch
     if command is None:
         print("Internal error: command parsing returned no command.", file=sys.stderr)
@@ -639,12 +870,22 @@ def main(*, dry_run: bool = False):
         commenter = ctx["commenter"]
         permission = get_user_permission(api_base, token, commenter)
         allowed_permissions = COMMAND_PERMISSIONS[command]
-        if permission not in allowed_permissions:
+        # Repo permission is the primary gate; team membership is a fallback.
+        authorized = permission in allowed_permissions or team_grants_access(
+            api_base, token, command, commenter, issue_number
+        )
+        if not authorized:
             if "write" in allowed_permissions:
                 permission_error = (
                     f"I can only run `/kernel-bot {command}` for users with `write` or `admin` "
                     "repository permission."
                 )
+                if command in TEAM_AUTHORIZED_COMMANDS:
+                    teams = ", ".join(f"`{o}/{t}`" for o, t in AUTHORIZED_TEAMS)
+                    permission_error += (
+                        f" Members of {teams} can run it too, as can anyone "
+                        "commenting on a PR opened by one."
+                    )
             else:
                 permission_error = (
                     f"I can only run `/kernel-bot {command}` for users with `admin` "
@@ -739,26 +980,31 @@ def main(*, dry_run: bool = False):
             )
         return 1 if release_result.security_failed else 0
 
+    # `pr` tests without uploading, `release` uploads without testing, `stage` both.
     if command in ("build", "security-and-build"):
         target_branch = requested_branch or f"pr-{issue_number}"
         dispatch_pr_number = str(issue_number)
         dispatch_upload = False
         dispatch_repo_prefix = "kernels-community"
+        dispatch_mode = "pr"
     elif command == "build-and-stage":
         target_branch = requested_branch or f"pr-{issue_number}"
         dispatch_pr_number = str(issue_number)
         dispatch_upload = True
         dispatch_repo_prefix = "kernels-staging"
+        dispatch_mode = "stage"
     elif command == "release":
         target_branch = requested_branch or ""
         dispatch_pr_number = ""
         dispatch_upload = True
         dispatch_repo_prefix = "kernels-community"
+        dispatch_mode = "release"
     else:  # merge-and-upload
         target_branch = requested_branch or ""
         dispatch_pr_number = ""
         dispatch_upload = True
         dispatch_repo_prefix = "kernels-community"
+        dispatch_mode = "release"
 
     mode_text = {
         "build": "build only",
@@ -767,11 +1013,54 @@ def main(*, dry_run: bool = False):
         "merge-and-upload": "merge, build and upload",
         "release": "release (linux + mac + windows)",
     }[command]
-    command_summary = f"/kernel-bot {command} {' '.join(kernels)}"
+    kernel_tokens = [
+        f"{k}[{','.join(kernel_backends[k])}]" if kernel_backends.get(k) else k
+        for k in kernels
+    ]
+    command_summary = f"/kernel-bot {command} {' '.join(kernel_tokens)}"
     if requested_branch is not None:
         command_summary += f" --branch {requested_branch}"
     # `/kernel-bot security-and-build` runs the security audit concurrently with the build.
     run_security = command == "security-and-build"
+
+    # External Hub repositories are updated through pull requests. The Hub can
+    # only open a pull request against an existing branch, and our token cannot
+    # create a new version branch in a vendor-owned repository. Check this
+    # before merge-and-upload merges the GitHub PR, and before either production
+    # upload command spends time building artifacts that cannot be uploaded.
+    if command in ("release", "merge-and-upload"):
+        config_ref = (
+            ""
+            if dry_run
+            else (pr_head_sha if command == "merge-and-upload" else default_branch)
+        )
+        preflight_failures = preflight_external_uploads(
+            kernels,
+            requested_branch=requested_branch,
+            ref=config_ref or "",
+        )
+        if preflight_failures:
+            failure_message = (
+                "External Hub upload preflight failed; no merge or build was started:\n"
+                + "\n".join(f"- {failure}" for failure in preflight_failures)
+            )
+            if dry_run:
+                print(failure_message, file=sys.stderr)
+            else:
+                try_post_issue_comment(
+                    api_base,
+                    token,
+                    issue_number,
+                    format_result_comment(
+                        command_summary,
+                        mode_text,
+                        target_branch,
+                        pr_head_sha,
+                        failure_message=failure_message,
+                    ),
+                )
+            return 1
+
     status_comment_id = None
     if not dry_run:
         status_comment_id = comment_id_from_response(
@@ -868,16 +1157,20 @@ def main(*, dry_run: bool = False):
             token=token,
             repo=repository,
             ref=default_branch,
-            mode="release",
+            mode=dispatch_mode,
             repo_prefix=dispatch_repo_prefix,
             dispatch_key_prefix=f"pr{issue_number}-",
             pr_number=dispatch_pr_number,
             head_sha=pr_head_sha or "",
             target_branch=target_branch,
             upload=dispatch_upload,
+            bot_comment_id=str(status_comment_id or "") if dispatch_upload else "",
+            requested_backends=kernel_backends.get(kernel_name),
             # The audit is per-PR, so request it only once (on the first kernel).
             run_security=run_security and index == 0,
             dry_run=dry_run,
+            # Read backends from the PR commit (dry-run reads the working tree).
+            metadata_ref="" if dry_run else (pr_head_sha or ""),
         )
         emit_dispatch_diagnostics(release_result, dry_run=dry_run)
         for wf, dk in release_result.dispatched:

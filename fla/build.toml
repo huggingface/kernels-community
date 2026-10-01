@@ -1,0 +1,14 @@
+[general]
+name = "fla"
+version = 1
+edition = 5
+license = "MIT"
+backends = ["cuda", "xpu"]
+python-depends = ["einops"]
+
+[general.hub]
+repo-id = "kernels-community/fla"
+
+[torch-noarch]
+
+[kernel]

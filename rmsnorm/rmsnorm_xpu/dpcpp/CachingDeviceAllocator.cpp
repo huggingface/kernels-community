@@ -868,4 +868,4 @@ void CachingDeviceAllocator::releasePool(
 }
 
 } // namespace dpcpp
-} // namespace torch_ipex::xpu
+} // namespace kernels::xpu

@@ -3,12 +3,15 @@ import numpy as np
 import random
 import torch
 
-import deep_gemm
-from deep_gemm.testing import (
-    bench_kineto,
-    calc_diff, count_bytes,
-    ignore_env, get_arch_major
-)
+import kernels
+
+deep_gemm = kernels.get_kernel("kernels-community/deep-gemm", version=2)
+
+bench_kineto = deep_gemm.testing.bench_kineto
+calc_diff = deep_gemm.testing.calc_diff
+count_bytes = deep_gemm.testing.count_bytes
+ignore_env = deep_gemm.testing.ignore_env
+get_arch_major = deep_gemm.testing.get_arch_major
 
 from generators import (
     KernelType, get_ue8m0_usage, layout_masked_to_psum, align,

@@ -11,6 +11,8 @@ from .utils import element_mul_kernel
 from .utils import is_hip
 from .utils import infer_device
 from .utils import is_npu_available
+from .utils import device_context
+
 
 if compare_version("triton", operator.ge, "3.0.0") and not is_npu_available():
     try:
@@ -372,44 +374,45 @@ def cross_entropy_forward(
     if target.stride(-1) != 1:
         target = target.contiguous()
 
-    # Here we use a trick to store X_ptr gradient in X_ptr so we can save memory
-    liger_cross_entropy_kernel[(n_rows,)](
-        X_ptr=_input,
-        X_stride=_input.stride(-2),
-        Y_ptr=target,
-        Y_stride=target.stride(-1),  # always 1
-        weight_ptr=weight,  # dummy if None
-        loss_ptr=loss_1d,
-        z_loss_ptr=z_loss_1d,
-        loss_stride=loss_1d.stride(-1),  # always 1
-        token_accuracy_ptr=token_accuracy_1d,
-        token_accuracy_stride=token_accuracy_1d.stride(-1)
-        if return_token_accuracy
-        else 0,  # always 1 if accuracy is enabled
-        predicted_tokens_ptr=predicted_tokens_1d,
-        predicted_tokens_stride=predicted_tokens_1d.stride(-1)
-        if return_predicted_tokens
-        else 0,  # always 1 if predicted tokens is enabled
-        n_cols=V,
-        n_non_ignore=n_non_ignore,
-        sum_non_ignore_weight=sum_non_ignore_weight,
-        ignore_index=ignore_index,
-        weight_sum=weight_sum,
-        lse_square_scale=lse_square_scale,
-        label_smoothing=label_smoothing,
-        reduction=reduction,
-        softcap=softcap,
-        RETURN_Z_LOSS=return_z_loss,
-        RETURN_TOKEN_ACCURACY=return_token_accuracy,
-        RETURN_PREDICTED_TOKENS=return_predicted_tokens,
-        BLOCK_SIZE=BLOCK_SIZE,
-        HAS_WEIGHT=True if weight is not None else False,
-        HAS_SOFTCAPPING=True if softcap is not None else False,
-        HAS_GRADIENTS=_input.requires_grad,
-        # TODO: 32 seems to give the best performance
-        # Performance is quite sensitive to num_warps
-        num_warps=32 if not is_hip() else 16,
-    )
+    with device_context(_input.device):
+        # Here we use a trick to store X_ptr gradient in X_ptr so we can save memory
+        liger_cross_entropy_kernel[(n_rows,)](
+            X_ptr=_input,
+            X_stride=_input.stride(-2),
+            Y_ptr=target,
+            Y_stride=target.stride(-1),  # always 1
+            weight_ptr=weight,  # dummy if None
+            loss_ptr=loss_1d,
+            z_loss_ptr=z_loss_1d,
+            loss_stride=loss_1d.stride(-1),  # always 1
+            token_accuracy_ptr=token_accuracy_1d,
+            token_accuracy_stride=token_accuracy_1d.stride(-1)
+            if return_token_accuracy
+            else 0,  # always 1 if accuracy is enabled
+            predicted_tokens_ptr=predicted_tokens_1d,
+            predicted_tokens_stride=predicted_tokens_1d.stride(-1)
+            if return_predicted_tokens
+            else 0,  # always 1 if predicted tokens is enabled
+            n_cols=V,
+            n_non_ignore=n_non_ignore,
+            sum_non_ignore_weight=sum_non_ignore_weight,
+            ignore_index=ignore_index,
+            weight_sum=weight_sum,
+            lse_square_scale=lse_square_scale,
+            label_smoothing=label_smoothing,
+            reduction=reduction,
+            softcap=softcap,
+            RETURN_Z_LOSS=return_z_loss,
+            RETURN_TOKEN_ACCURACY=return_token_accuracy,
+            RETURN_PREDICTED_TOKENS=return_predicted_tokens,
+            BLOCK_SIZE=BLOCK_SIZE,
+            HAS_WEIGHT=True if weight is not None else False,
+            HAS_SOFTCAPPING=True if softcap is not None else False,
+            HAS_GRADIENTS=_input.requires_grad,
+            # TODO: 32 seems to give the best performance
+            # Performance is quite sensitive to num_warps
+            num_warps=32 if not is_hip() else 16,
+        )
 
     if reduction == "none":
         loss = loss_1d
@@ -437,18 +440,19 @@ def cross_entropy_backward(_input, grad_output):
     # We use a Triton kernel instead of a PyTorch operation because modifying inputs in-place
     # for gradient storage and backward multiple times causes anomalies with PyTorch but not with Triton.
     else:
-        BT, V = _input.shape
-        n_rows = BT
-        BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
+        with device_context(_input.device):
+            BT, V = _input.shape
+            n_rows = BT
+            BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
 
-        element_mul_kernel[(n_rows,)](
-            _input,
-            _input.stride(-2),
-            grad_output,
-            V,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=32 if not is_hip() else 16,
-        )
+            element_mul_kernel[(n_rows,)](
+                _input,
+                _input.stride(-2),
+                grad_output,
+                V,
+                BLOCK_SIZE=BLOCK_SIZE,
+                num_warps=32 if not is_hip() else 16,
+            )
 
     return _input
 

@@ -16,19 +16,27 @@ KERNEL_SOURCE_MAPPING = {
     "aiter-rope": "https://github.com/ROCm/aiter",
     "causal-conv1d": "https://github.com/Dao-AILab/causal-conv1d",
     "deformable-detr": "",
+    "einops": "https://github.com/arogozhnikov/einops",
     "finegrained-fp8": "",
+    "finegrained-kernels": "",
     "flash-attn-ops": "https://github.com/Dao-AILab/flash-attention",
+    "topk": "",
     "flash-attn2": "https://github.com/Dao-AILab/flash-attention",
     "flash-attn3": "https://github.com/Dao-AILab/flash-attention",
     "flash-attn4": "https://github.com/Dao-AILab/flash-attention",
     "flash-mla": "https://github.com/deepseek-ai/FlashMLA",
     "fp8-fbgemm": "https://github.com/pytorch/FBGEMM",
+    "ggml-attn": "https://github.com/ggml-org/llama.cpp",
+    "ggml-gated-delta-net": "https://github.com/ggml-org/llama.cpp",
+    "ggml-norm": "https://github.com/ggml-org/llama.cpp",
+    "ggml-quantization": "https://github.com/ggml-org/llama.cpp",
     "gpt-oss-metal-kernels": "https://github.com/openai/gpt-oss",
     "layer-norm": "https://github.com/Dao-AILab/flash-attention",
     "mamba-ssm": "https://github.com/state-spaces/mamba",
     "megablocks": "https://github.com/databricks/megablocks",
     "mra": "",
     "msa": "https://github.com/MiniMax-AI/MSA",
+    "natten": "https://github.com/SHI-Labs/NATTEN",
     "paged-attention": "",
     "punica-sgmv": "https://github.com/predibase/lorax",
     "quantization-bitsandbytes": "https://github.com/bitsandbytes-foundation/bitsandbytes",
@@ -52,6 +60,7 @@ KERNEL_SOURCE_MAPPING = {
     "mlx-quantization-metal-kernels": "https://github.com/ml-explore/mlx",
     "mlx-rmsnorm": "https://github.com/ml-explore/mlx",
     "sage-attention": "https://github.com/thu-ml/SageAttention",
+    "sage-blackwell": "https://github.com/thu-ml/SageAttention",
     "deep-gemm": "https://github.com/deepseek-ai/DeepGEMM",
     "bitsandbytes-mps": "",
     "aiter-flash-attn": "https://github.com/ROCm/aiter",
@@ -59,6 +68,12 @@ KERNEL_SOURCE_MAPPING = {
     "aiter-kernels": "https://github.com/ROCm/aiter",
     # Too much stuff happening in vLLM, not worth reporting as MoE freshness.
     "vllm-moe": "",
+    "fla": "github.com/fla-org/flash-linear-attention",
+    "nvfp4-gemm": "",
+    # Developed in-house; upstream is a Hub kernel repo, not a GitHub project.
+    "esmfold2-trimul": "",
+    # Written for this repo, so there is no upstream to track.
+    "weathernext2-banded-attention": "",
 }
 
 def parse_args() -> argparse.Namespace:

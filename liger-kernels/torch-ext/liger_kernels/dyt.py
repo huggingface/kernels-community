@@ -9,6 +9,8 @@ from .utils import ensure_contiguous
 from .utils import get_npu_core_count
 from .utils import infer_device
 from .utils import is_npu_available
+from .utils import device_context
+
 
 if compare_version("triton", operator.ge, "3.0.0") and not is_npu_available():
     try:
@@ -107,16 +109,17 @@ def liger_dyt_fwd(x, alpha, gamma, beta):
 
     y = torch.empty_like(x)
 
-    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]), M)
-    _dyt_fwd_kernel[grid](
-        x,
-        y,
-        alpha,
-        gamma,
-        beta,
-        HAVE_BETA,
-        N,
-    )
+    with device_context(x.device):
+        grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]), M)
+        _dyt_fwd_kernel[grid](
+            x,
+            y,
+            alpha,
+            gamma,
+            beta,
+            HAVE_BETA,
+            N,
+        )
     return y.view(input_shape)
 
 
@@ -139,8 +142,9 @@ def liger_dyt_bwd(dy, x, alpha, gamma, beta):
     db = torch.empty(NUM_SMS, N, dtype=torch.float32, device=x.device) if HAVE_BETA else None
     dx = torch.empty_like(dy)
 
-    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]), NUM_SMS)
-    _dyt_bwd_kernel[grid](dy, dx, da, dg, db, x, alpha, gamma, HAVE_BETA, M, N)
+    with device_context(x.device):
+        grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]), NUM_SMS)
+        _dyt_bwd_kernel[grid](dy, dx, da, dg, db, x, alpha, gamma, HAVE_BETA, M, N)
     if HAVE_BETA:
         db = db.sum(0).to(x.dtype)
     dg = dg.sum(0).to(gamma.dtype)

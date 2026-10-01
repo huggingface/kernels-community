@@ -1,6 +1,7 @@
 [general]
 name = "punica-sgmv"
 version = 1
+edition = 5
 license = "Apache-2.0"
 backends = ["cuda"]
 
@@ -23,7 +24,10 @@ cuda-capabilities = [
     "9.0",
     "10.0",
     "10.1",
+    "10.3",
+    "11.0",
     "12.0",
+    "12.1+PTX",
 ]
 depends = ["torch"]
 include = ["."]
@@ -32,30 +36,6 @@ src = [
     "bgmv/bgmv_impl.cuh",
     "bgmv/bgmv_config.h",
     "flashinfer/vec_dtypes.cuh",
-]
-
-[kernel.sgmv_flashinfer]
-backend = "cuda"
-cuda-capabilities = [
-    "8.0",
-    "8.6",
-    "8.7",
-    "8.9",
-    "9.0",
-    "10.0",
-    "10.1",
-    "12.0",
-]
-depends = ["torch"]
-include = ["."]
-src = [
-    "flashinfer/cp_async.cuh",
-    "flashinfer/mma.cuh",
-    "flashinfer/permuted_smem.cuh",
-    "flashinfer/vec_dtypes.cuh",
-    "sgmv_flashinfer/sgmv_all.cu",
-    "sgmv_flashinfer/sgmv_config.h",
-    "sgmv_flashinfer/sgmv_flashinfer.cuh",
 ]
 
 [kernel.sgmv]
@@ -78,4 +58,31 @@ src = [
     "punica_kernels/punica_ops.cc",
     "sgmv/sgmv.h",
     "sgmv_flashinfer/sgmv_config.h",
+]
+
+[kernel.sgmv_flashinfer]
+backend = "cuda"
+cuda-capabilities = [
+    "8.0",
+    "8.6",
+    "8.7",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.1",
+    "10.3",
+    "11.0",
+    "12.0",
+    "12.1+PTX",
+]
+depends = ["torch"]
+include = ["."]
+src = [
+    "flashinfer/cp_async.cuh",
+    "flashinfer/mma.cuh",
+    "flashinfer/permuted_smem.cuh",
+    "flashinfer/vec_dtypes.cuh",
+    "sgmv_flashinfer/sgmv_all.cu",
+    "sgmv_flashinfer/sgmv_config.h",
+    "sgmv_flashinfer/sgmv_flashinfer.cuh",
 ]

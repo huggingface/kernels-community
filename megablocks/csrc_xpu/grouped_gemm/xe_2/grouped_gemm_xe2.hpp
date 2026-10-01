@@ -45,6 +45,7 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 namespace MoE {
+inline namespace MEGABLOCKS_XE_TARGET_NS {
 using namespace cute;
 
 template <typename T, char LayoutKind>
@@ -90,7 +91,12 @@ CUTE_DEVICE void MoEGEMM(
                                     (!std::is_same_v<ElementS, uint8_t>);
   static constexpr bool is_B_mxfp4 = (std::is_same_v<ElementB, uint8_t>) &&
                                      (std::is_same_v<ElementS, uint8_t>);
+  static constexpr bool is_B_mxfp8 =
+      (std::is_same_v<ElementB, cutlass::float_e4m3_t> ||
+       std::is_same_v<ElementB, cutlass::float_e5m2_t>) &&
+      (std::is_same_v<ElementS, uint8_t>);
   static constexpr bool is_B_4bits = std::is_same_v<ElementB, uint8_t>;
+  static constexpr bool is_B_block_scaled = is_B_4bits || is_B_mxfp8;
 
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   auto wg_tile = mma.tile_mnk();
@@ -146,6 +152,12 @@ CUTE_DEVICE void MoEGEMM(
     if constexpr (is_B_4bits) {
       ptr_Scales_curr_batch =
           const_cast<ElementS*>(Scales) + B_offset * 2 / group_size;
+    } else if constexpr (is_B_mxfp8) {
+      ptr_Scales_curr_batch =
+          const_cast<ElementS*>(Scales) +
+          static_cast<int64_t>(expert_id) *
+              static_cast<int64_t>(gemm_n) *
+              (static_cast<int64_t>(gemm_k) / group_size);
     }
     ElementBI* ptr_Bias_curr_batch = nullptr;
     if (Bias != static_cast<ElementBI*>(nullptr)) {
@@ -161,6 +173,9 @@ CUTE_DEVICE void MoEGEMM(
       } else if constexpr (is_B_mxfp4) {
         return make_moe_tensor<float_e2m1_t, actual_layout_of_B>(
             reinterpret_cast<float_e2m1_t*>(ptr_B_curr_batch), gemm_n, gemm_k);
+      } else if constexpr (is_B_mxfp8) {
+        return make_moe_tensor<ElementB, actual_layout_of_B>(
+            ptr_B_curr_batch, gemm_n, gemm_k);
       } else {
         return make_moe_tensor<ElementB, actual_layout_of_B>(
             ptr_B_curr_batch, gemm_n, gemm_k);
@@ -174,7 +189,7 @@ CUTE_DEVICE void MoEGEMM(
       int m_coord = (group_m_id - pre_tiles);
       auto tile_coord = make_coord(m_coord, n_coord, _, 0);
 
-      if constexpr (is_B_4bits) {
+      if constexpr (is_B_block_scaled) {
 #define XE_GEMM_4BITS_CALLER(GroupSize)                                     \
   xe_gemm_4bits<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD, GroupSize>( \
       A_tensor,                                                             \
@@ -217,4 +232,5 @@ CUTE_DEVICE void MoEGEMM(
   }
 }
 
+}  // inline namespace MEGABLOCKS_XE_TARGET_NS
 }  // namespace MoE

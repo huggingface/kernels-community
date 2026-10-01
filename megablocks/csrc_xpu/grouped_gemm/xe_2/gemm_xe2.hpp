@@ -44,13 +44,24 @@
 #include "cutlass/util/reference/device/gemm_complex.h"
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/reference/host/tensor_fill.h"
+#include "xe2_target_ns.hpp"
 
 #pragma clang diagnostic ignored "-Wpass-failed"
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 namespace MoE {
+inline namespace MEGABLOCKS_XE_TARGET_NS {
 
 using namespace cute;
+
+// sycl-tla 0.9.1+ (PyTorch 2.13) passes a SPIRVScope enum to the barriers
+// instead of int; the enum lives in <cute/util/xe_split_barrier.hpp>, absent in
+// older versions, so detect it and fall back to int 2 (workgroup scope).
+#if defined(__has_include) && __has_include(<cute/util/xe_split_barrier.hpp>)
+inline constexpr auto kBarrierScope = ScopeWorkgroup;
+#else
+inline constexpr int kBarrierScope = 2;
+#endif
 
 template <
     class GmemTiledCopyA,
@@ -130,7 +141,7 @@ CUTE_DEVICE void xe_gemm(
 
   const int prefetch_dist = 3;
 
-  constexpr int barrier_scope = 2;
+  constexpr auto barrier_scope = kBarrierScope;
 
   int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
   int k_tile_prefetch = 0;
@@ -292,7 +303,7 @@ CUTE_DEVICE void xe_gemm_4bits(
 
   const int prefetch_dist = 3;
 
-  constexpr int barrier_scope = 2;
+  constexpr auto barrier_scope = kBarrierScope;
 
   int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
   int k_tile_prefetch = 0;
@@ -357,7 +368,9 @@ CUTE_DEVICE void xe_gemm_4bits(
             scale = Scales
                 [(n_tile_start + n_sg_start + sg_local_n) * group_num +
                  group_idx];
-          } else if constexpr (std::is_same_v<TB, float_e2m1_t>) {
+          } else if constexpr (std::is_same_v<TB, float_e2m1_t> ||
+                               std::is_same_v<TB, float_e4m3_t> ||
+                               std::is_same_v<TB, float_e5m2_t>) {
             uint32_t scale_u32 =
                 Scales
                     [(n_tile_start + n_sg_start + sg_local_n) * group_num +
@@ -411,4 +424,5 @@ CUTE_DEVICE void xe_gemm_4bits(
   copy(copy_c, tCrC_final_sg_tensor, tCgC);
 }
 
+}  // inline namespace MEGABLOCKS_XE_TARGET_NS
 }  // namespace MoE

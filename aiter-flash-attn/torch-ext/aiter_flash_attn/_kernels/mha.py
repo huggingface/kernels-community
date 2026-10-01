@@ -3,15 +3,16 @@
 
 import functools
 import json
+
 import torch
 import triton
 import triton.language as tl
 
 from ..utils._triton import arch_info
-from ..utils.core import AITER_TRITON_CONFIGS_PATH
-from ..utils._triton.pid_preprocessing import remap_xcd
-from ..utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 from ..utils._triton.kernel_repr import make_kernel_repr
+from ..utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
+from ..utils._triton.pid_preprocessing import remap_xcd
+from ..utils.core import AITER_TRITON_CONFIGS_PATH
 
 
 @triton.jit
@@ -362,6 +363,7 @@ def _attn_fwd(
     USE_INT64_STRIDES: tl.constexpr,
     ENABLE_SINK: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    HEAD_STRIDE_ALIGNED_8: tl.constexpr = False,
 ):
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
     # calculate offsets
@@ -564,9 +566,22 @@ def _attn_fwd(
         off_k_head = off_q_head
 
     # q,k,v offsets
+    # When the caller guarantees that the head-axis strides of Q/K/V are
+    # multiples of 8 elements (set via HEAD_STRIDE_ALIGNED_8), the head-axis
+    # byte offset is 16-byte aligned. Auto-specialization only fires at the
+    # 16-element threshold, so hint the smaller multiple explicitly to let
+    # AxisInfo widen the global load.
+    qh_off = off_q_head * stride_qh
+    kh_off = off_k_head * stride_kh
+    vh_off = off_k_head * stride_vh
+    if HEAD_STRIDE_ALIGNED_8:
+        qh_off = tl.multiple_of(qh_off, 8)
+        kh_off = tl.multiple_of(kh_off, 8)
+        vh_off = tl.multiple_of(vh_off, 8)
+
     q_offs = (
         off_z * stride_qz
-        + off_q_head * stride_qh
+        + qh_off
         + cu_seqlens_q_start * stride_qm
         + offs_m[:, None] * stride_qm
         + offs_d[None, :] * stride_qk
@@ -575,7 +590,7 @@ def _attn_fwd(
     if HAS_PE:
         q_pe_offs = (
             off_z * stride_qz
-            + off_q_head * stride_qh
+            + qh_off
             + cu_seqlens_q_start * stride_qm
             + offs_m[:, None] * stride_qm
             + offs_pe[None, :] * stride_qk
@@ -586,7 +601,7 @@ def _attn_fwd(
 
     k_offs = (
         off_z * stride_kz
-        + off_k_head * stride_kh
+        + kh_off
         + cu_seqlens_k_start * stride_kn
         + offs_d[:, None] * stride_kk
         + offs_n[None, :] * stride_kn
@@ -595,7 +610,7 @@ def _attn_fwd(
     if HAS_PE:
         k_pe_offs = (
             off_z * stride_kz
-            + off_k_head * stride_kh
+            + kh_off
             + cu_seqlens_k_start * stride_kn
             + offs_pe[:, None] * stride_kk
             + offs_n[None, :] * stride_kn
@@ -606,7 +621,7 @@ def _attn_fwd(
 
     v_offs = (
         off_z * stride_vz
-        + off_k_head * stride_vh
+        + vh_off
         + cu_seqlens_k_start * stride_vn
         + offs_n[:, None] * stride_vn
         + offs_d[None, :] * stride_vk
@@ -856,15 +871,14 @@ def _attn_fwd(
     end_m_idx = (start_m + 1) * BLOCK_M
     start_m_idx = start_m * BLOCK_M
     causal_start_idx = seqlen_q - seqlen_k
-    if IS_CAUSAL:
-        if causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
-            out_mask_boundary = tl.full(
-                (BLOCK_DMODEL_POW2,), causal_start_idx, dtype=tl.int32
-            )
-            mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
-            out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
-            z = 0.0
-            acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
+    if IS_CAUSAL and (causal_start_idx > start_m_idx and causal_start_idx < end_m_idx):
+        out_mask_boundary = tl.full(
+            (BLOCK_DMODEL_POW2,), causal_start_idx, dtype=tl.int32
+        )
+        mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
+        out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
+        z = 0.0
+        acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
 
     # write back LSE(Log Sum Exponents), the log of the normalization constant
     overflow_size = end_m_idx - seqlen_q

@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cute/util/compat.hpp>
 #include <cute/tensor.hpp>
+#include "xe_barrier_compat.hpp"
 
 #include "cutlass/gemm/device/gemm_universal.h"
 #include "cutlass/util/print_error.hpp"
@@ -302,7 +303,7 @@ gemm_kernel(Trait &trait,
     auto pBgB = thr_prefetch_B.partition_S(gB);
 
     const int prefetch_dist = 3;
-    constexpr int barrier_scope = 2;
+    constexpr auto barrier_scope = ScopeWorkgroup;
 
     int k_tile_count = ceil_div(shape<1>(A), get<2>(tile_mnk));
     int k_tile_prefetch = 0;

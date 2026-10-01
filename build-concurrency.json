@@ -4,5 +4,11 @@
       "max-jobs": 1,
       "cores": 4
     }
+  },
+  "natten": {
+    "cuda": {
+      "max-jobs": 2,
+      "cores": 16
+    }
   }
 }
