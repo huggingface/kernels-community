@@ -1,8 +1,11 @@
 """The kernel has to agree with the PyTorch path it replaces, on the mask shape the model uses."""
 
+import importlib
+
 import kernels
 import pytest
 import torch
+import triton
 
 
 weathernext2_banded_attention = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=2)
@@ -41,6 +44,15 @@ def banded_mask(blocks, block_size, density, device, generator):
 # every kernel launch and the declared backend would go untested.
 DEVICE = weathernext2_banded_attention.infer_device()
 requires_accelerator = pytest.mark.skipif(DEVICE == "cpu", reason="the kernel needs an accelerator")
+
+
+@pytest.fixture(autouse=True)
+def fixed_attention_config(monkeypatch):
+    module = importlib.import_module(banded_attention.__module__)
+    configs = [triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1)]
+    for tuner in (module._banded_attention_kernel, module._sparse_attention_kernel):
+        monkeypatch.setattr(tuner, "configs", configs)
+        monkeypatch.setattr(tuner, "cache", {})
 
 
 @requires_accelerator

@@ -32,6 +32,11 @@ This kernel walks the three neighbours straight out of the ungathered tensors, s
 - the mask is streamed a tile at a time rather than expanded,
 - tiles the band never reaches are skipped before their two matmuls, not after.
 
+The layer's packed-mask path instead decodes one mesh block with Triton and calls
+`scaled_dot_product_attention` for that block. This bounds attention workspace while
+retaining the reference arithmetic. The direct `banded_attention` API still provides
+the fused tiled implementation.
+
 Forward only. The layer refuses the fast path whenever autograd is live, because the
 kernel's output carries no `grad_fn`: a `loss.backward()` would still succeed while every
 parameter upstream of attention silently received nothing. Fine-tuning therefore takes
@@ -47,9 +52,9 @@ The reference implementation runs this attention in float32. `precision` control
 | `"default"` (default) | Triton's backend default: TF32 on supported NVIDIA GPUs, IEEE on AMD |
 | `"ieee"` | true float32, no tensor-core path, slower than the fallback it replaces |
 
-`"ieee"` is mainly for checking numerics on NVIDIA rather than for running. The model layer uses
-the backend default; the low-level `banded_attention` function accepts `precision="ieee"` for
-diagnostics. The default computes in full float32 on AMD.
+The direct `banded_attention` API accepts either mode. The layer selects `"ieee"`
+for the fused boolean-mask path; its packed-mask path uses block-wise SDPA. Neither
+layer path opts into reduced precision.
 
 ## Supported shapes
 
@@ -98,6 +103,9 @@ rather than assuming CUDA.
 
 **CUDA (H100, `kashif/weathernext2-mini`, 1 degree: 4 blocks of 2577 nodes, 7731 keys,
 4 heads, head_dim 128, 13% band density), real initial conditions:**
+
+These historical measurements describe the fused attention path, not the block-wise
+packed-mask path.
 
 | path | ms/step | attention peak GiB |
 |---|---|---|
