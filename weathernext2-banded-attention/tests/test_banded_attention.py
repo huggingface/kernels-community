@@ -1,11 +1,8 @@
 """The kernel has to agree with the PyTorch path it replaces, on the mask shape the model uses."""
 
+import kernels
 import pytest
 import torch
-import importlib
-import triton
-
-import kernels
 
 
 weathernext2_banded_attention = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=2)
@@ -118,6 +115,26 @@ class _StubAttention(WeatherNext2Attention):
 
 
 @pytest.mark.kernels_ci
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_layer_keeps_attention_in_full_float32(dtype, monkeypatch):
+    attention = _StubAttention(64, 2).to(dtype=dtype).eval()
+    hidden_states = torch.randn(2, 3, 16, 64, dtype=dtype)
+    mask = torch.ones(3, 16, 48, dtype=torch.bool)
+    calls = []
+
+    def forward(query, key, value, mask, scaling, **kwargs):
+        calls.append((query.dtype, key.dtype, value.dtype, kwargs))
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(weathernext2_banded_attention.layers, "banded_attention", forward)
+    with torch.inference_mode():
+        output, _ = attention(hidden_states, mask)
+
+    assert calls == [(torch.float32, torch.float32, torch.float32, {"precision": "ieee"})]
+    assert output.dtype == dtype
+
+
+@pytest.mark.kernels_ci
 def test_backward_reaches_every_projection():
     """The kernel has no backward, so anything needing one must take the differentiable path.
 
@@ -168,17 +185,7 @@ def test_rejects_head_dimensions_it_cannot_tile():
 @pytest.mark.parametrize("block_size", [65, 129])
 @pytest.mark.parametrize("pattern", ["self", "random", "empty"])
 @pytest.mark.parametrize("packed_mask", [False, True])
-def test_sparse_tiles_preserve_outputs(block_size, pattern, packed_mask, monkeypatch):
-    module = importlib.import_module(banded_attention.__module__)
-    tuner = module._banded_attention_kernel
-    monkeypatch.setattr(
-        tuner,
-        "configs",
-        [triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1)],
-    )
-    monkeypatch.setattr(tuner, "cache", {})
-    monkeypatch.setattr(module._sparse_attention_kernel, "configs", tuner.configs)
-    monkeypatch.setattr(module._sparse_attention_kernel, "cache", {})
+def test_sparse_tiles_preserve_outputs(block_size, pattern, packed_mask):
     generator = torch.Generator(device=DEVICE).manual_seed(7)
     shape = (2, 3, block_size, 2, 32)
     query, key, value = (torch.randn(shape, device=DEVICE, generator=generator).transpose(2, 3) for _ in range(3))
@@ -202,4 +209,18 @@ def test_sparse_tiles_preserve_outputs(block_size, pattern, packed_mask, monkeyp
         packed_mask=packed_mask,
     )
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(actual, reference(query, key, value, mask, 32**-0.5), atol=2e-5, rtol=2e-5)
+
+
+@requires_accelerator
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("block_size", [65, 129])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_packed_layer_preserves_sdpa(block_size, batch):
+    generator = torch.Generator(device=DEVICE).manual_seed(7)
+    shape = (batch, 3, block_size, 2, 32)
+    query, key, value = (torch.randn(shape, device=DEVICE, generator=generator).transpose(2, 3) for _ in range(3))
+    mask = banded_mask(3, block_size, 0.1, DEVICE, generator)
+    prepared = weathernext2_banded_attention.layers._prepare_mask(mask, sparse_tiles=True, packed_mask=True)
+    actual = weathernext2_banded_attention.layers._packed_attention(query, key, value, prepared, 32**-0.5)
     torch.testing.assert_close(actual, reference(query, key, value, mask, 32**-0.5), atol=2e-5, rtol=2e-5)

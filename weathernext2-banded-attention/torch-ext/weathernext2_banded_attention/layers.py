@@ -7,7 +7,7 @@ Only `forward` is defined: `kernels` binds it onto the model's own module, so `s
 import torch
 from torch import nn
 
-from .banded_attention import PreparedMask, _prepare_mask, banded_attention
+from .banded_attention import PreparedMask, _prepare_mask, _unpack_mask, banded_attention
 from .utils import device_context
 from .grid import WeatherNext2ForecastHead as WeatherNext2ForecastHead
 from .grid import WeatherNext2GridEncoder as WeatherNext2GridEncoder
@@ -89,6 +89,27 @@ def _reference_attention(query, key, value, attention_mask, scaling):
 _PREPARED_BUFFERS = ("packed", "tiles", "counts", "offsets")
 
 
+def _packed_attention(query, key, value, mask, scaling):
+    """Preserve SDPA arithmetic while bounding its workspace to one mesh block."""
+    batch, blocks, heads, block_size, head_dim = query.shape
+    out = torch.empty_like(query)
+    padding = query.new_zeros(batch, heads, block_size, head_dim)
+    for block in range(blocks):
+        dense_mask = _unpack_mask(mask, block)
+        keys, values = (
+            torch.cat(
+                [states[:, source] if 0 <= source < blocks else padding for source in (block - 1, block, block + 1)],
+                dim=2,
+            )
+            for states in (key, value)
+        )
+        out[:, block] = nn.functional.scaled_dot_product_attention(
+            query[:, block], keys, values, attn_mask=dense_mask, scale=scaling
+        )
+        del dense_mask
+    return out
+
+
 class WeatherNext2AttentionMask(nn.Module):
     """Packs the geometry's banded mask once, into the active tiles the attention kernel walks.
 
@@ -131,9 +152,12 @@ class WeatherNext2Attention(nn.Module):
 
         banded = _banded_mask(attention_mask)
         if _is_banded(attention_mask, hidden_states) and not _needs_grad(query, key, value):
-            # The kernel walks the three neighbouring blocks itself, so the keys and values are
-            # never tripled and the mask is never expanded.
-            attn_output = banded_attention(query.float(), key.float(), value.float(), banded, self.scaling)
+            if isinstance(banded, PreparedMask):
+                attn_output = _packed_attention(query.float(), key.float(), value.float(), banded, self.scaling)
+            else:
+                attn_output = banded_attention(
+                    query.float(), key.float(), value.float(), banded, self.scaling, precision="ieee"
+                )
         else:
             attn_output = _reference_attention(query, key, value, attention_mask, self.scaling)
 

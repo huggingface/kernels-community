@@ -109,6 +109,23 @@ def test_prepared_mask_needs_packed_words():
         kernel.banded_attention(query, query, query, prepared, 32**-0.5)
 
 
+@requires_accelerator
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("empty", [False, True])
+def test_decode_one_block(empty):
+    storage = torch.rand(3, 65, 390, device=DEVICE) > 0.5
+    mask = storage[..., ::2]
+    mask[0, :, :65] = False
+    mask[-1, :, 130:] = False
+    if empty:
+        mask.zero_()
+    prepared = kernel.layers._prepare_mask(mask, sparse_tiles=True, packed_mask=True)
+    for block in range(3):
+        decoded = kernel.layers._unpack_mask(prepared, block)
+        assert decoded.shape == (65, 195)
+        torch.testing.assert_close(decoded, mask[block], atol=0, rtol=0)
+
+
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("reason", ["training", "gradients", "flex"])
 def test_standard_mask_fallback(reason):

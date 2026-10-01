@@ -12,6 +12,7 @@ float32 accumulation, because upstream casts q, k and v to float32 before attent
 (`sparse_transformer.py`, `upcast_attn_to_fp32`) and the released configs all set it.
 """
 
+import os
 from typing import NamedTuple
 
 import torch
@@ -27,6 +28,7 @@ from .utils import device_context
 PRECISION_DEFAULT = 0
 PRECISION_IEEE = 1
 _PRECISIONS = {"default": PRECISION_DEFAULT, "ieee": PRECISION_IEEE}
+_AUTOTUNE = os.environ.get("WEATHERNEXT2_BANDED_ATTENTION_AUTOTUNE", "0").lower() in ("1", "true", "yes", "on")
 
 
 class PreparedMask(NamedTuple):
@@ -48,6 +50,10 @@ def _is_hip() -> bool:
 def _configs():
     """Tile shapes to sweep, per backend.
 
+    Without `WEATHERNEXT2_BANDED_ATTENTION_AUTOTUNE=1` this is the one config Faster-WeatherNext runs
+    its tiled attention with (64 x 32 tiles, 4 warps, 1 stage). A single config skips the autotuner's
+    benchmarking, which otherwise runs every config on the first forward and took minutes per shape.
+
     AMD wants fewer pipeline stages than Hopper, whose SMEM is larger than CDNA/RDNA's LDS, so the
     HIP sweep shifts down one. Everything else, Intel XPU included, takes the same conservative
     sweep rather than a guess.
@@ -56,6 +62,8 @@ def _configs():
     (`kernel[grid](..., waves_per_eu=n)`), and `triton.Config` has no such parameter, so putting it
     here raises `TypeError` on the very backend it is meant to help.
     """
+    if not _AUTOTUNE:
+        return [triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1)]
     # BLOCK_N=32 is kept: with a sparse band the narrow key tile wins often enough to matter, and
     # dropping it cost ~35% on the mini checkpoint's shape.
     tiles = [(m, n) for m in (64, 128) for n in (32, 64, 128)]
@@ -112,6 +120,38 @@ def _read_mask(mask_ptr, block, rows, columns, stride_b, stride_m, stride_n, val
         mask_ptr + block * stride_b + rows[:, None] * stride_m + columns[None, :] * stride_n, mask=valid, other=0
     )
     return word.to(tl.int1)
+
+
+@triton.jit
+def _unpack_mask_kernel(packed_ptr, tiles_ptr, counts_ptr, offsets_ptr, out_ptr, block, block_size):
+    tile = tl.program_id(0)
+    neighbour = tl.program_id(1)
+    slot = (block * tl.cdiv(block_size, 64) + tile) * 3 + neighbour
+    key_tiles = tl.cdiv(block_size, 32)
+    count = tl.load(counts_ptr + slot)
+    offset = tl.load(offsets_ptr + slot)
+    rows = tile * 64 + tl.arange(0, 64)
+    bits = tl.arange(0, 32)
+    for index in range(count):
+        columns = tl.load(tiles_ptr + slot * key_tiles + index) * 32 + bits
+        word = tl.load(packed_ptr + (offset + index) * 64 + tl.arange(0, 64))
+        keep = ((word[:, None] >> bits[None, :]) & 1).to(tl.int1)
+        tl.store(
+            out_ptr + rows[:, None] * (3 * block_size) + neighbour * block_size + columns[None, :],
+            keep,
+            mask=(rows[:, None] < block_size) & (columns[None, :] < block_size),
+        )
+
+
+def _unpack_mask(mask, block):
+    """Decode one mesh block, without materializing a batch- or head-expanded mask."""
+    _, block_size, key_length = mask.shape
+    out = torch.zeros((block_size, key_length), dtype=torch.bool, device=mask.packed.device)
+    with device_context(out.device):
+        _unpack_mask_kernel[(triton.cdiv(block_size, 64), 3)](
+            mask.packed, mask.tiles, mask.counts, mask.offsets, out, block, block_size, num_warps=4
+        )
+    return out
 
 
 @triton.jit

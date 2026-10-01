@@ -13,6 +13,11 @@ kernel with a pure-PyTorch fallback.
 Written for this repo. One Triton source, no backend-specific code beyond the autotune sweep, so
 it builds for anything Triton targets.
 
+The attention kernel runs one fixed config by default, the 64 x 32 tiles with 4 warps and 1 stage
+that [Faster-WeatherNext](https://github.com/Raymondlol/Faster-WeatherNext) uses, so the first
+forward only compiles. Set `WEATHERNEXT2_BANDED_ATTENTION_AUTOTUNE=1` to sweep tile shapes, warps
+and stages instead; that benchmarks every config on the first call for each shape.
+
 ## What it does
 
 WeatherNext 2 runs on an icosahedral mesh whose nodes are ordered by reverse
