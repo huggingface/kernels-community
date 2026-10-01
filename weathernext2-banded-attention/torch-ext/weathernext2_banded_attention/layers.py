@@ -86,30 +86,32 @@ def _reference_attention(query, key, value, attention_mask, scaling):
     return out.reshape(batch, blocks, heads, block_size, head_dim)
 
 
+_PREPARED_BUFFERS = ("packed", "tiles", "counts", "offsets")
+
+
 class WeatherNext2AttentionMask(nn.Module):
+    """Packs the geometry's banded mask once, into the active tiles the attention kernel walks.
+
+    The packed form is kept as non-persistent buffers, so it follows the model across `.to()` and
+    stays out of the state dict. It is rebuilt only when the geometry buffer itself changes.
+    """
+
     def forward(self, attention_mask, batch_size, dtype):
         if self.training or torch.is_grad_enabled() or self.config._attn_implementation == "flex_attention":
             return type(self).forward(self, attention_mask, batch_size, dtype)
         mask = attention_mask[:, 0]
         try:
-            version = mask._version
+            key = (mask.data_ptr(), mask.device, mask._version)
         except RuntimeError:
-            version = None
-        key = (mask.data_ptr(), tuple(mask.shape), mask.stride(), mask.device, version)
-        backend = getattr(torch, mask.device.type)
-        with device_context(mask.device):
-            cached = getattr(self, "_prepared_attention_mask", None)
-            if version is not None and cached is not None and cached[0] == key:
-                stream = backend.current_stream(mask.device)
-                stream.wait_event(cached[2])
-                for tensor in cached[1][:4]:
-                    tensor.record_stream(stream)
-                return cached[1]
-            prepared = _prepare_mask(mask, True, True)
-            ready = backend.Event()
-            ready.record()
-            self._prepared_attention_mask = (key, prepared, ready)
-            return prepared
+            key = None  # An inference tensor has no version counter, so a change could not be seen.
+        if key is None or getattr(self, "_prepared_key", None) != key:
+            with device_context(mask.device):
+                prepared = _prepare_mask(mask, sparse_tiles=True, packed_mask=True)
+            for name, tensor in zip(_PREPARED_BUFFERS, prepared):
+                self.register_buffer(f"_prepared_{name}", tensor, persistent=False)
+            self._prepared_key = key
+            self._prepared_shape = prepared.shape
+        return PreparedMask(*(getattr(self, f"_prepared_{name}") for name in _PREPARED_BUFFERS), self._prepared_shape)
 
 
 class WeatherNext2Attention(nn.Module):
@@ -126,15 +128,7 @@ class WeatherNext2Attention(nn.Module):
         if _is_banded(attention_mask, hidden_states) and not _needs_grad(query, key, value):
             # The kernel walks the three neighbouring blocks itself, so the keys and values are
             # never tripled and the mask is never expanded.
-            attn_output = banded_attention(
-                query.float(),
-                key.float(),
-                value.float(),
-                banded,
-                self.scaling,
-                sparse_tiles=kwargs.get("sparse_tiles", False),
-                packed_mask=kwargs.get("packed_mask", False),
-            )
+            attn_output = banded_attention(query.float(), key.float(), value.float(), banded, self.scaling)
         else:
             attn_output = _reference_attention(query, key, value, attention_mask, self.scaling)
 
