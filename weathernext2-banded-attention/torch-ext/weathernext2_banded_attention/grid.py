@@ -15,10 +15,15 @@ def _can_chunk(layer, weights):
     return (
         not layer.training
         and not torch.is_grad_enabled()
-        and weights.dtype == torch.float32
+        and weights.is_floating_point()
         and weights.device.type in ("cpu", "cuda", "xpu")
         and not torch.is_autocast_enabled(weights.device.type)
     )
+
+
+def _can_fuse(output):
+    """The Triton epilogues are written for float32; other dtypes keep PyTorch's own rounding."""
+    return output.device.type != "cpu" and output.dtype == torch.float32
 
 
 @triton.jit
@@ -94,7 +99,8 @@ class WeatherNext2GridEncoder(nn.Module):
         batch, points, _ = grid_features.shape
         channels = self.fc2.out_features
         output = self.fc2.weight.new_empty((batch, points, channels))
-        film = self.norm.linear(conditioning) if output.device.type != "cpu" else None
+        fused = _can_fuse(output)
+        film = self.norm.linear(conditioning) if fused else None
         for start in range(0, points, GRID_CHUNK_SIZE):
             end = min(start + GRID_CHUNK_SIZE, points)
             spatial = spatial_features[start:end].unsqueeze(0).expand(batch, -1, -1)
@@ -107,7 +113,7 @@ class WeatherNext2GridEncoder(nn.Module):
             )
             values = self.fc2(self.activation_fn(self.fc1(inputs)))
             target = output[:, start:end]
-            if output.device.type == "cpu":
+            if not fused:
                 target.copy_(self.norm(values, conditioning))
             else:
                 # Keep the original LayerNorm reduction: small rounding changes
@@ -134,19 +140,20 @@ class WeatherNext2ForecastHead(nn.Module):
     def forward(self, grid_states):
         if (
             not _can_chunk(self, self.decoder_proj.weight)
-            or grid_states.dtype != torch.float32
+            or grid_states.dtype != self.decoder_proj.weight.dtype
         ):
             return type(self).forward(self, grid_states)
         batch, points, _ = grid_states.shape
         channels = self.output_proj.out_features
         output = grid_states.new_empty((batch, points, channels))
+        fused = _can_fuse(output)
         for start in range(0, points, GRID_CHUNK_SIZE):
             end = min(start + GRID_CHUNK_SIZE, points)
             values = self.output_proj(
                 self.act_fn(self.decoder_proj(grid_states[:, start:end]))
             )
             target = output[:, start:end]
-            if output.device.type == "cpu":
+            if not fused:
                 target.copy_(
                     torch.where(
                         self.sigmoid_gate,

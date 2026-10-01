@@ -108,8 +108,10 @@ def test_chunked_grid_matches_original(device, dtype, batch, name, monkeypatch):
         expected = reference(*args)
         actual = blocked(*args)
     hook.remove()
-    assert sizes == ([8, 8, 5] if dtype == torch.float32 else [21])
-    torch.testing.assert_close(actual, expected)
+    assert sizes == [8, 8, 5]
+    # A chunked bf16 matmul rounds differently from a whole-grid one, by up to a few bf16 ulps.
+    tolerances = {torch.float32: {}, torch.bfloat16: {"atol": 1e-1, "rtol": 1e-2}}
+    torch.testing.assert_close(actual, expected, **tolerances[dtype])
 
 
 @pytest.mark.kernels_ci
