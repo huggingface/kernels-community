@@ -46,6 +46,21 @@ def test_matching_import_with_nested_manifest(tmp_path):
     assert checker.check_repository(tmp_path) == ([], 1, 1)
 
 
+def test_ported_kernel_tests_under_src(tmp_path):
+    kernel = tmp_path / "example"
+    (kernel / "src" / "tests").mkdir(parents=True)
+    (kernel / "src" / "build.toml").write_text(
+        '[general]\nversion = 2\n\n[general.hub]\nrepo-id = "kernels-community/example"\n'
+    )
+    (kernel / "src" / "tests" / "test_example.py").write_text(
+        "from kernels import get_kernel\n"
+        'example = get_kernel("kernels-community/example", version=1)\n'
+    )
+
+    problems, _, _ = checker.check_repository(tmp_path)
+    assert len(problems) == 1
+
+
 def test_matching_call_is_formatting_agnostic(tmp_path):
     kernel = write_kernel(tmp_path)
     (kernel / "tests" / "test_example.py").write_text(
