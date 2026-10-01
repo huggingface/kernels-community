@@ -454,7 +454,7 @@ def w8a8_block_dynamic_fp8_moe_grouped_down_kernel(
         flat = tl.load(Perm + offs_global_m * stride_perm, mask=row_mask, other=0)
         weight = tl.load(SampleWeights + flat, mask=row_mask, other=0.0)
         acc = acc * weight[:, None]
-        store_tile(ProjOut, acc, flat, offs_h, row_mask, stride_po_m, stride_po_n)
+        store_tile(ProjOut, acc, flat, offs_h, row_mask, stride_po_m, stride_po_n, HIDDEN_DIM)
 
 
 def w8a8_block_dynamic_fp8_moe_grouped(
@@ -975,7 +975,7 @@ def mxfp_dynamic_moe_grouped_down_kernel(
         flat = tl.load(Perm + offs_global_m * stride_perm, mask=row_mask, other=0)
         weight = tl.load(SampleWeights + flat, mask=row_mask, other=0.0)
         acc = acc * weight[:, None]
-        store_tile(ProjOut, acc, flat, offs_bn, row_mask, stride_po_m, stride_po_n)
+        store_tile(ProjOut, acc, flat, offs_bn, row_mask, stride_po_m, stride_po_n, HIDDEN_DIM)
 
 
 def mxfp_dynamic_moe_grouped(
