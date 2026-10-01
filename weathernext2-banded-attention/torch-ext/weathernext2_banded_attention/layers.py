@@ -101,10 +101,15 @@ class WeatherNext2AttentionMask(nn.Module):
             return type(self).forward(self, attention_mask, batch_size, dtype)
         mask = attention_mask[:, 0]
         try:
-            key = (mask.data_ptr(), mask.device, mask._version)
+            # A view of the same storage can describe a different geometry, so shape and strides count too.
+            key = (mask.data_ptr(), tuple(mask.shape), mask.stride(), mask.device, mask._version)
         except RuntimeError:
             key = None  # An inference tensor has no version counter, so a change could not be seen.
-        if key is None or getattr(self, "_prepared_key", None) != key:
+        # The buffers move with this module, which can be placed apart from the geometry it was built from.
+        stale = (
+            key is None or getattr(self, "_prepared_key", None) != key or self._prepared_tiles.device != mask.device
+        )
+        if stale:
             with device_context(mask.device):
                 prepared = _prepare_mask(mask, sparse_tiles=True, packed_mask=True)
             for name, tensor in zip(_PREPARED_BUFFERS, prepared):

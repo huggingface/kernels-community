@@ -62,6 +62,31 @@ def test_prepared_mask_follows_the_module():
 
 @requires_accelerator
 @pytest.mark.kernels_ci
+def test_reshaped_geometry_is_prepared_again():
+    layer = MaskPreparer().eval()
+    layer.forward = MethodType(kernel.WeatherNext2AttentionMask.forward, layer)
+    storage = torch.rand(4, 1, 64, 192, device=DEVICE) > 0.5
+    with torch.no_grad():
+        assert layer(storage, 1, torch.float32).shape == (4, 64, 192)
+        # The same storage and version, read as one block of 128 rather than four of 64.
+        assert layer(storage.view(1, 1, 128, 384), 1, torch.float32).shape == (1, 128, 384)
+
+
+@requires_accelerator
+@pytest.mark.kernels_ci
+def test_prepared_mask_follows_the_geometry_device():
+    layer = MaskPreparer().eval()
+    layer.forward = MethodType(kernel.WeatherNext2AttentionMask.forward, layer)
+    mask = torch.rand(3, 1, 65, 195, device=DEVICE) > 0.5
+    with torch.no_grad():
+        layer(mask, 1, torch.float32)
+        layer.cpu()  # The geometry stays where it was.
+        prepared = layer(mask, 1, torch.float32)
+    assert all(tensor.device == mask.device for tensor in prepared[:4])
+
+
+@requires_accelerator
+@pytest.mark.kernels_ci
 def test_inference_tensor_geometry_is_not_cached():
     layer = MaskPreparer().eval()
     layer.forward = MethodType(kernel.WeatherNext2AttentionMask.forward, layer)
