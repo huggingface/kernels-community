@@ -7,7 +7,8 @@ Only `forward` is defined: `kernels` binds it onto the model's own module, so `s
 import torch
 from torch import nn
 
-from .banded_attention import banded_attention
+from .banded_attention import PreparedMask, _prepare_mask, banded_attention
+from .utils import device_context
 from .grid import WeatherNext2ForecastHead as WeatherNext2ForecastHead
 from .grid import WeatherNext2GridEncoder as WeatherNext2GridEncoder
 
@@ -28,6 +29,8 @@ def _banded_mask(attention_mask):
     the guard rejects every mask the model actually produces and the kernel silently never
     runs. A `BlockMask` from flex attention is not a tensor and is rejected here.
     """
+    if isinstance(attention_mask, PreparedMask):
+        return attention_mask
     if not isinstance(attention_mask, torch.Tensor) or attention_mask.dtype != torch.bool:
         return None
     if attention_mask.ndim == 4 and attention_mask.shape[1] == 1:
@@ -79,10 +82,34 @@ def _reference_attention(query, key, value, attention_mask, scaling):
             "use_kernels=True."
         )
 
-    out = nn.functional.scaled_dot_product_attention(
-        queries, keys, values, attn_mask=attention_mask, scale=scaling
-    )
+    out = nn.functional.scaled_dot_product_attention(queries, keys, values, attn_mask=attention_mask, scale=scaling)
     return out.reshape(batch, blocks, heads, block_size, head_dim)
+
+
+class WeatherNext2AttentionMask(nn.Module):
+    def forward(self, attention_mask, batch_size, dtype):
+        if self.training or torch.is_grad_enabled() or self.config._attn_implementation == "flex_attention":
+            return type(self).forward(self, attention_mask, batch_size, dtype)
+        mask = attention_mask[:, 0]
+        try:
+            version = mask._version
+        except RuntimeError:
+            version = None
+        key = (mask.data_ptr(), tuple(mask.shape), mask.stride(), mask.device, version)
+        backend = getattr(torch, mask.device.type)
+        with device_context(mask.device):
+            cached = getattr(self, "_prepared_attention_mask", None)
+            if version is not None and cached is not None and cached[0] == key:
+                stream = backend.current_stream(mask.device)
+                stream.wait_event(cached[2])
+                for tensor in cached[1][:4]:
+                    tensor.record_stream(stream)
+                return cached[1]
+            prepared = _prepare_mask(mask, True, True)
+            ready = backend.Event()
+            ready.record()
+            self._prepared_attention_mask = (key, prepared, ready)
+            return prepared
 
 
 class WeatherNext2Attention(nn.Module):
@@ -99,11 +126,17 @@ class WeatherNext2Attention(nn.Module):
         if _is_banded(attention_mask, hidden_states) and not _needs_grad(query, key, value):
             # The kernel walks the three neighbouring blocks itself, so the keys and values are
             # never tripled and the mask is never expanded.
-            attn_output = banded_attention(query.float(), key.float(), value.float(), banded, self.scaling)
+            attn_output = banded_attention(
+                query.float(),
+                key.float(),
+                value.float(),
+                banded,
+                self.scaling,
+                sparse_tiles=kwargs.get("sparse_tiles", False),
+                packed_mask=kwargs.get("packed_mask", False),
+            )
         else:
             attn_output = _reference_attention(query, key, value, attention_mask, self.scaling)
 
-        attn_output = (
-            attn_output.to(hidden_states.dtype).transpose(2, 3).reshape(*input_shape, -1).contiguous()
-        )
+        attn_output = attn_output.to(hidden_states.dtype).transpose(2, 3).reshape(*input_shape, -1).contiguous()
         return self.o_proj(attn_output), None

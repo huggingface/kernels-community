@@ -2,13 +2,13 @@
 
 import pytest
 import torch
+import importlib
+import triton
 
 import kernels
 
 
-weathernext2_banded_attention = kernels.get_kernel(
-    "kernels-community/weathernext2-banded-attention", version=2
-)
+weathernext2_banded_attention = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=2)
 WeatherNext2Attention = weathernext2_banded_attention.WeatherNext2Attention
 banded_attention = weathernext2_banded_attention.banded_attention
 
@@ -26,9 +26,7 @@ def reference(query, key, value, mask, scaling):
     queries = query.reshape(batch * blocks, heads, block_size, head_dim)
     dense = mask[None, :, None].expand(batch, blocks, 1, block_size, 3 * block_size)
     dense = dense.reshape(batch * blocks, 1, block_size, 3 * block_size)
-    out = torch.nn.functional.scaled_dot_product_attention(
-        queries, keys, values, attn_mask=dense, scale=scaling
-    )
+    out = torch.nn.functional.scaled_dot_product_attention(queries, keys, values, attn_mask=dense, scale=scaling)
     return out.reshape(batch, blocks, heads, block_size, head_dim)
 
 
@@ -51,7 +49,9 @@ requires_accelerator = pytest.mark.skipif(DEVICE == "cpu", reason="the kernel ne
 @requires_accelerator
 @pytest.mark.parametrize("blocks", [2, 4])
 @pytest.mark.parametrize("density", [0.05, 0.4])
-def test_matches_scaled_dot_product_attention(blocks, density):
+@pytest.mark.parametrize("sparse_tiles", [False, True])
+@pytest.mark.parametrize("packed_mask", [False, True])
+def test_matches_scaled_dot_product_attention(blocks, density, sparse_tiles, packed_mask):
     device = torch.device(DEVICE)
     generator = torch.Generator(device=device).manual_seed(0)
     batch, heads, block_size, head_dim = 1, 4, 128, 64
@@ -71,7 +71,16 @@ def test_matches_scaled_dot_product_attention(blocks, density):
     # IEEE, and `input_precision="ieee"` is not guaranteed to be implemented on other backends.
     on_nvidia = torch.version.cuda is not None and torch.version.hip is None
     precision = "ieee" if on_nvidia else "default"
-    ours = banded_attention(query, key, value, mask, scaling, precision=precision)
+    ours = banded_attention(
+        query,
+        key,
+        value,
+        mask,
+        scaling,
+        precision=precision,
+        sparse_tiles=sparse_tiles,
+        packed_mask=packed_mask,
+    )
     torch.testing.assert_close(ours, reference(query, key, value, mask, scaling), atol=2e-5, rtol=2e-5)
 
 
@@ -83,9 +92,7 @@ def test_rows_that_reach_only_themselves_are_finite():
     generator = torch.Generator(device=device).manual_seed(0)
     batch, blocks, heads, block_size, head_dim = 1, 3, 2, 64, 32
     shape = (batch, blocks, heads, block_size, head_dim)
-    query, key, value = (
-        torch.randn(shape, device=device, dtype=torch.float32, generator=generator) for _ in range(3)
-    )
+    query, key, value = (torch.randn(shape, device=device, dtype=torch.float32, generator=generator) for _ in range(3))
     mask = torch.zeros(blocks, block_size, 3 * block_size, dtype=torch.bool, device=device)
     mask[:, :, block_size : 2 * block_size] = torch.eye(block_size, dtype=torch.bool, device=device)
 
@@ -103,7 +110,11 @@ class _StubAttention(WeatherNext2Attention):
         self.head_dim = hidden_size // heads
         self.scaling = self.head_dim**-0.5
         for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            setattr(self, name, torch.nn.Linear(hidden_size, hidden_size, bias=name == "o_proj"))
+            setattr(
+                self,
+                name,
+                torch.nn.Linear(hidden_size, hidden_size, bias=name == "o_proj"),
+            )
 
 
 @pytest.mark.kernels_ci
@@ -150,3 +161,45 @@ def test_rejects_head_dimensions_it_cannot_tile():
         query = torch.zeros(1, 2, 2, 32, head_dim)
         with pytest.raises(ValueError, match="head_dim must be a power of two"):
             banded_attention(query, query, query, mask, head_dim**-0.5)
+
+
+@requires_accelerator
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("block_size", [65, 129])
+@pytest.mark.parametrize("pattern", ["self", "random", "empty"])
+@pytest.mark.parametrize("packed_mask", [False, True])
+def test_sparse_tiles_preserve_outputs(block_size, pattern, packed_mask, monkeypatch):
+    module = importlib.import_module(banded_attention.__module__)
+    tuner = module._banded_attention_kernel
+    monkeypatch.setattr(
+        tuner,
+        "configs",
+        [triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1)],
+    )
+    monkeypatch.setattr(tuner, "cache", {})
+    monkeypatch.setattr(module._sparse_attention_kernel, "configs", tuner.configs)
+    monkeypatch.setattr(module._sparse_attention_kernel, "cache", {})
+    generator = torch.Generator(device=DEVICE).manual_seed(7)
+    shape = (2, 3, block_size, 2, 32)
+    query, key, value = (torch.randn(shape, device=DEVICE, generator=generator).transpose(2, 3) for _ in range(3))
+    mask = banded_mask(3, block_size, 0.01 if pattern == "random" else 0, DEVICE, generator)
+    if pattern == "empty":
+        mask.zero_()
+    # Preserve a noncontiguous mask view, including the partial final query/key tiles.
+    storage = torch.zeros(3, block_size, 6 * block_size, dtype=torch.bool, device=DEVICE)
+    storage[..., ::2] = mask
+    mask = storage[..., ::2]
+    precision = "ieee" if torch.version.cuda and not torch.version.hip else "default"
+    expected = banded_attention(query, key, value, mask, 32**-0.5, precision=precision)
+    actual = banded_attention(
+        query,
+        key,
+        value,
+        mask,
+        32**-0.5,
+        precision=precision,
+        sparse_tiles=True,
+        packed_mask=packed_mask,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(actual, reference(query, key, value, mask, 32**-0.5), atol=2e-5, rtol=2e-5)

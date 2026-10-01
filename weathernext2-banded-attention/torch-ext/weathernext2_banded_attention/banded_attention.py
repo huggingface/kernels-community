@@ -12,6 +12,8 @@ float32 accumulation, because upstream casts q, k and v to float32 before attent
 (`sparse_transformer.py`, `upcast_attn_to_fp32`) and the released configs all set it.
 """
 
+from typing import NamedTuple
+
 import torch
 import triton
 import triton.language as tl
@@ -25,6 +27,14 @@ from .utils import device_context
 PRECISION_DEFAULT = 0
 PRECISION_IEEE = 1
 _PRECISIONS = {"default": PRECISION_DEFAULT, "ieee": PRECISION_IEEE}
+
+
+class PreparedMask(NamedTuple):
+    packed: torch.Tensor | None
+    tiles: torch.Tensor
+    counts: torch.Tensor
+    offsets: torch.Tensor | None
+    shape: tuple[int, int, int]
 
 
 def _is_hip() -> bool:
@@ -58,7 +68,94 @@ def _configs():
     ]
 
 
-@triton.autotune(configs=_configs(), key=["block_size", "HEAD_DIM"])
+@triton.jit
+def _pack_active_mask_kernel(
+    mask_ptr,
+    tiles_ptr,
+    counts_ptr,
+    offsets_ptr,
+    out_ptr,
+    stride_b,
+    stride_m,
+    stride_n,
+    block_size,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    block = tl.program_id(1)
+    neighbour = tl.program_id(2)
+    slot = (block * tl.cdiv(block_size, BLOCK_M) + tile) * 3 + neighbour
+    key_tiles = tl.cdiv(block_size, BLOCK_N)
+    count = tl.load(counts_ptr + slot)
+    offset = tl.load(offsets_ptr + slot)
+    rows = tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    bits = tl.arange(0, BLOCK_N)
+    for index in range(count):
+        key_tile = tl.load(tiles_ptr + slot * key_tiles + index)
+        columns = key_tile * BLOCK_N + bits
+        keep = tl.load(
+            mask_ptr
+            + block * stride_b
+            + rows[:, None] * stride_m
+            + (neighbour * block_size + columns[None, :]) * stride_n,
+            mask=(rows[:, None] < block_size) & (columns[None, :] < block_size),
+            other=0,
+        )
+        word = tl.sum(keep.to(tl.uint32) << bits[None, :], axis=1)
+        tl.store(out_ptr + (offset + index) * BLOCK_M + tl.arange(0, BLOCK_M), word)
+
+
+@triton.jit
+def _read_mask(mask_ptr, block, rows, columns, stride_b, stride_m, stride_n, valid):
+    word = tl.load(
+        mask_ptr + block * stride_b + rows[:, None] * stride_m + columns[None, :] * stride_n, mask=valid, other=0
+    )
+    return word.to(tl.int1)
+
+
+@triton.jit
+def _active_tiles_kernel(
+    mask_ptr,
+    tiles_ptr,
+    counts_ptr,
+    stride_mb,
+    stride_mm,
+    stride_mn,
+    block_size,
+    num_blocks,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    block = tl.program_id(1)
+    neighbour = tl.program_id(2)
+    key_tiles = tl.cdiv(block_size, BLOCK_N)
+    query_tiles = tl.cdiv(block_size, BLOCK_M)
+    slot = (block * query_tiles + tile) * 3 + neighbour
+    rows = tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    count = 0
+    source = block + neighbour - 1
+    if (source >= 0) and (source < num_blocks):
+        for index in range(key_tiles):
+            columns = index * BLOCK_N + tl.arange(0, BLOCK_N)
+            keep = _read_mask(
+                mask_ptr,
+                block,
+                rows,
+                neighbour * block_size + columns,
+                stride_mb,
+                stride_mm,
+                stride_mn,
+                (rows[:, None] < block_size) & (columns[None, :] < block_size),
+            )
+            if tl.sum(keep.to(tl.int32)) > 0:
+                tl.store(tiles_ptr + slot * key_tiles + count, index)
+                count += 1
+    tl.store(counts_ptr + slot, count)
+
+
+@triton.autotune(configs=_configs(), key=["block_size", "HEAD_DIM", "PACKED"])
 @triton.jit
 def _banded_attention_kernel(
     query_ptr,
@@ -66,6 +163,9 @@ def _banded_attention_kernel(
     value_ptr,
     mask_ptr,
     out_ptr,
+    tiles_ptr,
+    counts_ptr,
+    offsets_ptr,
     stride_qb,
     stride_qh,
     stride_qm,
@@ -92,6 +192,8 @@ def _banded_attention_kernel(
     PRECISION: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    SPARSE_TILES: tl.constexpr = False,
+    PACKED: tl.constexpr = False,
 ):
     """One program per (query tile, mesh block, head), looping over the three neighbour blocks."""
     tile = tl.program_id(0)
@@ -125,7 +227,19 @@ def _banded_attention_kernel(
             key_base = key_ptr + source_flat * stride_kb + head * stride_kh
             value_base = value_ptr + source_flat * stride_vb + head * stride_vh
 
-            for start in range(0, block_size, BLOCK_N):
+            key_tiles = tl.cdiv(block_size, BLOCK_N)
+            if SPARSE_TILES:
+                slot = (block_index * tl.cdiv(block_size, BLOCK_M) + tile) * 3 + neighbour
+                count = tl.load(counts_ptr + slot)
+                if PACKED:
+                    offset = tl.load(offsets_ptr + slot)
+            else:
+                count = key_tiles
+            for index in range(count):
+                if SPARSE_TILES:
+                    start = tl.load(tiles_ptr + slot * key_tiles + index) * BLOCK_N
+                else:
+                    start = index * BLOCK_N
                 columns = start + tl.arange(0, BLOCK_N)
                 column_valid = columns < block_size
 
@@ -133,16 +247,22 @@ def _banded_attention_kernel(
                 # first: the band is sparse, and a tile nothing reaches costs two matmuls to compute
                 # and then throw away.
                 mask_columns = neighbour * block_size + columns
-                keep = tl.load(
-                    mask_ptr
-                    + block_index * stride_mb
-                    + rows[:, None] * stride_mm
-                    + mask_columns[None, :] * stride_mn,
-                    mask=row_valid[:, None] & column_valid[None, :],
-                    other=0,
-                ).to(tl.int1)
+                if SPARSE_TILES and PACKED:
+                    word = tl.load(mask_ptr + (offset + index) * BLOCK_M + tl.arange(0, BLOCK_M))
+                    keep = ((word[:, None] >> tl.arange(0, BLOCK_N)[None, :]) & 1).to(tl.int1)
+                else:
+                    keep = _read_mask(
+                        mask_ptr,
+                        block_index,
+                        rows,
+                        mask_columns,
+                        stride_mb,
+                        stride_mm,
+                        stride_mn,
+                        row_valid[:, None] & column_valid[None, :],
+                    )
 
-                if tl.sum(keep.to(tl.int32)) > 0:
+                if SPARSE_TILES or tl.sum(keep.to(tl.int32)) > 0:
                     key = tl.load(
                         key_base + columns[:, None] * stride_km + dims[None, :] * stride_kd,
                         mask=column_valid[:, None],
@@ -188,13 +308,40 @@ def _banded_attention_kernel(
     )
 
 
+_sparse_attention_kernel = triton.autotune(
+    configs=[config for config in _configs() if config.kwargs == {"BLOCK_M": 64, "BLOCK_N": 32}],
+    key=["block_size", "HEAD_DIM", "PACKED"],
+)(_banded_attention_kernel.fn)
+
+
+def _prepare_mask(mask, sparse_tiles, packed_mask):
+    blocks, block_size, _ = mask.shape
+    packed, tiles, counts, offsets = None, None, None, None
+    if sparse_tiles:
+        query_tiles, key_tiles = triton.cdiv(block_size, 64), triton.cdiv(block_size, 32)
+        counts = torch.empty((blocks, query_tiles, 3), dtype=torch.int32, device=mask.device)
+        tiles = torch.empty((*counts.shape, key_tiles), dtype=torch.int32, device=mask.device)
+        _active_tiles_kernel[(query_tiles, blocks, 3)](
+            mask, tiles, counts, *mask.stride(), block_size, blocks, BLOCK_M=64, BLOCK_N=32, num_warps=4
+        )
+        if packed_mask:
+            offsets = torch.cat((counts.new_zeros(1), counts.flatten().cumsum(0, dtype=torch.int32)))
+            packed = torch.empty((int(offsets[-1].item()), 64), dtype=torch.uint32, device=mask.device)
+            _pack_active_mask_kernel[(query_tiles, blocks, 3)](
+                mask, tiles, counts, offsets, packed, *mask.stride(), block_size, BLOCK_M=64, BLOCK_N=32, num_warps=4
+            )
+    return PreparedMask(packed, tiles, counts, offsets, tuple(mask.shape))
+
+
 def banded_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    mask: torch.Tensor,
+    mask: torch.Tensor | PreparedMask,
     scaling: float,
     precision: str = "default",
+    sparse_tiles: bool = False,
+    packed_mask: bool = False,
 ) -> torch.Tensor:
     """Attention over the three block-diagonals of the mesh adjacency.
 
@@ -205,6 +352,10 @@ def banded_attention(
         scaling: the usual `head_dim ** -0.5`.
         precision: how `tl.dot` treats the float32 inputs. `"default"` uses Triton's default for the
             active backend; `"ieee"` forces true float32 for strict numerical comparisons.
+        sparse_tiles: experimental active-key-tile traversal using fixed 64-query / 32-key tiles.
+            Warps and stages are autotuned; the tile shape is fixed by the metadata layout.
+        packed_mask: store only active tiles, with 32 mask entries per uint32 word.
+            Implies sparse traversal. A PreparedMask skips this preparation entirely.
 
     Returns:
         `[batch, num_blocks, heads, block_size, head_dim]`.
@@ -223,10 +374,7 @@ def banded_attention(
     if mask.shape != (num_blocks, block_size, 3 * block_size):
         raise ValueError(f"mask is {tuple(mask.shape)}, expected {(num_blocks, block_size, 3 * block_size)}")
 
-    query, key, value = (
-        t.reshape(batch * num_blocks, heads, block_size, head_dim) for t in (query, key, value)
-    )
-    mask = mask.contiguous()
+    query, key, value = (t.reshape(batch * num_blocks, heads, block_size, head_dim) for t in (query, key, value))
     out = torch.empty(query.shape, dtype=query.dtype, device=query.device)
 
     def grid(meta):
@@ -235,12 +383,31 @@ def banded_attention(
     # Triton launches on whichever device is current, not on the one the tensors live on, so a
     # shard placed on cuda:1 by `device_map="auto"` would otherwise be launched against cuda:0.
     with device_context(query.device):
-        _banded_attention_kernel[grid](
+        tiles, counts, offsets = None, None, None
+        if isinstance(mask, PreparedMask):
+            prepared = mask
+            sparse_tiles, packed_mask = True, prepared.packed is not None
+            mask = prepared.packed
+        elif sparse_tiles or packed_mask:
+            prepared = _prepare_mask(mask, sparse_tiles or packed_mask, packed_mask)
+            sparse_tiles = sparse_tiles or packed_mask
+        else:
+            prepared = None
+        if prepared is not None:
+            packed, tiles, counts, offsets, _ = prepared
+            if packed is not None:
+                mask = packed
+        mask_strides = (0, 0, 0) if sparse_tiles and packed_mask else mask.stride()
+        attention_kernel = _sparse_attention_kernel if sparse_tiles else _banded_attention_kernel
+        attention_kernel[grid](
             query,
             key,
             value,
             mask,
             out,
+            tiles,
+            counts,
+            offsets,
             query.stride(0),
             query.stride(1),
             query.stride(2),
@@ -257,13 +424,13 @@ def banded_attention(
             out.stride(1),
             out.stride(2),
             out.stride(3),
-            mask.stride(0),
-            mask.stride(1),
-            mask.stride(2),
+            *mask_strides,
             num_blocks,
             block_size,
             scaling,
             HEAD_DIM=head_dim,
             PRECISION=_PRECISIONS[precision],
+            SPARSE_TILES=sparse_tiles,
+            PACKED=packed_mask,
         )
     return out.reshape(batch, num_blocks, heads, block_size, head_dim)
