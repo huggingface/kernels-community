@@ -1,7 +1,6 @@
-"""The model owns one prepared geometry mask, shared by every attention layer."""
+"""The mask layer prepares one compact geometry mask shared by all attention layers."""
 
 from types import MethodType, SimpleNamespace
-from unittest.mock import patch
 
 import kernels
 import pytest
@@ -23,107 +22,82 @@ class MaskPreparer(nn.Module):
         return mask
 
 
-@requires_accelerator
+def decode_mask(mask):
+    """Independent CPU decoder of the packed representation; never used by inference."""
+    packed = mask.packed.cpu().to(torch.int64)
+    tiles, offsets = (tensor.cpu() for tensor in (mask.tiles, mask.offsets))
+    decoded = torch.zeros(mask.shape, dtype=torch.bool)
+    block_size = mask.shape[1]
+    query_tiles = (block_size + 63) // 64
+    for block in range(mask.shape[0]):
+        for query_tile in range(query_tiles):
+            start = query_tile * 64
+            rows = min(64, block_size - start)
+            for neighbour in range(3):
+                slot = (block * query_tiles + query_tile) * 3 + neighbour
+                for index in range(int(offsets[slot]), int(offsets[slot + 1])):
+                    column = int(tiles[index]) * 32
+                    columns = min(32, block_size - column)
+                    words = packed[index, :rows]
+                    bits = ((words[:, None] >> torch.arange(columns)) & 1).bool()
+                    column += neighbour * block_size
+                    decoded[block, start : start + rows, column : column + columns] = bits
+    return decoded
+
+
 @pytest.mark.kernels_ci
+@pytest.mark.parametrize("device", list(dict.fromkeys(["cpu", DEVICE])))
 @pytest.mark.parametrize("inference_mode", [False, True])
-def test_model_owned_cache(inference_mode):
+def test_inference_prepares_one_shared_mask(device, inference_mode):
     layer = MaskPreparer().eval()
     layer.forward = MethodType(kernel.WeatherNext2AttentionMask.forward, layer)
-    mask = torch.rand(3, 1, 65, 195, device=DEVICE) > 0.5
-    with patch.object(kernel.layers, "_prepare_mask", wraps=kernel.layers._prepare_mask) as prepare:
-        with torch.inference_mode(inference_mode), torch.no_grad():
-            first = layer(mask, 1, torch.float32)
-            second = layer(mask, 2, torch.float32)
-            assert first.packed is second.packed
-            assert prepare.call_count == 1
-        mask.zero_()
-        with torch.inference_mode(inference_mode), torch.no_grad():
-            third = layer(mask, 1, torch.float32)
-            assert third.packed is not first.packed
-            assert prepare.call_count == 2
-            assert third.packed.numel() == 0
-            assert layer._prepared_packed is third.packed
-
-
-@requires_accelerator
-@pytest.mark.kernels_ci
-def test_prepared_mask_follows_the_module():
-    layer = MaskPreparer().eval()
-    layer.forward = MethodType(kernel.WeatherNext2AttentionMask.forward, layer)
-    mask = torch.rand(3, 1, 65, 195, device=DEVICE) > 0.5
-    with torch.no_grad():
-        prepared = layer(mask, 1, torch.float32)
-    assert prepared.packed.numel() > 0
-    # Non-persistent: never saved, but moved with the module, so `.cpu()` releases the device copy.
-    assert not any(name.startswith("_prepared_") for name in layer.state_dict())
-    layer.cpu()
-    assert all(getattr(layer, f"_prepared_{name}").device.type == "cpu" for name in ("packed", "tiles", "counts"))
-
-
-@requires_accelerator
-@pytest.mark.kernels_ci
-def test_reshaped_geometry_is_prepared_again():
-    layer = MaskPreparer().eval()
-    layer.forward = MethodType(kernel.WeatherNext2AttentionMask.forward, layer)
-    storage = torch.rand(4, 1, 64, 192, device=DEVICE) > 0.5
-    with torch.no_grad():
-        assert layer(storage, 1, torch.float32).shape == (4, 64, 192)
-        # The same storage and version, read as one block of 128 rather than four of 64.
-        assert layer(storage.view(1, 1, 128, 384), 1, torch.float32).shape == (1, 128, 384)
-
-
-@requires_accelerator
-@pytest.mark.kernels_ci
-def test_prepared_mask_follows_the_geometry_device():
-    layer = MaskPreparer().eval()
-    layer.forward = MethodType(kernel.WeatherNext2AttentionMask.forward, layer)
-    mask = torch.rand(3, 1, 65, 195, device=DEVICE) > 0.5
-    with torch.no_grad():
-        layer(mask, 1, torch.float32)
-        layer.cpu()  # The geometry stays where it was.
-        prepared = layer(mask, 1, torch.float32)
-    assert all(tensor.device == mask.device for tensor in prepared[:4])
-
-
-@requires_accelerator
-@pytest.mark.kernels_ci
-def test_inference_tensor_geometry_is_not_cached():
-    layer = MaskPreparer().eval()
-    layer.forward = MethodType(kernel.WeatherNext2AttentionMask.forward, layer)
-    with patch.object(kernel.layers, "_prepare_mask", wraps=kernel.layers._prepare_mask) as prepare:
-        with torch.inference_mode():
-            # Created under inference mode, so it has no version counter to say it changed.
-            mask = torch.rand(3, 1, 65, 195, device=DEVICE) > 0.5
-            layer(mask, 1, torch.float32)
-            layer(mask, 1, torch.float32)
-    assert prepare.call_count == 2
-
-
-@requires_accelerator
-@pytest.mark.kernels_ci
-def test_prepared_mask_needs_packed_words():
-    mask = torch.ones(2, 32, 96, dtype=torch.bool, device=DEVICE)
-    prepared = kernel.layers._prepare_mask(mask, sparse_tiles=True, packed_mask=False)
-    query = torch.zeros(1, 2, 2, 32, 32, device=DEVICE)
-    with pytest.raises(ValueError, match="needs its packed mask"):
-        kernel.banded_attention(query, query, query, prepared, 32**-0.5)
+    mask = torch.rand(3, 1, 65, 195, device=device) > 0.5
+    mask[0, :, :, :65] = False
+    mask[-1, :, :, 130:] = False
+    with torch.inference_mode(inference_mode), torch.no_grad():
+        banded = layer(mask, 2, torch.float32)
+    assert banded.shape == (3, 65, 195)
+    if device == "cpu":
+        assert banded.data_ptr() == mask.data_ptr()
+    else:
+        assert banded.packed.dtype == torch.uint32
+        torch.testing.assert_close(decode_mask(banded), mask[:, 0].cpu())
+    assert list(layer.buffers()) == []
 
 
 @requires_accelerator
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("empty", [False, True])
-def test_decode_one_block(empty):
+def test_packed_mask_roundtrip(empty):
     storage = torch.rand(3, 65, 390, device=DEVICE) > 0.5
     mask = storage[..., ::2]
     mask[0, :, :65] = False
     mask[-1, :, 130:] = False
     if empty:
         mask.zero_()
-    prepared = kernel.layers._prepare_mask(mask, sparse_tiles=True, packed_mask=True)
-    for block in range(3):
-        decoded = kernel.layers._unpack_mask(prepared, block)
-        assert decoded.shape == (65, 195)
-        torch.testing.assert_close(decoded, mask[block], atol=0, rtol=0)
+    prepared = kernel.layers._prepare_mask(mask)
+    assert prepared.tiles.ndim == 1
+    assert prepared.tiles.numel() == prepared.packed.shape[0] == int(prepared.offsets[-1])
+    assert prepared.offsets.numel() == 3 * 2 * 3 + 1
+    if empty:
+        assert prepared.tiles.numel() == prepared.packed.numel() == 0
+    torch.testing.assert_close(decode_mask(prepared), mask.cpu(), atol=0, rtol=0)
+
+
+@requires_accelerator
+@pytest.mark.kernels_ci
+def test_sparse_mask_stores_only_active_tiles():
+    blocks, block_size = 3, 129
+    mask = torch.zeros(blocks, block_size, 3 * block_size, dtype=torch.bool, device=DEVICE)
+    mask[:, :, block_size : 2 * block_size] = torch.eye(block_size, dtype=torch.bool, device=DEVICE)
+    prepared = kernel.layers._prepare_mask(mask)
+    assert prepared.tiles.numel() == blocks * ((block_size + 31) // 32)
+    assert prepared.packed.shape == (prepared.tiles.numel(), 64)
+    assert prepared.offsets[0] == 0
+    assert torch.all(prepared.offsets[1:] >= prepared.offsets[:-1])
+    storage_bytes = sum(tensor.numel() * tensor.element_size() for tensor in prepared[:3])
+    assert storage_bytes < mask.numel() * mask.element_size() // 8
+    torch.testing.assert_close(decode_mask(prepared), mask.cpu(), atol=0, rtol=0)
 
 
 @pytest.mark.kernels_ci

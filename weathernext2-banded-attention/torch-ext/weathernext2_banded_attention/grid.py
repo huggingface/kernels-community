@@ -16,14 +16,13 @@ def _can_chunk(layer, weights):
         not layer.training
         and not torch.is_grad_enabled()
         and weights.is_floating_point()
-        and weights.device.type in ("cpu", "cuda", "xpu")
         and not torch.is_autocast_enabled(weights.device.type)
     )
 
 
 def _can_fuse(output):
     """The Triton epilogues are written for float32; other dtypes keep PyTorch's own rounding."""
-    return output.device.type != "cpu" and output.dtype == torch.float32
+    return not output.is_cpu and output.dtype == torch.float32
 
 
 @triton.jit
@@ -81,10 +80,7 @@ def _forecast_output(
     offset = tl.load(shift + channel, valid, 0)
     result = tl.where(gated, 1.0 / (1.0 + tl.exp(-(x - offset))), x)
     tl.store(
-        output
-        + batch * output_batch_stride
-        + (indices // channels) * output_point_stride
-        + channel,
+        output + batch * output_batch_stride + (indices // channels) * output_point_stride + channel,
         result,
         valid,
     )
@@ -93,9 +89,7 @@ def _forecast_output(
 class WeatherNext2GridEncoder(nn.Module):
     def forward(self, grid_features, spatial_features, conditioning):
         if not _can_chunk(self, self.fc1.weight):
-            return type(self).forward(
-                self, grid_features, spatial_features, conditioning
-            )
+            return type(self).forward(self, grid_features, spatial_features, conditioning)
         batch, points, _ = grid_features.shape
         channels = self.fc2.out_features
         output = self.fc2.weight.new_empty((batch, points, channels))
@@ -138,10 +132,7 @@ class WeatherNext2GridEncoder(nn.Module):
 
 class WeatherNext2ForecastHead(nn.Module):
     def forward(self, grid_states):
-        if (
-            not _can_chunk(self, self.decoder_proj.weight)
-            or grid_states.dtype != self.decoder_proj.weight.dtype
-        ):
+        if not _can_chunk(self, self.decoder_proj.weight) or grid_states.dtype != self.decoder_proj.weight.dtype:
             return type(self).forward(self, grid_states)
         batch, points, _ = grid_states.shape
         channels = self.output_proj.out_features
@@ -149,9 +140,7 @@ class WeatherNext2ForecastHead(nn.Module):
         fused = _can_fuse(output)
         for start in range(0, points, GRID_CHUNK_SIZE):
             end = min(start + GRID_CHUNK_SIZE, points)
-            values = self.output_proj(
-                self.act_fn(self.decoder_proj(grid_states[:, start:end]))
-            )
+            values = self.output_proj(self.act_fn(self.decoder_proj(grid_states[:, start:end])))
             target = output[:, start:end]
             if not fused:
                 target.copy_(
@@ -163,9 +152,7 @@ class WeatherNext2ForecastHead(nn.Module):
                 )
             else:
                 with device_context(output.device):
-                    _forecast_output[
-                        (triton.cdiv((end - start) * channels, 1024), batch)
-                    ](
+                    _forecast_output[(triton.cdiv((end - start) * channels, 1024), batch)](
                         values,
                         self.sigmoid_gate,
                         self.sigmoid_shift,
@@ -177,6 +164,4 @@ class WeatherNext2ForecastHead(nn.Module):
                         channels,
                         1024,
                     )
-        return output.transpose(1, 2).reshape(
-            batch, channels, self.config.grid_latitudes, self.config.grid_longitudes
-        )
+        return output.transpose(1, 2).reshape(batch, channels, self.config.grid_latitudes, self.config.grid_longitudes)

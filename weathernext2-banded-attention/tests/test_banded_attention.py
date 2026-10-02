@@ -1,11 +1,8 @@
 """The kernel has to agree with the PyTorch path it replaces, on the mask shape the model uses."""
 
-import importlib
-
 import kernels
 import pytest
 import torch
-import triton
 
 
 weathernext2_banded_attention = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=2)
@@ -39,28 +36,15 @@ def banded_mask(blocks, block_size, density, device, generator):
     return mask
 
 
-# The kernel is pure Triton and the package declares cuda, rocm and xpu, so the tests have to run
-# on whichever accelerator is present rather than assuming CUDA. Otherwise XPU or NPU CI would skip
-# every kernel launch and the declared backend would go untested.
 DEVICE = weathernext2_banded_attention.infer_device()
 requires_accelerator = pytest.mark.skipif(DEVICE == "cpu", reason="the kernel needs an accelerator")
-
-
-@pytest.fixture(autouse=True)
-def fixed_attention_config(monkeypatch):
-    module = importlib.import_module(banded_attention.__module__)
-    configs = [triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1)]
-    for tuner in (module._banded_attention_kernel, module._sparse_attention_kernel):
-        monkeypatch.setattr(tuner, "configs", configs)
-        monkeypatch.setattr(tuner, "cache", {})
 
 
 @requires_accelerator
 @pytest.mark.parametrize("blocks", [2, 4])
 @pytest.mark.parametrize("density", [0.05, 0.4])
-@pytest.mark.parametrize("sparse_tiles", [False, True])
-@pytest.mark.parametrize("packed_mask", [False, True])
-def test_matches_scaled_dot_product_attention(blocks, density, sparse_tiles, packed_mask):
+@pytest.mark.parametrize("prepared", [False, True])
+def test_matches_scaled_dot_product_attention(blocks, density, prepared):
     device = torch.device(DEVICE)
     generator = torch.Generator(device=device).manual_seed(0)
     batch, heads, block_size, head_dim = 1, 4, 128, 64
@@ -75,22 +59,39 @@ def test_matches_scaled_dot_product_attention(blocks, density, sparse_tiles, pac
     mask = banded_mask(blocks, block_size, density, device, generator)
     scaling = head_dim**-0.5
 
-    # On NVIDIA, force IEEE so this stays a strict algorithmic comparison rather than a tensor-core
-    # precision one. Everywhere else take the backend default: AMD has no TF32 so it is already
-    # IEEE, and `input_precision="ieee"` is not guaranteed to be implemented on other backends.
-    on_nvidia = torch.version.cuda is not None and torch.version.hip is None
-    precision = "ieee" if on_nvidia else "default"
+    banded = weathernext2_banded_attention.layers._prepare_mask(mask) if prepared else mask
     ours = banded_attention(
         query,
         key,
         value,
-        mask,
+        banded,
         scaling,
-        precision=precision,
-        sparse_tiles=sparse_tiles,
-        packed_mask=packed_mask,
+        precision="ieee",
     )
     torch.testing.assert_close(ours, reference(query, key, value, mask, scaling), atol=2e-5, rtol=2e-5)
+
+
+@requires_accelerator
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("prepared", [False, True])
+def test_matches_float64_reference(prepared):
+    generator = torch.Generator(device=DEVICE).manual_seed(7)
+    shape = (2, 3, 2, 129, 128)
+    query, key, value = (torch.randn(shape, device=DEVICE, generator=generator) for _ in range(3))
+    mask = banded_mask(3, 129, 0.05, DEVICE, generator)
+    scaling = 128**-0.5
+
+    # Faster-WeatherNext validates against a float64 QK -> scale -> softmax -> PV reference.
+    queries, keys, values = (tensor.cpu().double() for tensor in (query, key, value))
+    keys, values = (gather_neighbouring_blocks(tensor) for tensor in (keys, values))
+    scores = (queries @ keys.transpose(-1, -2)) * scaling
+    scores = scores.masked_fill(~mask.cpu()[None, :, None], float("-inf"))
+    expected = scores.softmax(dim=-1) @ values
+
+    banded = weathernext2_banded_attention.layers._prepare_mask(mask) if prepared else mask
+    actual = banded_attention(query, key, value, banded, scaling, precision="ieee")
+    torch.testing.assert_close(actual.cpu().double(), expected, atol=2e-5, rtol=2e-5)
+    assert (actual.cpu().double() - expected).abs().max() / expected.abs().max() < 1e-5
 
 
 @requires_accelerator
@@ -126,39 +127,43 @@ class _StubAttention(WeatherNext2Attention):
             )
 
 
+@requires_accelerator
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_layer_keeps_attention_in_full_float32(dtype, monkeypatch):
-    attention = _StubAttention(64, 2).to(dtype=dtype).eval()
-    hidden_states = torch.randn(2, 3, 16, 64, dtype=dtype)
-    mask = torch.ones(3, 16, 48, dtype=torch.bool)
-    calls = []
-
-    def forward(query, key, value, mask, scaling, **kwargs):
-        calls.append((query.dtype, key.dtype, value.dtype, kwargs))
-        return torch.zeros_like(query)
-
-    monkeypatch.setattr(weathernext2_banded_attention.layers, "banded_attention", forward)
+def test_layer_keeps_attention_in_full_float32(dtype):
+    torch.manual_seed(7)
+    attention = _StubAttention(64, 2).to(device=DEVICE, dtype=dtype).eval()
+    hidden_states = torch.randn(2, 3, 16, 64, device=DEVICE, dtype=dtype)
+    generator = torch.Generator(device=DEVICE).manual_seed(7)
+    mask = banded_mask(3, 16, 0.1, DEVICE, generator)
     with torch.inference_mode():
+        query, key, value = (
+            getattr(attention, name)(hidden_states).view(2, 3, 16, 2, 32).transpose(2, 3).float()
+            for name in ("q_proj", "k_proj", "v_proj")
+        )
+        expected = reference(query, key, value, mask, attention.scaling)
+        expected = attention.o_proj(expected.to(dtype).transpose(2, 3).reshape_as(hidden_states))
         output, _ = attention(hidden_states, mask)
-
-    assert calls == [(torch.float32, torch.float32, torch.float32, {"precision": "ieee"})]
+    torch.testing.assert_close(output, expected)
     assert output.dtype == dtype
 
 
 @pytest.mark.kernels_ci
-def test_backward_reaches_every_projection():
+@pytest.mark.parametrize("batched_mask", [False, True])
+def test_backward_reaches_every_projection(batched_mask):
     """The kernel has no backward, so anything needing one must take the differentiable path.
 
     Without the guard this still runs: the kernel's output carries no `grad_fn`, so `backward()`
     succeeds while `q_proj`, `k_proj` and `v_proj` silently receive nothing.
     """
     torch.manual_seed(0)
-    batch, blocks, heads, block_size, hidden = 1, 3, 2, 16, 32
+    batch, blocks, heads, block_size, hidden = 2, 3, 2, 16, 32
     attention = _StubAttention(hidden, heads)
     hidden_states = torch.randn(batch, blocks, block_size, hidden, requires_grad=True)
     mask = torch.zeros(blocks, block_size, 3 * block_size, dtype=torch.bool)
     mask[:, :, block_size : 2 * block_size] = torch.eye(block_size, dtype=torch.bool)
+    if batched_mask:
+        mask = mask.repeat(batch, 1, 1)
 
     attention(hidden_states, mask)[0].square().mean().backward()
 
@@ -196,8 +201,7 @@ def test_rejects_head_dimensions_it_cannot_tile():
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("block_size", [65, 129])
 @pytest.mark.parametrize("pattern", ["self", "random", "empty"])
-@pytest.mark.parametrize("packed_mask", [False, True])
-def test_sparse_tiles_preserve_outputs(block_size, pattern, packed_mask):
+def test_sparse_tiles_preserve_outputs(block_size, pattern):
     generator = torch.Generator(device=DEVICE).manual_seed(7)
     shape = (2, 3, block_size, 2, 32)
     query, key, value = (torch.randn(shape, device=DEVICE, generator=generator).transpose(2, 3) for _ in range(3))
@@ -208,17 +212,16 @@ def test_sparse_tiles_preserve_outputs(block_size, pattern, packed_mask):
     storage = torch.zeros(3, block_size, 6 * block_size, dtype=torch.bool, device=DEVICE)
     storage[..., ::2] = mask
     mask = storage[..., ::2]
-    precision = "ieee" if torch.version.cuda and not torch.version.hip else "default"
-    expected = banded_attention(query, key, value, mask, 32**-0.5, precision=precision)
+    assert not mask.is_contiguous()
+    expected = banded_attention(query, key, value, mask, 32**-0.5, precision="ieee")
+    prepared = weathernext2_banded_attention.layers._prepare_mask(mask)
     actual = banded_attention(
         query,
         key,
         value,
-        mask,
+        prepared,
         32**-0.5,
-        precision=precision,
-        sparse_tiles=True,
-        packed_mask=packed_mask,
+        precision="ieee",
     )
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     torch.testing.assert_close(actual, reference(query, key, value, mask, 32**-0.5), atol=2e-5, rtol=2e-5)
@@ -228,11 +231,85 @@ def test_sparse_tiles_preserve_outputs(block_size, pattern, packed_mask):
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("block_size", [65, 129])
 @pytest.mark.parametrize("batch", [1, 2])
-def test_packed_layer_preserves_sdpa(block_size, batch):
+@pytest.mark.parametrize("prepared", [False, True])
+def test_layer_preserves_sdpa(block_size, batch, prepared):
     generator = torch.Generator(device=DEVICE).manual_seed(7)
     shape = (batch, 3, block_size, 2, 32)
     query, key, value = (torch.randn(shape, device=DEVICE, generator=generator).transpose(2, 3) for _ in range(3))
     mask = banded_mask(3, block_size, 0.1, DEVICE, generator)
-    prepared = weathernext2_banded_attention.layers._prepare_mask(mask, sparse_tiles=True, packed_mask=True)
-    actual = weathernext2_banded_attention.layers._packed_attention(query, key, value, prepared, 32**-0.5)
+    banded = weathernext2_banded_attention.layers._prepare_mask(mask) if prepared else mask
+    actual = weathernext2_banded_attention.layers._blockwise_attention(query, key, value, banded, 32**-0.5)
     torch.testing.assert_close(actual, reference(query, key, value, mask, 32**-0.5), atol=2e-5, rtol=2e-5)
+
+
+@requires_accelerator
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("mask_layout", ["geometry", "batched", "packed"])
+def test_inference_layer_preserves_reference(mask_layout):
+    torch.manual_seed(7)
+    attention = _StubAttention(256, 2).to(DEVICE).eval()
+    generator = torch.Generator(device=DEVICE).manual_seed(7)
+    hidden_states = torch.randn(2, 3, 129, 256, device=DEVICE, generator=generator)
+    mask = banded_mask(3, 129, 0.05, DEVICE, generator)
+    if mask_layout == "packed":
+        banded = weathernext2_banded_attention.layers._prepare_mask(mask)
+    elif mask_layout == "batched":
+        second_mask = banded_mask(3, 129, 0.1, DEVICE, generator)
+        banded = torch.stack((mask, second_mask)).view(6, 1, 129, 387)
+    else:
+        banded = mask[:, None]
+    assert weathernext2_banded_attention.layers._is_banded(banded, hidden_states)
+    with torch.inference_mode():
+        query, key, value = (
+            getattr(attention, name)(hidden_states).view(2, 3, 129, 2, 128).transpose(2, 3)
+            for name in ("q_proj", "k_proj", "v_proj")
+        )
+        if mask_layout == "batched":
+            expected = torch.cat(
+                [
+                    reference(query[:1], key[:1], value[:1], mask, attention.scaling),
+                    reference(query[1:], key[1:], value[1:], second_mask, attention.scaling),
+                ]
+            )
+        else:
+            expected = reference(query, key, value, mask, attention.scaling)
+        expected = attention.o_proj(expected.transpose(2, 3).reshape_as(hidden_states))
+        actual, _ = attention(hidden_states, banded)
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("head_axis", [False, True])
+def test_cpu_inference_preserves_reference(dtype, head_axis):
+    torch.manual_seed(7)
+    attention = _StubAttention(64, 2).to(dtype=dtype).eval()
+    hidden_states = torch.randn(2, 3, 16, 64, dtype=dtype)
+    mask = banded_mask(3, 16, 0.1, "cpu", torch.Generator().manual_seed(7))
+    with torch.inference_mode():
+        query, key, value = (
+            getattr(attention, name)(hidden_states).view(2, 3, 16, 2, 32).transpose(2, 3).float()
+            for name in ("q_proj", "k_proj", "v_proj")
+        )
+        expected = reference(query, key, value, mask, attention.scaling)
+        expected = attention.o_proj(expected.to(dtype).transpose(2, 3).reshape_as(hidden_states))
+        actual, _ = attention(hidden_states, mask[:, None] if head_axis else mask)
+    torch.testing.assert_close(actual, expected)
+
+
+@requires_accelerator
+@pytest.mark.kernels_ci
+def test_attention_on_noncurrent_device():
+    backend = torch.get_device_module(DEVICE)
+    if backend.device_count() < 2:
+        pytest.skip("requires two accelerators")
+    device = torch.device(DEVICE, 1)
+    generator = torch.Generator(device=device).manual_seed(7)
+    query, key, value = (torch.randn(1, 3, 2, 65, 32, device=device, generator=generator) for _ in range(3))
+    mask = banded_mask(3, 65, 0.05, device, generator)
+    with backend.device(0):
+        prepared = weathernext2_banded_attention.layers._prepare_mask(mask)
+        actual = banded_attention(query, key, value, prepared, 32**-0.5, precision="ieee")
+        torch.testing.assert_close(actual, reference(query, key, value, mask, 32**-0.5), atol=2e-5, rtol=2e-5)
+        assert actual.device == device
+        assert backend.current_device() == 0

@@ -9,9 +9,7 @@ import torch
 from torch import nn
 
 
-kernel = kernels.get_kernel(
-    "kernels-community/weathernext2-banded-attention", version=2
-)
+kernel = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=2)
 DEVICES = list(dict.fromkeys(["cpu", kernel.infer_device()]))
 
 
@@ -58,27 +56,28 @@ class ForecastHead(nn.Module):
 
     def forward(self, grid_states):
         values = self.output_proj(self.act_fn(self.decoder_proj(grid_states)))
-        values = torch.where(
-            self.sigmoid_gate, torch.sigmoid(values - self.sigmoid_shift), values
+        values = torch.where(self.sigmoid_gate, torch.sigmoid(values - self.sigmoid_shift), values)
+        return values.transpose(1, 2).reshape(
+            values.shape[0], 11, self.config.grid_latitudes, self.config.grid_longitudes
         )
-        return values.transpose(1, 2).reshape(values.shape[0], 11, 3, 7)
 
 
-def make_layer(name, device, dtype, batch):
+def make_layer(name, device, dtype, batch, points=21):
     torch.manual_seed(7)
     if name == "encoder":
         layer = GridEncoder()
         # A transpose models the noncontiguous channels-first atmospheric inputs.
         args = (
-            torch.randn(batch, 13, 21).transpose(1, 2),
-            torch.randn(21, 3),
+            torch.randn(batch, 13, points).transpose(1, 2),
+            torch.randn(points, 3),
             torch.randn(batch, 4),
         )
         forward = kernel.WeatherNext2GridEncoder.forward
         projection = "fc1"
     else:
         layer = ForecastHead()
-        args = (torch.randn(batch, 37, 21).transpose(1, 2),)
+        layer.config.grid_latitudes, layer.config.grid_longitudes = 1, points
+        args = (torch.randn(batch, 37, points).transpose(1, 2),)
         forward = kernel.WeatherNext2ForecastHead.forward
         projection = "decoder_proj"
     layer = layer.to(device=device, dtype=dtype).eval()
@@ -97,9 +96,9 @@ def make_layer(name, device, dtype, batch):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("name", ["encoder", "head"])
-def test_chunked_grid_matches_original(device, dtype, batch, name, monkeypatch):
-    monkeypatch.setattr(kernel.grid, "GRID_CHUNK_SIZE", 8)
-    reference, blocked, args, projection = make_layer(name, device, dtype, batch)
+def test_chunked_grid_matches_original(device, dtype, batch, name):
+    chunk_size = kernel.grid.GRID_CHUNK_SIZE
+    reference, blocked, args, projection = make_layer(name, device, dtype, batch, points=chunk_size + 5)
     sizes = []
     hook = getattr(blocked, projection).register_forward_pre_hook(
         lambda module, inputs: sizes.append(inputs[0].shape[1])
@@ -108,15 +107,14 @@ def test_chunked_grid_matches_original(device, dtype, batch, name, monkeypatch):
         expected = reference(*args)
         actual = blocked(*args)
     hook.remove()
-    assert sizes == [8, 8, 5]
+    assert sizes == [chunk_size, 5]
     torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("name", ["encoder", "head"])
 @pytest.mark.parametrize("reason", ["training", "autocast", "gradients"])
-def test_grid_fallback_preserves_outputs_and_gradients(name, reason, monkeypatch):
-    monkeypatch.setattr(kernel.grid, "GRID_CHUNK_SIZE", 8)
+def test_grid_fallback_preserves_outputs_and_gradients(name, reason):
     reference, blocked, args, projection = make_layer(name, "cpu", torch.float32, 2)
     if reason == "training":
         reference.train()
@@ -135,9 +133,7 @@ def test_grid_fallback_preserves_outputs_and_gradients(name, reason, monkeypatch
         if reason == "gradients":
             expected.sum().backward()
             actual.sum().backward()
-            for original, replacement in zip(
-                reference.parameters(), blocked.parameters()
-            ):
+            for original, replacement in zip(reference.parameters(), blocked.parameters()):
                 assert replacement.grad is not None
                 torch.testing.assert_close(replacement.grad, original.grad)
     hook.remove()
@@ -146,7 +142,7 @@ def test_grid_fallback_preserves_outputs_and_gradients(name, reason, monkeypatch
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(
-    kernel.infer_device() not in ("cuda", "xpu"),
+    kernel.infer_device() == "cpu",
     reason="Triton requires an accelerator.",
 )
 def test_fused_conditioning_preserves_pytorch_rounding():

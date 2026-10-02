@@ -6,17 +6,17 @@ tags:
 
 # WeatherNext 2 banded mesh-attention kernel
 
-Inference Triton kernel for **WeatherNext 2's mesh attention**, the dominant cost of a
-forecast step. Packaged as a [`kernels`](https://github.com/huggingface/kernels) Hub
-kernel with a pure-PyTorch fallback.
+Memory-bounded inference layers and fused Triton attention for
+**WeatherNext 2's mesh attention**. Packaged as a
+[`kernels`](https://github.com/huggingface/kernels) Hub kernel.
 
-Written for this repo. One Triton source, no backend-specific code beyond the autotune sweep, so
+Written for this repo. One Triton source, no backend-specific attention code, so
 it builds for anything Triton targets.
 
-The attention kernel runs one fixed config by default, the 64 x 32 tiles with 4 warps and 1 stage
-that [Faster-WeatherNext](https://github.com/Raymondlol/Faster-WeatherNext) uses, so the first
-forward only compiles. Set `WEATHERNEXT2_BANDED_ATTENTION_AUTOTUNE=1` to sweep tile shapes, warps
-and stages instead; that benchmarks every config on the first call for each shape.
+The attention kernel uses the same fixed 64 x 32 tiles, 4 warps and 1 stage as
+[Faster-WeatherNext](https://github.com/Raymondlol/Faster-WeatherNext), so the first forward
+only compiles, without benchmarking alternative configurations. Its QK scaling and online
+softmax accumulator update follow their tiled attention implementation.
 
 ## What it does
 
@@ -32,35 +32,40 @@ This kernel walks the three neighbours straight out of the ungathered tensors, s
 - the mask is streamed a tile at a time rather than expanded,
 - tiles the band never reaches are skipped before their two matmuls, not after.
 
-The layer's packed-mask path instead decodes one mesh block with Triton and calls
-`scaled_dot_product_attention` for that block. This bounds attention workspace while
-retaining the reference arithmetic. The direct `banded_attention` API still provides
-the fused tiled implementation.
+The mask layer builds one packed active-tile representation per forward, shared by all
+attention layers: CSR offsets, compact tile indices and one uint32 word per query row
+per active 32-key tile, following Faster-WeatherNext. Temporary scan counts and padded
+tile lists are discarded after preparation. The model-facing attention consumes those words directly, without
+unpacking the mask or storing a score matrix. Boolean masks use the same preparation
+when the attention replacement is used without its mask layer.
 
-Forward only. The layer refuses the fast path whenever autograd is live, because the
-kernel's output carries no `grad_fn`: a `loss.backward()` would still succeed while every
-parameter upstream of attention silently received nothing. Fine-tuning therefore takes
-the differentiable fallback. A real backward is what accelerating training would need.
+The fused Triton API is forward only. The model-facing layer uses the differentiable
+fallback when gradients are required, since retaining each chunk's activations would
+lose the inference memory saving.
 
 ## Precision
 
 The reference implementation runs this attention in float32. `precision` controls how
-`tl.dot` treats those inputs without assuming that every backend implements NVIDIA's TF32:
+`tl.dot` treats those inputs:
 
 | `precision` | what it does |
 |---|---|
-| `"default"` (default) | Triton's backend default: TF32 on supported NVIDIA GPUs, IEEE on AMD |
-| `"ieee"` | true float32, no tensor-core path, slower than the fallback it replaces |
+| `"default"` (default) | Triton's backend default |
+| `"ieee"` | full float32 multiplication |
 
-The direct `banded_attention` API accepts either mode. The layer selects `"ieee"`
-for the fused boolean-mask path; its packed-mask path uses block-wise SDPA. Neither
-layer path opts into reduced precision.
+The direct `banded_attention` API accepts either mode. Model-facing attention uses IEEE
+float32 multiplication. CPU execution and execution requiring gradients use the reference
+implementation instead.
+
+IEEE dot products can be substantially slower than accelerated reduced-precision dots,
+and can be slower than SDPA. Requesting IEEE precision alone does not reproduce SDPA's
+reduction order or guarantee full-forecast parity.
 
 ## Supported shapes
 
 Queries are `[batch, blocks, heads, block_size, head_dim]` float32, keys and values the
 same and **not** gathered over neighbours, and the mask is `[blocks, block_size,
-3 * block_size]` bool.
+3 * block_size]` bool, or an already prepared packed mask.
 
 `head_dim` **must be a power of two and at least 16**. It is a `tl.constexpr` tile width and
 the loads along it are not masked, so anything else reads past the end of every row, and
@@ -70,10 +75,9 @@ rather than returning quietly wrong numbers. WeatherNext 2's released checkpoint
 Every mesh node must reach at least itself, or that row softmaxes over nothing. The real
 geometry guarantees this; the empty rows past the last mesh node are handled.
 
-Reaching the fast path needs the geometry's own banded mask rather than the one
-`masking_utils` expands, which takes a companion change in `transformers` to pass through.
-Given a different tensor mask the layer falls back to gather-plus-sdpa, so it is never
-wrong, only unaccelerated. `attn_implementation="flex_attention"` is unsupported: that
+The attention layer accepts boolean geometry masks, with an optional singleton head axis,
+and masks whose block axis is folded into the batch axis. Other tensor layouts take
+the gather-plus-SDPA fallback. `attn_implementation="flex_attention"` is unsupported: that
 hands the layer a `BlockMask`, which neither path can read, so it raises rather than
 quietly dropping the mask.
 
@@ -88,63 +92,17 @@ replacements that reuse the layer's weights. They process grid points
 in blocks of 32,768. The encoder constructs inputs per block and fuses conditioning
 and output writes in Triton; the head fuses shifted-sigmoid selection and output
 writes. Matrix multiplications and LayerNorm use PyTorch's backend. These inference
-replacements retain the original forwards for training, autocast and
-lower-precision weights, and use PyTorch epilogues on CPU.
+replacements retain the original forwards for training and autocast. Lower-precision
+weights and CPU execution use PyTorch epilogues while retaining grid chunking.
 
 ## Validation
 
 `tests/` checks the kernel against an fp32 sdpa reference across block counts and band
 densities, checks that a node reaching only itself returns its own value vector rather
 than NaN, checks that unsupported head dimensions raise, and checks that a backward
-reaches all four projections.
+reaches all four projections. Model-facing tests cover
+batch-specific masks, shared packed geometry and CPU execution. Tests use the implementation's
+fixed launch defaults, without overriding tuning configurations.
 
 Tests pick the device with `infer_device()`, so they run on whichever accelerator is present
 rather than assuming CUDA.
-
-**CUDA (H100, `kashif/weathernext2-mini`, 1 degree: 4 blocks of 2577 nodes, 7731 keys,
-4 heads, head_dim 128, 13% band density), real initial conditions:**
-
-These historical measurements describe the fused attention path, not the block-wise
-packed-mask path.
-
-| path | ms/step | attention peak GiB |
-|---|---|---|
-| shipped (gather + sdpa) | 299.6 | 0.90 |
-| this kernel | 181.8 | 0.37 |
-
-**1.65x end to end.** Whole-model peak memory is unchanged at this resolution: the
-attention saving is real but the global peak is set elsewhere. Not measured at 0.25
-degrees, where attention dominates the footprint.
-
-Accuracy in physical units, worst variable, as a fraction of that field's spatial spread:
-the shipped path sits 7.0e-04 from the JAX reference, this kernel 2.4e-03. In `"ieee"` it
-matches sdpa to 2e-06, so the gap is tf32 rounding rather than a different computation.
-
-Timings were taken on a shared GPU where run-to-run spread is around 18%, so treat the ratio
-rather than the absolute numbers as the result.
-
-**ROCm (gfx1150, torch 2.13.0+rocm7.2, triton 3.7.1):** all tests pass, matching sdpa to
-6.9e-07. The autotune sweep uses fewer pipeline stages there than on CUDA. Speed and memory against sdpa, sweeping block size:
-
-| block_size | sdpa ms / GiB | kernel ms / GiB | speed | memory |
-|---|---|---|---|---|
-| 256 | 2.56 / 0.07 | 2.83 / 0.05 | 0.90x | 0.71x |
-| 512 | 9.11 / 0.18 | 12.22 / 0.07 | 0.75x | 0.39x |
-| 1024 | 34.59 / 0.56 | 48.45 / 0.10 | 0.71x | 0.18x |
-
-The kernel is slower per step on this device and its memory advantage widens sharply with
-block size, because sdpa's footprint grows with `block_size**2` while the kernel's stays
-close to flat. Torch also reports that memory-efficient attention on AMD is still
-experimental, so sdpa is falling back to the math path. gfx1150 is integrated RDNA 3.5
-with no tf32 and the autotune configs were chosen on an H100, so **these timings should
-not be read as representative of CDNA**.
-
-## Follow-ups
-
-- **Measure on CDNA (MI300).** The ROCm numbers come from an integrated RDNA 3.5 GPU at a
-  tenth of the model's real block size, so the HIP tile sweep is unproven.
-- **XPU is declared but untested**, with no Intel GPU available. The warp count is the first
-  thing to tune there; this sweep's `(4, 8)` is aimed at CUDA and ROCm.
-- **NPU is not declared**, since no kernel in this repo declares it yet.
-- **A backward**, if training is ever to use this rather than fall back.
-- **Autotune properly.** The current config sweep is fixed and was chosen on one device.

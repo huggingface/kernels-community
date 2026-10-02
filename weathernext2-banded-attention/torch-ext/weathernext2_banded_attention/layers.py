@@ -7,8 +7,8 @@ Only `forward` is defined: `kernels` binds it onto the model's own module, so `s
 import torch
 from torch import nn
 
-from .banded_attention import PreparedMask, _prepare_mask, _unpack_mask, banded_attention
-from .utils import device_context
+from .banded_attention import PreparedMask, banded_attention
+from .banded_attention import _prepare_mask as _prepare_mask
 from .grid import WeatherNext2ForecastHead as WeatherNext2ForecastHead
 from .grid import WeatherNext2GridEncoder as WeatherNext2GridEncoder
 
@@ -47,7 +47,13 @@ def _is_banded(attention_mask, hidden_states) -> bool:
     return (
         key_length == 3 * block_size
         and hidden_states.ndim == 4
-        and hidden_states.shape[1] == num_blocks
+        and (
+            hidden_states.shape[1] == num_blocks
+            or (
+                isinstance(attention_mask, torch.Tensor)
+                and hidden_states.shape[0] * hidden_states.shape[1] == num_blocks
+            )
+        )
         and hidden_states.shape[2] == block_size
     )
 
@@ -55,9 +61,7 @@ def _is_banded(attention_mask, hidden_states) -> bool:
 def _needs_grad(*tensors: torch.Tensor) -> bool:
     """Is autograd going to want a backward through this?
 
-    The kernel has no backward. Its output is written into a fresh tensor, so it carries no
-    `grad_fn`: a `loss.backward()` would still succeed, and every parameter upstream of attention
-    would silently receive nothing. Falling back is the only safe answer until a backward exists.
+    Triton attention is forward-only. Training must retain the differentiable reference path.
     """
     return torch.is_grad_enabled() and any(t.requires_grad for t in tensors)
 
@@ -71,8 +75,11 @@ def _reference_attention(query, key, value, attention_mask, scaling):
 
     if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 3:
         # The geometry's banded mask, which sdpa needs broadcast over the folded batch axis.
-        attention_mask = attention_mask[None, :, None].expand(batch, blocks, 1, block_size, 3 * block_size)
-        attention_mask = attention_mask.reshape(batch * blocks, 1, block_size, 3 * block_size)
+        if attention_mask.shape[0] == blocks:
+            attention_mask = attention_mask[None, :, None].expand(batch, blocks, 1, block_size, 3 * block_size)
+            attention_mask = attention_mask.reshape(batch * blocks, 1, block_size, 3 * block_size)
+        else:
+            attention_mask = attention_mask[:, None]
     elif not isinstance(attention_mask, torch.Tensor):
         # A `BlockMask` only arrives with `attn_implementation="flex_attention"`, and sdpa cannot
         # consume one. Say so rather than drop the mask, which would attend across the whole band.
@@ -86,58 +93,38 @@ def _reference_attention(query, key, value, attention_mask, scaling):
     return out.reshape(batch, blocks, heads, block_size, head_dim)
 
 
-_PREPARED_BUFFERS = ("packed", "tiles", "counts", "offsets")
-
-
-def _packed_attention(query, key, value, mask, scaling):
-    """Preserve SDPA arithmetic while bounding its workspace to one mesh block."""
-    batch, blocks, heads, block_size, head_dim = query.shape
-    out = torch.empty_like(query)
-    padding = query.new_zeros(batch, heads, block_size, head_dim)
-    for block in range(blocks):
-        dense_mask = _unpack_mask(mask, block)
-        keys, values = (
-            torch.cat(
-                [states[:, source] if 0 <= source < blocks else padding for source in (block - 1, block, block + 1)],
-                dim=2,
+def _blockwise_attention(query, key, value, mask, scaling):
+    """Run sparse Triton attention without gathering neighbouring key/value blocks."""
+    batch, blocks = query.shape[:2]
+    if isinstance(mask, PreparedMask) or mask.shape[0] == blocks:
+        return banded_attention(query, key, value, mask, scaling, precision="ieee")
+    # Expanded masks can differ between ensemble members; never reuse the first member's mask.
+    masks = mask.reshape(batch, blocks, *mask.shape[1:])
+    return torch.cat(
+        [
+            banded_attention(
+                query[i : i + 1],
+                key[i : i + 1],
+                value[i : i + 1],
+                masks[i],
+                scaling,
+                precision="ieee",
             )
-            for states in (key, value)
-        )
-        out[:, block] = nn.functional.scaled_dot_product_attention(
-            query[:, block], keys, values, attn_mask=dense_mask, scale=scaling
-        )
-        del dense_mask
-    return out
+            for i in range(batch)
+        ]
+    )
 
 
 class WeatherNext2AttentionMask(nn.Module):
-    """Packs the geometry's banded mask once, into the active tiles the attention kernel walks.
-
-    The packed form is kept as non-persistent buffers, so it follows the model across `.to()` and
-    stays out of the state dict. It is rebuilt only when the geometry buffer itself changes.
-    """
+    """Prepare one packed geometry mask per forward, shared by all transformer layers."""
 
     def forward(self, attention_mask, batch_size, dtype):
         if self.training or torch.is_grad_enabled() or self.config._attn_implementation == "flex_attention":
             return type(self).forward(self, attention_mask, batch_size, dtype)
         mask = attention_mask[:, 0]
-        try:
-            # A view of the same storage can describe a different geometry, so shape and strides count too.
-            key = (mask.data_ptr(), tuple(mask.shape), mask.stride(), mask.device, mask._version)
-        except RuntimeError:
-            key = None  # An inference tensor has no version counter, so a change could not be seen.
-        # The buffers move with this module, which can be placed apart from the geometry it was built from.
-        stale = (
-            key is None or getattr(self, "_prepared_key", None) != key or self._prepared_tiles.device != mask.device
-        )
-        if stale:
-            with device_context(mask.device):
-                prepared = _prepare_mask(mask, sparse_tiles=True, packed_mask=True)
-            for name, tensor in zip(_PREPARED_BUFFERS, prepared):
-                self.register_buffer(f"_prepared_{name}", tensor, persistent=False)
-            self._prepared_key = key
-            self._prepared_shape = prepared.shape
-        return PreparedMask(*(getattr(self, f"_prepared_{name}") for name in _PREPARED_BUFFERS), self._prepared_shape)
+        if mask.is_cpu:
+            return mask
+        return _prepare_mask(mask)
 
 
 class WeatherNext2Attention(nn.Module):
@@ -149,17 +136,14 @@ class WeatherNext2Attention(nn.Module):
         query = self.q_proj(hidden_states).view(hidden_shape).transpose(2, 3)
         key = self.k_proj(hidden_states).view(hidden_shape).transpose(2, 3)
         value = self.v_proj(hidden_states).view(hidden_shape).transpose(2, 3)
+        query, key, value = (states.float() for states in (query, key, value))
 
         banded = _banded_mask(attention_mask)
-        if _is_banded(attention_mask, hidden_states) and not _needs_grad(query, key, value):
-            if isinstance(banded, PreparedMask):
-                attn_output = _packed_attention(query.float(), key.float(), value.float(), banded, self.scaling)
-            else:
-                attn_output = banded_attention(
-                    query.float(), key.float(), value.float(), banded, self.scaling, precision="ieee"
-                )
+        if _is_banded(attention_mask, hidden_states) and not query.is_cpu and not _needs_grad(query, key, value):
+            attn_output = _blockwise_attention(query, key, value, banded, self.scaling)
         else:
-            attn_output = _reference_attention(query, key, value, attention_mask, self.scaling)
+            mask = banded if banded is not None else attention_mask
+            attn_output = _reference_attention(query, key, value, mask, self.scaling)
 
         attn_output = attn_output.to(hidden_states.dtype).transpose(2, 3).reshape(*input_shape, -1).contiguous()
         return self.o_proj(attn_output), None
