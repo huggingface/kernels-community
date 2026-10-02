@@ -190,9 +190,9 @@ class swigluoai_and_mul_kernel {
   if (num_tokens == 0) {                                     \
     return;                                                  \
   }                                                          \
-  auto out_ptr = out.data_ptr<scalar_t>();                   \
-  auto input_ptr = input.data_ptr<scalar_t>();               \
-  at::DeviceGuard device_guard(input.device());              \
+  auto out_ptr = out.mutable_data_ptr<scalar_t>();                   \
+  auto input_ptr = input.mutable_data_ptr<scalar_t>();               \
+  const torch::stable::accelerator::DeviceGuard device_guard(input.get_device_index());              \
   auto& queue = vllm::xpu::vllmGetQueue();                   \
   queue.submit([&](sycl::handler& cgh) {                     \
     cgh.parallel_for(                                        \
@@ -202,8 +202,8 @@ class swigluoai_and_mul_kernel {
   });
 
 void silu_and_mul(
-    torch::Tensor& out,    // [..., d]
-    torch::Tensor& input)  // [..., 2 * d]
+    torch::stable::Tensor& out,    // [..., d]
+    torch::stable::Tensor& input)  // [..., 2 * d]
 {
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "silu_and_mul", [&] {
     LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, true);
@@ -211,8 +211,8 @@ void silu_and_mul(
 }
 
 void mul_and_silu(
-    torch::Tensor& out,    // [..., d]
-    torch::Tensor& input)  // [..., 2 * d]
+    torch::stable::Tensor& out,    // [..., d]
+    torch::stable::Tensor& input)  // [..., 2 * d]
 {
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "mul_and_silu", [&] {
     LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, false);
@@ -220,8 +220,8 @@ void mul_and_silu(
 }
 
 void gelu_and_mul(
-    torch::Tensor& out,    // [..., d]
-    torch::Tensor& input)  // [..., 2 * d]
+    torch::stable::Tensor& out,    // [..., d]
+    torch::stable::Tensor& input)  // [..., 2 * d]
 {
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "gelu_and_mul", [&] {
     LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_kernel, true);
@@ -229,8 +229,8 @@ void gelu_and_mul(
 }
 
 void gelu_tanh_and_mul(
-    torch::Tensor& out,    // [..., d]
-    torch::Tensor& input)  // [..., 2 * d]
+    torch::stable::Tensor& out,    // [..., d]
+    torch::stable::Tensor& input)  // [..., 2 * d]
 {
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "gelu_tanh_and_mul", [&] {
     LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_tanh_kernel, true);
@@ -247,9 +247,9 @@ void gelu_tanh_and_mul(
   if (num_tokens == 0) {                                   \
     return;                                                \
   }                                                        \
-  auto out_ptr = out.data_ptr<scalar_t>();                 \
-  auto input_ptr = input.data_ptr<scalar_t>();             \
-  at::DeviceGuard device_guard(input.device());            \
+  auto out_ptr = out.mutable_data_ptr<scalar_t>();                 \
+  auto input_ptr = input.mutable_data_ptr<scalar_t>();             \
+  const torch::stable::accelerator::DeviceGuard device_guard(input.get_device_index());            \
   auto& queue = vllm::xpu::vllmGetQueue();                 \
   queue.submit([&](sycl::handler& cgh) {                   \
     cgh.parallel_for(                                      \
@@ -263,7 +263,7 @@ void gelu_tanh_and_mul(
   int64_t num_tokens = input.numel() / input.size(-1);                    \
   sycl::range<1> grid(num_tokens);                                        \
   sycl::range<1> block(std::min(d, 1024));                                \
-  at::DeviceGuard device_guard(input.device());                           \
+  const torch::stable::accelerator::DeviceGuard device_guard(input.get_device_index());                           \
   auto& queue = vllm::xpu::vllmGetQueue();                                \
   VLLM_DISPATCH_FLOATING_TYPES(                                           \
       input.scalar_type(), "clamp_swiglu_kernel_with_params", [&] {       \
@@ -271,8 +271,8 @@ void gelu_tanh_and_mul(
           cgh.parallel_for(                                               \
               sycl::nd_range<1>(grid * block, block),                     \
               vllm::swigluoai_and_mul_kernel<scalar_t, KERNEL<scalar_t>>( \
-                  out.data_ptr<scalar_t>(),                               \
-                  input.data_ptr<scalar_t>(),                             \
+                  out.mutable_data_ptr<scalar_t>(),                               \
+                  input.mutable_data_ptr<scalar_t>(),                             \
                   d,                                                      \
                   ALPHA,                                                  \
                   LIMIT));                                                \
@@ -280,8 +280,8 @@ void gelu_tanh_and_mul(
       });
 
 void gelu_new(
-    torch::Tensor& out,    // [..., d]
-    torch::Tensor& input)  // [..., d]
+    torch::stable::Tensor& out,    // [..., d]
+    torch::stable::Tensor& input)  // [..., d]
 {
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "gelu_new", [&] {
     LAUNCH_ACTIVATION_KERNEL(vllm::gelu_new_kernel);
@@ -289,8 +289,8 @@ void gelu_new(
 }
 
 void gelu_fast(
-    torch::Tensor& out,    // [..., d]
-    torch::Tensor& input)  // [..., d]
+    torch::stable::Tensor& out,    // [..., d]
+    torch::stable::Tensor& input)  // [..., d]
 {
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "gelu_fast", [&] {
     LAUNCH_ACTIVATION_KERNEL(vllm::gelu_fast_kernel);
@@ -298,8 +298,8 @@ void gelu_fast(
 }
 
 void gelu_quick(
-    torch::Tensor& out,    // [..., d]
-    torch::Tensor& input)  // [..., d]
+    torch::stable::Tensor& out,    // [..., d]
+    torch::stable::Tensor& input)  // [..., d]
 {
   VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "gelu_quick", [&] {
     LAUNCH_ACTIVATION_KERNEL(vllm::gelu_quick_kernel);
@@ -307,8 +307,8 @@ void gelu_quick(
 }
 
 void swigluoai_and_mul(
-    torch::Tensor& out,    // [..., d]
-    torch::Tensor& input,  // [..., 2 * d]
+    torch::stable::Tensor& out,    // [..., d]
+    torch::stable::Tensor& input,  // [..., 2 * d]
     double alpha,
     double limit) {
   LAUNCH_SWIGLUOAI_AND_MUL(vllm::swigluoai_and_mul, alpha, limit);

@@ -22,6 +22,7 @@ src = [
 [torch.stable-abi]
 cuda = "2.10"
 rocm = "2.10"
+xpu = "2.13"
 
 [kernel.megablocks_xpu]
 backend = "xpu"
@@ -33,7 +34,7 @@ src = [
     "csrc_xpu/utils.h",
     "csrc_xpu/dispatch_utils.h",
     "csrc_xpu/xpu_features.hpp",
-    "csrc_xpu/core/registration.h",
+
     "csrc_xpu/activation.cpp",
     "csrc_xpu/activation.h",
     "csrc_xpu/moe/moe_ops.h",

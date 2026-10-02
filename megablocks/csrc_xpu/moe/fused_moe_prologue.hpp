@@ -1,10 +1,9 @@
 #pragma once
-#include <torch/all.h>
 #include "../utils.h"
 
 #define MAX_SUBGROUP_SIZE 32
 constexpr static int EXPAND_THREADS_PER_BLOCK = 256;
-typedef at::BFloat16 bfloat16;
+typedef c10::BFloat16 bfloat16;
 
 template <typename T>
 inline T ceilDiv(T a, T b) {

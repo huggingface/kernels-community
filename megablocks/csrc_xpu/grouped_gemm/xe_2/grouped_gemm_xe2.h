@@ -1,17 +1,17 @@
-#include <torch/all.h>
+#include "../../utils.h"
 
 namespace MoE {
 
 // Instantiated once per target architecture: 20 for pvc/bmg, 35 for CRI. The
 // two instantiations live in separate translation units with different flags.
 template <int Arch>
-torch::Tensor cutlass_grouped_gemm_xe2(
-    torch::Tensor ptr_A,
-    torch::Tensor ptr_B,
-    const c10::optional<at::Tensor>& ptr_scales,
-    const c10::optional<at::Tensor>& ptr_bias,
-    torch::Tensor ptr_D,
-    torch::Tensor expert_first_token_offset,
+torch::stable::Tensor cutlass_grouped_gemm_xe2(
+    torch::stable::Tensor ptr_A,
+    torch::stable::Tensor ptr_B,
+    const std::optional<torch::stable::Tensor>& ptr_scales,
+    const std::optional<torch::stable::Tensor>& ptr_bias,
+    torch::stable::Tensor ptr_D,
+    torch::stable::Tensor expert_first_token_offset,
     int64_t N,
     int64_t K,
     int64_t num_experts,

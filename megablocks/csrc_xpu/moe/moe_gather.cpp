@@ -160,14 +160,14 @@ void MoeGatherLauncher(
       CASE_TOPK(8, ElemsPerItem)                                               \
       CASE_TOPK(10, ElemsPerItem)                                              \
       default:                                                                 \
-        TORCH_CHECK(false, "error: not support TOPK=" + std::to_string(TOPK)); \
+        STD_TORCH_CHECK(false, "error: not support TOPK=" + std::to_string(TOPK)); \
     }                                                                          \
     break;
 
   switch (elems_per_item) {
     CASE_ElemsPerItem(topk, 1) CASE_ElemsPerItem(topk, 2)
         CASE_ElemsPerItem(topk, 4) CASE_ElemsPerItem(topk, 8) default
-        : TORCH_CHECK(
+        : STD_TORCH_CHECK(
               false,
               "error: not support elems_per_item=" +
                   std::to_string(elems_per_item));
@@ -180,23 +180,23 @@ void MoeGatherLauncher(
 }  // namespace vllm
 
 void moe_gather(
-    torch::Tensor& output,              // [num_tokens, hidden_size]
-    const torch::Tensor& moe_output,    // [num_tokens * topk, hidden_size]
-    const torch::Tensor& topk_weights,  // [num_tokens, topk]
-    const torch::Tensor& permuted_row_to_unpermuted_row,  // [num_tokens * topk]
-    const torch::Tensor& unpermuted_row_to_permuted_row,  // [num_tokens * topk]
-    const torch::Tensor& expert_first_token_offset,       // [num_experts + 1]
+    torch::stable::Tensor& output,              // [num_tokens, hidden_size]
+    const torch::stable::Tensor& moe_output,    // [num_tokens * topk, hidden_size]
+    const torch::stable::Tensor& topk_weights,  // [num_tokens, topk]
+    const torch::stable::Tensor& permuted_row_to_unpermuted_row,  // [num_tokens * topk]
+    const torch::stable::Tensor& unpermuted_row_to_permuted_row,  // [num_tokens * topk]
+    const torch::stable::Tensor& expert_first_token_offset,       // [num_experts + 1]
     const int64_t num_experts) {
   // Implementation of the gather operation
   const int num_tokens = topk_weights.size(0);
   const int topk = topk_weights.size(1);
   const int hidden_size = output.size(1);
 
-  TORCH_CHECK(
-      topk_weights.scalar_type() == torch::kFloat32,
+  STD_TORCH_CHECK(
+      topk_weights.scalar_type() == ScalarType::Float,
       "topk_weights must be float32");
 
-  const at::DeviceGuard device_guard(output.device());
+  const torch::stable::accelerator::DeviceGuard device_guard(output.get_device_index());
   auto& queue = vllm::xpu::vllmGetQueue();
 
 #define LAUNCH_MOE_GATHER(T)                                             \
@@ -213,13 +213,13 @@ void moe_gather(
       hidden_size,                                                       \
       queue);
 
-  if (output.scalar_type() == torch::kFloat16) {
+  if (output.scalar_type() == ScalarType::Half) {
     using scalar_t = sycl::half;
     LAUNCH_MOE_GATHER(scalar_t);
-  } else if (output.scalar_type() == torch::kBFloat16) {
+  } else if (output.scalar_type() == ScalarType::BFloat16) {
     using scalar_t = sycl::ext::oneapi::bfloat16;
     LAUNCH_MOE_GATHER(scalar_t);
-  } else if (output.scalar_type() == torch::kFloat32) {
+  } else if (output.scalar_type() == ScalarType::Float) {
     using scalar_t = float;
     LAUNCH_MOE_GATHER(scalar_t);
   } else {
