@@ -1,6 +1,18 @@
+#ifdef TORCH_TARGET_VERSION
+#include <torch/csrc/stable/library.h>
+#else
 #include <torch/library.h>
+#endif
 #include <optional>
 #include <vector>
+
+// The CUDA/ROCm sources use the stable ABI, the XPU/CPU sources do not.
+#if (defined(CUDA_KERNEL) || defined(ROCM_KERNEL)) && !defined(TORCH_TARGET_VERSION)
+#error "The CUDA/ROCm sources require a Torch stable ABI build"
+#endif
+#if (defined(XPU_KERNEL) || defined(CPU_KERNEL)) && defined(TORCH_TARGET_VERSION)
+#error "The XPU/CPU sources do not support the Torch stable ABI"
+#endif
 
 #if defined(CUDA_KERNEL) || defined(ROCM_KERNEL)
 #include "registration.h"
@@ -28,23 +40,23 @@
 #include "../csrc_cpu/moe_dispatcher.h"
 #endif
 
-#if defined(CUDA_KERNEL) || defined(ROCM_KERNEL)
+#ifdef TORCH_TARGET_VERSION
 // ==================== CUDA / ROCm Implementation =====================
 
 // void exclusive_cumsum(torch::Tensor x, int dim, torch::Tensor out) {
-torch::Tensor exclusive_cumsum_wrapper(torch::Tensor x, int64_t dim, torch::Tensor out) {
+torch::stable::Tensor exclusive_cumsum_wrapper(torch::stable::Tensor x, int64_t dim, torch::stable::Tensor out) {
   megablocks::exclusive_cumsum(x, dim, out);
   return out;
 }
 
 // void inclusive_cumsum(torch::Tensor x, int dim, torch::Tensor out) {
-torch::Tensor inclusive_cumsum_wrapper(torch::Tensor x, int64_t dim, torch::Tensor out) {
+torch::stable::Tensor inclusive_cumsum_wrapper(torch::stable::Tensor x, int64_t dim, torch::stable::Tensor out) {
   megablocks::inclusive_cumsum(x, dim, out);
   return out;
 }
 
 // torch::Tensor histogram(torch::Tensor x, int num_bins);
-torch::Tensor histogram_wrapper(torch::Tensor x, int64_t num_bins) {
+torch::stable::Tensor histogram_wrapper(torch::stable::Tensor x, int64_t num_bins) {
   return megablocks::histogram(x, num_bins);
 }
 
@@ -53,11 +65,11 @@ torch::Tensor histogram_wrapper(torch::Tensor x, int64_t num_bins) {
 //   int output_block_rows,
 //   int output_block_columns,
 //   torch::Tensor out);
-torch::Tensor indices_wrapper(torch::Tensor padded_bins,
+torch::stable::Tensor indices_wrapper(torch::stable::Tensor padded_bins,
                                int64_t block_size,
                                int64_t output_block_rows,
                                int64_t output_block_columns,
-                               torch::Tensor out) {
+                               torch::stable::Tensor out) {
   megablocks::indices(padded_bins, block_size, output_block_rows, output_block_columns, out);
   return out;
 }
@@ -68,7 +80,7 @@ torch::Tensor indices_wrapper(torch::Tensor padded_bins,
 // void replicate_forward(torch::Tensor x,
 //   torch::Tensor bins,
 //   torch::Tensor out);
-torch::Tensor replicate_forward_wrapper(torch::Tensor x, torch::Tensor bins, torch::Tensor out) {
+torch::stable::Tensor replicate_forward_wrapper(torch::stable::Tensor x, torch::stable::Tensor bins, torch::stable::Tensor out) {
   megablocks::replicate_forward(x, bins, out);
   return out;
 }
@@ -77,7 +89,7 @@ torch::Tensor replicate_forward_wrapper(torch::Tensor x, torch::Tensor bins, tor
 // void replicate_backward(torch::Tensor grad,
 //    torch::Tensor bins,
 //    torch::Tensor out);
-torch::Tensor replicate_backward_wrapper(torch::Tensor grad, torch::Tensor bins, torch::Tensor out) {
+torch::stable::Tensor replicate_backward_wrapper(torch::stable::Tensor grad, torch::stable::Tensor bins, torch::stable::Tensor out) {
   megablocks::replicate_backward(grad, bins, out);
   return out;
 }
@@ -87,14 +99,14 @@ torch::Tensor replicate_backward_wrapper(torch::Tensor grad, torch::Tensor bins,
 //   int end_bit,
 //   torch::Tensor x_out,
 //   torch::Tensor iota_out);
-torch::Tensor sort_wrapper(torch::Tensor x, int64_t end_bit, torch::Tensor x_out, torch::Tensor iota_out) {
+torch::stable::Tensor sort_wrapper(torch::stable::Tensor x, int64_t end_bit, torch::stable::Tensor x_out, torch::stable::Tensor iota_out) {
   megablocks::sort(x, end_bit, x_out, iota_out);
   return x_out;
 }
 
 #if defined(CUDA_KERNEL)
 // GroupedGemm operation (CUTLASS, CUDA-only).
-torch::Tensor gmm(torch::Tensor a, torch::Tensor b, torch::Tensor c, torch::Tensor batch_sizes, bool trans_a, bool trans_b) {
+torch::stable::Tensor gmm(torch::stable::Tensor a, torch::stable::Tensor b, torch::stable::Tensor c, torch::stable::Tensor batch_sizes, bool trans_a, bool trans_b) {
   grouped_gemm::GroupedGemm(a, b, c, batch_sizes, trans_a, trans_b);
   return c;
 }
@@ -110,32 +122,30 @@ torch::Tensor gmm(torch::Tensor a, torch::Tensor b, torch::Tensor c, torch::Tens
 // m.def("replicate_backward", &replicate_backward, "(bwd) replicate a vector dynamically.");
 // m.def("sort", &sort, "key/value sort.");
 
-TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("exclusive_cumsum(Tensor x, int dim, Tensor(a!) out) -> Tensor(a!)");
-  ops.impl("exclusive_cumsum", torch::kCUDA, &exclusive_cumsum_wrapper);
-
   ops.def("inclusive_cumsum(Tensor x, int dim, Tensor(a!) out) -> Tensor(a!)");
-  ops.impl("inclusive_cumsum", torch::kCUDA, &inclusive_cumsum_wrapper);
-
   ops.def("histogram(Tensor x, int num_bins) -> Tensor");
-  ops.impl("histogram", torch::kCUDA, &histogram_wrapper);
-
   ops.def("indices(Tensor padded_bins, int block_size, int output_block_rows, int output_block_columns, Tensor(a!) out) -> Tensor(a!)");
-  ops.impl("indices", torch::kCUDA, &indices_wrapper);
-
   ops.def("replicate_forward(Tensor x, Tensor bins, Tensor(a!) out) -> Tensor(a!)");
-  ops.impl("replicate_forward", torch::kCUDA, &replicate_forward_wrapper);
-
   ops.def("replicate_backward(Tensor grad, Tensor bins, Tensor(a!) out) -> Tensor(a!)");
-  ops.impl("replicate_backward", torch::kCUDA, &replicate_backward_wrapper);
-  
   ops.def("sort(Tensor x, int end_bit, Tensor x_out, Tensor iota_out) -> Tensor(x_out)");
-  ops.impl("sort", torch::kCUDA, &sort_wrapper);
-
 #if defined(CUDA_KERNEL)
   // Register the gmm GroupedGemm operation (CUTLASS, CUDA-only).
   ops.def("gmm(Tensor (a!) a, Tensor (b!) b, Tensor(c!) c, Tensor batch_sizes, bool trans_a, bool trans_b) -> Tensor(c!)");
-  ops.impl("gmm", torch::kCUDA, &gmm);
+#endif
+}
+
+STABLE_TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, ops) {
+  ops.impl("exclusive_cumsum", TORCH_BOX(&exclusive_cumsum_wrapper));
+  ops.impl("inclusive_cumsum", TORCH_BOX(&inclusive_cumsum_wrapper));
+  ops.impl("histogram", TORCH_BOX(&histogram_wrapper));
+  ops.impl("indices", TORCH_BOX(&indices_wrapper));
+  ops.impl("replicate_forward", TORCH_BOX(&replicate_forward_wrapper));
+  ops.impl("replicate_backward", TORCH_BOX(&replicate_backward_wrapper));
+  ops.impl("sort", TORCH_BOX(&sort_wrapper));
+#if defined(CUDA_KERNEL)
+  ops.impl("gmm", TORCH_BOX(&gmm));
 #endif
 }
 
@@ -406,4 +416,4 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
 
-#endif  // CUDA_KERNEL / XPU_KERNEL / CPU_KERNEL
+#endif  // TORCH_TARGET_VERSION / XPU_KERNEL / CPU_KERNEL

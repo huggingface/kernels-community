@@ -1,14 +1,15 @@
 #include "indices.h"
 #include <cstdint>
-#include <c10/util/Half.h>
-#include <c10/cuda/CUDAStream.h>
+#include <torch/headeronly/util/Half.h>
 
 #define CUDA_CALL(code)					    \
   do {                                                      \
     cudaError_t status = code;                              \
     std::string err = cudaGetErrorString(status);           \
-    TORCH_CHECK(status == cudaSuccess, err);		    \
+    STD_TORCH_CHECK(status == cudaSuccess, err);	    \
   } while (0)
+
+using torch::headeronly::ScalarType;
 
 namespace megablocks {
 namespace construct_indices {
@@ -66,30 +67,30 @@ cudaError_t ConstructIndices(short * __restrict__ indices,
 
 } // namespace construct_indices
 
-void indices(torch::Tensor padded_bins,
+void indices(torch::stable::Tensor padded_bins,
 	     int block_size,
 	     int output_block_rows,
 	     int output_block_columns,
-	     torch::Tensor out) {
-  TORCH_CHECK(padded_bins.is_cuda());
-  TORCH_CHECK(padded_bins.ndimension() == 1);
-  TORCH_CHECK(padded_bins.scalar_type() == torch::kInt);
+	     torch::stable::Tensor out) {
+  STD_TORCH_CHECK(padded_bins.is_cuda());
+  STD_TORCH_CHECK(padded_bins.dim() == 1);
+  STD_TORCH_CHECK(padded_bins.scalar_type() == ScalarType::Int);
 
-  TORCH_CHECK(out.is_cuda());
-  TORCH_CHECK(out.ndimension() == 1);
-  TORCH_CHECK(out.scalar_type() == torch::kInt16);
-  TORCH_CHECK(out.numel() == (output_block_rows * output_block_columns));
+  STD_TORCH_CHECK(out.is_cuda());
+  STD_TORCH_CHECK(out.dim() == 1);
+  STD_TORCH_CHECK(out.scalar_type() == ScalarType::Short);
+  STD_TORCH_CHECK(out.numel() == (output_block_rows * output_block_columns));
 
   // Exit early if there is no work to do.
   if (out.numel() == 0) return;
 
-  CUDA_CALL(construct_indices::ConstructIndices(out.data_ptr<short>(),
+  CUDA_CALL(construct_indices::ConstructIndices(out.mutable_data_ptr<short>(),
 						output_block_rows,
 						output_block_columns,
 						block_size,
-						padded_bins.data_ptr<int>(),
+						padded_bins.const_data_ptr<int>(),
 						padded_bins.numel(),
-						c10::cuda::getCurrentCUDAStream()));
+						static_cast<cudaStream_t>(current_stream_ptr(out))));
 }
 
 } // namespace megablocks

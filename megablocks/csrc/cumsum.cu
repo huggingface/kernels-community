@@ -6,15 +6,16 @@
 #include "cumsum.h"
 #include <cstdint>
 #include <cub/cub.cuh>
-#include <c10/cuda/CUDAStream.h>
 
 #define CUDA_CALL(code)                           \
   do                                              \
   {                                               \
     cudaError_t status = code;                    \
     std::string err = cudaGetErrorString(status); \
-    TORCH_CHECK(status == cudaSuccess, err);      \
+    STD_TORCH_CHECK(status == cudaSuccess, err);  \
   } while (0)
+
+using torch::headeronly::ScalarType;
 
 namespace megablocks
 {
@@ -76,25 +77,22 @@ namespace megablocks
   };
 
   template <typename SumType, typename T>
-  void cub_cumsum(torch::Tensor x, int dim, torch::Tensor out)
+  void cub_cumsum(torch::stable::Tensor x, int dim, torch::stable::Tensor out)
   {
     // Get temporary storage size.
     size_t scratchpad_bytes = 0;
     Cumsum<SumType>::Run(nullptr,
                          scratchpad_bytes,
-                         x.data_ptr<T>(),
-                         out.data_ptr<T>(),
+                         x.const_data_ptr<T>(),
+                         out.mutable_data_ptr<T>(),
                          x.size(1),
-                         c10::cuda::getCurrentCUDAStream());
+                         static_cast<cudaStream_t>(current_stream_ptr(x)));
 
     // Allocate scratchpad.
     //
     // NOTE: We scale for the batch dimension so we can run in parallel.
-    auto options = torch::TensorOptions()
-                       .dtype(torch::kInt8)
-                       .device(x.device());
-    torch::Tensor scratchpad = torch::empty(scratchpad_bytes * x.size(0),
-                                            options);
+    torch::stable::Tensor scratchpad = torch::stable::new_empty(
+        x, {static_cast<int64_t>(scratchpad_bytes * x.size(0))}, ScalarType::Char);
 
     // Run the kernel.
     //
@@ -106,71 +104,71 @@ namespace megablocks
     // from this formulation anyways.
     for (int i = 0; i < x.size(0); ++i)
     {
-      void *scratchpad_ptr = (int8_t *)scratchpad.data_ptr() + scratchpad_bytes * i;
+      void *scratchpad_ptr = (int8_t *)scratchpad.mutable_data_ptr() + scratchpad_bytes * i;
       Cumsum<SumType>::Run(scratchpad_ptr,
                            scratchpad_bytes,
-                           x.data_ptr<T>() + x.size(1) * i,
-                           out.data_ptr<T>() + x.size(1) * i,
+                           x.const_data_ptr<T>() + x.size(1) * i,
+                           out.mutable_data_ptr<T>() + x.size(1) * i,
                            x.size(1),
-                           c10::cuda::getCurrentCUDAStream());
+                           static_cast<cudaStream_t>(current_stream_ptr(x)));
     }
   }
 
-  void exclusive_cumsum(torch::Tensor x, int dim, torch::Tensor out)
+  void exclusive_cumsum(torch::stable::Tensor x, int dim, torch::stable::Tensor out)
   {
     // Validate the input matrix.
-    TORCH_CHECK(x.is_cuda());
-    TORCH_CHECK(x.ndimension() == 2);
-    TORCH_CHECK(x.scalar_type() == torch::kInt16 ||
-                x.scalar_type() == torch::kInt32 ||
-                x.scalar_type() == torch::kInt64);
-    TORCH_CHECK(out.is_cuda());
-    TORCH_CHECK(out.ndimension() == 2);
-    TORCH_CHECK(out.scalar_type() == x.scalar_type());
+    STD_TORCH_CHECK(x.is_cuda());
+    STD_TORCH_CHECK(x.dim() == 2);
+    STD_TORCH_CHECK(x.scalar_type() == ScalarType::Short ||
+                    x.scalar_type() == ScalarType::Int ||
+                    x.scalar_type() == ScalarType::Long);
+    STD_TORCH_CHECK(out.is_cuda());
+    STD_TORCH_CHECK(out.dim() == 2);
+    STD_TORCH_CHECK(out.scalar_type() == x.scalar_type());
 
     // NOTE: We currently only support contraction across the contiguous
     // dimension in the matrix.
-    TORCH_CHECK(dim == 1);
+    STD_TORCH_CHECK(dim == 1);
 
     switch (x.scalar_type())
     {
-    case torch::kInt16:
+    case ScalarType::Short:
       cub_cumsum<Exclusive, short>(x, dim, out);
       return;
-    case torch::kInt32:
+    case ScalarType::Int:
       cub_cumsum<Exclusive, int>(x, dim, out);
       return;
     }
-    TORCH_CHECK(x.scalar_type() == torch::kInt64);
+    STD_TORCH_CHECK(x.scalar_type() == ScalarType::Long);
     cub_cumsum<Exclusive, long>(x, dim, out);
   }
 
-  void inclusive_cumsum(torch::Tensor x, int dim, torch::Tensor out)
+  void inclusive_cumsum(torch::stable::Tensor x, int dim, torch::stable::Tensor out)
   {
     // Validate the input matrix.
-    TORCH_CHECK(x.is_cuda());
-    TORCH_CHECK(x.ndimension() == 2);
-    TORCH_CHECK(x.scalar_type() == torch::kInt16 ||
-                x.scalar_type() == torch::kInt32 ||
-                x.scalar_type() == torch::kInt64);
-    TORCH_CHECK(out.is_cuda());
-    TORCH_CHECK(out.ndimension() == 2);
-    TORCH_CHECK(out.scalar_type() == x.scalar_type());
+    STD_TORCH_CHECK(x.is_cuda());
+    STD_TORCH_CHECK(x.dim() == 2);
+    STD_TORCH_CHECK(x.scalar_type() == ScalarType::Short ||
+                    x.scalar_type() == ScalarType::Int ||
+                    x.scalar_type() == ScalarType::Long);
+    STD_TORCH_CHECK(out.is_cuda());
+    STD_TORCH_CHECK(out.dim() == 2);
+    STD_TORCH_CHECK(out.scalar_type() == x.scalar_type());
 
     // NOTE: We currently only support contraction across the contiguous
     // dimension in the matrix.
-    TORCH_CHECK(dim == 1);
+    STD_TORCH_CHECK(dim == 1);
 
     switch (x.scalar_type())
     {
-    case torch::kInt16:
+    case ScalarType::Short:
       cub_cumsum<Inclusive, short>(x, dim, out);
       return;
-    case torch::kInt32:
+    case ScalarType::Int:
       cub_cumsum<Inclusive, int>(x, dim, out);
       return;
     }
-    TORCH_CHECK(x.scalar_type() == torch::kInt64);
+    STD_TORCH_CHECK(x.scalar_type() == ScalarType::Long);
     cub_cumsum<Inclusive, long>(x, dim, out);
   }
 
