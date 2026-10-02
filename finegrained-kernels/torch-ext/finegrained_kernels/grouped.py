@@ -1816,16 +1816,11 @@ def mx_dynamic_matmul_grouped(
     if a_global_scale is not None:
         assert activation_format == "nvfp4", "an activation global is NVFP4-only"
         # A per-expert g_a quantizes each row against ITS expert's global, so every row must
-        # belong to one expert — i.e. A is expert-sorted (``gather_idx`` None: the down of both
-        # MoE chains, raw or pre-quantized). Under a gather, A is one row per SOURCE token routed
-        # to top_k experts at once and no single quant can serve per-expert globals, so that call
-        # takes one global for the tensor (the global is a split of the block scale, not a value
-        # the GEMM loses: the accumulator multiplies back whatever the quant divided by).
-        assert not is_per_expert_global(a_global_scale) or gather_idx is None, (
-            "a per-expert a_global_scale needs an expert-sorted A (gather_idx None) — a gathered "
-            "A holds one row per source token, routed to several experts at once, so pass one "
-            "global for the tensor"
-        )
+        # belong to one expert. A gathered A holds one row per SOURCE token, routed to top_k
+        # experts at once, so a raw A is expanded to its expert-sorted routed rows first.
+        if is_per_expert_global(a_global_scale) and gather_idx is not None:
+            assert As is None, "a per-expert a_global_scale needs a raw A to expand per routed row"
+            A, gather_idx = A.index_select(0, gather_idx), None
     if swizzled_scales:
         if As is None and gather_idx is not None:
             # Quantize ONCE at (num_tokens, K) and let the kernel gather the packed rows:
