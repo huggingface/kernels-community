@@ -1,13 +1,13 @@
 #pragma once
 
-#include <torch/all.h>
+#include "stable_utils.h"
 
 namespace megablocks {
 
 // Public interface function for radix sorting with indices
-void sort(torch::Tensor x,
+void sort(torch::stable::Tensor x,
           int end_bit,
-          torch::Tensor x_out,
-          torch::Tensor iota_out);
+          torch::stable::Tensor x_out,
+          torch::stable::Tensor iota_out);
 
 } // namespace megablocks

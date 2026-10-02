@@ -5,7 +5,6 @@
 // the vendored AITER Triton kernels in Python.
 #if !defined(__HIP_PLATFORM_AMD__) && !defined(USE_ROCM)
 
-#include <ATen/cuda/detail/KernelUtils.h>
 #include <cub/cub.cuh>
 #include <cutlass/bfloat16.h>
 #include <cutlass/gemm_coord.h>

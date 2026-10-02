@@ -649,7 +649,7 @@ void topkGatingSoftmaxKernelLauncher(
       LAUNCH_SOFTMAX(576, WARPS_PER_TB, BYTES_PER_LDG_MULTIPLE_64);
       break;
     default: {
-      TORCH_CHECK(
+      STD_TORCH_CHECK(
           softmax_workspace != nullptr,
           "softmax_workspace must be provided for num_experts that are "
           "not a power of 2 or multiple of 64.");
@@ -689,10 +689,10 @@ void topkGatingSoftmaxKernelLauncher(
 }  // namespace vllm
 
 void topk_softmax(
-    torch::Tensor& topk_weights,          // [num_tokens, topk]
-    torch::Tensor& topk_indices,          // [num_tokens, topk]
-    torch::Tensor& token_expert_indices,  // [num_tokens, topk]
-    torch::Tensor& gating_output,         // [num_tokens, num_experts]
+    torch::stable::Tensor& topk_weights,          // [num_tokens, topk]
+    torch::stable::Tensor& topk_indices,          // [num_tokens, topk]
+    torch::stable::Tensor& token_expert_indices,  // [num_tokens, topk]
+    torch::stable::Tensor& gating_output,         // [num_tokens, num_experts]
     const bool renormalize) {
   const int num_experts = gating_output.size(-1);
   const auto num_tokens = gating_output.numel() / num_experts;
@@ -703,43 +703,43 @@ void topk_softmax(
   const bool needs_workspace = !is_pow_2 || num_experts > 256;
   const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
 
-  const at::DeviceGuard device_guard(gating_output.device());
+  const torch::stable::accelerator::DeviceGuard device_guard(gating_output.get_device_index());
   auto& queue = vllm::xpu::vllmGetQueue();
-  torch::Tensor softmax_workspace = torch::empty(
-      {workspace_size}, gating_output.options().dtype(torch::kFloat));
+  torch::stable::Tensor softmax_workspace = torch::stable::new_empty(
+      gating_output, {workspace_size}, ScalarType::Float);
 
 #define LAUNCH_TOPK_SOFTMAX(INPUTDTYPE, INDTYPE)                       \
   vllm::moe::topkGatingSoftmaxKernelLauncher(                          \
       reinterpret_cast<INPUTDTYPE*>(gating_output.mutable_data_ptr()), \
-      topk_weights.data_ptr<float>(),                                  \
-      topk_indices.data_ptr<INDTYPE>(),                                \
-      token_expert_indices.data_ptr<int>(),                            \
-      softmax_workspace.data_ptr<float>(),                             \
+      topk_weights.mutable_data_ptr<float>(),                                  \
+      topk_indices.mutable_data_ptr<INDTYPE>(),                                \
+      token_expert_indices.mutable_data_ptr<int>(),                            \
+      softmax_workspace.mutable_data_ptr<float>(),                             \
       num_tokens,                                                      \
       num_experts,                                                     \
       topk,                                                            \
       renormalize,                                                     \
       queue);
 
-  if (topk_indices.scalar_type() == at::ScalarType::Int) {
-    if (gating_output.scalar_type() == at::ScalarType::Float)
+  if (topk_indices.scalar_type() == ScalarType::Int) {
+    if (gating_output.scalar_type() == ScalarType::Float)
       LAUNCH_TOPK_SOFTMAX(float, int)
-    else if (gating_output.scalar_type() == at::ScalarType::Half)
+    else if (gating_output.scalar_type() == ScalarType::Half)
       LAUNCH_TOPK_SOFTMAX(sycl::half, int)
     else
       LAUNCH_TOPK_SOFTMAX(sycl::ext::oneapi::bfloat16, int)
-  } else if (topk_indices.scalar_type() == at::ScalarType::UInt32) {
-    if (gating_output.scalar_type() == at::ScalarType::Float)
+  } else if (topk_indices.scalar_type() == ScalarType::UInt32) {
+    if (gating_output.scalar_type() == ScalarType::Float)
       LAUNCH_TOPK_SOFTMAX(float, uint32_t)
-    else if (gating_output.scalar_type() == at::ScalarType::Half)
+    else if (gating_output.scalar_type() == ScalarType::Half)
       LAUNCH_TOPK_SOFTMAX(sycl::half, uint32_t)
     else
       LAUNCH_TOPK_SOFTMAX(sycl::ext::oneapi::bfloat16, uint32_t)
   } else {
-    TORCH_CHECK(topk_indices.scalar_type() == at::ScalarType::Long);
-    if (gating_output.scalar_type() == at::ScalarType::Float)
+    STD_TORCH_CHECK(topk_indices.scalar_type() == ScalarType::Long);
+    if (gating_output.scalar_type() == ScalarType::Float)
       LAUNCH_TOPK_SOFTMAX(float, int64_t)
-    else if (gating_output.scalar_type() == at::ScalarType::Half)
+    else if (gating_output.scalar_type() == ScalarType::Half)
       LAUNCH_TOPK_SOFTMAX(sycl::half, int64_t)
     else
       LAUNCH_TOPK_SOFTMAX(sycl::ext::oneapi::bfloat16, int64_t)

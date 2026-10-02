@@ -4,15 +4,16 @@
 #include "replicate.h"
 #include <cstdint>
 #include <cub/cub.cuh>
-#include <c10/util/Half.h>
-#include <c10/cuda/CUDAStream.h>
+#include <torch/headeronly/util/Half.h>
 
 #define CUDA_CALL(code)					    \
   do {                                                      \
     cudaError_t status = code;                              \
     std::string err = cudaGetErrorString(status);           \
-    TORCH_CHECK(status == cudaSuccess, err);		    \
+    STD_TORCH_CHECK(status == cudaSuccess, err);	    \
   } while (0)
+
+using torch::headeronly::ScalarType;
 
 // __ldg (read-only cache load) is a CUDA intrinsic that hipify does not
 // translate; on AMD fall back to a plain dereference.
@@ -84,18 +85,18 @@ cudaError_t ReplicateForward(T *x,
   return cudaGetLastError();
 }
 
-void cub_segmented_reduce(torch::Tensor grad,
-			  torch::Tensor bins,
-			  torch::Tensor out,
+void cub_segmented_reduce(torch::stable::Tensor grad,
+			  torch::stable::Tensor bins,
+			  torch::stable::Tensor out,
 			  cudaStream_t stream) {
   // Append a zero to the bin boundaries for CUB.
-  torch::Tensor offsets = torch::empty(bins.numel() + 1, bins.options());
-  CUDA_CALL(cudaMemsetAsync(offsets.data_ptr<int>(),
+  torch::stable::Tensor offsets = torch::stable::new_empty(bins, {bins.numel() + 1});
+  CUDA_CALL(cudaMemsetAsync(offsets.mutable_data_ptr<int>(),
 			    0,
 			    offsets.numel() * sizeof(int),
 			    stream));
-  CUDA_CALL(cudaMemcpyAsync(offsets.data_ptr<int>() + 1,
-			    bins.data_ptr<int>(),
+  CUDA_CALL(cudaMemcpyAsync(offsets.mutable_data_ptr<int>() + 1,
+			    bins.const_data_ptr<int>(),
 			    bins.numel() * sizeof(int),
 			    cudaMemcpyDeviceToDevice,
 			    stream));
@@ -104,112 +105,110 @@ void cub_segmented_reduce(torch::Tensor grad,
   size_t scratchpad_bytes = 0;
   CUDA_CALL(cub::DeviceSegmentedReduce::Sum(nullptr,
 					    scratchpad_bytes,
-					    grad.data_ptr<c10::Half>(),
-					    out.data_ptr<c10::Half>(),
+					    grad.const_data_ptr<c10::Half>(),
+					    out.mutable_data_ptr<c10::Half>(),
 					    bins.numel(),
-					    offsets.data_ptr<int>(),
-					    offsets.data_ptr<int>() + 1,
+					    offsets.const_data_ptr<int>(),
+					    offsets.const_data_ptr<int>() + 1,
 					    stream));
 
   // Allocate scratchpad.
-  auto options = torch::TensorOptions()
-    .dtype(torch::kInt8)
-    .device(grad.device());
-  torch::Tensor scratchpad = torch::empty(scratchpad_bytes, options);
+  torch::stable::Tensor scratchpad = torch::stable::new_empty(
+      grad, {static_cast<int64_t>(scratchpad_bytes)}, ScalarType::Char);
 
   // Run the kernel for each batch item.
   for (int i = 0; i < grad.size(0); ++i) {
     int num_bins = out.size(1);
     int num_values = grad.size(1);
-    CUDA_CALL(cub::DeviceSegmentedReduce::Sum(scratchpad.data_ptr<int8_t>(),
+    CUDA_CALL(cub::DeviceSegmentedReduce::Sum(scratchpad.mutable_data_ptr<int8_t>(),
 					      scratchpad_bytes,
-					      grad.data_ptr<c10::Half>() + i * num_values,
-					      out.data_ptr<c10::Half>() + i * num_bins,
+					      grad.const_data_ptr<c10::Half>() + i * num_values,
+					      out.mutable_data_ptr<c10::Half>() + i * num_bins,
 					      bins.numel(),
-					      offsets.data_ptr<int>(),
-					      offsets.data_ptr<int>() + 1,
+					      offsets.const_data_ptr<int>(),
+					      offsets.const_data_ptr<int>() + 1,
 					      stream));
   }
 }
 
 } // namespace replicate
 
-void replicate_forward(torch::Tensor x,
-		       torch::Tensor bins,
-		       torch::Tensor out) {
+void replicate_forward(torch::stable::Tensor x,
+		       torch::stable::Tensor bins,
+		       torch::stable::Tensor out) {
   // Validate the inputs.
-  TORCH_CHECK(x.is_cuda());
-  TORCH_CHECK(x.ndimension() == 2);
-  TORCH_CHECK(x.scalar_type() == torch::kFloat16 ||
-	      x.scalar_type() == torch::kInt16 ||
-	      x.scalar_type() == torch::kInt32);
-  TORCH_CHECK(bins.is_cuda());
-  TORCH_CHECK(bins.ndimension() == 1);
-  TORCH_CHECK(bins.scalar_type() == torch::kInt);
-  TORCH_CHECK(out.is_cuda());
-  TORCH_CHECK(out.ndimension() == 2);
-  TORCH_CHECK(out.scalar_type() == x.scalar_type());
+  STD_TORCH_CHECK(x.is_cuda());
+  STD_TORCH_CHECK(x.dim() == 2);
+  STD_TORCH_CHECK(x.scalar_type() == ScalarType::Half ||
+	          x.scalar_type() == ScalarType::Short ||
+	          x.scalar_type() == ScalarType::Int);
+  STD_TORCH_CHECK(bins.is_cuda());
+  STD_TORCH_CHECK(bins.dim() == 1);
+  STD_TORCH_CHECK(bins.scalar_type() == ScalarType::Int);
+  STD_TORCH_CHECK(out.is_cuda());
+  STD_TORCH_CHECK(out.dim() == 2);
+  STD_TORCH_CHECK(out.scalar_type() == x.scalar_type());
 
   // Batch dimensions should match for input/output.
-  TORCH_CHECK(x.size(0) == out.size(0));
+  STD_TORCH_CHECK(x.size(0) == out.size(0));
 
   // One input for each bin (in each batch).
-  TORCH_CHECK(x.size(1) == bins.size(0));
+  STD_TORCH_CHECK(x.size(1) == bins.size(0));
 
   // Exit early if there is no work to do.
   if (out.numel() == 0) return;
 
   switch (x.scalar_type()) {
-  case torch::kFloat16:
-    CUDA_CALL(replicate::ReplicateForward(x.data_ptr<c10::Half>(),
+  case ScalarType::Half:
+    CUDA_CALL(replicate::ReplicateForward(x.mutable_data_ptr<c10::Half>(),
 					  x.size(0),
 					  x.size(1),
-					  bins.data_ptr<int>(),
-					  out.data_ptr<c10::Half>(),
+					  bins.mutable_data_ptr<int>(),
+					  out.mutable_data_ptr<c10::Half>(),
 					  out.size(1),
-					  c10::cuda::getCurrentCUDAStream()));
+					  static_cast<cudaStream_t>(current_stream_ptr(x))));
     return;
-  case torch::kInt32:
-    CUDA_CALL(replicate::ReplicateForward(x.data_ptr<int>(),
+  case ScalarType::Int:
+    CUDA_CALL(replicate::ReplicateForward(x.mutable_data_ptr<int>(),
 					  x.size(0),
 					  x.size(1),
-					  bins.data_ptr<int>(),
-					  out.data_ptr<int>(),
+					  bins.mutable_data_ptr<int>(),
+					  out.mutable_data_ptr<int>(),
 					  out.size(1),
-					  c10::cuda::getCurrentCUDAStream()));
+					  static_cast<cudaStream_t>(current_stream_ptr(x))));
     return;
   }
-  TORCH_CHECK(x.scalar_type() == torch::kInt16);
-  CUDA_CALL(replicate::ReplicateForward(x.data_ptr<short>(),
+  STD_TORCH_CHECK(x.scalar_type() == ScalarType::Short);
+  CUDA_CALL(replicate::ReplicateForward(x.mutable_data_ptr<short>(),
 					x.size(0),
 					x.size(1),
-					bins.data_ptr<int>(),
-					out.data_ptr<short>(),
+					bins.mutable_data_ptr<int>(),
+					out.mutable_data_ptr<short>(),
 					out.size(1),
-					c10::cuda::getCurrentCUDAStream()));
+					static_cast<cudaStream_t>(current_stream_ptr(x))));
 }
 
-void replicate_backward(torch::Tensor grad,
-			torch::Tensor bins,
-			torch::Tensor out) {
+void replicate_backward(torch::stable::Tensor grad,
+			torch::stable::Tensor bins,
+			torch::stable::Tensor out) {
   // Validate the inputs.
-  TORCH_CHECK(grad.is_cuda());
-  TORCH_CHECK(grad.ndimension() == 2);
-  TORCH_CHECK(grad.scalar_type() == torch::kFloat16);
-  TORCH_CHECK(bins.is_cuda());
-  TORCH_CHECK(bins.ndimension() == 1);
-  TORCH_CHECK(bins.scalar_type() == torch::kInt);
-  TORCH_CHECK(out.is_cuda());
-  TORCH_CHECK(out.ndimension() == 2);
-  TORCH_CHECK(out.scalar_type() == torch::kFloat16);
+  STD_TORCH_CHECK(grad.is_cuda());
+  STD_TORCH_CHECK(grad.dim() == 2);
+  STD_TORCH_CHECK(grad.scalar_type() == ScalarType::Half);
+  STD_TORCH_CHECK(bins.is_cuda());
+  STD_TORCH_CHECK(bins.dim() == 1);
+  STD_TORCH_CHECK(bins.scalar_type() == ScalarType::Int);
+  STD_TORCH_CHECK(out.is_cuda());
+  STD_TORCH_CHECK(out.dim() == 2);
+  STD_TORCH_CHECK(out.scalar_type() == ScalarType::Half);
 
   // Batch dimensions should match for input/output.
-  TORCH_CHECK(grad.size(0) == out.size(0));
+  STD_TORCH_CHECK(grad.size(0) == out.size(0));
 
   // One output for each bin (in each batch).
-  TORCH_CHECK(out.size(1) == bins.size(0));
+  STD_TORCH_CHECK(out.size(1) == bins.size(0));
 
-  replicate::cub_segmented_reduce(grad, bins, out, c10::cuda::getCurrentCUDAStream());
+  replicate::cub_segmented_reduce(grad, bins, out, static_cast<cudaStream_t>(current_stream_ptr(grad)));
 }
 
 } // namespace megablocks

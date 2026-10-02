@@ -3,13 +3,19 @@
 
 from functools import partial
 
+import kernels
 import pytest
 import torch
 
-from megablocks._layers.arguments import Arguments
-from megablocks._layers.moe import MoE, batched_load_balancing_loss, clear_load_balancing_loss
-from megablocks._layers.router import batched_router_zloss, clear_router_zloss
 from tests.layers.architectures import FFN
+
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=2)
+Arguments = megablocks.Arguments
+MoE = megablocks.MoE
+batched_load_balancing_loss = megablocks._private_for_testing.moe.batched_load_balancing_loss
+clear_load_balancing_loss = megablocks._private_for_testing.moe.clear_load_balancing_loss
+batched_router_zloss = megablocks._private_for_testing.router.batched_router_zloss
+clear_router_zloss = megablocks._private_for_testing.router.clear_router_zloss
 
 _FORWARD_TESTS = (
     (16, 1024, 512, 1, 1),

@@ -6,12 +6,15 @@
 #include "grouped_gemm.h"
 #include "fill_arguments.cuh"
 
-#include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/detail/KernelUtils.h>
-#include <c10/util/BFloat16.h>
-#include <c10/cuda/CUDAStream.h>
+#include <cublas_v2.h>
 #include <cub/cub.cuh>
-#include <torch/torch.h>
+#include <torch/csrc/stable/macros.h>
+#include <torch/headeronly/util/BFloat16.h>
+
+#include <algorithm>
+#include <numeric>
+#include <unordered_map>
+#include <vector>
 
 #include "cutlass/bfloat16.h"
 #include "cutlass/complex.h"
@@ -27,14 +30,16 @@ namespace grouped_gemm {
   do {                                                      \
     cudaError_t status = code;                              \
     std::string err = cudaGetErrorString(status);           \
-    TORCH_CHECK(status == cudaSuccess, err);		    \
+    STD_TORCH_CHECK(status == cudaSuccess, err);	   \
   } while (0)
 
 #define CUBLAS_CALL(code)					  \
   do {								  \
     cublasStatus_t status = code;				  \
-    TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "CuBLAS Error"); \
+    STD_TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "CuBLAS Error"); \
   } while (0)
+
+using torch::headeronly::ScalarType;
 
 #define GROUPED_GEMM_STRINGIFY_HELPER(x) #x
 #define GROUPED_GEMM_STRINGIFY(x) \
@@ -86,15 +91,15 @@ template <bool trans_a, bool trans_b>
 using GemmGrouped = ::cutlass::gemm::device::GemmGrouped<GroupedGemmKernel<trans_a, trans_b>>;
 
 template <typename T>
-torch::Tensor CopyToDevice(const std::vector<T> &x, const torch::Device &device) {
+torch::stable::Tensor CopyToDevice(const std::vector<T> &x, const torch::stable::Device &device) {
   size_t bytes = x.size() * sizeof(T);
-  auto options = torch::TensorOptions().dtype(torch::kInt8).device(device);
-  torch::Tensor out = torch::empty(bytes, options);
+  torch::stable::Tensor out = torch::stable::empty(
+      {static_cast<int64_t>(bytes)}, ScalarType::Char, std::nullopt, device);
 
-  CUDA_CALL(cudaMemcpyAsync(out.data_ptr(),
+  CUDA_CALL(cudaMemcpyAsync(out.mutable_data_ptr(),
 			    x.data(), bytes,
 			    cudaMemcpyHostToDevice,
-			    c10::cuda::getCurrentCUDAStream()));
+			    static_cast<cudaStream_t>(current_stream_ptr(out))));
   return out;
 }
 
@@ -108,12 +113,13 @@ static void ReorderArray(T* data, const std::vector<size_t>& indices) {
 }
 
 template <typename T>
-torch::Tensor TypedEmpty(size_t numel, const torch::Device& device) {
-    return torch::empty(numel * sizeof(T), torch::dtype(torch::kInt8).device(device));
+torch::stable::Tensor TypedEmpty(size_t numel, const torch::stable::Device& device) {
+    return torch::stable::empty(
+        {static_cast<int64_t>(numel * sizeof(T))}, ScalarType::Char, std::nullopt, device);
 }
 
 struct RawGemmArguments {
-  torch::Tensor lda, ldb, ldc, ptr_a, ptr_b, ptr_c, problem_sizes;
+  torch::stable::Tensor lda, ldb, ldc, ptr_a, ptr_b, ptr_c, problem_sizes;
   int threadblock_count{};
 };
 
@@ -121,8 +127,8 @@ template <
   typename Gemm,
   typename ElementA, typename ElementB, typename ElementC
 >
-RawGemmArguments MakeArgumentsOnDevice(int num_experts, const torch::Device& device) {
-    TORCH_CHECK(
+RawGemmArguments MakeArgumentsOnDevice(int num_experts, const torch::stable::Device& device) {
+    STD_TORCH_CHECK(
         num_experts <= kMaxExperts,
         "At most ", kMaxExperts,
         " experts are supported when batch_sizes is a CUDA tensor, but got ", num_experts
@@ -148,10 +154,10 @@ template <
   typename ElementA, typename ElementB, typename ElementC,
   typename LayoutA, typename LayoutB, typename LayoutC
 >
-RawGemmArguments MakeArgumentsOnHost(torch::Tensor a,
-				     torch::Tensor b,
-				     torch::Tensor c,
-				     torch::Tensor batch_sizes,
+RawGemmArguments MakeArgumentsOnHost(torch::stable::Tensor a,
+				     torch::stable::Tensor b,
+				     torch::stable::Tensor c,
+				     torch::stable::Tensor batch_sizes,
 				     ::cutlass::gemm::GemmCoord coord_template,
 				     int64_t num_experts) {
   std::vector<::cutlass::gemm::GemmCoord> problem_sizes_host(num_experts);
@@ -165,15 +171,15 @@ RawGemmArguments MakeArgumentsOnHost(torch::Tensor a,
   for (int i = 0; i < num_experts; ++i) {
     auto& problem = problem_sizes_host[i];
     problem = coord_template;
-    (kDynamicK ? problem.k() : problem.m()) = batch_sizes.data_ptr<int64_t>()[i];
+    (kDynamicK ? problem.k() : problem.m()) = batch_sizes.const_data_ptr<int64_t>()[i];
 
     lda_host[i] = LayoutA::packed({problem.m(), problem.k()}).stride(0);
     ldb_host[i] = LayoutB::packed({problem.k(), problem.n()}).stride(0);
     ldc_host[i] = LayoutC::packed({problem.m(), problem.n()}).stride(0);
 
-    ptr_a_host[i] = (ElementA*)a.data_ptr() + elements_a;
-    ptr_b_host[i] = (ElementB*)b.data_ptr() + elements_b;
-    ptr_c_host[i] = (ElementC*)c.data_ptr() + elements_c;
+    ptr_a_host[i] = (ElementA*)a.mutable_data_ptr() + elements_a;
+    ptr_b_host[i] = (ElementB*)b.mutable_data_ptr() + elements_b;
+    ptr_c_host[i] = (ElementC*)c.mutable_data_ptr() + elements_c;
 
     elements_a += problem.m() * problem.k();
     elements_b += problem.k() * problem.n();
@@ -187,7 +193,7 @@ RawGemmArguments MakeArgumentsOnHost(torch::Tensor a,
       CUDA_CALL(cudaMemsetAsync(ptr_c_host[i],
         0,
         problem.m() * problem.n() * sizeof(ElementC),
-        c10::cuda::getCurrentCUDAStream()));
+        static_cast<cudaStream_t>(current_stream_ptr(c))));
 
       problem.m() = 0;
       problem.n() = 0;
@@ -232,10 +238,10 @@ template <
   typename ElementA, typename ElementB, typename ElementC,
   typename LayoutA, typename LayoutB, typename LayoutC
 >
-typename Gemm::Arguments MakeArguments(torch::Tensor a,
-				       torch::Tensor b,
-				       torch::Tensor c,
-				       torch::Tensor batch_sizes,
+typename Gemm::Arguments MakeArguments(torch::stable::Tensor a,
+				       torch::stable::Tensor b,
+				       torch::stable::Tensor c,
+				       torch::stable::Tensor batch_sizes,
 				       ::cutlass::gemm::GemmCoord coord_template,
 				       int64_t num_experts) {
   RawGemmArguments raw_args;
@@ -255,7 +261,7 @@ typename Gemm::Arguments MakeArguments(torch::Tensor a,
   printf("Using %d threadblocks for grouped GEMM.\n", raw_args.threadblock_count);
   // Validate the result.
   if (!raw_args.threadblock_count) {
-    TORCH_CHECK(false, "Grouped GEMM execution not possible with HW");
+    STD_TORCH_CHECK(false, "Grouped GEMM execution not possible with HW");
   }
 
   typename Gemm::EpilogueOutputOp::Params epilogue_op(/*alpha=*/1.0f, /*beta=*/0.0f);
@@ -263,18 +269,18 @@ typename Gemm::Arguments MakeArguments(torch::Tensor a,
   // so we can safely pass `nullptr` for `host_problem_sizes`.
   // TODO(tgale): Experiment with `GroupScheduleMode::kHostPrecompute` for `batch_sizes.is_cpu()`, where we
   // know the problem dimensions on the host.
-  typename Gemm::Arguments arguments((cutlass::gemm::GemmCoord*)raw_args.problem_sizes.data_ptr(),
+  typename Gemm::Arguments arguments((cutlass::gemm::GemmCoord*)raw_args.problem_sizes.mutable_data_ptr(),
 				     (int)num_experts,
 				     (int)raw_args.threadblock_count,
 				     epilogue_op,
-				     (ElementA**)raw_args.ptr_a.data_ptr(),
-				     (ElementB**)raw_args.ptr_b.data_ptr(),
-				     (ElementC**)raw_args.ptr_c.data_ptr(),
-				     (ElementC**)raw_args.ptr_c.data_ptr(),
-				     /*lda=*/(int64_t*)raw_args.lda.data_ptr(),
-				     /*ldb=*/(int64_t*)raw_args.ldb.data_ptr(),
-				     /*ldc=*/(int64_t*)raw_args.ldc.data_ptr(),
-				     /*ldd=*/(int64_t*)raw_args.ldc.data_ptr(),
+				     (ElementA**)raw_args.ptr_a.mutable_data_ptr(),
+				     (ElementB**)raw_args.ptr_b.mutable_data_ptr(),
+				     (ElementC**)raw_args.ptr_c.mutable_data_ptr(),
+				     (ElementC**)raw_args.ptr_c.mutable_data_ptr(),
+				     /*lda=*/(int64_t*)raw_args.lda.mutable_data_ptr(),
+				     /*ldb=*/(int64_t*)raw_args.ldb.mutable_data_ptr(),
+				     /*ldc=*/(int64_t*)raw_args.ldc.mutable_data_ptr(),
+				     /*ldd=*/(int64_t*)raw_args.ldc.mutable_data_ptr(),
 				     /*host_problem_sizes=*/nullptr);
   return arguments;
 }
@@ -286,10 +292,10 @@ template <
   typename Arguments
 >
 void FillCutlassArguments(int num_experts,
-			  torch::Tensor batch_sizes,
-			  torch::Tensor a,
-			  torch::Tensor b,
-			  torch::Tensor c,
+			  torch::stable::Tensor batch_sizes,
+			  torch::stable::Tensor a,
+			  torch::stable::Tensor b,
+			  torch::stable::Tensor c,
 			  const Arguments& arguments,
 			  ::cutlass::gemm::GemmCoord coord_template) {
   // Convert the batch sizes to the format CUTLASS understands on the device.
@@ -300,38 +306,40 @@ void FillCutlassArguments(int num_experts,
       /*kDynamicK*/trans_a,
       ElementA, ElementB, ElementC,
       LayoutA, LayoutB, LayoutC
-  ><<<1, kMaxExperts, 0, c10::cuda::getCurrentCUDAStream()>>>(
-      num_experts, batch_sizes.data_ptr<int64_t>(),
-      (ElementA*)a.data_ptr(), (ElementB*)b.data_ptr(), (ElementC*)c.data_ptr(),
+  ><<<1, kMaxExperts, 0, static_cast<cudaStream_t>(current_stream_ptr(a))>>>(
+      num_experts, batch_sizes.const_data_ptr<int64_t>(),
+      (ElementA*)a.mutable_data_ptr(), (ElementB*)b.mutable_data_ptr(), (ElementC*)c.mutable_data_ptr(),
       arguments, coord_template
   );
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  STD_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <typename Args>
-void RemoveK0Problems(int num_experts, const Args& arguments) {
+void RemoveK0Problems(int num_experts, const Args& arguments, cudaStream_t stream) {
   // For zeroing out the outputs (which might be arbitrarily large), we want to use
   // as many threadblocks as possible in order to hit the maximum possible global memory bandwidth.
   // `arguments.threadblock_count`, which we will use for the grouped GEMM proper,
   // should be a good approximation for this.
   // When the `k=0` case is fixed in CUTLASS, we can completely remove this function.
+  // Same value as at::cuda::detail::CUDA_NUM_THREADS.
+  constexpr int kCudaNumThreads = 1024;
   ZeroOutK0Outputs<><<<
-    arguments.threadblock_count, at::cuda::detail::CUDA_NUM_THREADS, 0, c10::cuda::getCurrentCUDAStream()
+    arguments.threadblock_count, kCudaNumThreads, 0, stream
   >>>(
     num_experts, arguments
   );
   IgnoreK0Problems<><<<
-    1, kMaxExperts, 0, c10::cuda::getCurrentCUDAStream()
+    1, kMaxExperts, 0, stream
   >>>(
     num_experts, arguments
   );
 }
 
 template <bool trans_a, bool trans_b>
-torch::Tensor CutlassGroupedGemm(torch::Tensor a,
-				 torch::Tensor b,
-				 torch::Tensor c,
-				 torch::Tensor batch_sizes,
+torch::stable::Tensor CutlassGroupedGemm(torch::stable::Tensor a,
+				 torch::stable::Tensor b,
+				 torch::stable::Tensor c,
+				 torch::stable::Tensor batch_sizes,
 				 ::cutlass::gemm::GemmCoord coord_template) {
   using Gemm = GemmGrouped<trans_a, trans_b>;
   using LayoutA = typename Gemm::LayoutA;
@@ -351,8 +359,7 @@ torch::Tensor CutlassGroupedGemm(torch::Tensor a,
     LayoutA, LayoutB, LayoutC
   >(a, b, c, batch_sizes, coord_template, num_experts);
   int64_t workspace_size = gemm.get_workspace_size(arguments);
-  auto options = torch::TensorOptions().dtype(torch::kInt8).device(a.device());
-  torch::Tensor workspace = torch::empty(workspace_size, options);
+  torch::stable::Tensor workspace = torch::stable::new_empty(a, {workspace_size}, ScalarType::Char);
 
   if (batch_sizes.is_cuda()) {
       FillCutlassArguments<
@@ -361,19 +368,39 @@ torch::Tensor CutlassGroupedGemm(torch::Tensor a,
         LayoutA, LayoutB, LayoutC
       >(num_experts, batch_sizes, a, b, c, arguments, coord_template);
 
-      RemoveK0Problems<>(num_experts, arguments);
+      RemoveK0Problems<>(num_experts, arguments, static_cast<cudaStream_t>(current_stream_ptr(a)));
   }
 
   // Initialize the kernel.
-  if(gemm.initialize(arguments, workspace.data_ptr()) != cutlass::Status::kSuccess) {
-    TORCH_CHECK(false, "Failed to initialize CUTLASS Grouped GEMM");
+  if(gemm.initialize(arguments, workspace.mutable_data_ptr()) != cutlass::Status::kSuccess) {
+    STD_TORCH_CHECK(false, "Failed to initialize CUTLASS Grouped GEMM");
   }
 
   // Execute the kernel in the current stream.
-  if(gemm.run(c10::cuda::getCurrentCUDAStream()) != cutlass::Status::kSuccess) {
-    TORCH_CHECK(false, "Failed to run CUTLASS Grouped GEMM");
+  if(gemm.run(static_cast<cudaStream_t>(current_stream_ptr(a))) != cutlass::Status::kSuccess) {
+    STD_TORCH_CHECK(false, "Failed to run CUTLASS Grouped GEMM");
   }
   return c;
+}
+
+// The stable ABI does not expose PyTorch's cuBLAS handle, so keep our own
+// handle per thread and device (as PyTorch does), bound to the current stream.
+cublasHandle_t CurrentCublasHandle() {
+  int device;
+  CUDA_CALL(cudaGetDevice(&device));
+
+  // Handles are intentionally never destroyed: destroying them at exit can
+  // race with CUDA context teardown.
+  thread_local std::unordered_map<int, cublasHandle_t> handles;
+  auto it = handles.find(device);
+  if (it == handles.end()) {
+    cublasHandle_t handle;
+    CUBLAS_CALL(cublasCreate(&handle));
+    it = handles.emplace(device, handle).first;
+  }
+
+  CUBLAS_CALL(cublasSetStream(it->second, static_cast<cudaStream_t>(current_stream_ptr(device))));
+  return it->second;
 }
 
 void CublasGemm(c10::BFloat16 *a, int64_t a_rows, int64_t a_cols, bool trans_a,
@@ -389,7 +416,7 @@ void CublasGemm(c10::BFloat16 *a, int64_t a_rows, int64_t a_cols, bool trans_a,
   cublasOperation_t transpose_b = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
 
   float alpha = 1.0, beta = 0.0;
-  CUBLAS_CALL(cublasGemmEx(at::cuda::getCurrentCUDABlasHandle(),
+  CUBLAS_CALL(cublasGemmEx(CurrentCublasHandle(),
 			   transpose_b, transpose_a,
 			   m, n, k, &alpha,
 			   b, CUDA_R_16BF, ldb,
@@ -399,19 +426,19 @@ void CublasGemm(c10::BFloat16 *a, int64_t a_rows, int64_t a_cols, bool trans_a,
 			   CUBLAS_GEMM_DEFAULT));
 }
 
-void CublasGroupedGemm(torch::Tensor a,
-		       torch::Tensor b,
-		       torch::Tensor c,
-		       torch::Tensor batch_sizes,
+void CublasGroupedGemm(torch::stable::Tensor a,
+		       torch::stable::Tensor b,
+		       torch::stable::Tensor c,
+		       torch::stable::Tensor batch_sizes,
 		       bool trans_b) {
   int64_t bs = batch_sizes.size(0), k = a.size(1);
   int64_t n = trans_b ? b.size(1) : b.size(2);
   int64_t b_rows = b.size(1), b_cols = b.size(2);
-  c10::BFloat16* a_ptr = a.data_ptr<c10::BFloat16>();
-  c10::BFloat16* b_ptr = b.data_ptr<c10::BFloat16>();
-  c10::BFloat16* c_ptr = c.data_ptr<c10::BFloat16>();
+  c10::BFloat16* a_ptr = a.mutable_data_ptr<c10::BFloat16>();
+  c10::BFloat16* b_ptr = b.mutable_data_ptr<c10::BFloat16>();
+  c10::BFloat16* c_ptr = c.mutable_data_ptr<c10::BFloat16>();
   for (int i = 0; i < bs; ++i) {
-    int64_t m = batch_sizes.data_ptr<int64_t>()[i];
+    int64_t m = batch_sizes.const_data_ptr<int64_t>()[i];
     CublasGemm(a_ptr, m, k, /*trans_a=*/false,
 	       b_ptr, b_rows, b_cols, trans_b,
 	       c_ptr, m, n);
@@ -421,16 +448,16 @@ void CublasGroupedGemm(torch::Tensor a,
   }
 }
 
-void CublasGroupedGemmVariableK(torch::Tensor a,
-				torch::Tensor b,
-				torch::Tensor c,
-				torch::Tensor batch_sizes) {
+void CublasGroupedGemmVariableK(torch::stable::Tensor a,
+				torch::stable::Tensor b,
+				torch::stable::Tensor c,
+				torch::stable::Tensor batch_sizes) {
   int64_t bs = batch_sizes.size(0), m = a.size(1), n = b.size(1);
-  c10::BFloat16* a_ptr = a.data_ptr<c10::BFloat16>();
-  c10::BFloat16* b_ptr = b.data_ptr<c10::BFloat16>();
-  c10::BFloat16* c_ptr = c.data_ptr<c10::BFloat16>();
+  c10::BFloat16* a_ptr = a.mutable_data_ptr<c10::BFloat16>();
+  c10::BFloat16* b_ptr = b.mutable_data_ptr<c10::BFloat16>();
+  c10::BFloat16* c_ptr = c.mutable_data_ptr<c10::BFloat16>();
   for (int i = 0; i < bs; ++i) {
-    int64_t k = batch_sizes.data_ptr<int64_t>()[i];
+    int64_t k = batch_sizes.const_data_ptr<int64_t>()[i];
     CublasGemm(a_ptr, k, m, /*trans_a=*/true,
 	       b_ptr, k, n, /*trans_b=*/false,
 	       c_ptr, m, n);
@@ -440,30 +467,30 @@ void CublasGroupedGemmVariableK(torch::Tensor a,
   }
 }
 
-void GroupedGemmVariableK(torch::Tensor a,
-			  torch::Tensor b,
-			  torch::Tensor c,
-			  torch::Tensor batch_sizes) {
+void GroupedGemmVariableK(torch::stable::Tensor a,
+			  torch::stable::Tensor b,
+			  torch::stable::Tensor c,
+			  torch::stable::Tensor batch_sizes) {
   // We expected a CUDA tensor with two dimensions and shape
   // (tokens, hidden_out) for 'b'.
-  TORCH_CHECK(b.is_cuda());
-  TORCH_CHECK(b.ndimension() == 2);
-  TORCH_CHECK(b.scalar_type() == torch::kBFloat16);
+  STD_TORCH_CHECK(b.is_cuda());
+  STD_TORCH_CHECK(b.dim() == 2);
+  STD_TORCH_CHECK(b.scalar_type() == ScalarType::BFloat16);
 
   // Validate the dimensions.
   int64_t tokens = a.size(0), num_experts = batch_sizes.size(0);
   int64_t m = a.size(1), n = b.size(1);
 
   // Validate that we have the same contraction dimension.
-  TORCH_CHECK(tokens == b.size(0));
+  STD_TORCH_CHECK(tokens == b.size(0));
 
   // Validate the output shape.
-  TORCH_CHECK(c.is_cuda());
-  TORCH_CHECK(c.ndimension() == 3);
-  TORCH_CHECK(c.scalar_type() == torch::kBFloat16);
-  TORCH_CHECK(c.size(0) == num_experts);
-  TORCH_CHECK(c.size(1) == m);
-  TORCH_CHECK(c.size(2) == n);
+  STD_TORCH_CHECK(c.is_cuda());
+  STD_TORCH_CHECK(c.dim() == 3);
+  STD_TORCH_CHECK(c.scalar_type() == ScalarType::BFloat16);
+  STD_TORCH_CHECK(c.size(0) == num_experts);
+  STD_TORCH_CHECK(c.size(1) == m);
+  STD_TORCH_CHECK(c.size(2) == n);
 
   // Run the computation.
   CublasGroupedGemmVariableK(a, b, c, batch_sizes);
@@ -473,29 +500,29 @@ void GroupedGemmVariableK(torch::Tensor a,
 // assumed to be batched with fixed sized batches.
 //
 // TODO(tgale): Validate alignment is true for every batch element.
-void GroupedGemm(torch::Tensor a,
-		 torch::Tensor b,
-		 torch::Tensor c,
-		 torch::Tensor batch_sizes,
+void GroupedGemm(torch::stable::Tensor a,
+		 torch::stable::Tensor b,
+		 torch::stable::Tensor c,
+		 torch::stable::Tensor batch_sizes,
 		 bool trans_a, bool trans_b) {
   // NOTE: We only support 'trans_a' or 'trans_b', not both.
-  TORCH_CHECK(!(trans_a && trans_b));
+  STD_TORCH_CHECK(!(trans_a && trans_b));
 
 #if !defined(GROUPED_GEMM_CUTLASS)
   // No way to run cuBLAS kernels if the problem dimensions are not known on the host.
-  TORCH_CHECK(batch_sizes.is_cpu());
+  STD_TORCH_CHECK(batch_sizes.is_cpu());
 #else
   // CUTLASS can handle both CPU- and CUDA-resident problem dimensions.
-  TORCH_CHECK(batch_sizes.is_cuda() || batch_sizes.is_cpu());
+  STD_TORCH_CHECK(batch_sizes.is_cuda() || batch_sizes.is_cpu());
 #endif
-  TORCH_CHECK(batch_sizes.ndimension() == 1);
-  TORCH_CHECK(batch_sizes.scalar_type() == torch::kInt64);
+  STD_TORCH_CHECK(batch_sizes.dim() == 1);
+  STD_TORCH_CHECK(batch_sizes.scalar_type() == ScalarType::Long);
 
   // We expected a CUDA tensor with two dimensions and shape
   // (tokens, hidden_in) for 'a'.
-  TORCH_CHECK(a.is_cuda());
-  TORCH_CHECK(a.ndimension() == 2);
-  TORCH_CHECK(a.scalar_type() == torch::kBFloat16);
+  STD_TORCH_CHECK(a.is_cuda());
+  STD_TORCH_CHECK(a.dim() == 2);
+  STD_TORCH_CHECK(a.scalar_type() == ScalarType::BFloat16);
 
 #if !defined(GROUPED_GEMM_CUTLASS)
   if (trans_a) {
@@ -506,10 +533,10 @@ void GroupedGemm(torch::Tensor a,
   }
 #endif
 
-  TORCH_CHECK(b.is_cuda());
-  TORCH_CHECK(c.is_cuda());
-  TORCH_CHECK(b.scalar_type() == torch::kBFloat16);
-  TORCH_CHECK(c.scalar_type() == torch::kBFloat16);
+  STD_TORCH_CHECK(b.is_cuda());
+  STD_TORCH_CHECK(c.is_cuda());
+  STD_TORCH_CHECK(b.scalar_type() == ScalarType::BFloat16);
+  STD_TORCH_CHECK(c.scalar_type() == ScalarType::BFloat16);
 
   // The expected shapes of 'b' and 'c' are:
   //   * when 'trans_a' is set: b=(tokens, hidden_out),                 c=(num_experts, hidden_in, hidden_out)
@@ -520,30 +547,30 @@ void GroupedGemm(torch::Tensor a,
     hidden_in = a.size(1);
     hidden_out = b.size(1);
 
-    TORCH_CHECK(b.ndimension() == 2);
-    TORCH_CHECK(c.ndimension() == 3);
-    TORCH_CHECK(b.size(0) == a.size(0));
-    TORCH_CHECK(c.size(0) == batch_sizes.size(0));
-    TORCH_CHECK(c.size(1) == hidden_in);
-    TORCH_CHECK(c.size(2) == hidden_out);
+    STD_TORCH_CHECK(b.dim() == 2);
+    STD_TORCH_CHECK(c.dim() == 3);
+    STD_TORCH_CHECK(b.size(0) == a.size(0));
+    STD_TORCH_CHECK(c.size(0) == batch_sizes.size(0));
+    STD_TORCH_CHECK(c.size(1) == hidden_in);
+    STD_TORCH_CHECK(c.size(2) == hidden_out);
   } else {
-    TORCH_CHECK(b.ndimension() == 3);
-    TORCH_CHECK(c.ndimension() == 2);
+    STD_TORCH_CHECK(b.dim() == 3);
+    STD_TORCH_CHECK(c.dim() == 2);
 
     // Validate the contraction dimensions match.
     int64_t tokens = a.size(0), num_experts = b.size(0);
     hidden_in = trans_b ? b.size(2) : b.size(1);
     hidden_out = trans_b ? b.size(1) : b.size(2);
-    TORCH_CHECK(hidden_in == a.size(1));
+    STD_TORCH_CHECK(hidden_in == a.size(1));
 
     // Validate that we have one size per expert.
-    TORCH_CHECK(batch_sizes.size(0) == num_experts);
+    STD_TORCH_CHECK(batch_sizes.size(0) == num_experts);
   }
 
   // NOTE: We support transposition through the 'trans_b' flag.
-  TORCH_CHECK(a.is_contiguous());
-  TORCH_CHECK(b.is_contiguous());
-  TORCH_CHECK(c.is_contiguous());
+  STD_TORCH_CHECK(a.is_contiguous());
+  STD_TORCH_CHECK(b.is_contiguous());
+  STD_TORCH_CHECK(c.is_contiguous());
 
 #if !defined(GROUPED_GEMM_CUTLASS)
   CublasGroupedGemm(a, b, c, batch_sizes, trans_b);

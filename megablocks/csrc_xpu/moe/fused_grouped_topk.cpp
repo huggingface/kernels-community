@@ -364,10 +364,10 @@ void fused_grouped_topk(
     const int topk_group) {
   auto& queue = vllm::xpu::vllmGetQueue();
 
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       topk_group <= num_expert_group,
       "topk_group must be less than or equal to num_expert_group");
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       experts % num_expert_group == 0,
       "The number of experts (experts=",
       experts,
@@ -397,7 +397,7 @@ void fused_grouped_topk(
     CASE_TOPK(8)
     CASE_TOPK(16)
     default:
-      TORCH_CHECK(
+      STD_TORCH_CHECK(
           false, "error: not support num_expert_group=%d,\n", num_expert_group);
   }
 #undef CASE_TOPK
@@ -413,33 +413,33 @@ void fused_grouped_topk(
  * @param n_topk_group The number of top experts to select in the group.
  * @return A tuple of tensors (topk_weights, topk_indices).
  */
-std::tuple<torch::Tensor, torch::Tensor> fused_grouped_topk(
-    const torch::Tensor& hidden_states,
-    const torch::Tensor& gating_output,
+std::tuple<torch::stable::Tensor, torch::stable::Tensor> fused_grouped_topk(
+    const torch::stable::Tensor& hidden_states,
+    const torch::stable::Tensor& gating_output,
     const int64_t n_topk,
     const bool renormalize,
     const int64_t n_expert_group,
     const int64_t n_topk_group,
-    const c10::string_view scoring_func,
+    const std::string& scoring_func,
     const double routed_scaling_factor,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::stable::Tensor>& bias) {
   auto shape = gating_output.sizes().vec();
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       hidden_states.sizes()[0] == gating_output.sizes()[0],
       "Number of tokens mismatch")
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       shape.size() == 2,
       "gating_output must be 2D tensor, but got ",
       shape.size(),
       "D");
   if (bias.has_value()) {
     auto shape_bias = bias->sizes().vec();
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         shape_bias[0] == shape[1],
         "gating_output and bias must has same innermost dimension, but got ",
-        shape,
+        shape[1],
         " and ",
-        shape_bias);
+        shape_bias[0]);
   }
   int n_tokens = shape[0];
   int n_experts = shape[1];
@@ -454,11 +454,11 @@ std::tuple<torch::Tensor, torch::Tensor> fused_grouped_topk(
   }
 
   auto topk_weights =
-      torch::empty({n_tokens, n_topk}, at::dtype(at::kFloat).device(at::kXPU));
+      torch::stable::new_empty(gating_output, {n_tokens, n_topk}, ScalarType::Float);
   auto topk_indices =
-      torch::empty({n_tokens, n_topk}, at::dtype(at::kInt).device(at::kXPU));
+      torch::stable::new_empty(gating_output, {n_tokens, n_topk}, ScalarType::Int);
 
-  if (gating_output.scalar_type() == at::kBFloat16) {
+  if (gating_output.scalar_type() == ScalarType::BFloat16) {
     using scalar_t = sycl::ext::oneapi::bfloat16;
     vllm::GroupedTopKImpl::fused_grouped_topk<scalar_t>(
         reinterpret_cast<float*>(topk_weights.data_ptr()),
@@ -474,7 +474,7 @@ std::tuple<torch::Tensor, torch::Tensor> fused_grouped_topk(
         n_topk,
         n_expert_group,
         n_topk_group);
-  } else if (gating_output.scalar_type() == at::kHalf) {
+  } else if (gating_output.scalar_type() == ScalarType::Half) {
     using scalar_t = sycl::half;
     vllm::GroupedTopKImpl::fused_grouped_topk<scalar_t>(
         reinterpret_cast<float*>(topk_weights.data_ptr()),

@@ -1,6 +1,6 @@
 [general]
 name = "megablocks"
-version = 1
+version = 2
 edition = 5
 license = "Apache-2.0"
 backends = [
@@ -19,6 +19,11 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
+[torch.stable-abi]
+cuda = "2.10"
+rocm = "2.10"
+xpu = "2.13"
+
 [kernel.megablocks_xpu]
 backend = "xpu"
 depends = [
@@ -29,7 +34,7 @@ src = [
     "csrc_xpu/utils.h",
     "csrc_xpu/dispatch_utils.h",
     "csrc_xpu/xpu_features.hpp",
-    "csrc_xpu/core/registration.h",
+
     "csrc_xpu/activation.cpp",
     "csrc_xpu/activation.h",
     "csrc_xpu/moe/moe_ops.h",
@@ -70,6 +75,7 @@ src = [
     "csrc/replicate.cu",
     "csrc/sort.h",
     "csrc/sort.cu",
+    "csrc/stable_utils.h",
 ]
 
 [kernel.megablocks_cpu]
@@ -121,6 +127,7 @@ src = [
     "csrc/replicate.cu",
     "csrc/sort.h",
     "csrc/sort.cu",
+    "csrc/stable_utils.h",
     "csrc/grouped_gemm/fill_arguments.cuh",
     "csrc/grouped_gemm/grouped_gemm.cu",
     "csrc/grouped_gemm/grouped_gemm.h",

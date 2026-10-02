@@ -1,5 +1,7 @@
+import kernels
 import torch
-import megablocks
+
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=2)
 
 
 def randn(bs, x, y):
@@ -42,7 +44,7 @@ def test_gmm():
     b_ref = b.detach().clone().requires_grad_(True)
 
     # out = ops.gmm(a, b, batch_sizes, trans_b)
-    out = megablocks.gg_ops.gmm(a, b, batch_sizes, trans_b)
+    out = megablocks._private_for_testing.gg_ops.gmm(a, b, batch_sizes, trans_b)
     print("out", out)
 
     expected_out = gmm(a_ref, b_ref, batch_sizes, trans_b)

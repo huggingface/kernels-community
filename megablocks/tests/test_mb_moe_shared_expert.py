@@ -1,6 +1,9 @@
+import kernels
 import torch
-import megablocks
-from megablocks.layers import MegaBlocksMoeMLPWithSharedExpert, create_shared_expert_weights
+
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=2)
+MegaBlocksMoeMLPWithSharedExpert = megablocks.layers.MegaBlocksMoeMLPWithSharedExpert
+create_shared_expert_weights = megablocks._private_for_testing.create_shared_expert_weights
 
 
 def test_megablocks_moe_mlp_with_shared_expert_import():
@@ -81,7 +84,7 @@ def test_shared_expert_weights_none_by_default():
 def test_inheritance_from_megablocks_moe_mlp():
     mlp = MegaBlocksMoeMLPWithSharedExpert()
     
-    from megablocks.layers import MegaBlocksMoeMLP
+    MegaBlocksMoeMLP = megablocks.layers.MegaBlocksMoeMLP
     assert isinstance(mlp, MegaBlocksMoeMLP)
     assert hasattr(mlp, 'forward')
 

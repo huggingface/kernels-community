@@ -5,13 +5,13 @@
 
 using megablocks::xpu::XPUFeatures;
 
-torch::Tensor cutlass_grouped_gemm_interface(
-    torch::Tensor ptr_A,
-    torch::Tensor ptr_B,
-    const c10::optional<at::Tensor>& ptr_scales,
-    const c10::optional<at::Tensor>& ptr_bias,
-    torch::Tensor ptr_D,
-    torch::Tensor expert_first_token_offset,
+torch::stable::Tensor cutlass_grouped_gemm_interface(
+    torch::stable::Tensor ptr_A,
+    torch::stable::Tensor ptr_B,
+    const std::optional<torch::stable::Tensor>& ptr_scales,
+    const std::optional<torch::stable::Tensor>& ptr_bias,
+    torch::stable::Tensor ptr_D,
+    torch::stable::Tensor expert_first_token_offset,
     int64_t N,
     int64_t K,
     int64_t num_experts,
@@ -20,7 +20,7 @@ torch::Tensor cutlass_grouped_gemm_interface(
     bool is_B_mxfp8) {
   // The grouped GEMMs are built twice: an Xe20 image for pvc/bmg and an Xe35
   // image for CRI. Both cover the same dtypes, so pick the variant by device.
-  auto gemm = XPUFeatures::isXe35(ptr_A.device().index())
+  auto gemm = XPUFeatures::isXe35(ptr_A.get_device_index())
       ? MoE::cutlass_grouped_gemm_xe2<35>
       : MoE::cutlass_grouped_gemm_xe2<20>;
   return gemm(

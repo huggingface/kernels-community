@@ -3,9 +3,11 @@
 
 import numpy as np
 import pytest
+import kernels
 import torch
 
-from megablocks import ops
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=2)
+ops = megablocks._private_for_testing.ops
 
 PADDED_GATHER_TESTS = (
     (4, 2, 2, 1),

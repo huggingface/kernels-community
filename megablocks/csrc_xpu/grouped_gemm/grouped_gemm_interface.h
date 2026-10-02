@@ -1,12 +1,12 @@
-#include <torch/all.h>
+#include "../utils.h"
 
-torch::Tensor cutlass_grouped_gemm_interface(
-    torch::Tensor ptr_A,
-    torch::Tensor ptr_B,
-    const c10::optional<at::Tensor>& ptr_scales,
-    const c10::optional<at::Tensor>& ptr_bias,
-    torch::Tensor ptr_D,
-    torch::Tensor expert_first_token_offset,
+torch::stable::Tensor cutlass_grouped_gemm_interface(
+    torch::stable::Tensor ptr_A,
+    torch::stable::Tensor ptr_B,
+    const std::optional<torch::stable::Tensor>& ptr_scales,
+    const std::optional<torch::stable::Tensor>& ptr_bias,
+    torch::stable::Tensor ptr_D,
+    torch::stable::Tensor expert_first_token_offset,
     int64_t N,
     int64_t K,
     int64_t num_experts,

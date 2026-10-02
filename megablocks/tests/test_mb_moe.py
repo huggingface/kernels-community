@@ -1,5 +1,7 @@
+import kernels
 import torch
-import megablocks
+
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=2)
 
 def test_import():
     """Simple test to check if the module can be imported."""
