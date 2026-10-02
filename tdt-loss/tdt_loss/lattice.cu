@@ -36,7 +36,7 @@ __global__ void __launch_bounds__(kMaxLatticeThreads)
     tdt_alpha_kernel(const float *__restrict__ blank_lp,
                                  const float *__restrict__ label_lp,
                                  const float *__restrict__ dur_lp,
-                                 const int *__restrict__ source_lengths,
+                                 const int *__restrict__ logit_lengths,
                                  const int *__restrict__ target_lengths,
                                  const int *__restrict__ durations, int max_T,
                                  int max_U, int D, double *__restrict__ alphas,
@@ -45,7 +45,7 @@ __global__ void __launch_bounds__(kMaxLatticeThreads)
 
   const int b = blockIdx.x;
   int T, U;
-  sample_lengths(source_lengths, target_lengths, b, max_T, max_U, T, U);
+  sample_lengths(logit_lengths, target_lengths, b, max_T, max_U, T, U);
   load_durations(durations, D, shm_durations);
 
   const int64_t sample = static_cast<int64_t>(b) * max_T * max_U;
@@ -98,7 +98,7 @@ __global__ void __launch_bounds__(kMaxLatticeThreads)
     tdt_beta_kernel(const float *__restrict__ blank_lp,
                     const float *__restrict__ label_lp,
                     const float *__restrict__ dur_lp,
-                    const int *__restrict__ source_lengths,
+                    const int *__restrict__ logit_lengths,
                     const int *__restrict__ target_lengths,
                     const int *__restrict__ durations, int max_T, int max_U,
                     int D, double *__restrict__ betas) {
@@ -106,7 +106,7 @@ __global__ void __launch_bounds__(kMaxLatticeThreads)
 
   const int b = blockIdx.x;
   int T, U;
-  sample_lengths(source_lengths, target_lengths, b, max_T, max_U, T, U);
+  sample_lengths(logit_lengths, target_lengths, b, max_T, max_U, T, U);
   load_durations(durations, D, shm_durations);
 
   const int64_t sample = static_cast<int64_t>(b) * max_T * max_U;
@@ -155,7 +155,7 @@ int lattice_block_size(int64_t max_U) {
 void check_lattice_args(torch::Tensor const &blank_lp,
                         torch::Tensor const &label_lp,
                         torch::Tensor const &dur_lp,
-                        torch::Tensor const &source_lengths,
+                        torch::Tensor const &logit_lengths,
                         torch::Tensor const &target_lengths,
                         torch::Tensor const &durations,
                         torch::Tensor const &out,
@@ -173,7 +173,7 @@ void check_lattice_args(torch::Tensor const &blank_lp,
   }
   TORCH_CHECK(out.scalar_type() == torch::kFloat64,
               "alphas/betas must be float64");
-  for (auto const *x : {&source_lengths, &target_lengths, &durations}) {
+  for (auto const *x : {&logit_lengths, &target_lengths, &durations}) {
     TORCH_CHECK(x->device() == blank_lp.device(),
                 "all tensors must be on the same device");
     TORCH_CHECK(x->scalar_type() == torch::kInt32,
@@ -186,7 +186,7 @@ void check_lattice_args(torch::Tensor const &blank_lp,
               "lattice tensors must have shape (batch, T, U+1)");
   TORCH_CHECK(dur_lp.numel() == nodes * durations.numel(),
               "dur_lp must have shape (batch, T, U+1, num_durations)");
-  TORCH_CHECK(source_lengths.numel() == B && target_lengths.numel() == B,
+  TORCH_CHECK(logit_lengths.numel() == B && target_lengths.numel() == B,
               "lengths must have shape (batch,)");
   if (log_ll != nullptr) {
     TORCH_CHECK(log_ll->device() == blank_lp.device() &&
@@ -204,12 +204,12 @@ void check_lattice_args(torch::Tensor const &blank_lp,
 
 void tdt_loss_fwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
                   torch::Tensor const &dur_lp,
-                  torch::Tensor const &source_lengths,
+                  torch::Tensor const &logit_lengths,
                   torch::Tensor const &target_lengths,
                   torch::Tensor const &durations, torch::Tensor &alphas,
                   torch::Tensor &log_ll) {
   using namespace tdt_loss;
-  check_lattice_args(blank_lp, label_lp, dur_lp, source_lengths,
+  check_lattice_args(blank_lp, label_lp, dur_lp, logit_lengths,
                      target_lengths, durations, alphas, &log_ll);
   const int64_t B = blank_lp.size(0);
   if (B == 0) return;
@@ -218,7 +218,7 @@ void tdt_loss_fwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   tdt_alpha_kernel<<<B, lattice_block_size(blank_lp.size(2)), 0, stream>>>(
       blank_lp.data_ptr<float>(), label_lp.data_ptr<float>(),
-      dur_lp.data_ptr<float>(), source_lengths.data_ptr<int>(),
+      dur_lp.data_ptr<float>(), logit_lengths.data_ptr<int>(),
       target_lengths.data_ptr<int>(), durations.data_ptr<int>(),
       blank_lp.size(1), blank_lp.size(2), durations.numel(),
       alphas.data_ptr<double>(), log_ll.data_ptr<double>());
@@ -227,11 +227,11 @@ void tdt_loss_fwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
 
 void tdt_loss_bwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
                   torch::Tensor const &dur_lp,
-                  torch::Tensor const &source_lengths,
+                  torch::Tensor const &logit_lengths,
                   torch::Tensor const &target_lengths,
                   torch::Tensor const &durations, torch::Tensor &betas) {
   using namespace tdt_loss;
-  check_lattice_args(blank_lp, label_lp, dur_lp, source_lengths,
+  check_lattice_args(blank_lp, label_lp, dur_lp, logit_lengths,
                      target_lengths, durations, betas, nullptr);
   const int64_t B = blank_lp.size(0);
   if (B == 0) return;
@@ -240,7 +240,7 @@ void tdt_loss_bwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   tdt_beta_kernel<<<B, lattice_block_size(blank_lp.size(2)), 0, stream>>>(
       blank_lp.data_ptr<float>(), label_lp.data_ptr<float>(),
-      dur_lp.data_ptr<float>(), source_lengths.data_ptr<int>(),
+      dur_lp.data_ptr<float>(), logit_lengths.data_ptr<int>(),
       target_lengths.data_ptr<int>(), durations.data_ptr<int>(),
       blank_lp.size(1), blank_lp.size(2), durations.numel(),
       betas.data_ptr<double>());

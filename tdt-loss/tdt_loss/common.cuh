@@ -98,13 +98,13 @@ __device__ __forceinline__ void block_reduce_max_sum(float &m, float &s,
 // trigger a device-side assert, like out-of-range indexing does in PyTorch;
 // they are also clamped so that no out-of-bounds access happens when asserts
 // are compiled out.
-__device__ __forceinline__ void sample_lengths(const int *source_lengths,
+__device__ __forceinline__ void sample_lengths(const int *logit_lengths,
                                                const int *target_lengths,
                                                int b, int max_T, int max_U,
                                                int &T, int &U) {
-  T = source_lengths[b];
+  T = logit_lengths[b];
   U = target_lengths[b];
-  CUDA_KERNEL_ASSERT(T >= 0 && T <= max_T && "source_lengths out of range");
+  CUDA_KERNEL_ASSERT(T >= 0 && T <= max_T && "logit_lengths out of range");
   CUDA_KERNEL_ASSERT(U >= 0 && U < max_U && "target_lengths out of range");
   T = min(max(T, 0), max_T);
   U = min(max(U, 0), max_U - 1);

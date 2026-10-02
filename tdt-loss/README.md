@@ -57,8 +57,9 @@ loss.backward()
 
 Samples without a valid alignment get an infinite loss and a zero gradient.
 
-The `layers.TDTLoss` layer has the same signature as `transformers.loss.loss_tdt.tdt_loss`, so 🤗 Transformers
-swaps it in for Parakeet TDT models loaded with `use_kernels=True`.
+The loss supports `torch.compile` (including `fullgraph=True`). The `layers.TDTLoss` layer has the same signature
+as `transformers.loss.loss_tdt.tdt_loss`, so 🤗 Transformers swaps it in for Parakeet TDT models loaded with
+`use_kernels=True`.
 
 ## Benchmarks
 

@@ -4,7 +4,7 @@ from typing import Dict, Sequence, Tuple, Union
 
 import torch
 
-from ._ops import ops
+from ._ops import add_op_namespace_prefix, ops
 
 _REDUCTIONS = ("mean_volume", "mean_batch", "mean", "sum", "none")
 
@@ -13,13 +13,15 @@ _DURATIONS_CACHE: Dict[Tuple[Tuple[int, ...], torch.device], torch.Tensor] = {}
 
 
 def _durations_tensor(durations: Union[Sequence[int], torch.Tensor], device: torch.device) -> torch.Tensor:
-    """Validated int32 tensor of durations on `device`, cached since the durations are fixed for a model."""
+    """Validated int32 tensor of durations on `device`, cached in eager mode since they are fixed for a model."""
     if isinstance(durations, torch.Tensor):
         durations = durations.tolist()
     key = (tuple(int(d) for d in durations), device)
+    if any(d < 0 for d in key[0]):
+        raise ValueError(f"Durations must be non-negative, got {list(key[0])}.")
+    if torch.compiler.is_compiling():
+        return torch.tensor(key[0], device=device, dtype=torch.int32)
     if key not in _DURATIONS_CACHE:
-        if any(d < 0 for d in key[0]):
-            raise ValueError(f"Durations must be non-negative, got {list(key[0])}.")
         _DURATIONS_CACHE[key] = torch.tensor(key[0], device=device, dtype=torch.int32)
     return _DURATIONS_CACHE[key]
 
@@ -28,6 +30,57 @@ def _last_dim_contiguous(x: torch.Tensor) -> torch.Tensor:
     # The kernels accept arbitrary strides for the (batch, T, U) dims, so slices of a
     # joint `(..., vocab_size + num_durations)` output can be passed without a copy.
     return x if x.stride(-1) == 1 else x.contiguous()
+
+
+# The ops only write to preallocated outputs, so their fake (meta) implementations have nothing to do. They let
+# `torch.compile` trace through the ops.
+@torch.library.register_fake(add_op_namespace_prefix("tdt_logprobs_fwd"))
+def _(
+    token_logits,
+    duration_logits,
+    targets,
+    logit_lengths,
+    target_lengths,
+    blank_id,
+    sigma,
+    blank_lp,
+    label_lp,
+    dur_lp,
+    token_lse,
+):
+    return None
+
+
+@torch.library.register_fake(add_op_namespace_prefix("tdt_loss_fwd"))
+def _(blank_lp, label_lp, dur_lp, logit_lengths, target_lengths, durations, alphas, log_ll):
+    return None
+
+
+@torch.library.register_fake(add_op_namespace_prefix("tdt_loss_bwd"))
+def _(blank_lp, label_lp, dur_lp, logit_lengths, target_lengths, durations, betas):
+    return None
+
+
+@torch.library.register_fake(add_op_namespace_prefix("tdt_logits_grad"))
+def _(
+    token_logits,
+    targets,
+    logit_lengths,
+    target_lengths,
+    durations,
+    blank_lp,
+    label_lp,
+    dur_lp,
+    token_lse,
+    alphas,
+    betas,
+    log_ll,
+    grad_loss,
+    blank_id,
+    grad_token_logits,
+    grad_duration_logits,
+):
+    return None
 
 
 class _TDTLossFunction(torch.autograd.Function):

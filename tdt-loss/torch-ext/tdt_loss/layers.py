@@ -13,7 +13,7 @@ class TDTLoss(nn.Module):
     """
 
     has_backward = True
-    can_torch_compile = False
+    can_torch_compile = True
 
     def forward(
         self,

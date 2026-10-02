@@ -336,3 +336,60 @@ def test_layer():
         reduction="none",
     )
     torch.testing.assert_close(tdt_loss_kernel.layers.TDTLoss()(**kwargs), tdt_loss_kernel.tdt_loss(**kwargs))
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_torch_compile(dtype):
+    """The loss and its gradients are the same with `torch.compile(fullgraph=True)`."""
+    if dtype == torch.bfloat16 and torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("bfloat16 requires compute capability >= 8.0")
+    V = 64
+    token_logits, _, targets, logit_lengths, target_lengths = make_inputs(3, 20, 6, V, DURATIONS, dtype=dtype, joint=True)
+
+    def loss_fn(logits, targets, logit_lengths, target_lengths):
+        return tdt_loss_kernel.tdt_loss(
+            logits[..., :V], logits[..., V:], targets, logit_lengths, target_lengths, 0, DURATIONS, sigma=0.05
+        )
+
+    torch._dynamo.reset()
+    results = []
+    for fn in (loss_fn, torch.compile(loss_fn, fullgraph=True)):
+        logits = token_logits._base.detach().clone().requires_grad_(True)
+        loss = fn(logits, targets, logit_lengths, target_lengths)
+        loss.backward()
+        results.append((loss.detach(), logits.grad))
+
+    torch.testing.assert_close(results[1][0], results[0][0])
+    torch.testing.assert_close(results[1][1], results[0][1])
+
+
+@pytest.mark.kernels_ci
+def test_opcheck():
+    """The schemas and fake implementations of the custom ops are consistent (`torch.library.opcheck`)."""
+    ops = tdt_loss_kernel.loss.ops
+    B, T, U, V = 2, 8, 4, 16
+    token_logits, duration_logits, targets, logit_lengths, target_lengths = make_inputs(B, T, U, V, DURATIONS)
+    durations = torch.tensor(DURATIONS, device=DEVICE, dtype=torch.int32)
+    f32 = dict(device=DEVICE, dtype=torch.float32)
+    f64 = dict(device=DEVICE, dtype=torch.float64)
+    shape = (B, T, U + 1)
+
+    blank_lp, label_lp, token_lse = (torch.empty(shape, **f32) for _ in range(3))
+    dur_lp = torch.empty(*shape, len(DURATIONS), **f32)
+    args = (token_logits, duration_logits, targets, logit_lengths, target_lengths, 0, 0.0)
+    args += (blank_lp, label_lp, dur_lp, token_lse)
+    torch.library.opcheck(ops.tdt_logprobs_fwd, args)
+    ops.tdt_logprobs_fwd(*args)
+
+    lattice = (blank_lp, label_lp, dur_lp, logit_lengths, target_lengths, durations)
+    alphas, betas, log_ll = torch.empty(shape, **f64), torch.empty(shape, **f64), torch.empty(B, **f64)
+    torch.library.opcheck(ops.tdt_loss_fwd, lattice + (alphas, log_ll))
+    ops.tdt_loss_fwd(*lattice, alphas, log_ll)
+    torch.library.opcheck(ops.tdt_loss_bwd, lattice + (betas,))
+    ops.tdt_loss_bwd(*lattice, betas)
+
+    args = (token_logits, targets, logit_lengths, target_lengths, durations, blank_lp, label_lp, dur_lp, token_lse)
+    args += (alphas, betas, log_ll, torch.ones(B, **f32), 0)
+    args += (torch.empty_like(token_logits), torch.empty_like(duration_logits))
+    torch.library.opcheck(ops.tdt_logits_grad, args)

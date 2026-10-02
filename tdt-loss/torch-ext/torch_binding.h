@@ -8,7 +8,7 @@
 void tdt_logprobs_fwd(torch::Tensor const &token_logits,
                       torch::Tensor const &duration_logits,
                       torch::Tensor const &targets,
-                      torch::Tensor const &source_lengths,
+                      torch::Tensor const &logit_lengths,
                       torch::Tensor const &target_lengths, int64_t blank_id,
                       double sigma, torch::Tensor &blank_lp,
                       torch::Tensor &label_lp, torch::Tensor &dur_lp,
@@ -17,7 +17,7 @@ void tdt_logprobs_fwd(torch::Tensor const &token_logits,
 // Forward recursion over the lattice (alphas) and per-sample log-likelihood.
 void tdt_loss_fwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
                   torch::Tensor const &dur_lp,
-                  torch::Tensor const &source_lengths,
+                  torch::Tensor const &logit_lengths,
                   torch::Tensor const &target_lengths,
                   torch::Tensor const &durations, torch::Tensor &alphas,
                   torch::Tensor &log_ll);
@@ -25,7 +25,7 @@ void tdt_loss_fwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
 // Backward recursion over the lattice (betas).
 void tdt_loss_bwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
                   torch::Tensor const &dur_lp,
-                  torch::Tensor const &source_lengths,
+                  torch::Tensor const &logit_lengths,
                   torch::Tensor const &target_lengths,
                   torch::Tensor const &durations, torch::Tensor &betas);
 
@@ -33,7 +33,7 @@ void tdt_loss_bwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
 // and duration logits.
 void tdt_logits_grad(
     torch::Tensor const &token_logits, torch::Tensor const &targets,
-    torch::Tensor const &source_lengths, torch::Tensor const &target_lengths,
+    torch::Tensor const &logit_lengths, torch::Tensor const &target_lengths,
     torch::Tensor const &durations, torch::Tensor const &blank_lp,
     torch::Tensor const &label_lp, torch::Tensor const &dur_lp,
     torch::Tensor const &token_lse, torch::Tensor const &alphas,

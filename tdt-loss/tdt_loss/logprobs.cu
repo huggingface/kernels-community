@@ -23,7 +23,7 @@ __global__ void __launch_bounds__(kMaxRowThreads) tdt_logprobs_fwd_kernel(
     int64_t tok_su, const scalar_t *__restrict__ duration_logits,
     int64_t dur_sb, int64_t dur_st, int64_t dur_su,
     const int *__restrict__ targets, int64_t targets_stride,
-    const int *__restrict__ source_lengths,
+    const int *__restrict__ logit_lengths,
     const int *__restrict__ target_lengths, int max_T, int max_U, int V, int D,
     int blank_id, float sigma, float *__restrict__ blank_lp,
     float *__restrict__ label_lp, float *__restrict__ dur_lp,
@@ -37,7 +37,7 @@ __global__ void __launch_bounds__(kMaxRowThreads) tdt_logprobs_fwd_kernel(
   const int b = row / (static_cast<int64_t>(max_U) * max_T);
 
   int T, U;
-  sample_lengths(source_lengths, target_lengths, b, max_T, max_U, T, U);
+  sample_lengths(logit_lengths, target_lengths, b, max_T, max_U, T, U);
 
   if (t >= T || u > U) {
     if (threadIdx.x == 0) {
@@ -101,7 +101,7 @@ template <typename scalar_t>
 __global__ void __launch_bounds__(kMaxRowThreads) tdt_logits_grad_kernel(
     const scalar_t *__restrict__ token_logits, int64_t tok_sb, int64_t tok_st,
     int64_t tok_su, const int *__restrict__ targets, int64_t targets_stride,
-    const int *__restrict__ source_lengths,
+    const int *__restrict__ logit_lengths,
     const int *__restrict__ target_lengths, const int *__restrict__ durations,
     const float *__restrict__ blank_lp, const float *__restrict__ label_lp,
     const float *__restrict__ dur_lp, const float *__restrict__ token_lse,
@@ -121,7 +121,7 @@ __global__ void __launch_bounds__(kMaxRowThreads) tdt_logits_grad_kernel(
   const int b = row / (static_cast<int64_t>(max_U) * max_T);
 
   int T, U;
-  sample_lengths(source_lengths, target_lengths, b, max_T, max_U, T, U);
+  sample_lengths(logit_lengths, target_lengths, b, max_T, max_U, T, U);
 
   scalar_t *gx = grad_token_logits + row * V;
   scalar_t *gd = grad_duration_logits + row * D;
@@ -256,7 +256,7 @@ void check_float_out(torch::Tensor const &x, char const *name,
 void tdt_logprobs_fwd(torch::Tensor const &token_logits,
                       torch::Tensor const &duration_logits,
                       torch::Tensor const &targets,
-                      torch::Tensor const &source_lengths,
+                      torch::Tensor const &logit_lengths,
                       torch::Tensor const &target_lengths, int64_t blank_id,
                       double sigma, torch::Tensor &blank_lp,
                       torch::Tensor &label_lp, torch::Tensor &dur_lp,
@@ -275,9 +275,9 @@ void tdt_logprobs_fwd(torch::Tensor const &token_logits,
                   targets.size(1) >= max_U - 1,
               "targets must have shape (batch, U)");
   check_int_tensor(targets, "targets", token_logits);
-  check_int_tensor(source_lengths, "source_lengths", token_logits);
+  check_int_tensor(logit_lengths, "logit_lengths", token_logits);
   check_int_tensor(target_lengths, "target_lengths", token_logits);
-  TORCH_CHECK(source_lengths.numel() == B && target_lengths.numel() == B,
+  TORCH_CHECK(logit_lengths.numel() == B && target_lengths.numel() == B,
               "lengths must have shape (batch,)");
   for (auto *out : {&blank_lp, &label_lp, &token_lse}) {
     check_float_out(*out, "log-prob output", token_logits);
@@ -306,7 +306,7 @@ void tdt_logprobs_fwd(torch::Tensor const &token_logits,
             duration_logits.data_ptr<scalar_t>(), duration_logits.stride(0),
             duration_logits.stride(1), duration_logits.stride(2),
             targets.data_ptr<int>(), targets.stride(0),
-            source_lengths.data_ptr<int>(), target_lengths.data_ptr<int>(),
+            logit_lengths.data_ptr<int>(), target_lengths.data_ptr<int>(),
             max_T, max_U, V, D, blank_id, static_cast<float>(sigma),
             blank_lp.data_ptr<float>(), label_lp.data_ptr<float>(),
             dur_lp.data_ptr<float>(), token_lse.data_ptr<float>());
@@ -316,7 +316,7 @@ void tdt_logprobs_fwd(torch::Tensor const &token_logits,
 
 void tdt_logits_grad(
     torch::Tensor const &token_logits, torch::Tensor const &targets,
-    torch::Tensor const &source_lengths, torch::Tensor const &target_lengths,
+    torch::Tensor const &logit_lengths, torch::Tensor const &target_lengths,
     torch::Tensor const &durations, torch::Tensor const &blank_lp,
     torch::Tensor const &label_lp, torch::Tensor const &dur_lp,
     torch::Tensor const &token_lse, torch::Tensor const &alphas,
@@ -339,7 +339,7 @@ void tdt_logits_grad(
               " durations are supported");
   TORCH_CHECK(blank_id >= 0 && blank_id < V, "blank_id out of range");
   check_int_tensor(targets, "targets", token_logits);
-  check_int_tensor(source_lengths, "source_lengths", token_logits);
+  check_int_tensor(logit_lengths, "logit_lengths", token_logits);
   check_int_tensor(target_lengths, "target_lengths", token_logits);
   check_int_tensor(durations, "durations", token_logits);
   for (auto *in : {&blank_lp, &label_lp, &token_lse}) {
@@ -389,7 +389,7 @@ void tdt_logits_grad(
             token_logits.data_ptr<scalar_t>(), token_logits.stride(0),
             token_logits.stride(1), token_logits.stride(2),
             targets.data_ptr<int>(), targets.stride(0),
-            source_lengths.data_ptr<int>(), target_lengths.data_ptr<int>(),
+            logit_lengths.data_ptr<int>(), target_lengths.data_ptr<int>(),
             durations.data_ptr<int>(), blank_lp.data_ptr<float>(),
             label_lp.data_ptr<float>(), dur_lp.data_ptr<float>(),
             token_lse.data_ptr<float>(), alphas.data_ptr<double>(),
