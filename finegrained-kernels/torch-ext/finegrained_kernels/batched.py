@@ -25,7 +25,7 @@ from .bayesian_autotuner import bayesian_autotune
 
 from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, pdl_launch_kwargs
 from .descriptors import rebind_batched_mx_bs_descriptor
-from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
+from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
@@ -1422,13 +1422,17 @@ def mx_dynamic_matmul_batched(
     # The act scale stays affine under a swizzled weight: load_act_mx reads it off as_ptrs
     # row-major, SWIZZLED_SCALES governs only the weight side.
     if As is None and activation_format == "nvfp4" and A.dtype not in (torch.int8, torch.float8_e4m3fn):
-        # a per-expert g_a quantizes each routed row against ITS expert's global; the rows are
-        # routed slots, so the row -> expert map is this op's own `expert_ids`
+        # a per-expert g_a quantizes each routed row against ITS expert's global, the row -> expert
+        # map being this op's own `expert_ids`; a gathered A holds one row per source token, routed
+        # to top_k experts at once, so it quantizes once per routed slot, through the gather
+        per_slot = is_per_expert_global(a_global_scale) and gather_idx is not None
         A, As = MX_ACT_QUANT["nvfp4"](
             A,
             global_scale=normalize_global_scale(a_global_scale, B.shape[0]),
             expert_index=expert_ids,
+            gather_idx=gather_idx if per_slot else None,
         )
+        gather_idx = None if per_slot else gather_idx
         pre_quantized = True
     # int8 A = caller-provided packed-E2M1 activations (W4A4, native mxf4 MMA): K is two
     # values per stored byte and the scales are mandatory (nothing left to quantize).

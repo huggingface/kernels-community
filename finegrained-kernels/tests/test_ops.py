@@ -612,11 +612,6 @@ def test_op_scenarios(problem: Problem, op):
     """Reference (the op written in torch) vs op (the kernel): same inputs, each returning the op's
     own output format, compared once through the shared ``_dequant``."""
     _skip_moe_only(problem, op)
-    if problem.per_expert_globals and op == "grouped":
-        # the grouped op quantizes one row per SOURCE token and gathers it per routed slot, so a
-        # per-expert activation global needs expert-sorted rows — the fused down, covered end to
-        # end by the MoE chain tests
-        pytest.skip("grouped takes per-expert activation globals on expert-sorted rows only")
     A, expert_ids = _routed(problem)
     row = WEIGHTS[problem.weights]
     E = 1 if op == "matmul" else problem.E  # matmul is a single weight matrix

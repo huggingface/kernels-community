@@ -1813,16 +1813,15 @@ def mx_dynamic_matmul_grouped(
     # pre-quantized As) and rides down as AsGlobal for the accumulator to multiply back — grouped A
     # is always quantized before the GEMM, so no in-kernel inline quant reads it.
     act_global_scale = normalize_global_scale(a_global_scale, num_experts)
+    # A per-expert g_a quantizes each row against ITS expert's global. A gathered A holds one row
+    # per SOURCE token, routed to top_k experts at once, so it quantizes once per routed copy, into
+    # expert-sorted rows the GEMM then reads without a gather.
+    per_copy = is_per_expert_global(a_global_scale) and gather_idx is not None
     if a_global_scale is not None:
         assert activation_format == "nvfp4", "an activation global is NVFP4-only"
-        # A per-expert g_a quantizes each row against ITS expert's global, so every row must
-        # belong to one expert. A gathered A holds one row per SOURCE token, routed to top_k
-        # experts at once, so a raw A is expanded to its expert-sorted routed rows first.
-        if is_per_expert_global(a_global_scale) and gather_idx is not None:
-            assert As is None, "a per-expert a_global_scale needs a raw A to expand per routed row"
-            A, gather_idx = A.index_select(0, gather_idx), None
+        assert not per_copy or As is None, "a per-expert a_global_scale under a gather needs a raw A"
     if swizzled_scales:
-        if As is None and gather_idx is not None:
+        if As is None and gather_idx is not None and not per_copy:
             # Quantize ONCE at (num_tokens, K) and let the kernel gather the packed rows:
             # the fused sorted-quant below re-reads and re-quantizes each row per routed
             # copy (top_k times). A/B at GLM nvfp4 / dsv4 mxfp8 prefill shapes: 1697 ->
@@ -1840,8 +1839,9 @@ def mx_dynamic_matmul_grouped(
         if As is None:
             a_vals, act_scales, n_m_tiles = mx_act_quant_grouped(
                 A, activation_format, scale_group, scale_dtype, gather_idx, expert_start,
-                act_global_scale,
+                act_global_scale, sorted_values=per_copy,
             )
+            gather_idx = None if per_copy else gather_idx
         elif As.ndim == 5:  # pre-swizzled by the gate_up requant epilogue (fused down) — read as is
             a_vals, act_scales, n_m_tiles = A, As, As.shape[1]
         else:  # given row-major scales -> gather+swizzle into the tcgen05 layout
@@ -1858,8 +1858,9 @@ def mx_dynamic_matmul_grouped(
             # whose tiles carry an expert — the dense grid would need that map as a tensor
             a_vals, act_scales, _ = mx_act_quant_grouped(
                 A, activation_format, scale_group, scale_dtype, gather_idx, expert_start,
-                act_global_scale, swizzled=False,
+                act_global_scale, swizzled=False, sorted_values=per_copy,
             )
+            gather_idx = None if per_copy else gather_idx
         elif As is None:
             a_vals, act_scales = (
                 MX_ACT_QUANT[activation_format](A, global_scale=act_global_scale)
