@@ -6,7 +6,7 @@ tags:
 
 # WeatherNext 2 banded mesh-attention kernel
 
-Memory-bounded inference layers and fused Triton attention for
+Shared mask preparation and fused Triton attention for
 **WeatherNext 2's mesh attention**. Packaged as a
 [`kernels`](https://github.com/huggingface/kernels) Hub kernel.
 
@@ -40,8 +40,7 @@ unpacking the mask or storing a score matrix. Boolean masks use the same prepara
 when the attention replacement is used without its mask layer.
 
 The fused Triton API is forward only. The model-facing layer uses the differentiable
-fallback when gradients are required, since retaining each chunk's activations would
-lose the inference memory saving.
+fallback when gradients are required.
 
 ## Precision
 
@@ -80,20 +79,6 @@ and masks whose block axis is folded into the batch axis. Other tensor layouts t
 the gather-plus-SDPA fallback. `attn_implementation="flex_attention"` is unsupported: that
 hands the layer a `BlockMask`, which neither path can read, so it raises rather than
 quietly dropping the mask.
-
-## Blocked grid layers
-
-The grid chunking approach is inspired by
-[Faster-WeatherNext](https://github.com/Raymondlol/Faster-WeatherNext),
-with an independent PyTorch implementation here.
-
-Version 2 exports `WeatherNext2GridEncoder` and `WeatherNext2ForecastHead` as forward
-replacements that reuse the layer's weights. They process grid points
-in blocks of 32,768. The encoder constructs inputs per block and fuses conditioning
-and output writes in Triton; the head fuses shifted-sigmoid selection and output
-writes. Matrix multiplications and LayerNorm use PyTorch's backend. These inference
-replacements retain the original forwards for training and autocast. Lower-precision
-weights and CPU execution use PyTorch epilogues while retaining grid chunking.
 
 ## Validation
 

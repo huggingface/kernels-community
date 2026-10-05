@@ -1,4 +1,4 @@
-"""The layer `kernels` swaps into `transformers`' `WeatherNext2Attention`.
+"""Layer forwards for WeatherNext 2 attention and its shared mask preparation.
 
 Only `forward` is defined: `kernels` binds it onto the model's own module, so `self.q_proj`,
 `self.head_dim` and the rest are the ones `transformers` built.
@@ -9,8 +9,6 @@ from torch import nn
 
 from .banded_attention import PreparedMask, banded_attention
 from .banded_attention import _prepare_mask as _prepare_mask
-from .grid import WeatherNext2ForecastHead as WeatherNext2ForecastHead
-from .grid import WeatherNext2GridEncoder as WeatherNext2GridEncoder
 
 
 def _gather_neighbouring_blocks(states: torch.Tensor) -> torch.Tensor:
