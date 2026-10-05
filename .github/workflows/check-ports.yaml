@@ -51,7 +51,8 @@ jobs:
           # Track huggingface/kernels main rather than pinning a rev, so that a
           # kernel-port change that breaks a port is caught immediately.
           # --refresh skips Nix's flake cache so every run sees the latest main.
-          KERNEL_PORT: "nix run --refresh github:huggingface/kernels#kernel-port --"
+          # TODO: switch back to main once huggingface/kernels#877 is merged.
+          KERNEL_PORT: "nix run --refresh github:huggingface/kernels/kernel-port-no-importlib#kernel-port --"
           BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
         run: |
           if [ -n "$BASE_REF" ]; then
