@@ -14,11 +14,8 @@
 // cost, and the gradient combines alpha + beta - log_likelihood, which cancels
 // catastrophically in float32 when the log-likelihood is large (long targets).
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <torch/all.h>
-
 #include "common.cuh"
+#include "stable.h"
 
 namespace tdt_loss {
 
@@ -32,15 +29,12 @@ __device__ __forceinline__ void load_durations(const int *durations, int D,
   __syncthreads();
 }
 
-__global__ void __launch_bounds__(kMaxLatticeThreads)
-    tdt_alpha_kernel(const float *__restrict__ blank_lp,
-                                 const float *__restrict__ label_lp,
-                                 const float *__restrict__ dur_lp,
-                                 const int *__restrict__ logit_lengths,
-                                 const int *__restrict__ target_lengths,
-                                 const int *__restrict__ durations, int max_T,
-                                 int max_U, int D, double *__restrict__ alphas,
-                                 double *__restrict__ log_ll) {
+__global__ void __launch_bounds__(kMaxLatticeThreads) tdt_alpha_kernel(
+    const float *__restrict__ blank_lp, const float *__restrict__ label_lp,
+    const float *__restrict__ dur_lp, const int *__restrict__ logit_lengths,
+    const int *__restrict__ target_lengths, const int *__restrict__ durations,
+    int max_T, int max_U, int D, double *__restrict__ alphas,
+    double *__restrict__ log_ll) {
   __shared__ int shm_durations[kMaxDurations];
 
   const int b = blockIdx.x;
@@ -59,23 +53,22 @@ __global__ void __launch_bounds__(kMaxLatticeThreads)
     const int u_max = min(n, U);
     for (int u = u_min + threadIdx.x; u <= u_max; u += blockDim.x) {
       const int t = n - u;
-      const double a =
-          n == 0 ? 0.0 : log_sum_exp([&](auto &&f) {
-            for (int i = 0; i < D; ++i) {
-              const int d = shm_durations[i];
-              const int t_prev = t - d;
-              if (t_prev < 0) continue;
-              if (d > 0) {
-                const int64_t src = static_cast<int64_t>(t_prev) * max_U + u;
-                f(alpha[src] + blank[src] + dur[src * D + i]);
-              }
-              if (u > 0) {
-                const int64_t src =
-                    static_cast<int64_t>(t_prev) * max_U + u - 1;
-                f(alpha[src] + label[src] + dur[src * D + i]);
-              }
-            }
-          });
+      const double a = n == 0 ? 0.0 : log_sum_exp([&](auto &&f) {
+        for (int i = 0; i < D; ++i) {
+          const int d = shm_durations[i];
+          const int t_prev = t - d;
+          if (t_prev < 0)
+            continue;
+          if (d > 0) {
+            const int64_t src = static_cast<int64_t>(t_prev) * max_U + u;
+            f(alpha[src] + blank[src] + dur[src * D + i]);
+          }
+          if (u > 0) {
+            const int64_t src = static_cast<int64_t>(t_prev) * max_U + u - 1;
+            f(alpha[src] + label[src] + dur[src * D + i]);
+          }
+        }
+      });
       alpha[static_cast<int64_t>(t) * max_U + u] = a;
     }
     __syncthreads();
@@ -86,7 +79,8 @@ __global__ void __launch_bounds__(kMaxLatticeThreads)
     for (int i = 0; i < D; ++i) {
       const int d = shm_durations[i];
       const int t_prev = T - d;
-      if (d == 0 || t_prev < 0) continue;
+      if (d == 0 || t_prev < 0)
+        continue;
       const int64_t src = static_cast<int64_t>(t_prev) * max_U + U;
       ll = log_add(ll, alpha[src] + blank[src] + dur[src * D + i]);
     }
@@ -94,14 +88,11 @@ __global__ void __launch_bounds__(kMaxLatticeThreads)
   }
 }
 
-__global__ void __launch_bounds__(kMaxLatticeThreads)
-    tdt_beta_kernel(const float *__restrict__ blank_lp,
-                    const float *__restrict__ label_lp,
-                    const float *__restrict__ dur_lp,
-                    const int *__restrict__ logit_lengths,
-                    const int *__restrict__ target_lengths,
-                    const int *__restrict__ durations, int max_T, int max_U,
-                    int D, double *__restrict__ betas) {
+__global__ void __launch_bounds__(kMaxLatticeThreads) tdt_beta_kernel(
+    const float *__restrict__ blank_lp, const float *__restrict__ label_lp,
+    const float *__restrict__ dur_lp, const int *__restrict__ logit_lengths,
+    const int *__restrict__ target_lengths, const int *__restrict__ durations,
+    int max_T, int max_U, int D, double *__restrict__ betas) {
   __shared__ int shm_durations[kMaxDurations];
 
   const int b = blockIdx.x;
@@ -131,7 +122,7 @@ __global__ void __launch_bounds__(kMaxLatticeThreads)
               const int64_t dst = static_cast<int64_t>(t_next) * max_U + u;
               f(beta[dst] + blank[node] + lp_dur);
             } else if (t_next == T && u == U) {
-              f(blank[node] + lp_dur);  // terminal arc
+              f(blank[node] + lp_dur); // terminal arc
             }
           }
           if (u < U && t_next < T) {
@@ -148,101 +139,100 @@ __global__ void __launch_bounds__(kMaxLatticeThreads)
 
 int lattice_block_size(int64_t max_U) {
   int threads = 32;
-  while (threads < kMaxLatticeThreads && threads < max_U) threads *= 2;
+  while (threads < kMaxLatticeThreads && threads < max_U)
+    threads *= 2;
   return threads;
 }
 
-void check_lattice_args(torch::Tensor const &blank_lp,
-                        torch::Tensor const &label_lp,
-                        torch::Tensor const &dur_lp,
-                        torch::Tensor const &logit_lengths,
-                        torch::Tensor const &target_lengths,
-                        torch::Tensor const &durations,
-                        torch::Tensor const &out,
-                        torch::Tensor const *log_ll) {
-  TORCH_CHECK(blank_lp.is_cuda(), "blank_lp must be a CUDA tensor");
-  TORCH_CHECK(blank_lp.dim() == 3, "blank_lp must have shape (batch, T, U+1)");
+void check_lattice_args(Tensor const &blank_lp, Tensor const &label_lp,
+                        Tensor const &dur_lp, Tensor const &logit_lengths,
+                        Tensor const &target_lengths, Tensor const &durations,
+                        Tensor const &out, Tensor const *log_ll) {
+  STD_TORCH_CHECK(blank_lp.is_cuda(), "blank_lp must be a CUDA tensor");
+  STD_TORCH_CHECK(blank_lp.dim() == 3,
+                  "blank_lp must have shape (batch, T, U+1)");
   for (auto const *x : {&blank_lp, &label_lp, &dur_lp, &out}) {
-    TORCH_CHECK(x->device() == blank_lp.device(),
-                "all tensors must be on the same device");
-    TORCH_CHECK(x->is_contiguous(), "lattice tensors must be contiguous");
+    STD_TORCH_CHECK(same_device(*x, blank_lp),
+                    "all tensors must be on the same device");
+    STD_TORCH_CHECK(x->is_contiguous(), "lattice tensors must be contiguous");
   }
   for (auto const *x : {&blank_lp, &label_lp, &dur_lp}) {
-    TORCH_CHECK(x->scalar_type() == torch::kFloat32,
-                "log-prob tensors must be float32");
+    STD_TORCH_CHECK(x->scalar_type() == ScalarType::Float,
+                    "log-prob tensors must be float32");
   }
-  TORCH_CHECK(out.scalar_type() == torch::kFloat64,
-              "alphas/betas must be float64");
+  STD_TORCH_CHECK(out.scalar_type() == ScalarType::Double,
+                  "alphas/betas must be float64");
   for (auto const *x : {&logit_lengths, &target_lengths, &durations}) {
-    TORCH_CHECK(x->device() == blank_lp.device(),
-                "all tensors must be on the same device");
-    TORCH_CHECK(x->scalar_type() == torch::kInt32,
-                "lengths and durations must be int32");
-    TORCH_CHECK(x->is_contiguous(), "lengths and durations must be contiguous");
+    STD_TORCH_CHECK(same_device(*x, blank_lp),
+                    "all tensors must be on the same device");
+    STD_TORCH_CHECK(x->scalar_type() == ScalarType::Int,
+                    "lengths and durations must be int32");
+    STD_TORCH_CHECK(x->is_contiguous(),
+                    "lengths and durations must be contiguous");
   }
   const int64_t B = blank_lp.size(0);
   const int64_t nodes = blank_lp.numel();
-  TORCH_CHECK(label_lp.numel() == nodes && out.numel() == nodes,
-              "lattice tensors must have shape (batch, T, U+1)");
-  TORCH_CHECK(dur_lp.numel() == nodes * durations.numel(),
-              "dur_lp must have shape (batch, T, U+1, num_durations)");
-  TORCH_CHECK(logit_lengths.numel() == B && target_lengths.numel() == B,
-              "lengths must have shape (batch,)");
+  STD_TORCH_CHECK(label_lp.numel() == nodes && out.numel() == nodes,
+                  "lattice tensors must have shape (batch, T, U+1)");
+  STD_TORCH_CHECK(dur_lp.numel() == nodes * durations.numel(),
+                  "dur_lp must have shape (batch, T, U+1, num_durations)");
+  STD_TORCH_CHECK(logit_lengths.numel() == B && target_lengths.numel() == B,
+                  "lengths must have shape (batch,)");
   if (log_ll != nullptr) {
-    TORCH_CHECK(log_ll->device() == blank_lp.device() &&
-                    log_ll->scalar_type() == torch::kFloat64 &&
-                    log_ll->is_contiguous() && log_ll->numel() == B,
-                "log_ll must be a contiguous float64 tensor of shape (batch,)");
+    STD_TORCH_CHECK(
+        same_device(*log_ll, blank_lp) &&
+            log_ll->scalar_type() == ScalarType::Double &&
+            log_ll->is_contiguous() && log_ll->numel() == B,
+        "log_ll must be a contiguous float64 tensor of shape (batch,)");
   }
-  TORCH_CHECK(durations.numel() <= kMaxDurations, "at most ", kMaxDurations,
-              " durations are supported");
+  STD_TORCH_CHECK(durations.numel() <= kMaxDurations, "at most ", kMaxDurations,
+                  " durations are supported");
 }
 
-}  // namespace
+} // namespace
 
-}  // namespace tdt_loss
+} // namespace tdt_loss
 
-void tdt_loss_fwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
-                  torch::Tensor const &dur_lp,
-                  torch::Tensor const &logit_lengths,
-                  torch::Tensor const &target_lengths,
-                  torch::Tensor const &durations, torch::Tensor &alphas,
-                  torch::Tensor &log_ll) {
+void tdt_loss_fwd(Tensor const &blank_lp, Tensor const &label_lp,
+                  Tensor const &dur_lp, Tensor const &logit_lengths,
+                  Tensor const &target_lengths, Tensor const &durations,
+                  Tensor &alphas, Tensor &log_ll) {
   using namespace tdt_loss;
-  check_lattice_args(blank_lp, label_lp, dur_lp, logit_lengths,
-                     target_lengths, durations, alphas, &log_ll);
+  check_lattice_args(blank_lp, label_lp, dur_lp, logit_lengths, target_lengths,
+                     durations, alphas, &log_ll);
   const int64_t B = blank_lp.size(0);
-  if (B == 0) return;
+  if (B == 0)
+    return;
 
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(blank_lp));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      blank_lp.get_device_index());
+  const cudaStream_t stream = current_stream(blank_lp);
   tdt_alpha_kernel<<<B, lattice_block_size(blank_lp.size(2)), 0, stream>>>(
-      blank_lp.data_ptr<float>(), label_lp.data_ptr<float>(),
-      dur_lp.data_ptr<float>(), logit_lengths.data_ptr<int>(),
-      target_lengths.data_ptr<int>(), durations.data_ptr<int>(),
+      ptr<float>(blank_lp), ptr<float>(label_lp), ptr<float>(dur_lp),
+      ptr<int>(logit_lengths), ptr<int>(target_lengths), ptr<int>(durations),
       blank_lp.size(1), blank_lp.size(2), durations.numel(),
-      alphas.data_ptr<double>(), log_ll.data_ptr<double>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      ptr<double>(alphas), ptr<double>(log_ll));
+  STD_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void tdt_loss_bwd(torch::Tensor const &blank_lp, torch::Tensor const &label_lp,
-                  torch::Tensor const &dur_lp,
-                  torch::Tensor const &logit_lengths,
-                  torch::Tensor const &target_lengths,
-                  torch::Tensor const &durations, torch::Tensor &betas) {
+void tdt_loss_bwd(Tensor const &blank_lp, Tensor const &label_lp,
+                  Tensor const &dur_lp, Tensor const &logit_lengths,
+                  Tensor const &target_lengths, Tensor const &durations,
+                  Tensor &betas) {
   using namespace tdt_loss;
-  check_lattice_args(blank_lp, label_lp, dur_lp, logit_lengths,
-                     target_lengths, durations, betas, nullptr);
+  check_lattice_args(blank_lp, label_lp, dur_lp, logit_lengths, target_lengths,
+                     durations, betas, nullptr);
   const int64_t B = blank_lp.size(0);
-  if (B == 0) return;
+  if (B == 0)
+    return;
 
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(blank_lp));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      blank_lp.get_device_index());
+  const cudaStream_t stream = current_stream(blank_lp);
   tdt_beta_kernel<<<B, lattice_block_size(blank_lp.size(2)), 0, stream>>>(
-      blank_lp.data_ptr<float>(), label_lp.data_ptr<float>(),
-      dur_lp.data_ptr<float>(), logit_lengths.data_ptr<int>(),
-      target_lengths.data_ptr<int>(), durations.data_ptr<int>(),
+      ptr<float>(blank_lp), ptr<float>(label_lp), ptr<float>(dur_lp),
+      ptr<int>(logit_lengths), ptr<int>(target_lengths), ptr<int>(durations),
       blank_lp.size(1), blank_lp.size(2), durations.numel(),
-      betas.data_ptr<double>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      ptr<double>(betas));
+  STD_CUDA_KERNEL_LAUNCH_CHECK();
 }

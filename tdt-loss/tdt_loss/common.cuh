@@ -1,7 +1,7 @@
 #pragma once
 
-#include <c10/macros/Macros.h>
 #include <cuda_runtime.h>
+#include <torch/headeronly/macros/Macros.h>
 
 #include <cfloat>
 #include <cmath>
@@ -23,8 +23,10 @@ __device__ __forceinline__ float neg_inf() { return -INFINITY; }
 // float64 to keep large log-likelihoods exact, but the correction term only
 // depends on |a - b| and is computed in float32.
 __device__ __forceinline__ double log_add(double a, double b) {
-  if (a == -INFINITY) return b;
-  if (b == -INFINITY) return a;
+  if (a == -INFINITY)
+    return b;
+  if (b == -INFINITY)
+    return a;
   return fmax(a, b) + log1pf(expf(-fabsf(static_cast<float>(a - b))));
 }
 
@@ -35,7 +37,8 @@ template <typename ForEach>
 __device__ __forceinline__ double log_sum_exp(ForEach for_each) {
   double m = -INFINITY;
   for_each([&](double v) { m = fmax(m, v); });
-  if (m == -INFINITY) return m;
+  if (m == -INFINITY)
+    return m;
   float s = 0.f;
   for_each([&](double v) { s += expf(static_cast<float>(v - m)); });
   return m + logf(s);
@@ -56,9 +59,8 @@ __device__ __forceinline__ void merge_max_sum(float &m, float &s, float m_other,
 
 // Block-wide reduction of (max, sum) pairs. The result is valid in all threads.
 // `shm_m` and `shm_s` must hold at least blockDim.x / kWarpSize floats.
-__device__ __forceinline__ void block_reduce_max_sum(float &m, float &s,
-                                                     float *shm_m,
-                                                     float *shm_s) {
+__device__ __forceinline__ void
+block_reduce_max_sum(float &m, float &s, float *shm_m, float *shm_s) {
   const int lane = threadIdx.x % kWarpSize;
   const int warp = threadIdx.x / kWarpSize;
   const int num_warps = (blockDim.x + kWarpSize - 1) / kWarpSize;
@@ -99,9 +101,9 @@ __device__ __forceinline__ void block_reduce_max_sum(float &m, float &s,
 // they are also clamped so that no out-of-bounds access happens when asserts
 // are compiled out.
 __device__ __forceinline__ void sample_lengths(const int *logit_lengths,
-                                               const int *target_lengths,
-                                               int b, int max_T, int max_U,
-                                               int &T, int &U) {
+                                               const int *target_lengths, int b,
+                                               int max_T, int max_U, int &T,
+                                               int &U) {
   T = logit_lengths[b];
   U = target_lengths[b];
   CUDA_KERNEL_ASSERT(T >= 0 && T <= max_T && "logit_lengths out of range");
@@ -110,4 +112,4 @@ __device__ __forceinline__ void sample_lengths(const int *logit_lengths,
   U = min(max(U, 0), max_U - 1);
 }
 
-}  // namespace tdt_loss
+} // namespace tdt_loss
