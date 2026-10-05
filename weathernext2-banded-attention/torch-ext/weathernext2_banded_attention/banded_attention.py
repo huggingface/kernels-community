@@ -12,6 +12,8 @@ float32 accumulation, because upstream casts q, k and v to float32 before attent
 (`sparse_transformer.py`, `upcast_attn_to_fp32`) and the released configs all set it.
 """
 
+from typing import NamedTuple
+
 import torch
 import triton
 import triton.language as tl
@@ -19,46 +21,97 @@ import triton.language as tl
 from .utils import device_context
 
 
-# A bare `tl.dot` uses the backend default: TF32 on NVIDIA and IEEE on AMD. CDNA3 permits TF32 when
-# explicitly requested, but AMD's default remains IEEE. The explicit `ieee` mode is for checking
-# NVIDIA numerics; it was roughly 100x slower than TF32 in the H100 benchmark.
+# Default follows the compiler's float32 dot precision; IEEE requests full float32 multiplication.
 PRECISION_DEFAULT = 0
 PRECISION_IEEE = 1
 _PRECISIONS = {"default": PRECISION_DEFAULT, "ieee": PRECISION_IEEE}
 
 
-def _is_hip() -> bool:
-    """Is Triton targeting AMD? Anything else, including Intel XPU, takes the generic path."""
-    try:
-        return triton.runtime.driver.active.get_current_target().backend == "hip"
-    except Exception:
-        return False
+class PreparedMask(NamedTuple):
+    packed: torch.Tensor
+    tiles: torch.Tensor
+    offsets: torch.Tensor
+    shape: tuple[int, int, int]
 
 
-def _configs():
-    """Tile shapes to sweep, per backend.
+@triton.jit
+def _pack_active_mask_kernel(
+    mask_ptr,
+    tiles_ptr,
+    offsets_ptr,
+    compact_tiles_ptr,
+    out_ptr,
+    stride_b,
+    stride_m,
+    stride_n,
+    block_size,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    block = tl.program_id(1)
+    neighbour = tl.program_id(2)
+    slot = (block * tl.cdiv(block_size, BLOCK_M) + tile) * 3 + neighbour
+    key_tiles = tl.cdiv(block_size, BLOCK_N)
+    offset = tl.load(offsets_ptr + slot)
+    count = tl.load(offsets_ptr + slot + 1) - offset
+    rows = tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    bits = tl.arange(0, BLOCK_N)
+    for index in range(count):
+        key_tile = tl.load(tiles_ptr + slot * key_tiles + index)
+        tl.store(compact_tiles_ptr + offset + index, key_tile)
+        columns = key_tile * BLOCK_N + bits
+        keep = tl.load(
+            mask_ptr
+            + block * stride_b
+            + rows[:, None] * stride_m
+            + (neighbour * block_size + columns[None, :]) * stride_n,
+            mask=(rows[:, None] < block_size) & (columns[None, :] < block_size),
+            other=0,
+        )
+        word = tl.sum(keep.to(tl.uint32) << bits[None, :], axis=1)
+        tl.store(out_ptr + (offset + index) * BLOCK_M + tl.arange(0, BLOCK_M), word)
 
-    AMD wants fewer pipeline stages than Hopper, whose SMEM is larger than CDNA/RDNA's LDS, so the
-    HIP sweep shifts down one. Everything else, Intel XPU included, takes the same conservative
-    sweep rather than a guess.
 
-    `waves_per_eu` is deliberately absent. AMD kernels do use it, but as a launch keyword
-    (`kernel[grid](..., waves_per_eu=n)`), and `triton.Config` has no such parameter, so putting it
-    here raises `TypeError` on the very backend it is meant to help.
-    """
-    # BLOCK_N=32 is kept: with a sparse band the narrow key tile wins often enough to matter, and
-    # dropping it cost ~35% on the mini checkpoint's shape.
-    tiles = [(m, n) for m in (64, 128) for n in (32, 64, 128)]
-    stages = (1, 2) if _is_hip() else (2, 3)
-    return [
-        triton.Config({"BLOCK_M": m, "BLOCK_N": n}, num_warps=warps, num_stages=stage)
-        for m, n in tiles
-        for warps in (4, 8)
-        for stage in stages
-    ]
+@triton.jit
+def _active_tiles_kernel(
+    mask_ptr,
+    tiles_ptr,
+    counts_ptr,
+    stride_mb,
+    stride_mm,
+    stride_mn,
+    block_size,
+    num_blocks,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    block = tl.program_id(1)
+    neighbour = tl.program_id(2)
+    key_tiles = tl.cdiv(block_size, BLOCK_N)
+    query_tiles = tl.cdiv(block_size, BLOCK_M)
+    slot = (block * query_tiles + tile) * 3 + neighbour
+    rows = tile * BLOCK_M + tl.arange(0, BLOCK_M)
+    count = 0
+    source = block + neighbour - 1
+    if (source >= 0) and (source < num_blocks):
+        for index in range(key_tiles):
+            columns = index * BLOCK_N + tl.arange(0, BLOCK_N)
+            keep = tl.load(
+                mask_ptr
+                + block * stride_mb
+                + rows[:, None] * stride_mm
+                + (neighbour * block_size + columns[None, :]) * stride_mn,
+                mask=(rows[:, None] < block_size) & (columns[None, :] < block_size),
+                other=0,
+            )
+            if tl.sum(keep.to(tl.int32)) > 0:
+                tl.store(tiles_ptr + slot * key_tiles + count, index)
+                count += 1
+    tl.store(counts_ptr + slot, count)
 
 
-@triton.autotune(configs=_configs(), key=["block_size", "HEAD_DIM"])
 @triton.jit
 def _banded_attention_kernel(
     query_ptr,
@@ -66,6 +119,8 @@ def _banded_attention_kernel(
     value_ptr,
     mask_ptr,
     out_ptr,
+    tiles_ptr,
+    offsets_ptr,
     stride_qb,
     stride_qh,
     stride_qm,
@@ -82,9 +137,6 @@ def _banded_attention_kernel(
     stride_oh,
     stride_om,
     stride_od,
-    stride_mb,
-    stride_mm,
-    stride_mn,
     num_blocks,
     block_size,
     scaling,
@@ -109,7 +161,6 @@ def _banded_attention_kernel(
         mask=row_valid[:, None],
         other=0.0,
     )
-    query = query * scaling
 
     # Running softmax, flash style: one pass over the band, rescaling as the maximum moves.
     running_max = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
@@ -118,68 +169,49 @@ def _banded_attention_kernel(
 
     for neighbour in range(3):
         source = block_index + neighbour - 1
-        # Blocks off either end have no neighbour there. The PyTorch path zero-pads them and relies
-        # on the mask being False; skipping them outright is the same answer without the traffic.
         if (source >= 0) and (source < num_blocks):
             source_flat = flat_block - block_index + source
             key_base = key_ptr + source_flat * stride_kb + head * stride_kh
             value_base = value_ptr + source_flat * stride_vb + head * stride_vh
-
-            for start in range(0, block_size, BLOCK_N):
+            slot = (block_index * tl.cdiv(block_size, BLOCK_M) + tile) * 3 + neighbour
+            offset = tl.load(offsets_ptr + slot)
+            end = tl.load(offsets_ptr + slot + 1)
+            for index in range(offset, end):
+                start = tl.load(tiles_ptr + index) * BLOCK_N
                 columns = start + tl.arange(0, BLOCK_N)
                 column_valid = columns < block_size
+                word = tl.load(mask_ptr + index * BLOCK_M + tl.arange(0, BLOCK_M))
+                keep = ((word[:, None] >> tl.arange(0, BLOCK_N)[None, :]) & 1).to(tl.int1)
+                key = tl.load(
+                    key_base + columns[:, None] * stride_km + dims[None, :] * stride_kd,
+                    mask=column_valid[:, None],
+                    other=0.0,
+                )
+                if PRECISION == 0:
+                    logits = tl.dot(query, tl.trans(key))
+                else:
+                    logits = tl.dot(query, tl.trans(key), input_precision="ieee")
+                # Match Faster-WeatherNext's QK dot followed by scaling.
+                logits = tl.where(keep, logits * scaling, -1e30)
+                tile_max = tl.max(logits, axis=1)
+                new_max = tl.maximum(running_max, tile_max)
+                weights = tl.where(keep, tl.exp(logits - new_max[:, None]), 0.0)
+                rescale = tl.exp(running_max - new_max)
+                running_sum = rescale * running_sum + tl.sum(weights, axis=1)
+                running_max = new_max
+                value = tl.load(
+                    value_base + columns[:, None] * stride_vm + dims[None, :] * stride_vd,
+                    mask=column_valid[:, None],
+                    other=0.0,
+                )
+                weights = weights.to(value.dtype)
+                if PRECISION == 0:
+                    contribution = tl.dot(weights, value)
+                else:
+                    contribution = tl.dot(weights, value, input_precision="ieee")
+                accumulator = rescale[:, None] * accumulator + contribution
 
-                # The mask spans three blocks side by side, so the neighbour picks the third. Read it
-                # first: the band is sparse, and a tile nothing reaches costs two matmuls to compute
-                # and then throw away.
-                mask_columns = neighbour * block_size + columns
-                keep = tl.load(
-                    mask_ptr
-                    + block_index * stride_mb
-                    + rows[:, None] * stride_mm
-                    + mask_columns[None, :] * stride_mn,
-                    mask=row_valid[:, None] & column_valid[None, :],
-                    other=0,
-                ).to(tl.int1)
-
-                if tl.sum(keep.to(tl.int32)) > 0:
-                    key = tl.load(
-                        key_base + columns[:, None] * stride_km + dims[None, :] * stride_kd,
-                        mask=column_valid[:, None],
-                        other=0.0,
-                    )
-                    if PRECISION == 0:
-                        logits = tl.dot(query, tl.trans(key))
-                    else:
-                        logits = tl.dot(query, tl.trans(key), input_precision="ieee")
-                    logits = tl.where(keep, logits, float("-inf"))
-
-                    tile_max = tl.max(logits, axis=1)
-                    new_max = tl.maximum(running_max, tile_max)
-                    # A row that has seen nothing yet stays at -inf; guard so it contributes zero.
-                    safe_max = tl.where(new_max == float("-inf"), 0.0, new_max)
-                    weights = tl.exp(logits - safe_max[:, None])
-                    weights = tl.where(keep, weights, 0.0)
-
-                    rescale = tl.exp(tl.where(running_max == float("-inf"), 0.0, running_max) - safe_max)
-                    rescale = tl.where(running_max == float("-inf"), 0.0, rescale)
-                    running_sum = running_sum * rescale + tl.sum(weights, axis=1)
-                    accumulator = accumulator * rescale[:, None]
-
-                    value = tl.load(
-                        value_base + columns[:, None] * stride_vm + dims[None, :] * stride_vd,
-                        mask=column_valid[:, None],
-                        other=0.0,
-                    )
-                    # The accumulator-passing form of `tl.dot` folds the running sum into the matmul.
-                    weights = weights.to(value.dtype)
-                    if PRECISION == 0:
-                        accumulator = tl.dot(weights, value, accumulator)
-                    else:
-                        accumulator = tl.dot(weights, value, accumulator, input_precision="ieee")
-                    running_max = new_max
-
-    accumulator = accumulator / tl.where(running_sum == 0.0, 1.0, running_sum)[:, None]
+    accumulator = accumulator / tl.maximum(running_sum, 1e-30)[:, None]
     out_base = out_ptr + flat_block * stride_ob + head * stride_oh
     tl.store(
         out_base + rows[:, None] * stride_om + dims[None, :] * stride_od,
@@ -188,11 +220,39 @@ def _banded_attention_kernel(
     )
 
 
+def _prepare_mask(mask):
+    blocks, block_size, _ = mask.shape
+    query_tiles, key_tiles = triton.cdiv(block_size, 64), triton.cdiv(block_size, 32)
+    counts = torch.empty((blocks, query_tiles, 3), dtype=torch.int32, device=mask.device)
+    tiles = torch.empty((*counts.shape, key_tiles), dtype=torch.int32, device=mask.device)
+    with device_context(mask.device):
+        _active_tiles_kernel[(query_tiles, blocks, 3)](
+            mask, tiles, counts, *mask.stride(), block_size, blocks, BLOCK_M=64, BLOCK_N=32, num_warps=4
+        )
+        offsets = torch.cat((counts.new_zeros(1), counts.flatten().cumsum(0, dtype=torch.int32)))
+        active_tiles = int(offsets[-1].item())
+        packed = torch.empty((active_tiles, 64), dtype=torch.uint32, device=mask.device)
+        compact_tiles = torch.empty((active_tiles,), dtype=torch.int32, device=mask.device)
+        _pack_active_mask_kernel[(query_tiles, blocks, 3)](
+            mask,
+            tiles,
+            offsets,
+            compact_tiles,
+            packed,
+            *mask.stride(),
+            block_size,
+            BLOCK_M=64,
+            BLOCK_N=32,
+            num_warps=4,
+        )
+    return PreparedMask(packed, compact_tiles, offsets, tuple(mask.shape))
+
+
 def banded_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    mask: torch.Tensor,
+    mask: torch.Tensor | PreparedMask,
     scaling: float,
     precision: str = "default",
 ) -> torch.Tensor:
@@ -201,7 +261,7 @@ def banded_attention(
     Args:
         query, key, value: `[batch, num_blocks, heads, block_size, head_dim]`, float32. Note that
             key and value are *not* gathered over neighbours; the kernel walks them itself.
-        mask: `[num_blocks, block_size, 3 * block_size]`, bool.
+        mask: `[num_blocks, block_size, 3 * block_size]`, bool, or a shared PreparedMask.
         scaling: the usual `head_dim ** -0.5`.
         precision: how `tl.dot` treats the float32 inputs. `"default"` uses Triton's default for the
             active backend; `"ieee"` forces true float32 for strict numerical comparisons.
@@ -223,24 +283,23 @@ def banded_attention(
     if mask.shape != (num_blocks, block_size, 3 * block_size):
         raise ValueError(f"mask is {tuple(mask.shape)}, expected {(num_blocks, block_size, 3 * block_size)}")
 
-    query, key, value = (
-        t.reshape(batch * num_blocks, heads, block_size, head_dim) for t in (query, key, value)
-    )
-    mask = mask.contiguous()
+    query, key, value = (t.reshape(batch * num_blocks, heads, block_size, head_dim) for t in (query, key, value))
     out = torch.empty(query.shape, dtype=query.dtype, device=query.device)
 
     def grid(meta):
         return (triton.cdiv(block_size, meta["BLOCK_M"]), batch * num_blocks, heads)
 
-    # Triton launches on whichever device is current, not on the one the tensors live on, so a
-    # shard placed on cuda:1 by `device_map="auto"` would otherwise be launched against cuda:0.
+    # Sharded layers must launch on their tensors' device, not the current device.
     with device_context(query.device):
+        prepared = mask if isinstance(mask, PreparedMask) else _prepare_mask(mask)
         _banded_attention_kernel[grid](
             query,
             key,
             value,
-            mask,
+            prepared.packed,
             out,
+            prepared.tiles,
+            prepared.offsets,
             query.stride(0),
             query.stride(1),
             query.stride(2),
@@ -257,13 +316,14 @@ def banded_attention(
             out.stride(1),
             out.stride(2),
             out.stride(3),
-            mask.stride(0),
-            mask.stride(1),
-            mask.stride(2),
             num_blocks,
             block_size,
             scaling,
             HEAD_DIM=head_dim,
             PRECISION=_PRECISIONS[precision],
+            BLOCK_M=64,
+            BLOCK_N=32,
+            num_warps=4,
+            num_stages=1,
         )
     return out.reshape(batch, num_blocks, heads, block_size, head_dim)
