@@ -316,7 +316,7 @@ void tdt_logprobs_fwd(Tensor const &token_logits, Tensor const &duration_logits,
                 ptr<float>(label_lp), ptr<float>(dur_lp),
                 ptr<float>(token_lse));
       });
-  STD_CUDA_KERNEL_LAUNCH_CHECK();
+  TDT_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void tdt_logits_grad(Tensor const &token_logits, Tensor const &targets,
@@ -369,7 +369,7 @@ void tdt_logits_grad(Tensor const &token_logits, Tensor const &targets,
                   "log_ll and grad_loss must have shape (batch,)");
   STD_TORCH_CHECK(
       grad_token_logits.is_contiguous() &&
-          grad_token_logits.sizes() == token_logits.sizes() &&
+          same_sizes(grad_token_logits, token_logits) &&
           grad_token_logits.scalar_type() == token_logits.scalar_type(),
       "grad_token_logits must be contiguous and match token_logits");
   STD_TORCH_CHECK(grad_duration_logits.is_contiguous() &&
@@ -404,5 +404,5 @@ void tdt_logits_grad(Tensor const &token_logits, Tensor const &targets,
                 blank_id, ptr<scalar_t>(grad_token_logits),
                 ptr<scalar_t>(grad_duration_logits));
       });
-  STD_CUDA_KERNEL_LAUNCH_CHECK();
+  TDT_CUDA_KERNEL_LAUNCH_CHECK();
 }

@@ -33,6 +33,15 @@ using torch::stable::Tensor;
               THO_PRIVATE_CASE_TYPE_USING_HINT(ScalarType::BFloat16, scalar_t, \
                                                __VA_ARGS__))
 
+// Like STD_CUDA_KERNEL_LAUNCH_CHECK, which needs shim functions that are only
+// declared with USE_CUDA.
+#define TDT_CUDA_KERNEL_LAUNCH_CHECK()                                         \
+  do {                                                                         \
+    const cudaError_t err = cudaGetLastError();                                \
+    STD_TORCH_CHECK(err == cudaSuccess,                                        \
+                    "CUDA error: ", cudaGetErrorString(err));                  \
+  } while (0)
+
 namespace tdt_loss {
 
 template <typename T> T *ptr(Tensor const &x) {
@@ -42,6 +51,16 @@ template <typename T> T *ptr(Tensor const &x) {
 inline bool same_device(Tensor const &a, Tensor const &b) {
   return a.is_cuda() == b.is_cuda() &&
          a.get_device_index() == b.get_device_index();
+}
+
+inline bool same_sizes(Tensor const &a, Tensor const &b) {
+  if (a.dim() != b.dim())
+    return false;
+  for (int64_t i = 0; i < a.dim(); ++i) {
+    if (a.size(i) != b.size(i))
+      return false;
+  }
+  return true;
 }
 
 inline cudaStream_t current_stream(Tensor const &x) {

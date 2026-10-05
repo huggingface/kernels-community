@@ -212,7 +212,7 @@ void tdt_loss_fwd(Tensor const &blank_lp, Tensor const &label_lp,
       ptr<int>(logit_lengths), ptr<int>(target_lengths), ptr<int>(durations),
       blank_lp.size(1), blank_lp.size(2), durations.numel(),
       ptr<double>(alphas), ptr<double>(log_ll));
-  STD_CUDA_KERNEL_LAUNCH_CHECK();
+  TDT_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void tdt_loss_bwd(Tensor const &blank_lp, Tensor const &label_lp,
@@ -234,5 +234,5 @@ void tdt_loss_bwd(Tensor const &blank_lp, Tensor const &label_lp,
       ptr<int>(logit_lengths), ptr<int>(target_lengths), ptr<int>(durations),
       blank_lp.size(1), blank_lp.size(2), durations.numel(),
       ptr<double>(betas));
-  STD_CUDA_KERNEL_LAUNCH_CHECK();
+  TDT_CUDA_KERNEL_LAUNCH_CHECK();
 }
