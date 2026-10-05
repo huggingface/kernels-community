@@ -670,6 +670,9 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
 # (E4M3 scales: the nvfp4_native_ok fence + software decode arms).
 _SWEEP_CELLS = [
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
+    # K off the BK=128 grid admits the BK=64 rows, the family a K=256 cell never reaches
+    (Problem(weights="mxfp4", K=320), "grouped", "mx_dynamic_matmul_grouped_kernel"),
+    (Problem(weights="mxfp8", K=320), "grouped", "mx_dynamic_matmul_grouped_kernel"),
     (Problem(weights="mxfp4", S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", "mx_dynamic_matmul_kernel"),

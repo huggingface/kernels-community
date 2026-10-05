@@ -418,6 +418,18 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
             and getattr(args.get("Bs"), "dtype", None) != torch.float8_e4m3fn
         ):
             return False
+        # Triton <= 3.8.0 mis-lowers native dot_scaled with UE8M0 scales at BM=128 / BN=64 /
+        # BK=64 / 8 warps: wrong results at any K (fixed upstream after 3.8.0). Admitted wherever
+        # BK=128 cannot divide K.
+        if (
+            not c.kwargs.get("SWAP_AB")
+            and c.kwargs.get("BLOCK_SIZE_M", args.get("BLOCK_SIZE_M")) == 128
+            and config_dim(c, args, "BLOCK_SIZE_K") == 64
+            and config_dim(c, args, "BLOCK_SIZE_N") == 64
+            and c.num_warps == 8
+            and getattr(args.get("Bs"), "dtype", None) != torch.float8_e4m3fn
+        ):
+            return False
         # Single-trip dot_scaled (BK >= contraction dim) trips the sm_10x
         # accumulator-init miscompile (uninitialized TMEM alloc must be mutable).
         # Bites only small K (e.g. a K=512 gate_up with BK=512): silently wrong results

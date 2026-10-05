@@ -24,7 +24,7 @@ from .bayesian_autotuner import bayesian_autotune
 from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, sm_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
-from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands
+from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, quantize_routed_copies, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
@@ -1820,8 +1820,19 @@ def mx_dynamic_matmul_grouped(
     if a_global_scale is not None:
         assert activation_format == "nvfp4", "an activation global is NVFP4-only"
         assert not per_copy or As is None, "a per-expert a_global_scale under a gather needs a raw A"
-    if swizzled_scales:
-        if As is None and gather_idx is not None and not per_copy:
+    # the quant stores straight into the GEMM's swizzled tiles when each row's scale columns fill
+    # whole 4-column blocks; otherwise it writes them row-major for the swizzle pass to pad
+    direct_swizzle = swizzled_scales and A.shape[1] % (4 * scale_group) == 0
+    if per_copy:
+        a_vals, act_scales, n_m_tiles = quantize_routed_copies(
+            A, activation_format, scale_group, scale_dtype, gather_idx, expert_start, act_global_scale,
+            swizzled=direct_swizzle,
+        )
+        if swizzled_scales and not direct_swizzle:
+            act_scales, n_m_tiles = swizzle_grouped_mx_scales(ue8m0_as_uint8(act_scales), expert_start, None)
+        gather_idx = None
+    elif swizzled_scales:
+        if As is None and gather_idx is not None:
             # Quantize ONCE at (num_tokens, K) and let the kernel gather the packed rows:
             # the fused sorted-quant below re-reads and re-quantizes each row per routed
             # copy (top_k times). A/B at GLM nvfp4 / dsv4 mxfp8 prefill shapes: 1697 ->
@@ -1839,10 +1850,9 @@ def mx_dynamic_matmul_grouped(
         if As is None:
             a_vals, act_scales, n_m_tiles = mx_act_quant_grouped(
                 A, activation_format, scale_group, scale_dtype, gather_idx, expert_start,
-                act_global_scale, sorted_values=per_copy,
+                act_global_scale,
             )
-            gather_idx = None if per_copy else gather_idx
-        elif As.ndim == 5:  # pre-swizzled by the gate_up requant epilogue (fused down) — read as is
+        elif As.ndim == 5:  # pre-swizzled (requant epilogue, a forward's routed quant) — read as is
             a_vals, act_scales, n_m_tiles = A, As, As.shape[1]
         else:  # given row-major scales -> gather+swizzle into the tcgen05 layout
             a_vals = A
@@ -1858,9 +1868,8 @@ def mx_dynamic_matmul_grouped(
             # whose tiles carry an expert — the dense grid would need that map as a tensor
             a_vals, act_scales, _ = mx_act_quant_grouped(
                 A, activation_format, scale_group, scale_dtype, gather_idx, expert_start,
-                act_global_scale, swizzled=False, sorted_values=per_copy,
+                act_global_scale, swizzled=False,
             )
-            gather_idx = None if per_copy else gather_idx
         elif As is None:
             a_vals, act_scales = (
                 MX_ACT_QUANT[activation_format](A, global_scale=act_global_scale)
