@@ -58,7 +58,7 @@ from .compat import (
 )
 from .formats import get_supported_act_fns, is_mx, is_mxfp4, is_per_expert_global, mx_scale_family, normalize_global_scale, ue8m0_as_uint8, weight_format
 from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
-from .quant import _launch_act_quant, MX_ACT_QUANT, quantize_once_with_routed_scales
+from .quant import _launch_act_quant, MX_ACT_QUANT, mx_act_quant_routed_scales
 from .scheduling import compute_grouped_scheduling
 from .epilogue import fused_glu
 
@@ -317,7 +317,7 @@ def _fused_post_expert_norm(down_out, post_expert_norm, weight, eps):
 
 def _gate_up_activations(hidden, fmt, gate_up_scale, global_scale, activation_scale, scatter_idx, expert_start):
     """``(A, As)`` for the grouped gate_up. Under a shared global on swizzled MX weights, ``hidden``
-    is quantized once with its scales stored straight into each routed copy's expert tile, which
+    is quantized once with its scales stored straight into each routed row's expert tile, which
     the op reads as is while gathering the values; anywhere else the op quantizes ``hidden``."""
     if (
         fmt not in MX_ACT_QUANT
@@ -330,7 +330,7 @@ def _gate_up_activations(hidden, fmt, gate_up_scale, global_scale, activation_sc
     scale_group = mx_scale_family(gate_up_scale, K)
     if K % (4 * scale_group) != 0:  # a partial 4-column scale block takes the op's padding pass
         return hidden, activation_scale
-    return quantize_once_with_routed_scales(
+    return mx_act_quant_routed_scales(
         hidden, fmt, scale_group, ue8m0_as_uint8(gate_up_scale).dtype, scatter_idx, expert_start,
         normalize_global_scale(global_scale, expert_start.numel() - 1),
     )

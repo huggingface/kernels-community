@@ -24,7 +24,7 @@ from .bayesian_autotuner import bayesian_autotune
 from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, sm_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
-from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, quantize_routed_copies, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands
+from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
@@ -1814,22 +1814,19 @@ def mx_dynamic_matmul_grouped(
     # is always quantized before the GEMM, so no in-kernel inline quant reads it.
     act_global_scale = normalize_global_scale(a_global_scale, num_experts)
     # A per-expert g_a quantizes each row against ITS expert's global. A gathered A holds one row
-    # per SOURCE token, routed to top_k experts at once, so it quantizes once per routed copy, into
-    # expert-sorted rows the GEMM then reads without a gather.
-    per_copy = is_per_expert_global(a_global_scale) and gather_idx is not None
+    # per token, routed to top_k experts at once, so it quantizes per routed row, into expert-sorted
+    # rows the GEMM then reads without a gather.
+    quantize_per_routed_row = is_per_expert_global(a_global_scale) and gather_idx is not None
     if a_global_scale is not None:
         assert activation_format == "nvfp4", "an activation global is NVFP4-only"
-        assert not per_copy or As is None, "a per-expert a_global_scale under a gather needs a raw A"
-    # the quant stores straight into the GEMM's swizzled tiles when each row's scale columns fill
-    # whole 4-column blocks; otherwise it writes them row-major for the swizzle pass to pad
-    direct_swizzle = swizzled_scales and A.shape[1] % (4 * scale_group) == 0
-    if per_copy:
-        a_vals, act_scales, n_m_tiles = quantize_routed_copies(
-            A, activation_format, scale_group, scale_dtype, gather_idx, expert_start, act_global_scale,
-            swizzled=direct_swizzle,
+        assert not quantize_per_routed_row or As is None, (
+            "a per-expert a_global_scale under a gather needs a raw A"
         )
-        if swizzled_scales and not direct_swizzle:
-            act_scales, n_m_tiles = swizzle_grouped_mx_scales(ue8m0_as_uint8(act_scales), expert_start, None)
+    if quantize_per_routed_row:
+        a_vals, act_scales, n_m_tiles = mx_act_quant_routed_rows(
+            A, activation_format, scale_group, scale_dtype, gather_idx, expert_start, act_global_scale,
+            swizzled=swizzled_scales,
+        )
         gather_idx = None
     elif swizzled_scales:
         if As is None and gather_idx is not None:

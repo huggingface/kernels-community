@@ -1423,16 +1423,16 @@ def mx_dynamic_matmul_batched(
     # row-major, SWIZZLED_SCALES governs only the weight side.
     if As is None and activation_format == "nvfp4" and A.dtype not in (torch.int8, torch.float8_e4m3fn):
         # a per-expert g_a quantizes each routed row against ITS expert's global, the row -> expert
-        # map being this op's own `expert_ids`; a gathered A holds one row per source token, routed
-        # to top_k experts at once, so it quantizes once per routed slot, through the gather
-        per_slot = is_per_expert_global(a_global_scale) and gather_idx is not None
+        # map being this op's own `expert_ids`; a gathered A holds one row per token, routed to
+        # top_k experts at once, so it quantizes per routed row, through the gather
+        quantize_per_routed_row = is_per_expert_global(a_global_scale) and gather_idx is not None
         A, As = MX_ACT_QUANT["nvfp4"](
             A,
             global_scale=normalize_global_scale(a_global_scale, B.shape[0]),
             expert_index=expert_ids,
-            gather_idx=gather_idx if per_slot else None,
+            gather_idx=gather_idx if quantize_per_routed_row else None,
         )
-        gather_idx = None if per_slot else gather_idx
+        gather_idx = None if quantize_per_routed_row else gather_idx
         pre_quantized = True
     # int8 A = caller-provided packed-E2M1 activations (W4A4, native mxf4 MMA): K is two
     # values per stored byte and the scales are mandatory (nothing left to quantize).
