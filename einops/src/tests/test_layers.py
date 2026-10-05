@@ -1,22 +1,14 @@
-__kernel_port_einops_root = None
-def __kernel_port_einops(module=""):
-    global __kernel_port_einops_root
-    if __kernel_port_einops_root is None:
-        __kernel_port_einops_root = __import__("kernels").get_kernel("kernels-community/einops", version=1)
-    root = __kernel_port_einops_root
-    if not module:
-        return root
-    return __import__("importlib").import_module(root.__name__ + "." + module)
-
 import pickle
 from collections import namedtuple
 
 import numpy
 import pytest
 
-pytestmark = pytest.mark.kernels_ci
-
-rearrange, reduce, EinopsError = getattr(__kernel_port_einops(), "rearrange"), getattr(__kernel_port_einops(), "reduce"), getattr(__kernel_port_einops(), "EinopsError")
+import kernels
+einops = kernels.get_kernel("kernels-community/einops", version=1)
+rearrange = einops.rearrange
+reduce = einops.reduce
+EinopsError = einops.EinopsError
 from . import collect_test_backends, is_backend_tested, FLOAT_REDUCTIONS as REDUCTIONS
 
 __author__ = "Alex Rogozhnikov"
@@ -45,6 +37,7 @@ rearrangement_patterns = [
 ]
 
 
+@pytest.mark.kernels_ci
 def test_rearrange_imperative():
     for backend in collect_test_backends(symbolic=False, layers=True):
         print("Test layer for ", backend.framework_name)
@@ -77,6 +70,7 @@ def test_rearrange_imperative():
             assert numpy.allclose(backend.to_numpy(variable.grad), 1)
 
 
+@pytest.mark.kernels_ci
 def test_rearrange_symbolic():
     for backend in collect_test_backends(symbolic=True, layers=True):
         print("Test layer for ", backend.framework_name)
@@ -117,6 +111,7 @@ reduction_patterns = rearrangement_patterns + [
 ]
 
 
+@pytest.mark.kernels_ci
 def test_reduce_imperative():
     for backend in collect_test_backends(symbolic=False, layers=True):
         print("Test layer for ", backend.framework_name)
@@ -158,6 +153,7 @@ def test_reduce_imperative():
                     assert numpy.sum(grad) > 0.5
 
 
+@pytest.mark.kernels_ci
 def test_reduce_symbolic():
     for backend in collect_test_backends(symbolic=True, layers=True):
         print("Test layer for ", backend.framework_name)
@@ -189,7 +185,7 @@ def create_torch_model(use_reduce=False, add_scripted_layer=False):
         pytest.skip()
     else:
         from torch.nn import Sequential, Conv2d, MaxPool2d, Linear, ReLU
-        Rearrange, Reduce, EinMix = getattr(__kernel_port_einops("layers.torch"), "Rearrange"), getattr(__kernel_port_einops("layers.torch"), "Reduce"), getattr(__kernel_port_einops("layers.torch"), "EinMix")
+        Rearrange, Reduce, EinMix = einops.layers.torch.Rearrange, einops.layers.torch.Reduce, einops.layers.torch.EinMix
         import torch.jit
 
         return Sequential(
@@ -210,6 +206,7 @@ def create_torch_model(use_reduce=False, add_scripted_layer=False):
         )
 
 
+@pytest.mark.kernels_ci
 def test_torch_layer():
     if not is_backend_tested("torch"):
         pytest.skip()
@@ -236,6 +233,7 @@ def test_torch_layer():
         torch.testing.assert_close(model1(input + 1), model4(input + 1), atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.kernels_ci
 def test_torch_layers_scripting():
     if not is_backend_tested("torch"):
         pytest.skip()
@@ -250,6 +248,7 @@ def test_torch_layers_scripting():
             torch.testing.assert_close(model1(input), model2(input), atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.kernels_ci
 def test_keras_layer():
     if not is_backend_tested("tensorflow"):
         pytest.skip()
@@ -261,7 +260,7 @@ def test_keras_layer():
             pytest.skip()
         from tensorflow.keras.models import Sequential
         from tensorflow.keras.layers import Conv2D as Conv2d, Dense as Linear, ReLU
-        Rearrange, Reduce, EinMix, keras_custom_objects = getattr(__kernel_port_einops("layers.keras"), "Rearrange"), getattr(__kernel_port_einops("layers.keras"), "Reduce"), getattr(__kernel_port_einops("layers.keras"), "EinMix"), getattr(__kernel_port_einops("layers.keras"), "keras_custom_objects")
+        Rearrange, Reduce, EinMix, keras_custom_objects = einops.layers.keras.Rearrange, einops.layers.keras.Reduce, einops.layers.keras.EinMix, einops.layers.keras.keras_custom_objects
 
         def create_keras_model():
             return Sequential(
@@ -310,6 +309,7 @@ def test_keras_layer():
         numpy.testing.assert_allclose(model1.predict_on_batch(input), model4.predict_on_batch(input))
 
 
+@pytest.mark.kernels_ci
 def test_flax_layers():
     """
     One-off simple tests for Flax layers.
@@ -323,7 +323,7 @@ def test_flax_layers():
 
         import flax
         from flax import linen as nn
-        EinMix, Reduce, Rearrange = getattr(__kernel_port_einops("layers.flax"), "EinMix"), getattr(__kernel_port_einops("layers.flax"), "Reduce"), getattr(__kernel_port_einops("layers.flax"), "Rearrange")
+        EinMix, Reduce, Rearrange = einops.layers.flax.EinMix, einops.layers.flax.Reduce, einops.layers.flax.Rearrange
 
         class NN(nn.Module):
             @nn.compact
@@ -357,11 +357,12 @@ def test_flax_layers():
         _loaded = flax.serialization.from_bytes(params, fbytes)
 
 
+@pytest.mark.kernels_ci
 def test_einmix_decomposition():
     """
     Testing that einmix correctly decomposes into smaller transformations.
     """
-    _EinmixDebugger = getattr(__kernel_port_einops("layers._einmix"), "_EinmixDebugger")
+    _EinmixDebugger = einops.layers._einmix._EinmixDebugger
 
     mixin1 = _EinmixDebugger(
         "a b c d e -> e d c b a",
@@ -447,11 +448,12 @@ def test_einmix_decomposition():
     assert mixin7.saved_bias_shape == [1, 4, 2]  # (a) d b, ellipsis does not participate
 
 
+@pytest.mark.kernels_ci
 def test_einmix_restrictions():
     """
     Testing different cases
     """
-    _EinmixDebugger = getattr(__kernel_port_einops("layers._einmix"), "_EinmixDebugger")
+    _EinmixDebugger = einops.layers._einmix._EinmixDebugger
 
     with pytest.raises(EinopsError):
         _EinmixDebugger(

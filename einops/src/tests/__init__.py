@@ -2,23 +2,15 @@
 Common utils for testing.
 These functions allow testing only some frameworks, not all.
 """
-__kernel_port_einops_root = None
-def __kernel_port_einops(module=""):
-    global __kernel_port_einops_root
-    if __kernel_port_einops_root is None:
-        __kernel_port_einops_root = __import__("kernels").get_kernel("kernels-community/einops", version=1)
-    root = __kernel_port_einops_root
-    if not module:
-        return root
-    return __import__("importlib").import_module(root.__name__ + "." + module)
-
 
 import logging
 import os
 from functools import lru_cache
 from typing import List, Tuple
 
-_backends = getattr(__kernel_port_einops(), "_backends")
+import kernels
+_einops = kernels.get_kernel("kernels-community/einops", version=1)
+_backends = _einops._backends
 import warnings
 
 __author__ = "Alex Rogozhnikov"
@@ -55,7 +47,7 @@ def unparse_backends(backend_names: List[str]) -> Tuple[str, str]:
 @lru_cache(maxsize=1)
 def parse_backends_to_test() -> List[str]:
     if ENVVAR_NAME not in os.environ:
-        return ["torch", "numpy"]
+        raise RuntimeError(f"Testing frameworks were not specified, env var {ENVVAR_NAME} not set")
     parsed_backends = os.environ[ENVVAR_NAME].split(",")
     _known_backends = find_names_of_all_frameworks()
     for backend_name in parsed_backends:

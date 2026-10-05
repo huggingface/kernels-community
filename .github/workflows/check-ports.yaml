@@ -7,11 +7,15 @@ name: Check Ports
 # without rerunning the port (src/port-provenance.json records the recipe hash,
 # so that case shows up as a diff in the provenance file).
 #
-# Pull requests only check the ports they touch; pushes to main and manual
-# runs check every port.
+# Pull requests only check the ports they touch; pushes to main, the daily
+# run and manual runs check every port.
 on:
   push:
     branches: [main]
+  # kernel-port tracks huggingface/kernels main, so also run without a change
+  # here: a kernel-port regression should surface even when no port PR is open.
+  schedule:
+    - cron: "0 6 * * *"
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened]
@@ -44,11 +48,10 @@ jobs:
       # origin URL, HEAD and cleanliness of the checkout it is handed.
       - name: Regenerate every port and compare
         env:
-          # kernel-port is experimental upstream (no CLI or op stability
-          # guarantee), so pin a huggingface/kernels main rev rather than
-          # tracking the branch: a push there cannot break every open PR, and
-          # bumping the pin is an explicit PR that re-checks every port.
-          KERNEL_PORT: "nix run github:huggingface/kernels/ca9095966486b76168115a34e2027c6c98805919#kernel-port --"
+          # Track huggingface/kernels main rather than pinning a rev, so that a
+          # kernel-port change that breaks a port is caught immediately.
+          # --refresh skips Nix's flake cache so every run sees the latest main.
+          KERNEL_PORT: "nix run --refresh github:huggingface/kernels#kernel-port --"
           BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
         run: |
           if [ -n "$BASE_REF" ]; then

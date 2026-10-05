@@ -8,9 +8,6 @@ source \
 // Retain only the Python package and its upstream tests.
 prune keep="einops/**"
 
-// Drop upstream's pip-install test runner; it is not a test.
-delete in="einops/tests/run_tests.py"
-
 // Lift upstream tests out of the package into the kernel test root.
 move \
     from="einops/tests" \
@@ -43,33 +40,32 @@ relativize_imports \
     in="tests/{__init__,test_*}.py" \
     package_root="tests"
 
-// Resolve product imports through the locally built Hub kernel.
+// Resolve product imports through the locally built Hub kernel. The package
+// init binds it privately so `from . import *` cannot pick it up.
 kernelize_imports \
-    in="tests/{__init__,test_*}.py" \
+    in="tests/__init__.py" \
+    package="einops" \
+    binding="_einops" \
+    kernel="kernels-community/einops" \
+    version=1
+
+kernelize_imports \
+    in="tests/test_*.py" \
     package="einops" \
     kernel="kernels-community/einops" \
     version=1
 
-// Default to the two Kernel CI backends when upstream's env var is absent.
-replace in="tests/__init__.py" \
-    find=#"        raise RuntimeError(f"Testing frameworks were not specified, env var {ENVVAR_NAME} not set")"# \
-    with=#"        return ["torch", "numpy"]"#
+// Pick the test backends from the installed frameworks; upstream requires
+// EINOPS_TEST_BACKENDS to be set, which Kernel CI cannot do.
+overlay from="overlay"
 
 // Use the supported replacement for NumPy 2's removed in1d API.
 replace in="tests/test_layers.py" \
     find="numpy.in1d(grad, [0, 1])" \
     with="numpy.isin(grad, [0, 1])"
 
-// Select every upstream test module for the kernel CI suite.
-replace \
-    in="tests/test_*.py" \
-    find="import pytest" \
-    with="import pytest\n\npytestmark = pytest.mark.kernels_ci"
-
-// Keep pytest from collecting the imported doctest helper as a marked test.
-replace in="tests/test_other.py" \
-    find="from doctest import testmod" \
-    with="from doctest import testmod\ntestmod.__test__ = False"
+// Select every upstream test for the kernel CI suite.
+mark_tests in="tests/test_*.py" marker="kernels_ci" changes=63
 
 // Emit the noarch kernel manifest and supported runtime backends.
 manifest \
