@@ -59,12 +59,13 @@ def test_rms_norm_post_norm_backward(compile):
     x_liger = x.clone().requires_grad_()
     dy = torch.randn_like(x)
 
-    ref(x_ref).backward(dy)
+    out_ref = ref(x_ref)
+    out_ref.backward(dy)
     liger_fwd = torch.compile(liger) if compile else liger
-    out = liger_fwd(x_liger)
-    out.backward(dy)
+    out_liger = liger_fwd(x_liger)
+    out_liger.backward(dy)
 
-    torch.testing.assert_close(out, ref(x), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out_liger, out_ref, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(x_liger.grad, x_ref.grad, atol=1e-5, rtol=1e-5)
     for (name, p_ref), p_liger in zip(ref.named_parameters(), liger.parameters()):
         torch.testing.assert_close(p_liger.grad, p_ref.grad, atol=1e-4, rtol=1e-4, msg=name)

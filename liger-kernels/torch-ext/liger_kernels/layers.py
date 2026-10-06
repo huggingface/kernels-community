@@ -26,8 +26,7 @@ class LigerRMSNorm(nn.Module):
             self.variance_epsilon,
             0,
             "llama",
-            # Not in place: post-norm models (e.g. OLMo2) feed the norm's output
-            # gradient to the residual too, so overwriting it corrupts that branch.
+            # Not in place: dY can be shared with other branches (e.g. a residual add).
             False,
             None,
         )
