@@ -265,6 +265,8 @@ def scenarios() -> list[Problem]:
         Problem(weights="mxfp8", bias=True),
         Problem(weights="nvfp4", bias=True),
         Problem(weights="mxfp8", gate=True, bias=True),
+        Problem(weights="fp8_128x128", gate=True, bias=True, S=8),  # block-FP8's unstacked-gate decode band
+        Problem(weights="fp8_128x128", gate=True, activation_format="fp8", quantize_output=True, S=8),  # its requant
         Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
         Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True, S=8),
     ]

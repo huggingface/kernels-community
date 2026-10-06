@@ -1056,18 +1056,18 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     # fp8 ``tl.dot`` — unlike the MX/NVFP4 scaled MMA, whose wide M operand earns the
     # native instruction — gains nothing back: DSV3 shape, same 235MB weight read, stacked
     # 69.8µs vs unstacked 49.8µs at S=8, a wash by S=32. A requant is the same offline
-    # quant the raw activation gets below, applied to the GLU output — quantizing the bf16
-    # intermediate (the unfused-reference order) where the stacked epilogue quantizes its
-    # fp32 accumulator, a sub-quantum difference consistent with the band's semantics.
+    # quant the raw activation gets below, applied to the GLU output. The intermediate is the
+    # fp32 accumulators, so the GLU and the requant round as the stacked epilogue does; under
+    # ``simulate_unfused`` it lands in the activation dtype first, the unfused-reference order.
     if gate and S <= GATE_UNSTACK_MAX_S:
         [gate_up] = w8a8_block_dynamic_fp8_matmul_batched(
             A, B, As, Bs, expert_ids, block_size,
-            activation_format=activation_format, output_dtype=output_dtype,
-            gather_idx=gather_idx, scatter_idx=scatter_idx,
+            activation_format=activation_format, output_dtype=output_dtype if simulate_unfused else torch.float32,
+            gather_idx=gather_idx, scatter_idx=scatter_idx, bias=bias,
         )
         out = fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit,
                         quant_group=block_n if requant else None,
-                        use_ue8m0=bs_u8.dtype == torch.uint8)
+                        use_ue8m0=bs_u8.dtype == torch.uint8, out_dtype=None if requant else output_dtype)
         return list(out) if requant else [out]
     # A raw (As is None) -> quantize here (offline); else pre-quantized (As given, e.g. the
     # requantized intermediate handed to the down projection).
