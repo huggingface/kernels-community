@@ -1,7 +1,7 @@
 # `vendor/` is a pinned subset of MLX (revision in vendor/UPSTREAM); refresh it with
 # `python vendor.py --rev <tag>`. It holds upstream's Metal kernels as they ship -- no local copy is
-# generated from them. The host dispatch in mlx_metal/ is transcribed from upstream's quantized.cpp,
-# which tests/test_vendor_drift.py checks on every pin bump.
+# generated from them. The host code in mlx_metal/ is transcribed from upstream's, which
+# tests/test_vendor_drift.py checks on every pin bump.
 
 [general]
 name = "mlx-quantization-metal-kernels"
@@ -22,10 +22,12 @@ src = [
 [kernel.mlx_quantization_metal_kernels]
 backend = "metal"
 depends = ["torch"]
-# quantized.metal includes "mlx/backend/metal/kernels/...", which resolves from vendor/.
-include = ["torch-ext", "vendor"]
+# upstream includes "mlx/backend/metal/kernels/...", which resolves from vendor/
+include = ["mlx_metal", "torch-ext", "vendor"]
 src = [
+    "mlx_metal/common.h",
     "mlx_metal/mlx_dispatch.mm",
+    "mlx_metal/mlx_quantization.cpp",
     # one wrapper per upstream .metal: each includes the vendored file (shipped as .metal.h, see
     # vendor.py) under MLX's math mode
     "mlx_metal/mlx_fp_quantized.metal",

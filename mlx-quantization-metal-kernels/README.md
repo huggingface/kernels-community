@@ -1,45 +1,75 @@
-# mlx-quantization-metal-kernels
+## mlx-quantization-metal-kernels
 
-MLX's affine quantized matmul kernels for torch tensors on Apple Silicon (MPS).
+[MLX](https://github.com/ml-explore/mlx)'s quantized kernels for torch tensors on Apple Silicon (MPS):
+the same Metal kernels, chosen and launched the way MLX chooses and launches them, so every op
+returns what its `mlx.core` counterpart returns, bit for bit.
 
-The Metal kernels are [MLX](https://github.com/ml-explore/mlx)'s own, vendored at a pinned release
-(`vendor/UPSTREAM`) and compiled as they ship. The host-side dispatch in `mlx_metal/mlx_dispatch.mm`
-transcribes MLX's `QuantizedMatmul::eval_gpu`, so a given shape runs the kernel it would under
-`mlx.core.quantized_matmul`: matrix-vector kernels (`qmv_fast`, `qmv`, `qmv_quad`, `qmv_wide`) for
-decode-sized inputs, and split-K or tiled `qmm_t` above MLX's per-GPU crossover.
+- `quantize` / `dequantize` — MLX's packed layout (`mx.quantize` / `mx.dequantize`)
+- `quantized_matmul` — `x @ dequantize(w).T`, or `x @ dequantize(w)` with `transpose=False`
+- `gather_qmm` — `quantized_matmul` with per-row weights picked by index, for mixture-of-experts
+
+Modes: `affine` (group size 32/64/128, 2/3/4/5/6/8 bits, default 64/4; scales and biases in the
+activation dtype) and the fp formats `mxfp4` (32/4), `mxfp8` (32/8) and `nvfp4` (16/4; uint8 scales,
+no biases, optional global scale).
+
+## Usage
 
 ```python
+import torch
 from kernels import get_kernel
 
-mq = get_kernel("kernels-community/mlx-quantization-metal-kernels", version=1)
+mq = get_kernel("kernels-community/mlx-quantization-metal-kernels", version=2)
 
-# x: [..., K] float32/float16/bfloat16
-# w: [N, K * bits / 32] uint32, scales/biases: [N, K / group_size] in x's dtype (MLX's layout)
-y = mq.affine_qmm_t(x, w, scales, biases, group_size=64, bits=4)  # [..., N]
+w = torch.randn(4096, 4096, dtype=torch.bfloat16, device="mps")
+x = torch.randn(1, 4096, dtype=torch.bfloat16, device="mps")
+
+wq, scales, biases = mq.quantize(w)                         # affine, 64/4
+y = mq.quantized_matmul(x, wq, scales, biases)              # (1, 4096), an nn.Linear without bias
+
+wq4, s4 = mq.quantize(w, mode="mxfp4")
+y4 = mq.quantized_matmul(x, wq4, s4, mode="mxfp4")
 ```
 
-`affine_qmm_t` is the only API: it is what transformers' `MetalConfig` uses.
+Version 1's functions (`affine_qmm_t`, `affine_qmv`, `mxfp4_qmv`, ...) are kept, on top of these.
 
-`group_size` is 32, 64 or 128; `bits` is 2, 3, 4, 5, 6 or 8. Results match `mx.quantized_matmul`
-bit for bit, except on the split-K path, where the partial products are summed in float32 rather
-than in the output dtype.
+## How it is put together
 
-Not covered: the fp modes (mxfp4/nvfp4/mxfp8), batched weights, gather (MoE) matmuls, and MLX's NAX
-path for M5-class GPUs, which needs Metal 4 features the builder does not enable.
+```
+vendor/                       MLX at the release in vendor/UPSTREAM, as it ships
+mlx_metal/
+├── mlx_*.metal               one per upstream .metal: includes it under MLX's math mode
+├── common.h                  the boundary: a minimal `array` and the three launchers
+├── mlx_dispatch.mm           Metal side: MLX's launchers, transcribed (quantized.cpp, reduce.cpp)
+└── mlx_quantization.cpp      torch side: MLX's op layer, transcribed (ops.cpp)
+torch-ext/                    schema, registration, Python API
+```
+
+The kernels are compiled as they ship. What cannot be vendored is the host code that launches them,
+which upstream writes against its own `array` and device types; `mlx_dispatch.mm` and
+`mlx_quantization.cpp` transcribe it function by function, keeping upstream's names, and helpers
+marked verbatim are upstream's text.
+
+Two build details: kernel-builder compiles every `.metal` it is given with its own flags and has no
+way to pass MLX's `-fno-fast-math`, so each wrapper sets the equivalent `#pragma METAL fp
+math_mode(safe)` and includes the upstream file, which `vendor.py` stores as `.metal.h` so it is not
+compiled a second time. On M5-class GPUs MLX's dispatch picks the NAX kernels, as upstream does.
 
 ## Updating MLX
 
 ```bash
-python vendor.py --rev v0.32.3   # clones MLX next to this file if --src is not given
+python vendor.py --rev v0.32.3      # clones MLX next to this file unless --src is given
 python -m pytest tests/test_vendor_drift.py
 ```
 
-`test_vendor_drift.py` needs no GPU. It fails when upstream changes something the dispatch
-transcribes -- a helper, a threshold, a grid, a kernel name or a buffer index -- and says which.
+`test_vendor_drift.py` needs no GPU. It fails when upstream changes anything the transcription relies
+on — a verbatim helper, a threshold, a grid, a kernel name or a buffer index — and says what.
 
 ## Building and testing
 
 ```bash
 nix run .#build-and-copy -L
-python -m pytest tests   # needs MPS; parity tests against MLX need `pip install mlx==<pinned version>`
+LOCAL_KERNELS=kernels-community/mlx-quantization-metal-kernels=$PWD/build python -m pytest tests
 ```
+
+The tests compare every op with `mlx.core` (install the `mlx` release `vendor/UPSTREAM` pins; those
+tests skip without it) and check which kernels each call plans, including for other GPU generations.
