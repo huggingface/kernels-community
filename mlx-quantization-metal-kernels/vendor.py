@@ -43,6 +43,19 @@ FILES = [
     f"{KERNELS}/steel/gemm/mma.h",
     f"{KERNELS}/steel/gemm/params.h",
     f"{KERNELS}/steel/gemm/transforms.h",
+    # the fp modes (mxfp4 / mxfp8 / nvfp4)
+    f"{KERNELS}/fp_quantized.metal",
+    f"{KERNELS}/fp_quantized.h",
+    f"{KERNELS}/fp4.h",
+    f"{KERNELS}/fp8.h",
+    # the NAX (M5-class) matmuls
+    f"{KERNELS}/quantized_nax.metal",
+    f"{KERNELS}/quantized_nax.h",
+    f"{KERNELS}/fp_quantized_nax.metal",
+    f"{KERNELS}/fp_quantized_nax.h",
+    f"{KERNELS}/steel/gemm/nax.h",
+    # the expert offsets gather_qmm's sorted path reads
+    f"{KERNELS}/gather_mm_offsets.metal",
     # the column reduction MLX sums split-K partial products with, and what it includes
     f"{KERNELS}/reduce.metal",
     f"{KERNELS}/reduce.h",
@@ -55,6 +68,10 @@ FILES = [
     # the host dispatch the .mm transcribes; reference only, never compiled
     "mlx/backend/metal/quantized.cpp",
     "mlx/backend/metal/reduce.cpp",
+    # op-level defaults and checks (quantization_params_from_mode, gather_qmm's indices), and
+    # is_nax_available
+    "mlx/ops.cpp",
+    "mlx/backend/metal/device.cpp",
     # the flags upstream compiles its kernels with (-fno-fast-math)
     f"{KERNELS}/CMakeLists.txt",
 ]
@@ -62,11 +79,11 @@ FILES = [
 
 # kernel-builder compiles every `.metal` it is given with its own flags, and only hands the build the
 # files listed in build.toml. `mlx_metal/*.metal` compile upstream's kernels under MLX's own math
-# mode by including these files, so they are shipped with a header suffix: listed, but not compiled
+# mode by including these files (one wrapper per upstream .metal), so they are shipped with a header suffix: listed, but not compiled
 # a second time. The contents are upstream's, byte for byte.
 RENAMED = {
-    f"{KERNELS}/quantized.metal": f"{KERNELS}/quantized.metal.h",
-    f"{KERNELS}/reduce.metal": f"{KERNELS}/reduce.metal.h",
+    f"{KERNELS}/{name}.metal": f"{KERNELS}/{name}.metal.h"
+    for name in ["quantized", "fp_quantized", "quantized_nax", "fp_quantized_nax", "gather_mm_offsets", "reduce"]
 }
 
 

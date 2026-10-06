@@ -1,23 +1,25 @@
-"""`affine_qmm_t` against a dequantize-then-matmul reference, and against MLX itself.
+"""The ops against MLX itself.
 
-The reference unpacks MLX's affine layout in plain torch: each row of `w` is a little-endian bit
-stream of `bits`-wide values, and each `group_size` run shares a scale and a bias. When `mlx` is
-installed, quantization goes through `mx.quantize`, so the layout under test is MLX's own, and the
-output is also compared with `mx.quantized_matmul` -- which, for the same shape on the same GPU,
-runs the same kernel and must agree exactly.
+Every op is compared with its `mlx.core` counterpart on the same inputs: since both run the same
+kernels with the same dispatch on the same GPU, results must agree bit for bit. Which kernels run is
+checked through `trace_*`, which plans a call without launching it; `MLX_METAL_GPU_ARCH` (as in MLX)
+steers that plan to other GPU generations.
 
-Every branch of the dispatch is reached by steering `MLX_METAL_GPU_ARCH`, as MLX itself allows.
+Needs MPS, and `mlx` at the version vendor/UPSTREAM pins (the parity tests skip without it).
 """
 
 import os
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 import torch
 
-import mlx_quantization_metal_kernels as mq
-from mlx_quantization_metal_kernels._ops import ops
+import kernels
 
+
+mq = kernels.get_kernel("kernels-community/mlx-quantization-metal-kernels", version=2)
+ops = mq.ops
 
 pytestmark = pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
 
@@ -27,9 +29,11 @@ try:
 except ImportError:
     mx = None
 
+needs_mlx = pytest.mark.skipif(mx is None, reason="needs mlx")
+
 DTYPES = [torch.float32, torch.float16, torch.bfloat16]
-BITS = [2, 3, 4, 5, 6, 8]
-GROUP_SIZES = [32, 64, 128]
+MODES = {"affine": (64, 4), "mxfp4": (32, 4), "mxfp8": (32, 8), "nvfp4": (16, 4)}
+AFFINE = [(gs, b) for gs in (32, 64, 128) for b in (2, 3, 4, 5, 6, 8)]
 
 
 @contextmanager
@@ -45,267 +49,414 @@ def arch(name):
             os.environ["MLX_METAL_GPU_ARCH"] = old
 
 
-def quantize(w, group_size, bits):
-    """[N, K] float -> (w_q uint32 [N, K*bits/32], scales [N, K/gs], biases [N, K/gs]), MLX's layout."""
-    if mx is not None:
-        wq, s, b = mx.quantize(mx.array(w.float().numpy()), group_size=group_size, bits=bits)
-        to_t = lambda a: torch.from_numpy(np.array(a))  # noqa: E731
-        return to_t(wq).view(torch.uint32), to_t(s).float(), to_t(b).float()
-    # MLX's affine scheme, for when mlx is not installed
-    N, K = w.shape
-    g = w.float().reshape(N, K // group_size, group_size)
-    w_min, w_max = g.amin(-1), g.amax(-1)
-    n_bins = 2**bits - 1
-    scales = ((w_max - w_min) / n_bins).clamp_min(1e-7)
-    side = w_min.abs() > w_max.abs()
-    scales = torch.where(side, scales, -scales)
-    edge = torch.where(side, w_min, w_max)
-    q0 = (edge / scales).round()
-    scales = torch.where(q0 != 0, edge / q0, scales)
-    biases = torch.where(q0 == 0, torch.zeros_like(q0), edge)
-    q = ((g - biases[..., None]) / scales[..., None]).round().clamp(0, n_bins).to(torch.int64).reshape(N, K)
-    # pack as a little-endian bit stream
-    shifts = torch.arange(bits)
-    stream = ((q[..., None] >> shifts) & 1).reshape(N, K * bits // 8, 8)
-    packed = (stream << torch.arange(8)).sum(-1).to(torch.uint8)
-    return packed.view(torch.int32).view(torch.uint32), scales, biases
+# --- conversions --------------------------------------------------------------------------------
 
 
-def dequantize(wq, scales, biases, group_size, bits):
-    """MLX's affine layout -> [N, K] float32, in plain torch."""
-    N = wq.shape[0]
-    bytes_ = wq.cpu().view(torch.uint8).to(torch.int64)
-    stream = ((bytes_[..., None] >> torch.arange(8)) & 1).reshape(N, -1, bits)
-    q = (stream << torch.arange(bits)).sum(-1).float()
-    K = q.shape[1]
-    q = q.reshape(N, K // group_size, group_size)
-    return (q * scales.cpu().float()[..., None] + biases.cpu().float()[..., None]).reshape(N, K)
+def mx_dtype(dtype):
+    return {torch.float32: mx.float32, torch.float16: mx.float16, torch.bfloat16: mx.bfloat16}[dtype]
 
 
-def make(N, K, group_size, bits, dtype, seed=0):
-    torch.manual_seed(seed)
-    wq, s, b = quantize(torch.randn(N, K), group_size, bits)
-    return wq.to("mps"), s.to("mps", dtype), b.to("mps", dtype)
+def to_mx(t):
+    t = t.detach().cpu()
+    if t.dtype == torch.uint32:
+        return mx.array(t.view(torch.int32).numpy()).view(mx.uint32)
+    if t.dtype in (torch.float16, torch.bfloat16):
+        return mx.array(t.float().numpy()).astype(mx_dtype(t.dtype))
+    return mx.array(t.numpy())
 
 
-def check(y, x, wq, s, b, group_size, bits):
-    """`y` against x @ dequantize(w).T in float32, within a rounding bound.
-
-    The kernels accumulate in float32 and round once to x's dtype, so the error is bounded by a few
-    units in the last place of the output's dtype times sum_k |x_k * w_k| -- the bound that also
-    covers the cancellation a plain relative tolerance trips on.
-    """
-    w = dequantize(wq, s, b, group_size, bits)
-    xf = x.cpu().float().reshape(-1, x.shape[-1])
-    ref = xf @ w.T
-    scale = xf.abs() @ w.abs().T
-    unit = {torch.float32: 2.0**-24, torch.float16: 2.0**-11, torch.bfloat16: 2.0**-8}[x.dtype]
-    assert y.shape == (*x.shape[:-1], w.shape[0]) and y.dtype == x.dtype
-    yf = y.cpu().float().reshape(ref.shape)
-    assert torch.isfinite(yf).all()
-    err = (yf - ref).abs()
-    bound = 2 * unit * scale + 1e-6 * scale
-    assert (err <= bound).all(), f"max err {err.max():.3g}, worst err/bound {(err / bound).max():.3g}"
+def mx_indices(t):
+    return mx.array(t.cpu().to(torch.int32).numpy()).astype(mx.uint32)
 
 
-# --- the reference itself --------------------------------------------------------------------------
+def to_t(a, device="mps"):
+    if a.dtype == mx.uint32:
+        return torch.from_numpy(np.array(a.view(mx.int32))).view(torch.uint32).to(device)
+    if a.dtype in (mx.float16, mx.bfloat16):
+        dtype = torch.float16 if a.dtype == mx.float16 else torch.bfloat16
+        return torch.from_numpy(np.array(a.astype(mx.float32))).to(device, dtype)
+    return torch.from_numpy(np.array(a)).to(device)
 
 
-@pytest.mark.skipif(mx is None, reason="needs mlx")
-@pytest.mark.parametrize("bits", BITS)
-def test_reference_dequantize_matches_mlx(bits):
-    wq, s, b = quantize(torch.randn(64, 256), 64, bits)
-    ours = dequantize(wq, s, b, 64, bits)
-    to_mx = lambda t: mx.array(t.numpy())  # noqa: E731
-    theirs = mx.dequantize(to_mx(wq.view(torch.int32)).view(mx.uint32), to_mx(s), to_mx(b), group_size=64, bits=bits)
-    torch.testing.assert_close(ours, torch.from_numpy(np.array(theirs)))
+def assert_same(ours, theirs):
+    """Bit for bit, compared as float32 (exact for every dtype here)."""
+    theirs = to_t(theirs, "cpu")
+    assert ours.shape == theirs.shape, (ours.shape, theirs.shape)
+    assert ours.dtype == theirs.dtype, (ours.dtype, theirs.dtype)
+    torch.testing.assert_close(ours.cpu().float(), theirs.float(), rtol=0, atol=0, equal_nan=True)
 
 
-# --- every branch of the dispatch ------------------------------------------------------------------
+def quantized(shape, dtype, mode, group_size=None, bits=None, seed=0):
+    """MLX-quantized weights, as (torch tensors, mlx arrays); affine scales/biases in `dtype`."""
+    mx.random.seed(seed)
+    w = mx.random.normal(shape).astype(mx_dtype(dtype))
+    q = mx.quantize(w, group_size=group_size, bits=bits, mode=mode)
+    if mode != "affine":
+        q = [*q, None]
+    return [None if a is None else to_t(a) for a in q], list(q)
 
-# (arch, M, N, K, expected kernel prefix). Limits from get_qmv_batch_limit: g14s at <=2048 is 14,
-# at <=4096 is 10; g15s routes 2+ rows to qmv_wide.
-BRANCHES = [
-    ("applegpu_g14s", 1, 512, 64, "affine_qmv_quad_"),
-    ("applegpu_g14s", 3, 512, 128, "affine_qmv_quad_"),
-    ("applegpu_g14s", 1, 1024, 1024, "affine_qmv_fast_"),
-    ("applegpu_g14s", 5, 1004, 1024, "affine_qmv_"),  # N % 8 != 0 -> not fast
-    ("applegpu_g14s", 2, 1024, 1024 + 64, "affine_qmv_"),  # K off the fast alignment
-    ("applegpu_g15s", 2, 1024, 1024, "affine_qmv_wide_"),
-    ("applegpu_g15s", 5, 1024, 1024, "affine_qmv_wide_"),
-    ("applegpu_g15s", 12, 1000, 1024, "affine_qmv_wide_"),
-    ("applegpu_g14s", 16, 1024, 1024, "affine_qmm_t_splitk_"),
-    ("applegpu_g14s", 16, 1000, 1024, "affine_qmm_t_splitk_"),  # alN_false
-    ("applegpu_g14s", 300, 1024, 1024, "affine_qmm_t_"),
-    ("applegpu_g14s", 300, 1000, 1024, "affine_qmm_t_"),  # alN_false
-    ("applegpu_g14s", 17, 1024, 1024 + 64, "affine_qmm_t_"),  # split-K cannot divide K -> qmm
+
+def gs_bits(mode, group_size=None, bits=None):
+    d = MODES[mode]
+    return group_size or d[0], bits or d[1]
+
+
+# --- quantize / dequantize --------------------------------------------------------------------
+
+
+@needs_mlx
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("mode", MODES)
+def test_quantize_matches_mlx(mode, dtype):
+    torch.manual_seed(0)
+    w = torch.randn(64, 512, dtype=dtype, device="mps")
+    ours = mq.quantize(w, mode=mode)
+    theirs = mx.quantize(to_mx(w), mode=mode)
+    assert len(ours) == len(theirs)
+    for o, t in zip(ours, theirs):
+        if t.dtype in (mx.uint32, mx.uint8):
+            assert torch.equal(o.cpu(), to_t(t, "cpu"))
+        else:
+            assert_same(o, t)
+
+
+@needs_mlx
+@pytest.mark.parametrize("group_size,bits", AFFINE)
+def test_affine_quantize_dequantize_match_mlx(group_size, bits):
+    torch.manual_seed(0)
+    w = torch.randn(3, 32, 384, dtype=torch.bfloat16, device="mps")
+    wq, s, b = mq.quantize(w, group_size, bits)
+    wq_m, s_m, b_m = mx.quantize(to_mx(w), group_size=group_size, bits=bits)
+    assert torch.equal(wq.cpu(), to_t(wq_m, "cpu"))
+    assert_same(s, s_m)
+    assert_same(b, b_m)
+    assert_same(mq.dequantize(wq, s, b, group_size, bits), mx.dequantize(wq_m, s_m, b_m, group_size, bits))
+
+
+@needs_mlx
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("mode", ["mxfp4", "mxfp8", "nvfp4"])
+def test_fp_dequantize_matches_mlx(mode, dtype):
+    (wq, s, _), (wq_m, s_m, _) = quantized((32, 256), torch.float32, mode)
+    assert_same(
+        mq.dequantize(wq, s, mode=mode, dtype=dtype),
+        mx.dequantize(wq_m, s_m, mode=mode, dtype=mx_dtype(dtype)),
+    )
+    assert_same(mq.dequantize(wq, s, mode=mode), mx.dequantize(wq_m, s_m, mode=mode))  # bfloat16 default
+
+
+@needs_mlx
+def test_nvfp4_global_scale_matches_mlx():
+    torch.manual_seed(0)
+    w = torch.randn(32, 256, dtype=torch.bfloat16, device="mps")
+    g = torch.tensor(3.5, device="mps")
+    wq, s = mq.quantize(w, mode="nvfp4", global_scale=g)
+    wq_m, s_m = mx.quantize(to_mx(w), mode="nvfp4", global_scale=to_mx(g))
+    assert torch.equal(wq.cpu(), to_t(wq_m, "cpu")) and torch.equal(s.cpu(), to_t(s_m, "cpu"))
+    assert_same(
+        mq.dequantize(wq, s, mode="nvfp4", global_scale=g),
+        mx.dequantize(wq_m, s_m, mode="nvfp4", global_scale=to_mx(g)),
+    )
+
+
+# --- quantized_matmul -------------------------------------------------------------------------
+
+# (transpose, M, N, K): row counts either side of the qmv/qmm crossover, K of 64 for qmv_quad,
+# N off the 8/32 alignments, and K of 512 / 2048 for qvm vs qvm_split_k.
+MATMUL_SHAPES = [
+    (True, 1, 1024, 2048),
+    (True, 3, 1000, 2048),
+    (True, 9, 1024, 2048),
+    (True, 16, 1024, 2048),
+    (True, 33, 1000, 2048),
+    (True, 200, 1024, 2048),
+    (True, 600, 512, 1024),
+    (True, 2, 512, 64),
+    (False, 1, 512, 512),
+    (False, 3, 512, 2048),
+    (False, 8, 256, 512),
+    (False, 40, 512, 1024),
 ]
 
 
-@pytest.mark.parametrize("arch_name,M,N,K,expected", BRANCHES)
+@needs_mlx
+@pytest.mark.parametrize("transpose,M,N,K", MATMUL_SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_every_branch(arch_name, M, N, K, expected, dtype):
-    group_size, bits = 64, 4
-    with arch(arch_name):
-        name = ops.kernel_for(M, N, K, group_size, bits, dtype)
-        assert name.startswith(expected), name
-        if expected == "affine_qmv_":
-            assert not name.startswith("affine_qmv_fast_")
-        if expected == "affine_qmm_t_":
-            assert "splitk" not in name
-        wq, s, b = make(N, K, group_size, bits, dtype)
-        x = torch.randn(M, K, device="mps", dtype=dtype)
-        check(mq.affine_qmm_t(x, wq, s, b, group_size, bits), x, wq, s, b, group_size, bits)
+@pytest.mark.parametrize("mode", MODES)
+def test_quantized_matmul_matches_mlx(mode, dtype, transpose, M, N, K):
+    group_size, bits = gs_bits(mode)
+    if K % group_size or (not transpose and N % group_size):
+        pytest.skip("shape not divisible by the group size")
+    qt, qm = quantized((N, K) if transpose else (K, N), dtype, mode)
+    torch.manual_seed(1)
+    x = torch.randn(M, K, dtype=dtype, device="mps")
+    ours = mq.quantized_matmul(x, *qt, transpose=transpose, mode=mode)
+    theirs = mx.quantized_matmul(to_mx(x), *qm, transpose=transpose, mode=mode)
+    assert_same(ours, theirs)
 
 
-@pytest.mark.parametrize("bits", BITS)
-@pytest.mark.parametrize("group_size", GROUP_SIZES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("M", [1, 7, 64])
-def test_bits_group_sizes_dtypes(bits, group_size, dtype, M):
+@needs_mlx
+@pytest.mark.parametrize("group_size,bits", AFFINE)
+@pytest.mark.parametrize("M", [1, 5, 64])
+@pytest.mark.parametrize("transpose", [True, False])
+def test_affine_bits_and_group_sizes_match_mlx(group_size, bits, M, transpose):
+    N, K = 256, 1024
+    qt, qm = quantized((N, K) if transpose else (K, N), torch.float16, "affine", group_size, bits)
+    torch.manual_seed(1)
+    x = torch.randn(M, K, dtype=torch.float16, device="mps")
+    assert_same(
+        mq.quantized_matmul(x, *qt, transpose=transpose, group_size=group_size, bits=bits),
+        mx.quantized_matmul(to_mx(x), *qm, transpose=transpose, group_size=group_size, bits=bits),
+    )
+
+
+@needs_mlx
+@pytest.mark.parametrize("transpose", [True, False])
+@pytest.mark.parametrize("M", [1, 3, 40])
+@pytest.mark.parametrize("mode", ["affine", "mxfp4"])
+def test_batched_weights_match_mlx(mode, M, transpose):
+    """3D weights, broadcast against a 4D x; MLX runs the batched kernels for this."""
     N, K = 256, 512
-    wq, s, b = make(N, K, group_size, bits, dtype)
-    x = torch.randn(M, K, device="mps", dtype=dtype)
-    check(mq.affine_qmm_t(x, wq, s, b, group_size, bits), x, wq, s, b, group_size, bits)
+    qt, qm = quantized((3, N, K) if transpose else (3, K, N), torch.float16, mode)
+    torch.manual_seed(1)
+    x = torch.randn(2, 1, M, K, dtype=torch.float16, device="mps")
+    assert_same(
+        mq.quantized_matmul(x, *qt, transpose=transpose, mode=mode),
+        mx.quantized_matmul(to_mx(x), *qm, transpose=transpose, mode=mode),
+    )
 
 
-# --- parity with MLX -------------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(mx is None, reason="needs mlx")
-@pytest.mark.parametrize("M", [1, 3, 9, 16, 33, 200, 600])
-@pytest.mark.parametrize("bits", BITS)
+@needs_mlx
+@pytest.mark.parametrize("reduce_shape", [(16, 1024, 2048), (16, 256, 4096), (8, 32, 32768)])
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_matches_mlx(M, bits, dtype):
-    """Against `mx.quantized_matmul` on the same weights: same kernels on this GPU, so bit for bit."""
-    assert "MLX_METAL_GPU_ARCH" not in os.environ
-    N, K, group_size = 1024, 2048, 64
-    mx.random.seed(0)
-    wq_mx, s_mx, b_mx = mx.quantize(mx.random.normal((N, K)), group_size=group_size, bits=bits)
-    mx_dtype = {torch.float32: mx.float32, torch.float16: mx.float16, torch.bfloat16: mx.bfloat16}[dtype]
-    s_mx, b_mx = s_mx.astype(mx_dtype), b_mx.astype(mx_dtype)
-    torch.manual_seed(0)
-    x = torch.randn(M, K).to(dtype)
-    x_mx = mx.array(x.float().numpy()).astype(mx_dtype)
-    theirs = mx.quantized_matmul(x_mx, wq_mx, s_mx, b_mx, transpose=True, group_size=group_size, bits=bits)
-
-    to_t = lambda a: torch.from_numpy(np.array(a.astype(mx.float32)))  # noqa: E731
-    wq = torch.from_numpy(np.array(wq_mx)).view(torch.uint32)
-    s, b = to_t(s_mx).to(dtype), to_t(b_mx).to(dtype)
-    ours = mq.affine_qmm_t(x.to("mps"), wq.to("mps"), s.to("mps"), b.to("mps"), group_size, bits).cpu()
-    theirs = to_t(theirs)
-
-    torch.testing.assert_close(ours.float(), theirs, rtol=0, atol=0)
+def test_split_k_sums_match_mlx(reduce_shape, dtype):
+    """qmm_t_splitk followed by each of upstream's column sums: small, looped and two-pass."""
+    M, N, K = reduce_shape
+    qt, qm = quantized((N, K), dtype, "affine")
+    x = torch.randn(M, K, dtype=dtype, device="mps")
+    trace = ops.trace_quantized_matmul(x, *qt, True, None, None, "affine")
+    assert any("splitk" in k for k in trace) and any(k.startswith("col_reduce_") for k in trace), trace
+    assert_same(mq.quantized_matmul(x, *qt), mx.quantized_matmul(to_mx(x), *qm))
 
 
-@pytest.mark.skipif(mx is None, reason="needs mlx")
+# --- gather_qmm ---------------------------------------------------------------------------------
+
+
+@needs_mlx
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize(
-    "M,N,K,reduce",
+    "case,transpose,M,expect",
     [
-        (16, 1024, 2048, "col_reduce_small"),  # split_k < 32
-        (16, 256, 4096, "col_reduce_looped"),  # 8 output tiles -> split_k 64
-        (8, 32, 32768, "col_reduce_2pass"),  # 1 output tile -> split_k 512
+        ("lhs_rhs", True, 1, "gather_qmv"),
+        ("lhs_rhs", True, 20, "gather_qmm_t"),
+        ("lhs_rhs", False, 1, "gather_qvm"),
+        ("lhs_rhs", False, 20, "gather_qmm_n"),
+        ("rhs_only", True, 1, "gather_qmv"),
+        ("sorted", True, 1, "gather_qmm_rhs_nt"),
+        ("sorted", False, 1, "gather_qmm_rhs_nn"),
     ],
 )
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_split_k_reductions_match_mlx(M, N, K, reduce, dtype):
-    """Each of upstream's split-K sums, bit for bit against MLX."""
-    group_size, bits = 64, 4
-    assert ops.kernel_for(M, N, K, group_size, bits, dtype).endswith(reduce)
-    mx.random.seed(1)
-    wq_mx, s_mx, b_mx = mx.quantize(mx.random.normal((N, K)), group_size=group_size, bits=bits)
-    mx_dtype = {torch.float32: mx.float32, torch.float16: mx.float16, torch.bfloat16: mx.bfloat16}[dtype]
-    s_mx, b_mx = s_mx.astype(mx_dtype), b_mx.astype(mx_dtype)
-    torch.manual_seed(1)
-    x = torch.randn(M, K).to(dtype)
-    theirs = mx.quantized_matmul(
-        mx.array(x.float().numpy()).astype(mx_dtype), wq_mx, s_mx, b_mx, transpose=True, group_size=group_size, bits=bits
+def test_gather_qmm_matches_mlx(mode, dtype, case, transpose, M, expect):
+    E, N, K, T = 8, 256, 512, 64
+    qt, qm = quantized((E, N, K) if transpose else (E, K, N), dtype, mode)
+    torch.manual_seed(2)
+    rhs = torch.randint(0, E, (T,), device="mps")
+    if case == "sorted":
+        rhs = rhs.sort().values
+    if case == "lhs_rhs":
+        x = torch.randn(4, M, K, dtype=dtype, device="mps")
+        lhs = torch.randint(0, 4, (T,), device="mps")
+        kw = dict(lhs_indices=lhs, rhs_indices=rhs)
+        kw_m = dict(lhs_indices=mx_indices(lhs), rhs_indices=mx_indices(rhs))
+    else:
+        x = torch.randn(T, M, K, dtype=dtype, device="mps")
+        kw = dict(rhs_indices=rhs, sorted_indices=case == "sorted")
+        kw_m = dict(rhs_indices=mx_indices(rhs), sorted_indices=case == "sorted")
+    trace = ops.trace_gather_qmm(
+        x, *qt, kw.get("lhs_indices"), rhs, transpose, None, None, mode, None, case == "sorted"
     )
-    to_t = lambda a: torch.from_numpy(np.array(a.astype(mx.float32)))  # noqa: E731
-    wq = torch.from_numpy(np.array(wq_mx)).view(torch.uint32)
-    ours = mq.affine_qmm_t(
-        x.to("mps"), wq.to("mps"), to_t(s_mx).to(dtype).to("mps"), to_t(b_mx).to(dtype).to("mps"), group_size, bits
-    ).cpu()
-    torch.testing.assert_close(ours.float(), to_t(theirs), rtol=0, atol=0)
+    assert any(k.startswith(f"{mode}_{expect}_") for k in trace), trace
+    assert_same(
+        mq.gather_qmm(x, *qt, transpose=transpose, mode=mode, **kw),
+        mx.gather_qmm(to_mx(x), *qm, transpose=transpose, mode=mode, **kw_m),
+    )
 
 
-# --- shapes and layouts ----------------------------------------------------------------------------
+@needs_mlx
+def test_gather_qmm_nvfp4_global_scale_matches_mlx():
+    E, N, K, T = 4, 128, 256, 16
+    (wq, s, _), (wq_m, s_m, _) = quantized((E, N, K), torch.bfloat16, "nvfp4")
+    g = torch.rand(E, device="mps") + 0.5
+    x = torch.randn(T, 1, K, dtype=torch.bfloat16, device="mps")
+    rhs = torch.randint(0, E, (T,), device="mps")
+    assert_same(
+        mq.gather_qmm(x, wq, s, rhs_indices=rhs, mode="nvfp4", global_scale=g),
+        mx.gather_qmm(to_mx(x), wq_m, s_m, rhs_indices=mx_indices(rhs), mode="nvfp4", global_scale=to_mx(g)),
+    )
 
 
-@pytest.mark.parametrize("M_per_row", [1, 3, 40])
+# --- which kernels run --------------------------------------------------------------------------
+
+
+def meta_quantized(shape, mode, dtype=torch.float16):
+    group_size, bits = gs_bits(mode)
+    *batch, rows, cols = shape
+    wq = torch.empty(*batch, rows, cols * bits // 32, dtype=torch.uint32, device="meta")
+    if mode == "affine":
+        s = torch.empty(*batch, rows, cols // group_size, dtype=dtype, device="meta")
+        return wq, s, s.clone()
+    return wq, torch.empty(*batch, rows, cols // group_size, dtype=torch.uint8, device="meta"), None
+
+
+# (arch, transpose, M, N, K, expected first kernel). Limits from get_qmv_batch_limit: g14s is 14 up
+# to 2048, 10 up to 4096; g15s routes 2+ rows to qmv_wide; g17s (M5) runs NAX for qmm.
+BRANCHES = [
+    ("applegpu_g14s", True, 1, 512, 64, "affine_qmv_quad_"),
+    ("applegpu_g14s", True, 1, 1024, 1024, "affine_qmv_fast_"),
+    ("applegpu_g14s", True, 5, 1004, 1024, "affine_qmv_float"),
+    ("applegpu_g15s", True, 5, 1024, 1024, "affine_qmv_wide_"),
+    ("applegpu_g14s", True, 16, 1024, 1024, "affine_qmm_t_splitk_"),
+    ("applegpu_g14s", True, 300, 1024, 1024, "affine_qmm_t_float"),
+    ("applegpu_g14s", False, 2, 1024, 512, "affine_qvm_float"),
+    ("applegpu_g14s", False, 2, 1024, 2048, "affine_qvm_split_k_"),
+    ("applegpu_g14s", False, 4, 1024, 512, "affine_qmm_n_float"),
+    ("applegpu_g17s", True, 300, 1024, 1024, "affine_qmm_t_nax_"),
+    ("applegpu_g17s", False, 300, 1024, 1024, "affine_qmm_n_nax_"),
+]
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("arch_name,transpose,M,N,K,expected", BRANCHES)
+def test_dispatch_branches(arch_name, transpose, M, N, K, expected):
+    w, s, b = meta_quantized((N, K) if transpose else (K, N), "affine")
+    x = torch.empty(M, K, dtype=torch.float16, device="meta")
+    with arch(arch_name):
+        trace = ops.trace_quantized_matmul(x, w, s, b, transpose, None, None, "affine")
+    assert trace[0].startswith(expected), trace
+
+
+def test_every_traced_kernel_is_in_the_metallib():
+    """Names the dispatch builds for other GPUs (NAX on M5, qmv_wide on M3+) must exist in the build,
+    even where this GPU cannot run them. The metallib is embedded in the extension."""
+    so = next(Path(mq.__file__).parent.glob("_mlx_quantization_metal_kernels*.so"))
+    blob = so.read_bytes()
+    names = set()
+    for arch_name in ("applegpu_g14s", "applegpu_g15s", "applegpu_g17s"):
+        with arch(arch_name):
+            for mode in MODES:
+                for transpose, M, N, K in [
+                    (True, 1, 1024, 1024),
+                    (True, 5, 1024, 1024),
+                    (True, 300, 1024, 1024),
+                    (False, 2, 1024, 2048),
+                    (False, 300, 1024, 1024),
+                ]:
+                    w, s, b = meta_quantized((N, K) if transpose else (K, N), mode)
+                    x = torch.empty(M, K, dtype=torch.bfloat16, device="meta")
+                    names.update(ops.trace_quantized_matmul(x, w, s, b, transpose, None, None, mode))
+                w, s, b = meta_quantized((8, 1024, 1024), mode)
+                rhs = torch.zeros(64, dtype=torch.int32, device="meta")
+                for M, sort in [(1, True), (1, False), (40, False)]:
+                    x = torch.empty(64, M, 1024, dtype=torch.bfloat16, device="meta")
+                    names.update(ops.trace_gather_qmm(x, w, s, b, None, rhs, True, None, None, mode, None, sort))
+    missing = sorted(n for n in names if n.encode() not in blob)
+    assert len(names) > 40 and not missing, missing
+
+
+# --- the version 1 API ------------------------------------------------------------------------
+
+
+@pytest.mark.kernels_ci
+def test_v1_functions():
+    torch.manual_seed(0)
+    N, K = 256, 512
+    x = torch.randn(4, K, dtype=torch.float16, device="mps")
+    w = torch.randn(N, K, dtype=torch.float16, device="mps")
+    wq, s, b = mq.quantize(w, 128, 4)
+    y = mq.quantized_matmul(x, wq, s, b, group_size=128)
+    for f in (mq.affine_qmm_t, mq.affine_qmm_t_nax):
+        torch.testing.assert_close(f(x, wq, s, b), y, rtol=0, atol=0)
+    torch.testing.assert_close(mq.affine_qmv(x, wq, s, b, N), y, rtol=0, atol=0)
+
+    wq_n, s_n, b_n = mq.quantize(w.T.contiguous(), 128, 4)  # [K, N]
+    y_n = mq.quantized_matmul(x, wq_n, s_n, b_n, transpose=False, group_size=128)
+    for f in (mq.affine_qmm_n, mq.affine_qmm_n_nax):
+        torch.testing.assert_close(f(x, wq_n, s_n, b_n, N), y_n, rtol=0, atol=0)
+
+    wq4, s4 = mq.quantize(w, mode="mxfp4")
+    torch.testing.assert_close(mq.mxfp4_qmv(x, wq4, s4, N), mq.quantized_matmul(x, wq4, s4, mode="mxfp4"))
+    wq4n, s4n = mq.quantize(w.T.contiguous(), mode="mxfp4")
+    torch.testing.assert_close(
+        mq.mxfp4_qmm_n(x, wq4n, s4n, N), mq.quantized_matmul(x, wq4n, s4n, transpose=False, mode="mxfp4")
+    )
+
+    we = torch.randn(4, N, K, dtype=torch.float16, device="mps")
+    wqe, se, be = mq.quantize(we, 128, 4)
+    idx = torch.tensor([3, 0, 0, 2], device="mps")
+    y_g = mq.affine_gather_qmm_rhs_nax(x, wqe, se, be, idx, N)
+    for m in range(4):
+        e = int(idx[m])
+        torch.testing.assert_close(y_g[m], mq.quantized_matmul(x[m], wqe[e], se[e], be[e], group_size=128))
+
+    with pytest.raises(ValueError, match="output_features"):
+        mq.affine_qmv(x, wq, s, b, N + 1)
+
+
+# --- shapes and layouts ---------------------------------------------------------------------------
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("rows", [1, 3, 40])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_batched_input_matches_per_row(M_per_row, dtype):
+def test_batched_input_matches_per_row(rows, dtype):
     """huggingface/transformers#49337: every row of a 3D input must equal that row run alone."""
-    N, K, group_size, bits = 256, 512, 64, 8
-    wq, s, b = make(N, K, group_size, bits, dtype)
-    x = torch.randn(4, M_per_row, K, device="mps", dtype=dtype)
-    batched = mq.affine_qmm_t(x, wq, s, b, group_size, bits)
-    per_row = torch.stack([mq.affine_qmm_t(r, wq, s, b, group_size, bits) for r in x])
-    assert batched.shape == (4, M_per_row, N)
+    w = torch.randn(256, 512, dtype=dtype, device="mps")
+    wq, s, b = mq.quantize(w, 64, 8)
+    x = torch.randn(4, rows, 512, dtype=dtype, device="mps")
+    batched = mq.quantized_matmul(x, wq, s, b, bits=8)
+    per_row = torch.stack([mq.quantized_matmul(r, wq, s, b, bits=8) for r in x])
+    assert batched.shape == (4, rows, 256)
     torch.testing.assert_close(batched, per_row, rtol=0, atol=0)
 
 
-def test_1d_and_4d_inputs():
-    N, K = 128, 256
-    wq, s, b = make(N, K, 64, 4, torch.float16)
-    v = torch.randn(K, device="mps", dtype=torch.float16)
-    assert mq.affine_qmm_t(v, wq, s, b, 64, 4).shape == (N,)
-    x = torch.randn(2, 3, 5, K, device="mps", dtype=torch.float16)
-    y = mq.affine_qmm_t(x, wq, s, b, 64, 4)
-    torch.testing.assert_close(y, mq.affine_qmm_t(x.reshape(-1, K), wq, s, b, 64, 4).reshape(2, 3, 5, N))
-
-
-@pytest.mark.parametrize("M", [2, 8, 100])
-def test_non_contiguous_input(M):
-    N, K = 256, 512
-    wq, s, b = make(N, K, 64, 4, torch.float16)
-    xt = torch.randn(K, M, device="mps", dtype=torch.float16).t()
+def test_layouts():
+    w = torch.randn(256, 512, dtype=torch.float16, device="mps")
+    wq, s, b = mq.quantize(w)
+    big = torch.randn(10, 512, dtype=torch.float16, device="mps")
+    y = mq.quantized_matmul(big[3:7].clone(), wq, s, b)
+    torch.testing.assert_close(mq.quantized_matmul(big[3:7], wq, s, b), y, rtol=0, atol=0)  # storage offset
+    xt = big[3:7].clone().T.contiguous().T  # same values, column-major
     assert not xt.is_contiguous()
-    torch.testing.assert_close(
-        mq.affine_qmm_t(xt, wq, s, b, 64, 4), mq.affine_qmm_t(xt.contiguous(), wq, s, b, 64, 4), rtol=0, atol=0
-    )
+    torch.testing.assert_close(mq.quantized_matmul(xt, wq, s, b), y, rtol=0, atol=0)
+    assert mq.quantized_matmul(big[3], wq, s, b).shape == (256,)  # 1D x
+    assert mq.quantized_matmul(big[:0], wq, s, b).shape == (0, 256)  # empty
 
 
-def test_input_with_storage_offset():
-    N, K = 256, 512
-    wq, s, b = make(N, K, 64, 4, torch.float16)
-    big = torch.randn(10, K, device="mps", dtype=torch.float16)
-    torch.testing.assert_close(
-        mq.affine_qmm_t(big[3:7], wq, s, b, 64, 4), mq.affine_qmm_t(big[3:7].clone(), wq, s, b, 64, 4), rtol=0, atol=0
-    )
-
-
-def test_empty_input():
-    wq, s, b = make(128, 256, 64, 4, torch.float16)
-    y = mq.affine_qmm_t(torch.empty(0, 256, device="mps", dtype=torch.float16), wq, s, b, 64, 4)
-    assert y.shape == (0, 128)
-
-
-# --- inputs the kernels cannot take fail loudly ------------------------------------------------------
-
-
+@pytest.mark.kernels_ci
 @pytest.mark.parametrize(
-    "case",
-    ["scales_dtype", "w_dtype", "w_shape", "scales_shape", "group_size", "bits", "cpu"],
+    "case", ["scales_dtype", "w_dtype", "w_shape", "group_size", "bits", "mode", "biases_fp", "cpu"]
 )
 def test_bad_inputs_raise(case):
-    N, K = 128, 256
-    wq, s, b = make(N, K, 64, 4, torch.float16)
-    x = torch.randn(2, K, device="mps", dtype=torch.float16)
-    gs, bits = 64, 4
+    w = torch.randn(128, 256, dtype=torch.float16, device="mps")
+    wq, s, b = mq.quantize(w)
+    x = torch.randn(2, 256, dtype=torch.float16, device="mps")
+    kw = dict(group_size=None, bits=None, mode="affine")
     if case == "scales_dtype":
-        s, b = s.float(), b.float()
+        s, b = s.to(torch.int32), b.to(torch.int32)
     elif case == "w_dtype":
         wq = wq.view(torch.int32)
     elif case == "w_shape":
         wq = wq[:, :-1]
-    elif case == "scales_shape":
-        s = s[:, :-1]
     elif case == "group_size":
-        gs = 16
+        kw["group_size"] = 16
     elif case == "bits":
-        bits = 7
+        kw["bits"] = 7
+    elif case == "mode":
+        kw["mode"] = "int4"
+    elif case == "biases_fp":
+        kw["mode"] = "mxfp4"
     elif case == "cpu":
         x = x.cpu()
     with pytest.raises(RuntimeError, match="mlx-quantization-metal-kernels"):
-        mq.affine_qmm_t(x, wq, s, b, gs, bits)
+        mq.quantized_matmul(x, wq, s, b, **kw)

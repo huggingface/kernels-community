@@ -2,14 +2,44 @@
 
 #include <torch/torch.h>
 
+#include <optional>
 #include <string>
+#include <vector>
 
-// y = x @ dequantize(w, scales, biases).T, MLX's `quantized_matmul(..., transpose=True)` in affine
-// mode. `x` is [..., K] (float32/float16/bfloat16), `w` is [N, K * bits / 32] uint32, `scales` and
-// `biases` are [N, K / group_size] in x's dtype. Returns [..., N]. Picks the kernel the way MLX does.
-at::Tensor affine_qmm_t(const at::Tensor &x, const at::Tensor &w, const at::Tensor &scales,
-                        const at::Tensor &biases, int64_t group_size, int64_t bits);
+// MLX's quantized ops, on torch tensors: same arguments, defaults and checks as mlx.core's, and the
+// same Metal kernels. `group_size`/`bits` default per mode (affine 64/4, mxfp4 32/4, mxfp8 32/8,
+// nvfp4 16/4), as in MLX.
 
-// The kernel `affine_qmm_t` would launch for an [M, K] x [N, K] product on this GPU, by name.
-std::string kernel_for(int64_t M, int64_t N, int64_t K, int64_t group_size, int64_t bits,
-                       at::ScalarType dtype);
+at::Tensor quantized_matmul(const at::Tensor &x, const at::Tensor &w, const at::Tensor &scales,
+                            const std::optional<at::Tensor> &biases, bool transpose,
+                            std::optional<int64_t> group_size, std::optional<int64_t> bits,
+                            const std::string &mode);
+
+at::Tensor gather_qmm(const at::Tensor &x, const at::Tensor &w, const at::Tensor &scales,
+                      const std::optional<at::Tensor> &biases, const std::optional<at::Tensor> &lhs_indices,
+                      const std::optional<at::Tensor> &rhs_indices, bool transpose,
+                      std::optional<int64_t> group_size, std::optional<int64_t> bits, const std::string &mode,
+                      const std::optional<at::Tensor> &global_scale, bool sorted_indices);
+
+std::vector<at::Tensor> quantize(const at::Tensor &w, std::optional<int64_t> group_size,
+                                 std::optional<int64_t> bits, const std::string &mode,
+                                 const std::optional<at::Tensor> &global_scale);
+
+at::Tensor dequantize(const at::Tensor &w, const at::Tensor &scales, const std::optional<at::Tensor> &biases,
+                      std::optional<int64_t> group_size, std::optional<int64_t> bits, const std::string &mode,
+                      const std::optional<at::Tensor> &global_scale, std::optional<at::ScalarType> dtype);
+
+// The kernels the two matmuls would launch for these inputs, in order, without launching them. For
+// the tests: inputs may be on the meta device.
+std::vector<std::string> trace_quantized_matmul(const at::Tensor &x, const at::Tensor &w, const at::Tensor &scales,
+                                                const std::optional<at::Tensor> &biases, bool transpose,
+                                                std::optional<int64_t> group_size, std::optional<int64_t> bits,
+                                                const std::string &mode);
+
+std::vector<std::string> trace_gather_qmm(const at::Tensor &x, const at::Tensor &w, const at::Tensor &scales,
+                                          const std::optional<at::Tensor> &biases,
+                                          const std::optional<at::Tensor> &lhs_indices,
+                                          const std::optional<at::Tensor> &rhs_indices, bool transpose,
+                                          std::optional<int64_t> group_size, std::optional<int64_t> bits,
+                                          const std::string &mode, const std::optional<at::Tensor> &global_scale,
+                                          bool sorted_indices);
