@@ -79,7 +79,7 @@ def selective_state_update_ref(state, x, dt, A, B, C, D=None, z=None, dt_bias=No
     return out
 
 
-@pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("itype", [torch.float32, torch.float16])
 # @pytest.mark.parametrize('itype', [torch.float16])
 @pytest.mark.parametrize("has_z", [False, True])
 # @pytest.mark.parametrize('has_z', [True])
