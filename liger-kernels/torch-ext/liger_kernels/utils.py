@@ -180,9 +180,7 @@ def set_large_grf_mode(kernel_args: dict):
 def device_context(device: torch.device):
     """Context manager that sets the active device for any backend (cuda, xpu, etc.)."""
     backend = getattr(torch, device.type, None)
-    # Skipped while compiling to work around a torch 2.14 regression: Dynamo crashes tracing
-    # this device switch inside an autograd.Function (2.13 and earlier are fine). Inductor
-    # already sets the device for the kernels it launches.
+    # Skipped while compiling: torch 2.14 regression, https://github.com/pytorch/pytorch/issues/199919
     if not torch.compiler.is_compiling() and backend is not None and hasattr(backend, "device"):
         with backend.device(device):
             yield
