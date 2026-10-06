@@ -84,6 +84,7 @@ class Problem:
     noncontiguous: bool = False
     empty_expert: bool = False
     compile: bool = False
+    bias: bool = False  # a per-expert output bias, added on the accumulator before the GLU
     dtype: torch.dtype = torch.bfloat16
 
     @property
@@ -115,6 +116,8 @@ class Problem:
             tag += "_emptyexpert"
         if self.compile:
             tag += "_compile"
+        if self.bias:
+            tag += "_bias"
         if self.dtype != torch.bfloat16:
             tag += f"_{str(self.dtype).rsplit('.', 1)[-1]}"  # float16 / float32
         return f"{tag}_S{self.S}_E{self.E}_N{self.N}_K{self.K}"
@@ -255,6 +258,15 @@ def scenarios() -> list[Problem]:
         Problem(weights="mxfp4", dtype=torch.float32),
         Problem(weights="mxfp8", dtype=torch.float16),
         Problem(weights="mxfp8", dtype=torch.float32),
+        # output bias (gpt-oss ships one on both projections): a plain cell per kernel family, and the
+        # gpt-oss gate_up itself — weight-only MXFP4 with the clamped SwiGLU, at prefill and decode
+        Problem(weights="bf16", bias=True),
+        Problem(weights="fp8_128x128", bias=True),
+        Problem(weights="mxfp8", bias=True),
+        Problem(weights="nvfp4", bias=True),
+        Problem(weights="mxfp8", gate=True, bias=True),
+        Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
+        Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True, S=8),
     ]
     return out
 
@@ -280,6 +292,18 @@ def _routed(problem: Problem):
     if problem.noncontiguous:
         expert_ids = _make_noncontig(expert_ids)
     return A, expert_ids
+
+
+def _bias(problem: Problem, op):
+    """The scenario's output bias, else None: ``(E, N_out)`` for the routed ops, ``(N_out,)`` for
+    ``matmul``, ``N_out`` the GEMM's width (the interleaved gate|up columns under gate). Seeded, so the
+    reference and the op read the identical values; large enough that dropping it fails the check."""
+    if not problem.bias:
+        return None
+    g = torch.Generator(device=TEST_DEVICE).manual_seed(1)
+    rows = 2 * problem.N if problem.gate else problem.N
+    bias = torch.randn(problem.E, rows, device=TEST_DEVICE, generator=g).to(problem.dtype)
+    return bias[0] if op == "matmul" else bias
 
 
 def _make_noncontig(x):
@@ -394,11 +418,16 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
     row = WEIGHTS[problem.weights]
     A_dq = _act_dequant(problem, op, A, As, As_global, expert_ids)
     W = row["dequant"](B, Bs, Bs_global)  # (E, rows, K) fp32
+    bias = _bias(problem, op)
     if op == "matmul":
         ref = A_dq @ W[0].T  # single linear, no routing
+        if bias is not None:
+            ref = ref + bias.float()
     else:
         local = expert_ids.long().clamp(max=problem.E - 1)
         ref = torch.einsum("sk,snk->sn", A_dq, W[local])
+        if bias is not None:
+            ref = ref + bias.float()[local]
         ref[expert_ids.long() >= problem.E] = 0
     if problem.gate:
         gate_v, up_v = ref[..., 0::2], ref[..., 1::2]
@@ -463,6 +492,8 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
         )
     if not problem.quantize_output:
         kw["output_dtype"] = problem.dtype
+    if problem.bias:
+        kw["bias"] = _bias(problem, op)
     if out_global is not None:  # provided NVFP4 output global (next proj's input_scale)
         kw["output_global_scale"] = out_global
     if problem.static:  # fused static activation quant — As is the calibrated scale

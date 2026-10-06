@@ -1699,7 +1699,7 @@ def mx_weight_only_matmul_batched(
         )
         [gate_up] = mx_weight_only_matmul_batched(
             A, B, Bs, expert_ids, output_dtype=inter_dtype,
-            gather_idx=gather_idx, scatter_idx=scatter_idx, b_global_scale=b_global_scale,
+            gather_idx=gather_idx, scatter_idx=scatter_idx, b_global_scale=b_global_scale, bias=bias,
         )
         return [fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit,
                           out_dtype=resolve_output_dtype(output_dtype, A, None))]
