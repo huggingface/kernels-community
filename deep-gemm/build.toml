@@ -25,7 +25,7 @@ src = [
 
 [kernel.deep_gemm]
 backend = "cuda"
-cuda-capabilities = ["9.0a"]
+cuda-capabilities = ["9.0a", "10.0a"]
 cuda-flags = [
     "-std=c++20",
     "-O3",

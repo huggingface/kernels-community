@@ -1,6 +1,6 @@
 [general]
 name = "paged-attention"
-version = 1
+version = 2
 edition = 5
 license = "Apache-2.0"
 backends = [
@@ -17,6 +17,10 @@ src = [
     "torch-ext/torch_binding.cpp",
     "torch-ext/torch_binding.h",
 ]
+
+[torch.stable-abi]
+cuda = "2.10"
+rocm = "2.10"
 
 [kernel.paged_attention_metal]
 backend = "metal"
@@ -70,6 +74,7 @@ src = [
     "paged-attention/dispatch_utils.h",
     "paged-attention/quantization/fp8/amd/quant_utils.cuh",
     "paged-attention/quantization/fp8/nvidia/quant_utils.cuh",
+    "paged-attention/stable_utils.h",
 ]
 
 [kernel.cuda_utils]
@@ -123,4 +128,5 @@ src = [
     "paged-attention/dispatch_utils.h",
     "paged-attention/quantization/fp8/amd/quant_utils.cuh",
     "paged-attention/quantization/fp8/nvidia/quant_utils.cuh",
+    "paged-attention/stable_utils.h",
 ]

@@ -16,6 +16,12 @@
 
 #include <sycl/sycl.hpp>
 
+#ifndef TORCH_TARGET_VERSION
+// When not building for the stable ABI we need to use the regular C++ API
+// to get the XPU stream.
+#include <c10/xpu/XPUStream.h>
+#endif
+
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -23,7 +29,8 @@
 
 #define CHECK_SHAPE(x, ...)                                                    \
   STD_TORCH_CHECK(                                                             \
-      x.sizes() == torch::headeronly::IntHeaderOnlyArrayRef({__VA_ARGS__}),    \
+      x.sizes().equals(                                                        \
+          torch::headeronly::IntHeaderOnlyArrayRef({__VA_ARGS__})),            \
       #x " must have shape (" #__VA_ARGS__ ")")
 
 namespace causal_conv1d_xpu {
@@ -35,17 +42,22 @@ inline bool is_xpu(const Tensor &t) {
   return t.device().type() == torch::headeronly::DeviceType::XPU;
 }
 
-// The SYCL queue backing Torch's current XPU stream on the tensor's device.
-// For XPU streams, the stable stream's native handle is a `sycl::queue*`
-// (requires Torch >= 2.13). The queue is owned by Torch's stream pool, so the
-// reference outlives the temporary stream handle.
+#ifdef TORCH_TARGET_VERSION
 inline sycl::queue &current_queue(const Tensor &t) {
+  // The SYCL queue backing Torch's current XPU stream on the tensor's device.
+  // The queue is owned by Torch's stream pool, so the reference outlives the
+  // temporary stream handle.
   void *handle =
       torch::stable::accelerator::getCurrentStream(t.get_device_index())
           .nativeHandle();
   STD_TORCH_CHECK(handle != nullptr, "could not get the current XPU queue");
   return *static_cast<sycl::queue *>(handle);
 }
+#else
+inline sycl::queue &current_queue(const Tensor &t) {
+  return c10::xpu::getCurrentXPUStream(t.get_device_index()).queue();
+}
+#endif
 
 // The CUDA backend only supports widths 2..4; keep the same limit so that the
 // unrolled register buffers below have a compile-time bound.
