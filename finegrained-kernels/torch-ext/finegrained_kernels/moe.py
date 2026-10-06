@@ -53,12 +53,12 @@ from .compat import (
     ScalingType,
     SwizzleType,
     compile_time_only_triton_wrap,
-    decode_pdl,
     device_context,
+    pdl_launch_kwargs,
 )
-from .formats import get_supported_act_fns, is_mx, is_mxfp4, weight_format
+from .formats import get_supported_act_fns, is_mx, is_mxfp4, is_per_expert_global, mx_scale_family, normalize_global_scale, ue8m0_as_uint8, weight_format
 from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
-from .quant import _launch_act_quant
+from .quant import _launch_act_quant, MX_ACT_QUANT, mx_act_quant_routed_scales
 from .scheduling import compute_grouped_scheduling
 from .epilogue import fused_glu
 
@@ -187,8 +187,7 @@ def weighted_reduce(
             NUM_EXPERTS=num_experts,
             NORM=norm,
             SIMULATE_UNFUSED=simulate_unfused,
-            PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
     return reduced
 
@@ -316,6 +315,27 @@ def _fused_post_expert_norm(down_out, post_expert_norm, weight, eps):
     return _post_expert_norm(down_out, post_expert_norm, weight, eps), {}
 
 
+def _gate_up_activations(hidden, fmt, gate_up_scale, global_scale, activation_scale, scatter_idx, expert_start):
+    """``(A, As)`` for the grouped gate_up. Under a shared global on swizzled MX weights, ``hidden``
+    is quantized once with its scales stored straight into each routed row's expert tile, which
+    the op reads as is while gathering the values; anywhere else the op quantizes ``hidden``."""
+    if (
+        fmt not in MX_ACT_QUANT
+        or gate_up_scale.ndim != 5
+        or activation_scale is not None
+        or is_per_expert_global(global_scale)
+    ):
+        return hidden, activation_scale
+    K = hidden.shape[1]
+    scale_group = mx_scale_family(gate_up_scale, K)
+    if K % (4 * scale_group) != 0:  # a partial 4-column scale block takes the op's padding pass
+        return hidden, activation_scale
+    return mx_act_quant_routed_scales(
+        hidden, fmt, scale_group, ue8m0_as_uint8(gate_up_scale).dtype, scatter_idx, expert_start,
+        normalize_global_scale(global_scale, expert_start.numel() - 1),
+    )
+
+
 def moe_fused_grouped(
     hidden_states: torch.Tensor,  # (T, H)
     top_k_index: torch.Tensor,  # (T, K) int
@@ -370,14 +390,17 @@ def moe_fused_grouped(
     )
 
     # Phase 1: gate_up + SiLU + requant in the block format -> expert-ordered quantized
-    # intermediate (the op quantizes the raw hidden itself and owns the expand-vs-gather
-    # regime policy — this forward is pure sequencing). scatter_idx=None: the down reads
-    # the intermediate in place. (C, Cs) under a requant format; a bare Tensor otherwise.
+    # intermediate. scatter_idx=None: the down reads the intermediate in place. (C, Cs) under a
+    # requant format; a bare Tensor otherwise.
     static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
+    gate_up_in, gate_up_in_scale = _gate_up_activations(
+        hidden_states, fmt, gate_up_proj_scale_inv, gate_up_proj_input_global_scale,
+        gate_up_proj_activation_scale, scatter_idx, expert_start,
+    )
     gate_up_out = matmul_grouped(
-        hidden_states,
+        gate_up_in,
         gate_up_proj,
-        As=gate_up_proj_activation_scale,
+        As=gate_up_in_scale,
         Bs=gate_up_proj_scale_inv,
         a_global_scale=gate_up_proj_input_global_scale,
         b_global_scale=gate_up_proj_weight_global_scale,
@@ -603,10 +626,14 @@ def moe_unfused_grouped(
     )
 
     # gate_up as a plain GEMM (no gate epilogue) over gathered hidden -> expert-ordered (S, 2I).
+    gate_up_in, gate_up_in_scale = _gate_up_activations(
+        hidden_states, fmt, gate_up_proj_scale_inv, gate_up_proj_input_global_scale,
+        gate_up_proj_activation_scale, scatter_idx, expert_start,
+    )
     gate_up_out = matmul_grouped(
-        hidden_states,
+        gate_up_in,
         gate_up_proj,
-        As=gate_up_proj_activation_scale,
+        As=gate_up_in_scale,
         Bs=gate_up_proj_scale_inv,
         a_global_scale=gate_up_proj_input_global_scale,
         b_global_scale=gate_up_proj_weight_global_scale,

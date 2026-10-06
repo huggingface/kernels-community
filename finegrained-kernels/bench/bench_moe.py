@@ -147,8 +147,10 @@ _MX_WEIGHTS = {"mxfp8", "mxfp8_u8", "mxfp4", "nvfp4"}
 def _can_preswizzle(cfg):
     # Deployment feeds ONE pre-swizzled checkpoint to both prefill (grouped) and decode (batched):
     # the interleaved gate|up + non-gate swizzle round-trips bit-exact on every fused op. Only MX
-    # weights on 128-aligned dims swizzle (the descriptor reads whole 128-row blocks).
-    return (PRESWIZZLE and cfg["weights"] in _MX_WEIGHTS
+    # weights on 128-aligned dims swizzle (the descriptor reads whole 128-row blocks), and only on
+    # CUDA — SWIZZLE_32_4_4 is the tcgen05 layout, so elsewhere the arms take their affine path.
+    return (PRESWIZZLE and torch.accelerator.current_accelerator().type == "cuda"
+            and cfg["weights"] in _MX_WEIGHTS
             and cfg["H"] % 128 == 0 and cfg["I"] % 128 == 0)
 
 
@@ -335,7 +337,13 @@ if not (MOCK or REPLOT):
     triton_kernels_hub = get_kernel("kernels-community/gpt-oss-triton-kernels", version=1, trust_remote_code=TRUSTED)
     _tfmx.triton_kernels_hub = triton_kernels_hub
 
-DEV = "cuda"
+DEVICE = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+if DEVICE not in ("cuda", "xpu"):
+    raise RuntimeError(f"unsupported accelerator {DEVICE!r}; this benchmark needs cuda or xpu")
+# Only the device-visibility knob for the sharded runner is backend-specific; every other
+# accelerator call goes through torch.accelerator.
+DEVICE_MASK_ENV = {"cuda": "CUDA_VISIBLE_DEVICES", "xpu": "ZE_AFFINITY_MASK"}[DEVICE]
+ACCELERATOR = torch.get_device_module(DEVICE)
 DECODE_TOKENS = 1
 PREFILL_TOKENS = 256 if SMOKE else 8192
 
@@ -344,7 +352,22 @@ PREFILL_TOKENS = 256 if SMOKE else 8192
 # support first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last.
 CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2", "Mistral-4"]
 
-MOE_PROBLEMS = {
+# Low-VRAM parts run the same recipes and baselines at /8 experts, /2 dims, INSTEAD OF the
+# full roster rather than alongside it. Selected off the device, not a knob, so a small part
+# can't silently be benched on the full roster (or vice versa).
+#
+# The threshold is set by the largest row's BUILD peak, not by its steady-state footprint:
+# build() materializes the pre-quant weights in fp32, and the E256 H4096 I2048 gate_up grid
+# alone is 256 * 2I * H * 4B = 17.2 GiB, with the quantize step live at roughly twice that
+# before the fp32 copy is freed. 64 GiB keeps a margin over that peak and puts every 32/48 GiB
+# part on the small roster while 80 GiB+ datacenter parts (where these kernels are tested)
+# keep the full one.
+FULL_ROSTER_MIN_VRAM = 64 * 1024**3
+_TOTAL_VRAM = ACCELERATOR.get_device_properties(0).total_memory
+SMALL_GEOMETRY = _TOTAL_VRAM < FULL_ROSTER_MIN_VRAM
+
+
+FULL_MOE_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E256 H4096 I2048 top6)": dict(
         # config.json: fp8 e4m3, scale_fmt ue8m0, weight_block_size [128,128], dynamic acts.
         # Same expert geometry as the MXFP4 V4 row below — the difference is the deployed
@@ -408,7 +431,7 @@ MOE_PROBLEMS = {
     ),
 }
 # the same base-model roster, run as if dequantized to BF16 (one shape per model)
-BF16_PROBLEMS = {
+FULL_BF16_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6)": dict(
         E=256, H=4096, I=2048, top_k=6, weights="bf16", activation_format=None,
         baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
@@ -440,6 +463,82 @@ BF16_PROBLEMS = {
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
     ),
 }
+# Every row above at /8 experts and /2 dims: same weight format, same baselines,
+# same activation. Only the geometry shrinks, so a low-VRAM part can cover most of the recipes.
+SMALL_MOE_PROBLEMS = {
+    "deepseek-ai/DeepSeek-V4-Base FP8 block-dyn W8A8 ue8m0 (E32 H2048 I1024 top6)": dict(
+        E=32, H=2048, I=1024, top_k=6, weights="fp8_128x128_ue8m0", activation_format=None,
+        baselines=("finegrained-fp8", "deepgemm", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "deepseek-ai/DeepSeek-V4 MXFP4 W4A8 (E32 H2048 I1024 top6)": dict(
+        E=32, H=2048, I=1024, top_k=6, weights="mxfp4", activation_format="mxfp8",
+        baselines=("finegrained-fp8", "deepgemm", "trtllm"), fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    # H/I stay at full size: 2880/2 = 1440 is not a multiple of any BLOCK_SIZE_K in the BF16
+    # autotune grid, so halving them takes the row out of the kernel's legal K set entirely.
+    # Only the expert count shrinks here.
+    "openai/GPT-OSS-120B MXFP4 W4A16 (E16 H2880 I2880 top4)": dict(
+        E=16, H=2880, I=2880, top_k=4, weights="mxfp4", activation_format="bf16",
+        baselines=("trtllm",), fused_extra=("triton_kernels",), fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
+    ),
+    # No NVFP4 row: the format's scales are the SWIZZLE_32_4_4 tcgen05 layout, so it is a
+    # CUDA-only path — a small-geometry stand-in would only ever record a crash. GLM-5.2 stays
+    # covered here through its BF16 row.
+    "deepseek-ai/DeepSeek-V3 FP8 block-dyn W8A8 fp32 (E32 H3584 I1024 top8)": dict(
+        E=32, H=3584, I=1024, top_k=8, weights="fp8_128x128", activation_format=None,
+        baselines=("finegrained-fp8", "vllm", "trtllm"), fp8_block=[128, 128], block_size=(128, 128),
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "MiniMaxAI/MiniMax-M3 MXFP8 (E16 H3072 I1536 top4)": dict(
+        E=16, H=3072, I=1536, top_k=4, weights="mxfp8", activation_format=None,
+        baselines=("finegrained-fp8",), fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
+    ),
+}
+SMALL_BF16_PROBLEMS = {
+    "deepseek-ai/DeepSeek-V4 BF16 (E32 H2048 I1024 top6)": dict(
+        E=32, H=2048, I=1024, top_k=6, weights="bf16", activation_format=None,
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
+        fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "openai/GPT-OSS-120B BF16 (E16 H2880 I2880 top4)": dict(
+        E=16, H=2880, I=2880, top_k=4, weights="bf16", activation_format=None,
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
+        fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
+    ),
+    "zai-org/GLM-5.2 BF16 (E32 H3072 I1024 top8)": dict(
+        E=32, H=3072, I=1024, top_k=8, weights="bf16", activation_format=None,
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
+        fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "deepseek-ai/DeepSeek-V3 BF16 (E32 H3584 I1024 top8)": dict(
+        E=32, H=3584, I=1024, top_k=8, weights="bf16", activation_format=None,
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
+        fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=None, swiglu_limit=None,
+    ),
+    "MiniMaxAI/MiniMax-M3 BF16 (E16 H3072 I1536 top4)": dict(
+        E=16, H=3072, I=1536, top_k=4, weights="bf16", activation_format=None,
+        baselines=("transformers", "sonicmoe", "vllm", "deepgemm_bf16"),
+        fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
+    ),
+}
+
+MOE_PROBLEMS = SMALL_MOE_PROBLEMS if SMALL_GEOMETRY else FULL_MOE_PROBLEMS
+BF16_PROBLEMS = SMALL_BF16_PROBLEMS if SMALL_GEOMETRY else FULL_BF16_PROBLEMS
+# the roster is picked off the device, so say which one ran: the two are not comparable, and a
+# figure carrying the small geometry must not be read as the full roster's numbers
+print(f"[bench] {DEVICE} has {_TOTAL_VRAM / 1024**3:.1f} GiB -> "
+      f"{'small' if SMALL_GEOMETRY else 'full'} roster "
+      f"({len(MOE_PROBLEMS)} quantized + {len(BF16_PROBLEMS)} bf16 rows)")
+
 ATTN_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4 attn FP8 W8A8 ue8m0 qkv-shaped (N=12288 K=4096)": dict(
         # DeepSeek-V4's attention deploys block-FP8 W8A8 with UE8M0 (power-of-two) scales
@@ -543,7 +642,7 @@ def build(cfg):
     E, H, inter = cfg["E"], cfg["H"], cfg["I"]
     if cfg["weights"] == "fp8_128x128_ue8m0":
         def make(n, k, e):
-            return (*make_weights(n, k, DEV, [128, 128],
+            return (*make_weights(n, k, DEVICE, [128, 128],
                                   scale_dtype=torch.float8_e8m0fnu, num_experts=e), None)
     else:
         make = WEIGHTS[cfg["weights"]]["make"]
@@ -557,8 +656,8 @@ def build(cfg):
 
 def routing(cfg, tokens):
     torch.manual_seed(0)
-    hidden = torch.randn(tokens, cfg["H"], device=DEV, dtype=torch.bfloat16)
-    logits = torch.randn(tokens, cfg["E"], device=DEV)
+    hidden = torch.randn(tokens, cfg["H"], device=DEVICE, dtype=torch.bfloat16)
+    logits = torch.randn(tokens, cfg["E"], device=DEVICE)
     w, idx = torch.topk(torch.softmax(logits, -1), cfg["top_k"], dim=-1)
     return hidden, idx.to(torch.int32), w, logits
 
@@ -1093,7 +1192,7 @@ def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_
 
     experts = tfmx.Mxfp4GptOssExperts(
         SimpleNamespace(num_local_experts=E, intermediate_size=inter, hidden_size=H,
-                        swiglu_limit=cfg["swiglu_limit"] or 7.0)).to(DEV)
+                        swiglu_limit=cfg["swiglu_limit"] or 7.0)).to(DEVICE)
     # dequantize the SHARED mxfp4 weights to bf16 and re-quantize through their prep: the
     # values are already on the E2M1 grid, so the round-trip is exact and both impls run
     # bit-identical weights (drawing fresh randn here made parity meaningless).
@@ -1109,8 +1208,8 @@ def triton_kernels_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_
         experts._parameters.pop(p, None)
     experts.gate_up_proj, experts.gate_up_proj_precision_config = prep(gu_bf16)
     experts.down_proj, experts.down_proj_precision_config = prep(dn_bf16)
-    experts.gate_up_proj_bias = torch.zeros(E, 2 * inter, device=DEV)
-    experts.down_proj_bias = torch.zeros(E, H, device=DEV)
+    experts.gate_up_proj_bias = torch.zeros(E, 2 * inter, device=DEVICE)
+    experts.down_proj_bias = torch.zeros(E, H, device=DEVICE)
     _mark_static(experts.gate_up_proj_bias, experts.down_proj_bias)
     # sm_first=True = softmax over ALL experts then top-k, matching the bench's routing().
     # Their default top-ks first then softmaxes over the k (weights sum to 1, the GPT-OSS
@@ -1198,15 +1297,15 @@ ARMS = {
 
 
 def _context_poisoned(tag, mode):
-    """Probe the CUDA context right after an arm ran. An async fault — e.g. an out-of-bounds
+    """Probe the accelerator context right after an arm ran. An async fault — e.g. an out-of-bounds
     write that lands in a neighbouring allocation — leaves the context poisoned WITHOUT failing
     the arm that caused it: that arm posts a normal latency and the NEXT arm dies instead. That
     is how one kernel silently blanked 10 cells and dropped a whole problem from a run, with the
     blame landing on an innocent baseline. One tiny launch per (arm, mode) buys the attribution."""
     try:
-        p = torch.empty(64, 64, device=DEV, dtype=torch.float32).normal_()
+        p = torch.empty(64, 64, device=DEVICE, dtype=torch.float32).normal_()
         float(p.sum())
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         return False
     except Exception as e:
         print(f"      !! CONTEXT POISONED by [{tag} {mode}]: {type(e).__name__}: "
@@ -1220,7 +1319,7 @@ def bench_modes(run, tag):
     res, out = {}, None
     try:
         out = run()
-        torch.cuda.synchronize()  # warm + tune before ANY timing/capture
+        torch.accelerator.synchronize()  # warm + tune before ANY timing/capture
         res["eager"] = do_bench(run, return_mode="min") * 1e3
         print(f"      {tag:14s} eager      {res['eager']:9.1f}us", flush=True)
     except Exception as e:
@@ -1237,7 +1336,7 @@ def bench_modes(run, tag):
     try:
         crun = torch.compile(run, mode="max-autotune", fullgraph=True)
         cout = crun()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         # Self-check the compiled graph against THIS arm's own eager output before timing it.
         # The cross-impl parity below is computed from eager only, so without this a compiled
         # graph that drops work (e.g. an out-param matmul DCE'd because its mutation isn't
@@ -1334,7 +1433,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
     N, K, block = cfg["N"], cfg["K"], cfg["block"]
     W_g = None
     if cfg["weights"] == "fp8_128x128_ue8m0":
-        W, Ws = make_weights(N, K, DEV, [128, 128],
+        W, Ws = make_weights(N, K, DEVICE, [128, 128],
                              scale_dtype=torch.float8_e8m0fnu)
     else:
         # registry makers are expert-batched; build E=1 and index the slab off. NVFP4 returns a
@@ -1350,13 +1449,14 @@ def bench_attn_row(row, pname, cfg, rows_out):
     # dense attn weights ship pre-swizzled like the MoE arms, so the 2D op benches the tcgen05
     # fast path (weight-only formats stay affine — no swizzled read)
     Ws_fgm = Ws
-    if PRESWIZZLE and cfg["weights"] in _MX_WEIGHTS and _quantized_acts(cfg) and N % 128 == 0:
+    if (PRESWIZZLE and DEVICE == "cuda" and cfg["weights"] in _MX_WEIGHTS
+            and _quantized_acts(cfg) and N % 128 == 0):
         Ws_fgm = fgm.swizzle_mx_scales(Ws)
     # OpenAI triton_kernels dense mxfp4 matmul (matmul_ogs, no routing): the qkv linear
     # in the GPT-OSS MXFP4 format. Weight is a single (1, K, N) expert, swizzled once
     # at load (same as the fused arm); latency-only (its own weights).
     if "triton_kernels" in cfg["baselines"]:
-        tw_bf = torch.randn(1, K, N, device=DEV, dtype=torch.bfloat16) * 0.05
+        tw_bf = torch.randn(1, K, N, device=DEVICE, dtype=torch.bfloat16) * 0.05
         tw, tws = _tfmx.quantize_to_mxfp4(tw_bf, triton_kernels_hub)
         tw, tws = _tfmx.swizzle_mxfp4(tw, tws, triton_kernels_hub)
         tk_pc = triton_kernels_hub.matmul_ogs.PrecisionConfig(
@@ -1382,7 +1482,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
 
         nvfp4_row = cfg["weights"] == "nvfp4"
         FP4 = getattr(torch, "float4_e2m1fn_x2", None)
-        one = torch.ones(1, device=DEV, dtype=torch.float32)
+        one = torch.ones(1, device=DEVICE, dtype=torch.float32)
         if nvfp4_row:
             sb = [to_blocked(Ws.view(torch.uint8)).view(torch.float8_e4m3fn),
                   (W_g if W_g is not None else one).reshape(1)]
@@ -1427,7 +1527,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
     for regime, tokens in (("decode", DECODE_TOKENS), ("prefill", PREFILL_TOKENS)):
         print(f"   -- {regime}")
         torch.manual_seed(0)
-        x = torch.randn(tokens, K, device=DEV, dtype=torch.bfloat16)
+        x = torch.randn(tokens, K, device=DEVICE, dtype=torch.bfloat16)
         # a STATIC row's calibrated activation scale replaces the inline quant: one value, since a
         # dense module is one quantized module (the MoE's per-expert form has no dense analogue)
         attn_act_scale = (
@@ -1484,7 +1584,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
     print()
 
 
-device_name = "MOCK (random values)" if MOCK else torch.cuda.get_device_name(0)
+device_name = "MOCK (random values)" if MOCK else ACCELERATOR.get_device_name(0)
 print(f"device: {device_name}  torch {torch.__version__}"
       f"{'  [SMOKE]' if SMOKE else ''}")
 print("finegrained-kernels = local build; baselines: finegrained-fp8 (upstream), DeepGEMM, "
@@ -1655,7 +1755,7 @@ elif GPUS > 1 and _SHARD is None and not MOCK:
     worker_flags = (["--smoke"] if SMOKE else []) + ([] if PRESWIZZLE else ["--no-preswizzle"])
     procs = [subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--gpus", "1", *worker_flags, *FILTERS],
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": devices[g] if devices else str(g),
+        env={**os.environ, DEVICE_MASK_ENV: devices[g] if devices else str(g),
              "BENCH_SHARD": f"{g}/{GPUS}"}) for g in range(GPUS)]
     nfail = sum(p.wait() != 0 for p in procs)
     missing = [g for g, sp in enumerate(shard_paths) if not os.path.exists(sp)]

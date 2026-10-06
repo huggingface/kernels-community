@@ -21,16 +21,15 @@ import torch
 from finegrained_kernels.compat import (  # type: ignore
     MX_SCALE_GROUP_K,
     NVFP4_SCALE_GROUP_K,
+    is_sm10x,
 )
 
 
 # ── Device + capability ───────────────────────────────────────────────────────
 
 TEST_DEVICE = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "xpu"
-    if hasattr(torch, "xpu") and torch.xpu.is_available()
+    torch.accelerator.current_accelerator().type
+    if torch.accelerator.is_available()
     else None
 )
 # FP8 kernels require Hopper (SM90) or newer on CUDA. SM89 (Ada Lovelace) can
@@ -47,6 +46,11 @@ SUPPORTS_FP8 = TEST_DEVICE == "xpu" or (
 # SM90 (Hopper, e.g. H100) is the only architecture the benchmark baselines
 # are calibrated against — every other SM has its own latency profile.
 IS_SM90 = TEST_DEVICE == "cuda" and torch.cuda.get_device_capability() == (9, 0)
+# The SWIZZLE_32_4_4 scale layout exists to feed tcgen05, so the ops only grow a
+# swizzled arm where that instruction is: sm_10x. Elsewhere the scales stay row-major
+# (affine) and the pre-swizzled variants of each problem are skipped rather than run
+# unswizzled.
+SUPPORTS_SWIZZLED_SCALES = is_sm10x()
 DTYPE_TAG = {
     torch.bfloat16: "bf16",
     torch.float16: "fp16",
@@ -59,14 +63,6 @@ DTYPE_TO_TOL = {
 }
 
 
-def accelerator_module():
-    if TEST_DEVICE == "cuda":
-        return torch.cuda
-    if TEST_DEVICE == "xpu":
-        return torch.xpu
-    raise RuntimeError("No supported accelerator available")
-
-
 def maybe_compile(fn, enabled):
     """Wrap ``fn`` in ``torch.compile`` (max-autotune, fullgraph) when ``enabled``,
     resetting the compiler and clearing the allocator cache first; otherwise return
@@ -74,7 +70,7 @@ def maybe_compile(fn, enabled):
     if not enabled:
         return fn
     torch.compiler.reset()
-    accelerator_module().empty_cache()
+    torch.accelerator.empty_cache()
     return torch.compile(fn, mode="max-autotune", fullgraph=True)
 
 
