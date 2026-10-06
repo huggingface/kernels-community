@@ -128,6 +128,90 @@ The `Check Public API` workflow enforces this via
 brand-new cases on its own. The AoT case is not visible from the repo, so bump
 the version there anyway - a bump is never wrong.
 
+## Torch Stable ABI
+
+When converting kernels to the Torch stable ABI, see
+[Torch Stable ABI](https://docs.pytorch.org/docs/main/notes/libtorch_stable_abi.html)
+for a general overview of the ABI. This section gives more details on how
+the stable ABI works in kernel-builder.
+
+### Converting existing kernels
+
+Keep changes to vendored upstream code minimal and line-for-line; avoid new
+abstractions. The goal is to make it straightforward to sync new versions
+from upstream.
+
+### Enabling the stable ABI for a backend
+
+The stable ABI is enabled per backend in `build.toml` in the `torch.stable-abi`
+section. For example:
+
+```toml
+[torch.stable-abi]
+cuda = "2.10"
+xpu = "2.13"
+```
+
+We aim to target 2.10 as the lowest Torch stable ABI version. However, in some
+cases this is not possible, because only newer versions might provide an API that
+is needed for a backend. So, always aim for the lowest possible version for a
+backend (with 2.10 as the lower bound).
+
+The following versions are built through a bundle build (`nix build .#bundle`
+or `nix build .#backendBundle.<backend>`), given a stable ABI version `n.m`:
+
+- Only a single stable ABI version will be built for each Torch >= `n.m`. Note
+  there may still be multiple builds for different backend versions (e.g. CUDA 12.6,
+  13.0, and 13.2).
+- For each supported version < `n.m` a non-stable ABI build variant will be made.
+
+For example, given the TOML above, the outputs could be:
+
+```
+torch210-xpu20253-x86_64-linux
+torch211-xpu20253-x86_64-linux
+torch212-xpu20253-x86_64-linux
+torch-stable-abi213-xpu20260-x86_64-linux
+torch-stable-abi213-xpu20261-x86_64-linux
+torch-stable-abi210-cu126-x86_64-linux
+torch-stable-abi210-cu130-x86_64-linux
+torch-stable-abi210-cu132-x86_64-linux
+```
+
+### Handling non-stable ABI versions
+
+Given the example in the previous section, for XPU it would still be possible
+to use stable ABI functions for functions that are available in e.g. Torch 2.10.
+For functions that are not available in the stable ABI for these older versions,
+it is typically best to use conditional compilation. For instance, getting the XPU SYCL
+queue through `getCurrentStream(...).nativeHandle()` is only available since
+Torch 2.13. Guard such code on `TORCH_FEATURE_VERSION`, which is the stable
+ABI target in stable-ABI builds and the Torch version otherwise:
+
+```cpp
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_13_0
+inline sycl::queue &current_queue(const Tensor &t) {
+  void *handle =
+      torch::stable::accelerator::getCurrentStream(t.get_device_index())
+          .nativeHandle();
+  STD_TORCH_CHECK(handle != nullptr, "could not get the current XPU queue");
+  return *static_cast<sycl::queue *>(handle);
+}
+#else
+inline sycl::queue &current_queue(const Tensor &t) {
+  return c10::xpu::getCurrentXPUStream(t.get_device_index()).queue();
+}
+#endif
+```
+
+Use `#ifdef TORCH_TARGET_VERSION` only to distinguish stable-ABI builds from
+non-stable builds, e.g. for op registration.
+
+### Reference conversions
+
+`activation`, `causal-conv1d` (CUDA and XPU), `cv-utils`,
+`paged-attention` (stable CUDA/ROCm next to non-stable Metal).
+
 # Kernel-specific instructions
 
 ## flash-attn3
