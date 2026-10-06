@@ -10,7 +10,7 @@ import pytest
 from einops import rearrange, repeat
 
 
-mamba_ssm = kernels.get_kernel("kernels-community/fla", version=3)
+mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=3)
 
 chunk_state = mamba_ssm.ops.triton.ssd_chunk_state.chunk_state
 _chunk_cumsum_fwd = mamba_ssm.ops.triton.ssd_chunk_state._chunk_cumsum_fwd

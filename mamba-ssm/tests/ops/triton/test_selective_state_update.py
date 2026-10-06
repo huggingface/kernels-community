@@ -11,7 +11,7 @@ import pytest
 from einops import rearrange, repeat
 
 
-mamba_ssm = kernels.get_kernel("kernels-community/fla", version=3)
+mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=3)
 
 selective_state_update = mamba_ssm.ops.triton.selective_state_update.selective_state_update
 selective_state_update_ref = mamba_ssm.ops.triton.selective_state_update.selective_state_update_ref

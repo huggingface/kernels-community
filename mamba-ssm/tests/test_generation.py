@@ -8,7 +8,7 @@ import pytest
 from einops import rearrange, repeat
 
 
-mamba_ssm = kernels.get_kernel("kernels-community/fla", version=3)
+mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=3)
 
 MambaLMHeadModel = mamba_ssm.models.mixer_seq_simple.MambaLMHeadModel
 MambaConfig = mamba_ssm.models.config_mamba.MambaConfig
