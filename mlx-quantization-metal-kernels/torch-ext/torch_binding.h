@@ -1,59 +1,15 @@
 #pragma once
 
-#include <ATen/ATen.h>
+#include <torch/torch.h>
 
-// ============================================================================
-// FP-quantized (MXFP4) operations — defined in fp_quantized.mm
-// ============================================================================
+#include <string>
 
-// Matrix-matrix multiply, non-transposed weight: y = x @ dequant(w)
-// x: [..., M, K], w: [K_packed, N] (uint32), y: [..., M, N]
-at::Tensor mxfp4_qmm_n(
-    at::Tensor x,
-    at::Tensor w,
-    at::Tensor scales,
-    int64_t output_features);
+// y = x @ dequantize(w, scales, biases).T, MLX's `quantized_matmul(..., transpose=True)` in affine
+// mode. `x` is [..., K] (float32/float16/bfloat16), `w` is [N, K * bits / 32] uint32, `scales` and
+// `biases` are [N, K / group_size] in x's dtype. Returns [..., N]. Picks the kernel the way MLX does.
+at::Tensor affine_qmm_t(const at::Tensor &x, const at::Tensor &w, const at::Tensor &scales,
+                        const at::Tensor &biases, int64_t group_size, int64_t bits);
 
-// Matrix-vector multiply: y = dequant(w) @ x
-// x: [..., K], w: [N, K_packed] (uint32), y: [..., N]
-at::Tensor mxfp4_qmv(
-    at::Tensor x,
-    at::Tensor w,
-    at::Tensor scales,
-    int64_t output_features);
-
-// ============================================================================
-// Affine quantized operations — defined in quantized.mm
-// ============================================================================
-
-// Matrix-vector multiply
-at::Tensor affine_qmv(
-    at::Tensor x,
-    at::Tensor w,
-    at::Tensor scales,
-    at::Tensor biases,
-    int64_t group_size,
-    int64_t bits,
-    int64_t output_features);
-
-// Matrix-matrix multiply, transposed weight: y = x @ dequant(w).T
-// x: [..., M, K], w: [N, K_packed], y: [..., M, N]
-at::Tensor affine_qmm_t(
-    at::Tensor x,
-    at::Tensor w,
-    at::Tensor scales,
-    at::Tensor biases,
-    int64_t group_size,
-    int64_t bits);
-
-// Matrix-matrix multiply, non-transposed weight: y = x @ dequant(w)
-// x: [..., M, K], w: [K_packed, N], y: [..., M, N]
-at::Tensor affine_qmm_n(
-    at::Tensor x,
-    at::Tensor w,
-    at::Tensor scales,
-    at::Tensor biases,
-    int64_t group_size,
-    int64_t bits,
-    int64_t output_features);
-
+// The kernel `affine_qmm_t` would launch for an [M, K] x [N, K] product on this GPU, by name.
+std::string kernel_for(int64_t M, int64_t N, int64_t K, int64_t group_size, int64_t bits,
+                       at::ScalarType dtype);

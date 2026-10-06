@@ -1,75 +1,45 @@
-# quantization-mlx
+# mlx-quantization-metal-kernels
 
-Metal quantization kernels for Apple Silicon, ported from [MLX](https://github.com/ml-explore/mlx) and wrapped as a PyTorch extension via [kernel-builder](https://github.com/huggingface/kernel-builder).
+MLX's affine quantized matmul kernels for torch tensors on Apple Silicon (MPS).
 
-## Features
-
-- **Affine quantized** matmul/matvec (2/3/4/5/6/8-bit with per-group scales + biases)
-- **FP-quantized** matmul/matvec (MXFP4/MXFP8 with FP8 scales)
-- **NAX GEMM** variants using MetalPerformancePrimitives for M-series GPUs
-- Supports `float32`, `float16`, and `bfloat16`
-
-## Building
-
-```bash
-nix build
-```
-
-Or with kernel-builder directly:
-
-```bash
-pip install kernel-builder
-kernel-builder build .
-```
-
-## Operations
-
-### FP-quantized (MXFP4)
-
-| Function | Description |
-|---|---|
-| `mxfp4_qmm_n(x, w, scales, output_features)` | Matrix-matrix, non-transposed weight |
-| `mxfp4_qmv(x, w, scales, output_features)` | Matrix-vector |
-
-### Affine quantized (scales + biases)
-
-| Function | Description |
-|---|---|
-| `affine_qmm_t(x, w, scales, biases, group_size, bits)` | Matrix-matrix, transposed weight |
-| `affine_qmm_n(x, w, scales, biases, output_features, group_size, bits)` | Matrix-matrix, non-transposed weight |
-| `affine_qmv(x, w, scales, biases, output_features, group_size, bits)` | Matrix-vector |
-
-### NAX variants (MetalPerformancePrimitives)
-
-| Function | Description |
-|---|---|
-| `affine_qmm_t_nax(x, w, scales, biases, group_size, bits)` | NAX transposed matmul |
-| `affine_qmm_n_nax(x, w, scales, biases, output_features, group_size, bits)` | NAX non-transposed matmul |
-| `affine_gather_qmm_rhs_nax(x, w, scales, biases, indices, output_features, ...)` | NAX gather + matmul |
-
-## Usage
+The Metal kernels are [MLX](https://github.com/ml-explore/mlx)'s own, vendored at a pinned release
+(`vendor/UPSTREAM`) and compiled as they ship. The host-side dispatch in `mlx_metal/mlx_dispatch.mm`
+transcribes MLX's `QuantizedMatmul::eval_gpu`, so a given shape runs the kernel it would under
+`mlx.core.quantized_matmul`: matrix-vector kernels (`qmv_fast`, `qmv`, `qmv_quad`, `qmv_wide`) for
+decode-sized inputs, and split-K or tiled `qmm_t` above MLX's per-GPU crossover.
 
 ```python
-import torch
-import quantization_mlx
+from kernels import get_kernel
 
-# Affine 4-bit quantized matmul (transposed weight)
-x = torch.randn(1, 32, 4096, dtype=torch.float16, device="mps")
-w = torch.randint(0, 255, (4096, 512), dtype=torch.int32, device="mps")  # [N, K_packed]
-scales = torch.randn(4096, 4096 // 128, dtype=torch.float16, device="mps")
-biases = torch.zeros(4096, 4096 // 128, dtype=torch.float16, device="mps")
+mq = get_kernel("kernels-community/mlx-quantization-metal-kernels", version=1)
 
-y = quantization_mlx.affine_qmm_t(x, w, scales, biases, group_size=128, bits=4)
-# y shape: [1, 32, 4096]
+# x: [..., K] float32/float16/bfloat16
+# w: [N, K * bits / 32] uint32, scales/biases: [N, K / group_size] in x's dtype (MLX's layout)
+y = mq.affine_qmm_t(x, w, scales, biases, group_size=64, bits=4)  # [..., N]
 ```
 
-## Weight layout conventions
+`affine_qmm_t` is the only API: it is what transformers' `MetalConfig` uses.
 
-- **Transposed (`qmm_t`)**: `w = [N, K_packed]` — N (output features) is the first dimension, K is packed
-- **Non-transposed (`qmm_n`)**: `w = [K_packed, N_packed]` — both dims may be packed; pass `output_features` explicitly
-- **Matvec (`qmv`)**: `w = [N, K_packed]` — same as transposed layout
+`group_size` is 32, 64 or 128; `bits` is 2, 3, 4, 5, 6 or 8. Results match `mx.quantized_matmul`
+bit for bit, except on the split-K path, where the partial products are summed in float32 rather
+than in the output dtype.
 
-Packing for affine quantized (uint32 storage):
-- 4-bit: `pack_factor = 8`, so `K_packed = K // 8`
-- 8-bit: `pack_factor = 4`, so `K_packed = K // 4`
-- 2-bit: `pack_factor = 16`, so `K_packed = K // 16`
+Not covered: the fp modes (mxfp4/nvfp4/mxfp8), batched weights, gather (MoE) matmuls, and MLX's NAX
+path for M5-class GPUs, which needs Metal 4 features the builder does not enable.
+
+## Updating MLX
+
+```bash
+python vendor.py --rev v0.32.3   # clones MLX next to this file if --src is not given
+python -m pytest tests/test_vendor_drift.py
+```
+
+`test_vendor_drift.py` needs no GPU. It fails when upstream changes something the dispatch
+transcribes -- a helper, a threshold, a grid, a kernel name or a buffer index -- and says which.
+
+## Building and testing
+
+```bash
+nix run .#build-and-copy -L
+python -m pytest tests   # needs MPS; parity tests against MLX need `pip install mlx==<pinned version>`
+```

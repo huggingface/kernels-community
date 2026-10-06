@@ -1,62 +1,20 @@
-from typing import Optional
+"""MLX's quantized matmul kernels, for torch tensors on MPS.
+
+The Metal kernels are MLX's own, compiled as they ship; `vendor/UPSTREAM` pins the revision. The
+host-side dispatch transcribes MLX's `QuantizedMatmul::eval_gpu`, so a given shape runs the same
+kernel it would under `mlx.core.quantized_matmul`.
+
+The weight layout is MLX's affine one, the same `mx.quantize` produces: `w` packs `bits`-wide values
+little-endian into uint32, and each `group_size` run of a row shares a scale and a bias, so
+`w_float = scale * q + bias`.
+"""
 
 import torch
 
 from ._ops import ops
 
 
-# =============================================================================
-# FP-quantized (MXFP4) operations
-# =============================================================================
-
-
-def mxfp4_qmm_n(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    scales: torch.Tensor,
-    output_features: int,
-) -> torch.Tensor:
-    """Matrix-matrix multiply with MXFP4 quantized non-transposed weight.
-
-    Computes y = x @ dequantize(w, scales).
-    x: [..., M, K], w: [K_packed, N_packed] (uint32), y: [..., M, output_features]
-    """
-    return ops.mxfp4_qmm_n(x, w, scales, output_features)
-
-
-def mxfp4_qmv(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    scales: torch.Tensor,
-    output_features: int,
-) -> torch.Tensor:
-    """Matrix-vector multiply with MXFP4 quantized weight.
-
-    Computes y = dequantize(w, scales) @ x.
-    x: [..., K], w: [N, K_packed] (uint32), y: [..., output_features]
-    """
-    return ops.mxfp4_qmv(x, w, scales, output_features)
-
-
-# =============================================================================
-# Affine quantized operations (scales + biases)
-# =============================================================================
-
-
-def affine_qmv(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    scales: torch.Tensor,
-    biases: torch.Tensor,
-    output_features: int,
-    group_size: int = 128,
-    bits: int = 4,
-) -> torch.Tensor:
-    """Matrix-vector multiply with affine quantized weight.
-
-    x: [..., K], w: [N, K_packed], y: [..., output_features]
-    """
-    return ops.affine_qmv(x, w, scales, biases, group_size, bits, output_features)
+__all__ = ["affine_qmm_t"]
 
 
 def affine_qmm_t(
@@ -64,99 +22,17 @@ def affine_qmm_t(
     w: torch.Tensor,
     scales: torch.Tensor,
     biases: torch.Tensor,
-    group_size: int = 128,
+    group_size: int = 64,
     bits: int = 4,
 ) -> torch.Tensor:
-    """Matrix-matrix multiply with affine quantized transposed weight.
+    """`x @ dequantize(w, scales, biases).T`, i.e. a quantized `nn.Linear` without its bias.
 
-    Computes y = x @ dequantize(w, scales, biases).T
-    x: [..., M, K], w: [N, K_packed], y: [..., M, N]
-    N is inferred from w.size(0).
+    x: [..., K] float32/float16/bfloat16, w: [N, K * bits / 32] uint32,
+    scales/biases: [N, K / group_size] in x's dtype. Returns [..., N].
+
+    group_size is 32, 64 or 128; bits is 2, 3, 4, 5, 6 or 8. A few rows (decode) run a
+    matrix-vector kernel and many rows (prefill) a tiled matmul, with the crossover MLX uses for
+    this GPU.
     """
     return ops.affine_qmm_t(x, w, scales, biases, group_size, bits)
 
-
-def affine_qmm_n(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    scales: torch.Tensor,
-    biases: torch.Tensor,
-    output_features: int,
-    group_size: int = 128,
-    bits: int = 4,
-) -> torch.Tensor:
-    """Matrix-matrix multiply with affine quantized non-transposed weight.
-
-    Computes y = x @ dequantize(w, scales, biases)
-    x: [..., M, K], w: [K_packed, N_packed], y: [..., M, output_features]
-    """
-    return ops.affine_qmm_n(x, w, scales, biases, group_size, bits, output_features)
-
-
-# =============================================================================
-# Affine quantized NAX operations (MetalPerformancePrimitives accelerated)
-# =============================================================================
-
-
-def affine_qmm_t_nax(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    scales: torch.Tensor,
-    biases: torch.Tensor,
-    group_size: int = 128,
-    bits: int = 4,
-) -> torch.Tensor:
-    """NAX-accelerated matrix-matrix multiply with transposed quantized weight.
-
-    x: [..., M, K], w: [N, K_packed], y: [..., M, N]
-    """
-    return ops.affine_qmm_t_nax(x, w, scales, biases, group_size, bits)
-
-
-def affine_qmm_n_nax(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    scales: torch.Tensor,
-    biases: torch.Tensor,
-    output_features: int,
-    group_size: int = 128,
-    bits: int = 4,
-) -> torch.Tensor:
-    """NAX-accelerated matrix-matrix multiply with non-transposed quantized weight.
-
-    x: [..., M, K], w: [K_packed, N_packed], y: [..., M, output_features]
-    """
-    return ops.affine_qmm_n_nax(x, w, scales, biases, group_size, bits, output_features)
-
-
-def affine_gather_qmm_rhs_nax(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    scales: torch.Tensor,
-    biases: torch.Tensor,
-    indices: torch.Tensor,
-    output_features: int,
-    group_size: int = 128,
-    bits: int = 4,
-    transpose: bool = True,
-) -> torch.Tensor:
-    """NAX-accelerated gather + matrix-matrix multiply.
-
-    Gathers weight rows using indices, then computes matmul.
-    x: [M, K], w: [num_experts, ...], indices: [M], y: [M, output_features]
-    """
-    return ops.affine_gather_qmm_rhs_nax(
-        x, w, scales, biases, indices, group_size, bits, output_features, transpose
-    )
-
-
-__all__ = [
-    "mxfp4_qmm_n",
-    "mxfp4_qmv",
-    "affine_qmv",
-    "affine_qmm_t",
-    "affine_qmm_n",
-    "affine_qmm_t_nax",
-    "affine_qmm_n_nax",
-    "affine_gather_qmm_rhs_nax",
-]

@@ -4,27 +4,12 @@
 #include "torch_binding.h"
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
-  // FP-quantized (MXFP4) operations
-  ops.def("mxfp4_qmm_n(Tensor x, Tensor w, Tensor scales, int output_features) -> Tensor");
-  ops.def("mxfp4_qmv(Tensor x, Tensor w, Tensor scales, int output_features) -> Tensor");
-
-  // Affine quantized operations
-  ops.def("affine_qmv(Tensor x, Tensor w, Tensor scales, Tensor biases, int group_size, int bits, int output_features) -> Tensor");
   ops.def("affine_qmm_t(Tensor x, Tensor w, Tensor scales, Tensor biases, int group_size, int bits) -> Tensor");
-  ops.def("affine_qmm_n(Tensor x, Tensor w, Tensor scales, Tensor biases, int group_size, int bits, int output_features) -> Tensor");
-
-}
-
-TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, MPS, ops) {
-  // FP-quantized (MXFP4)
-  ops.impl("mxfp4_qmm_n", mxfp4_qmm_n);
-  ops.impl("mxfp4_qmv", mxfp4_qmv);
-
-  // Affine quantized
-  ops.impl("affine_qmv", affine_qmv);
-  ops.impl("affine_qmm_t", affine_qmm_t);
-  ops.impl("affine_qmm_n", affine_qmm_n);
-
+  ops.impl("affine_qmm_t", torch::kMPS, &affine_qmm_t);
+  // Not part of the Python API: the tests use it (through `_ops`) to check which kernel the
+  // dispatch picks. Takes no tensor, so it is registered as a catch-all.
+  ops.def("kernel_for(int M, int N, int K, int group_size, int bits, ScalarType dtype) -> str");
+  ops.impl("kernel_for", &kernel_for);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
