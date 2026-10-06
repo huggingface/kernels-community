@@ -273,6 +273,121 @@ void set(id<MTLComputeCommandEncoder> enc, const at::Tensor &t, int index) {
          atIndex:index];
 }
 
+// ---------------------------------------------------------------------------------------------------
+// Split-K's sum: upstream's strided_reduce_general_dispatch (reduce.cpp), as qmm_splitk calls it.
+//
+// That call reduces axis 0 of a row-contiguous [split_k, M, N] intermediate, for which upstream's
+// ColReduceArgs comes out as reduction_size = split_k, reduction_stride = M * N, no outer dims
+// (ndim 0) and non_col_reductions 1; each kernel then appends (reduction_size, reduction_stride) as
+// its single reduce dim. output_grid_for_col_reduce is (1, 1, 1): every output stride is below
+// M * N. Sum keeps the input dtype (remap_reduce_types), so fp16 partials are summed in fp16.
+// ---------------------------------------------------------------------------------------------------
+
+enum class Reduce { Small, Looped, TwoPass };
+
+struct ReducePlan {
+  Reduce kind;
+  bool large;  // in.size() > INT32_MAX selects the int64-indexed instantiations
+};
+
+ReducePlan reduce_plan(int64_t split_k, int64_t MN) {
+  const size_t total = split_k;  // reduction_size * non_col_reductions
+  if (total < 32) return {Reduce::Small, split_k * MN > INT32_MAX};
+  TORCH_CHECK(!(MN < 32 && total >= 1024),
+              "mlx-quantization-metal-kernels: split_k=", split_k, " with M*N=", MN,
+              " needs upstream's col_reduce_longcolumn, which is not transcribed");
+  if (total > 256 && MN / 32 < 1024) return {Reduce::TwoPass, split_k * MN > INT32_MAX};
+  return {Reduce::Looped, split_k * MN > INT32_MAX};
+}
+
+// Upstream's type_to_name, for the reduce kernels' names.
+std::string reduce_type_name(at::ScalarType t) {
+  switch (t) {
+    case at::kFloat: return "float32";
+    case at::kHalf: return "float16";
+    case at::kBFloat16: return "bfloat16";
+    default: TORCH_CHECK(false, "mlx-quantization-metal-kernels: unsupported dtype ", t);
+  }
+}
+
+std::string reduce_kernel_name(const char *func, bool large, const char *tile, at::ScalarType t) {
+  return std::string(func) + (large ? "_large" : "") + "_1" + tile + "_reduce_sum" + reduce_type_name(t);
+}
+
+// ColReduceArgs::encode, with the one reduce dim the kernel appended.
+void encode_col_reduce_args(id<MTLComputeCommandEncoder> enc, size_t reduction_size,
+                            int64_t reduction_stride, int reduce_dim, int64_t reduce_dim_stride) {
+  const int zero_i = 0, ndim = 0, reduce_ndim = 1;
+  const int64_t zero_l = 0;
+  const size_t non_col_reductions = 1;
+  [enc setBytes:&reduction_size length:sizeof(size_t) atIndex:2];
+  [enc setBytes:&reduction_stride length:sizeof(int64_t) atIndex:3];
+  [enc setBytes:&zero_i length:sizeof(int) atIndex:4];  // shape: empty, pushed as {0}
+  [enc setBytes:&zero_l length:sizeof(int64_t) atIndex:5];  // strides: empty, pushed as {0}
+  [enc setBytes:&ndim length:sizeof(int) atIndex:6];
+  [enc setBytes:&reduce_dim length:sizeof(int) atIndex:7];
+  [enc setBytes:&reduce_dim_stride length:sizeof(int64_t) atIndex:8];
+  [enc setBytes:&reduce_ndim length:sizeof(int) atIndex:9];
+  [enc setBytes:&non_col_reductions length:sizeof(size_t) atIndex:10];
+}
+
+// Sums `partials` [split_k, M, N] over axis 0 into `out` [M, N]. `scratch` is the [32, M, N]
+// accumulator strided_reduce_2pass allocates, and is only read for that path.
+void encode_split_k_sum(id<MTLComputeCommandEncoder> enc, const ReducePlan &rp,
+                        const at::Tensor &partials, const at::Tensor &out, const at::Tensor &scratch,
+                        int64_t split_k, int64_t MN) {
+  const at::ScalarType t = partials.scalar_type();
+  const int BN = 32;
+  const int threadgroup_size = 8 * 32;
+  switch (rp.kind) {
+    case Reduce::Small: {
+      id<MTLComputePipelineState> pso = pipeline(reduce_kernel_name("col_reduce_small", rp.large, "", t));
+      [enc setComputePipelineState:pso];
+      set(enc, partials, 0);
+      set(enc, out, 1);
+      encode_col_reduce_args(enc, split_k, MN, split_k, MN);
+      const int n_reads = 4;
+      const size_t reduction_stride_blocks = (MN + n_reads - 1) / n_reads;
+      const size_t total = split_k;
+      const size_t threadgroup_x = std::min<size_t>(reduction_stride_blocks, 32);
+      const size_t threadgroup_y =
+          std::min<size_t>(8, std::min<size_t>(pso.maxTotalThreadsPerThreadgroup / threadgroup_x, total));
+      [enc dispatchThreadgroups:MTLSizeMake((reduction_stride_blocks + threadgroup_x - 1) / threadgroup_x, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(threadgroup_x, threadgroup_y, 1)];
+      break;
+    }
+    case Reduce::Looped: {
+      [enc setComputePipelineState:pipeline(reduce_kernel_name("col_reduce_looped", rp.large, "_32_32", t))];
+      set(enc, partials, 0);
+      set(enc, out, 1);
+      encode_col_reduce_args(enc, split_k, MN, split_k, MN);
+      [enc dispatchThreads:MTLSizeMake(threadgroup_size * ((MN + BN - 1) / BN), 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
+      break;
+    }
+    case Reduce::TwoPass: {
+      const int outer_blocks = 32;
+      [enc setComputePipelineState:pipeline(reduce_kernel_name("col_reduce_2pass", rp.large, "_32_32", t))];
+      set(enc, partials, 0);
+      set(enc, scratch, 1);
+      encode_col_reduce_args(enc, split_k, MN, split_k, MN);
+      const size_t out_size = 1;  // out.size() / reduction_stride
+      [enc setBytes:&out_size length:sizeof(size_t) atIndex:11];
+      [enc dispatchThreads:MTLSizeMake(threadgroup_size * ((MN + BN - 1) / BN), outer_blocks, 1)
+          threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
+      // second pass: ColReduceArgs(intermediate), plus the outer_blocks reduce dim
+      const bool large = int64_t(outer_blocks) * MN > INT32_MAX;
+      [enc setComputePipelineState:pipeline(reduce_kernel_name("col_reduce_looped", large, "_32_32", t))];
+      set(enc, scratch, 0);
+      set(enc, out, 1);
+      encode_col_reduce_args(enc, outer_blocks, MN, outer_blocks, MN);
+      [enc dispatchThreads:MTLSizeMake(threadgroup_size * ((MN + BN - 1) / BN), 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(threadgroup_size, 1, 1)];
+      break;
+    }
+  }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------------
@@ -322,8 +437,12 @@ at::Tensor affine_qmm_t(const at::Tensor &x, const at::Tensor &w, const at::Tens
 
   const Plan p = plan(M, N, K, group_size, bits, type_string(x.scalar_type()));
   auto out = at::empty({M, N}, x.options());
-  // split-K writes one partial product per K partition, summed below
-  auto target = p.kind == Kind::QmmSplitK ? at::empty({p.split_k, M, N}, x.options()) : out;
+  // split-K writes one partial product per K partition, then sums them the way upstream does
+  const bool split = p.kind == Kind::QmmSplitK;
+  auto target = split ? at::empty({p.split_k, M, N}, x.options()) : out;
+  const ReducePlan rp = split ? reduce_plan(p.split_k, M * N) : ReducePlan{};
+  const at::Tensor scratch =
+      split && rp.kind == Reduce::TwoPass ? at::empty({32, M, N}, x.options()) : at::Tensor();
 
   const int Ki = K, Ni = N, Mi = M;
   id<MTLComputePipelineState> pso = pipeline(p.name);
@@ -361,18 +480,19 @@ at::Tensor affine_qmm_t(const at::Tensor &x, const at::Tensor &w, const at::Tens
         }
       }
       [enc dispatchThreadgroups:p.grid threadsPerThreadgroup:p.group];
+      if (split) encode_split_k_sum(enc, rp, target, out, scratch, p.split_k, M * N);
     }
   });
-
-  if (p.kind == Kind::QmmSplitK) {
-    // upstream sums the partitions with a strided reduce; torch's sum is the same reduction
-    at::sum_out(out, target, {0});
-  }
   return out.view(out_shape);
 }
 
 std::string kernel_for(int64_t M, int64_t N, int64_t K, int64_t group_size, int64_t bits,
                        at::ScalarType dtype) {
   const Plan p = plan(M, N, K, group_size, bits, type_string(dtype));
-  return p.kind == Kind::QmmSplitK ? p.name + " x split_k=" + std::to_string(p.split_k) : p.name;
+  if (p.kind != Kind::QmmSplitK) return p.name;
+  const ReducePlan rp = reduce_plan(p.split_k, M * N);
+  const char *reduce = rp.kind == Reduce::Small ? "col_reduce_small"
+                       : rp.kind == Reduce::Looped ? "col_reduce_looped"
+                                                   : "col_reduce_2pass";
+  return p.name + " x split_k=" + std::to_string(p.split_k) + " + " + reduce;
 }

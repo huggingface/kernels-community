@@ -30,6 +30,16 @@ src = [
     # MLX's math mode
     "mlx_metal/mlx_quantized.metal",
     "vendor/mlx/backend/metal/kernels/quantized.metal.h",
+    # upstream's reduce.metal, the same way: split-K sums its partial products with it
+    "mlx_metal/mlx_reduce.metal",
+    "vendor/mlx/backend/metal/kernels/reduce.metal.h",
+    "vendor/mlx/backend/metal/kernels/reduce.h",
+    "vendor/mlx/backend/metal/kernels/atomic.h",
+    "vendor/mlx/backend/metal/kernels/reduction/ops.h",
+    "vendor/mlx/backend/metal/kernels/reduction/reduce_all.h",
+    "vendor/mlx/backend/metal/kernels/reduction/reduce_col.h",
+    "vendor/mlx/backend/metal/kernels/reduction/reduce_init.h",
+    "vendor/mlx/backend/metal/kernels/reduction/reduce_row.h",
     "vendor/mlx/backend/metal/kernels/quantized.h",
     "vendor/mlx/backend/metal/kernels/quantized_utils.h",
     "vendor/mlx/backend/metal/kernels/utils.h",

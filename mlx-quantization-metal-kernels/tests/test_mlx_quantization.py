@@ -177,11 +177,7 @@ def test_bits_group_sizes_dtypes(bits, group_size, dtype, M):
 @pytest.mark.parametrize("bits", BITS)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_matches_mlx(M, bits, dtype):
-    """Against `mx.quantized_matmul` on the same weights, which runs the same kernels on this GPU.
-
-    Bit for bit, except split-K: MLX sums its K partitions in the output dtype, this package in
-    float32 (torch's sum), so there the requirement is to be at least as close to an exact result.
-    """
+    """Against `mx.quantized_matmul` on the same weights: same kernels on this GPU, so bit for bit."""
     assert "MLX_METAL_GPU_ARCH" not in os.environ
     N, K, group_size = 1024, 2048, 64
     mx.random.seed(0)
@@ -199,13 +195,38 @@ def test_matches_mlx(M, bits, dtype):
     ours = mq.affine_qmm_t(x.to("mps"), wq.to("mps"), s.to("mps"), b.to("mps"), group_size, bits).cpu()
     theirs = to_t(theirs)
 
-    if "splitk" not in ops.kernel_for(M, N, K, group_size, bits, dtype):
-        torch.testing.assert_close(ours.float(), theirs, rtol=0, atol=0)
-    else:
-        exact = x.float() @ dequantize(wq, s, b, group_size, bits).T
-        ours_err = (ours.float() - exact).abs().mean()
-        theirs_err = (theirs - exact).abs().mean()
-        assert ours_err <= theirs_err * 1.01, (ours_err, theirs_err)
+    torch.testing.assert_close(ours.float(), theirs, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(mx is None, reason="needs mlx")
+@pytest.mark.parametrize(
+    "M,N,K,reduce",
+    [
+        (16, 1024, 2048, "col_reduce_small"),  # split_k < 32
+        (16, 256, 4096, "col_reduce_looped"),  # 8 output tiles -> split_k 64
+        (8, 32, 32768, "col_reduce_2pass"),  # 1 output tile -> split_k 512
+    ],
+)
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_split_k_reductions_match_mlx(M, N, K, reduce, dtype):
+    """Each of upstream's split-K sums, bit for bit against MLX."""
+    group_size, bits = 64, 4
+    assert ops.kernel_for(M, N, K, group_size, bits, dtype).endswith(reduce)
+    mx.random.seed(1)
+    wq_mx, s_mx, b_mx = mx.quantize(mx.random.normal((N, K)), group_size=group_size, bits=bits)
+    mx_dtype = {torch.float32: mx.float32, torch.float16: mx.float16, torch.bfloat16: mx.bfloat16}[dtype]
+    s_mx, b_mx = s_mx.astype(mx_dtype), b_mx.astype(mx_dtype)
+    torch.manual_seed(1)
+    x = torch.randn(M, K).to(dtype)
+    theirs = mx.quantized_matmul(
+        mx.array(x.float().numpy()).astype(mx_dtype), wq_mx, s_mx, b_mx, transpose=True, group_size=group_size, bits=bits
+    )
+    to_t = lambda a: torch.from_numpy(np.array(a.astype(mx.float32)))  # noqa: E731
+    wq = torch.from_numpy(np.array(wq_mx)).view(torch.uint32)
+    ours = mq.affine_qmm_t(
+        x.to("mps"), wq.to("mps"), to_t(s_mx).to(dtype).to("mps"), to_t(b_mx).to(dtype).to("mps"), group_size, bits
+    ).cpu()
+    torch.testing.assert_close(ours.float(), to_t(theirs), rtol=0, atol=0)
 
 
 # --- shapes and layouts ----------------------------------------------------------------------------

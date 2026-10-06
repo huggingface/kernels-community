@@ -6,8 +6,8 @@ upstream paths so its `#include "mlx/backend/metal/kernels/..."` lines resolve u
 bump makes upstream reach for something new, the build fails loudly on a missing header, which is
 the signal to add it here.
 
-`quantized.cpp` is MLX's host-side dispatch. It is not compiled -- it is written against MLX's own
-array and device types -- but `mlx_metal/mlx_dispatch.mm` transcribes its choices, and
+`quantized.cpp` and `reduce.cpp` are MLX's host-side dispatch. They are not compiled -- it is written against MLX's own
+array and device types -- but `mlx_metal/mlx_dispatch.mm` transcribes their choices, and
 `tests/test_vendor_drift.py` checks the transcription against this copy on every pin bump.
 
 Usage: python vendor.py [--src /path/to/mlx] [--rev <git rev>]
@@ -43,16 +43,31 @@ FILES = [
     f"{KERNELS}/steel/gemm/mma.h",
     f"{KERNELS}/steel/gemm/params.h",
     f"{KERNELS}/steel/gemm/transforms.h",
+    # the column reduction MLX sums split-K partial products with, and what it includes
+    f"{KERNELS}/reduce.metal",
+    f"{KERNELS}/reduce.h",
+    f"{KERNELS}/atomic.h",
+    f"{KERNELS}/reduction/ops.h",
+    f"{KERNELS}/reduction/reduce_all.h",
+    f"{KERNELS}/reduction/reduce_col.h",
+    f"{KERNELS}/reduction/reduce_init.h",
+    f"{KERNELS}/reduction/reduce_row.h",
     # the host dispatch the .mm transcribes; reference only, never compiled
     "mlx/backend/metal/quantized.cpp",
+    "mlx/backend/metal/reduce.cpp",
+    # the flags upstream compiles its kernels with (-fno-fast-math)
+    f"{KERNELS}/CMakeLists.txt",
 ]
 
 
 # kernel-builder compiles every `.metal` it is given with its own flags, and only hands the build the
-# files listed in build.toml. `mlx_metal/mlx_quantized.metal` compiles upstream's kernels under MLX's
-# own math mode by including this file, so it is shipped with a header suffix: listed, but not
-# compiled a second time. The contents are upstream's, byte for byte.
-RENAMED = {f"{KERNELS}/quantized.metal": f"{KERNELS}/quantized.metal.h"}
+# files listed in build.toml. `mlx_metal/*.metal` compile upstream's kernels under MLX's own math
+# mode by including these files, so they are shipped with a header suffix: listed, but not compiled
+# a second time. The contents are upstream's, byte for byte.
+RENAMED = {
+    f"{KERNELS}/quantized.metal": f"{KERNELS}/quantized.metal.h",
+    f"{KERNELS}/reduce.metal": f"{KERNELS}/reduce.metal.h",
+}
 
 
 def main():
