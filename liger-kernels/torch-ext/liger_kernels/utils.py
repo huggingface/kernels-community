@@ -180,7 +180,9 @@ def set_large_grf_mode(kernel_args: dict):
 def device_context(device: torch.device):
     """Context manager that sets the active device for any backend (cuda, xpu, etc.)."""
     backend = getattr(torch, device.type, None)
-    if backend is not None and hasattr(backend, "device"):
+    # Dynamo cannot trace a device switch inside an autograd.Function, and
+    # Inductor already guards the device of the kernels it launches.
+    if not torch.compiler.is_compiling() and backend is not None and hasattr(backend, "device"):
         with backend.device(device):
             yield
     else:

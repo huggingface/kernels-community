@@ -13,10 +13,11 @@ from .swiglu import LigerSiLUMulFunction
 from .tiled_mlp import apply_tiled_mlp
 
 
-# NOTE: Not compile-friendly --> large deviations to the original implementation under compile
 class LigerRMSNorm(nn.Module):
     weight: nn.Parameter
     variance_epsilon: float
+
+    can_torch_compile = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return LigerRMSNormFunction.apply(
@@ -25,7 +26,9 @@ class LigerRMSNorm(nn.Module):
             self.variance_epsilon,
             0,
             "llama",
-            True,
+            # Not in place: post-norm models (e.g. OLMo2) feed the norm's output
+            # gradient to the residual too, so overwriting it corrupts that branch.
+            False,
             None,
         )
 
