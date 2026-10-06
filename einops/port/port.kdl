@@ -55,8 +55,7 @@ kernelize_imports \
     kernel="kernels-community/einops" \
     version=1
 
-// Pick the test backends from the installed frameworks; upstream requires
-// EINOPS_TEST_BACKENDS to be set, which Kernel CI cannot do.
+// Default to Torch and NumPy tests, with an EINOPS_TEST_BACKENDS override.
 overlay from="overlay"
 
 // Use the supported replacement for NumPy 2's removed in1d API.

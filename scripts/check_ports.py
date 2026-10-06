@@ -1,30 +1,4 @@
 #!/usr/bin/env python3
-"""Verify that every ported kernel's committed tree matches its recipe.
-
-A ported kernel is a directory holding `port/port.kdl`. The recipe generates
-`<kernel>/src`, which is committed so that what ships stays reviewable. This
-script re-runs the port against a fresh upstream checkout at the pinned commit
-and fails if the result differs from what is committed.
-
-Without this, four failure modes are silent:
-
-  - an overlay file goes stale, so regenerating reverts a fix made in-tree
-  - a build.toml field is edited by hand, and the manifest op drops it
-  - an overlay file and its generated twin are edited independently and drift
-  - the recipe is edited without rerunning the port; src/port-provenance.json
-    records the recipe hash, so this shows up as a diff in that file
-
-Usage:
-    python3 scripts/check_ports.py [kernel ...]
-    python3 scripts/check_ports.py --changed-since <ref>
-
-Defaults to every port found. --changed-since limits the check to ports whose
-port/ or src/ tree differs from <ref> (or every port, if the checker itself
-changed), which is what CI uses for pull requests.
-Set KERNEL_PORT to override the runner command (e.g. "nix run
-github:huggingface/kernels#kernel-port --").
-"""
-
 import filecmp
 import os
 import re
@@ -35,8 +9,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-# `source repo="..." commit="..."` is the recipe's first op; the runner already
-# enforces a 40-char sha and a clean checkout, so a loose match is enough here.
+# Extract source arguments; kernel-port validates them.
 SOURCE_RE = re.compile(
     r"^source\b(?P<body>(?:[^\n\\]|\\\s*\n)*)", re.MULTILINE
 )
@@ -56,11 +29,7 @@ def find_ports(root: Path) -> list:
 
 
 def changed_ports(root: Path, ref: str) -> list:
-    """Ports whose port/ or src/ tree differs from `ref`.
-
-    A change to the checker itself (this script, or the workflow that pins the
-    runner) can break any port, so it selects all of them.
-    """
+    """Select changed ports, or all ports when the checker or workflow changes."""
     out = subprocess.run(
         ["git", "diff", "--name-only", f"{ref}...HEAD"],
         capture_output=True,
@@ -90,8 +59,6 @@ def parse_source(recipe: Path) -> tuple:
 
 
 def checkout(repo: str, commit: str, dest: Path) -> None:
-    # The `source` op verifies origin URL, HEAD, and cleanliness, so clone from
-    # the exact URL the recipe names and land on the exact commit.
     subprocess.run(
         ["git", "clone", "--quiet", "--filter=blob:none", "--no-checkout", repo, str(dest)],
         check=True,
@@ -125,7 +92,7 @@ def check(kernel: str, root: Path, workdir: Path) -> list:
     repo, commit = parse_source(recipe)
     print(f"  {kernel}: {repo} @ {commit[:12]}")
 
-    # One checkout per (repo, commit): two kernels may share an upstream.
+    # Reuse checkouts for kernels sharing an upstream commit.
     src = workdir / f"upstream-{commit[:12]}"
     if not src.exists():
         checkout(repo, commit, src)

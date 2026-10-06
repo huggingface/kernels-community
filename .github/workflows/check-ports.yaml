@@ -1,19 +1,11 @@
 name: Check Ports
 
-# A ported kernel's <kernel>/src is generated from <kernel>/port/port.kdl and
-# committed. Regenerate it here and fail if the two disagree: a stale overlay
-# reverting an in-tree fix, a hand-edited build.toml field the manifest op
-# drops, an overlay file edited without its generated twin, or a recipe edited
-# without rerunning the port (src/port-provenance.json records the recipe hash,
-# so that case shows up as a diff in the provenance file).
-#
-# Pull requests only check the ports they touch; pushes to main, the daily
-# run and manual runs check every port.
+# Verify committed src trees match their port recipes. PRs check changed ports;
+# checker changes, pushes to main, scheduled runs and manual runs check all ports.
 on:
   push:
     branches: [main]
-  # kernel-port tracks huggingface/kernels main, so also run without a change
-  # here: a kernel-port regression should surface even when no port PR is open.
+  # Catch kernel-port regressions even when no port changes.
   schedule:
     - cron: "0 6 * * *"
   pull_request:
@@ -44,13 +36,9 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
-      # Each recipe pins its own upstream commit; the runner verifies the
-      # origin URL, HEAD and cleanliness of the checkout it is handed.
-      - name: Regenerate every port and compare
+      - name: Regenerate selected ports and compare
         env:
-          # Track huggingface/kernels main rather than pinning a rev, so that a
-          # kernel-port change that breaks a port is caught immediately.
-          # --refresh skips Nix's flake cache so every run sees the latest main.
+          # Refresh the runner to catch upstream changes.
           # TODO: switch back to main once huggingface/kernels#877 is merged.
           KERNEL_PORT: "nix run --refresh github:huggingface/kernels/kernel-port-no-importlib#kernel-port --"
           BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
