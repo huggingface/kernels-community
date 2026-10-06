@@ -1,6 +1,6 @@
 [general]
 name = "liger-kernels"
-version = 3
+version = 4
 edition = 5
 license = "BSD-2-Clause"
 backends = [

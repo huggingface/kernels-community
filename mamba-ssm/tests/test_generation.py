@@ -1,13 +1,18 @@
+import kernels
+
 import torch
 import torch.nn.functional as F
-
-from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
-from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.utils.generation import InferenceParams
 
 import pytest
 
 from einops import rearrange, repeat
+
+
+mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=3)
+
+MambaLMHeadModel = mamba_ssm.models.mixer_seq_simple.MambaLMHeadModel
+MambaConfig = mamba_ssm.models.config_mamba.MambaConfig
+InferenceParams = mamba_ssm.utils.generation.InferenceParams
 
 
 def test_generation():
