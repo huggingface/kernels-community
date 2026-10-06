@@ -1,5 +1,7 @@
 import math
 
+import kernels
+
 import torch
 import torch.nn.functional as F
 
@@ -7,7 +9,11 @@ import pytest
 
 from einops import rearrange, repeat
 
-from mamba_ssm.ops.triton.layernorm_gated import layernorm_fn, rms_norm_ref
+
+mamba_ssm = kernels.get_kernel("kernels-community/fla", version=3)
+
+layernorm_fn = mamba_ssm.ops.triton.layernorm_gated.layernorm_fn
+rms_norm_ref = mamba_ssm.ops.triton.layernorm_gated.rms_norm_ref
 
 
 @pytest.mark.parametrize("norm_before_gate", [True, False])
@@ -26,6 +32,7 @@ from mamba_ssm.ops.triton.layernorm_gated import layernorm_fn, rms_norm_ref
 @pytest.mark.parametrize("wtype", [torch.float32])
 @pytest.mark.parametrize('d', [2048, 4096])
 # @pytest.mark.parametrize('d', [4096])
+@pytest.mark.kernels_ci
 def test_layer_norm_gated(d, dtype, wtype, has_bias, has_z, is_rms_norm, has_group, norm_before_gate):
     if not has_z and not norm_before_gate:
         pytest.skip()

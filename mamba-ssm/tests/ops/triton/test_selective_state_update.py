@@ -2,13 +2,19 @@
 
 import math
 
+import kernels
+
 import torch
 import torch.nn.functional as F
 import pytest
 
 from einops import rearrange, repeat
 
-from mamba_ssm.ops.triton.selective_state_update import selective_state_update, selective_state_update_ref
+
+mamba_ssm = kernels.get_kernel("kernels-community/fla", version=3)
+
+selective_state_update = mamba_ssm.ops.triton.selective_state_update.selective_state_update
+selective_state_update_ref = mamba_ssm.ops.triton.selective_state_update.selective_state_update_ref
 
 
 @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
@@ -19,6 +25,7 @@ from mamba_ssm.ops.triton.selective_state_update import selective_state_update, 
 # @pytest.mark.parametrize("dstate", [16])
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 # @pytest.mark.parametrize("dim", [2048])
+@pytest.mark.kernels_ci
 def test_selective_state_update(dim, dstate, has_z, itype):
     device = "cuda"
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 1e-2)
@@ -63,6 +70,7 @@ def test_selective_state_update(dim, dstate, has_z, itype):
 # @pytest.mark.parametrize("dstate", [16])
 @pytest.mark.parametrize("dim", [2048, 4096])
 # @pytest.mark.parametrize("dim", [2048])
+@pytest.mark.kernels_ci
 def test_selective_state_update_with_heads(dim, dstate, ngroups, has_z, tie_hdim, itype):
     device = "cuda"
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 3e-2)
@@ -109,6 +117,7 @@ def test_selective_state_update_with_heads(dim, dstate, ngroups, has_z, tie_hdim
 # @pytest.mark.parametrize("dstate", [16])
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
 # @pytest.mark.parametrize("dim", [2048])
+@pytest.mark.kernels_ci
 def test_selective_state_update_with_batch_indices(dim, dstate, has_z, itype):
     device = "cuda"
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 1e-2)
@@ -158,6 +167,7 @@ def test_selective_state_update_with_batch_indices(dim, dstate, has_z, itype):
 # @pytest.mark.parametrize("dstate", [16])
 @pytest.mark.parametrize("dim", [2048, 4096])
 # @pytest.mark.parametrize("dim", [2048])
+@pytest.mark.kernels_ci
 def test_selective_state_update_with_heads_with_batch_indices(dim, dstate, ngroups, has_z, tie_hdim, itype):
     device = "cuda"
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 3e-2)
