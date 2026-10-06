@@ -12,18 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib.util
-
+import kernels
 import pytest
 import torch
 import torch.nn.functional as F
 
-if importlib.util.find_spec("kernels") is not None:
-    import kernels
-
-    gemma_quant_kernels = kernels.get_kernel("kernels-community/gemma-quant-kernels", version=1)
-else:
-    import gemma_quant_kernels  # type: ignore
+gemma_quant_kernels = kernels.get_kernel("kernels-community/gemma-quant-kernels", version=1)
 
 
 def _make_packed_weights(out_features: int, in_features: int, num_bits: int, device: str = "cuda"):
