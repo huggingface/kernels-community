@@ -10,7 +10,7 @@ import pytest
 from einops import rearrange, repeat
 
 
-mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=3)
+mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=4)
 
 layernorm_fn = mamba_ssm.ops.triton.layernorm_gated.layernorm_fn
 rms_norm_ref = mamba_ssm.ops.triton.layernorm_gated.rms_norm_ref
