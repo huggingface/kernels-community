@@ -980,6 +980,18 @@ def full_precision_matmul_batched_kernel(
 GATE_UNSTACK_MAX_S = 16  # the unstacked-gate decode band (see the dispatch in the wrapper)
 
 
+def unstacked_gate(gemm, output_dtype, simulate_unfused, act_fn, swiglu_alpha, swiglu_limit,
+                   quant_group=None, use_ue8m0=False):
+    """The ``gate`` contract as one ungated GEMM over the stacked weight, ``gemm(intermediate_dtype)``,
+    then the one-kernel ``fused_glu``. The GLU reads the fp32 accumulators as the stacked epilogue
+    does; ``simulate_unfused`` lands them in ``output_dtype`` first, the unfused-reference order.
+    ``quant_group`` requantizes the GLU output and returns ``[q, scales]``."""
+    [gate_up] = gemm(output_dtype if simulate_unfused else torch.float32)
+    out = fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit,
+                    quant_group=quant_group, use_ue8m0=use_ue8m0, out_dtype=output_dtype)
+    return list(out) if quant_group is not None else [out]
+
+
 @compile_time_only_triton_op(
     add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_batched"),
     mutates_args=(),
@@ -1048,27 +1060,23 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     assert not requant or block_size[0] == block_size[1], (
         f"the fused 'fp8' requant needs square quant blocks, got {block_size}"
     )
-    # The decode band runs the ``gate`` contract UNSTACKED: this same op without the gate
-    # (one plain GEMM over the stacked weight), then the one-kernel ``fused_glu`` — bit-
-    # identical rounding, and exactly the unfused-reference order, so ``simulate_unfused``
-    # needs no carve-out. Holding the gate AND up tiles per CTA doubles the smem footprint
-    # and halves occupancy precisely where the launch is weight-bandwidth-bound, and the
-    # fp8 ``tl.dot`` — unlike the MX/NVFP4 scaled MMA, whose wide M operand earns the
-    # native instruction — gains nothing back: DSV3 shape, same 235MB weight read, stacked
-    # 69.8µs vs unstacked 49.8µs at S=8, a wash by S=32. A requant is the same offline
-    # quant the raw activation gets below, applied to the GLU output. The intermediate is the
-    # fp32 accumulators, so the GLU and the requant round as the stacked epilogue does; under
-    # ``simulate_unfused`` it lands in the activation dtype first, the unfused-reference order.
+    # The decode band runs the ``gate`` contract UNSTACKED (``unstacked_gate``): this same op
+    # without the gate, then the one-kernel ``fused_glu``. Holding the gate AND up tiles per CTA
+    # doubles the smem footprint and halves occupancy precisely where the launch is
+    # weight-bandwidth-bound, and the fp8 ``tl.dot`` — unlike the MX/NVFP4 scaled MMA, whose
+    # wide M operand earns the native instruction — gains nothing back: DSV3 shape, same 235MB
+    # weight read, stacked 69.8µs vs unstacked 49.8µs at S=8, a wash by S=32. A requant is the
+    # same offline quant the raw activation gets below, applied to the GLU output.
     if gate and S <= GATE_UNSTACK_MAX_S:
-        [gate_up] = w8a8_block_dynamic_fp8_matmul_batched(
-            A, B, As, Bs, expert_ids, block_size,
-            activation_format=activation_format, output_dtype=output_dtype if simulate_unfused else torch.float32,
-            gather_idx=gather_idx, scatter_idx=scatter_idx, bias=bias,
+        return unstacked_gate(
+            lambda intermediate_dtype: w8a8_block_dynamic_fp8_matmul_batched(
+                A, B, As, Bs, expert_ids, block_size,
+                activation_format=activation_format, output_dtype=intermediate_dtype,
+                gather_idx=gather_idx, scatter_idx=scatter_idx, bias=bias,
+            ),
+            output_dtype, simulate_unfused, act_fn, swiglu_alpha, swiglu_limit,
+            quant_group=block_n if requant else None, use_ue8m0=bs_u8.dtype == torch.uint8,
         )
-        out = fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit,
-                        quant_group=block_n if requant else None,
-                        use_ue8m0=bs_u8.dtype == torch.uint8, out_dtype=None if requant else output_dtype)
-        return list(out) if requant else [out]
     # A raw (As is None) -> quantize here (offline); else pre-quantized (As given, e.g. the
     # requantized intermediate handed to the down projection).
     if As is None:
@@ -1681,29 +1689,20 @@ def mx_weight_only_matmul_batched(
         f"weight-only takes a raw bf16/fp16/fp32 activation, got {A.dtype}"
     )
     assert Bs.ndim == 3, f"weight-only batched takes affine (3D) weight scales, got ndim={Bs.ndim}"
-    # The ``gate`` contract runs UNSTACKED at every S: this same op without the gate (one
-    # plain GEMM over the stacked weight), then the one-kernel ``fused_glu`` — bit-identical
-    # rounding, the unfused-reference order, so ``simulate_unfused`` rides through. The
-    # upcast weight feeds a plain bf16 dot, so the stacked tile buys no native MMA and only
-    # halves occupancy on a weight-bandwidth-bound loop; unlike the block-FP8 band this
-    # never inverts (GPT-OSS shape: 48.0->39.7µs at S=4, still ahead at S=512; 2026-08-06).
-    if gate:
-        # fp32 intermediate = the exact GEMM accumulators, so the GLU keeps the gated
-        # epilogue's FUSED-order rounding (bf16 operands would drift steep-sigmoid elements
-        # past the weight-only tests' exact-ish tolerances). Under ``simulate_unfused`` the
-        # caller is asking for the UNFUSED order instead, where the reference lands its gate_up
-        # in the activation dtype before the GLU — carrying fp32 there leaves the two a bf16 ULP
-        # apart (256.0 absolute at magnitude 2^15), which the parity tolerance rejects.
-        inter_dtype = (
-            resolve_output_dtype(output_dtype, A, None) if simulate_unfused else torch.float32
-        )
-        [gate_up] = mx_weight_only_matmul_batched(
-            A, B, Bs, expert_ids, output_dtype=inter_dtype,
-            gather_idx=gather_idx, scatter_idx=scatter_idx, b_global_scale=b_global_scale, bias=bias,
-        )
-        return [fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit,
-                          out_dtype=resolve_output_dtype(output_dtype, A, None))]
+    # The ``gate`` contract runs UNSTACKED at every S (``unstacked_gate``): this same op without
+    # the gate, then the one-kernel ``fused_glu``. The upcast weight feeds a plain bf16 dot, so
+    # the stacked tile buys no native MMA and only halves occupancy on a weight-bandwidth-bound
+    # loop; unlike the block-FP8 band this never inverts (GPT-OSS shape: 48.0->39.7µs at S=4,
+    # still ahead at S=512; 2026-08-06).
     output_dtype = resolve_output_dtype(output_dtype, A, None)
+    if gate:
+        return unstacked_gate(
+            lambda intermediate_dtype: mx_weight_only_matmul_batched(
+                A, B, Bs, expert_ids, output_dtype=intermediate_dtype,
+                gather_idx=gather_idx, scatter_idx=scatter_idx, b_global_scale=b_global_scale, bias=bias,
+            ),
+            output_dtype, simulate_unfused, act_fn, swiglu_alpha, swiglu_limit,
+        )
     K = A.shape[1]
     S = expert_ids.shape[0]
     WEIGHT_VALUES_PER_BYTE = 2 if B.dtype == torch.int8 else 1
