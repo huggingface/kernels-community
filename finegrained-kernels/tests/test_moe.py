@@ -34,7 +34,7 @@ from utils import (  # type: ignore
     WEIGHTS,
 )
 
-from finegrained_kernels import moe, swizzle_mx_scales  # type: ignore
+from finegrained_kernels import moe, scheduling, swizzle_mx_scales  # type: ignore
 from finegrained_kernels.epilogue import fused_glu  # type: ignore
 
 
@@ -52,6 +52,7 @@ class MoEProblem:
     intermediate_dim: int = 256
     num_top_k: int = 8
     sentinel_fraction: float = 0.0
+    negative_sentinels: bool = False  # off-rank routes as -1 rather than num_experts
     dtype: torch.dtype = torch.bfloat16
     activation_format: Optional[str] = None
     swiglu_alpha: Optional[float] = None
@@ -62,6 +63,7 @@ class MoEProblem:
     expert_globals: bool = False  # the down's calibrated input_scale differs per expert
     static: bool = False  # calibrated (static) activation scale, one per expert
     post_expert_norm: Optional[str] = None  # a model's per-expert output norm, by name
+    bias: bool = False  # a per-expert output bias on both projections (GPT-OSS ships them)
 
     @property
     def id(self):
@@ -84,7 +86,9 @@ class MoEProblem:
             f"{'_expertglobals' if self.expert_globals else ''}"
             f"{'_static' if self.static else ''}"
             f"{'_' + self.post_expert_norm if self.post_expert_norm else ''}"
+            f"{'_bias' if self.bias else ''}"
             f"{'_sentinel' if self.sentinel_fraction > 0 else ''}"
+            f"{'_negative' if self.negative_sentinels else ''}"
         )
 
 
@@ -177,9 +181,24 @@ MOE_PROBLEMS = [
     # ── GeGLU / ReGLU (activation orthogonal to format, one MXFP8 shape each) ──
     MoEProblem(weights="mxfp8", act_fn="gelu"),
     MoEProblem(weights="mxfp8", act_fn="relu"),
+    # ── per-expert output bias on both projections, one cell per kernel family; block-FP8 also inside its
+    # unstacked-gate decode band (<= 16 routed rows), and the GPT-OSS gate_up (weight-only MXFP4, clamped SwiGLU,
+    # always unstacked) ──
+    MoEProblem(weights="bf16", bias=True),
+    MoEProblem(weights="fp8_128x128", bias=True),
+    MoEProblem(weights="fp8_128x128", num_tokens=1, bias=True),
+    MoEProblem(weights="fp8_tensor", num_top_k=4, static=True, bias=True),
+    MoEProblem(weights="mxfp8", bias=True),
+    MoEProblem(weights="nvfp4", input_globals=True, bias=True),
+    MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=1, bias=True),
     # ── expert parallelism: non-local experts sentinel-masked ──
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="fp8_128x128", num_tokens=8, sentinel_fraction=0.875),
+    MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875, negative_sentinels=True),
+    # swizzled MX scales quantize the activations once per token into every routed row's tile, which a token
+    # routed only to other ranks' experts must not write
+    MoEProblem(weights="mxfp8", num_tokens=8, swizzled=True, sentinel_fraction=0.875),
+    MoEProblem(weights="nvfp4", num_tokens=8, swizzled=True, sentinel_fraction=0.875),
     # int32 pointer-offset overflow guard for the fused paths: the last experts'
     # gate_up offsets exceed 2^31 elements (127 * 2*2048 * 6144 = 3.196e9); a regressed
     # int64 cast corrupts the high-routed tokens vs the torch reference. E is a power of
@@ -230,11 +249,11 @@ def _make_moe_inputs(problem: MoEProblem):
     )
     if problem.sentinel_fraction > 0:
         # EP: mark a random subset of routed slots non-local with an out-of-range id
-        # (== num_experts), which the fused path must skip.
+        # (num_experts, or -1), which the fused path must skip.
         flat = top_k_index.reshape(-1)
         n_sentinel = int(round(flat.numel() * problem.sentinel_fraction))
         idx = torch.randperm(flat.numel(), device=flat.device)[:n_sentinel]
-        flat[idx] = problem.num_experts
+        flat[idx] = -1 if problem.negative_sentinels else problem.num_experts
     top_k_weights = torch.rand(
         problem.num_tokens, problem.num_top_k, device=TEST_DEVICE, dtype=problem.dtype
     )
@@ -285,9 +304,19 @@ def _static_scales(problem: MoEProblem, hidden, gate_up, gate_up_s, top_k_index)
     return tuple(scale.contiguous() for scale in scales)
 
 
+def _biases(problem: MoEProblem):
+    """The per-expert output biases, ``(E, 2I)`` on gate_up (added before the GLU) and ``(E, H)`` on down, at the
+    activation dtype as a checkpoint ships them; ``None`` on a problem without them."""
+    if not problem.bias:
+        return None, None
+    gate_up_bias = torch.randn(problem.num_experts, 2 * problem.intermediate_dim, device=TEST_DEVICE, dtype=problem.dtype)
+    down_bias = torch.randn(problem.num_experts, problem.hidden_dim, device=TEST_DEVICE, dtype=problem.dtype)
+    return gate_up_bias, down_bias
+
+
 def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s, gate_up_g, down_g):
-    """The kwargs every forward takes: the weights' second-level globals, the calibrated activation
-    globals and scales, the GLU knobs, and a model's per-expert output norm. The fused chain
+    """The kwargs every forward takes: the per-expert biases, the weights' second-level globals, the calibrated
+    activation globals and scales, the GLU knobs, and a model's per-expert output norm. The fused chain
     folds a named norm into its reduce while the unfused reference normalizes the routed rows in
     a pass of their own, so handing both the same weight is what makes that a parity check."""
     gate_up_in_g, down_in_g = _input_globals(problem, hidden)
@@ -297,7 +326,10 @@ def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s,
         if problem.post_expert_norm
         else None
     )
+    gate_up_bias, down_bias = _biases(problem)
     return dict(
+        gate_up_proj_bias=gate_up_bias,
+        down_proj_bias=down_bias,
         gate_up_proj_weight_global_scale=gate_up_g,
         down_proj_weight_global_scale=down_g,
         gate_up_proj_input_global_scale=gate_up_in_g,
@@ -347,6 +379,33 @@ def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
+@pytest.mark.parametrize("sentinel_fraction", [0.5, 1.0])
+@pytest.mark.parametrize("negative", [False, True], ids=["past_experts", "negative"])
+def test_grouped_scheduling_defines_every_route(sentinel_fraction, negative):
+    """Both maps are a permutation of the ``S`` routes: the local rows expert-sorted up to ``expert_start[E]``,
+    the EP-sentinel routes (another rank's experts, any id outside ``[0, E)``) after them, so a consumer over
+    all ``S`` rows reads real slots and tokens."""
+    E, T, K = 8, 300, 4
+    g = torch.Generator(device=TEST_DEVICE).manual_seed(0)
+    expert_ids = torch.randint(0, E, (T, K), device=TEST_DEVICE, generator=g)
+    off_rank = torch.rand(T, K, device=TEST_DEVICE, generator=g) < sentinel_fraction
+    expert_ids = torch.where(off_rank, -1 if negative else E, expert_ids)
+    # the caching allocator hands these freed blocks to the `torch.empty` maps: an unwritten slot reads -1
+    poison = [torch.full((T * K,), -1, device=TEST_DEVICE, dtype=torch.int32) for _ in range(2)]
+    del poison
+    expert_start, gather_idx, scatter_idx = scheduling.compute_grouped_scheduling(expert_ids, E, K)
+    local = int((~off_rank).sum())
+    assert int(expert_start[-1]) == local
+    assert torch.equal(scatter_idx.long().sort().values, torch.arange(T * K, device=TEST_DEVICE))
+    assert torch.equal(gather_idx.long(), scatter_idx.long() // K)
+    routed = expert_ids.flatten()[scatter_idx.long()]
+    assert not bool(scheduling.off_rank(routed[:local], E).any())
+    assert bool(scheduling.off_rank(routed[local:], E).all())
+    assert torch.equal(routed[:local].sort().values, routed[:local])
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
 @pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
 def test_fused_batched(problem):
     """Fused two-kernel MoE (gate_up + activation + requant + down + top-k reduce) via
@@ -372,6 +431,7 @@ _PRODUCTION_ARM_PROBLEMS = [
     MoEProblem(weights="fp8_128x128"),
     MoEProblem(weights="nvfp4", input_globals=True),
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
+    MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=1, bias=True),
 ]
 
 
@@ -409,6 +469,7 @@ _TORCH_BASELINE_PROBLEMS = [
     MoEProblem(weights="mxfp4", num_tokens=64),
     MoEProblem(weights="nvfp4", num_tokens=64),
     MoEProblem(weights="nvfp4", num_tokens=64, input_globals=True),
+    MoEProblem(weights="mxfp8", num_tokens=64, sentinel_fraction=0.875),
 ]
 
 

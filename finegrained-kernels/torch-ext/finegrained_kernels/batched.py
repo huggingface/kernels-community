@@ -29,6 +29,7 @@ from .formats import check_activation_format, global_scale_stride, normalize_glo
 from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
+from .scheduling import is_off_rank
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .loading.tiles import (
     advance_ptrs,
@@ -77,7 +78,7 @@ def expert_setup(
     row is ``ScatterIdx[batch_id]`` when ``ScatterIdx`` is not None else ``batch_id`` — the same virtual
     gather/scatter ``matmul_grouped`` does, so the routed rows need no materialized copy.
 
-    The caller must early-return on the EP sentinel (``expert_id >= num_experts``)
+    The caller must early-return on the EP sentinel (``is_off_rank``)
     before any load — the pointer arithmetic itself is harmless, only the loads on a
     non-local expert would be out of bounds."""
     batch_id = tl.program_id(axis=0)
@@ -197,7 +198,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         stride_eid,
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
-    if expert_id >= num_experts:
+    if is_off_rank(expert_id, num_experts):
         return
 
     # One scale per quant block, broadcast over the tile, so an N tile narrower than BLOCK_N just
@@ -329,7 +330,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
         stride_eid,
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
-    if expert_id >= num_experts:
+    if is_off_rank(expert_id, num_experts):
         return
 
     # this batch's expert scale: stride 0 means one calibrated scale for every expert. It feeds
@@ -464,7 +465,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
         stride_eid,
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
-    if expert_id >= num_experts:
+    if is_off_rank(expert_id, num_experts):
         return
 
     # under GATE the gate|up rows are interleaved, so the tile is one 2*BN span
@@ -637,7 +638,7 @@ def mx_dynamic_matmul_batched_kernel(
         ADVANCE_BS=False,  # scale leaf applies the per-expert offset (swizzled indexes by block)
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
-    if expert_id >= num_experts:
+    if is_off_rank(expert_id, num_experts):
         return
 
     # each operand's format is its dtype: uint8 = packed E2M1 (two values per byte, W4A4
@@ -793,7 +794,7 @@ def mx_weight_only_matmul_batched_kernel(
         A, B, C, Bs, ExpertIds, GatherIdx, ScatterIdx,
         stride_a_m, stride_b_e, stride_c_m, stride_bs_e, stride_eid, ADVANCE_BS=False,
     )
-    if expert_id >= num_experts:  # EP sentinel: non-local expert, output left uninit
+    if is_off_rank(expert_id, num_experts):  # EP sentinel: non-local expert, output left uninit
         return
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     # non-128 N: the last N-tile's rows run past B (N=320, n_width=256 -> tile 2 wants rows
@@ -939,7 +940,7 @@ def full_precision_matmul_batched_kernel(
         ADVANCE_BS=False,
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
-    if expert_id >= num_experts:
+    if is_off_rank(expert_id, num_experts):
         return
 
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
@@ -978,6 +979,18 @@ def full_precision_matmul_batched_kernel(
 
 
 GATE_UNSTACK_MAX_S = 16  # the unstacked-gate decode band (see the dispatch in the wrapper)
+
+
+def unstacked_gate(gemm, output_dtype, simulate_unfused, act_fn, swiglu_alpha, swiglu_limit,
+                   quant_group=None, use_ue8m0=False):
+    """The ``gate`` contract as one ungated GEMM over the stacked weight, ``gemm(intermediate_dtype)``,
+    then the one-kernel ``fused_glu``. The GLU reads the fp32 accumulators as the stacked epilogue
+    does; ``simulate_unfused`` lands them in ``output_dtype`` first, the unfused-reference order.
+    ``quant_group`` requantizes the GLU output and returns ``[q, scales]``."""
+    [gate_up] = gemm(output_dtype if simulate_unfused else torch.float32)
+    out = fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit,
+                    quant_group=quant_group, use_ue8m0=use_ue8m0, out_dtype=output_dtype)
+    return list(out) if quant_group is not None else [out]
 
 
 @compile_time_only_triton_op(
@@ -1048,27 +1061,23 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     assert not requant or block_size[0] == block_size[1], (
         f"the fused 'fp8' requant needs square quant blocks, got {block_size}"
     )
-    # The decode band runs the ``gate`` contract UNSTACKED: this same op without the gate
-    # (one plain GEMM over the stacked weight), then the one-kernel ``fused_glu`` — bit-
-    # identical rounding, and exactly the unfused-reference order, so ``simulate_unfused``
-    # needs no carve-out. Holding the gate AND up tiles per CTA doubles the smem footprint
-    # and halves occupancy precisely where the launch is weight-bandwidth-bound, and the
-    # fp8 ``tl.dot`` — unlike the MX/NVFP4 scaled MMA, whose wide M operand earns the
-    # native instruction — gains nothing back: DSV3 shape, same 235MB weight read, stacked
-    # 69.8µs vs unstacked 49.8µs at S=8, a wash by S=32. A requant is the same offline
-    # quant the raw activation gets below, applied to the GLU output — quantizing the bf16
-    # intermediate (the unfused-reference order) where the stacked epilogue quantizes its
-    # fp32 accumulator, a sub-quantum difference consistent with the band's semantics.
+    # The decode band runs the ``gate`` contract UNSTACKED (``unstacked_gate``): this same op
+    # without the gate, then the one-kernel ``fused_glu``. Holding the gate AND up tiles per CTA
+    # doubles the smem footprint and halves occupancy precisely where the launch is
+    # weight-bandwidth-bound, and the fp8 ``tl.dot`` — unlike the MX/NVFP4 scaled MMA, whose
+    # wide M operand earns the native instruction — gains nothing back: DSV3 shape, same 235MB
+    # weight read, stacked 69.8µs vs unstacked 49.8µs at S=8, a wash by S=32. A requant is the
+    # same offline quant the raw activation gets below, applied to the GLU output.
     if gate and S <= GATE_UNSTACK_MAX_S:
-        [gate_up] = w8a8_block_dynamic_fp8_matmul_batched(
-            A, B, As, Bs, expert_ids, block_size,
-            activation_format=activation_format, output_dtype=output_dtype,
-            gather_idx=gather_idx, scatter_idx=scatter_idx,
+        return unstacked_gate(
+            lambda intermediate_dtype: w8a8_block_dynamic_fp8_matmul_batched(
+                A, B, As, Bs, expert_ids, block_size,
+                activation_format=activation_format, output_dtype=intermediate_dtype,
+                gather_idx=gather_idx, scatter_idx=scatter_idx, bias=bias,
+            ),
+            output_dtype, simulate_unfused, act_fn, swiglu_alpha, swiglu_limit,
+            quant_group=block_n if requant else None, use_ue8m0=bs_u8.dtype == torch.uint8,
         )
-        out = fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit,
-                        quant_group=block_n if requant else None,
-                        use_ue8m0=bs_u8.dtype == torch.uint8)
-        return list(out) if requant else [out]
     # A raw (As is None) -> quantize here (offline); else pre-quantized (As given, e.g. the
     # requantized intermediate handed to the down projection).
     if As is None:
@@ -1681,29 +1690,20 @@ def mx_weight_only_matmul_batched(
         f"weight-only takes a raw bf16/fp16/fp32 activation, got {A.dtype}"
     )
     assert Bs.ndim == 3, f"weight-only batched takes affine (3D) weight scales, got ndim={Bs.ndim}"
-    # The ``gate`` contract runs UNSTACKED at every S: this same op without the gate (one
-    # plain GEMM over the stacked weight), then the one-kernel ``fused_glu`` — bit-identical
-    # rounding, the unfused-reference order, so ``simulate_unfused`` rides through. The
-    # upcast weight feeds a plain bf16 dot, so the stacked tile buys no native MMA and only
-    # halves occupancy on a weight-bandwidth-bound loop; unlike the block-FP8 band this
-    # never inverts (GPT-OSS shape: 48.0->39.7µs at S=4, still ahead at S=512; 2026-08-06).
-    if gate:
-        # fp32 intermediate = the exact GEMM accumulators, so the GLU keeps the gated
-        # epilogue's FUSED-order rounding (bf16 operands would drift steep-sigmoid elements
-        # past the weight-only tests' exact-ish tolerances). Under ``simulate_unfused`` the
-        # caller is asking for the UNFUSED order instead, where the reference lands its gate_up
-        # in the activation dtype before the GLU — carrying fp32 there leaves the two a bf16 ULP
-        # apart (256.0 absolute at magnitude 2^15), which the parity tolerance rejects.
-        inter_dtype = (
-            resolve_output_dtype(output_dtype, A, None) if simulate_unfused else torch.float32
-        )
-        [gate_up] = mx_weight_only_matmul_batched(
-            A, B, Bs, expert_ids, output_dtype=inter_dtype,
-            gather_idx=gather_idx, scatter_idx=scatter_idx, b_global_scale=b_global_scale,
-        )
-        return [fused_glu(gate_up, act_fn, swiglu_alpha, swiglu_limit,
-                          out_dtype=resolve_output_dtype(output_dtype, A, None))]
+    # The ``gate`` contract runs UNSTACKED at every S (``unstacked_gate``): this same op without
+    # the gate, then the one-kernel ``fused_glu``. The upcast weight feeds a plain bf16 dot, so
+    # the stacked tile buys no native MMA and only halves occupancy on a weight-bandwidth-bound
+    # loop; unlike the block-FP8 band this never inverts (GPT-OSS shape: 48.0->39.7µs at S=4,
+    # still ahead at S=512; 2026-08-06).
     output_dtype = resolve_output_dtype(output_dtype, A, None)
+    if gate:
+        return unstacked_gate(
+            lambda intermediate_dtype: mx_weight_only_matmul_batched(
+                A, B, Bs, expert_ids, output_dtype=intermediate_dtype,
+                gather_idx=gather_idx, scatter_idx=scatter_idx, b_global_scale=b_global_scale, bias=bias,
+            ),
+            output_dtype, simulate_unfused, act_fn, swiglu_alpha, swiglu_limit,
+        )
     K = A.shape[1]
     S = expert_ids.shape[0]
     WEIGHT_VALUES_PER_BYTE = 2 if B.dtype == torch.int8 else 1
