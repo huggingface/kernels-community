@@ -1367,7 +1367,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
             A, block_k, use_ue8m0=bs_u8.dtype == torch.uint8
         )
         # post-quant: trade the in-kernel gather for one packed-row copy where that wins
-        A, As, gather_idx = expand_gather_below_parity(A, As, gather_idx, num_experts)
+        A, As, gather_idx = expand_gather_below_parity(A, As, gather_idx, num_experts, expert_start)
     if requant:
         C = A.new_empty(S, N, dtype=FP8_DTYPE)
         # UE8M0 model (ue8m0 weights) -> UE8M0 intermediate scales so the down proj reads
@@ -1642,7 +1642,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
         # post-quant: trade the in-kernel gather for one packed-row copy where that wins. Keyed
         # on A being quantized, which the dynamic quant, a shared calibrated scale and the
         # per-expert layout above all reach; raw rows (decode) keep the gather.
-        A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, num_experts)
+        A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, num_experts, expert_start)
     C = A.new_empty(S, N, dtype=output_dtype)
     num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
@@ -1880,7 +1880,7 @@ def mx_dynamic_matmul_grouped(
         # GLM shape): the affine scale gather forfeits WS and the descriptor-A configs, so
         # materialized rows keep the faster GEMM.
         a_vals, act_scales, gather_idx = expand_gather_below_parity(
-            a_vals, act_scales, gather_idx, num_experts
+            a_vals, act_scales, gather_idx, num_experts, expert_start
         )
         n_rows = gather_idx.numel() if gather_idx is not None else a_vals.shape[0]
         n_m_tiles = n_rows // 128 + num_experts
@@ -2253,8 +2253,8 @@ def matmul_grouped(
     already expert-ordered), ``scatter_idx`` scatters the output. The fused MoE chain is one
     scheduling pass: gate_up with ``scatter_idx=None`` + ``gate=True`` + ``quantize_output=True``,
     then down with ``gather_idx=None`` and the
-    intermediate's scales as ``As``. EP-sentinel routes fall past ``expert_start[-1]`` and
-    are never touched.
+    intermediate's scales as ``As``. EP-sentinel routes sit past ``expert_start[-1]``, which
+    no tile reaches.
 
     Routes by what the weight tensors themselves say (there is no ``block_size``
     parameter — the quantization block is derived from the scale shape,
@@ -2271,7 +2271,7 @@ def matmul_grouped(
         # weight-only: raw bf16 rows are what the kernel consumes, so the trade is decided
         # here; the QUANTIZED formats decide it in their family wrappers AFTER the act quant
         # (expanding packed rows + scales — see ``expand_gather_below_parity``).
-        A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, B.shape[0])
+        A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, B.shape[0], expert_start)
     assert (a_global_scale is None and b_global_scale is None) or (
         Bs is not None and weight_format(B, Bs) == "nvfp4"
     ), "two-level globals (a_global_scale / b_global_scale) are NVFP4-only"

@@ -4,7 +4,7 @@ import torch.nn as nn
 
 import kernels
 
-liger_kernels = kernels.get_kernel("kernels-community/liger-kernels", version=3)
+liger_kernels = kernels.get_kernel("kernels-community/liger-kernels", version=4)
 
 DEVICE = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else None
 
