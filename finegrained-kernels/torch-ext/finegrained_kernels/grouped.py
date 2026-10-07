@@ -2253,8 +2253,8 @@ def matmul_grouped(
     already expert-ordered), ``scatter_idx`` scatters the output. The fused MoE chain is one
     scheduling pass: gate_up with ``scatter_idx=None`` + ``gate=True`` + ``quantize_output=True``,
     then down with ``gather_idx=None`` and the
-    intermediate's scales as ``As``. EP-sentinel routes fall past ``expert_start[-1]`` and
-    are never touched.
+    intermediate's scales as ``As``. EP-sentinel routes sit past ``expert_start[-1]``, which
+    no tile reaches.
 
     Routes by what the weight tensors themselves say (there is no ``block_size``
     parameter — the quantization block is derived from the scale shape,

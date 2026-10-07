@@ -622,8 +622,7 @@ def _routed_row_map_kernel(
     """For each routed row (expert-sorted): its expert and its row in the grouped GEMM's padded
     128-row expert tiles (-1 past every expert, an EP sentinel). The tile row is stored at the
     routed row, or at its ``ScatterIdx`` slot (``t * top_k + j``), so token ``t``'s ``top_k`` entries
-    name its routed rows' tiles. ``ScatterIdx`` holds only the local experts' rows (the scheduling
-    skips EP sentinels), so the rows past them have no slot to store to."""
+    name its routed rows' tiles."""
     if PDL:
         gdc_wait()
     rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -638,11 +637,7 @@ def _routed_row_map_kernel(
         in_expert = e_offs[None, :] == expert_id[:, None]
         tile_row = tl.sum(tl.where(in_expert, (tile_start_excl * 128 - exp_start)[None, :], 0), 1) + rows
         tile_row = tl.where(expert_id < NUM_EXPERTS_POW2, tile_row, -1)
-        if ScatterIdx is not None:
-            mask = mask & (tile_row >= 0)
-            dest = tl.load(ScatterIdx + rows, mask=mask, other=0)
-        else:
-            dest = rows
+        dest = tl.load(ScatterIdx + rows, mask=mask, other=0) if ScatterIdx is not None else rows
         tl.store(ScaleRows + dest, tile_row, mask=mask)
 
 
@@ -737,8 +732,7 @@ def mx_act_quant_routed_scales(
     y = torch.empty(T, K // 2 if packed else K, device=x.device, dtype=torch.uint8 if packed else FP8_DTYPE)
     cb = triton.cdiv(K // scale_group, 4)
     scales = torch.empty(1, n_m_tiles, cb, 2, 256, device=x.device, dtype=scale_dtype)
-    # (T, top_k); a slot routed to another rank's expert keeps -1, which the quant skips
-    scale_rows = torch.full((S,), -1, device=x.device, dtype=torch.int32)
+    scale_rows = torch.empty(S, device=x.device, dtype=torch.int32)  # (T, top_k)
     with device_context(x.device):
         compile_time_only_triton_wrap(_routed_row_map_kernel)[(triton.cdiv(S, ROUTED_ROW_MAP_BLOCK),)](
             expert_start, None, scale_rows, scatter_idx, S,
@@ -1162,7 +1156,8 @@ def _static_row_scale(S, ExpertStart, row, stride_s, NUM_EXPERTS: tl.constexpr, 
     vector (a gather or a repeat_interleave, either of which outweighs this whole kernel)."""
     if PER_EXPERT:
         ends = tl.load(ExpertStart + 1 + tl.arange(0, NUM_EXPERTS))
-        s = tl.load(S + tl.sum((ends <= row).to(tl.int32)))
+        # an EP-sentinel row past every expert takes the last scale; nothing reads its output
+        s = tl.load(S + tl.minimum(tl.sum((ends <= row).to(tl.int32)), NUM_EXPERTS - 1))
     else:
         s = tl.load(S + row * stride_s)
     return s

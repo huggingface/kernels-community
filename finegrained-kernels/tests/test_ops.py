@@ -645,6 +645,33 @@ def _skip_moe_only(problem: Problem, op: str) -> None:
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+@pytest.mark.parametrize("sentinel_fraction", [0.5, 1.0])
+def test_grouped_scheduling_defines_every_route(sentinel_fraction):
+    """Both maps are a permutation of the ``S`` routes: the local rows expert-sorted up to ``expert_start[E]``,
+    the EP-sentinel routes (another rank's experts) after them, so a consumer over all ``S`` rows reads real
+    slots and tokens."""
+    E, T, K = 8, 300, 4
+    g = torch.Generator(device=TEST_DEVICE).manual_seed(0)
+    expert_ids = torch.randint(0, E, (T, K), device=TEST_DEVICE, generator=g)
+    off_rank = torch.rand(T, K, device=TEST_DEVICE, generator=g) < sentinel_fraction
+    expert_ids = torch.where(off_rank, E + expert_ids, expert_ids)
+    # hand both maps' allocations back holding -1, so a slot the scheduling leaves unwritten fails every run
+    poison = [torch.full((T * K,), -1, device=TEST_DEVICE, dtype=torch.int32) for _ in range(2)]
+    del poison
+    expert_start, gather_idx, scatter_idx = finegrained_kernels.scheduling.compute_grouped_scheduling(
+        expert_ids, E, K
+    )
+    local = int((~off_rank).sum())
+    assert int(expert_start[-1]) == local
+    assert torch.equal(scatter_idx.long().sort().values, torch.arange(T * K, device=TEST_DEVICE))
+    assert torch.equal(gather_idx.long(), scatter_idx.long() // K)
+    routed = expert_ids.flatten()[scatter_idx.long()]
+    assert bool((routed[:local] < E).all()) and bool((routed[local:] >= E).all())
+    assert torch.equal(routed[:local].sort().values, routed[:local])
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("op", ["batched", "grouped", "matmul"])
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_op_scenarios(problem: Problem, op):
