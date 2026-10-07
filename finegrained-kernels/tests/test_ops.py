@@ -258,15 +258,21 @@ def scenarios() -> list[Problem]:
         Problem(weights="mxfp4", dtype=torch.float32),
         Problem(weights="mxfp8", dtype=torch.float16),
         Problem(weights="mxfp8", dtype=torch.float32),
-        # output bias (gpt-oss ships one on both projections): a plain cell per kernel family, and the
-        # gpt-oss gate_up itself — weight-only MXFP4 with the clamped SwiGLU, at prefill and decode
+        # output bias (gpt-oss ships one on both projections), added in the shared epilogue: one cell per kernel
+        # (full precision, block-FP8 dynamic and static, per-tensor FP8, MX dynamic, MX weight-only), then the
+        # epilogue paths — the two-level global applied before it, the gated columns, the swapped decode tile,
+        # block-FP8's unstacked-gate decode band, the requantized output — and the gpt-oss gate_up itself
         Problem(weights="bf16", bias=True),
         Problem(weights="fp8_128x128", bias=True),
+        Problem(weights="fp8_128x128", static=True, bias=True),
+        Problem(weights="fp8_tensor", bias=True),
         Problem(weights="mxfp8", bias=True),
+        Problem(weights="mxfp8", activation_format="bf16", bias=True),
         Problem(weights="nvfp4", bias=True),
         Problem(weights="mxfp8", gate=True, bias=True),
-        Problem(weights="fp8_128x128", gate=True, bias=True, S=8),  # block-FP8's unstacked-gate decode band
-        Problem(weights="fp8_128x128", gate=True, activation_format="fp8", quantize_output=True, S=8),  # its requant
+        Problem(weights="nvfp4", S=8, bias=True),
+        Problem(weights="fp8_128x128", gate=True, S=8, bias=True),
+        Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, bias=True),
         Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
         Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True, S=8),
     ]

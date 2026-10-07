@@ -179,17 +179,16 @@ MOE_PROBLEMS = [
     # ── GeGLU / ReGLU (activation orthogonal to format, one MXFP8 shape each) ──
     MoEProblem(weights="mxfp8", act_fn="gelu"),
     MoEProblem(weights="mxfp8", act_fn="relu"),
-    # ── per-expert output bias on both projections: the GPT-OSS gate_up (weight-only MXFP4, clamped
-    # SwiGLU) at decode and batch, block-FP8 inside and above its unstacked-gate decode band (S <= 16
-    # routed rows), and one cell per remaining family ──
-    MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=1, bias=True),
-    MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
-    MoEProblem(weights="fp8_128x128", num_tokens=1, bias=True),
-    MoEProblem(weights="fp8_128x128", num_tokens=64, num_top_k=2, bias=True),
-    MoEProblem(weights="mxfp8", bias=True),
-    MoEProblem(weights="mxfp4", bias=True),
-    MoEProblem(weights="nvfp4", bias=True),
+    # ── per-expert output bias on both projections, one cell per kernel family; block-FP8 also inside its
+    # unstacked-gate decode band (<= 16 routed rows), and the GPT-OSS gate_up (weight-only MXFP4, clamped SwiGLU,
+    # always unstacked) ──
     MoEProblem(weights="bf16", bias=True),
+    MoEProblem(weights="fp8_128x128", bias=True),
+    MoEProblem(weights="fp8_128x128", num_tokens=1, bias=True),
+    MoEProblem(weights="fp8_tensor", num_top_k=4, static=True, bias=True),
+    MoEProblem(weights="mxfp8", bias=True),
+    MoEProblem(weights="nvfp4", input_globals=True, bias=True),
+    MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=1, bias=True),
     # ── expert parallelism: non-local experts sentinel-masked ──
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="fp8_128x128", num_tokens=8, sentinel_fraction=0.875),
