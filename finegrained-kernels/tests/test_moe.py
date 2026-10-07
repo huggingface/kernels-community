@@ -62,6 +62,7 @@ class MoEProblem:
     expert_globals: bool = False  # the down's calibrated input_scale differs per expert
     static: bool = False  # calibrated (static) activation scale, one per expert
     post_expert_norm: Optional[str] = None  # a model's per-expert output norm, by name
+    bias: bool = False  # a per-expert output bias on both projections (GPT-OSS ships them)
 
     @property
     def id(self):
@@ -84,6 +85,7 @@ class MoEProblem:
             f"{'_expertglobals' if self.expert_globals else ''}"
             f"{'_static' if self.static else ''}"
             f"{'_' + self.post_expert_norm if self.post_expert_norm else ''}"
+            f"{'_bias' if self.bias else ''}"
             f"{'_sentinel' if self.sentinel_fraction > 0 else ''}"
         )
 
@@ -177,6 +179,17 @@ MOE_PROBLEMS = [
     # ── GeGLU / ReGLU (activation orthogonal to format, one MXFP8 shape each) ──
     MoEProblem(weights="mxfp8", act_fn="gelu"),
     MoEProblem(weights="mxfp8", act_fn="relu"),
+    # ── per-expert output bias on both projections: the GPT-OSS gate_up (weight-only MXFP4, clamped
+    # SwiGLU) at decode and batch, block-FP8 inside and above its unstacked-gate decode band (S <= 16
+    # routed rows), and one cell per remaining family ──
+    MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=1, bias=True),
+    MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
+    MoEProblem(weights="fp8_128x128", num_tokens=1, bias=True),
+    MoEProblem(weights="fp8_128x128", num_tokens=64, num_top_k=2, bias=True),
+    MoEProblem(weights="mxfp8", bias=True),
+    MoEProblem(weights="mxfp4", bias=True),
+    MoEProblem(weights="nvfp4", bias=True),
+    MoEProblem(weights="bf16", bias=True),
     # ── expert parallelism: non-local experts sentinel-masked ──
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="fp8_128x128", num_tokens=8, sentinel_fraction=0.875),
@@ -286,8 +299,8 @@ def _static_scales(problem: MoEProblem, hidden, gate_up, gate_up_s, top_k_index)
 
 
 def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s, gate_up_g, down_g):
-    """The kwargs every forward takes: the weights' second-level globals, the calibrated activation
-    globals and scales, the GLU knobs, and a model's per-expert output norm. The fused chain
+    """The kwargs every forward takes: the per-expert biases, the weights' second-level globals, the calibrated
+    activation globals and scales, the GLU knobs, and a model's per-expert output norm. The fused chain
     folds a named norm into its reduce while the unfused reference normalizes the routed rows in
     a pass of their own, so handing both the same weight is what makes that a parity check."""
     gate_up_in_g, down_in_g = _input_globals(problem, hidden)
@@ -297,7 +310,15 @@ def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s,
         if problem.post_expert_norm
         else None
     )
+    biases = dict(gate_up_proj_bias=None, down_proj_bias=None)
+    if problem.bias:
+        rows = {"gate_up_proj_bias": 2 * problem.intermediate_dim, "down_proj_bias": problem.hidden_dim}
+        biases = {
+            name: torch.randn(problem.num_experts, n, device=TEST_DEVICE, dtype=problem.dtype)
+            for name, n in rows.items()
+        }
     return dict(
+        **biases,
         gate_up_proj_weight_global_scale=gate_up_g,
         down_proj_weight_global_scale=down_g,
         gate_up_proj_input_global_scale=gate_up_in_g,
@@ -368,6 +389,7 @@ def test_fused_grouped(problem):
 
 
 _PRODUCTION_ARM_PROBLEMS = [
+    MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=1, bias=True),
     MoEProblem(weights="mxfp8"),
     MoEProblem(weights="fp8_128x128"),
     MoEProblem(weights="nvfp4", input_globals=True),
