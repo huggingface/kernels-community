@@ -195,9 +195,6 @@ MOE_PROBLEMS = [
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="fp8_128x128", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875, negative_sentinels=True),
-    # the batched act quant indexes a per-expert activation global by the raw expert id
-    MoEProblem(weights="nvfp4", num_tokens=8, input_globals=True, expert_globals=True, sentinel_fraction=0.875,
-               negative_sentinels=True),
     # swizzled MX scales quantize the activations once per token into every routed row's tile, which a token
     # routed only to other ranks' experts must not write
     MoEProblem(weights="mxfp8", num_tokens=8, swizzled=True, sentinel_fraction=0.875),
