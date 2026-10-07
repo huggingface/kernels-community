@@ -23,6 +23,9 @@ class CausalConv1dFn(torch.autograd.Function):
             raise NotImplementedError("activation must be None, silu, or swish")
         if x.stride(2) != 1 and x.stride(1) != 1:
             x = x.contiguous()
+        if x.stride(1) == 1 and (x.stride(0) % 8 != 0 or x.stride(2) % 8 != 0):
+            # Mamba2 slices xBC out of a projection whose full width can be unaligned.
+            x = x.transpose(1, 2).contiguous().transpose(1, 2)
         bias = bias.contiguous() if bias is not None else None
         if seq_idx is not None:
             assert (

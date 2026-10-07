@@ -5,9 +5,63 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from .._causal_conv1d import causal_conv1d_cuda, causal_conv1d_fn
-from .._ops import ops
+from .._ops import add_op_namespace_prefix, ops
 from ..utils.torch import custom_bwd, custom_fwd
 from .triton.layer_norm import _layer_norm_fwd
+
+
+def _selective_scan_fwd_fake(u, delta, A, B, C, D, z, delta_bias, delta_softplus):
+    batch, dim, seqlen = u.shape
+    n_chunks = (seqlen + 2048 - 1) // 2048
+    x = u.new_empty((batch, dim, n_chunks, A.shape[1] * 2), dtype=A.dtype)
+    return [torch.empty_like(delta), x] + ([torch.empty_like(z)] if z is not None else [])
+
+
+# XPU builds provide causal convolution, but do not define the native scan ops.
+if hasattr(ops, "selective_scan_fwd"):
+    torch.library.register_fake(add_op_namespace_prefix("selective_scan_fwd"))(_selective_scan_fwd_fake)
+
+
+# `selective_scan_bwd` returns undefined tensors for absent optionals as well as its `dz_`
+# argument, so it cannot be given a fake implementation directly. This wrapper gives it a
+# fixed signature that torch.compile can trace. Absent outputs are returned as empty tensors.
+@torch.library.custom_op(add_op_namespace_prefix("_selective_scan_bwd"), mutates_args=("dz",), device_types="cuda")
+def _selective_scan_bwd(
+    u: torch.Tensor,
+    delta: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor | None,
+    z: torch.Tensor | None,
+    delta_bias: torch.Tensor | None,
+    dout: torch.Tensor,
+    x: torch.Tensor | None,
+    out: torch.Tensor | None,
+    dz: torch.Tensor | None,
+    delta_softplus: bool,
+    recompute_out_z: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = ops.selective_scan_bwd(
+        u, delta, A, B, C, D, z, delta_bias, dout, x, out, dz, delta_softplus, recompute_out_z
+    )
+    empty = lambda: du.new_empty(0)  # one per output, outputs may not alias each other
+    # A passed-in `dz` is written in place, so only return the one the kernel allocated.
+    dz_out = rest[0] if z is not None and dz is None else empty()
+    out_z = rest[-1] if z is not None and recompute_out_z else empty()
+    dD = dD if D is not None else empty()
+    ddelta_bias = ddelta_bias if delta_bias is not None else empty()
+    return du, ddelta, dA, dB, dC, dD, ddelta_bias, dz_out, out_z
+
+
+@torch.library.register_fake(add_op_namespace_prefix("_selective_scan_bwd"))
+def _selective_scan_bwd_fake(u, delta, A, B, C, D, z, delta_bias, dout, x, out, dz, delta_softplus, recompute_out_z):
+    like = lambda t, keep=True: torch.empty_like(t) if keep and t is not None else u.new_empty(0)
+    return (
+        *(like(t) for t in (u, delta, A, B, C, D, delta_bias)),
+        like(z, dz is None),
+        like(out, z is not None and recompute_out_z),
+    )
 
 
 class SelectiveScanFn(torch.autograd.Function):
@@ -70,7 +124,7 @@ class SelectiveScanFn(torch.autograd.Function):
         # The kernel supports passing in a pre-allocated dz (e.g., in case we want to fuse the
         # backward of selective_scan_cuda with the backward of chunk).
         # Here we just pass in None and dz will be allocated in the C++ code.
-        du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = ops.selective_scan_bwd(
+        du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = _selective_scan_bwd(
             u,
             delta,
             A,
@@ -437,9 +491,12 @@ class MambaInnerFn(torch.autograd.Function):
         dxz = torch.empty_like(xz)  # (batch, dim, seqlen)
         dx, dz = dxz.chunk(2, dim=1)
         dout = rearrange(dout, "b l e -> e (b l)")
+        dout_proj_bias = dout.sum(dim=1) if not ctx.out_proj_bias_is_None else None
+        # Transformers can pass an FP32 output bias with BF16 projection weights.
+        dout = dout.to(dtype=out_proj_weight.dtype)
         dout_y = rearrange(out_proj_weight.t() @ dout, "d (b l) -> b d l", l=L)
-        dconv1d_out, ddelta, dA, dB, dC, dD, ddelta_bias, dz, out_z = (
-            ops.selective_scan_bwd(
+        dconv1d_out, ddelta, dA, dB, dC, dD, ddelta_bias, _, out_z = (
+            _selective_scan_bwd(
                 conv1d_out,
                 delta,
                 A,
@@ -459,7 +516,6 @@ class MambaInnerFn(torch.autograd.Function):
         dout_proj_weight = torch.einsum(
             "eB,dB->ed", dout, rearrange(out_z, "b d l -> d (b l)")
         )
-        dout_proj_bias = dout.sum(dim=(0, 1)) if not ctx.out_proj_bias_is_None else None
         dD = dD if D is not None else None
         dx_dbl = torch.empty_like(x_dbl)
         dB_proj_bias = None
@@ -536,6 +592,12 @@ class MambaInnerFn(torch.autograd.Function):
             None,
             None,
         )
+
+
+# Dynamo cannot trace MambaInnerFn.forward when its inputs are module parameters: it saves
+# no-op views of them (e.g. `D.contiguous()`, the rearranged conv weight) for backward, which
+# Dynamo rejects as intermediates aliasing an input. Keep it opaque to Dynamo instead.
+torch.compiler.allow_in_graph(MambaInnerFn)
 
 
 def mamba_inner_fn(

@@ -11,6 +11,8 @@ from .ops.selective_scan_interface import selective_scan_fn as cuda_selective_sc
 
 
 class mamba_inner_fn(nn.Module):
+    can_torch_compile = True
+
     def forward(
         self,
         xz: torch.Tensor,
@@ -54,6 +56,8 @@ class mamba_inner_fn(nn.Module):
 
 
 class mamba_split_conv1d_scan_combined(nn.Module):
+    can_torch_compile = True
+
     def forward(
         self,
         zxbcdt: torch.Tensor,
@@ -103,6 +107,8 @@ class mamba_split_conv1d_scan_combined(nn.Module):
 
 
 class mamba_chunk_scan_combined(nn.Module):
+    can_torch_compile = True
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -141,6 +147,8 @@ class mamba_chunk_scan_combined(nn.Module):
 
 
 class selective_state_update(nn.Module):
+    can_torch_compile = True
+
     def forward(
         self,
         state: torch.Tensor,
@@ -170,6 +178,8 @@ class selective_state_update(nn.Module):
 
 
 class selective_scan_fn(nn.Module):
+    can_torch_compile = True
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -202,6 +212,8 @@ class selective_scan_fn(nn.Module):
 
 
 class causal_conv1d_fn(nn.Module):
+    can_torch_compile = True
+
     def forward(
         self,
         hidden_states,
@@ -223,6 +235,8 @@ class causal_conv1d_fn(nn.Module):
 
 
 class causal_conv1d_update(nn.Module):
+    can_torch_compile = True
+
     def forward(
         self,
         hidden_states,
