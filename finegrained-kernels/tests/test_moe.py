@@ -195,6 +195,9 @@ MOE_PROBLEMS = [
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="fp8_128x128", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875, negative_sentinels=True),
+    # the batched act quant indexes a per-expert activation global by the raw expert id
+    MoEProblem(weights="nvfp4", num_tokens=8, input_globals=True, expert_globals=True, sentinel_fraction=0.875,
+               negative_sentinels=True),
     # swizzled MX scales quantize the activations once per token into every routed row's tile, which a token
     # routed only to other ranks' experts must not write
     MoEProblem(weights="mxfp8", num_tokens=8, swizzled=True, sentinel_fraction=0.875),
@@ -389,8 +392,8 @@ def test_grouped_scheduling_defines_every_route(sentinel_fraction, negative):
     g = torch.Generator(device=TEST_DEVICE).manual_seed(0)
     expert_ids = torch.randint(0, E, (T, K), device=TEST_DEVICE, generator=g)
     off_rank = torch.rand(T, K, device=TEST_DEVICE, generator=g) < sentinel_fraction
-    expert_ids = torch.where(off_rank, -1 - expert_ids if negative else E + expert_ids, expert_ids)
-    # hand both maps' allocations back holding -1, so a slot the scheduling leaves unwritten fails every run
+    expert_ids = torch.where(off_rank, -1 if negative else E, expert_ids)
+    # the caching allocator hands these freed blocks to the `torch.empty` maps: an unwritten slot reads -1
     poison = [torch.full((T * K,), -1, device=TEST_DEVICE, dtype=torch.int32) for _ in range(2)]
     del poison
     expert_start, gather_idx, scatter_idx = scheduling.compute_grouped_scheduling(expert_ids, E, K)

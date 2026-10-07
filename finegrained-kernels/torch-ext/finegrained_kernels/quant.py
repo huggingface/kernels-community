@@ -438,7 +438,7 @@ def _mx_act_quant_kernel(
     GlobalIdx,  # (T,) row -> expert map, for a per-expert global on the DENSE grid (the batched op's own expert_ids); None on the grouped grid, whose tiles carry an expert
     ScaleRows,  # (T, SCALE_ROWS) dense row -> its rows of the swizzled scale tiles (-1 skips); None = the row itself
     stride_global,  # expert stride of GlobalScale (0 broadcasts a scalar)
-    last_global,  # index of GlobalScale's last entry — clamps GlobalIdx, whose EP sentinel rows name an out-of-range expert (they are masked out of the GEMM, so any in-range global serves them)
+    last_global,  # index of GlobalScale's last entry — GlobalIdx is clamped to [0, last_global]: an EP sentinel row names an off-rank expert (masked out of the GEMM, so any in-range global serves it)
     stride_x_t,
     stride_x_k,
     T,
@@ -517,7 +517,7 @@ def _mx_act_quant_kernel(
         # the grouped grid resolved for free — the rows of a tile belong to one expert; the dense
         # grid has no such layout and takes the caller's row map. None folds the arm out.
         if GlobalIdx is not None:
-            e = tl.minimum(tl.load(GlobalIdx + out_row, mask=row_mask, other=0), last_global)
+            e = tl.minimum(tl.maximum(tl.load(GlobalIdx + out_row, mask=row_mask, other=0), 0), last_global)
             x = x / tl.load(GlobalScale + e * stride_global).to(tl.float32)[:, None]
         else:
             x = x / tl.load(GlobalScale + expert_id * stride_global).to(tl.float32)

@@ -773,7 +773,7 @@ def moe_torch_grouped(
     top_k = top_k_index.shape[1]
     out_dtype = hidden_states.dtype
 
-    # route: stable-sort routed slots by expert into contiguous groups (torch has no gather/scatter fuse)
+    # route: sort routed slots by expert into contiguous groups (torch has no gather/scatter fuse)
     flat_e = top_k_index.reshape(-1)
     flat_e = torch.where(off_rank(flat_e, E), E, flat_e)  # EP sentinels, -1 included, sort past every group
     slot_e, order = torch.sort(flat_e)  # expert of each sorted slot, for the per-expert biases
