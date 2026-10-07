@@ -298,6 +298,16 @@ def _static_scales(problem: MoEProblem, hidden, gate_up, gate_up_s, top_k_index)
     return tuple(scale.contiguous() for scale in scales)
 
 
+def _biases(problem: MoEProblem):
+    """The per-expert output biases, ``(E, 2I)`` on gate_up (added before the GLU) and ``(E, H)`` on down, at the
+    activation dtype as a checkpoint ships them; ``None`` on a problem without them."""
+    if not problem.bias:
+        return None, None
+    gate_up_bias = torch.randn(problem.num_experts, 2 * problem.intermediate_dim, device=TEST_DEVICE, dtype=problem.dtype)
+    down_bias = torch.randn(problem.num_experts, problem.hidden_dim, device=TEST_DEVICE, dtype=problem.dtype)
+    return gate_up_bias, down_bias
+
+
 def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s, gate_up_g, down_g):
     """The kwargs every forward takes: the per-expert biases, the weights' second-level globals, the calibrated
     activation globals and scales, the GLU knobs, and a model's per-expert output norm. The fused chain
@@ -310,15 +320,10 @@ def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s,
         if problem.post_expert_norm
         else None
     )
-    biases = dict(gate_up_proj_bias=None, down_proj_bias=None)
-    if problem.bias:
-        rows = {"gate_up_proj_bias": 2 * problem.intermediate_dim, "down_proj_bias": problem.hidden_dim}
-        biases = {
-            name: torch.randn(problem.num_experts, n, device=TEST_DEVICE, dtype=problem.dtype)
-            for name, n in rows.items()
-        }
+    gate_up_bias, down_bias = _biases(problem)
     return dict(
-        **biases,
+        gate_up_proj_bias=gate_up_bias,
+        down_proj_bias=down_bias,
         gate_up_proj_weight_global_scale=gate_up_g,
         down_proj_weight_global_scale=down_g,
         gate_up_proj_input_global_scale=gate_up_in_g,
@@ -389,11 +394,11 @@ def test_fused_grouped(problem):
 
 
 _PRODUCTION_ARM_PROBLEMS = [
-    MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=1, bias=True),
     MoEProblem(weights="mxfp8"),
     MoEProblem(weights="fp8_128x128"),
     MoEProblem(weights="nvfp4", input_globals=True),
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
+    MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=1, bias=True),
 ]
 
 
