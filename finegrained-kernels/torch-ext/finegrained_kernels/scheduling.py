@@ -71,6 +71,17 @@ _ROUTING_BLOCK_SIZE = 256
 
 
 @triton.jit
+def is_off_rank(expert_id, num_experts):
+    """An EP sentinel: any id outside ``[0, num_experts)`` routes to another rank's expert."""
+    return (expert_id < 0) | (expert_id >= num_experts)
+
+
+def off_rank(expert_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """``is_off_rank`` on the host."""
+    return (expert_ids < 0) | (expert_ids >= num_experts)
+
+
+@triton.jit
 def _exclusive_offsets_kernel(
     ExpertFreq, ExpertStart, Counters, NUM_EXPERTS: tl.constexpr
 ):
@@ -99,14 +110,14 @@ def _scatter_kernel(
     """Counting-sort scatter: each flat slot atomically claims the next slot of its expert
     (``expert_start[e] + counter[e]++``). O(S), replaces an O(S·logS) argsort. Within-expert
     order is arbitrary (atomic race) — fine, the per-token reduce is order-invariant. Slots whose
-    expert is non-local (EP sentinel id ``>= NUM_EXPERTS``) fill the tail past
+    expert is non-local (an ``is_off_rank`` EP sentinel) fill the tail past
     ``expert_start[E]``, one atomic per block, so every entry of both maps is a real slot / token
     and a consumer that runs over all ``S`` rows reads in bounds; the tiles never reach them."""
     offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     in_range = offs < S
     expert_id = tl.load(ExpertIds + offs, mask=in_range, other=NUM_EXPERTS)
-    valid = expert_id < NUM_EXPERTS
-    sentinel = in_range & (expert_id >= NUM_EXPERTS)
+    sentinel = in_range & is_off_rank(expert_id, NUM_EXPERTS)
+    valid = in_range & ~sentinel
     local = tl.load(ExpertStart + expert_id, mask=valid, other=0) + tl.atomic_add(
         Counters + expert_id, 1, mask=valid, sem="relaxed"
     )
@@ -131,7 +142,7 @@ def _count_kernel(
     mask = offs < S
     expert_id = tl.load(ExpertIds + offs, mask=mask, other=NUM_EXPERTS)
     tl.atomic_add(
-        ExpertFreq + expert_id, 1, mask=mask & (expert_id < NUM_EXPERTS), sem="relaxed"
+        ExpertFreq + expert_id, 1, mask=mask & ~is_off_rank(expert_id, NUM_EXPERTS), sem="relaxed"
     )
 
 
@@ -377,7 +388,42 @@ def resolve_grouped_tile(
     return pid_n, expert_id, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start
 
 
-def expand_gather_below_parity(vals, scales, gather_idx, num_experts):
+@triton.jit
+def _gather_local_rows_kernel(Src, Dst, GatherIdx, ExpertStart, row_words, NUM_EXPERTS: tl.constexpr,
+                              BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr):
+    """``Dst[r] = Src[GatherIdx[r]]`` for ``BLOCK_R`` routed rows per program, in machine words; the
+    EP-sentinel tail past ``expert_start[E]`` is never read, so a program wholly inside it returns."""
+    local = tl.load(ExpertStart + NUM_EXPERTS)
+    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    if tl.program_id(0) * BLOCK_R >= local:
+        return
+    row_mask = rows < local
+    src = tl.load(GatherIdx + rows, mask=row_mask, other=0).to(tl.int64)
+    for c in range(0, row_words, BLOCK_C):
+        cols = c + tl.arange(0, BLOCK_C)
+        mask = row_mask[:, None] & (cols < row_words)[None, :]
+        vals = tl.load(Src + src[:, None] * row_words + cols[None, :], mask=mask)
+        tl.store(Dst + rows.to(tl.int64)[:, None] * row_words + cols[None, :], vals, mask=mask)
+
+
+def _gather_local_rows(x, gather_idx, expert_start, num_experts):
+    """``x[gather_idx]`` over the local routed rows only (the expansion's copy). 4 rows x 256 words per
+    program: 18-71% under torch's index copy without EP (32k rows, bf16 / packed fp4 / scales), and the
+    off-rank tail skipped under it."""
+    S = gather_idx.shape[0]
+    row_bytes = x[0].numel() * x.element_size()
+    word = next(w for w in (torch.int64, torch.int32, torch.int16, torch.uint8) if row_bytes % w.itemsize == 0)
+    rows = x.contiguous().view(x.shape[0], -1).view(word)
+    out = torch.empty(S, rows.shape[1], device=x.device, dtype=word)
+    with device_context(x.device):
+        compile_time_only_triton_wrap(_gather_local_rows_kernel)[(triton.cdiv(S, 4),)](
+            rows, out, gather_idx, expert_start, rows.shape[1], NUM_EXPERTS=num_experts,
+            BLOCK_R=4, BLOCK_C=256, num_warps=4,
+        )
+    return out.view(x.dtype).view(S, *x.shape[1:])
+
+
+def expand_gather_below_parity(vals, scales, gather_idx, num_experts, expert_start):
     """Trade an in-kernel activation gather for one contiguous copy of the (packed) rows +
     scales, when the copy beats what gathering can offer: on sm_10x the gathered descriptor
     arm is tma gather4, MONOTONIC in tokens/expert (2x loss at 32/expert, parity ~1024 — the
@@ -390,10 +436,9 @@ def expand_gather_below_parity(vals, scales, gather_idx, num_experts):
     if gather_idx is None:
         return vals, scales, gather_idx
     if expand_regime(gather_idx.shape[0], num_experts):
-        g = gather_idx.to(torch.long)
-        vals = vals[g].contiguous()
+        vals = _gather_local_rows(vals, gather_idx, expert_start, num_experts)
         if scales is not None and scales.ndim == 2:  # row-major per-row scales follow the rows
-            scales = scales[g].contiguous()
+            scales = _gather_local_rows(scales, gather_idx, expert_start, num_experts)
         gather_idx = None
     return vals, scales, gather_idx
 

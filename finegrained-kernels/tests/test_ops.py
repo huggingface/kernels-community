@@ -169,6 +169,10 @@ def scenarios() -> list[Problem]:
         Problem(weights="mxfp8", prequant=True),
         Problem(weights="nvfp4", prequant=True),
         Problem(weights="mxfp8", sentinel_fraction=0.25),
+        # the prefill expansion (>= 4096 routed rows below 1024 per expert) copies only the local rows:
+        # values + 2D scales, and raw bf16 rows
+        Problem(weights="fp8_128x128", S=4096, E=8, sentinel_fraction=0.5),
+        Problem(weights="bf16", S=4096, E=8, sentinel_fraction=0.5),
         Problem(weights="mxfp8", noncontiguous=True),
         Problem(weights="mxfp8", empty_expert=True),
         # decode shape (small M — inline act-quant on MX, the software/scalar arms elsewhere)

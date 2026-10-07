@@ -29,6 +29,7 @@ from .formats import check_activation_format, global_scale_stride, normalize_glo
 from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
+from .scheduling import is_off_rank
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .loading.tiles import (
     advance_ptrs,
@@ -77,7 +78,7 @@ def expert_setup(
     row is ``ScatterIdx[batch_id]`` when ``ScatterIdx`` is not None else ``batch_id`` — the same virtual
     gather/scatter ``matmul_grouped`` does, so the routed rows need no materialized copy.
 
-    The caller must early-return on the EP sentinel (``expert_id >= num_experts``)
+    The caller must early-return on the EP sentinel (``is_off_rank``)
     before any load — the pointer arithmetic itself is harmless, only the loads on a
     non-local expert would be out of bounds."""
     batch_id = tl.program_id(axis=0)
@@ -197,7 +198,7 @@ def w8a8_block_dynamic_fp8_matmul_batched_kernel(
         stride_eid,
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
-    if expert_id >= num_experts:
+    if is_off_rank(expert_id, num_experts):
         return
 
     # One scale per quant block, broadcast over the tile, so an N tile narrower than BLOCK_N just
@@ -329,7 +330,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
         stride_eid,
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
-    if expert_id >= num_experts:
+    if is_off_rank(expert_id, num_experts):
         return
 
     # this batch's expert scale: stride 0 means one calibrated scale for every expert. It feeds
@@ -464,7 +465,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
         stride_eid,
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
-    if expert_id >= num_experts:
+    if is_off_rank(expert_id, num_experts):
         return
 
     # under GATE the gate|up rows are interleaved, so the tile is one 2*BN span
@@ -637,7 +638,7 @@ def mx_dynamic_matmul_batched_kernel(
         ADVANCE_BS=False,  # scale leaf applies the per-expert offset (swizzled indexes by block)
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
-    if expert_id >= num_experts:
+    if is_off_rank(expert_id, num_experts):
         return
 
     # each operand's format is its dtype: uint8 = packed E2M1 (two values per byte, W4A4
@@ -793,7 +794,7 @@ def mx_weight_only_matmul_batched_kernel(
         A, B, C, Bs, ExpertIds, GatherIdx, ScatterIdx,
         stride_a_m, stride_b_e, stride_c_m, stride_bs_e, stride_eid, ADVANCE_BS=False,
     )
-    if expert_id >= num_experts:  # EP sentinel: non-local expert, output left uninit
+    if is_off_rank(expert_id, num_experts):  # EP sentinel: non-local expert, output left uninit
         return
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     # non-128 N: the last N-tile's rows run past B (N=320, n_width=256 -> tile 2 wants rows
@@ -939,7 +940,7 @@ def full_precision_matmul_batched_kernel(
         ADVANCE_BS=False,
     )
     # EP sentinel: row routed to a non-local expert; output is left uninit.
-    if expert_id >= num_experts:
+    if is_off_rank(expert_id, num_experts):
         return
 
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
