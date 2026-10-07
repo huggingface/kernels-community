@@ -9,8 +9,7 @@ einops = kernels.get_kernel("kernels-community/einops", version=1)
 rearrange = einops.rearrange
 reduce = einops.reduce
 EinopsError = einops.EinopsError
-from . import collect_test_backends, is_backend_tested
-from . import FLOAT_REDUCTIONS as REDUCTIONS
+from . import collect_test_backends, is_backend_tested, FLOAT_REDUCTIONS as REDUCTIONS
 
 __author__ = "Alex Rogozhnikov"
 

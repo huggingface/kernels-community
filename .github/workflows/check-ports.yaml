@@ -1,0 +1,50 @@
+name: Check Ports
+
+# Verify committed src trees match their port recipes. PRs check changed ports;
+# checker changes, pushes to main, scheduled runs and manual runs check all ports.
+on:
+  push:
+    branches: [main]
+  # Catch kernel-port regressions even when no port changes.
+  schedule:
+    - cron: "0 6 * * *"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - "*/port/**"
+      - "*/src/**"
+      - "scripts/check_ports.py"
+      - ".github/workflows/check-ports.yaml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check-ports:
+    name: Check ports reproduce
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Regenerate selected ports and compare
+        env:
+          # Refresh the runner to catch upstream changes.
+          # TODO: switch back to main once huggingface/kernels#877 is merged.
+          KERNEL_PORT: "nix run --refresh github:huggingface/kernels/kernel-port-no-importlib#kernel-port --"
+          BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            python3 scripts/check_ports.py --changed-since "$BASE_REF"
+          else
+            python3 scripts/check_ports.py
+          fi

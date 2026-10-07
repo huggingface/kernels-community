@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "recipe": "sha256:238127312e85c9489a67de689d3b2e59c75c456f6839afb640f344ef0e7965d5",
+  "runner": "kernel-port 0.1.0",
+  "sources": {
+    "upstream": {
+      "repo": "https://github.com/arogozhnikov/einops.git",
+      "commit": "ad2c8d67d08cbebb45e1aff2be21dc88635fc695"
+    }
+  },
+  "tree": "sha256:418031b9de86c73cadcf391017cb3f666fd816137449513b481f4af2caa6fe53"
+}

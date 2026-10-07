@@ -40,7 +40,9 @@ def discover_kernels(repository_root: Path) -> list[Kernel]:
         if not manifest.is_file():
             # Ported kernels keep generated sources and build.toml under src/.
             manifest = root / "src" / "build.toml"
-        if not manifest.is_file() or not (root / "tests").is_dir():
+        # A ported kernel generates its tests next to build.toml in src/.
+        tests_root = manifest.parent if (manifest.parent / "tests").is_dir() else root
+        if not manifest.is_file() or not (tests_root / "tests").is_dir():
             continue
 
         with manifest.open("rb") as handle:
@@ -52,7 +54,7 @@ def discover_kernels(repository_root: Path) -> list[Kernel]:
             raise ValueError(f"{manifest}: [general.hub].repo-id must be a string")
         if type(version) is not int:
             raise ValueError(f"{manifest}: [general].version must be an integer")
-        kernels.append(Kernel(root=root, repo_id=repo_id, version=version))
+        kernels.append(Kernel(root=tests_root, repo_id=repo_id, version=version))
     return kernels
 
 
