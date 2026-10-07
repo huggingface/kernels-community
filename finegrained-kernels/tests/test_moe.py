@@ -192,6 +192,10 @@ MOE_PROBLEMS = [
     # ── expert parallelism: non-local experts sentinel-masked ──
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="fp8_128x128", num_tokens=8, sentinel_fraction=0.875),
+    # swizzled MX scales quantize the activations once per token into every routed row's tile, which a token
+    # routed only to other ranks' experts must not write
+    MoEProblem(weights="mxfp8", num_tokens=8, swizzled=True, sentinel_fraction=0.875),
+    MoEProblem(weights="nvfp4", num_tokens=8, swizzled=True, sentinel_fraction=0.875),
     # int32 pointer-offset overflow guard for the fused paths: the last experts'
     # gate_up offsets exceed 2^31 elements (127 * 2*2048 * 6144 = 3.196e9); a regressed
     # int64 cast corrupts the high-routed tokens vs the torch reference. E is a power of
