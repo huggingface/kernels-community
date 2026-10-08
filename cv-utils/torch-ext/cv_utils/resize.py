@@ -203,6 +203,11 @@ def _horizontal_pass(
     """
     device = frames[0].device
     channels = frames[0].shape[0]
+    if any(
+        frame.dtype != torch.uint8 or frame.ndim != 3 or frame.device != device or frame.shape[0] != channels
+        for frame in frames
+    ):
+        raise ValueError("Frames must be uint8 (C, H, W) tensors on one device with the same number of channels.")
     frames = [frame.contiguous() for frame in frames]
     heights = [frame.shape[1] for frame in frames]
     widths = [frame.shape[2] for frame in frames]
@@ -309,6 +314,8 @@ def resize_normalize(
     else:
         resize_sizes = [tuple(size)] * len(images)
     out_height, out_width = crop_size if crop_size is not None else size
+    if any(height < out_height or width < out_width for height, width in resize_sizes):
+        raise ValueError(f"crop_size {crop_size} is larger than a resized image.")
     cubic = resample == "bicubic"
     resize_heights = [height for height, _ in resize_sizes]
     intermediate, intermediate_offsets, heights, resize_heights_tensor, vertical_table = _horizontal_pass(

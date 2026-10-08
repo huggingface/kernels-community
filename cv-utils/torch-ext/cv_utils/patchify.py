@@ -107,6 +107,11 @@ def resize_normalize_patchify(
     device = frames[0].device
     channels = frames[0].shape[0]
     cubic = resample == "bicubic"
+    factor = patch_size * merge_size
+    if any(height % factor or width % factor for height, width in target_sizes):
+        raise ValueError(f"Every target size must be a multiple of patch_size * merge_size = {factor}.")
+    if any(len({tuple(target_sizes[index]) for index in item}) != 1 for item in items):
+        raise ValueError("The frames of one item must share a target size.")
     out_heights = [height for height, _ in target_sizes]
     out_widths = [width for _, width in target_sizes]
     intermediate, intermediate_offsets, heights, _, vertical_table = _horizontal_pass(
