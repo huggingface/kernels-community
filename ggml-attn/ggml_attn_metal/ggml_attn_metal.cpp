@@ -47,12 +47,16 @@ at::Tensor flash_attn(const at::Tensor &q, const at::Tensor &k, const at::Tensor
               "flash_attn: n_heads must be a multiple of n_heads_kv, got ", n_heads, " and ",
               n_heads_kv);
 
-  // q is f32, as ggml computes it. K/V keep an f16 cache as it is -- converting it would copy the whole
-  // cache, every call, and then read twice the bytes -- and anything else goes to f32.
+  // q is f32, as ggml computes it. K/V keep an f16 or bf16 cache as it is -- converting it would copy
+  // the whole cache, every call, and then read twice the bytes. Mixed types go to f32.
   const auto qc = as_f32(q);
-  const bool kv_f16 = k.scalar_type() == at::kHalf && v.scalar_type() == at::kHalf;
-  const auto kc = kv_f16 ? k.contiguous() : as_f32(k);
-  const auto vc = kv_f16 ? v.contiguous() : as_f32(v);
+  int kv_type = GGML_ATTN_KV_F32;
+  if (k.scalar_type() == v.scalar_type()) {
+    if (k.scalar_type() == at::kHalf) kv_type = GGML_ATTN_KV_F16;
+    if (k.scalar_type() == at::kBFloat16) kv_type = GGML_ATTN_KV_BF16;
+  }
+  const auto kc = kv_type == GGML_ATTN_KV_F32 ? as_f32(k) : k.contiguous();
+  const auto vc = kv_type == GGML_ATTN_KV_F32 ? as_f32(v) : v.contiguous();
 
   // ggml's kernel reads an f16 mask. A caller's additive f32 mask is small (one row per query), so
   // converting here costs little and keeps the caller's side ordinary.
@@ -85,7 +89,7 @@ at::Tensor flash_attn(const at::Tensor &q, const at::Tensor &k, const at::Tensor
       byte_offset(vc), mtl_buffer(mc), byte_offset(mc), mtl_buffer(pad), byte_offset(pad),
       mtl_buffer(tmp), byte_offset(tmp), mtl_buffer(blk), byte_offset(blk), mtl_buffer(dst),
       byte_offset(dst), n_seqs, n_heads,
-      n_heads_kv, n_q, n_kv, head_dim_k, head_dim_v, static_cast<float>(scale), has_mask, kv_f16);
+      n_heads_kv, n_q, n_kv, head_dim_k, head_dim_v, static_cast<float>(scale), has_mask, kv_type);
   TORCH_CHECK(rc == 0, "ggml-attn: no kernel for n_q ", n_q, ", head_dim ", head_dim_k, "/",
               head_dim_v, " (rc ", rc, ") -- ask `supports_flash_attn` first");
   return dst;

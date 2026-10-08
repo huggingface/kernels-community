@@ -15,16 +15,19 @@
 
 extern "C" {
 
+// The cache types there are kernels for.
+enum { GGML_ATTN_KV_F32 = 0, GGML_ATTN_KV_F16 = 1, GGML_ATTN_KV_BF16 = 2 };
+
 // Flash attention, ggml's GGML_OP_FLASH_ATTN_EXT, vector path only (see `supports` below).
 //
 // Shapes in torch order, which is also SDPA's:
 //   q     (n_seqs, n_heads,    n_q,  head_dim_k)  f32
-//   k     (n_seqs, n_heads_kv, n_kv, head_dim_k)  f16 or f32 (`kv_f16`)
+//   k     (n_seqs, n_heads_kv, n_kv, head_dim_k)  f32, f16 or bf16 (`kv_type`)
 //   v     (n_seqs, n_heads_kv, n_kv, head_dim_v)  same type as k
 //   mask  (n_seqs, 1, n_q, n_kv)                  f16, additive; may be null
 //   dst   (n_seqs, n_q, n_heads, head_dim_v)      f32   <- note: heads and tokens swapped
 //
-// An f16 cache is read as f16, the way llama.cpp's default cache is; f32 is read as f32.
+// The cache is read in its own type, as llama.cpp binds it: an f16 or bf16 cache is not converted.
 //
 // Grouped-query attention is native: `n_heads_kv` may be smaller than `n_heads` and no expansion of
 // k or v is needed. `dst` comes out with tokens before heads, which is the layout a caller wants
@@ -40,7 +43,7 @@ int ggml_attn_metal_flash_attn(void *q, size_t q_off, void *k, size_t k_off, voi
                           void *mask, size_t mask_off, void *pad, size_t pad_off, void *tmp,
                           size_t tmp_off, void *blk, size_t blk_off, void *dst, size_t dst_off, int64_t n_seqs, int64_t n_heads,
                           int64_t n_heads_kv, int64_t n_q, int64_t n_kv, int64_t head_dim_k,
-                          int64_t head_dim_v, float scale, int has_mask, int kv_f16);
+                          int64_t head_dim_v, float scale, int has_mask, int kv_type);
 
 // Scratch sizes in floats for the shapes above, so the caller allocates them from torch.
 void ggml_attn_metal_flash_attn_scratch(int64_t n_seqs, int64_t n_heads, int64_t n_heads_kv, int64_t n_q,

@@ -35,8 +35,10 @@ src = [
     "ggml_attn_metal/ggml_dispatch.mm",
     "ggml_attn_metal/common.h",
     # Upstream's Metal kernels, compiled as they ship: one file per operation, so a package
-    # lists the ones it dispatches.
-    "vendor/src/ggml-metal/kernels/fa.metal",
+    # lists the ones it dispatches. fa.metal includes upstream's (vendored as fa.metal.h) with the
+    # bf16 kernels enabled, as llama.cpp builds them.
+    "ggml_attn_metal/fa.metal",
+    "vendor/src/ggml-metal/kernels/fa.metal.h",
     "vendor/src/ggml-metal/kernels/common.h",
     "vendor/src/ggml-metal/kernels/dequantize.h",
     "vendor/src/ggml-metal/ggml-metal-impl.h",

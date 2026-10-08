@@ -100,6 +100,11 @@ void set_bool(MTLFunctionConstantValues *cv, bool value, NSUInteger index) {
 
 int64_t pad_to(int64_t x, int64_t n) { return ((x + n - 1) / n) * n; }
 
+// ggml_type_name of the cache, which names the kernel instantiation upstream picks.
+const char *kv_type_name(int kv_type) {
+  return kv_type == GGML_ATTN_KV_F16 ? "f16" : kv_type == GGML_ATTN_KV_BF16 ? "bf16" : "f32";
+}
+
 // Upstream's two flash-attention paths, from ggml-metal-impl.h and the dispatch in
 // ggml-metal-ops.cpp. Both are ported: the vector one for few queries, the tiled one above that.
 constexpr int FA_VEC_NQPSG = 1;   // queries per threadgroup
@@ -241,7 +246,7 @@ static int fa_dispatch_tiled(void *q, size_t q_off, void *k, size_t k_off, void 
                              size_t blk_off, void *dst, size_t dst_off, int64_t n_seqs,
                              int64_t n_heads, int64_t n_heads_kv, int64_t n_q, int64_t n_kv,
                              int64_t head_dim_k, int64_t head_dim_v, float scale, int has_mask,
-                             int kv_f16) {
+                             int kv_type) {
   const bool has_kvpad = (n_kv % FA_NCPSG) != 0;
   // "do bounds checks for the mask?" -- upstream sets it when the query count does not fill whole
   // threadgroups, so the last one would read past the mask.
@@ -252,7 +257,7 @@ static int fa_dispatch_tiled(void *q, size_t q_off, void *k, size_t k_off, void 
   const uint64_t f32 = sizeof(float), f16 = 2;
   const uint64_t nb01 = f32 * head_dim_k, nb02 = nb01 * n_q, nb03 = nb02 * n_heads;
   // K/V are read in their own type, as upstream binds an f16 cache: only the element size changes.
-  const uint64_t kv = kv_f16 ? f16 : f32;
+  const uint64_t kv = kv_type == GGML_ATTN_KV_F32 ? f32 : f16;  // f16 and bf16 are both 2 bytes
   const uint64_t nb11 = kv * head_dim_k, nb12 = nb11 * n_kv, nb13 = nb12 * n_heads_kv;
   const uint64_t nb21 = kv * head_dim_v, nb22 = nb21 * n_kv, nb23 = nb22 * n_heads_kv;
   const uint64_t nb31 = f16 * n_kv, nb32 = nb31 * n_q, nb33 = nb32;
@@ -297,7 +302,7 @@ static int fa_dispatch_tiled(void *q, size_t q_off, void *k, size_t k_off, void 
   };
 
   char fn[160];
-  snprintf(fn, sizeof(fn), "kernel_flash_attn_ext_%s_dk%lld_dv%lld", kv_f16 ? "f16" : "f32",
+  snprintf(fn, sizeof(fn), "kernel_flash_attn_ext_%s_dk%lld_dv%lld", kv_type_name(kv_type),
            (long long)head_dim_k, (long long)head_dim_v);
   std::string key = std::string(fn) + "_mask=" + std::to_string(has_mask != 0) +
                     "_kvpad=" + std::to_string(has_kvpad) + "_bcm=" + std::to_string(bc_mask) +
@@ -439,14 +444,14 @@ extern "C" int ggml_attn_metal_flash_attn(void *q, size_t q_off, void *k, size_t
                                           size_t blk_off, void *dst, size_t dst_off, int64_t n_seqs,
                                           int64_t n_heads, int64_t n_heads_kv, int64_t n_q,
                                           int64_t n_kv, int64_t head_dim_k, int64_t head_dim_v,
-                                          float scale, int has_mask, int kv_f16) {
+                                          float scale, int has_mask, int kv_type) {
   if (!ggml_attn_metal_supports_flash_attn(n_q, head_dim_k, head_dim_v)) {
     return 1;
   }
   if (!fa_use_vec(n_q, head_dim_k)) {
     return fa_dispatch_tiled(q, q_off, k, k_off, v, v_off, mask, mask_off, pad, pad_off, blk,
                              blk_off, dst, dst_off, n_seqs, n_heads, n_heads_kv, n_q, n_kv,
-                             head_dim_k, head_dim_v, scale, has_mask, kv_f16);
+                             head_dim_k, head_dim_v, scale, has_mask, kv_type);
   }
   const bool has_kvpad = (n_kv % FA_VEC_NCPSG) != 0;
   const int nsg = fa_vec_nsg(n_kv);
@@ -457,7 +462,7 @@ extern "C" int ggml_attn_metal_flash_attn(void *q, size_t q_off, void *k, size_t
   const uint64_t f32 = sizeof(float), f16 = 2;
   const uint64_t nb01 = f32 * head_dim_k, nb02 = nb01 * n_q, nb03 = nb02 * n_heads;
   // K/V are read in their own type, as upstream binds an f16 cache: only the element size changes.
-  const uint64_t kv = kv_f16 ? f16 : f32;
+  const uint64_t kv = kv_type == GGML_ATTN_KV_F32 ? f32 : f16;  // f16 and bf16 are both 2 bytes
   const uint64_t nb11 = kv * head_dim_k, nb12 = nb11 * n_kv, nb13 = nb12 * n_heads_kv;
   const uint64_t nb21 = kv * head_dim_v, nb22 = nb21 * n_kv, nb23 = nb22 * n_heads_kv;
   const uint64_t nb31 = f16 * n_kv, nb32 = nb31 * n_q, nb33 = nb32;  // mask ne32 == 1
@@ -505,7 +510,7 @@ extern "C" int ggml_attn_metal_flash_attn(void *q, size_t q_off, void *k, size_t
 
   char vec_fn[160];
   snprintf(vec_fn, sizeof(vec_fn), "kernel_flash_attn_ext_vec_%s_dk%lld_dv%lld",
-           kv_f16 ? "f16" : "f32", (long long)head_dim_k, (long long)head_dim_v);
+           kv_type_name(kv_type), (long long)head_dim_k, (long long)head_dim_v);
   std::string vec_key = std::string(vec_fn) + "_mask=" + std::to_string(has_mask != 0) +
                         "_kvpad=" + std::to_string(has_kvpad) +
                         "_ns10=" + std::to_string(args.ns10) +
