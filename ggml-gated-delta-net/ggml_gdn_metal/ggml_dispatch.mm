@@ -189,14 +189,16 @@ extern "C" int ggml_gdn_metal_rms_norm_gate(void *x, size_t x_off, void *weight,
 
 extern "C" int ggml_gdn_metal_delta_gates(void *b, size_t b_off, void *a, size_t a_off, void *a_log,
                                            size_t a_log_off, void *dt_bias, size_t dt_bias_off, void *beta,
-                                           size_t beta_off, void *g, size_t g_off, int64_t n_heads) {
+                                           size_t beta_off, void *g, size_t g_off, int64_t n_heads,
+                                           int64_t n_values) {
   id<MTLComputePipelineState> pso = pipeline("kernel_delta_gates_f32", "kernel_delta_gates_f32", nil);
   if (pso == nil) {
     return 2;
   }
   struct {
     int32_t n_heads;
-  } args = {(int32_t)n_heads};
+    int32_t n_values;
+  } args = {(int32_t)n_heads, (int32_t)n_values};
 
   at::mps::MPSStream *stream = at::mps::getCurrentMPSStream();
   dispatch_sync(stream->queue(), ^{
@@ -209,8 +211,8 @@ extern "C" int ggml_gdn_metal_delta_gates(void *b, size_t b_off, void *a, size_t
     [enc setBuffer:(__bridge id<MTLBuffer>)dt_bias offset:dt_bias_off atIndex:4];
     [enc setBuffer:(__bridge id<MTLBuffer>)beta offset:beta_off atIndex:5];
     [enc setBuffer:(__bridge id<MTLBuffer>)g offset:g_off atIndex:6];
-    const NSUInteger nth = MIN((NSUInteger)n_heads, pso.maxTotalThreadsPerThreadgroup);
-    [enc dispatchThreads:MTLSizeMake(n_heads, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+    const NSUInteger nth = MIN((NSUInteger)n_values, pso.maxTotalThreadsPerThreadgroup);
+    [enc dispatchThreads:MTLSizeMake(n_values, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
   });
   return 0;
 }

@@ -11,8 +11,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// `b` and `a` hold one value per head for every sequence in the batch, `n_values` in all; `a_log` and
+// `dt_bias` hold one per head and repeat across the batch.
 typedef struct {
     int32_t n_heads;
+    int32_t n_values;
 } ggml_attn_kargs_delta_gates;
 
 kernel void kernel_delta_gates_f32(
@@ -24,14 +27,15 @@ kernel void kernel_delta_gates_f32(
         device       float * beta,
         device       float * g,
         uint tpig[[thread_position_in_grid]]) {
-    if ((int) tpig >= args.n_heads) {
+    if ((int) tpig >= args.n_values) {
         return;
     }
+    const int head = (int) tpig % args.n_heads;
 
     beta[tpig] = 1.0f / (1.0f + exp(-b[tpig]));
 
-    const float x = a[tpig] + dt_bias[tpig];
+    const float x = a[tpig] + dt_bias[head];
     // log1p(exp(x)) saturates to x once exp(x) overflows the mantissa; 20 is where the two agree to f32.
     const float softplus = x > 20.0f ? x : log(1.0f + exp(x));
-    g[tpig] = -exp(a_log[tpig]) * softplus;
+    g[tpig] = -exp(a_log[head]) * softplus;
 }
