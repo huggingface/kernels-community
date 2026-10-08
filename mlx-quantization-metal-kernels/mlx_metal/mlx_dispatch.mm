@@ -37,7 +37,7 @@
 #include EMBEDDED_METALLIB_HEADER
 #endif
 
-#define CHECK(cond, ...) TORCH_CHECK(cond, "mlx-quantization-metal-kernels: ", __VA_ARGS__)
+#define MLXQ_CHECK(cond, ...) TORCH_CHECK(cond, "mlx-quantization-metal-kernels: ", __VA_ARGS__)
 
 using mlxq::array;
 using mlxq::Dtype;
@@ -188,7 +188,7 @@ id<MTLLibrary> library() {
 #else
     id<MTLLibrary> l = [dev newDefaultLibrary];
 #endif
-    CHECK(l != nil, "failed to load the metallib: ", error ? error.localizedDescription.UTF8String : "unknown");
+    MLXQ_CHECK(l != nil, "failed to load the metallib: ", error ? error.localizedDescription.UTF8String : "unknown");
     return l;
   }();
   return lib;
@@ -217,10 +217,10 @@ id<MTLComputePipelineState> pipeline(const std::string &name, std::optional<std:
   } else {
     fn = [library() newFunctionWithName:@(name.c_str())];
   }
-  CHECK(fn != nil, "no kernel named ", name, " in the metallib");
+  MLXQ_CHECK(fn != nil, "no kernel named ", name, " in the metallib");
   id<MTLComputePipelineState> state =
       [at::mps::MPSDevice::getInstance()->device() newComputePipelineStateWithFunction:fn error:&error];
-  CHECK(state != nil, "failed to build ", name, ": ", error ? error.localizedDescription.UTF8String : "unknown");
+  MLXQ_CHECK(state != nil, "failed to build ", name, ": ", error ? error.localizedDescription.UTF8String : "unknown");
   return cache[key] = state;
 }
 
@@ -230,7 +230,7 @@ std::string get_type_string(Dtype t) {
     case Dtype::float32: return "float";
     case Dtype::float16: return "float16_t";
     case Dtype::bfloat16: return "bfloat16_t";
-    default: CHECK(false, "no kernels for this dtype");
+    default: MLXQ_CHECK(false, "no kernels for this dtype");
   }
 }
 
@@ -240,7 +240,7 @@ std::string type_to_name(Dtype t) {
     case Dtype::float32: return "float32";
     case Dtype::float16: return "float16";
     case Dtype::bfloat16: return "bfloat16";
-    default: CHECK(false, "no kernels for this dtype");
+    default: MLXQ_CHECK(false, "no kernels for this dtype");
   }
 }
 
@@ -469,7 +469,7 @@ void strided_sum(CommandEncoder &compute_encoder, const array &in, const array &
   }
 
   // Long column but small row
-  CHECK(!(inner < 32 && total >= 1024), "a split-K sum of ", S, " partitions of ", inner,
+  MLXQ_CHECK(!(inner < 32 && total >= 1024), "a split-K sum of ", S, " partitions of ", inner,
         " values needs col_reduce_longcolumn, which is not transcribed");
 
   if (total > 256 && out.size() / 32 < 1024) {
@@ -1124,7 +1124,7 @@ std::vector<std::string> quantize(const array &w, const array &out, const array 
     int packs_per_int = (q.bits == 3 || q.bits == 5) ? 8 : q.bits == 6 ? 4 : 8 / q.bits;
     int per_thread = dequantize ? packs_per_int : std::max(q.group_size / simd_size, 1);
     size_t nthreads = dequantize ? out.size() / packs_per_int : w.size() / per_thread;
-    CHECK(nthreads <= UINT_MAX, "tensor too large for a 1D grid");
+    MLXQ_CHECK(nthreads <= UINT_MAX, "tensor too large for a 1D grid");
     size_t thread_group_size = std::min<size_t>(compute_encoder.max_threads(), nthreads);
     compute_encoder.dispatch_threads(MTLSizeMake(nthreads, 1, 1), MTLSizeMake(thread_group_size, 1, 1));
   });

@@ -26,7 +26,9 @@ OPS_CPP = VENDOR / "ops.cpp"
 DISPATCH_MM = ROOT / "mlx_metal/mlx_dispatch.mm"
 TORCH_SIDE = ROOT / "mlx_metal/mlx_quantization.cpp"
 
-pytestmark = [pytest.mark.kernels_ci, pytest.mark.skipif(not QUANTIZED_CPP.exists(), reason="vendor/ is not checked out")]
+# Not in the kernels_ci subset: CI builds from the files build.toml lists, which leaves out vendor/'s
+# host sources, so these run locally (after `vendor.py`) instead.
+pytestmark = pytest.mark.skipif(not QUANTIZED_CPP.exists(), reason="vendor/ is not checked out")
 
 
 def squash(text):

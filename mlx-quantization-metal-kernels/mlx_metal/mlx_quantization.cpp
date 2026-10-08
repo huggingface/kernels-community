@@ -15,7 +15,7 @@
 #include "common.h"
 #include "torch_binding.h"
 
-#define CHECK(cond, ...) TORCH_CHECK(cond, "mlx-quantization-metal-kernels: ", __VA_ARGS__)
+#define MLXQ_CHECK(cond, ...) TORCH_CHECK(cond, "mlx-quantization-metal-kernels: ", __VA_ARGS__)
 
 namespace {
 
@@ -27,7 +27,7 @@ mlxq::Dtype to_dtype(at::ScalarType t) {
     case at::kByte: return mlxq::Dtype::uint8;
     case at::kUInt32: return mlxq::Dtype::uint32;
     case at::kInt: return mlxq::Dtype::int32;
-    default: CHECK(false, "unsupported dtype ", t);
+    default: MLXQ_CHECK(false, "unsupported dtype ", t);
   }
 }
 
@@ -40,7 +40,7 @@ at::ScalarType to_scalar_type(mlxq::Dtype t) {
     case mlxq::Dtype::uint32: return at::kUInt32;
     case mlxq::Dtype::int32: return at::kInt;
   }
-  CHECK(false, "unsupported dtype");
+  MLXQ_CHECK(false, "unsupported dtype");
 }
 
 // A torch MPS tensor's storage is a whole MTLBuffer that the tensor may be a view into, so it
@@ -87,7 +87,7 @@ struct TorchWorkspace : mlxq::Workspace {
         return to_array(owned.back());
       }
     }
-    CHECK(false, "internal error: copy of an array the workspace does not know");
+    MLXQ_CHECK(false, "internal error: copy of an array the workspace does not know");
   }
 };
 
@@ -108,17 +108,17 @@ mlxq::Quantization quantization(const std::string &mode, std::optional<int64_t> 
   } else if (mode == "mxfp8") {
     default_group_size = 32, default_bits = 8;
   } else {
-    CHECK(false, "unknown quantization mode '", mode, "'; expected affine, mxfp4, mxfp8 or nvfp4");
+    MLXQ_CHECK(false, "unknown quantization mode '", mode, "'; expected affine, mxfp4, mxfp8 or nvfp4");
   }
   mlxq::Quantization q{mode, int(group_size.value_or(default_group_size)), int(bits.value_or(default_bits))};
   if (mode == "affine") {
-    CHECK(q.group_size == 32 || q.group_size == 64 || q.group_size == 128,
+    MLXQ_CHECK(q.group_size == 32 || q.group_size == 64 || q.group_size == 128,
           "affine group_size must be 32, 64 or 128, got ", q.group_size);
-    CHECK(q.bits == 2 || q.bits == 3 || q.bits == 4 || q.bits == 5 || q.bits == 6 || q.bits == 8,
+    MLXQ_CHECK(q.bits == 2 || q.bits == 3 || q.bits == 4 || q.bits == 5 || q.bits == 6 || q.bits == 8,
           "affine bits must be one of 2, 3, 4, 5, 6, 8, got ", q.bits);
   } else {
     // fp_quantize's own check, and the only instantiations
-    CHECK(q.group_size == default_group_size && q.bits == default_bits, mode, " requires group_size ",
+    MLXQ_CHECK(q.group_size == default_group_size && q.bits == default_bits, mode, " requires group_size ",
           default_group_size, " and bits ", default_bits, ", got ", q.group_size, " and ", q.bits);
   }
   return q;
@@ -131,26 +131,26 @@ at::ScalarType validate_mode_with_type(const mlxq::Quantization &q, const at::Te
                                        const std::optional<at::Tensor> &biases,
                                        std::optional<at::ScalarType> out_type) {
   if (q.mode == "affine") {
-    CHECK(biases.has_value(), "biases must be provided for affine quantization");
+    MLXQ_CHECK(biases.has_value(), "biases must be provided for affine quantization");
     auto dtype = at::result_type(scales, *biases);
-    CHECK(is_float(dtype), "scales and biases must be floating point, got ", scales.scalar_type(), " and ",
+    MLXQ_CHECK(is_float(dtype), "scales and biases must be floating point, got ", scales.scalar_type(), " and ",
           biases->scalar_type());
     return out_type.value_or(dtype);
   }
-  CHECK(scales.scalar_type() == at::kByte, "scales must be uint8 for mode '", q.mode, "', got ", scales.scalar_type());
-  CHECK(!biases.has_value(), "biases must be None for mode '", q.mode, "'");
+  MLXQ_CHECK(scales.scalar_type() == at::kByte, "scales must be uint8 for mode '", q.mode, "', got ", scales.scalar_type());
+  MLXQ_CHECK(!biases.has_value(), "biases must be None for mode '", q.mode, "'");
   return out_type.value_or(at::kBFloat16);
 }
 
 void validate_quantized_input(const at::Tensor &w, const at::Tensor &scales, const mlxq::Quantization &q,
                               const std::optional<at::Tensor> &biases) {
-  CHECK(w.scalar_type() == at::kUInt32, "the weight matrix should be uint32, got ", w.scalar_type());
-  CHECK(w.dim() >= 2, "the weight matrix must have at least 2 dimensions, got ", w.sizes());
-  CHECK(!biases || scales.sizes() == biases->sizes(), "scales and biases should have the same shape, got ",
+  MLXQ_CHECK(w.scalar_type() == at::kUInt32, "the weight matrix should be uint32, got ", w.scalar_type());
+  MLXQ_CHECK(w.dim() >= 2, "the weight matrix must have at least 2 dimensions, got ", w.sizes());
+  MLXQ_CHECK(!biases || scales.sizes() == biases->sizes(), "scales and biases should have the same shape, got ",
         scales.sizes(), " and ", biases->sizes());
-  CHECK(scales.dim() == w.dim() && std::equal(w.sizes().begin(), w.sizes().end() - 2, scales.sizes().begin()),
+  MLXQ_CHECK(scales.dim() == w.dim() && std::equal(w.sizes().begin(), w.sizes().end() - 2, scales.sizes().begin()),
         "weight and scales should have the same batch shape, got ", w.sizes(), " and ", scales.sizes());
-  CHECK(w.size(-1) * 32 / q.bits == scales.size(-1) * q.group_size, "the shapes of the weight ", w.sizes(),
+  MLXQ_CHECK(w.size(-1) * 32 / q.bits == scales.size(-1) * q.group_size, "the shapes of the weight ", w.sizes(),
         " and scales ", scales.sizes(), " are incompatible with group_size=", q.group_size, " and bits=", q.bits);
 }
 
@@ -161,7 +161,7 @@ std::pair<int64_t, int64_t> quantized_matmul_dims(const at::Tensor &x, const at:
   validate_quantized_input(w, scales, q, biases);
   int64_t w_inner_dims = transpose ? w.size(-1) * 32 / q.bits : w.size(-2);
   int64_t w_outer_dims = transpose ? w.size(-2) : w.size(-1) * 32 / q.bits;
-  CHECK(x.dim() >= 1 && x.size(-1) == w_inner_dims, "last dimension of x ", x.sizes(),
+  MLXQ_CHECK(x.dim() >= 1 && x.size(-1) == w_inner_dims, "last dimension of x ", x.sizes(),
         " does not match the expanded quantized matrix (", w_inner_dims, ", ", w_outer_dims, ") computed from w ",
         w.sizes(), " with group_size=", q.group_size, ", bits=", q.bits, " and transpose=", transpose);
   return {w_inner_dims, w_outer_dims};
@@ -199,7 +199,7 @@ std::optional<at::Tensor> row_contiguous_matrix(const std::optional<at::Tensor> 
 
 at::Tensor indices_or_default(const std::optional<at::Tensor> &indices, const at::Tensor &x) {
   if (indices) {
-    CHECK(!at::isFloatingType(indices->scalar_type()) && indices->scalar_type() != at::kBool,
+    MLXQ_CHECK(!at::isFloatingType(indices->scalar_type()) && indices->scalar_type() != at::kBool,
           "indices must be integers, got ", indices->scalar_type());
     return indices->to(at::kInt);  // the kernels read uint32: the same bits for every valid index
   }
@@ -209,14 +209,14 @@ at::Tensor indices_or_default(const std::optional<at::Tensor> &indices, const at
 
 void check_global_scale(const mlxq::Quantization &q, const std::optional<at::Tensor> &global_scale) {
   if (!global_scale) return;
-  CHECK(q.mode == "nvfp4", "global scale is only supported for 'nvfp4' quantization mode");
-  CHECK(global_scale->scalar_type() == at::kFloat, "global scale must be float32, got ",
+  MLXQ_CHECK(q.mode == "nvfp4", "global scale is only supported for 'nvfp4' quantization mode");
+  MLXQ_CHECK(global_scale->scalar_type() == at::kFloat, "global scale must be float32, got ",
         global_scale->scalar_type());
 }
 
 void check_mps(std::initializer_list<std::optional<at::Tensor>> ts) {
   for (const auto &t : ts) {
-    if (t) CHECK(t->is_mps(), "all inputs must be on mps, got one on ", t->device());
+    if (t) MLXQ_CHECK(t->is_mps(), "all inputs must be on mps, got one on ", t->device());
   }
 }
 
@@ -233,7 +233,7 @@ std::pair<at::Tensor, std::vector<std::string>> run_quantized_matmul(
   at::ScalarType dtype = validate_mode_with_type(q, scales_in, biases_in, std::nullopt);
   auto [w_inner_dims, w_outer_dims] = quantized_matmul_dims(x_in, w_in, scales_in, biases_in, transpose, q);
   dtype = affine ? at::promote_types(x_in.scalar_type(), dtype) : x_in.scalar_type();
-  CHECK(is_float(dtype), "x must be float32, float16 or bfloat16, got ", x_in.scalar_type());
+  MLXQ_CHECK(is_float(dtype), "x must be float32, float16 or bfloat16, got ", x_in.scalar_type());
 
   std::vector<at::Tensor> inputs = {x_in.to(dtype), w_in, affine ? scales_in.to(dtype) : scales_in};
   if (affine) inputs.push_back(biases_in->to(dtype));
@@ -248,7 +248,7 @@ std::pair<at::Tensor, std::vector<std::string>> run_quantized_matmul(
   std::optional<at::Tensor> biases;
   if (affine) biases = row_contiguous_matrix(inputs[3]);
   at::Tensor out = at::empty(out_shape, x.options());
-  CHECK(x.dim() >= 2 || w.dim() == 2, "x must have at least 2 dimensions when w is batched");
+  MLXQ_CHECK(x.dim() >= 2 || w.dim() == 2, "x must have at least 2 dimensions when w is batched");
   if (out.numel() == 0 || x.size(-1) == 0) return {out.zero_(), {}};
 
   TorchWorkspace ws(x);
@@ -264,23 +264,23 @@ std::pair<at::Tensor, std::vector<std::string>> run_gather_qmm(
     std::optional<int64_t> bits, const std::string &mode, const std::optional<at::Tensor> &global_scale_in,
     bool sorted_indices, bool encode) {
   if (!lhs_in && !rhs_in) {
-    CHECK(!global_scale_in, "global scale is not supported without indices");
+    MLXQ_CHECK(!global_scale_in, "global scale is not supported without indices");
     return run_quantized_matmul(x_in, w_in, scales_in, biases_in, transpose, group_size, bits, mode, encode);
   }
   auto q = quantization(mode, group_size, bits);
   bool affine = q.mode == "affine";
   at::ScalarType out_type = validate_mode_with_type(q, scales_in, biases_in, std::nullopt);
   auto [w_inner_dims, w_outer_dims] = quantized_matmul_dims(x_in, w_in, scales_in, biases_in, transpose, q);
-  CHECK(x_in.dim() >= 2, "x must have at least 2 dimensions, got ", x_in.sizes());
+  MLXQ_CHECK(x_in.dim() >= 2, "x must have at least 2 dimensions, got ", x_in.sizes());
   check_global_scale(q, global_scale_in);
   if (global_scale_in) {
     // one scale per expert, so it matches the batch dimensions of w
     std::vector<int64_t> expected(w_in.sizes().begin(), w_in.sizes().end() - 2);
-    CHECK(global_scale_in->sizes().vec() == expected, "global scale must have one entry per expert, shape ",
+    MLXQ_CHECK(global_scale_in->sizes().vec() == expected, "global scale must have one entry per expert, shape ",
           expected, ", got ", global_scale_in->sizes());
   }
   out_type = affine ? at::promote_types(x_in.scalar_type(), out_type) : x_in.scalar_type();
-  CHECK(is_float(out_type), "x must be float32, float16 or bfloat16, got ", x_in.scalar_type());
+  MLXQ_CHECK(is_float(out_type), "x must be float32, float16 or bfloat16, got ", x_in.scalar_type());
 
   // Extract indices and broadcast them
   auto indices = at::broadcast_tensors({indices_or_default(lhs_in, x_in), indices_or_default(rhs_in, w_in)});
@@ -340,13 +340,13 @@ std::vector<at::Tensor> quantize(const at::Tensor &w_in, std::optional<int64_t> 
   check_mps({w_in, global_scale});
   auto q = quantization(mode, group_size, bits);
   bool affine = q.mode == "affine";
-  CHECK(is_float(w_in.scalar_type()), "only float32, float16 or bfloat16 can be quantized, got ",
+  MLXQ_CHECK(is_float(w_in.scalar_type()), "only float32, float16 or bfloat16 can be quantized, got ",
         w_in.scalar_type());
-  CHECK(w_in.dim() >= 2, "the matrix to be quantized must have at least 2 dimensions, got ", w_in.sizes());
-  CHECK(w_in.size(-1) % q.group_size == 0, "the last dimension (", w_in.size(-1),
+  MLXQ_CHECK(w_in.dim() >= 2, "the matrix to be quantized must have at least 2 dimensions, got ", w_in.sizes());
+  MLXQ_CHECK(w_in.size(-1) % q.group_size == 0, "the last dimension (", w_in.size(-1),
         ") must be divisible by the group size ", q.group_size);
   check_global_scale(q, global_scale);
-  if (global_scale) CHECK(global_scale->numel() == 1, "global scale must be a scalar, got ", global_scale->sizes());
+  if (global_scale) MLXQ_CHECK(global_scale->numel() == 1, "global scale must be a scalar, got ", global_scale->sizes());
 
   at::Tensor w = w_in.contiguous();
   auto wq_shape = w.sizes().vec(), scales_shape = w.sizes().vec();
@@ -373,22 +373,22 @@ at::Tensor dequantize(const at::Tensor &w_in, const at::Tensor &scales_in, const
   auto q = quantization(mode, group_size, bits);
   bool affine = q.mode == "affine";
   at::ScalarType out_type = validate_mode_with_type(q, scales_in, biases_in, dtype);
-  CHECK(is_float(out_type), "dtype must be float32, float16 or bfloat16, got ", out_type);
-  CHECK(w_in.scalar_type() == at::kUInt32, "the matrix should be given as uint32, got ", w_in.scalar_type());
-  CHECK(w_in.dim() >= 2, "the matrix to be dequantized must have at least 2 dimensions, got ", w_in.sizes());
+  MLXQ_CHECK(is_float(out_type), "dtype must be float32, float16 or bfloat16, got ", out_type);
+  MLXQ_CHECK(w_in.scalar_type() == at::kUInt32, "the matrix should be given as uint32, got ", w_in.scalar_type());
+  MLXQ_CHECK(w_in.dim() >= 2, "the matrix to be dequantized must have at least 2 dimensions, got ", w_in.sizes());
   check_global_scale(q, global_scale);
   auto w_shape = w_in.sizes().vec(), s_shape = scales_in.sizes().vec();
   w_shape.back() = s_shape.back() = -1;
-  CHECK(w_shape == s_shape, "shape of scales ", scales_in.sizes(), " does not match the matrix ", w_in.sizes());
+  MLXQ_CHECK(w_shape == s_shape, "shape of scales ", scales_in.sizes(), " does not match the matrix ", w_in.sizes());
   int64_t out_size = w_in.size(-1) * 32 / q.bits;
-  CHECK(out_size == scales_in.size(-1) * q.group_size, "shape of scales ", scales_in.sizes(),
+  MLXQ_CHECK(out_size == scales_in.size(-1) * q.group_size, "shape of scales ", scales_in.sizes(),
         " does not match the matrix ", w_in.sizes(), " with group_size=", q.group_size, " and bits=", q.bits);
 
   at::Tensor w = w_in.contiguous();
   at::Tensor scales = scales_in.contiguous();
   std::optional<at::Tensor> biases;
   if (affine) {
-    CHECK(biases_in->sizes() == scales_in.sizes(), "shape of biases ", biases_in->sizes(), " does not match scales ",
+    MLXQ_CHECK(biases_in->sizes() == scales_in.sizes(), "shape of biases ", biases_in->sizes(), " does not match scales ",
           scales_in.sizes());
     // affine_dequantize's primitive reads scales, biases and its output as the scales' type
     biases = biases_in->to(scales.scalar_type()).contiguous();
