@@ -42,6 +42,7 @@
   "quantization-bitsandbytes": [],
   "quantization-eetq": [],
   "quantization-gptq": [],
+  "ragged-dot-tpu": [],
   "relu": [],
   "rmsnorm": [],
   "rotary": [],
