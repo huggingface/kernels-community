@@ -34,7 +34,8 @@ bool supports_flash_attn(int64_t n_q, int64_t head_dim_k, int64_t head_dim_v) {
 }
 
 at::Tensor flash_attn(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
-                      const std::optional<at::Tensor> &mask, double scale) {
+                      const std::optional<at::Tensor> &mask, double scale,
+                      const std::optional<at::Tensor> &sinks, double softcap) {
   TORCH_CHECK(q.is_mps(), "flash_attn: expected mps tensors");
   TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
               "flash_attn: q, k and v must be (n_seqs, n_heads, n_positions, head_dim)");
@@ -47,19 +48,44 @@ at::Tensor flash_attn(const at::Tensor &q, const at::Tensor &k, const at::Tensor
               "flash_attn: n_heads must be a multiple of n_heads_kv, got ", n_heads, " and ",
               n_heads_kv);
 
-  const auto qc = as_f32(q), kc = as_f32(k), vc = as_f32(v);
+  // q is f32, as ggml computes it. K/V keep an f16 or bf16 cache as it is -- converting it would copy
+  // the whole cache, every call, and then read twice the bytes. Mixed types go to f32.
+  const auto qc = as_f32(q);
+  int kv_type = GGML_ATTN_KV_F32;
+  if (k.scalar_type() == v.scalar_type()) {
+    if (k.scalar_type() == at::kHalf) kv_type = GGML_ATTN_KV_F16;
+    if (k.scalar_type() == at::kBFloat16) kv_type = GGML_ATTN_KV_BF16;
+  }
+  const auto kc = kv_type == GGML_ATTN_KV_F32 ? as_f32(k) : k.contiguous();
+  const auto vc = kv_type == GGML_ATTN_KV_F32 ? as_f32(v) : v.contiguous();
 
   // ggml's kernel reads an f16 mask. A caller's additive f32 mask is small (one row per query), so
   // converting here costs little and keeps the caller's side ordinary.
   const bool has_mask = mask.has_value() && mask->defined();
   at::Tensor mc;
+  int64_t mask_seqs = 1;
   if (has_mask) {
-    TORCH_CHECK(mask->dim() == 4, "flash_attn: mask must be (n_seqs, 1, n_q, n_kv)");
+    TORCH_CHECK(mask->dim() == 4 && mask->size(1) == 1 &&
+                    (mask->size(0) == 1 || mask->size(0) == n_seqs),
+                "flash_attn: mask must be (n_seqs or 1, 1, n_q, n_kv)");
     TORCH_CHECK(mask->size(2) >= n_q && mask->size(3) == n_kv,
                 "flash_attn: mask must be at least n_q rows and exactly n_kv wide");
-    mc = mask->to(at::kHalf).contiguous();
+    // the first n_q rows, as ggml reads a padded mask; one mask may serve the whole batch
+    mc = mask->narrow(2, 0, n_q).to(at::kHalf).contiguous();
+    mask_seqs = mask->size(0);
   } else {
     mc = qc;  // a buffer still has to be bound; the kernel will not read it
+  }
+
+  // Attention sinks: one f32 logit per query head, as ggml_flash_attn_ext_add_sinks requires.
+  const bool has_sinks = sinks.has_value() && sinks->defined();
+  at::Tensor sc;
+  if (has_sinks) {
+    TORCH_CHECK(sinks->numel() == n_heads, "flash_attn: sinks must have one value per query head (", n_heads,
+                "), got ", sinks->numel());
+    sc = as_f32(*sinks);
+  } else {
+    sc = qc;  // a buffer still has to be bound; the kernel will not read it
   }
 
   int64_t pad_floats = 0, tmp_floats = 0, blk_floats = 0;
@@ -80,7 +106,8 @@ at::Tensor flash_attn(const at::Tensor &q, const at::Tensor &k, const at::Tensor
       byte_offset(vc), mtl_buffer(mc), byte_offset(mc), mtl_buffer(pad), byte_offset(pad),
       mtl_buffer(tmp), byte_offset(tmp), mtl_buffer(blk), byte_offset(blk), mtl_buffer(dst),
       byte_offset(dst), n_seqs, n_heads,
-      n_heads_kv, n_q, n_kv, head_dim_k, head_dim_v, static_cast<float>(scale), has_mask);
+      n_heads_kv, n_q, n_kv, head_dim_k, head_dim_v, static_cast<float>(scale), has_mask, mask_seqs, kv_type,
+      mtl_buffer(sc), byte_offset(sc), has_sinks, static_cast<float>(softcap));
   TORCH_CHECK(rc == 0, "ggml-attn: no kernel for n_q ", n_q, ", head_dim ", head_dim_k, "/",
               head_dim_v, " (rc ", rc, ") -- ask `supports_flash_attn` first");
   return dst;

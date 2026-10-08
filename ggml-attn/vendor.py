@@ -27,6 +27,13 @@ FILES = [
 ]
 
 
+# kernel-builder compiles every `.metal` it is given with its own flags, and llama.cpp compiles its
+# shaders with GGML_METAL_HAS_BF16 defined on every device with bfloat support -- which a build here
+# cannot pass. `ggml_attn_metal/fa.metal` defines it and includes upstream's file, so that file is
+# shipped with a header suffix: listed, but not compiled a second time. Its contents are upstream's.
+RENAMED = {"src/ggml-metal/kernels/fa.metal": "src/ggml-metal/kernels/fa.metal.h"}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default=os.environ.get("LLAMA_CPP_SRC", os.path.join(HERE, "llama.cpp")))
@@ -47,7 +54,7 @@ def main():
     if os.path.isdir(VENDOR):
         shutil.rmtree(VENDOR)
     for rel in FILES:
-        dst = os.path.join(VENDOR, rel)
+        dst = os.path.join(VENDOR, RENAMED.get(rel, rel))
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(os.path.join(args.src, "ggml", rel), dst)
 
