@@ -7,8 +7,8 @@
 
 #pragma once
 
-#include <ATen/xpu/XPUContext.h>
 #include <cstdlib>
+#include "utils.h"
 
 namespace megablocks {
 namespace xpu {
@@ -19,13 +19,17 @@ class XPUFeatures {
  public:
   // True when the device is Xe35 (CRI) or newer, which selects the kernels
   // built from the CRI-only translation unit.
-  static bool isXe35(c10::DeviceIndex device) {
+  static bool isXe35(vllm::xpu::DeviceIndex device) {
     return ipVersionMajor(device) >= 35;
   }
 
-  // Major component of the device IP version, e.g. 20 for "20.1.0".
-  static int ipVersionMajor(c10::DeviceIndex device) {
-    return std::atoi(at::xpu::getDeviceProperties(device)->version.c_str());
+  // Major component of the device IP version, e.g. 20 for "20.1.0". This is
+  // the same SYCL query that Torch uses for `DeviceProp::version`.
+  static int ipVersionMajor(vllm::xpu::DeviceIndex device) {
+    return std::atoi(vllm::xpu::vllmGetQueue(device)
+                         .get_device()
+                         .get_info<sycl::info::device::version>()
+                         .c_str());
   }
 };
 

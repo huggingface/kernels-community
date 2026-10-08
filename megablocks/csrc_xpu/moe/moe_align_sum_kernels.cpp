@@ -1,5 +1,4 @@
-#include <ATen/ATen.h>
-#include <ATen/DeviceGuard.h>
+#include "../utils.h"
 
 #include <sycl/sycl.hpp>
 
@@ -453,13 +452,13 @@ class moe_align_block_size_small_batch_expert_kernel {
 // taken from
 // https://github.com/sgl-project/sglang/blob/8b5f83ed3b7d2a49ad5c5cd5aa61c5d502f47dbc
 void moe_align_block_size(
-    torch::Tensor topk_ids,
+    torch::stable::Tensor topk_ids,
     int64_t num_experts,
     int64_t block_size,
-    torch::Tensor sorted_token_ids,
-    torch::Tensor experts_ids,
-    torch::Tensor num_tokens_post_pad) {
-  const auto& queue = at::xpu::getCurrentXPUStream();
+    torch::stable::Tensor sorted_token_ids,
+    torch::stable::Tensor experts_ids,
+    torch::stable::Tensor num_tokens_post_pad) {
+  sycl::queue* queue = &vllm::xpu::vllmGetQueue();
 
   constexpr int32_t WARP_SIZE = 32;
   int64_t padded_num_experts =
@@ -469,16 +468,14 @@ void moe_align_block_size(
   threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
   // BlockScan uses 1024 threads and assigns one thread per expert.
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       padded_num_experts < 1024, "padded_num_experts must be less than 1024");
 
   VLLM_DISPATCH_INTEGRAL_AND_UNSIGNED_TYPES(
       topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
         // calc needed amount of shared mem for `cumsum` tensors
-        auto options_int =
-            torch::TensorOptions().dtype(torch::kInt).device(topk_ids.device());
-        torch::Tensor cumsum_buffer =
-            torch::empty({num_experts + 1}, options_int);
+        torch::stable::Tensor cumsum_buffer =
+            torch::stable::new_empty(topk_ids, {num_experts + 1}, ScalarType::Int);
         bool small_batch_expert_mode =
             (topk_ids.numel() < 1024) && (num_experts <= 64);
 
@@ -502,10 +499,10 @@ void moe_align_block_size(
                 sycl::nd_range<1>(grid1 * block1, block1),
                 small_batch_expert_kernel(
                     slm,
-                    topk_ids.data_ptr<scalar_t>(),
-                    sorted_token_ids.data_ptr<int32_t>(),
-                    experts_ids.data_ptr<int32_t>(),
-                    num_tokens_post_pad.data_ptr<int32_t>(),
+                    topk_ids.mutable_data_ptr<scalar_t>(),
+                    sorted_token_ids.mutable_data_ptr<int32_t>(),
+                    experts_ids.mutable_data_ptr<int32_t>(),
+                    num_tokens_post_pad.mutable_data_ptr<int32_t>(),
                     num_experts,
                     block_size,
                     topk_ids.numel(),
@@ -527,16 +524,16 @@ void moe_align_block_size(
                 sycl::nd_range<1>(grid1 * block1, block1),
                 align_kernel(
                     slm,
-                    topk_ids.data_ptr<scalar_t>(),
-                    sorted_token_ids.data_ptr<int32_t>(),
-                    experts_ids.data_ptr<int32_t>(),
-                    num_tokens_post_pad.data_ptr<int32_t>(),
+                    topk_ids.mutable_data_ptr<scalar_t>(),
+                    sorted_token_ids.mutable_data_ptr<int32_t>(),
+                    experts_ids.mutable_data_ptr<int32_t>(),
+                    num_tokens_post_pad.mutable_data_ptr<int32_t>(),
                     num_experts,
                     padded_num_experts,
                     experts_per_warp,
                     block_size,
                     topk_ids.numel(),
-                    cumsum_buffer.data_ptr<int32_t>(),
+                    cumsum_buffer.mutable_data_ptr<int32_t>(),
                     sorted_token_ids.size(0)));
           });
 
@@ -555,9 +552,9 @@ void moe_align_block_size(
             cgh.parallel_for(
                 sycl::nd_range<1>(grid2 * block2, block2),
                 sort_kernel(
-                    topk_ids.data_ptr<scalar_t>(),
-                    sorted_token_ids.data_ptr<int32_t>(),
-                    cumsum_buffer.data_ptr<int32_t>(),
+                    topk_ids.mutable_data_ptr<scalar_t>(),
+                    sorted_token_ids.mutable_data_ptr<int32_t>(),
+                    cumsum_buffer.mutable_data_ptr<int32_t>(),
                     topk_ids.numel(),
                     num_experts));
           });
@@ -568,23 +565,23 @@ void moe_align_block_size(
 void batched_moe_align_block_size(
     int64_t max_tokens_per_batch,
     int64_t block_size,
-    torch::Tensor const& batch_num_tokens,
-    torch::Tensor sorted_ids,
-    torch::Tensor batch_ids,
-    torch::Tensor num_tokens_post_pad) {
+    torch::stable::Tensor const& batch_num_tokens,
+    torch::stable::Tensor sorted_ids,
+    torch::stable::Tensor batch_ids,
+    torch::stable::Tensor num_tokens_post_pad) {
   namespace batched_kernel = vllm::moe::batched_moe_align_block_size;
 
-  const auto& queue = at::xpu::getCurrentXPUStream();
+  sycl::queue* queue = &vllm::xpu::vllmGetQueue();
   int32_t const B = batch_num_tokens.size(0);
   int32_t const num_blocks_per_batch =
       round_to_next_multiple_of(max_tokens_per_batch, block_size) / block_size;
   int32_t const num_blocks = num_blocks_per_batch * B;
   int64_t const sorted_ids_size = num_blocks * block_size;
 
-  TORCH_CHECK(sorted_ids.size(0) == sorted_ids_size);
-  TORCH_CHECK(batch_ids.size(0) == sorted_ids_size / block_size);
-  TORCH_CHECK(num_tokens_post_pad.size(0) == 1);
-  TORCH_CHECK(B <= batched_kernel::num_threads);
+  STD_TORCH_CHECK(sorted_ids.size(0) == sorted_ids_size);
+  STD_TORCH_CHECK(batch_ids.size(0) == sorted_ids_size / block_size);
+  STD_TORCH_CHECK(num_tokens_post_pad.size(0) == 1);
+  STD_TORCH_CHECK(B <= batched_kernel::num_threads);
 
   sycl::range<1> grid(batched_kernel::num_blocks);
   sycl::range<1> block(batched_kernel::num_threads);
@@ -599,16 +596,16 @@ void batched_moe_align_block_size(
             B,
             max_tokens_per_batch,
             block_size,
-            batch_num_tokens.data_ptr<int32_t>(),
-            sorted_ids.data_ptr<int32_t>(),
-            batch_ids.data_ptr<int32_t>(),
-            num_tokens_post_pad.data_ptr<int32_t>()));
+            batch_num_tokens.mutable_data_ptr<int32_t>(),
+            sorted_ids.mutable_data_ptr<int32_t>(),
+            batch_ids.mutable_data_ptr<int32_t>(),
+            num_tokens_post_pad.mutable_data_ptr<int32_t>()));
   });
 }
 
 void moe_sum(
-    torch::Tensor& input,   // [num_tokens, topk, hidden_size]
-    torch::Tensor& output)  // [num_tokens, hidden_size]
+    torch::stable::Tensor& input,   // [num_tokens, topk, hidden_size]
+    torch::stable::Tensor& output)  // [num_tokens, hidden_size]
 {
   const int hidden_size = input.size(-1);
   const auto num_tokens = output.numel() / hidden_size;
@@ -616,8 +613,8 @@ void moe_sum(
 
   sycl::range<1> grid(num_tokens);
   sycl::range<1> block(std::min(hidden_size, 1024));
-  at::Device curDevice = at::Device(at::kXPU, at::xpu::current_device());
-  at::DeviceGuard device_guard(curDevice);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      torch::stable::accelerator::getCurrentDeviceIndex());
   auto& queue = vllm::xpu::vllmGetQueue();
 
   switch (topk) {
@@ -627,8 +624,8 @@ void moe_sum(
           cgh.parallel_for(
               sycl::nd_range<1>(grid * block, block),
               vllm::moe::moe_sum_kernel<scalar_t, 2>(
-                  output.data_ptr<scalar_t>(),
-                  input.data_ptr<scalar_t>(),
+                  output.mutable_data_ptr<scalar_t>(),
+                  input.mutable_data_ptr<scalar_t>(),
                   hidden_size));
         });
       });
@@ -640,8 +637,8 @@ void moe_sum(
           cgh.parallel_for(
               sycl::nd_range<1>(grid * block, block),
               vllm::moe::moe_sum_kernel<scalar_t, 3>(
-                  output.data_ptr<scalar_t>(),
-                  input.data_ptr<scalar_t>(),
+                  output.mutable_data_ptr<scalar_t>(),
+                  input.mutable_data_ptr<scalar_t>(),
                   hidden_size));
         });
       });
@@ -653,15 +650,19 @@ void moe_sum(
           cgh.parallel_for(
               sycl::nd_range<1>(grid * block, block),
               vllm::moe::moe_sum_kernel<scalar_t, 4>(
-                  output.data_ptr<scalar_t>(),
-                  input.data_ptr<scalar_t>(),
+                  output.mutable_data_ptr<scalar_t>(),
+                  input.mutable_data_ptr<scalar_t>(),
                   hidden_size));
         });
       });
       break;
 
     default:
-      at::sum_out(output, input, 1);
+    {
+      const int64_t sum_dims[] = {1};
+      torch::stable::sum_out(
+          output, input, torch::headeronly::IntHeaderOnlyArrayRef(sum_dims, 1));
+    }
       break;
   }
 }

@@ -1,5 +1,4 @@
 #include <sycl/sycl.hpp>
-#include <torch/all.h>
 
 #include "../utils.h"
 #include "../dispatch_utils.h"
@@ -779,9 +778,9 @@ INSTANTIATE_NOAUX_TC(sycl::ext::oneapi::bfloat16, int32_t);
 }  // end namespace moe
 }  // namespace vllm
 
-std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
-    torch::Tensor const& scores,
-    torch::Tensor const& scores_with_bias,
+std::tuple<torch::stable::Tensor, torch::stable::Tensor> grouped_topk(
+    torch::stable::Tensor const& scores,
+    torch::stable::Tensor const& scores_with_bias,
     int64_t n_group,
     int64_t topk_group,
     int64_t topk,
@@ -791,24 +790,24 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
   auto input_size = scores_with_bias.sizes();
   int64_t num_tokens = input_size[0];
   int64_t num_experts = input_size[1];
-  TORCH_CHECK(input_size.size() == 2, "scores_with_bias must be a 2D Tensor");
-  TORCH_CHECK(
+  STD_TORCH_CHECK(input_size.size() == 2, "scores_with_bias must be a 2D Tensor");
+  STD_TORCH_CHECK(
       num_experts % n_group == 0, "num_experts should be divisible by n_group");
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       n_group <= 32, "n_group should be smaller than or equal to 32 for now");
-  TORCH_CHECK(topk <= 32, "topk should be smaller than or equal to 32 for now");
+  STD_TORCH_CHECK(topk <= 32, "topk should be smaller than or equal to 32 for now");
 
-  torch::Tensor group_scores = torch::empty(
-      {num_tokens, n_group}, torch::dtype(data_type).device(torch::kXPU));
-  torch::Tensor topk_values = torch::empty(
-      {num_tokens, topk}, torch::dtype(data_type).device(torch::kXPU));
-  torch::Tensor topk_indices = torch::empty(
-      {num_tokens, topk}, torch::dtype(torch::kInt32).device(torch::kXPU));
+  torch::stable::Tensor group_scores = torch::stable::new_empty(
+      scores_with_bias, {num_tokens, n_group}, data_type);
+  torch::stable::Tensor topk_values = torch::stable::new_empty(
+      scores_with_bias, {num_tokens, topk}, data_type);
+  torch::stable::Tensor topk_indices = torch::stable::new_empty(
+      scores_with_bias, {num_tokens, topk}, ScalarType::Int);
 
   auto& queue = vllm::xpu::vllmGetQueue();
 
   switch (data_type) {
-    case torch::kFloat16:
+    case ScalarType::Half:
       // Handle Float16
       vllm::moe::invokeNoAuxTc<sycl::half, int32_t>(
           reinterpret_cast<sycl::half*>(scores.mutable_data_ptr()),
@@ -826,7 +825,7 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
           false,
           queue);
       break;
-    case torch::kFloat32:
+    case ScalarType::Float:
       // Handle Float32
       vllm::moe::invokeNoAuxTc<float, int32_t>(
           reinterpret_cast<float*>(scores.mutable_data_ptr()),
@@ -844,7 +843,7 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
           false,
           queue);
       break;
-    case torch::kBFloat16:
+    case ScalarType::BFloat16:
       // Handle BFloat16
       vllm::moe::invokeNoAuxTc<sycl::ext::oneapi::bfloat16, int32_t>(
           reinterpret_cast<sycl::ext::oneapi::bfloat16*>(

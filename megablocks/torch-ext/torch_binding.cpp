@@ -1,6 +1,17 @@
+#if defined(CPU_KERNEL)
 #include <torch/library.h>
+#else
+#include <torch/csrc/stable/library.h>
+#endif
 #include <optional>
 #include <vector>
+
+#if (defined(CUDA_KERNEL) || defined(ROCM_KERNEL)) && !defined(TORCH_TARGET_VERSION)
+#error "The CUDA/ROCm sources require a Torch stable ABI build"
+#endif
+#if defined(CPU_KERNEL) && defined(TORCH_TARGET_VERSION)
+#error "The CPU sources do not support the Torch stable ABI"
+#endif
 
 #if defined(CUDA_KERNEL) || defined(ROCM_KERNEL)
 #include "registration.h"
@@ -18,7 +29,7 @@
 #include "grouped_gemm/grouped_gemm.h"
 #endif
 #elif defined(XPU_KERNEL)
-#include "../csrc_xpu/core/registration.h"
+#include "registration.h"
 #include "../csrc_xpu/moe/moe_ops.h"
 #include "../csrc_xpu/activation.h"
 #include "../csrc_xpu/grouped_gemm/grouped_gemm_interface.h"
@@ -32,19 +43,19 @@
 // ==================== CUDA / ROCm Implementation =====================
 
 // void exclusive_cumsum(torch::Tensor x, int dim, torch::Tensor out) {
-torch::Tensor exclusive_cumsum_wrapper(torch::Tensor x, int64_t dim, torch::Tensor out) {
+torch::stable::Tensor exclusive_cumsum_wrapper(torch::stable::Tensor x, int64_t dim, torch::stable::Tensor out) {
   megablocks::exclusive_cumsum(x, dim, out);
   return out;
 }
 
 // void inclusive_cumsum(torch::Tensor x, int dim, torch::Tensor out) {
-torch::Tensor inclusive_cumsum_wrapper(torch::Tensor x, int64_t dim, torch::Tensor out) {
+torch::stable::Tensor inclusive_cumsum_wrapper(torch::stable::Tensor x, int64_t dim, torch::stable::Tensor out) {
   megablocks::inclusive_cumsum(x, dim, out);
   return out;
 }
 
 // torch::Tensor histogram(torch::Tensor x, int num_bins);
-torch::Tensor histogram_wrapper(torch::Tensor x, int64_t num_bins) {
+torch::stable::Tensor histogram_wrapper(torch::stable::Tensor x, int64_t num_bins) {
   return megablocks::histogram(x, num_bins);
 }
 
@@ -53,11 +64,11 @@ torch::Tensor histogram_wrapper(torch::Tensor x, int64_t num_bins) {
 //   int output_block_rows,
 //   int output_block_columns,
 //   torch::Tensor out);
-torch::Tensor indices_wrapper(torch::Tensor padded_bins,
+torch::stable::Tensor indices_wrapper(torch::stable::Tensor padded_bins,
                                int64_t block_size,
                                int64_t output_block_rows,
                                int64_t output_block_columns,
-                               torch::Tensor out) {
+                               torch::stable::Tensor out) {
   megablocks::indices(padded_bins, block_size, output_block_rows, output_block_columns, out);
   return out;
 }
@@ -68,7 +79,7 @@ torch::Tensor indices_wrapper(torch::Tensor padded_bins,
 // void replicate_forward(torch::Tensor x,
 //   torch::Tensor bins,
 //   torch::Tensor out);
-torch::Tensor replicate_forward_wrapper(torch::Tensor x, torch::Tensor bins, torch::Tensor out) {
+torch::stable::Tensor replicate_forward_wrapper(torch::stable::Tensor x, torch::stable::Tensor bins, torch::stable::Tensor out) {
   megablocks::replicate_forward(x, bins, out);
   return out;
 }
@@ -77,7 +88,7 @@ torch::Tensor replicate_forward_wrapper(torch::Tensor x, torch::Tensor bins, tor
 // void replicate_backward(torch::Tensor grad,
 //    torch::Tensor bins,
 //    torch::Tensor out);
-torch::Tensor replicate_backward_wrapper(torch::Tensor grad, torch::Tensor bins, torch::Tensor out) {
+torch::stable::Tensor replicate_backward_wrapper(torch::stable::Tensor grad, torch::stable::Tensor bins, torch::stable::Tensor out) {
   megablocks::replicate_backward(grad, bins, out);
   return out;
 }
@@ -87,14 +98,14 @@ torch::Tensor replicate_backward_wrapper(torch::Tensor grad, torch::Tensor bins,
 //   int end_bit,
 //   torch::Tensor x_out,
 //   torch::Tensor iota_out);
-torch::Tensor sort_wrapper(torch::Tensor x, int64_t end_bit, torch::Tensor x_out, torch::Tensor iota_out) {
+torch::stable::Tensor sort_wrapper(torch::stable::Tensor x, int64_t end_bit, torch::stable::Tensor x_out, torch::stable::Tensor iota_out) {
   megablocks::sort(x, end_bit, x_out, iota_out);
   return x_out;
 }
 
 #if defined(CUDA_KERNEL)
 // GroupedGemm operation (CUTLASS, CUDA-only).
-torch::Tensor gmm(torch::Tensor a, torch::Tensor b, torch::Tensor c, torch::Tensor batch_sizes, bool trans_a, bool trans_b) {
+torch::stable::Tensor gmm(torch::stable::Tensor a, torch::stable::Tensor b, torch::stable::Tensor c, torch::stable::Tensor batch_sizes, bool trans_a, bool trans_b) {
   grouped_gemm::GroupedGemm(a, b, c, batch_sizes, trans_a, trans_b);
   return c;
 }
@@ -110,32 +121,30 @@ torch::Tensor gmm(torch::Tensor a, torch::Tensor b, torch::Tensor c, torch::Tens
 // m.def("replicate_backward", &replicate_backward, "(bwd) replicate a vector dynamically.");
 // m.def("sort", &sort, "key/value sort.");
 
-TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("exclusive_cumsum(Tensor x, int dim, Tensor(a!) out) -> Tensor(a!)");
-  ops.impl("exclusive_cumsum", torch::kCUDA, &exclusive_cumsum_wrapper);
-
   ops.def("inclusive_cumsum(Tensor x, int dim, Tensor(a!) out) -> Tensor(a!)");
-  ops.impl("inclusive_cumsum", torch::kCUDA, &inclusive_cumsum_wrapper);
-
   ops.def("histogram(Tensor x, int num_bins) -> Tensor");
-  ops.impl("histogram", torch::kCUDA, &histogram_wrapper);
-
   ops.def("indices(Tensor padded_bins, int block_size, int output_block_rows, int output_block_columns, Tensor(a!) out) -> Tensor(a!)");
-  ops.impl("indices", torch::kCUDA, &indices_wrapper);
-
   ops.def("replicate_forward(Tensor x, Tensor bins, Tensor(a!) out) -> Tensor(a!)");
-  ops.impl("replicate_forward", torch::kCUDA, &replicate_forward_wrapper);
-
   ops.def("replicate_backward(Tensor grad, Tensor bins, Tensor(a!) out) -> Tensor(a!)");
-  ops.impl("replicate_backward", torch::kCUDA, &replicate_backward_wrapper);
-  
   ops.def("sort(Tensor x, int end_bit, Tensor x_out, Tensor iota_out) -> Tensor(x_out)");
-  ops.impl("sort", torch::kCUDA, &sort_wrapper);
-
 #if defined(CUDA_KERNEL)
   // Register the gmm GroupedGemm operation (CUTLASS, CUDA-only).
   ops.def("gmm(Tensor (a!) a, Tensor (b!) b, Tensor(c!) c, Tensor batch_sizes, bool trans_a, bool trans_b) -> Tensor(c!)");
-  ops.impl("gmm", torch::kCUDA, &gmm);
+#endif
+}
+
+STABLE_TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, ops) {
+  ops.impl("exclusive_cumsum", TORCH_BOX(&exclusive_cumsum_wrapper));
+  ops.impl("inclusive_cumsum", TORCH_BOX(&inclusive_cumsum_wrapper));
+  ops.impl("histogram", TORCH_BOX(&histogram_wrapper));
+  ops.impl("indices", TORCH_BOX(&indices_wrapper));
+  ops.impl("replicate_forward", TORCH_BOX(&replicate_forward_wrapper));
+  ops.impl("replicate_backward", TORCH_BOX(&replicate_backward_wrapper));
+  ops.impl("sort", TORCH_BOX(&sort_wrapper));
+#if defined(CUDA_KERNEL)
+  ops.impl("gmm", TORCH_BOX(&gmm));
 #endif
 }
 
@@ -145,12 +154,11 @@ REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
 // ======================== XPU Implementation ========================
 
 // All XPU operations in a single library
-TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // ==================== MOE Operations ====================
   // Calculate the result of moe by summing up the partial results
   // from all selected experts.
   ops.def("moe_sum(Tensor input, Tensor! output) -> ()");
-  ops.impl("moe_sum", torch::kXPU, &moe_sum);
 
   // Aligning the number of tokens to be processed by each expert such
   // that it is divisible by the block size.
@@ -159,7 +167,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                     int block_size, Tensor! sorted_token_ids,"
       "                     Tensor! experts_ids,"
       "                     Tensor! num_tokens_post_pad) -> ()");
-  ops.impl("moe_align_block_size", torch::kXPU, &moe_align_block_size);
 
   // Aligning the number of tokens to be processed by each expert such
   // that it is divisible by the block size, but for the batched case.
@@ -169,10 +176,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                     Tensor! sorted_token_ids,"
       "                     Tensor! experts_ids,"
       "                     Tensor! num_tokens_post_pad) -> ()");
-  ops.impl(
-      "batched_moe_align_block_size",
-      torch::kXPU,
-      &batched_moe_align_block_size);
 
   // Aligning the number of tokens to be processed by each expert such
   // that it is divisible by the block size.
@@ -188,14 +191,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                     Tensor !num_tokens_post_pad,"
       "                     Tensor !adapter_enabled,"
       "                     Tensor !lora_ids) -> () ");
-  ops.impl("moe_lora_align_block_size", torch::kXPU, &moe_lora_align_block_size);
 
   // Apply grouped topk routing to select experts.
   ops.def(
       "grouped_topk(Tensor scores, Tensor scores_with_bias, int n_group, int "
       "topk_group, int topk, bool renormalize, float "
       "routed_scaling_factor) -> (Tensor, Tensor)");
-  ops.impl("grouped_topk", torch::kXPU, &grouped_topk);
 
   // Fused Grouped TopK
   ops.def(
@@ -204,13 +205,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool renormalize, int n_expert_group, int n_topk_group, str "
       "scoring_func, float routed_scaling_factor, Tensor? bias=None) -> "
       "(Tensor, Tensor)");
-  ops.impl("fused_grouped_topk", torch::kXPU, &fused_grouped_topk);
 
   // Apply topk softmax to the gating outputs.
   ops.def(
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor! "
       "token_expert_indices, Tensor gating_output, bool renormalize) -> ()");
-  ops.impl("topk_softmax", torch::kXPU, &topk_softmax);
 
   // Gather MOE outputs
   ops.def(
@@ -218,7 +217,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor permuted_row_to_unpermuted_row, "
       "Tensor unpermuted_row_to_permuted_row, Tensor "
       "expert_first_token_offset, int num_experts) -> ()");
-  ops.impl("moe_gather", torch::kXPU, &moe_gather);
 
   // Fused MOE prologue
   ops.def(
@@ -228,35 +226,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int ep_rank, int ep_size, "
       "int num_experts_on_rank) -> "
       "()");
-  ops.impl("fused_moe_prologue", torch::kXPU, &fused_moe_prologue);
 
   // ==================== Activation Operations ====================
   ops.def("silu_and_mul(Tensor! out, Tensor! input) -> ()");
-  ops.impl("silu_and_mul", torch::kXPU, &silu_and_mul);
-
   ops.def("mul_and_silu(Tensor! out, Tensor! input) -> ()");
-  ops.impl("mul_and_silu", torch::kXPU, &mul_and_silu);
-
   ops.def("gelu_and_mul(Tensor! out, Tensor! input) -> ()");
-  ops.impl("gelu_and_mul", torch::kXPU, &gelu_and_mul);
-
   ops.def("gelu_tanh_and_mul(Tensor! out, Tensor! input) -> ()");
-  ops.impl("gelu_tanh_and_mul", torch::kXPU, &gelu_tanh_and_mul);
-
   ops.def("gelu_fast(Tensor! out, Tensor! input) -> ()");
-  ops.impl("gelu_fast", torch::kXPU, &gelu_fast);
-
   ops.def("gelu_new(Tensor! out, Tensor! input) -> ()");
-  ops.impl("gelu_new", torch::kXPU, &gelu_new);
-
   ops.def("gelu_quick(Tensor! out, Tensor! input) -> ()");
-  ops.impl("gelu_quick", torch::kXPU, &gelu_quick);
-
   ops.def(
       "swigluoai_and_mul(Tensor! out, Tensor input, float alpha=1.702, float "
       "limit=7.0) "
       "-> ()");
-  ops.impl("swigluoai_and_mul", torch::kXPU, &swigluoai_and_mul);
 
   // ==================== Grouped GEMM Operations ====================
   ops.def(
@@ -264,7 +246,27 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? ptr_scales, Tensor? ptr_bias, Tensor! ptr_D, "
       "Tensor expert_first_token_offset, int N, int K, int num_experts, "
       "bool is_B_int4, bool is_B_mxfp4, bool is_B_mxfp8=False) -> Tensor");
-  ops.impl("cutlass_grouped_gemm_interface", torch::kXPU, &cutlass_grouped_gemm_interface);
+}
+
+STABLE_TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, XPU, ops) {
+  ops.impl("moe_sum", TORCH_BOX(&moe_sum));
+  ops.impl("moe_align_block_size", TORCH_BOX(&moe_align_block_size));
+  ops.impl("batched_moe_align_block_size", TORCH_BOX(&batched_moe_align_block_size));
+  ops.impl("moe_lora_align_block_size", TORCH_BOX(&moe_lora_align_block_size));
+  ops.impl("grouped_topk", TORCH_BOX(&grouped_topk));
+  ops.impl("fused_grouped_topk", TORCH_BOX(&fused_grouped_topk));
+  ops.impl("topk_softmax", TORCH_BOX(&topk_softmax));
+  ops.impl("moe_gather", TORCH_BOX(&moe_gather));
+  ops.impl("fused_moe_prologue", TORCH_BOX(&fused_moe_prologue));
+  ops.impl("silu_and_mul", TORCH_BOX(&silu_and_mul));
+  ops.impl("mul_and_silu", TORCH_BOX(&mul_and_silu));
+  ops.impl("gelu_and_mul", TORCH_BOX(&gelu_and_mul));
+  ops.impl("gelu_tanh_and_mul", TORCH_BOX(&gelu_tanh_and_mul));
+  ops.impl("gelu_fast", TORCH_BOX(&gelu_fast));
+  ops.impl("gelu_new", TORCH_BOX(&gelu_new));
+  ops.impl("gelu_quick", TORCH_BOX(&gelu_quick));
+  ops.impl("swigluoai_and_mul", TORCH_BOX(&swigluoai_and_mul));
+  ops.impl("cutlass_grouped_gemm_interface", TORCH_BOX(&cutlass_grouped_gemm_interface));
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

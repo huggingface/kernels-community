@@ -1131,7 +1131,11 @@ class MegaBlocksMoeMLP(torch.nn.Module):
 
 
 # Export main classes
-__all__ = ["MegaBlocksMoeMLP", "MegaBlocksMoeMLPWithSharedExpert"]
+__all__ = [
+    "CPUMegaBlocksMoeMLP",
+    "MegaBlocksMoeMLP",
+    "MegaBlocksMoeMLPWithSharedExpert",
+]
 
 
 class MegaBlocksMoeMLPWithSharedExpert(MegaBlocksMoeMLP):

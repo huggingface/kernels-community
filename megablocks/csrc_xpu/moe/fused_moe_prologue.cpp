@@ -1,14 +1,13 @@
-#include <torch/all.h>
 #include "../utils.h"
 #include "fused_moe_prologue.hpp"
 
-typedef at::BFloat16 bfloat16;
+typedef c10::BFloat16 bfloat16;
 
 void fused_moe_prologue(
-    torch::Tensor input,
-    torch::Tensor token_selected_experts,
-    torch::Tensor token_final_scales,
-    torch::Tensor workspace,
+    torch::stable::Tensor input,
+    torch::stable::Tensor token_selected_experts,
+    torch::stable::Tensor token_final_scales,
+    torch::stable::Tensor workspace,
     int64_t hidden_size,
     int64_t inter_size,
     int64_t ep_rank,
@@ -19,10 +18,10 @@ void fused_moe_prologue(
   assert(ep_rank >= 0 && ep_rank < ep_size);
   auto const num_experts_total =
       static_cast<int>(num_experts_on_rank * ep_size);
-  auto& stream = at::xpu::getCurrentXPUStream(input.device().index()).queue();
+  auto& stream = vllm::xpu::vllmGetQueue(input.get_device_index());
 
-  TORCH_CHECK(
-      token_selected_experts.dtype() == torch::kInt64,
+  STD_TORCH_CHECK(
+      token_selected_experts.scalar_type() == ScalarType::Long,
       "token_selected_experts must be int64 dtype");
   auto const* token_selected_experts_ =
       reinterpret_cast<int64_t const*>(token_selected_experts.data_ptr());
@@ -105,7 +104,7 @@ void fused_moe_prologue(
   auto permuted_token_final_scales_ =
       getWsPtr(float{}, "permuted_token_final_scales");
   bool use_per_expert_act_scale = false;
-  at::DeviceGuard device_guard(input.device());
+  const torch::stable::accelerator::DeviceGuard device_guard(input.get_device_index());
   // TODO: fused prologe
   threeStepBuildExpertMapsSortFirstToken(
       token_selected_experts_,

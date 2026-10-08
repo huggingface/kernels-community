@@ -33,7 +33,6 @@
     \brief CUTLASS Intel BMG MoE API example based on sycl-tla Group GEMM
 
 */
-#include <torch/all.h>
 #include "../../utils.h"
 
 #include <cute/tensor.hpp>
@@ -111,7 +110,7 @@ void MoEGEMMLauncher(
 
   static constexpr int MaxThreadsPerSM = 512;
 
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       MaxThreadsPerSM % MaxThreadsPerWorkgroup == 0,
       "MaxThreadsPerSM must be divisible by MaxThreadsPerWorkgroup")
 
@@ -173,13 +172,13 @@ using namespace cute;
 // Entry point for one architecture, instantiated as <20> by the pvc/bmg
 // translation unit and as <35> by the CRI one.
 template <int Arch>
-torch::Tensor cutlass_grouped_gemm_xe2(
-    torch::Tensor ptr_A,
-    torch::Tensor ptr_B,
-    const c10::optional<at::Tensor>& ptr_scales,
-    const c10::optional<at::Tensor>& ptr_bias,
-    torch::Tensor ptr_D,
-    torch::Tensor expert_first_token_offset,
+torch::stable::Tensor cutlass_grouped_gemm_xe2(
+    torch::stable::Tensor ptr_A,
+    torch::stable::Tensor ptr_B,
+    const std::optional<torch::stable::Tensor>& ptr_scales,
+    const std::optional<torch::stable::Tensor>& ptr_bias,
+    torch::stable::Tensor ptr_D,
+    torch::stable::Tensor expert_first_token_offset,
     int64_t N,
     int64_t K,
     int64_t num_experts,
@@ -191,26 +190,26 @@ torch::Tensor cutlass_grouped_gemm_xe2(
       Arch == MEGABLOCKS_XE_TARGET_ARCH,
       "Arch must match MEGABLOCKS_XE_TARGET_ARCH");
   auto& dpcpp_queue =
-      at::xpu::getCurrentXPUStream(ptr_A.device().index()).queue();
-  auto A_dtype = ptr_A.dtype();
-  auto B_dtype = ptr_B.dtype();
+      vllm::xpu::vllmGetQueue(ptr_A.get_device_index());
+  auto A_dtype = ptr_A.scalar_type();
+  auto B_dtype = ptr_B.scalar_type();
   bool is_weight_fp8 =
-      ((B_dtype == at::kFloat8_e4m3fn) || (B_dtype == at::kFloat8_e5m2));
+      ((B_dtype == ScalarType::Float8_e4m3fn) || (B_dtype == ScalarType::Float8_e5m2));
 
-  TORCH_CHECK(N % 32 == 0, "N must be divisible by 32");
+  STD_TORCH_CHECK(N % 32 == 0, "N must be divisible by 32");
 
-  TORCH_CHECK(ptr_A.dim() == 2, "ptr_A must be 2D [Total_M, K]");
-  TORCH_CHECK(ptr_B.dim() == 3, "ptr_B must be 3D [num_experts, K, N]");
-  TORCH_CHECK(ptr_D.dim() == 2, "ptr_D must be 2D [Total_M, N]");
+  STD_TORCH_CHECK(ptr_A.dim() == 2, "ptr_A must be 2D [Total_M, K]");
+  STD_TORCH_CHECK(ptr_B.dim() == 3, "ptr_B must be 3D [num_experts, K, N]");
+  STD_TORCH_CHECK(ptr_D.dim() == 2, "ptr_D must be 2D [Total_M, N]");
   if (ptr_bias.has_value()) {
-    TORCH_CHECK(ptr_bias->dim() == 2, "ptr_bias must be 2D [num_experts, N]");
+    STD_TORCH_CHECK(ptr_bias->dim() == 2, "ptr_bias must be 2D [num_experts, N]");
   }
 
-  TORCH_CHECK(ptr_A.is_contiguous(), "ptr_A must be contiguous");
-  TORCH_CHECK(ptr_B.is_contiguous(), "ptr_B must be contiguous");
-  TORCH_CHECK(ptr_D.is_contiguous(), "ptr_D must be contiguous");
+  STD_TORCH_CHECK(ptr_A.is_contiguous(), "ptr_A must be contiguous");
+  STD_TORCH_CHECK(ptr_B.is_contiguous(), "ptr_B must be contiguous");
+  STD_TORCH_CHECK(ptr_D.is_contiguous(), "ptr_D must be contiguous");
   if (ptr_bias.has_value()) {
-    TORCH_CHECK(ptr_bias->is_contiguous(), "ptr_bias must be contiguous");
+    STD_TORCH_CHECK(ptr_bias->is_contiguous(), "ptr_bias must be contiguous");
   }
 
   int A_total_M = ptr_A.size(0);
@@ -233,19 +232,19 @@ torch::Tensor cutlass_grouped_gemm_xe2(
   int group_size = -1;
   int A_avg_M = A_total_M / num_experts;
 
-  TORCH_CHECK(B_E == num_experts, "ptr_B.size(0) must match num_experts");
-  TORCH_CHECK(A_total_M == D_total_M, "ptr_A.size(0) must match ptr_D.size(0)");
-  TORCH_CHECK(A_K == B_K && B_K == K, "ptr_A.size(1) must match ptr_B.size(1)");
-  TORCH_CHECK(B_N == D_N && D_N == N, "ptr_B.size(2) must match ptr_D.size(1)");
+  STD_TORCH_CHECK(B_E == num_experts, "ptr_B.size(0) must match num_experts");
+  STD_TORCH_CHECK(A_total_M == D_total_M, "ptr_A.size(0) must match ptr_D.size(0)");
+  STD_TORCH_CHECK(A_K == B_K && B_K == K, "ptr_A.size(1) must match ptr_B.size(1)");
+  STD_TORCH_CHECK(B_N == D_N && D_N == N, "ptr_B.size(2) must match ptr_D.size(1)");
   if (ptr_bias.has_value()) {
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         ptr_bias->size(0) == num_experts,
         "ptr_bias.size(0) must match num_experts");
-    TORCH_CHECK(ptr_bias->size(1) == N, "ptr_bias.size(1) must match N");
+    STD_TORCH_CHECK(ptr_bias->size(1) == N, "ptr_bias.size(1) must match N");
   }
 
-  at::Tensor atomic_buffer =
-      at::empty({static_cast<long>(1)}, ptr_A.options().dtype(at::kInt));
+  torch::stable::Tensor atomic_buffer =
+      torch::stable::new_empty(ptr_A, {static_cast<long>(1)}, ScalarType::Int);
 
 #define MoEGEMMLauncherCallER(                                                 \
     LayoutA, LayoutB, Policy, ElementA, ElementB, ElementS)                    \
@@ -267,41 +266,41 @@ torch::Tensor cutlass_grouped_gemm_xe2(
       static_cast<int*>(atomic_buffer.data_ptr()));
 
   if (is_B_int4 || is_B_mxfp4) {
-    TORCH_CHECK(ptr_scales.has_value(), "w8a16 grouped gemm must have scales");
-    TORCH_CHECK(ptr_scales->is_contiguous(), "ptr_scales must be contiguous");
-    TORCH_CHECK(
+    STD_TORCH_CHECK(ptr_scales.has_value(), "w8a16 grouped gemm must have scales");
+    STD_TORCH_CHECK(ptr_scales->is_contiguous(), "ptr_scales must be contiguous");
+    STD_TORCH_CHECK(
         ptr_scales->dim() == 3,
         "ptr_scales of int4 must be 3D [num_experts, group_num, N]");
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         ptr_scales->size(0) == num_experts,
         "ptr_scales.size(0) of int4 must match num_experts");
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         K % ptr_scales->size(2) == 0,
         "ptr_scales.size(2) of int4 must be divisible by K");
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         ptr_scales->size(1) == N, "ptr_scales.size(1) of int4 must match N");
     int group_num = ptr_scales->size(2);
     group_size = K / group_num;
 
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         group_size == 32 || group_size == 64 || group_size == 128 ||
             group_size == 256,
         "group_size must be 32, 64, 128 or 256");
 
 #define W4A16LauncherCallER(policy)                                         \
   if (is_B_int4) {                                                          \
-    if (A_dtype == at::kBFloat16) {                                         \
+    if (A_dtype == ScalarType::BFloat16) {                                         \
       using scalar_t = bfloat16_t;                                          \
       MoEGEMMLauncherCallER('R', 'C', policy, scalar_t, uint8_t, scalar_t); \
-    } else if (A_dtype == at::kHalf) {                                      \
+    } else if (A_dtype == ScalarType::Half) {                                      \
       using scalar_t = half_t;                                              \
       MoEGEMMLauncherCallER('R', 'C', policy, scalar_t, uint8_t, scalar_t); \
     }                                                                       \
   } else if (is_B_mxfp4) {                                                  \
-    if (A_dtype == at::kBFloat16) {                                         \
+    if (A_dtype == ScalarType::BFloat16) {                                         \
       using scalar_t = bfloat16_t;                                          \
       MoEGEMMLauncherCallER('R', 'C', policy, scalar_t, uint8_t, uint8_t);  \
-    } else if (A_dtype == at::kHalf) {                                      \
+    } else if (A_dtype == ScalarType::Half) {                                      \
       using scalar_t = half_t;                                              \
       MoEGEMMLauncherCallER('R', 'C', policy, scalar_t, uint8_t, uint8_t);  \
     }                                                                       \
@@ -320,41 +319,41 @@ torch::Tensor cutlass_grouped_gemm_xe2(
 #undef W4A16LauncherCallER
   } else if (is_B_mxfp8) {
     // MXFP8: block-scaled FP8 with e8m0 scales
-    TORCH_CHECK(ptr_scales.has_value(), "mxfp8 grouped gemm must have scales");
-    TORCH_CHECK(ptr_scales->is_contiguous(), "ptr_scales must be contiguous");
-    TORCH_CHECK(
+    STD_TORCH_CHECK(ptr_scales.has_value(), "mxfp8 grouped gemm must have scales");
+    STD_TORCH_CHECK(ptr_scales->is_contiguous(), "ptr_scales must be contiguous");
+    STD_TORCH_CHECK(
         ptr_scales->dim() == 3,
         "ptr_scales of mxfp8 must be 3D [num_experts, N, K // group_size]");
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         ptr_scales->size(0) == num_experts,
         "ptr_scales.size(0) of mxfp8 must match num_experts");
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         ptr_scales->size(1) == N,
         "ptr_scales.size(1) of mxfp8 must match N");
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         K % ptr_scales->size(2) == 0,
         "K must be divisible by ptr_scales.size(2) for mxfp8");
     int group_num = ptr_scales->size(2);
     group_size = K / group_num;
 
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         group_size == 32 || group_size == 64 || group_size == 128,
         "mxfp8 group_size must be 32, 64 or 128");
 
 #define MXFP8LauncherCallER(policy)                                            \
-  if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kBFloat16) {             \
+  if (B_dtype == ScalarType::Float8_e4m3fn && A_dtype == ScalarType::BFloat16) {             \
     using scalar_t = bfloat16_t;                                               \
     MoEGEMMLauncherCallER(                                                     \
         'R', 'C', policy, scalar_t, float_e4m3_t, uint8_t);                    \
-  } else if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kHalf) {          \
+  } else if (B_dtype == ScalarType::Float8_e4m3fn && A_dtype == ScalarType::Half) {          \
     using scalar_t = half_t;                                                   \
     MoEGEMMLauncherCallER(                                                     \
         'R', 'C', policy, scalar_t, float_e4m3_t, uint8_t);                    \
-  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kBFloat16) {        \
+  } else if (B_dtype == ScalarType::Float8_e5m2 && A_dtype == ScalarType::BFloat16) {        \
     using scalar_t = bfloat16_t;                                               \
     MoEGEMMLauncherCallER(                                                     \
         'R', 'C', policy, scalar_t, float_e5m2_t, uint8_t);                    \
-  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kHalf) {            \
+  } else if (B_dtype == ScalarType::Float8_e5m2 && A_dtype == ScalarType::Half) {            \
     using scalar_t = half_t;                                                   \
     MoEGEMMLauncherCallER(                                                     \
         'R', 'C', policy, scalar_t, float_e5m2_t, uint8_t);                    \
@@ -372,26 +371,26 @@ torch::Tensor cutlass_grouped_gemm_xe2(
     }
 #undef MXFP8LauncherCallER
   } else if (is_weight_fp8) {
-    TORCH_CHECK(ptr_scales.has_value(), "w8a16 grouped gemm must have scales");
-    TORCH_CHECK(ptr_scales->is_contiguous(), "ptr_scales must be contiguous");
-    TORCH_CHECK(
+    STD_TORCH_CHECK(ptr_scales.has_value(), "w8a16 grouped gemm must have scales");
+    STD_TORCH_CHECK(ptr_scales->is_contiguous(), "ptr_scales must be contiguous");
+    STD_TORCH_CHECK(
         ptr_scales->dim() == 1, "ptr_scales of fp8 must be 1D [num_experts]");
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         ptr_scales->size(0) == num_experts,
         "ptr_scales.size(0) of fp8 must match num_experts");
-    TORCH_CHECK(ptr_scales->dtype() == at::kFloat, "ptr_scales must be float");
+    STD_TORCH_CHECK(ptr_scales->scalar_type() == ScalarType::Float, "ptr_scales must be float");
 
 #define W8A16LauncherCallER(policy)                                         \
-  if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kHalf) {              \
+  if (B_dtype == ScalarType::Float8_e4m3fn && A_dtype == ScalarType::Half) {              \
     using scalar_t = half_t;                                                \
     MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, float_e4m3_t, float); \
-  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kHalf) {         \
+  } else if (B_dtype == ScalarType::Float8_e5m2 && A_dtype == ScalarType::Half) {         \
     using scalar_t = half_t;                                                \
     MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, float_e5m2_t, float); \
-  } else if (B_dtype == at::kFloat8_e4m3fn && A_dtype == at::kBFloat16) {   \
+  } else if (B_dtype == ScalarType::Float8_e4m3fn && A_dtype == ScalarType::BFloat16) {   \
     using scalar_t = bfloat16_t;                                            \
     MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, float_e4m3_t, float); \
-  } else if (B_dtype == at::kFloat8_e5m2 && A_dtype == at::kBFloat16) {     \
+  } else if (B_dtype == ScalarType::Float8_e5m2 && A_dtype == ScalarType::BFloat16) {     \
     using scalar_t = bfloat16_t;                                            \
     MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, float_e5m2_t, float); \
   }
@@ -408,14 +407,14 @@ torch::Tensor cutlass_grouped_gemm_xe2(
     }
 #undef W8A16LauncherCallER
   } else {
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         !ptr_scales.has_value(), "w16a16 grouped gemm must not have scales");
 
 #define W16A16LauncherCallER(policy)                                       \
-  if (A_dtype == at::kBFloat16) {                                          \
+  if (A_dtype == ScalarType::BFloat16) {                                          \
     using scalar_t = bfloat16_t;                                           \
     MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, scalar_t, scalar_t); \
-  } else if (A_dtype == at::kHalf) {                                       \
+  } else if (A_dtype == ScalarType::Half) {                                       \
     using scalar_t = half_t;                                               \
     MoEGEMMLauncherCallER('R', 'R', policy, scalar_t, scalar_t, scalar_t); \
   }

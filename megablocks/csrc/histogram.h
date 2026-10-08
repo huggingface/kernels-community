@@ -1,10 +1,10 @@
 #pragma once
 
-#include <torch/all.h>
+#include "stable_utils.h"
 
 namespace megablocks {
 
 // Public interface function for computing histograms
-torch::Tensor histogram(torch::Tensor x, int num_bins);
+torch::stable::Tensor histogram(torch::stable::Tensor x, int num_bins);
 
 } // namespace megablocks

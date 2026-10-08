@@ -5,9 +5,11 @@ from typing import Dict, Optional, Union
 
 import numpy as np
 import pytest
+import kernels
 import torch
 
-from megablocks import ops
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=2)
+ops = megablocks._private_for_testing.ops
 
 SORT_TESTS = [
     (32, torch.int16, None),

@@ -1,44 +1,100 @@
 #pragma once
+// Standard library headers that used to be included transitively through
+// <torch/all.h>.
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <map>
 #include <memory>
-#include <ATen/ATen.h>
-#include <c10/xpu/XPUStream.h>
-#include <c10/xpu/XPUFunctions.h>
+#include <numeric>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/csrc/stable/version.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/BFloat16.h>
+#include <torch/headeronly/util/Exception.h>
+#include <torch/headeronly/util/Float8_e4m3fn.h>
+#include <torch/headeronly/util/Float8_e5m2.h>
+#include <torch/headeronly/util/Half.h>
+#include <torch/headeronly/util/complex.h>
 #include <sycl/sycl.hpp>
 
-#define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
+// Define for older Torch versions.
+#ifndef TORCH_VERSION_2_13_0
+#define TORCH_VERSION_2_13_0 (((0ULL + 2) << 56) | ((0ULL + 13) << 48))
+#endif
+
+#if TORCH_FEATURE_VERSION < TORCH_VERSION_2_13_0
+// The stable ABI can only return the native XPU stream handle since Torch
+// 2.13, so use the regular C++ API on older versions.
+#include <c10/xpu/XPUStream.h>
+#endif
+
+using torch::headeronly::ScalarType;
+
+#define CHECK_DEVICE(x)                                                   \
+  STD_TORCH_CHECK(                                                        \
+      x.device().type() == torch::stable::DeviceType::XPU,                \
+      #x " must be on XPU")
 #define CHECK_CONTIGUOUS(x) \
-  TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
+  STD_TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 namespace vllm {
 namespace xpu {
 
-static inline sycl::queue& vllmGetQueue(at::DeviceIndex device_index = -1) {
-  auto current_stream = c10::xpu::getCurrentXPUStream(device_index);
-  auto& queue = current_stream.queue();
-  return queue;
+using torch::stable::accelerator::DeviceIndex;
+
+// The SYCL queue backing Torch's current XPU stream on the given device
+// (-1 is the current device).
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_13_0
+static inline sycl::queue& vllmGetQueue(DeviceIndex device_index = -1) {
+  if (device_index == -1) {
+    device_index = torch::stable::accelerator::getCurrentDeviceIndex();
+  }
+  // The queue is owned by Torch's stream pool, so the reference outlives the
+  // temporary stream handle.
+  void* handle =
+      torch::stable::accelerator::getCurrentStream(device_index).nativeHandle();
+  STD_TORCH_CHECK(handle != nullptr, "could not get the current XPU queue");
+  return *static_cast<sycl::queue*>(handle);
 }
+#else
+static inline sycl::queue& vllmGetQueue(DeviceIndex device_index = -1) {
+  return c10::xpu::getCurrentXPUStream(device_index).queue();
+}
+#endif
 
 namespace syclex = sycl::ext::oneapi::experimental;
 
 static inline syclex::architecture
-get_device_architecture(at::DeviceIndex device_index = -1) {
-  auto device_id =
-      (device_index == -1) ? c10::xpu::current_device() : device_index;
-  auto raw_device = c10::xpu::get_raw_device(device_id);
-  return raw_device.get_info<syclex::info::device::architecture>();
+get_device_architecture(DeviceIndex device_index = -1) {
+  return vllmGetQueue(device_index)
+      .get_device()
+      .get_info<syclex::info::device::architecture>();
 }
 
-static inline bool is_bmg(at::DeviceIndex device_index = -1) {
+static inline bool is_bmg(DeviceIndex device_index = -1) {
   return get_device_architecture(device_index) ==
          syclex::architecture::intel_gpu_bmg_g21;
 }
 
-static inline bool is_pvc(at::DeviceIndex device_index = -1) {
+static inline bool is_pvc(DeviceIndex device_index = -1) {
   return get_device_architecture(device_index) ==
          syclex::architecture::intel_gpu_pvc;
 }
 
-static inline bool is_xe2_arch(at::DeviceIndex device_index = -1) {
+static inline bool is_xe2_arch(DeviceIndex device_index = -1) {
   auto arch = get_device_architecture(device_index);
   return arch == syclex::architecture::intel_gpu_bmg_g21 ||
          arch == syclex::architecture::intel_gpu_pvc;
@@ -68,7 +124,7 @@ template <typename T>
 struct AccumulateType {
  private:
   static constexpr bool is_narrow_float =
-      std::is_same_v<T, at::Half> || std::is_same_v<T, at::BFloat16> ||
+      std::is_same_v<T, c10::Half> || std::is_same_v<T, c10::BFloat16> ||
       std::is_same_v<T, c10::Float8_e4m3fn> ||
       std::is_same_v<T, c10::Float8_e5m2>;
 

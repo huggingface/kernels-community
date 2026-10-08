@@ -1,5 +1,4 @@
-#include <ATen/ATen.h>
-#include <ATen/DeviceGuard.h>
+#include "../utils.h"
 #include <sycl/sycl.hpp>
 
 #include "../utils.h"
@@ -235,8 +234,8 @@ void launch_moe_lora_align_sum_kernel(
   size_t cumsum_elems = (size_t)num_experts + 1;
   size_t tokens_cnts_elems = (size_t)(num_thread + 1) * (size_t)num_experts;
 
-  at::Device curDevice = at::Device(at::kXPU, at::xpu::current_device());
-  at::DeviceGuard device_guard(curDevice);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      torch::stable::accelerator::getCurrentDeviceIndex());
 
   // Launch nd_range kernel
   queue.submit([&](sycl::handler& h) {
@@ -268,23 +267,23 @@ void launch_moe_lora_align_sum_kernel(
 };
 
 void moe_lora_align_block_size(
-    torch::Tensor topk_ids,
-    torch::Tensor token_lora_mapping,
+    torch::stable::Tensor topk_ids,
+    torch::stable::Tensor token_lora_mapping,
     int64_t num_experts,
     int64_t block_size,
     int64_t max_loras,
     int64_t max_num_tokens_padded,
     int64_t max_num_m_blocks,
-    torch::Tensor sorted_token_ids,
-    torch::Tensor expert_ids,
-    torch::Tensor num_tokens_post_pad,
-    torch::Tensor adapter_enabled,
-    torch::Tensor lora_ids) {
+    torch::stable::Tensor sorted_token_ids,
+    torch::stable::Tensor expert_ids,
+    torch::stable::Tensor num_tokens_post_pad,
+    torch::stable::Tensor adapter_enabled,
+    torch::stable::Tensor lora_ids) {
   const int topk_num = topk_ids.size(1);
-  TORCH_CHECK(block_size > 0, "block_size should be greater than 0.");
+  STD_TORCH_CHECK(block_size > 0, "block_size should be greater than 0.");
 
   const int32_t num_thread = std::max((int32_t)num_experts, 128);
-  TORCH_CHECK(
+  STD_TORCH_CHECK(
       num_thread <= 1024,
       "num_experts must be less than 1024, "
       "and fallback is not implemented yet.");
@@ -297,7 +296,7 @@ void moe_lora_align_block_size(
                              (num_experts + 1) * sizeof(int32_t);
 
   if (shared_mem > device_max_shared_mem) {
-    TORCH_CHECK(
+    STD_TORCH_CHECK(
         false,
         "Shared memory usage exceeds device limit, and global memory "
         "fallback is not implemented yet.");
@@ -308,19 +307,19 @@ void moe_lora_align_block_size(
         launch_moe_lora_align_sum_kernel<scalar_t, int32_t>(
             queue,
             num_thread,
-            topk_ids.data_ptr<scalar_t>(),
-            token_lora_mapping.data_ptr<int32_t>(),
+            topk_ids.mutable_data_ptr<scalar_t>(),
+            token_lora_mapping.mutable_data_ptr<int32_t>(),
             block_size,
             num_experts,
             max_loras,
             topk_ids.numel(),
             max_num_tokens_padded,
             max_num_m_blocks,
-            sorted_token_ids.data_ptr<int32_t>(),
-            expert_ids.data_ptr<int32_t>(),
+            sorted_token_ids.mutable_data_ptr<int32_t>(),
+            expert_ids.mutable_data_ptr<int32_t>(),
             topk_num,
-            num_tokens_post_pad.data_ptr<int32_t>(),
-            adapter_enabled.data_ptr<int32_t>(),
-            lora_ids.data_ptr<int32_t>());
+            num_tokens_post_pad.mutable_data_ptr<int32_t>(),
+            adapter_enabled.mutable_data_ptr<int32_t>(),
+            lora_ids.mutable_data_ptr<int32_t>());
       });
 }
