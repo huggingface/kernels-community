@@ -246,7 +246,8 @@ static int fa_dispatch_tiled(void *q, size_t q_off, void *k, size_t k_off, void 
                              size_t blk_off, void *dst, size_t dst_off, int64_t n_seqs,
                              int64_t n_heads, int64_t n_heads_kv, int64_t n_q, int64_t n_kv,
                              int64_t head_dim_k, int64_t head_dim_v, float scale, int has_mask,
-                             int kv_type) {
+                             int64_t mask_seqs, int kv_type, void *sinks, size_t sinks_off, int has_sinks,
+                             float logit_softcap) {
   const bool has_kvpad = (n_kv % FA_NCPSG) != 0;
   // "do bounds checks for the mask?" -- upstream sets it when the query count does not fill whole
   // threadgroups, so the last one would read past the mask.
@@ -260,10 +261,16 @@ static int fa_dispatch_tiled(void *q, size_t q_off, void *k, size_t k_off, void 
   const uint64_t kv = kv_type == GGML_ATTN_KV_F32 ? f32 : f16;  // f16 and bf16 are both 2 bytes
   const uint64_t nb11 = kv * head_dim_k, nb12 = nb11 * n_kv, nb13 = nb12 * n_heads_kv;
   const uint64_t nb21 = kv * head_dim_v, nb22 = nb21 * n_kv, nb23 = nb22 * n_heads_kv;
+  // One mask row per query, shared by every head (ne32 == 1). A mask with fewer sequences than the
+  // batch is broadcast over it -- the kernels index it with `iq3 % ne33`, as upstream allows.
   const uint64_t nb31 = f16 * n_kv, nb32 = nb31 * n_q, nb33 = nb32;
-  const int32_t ne31 = (int32_t)n_q, ne32 = 1, ne33 = (int32_t)n_seqs;
+  const int32_t ne31 = (int32_t)n_q, ne32 = 1, ne33 = (int32_t)mask_seqs;
 
-  const float max_bias = 0.0f, logit_softcap = 0.0f;
+  const float max_bias = 0.0f;
+  const bool has_scap = logit_softcap != 0.0f;
+  if (has_scap) {
+    scale /= logit_softcap;  // as upstream: the kernel applies softcap * tanh(s) to the scaled scores
+  }
   const int32_t n_head_log2 = 1 << (int)floorf(log2f((float)n_heads));
 
   ggml_metal_kargs_flash_attn_ext args = {
@@ -305,14 +312,15 @@ static int fa_dispatch_tiled(void *q, size_t q_off, void *k, size_t k_off, void 
   snprintf(fn, sizeof(fn), "kernel_flash_attn_ext_%s_dk%lld_dv%lld", kv_type_name(kv_type),
            (long long)head_dim_k, (long long)head_dim_v);
   std::string key = std::string(fn) + "_mask=" + std::to_string(has_mask != 0) +
+      "_sinks=" + std::to_string(has_sinks != 0) + "_scap=" + std::to_string(has_scap) +
                     "_kvpad=" + std::to_string(has_kvpad) + "_bcm=" + std::to_string(bc_mask) +
                     "_ns10=" + std::to_string(args.ns10) + "_ns20=" + std::to_string(args.ns20) +
                     "_nsg=" + std::to_string(nsg);
   MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
   set_bool(cv, has_mask != 0, FC_FLASH_ATTN_EXT + 0);
-  set_bool(cv, false, FC_FLASH_ATTN_EXT + 1);  // sinks
+  set_bool(cv, has_sinks != 0, FC_FLASH_ATTN_EXT + 1);
   set_bool(cv, false, FC_FLASH_ATTN_EXT + 2);  // ALiBi
-  set_bool(cv, false, FC_FLASH_ATTN_EXT + 3);  // logit softcap
+  set_bool(cv, has_scap, FC_FLASH_ATTN_EXT + 3);
   set_bool(cv, has_kvpad, FC_FLASH_ATTN_EXT + 4);
   set_bool(cv, bc_mask, FC_FLASH_ATTN_EXT + 10);
   set_int(cv, args.ns10, FC_FLASH_ATTN_EXT + 20);
@@ -426,7 +434,7 @@ static int fa_dispatch_tiled(void *q, size_t q_off, void *k, size_t k_off, void 
     [enc setBuffer:(__bridge id<MTLBuffer>)k offset:k_off atIndex:2];
     [enc setBuffer:(__bridge id<MTLBuffer>)v offset:v_off atIndex:3];
     [enc setBuffer:(__bridge id<MTLBuffer>)mask_buf offset:mask_buf_off atIndex:4];
-    [enc setBuffer:(__bridge id<MTLBuffer>)q offset:q_off atIndex:5];  // sinks, unused
+    [enc setBuffer:(__bridge id<MTLBuffer>)(has_sinks ? sinks : q) offset:(has_sinks ? sinks_off : q_off) atIndex:5];
     [enc setBuffer:(__bridge id<MTLBuffer>)pad offset:pad_off atIndex:6];
     [enc setBuffer:(__bridge id<MTLBuffer>)blk offset:blk_off atIndex:7];
     [enc setBuffer:(__bridge id<MTLBuffer>)dst offset:dst_off atIndex:8];
@@ -444,14 +452,16 @@ extern "C" int ggml_attn_metal_flash_attn(void *q, size_t q_off, void *k, size_t
                                           size_t blk_off, void *dst, size_t dst_off, int64_t n_seqs,
                                           int64_t n_heads, int64_t n_heads_kv, int64_t n_q,
                                           int64_t n_kv, int64_t head_dim_k, int64_t head_dim_v,
-                                          float scale, int has_mask, int kv_type) {
+                                          float scale, int has_mask, int64_t mask_seqs, int kv_type, void *sinks,
+                                          size_t sinks_off, int has_sinks, float logit_softcap) {
   if (!ggml_attn_metal_supports_flash_attn(n_q, head_dim_k, head_dim_v)) {
     return 1;
   }
   if (!fa_use_vec(n_q, head_dim_k)) {
     return fa_dispatch_tiled(q, q_off, k, k_off, v, v_off, mask, mask_off, pad, pad_off, blk,
                              blk_off, dst, dst_off, n_seqs, n_heads, n_heads_kv, n_q, n_kv,
-                             head_dim_k, head_dim_v, scale, has_mask, kv_type);
+                             head_dim_k, head_dim_v, scale, has_mask, mask_seqs, kv_type, sinks, sinks_off,
+                             has_sinks, logit_softcap);
   }
   const bool has_kvpad = (n_kv % FA_VEC_NCPSG) != 0;
   const int nsg = fa_vec_nsg(n_kv);
@@ -466,11 +476,15 @@ extern "C" int ggml_attn_metal_flash_attn(void *q, size_t q_off, void *k, size_t
   const uint64_t nb11 = kv * head_dim_k, nb12 = nb11 * n_kv, nb13 = nb12 * n_heads_kv;
   const uint64_t nb21 = kv * head_dim_v, nb22 = nb21 * n_kv, nb23 = nb22 * n_heads_kv;
   const uint64_t nb31 = f16 * n_kv, nb32 = nb31 * n_q, nb33 = nb32;  // mask ne32 == 1
-  const int32_t ne31 = (int32_t)n_q, ne32 = 1, ne33 = (int32_t)n_seqs;
+  const int32_t ne31 = (int32_t)n_q, ne32 = 1, ne33 = (int32_t)mask_seqs;
 
   // No ALiBi and no logit softcap: both are off for the models this serves, and leaving them out
   // keeps the specialisation (and the argument block) honest about what has been tested.
-  const float max_bias = 0.0f, logit_softcap = 0.0f;
+  const float max_bias = 0.0f;
+  const bool has_scap = logit_softcap != 0.0f;
+  if (has_scap) {
+    scale /= logit_softcap;  // as upstream: the kernel applies softcap * tanh(s) to the scaled scores
+  }
   const int32_t n_head_log2 = 1 << (int)floorf(log2f((float)n_heads));
 
   ggml_metal_kargs_flash_attn_ext_vec args = {
@@ -512,6 +526,7 @@ extern "C" int ggml_attn_metal_flash_attn(void *q, size_t q_off, void *k, size_t
   snprintf(vec_fn, sizeof(vec_fn), "kernel_flash_attn_ext_vec_%s_dk%lld_dv%lld",
            kv_type_name(kv_type), (long long)head_dim_k, (long long)head_dim_v);
   std::string vec_key = std::string(vec_fn) + "_mask=" + std::to_string(has_mask != 0) +
+      "_sinks=" + std::to_string(has_sinks != 0) + "_scap=" + std::to_string(has_scap) +
                         "_kvpad=" + std::to_string(has_kvpad) +
                         "_ns10=" + std::to_string(args.ns10) +
                         "_ns20=" + std::to_string(args.ns20) + "_nsg=" + std::to_string(nsg) +
@@ -519,9 +534,9 @@ extern "C" int ggml_attn_metal_flash_attn(void *q, size_t q_off, void *k, size_t
 
   MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
   set_bool(cv, has_mask != 0, FC_FLASH_ATTN_EXT_VEC + 0);
-  set_bool(cv, false, FC_FLASH_ATTN_EXT_VEC + 1);  // sinks
+  set_bool(cv, has_sinks != 0, FC_FLASH_ATTN_EXT_VEC + 1);
   set_bool(cv, false, FC_FLASH_ATTN_EXT_VEC + 2);  // ALiBi
-  set_bool(cv, false, FC_FLASH_ATTN_EXT_VEC + 3);  // logit softcap
+  set_bool(cv, has_scap, FC_FLASH_ATTN_EXT_VEC + 3);
   set_bool(cv, has_kvpad, FC_FLASH_ATTN_EXT_VEC + 4);
   set_int(cv, args.ns10, FC_FLASH_ATTN_EXT_VEC + 20);
   set_int(cv, args.ns20, FC_FLASH_ATTN_EXT_VEC + 21);
@@ -614,7 +629,7 @@ extern "C" int ggml_attn_metal_flash_attn(void *q, size_t q_off, void *k, size_t
     [enc setBuffer:(__bridge id<MTLBuffer>)k offset:k_off atIndex:2];
     [enc setBuffer:(__bridge id<MTLBuffer>)v offset:v_off atIndex:3];
     [enc setBuffer:(__bridge id<MTLBuffer>)mask_buf offset:mask_buf_off atIndex:4];
-    [enc setBuffer:(__bridge id<MTLBuffer>)q offset:q_off atIndex:5];  // sinks, unused
+    [enc setBuffer:(__bridge id<MTLBuffer>)(has_sinks ? sinks : q) offset:(has_sinks ? sinks_off : q_off) atIndex:5];
     [enc setBuffer:(__bridge id<MTLBuffer>)pad offset:pad_off atIndex:6];
     [enc setBuffer:(__bridge id<MTLBuffer>)tmp offset:tmp_off atIndex:7];
     [enc setThreadgroupMemoryLength:smem atIndex:0];
