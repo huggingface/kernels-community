@@ -21,12 +21,11 @@ if LIB:
     torch.ops.load_library(LIB)
     ops = getattr(torch.ops, os.path.basename(LIB).removesuffix(".so"))
 else:
-    from pathlib import Path
-
     try:
-        from kernels import get_local_kernel
+        import kernels
 
-        ops = get_local_kernel(Path(__file__).resolve().parent.parent, "metal")
+        # resolves to the local build when LOCAL_KERNELS points at it, as in kernels-community CI
+        ops = kernels.get_kernel("ggml-org/ggml-attn", version=1)
     except Exception as error:  # pragma: no cover
         pytest.skip(f"no kernel to test ({error})", allow_module_level=True)
 
@@ -230,3 +229,27 @@ def test_forward_handles_wide_queries():
     assert (got - ref).abs().max().item() / max(ref.abs().max().item(), 1e-6) < 3e-3
 
 
+
+
+@pytest.mark.parametrize("n_q", [1, 8, 32])  # the vector path, and the tiled one above 20 queries
+@pytest.mark.parametrize("n_kv", [141, 512])  # unaligned (pads, with 2-byte rows) and aligned
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_f16_cache_is_read_as_f16(n_q, n_kv, head_dim):
+    """An f16 cache goes to ggml's f16 kernels, as llama.cpp's default cache does, not through f32.
+
+    Same answer as attention over those f16 values: the cache is not rounded any further.
+    """
+    q, k, v, m = inputs(n_q=n_q, n_kv=n_kv, head_dim=head_dim, mask="causal" if n_q > 1 else None)
+    k16, v16 = k.half(), v.half()
+    scale = head_dim**-0.5
+    got = ops.flash_attn(q, k16, v16, m, scale)
+    ref = reference(q, k16.float(), v16.float(), m, scale)
+    torch.mps.synchronize()
+    assert got.dtype == torch.float32 and got.shape == ref.shape
+    torch.testing.assert_close(got, ref, rtol=5e-3, atol=5e-3)
+
+
+def test_forward_returns_the_models_dtype():
+    q, k, v, _ = inputs(n_q=1, n_kv=64, head_dim=64)
+    out, _ = ops.flash_attn_forward(None, q.half(), k.half(), v.half(), scaling=64**-0.5)
+    assert out.dtype == torch.float16

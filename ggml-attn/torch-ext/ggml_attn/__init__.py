@@ -35,14 +35,15 @@ def flash_attn(
     Args:
         q: `(n_seqs, n_heads, n_q, head_dim)`.
         k, v: `(n_seqs, n_heads_kv, n_kv, head_dim)`. Grouped-query attention is native, so do **not**
-            expand them to `n_heads` first — that copy is exactly what this avoids.
+            expand them to `n_heads` first — that copy is exactly what this avoids. An f16 cache is read
+            as f16, as llama.cpp reads its default cache; other dtypes are read as f32.
         mask: `(n_seqs, 1, n_q, n_kv)` additive mask, or None. Cast to f16 internally, as the kernel
             requires. **A None mask means attend to everything**: ggml has no `is_causal` argument, so
             causality has to arrive as a mask. `flash_attn_forward` builds one when it must.
         scale: softmax scale; defaults to `head_dim ** -0.5`.
 
     Returns:
-        `(n_seqs, n_q, n_heads, head_dim)` — tokens before heads, which is what SDPA gives after its
+        `(n_seqs, n_q, n_heads, head_dim)` f32 — tokens before heads, which is what SDPA gives after its
         own `.transpose(1, 2)`, so a caller usually wants precisely this and no further permute.
 
     Ask `supports_flash_attn` first: it answers for whichever of upstream's two paths the shape selects.
@@ -142,4 +143,5 @@ def flash_attn_forward(
         mask = torch.zeros_like(mask, dtype=query.dtype).masked_fill_(~mask, float("-inf"))
     elif mask is None and n_q > 1:
         mask = _causal_mask(query, key.shape[2])
-    return flash_attn(query, key, value, mask, scaling), None
+    # ggml writes f32; hand the model back the dtype it computes in
+    return flash_attn(query, key, value, mask, scaling).to(query.dtype), None
