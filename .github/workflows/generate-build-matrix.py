@@ -22,7 +22,7 @@ import os
 import sys
 from pathlib import Path
 
-VALID_BACKENDS = frozenset({"cuda", "cpu", "rocm", "metal", "xpu"})
+VALID_BACKENDS = frozenset({"cuda", "cpu", "rocm", "metal", "xpu", "tpu"})
 
 ARCHES = [
     ("x86_64-linux", "aws-highmemory-32-plus-nix"),
