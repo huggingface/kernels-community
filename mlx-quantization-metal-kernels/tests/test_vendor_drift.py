@@ -102,6 +102,20 @@ TRANSCRIBED = {
         "int bm = (M / E < 64) ? 32 : 64;",
         "{&align_N, MTL::DataType::DataTypeBool, 201}, {&align_K, MTL::DataType::DataTypeBool, 202},",
         "MTL::Size grid_dims( (N + bn - 1) / bn, std::min(M, (M + bm - 1) / bm + E - 1), 1);",
+        # QQMatmul::eval_gpu
+        "if (has_global_scales && w_quantized && non_batched && x.dtype() == bfloat16 && K % 32 == 0 && M >= get_qmv_batch_limit(K, N, d)) { qmm(x,",
+        "dispatch_qmv( x, w_q, scales_w, std::nullopt, global_scale_w, out,",
+        # GatherQQMM::eval_gpu
+        "array gs_e(Shape{E}, float32, nullptr, {}); broadcast(*global_scale_w, gs_e);",
+        "bool use_matrix_kernels = has_global_scales && w_quantized && x.dtype() == bfloat16 && w_q.ndim() == 3 && K % (metal::is_nax_available() ? 64 : 32) == 0;",
+        "if (use_matrix_kernels && M == 1 && B >= 16 && right_sorted_) { int E = w_q.size() / w_q.shape(-1) / w_q.shape(-2); if (B / E >= 4) { gather_qmm_rhs(",
+        "if (use_matrix_kernels && M >= get_qmv_batch_limit(K, N, d)) { gather_qmm(",
+        # quantize_input and fp_quantize_dequantize, which QQMatmul and GatherQQMM run first
+        "wq_shape.back() = w.shape(-1) * bits / 32;",
+        "scales_shape.back() = w.shape(-1) / group_size;",
+        "array(wq_shape, uint32, nullptr, {}), array(scales_shape, uint8, nullptr, {})};",
+        'mode + "_quantize_dequantize_", type_string, "_gs_", group_size, "_b_", bits, "_hgs_", global_scale ? "true" : "false");',
+        "compute_encoder.set_input_array(*global_scale, 1); } compute_encoder.set_output_array(out, 2);",
         # quantize_impl / get_quantize_kernel_dims
         "int packs_per_int = (bits == 3 || bits == 5) ? 8 : bits == 6 ? 4 : 8 / bits;",
         "dequantize ? packs_per_int : std::max(group_size / simd_size, 1);",
@@ -131,6 +145,15 @@ TRANSCRIBED = {
         "sorted_indices && !lhs_indices_),",
         # validate_mode_with_type: fp modes dequantize to bfloat16 by default
         "return {bfloat16, qmode};",
+        # qqmm / validate_qqmm_inputs / extract_qqmm_dims / gather_qqmm
+        "} else if (w.ndim() == 2 && x.ndim() > 2) { x = flatten(x, 0, -2, s); }",
+        "if (x.ndim() > 2 || w.ndim() > 2) {",
+        "if (global_scale->size() != 1) {",
+        "bool has_x = global_scale_x.has_value(); bool has_w = global_scale_w.has_value(); if (has_x != has_w) {",
+        "return std::make_pair(w.shape(-1), w.shape(-2));",
+        "if (global_scale_x.has_value() && global_scale_w.has_value()) { inputs.push_back(*global_scale_x); inputs.push_back(*global_scale_w); }",
+        "x.dtype(), // output dtype is the same as x dtype",
+        "sorted_indices && !rhs_indices_, sorted_indices && !lhs_indices_),",
     ],
 }
 
@@ -190,6 +213,7 @@ BOUND = {
     ("fp_quantized.h", "fp_gather_qmm_rhs"): "x w scales global_scale offsets y M N K num_groups",
     ("fp_quantized.h", "fp_quantize"): "w out scales global_scale",
     ("fp_quantized.h", "fp_dequantize"): "w scales global_scale out",
+    ("fp_quantized.h", "fp_quantize_dequantize"): "w global_scale out",
 }
 
 
@@ -214,6 +238,9 @@ def test_buffer_layout(header, kernel):
         ("quantized.metal.h", '"_bm_" #bm "_bn_" #bn "_bk_" #bk "_wm_" #wm "_wn_" #wn'),
         ("fp_quantized.metal.h", '#mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched'),
         ("fp_quantized.metal.h", '#mode "_quantize_" #type "_gs_" #group_size "_b_" #bits "_hgs_" #has_global_scale'),
+        ("fp_quantized.metal.h", '#mode "_quantize_dequantize_" #type "_gs_" #group_size "_b_" #bits "_hgs_" #has_global_scale'),
+        ("fp_quantized.metal.h", '#mode "_" #name "_" #type "_gs_" #group_size "_b_" #bits "_batch_" #batched "_hgs"'),
+        ("fp_quantized.metal.h", '"_alN_" #aligned "_batch_" #batched "_hgs"'),
         ("quantized_nax.metal.h", '"_bm" #bm "_bn" #bn "_bk" #bk "_wm" #wm "_wn" #wn "_alN_" #aligned "_batch_" #batched'),
         ("reduce.metal.h", '"col_reduce_small_" #dim "_reduce_" #name'),
         ("reduce.metal.h", '"col_reduce_looped_" #dim "_" #bm "_" #bn "_reduce_" #name'),

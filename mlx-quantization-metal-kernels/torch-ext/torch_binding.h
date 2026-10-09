@@ -29,7 +29,20 @@ at::Tensor dequantize(const at::Tensor &w, const at::Tensor &scales, const std::
                       std::optional<int64_t> group_size, std::optional<int64_t> bits, const std::string &mode,
                       const std::optional<at::Tensor> &global_scale, std::optional<at::ScalarType> dtype);
 
-// The kernels the two matmuls would launch for these inputs, in order, without launching them. For
+// mx.qqmm / mx.gather_qqmm: `x` is quantized on the fly (rounded through the fp format), `w` is used
+// as given when quantized (uint32 with uint8 `scales`) and quantized on the fly otherwise. fp modes
+// only; the global scales are nvfp4's, and go together.
+at::Tensor qqmm(const at::Tensor &x, const at::Tensor &w, const std::optional<at::Tensor> &scales,
+                std::optional<int64_t> group_size, std::optional<int64_t> bits, const std::string &mode,
+                const std::optional<at::Tensor> &global_scale_x, const std::optional<at::Tensor> &global_scale_w);
+
+at::Tensor gather_qqmm(const at::Tensor &x, const at::Tensor &w, const std::optional<at::Tensor> &scales,
+                       const std::optional<at::Tensor> &lhs_indices, const std::optional<at::Tensor> &rhs_indices,
+                       std::optional<int64_t> group_size, std::optional<int64_t> bits, const std::string &mode,
+                       const std::optional<at::Tensor> &global_scale_x, const std::optional<at::Tensor> &global_scale_w,
+                       bool sorted_indices);
+
+// The kernels the matmuls would launch for these inputs, in order, without launching them. For
 // the tests: inputs may be on the meta device.
 std::vector<std::string> trace_quantized_matmul(const at::Tensor &x, const at::Tensor &w, const at::Tensor &scales,
                                                 const std::optional<at::Tensor> &biases, bool transpose,
@@ -43,3 +56,16 @@ std::vector<std::string> trace_gather_qmm(const at::Tensor &x, const at::Tensor 
                                           std::optional<int64_t> group_size, std::optional<int64_t> bits,
                                           const std::string &mode, const std::optional<at::Tensor> &global_scale,
                                           bool sorted_indices);
+
+std::vector<std::string> trace_qqmm(const at::Tensor &x, const at::Tensor &w, const std::optional<at::Tensor> &scales,
+                                    std::optional<int64_t> group_size, std::optional<int64_t> bits,
+                                    const std::string &mode, const std::optional<at::Tensor> &global_scale_x,
+                                    const std::optional<at::Tensor> &global_scale_w);
+
+std::vector<std::string> trace_gather_qqmm(const at::Tensor &x, const at::Tensor &w,
+                                           const std::optional<at::Tensor> &scales,
+                                           const std::optional<at::Tensor> &lhs_indices,
+                                           const std::optional<at::Tensor> &rhs_indices,
+                                           std::optional<int64_t> group_size, std::optional<int64_t> bits,
+                                           const std::string &mode, const std::optional<at::Tensor> &global_scale_x,
+                                           const std::optional<at::Tensor> &global_scale_w, bool sorted_indices);

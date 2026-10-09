@@ -220,6 +220,84 @@ void check_mps(std::initializer_list<std::optional<at::Tensor>> ts) {
   }
 }
 
+// string_to_quantization_mode(mode, "qqmm") + quantization_params_from_mode. qqmm rounds its activation
+// through an fp format; mlx.core accepts "affine" here, then crashes building the op, so it is refused.
+mlxq::Quantization qq_quantization(const std::string &mode, std::optional<int64_t> group_size,
+                                   std::optional<int64_t> bits) {
+  MLXQ_CHECK(mode != "affine", "qqmm needs an fp mode (mxfp4, mxfp8 or nvfp4), got 'affine'");
+  return quantization(mode, group_size, bits);
+}
+
+// validate_global_scale
+void validate_global_scale(const mlxq::Quantization &q, const std::optional<at::Tensor> &global_scale) {
+  check_global_scale(q, global_scale);
+  if (global_scale) {
+    MLXQ_CHECK(global_scale->numel() == 1, "global scale must be a scalar, got shape ", global_scale->sizes());
+  }
+}
+
+// extract_qqmm_dims: (w_inner_dims, w_outer_dims), for a quantized `w` or a plain one.
+std::pair<int64_t, int64_t> qqmm_dims(const at::Tensor &x, const at::Tensor &w, const std::optional<at::Tensor> &scales,
+                                      const mlxq::Quantization &q) {
+  if (w.scalar_type() != at::kUInt32) {
+    MLXQ_CHECK(w.dim() >= 2, "w must have at least 2 dimensions, got ", w.sizes());
+    MLXQ_CHECK(x.size(-1) == w.size(-1), "last dimension of x ", x.sizes(), " must match last dimension of w ",
+               w.sizes());
+    return {w.size(-1), w.size(-2)};
+  }
+  MLXQ_CHECK(scales.has_value(), "scales must be provided if w is quantized");
+  return quantized_matmul_dims(x, w, *scales, std::nullopt, true, q);
+}
+
+// What QQMatmul and GatherQQMM run before their matmul, in their order: quantize_input on `w` when it
+// comes unquantized, then quantize_dequantize_input on `x`. Each is its own pass on torch's stream,
+// so the matmul's planning can copy their outputs.
+struct QQInputs {
+  at::Tensor x, w, scales;
+  std::vector<std::string> names;
+};
+
+QQInputs quantize_qq_inputs(const at::Tensor &x_in, const at::Tensor &w_in, const std::optional<at::Tensor> &scales_in,
+                            const std::optional<at::Tensor> &global_scale_x,
+                            const std::optional<at::Tensor> &global_scale_w, const mlxq::Quantization &q,
+                            bool encode) {
+  QQInputs in;
+  if (w_in.scalar_type() != at::kUInt32) {
+    // quantize_input
+    at::Tensor w = w_in.contiguous();
+    auto wq_shape = w.sizes().vec(), scales_shape = w.sizes().vec();
+    wq_shape.back() = w.size(-1) * q.bits / 32;
+    scales_shape.back() = w.size(-1) / q.group_size;
+    in.w = at::empty(wq_shape, w.options().dtype(at::kUInt32));
+    in.scales = at::empty(scales_shape, w.options().dtype(at::kByte));
+    std::optional<at::Tensor> gs;
+    if (global_scale_w) gs = global_scale_w->contiguous();
+    TorchWorkspace ws(w);
+    in.names = mlxq::quantize(to_array(w), to_array(in.w), to_array(in.scales), std::nullopt, to_array(gs), false, q,
+                              ws, encode);
+  } else {
+    // ensure_row_contiguous_matrix(w_pre), ensure_row_contiguous_matrix(scales)
+    in.w = row_contiguous_matrix(w_in);
+    in.scales = row_contiguous_matrix(*scales_in);
+  }
+  // quantize_dequantize_input
+  at::Tensor x = x_in.contiguous();
+  in.x = at::empty(x.sizes(), x.options());
+  std::optional<at::Tensor> gs;
+  if (global_scale_x) gs = global_scale_x->contiguous();
+  TorchWorkspace ws(x);
+  auto names = mlxq::quantize_dequantize(to_array(x), to_array(gs), to_array(in.x), q, ws, encode);
+  in.names.insert(in.names.end(), names.begin(), names.end());
+  return in;
+}
+
+// The group the activation is quantized in has to divide K, as the weight's does. mlx.core does not
+// check this for an unquantized `w`, and the last group would then be misread.
+void check_groups(const at::Tensor &x, const mlxq::Quantization &q) {
+  MLXQ_CHECK(x.size(-1) % q.group_size == 0, "the last dimension of x (", x.size(-1),
+             ") must be divisible by the group size ", q.group_size);
+}
+
 // ---------------------------------------------------------------------------------------------------
 // The ops: prepare as ops.cpp does, then hand over to the Metal side
 // ---------------------------------------------------------------------------------------------------
@@ -306,6 +384,119 @@ std::pair<at::Tensor, std::vector<std::string>> run_gather_qmm(
   if (global_scale) ga = ws.track(*global_scale);
   auto names = mlxq::gather_qmm(xa, wa, sa, ba, ga, to_array(indices[0]), ra, to_array(out), transpose,
                                 sorted_indices && !lhs_in, q, ws, encode);
+  return {out, names};
+}
+
+std::pair<at::Tensor, std::vector<std::string>> run_qqmm(
+    const at::Tensor &x_in, const at::Tensor &w, const std::optional<at::Tensor> &scales,
+    std::optional<int64_t> group_size, std::optional<int64_t> bits, const std::string &mode,
+    const std::optional<at::Tensor> &global_scale_x, const std::optional<at::Tensor> &global_scale_w, bool encode) {
+  auto q = qq_quantization(mode, group_size, bits);
+
+  // Allow gemv
+  at::Tensor x = x_in;
+  if (x.dim() == 1) {
+    x = x.unsqueeze(0);
+  } else if (w.dim() == 2 && x.dim() > 2) {
+    x = x.flatten(0, -2);
+  }
+
+  // validate_qqmm_inputs
+  MLXQ_CHECK(x.dim() <= 2 && w.dim() <= 2, "qqmm only supports 2D inputs, got x ", x.sizes(), " and w ", w.sizes());
+  bool w_quantized = w.scalar_type() == at::kUInt32;
+  if (w_quantized) {
+    MLXQ_CHECK(scales.has_value(), "scales must be provided if w is quantized");
+    validate_quantized_input(w, *scales, q, std::nullopt);
+  } else {
+    MLXQ_CHECK(is_float(w.scalar_type()), "w must be float32, float16 or bfloat16 (or quantized), got ",
+               w.scalar_type());
+  }
+  MLXQ_CHECK(is_float(x.scalar_type()), "x must be float32, float16 or bfloat16, got ", x.scalar_type());
+  validate_global_scale(q, global_scale_x);
+  validate_global_scale(q, global_scale_w);
+  if (q.mode == "nvfp4") {
+    MLXQ_CHECK(global_scale_x.has_value() == global_scale_w.has_value(),
+               "for nvfp4, either both global_scale_x and global_scale_w must be provided, or neither");
+  }
+  auto [w_inner_dims, w_outer_dims] = qqmm_dims(x, w, scales, q);
+  check_groups(x, q);
+  bool has_global_scales = q.mode == "nvfp4" && global_scale_x && global_scale_w;
+
+  auto out_shape = x.sizes().vec();
+  out_shape.back() = w_outer_dims;
+  at::Tensor out = at::empty(out_shape, x.options());  // output dtype is the same as x dtype
+  std::vector<std::string> names;
+  if (out.numel() > 0 && x.size(-1) > 0) {
+    auto in = quantize_qq_inputs(x, w, scales, has_global_scales ? global_scale_x : std::nullopt,
+                                 has_global_scales ? global_scale_w : std::nullopt, q, encode);
+    std::optional<at::Tensor> gs;
+    if (has_global_scales) gs = global_scale_w->contiguous();
+    TorchWorkspace ws(in.x);
+    names = mlxq::qqmm(to_array(in.x), to_array(in.w), to_array(in.scales), to_array(gs), to_array(out),
+                       has_global_scales, w_quantized, q, ws, encode);
+    names.insert(names.begin(), in.names.begin(), in.names.end());
+  } else {
+    out.zero_();
+  }
+
+  if (x_in.dim() > 2) {
+    auto shape = x_in.sizes().vec();
+    shape.back() = w_outer_dims;
+    out = out.reshape(shape);
+  } else if (x_in.dim() == 1) {
+    out = out.squeeze(0);
+  }
+  return {out, names};
+}
+
+std::pair<at::Tensor, std::vector<std::string>> run_gather_qqmm(
+    const at::Tensor &x_in, const at::Tensor &w, const std::optional<at::Tensor> &scales,
+    const std::optional<at::Tensor> &lhs_in, const std::optional<at::Tensor> &rhs_in,
+    std::optional<int64_t> group_size, std::optional<int64_t> bits, const std::string &mode,
+    const std::optional<at::Tensor> &global_scale_x, const std::optional<at::Tensor> &global_scale_w,
+    bool sorted_indices, bool encode) {
+  auto q = qq_quantization(mode, group_size, bits);
+  MLXQ_CHECK(x_in.dim() >= 2, "x must have at least 2 dimensions, got ", x_in.sizes());
+  MLXQ_CHECK(is_float(x_in.scalar_type()), "x must be float32, float16 or bfloat16, got ", x_in.scalar_type());
+  bool w_quantized = w.scalar_type() == at::kUInt32;
+  MLXQ_CHECK(w_quantized || is_float(w.scalar_type()), "w must be float32, float16 or bfloat16 (or quantized), got ",
+             w.scalar_type());
+
+  // Extract indices and broadcast them
+  auto indices = at::broadcast_tensors({indices_or_default(lhs_in, x_in), indices_or_default(rhs_in, w)});
+  auto [w_inner_dims, w_outer_dims] = qqmm_dims(x_in, w, scales, q);
+  check_groups(x_in, q);
+  // The global scales only count as a pair, and only for nvfp4 (GatherQQMM's inputs.size() check).
+  bool has_global_scales = q.mode == "nvfp4" && global_scale_x && global_scale_w;
+  if (has_global_scales) {
+    validate_global_scale(q, global_scale_x);
+    validate_global_scale(q, global_scale_w);
+  }
+
+  auto out_shape = indices[0].sizes().vec();
+  out_shape.push_back(x_in.size(-2));
+  out_shape.push_back(w_outer_dims);
+  at::Tensor out = at::empty(out_shape, x_in.options());
+  if (out.numel() == 0 || x_in.size(-1) == 0) return {out.zero_(), {}};
+
+  auto in = quantize_qq_inputs(x_in, w, scales, has_global_scales ? global_scale_x : std::nullopt,
+                               has_global_scales ? global_scale_w : std::nullopt, q, encode);
+  // temporary, until we add proper scaling for gather qqmm: the scale broadcast to one per expert
+  std::optional<at::Tensor> gs;
+  if (has_global_scales) {
+    int64_t E = in.w.numel() / in.w.size(-1) / in.w.size(-2);
+    gs = global_scale_w->reshape({1}).expand({E}).contiguous();
+  }
+  // ensure_row_contiguous on both index arrays
+  at::Tensor lhs = indices[0].contiguous(), rhs = indices[1].contiguous();
+
+  TorchWorkspace ws(in.x);
+  mlxq::array xa = ws.track(in.x), wa = ws.track(in.w), sa = ws.track(in.scales), ra = ws.track(rhs);
+  std::optional<mlxq::array> ga;
+  if (gs) ga = ws.track(*gs);
+  auto names = mlxq::gather_qqmm(xa, wa, sa, ga, to_array(lhs), ra, to_array(out), has_global_scales, w_quantized,
+                                 sorted_indices && !lhs_in, q, ws, encode);
+  names.insert(names.begin(), in.names.begin(), in.names.end());
   return {out, names};
 }
 
@@ -421,5 +612,42 @@ std::vector<std::string> trace_gather_qmm(const at::Tensor &x, const at::Tensor 
                                           bool sorted_indices) {
   return run_gather_qmm(x, w, scales, biases, lhs_indices, rhs_indices, transpose, group_size, bits, mode,
                         global_scale, sorted_indices, false)
+      .second;
+}
+
+at::Tensor qqmm(const at::Tensor &x, const at::Tensor &w, const std::optional<at::Tensor> &scales,
+                std::optional<int64_t> group_size, std::optional<int64_t> bits, const std::string &mode,
+                const std::optional<at::Tensor> &global_scale_x, const std::optional<at::Tensor> &global_scale_w) {
+  check_mps({x, w, scales, global_scale_x, global_scale_w});
+  return run_qqmm(x, w, scales, group_size, bits, mode, global_scale_x, global_scale_w, true).first;
+}
+
+at::Tensor gather_qqmm(const at::Tensor &x, const at::Tensor &w, const std::optional<at::Tensor> &scales,
+                       const std::optional<at::Tensor> &lhs_indices, const std::optional<at::Tensor> &rhs_indices,
+                       std::optional<int64_t> group_size, std::optional<int64_t> bits, const std::string &mode,
+                       const std::optional<at::Tensor> &global_scale_x, const std::optional<at::Tensor> &global_scale_w,
+                       bool sorted_indices) {
+  check_mps({x, w, scales, lhs_indices, rhs_indices, global_scale_x, global_scale_w});
+  return run_gather_qqmm(x, w, scales, lhs_indices, rhs_indices, group_size, bits, mode, global_scale_x,
+                         global_scale_w, sorted_indices, true)
+      .first;
+}
+
+std::vector<std::string> trace_qqmm(const at::Tensor &x, const at::Tensor &w, const std::optional<at::Tensor> &scales,
+                                    std::optional<int64_t> group_size, std::optional<int64_t> bits,
+                                    const std::string &mode, const std::optional<at::Tensor> &global_scale_x,
+                                    const std::optional<at::Tensor> &global_scale_w) {
+  return run_qqmm(x, w, scales, group_size, bits, mode, global_scale_x, global_scale_w, false).second;
+}
+
+std::vector<std::string> trace_gather_qqmm(const at::Tensor &x, const at::Tensor &w,
+                                           const std::optional<at::Tensor> &scales,
+                                           const std::optional<at::Tensor> &lhs_indices,
+                                           const std::optional<at::Tensor> &rhs_indices,
+                                           std::optional<int64_t> group_size, std::optional<int64_t> bits,
+                                           const std::string &mode, const std::optional<at::Tensor> &global_scale_x,
+                                           const std::optional<at::Tensor> &global_scale_w, bool sorted_indices) {
+  return run_gather_qqmm(x, w, scales, lhs_indices, rhs_indices, group_size, bits, mode, global_scale_x,
+                         global_scale_w, sorted_indices, false)
       .second;
 }

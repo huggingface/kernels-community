@@ -8,6 +8,8 @@ inputs on the same GPU, and the functions take MLX's arguments, defaults and lay
 - `quantized_matmul`: `x @ dequantize(w).T` (or `x @ dequantize(w)` with `transpose=False`).
 - `gather_qmm`: `quantized_matmul` with the weights (and inputs) picked per batch element by index,
   as mixture-of-experts layers use it.
+- `qqmm` / `gather_qqmm`: the same with the activations quantized too (fp modes): `x` is rounded
+  through the format on the fly, as `nn.QQLinear` does.
 
 Modes: "affine" (scales and biases in the activation dtype; group_size 32/64/128, bits
 2/3/4/5/6/8, default 64/4) and the fp formats "mxfp4" (32/4), "mxfp8" (32/8) and "nvfp4" (16/4),
@@ -26,6 +28,8 @@ from ._ops import ops
 __all__ = [
     "dequantize",
     "gather_qmm",
+    "gather_qqmm",
+    "qqmm",
     "quantize",
     "quantized_matmul",
     # version 1
@@ -115,6 +119,50 @@ def gather_qmm(
     """
     return ops.gather_qmm(
         x, w, scales, biases, lhs_indices, rhs_indices, transpose, group_size, bits, mode, global_scale, sorted_indices
+    )
+
+
+def qqmm(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scales: Optional[torch.Tensor] = None,
+    group_size: Optional[int] = None,
+    bits: Optional[int] = None,
+    mode: str = "nvfp4",
+    global_scale_x: Optional[torch.Tensor] = None,
+    global_scale_w: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """`mx.qqmm`: `x @ w.T` with both sides quantized, as `nn.QQLinear` computes it.
+
+    `x` ([..., K]) is quantized on the fly. `w` ([N, K], 2D) is either already quantized (uint32,
+    with its uint8 `scales`) or quantized on the fly. Modes "nvfp4" (the default), "mxfp8" and
+    "mxfp4". The nvfp4 global scales (float32 scalars) go together: both or neither. The result has
+    `x`'s dtype.
+    """
+    return ops.qqmm(x, w, scales, group_size, bits, mode, global_scale_x, global_scale_w)
+
+
+def gather_qqmm(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scales: Optional[torch.Tensor] = None,
+    lhs_indices: Optional[torch.Tensor] = None,
+    rhs_indices: Optional[torch.Tensor] = None,
+    group_size: Optional[int] = None,
+    bits: Optional[int] = None,
+    mode: str = "nvfp4",
+    global_scale_x: Optional[torch.Tensor] = None,
+    global_scale_w: Optional[torch.Tensor] = None,
+    sorted_indices: bool = False,
+) -> torch.Tensor:
+    """`mx.gather_qqmm`: `qqmm` of `x[lhs_indices]` with `w[rhs_indices]`, as `gather_qmm` indexes.
+
+    `x` is [..., M, K] and `w` is [E, N, K] (quantized or not); the result is
+    `indices.shape + [M, N]` in `x`'s dtype. The nvfp4 global scales are float32 scalars and only
+    apply when both are given.
+    """
+    return ops.gather_qqmm(
+        x, w, scales, lhs_indices, rhs_indices, group_size, bits, mode, global_scale_x, global_scale_w, sorted_indices
     )
 
 

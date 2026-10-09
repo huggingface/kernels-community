@@ -76,4 +76,23 @@ std::vector<std::string> quantize(const array &w, const array &out, const array 
                                   const std::optional<array> &biases, const std::optional<array> &global_scale,
                                   bool dequantize, const Quantization &q, Workspace &ws, bool encode);
 
+// quantize_dequantize_input's kernel (fp_quantize_dequantize): `x` rounded through the fp format and
+// back into `out`, which has x's shape and dtype. QQMatmul and GatherQQMM run it on their activation.
+std::vector<std::string> quantize_dequantize(const array &x, const std::optional<array> &global_scale,
+                                             const array &out, const Quantization &q, Workspace &ws, bool encode);
+
+// QQMatmul::eval_gpu and GatherQQMM::eval_gpu once their inputs are quantized: `x` is the
+// quantize-dequantized activation, `w`/`scales` the quantized weight (quantize_input's output when the
+// caller passed it unquantized, which `w_quantized` records), `global_scale_w` set only with both
+// global scales (per expert for the gather).
+std::vector<std::string> qqmm(const array &x, const array &w, const array &scales,
+                              const std::optional<array> &global_scale_w, const array &out, bool has_global_scales,
+                              bool w_quantized, const Quantization &q, Workspace &ws, bool encode);
+
+std::vector<std::string> gather_qqmm(const array &x, const array &w, const array &scales,
+                                     const std::optional<array> &global_scale_w, const array &lhs_indices,
+                                     const array &rhs_indices, const array &out, bool has_global_scales,
+                                     bool w_quantized, bool right_sorted, const Quantization &q, Workspace &ws,
+                                     bool encode);
+
 }  // namespace mlxq

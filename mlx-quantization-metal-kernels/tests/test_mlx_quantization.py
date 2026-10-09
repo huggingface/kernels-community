@@ -460,3 +460,209 @@ def test_bad_inputs_raise(case):
         x = x.cpu()
     with pytest.raises(RuntimeError, match="mlx-quantization-metal-kernels"):
         mq.quantized_matmul(x, wq, s, b, **kw)
+
+
+# --- qqmm / gather_qqmm -------------------------------------------------------------------------
+
+QQ_MODES = ["nvfp4", "mxfp8", "mxfp4"]
+
+
+def global_scale(t):
+    """An nvfp4 global scale for `t`, as a float32 scalar on mps (amax / (fp8 max * fp4 max))."""
+    return (t.float().abs().max() / (448.0 * 6.0)).reshape(())
+
+
+def qq_weight(w, mode, quantize_w, gw=None):
+    """(ours, mlx) weight arguments for qqmm: as is, or quantized by MLX (with `gw` for nvfp4)."""
+    if not quantize_w:
+        return (w, None), (to_mx(w), None)
+    kw = {} if gw is None else dict(global_scale=to_mx(gw))
+    wq, s = mx.quantize(to_mx(w), mode=mode, **kw)
+    return (to_t(wq), to_t(s)), (wq, s)
+
+
+@needs_mlx
+@pytest.mark.parametrize("quantize_w", [True, False])
+@pytest.mark.parametrize("M", [1, 4, 32, 512])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("mode", QQ_MODES)
+def test_qqmm_matches_mlx(mode, dtype, M, quantize_w):
+    N, K = 256, 512
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=dtype, device="mps")
+    w = torch.randn(N, K, dtype=dtype, device="mps")
+    (wt, st), (wm, sm) = qq_weight(w, mode, quantize_w)
+    assert_same(mq.qqmm(x, wt, st, mode=mode), mx.qqmm(to_mx(x), wm, sm, mode=mode))
+
+
+@needs_mlx
+@pytest.mark.parametrize("quantize_w", [True, False])
+@pytest.mark.parametrize("M", [1, 4, 32, 512])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_qqmm_nvfp4_global_scales_match_mlx(dtype, M, quantize_w):
+    """With both global scales; a quantized bf16 weight takes qmm past the qmv limit, qmv otherwise."""
+    N, K = 256, 512
+    torch.manual_seed(1)
+    x = torch.randn(M, K, dtype=dtype, device="mps")
+    w = torch.randn(N, K, dtype=dtype, device="mps")
+    gx, gw = global_scale(x), global_scale(w)
+    (wt, st), (wm, sm) = qq_weight(w, "nvfp4", quantize_w, gw)
+    with arch("applegpu_g14s"):  # qmv up to 17 rows at this size (get_qmv_batch_limit)
+        trace = ops.trace_qqmm(x, wt, st, None, None, "nvfp4", gx, gw)
+    qmm = quantize_w and dtype == torch.bfloat16 and M >= 32
+    assert any(k.startswith("nvfp4_qmm_t_") and k.endswith("_hgs") for k in trace) == qmm, trace
+    assert_same(
+        mq.qqmm(x, wt, st, mode="nvfp4", global_scale_x=gx, global_scale_w=gw),
+        mx.qqmm(to_mx(x), wm, sm, mode="nvfp4", global_scale_x=to_mx(gx), global_scale_w=to_mx(gw)),
+    )
+
+
+@needs_mlx
+@pytest.mark.parametrize("shape", [(256,), (2, 3, 256), (2, 1, 5, 256)])
+def test_qqmm_flattens_x_like_mlx(shape):
+    torch.manual_seed(2)
+    x = torch.randn(*shape, dtype=torch.bfloat16, device="mps")
+    w = torch.randn(64, 256, dtype=torch.bfloat16, device="mps")
+    (wt, st), (wm, sm) = qq_weight(w, "nvfp4", True)
+    assert_same(mq.qqmm(x, wt, st), mx.qqmm(to_mx(x), wm, sm))
+
+
+@needs_mlx
+@pytest.mark.parametrize("quantize_w", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "mode,global_scales", [("nvfp4", False), ("nvfp4", True), ("mxfp8", False), ("mxfp4", False)]
+)
+@pytest.mark.parametrize(
+    "case,M",
+    [("lhs_rhs", 1), ("lhs_rhs", 32), ("rhs_only", 1), ("rhs_only", 32), ("sorted", 1)],
+)
+def test_gather_qqmm_matches_mlx(case, M, mode, global_scales, dtype, quantize_w):
+    E, N, K, T = 8, 256, 512, 64
+    torch.manual_seed(3)
+    w = torch.randn(E, N, K, dtype=dtype, device="mps")
+    rhs = torch.randint(0, E, (T,), device="mps")
+    if case == "sorted":
+        rhs = rhs.sort().values
+    if case == "lhs_rhs":
+        x = torch.randn(4, M, K, dtype=dtype, device="mps")
+        lhs = torch.randint(0, 4, (T,), device="mps")
+        kw, kw_m = dict(lhs_indices=lhs, rhs_indices=rhs), dict(lhs_indices=mx_indices(lhs), rhs_indices=mx_indices(rhs))
+    else:
+        x = torch.randn(T, M, K, dtype=dtype, device="mps")
+        lhs = None
+        kw = dict(rhs_indices=rhs, sorted_indices=case == "sorted")
+        kw_m = dict(rhs_indices=mx_indices(rhs), sorted_indices=case == "sorted")
+    gx = gw = None
+    if global_scales:
+        gx, gw = global_scale(x), global_scale(w)
+        kw.update(global_scale_x=gx, global_scale_w=gw)
+        kw_m.update(global_scale_x=to_mx(gx), global_scale_w=to_mx(gw))
+    (wt, st), (wm, sm) = qq_weight(w, mode, quantize_w, gw)
+
+    # the matrix kernels need both global scales, a quantized bf16 weight and K % 32 == 0
+    matrix = global_scales and quantize_w and dtype == torch.bfloat16
+    expect = "gather_qmv_" if not matrix else {"sorted": "gather_qmm_rhs_nt_", "lhs_rhs": None}.get(case, None)
+    if matrix and expect is None:
+        expect = "gather_qmm_t_" if M == 32 else "gather_qmv_"
+    trace = ops.trace_gather_qqmm(x, wt, st, lhs, rhs, None, None, mode, gx, gw, case == "sorted")
+    assert any(k.startswith(f"{mode}_{expect}") for k in trace), trace
+    assert_same(
+        mq.gather_qqmm(x, wt, st, mode=mode, **kw),
+        mx.gather_qqmm(to_mx(x), wm, sm, mode=mode, **kw_m),
+    )
+
+
+@needs_mlx
+def test_gather_qqmm_default_indices_match_mlx():
+    torch.manual_seed(4)
+    x = torch.randn(4, 3, 256, dtype=torch.bfloat16, device="mps")
+    w = torch.randn(4, 64, 256, dtype=torch.bfloat16, device="mps")
+    (wt, st), (wm, sm) = qq_weight(w, "nvfp4", True)
+    assert_same(mq.gather_qqmm(x, wt, st), mx.gather_qqmm(to_mx(x), wm, sm))
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("mode", QQ_MODES)
+def test_qqmm_quantizes_an_unquantized_weight_like_quantize(mode):
+    """A plain `w` is quantized on the fly with `quantize`'s kernel, so the result is the same."""
+    torch.manual_seed(5)
+    x = torch.randn(3, 256, dtype=torch.bfloat16, device="mps")
+    w = torch.randn(64, 256, dtype=torch.bfloat16, device="mps")
+    wq, s = mq.quantize(w, mode=mode)
+    ours = mq.qqmm(x, w, mode=mode)
+    assert ours.shape == (3, 64) and ours.dtype == torch.bfloat16
+    assert torch.equal(ours, mq.qqmm(x, wq, s, mode=mode))
+    # and close to the unquantized product (both sides lose precision)
+    ref = x.float() @ w.float().T
+    assert (ours.float() - ref).abs().max() < 0.5 * ref.abs().max()
+
+
+@pytest.mark.kernels_ci
+def test_qqmm_dispatch():
+    """The kernels each path launches: quantize the weight if needed, quantize-dequantize x, matmul."""
+    w = torch.empty(1024, 1024, dtype=torch.bfloat16, device="meta")
+    wq = torch.empty(1024, 1024 * 4 // 32, dtype=torch.uint32, device="meta")
+    s = torch.empty(1024, 1024 // 16, dtype=torch.uint8, device="meta")
+    g = torch.empty((), dtype=torch.float32, device="meta")
+    with arch("applegpu_g14s"):
+        x = torch.empty(1, 1024, dtype=torch.bfloat16, device="meta")
+        assert ops.trace_qqmm(x, w, None, None, None, "nvfp4", None, None) == [
+            "nvfp4_quantize_bfloat16_t_gs_16_b_4_hgs_false",
+            "nvfp4_quantize_dequantize_bfloat16_t_gs_16_b_4_hgs_false",
+            "nvfp4_qmv_fast_bfloat16_t_gs_16_b_4_batch_0",
+        ]
+        x = torch.empty(300, 1024, dtype=torch.bfloat16, device="meta")
+        assert ops.trace_qqmm(x, wq, s, None, None, "nvfp4", g, g) == [
+            "nvfp4_quantize_dequantize_bfloat16_t_gs_16_b_4_hgs_true",
+            "nvfp4_qmm_t_bfloat16_t_gs_16_b_4_alN_true_batch_0_hgs",
+        ]
+        # without the global scales the matrix kernel is not used, however large M is
+        assert ops.trace_qqmm(x, wq, s, None, None, "nvfp4", None, None)[-1].startswith("nvfp4_qmv_wide_")
+
+
+def test_every_traced_qqmm_kernel_is_in_the_metallib():
+    so = next(Path(mq.__file__).parent.glob("_mlx_quantization_metal_kernels*.so"))
+    blob = so.read_bytes()
+    names = set()
+    for arch_name in ("applegpu_g14s", "applegpu_g15s", "applegpu_g17s"):
+        with arch(arch_name):
+            for mode in QQ_MODES:
+                g = torch.empty((), dtype=torch.float32, device="meta") if mode == "nvfp4" else None
+                for dtype in DTYPES:
+                    for M in (1, 5, 300):
+                        x = torch.empty(M, 1024, dtype=dtype, device="meta")
+                        w = torch.empty(1024, 1024, dtype=dtype, device="meta")
+                        names.update(ops.trace_qqmm(x, w, None, None, None, mode, g, g))
+                        wq, s, _ = meta_quantized((1024, 1024), mode)
+                        names.update(ops.trace_qqmm(x, wq, s, None, None, mode, g, g))
+                    wq, s, _ = meta_quantized((8, 1024, 1024), mode)
+                    rhs = torch.zeros(64, dtype=torch.int32, device="meta")
+                    for M, sort in [(1, True), (1, False), (40, False)]:
+                        x = torch.empty(64, M, 1024, dtype=dtype, device="meta")
+                        names.update(ops.trace_gather_qqmm(x, wq, s, None, rhs, None, None, mode, g, g, sort))
+    missing = sorted(n for n in names if n.encode() not in blob)
+    assert len(names) > 40 and not missing, missing
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("case", ["affine", "w_3d", "one_global_scale", "global_scale_mxfp8", "no_scales", "groups"])
+def test_qqmm_bad_inputs_raise(case):
+    x = torch.randn(2, 256, dtype=torch.bfloat16, device="mps")
+    w = torch.randn(64, 256, dtype=torch.bfloat16, device="mps")
+    g = torch.ones((), dtype=torch.float32, device="mps")
+    args, kw = (x, w), {}
+    if case == "affine":
+        kw = dict(mode="affine")
+    elif case == "w_3d":
+        args = (x, w[None])
+    elif case == "one_global_scale":
+        kw = dict(global_scale_x=g)
+    elif case == "global_scale_mxfp8":
+        kw = dict(mode="mxfp8", global_scale_x=g, global_scale_w=g)
+    elif case == "no_scales":
+        args = (x, mq.quantize(w, mode="nvfp4")[0])
+    elif case == "groups":
+        args = (x[:, :250], w[:, :250])
+    with pytest.raises(RuntimeError, match="mlx-quantization-metal-kernels"):
+        mq.qqmm(*args, **kw)

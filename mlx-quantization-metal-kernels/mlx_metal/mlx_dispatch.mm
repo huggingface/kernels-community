@@ -3,8 +3,9 @@
  * The kernels are upstream's, compiled as they ship (vendor/UPSTREAM pins the revision). This file
  * is the host side, which cannot be vendored, transcribed from upstream function by function:
  *
- *   vendor/mlx/backend/metal/quantized.cpp   QuantizedMatmul, GatherQMM, fast::Quantize::eval_gpu
- *                                            and the qmv / qvm / qmm / gather launchers they call
+ *   vendor/mlx/backend/metal/quantized.cpp   QuantizedMatmul, GatherQMM, QQMatmul, GatherQQMM,
+ *                                            fast::Quantize::eval_gpu and the qmv / qvm / qmm /
+ *                                            gather / quantize launchers they call
  *   vendor/mlx/backend/metal/reduce.cpp      strided_reduce_general_dispatch, for split-K sums
  *   vendor/mlx/backend/metal/device.cpp      is_nax_available
  *
@@ -542,10 +543,14 @@ void qmv(CommandEncoder &compute_encoder, const Args &a, metal::Device &d) {
   bn = 2 * results_per_simdgroup;
   compute_encoder.set_compute_pipeline_state(concatenate(a.mode, fast ? "_qmv_fast_" : "_qmv_", a.type_string, "_gs_",
                                                          a.group_size, "_b_", a.bits, use_narrow_qmv ? "_r_2" : "",
-                                                         B > 1 ? "_batch_1" : "_batch_0"));
+                                                         B > 1 ? "_batch_1" : "_batch_0", a.global_scale ? "_hgs" : ""));
   compute_encoder.set_input_array(a.w, 0);
   compute_encoder.set_input_array(a.scales, 1);
-  if (a.biases) compute_encoder.set_input_array(*a.biases, 2);
+  if (a.biases) {
+    compute_encoder.set_input_array(*a.biases, 2);
+  } else if (a.global_scale) {
+    compute_encoder.set_input_array(*a.global_scale, 2);
+  }
   int c = 3;
   compute_encoder.set_input_array(a.x, c++);
   compute_encoder.set_output_array(a.out, c++);
@@ -583,12 +588,12 @@ void qmv_wide(CommandEncoder &compute_encoder, const Args &a) {
 
 void dispatch_qmv(CommandEncoder &compute_encoder, const Args &a, metal::Device &d) {
   // It is a qmv with a small inner dimension so route to qmv_quad kernel
-  if ((a.K == 128 || a.K == 64) && is_power_of_2(a.bits)) {
+  if ((a.K == 128 || a.K == 64) && is_power_of_2(a.bits) && !a.global_scale) {
     qmv_quad(compute_encoder, a);
     return;
   }
   // Small batch so route to qmv_wide, which reuses each weight group across the M vectors.
-  if (a.M >= 2 && use_qmv_wide(a.mode, d)) {
+  if (a.M >= 2 && use_qmv_wide(a.mode, d) && !a.global_scale) {
     qmv_wide(compute_encoder, a);
     return;
   }
@@ -703,13 +708,16 @@ void qmm_nax(CommandEncoder &compute_encoder, const Args &a) {
   compute_encoder.set_compute_pipeline_state(concatenate(
       a.mode, a.transpose ? "_qmm_t_nax_" : "_qmm_n_nax_", a.type_string, "_gs_", a.group_size, "_b_", a.bits, "_bm",
       bm, "_bn", bn, "_bk", bk, "_wm", wm, "_wn", wn, a.transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
-      batched ? "_batch_1" : "_batch_0"));
+      batched ? "_batch_1" : "_batch_0", a.global_scale ? "_hgs" : ""));
   int c = 0;
   compute_encoder.set_input_array(a.w, c++);
   compute_encoder.set_input_array(a.scales, c++);
   if (a.biases) {
     compute_encoder.set_input_array(*a.biases, c++);
   } else if (a.transpose) {
+    if (a.global_scale) {
+      compute_encoder.set_input_array(*a.global_scale, c);
+    }
     c++;
   }
   compute_encoder.set_input_array(a.x, c++);
@@ -739,13 +747,17 @@ void qmm(CommandEncoder &compute_encoder, const Args &a) {
   bool batched = B > 1;
   compute_encoder.set_compute_pipeline_state(concatenate(
       a.mode, a.transpose ? "_qmm_t_" : "_qmm_n_", a.type_string, "_gs_", a.group_size, "_b_", a.bits,
-      a.transpose ? (aligned ? "_alN_true" : "_alN_false") : "", batched ? "_batch_1" : "_batch_0"));
+      a.transpose ? (aligned ? "_alN_true" : "_alN_false") : "", batched ? "_batch_1" : "_batch_0",
+      a.global_scale ? "_hgs" : ""));
   int c = 0;
   compute_encoder.set_input_array(a.w, c++);
   compute_encoder.set_input_array(a.scales, c++);
   if (a.biases) {
     compute_encoder.set_input_array(*a.biases, c++);
   } else if (a.transpose) {
+    if (a.global_scale) {
+      compute_encoder.set_input_array(*a.global_scale, c);
+    }
     c++;
   }
   compute_encoder.set_input_array(a.x, c++);
@@ -1051,6 +1063,105 @@ void gather_qmm_eval(CommandEncoder &compute_encoder, const GatherArgs &a) {
   gather_qvm(compute_encoder, a);
 }
 
+// ---------------------------------------------------------------------------------------------------
+// fast::Quantize (quantize_impl), and what QQMatmul / GatherQQMM run on their inputs before the
+// matmul: quantize_input for an unquantized weight, quantize_dequantize_input for the activation.
+// ---------------------------------------------------------------------------------------------------
+
+// get_quantize_kernel_dims, then the dispatch. Treat uint32 as uint8 in kernel
+void dispatch_quantize_kernel(CommandEncoder &compute_encoder, const array &w, const array &out, int group_size,
+                              int bits, bool dequantize) {
+  constexpr int simd_size = 32;
+  int packs_per_int = (bits == 3 || bits == 5) ? 8 : bits == 6 ? 4 : 8 / bits;
+  int per_thread = dequantize ? packs_per_int : std::max(group_size / simd_size, 1);
+  size_t nthreads = dequantize ? out.size() / packs_per_int : w.size() / per_thread;
+  MLXQ_CHECK(nthreads <= UINT_MAX, "tensor too large for a 1D grid");
+  size_t thread_group_size = std::min<size_t>(compute_encoder.max_threads(), nthreads);
+  compute_encoder.dispatch_threads(MTLSizeMake(nthreads, 1, 1), MTLSizeMake(thread_group_size, 1, 1));
+}
+
+// quantize_impl. The inputs arrive row-contiguous (ensure_row_contiguous is the torch side's).
+void quantize_impl(CommandEncoder &compute_encoder, const array &w, const array &out, const array &scales,
+                   const std::optional<array> &biases, const std::optional<array> &global_scale, bool dequantize,
+                   const mlxq::Quantization &q) {
+  bool has_biases = q.mode == "affine";
+  bool has_global_scale = !has_biases && global_scale.has_value();
+  std::string kname = concatenate(q.mode, dequantize ? "_dequantize" : "_quantize", "_",
+                                  get_type_string(dequantize ? out.dtype() : w.dtype()), "_gs_", q.group_size, "_b_",
+                                  q.bits);
+  if (!has_biases) {
+    kname += concatenate("_hgs_", has_global_scale ? "true" : "false");
+  }
+  compute_encoder.set_compute_pipeline_state(kname);
+  if (dequantize) {
+    if (has_biases) {
+      compute_encoder.set_input_array(*biases, 2);
+    } else if (has_global_scale) {
+      compute_encoder.set_input_array(*global_scale, 2);
+    }
+    compute_encoder.set_input_array(w, 0);
+    compute_encoder.set_input_array(scales, 1);
+    compute_encoder.set_output_array(out, 3);
+  } else {
+    if (has_biases) {
+      compute_encoder.set_output_array(*biases, 3);
+    } else if (has_global_scale) {
+      compute_encoder.set_input_array(*global_scale, 3);
+    }
+    compute_encoder.set_input_array(w, 0);
+    compute_encoder.set_output_array(out, 1);
+    compute_encoder.set_output_array(scales, 2);
+  }
+  dispatch_quantize_kernel(compute_encoder, w, out, q.group_size, q.bits, dequantize);
+}
+
+// fp_quantize_dequantize (quantize_dequantize_input's kernel): `x` rounded through the fp format and
+// back, into `out` of x's shape and dtype.
+void fp_quantize_dequantize(CommandEncoder &compute_encoder, const array &x, const std::optional<array> &global_scale,
+                            const array &out, const std::string &mode, int group_size, int bits) {
+  compute_encoder.set_compute_pipeline_state(concatenate(mode, "_quantize_dequantize_", get_type_string(x.dtype()),
+                                                         "_gs_", group_size, "_b_", bits, "_hgs_",
+                                                         global_scale ? "true" : "false"));
+  compute_encoder.set_input_array(x, 0);
+  if (global_scale) {
+    compute_encoder.set_input_array(*global_scale, 1);
+  }
+  compute_encoder.set_output_array(out, 2);
+  dispatch_quantize_kernel(compute_encoder, x, out, group_size, bits, false);
+}
+
+// QQMatmul::eval_gpu, from "bool non_batched" on: `x` is the quantize-dequantized activation, `w` the
+// quantized weight.
+void qqmm_eval(CommandEncoder &compute_encoder, const Args &a, bool has_global_scales, bool w_quantized) {
+  auto d = device();
+  bool non_batched = a.w.ndim() == 2;
+  if (has_global_scales && w_quantized && non_batched && a.x.dtype() == Dtype::bfloat16 && a.K % 32 == 0 &&
+      a.M >= get_qmv_batch_limit(a.K, a.N, d)) {
+    return qmm(compute_encoder, a);
+  }
+  dispatch_qmv(compute_encoder, a, d);
+}
+
+// GatherQQMM::eval_gpu, from "bool non_batched" on (the global scale already broadcast per expert).
+void gather_qqmm_eval(CommandEncoder &compute_encoder, const GatherArgs &a, bool has_global_scales,
+                      bool w_quantized) {
+  auto d = device();
+  int B = a.B();
+  bool use_matrix_kernels = has_global_scales && w_quantized && a.x.dtype() == Dtype::bfloat16 && a.w.ndim() == 3 &&
+                            a.K % (is_nax_available() ? 64 : 32) == 0;
+
+  if (use_matrix_kernels && a.M == 1 && B >= 16 && a.right_sorted) {
+    int E = a.w.size() / a.w.shape(-1) / a.w.shape(-2);
+    if (B / E >= 4) {
+      return gather_qmm_rhs(compute_encoder, a, a.x.size() / a.K);
+    }
+  }
+  if (use_matrix_kernels && a.M >= get_qmv_batch_limit(a.K, a.N, d)) {
+    return gather_qmm(compute_encoder, a);
+  }
+  gather_qmv(compute_encoder, a);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------------
@@ -1085,49 +1196,43 @@ std::vector<std::string> gather_qmm(const array &x, const array &w, const array 
   return run(ws, encode, [&](CommandEncoder &e) { gather_qmm_eval(e, a); });
 }
 
-// quantize_impl and get_quantize_kernel_dims
 std::vector<std::string> quantize(const array &w, const array &out, const array &scales,
                                   const std::optional<array> &biases, const std::optional<array> &global_scale,
                                   bool dequantize, const Quantization &q, Workspace &ws, bool encode) {
-  return run(ws, encode, [&](CommandEncoder &compute_encoder) {
-    bool has_biases = q.mode == "affine";
-    bool has_global_scale = !has_biases && global_scale.has_value();
-    std::string kname = concatenate(q.mode, dequantize ? "_dequantize" : "_quantize", "_",
-                                    get_type_string(dequantize ? out.dtype() : w.dtype()), "_gs_", q.group_size,
-                                    "_b_", q.bits);
-    if (!has_biases) {
-      kname += concatenate("_hgs_", has_global_scale ? "true" : "false");
-    }
-    compute_encoder.set_compute_pipeline_state(kname);
-    if (dequantize) {
-      if (has_biases) {
-        compute_encoder.set_input_array(*biases, 2);
-      } else if (has_global_scale) {
-        compute_encoder.set_input_array(*global_scale, 2);
-      }
-      compute_encoder.set_input_array(w, 0);
-      compute_encoder.set_input_array(scales, 1);
-      compute_encoder.set_output_array(out, 3);
-    } else {
-      if (has_biases) {
-        compute_encoder.set_output_array(*biases, 3);
-      } else if (has_global_scale) {
-        compute_encoder.set_input_array(*global_scale, 3);
-      }
-      compute_encoder.set_input_array(w, 0);
-      compute_encoder.set_output_array(out, 1);
-      compute_encoder.set_output_array(scales, 2);
-    }
+  return run(ws, encode, [&](CommandEncoder &e) { quantize_impl(e, w, out, scales, biases, global_scale, dequantize, q); });
+}
 
-    // get_quantize_kernel_dims. Treat uint32 as uint8 in kernel
-    constexpr int simd_size = 32;
-    int packs_per_int = (q.bits == 3 || q.bits == 5) ? 8 : q.bits == 6 ? 4 : 8 / q.bits;
-    int per_thread = dequantize ? packs_per_int : std::max(q.group_size / simd_size, 1);
-    size_t nthreads = dequantize ? out.size() / packs_per_int : w.size() / per_thread;
-    MLXQ_CHECK(nthreads <= UINT_MAX, "tensor too large for a 1D grid");
-    size_t thread_group_size = std::min<size_t>(compute_encoder.max_threads(), nthreads);
-    compute_encoder.dispatch_threads(MTLSizeMake(nthreads, 1, 1), MTLSizeMake(thread_group_size, 1, 1));
-  });
+std::vector<std::string> quantize_dequantize(const array &x, const std::optional<array> &global_scale,
+                                             const array &out, const Quantization &q, Workspace &ws, bool encode) {
+  return run(ws, encode,
+             [&](CommandEncoder &e) { fp_quantize_dequantize(e, x, global_scale, out, q.mode, q.group_size, q.bits); });
+}
+
+std::vector<std::string> qqmm(const array &x, const array &w, const array &scales,
+                              const std::optional<array> &global_scale_w, const array &out, bool has_global_scales,
+                              bool w_quantized, const Quantization &q, Workspace &ws, bool encode) {
+  // int K = x.shape(-1); int M = non_batched ? x.size() / K : x.shape(-2); int N = out.shape(-1);
+  bool non_batched = w.ndim() == 2;
+  Args a{x, w, scales, std::nullopt, global_scale_w, out, q.group_size, q.bits, 0, out.shape(-1), x.shape(-1),
+         q.mode, get_type_string(x.dtype()), true};
+  a.M = non_batched ? x.size() / a.K : x.shape(-2);
+  return run(ws, encode, [&](CommandEncoder &e) { qqmm_eval(e, a, has_global_scales, w_quantized); });
+}
+
+std::vector<std::string> gather_qqmm(const array &x, const array &w, const array &scales,
+                                     const std::optional<array> &global_scale_w, const array &lhs_indices,
+                                     const array &rhs_indices, const array &out, bool has_global_scales,
+                                     bool w_quantized, bool right_sorted, const Quantization &q, Workspace &ws,
+                                     bool encode) {
+  bool non_batched = w.ndim() == 2;
+  GatherArgs a;
+  static_cast<Args &>(a) = Args{x, w, scales, std::nullopt, global_scale_w, out, q.group_size, q.bits, 0,
+                                out.shape(-1), x.shape(-1), q.mode, get_type_string(x.dtype()), true};
+  a.M = non_batched ? x.size() / a.K : x.shape(-2);
+  a.lhs_indices = lhs_indices;
+  a.rhs_indices = rhs_indices;
+  a.right_sorted = right_sorted;
+  return run(ws, encode, [&](CommandEncoder &e) { gather_qqmm_eval(e, a, has_global_scales, w_quantized); });
 }
 
 }  // namespace mlxq
