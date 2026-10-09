@@ -1,0 +1,28 @@
+[general]
+name = "tdt-loss"
+license = "Apache-2.0"
+version = 1
+edition = 5
+backends = ["cuda"]
+
+[general.hub]
+repo-id = "kernels-community/tdt-loss"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+[torch.stable-abi]
+cuda = "2.10"
+
+[kernel.tdt_loss]
+backend = "cuda"
+depends = ["torch"]
+src = [
+    "tdt_loss/common.cuh",
+    "tdt_loss/lattice.cu",
+    "tdt_loss/logprobs.cu",
+    "tdt_loss/stable.h",
+]
