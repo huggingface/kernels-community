@@ -283,6 +283,28 @@ def gated_pointer_weight_warp_spec_pruner():
     )
 
 
+def gate_tile_cap_pruner(max_bn: int = 32):
+    """``early_config_prune`` capping ``BLOCK_SIZE_N`` on the XPU GATE arm, whose tile spans
+    ``2 * BLOCK_SIZE_N`` weight columns and so covers the output in half as many programs.
+    Measured on BMG, batched MXFP8 decode: BN=32 beats 64 by 10% and 128 by 60%.
+
+    A cap rather than a tuner hint because the default trial budget does not reach BN=32 on its
+    own — it crowns BN=64, ~6% of decode. Sub-32 tiles stay available, so no N is unschedulable.
+
+    XPU + GATE only: CUDA's wider tile is the measured winner there, and ungated launches prefer
+    it too (down is ~25% faster at BN=64). The win is grid-, not register-bound — BN=32 still
+    spills under ``IGC_ShaderDumpEnable``, more than BN=64 does.
+
+    Probed on BMG (Xe2) only — best to re-probe on other Xe parts before taking this as a Xe-wide law."""
+
+    def ok(c, args):
+        return config_dim(c, args, "BLOCK_SIZE_N") <= max_bn
+
+    return config_filter(
+        ok, when=lambda args: args.get("GATE", False) and get_active_device_type() == "xpu"
+    )
+
+
 def affine_scale_warp_spec_pruner():
     """``early_config_prune`` dropping ``warp_specialize`` on the grouped MX AFFINE (row-major,
     non-``SWIZZLED_SCALES``) scale path. Its per-(gathered-row, K-group) 2D pointer-gather scale
@@ -393,6 +415,18 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
         if (
             c.kwargs.get("SWAP_AB")
             and config_dim(c, args, "BLOCK_SIZE_K") < 128
+            and getattr(args.get("Bs"), "dtype", None) != torch.float8_e4m3fn
+        ):
+            return False
+        # Triton <= 3.8.0 mis-lowers native dot_scaled with UE8M0 scales at BM=128 / BN=64 /
+        # BK=64 / 8 warps: wrong results at any K (fixed upstream after 3.8.0). Admitted wherever
+        # BK=128 cannot divide K.
+        if (
+            not c.kwargs.get("SWAP_AB")
+            and c.kwargs.get("BLOCK_SIZE_M", args.get("BLOCK_SIZE_M")) == 128
+            and config_dim(c, args, "BLOCK_SIZE_K") == 64
+            and config_dim(c, args, "BLOCK_SIZE_N") == 64
+            and c.num_warps == 8
             and getattr(args.get("Bs"), "dtype", None) != torch.float8_e4m3fn
         ):
             return False

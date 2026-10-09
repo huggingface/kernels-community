@@ -11,8 +11,7 @@ rearrange = einops.einops.rearrange
 reduce = einops.einops.reduce
 repeat = einops.einops.repeat
 _enumerate_directions = einops.einops._enumerate_directions
-from . import collect_test_backends, is_backend_tested
-from . import FLOAT_REDUCTIONS as REDUCTIONS
+from . import collect_test_backends, is_backend_tested, FLOAT_REDUCTIONS as REDUCTIONS
 
 imp_op_backends = collect_test_backends(symbolic=False, layers=False)
 sym_op_backends = collect_test_backends(symbolic=True, layers=False)
@@ -370,10 +369,7 @@ def test_reduction_with_callable_imperatives():
         y = numpy.sum(y, axis=tuple_of_axes)
         return numpy.log(y) + minused
 
-    TorchBackend = einops._backends.TorchBackend
-    TensorflowBackend = einops._backends.TensorflowBackend
-    TFKerasBackend = einops._backends.TFKerasBackend
-    NumpyBackend = einops._backends.NumpyBackend
+    TorchBackend, TensorflowBackend, TFKerasBackend, NumpyBackend = einops._backends.TorchBackend, einops._backends.TensorflowBackend, einops._backends.TFKerasBackend, einops._backends.NumpyBackend
 
     backend2callback = {
         TorchBackend.framework_name: logsumexp_torch,

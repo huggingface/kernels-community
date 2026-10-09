@@ -1,10 +1,10 @@
 from typing import Any, Callable
+from . import collect_test_backends
 import kernels
 einops = kernels.get_kernel("kernels-community/einops", version=1)
 _compactify_pattern_for_einsum = einops.einops._compactify_pattern_for_einsum
 einsum = einops.einops.einsum
-EinopsError = einops.EinopsError
-from . import collect_test_backends
+EinopsError = einops.einops.EinopsError
 import numpy as np
 import pytest
 import string

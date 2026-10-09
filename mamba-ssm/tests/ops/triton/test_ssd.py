@@ -1,5 +1,7 @@
 import math
 
+import kernels
+
 import torch
 import torch.nn.functional as F
 
@@ -7,14 +9,14 @@ import pytest
 
 from einops import rearrange, repeat
 
-from mamba_ssm.ops.triton.ssd_chunk_state import chunk_state, chunk_state_ref
-from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
-from mamba_ssm.ops.triton.ssd_chunk_state import chunk_state_varlen
-from mamba_ssm.ops.triton.ssd_state_passing import state_passing, state_passing_ref
-from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd
-from mamba_ssm.ops.triton.ssd_chunk_scan import chunk_scan, chunk_scan_ref
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined, mamba_chunk_scan, ssd_chunk_scan_combined_ref, ssd_selective_scan
-from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined, mamba_split_conv1d_scan_ref
+
+mamba_ssm = kernels.get_kernel("kernels-community/mamba-ssm", version=3)
+
+chunk_state = mamba_ssm.ops.triton.ssd_chunk_state.chunk_state
+_chunk_cumsum_fwd = mamba_ssm.ops.triton.ssd_chunk_state._chunk_cumsum_fwd
+_chunk_state_fwd = mamba_ssm.ops.triton.ssd_chunk_state._chunk_state_fwd
+chunk_state_varlen = mamba_ssm.ops.triton.ssd_chunk_state.chunk_state_varlen
+_state_passing_fwd = mamba_ssm.ops.triton.ssd_state_passing._state_passing_fwd
 
 
 def detach_clone(*args):
@@ -27,6 +29,7 @@ def detach_clone(*args):
 # @pytest.mark.parametrize('ngroups', [1])
 @pytest.mark.parametrize('chunk_size', [64, 128])
 # @pytest.mark.parametrize('chunk_size', [128])
+@pytest.mark.kernels_ci
 def test_chunk_state_varlen(chunk_size, ngroups, dtype):
     device = 'cuda'
     rtol, atol = (1e-2, 3e-3)

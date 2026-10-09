@@ -28,7 +28,7 @@ kernels live in this module:
 grouped (prefill) shares one on-device routing pass (``compute_grouped_scheduling``): gate_up
 gathers hidden by routed row and leaves its output expert-ordered; down reads it in place and
 scatters to routed rows. batched (decode) dispatches per token: ``gather_idx`` reads each routed
-row from the unexpanded hidden in-kernel (no copy), and EP-sentinel rows (``id >= num_experts``)
+row from the unexpanded hidden in-kernel (no copy), and EP-sentinel rows (an id outside ``[0, num_experts)``)
 are left uninit by the GEMM and skipped in ``weighted_reduce``. ``moe_fused_*`` / ``moe_unfused_*`` are format-neutral:
 the base ops dispatch on the weight dtypes / scale layout (block-dynamic FP8, MXFP4/MXFP8,
 NVFP4), and every forward takes ``activation_format`` naming the block's activation quantization
@@ -53,13 +53,13 @@ from .compat import (
     ScalingType,
     SwizzleType,
     compile_time_only_triton_wrap,
-    decode_pdl,
     device_context,
+    pdl_launch_kwargs,
 )
-from .formats import get_supported_act_fns, is_mx, is_mxfp4, weight_format
+from .formats import get_supported_act_fns, is_mx, is_mxfp4, is_per_expert_global, mx_scale_family, normalize_global_scale, ue8m0_as_uint8, weight_format
 from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
-from .quant import _launch_act_quant
-from .scheduling import compute_grouped_scheduling
+from .quant import _launch_act_quant, MX_ACT_QUANT, mx_act_quant_routed_scales
+from .scheduling import compute_grouped_scheduling, is_off_rank, off_rank
 from .epilogue import fused_glu
 
 
@@ -79,7 +79,7 @@ from .epilogue import fused_glu
 def weighted_reduce_kernel(
     Rows,  # (num_groups * NUM_TOP_K, H) — rows to reduce, group-major
     Out,  # (num_groups, H) — one reduced row per group
-    Ids,  # (num_groups, NUM_TOP_K) — per-row id; a row is skipped when its id >= NUM_EXPERTS
+    Ids,  # (num_groups, NUM_TOP_K) — per-row id; an ``is_off_rank`` row is skipped
     Weights,  # (num_groups * NUM_TOP_K,) — per-row scale
     NormWeight,  # (H,) fused post-expert norm weight; None (with NormInv) folds the arm out
     NormInv,  # (num_groups * NUM_TOP_K,) fp32 per-row rsqrt from rms_inv_rows
@@ -100,7 +100,7 @@ def weighted_reduce_kernel(
 ):
     """Per group ``g``, the weighted sum of its ``NUM_TOP_K`` rows into ``Out[g]``:
     ``sum_k Weights[g*NUM_TOP_K + k] * Rows[g*NUM_TOP_K + k]``, skipping rows whose id is
-    ``>= NUM_EXPERTS`` (out-of-range rows are never written upstream and contribute 0).
+    outside ``[0, NUM_EXPERTS)`` (off-rank rows are never written upstream and contribute 0).
     fp32 accumulate; ~2.8x a generic ``view(g, k, H).sum(1)``. ``SIMULATE_UNFUSED`` rounds
     each weighted row to ``Out``'s dtype before summing, matching a reference that weights
     in that dtype; production leaves the accumulation in fp32.
@@ -118,7 +118,7 @@ def weighted_reduce_kernel(
         factor = norm_column_factor(NormWeight, offs_h, mask, NORM)
     for k in tl.static_range(NUM_TOP_K):
         flat = g * NUM_TOP_K + k
-        valid = tl.load(Ids + g * stride_ids_m + k * stride_ids_k) < NUM_EXPERTS
+        valid = ~is_off_rank(tl.load(Ids + g * stride_ids_m + k * stride_ids_k), NUM_EXPERTS)
         weight = tl.load(Weights + flat)
         row = tl.load(
             Rows + flat * stride_rows_m + offs_h * stride_rows_h,
@@ -157,7 +157,7 @@ def weighted_reduce(
 ) -> torch.Tensor:
     """Routing-weighted top-k reduce — the bookend of the fused-MoE chain. Folds each token's
     ``num_top_k`` expert-output rows (``rows``, group-major, scaled by ``top_k_weights``, with
-    EP-sentinel rows ``id >= num_experts`` skipped) from the routed-row layout back to
+    EP-sentinel rows, ids outside ``[0, num_experts)``, skipped) from the routed-row layout back to
     ``(num_tokens, H)``. See ``weighted_reduce_kernel``. ``norm`` (a ``get_supported_norms()``
     name, with ``norm_weight`` and the ``rms_inv_rows`` ``norm_inv``) folds a per-expert output
     norm into this pass rather than normalizing the rows in one of their own."""
@@ -187,8 +187,7 @@ def weighted_reduce(
             NUM_EXPERTS=num_experts,
             NORM=norm,
             SIMULATE_UNFUSED=simulate_unfused,
-            PDL=decode_pdl(),
-            launch_pdl=decode_pdl(),
+            **pdl_launch_kwargs(),
         )
     return reduced
 
@@ -233,12 +232,12 @@ def _gather_idx_cached(
 def _torch_weighted_reduce(down_out, top_k_index, top_k_weights, num_experts):
     """Naive (unfused) routing-weighted top-k reduce in plain torch — NOT the fused
     ``weighted_reduce`` kernel. Materializes the (bf16) weighted contribs, masks EP-sentinel rows
-    (``id >= num_experts``, left uninit in ``down_out``) to 0, and torch-sums to ``(num_tokens, H)``
+    (ids outside ``[0, num_experts)``, left uninit in ``down_out``) to 0, and torch-sums to ``(num_tokens, H)``
     (fp32 accumulate, activation-dtype out). This is the independent reference the fused
     ``weighted_reduce`` is checked against; the fused path's ``simulate_unfused`` reproduces its
     bf16-contrib rounding."""
     num_tokens, num_top_k = top_k_index.shape
-    dropped = (top_k_index.reshape(-1) >= num_experts).reshape(-1, 1)
+    dropped = off_rank(top_k_index.reshape(-1), num_experts).reshape(-1, 1)
     # masked in place on the PRODUCT: a sentinel row's down_out is uninitialized, so zeroing the
     # weight instead would leave 0 * NaN == NaN.
     contrib = down_out * top_k_weights.reshape(-1, 1)
@@ -316,6 +315,27 @@ def _fused_post_expert_norm(down_out, post_expert_norm, weight, eps):
     return _post_expert_norm(down_out, post_expert_norm, weight, eps), {}
 
 
+def _gate_up_activations(hidden, fmt, gate_up_scale, global_scale, activation_scale, scatter_idx, expert_start):
+    """``(A, As)`` for the grouped gate_up. Under a shared global on swizzled MX weights, ``hidden``
+    is quantized once with its scales stored straight into each routed row's expert tile, which
+    the op reads as is while gathering the values; anywhere else the op quantizes ``hidden``."""
+    if (
+        fmt not in MX_ACT_QUANT
+        or gate_up_scale.ndim != 5
+        or activation_scale is not None
+        or is_per_expert_global(global_scale)
+    ):
+        return hidden, activation_scale
+    K = hidden.shape[1]
+    scale_group = mx_scale_family(gate_up_scale, K)
+    if K % (4 * scale_group) != 0:  # a partial 4-column scale block takes the op's padding pass
+        return hidden, activation_scale
+    return mx_act_quant_routed_scales(
+        hidden, fmt, scale_group, ue8m0_as_uint8(gate_up_scale).dtype, scatter_idx, expert_start,
+        normalize_global_scale(global_scale, expert_start.numel() - 1),
+    )
+
+
 def moe_fused_grouped(
     hidden_states: torch.Tensor,  # (T, H)
     top_k_index: torch.Tensor,  # (T, K) int
@@ -370,14 +390,17 @@ def moe_fused_grouped(
     )
 
     # Phase 1: gate_up + SiLU + requant in the block format -> expert-ordered quantized
-    # intermediate (the op quantizes the raw hidden itself and owns the expand-vs-gather
-    # regime policy — this forward is pure sequencing). scatter_idx=None: the down reads
-    # the intermediate in place. (C, Cs) under a requant format; a bare Tensor otherwise.
+    # intermediate. scatter_idx=None: the down reads the intermediate in place. (C, Cs) under a
+    # requant format; a bare Tensor otherwise.
     static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
+    gate_up_in, gate_up_in_scale = _gate_up_activations(
+        hidden_states, fmt, gate_up_proj_scale_inv, gate_up_proj_input_global_scale,
+        gate_up_proj_activation_scale, scatter_idx, expert_start,
+    )
     gate_up_out = matmul_grouped(
-        hidden_states,
+        gate_up_in,
         gate_up_proj,
-        As=gate_up_proj_activation_scale,
+        As=gate_up_in_scale,
         Bs=gate_up_proj_scale_inv,
         a_global_scale=gate_up_proj_input_global_scale,
         b_global_scale=gate_up_proj_weight_global_scale,
@@ -603,10 +626,14 @@ def moe_unfused_grouped(
     )
 
     # gate_up as a plain GEMM (no gate epilogue) over gathered hidden -> expert-ordered (S, 2I).
+    gate_up_in, gate_up_in_scale = _gate_up_activations(
+        hidden_states, fmt, gate_up_proj_scale_inv, gate_up_proj_input_global_scale,
+        gate_up_proj_activation_scale, scatter_idx, expert_start,
+    )
     gate_up_out = matmul_grouped(
-        hidden_states,
+        gate_up_in,
         gate_up_proj,
-        As=gate_up_proj_activation_scale,
+        As=gate_up_in_scale,
         Bs=gate_up_proj_scale_inv,
         a_global_scale=gate_up_proj_input_global_scale,
         b_global_scale=gate_up_proj_weight_global_scale,
@@ -746,13 +773,15 @@ def moe_torch_grouped(
     top_k = top_k_index.shape[1]
     out_dtype = hidden_states.dtype
 
-    # route: stable-sort routed slots by expert into contiguous groups (torch has no gather/scatter fuse)
+    # route: sort routed slots by expert into contiguous groups (torch has no gather/scatter fuse)
     flat_e = top_k_index.reshape(-1)
-    order = torch.argsort(flat_e, stable=True)
-    counts = torch.histc(flat_e.float(), bins=E, min=0, max=E - 1).to(torch.int32)
+    flat_e = torch.where(off_rank(flat_e, E), E, flat_e)  # EP sentinels, -1 included, sort past every group
+    slot_e, order = torch.sort(flat_e)  # expert of each sorted slot, for the per-expert biases
+    counts = torch.histc(slot_e.float(), bins=E, min=0, max=E - 1).to(torch.int32)  # sentinels fall outside
     offs = counts.cumsum(0).to(torch.int32)
     tok = (order // top_k).to(torch.long)  # source token of each sorted slot
-    slot_e = flat_e[order].to(torch.long)  # expert of each sorted slot, for the per-expert biases
+    dropped = (slot_e == E).unsqueeze(-1)  # past offs[-1]: no group computes these rows
+    slot_e = slot_e.to(torch.long).clamp_(max=E - 1)
 
     def pk(t):  # view a packed-e2m1 operand as torch's fp4 dtype for scaled_grouped_mm
         return t.view(FP4) if packed else t
@@ -821,7 +850,7 @@ def moe_torch_grouped(
     down_out = _post_expert_norm(
         down_out, post_expert_norm, post_expert_norm_weight, post_expert_norm_eps
     )
-    return out.index_add_(0, tok, down_out * w)
+    return out.index_add_(0, tok, (down_out * w).masked_fill_(dropped, 0))
 
 
 def moe_unfused_batched(

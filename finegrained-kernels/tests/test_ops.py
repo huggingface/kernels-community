@@ -39,6 +39,7 @@ from utils import (  # type: ignore
     DTYPE_TO_TOL,
     REQUANT_FN,
     REQUANT_GROUP,
+    SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
     dq_grouped,
@@ -83,6 +84,7 @@ class Problem:
     noncontiguous: bool = False
     empty_expert: bool = False
     compile: bool = False
+    bias: bool = False  # a per-expert output bias, added on the accumulator before the GLU
     dtype: torch.dtype = torch.bfloat16
 
     @property
@@ -114,6 +116,8 @@ class Problem:
             tag += "_emptyexpert"
         if self.compile:
             tag += "_compile"
+        if self.bias:
+            tag += "_bias"
         if self.dtype != torch.bfloat16:
             tag += f"_{str(self.dtype).rsplit('.', 1)[-1]}"  # float16 / float32
         return f"{tag}_S{self.S}_E{self.E}_N{self.N}_K{self.K}"
@@ -165,6 +169,10 @@ def scenarios() -> list[Problem]:
         Problem(weights="mxfp8", prequant=True),
         Problem(weights="nvfp4", prequant=True),
         Problem(weights="mxfp8", sentinel_fraction=0.25),
+        # the prefill expansion (>= 4096 routed rows below 1024 per expert) copies only the local rows:
+        # values + 2D scales, and raw bf16 rows
+        Problem(weights="fp8_128x128", S=4096, E=8, sentinel_fraction=0.5),
+        Problem(weights="bf16", S=4096, E=8, sentinel_fraction=0.5),
         Problem(weights="mxfp8", noncontiguous=True),
         Problem(weights="mxfp8", empty_expert=True),
         # decode shape (small M — inline act-quant on MX, the software/scalar arms elsewhere)
@@ -254,6 +262,23 @@ def scenarios() -> list[Problem]:
         Problem(weights="mxfp4", dtype=torch.float32),
         Problem(weights="mxfp8", dtype=torch.float16),
         Problem(weights="mxfp8", dtype=torch.float32),
+        # output bias (gpt-oss ships one on both projections), added in the shared epilogue: one cell per kernel
+        # (full precision, block-FP8 dynamic and static, per-tensor FP8, MX dynamic, MX weight-only), then the
+        # epilogue paths — the two-level global applied before it, the gated columns, the swapped decode tile,
+        # block-FP8's unstacked-gate decode band, the requantized output — and the gpt-oss gate_up itself
+        Problem(weights="bf16", bias=True),
+        Problem(weights="fp8_128x128", bias=True),
+        Problem(weights="fp8_128x128", static=True, bias=True),
+        Problem(weights="fp8_tensor", bias=True),
+        Problem(weights="mxfp8", bias=True),
+        Problem(weights="mxfp8", activation_format="bf16", bias=True),
+        Problem(weights="nvfp4", bias=True),
+        Problem(weights="mxfp8", gate=True, bias=True),
+        Problem(weights="nvfp4", S=8, bias=True),
+        Problem(weights="fp8_128x128", gate=True, S=8, bias=True),
+        Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, bias=True),
+        Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
+        Problem(weights="mxfp4", activation_format="bf16", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True, S=8),
     ]
     return out
 
@@ -279,6 +304,18 @@ def _routed(problem: Problem):
     if problem.noncontiguous:
         expert_ids = _make_noncontig(expert_ids)
     return A, expert_ids
+
+
+def _bias(problem: Problem, op):
+    """The scenario's output bias, else None: ``(E, N_out)`` for the routed ops, ``(N_out,)`` for
+    ``matmul``, ``N_out`` the GEMM's width (the interleaved gate|up columns under gate). Seeded, so the
+    reference and the op read the identical values; large enough that dropping it fails the check."""
+    if not problem.bias:
+        return None
+    g = torch.Generator(device=TEST_DEVICE).manual_seed(1)
+    rows = 2 * problem.N if problem.gate else problem.N
+    bias = torch.randn(problem.E, rows, device=TEST_DEVICE, generator=g).to(problem.dtype)
+    return bias[0] if op == "matmul" else bias
 
 
 def _make_noncontig(x):
@@ -393,11 +430,16 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
     row = WEIGHTS[problem.weights]
     A_dq = _act_dequant(problem, op, A, As, As_global, expert_ids)
     W = row["dequant"](B, Bs, Bs_global)  # (E, rows, K) fp32
+    bias = _bias(problem, op)
     if op == "matmul":
         ref = A_dq @ W[0].T  # single linear, no routing
+        if bias is not None:
+            ref = ref + bias.float()
     else:
         local = expert_ids.long().clamp(max=problem.E - 1)
         ref = torch.einsum("sk,snk->sn", A_dq, W[local])
+        if bias is not None:
+            ref = ref + bias.float()[local]
         ref[expert_ids.long() >= problem.E] = 0
     if problem.gate:
         gate_v, up_v = ref[..., 0::2], ref[..., 1::2]
@@ -462,6 +504,8 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
         )
     if not problem.quantize_output:
         kw["output_dtype"] = problem.dtype
+    if problem.bias:
+        kw["bias"] = _bias(problem, op)
     if out_global is not None:  # provided NVFP4 output global (next proj's input_scale)
         kw["output_global_scale"] = out_global
     if problem.static:  # fused static activation quant — As is the calibrated scale
@@ -474,6 +518,8 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
         Bs_global = Bs_global[:1] if Bs_global is not None else None
     # weight-scale swizzle, shared by all three ops — a pure layout change (values unchanged),
     # so the op's result still matches the affine-Bs reference.
+    if problem.swizzled and not SUPPORTS_SWIZZLED_SCALES:
+        pytest.skip("the SWIZZLE_32_4_4 scale layout is the tcgen05 fast path (CUDA-only)")
     bs = swizzle_mx_scales(Bs) if problem.swizzled and Bs is not None else Bs
     globals_kw = dict(a_global_scale=As_global, b_global_scale=Bs_global)
     if op == "matmul":
@@ -602,18 +648,13 @@ def _skip_moe_only(problem: Problem, op: str) -> None:
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("op", ["batched", "grouped", "matmul"])
 @pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
 def test_op_scenarios(problem: Problem, op):
     """Reference (the op written in torch) vs op (the kernel): same inputs, each returning the op's
     own output format, compared once through the shared ``_dequant``."""
     _skip_moe_only(problem, op)
-    if problem.per_expert_globals and op == "grouped":
-        # the grouped op quantizes one row per SOURCE token and gathers it per routed slot, so a
-        # per-expert activation global needs expert-sorted rows — the fused down, covered end to
-        # end by the MoE chain tests
-        pytest.skip("grouped takes per-expert activation globals on expert-sorted rows only")
     A, expert_ids = _routed(problem)
     row = WEIGHTS[problem.weights]
     E = 1 if op == "matmul" else problem.E  # matmul is a single weight matrix
@@ -672,6 +713,9 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
 # (E4M3 scales: the nvfp4_native_ok fence + software decode arms).
 _SWEEP_CELLS = [
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
+    # K off the BK=128 grid admits the BK=64 rows, the family a K=256 cell never reaches
+    (Problem(weights="mxfp4", K=320), "grouped", "mx_dynamic_matmul_grouped_kernel"),
+    (Problem(weights="mxfp8", K=320), "grouped", "mx_dynamic_matmul_grouped_kernel"),
     (Problem(weights="mxfp4", S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", "mx_dynamic_matmul_kernel"),
@@ -684,7 +728,7 @@ _SWEEP_CELLS = [
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA required")
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize(
     "problem, op, kernel_name",
     _SWEEP_CELLS,

@@ -45,12 +45,12 @@ template <typename T, typename CACHE_T, int BLOCK_SIZE,
           vllm::Fp8KVCacheDataType KV_DTYPE, bool IS_BLOCK_SPARSE,
           int NUM_THREADS = 128, int PARTITION_SIZE = 512>
 void paged_attention_v2_launcher(
-    torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
-    torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,
-    torch::Tensor& value_cache, int num_kv_heads, float scale,
-    torch::Tensor& block_tables, torch::Tensor& seq_lens, int max_seq_len,
-    const std::optional<torch::Tensor>& alibi_slopes, torch::Tensor& k_scale,
-    torch::Tensor& v_scale, const int tp_rank,
+    torch::stable::Tensor& out, torch::stable::Tensor& exp_sums, torch::stable::Tensor& max_logits,
+    torch::stable::Tensor& tmp_out, torch::stable::Tensor& query, torch::stable::Tensor& key_cache,
+    torch::stable::Tensor& value_cache, int num_kv_heads, float scale,
+    torch::stable::Tensor& block_tables, torch::stable::Tensor& seq_lens, int max_seq_len,
+    const std::optional<torch::stable::Tensor>& alibi_slopes, torch::stable::Tensor& k_scale,
+    torch::stable::Tensor& v_scale, const int tp_rank,
     const int blocksparse_local_blocks, const int blocksparse_vert_stride,
     const int blocksparse_block_size, const int blocksparse_head_sliding_step) {
   int num_seqs = query.size(0);
@@ -74,8 +74,8 @@ void paged_attention_v2_launcher(
   T* query_ptr = reinterpret_cast<T*>(query.data_ptr());
   CACHE_T* key_cache_ptr = reinterpret_cast<CACHE_T*>(key_cache.data_ptr());
   CACHE_T* value_cache_ptr = reinterpret_cast<CACHE_T*>(value_cache.data_ptr());
-  int* block_tables_ptr = block_tables.data_ptr<int>();
-  int* seq_lens_ptr = seq_lens.data_ptr<int>();
+  int* block_tables_ptr = block_tables.mutable_data_ptr<int>();
+  int* seq_lens_ptr = seq_lens.mutable_data_ptr<int>();
   const float* k_scale_ptr = reinterpret_cast<const float*>(k_scale.data_ptr());
   const float* v_scale_ptr = reinterpret_cast<const float*>(v_scale.data_ptr());
 
@@ -92,8 +92,10 @@ void paged_attention_v2_launcher(
   int reduce_shared_mem_size = 2 * max_num_partitions * sizeof(float);
 
   dim3 block(NUM_THREADS);
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      query.get_device_index());
+  const cudaStream_t stream =
+      static_cast<cudaStream_t>(current_stream_ptr(query));
   switch (head_size) {
     // NOTE(woosuk): To reduce the compilation time, we only compile for the
     // head sizes that we use in the model. However, we can easily extend this
@@ -126,7 +128,7 @@ void paged_attention_v2_launcher(
       LAUNCH_PAGED_ATTENTION_V2(256);
       break;
     default:
-      TORCH_CHECK(false, "Unsupported head size: ", head_size);
+      STD_TORCH_CHECK(false, "Unsupported head size: ", head_size);
       break;
   }
 }
@@ -161,34 +163,34 @@ void paged_attention_v2_launcher(
       CALL_V2_LAUNCHER_SPARSITY(T, CACHE_T, 32, KV_DTYPE);        \
       break;                                                      \
     default:                                                      \
-      TORCH_CHECK(false, "Unsupported block size: ", block_size); \
+      STD_TORCH_CHECK(false, "Unsupported block size: ", block_size); \
       break;                                                      \
   }
 
 void paged_attention_v2(
-    torch::Tensor& out,         // [num_seqs, num_heads, head_size]
-    torch::Tensor& exp_sums,    // [num_seqs, num_heads, max_num_partitions]
-    torch::Tensor& max_logits,  // [num_seqs, num_heads, max_num_partitions]
-    torch::Tensor&
+    torch::stable::Tensor& out,         // [num_seqs, num_heads, head_size]
+    torch::stable::Tensor& exp_sums,    // [num_seqs, num_heads, max_num_partitions]
+    torch::stable::Tensor& max_logits,  // [num_seqs, num_heads, max_num_partitions]
+    torch::stable::Tensor&
         tmp_out,  // [num_seqs, num_heads, max_num_partitions, head_size]
-    torch::Tensor& query,  // [num_seqs, num_heads, head_size]
-    torch::Tensor&
+    torch::stable::Tensor& query,  // [num_seqs, num_heads, head_size]
+    torch::stable::Tensor&
         key_cache,  // [num_blocks, num_heads, head_size/x, block_size, x]
-    torch::Tensor&
+    torch::stable::Tensor&
         value_cache,       // [num_blocks, num_heads, head_size, block_size]
     int64_t num_kv_heads,  // [num_heads]
     double scale,
-    torch::Tensor& block_tables,  // [num_seqs, max_num_blocks_per_seq]
-    torch::Tensor& seq_lens,      // [num_seqs]
+    torch::stable::Tensor& block_tables,  // [num_seqs, max_num_blocks_per_seq]
+    torch::stable::Tensor& seq_lens,      // [num_seqs]
     int64_t block_size, int64_t max_seq_len,
-    const std::optional<torch::Tensor>& alibi_slopes,
-    const std::string& kv_cache_dtype, torch::Tensor& k_scale,
-    torch::Tensor& v_scale, const int64_t tp_rank,
+    const std::optional<torch::stable::Tensor>& alibi_slopes,
+    const std::string& kv_cache_dtype, torch::stable::Tensor& k_scale,
+    torch::stable::Tensor& v_scale, const int64_t tp_rank,
     const int64_t blocksparse_local_blocks,
     const int64_t blocksparse_vert_stride, const int64_t blocksparse_block_size,
     const int64_t blocksparse_head_sliding_step) {
   const bool is_block_sparse = (blocksparse_vert_stride > 1);
-  DISPATCH_BY_KV_CACHE_DTYPE(query.dtype(), kv_cache_dtype,
+  DISPATCH_BY_KV_CACHE_DTYPE(query.scalar_type(), kv_cache_dtype,
                              CALL_V2_LAUNCHER_BLOCK_SIZE)
 }
 

@@ -46,23 +46,15 @@ def unparse_backends(backend_names: List[str]) -> Tuple[str, str]:
 
 @lru_cache(maxsize=1)
 def parse_backends_to_test() -> List[str]:
-    if ENVVAR_NAME in os.environ:
-        parsed_backends = os.environ[ENVVAR_NAME].split(",")
-        _known_backends = find_names_of_all_frameworks()
-        for backend_name in parsed_backends:
-            if backend_name not in _known_backends:
-                raise RuntimeError(f"Unknown framework: {backend_name}")
-        return parsed_backends
+    if ENVVAR_NAME not in os.environ:
+        raise RuntimeError(f"Testing frameworks were not specified, env var {ENVVAR_NAME} not set")
+    parsed_backends = os.environ[ENVVAR_NAME].split(",")
+    _known_backends = find_names_of_all_frameworks()
+    for backend_name in parsed_backends:
+        if backend_name not in _known_backends:
+            raise RuntimeError(f"Unknown framework: {backend_name}")
 
-    # Auto-detect available frameworks.
-    available = []
-    for module, name in [("torch", "torch"), ("jax", "jax"), ("numpy", "numpy"), ("tensorflow", "tensorflow")]:
-        try:
-            __import__(module)
-            available.append(name)
-        except ImportError:
-            pass
-    return available
+    return parsed_backends
 
 
 def is_backend_tested(backend: str) -> bool:
