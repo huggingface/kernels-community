@@ -10,7 +10,7 @@ import pytest
 import torch
 
 
-cv_utils = kernels.get_kernel("kernels-community/cv-utils", version=1)
+cv_utils = kernels.get_kernel("kernels-community/cv-utils", version=2)
 
 pytestmark = pytest.mark.kernels_ci
 
