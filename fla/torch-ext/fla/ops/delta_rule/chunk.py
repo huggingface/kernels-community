@@ -275,7 +275,7 @@ def chunk_delta_rule(
         >>> import torch
         >>> import torch.nn.functional as F
         >>> from einops import rearrange
-        >>> from ...ops.delta_rule import chunk_delta_rule
+        >>> from fla.ops.delta_rule import chunk_delta_rule
         # inputs with equal lengths
         >>> B, T, H, K, V = 4, 2048, 4, 512, 512
         >>> q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device='cuda')
