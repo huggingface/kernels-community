@@ -75,6 +75,7 @@ KERNEL_SOURCE_MAPPING = {
     "esmfold2-trimul": "",
     # Written for this repo, so there is no upstream to track.
     "weathernext2-banded-attention": "",
+    "gemma-quant-kernels": "",
 }
 
 def parse_args() -> argparse.Namespace:
