@@ -237,6 +237,17 @@ def test_cc_2d_patterns():
     check_cc(patterns)
 
 
+@pytest.mark.parametrize("shape", [(1, 1, 5, 7), (2, 1, 30, 46), (1, 1, 63, 65)])
+def test_connected_component_areas_any_size(shape):
+    g = torch.Generator().manual_seed(sum(shape))
+    mask = torch.rand(shape, generator=g) < 0.45
+    areas = cv_utils.connected_component_areas(mask.to(DEVICE))
+    assert areas.shape == mask.shape
+    for n in range(shape[0]):
+        _, sizes_ref = cc_ref(mask[n, 0].to(torch.uint8))
+        assert areas[n, 0].tolist() == sizes_ref
+
+
 def test_cc_2d_non_zero_values_are_foreground():
     inputs = torch.tensor([[[[0, 7], [255, 0]]]], dtype=torch.uint8)
     labels, counts = cv_utils.cc_2d(inputs.to(DEVICE), True)

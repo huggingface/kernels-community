@@ -88,22 +88,25 @@ def _vertical_patchify_kernel(
 def resize_normalize_patchify(
     frames,
     target_sizes,
-    items,
     image_mean,
     image_std,
     rescale_factor,
     resample,
-    antialias,
     patch_size,
     merge_size,
     temporal_patch_size,
-    round_to_uint8=False,
+    items=None,
+    antialias=True,
+    round_to_uint8=True,
 ):
-    """Resize, normalize and patchify uint8 CHW frames into Qwen2-VL `pixel_values` and `grid_thw`.
+    """Resize, normalize and patchify uint8 CHW frames into Qwen2-VL `pixel_values` and an int64 `grid_thw`.
 
     `target_sizes[j]` is the size of `frames[j]`. `items` lists the frame indices of each output item: `[i]` for an
-    image, the frames of a video in order. A missing frame of the last temporal patch repeats the last frame.
+    image, the frames of a video in order. It defaults to one item per frame. A missing frame of the last temporal
+    patch repeats the last frame. `merge_size=1` writes the patches of each item row by row.
     """
+    if items is None:
+        items = [[index] for index in range(len(frames))]
     device = frames[0].device
     channels = frames[0].shape[0]
     cubic = resample == "bicubic"
@@ -147,7 +150,7 @@ def resize_normalize_patchify(
         grid_thw.append((grid_t, grid_h, grid_w))
         total_patches += grid_t * grid_h * grid_w
 
-    means, stds = _normalization(tuple(image_mean), tuple(image_std), rescale_factor, device)
+    means, stds = _normalization(image_mean, image_std, rescale_factor, channels, device)
     output = torch.empty((total_patches, patch_dim), device=device, dtype=torch.float32)
     slot_frames, slot_temporal_starts, slot_temporal_counts, slot_groups, slot_output_offsets = zip(*slots)
     metadata = _as_tensors(
@@ -182,4 +185,4 @@ def resize_normalize_patchify(
         MERGE=merge_size,
         TEMPORAL=temporal_patch_size,
     )
-    return output, grid_thw
+    return output, torch.tensor(grid_thw, dtype=torch.int64)

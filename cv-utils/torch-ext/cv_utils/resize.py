@@ -179,8 +179,17 @@ def _tile(tile, out_width):
     return rows * columns // capped_columns, capped_columns
 
 
+def _normalization(mean, std, rescale, channels, device):
+    """Per-channel mean and std tensors for the kernels. A single number is used for every channel."""
+    mean = (mean,) * channels if isinstance(mean, (int, float)) else tuple(mean)
+    std = (std,) * channels if isinstance(std, (int, float)) else tuple(std)
+    if len(mean) != channels or len(std) != channels:
+        raise ValueError(f"`image_mean` and `image_std` need one value per channel, the images have {channels}.")
+    return _rescaled_normalization(mean, std, rescale, device)
+
+
 @lru_cache
-def _normalization(mean, std, rescale, device):
+def _rescaled_normalization(mean, std, rescale, device):
     """Mean and std divided by `rescale`, so that `(x - mean') / std' == (x * rescale - mean) / std`."""
     return _as_tensors(device, torch.float32, [value / rescale for value in mean], [value / rescale for value in std])
 
@@ -290,25 +299,32 @@ def _horizontal_pass(
 
 def resize_normalize(
     images,
-    size,
     image_mean,
     image_std,
     rescale_factor,
     resample,
-    antialias,
+    size=None,
+    shortest_edge=None,
     crop_size=None,
-    resize_mode="square",
-    round_to_uint8=False,
+    antialias=True,
+    round_to_uint8=True,
 ):
     """Resize uint8 CHW images, center crop them to `crop_size`, rescale and normalize, into one `(N, C, H, W)` tensor.
 
-    `resize_mode="square"` resizes every image to `size = (height, width)`. `resize_mode="shortest_edge"` resizes the
-    short side to `size` and keeps the aspect ratio, and needs a `crop_size`.
+    Pass `size = (height, width)` to resize every image to that size, or `shortest_edge` to resize the short side and
+    keep the aspect ratio, which needs a `crop_size`. `round_to_uint8=True` rounds after each resize pass like the
+    torchvision uint8 path.
     """
+    if (size is None) == (shortest_edge is None):
+        raise ValueError("Pass exactly one of `size` and `shortest_edge`.")
+    if shortest_edge is not None and crop_size is None:
+        raise ValueError("A `shortest_edge` resize needs a `crop_size`.")
     shapes = [image.shape[1:] for image in images]
-    if resize_mode == "shortest_edge":
+    if shortest_edge is not None:
         resize_sizes = [
-            (size, int(width * size / height)) if height <= width else (int(height * size / width), size)
+            (shortest_edge, int(width * shortest_edge / height))
+            if height <= width
+            else (int(height * shortest_edge / width), shortest_edge)
             for height, width in shapes
         ]
     else:
@@ -332,7 +348,7 @@ def resize_normalize(
     )
     device = images[0].device
     channels = images[0].shape[0]
-    means, stds = _normalization(tuple(image_mean), tuple(image_std), rescale_factor, device)
+    means, stds = _normalization(image_mean, image_std, rescale_factor, channels, device)
     output = torch.empty((len(images), channels, out_height, out_width), device=device, dtype=torch.float32)
     block_rows, block_columns = _tile(VERTICAL_TILE, out_width)
     _vertical_kernel[(len(images), triton.cdiv(out_height, block_rows), triton.cdiv(out_width, block_columns))](

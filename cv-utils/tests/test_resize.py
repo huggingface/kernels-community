@@ -37,19 +37,30 @@ def reference(image, size, resample, antialias=True):
 @pytest.mark.parametrize("antialias", [True, False])
 @pytest.mark.parametrize("resample", ["bilinear", "bicubic"])
 @pytest.mark.parametrize(
-    "resize_mode, size, crop_size",
-    [("square", (224, 224), None), ("square", (256, 256), (224, 224)), ("shortest_edge", 256, (224, 224))],
+    "size, shortest_edge, crop_size",
+    [((224, 224), None, None), ((256, 256), None, (224, 224)), (None, 256, (224, 224))],
 )
-def test_resize_normalize_matches_interpolate(antialias, resample, resize_mode, size, crop_size):
+def test_resize_normalize_matches_interpolate(antialias, resample, size, shortest_edge, crop_size):
     images = random_images([(480, 640), (300, 300), (1024, 768)])
     output = cv_utils.resize_normalize(
-        images, size, MEAN, STD, 1 / 255, resample, antialias, crop_size=crop_size, resize_mode=resize_mode
+        images,
+        MEAN,
+        STD,
+        1 / 255,
+        resample,
+        size=size,
+        shortest_edge=shortest_edge,
+        crop_size=crop_size,
+        antialias=antialias,
+        round_to_uint8=False,
     )
     for image, result in zip(images, output):
         height, width = image.shape[1:]
-        if resize_mode == "shortest_edge":
+        if shortest_edge is not None:
             size_of_image = (
-                (size, int(width * size / height)) if height <= width else (int(height * size / width), size)
+                (shortest_edge, int(width * shortest_edge / height))
+                if height <= width
+                else (int(height * shortest_edge / width), shortest_edge)
             )
         else:
             size_of_image = size
@@ -67,7 +78,7 @@ def test_resize_normalize_patchify_matches_reference():
     items = [[0], [1, 2, 3]]
     patch, merge, temporal = 14, 2, 2
     pixel_values, grid_thw = cv_utils.resize_normalize_patchify(
-        frames, target_sizes, items, MEAN, STD, 1 / 255, "bicubic", True, patch, merge, temporal
+        frames, target_sizes, MEAN, STD, 1 / 255, "bicubic", patch, merge, temporal, items=items, round_to_uint8=False
     )
 
     expected = []
@@ -79,14 +90,15 @@ def test_resize_normalize_patchify_matches_reference():
             grid_t, temporal, 3, height // patch // merge, merge, patch, width // patch // merge, merge, patch
         )
         expected.append(patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8).reshape(-1, 3 * temporal * patch * patch))
-    assert grid_thw == [(1, 16, 24), (2, 8, 8)]
+    assert grid_thw.dtype == torch.int64
+    assert grid_thw.tolist() == [[1, 16, 24], [2, 8, 8]]
     torch.testing.assert_close(pixel_values, torch.cat(expected), atol=2e-3, rtol=0)
 
 
 @pytest.mark.parametrize("resample", ["bilinear", "bicubic"])
 def test_resize_normalize_rounds_like_two_uint8_passes(resample):
     images = random_images([(480, 640), (1024, 768)])
-    output = cv_utils.resize_normalize(images, (224, 224), MEAN, STD, 1 / 255, resample, True, round_to_uint8=True)
+    output = cv_utils.resize_normalize(images, MEAN, STD, 1 / 255, resample, size=(224, 224))
     for image, result in zip(images, output):
         wide = F.interpolate(image[None].float(), size=(image.shape[1], 224), mode=resample, antialias=True)
         wide = wide.round().clamp(0, 255)
@@ -101,22 +113,35 @@ def test_resize_normalize_rounds_like_two_uint8_passes(resample):
 def test_invalid_inputs_raise():
     image = random_images([(64, 64)])[0]
     with pytest.raises(ValueError, match="uint8"):
-        cv_utils.resize_normalize([image.float()], (32, 32), MEAN, STD, 1 / 255, "bilinear", True)
+        cv_utils.resize_normalize([image.float()], MEAN, STD, 1 / 255, "bilinear", size=(32, 32))
     with pytest.raises(ValueError, match="crop_size"):
-        cv_utils.resize_normalize([image], (32, 32), MEAN, STD, 1 / 255, "bilinear", True, crop_size=(48, 48))
+        cv_utils.resize_normalize([image], MEAN, STD, 1 / 255, "bilinear", size=(32, 32), crop_size=(48, 48))
+    with pytest.raises(ValueError, match="exactly one"):
+        cv_utils.resize_normalize([image], MEAN, STD, 1 / 255, "bilinear", size=(32, 32), shortest_edge=32)
+    with pytest.raises(ValueError, match="needs a `crop_size`"):
+        cv_utils.resize_normalize([image], MEAN, STD, 1 / 255, "bilinear", shortest_edge=32)
+    with pytest.raises(ValueError, match="one value per channel"):
+        cv_utils.resize_normalize([image], [0.5, 0.5], [0.5, 0.5], 1 / 255, "bilinear", size=(32, 32))
     with pytest.raises(ValueError, match="multiple"):
-        cv_utils.resize_normalize_patchify([image], [(42, 56)], [[0]], MEAN, STD, 1 / 255, "bicubic", True, 14, 2, 2)
+        cv_utils.resize_normalize_patchify([image], [(42, 56)], MEAN, STD, 1 / 255, "bicubic", 14, 2, 2)
     with pytest.raises(ValueError, match="share a target size"):
         cv_utils.resize_normalize_patchify(
-            [image, image], [(56, 56), (28, 28)], [[0, 1]], MEAN, STD, 1 / 255, "bicubic", True, 14, 2, 2
+            [image, image], [(56, 56), (28, 28)], MEAN, STD, 1 / 255, "bicubic", 14, 2, 2, items=[[0, 1]]
         )
+
+
+def test_single_mean_and_std_apply_to_every_channel():
+    images = random_images([(64, 64)])
+    single = cv_utils.resize_normalize(images, 0.5, 0.5, 1 / 255, "bilinear", size=(32, 32))
+    per_channel = cv_utils.resize_normalize(images, [0.5] * 3, [0.5] * 3, 1 / 255, "bilinear", size=(32, 32))
+    torch.testing.assert_close(single, per_channel, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("patch, target_sizes", [(14, [(280, 420), (504, 336)]), (16, [(288, 448), (512, 320)])])
 def test_resize_normalize_patchify_row_by_row_with_merge_size_one(patch, target_sizes):
     frames = random_images([(300, 450), (500, 333)])
     pixel_values, grid_thw = cv_utils.resize_normalize_patchify(
-        frames, target_sizes, [[0], [1]], MEAN, STD, 1 / 255, "bicubic", True, patch, 1, 1
+        frames, target_sizes, MEAN, STD, 1 / 255, "bicubic", patch, 1, 1, round_to_uint8=False
     )
 
     expected = []
@@ -124,5 +149,5 @@ def test_resize_normalize_patchify_row_by_row_with_merge_size_one(patch, target_
         image = reference(frame, (height, width), "bicubic")
         patches = image.view(3, height // patch, patch, width // patch, patch).permute(1, 3, 0, 2, 4)
         expected.append(patches.reshape(-1, 3 * patch * patch))
-    assert grid_thw == [(1, height // patch, width // patch) for height, width in target_sizes]
+    assert grid_thw.tolist() == [[1, height // patch, width // patch] for height, width in target_sizes]
     torch.testing.assert_close(pixel_values, torch.cat(expected), atol=2e-3, rtol=0)
