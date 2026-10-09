@@ -1,6 +1,11 @@
+# `vendor/` is a pinned subset of MLX (revision in vendor/UPSTREAM); refresh it with
+# `python vendor.py --rev <tag>`. It holds upstream's Metal kernels as they ship -- no local copy is
+# generated from them. The host code in mlx_metal/ is transcribed from upstream's, which
+# tests/test_vendor_drift.py checks on every pin bump.
+
 [general]
 name = "mlx-quantization-metal-kernels"
-version = 1
+version = 2
 edition = 5
 license = "MIT"
 backends = ["metal"]
@@ -17,29 +22,55 @@ src = [
 [kernel.mlx_quantization_metal_kernels]
 backend = "metal"
 depends = ["torch"]
-include = ["quantization_mlx"]
+# upstream includes "mlx/backend/metal/kernels/...", which resolves from vendor/
+include = ["mlx_metal", "torch-ext", "vendor"]
 src = [
-    "quantization_mlx/bf16.h",
-    "quantization_mlx/bf16_math.h",
-    "quantization_mlx/complex.h",
-    "quantization_mlx/defines.h",
-    "quantization_mlx/utils.h",
-    "quantization_mlx/gemm/defines.h",
-    "quantization_mlx/gemm/gemm.h",
-    "quantization_mlx/gemm/loader.h",
-    "quantization_mlx/gemm/mma.h",
-    "quantization_mlx/gemm/params.h",
-    "quantization_mlx/gemm/transforms.h",
-    "quantization_mlx/gemm/utils.h",
-    "quantization_mlx/gemm/utils/integral_constant.h",
-    "quantization_mlx/gemm/utils/type_traits.h",
-    "quantization_mlx/quantized_utils.h",
-    "quantization_mlx/fp4.h",
-    "quantization_mlx/fp8.h",
-    "quantization_mlx/quantized.h",
-    "quantization_mlx/quantized.metal",
-    "quantization_mlx/quantized.mm",
-    "quantization_mlx/fp_quantized.h",
-    "quantization_mlx/fp_quantized.metal",
-    "quantization_mlx/fp_quantized.mm",
+    "mlx_metal/common.h",
+    "mlx_metal/mlx_dispatch.mm",
+    "mlx_metal/mlx_quantization.cpp",
+    # one wrapper per upstream .metal: each includes the vendored file (shipped as .metal.h, see
+    # vendor.py) under MLX's math mode
+    "mlx_metal/mlx_fp_quantized.metal",
+    "mlx_metal/mlx_fp_quantized_nax.metal",
+    "mlx_metal/mlx_gather_mm_offsets.metal",
+    "mlx_metal/mlx_quantized.metal",
+    "mlx_metal/mlx_quantized_nax.metal",
+    "mlx_metal/mlx_reduce.metal",
+    # upstream's kernel sources and headers, as vendored
+    "vendor/mlx/backend/metal/kernels/atomic.h",
+    "vendor/mlx/backend/metal/kernels/bf16.h",
+    "vendor/mlx/backend/metal/kernels/bf16_math.h",
+    "vendor/mlx/backend/metal/kernels/complex.h",
+    "vendor/mlx/backend/metal/kernels/defines.h",
+    "vendor/mlx/backend/metal/kernels/fp4.h",
+    "vendor/mlx/backend/metal/kernels/fp8.h",
+    "vendor/mlx/backend/metal/kernels/fp_quantized.h",
+    "vendor/mlx/backend/metal/kernels/fp_quantized.metal.h",
+    "vendor/mlx/backend/metal/kernels/fp_quantized_nax.h",
+    "vendor/mlx/backend/metal/kernels/fp_quantized_nax.metal.h",
+    "vendor/mlx/backend/metal/kernels/gather_mm_offsets.metal.h",
+    "vendor/mlx/backend/metal/kernels/logging.h",
+    "vendor/mlx/backend/metal/kernels/quantized.h",
+    "vendor/mlx/backend/metal/kernels/quantized.metal.h",
+    "vendor/mlx/backend/metal/kernels/quantized_nax.h",
+    "vendor/mlx/backend/metal/kernels/quantized_nax.metal.h",
+    "vendor/mlx/backend/metal/kernels/quantized_utils.h",
+    "vendor/mlx/backend/metal/kernels/reduce.h",
+    "vendor/mlx/backend/metal/kernels/reduce.metal.h",
+    "vendor/mlx/backend/metal/kernels/reduction/ops.h",
+    "vendor/mlx/backend/metal/kernels/reduction/reduce_all.h",
+    "vendor/mlx/backend/metal/kernels/reduction/reduce_col.h",
+    "vendor/mlx/backend/metal/kernels/reduction/reduce_init.h",
+    "vendor/mlx/backend/metal/kernels/reduction/reduce_row.h",
+    "vendor/mlx/backend/metal/kernels/steel/defines.h",
+    "vendor/mlx/backend/metal/kernels/steel/gemm/gemm.h",
+    "vendor/mlx/backend/metal/kernels/steel/gemm/loader.h",
+    "vendor/mlx/backend/metal/kernels/steel/gemm/mma.h",
+    "vendor/mlx/backend/metal/kernels/steel/gemm/nax.h",
+    "vendor/mlx/backend/metal/kernels/steel/gemm/params.h",
+    "vendor/mlx/backend/metal/kernels/steel/gemm/transforms.h",
+    "vendor/mlx/backend/metal/kernels/steel/utils.h",
+    "vendor/mlx/backend/metal/kernels/steel/utils/integral_constant.h",
+    "vendor/mlx/backend/metal/kernels/steel/utils/type_traits.h",
+    "vendor/mlx/backend/metal/kernels/utils.h",
 ]
