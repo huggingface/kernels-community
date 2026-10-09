@@ -15,13 +15,9 @@ def causal_conv1d_fwd_function(
     silu_activation: bool,
 ) -> torch.Tensor:
     out = torch.empty_like(x)
+    # Positional: torch.compile rejects a non-contiguous (e.g. channel-last) `out=` keyword.
     ops.causal_conv1d_fwd(
-        x=x,
-        weight=weight,
-        bias=bias,
-        seq_idx=seq_idx,
-        initial_states=initial_states,
-        out=out,
+        x, weight, bias, seq_idx, initial_states, out,
         final_states_out=final_states_out,
         silu_activation=silu_activation,
     )
@@ -86,12 +82,9 @@ def causal_conv1d_update_function(
     conv_state_indices: torch.Tensor | None,
 ) -> torch.Tensor:
     out = torch.empty_like(x)
+    # Positional on purpose, see `causal_conv1d_fwd_function`.
     ops.causal_conv1d_update(
-        x=x,
-        conv_state=conv_state,
-        weight=weight,
-        bias=bias,
-        out=out,
+        x, conv_state, weight, bias, out,
         silu_activation=silu_activation,
         cache_seqlens=cache_seqlens,
         conv_state_indices=conv_state_indices,
