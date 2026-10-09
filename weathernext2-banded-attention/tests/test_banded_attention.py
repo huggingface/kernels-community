@@ -313,3 +313,27 @@ def test_attention_on_noncurrent_device():
         torch.testing.assert_close(actual, reference(query, key, value, mask, 32**-0.5), atol=2e-5, rtol=2e-5)
         assert actual.device == device
         assert backend.current_device() == 0
+
+
+@requires_accelerator
+@pytest.mark.parametrize("prepared", [False, True])
+def test_attention_compile(prepared):
+    generator = torch.Generator(device=DEVICE).manual_seed(7)
+    shape = (2, 3, 2, 65, 32)
+    query, key, value = (torch.randn(shape, device=DEVICE, generator=generator) for _ in range(3))
+    mask = banded_mask(3, 65, 0.05, DEVICE, generator)
+    banded = weathernext2_banded_attention.layers._prepare_mask(mask) if prepared else mask
+
+    def attention(query, key, value, mask):
+        return banded_attention(query, key, value, mask, 32**-0.5, precision="ieee")
+
+    compiled = torch.compile(attention, fullgraph=True)
+    try:
+        with torch.inference_mode():
+            for _ in range(2):
+                query = torch.randn(shape, device=DEVICE, generator=generator)
+                actual = compiled(query, key, value, banded)
+                expected = reference(query, key, value, mask, 32**-0.5)
+                torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    finally:
+        torch._dynamo.reset()

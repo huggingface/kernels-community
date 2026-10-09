@@ -116,6 +116,8 @@ def _blockwise_attention(query, key, value, mask, scaling):
 class WeatherNext2AttentionMask(nn.Module):
     """Prepare one packed geometry mask per forward, shared by all transformer layers."""
 
+    can_torch_compile = True
+
     def forward(self, attention_mask, batch_size, dtype):
         if self.training or torch.is_grad_enabled() or self.config._attn_implementation == "flex_attention":
             return type(self).forward(self, attention_mask, batch_size, dtype)
@@ -126,6 +128,8 @@ class WeatherNext2AttentionMask(nn.Module):
 
 
 class WeatherNext2Attention(nn.Module):
+    can_torch_compile = True
+
     def forward(self, hidden_states: torch.Tensor, attention_mask, **kwargs):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
