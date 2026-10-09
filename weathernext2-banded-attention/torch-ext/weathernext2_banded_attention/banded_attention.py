@@ -154,6 +154,7 @@ def _banded_attention_kernel(
     rows = tile * BLOCK_M + tl.arange(0, BLOCK_M)
     dims = tl.arange(0, HEAD_DIM)
     row_valid = rows < block_size
+    scaling = scaling.to(tl.float32)
 
     query_base = query_ptr + flat_block * stride_qb + head * stride_qh
     query = tl.load(
