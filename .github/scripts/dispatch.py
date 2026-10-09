@@ -40,6 +40,7 @@ BACKEND_TO_WORKFLOWS = {
     "rocm": {"build.yaml"},
     "metal": {"build-mac.yaml"},
     "xpu": {"build.yaml", "build-windows.yaml"},
+    "tpu": {"build.yaml"},
 }
 
 WORKFLOW_TO_BACKENDS = {

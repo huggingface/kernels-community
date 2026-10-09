@@ -85,6 +85,7 @@ jobs:
       kernel: ${{ steps.validate.outputs.kernel }}
       config: ${{ steps.validate.outputs.config }}
       matrix: ${{ steps.matrix.outputs.matrix }}
+      tpu-kernel: ${{ steps.matrix.outputs.tpu-kernel }}
     steps:
       # Reject kernel names outside the safe charset before any step uses them.
       # Accepts e.g.: flash-attn3, rejects: $(myevilcommand).
@@ -201,6 +202,11 @@ jobs:
           ARM_BACKENDS=$(cd "$KERNEL" && nix eval .#${NIX_TARGET} --apply builtins.attrNames --json --system aarch64-linux)
           MATRIX=$(python3 .github/workflows/generate-build-matrix.py "$X86_BACKENDS" "$ARM_BACKENDS")
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          TPU_KERNEL=$(python3 -c 'import json, sys; print(str("tpu" in json.loads(sys.argv[1])).lower())' "$X86_BACKENDS")
+          echo "tpu-kernel=$TPU_KERNEL" >> "$GITHUB_OUTPUT"
+          if [ "$TPU_KERNEL" = "true" ]; then
+            echo "TPU support is build-only: hardware tests are not run and test closures are not uploaded." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # Compile the kernel for each (backend, arch) pair; release mode also uploads to the Hub.
   build-kernel:
@@ -239,11 +245,58 @@ jobs:
             sandbox-fallback = false
       - name: Nix info
         run: nix-shell -p nix-info --run "nix-info -m"
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+      # Gated TPU dependencies must never be pushed to the public cache.
+      - if: matrix.backend != 'tpu'
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: huggingface
         env:
           USER: runner
+
+      - name: Install TPU prefetch tools
+        if: matrix.backend == 'tpu'
+        run: echo "$(nix build nixpkgs#jq --no-link --print-out-paths)/bin" >> "$GITHUB_PATH"
+
+      # Match the Windows workflow: use the kernel's pinned builder helpers.
+      - name: Kernel extract required builder version
+        if: matrix.backend == 'tpu'
+        id: extract-builder-version
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+        run: |
+          REVISION=$(jq -er '.nodes["kernel-builder"].locked.rev' "$KERNEL/flake.lock")
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout kernels
+        if: matrix.backend == 'tpu'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: huggingface/kernels
+          ref: ${{ steps.extract-builder-version.outputs.revision }}
+          path: kernels
+
+      - name: Resolve TPU wheel versions
+        if: matrix.backend == 'tpu'
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+        run: |
+          # requireFile names include the versions and ABI expected by this lockfile.
+          cd "$KERNEL"
+          nix derivation show --recursive .#redistributable.torch-tpu | jq -er '
+            [.[] | .env.name // "" |
+              capture("^(?<package>torch_tpu|libtpu)-(?<version>[A-Za-z0-9.]+)-(?<abi>cp[0-9]+)-\\k<abi>-manylinux_2_31_x86_64[.]whl$")]
+            | unique
+            | .[] | [.package, .version, .abi] | @tsv
+          ' > "$RUNNER_TEMP/tpu-wheels.tsv"
+
+      - name: Prefetch gated TPU wheels
+        if: matrix.backend == 'tpu'
+        env:
+          GCLOUD_ACCESS_TOKEN: ${{ secrets.GCLOUD_ACCESS_TOKEN }}
+        run: |
+          while IFS=$'\t' read -r package version abi; do
+            bash kernels/nix-builder/scripts/helpers/prefetch-tpu-wheel.sh "$package" "$version" "$abi"
+          done < "$RUNNER_TEMP/tpu-wheels.tsv"
 
       # PR mode builds backendCi (single representative variant);
       # release mode builds backendBundle (full set of variants).
@@ -253,12 +306,24 @@ jobs:
           MODE: ${{ inputs.mode }}
           BACKEND: ${{ matrix.backend }}
         run: |
-          if [ "$MODE" = "pr" ]; then
+          if [ "$BACKEND" = "tpu" ]; then
+            ( cd "$KERNEL" && nix build -L .#redistributable.torch-tpu && ls -l result/ )
+          elif [ "$MODE" = "pr" ]; then
             ( cd "$KERNEL" && nix build -L ".#backendCi.$BACKEND" && ls -l result/ )
           else
             ( cd "$KERNEL" && nix build -L ".#backendBundle.$BACKEND" && ls -l result/ )
           fi
           ( cd "$KERNEL" && cp -rL result build && rm result && chmod -R u+w build )
+
+      # Direct builds already contain the variant directory, but lack the bundle card.
+      - name: Fill TPU kernel card
+        if: matrix.backend == 'tpu' && inputs.mode != 'pr'
+        env:
+          KERNEL: ${{ needs.setup.outputs.kernel }}
+        run: |
+          if [ -f "$KERNEL/CARD.md" ]; then
+            nix run -L github:huggingface/kernels#kernel-builder -- fill-card "$KERNEL" "$KERNEL/build/CARD.md"
+          fi
 
       # cosign-installer >= v4.1.1 requires envsubst (gettext), which is not
       # preinstalled on the custom runner images.
@@ -338,7 +403,7 @@ jobs:
     permissions:
       contents: read
     needs: setup
-    if: needs.setup.outputs.skip == 'false' && (inputs.mode == 'pr' || inputs.mode == 'stage')
+    if: needs.setup.outputs.skip == 'false' && needs.setup.outputs.tpu-kernel != 'true' && (inputs.mode == 'pr' || inputs.mode == 'stage')
     runs-on:
       group: aws-highmemory-32-plus-nix
     timeout-minutes: 600 # 10h
@@ -402,7 +467,7 @@ jobs:
   test-kernel-gpu:
     permissions: {}
     needs: [setup, build-kernel, build-ci-test]
-    if: needs.setup.outputs.skip == 'false' && (inputs.mode == 'pr' || inputs.mode == 'stage')
+    if: needs.setup.outputs.skip == 'false' && needs.setup.outputs.tpu-kernel != 'true' && (inputs.mode == 'pr' || inputs.mode == 'stage')
     runs-on:
       group: aws-g6-12xlarge-plus
     steps:
