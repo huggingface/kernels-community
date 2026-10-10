@@ -34,8 +34,14 @@ registers it inference-only.
 ## How transformers uses it
 
 `EsmFold2TriangleMultiplicativeUpdate` is decorated
-`@use_kernel_forward_from_hub("ESMFold2TriangleMultiplication")` and mapped to this
-repo in `integrations/hub_kernels.py` (cuda, `Mode.INFERENCE`).
+`@use_kernel_forward_from_hub("EsmFold2TriangleMultiplication")` and mapped to this
+repo's `ESMFold2TriangleMultiplication` layer in `integrations/hub_kernels.py` (cuda,
+inference).
+
+The layer sets `can_torch_compile = True`: the inference path traces with
+`torch.compile(fullgraph=True)` (the Triton kernels are captured directly, no graph
+break), and the sequence length stays symbolic under dynamic shapes, so new lengths do
+not recompile.
 
 ```python
 import torch
@@ -69,9 +75,8 @@ output past their ends; the LayerNorm kernels additionally index channels with
 raise `ValueError` instead of silently returning nondeterministic garbage — see
 "Follow-ups" for the real fix.
 
-Sequence length `L` is unconstrained (the row dim is masked everywhere), except that
-`B == L == 1` makes `M == 1`, which Triton specializes to a constexpr and the LayerNorm
-kernel's `M.to(tl.int64)` then rejects.
+Sequence length `L` is unconstrained (the row dim is masked everywhere), including
+`B == L == 1`.
 
 ## Validation
 
@@ -86,7 +91,8 @@ growing with N (`torch.compile` of the fallback only reaches ~1–7×).
 `tests/` checks the fused path against an fp32 PyTorch reference across both flow
 directions, supported channel counts, mask/dropout-mask combinations and a range of
 sequence lengths, and asserts repeated calls are bit-identical (drift would indicate an
-out-of-bounds read).
+out-of-bounds read). It also checks that `torch.compile(fullgraph=True)` matches eager
+and that varying the sequence length under `dynamic=True` never recompiles.
 
 ## Follow-ups
 

@@ -76,8 +76,10 @@ def _gated_gemm_with_residual_kernel(
     M,
     N,
     K,
-    STRIDE_B: tl.constexpr,  # = N_ROW * N_COL  (for decoding b from m)
-    N_COL: tl.constexpr,  # = L_col  (for decoding j from m)
+    # Runtime args, not constexpr: both scale with sequence length, so constexpr
+    # would recompile the kernel (and torch.compile the graph) per distinct L.
+    STRIDE_B,  # = N_ROW * N_COL  (for decoding b from m)
+    N_COL,  # = L_col  (for decoding j from m)
     TILE_M: tl.constexpr,
     TILE_N: tl.constexpr,
     TILE_K: tl.constexpr,
@@ -215,8 +217,8 @@ def _gated_gemm_with_residual_backward_kernel(
     M,
     N,
     K,
-    STRIDE_B: tl.constexpr,
-    N_COL: tl.constexpr,
+    STRIDE_B,  # runtime, not constexpr: see the forward kernel
+    N_COL,
     TILE_M: tl.constexpr,
     TILE_N: tl.constexpr,
     TILE_K: tl.constexpr,
@@ -531,7 +533,6 @@ def _gated_gemm_with_residual(
     )
 
 
-@torch._dynamo.disable
 def triangle_multiplicative_update_with_residual(
     pair: torch.Tensor,
     direction: str,

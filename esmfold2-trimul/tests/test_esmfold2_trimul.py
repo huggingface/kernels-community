@@ -118,12 +118,12 @@ def test_masks(use_mask, use_drop_mask):
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("L", [2, 7, 33, 64])
+@pytest.mark.parametrize("L", [1, 2, 7, 33, 64])
 def test_sequence_lengths(L):
     """L is unconstrained: the row dim is masked in every kernel.
 
-    B == L == 1 is excluded: it makes M == 1, which Triton specializes to a
-    constexpr and the LayerNorm kernel's ``M.to(tl.int64)`` then rejects.
+    B == L == 1 makes M == 1, which Triton specializes to a constexpr; the
+    LayerNorm kernels must still accept it.
     """
     _assert_matches_reference(1, L, 64, "outgoing", use_mask=True, use_drop_mask=False)
 
@@ -154,6 +154,55 @@ def test_deterministic():
         assert torch.equal(outs[0], other)
 
 
+def _compile_case(c_z, device):
+    """An inference-path TriMul closure plus an input factory, as the layer calls it."""
+    w = _weights(c_z, device)
+
+    def fn(pair, mask):
+        return esmfold2_trimul.triangle_multiplicative_update_with_residual(
+            pair, "outgoing", torch.zeros_like(pair), None, mask=mask, **w
+        )
+
+    def inputs(L):
+        pair = torch.randn(1, L, L, c_z, device=device).to(torch.bfloat16)
+        mask = torch.rand(1, L, L, device=device).to(torch.bfloat16)
+        return pair, mask
+
+    return fn, inputs
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_torch_compile_fullgraph_matches_eager():
+    """The layer declares `can_torch_compile`, so the op must trace without graph breaks."""
+    torch.manual_seed(0)
+    torch.compiler.reset()
+    fn, inputs = _compile_case(128, torch.device("cuda"))
+    pair, mask = inputs(24)
+
+    with torch.no_grad():
+        want = fn(pair, mask)
+        got = torch.compile(fn, fullgraph=True)(pair, mask)
+    torch.testing.assert_close(got, want)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_torch_compile_no_recompile_across_lengths():
+    """L must stay symbolic under dynamic shapes; protein lengths vary per call."""
+    torch.manual_seed(0)
+    torch.compiler.reset()
+    fn, inputs = _compile_case(128, torch.device("cuda"))
+    compiled = torch.compile(fn, fullgraph=True, dynamic=True)
+
+    with torch.no_grad():
+        compiled(*inputs(16))
+        with torch.compiler.set_stance("fail_on_recompile"):
+            for L in (24, 33, 64):
+                pair, mask = inputs(L)
+                torch.testing.assert_close(compiled(pair, mask), fn(pair, mask))
+
+
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("c_z", [16, 32, 96, 192])
 def test_rejects_unsupported_channels(c_z):
@@ -180,3 +229,5 @@ def test_layer_is_exposed_for_kernels():
     assert issubclass(layer, torch.nn.Module)
     # `kernels` requires layers to be stateless: no constructor of their own.
     assert layer.__init__ is torch.nn.Module.__init__
+    # Lets transformers register the layer for `Mode.TORCH_COMPILE`.
+    assert layer.can_torch_compile is True
