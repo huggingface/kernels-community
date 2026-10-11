@@ -381,12 +381,14 @@ def test_layer_precision_follows_torch(monkeypatch, matmul, expected):
 def test_layer_precision_follows_set_float32_matmul_precision():
     precision = weathernext2_banded_attention.layers._float32_precision
     on_rocm = torch.version.hip is not None
+    previous = torch.get_float32_matmul_precision()
     try:
         torch.set_float32_matmul_precision("high")
         assert precision(torch.device("cuda")) == ("ieee" if on_rocm else "default")
-    finally:
         torch.set_float32_matmul_precision("highest")
-    assert precision(torch.device("cuda")) == ("ieee" if on_rocm else "tf32x3")
+        assert precision(torch.device("cuda")) == ("ieee" if on_rocm else "tf32x3")
+    finally:
+        torch.set_float32_matmul_precision(previous)
 
 
 @pytest.mark.kernels_ci
@@ -427,7 +429,9 @@ def test_compiled_layer_attention_follows_precision_changes():
     def eager(precision):
         return banded_attention(query, key, value, prepared, 32**-0.5, precision=precision)
 
+    previous = torch.get_float32_matmul_precision()
     try:
+        torch.set_float32_matmul_precision("highest")
         with torch.inference_mode():
             assert torch.equal(compiled(query, key, value, prepared, 32**-0.5), eager("tf32x3"))
             torch.set_float32_matmul_precision("high")
@@ -435,5 +439,5 @@ def test_compiled_layer_attention_follows_precision_changes():
             torch.set_float32_matmul_precision("highest")
             assert torch.equal(compiled(query, key, value, prepared, 32**-0.5), eager("tf32x3"))
     finally:
-        torch.set_float32_matmul_precision("highest")
+        torch.set_float32_matmul_precision(previous)
         torch._dynamo.reset()
