@@ -91,11 +91,41 @@ def _reference_attention(query, key, value, attention_mask, scaling):
     return out.reshape(batch, blocks, heads, block_size, head_dim)
 
 
+@torch.compiler.assume_constant_result
+def _tf32_allowed() -> bool:
+    """Does PyTorch allow TF32 for float32 matmuls?
+
+    Dynamo cannot trace the read, so it is taken as a constant at trace time; Dynamo's global-state
+    guard on `allow_tf32` retraces when the setting changes.
+    """
+    matmul = torch.backends.cuda.matmul
+    # `fp32_precision` reflects both the legacy and the fine-grained precision APIs, whereas
+    # `allow_tf32` raises once the two have been mixed.
+    if hasattr(matmul, "fp32_precision"):
+        return matmul.fp32_precision == "tf32"
+    return matmul.allow_tf32
+
+
+def _float32_precision(device: torch.device) -> str:
+    """The `tl.dot` precision that matches PyTorch's float32 matmul setting.
+
+    By default PyTorch keeps float32 matmuls at full precision. On NVIDIA, Triton's IEEE dot does
+    that without tensor cores, which makes the kernel slower than the sdpa path it replaces, so CUDA
+    uses TF32x3 there: float32-level accuracy on tensor cores. When TF32 is allowed (e.g.
+    `torch.set_float32_matmul_precision("high")`), CUDA uses Triton's default, TF32. Other
+    backends keep IEEE.
+    """
+    if device.type != "cuda" or torch.version.hip is not None:
+        return "ieee"
+    return "default" if _tf32_allowed() else "tf32x3"
+
+
 def _blockwise_attention(query, key, value, mask, scaling):
     """Run sparse Triton attention without gathering neighbouring key/value blocks."""
     batch, blocks = query.shape[:2]
+    precision = _float32_precision(query.device)
     if isinstance(mask, PreparedMask) or mask.shape[0] == blocks:
-        return banded_attention(query, key, value, mask, scaling, precision="ieee")
+        return banded_attention(query, key, value, mask, scaling, precision=precision)
     # Expanded masks can differ between ensemble members; never reuse the first member's mask.
     masks = mask.reshape(batch, blocks, *mask.shape[1:])
     return torch.cat(
@@ -106,7 +136,7 @@ def _blockwise_attention(query, key, value, mask, scaling):
                 value[i : i + 1],
                 masks[i],
                 scaling,
-                precision="ieee",
+                precision=precision,
             )
             for i in range(batch)
         ]

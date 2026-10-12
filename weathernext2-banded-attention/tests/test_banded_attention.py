@@ -1,5 +1,7 @@
 """The kernel has to agree with the PyTorch path it replaces, on the mask shape the model uses."""
 
+from types import SimpleNamespace
+
 import kernels
 import pytest
 import torch
@@ -38,6 +40,9 @@ def banded_mask(blocks, block_size, density, device, generator):
 
 DEVICE = weathernext2_banded_attention.infer_device()
 requires_accelerator = pytest.mark.skipif(DEVICE == "cpu", reason="the kernel needs an accelerator")
+requires_nvidia = pytest.mark.skipif(
+    DEVICE != "cuda" or torch.version.hip is not None, reason="TF32x3 is an NVIDIA tensor-core mode"
+)
 
 
 @requires_accelerator
@@ -336,4 +341,103 @@ def test_attention_compile(prepared):
                 expected = reference(query, key, value, mask, 32**-0.5)
                 torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
     finally:
+        torch._dynamo.reset()
+
+
+@requires_nvidia
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("prepared", [False, True])
+def test_tf32x3_matches_ieee(prepared):
+    generator = torch.Generator(device=DEVICE).manual_seed(7)
+    shape = (2, 3, 2, 129, 128)
+    query, key, value = (torch.randn(shape, device=DEVICE, generator=generator) for _ in range(3))
+    mask = banded_mask(3, 129, 0.05, DEVICE, generator)
+    banded = weathernext2_banded_attention.layers._prepare_mask(mask) if prepared else mask
+    expected = banded_attention(query, key, value, banded, 128**-0.5, precision="ieee")
+    actual = banded_attention(query, key, value, banded, 128**-0.5, precision="tf32x3")
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize(
+    ("matmul", "expected"),
+    [
+        (SimpleNamespace(fp32_precision="none"), "tf32x3"),
+        (SimpleNamespace(fp32_precision="ieee"), "tf32x3"),
+        (SimpleNamespace(fp32_precision="tf32"), "default"),
+        # torch before the fine-grained precision API
+        (SimpleNamespace(allow_tf32=False), "tf32x3"),
+        (SimpleNamespace(allow_tf32=True), "default"),
+    ],
+)
+def test_layer_precision_follows_torch(monkeypatch, matmul, expected):
+    monkeypatch.setattr(torch.backends.cuda, "matmul", matmul)
+    precision = weathernext2_banded_attention.layers._float32_precision
+    assert precision(torch.device("cuda")) == ("ieee" if torch.version.hip is not None else expected)
+    assert precision(torch.device("xpu")) == "ieee"
+
+
+@pytest.mark.kernels_ci
+def test_layer_precision_follows_set_float32_matmul_precision():
+    precision = weathernext2_banded_attention.layers._float32_precision
+    on_rocm = torch.version.hip is not None
+    previous = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("high")
+        assert precision(torch.device("cuda")) == ("ieee" if on_rocm else "default")
+        torch.set_float32_matmul_precision("highest")
+        assert precision(torch.device("cuda")) == ("ieee" if on_rocm else "tf32x3")
+    finally:
+        torch.set_float32_matmul_precision(previous)
+
+
+@pytest.mark.kernels_ci
+def test_tf32x3_needs_nvidia():
+    query = key = value = torch.zeros(1, 3, 1, 16, 16)
+    mask = torch.ones(3, 16, 48, dtype=torch.bool)
+    with pytest.raises(ValueError, match="tf32x3"):
+        banded_attention(query, key, value, mask, 0.25, precision="tf32x3")
+
+
+@requires_accelerator
+@pytest.mark.kernels_ci
+def test_layer_attention_compile():
+    generator = torch.Generator(device=DEVICE).manual_seed(7)
+    shape = (2, 3, 2, 65, 32)
+    query, key, value = (torch.randn(shape, device=DEVICE, generator=generator) for _ in range(3))
+    mask = banded_mask(3, 65, 0.05, DEVICE, generator)
+    prepared = weathernext2_banded_attention.layers._prepare_mask(mask)
+    compiled = torch.compile(weathernext2_banded_attention.layers._blockwise_attention, fullgraph=True)
+    try:
+        with torch.inference_mode():
+            actual = compiled(query, key, value, prepared, 32**-0.5)
+        torch.testing.assert_close(actual, reference(query, key, value, mask, 32**-0.5), atol=2e-5, rtol=2e-5)
+    finally:
+        torch._dynamo.reset()
+
+
+@requires_nvidia
+@pytest.mark.kernels_ci
+def test_compiled_layer_attention_follows_precision_changes():
+    generator = torch.Generator(device=DEVICE).manual_seed(7)
+    shape = (2, 3, 2, 65, 32)
+    query, key, value = (torch.randn(shape, device=DEVICE, generator=generator) for _ in range(3))
+    mask = banded_mask(3, 65, 0.05, DEVICE, generator)
+    prepared = weathernext2_banded_attention.layers._prepare_mask(mask)
+    compiled = torch.compile(weathernext2_banded_attention.layers._blockwise_attention, fullgraph=True)
+
+    def eager(precision):
+        return banded_attention(query, key, value, prepared, 32**-0.5, precision=precision)
+
+    previous = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("highest")
+        with torch.inference_mode():
+            assert torch.equal(compiled(query, key, value, prepared, 32**-0.5), eager("tf32x3"))
+            torch.set_float32_matmul_precision("high")
+            assert torch.equal(compiled(query, key, value, prepared, 32**-0.5), eager("default"))
+            torch.set_float32_matmul_precision("highest")
+            assert torch.equal(compiled(query, key, value, prepared, 32**-0.5), eager("tf32x3"))
+    finally:
+        torch.set_float32_matmul_precision(previous)
         torch._dynamo.reset()
