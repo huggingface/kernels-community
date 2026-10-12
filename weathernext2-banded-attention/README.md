@@ -42,6 +42,17 @@ when the attention replacement is used without its mask layer.
 The fused Triton API is forward only. The model-facing layer uses the differentiable
 fallback when gradients are required.
 
+## Tiled grid inference
+
+The conditioned MLP, grid-to-mesh, mesh-to-grid and forecasting-head replacements process
+grid points and edges in bounded tiles, following
+[Faster-WeatherNext](https://github.com/Raymondlol/Faster-WeatherNext/blob/main/docs/how-it-works.md).
+They reuse the original matrix multiplies and LayerNorm, fuse float32 conditioning and forecast
+output epilogues in Triton, and preserve PyTorch rounding for lower-precision tensors.
+Outputs are preallocated, and the graph replacements update grid latents in place during inference.
+The mesh-to-grid replacement expects receiver-sorted edges, three per grid point.
+Training, gradient-enabled execution and autocast use the reference forward instead.
+
 ## Precision
 
 The reference implementation runs this attention in float32. `precision` controls how
