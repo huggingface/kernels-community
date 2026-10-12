@@ -51,9 +51,12 @@ The reference implementation runs this attention in float32. `precision` control
 |---|---|
 | `"default"` (default) | Triton's backend default |
 | `"ieee"` | full float32 multiplication |
+| `"tf32x3"` | three TF32 passes: float32-level accuracy on tensor cores (NVIDIA only) |
 
-The direct `banded_attention` API accepts either mode. Model-facing attention uses IEEE
-float32 multiplication. CPU execution and execution requiring gradients use the reference
+The direct `banded_attention` API accepts any of these. Model-facing attention follows PyTorch's
+float32 matmul setting: at full precision (PyTorch's default) it uses TF32x3 on NVIDIA and IEEE
+elsewhere; when TF32 is allowed, e.g. with `torch.set_float32_matmul_precision("high")`, it uses
+Triton's default. CPU execution and execution requiring gradients use the reference
 implementation instead.
 
 IEEE dot products can be substantially slower than accelerated reduced-precision dots,
@@ -86,8 +89,10 @@ quietly dropping the mask.
 densities, checks that a node reaching only itself returns its own value vector rather
 than NaN, checks that unsupported head dimensions raise, and checks that a backward
 reaches all four projections. Model-facing tests cover
-batch-specific masks, shared packed geometry and CPU execution. Tests use the implementation's
-fixed launch defaults, without overriding tuning configurations.
+batch-specific masks, shared packed geometry and CPU execution. Precision tests check `"tf32x3"`
+against `"ieee"`, the layer's choice under each PyTorch float32 setting, and that a compiled
+layer follows a later change of that setting. Tests use the implementation's fixed launch
+defaults, without overriding tuning configurations.
 
 Tests pick the device with `infer_device()`, so they run on whichever accelerator is present
 rather than assuming CUDA.
