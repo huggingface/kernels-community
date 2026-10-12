@@ -2,7 +2,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import esmfold2_trimul
+import kernels
+
+esmfold2_trimul = kernels.get_kernel("biohub/esmfold2-trimul", version=1)
 
 
 # Channel counts the fused GEMMs support: powers of two >= 64. ESMFold2 uses 128.
