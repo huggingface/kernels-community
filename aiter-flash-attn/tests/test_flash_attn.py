@@ -130,6 +130,53 @@ def test_flash_attn_sliding_window_matches_sdpa(causal, window_size):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm device")
+@pytest.mark.parametrize("impl", ["default", "dao_ai"])
+def test_flash_attn_varlen_backward_very_negative_logits(impl):
+    # Rows whose logits are all very negative (logsumexp < -88) once overflowed exp(0 - lse) to inf on
+    # the zero-loaded keys of the last partial key block, and inf * 0 put NaN in dq. Seen on real
+    # Qwen2.5-1.5B activations. Sequence lengths are not block multiples so that partial block exists.
+    from aiter_flash_attn import flash_attn_varlen_func
+    from aiter_flash_attn import mha_set_impl
+
+    torch.manual_seed(0)
+    H, D = 4, 128
+    seqlens = [300, 250]
+    total = sum(seqlens)
+    u = torch.nn.functional.normalize(torch.randn(D, device="cuda"), dim=0)
+    a = 34.0  # q . k ~ -a^2, so logits ~ -a^2 / sqrt(D) ~ -102
+    q = (-a * u + 0.5 * torch.randn(total, H, D, device="cuda")).to(torch.bfloat16).requires_grad_(True)
+    k = (a * u + 0.5 * torch.randn(total, H, D, device="cuda")).to(torch.bfloat16).requires_grad_(True)
+    v = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
+    cu = torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
+    max_s = max(seqlens)
+
+    mha_set_impl(impl)
+    try:
+        out = flash_attn_varlen_func(q, k, v, cu, cu, max_s, max_s, causal=True)
+        out.backward(g)
+    finally:
+        mha_set_impl("default")
+
+    qr = q.detach().clone().requires_grad_(True)
+    kr = k.detach().clone().requires_grad_(True)
+    vr = v.detach().clone().requires_grad_(True)
+    parts = []
+    offset = 0
+    for s in seqlens:
+        sl = slice(offset, offset + s)
+        parts.append(_sdpa_reference(qr[sl][None], kr[sl][None], vr[sl][None], causal=True)[0])
+        offset += s
+    torch.cat(parts).backward(g)
+
+    assert torch.isfinite(q.grad).all() and torch.isfinite(k.grad).all() and torch.isfinite(v.grad).all()
+    # |q| and |k| are ~34 here, so bf16 rounding alone gives ~2% error (the fused backward matches it).
+    torch.testing.assert_close(q.grad, qr.grad, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(k.grad, kr.grad, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(v.grad, vr.grad, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm device")
 @pytest.mark.parametrize("causal,window_size", [(False, (16, 16)), (True, (16, 0))])
 def test_flash_attn_sliding_window_backward_matches_sdpa(causal, window_size):
     # Exercises the re-vendored dao_ai sliding-window backward (ROCm/aiter #3742).
