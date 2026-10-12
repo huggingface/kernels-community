@@ -1,6 +1,6 @@
 [general]
 name = "rotary"
-version = 2
+version = 3
 edition = 5
 license = "BSD-3-Clause"
 backends = [
