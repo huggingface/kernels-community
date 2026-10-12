@@ -279,9 +279,11 @@ jobs:
           KERNEL: ${{ needs.setup.outputs.kernel }}
         run: |
           # requireFile names include the versions and ABI expected by this lockfile.
+          # Newer Nix wraps the output as {"derivations": {...}, "version": N};
+          # older versions emit the derivations as the top-level object.
           cd "$KERNEL"
           nix derivation show --recursive .#redistributable.torch-tpu | jq -er '
-            [.[] | .env.name // "" |
+            [(.derivations // .)[] | .env.name // "" |
               capture("^(?<package>torch_tpu|libtpu)-(?<version>[A-Za-z0-9.]+)-(?<abi>cp[0-9]+)-\\k<abi>-manylinux_2_31_x86_64[.]whl$")]
             | unique
             | .[] | [.package, .version, .abi] | @tsv
