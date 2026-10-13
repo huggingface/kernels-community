@@ -36,15 +36,17 @@ bool supports_gated_delta_net(int64_t head_dim) {
 std::vector<at::Tensor> delta_gates(const at::Tensor &b, const at::Tensor &a, const at::Tensor &a_log,
                                    const at::Tensor &dt_bias) {
   at::Tensor bc = as_f32(b), ac = as_f32(a), lc = as_f32(a_log), dc = as_f32(dt_bias);
-  const int64_t n_heads = lc.numel();
-  TORCH_CHECK(bc.numel() == n_heads && ac.numel() == n_heads && dc.numel() == n_heads,
-              "delta_gates: every input must have one value per head");
-  at::Tensor beta = at::empty_like(lc);
-  at::Tensor g = at::empty_like(lc);
+  // `b`/`a` carry one value per head for each sequence of a batch; `a_log`/`dt_bias` one per head.
+  const int64_t n_heads = lc.numel(), n_values = bc.numel();
+  TORCH_CHECK(dc.numel() == n_heads, "delta_gates: a_log and dt_bias must have one value per head");
+  TORCH_CHECK(ac.numel() == n_values && n_heads > 0 && n_values % n_heads == 0,
+              "delta_gates: b and a must have one value per head for each sequence");
+  at::Tensor beta = at::empty_like(bc);
+  at::Tensor g = at::empty_like(bc);
   const int status = ggml_gdn_metal_delta_gates(
       mtl_buffer(bc), byte_offset(bc), mtl_buffer(ac), byte_offset(ac), mtl_buffer(lc), byte_offset(lc),
       mtl_buffer(dc), byte_offset(dc), mtl_buffer(beta), byte_offset(beta), mtl_buffer(g), byte_offset(g),
-      n_heads);
+      n_heads, n_values);
   TORCH_CHECK(status == 0, "delta_gates: no kernel for this build (", status, ")");
   return {beta, g};
 }
