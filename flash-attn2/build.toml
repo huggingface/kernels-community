@@ -1,6 +1,6 @@
 [general]
 name = "flash-attn2"
-version = 3
+version = 4
 edition = 6
 license = "BSD-3-Clause"
 backends = [
