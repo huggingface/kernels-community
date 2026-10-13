@@ -348,7 +348,8 @@ def chunk_kda_bwd_dAv(
     return dA, dv
 
 
-@dispatch('kda')
+# Use triton only, other backends (cutlass, cute, etc.) need additional torch.compile support
+# @dispatch('kda')
 def chunk_kda_bwd_wy_dqkg_fused(
     q: torch.Tensor,
     k: torch.Tensor,

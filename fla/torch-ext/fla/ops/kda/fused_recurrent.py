@@ -230,7 +230,6 @@ def fused_recurrent_kda_fwd_kernel(
             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
-@torch.compiler.disable
 def fused_recurrent_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
