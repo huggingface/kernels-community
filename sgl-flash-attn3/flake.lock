@@ -41,16 +41,16 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1791882856,
-        "narHash": "sha256-WCRJHK+nKKv5nL8ujhRhL5YYsUnS/vFL0zFTyxG19Hw=",
+        "lastModified": 1791895853,
+        "narHash": "sha256-tePTPAStEiMNQbm05v7bMJRMwhIg/8Mwc0kGhYBLKVU=",
         "owner": "huggingface",
         "repo": "kernels",
-        "rev": "c3365965af50d5572864499dffe8b781f17366c1",
+        "rev": "6dfbaa2df9900e38747aef9c9aea82ee67329721",
         "type": "github"
       },
       "original": {
         "owner": "huggingface",
-        "ref": "nix-pass-gpu-lang",
+        "ref": "torch-2.15.0-rc3-fixes",
         "repo": "kernels",
         "type": "github"
       }

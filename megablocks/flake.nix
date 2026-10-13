@@ -2,7 +2,7 @@
   description = "Flake for megablocks_moe kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/nix-pass-gpu-lang";
+    kernel-builder.url = "github:huggingface/kernels/torch-2.15.0-rc3-fixes";
   };
 
   outputs =

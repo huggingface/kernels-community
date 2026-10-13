@@ -2,7 +2,7 @@
   description = "SGLang Flash Attention 3 kernel (forward-only, with sinks)";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels/nix-pass-gpu-lang";
+    kernel-builder.url = "github:huggingface/kernels/torch-2.15.0-rc3-fixes";
   };
 
   outputs =
