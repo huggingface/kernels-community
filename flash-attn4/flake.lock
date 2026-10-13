@@ -41,15 +41,16 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1791873650,
-        "narHash": "sha256-wz89HzyXITYNRnHr2jaiVlgXX5RogeLsbETmITulUm0=",
+        "lastModified": 1791882856,
+        "narHash": "sha256-WCRJHK+nKKv5nL8ujhRhL5YYsUnS/vFL0zFTyxG19Hw=",
         "owner": "huggingface",
         "repo": "kernels",
-        "rev": "27f45cd8df44137e9323037bd644d0a14401c4f2",
+        "rev": "c3365965af50d5572864499dffe8b781f17366c1",
         "type": "github"
       },
       "original": {
         "owner": "huggingface",
+        "ref": "nix-pass-gpu-lang",
         "repo": "kernels",
         "type": "github"
       }

@@ -2,7 +2,7 @@
   description = "Flake for vLLM-MoE kernel";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels";
+    kernel-builder.url = "github:huggingface/kernels/nix-pass-gpu-lang";
   };
 
   outputs =

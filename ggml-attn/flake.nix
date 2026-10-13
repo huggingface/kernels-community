@@ -1,7 +1,7 @@
 {
   description = "ggml's flash attention as a torch op and a transformers attention implementation";
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels";
+    kernel-builder.url = "github:huggingface/kernels/nix-pass-gpu-lang";
   };
   outputs =
     { self, kernel-builder }:

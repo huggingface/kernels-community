@@ -2,7 +2,7 @@
   description = "Flake for AITER RoPE (AMD ROCm Triton) kernels";
 
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels";
+    kernel-builder.url = "github:huggingface/kernels/nix-pass-gpu-lang";
   };
 
   outputs =
