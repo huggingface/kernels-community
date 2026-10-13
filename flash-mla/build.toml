@@ -1,7 +1,7 @@
 [general]
 name = "flash-mla"
 version = 1
-edition = 5
+edition = 6
 license = "MIT"
 backends = ["cuda"]
 
@@ -17,8 +17,105 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
+[kernel.flash_mla_sm90]
+language = "cpp-cuda"
+cuda-capabilities = ["9.0a"]
+cuda-flags = [
+    "-O3",
+    "-std=c++20",
+    "-DNDEBUG",
+    "-DFLASH_MLA_SM90_ONLY",
+    "-D_USE_MATH_DEFINES",
+    "-Wno-deprecated-declarations",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--use_fast_math",
+]
+cuda-minver = "12.8"
+depends = [
+    "torch",
+    "cutlass_4_0",
+]
+include = [
+    "csrc",
+    "csrc/api",
+    "csrc/kerutils/include",
+    "csrc/sm90",
+    "csrc/sm100",
+]
+src = [
+    "csrc/api/api_impl.cu",
+    "csrc/api/common.h",
+    "csrc/api/dense_decode.h",
+    "csrc/api/dense_fwd.h",
+    "csrc/api/sparse_decode.h",
+    "csrc/api/sparse_fwd.h",
+    "csrc/defines.h",
+    "csrc/params.h",
+    "csrc/utils.h",
+    "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
+    "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h",
+    "csrc/smxx/decode/combine/combine.cu",
+    "csrc/smxx/decode/combine/combine.h",
+    "csrc/kerutils/include/kerutils/kerutils.cuh",
+    "csrc/kerutils/include/kerutils/common/common.h",
+    "csrc/kerutils/include/kerutils/host/host.h",
+    "csrc/kerutils/include/kerutils/device/common.h",
+    "csrc/kerutils/include/kerutils/device/device.cuh",
+    "csrc/kerutils/include/kerutils/device/sm80/intrinsics.cuh",
+    "csrc/kerutils/include/kerutils/device/sm80/helpers.cuh",
+    "csrc/kerutils/include/kerutils/device/sm90/intrinsics.cuh",
+    "csrc/kerutils/include/kerutils/device/sm90/helpers.cuh",
+    "csrc/kerutils/include/kerutils/device/sm100/intrinsics.cuh",
+    "csrc/kerutils/include/kerutils/device/sm100/helpers.cuh",
+    "csrc/kerutils/include/kerutils/device/sm100/gemm.cuh",
+    "csrc/kerutils/include/kerutils/device/sm100/tma_cta_group2_nosplit.cuh",
+    "csrc/kerutils/include/kerutils/supplemental/torch_tensors.h",
+    "csrc/sm100/helpers.h",
+    "csrc/sm100/prefill/dense/interface.h",
+    "csrc/sm100/prefill/sparse/common_subroutine.h",
+    "csrc/sm100/prefill/sparse/fwd/head64/config.h",
+    "csrc/sm100/prefill/sparse/fwd/head64/phase1.h",
+    "csrc/sm100/prefill/sparse/fwd/head128/config.h",
+    "csrc/sm100/prefill/sparse/fwd/head128/phase1.h",
+    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/config.h",
+    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h",
+    "csrc/sm100/decode/head64/config.h",
+    "csrc/sm100/decode/head64/kernel.h",
+    "csrc/sm90/helpers.h",
+    "csrc/sm90/decode/dense/config.h",
+    "csrc/sm90/decode/dense/traits.h",
+    "csrc/sm90/decode/dense/splitkv_mla.h",
+    "csrc/sm90/decode/dense/splitkv_mla.cuh",
+    "csrc/sm90/decode/dense/instantiations/fp16.cu",
+    "csrc/sm90/decode/dense/instantiations/bf16.cu",
+    "csrc/sm90/decode/sparse_fp8/config.h",
+    "csrc/sm90/decode/sparse_fp8/splitkv_mla.h",
+    "csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh",
+    "csrc/sm90/decode/sparse_fp8/components/config.h",
+    "csrc/sm90/decode/sparse_fp8/components/dequant.h",
+    "csrc/sm90/decode/sparse_fp8/components/helpers.h",
+    "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu",
+    "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
+    "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
+    "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
+    "csrc/sm90/prefill/sparse/config.h",
+    "csrc/sm90/prefill/sparse/fwd.h",
+    "csrc/sm90/prefill/sparse/phase1.h",
+    "csrc/sm90/prefill/sparse/phase1.cuh",
+    "csrc/sm90/prefill/sparse/fwd.cu",
+    "csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu",
+    "csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
+    "csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu",
+    "csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
+]
+
 [kernel.flash_mla_sm100]
-backend = "cuda"
+language = "cpp-cuda"
 cuda-capabilities = ["10.0f"]
 cuda-flags = [
     "-O3",
@@ -133,101 +230,4 @@ src = [
     "csrc/sm100/decode/head64/kernel.cuh",
     "csrc/sm100/decode/head64/instantiations/v32.cu",
     "csrc/sm100/decode/head64/instantiations/model1.cu",
-]
-
-[kernel.flash_mla_sm90]
-backend = "cuda"
-cuda-capabilities = ["9.0a"]
-cuda-flags = [
-    "-O3",
-    "-std=c++20",
-    "-DNDEBUG",
-    "-DFLASH_MLA_SM90_ONLY",
-    "-D_USE_MATH_DEFINES",
-    "-Wno-deprecated-declarations",
-    "-U__CUDA_NO_HALF_OPERATORS__",
-    "-U__CUDA_NO_HALF_CONVERSIONS__",
-    "-U__CUDA_NO_HALF2_OPERATORS__",
-    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-    "--expt-relaxed-constexpr",
-    "--expt-extended-lambda",
-    "--use_fast_math",
-]
-cuda-minver = "12.8"
-depends = [
-    "torch",
-    "cutlass_4_0",
-]
-include = [
-    "csrc",
-    "csrc/api",
-    "csrc/kerutils/include",
-    "csrc/sm90",
-    "csrc/sm100",
-]
-src = [
-    "csrc/api/api_impl.cu",
-    "csrc/api/common.h",
-    "csrc/api/dense_decode.h",
-    "csrc/api/dense_fwd.h",
-    "csrc/api/sparse_decode.h",
-    "csrc/api/sparse_fwd.h",
-    "csrc/defines.h",
-    "csrc/params.h",
-    "csrc/utils.h",
-    "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
-    "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h",
-    "csrc/smxx/decode/combine/combine.cu",
-    "csrc/smxx/decode/combine/combine.h",
-    "csrc/kerutils/include/kerutils/kerutils.cuh",
-    "csrc/kerutils/include/kerutils/common/common.h",
-    "csrc/kerutils/include/kerutils/host/host.h",
-    "csrc/kerutils/include/kerutils/device/common.h",
-    "csrc/kerutils/include/kerutils/device/device.cuh",
-    "csrc/kerutils/include/kerutils/device/sm80/intrinsics.cuh",
-    "csrc/kerutils/include/kerutils/device/sm80/helpers.cuh",
-    "csrc/kerutils/include/kerutils/device/sm90/intrinsics.cuh",
-    "csrc/kerutils/include/kerutils/device/sm90/helpers.cuh",
-    "csrc/kerutils/include/kerutils/device/sm100/intrinsics.cuh",
-    "csrc/kerutils/include/kerutils/device/sm100/helpers.cuh",
-    "csrc/kerutils/include/kerutils/device/sm100/gemm.cuh",
-    "csrc/kerutils/include/kerutils/device/sm100/tma_cta_group2_nosplit.cuh",
-    "csrc/kerutils/include/kerutils/supplemental/torch_tensors.h",
-    "csrc/sm100/helpers.h",
-    "csrc/sm100/prefill/dense/interface.h",
-    "csrc/sm100/prefill/sparse/common_subroutine.h",
-    "csrc/sm100/prefill/sparse/fwd/head64/config.h",
-    "csrc/sm100/prefill/sparse/fwd/head64/phase1.h",
-    "csrc/sm100/prefill/sparse/fwd/head128/config.h",
-    "csrc/sm100/prefill/sparse/fwd/head128/phase1.h",
-    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/config.h",
-    "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h",
-    "csrc/sm100/decode/head64/config.h",
-    "csrc/sm100/decode/head64/kernel.h",
-    "csrc/sm90/helpers.h",
-    "csrc/sm90/decode/dense/config.h",
-    "csrc/sm90/decode/dense/traits.h",
-    "csrc/sm90/decode/dense/splitkv_mla.h",
-    "csrc/sm90/decode/dense/splitkv_mla.cuh",
-    "csrc/sm90/decode/dense/instantiations/fp16.cu",
-    "csrc/sm90/decode/dense/instantiations/bf16.cu",
-    "csrc/sm90/decode/sparse_fp8/config.h",
-    "csrc/sm90/decode/sparse_fp8/splitkv_mla.h",
-    "csrc/sm90/decode/sparse_fp8/splitkv_mla.cuh",
-    "csrc/sm90/decode/sparse_fp8/components/config.h",
-    "csrc/sm90/decode/sparse_fp8/components/dequant.h",
-    "csrc/sm90/decode/sparse_fp8/components/helpers.h",
-    "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu",
-    "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
-    "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
-    "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
-    "csrc/sm90/prefill/sparse/config.h",
-    "csrc/sm90/prefill/sparse/fwd.h",
-    "csrc/sm90/prefill/sparse/phase1.h",
-    "csrc/sm90/prefill/sparse/phase1.cuh",
-    "csrc/sm90/prefill/sparse/fwd.cu",
-    "csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu",
-    "csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
-    "csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu",
-    "csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
 ]

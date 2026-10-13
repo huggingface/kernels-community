@@ -1,7 +1,7 @@
 [general]
 name = "tinygrad-rms"
 version = 1
-edition = 5
+edition = 6
 license = "MIT"
 backends = ["cuda"]
 
@@ -15,6 +15,6 @@ src = [
 ]
 
 [kernel.tinygrad_rms]
-backend = "cuda"
+language = "cpp-cuda"
 depends = ["torch"]
 src = ["tinygrad_rms_cuda/tinygrad_rms.cu"]

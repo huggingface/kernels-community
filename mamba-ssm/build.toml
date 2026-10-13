@@ -1,7 +1,7 @@
 [general]
 name = "mamba-ssm"
 version = 3
-edition = 5
+edition = 6
 license = "Apache-2.0"
 backends = [
     "cuda",
@@ -19,8 +19,33 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
+[kernel.causal_conv1d]
+language = "cpp-cuda"
+depends = ["torch"]
+src = [
+    "causal-conv1d/causal_conv1d_bwd.cu",
+    "causal-conv1d/causal_conv1d_common.h",
+    "causal-conv1d/causal_conv1d.cpp",
+    "causal-conv1d/causal_conv1d_fwd.cu",
+    "causal-conv1d/causal_conv1d.h",
+    "causal-conv1d/causal_conv1d_update.cu",
+    "causal-conv1d/static_switch.h",
+]
+
+[kernel.causal_conv1d_xpu]
+language = "cpp-xpu"
+depends = ["torch"]
+include = ["causal-conv1d-xpu"]
+src = [
+    "causal-conv1d-xpu/causal_conv1d_xpu_bwd.cpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_common.hpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_fwd.cpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu.hpp",
+    "causal-conv1d-xpu/causal_conv1d_xpu_update.cpp",
+]
+
 [kernel.selective_scan]
-backend = "cuda"
+language = "cpp-cuda"
 depends = ["torch"]
 src = [
     "selective-scan/reverse_scan.cuh",
@@ -40,29 +65,4 @@ src = [
     "selective-scan/selective_scan_fwd_kernel.cuh",
     "selective-scan/static_switch.h",
     "selective-scan/uninitialized_copy.cuh",
-]
-
-[kernel.causal_conv1d]
-backend = "cuda"
-depends = ["torch"]
-src = [
-    "causal-conv1d/causal_conv1d_bwd.cu",
-    "causal-conv1d/causal_conv1d_common.h",
-    "causal-conv1d/causal_conv1d.cpp",
-    "causal-conv1d/causal_conv1d_fwd.cu",
-    "causal-conv1d/causal_conv1d.h",
-    "causal-conv1d/causal_conv1d_update.cu",
-    "causal-conv1d/static_switch.h",
-]
-
-[kernel.causal_conv1d_xpu]
-backend = "xpu"
-depends = ["torch"]
-include = ["causal-conv1d-xpu"]
-src = [
-    "causal-conv1d-xpu/causal_conv1d_xpu_bwd.cpp",
-    "causal-conv1d-xpu/causal_conv1d_xpu_common.hpp",
-    "causal-conv1d-xpu/causal_conv1d_xpu_fwd.cpp",
-    "causal-conv1d-xpu/causal_conv1d_xpu.hpp",
-    "causal-conv1d-xpu/causal_conv1d_xpu_update.cpp",
 ]

@@ -1,7 +1,7 @@
 [general]
 name = "megablocks"
 version = 1
-edition = 5
+edition = 6
 license = "Apache-2.0"
 backends = [
     "cuda",
@@ -20,7 +20,7 @@ src = [
 ]
 
 [kernel.megablocks_xpu]
-backend = "xpu"
+language = "cpp-xpu"
 depends = [
     "torch",
     "sycl_tla",
@@ -53,7 +53,7 @@ src = [
 ]
 
 [kernel.megablocks_rocm]
-backend = "rocm"
+language = "cpp-rocm"
 depends = ["torch"]
 rocm-archs = [
     "gfx942",
@@ -72,40 +72,8 @@ src = [
     "csrc/sort.cu",
 ]
 
-[kernel.megablocks_cpu]
-backend = "cpu"
-depends = ["torch"]
-include = ["csrc_cpu"]
-src = [
-    "csrc_cpu/cpu_features.hpp",
-    "csrc_cpu/moe_dispatcher.h",
-    "csrc_cpu/moe_dispatcher.cpp",
-    "csrc_cpu/moe_fallback.h",
-    "csrc_cpu/moe_fallback.cpp",
-]
-
-[kernel.megablocks_xpu_cri]
-backend = "xpu"
-depends = [
-    "torch",
-    "sycl_tla",
-]
-sycl-flags = [
-    "-fsycl-targets=spir64_gen",
-    "-D__SYCL_TARGET_INTEL_GPU_CRI__=1",
-]
-src = [
-    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2_cri.cpp",
-    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.h",
-    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp",
-    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp",
-    "csrc_xpu/grouped_gemm/xe_2/gemm_xe2.hpp",
-    "csrc_xpu/grouped_gemm/xe_2/gemm_xe2_policy.hpp",
-    "csrc_xpu/grouped_gemm/xe_2/xe2_target_ns.hpp",
-]
-
 [kernel.megablocks]
-backend = "cuda"
+language = "cpp-cuda"
 depends = [
     "torch",
     "cutlass_3_8",
@@ -126,8 +94,40 @@ src = [
     "csrc/grouped_gemm/grouped_gemm.h",
 ]
 
+[kernel.megablocks_xpu_cri]
+language = "cpp-xpu"
+depends = [
+    "torch",
+    "sycl_tla",
+]
+sycl-flags = [
+    "-fsycl-targets=spir64_gen",
+    "-D__SYCL_TARGET_INTEL_GPU_CRI__=1",
+]
+src = [
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2_cri.cpp",
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.h",
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/gemm_xe2.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/gemm_xe2_policy.hpp",
+    "csrc_xpu/grouped_gemm/xe_2/xe2_target_ns.hpp",
+]
+
+[kernel.megablocks_cpu]
+language = "cpp-cpu"
+depends = ["torch"]
+include = ["csrc_cpu"]
+src = [
+    "csrc_cpu/cpu_features.hpp",
+    "csrc_cpu/moe_dispatcher.h",
+    "csrc_cpu/moe_dispatcher.cpp",
+    "csrc_cpu/moe_fallback.h",
+    "csrc_cpu/moe_fallback.cpp",
+]
+
 [kernel.megablocks_cpu_avx512]
-backend = "cpu"
+language = "cpp-cpu"
 cxx-flags = [
     "-O3",
     "-mfma",
