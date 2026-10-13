@@ -4,8 +4,16 @@ Run with `pytest tests/test_flash_attn.py` on a ROCm host.
 """
 
 import math
+
+import kernels
 import pytest
 import torch
+
+
+if torch.version.hip is None or not torch.cuda.is_available():
+    pytest.skip("AITER kernels need a ROCm GPU", allow_module_level=True)
+
+aiter_flash_attn = kernels.get_kernel("kernels-community/aiter-flash-attn", version=2)
 
 
 def _sdpa_reference(q, k, v, causal=False, scale=None, window_size=(-1, -1), sink=None):
@@ -50,27 +58,21 @@ def _sdpa_reference(q, k, v, causal=False, scale=None, window_size=(-1, -1), sin
     return out.transpose(1, 2).to(q.dtype)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm device")
 @pytest.mark.parametrize("causal", [False, True])
 def test_flash_attn_func_matches_sdpa(causal):
-    from aiter_flash_attn import flash_attn_func
-
     torch.manual_seed(0)
     B, S, H, D = 2, 64, 4, 64
     q = torch.randn(B, S, H, D, device="cuda", dtype=torch.float16)
     k = torch.randn(B, S, H, D, device="cuda", dtype=torch.float16)
     v = torch.randn(B, S, H, D, device="cuda", dtype=torch.float16)
 
-    out = flash_attn_func(q, k, v, causal=causal)
+    out = aiter_flash_attn.flash_attn_func(q, k, v, causal=causal)
     ref = _sdpa_reference(q, k, v, causal=causal)
 
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm device")
 def test_flash_attn_varlen_matches_sdpa():
-    from aiter_flash_attn import flash_attn_varlen_func
-
     torch.manual_seed(0)
     H, D = 4, 64
     seqlens = [32, 48, 24]
@@ -81,7 +83,7 @@ def test_flash_attn_varlen_matches_sdpa():
     cu = torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
     max_s = max(seqlens)
 
-    out = flash_attn_varlen_func(q, k, v, cu, cu, max_s, max_s, causal=True)
+    out = aiter_flash_attn.flash_attn_varlen_func(q, k, v, cu, cu, max_s, max_s, causal=True)
 
     # Reference: run dense attention per sequence and stitch.
     parts = []
@@ -97,7 +99,6 @@ def test_flash_attn_varlen_matches_sdpa():
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm device")
 @pytest.mark.parametrize(
     "causal,window_size",
     [
@@ -112,10 +113,8 @@ def test_flash_attn_sliding_window_matches_sdpa(causal, window_size):
     # auto-routed to the dao_ai backend; causal right windows are normalized away
     # (causal subsumes them) and stay on the default kernel. Both must be correct
     # without the caller ever setting mha_set_impl.
-    from aiter_flash_attn import flash_attn_func
-    from aiter_flash_attn import mha
 
-    assert mha._MHA_IMPL == "default", "impl must stay default (no explicit override)"
+    assert aiter_flash_attn.mha._MHA_IMPL == "default", "impl must stay default (no explicit override)"
 
     torch.manual_seed(0)
     B, S, H, D = 2, 128, 4, 64
@@ -123,17 +122,59 @@ def test_flash_attn_sliding_window_matches_sdpa(causal, window_size):
     k = torch.randn(B, S, H, D, device="cuda", dtype=torch.float16)
     v = torch.randn(B, S, H, D, device="cuda", dtype=torch.float16)
 
-    out = flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    out = aiter_flash_attn.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
     ref = _sdpa_reference(q, k, v, causal=causal, window_size=window_size)
 
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm device")
+@pytest.mark.parametrize("impl", ["default", "dao_ai"])
+def test_flash_attn_varlen_backward_very_negative_logits(impl):
+    # Rows whose logits are all very negative (logsumexp < -88) once overflowed exp(0 - lse) to inf on
+    # the zero-loaded keys of the last partial key block, and inf * 0 put NaN in dq. Seen on real
+    # Qwen2.5-1.5B activations. Sequence lengths are not block multiples so that partial block exists.
+
+    torch.manual_seed(0)
+    H, D = 4, 128
+    seqlens = [300, 250]
+    total = sum(seqlens)
+    u = torch.nn.functional.normalize(torch.randn(D, device="cuda"), dim=0)
+    a = 34.0  # q . k ~ -a^2, so logits ~ -a^2 / sqrt(D) ~ -102
+    q = (-a * u + 0.5 * torch.randn(total, H, D, device="cuda")).to(torch.bfloat16).requires_grad_(True)
+    k = (a * u + 0.5 * torch.randn(total, H, D, device="cuda")).to(torch.bfloat16).requires_grad_(True)
+    v = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
+    cu = torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
+    max_s = max(seqlens)
+
+    aiter_flash_attn.mha_set_impl(impl)
+    try:
+        out = aiter_flash_attn.flash_attn_varlen_func(q, k, v, cu, cu, max_s, max_s, causal=True)
+        out.backward(g)
+    finally:
+        aiter_flash_attn.mha_set_impl("default")
+
+    qr = q.detach().clone().requires_grad_(True)
+    kr = k.detach().clone().requires_grad_(True)
+    vr = v.detach().clone().requires_grad_(True)
+    parts = []
+    offset = 0
+    for s in seqlens:
+        sl = slice(offset, offset + s)
+        parts.append(_sdpa_reference(qr[sl][None], kr[sl][None], vr[sl][None], causal=True)[0])
+        offset += s
+    torch.cat(parts).backward(g)
+
+    assert torch.isfinite(q.grad).all() and torch.isfinite(k.grad).all() and torch.isfinite(v.grad).all()
+    # |q| and |k| are ~34 here, so bf16 rounding alone gives ~2% error (the fused backward matches it).
+    torch.testing.assert_close(q.grad, qr.grad, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(k.grad, kr.grad, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(v.grad, vr.grad, atol=5e-2, rtol=5e-2)
+
+
 @pytest.mark.parametrize("causal,window_size", [(False, (16, 16)), (True, (16, 0))])
 def test_flash_attn_sliding_window_backward_matches_sdpa(causal, window_size):
     # Exercises the re-vendored dao_ai sliding-window backward (ROCm/aiter #3742).
-    from aiter_flash_attn import flash_attn_func
 
     torch.manual_seed(0)
     B, S, H, D = 2, 128, 4, 64
@@ -142,7 +183,7 @@ def test_flash_attn_sliding_window_backward_matches_sdpa(causal, window_size):
     v = torch.randn(B, S, H, D, device="cuda", dtype=torch.float16, requires_grad=True)
     g = torch.randn(B, S, H, D, device="cuda", dtype=torch.float16)
 
-    out = flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    out = aiter_flash_attn.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
     out.backward(g)
 
     qr = q.detach().clone().requires_grad_(True)
@@ -156,10 +197,7 @@ def test_flash_attn_sliding_window_backward_matches_sdpa(causal, window_size):
     torch.testing.assert_close(v.grad, vr.grad, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm device")
 def test_flash_attn_varlen_sliding_window_matches_sdpa():
-    from aiter_flash_attn import flash_attn_varlen_func
-
     torch.manual_seed(0)
     H, D = 4, 64
     window_size = (16, 0)
@@ -171,7 +209,7 @@ def test_flash_attn_varlen_sliding_window_matches_sdpa():
     cu = torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
     max_s = max(seqlens)
 
-    out = flash_attn_varlen_func(
+    out = aiter_flash_attn.flash_attn_varlen_func(
         q, k, v, cu, cu, max_s, max_s, causal=True, window_size=window_size
     )
 
@@ -190,17 +228,14 @@ def test_flash_attn_varlen_sliding_window_matches_sdpa():
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA/ROCm device")
 @pytest.mark.parametrize("window_right", [0, -1])
 def test_flash_attn_causal_sliding_window_with_sink(window_right):
     # gpt-oss style: causal sliding window + attention sinks. Under causal
     # masking a right window of 0 is a no-op, so it must be accepted and stay on
     # the default kernel (which supports a left window together with sinks) --
     # dao_ai has no sink support, so this must NOT route there.
-    from aiter_flash_attn import flash_attn_func
-    from aiter_flash_attn import mha
 
-    assert mha._MHA_IMPL == "default"
+    assert aiter_flash_attn.mha._MHA_IMPL == "default"
 
     torch.manual_seed(0)
     B, S, H, D = 2, 128, 4, 64
@@ -210,7 +245,7 @@ def test_flash_attn_causal_sliding_window_with_sink(window_right):
     v = torch.randn(B, S, H, D, device="cuda", dtype=torch.float16)
     sink = torch.randn(H, device="cuda", dtype=torch.float16)
 
-    out = flash_attn_func(
+    out = aiter_flash_attn.flash_attn_func(
         q, k, v, causal=True, window_size=(left, window_right), s_aux=sink
     )
     ref = _sdpa_reference(
