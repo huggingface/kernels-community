@@ -185,7 +185,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from ...utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 
 def naive_recurrent_rwkv7(
