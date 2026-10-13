@@ -156,6 +156,12 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, p, rng_state
 
 
+# Alias matching upstream `flash_attn.flash_attn_interface`, which resolves it to
+# the registered op on Torch >= 2.4. Kept so code written against the pip package
+# ports unchanged.
+_wrapped_flash_attn_forward = flash_attn._flash_attn_forward
+
+
 @torch.library.custom_op(
     add_op_namespace_prefix("_flash_attn_varlen_forward"),
     mutates_args=(),
@@ -256,6 +262,12 @@ def _flash_attn_varlen_forward_fake(
     return out, softmax_lse, p, rng_state
 
 
+# Alias matching upstream `flash_attn.flash_attn_interface`, which resolves it to
+# the registered op on Torch >= 2.4. Kept so code written against the pip package
+# ports unchanged.
+_wrapped_flash_attn_varlen_forward = flash_attn._flash_attn_varlen_forward
+
+
 @torch.library.custom_op(
     add_op_namespace_prefix("_flash_attn_backward"),
     mutates_args=("dq", "dk", "dv"),
@@ -348,6 +360,12 @@ def _flash_attn_backward_fake(
     )
 
     return softmax_d
+
+
+# Alias matching upstream `flash_attn.flash_attn_interface`, which resolves it to
+# the registered op on Torch >= 2.4. Kept so code written against the pip package
+# ports unchanged.
+_wrapped_flash_attn_backward = flash_attn._flash_attn_backward
 
 
 @torch.library.custom_op(
@@ -459,6 +477,12 @@ def _flash_attn_varlen_backward_fake(
     )
 
     return softmax_d
+
+
+# Alias matching upstream `flash_attn.flash_attn_interface`, which resolves it to
+# the registered op on Torch >= 2.4. Kept so code written against the pip package
+# ports unchanged.
+_wrapped_flash_attn_varlen_backward = flash_attn._flash_attn_varlen_backward
 
 
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
