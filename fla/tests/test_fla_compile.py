@@ -27,24 +27,24 @@ DENSE_SHAPES = (
     (4, 4, 32),
 )
 # (num_heads, head_dim) -> bsz will default to 1 (flattened inpit)
-PACKED_SHAPES = ((1, 32), (2, 64), (4, 128), (8, 64))
+PACKED_SHAPES = ((1, 32), (2, 32), (2, 64), (4, 128), (8, 64))
 
 # (seq_len,)
 CHUNK_LENGTHS = (32, 64, 128, 256)
 RECURRENT_LENGTHS = (1, 2, 4, 8)
-PACKED_CHUNK_LENGTHS = ((32, 32), (64, 32), (128, 64), (192, 64))
+PACKED_CHUNK_LENGTHS = ((32, 16), (32, 32), (64, 32), (128, 64), (192, 64))
 PACKED_RECURRENT_LENGTHS = ((1, 1), (1, 2), (2, 3), (4, 8))
 
 # CI subset
 CI_INFERENCE = {
-    ("recurrent_gated_delta_rule", "dense", 2, 8, 128, (8,)),
-    ("recurrent_kimi_delta_attention", "dense", 2, 8, 128, (8,)),
+    ("recurrent_gated_delta_rule", "dense", 1, 2, 64, (4,)),
+    ("recurrent_kimi_delta_attention", "dense", 1, 2, 64, (1,)),
 }
 CI_TRAINING = {
-    ("chunk_kimi_delta_attention", "dense", 2, 8, 128, (128,)),
-    ("chunk_kimi_delta_attention", "packed", 1, 4, 128, (192, 64)),
-    ("chunk_gated_delta_rule", "dense", 2, 8, 128, (128,)),
-    ("chunk_gated_delta_rule", "packed", 1, 4, 128, (192, 64)),
+    ("chunk_kimi_delta_attention", "dense", 2, 2, 32, (32,)),
+    ("chunk_kimi_delta_attention", "packed", 1, 2, 32, (32, 16)),
+    ("chunk_gated_delta_rule", "dense", 2, 2, 32, (32,)),
+    ("chunk_gated_delta_rule", "packed", 1, 2, 32, (32, 16)),
 }
 
 def _lin_attention_cases(names, ci_cases):
@@ -148,10 +148,10 @@ def _lin_attention_case(name, device, mode, bsz, h, d, lengths):
 @pytest.mark.parametrize(
     "bsz,seq_len,d",
     (
-        (1, 64, 128),
+        pytest.param(1, 64, 128, marks=pytest.mark.kernels_ci),
         (2, 128, 256),
         (4, 64, 512),
-        pytest.param(2, 256, 1024, marks=pytest.mark.kernels_ci),
+        (2, 256, 1024),
     ),
 )
 def test_rmsnorm_gated_compiled_outputs_and_gradients_match_reference(fla, device, bsz, seq_len, d):
