@@ -54,6 +54,7 @@ jobs:
         with:
           ref: refs/pull/${{ inputs.pr_number }}/head
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -223,7 +224,7 @@ jobs:
                 --model claude-opus-4-8 \
                 --permission-mode plan \
                 --allowedTools "Read,Grep,Glob,LS" \
-                --disallowedTools "Bash,BashOutput,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task,KillShell" \
+                --disallowedTools "Bash,BashOutput,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task,KillShell,Read(./.git/**),Grep(./.git/**),Glob(./.git/**),LS(./.git/**),Read(//proc/**),Read(//home/**),Read(//root/**),Read(//etc/**),Read(//tmp/**),Read(//sys/**)" \
                 --max-turns 40 \
               > /tmp/audit_result.txt
 
@@ -253,7 +254,7 @@ jobs:
               printf '## 🔒 Security Audit — findings detected\n\n'
               printf 'An automated, AI-generated security review of this PR flagged the following. '
               printf 'These may include false positives — review each item before acting.\n\n'
-              cat /tmp/audit_result.txt
+              sed -E -e 's/gh[pousr]_[A-Za-z0-9]{20,}/[REDACTED]/g' -e 's/github_pat_[A-Za-z0-9_]{20,}/[REDACTED]/g' -e 's/sk-ant-[A-Za-z0-9_-]+/[REDACTED]/g' -e 's/(authorization|extraheader|x-access-token)[^[:space:]]*/[REDACTED]/Ig' -e 's/[A-Za-z0-9+\/]{60,}={0,2}/[REDACTED]/g' /tmp/audit_result.txt
             else
               printf '## 🔒 Security Audit — no findings\n\n'
               printf 'An automated security review of this PR found no issues.\n'
