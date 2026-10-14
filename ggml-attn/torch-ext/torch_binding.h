@@ -17,7 +17,8 @@
 // ggml takes no `is_causal` argument: the mask *is* the causality, and no mask means attend to
 // everything. For `n_q > 1` a causal caller must pass one.
 at::Tensor flash_attn(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
-                      const std::optional<at::Tensor> &mask, double scale);
+                      const std::optional<at::Tensor> &mask, double scale,
+                      const std::optional<at::Tensor> &sinks, double softcap);
 
 // Whether this build has a flash-attention kernel for these shapes. Only the decode-shaped vector
 // path is ported: ask, and fall back to torch's attention when it says no.
