@@ -2,11 +2,31 @@
 
 from typing import Optional, Union, List, Tuple
 
+import os
 import torch
 import torch.nn as nn
 
-from ._ops import ops as flash_attn_3_cuda
-from ._ops import add_op_namespace_prefix
+from ._ops import add_op_namespace_prefix, ops
+import warnings
+
+
+USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
+if not USE_TRITON_ROCM and getattr(torch.version, 'hip', None) is not None:
+    try:
+        import flash_attn_3._C
+    except ImportError:
+        warnings.warn("flash_attn_3._C (which has ROCm/HIP kernels) not found, falling back to Triton implementation")
+        USE_TRITON_ROCM = True
+
+if USE_TRITON_ROCM:
+    from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3 as flash_attn_3_gpu
+else:
+    # isort: off
+    # We need to import the CUDA kernels after importing torch
+
+    # isort: on
+
+    flash_attn_3_gpu = ops
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -85,7 +105,7 @@ def _flash_attn_forward(
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     seqlens_rotary = maybe_contiguous(seqlens_rotary)
-    out, softmax_lse, out_accum, softmax_lse_accum = flash_attn_3_cuda.fwd(
+    out, softmax_lse, out_accum, softmax_lse_accum = flash_attn_3_gpu.fwd(
         q,
         k,
         v,
@@ -263,7 +283,7 @@ def _flash_attn_backward(
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    softmax_d, *rest = flash_attn_3_cuda.bwd(
+    softmax_d, *rest = flash_attn_3_gpu.bwd(
         dout,
         q,
         k,
@@ -917,7 +937,7 @@ def flash_attn_varlen_func(
 
 
 def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
-    return flash_attn_3_cuda.fwd_combine(out_partial, lse_partial, out, out_dtype)
+    return flash_attn_3_gpu.fwd_combine(out_partial, lse_partial, out, out_dtype)
 
 
 def flash_attn_with_kvcache(
@@ -1105,7 +1125,7 @@ def get_scheduler_metadata(
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
         headdim_v = headdim
-    scheduler_metadata = flash_attn_3_cuda.get_scheduler_metadata(
+    scheduler_metadata = flash_attn_3_gpu.get_scheduler_metadata(
         batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
         qkv_dtype,
         cache_seqlens,
