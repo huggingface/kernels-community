@@ -50,8 +50,19 @@ when you need the LSE or drive the backward pass yourself, for instance in
 ring or context-parallel attention. The names keep their upstream leading
 underscore so code written against the `flash_attn` package ports unchanged.
 
-Note that the stable-ABI builds (Torch 2.10 and later) do not support
-`dropout_p > 0`, and `return_softmax` requires dropout, so pass `False` for it.
+Dropout is supported. The CUDA build uses the Torch stable ABI and cannot read
+the CUDA generator itself, so the forward is handed a generator and reserves
+its Philox seed and offset through the dispatcher, exactly as the non-stable
+build did. Masks are therefore bit-identical to earlier kernel versions and to
+the pip `flash_attn` package for the same `torch.manual_seed`, including under
+activation checkpointing and CUDA graph capture.
+
+Torch 2.10 to 2.12 cannot pass a generator through the stable ABI. There the
+kernel draws its seed and offset from the default generator instead, which is
+reproducible under `torch.manual_seed` but not bit-identical to other Torch
+versions, and the `gen` argument of `fwd`/`varlen_fwd` raises a `ValueError`.
+
+`return_softmax` requires `dropout_p > 0`.
 {% if layers %}
 
 ## Available layers
