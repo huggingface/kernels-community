@@ -7,7 +7,6 @@
 #include <cuda_runtime.h>
 #include <iostream>
 #ifndef NVTX_VERSION
-// #include <nvToolsExt.h>
 #endif
 #include <torch/custom_class.h>
 #include <torch/script.h>

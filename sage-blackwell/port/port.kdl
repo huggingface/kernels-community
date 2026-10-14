@@ -26,51 +26,46 @@ move \
 
 // Ops are registered in torch-ext/torch_binding.cpp instead of pybind11: drop
 // the trailing PYBIND11_MODULE blocks and the Python-only Torch headers.
-strip_suffix \
-    in="sage_blackwell/blackwell/api.cu" \
-    files=1 \
-    suffix="\n\n\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {\n    m.doc() = \"FlashAttention\";\n    m.def(\"fwd\", &mha_fwd, \"Forward pass\");\n}\n"
-
-strip_suffix \
-    in="sage_blackwell/quantization/fp4_quantization_4d.cu" \
-    files=1 \
-    suffix="\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {\n  m.def(\"scaled_fp4_quant\", &scaled_fp4_quant);\n  m.def(\"scaled_fp4_quant_permute\", &scaled_fp4_quant_permute);\n  m.def(\"scaled_fp4_quant_trans\", &scaled_fp4_quant_trans);\n}"
-
-replace \
-    in="sage_blackwell/blackwell/api.cu" \
-    find="#include <torch/python.h>" \
-    with="#include <torch/all.h>"
-
-replace \
-    in="sage_blackwell/{blackwell/api.cu,quantization/fp4_quantization_4d.cu}" \
-    find="#include <torch/nn/functional.h>\n" \
+rewrite \
+    in="sage_blackwell/**/*.cu" \
+    pattern="PYBIND11_MODULE(:[name], :[m]) {:[defs]}" \
     with="" \
-    count=2
+    changes=2
 
-replace \
+rewrite \
+    in="sage_blackwell/blackwell/api.cu" \
+    pattern="#include <torch/python.h>" \
+    with="#include <torch/all.h>" \
+    changes=1
+
+rewrite \
     in="sage_blackwell/quantization/fp4_quantization_4d.cu" \
-    find="#include <torch/python.h>\n" \
-    with=""
+    pattern="#include <torch/python.h>" \
+    with="" \
+    changes=1
+
+rewrite \
+    in="sage_blackwell/**/*.cu" \
+    pattern="#include <torch/nn/functional.h>" \
+    with="" \
+    changes=2
 
 expect in="sage_blackwell/**" find="pybind11" count=0
 expect in="sage_blackwell/**" find="PYBIND11" count=0
 
 // A Torch schema `Tensor?` cannot bind to a mutable reference.
-replace \
+rewrite \
     in="sage_blackwell/blackwell/api.cu" \
-    find="c10::optional<at::Tensor> &out_," \
-    with="std::optional<at::Tensor> out_,"
+    pattern="c10::optional<:[type]> &:[[name]]" \
+    with="std::optional<:[type]> :[name]" \
+    changes=1
 
 // Resolve the pybind extension modules to the kernel's Torch op aliases.
-replace \
+rewrite \
     in="torch-ext/sage_blackwell/api.py" \
-    find="import fp4attn_cuda\n" \
-    with="from . import sm120_compile as fp4attn_cuda\n"
-
-replace \
-    in="torch-ext/sage_blackwell/api.py" \
-    find="import fp4quant_cuda\n" \
-    with="from . import sm120_compile as fp4quant_cuda\n"
+    pattern="import :[[module]]_cuda" \
+    with="from . import sm120_compile as :[module]_cuda" \
+    changes=2
 
 // Bindings, sm120_compile.py (op aliases and fake registrations), the package
 // init with its explicit __all__, tests and docs have no upstream equivalent.

@@ -46,24 +46,27 @@ expect \
     count=1
 
 // Point the GELU epilogue at the fixed activation.
-replace \
+rewrite \
     in="cutlass_extensions/include/cutlass_extensions/epilogue_helpers.h" \
-    find="thread::GELU_taylor," \
-    with="thread::GELU_taylor_fixed,"
+    pattern="thread::GELU_taylor," \
+    with="thread::GELU_taylor_fixed," \
+    changes=1
 
 // torch/extension.h pulls in pybind11; torch/all.h is enough for ops
 // registered through TORCH_LIBRARY.
-replace \
+rewrite \
     in="utils/torch_utils.h" \
-    find="#include \"torch/extension.h\"" \
-    with="#include \"torch/all.h\""
+    pattern="#include \"torch/extension.h\"" \
+    with="#include \"torch/all.h\"" \
+    changes=1
 
 // nvToolsExt.h (NVTX 2) conflicts with the NVTX 3 headers of newer CUDA
 // toolkits and is not used.
-replace \
+rewrite \
     in="utils/torch_utils.h" \
-    find="#include <nvToolsExt.h>" \
-    with="// #include <nvToolsExt.h>"
+    pattern="#include <nvToolsExt.h>" \
+    with="" \
+    changes=1
 
 // Bindings, Python wrappers, docs and the locally rewritten sources above.
 overlay from="overlay"

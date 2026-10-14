@@ -331,3 +331,6 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x (head_size
     // printf("%s\n", cudaGetErrorString(err));
     return {out, softmax_lse};
 }
+
+
+

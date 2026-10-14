@@ -618,3 +618,4 @@ void scaled_fp4_quant_trans(torch::Tensor const& input,
     });
   });
 }
+

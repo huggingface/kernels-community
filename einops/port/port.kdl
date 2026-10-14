@@ -59,9 +59,10 @@ kernelize_imports \
 overlay from="overlay"
 
 // Use the supported replacement for NumPy 2's removed in1d API.
-replace in="tests/test_layers.py" \
-    find="numpy.in1d(grad, [0, 1])" \
-    with="numpy.isin(grad, [0, 1])"
+rewrite in="tests/test_layers.py" \
+    pattern="numpy.in1d(:[args])" \
+    with="numpy.isin(:[args])" \
+    changes=1
 
 // Select every upstream test for the kernel CI suite.
 mark_tests in="tests/test_*.py" marker="kernels_ci" changes=63
