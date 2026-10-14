@@ -5,15 +5,14 @@ from typing import Optional, Union, List, Tuple
 import os
 import torch
 import torch.nn as nn
-
-from ._ops import add_op_namespace_prefix, ops
 import warnings
+from ._ops import add_op_namespace_prefix, ops
 
 
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 if not USE_TRITON_ROCM and getattr(torch.version, 'hip', None) is not None:
     try:
-        import flash_attn_3._C
+        from . import _ops
     except ImportError:
         warnings.warn("flash_attn_3._C (which has ROCm/HIP kernels) not found, falling back to Triton implementation")
         USE_TRITON_ROCM = True
@@ -23,6 +22,7 @@ if USE_TRITON_ROCM:
 else:
     # isort: off
     # We need to import the CUDA kernels after importing torch
+    from . import _ops # Registers operators with PyTorch
 
     # isort: on
 

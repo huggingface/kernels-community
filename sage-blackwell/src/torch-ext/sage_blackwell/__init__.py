@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+from . import sm120_compile  # noqa: F401 - registers the fake implementations
 from .api import sageattn3_blackwell
 
 __all__ = ["sageattn3_blackwell"]

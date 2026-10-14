@@ -24,34 +24,20 @@ move \
     from="sageattention3_blackwell/sageattn3" \
     to="torch-ext/sage_blackwell"
 
-// Ops are registered in torch-ext/torch_binding.cpp instead of pybind11: drop
-// the trailing PYBIND11_MODULE blocks and the Python-only Torch headers.
-rewrite \
-    in="sage_blackwell/**/*.cu" \
-    pattern="PYBIND11_MODULE(:[name], :[m]) {:[defs]}" \
-    with="" \
-    changes=2
+// Upstream builds two pybind extensions, imported as fp4attn_cuda and
+// fp4quant_cuda. Register their ops through torch-ext/torch_binding.cpp and
+// call them through the kernel's ops instead.
+extension \
+    sources="sage_blackwell/**/*.cu" \
+    modules="fp4attn_cuda,fp4quant_cuda" \
+    changes=6
 
-rewrite \
-    in="sage_blackwell/blackwell/api.cu" \
-    pattern="#include <torch/python.h>" \
-    with="#include <torch/all.h>" \
-    changes=1
-
-rewrite \
-    in="sage_blackwell/quantization/fp4_quantization_4d.cu" \
-    pattern="#include <torch/python.h>" \
-    with="" \
-    changes=1
-
+// torch/nn/functional.h was upstream's lighter stand-in for torch/extension.h.
 rewrite \
     in="sage_blackwell/**/*.cu" \
     pattern="#include <torch/nn/functional.h>" \
     with="" \
     changes=2
-
-expect in="sage_blackwell/**" find="pybind11" count=0
-expect in="sage_blackwell/**" find="PYBIND11" count=0
 
 // A Torch schema `Tensor?` cannot bind to a mutable reference.
 rewrite \
@@ -60,15 +46,8 @@ rewrite \
     with="std::optional<:[type]> :[name]" \
     changes=1
 
-// Resolve the pybind extension modules to the kernel's Torch op aliases.
-rewrite \
-    in="torch-ext/sage_blackwell/api.py" \
-    pattern="import :[[module]]_cuda" \
-    with="from . import sm120_compile as :[module]_cuda" \
-    changes=2
-
-// Bindings, sm120_compile.py (op aliases and fake registrations), the package
-// init with its explicit __all__, tests and docs have no upstream equivalent.
+// Bindings, sm120_compile.py (fake registrations), the package init with its
+// explicit __all__, tests and docs have no upstream equivalent.
 overlay from="overlay"
 
 // Fail on new upstream sources so they get reviewed rather than silently
