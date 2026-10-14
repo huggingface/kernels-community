@@ -1,0 +1,16 @@
+{
+  "format": 1,
+  "recipe": "sha256:52ea399bb6e3fb18f60e475fc4b504a711a5620834f23755a744ea6145a65fa3",
+  "runner": "kernel-port 0.1.0",
+  "sources": {
+    "quack": {
+      "repo": "https://github.com/Dao-AILab/quack.git",
+      "commit": "df0d49be03fcf9003e8971dbfa2357a70e361d49"
+    },
+    "upstream": {
+      "repo": "https://github.com/MiniMax-AI/MSA.git",
+      "commit": "9175bebf2b623ca0ea8ad5247bb615cd424598a0"
+    }
+  },
+  "tree": "sha256:bd0501248ac734d7e0f8c2f831c6fa8c2dd25469caf388abbb960f0c25268955"
+}

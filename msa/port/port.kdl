@@ -1,0 +1,160 @@
+recipe version=1
+
+// Pin the exact clean upstream tree this recipe transforms.
+source \
+    repo="https://github.com/MiniMax-AI/MSA.git" \
+    commit="9175bebf2b623ca0ea8ad5247bb615cd424598a0"
+
+// The CuTe-DSL stack imports a handful of quack modules. Vendor quack at the
+// release that requirements.txt asks for (quack-kernels>=0.2.10).
+vendor \
+    name="quack" \
+    repo="https://github.com/Dao-AILab/quack.git" \
+    commit="df0d49be03fcf9003e8971dbfa2357a70e361d49" \
+    path="." \
+    to="_vendor/quack"
+
+// Retain only the CuTe-DSL sparse stack, its tests, and the quack modules it
+// imports. The dense FMHA stack (csrc/, api.py, jit.py) relies on runtime
+// nvcc/jinja JIT compilation and is intentionally excluded, as are
+// example.py, Makefile, pytest.ini and requirements.txt.
+prune keep="LICENSE,python/fmha_sm100/cute/{interface,fp4_indexer_interface,quantize,sparse_index_utils}.py,python/fmha_sm100/cute/README.md,python/fmha_sm100/cute/src/**,python/fmha_sm100/cute/test_{sparse_atten,fp4_indexer}.py,_vendor/quack/LICENSE,_vendor/quack/quack/{layout_utils,copy_utils,cute_dsl_utils,activation,compile_utils}.py"
+
+// The CUDA helper extensions become precompiled Torch ops instead of
+// torch.utils.cpp_extension.load JIT modules.
+move \
+    from="python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu" \
+    to="csrc/build_k2q_csr.cu"
+
+move \
+    from="python/fmha_sm100/cute/src/sm100/fwd_decode/build_decode_schedule/build_decode_schedule.cu" \
+    to="csrc/build_decode_schedule.cu"
+
+// Lift upstream tests out of the package into the kernel test root.
+move \
+    from="python/fmha_sm100/cute/test_sparse_atten.py" \
+    to="tests/test_sparse_atten.py"
+
+move \
+    from="python/fmha_sm100/cute/test_fp4_indexer.py" \
+    to="tests/test_fp4_indexer.py"
+
+// Place the distributable package in the torch extension tree.
+move \
+    from="python/fmha_sm100/cute" \
+    to="torch-ext/msa"
+
+move \
+    from="LICENSE" \
+    to="torch-ext/msa/LICENSE"
+
+move \
+    from="_vendor/quack/quack" \
+    to="torch-ext/msa/quack"
+
+move \
+    from="_vendor/quack/LICENSE" \
+    to="torch-ext/msa/quack/LICENSE"
+
+// Only the imported quack modules are vendored, so the package init stays
+// empty rather than importing upstream's full module set.
+ensure_init under="torch-ext/msa/quack" changes=1
+
+// `import quack.activation` binds the top-level package, so convert_import
+// rejects it and it has no relative form; import the module instead.
+replace \
+    in="torch-ext/msa/src/common/utils.py" \
+    find="import quack.activation" \
+    with="from quack import activation"
+
+replace \
+    in="torch-ext/msa/src/common/utils.py" \
+    find="quack.activation.sub_packed_f32x2(" \
+    with="activation.sub_packed_f32x2(" \
+    count=2
+
+// Upstream runs with cute/ on sys.path, importing `src` and `quack` as
+// top-level packages. Move both under the kernel package, then make every
+// intra-package import relative.
+convert_import \
+    in="torch-ext/msa/**" \
+    prefix="src" \
+    changes=2
+
+remap_module \
+    in="torch-ext/msa/**" \
+    from="src" \
+    to="msa.src" \
+    changes=67
+
+remap_module \
+    in="torch-ext/msa/**" \
+    from="quack" \
+    to="msa.quack" \
+    changes=13
+
+relativize_imports \
+    in="torch-ext/msa/**" \
+    package_root="torch-ext/msa" \
+    root_relative=#true \
+    changes=80
+
+// The CUDA helpers and their Python wrappers are substantively rewritten
+// locally, so they come from the overlay instead of being patched:
+// - csrc/build_k2q_csr.cu: torch/all.h + torch_binding.h instead of
+//   torch/extension.h, and no PYBIND11_MODULE (ops are registered in
+//   torch-ext/torch_binding.cpp).
+// - csrc/build_decode_schedule.cu: same, plus it returns a tuple of tensors
+//   and a fixed-order int[] scalar summary instead of a py::dict, which a
+//   Torch schema cannot express.
+// - src/sm100/build_k2q_csr/__init__.py and
+//   src/sm100/fwd_decode/build_decode_schedule/__init__.py: dispatch through
+//   ._ops instead of torch.utils.cpp_extension.load JIT compilation, and
+//   reassemble the decode schedule dict from the op's tuple.
+// Guard the upstream entry points these overlay files mirror, so an upstream
+// change to them fails the port and gets re-reviewed.
+expect in="csrc/build_k2q_csr.cu" find="void run_build_k2q_csr(" count=1
+expect in="csrc/build_k2q_csr.cu" find="void run_build_k2q_csr_with_schedule(" count=1
+expect in="csrc/build_decode_schedule.cu" find="py::dict build_decode_schedule(" count=1
+expect in="torch-ext/msa/src/sm100/build_k2q_csr/__init__.py" find="def run_build_k2q_csr(" count=1
+expect in="torch-ext/msa/src/sm100/build_k2q_csr/__init__.py" find="def run_build_k2q_csr_with_schedule(" count=1
+expect in="torch-ext/msa/src/sm100/fwd_decode/build_decode_schedule/__init__.py" find="def build_decode_schedule(" count=1
+
+// Tests import the top-level modules from cute/; point them at the msa
+// package instead.
+remap_module in="tests/*.py" from="interface" to="msa.interface" changes=1
+// remap_module and convert_import do not handle a bare `import X as Y`.
+replace in="tests/test_sparse_atten.py" find="import interface as sparse_interface" with="import msa.interface as sparse_interface"
+remap_module in="tests/*.py" from="sparse_index_utils" to="msa.sparse_index_utils" changes=1
+remap_module in="tests/*.py" from="quantize" to="msa.quantize" changes=3
+remap_module in="tests/*.py" from="fp4_indexer_interface" to="msa.fp4_indexer_interface" changes=1
+remap_module in="tests/*.py" from="src" to="msa.src" changes=2
+
+// Package init (public API re-exports), bindings and docs have no upstream
+// equivalent; the CUDA helpers and their wrappers are rewritten (see above).
+overlay from="overlay"
+
+// Fail on new upstream sources so they get reviewed rather than silently
+// shipped or dropped.
+expect in="torch-ext/msa/**/*.py" files=46
+expect in="csrc/*" files=2
+
+kernel \
+    name="msa" \
+    backend="cuda" \
+    src="csrc/*.cu" \
+    include="torch-ext" \
+    capabilities="10.0"
+
+manifest \
+    name="msa" \
+    version=0 \
+    edition=5 \
+    license="other" \
+    upstream="https://github.com/MiniMax-AI/MSA" \
+    backends="cuda" \
+    python_depends="tvm-ffi" \
+    cuda_minver="12.8" \
+    cuda_python_depends="nvidia-cutlass-dsl" \
+    repo_id="MiniMaxAI/msa" \
+    torch_src="torch-ext/torch_binding.cpp,torch-ext/torch_binding.h"

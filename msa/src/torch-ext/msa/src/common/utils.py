@@ -16,6 +16,7 @@ from cutlass.cute.runtime import from_dlpack
 
 
 from ...quack import activation
+
 _MIXER_ATTRS = ("__vec_size__",)
 
 # Obtained from sollya:

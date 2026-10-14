@@ -26,6 +26,6 @@ cuda-capabilities = ["10.0"]
 depends = ["torch"]
 include = ["torch-ext"]
 src = [
-    "csrc/build_k2q_csr.cu",
     "csrc/build_decode_schedule.cu",
+    "csrc/build_k2q_csr.cu",
 ]

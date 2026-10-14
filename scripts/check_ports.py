@@ -9,9 +9,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Extract source arguments; kernel-port validates them.
+# Extract source and vendor arguments; kernel-port validates them.
 SOURCE_RE = re.compile(
     r"^source\b(?P<body>(?:[^\n\\]|\\\s*\n)*)", re.MULTILINE
+)
+VENDOR_RE = re.compile(
+    r"^vendor\b(?P<body>(?:[^\n\\]|\\\s*\n)*)", re.MULTILINE
 )
 ARG_RE = re.compile(r'(\w+)="([^"]*)"')
 
@@ -58,6 +61,17 @@ def parse_source(recipe: Path) -> tuple:
         raise SystemExit(f"{recipe}: source is missing {exc}") from exc
 
 
+def parse_vendors(recipe: Path) -> list:
+    vendors = []
+    for m in VENDOR_RE.finditer(recipe.read_text()):
+        args = dict(ARG_RE.findall(m.group("body").replace("\\\n", " ")))
+        try:
+            vendors.append((args["name"], args["repo"], args["commit"]))
+        except KeyError as exc:
+            raise SystemExit(f"{recipe}: vendor is missing {exc}") from exc
+    return vendors
+
+
 def checkout(repo: str, commit: str, dest: Path) -> None:
     subprocess.run(
         ["git", "clone", "--quiet", "--filter=blob:none", "--no-checkout", repo, str(dest)],
@@ -97,10 +111,18 @@ def check(kernel: str, root: Path, workdir: Path) -> list:
     if not src.exists():
         checkout(repo, commit, src)
 
+    vendor_args = []
+    for name, vrepo, vcommit in parse_vendors(recipe):
+        print(f"    vendor {name}: {vrepo} @ {vcommit[:12]}")
+        vdir = workdir / f"upstream-{vcommit[:12]}"
+        if not vdir.exists():
+            checkout(vrepo, vcommit, vdir)
+        vendor_args += ["--vendor", f"{name}={vdir}"]
+
     out = workdir / f"out-{kernel}"
     shutil.rmtree(out, ignore_errors=True)
     proc = subprocess.run(
-        [*runner_cmd(), str(recipe), "--dir", str(src), "--out", str(out)],
+        [*runner_cmd(), str(recipe), "--dir", str(src), "--out", str(out), *vendor_args],
         capture_output=True,
         text=True,
     )
