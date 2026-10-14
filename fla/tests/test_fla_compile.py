@@ -177,12 +177,12 @@ def test_rmsnorm_gated_compiled_outputs_and_gradients_match_reference(fla, devic
     def reference(x, gate):
         return x + F.rms_norm(x, (d,), ref_weight, 1e-5) * F.silu(gate)
 
-    compiled = torch.compile(forward, fullgraph=True) # covers no initial graph break (fullgraph)
+    compiled = torch.compile(forward, fullgraph=True)  # no graph break
     eager_out = forward(*eager_inputs)
-    with torch._dynamo.config.patch(error_on_recompile=True): # covers no graph break on replay
+    ref_out = reference(*ref_inputs)
+    with torch._dynamo.config.patch(error_on_recompile=True):  # no recompile
         compiled_out = compiled(*compiled_inputs)
         compiled(*compiled_inputs)
-    ref_out = reference(*ref_inputs)
 
     tol = dict(rtol=2e-3, atol=2e-3, max_rel_l2=2e-3)
     # fwd check
@@ -192,8 +192,10 @@ def test_rmsnorm_gated_compiled_outputs_and_gradients_match_reference(fla, devic
 
     # bwd check
     eager_grads = torch.autograd.grad(eager_out.sum(), (*eager_inputs, module.weight))
-    compiled_grads = torch.autograd.grad(compiled_out.sum(), (*compiled_inputs, module.weight))
     ref_grads = torch.autograd.grad(ref_out.sum(), (*ref_inputs, ref_weight))
+    with torch._dynamo.config.patch(error_on_recompile=True):  # no recompile
+        compiled_grads = torch.autograd.grad(compiled_out.sum(), (*compiled_inputs, module.weight))
+
     for actual, eager, ref in zip(compiled_grads, eager_grads, ref_grads, strict=True):
         _check(actual, eager, **tol)
         _check(eager, ref, **tol)
@@ -220,10 +222,10 @@ def test_lin_attention_compiled_outputs_match_eager(
             **kwargs,
         )
 
-    compiled = torch.compile(forward, fullgraph=True) # covers no initial graph break (fullgraph)
+    compiled = torch.compile(forward, fullgraph=True)  # no graph break
     with torch.inference_mode():
         eager = forward(*inputs, initial_state)
-        with torch._dynamo.config.patch(error_on_recompile=True): # covers no graph break on replay
+        with torch._dynamo.config.patch(error_on_recompile=True):  # no recompile
             actual = compiled(*(x.clone() for x in inputs), initial_state.clone())
             compiled(*(x.clone() for x in inputs), initial_state.clone())
 
@@ -275,9 +277,9 @@ def test_lin_attention_compiled_outputs_and_gradients_match_eager(
         )
 
 
-    compiled = torch.compile(forward, fullgraph=True) # covers no initial graph break (fullgraph)
+    compiled = torch.compile(forward, fullgraph=True)  # no graph break
     eager_out = forward(*eager_inputs)
-    with torch._dynamo.config.patch(error_on_recompile=True): # covers no graph break on replay
+    with torch._dynamo.config.patch(error_on_recompile=True):  # no recompile
         compiled_out = compiled(*compiled_inputs)
         compiled(*compiled_inputs)
 
@@ -287,7 +289,9 @@ def test_lin_attention_compiled_outputs_and_gradients_match_eager(
 
     # bwd check
     eager_grads = torch.autograd.grad(loss_fn(eager_out), (*eager_inputs, head.weight))
-    compiled_grads = torch.autograd.grad(loss_fn(compiled_out), (*compiled_inputs, head.weight))
+    with torch._dynamo.config.patch(error_on_recompile=True):  # no recompile
+        compiled_grads = torch.autograd.grad(loss_fn(compiled_out), (*compiled_inputs, head.weight))
+
     for label, actual, expected in zip(
         ("dq", "dk", "dv", "dg", "dbeta", "dh0", "dweight"),
         compiled_grads, eager_grads, strict=True,
