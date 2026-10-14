@@ -349,14 +349,14 @@ out the following steps:
   - `cute/src/sm100/build_k2q_csr/build_k2q_csr.cu` → `msa/csrc/build_k2q_csr.cu`
   - `cute/src/sm100/fwd_decode/build_decode_schedule/build_decode_schedule.cu`
     → `msa/csrc/build_decode_schedule.cu`
-  When syncing, diff the upstream `.cu` files against the local copies and
-  re-apply the local porting changes: `torch/extension.h` → `torch/all.h`,
-  no pybind11 (ops are registered in `msa/torch-ext/torch_binding.cpp`), and
-  `build_decode_schedule` returns a tuple of tensors plus a fixed-order
-  `int[]` scalar summary instead of a `py::dict`. The corresponding Python
-  wrapper `__init__.py` files under `msa/torch-ext/msa/src/sm100/` dispatch
-  through `._ops` and must keep their public signatures in sync with
-  upstream.
+  Ops are registered in `msa/torch-ext/torch_binding.cpp`. The recipe's
+  `extension` op converts `build_k2q_csr` (`torch/extension.h` →
+  `torch/all.h`, no pybind11, its wrapper's JIT `load` → `._ops`).
+  `build_decode_schedule` is carried in the overlay, because it returns a
+  tuple of tensors plus a fixed-order `int[]` scalar summary instead of a
+  `py::dict`; when syncing, diff the upstream `.cu` and its Python wrapper
+  under `src/sm100/fwd_decode/build_decode_schedule/` against the overlay
+  copies and keep the public signatures in sync with upstream.
 - Check in `python/fmha_sm100/cute/requirements.txt` (or the upstream
   `pyproject.toml`) which version of quack is required.
 - Get this version of quack from https://github.com/Dao-AILab/quack.git

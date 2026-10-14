@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
-"""q2k -> k2q CSR builder backed by the precompiled Torch ops.
+"""JIT-loaded CUDA C++ extension for the q2k -> k2q CSR builder.
 
-The CUDA implementation lives in ``csrc/build_k2q_csr.cu`` and is built
-ahead of time by kernel-builder; it is reached through the ``_ops``
-namespace instead of being JIT-compiled at import time.
+This module compiles ``build_k2q_csr.cu`` on first import via
+``torch.utils.cpp_extension.load`` and exposes ``run_build_k2q_csr``.
+The extension is cached in ``~/.cache/torch_extensions/`` so subsequent
+imports are cheap.
 
 The kernel pipeline is tuned and verified for SM100; other
 architectures are not supported.
@@ -15,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-from ...._ops import ops
+from ...._ops import ops as _ext
 
 
 def run_build_k2q_csr(
@@ -44,7 +45,7 @@ def run_build_k2q_csr(
       max_kv_blocks: max over batches of ceil(seqlen_k / blk_kv); upper bound
                      used to size the row_map workspace and clamp valid kv ids.
     """
-    ops.run_build_k2q_csr(
+    _ext.run_build_k2q_csr(
         q2k,
         cu_seqlens_q,
         cu_seqlens_k,
@@ -76,7 +77,7 @@ def run_build_k2q_csr_with_schedule(
     max_seqlen_q: int,
 ) -> None:
     """In-place fill of CSR plus fused sparse attention schedule metadata."""
-    ops.run_build_k2q_csr_with_schedule(
+    _ext.run_build_k2q_csr_with_schedule(
         q2k,
         cu_seqlens_q,
         cu_seqlens_k,

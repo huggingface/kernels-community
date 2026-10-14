@@ -56,6 +56,14 @@ move \
     from="_vendor/quack/LICENSE" \
     to="torch-ext/msa/quack/LICENSE"
 
+// build_k2q_csr is JIT-compiled at import time upstream. Precompile it: drop
+// its pybind module and point its Python wrapper at the kernel's ops. Its ops
+// are registered in torch-ext/torch_binding.cpp.
+extension \
+    sources="csrc/build_k2q_csr.cu" \
+    modules="sparse_build_k2q_csr_ext" \
+    changes=9
+
 // Only the imported quack modules are vendored, so the package init stays
 // empty rather than importing upstream's full module set.
 ensure_init under="torch-ext/msa/quack" changes=1
@@ -92,25 +100,14 @@ relativize_imports \
     root_relative=#true \
     changes=80
 
-// The CUDA helpers and their Python wrappers are substantively rewritten
-// locally, so they come from the overlay instead of being patched:
-// - csrc/build_k2q_csr.cu: torch/all.h + torch_binding.h instead of
-//   torch/extension.h, and no PYBIND11_MODULE (ops are registered in
-//   torch-ext/torch_binding.cpp).
-// - csrc/build_decode_schedule.cu: same, plus it returns a tuple of tensors
-//   and a fixed-order int[] scalar summary instead of a py::dict, which a
-//   Torch schema cannot express.
-// - src/sm100/build_k2q_csr/__init__.py and
-//   src/sm100/fwd_decode/build_decode_schedule/__init__.py: dispatch through
-//   ._ops instead of torch.utils.cpp_extension.load JIT compilation, and
-//   reassemble the decode schedule dict from the op's tuple.
-// Guard the upstream entry points these overlay files mirror, so an upstream
-// change to them fails the port and gets re-reviewed.
-expect in="csrc/build_k2q_csr.cu" find="void run_build_k2q_csr(" count=1
-expect in="csrc/build_k2q_csr.cu" find="void run_build_k2q_csr_with_schedule(" count=1
+// build_decode_schedule returns a py::dict, which a Torch op schema cannot
+// express, so it and its Python wrapper are rewritten locally and come from
+// the overlay: csrc/build_decode_schedule.cu returns a tuple of tensors and a
+// fixed-order int[] scalar summary, and
+// src/sm100/fwd_decode/build_decode_schedule/__init__.py dispatches through
+// ._ops and reassembles the dict. Guard the upstream entry points they
+// mirror, so an upstream change to them fails the port and gets re-reviewed.
 expect in="csrc/build_decode_schedule.cu" find="py::dict build_decode_schedule(" count=1
-expect in="torch-ext/msa/src/sm100/build_k2q_csr/__init__.py" find="def run_build_k2q_csr(" count=1
-expect in="torch-ext/msa/src/sm100/build_k2q_csr/__init__.py" find="def run_build_k2q_csr_with_schedule(" count=1
 expect in="torch-ext/msa/src/sm100/fwd_decode/build_decode_schedule/__init__.py" find="def build_decode_schedule(" count=1
 
 // Tests import the top-level modules from cute/; point them at the msa
@@ -122,7 +119,7 @@ remap_module in="tests/*.py" from="fp4_indexer_interface" to="msa.fp4_indexer_in
 remap_module in="tests/*.py" from="src" to="msa.src" changes=2
 
 // Package init (public API re-exports), bindings and docs have no upstream
-// equivalent; the CUDA helpers and their wrappers are rewritten (see above).
+// equivalent; the decode schedule helper is rewritten (see above).
 overlay from="overlay"
 
 // Fail on new upstream sources so they get reviewed rather than silently
