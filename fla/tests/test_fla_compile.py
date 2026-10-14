@@ -1,10 +1,7 @@
-import importlib
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 import torch.nn.functional as F
+from kernels import get_kernel
 from torch import nn
 
 
@@ -15,8 +12,8 @@ LIN_ATTENTION = (
     "recurrent_gated_delta_rule",
 )
 TRAINABLE_LIN_ATTENTION = ("chunk_kimi_delta_attention", "chunk_gated_delta_rule")
-# dense: normal, packed: packed training, fused: fused paths (similar to mamba inner fn)
-MODES = ("dense", "packed", "fused")
+# packed is the cuseqlens path as in FA (training usually or CB)
+MODES = ("dense", "packed")
 
 # (bsz, num_heads, head_dim)
 DENSE_SHAPES = (
@@ -38,56 +35,44 @@ RECURRENT_LENGTHS = (1, 2, 4, 8)
 PACKED_CHUNK_LENGTHS = ((32, 32), (64, 32), (128, 64), (192, 64))
 PACKED_RECURRENT_LENGTHS = ((1, 1), (1, 2), (2, 3), (4, 8))
 
-# subset for CI
-CI_CASES = {
-    "chunk": {
-        ("dense", 1, 2, 64, (64,)),
-        ("dense", 2, 4, 64, (128,)),
-        ("packed", 1, 2, 64, (64, 32)),
-        ("packed", 1, 4, 128, (128, 64)),
-        ("fused", 1, 2, 64, (64,)),
-        ("fused", 2, 8, 128, (128,)),
-    },
-    "recurrent": {
-        ("dense", 1, 2, 64, (1,)),
-        ("dense", 2, 4, 64, (4,)),
-        ("packed", 1, 2, 64, (1, 2)),
-        ("fused", 1, 2, 64, (2,)),
-        ("fused", 2, 8, 128, (8,)),
-    },
+# CI subset
+CI_INFERENCE = {
+    ("recurrent_gated_delta_rule", "dense", 2, 8, 128, (8,)),
+    ("recurrent_kimi_delta_attention", "dense", 2, 8, 128, (8,)),
+}
+CI_TRAINING = {
+    ("chunk_kimi_delta_attention", "dense", 2, 8, 128, (128,)),
+    ("chunk_kimi_delta_attention", "packed", 1, 4, 128, (192, 64)),
+    ("chunk_gated_delta_rule", "dense", 2, 8, 128, (128,)),
+    ("chunk_gated_delta_rule", "packed", 1, 4, 128, (192, 64)),
 }
 
-
-def _lin_attention_cases(names):
+def _lin_attention_cases(names, ci_cases):
     cases = []
     for name in names:
-        is_chunk = name.startswith("chunk_")
-        kind = "chunk" if is_chunk else "recurrent"
+        chunk = name.startswith("chunk_")
         for mode in MODES:
             if mode == "packed":
-                packed_lengths = (
-                    PACKED_CHUNK_LENGTHS if is_chunk else PACKED_RECURRENT_LENGTHS
-                )
+                lengths_list = PACKED_CHUNK_LENGTHS if chunk else PACKED_RECURRENT_LENGTHS
                 shapes = (
                     (1, h, d, lengths)
                     for h, d in PACKED_SHAPES
-                    for lengths in packed_lengths
+                    for lengths in lengths_list
                 )
             else:
-                seq_lens = CHUNK_LENGTHS if is_chunk else RECURRENT_LENGTHS
+                lengths_list = CHUNK_LENGTHS if chunk else RECURRENT_LENGTHS
                 shapes = (
                     (bsz, h, d, (t,))
                     for bsz, h, d in DENSE_SHAPES
-                    for t in seq_lens
+                    for t in lengths_list
                 )
 
             for bsz, h, d, lengths in shapes:
                 case = (mode, bsz, h, d, lengths)
-                marks = pytest.mark.kernels_ci if case in CI_CASES[kind] else ()
                 cases.append(
                     pytest.param(
                         name, mode, bsz, h, d, lengths,
-                        marks=marks,
+                        marks=pytest.mark.kernels_ci if (name, *case) in ci_cases else (),
                         id=f"{mode}-{name}-b{bsz}-h{h}-d{d}-t{'x'.join(map(str, lengths))}",
                     )
                 )
@@ -105,9 +90,8 @@ def device():
 
 @pytest.fixture(scope="module")
 def fla(device):
-    # TODO: Replace with get_kernel after local staging / building
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "torch-ext"))
-    return importlib.import_module("fla")
+    # TODO: Replace with non-staged version
+    return get_kernel("kernels-staging/fla", revision="pr-1223")
 
 
 @pytest.fixture(autouse=True)
@@ -129,60 +113,63 @@ def _check(actual, expected, *, rtol=5e-3, atol=1e-3, max_rel_l2=5e-3):
 
 
 def _lin_attention_case(name, device, mode, bsz, h, d, lengths):
+    """
+    Returns the different linear attn cores like QKV and lin attn specific g/decay and beta
+
+    Adiitionally, we return an initial state (important for certain gradient flows) and kwargs for e.g. packed (cuseqlens)
+    """
     torch.manual_seed(42)
-    is_kimi = "kimi" in name
+
     dtype = (
         torch.bfloat16
         if device.type == "xpu" or torch.cuda.is_bf16_supported()
         else torch.float16
     )
+
+    # metadata
     t = sum(lengths)
     shape = (bsz, t, h, d)
+    nseq = len(lengths) if mode == "packed" else bsz
 
-    q, k, v = (
-        torch.randn(shape, device=device, dtype=dtype) * 0.1 for _ in range(3)
-    )
-    g_shape = shape if is_kimi else (bsz, t, h)
+    q, k, v = (torch.randn(shape, device=device, dtype=dtype) * 0.1 for _ in range(3))
+    g_shape = shape if "kimi" in name else (bsz, t, h)  # KDA has learnable per head decay
     g = -torch.rand(g_shape, device=device, dtype=dtype) * 0.1
     beta = 0.25 + torch.rand((bsz, t, h), device=device, dtype=dtype) * 0.5
-    nseq = len(lengths) if mode == "packed" else bsz
-    state = torch.randn((nseq, h, d, d), device=device, dtype=torch.float32) * 0.01
+    initial_state = torch.randn((nseq, h, d, d), device=device) * 0.01
 
-    kwargs = {}
+    kwargs = {"use_qk_l2norm_in_kernel": True}  # we do it as kwarg in transformers
     if mode == "packed":
         offsets = (0, lengths[0], sum(lengths))
         kwargs["cu_seq_lens_q"] = torch.tensor(offsets, device=device, dtype=torch.int32)
-    elif mode == "fused":
-        kwargs.update(
-            use_qk_l2norm_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
-            use_gate_in_kernel=True,
-            A_log=torch.full((h,), -1.5, device=device),
-            dt_bias=torch.zeros((h * d if is_kimi else h,), device=device),
-        )
 
-    return (q, k, v, g, beta), state, kwargs
+    return (q, k, v, g, beta), initial_state, kwargs
 
 
 @pytest.mark.parametrize(
     "bsz,seq_len,d",
     (
-        pytest.param(1, 64, 128, marks=pytest.mark.kernels_ci),
+        (1, 64, 128),
         (2, 128, 256),
         (4, 64, 512),
         pytest.param(2, 256, 1024, marks=pytest.mark.kernels_ci),
     ),
 )
-def test_rmsnorm_gated_fullgraph_forward_backward(fla, device, bsz, seq_len, d):
+def test_rmsnorm_gated_compiled_outputs_and_gradients_match_reference(fla, device, bsz, seq_len, d):
     torch.manual_seed(0)
+
+    # As we would find it under transformers
     module = fla.layers.FusedRMSNormGated().to(device)
     module.weight = nn.Parameter(torch.ones(d, device=device))
     module.activation = "silu"
     module.variance_epsilon = 1e-5
 
+    # Dummy input
     x = torch.randn((bsz, seq_len, d), device=device)
     gate = torch.randn_like(x)
+    ref_inputs = (_leaf(x), _leaf(gate))
     ref_weight = _leaf(module.weight)
+    eager_inputs = (_leaf(x), _leaf(gate))
+    compiled_inputs = (_leaf(x), _leaf(gate))
 
     def forward(x, gate):
         return x + module(x, gate)
@@ -190,20 +177,20 @@ def test_rmsnorm_gated_fullgraph_forward_backward(fla, device, bsz, seq_len, d):
     def reference(x, gate):
         return x + F.rms_norm(x, (d,), ref_weight, 1e-5) * F.silu(gate)
 
-    eager_inputs = (_leaf(x), _leaf(gate))
-    compiled_inputs = (_leaf(x), _leaf(gate))
-    ref_inputs = (_leaf(x), _leaf(gate))
-    compiled = torch.compile(forward, backend="inductor", fullgraph=True)
-
+    compiled = torch.compile(forward, fullgraph=True) # covers no initial graph break (fullgraph)
     eager_out = forward(*eager_inputs)
-    compiled_out = compiled(*compiled_inputs)
+    with torch._dynamo.config.patch(error_on_recompile=True): # covers no graph break on replay
+        compiled_out = compiled(*compiled_inputs)
+        compiled(*compiled_inputs)
     ref_out = reference(*ref_inputs)
 
     tol = dict(rtol=2e-3, atol=2e-3, max_rel_l2=2e-3)
+    # fwd check
     _check(compiled_out, eager_out, **tol)
     _check(eager_out, ref_out, **tol)
     _check(compiled_out, ref_out, **tol)
 
+    # bwd check
     eager_grads = torch.autograd.grad(eager_out.sum(), (*eager_inputs, module.weight))
     compiled_grads = torch.autograd.grad(compiled_out.sum(), (*compiled_inputs, module.weight))
     ref_grads = torch.autograd.grad(ref_out.sum(), (*ref_inputs, ref_weight))
@@ -215,13 +202,13 @@ def test_rmsnorm_gated_fullgraph_forward_backward(fla, device, bsz, seq_len, d):
 
 @pytest.mark.parametrize(
     "name,mode,bsz,heads,head_dim,lengths",
-    _lin_attention_cases(LIN_ATTENTION),
+    _lin_attention_cases(LIN_ATTENTION, CI_INFERENCE),
 )
-def test_lin_attention_fullgraph_inference(
+def test_lin_attention_compiled_outputs_match_eager(
     fla, device, name, mode, bsz, heads, head_dim, lengths
 ):
     module = getattr(fla.layers, name)().eval()
-    tensors, state, kwargs = _lin_attention_case(
+    inputs, initial_state, kwargs = _lin_attention_case(
         name, device, mode, bsz, heads, head_dim, lengths
     )
 
@@ -233,20 +220,23 @@ def test_lin_attention_fullgraph_inference(
             **kwargs,
         )
 
-    compiled = torch.compile(forward, backend="inductor", fullgraph=True)
+    compiled = torch.compile(forward, fullgraph=True) # covers no initial graph break (fullgraph)
     with torch.inference_mode():
-        eager = forward(*tensors, state)
-        actual = compiled(*(x.clone() for x in tensors), state.clone())
+        eager = forward(*inputs, initial_state)
+        with torch._dynamo.config.patch(error_on_recompile=True): # covers no graph break on replay
+            actual = compiled(*(x.clone() for x in inputs), initial_state.clone())
+            compiled(*(x.clone() for x in inputs), initial_state.clone())
 
+    # fwd check
     for a, b in zip(actual, eager, strict=True):
         _check(a, b)
 
 
 @pytest.mark.parametrize(
     "name,mode,bsz,heads,head_dim,lengths",
-    _lin_attention_cases(TRAINABLE_LIN_ATTENTION),
+    _lin_attention_cases(TRAINABLE_LIN_ATTENTION, CI_TRAINING),
 )
-def test_lin_attention_fullgraph_forward_backward(
+def test_lin_attention_compiled_outputs_and_gradients_match_eager(
     fla, device, name, mode, bsz, heads, head_dim, lengths
 ):
     # XPU bug, also marked in transformers as incompatible
@@ -254,12 +244,17 @@ def test_lin_attention_fullgraph_forward_backward(
         pytest.skip("Chunk KDA backward is not supported on XPU")
 
     module = getattr(fla.layers, name)().train()
-    tensors, state, kwargs = _lin_attention_case(
+    inputs, initial_state, kwargs = _lin_attention_case(
         name, device, mode, bsz, heads, head_dim, lengths
     )
+
+    # Dummy input
+    eager_inputs = tuple(_leaf(x) for x in (*inputs, initial_state))
+    compiled_inputs = tuple(_leaf(x) for x in (*inputs, initial_state))
+
     head = nn.Linear(heads * head_dim, 32, bias=False).to(device)
-    targets = torch.randint(32, (bsz, tensors[0].shape[1]), device=device)
-    state_target = torch.randn_like(state) * 0.01
+    targets = torch.randint(32, (bsz, inputs[0].shape[1]), device=device)
+    state_target = torch.randn_like(initial_state) * 0.01
 
     def forward(q, k, v, g, beta, initial_state):
         y, final_state = module(
@@ -268,27 +263,29 @@ def test_lin_attention_fullgraph_forward_backward(
             output_final_state=True,
             **kwargs,
         )
-        residual = v + y
+        residual = v + y  # makes sure we dont have unintended inplace modifications (compile issue)
         logits = head(residual.float().flatten(2))
         return residual, logits, final_state
 
     def loss_fn(result):
         _, logits, final_state = result
-        # Mean token loss keeps gradient scale stable across sequence lengths
         return (
             F.cross_entropy(logits.reshape(-1, 32), targets.reshape(-1))
-            + 0.01 * (final_state.float() - state_target).square().sum()
+            + 0.01 * (final_state.float() - state_target).square().sum()  # just to make sure this could work
         )
 
-    eager_inputs = tuple(_leaf(x) for x in (*tensors, state))
-    compiled_inputs = tuple(_leaf(x) for x in (*tensors, state))
-    compiled = torch.compile(forward, backend="inductor", fullgraph=True)
 
+    compiled = torch.compile(forward, fullgraph=True) # covers no initial graph break (fullgraph)
     eager_out = forward(*eager_inputs)
-    compiled_out = compiled(*compiled_inputs)
+    with torch._dynamo.config.patch(error_on_recompile=True): # covers no graph break on replay
+        compiled_out = compiled(*compiled_inputs)
+        compiled(*compiled_inputs)
+
+    # fwd check
     for a, b in zip(compiled_out, eager_out, strict=True):
         _check(a, b)
 
+    # bwd check
     eager_grads = torch.autograd.grad(loss_fn(eager_out), (*eager_inputs, head.weight))
     compiled_grads = torch.autograd.grad(loss_fn(compiled_out), (*compiled_inputs, head.weight))
     for label, actual, expected in zip(
