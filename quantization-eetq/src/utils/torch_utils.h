@@ -6,10 +6,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <iostream>
-// Generates a conflict with CUDA 12.6 between nvtx 2 and 3. Does not
-// seem to be used anyway?
-//
+#ifndef NVTX_VERSION
 // #include <nvToolsExt.h>
+#endif
 #include <torch/custom_class.h>
 #include <torch/script.h>
 #include <vector>

@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "recipe": "sha256:b855ffd3c032a4932f30cc98940d6ce3992c2050ed320cd0e64833b56ebde87a",
+  "runner": "kernel-port 0.1.0",
+  "sources": {
+    "upstream": {
+      "repo": "https://github.com/NetEase-FuXi/EETQ.git",
+      "commit": "f3476354e1e129bea724aa00e1bcc8756a519de2"
+    }
+  },
+  "tree": "sha256:08266d84bbc8f028066915233e4b09acc52f730378dcfc77998852ce17dbc95f"
+}

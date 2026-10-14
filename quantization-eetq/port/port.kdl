@@ -1,0 +1,102 @@
+recipe version=1
+
+// Pin the exact clean upstream tree this recipe transforms.
+source \
+    repo="https://github.com/NetEase-FuXi/EETQ.git" \
+    commit="f3476354e1e129bea724aa00e1bcc8756a519de2"
+
+// Retain only the CUDA sources of the W8A16 GEMM/GEMV kernels. The Python
+// package, pybind module (eetpy.cpp), embedding/layernorm kernels and CMake
+// files are out of scope.
+prune keep="csrc/{cutlass_extensions,utils,weightOnlyBatchedGemv}/**,csrc/cutlass_kernels/**/*.{cc,cu,h}"
+
+// Lift the kernel sources out of csrc/.
+move from="csrc/cutlass_extensions" to="cutlass_extensions"
+move from="csrc/cutlass_kernels" to="cutlass_kernels"
+move from="csrc/utils" to="utils"
+move from="csrc/weightOnlyBatchedGemv" to="weightOnlyBatchedGemv"
+
+// The heuristic includes CUDA headers, so compile it with nvcc.
+move \
+    from="cutlass_kernels/cutlass_heuristic.cc" \
+    to="cutlass_kernels/cutlass_heuristic.cu"
+
+// Files rewritten locally are carried in the overlay. Guard the upstream text
+// each rewrite is based on, so upstream drift fails the run and the overlay
+// copy gets refreshed.
+//
+// ft_fused_activations.h: GELU_taylor is incomplete in CUTLASS 2.10, so the
+// overlay vendors a complete GELU_taylor_fixed in place of the upstream
+// GELU_taylor<float> specialization.
+expect \
+    in="cutlass_extensions/include/cutlass_extensions/epilogue/thread/ft_fused_activations.h" \
+    find="struct GELU_taylor<float> {" \
+    count=1
+
+// fpA_intB_gemm_wrapper.{cu,h}: Torch op schemas need const tensors, a
+// ScalarType instead of a pybind dtype object, and int64_t sizes.
+expect \
+    in="cutlass_kernels/fpA_intB_gemm_wrapper.{cu,h}" \
+    find="py::object &quant_type," \
+    count=2
+
+expect \
+    in="cutlass_kernels/fpA_intB_gemm_wrapper.h" \
+    find="const int k);" \
+    count=1
+
+// Point the GELU epilogue at the fixed activation.
+replace \
+    in="cutlass_extensions/include/cutlass_extensions/epilogue_helpers.h" \
+    find="thread::GELU_taylor," \
+    with="thread::GELU_taylor_fixed,"
+
+// torch/extension.h pulls in pybind11; torch/all.h is enough for ops
+// registered through TORCH_LIBRARY.
+replace \
+    in="utils/torch_utils.h" \
+    find="#include \"torch/extension.h\"" \
+    with="#include \"torch/all.h\""
+
+// nvToolsExt.h (NVTX 2) conflicts with the NVTX 3 headers of newer CUDA
+// toolkits and is not used.
+replace \
+    in="utils/torch_utils.h" \
+    find="#include <nvToolsExt.h>" \
+    with="// #include <nvToolsExt.h>"
+
+// Bindings, Python wrappers, docs and the locally rewritten sources above.
+overlay from="overlay"
+
+// Fail on new upstream sources so they get reviewed rather than silently
+// compiled in or dropped.
+expect in="cutlass_extensions/**" files=25
+expect in="cutlass_kernels/**" files=10
+expect in="utils/*" files=7
+expect in="weightOnlyBatchedGemv/*" files=14
+
+kernel \
+    name="weight_only_batched_gemv" \
+    backend="cuda" \
+    src="cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h,cutlass_extensions/include/cutlass_extensions/gemm/kernel/mixed_gemm_B_layout.h,weightOnlyBatchedGemv/*" \
+    include="cutlass_extensions/include" \
+    depends="cutlass_2_10,torch"
+
+// utils/cuda_utils.cc is not compiled: nothing in the kernels uses it.
+kernel \
+    name="cutlass_kernels" \
+    backend="cuda" \
+    src="cutlass_extensions/**,cutlass_kernels/**,weightOnlyBatchedGemv/{common,enabled}.h,utils/*.h,utils/logger.cc" \
+    include=".,utils,cutlass_extensions/include" \
+    depends="cutlass_2_10,torch"
+
+manifest \
+    name="quantization-eetq" \
+    version=1 \
+    edition=5 \
+    license="Apache-2.0" \
+    upstream="https://github.com/NetEase-FuXi/EETQ.git" \
+    backends="cuda" \
+    cuda_maxver="12.9" \
+    repo_id="kernels-community/quantization-eetq" \
+    torch_src="torch-ext/torch_binding.cpp,torch-ext/torch_binding.h"

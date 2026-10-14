@@ -3,6 +3,7 @@ name = "quantization-eetq"
 version = 1
 edition = 5
 license = "Apache-2.0"
+upstream = "https://github.com/NetEase-FuXi/EETQ.git"
 backends = ["cuda"]
 
 [general.cuda]
@@ -19,14 +20,11 @@ src = [
 
 [kernel.weight_only_batched_gemv]
 backend = "cuda"
-depends = [
-    "cutlass_2_10",
-    "torch",
-]
+depends = ["cutlass_2_10", "torch"]
 include = ["cutlass_extensions/include"]
 src = [
-    "cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h",
     "cutlass_extensions/include/cutlass_extensions/gemm/kernel/mixed_gemm_B_layout.h",
+    "cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h",
     "weightOnlyBatchedGemv/common.h",
     "weightOnlyBatchedGemv/enabled.h",
     "weightOnlyBatchedGemv/kernel.h",
@@ -45,15 +43,8 @@ src = [
 
 [kernel.cutlass_kernels]
 backend = "cuda"
-depends = [
-    "cutlass_2_10",
-    "torch",
-]
-include = [
-    ".",
-    "utils",
-    "cutlass_extensions/include",
-]
+depends = ["cutlass_2_10", "torch"]
+include = [".", "utils", "cutlass_extensions/include"]
 src = [
     "cutlass_extensions/include/cutlass_extensions/arch/mma.h",
     "cutlass_extensions/include/cutlass_extensions/compute_occupancy.h",
@@ -90,12 +81,12 @@ src = [
     "cutlass_kernels/fpA_intB_gemm/fpA_intB_gemm_template.h",
     "cutlass_kernels/fpA_intB_gemm_wrapper.cu",
     "cutlass_kernels/fpA_intB_gemm_wrapper.h",
-    "weightOnlyBatchedGemv/common.h",
-    "weightOnlyBatchedGemv/enabled.h",
     "utils/activation_types.h",
     "utils/cuda_utils.h",
     "utils/logger.cc",
     "utils/logger.h",
     "utils/string_utils.h",
     "utils/torch_utils.h",
+    "weightOnlyBatchedGemv/common.h",
+    "weightOnlyBatchedGemv/enabled.h",
 ]
