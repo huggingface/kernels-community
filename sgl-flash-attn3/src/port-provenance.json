@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "recipe": "sha256:853f508ecde9a9e543cfadce8c0af61894678288c1ce5f3c7de821325646a3c2",
+  "runner": "kernel-port 0.1.0",
+  "sources": {
+    "upstream": {
+      "repo": "https://github.com/sgl-project/sgl-flash-attn.git",
+      "commit": "224a674ddc489f4dee3510cfa4678e662524e099"
+    }
+  },
+  "tree": "sha256:b4bf788397b23b127a6b2978323a634f7670aeeb65112b594a59a18d21d8abe5"
+}

@@ -20,6 +20,12 @@ src = [
 
 [kernel.flash_attn_sm80]
 backend = "cuda"
+cxx-flags = [
+    "-DFLASHATTENTION_DISABLE_BACKWARD",
+    "-DFLASHATTENTION_DISABLE_DROPOUT",
+    "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+    "-DFLASHATTENTION_VARLEN_ONLY",
+]
 cuda-capabilities = ["8.0"]
 cuda-flags = [
     "-O3",
@@ -37,16 +43,7 @@ cuda-flags = [
     "-DFLASHATTENTION_DISABLE_UNEVEN_K",
     "-DFLASHATTENTION_VARLEN_ONLY",
 ]
-cxx-flags = [
-    "-DFLASHATTENTION_DISABLE_BACKWARD",
-    "-DFLASHATTENTION_DISABLE_DROPOUT",
-    "-DFLASHATTENTION_DISABLE_UNEVEN_K",
-    "-DFLASHATTENTION_VARLEN_ONLY",
-]
-depends = [
-    "torch",
-    "cutlass_4_0",
-]
+depends = ["torch", "cutlass_4_0"]
 include = ["flash-attn"]
 src = [
     "flash-attn/block.h",
@@ -54,21 +51,10 @@ src = [
     "flash-attn/epilogue_bwd.hpp",
     "flash-attn/epilogue_fwd.hpp",
     "flash-attn/flash.h",
-    "flash-attn/flash_fwd_launch_template.h",
     "flash-attn/flash_fwd_kernel_sm80.h",
     "flash-attn/flash_fwd_kernel_sm90.h",
+    "flash-attn/flash_fwd_launch_template.h",
     "flash-attn/heuristics.h",
-    "flash-attn/mainloop_fwd_sm80.hpp",
-    "flash-attn/mainloop_fwd_sm90_tma_gmma_ws.hpp",
-    "flash-attn/mask.h",
-    "flash-attn/named_barrier.hpp",
-    "flash-attn/pack_gqa.h",
-    "flash-attn/paged_kv.h",
-    "flash-attn/rotary.h",
-    "flash-attn/sm90_pipeline_no_cluster.hpp",
-    "flash-attn/softmax.h",
-    "flash-attn/tile_size.h",
-    "flash-attn/tile_scheduler.hpp",
     "flash-attn/instantiations/flash_fwd_hdim128_bf16_paged_sm80.cu",
     "flash-attn/instantiations/flash_fwd_hdim128_bf16_paged_softcap_sm80.cu",
     "flash-attn/instantiations/flash_fwd_hdim128_bf16_paged_softcapall_sm80.cu",
@@ -189,10 +175,27 @@ src = [
     "flash-attn/instantiations/flash_fwd_hdim96_fp16_split_sm80.cu",
     "flash-attn/instantiations/flash_fwd_hdim96_fp16_split_softcap_sm80.cu",
     "flash-attn/instantiations/flash_fwd_hdim96_fp16_split_softcapall_sm80.cu",
+    "flash-attn/mainloop_fwd_sm80.hpp",
+    "flash-attn/mainloop_fwd_sm90_tma_gmma_ws.hpp",
+    "flash-attn/mask.h",
+    "flash-attn/named_barrier.hpp",
+    "flash-attn/pack_gqa.h",
+    "flash-attn/paged_kv.h",
+    "flash-attn/rotary.h",
+    "flash-attn/sm90_pipeline_no_cluster.hpp",
+    "flash-attn/softmax.h",
+    "flash-attn/tile_scheduler.hpp",
+    "flash-attn/tile_size.h",
 ]
 
 [kernel.flash_attn_sm90]
 backend = "cuda"
+cxx-flags = [
+    "-DFLASHATTENTION_DISABLE_BACKWARD",
+    "-DFLASHATTENTION_DISABLE_DROPOUT",
+    "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+    "-DFLASHATTENTION_VARLEN_ONLY",
+]
 cuda-capabilities = ["9.0a"]
 cuda-flags = [
     "-O3",
@@ -210,16 +213,7 @@ cuda-flags = [
     "-DFLASHATTENTION_DISABLE_UNEVEN_K",
     "-DFLASHATTENTION_VARLEN_ONLY",
 ]
-cxx-flags = [
-    "-DFLASHATTENTION_DISABLE_BACKWARD",
-    "-DFLASHATTENTION_DISABLE_DROPOUT",
-    "-DFLASHATTENTION_DISABLE_UNEVEN_K",
-    "-DFLASHATTENTION_VARLEN_ONLY",
-]
-depends = [
-    "torch",
-    "cutlass_4_0",
-]
+depends = ["torch", "cutlass_4_0"]
 include = ["flash-attn"]
 src = [
     "flash-attn/block.h",
@@ -227,21 +221,10 @@ src = [
     "flash-attn/epilogue_bwd.hpp",
     "flash-attn/epilogue_fwd.hpp",
     "flash-attn/flash.h",
-    "flash-attn/flash_fwd_launch_template.h",
     "flash-attn/flash_fwd_kernel_sm80.h",
     "flash-attn/flash_fwd_kernel_sm90.h",
+    "flash-attn/flash_fwd_launch_template.h",
     "flash-attn/heuristics.h",
-    "flash-attn/mainloop_fwd_sm80.hpp",
-    "flash-attn/mainloop_fwd_sm90_tma_gmma_ws.hpp",
-    "flash-attn/mask.h",
-    "flash-attn/named_barrier.hpp",
-    "flash-attn/pack_gqa.h",
-    "flash-attn/paged_kv.h",
-    "flash-attn/rotary.h",
-    "flash-attn/sm90_pipeline_no_cluster.hpp",
-    "flash-attn/softmax.h",
-    "flash-attn/tile_size.h",
-    "flash-attn/tile_scheduler.hpp",
     "flash-attn/instantiations/flash_fwd_hdim128_bf16_packgqa_sm90.cu",
     "flash-attn/instantiations/flash_fwd_hdim128_bf16_paged_sm90.cu",
     "flash-attn/instantiations/flash_fwd_hdim128_bf16_paged_softcap_sm90.cu",
@@ -522,14 +505,28 @@ src = [
     "flash-attn/instantiations/flash_fwd_hdimdiff_fp16_softcap_sm90.cu",
     "flash-attn/instantiations/flash_fwd_hdimdiff_fp16_split_sm90.cu",
     "flash-attn/instantiations/flash_fwd_hdimdiff_fp16_split_softcap_sm90.cu",
+    "flash-attn/mainloop_fwd_sm80.hpp",
+    "flash-attn/mainloop_fwd_sm90_tma_gmma_ws.hpp",
+    "flash-attn/mask.h",
+    "flash-attn/named_barrier.hpp",
+    "flash-attn/pack_gqa.h",
+    "flash-attn/paged_kv.h",
+    "flash-attn/rotary.h",
+    "flash-attn/sm90_pipeline_no_cluster.hpp",
+    "flash-attn/softmax.h",
+    "flash-attn/tile_scheduler.hpp",
+    "flash-attn/tile_size.h",
 ]
 
 [kernel.flash_attn]
 backend = "cuda"
-cuda-capabilities = [
-    "8.0",
-    "9.0a",
+cxx-flags = [
+    "-DFLASHATTENTION_DISABLE_BACKWARD",
+    "-DFLASHATTENTION_DISABLE_DROPOUT",
+    "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+    "-DFLASHATTENTION_VARLEN_ONLY",
 ]
+cuda-capabilities = ["8.0", "9.0a"]
 cuda-flags = [
     "-O3",
     "-std=c++17",
@@ -546,23 +543,14 @@ cuda-flags = [
     "-DFLASHATTENTION_DISABLE_UNEVEN_K",
     "-DFLASHATTENTION_VARLEN_ONLY",
 ]
-cxx-flags = [
-    "-DFLASHATTENTION_DISABLE_BACKWARD",
-    "-DFLASHATTENTION_DISABLE_DROPOUT",
-    "-DFLASHATTENTION_DISABLE_UNEVEN_K",
-    "-DFLASHATTENTION_VARLEN_ONLY",
-]
-depends = [
-    "torch",
-    "cutlass_4_0",
-]
+depends = ["torch", "cutlass_4_0"]
 src = [
     "flash-attn/cuda_check.h",
+    "flash-attn/flash.h",
     "flash-attn/flash_api.cpp",
     "flash-attn/flash_fwd_combine.cu",
     "flash-attn/flash_fwd_combine_kernel.h",
     "flash-attn/flash_fwd_combine_launch_template.h",
-    "flash-attn/flash.h",
     "flash-attn/flash_prepare_scheduler.cu",
     "flash-attn/heuristics.h",
     "flash-attn/seqlen.h",
