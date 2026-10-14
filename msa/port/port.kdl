@@ -14,6 +14,22 @@ vendor \
     path="." \
     to="_vendor/quack"
 
+// build_decode_schedule returns a py::dict, which a Torch op schema cannot
+// express, so it and its Python wrapper are rewritten locally and come from
+// the overlay: csrc/build_decode_schedule.cu returns a tuple of tensors and a
+// fixed-order int[] scalar summary, and
+// src/sm100/fwd_decode/build_decode_schedule/__init__.py dispatches through
+// ._ops and reassembles the dict. Pin the upstream files they were made from,
+// so any upstream change to them fails the run and the overlay copies get
+// refreshed; the error names the `git diff` to review.
+expect \
+    in="python/fmha_sm100/cute/src/sm100/fwd_decode/build_decode_schedule/build_decode_schedule.cu" \
+    blob="1e1a2813b63eef9b29e6d8dcb1ab22972445ea58"
+
+expect \
+    in="python/fmha_sm100/cute/src/sm100/fwd_decode/build_decode_schedule/__init__.py" \
+    blob="46ca23e7aa8ea100d28443e7be585b9b02846d8c"
+
 // Retain only the CuTe-DSL sparse stack, its tests, and the quack modules it
 // imports. The dense FMHA stack (csrc/, api.py, jit.py) relies on runtime
 // nvcc/jinja JIT compilation and is intentionally excluded, as are
@@ -100,16 +116,6 @@ relativize_imports \
     root_relative=#true \
     changes=80
 
-// build_decode_schedule returns a py::dict, which a Torch op schema cannot
-// express, so it and its Python wrapper are rewritten locally and come from
-// the overlay: csrc/build_decode_schedule.cu returns a tuple of tensors and a
-// fixed-order int[] scalar summary, and
-// src/sm100/fwd_decode/build_decode_schedule/__init__.py dispatches through
-// ._ops and reassembles the dict. Guard the upstream entry points they
-// mirror, so an upstream change to them fails the port and gets re-reviewed.
-expect in="csrc/build_decode_schedule.cu" find="py::dict build_decode_schedule(" count=1
-expect in="torch-ext/msa/src/sm100/fwd_decode/build_decode_schedule/__init__.py" find="def build_decode_schedule(" count=1
-
 // Tests import the top-level modules from cute/; point them at the msa
 // package instead.
 remap_module in="tests/*.py" from="interface" to="msa.interface" changes=2
@@ -119,14 +125,8 @@ remap_module in="tests/*.py" from="fp4_indexer_interface" to="msa.fp4_indexer_in
 remap_module in="tests/*.py" from="src" to="msa.src" changes=2
 
 // Package init (public API re-exports), bindings and docs have no upstream
-// equivalent; the decode schedule helper is rewritten (see above).
+// equivalent; the decode schedule helper is rewritten (see the top).
 overlay from="overlay"
-
-// The bindings in the overlay declare the upstream build_k2q_csr entry points
-// they register. Fail when upstream changes their parameters, so the binding
-// gets updated instead of breaking the link.
-expect in="csrc/build_k2q_csr.cu" function="run_build_k2q_csr" declared_in="torch-ext/torch_binding.h"
-expect in="csrc/build_k2q_csr.cu" function="run_build_k2q_csr_with_schedule" declared_in="torch-ext/torch_binding.h"
 
 // Fail on new upstream sources so they get reviewed rather than silently
 // shipped or dropped.

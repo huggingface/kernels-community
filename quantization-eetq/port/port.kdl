@@ -5,6 +5,22 @@ source \
     repo="https://github.com/NetEase-FuXi/EETQ.git" \
     commit="f3476354e1e129bea724aa00e1bcc8756a519de2"
 
+// Files rewritten locally are carried in the overlay. Pin the upstream file
+// each copy was made from, so any upstream change to it fails the run and the
+// overlay copy gets refreshed; the error names the `git diff` to review.
+//
+// ft_fused_activations.h: GELU_taylor is incomplete in CUTLASS 2.10, so the
+// overlay vendors a complete GELU_taylor_fixed in place of the upstream
+// GELU_taylor<float> specialization.
+expect \
+    in="csrc/cutlass_extensions/include/cutlass_extensions/epilogue/thread/ft_fused_activations.h" \
+    blob="bd4fafbfb95c2f148a90a7eb3126c5486cdf6c51"
+
+// fpA_intB_gemm_wrapper.{cu,h}: Torch op schemas need const tensors, a
+// ScalarType instead of a pybind dtype object, and int64_t sizes.
+expect in="csrc/cutlass_kernels/fpA_intB_gemm_wrapper.cu" blob="8a12a215b5294ba8726209a32c597fa523f0b542"
+expect in="csrc/cutlass_kernels/fpA_intB_gemm_wrapper.h" blob="8176ff2d5eebe77050955f408fed2805d65237d5"
+
 // Retain only the CUDA sources of the W8A16 GEMM/GEMV kernels. The Python
 // package, pybind module (eetpy.cpp), embedding/layernorm kernels and CMake
 // files are out of scope.
@@ -20,30 +36,6 @@ move from="csrc/weightOnlyBatchedGemv" to="weightOnlyBatchedGemv"
 move \
     from="cutlass_kernels/cutlass_heuristic.cc" \
     to="cutlass_kernels/cutlass_heuristic.cu"
-
-// Files rewritten locally are carried in the overlay. Guard the upstream text
-// each rewrite is based on, so upstream drift fails the run and the overlay
-// copy gets refreshed.
-//
-// ft_fused_activations.h: GELU_taylor is incomplete in CUTLASS 2.10, so the
-// overlay vendors a complete GELU_taylor_fixed in place of the upstream
-// GELU_taylor<float> specialization.
-expect \
-    in="cutlass_extensions/include/cutlass_extensions/epilogue/thread/ft_fused_activations.h" \
-    find="struct GELU_taylor<float> {" \
-    count=1
-
-// fpA_intB_gemm_wrapper.{cu,h}: Torch op schemas need const tensors, a
-// ScalarType instead of a pybind dtype object, and int64_t sizes.
-expect \
-    in="cutlass_kernels/fpA_intB_gemm_wrapper.{cu,h}" \
-    find="py::object &quant_type," \
-    count=2
-
-expect \
-    in="cutlass_kernels/fpA_intB_gemm_wrapper.h" \
-    find="const int k);" \
-    count=1
 
 // Point the GELU epilogue at the fixed activation.
 rewrite \

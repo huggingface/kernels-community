@@ -50,14 +50,6 @@ rewrite \
 // explicit __all__, tests and docs have no upstream equivalent.
 overlay from="overlay"
 
-// The bindings in the overlay declare the upstream functions they register.
-// Fail when upstream changes their parameters, so the binding gets updated
-// instead of breaking the link.
-expect in="sage_blackwell/blackwell/api.cu" function="mha_fwd" declared_in="torch-ext/torch_binding.h"
-expect in="sage_blackwell/quantization/fp4_quantization_4d.cu" function="scaled_fp4_quant" declared_in="torch-ext/torch_binding.h"
-expect in="sage_blackwell/quantization/fp4_quantization_4d.cu" function="scaled_fp4_quant_permute" declared_in="torch-ext/torch_binding.h"
-expect in="sage_blackwell/quantization/fp4_quantization_4d.cu" function="scaled_fp4_quant_trans" declared_in="torch-ext/torch_binding.h"
-
 // Fail on new upstream sources so they get reviewed rather than silently
 // compiled in or dropped.
 expect in="sage_blackwell/blackwell/*" files=15

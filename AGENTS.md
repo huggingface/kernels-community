@@ -354,9 +354,11 @@ out the following steps:
   `torch/all.h`, no pybind11, its wrapper's JIT `load` → `._ops`).
   `build_decode_schedule` is carried in the overlay, because it returns a
   tuple of tensors plus a fixed-order `int[]` scalar summary instead of a
-  `py::dict`; when syncing, diff the upstream `.cu` and its Python wrapper
-  under `src/sm100/fwd_decode/build_decode_schedule/` against the overlay
-  copies and keep the public signatures in sync with upstream.
+  `py::dict`. The recipe pins the upstream `.cu` and its Python wrapper
+  under `src/sm100/fwd_decode/build_decode_schedule/` by git blob id; when a
+  pin fails, review the `git diff` it prints, carry the change into the
+  overlay copies, keep the public signatures in sync with upstream, and
+  update the `blob=` value.
 - Check in `python/fmha_sm100/cute/requirements.txt` (or the upstream
   `pyproject.toml`) which version of quack is required.
 - Get this version of quack from https://github.com/Dao-AILab/quack.git
