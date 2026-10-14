@@ -3,13 +3,10 @@ name = "sage-blackwell"
 version = 1
 edition = 5
 license = "Apache-2.0"
-backends = ["cuda"]
 upstream = "https://github.com/thu-ml/SageAttention.git"
+backends = ["cuda"]
 
 [general.cuda]
-# SageAttention3 requires CUDA >= 12.8: the FP4 attention kernel targets
-# sm_120a (consumer Blackwell) and uses the SM120 blockscaled NVFP4 MMA,
-# which older toolkits cannot compile.
 minver = "12.8"
 
 [general.hub]
@@ -36,7 +33,6 @@ cuda-flags = [
     "--expt-extended-lambda",
     "--use_fast_math",
     "--threads=1",
-    # Important, otherwise performance is severely impacted (upstream note).
     "-DNDEBUG",
 ]
 depends = ["torch", "cutlass_4_5"]
@@ -77,6 +73,6 @@ cuda-flags = [
 depends = ["torch"]
 include = ["."]
 src = [
-    "sage_blackwell/quantization/fp4_quantization_4d.cu",
     "sage_blackwell/quantization/cuda_utils.h",
+    "sage_blackwell/quantization/fp4_quantization_4d.cu",
 ]

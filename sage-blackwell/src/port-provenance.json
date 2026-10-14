@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "recipe": "sha256:2ba098175b7538c4e4e7feb8213ef8b1ebe7d9faad032503435a02eaef4645b5",
+  "runner": "kernel-port 0.1.0",
+  "sources": {
+    "upstream": {
+      "repo": "https://github.com/thu-ml/SageAttention.git",
+      "commit": "d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5"
+    }
+  },
+  "tree": "sha256:677c1e7fbee7426581ee533e7eb7cb909fc66e580a02cc4baa34632e296113ff"
+}

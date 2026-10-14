@@ -1,0 +1,114 @@
+recipe version=1
+
+// Pin the exact clean upstream tree this recipe transforms. SageAttention3
+// shares its repository with sage-attention; tags lag main, so pin a commit.
+source \
+    repo="https://github.com/thu-ml/SageAttention.git" \
+    commit="d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5"
+
+// Retain only the SageAttention3 CUDA sources and Python API. setup.py and the
+// upstream README are out of scope; CUTLASS comes from the builder.
+prune keep="sageattention3_blackwell/sageattn3/api.py,sageattention3_blackwell/sageattn3/blackwell/*.{cu,h},sageattention3_blackwell/sageattn3/quantization/{fp4_quantization_4d.cu,cuda_utils.h}"
+
+// Place the CUDA sources in the kernel source tree.
+move \
+    from="sageattention3_blackwell/sageattn3/blackwell" \
+    to="sage_blackwell/blackwell"
+
+move \
+    from="sageattention3_blackwell/sageattn3/quantization" \
+    to="sage_blackwell/quantization"
+
+// Place the Python API in the torch extension tree.
+move \
+    from="sageattention3_blackwell/sageattn3" \
+    to="torch-ext/sage_blackwell"
+
+// Ops are registered in torch-ext/torch_binding.cpp instead of pybind11: drop
+// the trailing PYBIND11_MODULE blocks and the Python-only Torch headers.
+strip_suffix \
+    in="sage_blackwell/blackwell/api.cu" \
+    files=1 \
+    suffix="\n\n\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {\n    m.doc() = \"FlashAttention\";\n    m.def(\"fwd\", &mha_fwd, \"Forward pass\");\n}\n"
+
+strip_suffix \
+    in="sage_blackwell/quantization/fp4_quantization_4d.cu" \
+    files=1 \
+    suffix="\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {\n  m.def(\"scaled_fp4_quant\", &scaled_fp4_quant);\n  m.def(\"scaled_fp4_quant_permute\", &scaled_fp4_quant_permute);\n  m.def(\"scaled_fp4_quant_trans\", &scaled_fp4_quant_trans);\n}"
+
+replace \
+    in="sage_blackwell/blackwell/api.cu" \
+    find="#include <torch/python.h>" \
+    with="#include <torch/all.h>"
+
+replace \
+    in="sage_blackwell/{blackwell/api.cu,quantization/fp4_quantization_4d.cu}" \
+    find="#include <torch/nn/functional.h>\n" \
+    with="" \
+    count=2
+
+replace \
+    in="sage_blackwell/quantization/fp4_quantization_4d.cu" \
+    find="#include <torch/python.h>\n" \
+    with=""
+
+expect in="sage_blackwell/**" find="pybind11" count=0
+expect in="sage_blackwell/**" find="PYBIND11" count=0
+
+// A Torch schema `Tensor?` cannot bind to a mutable reference.
+replace \
+    in="sage_blackwell/blackwell/api.cu" \
+    find="c10::optional<at::Tensor> &out_," \
+    with="std::optional<at::Tensor> out_,"
+
+// Resolve the pybind extension modules to the kernel's Torch op aliases.
+replace \
+    in="torch-ext/sage_blackwell/api.py" \
+    find="import fp4attn_cuda\n" \
+    with="from . import sm120_compile as fp4attn_cuda\n"
+
+replace \
+    in="torch-ext/sage_blackwell/api.py" \
+    find="import fp4quant_cuda\n" \
+    with="from . import sm120_compile as fp4quant_cuda\n"
+
+// Bindings, sm120_compile.py (op aliases and fake registrations), the package
+// init with its explicit __all__, tests and docs have no upstream equivalent.
+overlay from="overlay"
+
+// Fail on new upstream sources so they get reviewed rather than silently
+// compiled in or dropped.
+expect in="sage_blackwell/blackwell/*" files=15
+expect in="sage_blackwell/quantization/*" files=2
+
+// sm_120a only: the MMA atom is gated behind the sm_120a/sm_121a feature set,
+// and 12.1 is not a kernel-builder capability.
+kernel \
+    name="_fp4attn" \
+    backend="cuda" \
+    src="sage_blackwell/blackwell/*" \
+    include="." \
+    depends="torch,cutlass_4_5" \
+    capabilities="12.0a" \
+    cuda_flags="-O3,-U__CUDA_NO_HALF_OPERATORS__,-U__CUDA_NO_HALF_CONVERSIONS__,-U__CUDA_NO_BFLOAT16_OPERATORS__,-U__CUDA_NO_BFLOAT16_CONVERSIONS__,-U__CUDA_NO_BFLOAT162_OPERATORS__,-U__CUDA_NO_BFLOAT162_CONVERSIONS__,--expt-relaxed-constexpr,--expt-extended-lambda,--use_fast_math,--threads=1,-DNDEBUG"
+
+kernel \
+    name="_fp4quant" \
+    backend="cuda" \
+    src="sage_blackwell/quantization/*" \
+    include="." \
+    depends="torch" \
+    capabilities="12.0a" \
+    cuda_flags="-O3,-U__CUDA_NO_HALF_OPERATORS__,-U__CUDA_NO_HALF_CONVERSIONS__,-U__CUDA_NO_BFLOAT16_OPERATORS__,-U__CUDA_NO_BFLOAT16_CONVERSIONS__,--expt-relaxed-constexpr,--expt-extended-lambda,--use_fast_math,--threads=1,-DNDEBUG"
+
+// CUDA >= 12.8 is required for the FP4 MMA and the e2m1 conversion PTX.
+manifest \
+    name="sage-blackwell" \
+    version=1 \
+    edition=5 \
+    license="Apache-2.0" \
+    upstream="https://github.com/thu-ml/SageAttention.git" \
+    backends="cuda" \
+    cuda_minver="12.8" \
+    repo_id="SageAttention/sage-blackwell" \
+    torch_src="torch-ext/torch_binding.cpp,torch-ext/torch_binding.h"

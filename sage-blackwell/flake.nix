@@ -9,6 +9,6 @@
     { self, kernel-builder }:
     kernel-builder.lib.genKernelFlakeOutputs {
       inherit self;
-      path = ./.;
+      path = ./src;
     };
 }
