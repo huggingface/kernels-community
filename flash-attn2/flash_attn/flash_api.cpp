@@ -22,6 +22,7 @@
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
+#include <torch/csrc/stable/c/shim.h>
 
 // Declare the CUDA stream function that's behind #ifdef USE_CUDA in shim.h
 extern "C" AOTITorchError aoti_torch_get_current_cuda_stream(int32_t device_index, void** ret_stream);
@@ -366,6 +367,59 @@ std::tuple<Tensor, Tensor> set_params_splitkv(Flash_fwd_params &params, const in
     return std::make_tuple(softmax_lse_accum, out_accum);
 }
 
+// Philox seed/offset for one dropout forward pass. The stable ABI cannot read the CUDA
+// generator directly, so two routes are used, both through the stable dispatcher:
+//
+// 1. A generator arrived in the `Generator? gen_` slot (possible on Torch >= 2.13 runtimes;
+//    the Python wrappers pass the default generator there whenever the runtime allows it).
+//    `inductor_prims::inductor_reserve_rng_state(gen, increment)` then returns the generator's
+//    seed and current offset as device tensors and advances the offset by `increment`, which
+//    is exactly what ATen's `philox_cuda_state(increment)` did in the non-stable build. Dropout
+//    masks are therefore bit-identical to that build and to upstream flash-attn.
+// 2. No generator (Torch 2.10-2.12 runtimes cannot pass one through the stable ABI): fill an
+//    int64[2] device tensor with `aten::random_`, which consumes the default generator like any
+//    other Torch RNG op. Reproducible under `torch.manual_seed`, correct under activation
+//    checkpointing and graph capture, but the masks differ from the non-stable build.
+//
+// In both cases the kernel reads seed and offset on device via the pointer form of
+// PhiloxCudaState, so there is no host sync. Without dropout the generator is left untouched,
+// as in the non-stable build.
+void set_params_philox(Flash_fwd_params &params, std::vector<Tensor> &keep_alive, const Tensor &ref,
+                       const float p_dropout, StableIValue generator_slot, int64_t counter_offset) {
+    if (p_dropout <= 0.f) { return; }
+    const bool has_generator = torch::stable::detail::to<StableIValue *>(generator_slot) != nullptr;
+    if (has_generator) {
+        std::array<StableIValue, 3> stack = {generator_slot, torch::stable::detail::from(counter_offset), StableIValue{}};
+        TORCH_ERROR_CODE_CHECK(torch_call_dispatcher("inductor_prims::inductor_reserve_rng_state", "", stack.data(), TORCH_ABI_VERSION));
+        Tensor seed = torch::stable::detail::to<Tensor>(stack[0]);
+        Tensor offset = torch::stable::detail::to<Tensor>(stack[1]);
+        Tensor offset_intragraph = torch::stable::detail::to<Tensor>(stack[2]);
+        STD_TORCH_CHECK(seed.is_cuda() && offset.is_cuda() && seed.numel() == 1 && offset.numel() == 1 &&
+                        seed.scalar_type() == torch::headeronly::ScalarType::Long &&
+                        offset.scalar_type() == torch::headeronly::ScalarType::Long,
+                        "unexpected result from inductor_reserve_rng_state");
+        // The intra-graph offset is a CPU scalar (0 outside graph capture).
+        uint32_t intragraph = 0;
+        if (!offset_intragraph.is_cuda()) {
+            intragraph = static_cast<uint32_t>(*static_cast<int64_t *>(offset_intragraph.data_ptr()));
+        }
+        params.philox_args = FLASH_NAMESPACE::PhiloxCudaState(
+            static_cast<int64_t *>(seed.data_ptr()), static_cast<int64_t *>(offset.data_ptr()), intragraph);
+        keep_alive.push_back(seed);
+        keep_alive.push_back(offset);
+        return;
+    }
+    Tensor seed_offset = torch::stable::new_empty(ref, {2}, torch::headeronly::ScalarType::Long);
+    std::array<StableIValue, 2> stack = {
+        torch::stable::detail::from(seed_offset),
+        torch::stable::detail::from(std::nullopt)};  // Generator? generator: the default CUDA generator
+    TORCH_ERROR_CODE_CHECK(torch_call_dispatcher("aten::random_", "", stack.data(), TORCH_ABI_VERSION));
+    (void)torch::stable::detail::to<Tensor>(stack[0]);  // release the returned Tensor(a!) handle
+    int64_t *ptr = static_cast<int64_t *>(seed_offset.data_ptr());
+    params.philox_args = FLASH_NAMESPACE::PhiloxCudaState(ptr, ptr + 1, /*offset_intragraph=*/0);
+    keep_alive.push_back(seed_offset);
+}
+
 void set_params_alibi(Flash_fwd_params &params, std::optional<Tensor> &alibi_slopes_, int batch_size, int num_heads){
 #ifdef FLASHATTENTION_DISABLE_ALIBI
     STD_TORCH_CHECK(!alibi_slopes_.has_value(), "This flash attention build does not support alibi.");
@@ -399,7 +453,8 @@ mha_fwd(Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple
         int window_size_left,
         int window_size_right,
         const float softcap,
-        const bool return_softmax) {
+        const bool return_softmax,
+        StableIValue generator_slot) {  // boxed `Generator? gen_`, see set_params_philox
 
     // Otherwise the kernel will be launched from cuda:0 device
     auto device_guard = make_device_guard(q);
@@ -523,8 +578,10 @@ mha_fwd(Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple
     // Forward kernel will populate memory with the seed and offset.
     params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
-    STD_TORCH_CHECK(p_dropout == 0.0, "flash-attn2 stable-ABI build does not support dropout (p_dropout > 0).");
-    (void)counter_offset;
+    // Seed and offset come from the Torch CUDA generator, see set_params_philox. The tensors
+    // they live in are kept alive until the kernel has been launched.
+    std::vector<Tensor> philox_tensors;
+    set_params_philox(params, philox_tensors, q, p_dropout, generator_slot, counter_offset);
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
 
@@ -568,7 +625,8 @@ mha_varlen_fwd(Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{
                int window_size_left,
                int window_size_right,
                const float softcap,
-               const bool return_softmax) {
+               const bool return_softmax,
+               StableIValue generator_slot) {  // boxed `Generator? gen_`, see set_params_philox
 
     // Otherwise the kernel will be launched from cuda:0 device
     auto device_guard = make_device_guard(q);
@@ -760,8 +818,10 @@ mha_varlen_fwd(Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{
     // Forward kernel will populate memory with the seed and offset.
     params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
-    STD_TORCH_CHECK(p_dropout == 0.0, "flash-attn2 stable-ABI build does not support dropout (p_dropout > 0).");
-    (void)counter_offset;
+    // Seed and offset come from the Torch CUDA generator, see set_params_philox. The tensors
+    // they live in are kept alive until the kernel has been launched.
+    std::vector<Tensor> philox_tensors;
+    set_params_philox(params, philox_tensors, q, p_dropout, generator_slot, counter_offset);
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
 
@@ -977,7 +1037,7 @@ mha_bwd(const Tensor &dout,  // batch_size x seqlen_q x num_heads, x multiple_of
     if ( rng_state.has_value() ) {
         params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
     } else {
-        STD_TORCH_CHECK(!is_dropout, "flash-attn2 stable-ABI build does not support dropout backward without a saved rng_state.");
+        STD_TORCH_CHECK(!is_dropout, "dropout backward requires the rng_state returned by the forward pass.");
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
@@ -1206,7 +1266,7 @@ mha_varlen_bwd(const Tensor &dout,  // total_q x num_heads, x head_size
     if ( rng_state.has_value() ) {
         params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
     } else {
-        STD_TORCH_CHECK(!is_dropout, "flash-attn2 stable-ABI build does not support dropout backward without a saved rng_state.");
+        STD_TORCH_CHECK(!is_dropout, "dropout backward requires the rng_state returned by the forward pass.");
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
@@ -1518,16 +1578,11 @@ mha_fwd_kvcache(Tensor &q,                 // batch_size x seqlen_q x num_heads 
 // result tuple back.
 
 namespace {
-// The `Generator? gen_` slot is kept in the schema to match the non-stable
-// bindings, but the stable ABI does not expose the CUDA RNG generator, so
-// dropout (its only consumer) is unsupported here. Reject a caller-supplied
-// generator instead of silently ignoring it. An optional boxes to a
-// `StableIValue*` that is null exactly when the argument is None, so the slot
-// can be tested without naming the unavailable Generator type.
+// The backward never needs a generator (it replays the forward's rng_state). An optional
+// boxes to a `StableIValue*` that is null exactly when the argument is None.
 void check_no_generator(StableIValue gen_slot) {
     STD_TORCH_CHECK(to<StableIValue*>(gen_slot) == nullptr,
-                    "This flash attention build does not support passing a generator: "
-                    "the RNG generator is not exposed by the Torch stable ABI.");
+                    "flash-attn2 backward does not take a generator; pass the forward's rng_state instead.");
 }
 } // namespace
 
@@ -1544,13 +1599,13 @@ void boxed_mha_fwd(StableIValue* stack, uint64_t num_args, uint64_t num_outputs)
     int64_t window_size_right = to<int64_t>(stack[9]);
     double softcap = to<double>(stack[10]);
     bool return_softmax = to<bool>(stack[11]);
-    check_no_generator(stack[12]);  // Generator? gen_
+    StableIValue generator_slot = stack[12];  // Generator? gen_, consumed by set_params_philox
 
     auto out = FLASH_NAMESPACE::mha_fwd(
         q, k, v, out_, alibi_slopes_,
         static_cast<float>(p_dropout), static_cast<float>(softmax_scale), is_causal,
         static_cast<int>(window_size_left), static_cast<int>(window_size_right),
-        static_cast<float>(softcap), return_softmax);
+        static_cast<float>(softcap), return_softmax, generator_slot);
 
     stack[0] = from(out[0]);
     stack[1] = from(out[1]);
@@ -1579,14 +1634,14 @@ void boxed_mha_varlen_fwd(StableIValue* stack, uint64_t num_args, uint64_t num_o
     int64_t window_size_right = to<int64_t>(stack[17]);
     double softcap = to<double>(stack[18]);
     bool return_softmax = to<bool>(stack[19]);
-    check_no_generator(stack[20]);  // Generator? gen_
+    StableIValue generator_slot = stack[20];  // Generator? gen_, consumed by set_params_philox
 
     auto out = FLASH_NAMESPACE::mha_varlen_fwd(
         q, k, v, out_, cu_seqlens_q, cu_seqlens_k, seqused_k, leftpad_k_, block_table_,
         alibi_slopes_, static_cast<int>(max_seqlen_q), static_cast<int>(max_seqlen_k),
         static_cast<float>(p_dropout), static_cast<float>(softmax_scale), zero_tensors, is_causal,
         static_cast<int>(window_size_left), static_cast<int>(window_size_right),
-        static_cast<float>(softcap), return_softmax);
+        static_cast<float>(softcap), return_softmax, generator_slot);
 
     stack[0] = from(out[0]);
     stack[1] = from(out[1]);

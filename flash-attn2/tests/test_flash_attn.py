@@ -8,7 +8,7 @@ from einops import rearrange, repeat
 
 from .bert_padding import pad_input, unpad_input
 
-flash_attn2 = kernels.get_kernel("kernels-community/flash-attn2", version=3)
+flash_attn2 = kernels.get_kernel("kernels-community/flash-attn2", version=4)
 
 flash_attn_func = flash_attn2.flash_attn_func
 flash_attn_kvpacked_func = flash_attn2.flash_attn_kvpacked_func
