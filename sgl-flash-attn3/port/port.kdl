@@ -22,6 +22,11 @@ move \
 // docs have no upstream equivalent.
 overlay from="overlay"
 
+// The bindings in the overlay declare the upstream entry point they register.
+// Fail when upstream changes its parameters, so the binding gets updated
+// instead of breaking the link.
+expect in="flash-attn/flash_api.cpp" function="mha_fwd" declared_in="torch-ext/torch_binding.h"
+
 // Fail on new upstream instantiations so they get reviewed rather than
 // silently compiled in or dropped.
 expect in="flash-attn/instantiations/*_sm80.cu" files=120

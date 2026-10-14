@@ -122,6 +122,12 @@ remap_module in="tests/*.py" from="src" to="msa.src" changes=2
 // equivalent; the decode schedule helper is rewritten (see above).
 overlay from="overlay"
 
+// The bindings in the overlay declare the upstream build_k2q_csr entry points
+// they register. Fail when upstream changes their parameters, so the binding
+// gets updated instead of breaking the link.
+expect in="csrc/build_k2q_csr.cu" function="run_build_k2q_csr" declared_in="torch-ext/torch_binding.h"
+expect in="csrc/build_k2q_csr.cu" function="run_build_k2q_csr_with_schedule" declared_in="torch-ext/torch_binding.h"
+
 // Fail on new upstream sources so they get reviewed rather than silently
 // shipped or dropped.
 expect in="torch-ext/msa/**/*.py" files=46
