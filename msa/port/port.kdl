@@ -60,27 +60,19 @@ move \
 // empty rather than importing upstream's full module set.
 ensure_init under="torch-ext/msa/quack" changes=1
 
-// `import quack.activation` binds the top-level package, so convert_import
-// rejects it and it has no relative form; import the module instead.
-rewrite \
-    in="torch-ext/msa/src/common/utils.py" \
-    pattern="import quack.activation" \
-    with="from quack import activation" \
-    changes=1
-
-rewrite \
-    in="torch-ext/msa/src/common/utils.py" \
-    pattern="quack.activation." \
-    with="activation." \
-    changes=2
-
 // Upstream runs with cute/ on sys.path, importing `src` and `quack` as
 // top-level packages. Move both under the kernel package, then make every
-// intra-package import relative.
+// intra-package import relative. `import`s have no relative form, so turn
+// them into from-imports first.
 convert_import \
     in="torch-ext/msa/**" \
     prefix="src" \
     changes=2
+
+convert_import \
+    in="torch-ext/msa/**" \
+    prefix="quack" \
+    changes=1
 
 remap_module \
     in="torch-ext/msa/**" \
@@ -123,9 +115,7 @@ expect in="torch-ext/msa/src/sm100/fwd_decode/build_decode_schedule/__init__.py"
 
 // Tests import the top-level modules from cute/; point them at the msa
 // package instead.
-remap_module in="tests/*.py" from="interface" to="msa.interface" changes=1
-// remap_module and convert_import do not handle a bare `import X as Y`.
-rewrite in="tests/test_sparse_atten.py" pattern="import interface as sparse_interface" with="import msa.interface as sparse_interface" changes=1
+remap_module in="tests/*.py" from="interface" to="msa.interface" changes=2
 remap_module in="tests/*.py" from="sparse_index_utils" to="msa.sparse_index_utils" changes=1
 remap_module in="tests/*.py" from="quantize" to="msa.quantize" changes=3
 remap_module in="tests/*.py" from="fp4_indexer_interface" to="msa.fp4_indexer_interface" changes=1

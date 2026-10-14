@@ -90,10 +90,10 @@ rewrite \
     changes=1
 
 // The schema check is cheap; run it in CI next to test_kernels_ci.py.
-rewrite \
+mark_tests \
     in="tests/test_flash_attn.py" \
-    pattern="def test_flash3_bw_compatibility(" \
-    with="@pytest.mark.kernels_ci\ndef test_flash3_bw_compatibility(" \
+    marker="kernels_ci" \
+    only="test_flash3_bw_compatibility" \
     changes=1
 
 remap_module \

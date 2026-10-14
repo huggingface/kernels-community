@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "recipe": "sha256:572ef7075755896a7191d38f18dd64738a7f5161149eead9bb38fd2a1a7fd17d",
+  "recipe": "sha256:3fd3ee3d8c412c914153cfac0364d7227ddd703c7c76e466927de8c7de9e00d0",
   "runner": "kernel-port 0.1.0",
   "sources": {
     "quack": {
