@@ -27,10 +27,12 @@ def assert_close(actual, expected, dtype):
     )
 
 
+@torch._dynamo.config.patch(error_on_recompile=True)
 def check_compiled(fn, args, dtype, backward=True, **kwargs):
     """Compare `fn` compiled with `fullgraph=True` against eager on fresh copies of `args`.
 
-    Inputs are compared as well as outputs, since some ops update a state argument in place.
+    Compare outputs and input gradients (when backward=True), plus inputs themselves
+    since some ops update a state argument in place.
     """
     compiled = torch.compile(fn, fullgraph=True)
     try:

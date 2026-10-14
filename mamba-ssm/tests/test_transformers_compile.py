@@ -20,7 +20,8 @@ class LoadedLayer:
         return getattr(kernel.layers, self.layer_name)
 
 
-# Mamba2 compiles are expensive, so CI only runs the Mamba cases of these tests.
+# Mamba2 Triton compilation is expensive; its model cases and the direct SSD tests
+# in test_compile.py run in the full suite, outside kernels_ci.
 @pytest.fixture(params=[pytest.param("mamba", marks=pytest.mark.kernels_ci), "mamba2"])
 def model(request):
     transformers = pytest.importorskip("transformers")
@@ -67,13 +68,9 @@ def assert_close(actual, expected, dtype):
     )
 
 
-@pytest.mark.parametrize("dtype,autocast,use_cache", [
-    (torch.float32, False, False), (torch.bfloat16, False, False), (torch.float32, True, False),
-    # A cache makes the mixers take the separate convolution and scan ops instead of the fused one.
-    (torch.float32, False, True), (torch.bfloat16, False, True),
-])
-def test_transformers_compile_training(model, dtype, autocast, use_cache):
-    eager = kernelize(model.to(dtype).train())
+@torch._dynamo.config.patch(error_on_recompile=True)
+def check_compiled_training(model, forward, dtype):
+    eager = kernelize(model.train())
     compiled = copy.deepcopy(eager)
     compiled.forward = torch.compile(compiled.forward, fullgraph=True)
     try:
@@ -82,19 +79,38 @@ def test_transformers_compile_training(model, dtype, autocast, use_cache):
             ids = torch.randint(0, 64, (2, 33), device="cuda")
             compiled.zero_grad(set_to_none=True)
             eager.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
-                actual = compiled(ids, use_cache=use_cache).logits
+
+            actual = forward(compiled, ids)
             actual.float().square().mean().backward()
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
-                expected = eager(ids, use_cache=use_cache).logits
+
+            expected = forward(eager, ids)
             expected.float().square().mean().backward()
-            comparison_dtype = torch.bfloat16 if autocast else dtype
-            assert_close(actual, expected, comparison_dtype)
+
+            assert_close(actual, expected, dtype)
             for (name, param), (_, ref) in zip(compiled.named_parameters(), eager.named_parameters()):
                 assert param.grad is not None and ref.grad is not None, name
-                assert_close(param.grad, ref.grad, comparison_dtype)
+                assert_close(param.grad, ref.grad, dtype)
     finally:
         torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("use_cache", [False, True])
+def test_transformers_compile_training(model, dtype, use_cache):
+    # A cache exercises separate convolution and scan ops instead of the fused path.
+    def forward(model, ids):
+        return model(ids, use_cache=use_cache).logits
+
+    check_compiled_training(model.to(dtype), forward, dtype)
+
+
+def test_transformers_compile_training_autocast(model):
+    # FP32 parameters with BF16 autocast exercise mixed bias/weight dtypes.
+    def forward(model, ids):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            return model(ids, use_cache=False).logits
+
+    check_compiled_training(model.float(), forward, torch.bfloat16)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
