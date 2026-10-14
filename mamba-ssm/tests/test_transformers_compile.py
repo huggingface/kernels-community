@@ -20,7 +20,8 @@ class LoadedLayer:
         return getattr(kernel.layers, self.layer_name)
 
 
-@pytest.fixture(params=["mamba", "mamba2"])
+# Mamba2 compiles are expensive, so CI only runs the Mamba cases of these tests.
+@pytest.fixture(params=[pytest.param("mamba", marks=pytest.mark.kernels_ci), "mamba2"])
 def model(request):
     transformers = pytest.importorskip("transformers")
     common = dict(
@@ -32,7 +33,7 @@ def model(request):
         cls = transformers.MambaForCausalLM
     else:
         config = transformers.Mamba2Config(
-            **common, num_heads=4, head_dim=16, n_groups=1, chunk_size=16,
+            **common, num_heads=8, head_dim=8, n_groups=1, chunk_size=16,
         )
         cls = transformers.Mamba2ForCausalLM
     torch.manual_seed(0)
@@ -66,10 +67,12 @@ def assert_close(actual, expected, dtype):
     )
 
 
-@pytest.mark.parametrize("dtype,autocast", [
-    (torch.float32, False), (torch.bfloat16, False), (torch.float32, True),
+@pytest.mark.parametrize("dtype,autocast,use_cache", [
+    (torch.float32, False, False), (torch.bfloat16, False, False), (torch.float32, True, False),
+    # A cache makes the mixers take the separate convolution and scan ops instead of the fused one.
+    (torch.float32, False, True), (torch.bfloat16, False, True),
 ])
-def test_transformers_compile_training(model, dtype, autocast):
+def test_transformers_compile_training(model, dtype, autocast, use_cache):
     eager = kernelize(model.to(dtype).train())
     compiled = copy.deepcopy(eager)
     compiled.forward = torch.compile(compiled.forward, fullgraph=True)
@@ -80,10 +83,10 @@ def test_transformers_compile_training(model, dtype, autocast):
             compiled.zero_grad(set_to_none=True)
             eager.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
-                actual = compiled(ids, use_cache=False).logits
+                actual = compiled(ids, use_cache=use_cache).logits
             actual.float().square().mean().backward()
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
-                expected = eager(ids, use_cache=False).logits
+                expected = eager(ids, use_cache=use_cache).logits
             expected.float().square().mean().backward()
             comparison_dtype = torch.bfloat16 if autocast else dtype
             assert_close(actual, expected, comparison_dtype)
@@ -116,5 +119,28 @@ def test_transformers_compile_cached_decode(model, dtype):
                     assert states.keys() == ref_states.keys()
                     for key in states:
                         assert_close(states[key], ref_states[key], dtype)
+    finally:
+        torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.no_grad()
+def test_transformers_generate_compile_config(model, dtype):
+    transformers = pytest.importorskip("transformers")
+    eager = kernelize(model.to(dtype).eval())
+    compiled = copy.deepcopy(eager)
+    ids = torch.randint(0, 64, (2, 9), device="cuda")
+    kwargs = dict(max_new_tokens=4, do_sample=False, output_logits=True, return_dict_in_generate=True)
+    try:
+        expected = eager.generate(ids, disable_compile=True, **kwargs)
+        # Only a static cache opts generate into compiling: Mamba's default cache is a DynamicCache.
+        actual = compiled.generate(
+            ids, cache_implementation="static",
+            compile_config=transformers.CompileConfig(fullgraph=True), **kwargs,
+        )
+        assert hasattr(compiled, "_compiled_call"), "generate must have compiled the decode steps"
+        for step, (actual_logits, expected_logits) in enumerate(zip(actual.logits, expected.logits)):
+            assert_close(actual_logits, expected_logits, dtype)
+        torch.testing.assert_close(actual.sequences, expected.sequences)
     finally:
         torch._dynamo.reset()

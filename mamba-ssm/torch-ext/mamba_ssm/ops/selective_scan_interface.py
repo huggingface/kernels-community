@@ -10,9 +10,14 @@ from ..utils.torch import custom_bwd, custom_fwd
 from .triton.layer_norm import _layer_norm_fwd
 
 
+# The CUDA scan processes the sequence in chunks of this size and saves one state per chunk, see
+# `n_chunks` in `selective-scan/selective_scan.cpp`.
+_SELECTIVE_SCAN_CHUNK_SIZE = 2048
+
+
 def _selective_scan_fwd_fake(u, delta, A, B, C, D, z, delta_bias, delta_softplus):
     batch, dim, seqlen = u.shape
-    n_chunks = (seqlen + 2048 - 1) // 2048
+    n_chunks = (seqlen + _SELECTIVE_SCAN_CHUNK_SIZE - 1) // _SELECTIVE_SCAN_CHUNK_SIZE
     x = u.new_empty((batch, dim, n_chunks, A.shape[1] * 2), dtype=A.dtype)
     return [torch.empty_like(delta), x] + ([torch.empty_like(z)] if z is not None else [])
 
