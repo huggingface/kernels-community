@@ -11,7 +11,7 @@ source \
 // instantiation, the stable-ABI API, setup, benchmarks and the upstream
 // Python interface are out of scope: this kernel is forward-only and its
 // Python wrapper follows sgl-kernel instead.
-prune keep="hopper/{block.h,copy_sm90_bulk_reduce.hpp,cuda_check.h,epilogue_bwd.hpp,epilogue_fwd.hpp,flash.h,flash_api.cpp,flash_fwd_combine.cu,flash_fwd_combine_kernel.h,flash_fwd_combine_launch_template.h,flash_fwd_kernel_sm80.h,flash_fwd_kernel_sm90.h,flash_fwd_launch_template.h,flash_prepare_scheduler.cu,heuristics.h,mainloop_fwd_sm80.hpp,mainloop_fwd_sm90_tma_gmma_ws.hpp,mask.h,named_barrier.hpp,pack_gqa.h,paged_kv.h,rotary.h,seqlen.h,sm90_pipeline_no_cluster.hpp,softmax.h,static_switch.h,tile_scheduler.hpp,tile_size.h,utils.h},hopper/instantiations/flash_fwd_*_sm{80,90}.cu"
+prune keep="hopper/{block.h,cuda_check.h,epilogue_fwd.hpp,flash.h,flash_api.cpp,flash_fwd_combine.cu,flash_fwd_combine_kernel.h,flash_fwd_combine_launch_template.h,flash_fwd_kernel_sm80.h,flash_fwd_kernel_sm90.h,flash_fwd_launch_template.h,flash_prepare_scheduler.cu,heuristics.h,mainloop_fwd_sm80.hpp,mainloop_fwd_sm90_tma_gmma_ws.hpp,mask.h,named_barrier.hpp,pack_gqa.h,paged_kv.h,rotary.h,seqlen.h,sm90_pipeline_no_cluster.hpp,softmax.h,static_switch.h,tile_scheduler.hpp,tile_size.h,utils.h},hopper/instantiations/flash_fwd_*_sm{80,90}.cu"
 
 // Place the CUDA sources in the kernel source tree.
 move \
@@ -27,12 +27,15 @@ overlay from="overlay"
 expect in="flash-attn/instantiations/*_sm80.cu" files=120
 expect in="flash-attn/instantiations/*_sm90.cu" files=280
 
-// Inference-only build: no backward, dropout or uneven K, varlen only.
+// Inference-only build: no backward, dropout or uneven K, varlen only. Each
+// kernel names its compilation units; the headers they need are found by
+// following their #includes.
 kernel \
     name="flash_attn_sm80" \
     backend="cuda" \
-    src="flash-attn/{block.h,copy_sm90_bulk_reduce.hpp,epilogue_bwd.hpp,epilogue_fwd.hpp,flash.h,flash_fwd_launch_template.h,flash_fwd_kernel_sm80.h,flash_fwd_kernel_sm90.h,heuristics.h,mainloop_fwd_sm80.hpp,mainloop_fwd_sm90_tma_gmma_ws.hpp,mask.h,named_barrier.hpp,pack_gqa.h,paged_kv.h,rotary.h,sm90_pipeline_no_cluster.hpp,softmax.h,tile_size.h,tile_scheduler.hpp},flash-attn/instantiations/*_sm80.cu" \
+    src="flash-attn/instantiations/*_sm80.cu" \
     include="flash-attn" \
+    follow_includes=#true \
     depends="torch,cutlass_4_0" \
     capabilities="8.0" \
     cuda_flags="-O3,-std=c++17,--ftemplate-backtrace-limit=0,--use_fast_math,-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED,-DCUTLASS_ENABLE_GDC_FOR_SM90,--expt-relaxed-constexpr,--expt-extended-lambda,--use_fast_math,-DNDEBUG,-DFLASHATTENTION_DISABLE_BACKWARD,-DFLASHATTENTION_DISABLE_DROPOUT,-DFLASHATTENTION_DISABLE_UNEVEN_K,-DFLASHATTENTION_VARLEN_ONLY" \
@@ -41,8 +44,9 @@ kernel \
 kernel \
     name="flash_attn_sm90" \
     backend="cuda" \
-    src="flash-attn/{block.h,copy_sm90_bulk_reduce.hpp,epilogue_bwd.hpp,epilogue_fwd.hpp,flash.h,flash_fwd_launch_template.h,flash_fwd_kernel_sm80.h,flash_fwd_kernel_sm90.h,heuristics.h,mainloop_fwd_sm80.hpp,mainloop_fwd_sm90_tma_gmma_ws.hpp,mask.h,named_barrier.hpp,pack_gqa.h,paged_kv.h,rotary.h,sm90_pipeline_no_cluster.hpp,softmax.h,tile_size.h,tile_scheduler.hpp},flash-attn/instantiations/*_sm90.cu" \
+    src="flash-attn/instantiations/*_sm90.cu" \
     include="flash-attn" \
+    follow_includes=#true \
     depends="torch,cutlass_4_0" \
     capabilities="9.0a" \
     cuda_flags="-O3,-std=c++17,--ftemplate-backtrace-limit=0,--use_fast_math,-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED,-DCUTLASS_ENABLE_GDC_FOR_SM90,--expt-relaxed-constexpr,--expt-extended-lambda,--use_fast_math,-DNDEBUG,-DFLASHATTENTION_DISABLE_BACKWARD,-DFLASHATTENTION_DISABLE_DROPOUT,-DFLASHATTENTION_DISABLE_UNEVEN_K,-DFLASHATTENTION_VARLEN_ONLY" \
@@ -51,7 +55,8 @@ kernel \
 kernel \
     name="flash_attn" \
     backend="cuda" \
-    src="flash-attn/{cuda_check.h,flash_api.cpp,flash_fwd_combine.cu,flash_fwd_combine_kernel.h,flash_fwd_combine_launch_template.h,flash.h,flash_prepare_scheduler.cu,heuristics.h,seqlen.h,static_switch.h,tile_size.h,utils.h}" \
+    src="flash-attn/{flash_api.cpp,flash_fwd_combine.cu,flash_prepare_scheduler.cu}" \
+    follow_includes=#true \
     depends="torch,cutlass_4_0" \
     capabilities="8.0,9.0a" \
     cuda_flags="-O3,-std=c++17,--ftemplate-backtrace-limit=0,--use_fast_math,-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED,-DCUTLASS_ENABLE_GDC_FOR_SM90,--expt-relaxed-constexpr,--expt-extended-lambda,--use_fast_math,-DNDEBUG,-DFLASHATTENTION_DISABLE_BACKWARD,-DFLASHATTENTION_DISABLE_DROPOUT,-DFLASHATTENTION_DISABLE_UNEVEN_K,-DFLASHATTENTION_VARLEN_ONLY" \

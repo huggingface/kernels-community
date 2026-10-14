@@ -47,8 +47,7 @@ depends = ["torch", "cutlass_4_0"]
 include = ["flash-attn"]
 src = [
     "flash-attn/block.h",
-    "flash-attn/copy_sm90_bulk_reduce.hpp",
-    "flash-attn/epilogue_bwd.hpp",
+    "flash-attn/cuda_check.h",
     "flash-attn/epilogue_fwd.hpp",
     "flash-attn/flash.h",
     "flash-attn/flash_fwd_kernel_sm80.h",
@@ -182,10 +181,13 @@ src = [
     "flash-attn/pack_gqa.h",
     "flash-attn/paged_kv.h",
     "flash-attn/rotary.h",
+    "flash-attn/seqlen.h",
     "flash-attn/sm90_pipeline_no_cluster.hpp",
     "flash-attn/softmax.h",
+    "flash-attn/static_switch.h",
     "flash-attn/tile_scheduler.hpp",
     "flash-attn/tile_size.h",
+    "flash-attn/utils.h",
 ]
 
 [kernel.flash_attn_sm90]
@@ -217,8 +219,7 @@ depends = ["torch", "cutlass_4_0"]
 include = ["flash-attn"]
 src = [
     "flash-attn/block.h",
-    "flash-attn/copy_sm90_bulk_reduce.hpp",
-    "flash-attn/epilogue_bwd.hpp",
+    "flash-attn/cuda_check.h",
     "flash-attn/epilogue_fwd.hpp",
     "flash-attn/flash.h",
     "flash-attn/flash_fwd_kernel_sm80.h",
@@ -512,10 +513,13 @@ src = [
     "flash-attn/pack_gqa.h",
     "flash-attn/paged_kv.h",
     "flash-attn/rotary.h",
+    "flash-attn/seqlen.h",
     "flash-attn/sm90_pipeline_no_cluster.hpp",
     "flash-attn/softmax.h",
+    "flash-attn/static_switch.h",
     "flash-attn/tile_scheduler.hpp",
     "flash-attn/tile_size.h",
+    "flash-attn/utils.h",
 ]
 
 [kernel.flash_attn]

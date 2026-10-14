@@ -16,7 +16,12 @@ repo-id = "kernels-community/flash-attn3"
 [torch]
 stable-abi = "2.9"
 src = [
+    "flash-attn/cuda_check.h",
+    "flash-attn/flash.h",
     "flash-attn/flash_api_stable.cpp",
+    "flash-attn/heuristics.h",
+    "flash-attn/static_switch.h",
+    "flash-attn/tile_size.h",
     "torch-ext/torch_binding.cpp",
 ]
 
@@ -41,10 +46,8 @@ src = [
     "flash-attn/flash_fwd_combine_kernel.h",
     "flash-attn/flash_fwd_combine_launch_template.h",
     "flash-attn/flash_prepare_scheduler.cu",
-    "flash-attn/heuristics.h",
     "flash-attn/seqlen.h",
     "flash-attn/static_switch.h",
-    "flash-attn/tile_size.h",
     "flash-attn/utils.h",
 ]
 
@@ -66,6 +69,7 @@ include = ["flash-attn"]
 src = [
     "flash-attn/block.h",
     "flash-attn/copy_sm90_bulk_reduce.hpp",
+    "flash-attn/cuda_check.h",
     "flash-attn/epilogue_bwd.hpp",
     "flash-attn/epilogue_fwd.hpp",
     "flash-attn/flash.h",
@@ -77,7 +81,6 @@ src = [
     "flash-attn/flash_fwd_kernel_sm80.h",
     "flash-attn/flash_fwd_kernel_sm90.h",
     "flash-attn/flash_fwd_launch_template.h",
-    "flash-attn/heuristics.h",
     "flash-attn/instantiations/flash_bwd_hdim128_bf16_sm80.cu",
     "flash-attn/instantiations/flash_bwd_hdim128_bf16_softcap_sm80.cu",
     "flash-attn/instantiations/flash_bwd_hdim128_fp16_sm80.cu",
@@ -187,10 +190,13 @@ src = [
     "flash-attn/pack_gqa.h",
     "flash-attn/paged_kv.h",
     "flash-attn/rotary.h",
+    "flash-attn/seqlen.h",
     "flash-attn/sm90_pipeline_no_cluster.hpp",
     "flash-attn/softmax.h",
+    "flash-attn/static_switch.h",
     "flash-attn/tile_scheduler.hpp",
     "flash-attn/tile_size.h",
+    "flash-attn/utils.h",
 ]
 
 [kernel.flash_attn_sm90]
@@ -211,6 +217,7 @@ include = ["flash-attn"]
 src = [
     "flash-attn/block.h",
     "flash-attn/copy_sm90_bulk_reduce.hpp",
+    "flash-attn/cuda_check.h",
     "flash-attn/epilogue_bwd.hpp",
     "flash-attn/epilogue_fwd.hpp",
     "flash-attn/flash.h",
@@ -222,7 +229,6 @@ src = [
     "flash-attn/flash_fwd_kernel_sm80.h",
     "flash-attn/flash_fwd_kernel_sm90.h",
     "flash-attn/flash_fwd_launch_template.h",
-    "flash-attn/heuristics.h",
     "flash-attn/instantiations/flash_bwd_hdim128_bf16_sm90.cu",
     "flash-attn/instantiations/flash_bwd_hdim128_bf16_softcap_sm90.cu",
     "flash-attn/instantiations/flash_bwd_hdim128_fp16_sm90.cu",
@@ -532,8 +538,11 @@ src = [
     "flash-attn/pack_gqa.h",
     "flash-attn/paged_kv.h",
     "flash-attn/rotary.h",
+    "flash-attn/seqlen.h",
     "flash-attn/sm90_pipeline_no_cluster.hpp",
     "flash-attn/softmax.h",
+    "flash-attn/static_switch.h",
     "flash-attn/tile_scheduler.hpp",
     "flash-attn/tile_size.h",
+    "flash-attn/utils.h",
 ]

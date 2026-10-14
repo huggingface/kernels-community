@@ -118,11 +118,15 @@ kernelize_imports \
 expect in="flash-attn/*" files=37
 expect in="flash-attn/instantiations/*" files=451
 
+// Each kernel names its compilation units; the headers they need are found
+// by following their #includes.
+//
 // Shared sources for both architectures: combine and scheduler kernels.
 kernel \
     name="flash_attn" \
     backend="cuda" \
-    src="flash-attn/{cuda_check.h,flash_fwd_combine.cu,flash_fwd_combine_kernel.h,flash_fwd_combine_launch_template.h,flash.h,flash_prepare_scheduler.cu,heuristics.h,seqlen.h,static_switch.h,tile_size.h,utils.h}" \
+    src="flash-attn/{flash_fwd_combine,flash_prepare_scheduler}.cu" \
+    follow_includes=#true \
     depends="torch,cutlass_4_0" \
     capabilities="8.0,9.0a" \
     cuda_flags="-O3,-std=c++17,--ftemplate-backtrace-limit=0,--use_fast_math,-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED,-DCUTLASS_ENABLE_GDC_FOR_SM90,-DCUTLASS_DEBUG_TRACE_LEVEL=0,-DNDEBUG"
@@ -132,17 +136,21 @@ kernel \
 kernel \
     name="flash_attn_sm80" \
     backend="cuda" \
-    src="flash-attn/{block.h,copy_sm90_bulk_reduce.hpp,epilogue_bwd.hpp,epilogue_fwd.hpp,flash.h,flash_bwd_kernel_sm80.h,flash_bwd_kernel_sm90.h,flash_bwd_launch_template.h,flash_bwd_postprocess_kernel.h,flash_bwd_preprocess_kernel.h,flash_fwd_launch_template.h,flash_fwd_kernel_sm80.h,flash_fwd_kernel_sm90.h,heuristics.h,mainloop_bwd_sm80.hpp,mainloop_fwd_sm80.hpp,mainloop_bwd_sm90_tma_gmma_ws.hpp,mainloop_fwd_sm90_tma_gmma_ws.hpp,mask.h,named_barrier.hpp,pack_gqa.h,paged_kv.h,rotary.h,sm90_pipeline_no_cluster.hpp,softmax.h,tile_size.h,tile_scheduler.hpp},flash-attn/instantiations/flash_bwd_hdim[0-9]*_{bf16,fp16}_{sm80,softcap_sm80}.cu,flash-attn/instantiations/flash_fwd_hdim[0-9]*_{bf16,fp16}_{sm80,softcap_sm80,paged_sm80,paged_softcap_sm80,paged_split_sm80,paged_split_softcap_sm80,split_sm80,split_softcap_sm80}.cu" \
+    src="flash-attn/instantiations/flash_bwd_hdim[0-9]*_{bf16,fp16}_{sm80,softcap_sm80}.cu,flash-attn/instantiations/flash_fwd_hdim[0-9]*_{bf16,fp16}_{sm80,softcap_sm80,paged_sm80,paged_softcap_sm80,paged_split_sm80,paged_split_softcap_sm80,split_sm80,split_softcap_sm80}.cu" \
     include="flash-attn" \
+    follow_includes=#true \
     depends="torch,cutlass_4_0" \
     capabilities="8.0" \
     cuda_flags="-O3,-std=c++17,--ftemplate-backtrace-limit=0,--use_fast_math,-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED,-DCUTLASS_ENABLE_GDC_FOR_SM90,-DCUTLASS_DEBUG_TRACE_LEVEL=0,-DNDEBUG"
 
+// The per-hdim forward units (now .cuh) come in through the hdimall/hdimdiff
+// aggregates that #include them.
 kernel \
     name="flash_attn_sm90" \
     backend="cuda" \
-    src="flash-attn/{block.h,copy_sm90_bulk_reduce.hpp,epilogue_bwd.hpp,epilogue_fwd.hpp,flash.h,flash_bwd_kernel_sm80.h,flash_bwd_kernel_sm90.h,flash_bwd_launch_template.h,flash_bwd_postprocess_kernel.h,flash_bwd_preprocess_kernel.h,flash_fwd_launch_template.h,flash_fwd_kernel_sm80.h,flash_fwd_kernel_sm90.h,heuristics.h,mainloop_bwd_sm80.hpp,mainloop_fwd_sm80.hpp,mainloop_bwd_sm90_tma_gmma_ws.hpp,mainloop_fwd_sm90_tma_gmma_ws.hpp,mask.h,named_barrier.hpp,pack_gqa.h,paged_kv.h,rotary.h,sm90_pipeline_no_cluster.hpp,softmax.h,tile_size.h,tile_scheduler.hpp},flash-attn/instantiations/flash_bwd_hdim[0-9]*_{bf16,fp16}_{sm90,softcap_sm90}.cu,flash-attn/instantiations/flash_fwd_hdim{all,diff}_*_sm90.cu,flash-attn/instantiations/flash_fwd_hdim[0-9]*_sm90.cuh" \
+    src="flash-attn/instantiations/flash_bwd_hdim[0-9]*_{bf16,fp16}_{sm90,softcap_sm90}.cu,flash-attn/instantiations/flash_fwd_hdim{all,diff}_*_sm90.cu" \
     include="flash-attn" \
+    follow_includes=#true \
     depends="torch,cutlass_4_0" \
     capabilities="9.0a" \
     cuda_flags="-O3,-std=c++17,--ftemplate-backtrace-limit=0,--use_fast_math,-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED,-DCUTLASS_ENABLE_GDC_FOR_SM90,-DCUTLASS_DEBUG_TRACE_LEVEL=0,-DNDEBUG"
@@ -158,4 +166,5 @@ manifest \
     cuda_maxver="13.0" \
     repo_id="kernels-community/flash-attn3" \
     torch_src="flash-attn/flash_api_stable.cpp,torch-ext/torch_binding.cpp" \
+    torch_follow_includes=#true \
     stable_abi_version="2.9"
