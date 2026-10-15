@@ -20,6 +20,10 @@ from ._ops import add_op_namespace_prefix
 
 # # isort: on
 
+# Torch >= 2.13 can pass a Generator through the stable ABI. Older versions reject the argument
+# before the kernel runs, so there the CUDA op has to draw its Philox seed and offset itself.
+_STABLE_ABI_GENERATOR = torch.__version__ >= "2.13"
+
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -77,10 +81,37 @@ def round_multiple(x, m):
     return (x + m - 1) // m * m
 
 
+def _philox_generator(
+    q: torch.Tensor, dropout_p: float, generator: Optional[torch.Generator] = None
+) -> Optional[torch.Generator]:
+    """The generator to hand to `fwd` / `varlen_fwd`.
+
+    With dropout on CUDA this is the default generator unless one is given, so the kernel reserves
+    its seed and offset exactly like the non-stable build (see set_params_philox in flash_api.cpp).
+    """
+    if not q.is_cuda:
+        return generator
+    if dropout_p <= 0:
+        return None
+    if not _STABLE_ABI_GENERATOR:
+        if generator is not None:
+            raise ValueError(
+                "flash_attn2: passing a generator to the CUDA kernel requires torch >= 2.13; "
+                "seed the default generator with torch.manual_seed instead"
+            )
+        return None
+    if generator is None:
+        generator = torch.cuda.default_generators[q.device.index]
+    return generator
+
+
 @torch.library.custom_op(
     add_op_namespace_prefix("_flash_attn_forward"),
     mutates_args=(),
     device_types=_get_device(),
+    # Tells torch.compile the forward draws random numbers, so it is never deduplicated or
+    # recomputed (e.g. under activation checkpointing).
+    tags=(torch.Tag.nondeterministic_seeded,),
 )
 def _flash_attn_forward(
     q: torch.Tensor,
@@ -96,6 +127,7 @@ def _flash_attn_forward(
     return_softmax: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    gen = _philox_generator(q, dropout_p)
     out, softmax_lse, S_dmask, rng_state = flash_attn.fwd(
         q,
         k,
@@ -109,7 +141,7 @@ def _flash_attn_forward(
         window_size_right,
         softcap,
         return_softmax,
-        None,
+        gen,
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -156,10 +188,14 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, p, rng_state
 
 
+_wrapped_flash_attn_forward = flash_attn._flash_attn_forward  # upstream alias, see CARD.md
+
+
 @torch.library.custom_op(
     add_op_namespace_prefix("_flash_attn_varlen_forward"),
     mutates_args=(),
     device_types=_get_device(),
+    tags=(torch.Tag.nondeterministic_seeded,),
 )
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
@@ -183,6 +219,7 @@ def _flash_attn_varlen_forward(
     zero_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    gen = _philox_generator(q, dropout_p)
     out, softmax_lse, S_dmask, rng_state = flash_attn.varlen_fwd(
         q,
         k,
@@ -204,7 +241,7 @@ def _flash_attn_varlen_forward(
         window_size_right,
         softcap,
         return_softmax,
-        None,
+        gen,
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
@@ -254,6 +291,9 @@ def _flash_attn_varlen_forward_fake(
         )
     rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     return out, softmax_lse, p, rng_state
+
+
+_wrapped_flash_attn_varlen_forward = flash_attn._flash_attn_varlen_forward  # upstream alias, see CARD.md
 
 
 @torch.library.custom_op(
@@ -348,6 +388,9 @@ def _flash_attn_backward_fake(
     )
 
     return softmax_d
+
+
+_wrapped_flash_attn_backward = flash_attn._flash_attn_backward  # upstream alias, see CARD.md
 
 
 @torch.library.custom_op(
@@ -459,6 +502,9 @@ def _flash_attn_varlen_backward_fake(
     )
 
     return softmax_d
+
+
+_wrapped_flash_attn_varlen_backward = flash_attn._flash_attn_varlen_backward  # upstream alias, see CARD.md
 
 
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
