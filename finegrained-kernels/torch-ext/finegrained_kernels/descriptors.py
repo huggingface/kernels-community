@@ -50,6 +50,13 @@ def rebind_bd_descriptors(nargs):
     rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], nargs["block_k"])
 
 
+def rebind_tiled_descriptors(nargs):
+    """Per-config pre_hook for the FP8 kernels with a tuned K tile (tensor-wide / row-wise): set the
+    A/B host-TMA boxes to ``[BM, BK]`` and ``[(2|1) * BN, BK]`` over the (rows, K) E4M3 matrices."""
+    rebind_operand_box(nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], nargs["BLOCK_SIZE_K"])
+    rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], nargs["BLOCK_SIZE_K"])
+
+
 def rebind_weight_only_descriptors(nargs):
     """Per-config pre_hook for the weight-only kernels — set the A/B host-TMA boxes to the tuned tile:
     ``[BM, BK]`` over the (M, K) bf16 activation and ``[BN, BK // WEIGHT_VALUES_PER_BYTE]`` over the

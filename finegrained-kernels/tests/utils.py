@@ -364,6 +364,18 @@ WEIGHTS = {
         },
         dq_act=lambda q, s: q.float() * s.float().reshape(-1, 1),
     ),
+    # Row-wise FP8: one fp32 scale per output row, (E, N, 1) — Llama 4 FP8; per-token activations.
+    "fp8_rowwise": dict(
+        make=lambda N, K, E: (*make_weights(N, K, TEST_DEVICE, [1, K], num_experts=E), None),
+        dequant=lambda B, Bs, g=None: B.float() * Bs.float(),
+        activation_formats=("fp8",),
+        requant_formats=(),
+        act_quant={
+            None: lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
+            "fp8": lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
+        },
+        dq_act=lambda q, s: q.float() * s.float().reshape(-1, 1),
+    ),
     "mxfp8": dict(
         make=_make_mx(torch.float8_e4m3fn, torch.float8_e8m0fnu),
         dequant=lambda B, Bs, g=None: dq_grouped(B, Bs, MX_SCALE_GROUP_K),

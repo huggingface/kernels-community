@@ -119,6 +119,15 @@ MOE_PROBLEMS = [
     # out quantized instead (``quantize_routed_rows_per_expert``): 4096 routed rows, which the
     # 64-token cells above never reach, so only this one runs the kernel's pre-quantized arm
     MoEProblem(weights="fp8_tensor", num_tokens=1024, num_top_k=4, static=True),
+    # dynamic per-token activations (tensor-wide, row-wise): the intermediate's whole-row scale is
+    # beyond any gate_up epilogue tile, so the chain hands the down a bf16 intermediate to quantize
+    MoEProblem(weights="fp8_tensor", num_top_k=4),
+    # row-wise weights (Llama 4 FP8 experts, top-1): decode, small batch, and a prefill batch
+    # deep enough per expert for the grouped kernel's big tiles
+    MoEProblem(weights="fp8_rowwise", num_tokens=1, num_top_k=1),
+    MoEProblem(weights="fp8_rowwise", num_top_k=1),
+    MoEProblem(weights="fp8_rowwise", num_tokens=1024, num_top_k=1),
+    MoEProblem(weights="fp8_rowwise", num_top_k=4, static=True),
     # block-FP8 with UE8M0 (power-of-two) scales — the whole-model UE8M0 contract: acts,
     # weights, and the fused intermediate requant all power-of-two (DeepSeek-V4 attn / B200).
     MoEProblem(weights="fp8_128x128_ue8m0", num_tokens=1),
@@ -188,12 +197,14 @@ MOE_PROBLEMS = [
     MoEProblem(weights="fp8_128x128", bias=True),
     MoEProblem(weights="fp8_128x128", num_tokens=1, bias=True),
     MoEProblem(weights="fp8_tensor", num_top_k=4, static=True, bias=True),
+    MoEProblem(weights="fp8_rowwise", num_top_k=4, bias=True),
     MoEProblem(weights="mxfp8", bias=True),
     MoEProblem(weights="nvfp4", input_globals=True, bias=True),
     MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=1, bias=True),
     # ── expert parallelism: non-local experts sentinel-masked ──
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="fp8_128x128", num_tokens=8, sentinel_fraction=0.875),
+    MoEProblem(weights="fp8_rowwise", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875, negative_sentinels=True),
     # swizzled MX scales quantize the activations once per token into every routed row's tile, which a token
     # routed only to other ranks' experts must not write

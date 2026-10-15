@@ -56,7 +56,7 @@ from .compat import (
     device_context,
     pdl_launch_kwargs,
 )
-from .formats import get_supported_act_fns, is_mx, is_mxfp4, is_per_expert_global, mx_scale_family, normalize_global_scale, ue8m0_as_uint8, weight_format
+from .formats import get_supported_act_fns, is_mx, is_mxfp4, is_per_expert_global, mx_scale_family, normalize_global_scale, per_token_activations, ue8m0_as_uint8, weight_format
 from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
 from .quant import _launch_act_quant, MX_ACT_QUANT, mx_act_quant_routed_scales
 from .scheduling import compute_grouped_scheduling, is_off_rank, off_rank
@@ -373,8 +373,10 @@ def moe_fused_grouped(
     ``*_proj_input_global_scale`` pair is the NVFP4 activation second level (a checkpoint's
     calibrated per-projection ``input_scale``): the gate_up quantizes hidden against its own,
     requants the intermediate against the down's, and the down consumes that as its activation
-    global. ``None`` is dynamic quant everywhere else. ``simulate_unfused`` (testing) rounds each step through
-    the activation dtype so the output matches the unfused reference to reduce order. ``act_fn`` is a
+    global. ``None`` is dynamic quant everywhere else. Tensor-wide / row-wise FP8 hand the
+    down a bf16 intermediate it quantizes per token (a whole-row scale no epilogue tile sees).
+    ``simulate_unfused`` (testing) rounds each step through the activation dtype so the output
+    matches the unfused reference to reduce order. ``act_fn`` is a
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
     callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
     projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
@@ -393,6 +395,9 @@ def moe_fused_grouped(
     # intermediate. scatter_idx=None: the down reads the intermediate in place. (C, Cs) under a
     # requant format; a bare Tensor otherwise.
     static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
+    # a per-token (tensor-wide / row-wise) intermediate scale spans the whole row, which the
+    # gate_up epilogue's tiles never see: the down quantizes the bf16 intermediate instead
+    per_token = per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
     gate_up_in, gate_up_in_scale = _gate_up_activations(
         hidden_states, fmt, gate_up_proj_scale_inv, gate_up_proj_input_global_scale,
         gate_up_proj_activation_scale, scatter_idx, expert_start,
@@ -413,7 +418,7 @@ def moe_fused_grouped(
         # fmt is the resolved format; "bf16" (weight-only) leaves the GLU intermediate bf16,
         # no requant. So does static, whose epilogue has no calibrated scale to requant against.
         activation_format=fmt,
-        quantize_output=bool(glu) and fmt != "bf16" and not static_act,
+        quantize_output=bool(glu) and fmt != "bf16" and not static_act and not per_token,
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
@@ -490,8 +495,9 @@ def moe_fused_batched(
     ``*_proj_input_global_scale`` pair is the NVFP4 activation second level (a checkpoint's
     calibrated per-projection ``input_scale``): the gate_up quantizes hidden against its own,
     requants the intermediate against the down's, and the down consumes that as its activation
-    global. ``None`` is dynamic quant everywhere else. ``simulate_unfused`` (testing) rounds each
-    step through the activation dtype so the output matches the unfused reference to
+    global. ``None`` is dynamic quant everywhere else. Tensor-wide / row-wise FP8 hand the
+    down a bf16 intermediate it quantizes per token (a whole-row scale no epilogue tile sees).
+    ``simulate_unfused`` (testing) rounds each step through the activation dtype so the output matches the unfused reference to
     reduce order. ``act_fn`` is a
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
     callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
@@ -510,6 +516,9 @@ def moe_fused_batched(
     # row from the unexpanded hidden in-kernel (no copy).
     # (C, Cs) under a requant format; a bare Tensor on the full-precision path
     static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
+    # see the grouped sibling: the down quantizes the bf16 intermediate per token — measured faster
+    # here than the unstacked gate + one-kernel GLU requant (37.0 vs 45.3us, Llama 4 E=16, T=1)
+    per_token = per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
     gate_up_out = matmul_batched(
         hidden_states,
         gate_up_proj,
@@ -535,6 +544,7 @@ def moe_fused_batched(
             and fmt != "bf16"
             and (fmt != "fp8" or expert_ids.numel() <= GATE_UNSTACK_MAX_S)
             and not static_act
+            and not per_token
         ),
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,

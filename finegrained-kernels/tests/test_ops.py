@@ -45,6 +45,7 @@ from utils import (  # type: ignore
     dq_grouped,
     dq_scale,
     make_static_activation_scale,
+    make_weights,
     maybe_compile,
     quant_dequant_a,
 )
@@ -52,7 +53,7 @@ from utils import (  # type: ignore
 import finegrained_kernels  # type: ignore
 from finegrained_kernels import swizzle_mx_scales, unswizzle_mx_scales  # type: ignore
 from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore
-from finegrained_kernels.quant import nvfp4_act_quant  # type: ignore
+from finegrained_kernels.quant import fp8_act_quant_tensor_wide, nvfp4_act_quant  # type: ignore
 from finegrained_kernels.epilogue import apply_glu  # type: ignore
 
 
@@ -148,7 +149,7 @@ def scenarios() -> list[Problem]:
                 out.append(
                     Problem(weights=w, gate=True, activation_format=fmt, quantize_output=True, swizzled=True)
                 )
-        default_in = {"fp8_128x128": "fp8", "fp8_tensor": "fp8"}.get(w)
+        default_in = {"fp8_128x128": "fp8", "fp8_tensor": "fp8", "fp8_rowwise": "fp8"}.get(w)
         for fmt in row["activation_formats"]:
             if fmt != default_in:
                 out.append(Problem(weights=w, activation_format=fmt))
@@ -243,6 +244,20 @@ def scenarios() -> list[Problem]:
         # per-TENSOR weights: the shipped static form (Ministral-3 dense, Mistral-4 MoE — both
         # write qscheme_act="TENSOR" with weight_block_size=None)
         Problem(weights="fp8_tensor", static=True),
+        # row-wise weights (Llama 4 FP8): the stacked gate|up rows carry their own scales, the swapped decode
+        # tile folds them on its other axis, a caller's per-token As rides as-is, and the launch-scale shape
+        # reaches the grouped kernel's descriptor / warp-specialized arms
+        Problem(weights="fp8_rowwise", gate=True),
+        Problem(weights="fp8_rowwise", S=8),
+        Problem(weights="fp8_rowwise", gate=True, S=8),
+        Problem(weights="fp8_rowwise", prequant=True),
+        Problem(weights="fp8_rowwise", static=True),
+        Problem(weights="fp8_rowwise", bias=True),
+        Problem(weights="fp8_rowwise", compile=True),
+        Problem(weights="fp8_rowwise", S=2048, E=16, N=512, K=1024),
+        # the prefill expansion lays the routed rows out, and their per-token scales with them
+        Problem(weights="fp8_rowwise", S=4096, E=8, sentinel_fraction=0.5),
+        Problem(weights="fp8_tensor", S=4096, E=8),
         # non-aligned N (64-grid, off the 128-grid — gpt-oss H=I=2880 shape). matmul_2d masks the
         # N-tail; routed MX runs the affine arm (per-row scales, any BN|N); routed FP8 rejects it
         # (its scales are 128-blocked along N — raises pointing to matmul_2d).
@@ -724,6 +739,11 @@ _SWEEP_CELLS = [
     # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is
     # the one a memory-mode fence gets wrong (silently — the tuner forgives what will not lower)
     (Problem(weights="fp8_tensor", static=True), "grouped", "w8a8_tensor_dynamic_fp8_matmul_grouped_kernel"),
+    # row-wise weights: the per-row scale vector each arm folds on its own weight-row axis — the
+    # stacked gate|up span, the swapped decode tile, and the 2D kernel's tile
+    (Problem(weights="fp8_rowwise", gate=True, S=512), "grouped", "w8a8_tensor_dynamic_fp8_matmul_grouped_kernel"),
+    (Problem(weights="fp8_rowwise", gate=True, S=8), "batched", "w8a8_tensor_dynamic_fp8_matmul_batched_kernel"),
+    (Problem(weights="fp8_rowwise", gate=True, S=256), "matmul", "w8a8_tensor_dynamic_fp8_matmul_kernel"),
 ]
 
 
@@ -796,3 +816,28 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
         print(f"\n[sweep] {len(forgiven)} admitted config(s) failed to compile/run (forgiven):")
         for cfg, err in forgiven:
             print(f"  {cfg}: {err}")
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="torch._scaled_mm row-wise is CUDA-only")
+@pytest.mark.parametrize("M", [1, 16, 512])
+def test_rowwise_matmul_2d_matches_scaled_mm(M, monkeypatch):
+    """Row-wise FP8 ``matmul_2d`` against cuBLAS ``torch._scaled_mm`` row-wise on the identical
+    E4M3 operands: the Triton kernel folds the per-token activation scale and the per-row weight
+    scale the same way, so only the accumulation order differs, and the op's own cuBLAS route
+    (decode / mid-size M) is the reference itself."""
+    torch.manual_seed(0)
+    N, K = 512, 1024
+    B, Bs = make_weights(N, K, TEST_DEVICE, [1, K])
+    A = torch.randn(M, K, device=TEST_DEVICE, dtype=torch.bfloat16)
+    Aq, As = fp8_act_quant_tensor_wide(A, K)
+
+    ref = torch._scaled_mm(Aq, B.t(), scale_a=As.reshape(M, 1), scale_b=Bs.reshape(1, N), out_dtype=torch.bfloat16)
+    routed = finegrained_kernels.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
+    torch.testing.assert_close(routed, ref, atol=0, rtol=0)
+    monkeypatch.setenv("FINEGRAINED_DISABLE_SCALED_MM", "1")
+    out = finegrained_kernels.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
+    prequant = finegrained_kernels.matmul_2d(Aq, B, As, Bs, output_dtype=torch.bfloat16)
+    atol, rtol = DTYPE_TO_TOL[torch.bfloat16]
+    torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
+    torch.testing.assert_close(prequant.float(), ref.float(), atol=atol, rtol=rtol)

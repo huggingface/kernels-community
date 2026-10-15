@@ -23,11 +23,12 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, sm_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
-from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
+from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
+from .loading.scales import apply_row_scale
 from .loading.tiles import (
     load_act_block_dynamic,
     load_act_mx,
@@ -470,6 +471,7 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
             warp_spec_compile_guard_pruner(),
+            warp_spec_memory_mode_pruner(),
             descriptor_box_pruner(),
             smem_pruner(),
             raw_activation_pointer_pruner(),
@@ -483,7 +485,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     As,  # per-token activation scales (S,), or a calibrated (static) one: shared, or per expert
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
     BDescriptor,  # host TMA descriptor over B viewed (E, 2N|N, K), box (1, (2|1)*BN, BK); read iff B_MEMORY_MODE != "pointer"
-    Bs,  # (num_experts, 1, 1) per-tensor weight scales (one scalar covers the gate|up stack)
+    Bs,  # (num_experts, N, 1) row-wise weight scales, or (num_experts, 1, 1) per tensor (stride_bs_n 0)
     C,  # (S, N) output; under GATE the bf16 GLU intermediate
     Cs,  # None (tensor-wide has no fused requant); kept for the shared epilogue signature
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
@@ -504,6 +506,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     stride_b_k,
     stride_b_n,
     stride_bs_e,
+    stride_bs_n,
     stride_c_m,
     stride_c_n,
     stride_cs_m,
@@ -535,12 +538,13 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
 ):
-    """Tensor-scale grouped FP8 expert matmul kernel — persistent grid-stride over tiles.
+    """Tensor-scale / row-wise grouped FP8 expert matmul kernel — persistent grid-stride over tiles.
 
     Grouped expert scheduling with pre-quantized activations plus per-token activation scales
-    and one per-expert tensor weight scale. ``GATE`` fuses the gate|up projection (``B`` the
-    ``(E, 2N, K)`` stack, one scale for both) into a ``[BK, 2*BN]`` dot + SwiGLU ``glu``,
-    emitting the bf16 intermediate; ``GATE=False`` is the plain GEMM (bit-identical)."""
+    and a per-expert weight scale constant along K (per tensor, or per output row), both folded
+    after the loop. ``GATE`` fuses the gate|up projection (``B`` the ``(E, 2N, K)`` stack, its
+    scales stacked alike) into a ``[BK, 2*BN]`` dot + SwiGLU ``glu``, emitting the bf16
+    intermediate; ``GATE=False`` is the plain GEMM (bit-identical)."""
     start_pid = tl.program_id(axis=0)
     if PACKED_SCHEDULE:
         total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
@@ -578,8 +582,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
                 Schedule, (tile_id + NUM_SMS) // num_n_tiles, total_m_tiles
             )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
-        # GATE stacks gate|up into one [BK, 2*BN] tile (one per-tensor scale covers both);
-        # rows are interleaved, so the tile is one 2*BN span. GATE=False -> plain [BK, BN].
+        # GATE stacks gate|up into one [BK, 2*BN] tile; rows are interleaved, so the tile is
+        # one 2*BN span. GATE=False -> plain [BK, BN].
         b_ptrs = weight_tile_ptrs(
             B + expert_id64 * stride_b_e,
             offs_bn,
@@ -593,7 +597,6 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         a_s = tl.load(
             As + in_row * stride_as_m + expert_id64.to(tl.int32) * stride_as_e, mask=row_mask, other=1.0
         )
-        b_s = tl.load(Bs + expert_id64 * stride_bs_e)
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
@@ -608,8 +611,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
             acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
             a_ptrs += BLOCK_SIZE_K * stride_a_k
             b_ptrs += BLOCK_SIZE_K * stride_b_k
-        # per-token activation scale and per-expert tensor weight scale, applied once post-loop
-        acc = acc * a_s[:, None] * b_s
+        # per-token activation scale and the expert's weight scale, applied once post-loop
+        acc = apply_row_scale(acc * a_s[:, None], Bs + expert_id64 * stride_bs_e, offs_bn, stride_bs_n)
 
         gemm_epilogue(
             C,
@@ -1597,7 +1600,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
-    """Tensor-scale grouped FP8 matmul over expert-sorted positions (per-tile
+    """Tensor-scale / row-wise grouped FP8 matmul over expert-sorted positions (per-tile
     gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
     Raw activations are quantized here (``fp8_act_quant_tensor_wide``, one offline pass);
     pre-quantized ``A`` + ``As`` is read as-is.
@@ -1608,7 +1611,8 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     B:  (num_experts, N, K) FP8 expert weights; under ``gate`` the (num_experts, 2N, K) stack
     As: (S,) per-token scales alongside a pre-quantized A, or — on a raw A — the calibrated
         (static) activation scale: one value, or one per expert
-    Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales
+    Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales, or (num_experts, N, 1)
+        row-wise (2N rows under ``gate``)
     expert_start: (num_experts_pow2 + 1,) int32 — cumulative sorted-row starts, S sentinel
     gather_idx: optional (S,) — sorted position -> source row of A; None = A is expert-sorted
     scatter_idx: optional (S,) — sorted position -> destination row of C; None = C stays expert-sorted
@@ -1628,7 +1632,6 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     num_experts, _, N = expert_weight_shape(B, gate)
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
 
-    # Normalize Bs to (num_experts, 1, 1) — one per-tensor scale (covers the gate|up stack)
     Bs = normalize_per_expert_scale(Bs, num_experts)
 
     output_dtype = resolve_output_dtype(output_dtype, A, As)
@@ -1641,8 +1644,11 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     if A.dtype == FP8_DTYPE:
         # post-quant: trade the in-kernel gather for one packed-row copy where that wins. Keyed
         # on A being quantized, which the dynamic quant, a shared calibrated scale and the
-        # per-expert layout above all reach; raw rows (decode) keep the gather.
-        A, _, gather_idx = expand_gather_below_parity(A, None, gather_idx, num_experts, expert_start)
+        # per-expert layout above all reach; raw rows (decode) keep the gather. Per-token scales
+        # (stride_m 1) follow their rows into the copy.
+        row_scales = As.view(-1, 1) if as_stride_m else None
+        A, row_scales, gather_idx = expand_gather_below_parity(A, row_scales, gather_idx, num_experts, expert_start)
+        As = row_scales.view(-1) if as_stride_m else As
     C = A.new_empty(S, N, dtype=output_dtype)
     num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
@@ -1681,6 +1687,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
             B.stride(2),
             B.stride(1),
             Bs.stride(0),
+            row_scale_stride(Bs),
             C.stride(0),
             C.stride(1),
             1,  # Cs strides: unread, Cs is None
@@ -2262,7 +2269,7 @@ def matmul_grouped(
     - ``Bs`` None → ``full_precision_matmul_grouped`` (plain dot, no scales anywhere).
     - MX weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
       group-32 ``Bs`` → ``mx_dynamic_matmul_grouped``.
-    - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) →
+    - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) or per output row (``(E, N, 1)``) →
       ``w8a8_tensor_dynamic_fp8_matmul_grouped``.
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_grouped``.
     """

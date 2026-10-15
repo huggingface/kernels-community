@@ -878,6 +878,36 @@ def raw_activation_pointer_pruner():
     return config_filter(ok)
 
 
+def native_mma_m_pruner():
+    """``early_config_prune`` dropping the unswapped ``BLOCK_SIZE_M < 64`` rows of a 2D plain fp8
+    ``tl.dot`` kernel on sm_10x: tcgen05 takes an M of 64 or 128, so a narrower tile lowers to the
+    warp-level MMA, and it loses at every M measured — the token-count gap is covered by rows
+    replicated or padded up to the tile. Forced configs, B200, row-wise N=16384/K=5120 and
+    N=5120/K=8192, host-TMA both operands, BK=256 w4 s4, M=1..16 on a padded A: BM=16 13.5/14.5us,
+    BM=32 20.1/21.9us, BM=64 10.6/10.8us; at M=64 BM=64 10.6 vs BM=16 39.3us. Pruning them leaves
+    the tuner's trials on the native tiles, which it otherwise missed at decode (14.6 vs 10.6us).
+    The swapped decode rows pass (their MMA M is the weight tile). CUDA sm_10x only."""
+
+    def ok(c, args):
+        return bool(c.kwargs.get("SWAP_AB")) or config_dim(c, args, "BLOCK_SIZE_M") >= 64
+
+    return config_filter(ok, when=lambda args: is_sm10x())
+
+
+def swap_decode_scope_pruner(max_m: int = 16):
+    """``early_config_prune`` scoping a 2D plain-dot kernel's ``SWAP_AB`` rows (BM=1: the weight's
+    output rows in the MMA M dim, the token padded to the N=16 atom) to decode M, where they run
+    one program row per token, and to a pointer-mode activation (an A-side descriptor under
+    ``SWAP_AB`` traps on Triton 3.8, see ``mx_2d_swap_scope_pruner``). Unswapped rows pass."""
+
+    def ok(c, args):
+        if not c.kwargs.get("SWAP_AB"):
+            return True
+        return args["M"] <= max_m and c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
+
+    return config_filter(ok)
+
+
 def mx_2d_swap_scope_pruner(max_m: int = 16):
     """``early_config_prune`` scoping the 2D mx kernel's ``SWAP_AB`` rows to the ONE regime
     they exist for: E4M3-scale (NVFP4) single-token decode. NVFP4 has no other native M=1

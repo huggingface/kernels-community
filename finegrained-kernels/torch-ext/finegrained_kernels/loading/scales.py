@@ -262,6 +262,19 @@ def load_mx_act_tile(
 
 
 @triton.jit
+def apply_row_scale(acc, Scale, offs_rows, stride_rows, SWAP_AB: tl.constexpr = False):
+    """Fold a K-constant weight scale onto the fp32 accumulator after the K-loop: weight row ``n``
+    reads ``Scale + n * stride_rows`` — a row-wise scale, or a per-tensor one broadcast by stride
+    0. It lands on the acc's weight-row axis (axis 0 under ``SWAP_AB``)."""
+    s = tl.load(Scale + offs_rows * stride_rows)
+    if SWAP_AB:
+        out = acc * s[:, None]
+    else:
+        out = acc * s[None, :]
+    return out
+
+
+@triton.jit
 def apply_global_scale(acc, GlobalScale, stride_gs_e, GlobalScaleA, stride_gsa_e, expert_id):
     """Fold the NVFP4 second-level globals onto the fp32 accumulator: the weight global ``g_b``
     and the activation global ``g_a``, each per tensor (stride 0, broadcast) or per expert.
