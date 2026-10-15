@@ -23,7 +23,7 @@ CHANNELS = {
 
 @pytest.fixture(scope="module")
 def deformable_detr():
-    return kernels.get_kernel("kernels-community/deformable-detr", version=1)
+    return kernels.get_kernel("kernels-community/deformable-detr", version=2)
 
 
 def make_inputs(
