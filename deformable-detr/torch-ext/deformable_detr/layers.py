@@ -1,11 +1,34 @@
 from typing import List, Union, Tuple
 
+import torch
 from torch import Tensor
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 import torch.nn as nn
 
-from ._ops import ops
+from ._ops import add_op_namespace_prefix, ops
+
+
+# Fake implementations, so that `torch.compile` can trace the ops.
+@torch.library.register_fake(add_op_namespace_prefix("ms_deform_attn_forward"))
+def _ms_deform_attn_forward_fake(
+    value, spatial_shapes, level_start_index, sampling_loc, attn_weight, im2col_step
+):
+    batch, _, num_heads, channels = value.shape
+    return value.new_empty(batch, sampling_loc.shape[1], num_heads * channels)
+
+
+@torch.library.register_fake(add_op_namespace_prefix("ms_deform_attn_backward"))
+def _ms_deform_attn_backward_fake(
+    value,
+    spatial_shapes,
+    level_start_index,
+    sampling_loc,
+    attn_weight,
+    grad_output,
+    im2col_step,
+):
+    return [t.new_empty(t.shape) for t in (value, sampling_loc, attn_weight)]
 
 
 class MultiScaleDeformableAttentionFunction(Function):
@@ -53,7 +76,9 @@ class MultiScaleDeformableAttentionFunction(Function):
             value_level_start_index,
             sampling_locations,
             attention_weights,
-            grad_output,
+            # The kernel requires a contiguous gradient, which autograd does not
+            # guarantee (e.g. the expanded gradient of `.sum()`).
+            grad_output.contiguous(),
             context.im2col_step,
         )
 
@@ -61,6 +86,8 @@ class MultiScaleDeformableAttentionFunction(Function):
 
 
 class MultiScaleDeformableAttention(nn.Module):
+    can_torch_compile: bool = True
+
     def forward(
         self,
         value: Tensor,
@@ -71,6 +98,17 @@ class MultiScaleDeformableAttention(nn.Module):
         attention_weights: Tensor,
         im2col_step: int,
     ):
+        # The kernel needs a single dtype. Under autocast, Transformers passes
+        # a reduced precision `value` with float32 sampling locations and
+        # attention weights, for which the reference implementation (with
+        # `grid_sample`) computes and returns float32. Do the same.
+        dtype = torch.promote_types(
+            torch.promote_types(value.dtype, sampling_locations.dtype),
+            attention_weights.dtype,
+        )
+        value, sampling_locations, attention_weights = (
+            t.to(dtype) for t in (value, sampling_locations, attention_weights)
+        )
         return MultiScaleDeformableAttentionFunction.apply(
             value,
             value_spatial_shapes,
