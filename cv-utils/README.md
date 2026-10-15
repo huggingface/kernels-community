@@ -36,8 +36,8 @@ resizes the height, rescales, normalizes and writes the output. Images of differ
 The filter weights follow `torch.nn.functional.interpolate(..., antialias=True)`. By default (`round_to_uint8=True`),
 each pass rounds to uint8, like torchvision on uint8 tensors.
 
-`resize_normalize_patchify` takes uint8 `(T, C, H, W)` videos, an image being a one-frame video, and one target size
-per video. It writes each value directly at its place in the patch layout, in `block_size x block_size` blocks of
+`resize_normalize_patchify` takes uint8 `(T, C, H, W)` inputs, with `T=1` for an image, and one target size
+per input. It writes each value directly at its place in the patch layout, in `block_size x block_size` blocks of
 patches, and returns `grid_thw` as an int64 tensor.
 
 ## Limitations

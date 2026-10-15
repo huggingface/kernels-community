@@ -86,7 +86,7 @@ def _vertical_patchify_kernel(
 
 
 def resize_normalize_patchify(
-    videos,
+    inputs,
     target_sizes,
     image_mean,
     image_std,
@@ -98,14 +98,14 @@ def resize_normalize_patchify(
     antialias=True,
     round_to_uint8=True,
 ):
-    """Resize, normalize and patchify uint8 `(T, C, H, W)` videos into Qwen2-VL `pixel_values` and an int64 `grid_thw`.
+    """Resize, normalize and patchify uint8 `(T, C, H, W)` inputs into Qwen2-VL `pixel_values` and an int64 `grid_thw`.
 
-    `target_sizes[i]` is the frame size of `videos[i]`. An image is a one-frame video. A missing frame of the last
+    `target_sizes[i]` is the frame size of `inputs[i]`, with `T=1` for an image. A missing frame of the last
     temporal patch repeats the last frame. Patches are written in `block_size x block_size` blocks, `block_size=1`
     writes them row by row.
     """
-    frames = [frame for video in videos for frame in video]
-    frame_counts = [video.shape[0] for video in videos]
+    frames = [frame for input_frames in inputs for frame in input_frames]
+    frame_counts = [input_frames.shape[0] for input_frames in inputs]
     device = frames[0].device
     channels = frames[0].shape[0]
     cubic = resample == "bicubic"

@@ -66,16 +66,16 @@ def test_resize_normalize_matches_interpolate(antialias, resample, shortest_edge
 
 def test_resize_normalize_patchify_matches_reference():
     frames = random_images([(280, 420), (140, 140), (140, 140), (140, 140)])
-    videos = [frames[0][None], torch.stack(frames[1:])]
+    inputs = [frames[0][None], torch.stack(frames[1:])]
     target_sizes = [(224, 336), (112, 112)]
     patch, merge, temporal = 14, 2, 2
     pixel_values, grid_thw = cv_utils.resize_normalize_patchify(
-        videos, target_sizes, MEAN, STD, 1 / 255, "bicubic", patch, merge, temporal, round_to_uint8=False
+        inputs, target_sizes, MEAN, STD, 1 / 255, "bicubic", patch, merge, temporal, round_to_uint8=False
     )
 
     expected = []
-    for video, target_size in zip(videos, target_sizes):
-        clip = torch.stack([reference(frame, target_size, "bicubic") for frame in video])
+    for input_frames, target_size in zip(inputs, target_sizes):
+        clip = torch.stack([reference(frame, target_size, "bicubic") for frame in input_frames])
         clip = torch.cat([clip, clip[-1:].expand(-clip.shape[0] % temporal, -1, -1, -1)])
         grid_t, (height, width) = clip.shape[0] // temporal, clip.shape[-2:]
         patches = clip.view(
@@ -126,9 +126,9 @@ def test_single_mean_and_std_apply_to_every_channel():
 @pytest.mark.parametrize("patch, target_sizes", [(14, [(280, 420), (504, 336)]), (16, [(288, 448), (512, 320)])])
 def test_resize_normalize_patchify_row_by_row_with_block_size_one(patch, target_sizes):
     frames = random_images([(300, 450), (500, 333)])
-    videos = [frame[None] for frame in frames]
+    inputs = [frame[None] for frame in frames]
     pixel_values, grid_thw = cv_utils.resize_normalize_patchify(
-        videos, target_sizes, MEAN, STD, 1 / 255, "bicubic", patch, 1, 1, round_to_uint8=False
+        inputs, target_sizes, MEAN, STD, 1 / 255, "bicubic", patch, 1, 1, round_to_uint8=False
     )
 
     expected = []
