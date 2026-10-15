@@ -91,8 +91,7 @@ def device():
 
 @pytest.fixture(scope="module")
 def fla(device):
-    # TODO: Replace with non-staged version
-    return get_kernel("kernels-staging/fla", revision="pr-1223")
+    return get_kernel("kernels-community/fla", version=2)
 
 
 @pytest.fixture(autouse=True)
