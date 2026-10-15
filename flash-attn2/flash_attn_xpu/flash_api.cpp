@@ -31,6 +31,12 @@ inline at::Tensor ensure_contiguous(const at::Tensor& tensor) {
     return tensor.is_contiguous() ? tensor : tensor.contiguous();
 }
 
+inline std::pair<at::Tensor, at::Tensor> lse_token_indices(const at::Tensor& cu_seqlens_q, int64_t total_q) {
+    auto tokens = at::arange(total_q, cu_seqlens_q.options().dtype(at::kLong));
+    auto batches = at::searchsorted(cu_seqlens_q.slice(0, 1).contiguous(), tokens, false, true);
+    return {batches, tokens - cu_seqlens_q.index_select(0, batches)};
+}
+
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
 
 std::vector<at::Tensor>
@@ -494,7 +500,10 @@ mha_varlen_fwd(
                     .contiguous()
         : ensure_contiguous(out_padded);
 
-    return {out, softmax_lse, S_dmask, rng_state};
+    auto [batches, positions] = lse_token_indices(cu_seqlens_q, total_q);
+    auto packed_lse = softmax_lse.index({batches, torch::indexing::Slice(), positions})
+                          .transpose(0, 1).contiguous();
+    return {out, packed_lse, S_dmask, rng_state};
   }
 
 std::vector<at::Tensor>
@@ -592,9 +601,9 @@ mha_varlen_bwd(
                 "k and v head dimensions must match q");
     TORCH_CHECK(num_heads % num_heads_k == 0,
                 "Number of heads in key/value must divide number of heads in query");
-    TORCH_CHECK(softmax_lse_contig.dim() == 3 && softmax_lse_contig.size(0) == batch_size &&
-                softmax_lse_contig.size(1) == num_heads && softmax_lse_contig.size(2) == max_seqlen_q,
-                "softmax_lse must have shape (batch_size, num_heads, max_seqlen_q)");
+    TORCH_CHECK(softmax_lse_contig.dim() == 2 && softmax_lse_contig.size(0) == num_heads &&
+                softmax_lse_contig.size(1) == total_q,
+                "softmax_lse must have shape (num_heads, total_q)");
     const int head_size_padded = round_multiple(head_size_og, 32);
     const bool needs_padding = (head_size_og != head_size_padded);
     const int pad_size = head_size_padded - head_size_og;
@@ -658,9 +667,13 @@ mha_varlen_bwd(
         philox_offset = static_cast<uint64_t>(rng_state_val[1].item<int64_t>());
     }
 
+    auto [batches, positions] = lse_token_indices(cu_q_contig, total_q);
+    auto padded_lse = at::zeros({batch_size, num_heads, max_seqlen_q}, softmax_lse_contig.options());
+    padded_lse.index_put_({batches, torch::indexing::Slice(), positions}, softmax_lse_contig.transpose(0, 1));
+
     cutlass_fmha_bwd_varlen_impl(
         queue,
-        dout_padded, q_padded, k_padded, v_padded, out_padded, softmax_lse_contig,
+        dout_padded, q_padded, k_padded, v_padded, out_padded, padded_lse,
         cu_q_contig, cu_k_contig,
         dq_work, dk_expanded, dv_expanded, softmax_d,
         softmax_scale,
