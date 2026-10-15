@@ -36,7 +36,7 @@ class LoadedLayer:
     layer_name: str
 
     def load(self):
-        kernel = kernels.get_kernel("kernels-community/deformable-detr", version=1)
+        kernel = kernels.get_kernel("kernels-community/deformable-detr", version=2)
         return getattr(kernel.layers, self.layer_name)
 
 
