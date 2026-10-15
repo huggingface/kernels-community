@@ -1,0 +1,187 @@
+import torch
+import triton
+import triton.language as tl
+
+from .resize import (
+    VERTICAL_TILE,
+    _as_tensors,
+    _horizontal_pass,
+    _normalization,
+    _round,
+    _tap_count,
+    _tile,
+)
+
+
+@triton.jit
+def _vertical_patchify_kernel(
+    intermediate,
+    output,
+    intermediate_offsets,
+    heights,
+    out_heights,
+    out_widths,
+    slot_frames,
+    slot_temporal_starts,
+    slot_temporal_counts,
+    slot_groups,
+    slot_output_offsets,
+    weights,
+    first_taps,
+    table_offsets,
+    taps_stride,
+    means,
+    stds,
+    CHANNELS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLUMNS: tl.constexpr,
+    CUBIC: tl.constexpr,
+    ANTIALIAS: tl.constexpr,
+    ROUND_TO_UINT8: tl.constexpr,
+    PATCH: tl.constexpr,
+    PATCH_BLOCK: tl.constexpr,
+    TEMPORAL: tl.constexpr,
+):
+    slot = tl.program_id(0)
+    frame = tl.load(slot_frames + slot)
+    out_height = tl.load(out_heights + frame)
+    out_width = tl.load(out_widths + frame)
+    first_row = tl.program_id(1) * BLOCK_ROWS
+    first_column = tl.program_id(2) * BLOCK_COLUMNS
+    if first_row >= out_height or first_column >= out_width:
+        return
+    height = tl.load(heights + frame)
+    rows = first_row + tl.arange(0, BLOCK_ROWS)
+    columns = first_column + tl.arange(0, BLOCK_COLUMNS)
+    row_active = rows < out_height
+    active = row_active[:, None] & (columns < out_width)[None, :]
+    patch_block_rows = out_height // (PATCH * PATCH_BLOCK)
+    patch_block_columns = out_width // (PATCH * PATCH_BLOCK)
+    grid_rows = rows // PATCH
+    grid_columns = columns // PATCH
+    row_part = (tl.load(slot_groups + slot) * patch_block_rows + grid_rows // PATCH_BLOCK) * patch_block_columns
+    patch = (row_part[:, None] + (grid_columns // PATCH_BLOCK)[None, :]) * PATCH_BLOCK
+    patch = (patch + (grid_rows % PATCH_BLOCK)[:, None]) * PATCH_BLOCK + (grid_columns % PATCH_BLOCK)[None, :]
+    within_patch = ((rows % PATCH) * PATCH)[:, None] + (columns % PATCH)[None, :]
+    patch_start = tl.load(slot_output_offsets + slot) + patch.to(tl.int64) * (CHANNELS * TEMPORAL * PATCH * PATCH)
+    patch_start += within_patch
+    temporal_start = tl.load(slot_temporal_starts + slot)
+    temporal_count = tl.load(slot_temporal_counts + slot)
+    taps = _tap_count(height.to(tl.float32) / out_height.to(tl.float32), CUBIC, ANTIALIAS)
+    table_rows = (tl.load(table_offsets + frame) + rows).to(tl.int64)
+    first_tap = tl.load(first_taps + table_rows, mask=row_active, other=0)
+    for channel in tl.static_range(CHANNELS):
+        plane_start = tl.load(intermediate_offsets + frame) + channel * height.to(tl.int64) * out_width
+        source = intermediate + plane_start + columns[None, :]
+        total = tl.zeros([BLOCK_ROWS, BLOCK_COLUMNS], dtype=tl.float32)
+        for tap in range(taps):
+            weight = tl.load(weights + table_rows * taps_stride + tap, mask=row_active, other=0)
+            index = tl.minimum(tl.maximum(first_tap + tap, 0), height - 1).to(tl.int64)
+            pixels = tl.load(source + index[:, None] * out_width, mask=active, other=0)
+            total += weight[:, None] * pixels.to(tl.float32)
+        total = (_round(total, ROUND_TO_UINT8) - tl.load(means + channel)) / tl.load(stds + channel)
+        for temporal in tl.static_range(TEMPORAL):
+            write_index = patch_start + (channel * TEMPORAL + temporal_start + temporal) * PATCH * PATCH
+            tl.store(output + write_index, total, mask=active & (temporal < temporal_count))
+
+
+def resize_normalize_patchify(
+    inputs,
+    target_sizes,
+    image_mean,
+    image_std,
+    rescale_factor,
+    resample,
+    patch_size,
+    block_size,
+    temporal_patch_size,
+    antialias=True,
+    round_to_uint8=True,
+):
+    """Resize, normalize and patchify uint8 `(T, C, H, W)` inputs into Qwen2-VL `pixel_values` and an int64 `grid_thw`.
+
+    `target_sizes[i]` is the frame size of `inputs[i]`, with `T=1` for an image. A missing frame of the last
+    temporal patch repeats the last frame. Patches are written in `block_size x block_size` blocks, `block_size=1`
+    writes them row by row.
+    """
+    frames = [frame for input_frames in inputs for frame in input_frames]
+    frame_counts = [input_frames.shape[0] for input_frames in inputs]
+    device = frames[0].device
+    channels = frames[0].shape[0]
+    cubic = resample == "bicubic"
+    factor = patch_size * block_size
+    if any(height % factor or width % factor for height, width in target_sizes):
+        raise ValueError(f"Every target size must be a multiple of patch_size * block_size = {factor}.")
+    out_heights = [height for (height, _), count in zip(target_sizes, frame_counts) for _ in range(count)]
+    out_widths = [width for (_, width), count in zip(target_sizes, frame_counts) for _ in range(count)]
+    intermediate, intermediate_offsets, heights, _, vertical_table = _horizontal_pass(
+        frames,
+        out_widths,
+        [0] * len(frames),
+        out_widths,
+        out_heights,
+        [0] * len(frames),
+        out_heights,
+        cubic,
+        antialias,
+        round_to_uint8,
+    )
+
+    patch_dim = channels * temporal_patch_size * patch_size * patch_size
+    slots, grid_thw, total_patches, first_frame = [], [], 0, 0
+    for (height, width), frame_count in zip(target_sizes, frame_counts):
+        padded = list(range(first_frame, first_frame + frame_count))
+        padded += [padded[-1]] * (-frame_count % temporal_patch_size)
+        first_frame += frame_count
+        grid_t = len(padded) // temporal_patch_size
+        grid_h, grid_w = height // patch_size, width // patch_size
+        for group in range(grid_t):
+            group_frames = padded[group * temporal_patch_size : (group + 1) * temporal_patch_size]
+            position = 0
+            while position < temporal_patch_size:
+                count = 1
+                while (
+                    position + count < temporal_patch_size and group_frames[position + count] == group_frames[position]
+                ):
+                    count += 1
+                slots.append((group_frames[position], position, count, group, total_patches * patch_dim))
+                position += count
+        grid_thw.append((grid_t, grid_h, grid_w))
+        total_patches += grid_t * grid_h * grid_w
+
+    means, stds = _normalization(image_mean, image_std, rescale_factor, channels, device)
+    output = torch.empty((total_patches, patch_dim), device=device, dtype=torch.float32)
+    slot_frames, slot_temporal_starts, slot_temporal_counts, slot_groups, slot_output_offsets = zip(*slots)
+    metadata = _as_tensors(
+        device,
+        torch.int32,
+        out_heights,
+        out_widths,
+        slot_frames,
+        slot_temporal_starts,
+        slot_temporal_counts,
+        slot_groups,
+    )
+    block_rows, block_columns = _tile(VERTICAL_TILE, max(out_widths))
+    grid = (len(slots), triton.cdiv(max(out_heights), block_rows), triton.cdiv(max(out_widths), block_columns))
+    _vertical_patchify_kernel[grid](
+        intermediate,
+        output,
+        intermediate_offsets,
+        heights,
+        *metadata,
+        *_as_tensors(device, torch.int64, slot_output_offsets),
+        *vertical_table,
+        means,
+        stds,
+        CHANNELS=channels,
+        BLOCK_ROWS=block_rows,
+        BLOCK_COLUMNS=block_columns,
+        CUBIC=cubic,
+        ANTIALIAS=antialias,
+        ROUND_TO_UINT8=round_to_uint8,
+        PATCH=patch_size,
+        PATCH_BLOCK=block_size,
+        TEMPORAL=temporal_patch_size,
+    )
+    return output, torch.tensor(grid_thw, dtype=torch.int64)
