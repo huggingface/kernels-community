@@ -16,8 +16,10 @@ import pytest
 import torch
 
 # `kernels-community/deep-ep` is `[general.hub] repo-id` and 1 is
-# `[general] version` in `build.toml`.
-deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+# `[general] version` in `build.toml`. The build declares Hopper/Blackwell only
+# (DeepEP's JIT kernels need them), but nothing tested here launches a kernel,
+# so skip the architecture check to also run on the CI runner's GPU.
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1, check_arch=False)
 
 pytestmark = [
     pytest.mark.kernels_ci,
