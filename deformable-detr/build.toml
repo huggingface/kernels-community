@@ -14,13 +14,15 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
-[kernel.activation]
+[torch.stable-abi]
+cuda = "2.10"
+
+[kernel.deformable_detr]
 language = "cpp-cuda"
 depends = ["torch"]
 include = ["."]
 src = [
+    "deformable_detr/atomics.cuh",
     "deformable_detr/ms_deform_attn_cuda.cu",
     "deformable_detr/ms_deform_im2col_cuda.cuh",
-    "deformable_detr/ms_deform_attn_cuda.cuh",
-    "deformable_detr/ms_deform_attn_cuda.h",
 ]
