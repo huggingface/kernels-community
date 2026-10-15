@@ -6,6 +6,16 @@
 #include <vector>
 #include <unistd.h>
 #include <sys/syscall.h>
+#ifdef DEEP_EP_KERNELS
+// kernels-community: the manylinux_2_28 kernel headers predate pidfd (Linux 5.3/5.6), whose
+// syscall numbers are the same on all architectures
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438
+#endif
+#endif
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
 #include <deep_ep/common/math.cuh>

@@ -678,6 +678,8 @@ to sync a DeepEP release, carry out the following steps:
   - `third-party/deep_jit/include/deep_jit/utils/gil.hpp`: no pybind11 under
     `DEEP_EP_KERNELS` (Torch already releases the GIL around custom ops and
     custom class methods).
+  - `csrc/kernels/comm/symmetric.hpp`: define `SYS_pidfd_open`/`SYS_pidfd_getfd`
+    when missing (the manylinux_2_28 kernel headers predate them).
   - `third-party/deep_jit/include/deep_jit/utils/exception.hpp`: include
     `<elfutils/libdwfl.h>` only if available (`__has_include`), with a stub
     `DwflApi` otherwise; backtraces then lack source lines.
