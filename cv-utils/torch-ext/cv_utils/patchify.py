@@ -39,7 +39,7 @@ def _vertical_patchify_kernel(
     ANTIALIAS: tl.constexpr,
     ROUND_TO_UINT8: tl.constexpr,
     PATCH: tl.constexpr,
-    MERGE: tl.constexpr,
+    PATCH_BLOCK: tl.constexpr,
     TEMPORAL: tl.constexpr,
 ):
     slot = tl.program_id(0)
@@ -55,13 +55,13 @@ def _vertical_patchify_kernel(
     columns = first_column + tl.arange(0, BLOCK_COLUMNS)
     row_active = rows < out_height
     active = row_active[:, None] & (columns < out_width)[None, :]
-    merged_rows = out_height // (PATCH * MERGE)
-    merged_columns = out_width // (PATCH * MERGE)
+    patch_block_rows = out_height // (PATCH * PATCH_BLOCK)
+    patch_block_columns = out_width // (PATCH * PATCH_BLOCK)
     grid_rows = rows // PATCH
     grid_columns = columns // PATCH
-    row_part = (tl.load(slot_groups + slot) * merged_rows + grid_rows // MERGE) * merged_columns
-    patch = ((row_part[:, None] + (grid_columns // MERGE)[None, :]) * MERGE + (grid_rows % MERGE)[:, None]) * MERGE
-    patch += (grid_columns % MERGE)[None, :]
+    row_part = (tl.load(slot_groups + slot) * patch_block_rows + grid_rows // PATCH_BLOCK) * patch_block_columns
+    patch = (row_part[:, None] + (grid_columns // PATCH_BLOCK)[None, :]) * PATCH_BLOCK
+    patch = (patch + (grid_rows % PATCH_BLOCK)[:, None]) * PATCH_BLOCK + (grid_columns % PATCH_BLOCK)[None, :]
     within_patch = ((rows % PATCH) * PATCH)[:, None] + (columns % PATCH)[None, :]
     patch_start = tl.load(slot_output_offsets + slot) + patch.to(tl.int64) * (CHANNELS * TEMPORAL * PATCH * PATCH)
     patch_start += within_patch
@@ -86,37 +86,34 @@ def _vertical_patchify_kernel(
 
 
 def resize_normalize_patchify(
-    frames,
+    videos,
     target_sizes,
     image_mean,
     image_std,
     rescale_factor,
     resample,
     patch_size,
-    merge_size,
+    block_size,
     temporal_patch_size,
-    items=None,
     antialias=True,
     round_to_uint8=True,
 ):
-    """Resize, normalize and patchify uint8 CHW frames into Qwen2-VL `pixel_values` and an int64 `grid_thw`.
+    """Resize, normalize and patchify uint8 `(T, C, H, W)` videos into Qwen2-VL `pixel_values` and an int64 `grid_thw`.
 
-    `target_sizes[j]` is the size of `frames[j]`. `items` lists the frame indices of each output item: `[i]` for an
-    image, the frames of a video in order. It defaults to one item per frame. A missing frame of the last temporal
-    patch repeats the last frame. `merge_size=1` writes the patches of each item row by row.
+    `target_sizes[i]` is the frame size of `videos[i]`. An image is a one-frame video. A missing frame of the last
+    temporal patch repeats the last frame. Patches are written in `block_size x block_size` blocks, `block_size=1`
+    writes them row by row.
     """
-    if items is None:
-        items = [[index] for index in range(len(frames))]
+    frames = [frame for video in videos for frame in video]
+    frame_counts = [video.shape[0] for video in videos]
     device = frames[0].device
     channels = frames[0].shape[0]
     cubic = resample == "bicubic"
-    factor = patch_size * merge_size
+    factor = patch_size * block_size
     if any(height % factor or width % factor for height, width in target_sizes):
-        raise ValueError(f"Every target size must be a multiple of patch_size * merge_size = {factor}.")
-    if any(len({tuple(target_sizes[index]) for index in item}) != 1 for item in items):
-        raise ValueError("The frames of one item must share a target size.")
-    out_heights = [height for height, _ in target_sizes]
-    out_widths = [width for _, width in target_sizes]
+        raise ValueError(f"Every target size must be a multiple of patch_size * block_size = {factor}.")
+    out_heights = [height for (height, _), count in zip(target_sizes, frame_counts) for _ in range(count)]
+    out_widths = [width for (_, width), count in zip(target_sizes, frame_counts) for _ in range(count)]
     intermediate, intermediate_offsets, heights, _, vertical_table = _horizontal_pass(
         frames,
         out_widths,
@@ -131,11 +128,13 @@ def resize_normalize_patchify(
     )
 
     patch_dim = channels * temporal_patch_size * patch_size * patch_size
-    slots, grid_thw, total_patches = [], [], 0
-    for item in items:
-        padded = list(item) + [item[-1]] * (-len(item) % temporal_patch_size)
+    slots, grid_thw, total_patches, first_frame = [], [], 0, 0
+    for (height, width), frame_count in zip(target_sizes, frame_counts):
+        padded = list(range(first_frame, first_frame + frame_count))
+        padded += [padded[-1]] * (-frame_count % temporal_patch_size)
+        first_frame += frame_count
         grid_t = len(padded) // temporal_patch_size
-        grid_h, grid_w = out_heights[item[0]] // patch_size, out_widths[item[0]] // patch_size
+        grid_h, grid_w = height // patch_size, width // patch_size
         for group in range(grid_t):
             group_frames = padded[group * temporal_patch_size : (group + 1) * temporal_patch_size]
             position = 0
@@ -182,7 +181,7 @@ def resize_normalize_patchify(
         ANTIALIAS=antialias,
         ROUND_TO_UINT8=round_to_uint8,
         PATCH=patch_size,
-        MERGE=merge_size,
+        PATCH_BLOCK=block_size,
         TEMPORAL=temporal_patch_size,
     )
     return output, torch.tensor(grid_thw, dtype=torch.int64)

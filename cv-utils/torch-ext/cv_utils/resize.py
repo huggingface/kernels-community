@@ -133,8 +133,9 @@ def _vertical_kernel(
     taps_stride,
     means,
     stds,
-    out_height,
-    out_width,
+    out_heights,
+    out_widths,
+    output_offsets,
     CHANNELS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_COLUMNS: tl.constexpr,
@@ -143,9 +144,15 @@ def _vertical_kernel(
     ROUND_TO_UINT8: tl.constexpr,
 ):
     item = tl.program_id(0)
+    out_height = tl.load(out_heights + item)
+    out_width = tl.load(out_widths + item)
+    first_row = tl.program_id(1) * BLOCK_ROWS
+    first_column = tl.program_id(2) * BLOCK_COLUMNS
+    if first_row >= out_height or first_column >= out_width:
+        return
     height = tl.load(heights + item)
-    rows = tl.program_id(1) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    columns = tl.program_id(2) * BLOCK_COLUMNS + tl.arange(0, BLOCK_COLUMNS)
+    rows = first_row + tl.arange(0, BLOCK_ROWS)
+    columns = first_column + tl.arange(0, BLOCK_COLUMNS)
     row_active = rows < out_height
     active = row_active[:, None] & (columns < out_width)[None, :]
     taps = _tap_count(height.to(tl.float32) / tl.load(resize_heights + item).to(tl.float32), CUBIC, ANTIALIAS)
@@ -161,14 +168,16 @@ def _vertical_kernel(
             pixels = tl.load(source + index[:, None] * out_width, mask=active, other=0)
             total += weight[:, None] * pixels.to(tl.float32)
         total = (_round(total, ROUND_TO_UINT8) - tl.load(means + channel)) / tl.load(stds + channel)
-        plane = (item * CHANNELS + channel).to(tl.int64) * out_height
-        tl.store(output + (plane + rows)[:, None] * out_width + columns[None, :], total, mask=active)
+        plane_rows = (channel * out_height + rows).to(tl.int64)
+        destination = output + tl.load(output_offsets + item) + plane_rows[:, None] * out_width + columns[None, :]
+        tl.store(destination, total, mask=active)
 
 
 def _as_tensors(device, dtype, *lists):
     """Copy several lists to `device` in one transfer, and return one tensor view per list."""
     lists = [list(values) for values in lists]
-    packed = torch.tensor([value for values in lists for value in values], dtype=dtype, device=device)
+    packed = torch.tensor([value for values in lists for value in values], dtype=dtype, pin_memory=True)
+    packed = packed.to(device, non_blocking=True)
     return packed.split([len(values) for values in lists])
 
 
@@ -299,59 +308,52 @@ def _horizontal_pass(
 
 def resize_normalize(
     images,
+    sizes,
     image_mean,
     image_std,
     rescale_factor,
     resample,
-    size=None,
-    shortest_edge=None,
     crop_size=None,
     antialias=True,
     round_to_uint8=True,
 ):
-    """Resize uint8 CHW images, center crop them to `crop_size`, rescale and normalize, into one `(N, C, H, W)` tensor.
+    """Resize uint8 CHW images, center crop them to `crop_size`, rescale and normalize them.
 
-    Pass `size = (height, width)` to resize every image to that size, or `shortest_edge` to resize the short side and
-    keep the aspect ratio, which needs a `crop_size`. `round_to_uint8=True` rounds after each resize pass like the
-    torchvision uint8 path.
+    `sizes[i]` is the `(height, width)` that `images[i]` is resized to. Returns one float32 `(C, H, W)` tensor per
+    image, all views of one buffer. `round_to_uint8=True` rounds after each resize pass like the torchvision uint8 path.
     """
-    if (size is None) == (shortest_edge is None):
-        raise ValueError("Pass exactly one of `size` and `shortest_edge`.")
-    if shortest_edge is not None and crop_size is None:
-        raise ValueError("A `shortest_edge` resize needs a `crop_size`.")
-    shapes = [image.shape[1:] for image in images]
-    if shortest_edge is not None:
-        resize_sizes = [
-            (shortest_edge, int(width * shortest_edge / height))
-            if height <= width
-            else (int(height * shortest_edge / width), shortest_edge)
-            for height, width in shapes
-        ]
-    else:
-        resize_sizes = [tuple(size)] * len(images)
-    out_height, out_width = crop_size if crop_size is not None else size
-    if any(height < out_height or width < out_width for height, width in resize_sizes):
+    if len(sizes) != len(images):
+        raise ValueError(f"Pass one size per image, got {len(sizes)} sizes for {len(images)} images.")
+    if crop_size is not None and any(crop_size[0] > height or crop_size[1] > width for height, width in sizes):
         raise ValueError(f"crop_size {crop_size} is larger than a resized image.")
+    resize_heights = [height for height, _ in sizes]
+    resize_widths = [width for _, width in sizes]
+    out_heights = resize_heights if crop_size is None else [crop_size[0]] * len(images)
+    out_widths = resize_widths if crop_size is None else [crop_size[1]] * len(images)
     cubic = resample == "bicubic"
-    resize_heights = [height for height, _ in resize_sizes]
+    device = images[0].device
+    channels = images[0].shape[0]
+    means, stds = _normalization(image_mean, image_std, rescale_factor, channels, device)
+    output_sizes = [channels * height * width for height, width in zip(out_heights, out_widths)]
+    out_heights_tensor, out_widths_tensor, output_offsets = _as_tensors(
+        device, torch.int64, out_heights, out_widths, accumulate([0] + output_sizes[:-1])
+    )
     intermediate, intermediate_offsets, heights, resize_heights_tensor, vertical_table = _horizontal_pass(
         images,
-        [width for _, width in resize_sizes],
-        [(width - out_width) // 2 for _, width in resize_sizes],
-        [out_width] * len(images),
+        resize_widths,
+        [(width - out_width) // 2 for width, out_width in zip(resize_widths, out_widths)],
+        out_widths,
         resize_heights,
-        [(height - out_height) // 2 for height in resize_heights],
-        [out_height] * len(images),
+        [(height - out_height) // 2 for height, out_height in zip(resize_heights, out_heights)],
+        out_heights,
         cubic,
         antialias,
         round_to_uint8,
     )
-    device = images[0].device
-    channels = images[0].shape[0]
-    means, stds = _normalization(image_mean, image_std, rescale_factor, channels, device)
-    output = torch.empty((len(images), channels, out_height, out_width), device=device, dtype=torch.float32)
-    block_rows, block_columns = _tile(VERTICAL_TILE, out_width)
-    _vertical_kernel[(len(images), triton.cdiv(out_height, block_rows), triton.cdiv(out_width, block_columns))](
+    output = torch.empty(sum(output_sizes), device=device, dtype=torch.float32)
+    block_rows, block_columns = _tile(VERTICAL_TILE, max(out_widths))
+    grid = (len(images), triton.cdiv(max(out_heights), block_rows), triton.cdiv(max(out_widths), block_columns))
+    _vertical_kernel[grid](
         intermediate,
         output,
         intermediate_offsets,
@@ -360,8 +362,9 @@ def resize_normalize(
         *vertical_table,
         means,
         stds,
-        out_height,
-        out_width,
+        out_heights_tensor,
+        out_widths_tensor,
+        output_offsets,
         CHANNELS=channels,
         BLOCK_ROWS=block_rows,
         BLOCK_COLUMNS=block_columns,
@@ -369,4 +372,7 @@ def resize_normalize(
         ANTIALIAS=antialias,
         ROUND_TO_UINT8=round_to_uint8,
     )
-    return output
+    return [
+        values.view(channels, height, width)
+        for values, height, width in zip(output.split(output_sizes), out_heights, out_widths)
+    ]
