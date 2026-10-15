@@ -1,5 +1,9 @@
+import sys  # kernels-community
+import os  # kernels-community
 import torch
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # kernels-community
+from deep_ep_kernel import deep_ep  # noqa: E402  kernels-community: load through `kernels.get_kernel`
 from deep_ep.utils.math import ceil_div
 from deep_ep.utils.gate import get_unbalanced_scores
 

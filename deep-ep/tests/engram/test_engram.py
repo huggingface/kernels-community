@@ -1,9 +1,11 @@
+import sys  # kernels-community
 import argparse
 import os
 import torch
 import torch.distributed as dist
 
-import deep_ep
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # kernels-community
+from deep_ep_kernel import deep_ep  # noqa: E402  kernels-community: load through `kernels.get_kernel`
 from deep_ep.utils.envs import init_dist, dist_print
 from deep_ep.utils.math import ceil_div, per_token_cast_to_fp8
 from deep_ep.utils.testing import bench_kineto

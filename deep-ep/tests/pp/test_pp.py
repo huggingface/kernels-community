@@ -1,3 +1,4 @@
+import sys  # kernels-community
 import os
 
 # Must pop before PyTorch imports
@@ -11,7 +12,8 @@ import random
 import torch
 import torch.distributed as dist
 
-import deep_ep
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # kernels-community
+from deep_ep_kernel import deep_ep  # noqa: E402  kernels-community: load through `kernels.get_kernel`
 from deep_ep.utils.envs import init_dist, dist_print, get_rdma_gbs
 from deep_ep.utils.testing import bench_kineto
 

@@ -1,10 +1,12 @@
+import sys  # kernels-community
 import argparse
 import os
 import torch
 import torch.distributed as dist
 from typing import Union, Tuple, Optional
 
-import deep_ep
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # kernels-community
+from deep_ep_kernel import deep_ep  # noqa: E402  kernels-community: load through `kernels.get_kernel`
 from deep_ep.utils.math import (
     align, count_bytes, calc_diff,
     per_token_cast_back, per_token_cast_to_fp8,
