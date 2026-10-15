@@ -5,9 +5,9 @@
 # need several NVLink-connected Hopper/Blackwell GPUs, NCCL >= 2.32.3 and a
 # CUDA >= 13.1 toolkit for the runtime JIT (run them as
 # `python tests/ep/test_ep.py --num-processes 2`). The tests here only need one
-# CUDA device and cover what does not launch communication kernels: loading the
-# extension against PyTorch's NCCL, the constants, events, allocation plans and
-# the runtime requirement checks.
+# Hopper or newer GPU (they skip otherwise) and cover what does not launch
+# communication kernels: loading the extension against PyTorch's NCCL, the
+# constants, events, allocation plans and the runtime requirement checks.
 
 import os
 
@@ -15,16 +15,16 @@ import kernels
 import pytest
 import torch
 
-# `kernels-community/deep-ep` is `[general.hub] repo-id` and 1 is
-# `[general] version` in `build.toml`. The build declares Hopper/Blackwell only
-# (DeepEP's JIT kernels need them), but nothing tested here launches a kernel,
-# so skip the architecture check to also run on the CI runner's GPU.
-deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1, check_arch=False)
+# DeepEP needs Hopper or newer: skip before loading the kernel, whose build
+# only declares those architectures.
+if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
+    pytest.skip("DeepEP requires a Hopper or newer CUDA device", allow_module_level=True)
 
-pytestmark = [
-    pytest.mark.kernels_ci,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device"),
-]
+# `kernels-community/deep-ep` is `[general.hub] repo-id` and 1 is
+# `[general] version` in `build.toml`.
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+
+pytestmark = pytest.mark.kernels_ci
 
 
 def test_uses_torch_nccl():
