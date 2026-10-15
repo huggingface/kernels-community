@@ -1,0 +1,50 @@
+[general]
+name = "aiter-sage-attention"
+version = 1
+edition = 5
+license = "MIT"
+backends = ["rocm"]
+
+[general.hub]
+repo-id = "kernels-community/aiter-sage-attention"
+
+[torch]
+src = [
+    "torch-ext/torch_binding.cpp",
+    "torch-ext/torch_binding.h",
+]
+
+# Flags follow aiter's JIT build of the same sources (aiter/jit/core.py and the
+# module_gfx1201_sage_* entries of aiter/jit/optCompilerConfig.json).
+[kernel.gfx1201_sage_prepare]
+backend = "rocm"
+depends = ["torch"]
+rocm-archs = ["gfx1201"]
+hip-flags = [
+    "-ffp-contract=off",
+    "-fno-gpu-flush-denormals-to-zero",
+]
+include = ["aiter/include"]
+src = [
+    "aiter/include/aiter_stream.h",
+    "aiter/include/aiter_tensor.h",
+    "aiter/include/gfx1201_sage_prepare.h",
+    "aiter/kernels/gfx1201_sage_prepare.hip",
+]
+
+[kernel.gfx1201_sage_attention]
+backend = "rocm"
+depends = ["torch"]
+rocm-archs = ["gfx1201"]
+hip-flags = [
+    "-fgpu-flush-denormals-to-zero",
+]
+include = ["aiter/include"]
+src = [
+    "aiter/include/aiter_stream.h",
+    "aiter/include/aiter_tensor.h",
+    "aiter/include/gfx1201_sage_attention.h",
+    "aiter/include/gfx1201_sage_prepare.h",
+    "aiter/kernels/gfx1201_sage_attention.hip",
+    "aiter/torch_itfs/gfx1201_sage_torch.hip",
+]
