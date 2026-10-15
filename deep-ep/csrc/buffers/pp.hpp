@@ -123,6 +123,7 @@ public:
     }
 };
 
+#ifndef DEEP_EP_KERNELS
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<PPBuffer, BufferBase>(m, "PPBuffer")
         .def(pybind11::init<int, int, int64_t, int64_t, int, std::optional<int>, int, bool>(),
@@ -144,5 +145,6 @@ static void register_apis(pybind11::module_& m) {
              py::arg("src_rank_idx"),
              py::arg("num_sms") = 0);
 }
+#endif
 
 }  // namespace deep_ep::pp

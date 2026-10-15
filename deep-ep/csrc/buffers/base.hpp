@@ -53,11 +53,13 @@ public:
 
 namespace deep_ep::base {
 
+#ifndef DEEP_EP_KERNELS
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<BufferBase>(m, "BufferBase")
         .def_readonly("main_context", &BufferBase::main_context)
         .def("print_memory_usage", &BufferBase::print_memory_usage)
         .def("destroy", &BufferBase::destroy);
 }
+#endif
 
 }  // namespace deep_ep::base

@@ -1,6 +1,12 @@
 #pragma once
 
+#if __has_include(<elfutils/libdwfl.h>)
 #include <elfutils/libdwfl.h>
+#define DJ_HAS_LIBDWFL 1
+#else
+// kernels-community: without the elfutils headers, backtraces omit source lines
+#define DJ_HAS_LIBDWFL 0
+#endif
 
 #include <array>
 #include <cstdint>
@@ -18,6 +24,7 @@ namespace deep_jit::exception {
 
 namespace detail {
 
+#if DJ_HAS_LIBDWFL
 struct DwflApi {
     struct FrameInfo {
         const char* function = nullptr;
@@ -95,6 +102,17 @@ struct DwflApi {
         return result;
     }
 };
+#else
+struct DwflApi {
+    struct FrameInfo {
+        const char* function = nullptr;
+        std::string file_line = "??:0";
+    };
+
+    void refresh() const {}
+    FrameInfo find(const std::uintptr_t) const { return {}; }
+};
+#endif
 
 inline bool is_python_frame(const Dl_info& info) {
     if (info.dli_sname != nullptr) {

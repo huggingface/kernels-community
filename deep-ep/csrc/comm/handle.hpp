@@ -5,6 +5,7 @@
 
 namespace deep_ep::comm {
 
+#ifndef DEEP_EP_KERNELS
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<Context, std::shared_ptr<Context>>(m, "Context")
         .def("get_physical_domain_size", &Context::get_physical_domain_size)
@@ -28,5 +29,6 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_logical_domain_size", &get_logical_domain_size);
     m.def("get_comm_stream", []() -> torch::Stream { return get_comm_stream(); });
 }
+#endif
 
 }  // namespace deep_ep::comm

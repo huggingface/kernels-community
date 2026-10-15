@@ -304,6 +304,7 @@ public:
     }
 };
 
+#ifndef DEEP_EP_KERNELS
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<EngramBuffer, BufferBase>(m, "EngramBuffer")
         .def(pybind11::init<int, int, int64_t, symmetric::shared_comm_t, int64_t, int64_t, bool, bool, std::optional<int>, int, int, int, bool>())
@@ -315,5 +316,6 @@ static void register_apis(pybind11::module_& m) {
         .def_static("calculate_storage_size", &EngramBuffer::calculate_storage_size)
         .def_static("get_theoretical_config", &EngramBuffer::get_theoretical_config);
 }
+#endif
 
 }  // namespace deep_ep::engram

@@ -29,10 +29,12 @@ struct EventHandle {
     void current_stream_wait() const { at::cuda::getCurrentCUDAStream().unwrap().wait(*event); }
 };
 
+#ifndef DEEP_EP_KERNELS
 static void register_event_apis(pybind11::module_& m) {
     pybind11::class_<EventHandle>(m, "EventHandle")
         .def(pybind11::init<>())
         .def("current_stream_wait", &EventHandle::current_stream_wait);
 }
+#endif
 
 }  // namespace deep_ep

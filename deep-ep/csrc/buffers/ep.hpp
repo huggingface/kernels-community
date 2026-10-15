@@ -1081,6 +1081,7 @@ public:
     }
 };
 
+#ifndef DEEP_EP_KERNELS
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<EPBuffer, BufferBase>(m, "EPBuffer")
         .def(pybind11::init<int, int, int64_t, int64_t, int64_t, bool, bool, bool, std::optional<int>, int, int, int, bool>())
@@ -1096,5 +1097,6 @@ static void register_apis(pybind11::module_& m) {
     });
 
 }
+#endif
 
 }  // namespace deep_ep::ep

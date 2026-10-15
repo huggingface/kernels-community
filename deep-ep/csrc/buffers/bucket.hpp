@@ -340,6 +340,7 @@ public:
     }
 };
 
+#ifndef DEEP_EP_KERNELS
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<BucketBuffer, BufferBase>(m, "BucketBuffer")
         .def(pybind11::init<std::vector<int>, std::vector<int>, std::vector<int64_t>, int64_t, std::optional<int>, int, float, float, bool>(),
@@ -370,5 +371,6 @@ static void register_apis(pybind11::module_& m) {
              py::arg("context_idx") = 0,
              py::arg("num_sms") = 0);
 }
+#endif
 
 }  // namespace deep_ep::bucket

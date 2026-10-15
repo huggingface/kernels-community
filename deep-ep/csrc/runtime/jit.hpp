@@ -6,7 +6,9 @@
 
 #include <deep_ep/common/compiled.cuh>
 #include <deep_jit/backend/cuda/backend.hpp>
+#ifndef DEEP_EP_KERNELS
 #include <deep_jit/python_api.hpp>
+#endif
 
 #include "../utils/system.hpp"
 
@@ -46,9 +48,11 @@ inline void init_jit(const std::string& library_root_path, const std::string& nc
     });
 }
 
+#ifndef DEEP_EP_KERNELS
 inline void register_apis(pybind11::module_& module) {
     deep_jit::register_python_api(module, jit);
     module.def("init_jit", &init_jit);
 }
+#endif
 
 }  // namespace deep_ep
