@@ -1,6 +1,6 @@
 [general]
 name = "deformable-detr"
-version = 1
+version = 2
 edition = 6
 license = "Apache-2.0"
 backends = ["cuda"]
