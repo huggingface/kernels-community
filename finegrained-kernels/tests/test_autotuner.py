@@ -28,6 +28,7 @@ import triton.language as tl
 from utils import TEST_DEVICE, make_weights
 
 import finegrained_kernels  # type: ignore
+from finegrained_kernels.formats import is_mxfp4, is_mxfp8, mx_scale_family, ue8m0_as_uint8  # type: ignore
 import finegrained_kernels.matmul  # type: ignore
 from finegrained_kernels.bayesian_autotuner import bayesian_autotune  # type: ignore
 from finegrained_kernels.compat import is_sm10x  # type: ignore
@@ -348,20 +349,18 @@ def test_compile_failures_are_memoized_across_keys(caplog):
 @pytest.mark.kernels_ci
 def test_uint8_mx_scales_without_native_ue8m0(monkeypatch):
     """MX format checks accept raw exponent bytes without a native UE8M0 dtype."""
-    from finegrained_kernels import formats
-
     scale = torch.full((16, 4), 127, dtype=torch.uint8)
     if (native_dtype := getattr(torch, "float8_e8m0fnu", None)) is not None:
         native_scale = scale.view(native_dtype)
-        assert torch.equal(formats.ue8m0_as_uint8(native_scale), scale)
-        assert formats.mx_scale_family(native_scale, 128) == 32
+        assert torch.equal(ue8m0_as_uint8(native_scale), scale)
+        assert mx_scale_family(native_scale, 128) == 32
 
     monkeypatch.delattr(torch, "float8_e8m0fnu", raising=False)
-    assert formats.ue8m0_as_uint8(scale) is scale
-    assert formats.is_mxfp8(
+    assert ue8m0_as_uint8(scale) is scale
+    assert is_mxfp8(
         torch.empty((16, 128), dtype=torch.float8_e4m3fn), scale
     )
-    assert formats.is_mxfp4(torch.empty((16, 64), dtype=torch.int8), scale)
-    assert formats.mx_scale_family(scale, 128) == 32
+    assert is_mxfp4(torch.empty((16, 64), dtype=torch.int8), scale)
+    assert mx_scale_family(scale, 128) == 32
     fp32 = torch.ones((16, 4), dtype=torch.float32)
-    assert formats.ue8m0_as_uint8(fp32) is fp32
+    assert ue8m0_as_uint8(fp32) is fp32
