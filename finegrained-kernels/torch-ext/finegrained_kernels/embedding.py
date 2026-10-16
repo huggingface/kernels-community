@@ -46,7 +46,8 @@ def _embedding_kernel(
 ):
     # Read each packed byte once and let the shared decoder interleave its two values.
     packing: tl.constexpr = 2 if NVFP4 else 1
-    offsets = tl.program_id(0) * (BLOCK // packing) + tl.arange(0, BLOCK // packing)
+    program = tl.program_id(0).to(tl.int64)
+    offsets = program * (BLOCK // packing) + tl.arange(0, BLOCK // packing)
     valid = offsets < N * (D // packing)
     row = tl.load(Ids + offsets // (D // packing), valid, other=0).to(tl.int64)
     in_bounds = (row >= 0) & (row < V)
@@ -63,7 +64,7 @@ def _embedding_kernel(
     else:
         value = tl.load(W + row * W_ROW + col * W_COL, valid, other=0.0).to(tl.float32)
         value = value * tl.load(S).to(tl.float32)
-    output_offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    output_offsets = program * BLOCK + tl.arange(0, BLOCK)
     tl.store(Out + output_offsets, value, output_offsets < N * D)
 
 
