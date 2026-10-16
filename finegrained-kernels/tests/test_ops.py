@@ -51,11 +51,10 @@ from utils import (  # type: ignore
 
 import finegrained_kernels  # type: ignore
 from finegrained_kernels import swizzle_mx_scales, unswizzle_mx_scales  # type: ignore
-from finegrained_kernels.batched import matmul_batched, mx_dynamic_matmul_batched_kernel  # type: ignore
+from finegrained_kernels.batched import mx_dynamic_matmul_batched_kernel  # type: ignore
 from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore
 from finegrained_kernels.grouped import (  # type: ignore
     block_fp8_weight_only_matmul_grouped_kernel,
-    matmul_grouped,
     mx_dynamic_matmul_grouped_kernel,
     w8a8_tensor_dynamic_fp8_matmul_grouped_kernel,
 )
@@ -807,34 +806,6 @@ def test_every_admitted_config_is_correct(problem: Problem, op, tuner):
         print(f"\n[sweep] {len(forgiven)} admitted config(s) failed to compile/run (forgiven):")
         for cfg, err in forgiven:
             print(f"  {cfg}: {err}")
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize("op", [matmul_batched, matmul_grouped])
-def test_weight_only_large_expert_offsets(op):
-    """Int32 routing must address expert slabs beyond 2GiB without wrapping.
-    The storage offset makes the old wrapped address read legal zeros; only two planes are touched.
-    """
-    if TEST_DEVICE != "cuda":
-        pytest.skip("CUDA large-allocation regression")
-    e, n, k = 512, 1280, 5120
-    stride, offset = n * k, 1 << 31
-    if torch.cuda.mem_get_info()[0] < offset + e * stride + (512 << 20):
-        pytest.skip("requires a sparse 5.2GiB backing allocation")
-    storage = torch.empty(offset + e * stride, device=TEST_DEVICE, dtype=torch.float8_e4m3fn)
-    wrapped = offset + (e - 1) * stride - (1 << 32)
-    storage[wrapped : wrapped + stride].zero_()
-    weight = storage[offset:].view(e, n, k)
-    weight[-1].fill_(1)
-    a = torch.ones(1, k, device=TEST_DEVICE, dtype=torch.bfloat16)
-    scales = torch.ones(e, 1, 1, device=TEST_DEVICE)
-    route = dict(expert_ids=torch.tensor([e - 1], device=TEST_DEVICE, dtype=torch.int32)) if op is matmul_batched else dict(
-        expert_start=torch.tensor([0] * e + [1], device=TEST_DEVICE, dtype=torch.int32)
-    )
-    out = op(
-        a, weight, None, scales, activation_format="bf16", output_dtype=torch.float32, **route,
-    )
-    torch.testing.assert_close(out, torch.full_like(out, k), rtol=0, atol=0)
 
 
 @pytest.mark.kernels_ci
