@@ -355,3 +355,23 @@ def resolve_output_dtype(
     if output_dtype is not None:
         return output_dtype
     return activation.dtype if act_scale is None else torch.bfloat16
+
+
+def block_fp8_weight_scale_grid(B: torch.Tensor, Bs: torch.Tensor, gate: bool = False):
+    """Normalize scalar/block FP8 scales and infer their block size from the grid.
+
+    A partial square block on N retains the size implied by K. Under a gate
+    epilogue, separately calibrated gate/up scale rows alternate per block.
+    """
+    assert B.dtype == torch.float8_e4m3fn and B.ndim in (2, 3)
+    experts = B.shape[0] if B.ndim == 3 else 1
+    rows, K = B.shape[-2:]
+    if Bs.numel() == experts:
+        return Bs.reshape(*B.shape[:-2], 1, 1), rows, K
+    assert Bs.ndim == B.ndim and Bs.shape[:-2] == B.shape[:-2]
+    assert K % Bs.shape[-1] == 0, "the weight scale grid must tile K evenly"
+    block_k = K // Bs.shape[-1]
+    block_n = block_k if ((rows + block_k - 1) // block_k) == Bs.shape[-2] else rows // Bs.shape[-2]
+    assert block_n > 0 and ((rows + block_n - 1) // block_n) == Bs.shape[-2]
+    assert not gate or Bs.shape[-2] == 1 or Bs.shape[-2] % 2 == 0, "gate/up scale rows must occur in pairs"
+    return Bs, block_n, block_k

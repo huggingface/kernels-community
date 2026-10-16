@@ -23,11 +23,12 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, sm_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
-from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
+from .formats import block_fp8_weight_scale_grid, check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
+from .loading.scales import dequant_block_fp8_weight_tile
 from .loading.tiles import (
     load_act_block_dynamic,
     load_act_mx,
@@ -1093,7 +1094,7 @@ def mx_weight_only_matmul_grouped_kernel(
         pre_hook=rebind_grouped_descriptors,
     ),
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
-    ["N", "K", "tokens_per_expert_bit_length", "GATE"],
+    ["N", "K", "tokens_per_expert_bit_length", "GATE", "SCALE_BLOCK_N", "SCALE_BLOCK_K", "GATE_SCALES"],
     n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BLOCK_SIZE_K is a tuned axis and the K-loop is maskless — veto non-dividing BKs.
@@ -1159,11 +1160,18 @@ def full_precision_matmul_grouped_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    WeightScales=None,
+    stride_scale_e=0,
+    stride_scale_n=0,
+    stride_scale_k=0,
+    SCALE_BLOCK_N: tl.constexpr = 1,
+    SCALE_BLOCK_K: tl.constexpr = 1,
+    GATE_SCALES: tl.constexpr = False,
 ):
-    """Full-precision grouped expert matmul kernel — persistent grid-stride over tiles.
+    """Raw-activation grouped GEMM — persistent grid-stride over expert tiles.
 
-    Grouped expert scheduling over unquantized BF16/FP16 activations and weights: plain
-    ``tl.dot`` with fp32 accumulation, no scales anywhere. ``GATE`` fuses the gate|up
+    BF16/FP16 activations multiply matching weights, or FP8 weights rescaled per tile
+    when ``WeightScales`` is provided, with FP32 accumulation. ``GATE`` fuses the gate|up
     projection (``B`` the ``(E, 2N, K)`` stack) into a ``[BK, 2*BN]`` dot + SwiGLU ``glu``,
     emitting the intermediate; ``GATE=False`` is the plain GEMM (bit-identical)."""
     start_pid = tl.program_id(axis=0)
@@ -1252,6 +1260,12 @@ def full_precision_matmul_grouped_kernel(
                 GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
                 B_DESCRIPTOR_IS_2D=B_DESCRIPTOR_IS_2D,
             )
+            if WeightScales is not None:
+                w = dequant_block_fp8_weight_tile(
+                    w, WeightScales, expert_id64, offs_bn, k * BLOCK_SIZE_K + offs_k,
+                    stride_scale_e, stride_scale_n, stride_scale_k,
+                    SCALE_BLOCK_N, SCALE_BLOCK_K, GATE_SCALES, False, a.dtype,
+                )
             acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
             if A_MEMORY_MODE == "pointer":
                 a_ptrs += BLOCK_SIZE_K * stride_a_k
@@ -2005,12 +2019,7 @@ def mx_dynamic_matmul_grouped(
     return [C, cs_ret] if requant else [C]
 
 
-@compile_time_only_triton_op(
-    add_op_namespace_prefix("full_precision_matmul_grouped"),
-    mutates_args=(),
-    opaque=True,
-)
-def full_precision_matmul_grouped(
+def _raw_activation_matmul_grouped(
     A: torch.Tensor,
     B: torch.Tensor,
     expert_start: torch.Tensor,
@@ -2025,23 +2034,25 @@ def full_precision_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    Bs: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
-    """Full-precision (BF16/FP16) grouped matmul over expert-sorted positions (per-tile
-    gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
-    No quantization anywhere: activations and weights share one high-precision dtype and the
-    dot accumulates in fp32. ``gate``/``act_fn``/``swiglu_*``/``simulate_unfused`` are the
-    dispatcher's gate|up fusion kwargs (GLU only; ``requant`` is meaningless without a quantized format).
-
-    A:  (S, K) BF16/FP16 activations — rows addressed via ``gather_idx``
-    B:  (num_experts, N, K) expert weights in A's dtype; under ``gate`` the (num_experts, 2N, K) stack
-    expert_start: (num_experts_pow2 + 1,) int32 — cumulative sorted-row starts, S sentinel
-    gather_idx: optional (S,) — sorted position -> source row of A; None = A is expert-sorted
-    scatter_idx: optional (S,) — sorted position -> destination row of C; None = C stays expert-sorted
-    """
+    """Shared raw-activation launch, optionally dequantizing FP8 weight tiles."""
     validate_dense_operands(A, B)
-    assert A.dtype == B.dtype and A.dtype in (torch.bfloat16, torch.float16), (
-        f"full-precision path needs matching BF16/FP16 A and B, got {A.dtype} / {B.dtype}"
-    )
+    if Bs is None:
+        assert A.dtype == B.dtype and A.dtype in (torch.bfloat16, torch.float16), (
+            f"full-precision path needs matching BF16/FP16 A and B, got {A.dtype} / {B.dtype}"
+        )
+        scale_operands = {}
+    else:
+        assert A.dtype in (torch.bfloat16, torch.float16), "FP8 weight-only takes raw BF16/FP16 activations"
+        Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate)
+        Bs = ue8m0_as_uint8(Bs)
+        scale_operands = dict(
+            WeightScales=Bs,
+            stride_scale_e=Bs.stride(0), stride_scale_n=Bs.stride(1), stride_scale_k=Bs.stride(2),
+            SCALE_BLOCK_N=scale_block_n, SCALE_BLOCK_K=scale_block_k,
+            GATE_SCALES=gate and Bs.shape[1] > 1,
+        )
     assert activation_format in (None, "bf16") and not quantize_output, (
         "the full-precision path quantizes nothing — no quantized activation format or requant applies"
     )
@@ -2096,10 +2107,68 @@ def full_precision_matmul_grouped(
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+            **scale_operands,
         )
 
     return [C]
 
+
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("full_precision_matmul_grouped"),
+    mutates_args=(),
+    opaque=True,
+)
+def full_precision_matmul_grouped(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    expert_start: torch.Tensor,
+    gate: bool = False,
+    act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
+    activation_format: str | None = None,
+    quantize_output: bool = False,
+    output_dtype: torch.dtype | None = None,
+    gather_idx: torch.Tensor | None = None,
+    scatter_idx: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+) -> list[torch.Tensor]:
+    """Full-precision BF16/FP16 grouped GEMM with no quantization."""
+    return _raw_activation_matmul_grouped(
+        A, B, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit,
+        simulate_unfused, activation_format, quantize_output, output_dtype,
+        gather_idx, scatter_idx, bias,
+    )
+
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("block_fp8_weight_only_matmul_grouped"),
+    mutates_args=(),
+    opaque=True,
+)
+def block_fp8_weight_only_matmul_grouped(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    expert_start: torch.Tensor,
+    gate: bool = False,
+    act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
+    activation_format: str | None = None,
+    quantize_output: bool = False,
+    output_dtype: torch.dtype | None = None,
+    gather_idx: torch.Tensor | None = None,
+    scatter_idx: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+) -> list[torch.Tensor]:
+    """FP8 W8A16 grouped GEMM; rescale weight tiles inside the raw-activation GEMM."""
+    return _raw_activation_matmul_grouped(
+        A, B, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit,
+        simulate_unfused, activation_format, quantize_output, output_dtype,
+        gather_idx, scatter_idx, bias, Bs=Bs,
+    )
 
 @compile_time_only_triton_op(
     add_op_namespace_prefix("mx_weight_only_matmul_grouped"),
@@ -2281,6 +2350,14 @@ def matmul_grouped(
         "output_global_scale is the NVFP4 requant second level — it requires quantize_output=True on NVFP4 "
         "(the epilogue would otherwise normalize by it with nothing downstream to compensate)"
     )
+    if Bs is not None and not is_mx(B, Bs) and activation_format == "bf16":
+        assert As is None and not quantize_output, "weight-only takes raw activations without requantization"
+        out = block_fp8_weight_only_matmul_grouped(
+            A, B, Bs, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit,
+            simulate_unfused, activation_format, quantize_output, output_dtype,
+            gather_idx, scatter_idx, bias=bias,
+        )
+        return out[0]
     # a calibrated (static) scale on a raw A (see `tensor_wide_act_operands`): block-scale weights
     # have a dedicated static kernel, per-tensor ones read the same As on the tensor-wide arm
     static_act = As is not None and As.ndim <= 1 and As.numel() in (1, B.shape[0]) and A.dtype != FP8_DTYPE

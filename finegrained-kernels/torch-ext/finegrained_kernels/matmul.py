@@ -23,7 +23,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_weight_only_descriptors
-from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
+from .formats import block_fp8_weight_scale_grid, check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands
 from .loading.scales import apply_global_scale, mx_2d_scale_ptrs
@@ -921,6 +921,87 @@ def mx_weight_only_matmul_2d_kernel(
 
 
 @bayesian_autotune(
+    get_accelerator_autotuning_configs(tune_block_nk=True, tune_block_m=True),
+    ["N", "K", "m_bit_length", "GATE", "SCALE_BLOCK_N", "SCALE_BLOCK_K"],
+    n_trials=100,
+    finite_check_args=("C",),
+    prune_configs_by={"early_config_prune": block_within_dim_pruner("K")},
+)
+@triton.jit
+def block_fp8_weight_only_matmul_2d_kernel(
+    A, B, Bs, C, Bias,
+    M, N, K, m_bit_length,
+    stride_a_m, stride_a_k, stride_b_n, stride_b_k,
+    stride_bs_n, stride_bs_k, stride_c_m, stride_c_n,
+    stride_bias_e, stride_bias_n,
+    SCALE_BLOCK_N: tl.constexpr,
+    SCALE_BLOCK_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GATE: tl.constexpr = False,
+    ACT_FN: tl.constexpr = "silu",
+    SWIGLU_ALPHA: tl.constexpr = None,
+    SWIGLU_LIMIT: tl.constexpr = None,
+    SIMULATE_UNFUSED: tl.constexpr = False,
+    INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    GATE_SCALES: tl.constexpr = False,
+):
+    """Raw BF16/FP16 acts against FP8 weights with coarse FP32 block scales.
+    Dequantization stays inside the GEMM tile: no activation quantization or
+    full-precision weight buffer is needed, including for per-tensor scales.
+    """
+    n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
+        M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GATE=GATE
+    )
+    rows = 2 * N if GATE else N
+    accumulator = tl.zeros((BLOCK_SIZE_M, n_width), dtype=tl.float32)
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
+        kk = k * BLOCK_SIZE_K + offs_k
+        a = tl.load(
+            A + offs_am[:, None] * stride_a_m + kk[None, :] * stride_a_k,
+            mask=(offs_am[:, None] < M) & (kk[None, :] < K), other=0,
+        )
+        w = tl.load(
+            B + kk[:, None] * stride_b_k + offs_bn[None, :] * stride_b_n,
+            mask=(kk[:, None] < K) & (offs_bn[None, :] < rows), other=0.0,
+        ).to(tl.float32)
+        if GATE_SCALES:
+            scale_n = (offs_bn // 2 // SCALE_BLOCK_N) * 2 + offs_bn % 2
+        else:
+            scale_n = offs_bn // SCALE_BLOCK_N
+        scale = tl.load(
+            Bs + (kk[:, None] // SCALE_BLOCK_K) * stride_bs_k
+            + scale_n[None, :] * stride_bs_n,
+            mask=(kk[:, None] < K) & (offs_bn[None, :] < rows), other=0.0,
+        )
+        if Bs.dtype.element_ty == tl.uint8:
+            scale = tl.exp2(scale.to(tl.float32) - 127.)
+        w = (w * scale.to(tl.float32)).to(a.dtype)
+        accumulator = tl.dot(a, w, accumulator)
+    if GATE:
+        out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        gemm_epilogue(
+            C, None, accumulator, out_row, pid_n, pid_m, out_row < M,
+            stride_c_m, stride_c_n, 0, 0,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
+            ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+            COMPUTE_MODE="dot", N_COLS=N,
+            Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
+        )
+    else:
+        accumulator = add_bias(
+            accumulator, Bias, stride_bias_e, stride_bias_n, 0, pid_n,
+            BLOCK_SIZE_N, N, False,
+        )
+        store_masked(
+            C, accumulator, pid_m, pid_n, M, N, stride_c_m, stride_c_n,
+            BLOCK_SIZE_M, BLOCK_SIZE_N,
+        )
+
+
+@bayesian_autotune(
     # Same 2D-swizzle loop physics as the tensor kernel — tune the tile, WS a pure perf axis
     # (compile-guarded), no memory-mode/scale axes (unquantized, no scales anywhere).
     get_accelerator_autotuning_configs(tune_block_nk=True, warp_spec=True, tune_block_m=True),
@@ -1731,6 +1812,49 @@ def mx_weight_only_matmul_2d(
         )
 
     return [C]
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("block_fp8_weight_only_matmul_2d"), mutates_args=(), opaque=True,
+)
+def block_fp8_weight_only_matmul_2d(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype | None = None,
+    gate: bool = False,
+    act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
+    bias: torch.Tensor | None = None,
+) -> list[torch.Tensor]:
+    """Block/per-tensor FP8 weights with unquantized activations (ModelOpt FP8_PB_WO)."""
+    assert A.dtype in (torch.bfloat16, torch.float16), "weight-only FP8 expects BF16/FP16 activations"
+    assert A.is_contiguous(), "A must be contiguous"
+    assert B.ndim == 2 and B.dtype == torch.float8_e4m3fn
+    assert Bs.ndim == 2 or Bs.numel() == 1, "weight scales must be a 2D block grid or a scalar"
+    rows, K = B.shape
+    assert A.shape[-1] == K
+    M = A.numel() // K
+    N = rows // 2 if gate else rows
+    Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate)
+    Bs = ue8m0_as_uint8(Bs)
+    C = A.new_empty(A.shape[:-1] + (N,), dtype=resolve_output_dtype(output_dtype, A, None))
+    with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
+        compile_time_only_triton_wrap(block_fp8_weight_only_matmul_2d_kernel)[
+            lambda meta: (triton.cdiv(M, meta["BLOCK_SIZE_M"]), triton.cdiv(N, meta["BLOCK_SIZE_N"]))
+        ](
+            A, B, Bs, C, bias, M, N, K, int(M).bit_length(),
+            A.stride(-2), A.stride(-1), B.stride(0), B.stride(1),
+            Bs.stride(0), Bs.stride(1), C.stride(-2), C.stride(-1),
+            bias_stride_e, bias_stride_n,
+            SCALE_BLOCK_N=scale_block_n, SCALE_BLOCK_K=scale_block_k,
+            GATE=gate, ACT_FN=act_fn, SWIGLU_ALPHA=swiglu_alpha,
+            SWIGLU_LIMIT=swiglu_limit, SIMULATE_UNFUSED=simulate_unfused,
+            INTERMEDIATE_DTYPE=tl_dtype(resolve_output_dtype(output_dtype, A, None)),
+            GATE_SCALES=gate and Bs.shape[0] > 1,
+        )
+    return [C]
 
 
 # ── torch scaled_mm fast path (2D dense, Blackwell) ──────────────────────────
@@ -1984,6 +2108,13 @@ def matmul_2d(
                 A, B, As, Bs, output_dtype, activation_format,
                 gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, quantize_output,
                 a_global_scale, b_global_scale, output_global_scale, bias=bias)
+        )
+    if activation_format == "bf16":
+        assert As is None and not quantize_output, "weight-only takes raw activations without requantization"
+        return _unwrap(
+            block_fp8_weight_only_matmul_2d(
+                A, B, Bs, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit,
+                simulate_unfused, bias=bias)
         )
     # FP8 activations are always E4M3 with the weight-implied scale granularity, so "fp8" is a
     # no-op format name (accepted for symmetry with the MoE ops); no other name applies here.

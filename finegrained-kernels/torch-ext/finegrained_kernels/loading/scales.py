@@ -323,3 +323,30 @@ def mx_2d_scale_ptrs(
         as_mask = offs_am_lin < M
         bs_mask = offs_bn_lin < (2 * N if GATE else N)
     return as_ptrs, bs_ptrs, as_mask, bs_mask
+
+
+@triton.jit
+def dequant_block_fp8_weight_tile(
+    w, Scales, expert, offs_n, offs_k,
+    stride_scale_e, stride_scale_n, stride_scale_k,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GATE_SCALES: tl.constexpr = False,
+    SWAP_AB: tl.constexpr = False,
+    DTYPE: tl.constexpr = tl.bfloat16,
+):
+    """Rescale an FP8 tile to the raw activation dtype, retaining coarse block scales.
+
+    Gate/up weight rows alternate per value; their scale rows alternate per block.
+    """
+    if GATE_SCALES:
+        scale_n = (offs_n // 2 // BLOCK_N) * 2 + offs_n % 2
+    else:
+        scale_n = offs_n // BLOCK_N
+    scales = tl.load(
+        Scales + expert * stride_scale_e + scale_n[:, None] * stride_scale_n
+        + (offs_k[None, :] // BLOCK_K) * stride_scale_k
+    )
+    scales = decode_group_scale(scales)
+    if not SWAP_AB:
+        scales = tl.trans(scales)
+    return (w.to(tl.float32) * scales).to(DTYPE)

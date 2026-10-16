@@ -75,6 +75,11 @@ matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None,
   gate|up stack whose halves a checkpoint calibrated separately carries one global per half; the
   loader merges those into one per expert (the up half's folds into the down projection's global,
   SwiGLU being linear in it) rather than the ops taking a second layout.
+- Weight-only FP8 (`activation_format="bf16"`) supports both coarse block scales and one scale
+  per tensor/expert, as well as MX group scales. The GEMM reads FP8 weights and rescales each
+  tile into the activation dtype inside the kernel, without quantizing activations or allocating
+  a full-precision weight matrix. Dense, grouped, batched, and fused MoE entrypoints share this
+  contract, including separately calibrated interleaved gate/up scale grids.
 - Routing: `matmul_batched` reads one expert id per row (`expert_ids`, EP sentinels
   `>= num_experts` skipped); `matmul_grouped` takes the launch maps from
   `compute_grouped_scheduling(expert_ids, num_experts, top_k)` — no pre-sorted input required.
