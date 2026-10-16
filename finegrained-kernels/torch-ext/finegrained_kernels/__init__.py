@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+from .embedding import embedding_lookup
 from .matmul import matmul_2d
 from .batched import matmul_batched
 from .grouped import matmul_grouped
@@ -26,6 +27,7 @@ from .quant import mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant
 __all__ = [
     # the three GEMM dispatchers (the weight format is read off the tensors; `activation_format`
     # names the activations', the gate|up fusion rides as kwargs)
+    "embedding_lookup",
     "matmul_2d",
     "matmul_batched",
     "matmul_grouped",

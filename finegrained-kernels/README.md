@@ -43,6 +43,32 @@ The unfused two-GEMM references (`moe.moe_unfused_*`), the cuBLAS baseline (`moe
 `scheduling.compute_grouped_scheduling` and the block/tensor fp8 and two-level NVFP4 quantizers stay
 importable from their modules.
 
+### Quantized embedding lookup
+
+```python
+import kernels
+
+kernel = kernels.get_kernel("kernels-community/finegrained-kernels", version=0)
+rows = kernel.embedding_lookup(weight, indices, scale, global_scale=None, output_dtype=None)
+```
+
+This inference op gathers and dequantizes only the selected rows in one launch. FP8 takes a
+`(vocab, width)` E4M3 table and a scalar scale; its output defaults to the scale dtype. NVFP4 takes
+low-nibble-first packed int8/uint8 weights `(vocab, width // 2)`, an affine E4M3 scale grid
+`(vocab, width // 16)`, and one FP32 global multiplier; its output defaults to bf16. All tensors
+must share a device. Table and grid strides can describe column or row slices without copies.
+
+Indices may be int32/int64, noncontiguous, repeated, scalar, or empty. Negative and out-of-range
+indices trigger a device assertion, as native embedding lookup does. A padding index returns its
+stored row. Output can be fp16, bf16, or fp32; fullgraph compilation is supported. The op neither
+materializes a full dequantized table nor needs GEMM autotuning.
+
+`bench/bench_embedding.py` compares the selected-row PyTorch expressions (including a compiled
+baseline) with the fused op for decode/prefill and repeated/cold indices. It flushes 256 MiB outside
+the cold timed replay; single-replay event overhead makes cold timings distinct from batched hot
+CUDA-graph timings. NVFP4's ordinary eager LUT construction cannot be graph-captured, so its
+benchmark uses the compiled PyTorch baseline.
+
 ### GEMM dispatchers
 
 Every op takes the same operand spec and routes to the right kernel **from the weight dtype and
