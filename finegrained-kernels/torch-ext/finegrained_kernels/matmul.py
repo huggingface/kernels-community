@@ -1914,7 +1914,7 @@ def matmul_2d(
     a_global_scale: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
-) -> torch.Tensor | List[torch.Tensor]:
+) -> torch.Tensor | list[torch.Tensor]:
     """Dense (2D) quantized matmul dispatcher (W8A8 FP8, W4A8/W4A4 FP4) — the single-GEMM sibling of
     ``matmul_grouped``/``matmul_batched``, taking the same ``As``/``Bs`` scale spec,
     ``activation_format`` / gate|up fusion kwargs, and inferred quant block (no ``block_size`` argument — it
@@ -1954,7 +1954,7 @@ def matmul_2d(
         "(the epilogue would otherwise normalize by it with nothing downstream to compensate)"
     )
 
-    def _unwrap(ret: List[torch.Tensor]) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    def _unwrap(ret: list[torch.Tensor]) -> torch.Tensor | tuple[torch.Tensor, ...]:
         # tuple, matching the routed siblings — callers branch on isinstance(out, tuple)
         return ret[0] if len(ret) == 1 else tuple(ret)
 
