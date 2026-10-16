@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 
-kernel = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=2)
+kernel = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=3)
 DEVICE = kernel.infer_device()
 requires_accelerator = pytest.mark.skipif(DEVICE == "cpu", reason="the kernel needs an accelerator")
 

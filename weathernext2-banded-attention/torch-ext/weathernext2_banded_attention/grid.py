@@ -70,17 +70,23 @@ def _forecast_output(
 class WeatherNext2ConditionedMlp(nn.Module):
     can_torch_compile = True
 
-    def forward(self, hidden_states, conditioning):
+    def forward(self, hidden_states, conditioning, spatial_features=None):
         if not _can_tile(self, hidden_states) or self.chunk_size is None:
-            return type(self).forward(self, hidden_states, conditioning)
+            return type(self).forward(self, hidden_states, conditioning, spatial_features=spatial_features)
+        if hidden_states.ndim == 2:
+            hidden_states = hidden_states.unsqueeze(1).expand(-1, spatial_features.shape[0], -1)
         batch, points, _ = hidden_states.shape
         channels = self.fc2.out_features
-        output = hidden_states.new_empty((batch, points, channels))
+        output = hidden_states.new_empty((batch, points, channels), dtype=self.fc2.weight.dtype)
         fused = not output.is_cpu and output.dtype == torch.float32
         film = self.norm.linear(conditioning) if fused else None
         for start in range(0, points, self.chunk_size):
             end = min(start + self.chunk_size, points)
-            values = self.fc2(self.activation_fn(self.fc1(hidden_states[:, start:end])))
+            states = hidden_states[:, start:end].to(dtype=self.fc1.weight.dtype)
+            if spatial_features is not None:
+                spatial = spatial_features[start:end].to(states).unsqueeze(0).expand(batch, -1, -1)
+                states = torch.cat([spatial, states], dim=-1)
+            values = self.fc2(self.activation_fn(self.fc1(states)))
             target = output[:, start:end]
             if not fused:
                 target.copy_(self.norm(values, conditioning))

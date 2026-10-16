@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 
-kernel = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=2)
+kernel = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=3)
 DEVICE = kernel.infer_device()
 
 
@@ -32,7 +32,13 @@ class _Mlp(nn.Module):
         self.activation_fn = torch.nn.functional.gelu
         self.norm = _ConditionedNorm(outputs)
 
-    def forward(self, states, conditioning):
+    def forward(self, states, conditioning, spatial_features=None):
+        states = states.to(dtype=self.fc1.weight.dtype)
+        if spatial_features is not None:
+            if states.ndim == 2:
+                states = states.unsqueeze(1).expand(-1, spatial_features.shape[0], -1)
+            spatial_features = spatial_features.to(states).unsqueeze(0).expand(states.shape[0], -1, -1)
+            states = torch.cat([spatial_features, states], dim=-1)
         return self.norm(self.fc2(self.activation_fn(self.fc1(states))), conditioning)
 
 
@@ -108,9 +114,13 @@ def _grid_case(layer_name, dtype=torch.float32):
     torch.manual_seed(7)
     conditioning = torch.randn(2, 4, device=DEVICE, dtype=dtype)
     grid = torch.randn(2, 38, 16, device=DEVICE, dtype=dtype)[:, ::2]
-    if layer_name == "mlp":
-        layer, replacement = _Mlp(16, 16), kernel.WeatherNext2ConditionedMlp
-        args = (grid, conditioning)
+    if layer_name in ("mlp", "grid_encoder", "mesh_encoder"):
+        spatial = None if layer_name == "mlp" else torch.randn(19, 3, device=DEVICE)
+        states = grid if layer_name != "mesh_encoder" else grid[:, 0]
+        if spatial is not None:
+            states = states.float()
+        layer, replacement = _Mlp(16 if spatial is None else 19, 16), kernel.WeatherNext2ConditionedMlp
+        args = (states, conditioning, spatial)
     elif layer_name == "head":
         layer, replacement = _Head(), kernel.WeatherNext2ForecastHead
         args = (grid,)
@@ -132,7 +142,7 @@ def _grid_case(layer_name, dtype=torch.float32):
 
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("layer_name", ["mlp", "grid_to_mesh", "mesh_to_grid", "head"])
+@pytest.mark.parametrize("layer_name", ["mlp", "grid_encoder", "mesh_encoder", "grid_to_mesh", "mesh_to_grid", "head"])
 def test_tiled_grid_preserves_reference(layer_name, dtype):
     layer, replacement, args = _grid_case(layer_name, dtype)
     with torch.inference_mode():
@@ -144,7 +154,7 @@ def test_tiled_grid_preserves_reference(layer_name, dtype):
 
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("training", [False, True])
-@pytest.mark.parametrize("layer_name", ["mlp", "grid_to_mesh", "mesh_to_grid", "head"])
+@pytest.mark.parametrize("layer_name", ["mlp", "grid_encoder", "mesh_encoder", "grid_to_mesh", "mesh_to_grid", "head"])
 def test_gradients_use_reference(training, layer_name):
     layer, replacement, args = _grid_case(layer_name)
     layer.train(training)
@@ -162,7 +172,7 @@ def test_gradients_use_reference(training, layer_name):
 
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("fallback", ["training", "autocast"])
-@pytest.mark.parametrize("layer_name", ["mlp", "grid_to_mesh", "mesh_to_grid", "head"])
+@pytest.mark.parametrize("layer_name", ["mlp", "grid_encoder", "mesh_encoder", "grid_to_mesh", "mesh_to_grid", "head"])
 def test_inference_fallback_preserves_inputs(fallback, layer_name):
     layer, replacement, args = _grid_case(layer_name)
     layer.train(fallback == "training")
@@ -176,7 +186,7 @@ def test_inference_fallback_preserves_inputs(fallback, layer_name):
 
 
 @pytest.mark.skipif(DEVICE == "cpu", reason="requires an accelerator")
-@pytest.mark.parametrize("layer_name", ["mlp", "grid_to_mesh", "mesh_to_grid", "head"])
+@pytest.mark.parametrize("layer_name", ["mlp", "grid_encoder", "mesh_encoder", "grid_to_mesh", "mesh_to_grid", "head"])
 def test_tiled_epilogue_compile(layer_name):
     layer, replacement, args = _grid_case(layer_name)
     compiled = torch.compile(replacement.forward, fullgraph=True)

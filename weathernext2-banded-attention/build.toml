@@ -1,6 +1,6 @@
 [general]
 name = "weathernext2-banded-attention"
-version = 2
+version = 3
 license = "Apache-2.0"
 # Shared Triton source for the supported accelerator backends.
 backends = ["cuda", "rocm", "xpu"]
