@@ -40,13 +40,6 @@ CI_INFERENCE = {
     ("recurrent_gated_delta_rule", "dense", 1, 2, 64, (4,)),
     ("recurrent_kimi_delta_attention", "dense", 1, 2, 64, (1,)),
 }
-# Training is too expensive we only check inference for sanity
-CI_TRAINING = {
-    # ("chunk_kimi_delta_attention", "dense", 2, 2, 32, (32,)),
-    # ("chunk_kimi_delta_attention", "packed", 1, 2, 32, (32, 16)),
-    # ("chunk_gated_delta_rule", "dense", 2, 2, 32, (32,)),
-    # ("chunk_gated_delta_rule", "packed", 1, 2, 32, (32, 16)),
-}
 
 def _lin_attention_cases(names, ci_cases):
     cases = []
@@ -236,7 +229,7 @@ def test_lin_attention_compiled_outputs_match_eager(
 
 @pytest.mark.parametrize(
     "name,mode,bsz,heads,head_dim,lengths",
-    _lin_attention_cases(TRAINABLE_LIN_ATTENTION, CI_TRAINING),
+    _lin_attention_cases(TRAINABLE_LIN_ATTENTION, {}),  # Training is too expensive for CI so empty
 )
 def test_lin_attention_compiled_outputs_and_gradients_match_eager(
     fla, device, name, mode, bsz, heads, head_dim, lengths
