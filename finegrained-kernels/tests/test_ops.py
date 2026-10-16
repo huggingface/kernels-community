@@ -796,3 +796,129 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
         print(f"\n[sweep] {len(forgiven)} admitted config(s) failed to compile/run (forgiven):")
         for cfg, err in forgiven:
             print(f"  {cfg}: {err}")
+
+
+# Embedding lookup has no GEMM operands or epilogue: check the selected-row operation directly.
+
+
+def _embedding_table(packed, dtype, sliced=False):
+    device = TEST_DEVICE
+    rows, width = 37, 160
+    if packed:
+        weight = torch.randint(
+            0, 256, (rows, width // 2), device=device, dtype=torch.uint8
+        )
+        scale = (torch.rand(rows, width // 16, device=device) * 3 + 0.125).to(
+            torch.float8_e4m3fn
+        )
+        weight[0] = torch.arange(16, device=device, dtype=torch.uint8).mul(17).repeat(5)
+        global_scale = torch.tensor([0.0371], device=device)
+        if sliced:
+            weight, scale = weight[:, :40].view(torch.int8), scale[:, :5]
+    else:
+        weight = (torch.randn(rows, width, device=device) * 3).to(torch.float8_e4m3fn)
+        scale = torch.tensor([0.375], device=device, dtype=dtype)
+        global_scale = None
+        if sliced:
+            weight = weight[:, :80]
+    return weight, scale, global_scale
+
+
+def _embedding_reference(weight, ids, scale, global_scale, dtype):
+    rows = torch.nn.functional.embedding(ids, weight)
+    if global_scale is None:
+        return rows.to(scale.dtype) * scale
+    selected_scales = torch.nn.functional.embedding(ids, scale)
+    return (dq_grouped(rows, selected_scales, 16) * global_scale).to(dtype)
+
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("sliced", [False, True])
+def test_embedding_lookup_matches_selected_rows(packed, dtype, sliced):
+    weight, scale, global_scale = _embedding_table(packed, dtype, sliced)
+    ids = torch.tensor([[3, 0, 3], [36, 4, 0]], device=weight.device).t()
+    actual = finegrained_kernels.embedding_lookup(weight, ids, scale, global_scale, dtype)
+    torch.testing.assert_close(
+        actual,
+        _embedding_reference(weight, ids, scale, global_scale, dtype),
+        rtol=0,
+        atol=0,
+    )
+    assert actual.dtype == dtype
+    default = finegrained_kernels.embedding_lookup(weight, ids, scale, global_scale)
+    default_dtype = torch.bfloat16 if packed else scale.dtype
+    assert default.dtype == default_dtype
+    torch.testing.assert_close(
+        default,
+        _embedding_reference(weight, ids, scale, global_scale, default_dtype),
+        rtol=0,
+        atol=0,
+    )
+    for ids in (ids.to(torch.int32), ids.new_empty((2, 0)), ids.new_tensor(3)):
+        actual = finegrained_kernels.embedding_lookup(
+            weight, ids, scale, global_scale, dtype
+        )
+        torch.testing.assert_close(
+            actual,
+            _embedding_reference(weight, ids, scale, global_scale, dtype),
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("packed", [False, True])
+def test_embedding_lookup_fullgraph_compile(packed):
+    weight, scale, global_scale = _embedding_table(packed, torch.bfloat16)
+    ids = torch.tensor([[3, 0, 3], [36, 4, 0]], device=weight.device).t()
+    lookup = torch.compile(finegrained_kernels.embedding_lookup, fullgraph=True)
+    actual = lookup(weight, ids, scale, global_scale, torch.bfloat16)
+    torch.testing.assert_close(
+        actual,
+        _embedding_reference(weight, ids, scale, global_scale, torch.bfloat16),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("invalid", ["indices", "weight", "scale", "global", "width"])
+def test_embedding_lookup_rejects_invalid_metadata(invalid):
+    weight, scale, global_scale = _embedding_table(True, torch.bfloat16)
+    ids = torch.tensor([0], device=weight.device)
+    if invalid == "indices":
+        ids = ids.float()
+    elif invalid == "weight":
+        weight = weight.float()
+    elif invalid == "scale":
+        scale = scale[:, :-1]
+    elif invalid == "global":
+        global_scale = global_scale.half()
+    else:
+        weight, scale = weight[:, :0], scale[:, :0]
+    with pytest.raises(ValueError):
+        finegrained_kernels.embedding_lookup(weight, ids, scale, global_scale)
+
+
+def _embedding_invalid_index(_rank, index, packed):
+    weight = torch.ones(37, 16 if packed else 32, device=TEST_DEVICE).to(
+        torch.uint8 if packed else torch.float8_e4m3fn
+    )
+    scale = (
+        torch.ones(37, 2, device=TEST_DEVICE).to(torch.float8_e4m3fn)
+        if packed else torch.ones(1, device=TEST_DEVICE)
+    )
+    global_scale = torch.ones(1, device=TEST_DEVICE) if packed else None
+    finegrained_kernels.embedding_lookup(weight, torch.tensor([index], device=TEST_DEVICE), scale, global_scale)
+    getattr(torch, torch.device(TEST_DEVICE).type).synchronize()
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("index", [-1, 37])
+def test_embedding_invalid_index_fails_in_separate_process(index, packed):
+    # Isolate the poisoned device context, as for native embedding's bounds assertions.
+    with pytest.raises(torch.multiprocessing.ProcessRaisedException, match="(?i)device-side assert|assertion failure"):
+        torch.multiprocessing.spawn(_embedding_invalid_index, args=(index, packed), nprocs=1)

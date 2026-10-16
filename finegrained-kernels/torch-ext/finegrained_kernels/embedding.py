@@ -18,7 +18,13 @@ import torch
 import triton
 import triton.language as tl
 
-from .compat import add_op_namespace_prefix, device_context
+from .compat import (
+    add_op_namespace_prefix,
+    compile_time_only_triton_op,
+    compile_time_only_triton_wrap,
+    device_context,
+)
+from .quant import e2m1_cols_to_f32
 
 
 @triton.jit
@@ -38,35 +44,45 @@ def _embedding_kernel(
     NVFP4: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    valid = offsets < N * D
-    row = tl.load(Ids + offsets // D, valid, other=0).to(tl.int64)
-    tl.device_assert(((row >= 0) & (row < V)) | ~valid, "embedding index out of range")
-    col = offsets % D
+    # Read each packed byte once and let the shared decoder interleave its two values.
+    packing: tl.constexpr = 2 if NVFP4 else 1
+    offsets = tl.program_id(0) * (BLOCK // packing) + tl.arange(0, BLOCK // packing)
+    valid = offsets < N * (D // packing)
+    row = tl.load(Ids + offsets // (D // packing), valid, other=0).to(tl.int64)
+    in_bounds = (row >= 0) & (row < V)
+    tl.device_assert(in_bounds | ~valid, "embedding index out of range")
+    valid = valid & in_bounds
+    col = offsets % (D // packing)
     if NVFP4:
-        packed = tl.load(W + row * W_ROW + (col // 2) * W_COL, valid, other=0).to(
-            tl.uint8
-        )
-        code = (packed >> ((col % 2) * 4)) & 15
-        magnitude = (code & 7).to(tl.int32)
-        bits = (((magnitude >> 1) + 126) << 23) | ((magnitude & 1) << 22)
-        value = tl.where(
-            magnitude < 2,
-            magnitude.to(tl.float32) * 0.5,
-            bits.to(tl.float32, bitcast=True),
-        )
-        value = tl.where((code & 8) != 0, -value, value)
-        scale = tl.load(S + row * S_ROW + (col // 16) * S_COL, valid, other=0.0).to(
+        packed = tl.load(W + row * W_ROW + col * W_COL, valid, other=0).to(tl.uint8)
+        value = e2m1_cols_to_f32(packed)
+        scale = tl.load(S + row * S_ROW + (col // 8) * S_COL, valid, other=0.0).to(
             tl.float32
         )
-        value = (value * scale) * tl.load(G).to(tl.float32)
+        value = (value * tl.interleave(scale, scale)) * tl.load(G).to(tl.float32)
     else:
         value = tl.load(W + row * W_ROW + col * W_COL, valid, other=0.0).to(tl.float32)
         value = value * tl.load(S).to(tl.float32)
-    tl.store(Out + offsets, value, valid)
+    output_offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(Out + output_offsets, value, output_offsets < N * D)
 
 
-def _output_spec(weight, indices, scale, global_scale, output_dtype):
+@compile_time_only_triton_op(add_op_namespace_prefix("embedding_lookup"))
+def embedding_lookup(
+    weight: torch.Tensor,
+    indices: torch.Tensor,
+    scale: torch.Tensor,
+    global_scale: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Gather and dequantize only selected rows, without expanding the embedding table.
+
+    FP8 takes an E4M3 table and one scale (output defaults to the scale dtype). NVFP4 takes
+    low-nibble-first packed int8/uint8 weights, an affine E4M3 scale grid per 16 values, and
+    one FP32 multiplier (output defaults to bf16). Table/grid strides may describe TP slices.
+    Indices follow ``torch.nn.functional.embedding``: negative and out-of-range values fail;
+    padding indices look up their stored row. Empty, repeated, and noncontiguous indices work.
+    """
     packed = global_scale is not None
     if weight.ndim != 2 or indices.dtype not in (torch.int32, torch.int64):
         raise ValueError("Expected a 2D embedding table and int32/int64 indices.")
@@ -104,35 +120,17 @@ def _output_spec(weight, indices, scale, global_scale, output_dtype):
         dtype = output_dtype or scale.dtype
     if dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError("Embedding output must be float16, bfloat16, or float32.")
-    return packed, width, dtype
-
-
-@torch.library.custom_op(add_op_namespace_prefix("embedding_lookup"), mutates_args=())
-def embedding_lookup(
-    weight: torch.Tensor,
-    indices: torch.Tensor,
-    scale: torch.Tensor,
-    global_scale: torch.Tensor | None = None,
-    output_dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    """Gather and dequantize only selected rows, without expanding the embedding table.
-
-    FP8 takes an E4M3 table and one scale (output defaults to the scale dtype). NVFP4 takes
-    low-nibble-first packed int8/uint8 weights, an affine E4M3 scale grid per 16 values, and
-    one FP32 multiplier (output defaults to bf16). Table/grid strides may describe TP slices.
-    Indices follow ``torch.nn.functional.embedding``: negative and out-of-range values fail;
-    padding indices look up their stored row. Empty, repeated, and noncontiguous indices work.
-    """
-    packed, width, dtype = _output_spec(
-        weight, indices, scale, global_scale, output_dtype
-    )
+    if width == 0:
+        raise ValueError("Embedding width must be positive.")
+    if weight.device.type not in ("cuda", "xpu"):
+        raise ValueError("Fused embedding lookup requires a CUDA, ROCm, or XPU device.")
     out = torch.empty((*indices.shape, width), dtype=dtype, device=weight.device)
     if indices.numel() == 0:
         return out
-    if weight.device.type not in ("cuda", "xpu"):
-        raise ValueError("Fused embedding lookup requires a CUDA, ROCm, or XPU device.")
     with device_context(weight.device):
-        _embedding_kernel[(triton.cdiv(indices.numel() * width, 256),)](
+        compile_time_only_triton_wrap(_embedding_kernel)[
+            (triton.cdiv(indices.numel() * width, 256),)
+        ](
             weight,
             indices.reshape(-1),
             scale,
@@ -152,9 +150,3 @@ def embedding_lookup(
             debug=True,
         )
     return out
-
-
-@embedding_lookup.register_fake
-def _(weight, indices, scale, global_scale=None, output_dtype=None):
-    _, width, dtype = _output_spec(weight, indices, scale, global_scale, output_dtype)
-    return weight.new_empty((*indices.shape, width), dtype=dtype)
