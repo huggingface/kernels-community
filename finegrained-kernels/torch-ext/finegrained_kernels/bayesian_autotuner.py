@@ -489,6 +489,7 @@ class BayesianAutotuner(Autotuner):
         # per-dimension model can write off a whole axis it never saw succeed (two dsv4 tunes
         # shipped 25-60% slow winners because their random seeds only sampled a basin's dead
         # configs), and coordinate descent can't recover a winner two coupled flips away.
+        single_trial = self.n_trials == 1
         n_startup = max(2, min(self.n_startup_trials, self.n_trials))
         anchors = self._basin_anchor_indices(configs)
         order = list(range(len(configs)))
@@ -496,7 +497,10 @@ class BayesianAutotuner(Autotuner):
         warm_idx = self._warm_start_index(configs, key)
         head = anchors + ([warm_idx] if warm_idx is not None else [])
         order = list(dict.fromkeys(head + order))
-        for idx in order[: max(n_startup, len(head))]:
+        # Budget 1 is the fast correctness-test mode: stop after one valid measurement,
+        # rather than probing every basin. The TPE loop below retries failed candidates.
+        seed_count = 1 if single_trial else max(n_startup, len(head))
+        for idx in order[:seed_count]:
             bench_idx(idx)
 
         # TPE: split measured configs into good (top-gamma) / bad, build per-dimension value
@@ -574,7 +578,7 @@ class BayesianAutotuner(Autotuner):
 
         # Coordinate-descent refinement: try single-dim perturbations around
         # the current best until no neighbor improves.
-        if self.refine:
+        if self.refine and not single_trial:
             for _ in range(self.max_refine_iters):
                 best_idx = min(timings, key=timings.get)
                 best_sig = sigs[best_idx]
@@ -597,7 +601,7 @@ class BayesianAutotuner(Autotuner):
         # the top candidates back-to-back — same warmed process, adjacent in time, so they see
         # the same clocks — and crown the winner of THAT comparison. Costs ~3 extra benches.
         finite = sorted((t, i) for i, t in timings.items() if t != float("inf"))
-        if len(finite) > 1:
+        if len(finite) > 1 and not single_trial:
             for _, i in finite[:3]:
                 timings.pop(i, None)
                 bench_idx(i)  # memoizing closure: re-benches and re-records the popped entry
