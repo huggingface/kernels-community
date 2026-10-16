@@ -879,15 +879,9 @@ def raw_activation_pointer_pruner():
 
 
 def native_mma_m_pruner():
-    """``early_config_prune`` dropping the unswapped ``BLOCK_SIZE_M < 64`` rows of a 2D plain fp8
-    ``tl.dot`` kernel on sm_10x. tcgen05 takes an M of 64 or 128, so a narrower tile lowers to
-    ``mma.sync`` (PTX: BM=16/32 emit only ``mma.sync``, BM>=64 and the swapped rows ``tcgen05.mma``).
-    With cold weights BM=16 ties BM=64 (within 2%) and BM=32 loses; warm, both lose. Pruning them
-    narrows the search to the native tiles at no measured cost.
-    Forced configs, B200, row-wise, host-TMA both operands, BK=256 w4 s4, M=1..16, decode with cold
-    weights (warm with them L2-resident): N=16384/K=5120 BM=16 23.8us (14.8), BM=32 27.3 (21.5),
-    BM=64 24.0 (10.6); N=5120/K=8192 BM=16 21.9 (15.9), BM=32 27.9 (23.4), BM=64 22.3 (12.5). The
-    swapped decode rows pass (their MMA M is the weight tile). CUDA sm_10x only."""
+    """Keep native tcgen05 M tiles for plain FP8 on sm_10x. Narrow unswapped
+    tiles lower to warp MMA and lose warm-cache performance; swapped decode tiles
+    use the weight-row dimension as MMA M and remain eligible."""
 
     def ok(c, args):
         return bool(c.kwargs.get("SWAP_AB")) or config_dim(c, args, "BLOCK_SIZE_M") >= 64
@@ -896,13 +890,8 @@ def native_mma_m_pruner():
 
 
 def single_row_tile_pruner():
-    """``early_config_prune`` keeping only the ``BLOCK_SIZE_M == 1`` rows of the tensor-wide /
-    row-wise batched kernel, dropping the token replicated across a 16-row tile. Both lower to the
-    warp-level MMA (the token is one row either way), and the replicated tile is a near-tie or a
-    loser with cold weights (B200, row-wise, Llama 4 E=16 H=5120 I=8192, best forced config per
-    arm): gate_up S=1 BM=16 18.0us vs BM=1 16.4us, down S=16 84.35 vs 84.23us. Pruning it takes the
-    tuner's misses at decode with it (three 100-trial tunes of the gate_up at S=1 crowned BM=16
-    twice). Restricted to SM10x, where these configurations were measured."""
+    """Avoid replicating a single token across a BM=16 warp-MMA tile on sm_10x.
+    BM=1 retains the same compute path with less replicated work."""
 
     def ok(c, args):
         return config_dim(c, args, "BLOCK_SIZE_M") == 1
