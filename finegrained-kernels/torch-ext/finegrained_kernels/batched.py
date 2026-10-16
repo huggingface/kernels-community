@@ -14,6 +14,8 @@
 
 
 
+from typing import List
+
 import torch
 import triton
 import triton.language as tl
@@ -1724,7 +1726,7 @@ def block_fp8_weight_only_matmul_batched(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """FP8 W8A16 batched GEMM; rescale weight tiles inside the raw-activation GEMM."""
     return _raw_activation_matmul_batched(
         A, B, expert_ids, gate, act_fn, swiglu_alpha, swiglu_limit,

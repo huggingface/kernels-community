@@ -14,6 +14,7 @@
 
 
 import os
+from typing import List
 
 import torch
 import triton
@@ -1826,7 +1827,7 @@ def block_fp8_weight_only_matmul_2d(
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Block/per-tensor FP8 weights with unquantized activations (ModelOpt FP8_PB_WO)."""
     assert A.dtype in (torch.bfloat16, torch.float16), "weight-only FP8 expects BF16/FP16 activations"
     assert A.is_contiguous(), "A must be contiguous"
