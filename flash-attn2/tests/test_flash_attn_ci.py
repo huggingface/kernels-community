@@ -88,6 +88,26 @@ def test_flash_attn_varlen_lse_ci(device):
 
 
 @pytest.mark.kernels_ci
+def test_flash_attn_varlen_padded_query_lse_ci(device):
+    cu_seqlens = torch.tensor([0, 5] + [5] * 63, dtype=torch.int32, device=device)
+    query = torch.randn(64, 2, 64, dtype=torch.float16, device=device, requires_grad=True)
+    key = torch.randn(5, 2, 64, dtype=torch.float16, device=device, requires_grad=True)
+    value = torch.randn(5, 2, 64, dtype=torch.float16, device=device, requires_grad=True)
+
+    output, lse, _ = upstream.flash_attn_varlen_func(
+        query, key, value, cu_seqlens, cu_seqlens, 64, 64, return_attn_probs=True
+    )
+    assert output.shape == query.shape
+    assert lse.shape == (2, 64)
+    scores = torch.einsum("qhd,khd->hqk", query[:5].float(), key.float()) * (64**-0.5)
+    torch.testing.assert_close(lse[:, :5], torch.logsumexp(scores, dim=-1), atol=3e-2, rtol=1e-2)
+    torch.testing.assert_close(lse[:, 5:], torch.zeros_like(lse[:, 5:]))
+    gradients = torch.autograd.grad(output[:5].sum(), (query, key, value))
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    torch.testing.assert_close(gradients[0][5:], torch.zeros_like(gradients[0][5:]))
+
+
+@pytest.mark.kernels_ci
 @pytest.mark.parametrize("causal", [False, True])
 def test_flash_attn_splitkv_ci(causal, device):
     upstream.test_flash_attn_splitkv(
