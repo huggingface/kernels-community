@@ -969,25 +969,15 @@ def block_fp8_weight_only_matmul_2d_kernel(
         accumulator = accumulator + fp8_dot(a, w, False, BLOCK_SIZE_K)
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
-    if GATE:
-        out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        gemm_epilogue(
-            C, None, accumulator, out_row, pid_n, pid_m, out_row < M,
-            stride_c_m, stride_c_n, 0, 0,
-            BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
-            ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-            COMPUTE_MODE="dot", N_COLS=N,
-            Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
-        )
-    else:
-        accumulator = add_bias(
-            accumulator, Bias, stride_bias_e, stride_bias_n, 0, pid_n,
-            BLOCK_SIZE_N, N, False,
-        )
-        store_masked(
-            C, accumulator, pid_m, pid_n, M, N, stride_c_m, stride_c_n,
-            BLOCK_SIZE_M, BLOCK_SIZE_N,
-        )
+    out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    gemm_epilogue(
+        C, None, accumulator, out_row, pid_n, pid_m, out_row < M,
+        stride_c_m, stride_c_n, 0, 0,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
+        ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+        COMPUTE_MODE="dot", N_COLS=N,
+        Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
+    )
 
 
 @bayesian_autotune(

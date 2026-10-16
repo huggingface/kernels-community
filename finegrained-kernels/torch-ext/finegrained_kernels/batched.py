@@ -86,7 +86,7 @@ def expert_setup(
     non-local expert would be out of bounds."""
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
-    # Cast to int64 before multiplying strides into the stacked weight tensor.
+    # Cast to int64 to prevent overflow on expert_id * stride_b_e.
     expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
     in_row = tl.load(GatherIdx + batch_id).to(tl.int64) if GatherIdx is not None else batch_id
     out_row = tl.load(ScatterIdx + batch_id).to(tl.int64) if ScatterIdx is not None else batch_id
@@ -920,13 +920,14 @@ def full_precision_matmul_batched_kernel(
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     PDL: tl.constexpr = False,
 ):
-    """Full-precision batched expert GEMM: matching BF16/FP16 activations and weights. ``GATE``
+    """Full-precision batched expert matmul kernel: plain ``tl.dot`` over unquantized
+    BF16/FP16 activations and weights, fp32 accumulation, no scales anywhere. ``GATE``
     computes gate|up as ONE stacked tile + dot (straight-line, both orientations) and
     applies the ``ACT_FN``/SwiGLU ``glu``. ``SWAP_AB`` (tuner axis, M=1 decode): weight
     output rows in the MMA M dim, the single token padded to the N=16 atom."""
     if PDL:
         gdc_wait()
-    batch_id, pid_n, expert_id, A, B, C, unused_scale_base, in_row, out_row = expert_setup(
+    batch_id, pid_n, expert_id, A, B, C, _, in_row, out_row = expert_setup(
         A,
         B,
         C,
@@ -956,13 +957,13 @@ def full_precision_matmul_batched_kernel(
     )
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a, unused_activation = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
-        w, unused_weight = load_weight_plain(
+    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a, _ = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
+        w, _ = load_weight_plain(
             b_ptrs, b_ptrs, 0, 0, 0, GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K
         )
         accumulator = accumulator + fp8_dot(a, w, SWAP_AB, BLOCK_SIZE_K)
-        a_ptrs, unused_as_ptr, b_ptrs, unused_bs_ptr, unused_up_ptr, unused_up_scale_ptr = advance_ptrs(
+        a_ptrs, _, b_ptrs, _, _, _ = advance_ptrs(
             a_ptrs, a_ptrs, b_ptrs, b_ptrs, b_ptrs, b_ptrs,
             BLOCK_SIZE_K * stride_a_k, 0, BLOCK_SIZE_K * stride_b_k, 0,
             "pointer", "pointer", False, False, False,
@@ -1717,7 +1718,15 @@ def full_precision_matmul_batched(
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
-    """Full-precision BF16/FP16 expert GEMM with no quantization."""
+    """Full-precision (BF16/FP16) batched matmul: C[s] = A[s] @ B[expert_ids[s]].T — no
+    quantization anywhere, fp32 accumulation. ``gate``/``act_fn``/``swiglu_*``/
+    ``simulate_unfused`` are the dispatcher's gate|up fusion kwargs (GLU only; ``requant`` is
+    meaningless without a quantized format). ``gather_idx``/``scatter_idx`` map the source
+    row of A / destination row of C per program (None = row s).
+
+    A:  (rows, K) BF16/FP16 activations — rows addressed via ``gather_idx``
+    B:  (num_experts, N, K) expert weights in A's dtype; under ``gate`` the (num_experts, 2N, K) stack
+    """
     validate_dense_operands(A, B)
     assert A.dtype == B.dtype and A.dtype in (torch.bfloat16, torch.float16), (
         f"full-precision path needs matching BF16/FP16 A and B, got {A.dtype} / {B.dtype}"
@@ -1792,11 +1801,13 @@ def block_fp8_weight_only_matmul_batched(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    *,
+    interleaved_scales: bool = False,
 ) -> List[torch.Tensor]:
     """FP8 W8A16 expert GEMM with in-tile weight rescaling."""
     validate_dense_operands(A, B)
     assert A.dtype in (torch.bfloat16, torch.float16), "FP8 weight-only takes raw BF16/FP16 activations"
-    Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate)
+    Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate or interleaved_scales)
     Bs = ue8m0_as_uint8(Bs)
     assert activation_format in (None, "bf16") and not quantize_output, (
         "FP8 weight-only requires unquantized activations and output"
@@ -1842,7 +1853,7 @@ def block_fp8_weight_only_matmul_batched(
             BLOCK_N=scale_block_n,
             BLOCK_K=scale_block_k,
             GATE=gate,
-            GATE_SCALES=gate and Bs.shape[1] > 1,
+            GATE_SCALES=(gate or interleaved_scales) and Bs.shape[1] > 1,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
@@ -1969,6 +1980,7 @@ def matmul_batched(
     bias: torch.Tensor | None = None,  # (E, N_out) per-expert output bias; (N_out,) for 2D
     activation_format: str | None = None,
     gate: bool = False,
+    interleaved_scales: bool = False,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -1992,7 +2004,9 @@ def matmul_batched(
     ``"mxfp4"`` = packed E2M1 activations). ``Bs`` ``None`` = unquantized BF16/FP16 weights.
     ``quantize_output`` requantizes the output into ``activation_format`` — the return is then
     ``(C, Cs)``. ``gate``/``act_fn``/``swiglu_alpha``/``swiglu_limit`` fuse the gate|up GLU into the
-    epilogue. ``As``/``Bs`` are each a bare block-scale tensor; the two-level NVFP4
+    epilogue. ``interleaved_scales=True`` reads separately calibrated gate/up scale
+    blocks without fusing the GLU; the unfused MoE gate/up projection uses this layout.
+    ``As``/``Bs`` are each a bare block-scale tensor; the two-level NVFP4
     second-level scales ride the separate ``a_global_scale``/``b_global_scale`` (fp32 per-tensor,
     weights per-expert ``(E,)``; from ``nvfp4_quantize_two_level``), and the op folds ``g_a · g_b``
     onto the accumulator. The activation global ``g_a`` is CALIBRATED (the checkpoint's
@@ -2016,6 +2030,9 @@ def matmul_batched(
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_batched``.
     """
     check_activation_format(activation_format, quantize_output)
+    assert not interleaved_scales or (
+        Bs is not None and not is_mx(B, Bs) and activation_format == "bf16"
+    ), "interleaved_scales describes calibrated gate/up blocks on FP8 weight-only GEMMs"
     assert (a_global_scale is None and b_global_scale is None) or (
         Bs is not None and weight_format(B, Bs) == "nvfp4"
     ), "two-level globals (a_global_scale / b_global_scale) are NVFP4-only"
@@ -2030,7 +2047,7 @@ def matmul_batched(
         out = block_fp8_weight_only_matmul_batched(
             A, B, Bs, expert_ids, gate, act_fn, swiglu_alpha, swiglu_limit,
             simulate_unfused, activation_format, quantize_output, output_dtype,
-            gather_idx, scatter_idx, bias=bias,
+            gather_idx, scatter_idx, bias=bias, interleaved_scales=interleaved_scales,
         )
         return out[0]
     # a calibrated (static) scale on a raw A (see `tensor_wide_act_operands`): block-scale weights

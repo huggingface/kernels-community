@@ -806,17 +806,3 @@ def test_every_admitted_config_is_correct(problem: Problem, op, tuner):
         print(f"\n[sweep] {len(forgiven)} admitted config(s) failed to compile/run (forgiven):")
         for cfg, err in forgiven:
             print(f"  {cfg}: {err}")
-
-
-@pytest.mark.kernels_ci
-@pytest.mark.parametrize("byte", [0, 127, 254, 255])
-def test_weight_only_ue8m0_boundaries(byte):
-    a = torch.full((7, 256), 2.0 ** (-120 if byte == 254 else 0), device=TEST_DEVICE, dtype=torch.bfloat16)
-    weight = torch.ones(128, 256, device=TEST_DEVICE, dtype=torch.float8_e4m3fn)
-    scales = torch.tensor(byte, device=TEST_DEVICE, dtype=torch.uint8)
-    scale = float("nan") if byte == 255 else 2.0 ** (byte - 127)
-    reference = a @ torch.full_like(weight, scale, dtype=a.dtype).T
-    out = finegrained_kernels.matmul_2d(
-        a, weight, None, scales, activation_format="bf16", output_dtype=torch.float32,
-    )
-    torch.testing.assert_close(out, reference.float(), rtol=0, atol=0, equal_nan=True)

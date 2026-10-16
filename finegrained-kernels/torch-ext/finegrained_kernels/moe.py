@@ -56,7 +56,7 @@ from .compat import (
     device_context,
     pdl_launch_kwargs,
 )
-from .formats import block_fp8_weight_scale_grid, get_supported_act_fns, is_mx, is_mxfp4, is_per_expert_global, mx_scale_family, normalize_global_scale, ue8m0_as_uint8, weight_format
+from .formats import get_supported_act_fns, is_mx, is_mxfp4, is_per_expert_global, mx_scale_family, normalize_global_scale, ue8m0_as_uint8, weight_format
 from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
 from .quant import _launch_act_quant, MX_ACT_QUANT, mx_act_quant_routed_scales
 from .scheduling import compute_grouped_scheduling, is_off_rank, off_rank
@@ -576,17 +576,6 @@ def moe_fused_batched(
 # ── Unfused (plain GEMMs + host GLU) ──────────────────────────────────────────
 
 
-def _ungated_gate_up_scales(B, Bs, gate, activation_format):
-    """Expose calibrated gate/up blocks as physical-row scales for a plain GEMM."""
-    if (not gate or activation_format != "bf16" or B.dtype != torch.float8_e4m3fn
-            or is_mx(B, Bs) or Bs.numel() == B.shape[0]):
-        return Bs
-    Bs, block_n, _ = block_fp8_weight_scale_grid(B, Bs, gate=True)
-    return (Bs.reshape(B.shape[0], -1, 2, Bs.shape[-1])
-            .repeat_interleave(block_n, dim=1)
-            .flatten(1, 2)[:, :B.shape[1]].contiguous())
-
-
 def moe_unfused_grouped(
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
@@ -636,10 +625,6 @@ def moe_unfused_grouped(
         top_k_index, NUM_EXPERTS, num_top_k
     )
 
-    gate_up_proj_scale_inv = _ungated_gate_up_scales(
-        gate_up_proj, gate_up_proj_scale_inv, gate, fmt,
-    )
-
     # gate_up as a plain GEMM (no gate epilogue) over gathered hidden -> expert-ordered (S, 2I).
     gate_up_in, gate_up_in_scale = _gate_up_activations(
         hidden_states, fmt, gate_up_proj_scale_inv, gate_up_proj_input_global_scale,
@@ -650,6 +635,10 @@ def moe_unfused_grouped(
         gate_up_proj,
         As=gate_up_in_scale,
         Bs=gate_up_proj_scale_inv,
+        interleaved_scales=(
+            gate and fmt == "bf16" and gate_up_proj.dtype == torch.float8_e4m3fn
+            and not is_mx(gate_up_proj, gate_up_proj_scale_inv)
+        ),
         a_global_scale=gate_up_proj_input_global_scale,
         b_global_scale=gate_up_proj_weight_global_scale,
         expert_start=expert_start,
@@ -913,16 +902,16 @@ def moe_unfused_batched(
     expert_ids = top_k_index.reshape(-1)
     gather_idx = _gather_idx(top_k_index)
 
-    gate_up_proj_scale_inv = _ungated_gate_up_scales(
-        gate_up_proj, gate_up_proj_scale_inv, gate, fmt,
-    )
-
     # gate_up as a plain GEMM (no gate epilogue) over gathered hidden -> (S, 2I).
     gate_up_out = matmul_batched(
         hidden_states,
         gate_up_proj,
         As=gate_up_proj_activation_scale,
         Bs=gate_up_proj_scale_inv,
+        interleaved_scales=(
+            gate and fmt == "bf16" and gate_up_proj.dtype == torch.float8_e4m3fn
+            and not is_mx(gate_up_proj, gate_up_proj_scale_inv)
+        ),
         a_global_scale=gate_up_proj_input_global_scale,
         b_global_scale=gate_up_proj_weight_global_scale,
         expert_ids=expert_ids,
