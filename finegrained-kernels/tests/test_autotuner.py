@@ -375,10 +375,10 @@ def test_raw_grouped_gather_warp_spec_scope(monkeypatch):
     # The compiler failure also affects original BF16 weights: it is a gathered
     # descriptor layout restriction, independent of weight dequantization.
     for scales in (None, object()):
-        assert prune(configs, {"GatherIdx": object(), "WeightScales": scales}) == [
+        assert prune(configs, {"GatherIdx": object(), "Bs": scales}) == [
             configs[i] for i in (0, 4, 5)
         ]
-        assert prune(configs, {"GatherIdx": None, "WeightScales": scales}) == configs
+        assert prune(configs, {"GatherIdx": None, "Bs": scales}) == configs
 
 
 @pytest.mark.skipif(
@@ -394,9 +394,9 @@ def test_raw_grouped_warp_spec_survivors_compile(gather, scaled):
     from triton.runtime.jit import MockTensor
     from triton.tools.tensor_descriptor import TensorDescriptor
 
-    jit = importlib.import_module(
-        finegrained_kernels.__name__ + ".grouped"
-    ).full_precision_matmul_grouped_kernel.fn
+    module = importlib.import_module(finegrained_kernels.__name__ + ".grouped")
+    jit = (module.block_fp8_weight_only_matmul_grouped_kernel if scaled
+           else module.full_precision_matmul_grouped_kernel).fn
     dtype = torch.float8_e4m3fn if scaled else torch.bfloat16
     a_desc = TensorDescriptor.from_tensor(
         torch.empty((64, 256), dtype=torch.bfloat16), [1 if gather else 128, 128]
@@ -408,42 +408,25 @@ def test_raw_grouped_warp_spec_survivors_compile(gather, scaled):
     idx = MockTensor(torch.int32)
     scale_operands = (
         dict(
-            WeightScales=MockTensor(torch.float32),
-            stride_scale_e=8,
-            stride_scale_n=2,
-            stride_scale_k=1,
-            SCALE_BLOCK_N=128,
-            SCALE_BLOCK_K=128,
+            Bs=MockTensor(torch.float32),
+            stride_bs_e=8,
+            stride_bs_n=2,
+            stride_bs_k=1,
+            BLOCK_N=128,
+            BLOCK_K=128,
             GATE_SCALES=True,
         )
         if scaled
         else {}
     )
     jit.warmup(
-        a,
-        a_desc,
-        b,
-        b_desc,
-        c,
-        None,
-        idx if gather else None,
-        None,
-        idx,
-        idx,
-        64,
-        256,
-        256,
-        256,
-        1,
-        512 * 256,
-        1,
-        256,
-        256,
-        1,
-        0,
-        0,
-        8,
-        4,
+        A=a, ADescriptor=a_desc, B=b, BDescriptor=b_desc,
+        C=c, Bias=None, GatherIdx=idx if gather else None, ScatterIdx=None,
+        ExpertStart=idx, Schedule=idx,
+        S=64, N=256, K=256, num_experts=8, tokens_per_expert_bit_length=4,
+        stride_a_m=256, stride_a_k=1,
+        stride_b_e=512 * 256, stride_b_k=1, stride_b_n=256,
+        stride_c_m=256, stride_c_n=1, stride_bias_e=0, stride_bias_n=0,
         BLOCK_SIZE_M=128,
         BLOCK_SIZE_N=64,
         BLOCK_SIZE_K=128,

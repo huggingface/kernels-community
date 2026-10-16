@@ -924,7 +924,7 @@ def mx_weight_only_matmul_2d_kernel(
 
 @bayesian_autotune(
     get_accelerator_autotuning_configs(tune_block_nk=True, tune_block_m=True),
-    ["N", "K", "m_bit_length", "GATE", "SCALE_BLOCK_N", "SCALE_BLOCK_K"],
+    ["N", "K", "m_bit_length", "GATE", "BLOCK_N", "BLOCK_K", "GATE_SCALES"],
     n_trials=100,
     finite_check_args=("C",),
     prune_configs_by={"early_config_prune": block_within_dim_pruner("K")},
@@ -936,18 +936,18 @@ def block_fp8_weight_only_matmul_2d_kernel(
     stride_a_m, stride_a_k, stride_b_n, stride_b_k,
     stride_bs_n, stride_bs_k, stride_c_m, stride_c_n,
     stride_bias_e, stride_bias_n,
-    SCALE_BLOCK_N: tl.constexpr,
-    SCALE_BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GATE: tl.constexpr = False,
+    GATE_SCALES: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
-    GATE_SCALES: tl.constexpr = False,
 ):
     """Raw BF16/FP16 acts against FP8 weights with coarse FP32 block scales.
     Dequantization stays inside the GEMM tile: no activation quantization or
@@ -971,7 +971,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
         ).to(tl.float32)
         w = dequant_block_fp8_weight_tile(
             w, Bs, 0, offs_bn, kk, 0, stride_bs_n, stride_bs_k,
-            SCALE_BLOCK_N, SCALE_BLOCK_K, GATE_SCALES, DTYPE=a.dtype,
+            BLOCK_N, BLOCK_K, GATE_SCALES, DTYPE=a.dtype,
             mask=(offs_bn[:, None] < rows) & (kk[None, :] < K),
         )
         accumulator = tl.dot(a, w, accumulator)
@@ -1885,7 +1885,7 @@ def block_fp8_weight_only_matmul_2d(
             A.stride(-2), A.stride(-1), B.stride(0), B.stride(1),
             Bs.stride(0), Bs.stride(1), C.stride(-2), C.stride(-1),
             bias_stride_e, bias_stride_n,
-            SCALE_BLOCK_N=scale_block_n, SCALE_BLOCK_K=scale_block_k,
+            BLOCK_N=scale_block_n, BLOCK_K=scale_block_k,
             GATE=gate, ACT_FN=act_fn, SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit, SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(resolve_output_dtype(output_dtype, A, None)),
