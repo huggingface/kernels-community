@@ -1105,6 +1105,7 @@ def mx_weight_only_matmul_grouped_kernel(
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
             warp_spec_compile_guard_pruner(),
+            warp_spec_memory_mode_pruner(gather_only=True),
             packed_schedule_scope_pruner(),
             descriptor_box_pruner(),
             smem_pruner(),
