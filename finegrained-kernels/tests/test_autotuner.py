@@ -343,3 +343,119 @@ def test_compile_failures_are_memoized_across_keys(caplog):
     assert len(msgs) == 2, msgs
     assert "[memoized]" not in msgs[0] or "[memoized]" in msgs[1]
     assert "[memoized]" in msgs[1], msgs[1]
+
+
+def test_raw_grouped_gather_warp_spec_scope(monkeypatch):
+    import importlib
+    import triton
+
+    pruners = importlib.import_module(finegrained_kernels.__name__ + ".pruners")
+    monkeypatch.setattr(pruners, "is_sm10x", lambda: True)
+    monkeypatch.setattr(pruners, "_warp_spec_needs_descriptor_tile", lambda: True)
+    configs = [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": bm,
+                "WARP_SPEC": ws,
+                "A_MEMORY_MODE": mode,
+                "B_MEMORY_MODE": "host_descriptor",
+            },
+            num_warps=warps,
+        )
+        for bm, warps, ws, mode in [
+            (128, 4, True, "host_descriptor"),
+            (128, 8, True, "host_descriptor"),
+            (128, 16, True, "host_descriptor"),
+            (64, 4, True, "host_descriptor"),
+            (128, 16, True, "pointer"),
+            (64, 16, False, "host_descriptor"),
+        ]
+    ]
+    prune = pruners.warp_spec_memory_mode_pruner(gather_only=True)
+    # The compiler failure also affects original BF16 weights: it is a gathered
+    # descriptor layout restriction, independent of weight dequantization.
+    for scales in (None, object()):
+        assert prune(configs, {"GatherIdx": object(), "WeightScales": scales}) == [
+            configs[i] for i in (0, 4, 5)
+        ]
+        assert prune(configs, {"GatherIdx": None, "WeightScales": scales}) == configs
+
+
+@pytest.mark.skipif(
+    TEST_DEVICE != "cuda" or torch.cuda.get_device_capability() != (10, 0),
+    reason="B200 compiler regression",
+)
+@pytest.mark.parametrize("gather", [False, True])
+@pytest.mark.parametrize("scaled", [False, True])
+def test_raw_grouped_warp_spec_survivors_compile(gather, scaled):
+    """Compile surviving TMA configurations using mock pointers; launch no GPU kernels."""
+    import importlib
+
+    from triton.runtime.jit import MockTensor
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    jit = importlib.import_module(
+        finegrained_kernels.__name__ + ".grouped"
+    ).full_precision_matmul_grouped_kernel.fn
+    dtype = torch.float8_e4m3fn if scaled else torch.bfloat16
+    a_desc = TensorDescriptor.from_tensor(
+        torch.empty((64, 256), dtype=torch.bfloat16), [1 if gather else 128, 128]
+    )
+    b_desc = TensorDescriptor.from_tensor(
+        torch.empty((8, 512, 256), dtype=dtype), [1, 128, 128]
+    )
+    a, b, c = MockTensor(torch.bfloat16), MockTensor(dtype), MockTensor(torch.bfloat16)
+    idx = MockTensor(torch.int32)
+    scale_operands = (
+        dict(
+            WeightScales=MockTensor(torch.float32),
+            stride_scale_e=8,
+            stride_scale_n=2,
+            stride_scale_k=1,
+            SCALE_BLOCK_N=128,
+            SCALE_BLOCK_K=128,
+            GATE_SCALES=True,
+        )
+        if scaled
+        else {}
+    )
+    jit.warmup(
+        a,
+        a_desc,
+        b,
+        b_desc,
+        c,
+        None,
+        idx if gather else None,
+        None,
+        idx,
+        idx,
+        64,
+        256,
+        256,
+        256,
+        1,
+        512 * 256,
+        1,
+        256,
+        256,
+        1,
+        0,
+        0,
+        8,
+        4,
+        BLOCK_SIZE_M=128,
+        BLOCK_SIZE_N=64,
+        BLOCK_SIZE_K=128,
+        NUM_EXPERTS_POW2=8,
+        NUM_SMS=144,
+        WARP_SPEC=True,
+        PACKED_SCHEDULE=False,
+        A_MEMORY_MODE="host_descriptor",
+        B_MEMORY_MODE="host_descriptor",
+        GATE=True,
+        num_warps=4 if gather else 16,
+        num_stages=5,
+        grid=(144,),
+        **scale_operands,
+    )

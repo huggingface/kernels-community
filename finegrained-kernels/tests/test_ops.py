@@ -153,6 +153,14 @@ def scenarios() -> list[Problem]:
             if fmt != default_in:
                 out.append(Problem(weights=w, activation_format=fmt))
     out += [
+        # Coarse and per-tensor FP8 with raw BF16/FP16 activations.
+        Problem(weights="fp8_128x128", activation_format="bf16", S=1, N=192, K=384, bias=True),
+        Problem(weights="fp8_tensor", activation_format="bf16", S=8, gate=True, bias=True),
+        Problem(weights="fp8_128x128", activation_format="bf16", S=16, sentinel_fraction=0.25),
+        Problem(weights="fp8_128x128_ue8m0", activation_format="bf16", S=8, empty_expert=True),
+        Problem(weights="fp8_128x128", activation_format="bf16", S=7, dtype=torch.float16),
+        Problem(weights="fp8_128x128", activation_format="bf16", S=17, N=1536, K=1024, compile=True, bias=True),
+        Problem(weights="fp8_tensor", activation_format="bf16", S=1, gate=True, compile=True),
         Problem(weights="fp16", dtype=torch.float16),
         # gate WITHOUT requant (raw GLU intermediate) — one quantized + one full format
         Problem(weights="mxfp8", gate=True),
@@ -430,6 +438,8 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
     row = WEIGHTS[problem.weights]
     A_dq = _act_dequant(problem, op, A, As, As_global, expert_ids)
     W = row["dequant"](B, Bs, Bs_global)  # (E, rows, K) fp32
+    if problem.activation_format == "bf16":
+        W = W.to(A.dtype).float()
     bias = _bias(problem, op)
     if op == "matmul":
         ref = A_dq @ W[0].T  # single linear, no routing
@@ -643,7 +653,7 @@ def _skip_moe_only(problem: Problem, op: str) -> None:
         pytest.skip("per-expert globals need routing (MoE only)")
 
     mx = problem.weights in ("mxfp8", "mxfp8_u8", "mxfp4", "nvfp4")
-    if not mx and (problem.activation_format is not None or problem.quantize_output):
+    if not mx and (problem.activation_format not in (None, "bf16") or problem.quantize_output):
         pytest.skip("an explicit activation format / requant is MX-only for matmul_2d")
 
 
@@ -659,7 +669,8 @@ def test_op_scenarios(problem: Problem, op):
     row = WEIGHTS[problem.weights]
     E = 1 if op == "matmul" else problem.E  # matmul is a single weight matrix
     B, Bs, Bs_global = _make_weights(problem, row, E)
-    if op != "matmul" and problem.N % 128 != 0 and problem.weights.startswith("fp8"):
+    if (op != "matmul" and problem.N % 128 != 0 and problem.weights.startswith("fp8")
+            and problem.activation_format != "bf16"):
         # fp8 weight scales are 128-blocked along N, so routed fp8 rejects non-128 N. MX (per-row
         # scales, BN | N) handles it on the affine arm — falls through to the normal ref-vs-op run.
         with pytest.raises(ValueError, match="matmul_2d"):
@@ -808,10 +819,9 @@ def test_sparse_decode_expert_offset_exceeds_int32(monkeypatch, op):
     Excluded from kernels_ci because of the backing allocation.
     """
     import importlib
-    import kernels
     import triton
 
-    kernel = kernels.get_kernel("kernels-community/finegrained-kernels", version=0)
+    kernel = finegrained_kernels
 
     if TEST_DEVICE != "cuda" or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("B200 sparse decode path")
@@ -865,9 +875,8 @@ def test_sparse_decode_expert_offset_exceeds_int32(monkeypatch, op):
 @pytest.mark.parametrize("byte", [0, 127, 254, 255])
 def test_dense_weight_only_ue8m0_boundaries(byte):
     """The small-batch fallback shares UE8M0 zero/NaN semantics with decode and MX."""
-    import kernels
 
-    kernel = kernels.get_kernel("kernels-community/finegrained-kernels", version=0)
+    kernel = finegrained_kernels
     a = torch.full(
         (7, 256),
         2.0 ** (-120 if byte == 254 else 0),
@@ -883,3 +892,143 @@ def test_dense_weight_only_ue8m0_boundaries(byte):
         a, weight, None, scales, activation_format="bf16", output_dtype=torch.float32
     )
     torch.testing.assert_close(out, reference, rtol=0, atol=0, equal_nan=True)
+
+
+def _weight_reference(
+    weight, scales, block_n, block_k, gate=False, dtype=torch.bfloat16
+):
+    if scales.dtype == torch.uint8:
+        scales = torch.pow(2.0, scales.float() - 127)
+    rows = weight.shape[-2]
+    if scales.shape[-2] == 1:
+        scale_rows = torch.zeros(rows, device=weight.device, dtype=torch.long)
+    elif gate:
+        row = torch.arange(rows, device=weight.device)
+        scale_rows = (row // 2 // block_n) * 2 + row % 2
+    else:
+        scale_rows = torch.arange(rows, device=weight.device) // block_n
+    return (
+        weight.float() * scales[..., scale_rows, :].repeat_interleave(block_k, -1)
+    ).to(dtype)
+
+
+@pytest.mark.parametrize("split_k", [1, 2, 8, 16])
+@pytest.mark.parametrize("gate,scalar", [(False, False), (True, False), (True, True)])
+def test_weight_only_decode_split_and_empty_partials(
+    monkeypatch, split_k, gate, scalar
+):
+    """Every split arm must reduce correctly, including splits beyond the final K group."""
+    import importlib
+
+    import triton
+
+    if TEST_DEVICE != "cuda" or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("B200 decode route")
+    weight_only = importlib.import_module(finegrained_kernels.__name__ + ".weight_only")
+    monkeypatch.setattr(
+        weight_only._decode_partial,
+        "configs",
+        [
+            triton.Config(
+                {"BLOCK_N": 16, "BLOCK_K": 256, "SPLIT_K": split_k},
+                num_warps=4,
+                num_stages=1,
+            )
+        ],
+    )
+    torch.manual_seed(104)
+    n, k = 192, 384
+    rows = 2 * n if gate else n
+    a = torch.randn(1, k, device=TEST_DEVICE, dtype=torch.bfloat16)
+    b = torch.randn(rows, k, device=TEST_DEVICE).to(torch.float8_e4m3fn)
+    shape = (
+        (1, 1)
+        if scalar
+        else (2 * ((n + 127) // 128) if gate else (n + 127) // 128, k // 128)
+    )
+    scales = torch.rand(shape, device=TEST_DEVICE) * 0.031 + 0.013
+    block_n, block_k = (rows, k) if scalar else (128, 128)
+    bias = torch.randn(rows, device=TEST_DEVICE, dtype=a.dtype) * 0.1
+    w = _weight_reference(b, scales, block_n, block_k, gate)
+    ref = a.float() @ w.float().T + bias.float()
+    if gate:
+        ref = torch.nn.functional.silu(ref[:, 0::2]) * ref[:, 1::2]
+    got = finegrained_kernels.matmul_2d(
+        a,
+        b,
+        None,
+        scales,
+        activation_format="bf16",
+        gate=gate,
+        bias=bias,
+        output_dtype=torch.float32,
+    )
+    torch.testing.assert_close(got, ref, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize("gate,scalar", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.uint8])
+def test_temporary_weight_workspace_expert_strides(gate, scalar, scale_dtype):
+    """The shared dequantizer must retain expert, partial-block, and gate scale indexing."""
+    import importlib
+
+    weight_only = importlib.import_module(finegrained_kernels.__name__ + ".weight_only")
+    torch.manual_seed(109)
+    e, n, k = 3, 192, 384
+    rows = 2 * n if gate else n
+    # A transposed weight view exercises the input strides independently of output layout.
+    b = (
+        torch.randn(e, k, rows, device=TEST_DEVICE)
+        .to(torch.float8_e4m3fn)
+        .transpose(-1, -2)
+    )
+    shape = (
+        (e, 1, 1)
+        if scalar
+        else (e, 2 * ((n + 127) // 128) if gate else (n + 127) // 128, k // 128)
+    )
+    if scale_dtype == torch.uint8:
+        scales = torch.randint(123, 129, shape, device=TEST_DEVICE, dtype=torch.uint8)
+    else:
+        scales = torch.rand(shape, device=TEST_DEVICE) * 0.031 + 0.013
+    bn, bk = (rows, k) if scalar else (128, 128)
+    actual = weight_only.dequantize_weight(
+        b, scales, torch.float16, bn, bk, gate and not scalar
+    )
+    expected = _weight_reference(b, scales, bn, bk, gate, torch.float16)
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_uint8_scale_decode_matches_native_ue8m0():
+    import importlib
+    import triton
+    import triton.language as tl
+
+    decode = importlib.import_module(
+        finegrained_kernels.__name__ + ".loading.scales"
+    ).decode_group_scale
+
+    @triton.jit
+    def run(Scale, Out, BLOCK: tl.constexpr):
+        i = tl.arange(0, BLOCK)
+        tl.store(Out + i, decode(tl.load(Scale + i)))
+
+    # Include exponent zero (an FP32 subnormal), the normal range endpoints,
+    # the multiplicative identity, and the reserved NaN byte.
+    values = torch.tensor(
+        [0, 1, 126, 127, 128, 253, 254, 255], device="cuda", dtype=torch.uint8
+    )
+    actual = torch.empty(values.numel(), device="cuda", dtype=torch.float32)
+    run[(1,)](values, actual, values.numel())
+    expected = torch.tensor(
+        [2.0**-127, 2.0**-126, 0.5, 1.0, 2.0, 2.0**126, 2.0**127, float("nan")],
+        device="cuda",
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    native_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if native_dtype is not None:
+        native = values.view(native_dtype).float()
+        torch.testing.assert_close(actual, native, rtol=0, atol=0, equal_nan=True)
