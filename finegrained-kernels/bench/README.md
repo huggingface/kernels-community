@@ -73,3 +73,51 @@ committed (the top-level README embeds it), so refresh it in the same commit as 
 that moves the numbers; the CSV is git-ignored (`bench/*.csv` in the repo's `.gitignore`) and regenerated per machine. Requires the bench env: `transformers`
 (with the `integrations.{deepgemm,moe,sonicmoe,mxfp4}` helpers), `kernels`, DeepGEMM, and a
 Blackwell (sm_100) GPU. **Don't run under concurrent GPU load** — the latencies won't be trustworthy.
+
+## Rowwise FP8 and coarse-scale W8A16 linears
+
+`bench_fp8_linear.py` measures dense linears through `kernels.get_kernel`. Select a
+local build with `LOCAL_KERNELS` when comparing revisions. Performance runs require
+at least 100 autotuning trials; the one-trial correctness policy is not used.
+
+```bash
+FINEGRAINED_AUTOTUNE_TRIALS=100 python bench/bench_fp8_linear.py \
+  --family weight_only \
+  --shapes '1,4096,4096;256,4096,4096;2048,4096,4096;1,16384,5120;256,16384,5120;2048,16384,5120' \
+  --output weight_only.jsonl
+FINEGRAINED_AUTOTUNE_TRIALS=100 python bench/bench_fp8_linear.py \
+  --family rowwise \
+  --shapes '1,16384,5120;16,16384,5120;256,16384,5120;4096,16384,5120;1,5120,8192;16,5120,8192;256,5120,8192;4096,5120,8192' \
+  --output rowwise.jsonl
+```
+
+The JSONL records medians of five warm CUDA graph measurements and three cold
+measurements. Cold measurements flush L2 between single-operation graph replays,
+so Python and TMA descriptor construction are excluded from both timings. Warm
+replays can keep these weights in B200 L2; neither measurement is whole-model
+throughput. Rowwise results include activation quantization and compare against
+cuBLAS rowwise FP8, including its quantization cost. Weight-only results compare
+against both per-call dequantization plus cuBLAS and persistent BF16 weights.
+Persistent BF16 weights use twice the weight storage; they are a speed reference,
+not an equivalent memory configuration.
+
+B200 W8A16 results (Torch 2.14.1+cu130, Triton 3.8.0; microseconds, BF16 activations,
+128×128 weight scales):
+
+| M | N | K | W8A16 warm | W8A16 cold | Persistent BF16 warm |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 4096 | 4096 | 8.09 | 14.34 | 6.24 |
+| 256 | 4096 | 4096 | 15.62 | 26.62 | 8.46 |
+| 2048 | 4096 | 4096 | 59.56 | 61.63 | 50.43 |
+| 1 | 16384 | 5120 | 26.87 | 36.86 | 26.70 |
+| 256 | 16384 | 5120 | 92.56 | 92.10 | 42.73 |
+| 2048 | 16384 | 5120 | 292.19 | 288.93 | 241.94 |
+
+One-token W8A16 uses a scalar split-K reduction, including its finishing kernel
+in tuning. Larger dense calls use a temporary BF16 weight workspace plus cuBLAS
+when eligible; the table includes conversion and GEMM work. CUDA graph replay
+reuses captured allocations. The workspace requires two bytes per weight for the
+duration of the call.
+Fused gate/bias epilogues retain the existing full-precision Triton path after
+conversion. Persistent weights stay FP8. These coarse-scale W8A16 operations are
+inference-only; their custom operators do not register an autograd formula.

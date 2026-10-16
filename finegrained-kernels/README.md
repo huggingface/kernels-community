@@ -75,11 +75,15 @@ matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None,
   gate|up stack whose halves a checkpoint calibrated separately carries one global per half; the
   loader merges those into one per expert (the up half's folds into the down projection's global,
   SwiGLU being linear in it) rather than the ops taking a second layout.
-- Weight-only FP8 (`activation_format="bf16"`) supports both coarse block scales and one scale
-  per tensor/expert, as well as MX group scales. The GEMM reads FP8 weights and rescales each
-  tile into the activation dtype inside the kernel, without quantizing activations or allocating
-  a full-precision weight matrix. Dense, grouped, batched, and fused MoE entrypoints share this
-  contract, including separately calibrated interleaved gate/up scale grids.
+- Weight-only FP8 (`activation_format="bf16"`) supports coarse block scales, one scale per
+  tensor/expert, and MX group scales. Activations remain unquantized; scaled weights round to
+  the activation dtype before multiplication. Separately calibrated interleaved gate/up grids
+  work in dense, grouped, batched, and fused MoE entrypoints. The routed kernels rescale tiles
+  inside the GEMM. Dense B200 decode uses a scalar/split-K kernel with fused bias/GLU; large
+  prefill GEMMs instead dequantize into a temporary BF16/FP16 weight workspace and use cuBLAS
+  (or the fused full-precision kernel for epilogues). This workspace costs two bytes per weight
+  during the call; persistent weights and saved checkpoints remain FP8. The coarse FP8
+  W8A16 entrypoints currently support inference; their activation-gradient rule is not registered.
 - Routing: `matmul_batched` reads one expert id per row (`expert_ids`, EP sentinels
   `>= num_experts` skipped); `matmul_grouped` takes the launch maps from
   `compute_grouped_scheduling(expert_ids, num_experts, top_k)` — no pre-sorted input required.

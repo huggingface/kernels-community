@@ -22,6 +22,7 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
+from .weight_only import decode_matmul, dequantize_weight
 from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_weight_only_descriptors
 from .formats import block_fp8_weight_scale_grid, check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
@@ -1839,7 +1840,49 @@ def block_fp8_weight_only_matmul_2d(
     N = rows // 2 if gate else rows
     Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate)
     Bs = ue8m0_as_uint8(Bs)
-    C = A.new_empty(A.shape[:-1] + (N,), dtype=resolve_output_dtype(output_dtype, A, None))
+    dtype = resolve_output_dtype(output_dtype, A, None)
+    gate_scales = gate and Bs.shape[0] > 1
+    # B200 graph-timed measurements: the one-token scalar/split-K path avoids
+    # tensor-core M padding; prefill instead amortizes a temporary BF16 workspace
+    # and uses the mature full-precision GEMM. Persistent weights stay FP8.
+    if is_sm10x() and M == 1:
+        with device_context(A.device):
+            return [
+                decode_matmul(
+                    A,
+                    B,
+                    Bs,
+                    scale_block_n,
+                    scale_block_k,
+                    dtype,
+                    gate=gate,
+                    gate_scales=gate_scales,
+                    bias=bias,
+                    act_fn=act_fn,
+                    swiglu_alpha=swiglu_alpha,
+                    swiglu_limit=swiglu_limit,
+                    simulate_unfused=simulate_unfused,
+                )
+            ]
+    if is_sm10x() and M >= 16 and B.numel() >= 1024 * 1024:
+        with device_context(A.device):
+            weight = dequantize_weight(
+                B, Bs, A.dtype, scale_block_n, scale_block_k, gate_scales
+            )
+            if not gate and bias is None and dtype == A.dtype:
+                return [(A.view(M, K) @ weight.T).view(A.shape[:-1] + (N,))]
+            return full_precision_matmul_2d(
+                A,
+                weight,
+                output_dtype=dtype,
+                gate=gate,
+                act_fn=act_fn,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_limit=swiglu_limit,
+                simulate_unfused=simulate_unfused,
+                bias=bias,
+            )
+    C = A.new_empty(A.shape[:-1] + (N,), dtype=dtype)
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(block_fp8_weight_only_matmul_2d_kernel)[

@@ -373,3 +373,190 @@ def test_raw_grouped_warp_spec_survivors_compile(kernel, gather, scaled):
         grid=(144,),
         **scale_operands,
     )
+
+
+@pytest.mark.parametrize("split_k", [1, 2, 8, 16])
+@pytest.mark.parametrize("gate,scalar", [(False, False), (True, False), (True, True)])
+def test_weight_only_decode_split_and_empty_partials(
+    kernel, monkeypatch, split_k, gate, scalar
+):
+    """Every split arm must reduce correctly, including splits beyond the final K group."""
+    import importlib
+
+    import triton
+
+    if TEST_DEVICE != "cuda" or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("B200 decode route")
+    weight_only = importlib.import_module(kernel.__name__ + ".weight_only")
+    monkeypatch.setattr(
+        weight_only._decode_partial,
+        "configs",
+        [
+            triton.Config(
+                {"BLOCK_N": 16, "BLOCK_K": 256, "SPLIT_K": split_k},
+                num_warps=4,
+                num_stages=1,
+            )
+        ],
+    )
+    torch.manual_seed(104)
+    n, k = 192, 384
+    rows = 2 * n if gate else n
+    a = torch.randn(1, k, device=TEST_DEVICE, dtype=torch.bfloat16)
+    b = torch.randn(rows, k, device=TEST_DEVICE).to(torch.float8_e4m3fn)
+    shape = (
+        (1, 1)
+        if scalar
+        else (2 * ((n + 127) // 128) if gate else (n + 127) // 128, k // 128)
+    )
+    scales = torch.rand(shape, device=TEST_DEVICE) * 0.031 + 0.013
+    block_n, block_k = (rows, k) if scalar else (128, 128)
+    bias = torch.randn(rows, device=TEST_DEVICE, dtype=a.dtype) * 0.1
+    w = _weight_reference(b, scales, block_n, block_k, gate)
+    ref = a.float() @ w.float().T + bias.float()
+    if gate:
+        ref = torch.nn.functional.silu(ref[:, 0::2]) * ref[:, 1::2]
+    got = kernel.matmul_2d(
+        a,
+        b,
+        None,
+        scales,
+        activation_format="bf16",
+        gate=gate,
+        bias=bias,
+        output_dtype=torch.float32,
+    )
+    torch.testing.assert_close(got, ref, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize("gate", [False, True])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_weight_only_prefill_temporary_workspace(kernel, gate, compiled):
+    """The large-weight path must retain scaled-weight rounding and fused bias/GLU semantics."""
+    if TEST_DEVICE != "cuda" or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("B200 prefill route")
+    torch.manual_seed(107)
+    m, n, k = 17, 768 if gate else 1536, 1024
+    rows = 2 * n if gate else n
+    a = torch.randn(m, k, device=TEST_DEVICE, dtype=torch.bfloat16)
+    b = torch.randn(rows, k, device=TEST_DEVICE).to(torch.float8_e4m3fn)
+    scales = torch.rand(rows // 128, k // 128, device=TEST_DEVICE) * 0.031 + 0.013
+    bias = torch.randn(rows, device=TEST_DEVICE, dtype=a.dtype) * 0.1 if gate else None
+    w = _weight_reference(b, scales, 128, 128, gate)
+    ref = a.double() @ w.double().T
+    if gate:
+        ref += bias.double()
+        ref = torch.nn.functional.silu(ref[:, 0::2]) * ref[:, 1::2]
+
+    def run(x):
+        return kernel.matmul_2d(
+            x,
+            b,
+            None,
+            scales,
+            activation_format="bf16",
+            gate=gate,
+            bias=bias,
+            output_dtype=x.dtype,
+        )
+
+    if compiled:
+        run = torch.compile(run, fullgraph=True, dynamic=False)
+    actual = run(a)
+    if not gate:
+        # Independent dequantization plus the vendor GEMM is the exact plain oracle.
+        torch.testing.assert_close(actual, a @ w.T, rtol=0, atol=0)
+        # FP64 also bounds the aggregate BF16 error, including cancellation points
+        # where local ULP counts overstate ordinary FP32 accumulation error.
+        relative_error = torch.linalg.vector_norm(
+            actual.double() - ref
+        ) / torch.linalg.vector_norm(ref)
+        assert relative_error < torch.finfo(a.dtype).eps / 2
+        return
+    expected = ref.to(a.dtype)
+    # FP32 MMA reduction order can move a BF16 rounding tie by one output ULP.
+    # Use the independent FP64 oracle and bound that discrete difference explicitly.
+    _, exponent = torch.frexp(expected.float())
+    spacing = torch.ldexp(torch.ones_like(expected.float()), exponent - 8)
+    spacing = torch.where(
+        expected == 0, torch.finfo(a.dtype).tiny * torch.finfo(a.dtype).eps, spacing
+    )
+    ulp_error = (actual.float() - expected.float()).abs() / spacing
+    assert ulp_error.max() <= 1, f"maximum BF16 error: {ulp_error.max().item()} ULP"
+
+
+@pytest.mark.parametrize("gate,scalar", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.uint8])
+def test_temporary_weight_workspace_expert_strides(kernel, gate, scalar, scale_dtype):
+    """The shared dequantizer must retain expert, partial-block, and gate scale indexing."""
+    import importlib
+
+    weight_only = importlib.import_module(kernel.__name__ + ".weight_only")
+    torch.manual_seed(109)
+    e, n, k = 3, 192, 384
+    rows = 2 * n if gate else n
+    # A transposed weight view exercises the input strides independently of output layout.
+    b = (
+        torch.randn(e, k, rows, device=TEST_DEVICE)
+        .to(torch.float8_e4m3fn)
+        .transpose(-1, -2)
+    )
+    shape = (
+        (e, 1, 1)
+        if scalar
+        else (e, 2 * ((n + 127) // 128) if gate else (n + 127) // 128, k // 128)
+    )
+    if scale_dtype == torch.uint8:
+        scales = torch.randint(123, 129, shape, device=TEST_DEVICE, dtype=torch.uint8)
+    else:
+        scales = torch.rand(shape, device=TEST_DEVICE) * 0.031 + 0.013
+    bn, bk = (rows, k) if scalar else (128, 128)
+    actual = weight_only.dequantize_weight(
+        b, scales, torch.float16, bn, bk, gate and not scalar
+    )
+    expected = _weight_reference(b, scales, bn, bk, gate, torch.float16)
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("gate", [False, True])
+def test_weight_only_decode_compiles_fullgraph(kernel, monkeypatch, gate):
+    """The split-K decode route must capture its workspace/reduction and consume new inputs."""
+    import importlib
+
+    import triton
+
+    if TEST_DEVICE != "cuda" or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("B200 decode route")
+    weight_only = importlib.import_module(kernel.__name__ + ".weight_only")
+    monkeypatch.setattr(
+        weight_only._decode_partial,
+        "configs",
+        [
+            triton.Config(
+                {"BLOCK_N": 16, "BLOCK_K": 256, "SPLIT_K": 4}, num_warps=4, num_stages=1
+            )
+        ],
+    )
+    torch.manual_seed(113)
+    rows, k = 512 if gate else 256, 384
+    a = torch.randn(1, k, device=TEST_DEVICE, dtype=torch.bfloat16)
+    b = torch.randn(rows, k, device=TEST_DEVICE).to(torch.float8_e4m3fn)
+    scales = torch.rand(rows // 128, k // 128, device=TEST_DEVICE) * 0.031 + 0.013
+    bias = torch.randn(rows, device=TEST_DEVICE, dtype=a.dtype) * 0.1
+
+    def run(x):
+        return kernel.matmul_2d(
+            x,
+            b,
+            None,
+            scales,
+            activation_format="bf16",
+            gate=gate,
+            bias=bias,
+            output_dtype=x.dtype,
+        )
+
+    compiled = torch.compile(run, fullgraph=True, dynamic=False, mode="reduce-overhead")
+    torch.testing.assert_close(compiled(a), run(a), rtol=0, atol=0)
+    torch.testing.assert_close(compiled(a + 1), run(a + 1), rtol=0, atol=0)
