@@ -17,6 +17,7 @@ The ``finegrained_kernels`` package is on ``sys.path`` via ``conftest.py`` (pyte
 auto-loads it before any test module)."""
 
 import torch
+import finegrained_kernels
 
 from finegrained_kernels.compat import (  # type: ignore
     MX_SCALE_GROUP_K,
@@ -506,22 +507,17 @@ def encode_csf_scales(scales):
     return fixed, streams
 
 
-def prepare_weight_scales(scales, encoding, fn, compiled=False):
+def prepare_weight_scales(scales, csf_encoding, fn, compiled=False):
     """Wrap a matrix Problem's existing op; compiled cases capture decode + GEMM together."""
-    if encoding is None:
+    if not csf_encoding:
         return maybe_compile(fn, compiled)
-    from kernels import get_kernel
-
-    assert encoding == "csf"
-    kernel = get_kernel("kernels-community/finegrained-kernels", version=0)
     fixed, exceptions = encode_csf_scales(scales)
     buffers = tuple(
-        t.to(scales.device) for t in kernel.prepare_nvfp4_csf_scales(fixed, exceptions)
+        t.to(scales.device) for t in finegrained_kernels.prepare_nvfp4_csf_scales(fixed, exceptions)
     )
-    op = getattr(kernel, fn.__name__)
 
     def run(A, B, As, Bs, **kwargs):
-        decoded = kernel.decompress_nvfp4_csf_scales(*buffers)
-        return op(A, B, As, decoded.reshape(Bs.shape), **kwargs)
+        decoded = finegrained_kernels.decompress_nvfp4_csf_scales(*buffers)
+        return fn(A, B, As, decoded.reshape(Bs.shape), **kwargs)
 
     return maybe_compile(run, compiled)
