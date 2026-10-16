@@ -31,7 +31,7 @@ from .formats import block_fp8_weight_scale_grid, check_activation_format, globa
 from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
-from .scheduling import is_off_rank
+from .scheduling import is_off_rank, resolve_row
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from . import compat
 from .weight_only import decode_matmul
@@ -88,10 +88,9 @@ def expert_setup(
     non-local expert would be out of bounds."""
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
-    # Cast to int64 to prevent overflow on expert_id * stride_b_e.
-    expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
-    in_row = tl.load(GatherIdx + batch_id).to(tl.int64) if GatherIdx is not None else batch_id
-    out_row = tl.load(ScatterIdx + batch_id).to(tl.int64) if ScatterIdx is not None else batch_id
+    expert_id, in_row, out_row, _ = resolve_row(
+        batch_id, ExpertIds, None, GatherIdx, ScatterIdx, 0, stride_eid,
+    )
     A = A + in_row * stride_a_m
     B = B + expert_id * stride_b_e
     C = C + out_row * stride_c_m
