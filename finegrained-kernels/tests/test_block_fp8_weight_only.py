@@ -60,6 +60,7 @@ def _weight_reference(
         ),
         (17, 256, 256, 64, 128, True, torch.bfloat16),
         (7, 128, 256, 256, 128, True, torch.bfloat16),
+        (7, 192, 256, 128, 128, True, torch.bfloat16),
     ],
 )
 def test_block_fp8_weight_only(kernel, m, n, k, block_n, block_k, gate, dtype):
@@ -67,11 +68,11 @@ def test_block_fp8_weight_only(kernel, m, n, k, block_n, block_k, gate, dtype):
     a = torch.randn(m, k, device=TEST_DEVICE, dtype=dtype)
     rows = 2 * n if gate else n
     b = torch.randn(rows, k, device=TEST_DEVICE).to(torch.float8_e4m3fn)
+    scale_rows = (rows + block_n - 1) // block_n
+    if gate and scale_rows > 1:
+        scale_rows = 2 * ((n + block_n - 1) // block_n)
     scales = torch.pow(
-        2.0,
-        torch.randint(
-            -3, 3, ((rows + block_n - 1) // block_n, k // block_k), device=TEST_DEVICE
-        ),
+        2.0, torch.randint(-3, 3, (scale_rows, k // block_k), device=TEST_DEVICE)
     )
     bias = torch.randn(rows, device=TEST_DEVICE, dtype=dtype)
     dequantized = _weight_reference(b, scales, block_n, block_k, gate, dtype)

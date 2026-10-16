@@ -371,7 +371,11 @@ def block_fp8_weight_scale_grid(B: torch.Tensor, Bs: torch.Tensor, gate: bool = 
     assert Bs.ndim == B.ndim and Bs.shape[:-2] == B.shape[:-2]
     assert K % Bs.shape[-1] == 0, "the weight scale grid must tile K evenly"
     block_k = K // Bs.shape[-1]
-    block_n = block_k if ((rows + block_k - 1) // block_k) == Bs.shape[-2] else rows // Bs.shape[-2]
-    assert block_n > 0 and ((rows + block_n - 1) // block_n) == Bs.shape[-2]
-    assert not gate or Bs.shape[-2] == 1 or Bs.shape[-2] % 2 == 0, "gate/up scale rows must occur in pairs"
+    if gate and Bs.shape[-2] > 1:
+        assert rows % 2 == 0 and Bs.shape[-2] % 2 == 0, "gate/up scale rows must occur in pairs"
+        scale_rows, weight_rows = Bs.shape[-2] // 2, rows // 2
+    else:
+        scale_rows, weight_rows = Bs.shape[-2], rows
+    block_n = block_k if ((weight_rows + block_k - 1) // block_k) == scale_rows else weight_rows // scale_rows
+    assert block_n > 0 and ((weight_rows + block_n - 1) // block_n) == scale_rows
     return Bs, block_n, block_k
