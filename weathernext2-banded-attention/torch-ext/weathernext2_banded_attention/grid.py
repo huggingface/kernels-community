@@ -165,8 +165,7 @@ class WeatherNext2MeshToGrid(nn.Module):
                 conditioning,
                 projected_senders=projected_senders,
             )
-            aggregated = torch.zeros(block.shape, dtype=torch.float32, device=block.device)
-            aggregated.index_add_(1, local_receivers, messages.float())
+            aggregated = messages.reshape(*block.shape[:2], 3, -1).sum(dim=2, dtype=torch.float32)
             block.add_(self.grid_node_update(torch.cat([block, aggregated.to(block.dtype)], dim=-1), conditioning))
         mesh_states = mesh_states + self.mesh_node_update(mesh_states, conditioning)
         return grid_states, mesh_states
