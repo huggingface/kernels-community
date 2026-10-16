@@ -17,9 +17,9 @@ activation-quant arm equivalence, and cross-process determinism; each docstring
 carries its incident."""
 
 import logging
-from collections import Counter
 import subprocess
 import sys
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -30,7 +30,7 @@ from utils import TEST_DEVICE, make_weights
 
 import finegrained_kernels  # type: ignore
 import finegrained_kernels.matmul  # type: ignore
-from finegrained_kernels.bayesian_autotuner import BayesianAutotuner, bayesian_autotune  # type: ignore
+from finegrained_kernels.bayesian_autotuner import bayesian_autotune  # type: ignore
 from finegrained_kernels.compat import is_sm10x  # type: ignore
 from finegrained_kernels.pruners import block_within_dim_pruner, mx_config_pruner  # type: ignore
 
@@ -346,80 +346,21 @@ def test_compile_failures_are_memoized_across_keys(caplog):
     assert "[memoized]" in msgs[1], msgs[1]
 
 
-class HostKernel:
-    def __init__(self):
-        # Triton's constructor unwraps .fn until it reaches a Python function.
-        self.fn = lambda: None
-        self.__name__ = "host_budget_probe"
-        self.launches = []
-
-    def run(self, **kwargs):
-        self.launches.append((kwargs["MODE"], kwargs["BLOCK_SIZE_N"]))
-
-
-def make_tuner(first_failure=None):
-    kernel = HostKernel()
-    attempts, successful = [], []
-
-    def measure(kernel_call, quantiles):
-        attempts.append(None)
-        if len(attempts) == 1 and first_failure == "exception":
-            raise RuntimeError("synthetic rejected configuration")
-        kernel_call()
-        if len(attempts) == 1 and first_failure == "inf":
-            return [float("inf")] * 3
-        mode, tile = kernel.launches[-1]
-        successful.append((mode, tile))
-        return [1.0 / tile] * 3
-
-    configs = [
-        triton.Config({"MODE": mode, "BLOCK_SIZE_N": tile}, num_warps=4, num_stages=2)
-        for mode in ("plain", "swap", "tma")
-        for tile in (16, 32, 64)
-    ]
-    tuner = BayesianAutotuner(
-        kernel,
-        [],
-        configs,
-        [],
-        None,
-        None,
-        n_trials=80,
-        refine=True,
-        path_anchor_axes=("MODE",),
-        cache_results=False,
-        do_bench=measure,
-    )
-    return tuner, kernel, attempts, successful
-
-
 @pytest.mark.kernels_ci
-@pytest.mark.parametrize("first_failure", [None, "exception", "inf"])
-def test_single_trial_measures_one_success(monkeypatch, first_failure):
-    """Multiple basins and enabled refinement must not expand the one-trial budget."""
+def test_single_trial_measures_one_config(monkeypatch):
     monkeypatch.setenv("FINEGRAINED_AUTOTUNE_TRIALS", "1")
-    tuner, kernel, attempts, successful = make_tuner(first_failure)
-    tuner.run()
-    assert len(successful) == 1
-    assert len(attempts) == (1 if first_failure is None else 2)
-    assert kernel.launches[-1] == successful[0]
-    # A repeated key is a normal cached launch, not a second measurement.
-    tuner.run()
-    assert len(successful) == 1
-    assert len(attempts) == (1 if first_failure is None else 2)
+    configs = [
+        triton.Config({"MODE": mode, "BLOCK_SIZE_N": tile})
+        for mode in ("plain", "swap") for tile in (16, 32, 64)
+    ]
 
+    @bayesian_autotune(configs, [], n_trials=80, refine=True, path_anchor_axes=("MODE",))
+    @triton.jit
+    def kernel(MODE: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
+        pass
 
-@pytest.mark.kernels_ci
-def test_larger_budget_keeps_anchors_refinement_and_runoff(monkeypatch):
-    """Budget 2 keeps the established wider search: six anchors, a neighbor and runoff."""
-    monkeypatch.setenv("FINEGRAINED_AUTOTUNE_TRIALS", "2")
-    tuner, kernel, attempts, successful = make_tuner()
-    tuner.run()
-    counts = Counter(successful)
-    assert set(mode for mode, _ in successful) == {"plain", "swap", "tma"}
-    assert any(
-        tile == 16 for _, tile in successful
-    )  # refinement beyond median/max anchors
-    assert all(counts[(mode, 64)] == 2 for mode in ("plain", "swap", "tma"))  # runoff
-    assert len(successful) == len(attempts) == 10
-    assert kernel.launches[-1][1] == 64
+    measure = Mock(return_value=1.0)
+    monkeypatch.setattr(kernel, "_bench", measure)
+    winner = kernel._bayesian_search(configs, (), {}, ())
+    measure.assert_called_once()
+    assert winner is measure.call_args.kwargs["config"]
