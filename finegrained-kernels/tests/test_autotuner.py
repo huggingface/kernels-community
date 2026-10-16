@@ -16,10 +16,12 @@ crash-config pruner guards, autotuner resilience and reporting for failing confi
 activation-quant arm equivalence, and cross-process determinism; each docstring
 carries its incident."""
 
+import importlib
 import logging
 import subprocess
 import sys
 
+import kernels
 import pytest
 import torch
 import triton
@@ -346,23 +348,21 @@ def test_compile_failures_are_memoized_across_keys(caplog):
 
 
 @pytest.mark.kernels_ci
-def test_uint8_mx_scales_without_native_ue8m0():
-    """Older Torch must import the real package and recognize raw exponent scales."""
-    script = """
-import torch
-import torch._inductor.utils
-if hasattr(torch, "float8_e8m0fnu"):
-    del torch.float8_e8m0fnu
-import importlib
-import kernels
-kernel = kernels.get_kernel("kernels-community/finegrained-kernels", version=0)
-formats = importlib.import_module(kernel.__name__ + ".formats")
-is_mxfp4, is_mxfp8, ue8m0_as_uint8 = formats.is_mxfp4, formats.is_mxfp8, formats.ue8m0_as_uint8
-scale = torch.full((16, 4), 127, dtype=torch.uint8)
-assert ue8m0_as_uint8(scale) is scale
-assert is_mxfp8(torch.empty((16, 128), dtype=torch.float8_e4m3fn), scale)
-assert is_mxfp4(torch.empty((16, 64), dtype=torch.int8), scale)
-fp32 = torch.ones((16, 4), dtype=torch.float32)
-assert ue8m0_as_uint8(fp32) is fp32
-"""
-    subprocess.run([sys.executable, "-c", script], check=True, timeout=60)
+def test_uint8_mx_scales_without_native_ue8m0(monkeypatch):
+    """Import-time format detection must accept uint8 scales without native UE8M0."""
+    kernel = kernels.get_kernel("kernels-community/finegrained-kernels", version=0)
+    formats = importlib.import_module(kernel.__name__ + ".formats")
+    try:
+        with monkeypatch.context() as patch:
+            patch.delattr(torch, "float8_e8m0fnu", raising=False)
+            importlib.reload(formats)
+            scale = torch.full((16, 4), 127, dtype=torch.uint8)
+            assert formats.ue8m0_as_uint8(scale) is scale
+            assert formats.is_mxfp8(
+                torch.empty((16, 128), dtype=torch.float8_e4m3fn), scale
+            )
+            assert formats.is_mxfp4(torch.empty((16, 64), dtype=torch.int8), scale)
+            fp32 = torch.ones((16, 4), dtype=torch.float32)
+            assert formats.ue8m0_as_uint8(fp32) is fp32
+    finally:
+        importlib.reload(formats)
