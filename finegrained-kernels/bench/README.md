@@ -111,3 +111,47 @@ ignored when absent from the pruned grid. They never override measured dispatch.
 Other devices retain the native benchmark and do not receive these B200 seeds.
 The existing cuBLAS dispatch for medium row counts is unchanged. Narrow prefill
 is approximately neutral; the table does not claim improvements at every shape.
+
+## Routed rowwise FP8 measurements
+
+```bash
+FINEGRAINED_AUTOTUNE_TRIALS=100 python bench/bench_fp8_routed.py \
+  --family rowwise --kind grouped --rows 1,16,256 --output routed.jsonl
+FINEGRAINED_AUTOTUNE_TRIALS=100 python bench/bench_fp8_routed.py \
+  --family rowwise --kind batched --rows 1,16 --output batched.jsonl
+```
+
+Eight active experts, N1280/K5120; 52 MB of FP8 weights. Times include activation
+quantization and grouped schedule construction. The persistent BF16 bmm comparison
+holds 105 MB of weights; its warm working set also fits B200 L2.
+
+| Rows per expert | Before grouped warm | After grouped warm / cold | Persistent BF16 bmm warm / cold |
+|---:|---:|---:|---:|
+| 1 | 16.68 | 16.69 / 26.69 | 17.52 / 32.83 |
+| 16 | 19.03 | 14.87 / 28.74 | 19.49 / 32.80 |
+| 256 | 40.37 | 28.98 / 45.09 | 29.52 / 36.83 |
+
+Grouped tuning measures warm and cold execution and seeds representative sparse
+and packed-prefill candidates. Without the sparse seed, that tuning change
+regressed warm decode. The tuner can move from the seeds: the selected prefill
+stage count differs from its initial representative. Batched decode measured
+12.25 µs at one row per expert, but 77.50 µs at 16 rows; grouped is the path for
+reusing expert weights across many rows.
+
+The grids cover M/N/K tiles, warps/stages, operand pointer/TMA modes, warp
+specialization, dense operand swap, and grouped packed/inline scheduling. Bounded
+probes around the full-100-trial winners also checked persistent program count
+and the existing dense L2 swizzle: half as many grouped programs regressed
+prefill to 47.17 µs, twice as many was approximately neutral (28.75 µs). Reducing
+the dense swizzle's A window from 512 KiB to 128 KiB regressed wide prefill from
+320 to 347 µs at the same tile; larger windows produce the same mapping for the
+measured 32-row-tile shapes. Those constants stay unchanged. These were fixed
+winner probes, not fresh full-grid optimization claims.
+
+A scalar/split-K decode prototype transferred from W8A16 to rowwise FP8 lost to
+the existing tensor-core path and was rejected. Rowwise scales stay affine and
+are folded after the dot; MX-specific scale swizzles do not apply. The supplied
+Torch nightly's grouped FP8 cuBLAS primitive traps with an architecture mismatch,
+so it is excluded from routed comparisons; dense cuBLAS FP8 is healthy. The
+results establish the measured B200 regimes, not optimality over all layouts,
+algorithms, shapes, activation functions or accelerators.

@@ -154,3 +154,67 @@ def test_tuning_seeds_are_measured_without_bypassing_pruning(kernel, monkeypatch
     assert measured[0] is configs[19]
     assert removed not in measured
     assert len(set(measured)) == 2
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("gathered", [False, True])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_rowwise_grouped_tuning_preserves_irregular_routes(
+    kernel, monkeypatch, gathered, compiled
+):
+    """New TMA/packed-schedule starting candidates retain tail masks and expert routing."""
+    import importlib
+
+    if TEST_DEVICE != "cuda" or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("B200 tuning candidates")
+    module = importlib.import_module(kernel.__name__ + ".grouped")
+    tuner = module.w8a8_tensor_dynamic_fp8_matmul_grouped_kernel
+    candidate = tuner.seed_configs[0 if gathered else 1]
+    # Preserve the real grid's descriptor-rebinding hook while forcing each coupled path.
+    actual_config = next(
+        c for c in tuner.configs if c.all_kwargs() == candidate.all_kwargs()
+    )
+    monkeypatch.setattr(tuner, "configs", [actual_config])
+    tuner.cache.clear()
+    torch.manual_seed(73)
+    e, s, n, k = 4, 257, 256, 256
+    source_rows = 17 if gathered else s
+    a = torch.randn(source_rows, k, device=TEST_DEVICE, dtype=torch.bfloat16) * 0.1
+    b = (torch.randn(e, n, k, device=TEST_DEVICE) * 0.1).to(torch.float8_e4m3fn)
+    bs = torch.rand(e, n, 1, device=TEST_DEVICE) * 0.3 + 0.1
+    bias = torch.randn(e, n, device=TEST_DEVICE) * 0.01
+    starts = torch.tensor([0, 1, 130, 130, s], device=TEST_DEVICE, dtype=torch.int32)
+    source = torch.arange(s, device=TEST_DEVICE).remainder(source_rows).to(torch.int32)
+    scatter = torch.randperm(s, device=TEST_DEVICE).to(torch.int32)
+    experts = torch.tensor([0] + [1] * 129 + [3] * 127, device=TEST_DEVICE)
+    scales = a.float().abs().amax(-1, keepdim=True).clamp_min(1e-12) / 448
+    aq = (a.float() / scales).to(torch.float8_e4m3fn)
+    a_reference = aq.float() * scales
+    weights = b.float() * bs
+    expected = torch.empty(s, n, device=TEST_DEVICE)
+    values = (
+        torch.bmm(
+            a_reference[source.long()].unsqueeze(1), weights[experts].transpose(1, 2)
+        ).squeeze(1)
+        + bias[experts]
+    )
+    expected[scatter.long()] = values
+
+    def forward(x):
+        return kernel.matmul_grouped(
+            x,
+            b,
+            None,
+            bs,
+            expert_start=starts,
+            gather_idx=source if gathered else None,
+            scatter_idx=scatter,
+            bias=bias,
+            output_dtype=torch.float32,
+        )
+
+    if compiled:
+        forward = torch.compile(forward, fullgraph=True, mode="reduce-overhead")
+    with torch.no_grad():
+        result = forward(a)
+    torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
