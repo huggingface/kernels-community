@@ -1,5 +1,3 @@
-# DeepEP 2.5.0 (deepseek-ai/DeepEP def865146e95aa9ea223e277c0a8a4c6b81e5ac7)
-# with DeepJIT cba802df081985141eeee36803685775c183a047.
 [general]
 name = "deep-ep"
 version = 1
@@ -8,40 +6,19 @@ license = "MIT"
 upstream = "https://github.com/deepseek-ai/DeepEP"
 backends = ["cuda"]
 
-# The host extension uses CUDA 13 runtime APIs; the JIT needs nvcc >= 13.1 at runtime anyway.
 [general.cuda]
 minver = "13.0"
 
 [general.hub]
 repo-id = "kernels-community/deep-ep"
 
-# Only DeepEP's small host extension is built here; its GPU kernels are
-# compiled at runtime by DeepJIT (CUDA >= 13.1 at runtime), against the NCCL
-# that PyTorch loads (>= 2.32.3). The extension does not link or ship NCCL; its
-# NCCL symbols resolve to PyTorch's library. The NCCL headers in
-# `third-party/nccl` are only used to compile the host extension.
 [torch]
-include = [
-    "torch-ext",
-    "torch-ext/compat",
-    "csrc",
-    "deep_ep/include",
-    "third-party/deep_jit/include",
-    "third-party/nccl/include",
-]
-cxx-flags = [
-    "-std=c++20",
-    "-DDEEP_EP_KERNELS",
-    "-Wno-deprecated-declarations",
-    "-Wno-unused-variable",
-    "-Wno-sign-compare",
-    "-Wno-reorder",
-    "-Wno-attributes",
-]
+cxx-flags = ["-std=c++20", "-DDEEP_EP_KERNELS", "-Wno-deprecated-declarations", "-Wno-unused-variable", "-Wno-sign-compare", "-Wno-reorder", "-Wno-attributes"]
 pyext = [
     "py",
     "cuh",
 ]
+include = ["torch-ext", "torch-ext/compat", "csrc", "deep_ep/include", "third-party/deep_jit/include", "third-party/nccl/include"]
 src = [
     "torch-ext/deep_ep_holders.hpp",
     "torch-ext/torch_binding.cpp",
@@ -49,10 +26,6 @@ src = [
 
 [kernel.deep_ep]
 language = "cpp-cuda"
-cuda-capabilities = [
-    "9.0a",
-    "10.0a",
-]
 cxx-flags = [
     "-std=c++20",
     "-O3",
@@ -63,17 +36,10 @@ cxx-flags = [
     "-Wno-reorder",
     "-Wno-attributes",
 ]
+cuda-capabilities = ["9.0a", "10.0a"]
 depends = ["torch"]
-include = [
-    "torch-ext/compat",
-    "csrc",
-    "deep_ep/include",
-    "third-party/deep_jit/include",
-    "third-party/nccl/include",
-]
+include = ["torch-ext/compat", "csrc", "deep_ep/include", "third-party/deep_jit/include", "third-party/nccl/include"]
 src = [
-    "csrc/kernels/comm/context.cpp",
-    "csrc/kernels/driver/driver.cpp",
     "csrc/buffers/base.hpp",
     "csrc/buffers/bucket.hpp",
     "csrc/buffers/engram.hpp",
@@ -88,8 +54,10 @@ src = [
     "csrc/kernels/bucket/reduce_scatter.hpp",
     "csrc/kernels/comm/api.hpp",
     "csrc/kernels/comm/barrier.hpp",
+    "csrc/kernels/comm/context.cpp",
     "csrc/kernels/comm/symmetric.hpp",
     "csrc/kernels/driver/api.hpp",
+    "csrc/kernels/driver/driver.cpp",
     "csrc/kernels/engram/engram.hpp",
     "csrc/kernels/ep/api.hpp",
     "csrc/kernels/ep/combine.hpp",

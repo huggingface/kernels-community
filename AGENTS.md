@@ -658,14 +658,19 @@ from.
 upstream layout, with the `third-party/deep_jit` submodule (DeepJIT) inlined at
 the commit the DeepEP release pins. Only the small host extension is built;
 DeepEP's GPU kernels are JIT-compiled at runtime by DeepJIT. When the user asks
-to sync a DeepEP release, carry out the following steps:
+to sync a DeepEP release, update `deep-ep/port/port.kdl` and its handwritten
+`overlay/` files, then regenerate and check the output with
+`deep-ep/port/regenerate.py` (see `deep-ep/port/README.md`). Do not make porting
+changes only in the generated tree. The recipe pins DeepEP, DeepJIT and NCCL
+and retains the existing Torch ops/custom-class bindings. The synchronization
+requirements encoded in the recipe are:
 
 - Fetch https://github.com/deepseek-ai/DeepEP.git and check out the release
   commit the user specified (upstream does not tag V2 releases; find the
   "DeepEP V<x>" commit and check `__version__` in `deep_ep/__init__.py`).
-- Copy the release verbatim over `deep-ep/`, and DeepJIT at the submodule commit
-  pinned by that release over `deep-ep/third-party/deep_jit`, in a separate
-  "import verbatim" commit, so the porting changes stay reviewable as a diff.
+- Update the source pin to that release and the DeepJIT vendor pin to its
+  submodule commit. Keep upstream edits in guarded recipe operations so the
+  porting changes remain reviewable separately from imported code.
 - Delete upstream's build entry points again (`setup.py`, `pyproject.toml`,
   `CMakeLists.txt`, `build.sh`, `install.sh`, `develop.sh`): `kernel-builder
   create-pyproject` generates `setup.py`, `pyproject.toml` and `CMakeLists.txt`
