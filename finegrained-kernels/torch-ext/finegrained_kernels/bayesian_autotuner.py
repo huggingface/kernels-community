@@ -94,11 +94,6 @@ class BayesianAutotuner(Autotuner):
         finite_check_args: tuple[str, ...] = (),
         **kwargs,
     ):
-        benchmark = kwargs.get("do_bench")
-        self._benchmark_name = "default" if benchmark is None else (
-            f"{getattr(benchmark, '__module__', type(benchmark).__module__)}."
-            f"{getattr(benchmark, '__qualname__', type(benchmark).__qualname__)}"
-        )
         super().__init__(*args, **kwargs)
         self.fn_name = getattr(self.fn, "__name__", str(self.fn))
         # Bayesian trial budget — the per-decorator default, overridable via the
@@ -751,7 +746,6 @@ class BayesianAutotuner(Autotuner):
         env_vars = get_cache_invalidating_env_vars()
         cache_key = [
             _TUNING_POLICY,
-            self._benchmark_name,
             triton_key(),
             make_backend(driver.active.get_current_target()).hash(),
             fn.cache_key,

@@ -29,7 +29,7 @@ from utils import TEST_DEVICE, make_weights
 
 import finegrained_kernels  # type: ignore
 import finegrained_kernels.matmul  # type: ignore
-from finegrained_kernels.bayesian_autotuner import bayesian_autotune  # type: ignore
+from finegrained_kernels.bayesian_autotuner import BayesianAutotuner, bayesian_autotune  # type: ignore
 from finegrained_kernels.compat import is_sm10x  # type: ignore
 from finegrained_kernels.pruners import block_within_dim_pruner, mx_config_pruner  # type: ignore
 
@@ -346,61 +346,7 @@ def test_compile_failures_are_memoized_across_keys(caplog):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.parametrize(
-    "device_type,sm10x", [("cuda", True), ("cuda", False), ("xpu", False)]
-)
-def test_rowwise_replay_benchmark_uses_device_backend(
-    monkeypatch, device_type, sm10x
-):
-    """CUDA replay timing includes the whole callback; other devices keep their benchmark."""
-    import importlib
-    from contextlib import nullcontext
-    from types import SimpleNamespace
-
-    import triton
-    import triton.testing
-
-    compat = importlib.import_module(finegrained_kernels.__name__ + ".compat")
-    matmul = importlib.import_module(finegrained_kernels.__name__ + ".matmul")
-    called = []
-
-    def callback():
-        called.append("callback")
-
-    quantiles = (0.5, 0.2, 0.8)
-
-    def bench(fn, **kwargs):
-        assert fn is callback
-        assert kwargs["quantiles"] == quantiles
-        assert kwargs.get("rep") == (60 if device_type == "cuda" and sm10x else None)
-        fn()
-        return [1.0, 0.9, 1.1]
-
-    monkeypatch.setattr(compat, "get_active_device_type", lambda: device_type)
-    monkeypatch.setattr(compat, "is_sm10x", lambda: sm10x)
-    monkeypatch.setattr(triton.testing, "do_bench_cudagraph", bench)
-    monkeypatch.setattr(triton.testing, "do_bench", bench)
-    monkeypatch.setattr(
-        torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=callback)
-    )
-    monkeypatch.setattr(torch.cuda, "graph", lambda graph: nullcontext())
-    monkeypatch.setattr(
-        triton.runtime,
-        "driver",
-        SimpleNamespace(active=SimpleNamespace(get_benchmarker=lambda: bench)),
-    )
-    expected = [2.0, 1.8, 2.2] if device_type == "cuda" and sm10x else [1.0, 0.9, 1.1]
-    assert compat.replay_benchmark(callback, quantiles) == expected
-    assert called == ["callback"] * (3 if device_type == "cuda" and sm10x else 1)
-    assert (
-        matmul.w8a8_tensor_dynamic_fp8_matmul_kernel.do_bench is compat.replay_benchmark
-    )
-
-
-@pytest.mark.kernels_ci
 def test_basin_anchors_cover_interior_and_wide_output_tiles():
-    from finegrained_kernels.bayesian_autotuner import BayesianAutotuner
-
     tuner = object.__new__(BayesianAutotuner)
     tuner.path_anchor_axes = ("SWAP_AB",)
     configs = [
@@ -420,41 +366,3 @@ def test_basin_anchors_cover_interior_and_wide_output_tiles():
     assert [(c.kwargs["BLOCK_SIZE_M"], c.kwargs["BLOCK_SIZE_N"]) for c in anchors] == [
         (64, 128), (128, 256), (64, 128), (128, 256),
     ]
-
-
-@pytest.mark.kernels_ci
-def test_autotune_cache_tracks_search_and_benchmark_policy(monkeypatch):
-    from types import SimpleNamespace
-    import finegrained_kernels.bayesian_autotuner as module
-    import triton.compiler.compiler as compiler
-
-    tuner = object.__new__(module.BayesianAutotuner)
-    tuner.fn = SimpleNamespace(cache_key="kernel", __name__="kernel")
-    tuner.keys, tuner.n_trials, tuner.n_startup_trials, tuner.gamma = ["N"], 100, 12, 0.25
-    tuner._benchmark_name = "finegrained_kernels.compat.replay_benchmark"
-    monkeypatch.setattr(module, "JITFunction", SimpleNamespace)
-    monkeypatch.setattr(module, "triton_key", lambda: "triton")
-    monkeypatch.setattr(module, "get_cache_invalidating_env_vars", lambda: {})
-    monkeypatch.setattr(module, "driver", SimpleNamespace(active=SimpleNamespace(get_current_target=lambda: None)))
-    monkeypatch.setattr(compiler, "make_backend", lambda target: SimpleNamespace(hash=lambda: "backend"))
-    keys = []
-
-    def capture(key):
-        keys.append(key)
-        raise StopIteration
-
-    monkeypatch.setattr(module, "get_cache_manager", capture)
-
-    def cache_key():
-        with pytest.raises(StopIteration):
-            tuner.check_disk_cache((128,), [triton.Config({"BLOCK": 64})], lambda: None)
-        return keys[-1]
-
-    first = cache_key()
-    assert cache_key() == first
-    policy = module._TUNING_POLICY
-    monkeypatch.setattr(module, "_TUNING_POLICY", "previous-policy")
-    assert cache_key() != first
-    monkeypatch.setattr(module, "_TUNING_POLICY", policy)
-    tuner._benchmark_name = "other.benchmark"
-    assert cache_key() != first

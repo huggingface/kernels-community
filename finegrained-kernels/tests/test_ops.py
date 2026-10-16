@@ -51,6 +51,9 @@ from utils import (  # type: ignore
 )
 
 import finegrained_kernels  # type: ignore
+from finegrained_kernels.batched import mx_dynamic_matmul_batched_kernel, w8a8_tensor_dynamic_fp8_matmul_batched_kernel
+from finegrained_kernels.grouped import mx_dynamic_matmul_grouped_kernel, w8a8_tensor_dynamic_fp8_matmul_grouped_kernel
+from finegrained_kernels.matmul import mx_dynamic_matmul_kernel, w8a8_tensor_dynamic_fp8_matmul_kernel
 from finegrained_kernels import swizzle_mx_scales, unswizzle_mx_scales  # type: ignore
 from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore
 from finegrained_kernels.quant import fp8_act_quant_tensor_wide, nvfp4_act_quant  # type: ignore
@@ -730,47 +733,40 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
 # kernel (the dense gate fusion and its gate_pointer_only/WS pruners), and one nvfp4 cell
 # (E4M3 scales: the nvfp4_native_ok fence + software decode arms).
 _SWEEP_CELLS = [
-    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True), "grouped", mx_dynamic_matmul_grouped_kernel),
     # K off the BK=128 grid admits the BK=64 rows, the family a K=256 cell never reaches
-    (Problem(weights="mxfp4", K=320), "grouped", "mx_dynamic_matmul_grouped_kernel"),
-    (Problem(weights="mxfp8", K=320), "grouped", "mx_dynamic_matmul_grouped_kernel"),
-    (Problem(weights="mxfp4", S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
-    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
-    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", "mx_dynamic_matmul_kernel"),
-    (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
+    (Problem(weights="mxfp4", K=320), "grouped", mx_dynamic_matmul_grouped_kernel),
+    (Problem(weights="mxfp8", K=320), "grouped", mx_dynamic_matmul_grouped_kernel),
+    (Problem(weights="mxfp4", S=8), "batched", mx_dynamic_matmul_batched_kernel),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", mx_dynamic_matmul_grouped_kernel),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", mx_dynamic_matmul_kernel),
+    (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", mx_dynamic_matmul_batched_kernel),
     # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize
     # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is
     # the one a memory-mode fence gets wrong (silently — the tuner forgives what will not lower)
-    (Problem(weights="fp8_tensor", static=True), "grouped", "w8a8_tensor_dynamic_fp8_matmul_grouped_kernel"),
+    (Problem(weights="fp8_tensor", static=True), "grouped", w8a8_tensor_dynamic_fp8_matmul_grouped_kernel),
     # row-wise weights: the per-row scale vector each arm folds on its own weight-row axis — the
     # stacked gate|up span, the swapped decode tile, and the 2D kernel's tile
-    (Problem(weights="fp8_rowwise", gate=True, S=512), "grouped", "w8a8_tensor_dynamic_fp8_matmul_grouped_kernel"),
-    (Problem(weights="fp8_rowwise", gate=True, S=8), "batched", "w8a8_tensor_dynamic_fp8_matmul_batched_kernel"),
-    (Problem(weights="fp8_rowwise", gate=True, S=256), "matmul", "w8a8_tensor_dynamic_fp8_matmul_kernel"),
+    (Problem(weights="fp8_rowwise", gate=True, S=512), "grouped", w8a8_tensor_dynamic_fp8_matmul_grouped_kernel),
+    (Problem(weights="fp8_rowwise", gate=True, S=8), "batched", w8a8_tensor_dynamic_fp8_matmul_batched_kernel),
+    (Problem(weights="fp8_rowwise", gate=True, S=256), "matmul", w8a8_tensor_dynamic_fp8_matmul_kernel),
 ]
 
 
 @pytest.mark.slow
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize(
-    "problem, op, kernel_name",
+    "problem, op, tuner",
     _SWEEP_CELLS,
     ids=[f"{p.id}_{op}" for p, op, _ in _SWEEP_CELLS],
 )
-def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
+def test_every_admitted_config_is_correct(problem: Problem, op, tuner):
     """Force-run EVERY config the pruners admit for one launch and hard-check each against the
     torch oracle. The tuner benches configs by SPEED, so a wrong-but-fast config that slips the
     pruners gets crowned silently — the class no winner-only test can see. A forced config may
     fail to compile/launch (the tuner's forgiven-inf path — reported, not asserted); a config
     that RUNS must be correct."""
-    import finegrained_kernels.batched as batched_mod
-    import finegrained_kernels.grouped as grouped_mod
-    import finegrained_kernels.matmul as matmul_mod
-    import finegrained_kernels.quant as quant_mod
 
-    # the op's own kernel, or one of the shared passes it launches (the activation quant)
-    op_mod = {"batched": batched_mod, "grouped": grouped_mod, "matmul": matmul_mod}[op]
-    tuner = getattr(op_mod, kernel_name, None) or getattr(quant_mod, kernel_name)
     A, expert_ids = _routed(problem)
     row = WEIGHTS[problem.weights]
     B, Bs, Bs_global = _make_weights(problem, row, problem.E)
@@ -788,7 +784,7 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
     try:
         tuner.cache.clear()
         _run_ref_vs_op(problem, op, A, expert_ids, B, Bs, Bs_global, shared=shared)
-        assert admitted.get("configs"), "the spy never saw a prune pass — wrong kernel_name?"
+        assert admitted.get("configs"), "the spy never saw a prune pass"
         forgiven = []
         for cfg in admitted["configs"]:
             tuner.configs = [cfg]
@@ -898,12 +894,9 @@ def test_rowwise_grouped_memory_modes_preserve_irregular_routes(
     monkeypatch, gathered, compiled
 ):
     """Pointer/gather and packed TMA paths retain tail masks and expert routing."""
-    import importlib
-
     if TEST_DEVICE != "cuda" or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("B200 tuning candidates")
-    module = importlib.import_module(finegrained_kernels.__name__ + ".grouped")
-    tuner = module.w8a8_tensor_dynamic_fp8_matmul_grouped_kernel
+    tuner = w8a8_tensor_dynamic_fp8_matmul_grouped_kernel
     actual_config = next(
         c for c in tuner.configs
         if c.kwargs["BLOCK_SIZE_M"] == (16 if gathered else 128)

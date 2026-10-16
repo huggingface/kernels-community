@@ -21,7 +21,6 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
-from .compat import replay_benchmark
 from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
 from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
@@ -459,7 +458,6 @@ def w8a8_block_static_fp8_matmul_grouped_kernel(
     # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
     ["N", "K", "tokens_per_expert_bit_length", "GATE"],
     n_trials=100,
-    do_bench=replay_benchmark,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BLOCK_SIZE_K/N are tuned axes; the K-loop is maskless and the N-tile store is
     # row-masked only — veto non-dividing tiles on both. WS is a pure perf axis here

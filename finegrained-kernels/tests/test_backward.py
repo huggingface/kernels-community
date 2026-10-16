@@ -45,6 +45,7 @@ from finegrained_kernels.backward import (
     dgrad_matmul_2d,
     dgrad_matmul_batched,
     dgrad_matmul_grouped,
+    dgrad_matmul_grouped_kernel,
     glu_backward,
 )
 
@@ -321,7 +322,6 @@ def test_dgrad_grouped_accumulates_over_top_k():
     row is written exactly once, so a kernel that STORES and one that ACCUMULATES are
     indistinguishable — which is how a store survived the suite while silently dropping all but
     one expert's contribution per token on any real MoE."""
-    from finegrained_kernels.backward import dgrad_matmul_grouped
 
     torch.manual_seed(0)
     T, tk, E, Ne, Ke = 8, 2, 4, 256, 256
@@ -365,8 +365,6 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
     benches configs by speed, so an arm that is wrong ONLY under these launch semantics gets
     crowned whenever it wins a near-tied tune — the descriptor-anchor bug this guards against
     read the wrong dY rows on exactly this launch while passing every identity-gather test."""
-    from finegrained_kernels import backward as backward_module
-    from finegrained_kernels.backward import dgrad_matmul_grouped
 
     torch.manual_seed(0)
     T, tk, E, Ne, Ke = 8, 2, 4, 256, 256
@@ -394,7 +392,7 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
             num_input_rows=T,
         )
 
-    tuner = backward_module.dgrad_matmul_grouped_kernel
+    tuner = dgrad_matmul_grouped_kernel
     admitted = {}
     original_prune, original_configs = tuner.early_config_prune, tuner.configs
 

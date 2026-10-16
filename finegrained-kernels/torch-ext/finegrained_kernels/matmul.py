@@ -22,7 +22,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
-from .compat import replay_benchmark, add_op_namespace_prefix, FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype
+from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors
 from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
@@ -294,7 +294,6 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space).
     ["N", "K", "m_bit_length", "GATE"],
     n_trials=100,
-    do_bench=replay_benchmark,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),
@@ -362,8 +361,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
 
     Computes ``C = A @ B.T`` with one activation scale per row and a weight scale constant
     along K — one for the full matrix, or one per output row — both folded after the loop.
-    Uses a 2D grid with swizzle for L2 cache locality on B tiles. Configuration
-    timing balances cache-hot replay and cache-cold execution on B200.
+    Uses a 2D grid with swizzle for L2 cache locality on B tiles.
 
     ``SWAP_AB`` (decode, BM=1): the weight's output rows fill the MMA M dim and the single token
     is padded to the N=16 atom; the accumulator collapses back to ``[1, (2|1)*BN]`` before the
@@ -1822,10 +1820,7 @@ def mx_weight_only_matmul_2d(
 # capture is fine (measured under do_bench_cudagraph).
 
 _SCALED_MM_MIN_M = int(os.environ.get("FINEGRAINED_SCALED_MM_MIN_M", "2"))
-# Row-wise FP8: at M <= 64 aten's RowWise call runs the GEMM swapped and copies the result back (an
-# extra DtoD launch), which leaves it no faster than the Triton kernel; past that cuBLAS wins up to
-# ~2k rows, and from 4096 rows the Triton kernel's host-TMA tiles win (B200, Llama 4 shapes
-# N=16384/K=5120 and N=5120/K=8192: 321 vs 340us and 172 vs 178us at M=4096, graph-timed).
+# Row-wise FP8 uses cuBLAS between the decode and large-prefill Triton paths.
 _SCALED_MM_ROWWISE_MIN_M = int(os.environ.get("FINEGRAINED_SCALED_MM_ROWWISE_MIN_M", "65"))
 _SCALED_MM_ROWWISE_MAX_M = int(os.environ.get("FINEGRAINED_SCALED_MM_ROWWISE_MAX_M", "4096"))
 
