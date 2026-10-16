@@ -761,10 +761,12 @@ class BayesianAutotuner(Autotuner):
             # and FINEGRAINED_AUTOTUNE_TRIALS is not in Triton's invalidating-env list —
             # without n_trials a 3-trial exploratory winner gets replayed at 100 trials.
             str(self.keys),
-            str([str(c) for c in self.seed_configs]),
             f"n_trials={self.n_trials},n_startup_trials={self.n_startup_trials},gamma={self.gamma}",
             str(tuning_key),
         ] + [str(c) for c in configs]  # str(Config) is pre_hook-free and process-stable
+        # Preserve existing cache keys for kernels that do not opt into seeded search.
+        if self.seed_configs:
+            cache_key.append(str([str(c) for c in self.seed_configs]))
         cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()
         cache = get_cache_manager(cache_key)
         file_name = f"{fn.__name__[:150]}.bayes_autotune.json"
