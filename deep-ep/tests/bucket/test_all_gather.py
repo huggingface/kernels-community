@@ -1,4 +1,4 @@
-import sys  # kernels-community
+import importlib
 import os
 
 # Must pop before PyTorch imports
@@ -7,13 +7,16 @@ os.environ.pop('NCCL_MAX_NCHANNELS', None)
 os.environ.pop('NCCL_NVLS_ENABLE', None)
 
 import argparse
+import kernels
 import torch
 import torch.distributed as dist
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # kernels-community
-from deep_ep_kernel import deep_ep  # noqa: E402  kernels-community: load through `kernels.get_kernel`
-from deep_ep.utils.envs import dist_print, init_dist
-from deep_ep.utils.testing import bench, bench_kineto, parse_num_bytes
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+dist_print, init_dist = deep_ep_envs.dist_print, deep_ep_envs.init_dist
+bench, bench_kineto = deep_ep_testing.bench, deep_ep_testing.bench_kineto
+parse_num_bytes = deep_ep_testing.parse_num_bytes
 
 
 @torch.inference_mode()

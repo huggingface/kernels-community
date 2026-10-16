@@ -1,23 +1,32 @@
-import sys  # kernels-community
+import importlib
 import argparse
 import os
+import kernels
 import torch
 import torch.distributed as dist
 from typing import Union, Tuple, Optional
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # kernels-community
-from deep_ep_kernel import deep_ep  # noqa: E402  kernels-community: load through `kernels.get_kernel`
-from deep_ep.utils.math import (
-    align, count_bytes, calc_diff,
-    per_token_cast_back, per_token_cast_to_fp8,
-    safe_div
-)
-from deep_ep.utils.gate import get_unbalanced_scores
-from deep_ep.utils.envs import init_dist, init_seed, dist_print
-from deep_ep.utils.refs import dispatch as ref_dispatch
-from deep_ep.utils.refs import combine as ref_combine
-from deep_ep.utils.refs import generate_pre_combine_data, ordered_accumulate
-from deep_ep.utils.testing import bench_kineto
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_math = importlib.import_module(f"{deep_ep.__name__}.utils.math")
+align = deep_ep_math.align
+count_bytes = deep_ep_math.count_bytes
+calc_diff = deep_ep_math.calc_diff
+per_token_cast_back = deep_ep_math.per_token_cast_back
+per_token_cast_to_fp8 = deep_ep_math.per_token_cast_to_fp8
+safe_div = deep_ep_math.safe_div
+deep_ep_gate = importlib.import_module(f"{deep_ep.__name__}.utils.gate")
+get_unbalanced_scores = deep_ep_gate.get_unbalanced_scores
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+init_dist = deep_ep_envs.init_dist
+init_seed = deep_ep_envs.init_seed
+dist_print = deep_ep_envs.dist_print
+deep_ep_refs = importlib.import_module(f"{deep_ep.__name__}.utils.refs")
+ref_dispatch = deep_ep_refs.dispatch
+ref_combine = deep_ep_refs.combine
+generate_pre_combine_data = deep_ep_refs.generate_pre_combine_data
+ordered_accumulate = deep_ep_refs.ordered_accumulate
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+bench_kineto = deep_ep_testing.bench_kineto
 
 
 # noinspection PyUnusedLocal,PyShadowingNames

@@ -1,4 +1,4 @@
-import sys  # kernels-community
+import importlib
 import os
 
 # Must pop before PyTorch imports
@@ -14,14 +14,18 @@ import random
 import weakref
 from typing import List, Tuple
 
+import kernels
 import torch
 import torch.distributed as dist
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # kernels-community
-from deep_ep_kernel import deep_ep  # noqa: E402  kernels-community: load through `kernels.get_kernel`
-from deep_ep.utils.envs import dist_print, init_dist
-from deep_ep.utils.math import align
-from deep_ep.utils.testing import parse_num_bytes
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_envs = importlib.import_module(f"{deep_ep.__name__}.utils.envs")
+dist_print = deep_ep_envs.dist_print
+init_dist = deep_ep_envs.init_dist
+deep_ep_math = importlib.import_module(f"{deep_ep.__name__}.utils.math")
+align = deep_ep_math.align
+deep_ep_testing = importlib.import_module(f"{deep_ep.__name__}.utils.testing")
+parse_num_bytes = deep_ep_testing.parse_num_bytes
 
 OPS = ('all_reduce', 'reduce_scatter', 'all_gather', 'rs_ag')
 

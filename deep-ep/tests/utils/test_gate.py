@@ -1,11 +1,12 @@
-import sys  # kernels-community
-import os  # kernels-community
+import importlib
+import kernels
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # kernels-community
-from deep_ep_kernel import deep_ep  # noqa: E402  kernels-community: load through `kernels.get_kernel`
-from deep_ep.utils.math import ceil_div
-from deep_ep.utils.gate import get_unbalanced_scores
+deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)
+deep_ep_math = importlib.import_module(f"{deep_ep.__name__}.utils.math")
+ceil_div = deep_ep_math.ceil_div
+deep_ep_gate = importlib.import_module(f"{deep_ep.__name__}.utils.gate")
+get_unbalanced_scores = deep_ep_gate.get_unbalanced_scores
 
 
 def test_unbalanced_scores():

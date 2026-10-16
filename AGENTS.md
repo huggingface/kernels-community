@@ -705,8 +705,11 @@ to sync a DeepEP release, carry out the following steps:
   `_runtime.py` (requirement checks and JIT initialization on first buffer
   creation) and `_nccl_symbols.py` are local files with no upstream
   counterpart; update `_C.py` when the pybind11 API changes.
-- In the upstream tests, keep the two-line `deep_ep_kernel` loader in place of
-  `import deep_ep` (it loads the kernel with `kernels.get_kernel`).
+- In every upstream test, replace `import deep_ep` with
+  `deep_ep = kernels.get_kernel("kernels-community/deep-ep", version=1)`.
+  Load utility submodules with `importlib.import_module` using
+  `deep_ep.__name__` as the package prefix; do not insert test paths into
+  `sys.path` or alias the kernel to `deep_ep` in `sys.modules`.
 - Update the DeepEP/DeepJIT commits in `build.toml`, `CARD.md` and
   `__version__`, and the NCCL/CUDA minimums in `_runtime.py` and `CARD.md` if
   upstream's README changed them.
