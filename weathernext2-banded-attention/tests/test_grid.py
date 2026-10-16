@@ -98,14 +98,14 @@ class _Head(nn.Module):
     def __init__(self):
         super().__init__()
         self.config = SimpleNamespace(chunk_size=7, grid_latitudes=1, grid_longitudes=19)
-        self.decoder_proj = nn.Linear(16, 16)
-        self.output_proj = nn.Linear(16, 5)
-        self.act_fn = torch.nn.functional.gelu
+        self.fc1 = nn.Linear(16, 16)
+        self.fc2 = nn.Linear(16, 5)
+        self.activation_fn = torch.nn.functional.gelu
         self.register_buffer("sigmoid_gate", torch.tensor([False, True, False, True, False]))
         self.register_buffer("sigmoid_shift", torch.tensor([0.0, 2.0, 0.0, 3.0, 0.0]))
 
     def forward(self, states):
-        values = self.output_proj(self.act_fn(self.decoder_proj(states)))
+        values = self.fc2(self.activation_fn(self.fc1(states)))
         values = torch.where(self.sigmoid_gate, torch.sigmoid(values - self.sigmoid_shift), values)
         return values.transpose(1, 2).reshape(states.shape[0], 5, 1, 19)
 

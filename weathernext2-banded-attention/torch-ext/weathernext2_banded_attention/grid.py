@@ -179,12 +179,12 @@ class WeatherNext2ForecastHead(nn.Module):
         if not _can_tile(self, grid_states) or self.config.chunk_size is None:
             return type(self).forward(self, grid_states)
         batch, points, _ = grid_states.shape
-        channels = self.output_proj.out_features
+        channels = self.fc2.out_features
         output = grid_states.new_empty((batch, points, channels))
         fused = not output.is_cpu and output.dtype == torch.float32
         for start in range(0, points, self.config.chunk_size):
             end = min(start + self.config.chunk_size, points)
-            values = self.output_proj(self.act_fn(self.decoder_proj(grid_states[:, start:end])))
+            values = self.fc2(self.activation_fn(self.fc1(grid_states[:, start:end])))
             target = output[:, start:end]
             if not fused:
                 target.copy_(torch.where(self.sigmoid_gate, torch.sigmoid(values - self.sigmoid_shift), values))
