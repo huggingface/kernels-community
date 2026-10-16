@@ -93,6 +93,9 @@ class MoEProblem:
 
 
 MOE_PROBLEMS = [
+    MoEProblem(weights="fp8_128x128", activation_format="bf16", num_tokens=1, bias=True),
+    MoEProblem(weights="fp8_tensor", activation_format="bf16", num_tokens=5, num_top_k=2),
+
     # ── one decode-size + one small-batch shape per weight family ──
     MoEProblem(weights="mxfp4", num_tokens=1),
     MoEProblem(weights="mxfp4"),
