@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
+
+import torch
 import triton
 import triton.language as tl
 
+from ..compat import (
+    add_op_namespace_prefix, compile_time_only_triton_op, compile_time_only_triton_wrap,
+    device_context, sm_count,
+)
 from ..quant import fp8_act_quant_inline, mx_act_quant_inline
 
 
@@ -323,3 +330,225 @@ def mx_2d_scale_ptrs(
         as_mask = offs_am_lin < M
         bs_mask = offs_bn_lin < (2 * N if GATE else N)
     return as_ptrs, bs_ptrs, as_mask, bs_mask
+
+
+# CSF byte-window scales: CPU preparation and staged decoding before ordinary GEMMs.
+
+
+def prepare_nvfp4_csf_scales(
+    fixed: torch.Tensor, exceptions: torch.Tensor | Sequence[torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare one matrix or an expert stack on CPU, without expanding its scales.
+
+    `fixed` is uint8 `[rows/16, 16*(1+cols/2)]`, or the same shape with an
+    expert dimension. Exceptions are uint32 `[count]` for one matrix, or one
+    tensor per expert; low 24 bits locate a scale and high 8 bits replace it.
+    Returns (fixed, concatenated exceptions, expert offsets), all CPU tensors.
+    Decode once at load time for dense residency, or move the streams to the
+    accelerator and decode into shared scratch immediately before GEMM.
+    """
+    if fixed.dtype != torch.uint8 or fixed.ndim not in (2, 3):
+        raise ValueError("CSF fixed stream must be a 2D or 3D uint8 tensor")
+    if fixed.device.type != "cpu":
+        raise ValueError("Prepare CSF scales on CPU before moving them to the device")
+    fixed = fixed.unsqueeze(0) if fixed.ndim == 2 else fixed
+    experts, slabs, slab_bytes = fixed.shape
+    if experts == 0 or slabs == 0 or slab_bytes <= 16 or slab_bytes % 16:
+        raise ValueError("Invalid CSF slab shape")
+    rows, cols = slabs * 16, (slab_bytes // 16 - 1) * 2
+    if rows * cols > 1 << 24:
+        raise ValueError(
+            "CSF exception positions support at most 2**24 scales per matrix"
+        )
+    if bool((fixed[:, :, :16] > 240).any()):
+        raise ValueError("CSF row bases must be in 0..240")
+    streams = [exceptions] if isinstance(exceptions, torch.Tensor) else list(exceptions)
+    if len(streams) != experts:
+        raise ValueError("CSF needs one exception stream per expert")
+    offsets, words = [0], []
+    for stream in streams:
+        if (
+            stream.dtype != torch.uint32
+            or stream.ndim != 1
+            or stream.device.type != "cpu"
+        ):
+            raise ValueError("CSF exception streams must be 1D CPU uint32 tensors")
+        values = stream.to(torch.int64)
+        positions = values & 0xFFFFFF
+        if positions.numel() and (
+            int(positions[-1]) >= rows * cols
+            or bool((positions[1:] <= positions[:-1]).any())
+        ):
+            raise ValueError(
+                "CSF exception positions must be sorted, unique and in range"
+            )
+        offsets.append(offsets[-1] + stream.numel())
+        words.append(stream)
+    if offsets[-1] >= 1 << 32:
+        raise ValueError("CSF exception directory exceeds uint32 offsets")
+    return (
+        fixed.contiguous(),
+        torch.cat(words),
+        torch.tensor(offsets, dtype=torch.uint32),
+    )
+
+
+@triton.jit
+def _decode_fixed_kernel(
+    Fixed,
+    Out,
+    E: tl.constexpr,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    PAIRS: tl.constexpr,
+):
+    col_tiles: tl.constexpr = tl.cdiv(COLS // 2, PAIRS)
+    tiles: tl.constexpr = tl.cdiv(ROWS, BLOCK_ROWS) * col_tiles
+    rows = tl.arange(0, BLOCK_ROWS)
+    cols = tl.arange(0, PAIRS)
+    # Decode pairs together: load each row base once and store adjacent output
+    # bytes as uint16. The format always has an even column count.
+    output = Out.to(tl.pointer_type(tl.uint16))
+    for tile in range(tl.program_id(0), E * tiles, tl.num_programs(0)):
+        expert = tile // tiles
+        row = ((tile % tiles) // col_tiles) * BLOCK_ROWS + rows
+        col = ((tile % tiles) % col_tiles) * PAIRS + cols
+        slab = expert.to(tl.int64) * (ROWS // 16) + row // 16
+        slab_bytes: tl.constexpr = 16 * (1 + COLS // 2)
+        base = tl.load(Fixed + slab * slab_bytes + row % 16, row < ROWS, other=0).to(
+            tl.uint16
+        )
+        mask = (row[:, None] < ROWS) & (col[None, :] < COLS // 2)
+        packed = tl.load(
+            Fixed
+            + slab[:, None] * slab_bytes
+            + 16
+            + (row[:, None] % 16) * (COLS // 2)
+            + col[None, :],
+            mask,
+            other=0,
+        ).to(tl.uint16)
+        bits = (base[:, None] + (packed & 15)) | ((base[:, None] + (packed >> 4)) << 8)
+        tl.store(
+            output
+            + expert.to(tl.int64) * ROWS * (COLS // 2)
+            + row[:, None] * (COLS // 2)
+            + col[None, :],
+            bits,
+            mask,
+        )
+
+
+@triton.jit
+def _apply_exceptions_kernel(
+    Exceptions,
+    ExpertOffsets,
+    Out,
+    E: tl.constexpr,
+    PLANE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    expert = tl.program_id(0)
+    start = tl.load(ExpertOffsets + expert).to(tl.int64)
+    end = tl.load(ExpertOffsets + expert + 1).to(tl.int64)
+    for base in range(start, end, BLOCK):
+        index = base + tl.arange(0, BLOCK)
+        word = tl.load(Exceptions + index, index < end, other=0)
+        position = word & 0xFFFFFF
+        value = (word >> 24).to(tl.uint8).to(tl.float8e4nv, bitcast=True)
+        tl.store(Out + expert.to(tl.int64) * PLANE + position, value, index < end)
+
+
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("decompress_nvfp4_csf_scales_into"),
+    mutates_args={"out"},
+    opaque=True,
+)
+def _decompress_into(
+    fixed: torch.Tensor,
+    exceptions: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    experts, rows, cols = out.shape
+    with device_context(fixed.device):
+        programs = min(
+            experts * triton.cdiv(rows, 64) * triton.cdiv(cols // 2, 128),
+            16 * sm_count(fixed.device.index),
+        )
+        compile_time_only_triton_wrap(_decode_fixed_kernel)[(programs,)](
+            fixed,
+            out,
+            experts,
+            rows,
+            cols,
+            64,
+            min(128, triton.next_power_of_2(cols // 2)),
+        )
+        if exceptions.numel():
+            compile_time_only_triton_wrap(_apply_exceptions_kernel)[(experts,)](
+                exceptions, expert_offsets, out, experts, rows * cols, 256
+            )
+
+
+def decompress_nvfp4_csf_scales(
+    fixed: torch.Tensor,
+    exceptions: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode prepared CSF streams to dense E4M3 scales for an ordinary NVFP4 GEMM.
+
+    With no `out`, allocate dense scales, e.g. once on CPU at checkpoint loading.
+    Pass reusable contiguous [experts, rows, cols] workspace to keep the streams
+    compressed between layers. Consume the workspace before overwriting it; it
+    must not be retained for backward or shared by concurrent consumers.
+    A shared dense workspace saves memory across layers, not within one layer.
+    """
+    if fixed.dtype != torch.uint8 or fixed.ndim != 3 or not fixed.is_contiguous():
+        raise ValueError("CSF fixed stream must be contiguous 3D uint8 prepared on CPU")
+    experts, slabs, slab_bytes = fixed.shape
+    if experts == 0 or slabs == 0 or slab_bytes <= 16 or slab_bytes % 16:
+        raise ValueError("Invalid CSF slab shape")
+    if (
+        exceptions.dtype != torch.uint32
+        or exceptions.ndim != 1
+        or not exceptions.is_contiguous()
+        or expert_offsets.dtype != torch.uint32
+        or expert_offsets.shape != (experts + 1,)
+        or not expert_offsets.is_contiguous()
+    ):
+        raise ValueError(
+            "CSF exceptions and expert offsets must be contiguous uint32 vectors of prepared shape"
+        )
+    rows, cols = slabs * 16, (slab_bytes // 16 - 1) * 2
+    if rows * cols > 1 << 24:
+        raise ValueError(
+            "CSF exception positions support at most 2**24 scales per matrix"
+        )
+    shape = (experts, rows, cols)
+    if out is None:
+        out = torch.empty(shape, dtype=torch.float8_e4m3fn, device=fixed.device)
+    if (
+        out.shape != shape
+        or out.dtype != torch.float8_e4m3fn
+        or not out.is_contiguous()
+    ):
+        raise ValueError(f"CSF workspace must be contiguous E4M3 with shape {shape}")
+    if any(t.device != out.device for t in (fixed, exceptions, expert_offsets)):
+        raise ValueError("CSF buffers and workspace must share a device")
+    if out.device.type == "cpu":
+        bases = fixed[:, :, :16].reshape(experts, rows, 1).to(torch.int16)
+        packed = fixed[:, :, 16:].reshape(experts, rows, cols // 2)
+        codes = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(shape)
+        dense = (bases + codes).to(torch.uint8)
+        for expert in range(experts):
+            start, end = int(expert_offsets[expert]), int(expert_offsets[expert + 1])
+            words = exceptions[start:end].to(torch.int64)
+            dense[expert].view(-1)[words & 0xFFFFFF] = (words >> 24).to(torch.uint8)
+        out.copy_(dense.view(torch.float8_e4m3fn))
+    else:
+        _decompress_into(fixed, exceptions, expert_offsets, out)
+    return out

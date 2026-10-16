@@ -476,3 +476,52 @@ def dequantize_weight(
     return out
 
 
+def encode_csf_scales(scales):
+    """Independent CSF fixture encoder; the original dense bytes remain the oracle."""
+    shape = scales.shape
+    values = scales.cpu().contiguous().view(torch.uint8)
+    values = values.reshape(-1, shape[-2], shape[-1])
+    experts, rows, cols = values.shape
+    bases = values.amin(dim=-1, keepdim=True).clamp_max(240)
+    delta = values.to(torch.int16) - bases.to(torch.int16)
+    nibbles = delta.clamp(0, 15).to(torch.uint8)
+    packed = nibbles[:, :, ::2] | (nibbles[:, :, 1::2] << 4)
+    fixed = torch.cat(
+        (
+            bases.reshape(experts, rows // 16, 16),
+            packed.reshape(experts, rows // 16, 16 * cols // 2),
+        ),
+        dim=-1,
+    )
+    streams = []
+    for expert in range(experts):
+        positions = (
+            ((delta[expert] < 0) | (delta[expert] > 15)).flatten().nonzero().flatten()
+        )
+        streams.append(
+            (positions | (values[expert].flatten()[positions].long() << 24)).to(
+                torch.uint32
+            )
+        )
+    return fixed, streams
+
+
+def prepare_weight_scales(scales, encoding, fn, compiled=False):
+    """Wrap a matrix Problem's existing op; compiled cases capture decode + GEMM together."""
+    if encoding is None:
+        return maybe_compile(fn, compiled)
+    from kernels import get_kernel
+
+    assert encoding == "csf"
+    kernel = get_kernel("kernels-community/finegrained-kernels", version=0)
+    fixed, exceptions = encode_csf_scales(scales)
+    buffers = tuple(
+        t.to(scales.device) for t in kernel.prepare_nvfp4_csf_scales(fixed, exceptions)
+    )
+    op = getattr(kernel, fn.__name__)
+
+    def run(A, B, As, Bs, **kwargs):
+        decoded = kernel.decompress_nvfp4_csf_scales(*buffers)
+        return op(A, B, As, decoded.reshape(Bs.shape), **kwargs)
+
+    return maybe_compile(run, compiled)

@@ -15,7 +15,6 @@
 import triton
 import triton.language as tl
 
-from .csf import load_nvfp4_csf_scale
 from .scales import load_block_fp8_act_tile, load_mx_act_tile, load_swizzled_scale, load_swizzled_scale_tile, load_weight_scale_tile
 
 # A-sub-tile byte budget for the 1-byte-activation grouped-swizzle depth cap (see
@@ -448,28 +447,17 @@ def load_weight_mx(
     BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
     WEIGHT_VALUES_PER_BYTE: tl.constexpr,
     k_col_off=0,
-    CsfFixed=None, CsfExceptions=None, CsfRowOffsets=None, CSF_STEPS: tl.constexpr = 0,
 ):
     """The MX weight path: value tile + pre-swizzled/affine group scale. ``k_col_off`` shifts the
     affine scale read for a K-tile the caller clamped back in bounds (0 for aligned callers)."""
     KB: tl.constexpr = BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE
     SCALE_COLS: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
     w = _weight_value(b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB)
-    if CsfFixed is not None:
-        NW: tl.constexpr = (2 if GATE else 1) * BLOCK_SIZE_N
-        full_rows = (2 if GATE else 1) * N
-        rows = tl.minimum(pid_n * NW + tl.arange(0, NW), full_rows - 1)
-        cols = k * SCALE_COLS + k_col_off + tl.arange(0, SCALE_COLS)
-        w_s = load_nvfp4_csf_scale(
-            CsfFixed, CsfExceptions, CsfRowOffsets, expert_id,
-            rows[:, None], cols[None, :], full_rows, K // 16, CSF_STEPS,
-        )
-    else:
-        w_s = _weight_scale_mx(
-            bs_ptrs, bs_mask, bs_descriptor, bs_ptr, blk_idx, expert_id, pid_n, k, N, K,
-            stride_bs_e, stride_bs_n, stride_bs_k,
-            GROUPED, GATE, PER_EXPERT, SWIZZLED_SCALES, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K, k_col_off=k_col_off,
-        )
+    w_s = _weight_scale_mx(
+        bs_ptrs, bs_mask, bs_descriptor, bs_ptr, blk_idx, expert_id, pid_n, k, N, K,
+        stride_bs_e, stride_bs_n, stride_bs_k,
+        GROUPED, GATE, PER_EXPERT, SWIZZLED_SCALES, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K, k_col_off=k_col_off,
+    )
     return w, w_s
 
 

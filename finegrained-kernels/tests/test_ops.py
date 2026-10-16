@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from kernels import get_kernel
 
 from utils import (  # type: ignore
     DTYPE_TO_TOL,
@@ -45,8 +46,9 @@ from utils import (  # type: ignore
     dq_grouped,
     dq_scale,
     make_static_activation_scale,
-    maybe_compile,
     quant_dequant_a,
+    encode_csf_scales,
+    prepare_weight_scales,
 )
 
 import finegrained_kernels  # type: ignore
@@ -79,6 +81,7 @@ class Problem:
     per_expert_globals: bool = False  # activation (and requant output) globals calibrated per expert
     prequant: bool = False  # pass As explicitly (must be bit-identical to raw A)
     static: bool = False  # calibrated (static) activation scale instead of a runtime one
+    scale_encoding: str | None = None
     swizzled: bool = False  # pass MX weight scales pre-swizzled (5D SWIZZLE_32_4_4 fast path)
     sentinel_fraction: float = 0.0
     noncontiguous: bool = False
@@ -106,6 +109,8 @@ class Problem:
             tag += "_prequant"
         if self.static:
             tag += "_static"
+        if self.scale_encoding:
+            tag += f"_{self.scale_encoding}"
         if self.swizzled:
             tag += "_swizzled"
         if self.sentinel_fraction:
@@ -153,6 +158,10 @@ def scenarios() -> list[Problem]:
             if fmt != default_in:
                 out.append(Problem(weights=w, activation_format=fmt))
     out += [
+        Problem(weights="nvfp4", scale_encoding="csf", S=8),
+        Problem(weights="nvfp4", scale_encoding="csf", empty_expert=True, sentinel_fraction=0.25),
+        Problem(weights="nvfp4", scale_encoding="csf", activation_format="bf16"),
+        Problem(weights="nvfp4", scale_encoding="csf", gate=True, activation_format="nvfp4", quantize_output=True, compile=True),
         Problem(weights="fp16", dtype=torch.float16),
         # gate WITHOUT requant (raw GLU intermediate) — one quantized + one full format
         Problem(weights="mxfp8", gate=True),
@@ -523,15 +532,15 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
     bs = swizzle_mx_scales(Bs) if problem.swizzled and Bs is not None else Bs
     globals_kw = dict(a_global_scale=As_global, b_global_scale=Bs_global)
     if op == "matmul":
-        fn = maybe_compile(finegrained_kernels.matmul_2d, problem.compile)
+        fn = prepare_weight_scales(bs, problem.scale_encoding, finegrained_kernels.matmul_2d, problem.compile)
         return fn(A, B, As, bs, **globals_kw, **kw)
     if op == "batched":
-        fn = maybe_compile(finegrained_kernels.matmul_batched, problem.compile)
+        fn = prepare_weight_scales(bs, problem.scale_encoding, finegrained_kernels.matmul_batched, problem.compile)
         return fn(A, B, As, bs, expert_ids=expert_ids, **globals_kw, **kw)
     expert_start, gather_idx, scatter_idx = finegrained_kernels.scheduling.compute_grouped_scheduling(
         expert_ids, problem.E, 1
     )
-    fn = maybe_compile(finegrained_kernels.matmul_grouped, problem.compile)
+    fn = prepare_weight_scales(bs, problem.scale_encoding, finegrained_kernels.matmul_grouped, problem.compile)
     raw = fn(
         A,
         B,
@@ -796,3 +805,110 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
         print(f"\n[sweep] {len(forgiven)} admitted config(s) failed to compile/run (forgiven):")
         for cfg, err in forgiven:
             print(f"  {cfg}: {err}")
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("device", ["cpu", TEST_DEVICE])
+def test_csf_scale_bytes_and_workspace(device):
+    kernel = get_kernel(
+        "kernels-community/finegrained-kernels", version=0, check_arch=False
+    )
+    expected = (
+        torch.arange(3 * 32 * 18).remainder(256).to(torch.uint8).reshape(3, 32, 18)
+    )
+    fixed, exceptions = encode_csf_scales(expected.view(torch.float8_e4m3fn))
+    buffers = tuple(
+        t.to(device) for t in kernel.prepare_nvfp4_csf_scales(fixed, exceptions)
+    )
+    workspace = torch.empty(expected.shape, dtype=torch.float8_e4m3fn, device=device)
+    actual = kernel.decompress_nvfp4_csf_scales(*buffers, out=workspace)
+    assert actual is workspace
+    torch.testing.assert_close(actual.cpu().view(torch.uint8), expected, rtol=0, atol=0)
+    fixed.zero_()
+    buffers = tuple(
+        t.to(device)
+        for t in kernel.prepare_nvfp4_csf_scales(
+            fixed, [torch.empty(0, dtype=torch.uint32)] * 3
+        )
+    )
+    kernel.decompress_nvfp4_csf_scales(*buffers, out=workspace)
+    assert not workspace.view(torch.uint8).any()
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("positions", [[1, 1], [3, 1], [32 * 6]])
+def test_csf_invalid_positions(positions):
+    kernel = get_kernel(
+        "kernels-community/finegrained-kernels", version=0, check_arch=False
+    )
+    fixed = torch.zeros((2, 64), dtype=torch.uint8)
+    with pytest.raises(ValueError, match="sorted, unique and in range"):
+        kernel.prepare_nvfp4_csf_scales(
+            fixed, torch.tensor(positions, dtype=torch.uint32)
+        )
+
+
+def test_csf_scale_boundaries():
+    kernel = get_kernel(
+        "kernels-community/finegrained-kernels", version=0, check_arch=False
+    )
+    cols = (1 << 24) // 16
+    fixed = torch.zeros((1, 16 * (1 + cols // 2)), dtype=torch.uint8)
+    prepared = kernel.prepare_nvfp4_csf_scales(
+        fixed, torch.tensor([0xFFFFFFFF], dtype=torch.uint32)
+    )
+    actual = kernel.decompress_nvfp4_csf_scales(
+        *(t.to(TEST_DEVICE) for t in prepared)
+    ).view(torch.uint8)
+    assert actual.flatten()[-1].item() == 255
+    assert torch.count_nonzero(actual).item() == 1
+    with pytest.raises(ValueError, match=r"2\*\*24"):
+        kernel.prepare_nvfp4_csf_scales(
+            torch.zeros((1, fixed.shape[1] + 16), dtype=torch.uint8),
+            torch.empty(0, dtype=torch.uint32),
+        )
+    fixed[0, 0] = 241
+    with pytest.raises(ValueError, match="bases"):
+        kernel.prepare_nvfp4_csf_scales(fixed, torch.empty(0, dtype=torch.uint32))
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "fixed_dtype",
+        "fixed_rank",
+        "fixed_stride",
+        "exceptions_dtype",
+        "offsets_dtype",
+        "offsets_length",
+        "offsets_stride",
+        "workspace",
+    ],
+)
+def test_csf_tensor_metadata(malformed):
+    kernel = get_kernel(
+        "kernels-community/finegrained-kernels", version=0, check_arch=False
+    )
+    fixed, exceptions, offsets = kernel.prepare_nvfp4_csf_scales(
+        torch.zeros((2, 64), dtype=torch.uint8), torch.empty(0, dtype=torch.uint32)
+    )
+    out = None
+    if malformed == "fixed_dtype":
+        fixed = fixed.float()
+    elif malformed == "fixed_rank":
+        fixed = fixed[0]
+    elif malformed == "fixed_stride":
+        fixed = fixed[:, :, ::2]
+    elif malformed == "exceptions_dtype":
+        exceptions = exceptions.long()
+    elif malformed == "offsets_dtype":
+        offsets = offsets.long()
+    elif malformed == "offsets_length":
+        offsets = offsets[:-1]
+    elif malformed == "offsets_stride":
+        offsets = torch.empty(4, dtype=torch.uint32)[::2]
+    else:
+        out = torch.empty((1, 32, 6), dtype=torch.float32)
+    with pytest.raises(ValueError):
+        kernel.decompress_nvfp4_csf_scales(fixed, exceptions, offsets, out=out)

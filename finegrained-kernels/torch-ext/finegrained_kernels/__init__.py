@@ -21,22 +21,12 @@ from . import backward
 from .formats import get_supported_act_fns
 from .norm import get_supported_norms, rms_norm_rows
 from .swizzle import swizzle_mx_scales, unswizzle_mx_scales
-from .csf import (
-    NVFP4CSFScales,
-    prepare_nvfp4_csf_scales,
-    decompress_nvfp4_csf_scales,
-    matmul_csf_batched,
-    matmul_csf_grouped,
-)
+from .loading.scales import prepare_nvfp4_csf_scales, decompress_nvfp4_csf_scales
 from .quant import mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant
 
 __all__ = [
-    # Experimental compressed-scale expert kernels and load-time codec helpers.
-    "NVFP4CSFScales",
     "prepare_nvfp4_csf_scales",
     "decompress_nvfp4_csf_scales",
-    "matmul_csf_batched",
-    "matmul_csf_grouped",
     # the three GEMM dispatchers (the weight format is read off the tensors; `activation_format`
     # names the activations', the gate|up fusion rides as kwargs)
     "matmul_2d",
