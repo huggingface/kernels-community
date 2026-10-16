@@ -157,11 +157,12 @@ the offline activation quants the ops use internally, exposed for pre-quantized 
 Every kernel is tuned by a Tree-structured Parzen Estimator (TPE, the Bayesian search Optuna
 uses) autotuner with per-shape disk caching, config pruners
 that fence compiler bugs and can't-win regions per (arch, format), and failed-compile memoization.
-`FINEGRAINED_AUTOTUNE_TRIALS` overrides the trial budget. Set it to `1` for correctness tests:
-the tuner stops after one successful measurement, retrying failed candidates, and skips the
-additional basin probes, coordinate refinement, and winner remeasurement. Larger budgets retain
-those performance search steps. `FINEGRAINED_AUTOTUNE_LOG=<path>` appends per-config timings as
-JSONL to `<path>`.
+`FINEGRAINED_AUTOTUNE_TRIALS` overrides the trial budget. Basin probes, coordinate refinement,
+and winner remeasurement are independently controlled by `FINEGRAINED_AUTOTUNE_BASIN_PROBES`,
+`FINEGRAINED_AUTOTUNE_REFINE`, and `FINEGRAINED_AUTOTUNE_RUNOFF` (`0` or `1`, all enabled by default).
+For correctness tests, set the trial budget to `1` and all three controls to `0`: only one
+successful configuration is measured, retrying failed candidates. `FINEGRAINED_AUTOTUNE_LOG=<path>`
+appends per-config timings as JSONL to `<path>`.
 
 ## Tests
 

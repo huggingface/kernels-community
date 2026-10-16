@@ -347,8 +347,11 @@ def test_compile_failures_are_memoized_across_keys(caplog):
 
 
 @pytest.mark.kernels_ci
-def test_single_trial_measures_one_config(monkeypatch):
+@pytest.mark.parametrize("search_phases", [False, True])
+def test_autotune_search_controls(monkeypatch, search_phases):
     monkeypatch.setenv("FINEGRAINED_AUTOTUNE_TRIALS", "1")
+    for phase in ("BASIN_PROBES", "REFINE", "RUNOFF"):
+        monkeypatch.setenv(f"FINEGRAINED_AUTOTUNE_{phase}", str(int(search_phases)))
     configs = [
         triton.Config({"MODE": mode, "BLOCK_SIZE_N": tile})
         for mode in ("plain", "swap") for tile in (16, 32, 64)
@@ -362,5 +365,5 @@ def test_single_trial_measures_one_config(monkeypatch):
     measure = Mock(return_value=1.0)
     monkeypatch.setattr(kernel, "_bench", measure)
     winner = kernel._bayesian_search(configs, (), {}, ())
-    measure.assert_called_once()
-    assert winner is measure.call_args.kwargs["config"]
+    assert (measure.call_count > 1) == search_phases
+    assert winner in [call.kwargs["config"] for call in measure.call_args_list]
