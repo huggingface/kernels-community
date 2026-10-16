@@ -397,7 +397,8 @@ def moe_fused_grouped(
     static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
     # a per-token (tensor-wide / row-wise) intermediate scale spans the whole row, which the
     # gate_up epilogue's tiles never see: the down quantizes the bf16 intermediate instead
-    per_token = per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
+    per_token = (per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
+                 or per_token_activations(down_proj, down_proj_scale_inv))
     gate_up_in, gate_up_in_scale = _gate_up_activations(
         hidden_states, fmt, gate_up_proj_scale_inv, gate_up_proj_input_global_scale,
         gate_up_proj_activation_scale, scatter_idx, expert_start,
@@ -518,7 +519,8 @@ def moe_fused_batched(
     static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
     # see the grouped sibling: the down quantizes the bf16 intermediate per token — measured faster
     # here than the unstacked gate + one-kernel GLU requant (37.0 vs 45.3us, Llama 4 E=16, T=1)
-    per_token = per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
+    per_token = (per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
+                 or per_token_activations(down_proj, down_proj_scale_inv))
     gate_up_out = matmul_batched(
         hidden_states,
         gate_up_proj,
