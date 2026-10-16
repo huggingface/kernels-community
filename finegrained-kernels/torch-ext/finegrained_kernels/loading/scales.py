@@ -445,7 +445,6 @@ def _apply_exceptions_kernel(
     Exceptions,
     ExpertOffsets,
     Out,
-    E: tl.constexpr,
     PLANE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -488,7 +487,7 @@ def _decompress_into(
         )
         if exceptions.numel():
             compile_time_only_triton_wrap(_apply_exceptions_kernel)[(experts,)](
-                exceptions, expert_offsets, out, experts, rows * cols, 256
+                exceptions, expert_offsets, out, rows * cols, 256
             )
 
 
