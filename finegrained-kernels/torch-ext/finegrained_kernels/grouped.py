@@ -30,6 +30,8 @@ from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_group
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
+from . import compat
+from .weight_only import decode_matmul
 from .loading.scales import dequant_block_fp8_weight_tile
 from .loading.tiles import (
     load_act_block_dynamic,
@@ -2066,6 +2068,30 @@ def _raw_activation_matmul_grouped(
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
 
     output_dtype = resolve_output_dtype(output_dtype, A, None)
+    # Scalar split-K avoids padding each sparse expert to a tensor-core M tile.
+    # Keep large routed batches on the tensor-core path and materialize no BF16 experts.
+    if Bs is not None and compat.is_sm10x() and S <= min(16, 2 * num_experts):
+        return [
+            decode_matmul(
+                A,
+                B,
+                Bs,
+                scale_block_n,
+                scale_block_k,
+                output_dtype,
+                gate=gate,
+                gate_scales=gate and Bs.shape[1] > 1,
+                bias=bias,
+                act_fn=act_fn,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_limit=swiglu_limit,
+                simulate_unfused=simulate_unfused,
+                expert_start=expert_start,
+                gather_idx=gather_idx,
+                scatter_idx=scatter_idx,
+                num_rows=S,
+            )
+        ]
     C = A.new_empty(S, N, dtype=output_dtype)
     num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(

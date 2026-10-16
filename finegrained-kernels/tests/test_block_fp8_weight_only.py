@@ -191,22 +191,25 @@ def test_routed_block_fp8_weight_only(kernel, op, per_tensor):
 
 
 @pytest.mark.parametrize("op", ["batched", "grouped"])
-def test_weight_only_fp8_moe(kernel, op):
+@pytest.mark.parametrize("tokens", [1, 5])
+def test_weight_only_fp8_moe(kernel, op, tokens):
     torch.manual_seed(21)
     e, h, i = 4, 256, 128
-    hidden = torch.randn(5, h, device=TEST_DEVICE, dtype=torch.bfloat16) * 0.05
+    hidden = torch.randn(tokens, h, device=TEST_DEVICE, dtype=torch.bfloat16) * 0.05
     gate_up = (torch.randn(e, 2 * i, h, device=TEST_DEVICE) * 0.1).to(
         torch.float8_e4m3fn
     )
     down = (torch.randn(e, h, i, device=TEST_DEVICE) * 0.1).to(torch.float8_e4m3fn)
     gate_scales = torch.pow(2.0, torch.randint(-2, 1, (e, 2, 2), device=TEST_DEVICE))
     down_scales = torch.pow(2.0, torch.randint(-2, 1, (e, 2, 1), device=TEST_DEVICE))
-    ids = torch.tensor([[0, 2], [2, 4], [0, 2], [4, 4], [0, 0]], device=TEST_DEVICE)
-    routing = torch.full((5, 2), 0.5, device=TEST_DEVICE)
+    ids = torch.tensor(
+        [[0, 4], [2, 4], [0, 2], [4, 4], [0, 0]][:tokens], device=TEST_DEVICE
+    )
+    routing = torch.full((tokens, 2), 0.5, device=TEST_DEVICE)
     gate_weight = _weight_reference(gate_up, gate_scales, 128, 128, True)
     down_weight = _weight_reference(down, down_scales, 128, 128)
     reference = torch.zeros_like(hidden, dtype=torch.float32)
-    for token in range(5):
+    for token in range(tokens):
         for slot in range(2):
             expert = int(ids[token, slot])
             if expert >= e:
@@ -560,3 +563,109 @@ def test_weight_only_decode_compiles_fullgraph(kernel, monkeypatch, gate):
     compiled = torch.compile(run, fullgraph=True, dynamic=False, mode="reduce-overhead")
     torch.testing.assert_close(compiled(a), run(a), rtol=0, atol=0)
     torch.testing.assert_close(compiled(a + 1), run(a + 1), rtol=0, atol=0)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("op", ["batched", "grouped"])
+@pytest.mark.parametrize("gate", [False, True])
+@pytest.mark.parametrize("per_tensor", [False, True])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_sparse_decode_routing_split_k(
+    kernel, monkeypatch, op, gate, per_tensor, compiled
+):
+    """Sparse decode retains top-k gathers, scatter, empty experts, bias and off-rank masks."""
+    import importlib
+
+    import triton
+
+    if TEST_DEVICE != "cuda" or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("B200 decode specialization")
+    module = importlib.import_module(kernel.__name__ + ".weight_only")
+    tuner = module._decode_partial
+    monkeypatch.setattr(
+        tuner,
+        "configs",
+        [
+            triton.Config(
+                {"BLOCK_N": 32, "BLOCK_K": 128, "SPLIT_K": 4}, num_warps=4, num_stages=2
+            )
+        ],
+    )
+    tuner.cache.clear()
+    torch.manual_seed(135)
+    e, n, k = 4, 192, 384
+    a = torch.randn(2, k, device=TEST_DEVICE, dtype=torch.bfloat16)
+    rows = n * (2 if gate else 1)
+    b = (torch.randn(e, rows, k, device=TEST_DEVICE) * 0.1).to(torch.float8_e4m3fn)
+    if per_tensor:
+        scales = torch.rand(e, 1, 1, device=TEST_DEVICE) * 0.3 + 0.1
+        bn, bk = rows, k
+    else:
+        scale_rows = 4 if gate else 2
+        scales = (
+            torch.randint(-3, 1, (e, scale_rows, 3), device=TEST_DEVICE) + 127
+        ).to(torch.uint8)
+        bn, bk = 128, 128
+    weights = _weight_reference(b, scales, bn, bk, gate)
+    bias = torch.randn(e, rows, device=TEST_DEVICE) * 0.01
+    expert_list = [3, 0, 3, 1, 4]
+    ids = torch.tensor(expert_list, device=TEST_DEVICE, dtype=torch.int32)
+    source = torch.tensor([0, 1, 0, 1, 99999], device=TEST_DEVICE, dtype=torch.int32)
+    scatter = torch.tensor([2, 0, 3, 1, 4], device=TEST_DEVICE, dtype=torch.int32)
+    if op == "batched":
+        kwargs = dict(expert_ids=ids, gather_idx=source, scatter_idx=scatter)
+    else:
+        order = torch.argsort(ids)
+        starts = torch.tensor([0, 1, 2, 2, 4], device=TEST_DEVICE, dtype=torch.int32)
+        kwargs = dict(
+            expert_start=starts, gather_idx=source[order], scatter_idx=scatter[order]
+        )
+    fn = getattr(kernel, "matmul_" + op)
+
+    def forward(x):
+        return fn(
+            x,
+            b,
+            None,
+            scales,
+            activation_format="bf16",
+            gate=gate,
+            bias=bias,
+            output_dtype=torch.float32,
+            **kwargs,
+        )
+
+    if compiled:
+        forward = torch.compile(forward, fullgraph=True, mode="reduce-overhead")
+    for x in (a, a + 1) if compiled else (a,):
+        expected = torch.empty(4, n, device=TEST_DEVICE)
+        for row, expert in enumerate(expert_list[:-1]):
+            value = (
+                x[source[row]].double() @ weights[expert].double().T
+                + bias[expert].double()
+            )
+            if gate:
+                value = torch.nn.functional.silu(value[0::2]) * value[1::2]
+            expected[scatter[row]] = value.float()
+        with torch.no_grad():
+            actual = forward(x)
+        torch.testing.assert_close(actual[:4], expected, rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("op", ["batched", "grouped"])
+def test_sparse_decode_empty_routes(kernel, op):
+    """An EP rank with no local routes returns an empty matrix without launching a zero grid."""
+    a = torch.empty(0, 256, device=TEST_DEVICE, dtype=torch.bfloat16)
+    b = torch.zeros(4, 128, 256, device=TEST_DEVICE, dtype=torch.float8_e4m3fn)
+    scales = torch.ones(4, 1, 1, device=TEST_DEVICE)
+    kwargs = (
+        dict(expert_ids=torch.empty(0, device=TEST_DEVICE, dtype=torch.int32))
+        if op == "batched"
+        else dict(expert_start=torch.zeros(5, device=TEST_DEVICE, dtype=torch.int32))
+    )
+    result = getattr(kernel, "matmul_" + op)(
+        a, b, None, scales, activation_format="bf16", **kwargs
+    )
+    assert result.shape == (0, 128)
+    assert result.dtype == a.dtype

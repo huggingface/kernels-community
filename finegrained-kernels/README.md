@@ -78,8 +78,9 @@ matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None,
 - Weight-only FP8 (`activation_format="bf16"`) supports coarse block scales, one scale per
   tensor/expert, and MX group scales. Activations remain unquantized; scaled weights round to
   the activation dtype before multiplication. Separately calibrated interleaved gate/up grids
-  work in dense, grouped, batched, and fused MoE entrypoints. The routed kernels rescale tiles
-  inside the GEMM. Dense B200 decode uses a scalar/split-K kernel with fused bias/GLU; large
+  work in dense, grouped, batched, and fused MoE entrypoints. Dense B200 decode and sparse
+  routed decode use a scalar/split-K kernel with fused bias/GLU and routing; larger routed
+  batches rescale tiles inside the GEMM and remain a performance limitation. Large dense
   prefill GEMMs instead dequantize into a temporary BF16/FP16 weight workspace and use cuBLAS
   (or the fused full-precision kernel for epilogues). This workspace costs two bytes per weight
   during the call; persistent weights and saved checkpoints remain FP8. The coarse FP8

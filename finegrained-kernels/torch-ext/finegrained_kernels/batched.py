@@ -33,6 +33,8 @@ from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_
 from .swizzle import swizzled_scale_descriptor
 from .scheduling import is_off_rank
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
+from . import compat
+from .weight_only import decode_matmul
 from .loading.scales import dequant_block_fp8_weight_tile
 from .loading.tiles import (
     advance_ptrs,
@@ -1635,6 +1637,30 @@ def _raw_activation_matmul_batched(
     K = A.shape[1]
     S = expert_ids.shape[0]
     num_experts, _, N = expert_weight_shape(B, gate)
+    # Scalar split-K avoids padding each sparse expert to a tensor-core M tile.
+    # Keep large routed batches on the tensor-core path and materialize no BF16 experts.
+    if Bs is not None and compat.is_sm10x() and S <= min(16, 2 * num_experts):
+        return [
+            decode_matmul(
+                A,
+                B,
+                Bs,
+                scale_block_n,
+                scale_block_k,
+                output_dtype,
+                gate=gate,
+                gate_scales=gate and Bs.shape[1] > 1,
+                bias=bias,
+                act_fn=act_fn,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_limit=swiglu_limit,
+                simulate_unfused=simulate_unfused,
+                expert_ids=expert_ids,
+                gather_idx=gather_idx,
+                scatter_idx=scatter_idx,
+                num_rows=S,
+            )
+        ]
     C = A.new_empty(S, N, dtype=output_dtype)
 
     def grid(META):

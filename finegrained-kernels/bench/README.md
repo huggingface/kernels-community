@@ -121,3 +121,36 @@ duration of the call.
 Fused gate/bias epilogues retain the existing full-precision Triton path after
 conversion. Persistent weights stay FP8. These coarse-scale W8A16 operations are
 inference-only; their custom operators do not register an autograd formula.
+
+Sparse routed decode reuses the split-K path for at most 16 routed rows and at
+most two rows per expert on average. It reads only the selected expert weights
+and fuses gather/scatter and bias/GLU, including invalid off-rank route masking.
+This path does not create a BF16 expert-weight workspace. Reproduce routed
+measurements with:
+
+```bash
+FINEGRAINED_AUTOTUNE_TRIALS=100 python bench/bench_fp8_routed.py \
+  --family weight_only --kind grouped --rows 1,2 --output routed.jsonl
+FINEGRAINED_AUTOTUNE_TRIALS=100 python bench/bench_fp8_routed.py \
+  --family weight_only --kind batched --rows 1 --gate --gather --output gate.jsonl
+```
+
+With eight active experts, N1280/K5120 (52 MB of FP8 weights):
+
+| Rows per expert | W8A16 warm / cold | Persistent BF16 bmm warm / cold | Per-call dequant + bmm warm / cold |
+|---:|---:|---:|---:|
+| 1 | 19.35 / 28.64 | 17.32 / 30.72 | 49.21 / 53.28 |
+| 2 | 31.94 / 40.93 | 17.55 / 32.74 | 50.76 / 57.18 |
+
+The BF16 reference retains twice the weight storage. The warm eight-expert case
+fits in B200 L2; cold replay is also reported to avoid relying on that favorable
+cache residency. Larger routed batches retain the original in-tile W8A16 path;
+its throughput and large number of shared-memory rejections during tuning remain
+known limitations. The dense and sparse decode improvements do not imply tuned
+routed prefill performance.
+
+The batched gate+gather case (eight experts, logical N1280/K5120; 105 MB FP8
+weights) measured 36.64 µs warm / 45.06 cold, versus persistent BF16 bmm plus
+GLU at 41.00 / 57.34 and per-call dequant+bmm+GLU at 102.37 / 108.54. The
+committed routed harness reproduces this comparison, including the fused
+finishing reduction in the FP8 path and each baseline's epilogue cost.

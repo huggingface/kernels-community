@@ -23,6 +23,27 @@ from .epilogue import glu
 from .loading.scales import decode_group_scale
 
 
+@triton.jit
+def _decode_route(row, ExpertIds, ExpertStart, GatherIdx, ScatterIdx, E: tl.constexpr):
+    valid = True
+    expert = 0
+    if ExpertIds is not None:
+        expert = tl.load(ExpertIds + row)
+        valid = (expert >= 0) & (expert < E)
+    elif ExpertStart is not None:
+        offsets = tl.arange(0, triton.next_power_of_2(E))
+        starts = tl.load(ExpertStart + offsets, offsets < E, other=2147483647)
+        expert = tl.sum((row >= starts).to(tl.int32), 0) - 1
+        valid = (expert >= 0) & (row < tl.load(ExpertStart + E))
+    source = row
+    destination = row
+    if GatherIdx is not None:
+        source = tl.load(GatherIdx + row)
+    if ScatterIdx is not None:
+        destination = tl.load(ScatterIdx + row)
+    return expert, source, destination, valid
+
+
 @bayesian_autotune(
     [
         triton.Config({"BLOCK": b}, num_warps=w, num_stages=s)
@@ -108,7 +129,7 @@ def dequantize_weight(B, Bs, dtype, scale_n, scale_k, gate_scales=False):
         for b in (128, 256, 512, 1024)
         for w in (4, 8)
     ],
-    key=["M", "N", "SPLIT_K", "GATE"],
+    key=["M", "N", "E", "SPLIT_K", "GATE"],
     n_trials=100,
     do_bench=compat.replay_benchmark,
 )
@@ -117,9 +138,15 @@ def _finish_decode(
     P,
     C,
     Bias,
+    ExpertIds,
+    ExpertStart,
+    GatherIdx,
+    ScatterIdx,
     M,
     N,
+    E: tl.constexpr,
     stride_bias,
+    stride_bias_e,
     SPLIT_K: tl.constexpr,
     GATE: tl.constexpr,
     ACT_FN: tl.constexpr,
@@ -130,6 +157,11 @@ def _finish_decode(
     BLOCK: tl.constexpr,
 ):
     row, tile = tl.program_id(0), tl.program_id(1)
+    expert, _, destination, valid = _decode_route(
+        row, ExpertIds, ExpertStart, GatherIdx, ScatterIdx, E
+    )
+    if Bias is not None:
+        Bias += expert * stride_bias_e
     out_n = N // 2 if GATE else N
     n = tile * BLOCK + tl.arange(0, BLOCK)
     split = tl.arange(0, SPLIT_K)
@@ -138,15 +170,15 @@ def _finish_decode(
     values = tl.load(P + offset, n[None, :] < out_n, other=0.0)
     value = tl.sum(values, 0)
     if Bias is not None:
-        value += tl.load(Bias + raw_n * stride_bias, n < out_n, other=0.0).to(
+        value += tl.load(Bias + raw_n * stride_bias, (n < out_n) & valid, other=0.0).to(
             tl.float32
         )
     if GATE:
         up = tl.sum(tl.load(P + offset + 1, n[None, :] < out_n, other=0.0), 0)
         if Bias is not None:
-            up += tl.load(Bias + (raw_n + 1) * stride_bias, n < out_n, other=0.0).to(
-                tl.float32
-            )
+            up += tl.load(
+                Bias + (raw_n + 1) * stride_bias, (n < out_n) & valid, other=0.0
+            ).to(tl.float32)
         value = glu(
             value,
             up,
@@ -156,7 +188,7 @@ def _finish_decode(
             SIMULATE_UNFUSED,
             OUTPUT_DTYPE,
         )
-    tl.store(C + row * out_n + n, value, n < out_n)
+    tl.store(C + destination * out_n + n, value, (n < out_n) & valid)
 
 
 def _finish_after_bench(args, exception):
@@ -170,9 +202,15 @@ def _launch_finish(args):
         args["P"],
         args["C"],
         args["Bias"],
+        args["ExpertIds"],
+        args["ExpertStart"],
+        args["GatherIdx"],
+        args["ScatterIdx"],
         args["M"],
         args["N"],
+        args["E"],
         args["stride_bias"],
+        args["stride_bias_e"],
         args["SPLIT_K"],
         args["GATE"],
         args["ACT_FN"],
@@ -203,7 +241,7 @@ def _prune_decode(configs, named_args, **kwargs):
         for w in (2, 4, 8, 16)
         for s in (1, 2, 3, 4, 5, 6)
     ],
-    key=["M", "N", "K", "SCALE_N", "SCALE_K", "GATE", "GATE_SCALES"],
+    key=["M", "N", "K", "E", "SCALE_N", "SCALE_K", "GATE", "GATE_SCALES"],
     n_trials=100,
     do_bench=compat.replay_benchmark,
     path_anchor_axes=("SPLIT_K",),
@@ -219,9 +257,17 @@ def _decode_partial(
     P,
     C,
     Bias,
+    ExpertIds,
+    ExpertStart,
+    GatherIdx,
+    ScatterIdx,
     M,
     N,
     K: tl.constexpr,
+    E: tl.constexpr,
+    stride_be,
+    stride_se,
+    stride_bias_e,
     stride_am,
     stride_ak,
     stride_bn,
@@ -243,6 +289,13 @@ def _decode_partial(
     SPLIT_K: tl.constexpr,
 ):
     row, tile, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    expert, source, destination, valid = _decode_route(
+        row, ExpertIds, ExpertStart, GatherIdx, ScatterIdx, E
+    )
+    B += expert * stride_be
+    Bs += expert * stride_se
+    if Bias is not None:
+        Bias += expert * stride_bias_e
     n = tile * BLOCK_N + tl.arange(0, BLOCK_N)
     kk = tl.arange(0, BLOCK_K)
     if SCALE_K >= K:
@@ -258,12 +311,12 @@ def _decode_partial(
     acc = tl.full((BLOCK_N,), 0.0, tl.float32)
     for off in range(tl.cdiv(chunk, BLOCK_K)):
         k = start + off * BLOCK_K + kk
-        a = tl.load(A + row * stride_am + k * stride_ak, k < end, other=0.0).to(
-            tl.float32
-        )
+        a = tl.load(
+            A + source * stride_am + k * stride_ak, (k < end) & valid, other=0.0
+        ).to(tl.float32)
         w = tl.load(
             B + n[:, None] * stride_bn + k[None, :] * stride_bk,
-            (n[:, None] < N) & (k[None, :] < end),
+            (n[:, None] < N) & (k[None, :] < end) & valid,
             other=0.0,
         ).to(tl.float32)
         if SCALE_K < K and BLOCK_K >= SCALE_K and BLOCK_K % SCALE_K == 0:
@@ -271,7 +324,7 @@ def _decode_partial(
             kg = start // SCALE_K + off * groups + tl.arange(0, groups)
             scale = tl.load(
                 Bs + sn[:, None] * stride_sn + kg[None, :] * stride_sk,
-                (n[:, None] < N) & (kg[None, :] * SCALE_K < end),
+                (n[:, None] < N) & (kg[None, :] * SCALE_K < end) & valid,
                 other=0.0,
             )
             w = (
@@ -281,7 +334,7 @@ def _decode_partial(
         else:
             scale = tl.load(
                 Bs + sn[:, None] * stride_sn + (k[None, :] // SCALE_K) * stride_sk,
-                (n[:, None] < N) & (k[None, :] < end),
+                (n[:, None] < N) & (k[None, :] < end) & valid,
                 other=0.0,
             )
             w *= decode_group_scale(scale)
@@ -290,8 +343,10 @@ def _decode_partial(
         acc += tl.sum(w * a[None, :], 1)
     if SPLIT_K == 1 and not GATE:
         if Bias is not None:
-            acc += tl.load(Bias + n * stride_bias, n < N, other=0.0).to(tl.float32)
-        tl.store(C + row * N + n, acc, n < N)
+            acc += tl.load(Bias + n * stride_bias, (n < N) & valid, other=0.0).to(
+                tl.float32
+            )
+        tl.store(C + destination * N + n, acc, (n < N) & valid)
     else:
         tl.store(P + row * 16 * N + split * N + n, acc, n < N)
 
@@ -311,14 +366,21 @@ def decode_matmul(
     swiglu_alpha=None,
     swiglu_limit=None,
     simulate_unfused=False,
+    expert_ids=None,
+    expert_start=None,
+    gather_idx=None,
+    scatter_idx=None,
+    num_rows=None,
 ):
     """One-token W8A16 GEMM with fused bias/GLU and a tuned optional split-K reduction."""
-    m, k = A.numel() // A.shape[-1], A.shape[-1]
-    n = B.shape[0]
+    m = A.numel() // A.shape[-1] if num_rows is None else num_rows
+    k, n = A.shape[-1], B.shape[-2]
+    experts = B.shape[0] if B.ndim == 3 else 1
+    output_shape = A.shape[:-1] if num_rows is None else (m,)
     out = torch.empty(
-        A.shape[:-1] + (n // 2 if gate else n,), dtype=output_dtype, device=A.device
+        output_shape + (n // 2 if gate else n,), dtype=output_dtype, device=A.device
     )
-    if compat._SKIP_LAUNCHES_MIRROR:
+    if compat._SKIP_LAUNCHES_MIRROR or m == 0:
         return out
     partial = torch.empty((m, 16, n), device=A.device, dtype=torch.float32)
     meta = dict(
@@ -333,6 +395,15 @@ def decode_matmul(
         OUTPUT_DTYPE=compat.tl_dtype(output_dtype),
     )
     stride_bias = bias.stride(-1) if bias is not None else 0
+    stride_bias_e = bias.stride(0) if bias is not None and bias.ndim == 2 else 0
+    routing = dict(
+        ExpertIds=expert_ids,
+        ExpertStart=expert_start,
+        GatherIdx=gather_idx,
+        ScatterIdx=scatter_idx,
+        E=experts,
+        stride_bias_e=stride_bias_e,
+    )
     _decode_partial[
         lambda config: (m, triton.cdiv(n, config["BLOCK_N"]), config["SPLIT_K"])
     ](
@@ -342,15 +413,23 @@ def decode_matmul(
         partial,
         out,
         bias,
+        expert_ids,
+        expert_start,
+        gather_idx,
+        scatter_idx,
         m,
         n,
         k,
+        experts,
+        B.stride(0) if B.ndim == 3 else 0,
+        Bs.stride(0) if Bs.ndim == 3 else 0,
+        stride_bias_e,
         A.stride(-2),
         A.stride(-1),
-        B.stride(0),
-        B.stride(1),
-        Bs.stride(0),
-        Bs.stride(1),
+        B.stride(-2),
+        B.stride(-1),
+        Bs.stride(-2),
+        Bs.stride(-1),
         stride_bias,
         **meta,
     )
@@ -364,6 +443,7 @@ def decode_matmul(
                 M=m,
                 N=n,
                 stride_bias=stride_bias,
+                **routing,
                 SPLIT_K=splits,
                 **meta,
             )
