@@ -154,3 +154,13 @@ weights) measured 36.64 µs warm / 45.06 cold, versus persistent BF16 bmm plus
 GLU at 41.00 / 57.34 and per-call dequant+bmm+GLU at 102.37 / 108.54. The
 committed routed harness reproduces this comparison, including the fused
 finishing reduction in the FP8 path and each baseline's epilogue cost.
+
+The W8A16 scalar grid searches N/K tiles, warps, stages and split counts 1/2/4/8/16.
+Its compact block-scale loads retain BF16/FP16 weight rounding, and tuning includes
+the finishing reduction plus fused epilogue. The temporary converter searches
+vector width, warps and stages; prefill GEMM selection is delegated to cuBLAS.
+A direct TMA/warp-specialized upcast experiment remained much slower than that
+conversion-plus-cuBLAS route and was rejected. Larger expert batches still need
+work: unconditional conversion of every expert would require a large BF16
+workspace and undermine the memory purpose of the quantized model. These B200
+measurements do not establish optimality on other shapes or devices.
