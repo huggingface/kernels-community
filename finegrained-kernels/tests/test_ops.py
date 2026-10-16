@@ -50,6 +50,7 @@ from utils import (  # type: ignore
 )
 
 import finegrained_kernels  # type: ignore
+from finegrained_kernels.embedding import embedding_lookup
 from finegrained_kernels import swizzle_mx_scales, unswizzle_mx_scales  # type: ignore
 from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore
 from finegrained_kernels.quant import nvfp4_act_quant  # type: ignore
@@ -840,7 +841,7 @@ def _embedding_reference(weight, ids, scale, global_scale, dtype):
 def test_embedding_lookup_matches_selected_rows(packed, dtype, sliced):
     weight, scale, global_scale = _embedding_table(packed, dtype, sliced)
     ids = torch.tensor([[3, 0, 3], [36, 4, 0]], device=weight.device).t()
-    actual = finegrained_kernels.embedding_lookup(weight, ids, scale, global_scale, dtype)
+    actual = embedding_lookup(weight, ids, scale, global_scale, dtype)
     torch.testing.assert_close(
         actual,
         _embedding_reference(weight, ids, scale, global_scale, dtype),
@@ -848,7 +849,7 @@ def test_embedding_lookup_matches_selected_rows(packed, dtype, sliced):
         atol=0,
     )
     assert actual.dtype == dtype
-    default = finegrained_kernels.embedding_lookup(weight, ids, scale, global_scale)
+    default = embedding_lookup(weight, ids, scale, global_scale)
     default_dtype = torch.bfloat16 if packed else scale.dtype
     assert default.dtype == default_dtype
     torch.testing.assert_close(
@@ -858,7 +859,7 @@ def test_embedding_lookup_matches_selected_rows(packed, dtype, sliced):
         atol=0,
     )
     for ids in (ids.to(torch.int32), ids.new_empty((2, 0)), ids.new_tensor(3)):
-        actual = finegrained_kernels.embedding_lookup(
+        actual = embedding_lookup(
             weight, ids, scale, global_scale, dtype
         )
         torch.testing.assert_close(
@@ -874,7 +875,7 @@ def test_embedding_lookup_matches_selected_rows(packed, dtype, sliced):
 def test_embedding_lookup_fullgraph_compile(packed):
     weight, scale, global_scale = _embedding_table(packed, torch.bfloat16)
     ids = torch.tensor([[3, 0, 3], [36, 4, 0]], device=weight.device).t()
-    lookup = torch.compile(finegrained_kernels.embedding_lookup, fullgraph=True)
+    lookup = torch.compile(embedding_lookup, fullgraph=True)
     actual = lookup(weight, ids, scale, global_scale, torch.bfloat16)
     torch.testing.assert_close(
         actual,
@@ -900,7 +901,7 @@ def test_embedding_lookup_rejects_invalid_metadata(invalid):
     else:
         weight, scale = weight[:, :0], scale[:, :0]
     with pytest.raises(ValueError):
-        finegrained_kernels.embedding_lookup(weight, ids, scale, global_scale)
+        embedding_lookup(weight, ids, scale, global_scale)
 
 
 def _embedding_invalid_index(_rank, index, packed):
@@ -912,7 +913,7 @@ def _embedding_invalid_index(_rank, index, packed):
         if packed else torch.ones(1, device=TEST_DEVICE)
     )
     global_scale = torch.ones(1, device=TEST_DEVICE) if packed else None
-    finegrained_kernels.embedding_lookup(weight, torch.tensor([index], device=TEST_DEVICE), scale, global_scale)
+    embedding_lookup(weight, torch.tensor([index], device=TEST_DEVICE), scale, global_scale)
     getattr(torch, torch.device(TEST_DEVICE).type).synchronize()
 
 
