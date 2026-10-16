@@ -21,7 +21,6 @@ import logging
 import subprocess
 import sys
 
-import kernels
 import pytest
 import torch
 import triton
@@ -350,8 +349,7 @@ def test_compile_failures_are_memoized_across_keys(caplog):
 @pytest.mark.kernels_ci
 def test_uint8_mx_scales_without_native_ue8m0(monkeypatch):
     """Import-time format detection must accept uint8 scales without native UE8M0."""
-    kernel = kernels.get_kernel("kernels-community/finegrained-kernels", version=0)
-    formats = importlib.import_module(kernel.__name__ + ".formats")
+    from finegrained_kernels import formats
     try:
         with monkeypatch.context() as patch:
             patch.delattr(torch, "float8_e8m0fnu", raising=False)
