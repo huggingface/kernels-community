@@ -122,6 +122,7 @@ class _StubAttention(WeatherNext2Attention):
 
     def __init__(self, hidden_size, heads):
         super().__init__()
+        self.config = SimpleNamespace(_attn_implementation="sdpa")
         self.head_dim = hidden_size // heads
         self.scaling = self.head_dim**-0.5
         for name in ("q_proj", "k_proj", "v_proj", "o_proj"):

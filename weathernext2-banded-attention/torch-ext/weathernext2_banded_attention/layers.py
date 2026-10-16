@@ -15,6 +15,9 @@ from .grid import WeatherNext2GridToMesh as WeatherNext2GridToMesh
 from .grid import WeatherNext2MeshToGrid as WeatherNext2MeshToGrid
 
 
+_prepare_mask = torch.compiler.disable(_prepare_mask)
+
+
 def _gather_neighbouring_blocks(states: torch.Tensor) -> torch.Tensor:
     """`[batch, blocks, heads, block, dim]` -> the same with the three neighbours side by side."""
     padding = torch.zeros_like(states[:, :1])
@@ -82,14 +85,6 @@ def _reference_attention(query, key, value, attention_mask, scaling):
             attention_mask = attention_mask.reshape(batch * blocks, 1, block_size, 3 * block_size)
         else:
             attention_mask = attention_mask[:, None]
-    elif not isinstance(attention_mask, torch.Tensor):
-        # A `BlockMask` only arrives with `attn_implementation="flex_attention"`, and sdpa cannot
-        # consume one. Say so rather than drop the mask, which would attend across the whole band.
-        raise ValueError(
-            f"WeatherNext2Attention kernel got a {type(attention_mask).__name__} mask, which it "
-            'cannot read. Load the model with attn_implementation="sdpa" (the default) when '
-            "use_kernels=True."
-        )
 
     out = nn.functional.scaled_dot_product_attention(queries, keys, values, attn_mask=attention_mask, scale=scaling)
     return out.reshape(batch, blocks, heads, block_size, head_dim)
@@ -147,24 +142,33 @@ def _blockwise_attention(query, key, value, mask, scaling):
     )
 
 
-class WeatherNext2AttentionMask(nn.Module):
+class WeatherNext2MeshEncoder(nn.Module):
     """Prepare one packed geometry mask per forward, shared by all transformer layers."""
 
     can_torch_compile = True
 
-    def forward(self, attention_mask, batch_size, dtype):
-        if self.training or torch.is_grad_enabled() or self.config._attn_implementation == "flex_attention":
-            return type(self).forward(self, attention_mask, batch_size, dtype)
-        mask = attention_mask[:, 0]
-        if mask.is_cpu:
-            return mask
-        return _prepare_mask(mask)
+    def forward(self, hidden_states, attention_mask, conditioning, **kwargs):
+        if (
+            not isinstance(attention_mask, dict)
+            and not self.training
+            and not torch.is_grad_enabled()
+            and not hidden_states.is_cpu
+            and self.config._attn_implementation == "sdpa"
+        ):
+            num_nodes = hidden_states.shape[1]
+            block_size = min(self.config.attention_bandwidth, num_nodes)
+            num_blocks = (num_nodes + block_size - 1) // block_size
+            if attention_mask.shape == (num_blocks, 1, block_size, 3 * block_size):
+                attention_mask = {"full_attention": _prepare_mask(attention_mask[:, 0])}
+        return type(self).forward(self, hidden_states, attention_mask, conditioning, **kwargs)
 
 
 class WeatherNext2Attention(nn.Module):
     can_torch_compile = True
 
     def forward(self, hidden_states: torch.Tensor, attention_mask, **kwargs):
+        if self.config._attn_implementation != "sdpa" or not isinstance(attention_mask, (torch.Tensor, PreparedMask)):
+            return type(self).forward(self, hidden_states, attention_mask, **kwargs)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 

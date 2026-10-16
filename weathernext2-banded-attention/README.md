@@ -32,12 +32,13 @@ This kernel walks the three neighbours straight out of the ungathered tensors, s
 - the mask is streamed a tile at a time rather than expanded,
 - tiles the band never reaches are skipped before their two matmuls, not after.
 
-The mask layer builds one packed active-tile representation per forward, shared by all
+The mesh encoder builds one packed active-tile representation per forward, shared by all
 attention layers: CSR offsets, compact tile indices and one uint32 word per query row
 per active 32-key tile, following Faster-WeatherNext. Temporary scan counts and padded
 tile lists are discarded after preparation. The model-facing attention consumes those words directly, without
 unpacking the mask or storing a score matrix. Boolean masks use the same preparation
-when the attention replacement is used without its mask layer.
+when the attention replacement is used without the encoder replacement. Other attention
+implementations keep their original mask preparation and forward.
 
 The fused Triton API is forward only. The model-facing layer uses the differentiable
 fallback when gradients are required.
