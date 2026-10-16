@@ -11,11 +11,7 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened]
-    paths:
-      - "*/port/**"
-      - "*/src/**"
-      - "scripts/check_ports.py"
-      - ".github/workflows/check-ports.yaml"
+    # The checker selects changed ports, including kernels with a flat layout.
   workflow_dispatch:
 
 concurrency:
