@@ -331,20 +331,6 @@ def mx_2d_scale_ptrs(
 
 
 @triton.jit
-def block_fp8_scale_ptrs(
-    Scales, expert, n, k, stride_e, stride_n, stride_k,
-    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GATE_SCALES: tl.constexpr = False,
-):
-    """Map physical FP8 weight coordinates to their coarse scale cells."""
-    if GATE_SCALES:
-        scale_n = (n // 2 // BLOCK_N) * 2 + n % 2
-    else:
-        scale_n = n // BLOCK_N
-    return Scales + expert * stride_e + scale_n * stride_n + (k // BLOCK_K) * stride_k
-
-
-@triton.jit
 def dequant_block_fp8_weight_tile(
     w, Scales, expert, offs_n, offs_k,
     stride_scale_e, stride_scale_n, stride_scale_k,
@@ -352,18 +338,16 @@ def dequant_block_fp8_weight_tile(
     GATE_SCALES: tl.constexpr = False,
     SWAP_AB: tl.constexpr = False,
     DTYPE: tl.constexpr = tl.bfloat16,
-    mask=None,
 ):
     """Rescale an FP8 tile to the raw activation dtype, retaining coarse block scales.
 
     Gate/up weight rows alternate per value; their scale rows alternate per block.
     """
-    ptrs = block_fp8_scale_ptrs(
-        Scales, expert, offs_n[:, None], offs_k[None, :],
-        stride_scale_e, stride_scale_n, stride_scale_k,
-        BLOCK_N, BLOCK_K, GATE_SCALES,
-    )
-    scales = tl.load(ptrs) if mask is None else tl.load(ptrs, mask, other=0.0)
+    scale_n = (offs_n // 2 // BLOCK_N) * 2 + offs_n % 2 if GATE_SCALES else offs_n // BLOCK_N
+    ptrs = (Scales + expert * stride_scale_e
+            + scale_n[:, None] * stride_scale_n
+            + (offs_k[None, :] // BLOCK_K) * stride_scale_k)
+    scales = tl.load(ptrs)
     scales = decode_group_scale(scales)
     if not SWAP_AB:
         scales = tl.trans(scales)

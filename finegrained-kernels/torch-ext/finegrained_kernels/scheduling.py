@@ -22,29 +22,6 @@ from .compat import add_op_namespace_prefix, compile_time_only_triton_op, compil
 
 
 @triton.jit
-def resolve_row(row, ExpertIds, ExpertStart, GatherIdx, ScatterIdx, E: tl.constexpr, stride_eid=1):
-    valid = True
-    expert = tl.full((), 0, tl.int64)
-    if ExpertIds is not None:
-        expert = tl.load(ExpertIds + row * stride_eid).to(tl.int64)
-        if E > 0:
-            valid = (expert >= 0) & (expert < E)
-    elif ExpertStart is not None:
-        offsets = tl.arange(0, triton.next_power_of_2(E))
-        starts = tl.load(ExpertStart + offsets, offsets < E, other=2147483647)
-        expert = tl.sum((row >= starts).to(tl.int32), 0).to(tl.int64) - 1
-        valid = (expert >= 0) & (row < tl.load(ExpertStart + E))
-    source = row.to(tl.int64)
-    destination = row.to(tl.int64)
-    if GatherIdx is not None:
-        source = tl.load(GatherIdx + row).to(tl.int64)
-    if ScatterIdx is not None:
-        destination = tl.load(ScatterIdx + row).to(tl.int64)
-    return expert, source, destination, valid
-
-
-
-@triton.jit
 def build_tile_layout(
     ExpertStart, NUM_EXPERTS: tl.constexpr, BLOCK_SIZE_M: tl.constexpr
 ):

@@ -56,7 +56,7 @@ from .compat import (
     device_context,
     pdl_launch_kwargs,
 )
-from .formats import get_supported_act_fns, is_mx, is_mxfp4, is_per_expert_global, mx_scale_family, normalize_global_scale, ue8m0_as_uint8, weight_format
+from .formats import block_fp8_weight_scale_grid, get_supported_act_fns, is_mx, is_mxfp4, is_per_expert_global, mx_scale_family, normalize_global_scale, ue8m0_as_uint8, weight_format
 from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
 from .quant import _launch_act_quant, MX_ACT_QUANT, mx_act_quant_routed_scales
 from .scheduling import compute_grouped_scheduling, is_off_rank, off_rank
@@ -581,8 +581,6 @@ def _ungated_gate_up_scales(B, Bs, gate, activation_format):
     if (not gate or activation_format != "bf16" or B.dtype != torch.float8_e4m3fn
             or is_mx(B, Bs) or Bs.numel() == B.shape[0]):
         return Bs
-    from .formats import block_fp8_weight_scale_grid
-
     Bs, block_n, _ = block_fp8_weight_scale_grid(B, Bs, gate=True)
     return (Bs.reshape(B.shape[0], -1, 2, Bs.shape[-1])
             .repeat_interleave(block_n, dim=1)

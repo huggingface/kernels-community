@@ -99,11 +99,6 @@ _SKIP_LAUNCHES_MIRROR = False
 
 
 
-def launches_skipped() -> bool:
-    """Whether the current opaque fake call only needs output metadata."""
-    return _SKIP_LAUNCHES_MIRROR
-
-
 def compile_time_only_triton_wrap(kernel):
     """``wrap_triton`` while torch.compile is tracing (required to capture a raw Triton
     launch into the graph), the bare kernel in eager. Every kernel launch goes through
@@ -544,26 +539,3 @@ def sm_shared_memory_limit() -> int:
             raise RuntimeError(
                 f"Unsupported device type {dev} for sm_shared_memory_limit; only cuda/xpu are supported."
             )
-
-
-def replay_benchmark(fn, quantiles):
-    """Balance cache-hot replay and cache-cold execution when tuning B200 kernels.
-
-    Repeating one GEMM can retain its weights in L2, whereas whole-model decode
-    cycles through much more weight data. Score both regimes equally: a repeated
-    graph and a single captured operation with the native benchmark's L2 eviction.
-    Capture the whole callback so split-K reductions/epilogues count in both scores.
-    Other accelerators retain their native benchmark.
-    """
-    if get_active_device_type() == "cuda" and is_sm10x():
-        from triton.testing import do_bench, do_bench_cudagraph
-
-        warm = do_bench_cudagraph(fn, rep=60, quantiles=quantiles)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            fn()
-        cold = do_bench(graph.replay, warmup=25, rep=60, quantiles=quantiles)
-        if isinstance(warm, (float, int)):
-            return warm + cold
-        return [hot + evicted for hot, evicted in zip(warm, cold)]
-    return triton.runtime.driver.active.get_benchmarker()(fn, quantiles=quantiles)

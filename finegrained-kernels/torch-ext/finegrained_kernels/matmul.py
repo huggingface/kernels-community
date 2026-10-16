@@ -22,13 +22,12 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .bayesian_autotuner import bayesian_autotune
-from .weight_only import decode_matmul, dequantize_weight
 from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_weight_only_descriptors
 from .formats import block_fp8_weight_scale_grid, check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands
-from .loading.scales import dequant_block_fp8_weight_tile, apply_global_scale, mx_2d_scale_ptrs
+from .loading.scales import apply_global_scale, mx_2d_scale_ptrs
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .loading.tiles import (
     advance_ptrs,
@@ -37,6 +36,7 @@ from .loading.tiles import (
     load_act_plain,
     load_act_static,
     load_weight_block_dynamic,
+    load_weight_block_fp8,
     load_weight_mx,
     load_weight_plain,
     load_weight_static,
@@ -936,11 +936,11 @@ def block_fp8_weight_only_matmul_2d_kernel(
     stride_a_m, stride_a_k, stride_b_n, stride_b_k,
     stride_bs_n, stride_bs_k, stride_c_m, stride_c_n,
     stride_bias_e, stride_bias_n,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     GATE: tl.constexpr = False,
     GATE_SCALES: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
@@ -949,32 +949,26 @@ def block_fp8_weight_only_matmul_2d_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
 ):
-    """Raw BF16/FP16 acts against FP8 weights with coarse FP32 block scales.
-    Dequantization stays inside the GEMM tile: no activation quantization or
-    full-precision weight buffer is needed, including for per-tensor scales.
-    """
+    """Dense FP8 W8A16 GEMM with in-tile weight rescaling."""
     n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GATE=GATE
     )
-    rows = 2 * N if GATE else N
-    accumulator = tl.zeros((BLOCK_SIZE_M, n_width), dtype=tl.float32)
+    a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, "pointer", True)
+    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, "pointer")
+    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
-        kk = k * BLOCK_SIZE_K + offs_k
-        a = tl.load(
-            A + offs_am[:, None] * stride_a_m + kk[None, :] * stride_a_k,
-            mask=(offs_am[:, None] < M) & (kk[None, :] < K), other=0,
+        a, _ = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
+        w, _ws = load_weight_block_fp8(
+            b_ptrs, b_ptrs, Bs, 0, pid_n * n_width, k * BLOCK_SIZE_K,
+            0, offs_bn, k * BLOCK_SIZE_K + offs_k,
+            0, stride_bs_n, stride_bs_k,
+            GATE, False, "pointer", False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            BLOCK_N, BLOCK_K, GATE_SCALES, a.dtype,
         )
-        w = tl.load(
-            B + kk[:, None] * stride_b_k + offs_bn[None, :] * stride_b_n,
-            mask=(kk[:, None] < K) & (offs_bn[None, :] < rows), other=0.0,
-        ).to(tl.float32)
-        w = dequant_block_fp8_weight_tile(
-            w, Bs, 0, offs_bn, kk, 0, stride_bs_n, stride_bs_k,
-            BLOCK_N, BLOCK_K, GATE_SCALES, DTYPE=a.dtype,
-            mask=(offs_bn[:, None] < rows) & (kk[None, :] < K),
-        )
-        accumulator = tl.dot(a, w, accumulator)
+        accumulator = accumulator + fp8_dot(a, w, False, BLOCK_SIZE_K)
+        a_ptrs += BLOCK_SIZE_K * stride_a_k
+        b_ptrs += BLOCK_SIZE_K * stride_b_k
     if GATE:
         out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         gemm_epilogue(
@@ -1807,6 +1801,8 @@ def mx_weight_only_matmul_2d(
         )
 
     return [C]
+
+
 @compile_time_only_triton_op(
     add_op_namespace_prefix("block_fp8_weight_only_matmul_2d"), mutates_args=(), opaque=True,
 )
@@ -1834,47 +1830,6 @@ def block_fp8_weight_only_matmul_2d(
     Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate)
     Bs = ue8m0_as_uint8(Bs)
     dtype = resolve_output_dtype(output_dtype, A, None)
-    gate_scales = gate and Bs.shape[0] > 1
-    # B200 graph-timed measurements: the one-token scalar/split-K path avoids
-    # tensor-core M padding; prefill instead amortizes a temporary BF16 workspace
-    # and uses the mature full-precision GEMM. Persistent weights stay FP8.
-    if is_sm10x() and M == 1:
-        with device_context(A.device):
-            return [
-                decode_matmul(
-                    A,
-                    B,
-                    Bs,
-                    scale_block_n,
-                    scale_block_k,
-                    dtype,
-                    gate=gate,
-                    gate_scales=gate_scales,
-                    bias=bias,
-                    act_fn=act_fn,
-                    swiglu_alpha=swiglu_alpha,
-                    swiglu_limit=swiglu_limit,
-                    simulate_unfused=simulate_unfused,
-                )
-            ]
-    if is_sm10x() and M >= 16 and B.numel() >= 1024 * 1024:
-        with device_context(A.device):
-            weight = dequantize_weight(
-                B, Bs, A.dtype, scale_block_n, scale_block_k, gate_scales
-            )
-            if not gate and bias is None and dtype == A.dtype:
-                return [(A.view(M, K) @ weight.T).view(A.shape[:-1] + (N,))]
-            return full_precision_matmul_2d(
-                A,
-                weight,
-                output_dtype=dtype,
-                gate=gate,
-                act_fn=act_fn,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_limit=swiglu_limit,
-                simulate_unfused=simulate_unfused,
-                bias=bias,
-            )
     C = A.new_empty(A.shape[:-1] + (N,), dtype=dtype)
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)

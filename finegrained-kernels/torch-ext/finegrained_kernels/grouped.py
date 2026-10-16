@@ -30,15 +30,13 @@ from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_group
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
-from . import compat
-from .weight_only import decode_matmul
-from .loading.scales import dequant_block_fp8_weight_tile
 from .loading.tiles import (
     load_act_block_dynamic,
     load_act_mx,
     load_act_plain,
     load_act_static,
     load_weight_block_dynamic,
+    load_weight_block_fp8,
     load_weight_mx,
     load_weight_plain,
     load_weight_static,
@@ -1352,24 +1350,17 @@ def block_fp8_weight_only_matmul_grouped_kernel(
     stride_bias_e,
     stride_bias_n,
     # Meta-parameters
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     NUM_EXPERTS_POW2: tl.constexpr,
     NUM_SMS: tl.constexpr,
     WARP_SPEC: tl.constexpr = False,
-    # tuner axis: resolve M-tiles from the packed schedule (3 scalar loads) instead of the
-    # E-wide register-resident layout — pure register relief, bit-identical tiles; wins only
-    # at pressure-walled big-tile configs (dsv4 BM128/BK256: regs 244->187, +8%)
     PACKED_SCHEDULE: tl.constexpr = False,
-    # descriptor modes (host-built TMA / in-kernel tensormap) load weight tiles via the
-    # descriptor and run the swapped (weights-in-M) loop; "pointer" is the natural loop.
     B_MEMORY_MODE: tl.constexpr = "pointer",
     A_MEMORY_MODE: tl.constexpr = "pointer",
-    # Gate|up fusion epilogue (GATE=False -> plain grouped GEMM). No requant arm: the
-    # weight-only chain has no quantized intermediate — down consumes the GLU output as is.
     GATE: tl.constexpr = False,
     GATE_SCALES: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
@@ -1378,11 +1369,7 @@ def block_fp8_weight_only_matmul_grouped_kernel(
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
 ):
-    """Coarse FP8 W8A16 grouped GEMM — persistent grid-stride over expert tiles.
-
-    BF16/FP16 activations multiply rescaled FP8 weights with FP32 accumulation. ``GATE`` fuses the gate|up
-    projection (``B`` the ``(E, 2N, K)`` stack) into a ``[BK, 2*BN]`` dot + SwiGLU ``glu``,
-    emitting the intermediate; ``GATE=False`` is the plain GEMM (bit-identical)."""
+    """Persistent FP8 W8A16 GEMM with optional fused gate/up activation."""
     start_pid = tl.program_id(axis=0)
     if PACKED_SCHEDULE:
         total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
@@ -1424,9 +1411,6 @@ def block_fp8_weight_only_matmul_grouped_kernel(
                 Schedule, (tile_id + NUM_SMS) // num_n_tiles, total_m_tiles
             )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
-        # GATE reads the interleaved gate|up rows as one [BK, 2*BN] tile.
-        # GATE=False -> the plain [BK, BN] tile. Pointer arm — the descriptor modes
-        # fetch the [BN, BK] box at row0 and transpose it instead.
         b_ptrs = weight_tile_ptrs(
             B + expert_id64 * stride_b_e,
             offs_bn,
@@ -1437,17 +1421,7 @@ def block_fp8_weight_only_matmul_grouped_kernel(
         )
 
         acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
-        # Resolve each descriptor operand once per tile: the host-built box as passed, or an
-        # in-kernel tensormap where the host cannot build one (a host descriptor IS a TMA
-        # descriptor, and Xe has no TMA). The weight box is 2D over THIS expert's slab rather
-        # than 3D over the stack, for two reasons: a device-built 3D box silently drops its
-        # outermost offset on Xe (measured — every expert reads expert 0), and the slab's own
-        # K-contiguous axes are the orientation the Xe 2D block load needs to reach rate (a
-        # (K, N) view, what the pointer arm effectively does, falls well off it). A needs no
-        # such care — its box is 2D either way, and no gather reaches the descriptor arm here
-        # (``descriptor_box_pruner`` fences gathered descriptor A to sm_100), so the rows are
-        # the contiguous span at ``m_start``, tails zero-fill like the affine arm's mask, and
-        # rows outside the expert are dropped by the epilogue's row_mask.
+        # Device-built weight descriptors address a 2D slab for this expert.
         a_desc = operand_tile_descriptor(
             ADescriptor, A, S, K, stride_a_m, 1,  # K is the contiguous dim of (S, K)
             BLOCK_SIZE_M, BLOCK_SIZE_K, A_MEMORY_MODE,
@@ -1456,23 +1430,19 @@ def block_fp8_weight_only_matmul_grouped_kernel(
             BDescriptor, B + expert_id64 * stride_b_e, N, K, stride_b_n, 1,  # and of the slab
             BLOCK_SIZE_N, BLOCK_SIZE_K, B_MEMORY_MODE, GATE,
         )
-        # The box's rank, not the backend: only this kernel resolves its own 2D per-expert box
-        # (above). The other grouped kernels run the same mode on Xe against host-built 3D boxes.
         B_DESCRIPTOR_IS_2D: tl.constexpr = B_MEMORY_MODE == "device_descriptor"
         for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
             a, _as = load_act_plain(
                 a_ptrs, a_desc, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
                 A_MEMORY_MODE, GatherIdx is not None,
             )
-            w, _ws = load_weight_plain(
-                b_ptrs, b_desc, row0, n_off, k * BLOCK_SIZE_K,
-                GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
-                B_DESCRIPTOR_IS_2D=B_DESCRIPTOR_IS_2D,
-            )
-            w = dequant_block_fp8_weight_tile(
-                w, Bs, expert_id64, offs_bn, k * BLOCK_SIZE_K + offs_k,
+            w, _ws = load_weight_block_fp8(
+                b_ptrs, b_desc, Bs, row0, n_off, k * BLOCK_SIZE_K,
+                expert_id64, offs_bn, k * BLOCK_SIZE_K + offs_k,
                 stride_bs_e, stride_bs_n, stride_bs_k,
-                BLOCK_N, BLOCK_K, GATE_SCALES, False, a.dtype,
+                GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+                BLOCK_N, BLOCK_K, GATE_SCALES, a.dtype,
+                B_DESCRIPTOR_IS_2D=B_DESCRIPTOR_IS_2D,
             )
             acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
             if A_MEMORY_MODE == "pointer":
@@ -2349,30 +2319,6 @@ def block_fp8_weight_only_matmul_grouped(
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
 
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    # Scalar split-K avoids padding each sparse expert to a tensor-core M tile.
-    # Keep large routed batches on the tensor-core path and materialize no BF16 experts.
-    if compat.is_sm10x() and S <= min(16, 2 * num_experts):
-        return [
-            decode_matmul(
-                A,
-                B,
-                Bs,
-                scale_block_n,
-                scale_block_k,
-                output_dtype,
-                gate=gate,
-                gate_scales=gate and Bs.shape[1] > 1,
-                bias=bias,
-                act_fn=act_fn,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_limit=swiglu_limit,
-                simulate_unfused=simulate_unfused,
-                expert_start=expert_start,
-                gather_idx=gather_idx,
-                scatter_idx=scatter_idx,
-                num_rows=S,
-            )
-        ]
     C = A.new_empty(S, N, dtype=output_dtype)
     num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(

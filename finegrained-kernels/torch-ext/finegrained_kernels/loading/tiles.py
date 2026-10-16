@@ -15,7 +15,7 @@
 import triton
 import triton.language as tl
 
-from .scales import load_block_fp8_act_tile, load_mx_act_tile, load_swizzled_scale, load_swizzled_scale_tile, load_weight_scale_tile
+from .scales import dequant_block_fp8_weight_tile, load_block_fp8_act_tile, load_mx_act_tile, load_swizzled_scale, load_swizzled_scale_tile, load_weight_scale_tile
 
 # A-sub-tile byte budget for the 1-byte-activation grouped-swizzle depth cap (see
 # swizzle_offsets): the co-scheduled rows' A tile per K-step (depth*BM*BK bytes) must stay
@@ -473,6 +473,30 @@ def load_weight_block_dynamic(
     w = _weight_value(b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB)
     w_s = _weight_scale_block_dynamic(bs_ptrs, up_s_ptr, bs_mask, k, stride_bs_k, GROUPED, GATE, BLOCK_SIZE_N)
     return w, w_s
+
+
+@triton.jit
+def load_weight_block_fp8(
+    b_ptrs, b_descriptor, bs_ptr, row0, n_off, k_off,
+    expert_id, offs_n, offs_k, stride_bs_e, stride_bs_n, stride_bs_k,
+    GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GATE_SCALES: tl.constexpr, DTYPE: tl.constexpr,
+    B_DESCRIPTOR_IS_2D: tl.constexpr = False,
+):
+    """Coarse FP8 weight-only tile, rescaled to the raw activation dtype."""
+    w = _weight_value(
+        b_ptrs, b_descriptor, row0, n_off, k_off,
+        GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
+        B_DESCRIPTOR_IS_2D,
+    )
+    w = dequant_block_fp8_weight_tile(
+        w, bs_ptr, expert_id, offs_n, offs_k,
+        stride_bs_e, stride_bs_n, stride_bs_k,
+        BLOCK_N, BLOCK_K, GATE_SCALES, SWAP_AB, DTYPE,
+    )
+    return w, w
 
 
 @triton.jit

@@ -31,11 +31,8 @@ from .formats import block_fp8_weight_scale_grid, check_activation_format, globa
 from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
-from .scheduling import is_off_rank, resolve_row
+from .scheduling import is_off_rank
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
-from . import compat
-from .weight_only import decode_matmul
-from .loading.scales import dequant_block_fp8_weight_tile
 from .loading.tiles import (
     advance_ptrs,
     load_act_block_dynamic,
@@ -43,6 +40,7 @@ from .loading.tiles import (
     load_act_plain,
     load_act_static,
     load_weight_block_dynamic,
+    load_weight_block_fp8,
     load_weight_mx,
     load_weight_plain,
     load_weight_static,
@@ -88,9 +86,10 @@ def expert_setup(
     non-local expert would be out of bounds."""
     batch_id = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
-    expert_id, in_row, out_row, _ = resolve_row(
-        batch_id, ExpertIds, None, GatherIdx, ScatterIdx, 0, stride_eid,
-    )
+    # Cast to int64 before multiplying strides into the stacked weight tensor.
+    expert_id = tl.load(ExpertIds + batch_id * stride_eid).to(tl.int64)
+    in_row = tl.load(GatherIdx + batch_id).to(tl.int64) if GatherIdx is not None else batch_id
+    out_row = tl.load(ScatterIdx + batch_id).to(tl.int64) if ScatterIdx is not None else batch_id
     A = A + in_row * stride_a_m
     B = B + expert_id * stride_b_e
     C = C + out_row * stride_c_m
@@ -1027,14 +1026,12 @@ def block_fp8_weight_only_matmul_batched_kernel(
     stride_bias_n,
     stride_eid,
     # Meta-parameters
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
     SWAP_AB: tl.constexpr = False,
-    # Gate|up fusion epilogue (GATE=False -> plain batched GEMM). No requant arm: the
-    # weight-only chain has no quantized intermediate — down consumes the GLU output as is.
     GATE: tl.constexpr = False,
     GATE_SCALES: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
@@ -1044,10 +1041,7 @@ def block_fp8_weight_only_matmul_batched_kernel(
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     PDL: tl.constexpr = False,
 ):
-    """Coarse FP8 W8A16 batched expert GEMM, with in-tile weight rescaling. ``GATE``
-    computes gate|up as ONE stacked tile + dot (straight-line, both orientations) and
-    applies the ``ACT_FN``/SwiGLU ``glu``. ``SWAP_AB`` (tuner axis, M=1 decode): weight
-    output rows in the MMA M dim, the single token padded to the N=16 atom."""
+    """Batched FP8 W8A16 expert GEMM with optional fused gate/up activation."""
     if PDL:
         gdc_wait()
     batch_id, pid_n, expert_id, A, B, C, unused_scale_base, in_row, out_row = expert_setup(
@@ -1073,8 +1067,6 @@ def block_fp8_weight_only_matmul_batched_kernel(
     offs_bn = pid_n * n_width + tl.arange(0, n_width)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_k, stride_a_m, stride_a_k, "pointer", True)
-    # GATE reads one weight tile spanning the interleaved gate|up rows;
-    # GATE=False -> the plain oriented tile.
     b_ptrs = weight_tile_ptrs(
         B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB
     )
@@ -1082,20 +1074,16 @@ def block_fp8_weight_only_matmul_batched_kernel(
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a, unused_activation = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
-        w, unused_weight = load_weight_plain(
-            b_ptrs, b_ptrs, 0, 0, 0, GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K
-        )
-        w = dequant_block_fp8_weight_tile(
-            w, Bs, expert_id, offs_bn, k * BLOCK_SIZE_K + offs_k,
+        w, _ws = load_weight_block_fp8(
+            b_ptrs, b_ptrs, Bs, 0, 0, 0,
+            expert_id, offs_bn, k * BLOCK_SIZE_K + offs_k,
             stride_bs_e, stride_bs_n, stride_bs_k,
-            BLOCK_N, BLOCK_K, GATE_SCALES, SWAP_AB, a.dtype,
+            GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            BLOCK_N, BLOCK_K, GATE_SCALES, a.dtype,
         )
         accumulator = accumulator + fp8_dot(a, w, SWAP_AB, BLOCK_SIZE_K)
-        a_ptrs, unused_as_ptr, b_ptrs, unused_bs_ptr, unused_up_ptr, unused_up_scale_ptr = advance_ptrs(
-            a_ptrs, a_ptrs, b_ptrs, b_ptrs, b_ptrs, b_ptrs,
-            BLOCK_SIZE_K * stride_a_k, 0, BLOCK_SIZE_K * stride_b_k, 0,
-            "pointer", "pointer", False, False, False,
-        )
+        a_ptrs += BLOCK_SIZE_K * stride_a_k
+        b_ptrs += BLOCK_SIZE_K * stride_b_k
 
     if PDL:
         gdc_launch_dependents()
@@ -1818,30 +1806,6 @@ def block_fp8_weight_only_matmul_batched(
     K = A.shape[1]
     S = expert_ids.shape[0]
     num_experts, _, N = expert_weight_shape(B, gate)
-    # Scalar split-K avoids padding each sparse expert to a tensor-core M tile.
-    # Keep large routed batches on the tensor-core path and materialize no BF16 experts.
-    if compat.is_sm10x() and S <= min(16, 2 * num_experts):
-        return [
-            decode_matmul(
-                A,
-                B,
-                Bs,
-                scale_block_n,
-                scale_block_k,
-                output_dtype,
-                gate=gate,
-                gate_scales=gate and Bs.shape[1] > 1,
-                bias=bias,
-                act_fn=act_fn,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_limit=swiglu_limit,
-                simulate_unfused=simulate_unfused,
-                expert_ids=expert_ids,
-                gather_idx=gather_idx,
-                scatter_idx=scatter_idx,
-                num_rows=S,
-            )
-        ]
     C = A.new_empty(S, N, dtype=output_dtype)
 
     def grid(META):

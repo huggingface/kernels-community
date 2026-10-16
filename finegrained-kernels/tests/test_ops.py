@@ -51,7 +51,15 @@ from utils import (  # type: ignore
 
 import finegrained_kernels  # type: ignore
 from finegrained_kernels import swizzle_mx_scales, unswizzle_mx_scales  # type: ignore
+from finegrained_kernels.batched import matmul_batched, mx_dynamic_matmul_batched_kernel  # type: ignore
 from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore
+from finegrained_kernels.grouped import (  # type: ignore
+    block_fp8_weight_only_matmul_grouped_kernel,
+    matmul_grouped,
+    mx_dynamic_matmul_grouped_kernel,
+    w8a8_tensor_dynamic_fp8_matmul_grouped_kernel,
+)
+from finegrained_kernels.matmul import mx_dynamic_matmul_kernel  # type: ignore
 from finegrained_kernels.quant import nvfp4_act_quant  # type: ignore
 from finegrained_kernels.epilogue import apply_glu  # type: ignore
 
@@ -154,13 +162,11 @@ def scenarios() -> list[Problem]:
                 out.append(Problem(weights=w, activation_format=fmt))
     out += [
         # Coarse and per-tensor FP8 with raw BF16/FP16 activations.
-        Problem(weights="fp8_128x128", activation_format="bf16", S=1, N=192, K=384, bias=True),
-        Problem(weights="fp8_tensor", activation_format="bf16", S=8, gate=True, bias=True),
+        Problem(weights="fp8_128x128", activation_format="bf16", S=1, N=192, K=384, bias=True, dtype=torch.float16),
         Problem(weights="fp8_128x128", activation_format="bf16", S=16, sentinel_fraction=0.25),
         Problem(weights="fp8_128x128_ue8m0", activation_format="bf16", S=8, empty_expert=True),
-        Problem(weights="fp8_128x128", activation_format="bf16", S=7, dtype=torch.float16),
         Problem(weights="fp8_128x128", activation_format="bf16", S=17, N=1536, K=1024, compile=True, bias=True),
-        Problem(weights="fp8_tensor", activation_format="bf16", S=1, gate=True, compile=True),
+        Problem(weights="fp8_tensor", activation_format="bf16", S=1, gate=True, bias=True, compile=True),
         Problem(weights="fp8_128x128", activation_format="bf16", S=17, N=192, K=384, compile=True),
         Problem(weights="fp16", dtype=torch.float16),
         # gate WITHOUT requant (raw GLU intermediate) — one quantized + one full format
@@ -724,42 +730,35 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
 # kernel (the dense gate fusion and its gate_pointer_only/WS pruners), and one nvfp4 cell
 # (E4M3 scales: the nvfp4_native_ok fence + software decode arms).
 _SWEEP_CELLS = [
-    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
+    (Problem(weights="fp8_128x128", activation_format="bf16"), "grouped", block_fp8_weight_only_matmul_grouped_kernel),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True), "grouped", mx_dynamic_matmul_grouped_kernel),
     # K off the BK=128 grid admits the BK=64 rows, the family a K=256 cell never reaches
-    (Problem(weights="mxfp4", K=320), "grouped", "mx_dynamic_matmul_grouped_kernel"),
-    (Problem(weights="mxfp8", K=320), "grouped", "mx_dynamic_matmul_grouped_kernel"),
-    (Problem(weights="mxfp4", S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
-    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
-    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", "mx_dynamic_matmul_kernel"),
-    (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
+    (Problem(weights="mxfp4", K=320), "grouped", mx_dynamic_matmul_grouped_kernel),
+    (Problem(weights="mxfp8", K=320), "grouped", mx_dynamic_matmul_grouped_kernel),
+    (Problem(weights="mxfp4", S=8), "batched", mx_dynamic_matmul_batched_kernel),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", mx_dynamic_matmul_grouped_kernel),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", mx_dynamic_matmul_kernel),
+    (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", mx_dynamic_matmul_batched_kernel),
     # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize
     # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is
     # the one a memory-mode fence gets wrong (silently — the tuner forgives what will not lower)
-    (Problem(weights="fp8_tensor", static=True), "grouped", "w8a8_tensor_dynamic_fp8_matmul_grouped_kernel"),
+    (Problem(weights="fp8_tensor", static=True), "grouped", w8a8_tensor_dynamic_fp8_matmul_grouped_kernel),
 ]
 
 
 @pytest.mark.slow
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize(
-    "problem, op, kernel_name",
+    "problem, op, tuner",
     _SWEEP_CELLS,
     ids=[f"{p.id}_{op}" for p, op, _ in _SWEEP_CELLS],
 )
-def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
+def test_every_admitted_config_is_correct(problem: Problem, op, tuner):
     """Force-run EVERY config the pruners admit for one launch and hard-check each against the
     torch oracle. The tuner benches configs by SPEED, so a wrong-but-fast config that slips the
     pruners gets crowned silently — the class no winner-only test can see. A forced config may
     fail to compile/launch (the tuner's forgiven-inf path — reported, not asserted); a config
     that RUNS must be correct."""
-    import finegrained_kernels.batched as batched_mod
-    import finegrained_kernels.grouped as grouped_mod
-    import finegrained_kernels.matmul as matmul_mod
-    import finegrained_kernels.quant as quant_mod
-
-    # the op's own kernel, or one of the shared passes it launches (the activation quant)
-    op_mod = {"batched": batched_mod, "grouped": grouped_mod, "matmul": matmul_mod}[op]
-    tuner = getattr(op_mod, kernel_name, None) or getattr(quant_mod, kernel_name)
     A, expert_ids = _routed(problem)
     row = WEIGHTS[problem.weights]
     B, Bs, Bs_global = _make_weights(problem, row, problem.E)
@@ -777,7 +776,7 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
     try:
         tuner.cache.clear()
         _run_ref_vs_op(problem, op, A, expert_ids, B, Bs, Bs_global, shared=shared)
-        assert admitted.get("configs"), "the spy never saw a prune pass — wrong kernel_name?"
+        assert admitted.get("configs"), "the spy never saw a prune pass"
         forgiven = []
         for cfg in admitted["configs"]:
             tuner.configs = [cfg]
@@ -811,225 +810,42 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("op", ["batched", "grouped"])
-def test_sparse_decode_expert_offset_exceeds_int32(monkeypatch, op):
-    """Large expert strides use int64 even when IDs and cumulative starts are int32.
-
-    Only two expert planes are initialized. A 2GiB storage offset makes the
-    pre-fix wrapped address land on a legal zero region, rather than poisoning CUDA.
-    Excluded from kernels_ci because of the backing allocation.
+@pytest.mark.parametrize("op", [matmul_batched, matmul_grouped])
+def test_weight_only_large_expert_offsets(op):
+    """Int32 routing must address expert slabs beyond 2GiB without wrapping.
+    The storage offset makes the old wrapped address read legal zeros; only two planes are touched.
     """
-    import importlib
-    import triton
-
-    kernel = finegrained_kernels
-
-    if TEST_DEVICE != "cuda" or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("B200 sparse decode path")
+    if TEST_DEVICE != "cuda":
+        pytest.skip("CUDA large-allocation regression")
     e, n, k = 512, 1280, 5120
-    expert_stride = n * k
-    storage_offset = 1 << 31
-    elements = storage_offset + e * expert_stride
-    if torch.cuda.mem_get_info()[0] < elements + (512 << 20):
+    stride, offset = n * k, 1 << 31
+    if torch.cuda.mem_get_info()[0] < offset + e * stride + (512 << 20):
         pytest.skip("requires a sparse 5.2GiB backing allocation")
-    storage = torch.empty(elements, device=TEST_DEVICE, dtype=torch.float8_e4m3fn)
-    wrapped = storage_offset + (e - 1) * expert_stride - (1 << 32)
-    storage[wrapped : wrapped + expert_stride].zero_()
-    weight = storage[storage_offset:].view(e, n, k)
+    storage = torch.empty(offset + e * stride, device=TEST_DEVICE, dtype=torch.float8_e4m3fn)
+    wrapped = offset + (e - 1) * stride - (1 << 32)
+    storage[wrapped : wrapped + stride].zero_()
+    weight = storage[offset:].view(e, n, k)
     weight[-1].fill_(1)
     a = torch.ones(1, k, device=TEST_DEVICE, dtype=torch.bfloat16)
     scales = torch.ones(e, 1, 1, device=TEST_DEVICE)
-    module = importlib.import_module(kernel.__name__ + ".weight_only")
-    tuner = module._decode_partial
-    monkeypatch.setattr(
-        tuner,
-        "configs",
-        [
-            triton.Config(
-                {"BLOCK_N": 32, "BLOCK_K": 256, "SPLIT_K": 1}, num_warps=4, num_stages=1
-            )
-        ],
+    route = dict(expert_ids=torch.tensor([e - 1], device=TEST_DEVICE, dtype=torch.int32)) if op is matmul_batched else dict(
+        expert_start=torch.tensor([0] * e + [1], device=TEST_DEVICE, dtype=torch.int32)
     )
-    tuner.cache.clear()
-    route = (
-        dict(expert_ids=torch.tensor([e - 1], device=TEST_DEVICE, dtype=torch.int32))
-        if op == "batched"
-        else dict(
-            expert_start=torch.tensor(
-                [0] * e + [1], device=TEST_DEVICE, dtype=torch.int32
-            )
-        )
-    )
-    out = getattr(kernel, "matmul_" + op)(
-        a,
-        weight,
-        None,
-        scales,
-        activation_format="bf16",
-        output_dtype=torch.float32,
-        **route,
+    out = op(
+        a, weight, None, scales, activation_format="bf16", output_dtype=torch.float32, **route,
     )
     torch.testing.assert_close(out, torch.full_like(out, k), rtol=0, atol=0)
 
 
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("byte", [0, 127, 254, 255])
-def test_dense_weight_only_ue8m0_boundaries(byte):
-    """The small-batch fallback shares UE8M0 zero/NaN semantics with decode and MX."""
-
-    kernel = finegrained_kernels
-    a = torch.full(
-        (7, 256),
-        2.0 ** (-120 if byte == 254 else 0),
-        device=TEST_DEVICE,
-        dtype=torch.bfloat16,
-    )
+def test_weight_only_ue8m0_boundaries(byte):
+    a = torch.full((7, 256), 2.0 ** (-120 if byte == 254 else 0), device=TEST_DEVICE, dtype=torch.bfloat16)
     weight = torch.ones(128, 256, device=TEST_DEVICE, dtype=torch.float8_e4m3fn)
     scales = torch.tensor(byte, device=TEST_DEVICE, dtype=torch.uint8)
     scale = float("nan") if byte == 255 else 2.0 ** (byte - 127)
-    reference_weight = torch.full((128, 256), scale, device=TEST_DEVICE, dtype=a.dtype)
-    reference = (a @ reference_weight.T).float()
-    out = kernel.matmul_2d(
-        a, weight, None, scales, activation_format="bf16", output_dtype=torch.float32
+    reference = a @ torch.full_like(weight, scale, dtype=a.dtype).T
+    out = finegrained_kernels.matmul_2d(
+        a, weight, None, scales, activation_format="bf16", output_dtype=torch.float32,
     )
-    torch.testing.assert_close(out, reference, rtol=0, atol=0, equal_nan=True)
-
-
-def _weight_reference(
-    weight, scales, block_n, block_k, gate=False, dtype=torch.bfloat16
-):
-    if scales.dtype == torch.uint8:
-        scales = torch.pow(2.0, scales.float() - 127)
-    rows = weight.shape[-2]
-    if scales.shape[-2] == 1:
-        scale_rows = torch.zeros(rows, device=weight.device, dtype=torch.long)
-    elif gate:
-        row = torch.arange(rows, device=weight.device)
-        scale_rows = (row // 2 // block_n) * 2 + row % 2
-    else:
-        scale_rows = torch.arange(rows, device=weight.device) // block_n
-    return (
-        weight.float() * scales[..., scale_rows, :].repeat_interleave(block_k, -1)
-    ).to(dtype)
-
-
-@pytest.mark.parametrize("split_k", [1, 2, 8, 16])
-@pytest.mark.parametrize("gate,scalar", [(False, False), (True, False), (True, True)])
-def test_weight_only_decode_split_and_empty_partials(
-    monkeypatch, split_k, gate, scalar
-):
-    """Every split arm must reduce correctly, including splits beyond the final K group."""
-    import importlib
-
-    import triton
-
-    if TEST_DEVICE != "cuda" or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("B200 decode route")
-    weight_only = importlib.import_module(finegrained_kernels.__name__ + ".weight_only")
-    monkeypatch.setattr(
-        weight_only._decode_partial,
-        "configs",
-        [
-            triton.Config(
-                {"BLOCK_N": 16, "BLOCK_K": 256, "SPLIT_K": split_k},
-                num_warps=4,
-                num_stages=1,
-            )
-        ],
-    )
-    torch.manual_seed(104)
-    n, k = 192, 384
-    rows = 2 * n if gate else n
-    a = torch.randn(1, k, device=TEST_DEVICE, dtype=torch.bfloat16)
-    b = torch.randn(rows, k, device=TEST_DEVICE).to(torch.float8_e4m3fn)
-    shape = (
-        (1, 1)
-        if scalar
-        else (2 * ((n + 127) // 128) if gate else (n + 127) // 128, k // 128)
-    )
-    scales = torch.rand(shape, device=TEST_DEVICE) * 0.031 + 0.013
-    block_n, block_k = (rows, k) if scalar else (128, 128)
-    bias = torch.randn(rows, device=TEST_DEVICE, dtype=a.dtype) * 0.1
-    w = _weight_reference(b, scales, block_n, block_k, gate)
-    ref = a.float() @ w.float().T + bias.float()
-    if gate:
-        ref = torch.nn.functional.silu(ref[:, 0::2]) * ref[:, 1::2]
-    got = finegrained_kernels.matmul_2d(
-        a,
-        b,
-        None,
-        scales,
-        activation_format="bf16",
-        gate=gate,
-        bias=bias,
-        output_dtype=torch.float32,
-    )
-    torch.testing.assert_close(got, ref, rtol=2e-5, atol=2e-5)
-
-
-@pytest.mark.parametrize("gate,scalar", [(False, False), (True, False), (True, True)])
-@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.uint8])
-def test_temporary_weight_workspace_expert_strides(gate, scalar, scale_dtype):
-    """The shared dequantizer must retain expert, partial-block, and gate scale indexing."""
-    import importlib
-
-    weight_only = importlib.import_module(finegrained_kernels.__name__ + ".weight_only")
-    torch.manual_seed(109)
-    e, n, k = 3, 192, 384
-    rows = 2 * n if gate else n
-    # A transposed weight view exercises the input strides independently of output layout.
-    b = (
-        torch.randn(e, k, rows, device=TEST_DEVICE)
-        .to(torch.float8_e4m3fn)
-        .transpose(-1, -2)
-    )
-    shape = (
-        (e, 1, 1)
-        if scalar
-        else (e, 2 * ((n + 127) // 128) if gate else (n + 127) // 128, k // 128)
-    )
-    if scale_dtype == torch.uint8:
-        scales = torch.randint(123, 129, shape, device=TEST_DEVICE, dtype=torch.uint8)
-    else:
-        scales = torch.rand(shape, device=TEST_DEVICE) * 0.031 + 0.013
-    bn, bk = (rows, k) if scalar else (128, 128)
-    actual = weight_only.dequantize_weight(
-        b, scales, torch.float16, bn, bk, gate and not scalar
-    )
-    expected = _weight_reference(b, scales, bn, bk, gate, torch.float16)
-    assert actual.is_contiguous()
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.kernels_ci
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_uint8_scale_decode_matches_native_ue8m0():
-    import importlib
-    import triton
-    import triton.language as tl
-
-    decode = importlib.import_module(
-        finegrained_kernels.__name__ + ".loading.scales"
-    ).decode_group_scale
-
-    @triton.jit
-    def run(Scale, Out, BLOCK: tl.constexpr):
-        i = tl.arange(0, BLOCK)
-        tl.store(Out + i, decode(tl.load(Scale + i)))
-
-    # Include exponent zero (an FP32 subnormal), the normal range endpoints,
-    # the multiplicative identity, and the reserved NaN byte.
-    values = torch.tensor(
-        [0, 1, 126, 127, 128, 253, 254, 255], device="cuda", dtype=torch.uint8
-    )
-    actual = torch.empty(values.numel(), device="cuda", dtype=torch.float32)
-    run[(1,)](values, actual, values.numel())
-    expected = torch.tensor(
-        [2.0**-127, 2.0**-126, 0.5, 1.0, 2.0, 2.0**126, 2.0**127, float("nan")],
-        device="cuda",
-    )
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
-    native_dtype = getattr(torch, "float8_e8m0fnu", None)
-    if native_dtype is not None:
-        native = values.view(native_dtype).float()
-        torch.testing.assert_close(actual, native, rtol=0, atol=0, equal_nan=True)
+    torch.testing.assert_close(out, reference.float(), rtol=0, atol=0, equal_nan=True)
