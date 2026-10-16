@@ -55,9 +55,6 @@ from triton.runtime.autotuner import (
 
 logger = logging.getLogger(__name__)
 
-# Retune crowns produced before the ordinal/interior anchor policy.
-_TUNING_POLICY = "ordinal-interior-anchors"
-
 # Env-gated host-execution counter (FINEGRAINED_AUTOTUNE_CALLCOUNT=<path>): every
 # BayesianAutotuner.run() call increments its kernel's tally, dumped to <path> at exit.
 # Discriminates cudagraph REPLAY (host code runs only at capture) from per-token
@@ -642,8 +639,12 @@ class BayesianAutotuner(Autotuner):
             pass
 
     def _basin_anchor_indices(self, configs: List[Config]) -> List[int]:
-        """Interior representatives of categorical basins, plus a wide output tile
-        per declared compute path. All anchors come from the pruned grid."""
+        """One representative config index per (COMPUTE_MODE, SWAP_AB) basin — the MEDIAN in
+        tile-sort order, a mid-sized tile with mid warps/stages. Not the smallest: a basin's
+        minimal corner (min BK x 2 warps) can be latency-bound pathological (a 131µs anchor in
+        a basin whose peak is 41µs re-poisons the axis it was meant to protect). Coordinate
+        descent climbs BN/BK/warps/stages from wherever the TPE lands within the basin.
+        Returns [] when the grid has no such axes (single basin)."""
         # Basin axes are DERIVED, not declared: a config kwarg with string or boolean
         # values is a branch axis (different code path — compute mode, operand swap,
         # warp specialization), which partitions the grid into disjoint performance
@@ -669,40 +670,41 @@ class BayesianAutotuner(Autotuner):
         if len(groups) <= 1:
             return []
 
+        def tile_order(i):
+            return (
+                configs[i].kwargs.get("BLOCK_SIZE_N", 0),
+                configs[i].kwargs.get("BLOCK_SIZE_K", 0),
+                configs[i].num_warps,
+                configs[i].num_stages,
+            )
+
+        # Median anchor per basin, PLUS one max-tile anchor per declared PATH-axis combo
+        # (``path_anchor_axes``). The median alone left the big-tile end unsampled: TPE
+        # densities lock onto the first-timed mid-tile region and coordinate descent cannot
+        # cross DIAGONAL ridges — dsv4 mxfp8 prefill gate_up's BN=128/BK=256 winner (840us)
+        # needs BN and warps to move together, so descent from the BN=64 crown rejects the
+        # lone BN step and n_trials 100/200/400 all missed it; one guaranteed big-tile
+        # sample fixed it (crown 958 -> 880 at the default budget). The max anchor rides
+        # the declared COARSE grouping, NOT the full branch-axis cross: per-basin max
+        # anchors on the weight-only grouped grid (32 basins: modes x WS x PS x 2 memory
+        # modes each way) put 64 forced trials into a 100-trial budget and starved the
+        # search — gpt-oss prefill regressed 3463 -> 4099us on a quiet box before this was
+        # scoped. Which axes qualify is the KERNEL's declaration (configuration knowledge);
+        # axes absent from this grid are ignored.
         anchors = []
         coarse_seen = set()
         coarse_axes = [k for k in self.path_anchor_axes if k in basin_axes]
         for basin, idxs in groups.items():
-            # Choose the middle of every ordinal axis together. Lexicographic sorting
-            # ignores M and can put the "median" at extreme K/warps/stages.
-            values = [configs[i].all_kwargs() for i in idxs]
-            axes = {
-                k: sorted({v[k] for v in values})
-                for k, value in values[0].items()
-                if isinstance(value, (int, float)) and not isinstance(value, bool)
-            }
-
-            def distance(i):
-                args = configs[i].all_kwargs()
-                return sum(
-                    (options.index(args[k]) / max(1, len(options) - 1) - 0.5) ** 2
-                    for k, options in axes.items()
-                )
-
-            anchors.append(min(idxs, key=distance))
+            ordered = sorted(idxs, key=tile_order)
+            anchors.append(ordered[len(ordered) // 2])
             if not self.path_anchor_axes:
-                continue
+                continue  # no declaration -> median anchors only
+            # declared axes absent from THIS grid still coarse-group to () — one global
+            # max-tile anchor, the big-tile guarantee without per-basin anchor spam
             coarse = tuple(basin[basin_axes.index(k)] for k in coarse_axes)
-            if coarse not in coarse_seen:
+            if coarse not in coarse_seen and ordered[-1] != anchors[-1]:
                 coarse_seen.add(coarse)
-                # The existing wide-tile anchor protects coupled output-tile ridges,
-                # with interior contraction/warps/stages rather than their largest corner.
-                wide = min(idxs, key=lambda i: (
-                    -configs[i].kwargs.get("BLOCK_SIZE_M", 1)
-                    * configs[i].kwargs.get("BLOCK_SIZE_N", 1), distance(i),
-                ))
-                if wide != anchors[-1]:
-                    anchors.append(wide)
+                anchors.append(ordered[-1])
         return anchors
 
     def _warm_start_index(self, configs: List[Config], key=None):
@@ -745,7 +747,6 @@ class BayesianAutotuner(Autotuner):
             fn = fn.fn
         env_vars = get_cache_invalidating_env_vars()
         cache_key = [
-            _TUNING_POLICY,
             triton_key(),
             make_backend(driver.active.get_current_target()).hash(),
             fn.cache_key,

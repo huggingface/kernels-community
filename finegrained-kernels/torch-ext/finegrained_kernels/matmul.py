@@ -1340,13 +1340,16 @@ def w8a8_tensor_dynamic_fp8_matmul(
     # the tensor's rows takes the TMA's zero-fill path, which costs the decode GEMV ~4us with cold
     # weights (B200, N=16384 K=5120, M=1). A pre-quantized A whose storage lacks the padded rows
     # (``fp8_act_quant_tensor_wide(row_multiple=...)`` provides them) is copied into a padded
-    # buffer, cheaper than that path. Rows past M are never stored.
+    # buffer, cheaper than that path. An unaligned view also needs a copy for TMA's 16-byte base
+    # alignment. Rows past M are never stored.
     qA, As, as_stride_m, _ = tensor_wide_act_operands(
         A.reshape(M, K), None if As is None else As.reshape(-1),
         row_multiple=TENSOR_MATMUL_A_ROW_MULTIPLE,
     )
     a_rows = triton.cdiv(M, TENSOR_MATMUL_A_ROW_MULTIPLE) * TENSOR_MATMUL_A_ROW_MULTIPLE
-    if qA.untyped_storage().nbytes() < (qA.storage_offset() + a_rows * K) * qA.element_size():
+    if (qA.storage_offset() * qA.element_size()) % 16 or (
+        qA.untyped_storage().nbytes() < (qA.storage_offset() + a_rows * K) * qA.element_size()
+    ):
         qA = torch.empty(a_rows, K, device=qA.device, dtype=qA.dtype)[:M].copy_(qA)
     Bs = Bs.reshape(-1, 1)
 
@@ -1910,12 +1913,16 @@ def _torch_scaled_mm_2d_tensor_wise(A, B, As, Bs, activation_format, out_dtype):
         return _smm_reject("non-fp32 scale")
     if K % 16 or B.shape[0] % 16:
         return _smm_reject("shape")
+    if B.stride(-1) != 1 or (B.storage_offset() * B.element_size()) % 16:
+        return _smm_reject("weight-layout")
     if rowwise:
         Aq, As, _, _ = tensor_wide_act_operands(A.reshape(M, K), As)
     else:
         As = As.reshape(-1).float()
         Aq = A.reshape(M, K) if A.dtype == FP8_DTYPE else quantize_rows_static(A.reshape(M, K), As)
-    out = _scaled_mm_2d(Aq, As, B, Bs, None, None, "fp8")
+    if (Aq.storage_offset() * Aq.element_size()) % 16:
+        return _smm_reject("activation-alignment")
+    out = _scaled_mm_2d(Aq, As.contiguous(), B, Bs.contiguous(), None, None, "fp8")
     return out.reshape(*A.shape[:-1], B.shape[0])
 
 

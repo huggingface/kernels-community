@@ -29,7 +29,7 @@ from utils import TEST_DEVICE, make_weights
 
 import finegrained_kernels  # type: ignore
 import finegrained_kernels.matmul  # type: ignore
-from finegrained_kernels.bayesian_autotuner import BayesianAutotuner, bayesian_autotune  # type: ignore
+from finegrained_kernels.bayesian_autotuner import bayesian_autotune  # type: ignore
 from finegrained_kernels.compat import is_sm10x  # type: ignore
 from finegrained_kernels.pruners import block_within_dim_pruner, mx_config_pruner  # type: ignore
 
@@ -343,26 +343,3 @@ def test_compile_failures_are_memoized_across_keys(caplog):
     assert len(msgs) == 2, msgs
     assert "[memoized]" not in msgs[0] or "[memoized]" in msgs[1]
     assert "[memoized]" in msgs[1], msgs[1]
-
-
-@pytest.mark.kernels_ci
-def test_basin_anchors_cover_interior_and_wide_output_tiles():
-    tuner = object.__new__(BayesianAutotuner)
-    tuner.path_anchor_axes = ("SWAP_AB",)
-    configs = [
-        triton.Config(
-            {"BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk, "SWAP_AB": swap},
-            num_warps=warps, num_stages=stages,
-        )
-        for swap in (False, True)
-        for bm in (16, 64, 128) for bn in (64, 128, 256) for bk in (64, 128, 256)
-        for warps in (4, 8, 16) for stages in (2, 4, 6)
-    ]
-    anchors = [configs[i] for i in tuner._basin_anchor_indices(configs)]
-    assert len(anchors) == 4
-    for c in anchors:
-        assert c.kwargs["BLOCK_SIZE_K"] == 128
-        assert c.num_warps == 8 and c.num_stages == 4
-    assert [(c.kwargs["BLOCK_SIZE_M"], c.kwargs["BLOCK_SIZE_N"]) for c in anchors] == [
-        (64, 128), (128, 256), (64, 128), (128, 256),
-    ]

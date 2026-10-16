@@ -1191,7 +1191,11 @@ def descriptor_box_pruner(k_dim="BLOCK_SIZE_K"):
             b = args.get("B")
             if b is not None and getattr(b, "ndim", 0) == 2 and b.stride(-1) != 1:
                 return False
+            if "BDescriptor" in args and args["BDescriptor"] is None:
+                return False
         if c.kwargs.get("A_MEMORY_MODE", "pointer") != "pointer":
+            if "ADescriptor" in args and args["ADescriptor"] is None:
+                return False
             # descriptor A, both arms tuner-routed per the tokens-per-expert key:
             # contiguous boxes (no gather) win at dense routing (-7.1/-7.4%) and lose at
             # skew; tma gather4 (gathered rows, 1-row box, sm_100 only) is MONOTONIC in

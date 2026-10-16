@@ -255,7 +255,8 @@ def scenarios() -> list[Problem]:
         Problem(weights="fp8_rowwise", gate=True, S=8),
         Problem(weights="fp8_rowwise", prequant=True),
         Problem(weights="fp8_rowwise", S=4096, E=8, prequant=True, noncontiguous=True),
-        Problem(weights="fp8_rowwise", static=True),
+        Problem(weights="fp8_rowwise", static=True, S=17),
+        Problem(weights="fp8_rowwise", S=257, bias=True, empty_expert=True, compile=True),
         Problem(weights="fp8_rowwise", bias=True),
         Problem(weights="fp8_rowwise", compile=True),
         Problem(weights="fp8_rowwise", S=2048, E=16, N=512, K=1024),
@@ -747,7 +748,7 @@ _SWEEP_CELLS = [
     (Problem(weights="fp8_tensor", static=True), "grouped", w8a8_tensor_dynamic_fp8_matmul_grouped_kernel),
     # row-wise weights: the per-row scale vector each arm folds on its own weight-row axis — the
     # stacked gate|up span, the swapped decode tile, and the 2D kernel's tile
-    (Problem(weights="fp8_rowwise", gate=True, S=512), "grouped", w8a8_tensor_dynamic_fp8_matmul_grouped_kernel),
+    (Problem(weights="fp8_rowwise", gate=True, S=257, bias=True, empty_expert=True), "grouped", w8a8_tensor_dynamic_fp8_matmul_grouped_kernel),
     (Problem(weights="fp8_rowwise", gate=True, S=8), "batched", w8a8_tensor_dynamic_fp8_matmul_batched_kernel),
     (Problem(weights="fp8_rowwise", gate=True, S=256), "matmul", w8a8_tensor_dynamic_fp8_matmul_kernel),
 ]
@@ -819,136 +820,40 @@ def test_every_admitted_config_is_correct(problem: Problem, op, tuner):
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE != "cuda", reason="torch._scaled_mm row-wise is CUDA-only")
-@pytest.mark.parametrize("M", [1, 16, 512])
-def test_rowwise_matmul_2d_matches_scaled_mm(M, monkeypatch):
-    """Row-wise FP8 ``matmul_2d`` against cuBLAS ``torch._scaled_mm`` row-wise on the identical
-    E4M3 operands: the Triton kernel folds the per-token activation scale and the per-row weight
-    scale the same way, so only the accumulation order differs. Check both the default dispatch
-    (cuBLAS in its measured M window) and a forced Triton launch."""
+@pytest.mark.parametrize("M,layout,compiled", [
+    (1, "contiguous", False),
+    (16, "contiguous", False),
+    (512, "contiguous", False),
+    (128, "offset", False),
+    (128, "offset", True),
+    (128, "offset_weight", False),
+    (128, "transposed", False),
+    (128, "strided_scales", False),
+])
+def test_rowwise_matmul_2d_matches_scaled_mm(M, layout, compiled, monkeypatch):
+    """Default dispatch and Triton match cuBLAS on the same quantized values, including
+    views the fast path must normalize or pass to the stride-aware Triton kernel."""
     torch.manual_seed(0)
     N, K = 512, 1024
     B, Bs = make_weights(N, K, TEST_DEVICE, [1, K])
     A = torch.randn(M, K, device=TEST_DEVICE, dtype=torch.bfloat16)
     Aq, As = fp8_act_quant_tensor_wide(A, K)
-
     ref = torch._scaled_mm(Aq, B.t(), scale_a=As.reshape(M, 1), scale_b=Bs.reshape(1, N), out_dtype=torch.bfloat16)
-    routed = finegrained_kernels.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
+    if layout == "offset":
+        Aq = torch.empty(Aq.numel() + 1, device=A.device, dtype=Aq.dtype)[1:].view_as(Aq).copy_(Aq)
+    elif layout == "offset_weight":
+        B = torch.empty(B.numel() + 1, device=B.device, dtype=B.dtype)[1:].view_as(B).copy_(B)
+    elif layout == "transposed":
+        B = B.t().contiguous().t()
+    elif layout == "strided_scales":
+        As = _make_noncontig(As.flatten()).view_as(As)
+        Bs = _make_noncontig(Bs.flatten()).view_as(Bs)
+    fn = maybe_compile(finegrained_kernels.matmul_2d, compiled)
     atol, rtol = DTYPE_TO_TOL[torch.bfloat16]
-    torch.testing.assert_close(routed.float(), ref.float(), atol=atol, rtol=rtol)
-    monkeypatch.setenv("FINEGRAINED_DISABLE_SCALED_MM", "1")
-    out = finegrained_kernels.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
-    prequant = finegrained_kernels.matmul_2d(Aq, B, As, Bs, output_dtype=torch.bfloat16)
-    torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
-    torch.testing.assert_close(prequant.float(), ref.float(), atol=atol, rtol=rtol)
-
-
-@pytest.mark.parametrize("activation", ["raw", "prequant", "static"])
-@pytest.mark.parametrize(
-    "compiled", [pytest.param(False, marks=pytest.mark.kernels_ci), True]
-)
-def test_rowwise_compact_tail_activations(monkeypatch, activation, compiled):
-    """A nonzero storage offset and unpadded tail must work eagerly and in a full graph."""
-    monkeypatch.setenv("FINEGRAINED_DISABLE_SCALED_MM", "1")
-    torch.manual_seed(0)
-    M, N, K = 17, 128, 256
-    A = torch.randn(1, M, K, device=TEST_DEVICE, dtype=torch.bfloat16)
-    W = torch.randn(N, K, device=TEST_DEVICE, dtype=torch.float32)
-    Bs = W.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 448
-    B = (W / Bs).to(torch.float8_e4m3fn)
-    As = (
-        torch.full((), 0.02, device=TEST_DEVICE, dtype=torch.float32)
-        if activation == "static"
-        else None
-    )
-    scales = (
-        A.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 448
-        if As is None
-        else As
-    )
-    Aq = (A.float() / scales).clamp(-448, 448).to(torch.float8_e4m3fn)
-    ref = (Aq.float() * scales) @ (B.float() * Bs).t()
-    if activation == "prequant":
-        # A compact view with an offset cannot expose padding beyond its final row.
-        storage = torch.empty(M + 1, K, device=TEST_DEVICE, dtype=Aq.dtype)
-        A = storage[1:].copy_(Aq.reshape(M, K)).reshape(1, M, K)
-        As = scales
-
-    def run(x, scale):
-        return finegrained_kernels.matmul_2d(x, B, scale, Bs, output_dtype=torch.bfloat16)
-
-    if compiled:
-        run = torch.compile(run, fullgraph=True, dynamic=False)
-    out = run(A, As)
-    torch.testing.assert_close(
-        out.float(),
-        ref,
-        atol=DTYPE_TO_TOL[torch.bfloat16][0],
-        rtol=DTYPE_TO_TOL[torch.bfloat16][1],
-    )
-
-
-@pytest.mark.kernels_ci
-@pytest.mark.parametrize("gathered", [False, True])
-@pytest.mark.parametrize("compiled", [False, True])
-def test_rowwise_grouped_memory_modes_preserve_irregular_routes(
-    monkeypatch, gathered, compiled
-):
-    """Pointer/gather and packed TMA paths retain tail masks and expert routing."""
-    if TEST_DEVICE != "cuda" or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("B200 tuning candidates")
-    tuner = w8a8_tensor_dynamic_fp8_matmul_grouped_kernel
-    actual_config = next(
-        c for c in tuner.configs
-        if c.kwargs["BLOCK_SIZE_M"] == (16 if gathered else 128)
-        and c.kwargs["BLOCK_SIZE_N"] == 128
-        and c.kwargs["BLOCK_SIZE_K"] == (256 if gathered else 128)
-        and c.kwargs["WARP_SPEC"] == (not gathered)
-        and c.kwargs["PACKED_SCHEDULE"] == (not gathered)
-        and c.kwargs["A_MEMORY_MODE"] == ("pointer" if gathered else "host_descriptor")
-        and c.kwargs["B_MEMORY_MODE"] == "host_descriptor"
-        and c.num_warps == 4 and c.num_stages == (5 if gathered else 6)
-    )
-    monkeypatch.setattr(tuner, "configs", [actual_config])
-    tuner.cache.clear()
-    torch.manual_seed(73)
-    e, s, n, k = 4, 257, 256, 256
-    source_rows = 17 if gathered else s
-    a = torch.randn(source_rows, k, device=TEST_DEVICE, dtype=torch.bfloat16) * 0.1
-    b = (torch.randn(e, n, k, device=TEST_DEVICE) * 0.1).to(torch.float8_e4m3fn)
-    bs = torch.rand(e, n, 1, device=TEST_DEVICE) * 0.3 + 0.1
-    bias = torch.randn(e, n, device=TEST_DEVICE) * 0.01
-    starts = torch.tensor([0, 1, 130, 130, s], device=TEST_DEVICE, dtype=torch.int32)
-    source = torch.arange(s, device=TEST_DEVICE).remainder(source_rows).to(torch.int32)
-    scatter = torch.randperm(s, device=TEST_DEVICE).to(torch.int32)
-    experts = torch.tensor([0] + [1] * 129 + [3] * 127, device=TEST_DEVICE)
-    scales = a.float().abs().amax(-1, keepdim=True).clamp_min(1e-12) / 448
-    aq = (a.float() / scales).to(torch.float8_e4m3fn)
-    a_reference = aq.float() * scales
-    weights = b.float() * bs
-    expected = torch.empty(s, n, device=TEST_DEVICE)
-    values = (
-        torch.bmm(
-            a_reference[source.long()].unsqueeze(1), weights[experts].transpose(1, 2)
-        ).squeeze(1)
-        + bias[experts]
-    )
-    expected[scatter.long()] = values
-
-    def forward(x):
-        return finegrained_kernels.matmul_grouped(
-            x,
-            b,
-            None,
-            bs,
-            expert_start=starts,
-            gather_idx=source if gathered else None,
-            scatter_idx=scatter,
-            bias=bias,
-            output_dtype=torch.float32,
-        )
-
-    if compiled:
-        forward = torch.compile(forward, fullgraph=True, mode="reduce-overhead")
-    with torch.no_grad():
-        result = forward(a)
-    torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+    for disabled in ("", "1"):
+        monkeypatch.setenv("FINEGRAINED_DISABLE_SCALED_MM", disabled)
+        out = fn(Aq, B, As, Bs, output_dtype=torch.bfloat16)
+        torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
+        if layout == "contiguous":
+            out = fn(A, B, None, Bs, output_dtype=torch.bfloat16)
+            torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
