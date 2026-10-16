@@ -108,23 +108,28 @@ class WeatherNext2GridToMesh(nn.Module):
     can_torch_compile = True
 
     def forward(self, grid_states, mesh_states, edge_features, senders, receivers, conditioning):
-        if not _can_tile(self, grid_states) or self.chunk_size is None:
+        if not _can_tile(self, grid_states) or self.config.chunk_size is None:
             return type(self).forward(self, grid_states, mesh_states, edge_features, senders, receivers, conditioning)
-        projected_senders = self.edge_update.project_senders(grid_states)
+        projected_senders = None
         aggregated = torch.zeros(mesh_states.shape, dtype=torch.float32, device=mesh_states.device)
-        for start in range(0, senders.numel(), self.chunk_size):
-            edges = slice(start, start + self.chunk_size)
-            messages = self.edge_update(
-                self.edge_encoder(edge_features[:, edges], conditioning),
-                projected_senders,
+        for start in range(0, senders.numel(), self.config.chunk_size):
+            edges = slice(start, start + self.config.chunk_size)
+            features = edge_features[edges].unsqueeze(0).expand(grid_states.shape[0], -1, -1)
+            features = features.to(self.edge_encoder.fc1.weight.dtype)
+            messages, projected_senders = self.edge_update(
+                self.edge_encoder(features, conditioning),
+                grid_states,
                 senders[edges],
                 conditioning,
+                projected_senders=projected_senders,
             )
             aggregated.index_add_(1, receivers[edges], messages.float())
         del projected_senders
         if self.aggregate_normalization is not None:
             aggregated = aggregated / self.aggregate_normalization
-        mesh_states = mesh_states + self.mesh_node_update(self.with_aggregate(mesh_states, aggregated), conditioning)
+        mesh_states = mesh_states + self.mesh_node_update(
+            torch.cat([mesh_states, aggregated.to(mesh_states.dtype)], dim=-1), conditioning
+        )
         grid_states.add_(self.grid_node_update(grid_states, conditioning))
         return grid_states, mesh_states
 
@@ -133,27 +138,30 @@ class WeatherNext2MeshToGrid(nn.Module):
     can_torch_compile = True
 
     def forward(self, grid_states, mesh_states, edge_features, senders, receivers, conditioning):
-        if not _can_tile(self, grid_states) or self.chunk_size is None:
+        if not _can_tile(self, grid_states) or self.config.chunk_size is None:
             return type(self).forward(self, grid_states, mesh_states, edge_features, senders, receivers, conditioning)
         points = grid_states.shape[1]
         if senders.numel() != 3 * points:
             raise ValueError("The mesh-to-grid graph needs exactly three edges per grid point.")
-        projected_senders = self.edge_update.project_senders(mesh_states)
-        for start in range(0, points, self.chunk_size):
-            block = grid_states[:, start : start + self.chunk_size]
+        projected_senders = None
+        for start in range(0, points, self.config.chunk_size):
+            block = grid_states[:, start : start + self.config.chunk_size]
             edges = slice(3 * start, 3 * (start + block.shape[1]))
             local_receivers = receivers[edges] - start
-            messages = self.edge_update(
-                self.edge_encoder(edge_features[:, edges], conditioning),
-                projected_senders,
+            features = edge_features[edges].unsqueeze(0).expand(grid_states.shape[0], -1, -1)
+            features = features.to(self.edge_encoder.fc1.weight.dtype)
+            messages, projected_senders = self.edge_update(
+                self.edge_encoder(features, conditioning),
+                mesh_states,
                 block,
                 senders[edges],
                 local_receivers,
                 conditioning,
+                projected_senders=projected_senders,
             )
             aggregated = torch.zeros(block.shape, dtype=torch.float32, device=block.device)
             aggregated.index_add_(1, local_receivers, messages.float())
-            block.add_(self.grid_node_update(self.with_aggregate(block, aggregated), conditioning))
+            block.add_(self.grid_node_update(torch.cat([block, aggregated.to(block.dtype)], dim=-1), conditioning))
         mesh_states = mesh_states + self.mesh_node_update(mesh_states, conditioning)
         return grid_states, mesh_states
 

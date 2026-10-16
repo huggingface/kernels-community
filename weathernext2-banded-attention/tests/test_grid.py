@@ -45,10 +45,9 @@ class _EdgeUpdate(nn.Module):
         self.out_proj = nn.Linear(16, 16)
         self.norm = _ConditionedNorm(16)
 
-    def project_senders(self, states):
-        return self.sender_proj(states)
-
-    def forward(self, edges, projected_senders, *args):
+    def forward(self, edges, sender_states, *args, projected_senders=None):
+        if projected_senders is None:
+            projected_senders = self.sender_proj(sender_states)
         if self.receiver_proj is None:
             senders, conditioning = args
             messages = self.edge_proj(edges) + projected_senders[:, senders]
@@ -56,38 +55,35 @@ class _EdgeUpdate(nn.Module):
             states, senders, receivers, conditioning = args
             messages = self.edge_proj(edges) + projected_senders[:, senders]
             messages = messages + self.receiver_proj(states)[:, receivers]
-        return self.norm(self.out_proj(torch.nn.functional.gelu(messages)), conditioning)
+        return self.norm(self.out_proj(torch.nn.functional.gelu(messages)), conditioning), projected_senders
 
 
 class _Graph(nn.Module):
     def __init__(self, grid_to_mesh):
         super().__init__()
         self.grid_to_mesh = grid_to_mesh
-        self.chunk_size = 7
+        self.config = SimpleNamespace(chunk_size=7)
         self.aggregate_normalization = 3 if grid_to_mesh else None
         self.edge_encoder = _Mlp(4, 8)
         self.edge_update = _EdgeUpdate(grid_to_mesh)
         self.grid_node_update = _Mlp(16 if grid_to_mesh else 32, 16)
         self.mesh_node_update = _Mlp(32 if grid_to_mesh else 16, 16)
 
-    def with_aggregate(self, states, aggregated):
-        return torch.cat((states, aggregated.to(states.dtype)), dim=-1)
-
     def forward(self, grid, mesh, edges, senders, receivers, conditioning):
         source, target = (grid, mesh) if self.grid_to_mesh else (mesh, grid)
+        edges = edges.unsqueeze(0).expand(grid.shape[0], -1, -1).to(self.edge_encoder.fc1.weight.dtype)
         encoded = self.edge_encoder(edges, conditioning)
-        projected = self.edge_update.project_senders(source)
         args = (senders, conditioning) if self.grid_to_mesh else (target, senders, receivers, conditioning)
-        messages = self.edge_update(encoded, projected, *args)
+        messages, _ = self.edge_update(encoded, source, *args)
         aggregated = torch.zeros(target.shape, dtype=torch.float32, device=target.device)
         aggregated.index_add_(1, receivers, messages.float())
         if self.aggregate_normalization is not None:
             aggregated = aggregated / self.aggregate_normalization
         if self.grid_to_mesh:
-            mesh = mesh + self.mesh_node_update(self.with_aggregate(mesh, aggregated), conditioning)
+            mesh = mesh + self.mesh_node_update(torch.cat([mesh, aggregated.to(mesh.dtype)], dim=-1), conditioning)
             grid = grid + self.grid_node_update(grid, conditioning)
         else:
-            grid = grid + self.grid_node_update(self.with_aggregate(grid, aggregated), conditioning)
+            grid = grid + self.grid_node_update(torch.cat([grid, aggregated.to(grid.dtype)], dim=-1), conditioning)
             mesh = mesh + self.mesh_node_update(mesh, conditioning)
         return grid, mesh
 
@@ -123,7 +119,7 @@ def _grid_case(layer_name, dtype=torch.float32):
         layer = _Graph(grid_to_mesh)
         replacement = kernel.WeatherNext2GridToMesh if grid_to_mesh else kernel.WeatherNext2MeshToGrid
         mesh = torch.randn(2, 11, 16, device=DEVICE, dtype=dtype)
-        edges = torch.randn(2, 57, 4, device=DEVICE, dtype=dtype)
+        edges = torch.randn(57, 4, device=DEVICE, dtype=dtype)
         senders = torch.randint(19 if grid_to_mesh else 11, (57,), device=DEVICE)
         receivers = (
             torch.randint(11, (57,), device=DEVICE).sort().values
