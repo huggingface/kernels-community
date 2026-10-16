@@ -295,9 +295,6 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     ["N", "K", "m_bit_length", "GATE"],
     n_trials=100,
     do_bench=replay_benchmark,
-    # Seed the broad prefill TMA ridge: the generic maximum anchor uses BK256/w16,
-    # which can be much slower and hides the coupled BN256/BK128 optimum from TPE.
-    # These are measured candidates, never a dispatch override; pruning still applies.
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),

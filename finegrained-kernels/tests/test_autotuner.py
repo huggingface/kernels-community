@@ -396,3 +396,65 @@ def test_rowwise_replay_benchmark_uses_device_backend(
         matmul.w8a8_tensor_dynamic_fp8_matmul_kernel.do_bench is compat.replay_benchmark
     )
 
+
+@pytest.mark.kernels_ci
+def test_basin_anchors_cover_interior_and_wide_output_tiles():
+    from finegrained_kernels.bayesian_autotuner import BayesianAutotuner
+
+    tuner = object.__new__(BayesianAutotuner)
+    tuner.path_anchor_axes = ("SWAP_AB",)
+    configs = [
+        triton.Config(
+            {"BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk, "SWAP_AB": swap},
+            num_warps=warps, num_stages=stages,
+        )
+        for swap in (False, True)
+        for bm in (16, 64, 128) for bn in (64, 128, 256) for bk in (64, 128, 256)
+        for warps in (4, 8, 16) for stages in (2, 4, 6)
+    ]
+    anchors = [configs[i] for i in tuner._basin_anchor_indices(configs)]
+    assert len(anchors) == 4
+    for c in anchors:
+        assert c.kwargs["BLOCK_SIZE_K"] == 128
+        assert c.num_warps == 8 and c.num_stages == 4
+    assert [(c.kwargs["BLOCK_SIZE_M"], c.kwargs["BLOCK_SIZE_N"]) for c in anchors] == [
+        (64, 128), (128, 256), (64, 128), (128, 256),
+    ]
+
+
+@pytest.mark.kernels_ci
+def test_autotune_cache_tracks_search_and_benchmark_policy(monkeypatch):
+    from types import SimpleNamespace
+    import finegrained_kernels.bayesian_autotuner as module
+    import triton.compiler.compiler as compiler
+
+    tuner = object.__new__(module.BayesianAutotuner)
+    tuner.fn = SimpleNamespace(cache_key="kernel", __name__="kernel")
+    tuner.keys, tuner.n_trials, tuner.n_startup_trials, tuner.gamma = ["N"], 100, 12, 0.25
+    tuner._benchmark_name = "finegrained_kernels.compat.replay_benchmark"
+    monkeypatch.setattr(module, "JITFunction", SimpleNamespace)
+    monkeypatch.setattr(module, "triton_key", lambda: "triton")
+    monkeypatch.setattr(module, "get_cache_invalidating_env_vars", lambda: {})
+    monkeypatch.setattr(module, "driver", SimpleNamespace(active=SimpleNamespace(get_current_target=lambda: None)))
+    monkeypatch.setattr(compiler, "make_backend", lambda target: SimpleNamespace(hash=lambda: "backend"))
+    keys = []
+
+    def capture(key):
+        keys.append(key)
+        raise StopIteration
+
+    monkeypatch.setattr(module, "get_cache_manager", capture)
+
+    def cache_key():
+        with pytest.raises(StopIteration):
+            tuner.check_disk_cache((128,), [triton.Config({"BLOCK": 64})], lambda: None)
+        return keys[-1]
+
+    first = cache_key()
+    assert cache_key() == first
+    policy = module._TUNING_POLICY
+    monkeypatch.setattr(module, "_TUNING_POLICY", "previous-policy")
+    assert cache_key() != first
+    monkeypatch.setattr(module, "_TUNING_POLICY", policy)
+    tuner._benchmark_name = "other.benchmark"
+    assert cache_key() != first
