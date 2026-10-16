@@ -251,6 +251,7 @@ def scenarios() -> list[Problem]:
         Problem(weights="fp8_rowwise", S=8),
         Problem(weights="fp8_rowwise", gate=True, S=8),
         Problem(weights="fp8_rowwise", prequant=True),
+        Problem(weights="fp8_rowwise", S=4096, E=8, prequant=True, noncontiguous=True),
         Problem(weights="fp8_rowwise", static=True),
         Problem(weights="fp8_rowwise", bias=True),
         Problem(weights="fp8_rowwise", compile=True),
@@ -701,6 +702,8 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
         As_global = _act_global(problem, A, expert_ids)
         if problem.prequant:
             A, As = _prequant_args(problem, op, A, expert_ids)
+            if problem.noncontiguous and As is not None:
+                As = _make_noncontig(As.reshape(-1)).view(As.shape)
         g_out = _out_global(problem, op, A, expert_ids, B, Bs, Bs_global, As, As_global)
         ref = _reference(problem, op, A, expert_ids, B, Bs, Bs_global, As=As, As_global=As_global, out_global=g_out)
         if shared is not None:

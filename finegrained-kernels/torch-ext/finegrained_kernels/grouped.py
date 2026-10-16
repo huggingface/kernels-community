@@ -1682,7 +1682,9 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
         # (stride_m 1) follow their rows into the copy.
         row_scales = As.view(-1, 1) if as_stride_m else None
         A, row_scales, gather_idx = expand_gather_below_parity(A, row_scales, gather_idx, num_experts, expert_start)
-        As = row_scales.view(-1) if as_stride_m else As
+        if as_stride_m:
+            As = row_scales.view(-1)
+            as_stride_m = As.stride(0)
     C = A.new_empty(S, N, dtype=output_dtype)
     num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
