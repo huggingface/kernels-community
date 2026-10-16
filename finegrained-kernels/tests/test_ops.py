@@ -796,3 +796,90 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
         print(f"\n[sweep] {len(forgiven)} admitted config(s) failed to compile/run (forgiven):")
         for cfg, err in forgiven:
             print(f"  {cfg}: {err}")
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("op", ["batched", "grouped"])
+def test_sparse_decode_expert_offset_exceeds_int32(monkeypatch, op):
+    """Large expert strides use int64 even when IDs and cumulative starts are int32.
+
+    Only two expert planes are initialized. A 2GiB storage offset makes the
+    pre-fix wrapped address land on a legal zero region, rather than poisoning CUDA.
+    Excluded from kernels_ci because of the backing allocation.
+    """
+    import importlib
+    import kernels
+    import triton
+
+    kernel = kernels.get_kernel("kernels-community/finegrained-kernels", version=0)
+
+    if TEST_DEVICE != "cuda" or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("B200 sparse decode path")
+    e, n, k = 512, 1280, 5120
+    expert_stride = n * k
+    storage_offset = 1 << 31
+    elements = storage_offset + e * expert_stride
+    if torch.cuda.mem_get_info()[0] < elements + (512 << 20):
+        pytest.skip("requires a sparse 5.2GiB backing allocation")
+    storage = torch.empty(elements, device=TEST_DEVICE, dtype=torch.float8_e4m3fn)
+    wrapped = storage_offset + (e - 1) * expert_stride - (1 << 32)
+    storage[wrapped : wrapped + expert_stride].zero_()
+    weight = storage[storage_offset:].view(e, n, k)
+    weight[-1].fill_(1)
+    a = torch.ones(1, k, device=TEST_DEVICE, dtype=torch.bfloat16)
+    scales = torch.ones(e, 1, 1, device=TEST_DEVICE)
+    module = importlib.import_module(kernel.__name__ + ".weight_only")
+    tuner = module._decode_partial
+    monkeypatch.setattr(
+        tuner,
+        "configs",
+        [
+            triton.Config(
+                {"BLOCK_N": 32, "BLOCK_K": 256, "SPLIT_K": 1}, num_warps=4, num_stages=1
+            )
+        ],
+    )
+    tuner.cache.clear()
+    route = (
+        dict(expert_ids=torch.tensor([e - 1], device=TEST_DEVICE, dtype=torch.int32))
+        if op == "batched"
+        else dict(
+            expert_start=torch.tensor(
+                [0] * e + [1], device=TEST_DEVICE, dtype=torch.int32
+            )
+        )
+    )
+    out = getattr(kernel, "matmul_" + op)(
+        a,
+        weight,
+        None,
+        scales,
+        activation_format="bf16",
+        output_dtype=torch.float32,
+        **route,
+    )
+    torch.testing.assert_close(out, torch.full_like(out, k), rtol=0, atol=0)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("byte", [0, 127, 254, 255])
+def test_dense_weight_only_ue8m0_boundaries(byte):
+    """The small-batch fallback shares UE8M0 zero/NaN semantics with decode and MX."""
+    import kernels
+
+    kernel = kernels.get_kernel("kernels-community/finegrained-kernels", version=0)
+    a = torch.full(
+        (7, 256),
+        2.0 ** (-120 if byte == 254 else 0),
+        device=TEST_DEVICE,
+        dtype=torch.bfloat16,
+    )
+    weight = torch.ones(128, 256, device=TEST_DEVICE, dtype=torch.float8_e4m3fn)
+    scales = torch.tensor(byte, device=TEST_DEVICE, dtype=torch.uint8)
+    scale = float("nan") if byte == 255 else 2.0 ** (byte - 127)
+    reference_weight = torch.full((128, 256), scale, device=TEST_DEVICE, dtype=a.dtype)
+    reference = (a @ reference_weight.T).float()
+    out = kernel.matmul_2d(
+        a, weight, None, scales, activation_format="bf16", output_dtype=torch.float32
+    )
+    torch.testing.assert_close(out, reference, rtol=0, atol=0, equal_nan=True)

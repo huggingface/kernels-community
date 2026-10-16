@@ -26,21 +26,21 @@ from .loading.scales import decode_group_scale
 @triton.jit
 def _decode_route(row, ExpertIds, ExpertStart, GatherIdx, ScatterIdx, E: tl.constexpr):
     valid = True
-    expert = 0
+    expert = tl.full((), 0, tl.int64)
     if ExpertIds is not None:
-        expert = tl.load(ExpertIds + row)
+        expert = tl.load(ExpertIds + row).to(tl.int64)
         valid = (expert >= 0) & (expert < E)
     elif ExpertStart is not None:
         offsets = tl.arange(0, triton.next_power_of_2(E))
         starts = tl.load(ExpertStart + offsets, offsets < E, other=2147483647)
-        expert = tl.sum((row >= starts).to(tl.int32), 0) - 1
+        expert = tl.sum((row >= starts).to(tl.int32), 0).to(tl.int64) - 1
         valid = (expert >= 0) & (row < tl.load(ExpertStart + E))
-    source = row
-    destination = row
+    source = row.to(tl.int64)
+    destination = row.to(tl.int64)
     if GatherIdx is not None:
-        source = tl.load(GatherIdx + row)
+        source = tl.load(GatherIdx + row).to(tl.int64)
     if ScatterIdx is not None:
-        destination = tl.load(ScatterIdx + row)
+        destination = tl.load(ScatterIdx + row).to(tl.int64)
     return expert, source, destination, valid
 
 
@@ -74,7 +74,7 @@ def _dequantize(
     GATE_SCALES: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    expert = tl.program_id(0)
+    expert = tl.program_id(0).to(tl.int64)
     i = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     n, k = i // K, i % K
     if GATE_SCALES:

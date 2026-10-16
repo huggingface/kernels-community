@@ -28,7 +28,7 @@ from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_desc
 from .formats import block_fp8_weight_scale_grid, check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands
-from .loading.scales import apply_global_scale, mx_2d_scale_ptrs
+from .loading.scales import decode_group_scale, apply_global_scale, mx_2d_scale_ptrs
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .loading.tiles import (
     advance_ptrs,
@@ -978,9 +978,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
             + scale_n[None, :] * stride_bs_n,
             mask=(kk[:, None] < K) & (offs_bn[None, :] < rows), other=0.0,
         )
-        if Bs.dtype.element_ty == tl.uint8:
-            scale = tl.exp2(scale.to(tl.float32) - 127.)
-        w = (w * scale.to(tl.float32)).to(a.dtype)
+        w = (w * decode_group_scale(scale)).to(a.dtype)
         accumulator = tl.dot(a, w, accumulator)
     if GATE:
         out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
