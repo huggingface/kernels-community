@@ -68,3 +68,89 @@ def test_rowwise_compact_tail_activations(kernel, monkeypatch, activation, compi
         atol=DTYPE_TO_TOL[torch.bfloat16][0],
         rtol=DTYPE_TO_TOL[torch.bfloat16][1],
     )
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize(
+    "device_type,sm10x", [("cuda", True), ("cuda", False), ("xpu", False)]
+)
+def test_rowwise_replay_benchmark_uses_device_backend(
+    kernel, monkeypatch, device_type, sm10x
+):
+    """CUDA replay timing includes the whole callback; other devices keep their benchmark."""
+    import importlib
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import triton
+    import triton.testing
+
+    compat = importlib.import_module(kernel.__name__ + ".compat")
+    matmul = importlib.import_module(kernel.__name__ + ".matmul")
+    called = []
+
+    def callback():
+        called.append("callback")
+
+    quantiles = (0.5, 0.2, 0.8)
+
+    def bench(fn, **kwargs):
+        assert fn is callback
+        assert kwargs["quantiles"] == quantiles
+        assert kwargs.get("rep") == (60 if device_type == "cuda" and sm10x else None)
+        fn()
+        return [1.0, 0.9, 1.1]
+
+    monkeypatch.setattr(compat, "get_active_device_type", lambda: device_type)
+    monkeypatch.setattr(compat, "is_sm10x", lambda: sm10x)
+    monkeypatch.setattr(triton.testing, "do_bench_cudagraph", bench)
+    monkeypatch.setattr(triton.testing, "do_bench", bench)
+    monkeypatch.setattr(
+        torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=callback)
+    )
+    monkeypatch.setattr(torch.cuda, "graph", lambda graph: nullcontext())
+    monkeypatch.setattr(
+        triton.runtime,
+        "driver",
+        SimpleNamespace(active=SimpleNamespace(get_benchmarker=lambda: bench)),
+    )
+    expected = [2.0, 1.8, 2.2] if device_type == "cuda" and sm10x else [1.0, 0.9, 1.1]
+    assert compat.replay_benchmark(callback, quantiles) == expected
+    assert called == ["callback"] * (3 if device_type == "cuda" and sm10x else 1)
+    assert (
+        matmul.w8a8_tensor_dynamic_fp8_matmul_kernel.do_bench is compat.replay_benchmark
+    )
+
+
+@pytest.mark.kernels_ci
+def test_tuning_seeds_are_measured_without_bypassing_pruning(kernel, monkeypatch):
+    """A coupled optimum is considered at startup; an absent seed cannot reenter the grid."""
+    import importlib
+
+    import triton
+
+    module = importlib.import_module(kernel.__name__ + ".bayesian_autotuner")
+    tuner = object.__new__(module.BayesianAutotuner)
+    configs = [triton.Config({"TILE": i}) for i in range(20)]
+    removed = triton.Config({"TILE": 100})
+    tuner.seed_configs = (removed, configs[19])
+    tuner.n_trials = 2
+    tuner.n_startup_trials = 2
+    tuner.refine = False
+    tuner.max_failures = 2
+    tuner.gamma = 0.25
+    tuner.log_path = None
+    tuner.path_anchor_axes = ()
+    tuner.cache = {}
+    measured = []
+
+    def bench(*args, config, **kwargs):
+        measured.append(config)
+        return 1.0 if config is configs[19] else 10.0
+
+    monkeypatch.setattr(tuner, "_bench", bench)
+    best = tuner._bayesian_search(configs, (), {}, ())
+    assert best is configs[19]
+    assert measured[0] is configs[19]
+    assert removed not in measured
+    assert len(set(measured)) == 2

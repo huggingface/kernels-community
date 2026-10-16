@@ -73,3 +73,41 @@ committed (the top-level README embeds it), so refresh it in the same commit as 
 that moves the numbers; the CSV is git-ignored (`bench/*.csv` in the repo's `.gitignore`) and regenerated per machine. Requires the bench env: `transformers`
 (with the `integrations.{deepgemm,moe,sonicmoe,mxfp4}` helpers), `kernels`, DeepGEMM, and a
 Blackwell (sm_100) GPU. **Don't run under concurrent GPU load** — the latencies won't be trustworthy.
+
+## Dense rowwise FP8 measurements
+
+`bench_fp8_linear.py` measures linears through the public kernel loader. Select a
+local build with `LOCAL_KERNELS` to compare revisions. Use full performance tuning;
+the benchmark rejects a budget below 100 trials.
+
+```bash
+FINEGRAINED_AUTOTUNE_TRIALS=100 python bench/bench_fp8_linear.py \
+  --family rowwise \
+  --shapes '1,16384,5120;16,16384,5120;256,16384,5120;4096,16384,5120;1,5120,8192;16,5120,8192;256,5120,8192;4096,5120,8192' \
+  --output rowwise.jsonl
+```
+
+The JSONL reports medians of five warm CUDA graph measurements and three cold
+measurements. Cold timings flush L2 between single-operation graph replays,
+excluding Python and TMA descriptor construction. A small repeated weight matrix
+can remain in B200 L2; these measurements are microbenchmarks, not whole-model
+throughput. Activation quantization is included in both the public entrypoint and
+the cuBLAS FP8 comparison. GEMM-only and quantization-only costs are also recorded.
+
+B200 results (Torch 2.14.1+cu130, Triton 3.8.0; microseconds):
+
+| M | N | K | Before warm | After warm | After cold | cuBLAS FP8 including quant, warm |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 16384 | 5120 | 16.60 | 10.98 | 28.70 | 15.55 |
+| 1 | 5120 | 8192 | 13.08 | 12.54 | 24.54 | 14.95 |
+| 4096 | 16384 | 5120 | 343.11 | 320.15 | 321.79 | 337.22 |
+| 4096 | 5120 | 8192 | 167.78 | 169.86 | 174.05 | 177.08 |
+
+B200 tuning balances warm replay and cold execution; hot-only tuning regressed
+narrow decode's cold latency in an earlier candidate. Four representative TMA
+prefill candidates seed the existing full search so a slow maximum-tile anchor
+cannot hide the BN256/BK128 ridge. Seeds count toward the search budget and are
+ignored when absent from the pruned grid. They never override measured dispatch.
+Other devices retain the native benchmark and do not receive these B200 seeds.
+The existing cuBLAS dispatch for medium row counts is unchanged. Narrow prefill
+is approximately neutral; the table does not claim improvements at every shape.
