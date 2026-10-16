@@ -32,14 +32,6 @@ def e2m1_as_uint8(weight: torch.Tensor) -> torch.Tensor:
     instead of casting in-kernel at every load. E4M3 (MXFP8) weights pass through unchanged."""
     return weight.view(torch.uint8) if weight.dtype == torch.int8 else weight
 
-# UE8M0 group-32 scales arrive either as ``float8_e8m0fnu`` or as raw ``uint8`` — the same 8
-# exponent bits, and a common on-disk encoding (e.g. group-32 "mxfp8" checkpoints store the
-# scale tensor as uint8). Both are valid MX scales: ``ue8m0_as_uint8`` reinterprets to uint8
-# and the kernels decode ``2^(exp-127)`` inline, so the detectors accept either dtype.
-UE8M0_SCALE_DTYPES = (torch.uint8,)
-if (ue8m0_dtype := getattr(torch, "float8_e8m0fnu", None)) is not None:
-    UE8M0_SCALE_DTYPES += (ue8m0_dtype,)
-
 def _shapes_match(weight: torch.Tensor, scale: torch.Tensor, group: int) -> bool:
     """Shape leg of the family predicates: matching leading dims and a last dim of
     one scale per ``group`` unpacked values. Early-return ``if``s, not an ``and``
@@ -61,7 +53,7 @@ def is_mxfp8(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     separates MXFP8 from 128-block FP8 (which may also carry UE8M0 scales)."""
     return (
         weight.dtype == torch.float8_e4m3fn
-        and scale.dtype in UE8M0_SCALE_DTYPES
+        and scale.dtype in (torch.uint8, getattr(torch, "float8_e8m0fnu", None))
         and _shapes_match(weight, scale, MX_SCALE_GROUP_K)
     )
 
@@ -71,7 +63,7 @@ def is_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     MX_SCALE_GROUP_K`` (unpacked K = ``2 * K_half``), matching leading dims. 2D or 3D."""
     return (
         weight.dtype == torch.int8
-        and scale.dtype in UE8M0_SCALE_DTYPES
+        and scale.dtype in (torch.uint8, getattr(torch, "float8_e8m0fnu", None))
         and _shapes_match(weight, scale, MX_SCALE_GROUP_K)
     )
 
@@ -255,7 +247,7 @@ def mx_scale_family(Bs: torch.Tensor, K: int) -> int:
     validated; callers that need the format read it off ``Bs.dtype`` (``== torch.float8_e4m3fn``
     is NVFP4)."""
     nvfp4 = Bs.dtype == torch.float8_e4m3fn
-    assert nvfp4 or Bs.dtype in UE8M0_SCALE_DTYPES, (
+    assert nvfp4 or Bs.dtype in (torch.uint8, getattr(torch, "float8_e8m0fnu", None)), (
         f"Bs must be UE8M0 (float8_e8m0fnu/uint8) or E4M3 (NVFP4), got {Bs.dtype}"
     )
     scale_group = K // (Bs.shape[2] * 4) if Bs.ndim == 5 else K // Bs.shape[-1]

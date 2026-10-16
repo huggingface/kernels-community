@@ -16,7 +16,6 @@ crash-config pruner guards, autotuner resilience and reporting for failing confi
 activation-quant arm equivalence, and cross-process determinism; each docstring
 carries its incident."""
 
-import importlib
 import logging
 import subprocess
 import sys
@@ -348,19 +347,21 @@ def test_compile_failures_are_memoized_across_keys(caplog):
 
 @pytest.mark.kernels_ci
 def test_uint8_mx_scales_without_native_ue8m0(monkeypatch):
-    """Import-time format detection must accept uint8 scales without native UE8M0."""
+    """MX format checks accept raw exponent bytes without a native UE8M0 dtype."""
     from finegrained_kernels import formats
-    try:
-        with monkeypatch.context() as patch:
-            patch.delattr(torch, "float8_e8m0fnu", raising=False)
-            importlib.reload(formats)
-            scale = torch.full((16, 4), 127, dtype=torch.uint8)
-            assert formats.ue8m0_as_uint8(scale) is scale
-            assert formats.is_mxfp8(
-                torch.empty((16, 128), dtype=torch.float8_e4m3fn), scale
-            )
-            assert formats.is_mxfp4(torch.empty((16, 64), dtype=torch.int8), scale)
-            fp32 = torch.ones((16, 4), dtype=torch.float32)
-            assert formats.ue8m0_as_uint8(fp32) is fp32
-    finally:
-        importlib.reload(formats)
+
+    scale = torch.full((16, 4), 127, dtype=torch.uint8)
+    if (native_dtype := getattr(torch, "float8_e8m0fnu", None)) is not None:
+        native_scale = scale.view(native_dtype)
+        assert torch.equal(formats.ue8m0_as_uint8(native_scale), scale)
+        assert formats.mx_scale_family(native_scale, 128) == 32
+
+    monkeypatch.delattr(torch, "float8_e8m0fnu", raising=False)
+    assert formats.ue8m0_as_uint8(scale) is scale
+    assert formats.is_mxfp8(
+        torch.empty((16, 128), dtype=torch.float8_e4m3fn), scale
+    )
+    assert formats.is_mxfp4(torch.empty((16, 64), dtype=torch.int8), scale)
+    assert formats.mx_scale_family(scale, 128) == 32
+    fp32 = torch.ones((16, 4), dtype=torch.float32)
+    assert formats.ue8m0_as_uint8(fp32) is fp32
