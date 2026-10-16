@@ -824,8 +824,8 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
 def test_rowwise_matmul_2d_matches_scaled_mm(M, monkeypatch):
     """Row-wise FP8 ``matmul_2d`` against cuBLAS ``torch._scaled_mm`` row-wise on the identical
     E4M3 operands: the Triton kernel folds the per-token activation scale and the per-row weight
-    scale the same way, so only the accumulation order differs, and the op's own cuBLAS route
-    (decode / mid-size M) is the reference itself."""
+    scale the same way, so only the accumulation order differs. Check both the default dispatch
+    (cuBLAS in its measured M window) and a forced Triton launch."""
     torch.manual_seed(0)
     N, K = 512, 1024
     B, Bs = make_weights(N, K, TEST_DEVICE, [1, K])
@@ -834,10 +834,10 @@ def test_rowwise_matmul_2d_matches_scaled_mm(M, monkeypatch):
 
     ref = torch._scaled_mm(Aq, B.t(), scale_a=As.reshape(M, 1), scale_b=Bs.reshape(1, N), out_dtype=torch.bfloat16)
     routed = finegrained_kernels.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
-    torch.testing.assert_close(routed, ref, atol=0, rtol=0)
+    atol, rtol = DTYPE_TO_TOL[torch.bfloat16]
+    torch.testing.assert_close(routed.float(), ref.float(), atol=atol, rtol=rtol)
     monkeypatch.setenv("FINEGRAINED_DISABLE_SCALED_MM", "1")
     out = finegrained_kernels.matmul_2d(A, B, None, Bs, output_dtype=torch.bfloat16)
     prequant = finegrained_kernels.matmul_2d(Aq, B, As, Bs, output_dtype=torch.bfloat16)
-    atol, rtol = DTYPE_TO_TOL[torch.bfloat16]
     torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
     torch.testing.assert_close(prequant.float(), ref.float(), atol=atol, rtol=rtol)

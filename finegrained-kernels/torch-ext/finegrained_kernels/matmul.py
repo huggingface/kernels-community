@@ -293,10 +293,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     ),
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide, a distinct config space).
     ["N", "K", "m_bit_length", "GATE"],
-    # the free K tile x both memory regimes x swap make this the widest 2D grid: at 100 trials the
-    # row-wise prefill crown spread 633-690us over three tunes (N=16384 K=5120 M=8192, B200), 200
-    # found 615us (and 302us at N=5120 K=8192)
-    n_trials=200,
+    n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),
@@ -387,7 +384,7 @@ def w8a8_tensor_dynamic_fp8_matmul_kernel(
     # stacked row) are applied with the per-row act scale before the GLU split.
     b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
 
-    a_s = tl.load(As + offs_am * stride_as_m)
+    a_s = tl.load(As + offs_am * stride_as_m, mask=offs_am < M, other=0.0)
 
     # Accumulate raw dot products, apply scales once after the loop.
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
@@ -1340,10 +1337,17 @@ def w8a8_tensor_dynamic_fp8_matmul(
 
     # One scale per row, derived here into rows padded to the largest M tile, or the calibrated
     # one every row reads (stride 0). The A box then reads the padded extent in bounds: a box past
-    # the tensor's rows takes the TMA's zero-fill path, which cost the decode GEMV ~1.6x (B200,
-    # N=16384 K=5120, M=1: 16.9 vs 10.6us at BM=64). Rows past M are never stored.
-    a_rows = triton.cdiv(M, TENSOR_MATMUL_A_ROW_MULTIPLE) * TENSOR_MATMUL_A_ROW_MULTIPLE if As is None else M
-    qA, As, as_stride_m, _ = tensor_wide_act_operands(A, As, row_multiple=TENSOR_MATMUL_A_ROW_MULTIPLE)
+    # the tensor's rows takes the TMA's zero-fill path, which costs the decode GEMV ~4us with cold
+    # weights (B200, N=16384 K=5120, M=1). A pre-quantized A whose storage lacks the padded rows
+    # (``fp8_act_quant_tensor_wide(row_multiple=...)`` provides them) is copied into a padded
+    # buffer, cheaper than that path. Rows past M are never stored.
+    qA, As, as_stride_m, _ = tensor_wide_act_operands(
+        A.reshape(M, K), None if As is None else As.reshape(-1),
+        row_multiple=TENSOR_MATMUL_A_ROW_MULTIPLE,
+    )
+    a_rows = triton.cdiv(M, TENSOR_MATMUL_A_ROW_MULTIPLE) * TENSOR_MATMUL_A_ROW_MULTIPLE
+    if qA.untyped_storage().nbytes() < (qA.storage_offset() + a_rows * K) * qA.element_size():
+        qA = torch.empty(a_rows, K, device=qA.device, dtype=qA.dtype)[:M].copy_(qA)
     Bs = Bs.reshape(-1, 1)
 
     C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)

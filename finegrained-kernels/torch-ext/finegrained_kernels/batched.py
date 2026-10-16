@@ -47,7 +47,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, gate_tile_cap_pruner, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
+from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, gate_tile_cap_pruner, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, single_row_tile_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
 
 
 @triton.jit
@@ -381,7 +381,9 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
 @bayesian_autotune(
     # S (routed rows) keyed like the block-dynamic/mx batched siblings — decode re-tunes per batch.
     get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True),
-    ["N", "K", "S"],
+    # GATE keys the gate|up arm separately: its 2*BN tile is a different config space, and an
+    # ungated crown replayed under GATE can overflow shared memory
+    ["N", "K", "S", "GATE"],
     n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BLOCK_SIZE_K/N are tuned axes; the K-loop is maskless and the N-tile store is
@@ -391,6 +393,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
             fp8_dot_warp_pruner(),
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            single_row_tile_pruner(),
         )
     },
 )
