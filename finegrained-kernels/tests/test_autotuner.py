@@ -343,3 +343,26 @@ def test_compile_failures_are_memoized_across_keys(caplog):
     assert len(msgs) == 2, msgs
     assert "[memoized]" not in msgs[0] or "[memoized]" in msgs[1]
     assert "[memoized]" in msgs[1], msgs[1]
+
+
+@pytest.mark.kernels_ci
+def test_uint8_mx_scales_without_native_ue8m0():
+    """Older Torch must import the real package and recognize raw exponent scales."""
+    script = """
+import torch
+import torch._inductor.utils
+if hasattr(torch, "float8_e8m0fnu"):
+    del torch.float8_e8m0fnu
+import importlib
+import kernels
+kernel = kernels.get_kernel("kernels-community/finegrained-kernels", version=0)
+formats = importlib.import_module(kernel.__name__ + ".formats")
+is_mxfp4, is_mxfp8, ue8m0_as_uint8 = formats.is_mxfp4, formats.is_mxfp8, formats.ue8m0_as_uint8
+scale = torch.full((16, 4), 127, dtype=torch.uint8)
+assert ue8m0_as_uint8(scale) is scale
+assert is_mxfp8(torch.empty((16, 128), dtype=torch.float8_e4m3fn), scale)
+assert is_mxfp4(torch.empty((16, 64), dtype=torch.int8), scale)
+fp32 = torch.ones((16, 4), dtype=torch.float32)
+assert ue8m0_as_uint8(fp32) is fp32
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=60)

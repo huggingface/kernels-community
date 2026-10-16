@@ -14,6 +14,8 @@
 
 
 
+from typing import List
+
 import torch
 import triton
 import triton.language as tl
@@ -1004,7 +1006,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     As: torch.Tensor | None,
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
-    block_size: list[int],
+    block_size: List[int],
     gate: bool = False,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
@@ -1016,7 +1018,7 @@ def w8a8_block_dynamic_fp8_matmul_batched(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Block-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T; activations
     quantized offline in one pass. The ``gate``/``act_fn``/``swiglu_*``/``requant``/``output_dtype``
     flags are the dispatcher's gate|up fusion kwargs (torch custom ops take only primitives —
@@ -1161,7 +1163,7 @@ def w8a8_block_static_fp8_matmul_batched(
     As: torch.Tensor,
     Bs: torch.Tensor,
     expert_ids: torch.Tensor,
-    block_size: list[int],
+    block_size: List[int],
     gate: bool = False,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
@@ -1173,7 +1175,7 @@ def w8a8_block_static_fp8_matmul_batched(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Block-scale batched FP8 matmul with a static (per-tensor calibrated) activation scale — the
     block-dynamic batched sibling with the 2D ``block_static`` format. ``A`` is raw here: the op
     quantizes it against the scalar ``As`` (offline), the kernel applies the per-block weight scales
@@ -1389,7 +1391,7 @@ def mx_dynamic_matmul_batched(
     b_global_scale: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Batched MX matmul ``C[s] = A[s] @ B[expert_ids[s]].T``; activations quantized
     inline in the kernel (decode: one act row per program, inline is free). The
     ``gate``/``act_fn``/``swiglu_*``/``requant``/``output_dtype`` flags are ``matmul_batched``'s
@@ -1597,7 +1599,7 @@ def full_precision_matmul_batched(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Full-precision (BF16/FP16) batched matmul: C[s] = A[s] @ B[expert_ids[s]].T — no
     quantization anywhere, fp32 accumulation. ``gate``/``act_fn``/``swiglu_*``/
     ``simulate_unfused`` are the dispatcher's gate|up fusion kwargs (GLU only; ``requant`` is
@@ -1680,7 +1682,7 @@ def mx_weight_only_matmul_batched(
     scatter_idx: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """weight-only batched (decode) matmul: ``C[s] = A[s] @ B[expert_ids[s]].T`` with raw bf16/fp16
     activations against MXFP4/NVFP4/MXFP8 weights upcast to bf16 in-loop — the ``matmul_ogs`` format.
     Affine (3D) weight scales — UE8M0 group-32 (MX) or E4M3 group-16 (NVFP4, whose per-expert

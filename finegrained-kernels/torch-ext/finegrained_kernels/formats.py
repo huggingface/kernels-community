@@ -24,7 +24,7 @@ def ue8m0_as_uint8(scale: torch.Tensor | None) -> torch.Tensor | None:
     optional scale) passes through as ``None`` — kernels take the arg as None."""
     if scale is None:
         return None
-    return scale.view(torch.uint8) if scale.dtype == torch.float8_e8m0fnu else scale
+    return scale.view(torch.uint8) if scale.dtype == getattr(torch, "float8_e8m0fnu", None) else scale
 
 def e2m1_as_uint8(weight: torch.Tensor) -> torch.Tensor:
     """View an ``int8``-stored MXFP4 (packed E2M1) weight as ``uint8`` — a zero-cost
@@ -36,7 +36,9 @@ def e2m1_as_uint8(weight: torch.Tensor) -> torch.Tensor:
 # exponent bits, and a common on-disk encoding (e.g. group-32 "mxfp8" checkpoints store the
 # scale tensor as uint8). Both are valid MX scales: ``ue8m0_as_uint8`` reinterprets to uint8
 # and the kernels decode ``2^(exp-127)`` inline, so the detectors accept either dtype.
-UE8M0_SCALE_DTYPES = (torch.float8_e8m0fnu, torch.uint8)
+UE8M0_SCALE_DTYPES = (torch.uint8,)
+if (ue8m0_dtype := getattr(torch, "float8_e8m0fnu", None)) is not None:
+    UE8M0_SCALE_DTYPES += (ue8m0_dtype,)
 
 def _shapes_match(weight: torch.Tensor, scale: torch.Tensor, group: int) -> bool:
     """Shape leg of the family predicates: matching leading dims and a last dim of
