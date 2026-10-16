@@ -281,7 +281,12 @@ def decode_group_scale(scale):
     branch is a compile-time constant, so only the taken path is emitted (single return —
     Triton requires all ``return`` statements to share a type)."""
     if scale.dtype == tl.uint8:
-        scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        exponent = scale
+        scale = (exponent.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        # UE8M0 byte0 is 2^-127 (an FP32 subnormal), and byte255 is NaN.
+        # Direct exponent-bit construction otherwise turns these into zero/inf.
+        scale = tl.where(exponent == 0, 2.0 ** -127, scale)
+        scale = tl.where(exponent == 255, float("nan"), scale)
     elif scale.dtype == tl.float8e4nv:
         scale = scale.to(tl.float32)
     return scale
