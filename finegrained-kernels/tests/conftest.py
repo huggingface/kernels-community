@@ -106,4 +106,5 @@ def pytest_collection_modifyitems(config, items):
         return
     skip = pytest.mark.skip(reason="FP8 kernels require SM90+ on CUDA or XPU")
     for item in items:
-        item.add_marker(skip)
+        if item.get_closest_marker("cpu") is None:
+            item.add_marker(skip)

@@ -167,3 +167,72 @@ per-config timings as JSONL to `<path>`.
 (`tests/test_act_quant.py`), and autotuner/pruner guards (`tests/test_autotuner.py`). `pytest -n 8`
 pins one GPU per xdist worker. `-m "not slow"` skips the multi-process determinism and
 forced-config sweep tests.
+
+### Experimental compressed NVFP4 scales (CSF)
+
+This path trades scale memory for extra lookup work. It is slower than dense
+scales in the measurements below and is not selected by the ordinary dispatchers.
+
+`prepare_nvfp4_csf_scales(fixed, exceptions)` prepares the lossless
+`byte-window4-fixed-stream-u24-exceptions/1` format used by
+[nvidia/Qwen3.8-Flash-Next-FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local).
+The [reference runtime documents this codec](https://github.com/LocalInferenceLab/vllm/blob/13b13ad54b/docs/features/quantization/fp4_csf.md).
+This is a community checkpoint extension, distinct from ordinary dense ModelOpt
+NVFP4 scales. Each original `uint8` fixed stream has shape
+`[rows/16, 16*(1+cols/2)]`; a slab holds 16 row bases followed by each row's
+packed low/high nibble deltas. Sorted `uint32` exceptions use the low 24 bits
+for a flat matrix position and the high byte for its replacement E4M3 bits.
+Preparation validates the CPU streams and adds a `uint32` row directory without
+expanding the scale plane. Stack fixed streams along an expert axis and pass
+one exception tensor per expert, then move the result with `scales.to(device)`.
+
+`matmul_csf_batched(A, B, scales, expert_ids=...)` and
+`matmul_csf_grouped(A, B, scales, expert_start=...)` read these compressed
+buffers directly inside the existing NVFP4 GEMM scale-tile load. They support
+NVFP4 activations (default) and `activation_format="bf16"` weight-only compute,
+with the same global scales, gather/scatter, bias and gate epilogues as their
+dense-scale counterparts. Output requantization requires `gate=True`. They do not
+allocate dense scale scratch. The explicit `decompress_nvfp4_csf_scales` diagnostic/conversion helper does allocate
+a dense E4M3 tensor and preserves every original byte, including NaN patterns.
+
+The initial API supports inference. Compressed row order must match the weight
+row order, including any gate/up layout; concatenate/reorder the checkpoint
+streams accordingly before preparation. Tensor-parallel slicing requires
+format-aware slab/nibble slicing and exception rebasing; generic dense-scale
+axis slicing does not apply. CSF checkpoint loading and tensor-parallel slicing
+are outside this kernel API.
+
+
+Measured on NVIDIA B200 with 512 experts, real Qwen layer0/expert0 scale
+streams repeated across experts and random packed weights. Each weight stack
+is 419 MB, exceeding L2; CUDA-graph timings include activation quantization.
+Both paths independently use a 100-trial tuning budget with default refinement.
+These are kernel measurements, not end-to-end model throughput.
+
+| Projection (N × K) | Routing | Activations | Dense µs | CSF µs | CSF / dense |
+| --- | --- | --- | ---: | ---: | ---: |
+| gate (640 × 2560) | decode, 1/expert | FP4 | 86.2 | 359.4 | 4.17× |
+| gate (640 × 2560) | decode, 1/expert | BF16 | 138.5 | 322.7 | 2.33× |
+| gate (640 × 2560) | prefill, 16/expert | FP4 | 145.4 | 513.3 | 3.53× |
+| gate (640 × 2560) | prefill, 16/expert | BF16 | 323.2 | 712.6 | 2.21× |
+| down (2560 × 640) | decode, 1/expert | FP4 | 104.5 | 359.9 | 3.44× |
+| down (2560 × 640) | decode, 1/expert | BF16 | 138.4 | 322.4 | 2.33× |
+| down (2560 × 640) | prefill, 16/expert | FP4 | 258.4 | 599.6 | 2.32× |
+| down (2560 × 640) | prefill, 16/expert | BF16 | 335.6 | 748.0 | 2.23× |
+
+Resident scale buffers (including row lookup metadata) use 29,992,964 bytes for
+gate and 33,230,852 bytes for down, versus 52,428,800 bytes each when dense:
+**42.8% and 36.6% less scale memory**, respectively. The latency overhead remains
+a blocker for a performance-ready integration.
+
+Reproduce with:
+
+```bash
+FINEGRAINED_AUTOTUNE_TRIALS=100 python bench/bench_csf.py \
+    --fixed gate.fixed --exceptions gate.exceptions --rows 640 --cols 160 \
+    --experts 512 --tokens 1 16
+```
+
+Down uses `--rows 2560 --cols 40`.
+The fixed/exception inputs are raw byte streams extracted from the named
+safetensors tensors; `LOCAL_KERNELS` can select a local build.

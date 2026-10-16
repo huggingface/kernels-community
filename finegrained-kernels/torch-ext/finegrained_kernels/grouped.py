@@ -659,7 +659,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     # different memory-mode optima and must not share a tuned config.
     # OUTPUT_FORMAT/SWIZZLED_OUT key the requant epilogue explicitly (the C/Cs dtype append
     # splits them incidentally today; a descriptor Cs has no dtype token).
-    ["N", "K", "tokens_per_expert_bit_length", "GATE", "SWIZZLED_SCALES", "OUTPUT_FORMAT", "SWIZZLED_OUT"],
+    ["N", "K", "tokens_per_expert_bit_length", "GATE", "SWIZZLED_SCALES", "OUTPUT_FORMAT", "SWIZZLED_OUT", "CSF_STEPS"],
     n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BK-within-K veto + the sm_10x dot_scaled shape/trap gates (this kernel had no
@@ -753,6 +753,7 @@ def mx_dynamic_matmul_grouped_kernel(
     # E-wide register-resident layout — register relief, bit-identical tiles; scope pruner
     # admits it at BM>=128 only (see packed_schedule_scope_pruner)
     PACKED_SCHEDULE: tl.constexpr = False,
+    CsfFixed=None, CsfExceptions=None, CsfRowOffsets=None, CSF_STEPS: tl.constexpr = 0,
 ):
     """Unified grouped microscaled expert matmul (MXFP8/MXFP4/NVFP4; a ``uint8`` ``A``
     is caller-packed E2M1 — W4A4 on the native fp4 MMA) — persistent grid-stride.
@@ -857,6 +858,7 @@ def mx_dynamic_matmul_grouped_kernel(
                 stride_bs_e, stride_bs_n, stride_bs_k,
                 GATE, True, False, B_MEMORY_MODE, False, SWIZZLED_SCALES,
                 BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
+                CsfFixed=CsfFixed, CsfExceptions=CsfExceptions, CsfRowOffsets=CsfRowOffsets, CSF_STEPS=CSF_STEPS,
             )
             acc = mx_compute(
                 acc, a, a_s, w, w_s, COMPUTE_MODE,
@@ -924,7 +926,7 @@ def mx_dynamic_matmul_grouped_kernel(
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_grouped_descriptors,
     ),
-    ["N", "K", "tokens_per_expert_bit_length", "GATE"],
+    ["N", "K", "tokens_per_expert_bit_length", "GATE", "CSF_STEPS"],
     n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
     prune_configs_by={
@@ -999,6 +1001,7 @@ def mx_weight_only_matmul_grouped_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    CsfFixed=None, CsfExceptions=None, CsfRowOffsets=None, CSF_STEPS: tl.constexpr = 0,
 ):
     """weight-only grouped expert matmul: raw bf16 activations against MXFP4/MXFP8 weights upcast to bf16
     in-loop (unpack + per-group group-scale), plain ``tl.dot``. The ``matmul_ogs`` format. Persistent
@@ -1058,6 +1061,7 @@ def mx_weight_only_matmul_grouped_kernel(
                 GATE, True, False, B_MEMORY_MODE, False, False,
                 BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, WEIGHT_VALUES_PER_BYTE,
                 k_col_off=-(overlap // SCALE_GROUP_K),
+                CsfFixed=CsfFixed, CsfExceptions=CsfExceptions, CsfRowOffsets=CsfRowOffsets, CSF_STEPS=CSF_STEPS,
             )
             acc = mx_weight_only_compute(
                 acc, a, w, w_s, COMPUTE_MODE, BLOCK_SIZE_K, n_width, SCALE_GROUP_K
@@ -1725,6 +1729,9 @@ def mx_dynamic_matmul_grouped(
     b_global_scale: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    csf_exceptions: torch.Tensor | None = None,
+    csf_row_offsets: torch.Tensor | None = None,
+    csf_search_steps: int = 0,
 ) -> list[torch.Tensor]:
     """Grouped MX matmul over expert-sorted positions (per-tile gather/scatter, the
     sort is virtual — see ``compute_grouped_scheduling`` for the maps). Activations arrive
@@ -1741,6 +1748,7 @@ def mx_dynamic_matmul_grouped(
     gather_idx: optional (S,) — sorted position -> source row of A; None = A is expert-sorted
     scatter_idx: optional (S,) — sorted position -> destination row of C; None = C stays expert-sorted
     """
+    csf = csf_row_offsets is not None
     assert A.ndim == 2 and B.ndim == 3 and Bs.ndim in (3, 5)  # 5D = pre-swizzled
     assert B.dtype in (torch.int8, torch.float8_e4m3fn), (
         f"B must be int8 (packed E2M1) or float8_e4m3fn (E4M3), got {B.dtype}"
@@ -1764,8 +1772,10 @@ def mx_dynamic_matmul_grouped(
     # checkpoint shared with batched decode (is_preswizzled_mx). The format is the scale dtype
     # (E4M3 = NVFP4 group-16, UE8M0 = MX group-32).
     swizzled_scales = Bs.ndim == 5
-    scale_group = mx_scale_family(Bs, K)
-    if not swizzled_scales:
+    scale_group = 16 if csf else mx_scale_family(Bs, K)
+    if csf:
+        assert Bs.shape == (num_experts, n_rows // 16, 16 * (1 + K // 32))
+    elif not swizzled_scales:
         assert Bs.shape == (num_experts, n_rows, K // scale_group), (
             f"Bs shape {tuple(Bs.shape)} != ({num_experts}, {n_rows}, {K // scale_group})"
         )
@@ -1778,7 +1788,12 @@ def mx_dynamic_matmul_grouped(
         )
 
     output_dtype = resolve_output_dtype(output_dtype, A, As)
-    activation_format = resolve_activation_format(activation_format, B, Bs)
+    if csf:
+        if activation_format not in (None, "nvfp4"):
+            raise ValueError("CSF NVFP4 weights require nvfp4 or bf16 activations")
+        activation_format = "nvfp4"
+    else:
+        activation_format = resolve_activation_format(activation_format, B, Bs)
     output_format = activation_format if quantize_output else None
     requant = quantize_output
     # Non-128 N on the swizzled arm (bf16, non-gate): each expert's weight-scale slab pads to
@@ -1796,7 +1811,7 @@ def mx_dynamic_matmul_grouped(
             f"bf16 GEMM; gate|up needs N a multiple of 128, requant needs the un-swizzled arm or the "
             f"dense matmul_2d op."
         )
-    scale_dtype = ue8m0_as_uint8(Bs).dtype  # UE8M0 -> uint8, NVFP4 -> e4m3 (binder-safe)
+    scale_dtype = torch.float8_e4m3fn if csf else ue8m0_as_uint8(Bs).dtype  # UE8M0 -> uint8, NVFP4 -> e4m3 (binder-safe)
     # Activation scales track the weight layout (SWIZZLED_SCALES, one flag): swizzled weight ->
     # swizzled acts (the tcgen05 fast path); un-swizzled weight -> affine acts (no gain swizzling
     # only one operand). Raw A (As is None) is quantized here — the swizzled arm emits SWIZZLE_32_4_4
@@ -1806,7 +1821,7 @@ def mx_dynamic_matmul_grouped(
     # row-major affine). Each branch yields ``(a_vals, act scales, n_m_tiles)``; ``as_u8`` and its
     # descriptor are built below, symmetric with the weight scales.
     if As is not None:
-        assert (As.dtype == torch.float8_e4m3fn) == (Bs.dtype == torch.float8_e4m3fn), (
+        assert (As.dtype == torch.float8_e4m3fn) == (csf or Bs.dtype == torch.float8_e4m3fn), (
             f"activation scales ({As.dtype}) must match the weight scale family ({Bs.dtype})"
         )
     # g_a normalizes the act quant here in the wrapper (the raw-A arms below, or offline for a
@@ -1999,6 +2014,8 @@ def mx_dynamic_matmul_grouped(
             OUTPUT_FORMAT=output_format,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+            CsfFixed=Bs if csf else None, CsfExceptions=csf_exceptions,
+            CsfRowOffsets=csf_row_offsets, CSF_STEPS=csf_search_steps,
             SWIZZLED_SCALES=swizzled_scales,
             SWIZZLED_OUT=swizzled_out,
         )
@@ -2121,6 +2138,9 @@ def mx_weight_only_matmul_grouped(
     scatter_idx: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    csf_exceptions: torch.Tensor | None = None,
+    csf_row_offsets: torch.Tensor | None = None,
+    csf_search_steps: int = 0,
 ) -> list[torch.Tensor]:
     """weight-only grouped matmul: raw bf16/fp16 activations against MXFP4/NVFP4/MXFP8 weights upcast
     to bf16 in-loop — the ``matmul_ogs`` format (fp4/fp8 weight bytes, bf16 acts, weight upcast in-MMA).
@@ -2128,6 +2148,7 @@ def mx_weight_only_matmul_grouped(
     ``b_global_scale`` ``(E,)`` recovers on the accumulator; ``None`` = single-level). Same
     gather/scatter expert scheduling as the other grouped ops. Returns ``[C]`` (no requant — the
     bf16 intermediate needs none)."""
+    csf = csf_row_offsets is not None
     assert A.dtype in (torch.bfloat16, torch.float16, torch.float32), (
         f"weight-only takes a raw bf16/fp16/fp32 activation, got {A.dtype}"
     )
@@ -2139,7 +2160,7 @@ def mx_weight_only_matmul_grouped(
         f"K ({K}) must equal {WEIGHT_VALUES_PER_BYTE} * B.shape[2] ({K_b})"
     )
     N = rows // 2 if gate else rows
-    scale_group = mx_scale_family(Bs, K)
+    scale_group = 16 if csf else mx_scale_family(Bs, K)
     b_global_scale = normalize_global_scale(b_global_scale, num_experts)
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
     output_dtype = resolve_output_dtype(output_dtype, A, None)
@@ -2200,6 +2221,8 @@ def mx_weight_only_matmul_grouped(
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+            CsfFixed=Bs if csf else None, CsfExceptions=csf_exceptions,
+            CsfRowOffsets=csf_row_offsets, CSF_STEPS=csf_search_steps,
         )
 
     return [C]

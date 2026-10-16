@@ -114,6 +114,10 @@ RAW_ACT_MAX_BN = 128
 PATH_ANCHOR_AXES = ("COMPUTE_MODE", "SWAP_AB")
 
 
+def _has_nvfp4_scales(args):
+    return args.get("CsfFixed") is not None or getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn
+
+
 def config_dim(c, all_args, name):
     """A tile dimension for config ``c`` — from its tuned meta, else the launch args.
     No default: a pruner reasoning about a dimension the kernel doesn't have is a wiring
@@ -415,7 +419,7 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
         if (
             c.kwargs.get("SWAP_AB")
             and config_dim(c, args, "BLOCK_SIZE_K") < 128
-            and getattr(args.get("Bs"), "dtype", None) != torch.float8_e4m3fn
+            and not _has_nvfp4_scales(args)
         ):
             return False
         # Triton <= 3.8.0 mis-lowers native dot_scaled with UE8M0 scales at BM=128 / BN=64 /
@@ -427,7 +431,7 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
             and config_dim(c, args, "BLOCK_SIZE_K") == 64
             and config_dim(c, args, "BLOCK_SIZE_N") == 64
             and c.num_warps == 8
-            and getattr(args.get("Bs"), "dtype", None) != torch.float8_e4m3fn
+            and not _has_nvfp4_scales(args)
         ):
             return False
         # Single-trip dot_scaled (BK >= contraction dim) trips the sm_10x
@@ -529,7 +533,7 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
         return getattr(args.get("A"), "dtype", None) != torch.float32
 
     def scales_are_e4m3(args):
-        return getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn
+        return _has_nvfp4_scales(args)
 
     stages = [block_within_dim_pruner(k_arg)] if block_within_k else []
     if n_arg is not None:
@@ -904,7 +908,7 @@ def mx_2d_swap_scope_pruner(max_m: int = 16):
             return True
         return (
             config_dim(c, args, "BLOCK_SIZE_M") == 1
-            and getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn
+            and _has_nvfp4_scales(args)
             and args["M"] <= max_m
             # An A-side TMA descriptor under SWAP_AB traps the device on Triton 3.8 — a sticky
             # misaligned address, after which every later launch reports it wherever it came
@@ -1292,7 +1296,7 @@ def smem_pruner(k_dim="BLOCK_SIZE_K", min_sets: float = 0.5):
             # compile half a set — so any tighter bound drops configs the compiler would
             # have rescued. Proven est<=actual on 1,099 metadata.shared samples across the
             # family (see OPTIMIZATION_LOG: smem-keep-side-refit).
-            group = 16 if getattr(args.get("Bs"), "dtype", None) == torch.float8_e4m3fn else 32
+            group = 16 if _has_nvfp4_scales(args) else 32
             # A's smem bytes follow its LAUNCH dtype: packed E2M1 (int8/uint8) = 2 values/byte,
             # E4M3 = 1 B/value, raw bf16/fp16 (weight-only) = element_size B/value
             a_dtype = a.dtype
