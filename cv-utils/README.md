@@ -29,9 +29,13 @@ pixel_values = cv_utils.resize_normalize(images, [(224, 224)] * len(images), ima
 
 ## How it works
 
-The resize is separable. One launch computes the normalized filter weights of every output row and column of every
-image into a table. A horizontal pass then resizes the width of each image into a scratch buffer, and a vertical pass
-resizes the height, rescales, normalizes and writes the output. Images of different sizes share each launch.
+The resize is separable. A horizontal pass resizes the width of every image into a scratch buffer, and a vertical pass
+resizes the height, rescales, normalizes and writes the output. Images of different sizes share each launch. The
+horizontal pass is skipped when no image changes width.
+
+The per-image sizes, offsets and normalized filter weights depend only on the shapes and sizes of the batch. They are
+computed once per batch layout, with one copy to the device and one launch, and cached. A call with a known layout
+then launches only the two passes.
 
 The filter weights follow `torch.nn.functional.interpolate(..., antialias=True)`. By default (`round_to_uint8=True`),
 each pass rounds to uint8, like torchvision on uint8 tensors.
