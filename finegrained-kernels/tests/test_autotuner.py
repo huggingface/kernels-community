@@ -343,3 +343,56 @@ def test_compile_failures_are_memoized_across_keys(caplog):
     assert len(msgs) == 2, msgs
     assert "[memoized]" not in msgs[0] or "[memoized]" in msgs[1]
     assert "[memoized]" in msgs[1], msgs[1]
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize(
+    "device_type,sm10x", [("cuda", True), ("cuda", False), ("xpu", False)]
+)
+def test_rowwise_replay_benchmark_uses_device_backend(
+    monkeypatch, device_type, sm10x
+):
+    """CUDA replay timing includes the whole callback; other devices keep their benchmark."""
+    import importlib
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import triton
+    import triton.testing
+
+    compat = importlib.import_module(finegrained_kernels.__name__ + ".compat")
+    matmul = importlib.import_module(finegrained_kernels.__name__ + ".matmul")
+    called = []
+
+    def callback():
+        called.append("callback")
+
+    quantiles = (0.5, 0.2, 0.8)
+
+    def bench(fn, **kwargs):
+        assert fn is callback
+        assert kwargs["quantiles"] == quantiles
+        assert kwargs.get("rep") == (60 if device_type == "cuda" and sm10x else None)
+        fn()
+        return [1.0, 0.9, 1.1]
+
+    monkeypatch.setattr(compat, "get_active_device_type", lambda: device_type)
+    monkeypatch.setattr(compat, "is_sm10x", lambda: sm10x)
+    monkeypatch.setattr(triton.testing, "do_bench_cudagraph", bench)
+    monkeypatch.setattr(triton.testing, "do_bench", bench)
+    monkeypatch.setattr(
+        torch.cuda, "CUDAGraph", lambda: SimpleNamespace(replay=callback)
+    )
+    monkeypatch.setattr(torch.cuda, "graph", lambda graph: nullcontext())
+    monkeypatch.setattr(
+        triton.runtime,
+        "driver",
+        SimpleNamespace(active=SimpleNamespace(get_benchmarker=lambda: bench)),
+    )
+    expected = [2.0, 1.8, 2.2] if device_type == "cuda" and sm10x else [1.0, 0.9, 1.1]
+    assert compat.replay_benchmark(callback, quantiles) == expected
+    assert called == ["callback"] * (3 if device_type == "cuda" and sm10x else 1)
+    assert (
+        matmul.w8a8_tensor_dynamic_fp8_matmul_kernel.do_bench is compat.replay_benchmark
+    )
+

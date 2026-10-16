@@ -298,25 +298,6 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # Seed the broad prefill TMA ridge: the generic maximum anchor uses BK256/w16,
     # which can be much slower and hides the coupled BN256/BK128 optimum from TPE.
     # These are measured candidates, never a dispatch override; pruning still applies.
-    seed_configs=tuple(
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 128,
-                "WARP_SPEC": False,
-                "A_MEMORY_MODE": "host_descriptor",
-                "B_MEMORY_MODE": "host_descriptor",
-                "SWAP_AB": False,
-            },
-            num_warps=warps,
-            num_stages=stages,
-        )
-        for warps in (4, 8)
-        for stages in (3, 4)
-    )
-    if is_sm10x()
-    else (),
     path_anchor_axes=PATH_ANCHOR_AXES,
     # 2D outputs are fully written (no sentinel/padding contract), so the numerics veto is safe
     finite_check_args=("C", "Cs"),

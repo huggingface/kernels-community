@@ -88,7 +88,6 @@ class BayesianAutotuner(Autotuner):
         max_refine_iters: int = 5,
         log_path: str | None = None,
         path_anchor_axes: tuple[str, ...] = (),
-        seed_configs: tuple[Config, ...] = (),
         finite_check_args: tuple[str, ...] = (),
         **kwargs,
     ):
@@ -118,7 +117,6 @@ class BayesianAutotuner(Autotuner):
         # axis names). Each distinct value combination of these axes gets one guaranteed
         # max-tile anchor; empty = median anchors only.
         self.path_anchor_axes = tuple(path_anchor_axes)
-        self.seed_configs = tuple(seed_configs)
         # Output arg NAMES (a declaration — the tuner never hardcodes kernel details) whose
         # values are checked for NaN/inf after each config's bench: a config that writes
         # non-finite output scores inf and can never be crowned. The tuner times, it never
@@ -496,10 +494,7 @@ class BayesianAutotuner(Autotuner):
         order = list(range(len(configs)))
         random.Random(0).shuffle(order)
         warm_idx = self._warm_start_index(configs, key)
-        seed_sigs = {tuple(sorted(c.all_kwargs().items())) for c in self.seed_configs}
-        seeds = [i for i, sig in enumerate(sigs) if sig in seed_sigs]
-        # Match against the pruned grid: a seed never bypasses legality checks.
-        head = seeds + anchors + ([warm_idx] if warm_idx is not None else [])
+        head = anchors + ([warm_idx] if warm_idx is not None else [])
         order = list(dict.fromkeys(head + order))
         for idx in order[: max(n_startup, len(head))]:
             bench_idx(idx)
@@ -764,9 +759,6 @@ class BayesianAutotuner(Autotuner):
             f"n_trials={self.n_trials},n_startup_trials={self.n_startup_trials},gamma={self.gamma}",
             str(tuning_key),
         ] + [str(c) for c in configs]  # str(Config) is pre_hook-free and process-stable
-        # Preserve existing cache keys for kernels that do not opt into seeded search.
-        if self.seed_configs:
-            cache_key.append(str([str(c) for c in self.seed_configs]))
         cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()
         cache = get_cache_manager(cache_key)
         file_name = f"{fn.__name__[:150]}.bayes_autotune.json"
@@ -904,7 +896,6 @@ def bayesian_autotune(
     max_refine_iters: int = 5,
     log_path: str | None = None,
     path_anchor_axes: tuple[str, ...] = (),
-    seed_configs: tuple[Config, ...] = (),
     finite_check_args: tuple[str, ...] = (),
     cache_results: bool = True,
     reset_to_zero=None,
@@ -921,8 +912,6 @@ def bayesian_autotune(
                               optimum — one guaranteed max-tile anchor per value combo
                               (see _basin_anchor_indices); the kernel declares them, the
                               tuner stays independent of configuration details
-    seed_configs:             representative configurations measured at startup when present
-                              in the pruned grid; they count toward the trial budget
     max_failures:             abort the tune once this many configs fail to compile/run before
                               the measured budget is met (default n_trials; env override
                               FINEGRAINED_AUTOTUNE_MAX_FAILURES). Without it a broadly broken
@@ -948,7 +937,6 @@ def bayesian_autotune(
             max_refine_iters=max_refine_iters,
             log_path=log_path,
             path_anchor_axes=path_anchor_axes,
-            seed_configs=seed_configs,
             finite_check_args=finite_check_args,
             cache_results=cache_results,
             **kwargs,
