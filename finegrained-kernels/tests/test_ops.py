@@ -51,6 +51,7 @@ from utils import (  # type: ignore
 )
 
 import finegrained_kernels  # type: ignore
+from finegrained_kernels.loading.scales import decompress_nvfp4_csf_scales, prepare_nvfp4_csf_scales
 from finegrained_kernels import swizzle_mx_scales, unswizzle_mx_scales  # type: ignore
 from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore
 from finegrained_kernels.quant import nvfp4_act_quant  # type: ignore
@@ -814,20 +815,20 @@ def test_csf_scale_bytes_and_workspace(device):
     )
     fixed, exceptions = encode_csf_scales(expected.view(torch.float8_e4m3fn))
     buffers = tuple(
-        t.to(device) for t in finegrained_kernels.prepare_nvfp4_csf_scales(fixed, exceptions)
+        t.to(device) for t in prepare_nvfp4_csf_scales(fixed, exceptions)
     )
     workspace = torch.empty(expected.shape, dtype=torch.float8_e4m3fn, device=device)
-    actual = finegrained_kernels.decompress_nvfp4_csf_scales(*buffers, out=workspace)
+    actual = decompress_nvfp4_csf_scales(*buffers, out=workspace)
     assert actual is workspace
     torch.testing.assert_close(actual.cpu().view(torch.uint8), expected, rtol=0, atol=0)
     fixed.zero_()
     buffers = tuple(
         t.to(device)
-        for t in finegrained_kernels.prepare_nvfp4_csf_scales(
+        for t in prepare_nvfp4_csf_scales(
             fixed, [torch.empty(0, dtype=torch.uint32)] * 3
         )
     )
-    finegrained_kernels.decompress_nvfp4_csf_scales(*buffers, out=workspace)
+    decompress_nvfp4_csf_scales(*buffers, out=workspace)
     assert not workspace.view(torch.uint8).any()
 
 
@@ -836,7 +837,7 @@ def test_csf_scale_bytes_and_workspace(device):
 def test_csf_invalid_positions(positions):
     fixed = torch.zeros((2, 64), dtype=torch.uint8)
     with pytest.raises(ValueError, match="sorted, unique and in range"):
-        finegrained_kernels.prepare_nvfp4_csf_scales(
+        prepare_nvfp4_csf_scales(
             fixed, torch.tensor(positions, dtype=torch.uint32)
         )
 
@@ -844,58 +845,43 @@ def test_csf_invalid_positions(positions):
 def test_csf_scale_boundaries():
     cols = (1 << 24) // 16
     fixed = torch.zeros((1, 16 * (1 + cols // 2)), dtype=torch.uint8)
-    prepared = finegrained_kernels.prepare_nvfp4_csf_scales(
+    prepared = prepare_nvfp4_csf_scales(
         fixed, torch.tensor([0xFFFFFFFF], dtype=torch.uint32)
     )
-    actual = finegrained_kernels.decompress_nvfp4_csf_scales(
+    actual = decompress_nvfp4_csf_scales(
         *(t.to(TEST_DEVICE) for t in prepared)
     ).view(torch.uint8)
     assert actual.flatten()[-1].item() == 255
     assert torch.count_nonzero(actual).item() == 1
     with pytest.raises(ValueError, match=r"2\*\*24"):
-        finegrained_kernels.prepare_nvfp4_csf_scales(
+        prepare_nvfp4_csf_scales(
             torch.zeros((1, fixed.shape[1] + 16), dtype=torch.uint8),
             torch.empty(0, dtype=torch.uint32),
         )
     fixed[0, 0] = 241
     with pytest.raises(ValueError, match="bases"):
-        finegrained_kernels.prepare_nvfp4_csf_scales(fixed, torch.empty(0, dtype=torch.uint32))
+        prepare_nvfp4_csf_scales(fixed, torch.empty(0, dtype=torch.uint32))
 
 
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize(
-    "malformed",
+    "argument,value",
     [
-        "fixed_dtype",
-        "fixed_rank",
-        "fixed_stride",
-        "exceptions_dtype",
-        "offsets_dtype",
-        "offsets_length",
-        "offsets_stride",
-        "workspace",
+        ("fixed", torch.empty((1, 1, 64), dtype=torch.float32)),
+        ("fixed", torch.empty((1, 64), dtype=torch.uint8)),
+        ("fixed", torch.empty((1, 1, 128), dtype=torch.uint8)[:, :, ::2]),
+        ("exceptions", torch.empty(0, dtype=torch.int64)),
+        ("expert_offsets", torch.empty(2, dtype=torch.int64)),
+        ("expert_offsets", torch.empty(1, dtype=torch.uint32)),
+        ("expert_offsets", torch.empty(4, dtype=torch.uint32)[::2]),
+        ("out", torch.empty((1, 32, 6), dtype=torch.float32)),
     ],
 )
-def test_csf_tensor_metadata(malformed):
-    fixed, exceptions, offsets = finegrained_kernels.prepare_nvfp4_csf_scales(
+def test_csf_tensor_metadata(argument, value):
+    fixed, exceptions, offsets = prepare_nvfp4_csf_scales(
         torch.zeros((2, 64), dtype=torch.uint8), torch.empty(0, dtype=torch.uint32)
     )
-    out = None
-    if malformed == "fixed_dtype":
-        fixed = fixed.float()
-    elif malformed == "fixed_rank":
-        fixed = fixed[0]
-    elif malformed == "fixed_stride":
-        fixed = fixed[:, :, ::2]
-    elif malformed == "exceptions_dtype":
-        exceptions = exceptions.long()
-    elif malformed == "offsets_dtype":
-        offsets = offsets.long()
-    elif malformed == "offsets_length":
-        offsets = offsets[:-1]
-    elif malformed == "offsets_stride":
-        offsets = torch.empty(4, dtype=torch.uint32)[::2]
-    else:
-        out = torch.empty((1, 32, 6), dtype=torch.float32)
+    inputs = dict(fixed=fixed, exceptions=exceptions, expert_offsets=offsets)
+    inputs[argument] = value
     with pytest.raises(ValueError):
-        finegrained_kernels.decompress_nvfp4_csf_scales(fixed, exceptions, offsets, out=out)
+        decompress_nvfp4_csf_scales(**inputs)

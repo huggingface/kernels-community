@@ -17,7 +17,7 @@ The ``finegrained_kernels`` package is on ``sys.path`` via ``conftest.py`` (pyte
 auto-loads it before any test module)."""
 
 import torch
-import finegrained_kernels
+from finegrained_kernels.loading.scales import decompress_nvfp4_csf_scales, prepare_nvfp4_csf_scales
 
 from finegrained_kernels.compat import (  # type: ignore
     MX_SCALE_GROUP_K,
@@ -513,11 +513,11 @@ def prepare_weight_scales(scales, csf_encoding, fn, compiled=False):
         return maybe_compile(fn, compiled)
     fixed, exceptions = encode_csf_scales(scales)
     buffers = tuple(
-        t.to(scales.device) for t in finegrained_kernels.prepare_nvfp4_csf_scales(fixed, exceptions)
+        t.to(scales.device) for t in prepare_nvfp4_csf_scales(fixed, exceptions)
     )
 
     def run(A, B, As, Bs, **kwargs):
-        decoded = finegrained_kernels.decompress_nvfp4_csf_scales(*buffers)
+        decoded = decompress_nvfp4_csf_scales(*buffers)
         return fn(A, B, As, decoded.reshape(Bs.shape), **kwargs)
 
     return maybe_compile(run, compiled)
