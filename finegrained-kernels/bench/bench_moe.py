@@ -1939,6 +1939,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 # has only the two-GEMM shape, so that is what it contributes. No fused/unfused split in the
 # figure — it is an internal distinction of ours that most baselines do not have.
 ROW_ORDER = ["quantized", "linear quantized", "unquantized"]
+ROW_LABELS = {"quantized": "MoE quantized", "linear quantized": "Linear quantized",
+              "unquantized": "MoE unquantized (BF16)"}
 present_rows = [r for r in ROW_ORDER if any(rr == r for rr, *_ in rows)]
 
 # bars must be PHYSICALLY identical across every subplot of every figure: one slot
@@ -2067,7 +2069,7 @@ for ri, row in enumerate(present_rows):
         tok = DECODE_TOKENS if regime == "decode" else PREFILL_TOKENS
         mode_note = ("solid=cudagraph, hatch=compile-if-faster" if overlay_drawn
                      else (solid_mode if not overlay_mode else "cudagraph"))
-        ax.set_title(f"{row} — {regime} (T={tok}; {mode_note})")
+        ax.set_title(f"{ROW_LABELS[row]} — {regime} (T={tok}; {mode_note})")
         # legend: impl colors + the mode/marker key (compile entry only if any
         # panel bar actually had a compile win to show)
         handles = [mpatches.Patch(color=IMPL_COLORS[i], label=_impl_label(i, regime))
