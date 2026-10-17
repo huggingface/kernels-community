@@ -27,7 +27,7 @@ from .formats import check_activation_format, check_activation_scale_ub, global_
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
-from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
+from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, build_packed_schedule, load_packed_schedule, grouped_tile_order, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
 from .loading.scales import apply_row_scale
 from .loading.tiles import (
     load_act_block_dynamic,
@@ -546,19 +546,20 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     scales interleaved alike) into a ``[BK, 2*BN]`` dot + SwiGLU ``glu``, emitting the bf16
     intermediate; ``GATE=False`` is the plain GEMM (bit-identical)."""
     start_pid = tl.program_id(axis=0)
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
     if PACKED_SCHEDULE:
         total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
         prefetched = prefetch_packed_entry(
-            Schedule, start_pid // tl.cdiv(N, BLOCK_SIZE_N), total_m_tiles
+            Schedule, grouped_tile_order(start_pid, total_m_tiles, num_n_tiles) // num_n_tiles, total_m_tiles
         )
     else:
         exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
             ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
         )
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
+    for logical_tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
+        tile_id = grouped_tile_order(logical_tile_id, total_m_tiles, num_n_tiles)
         pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
             resolve_grouped_tile_packed(
                 tile_id, num_n_tiles, prefetched,
@@ -579,7 +580,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
         )
         if PACKED_SCHEDULE:
             prefetched = prefetch_packed_entry(
-                Schedule, (tile_id + NUM_SMS) // num_n_tiles, total_m_tiles
+                Schedule, grouped_tile_order(logical_tile_id + NUM_SMS, total_m_tiles, num_n_tiles) // num_n_tiles, total_m_tiles
             )
         a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
         # GATE stacks gate|up into one [BK, 2*BN] tile; rows are interleaved, so the tile is

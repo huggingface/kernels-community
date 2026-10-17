@@ -289,6 +289,18 @@ def load_packed_schedule(Schedule, BLOCK_SIZE_M: tl.constexpr):
 
 
 @triton.jit
+def grouped_tile_order(tile_id, num_m_tiles, num_n_tiles):
+    """Reuse each weight tile across up to eight adjacent M-tiles before advancing N."""
+    group_first_m = tile_id // (8 * num_n_tiles) * 8
+    # Keep a trailing prefetch past the M-grid well-defined.
+    group_size_m = tl.maximum(1, tl.minimum(8, num_m_tiles - group_first_m))
+    group_offset = tile_id % (8 * num_n_tiles)
+    pid_m = group_first_m + group_offset % group_size_m
+    pid_n = group_offset // group_size_m
+    return pid_m * num_n_tiles + pid_n
+
+
+@triton.jit
 def prefetch_packed_entry(Schedule, pid_m, total_m_tiles):
     """Issue a future M-tile's ``(expert_id, m_start, row_end)`` loads (masked past the
     schedule end). Consumed by ``resolve_grouped_tile_packed`` one persistent iteration
