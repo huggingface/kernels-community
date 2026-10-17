@@ -27,7 +27,7 @@ from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_desc
 from .formats import block_fp8_weight_scale_grid, check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands
-from .loading.scales import apply_global_scale, mx_2d_scale_ptrs
+from .loading.scales import apply_global_scale, dequant_block_fp8_weight, mx_2d_scale_ptrs
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .loading.tiles import (
     advance_ptrs,
@@ -61,6 +61,8 @@ from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, gate_stacked_tmem_tr
 # inline either way.
 MX_MATMUL_ACT_PREQUANT_MIN_M = 16
 STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
+# Full-weight conversion is amortized across prefill rows; decode keeps its inline conversion.
+FP8_WEIGHT_ONLY_DEQUANT_MIN_M = 1024
 # Block-dynamic has NO gate: offline wins at EVERY M incl. M=1 (24.7 vs 31.0us, isolated
 # arm A/B, graph-timed, H=6144 b128) — the inline arm pays a per-tile fp32 amax+div. The
 # always-offline paths (bd 2D/batched/grouped, fused gate_ups, MX grouped) quantize
@@ -1013,6 +1015,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
     prune_configs_by={
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("K"),
+            gate_stacked_tmem_trap_pruner(),
             warp_spec_compile_guard_pruner(),
         )
     },
@@ -1837,6 +1840,17 @@ def block_fp8_weight_only_matmul_2d(
     assert A.shape[-1] == K
     M = A.numel() // K
     N = rows // 2 if gate else rows
+    if M >= FP8_WEIGHT_ONLY_DEQUANT_MIN_M:
+        weights = dequant_block_fp8_weight(B, Bs, A.dtype, gate=gate)
+        if (not gate and output_dtype in (None, A.dtype)
+                and (bias is None or bias.dtype == A.dtype)):
+            native_bias = bias[0] if bias is not None and bias.ndim == 2 else bias
+            with torch.autocast(A.device.type, enabled=False):
+                return [torch.nn.functional.linear(A, weights, native_bias)]
+        return full_precision_matmul_2d(
+            A, weights,
+            output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, bias=bias,
+        )
     Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate)
     Bs = ue8m0_as_uint8(Bs)
     dtype = resolve_output_dtype(output_dtype, A, None)

@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch
 import triton
 import triton.language as tl
 
+from ..compat import compile_time_only_triton_wrap, device_context
+from ..formats import block_fp8_weight_scale_grid, ue8m0_as_uint8
 from ..quant import fp8_act_quant_inline, mx_act_quant_inline
 
 
@@ -364,3 +367,60 @@ def dequant_block_fp8_weight_tile(
             scales = tl.trans(scales)
         w = w.to(tl.float32) * scales
     return w.to(DTYPE)
+
+
+@triton.jit
+def _dequant_block_fp8_weight_kernel(
+    B, Bs, Out, ExpertStart,
+    N: tl.constexpr, K: tl.constexpr,
+    stride_b_e, stride_b_n, stride_b_k,
+    stride_bs_e, stride_bs_n, stride_bs_k,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GATE_SCALES: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    expert = tl.program_id(1).to(tl.int64)
+    active = True
+    if ExpertStart is not None:
+        active = tl.load(ExpertStart + expert) < tl.load(ExpertStart + expert + 1)
+    if active:
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        n, k = offsets // K, offsets % K
+        mask = offsets < N * K
+        scale_n = (n // 2 // BLOCK_N) * 2 + n % 2 if GATE_SCALES else n // BLOCK_N
+        weight = tl.load(B + expert * stride_b_e + n * stride_b_n + k * stride_b_k, mask, 0.0)
+        scale = tl.load(
+            Bs + expert * stride_bs_e + scale_n * stride_bs_n + (k // BLOCK_K) * stride_bs_k,
+            mask, 0.0,
+        )
+        value = weight.to(tl.float32) * decode_group_scale(scale)
+        tl.store(Out + expert * N * K + offsets, value, mask)
+
+
+def dequant_block_fp8_weight(B, Bs, dtype, *, gate=False, expert_start=None):
+    """Materialize FP8 weights for one prefill GEMM, rounding after the FP32 scale multiply.
+
+    Grouped weights retain their expert indices; inactive expert planes are allocated
+    but untouched, and the subsequent grouped GEMM never reads them.
+    """
+    assert dtype in (torch.bfloat16, torch.float16)
+    Bs, block_n, block_k = block_fp8_weight_scale_grid(B, Bs, gate)
+    Bs = ue8m0_as_uint8(Bs)
+    experts = B.shape[0] if B.ndim == 3 else 1
+    if expert_start is not None:
+        assert (B.ndim == 3 and expert_start.is_contiguous()
+                and expert_start.numel() >= experts + 1 and expert_start.device == B.device)
+    rows, K = B.shape[-2:]
+    output = B.new_empty(B.shape, dtype=dtype)
+    with device_context(B.device):
+        compile_time_only_triton_wrap(_dequant_block_fp8_weight_kernel)[
+            (triton.cdiv(rows * K, 4096), experts)
+        ](
+            B, Bs, output, expert_start, rows, K,
+            B.stride(0) if B.ndim == 3 else 0, B.stride(-2), B.stride(-1),
+            Bs.stride(0) if Bs.ndim == 3 else 0, Bs.stride(-2), Bs.stride(-1),
+            BLOCK_N=block_n, BLOCK_K=block_k,
+            GATE_SCALES=gate and Bs.shape[-2] > 1,
+            BLOCK_SIZE=4096,
+        )
+    return output

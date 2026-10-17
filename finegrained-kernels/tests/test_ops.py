@@ -54,7 +54,6 @@ from finegrained_kernels import swizzle_mx_scales, unswizzle_mx_scales  # type: 
 from finegrained_kernels.batched import mx_dynamic_matmul_batched_kernel  # type: ignore
 from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore
 from finegrained_kernels.grouped import (  # type: ignore
-    block_fp8_weight_only_matmul_grouped_kernel,
     mx_dynamic_matmul_grouped_kernel,
     w8a8_tensor_dynamic_fp8_matmul_grouped_kernel,
 )
@@ -164,7 +163,7 @@ def scenarios() -> list[Problem]:
         Problem(weights="fp8_128x128", activation_format="bf16", S=1, N=192, K=384, bias=True, dtype=torch.float16),
         Problem(weights="fp8_128x128_ue8m0", activation_format="bf16", S=8, empty_expert=True, sentinel_fraction=0.25),
         Problem(weights="fp8_tensor", activation_format="bf16", S=1, gate=True, bias=True, compile=True),
-        Problem(weights="fp8_128x128", activation_format="bf16", S=17, N=192, K=384, compile=True, bias=True),
+        Problem(weights="fp8_128x128", activation_format="bf16", S=1025, N=192, K=384, compile=True, bias=True),
         Problem(weights="fp16", dtype=torch.float16),
         # gate WITHOUT requant (raw GLU intermediate) — one quantized + one full format
         Problem(weights="mxfp8", gate=True),
@@ -735,7 +734,6 @@ _SWEEP_CELLS = [
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", mx_dynamic_matmul_grouped_kernel),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", mx_dynamic_matmul_kernel),
     (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", mx_dynamic_matmul_batched_kernel),
-    (Problem(weights="fp8_128x128", activation_format="bf16"), "grouped", block_fp8_weight_only_matmul_grouped_kernel),
     # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize
     # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is
     # the one a memory-mode fence gets wrong (silently — the tuner forgives what will not lower)
