@@ -521,7 +521,9 @@ def prepare_weight_scales(scales, csf_encoding, fn, compiled=False):
     workspace = workspace.reshape(-1, *scales.shape[-2:])
 
     def run(A, B, As, Bs, **kwargs):
-        decoded = decompress_nvfp4_csf_scales(*buffers, out=workspace)
+        decoded = decompress_nvfp4_csf_scales(
+            *buffers, out=workspace, expert_start=kwargs.get("expert_start")
+        )
         return fn(A, B, As, decoded.reshape(Bs.shape), **kwargs)
 
     return maybe_compile(run, compiled)

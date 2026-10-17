@@ -223,7 +223,7 @@ def scenarios() -> list[Problem]:
         Problem(weights="nvfp4", per_expert_globals=True),
         Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, per_expert_globals=True),
         Problem(weights="nvfp4", csf_encoding=True, S=8),
-        Problem(weights="nvfp4", csf_encoding=True, empty_expert=True, sentinel_fraction=0.25),
+        Problem(weights="nvfp4", csf_encoding=True, empty_expert=True, sentinel_fraction=0.25, compile=True),
         Problem(weights="nvfp4", csf_encoding=True, activation_format="bf16"),
         Problem(weights="nvfp4", csf_encoding=True, gate=True, activation_format="nvfp4", quantize_output=True, compile=True),
         # swizzled decode (S=8) — the bench's pre-swizzled batched decode arm per fp4 family

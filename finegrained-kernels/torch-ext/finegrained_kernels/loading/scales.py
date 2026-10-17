@@ -397,6 +397,7 @@ def prepare_nvfp4_csf_scales(
 def _decode_fixed_kernel(
     Fixed,
     Out,
+    ExpertStart,
     E: tl.constexpr,
     ROWS: tl.constexpr,
     COLS: tl.constexpr,
@@ -410,36 +411,40 @@ def _decode_fixed_kernel(
     # Keep indices local to an expert; only the expert base needs 64-bit addressing.
     for tile in range(tl.program_id(0), E * tiles, tl.num_programs(0)):
         expert = tile // tiles
-        pair = (tile % tiles) * BLOCK + offsets
-        row = pair // (COLS // 2)
-        slab = expert.to(tl.int64) * (ROWS // 16) + row // 16
-        slab_bytes: tl.constexpr = 16 * (1 + COLS // 2)
-        base = tl.load(Fixed + slab * slab_bytes + row % 16, pair < pairs, other=0).to(
-            tl.uint16
-        )
-        packed = tl.load(
-            Fixed + slab * slab_bytes + 16 + (row % 16) * (COLS // 2) + pair % (COLS // 2),
-            pair < pairs,
-            other=0,
-        ).to(tl.uint16)
-        low = base + (packed & 15)
-        high = base + (packed >> 4)
-        # A contiguous sliced workspace can start at an odd byte.
-        if ALIGNED_OUTPUT:
-            output = Out.to(tl.pointer_type(tl.uint16))
-            tl.store(
-                output + expert.to(tl.int64) * pairs + pair,
-                low | (high << 8),
+        active = True
+        if ExpertStart is not None:
+            active = tl.load(ExpertStart + expert + 1) > tl.load(ExpertStart + expert)
+        if active:
+            pair = (tile % tiles) * BLOCK + offsets
+            row = pair // (COLS // 2)
+            slab = expert.to(tl.int64) * (ROWS // 16) + row // 16
+            slab_bytes: tl.constexpr = 16 * (1 + COLS // 2)
+            base = tl.load(Fixed + slab * slab_bytes + row % 16, pair < pairs, other=0).to(
+                tl.uint16
+            )
+            packed = tl.load(
+                Fixed + slab * slab_bytes + 16 + (row % 16) * (COLS // 2) + pair % (COLS // 2),
                 pair < pairs,
-            )
-        else:
-            values = tl.interleave(low, high).to(tl.uint8).to(tl.float8e4nv, bitcast=True)
-            output_offsets = (tile % tiles) * BLOCK * 2 + tl.arange(0, BLOCK * 2)
-            tl.store(
-                Out + expert.to(tl.int64) * pairs * 2 + output_offsets,
-                values,
-                output_offsets < pairs * 2,
-            )
+                other=0,
+            ).to(tl.uint16)
+            low = base + (packed & 15)
+            high = base + (packed >> 4)
+            # A contiguous sliced workspace can start at an odd byte.
+            if ALIGNED_OUTPUT:
+                output = Out.to(tl.pointer_type(tl.uint16))
+                tl.store(
+                    output + expert.to(tl.int64) * pairs + pair,
+                    low | (high << 8),
+                    pair < pairs,
+                )
+            else:
+                values = tl.interleave(low, high).to(tl.uint8).to(tl.float8e4nv, bitcast=True)
+                output_offsets = (tile % tiles) * BLOCK * 2 + tl.arange(0, BLOCK * 2)
+                tl.store(
+                    Out + expert.to(tl.int64) * pairs * 2 + output_offsets,
+                    values,
+                    output_offsets < pairs * 2,
+                )
 
 
 @triton.jit
@@ -447,10 +452,14 @@ def _apply_exceptions_kernel(
     Exceptions,
     ExpertOffsets,
     Out,
+    ExpertStart,
     PLANE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     expert = tl.program_id(0)
+    if ExpertStart is not None:
+        if tl.load(ExpertStart + expert + 1) == tl.load(ExpertStart + expert):
+            return
     start = tl.load(ExpertOffsets + expert).to(tl.int64)
     end = tl.load(ExpertOffsets + expert + 1).to(tl.int64)
     for base in range(start, end, BLOCK):
@@ -471,6 +480,7 @@ def _decompress_into(
     exceptions: torch.Tensor,
     expert_offsets: torch.Tensor,
     out: torch.Tensor,
+    expert_start: torch.Tensor | None,
 ) -> None:
     experts, rows, cols = out.shape
     with device_context(fixed.device):
@@ -481,6 +491,7 @@ def _decompress_into(
         compile_time_only_triton_wrap(_decode_fixed_kernel)[(programs,)](
             fixed,
             out,
+            expert_start,
             experts,
             rows,
             cols,
@@ -489,7 +500,7 @@ def _decompress_into(
         )
         if exceptions.numel():
             compile_time_only_triton_wrap(_apply_exceptions_kernel)[(experts,)](
-                exceptions, expert_offsets, out, rows * cols, 256
+                exceptions, expert_offsets, out, expert_start, rows * cols, 256
             )
 
 
@@ -499,6 +510,7 @@ def decompress_nvfp4_csf_scales(
     expert_offsets: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
+    expert_start: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Decode prepared CSF streams to dense E4M3 scales for an ordinary NVFP4 GEMM.
 
@@ -507,6 +519,8 @@ def decompress_nvfp4_csf_scales(
     compressed between layers. Consume the workspace before overwriting it; it
     must not be retained for backward or shared by concurrent consumers.
     A shared dense workspace saves memory across layers, not within one layer.
+    Pass the grouped GEMM's cumulative `expert_start` to decode only experts with
+    routed tokens. Inactive workspace planes stay untouched and must not be read.
     """
     if fixed.dtype != torch.uint8 or fixed.ndim != 3 or not fixed.is_contiguous():
         raise ValueError("CSF fixed stream must be contiguous 3D uint8")
@@ -542,5 +556,12 @@ def decompress_nvfp4_csf_scales(
         raise ValueError(f"CSF workspace must be contiguous E4M3 with shape {shape}")
     if any(t.device != out.device for t in (fixed, exceptions, expert_offsets)):
         raise ValueError("CSF buffers and workspace must share a device")
-    _decompress_into(fixed, exceptions, expert_offsets, out)
+    if expert_start is not None and (
+        expert_start.shape != (experts + 1,)
+        or expert_start.dtype not in (torch.int32, torch.int64)
+        or not expert_start.is_contiguous()
+        or expert_start.device != out.device
+    ):
+        raise ValueError("CSF expert_start must be a contiguous device int32/int64 vector of length experts + 1")
+    _decompress_into(fixed, exceptions, expert_offsets, out, expert_start)
     return out
