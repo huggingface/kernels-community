@@ -727,7 +727,6 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
 # kernel (the dense gate fusion and its gate_pointer_only/WS pruners), and one nvfp4 cell
 # (E4M3 scales: the nvfp4_native_ok fence + software decode arms).
 _SWEEP_CELLS = [
-    (Problem(weights="fp8_128x128", activation_format="bf16"), "grouped", block_fp8_weight_only_matmul_grouped_kernel),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True), "grouped", mx_dynamic_matmul_grouped_kernel),
     # K off the BK=128 grid admits the BK=64 rows, the family a K=256 cell never reaches
     (Problem(weights="mxfp4", K=320), "grouped", mx_dynamic_matmul_grouped_kernel),
@@ -736,6 +735,7 @@ _SWEEP_CELLS = [
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", mx_dynamic_matmul_grouped_kernel),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", mx_dynamic_matmul_kernel),
     (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", mx_dynamic_matmul_batched_kernel),
+    (Problem(weights="fp8_128x128", activation_format="bf16"), "grouped", block_fp8_weight_only_matmul_grouped_kernel),
     # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize
     # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is
     # the one a memory-mode fence gets wrong (silently — the tuner forgives what will not lower)

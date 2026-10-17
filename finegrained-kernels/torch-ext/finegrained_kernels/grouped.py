@@ -1436,7 +1436,7 @@ def block_fp8_weight_only_matmul_grouped_kernel(
                 a_ptrs, a_desc, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
                 A_MEMORY_MODE, GatherIdx is not None,
             )
-            w, _ws = load_weight_block_fp8(
+            w = load_weight_block_fp8(
                 b_ptrs, b_desc, Bs, row0, n_off, k * BLOCK_SIZE_K,
                 expert_id64, offs_bn, k * BLOCK_SIZE_K + offs_k,
                 stride_bs_e, stride_bs_n, stride_bs_k,

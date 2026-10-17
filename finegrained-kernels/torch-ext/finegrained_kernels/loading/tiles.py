@@ -496,7 +496,7 @@ def load_weight_block_fp8(
         stride_bs_e, stride_bs_n, stride_bs_k,
         BLOCK_N, BLOCK_K, GATE_SCALES, SWAP_AB, DTYPE,
     )
-    return w, w
+    return w
 
 
 @triton.jit

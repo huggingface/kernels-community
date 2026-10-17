@@ -927,7 +927,7 @@ def mx_weight_only_matmul_2d_kernel(
     ["N", "K", "m_bit_length", "GATE", "BLOCK_N", "BLOCK_K", "GATE_SCALES"],
     n_trials=100,
     finite_check_args=("C",),
-    prune_configs_by={"early_config_prune": block_within_dim_pruner("K")},
+    prune_configs_by={"early_config_prune": compose_pruners(block_within_dim_pruner("K"), smem_pruner())},
 )
 @triton.jit
 def block_fp8_weight_only_matmul_2d_kernel(
@@ -959,7 +959,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         a, _ = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
-        w, _ws = load_weight_block_fp8(
+        w = load_weight_block_fp8(
             b_ptrs, b_ptrs, Bs, 0, pid_n * n_width, k * BLOCK_SIZE_K,
             0, offs_bn, k * BLOCK_SIZE_K + offs_k,
             0, stride_bs_n, stride_bs_k,

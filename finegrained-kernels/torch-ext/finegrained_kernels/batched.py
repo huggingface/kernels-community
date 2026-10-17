@@ -994,6 +994,7 @@ def full_precision_matmul_batched_kernel(
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            smem_pruner(),
         )
     },
 )
@@ -1075,7 +1076,7 @@ def block_fp8_weight_only_matmul_batched_kernel(
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a, unused_activation = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
-        w, _ws = load_weight_block_fp8(
+        w = load_weight_block_fp8(
             b_ptrs, b_ptrs, Bs, 0, 0, 0,
             expert_id, offs_bn, k * BLOCK_SIZE_K + offs_k,
             stride_bs_e, stride_bs_n, stride_bs_k,
