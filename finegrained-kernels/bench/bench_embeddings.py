@@ -86,13 +86,13 @@ def torch_embedding(weight, ids, scale, global_scale, fmt, width, fp4_lut):
         packed = weight[ids // 2].to(torch.int16)
         code = (packed >> ((ids % 2)[:, None] * 4)) & 15
         value = ((code ^ 8) - 8).float()
+    elif fmt in ("nvfp4", "mxfp4"):
+        cols = torch.arange(width, device=weight.device)
+        packed = weight[ids[:, None], cols[None, :] // 2]
+        code = (packed >> ((cols[None, :] % 2) * 4)) & 15
+        value = fp4_lut[code.long()]
     else:
-        value = weight[ids]
-        if fmt in ("nvfp4", "mxfp4"):
-            low, high = fp4_lut[(value & 15).long()], fp4_lut[(value >> 4).long()]
-            value = torch.stack((low, high), -1).flatten(-2)
-        else:
-            value = value.float()
+        value = weight[ids].float()
     if fmt == "fp8":
         selected_scale = scale
     elif fmt in ("fp8_row", "int8"):
@@ -100,6 +100,10 @@ def torch_embedding(weight, ids, scale, global_scale, fmt, width, fp4_lut):
     elif fmt == "fp8_block":
         cols = torch.arange(width, device=weight.device)
         selected_scale = scale[ids[:, None] // 128, cols[None, :] // 128]
+    elif fmt in ("nvfp4", "mxfp4"):
+        selected_scale = scale[ids[:, None], cols[None, :] // (16 if fmt == "nvfp4" else 32)].float()
+        if fmt == "mxfp4":
+            selected_scale = torch.exp2(selected_scale - 127)
     else:
         selected_scale = scale[ids].float()
         if fmt.startswith("mx"):
