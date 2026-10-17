@@ -923,15 +923,29 @@ def mx_weight_only_matmul_2d_kernel(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(tune_block_nk=True, tune_block_m=True),
+    get_accelerator_autotuning_configs(
+        tune_block_nk=True, tune_block_m=True, warp_spec=True,
+        a_memory_modes=("descriptor", "pointer"),
+        b_memory_modes=("descriptor", "pointer"),
+        pre_hook=rebind_weight_only_descriptors,
+    ),
     ["N", "K", "m_bit_length", "GATE", "BLOCK_N", "BLOCK_K", "GATE_SCALES"],
     n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
     finite_check_args=("C",),
-    prune_configs_by={"early_config_prune": compose_pruners(block_within_dim_pruner("K"), smem_pruner())},
+    prune_configs_by={
+        "early_config_prune": compose_pruners(
+            block_within_dim_pruner("K"),
+            gate_stacked_tmem_trap_pruner(),
+            warp_spec_compile_guard_pruner(),
+            descriptor_box_pruner(),
+            smem_pruner(),
+        )
+    },
 )
 @triton.jit
 def block_fp8_weight_only_matmul_2d_kernel(
-    A, B, Bs, C, Bias,
+    A, ADescriptor, B, BDescriptor, Bs, C, Bias,
     M, N, K, m_bit_length,
     stride_a_m, stride_a_k, stride_b_n, stride_b_k,
     stride_bs_n, stride_bs_k, stride_c_m, stride_c_n,
@@ -941,6 +955,9 @@ def block_fp8_weight_only_matmul_2d_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    A_MEMORY_MODE: tl.constexpr = "pointer",
+    B_MEMORY_MODE: tl.constexpr = "pointer",
+    WARP_SPEC: tl.constexpr = False,
     GATE: tl.constexpr = False,
     GATE_SCALES: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
@@ -954,16 +971,19 @@ def block_fp8_weight_only_matmul_2d_kernel(
     pid_m, pid_n, offs_am, offs_bn, offs_k = swizzle_offsets(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GATE=GATE
     )
-    a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, "pointer", True)
-    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, "pointer")
+    a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
+    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE)
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
-    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
-        a, _ = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+        a, _ = load_act_plain(
+            a_ptrs, ADescriptor, pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K, None, 0,
+            A_MEMORY_MODE, False,
+        )
         w = load_weight_block_fp8(
-            b_ptrs, b_ptrs, Bs, 0, pid_n * n_width, k * BLOCK_SIZE_K,
+            b_ptrs, BDescriptor, Bs, 0, pid_n * n_width, k * BLOCK_SIZE_K,
             0, offs_bn, k * BLOCK_SIZE_K + offs_k,
             0, stride_bs_n, stride_bs_k,
-            GATE, False, "pointer", False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            GATE, False, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
             BLOCK_N, BLOCK_K, GATE_SCALES, a.dtype,
         )
         accumulator = accumulator + fp8_dot(a, w, False, BLOCK_SIZE_K)
@@ -1821,12 +1841,14 @@ def block_fp8_weight_only_matmul_2d(
     Bs = ue8m0_as_uint8(Bs)
     dtype = resolve_output_dtype(output_dtype, A, None)
     C = A.new_empty(A.shape[:-1] + (N,), dtype=dtype)
+    a_descriptor = maybe_descriptor(A.view(M, K), [1, 32])
+    b_descriptor = maybe_descriptor(B, [1, 32])
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
         compile_time_only_triton_wrap(block_fp8_weight_only_matmul_2d_kernel)[
             lambda meta: (triton.cdiv(M, meta["BLOCK_SIZE_M"]), triton.cdiv(N, meta["BLOCK_SIZE_N"]))
         ](
-            A, B, Bs, C, bias, M, N, K, int(M).bit_length(),
+            A, a_descriptor, B, b_descriptor, Bs, C, bias, M, N, K, int(M).bit_length(),
             A.stride(-2), A.stride(-1), B.stride(0), B.stride(1),
             Bs.stride(0), Bs.stride(1), C.stride(-2), C.stride(-1),
             bias_stride_e, bias_stride_n,

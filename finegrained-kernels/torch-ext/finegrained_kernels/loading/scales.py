@@ -337,13 +337,30 @@ def dequant_block_fp8_weight_tile(
     """Rescale an FP8 tile to the raw activation dtype, retaining coarse block scales.
 
     Gate/up weight rows alternate per value; their scale rows alternate per block.
+    ``offs_k`` is a contiguous K tile starting at a multiple of its width.
     """
     scale_n = (offs_n // 2 // BLOCK_N) * 2 + offs_n % 2 if GATE_SCALES else offs_n // BLOCK_N
-    ptrs = (Scales + expert * stride_scale_e
-            + scale_n[:, None] * stride_scale_n
-            + (offs_k[None, :] // BLOCK_K) * stride_scale_k)
-    scales = tl.load(ptrs)
-    scales = decode_group_scale(scales)
-    if not SWAP_AB:
-        scales = tl.trans(scales)
-    return (w.to(tl.float32) * scales).to(DTYPE)
+    tile_k: tl.constexpr = offs_k.shape[0]
+    first_k = tl.min(offs_k, 0)
+    tl.device_assert(first_k % tile_k == 0, "weight K tiles must start on their tile grid")
+    if BLOCK_K % tile_k == 0 or tile_k % BLOCK_K == 0:
+        # Broadcast compact K-group scales rather than staging a full FP32 tile.
+        groups: tl.constexpr = max(tile_k // BLOCK_K, 1)
+        ptrs = (Scales + expert * stride_scale_e + scale_n[:, None] * stride_scale_n
+                + (first_k // BLOCK_K + tl.arange(0, groups)[None, :]) * stride_scale_k)
+        scales = decode_group_scale(tl.load(ptrs))
+        if SWAP_AB:
+            w = (w.to(tl.float32).reshape(offs_n.shape[0], groups, tile_k // groups)
+                 * scales[:, :, None]).reshape(offs_n.shape[0], tile_k)
+        else:
+            w = (w.to(tl.float32).reshape(groups, tile_k // groups, offs_n.shape[0])
+                 * tl.trans(scales)[:, None, :]).reshape(tile_k, offs_n.shape[0])
+    else:
+        ptrs = (Scales + expert * stride_scale_e
+                + scale_n[:, None] * stride_scale_n
+                + (offs_k[None, :] // BLOCK_K) * stride_scale_k)
+        scales = decode_group_scale(tl.load(ptrs))
+        if not SWAP_AB:
+            scales = tl.trans(scales)
+        w = w.to(tl.float32) * scales
+    return w.to(DTYPE)

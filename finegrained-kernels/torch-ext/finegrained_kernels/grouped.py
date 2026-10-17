@@ -1313,6 +1313,7 @@ def full_precision_matmul_grouped_kernel(
             warp_spec_memory_mode_pruner(gather_only=True),
             packed_schedule_scope_pruner(),
             descriptor_box_pruner(),
+            gate_stacked_tmem_trap_pruner(),
             smem_pruner(),
         )
     },
