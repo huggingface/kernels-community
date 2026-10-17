@@ -93,6 +93,7 @@ class BayesianAutotuner(Autotuner):
         max_refine_iters: int = 5,
         log_path: str | None = None,
         path_anchor_axes: tuple[str, ...] = (),
+        coupled_axes: tuple[tuple[str, ...], ...] = (),
         finite_check_args: tuple[str, ...] = (),
         **kwargs,
     ):
@@ -123,6 +124,12 @@ class BayesianAutotuner(Autotuner):
         # axis names). Each distinct value combination of these axes gets one guaranteed
         # max-tile anchor; empty = median anchors only.
         self.path_anchor_axes = tuple(path_anchor_axes)
+        # Joint choices share one TPE density and one coordinate-refinement step.
+        self.coupled_axes = tuple(tuple(group) for group in coupled_axes)
+        coupled_names = [name for group in self.coupled_axes for name in group]
+        if any(len(group) < 2 for group in self.coupled_axes) or len(set(coupled_names)) != len(coupled_names):
+            raise ValueError("coupled_axes must contain disjoint groups of at least two configuration fields")
+        self._coupled_names = frozenset(coupled_names)
         # Output arg NAMES (a declaration — the tuner never hardcodes kernel details) whose
         # values are checked for NaN/inf after each config's bench: a config that writes
         # non-finite output scores inf and can never be crowned. The tuner times, it never
@@ -466,9 +473,22 @@ class BayesianAutotuner(Autotuner):
         self.nargs = None
         return ret
 
+    def _search_signatures(self, configs: List[Config]):
+        signatures = []
+        for config in configs:
+            values = config.all_kwargs()
+            signature = {(name,): value for name, value in values.items() if name not in self._coupled_names}
+            for group in self.coupled_axes:
+                try:
+                    signature[group] = tuple(values[name] for name in group)
+                except KeyError as exc:
+                    raise ValueError(f"Unknown coupled_axes configuration field: {exc.args[0]}") from exc
+            signatures.append(tuple(sorted(signature.items())))
+        return signatures
+
     def _bayesian_search(self, configs: List[Config], args, kwargs, key) -> Config:
         timings: Dict[int, float] = {}
-        sigs = [tuple(sorted(c.all_kwargs().items())) for c in configs]
+        sigs = self._search_signatures(configs)
 
         def bench_idx(idx: int) -> float:
             if idx in timings:
@@ -761,7 +781,8 @@ class BayesianAutotuner(Autotuner):
             # without n_trials a 3-trial exploratory winner gets replayed at 100 trials.
             str(self.keys),
             f"n_trials={self.n_trials},n_startup_trials={self.n_startup_trials},gamma={self.gamma},"
-            f"basin_probes={self.basin_probes},max_refine_iters={self.max_refine_iters},runoff={self.runoff}",
+            f"basin_probes={self.basin_probes},max_refine_iters={self.max_refine_iters},runoff={self.runoff},"
+            f"coupled_axes={self.coupled_axes}",
             str(tuning_key),
         ] + [str(c) for c in configs]  # str(Config) is pre_hook-free and process-stable
         cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()
@@ -902,6 +923,7 @@ def bayesian_autotune(
     max_refine_iters: int = 5,
     log_path: str | None = None,
     path_anchor_axes: tuple[str, ...] = (),
+    coupled_axes: tuple[tuple[str, ...], ...] = (),
     finite_check_args: tuple[str, ...] = (),
     cache_results: bool = True,
     reset_to_zero=None,
@@ -923,6 +945,8 @@ def bayesian_autotune(
                               optimum — one guaranteed max-tile anchor per value combo
                               (see _basin_anchor_indices); the kernel declares them, the
                               tuner stays independent of configuration details
+    coupled_axes:             groups of config fields treated as joint choices by TPE and
+                              refinement, including Config fields such as num_stages
     max_failures:             abort the tune once this many configs fail to compile/run before
                               the measured budget is met (default n_trials; env override
                               FINEGRAINED_AUTOTUNE_MAX_FAILURES). Without it a broadly broken
@@ -949,6 +973,7 @@ def bayesian_autotune(
             max_refine_iters=max_refine_iters,
             log_path=log_path,
             path_anchor_axes=path_anchor_axes,
+            coupled_axes=coupled_axes,
             finite_check_args=finite_check_args,
             cache_results=cache_results,
             **kwargs,
