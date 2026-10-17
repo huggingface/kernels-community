@@ -1,18 +1,15 @@
-"""Layer forwards for WeatherNext 2 attention and its shared mask preparation.
-
-Only `forward` is defined: `kernels` binds it onto the model's own module, so `self.q_proj`,
-`self.head_dim` and the rest are the ones `transformers` built.
-"""
+"""Attention forwards bound to the model's existing modules."""
 
 import torch
 from torch import nn
 
-from .banded_attention import PreparedMask, banded_attention
-from .banded_attention import _prepare_mask as _prepare_mask
-from .grid import WeatherNext2ConditionedMlp as WeatherNext2ConditionedMlp
-from .grid import WeatherNext2ForecastHead as WeatherNext2ForecastHead
-from .grid import WeatherNext2GridToMesh as WeatherNext2GridToMesh
-from .grid import WeatherNext2MeshToGrid as WeatherNext2MeshToGrid
+from .banded_attention import PreparedMask, _prepare_mask as _prepare_mask, banded_attention
+from .grid import (
+    WeatherNext2ConditionedMlp as WeatherNext2ConditionedMlp,
+    WeatherNext2ForecastHead as WeatherNext2ForecastHead,
+    WeatherNext2GridToMesh as WeatherNext2GridToMesh,
+    WeatherNext2MeshToGrid as WeatherNext2MeshToGrid,
+)
 
 
 _prepare_mask = torch.compiler.disable(_prepare_mask)
@@ -26,14 +23,7 @@ def _gather_neighbouring_blocks(states: torch.Tensor) -> torch.Tensor:
 
 
 def _banded_mask(attention_mask):
-    """The geometry's banded mask, as `[blocks, block, 3 * block]`, or None.
-
-    `masking_utils.create_bidirectional_mask` inserts a singleton head axis, so the mask
-    reaching the layer is `[blocks, 1, block, 3 * block]` under sdpa and eager. That is the
-    same mask, so the axis is dropped rather than treated as a different shape; without this
-    the guard rejects every mask the model actually produces and the kernel silently never
-    runs. A `BlockMask` from flex attention is not a tensor and is rejected here.
-    """
+    """Return the banded mask without its optional singleton head axis, or None."""
     if isinstance(attention_mask, PreparedMask):
         return attention_mask
     if not isinstance(attention_mask, torch.Tensor) or attention_mask.dtype != torch.bool:
@@ -64,10 +54,7 @@ def _is_banded(attention_mask, hidden_states) -> bool:
 
 
 def _needs_grad(*tensors: torch.Tensor) -> bool:
-    """Is autograd going to want a backward through this?
-
-    Triton attention is forward-only. Training must retain the differentiable reference path.
-    """
+    """Whether any input needs the differentiable reference path."""
     return torch.is_grad_enabled() and any(t.requires_grad for t in tensors)
 
 
@@ -92,11 +79,7 @@ def _reference_attention(query, key, value, attention_mask, scaling):
 
 @torch.compiler.assume_constant_result
 def _tf32_allowed() -> bool:
-    """Does PyTorch allow TF32 for float32 matmuls?
-
-    Dynamo cannot trace the read, so it is taken as a constant at trace time; Dynamo's global-state
-    guard on `allow_tf32` retraces when the setting changes.
-    """
+    """Read PyTorch's TF32 setting under Dynamo's global-state guard."""
     matmul = torch.backends.cuda.matmul
     # `fp32_precision` reflects both the legacy and the fine-grained precision APIs, whereas
     # `allow_tf32` raises once the two have been mixed.
@@ -106,14 +89,7 @@ def _tf32_allowed() -> bool:
 
 
 def _float32_precision(device: torch.device) -> str:
-    """The `tl.dot` precision that matches PyTorch's float32 matmul setting.
-
-    By default PyTorch keeps float32 matmuls at full precision. On NVIDIA, Triton's IEEE dot does
-    that without tensor cores, which makes the kernel slower than the sdpa path it replaces, so CUDA
-    uses TF32x3 there: float32-level accuracy on tensor cores. When TF32 is allowed (e.g.
-    `torch.set_float32_matmul_precision("high")`), CUDA uses Triton's default, TF32. Other
-    backends keep IEEE.
-    """
+    """Follow PyTorch's float32 policy, using TF32x3 for full-precision NVIDIA dots."""
     if device.type != "cuda" or torch.version.hip is not None:
         return "ieee"
     return "default" if _tf32_allowed() else "tf32x3"

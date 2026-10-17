@@ -91,9 +91,8 @@ geometry guarantees this; the empty rows past the last mesh node are handled.
 
 The attention layer accepts boolean geometry masks, with an optional singleton head axis,
 and masks whose block axis is folded into the batch axis. Other tensor layouts take
-the gather-plus-SDPA fallback. `attn_implementation="flex_attention"` is unsupported: that
-hands the layer a `BlockMask`, which neither path can read, so it raises rather than
-quietly dropping the mask.
+the gather-plus-SDPA fallback. The optimized attention requires SDPA; other attention
+implementations, including flex attention, keep their original forward.
 
 ## Validation
 

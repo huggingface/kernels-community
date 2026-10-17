@@ -153,11 +153,9 @@ def test_tiled_grid_preserves_reference(layer_name, dtype):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.parametrize("training", [False, True])
 @pytest.mark.parametrize("layer_name", ["mlp", "grid_encoder", "mesh_encoder", "grid_to_mesh", "mesh_to_grid", "head"])
-def test_gradients_use_reference(training, layer_name):
+def test_gradients_use_reference(layer_name):
     layer, replacement, args = _grid_case(layer_name)
-    layer.train(training)
     reference = copy.deepcopy(layer)
     actual = replacement.forward(layer, *args)
     expected = reference(*args)

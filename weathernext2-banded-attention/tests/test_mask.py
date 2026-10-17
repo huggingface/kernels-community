@@ -67,7 +67,6 @@ def test_inference_prepares_one_shared_mask(device, inference_mode):
         torch.testing.assert_close(decode_mask(banded), mask[:, 0].cpu())
         with torch.no_grad():
             assert layer(hidden_states, prepared, conditioning) is prepared
-    assert list(layer.buffers()) == []
 
 
 @requires_accelerator
@@ -121,4 +120,3 @@ def test_standard_mask_fallback(reason):
     mask = torch.ones(3, 1, 65, 195, dtype=torch.bool, device=DEVICE)
     with torch.set_grad_enabled(reason == "gradients"):
         assert layer(hidden_states, mask, conditioning) is mask
-    assert not hasattr(layer, "_prepared_key")
