@@ -2107,6 +2107,8 @@ for ri, row in enumerate(present_rows):
         if eager_only_drawn:
             handles.append(mpatches.Patch(facecolor="none", edgecolor="black",
                                           hatch="..", label="eager (no cudagraph)"))
+        if weight_only_only and row == "linear quantized" and regime == "decode":
+            ax.set_ylim(top=1.4 * ax.get_ylim()[1])
         ax.legend(handles=handles, loc="upper left", fontsize=8)
 benchmark_title = "FP8 weight-only" if weight_only_only else "MoE bench — finegrained-kernels vs finegrained-fp8 + references"
 fig.suptitle(f"{benchmark_title}  "
