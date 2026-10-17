@@ -13,11 +13,11 @@
 # limitations under the License.
 
 
-from .embedding import embedding_lookup
 from .matmul import matmul_2d
 from .batched import matmul_batched
 from .grouped import matmul_grouped
 from .moe import moe_fused_batched, moe_fused_grouped
+from .embedding import embedding_lookup
 from . import backward
 from .formats import get_supported_act_fns
 from .norm import get_supported_norms, rms_norm_rows
@@ -25,7 +25,6 @@ from .swizzle import swizzle_mx_scales, unswizzle_mx_scales
 from .quant import mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant
 
 __all__ = [
-    "embedding_lookup",
     # the three GEMM dispatchers (the weight format is read off the tensors; `activation_format`
     # names the activations', the gate|up fusion rides as kwargs)
     "matmul_2d",
@@ -34,6 +33,8 @@ __all__ = [
     # the fused MoE forwards over them
     "moe_fused_batched",
     "moe_fused_grouped",
+    # selected-row embedding lookup
+    "embedding_lookup",
     # importing it registers the dgrad formulas on the ops, so a forward call differentiates
     "backward",
     "get_supported_act_fns",
