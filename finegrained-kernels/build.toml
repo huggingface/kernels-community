@@ -1,6 +1,6 @@
 [general]
 name = "finegrained-kernels"
-version = 1
+version = 0
 license = "Apache-2.0"
 backends = [
     "cuda",

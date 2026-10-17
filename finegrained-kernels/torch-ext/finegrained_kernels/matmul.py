@@ -933,6 +933,7 @@ def mx_weight_only_matmul_2d_kernel(
     ["N", "K", "m_bit_length", "GATE", "BLOCK_N", "BLOCK_K", "GATE_SCALES"],
     n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
+    coupled_axes=(("BLOCK_SIZE_K", "num_stages"),),
     finite_check_args=("C",),
     prune_configs_by={
         "early_config_prune": compose_pruners(
