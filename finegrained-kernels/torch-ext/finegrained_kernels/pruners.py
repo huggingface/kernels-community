@@ -1108,10 +1108,14 @@ def scalar_max_m_pruner(m_arg: str, max_m: int = 64):
 
 
 def swap_max_m_pruner(m_arg: str, max_m: int):
-    """Keep swapped GEMM candidates within the measured activation-row range."""
+    """Keep measured small-row swaps in one M tile, retaining BM1/2 candidates for M1."""
 
     def ok(c, args):
-        return not c.kwargs.get("SWAP_AB") or args[m_arg] <= max_m
+        if not c.kwargs.get("SWAP_AB"):
+            return True
+        m = args[m_arg]
+        bm = c.kwargs["BLOCK_SIZE_M"]
+        return m <= max_m and m <= bm <= triton.next_power_of_2(max(2, m))
 
     return config_filter(ok)
 

@@ -925,7 +925,7 @@ def mx_weight_only_matmul_2d_kernel(
 @bayesian_autotune(
     get_accelerator_autotuning_configs(
         tune_block_nk=True, tune_block_m=True, warp_spec=True,
-        swap_ab=True, swap_block_sizes_m=(1, 2),
+        swap_ab=True, swap_block_sizes_m=(1, 2, 4, 8),
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_weight_only_descriptors,
@@ -937,7 +937,7 @@ def mx_weight_only_matmul_2d_kernel(
     prune_configs_by={
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("K"),
-            swap_max_m_pruner("M", max_m=1),
+            swap_max_m_pruner("M", max_m=8),
             gate_stacked_tmem_trap_pruner(),
             warp_spec_compile_guard_pruner(),
             descriptor_box_pruner(),
@@ -1863,7 +1863,9 @@ def block_fp8_weight_only_matmul_2d(
         compile_time_only_triton_wrap(block_fp8_weight_only_matmul_2d_kernel)[
             lambda meta: (triton.cdiv(M, meta["BLOCK_SIZE_M"]), triton.cdiv(N, meta["BLOCK_SIZE_N"]))
         ](
-            A, a_descriptor, B, b_descriptor, Bs, C, bias, M, N, K, int(M).bit_length(),
+            A, a_descriptor, B, b_descriptor, Bs, C, bias, M, N, K,
+            # M=2 and M=3/4 need different one-tile swaps and cached configs.
+            max(int(M) - 1, 0).bit_length(),
             A.stride(-2), A.stride(-1), B.stride(0), B.stride(1),
             Bs.stride(0), Bs.stride(1), C.stride(-2), C.stride(-1),
             bias_stride_e, bias_stride_n,
