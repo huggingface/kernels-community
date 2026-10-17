@@ -124,7 +124,10 @@ if SMOKE:
     os.environ.setdefault("FINEGRAINED_AUTOTUNE_TRIALS", "3")
 
 import torch  # noqa: E402
-from torch.nn.functional import ScalingType, scaled_mm  # noqa: E402
+try:
+    from torch.nn.functional import ScalingType, scaled_mm  # noqa: E402
+except ImportError:
+    ScalingType = scaled_mm = None
 from triton.testing import do_bench, do_bench_cudagraph  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -809,6 +812,7 @@ def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_
     _mark_static(gu, gus, dns)  # derived closure tensors: unmarked, cudagraph trees re-copy them every compiled call
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], activation_format=_activation_format(cfg),
+              activation_scale_ub=cfg.get("activation_scale_ub"),
               gate_up_proj_weight_global_scale=gu_g, down_proj_weight_global_scale=dn_g,
               **nvfp4_kw, **static_kw)
     return lambda: fn(hidden, idx, w, gu, dn, gus, dns, **kw)
@@ -827,6 +831,7 @@ def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, 
     _mark_static(gu, gus, dns)  # derived closure tensors: unmarked, cudagraph trees re-copy them every compiled call
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], activation_format=_activation_format(cfg),
+              activation_scale_ub=cfg.get("activation_scale_ub"),
               gate_up_proj_weight_global_scale=gu_g, down_proj_weight_global_scale=dn_g,
               **nvfp4_kw, **static_kw)
     return lambda: fn(hidden, idx, w, gu, dn, gus, dns, **kw)
@@ -1637,6 +1642,8 @@ def bench_attn_row(row, pname, cfg, rows_out):
         def vllm_mm(a):
             aq, a_s = _vllm_tensor_quant(a, scale_ub=scale_ub, use_per_token_if_dynamic=True)
             return _vllm_scaled_mm(aq, mat_b, a_s, Ws.t(), out_dtype=a.dtype)
+        if scaled_mm is None:
+            torch_mm = None
     elif cfg["weights"] == "fp8_tensor" and cfg.get("static") and not (MOCK or REPLOT):
         # per-tensor static: one fp32 scale per operand IS scaled_mm's TensorWise, so this row
         # has a like-for-like cuBLAS bar after all. The calibrated activation scale is passed in
@@ -1669,6 +1676,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
         attn_arms = {
             "finegrained-kernels": lambda: fgm.matmul_2d(
                 x, W, attn_act_scale, Ws_fgm, activation_format=_activation_format(cfg), output_dtype=torch.bfloat16,
+                activation_scale_ub=cfg.get("activation_scale_ub"),
                 b_global_scale=W_g),
         }
         if torch_mm is not None:
@@ -1837,7 +1845,8 @@ def _run_task(kind, pname, cfg, rows_out):
                             and not (cfg["swiglu_alpha"] is None and cfg["swiglu_limit"] is None))
         unavailable = (("vllm",) if vllm_fused_experts is None else ()) + (
             ("trtllm",) if trtllm_fp8_block_scale_routed_moe is None or trtllm_gated_gap else ()) + (
-            ("fbgemm",) if _fbgemm_rowwise_grouped is None else ())
+            ("fbgemm",) if _fbgemm_rowwise_grouped is None else ()) + (
+            ("torch_rowwise",) if scaled_mm is None else ())
         quant_arms = tuple(a for a in quant_arms if a not in unavailable)
         # Arms whose kernel is known to TRAP asynchronously go LAST: a trap poisons the CUDA
         # context, which is unrecoverable in-process, so every arm benched after it blanks

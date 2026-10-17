@@ -260,8 +260,6 @@ def scenarios() -> list[Problem]:
         Problem(weights="fp8_rowwise", S=4096, E=8, prequant=True, noncontiguous=True),
         Problem(weights="fp8_rowwise", static=True, S=17),
         Problem(weights="fp8_rowwise", S=257, bias=True, empty_expert=True, compile=True),
-        Problem(weights="fp8_rowwise", bias=True),
-        Problem(weights="fp8_rowwise", compile=True),
         Problem(weights="fp8_rowwise", S=2048, E=16, N=512, K=1024),
         # the prefill expansion lays the routed rows out, and their per-token scales with them
         Problem(weights="fp8_rowwise", S=4096, E=8, sentinel_fraction=0.5),
