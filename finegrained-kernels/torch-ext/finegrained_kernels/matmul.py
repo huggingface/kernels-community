@@ -24,7 +24,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_weight_only_descriptors
-from .formats import block_fp8_weight_scale_grid, check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
+from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, mx_scale_family, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands
 from .loading.scales import apply_global_scale, dequant_block_fp8_weight, mx_2d_scale_ptrs
@@ -61,8 +61,6 @@ from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, gate_stacked_tmem_tr
 # inline either way.
 MX_MATMUL_ACT_PREQUANT_MIN_M = 16
 STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
-# Full-weight conversion is amortized across prefill rows; decode keeps its inline conversion.
-FP8_WEIGHT_ONLY_DEQUANT_MIN_M = 1024
 # Block-dynamic has NO gate: offline wins at EVERY M incl. M=1 (24.7 vs 31.0us, isolated
 # arm A/B, graph-timed, H=6144 b128) — the inline arm pays a per-tile fp32 amax+div. The
 # always-offline paths (bd 2D/batched/grouped, fused gate_ups, MX grouped) quantize

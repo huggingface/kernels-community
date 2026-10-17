@@ -17,6 +17,9 @@ import triton
 
 from .compat import MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, NVFP4_SCALE_GROUP_K
 
+# Amortize weight conversion across this many activation rows per GEMM.
+FP8_WEIGHT_ONLY_DEQUANT_MIN_M = 1024
+
 def ue8m0_as_uint8(scale: torch.Tensor | None) -> torch.Tensor | None:
     """View UE8M0 (``float8_e8m0fnu``) weight scales as ``uint8`` for the Triton
     binder, which doesn't recognize the dtype; kernels decode ``2^(exp-127)``

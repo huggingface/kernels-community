@@ -25,7 +25,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
-from .formats import check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
+from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, check_activation_format, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .loading.scales import dequant_block_fp8_weight
@@ -37,6 +37,7 @@ from .loading.tiles import (
     load_act_plain,
     load_act_static,
     load_weight_block_dynamic,
+    load_weight_block_fp8,
     load_weight_mx,
     load_weight_plain,
     load_weight_static,
@@ -1291,6 +1292,197 @@ def full_precision_matmul_grouped_kernel(
         )
 
 
+@bayesian_autotune(
+    get_accelerator_autotuning_configs(
+        tune_block_nk=True,
+        warp_spec=True,
+        tune_block_m=True,
+        packed_schedule=True,
+        a_memory_modes=("descriptor", "pointer"),
+        b_memory_modes=("descriptor", "pointer"),
+        pre_hook=rebind_grouped_descriptors,
+    ),
+    # GATE keys the gate|up arm separately (its dot is 2*BN wide, a different tile optimum).
+    ["N", "K", "tokens_per_expert_bit_length", "GATE", "BLOCK_N", "BLOCK_K", "GATE_SCALES"],
+    n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
+    # BLOCK_SIZE_K is a tuned axis and the K-loop is maskless — veto non-dividing BKs.
+    prune_configs_by={
+        "early_config_prune": compose_pruners(
+            block_within_dim_pruner("K"),
+            block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            warp_spec_compile_guard_pruner(),
+            warp_spec_memory_mode_pruner(gather_only=True),
+            packed_schedule_scope_pruner(),
+            descriptor_box_pruner(),
+            gate_stacked_tmem_trap_pruner(),
+            smem_pruner(),
+        )
+    },
+)
+@triton.jit
+def block_fp8_weight_only_matmul_grouped_kernel(
+    A,  # (num_tokens, K) BF16/FP16 activations, any row order
+    ADescriptor,  # host TMA descriptor over A (rows, K), box (BM, BK); read iff A_MEMORY_MODE != "pointer"
+    B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
+    BDescriptor,  # host TMA descriptor over B viewed (E, 2N|N, K), box (1, (2|1)*BN, BK); read iff B_MEMORY_MODE != "pointer"
+    Bs,  # coarse FP8 weight scales
+    C,  # (S, N) output; under GATE the GLU intermediate
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
+    GatherIdx,  # (S,) int32 — sorted position -> source row of A; read only when not None
+    ScatterIdx,  # (S,) int32 — sorted position -> destination row of C; read only when not None
+    ExpertStart,  # (NUM_EXPERTS_POW2 + 1,) int32 — cumulative row starts, S sentinel
+    Schedule,  # packed tile schedule (build_packed_schedule); read iff PACKED_SCHEDULE
+    # Shape
+    S,
+    N,
+    K,
+    num_experts,
+    tokens_per_expert_bit_length,  # autotune key only
+    # Strides
+    stride_a_m,
+    stride_a_k,
+    stride_b_e,
+    stride_b_k,
+    stride_b_n,
+    stride_bs_e,
+    stride_bs_n,
+    stride_bs_k,
+    stride_c_m,
+    stride_c_n,
+    stride_bias_e,
+    stride_bias_n,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_EXPERTS_POW2: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    WARP_SPEC: tl.constexpr = False,
+    PACKED_SCHEDULE: tl.constexpr = False,
+    B_MEMORY_MODE: tl.constexpr = "pointer",
+    A_MEMORY_MODE: tl.constexpr = "pointer",
+    GATE: tl.constexpr = False,
+    GATE_SCALES: tl.constexpr = False,
+    ACT_FN: tl.constexpr = "silu",
+    SWIGLU_ALPHA: tl.constexpr = None,
+    SWIGLU_LIMIT: tl.constexpr = None,
+    SIMULATE_UNFUSED: tl.constexpr = False,
+    INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+):
+    """Persistent FP8 W8A16 GEMM with optional fused gate/up activation."""
+    start_pid = tl.program_id(axis=0)
+    if PACKED_SCHEDULE:
+        total_m_tiles = load_packed_schedule(Schedule, BLOCK_SIZE_M)
+        prefetched = prefetch_packed_entry(
+            Schedule, start_pid // tl.cdiv(N, BLOCK_SIZE_N), total_m_tiles
+        )
+    else:
+        exp_start, freqs, tile_start_excl, total_m_tiles, e_offs = build_tile_layout(
+            ExpertStart, NUM_EXPERTS_POW2, BLOCK_SIZE_M
+        )
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    for tile_id in tl.range(start_pid, total_m_tiles * num_n_tiles, NUM_SMS):
+        if PACKED_SCHEDULE:
+            pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
+                resolve_grouped_tile_packed(
+                    tile_id, num_n_tiles, prefetched,
+                    GatherIdx, ScatterIdx, BLOCK_SIZE_N, BLOCK_SIZE_M, GATE,
+                )
+            )
+        else:
+            pid_n, _, expert_id64, in_row, out_row, row_mask, offs_bn, row0, n_off, m_start = (
+                resolve_grouped_tile(
+                    tile_id,
+                    num_n_tiles,
+                    exp_start,
+                    freqs,
+                    tile_start_excl,
+                    e_offs,
+                    GatherIdx,
+                    ScatterIdx,
+                    BLOCK_SIZE_N,
+                    BLOCK_SIZE_M,
+                    GATE,
+                )
+            )
+        if PACKED_SCHEDULE:
+            prefetched = prefetch_packed_entry(
+                Schedule, (tile_id + NUM_SMS) // num_n_tiles, total_m_tiles
+            )
+        a_ptrs = operand_tile_ptrs(A, in_row, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
+        b_ptrs = weight_tile_ptrs(
+            B + expert_id64 * stride_b_e,
+            offs_bn,
+            offs_k,
+            stride_b_n,
+            stride_b_k,
+            False,
+        )
+
+        acc = acc_init("dot", BLOCK_SIZE_M, (2 if GATE else 1) * BLOCK_SIZE_N, False)
+        # Device-built weight descriptors address a 2D slab for this expert.
+        a_desc = operand_tile_descriptor(
+            ADescriptor, A, S, K, stride_a_m, 1,  # K is the contiguous dim of (S, K)
+            BLOCK_SIZE_M, BLOCK_SIZE_K, A_MEMORY_MODE,
+        )
+        b_desc = operand_tile_descriptor(
+            BDescriptor, B + expert_id64 * stride_b_e, N, K, stride_b_n, 1,  # and of the slab
+            BLOCK_SIZE_N, BLOCK_SIZE_K, B_MEMORY_MODE, GATE,
+        )
+        B_DESCRIPTOR_IS_2D: tl.constexpr = B_MEMORY_MODE == "device_descriptor"
+        for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
+            a, _as = load_act_plain(
+                a_ptrs, a_desc, m_start, k * BLOCK_SIZE_K, row_mask, in_row,
+                A_MEMORY_MODE, GatherIdx is not None,
+            )
+            w = load_weight_block_fp8(
+                b_ptrs, b_desc, Bs, row0, n_off, k * BLOCK_SIZE_K,
+                expert_id64, offs_bn, k * BLOCK_SIZE_K + offs_k,
+                stride_bs_e, stride_bs_n, stride_bs_k,
+                GATE, True, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+                BLOCK_N, BLOCK_K, GATE_SCALES, a.dtype,
+                B_DESCRIPTOR_IS_2D=B_DESCRIPTOR_IS_2D,
+            )
+            acc = acc + fp8_dot(a, w, False, BLOCK_SIZE_K)
+            if A_MEMORY_MODE == "pointer":
+                a_ptrs += BLOCK_SIZE_K * stride_a_k
+            if B_MEMORY_MODE == "pointer":
+                b_ptrs += BLOCK_SIZE_K * stride_b_k
+
+        gemm_epilogue(
+            C,
+            None,  # no requant arm here
+            acc,
+            out_row,
+            pid_n,
+            tile_id // num_n_tiles,
+            row_mask,
+            stride_c_m,
+            stride_c_n,
+            1,  # Cs strides: unread, Cs is None
+            1,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            GATE,
+            None,
+            1,
+            ACT_FN,
+            SWIGLU_ALPHA,
+            SWIGLU_LIMIT,
+            SIMULATE_UNFUSED,
+            INTERMEDIATE_DTYPE,
+            Bias=Bias,
+            stride_bias_e=stride_bias_e,
+            stride_bias_n=stride_bias_n,
+            global_row=expert_id64,
+        )
+
+
+
 @compile_time_only_triton_op(
     add_op_namespace_prefix("w8a8_block_dynamic_fp8_matmul_grouped"),
     mutates_args=(),
@@ -2129,20 +2321,84 @@ def block_fp8_weight_only_matmul_grouped(
     *,
     interleaved_scales: bool = False,
 ) -> List[torch.Tensor]:
-    """FP8 W8A16 prefill: dequantize active experts once, then run the full-precision GEMM."""
+    """FP8 W8A16 grouped GEMM; stage weights only when routed reuse amortizes conversion."""
     validate_dense_operands(A, B)
     assert A.dtype in (torch.bfloat16, torch.float16), "FP8 weight-only takes raw BF16/FP16 activations"
     assert activation_format in (None, "bf16") and not quantize_output, (
         "FP8 weight-only requires unquantized activations and output"
     )
-    weights = dequant_block_fp8_weight(
-        B, Bs, A.dtype, gate=gate or interleaved_scales, expert_start=expert_start,
+
+    _, K = A.shape
+
+    num_experts, _, N = expert_weight_shape(B, gate)
+    S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
+    if S >= FP8_WEIGHT_ONLY_DEQUANT_MIN_M * num_experts:
+        weights = dequant_block_fp8_weight(
+            B, Bs, A.dtype, gate=gate or interleaved_scales, expert_start=expert_start,
+        )
+        return full_precision_matmul_grouped(
+            A, weights, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit,
+            simulate_unfused, activation_format, quantize_output, output_dtype,
+            gather_idx, scatter_idx, bias=bias,
+        )
+    Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate or interleaved_scales)
+    Bs = ue8m0_as_uint8(Bs)
+
+    output_dtype = resolve_output_dtype(output_dtype, A, None)
+    C = A.new_empty(S, N, dtype=output_dtype)
+    num_sms = persistent_program_count(A.device.index)
+    a_descriptor, b_descriptor = build_grouped_operand_descriptors(
+        A, B.view(num_experts, 2 * N if gate else N, K)
     )
-    return full_precision_matmul_grouped(
-        A, weights, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit,
-        simulate_unfused, activation_format, quantize_output, output_dtype,
-        gather_idx, scatter_idx, bias=bias,
-    )
+    # one launch per call (graph-safe, ~2µs) so PACKED_SCHEDULE and inline configs share
+    # identical launch args during tunes
+    schedule = build_packed_schedule(expert_start, S, num_experts)
+
+    with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
+        compile_time_only_triton_wrap(block_fp8_weight_only_matmul_grouped_kernel)[(num_sms,)](
+            A,
+            a_descriptor,
+            B,
+            b_descriptor,
+            Bs,
+            C,
+            bias,
+            gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
+            scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
+            expert_start,
+            schedule,
+            S,
+            N,
+            K,
+            num_experts,
+            tokens_per_expert_bucket(S, num_experts),
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            Bs.stride(0),
+            Bs.stride(1),
+            Bs.stride(2),
+            C.stride(0),
+            C.stride(1),
+            bias_stride_e,
+            bias_stride_n,
+            NUM_EXPERTS_POW2=triton.next_power_of_2(num_experts),
+            NUM_SMS=num_sms,
+            BLOCK_N=scale_block_n,
+            BLOCK_K=scale_block_k,
+            GATE=gate,
+            GATE_SCALES=(gate or interleaved_scales) and Bs.shape[1] > 1,
+            ACT_FN=act_fn,
+            SWIGLU_ALPHA=swiglu_alpha,
+            SWIGLU_LIMIT=swiglu_limit,
+            SIMULATE_UNFUSED=simulate_unfused,
+            INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+        )
+
+    return [C]
 
 
 @compile_time_only_triton_op(
