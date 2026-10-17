@@ -21,6 +21,7 @@ from . import backward
 from .formats import get_supported_act_fns
 from .norm import get_supported_norms, rms_norm_rows
 from .swizzle import swizzle_mx_scales, unswizzle_mx_scales
+from .loading.scales import prepare_nvfp4_csf_scales, decompress_nvfp4_csf_scales
 from .quant import mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant
 
 __all__ = [
@@ -42,6 +43,8 @@ __all__ = [
     # quantizers a loader uses to quantize weights into the group formats
     "swizzle_mx_scales",
     "unswizzle_mx_scales",
+    "prepare_nvfp4_csf_scales",
+    "decompress_nvfp4_csf_scales",
     "mxfp8_act_quant",
     "mxfp4_act_quant",
     "nvfp4_act_quant",
