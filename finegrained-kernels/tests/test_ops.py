@@ -42,6 +42,7 @@ from utils import (  # type: ignore
     SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
+    dq_block_fp8,
     dq_grouped,
     dq_scale,
     make_static_activation_scale,
@@ -802,93 +803,185 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
 # Embedding lookup has no GEMM operands or epilogue: check the selected-row operation directly.
 
 
-def _embedding_table(packed, dtype, sliced=False):
-    device = TEST_DEVICE
-    rows, width = 37, 160
-    if packed:
-        weight = torch.randint(
-            0, 256, (rows, width // 2), device=device, dtype=torch.uint8
+_EMBEDDING_CASES = [
+    pytest.param("fp8", "tensor", dtype, id=f"fp8_tensor_{dtype}")
+    for dtype in (torch.float32, torch.bfloat16, torch.float16)
+] + [
+    pytest.param("fp8", "row", torch.bfloat16, id="fp8_row"),
+    pytest.param("fp8", "block", torch.float32, id="fp8_block"),
+    pytest.param("nvfp4", "group", torch.bfloat16, id="nvfp4"),
+    pytest.param("mxfp8", "group", torch.bfloat16, id="mxfp8"),
+    pytest.param("mxfp4", "group", torch.float16, id="mxfp4"),
+    pytest.param("int8", "row", torch.float32, id="int8"),
+    pytest.param("int4", "group", torch.bfloat16, id="int4"),
+]
+
+
+def _embedding_table(weight_format, layout, dtype, sliced=False):
+    rows, width = 38, 160
+    if weight_format in ("nvfp4", "mxfp4", "int4"):
+        shape = (rows // 2, width) if weight_format == "int4" else (rows, width // 2)
+        weight = torch.randint(0, 256, shape, device=TEST_DEVICE, dtype=torch.uint8)
+        # Every nibble, including signed INT4's -8/-1 and E2M1's signed zero.
+        weight[0] = (
+            torch.arange(16, device=TEST_DEVICE, dtype=torch.uint8)
+            .mul(17)
+            .repeat(shape[1] // 16)
         )
-        scale = (torch.rand(rows, width // 16, device=device) * 3 + 0.125).to(
+    elif weight_format == "int8":
+        weight = torch.randint(
+            -128, 128, (rows, width), device=TEST_DEVICE, dtype=torch.int8
+        )
+    else:
+        weight = (torch.randn(rows, width, device=TEST_DEVICE) * 3).to(
             torch.float8_e4m3fn
         )
-        weight[0] = torch.arange(16, device=device, dtype=torch.uint8).mul(17).repeat(5)
-        global_scale = torch.tensor([0.0371], device=device)
-        if sliced:
-            weight, scale = weight[:, :40].view(torch.int8), scale[:, :5]
+    group = 16 if weight_format == "nvfp4" else 32
+    scale_shape = {
+        "tensor": (1,),
+        "row": (rows,),
+        "block": (2, 5),
+        "group": (rows, width // group),
+    }[layout]
+    if weight_format in ("mxfp8", "mxfp4"):
+        scale = torch.randint(
+            124, 131, scale_shape, device=TEST_DEVICE, dtype=torch.uint8
+        )
     else:
-        weight = (torch.randn(rows, width, device=device) * 3).to(torch.float8_e4m3fn)
-        scale = torch.tensor([0.375], device=device, dtype=dtype)
-        global_scale = None
-        if sliced:
-            weight = weight[:, :80]
+        scale_dtype = torch.float8_e4m3fn if weight_format == "nvfp4" else dtype
+        scale = (torch.rand(scale_shape, device=TEST_DEVICE) * 3 + 0.125).to(
+            scale_dtype
+        )
+    global_scale = (
+        torch.tensor([0.0371], device=TEST_DEVICE) if weight_format == "nvfp4" else None
+    )
+    if sliced:
+        if layout == "row":
+            scale = scale[:, None]
+        # Retain shape while exercising non-unit column strides and offset storage.
+        views = []
+        for tensor in (weight, scale):
+            backing = torch.empty(
+                (*tensor.shape[:-1], tensor.shape[-1] * 2 + 1),
+                device=tensor.device,
+                dtype=tensor.dtype,
+            )
+            view = backing[..., 1::2]
+            view.copy_(tensor)
+            views.append(view)
+        weight, scale = views
+        if weight_format == "nvfp4":
+            weight = weight.view(torch.int8)
+        if weight_format in ("mxfp8", "mxfp4"):
+            scale = scale.view(torch.float8_e8m0fnu)
     return weight, scale, global_scale
 
 
-def _embedding_reference(weight, ids, scale, global_scale, dtype):
-    rows = torch.nn.functional.embedding(ids, weight)
-    if global_scale is None:
-        return rows.to(scale.dtype) * scale
-    selected_scales = torch.nn.functional.embedding(ids, scale)
-    return (dq_grouped(rows, selected_scales, 16) * global_scale).to(dtype)
-
+def _embedding_reference(
+    weight, ids, scale, global_scale, dtype, weight_format, layout
+):
+    if weight_format == "int4":
+        u = weight.to(torch.uint8).long()
+        values = torch.stack((u & 15, u >> 4), dim=1).reshape(weight.shape[0] * 2, -1)
+        values = torch.where(values >= 8, values - 16, values).float()
+        values = values * scale.repeat_interleave(32, -1)
+    elif layout == "group":
+        values = dq_grouped(weight, scale, 16 if weight_format == "nvfp4" else 32)
+    elif layout == "block":
+        values = dq_block_fp8(weight, scale, 32, 32)
+    else:
+        values = weight.float() * (scale.reshape(-1, 1) if layout == "row" else scale)
+    if global_scale is not None:
+        values = values * global_scale
+    return torch.nn.functional.embedding(ids, values.to(dtype))
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("weight_format,layout,dtype", _EMBEDDING_CASES)
 @pytest.mark.parametrize("sliced", [False, True])
-def test_embedding_lookup_matches_selected_rows(packed, dtype, sliced):
-    weight, scale, global_scale = _embedding_table(packed, dtype, sliced)
-    ids = torch.tensor([[3, 0, 3], [36, 4, 0]], device=weight.device).t()
-    actual = embedding_lookup(weight, ids, scale, global_scale, dtype)
-    torch.testing.assert_close(
-        actual,
-        _embedding_reference(weight, ids, scale, global_scale, dtype),
-        rtol=0,
-        atol=0,
-    )
-    assert actual.dtype == dtype
-    default = embedding_lookup(weight, ids, scale, global_scale)
-    default_dtype = torch.bfloat16 if packed else scale.dtype
-    assert default.dtype == default_dtype
-    torch.testing.assert_close(
-        default,
-        _embedding_reference(weight, ids, scale, global_scale, default_dtype),
-        rtol=0,
-        atol=0,
-    )
-    for ids in (ids.to(torch.int32), ids.new_empty((2, 0)), ids.new_tensor(3)):
+def test_embedding_lookup_matches_selected_rows(weight_format, layout, dtype, sliced):
+    weight, scale, global_scale = _embedding_table(weight_format, layout, dtype, sliced)
+    ids = torch.tensor([[3, 0, 3], [37, 4, 1]], device=weight.device).t()
+    for indices in (ids, ids.to(torch.int32), ids.new_empty((2, 0)), ids.new_tensor(3)):
         actual = embedding_lookup(
-            weight, ids, scale, global_scale, dtype
+            weight,
+            indices,
+            scale,
+            global_scale,
+            dtype,
+            weight_format=weight_format,
+            block_size=32,
         )
         torch.testing.assert_close(
             actual,
-            _embedding_reference(weight, ids, scale, global_scale, dtype),
+            _embedding_reference(
+                weight, indices, scale, global_scale, dtype, weight_format, layout
+            ),
+            rtol=0,
+            atol=0,
+        )
+        assert actual.dtype == dtype
+    # Keep the original positional FP8/NVFP4 entry points covered.
+    if layout == "tensor" or weight_format == "nvfp4":
+        default = embedding_lookup(weight, ids, scale, global_scale)
+        default_dtype = torch.bfloat16 if weight_format == "nvfp4" else scale.dtype
+        assert default.dtype == default_dtype
+        torch.testing.assert_close(
+            default,
+            _embedding_reference(
+                weight, ids, scale, global_scale, default_dtype, weight_format, layout
+            ),
             rtol=0,
             atol=0,
         )
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.parametrize("packed", [False, True])
-def test_embedding_lookup_fullgraph_compile(packed):
-    weight, scale, global_scale = _embedding_table(packed, torch.bfloat16)
-    ids = torch.tensor([[3, 0, 3], [36, 4, 0]], device=weight.device).t()
-    lookup = torch.compile(embedding_lookup, fullgraph=True)
-    actual = lookup(weight, ids, scale, global_scale, torch.bfloat16)
+@pytest.mark.parametrize("weight_format,layout,dtype", _EMBEDDING_CASES)
+def test_embedding_lookup_fullgraph_compile(weight_format, layout, dtype):
+    weight, scale, global_scale = _embedding_table(
+        weight_format, layout, dtype, sliced=True
+    )
+    ids = torch.tensor([[3, 0, 3], [37, 4, 1]], device=weight.device).t()
+    lookup = maybe_compile(embedding_lookup, True)
+    actual = lookup(
+        weight,
+        ids,
+        scale,
+        global_scale,
+        dtype,
+        weight_format=weight_format,
+        block_size=32,
+    )
     torch.testing.assert_close(
         actual,
-        _embedding_reference(weight, ids, scale, global_scale, torch.bfloat16),
+        _embedding_reference(
+            weight, ids, scale, global_scale, dtype, weight_format, layout
+        ),
         rtol=0,
         atol=0,
     )
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.parametrize("invalid", ["indices", "weight", "scale", "global", "width"])
-def test_embedding_lookup_rejects_invalid_metadata(invalid):
-    weight, scale, global_scale = _embedding_table(True, torch.bfloat16)
+@pytest.mark.parametrize(
+    "weight_format,invalid",
+    [
+        ("nvfp4", invalid)
+        for invalid in ("indices", "weight", "scale", "global", "width")
+    ]
+    + [
+        ("mxfp8", "scale_dtype"),
+        ("mxfp4", "weight"),
+        ("int4", "vocab"),
+        ("fp8", "blockgrid"),
+    ],
+)
+def test_embedding_lookup_rejects_invalid_metadata(weight_format, invalid):
+    layout = "block" if weight_format == "fp8" else "group"
+    weight, scale, global_scale = _embedding_table(
+        weight_format, layout, torch.bfloat16
+    )
     ids = torch.tensor([0], device=weight.device)
     if invalid == "indices":
         ids = ids.float()
@@ -898,10 +991,16 @@ def test_embedding_lookup_rejects_invalid_metadata(invalid):
         scale = scale[:, :-1]
     elif invalid == "global":
         global_scale = global_scale.half()
+    elif invalid == "scale_dtype":
+        scale = scale.float()
+    elif invalid in ("vocab", "blockgrid"):
+        scale = scale[:-1]
     else:
         weight, scale = weight[:, :0], scale[:, :0]
     with pytest.raises(ValueError):
-        embedding_lookup(weight, ids, scale, global_scale)
+        embedding_lookup(
+            weight, ids, scale, global_scale, weight_format=weight_format, block_size=32
+        )
 
 
 def _embedding_invalid_index(_rank, index, packed):
@@ -910,10 +1009,13 @@ def _embedding_invalid_index(_rank, index, packed):
     )
     scale = (
         torch.ones(37, 2, device=TEST_DEVICE).to(torch.float8_e4m3fn)
-        if packed else torch.ones(1, device=TEST_DEVICE)
+        if packed
+        else torch.ones(1, device=TEST_DEVICE)
     )
     global_scale = torch.ones(1, device=TEST_DEVICE) if packed else None
-    embedding_lookup(weight, torch.tensor([index], device=TEST_DEVICE), scale, global_scale)
+    embedding_lookup(
+        weight, torch.tensor([index], device=TEST_DEVICE), scale, global_scale
+    )
     getattr(torch, torch.device(TEST_DEVICE).type).synchronize()
 
 
@@ -921,5 +1023,10 @@ def _embedding_invalid_index(_rank, index, packed):
 @pytest.mark.parametrize("index", [-1, 37])
 def test_embedding_invalid_index_fails_in_separate_process(index, packed):
     # Isolate the poisoned device context, as for native embedding's bounds assertions.
-    with pytest.raises(torch.multiprocessing.ProcessRaisedException, match="(?i)device-side assert|assertion failure"):
-        torch.multiprocessing.spawn(_embedding_invalid_index, args=(index, packed), nprocs=1)
+    with pytest.raises(
+        torch.multiprocessing.ProcessRaisedException,
+        match="(?i)device-side assert|assertion failure",
+    ):
+        torch.multiprocessing.spawn(
+            _embedding_invalid_index, args=(index, packed), nprocs=1
+        )
