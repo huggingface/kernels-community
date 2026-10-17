@@ -50,6 +50,9 @@ from utils import (  # type: ignore
 )
 
 import finegrained_kernels  # type: ignore
+from finegrained_kernels.batched import mx_dynamic_matmul_batched_kernel, w8a8_tensor_dynamic_fp8_matmul_batched_kernel
+from finegrained_kernels.grouped import mx_dynamic_matmul_grouped_kernel, w8a8_tensor_dynamic_fp8_matmul_grouped_kernel
+from finegrained_kernels.matmul import mx_dynamic_matmul_kernel, w8a8_tensor_dynamic_fp8_matmul_kernel
 from finegrained_kernels import swizzle_mx_scales, unswizzle_mx_scales  # type: ignore
 from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore
 from finegrained_kernels.quant import nvfp4_act_quant  # type: ignore
@@ -75,6 +78,7 @@ class Problem:
     swiglu_alpha: float | None = None
     swiglu_limit: float | None = None
     activation_format: str | None = None
+    activation_scale_ub: float | None = None
     quantize_output: bool = False
     per_expert_globals: bool = False  # activation (and requant output) globals calibrated per expert
     prequant: bool = False  # pass As explicitly (must be bit-identical to raw A)
@@ -90,6 +94,8 @@ class Problem:
     @property
     def id(self):
         tag = self.weights
+        if self.activation_scale_ub is not None:
+            tag += "_capped"
         if self.gate:
             tag += f"_gate_{self.act_fn}"
             if self.swiglu_alpha is not None:
@@ -148,7 +154,7 @@ def scenarios() -> list[Problem]:
                 out.append(
                     Problem(weights=w, gate=True, activation_format=fmt, quantize_output=True, swizzled=True)
                 )
-        default_in = {"fp8_128x128": "fp8", "fp8_tensor": "fp8"}.get(w)
+        default_in = {"fp8_128x128": "fp8", "fp8_tensor": "fp8", "fp8_rowwise": "fp8"}.get(w)
         for fmt in row["activation_formats"]:
             if fmt != default_in:
                 out.append(Problem(weights=w, activation_format=fmt))
@@ -234,6 +240,7 @@ def scenarios() -> list[Problem]:
         Problem(weights="fp8_128x128", compile=True),
         Problem(weights="mxfp4", compile=True),
         Problem(weights="bf16", compile=True),  # the fp kernel's pre_hook under compile
+        Problem(weights="fp8_rowwise", S=256, activation_scale_ub=0.5, compile=True),
         Problem(weights="fp8_tensor", static=True, compile=True),  # the static arm's operand marshalling
         # calibrated (static) activation quant, reached when As is a calibrated scale rather than
         # per-block. One value per quantized module, so the OP fixes the shape: a dense linear
@@ -243,6 +250,20 @@ def scenarios() -> list[Problem]:
         # per-TENSOR weights: the shipped static form (Ministral-3 dense, Mistral-4 MoE — both
         # write qscheme_act="TENSOR" with weight_block_size=None)
         Problem(weights="fp8_tensor", static=True),
+        # row-wise weights (Llama 4 FP8): the stacked gate|up rows carry their own scales, the swapped decode
+        # tile folds them on its other axis, a caller's per-token As rides as-is, and the launch-scale shape
+        # reaches the grouped kernel's descriptor / warp-specialized arms
+        Problem(weights="fp8_rowwise", gate=True),
+        Problem(weights="fp8_rowwise", S=8),
+        Problem(weights="fp8_rowwise", gate=True, S=8),
+        Problem(weights="fp8_rowwise", prequant=True, compile=True),
+        Problem(weights="fp8_rowwise", S=4096, E=8, prequant=True, noncontiguous=True),
+        Problem(weights="fp8_rowwise", static=True, S=17),
+        Problem(weights="fp8_rowwise", S=257, bias=True, empty_expert=True, compile=True),
+        Problem(weights="fp8_rowwise", S=2048, E=16, N=512, K=1024),
+        # the prefill expansion lays the routed rows out, and their per-token scales with them
+        Problem(weights="fp8_rowwise", S=4096, E=8, sentinel_fraction=0.5),
+        Problem(weights="fp8_tensor", S=4096, E=8),
         # non-aligned N (64-grid, off the 128-grid — gpt-oss H=I=2880 shape). matmul_2d masks the
         # N-tail; routed MX runs the affine arm (per-row scales, any BN|N); routed FP8 rejects it
         # (its scales are 128-blocked along N — raises pointing to matmul_2d).
@@ -376,6 +397,8 @@ def _dequant_a(problem: Problem, op, A, expert_ids=None):
     calibrated static scale of each row's expert), plus the pre-quantized ``(Aq, As)`` form for the prequant round-trip
     check (``None`` where ``A`` stays raw)."""
     row = WEIGHTS[problem.weights]
+    if problem.activation_scale_ub is not None:
+        return quant_dequant_a(A, problem.K, activation_scale_ub=problem.activation_scale_ub), None
     static_scale = _static_scale(problem, op, A)
     act_global = _act_global(problem, A, expert_ids)
     if static_scale is not None:  # static (calibrated) activation quant
@@ -494,7 +517,7 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
     it before requant — the same scalar the reference uses, so the two spaces match."""
     # a requant cell names its format explicitly (the reference snaps to that grid)
     assert not problem.quantize_output or problem.activation_format not in (None, "bf16")
-    kw = dict(activation_format=problem.activation_format, quantize_output=problem.quantize_output)
+    kw = dict(activation_format=problem.activation_format, activation_scale_ub=problem.activation_scale_ub, quantize_output=problem.quantize_output)
     if problem.gate:
         kw.update(
             gate=True,
@@ -503,7 +526,7 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
             swiglu_limit=problem.swiglu_limit,
         )
     if not problem.quantize_output:
-        kw["output_dtype"] = problem.dtype
+        kw["output_dtype"] = None if problem.prequant else problem.dtype
     if problem.bias:
         kw["bias"] = _bias(problem, op)
     if out_global is not None:  # provided NVFP4 output global (next proj's input_scale)
@@ -631,14 +654,16 @@ def _make_weights(problem: Problem, row, E):
 
 def _skip_moe_only(problem: Problem, op: str) -> None:
     """matmul_2d is the single-GEMM sibling: skip only the scenarios it can't represent — expert
-    routing (sentinel / noncontiguous / empty-expert / the MoE prequant-As check) and non-MX
+    routing (sentinel / noncontiguous / empty-expert), routed-only prequant inputs, and non-MX
     input/output format knobs (its FP8 paths infer the quant from the scale shape and return the
     intermediate dense). Everything else — including full-precision (BF16/FP16) weights and a
     shared static activation scale — runs on all three ops."""
     if op != "matmul":
         return
-    if problem.sentinel_fraction or problem.noncontiguous or problem.empty_expert or problem.prequant:
+    if problem.sentinel_fraction or problem.noncontiguous or problem.empty_expert:
         pytest.skip("expert-routing scenario (MoE only)")
+    if problem.prequant and problem.weights != "fp8_rowwise":
+        pytest.skip("prequantized block-scale inputs need routing")
     if problem.per_expert_globals:
         pytest.skip("per-expert globals need routing (MoE only)")
 
@@ -668,8 +693,8 @@ def test_op_scenarios(problem: Problem, op):
     # ref is the op written in torch; both take the same inputs — including the PROVIDED nvfp4 output
     # global — and return the op's own format, so _dequant reads them identically and _check compares
     # once. _assert_op_layout is the one op-only check (the reference never swizzles its output).
-    # prequant scenarios hand the op its activations already quantized (As set — routed ops only,
-    # _skip_moe_only excludes matmul); otherwise raw A + As=None and the op quantizes it. Reference
+    # prequant scenarios hand the op its activations already quantized (As set); otherwise
+    # raw A + As=None and the op quantizes it. Reference
     # and op take the identical (A, As): pre-quantizing just hands the op the values it would
     # otherwise compute, and _fp32_intermediate reads whichever form it's given. The nvfp4 activation
     # global comes off the RAW A (before prequant replaces it) and rides separately as As_global.
@@ -686,6 +711,8 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
         As_global = _act_global(problem, A, expert_ids)
         if problem.prequant:
             A, As = _prequant_args(problem, op, A, expert_ids)
+            if problem.noncontiguous and As is not None:
+                As = _make_noncontig(As.reshape(-1)).view(As.shape)
         g_out = _out_global(problem, op, A, expert_ids, B, Bs, Bs_global, As, As_global)
         ref = _reference(problem, op, A, expert_ids, B, Bs, Bs_global, As=As, As_global=As_global, out_global=g_out)
         if shared is not None:
@@ -712,42 +739,40 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
 # kernel (the dense gate fusion and its gate_pointer_only/WS pruners), and one nvfp4 cell
 # (E4M3 scales: the nvfp4_native_ok fence + software decode arms).
 _SWEEP_CELLS = [
-    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True), "grouped", mx_dynamic_matmul_grouped_kernel),
     # K off the BK=128 grid admits the BK=64 rows, the family a K=256 cell never reaches
-    (Problem(weights="mxfp4", K=320), "grouped", "mx_dynamic_matmul_grouped_kernel"),
-    (Problem(weights="mxfp8", K=320), "grouped", "mx_dynamic_matmul_grouped_kernel"),
-    (Problem(weights="mxfp4", S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
-    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
-    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", "mx_dynamic_matmul_kernel"),
-    (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
+    (Problem(weights="mxfp4", K=320), "grouped", mx_dynamic_matmul_grouped_kernel),
+    (Problem(weights="mxfp8", K=320), "grouped", mx_dynamic_matmul_grouped_kernel),
+    (Problem(weights="mxfp4", S=8), "batched", mx_dynamic_matmul_batched_kernel),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", mx_dynamic_matmul_grouped_kernel),
+    (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", mx_dynamic_matmul_kernel),
+    (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", mx_dynamic_matmul_batched_kernel),
     # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize
     # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is
     # the one a memory-mode fence gets wrong (silently — the tuner forgives what will not lower)
-    (Problem(weights="fp8_tensor", static=True), "grouped", "w8a8_tensor_dynamic_fp8_matmul_grouped_kernel"),
+    (Problem(weights="fp8_tensor", static=True), "grouped", w8a8_tensor_dynamic_fp8_matmul_grouped_kernel),
+    # row-wise weights: the per-row scale vector each arm folds on its own weight-row axis — the
+    # stacked gate|up span, the swapped decode tile, and the 2D kernel's tile
+    (Problem(weights="fp8_rowwise", gate=True, S=257, bias=True, empty_expert=True), "grouped", w8a8_tensor_dynamic_fp8_matmul_grouped_kernel),
+    (Problem(weights="fp8_rowwise", gate=True, S=8), "batched", w8a8_tensor_dynamic_fp8_matmul_batched_kernel),
+    (Problem(weights="fp8_rowwise", gate=True, S=256), "matmul", w8a8_tensor_dynamic_fp8_matmul_kernel),
 ]
 
 
 @pytest.mark.slow
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize(
-    "problem, op, kernel_name",
+    "problem, op, tuner",
     _SWEEP_CELLS,
     ids=[f"{p.id}_{op}" for p, op, _ in _SWEEP_CELLS],
 )
-def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
+def test_every_admitted_config_is_correct(problem: Problem, op, tuner):
     """Force-run EVERY config the pruners admit for one launch and hard-check each against the
     torch oracle. The tuner benches configs by SPEED, so a wrong-but-fast config that slips the
     pruners gets crowned silently — the class no winner-only test can see. A forced config may
     fail to compile/launch (the tuner's forgiven-inf path — reported, not asserted); a config
     that RUNS must be correct."""
-    import finegrained_kernels.batched as batched_mod
-    import finegrained_kernels.grouped as grouped_mod
-    import finegrained_kernels.matmul as matmul_mod
-    import finegrained_kernels.quant as quant_mod
 
-    # the op's own kernel, or one of the shared passes it launches (the activation quant)
-    op_mod = {"batched": batched_mod, "grouped": grouped_mod, "matmul": matmul_mod}[op]
-    tuner = getattr(op_mod, kernel_name, None) or getattr(quant_mod, kernel_name)
     A, expert_ids = _routed(problem)
     row = WEIGHTS[problem.weights]
     B, Bs, Bs_global = _make_weights(problem, row, problem.E)
@@ -765,7 +790,7 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
     try:
         tuner.cache.clear()
         _run_ref_vs_op(problem, op, A, expert_ids, B, Bs, Bs_global, shared=shared)
-        assert admitted.get("configs"), "the spy never saw a prune pass — wrong kernel_name?"
+        assert admitted.get("configs"), "the spy never saw a prune pass"
         forgiven = []
         for cfg in admitted["configs"]:
             tuner.configs = [cfg]

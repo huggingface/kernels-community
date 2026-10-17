@@ -32,10 +32,12 @@ from utils import (  # type: ignore
     SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
+    maybe_compile,
+    quant_dequant_a,
 )
 
 from finegrained_kernels import moe, scheduling, swizzle_mx_scales  # type: ignore
-from finegrained_kernels.epilogue import fused_glu  # type: ignore
+from finegrained_kernels.epilogue import apply_glu, fused_glu  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,8 @@ class MoEProblem:
     negative_sentinels: bool = False  # off-rank routes as -1 rather than num_experts
     dtype: torch.dtype = torch.bfloat16
     activation_format: Optional[str] = None
+    activation_scale_ub: Optional[float] = None
+    compile: bool = False
     swiglu_alpha: Optional[float] = None
     swiglu_limit: Optional[float] = None
     act_fn: Union[str, Callable] = "silu"  # a callable runs on the host between the GEMMs
@@ -81,6 +85,7 @@ class MoEProblem:
         return (
             f"{self.weights}_T{self.num_tokens}_E{self.num_experts}_H{self.hidden_dim}"
             f"_I{self.intermediate_dim}_top{self.num_top_k}_{DTYPE_TAG[self.dtype]}"
+            f"{'_capped' if self.activation_scale_ub is not None else ''}{'_compile' if self.compile else ''}"
             f"{act}{fmt}{'_swizzled' if self.swizzled else ''}"
             f"{'_inputglobals' if self.input_globals else ''}"
             f"{'_expertglobals' if self.expert_globals else ''}"
@@ -119,6 +124,16 @@ MOE_PROBLEMS = [
     # out quantized instead (``quantize_routed_rows_per_expert``): 4096 routed rows, which the
     # 64-token cells above never reach, so only this one runs the kernel's pre-quantized arm
     MoEProblem(weights="fp8_tensor", num_tokens=1024, num_top_k=4, static=True),
+    # dynamic per-token activations (tensor-wide, row-wise): the intermediate's whole-row scale is
+    # beyond any gate_up epilogue tile, so the chain hands the down a bf16 intermediate to quantize
+    MoEProblem(weights="fp8_tensor", num_top_k=4),
+    # row-wise weights (Llama 4 FP8 experts, top-1): decode, small batch, and a prefill batch
+    # deep enough per expert for the grouped kernel's big tiles
+    MoEProblem(weights="fp8_rowwise", num_tokens=1, num_top_k=1),
+    MoEProblem(weights="fp8_rowwise", num_top_k=1),
+    MoEProblem(weights="fp8_rowwise", num_top_k=1, activation_scale_ub=0.5, compile=True),
+    MoEProblem(weights="fp8_rowwise", num_tokens=1024, num_top_k=1),
+    MoEProblem(weights="fp8_rowwise", num_top_k=4, static=True),
     # block-FP8 with UE8M0 (power-of-two) scales — the whole-model UE8M0 contract: acts,
     # weights, and the fused intermediate requant all power-of-two (DeepSeek-V4 attn / B200).
     MoEProblem(weights="fp8_128x128_ue8m0", num_tokens=1),
@@ -188,12 +203,14 @@ MOE_PROBLEMS = [
     MoEProblem(weights="fp8_128x128", bias=True),
     MoEProblem(weights="fp8_128x128", num_tokens=1, bias=True),
     MoEProblem(weights="fp8_tensor", num_top_k=4, static=True, bias=True),
+    MoEProblem(weights="fp8_rowwise", num_top_k=4, bias=True),
     MoEProblem(weights="mxfp8", bias=True),
     MoEProblem(weights="nvfp4", input_globals=True, bias=True),
     MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=1, bias=True),
     # ── expert parallelism: non-local experts sentinel-masked ──
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="fp8_128x128", num_tokens=8, sentinel_fraction=0.875),
+    MoEProblem(weights="fp8_rowwise", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875, negative_sentinels=True),
     # swizzled MX scales quantize the activations once per token into every routed row's tile, which a token
     # routed only to other ranks' experts must not write
@@ -327,7 +344,7 @@ def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s,
         else None
     )
     gate_up_bias, down_bias = _biases(problem)
-    return dict(
+    kwargs = dict(
         gate_up_proj_bias=gate_up_bias,
         down_proj_bias=down_bias,
         gate_up_proj_weight_global_scale=gate_up_g,
@@ -343,6 +360,9 @@ def _common_kwargs(problem: MoEProblem, hidden, top_k_index, gate_up, gate_up_s,
         post_expert_norm=problem.post_expert_norm,
         post_expert_norm_weight=norm_weight,
     )
+    if problem.activation_scale_ub is not None:
+        kwargs["activation_scale_ub"] = problem.activation_scale_ub
+    return kwargs
 
 
 def _assert_fused_correctness(out, ref, problem: MoEProblem):
@@ -363,7 +383,7 @@ def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
     ref = unfused_fn(
         hidden, top_k_index, top_k_weights, gate_up, down, gate_up_s, down_s, **common
     )
-    out = fused_fn(
+    out = maybe_compile(fused_fn, problem.compile)(
         hidden,
         top_k_index,
         top_k_weights,
@@ -375,6 +395,18 @@ def _run_pair(problem: MoEProblem, fused_fn, unfused_fn):
         **common,
     )
     _assert_fused_correctness(out, ref, problem)
+    if problem.activation_scale_ub is not None:
+        # Check both clipping sites independently: fused and unfused share their quantizer.
+        row = WEIGHTS[problem.weights]
+        ids = top_k_index.flatten().long()
+        aq = quant_dequant_a(hidden, problem.hidden_dim, activation_scale_ub=problem.activation_scale_ub)
+        aq = aq.repeat_interleave(problem.num_top_k, dim=0)
+        gu = torch.einsum("sk,snk->sn", aq, row["dequant"](gate_up, gate_up_s)[ids]).to(problem.dtype)
+        inter = apply_glu(gu[:, 0::2], gu[:, 1::2])
+        iq = quant_dequant_a(inter, problem.intermediate_dim, activation_scale_ub=problem.activation_scale_ub)
+        rows = torch.einsum("sk,snk->sn", iq, row["dequant"](down, down_s)[ids]).to(problem.dtype)
+        torch_ref = (rows.view(problem.num_tokens, problem.num_top_k, -1) * top_k_weights[..., None]).sum(1)
+        _assert_fused_correctness(out, torch_ref, problem)
 
 
 @pytest.mark.kernels_ci

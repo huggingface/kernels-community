@@ -1080,6 +1080,7 @@ def fp8_act_quant_block_dynamic(
 @triton.jit
 def _fp8_act_quant_kernel(
     x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr, PADDED_BLOCK: tl.constexpr,
+    AMAX_UPPER_BOUND: tl.constexpr = None,
     PDL: tl.constexpr = False,
 ):
     if PDL:
@@ -1092,7 +1093,12 @@ def _fp8_act_quant_kernel(
     mask = cols < BLOCK_SIZE
     offs = pid * BLOCK_SIZE + cols
     x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    s = tl.max(tl.abs(x)) / 448.0  # float8_e4m3fn max
+    amax = tl.max(tl.abs(x))
+    if AMAX_UPPER_BOUND is not None:
+        # the amax is capped, and the values past it saturate
+        amax = tl.minimum(amax, AMAX_UPPER_BOUND)
+        x = tl.clamp(x, -amax, amax)
+    s = amax / 448.0  # float8_e4m3fn max
     y = (x / tl.maximum(s, 1e-12)).to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y, mask=mask)
     if PDL:
@@ -1120,7 +1126,11 @@ def static_expert_act_operands(A, As, num_experts):
 # not alias an input), and it hands back Python strides. The quant kernels it calls carry their
 # own compile handling.
 def tensor_wide_act_operands(
-    A: torch.Tensor, As: torch.Tensor | None, num_experts: int | None = None
+    A: torch.Tensor,
+    As: torch.Tensor | None,
+    num_experts: int | None = None,
+    row_multiple: int = 1,
+    activation_scale_ub: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
     """Activation operands of the tensor-scale FP8 arms: ``(A, As, stride_m, stride_e)``.
 
@@ -1130,10 +1140,13 @@ def tensor_wide_act_operands(
     one per expert, which stays raw for the kernel to quantize each tile against its own expert
     — a gathered row serves several experts, so it has no single pre-quantized form until the
     routed rows are laid out (``quantize_routed_rows_per_expert``). ``num_experts`` ``None`` on
-    the 2D op, whose rows belong to no expert.
+    the 2D op, whose rows belong to no expert. ``row_multiple`` pads the derived rows' storage
+    (``fp8_act_quant_tensor_wide``). ``activation_scale_ub`` caps their dynamic amax.
     """
     if As is None:
-        A, As = fp8_act_quant_tensor_wide(A, A.shape[-1])
+        A, As = fp8_act_quant_tensor_wide(
+            A, A.shape[-1], amax_upper_bound=activation_scale_ub, row_multiple=row_multiple
+        )
         As = As.reshape(-1)
         return A, As, As.stride(0), 0
     if A.dtype == FP8_DTYPE:
@@ -1217,11 +1230,19 @@ def quantize_routed_rows_per_expert(A, As, gather_idx, expert_start, num_experts
 
 
 def fp8_act_quant_tensor_wide(
-    x: torch.Tensor, block_size: int = 128
+    x: torch.Tensor,
+    block_size: int = 128,
+    amax_upper_bound: float | None = None,
+    row_multiple: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """E4M3 + one ``amax / 448`` fp32 scale per ``block_size`` span (``block_size = K``: per
+    token). ``amax_upper_bound`` caps the amax (values past it saturate); ``None`` leaves it
+    uncapped. ``row_multiple`` backs the E4M3 rows with storage rounded up to that many rows
+    (left unwritten), so a TMA box over the padded extent reads in bounds."""
     assert x.is_contiguous()
     assert x.shape[-1] % block_size == 0
-    y = torch.empty_like(x, dtype=FP8_DTYPE)
+    padded_rows = triton.cdiv(x.numel() // x.shape[-1], row_multiple) * row_multiple
+    y = x.new_empty(padded_rows * x.shape[-1], dtype=FP8_DTYPE)[: x.numel()].view(x.shape)
     grid = (triton.cdiv(x.numel(), block_size),)
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
 
@@ -1232,6 +1253,7 @@ def fp8_act_quant_tensor_wide(
             s,
             BLOCK_SIZE=block_size,
             PADDED_BLOCK=triton.next_power_of_2(block_size),
+            AMAX_UPPER_BOUND=amax_upper_bound,
             **pdl_launch_kwargs(),
         )
 

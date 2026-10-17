@@ -25,12 +25,13 @@ from .bayesian_autotuner import bayesian_autotune
 
 from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, pdl_launch_kwargs
 from .descriptors import rebind_batched_mx_bs_descriptor
-from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
+from .formats import check_activation_format, check_activation_scale_ub, global_scale_stride, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .scheduling import is_off_rank
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
+from .loading.scales import apply_row_scale
 from .loading.tiles import (
     advance_ptrs,
     load_act_block_dynamic,
@@ -46,7 +47,7 @@ from .loading.tiles import (
     weight_tile_ptrs,
 )
 from .epilogue import acc_init, bias_strides, gemm_epilogue
-from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, gate_tile_cap_pruner, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
+from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, dot_scaled_staging_pruner, block_fits_dim_pruner, block_within_dim_pruner, compose_pruners, gate_tile_cap_pruner, mx_config_pruner, require_moe_dims_aligned, scale_subblock_pruner, single_row_tile_pruner, smem_pruner, swizzled_scale_config_pruner, weight_only_swap_scope_pruner
 
 
 @triton.jit
@@ -380,7 +381,9 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
 @bayesian_autotune(
     # S (routed rows) keyed like the block-dynamic/mx batched siblings — decode re-tunes per batch.
     get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True),
-    ["N", "K", "S"],
+    # GATE keys the gate|up arm separately: its 2*BN tile is a different config space, and an
+    # ungated crown replayed under GATE can overflow shared memory
+    ["N", "K", "S", "GATE"],
     n_trials=100,
     path_anchor_axes=PATH_ANCHOR_AXES,
     # BLOCK_SIZE_K/N are tuned axes; the K-loop is maskless and the N-tile store is
@@ -390,6 +393,7 @@ def w8a8_block_static_fp8_matmul_batched_kernel(
             fp8_dot_warp_pruner(),
             block_within_dim_pruner("K"),
             block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            single_row_tile_pruner(),
         )
     },
 )
@@ -398,7 +402,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     A,  # (S, K) pre-quantized FP8 activations
     As,  # per-token activation scales (S,), or a calibrated (static) one: shared, or per expert
     B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
-    Bs,  # (num_experts, 1, 1) per-tensor weight scales
+    Bs,  # (num_experts, N, 1) row-wise weight scales, or (num_experts, 1, 1) per tensor (stride_bs_n 0)
     C,  # (S, N) output; under GATE the bf16 GLU intermediate
     Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
     ExpertIds,  # (S,) — which expert each batch element routes to
@@ -417,6 +421,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     stride_b_k,
     stride_b_n,
     stride_bs_e,
+    stride_bs_n,
     stride_c_m,
     stride_c_n,
     stride_bias_e,
@@ -437,16 +442,16 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     PDL: tl.constexpr = False,
 ):
-    """Tensor-scale batched FP8 expert matmul kernel.
+    """Tensor-scale / row-wise batched FP8 expert matmul kernel.
 
     Activations are already quantized; the kernel applies per-token activation
-    scales and per-expert tensor weight scales.
+    scales and per-expert weight scales constant along K (per tensor, or per output row).
 
     ``SWAP_AB`` (tuner axis, M=1 decode): weight output rows in the MMA M dim (``B`` as ``[BN, BK]``,
     single token padded to N=16); column 0 of the ``[BN, 16]`` accumulator is the result. Both
-    scales are per-token/per-tensor scalars, applied once after the loop, orientation-agnostic.
-    ``GATE`` fuses the gate|up projection (``B`` the interleaved (2N, K) stack, one per-tensor
-    scale over both halves) into one tile + SwiGLU, emitting the bf16 intermediate; ``GATE=False``
+    scales are applied once after the loop, the weight's on the acc's weight-row axis.
+    ``GATE`` fuses the gate|up projection (``B`` the interleaved (2N, K) stack, its scales
+    interleaved alike) into one tile + SwiGLU, emitting the bf16 intermediate; ``GATE=False``
     is the plain GEMM (bit-identical)."""
     if PDL:
         gdc_wait()
@@ -474,7 +479,6 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_k, stride_a_m, stride_a_k, "pointer", True)
     b_ptrs = oriented_tile_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB)
-    b_s = tl.load(Bs)
     a_s = tl.load(As + in_row * stride_as_m + expert_id * stride_as_e)
 
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
@@ -490,11 +494,11 @@ def w8a8_tensor_dynamic_fp8_matmul_batched_kernel(
             "pointer", "pointer", False, False, False,
         )
 
-    # per-tensor scales fold on the raw accumulator; `gemm_epilogue` owns the finalize.
+    # the scales fold on the raw accumulator; `gemm_epilogue` owns the finalize.
     # Finalizing here too was invisible under no-swap (a pass-through) and collapsed the
     # swapped tile twice, so every SWAP_AB config failed to compile and the tuner quietly
     # dropped the whole swap arm at this shape.
-    accumulator = accumulator * a_s * b_s
+    accumulator = apply_row_scale(accumulator * a_s, Bs, offs_bn, stride_bs_n, SWAP_AB)
     if PDL:
         gdc_launch_dependents()
     gemm_epilogue(
@@ -1293,8 +1297,9 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    activation_scale_ub: float | None = None,
 ) -> torch.Tensor:
-    """Tensor-scale batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T. ``A`` raw
+    """Tensor-scale / row-wise batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T. ``A`` raw
     (``As`` None) -> quantized here (offline, per-token); else pre-quantized (``As`` given).
     ``gather_idx``/``scatter_idx`` map the source row of A / destination row of C per program
     (None = row s).
@@ -1303,7 +1308,8 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     B:  (num_experts, N, K) FP8 expert weights; under ``gate`` the (num_experts, 2N, K) stack
     As: (rows,) per-token scales alongside a pre-quantized A, or — on a raw A — the calibrated
         (static) activation scale: one value, or one per expert
-    Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales
+    Bs: (num_experts,) or (num_experts, 1, 1) per-expert weight scales, or (num_experts, N, 1)
+        row-wise (2N rows under ``gate``)
     """
     validate_dense_operands(A, B)
 
@@ -1314,11 +1320,12 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     # under gate|up fusion B is the (E, 2N, K) stack; N is the per-projection output width
     N = rows // 2 if gate else rows
 
-    # Normalize Bs to (num_experts, 1, 1)
     Bs = normalize_per_expert_scale(Bs, num_experts)
 
     bs_u8 = ue8m0_as_uint8(Bs)
-    qA, As, as_stride_m, as_stride_e = tensor_wide_act_operands(A, As, num_experts)
+    qA, As, as_stride_m, as_stride_e = tensor_wide_act_operands(
+        A, As, num_experts, activation_scale_ub=activation_scale_ub
+    )
     C = A.new_empty(S, N, dtype=output_dtype)
 
     def grid(META):
@@ -1349,6 +1356,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
             B.stride(2),
             B.stride(1),
             bs_u8.stride(0),
+            row_scale_stride(bs_u8),
             C.stride(0),
             C.stride(1),
             bias_stride_e,
@@ -1774,6 +1782,7 @@ def matmul_batched(
     expert_ids: torch.Tensor,
     bias: torch.Tensor | None = None,  # (E, N_out) per-expert output bias; (N_out,) for 2D
     activation_format: str | None = None,
+    activation_scale_ub: float | None = None,
     gate: bool = False,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
@@ -1817,11 +1826,15 @@ def matmul_batched(
     - ``Bs`` None → ``full_precision_matmul_batched`` (plain dot, no scales anywhere).
     - MX weights — ``int8`` (packed E2M1) or ``float8_e4m3fn`` (E4M3) with UE8M0
       group-32 ``Bs`` → ``mx_dynamic_matmul_batched``.
-    - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) →
+    - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) or per output row (``(E, N, 1)``) →
       ``w8a8_tensor_dynamic_fp8_matmul_batched``.
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_batched``.
+
+    ``activation_scale_ub`` caps the dynamic per-token amax for row-wise FP8;
+    it requires raw activations and applies before conversion to E4M3.
     """
     check_activation_format(activation_format, quantize_output)
+    check_activation_scale_ub(A, As, B, Bs, activation_format, activation_scale_ub)
     assert (a_global_scale is None and b_global_scale is None) or (
         Bs is not None and weight_format(B, Bs) == "nvfp4"
     ), "two-level globals (a_global_scale / b_global_scale) are NVFP4-only"
@@ -1933,6 +1946,7 @@ def matmul_batched(
         out = w8a8_tensor_dynamic_fp8_matmul_batched(
             A, B, As, Bs, expert_ids, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused,
             output_dtype, gather_idx, scatter_idx, bias=bias,
+            activation_scale_ub=activation_scale_ub,
         )
     else:
         out = w8a8_block_dynamic_fp8_matmul_batched(

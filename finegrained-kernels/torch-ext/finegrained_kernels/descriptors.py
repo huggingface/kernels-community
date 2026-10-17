@@ -34,11 +34,11 @@ def rebind_operand_box(nargs, mode_key, desc_key, rows, cols):
 
 def maybe_descriptor(t: torch.Tensor, box: list[int]) -> TensorDescriptor | None:
     """A host-TMA descriptor over ``t``, or None when the layout cannot back one — a TMA box
-    needs a unit-stride innermost dim, which a transposed view (as a backward pass hands in to
-    contract over the other axis) does not have. ``None`` is the same signal the pointer arms
-    already take for an unused descriptor, and ``descriptor_box_pruner`` drops the configs that
-    would read it, so the tuner is left with the pointer arms the kernel serves stride-generally."""
-    if t is None or (t.ndim >= 2 and t.stride(-1) != 1):
+    needs a 16-byte-aligned base and unit-stride innermost dim, which a transposed view (as a
+    backward pass hands in to contract over the other axis) does not have. ``None`` is the same
+    signal the pointer arms already take for an unused descriptor; ``descriptor_box_pruner`` drops
+    the configs that would read it, leaving the stride-general pointer arms."""
+    if t is None or (t.ndim >= 2 and t.stride(-1) != 1) or (t.storage_offset() * t.element_size()) % 16:
         return None
     return TensorDescriptor.from_tensor(t, box)
 
@@ -48,6 +48,13 @@ def rebind_bd_descriptors(nargs):
     ``(rows, K)`` matrices — ``[BLOCK_SIZE_M, block_k]`` and ``[BLOCK_SIZE_N, block_k]``."""
     rebind_operand_box(nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], nargs["block_k"])
     rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], nargs["block_k"])
+
+
+def rebind_tiled_descriptors(nargs):
+    """Per-config pre_hook for the FP8 kernels with a tuned K tile (tensor-wide / row-wise): set the
+    A/B host-TMA boxes to ``[BM, BK]`` and ``[(2|1) * BN, BK]`` over the (rows, K) E4M3 matrices."""
+    rebind_operand_box(nargs, "A_MEMORY_MODE", "ADescriptor", nargs["BLOCK_SIZE_M"], nargs["BLOCK_SIZE_K"])
+    rebind_operand_box(nargs, "B_MEMORY_MODE", "BDescriptor", (2 if nargs.get("GATE") else 1) * nargs["BLOCK_SIZE_N"], nargs["BLOCK_SIZE_K"])
 
 
 def rebind_weight_only_descriptors(nargs):
