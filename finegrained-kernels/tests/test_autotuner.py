@@ -347,6 +347,9 @@ def test_compile_failures_are_memoized_across_keys(caplog):
 
 @pytest.mark.kernels_ci
 def test_basin_anchors_cover_interior_and_wide_output_tiles():
+    """Each swap basin gets an interior anchor and a wide output tile, both with
+    middle K, warp, and stage settings rather than lexicographic extremes.
+    """
     configs = [
         triton.Config(
             {"BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk, "SWAP_AB": swap},
