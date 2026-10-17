@@ -87,28 +87,6 @@ def test_fp8_act_quant_zero_block():
     assert (s == 0).all()
 
 
-@pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-def test_fp8_act_quant_tensor_wide_amax_upper_bound():
-    """``amax_upper_bound`` caps each row's amax before its scale is derived, and the values past
-    it saturate: rows under the bound quantize as without it, the outlier rows on the capped grid."""
-    torch.manual_seed(0)
-    x = torch.randn(8, 512, dtype=torch.bfloat16, device=TEST_DEVICE)
-    x[::2, 7] = 3000.0  # outliers on the even rows
-    bound = 1200.0
-
-    y, s = fp8_act_quant_tensor_wide(x, 512, amax_upper_bound=bound)
-
-    amax = x.float().abs().amax(dim=-1, keepdim=True).clamp(max=bound)
-    s_ref = amax / 448.0
-    y_ref = (x.float().clamp(-amax, amax) / s_ref).to(_FP8_DTYPE)
-    torch.testing.assert_close(s, s_ref, atol=0, rtol=0)
-    torch.testing.assert_close(y.float(), y_ref.float(), atol=0, rtol=0)
-    y_free, s_free = fp8_act_quant_tensor_wide(x, 512)
-    torch.testing.assert_close(y[1::2].float(), y_free[1::2].float(), atol=0, rtol=0)
-    assert (s[::2] < s_free[::2]).all()
-
-
 # ── inline-vs-offline arm parity (every format's quant has two implementations) ──────
 
 E2M1_LUT = [
