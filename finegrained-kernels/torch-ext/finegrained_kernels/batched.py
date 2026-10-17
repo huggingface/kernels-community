@@ -25,7 +25,7 @@ from .bayesian_autotuner import bayesian_autotune
 
 from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, pdl_launch_kwargs
 from .descriptors import rebind_batched_mx_bs_descriptor
-from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
+from .formats import check_activation_format, check_activation_scale_ub, global_scale_stride, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
@@ -1297,6 +1297,7 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    activation_scale_ub: float | None = None,
 ) -> torch.Tensor:
     """Tensor-scale / row-wise batched FP8 matmul: C[s] = A[s] @ B[expert_ids[s]].T. ``A`` raw
     (``As`` None) -> quantized here (offline, per-token); else pre-quantized (``As`` given).
@@ -1322,7 +1323,9 @@ def w8a8_tensor_dynamic_fp8_matmul_batched(
     Bs = normalize_per_expert_scale(Bs, num_experts)
 
     bs_u8 = ue8m0_as_uint8(Bs)
-    qA, As, as_stride_m, as_stride_e = tensor_wide_act_operands(A, As, num_experts)
+    qA, As, as_stride_m, as_stride_e = tensor_wide_act_operands(
+        A, As, num_experts, activation_scale_ub=activation_scale_ub
+    )
     C = A.new_empty(S, N, dtype=output_dtype)
 
     def grid(META):
@@ -1779,6 +1782,7 @@ def matmul_batched(
     expert_ids: torch.Tensor,
     bias: torch.Tensor | None = None,  # (E, N_out) per-expert output bias; (N_out,) for 2D
     activation_format: str | None = None,
+    activation_scale_ub: float | None = None,
     gate: bool = False,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
@@ -1825,8 +1829,12 @@ def matmul_batched(
     - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) or per output row (``(E, N, 1)``) →
       ``w8a8_tensor_dynamic_fp8_matmul_batched``.
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_batched``.
+
+    ``activation_scale_ub`` caps the dynamic per-token amax for row-wise FP8;
+    it requires raw activations and applies before conversion to E4M3.
     """
     check_activation_format(activation_format, quantize_output)
+    check_activation_scale_ub(A, As, B, Bs, activation_format, activation_scale_ub)
     assert (a_global_scale is None and b_global_scale is None) or (
         Bs is not None and weight_format(B, Bs) == "nvfp4"
     ), "two-level globals (a_global_scale / b_global_scale) are NVFP4-only"
@@ -1938,6 +1946,7 @@ def matmul_batched(
         out = w8a8_tensor_dynamic_fp8_matmul_batched(
             A, B, As, Bs, expert_ids, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused,
             output_dtype, gather_idx, scatter_idx, bias=bias,
+            activation_scale_ub=activation_scale_ub,
         )
     else:
         out = w8a8_block_dynamic_fp8_matmul_batched(

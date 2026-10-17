@@ -209,6 +209,7 @@ def quant_dequant_a(
     *,
     scale: torch.Tensor | None = None,
     pow2_scale: bool = False,
+    activation_scale_ub: float | None = None,
 ) -> torch.Tensor:
     """Mirror a kernel's inline activation quant→dequant round-trip in fp32.
 
@@ -222,7 +223,11 @@ def quant_dequant_a(
         return A_fp8.float() * scale
     M, K = A.shape
     groups = A.float().reshape(M, K // block_k, block_k)
-    s = groups.abs().amax(dim=-1, keepdim=True) / 448.0
+    amax = groups.abs().amax(dim=-1, keepdim=True)
+    if activation_scale_ub is not None:
+        amax = amax.clamp(max=activation_scale_ub)
+        groups = groups.clamp(min=-amax, max=amax)
+    s = amax / 448.0
     if pow2_scale:
         s = (_ue8m0_exp(s) << 23).view(torch.float32)
     A_fp8 = (groups / s.clamp(min=1e-12)).to(FP8_DTYPE)

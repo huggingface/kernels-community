@@ -24,7 +24,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from .bayesian_autotuner import bayesian_autotune
 from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors
-from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
+from .formats import check_activation_format, check_activation_scale_ub, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands
 from .loading.scales import apply_global_scale, apply_row_scale, mx_2d_scale_ptrs
@@ -1300,6 +1300,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     bias: torch.Tensor | None = None,
+    activation_scale_ub: float | None = None,
 ) -> list[torch.Tensor]:
     """Tensor-scale / row-wise FP8 matmul: ``C = A @ B.T``; activations quantized offline per row.
 
@@ -1322,7 +1323,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
     # every caller gets it, and a None falls through to the Triton launch unchanged.
     if not gate and not simulate_unfused and bias is None:
         _smm = _torch_scaled_mm_2d_tensor_wise(
-            A, B, As, Bs, None, output_dtype
+            A, B, As, Bs, None, output_dtype, activation_scale_ub
         )
         if _smm is not None:
             return [_smm]
@@ -1346,6 +1347,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
     qA, As, as_stride_m, _ = tensor_wide_act_operands(
         A.reshape(M, K), None if As is None else As.reshape(-1),
         row_multiple=TENSOR_MATMUL_A_ROW_MULTIPLE,
+        activation_scale_ub=activation_scale_ub,
     )
     a_rows = triton.cdiv(M, TENSOR_MATMUL_A_ROW_MULTIPLE) * TENSOR_MATMUL_A_ROW_MULTIPLE
     if (qA.storage_offset() * qA.element_size()) % 16 or (
@@ -1880,7 +1882,7 @@ def _smm_reject(reason):
     return None
 
 
-def _torch_scaled_mm_2d_tensor_wise(A, B, As, Bs, activation_format, out_dtype):
+def _torch_scaled_mm_2d_tensor_wise(A, B, As, Bs, activation_format, out_dtype, activation_scale_ub=None):
     """The scaled_mm route for the K-constant FP8 scales, or ``None`` to take the Triton ops.
 
     One fp32 value per operand IS scaled_mm's ``TensorWise`` and one per row of each its
@@ -1917,7 +1919,9 @@ def _torch_scaled_mm_2d_tensor_wise(A, B, As, Bs, activation_format, out_dtype):
     if B.stride(-1) != 1 or (B.storage_offset() * B.element_size()) % 16:
         return _smm_reject("weight-layout")
     if rowwise:
-        Aq, As, _, _ = tensor_wide_act_operands(A.reshape(M, K), As)
+        Aq, As, _, _ = tensor_wide_act_operands(
+            A.reshape(M, K), As, activation_scale_ub=activation_scale_ub
+        )
     else:
         As = As.reshape(-1).float()
         Aq = A.reshape(M, K) if A.dtype == FP8_DTYPE else quantize_rows_static(A.reshape(M, K), As)
@@ -1981,6 +1985,7 @@ def matmul_2d(
     *,
     bias: torch.Tensor | None = None,  # (E, N_out) per-expert output bias; (N_out,) for 2D
     activation_format: str | None = None,
+    activation_scale_ub: float | None = None,
     gate: bool = False,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
@@ -2019,8 +2024,12 @@ def matmul_2d(
     with UE8M0 group-32 or E4M3 group-16 ``Bs``) → ``mx_dynamic_matmul``; tensor-wide or row-wise FP8
     (scalar or ``(N, 1)`` ``Bs``) → ``w8a8_tensor_dynamic_fp8_matmul``; block FP8 → the static variant
     when ``As`` is a per-tensor scalar, else dynamic.
+
+    ``activation_scale_ub`` caps the dynamic per-token amax for row-wise FP8;
+    it requires raw activations and applies before conversion to E4M3.
     """
     check_activation_format(activation_format, quantize_output)
+    check_activation_scale_ub(A, As, B, Bs, activation_format, activation_scale_ub)
     assert (a_global_scale is None and b_global_scale is None) or (
         Bs is not None and weight_format(B, Bs) == "nvfp4"
     ), "two-level globals (a_global_scale / b_global_scale) are NVFP4-only"
@@ -2082,7 +2091,8 @@ def matmul_2d(
     if block_size is None:  # K-constant weight scale: per tensor or per row
         return _unwrap(
             w8a8_tensor_dynamic_fp8_matmul(
-                A, B, Bs, As, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, bias=bias)
+                A, B, Bs, As, output_dtype, gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused,
+                bias=bias, activation_scale_ub=activation_scale_ub)
         )
     # Block-wise FP8: a per-tensor scalar As is the static (calibrated) activation scale; else dynamic.
     if As is not None:

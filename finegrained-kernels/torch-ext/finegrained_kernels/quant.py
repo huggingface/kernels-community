@@ -1130,6 +1130,7 @@ def tensor_wide_act_operands(
     As: torch.Tensor | None,
     num_experts: int | None = None,
     row_multiple: int = 1,
+    activation_scale_ub: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
     """Activation operands of the tensor-scale FP8 arms: ``(A, As, stride_m, stride_e)``.
 
@@ -1140,10 +1141,12 @@ def tensor_wide_act_operands(
     — a gathered row serves several experts, so it has no single pre-quantized form until the
     routed rows are laid out (``quantize_routed_rows_per_expert``). ``num_experts`` ``None`` on
     the 2D op, whose rows belong to no expert. ``row_multiple`` pads the derived rows' storage
-    (``fp8_act_quant_tensor_wide``).
+    (``fp8_act_quant_tensor_wide``). ``activation_scale_ub`` caps their dynamic amax.
     """
     if As is None:
-        A, As = fp8_act_quant_tensor_wide(A, A.shape[-1], row_multiple=row_multiple)
+        A, As = fp8_act_quant_tensor_wide(
+            A, A.shape[-1], amax_upper_bound=activation_scale_ub, row_multiple=row_multiple
+        )
         As = As.reshape(-1)
         return A, As, As.stride(0), 0
     if A.dtype == FP8_DTYPE:

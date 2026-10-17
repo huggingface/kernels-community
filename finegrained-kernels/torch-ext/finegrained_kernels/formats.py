@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import torch
 import triton
 
@@ -339,6 +341,18 @@ def check_activation_format(activation_format: str | None, quantize_output: bool
     assert not (quantize_output and activation_format == "bf16"), (
         "quantize_output needs quantized activations (activation_format='bf16' is weight-only)"
     )
+
+
+def check_activation_scale_ub(A, As, B, Bs, activation_format, activation_scale_ub):
+    """An amax cap controls dynamic per-token FP8 quantization on row-wise weights."""
+    if activation_scale_ub is None:
+        return
+    if not math.isfinite(activation_scale_ub) or activation_scale_ub <= 0:
+        raise ValueError("activation_scale_ub must be finite and positive")
+    if Bs is None or not is_rowwise(B, Bs) or activation_format not in (None, "fp8"):
+        raise ValueError("activation_scale_ub requires row-wise FP8 weights and FP8 activations")
+    if As is not None or A.dtype == torch.float8_e4m3fn:
+        raise ValueError("activation_scale_ub requires raw activations without a calibrated activation scale")
 
 
 def weight_format(B: torch.Tensor, Bs: torch.Tensor) -> str:

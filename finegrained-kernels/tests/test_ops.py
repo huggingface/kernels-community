@@ -78,6 +78,7 @@ class Problem:
     swiglu_alpha: float | None = None
     swiglu_limit: float | None = None
     activation_format: str | None = None
+    activation_scale_ub: float | None = None
     quantize_output: bool = False
     per_expert_globals: bool = False  # activation (and requant output) globals calibrated per expert
     prequant: bool = False  # pass As explicitly (must be bit-identical to raw A)
@@ -93,6 +94,8 @@ class Problem:
     @property
     def id(self):
         tag = self.weights
+        if self.activation_scale_ub is not None:
+            tag += "_capped"
         if self.gate:
             tag += f"_gate_{self.act_fn}"
             if self.swiglu_alpha is not None:
@@ -237,6 +240,7 @@ def scenarios() -> list[Problem]:
         Problem(weights="fp8_128x128", compile=True),
         Problem(weights="mxfp4", compile=True),
         Problem(weights="bf16", compile=True),  # the fp kernel's pre_hook under compile
+        Problem(weights="fp8_rowwise", S=256, activation_scale_ub=0.5, compile=True),
         Problem(weights="fp8_tensor", static=True, compile=True),  # the static arm's operand marshalling
         # calibrated (static) activation quant, reached when As is a calibrated scale rather than
         # per-block. One value per quantized module, so the OP fixes the shape: a dense linear
@@ -395,6 +399,8 @@ def _dequant_a(problem: Problem, op, A, expert_ids=None):
     calibrated static scale of each row's expert), plus the pre-quantized ``(Aq, As)`` form for the prequant round-trip
     check (``None`` where ``A`` stays raw)."""
     row = WEIGHTS[problem.weights]
+    if problem.activation_scale_ub is not None:
+        return quant_dequant_a(A, problem.K, activation_scale_ub=problem.activation_scale_ub), None
     static_scale = _static_scale(problem, op, A)
     act_global = _act_global(problem, A, expert_ids)
     if static_scale is not None:  # static (calibrated) activation quant
@@ -513,7 +519,7 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
     it before requant — the same scalar the reference uses, so the two spaces match."""
     # a requant cell names its format explicitly (the reference snaps to that grid)
     assert not problem.quantize_output or problem.activation_format not in (None, "bf16")
-    kw = dict(activation_format=problem.activation_format, quantize_output=problem.quantize_output)
+    kw = dict(activation_format=problem.activation_format, activation_scale_ub=problem.activation_scale_ub, quantize_output=problem.quantize_output)
     if problem.gate:
         kw.update(
             gate=True,
