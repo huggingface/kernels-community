@@ -37,6 +37,7 @@ import random
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 
@@ -54,6 +55,9 @@ from triton.runtime.autotuner import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Include the tuner implementation alongside Triton's kernel-source hash.
+_TUNER_SOURCE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 # Env-gated host-execution counter (FINEGRAINED_AUTOTUNE_CALLCOUNT=<path>): every
 # BayesianAutotuner.run() call increments its kernel's tally, dumped to <path> at exit.
@@ -728,8 +732,8 @@ class BayesianAutotuner(Autotuner):
         """Persist the tuned best config to Triton's on-disk cache so a later run (or process)
         skips the whole minutes-long search+compile — most of which is Triton codegen, not
         benching. Keyed exactly like Triton's own autotune cache (triton version + backend +
-        kernel source hash + invalidating env + key + the full config grid), so any of those
-        changing re-tunes.
+        kernel/tuner source hashes + invalidating env + key + the full config grid), so any
+        of those changing re-tunes.
 
         Unlike Triton's stock version we do NOT bail when configs carry a ``pre_hook`` (ours
         always do): we persist each config's ``all_kwargs()`` — serializable and pre_hook-free —
@@ -749,6 +753,7 @@ class BayesianAutotuner(Autotuner):
             triton_key(),
             make_backend(driver.active.get_current_target()).hash(),
             fn.cache_key,
+            _TUNER_SOURCE_HASH,
             str(sorted(env_vars.items())),
             # Key NAMES and the search budget are determinants too: tuning_key holds
             # values only (renaming a key or swapping two same-typed keys would collide),
