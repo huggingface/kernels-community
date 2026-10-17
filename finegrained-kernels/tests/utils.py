@@ -17,13 +17,13 @@ The ``finegrained_kernels`` package is on ``sys.path`` via ``conftest.py`` (pyte
 auto-loads it before any test module)."""
 
 import torch
-from finegrained_kernels.loading.scales import decompress_nvfp4_csf_scales, prepare_nvfp4_csf_scales
 
 from finegrained_kernels.compat import (  # type: ignore
     MX_SCALE_GROUP_K,
     NVFP4_SCALE_GROUP_K,
     is_sm10x,
 )
+from finegrained_kernels.loading.scales import decompress_nvfp4_csf_scales, prepare_nvfp4_csf_scales
 
 
 # ── Device + capability ───────────────────────────────────────────────────────
@@ -516,7 +516,9 @@ def prepare_weight_scales(scales, csf_encoding, fn, compiled=False):
         fixed.to(scales.device), [stream.to(scales.device) for stream in exceptions]
     )
 
-    workspace = torch.empty_like(scales).reshape(-1, *scales.shape[-2:])
+    # A contiguous workspace need not start on a two-byte boundary.
+    workspace = torch.empty(scales.numel() + 1, dtype=scales.dtype, device=scales.device)[1:]
+    workspace = workspace.reshape(-1, *scales.shape[-2:])
 
     def run(A, B, As, Bs, **kwargs):
         decoded = decompress_nvfp4_csf_scales(*buffers, out=workspace)

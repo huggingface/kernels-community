@@ -156,10 +156,6 @@ def scenarios() -> list[Problem]:
             if fmt != default_in:
                 out.append(Problem(weights=w, activation_format=fmt))
     out += [
-        Problem(weights="nvfp4", csf_encoding=True, S=8),
-        Problem(weights="nvfp4", csf_encoding=True, empty_expert=True, sentinel_fraction=0.25),
-        Problem(weights="nvfp4", csf_encoding=True, activation_format="bf16"),
-        Problem(weights="nvfp4", csf_encoding=True, gate=True, activation_format="nvfp4", quantize_output=True, compile=True),
         Problem(weights="fp16", dtype=torch.float16),
         # gate WITHOUT requant (raw GLU intermediate) — one quantized + one full format
         Problem(weights="mxfp8", gate=True),
@@ -226,6 +222,10 @@ def scenarios() -> list[Problem]:
         # per-projection input_scale), which the act quant applies by the row's expert
         Problem(weights="nvfp4", per_expert_globals=True),
         Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, per_expert_globals=True),
+        Problem(weights="nvfp4", csf_encoding=True, S=8),
+        Problem(weights="nvfp4", csf_encoding=True, empty_expert=True, sentinel_fraction=0.25),
+        Problem(weights="nvfp4", csf_encoding=True, activation_format="bf16"),
+        Problem(weights="nvfp4", csf_encoding=True, gate=True, activation_format="nvfp4", quantize_output=True, compile=True),
         # swizzled decode (S=8) — the bench's pre-swizzled batched decode arm per fp4 family
         Problem(weights="mxfp4", swizzled=True, S=8),
         Problem(weights="nvfp4", swizzled=True, S=8),
@@ -633,7 +633,11 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
 
 def _make_weights(problem: Problem, row, E):
     """The scenario's weights: ``(B, Bs, Bs_global)`` at the stack's row count (doubled under gate)."""
-    return row["make"](2 * problem.N if problem.gate else problem.N, problem.K, E)
+    weight, scales, global_scale = row["make"](2 * problem.N if problem.gate else problem.N, problem.K, E)
+    if problem.csf_encoding:
+        # Their E4M3 byte codes differ by more than 15, requiring an exception in each expert.
+        scales[..., 0, :2] = scales.new_tensor([0.125, 1.0])
+    return weight, scales, global_scale
 
 
 def _skip_moe_only(problem: Problem, op: str) -> None:

@@ -402,13 +402,14 @@ def _decode_fixed_kernel(
     COLS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     PAIRS: tl.constexpr,
+    ALIGNED_OUTPUT: tl.constexpr,
 ):
     col_tiles: tl.constexpr = tl.cdiv(COLS // 2, PAIRS)
     tiles: tl.constexpr = tl.cdiv(ROWS, BLOCK_ROWS) * col_tiles
     rows = tl.arange(0, BLOCK_ROWS)
     cols = tl.arange(0, PAIRS)
-    # Decode pairs together: load each row base once and store adjacent output
-    # bytes as uint16. The format always has an even column count.
+    # Decode pairs together: each row base is loaded once. Aligned workspaces
+    # store pairs as uint16; a contiguous sliced workspace can start at an odd byte.
     output = Out.to(tl.pointer_type(tl.uint16))
     for tile in range(tl.program_id(0), E * tiles, tl.num_programs(0)):
         expert = tile // tiles
@@ -429,15 +430,26 @@ def _decode_fixed_kernel(
             mask,
             other=0,
         ).to(tl.uint16)
-        bits = (base[:, None] + (packed & 15)) | ((base[:, None] + (packed >> 4)) << 8)
-        tl.store(
-            output
-            + expert.to(tl.int64) * ROWS * (COLS // 2)
-            + row[:, None] * (COLS // 2)
-            + col[None, :],
-            bits,
-            mask,
-        )
+        if ALIGNED_OUTPUT:
+            bits = (base[:, None] + (packed & 15)) | ((base[:, None] + (packed >> 4)) << 8)
+            tl.store(
+                output
+                + expert.to(tl.int64) * ROWS * (COLS // 2)
+                + row[:, None] * (COLS // 2)
+                + col[None, :],
+                bits,
+                mask,
+            )
+        else:
+            low = base[:, None] + (packed & 15)
+            high = base[:, None] + (packed >> 4)
+            values = tl.interleave(low, high).to(tl.uint8).to(tl.float8e4nv, bitcast=True)
+            output_col = ((tile % tiles) % col_tiles) * PAIRS * 2 + tl.arange(0, PAIRS * 2)
+            tl.store(
+                Out + expert.to(tl.int64) * ROWS * COLS + row[:, None] * COLS + output_col[None, :],
+                values,
+                (row[:, None] < ROWS) & (output_col[None, :] < COLS),
+            )
 
 
 @triton.jit
@@ -484,6 +496,7 @@ def _decompress_into(
             cols,
             64,
             min(128, triton.next_power_of_2(cols // 2)),
+            ALIGNED_OUTPUT=out.storage_offset() % 2 == 0,
         )
         if exceptions.numel():
             compile_time_only_triton_wrap(_apply_exceptions_kernel)[(experts,)](
