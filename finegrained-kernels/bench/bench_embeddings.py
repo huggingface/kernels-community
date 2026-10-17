@@ -39,7 +39,6 @@ from triton.testing import do_bench, do_bench_cudagraph
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -199,41 +198,33 @@ def benchmark(args):
 
 def plot(results, path, device):
     widths = list(dict.fromkeys(int(row["width"]) for row in results))
-    fig, axes = plt.subplots(len(widths), 2, figsize=(18, 4 * len(widths)), squeeze=False)
-    for row_index, width in enumerate(widths):
+    fig, axes = plt.subplots(2 * len(widths), 2, figsize=(18, 7 * len(widths)), squeeze=False)
+    for width_index, width in enumerate(widths):
         for col, regime in enumerate(("decode", "prefill")):
-            ax = axes[row_index, col]
             cells = [r for r in results if int(r["width"]) == width and r["regime"] == regime]
             formats = list(dict.fromkeys(r["format"] for r in cells))
-            times = {(r["format"], r["impl"], r["mode"]): float(r["latency_us"]) for r in cells}
-            for index, fmt in enumerate(formats):
-                for arm, (impl, color) in enumerate(zip(IMPLS, COLORS)):
-                    x = index + (arm - 1) * 0.25
-                    ax.bar(x, times[fmt, impl, "cudagraph"], 0.23, color=color)
-                    ax.bar(
-                        x,
-                        times[fmt, impl, "cold"],
-                        0.23,
-                        facecolor="none",
-                        edgecolor=color,
-                        hatch="////",
-                        linewidth=1,
-                    )
-            ax.set_xticks(range(len(formats)), formats)
-            ax.set_yscale("log")
-            ax.set_ylabel("latency (µs, log scale)")
-            ax.set_title(f"D={width} — {regime}, {cells[0]['rows']} rows")
-            ax.legend(
-                handles=[Patch(color=color, label=impl) for impl, color in zip(IMPLS, COLORS)]
-                + [Patch(facecolor="none", hatch="////", label="cold weights")],
-                fontsize=8,
-            )
+            times = {(r["format"], r["impl"]): float(r["latency_us"]) for r in cells if r["mode"] == "cudagraph"}
+            for focused in (False, True):
+                ax = axes[2 * width_index + int(focused), col]
+                arms = ((IMPLS[0], COLORS[0]), (IMPLS[2], COLORS[2])) if focused else tuple(zip(IMPLS, COLORS))
+                bar_width = 0.8 / len(arms)
+                for arm, (impl, color) in enumerate(arms):
+                    positions = [i + (arm - (len(arms) - 1) / 2) * bar_width for i in range(len(formats))]
+                    bars = ax.bar(positions, [times[fmt, impl] for fmt in formats], bar_width, color=color, label=impl)
+                    if focused:
+                        ax.bar_label(bars, fmt="%.2f", fontsize=8, padding=2)
+                ax.set_xticks(range(len(formats)), formats)
+                ax.set_ylim(0, ax.get_ylim()[1] * 1.12)
+                ax.set_ylabel("latency (µs)")
+                comparison = "custom vs compiled" if focused else "all implementations"
+                ax.set_title(f"D={width} — {regime}, {cells[0]['rows']} rows — {comparison}")
+                ax.legend(fontsize=8)
     fig.suptitle(
-        f"Quantized embedding lookup — {device}\nsolid: CUDA graph; hatched: L2 flushed; "
-        "all arms gather and dequantize the same rows",
+        f"Quantized embedding lookup — {device} — CUDA graph replay\n"
+        "Linear axes; identical selected-row work. Cold-weight and host timings are retained in the CSV.",
         fontsize=12,
     )
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
