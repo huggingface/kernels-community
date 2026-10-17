@@ -386,7 +386,8 @@ def _dequant_block_fp8_weight_kernel(
     if active:
         offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         n, k = offsets // K, offsets % K
-        mask = offsets < N * K
+        # Full tiles avoid masked-load codegen; the final partial tile stays bounded.
+        mask = offsets < N * K if (N * K) % BLOCK_SIZE else tl.full((BLOCK_SIZE,), True, tl.int1)
         scale_n = (n // 2 // BLOCK_N) * 2 + n % 2 if GATE_SCALES else n // BLOCK_N
         weight = tl.load(B + expert * stride_b_e + n * stride_b_n + k * stride_b_k, mask, 0.0)
         scale = tl.load(
@@ -414,13 +415,13 @@ def dequant_block_fp8_weight(B, Bs, dtype, *, gate=False, expert_start=None):
     output = B.new_empty(B.shape, dtype=dtype)
     with device_context(B.device):
         compile_time_only_triton_wrap(_dequant_block_fp8_weight_kernel)[
-            (triton.cdiv(rows * K, 4096), experts)
+            (triton.cdiv(rows * K, 2048), experts)
         ](
             B, Bs, output, expert_start, rows, K,
             B.stride(0) if B.ndim == 3 else 0, B.stride(-2), B.stride(-1),
             Bs.stride(0) if Bs.ndim == 3 else 0, Bs.stride(-2), Bs.stride(-1),
             BLOCK_N=block_n, BLOCK_K=block_k,
             GATE_SCALES=gate and Bs.shape[-2] > 1,
-            BLOCK_SIZE=4096,
+            BLOCK_SIZE=2048,
         )
     return output

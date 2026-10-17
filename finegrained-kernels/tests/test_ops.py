@@ -164,7 +164,7 @@ def scenarios() -> list[Problem]:
         Problem(weights="fp8_128x128", activation_format="bf16", S=1, N=192, K=384, bias=True, dtype=torch.float16),
         Problem(weights="fp8_128x128_ue8m0", activation_format="bf16", S=8, empty_expert=True, sentinel_fraction=0.25),
         Problem(weights="fp8_tensor", activation_format="bf16", S=1, gate=True, bias=True, compile=True),
-        Problem(weights="fp8_128x128", activation_format="bf16", S=1025, N=192, K=384, compile=True, bias=True),
+        Problem(weights="fp8_128x128", activation_format="bf16", S=1025, E=1, N=192, K=384, compile=True, bias=True),
         Problem(weights="fp16", dtype=torch.float16),
         # gate WITHOUT requant (raw GLU intermediate) — one quantized + one full format
         Problem(weights="mxfp8", gate=True),
