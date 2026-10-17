@@ -56,9 +56,15 @@ def _embedding_kernel(
     program = tl.program_id(0).to(tl.int64)
     offsets = program * (BLOCK // packing) + tl.arange(0, BLOCK // packing)
     valid = offsets < N * (D // packing)
-    row = tl.load(Ids + offsets // (D // packing), valid, other=0).to(tl.int64)
+    # Tiles contained in one row share its index and per-row scale across all lanes.
+    if D % BLOCK == 0:
+        indices = program // (D // BLOCK)
+    else:
+        indices = offsets // (D // packing)
+    valid_rows = indices < N
+    row = tl.load(Ids + indices, valid_rows, other=0).to(tl.int64)
     in_bounds = (row >= 0) & (row < V)
-    tl.device_assert(in_bounds | ~valid, "embedding index out of range")
+    tl.device_assert(in_bounds | ~valid_rows, "embedding index out of range")
     valid = valid & in_bounds
     col = offsets % (D // packing)
     weight_row = row // 2 if FORMAT == "int4" else row
@@ -70,15 +76,17 @@ def _embedding_kernel(
         value = ((nibble ^ 8) - 8).to(tl.float32)
     else:
         value = value.to(tl.float32)
+    scale_offsets = (row // SCALE_BLOCK_ROW) * S_ROW
+    if S_COL != 0:
+        scale_offsets += (col * packing // SCALE_BLOCK_COL) * S_COL
     scale = tl.load(
-        S
-        + (row // SCALE_BLOCK_ROW) * S_ROW
-        + (col * packing // SCALE_BLOCK_COL) * S_COL,
-        valid,
+        S + scale_offsets,
+        (valid_rows & in_bounds) if S_COL == 0 else valid,
         other=0.0,
     )
     scale = decode_group_scale(scale).to(tl.float32)
     if packing == 2:
+        scale = tl.broadcast_to(scale, (BLOCK // packing,))
         scale = tl.interleave(scale, scale)
     value = value * scale
     if FORMAT == "nvfp4":

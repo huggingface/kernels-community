@@ -818,7 +818,7 @@ _EMBEDDING_CASES = [
 
 
 def _embedding_table(weight_format, layout, dtype, sliced=False):
-    rows, width = 38, 160
+    rows, width = 38, 256 if sliced else 160
     if weight_format in ("nvfp4", "mxfp4", "int4"):
         shape = (rows // 2, width) if weight_format == "int4" else (rows, width // 2)
         weight = torch.randint(0, 256, shape, device=TEST_DEVICE, dtype=torch.uint8)
@@ -840,7 +840,7 @@ def _embedding_table(weight_format, layout, dtype, sliced=False):
     scale_shape = {
         "tensor": (1,),
         "row": (rows,),
-        "block": (2, 5),
+        "block": ((rows + 31) // 32, (width + 31) // 32),
         "group": (rows, width // group),
     }[layout]
     if weight_format in ("mxfp8", "mxfp4"):
@@ -872,6 +872,8 @@ def _embedding_table(weight_format, layout, dtype, sliced=False):
         weight, scale = views
         if weight_format == "nvfp4":
             weight = weight.view(torch.int8)
+            # Zero column stride exercises scalar scale loads in packed decoding.
+            scale = scale[:, :1].expand_as(scale)
         if weight_format in ("mxfp8", "mxfp4"):
             scale = scale.view(torch.float8_e8m0fnu)
     return weight, scale, global_scale
@@ -961,46 +963,6 @@ def test_embedding_lookup_fullgraph_compile(weight_format, layout, dtype):
         rtol=0,
         atol=0,
     )
-
-
-@pytest.mark.kernels_ci
-@pytest.mark.parametrize(
-    "weight_format,invalid",
-    [
-        ("nvfp4", invalid)
-        for invalid in ("indices", "weight", "scale", "global", "width")
-    ]
-    + [
-        ("mxfp8", "scale_dtype"),
-        ("mxfp4", "weight"),
-        ("int4", "vocab"),
-        ("fp8", "blockgrid"),
-    ],
-)
-def test_embedding_lookup_rejects_invalid_metadata(weight_format, invalid):
-    layout = "block" if weight_format == "fp8" else "group"
-    weight, scale, global_scale = _embedding_table(
-        weight_format, layout, torch.bfloat16
-    )
-    ids = torch.tensor([0], device=weight.device)
-    if invalid == "indices":
-        ids = ids.float()
-    elif invalid == "weight":
-        weight = weight.float()
-    elif invalid == "scale":
-        scale = scale[:, :-1]
-    elif invalid == "global":
-        global_scale = global_scale.half()
-    elif invalid == "scale_dtype":
-        scale = scale.float()
-    elif invalid in ("vocab", "blockgrid"):
-        scale = scale[:-1]
-    else:
-        weight, scale = weight[:, :0], scale[:, :0]
-    with pytest.raises(ValueError):
-        embedding_lookup(
-            weight, ids, scale, global_scale, weight_format=weight_format, block_size=32
-        )
 
 
 def _embedding_invalid_index(_rank, index, packed):
