@@ -328,9 +328,10 @@ WEIGHTS = {
     "fp8_128x128": dict(
         make=lambda N, K, E: (*make_weights(N, K, TEST_DEVICE, [128, 128], num_experts=E), None),
         dequant=lambda B, Bs, g=None: dq_block_fp8(B, Bs, 128, 128),
-        activation_formats=("fp8",),
+        activation_formats=("fp8", "bf16"),
         requant_formats=("fp8",),
         act_quant={
+            "bf16": None,
             None: lambda A: fp8_act_quant_block_dynamic(A, 128),
             "fp8": lambda A: fp8_act_quant_block_dynamic(A, 128),
         },
@@ -343,9 +344,10 @@ WEIGHTS = {
             N, K, TEST_DEVICE, [128, 128], scale_dtype=torch.float8_e8m0fnu, num_experts=E
         ), None),
         dequant=lambda B, Bs, g=None: dq_block_fp8(B, Bs, 128, 128),
-        activation_formats=("fp8",),
+        activation_formats=("fp8", "bf16"),
         requant_formats=("fp8",),
         act_quant={
+            "bf16": None,
             None: lambda A: fp8_act_quant_block_dynamic(A, 128, use_ue8m0=True),
             "fp8": lambda A: fp8_act_quant_block_dynamic(A, 128, use_ue8m0=True),
         },
@@ -356,9 +358,10 @@ WEIGHTS = {
             N, K, TEST_DEVICE, None, scale_layout="per_tensor_3d", num_experts=E
         ), None),
         dequant=lambda B, Bs, g=None: B.float() * Bs.float().reshape(-1, 1, 1),
-        activation_formats=("fp8",),
+        activation_formats=("fp8", "bf16"),
         requant_formats=(),
         act_quant={
+            "bf16": None,
             None: lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
             "fp8": lambda A: fp8_act_quant_tensor_wide(A, A.shape[-1]),
         },

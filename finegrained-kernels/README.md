@@ -75,6 +75,8 @@ matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None,
   gate|up stack whose halves a checkpoint calibrated separately carries one global per half; the
   loader merges those into one per expert (the up half's folds into the down projection's global,
   SwiGLU being linear in it) rather than the ops taking a second layout.
+- Weight-only FP8 (`activation_format="bf16"`) also accepts coarse block scales and one scale
+  per tensor/expert, with unquantized activations. Coarse FP8 entrypoints are inference-only.
 - Routing: `matmul_batched` reads one expert id per row (`expert_ids`, EP sentinels
   `>= num_experts` skipped); `matmul_grouped` takes the launch maps from
   `compute_grouped_scheduling(expert_ids, num_experts, top_k)` — no pre-sorted input required.
@@ -157,8 +159,13 @@ the offline activation quants the ops use internally, exposed for pre-quantized 
 Every kernel is tuned by a Tree-structured Parzen Estimator (TPE, the Bayesian search Optuna
 uses) autotuner with per-shape disk caching, config pruners
 that fence compiler bugs and can't-win regions per (arch, format), and failed-compile memoization.
-`FINEGRAINED_AUTOTUNE_TRIALS` overrides the trial budget; `FINEGRAINED_AUTOTUNE_LOG=<path>` appends
-per-config timings as JSONL to `<path>`.
+`FINEGRAINED_AUTOTUNE_TRIALS` overrides the trial budget. Basin probes and winner remeasurement
+are controlled by `FINEGRAINED_AUTOTUNE_BASIN_PROBES` and `FINEGRAINED_AUTOTUNE_RUNOFF`
+(`0` or `1`, both enabled by default). `FINEGRAINED_AUTOTUNE_MAX_REFINE_ITERS` controls the
+coordinate-refinement iteration limit (default `5`; `0` disables refinement).
+For correctness tests, set the trial budget to `1` and all three controls to `0`: only one
+successful configuration is measured, retrying failed candidates. `FINEGRAINED_AUTOTUNE_LOG=<path>`
+appends per-config timings as JSONL to `<path>`.
 
 ## Tests
 

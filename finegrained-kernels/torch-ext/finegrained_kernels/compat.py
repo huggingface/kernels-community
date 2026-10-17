@@ -290,6 +290,7 @@ def get_accelerator_autotuning_configs(
     tune_block_n: bool = False,
     tune_block_nk: bool = False,
     swap_ab: bool = False,
+    swap_block_sizes_m=(1,),
     warp_spec: bool = False,
     packed_schedule: bool = False,
     compute_modes=None,
@@ -326,6 +327,8 @@ def get_accelerator_autotuning_configs(
       bursts are the one in-block lever that helps (+12% on the dsv4 swap GEMV; deeper
       num_stages and split-K both measured WORSE). Prefill tunes carry the same rows as
       trial-budget dilution (descriptor_box_pruner drops the illegal e4m3 boxes).
+    - ``swap_block_sizes_m``: token tiles for swapped plain GEMMs that retain a normal
+      logical accumulator. Padded-single-token helpers require the default ``(1,)``.
     - ``warp_spec``: warp-specialize the K-loop, crossed over every mode —
       pair it with ``warp_spec_compile_guard_pruner``, which owns the can't-compile
       regions (including dot_scaled + WS, a PassManager failure). Compile support is
@@ -448,21 +451,22 @@ def get_accelerator_autotuning_configs(
     # The coupled decode (BLOCK_SIZE_M, SWAP_AB) pairs — the single source of the swap/BM
     # coupling. At M=1 the MMA 16-atom is filled either by replicating the token (non-swap
     # BM=16, ~40% over the degenerate BM=1 on plain tl.dot) or by putting the weight's
-    # output rows in M (swap, BM=1). Swap REQUIRES BM=1 (its rhs is the single token
-    # padded to the N=16 atom), so (16, swap) never exists; the tuner picks. Prefill
+    # output rows in M (swap, BM=1). Padded-token helpers require BM=1; plain GEMMs
+    # can request additional swapped token tiles through swap_block_sizes_m. Prefill
     # kernels leave SWAP_AB unset — the prefill swap arms measured losers everywhere
     # (see the bd 2D kernel's tuner note).
     if swap_ab and tune_block_m:
-        # tuned-BM kernels (the 2D mx GEMM): the prefill BM sweep keeps no-swap; the swap
-        # decode rows are APPENDED at their structural BM=1 (dedup collapses the copies)
+        # Keep the normal BM sweep and append the requested swapped token tiles.
         blocks = [{**b, "SWAP_AB": False} for b in blocks] + [
-            {**b, "BLOCK_SIZE_M": 1, "SWAP_AB": True} for b in blocks
+            {**b, "BLOCK_SIZE_M": bm, "SWAP_AB": True}
+            for b in blocks for bm in swap_block_sizes_m
         ]
     elif swap_ab:
+        orientations = [(1, False), (16, False)] + [(bm, True) for bm in swap_block_sizes_m]
         blocks = [
             {**b, "BLOCK_SIZE_M": bm, "SWAP_AB": sw}
             for b in blocks
-            for bm, sw in ((1, False), (16, False), (1, True))
+            for bm, sw in orientations
         ]
 
     # scalar's BM is STRUCTURALLY 1 (a single-row GEVM reduce — a bigger-BM scalar

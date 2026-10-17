@@ -785,7 +785,7 @@ def _warp_spec_needs_descriptor_tile() -> bool:
     return tuple(int(n) for n in triton.__version__.split(".")[:2]) >= (3, 8)
 
 
-def warp_spec_memory_mode_pruner(weight_only: bool = False):
+def warp_spec_memory_mode_pruner(weight_only: bool = False, gather_only: bool = False):
     """``early_config_prune`` dropping ``warp_specialize`` configs the WS passes cannot lower
     (``TritonGPUOptimizePartitionWarps`` / ``RelayoutTritonGPU`` -> ``PassManager::run failed``).
 
@@ -805,6 +805,11 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False):
     REGRESSED in 3.8 and pointer+WS was FIXED. So each version gets the rule its own sweep
     measured, rather than an intersection that would fence off a whole memory mode on both.
 
+    ``gather_only`` applies this restriction only to gathered descriptor A. The raw-activation
+    grouped kernel reproduces the TMA gather layout failure with both BF16 and rescaled FP8
+    weights, while non-gathered descriptor boxes compile at the other warp counts. Pointer A
+    and non-gathered launches retain their existing search space.
+
     ``weight_only`` adds the rows that kernel charted for itself and the sweep did not re-probe:
     ``BN == 32`` with WS, which failed 9/9 cells there, and (below 3.8) its trapping
     pointer/pointer warp counts.
@@ -815,6 +820,10 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False):
     width law and belongs wherever gather width is decided."""
 
     def ok(c, args):
+        if gather_only and (
+            args.get("GatherIdx") is None or c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
+        ):
+            return True
         if not c.kwargs.get("WARP_SPEC"):
             return True
         if weight_only and config_dim(c, args, "BLOCK_SIZE_N") == 32:
@@ -1096,6 +1105,20 @@ def scalar_max_m_pruner(m_arg: str, max_m: int = 64):
         return c.kwargs.get("COMPUTE_MODE") != "scalar"
 
     return config_filter(ok, when=lambda args: args[m_arg] > max_m)
+
+
+def swap_max_m_pruner(m_arg: str, max_m: int):
+    """Keep measured small-row swaps in one M tile, retaining BM1/2 candidates for M1."""
+
+    def ok(c, args):
+        if not c.kwargs.get("SWAP_AB"):
+            return True
+        m = args[m_arg]
+        bm = c.kwargs["BLOCK_SIZE_M"]
+        return m <= max_m and m <= bm <= triton.next_power_of_2(max(2, m))
+
+    return config_filter(ok)
+
 
 def matched_memory_modes_pruner():
     """Drop configs that mix pointer and descriptor operand loads — for a DENSE 2D GEMM

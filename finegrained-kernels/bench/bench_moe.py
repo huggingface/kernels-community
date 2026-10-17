@@ -41,6 +41,7 @@ the unquantized row; baselines per problem):
                                               block scales (the B200 deployment format;
                                               DeepGEMM SM100 rejects fp32 scales by design)
   MiniMaxAI/MiniMax-M3     MXFP8 W8A8         finegrained-fp8 (no TRT-LLM: clamped SwiGLU)
+  unknown model          FP8 W8A16          E128 H6144 I6144 top4, tensor/block scales
 
 The TRT-LLM arms are FlashInfer's ``trtllm_*_routed_moe`` kernels — the backends vLLM's
 serving path dispatches to on Blackwell for these quant modes (its own triton fused-MoE
@@ -68,6 +69,7 @@ Run: python bench/bench_moe.py                         (all rows, single GPU)
      python bench/bench_moe.py --smoke                 (fast compile check)
      python bench/bench_moe.py --no-preswizzle         (affine MX scales instead of the fast path)
      python bench/bench_moe.py gpt-oss                 (substring filter on row/problem names)
+     python bench/bench_moe.py W8A16 --suffix _weight_only  (FP8 weight-only microbenchmarks)
      python bench/bench_moe.py --replot                (rebuild the figure from bench_moe.csv)
      python bench/bench_moe.py --mock                  (no GPU: random latencies, validates the figure layout)
      python bench/bench_moe.py --help
@@ -241,6 +243,15 @@ try:
     from vllm._custom_ops import scaled_fp8_quant as _vllm_tensor_quant  # noqa: E402
 except ImportError:
     vllm_fused_experts = None
+try:
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (  # noqa: E402
+        apply_fp8_marlin_linear, prepare_fp8_layer_for_marlin, prepare_fp8_moe_layer_for_marlin,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe  # noqa: E402
+    from vllm.scalar_type import scalar_types  # noqa: E402
+except ImportError:
+    fused_marlin_moe = None
+
 # kernels-community/nvfp4-gemm — the dense NVFP4 GEMM behind transformers' `NVFP4Linear`
 # (upstream #47883). Linear-only: it never sees an MoE, because experts are fused 3-D
 # parameters rather than nn.Linear. Benched here two ways — as a 2D GEMM against our
@@ -350,7 +361,7 @@ PREFILL_TOKENS = 256 if SMOKE else 8192
 # fixed left-to-right model order for every figure row (matched by base-model prefix,
 # so GLM-5.2-NVFP4 and GLM-5.2 both land in the GLM-5.2 slot). Roughly most-baseline-
 # support first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last.
-CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2", "Mistral-4"]
+CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2", "Mistral-4", "unknown model"]
 
 # Low-VRAM parts run the same recipes and baselines at /8 experts, /2 dims, INSTEAD OF the
 # full roster rather than alongside it. Selected off the device, not a knob, so a small part
@@ -429,8 +440,20 @@ FULL_MOE_PROBLEMS = {
         baselines=("finegrained-fp8",), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
     ),
+    "unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4)": dict(
+        E=128, H=6144, I=6144, top_k=4, weights="fp8_tensor", activation_format="bf16",
+        baselines=("finegrained-kernels-unfused", "torch_weight_only", "torch_weight_only_compiled",
+                   "marlin"), fp8_block=None, block_size=None,
+        act="silu", swiglu_alpha=None, swiglu_limit=None, weight_std=0.02,
+    ),
+    "unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4)": dict(
+        E=128, H=6144, I=6144, top_k=4, weights="fp8_128x128", activation_format="bf16",
+        baselines=("finegrained-kernels-unfused", "torch_weight_only", "torch_weight_only_compiled",
+                   "marlin"), fp8_block=[128, 128], block_size=(128, 128),
+        act="silu", swiglu_alpha=None, swiglu_limit=None, weight_std=0.02,
+    ),
 }
-# the same base-model roster, run as if dequantized to BF16 (one shape per model)
+# BF16 reference roster: one shape per base model.
 FULL_BF16_PROBLEMS = {
     "deepseek-ai/DeepSeek-V4 BF16 (E256 H4096 I2048 top6)": dict(
         E=256, H=4096, I=2048, top_k=6, weights="bf16", activation_format=None,
@@ -579,6 +602,14 @@ ATTN_PROBLEMS = {
         N=18432, K=6144, weights="mxfp8", activation_format=None,
         block=None, baselines=("finegrained-fp8",),  # DeepGEMM FP8 is 128-block, not group-32 MX
     ),
+    "unknown model FP8 W8A16 tensor linear (N=8192 K=6144)": dict(
+        N=8192, K=6144, weights="fp8_tensor", activation_format="bf16",
+        block=None, baselines=("torch_weight_only", "torch_weight_only_compiled", "marlin"), weight_std=0.02,
+    ),
+    "unknown model FP8 W8A16 block128 linear (N=8192 K=6144)": dict(
+        N=8192, K=6144, weights="fp8_128x128", activation_format="bf16",
+        block=[128, 128], baselines=("torch_weight_only", "torch_weight_only_compiled", "marlin"), weight_std=0.02,
+    ),
 }
 MODES = ["eager", "cudagraph", "compile"]
 
@@ -596,6 +627,10 @@ IMPL_COLORS = {
     "nvfp4_gemm": "#d62728",  # transformers NVFP4Linear kernel (dense 2D row only)
     "megablocks": "#7f7f7f",  # databricks dropless-MoE (bf16 reference)
     "torch": "#e377c2",  # torch/cuBLAS F.scaled_grouped_mm (quantized prefill reference)
+    "finegrained-kernels-unfused": "#6baed6",
+    "torch_weight_only": "#e377c2",
+    "torch_weight_only_compiled": "#bc80bd",
+    "marlin": "#17becf",
     "torch_mm": "#e377c2",  # torch/cuBLAS F.scaled_mm (the attn-row sibling)
 }
 
@@ -605,6 +640,14 @@ def _impl_label(impl, regime):
     transformers batched_mm -> torch.bmm (decode) / grouped_mm -> torch._grouped_mm (bf16);
     ``torch`` -> torch.scaled_grouped_mm (the quantized cuBLAS path). Every other impl
     (finegrained-kernels, finegrained-fp8, deepgemm, ...) is its own label."""
+    if impl == "finegrained-kernels-unfused":
+        return "finegrained-kernels unfused"
+    if impl == "torch_weight_only":
+        return "torch runtime dequant + BF16 GEMM"
+    if impl == "torch_weight_only_compiled":
+        return "torch compiled runtime dequant + matmul"
+    if impl == "marlin":
+        return "vLLM Marlin FP8 W8A16"
     if impl == "transformers":
         return "torch.bmm" if regime == "decode" else "torch._grouped_mm"
     if impl == "torch":
@@ -639,6 +682,7 @@ def build(cfg):
     """Quantized weights for one MoE problem, shared by every impl and row. The GLM-FP8
     problem uses UE8M0 block scales (finegrained-fp8/finegrained-kernels decode them natively; DeepGEMM SM100
     requires them)."""
+    torch.manual_seed(0)
     E, H, inter = cfg["E"], cfg["H"], cfg["I"]
     if cfg["weights"] == "fp8_128x128_ue8m0":
         def make(n, k, e):
@@ -650,6 +694,8 @@ def build(cfg):
     # single-level FP8/MX formats). Thread it through — dropping it silently ran nvfp4 at global=1.
     gu, gus, gu_g = make(2 * inter, H, E)
     dn, dns, dn_g = make(H, inter, E)
+    if "weight_std" in cfg:
+        gus, dns = gus * cfg["weight_std"], dns * cfg["weight_std"]
     _mark_static(gu, gus, dn, dns)
     return gu, gus, dn, dns, gu_g, dn_g
 
@@ -676,6 +722,9 @@ class _Experts:
     (grouped_mm/batched_mm, SonicMoE, DeepGEMM): our (E, out, in) layout is their
     ``is_transposed=False``; gate|up rows are stacked (concatenated), not interleaved."""
 
+    config = SimpleNamespace(hidden_act="silu")
+    has_post_expert_norm = False
+
     def __init__(self, cfg, gu, dn, gus=None, dns=None):
         self.num_experts = cfg["E"]
         self.has_gate, self.has_bias = True, False
@@ -690,7 +739,6 @@ class _Experts:
         self.activation_scheme = "dynamic"
         self._deepgemm_disabled = False
         self.act_fn = torch.nn.functional.silu
-        self.config = SimpleNamespace(hidden_act="silu")
         self.swiglu_alpha = cfg["swiglu_alpha"]
         self.swiglu_limit = cfg["swiglu_limit"]
         self._cfg = cfg
@@ -875,6 +923,55 @@ def transformers_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     mod = _Experts(cfg, gu, dn)
     fwd = grouped_mm_experts_forward if grouped else batched_mm_experts_forward
     return lambda: fwd(mod, hidden, idx, w)
+
+
+def dequantize_fp8_weight(weight, scale, block):
+    """Native dequantization of aligned blocks without materializing repeated scales."""
+    if block is None:
+        return (weight.float() * scale.float()).to(torch.bfloat16)
+    n, k = weight.shape[-2:]
+    shape = (*weight.shape[:-2], n // block[0], block[0], k // block[1], block[1])
+    values = weight.float().reshape(shape) * scale.float()[..., :, None, :, None]
+    return values.reshape(weight.shape).to(torch.bfloat16)
+
+
+def torch_weight_only_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
+    """Runtime dequantization: selected experts for decode, grouped BF16 GEMMs for prefill."""
+    block = cfg["fp8_block"]
+    if grouped:
+        def run():
+            experts = _Experts(cfg, dequantize_fp8_weight(gu, gus, block), dequantize_fp8_weight(dn, dns, block))
+            return grouped_mm_experts_forward(experts, hidden, idx, w)
+    else:
+        def run():
+            expert_ids = idx.flatten().long()
+            gu_bf16 = dequantize_fp8_weight(gu[expert_ids], gus[expert_ids], block)
+            dn_bf16 = dequantize_fp8_weight(dn[expert_ids], dns[expert_ids], block)
+            selected = hidden.repeat_interleave(cfg["top_k"], dim=0)
+            gate, up = torch.bmm(selected[:, None, :], gu_bf16.transpose(1, 2)).squeeze(1).chunk(2, dim=-1)
+            inter = _glu(gate, up, cfg).to(hidden.dtype)
+            down = torch.bmm(inter[:, None, :], dn_bf16.transpose(1, 2)).squeeze(1)
+            return (down.view(hidden.shape[0], cfg["top_k"], -1) * w[..., None]).sum(1).to(hidden.dtype)
+    return run
+
+
+def torch_weight_only_compiled_arm(*args):
+    """Compile the native path before capture so its graph bar includes fusion."""
+    return torch.compile(torch_weight_only_arm(*args), fullgraph=True, mode="max-autotune-no-cudagraphs")
+
+
+def marlin_weight_only_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
+    layer = torch.nn.Module()
+    layer.num_experts, layer.hidden_size = cfg["E"], cfg["H"]
+    layer.intermediate_size_per_partition = cfg["I"]
+    layer.weight_block_size, layer.orig_dtype = cfg["fp8_block"], hidden.dtype
+    layer.w13_weight = torch.nn.Parameter(gu, requires_grad=False)
+    gu, dn, gus, dns = prepare_fp8_moe_layer_for_marlin(layer, gu, dn, gus, dns)
+    _mark_static(gu, dn, gus, dns, layer.workspace)
+    return lambda: fused_marlin_moe(
+        hidden, gu, dn, None, None, gus, dns, w, idx,
+        scalar_types.float8_e4m3fn.id, workspace=layer.workspace,
+    )
 
 
 def transformers_main_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
@@ -1277,6 +1374,10 @@ def megablocks_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
 ARMS = {
     "finegrained-kernels": moe_fused_arm,
     "finegrained-kernels_unfused": moe_unfused_arm,
+    "finegrained-kernels-unfused": moe_unfused_arm,
+    "torch_weight_only": torch_weight_only_arm,
+    "torch_weight_only_compiled": torch_weight_only_compiled_arm,
+    "marlin": marlin_weight_only_arm,
     "finegrained-fp8": fp8_fused_arm,
     "finegrained-fp8_unfused": fp8_unfused_arm,
     "transformers": transformers_arm,
@@ -1393,10 +1494,15 @@ def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
         print(f"   -- {regime}")
         hidden, idx, w, logits = routing(cfg, tokens)
         args = (cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, logits)
+        reference = torch_weight_only_arm(*args)() if "torch_weight_only" in cfg["baselines"] else None
         anchor_res, anchor_out = None, None
         for name in arms:
             try:
                 run = ARMS[name](*args)
+                if reference is not None:
+                    candidate = run()
+                    torch.accelerator.synchronize()
+                    assert torch.isfinite(candidate).all() and rel_diff(candidate, reference) < 0.05, name
             except Exception as e:
                 print(f"      [{name} setup failed: {type(e).__name__}: {str(e)[:90]}]",
                       flush=True)
@@ -1423,7 +1529,7 @@ def _impl(arm_name):
 
 
 def bench_attn_row(row, pname, cfg, rows_out):
-    """One attn linear per model, in its deployment format (same weights across
+    """One attn linear per configured recipe (same weights across
     impls; the finegrained-kernels arm's ``activation_format`` follows the model — GPT-OSS runs W4A4)."""
     print(f"== [{row}] {pname}")
     if MOCK:
@@ -1442,6 +1548,8 @@ def bench_attn_row(row, pname, cfg, rows_out):
         W, Ws, W_g = WEIGHTS[cfg["weights"]]["make"](N, K, 1)
         W, Ws = W[0], Ws[0]
         W_g = W_g if W_g is None else W_g[0]
+    if "weight_std" in cfg:
+        Ws = Ws * cfg["weight_std"]
     _mark_static(W, Ws)
     Ws_fp8 = _fp8_scales(Ws, block)
     dg_block = tuple(block) if block else None
@@ -1524,6 +1632,15 @@ def bench_attn_row(row, pname, cfg, rows_out):
                 Ws.reshape(()), ScalingType.TensorWise,
                 output_dtype=torch.bfloat16)
 
+    if "marlin" in cfg["baselines"] and fused_marlin_moe is not None:
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(W, requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(Ws, requires_grad=False)
+        layer.output_size_per_partition, layer.input_size_per_partition = N, K
+        layer.weight_block_size, layer.orig_dtype = block, torch.bfloat16
+        prepare_fp8_layer_for_marlin(layer, size_k_first=False)
+        _mark_static(layer.weight, layer.weight_scale, layer.workspace)
+
     for regime, tokens in (("decode", DECODE_TOKENS), ("prefill", PREFILL_TOKENS)):
         print(f"   -- {regime}")
         torch.manual_seed(0)
@@ -1543,6 +1660,18 @@ def bench_attn_row(row, pname, cfg, rows_out):
                 x, W, attn_act_scale, Ws_fgm, activation_format=_activation_format(cfg), output_dtype=torch.bfloat16,
                 b_global_scale=W_g),
         }
+        if "torch_weight_only" in cfg["baselines"]:
+            attn_arms["torch_weight_only"] = lambda: torch.nn.functional.linear(
+                x, dequantize_fp8_weight(W, Ws, block)
+            )
+        if "torch_weight_only_compiled" in cfg["baselines"]:
+            attn_arms["torch_weight_only_compiled"] = torch.compile(
+                attn_arms["torch_weight_only"], fullgraph=True, mode="max-autotune-no-cudagraphs"
+            )
+        if "marlin" in cfg["baselines"] and fused_marlin_moe is not None:
+            attn_arms["marlin"] = lambda: apply_fp8_marlin_linear(
+                x, layer.weight, layer.weight_scale, layer.workspace, N, K, None
+            )
         if torch_mm is not None:
             attn_arms["torch_mm"] = lambda: torch_mm(x, attn_act_scale)
         if "finegrained-fp8" in cfg["baselines"]:
@@ -1568,8 +1697,13 @@ def bench_attn_row(row, pname, cfg, rows_out):
             )[0].to(torch.bfloat16)
             _pw = _nvfp4_gemm.pack(_w_bf16, device=x.device)
             attn_arms["nvfp4_gemm"] = lambda: _nvfp4_gemm.gemm(_pw, x)
+        reference = attn_arms["torch_weight_only"]() if "torch_weight_only" in attn_arms else None
         anchor_res, anchor_out = None, None
         for name, run in attn_arms.items():
+            if reference is not None:
+                candidate = run()
+                torch.accelerator.synchronize()
+                assert torch.isfinite(candidate).all() and rel_diff(candidate, reference) < 0.05, name
             res, out = bench_modes(run, name)
             parity = None
             if anchor_res is None:
@@ -1600,7 +1734,10 @@ def wanted(*names):
 # ── multi-GPU: GPUS>1 shards the per-problem tasks across GPUs, one process per GPU (each
 # owning one device via CUDA_VISIBLE_DEVICES). The coordinator spawns GPUS workers, each
 # writes a shard CSV, then the coordinator merges + plots. A single GPU (GPUS=1) runs inline. ──
-_CSV = os.path.join(_HERE, "bench_moe.csv")
+suffix = ARGS.suffix if ARGS.suffix is not None else (
+    "_mock" if MOCK else ("_partial" if FILTERS else "")
+)
+_CSV = os.path.join(_HERE, f"bench_moe{suffix}.csv")
 _CSV_HEADER = "category,problem,regime,impl,mode,latency_us,parity_vs_finegrained_kernels\n"
 
 
@@ -1701,7 +1838,8 @@ def _run_task(kind, pname, cfg, rows_out):
                             and not (cfg["swiglu_alpha"] is None and cfg["swiglu_limit"] is None))
         unavailable = (("vllm",) if vllm_fused_experts is None else ()) + (
             ("trtllm",) if trtllm_fp8_block_scale_routed_moe is None or trtllm_gated_gap else ())
-        quant_arms = tuple(a for a in quant_arms if a not in unavailable)
+        quant_arms = tuple(a for a in quant_arms if a not in unavailable
+                           and (a != "marlin" or fused_marlin_moe is not None))
         # Arms whose kernel is known to TRAP asynchronously go LAST: a trap poisons the CUDA
         # context, which is unrecoverable in-process, so every arm benched after it blanks
         # through no fault of its own (that is how finegrained-fp8's v4 int32 expert-offset
@@ -1793,6 +1931,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 # has only the two-GEMM shape, so that is what it contributes. No fused/unfused split in the
 # figure — it is an internal distinction of ours that most baselines do not have.
 ROW_ORDER = ["quantized", "linear quantized", "unquantized"]
+ROW_LABELS = {"quantized": "MoE quantized", "linear quantized": "Linear quantized",
+              "unquantized": "MoE unquantized (BF16)"}
 present_rows = [r for r in ROW_ORDER if any(rr == r for rr, *_ in rows)]
 
 # bars must be PHYSICALLY identical across every subplot of every figure: one slot
@@ -1815,9 +1955,6 @@ GLOBAL_SPAN = max(
 # single-process run writes here.
 # --suffix lets filtered rows run concurrently on separate GPUs without racing for the same
 # partial CSV/PNG (splice the pieces into bench_moe.csv afterwards)
-suffix = ARGS.suffix if ARGS.suffix is not None else (
-    "_mock" if MOCK else ("_partial" if FILTERS else "")
-)
 _via_coordinator = GPUS > 1 and _SHARD is None and not MOCK  # merged the CSV already
 if not REPLOT and _SHARD is None and not _via_coordinator:
     _write_rows_csv(os.path.join(_HERE, f"bench_moe{suffix}.csv"), rows)
@@ -1825,14 +1962,20 @@ if not REPLOT and _SHARD is None and not _via_coordinator:
 # ONE figure, 8 panels: rows = the 4 categories, cols = (decode | prefill). Each
 # bar is colored by impl (finegrained-kernels leftmost, fixed slots). DECODE superposes its two
 # graph-captured modes — cudagraph as the solid fill, compile as a black hatched
-# outline over the same slot — so the gap between them is visible per impl. PREFILL
-# is eager only (single solid) — prefill is not compiled in deployment, so a compile
-# bar there would show a mode nobody ships. Red X = crashed (no latency). This chart is latency
+# outline over the same slot — so the gap between them is visible per impl. FP8 weight-only
+# plots also show compile wins on prefill, where fusing native Torch dequantization matters.
+# Red X = crashed (no latency). This chart is latency
 # only; parity vs finegrained-kernels lives in the bench log + the CSV beside this png.
 import matplotlib.patches as mpatches  # noqa: E402
 
 # (solid_mode, overlay_mode) per regime
-REGIME_MODES = {"decode": ("cudagraph", "compile"), "prefill": ("eager", None)}
+weight_only_problems = {
+    name for name, cfg in {**MOE_PROBLEMS, **ATTN_PROBLEMS}.items()
+    if cfg["activation_format"] == "bf16" and cfg["weights"] in ("fp8_tensor", "fp8_128x128")
+}
+weight_only_only = bool(rows) and all(problem in weight_only_problems for _, problem, *_ in rows)
+REGIME_MODES = {"decode": ("cudagraph", "compile"),
+                "prefill": ("eager", "compile" if weight_only_only else None)}
 fig, axes = plt.subplots(max(len(present_rows), 1), 2,
                          figsize=(18, 4.6 * max(len(present_rows), 1)),
                          squeeze=False)
@@ -1841,14 +1984,17 @@ for ri, row in enumerate(present_rows):
         ax = axes[ri][ci]
         solid_mode, overlay_mode = REGIME_MODES[regime]
         cells = [(p, i, r, par) for (rr, p, reg, i, r, par) in rows
-                 if rr == row and reg == regime]
+                 if rr == row and reg == regime
+                 # The compiled native baseline is the useful comparison; keep its raw
+                 # eager counterpart in the CSV without letting it flatten this figure.
+                 and not (weight_only_only and i == "torch_weight_only")]
         problems = list(dict.fromkeys(p for p, *_ in cells))
         # ONE fixed model order across every row (was per-panel support-sort, which
         # reordered models between rows and read as confusing). Roughly most-supported
         # first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last; keyed on the base model so the
         # quantized/attn (GLM-5.2-NVFP4) and unquantized (GLM-5.2) rows line up.
         def _model_rank(p):
-            name = p.split(" ")[0].split("/")[-1]
+            name = p.split("/")[-1]
             for i, m in enumerate(CANONICAL_MODEL_ORDER):
                 if name.startswith(m):
                     return i
@@ -1865,6 +2011,8 @@ for ri, row in enumerate(present_rows):
             # compact 2-line tick: model short-name + format (full ids in the log)
             short = pname.split(" (")[0]
             model, _, rest = short.partition(" ")
+            if short.startswith("unknown model "):
+                model, rest = "unknown model", short.removeprefix("unknown model ")
             model = model.split("/")[-1]
             rest = rest.removeprefix("attn ").removesuffix(" qkv-shaped")
             ticklabels.append(f"{model}\n{rest}" if rest else model)
@@ -1922,9 +2070,9 @@ for ri, row in enumerate(present_rows):
         ax.set_xticklabels(ticklabels, fontsize=7)
         ax.set_ylabel("latency (us)")
         tok = DECODE_TOKENS if regime == "decode" else PREFILL_TOKENS
-        mode_note = ("solid=cudagraph, hatch=compile-if-faster" if overlay_drawn
-                     else (solid_mode if not overlay_mode else "cudagraph"))
-        ax.set_title(f"{row} — {regime} (T={tok}; {mode_note})")
+        mode_note = (f"solid={solid_mode}, hatch=compile-if-faster" if overlay_drawn
+                     else solid_mode)
+        ax.set_title(f"{ROW_LABELS[row]} — {regime} (T={tok}; {mode_note})")
         # legend: impl colors + the mode/marker key (compile entry only if any
         # panel bar actually had a compile win to show)
         handles = [mpatches.Patch(color=IMPL_COLORS[i], label=_impl_label(i, regime))
@@ -1935,11 +2083,19 @@ for ri, row in enumerate(present_rows):
         if eager_only_drawn:
             handles.append(mpatches.Patch(facecolor="none", edgecolor="black",
                                           hatch="..", label="eager (no cudagraph)"))
+        if weight_only_only and row == "linear quantized" and regime == "decode":
+            ax.set_ylim(top=1.4 * ax.get_ylim()[1])
         ax.legend(handles=handles, loc="upper left", fontsize=8)
-fig.suptitle(f"MoE bench — finegrained-kernels vs finegrained-fp8 + references  "
+benchmark_title = "FP8 weight-only" if weight_only_only else "MoE bench — finegrained-kernels vs finegrained-fp8 + references"
+fig.suptitle(f"{benchmark_title}  "
              f"({device_name}, real model shapes; decode=cudagraph+compile, "
-             f"prefill=eager)", y=0.9995)
-fig.tight_layout(rect=(0, 0, 1, 0.99))
+             f"prefill={'eager+compile' if weight_only_only else 'eager'})", y=0.9995)
+if weight_only_only:
+    fig.text(0.5, 0.01, "unknown model: FP8 W8A16, tensor/block128 scales, BF16 activations, fixed operands.\n"
+             "FP8 arms dequantize at runtime; native baseline is compiled (raw eager timings remain in CSV). "
+             "Hatches show compile wins.",
+             ha="center", va="bottom", fontsize=9)
+fig.tight_layout(rect=(0, 0.05 if weight_only_only else 0, 1, 0.99))
 out_png = os.path.join(_HERE, f"bench_moe{suffix}.png")
 fig.savefig(out_png, dpi=120)
 print(f"wrote {out_png}" + ("" if REPLOT else f" + bench_moe{suffix}.csv"))

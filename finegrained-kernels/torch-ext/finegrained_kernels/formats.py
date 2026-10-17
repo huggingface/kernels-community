@@ -17,6 +17,9 @@ import triton
 
 from .compat import MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, NVFP4_SCALE_GROUP_K
 
+# Amortize weight conversion across this many activation rows per GEMM.
+FP8_WEIGHT_ONLY_DEQUANT_MIN_M = 1024
+
 def ue8m0_as_uint8(scale: torch.Tensor | None) -> torch.Tensor | None:
     """View UE8M0 (``float8_e8m0fnu``) weight scales as ``uint8`` for the Triton
     binder, which doesn't recognize the dtype; kernels decode ``2^(exp-127)``
@@ -355,3 +358,27 @@ def resolve_output_dtype(
     if output_dtype is not None:
         return output_dtype
     return activation.dtype if act_scale is None else torch.bfloat16
+
+
+def block_fp8_weight_scale_grid(B: torch.Tensor, Bs: torch.Tensor, interleaved_scales: bool = False):
+    """Normalize scalar/block FP8 scales and infer their block size from the grid.
+
+    A partial square block on N retains the size implied by K. Separately
+    calibrated gate/up scale rows alternate per block under interleaved_scales.
+    """
+    assert B.dtype == torch.float8_e4m3fn and B.ndim in (2, 3)
+    experts = B.shape[0] if B.ndim == 3 else 1
+    rows, K = B.shape[-2:]
+    if Bs.numel() == experts:
+        return Bs.reshape(*B.shape[:-2], 1, 1), rows, K
+    assert Bs.ndim == B.ndim and Bs.shape[:-2] == B.shape[:-2]
+    assert K % Bs.shape[-1] == 0, "the weight scale grid must tile K evenly"
+    block_k = K // Bs.shape[-1]
+    if interleaved_scales and Bs.shape[-2] > 1:
+        assert rows % 2 == 0 and Bs.shape[-2] % 2 == 0, "gate/up scale rows must occur in pairs"
+        scale_rows, weight_rows = Bs.shape[-2] // 2, rows // 2
+    else:
+        scale_rows, weight_rows = Bs.shape[-2], rows
+    block_n = block_k if ((weight_rows + block_k - 1) // block_k) == scale_rows else weight_rows // scale_rows
+    assert block_n > 0 and ((weight_rows + block_n - 1) // block_n) == scale_rows
+    return Bs, block_n, block_k

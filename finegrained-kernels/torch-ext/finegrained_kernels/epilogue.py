@@ -374,8 +374,10 @@ def fused_glu(
                           dtype=out_dtype or gate_up.dtype, device=gate_up.device)
         n = out.numel()
         with device_context(gate_up.device):
+            # Explicit defaults keep torch.compile's Triton argument analysis consistent.
             compile_time_only_triton_wrap(_glu_kernel)[(triton.cdiv(n, 1024),)](
                 gate_up, out, None, n, inter_dim, act_fn, swiglu_alpha, swiglu_limit, BLOCK=1024,
+                QUANT_GROUP=128, UE8M0=False,
                 **pdl_launch_kwargs(),
             )
         return out

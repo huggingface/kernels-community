@@ -169,10 +169,12 @@ MOE_PROBLEMS = [
     MoEProblem(weights="mxfp4", hidden_dim=320, intermediate_dim=320),
     # ── explicit format forwarding: W4A8 chain on mxfp4 weights (default is W4A4) ──
     MoEProblem(weights="mxfp4", activation_format="mxfp8"),
-    # ── weight-only weight-only: bf16 acts × mxfp4 weights, dedicated dequant-then-bf16-dot
-    # kernels (the gpt-oss / matmul_ogs format); intermediate stays bf16 (no requant) ──
+    # ── weight-only: bf16 activations and intermediate (no requantization) ──
     MoEProblem(weights="mxfp4", activation_format="bf16", num_tokens=1),
     MoEProblem(weights="mxfp4", activation_format="bf16"),
+    MoEProblem(weights="fp8_128x128", activation_format="bf16", num_tokens=1, bias=True),
+    MoEProblem(weights="fp8_128x128", activation_format="bf16", num_tokens=5, bias=True),
+    MoEProblem(weights="fp8_tensor", activation_format="bf16", num_tokens=5, num_top_k=2),
     # ── clamped/scaled SwiGLU (GPT-OSS / MiniMax-M3); glu is format-independent ──
     MoEProblem(weights="mxfp8", swiglu_alpha=1.702, swiglu_limit=7.0),
     # alpha / limit are independent glu branches — cover each alone

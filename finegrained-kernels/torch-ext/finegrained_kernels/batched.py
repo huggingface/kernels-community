@@ -14,6 +14,8 @@
 
 
 
+from typing import List
+
 import torch
 import triton
 import triton.language as tl
@@ -25,12 +27,12 @@ from .bayesian_autotuner import bayesian_autotune
 
 from .compat import add_op_namespace_prefix, FP8_DTYPE, MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, tl_dtype, pdl_launch_kwargs
 from .descriptors import rebind_batched_mx_bs_descriptor
-from .formats import check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
+from .formats import block_fp8_weight_scale_grid, check_activation_format, global_scale_stride, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, is_per_expert_global, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, ue8m0_as_uint8, validate_dense_operands, weight_block_size, weight_format
 from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .scheduling import is_off_rank
-from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
+from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, plain_dot, static_dot
 from .loading.tiles import (
     advance_ptrs,
     load_act_block_dynamic,
@@ -38,6 +40,7 @@ from .loading.tiles import (
     load_act_plain,
     load_act_static,
     load_weight_block_dynamic,
+    load_weight_block_fp8,
     load_weight_mx,
     load_weight_plain,
     load_weight_static,
@@ -978,6 +981,124 @@ def full_precision_matmul_batched_kernel(
     )
 
 
+@bayesian_autotune(
+    get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True, swap_block_sizes_m=(1, 2)),
+    # S (routed rows) keyed like the fp8/mx batched siblings — decode re-tunes per batch;
+    # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide).
+    ["N", "K", "S", "GATE", "BLOCK_N", "BLOCK_K", "GATE_SCALES"],
+    n_trials=100,
+    path_anchor_axes=PATH_ANCHOR_AXES,
+    # BLOCK_SIZE_K/N are tuned axes; the K-loop is maskless and the N-tile store is
+    # row-masked only — veto non-dividing tiles on both.
+    prune_configs_by={
+        "early_config_prune": compose_pruners(
+            block_within_dim_pruner("K"),
+            block_within_dim_pruner("N", "BLOCK_SIZE_N"),
+            smem_pruner(),
+        )
+    },
+)
+@triton.jit
+def block_fp8_weight_only_matmul_batched_kernel(
+    A,  # (rows, K) BF16/FP16 activations
+    B,  # (num_experts, N, K) FP8 weights; under GATE the (num_experts, 2N, K) gate|up stack
+    Bs,  # coarse FP8 weight scales
+    C,  # (S, N) output; under GATE the GLU intermediate
+    Bias,  # (E, N_out) per-expert output bias, N_out = 2N under GATE; read iff not None
+    ExpertIds,  # (S,) — which expert each batch element routes to
+    GatherIdx,  # (S,) int — batch_id -> source row of A; read only when not None
+    ScatterIdx,  # (S,) int — batch_id -> destination row of C; read only when not None
+    # Shape
+    S,
+    N,
+    K,
+    num_experts,
+    # Strides
+    stride_a_m,
+    stride_a_k,
+    stride_b_e,
+    stride_b_k,
+    stride_b_n,
+    stride_bs_e,
+    stride_bs_n,
+    stride_bs_k,
+    stride_c_m,
+    stride_c_n,
+    stride_bias_e,
+    stride_bias_n,
+    stride_eid,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SWAP_AB: tl.constexpr = False,
+    GATE: tl.constexpr = False,
+    GATE_SCALES: tl.constexpr = False,
+    ACT_FN: tl.constexpr = "silu",
+    SWIGLU_ALPHA: tl.constexpr = None,
+    SWIGLU_LIMIT: tl.constexpr = None,
+    SIMULATE_UNFUSED: tl.constexpr = False,
+    INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    PDL: tl.constexpr = False,
+):
+    """Batched FP8 W8A16 expert GEMM with optional fused gate/up activation."""
+    if PDL:
+        gdc_wait()
+    batch_id, pid_n, expert_id, A, B, C, unused_scale_base, in_row, out_row = expert_setup(
+        A,
+        B,
+        C,
+        Bs,  # the scale leaf applies the expert offset
+        ExpertIds,
+        GatherIdx,
+        ScatterIdx,
+        stride_a_m,
+        stride_b_e,
+        stride_c_m,
+        stride_bs_e,
+        stride_eid,
+        ADVANCE_BS=False,
+    )
+    # EP sentinel: row routed to a non-local expert; output is left uninit.
+    if is_off_rank(expert_id, num_experts):
+        return
+
+    n_width: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
+    offs_bn = pid_n * n_width + tl.arange(0, n_width)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = operand_tile_ptrs(A, tl.arange(0, BLOCK_SIZE_M) * 0, offs_k, stride_a_m, stride_a_k, "pointer", True)
+    b_ptrs = weight_tile_ptrs(
+        B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB
+    )
+
+    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a, unused_activation = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
+        w = load_weight_block_fp8(
+            b_ptrs, b_ptrs, Bs, 0, 0, 0,
+            expert_id, offs_bn, k * BLOCK_SIZE_K + offs_k,
+            stride_bs_e, stride_bs_n, stride_bs_k,
+            GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            BLOCK_N, BLOCK_K, GATE_SCALES, a.dtype,
+        )
+        accumulator = plain_dot(accumulator, a, w, SWAP_AB)
+        a_ptrs += BLOCK_SIZE_K * stride_a_k
+        b_ptrs += BLOCK_SIZE_K * stride_b_k
+
+    if PDL:
+        gdc_launch_dependents()
+    gemm_epilogue(
+        C, None, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, 1, 1,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
+        ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
+        COMPUTE_MODE="dot", FAKE_BATCH=True,
+        Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
+        global_row=expert_id,
+    )
+
+
 GATE_UNSTACK_MAX_S = 16  # the unstacked-gate decode band (see the dispatch in the wrapper)
 
 
@@ -1661,6 +1782,91 @@ def full_precision_matmul_batched(
 
 
 @compile_time_only_triton_op(
+    add_op_namespace_prefix("block_fp8_weight_only_matmul_batched"),
+    mutates_args=(),
+    opaque=True,
+)
+def block_fp8_weight_only_matmul_batched(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    expert_ids: torch.Tensor,
+    gate: bool = False,
+    act_fn: str = "silu",
+    swiglu_alpha: float | None = None,
+    swiglu_limit: float | None = None,
+    simulate_unfused: bool = False,
+    activation_format: str | None = None,
+    quantize_output: bool = False,
+    output_dtype: torch.dtype | None = None,
+    gather_idx: torch.Tensor | None = None,
+    scatter_idx: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    *,
+    interleaved_scales: bool = False,
+) -> List[torch.Tensor]:
+    """FP8 W8A16 expert GEMM with in-tile weight rescaling."""
+    validate_dense_operands(A, B)
+    assert A.dtype in (torch.bfloat16, torch.float16), "FP8 weight-only takes raw BF16/FP16 activations"
+    Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate or interleaved_scales)
+    Bs = ue8m0_as_uint8(Bs)
+    assert activation_format in (None, "bf16") and not quantize_output, (
+        "FP8 weight-only requires unquantized activations and output"
+    )
+
+    output_dtype = resolve_output_dtype(output_dtype, A, None)
+    K = A.shape[1]
+    S = expert_ids.shape[0]
+    num_experts, _, N = expert_weight_shape(B, gate)
+    C = A.new_empty(S, N, dtype=output_dtype)
+
+    def grid(META):
+        return (S, triton.cdiv(N, META["BLOCK_SIZE_N"]))
+
+    with device_context(A.device):
+        bias_stride_e, bias_stride_n = bias_strides(bias)
+        compile_time_only_triton_wrap(block_fp8_weight_only_matmul_batched_kernel)[grid](
+            A,
+            B,
+            Bs,
+            C,
+            bias,
+            expert_ids,
+            gather_idx,  # None = A is expert-sorted; read only when not None (folds at trace time)
+            scatter_idx,  # None = C is expert-sorted; read only when not None (folds at trace time)
+            S,
+            N,
+            K,
+            num_experts,
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            Bs.stride(0),
+            Bs.stride(1),
+            Bs.stride(2),
+            C.stride(0),
+            C.stride(1),
+            bias_stride_e,
+            bias_stride_n,
+            expert_ids.stride(0),
+            BLOCK_N=scale_block_n,
+            BLOCK_K=scale_block_k,
+            GATE=gate,
+            GATE_SCALES=(gate or interleaved_scales) and Bs.shape[1] > 1,
+            ACT_FN=act_fn,
+            SWIGLU_ALPHA=swiglu_alpha,
+            SWIGLU_LIMIT=swiglu_limit,
+            SIMULATE_UNFUSED=simulate_unfused,
+            INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+            **pdl_launch_kwargs(),
+        )
+
+    return [C]
+
+
+@compile_time_only_triton_op(
     add_op_namespace_prefix("mx_weight_only_matmul_batched"),
     mutates_args=(),
     opaque=True,
@@ -1831,6 +2037,14 @@ def matmul_batched(
         "output_global_scale is the NVFP4 requant second level — it requires quantize_output=True on NVFP4 "
         "(the epilogue would otherwise normalize by it with nothing downstream to compensate)"
     )
+    if Bs is not None and not is_mx(B, Bs) and activation_format == "bf16":
+        assert As is None and not quantize_output, "weight-only takes raw activations without requantization"
+        out = block_fp8_weight_only_matmul_batched(
+            A, B, Bs, expert_ids, gate, act_fn, swiglu_alpha, swiglu_limit,
+            simulate_unfused, activation_format, quantize_output, output_dtype,
+            gather_idx, scatter_idx, bias=bias,
+        )
+        return out[0]
     # a calibrated (static) scale on a raw A (see `tensor_wide_act_operands`): block-scale weights
     # have a dedicated static kernel, per-tensor ones read the same As on the tensor-wide arm
     static_act = As is not None and As.ndim <= 1 and As.numel() in (1, B.shape[0]) and A.dtype != FP8_DTYPE
