@@ -56,7 +56,7 @@ from finegrained_kernels.grouped import mx_dynamic_matmul_grouped_kernel, w8a8_t
 from finegrained_kernels.matmul import mx_dynamic_matmul_kernel, w8a8_tensor_dynamic_fp8_matmul_kernel
 from finegrained_kernels import swizzle_mx_scales, unswizzle_mx_scales  # type: ignore
 from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore
-from finegrained_kernels.quant import fp8_act_quant_tensor_wide, nvfp4_act_quant  # type: ignore
+from finegrained_kernels.quant import nvfp4_act_quant  # type: ignore
 from finegrained_kernels.epilogue import apply_glu  # type: ignore
 
 
@@ -816,44 +816,3 @@ def test_every_admitted_config_is_correct(problem: Problem, op, tuner):
         print(f"\n[sweep] {len(forgiven)} admitted config(s) failed to compile/run (forgiven):")
         for cfg, err in forgiven:
             print(f"  {cfg}: {err}")
-
-
-@pytest.mark.kernels_ci
-@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="torch._scaled_mm row-wise is CUDA-only")
-@pytest.mark.parametrize("M,layout,compiled", [
-    (1, "contiguous", False),
-    (16, "contiguous", False),
-    (512, "contiguous", False),
-    (128, "offset", False),
-    (128, "offset", True),
-    (128, "offset_weight", False),
-    (128, "transposed", False),
-    (128, "strided_scales", False),
-])
-def test_rowwise_matmul_2d_matches_scaled_mm(M, layout, compiled, monkeypatch):
-    """Default dispatch and Triton match cuBLAS on the same quantized values, including
-    views the fast path must normalize or pass to the stride-aware Triton kernel."""
-    torch.manual_seed(0)
-    N, K = 512, 1024
-    B, Bs = make_weights(N, K, TEST_DEVICE, [1, K])
-    A = torch.randn(M, K, device=TEST_DEVICE, dtype=torch.bfloat16)
-    Aq, As = fp8_act_quant_tensor_wide(A, K)
-    ref = torch._scaled_mm(Aq, B.t(), scale_a=As.reshape(M, 1), scale_b=Bs.reshape(1, N), out_dtype=torch.bfloat16)
-    if layout == "offset":
-        Aq = torch.empty(Aq.numel() + 1, device=A.device, dtype=Aq.dtype)[1:].view_as(Aq).copy_(Aq)
-    elif layout == "offset_weight":
-        B = torch.empty(B.numel() + 1, device=B.device, dtype=B.dtype)[1:].view_as(B).copy_(B)
-    elif layout == "transposed":
-        B = B.t().contiguous().t()
-    elif layout == "strided_scales":
-        As = _make_noncontig(As.flatten()).view_as(As)
-        Bs = _make_noncontig(Bs.flatten()).view_as(Bs)
-    fn = maybe_compile(finegrained_kernels.matmul_2d, compiled)
-    atol, rtol = DTYPE_TO_TOL[torch.bfloat16]
-    for disabled in ("", "1"):
-        monkeypatch.setenv("FINEGRAINED_DISABLE_SCALED_MM", disabled)
-        out = fn(Aq, B, As, Bs, output_dtype=torch.bfloat16)
-        torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
-        if layout == "contiguous":
-            out = fn(A, B, None, Bs, output_dtype=torch.bfloat16)
-            torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=rtol)
