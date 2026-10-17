@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from typing import List
+
 import torch
 import triton
 import triton.language as tl
@@ -1298,7 +1300,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     As: torch.Tensor | None,
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
-    block_size: list[int],
+    block_size: List[int],
     gate: bool = False,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
@@ -1310,7 +1312,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Block-scale grouped FP8 matmul over expert-sorted positions (per-tile
     gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
     Raw activations are quantized here (``fp8_act_quant_block_dynamic``, one offline pass);
@@ -1452,7 +1454,7 @@ def w8a8_block_static_fp8_matmul_grouped(
     As: torch.Tensor,
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
-    block_size: list[int],
+    block_size: List[int],
     gate: bool = False,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
@@ -1464,7 +1466,7 @@ def w8a8_block_static_fp8_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Block-scale grouped FP8 matmul with a static (per-tensor calibrated) activation scale —
     the block-dynamic sibling with the 2D ``block_static`` format. ``A`` is raw here: the op
     quantizes it against the scalar ``As`` (offline, ``(A / As).to(fp8)``), the kernel applies the
@@ -1596,7 +1598,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Tensor-scale grouped FP8 matmul over expert-sorted positions (per-tile
     gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
     Raw activations are quantized here (``fp8_act_quant_tensor_wide``, one offline pass);
@@ -1725,7 +1727,7 @@ def mx_dynamic_matmul_grouped(
     b_global_scale: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Grouped MX matmul over expert-sorted positions (per-tile gather/scatter, the
     sort is virtual — see ``compute_grouped_scheduling`` for the maps). Activations arrive
     pre-quantized: the caller owns the act-quant (``mxfp8_act_quant``). The
@@ -2025,7 +2027,7 @@ def full_precision_matmul_grouped(
     gather_idx: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Full-precision (BF16/FP16) grouped matmul over expert-sorted positions (per-tile
     gather/scatter, the sort is virtual — see ``compute_grouped_scheduling`` for the maps).
     No quantization anywhere: activations and weights share one high-precision dtype and the
@@ -2121,7 +2123,7 @@ def mx_weight_only_matmul_grouped(
     scatter_idx: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """weight-only grouped matmul: raw bf16/fp16 activations against MXFP4/NVFP4/MXFP8 weights upcast
     to bf16 in-loop — the ``matmul_ogs`` format (fp4/fp8 weight bytes, bf16 acts, weight upcast in-MMA).
     Affine (3D) weight scales — UE8M0 group-32 (MX) or E4M3 group-16 (NVFP4, whose per-expert fp32
