@@ -1833,7 +1833,7 @@ def block_fp8_weight_only_matmul_2d(
             BLOCK_N=scale_block_n, BLOCK_K=scale_block_k,
             GATE=gate, ACT_FN=act_fn, SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit, SIMULATE_UNFUSED=simulate_unfused,
-            INTERMEDIATE_DTYPE=tl_dtype(resolve_output_dtype(output_dtype, A, None)),
+            INTERMEDIATE_DTYPE=tl_dtype(dtype),
             GATE_SCALES=gate and Bs.shape[0] > 1,
         )
     return [C]
