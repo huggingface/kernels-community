@@ -1309,19 +1309,20 @@ def w8a8_tensor_dynamic_fp8_matmul(
     B:  (N, K) FP8 weights — under ``gate`` the ``(2N, K)`` gate|up stack.
     Bs: scalar, (1,), or (1, 1) — single tensor-scale weight scale; or (N, 1) row-wise, one
         per (stacked) weight row.
-    As: the calibrated (static) activation scale, one value for the whole matmul; ``None``
-        derives one per row from the data.
+    As: per-token scales for pre-quantized A, or a scalar calibrated scale for raw A;
+        ``None`` derives one per row from the data.
 
     ``gate`` fuses the gate|up projection into one stacked GEMM + SwiGLU, returning the
     ``[..., N]`` GLU intermediate. Returns a one-element list (mirrors the MX/grouped op).
     """
     validate_dense_2d_operands(A, B)
+    output_dtype = resolve_output_dtype(output_dtype, A, As)
 
     # cuBLAS per-tensor fast path, INSIDE the op for the same reasons as the MX one below:
     # every caller gets it, and a None falls through to the Triton launch unchanged.
     if not gate and not simulate_unfused and bias is None:
         _smm = _torch_scaled_mm_2d_tensor_wise(
-            A, B, As, Bs, None, resolve_output_dtype(output_dtype, A, None)
+            A, B, As, Bs, None, output_dtype
         )
         if _smm is not None:
             return [_smm]
@@ -1394,7 +1395,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
-            INTERMEDIATE_DTYPE=tl_dtype(resolve_output_dtype(output_dtype, A, None)),
+            INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
             **pdl_launch_kwargs(),
         )
 

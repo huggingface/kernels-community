@@ -45,7 +45,6 @@ from utils import (  # type: ignore
     dq_grouped,
     dq_scale,
     make_static_activation_scale,
-    make_weights,
     maybe_compile,
     quant_dequant_a,
 )
@@ -253,7 +252,7 @@ def scenarios() -> list[Problem]:
         Problem(weights="fp8_rowwise", gate=True),
         Problem(weights="fp8_rowwise", S=8),
         Problem(weights="fp8_rowwise", gate=True, S=8),
-        Problem(weights="fp8_rowwise", prequant=True),
+        Problem(weights="fp8_rowwise", prequant=True, compile=True),
         Problem(weights="fp8_rowwise", S=4096, E=8, prequant=True, noncontiguous=True),
         Problem(weights="fp8_rowwise", static=True, S=17),
         Problem(weights="fp8_rowwise", S=257, bias=True, empty_expert=True, compile=True),
@@ -523,7 +522,7 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
             swiglu_limit=problem.swiglu_limit,
         )
     if not problem.quantize_output:
-        kw["output_dtype"] = problem.dtype
+        kw["output_dtype"] = None if problem.prequant else problem.dtype
     if problem.bias:
         kw["bias"] = _bias(problem, op)
     if out_global is not None:  # provided NVFP4 output global (next proj's input_scale)
@@ -651,14 +650,16 @@ def _make_weights(problem: Problem, row, E):
 
 def _skip_moe_only(problem: Problem, op: str) -> None:
     """matmul_2d is the single-GEMM sibling: skip only the scenarios it can't represent — expert
-    routing (sentinel / noncontiguous / empty-expert / the MoE prequant-As check) and non-MX
+    routing (sentinel / noncontiguous / empty-expert), routed-only prequant inputs, and non-MX
     input/output format knobs (its FP8 paths infer the quant from the scale shape and return the
     intermediate dense). Everything else — including full-precision (BF16/FP16) weights and a
     shared static activation scale — runs on all three ops."""
     if op != "matmul":
         return
-    if problem.sentinel_fraction or problem.noncontiguous or problem.empty_expert or problem.prequant:
+    if problem.sentinel_fraction or problem.noncontiguous or problem.empty_expert:
         pytest.skip("expert-routing scenario (MoE only)")
+    if problem.prequant and problem.weights != "fp8_rowwise":
+        pytest.skip("prequantized block-scale inputs need routing")
     if problem.per_expert_globals:
         pytest.skip("per-expert globals need routing (MoE only)")
 
@@ -688,8 +689,8 @@ def test_op_scenarios(problem: Problem, op):
     # ref is the op written in torch; both take the same inputs — including the PROVIDED nvfp4 output
     # global — and return the op's own format, so _dequant reads them identically and _check compares
     # once. _assert_op_layout is the one op-only check (the reference never swizzles its output).
-    # prequant scenarios hand the op its activations already quantized (As set — routed ops only,
-    # _skip_moe_only excludes matmul); otherwise raw A + As=None and the op quantizes it. Reference
+    # prequant scenarios hand the op its activations already quantized (As set); otherwise
+    # raw A + As=None and the op quantizes it. Reference
     # and op take the identical (A, As): pre-quantizing just hands the op the values it would
     # otherwise compute, and _fp32_intermediate reads whichever form it's given. The nvfp4 activation
     # global comes off the RAW A (before prequant replaces it) and rides separately as As_global.

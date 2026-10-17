@@ -55,7 +55,6 @@ class MoEProblem:
     negative_sentinels: bool = False  # off-rank routes as -1 rather than num_experts
     dtype: torch.dtype = torch.bfloat16
     activation_format: Optional[str] = None
-    down_weights: Optional[str] = None
     swiglu_alpha: Optional[float] = None
     swiglu_limit: Optional[float] = None
     act_fn: Union[str, Callable] = "silu"  # a callable runs on the host between the GEMMs
@@ -79,8 +78,6 @@ class MoEProblem:
         else:
             act = ""
         fmt = "" if self.activation_format is None else f"_format_{self.activation_format}"
-        if self.down_weights is not None:
-            fmt += f"_down_{self.down_weights}"
         return (
             f"{self.weights}_T{self.num_tokens}_E{self.num_experts}_H{self.hidden_dim}"
             f"_I{self.intermediate_dim}_top{self.num_top_k}_{DTYPE_TAG[self.dtype]}"
@@ -96,9 +93,6 @@ class MoEProblem:
 
 
 MOE_PROBLEMS = [
-    MoEProblem(weights="fp8_128x128", down_weights="fp8_rowwise", num_tokens=1),
-    MoEProblem(weights="fp8_128x128", down_weights="fp8_tensor", num_tokens=4),
-
     # ── one decode-size + one small-batch shape per weight family ──
     MoEProblem(weights="mxfp4", num_tokens=1),
     MoEProblem(weights="mxfp4"),
@@ -241,7 +235,7 @@ def _make_moe_weights(problem: MoEProblem):
     gate_up, gate_up_s, gate_up_g = make(
         2 * problem.intermediate_dim, problem.hidden_dim, problem.num_experts
     )
-    down, down_s, down_g = WEIGHTS[problem.down_weights or problem.weights]["make"](
+    down, down_s, down_g = make(
         problem.hidden_dim, problem.intermediate_dim, problem.num_experts
     )
     if problem.swizzled:

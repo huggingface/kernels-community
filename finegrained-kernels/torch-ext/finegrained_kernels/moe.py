@@ -56,7 +56,7 @@ from .compat import (
     device_context,
     pdl_launch_kwargs,
 )
-from .formats import get_supported_act_fns, is_mx, is_mxfp4, is_per_expert_global, mx_scale_family, normalize_global_scale, per_token_activations, ue8m0_as_uint8, weight_format
+from .formats import get_supported_act_fns, is_mx, is_per_expert_global, is_rowwise, mx_scale_family, normalize_global_scale, per_token_activations, ue8m0_as_uint8, weight_block_size, weight_format
 from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
 from .quant import _launch_act_quant, MX_ACT_QUANT, mx_act_quant_routed_scales
 from .scheduling import compute_grouped_scheduling, is_off_rank, off_rank
@@ -193,19 +193,27 @@ def weighted_reduce(
 
 
 def _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale):
-    """gate_up and down must share the format (both MX or both block-dynamic FP8 — the
-    intermediate handed between them carries one quant format). Returns whether the format
-    is MX (the fused dispatchers branch on it); the fp8 quantization block is derived from
-    the scale shapes (``weight_block_size``), never passed. Scales are the pure block scales
-    (per the decoupled API — per-tensor globals ride as separate ``*_global_scale`` args);
-    the format predicates read the block scale's dtype/grouping."""
+    """Require the same weight format and FP8 scale granularity for both projections."""
     gate_up_is_mx = is_mx(gate_up_proj, gate_up_proj_scale)
-    if gate_up_is_mx != is_mx(down_proj, down_proj_scale):
-        raise ValueError(
-            "gate_up_proj and down_proj must use the same format (both MX or both block-dynamic FP8)."
+    if gate_up_proj_scale is None or down_proj_scale is None:
+        matching = (
+            gate_up_proj_scale is None
+            and down_proj_scale is None
+            and gate_up_proj.dtype == down_proj.dtype
         )
-    if is_mxfp4(gate_up_proj, gate_up_proj_scale) != is_mxfp4(down_proj, down_proj_scale):
-        raise ValueError("gate_up_proj and down_proj must use the same MX format (both MXFP4 or both MXFP8).")
+    else:
+        matching = weight_format(gate_up_proj, gate_up_proj_scale) == weight_format(down_proj, down_proj_scale)
+        if matching and not gate_up_is_mx:
+            matching = (
+                is_rowwise(gate_up_proj, gate_up_proj_scale) == is_rowwise(down_proj, down_proj_scale)
+                and weight_block_size(gate_up_proj, gate_up_proj_scale) == weight_block_size(down_proj, down_proj_scale)
+                and gate_up_proj_scale.element_size() == down_proj_scale.element_size()
+            )
+    if not matching:
+        raise ValueError(
+            "gate_up_proj and down_proj must use the same quantization recipe "
+            "(weight format and scale granularity)."
+        )
     return gate_up_is_mx
 
 
@@ -397,8 +405,7 @@ def moe_fused_grouped(
     static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
     # a per-token (tensor-wide / row-wise) intermediate scale spans the whole row, which the
     # gate_up epilogue's tiles never see: the down quantizes the bf16 intermediate instead
-    per_token = (per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
-                 or per_token_activations(down_proj, down_proj_scale_inv))
+    per_token = per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
     gate_up_in, gate_up_in_scale = _gate_up_activations(
         hidden_states, fmt, gate_up_proj_scale_inv, gate_up_proj_input_global_scale,
         gate_up_proj_activation_scale, scatter_idx, expert_start,
@@ -519,8 +526,7 @@ def moe_fused_batched(
     static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
     # see the grouped sibling: the down quantizes the bf16 intermediate per token — measured faster
     # here than the unstacked gate + one-kernel GLU requant (37.0 vs 45.3us, Llama 4 E=16, T=1)
-    per_token = (per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
-                 or per_token_activations(down_proj, down_proj_scale_inv))
+    per_token = per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
     gate_up_out = matmul_batched(
         hidden_states,
         gate_up_proj,
