@@ -41,7 +41,7 @@ the unquantized row; baselines per problem):
                                               block scales (the B200 deployment format;
                                               DeepGEMM SM100 rejects fp32 scales by design)
   MiniMaxAI/MiniMax-M3     MXFP8 W8A8         finegrained-fp8 (no TRT-LLM: clamped SwiGLU)
-  microsoft/Phi-3.5-MoE   FP8 W8A16          model-shape microbenchmarks, tensor/block scales; not a checkpoint recipe
+  unknown model          FP8 W8A16          E128 H6144 I6144 top4, tensor/block scales
 
 The TRT-LLM arms are FlashInfer's ``trtllm_*_routed_moe`` kernels — the backends vLLM's
 serving path dispatches to on Blackwell for these quant modes (its own triton fused-MoE
@@ -69,7 +69,7 @@ Run: python bench/bench_moe.py                         (all rows, single GPU)
      python bench/bench_moe.py --smoke                 (fast compile check)
      python bench/bench_moe.py --no-preswizzle         (affine MX scales instead of the fast path)
      python bench/bench_moe.py gpt-oss                 (substring filter on row/problem names)
-     python bench/bench_moe.py Phi-3.5-MoE --suffix _weight_only  (FP8 weight-only microbenchmarks)
+     python bench/bench_moe.py W8A16 --suffix _weight_only  (FP8 weight-only microbenchmarks)
      python bench/bench_moe.py --replot                (rebuild the figure from bench_moe.csv)
      python bench/bench_moe.py --mock                  (no GPU: random latencies, validates the figure layout)
      python bench/bench_moe.py --help
@@ -80,6 +80,7 @@ import os
 import random
 import subprocess
 import sys
+from functools import partial
 from types import SimpleNamespace
 
 import argparse
@@ -130,6 +131,7 @@ _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "torch-ext"))
 sys.path.insert(0, os.path.join(_ROOT, "tests"))
 import finegrained_kernels as fgm  # noqa: E402  local branch
+from finegrained_kernels.loading.scales import dequant_block_fp8_weight  # noqa: E402
 from kernels import get_kernel  # noqa: E402
 
 # kernels-community IS a trusted publisher, so the check passes whenever it can reach the Hub
@@ -361,7 +363,7 @@ PREFILL_TOKENS = 256 if SMOKE else 8192
 # fixed left-to-right model order for every figure row (matched by base-model prefix,
 # so GLM-5.2-NVFP4 and GLM-5.2 both land in the GLM-5.2 slot). Roughly most-baseline-
 # support first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last.
-CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2", "Mistral-4", "Phi-3.5-MoE"]
+CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2", "Mistral-4", "unknown model"]
 
 # Low-VRAM parts run the same recipes and baselines at /8 experts, /2 dims, INSTEAD OF the
 # full roster rather than alongside it. Selected off the device, not a knob, so a small part
@@ -440,16 +442,16 @@ FULL_MOE_PROBLEMS = {
         baselines=("finegrained-fp8",), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
     ),
-    # Model-shape microbenchmarks, not claims about Phi's deployed checkpoint recipe.
-    # microsoft/Phi-3.5-MoE-instruct/config.json: E16 H4096 I6400 top2, plain SiLU.
-    "microsoft/Phi-3.5-MoE-instruct FP8 W8A16 tensor (E16 H4096 I6400 top2)": dict(
-        E=16, H=4096, I=6400, top_k=2, weights="fp8_tensor", activation_format="bf16",
-        baselines=("finegrained-kernels-unfused", "torch_weight_only", "torch_weight_only_compiled", "marlin"), fp8_block=None, block_size=None,
+    "unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4)": dict(
+        E=128, H=6144, I=6144, top_k=4, weights="fp8_tensor", activation_format="bf16",
+        baselines=("finegrained-kernels-unfused", "torch_weight_only", "torch_weight_only_compiled",
+                   "torch_predequantized", "finegrained-kernels-predequantized", "marlin"), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None, weight_std=0.02,
     ),
-    "microsoft/Phi-3.5-MoE-instruct FP8 W8A16 block128 (E16 H4096 I6400 top2)": dict(
-        E=16, H=4096, I=6400, top_k=2, weights="fp8_128x128", activation_format="bf16",
-        baselines=("finegrained-kernels-unfused", "torch_weight_only", "torch_weight_only_compiled", "marlin"), fp8_block=[128, 128], block_size=(128, 128),
+    "unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4)": dict(
+        E=128, H=6144, I=6144, top_k=4, weights="fp8_128x128", activation_format="bf16",
+        baselines=("finegrained-kernels-unfused", "torch_weight_only", "torch_weight_only_compiled",
+                   "torch_predequantized", "finegrained-kernels-predequantized", "marlin"), fp8_block=[128, 128], block_size=(128, 128),
         act="silu", swiglu_alpha=None, swiglu_limit=None, weight_std=0.02,
     ),
 }
@@ -602,13 +604,12 @@ ATTN_PROBLEMS = {
         N=18432, K=6144, weights="mxfp8", activation_format=None,
         block=None, baselines=("finegrained-fp8",),  # DeepGEMM FP8 is 128-block, not group-32 MX
     ),
-    # GQA fused QKV width: (32 query + 2 * 8 KV heads) * 128.
-    "microsoft/Phi-3.5-MoE-instruct FP8 W8A16 tensor qkv-shaped (N=6144 K=4096)": dict(
-        N=6144, K=4096, weights="fp8_tensor", activation_format="bf16",
+    "unknown model FP8 W8A16 tensor linear (N=8192 K=6144)": dict(
+        N=8192, K=6144, weights="fp8_tensor", activation_format="bf16",
         block=None, baselines=("torch_weight_only", "torch_weight_only_compiled", "torch_predequantized", "marlin"), weight_std=0.02,
     ),
-    "microsoft/Phi-3.5-MoE-instruct FP8 W8A16 block128 qkv-shaped (N=6144 K=4096)": dict(
-        N=6144, K=4096, weights="fp8_128x128", activation_format="bf16",
+    "unknown model FP8 W8A16 block128 linear (N=8192 K=6144)": dict(
+        N=8192, K=6144, weights="fp8_128x128", activation_format="bf16",
         block=[128, 128], baselines=("torch_weight_only", "torch_weight_only_compiled", "torch_predequantized", "marlin"), weight_std=0.02,
     ),
 }
@@ -632,6 +633,7 @@ IMPL_COLORS = {
     "torch_weight_only": "#e377c2",
     "torch_weight_only_compiled": "#bc80bd",
     "torch_predequantized": "#9467bd",
+    "finegrained-kernels-predequantized": "#393b79",
     "marlin": "#17becf",
     "torch_mm": "#e377c2",  # torch/cuBLAS F.scaled_mm (the attn-row sibling)
 }
@@ -650,6 +652,8 @@ def _impl_label(impl, regime):
         return "torch compiled runtime dequant + matmul"
     if impl == "torch_predequantized":
         return "torch BF16 GEMM (2x weight storage)"
+    if impl == "finegrained-kernels-predequantized":
+        return "finegrained-kernels BF16 (2x weight storage)"
     if impl == "marlin":
         return "vLLM Marlin FP8 W8A16"
     if impl == "transformers":
@@ -686,6 +690,7 @@ def build(cfg):
     """Quantized weights for one MoE problem, shared by every impl and row. The GLM-FP8
     problem uses UE8M0 block scales (finegrained-fp8/finegrained-kernels decode them natively; DeepGEMM SM100
     requires them)."""
+    torch.manual_seed(0)
     E, H, inter = cfg["E"], cfg["H"], cfg["I"]
     if cfg["weights"] == "fp8_128x128_ue8m0":
         def make(n, k, e):
@@ -726,6 +731,7 @@ class _Experts:
     ``is_transposed=False``; gate|up rows are stacked (concatenated), not interleaved."""
 
     config = SimpleNamespace(hidden_act="silu")
+    has_post_expert_norm = False
 
     def __init__(self, cfg, gu, dn, gus=None, dns=None):
         self.num_experts = cfg["E"]
@@ -937,13 +943,21 @@ def dequantize_fp8_weight(weight, scale, block):
     return values.reshape(weight.shape).to(torch.bfloat16)
 
 
+def predequantized_moe_arm(arm, cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
+    """Resident BF16 controls: dequantize the same weights once, outside timing."""
+    gu = dequant_block_fp8_weight(gu, gus, hidden.dtype)
+    dn = dequant_block_fp8_weight(dn, dns, hidden.dtype)
+    _mark_static(gu, dn)
+    cfg = dict(cfg, weights="bf16", activation_format="bf16", fp8_block=None, block_size=None)
+    return arm(cfg, grouped, hidden, idx, w, gu, None, dn, None, None, None)
+
+
 def torch_weight_only_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     """Runtime dequantization: selected experts for decode, grouped BF16 GEMMs for prefill."""
     block = cfg["fp8_block"]
     if grouped:
         def run():
             experts = _Experts(cfg, dequantize_fp8_weight(gu, gus, block), dequantize_fp8_weight(dn, dns, block))
-            experts.has_post_expert_norm = False
             return grouped_mm_experts_forward(experts, hidden, idx, w)
     else:
         def run():
@@ -1380,6 +1394,8 @@ ARMS = {
     "finegrained-kernels-unfused": moe_unfused_arm,
     "torch_weight_only": torch_weight_only_arm,
     "torch_weight_only_compiled": torch_weight_only_compiled_arm,
+    "torch_predequantized": partial(predequantized_moe_arm, transformers_arm),
+    "finegrained-kernels-predequantized": partial(predequantized_moe_arm, moe_fused_arm),
     "marlin": marlin_weight_only_arm,
     "finegrained-fp8": fp8_fused_arm,
     "finegrained-fp8_unfused": fp8_unfused_arm,
@@ -1502,16 +1518,16 @@ def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
         for name in arms:
             try:
                 run = ARMS[name](*args)
+                if reference is not None:
+                    candidate = run()
+                    torch.accelerator.synchronize()
+                    assert torch.isfinite(candidate).all() and rel_diff(candidate, reference) < 0.05, name
             except Exception as e:
                 print(f"      [{name} setup failed: {type(e).__name__}: {str(e)[:90]}]",
                       flush=True)
                 rows_out.append((row, pname, regime, _impl(name),
                                  {m: None for m in MODES}, None))
                 continue
-            if reference is not None:
-                candidate = run()
-                torch.accelerator.synchronize()
-                assert torch.isfinite(candidate).all() and rel_diff(candidate, reference) < 0.05, name
             res, out = bench_modes(run, name)
             parity = None
             if anchor_res is None:
@@ -1992,14 +2008,17 @@ for ri, row in enumerate(present_rows):
         ax = axes[ri][ci]
         solid_mode, overlay_mode = REGIME_MODES[regime]
         cells = [(p, i, r, par) for (rr, p, reg, i, r, par) in rows
-                 if rr == row and reg == regime]
+                 if rr == row and reg == regime
+                 # The compiled native baseline is the useful comparison; keep its raw
+                 # eager counterpart in the CSV without letting it flatten this figure.
+                 and not (weight_only_only and i == "torch_weight_only")]
         problems = list(dict.fromkeys(p for p, *_ in cells))
         # ONE fixed model order across every row (was per-panel support-sort, which
         # reordered models between rows and read as confusing). Roughly most-supported
         # first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last; keyed on the base model so the
         # quantized/attn (GLM-5.2-NVFP4) and unquantized (GLM-5.2) rows line up.
         def _model_rank(p):
-            name = p.split(" ")[0].split("/")[-1]
+            name = p.split("/")[-1]
             for i, m in enumerate(CANONICAL_MODEL_ORDER):
                 if name.startswith(m):
                     return i
@@ -2016,6 +2035,8 @@ for ri, row in enumerate(present_rows):
             # compact 2-line tick: model short-name + format (full ids in the log)
             short = pname.split(" (")[0]
             model, _, rest = short.partition(" ")
+            if short.startswith("unknown model "):
+                model, rest = "unknown model", short.removeprefix("unknown model ")
             model = model.split("/")[-1]
             rest = rest.removeprefix("attn ").removesuffix(" qkv-shaped")
             ticklabels.append(f"{model}\n{rest}" if rest else model)
@@ -2087,13 +2108,16 @@ for ri, row in enumerate(present_rows):
             handles.append(mpatches.Patch(facecolor="none", edgecolor="black",
                                           hatch="..", label="eager (no cudagraph)"))
         ax.legend(handles=handles, loc="upper left", fontsize=8)
-fig.suptitle(f"MoE bench — finegrained-kernels vs finegrained-fp8 + references  "
+benchmark_title = "FP8 weight-only" if weight_only_only else "MoE bench — finegrained-kernels vs finegrained-fp8 + references"
+fig.suptitle(f"{benchmark_title}  "
              f"({device_name}, real model shapes; decode=cudagraph+compile, "
              f"prefill={'eager+compile' if weight_only_only else 'eager'})", y=0.9995)
 if weight_only_only:
-    fig.text(0.5, 0.01, "Phi-3.5 model-shape microbenchmarks; FP8 W8A16 recipes are not a checkpoint claim. "
-             "Prefill includes runtime dequantization; compiled Torch may fuse it into decode GEMV. Hatches show compile wins.",
-             ha="center", fontsize=9)
+    fig.text(0.5, 0.01, "unknown model: FP8 W8A16, tensor/block128 scales, BF16 activations, fixed operands. "
+             "Resident BF16 controls use 2x weight storage.\n"
+             "FP8 arms dequantize at runtime; native baseline is compiled (raw eager timings remain in CSV). "
+             "Hatches show compile wins.",
+             ha="center", va="bottom", fontsize=9)
 fig.tight_layout(rect=(0, 0.05 if weight_only_only else 0, 1, 0.99))
 out_png = os.path.join(_HERE, f"bench_moe{suffix}.png")
 fig.savefig(out_png, dpi=120)
