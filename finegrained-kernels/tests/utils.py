@@ -516,8 +516,10 @@ def prepare_weight_scales(scales, csf_encoding, fn, compiled=False):
         t.to(scales.device) for t in prepare_nvfp4_csf_scales(fixed, exceptions)
     )
 
+    workspace = torch.empty_like(scales).reshape(-1, *scales.shape[-2:])
+
     def run(A, B, As, Bs, **kwargs):
-        decoded = decompress_nvfp4_csf_scales(*buffers)
+        decoded = decompress_nvfp4_csf_scales(*buffers, out=workspace)
         return fn(A, B, As, decoded.reshape(Bs.shape), **kwargs)
 
     return maybe_compile(run, compiled)
