@@ -44,8 +44,8 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
-from .grouped import matmul_grouped
-from .batched import GATE_UNSTACK_MAX_S, matmul_batched
+from .grouped import block_fp8_weight_only_matmul_grouped, matmul_grouped
+from .batched import GATE_UNSTACK_MAX_S, block_fp8_weight_only_matmul_batched, matmul_batched
 from .bayesian_autotuner import bayesian_autotune
 from .compat import (
     MX_SCALE_GROUP_K,
@@ -607,7 +607,7 @@ def moe_unfused_grouped(
     ``moe_fused_grouped`` but the SwiGLU + intermediate quant happen between two plain GEMMs
     rather than inside the gate_up epilogue; each GEMM quantizes its raw input in
     ``activation_format`` (``None`` follows the weight format, mirroring the fused forward — mxfp4
-    weights run the all-fp4 W4A4 chain). All formats route through the shared ``matmul_grouped``.
+    weights run the all-fp4 W4A4 chain).
     The NVFP4 activation globals thread the same way as the fused sibling: each GEMM quantizes its
     raw input against its ``*_input_global_scale``, and a ``*_activation_scale`` quantizes it
     against that calibrated scale instead of a runtime one. ``act_fn`` is a
@@ -630,23 +630,30 @@ def moe_unfused_grouped(
         hidden_states, fmt, gate_up_proj_scale_inv, gate_up_proj_input_global_scale,
         gate_up_proj_activation_scale, scatter_idx, expert_start,
     )
-    gate_up_out = matmul_grouped(
-        gate_up_in,
-        gate_up_proj,
-        As=gate_up_in_scale,
-        Bs=gate_up_proj_scale_inv,
-        interleaved_scales=(
-            gate and fmt == "bf16" and gate_up_proj.dtype == torch.float8_e4m3fn
-            and not is_mx(gate_up_proj, gate_up_proj_scale_inv)
-        ),
-        a_global_scale=gate_up_proj_input_global_scale,
-        b_global_scale=gate_up_proj_weight_global_scale,
-        expert_start=expert_start,
-        bias=gate_up_proj_bias,
-        activation_format=fmt,
-        output_dtype=hidden_states.dtype,
-        gather_idx=gather_idx,
-    )
+    if (gate and fmt == "bf16" and gate_up_proj.dtype == torch.float8_e4m3fn
+            and not is_mx(gate_up_proj, gate_up_proj_scale_inv)):
+        assert (gate_up_proj_activation_scale is None and gate_up_proj_input_global_scale is None
+                and gate_up_proj_weight_global_scale is None), "FP8 weight-only takes raw activations and block scales"
+        # Keep calibrated gate/up scale blocks interleaved while leaving the GLU unfused.
+        gate_up_out = block_fp8_weight_only_matmul_grouped(
+            gate_up_in, gate_up_proj, gate_up_proj_scale_inv, expert_start,
+            output_dtype=hidden_states.dtype, gather_idx=gather_idx,
+            bias=gate_up_proj_bias, interleaved_scales=True,
+        )[0]
+    else:
+        gate_up_out = matmul_grouped(
+            gate_up_in,
+            gate_up_proj,
+            As=gate_up_in_scale,
+            Bs=gate_up_proj_scale_inv,
+            a_global_scale=gate_up_proj_input_global_scale,
+            b_global_scale=gate_up_proj_weight_global_scale,
+            expert_start=expert_start,
+            bias=gate_up_proj_bias,
+            activation_format=fmt,
+            output_dtype=hidden_states.dtype,
+            gather_idx=gather_idx,
+        )
     inter = _host_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit, gate)
     # down over the expert-ordered intermediate (quantized in the same format), scattering
     # to routed rows.
@@ -886,9 +893,9 @@ def moe_unfused_batched(
     """Unfused batched MoE: gate_up (plain batched GEMM, gather hidden) → host ``apply_glu`` →
     down (plain batched GEMM) → routing-weighted reduce. Same math as ``moe_fused_batched`` but
     the SwiGLU + intermediate quant happen between two plain GEMMs; each GEMM quantizes its raw
-    input in ``activation_format`` (``None`` follows the weight format, ``"bf16"`` is weight-only). All
-    formats route through the shared ``matmul_batched``. The NVFP4 activation globals thread the
-    same way as the fused sibling: each GEMM quantizes its raw input against its
+    input in ``activation_format`` (``None`` follows the weight format, ``"bf16"`` is weight-only).
+    The NVFP4 activation globals thread the same way as the fused sibling: each GEMM
+    quantizes its raw input against its
     ``*_input_global_scale``, and a ``*_activation_scale`` quantizes it against that calibrated
     scale instead of a runtime one. ``act_fn`` is a
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
@@ -903,23 +910,30 @@ def moe_unfused_batched(
     gather_idx = _gather_idx(top_k_index)
 
     # gate_up as a plain GEMM (no gate epilogue) over gathered hidden -> (S, 2I).
-    gate_up_out = matmul_batched(
-        hidden_states,
-        gate_up_proj,
-        As=gate_up_proj_activation_scale,
-        Bs=gate_up_proj_scale_inv,
-        interleaved_scales=(
-            gate and fmt == "bf16" and gate_up_proj.dtype == torch.float8_e4m3fn
-            and not is_mx(gate_up_proj, gate_up_proj_scale_inv)
-        ),
-        a_global_scale=gate_up_proj_input_global_scale,
-        b_global_scale=gate_up_proj_weight_global_scale,
-        expert_ids=expert_ids,
-        bias=gate_up_proj_bias,
-        activation_format=fmt,
-        output_dtype=hidden_states.dtype,
-        gather_idx=gather_idx,
-    )
+    if (gate and fmt == "bf16" and gate_up_proj.dtype == torch.float8_e4m3fn
+            and not is_mx(gate_up_proj, gate_up_proj_scale_inv)):
+        assert (gate_up_proj_activation_scale is None and gate_up_proj_input_global_scale is None
+                and gate_up_proj_weight_global_scale is None), "FP8 weight-only takes raw activations and block scales"
+        # Keep calibrated gate/up scale blocks interleaved while leaving the GLU unfused.
+        gate_up_out = block_fp8_weight_only_matmul_batched(
+            hidden_states, gate_up_proj, gate_up_proj_scale_inv, expert_ids,
+            output_dtype=hidden_states.dtype, gather_idx=gather_idx,
+            bias=gate_up_proj_bias, interleaved_scales=True,
+        )[0]
+    else:
+        gate_up_out = matmul_batched(
+            hidden_states,
+            gate_up_proj,
+            As=gate_up_proj_activation_scale,
+            Bs=gate_up_proj_scale_inv,
+            a_global_scale=gate_up_proj_input_global_scale,
+            b_global_scale=gate_up_proj_weight_global_scale,
+            expert_ids=expert_ids,
+            bias=gate_up_proj_bias,
+            activation_format=fmt,
+            output_dtype=hidden_states.dtype,
+            gather_idx=gather_idx,
+        )
     inter = _host_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit, gate)
     # down over the intermediate (quantized in the same format), routed-order output.
     down_out = matmul_batched(

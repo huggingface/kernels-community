@@ -2502,7 +2502,6 @@ def matmul_grouped(
     bias: torch.Tensor | None = None,  # (E, N_out) per-expert output bias; (N_out,) for 2D
     activation_format: str | None = None,
     gate: bool = False,
-    interleaved_scales: bool = False,
     act_fn: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -2528,8 +2527,7 @@ def matmul_grouped(
     packed E2M1 activations). ``Bs`` ``None`` = unquantized BF16/FP16 weights.
     ``quantize_output`` requantizes the output into ``activation_format`` — the return is then
     ``(C, Cs)``. ``gate``/``act_fn``/``swiglu_alpha``/``swiglu_limit`` fuse the gate|up GLU into the
-    epilogue. ``interleaved_scales=True`` reads separately calibrated gate/up scale
-    blocks without fusing the GLU; the unfused MoE gate/up projection uses this layout.
+    epilogue.
     ``As``/``Bs`` are each a bare block-scale tensor; the two-level NVFP4 second-level scales ride
     the separate ``a_global_scale``/``b_global_scale`` (fp32 per-tensor, weights per-expert ``(E,)``;
     from ``nvfp4_quantize_two_level``), and the op folds ``g_a · g_b`` onto the accumulator. The
@@ -2556,9 +2554,6 @@ def matmul_grouped(
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_grouped``.
     """
     check_activation_format(activation_format, quantize_output)
-    assert not interleaved_scales or (
-        Bs is not None and not is_mx(B, Bs) and activation_format == "bf16"
-    ), "interleaved_scales describes calibrated gate/up blocks on FP8 weight-only GEMMs"
     if gather_idx is not None and activation_format == "bf16" and As is None:
         # weight-only: raw bf16 rows are what the kernel consumes, so the trade is decided
         # here; the QUANTIZED formats decide it in their family wrappers AFTER the act quant
@@ -2578,7 +2573,7 @@ def matmul_grouped(
         out = block_fp8_weight_only_matmul_grouped(
             A, B, Bs, expert_start, gate, act_fn, swiglu_alpha, swiglu_limit,
             simulate_unfused, activation_format, quantize_output, output_dtype,
-            gather_idx, scatter_idx, bias=bias, interleaved_scales=interleaved_scales,
+            gather_idx, scatter_idx, bias=bias,
         )
         return out[0]
     # a calibrated (static) scale on a raw A (see `tensor_wide_act_operands`): block-scale weights
