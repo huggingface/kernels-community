@@ -25,9 +25,9 @@ from .swizzle import swizzle_mx_scales, unswizzle_mx_scales
 from .quant import mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant
 
 __all__ = [
+    "embedding_lookup",
     # the three GEMM dispatchers (the weight format is read off the tensors; `activation_format`
     # names the activations', the gate|up fusion rides as kwargs)
-    "embedding_lookup",
     "matmul_2d",
     "matmul_batched",
     "matmul_grouped",
