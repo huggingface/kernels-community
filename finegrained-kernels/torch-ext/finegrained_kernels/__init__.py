@@ -25,8 +25,6 @@ from .loading.scales import prepare_nvfp4_csf_scales, decompress_nvfp4_csf_scale
 from .quant import mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant
 
 __all__ = [
-    "prepare_nvfp4_csf_scales",
-    "decompress_nvfp4_csf_scales",
     # the three GEMM dispatchers (the weight format is read off the tensors; `activation_format`
     # names the activations', the gate|up fusion rides as kwargs)
     "matmul_2d",
@@ -45,6 +43,8 @@ __all__ = [
     # quantizers a loader uses to quantize weights into the group formats
     "swizzle_mx_scales",
     "unswizzle_mx_scales",
+    "prepare_nvfp4_csf_scales",
+    "decompress_nvfp4_csf_scales",
     "mxfp8_act_quant",
     "mxfp4_act_quant",
     "nvfp4_act_quant",
