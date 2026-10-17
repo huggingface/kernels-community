@@ -332,25 +332,23 @@ def mx_2d_scale_ptrs(
     return as_ptrs, bs_ptrs, as_mask, bs_mask
 
 
-# CSF byte-window scales: CPU preparation and staged decoding before ordinary GEMMs.
+# CSF byte-window scales: stream preparation and staged decoding before ordinary GEMMs.
 
 
 def prepare_nvfp4_csf_scales(
     fixed: torch.Tensor, exceptions: torch.Tensor | Sequence[torch.Tensor]
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Prepare one matrix or an expert stack on CPU, without expanding its scales.
+    """Prepare one matrix or an expert stack without expanding or moving its scales.
 
     `fixed` is uint8 `[rows/16, 16*(1+cols/2)]`, or the same shape with an
     expert dimension. Exceptions are uint32 `[count]` for one matrix, or one
     tensor per expert; low 24 bits locate a scale and high 8 bits replace it.
-    Returns (fixed, concatenated exceptions, expert offsets), all CPU tensors.
-    Decode once at load time for dense residency, or move the streams to the
-    accelerator and decode into shared scratch immediately before GEMM.
+    Returns (fixed, concatenated exceptions, expert offsets) on the input device.
+    Decode on the accelerator at load time for dense residency, or into shared
+    scratch immediately before GEMM.
     """
     if fixed.dtype != torch.uint8 or fixed.ndim not in (2, 3):
         raise ValueError("CSF fixed stream must be a 2D or 3D uint8 tensor")
-    if fixed.device.type != "cpu":
-        raise ValueError("Prepare CSF scales on CPU before moving them to the device")
     fixed = fixed.unsqueeze(0) if fixed.ndim == 2 else fixed
     experts, slabs, slab_bytes = fixed.shape
     if experts == 0 or slabs == 0 or slab_bytes <= 16 or slab_bytes % 16:
@@ -370,9 +368,11 @@ def prepare_nvfp4_csf_scales(
         if (
             stream.dtype != torch.uint32
             or stream.ndim != 1
-            or stream.device.type != "cpu"
+            or stream.device != fixed.device
         ):
-            raise ValueError("CSF exception streams must be 1D CPU uint32 tensors")
+            raise ValueError(
+                "CSF exception streams must be 1D uint32 tensors on the fixed stream's device"
+            )
         values = stream.to(torch.int64)
         positions = values & 0xFFFFFF
         if positions.numel() and (
@@ -389,7 +389,7 @@ def prepare_nvfp4_csf_scales(
     return (
         fixed.contiguous(),
         torch.cat(words),
-        torch.tensor(offsets, dtype=torch.uint32),
+        torch.tensor(offsets, dtype=torch.uint32, device=fixed.device),
     )
 
 
@@ -500,14 +500,16 @@ def decompress_nvfp4_csf_scales(
 ) -> torch.Tensor:
     """Decode prepared CSF streams to dense E4M3 scales for an ordinary NVFP4 GEMM.
 
-    With no `out`, allocate dense scales, e.g. once on CPU at checkpoint loading.
+    With no `out`, allocate dense scales on the accelerator at checkpoint loading.
     Pass reusable contiguous [experts, rows, cols] workspace to keep the streams
     compressed between layers. Consume the workspace before overwriting it; it
     must not be retained for backward or shared by concurrent consumers.
     A shared dense workspace saves memory across layers, not within one layer.
     """
     if fixed.dtype != torch.uint8 or fixed.ndim != 3 or not fixed.is_contiguous():
-        raise ValueError("CSF fixed stream must be contiguous 3D uint8 prepared on CPU")
+        raise ValueError("CSF fixed stream must be contiguous 3D uint8")
+    if fixed.device.type == "cpu":
+        raise ValueError("CSF decompression requires an accelerator")
     experts, slabs, slab_bytes = fixed.shape
     if experts == 0 or slabs == 0 or slab_bytes <= 16 or slab_bytes % 16:
         raise ValueError("Invalid CSF slab shape")
@@ -538,16 +540,5 @@ def decompress_nvfp4_csf_scales(
         raise ValueError(f"CSF workspace must be contiguous E4M3 with shape {shape}")
     if any(t.device != out.device for t in (fixed, exceptions, expert_offsets)):
         raise ValueError("CSF buffers and workspace must share a device")
-    if out.device.type == "cpu":
-        bases = fixed[:, :, :16].reshape(experts, rows, 1).to(torch.int16)
-        packed = fixed[:, :, 16:].reshape(experts, rows, cols // 2)
-        codes = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(shape)
-        dense = (bases + codes).to(torch.uint8)
-        for expert in range(experts):
-            start, end = int(expert_offsets[expert]), int(expert_offsets[expert + 1])
-            words = exceptions[start:end].to(torch.int64)
-            dense[expert].view(-1)[words & 0xFFFFFF] = (words >> 24).to(torch.uint8)
-        out.copy_(dense.view(torch.float8_e4m3fn))
-    else:
-        _decompress_into(fixed, exceptions, expert_offsets, out)
+    _decompress_into(fixed, exceptions, expert_offsets, out)
     return out

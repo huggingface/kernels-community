@@ -512,8 +512,8 @@ def prepare_weight_scales(scales, csf_encoding, fn, compiled=False):
     if not csf_encoding:
         return maybe_compile(fn, compiled)
     fixed, exceptions = encode_csf_scales(scales)
-    buffers = tuple(
-        t.to(scales.device) for t in prepare_nvfp4_csf_scales(fixed, exceptions)
+    buffers = prepare_nvfp4_csf_scales(
+        fixed.to(scales.device), [stream.to(scales.device) for stream in exceptions]
     )
 
     workspace = torch.empty_like(scales).reshape(-1, *scales.shape[-2:])
