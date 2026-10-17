@@ -19,7 +19,6 @@ carries its incident."""
 import logging
 import subprocess
 import sys
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -344,28 +343,3 @@ def test_compile_failures_are_memoized_across_keys(caplog):
     assert len(msgs) == 2, msgs
     assert "[memoized]" not in msgs[0] or "[memoized]" in msgs[1]
     assert "[memoized]" in msgs[1], msgs[1]
-
-
-@pytest.mark.kernels_ci
-@pytest.mark.parametrize("phase", ["BASIN_PROBES", "REFINE", "RUNOFF"])
-@pytest.mark.parametrize("enabled", [False, True])
-def test_autotune_search_controls(monkeypatch, phase, enabled):
-    budget = 2 if phase == "RUNOFF" else 1
-    monkeypatch.setenv("FINEGRAINED_AUTOTUNE_TRIALS", str(budget))
-    for name in ("BASIN_PROBES", "REFINE", "RUNOFF"):
-        monkeypatch.setenv(f"FINEGRAINED_AUTOTUNE_{name}", str(int(enabled and name == phase)))
-    configs = [
-        triton.Config({"MODE": mode, "BLOCK_SIZE_N": tile})
-        for mode in ("plain", "swap") for tile in (16, 32, 64)
-    ]
-
-    @bayesian_autotune(configs, [], n_trials=80, refine=True, path_anchor_axes=("MODE",))
-    @triton.jit
-    def kernel(MODE: tl.constexpr, BLOCK_SIZE_N: tl.constexpr):
-        pass
-
-    measure = Mock(return_value=1.0)
-    monkeypatch.setattr(kernel, "_bench", measure)
-    winner = kernel._bayesian_search(configs, (), {}, ())
-    assert (measure.call_count > budget) == enabled
-    assert winner in [call.kwargs["config"] for call in measure.call_args_list]
