@@ -37,8 +37,11 @@ import random
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from functools import cached_property
+from pathlib import Path
 
 import torch
+from triton.testing import do_bench_cudagraph
 
 from typing import Dict, List
 
@@ -54,6 +57,28 @@ from triton.runtime.autotuner import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Include the tuner implementation alongside Triton's kernel-source hash.
+_TUNER_SOURCE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def _bench_cold_graph(fn, quantiles):
+    """Compare cold-input graph costs without per-launch timing events.
+
+    Scores include the same cache-clearing work for every candidate; they are
+    comparative costs, not standalone kernel latencies. Timing a graph of repeated
+    flush/launch pairs amortizes events that can obscure short-kernel differences.
+    """
+    cache = driver.active.get_empty_cache_for_benchmark()
+
+    def call():
+        driver.active.clear_cache(cache)
+        fn()
+
+    # Triton's graph timer warms up on its own stream; finish input producers first.
+    torch.cuda.current_stream().synchronize()
+    return do_bench_cudagraph(call, quantiles=quantiles)
+
 
 # Env-gated host-execution counter (FINEGRAINED_AUTOTUNE_CALLCOUNT=<path>): every
 # BayesianAutotuner.run() call increments its kernel's tally, dumped to <path> at exit.
@@ -84,10 +109,12 @@ class BayesianAutotuner(Autotuner):
         max_failures: int | None = None,
         n_startup_trials: int = 12,
         gamma: float = 0.25,
-        refine: bool = True,
+        basin_probes: bool = True,
+        runoff: bool = True,
         max_refine_iters: int = 5,
         log_path: str | None = None,
         path_anchor_axes: tuple[str, ...] = (),
+        coupled_axes: tuple[tuple[str, ...], ...] = (),
         finite_check_args: tuple[str, ...] = (),
         **kwargs,
     ):
@@ -110,13 +137,20 @@ class BayesianAutotuner(Autotuner):
         self.n_startup_trials = n_startup_trials
         # top fraction of measured configs the TPE treats as "good"
         self.gamma = gamma
-        self.refine = refine
-        self.max_refine_iters = max_refine_iters
+        self.basin_probes = os.environ.get("FINEGRAINED_AUTOTUNE_BASIN_PROBES", str(int(basin_probes))) == "1"
+        self.runoff = os.environ.get("FINEGRAINED_AUTOTUNE_RUNOFF", str(int(runoff))) == "1"
+        self.max_refine_iters = int(os.environ.get("FINEGRAINED_AUTOTUNE_MAX_REFINE_ITERS", str(max_refine_iters)))
         # Branch axes (by kwarg name) that relocate the TILE optimum — the caller's
         # declaration, since it is configuration knowledge (the tuner never hardcodes
         # axis names). Each distinct value combination of these axes gets one guaranteed
         # max-tile anchor; empty = median anchors only.
         self.path_anchor_axes = tuple(path_anchor_axes)
+        # Joint choices share one TPE density and one coordinate-refinement step.
+        self.coupled_axes = tuple(tuple(group) for group in coupled_axes)
+        coupled_names = [name for group in self.coupled_axes for name in group]
+        if any(len(group) < 2 for group in self.coupled_axes) or len(set(coupled_names)) != len(coupled_names):
+            raise ValueError("coupled_axes must contain disjoint groups of at least two configuration fields")
+        self._coupled_names = frozenset(coupled_names)
         # Output arg NAMES (a declaration — the tuner never hardcodes kernel details) whose
         # values are checked for NaN/inf after each config's bench: a config that writes
         # non-finite output scores inf and can never be crowned. The tuner times, it never
@@ -132,6 +166,18 @@ class BayesianAutotuner(Autotuner):
         self._arg_name_set = frozenset(self.arg_names)
         self._dtype_tag_cache: Dict[tuple, str] = {}
         self._dtype_str_cache: Dict[torch.dtype, str] = {}
+
+    @cached_property
+    def do_bench(self):
+        if self._do_bench is not None:
+            return self._do_bench
+        if (
+            driver.active.get_current_target().backend == "cuda"
+            and not self.user_defined_pre_hook
+            and not self.user_defined_post_hook
+        ):
+            return _bench_cold_graph
+        return driver.active.get_benchmarker()
 
     def _dtype_str(self, dtype) -> str:
         s = self._dtype_str_cache.get(dtype)
@@ -460,9 +506,22 @@ class BayesianAutotuner(Autotuner):
         self.nargs = None
         return ret
 
+    def _search_signatures(self, configs: List[Config]):
+        signatures = []
+        for config in configs:
+            values = config.all_kwargs()
+            signature = {(name,): value for name, value in values.items() if name not in self._coupled_names}
+            for group in self.coupled_axes:
+                try:
+                    signature[group] = tuple(values[name] for name in group)
+                except KeyError as exc:
+                    raise ValueError(f"Unknown coupled_axes configuration field: {exc.args[0]}") from exc
+            signatures.append(tuple(sorted(signature.items())))
+        return signatures
+
     def _bayesian_search(self, configs: List[Config], args, kwargs, key) -> Config:
         timings: Dict[int, float] = {}
-        sigs = [tuple(sorted(c.all_kwargs().items())) for c in configs]
+        sigs = self._search_signatures(configs)
 
         def bench_idx(idx: int) -> float:
             if idx in timings:
@@ -489,8 +548,8 @@ class BayesianAutotuner(Autotuner):
         # per-dimension model can write off a whole axis it never saw succeed (two dsv4 tunes
         # shipped 25-60% slow winners because their random seeds only sampled a basin's dead
         # configs), and coordinate descent can't recover a winner two coupled flips away.
-        n_startup = max(2, min(self.n_startup_trials, self.n_trials))
-        anchors = self._basin_anchor_indices(configs)
+        n_startup = min(self.n_trials, max(2, self.n_startup_trials))
+        anchors = self._basin_anchor_indices(configs) if self.basin_probes else []
         order = list(range(len(configs)))
         random.Random(0).shuffle(order)
         warm_idx = self._warm_start_index(configs, key)
@@ -574,22 +633,21 @@ class BayesianAutotuner(Autotuner):
 
         # Coordinate-descent refinement: try single-dim perturbations around
         # the current best until no neighbor improves.
-        if self.refine:
-            for _ in range(self.max_refine_iters):
-                best_idx = min(timings, key=timings.get)
-                best_sig = sigs[best_idx]
-                best_ms = timings[best_idx]
-                improved = False
-                for i, s in enumerate(sigs):
-                    if i in timings:
-                        continue
-                    diff = sum(1 for (_, a), (_, b) in zip(best_sig, s) if a != b)
-                    if diff != 1:
-                        continue
-                    if bench_idx(i) < best_ms:
-                        improved = True
-                if not improved:
-                    break
+        for _ in range(self.max_refine_iters):
+            best_idx = min(timings, key=timings.get)
+            best_sig = sigs[best_idx]
+            best_ms = timings[best_idx]
+            improved = False
+            for i, s in enumerate(sigs):
+                if i in timings:
+                    continue
+                diff = sum(1 for (_, a), (_, b) in zip(best_sig, s) if a != b)
+                if diff != 1:
+                    continue
+                if bench_idx(i) < best_ms:
+                    improved = True
+            if not improved:
+                break
 
         # Crown RUNOFF: the search's single-shot timings carry enough noise to flip crowns
         # between same-code tune rolls (gpt-oss prefill grouped rolled 1727-2150us on identical
@@ -597,21 +655,24 @@ class BayesianAutotuner(Autotuner):
         # the top candidates back-to-back — same warmed process, adjacent in time, so they see
         # the same clocks — and crown the winner of THAT comparison. Costs ~3 extra benches.
         finite = sorted((t, i) for i, t in timings.items() if t != float("inf"))
-        if len(finite) > 1:
-            for _, i in finite[:3]:
+        finalists = list(timings)
+        if self.runoff and len(finite) > 1:
+            finalists = [i for _, i in finite[:3]]
+            for i in finalists:
                 timings.pop(i, None)
                 bench_idx(i)  # memoizing closure: re-benches and re-records the popped entry
 
         self.configs_timings = {configs[i]: t for i, t in timings.items()}
-        best = min(timings, key=timings.get)
+        # Other candidates still carry search-time samples, not comparable runoff measurements.
+        best = min(finalists, key=timings.get)
         if timings[best] == float("inf"):
             # crowning an arbitrary broken config would persist it as `best` on disk and
             # every later healthy process would replay it without re-tuning — the exact
             # sticky-contaminated-context scenario inf-forgiveness exists to survive
             self._report_bench_failures()
             raise RuntimeError(
-                f"[bayesian-autotune] {self.fn_name}: every benched config failed "
-                "(all-inf tune) — nothing correct to crown or persist; the context may "
+                f"[bayesian-autotune] {self.fn_name}: every final candidate failed "
+                "— nothing correct to crown or persist; the context may "
                 "be trap-contaminated (retry in a fresh process) or the grid is broken "
                 "for this launch (see the failure report above)."
             )
@@ -619,7 +680,7 @@ class BayesianAutotuner(Autotuner):
 
     def _log_result(self, key, config: Config, ms: float):
         """Append one ``(key, config, ms)`` record as JSONL for offline analysis —
-        e.g. pruning configs that are consistently far off the per-key best. ``inf`` ms
+        CUDA graph costs include cache clearing, not just the kernel. ``inf`` ms
         marks a config that failed to compile/run (out of resources, etc.)."""
         if not self.log_path:
             return
@@ -639,12 +700,8 @@ class BayesianAutotuner(Autotuner):
             pass
 
     def _basin_anchor_indices(self, configs: List[Config]) -> List[int]:
-        """One representative config index per (COMPUTE_MODE, SWAP_AB) basin — the MEDIAN in
-        tile-sort order, a mid-sized tile with mid warps/stages. Not the smallest: a basin's
-        minimal corner (min BK x 2 warps) can be latency-bound pathological (a 131µs anchor in
-        a basin whose peak is 41µs re-poisons the axis it was meant to protect). Coordinate
-        descent climbs BN/BK/warps/stages from wherever the TPE lands within the basin.
-        Returns [] when the grid has no such axes (single basin)."""
+        """Interior representatives of categorical basins, plus a wide output tile
+        per declared compute path. All anchors come from the pruned grid."""
         # Basin axes are DERIVED, not declared: a config kwarg with string or boolean
         # values is a branch axis (different code path — compute mode, operand swap,
         # warp specialization), which partitions the grid into disjoint performance
@@ -670,41 +727,40 @@ class BayesianAutotuner(Autotuner):
         if len(groups) <= 1:
             return []
 
-        def tile_order(i):
-            return (
-                configs[i].kwargs.get("BLOCK_SIZE_N", 0),
-                configs[i].kwargs.get("BLOCK_SIZE_K", 0),
-                configs[i].num_warps,
-                configs[i].num_stages,
-            )
-
-        # Median anchor per basin, PLUS one max-tile anchor per declared PATH-axis combo
-        # (``path_anchor_axes``). The median alone left the big-tile end unsampled: TPE
-        # densities lock onto the first-timed mid-tile region and coordinate descent cannot
-        # cross DIAGONAL ridges — dsv4 mxfp8 prefill gate_up's BN=128/BK=256 winner (840us)
-        # needs BN and warps to move together, so descent from the BN=64 crown rejects the
-        # lone BN step and n_trials 100/200/400 all missed it; one guaranteed big-tile
-        # sample fixed it (crown 958 -> 880 at the default budget). The max anchor rides
-        # the declared COARSE grouping, NOT the full branch-axis cross: per-basin max
-        # anchors on the weight-only grouped grid (32 basins: modes x WS x PS x 2 memory
-        # modes each way) put 64 forced trials into a 100-trial budget and starved the
-        # search — gpt-oss prefill regressed 3463 -> 4099us on a quiet box before this was
-        # scoped. Which axes qualify is the KERNEL's declaration (configuration knowledge);
-        # axes absent from this grid are ignored.
         anchors = []
         coarse_seen = set()
         coarse_axes = [k for k in self.path_anchor_axes if k in basin_axes]
         for basin, idxs in groups.items():
-            ordered = sorted(idxs, key=tile_order)
-            anchors.append(ordered[len(ordered) // 2])
+            # Choose the middle of every ordinal axis together. Lexicographic sorting
+            # ignores M and can put the "median" at extreme K/warps/stages.
+            values = [configs[i].all_kwargs() for i in idxs]
+            axes = {
+                k: sorted({v[k] for v in values})
+                for k, value in values[0].items()
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+            }
+
+            def distance(i):
+                args = configs[i].all_kwargs()
+                return sum(
+                    (options.index(args[k]) / max(1, len(options) - 1) - 0.5) ** 2
+                    for k, options in axes.items()
+                )
+
+            anchors.append(min(idxs, key=distance))
             if not self.path_anchor_axes:
-                continue  # no declaration -> median anchors only
-            # declared axes absent from THIS grid still coarse-group to () — one global
-            # max-tile anchor, the big-tile guarantee without per-basin anchor spam
+                continue
             coarse = tuple(basin[basin_axes.index(k)] for k in coarse_axes)
-            if coarse not in coarse_seen and ordered[-1] != anchors[-1]:
+            if coarse not in coarse_seen:
                 coarse_seen.add(coarse)
-                anchors.append(ordered[-1])
+                # The existing wide-tile anchor protects coupled output-tile ridges,
+                # with interior contraction/warps/stages rather than their largest corner.
+                wide = min(idxs, key=lambda i: (
+                    -configs[i].kwargs.get("BLOCK_SIZE_M", 1)
+                    * configs[i].kwargs.get("BLOCK_SIZE_N", 1), distance(i),
+                ))
+                if wide != anchors[-1]:
+                    anchors.append(wide)
         return anchors
 
     def _warm_start_index(self, configs: List[Config], key=None):
@@ -729,8 +785,8 @@ class BayesianAutotuner(Autotuner):
         """Persist the tuned best config to Triton's on-disk cache so a later run (or process)
         skips the whole minutes-long search+compile — most of which is Triton codegen, not
         benching. Keyed exactly like Triton's own autotune cache (triton version + backend +
-        kernel source hash + invalidating env + key + the full config grid), so any of those
-        changing re-tunes.
+        kernel/tuner source hashes + invalidating env + key + the full config grid), so any
+        of those changing re-tunes.
 
         Unlike Triton's stock version we do NOT bail when configs carry a ``pre_hook`` (ours
         always do): we persist each config's ``all_kwargs()`` — serializable and pre_hook-free —
@@ -750,13 +806,16 @@ class BayesianAutotuner(Autotuner):
             triton_key(),
             make_backend(driver.active.get_current_target()).hash(),
             fn.cache_key,
+            _TUNER_SOURCE_HASH,
             str(sorted(env_vars.items())),
             # Key NAMES and the search budget are determinants too: tuning_key holds
             # values only (renaming a key or swapping two same-typed keys would collide),
             # and FINEGRAINED_AUTOTUNE_TRIALS is not in Triton's invalidating-env list —
             # without n_trials a 3-trial exploratory winner gets replayed at 100 trials.
             str(self.keys),
-            f"n_trials={self.n_trials},n_startup_trials={self.n_startup_trials},gamma={self.gamma}",
+            f"n_trials={self.n_trials},n_startup_trials={self.n_startup_trials},gamma={self.gamma},"
+            f"basin_probes={self.basin_probes},max_refine_iters={self.max_refine_iters},runoff={self.runoff},"
+            f"coupled_axes={self.coupled_axes}",
             str(tuning_key),
         ] + [str(c) for c in configs]  # str(Config) is pre_hook-free and process-stable
         cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()
@@ -892,10 +951,12 @@ def bayesian_autotune(
     max_failures: int | None = None,
     n_startup_trials: int = 12,
     gamma: float = 0.25,
-    refine: bool = True,
+    basin_probes: bool = True,
+    runoff: bool = True,
     max_refine_iters: int = 5,
     log_path: str | None = None,
     path_anchor_axes: tuple[str, ...] = (),
+    coupled_axes: tuple[tuple[str, ...], ...] = (),
     finite_check_args: tuple[str, ...] = (),
     cache_results: bool = True,
     reset_to_zero=None,
@@ -907,11 +968,18 @@ def bayesian_autotune(
                               that fail to compile/run are skipped without consuming it)
     n_startup_trials:         random seed configs before the TPE model kicks in
     gamma:                    top fraction of measured configs treated as "good"
-    refine, max_refine_iters: coordinate-descent refinement after the TPE
+    basin_probes:             measure categorical basin anchors before the TPE
+    max_refine_iters:         coordinate-descent iterations after the TPE (0 disables; env
+                              override FINEGRAINED_AUTOTUNE_MAX_REFINE_ITERS)
+    runoff:                   remeasure the top candidates before choosing the winner
+                              (basin_probes/runoff each have an env override:
+                              FINEGRAINED_AUTOTUNE_BASIN_PROBES/_RUNOFF, 0 or 1)
     path_anchor_axes:         branch axes (kwarg names) whose values relocate the tile
                               optimum — one guaranteed max-tile anchor per value combo
                               (see _basin_anchor_indices); the kernel declares them, the
                               tuner stays independent of configuration details
+    coupled_axes:             groups of config fields treated as joint choices by TPE and
+                              refinement, including Config fields such as num_stages
     max_failures:             abort the tune once this many configs fail to compile/run before
                               the measured budget is met (default n_trials; env override
                               FINEGRAINED_AUTOTUNE_MAX_FAILURES). Without it a broadly broken
@@ -933,10 +1001,12 @@ def bayesian_autotune(
             max_failures=max_failures,
             n_startup_trials=n_startup_trials,
             gamma=gamma,
-            refine=refine,
+            basin_probes=basin_probes,
+            runoff=runoff,
             max_refine_iters=max_refine_iters,
             log_path=log_path,
             path_anchor_axes=path_anchor_axes,
+            coupled_axes=coupled_axes,
             finite_check_args=finite_check_args,
             cache_results=cache_results,
             **kwargs,
