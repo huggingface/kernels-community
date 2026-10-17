@@ -1106,6 +1106,16 @@ def scalar_max_m_pruner(m_arg: str, max_m: int = 64):
 
     return config_filter(ok, when=lambda args: args[m_arg] > max_m)
 
+
+def swap_max_m_pruner(m_arg: str, max_m: int):
+    """Keep swapped GEMM candidates within the measured activation-row range."""
+
+    def ok(c, args):
+        return not c.kwargs.get("SWAP_AB") or args[m_arg] <= max_m
+
+    return config_filter(ok)
+
+
 def matched_memory_modes_pruner():
     """Drop configs that mix pointer and descriptor operand loads — for a DENSE 2D GEMM
     only (contiguous A, whole M in one tile). Measured across M=1..8192 on the block-scale

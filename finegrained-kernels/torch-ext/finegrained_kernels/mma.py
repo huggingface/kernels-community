@@ -295,6 +295,20 @@ def swap_pad_rhs(a, BLOCK_SIZE_K: tl.constexpr):
 
 
 @triton.jit
+def plain_dot(acc, a, b, SWAP_AB: tl.constexpr = False):
+    """Plain GEMM step with a logical [M, N] accumulator in either operand orientation.
+
+    Swapping uses row-major weights [N, K] as the MMA lhs and transposes the
+    [M, K] activations, avoiding the padded token columns of single-token helpers.
+    """
+    if SWAP_AB:
+        out = tl.trans(tl.dot(b, tl.trans(a), tl.trans(acc)))
+    else:
+        out = tl.dot(a, b, acc)
+    return out
+
+
+@triton.jit
 def fp8_dot(a, b, SWAP_AB: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
     """Swap-aware plain ``tl.dot`` for the fp8 (block/tensor-dynamic) paths — no scaling; the caller
     applies its own per-block/per-tensor scales. Swap: weight ``b`` ``[N, BK]`` × the single token

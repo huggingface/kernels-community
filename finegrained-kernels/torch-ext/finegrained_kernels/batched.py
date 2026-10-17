@@ -32,7 +32,7 @@ from .epilogue import fused_glu
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, static_expert_act_operands, tensor_wide_act_operands
 from .swizzle import swizzled_scale_descriptor
 from .scheduling import is_off_rank
-from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
+from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, plain_dot, static_dot
 from .loading.tiles import (
     advance_ptrs,
     load_act_block_dynamic,
@@ -982,7 +982,7 @@ def full_precision_matmul_batched_kernel(
 
 
 @bayesian_autotune(
-    get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True),
+    get_accelerator_autotuning_configs(tune_block_nk=True, swap_ab=True, swap_block_sizes_m=(1, 2)),
     # S (routed rows) keyed like the fp8/mx batched siblings — decode re-tunes per batch;
     # GATE keys the gate|up arm separately (its stacked dot is 2*BN wide).
     ["N", "K", "S", "GATE", "BLOCK_N", "BLOCK_K", "GATE_SCALES"],
@@ -1073,7 +1073,7 @@ def block_fp8_weight_only_matmul_batched_kernel(
         B, offs_bn, offs_k, stride_b_n, stride_b_k, SWAP_AB
     )
 
-    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
+    accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a, unused_activation = load_act_plain(a_ptrs, 0, 0, 0, None, 0, "pointer", False)
         w = load_weight_block_fp8(
@@ -1083,7 +1083,7 @@ def block_fp8_weight_only_matmul_batched_kernel(
             GATE, False, "pointer", SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
             BLOCK_N, BLOCK_K, GATE_SCALES, a.dtype,
         )
-        accumulator = accumulator + fp8_dot(a, w, SWAP_AB, BLOCK_SIZE_K)
+        accumulator = plain_dot(accumulator, a, w, SWAP_AB)
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
 
@@ -1093,7 +1093,7 @@ def block_fp8_weight_only_matmul_batched_kernel(
         C, None, accumulator, out_row, pid_n, 0, out_row, 1, stride_c_n, 1, 1,
         BLOCK_SIZE_M, BLOCK_SIZE_N, GATE, None, BLOCK_SIZE_K,
         ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-        COMPUTE_MODE="dot", SWAP_AB=SWAP_AB, FAKE_BATCH=True,
+        COMPUTE_MODE="dot", FAKE_BATCH=True,
         Bias=Bias, stride_bias_e=stride_bias_e, stride_bias_n=stride_bias_n,
         global_row=expert_id,
     )

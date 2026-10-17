@@ -28,7 +28,7 @@ from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid,
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands
 from .loading.scales import apply_global_scale, dequant_block_fp8_weight, mx_2d_scale_ptrs
-from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
+from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, plain_dot, static_dot
 from .loading.tiles import (
     advance_ptrs,
     load_act_block_dynamic,
@@ -46,7 +46,7 @@ from .loading.tiles import (
     swizzle_offsets,
 )
 from .epilogue import acc_init, add_bias, bias_strides, gemm_epilogue, store_masked, store_masked_oriented
-from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner
+from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, gate_stacked_tmem_trap_pruner, block_dynamic_2d_warp_spec_pruner, block_dynamic_mma_width_pruner, block_within_dim_pruner, compose_pruners, descriptor_box_pruner, descriptor_needs_prequant_pruner, matched_memory_modes_pruner, mx_2d_swap_scope_pruner, mx_config_pruner, scalar_max_m_pruner, smem_pruner, swap_max_m_pruner, swizzled_out_bm_pruner, swizzled_scale_config_pruner, warp_spec_compile_guard_pruner
 
 # The 2D-grid kernels' L2-locality swizzle depth is derived per-tile inside
 # ``swizzle_offsets`` (see SWIZZLE_GROUP_A_BYTES there) — no per-kernel constant here.
@@ -925,6 +925,7 @@ def mx_weight_only_matmul_2d_kernel(
 @bayesian_autotune(
     get_accelerator_autotuning_configs(
         tune_block_nk=True, tune_block_m=True, warp_spec=True,
+        swap_ab=True, swap_block_sizes_m=(1, 2),
         a_memory_modes=("descriptor", "pointer"),
         b_memory_modes=("descriptor", "pointer"),
         pre_hook=rebind_weight_only_descriptors,
@@ -936,6 +937,7 @@ def mx_weight_only_matmul_2d_kernel(
     prune_configs_by={
         "early_config_prune": compose_pruners(
             block_within_dim_pruner("K"),
+            swap_max_m_pruner("M", max_m=1),
             gate_stacked_tmem_trap_pruner(),
             warp_spec_compile_guard_pruner(),
             descriptor_box_pruner(),
@@ -958,6 +960,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
     A_MEMORY_MODE: tl.constexpr = "pointer",
     B_MEMORY_MODE: tl.constexpr = "pointer",
     WARP_SPEC: tl.constexpr = False,
+    SWAP_AB: tl.constexpr = False,
     GATE: tl.constexpr = False,
     GATE_SCALES: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
@@ -972,7 +975,7 @@ def block_fp8_weight_only_matmul_2d_kernel(
         M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GATE=GATE
     )
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, True)
-    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE)
+    b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, False)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), warp_specialize=WARP_SPEC):
         a, _ = load_act_plain(
@@ -983,10 +986,10 @@ def block_fp8_weight_only_matmul_2d_kernel(
             b_ptrs, BDescriptor, Bs, 0, pid_n * n_width, k * BLOCK_SIZE_K,
             0, offs_bn, k * BLOCK_SIZE_K + offs_k,
             0, stride_bs_n, stride_bs_k,
-            GATE, False, B_MEMORY_MODE, False, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            GATE, False, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
             BLOCK_N, BLOCK_K, GATE_SCALES, a.dtype,
         )
-        accumulator = accumulator + fp8_dot(a, w, False, BLOCK_SIZE_K)
+        accumulator = plain_dot(accumulator, a, w, SWAP_AB)
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
     out_row = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
