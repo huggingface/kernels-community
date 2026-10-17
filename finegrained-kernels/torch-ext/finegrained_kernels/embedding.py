@@ -76,18 +76,37 @@ def _embedding_kernel(
         value = ((nibble ^ 8) - 8).to(tl.float32)
     else:
         value = value.to(tl.float32)
-    scale_offsets = (row // SCALE_BLOCK_ROW) * S_ROW
-    if S_COL != 0:
-        scale_offsets += (col * packing // SCALE_BLOCK_COL) * S_COL
-    scale = tl.load(
-        S + scale_offsets,
-        (valid_rows & in_bounds) if S_COL == 0 else valid,
-        other=0.0,
-    )
-    scale = decode_group_scale(scale).to(tl.float32)
-    if packing == 2:
-        scale = tl.broadcast_to(scale, (BLOCK // packing,))
-        scale = tl.interleave(scale, scale)
+    if (
+        D % BLOCK == 0
+        and S_COL != 0
+        and BLOCK % SCALE_BLOCK_COL == 0
+        and FORMAT != "mxfp8"
+    ):
+        # Load one scale per group; MXFP8 favors its existing flat byte loads.
+        groups = (program % (D // BLOCK)) * (BLOCK // SCALE_BLOCK_COL)
+        groups += tl.arange(0, BLOCK // SCALE_BLOCK_COL)
+        scale = tl.load(
+            S + (row // SCALE_BLOCK_ROW) * S_ROW + groups * S_COL,
+            valid_rows & in_bounds,
+            other=0.0,
+        )
+        scale = decode_group_scale(scale).to(tl.float32)
+        scale = tl.broadcast_to(
+            scale[:, None], (BLOCK // SCALE_BLOCK_COL, SCALE_BLOCK_COL)
+        ).reshape((BLOCK,))
+    else:
+        scale_offsets = (row // SCALE_BLOCK_ROW) * S_ROW
+        if S_COL != 0:
+            scale_offsets += (col * packing // SCALE_BLOCK_COL) * S_COL
+        scale = tl.load(
+            S + scale_offsets,
+            (valid_rows & in_bounds) if S_COL == 0 else valid,
+            other=0.0,
+        )
+        scale = decode_group_scale(scale).to(tl.float32)
+        if packing == 2:
+            scale = tl.broadcast_to(scale, (BLOCK // packing,))
+            scale = tl.interleave(scale, scale)
     value = value * scale
     if FORMAT == "nvfp4":
         value = value * tl.load(G).to(tl.float32)
