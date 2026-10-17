@@ -134,16 +134,14 @@ def mx_weight_only_compute(
     SCALE_GROUP_K: tl.constexpr,
     SWAP_AB: tl.constexpr = False,
 ):
-    """Weight-only (W4A16/W8A16) MMA step: raw bf16/fp16 activations against an MXFP4/MXFP8 weight
-    tile, dispatched on ``COMPUTE_MODE``. ``"dot_scaled"`` hands the packed weight and its UE8M0
-    group scales straight to the tcgen05 scaled MMA with an UNSCALED activation operand (the
-    ``lhs_scale=None`` / bf16-format form), so the tensor core does the fp4 decode and the group
-    rescale; ``"dot"`` upcasts the tile to the activation dtype in-loop and runs a plain
-    ``tl.dot`` (the matmul_ogs Hopper format). Both are correct everywhere and the tuner picks per
-    workload — the two differ by arm: measured on gpt-oss K=2880, ``dot_scaled`` wins the down
-    projection by 18.5% while the stacked gate|up tile prefers ``dot`` by 7.3``%``. ``SWAP_AB``
-    is the decode form: weight output rows lead the tile and the FMA reduce replaces the MMA
-    (both dot arms keep the token in M). Single return — only the taken branch compiles."""
+    """Weight-only MMA step with raw activations and MXFP4/MXFP8 weights.
+
+    ``dot_scaled`` delegates weight upcasting and group scaling to Triton; an unscaled
+    BF16 activation does not imply native block-scaled MMA. ``dot`` explicitly upcasts
+    the weight tile before ``tl.dot``; the tuner chooses between these lowerings.
+    ``SWAP_AB`` uses a scalar FMA reduce for decode, with weight output rows leading
+    the tile.
+    """
     if SWAP_AB:
         acc = mx_weight_only_scalar_swapped(
             acc, tl.reshape(a, (BLOCK_SIZE_K,)), w, w_scale,
