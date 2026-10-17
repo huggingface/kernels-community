@@ -55,9 +55,6 @@ from triton.runtime.autotuner import (
 
 logger = logging.getLogger(__name__)
 
-# Retune crowns produced before the ordinal/interior anchor policy.
-_TUNING_POLICY = "ordinal-interior-anchors"
-
 # Env-gated host-execution counter (FINEGRAINED_AUTOTUNE_CALLCOUNT=<path>): every
 # BayesianAutotuner.run() call increments its kernel's tally, dumped to <path> at exit.
 # Discriminates cudagraph REPLAY (host code runs only at capture) from per-token
@@ -749,7 +746,6 @@ class BayesianAutotuner(Autotuner):
             fn = fn.fn
         env_vars = get_cache_invalidating_env_vars()
         cache_key = [
-            _TUNING_POLICY,
             triton_key(),
             make_backend(driver.active.get_current_target()).hash(),
             fn.cache_key,
