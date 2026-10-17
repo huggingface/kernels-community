@@ -80,7 +80,6 @@ import os
 import random
 import subprocess
 import sys
-from functools import partial
 from types import SimpleNamespace
 
 import argparse
@@ -131,7 +130,6 @@ _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "torch-ext"))
 sys.path.insert(0, os.path.join(_ROOT, "tests"))
 import finegrained_kernels as fgm  # noqa: E402  local branch
-from finegrained_kernels.loading.scales import dequant_block_fp8_weight  # noqa: E402
 from kernels import get_kernel  # noqa: E402
 
 # kernels-community IS a trusted publisher, so the check passes whenever it can reach the Hub
@@ -445,13 +443,13 @@ FULL_MOE_PROBLEMS = {
     "unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4)": dict(
         E=128, H=6144, I=6144, top_k=4, weights="fp8_tensor", activation_format="bf16",
         baselines=("finegrained-kernels-unfused", "torch_weight_only", "torch_weight_only_compiled",
-                   "torch_predequantized", "finegrained-kernels-predequantized", "marlin"), fp8_block=None, block_size=None,
+                   "marlin"), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=None, swiglu_limit=None, weight_std=0.02,
     ),
     "unknown model FP8 W8A16 block128 (E128 H6144 I6144 top4)": dict(
         E=128, H=6144, I=6144, top_k=4, weights="fp8_128x128", activation_format="bf16",
         baselines=("finegrained-kernels-unfused", "torch_weight_only", "torch_weight_only_compiled",
-                   "torch_predequantized", "finegrained-kernels-predequantized", "marlin"), fp8_block=[128, 128], block_size=(128, 128),
+                   "marlin"), fp8_block=[128, 128], block_size=(128, 128),
         act="silu", swiglu_alpha=None, swiglu_limit=None, weight_std=0.02,
     ),
 }
@@ -606,11 +604,11 @@ ATTN_PROBLEMS = {
     ),
     "unknown model FP8 W8A16 tensor linear (N=8192 K=6144)": dict(
         N=8192, K=6144, weights="fp8_tensor", activation_format="bf16",
-        block=None, baselines=("torch_weight_only", "torch_weight_only_compiled", "torch_predequantized", "marlin"), weight_std=0.02,
+        block=None, baselines=("torch_weight_only", "torch_weight_only_compiled", "marlin"), weight_std=0.02,
     ),
     "unknown model FP8 W8A16 block128 linear (N=8192 K=6144)": dict(
         N=8192, K=6144, weights="fp8_128x128", activation_format="bf16",
-        block=[128, 128], baselines=("torch_weight_only", "torch_weight_only_compiled", "torch_predequantized", "marlin"), weight_std=0.02,
+        block=[128, 128], baselines=("torch_weight_only", "torch_weight_only_compiled", "marlin"), weight_std=0.02,
     ),
 }
 MODES = ["eager", "cudagraph", "compile"]
@@ -632,8 +630,6 @@ IMPL_COLORS = {
     "finegrained-kernels-unfused": "#6baed6",
     "torch_weight_only": "#e377c2",
     "torch_weight_only_compiled": "#bc80bd",
-    "torch_predequantized": "#9467bd",
-    "finegrained-kernels-predequantized": "#393b79",
     "marlin": "#17becf",
     "torch_mm": "#e377c2",  # torch/cuBLAS F.scaled_mm (the attn-row sibling)
 }
@@ -650,10 +646,6 @@ def _impl_label(impl, regime):
         return "torch runtime dequant + BF16 GEMM"
     if impl == "torch_weight_only_compiled":
         return "torch compiled runtime dequant + matmul"
-    if impl == "torch_predequantized":
-        return "torch BF16 GEMM (2x weight storage)"
-    if impl == "finegrained-kernels-predequantized":
-        return "finegrained-kernels BF16 (2x weight storage)"
     if impl == "marlin":
         return "vLLM Marlin FP8 W8A16"
     if impl == "transformers":
@@ -941,15 +933,6 @@ def dequantize_fp8_weight(weight, scale, block):
     shape = (*weight.shape[:-2], n // block[0], block[0], k // block[1], block[1])
     values = weight.float().reshape(shape) * scale.float()[..., :, None, :, None]
     return values.reshape(weight.shape).to(torch.bfloat16)
-
-
-def predequantized_moe_arm(arm, cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
-    """Resident BF16 controls: dequantize the same weights once, outside timing."""
-    gu = dequant_block_fp8_weight(gu, gus, hidden.dtype)
-    dn = dequant_block_fp8_weight(dn, dns, hidden.dtype)
-    _mark_static(gu, dn)
-    cfg = dict(cfg, weights="bf16", activation_format="bf16", fp8_block=None, block_size=None)
-    return arm(cfg, grouped, hidden, idx, w, gu, None, dn, None, None, None)
 
 
 def torch_weight_only_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
@@ -1394,8 +1377,6 @@ ARMS = {
     "finegrained-kernels-unfused": moe_unfused_arm,
     "torch_weight_only": torch_weight_only_arm,
     "torch_weight_only_compiled": torch_weight_only_compiled_arm,
-    "torch_predequantized": partial(predequantized_moe_arm, transformers_arm),
-    "finegrained-kernels-predequantized": partial(predequantized_moe_arm, moe_fused_arm),
     "marlin": marlin_weight_only_arm,
     "finegrained-fp8": fp8_fused_arm,
     "finegrained-fp8_unfused": fp8_unfused_arm,
@@ -1651,9 +1632,6 @@ def bench_attn_row(row, pname, cfg, rows_out):
                 Ws.reshape(()), ScalingType.TensorWise,
                 output_dtype=torch.bfloat16)
 
-    if "torch_predequantized" in cfg["baselines"]:
-        W_bf16 = WEIGHTS[cfg["weights"]]["dequant"](W[None], Ws[None])[0].to(torch.bfloat16)
-        _mark_static(W_bf16)
     if "marlin" in cfg["baselines"] and fused_marlin_moe is not None:
         layer = torch.nn.Module()
         layer.weight = torch.nn.Parameter(W, requires_grad=False)
@@ -1690,8 +1668,6 @@ def bench_attn_row(row, pname, cfg, rows_out):
             attn_arms["torch_weight_only_compiled"] = torch.compile(
                 attn_arms["torch_weight_only"], fullgraph=True, mode="max-autotune-no-cudagraphs"
             )
-        if "torch_predequantized" in cfg["baselines"]:
-            attn_arms["torch_predequantized"] = lambda: torch.nn.functional.linear(x, W_bf16)
         if "marlin" in cfg["baselines"] and fused_marlin_moe is not None:
             attn_arms["marlin"] = lambda: apply_fp8_marlin_linear(
                 x, layer.weight, layer.weight_scale, layer.workspace, N, K, None
@@ -2115,8 +2091,7 @@ fig.suptitle(f"{benchmark_title}  "
              f"({device_name}, real model shapes; decode=cudagraph+compile, "
              f"prefill={'eager+compile' if weight_only_only else 'eager'})", y=0.9995)
 if weight_only_only:
-    fig.text(0.5, 0.01, "unknown model: FP8 W8A16, tensor/block128 scales, BF16 activations, fixed operands. "
-             "Resident BF16 controls use 2x weight storage.\n"
+    fig.text(0.5, 0.01, "unknown model: FP8 W8A16, tensor/block128 scales, BF16 activations, fixed operands.\n"
              "FP8 arms dequantize at runtime; native baseline is compiled (raw eager timings remain in CSV). "
              "Hatches show compile wins.",
              ha="center", va="bottom", fontsize=9)
