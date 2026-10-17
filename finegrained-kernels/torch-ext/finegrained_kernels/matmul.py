@@ -1824,9 +1824,9 @@ def mx_weight_only_matmul_2d(
 # capture is fine (measured under do_bench_cudagraph).
 
 _SCALED_MM_MIN_M = int(os.environ.get("FINEGRAINED_SCALED_MM_MIN_M", "2"))
-# Row-wise FP8 uses cuBLAS between the decode and large-prefill Triton paths.
+# Row-wise FP8 keeps Triton decode; the public path wins through the measured M=8192.
 _SCALED_MM_ROWWISE_MIN_M = int(os.environ.get("FINEGRAINED_SCALED_MM_ROWWISE_MIN_M", "65"))
-_SCALED_MM_ROWWISE_MAX_M = int(os.environ.get("FINEGRAINED_SCALED_MM_ROWWISE_MAX_M", "4096"))
+_SCALED_MM_ROWWISE_MAX_M = int(os.environ.get("FINEGRAINED_SCALED_MM_ROWWISE_MAX_M", "8193"))
 
 
 def _scaled_mm_2d(

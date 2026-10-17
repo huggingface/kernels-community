@@ -543,7 +543,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped_kernel(
     Grouped expert scheduling with pre-quantized activations plus per-token activation scales
     and a per-expert weight scale constant along K (per tensor, or per output row), both folded
     after the loop. ``GATE`` fuses the gate|up projection (``B`` the ``(E, 2N, K)`` stack, its
-    scales stacked alike) into a ``[BK, 2*BN]`` dot + SwiGLU ``glu``, emitting the bf16
+    scales interleaved alike) into a ``[BK, 2*BN]`` dot + SwiGLU ``glu``, emitting the bf16
     intermediate; ``GATE=False`` is the plain GEMM (bit-identical)."""
     start_pid = tl.program_id(axis=0)
     if PACKED_SCHEDULE:

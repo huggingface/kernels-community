@@ -524,8 +524,7 @@ def moe_fused_batched(
     # row from the unexpanded hidden in-kernel (no copy).
     # (C, Cs) under a requant format; a bare Tensor on the full-precision path
     static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
-    # see the grouped sibling: the down quantizes the bf16 intermediate per token — measured faster
-    # here than the unstacked gate + one-kernel GLU requant (37.0 vs 45.3us, Llama 4 E=16, T=1)
+    # A per-token scale spans the whole intermediate row, so the down projection quantizes it.
     per_token = per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
     gate_up_out = matmul_batched(
         hidden_states,
