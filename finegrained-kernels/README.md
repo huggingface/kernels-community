@@ -91,9 +91,6 @@ matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None,
 | MXFP4 | packed E2M1 (`int8`, 2/byte) | UE8M0 `(N, K/32)` | — |
 | NVFP4 | packed E2M1 (`int8`, 2/byte) | E4M3 `(N, K/16)` | fp32 global(s) |
 
-Row-wise FP8 supports activation gradients through `matmul_2d` and `matmul_grouped`. Its
-`matmul_batched` path currently supports inference only.
-
 Routed ops carry the expert dim in front (`(E, ...)` weights and scales). MX scales may instead be
 passed **pre-swizzled** — the 5D output of `swizzle_mx_scales` — which is the deployment contract:
 

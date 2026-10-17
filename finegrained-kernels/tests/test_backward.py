@@ -260,7 +260,8 @@ def test_inference_path_is_untouched():
     assert not out.requires_grad and torch.isfinite(out.float()).all()
 
 
-QUANT_WEIGHTS = [r for r in WEIGHTS if r not in ("bf16", "fp16")]
+# Row-wise FP8 is inference-only until the separate dgrad stream lands.
+QUANT_WEIGHTS = [r for r in WEIGHTS if r not in ("bf16", "fp16", "fp8_rowwise")]
 
 
 @pytest.mark.parametrize("weights", QUANT_WEIGHTS)
@@ -425,25 +426,3 @@ def test_dgrad_grouped_every_admitted_config_accumulates():
         tuner.configs = original_configs
         tuner.cache.clear()
     assert not wrong, f"{len(wrong)} config(s) break top-k accumulation, e.g. {wrong[0]}"
-
-
-def test_dgrad_grouped_rowwise():
-    """Routed row-wise FP8 (Llama 4 experts) through ``matmul_grouped`` and ``.backward()``: each
-    row's scale reaches the dgrad kernel as one group spanning K."""
-    torch.manual_seed(0)
-    E, S, Ne, Ke = 4, 128, 256, 256
-    B, Bs, _ = WEIGHTS["fp8_rowwise"]["make"](Ne, Ke, E)
-    expert_ids = torch.randint(0, E, (S,), device=TEST_DEVICE, dtype=torch.int32)
-    expert_start, gather_idx, scatter_idx = fg.scheduling.compute_grouped_scheduling(expert_ids, E, 1)
-    A = torch.randn(S, Ke, device=TEST_DEVICE, dtype=torch.bfloat16, requires_grad=True)
-    grad_out = torch.randn(S, Ne, device=TEST_DEVICE, dtype=torch.bfloat16)
-
-    out = fg.matmul_grouped(
-        A, B, None, Bs, expert_start=expert_start, gather_idx=gather_idx, scatter_idx=scatter_idx,
-        output_dtype=torch.bfloat16,
-    )
-    out.backward(grad_out)
-
-    W = WEIGHTS["fp8_rowwise"]["dequant"](B, Bs)
-    ref = torch.einsum("sn,snk->sk", grad_out.float(), W[expert_ids.long()])
-    assert _rel(A.grad, ref) < 1e-2, f"row-wise grouped dA vs dequantized reference: {_rel(A.grad, ref):.2e}"

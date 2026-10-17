@@ -85,7 +85,7 @@ from .pruners import (
     smem_pruner,
     warp_spec_compile_guard_pruner,
 )
-from .formats import global_scale_stride, normalize_global_scale, normalize_per_expert_scale
+from .formats import global_scale_stride, normalize_global_scale
 from .quant import e2m1_cols_to_bf16, e2m1_cols_to_f32
 from .loading.scales import decode_group_scale
 from .loading.tiles import load_grouped_act_tile, operand_tile_ptrs
@@ -96,11 +96,6 @@ from .scheduling import build_tile_layout, resolve_grouped_tile
 # ``register_autograd`` (the table at the bottom of this file), so an ordinary forward call
 # differentiates and there is
 # no second entry point to keep in sync. Nothing here is re-exported from the package root.
-
-
-def _tile_tiles_groups(block_k: int, group: int) -> bool:
-    group = max(group, 1)
-    return block_k % group == 0 or group % block_k == 0
 
 
 @triton.jit
@@ -120,17 +115,6 @@ def _dgrad_load_weight(
     else:
         w = b_descriptor.load([n_off, kb_off])
     return w
-
-
-@triton.jit
-def _dgrad_scale_cols(pid_k, K, BLOCK_SIZE_K: tl.constexpr, SCALE_GROUP_K: tl.constexpr):
-    """The scale-grid columns a ``BLOCK_SIZE_K`` output tile reads, clamped in bounds — one per
-    group, or the single column a group wider than the tile covers."""
-    GROUP: tl.constexpr = SCALE_GROUP_K if SCALE_GROUP_K < BLOCK_SIZE_K else BLOCK_SIZE_K
-    return tl.minimum(
-        (pid_k * BLOCK_SIZE_K) // SCALE_GROUP_K + tl.arange(0, BLOCK_SIZE_K // GROUP),
-        K // SCALE_GROUP_K - 1,
-    )
 
 
 @triton.jit
@@ -156,16 +140,14 @@ def _dgrad_weight_tile(
     bf16, and the multiply is a cheap exponent shift), fp32 for the scalar reduce, which widens
     anyway and for which the bf16/E4M3 hop is pure cost. Single return; only the taken arm
     compiles."""
-    # a group wider than the tile (a row-wise scale spans all of K) gives the tile one column
-    GROUP: tl.constexpr = SCALE_GROUP_K if SCALE_GROUP_K < BLOCK_SIZE_K else BLOCK_SIZE_K
-    NG: tl.constexpr = BLOCK_SIZE_K // GROUP
+    NG: tl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_K
     if OUT_DTYPE == tl.float32:  # scalar-reduce arm: unpack straight to fp32, no narrow hop
         vals = e2m1_cols_to_f32(w) if w.dtype == tl.uint8 else w.to(tl.float32)
         sc = decode_group_scale(w_scale).to(tl.float32)[:, :, None]
     else:  # MMA arm: dequantize in bf16, exactly as the forward's weight upcast does
         vals = e2m1_cols_to_bf16(w) if w.dtype == tl.uint8 else w.to(tl.bfloat16)
         sc = decode_group_scale(w_scale).to(tl.bfloat16)[:, :, None]
-    tile = vals.reshape(BLOCK_SIZE_N, NG, GROUP) * sc
+    tile = vals.reshape(BLOCK_SIZE_N, NG, SCALE_GROUP_K) * sc
     return tile.reshape(BLOCK_SIZE_N, BLOCK_SIZE_K).to(OUT_DTYPE)
 
 
@@ -191,8 +173,8 @@ def _dgrad_weight_tile(
             config_filter(  # the scale row advances by BN // SCALE_ROW_DIV — must be whole
                 lambda c, a: c.kwargs["BLOCK_SIZE_N"] % max(a.get("SCALE_ROW_DIV", 1), 1) == 0
             ),
-            config_filter(  # a K tile holds whole scale groups, or sits inside one
-                lambda c, a: _tile_tiles_groups(c.kwargs["BLOCK_SIZE_K"], a.get("SCALE_GROUP_K", 1))
+            config_filter(  # BK below one scale group gives NG=0 -> tl.arange(0, 0)
+                lambda c, a: c.kwargs["BLOCK_SIZE_K"] % max(a.get("SCALE_GROUP_K", 1), 1) == 0
             ),
             warp_spec_compile_guard_pruner(),
             descriptor_box_pruner("BLOCK_SIZE_K"),
@@ -245,7 +227,10 @@ def dgrad_matmul_2d_kernel(
         + tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
         K // WEIGHT_VALUES_PER_BYTE - 1,
     )
-    offs_kg = _dgrad_scale_cols(pid_k, K, BLOCK_SIZE_K, SCALE_GROUP_K)
+    offs_kg = tl.minimum(
+        (pid_k * BLOCK_SIZE_K) // SCALE_GROUP_K + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K),
+        K // SCALE_GROUP_K - 1,
+    )
     m_mask = offs_m < M
     k_mask = offs_k < K
 
@@ -384,8 +369,8 @@ def dgrad_matmul_2d(
             config_filter(  # the scale row advances by BN // SCALE_ROW_DIV — must be whole
                 lambda c, a: c.kwargs["BLOCK_SIZE_N"] % max(a.get("SCALE_ROW_DIV", 1), 1) == 0
             ),
-            config_filter(  # a K tile holds whole scale groups, or sits inside one
-                lambda c, a: _tile_tiles_groups(c.kwargs["BLOCK_SIZE_K"], a.get("SCALE_GROUP_K", 1))
+            config_filter(  # BK below one scale group gives NG=0 -> tl.arange(0, 0)
+                lambda c, a: c.kwargs["BLOCK_SIZE_K"] % max(a.get("SCALE_GROUP_K", 1), 1) == 0
             ),
             warp_spec_compile_guard_pruner(),
             descriptor_box_pruner("BLOCK_SIZE_K"),
@@ -472,7 +457,10 @@ def dgrad_matmul_grouped_kernel(
             + tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
             K // WEIGHT_VALUES_PER_BYTE - 1,
         )
-        offs_kg = _dgrad_scale_cols(pid_k, K, BLOCK_SIZE_K, SCALE_GROUP_K)
+        offs_kg = tl.minimum(
+            (pid_k * BLOCK_SIZE_K) // SCALE_GROUP_K + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K),
+            K // SCALE_GROUP_K - 1,
+        )
         b_base = B + expert_id64 * stride_b_e
         bs_base = Bs + expert_id64 * stride_bs_e
 
@@ -805,7 +793,10 @@ def dgrad_matmul_batched_kernel(
         + tl.arange(0, BLOCK_SIZE_K // WEIGHT_VALUES_PER_BYTE),
         K // WEIGHT_VALUES_PER_BYTE - 1,
     )
-    offs_kg = _dgrad_scale_cols(pid_k, K, BLOCK_SIZE_K, SCALE_GROUP_K)
+    offs_kg = tl.minimum(
+        (pid_k * BLOCK_SIZE_K) // SCALE_GROUP_K + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_K),
+        K // SCALE_GROUP_K - 1,
+    )
     b_base = B + expert_id * stride_b_e
     bs_base = Bs + expert_id * stride_bs_e
 
@@ -995,13 +986,9 @@ _register(
 )
 
 # per-tensor FP8: a scalar scale is orientation-free, so the same route needs no reorientation.
-# A row-wise scale binds to N, the dgrad contraction axis, so it takes the natural-tile route.
 _register(
     "w8a8_tensor_dynamic_fp8_matmul", saved=(1, 2),
-    dgrad=lambda ctx, dY, B, Bs: (
-        _dgrad_transposed_weight(dY, B, Bs, ctx.a_dtype) if Bs.numel() == 1
-        else _dgrad_mx(dY, B, Bs, None, ctx.a_dtype)
-    ),
+    dgrad=lambda ctx, dY, B, Bs: _dgrad_transposed_weight(dY, B, Bs, ctx.a_dtype),
 )
 
 # MX / NVFP4: per-row group scales bind to K and packed E2M1 packs along K, so the weight cannot
@@ -1054,16 +1041,6 @@ _register(
 _register(
     "w8a8_block_dynamic_fp8_matmul_grouped", saved=(1, 3, 4, 14, 15),
     dgrad=lambda ctx, dY, B, Bs, es, gi, si: _dgrad_grouped(ctx, dY, B, Bs, es, gi, si, None),
-)
-
-# Routed MoE, tensor-wide / row-wise FP8: a per-expert scalar is broadcast down the rows by stride
-# so both are the row-wise grid (one group spanning K, one row per scale). Positional slots: B=1,
-# Bs=3, expert_start=4, gather_idx=13, scatter_idx=14.
-_register(
-    "w8a8_tensor_dynamic_fp8_matmul_grouped", saved=(1, 3, 4, 13, 14),
-    dgrad=lambda ctx, dY, B, Bs, es, gi, si: _dgrad_grouped(
-        ctx, dY, B, normalize_per_expert_scale(Bs, B.shape[0]).expand(*B.shape[:2], 1), es, gi, si, None
-    ),
 )
 
 # The batched experts forward is a SELECTABLE dispatch in transformers, not a decode-only path, so
