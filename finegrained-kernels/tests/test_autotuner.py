@@ -387,6 +387,9 @@ def test_runoff_winner_uses_remeasured_candidates(monkeypatch):
     def kernel(BLOCK: tl.constexpr):
         pass
 
+    # Exercise runoff even when the surrounding correctness run limits tuning to one trial.
+    monkeypatch.setattr(kernel, "n_trials", len(configs))
+    monkeypatch.setattr(kernel, "runoff", True)
     samples = {16: iter((1.0, 6.0)), 32: iter((2.0, 5.0)),
                64: iter((3.0, 7.0)), 128: iter((4.0,))}
     monkeypatch.setattr(kernel, "_bench", lambda *args, config, **kwargs: next(samples[config.kwargs["BLOCK"]]))
