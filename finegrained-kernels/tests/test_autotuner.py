@@ -375,3 +375,20 @@ def test_basin_anchors_cover_interior_and_wide_output_tiles():
     assert [(c.kwargs["BLOCK_SIZE_M"], c.kwargs["BLOCK_SIZE_N"]) for c in anchors] == [
         (64, 128), (128, 256), (64, 128), (128, 256),
     ]
+
+
+@pytest.mark.kernels_ci
+def test_runoff_winner_uses_remeasured_candidates(monkeypatch):
+    """A fourth tile's stale search sample must not beat the runoff's three fresh samples."""
+    configs = [triton.Config({"BLOCK": block}) for block in (16, 32, 64, 128)]
+
+    @bayesian_autotune(configs, [], n_trials=4, basin_probes=False, max_refine_iters=0)
+    @triton.jit
+    def kernel(BLOCK: tl.constexpr):
+        pass
+
+    samples = {16: iter((1.0, 6.0)), 32: iter((2.0, 5.0)),
+               64: iter((3.0, 7.0)), 128: iter((4.0,))}
+    monkeypatch.setattr(kernel, "_bench", lambda *args, config, **kwargs: next(samples[config.kwargs["BLOCK"]]))
+    winner = kernel._bayesian_search(configs, (), {}, ())
+    assert winner.kwargs["BLOCK"] == 32

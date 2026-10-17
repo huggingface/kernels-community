@@ -602,21 +602,24 @@ class BayesianAutotuner(Autotuner):
         # the top candidates back-to-back — same warmed process, adjacent in time, so they see
         # the same clocks — and crown the winner of THAT comparison. Costs ~3 extra benches.
         finite = sorted((t, i) for i, t in timings.items() if t != float("inf"))
+        finalists = list(timings)
         if self.runoff and len(finite) > 1:
-            for _, i in finite[:3]:
+            finalists = [i for _, i in finite[:3]]
+            for i in finalists:
                 timings.pop(i, None)
                 bench_idx(i)  # memoizing closure: re-benches and re-records the popped entry
 
         self.configs_timings = {configs[i]: t for i, t in timings.items()}
-        best = min(timings, key=timings.get)
+        # Other candidates still carry search-time samples, not comparable runoff measurements.
+        best = min(finalists, key=timings.get)
         if timings[best] == float("inf"):
             # crowning an arbitrary broken config would persist it as `best` on disk and
             # every later healthy process would replay it without re-tuning — the exact
             # sticky-contaminated-context scenario inf-forgiveness exists to survive
             self._report_bench_failures()
             raise RuntimeError(
-                f"[bayesian-autotune] {self.fn_name}: every benched config failed "
-                "(all-inf tune) — nothing correct to crown or persist; the context may "
+                f"[bayesian-autotune] {self.fn_name}: every final candidate failed "
+                "— nothing correct to crown or persist; the context may "
                 "be trap-contaminated (retry in a fresh process) or the grid is broken "
                 "for this launch (see the failure report above)."
             )
