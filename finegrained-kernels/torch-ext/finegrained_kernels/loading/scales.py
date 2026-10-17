@@ -400,55 +400,45 @@ def _decode_fixed_kernel(
     E: tl.constexpr,
     ROWS: tl.constexpr,
     COLS: tl.constexpr,
-    BLOCK_ROWS: tl.constexpr,
-    PAIRS: tl.constexpr,
+    BLOCK: tl.constexpr,
     ALIGNED_OUTPUT: tl.constexpr,
 ):
-    col_tiles: tl.constexpr = tl.cdiv(COLS // 2, PAIRS)
-    tiles: tl.constexpr = tl.cdiv(ROWS, BLOCK_ROWS) * col_tiles
-    rows = tl.arange(0, BLOCK_ROWS)
-    cols = tl.arange(0, PAIRS)
-    # Decode pairs together: each row base is loaded once. Aligned workspaces
-    # store pairs as uint16; a contiguous sliced workspace can start at an odd byte.
-    output = Out.to(tl.pointer_type(tl.uint16))
+    pairs: tl.constexpr = ROWS * (COLS // 2)
+    tiles: tl.constexpr = tl.cdiv(pairs, BLOCK)
+    offsets = tl.arange(0, BLOCK)
+    # Contiguous pairs avoid padding each row to a power-of-two tile width.
+    # Keep indices local to an expert; only the expert base needs 64-bit addressing.
     for tile in range(tl.program_id(0), E * tiles, tl.num_programs(0)):
         expert = tile // tiles
-        row = ((tile % tiles) // col_tiles) * BLOCK_ROWS + rows
-        col = ((tile % tiles) % col_tiles) * PAIRS + cols
+        pair = (tile % tiles) * BLOCK + offsets
+        row = pair // (COLS // 2)
         slab = expert.to(tl.int64) * (ROWS // 16) + row // 16
         slab_bytes: tl.constexpr = 16 * (1 + COLS // 2)
-        base = tl.load(Fixed + slab * slab_bytes + row % 16, row < ROWS, other=0).to(
+        base = tl.load(Fixed + slab * slab_bytes + row % 16, pair < pairs, other=0).to(
             tl.uint16
         )
-        mask = (row[:, None] < ROWS) & (col[None, :] < COLS // 2)
         packed = tl.load(
-            Fixed
-            + slab[:, None] * slab_bytes
-            + 16
-            + (row[:, None] % 16) * (COLS // 2)
-            + col[None, :],
-            mask,
+            Fixed + slab * slab_bytes + 16 + (row % 16) * (COLS // 2) + pair % (COLS // 2),
+            pair < pairs,
             other=0,
         ).to(tl.uint16)
+        low = base + (packed & 15)
+        high = base + (packed >> 4)
+        # A contiguous sliced workspace can start at an odd byte.
         if ALIGNED_OUTPUT:
-            bits = (base[:, None] + (packed & 15)) | ((base[:, None] + (packed >> 4)) << 8)
+            output = Out.to(tl.pointer_type(tl.uint16))
             tl.store(
-                output
-                + expert.to(tl.int64) * ROWS * (COLS // 2)
-                + row[:, None] * (COLS // 2)
-                + col[None, :],
-                bits,
-                mask,
+                output + expert.to(tl.int64) * pairs + pair,
+                low | (high << 8),
+                pair < pairs,
             )
         else:
-            low = base[:, None] + (packed & 15)
-            high = base[:, None] + (packed >> 4)
             values = tl.interleave(low, high).to(tl.uint8).to(tl.float8e4nv, bitcast=True)
-            output_col = ((tile % tiles) % col_tiles) * PAIRS * 2 + tl.arange(0, PAIRS * 2)
+            output_offsets = (tile % tiles) * BLOCK * 2 + tl.arange(0, BLOCK * 2)
             tl.store(
-                Out + expert.to(tl.int64) * ROWS * COLS + row[:, None] * COLS + output_col[None, :],
+                Out + expert.to(tl.int64) * pairs * 2 + output_offsets,
                 values,
-                (row[:, None] < ROWS) & (output_col[None, :] < COLS),
+                output_offsets < pairs * 2,
             )
 
 
@@ -485,7 +475,7 @@ def _decompress_into(
     experts, rows, cols = out.shape
     with device_context(fixed.device):
         programs = min(
-            experts * triton.cdiv(rows, 64) * triton.cdiv(cols // 2, 128),
+            experts * triton.cdiv(rows * cols // 2, 4096),
             16 * sm_count(fixed.device.index),
         )
         compile_time_only_triton_wrap(_decode_fixed_kernel)[(programs,)](
@@ -494,8 +484,7 @@ def _decompress_into(
             experts,
             rows,
             cols,
-            64,
-            min(128, triton.next_power_of_2(cols // 2)),
+            4096,
             ALIGNED_OUTPUT=out.storage_offset() % 2 == 0,
         )
         if exceptions.numel():
