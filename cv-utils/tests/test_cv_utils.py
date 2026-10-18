@@ -10,7 +10,7 @@ import pytest
 import torch
 
 
-cv_utils = kernels.get_kernel("kernels-community/cv-utils", version=1)
+cv_utils = kernels.get_kernel("kernels-community/cv-utils", version=2)
 
 pytestmark = pytest.mark.kernels_ci
 
@@ -235,6 +235,17 @@ def test_cc_2d_patterns():
     # of the kernel's 2x2 blocks.
     patterns[4, 0, 1::4, 1::4] = 1
     check_cc(patterns)
+
+
+@pytest.mark.parametrize("shape", [(1, 1, 5, 7), (2, 1, 30, 46), (1, 1, 63, 65)])
+def test_connected_component_areas_any_size(shape):
+    g = torch.Generator().manual_seed(sum(shape))
+    mask = torch.rand(shape, generator=g) < 0.45
+    areas = cv_utils.connected_component_areas(mask.to(DEVICE))
+    assert areas.shape == mask.shape
+    for n in range(shape[0]):
+        _, sizes_ref = cc_ref(mask[n, 0].to(torch.uint8))
+        assert areas[n, 0].tolist() == sizes_ref
 
 
 def test_cc_2d_non_zero_values_are_foreground():

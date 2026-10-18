@@ -1,8 +1,51 @@
 ---
+license: apache-2.0
 tags:
-- kernels
+  - kernels
 ---
 
 # cv_utils
 
-This is a build for some kernel utilities for computer vision, including generic_nms and connected_components
+Kernels for computer vision pre- and post-processing.
+
+| function | computes | backend |
+|---|---|---|
+| `cc_2d` | connected-component labels of binary masks, optionally with component areas | CUDA |
+| `connected_component_areas` | the component area of every pixel of a mask of any height and width | CUDA |
+| `generic_nms` | non-maximum suppression of boxes | CUDA |
+| `resize_normalize` | antialiased resize to one size per image, center crop, rescale and normalize of uint8 images | Triton |
+| `resize_normalize_patchify` | the same, written in the Qwen2-VL `pixel_values` patch layout, for images and videos | Triton |
+
+## Usage
+
+```python
+from kernels import get_kernel
+
+cv_utils = get_kernel("kernels-community/cv-utils", version=2)
+pixel_values = cv_utils.resize_normalize(images, [(224, 224)] * len(images), image_mean, image_std, 1 / 255, "bicubic")
+```
+
+`transformers` image processors call these kernels when loaded with `use_kernels=True`.
+
+## How it works
+
+The resize is separable. One launch computes the normalized filter weights of every output row and column of every
+image into a table. A horizontal pass then resizes the width of each image into a scratch buffer, and a vertical pass
+resizes the height, rescales, normalizes and writes the output. Images of different sizes share each launch.
+
+The filter weights follow `torch.nn.functional.interpolate(..., antialias=True)`. By default (`round_to_uint8=True`),
+each pass rounds to uint8, like torchvision on uint8 tensors.
+
+`resize_normalize_patchify` takes uint8 `(T, C, H, W)` inputs, with `T=1` for an image, and one target size
+per input. It writes each value directly at its place in the patch layout, in `block_size x block_size` blocks of
+patches, and returns `grid_thw` as an int64 tensor.
+
+## Limitations
+
+- Inputs are uint8 `(C, H, W)` tensors on one CUDA device, with the same channel count.
+- Bilinear and bicubic only. The output is float32.
+- `resize_normalize` takes the resized size of each image from the caller, and an optional crop no larger than
+  any of them. It returns one `(C, H, W)` tensor per image.
+- `resize_normalize_patchify` needs target sizes that are multiples of `patch_size * block_size`.
+- With `round_to_uint8=True`, results can differ from torch by one uint8 level where a value falls on a rounding
+  boundary.
