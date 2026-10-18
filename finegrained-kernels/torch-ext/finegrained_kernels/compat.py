@@ -99,6 +99,12 @@ _SKIP_LAUNCHES_MIRROR = False
 
 
 
+def launches_skipped() -> bool:
+    """Whether this call runs inside an opaque op's fake impl, where only output allocation counts
+    (see ``compile_time_only_triton_wrap``) — for the non-Triton launches an op makes."""
+    return _SKIP_LAUNCHES_MIRROR
+
+
 def compile_time_only_triton_wrap(kernel):
     """``wrap_triton`` while torch.compile is tracing (required to capture a raw Triton
     launch into the graph), the bare kernel in eager. Every kernel launch goes through

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import torch
 import triton
 
@@ -124,14 +126,34 @@ def is_tensor_wide(block_size, weight: torch.Tensor) -> bool:
         block_size[0] == weight.shape[-2] and block_size[1] == weight.shape[-1]
     )
 
+def is_rowwise(weight: torch.Tensor, scale: torch.Tensor) -> bool:
+    """Row-wise FP8 weight/scale pair: E4M3 weights with one fp32 scale per output row —
+    ``scale`` ``(N, 1)`` for a 2D ``(N, K)`` weight, ``(E, N, 1)`` for a 3D stack (e.g. Llama 4
+    FP8). The block is ``(1, K)``: the scale is constant along K, so it folds once after the
+    K-loop, like a per-tensor one."""
+    return (
+        weight.dtype == torch.float8_e4m3fn
+        and scale.dtype == torch.float32
+        and scale.shape == weight.shape[:-1] + (1,)
+    )
+
+def per_token_activations(B: torch.Tensor, Bs: torch.Tensor | None) -> bool:
+    """Whether the weights take one activation scale per token: FP8 with a K-constant scale
+    (tensor-wide or row-wise). The scale spans the whole row, so a tile-local epilogue cannot
+    form it — such a GEMM never fuses the requant of its output."""
+    if Bs is None or is_mx(B, Bs):
+        return False
+    return Bs.numel() == (B.shape[0] if B.ndim == 3 else 1) or is_rowwise(B, Bs)
+
 def weight_block_size(B: torch.Tensor, Bs: torch.Tensor) -> list[int] | None:
     """The fp8 weight-quantization block ``[block_n, block_k]``, derived from the scale
     tensor's shape — the data already says how it was quantized, so no ``block_size``
-    parameter exists to disagree with it. ``None`` = tensor-wide (one scalar per expert:
-    ``Bs`` ``(E,)`` or ``(E, 1, 1)`` spanning the full ``(N, K)``). Expects a 3D
+    parameter exists to disagree with it. ``None`` = a scale constant along K, folded after
+    the K-loop by the tensor-wide kernels: one scalar per expert (``Bs`` ``(E,)`` or
+    ``(E, 1, 1)``) or one per output row (``(E, N, 1)``, ``is_rowwise``). Expects a 3D
     ``(E, N, K)`` fp8 ``B``; MX weights never reach here (format keyed by scale dtype)."""
     num_experts, n_rows, K = B.shape
-    if Bs.numel() == num_experts:
+    if Bs.numel() == num_experts or is_rowwise(B, Bs):
         return None
     assert Bs.ndim == 3 and K % Bs.shape[2] == 0, (
         f"Bs shape {tuple(Bs.shape)} does not tile B {tuple(B.shape)} along K"
@@ -236,8 +258,12 @@ def global_scale_stride(g: torch.Tensor | None) -> int:
     return 0 if g is None or g.numel() == 1 else 1
 
 def normalize_per_expert_scale(Bs: torch.Tensor, num_experts: int) -> torch.Tensor:
-    """One per-tensor scale per expert, normalized to ``(num_experts, 1, 1)`` from
-    either that or a bare ``(num_experts,)``."""
+    """A K-constant weight scale in the tensor-wide kernels' ``(num_experts, rows, 1)`` layout:
+    one per-tensor scale per expert (``rows`` 1, from that or a bare ``(num_experts,)``), or a
+    row-wise ``(num_experts, N, 1)`` passed through. The kernels read row ``n`` at
+    ``n * stride(1)``, so ``row_scale_stride`` broadcasts the per-tensor one."""
+    if Bs.ndim == 3 and Bs.shape[0] == num_experts and Bs.shape[1] > 1 and Bs.shape[2] == 1:
+        return Bs
     if Bs.ndim == 1:
         assert Bs.shape[0] == num_experts, (
             f"Bs shape {tuple(Bs.shape)} != expected ({num_experts},)"
@@ -247,6 +273,11 @@ def normalize_per_expert_scale(Bs: torch.Tensor, num_experts: int) -> torch.Tens
         f"Bs shape {tuple(Bs.shape)} != expected ({num_experts}, 1, 1)"
     )
     return Bs
+
+def row_scale_stride(Bs: torch.Tensor) -> int:
+    """The output-row stride of a K-constant weight scale (``normalize_per_expert_scale``, or a
+    2D ``(N, 1)`` / scalar one): 0 broadcasts a per-tensor scale to every row."""
+    return 0 if Bs.ndim < 2 or Bs.shape[-2] == 1 else Bs.stride(-2)
 
 def mx_scale_family(Bs: torch.Tensor, K: int) -> int:
     """The group size of an MX/NV weight-scale tensor, in either layout — the wrapper hands ``Bs``
@@ -298,13 +329,14 @@ def check_activation_format(activation_format: str | None, quantize_output: bool
     ==================  ===============================================================
     block-dynamic FP8   None / "fp8" (E4M3 + per-block scales); quantize_output ok
     tensor-wide FP8     None / "fp8" (E4M3 + per-token scales); no quantize_output
+    row-wise FP8        None / "fp8" (E4M3 + per-token scales); no quantize_output
     MXFP8 / MXFP4       None / "mxfp8" (E4M3 + UE8M0) / "mxfp4" (packed E2M1 + UE8M0) / "bf16"
     NVFP4               None / "nvfp4" (packed E2M1 + E4M3 group-16) / "bf16"
     full-precision      None (nothing to quantize)
     ==================  ===============================================================
 
-    (Tensor-wide's whole-row activation scale can't be formed by a tile-local epilogue; the unfused
-    path quantizes on the host between GEMMs.) A format the weight family doesn't support fails
+    (A per-token activation scale spans the whole row, which a tile-local epilogue can't form; the
+    next GEMM quantizes the intermediate instead.) A format the weight family doesn't support fails
     loudly at the op."""
     assert activation_format in ACTIVATION_FORMATS, (
         f"unknown activation_format {activation_format!r}; expected one of {ACTIVATION_FORMATS}"
@@ -312,6 +344,18 @@ def check_activation_format(activation_format: str | None, quantize_output: bool
     assert not (quantize_output and activation_format == "bf16"), (
         "quantize_output needs quantized activations (activation_format='bf16' is weight-only)"
     )
+
+
+def check_activation_scale_ub(A, As, B, Bs, activation_format, activation_scale_ub):
+    """An amax cap controls dynamic per-token FP8 quantization on row-wise weights."""
+    if activation_scale_ub is None:
+        return
+    if not math.isfinite(activation_scale_ub) or activation_scale_ub <= 0:
+        raise ValueError("activation_scale_ub must be finite and positive")
+    if Bs is None or not is_rowwise(B, Bs) or activation_format not in (None, "fp8"):
+        raise ValueError("activation_scale_ub requires row-wise FP8 weights and FP8 activations")
+    if As is not None or A.dtype == torch.float8_e4m3fn:
+        raise ValueError("activation_scale_ub requires raw activations without a calibrated activation scale")
 
 
 def weight_format(B: torch.Tensor, Bs: torch.Tensor) -> str:

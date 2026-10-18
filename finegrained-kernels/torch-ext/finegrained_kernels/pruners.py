@@ -887,6 +887,41 @@ def raw_activation_pointer_pruner():
     return config_filter(ok)
 
 
+def native_mma_m_pruner():
+    """Keep native tcgen05 M tiles for plain FP8 on sm_10x. Narrow unswapped
+    tiles lower to warp MMA and lose warm-cache performance; swapped decode tiles
+    use the weight-row dimension as MMA M and remain eligible."""
+
+    def ok(c, args):
+        return bool(c.kwargs.get("SWAP_AB")) or config_dim(c, args, "BLOCK_SIZE_M") >= 64
+
+    return config_filter(ok, when=lambda args: is_sm10x())
+
+
+def single_row_tile_pruner():
+    """Avoid replicating a single token across a BM=16 warp-MMA tile on sm_10x.
+    BM=1 retains the same compute path with less replicated work."""
+
+    def ok(c, args):
+        return config_dim(c, args, "BLOCK_SIZE_M") == 1
+
+    return config_filter(ok, when=lambda args: is_sm10x())
+
+
+def swap_decode_scope_pruner(max_m: int = 16):
+    """``early_config_prune`` scoping a 2D plain-dot kernel's ``SWAP_AB`` rows (BM=1: the weight's
+    output rows in the MMA M dim, the token padded to the N=16 atom) to decode M, where they run
+    one program row per token, and to a pointer-mode activation (an A-side descriptor under
+    ``SWAP_AB`` traps on Triton 3.8, see ``mx_2d_swap_scope_pruner``). Unswapped rows pass."""
+
+    def ok(c, args):
+        if not c.kwargs.get("SWAP_AB"):
+            return True
+        return args["M"] <= max_m and c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
+
+    return config_filter(ok)
+
+
 def mx_2d_swap_scope_pruner(max_m: int = 16):
     """``early_config_prune`` scoping the 2D mx kernel's ``SWAP_AB`` rows to the ONE regime
     they exist for: E4M3-scale (NVFP4) single-token decode. NVFP4 has no other native M=1
@@ -1179,7 +1214,11 @@ def descriptor_box_pruner(k_dim="BLOCK_SIZE_K"):
             b = args.get("B")
             if b is not None and getattr(b, "ndim", 0) == 2 and b.stride(-1) != 1:
                 return False
+            if "BDescriptor" in args and args["BDescriptor"] is None:
+                return False
         if c.kwargs.get("A_MEMORY_MODE", "pointer") != "pointer":
+            if "ADescriptor" in args and args["ADescriptor"] is None:
+                return False
             # descriptor A, both arms tuner-routed per the tokens-per-expert key:
             # contiguous boxes (no gather) win at dense routing (-7.1/-7.4%) and lose at
             # skew; tma gather4 (gathered rows, 1-row box, sm_100 only) is MONOTONIC in

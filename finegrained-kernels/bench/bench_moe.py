@@ -25,7 +25,7 @@ Rows (each row = decode | prefill subplot pair in the figure):
                                      transformers@main contributes its two-GEMM experts dispatch
   unquantized (BF16)  finegrained-kernels fused vs transformers grouped_mm/batched_mm vs SonicMoE
                       vs DeepGEMM grouped BF16
-  linear quantized      matmul_2d, one qkv-proj-shaped linear (N=3H, K=H) per model in
+  linear quantized      matmul_2d, one qkv-proj-shaped linear per model in
                       its deployment format — FP8 128x128 (finegrained-kernels/finegrained-fp8/DeepGEMM), MXFP4
                       W4A4 (finegrained-kernels W4A4, finegrained-fp8 W4A8, DeepGEMM FP4), NVFP4 (finegrained-kernels only),
                       MXFP8 (finegrained-kernels/finegrained-fp8)
@@ -41,11 +41,12 @@ the unquantized row; baselines per problem):
                                               block scales (the B200 deployment format;
                                               DeepGEMM SM100 rejects fp32 scales by design)
   MiniMaxAI/MiniMax-M3     MXFP8 W8A8         finegrained-fp8 (no TRT-LLM: clamped SwiGLU)
+  meta-llama/Llama-4-Scout rowwise FP8 W8A8  torch, FBGEMM, vLLM (TRT-LLM rowwise unavailable on B200)
   unknown model          FP8 W8A16          E128 H6144 I6144 top4, tensor/block scales
 
 The TRT-LLM arms are FlashInfer's ``trtllm_*_routed_moe`` kernels — the backends vLLM's
 serving path dispatches to on Blackwell for these quant modes (its own triton fused-MoE
-covers only bf16 and block-FP8). Weight prep and activation quant come from THEIR stack,
+covers bf16 and FP8). Weight prep and activation quant come from THEIR stack,
 so each bar is that integration end-to-end.
 
 Every (row, problem, regime, impl) cell runs in THREE modes:
@@ -69,6 +70,7 @@ Run: python bench/bench_moe.py                         (all rows, single GPU)
      python bench/bench_moe.py --smoke                 (fast compile check)
      python bench/bench_moe.py --no-preswizzle         (affine MX scales instead of the fast path)
      python bench/bench_moe.py gpt-oss                 (substring filter on row/problem names)
+     python bench/bench_moe.py Llama-4                 (Llama4 rowwise FP8 routed experts + QKV linear)
      python bench/bench_moe.py W8A16 --suffix _weight_only  (FP8 weight-only microbenchmarks)
      python bench/bench_moe.py --replot                (rebuild the figure from bench_moe.csv)
      python bench/bench_moe.py --mock                  (no GPU: random latencies, validates the figure layout)
@@ -80,6 +82,7 @@ import os
 import random
 import subprocess
 import sys
+from functools import partial
 from types import SimpleNamespace
 
 import argparse
@@ -123,6 +126,10 @@ if SMOKE:
     os.environ.setdefault("FINEGRAINED_AUTOTUNE_TRIALS", "3")
 
 import torch  # noqa: E402
+try:
+    from torch.nn.functional import ScalingType, scaled_mm  # noqa: E402
+except ImportError:
+    ScalingType = scaled_mm = None
 from triton.testing import do_bench, do_bench_cudagraph  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -130,6 +137,7 @@ _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "torch-ext"))
 sys.path.insert(0, os.path.join(_ROOT, "tests"))
 import finegrained_kernels as fgm  # noqa: E402  local branch
+from finegrained_kernels.quant import fp8_act_quant_tensor_wide  # noqa: E402
 from kernels import get_kernel  # noqa: E402
 
 # kernels-community IS a trusted publisher, so the check passes whenever it can reach the Hub
@@ -241,6 +249,7 @@ try:
     from vllm.model_executor.layers.fused_moe.config import fp8_w8a8_moe_quant_config as _vllm_fp8_qc  # noqa: E402
     from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8 as _vllm_group_quant  # noqa: E402
     from vllm._custom_ops import scaled_fp8_quant as _vllm_tensor_quant  # noqa: E402
+    from vllm._custom_ops import cutlass_scaled_mm as _vllm_scaled_mm  # noqa: E402
 except ImportError:
     vllm_fused_experts = None
 try:
@@ -252,6 +261,21 @@ try:
 except ImportError:
     fused_marlin_moe = None
 
+
+try:
+    import fbgemm_gpu.experimental.gen_ai  # noqa: E402,F401  registers the native operators
+    _fbgemm_rowwise_grouped = torch.ops.fbgemm.f8f8bf16_rowwise_grouped_stacked
+    _fbgemm_rowwise = torch.ops.fbgemm.f8f8bf16_rowwise
+    _fbgemm_rowwise_quant = torch.ops.fbgemm.quantize_fp8_per_row
+except (ImportError, AttributeError, OSError):
+    try:
+        import mslk.gemm  # noqa: E402,F401  registers the grouped GEMM and its compile metadata
+        from mslk.quantize.triton.fp8_quantize import quantize_fp8_row as _fbgemm_rowwise_quant  # noqa: E402
+        _fbgemm_rowwise_grouped = torch.ops.mslk.f8f8bf16_rowwise_grouped_stacked
+        _fbgemm_rowwise = torch.ops.mslk.f8f8bf16_rowwise
+    except (ImportError, AttributeError, OSError):
+        _fbgemm_rowwise_grouped = None
+        _fbgemm_rowwise = None
 # kernels-community/nvfp4-gemm — the dense NVFP4 GEMM behind transformers' `NVFP4Linear`
 # (upstream #47883). Linear-only: it never sees an MoE, because experts are fused 3-D
 # parameters rather than nn.Linear. Benched here two ways — as a 2D GEMM against our
@@ -361,7 +385,7 @@ PREFILL_TOKENS = 256 if SMOKE else 8192
 # fixed left-to-right model order for every figure row (matched by base-model prefix,
 # so GLM-5.2-NVFP4 and GLM-5.2 both land in the GLM-5.2 slot). Roughly most-baseline-
 # support first, finegrained-kernels-only (GPT-OSS, GLM-NVFP4) last.
-CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2", "Mistral-4", "unknown model"]
+CANONICAL_MODEL_ORDER = ["DeepSeek-V4", "DeepSeek-V3", "MiniMax-M3", "GPT-OSS-120B", "GLM-5.2", "Mistral-4", "Llama-4-Scout", "unknown model"]
 
 # Low-VRAM parts run the same recipes and baselines at /8 experts, /2 dims, INSTEAD OF the
 # full roster rather than alongside it. Selected off the device, not a knob, so a small part
@@ -439,6 +463,15 @@ FULL_MOE_PROBLEMS = {
         E=128, H=6144, I=3072, top_k=4, weights="mxfp8", activation_format=None,
         baselines=("finegrained-fp8",), fp8_block=None, block_size=None,
         act="silu", swiglu_alpha=1.702, swiglu_limit=7.0,
+    ),
+    "meta-llama/Llama-4-Scout-17B-16E-Instruct FP8 rowwise (E16 H5120 I8192 top1)": dict(
+        # hugging-quants/Llama-4-Scout-17B-16E-Instruct-fbgemm: one scale per weight row,
+        # dynamic per-token activations. Compare routed experts only: sigmoid input routing
+        # is prepared once for all arms; the router projection and shared expert are excluded.
+        E=16, H=5120, I=8192, top_k=1, weights="fp8_rowwise", activation_format="fp8",
+        baselines=("torch_rowwise", "fbgemm", "vllm"), fp8_block=None, block_size=(1, 5120),
+        act="silu", swiglu_alpha=None, swiglu_limit=None, router_weight_on_input=True,
+        weight_std=0.02, activation_scale_ub=1200.0,
     ),
     "unknown model FP8 W8A16 tensor (E128 H6144 I6144 top4)": dict(
         E=128, H=6144, I=6144, top_k=4, weights="fp8_tensor", activation_format="bf16",
@@ -602,6 +635,11 @@ ATTN_PROBLEMS = {
         N=18432, K=6144, weights="mxfp8", activation_format=None,
         block=None, baselines=("finegrained-fp8",),  # DeepGEMM FP8 is 128-block, not group-32 MX
     ),
+    "meta-llama/Llama-4-Scout-17B-16E-Instruct attn FP8 rowwise qkv-shaped (N=7168 K=5120)": dict(
+        # Scout uses GQA: (40 query heads + 2 * 8 KV heads) * head_dim 128.
+        N=7168, K=5120, weights="fp8_rowwise", activation_format="fp8",
+        block=None, baselines=("fbgemm", "vllm_mm"), weight_std=0.02, activation_scale_ub=1200.0,
+    ),
     "unknown model FP8 W8A16 tensor linear (N=8192 K=6144)": dict(
         N=8192, K=6144, weights="fp8_tensor", activation_format="bf16",
         block=None, baselines=("torch_weight_only", "torch_weight_only_compiled", "marlin"), weight_std=0.02,
@@ -631,7 +669,10 @@ IMPL_COLORS = {
     "torch_weight_only": "#e377c2",
     "torch_weight_only_compiled": "#bc80bd",
     "marlin": "#17becf",
+    "torch_rowwise": "#e377c2",
+    "fbgemm": "#bcbd22",
     "torch_mm": "#e377c2",  # torch/cuBLAS F.scaled_mm (the attn-row sibling)
+    "vllm_mm": "#17becf",
 }
 
 
@@ -652,6 +693,10 @@ def _impl_label(impl, regime):
         return "torch.bmm" if regime == "decode" else "torch._grouped_mm"
     if impl == "torch":
         return "torch.scaled_grouped_mm"
+    if impl == "torch_rowwise":
+        return "torch.scaled_mm (per expert)"
+    if impl == "fbgemm":
+        return "FBGEMM / MSLK"
     if impl == "torch_mm":
         return "torch.scaled_mm"
     # transformers' NVFP4Linear kernel (kernels-community/nvfp4-gemm). One name in both rows:
@@ -662,8 +707,10 @@ def _impl_label(impl, regime):
         return "nvfp4-gemm"
     if impl == "vllm":
         return "vLLM fused_moe"
+    if impl == "vllm_mm":
+        return "vLLM CUTLASS"
     if impl == "trtllm":
-        return "TRT-LLM (FlashInfer)"
+        return "FlashInfer"
     if impl == "finegrained-fp8":
         return f"finegrained-fp8@{UPSTREAM_FP8_LABEL}"
     return impl
@@ -704,7 +751,14 @@ def routing(cfg, tokens):
     torch.manual_seed(0)
     hidden = torch.randn(tokens, cfg["H"], device=DEVICE, dtype=torch.bfloat16)
     logits = torch.randn(tokens, cfg["E"], device=DEVICE)
-    w, idx = torch.topk(torch.softmax(logits, -1), cfg["top_k"], dim=-1)
+    if cfg.get("router_weight_on_input"):
+        # Llama4's top-1 sigmoid weight multiplies the expert input, before SwiGLU.
+        assert cfg["top_k"] == 1
+        scores, idx = torch.topk(logits, cfg["top_k"], dim=-1)
+        hidden = (hidden * scores.sigmoid()).to(hidden.dtype)
+        w = torch.ones_like(scores)
+    else:
+        w, idx = torch.topk(torch.softmax(logits, -1), cfg["top_k"], dim=-1)
     return hidden, idx.to(torch.int32), w, logits
 
 
@@ -803,6 +857,7 @@ def moe_fused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, *_
     _mark_static(gu, gus, dns)  # derived closure tensors: unmarked, cudagraph trees re-copy them every compiled call
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], activation_format=_activation_format(cfg),
+              activation_scale_ub=cfg.get("activation_scale_ub"),
               gate_up_proj_weight_global_scale=gu_g, down_proj_weight_global_scale=dn_g,
               **nvfp4_kw, **static_kw)
     return lambda: fn(hidden, idx, w, gu, dn, gus, dns, **kw)
@@ -821,6 +876,7 @@ def moe_unfused_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g, dn_g, 
     _mark_static(gu, gus, dns)  # derived closure tensors: unmarked, cudagraph trees re-copy them every compiled call
     kw = dict(act_fn=cfg["act"], swiglu_alpha=cfg["swiglu_alpha"],
               swiglu_limit=cfg["swiglu_limit"], activation_format=_activation_format(cfg),
+              activation_scale_ub=cfg.get("activation_scale_ub"),
               gate_up_proj_weight_global_scale=gu_g, down_proj_weight_global_scale=dn_g,
               **nvfp4_kw, **static_kw)
     return lambda: fn(hidden, idx, w, gu, dn, gus, dns, **kw)
@@ -1224,6 +1280,57 @@ def trtllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, gu_g=None, dn
     return run
 
 
+def rowwise_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_, fbgemm=False):
+    """Native rowwise GEMMs, with sort/GLU/scatter included in the forward.
+
+    Torch uses the shared Triton activation quantizer; FBGEMM uses its own per-row quantizer.
+    Both consume the same FP8 weights and per-output-channel scales without dequantizing them.
+    Torch 2.13's grouped rowwise kernel targets Hopper, so use its dense op per active expert.
+    Slice bounds are prepared once for this benchmark's fixed routing; no host sync is timed.
+    """
+    gus, dns = gus.squeeze(-1).contiguous(), dns.squeeze(-1).contiguous()
+    upper_bound = cfg["activation_scale_ub"]
+    scale_ub = torch.tensor([upper_bound], device=hidden.device)
+    _mark_static(gus, dns, scale_ub)
+    slices = []
+    if not fbgemm:
+        start = 0
+        for expert, count in enumerate(torch.bincount(idx.flatten().long(), minlength=cfg["E"]).tolist()):
+            if count:
+                slices.append((expert, start, start + count))
+            start += count
+
+    def mm(a, weight, scale, counts):
+        if fbgemm:
+            aq, a_scale = _fbgemm_rowwise_quant(a, scale_ub=scale_ub)
+            return _fbgemm_rowwise_grouped(aq, weight, a_scale, scale, counts)
+        aq, a_scale = fp8_act_quant_tensor_wide(a, a.shape[-1], amax_upper_bound=upper_bound)
+        outputs = [
+            scaled_mm(
+                aq[start:end], weight[expert].t(),
+                a_scale[start:end].reshape(-1, 1), ScalingType.RowWise,
+                scale[expert].unsqueeze(0), ScalingType.RowWise,
+                output_dtype=hidden.dtype, use_fast_accum=True,
+            )
+            for expert, start, end in slices
+        ]
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+
+    def run():
+        experts, order = torch.sort(idx.reshape(-1))
+        counts = (torch.histc(experts.float(), bins=cfg["E"], min=0, max=cfg["E"] - 1).to(torch.int64)
+                  if fbgemm else None)
+        tokens = order // cfg["top_k"]
+        gate_up = mm(hidden[tokens], gu, gus, counts)
+        gate, up = gate_up.chunk(2, dim=-1)
+        inter = _glu(gate, up, cfg).to(hidden.dtype)
+        down = mm(inter, dn, dns, counts)
+        weighted = down * w.reshape(-1)[order, None].to(down.dtype)
+        return torch.zeros_like(hidden).index_add_(0, tokens, weighted)
+
+    return run
+
+
 def vllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     """vLLM triton fused-MoE — the kernel its serving path runs for bf16, for
     block-fp8 W8A8 (the DeepSeek scheme; dynamic per-token-group act quant inside) and for
@@ -1237,7 +1344,10 @@ def vllm_moe_arm(cfg, grouped, hidden, idx, w, gu, gus, dn, dns, *_):
     tki = idx.to(torch.int32)
     tkw = w.to(torch.float32)
     qc = None
-    if cfg["fp8_block"] is not None:
+    if cfg["weights"] == "fp8_rowwise":
+        qc = _vllm_fp8_qc(w1_scale=gus, w2_scale=dns,
+                          per_act_token_quant=True, per_out_ch_quant=True)
+    elif cfg["fp8_block"] is not None:
         qc = _vllm_fp8_qc(w1_scale=gus.float(), w2_scale=dns.float(),
                           block_shape=list(cfg["fp8_block"]))
     elif cfg.get("static"):
@@ -1390,6 +1500,8 @@ ARMS = {
     "deepgemm_bf16": deepgemm_bf16_arm,
     "triton_kernels": triton_kernels_arm,
     "torch": torch_arm,
+    "torch_rowwise": rowwise_moe_arm,
+    "fbgemm": partial(rowwise_moe_arm, fbgemm=True),
     "megablocks": megablocks_arm,
 }
 
@@ -1585,7 +1697,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
     if cfg["weights"] in _MX_WEIGHTS and _quantized_acts(cfg) and not (MOCK or REPLOT):
         # both are version-gated: scaled_mm's scaling enums land in recent torch only, and
         # torchao is an optional dep — importing either at module scope would gate the whole bench
-        from torch.nn.functional import ScalingType, SwizzleType
+        from torch.nn.functional import SwizzleType
         from torchao.prototype.mx_formats.utils import to_blocked
 
         nvfp4_row = cfg["weights"] == "nvfp4"
@@ -1616,12 +1728,30 @@ def bench_attn_row(row, pname, cfg, rows_out):
                 return torch.nn.functional.scaled_mm(
                     aq, mat_b, sa, rb, sb, rb,
                     swizzle_a=swz, swizzle_b=swz, output_dtype=torch.bfloat16)
+    elif cfg["weights"] == "fp8_rowwise":
+        mat_b = W.t()
+        scale_ub = torch.tensor([cfg["activation_scale_ub"]], device=W.device)
+        _mark_static(scale_ub)
+
+        def torch_mm(a, a_scale=None):
+            aq, a_s = fp8_act_quant_tensor_wide(a, K, amax_upper_bound=cfg["activation_scale_ub"])
+            return scaled_mm(aq, mat_b, a_s, ScalingType.RowWise, Ws.t(), ScalingType.RowWise,
+                             output_dtype=a.dtype, use_fast_accum=True)
+
+        def fbgemm_mm(a):
+            aq, a_s = _fbgemm_rowwise_quant(a, scale_ub=scale_ub)
+            return _fbgemm_rowwise(aq, W, a_s, Ws.flatten(), use_fast_accum=True)
+
+        def vllm_mm(a):
+            aq, a_s = _vllm_tensor_quant(a, scale_ub=scale_ub, use_per_token_if_dynamic=True)
+            return _vllm_scaled_mm(aq, mat_b, a_s, Ws.t(), out_dtype=a.dtype)
+        if scaled_mm is None:
+            torch_mm = None
     elif cfg["weights"] == "fp8_tensor" and cfg.get("static") and not (MOCK or REPLOT):
         # per-tensor static: one fp32 scale per operand IS scaled_mm's TensorWise, so this row
         # has a like-for-like cuBLAS bar after all. The calibrated activation scale is passed in
         # rather than derived, so neither arm pays an amax pass the other doesn't.
         from finegrained_kernels.quant import quantize_rows_static
-        from torch.nn.functional import ScalingType
 
         mat_b = W.t()
 
@@ -1658,6 +1788,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
         attn_arms = {
             "finegrained-kernels": lambda: fgm.matmul_2d(
                 x, W, attn_act_scale, Ws_fgm, activation_format=_activation_format(cfg), output_dtype=torch.bfloat16,
+                activation_scale_ub=cfg.get("activation_scale_ub"),
                 b_global_scale=W_g),
         }
         if "torch_weight_only" in cfg["baselines"]:
@@ -1674,6 +1805,11 @@ def bench_attn_row(row, pname, cfg, rows_out):
             )
         if torch_mm is not None:
             attn_arms["torch_mm"] = lambda: torch_mm(x, attn_act_scale)
+        if cfg["weights"] == "fp8_rowwise":
+            if "fbgemm" in cfg["baselines"] and _fbgemm_rowwise is not None:
+                attn_arms["fbgemm"] = lambda: fbgemm_mm(x)
+            if "vllm_mm" in cfg["baselines"] and vllm_fused_experts is not None:
+                attn_arms["vllm_mm"] = lambda: vllm_mm(x)
         if "finegrained-fp8" in cfg["baselines"]:
             attn_arms["finegrained-fp8"] = lambda: upstream_fp8.matmul_2d(x, W, Ws_fp8, block,
                                                        torch.bfloat16)
@@ -1837,7 +1973,9 @@ def _run_task(kind, pname, cfg, rows_out):
         trtllm_gated_gap = (cfg["weights"] not in ("mxfp4", "nvfp4")
                             and not (cfg["swiglu_alpha"] is None and cfg["swiglu_limit"] is None))
         unavailable = (("vllm",) if vllm_fused_experts is None else ()) + (
-            ("trtllm",) if trtllm_fp8_block_scale_routed_moe is None or trtllm_gated_gap else ())
+            ("trtllm",) if trtllm_fp8_block_scale_routed_moe is None or trtllm_gated_gap else ()) + (
+            ("fbgemm",) if _fbgemm_rowwise_grouped is None else ()) + (
+            ("torch_rowwise",) if scaled_mm is None else ())
         quant_arms = tuple(a for a in quant_arms if a not in unavailable
                            and (a != "marlin" or fused_marlin_moe is not None))
         # Arms whose kernel is known to TRAP asynchronously go LAST: a trap poisons the CUDA
@@ -2095,7 +2233,12 @@ if weight_only_only:
              "FP8 arms dequantize at runtime; native baseline is compiled (raw eager timings remain in CSV). "
              "Hatches show compile wins.",
              ha="center", va="bottom", fontsize=9)
-fig.tight_layout(rect=(0, 0.05 if weight_only_only else 0, 1, 0.99))
+llama4_only = bool(FILTERS) and all("Llama-4-Scout" in problem for _, problem, *_ in rows)
+if llama4_only:
+    fig.text(0.5, 0.01, "MoE: routed experts only; sigmoid input routing prepared once; "
+             "Torch uses per-expert FP8 GEMMs. FlashInfer rowwise FP8: unavailable here.",
+             ha="center", fontsize=9)
+fig.tight_layout(rect=(0, 0.05 if weight_only_only or llama4_only else 0, 1, 0.99))
 out_png = os.path.join(_HERE, f"bench_moe{suffix}.png")
 fig.savefig(out_png, dpi=120)
 print(f"wrote {out_png}" + ("" if REPLOT else f" + bench_moe{suffix}.csv"))

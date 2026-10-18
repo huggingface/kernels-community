@@ -6,7 +6,7 @@ tags:
 
 # finegrained-kernels
 
-Triton GEMM + MoE kernels for fine-grained quantization — block/tensor FP8, MXFP8, MXFP4, and
+Triton GEMM + MoE kernels for fine-grained quantization — block/tensor/row-wise FP8, MXFP8, MXFP4, and
 two-level NVFP4 weights, with fused gate|up GLU epilogues, fused intermediate requantization, and
 expert routing — developed as part of the HuggingFace Transformers FP8 + MoE optimization effort.
 
@@ -88,6 +88,7 @@ matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None,
 | full precision | bf16 / fp16 | `None` | — |
 | block FP8 (128×128) | `float8_e4m3fn` | fp32 or UE8M0 `(⌈N/128⌉, K/128)` (the block is derived from the K dim, so K must divide) | — |
 | tensor FP8 | `float8_e4m3fn` | one scalar | — |
+| row-wise FP8 | `float8_e4m3fn` | fp32 `(N, 1)`, one per output row | — |
 | MXFP8 | `float8_e4m3fn` | UE8M0 `(N, K/32)` (raw `uint8` accepted) | — |
 | MXFP4 | packed E2M1 (`int8`, 2/byte) | UE8M0 `(N, K/32)` | — |
 | NVFP4 | packed E2M1 (`int8`, 2/byte) | E4M3 `(N, K/16)` | fp32 global(s) |
@@ -152,7 +153,9 @@ the rows. `rms_norm_rows` exposes the standalone kernel.
 `nvfp4_quantize_two_level(weight)` returns `(packed_e2m1, e4m3_block_scales, fp32_global)` — the
 canonical two-level NVFP4 weight quant (`global = amax / (6·448)`). The `*_act_quant` helpers are
 the offline activation quants the ops use internally, exposed for pre-quantized (`As`) pipelines;
-`fp8_act_quant_block_dynamic` / `fp8_act_quant_tensor_wide` are their block-FP8 siblings.
+`fp8_act_quant_block_dynamic` / `fp8_act_quant_tensor_wide` are their block-FP8 siblings;
+`fp8_act_quant_tensor_wide(x, K, amax_upper_bound=...)` is the per-token quant of the tensor-wide and
+row-wise formats, the optional bound capping each row's amax.
 
 ## Autotuning
 

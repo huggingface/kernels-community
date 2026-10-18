@@ -56,7 +56,7 @@ from .compat import (
     device_context,
     pdl_launch_kwargs,
 )
-from .formats import get_supported_act_fns, is_mx, is_mxfp4, is_per_expert_global, mx_scale_family, normalize_global_scale, ue8m0_as_uint8, weight_format
+from .formats import get_supported_act_fns, is_mx, is_per_expert_global, is_rowwise, mx_scale_family, normalize_global_scale, per_token_activations, ue8m0_as_uint8, weight_block_size, weight_format
 from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
 from .quant import _launch_act_quant, MX_ACT_QUANT, mx_act_quant_routed_scales
 from .scheduling import compute_grouped_scheduling, is_off_rank, off_rank
@@ -193,19 +193,27 @@ def weighted_reduce(
 
 
 def _validate_moe(gate_up_proj, gate_up_proj_scale, down_proj, down_proj_scale):
-    """gate_up and down must share the format (both MX or both block-dynamic FP8 — the
-    intermediate handed between them carries one quant format). Returns whether the format
-    is MX (the fused dispatchers branch on it); the fp8 quantization block is derived from
-    the scale shapes (``weight_block_size``), never passed. Scales are the pure block scales
-    (per the decoupled API — per-tensor globals ride as separate ``*_global_scale`` args);
-    the format predicates read the block scale's dtype/grouping."""
+    """Require the same weight format and FP8 scale granularity for both projections."""
     gate_up_is_mx = is_mx(gate_up_proj, gate_up_proj_scale)
-    if gate_up_is_mx != is_mx(down_proj, down_proj_scale):
-        raise ValueError(
-            "gate_up_proj and down_proj must use the same format (both MX or both block-dynamic FP8)."
+    if gate_up_proj_scale is None or down_proj_scale is None:
+        matching = (
+            gate_up_proj_scale is None
+            and down_proj_scale is None
+            and gate_up_proj.dtype == down_proj.dtype
         )
-    if is_mxfp4(gate_up_proj, gate_up_proj_scale) != is_mxfp4(down_proj, down_proj_scale):
-        raise ValueError("gate_up_proj and down_proj must use the same MX format (both MXFP4 or both MXFP8).")
+    else:
+        matching = weight_format(gate_up_proj, gate_up_proj_scale) == weight_format(down_proj, down_proj_scale)
+        if matching and not gate_up_is_mx:
+            matching = (
+                is_rowwise(gate_up_proj, gate_up_proj_scale) == is_rowwise(down_proj, down_proj_scale)
+                and weight_block_size(gate_up_proj, gate_up_proj_scale) == weight_block_size(down_proj, down_proj_scale)
+                and gate_up_proj_scale.element_size() == down_proj_scale.element_size()
+            )
+    if not matching:
+        raise ValueError(
+            "gate_up_proj and down_proj must use the same quantization recipe "
+            "(weight format and scale granularity)."
+        )
     return gate_up_is_mx
 
 
@@ -362,6 +370,7 @@ def moe_fused_grouped(
     simulate_unfused: bool = False,
     activation_format: str | None = None,
     gate: bool = True,
+    activation_scale_ub: float | None = None,
 ) -> torch.Tensor:
     """Fused grouped MoE (prefill): gather gate_up + SiLU + requant epilogue → quantized
     expert-ordered intermediate → grouped down → routing-weighted top-k reduce. Returns
@@ -373,12 +382,15 @@ def moe_fused_grouped(
     ``*_proj_input_global_scale`` pair is the NVFP4 activation second level (a checkpoint's
     calibrated per-projection ``input_scale``): the gate_up quantizes hidden against its own,
     requants the intermediate against the down's, and the down consumes that as its activation
-    global. ``None`` is dynamic quant everywhere else. ``simulate_unfused`` (testing) rounds each step through
-    the activation dtype so the output matches the unfused reference to reduce order. ``act_fn`` is a
+    global. ``None`` is dynamic quant everywhere else. Tensor-wide / row-wise FP8 hand the
+    down a bf16 intermediate it quantizes per token (a whole-row scale no epilogue tile sees).
+    ``simulate_unfused`` (testing) rounds each step through the activation dtype so the output
+    matches the unfused reference to reduce order. ``act_fn`` is a
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
     callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
     projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
-    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine."""
+    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine.
+    ``activation_scale_ub`` caps dynamic row-wise FP8 activations at both projections."""
     fmt = _block_format(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format
     )
@@ -393,6 +405,9 @@ def moe_fused_grouped(
     # intermediate. scatter_idx=None: the down reads the intermediate in place. (C, Cs) under a
     # requant format; a bare Tensor otherwise.
     static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
+    # a per-token (tensor-wide / row-wise) intermediate scale spans the whole row, which the
+    # gate_up epilogue's tiles never see: the down quantizes the bf16 intermediate instead
+    per_token = per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
     gate_up_in, gate_up_in_scale = _gate_up_activations(
         hidden_states, fmt, gate_up_proj_scale_inv, gate_up_proj_input_global_scale,
         gate_up_proj_activation_scale, scatter_idx, expert_start,
@@ -413,7 +428,8 @@ def moe_fused_grouped(
         # fmt is the resolved format; "bf16" (weight-only) leaves the GLU intermediate bf16,
         # no requant. So does static, whose epilogue has no calibrated scale to requant against.
         activation_format=fmt,
-        quantize_output=bool(glu) and fmt != "bf16" and not static_act,
+        activation_scale_ub=activation_scale_ub,
+        quantize_output=bool(glu) and fmt != "bf16" and not static_act and not per_token,
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
@@ -435,6 +451,7 @@ def moe_fused_grouped(
         bias=down_proj_bias,
         # weight-only: the intermediate is bf16 (As None) — the down goes weight-only too; a
         # quantized intermediate carries its format in its own dtypes.
+        activation_scale_ub=activation_scale_ub,
         activation_format=fmt if inter_scale is None else None,
         output_dtype=hidden_states.dtype,
         scatter_idx=scatter_idx,
@@ -478,6 +495,7 @@ def moe_fused_batched(
     simulate_unfused: bool = False,
     activation_format: str | None = None,
     gate: bool = True,
+    activation_scale_ub: float | None = None,
 ) -> torch.Tensor:
     """Fused batched MoE (decode): gate_up + SiLU + requant epilogue → per-row quantized
     intermediate → batched down → routing-weighted top-k reduce. Returns
@@ -490,13 +508,15 @@ def moe_fused_batched(
     ``*_proj_input_global_scale`` pair is the NVFP4 activation second level (a checkpoint's
     calibrated per-projection ``input_scale``): the gate_up quantizes hidden against its own,
     requants the intermediate against the down's, and the down consumes that as its activation
-    global. ``None`` is dynamic quant everywhere else. ``simulate_unfused`` (testing) rounds each
-    step through the activation dtype so the output matches the unfused reference to
+    global. ``None`` is dynamic quant everywhere else. Tensor-wide / row-wise FP8 hand the
+    down a bf16 intermediate it quantizes per token (a whole-row scale no epilogue tile sees).
+    ``simulate_unfused`` (testing) rounds each step through the activation dtype so the output matches the unfused reference to
     reduce order. ``act_fn`` is a
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
     callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
     projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
-    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine."""
+    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine.
+    ``activation_scale_ub`` caps dynamic row-wise FP8 activations at both projections."""
     fmt = _block_format(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format
     )
@@ -510,6 +530,8 @@ def moe_fused_batched(
     # row from the unexpanded hidden in-kernel (no copy).
     # (C, Cs) under a requant format; a bare Tensor on the full-precision path
     static_act = gate_up_proj_activation_scale is not None or down_proj_activation_scale is not None
+    # A per-token scale spans the whole intermediate row, so the down projection quantizes it.
+    per_token = per_token_activations(gate_up_proj, gate_up_proj_scale_inv)
     gate_up_out = matmul_batched(
         hidden_states,
         gate_up_proj,
@@ -530,11 +552,13 @@ def moe_fused_batched(
         # (down inline-quants) stays the win there. Static keeps bf16 either way, its epilogue
         # having no calibrated scale to requant against.
         activation_format=fmt,
+        activation_scale_ub=activation_scale_ub,
         quantize_output=(
             bool(glu)
             and fmt != "bf16"
             and (fmt != "fp8" or expert_ids.numel() <= GATE_UNSTACK_MAX_S)
             and not static_act
+            and not per_token
         ),
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
@@ -558,6 +582,7 @@ def moe_fused_batched(
         # weight-only / block-FP8: the intermediate is bf16 (As is None), so the down carries the
         # format and quantizes it, mirroring the unfused sibling; a quantized MX intermediate
         # carries its format in its own dtypes.
+        activation_scale_ub=activation_scale_ub,
         activation_format=fmt if inter_scale is None or fmt == "fp8" else None,
         output_dtype=hidden_states.dtype,
     )
@@ -601,6 +626,7 @@ def moe_unfused_grouped(
     swiglu_limit: float | None = None,
     activation_format: str | None = None,
     gate: bool = True,
+    activation_scale_ub: float | None = None,
 ) -> torch.Tensor:
     """Unfused grouped MoE: gate_up (plain grouped GEMM, gather hidden) → host ``apply_glu`` →
     down (plain grouped GEMM, scatter to routed rows) → routing-weighted reduce. Same math as
@@ -614,7 +640,8 @@ def moe_unfused_grouped(
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
     callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
     projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
-    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine."""
+    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine.
+    ``activation_scale_ub`` caps dynamic row-wise FP8 activations at both projections."""
     fmt = _block_format(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format
     )
@@ -651,6 +678,7 @@ def moe_unfused_grouped(
             expert_start=expert_start,
             bias=gate_up_proj_bias,
             activation_format=fmt,
+            activation_scale_ub=activation_scale_ub,
             output_dtype=hidden_states.dtype,
             gather_idx=gather_idx,
         )
@@ -667,6 +695,7 @@ def moe_unfused_grouped(
         expert_start=expert_start,
         bias=down_proj_bias,
         activation_format=fmt,
+        activation_scale_ub=activation_scale_ub,
         output_dtype=hidden_states.dtype,
         scatter_idx=scatter_idx,
     )
@@ -889,6 +918,7 @@ def moe_unfused_batched(
     swiglu_limit: float | None = None,
     activation_format: str | None = None,
     gate: bool = True,
+    activation_scale_ub: float | None = None,
 ) -> torch.Tensor:
     """Unfused batched MoE: gate_up (plain batched GEMM, gather hidden) → host ``apply_glu`` →
     down (plain batched GEMM) → routing-weighted reduce. Same math as ``moe_fused_batched`` but
@@ -901,7 +931,8 @@ def moe_unfused_batched(
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
     callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
     projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
-    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine."""
+    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine.
+    ``activation_scale_ub`` caps dynamic row-wise FP8 activations at both projections."""
     fmt = _block_format(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format
     )
@@ -931,6 +962,7 @@ def moe_unfused_batched(
             expert_ids=expert_ids,
             bias=gate_up_proj_bias,
             activation_format=fmt,
+            activation_scale_ub=activation_scale_ub,
             output_dtype=hidden_states.dtype,
             gather_idx=gather_idx,
         )
@@ -946,6 +978,7 @@ def moe_unfused_batched(
         expert_ids=expert_ids,
         bias=down_proj_bias,
         activation_format=fmt,
+        activation_scale_ub=activation_scale_ub,
         output_dtype=hidden_states.dtype,
     )
     return _torch_weighted_reduce(
