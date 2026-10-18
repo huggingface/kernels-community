@@ -109,8 +109,8 @@ class BayesianAutotuner(Autotuner):
         max_failures: int | None = None,
         n_startup_trials: int = 12,
         gamma: float = 0.25,
-        basin_probes: bool = True,
         runoff: bool = True,
+        basin_probes: bool = True,
         max_refine_iters: int = 5,
         log_path: str | None = None,
         path_anchor_axes: tuple[str, ...] = (),
@@ -137,8 +137,8 @@ class BayesianAutotuner(Autotuner):
         self.n_startup_trials = n_startup_trials
         # top fraction of measured configs the TPE treats as "good"
         self.gamma = gamma
-        self.basin_probes = os.environ.get("FINEGRAINED_AUTOTUNE_BASIN_PROBES", str(int(basin_probes))) == "1"
         self.runoff = os.environ.get("FINEGRAINED_AUTOTUNE_RUNOFF", str(int(runoff))) == "1"
+        self.basin_probes = os.environ.get("FINEGRAINED_AUTOTUNE_BASIN_PROBES", str(int(basin_probes))) == "1"
         self.max_refine_iters = int(os.environ.get("FINEGRAINED_AUTOTUNE_MAX_REFINE_ITERS", str(max_refine_iters)))
         # Branch axes (by kwarg name) that relocate the TILE optimum — the caller's
         # declaration, since it is configuration knowledge (the tuner never hardcodes
@@ -814,7 +814,7 @@ class BayesianAutotuner(Autotuner):
             # without n_trials a 3-trial exploratory winner gets replayed at 100 trials.
             str(self.keys),
             f"n_trials={self.n_trials},n_startup_trials={self.n_startup_trials},gamma={self.gamma},"
-            f"basin_probes={self.basin_probes},max_refine_iters={self.max_refine_iters},runoff={self.runoff},"
+            f"runoff={self.runoff},basin_probes={self.basin_probes},max_refine_iters={self.max_refine_iters},"
             f"coupled_axes={self.coupled_axes}",
             str(tuning_key),
         ] + [str(c) for c in configs]  # str(Config) is pre_hook-free and process-stable
@@ -951,8 +951,8 @@ def bayesian_autotune(
     max_failures: int | None = None,
     n_startup_trials: int = 12,
     gamma: float = 0.25,
-    basin_probes: bool = True,
     runoff: bool = True,
+    basin_probes: bool = True,
     max_refine_iters: int = 5,
     log_path: str | None = None,
     path_anchor_axes: tuple[str, ...] = (),
@@ -968,12 +968,12 @@ def bayesian_autotune(
                               that fail to compile/run are skipped without consuming it)
     n_startup_trials:         random seed configs before the TPE model kicks in
     gamma:                    top fraction of measured configs treated as "good"
+    runoff:                   remeasure the top candidates before choosing the winner
+                              (env override FINEGRAINED_AUTOTUNE_RUNOFF, 0 or 1)
     basin_probes:             measure categorical basin anchors before the TPE
+                              (env override FINEGRAINED_AUTOTUNE_BASIN_PROBES, 0 or 1)
     max_refine_iters:         coordinate-descent iterations after the TPE (0 disables; env
                               override FINEGRAINED_AUTOTUNE_MAX_REFINE_ITERS)
-    runoff:                   remeasure the top candidates before choosing the winner
-                              (basin_probes/runoff each have an env override:
-                              FINEGRAINED_AUTOTUNE_BASIN_PROBES/_RUNOFF, 0 or 1)
     path_anchor_axes:         branch axes (kwarg names) whose values relocate the tile
                               optimum — one guaranteed max-tile anchor per value combo
                               (see _basin_anchor_indices); the kernel declares them, the
@@ -1001,8 +1001,8 @@ def bayesian_autotune(
             max_failures=max_failures,
             n_startup_trials=n_startup_trials,
             gamma=gamma,
-            basin_probes=basin_probes,
             runoff=runoff,
+            basin_probes=basin_probes,
             max_refine_iters=max_refine_iters,
             log_path=log_path,
             path_anchor_axes=path_anchor_axes,
