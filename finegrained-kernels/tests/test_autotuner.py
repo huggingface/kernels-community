@@ -414,9 +414,9 @@ def test_coupled_axes_cross_refinement_valley(monkeypatch):
 
         monkeypatch.setattr(kernel, "n_trials", 2)
         monkeypatch.setattr(kernel, "n_startup_trials", 2)
+        monkeypatch.setattr(kernel, "runoff", False)
         monkeypatch.setattr(kernel, "basin_probes", True)
         monkeypatch.setattr(kernel, "max_refine_iters", 1)
-        monkeypatch.setattr(kernel, "runoff", False)
         monkeypatch.setattr(kernel, "_basin_anchor_indices", lambda configs: [0, 1])
         monkeypatch.setattr(
             kernel, "_bench", lambda *args, config, **kwargs: scores[(config.kwargs["BLOCK_SIZE_K"], config.num_stages)]
