@@ -157,6 +157,15 @@ the offline activation quants the ops use internally, exposed for pre-quantized 
 Every kernel is tuned by a Tree-structured Parzen Estimator (TPE, the Bayesian search Optuna
 uses) autotuner with per-shape disk caching, config pruners
 that fence compiler bugs and can't-win regions per (arch, format), and failed-compile memoization.
+Forward GEMMs tune with CUDA graph replay over identical weight banks whose active
+weight values exceed twice L2. Routed kernels count only selected expert planes. Weight
+strides and host TMA bindings are preserved; activations, scales and outputs stay shared.
+Banks are reused across candidates and released after the search. Unsupported layouts,
+excessive bank counts or insufficient memory use cold event timing, with cache clearing
+outside the measured interval. Kernels without a declared weight input also use cold events.
+Set `FINEGRAINED_AUTOTUNE_WARM_CACHE=1` before importing the kernel to opt into warm graph
+timing instead. The two modes have separate on-disk tuning results.
+Explicit benchmark callbacks, legacy timing options and user hooks retain their existing behavior.
 `FINEGRAINED_AUTOTUNE_TRIALS` overrides the trial budget. `FINEGRAINED_AUTOTUNE_RUNOFF`
 controls winner remeasurement (`0` or `1`, enabled by default).
 `FINEGRAINED_AUTOTUNE_BASIN_PROBES` controls basin probes (`0` or `1`, enabled by default).

@@ -19,6 +19,7 @@ carries its incident."""
 import logging
 import subprocess
 import sys
+import weakref
 
 import pytest
 import torch
@@ -30,6 +31,7 @@ from utils import TEST_DEVICE, make_weights
 import finegrained_kernels  # type: ignore
 import finegrained_kernels.matmul  # type: ignore
 from finegrained_kernels.bayesian_autotuner import bayesian_autotune  # type: ignore
+from finegrained_kernels.bench import weight_input  # type: ignore
 from finegrained_kernels.compat import is_sm10x  # type: ignore
 from finegrained_kernels.pruners import block_within_dim_pruner, mx_config_pruner  # type: ignore
 
@@ -242,6 +244,41 @@ def test_failed_configs_do_not_consume_trial_budget():
         ms for ms in _budget_kernel.configs_timings.values() if ms != float("inf")
     ]
     assert len(measured) == 3, _budget_kernel.configs_timings
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.skipif(TEST_DEVICE != "cuda", reason="CUDA graph timing required")
+@pytest.mark.parametrize("n_trials", [2, 3])
+def test_rotating_weights_are_reused_and_released(monkeypatch, n_trials):
+    """Cold graph tuning reuses identical banks across configs and frees them after the search."""
+    weight = torch.randn(256, device=TEST_DEVICE)
+    output = torch.empty_like(weight)
+    monkeypatch.setattr("finegrained_kernels.bench.rotation_count", lambda active_bytes, device: 3)
+    pointers, references = {}, {}
+
+    def observe(arguments):
+        value = arguments["B"]
+        pointers.setdefault(arguments["BLOCK"], set()).add(value.data_ptr())
+        references[value.data_ptr()] = weakref.ref(value)
+
+    @bayesian_autotune(
+        [triton.Config({"BLOCK": block}, pre_hook=observe) for block in (32, 64, 128)],
+        ["N"],
+        n_trials=n_trials,
+        benchmark_input=weight_input,
+        cache_results=False,
+    )
+    @triton.jit
+    def copy_weight(B, C, N, BLOCK: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        tl.store(C + offsets, tl.load(B + offsets, offsets < N, 0), offsets < N)
+
+    copy_weight[lambda meta: (triton.cdiv(256, meta["BLOCK"]),)](weight, output, 256)
+    torch.testing.assert_close(output, weight)
+    assert len(pointers) >= 2
+    assert len({frozenset(values) for values in pointers.values()}) == 1
+    assert all(len(values) == 3 for values in pointers.values())
+    assert all(reference() is None for pointer, reference in references.items() if pointer != weight.data_ptr())
 
 
 @pytest.mark.kernels_ci
