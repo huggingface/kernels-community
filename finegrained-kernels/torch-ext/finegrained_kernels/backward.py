@@ -894,7 +894,7 @@ def _dgrad_mx(dY, B, Bs, b_global, out_dtype):
     one value here, a 2D weight being one matrix."""
     if B.dtype == torch.int8:
         B = B.view(torch.uint8)
-    if Bs.dtype == torch.float8_e8m0fnu:
+    if Bs.dtype == getattr(torch, "float8_e8m0fnu", None):
         Bs = Bs.view(torch.uint8)
     values_per_byte = 2 if B.dtype == torch.uint8 else 1
     K = B.shape[-1] * values_per_byte
@@ -925,7 +925,7 @@ def _dgrad_grouped(ctx, dY, B, Bs, expert_start, gather_idx, scatter_idx, b_glob
     global folds in the kernel, which already resolves each tile's expert."""
     if B.dtype == torch.int8:
         B = B.view(torch.uint8)
-    if Bs.dtype == torch.float8_e8m0fnu:
+    if Bs.dtype == getattr(torch, "float8_e8m0fnu", None):
         Bs = Bs.view(torch.uint8)
     values_per_byte = 2 if B.dtype == torch.uint8 else 1
     K = B.shape[-1] * values_per_byte
@@ -1013,7 +1013,7 @@ def _dgrad_batched(ctx, dY, B, Bs, expert_ids, b_global):
     ``_dgrad_grouped`` is that the expert comes from a per-row index rather than sorted ranges."""
     if B.dtype == torch.int8:
         B = B.view(torch.uint8)
-    if Bs.dtype == torch.float8_e8m0fnu:
+    if Bs.dtype == getattr(torch, "float8_e8m0fnu", None):
         Bs = Bs.view(torch.uint8)
     values_per_byte = 2 if B.dtype == torch.uint8 else 1
     K = B.shape[-1] * values_per_byte

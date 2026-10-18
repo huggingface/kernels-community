@@ -14,6 +14,7 @@
 
 
 import os
+from typing import List
 
 import torch
 import triton
@@ -1023,7 +1024,7 @@ def w8a8_block_dynamic_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     Bs: torch.Tensor,
-    block_size: list[int],
+    block_size: List[int],
     output_dtype: torch.dtype | None = None,
     gate: bool = False,
     act_fn: str = "silu",
@@ -1031,7 +1032,7 @@ def w8a8_block_dynamic_fp8_matmul(
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Block-scale FP8 matmul: ``C = A @ B.T``; activations quantized offline in one pass.
 
     A:  (..., K) raw activations, bf16/fp16/fp32 (quantized to FP8 in one wrapper pass)
@@ -1133,7 +1134,7 @@ def w8a8_block_static_fp8_matmul(
     B: torch.Tensor,
     As: torch.Tensor,
     Bs: torch.Tensor,
-    block_size: list[int],
+    block_size: List[int],
     output_dtype: torch.dtype | None = None,
     gate: bool = False,
     act_fn: str = "silu",
@@ -1141,7 +1142,7 @@ def w8a8_block_static_fp8_matmul(
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Block-scale FP8 matmul with static (per-tensor) activation quantization.
 
     A:  (..., K) raw bf16/fp16 activations — pre-quantized against ``As`` in the wrapper
@@ -1260,7 +1261,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Tensor-scale FP8 matmul: ``C = A @ B.T``; activations quantized offline per row.
 
     A:  (..., K) raw activations, bf16/fp16/fp32 (flattened to (M, K)
@@ -1357,7 +1358,7 @@ def mx_dynamic_matmul(
     b_global_scale: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """MX/NVFP4 matmul ``C = A @ B.T``; activations quantized offline above the
     ``maybe_act_quant`` M threshold, inline below it. ``activation_format`` sets the
     activation grid — E4M3 (``"mxfp8"``, the default) or packed E2M1 (``"mxfp4"``,
@@ -1586,7 +1587,7 @@ def full_precision_matmul_2d(
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """Full-precision (BF16/FP16) 2D matmul ``C = A @ B.T``; no quantization anywhere. ``gate``
     fuses the ``(2N, K)`` gate|up projection into one stacked GEMM + SwiGLU, returning the
     ``[..., N]`` GLU intermediate. Returns a one-element list (mirrors the quantized 2D ops)."""
@@ -1653,7 +1654,7 @@ def mx_weight_only_matmul_2d(
     simulate_unfused: bool = False,
     b_global_scale: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     """weight-only dense matmul ``C = A @ B.T``: a RAW bf16/fp16 activation (no quant) against an
     MXFP4/NVFP4/MXFP8 weight upcast to bf16 in-loop (NVFP4's per-tensor fp32 ``b_global_scale``
     recovers on the accumulator; ``None`` = single-level) — the ``matmul_ogs`` format (fp4/fp8 weight bytes in
