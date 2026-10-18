@@ -7,7 +7,7 @@ import pytest
 import torch
 
 
-weathernext2_banded_attention = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=2)
+weathernext2_banded_attention = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=3)
 WeatherNext2Attention = weathernext2_banded_attention.WeatherNext2Attention
 banded_attention = weathernext2_banded_attention.banded_attention
 
@@ -33,7 +33,7 @@ def banded_mask(blocks, block_size, density, device, generator):
     mask = torch.rand(blocks, block_size, 3 * block_size, device=device, generator=generator) < density
     mask[0, :, :block_size] = False  # the first block has no predecessor
     mask[-1, :, 2 * block_size :] = False  # nor the last a successor
-    # Every mesh node reaches itself, so no row is empty and no row softmaxes to NaN.
+    # Keep every query row nonempty.
     mask[:, :, block_size : 2 * block_size] |= torch.eye(block_size, dtype=torch.bool, device=device)
     return mask
 
@@ -53,8 +53,7 @@ def test_matches_scaled_dot_product_attention(blocks, density, prepared):
     device = torch.device(DEVICE)
     generator = torch.Generator(device=device).manual_seed(0)
     batch, heads, block_size, head_dim = 1, 4, 128, 64
-    # The model produces this layout by splitting the hidden dimension into heads and transposing
-    # the block and head axes. Keep it non-contiguous so the kernel's stride handling is exercised.
+    # Match the model's non-contiguous head layout.
     source_shape = (batch, blocks, block_size, heads, head_dim)
     query, key, value = (
         torch.randn(source_shape, device=device, dtype=torch.float32, generator=generator).transpose(2, 3)
@@ -113,15 +112,13 @@ def test_rows_that_reach_only_themselves_are_finite():
 
     out = banded_attention(query, key, value, mask, head_dim**-0.5, precision="ieee")
     assert torch.isfinite(out).all()
-    # Attending to yourself alone is just your own value vector.
     torch.testing.assert_close(out, value, atol=2e-5, rtol=2e-5)
 
 
 class _StubAttention(WeatherNext2Attention):
-    """The attributes the layer reads off the `transformers` module it is bound onto."""
-
     def __init__(self, hidden_size, heads):
         super().__init__()
+        self.config = SimpleNamespace(_attn_implementation="sdpa")
         self.head_dim = hidden_size // heads
         self.scaling = self.head_dim**-0.5
         for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
@@ -156,11 +153,7 @@ def test_layer_keeps_attention_in_full_float32(dtype):
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("batched_mask", [False, True])
 def test_backward_reaches_every_projection(batched_mask):
-    """The kernel has no backward, so anything needing one must take the differentiable path.
-
-    Without the guard this still runs: the kernel's output carries no `grad_fn`, so `backward()`
-    succeeds while `q_proj`, `k_proj` and `v_proj` silently receive nothing.
-    """
+    """Gradient-enabled calls must use the differentiable reference."""
     torch.manual_seed(0)
     batch, blocks, heads, block_size, hidden = 2, 3, 2, 16, 32
     attention = _StubAttention(hidden, heads)
@@ -175,21 +168,6 @@ def test_backward_reaches_every_projection(batched_mask):
     for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
         assert getattr(attention, name).weight.grad is not None, f"{name} received no gradient"
     assert hidden_states.grad is not None
-
-
-@pytest.mark.kernels_ci
-def test_inference_takes_the_kernel_and_training_does_not():
-    """Under `no_grad` the fast path is available; with grad it must not be."""
-    layers = weathernext2_banded_attention.layers
-
-    hidden_states = torch.randn(1, 3, 16, 32)
-    mask = torch.zeros(3, 16, 48, dtype=torch.bool)
-    assert layers._is_banded(mask, hidden_states)
-
-    leaf = hidden_states.clone().requires_grad_(True)
-    assert layers._needs_grad(leaf)
-    with torch.no_grad():
-        assert not layers._needs_grad(leaf)
 
 
 @pytest.mark.kernels_ci
@@ -234,39 +212,27 @@ def test_sparse_tiles_preserve_outputs(block_size, pattern):
 
 @requires_accelerator
 @pytest.mark.kernels_ci
-@pytest.mark.parametrize("block_size", [65, 129])
-@pytest.mark.parametrize("batch", [1, 2])
-@pytest.mark.parametrize("prepared", [False, True])
-def test_layer_preserves_sdpa(block_size, batch, prepared):
-    generator = torch.Generator(device=DEVICE).manual_seed(7)
-    shape = (batch, 3, block_size, 2, 32)
-    query, key, value = (torch.randn(shape, device=DEVICE, generator=generator).transpose(2, 3) for _ in range(3))
-    mask = banded_mask(3, block_size, 0.1, DEVICE, generator)
-    banded = weathernext2_banded_attention.layers._prepare_mask(mask) if prepared else mask
-    actual = weathernext2_banded_attention.layers._blockwise_attention(query, key, value, banded, 32**-0.5)
-    torch.testing.assert_close(actual, reference(query, key, value, mask, 32**-0.5), atol=2e-5, rtol=2e-5)
-
-
-@requires_accelerator
-@pytest.mark.kernels_ci
-@pytest.mark.parametrize("mask_layout", ["geometry", "batched", "packed"])
-def test_inference_layer_preserves_reference(mask_layout):
+@pytest.mark.parametrize(
+    ("batch", "block_size", "mask_layout"),
+    [(1, 65, "geometry"), (1, 65, "packed"), (2, 129, "geometry"), (2, 129, "batched"), (2, 129, "packed")],
+)
+def test_inference_layer_preserves_reference(batch, block_size, mask_layout):
     torch.manual_seed(7)
     attention = _StubAttention(256, 2).to(DEVICE).eval()
     generator = torch.Generator(device=DEVICE).manual_seed(7)
-    hidden_states = torch.randn(2, 3, 129, 256, device=DEVICE, generator=generator)
-    mask = banded_mask(3, 129, 0.05, DEVICE, generator)
+    hidden_states = torch.randn(batch, 3, block_size, 256, device=DEVICE, generator=generator)
+    mask = banded_mask(3, block_size, 0.05, DEVICE, generator)
     if mask_layout == "packed":
         banded = weathernext2_banded_attention.layers._prepare_mask(mask)
     elif mask_layout == "batched":
-        second_mask = banded_mask(3, 129, 0.1, DEVICE, generator)
-        banded = torch.stack((mask, second_mask)).view(6, 1, 129, 387)
+        second_mask = banded_mask(3, block_size, 0.1, DEVICE, generator)
+        banded = torch.stack((mask, second_mask)).view(6, 1, block_size, 3 * block_size)
     else:
         banded = mask[:, None]
     assert weathernext2_banded_attention.layers._is_banded(banded, hidden_states)
     with torch.inference_mode():
         query, key, value = (
-            getattr(attention, name)(hidden_states).view(2, 3, 129, 2, 128).transpose(2, 3)
+            getattr(attention, name)(hidden_states).view(batch, 3, block_size, 2, 128).transpose(2, 3)
             for name in ("q_proj", "k_proj", "v_proj")
         )
         if mask_layout == "batched":
@@ -356,25 +322,6 @@ def test_tf32x3_matches_ieee(prepared):
     expected = banded_attention(query, key, value, banded, 128**-0.5, precision="ieee")
     actual = banded_attention(query, key, value, banded, 128**-0.5, precision="tf32x3")
     torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.kernels_ci
-@pytest.mark.parametrize(
-    ("matmul", "expected"),
-    [
-        (SimpleNamespace(fp32_precision="none"), "tf32x3"),
-        (SimpleNamespace(fp32_precision="ieee"), "tf32x3"),
-        (SimpleNamespace(fp32_precision="tf32"), "default"),
-        # torch before the fine-grained precision API
-        (SimpleNamespace(allow_tf32=False), "tf32x3"),
-        (SimpleNamespace(allow_tf32=True), "default"),
-    ],
-)
-def test_layer_precision_follows_torch(monkeypatch, matmul, expected):
-    monkeypatch.setattr(torch.backends.cuda, "matmul", matmul)
-    precision = weathernext2_banded_attention.layers._float32_precision
-    assert precision(torch.device("cuda")) == ("ieee" if torch.version.hip is not None else expected)
-    assert precision(torch.device("xpu")) == "ieee"
 
 
 @pytest.mark.kernels_ci

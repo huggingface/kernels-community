@@ -4,6 +4,7 @@
   "aiter-flash-attn-ck": ["U08QF4E6614"],
   "aiter-kernels": ["U08QF4E6614"],
   "aiter-rope": ["U08QF4E6614"],
+  "aiter-sage-attention": [],
   "bitsandbytes-mps": [],
   "causal-conv1d": [],
   "cv-utils": [],
