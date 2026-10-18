@@ -39,9 +39,7 @@ reported latency is its elapsed time divided by the bank count. Reuse inside one
 preserved. Prepared weight views and scales keep static addresses so compiled replay does not
 warm them with staging copies. No cache-flush kernel or profiler time is included in graph latency.
 
-CSV rows record `cache_policy`, `bank_count`, total `active_weight_bytes` across the banks,
-and `prepared_bytes` (the live allocation increase while the arm's bank closures are prepared;
-for dense rows, this covers the shared set of arm closures). Logs also show total checkpoint
+CSV rows record `cache_policy`; logs show bank counts, active bytes and checkpoint
 storage. Insufficient memory fails explicitly; it never falls back to warm weights. Replotting
 or merging old CSVs without matching cache metadata requires rerunning the benchmark. XPU
 retains its existing backend timing behavior and is labeled `backend_default`, not CUDA cold.

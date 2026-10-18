@@ -1571,10 +1571,10 @@ def _weight_banks(weights, active_experts=None):
     print(f"      cache: {CACHE_POLICY}; banks={count}, "
           f"active weights={count * active_bytes / 1024**2:.1f} MiB, "
           f"allocated weights={count * weight_bytes / 1024**3:.2f} GiB", flush=True)
-    return banks, count * active_bytes
+    return banks
 
 
-def bench_modes(runs, tag, active_weight_bytes, prepared_bytes):
+def bench_modes(runs, tag):
     """{mode: latency_us | None}, plus the eager output for parity. A mode that raises
     is a red CRASH cell — the other modes still run (fresh error printed inline)."""
     def run():
@@ -1582,8 +1582,7 @@ def bench_modes(runs, tag, active_weight_bytes, prepared_bytes):
         return tuple(fn() for fn in runs)
 
     count = len(runs)
-    res = dict(bank_count=count, active_weight_bytes=active_weight_bytes,
-               prepared_bytes=prepared_bytes)
+    res = {}
     out = None
     try:
         out = run()
@@ -1664,7 +1663,7 @@ def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
                                     ("prefill", PREFILL_TOKENS, True)):
         print(f"   -- {regime}")
         hidden, idx, w, logits = routing(cfg, tokens)
-        banks, active_bytes = _weight_banks(weights, idx.unique().numel())
+        banks = _weight_banks(weights, idx.unique().numel())
         inputs = [(hidden, idx, w, logits)] + [
             _clone_tensors((hidden, idx, w, logits)) for _ in banks[1:]
         ]
@@ -1673,10 +1672,8 @@ def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
         anchor_res, anchor_out = None, None
         for name in arms:
             try:
-                before = ACCELERATOR.memory_allocated()
                 runs = [ARMS[name](cfg, grouped, h, i, rw, *bank, rl)
                         for bank, (h, i, rw, rl) in zip(banks, inputs)]
-                prepared_bytes = max(0, ACCELERATOR.memory_allocated() - before)
                 if reference is not None:
                     candidate = runs[0]()
                     torch.accelerator.synchronize()
@@ -1687,7 +1684,7 @@ def bench_problem_row(row, pname, cfg, arms, weights, rows_out):
                 rows_out.append((row, pname, regime, _impl(name),
                                  {m: None for m in MODES}, None))
                 continue
-            res, out = bench_modes(runs, name, active_bytes, prepared_bytes)
+            res, out = bench_modes(runs, name)
             parity = None
             if anchor_res is None:
                 anchor_res, anchor_out = res, out
@@ -1915,11 +1912,9 @@ def bench_attn_row(row, pname, cfg, rows_out):
         print(f"   -- {regime}")
         torch.manual_seed(0)
         x = torch.randn(tokens, K, device=DEVICE, dtype=torch.bfloat16)
-        banks, active_bytes = _weight_banks(weights)
+        banks = _weight_banks(weights)
         inputs = [x] + [x.clone() for _ in banks[1:]]
-        before = ACCELERATOR.memory_allocated()
         bank_arms = [_attn_arms(cfg, hidden, bank) for bank, hidden in zip(banks, inputs)]
-        prepared_bytes = max(0, ACCELERATOR.memory_allocated() - before)
         reference = bank_arms[0]["torch_weight_only"]() if "torch_weight_only" in bank_arms[0] else None
         anchor_res, anchor_out = None, None
         for name in bank_arms[0]:
@@ -1928,7 +1923,7 @@ def bench_attn_row(row, pname, cfg, rows_out):
                 candidate = runs[0]()
                 torch.accelerator.synchronize()
                 assert torch.isfinite(candidate).all() and rel_diff(candidate, reference) < 0.05, name
-            res, out = bench_modes(runs, name, active_bytes, prepared_bytes)
+            res, out = bench_modes(runs, name)
             parity = None
             if anchor_res is None:
                 anchor_res, anchor_out = res, out
@@ -1964,7 +1959,7 @@ suffix = ARGS.suffix if ARGS.suffix is not None else (
 )
 _CSV = os.path.join(_HERE, f"bench_moe{suffix}.csv")
 _CSV_HEADER = ("category,problem,regime,impl,mode,latency_us,parity_vs_finegrained_kernels,"
-               "cache_policy,bank_count,active_weight_bytes,prepared_bytes\n")
+               "cache_policy\n")
 
 
 def _write_rows_csv(path, rows_out):
@@ -1975,9 +1970,7 @@ def _write_rows_csv(path, rows_out):
                 v = res.get(mode)
                 f.write(f'"{rr}","{p}",{reg},{i},{mode},'
                         f'{"" if v is None else f"{v:.2f}"},'
-                        f'{"" if par is None else par},{CACHE_POLICY},'
-                        f'{res.get("bank_count", "")},{res.get("active_weight_bytes", "")},'
-                        f'{res.get("prepared_bytes", "")}\n')
+                        f'{"" if par is None else par},{CACHE_POLICY}\n')
 
 
 def _load_rows_csv(path):
@@ -2011,9 +2004,6 @@ def _load_rows_csv(path):
         key = (r["category"], r["problem"], r["regime"], r["impl"])
         res, par = acc.setdefault(key, ({}, None))
         res[r["mode"]] = float(r["latency_us"]) if r["latency_us"] else None
-        for field in ("bank_count", "active_weight_bytes", "prepared_bytes"):
-            if r.get(field):
-                res[field] = int(r[field])
         if r["parity_vs_finegrained_kernels"]:
             acc[key] = (res, float(r["parity_vs_finegrained_kernels"]))
     return [(cat, p, reg, impl, res, par)
