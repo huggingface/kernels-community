@@ -30,6 +30,23 @@ Every cell runs in three modes: `eager`, `cudagraph` (decode's deployment mode),
 `compile` (`torch.compile(max-autotune, fullgraph)`). A cell that raises is a red ✕ marker;
 the others still run.
 
+On CUDA, every mode cycles through identical weight banks whose **active** weights exceed
+**twice the device's L2 cache**. For MoE, active bytes count only the experts selected by the
+unchanged routing, including weight scales. Dense layers count the whole matrix. Each bank
+has independent copies of the same inputs and routes, so compilation cannot share activation
+quantization or routing across invocations. The timed callback returns every bank's output;
+reported latency is its elapsed time divided by the bank count. Reuse inside one forward is
+preserved. Prepared weight views and scales keep static addresses so compiled replay does not
+warm them with staging copies. No cache-flush kernel or profiler time is included in graph latency.
+
+CSV rows record `cache_policy`, `bank_count`, total `active_weight_bytes` across the banks,
+and `prepared_bytes` (the live allocation increase while the arm's bank closures are prepared;
+for dense rows, this covers the shared set of arm closures). Logs also show total checkpoint
+storage. Insufficient memory fails explicitly; it never falls back to warm weights. Replotting
+or merging old CSVs without matching cache metadata requires rerunning the benchmark. XPU
+retains its existing backend timing behavior and is labeled `backend_default`, not CUDA cold.
+Previously generated figures used warm CUDA graph timing; regenerate them for cold-weight comparisons.
+
 ## The pre-swizzled fast path
 
 By default the finegrained-kernels arm feeds **pre-swizzled** (`SWIZZLE_32_4_4`) MX weight scales,
