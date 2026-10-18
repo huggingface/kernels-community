@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 
-kernel = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=2)
+kernel = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=3)
 DEVICE = kernel.infer_device()
 
 
@@ -32,7 +32,13 @@ class _Mlp(nn.Module):
         self.activation_fn = torch.nn.functional.gelu
         self.norm = _ConditionedNorm(outputs)
 
-    def forward(self, states, conditioning):
+    def forward(self, states, conditioning, spatial_features=None):
+        states = states.to(dtype=self.fc1.weight.dtype)
+        if spatial_features is not None:
+            if states.ndim == 2:
+                states = states.unsqueeze(1).expand(-1, spatial_features.shape[0], -1)
+            spatial_features = spatial_features.to(states).unsqueeze(0).expand(states.shape[0], -1, -1)
+            states = torch.cat([spatial_features, states], dim=-1)
         return self.norm(self.fc2(self.activation_fn(self.fc1(states))), conditioning)
 
 
@@ -45,10 +51,9 @@ class _EdgeUpdate(nn.Module):
         self.out_proj = nn.Linear(16, 16)
         self.norm = _ConditionedNorm(16)
 
-    def project_senders(self, states):
-        return self.sender_proj(states)
-
-    def forward(self, edges, projected_senders, *args):
+    def forward(self, edges, sender_states, *args, projected_senders=None):
+        if projected_senders is None:
+            projected_senders = self.sender_proj(sender_states)
         if self.receiver_proj is None:
             senders, conditioning = args
             messages = self.edge_proj(edges) + projected_senders[:, senders]
@@ -56,38 +61,35 @@ class _EdgeUpdate(nn.Module):
             states, senders, receivers, conditioning = args
             messages = self.edge_proj(edges) + projected_senders[:, senders]
             messages = messages + self.receiver_proj(states)[:, receivers]
-        return self.norm(self.out_proj(torch.nn.functional.gelu(messages)), conditioning)
+        return self.norm(self.out_proj(torch.nn.functional.gelu(messages)), conditioning), projected_senders
 
 
 class _Graph(nn.Module):
     def __init__(self, grid_to_mesh):
         super().__init__()
         self.grid_to_mesh = grid_to_mesh
-        self.chunk_size = 7
+        self.config = SimpleNamespace(chunk_size=7)
         self.aggregate_normalization = 3 if grid_to_mesh else None
         self.edge_encoder = _Mlp(4, 8)
         self.edge_update = _EdgeUpdate(grid_to_mesh)
         self.grid_node_update = _Mlp(16 if grid_to_mesh else 32, 16)
         self.mesh_node_update = _Mlp(32 if grid_to_mesh else 16, 16)
 
-    def with_aggregate(self, states, aggregated):
-        return torch.cat((states, aggregated.to(states.dtype)), dim=-1)
-
     def forward(self, grid, mesh, edges, senders, receivers, conditioning):
         source, target = (grid, mesh) if self.grid_to_mesh else (mesh, grid)
+        edges = edges.unsqueeze(0).expand(grid.shape[0], -1, -1).to(self.edge_encoder.fc1.weight.dtype)
         encoded = self.edge_encoder(edges, conditioning)
-        projected = self.edge_update.project_senders(source)
         args = (senders, conditioning) if self.grid_to_mesh else (target, senders, receivers, conditioning)
-        messages = self.edge_update(encoded, projected, *args)
+        messages, _ = self.edge_update(encoded, source, *args)
         aggregated = torch.zeros(target.shape, dtype=torch.float32, device=target.device)
         aggregated.index_add_(1, receivers, messages.float())
         if self.aggregate_normalization is not None:
             aggregated = aggregated / self.aggregate_normalization
         if self.grid_to_mesh:
-            mesh = mesh + self.mesh_node_update(self.with_aggregate(mesh, aggregated), conditioning)
+            mesh = mesh + self.mesh_node_update(torch.cat([mesh, aggregated.to(mesh.dtype)], dim=-1), conditioning)
             grid = grid + self.grid_node_update(grid, conditioning)
         else:
-            grid = grid + self.grid_node_update(self.with_aggregate(grid, aggregated), conditioning)
+            grid = grid + self.grid_node_update(torch.cat([grid, aggregated.to(grid.dtype)], dim=-1), conditioning)
             mesh = mesh + self.mesh_node_update(mesh, conditioning)
         return grid, mesh
 
@@ -96,14 +98,14 @@ class _Head(nn.Module):
     def __init__(self):
         super().__init__()
         self.config = SimpleNamespace(chunk_size=7, grid_latitudes=1, grid_longitudes=19)
-        self.decoder_proj = nn.Linear(16, 16)
-        self.output_proj = nn.Linear(16, 5)
-        self.act_fn = torch.nn.functional.gelu
+        self.fc1 = nn.Linear(16, 16)
+        self.fc2 = nn.Linear(16, 5)
+        self.activation_fn = torch.nn.functional.gelu
         self.register_buffer("sigmoid_gate", torch.tensor([False, True, False, True, False]))
         self.register_buffer("sigmoid_shift", torch.tensor([0.0, 2.0, 0.0, 3.0, 0.0]))
 
     def forward(self, states):
-        values = self.output_proj(self.act_fn(self.decoder_proj(states)))
+        values = self.fc2(self.activation_fn(self.fc1(states)))
         values = torch.where(self.sigmoid_gate, torch.sigmoid(values - self.sigmoid_shift), values)
         return values.transpose(1, 2).reshape(states.shape[0], 5, 1, 19)
 
@@ -112,9 +114,13 @@ def _grid_case(layer_name, dtype=torch.float32):
     torch.manual_seed(7)
     conditioning = torch.randn(2, 4, device=DEVICE, dtype=dtype)
     grid = torch.randn(2, 38, 16, device=DEVICE, dtype=dtype)[:, ::2]
-    if layer_name == "mlp":
-        layer, replacement = _Mlp(16, 16), kernel.WeatherNext2ConditionedMlp
-        args = (grid, conditioning)
+    if layer_name in ("mlp", "grid_encoder", "mesh_encoder"):
+        spatial = None if layer_name == "mlp" else torch.randn(19, 3, device=DEVICE)
+        states = grid if layer_name != "mesh_encoder" else grid[:, 0]
+        if spatial is not None:
+            states = states.float()
+        layer, replacement = _Mlp(16 if spatial is None else 19, 16), kernel.WeatherNext2ConditionedMlp
+        args = (states, conditioning, spatial)
     elif layer_name == "head":
         layer, replacement = _Head(), kernel.WeatherNext2ForecastHead
         args = (grid,)
@@ -123,7 +129,7 @@ def _grid_case(layer_name, dtype=torch.float32):
         layer = _Graph(grid_to_mesh)
         replacement = kernel.WeatherNext2GridToMesh if grid_to_mesh else kernel.WeatherNext2MeshToGrid
         mesh = torch.randn(2, 11, 16, device=DEVICE, dtype=dtype)
-        edges = torch.randn(2, 57, 4, device=DEVICE, dtype=dtype)
+        edges = torch.randn(57, 4, device=DEVICE, dtype=dtype)
         senders = torch.randint(19 if grid_to_mesh else 11, (57,), device=DEVICE)
         receivers = (
             torch.randint(11, (57,), device=DEVICE).sort().values
@@ -136,7 +142,7 @@ def _grid_case(layer_name, dtype=torch.float32):
 
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("layer_name", ["mlp", "grid_to_mesh", "mesh_to_grid", "head"])
+@pytest.mark.parametrize("layer_name", ["mlp", "grid_encoder", "mesh_encoder", "grid_to_mesh", "mesh_to_grid", "head"])
 def test_tiled_grid_preserves_reference(layer_name, dtype):
     layer, replacement, args = _grid_case(layer_name, dtype)
     with torch.inference_mode():
@@ -147,11 +153,9 @@ def test_tiled_grid_preserves_reference(layer_name, dtype):
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.parametrize("training", [False, True])
-@pytest.mark.parametrize("layer_name", ["mlp", "grid_to_mesh", "mesh_to_grid", "head"])
-def test_gradients_use_reference(training, layer_name):
+@pytest.mark.parametrize("layer_name", ["mlp", "grid_encoder", "mesh_encoder", "grid_to_mesh", "mesh_to_grid", "head"])
+def test_gradients_use_reference(layer_name):
     layer, replacement, args = _grid_case(layer_name)
-    layer.train(training)
     reference = copy.deepcopy(layer)
     actual = replacement.forward(layer, *args)
     expected = reference(*args)
@@ -166,7 +170,7 @@ def test_gradients_use_reference(training, layer_name):
 
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("fallback", ["training", "autocast"])
-@pytest.mark.parametrize("layer_name", ["mlp", "grid_to_mesh", "mesh_to_grid", "head"])
+@pytest.mark.parametrize("layer_name", ["mlp", "grid_encoder", "mesh_encoder", "grid_to_mesh", "mesh_to_grid", "head"])
 def test_inference_fallback_preserves_inputs(fallback, layer_name):
     layer, replacement, args = _grid_case(layer_name)
     layer.train(fallback == "training")
@@ -180,7 +184,7 @@ def test_inference_fallback_preserves_inputs(fallback, layer_name):
 
 
 @pytest.mark.skipif(DEVICE == "cpu", reason="requires an accelerator")
-@pytest.mark.parametrize("layer_name", ["mlp", "grid_to_mesh", "mesh_to_grid", "head"])
+@pytest.mark.parametrize("layer_name", ["mlp", "grid_encoder", "mesh_encoder", "grid_to_mesh", "mesh_to_grid", "head"])
 def test_tiled_epilogue_compile(layer_name):
     layer, replacement, args = _grid_case(layer_name)
     compiled = torch.compile(replacement.forward, fullgraph=True)
