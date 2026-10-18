@@ -41,7 +41,6 @@ from functools import cached_property, partial
 from pathlib import Path
 
 import torch
-from triton.testing import do_bench_cudagraph
 
 from typing import Dict, List
 
@@ -56,29 +55,14 @@ from triton.runtime.autotuner import (
     triton_key,
 )
 
+from .bench import do_bench
+
 logger = logging.getLogger(__name__)
 
-# Include the tuner implementation alongside Triton's kernel-source hash.
-_TUNER_SOURCE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-
-
-def _bench_graph(fn, quantiles, *, warm_cache=False):
-    """Compare graph costs with cold inputs unless warm-cache timing is requested.
-
-    Cold timing repeats cache-clear/kernel pairs while amortizing host/event overhead.
-    Those scores include the common cache-clearing cost; they are comparative costs,
-    not standalone kernel latencies.
-    """
-    cache = None if warm_cache else driver.active.get_empty_cache_for_benchmark()
-
-    def call():
-        if cache is not None:
-            driver.active.clear_cache(cache)
-        fn()
-
-    # Triton's graph timer warms up on its own stream; finish input producers first.
-    torch.cuda.current_stream().synchronize()
-    return do_bench_cudagraph(call, quantiles=quantiles)
+# Include timing and tuner implementations alongside Triton's kernel-source hash.
+_TUNER_SOURCE_HASH = hashlib.sha256(
+    Path(__file__).read_bytes() + Path(__file__).with_name("bench.py").read_bytes()
+).hexdigest()
 
 
 # Env-gated host-execution counter (FINEGRAINED_AUTOTUNE_CALLCOUNT=<path>): every
@@ -180,7 +164,7 @@ class BayesianAutotuner(Autotuner):
         ):
             return driver.active.get_benchmarker()
 
-        return partial(_bench_graph, warm_cache=self.warm_cache)
+        return partial(do_bench, cudagraph=self.warm_cache)
 
     def _dtype_str(self, dtype) -> str:
         s = self._dtype_str_cache.get(dtype)

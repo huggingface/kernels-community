@@ -157,10 +157,9 @@ the offline activation quants the ops use internally, exposed for pre-quantized 
 Every kernel is tuned by a Tree-structured Parzen Estimator (TPE, the Bayesian search Optuna
 uses) autotuner with per-shape disk caching, config pruners
 that fence compiler bugs and can't-win regions per (arch, format), and failed-compile memoization.
-CUDA tuning uses graph timing of repeated cache-clear/kernel pairs to represent model weights
-larger than L2; these comparative scores include cache clearing. Set
-`FINEGRAINED_AUTOTUNE_WARM_CACHE=1` before importing the kernel to time repeated warm inputs
-instead. The two modes have separate on-disk tuning results.
+CUDA tuning clears L2 before each measured event interval; cache clearing is excluded
+from the score. Set `FINEGRAINED_AUTOTUNE_WARM_CACHE=1` before importing the kernel to
+opt into warm CUDA graph timing instead. The two modes have separate on-disk tuning results.
 Explicit benchmark callbacks, legacy timing options and user hooks retain their existing behavior.
 `FINEGRAINED_AUTOTUNE_TRIALS` overrides the trial budget. `FINEGRAINED_AUTOTUNE_RUNOFF`
 controls winner remeasurement (`0` or `1`, enabled by default).

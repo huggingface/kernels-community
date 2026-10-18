@@ -124,13 +124,13 @@ if SMOKE:
     os.environ.setdefault("FINEGRAINED_AUTOTUNE_TRIALS", "3")
 
 import torch  # noqa: E402
-from triton.testing import do_bench, do_bench_cudagraph  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_ROOT, "torch-ext"))
 sys.path.insert(0, os.path.join(_ROOT, "tests"))
 import finegrained_kernels as fgm  # noqa: E402  local branch
+from finegrained_kernels.bench import do_bench  # noqa: E402
 from kernels import get_kernel  # noqa: E402
 
 # kernels-community IS a trusted publisher, so the check passes whenever it can reach the Hub
@@ -1381,7 +1381,7 @@ def bench_modes(runs, tag, active_weight_bytes, prepared_bytes):
         res["eager"] = None
     _context_poisoned(tag, "eager")
     try:
-        res["cudagraph"] = do_bench_cudagraph(run, return_mode="min") * 1e3 / count
+        res["cudagraph"] = do_bench(run, cudagraph=True, return_mode="min") * 1e3 / count
         print(f"      {tag:14s} cudagraph  {res['cudagraph']:9.1f}us", flush=True)
     except Exception as e:
         print(f"      [{tag} cudagraph crashed: {type(e).__name__}: {str(e)[:90]}]", flush=True)
