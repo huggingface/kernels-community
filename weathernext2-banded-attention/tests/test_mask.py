@@ -1,4 +1,4 @@
-"""The mask layer prepares one compact geometry mask shared by all attention layers."""
+"""The encoder prepares one compact geometry mask shared by all attention layers."""
 
 from types import MethodType, SimpleNamespace
 
@@ -8,18 +8,18 @@ import torch
 from torch import nn
 
 
-kernel = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=2)
+kernel = kernels.get_kernel("kernels-community/weathernext2-banded-attention", version=3)
 DEVICE = kernel.infer_device()
 requires_accelerator = pytest.mark.skipif(DEVICE == "cpu", reason="the kernel needs an accelerator")
 
 
-class MaskPreparer(nn.Module):
+class MeshEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.config = SimpleNamespace(_attn_implementation="sdpa")
+        self.config = SimpleNamespace(_attn_implementation="sdpa", attention_bandwidth=65)
 
-    def forward(self, mask, batch_size, dtype):
-        return mask
+    def forward(self, hidden_states, attention_mask, conditioning, **kwargs):
+        return attention_mask
 
 
 def decode_mask(mask):
@@ -49,20 +49,24 @@ def decode_mask(mask):
 @pytest.mark.parametrize("device", list(dict.fromkeys(["cpu", DEVICE])))
 @pytest.mark.parametrize("inference_mode", [False, True])
 def test_inference_prepares_one_shared_mask(device, inference_mode):
-    layer = MaskPreparer().eval()
-    layer.forward = MethodType(kernel.WeatherNext2AttentionMask.forward, layer)
+    layer = MeshEncoder().eval()
+    layer.forward = MethodType(kernel.WeatherNext2MeshEncoder.forward, layer)
+    hidden_states = torch.randn(2, 195, 32, device=device)
+    conditioning = torch.randn(2, 4, device=device)
     mask = torch.rand(3, 1, 65, 195, device=device) > 0.5
     mask[0, :, :, :65] = False
     mask[-1, :, :, 130:] = False
     with torch.inference_mode(inference_mode), torch.no_grad():
-        banded = layer(mask, 2, torch.float32)
-    assert banded.shape == (3, 65, 195)
+        prepared = layer(hidden_states, mask, conditioning)
     if device == "cpu":
-        assert banded.data_ptr() == mask.data_ptr()
+        assert prepared is mask
     else:
+        banded = prepared["full_attention"]
+        assert banded.shape == (3, 65, 195)
         assert banded.packed.dtype == torch.uint32
         torch.testing.assert_close(decode_mask(banded), mask[:, 0].cpu())
-    assert list(layer.buffers()) == []
+        with torch.no_grad():
+            assert layer(hidden_states, prepared, conditioning) is prepared
 
 
 @requires_accelerator
@@ -101,15 +105,18 @@ def test_sparse_mask_stores_only_active_tiles():
 
 
 @pytest.mark.kernels_ci
-@pytest.mark.parametrize("reason", ["training", "gradients", "flex"])
+@pytest.mark.parametrize("reason", ["training", "gradients", "flex", "geometry"])
 def test_standard_mask_fallback(reason):
-    layer = MaskPreparer().eval()
-    layer.forward = MethodType(kernel.WeatherNext2AttentionMask.forward, layer)
+    layer = MeshEncoder().eval()
+    layer.forward = MethodType(kernel.WeatherNext2MeshEncoder.forward, layer)
     if reason == "training":
         layer.train()
     if reason == "flex":
         layer.config._attn_implementation = "flex_attention"
-    mask = torch.ones(3, 1, 65, 195, dtype=torch.bool)
+    if reason == "geometry":
+        layer.config.attention_bandwidth = 64
+    hidden_states = torch.randn(2, 195, 32, device=DEVICE)
+    conditioning = torch.randn(2, 4, device=DEVICE)
+    mask = torch.ones(3, 1, 65, 195, dtype=torch.bool, device=DEVICE)
     with torch.set_grad_enabled(reason == "gradients"):
-        assert layer(mask, 1, torch.float32) is mask
-    assert not hasattr(layer, "_prepared_key")
+        assert layer(hidden_states, mask, conditioning) is mask
