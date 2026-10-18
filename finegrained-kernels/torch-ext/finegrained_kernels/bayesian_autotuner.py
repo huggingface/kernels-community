@@ -37,9 +37,11 @@ import random
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from functools import cached_property, partial
 from pathlib import Path
 
 import torch
+from triton.testing import do_bench_cudagraph
 
 from typing import Dict, List
 
@@ -58,6 +60,25 @@ logger = logging.getLogger(__name__)
 
 # Include the tuner implementation alongside Triton's kernel-source hash.
 _TUNER_SOURCE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def _bench_graph(fn, quantiles, *, warm_cache=False):
+    """Compare graph costs with cold inputs unless warm-cache timing is requested.
+
+    Cold timing repeats cache-clear/kernel pairs while amortizing host/event overhead.
+    Those scores include the common cache-clearing cost; they are comparative costs,
+    not standalone kernel latencies.
+    """
+    cache = None if warm_cache else driver.active.get_empty_cache_for_benchmark()
+
+    def call():
+        if cache is not None:
+            driver.active.clear_cache(cache)
+        fn()
+
+    # Triton's graph timer warms up on its own stream; finish input producers first.
+    torch.cuda.current_stream().synchronize()
+    return do_bench_cudagraph(call, quantiles=quantiles)
 
 
 # Env-gated host-execution counter (FINEGRAINED_AUTOTUNE_CALLCOUNT=<path>): every
@@ -100,6 +121,8 @@ class BayesianAutotuner(Autotuner):
     ):
         super().__init__(*args, **kwargs)
         self.fn_name = getattr(self.fn, "__name__", str(self.fn))
+        # Large-model weights exceed L2; opt into repeated warm inputs for smaller workloads.
+        self.warm_cache = os.environ.get("FINEGRAINED_AUTOTUNE_WARM_CACHE", "0") == "1"
         # Bayesian trial budget — the per-decorator default, overridable via the
         # FINEGRAINED_AUTOTUNE_TRIALS env var (quick sweeps / exhaustive runs without touching
         # the decorators; set it >= grid size to fall back to stock exhaustive bench-all).
@@ -146,6 +169,18 @@ class BayesianAutotuner(Autotuner):
         self._arg_name_set = frozenset(self.arg_names)
         self._dtype_tag_cache: Dict[tuple, str] = {}
         self._dtype_str_cache: Dict[torch.dtype, str] = {}
+
+    @cached_property
+    def do_bench(self):
+        if self._do_bench is not None:
+            return self._do_bench
+        if (
+            driver.active.get_current_target().backend != "cuda"
+            or self.user_defined_pre_hook or self.user_defined_post_hook
+        ):
+            return driver.active.get_benchmarker()
+
+        return partial(_bench_graph, warm_cache=self.warm_cache)
 
     def _dtype_str(self, dtype) -> str:
         s = self._dtype_str_cache.get(dtype)
@@ -783,7 +818,7 @@ class BayesianAutotuner(Autotuner):
             str(self.keys),
             f"n_trials={self.n_trials},n_startup_trials={self.n_startup_trials},gamma={self.gamma},"
             f"runoff={self.runoff},basin_probes={self.basin_probes},max_refine_iters={self.max_refine_iters},"
-            f"coupled_axes={self.coupled_axes}",
+            f"coupled_axes={self.coupled_axes},warm_cache={self.warm_cache}",
             str(tuning_key),
         ] + [str(c) for c in configs]  # str(Config) is pre_hook-free and process-stable
         cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()
