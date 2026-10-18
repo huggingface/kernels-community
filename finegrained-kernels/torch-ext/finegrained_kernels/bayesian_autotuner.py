@@ -37,11 +37,9 @@ import random
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from functools import cached_property
 from pathlib import Path
 
 import torch
-from triton.testing import do_bench_cudagraph
 
 from typing import Dict, List
 
@@ -60,24 +58,6 @@ logger = logging.getLogger(__name__)
 
 # Include the tuner implementation alongside Triton's kernel-source hash.
 _TUNER_SOURCE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-
-
-def _bench_cold_graph(fn, quantiles):
-    """Compare cold-input graph costs without per-launch timing events.
-
-    Scores include the same cache-clearing work for every candidate; they are
-    comparative costs, not standalone kernel latencies. Timing a graph of repeated
-    flush/launch pairs amortizes events that can obscure short-kernel differences.
-    """
-    cache = driver.active.get_empty_cache_for_benchmark()
-
-    def call():
-        driver.active.clear_cache(cache)
-        fn()
-
-    # Triton's graph timer warms up on its own stream; finish input producers first.
-    torch.cuda.current_stream().synchronize()
-    return do_bench_cudagraph(call, quantiles=quantiles)
 
 
 # Env-gated host-execution counter (FINEGRAINED_AUTOTUNE_CALLCOUNT=<path>): every
@@ -166,18 +146,6 @@ class BayesianAutotuner(Autotuner):
         self._arg_name_set = frozenset(self.arg_names)
         self._dtype_tag_cache: Dict[tuple, str] = {}
         self._dtype_str_cache: Dict[torch.dtype, str] = {}
-
-    @cached_property
-    def do_bench(self):
-        if self._do_bench is not None:
-            return self._do_bench
-        if (
-            driver.active.get_current_target().backend == "cuda"
-            and not self.user_defined_pre_hook
-            and not self.user_defined_post_hook
-        ):
-            return _bench_cold_graph
-        return driver.active.get_benchmarker()
 
     def _dtype_str(self, dtype) -> str:
         s = self._dtype_str_cache.get(dtype)
@@ -680,7 +648,7 @@ class BayesianAutotuner(Autotuner):
 
     def _log_result(self, key, config: Config, ms: float):
         """Append one ``(key, config, ms)`` record as JSONL for offline analysis —
-        CUDA graph costs include cache clearing, not just the kernel. ``inf`` ms
+        e.g. pruning configs that are consistently far off the per-key best. ``inf`` ms
         marks a config that failed to compile/run (out of resources, etc.)."""
         if not self.log_path:
             return
