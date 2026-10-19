@@ -2,7 +2,10 @@ import kernels
 import pytest
 import torch
 
+from .test_flash_attn import generate_qkv
+
 flash_attn2 = kernels.get_kernel("kernels-community/flash-attn2", version=4)
+iface = flash_attn2.flash_attn_interface
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -11,85 +14,59 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 # that check is covered by the compile tests below instead.
 OPCHECK_TEST_UTILS = ("test_schema", "test_autograd_registration", "test_faketensor")
 
+# Every test runs once against the dense ops and once against the varlen ops.
+VARLEN = pytest.mark.parametrize("varlen", [False, True], ids=["dense", "varlen"])
 
-def _qkv(shape, device="cuda", dtype=torch.bfloat16):
+
+def _ops(varlen):
+    if varlen:
+        return iface._flash_attn_varlen_forward, iface._flash_attn_varlen_backward
+    return iface._flash_attn_forward, iface._flash_attn_backward
+
+
+def _inputs(varlen):
+    """q, k, v, dout and, for varlen, (cu_seqlens, max_seqlen) of an unpadded batch."""
     torch.manual_seed(0)
-    return tuple(torch.randn(shape, device=device, dtype=dtype) for _ in range(4))
+    q, k, v, dout = (torch.randn(2, 128, 4, 64, device="cuda", dtype=torch.bfloat16) for _ in range(4))
+    if not varlen:
+        return q, k, v, dout, None
+    q, k, v, cu_seqlens, _, max_seqlen, *_ = generate_qkv(q, k, v)
+    # generate_qkv sets requires_grad; these tests call the raw ops without autograd.
+    return q.detach(), k.detach(), v.detach(), dout.flatten(0, 1), (cu_seqlens, max_seqlen)
 
 
-def _fwd_bwd(q, k, v, dout):
-    out, lse, _, rng_state = flash_attn2.flash_attn_interface._flash_attn_forward(
-        q, k, v, 0.0, q.shape[-1] ** -0.5, False, -1, -1, 0.0, None, False
-    )
-    dq, dk, dv = (torch.empty_like(x) for x in (q, k, v))
-    flash_attn2.flash_attn_interface._flash_attn_backward(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        lse,
-        dq,
-        dk,
-        dv,
-        0.0,
-        q.shape[-1] ** -0.5,
-        False,
-        -1,
-        -1,
-        0.0,
-        None,
-        False,
-        rng_state,
-    )
-    return out, lse, dq, dk, dv
-
-
-def _varlen_fwd_bwd(q, k, v, dout, cu_seqlens, max_seqlen):
+def _fwd_args(q, k, v, seqlens):
     scale = q.shape[-1] ** -0.5
-    out, lse, _, rng_state = flash_attn2.flash_attn_interface._flash_attn_varlen_forward(
-        q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, 0.0, scale, False
-    )
-    dq, dk, dv = (torch.empty_like(x) for x in (q, k, v))
-    flash_attn2.flash_attn_interface._flash_attn_varlen_backward(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        lse,
-        dq,
-        dk,
-        dv,
-        cu_seqlens,
-        cu_seqlens,
-        max_seqlen,
-        max_seqlen,
-        0.0,
-        scale,
-        False,
-        -1,
-        -1,
-        0.0,
-        None,
-        False,
-        rng_state,
-    )
-    return out, lse, dq, dk, dv
+    if seqlens is None:
+        return (q, k, v, 0.0, scale, False, -1, -1, 0.0, None, False)
+    cu_seqlens, max_seqlen = seqlens
+    return (q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, 0.0, scale, False)
 
 
-def test_low_level_ops_are_custom_ops():
-    for op in (
-        flash_attn2.flash_attn_interface._flash_attn_forward,
-        flash_attn2.flash_attn_interface._flash_attn_backward,
-        flash_attn2.flash_attn_interface._flash_attn_varlen_forward,
-        flash_attn2.flash_attn_interface._flash_attn_varlen_backward,
-    ):
+def _bwd_args(dout, q, k, v, out, lse, grads, rng_state, seqlens):
+    scale = q.shape[-1] ** -0.5
+    tail = (0.0, scale, False, -1, -1, 0.0, None, False, rng_state)
+    if seqlens is None:
+        return (dout, q, k, v, out, lse, *grads, *tail)
+    cu_seqlens, max_seqlen = seqlens
+    return (dout, q, k, v, out, lse, *grads, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, *tail)
+
+
+def _fwd_bwd(q, k, v, dout, seqlens):
+    fwd, bwd = _ops(seqlens is not None)
+    out, lse, _, rng_state = fwd(*_fwd_args(q, k, v, seqlens))
+    grads = tuple(torch.empty_like(x) for x in (q, k, v))
+    bwd(*_bwd_args(dout, q, k, v, out, lse, grads, rng_state, seqlens))
+    return out, lse, *grads
+
+
+@VARLEN
+def test_low_level_ops_are_custom_ops(varlen):
+    for op in _ops(varlen):
         assert isinstance(op, torch._library.custom_ops.CustomOpDef)
 
 
 def test_upstream_aliases():
-    iface = flash_attn2.flash_attn_interface
     for name in ("flash_attn_forward", "flash_attn_backward", "flash_attn_varlen_forward", "flash_attn_varlen_backward"):
         alias = getattr(iface, f"_wrapped_{name}")
         op = getattr(iface, f"_{name}")
@@ -97,95 +74,23 @@ def test_upstream_aliases():
         assert alias._qualified_op_name == op._qualname
 
 
-def test_opcheck():
-    q, k, v, dout = _qkv((2, 128, 4, 64))
-    scale = q.shape[-1] ** -0.5
-    fwd_args = (q, k, v, 0.0, scale, False, -1, -1, 0.0, None, False)
-    torch.library.opcheck(
-        flash_attn2.flash_attn_interface._flash_attn_forward, fwd_args, test_utils=OPCHECK_TEST_UTILS
-    )
+@VARLEN
+def test_opcheck(varlen):
+    q, k, v, dout, seqlens = _inputs(varlen)
+    fwd, bwd = _ops(varlen)
+    fwd_args = _fwd_args(q, k, v, seqlens)
+    torch.library.opcheck(fwd, fwd_args, test_utils=OPCHECK_TEST_UTILS)
 
-    out, lse, _, rng_state = flash_attn2.flash_attn_interface._flash_attn_forward(*fwd_args)
-    dq, dk, dv = (torch.empty_like(x) for x in (q, k, v))
-    bwd_args = (
-        dout,
-        q,
-        k,
-        v,
-        out,
-        lse,
-        dq,
-        dk,
-        dv,
-        0.0,
-        scale,
-        False,
-        -1,
-        -1,
-        0.0,
-        None,
-        False,
-        rng_state,
-    )
-    torch.library.opcheck(
-        flash_attn2.flash_attn_interface._flash_attn_backward, bwd_args, test_utils=OPCHECK_TEST_UTILS
-    )
+    out, lse, _, rng_state = fwd(*fwd_args)
+    grads = tuple(torch.empty_like(x) for x in (q, k, v))
+    bwd_args = _bwd_args(dout, q, k, v, out, lse, grads, rng_state, seqlens)
+    torch.library.opcheck(bwd, bwd_args, test_utils=OPCHECK_TEST_UTILS)
 
 
-def test_varlen_opcheck():
-    q, k, v, dout = (x.flatten(0, 1) for x in _qkv((2, 128, 4, 64)))
-    cu_seqlens = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
-    scale = q.shape[-1] ** -0.5
-    fwd_args = (q, k, v, cu_seqlens, cu_seqlens, 128, 128, 0.0, scale, False)
-    torch.library.opcheck(
-        flash_attn2.flash_attn_interface._flash_attn_varlen_forward, fwd_args, test_utils=OPCHECK_TEST_UTILS
-    )
-
-    out, lse, _, rng_state = flash_attn2.flash_attn_interface._flash_attn_varlen_forward(*fwd_args)
-    dq, dk, dv = (torch.empty_like(x) for x in (q, k, v))
-    bwd_args = (
-        dout,
-        q,
-        k,
-        v,
-        out,
-        lse,
-        dq,
-        dk,
-        dv,
-        cu_seqlens,
-        cu_seqlens,
-        128,
-        128,
-        0.0,
-        scale,
-        False,
-        -1,
-        -1,
-        0.0,
-        None,
-        False,
-        rng_state,
-    )
-    torch.library.opcheck(
-        flash_attn2.flash_attn_interface._flash_attn_varlen_backward, bwd_args, test_utils=OPCHECK_TEST_UTILS
-    )
-
-
-def test_compile_fullgraph_matches_eager():
-    q, k, v, dout = _qkv((2, 128, 4, 64))
-    expected = _fwd_bwd(q, k, v, dout)
-    actual = torch.compile(_fwd_bwd, fullgraph=True)(q, k, v, dout)
-    for e, a in zip(expected, actual):
-        torch.testing.assert_close(a, e)
-
-
-def test_varlen_compile_fullgraph_matches_eager():
-    q, k, v, dout = (x.flatten(0, 1) for x in _qkv((2, 128, 4, 64)))
-    cu_seqlens = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
-    expected = _varlen_fwd_bwd(q, k, v, dout, cu_seqlens, 128)
-    actual = torch.compile(_varlen_fwd_bwd, fullgraph=True)(
-        q, k, v, dout, cu_seqlens, 128
-    )
+@VARLEN
+def test_compile_fullgraph_matches_eager(varlen):
+    args = _inputs(varlen)
+    expected = _fwd_bwd(*args)
+    actual = torch.compile(_fwd_bwd, fullgraph=True)(*args)
     for e, a in zip(expected, actual):
         torch.testing.assert_close(a, e)
