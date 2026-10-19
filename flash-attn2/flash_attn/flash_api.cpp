@@ -31,9 +31,11 @@ extern "C" AOTITorchError aoti_torch_get_current_cuda_stream(int32_t device_inde
 #include <torch/headeronly/util/Exception.h>
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -45,6 +47,107 @@ namespace {
 inline tsa::DeviceGuard make_device_guard(const Tensor &t) {
   return tsa::DeviceGuard(static_cast<tsa::DeviceIndex>(t.get_device()));
 }
+// Host-overhead fast paths. torch::stable::{new_empty, empty_like, reshape, transpose} each go
+// through the boxed dispatcher (schema lookup plus StableIValue <-> IValue conversion), which
+// costs roughly 0.5-1 us of CPU time per call. Small decode calls are CPU-bound, so that shows up
+// directly in wall time. The functions below have the same semantics as their torch::stable
+// namesakes but call the unboxed AOTI C shims, all of which predate Torch 2.10. They are only
+// valid for CUDA tensors, which is all this file handles (see CHECK_DEVICE).
+namespace fast_stable {
+
+using torch::headeronly::IntHeaderOnlyArrayRef;
+using torch::headeronly::ScalarType;
+
+std::vector<int64_t> contiguous_strides(IntHeaderOnlyArrayRef sizes) {
+  std::vector<int64_t> strides(sizes.size());
+  int64_t stride = 1;
+  for (int64_t i = static_cast<int64_t>(sizes.size()) - 1; i >= 0; --i) {
+    strides[i] = stride;
+    stride *= std::max<int64_t>(sizes[i], 1);
+  }
+  return strides;
+}
+
+// c10's is_non_overlapping_and_dense: ignoring size-1 dims, the strides sorted ascending must be
+// the running product of the sizes. This is what empty_like(preserve_format) keys on.
+bool is_dense(const Tensor &t) {
+  const auto sizes = t.sizes();
+  const auto strides = t.strides();
+  std::vector<int64_t> dims;
+  for (int64_t i = 0; i < t.dim(); ++i) {
+    if (sizes[i] != 1) { dims.push_back(i); }
+  }
+  std::sort(dims.begin(), dims.end(), [&](int64_t a, int64_t b) { return strides[a] < strides[b]; });
+  int64_t expected = 1;
+  for (int64_t d : dims) {
+    if (strides[d] != expected) { return false; }
+    expected *= sizes[d];
+  }
+  return true;
+}
+
+// Uninitialized tensor on the device of `like` with the given sizes, strides and dtype.
+Tensor empty_strided(const Tensor &like, IntHeaderOnlyArrayRef sizes, IntHeaderOnlyArrayRef strides,
+                     ScalarType dtype) {
+  AtenTensorHandle handle;
+  TORCH_ERROR_CODE_CHECK(aoti_torch_empty_strided(
+      static_cast<int64_t>(sizes.size()), sizes.data(), strides.data(),
+      torch::stable::detail::to<int32_t>(torch::stable::detail::from(dtype)),
+      aoti_torch_device_type_cuda(), like.get_device_index(), &handle));
+  return Tensor(handle);
+}
+
+// torch::stable::new_empty(like, sizes[, dtype]): contiguous, on the device of `like`.
+Tensor new_empty(const Tensor &like, IntHeaderOnlyArrayRef sizes,
+                 std::optional<ScalarType> dtype = std::nullopt) {
+  return empty_strided(like, sizes, contiguous_strides(sizes), dtype.value_or(like.scalar_type()));
+}
+
+// torch::stable::empty_like(t): keeps the strides of a dense `t` (preserve_format). Anything
+// else is left to the dispatcher, which picks the layout.
+Tensor empty_like(const Tensor &t) {
+  if (!is_dense(t)) { return torch::stable::empty_like(t); }
+  return empty_strided(t, t.sizes(), t.strides(), t.scalar_type());
+}
+
+// View of `t`'s storage, same storage offset, with the given sizes and strides.
+Tensor as_strided(const Tensor &t, IntHeaderOnlyArrayRef sizes, IntHeaderOnlyArrayRef strides) {
+  AtenTensorHandle handle;
+  TORCH_ERROR_CODE_CHECK(aoti_torch__reinterpret_tensor(
+      t.get(), static_cast<int64_t>(sizes.size()), sizes.data(), strides.data(),
+      /*offset_increment=*/0, &handle));
+  return Tensor(handle);
+}
+
+// torch::stable::reshape(t, sizes): a view when `t` is contiguous, otherwise the dispatcher
+// decides whether a copy is needed.
+Tensor reshape(const Tensor &t, IntHeaderOnlyArrayRef sizes) {
+  if (!t.is_contiguous()) { return torch::stable::reshape(t, sizes); }
+  return as_strided(t, sizes, contiguous_strides(sizes));
+}
+
+// transpose(reshape(x, {b, nheads_k, ngroups, d}), 1, 2) for x of shape (b, 1, nheads_k * ngroups, d):
+// the (b, ngroups, nheads_k, d) view used on the seqlen_q == 1 GQA decode path.
+Tensor swap_seqlenq_ngroups(const Tensor &x, int64_t num_heads_k, int64_t ngroups) {
+  const int64_t sh = x.stride(2);
+  return as_strided(x, {x.size(0), ngroups, num_heads_k, x.size(3)},
+                    {x.stride(0), sh, ngroups * sh, x.stride(3)});
+}
+
+// reshape(transpose(x, 1, 2), {b, 1, nheads_k * ngroups, d}) for x of shape (b, ngroups, nheads_k, d):
+// the inverse of swap_seqlenq_ngroups. A view when the two head dims are adjacent in memory, which
+// holds for anything produced by swap_seqlenq_ngroups or empty_like of it; otherwise reshape copies.
+Tensor unswap_seqlenq_ngroups(const Tensor &x) {
+  const int64_t ngroups = x.size(1), num_heads_k = x.size(2);
+  const int64_t num_heads = num_heads_k * ngroups;
+  if (num_heads_k == 1 || x.stride(2) == ngroups * x.stride(1)) {
+    return as_strided(x, {x.size(0), 1, num_heads, x.size(3)},
+                      {x.stride(0), num_heads * x.stride(1), x.stride(1), x.stride(3)});
+  }
+  return torch::stable::reshape(torch::stable::transpose(x, 1, 2), {x.size(0), 1, num_heads, x.size(3)});
+}
+
+}  // namespace fast_stable
 }  // namespace
 
 #define CHECK_DEVICE(x) STD_TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
@@ -356,8 +459,8 @@ std::tuple<Tensor, Tensor> set_params_splitkv(Flash_fwd_params &params, const in
             params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
         }
         if (params.num_splits > 1) {
-            softmax_lse_accum = torch::stable::new_empty(splitkv_ref, {params.num_splits, batch_size, num_heads, max_seqlen_q}, torch::headeronly::ScalarType::Float);
-            out_accum = torch::stable::new_empty(splitkv_ref, {params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, torch::headeronly::ScalarType::Float);
+            softmax_lse_accum = fast_stable::new_empty(splitkv_ref, {params.num_splits, batch_size, num_heads, max_seqlen_q}, torch::headeronly::ScalarType::Float);
+            out_accum = fast_stable::new_empty(splitkv_ref, {params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, torch::headeronly::ScalarType::Float);
             params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
             params.oaccum_ptr = out_accum.data_ptr();
         }
@@ -504,7 +607,7 @@ mha_fwd(Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple
     const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
-        q = torch::stable::transpose(torch::stable::reshape(q, {batch_size, num_heads_k, ngroups, head_size}), 1, 2);
+        q = fast_stable::swap_seqlenq_ngroups(q, num_heads_k, ngroups);
         seqlen_q = ngroups;
         num_heads = num_heads_k;
     }
@@ -521,10 +624,10 @@ mha_fwd(Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple
         STD_TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, sizes[1], sizes[2], head_size);
         if (seqlenq_ngroups_swapped) {
-            out = torch::stable::transpose(torch::stable::reshape(out, {batch_size, num_heads_k, ngroups, head_size}), 1, 2);
+            out = fast_stable::swap_seqlenq_ngroups(out, num_heads_k, ngroups);
         }
     } else {
-        out = torch::stable::empty_like(q);
+        out = fast_stable::empty_like(q);
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -533,15 +636,15 @@ mha_fwd(Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
 
-    auto softmax_lse = torch::stable::new_empty(q, {batch_size, num_heads, seqlen_q}, torch::headeronly::ScalarType::Float);
+    auto softmax_lse = fast_stable::new_empty(q, {batch_size, num_heads, seqlen_q}, torch::headeronly::ScalarType::Float);
     Tensor p;
     // Only return softmax if there's dropout to reduce compilation time
     if (return_softmax) {
         STD_TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
-        p = torch::stable::new_empty(q, { batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded });
+        p = fast_stable::new_empty(q, { batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded });
     }
     else {
-        p = torch::stable::new_empty(q, { 0 });
+        p = fast_stable::new_empty(q, { 0 });
     }
 
     Flash_fwd_params params;
@@ -574,7 +677,7 @@ mha_fwd(Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = params.b * params.h * 32;
-    auto rng_state = torch::stable::new_empty(q, {2}, torch::headeronly::ScalarType::Long);
+    auto rng_state = fast_stable::new_empty(q, {2}, torch::headeronly::ScalarType::Long);
     // Forward kernel will populate memory with the seed and offset.
     params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
@@ -598,9 +701,9 @@ mha_fwd(Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple
     }
 
     if (seqlenq_ngroups_swapped) {
-        out = torch::stable::reshape(torch::stable::transpose(out, 1, 2), {batch_size, 1, num_heads_k * seqlen_q, head_size});
-        q = torch::stable::reshape(torch::stable::transpose(q, 1, 2), {batch_size, 1, num_heads_k * seqlen_q, head_size});
-        softmax_lse = torch::stable::reshape(softmax_lse, {batch_size, num_heads_k * seqlen_q, 1});
+        out = fast_stable::unswap_seqlenq_ngroups(out);
+        q = fast_stable::unswap_seqlenq_ngroups(q);
+        softmax_lse = fast_stable::reshape(softmax_lse, {batch_size, num_heads_k * seqlen_q, 1});
     }
     return {out, softmax_lse, p, rng_state};
 }
@@ -736,7 +839,7 @@ mha_varlen_fwd(Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{
             out = torch::stable::reshape(torch::stable::transpose(torch::stable::reshape(out, {batch_size, num_heads_k, ngroups, head_size}), 1, 2), {batch_size * ngroups, num_heads_k, head_size});
         }
     } else {
-        out = torch::stable::empty_like(q);
+        out = fast_stable::empty_like(q);
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -744,15 +847,15 @@ mha_varlen_fwd(Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{
     const int seqlen_q_rounded = round_multiple(max_seqlen_q, 128);
     const int seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
 
-    auto softmax_lse = torch::stable::new_empty(q, {num_heads, total_q}, torch::headeronly::ScalarType::Float);
+    auto softmax_lse = fast_stable::new_empty(q, {num_heads, total_q}, torch::headeronly::ScalarType::Float);
     Tensor p;
     // Only return softmax if there's dropout to reduce compilation time
     if (return_softmax) {
         STD_TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
-        p = torch::stable::new_empty(q, { batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded });
+        p = fast_stable::new_empty(q, { batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded });
     }
     else {
-        p = torch::stable::new_empty(q, { 0 });
+        p = fast_stable::new_empty(q, { 0 });
     }
 
     if (zero_tensors) {
@@ -814,7 +917,7 @@ mha_varlen_fwd(Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = params.b * params.h * 32;
-    auto rng_state = torch::stable::new_empty(q, {2}, torch::headeronly::ScalarType::Long);
+    auto rng_state = fast_stable::new_empty(q, {2}, torch::headeronly::ScalarType::Long);
     // Forward kernel will populate memory with the seed and offset.
     params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
@@ -1372,7 +1475,7 @@ mha_fwd_kvcache(Tensor &q,                 // batch_size x seqlen_q x num_heads 
     const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
     if (seqlenq_ngroups_swapped) {
         const int ngroups = num_heads / num_heads_k;
-        q = torch::stable::transpose(torch::stable::reshape(q, {batch_size, num_heads_k, ngroups, head_size_og}), 1, 2);
+        q = fast_stable::swap_seqlenq_ngroups(q, num_heads_k, ngroups);
         seqlen_q = ngroups;
         num_heads = num_heads_k;
     }
@@ -1408,9 +1511,9 @@ mha_fwd_kvcache(Tensor &q,                 // batch_size x seqlen_q x num_heads 
         CHECK_DEVICE(out);
         STD_TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_og);
-        if (head_size_og % 8 != 0) { out = torch::stable::empty_like(q_padded); }
+        if (head_size_og % 8 != 0) { out = fast_stable::empty_like(q_padded); }
     } else {
-        out = torch::stable::empty_like(q_padded);
+        out = fast_stable::empty_like(q_padded);
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -1420,7 +1523,7 @@ mha_fwd_kvcache(Tensor &q,                 // batch_size x seqlen_q x num_heads 
     const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
 
-    auto softmax_lse = torch::stable::new_empty(q, {batch_size, num_heads, seqlen_q}, torch::headeronly::ScalarType::Float);
+    auto softmax_lse = fast_stable::new_empty(q, {batch_size, num_heads, seqlen_q}, torch::headeronly::ScalarType::Float);
 
     Flash_fwd_params params;
     set_params_fprop(params,
@@ -1566,8 +1669,8 @@ mha_fwd_kvcache(Tensor &q,                 // batch_size x seqlen_q x num_heads 
     }
 
     if (seqlenq_ngroups_swapped) {
-        out = torch::stable::reshape(torch::stable::transpose(out, 1, 2), {batch_size, 1, num_heads_k * seqlen_q, head_size_og});
-        softmax_lse = torch::stable::reshape(softmax_lse, {batch_size, num_heads_k * seqlen_q, 1});
+        out = fast_stable::unswap_seqlenq_ngroups(out);
+        softmax_lse = fast_stable::reshape(softmax_lse, {batch_size, num_heads_k * seqlen_q, 1});
     }
     return {out, softmax_lse};
 }
