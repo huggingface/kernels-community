@@ -31,12 +31,6 @@ inline at::Tensor ensure_contiguous(const at::Tensor& tensor) {
     return tensor.is_contiguous() ? tensor : tensor.contiguous();
 }
 
-inline std::pair<at::Tensor, at::Tensor> lse_token_indices(const at::Tensor& cu_seqlens_q, int64_t total_q) {
-    auto tokens = at::arange(total_q, cu_seqlens_q.options().dtype(at::kLong));
-    auto batches = at::searchsorted(cu_seqlens_q.slice(0, 1).contiguous(), tokens, false, true);
-    return {batches, tokens - cu_seqlens_q.index_select(0, batches)};
-}
-
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_xpu(), #x " must be on XPU")
 
 std::vector<at::Tensor>
@@ -450,7 +444,7 @@ mha_varlen_fwd(
 
     // Allocate softmax_lse output tensor
     auto opts = q.options().dtype(torch::kFloat32);
-    at::Tensor softmax_lse = torch::zeros({batch_size, num_heads, max_seqlen_q}, opts);
+    at::Tensor softmax_lse = torch::zeros({num_heads, total_q}, opts);
 
     auto queue = c10::xpu::getCurrentXPUStream(device_idx).queue();
 
@@ -500,10 +494,7 @@ mha_varlen_fwd(
                     .contiguous()
         : ensure_contiguous(out_padded);
 
-    auto [batches, positions] = lse_token_indices(cu_seqlens_q, total_q);
-    auto packed_lse = softmax_lse.index({batches, torch::indexing::Slice(), positions})
-                          .transpose(0, 1).contiguous();
-    return {out, packed_lse, S_dmask, rng_state};
+    return {out, softmax_lse, S_dmask, rng_state};
   }
 
 std::vector<at::Tensor>
@@ -645,6 +636,7 @@ mha_varlen_bwd(
         dv_work = torch::empty({total_k, num_heads_k, head_size_padded}, opts);
     }
 
+    dq_work.zero_();
     at::Tensor softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
 
     at::Tensor dk_expanded, dv_expanded;
@@ -667,13 +659,9 @@ mha_varlen_bwd(
         philox_offset = static_cast<uint64_t>(rng_state_val[1].item<int64_t>());
     }
 
-    auto [batches, positions] = lse_token_indices(cu_q_contig, total_q);
-    auto padded_lse = at::zeros({batch_size, num_heads, max_seqlen_q}, softmax_lse_contig.options());
-    padded_lse.index_put_({batches, torch::indexing::Slice(), positions}, softmax_lse_contig.transpose(0, 1));
-
     cutlass_fmha_bwd_varlen_impl(
         queue,
-        dout_padded, q_padded, k_padded, v_padded, out_padded, padded_lse,
+        dout_padded, q_padded, k_padded, v_padded, out_padded, softmax_lse_contig,
         cu_q_contig, cu_k_contig,
         dq_work, dk_expanded, dv_expanded, softmax_d,
         softmax_scale,
