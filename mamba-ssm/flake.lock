@@ -41,16 +41,16 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1792049056,
-        "narHash": "sha256-Ru2ct3Wp3N1INA3UReLD0Ww/072r6nAT+SJFQUNZYCI=",
+        "lastModified": 1792398106,
+        "narHash": "sha256-87ZGBU4UMur8FqNsPA56z2VUUqh0ShRJ58JlyKAX9Ak=",
         "owner": "huggingface",
         "repo": "kernels",
-        "rev": "e83a5c268cd4ed8b5198b4a3a717afdb0fa1815e",
+        "rev": "d054906a13710b811b96697b4635f03020842733",
         "type": "github"
       },
       "original": {
         "owner": "huggingface",
-        "ref": "old-cuda-torches",
+        "ref": "torch-2.15.0-rc5",
         "repo": "kernels",
         "type": "github"
       }
