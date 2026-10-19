@@ -1,7 +1,7 @@
 [general]
 name = "quantization-bitsandbytes"
 version = 1
-edition = 5
+edition = 6
 license = "MIT"
 backends = ["cpu"]
 
@@ -12,7 +12,7 @@ repo-id = "kernels-community/quantization-bitsandbytes"
 src = ["torch-ext/torch_binding.cpp"]
 
 [kernel.bitsandbytes_cpu]
-backend = "cpu"
+language = "cpp-cpu"
 depends = ["torch"]
 include = ["bitsandbytes_cpu"]
 src = [
@@ -23,7 +23,7 @@ src = [
 ]
 
 [kernel.bitsandbytes_cpu_avx512]
-backend = "cpu"
+language = "cpp-cpu"
 cxx-flags = [
     "-mfma",
     "-fopenmp",

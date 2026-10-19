@@ -424,3 +424,34 @@ def test_flash_attention_after_mps_operation(causal):
     q = q.sin()
     metal_flash_sdpa.flash_attention_varlen(out, q, k, v, cu_seqlens, cu_seqlens, 12, 12, causal, 64**-0.5, 1.0)
     torch.testing.assert_close(out.tanh().cpu(), expected.tanh(), atol=5e-4, rtol=5e-4)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("q_len,k_len", [(32, 32), (1, 64), (16, 48)])  # prefill, decode, chunked prefill
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_func(dtype, q_len, k_len, causal):
+    """The fixed-length entry point: every sequence in the batch has the full length."""
+    batch, num_heads, num_heads_kv, head_dim = 3, 8, 2, 64
+    q = torch.randn(batch, q_len, num_heads, head_dim, device="mps", dtype=dtype)
+    k = torch.randn(batch, k_len, num_heads_kv, head_dim, device="mps", dtype=dtype)
+    v = torch.randn(batch, k_len, num_heads_kv, head_dim, device="mps", dtype=dtype)
+    s_aux = 2 * torch.randn(num_heads, device="mps", dtype=dtype)
+
+    out = metal_flash_sdpa.flash_attn_func(q, k, v, causal=causal, softcap=20.0, s_aux=s_aux, window_size=(24, -1))
+    assert out.shape == q.shape
+
+    cu_seqlens_q = create_cu_seqlens([q_len] * batch)
+    cu_seqlens_k = create_cu_seqlens([k_len] * batch)
+    expected = reference_attention(
+        q.reshape(-1, num_heads, head_dim),
+        k.reshape(-1, num_heads_kv, head_dim),
+        v.reshape(-1, num_heads_kv, head_dim),
+        cu_seqlens_q,
+        cu_seqlens_k,
+        causal=causal,
+        softcap=20.0,
+        sinks=s_aux,
+        window_size=(24, -1),
+    )
+    torch.testing.assert_close(out.reshape(-1, num_heads, head_dim).cpu().double(), expected, atol=ATOL[dtype], rtol=0)

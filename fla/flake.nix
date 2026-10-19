@@ -1,6 +1,6 @@
 {
   inputs = {
-    kernel-builder.url = "github:huggingface/kernels";
+    kernel-builder.url = "github:huggingface/kernels/torch-2.15.0-rc5";
   };
   outputs =
     { self, kernel-builder, ... }:
