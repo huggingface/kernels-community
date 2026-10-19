@@ -32,7 +32,10 @@ def _ms_deform_attn_backward_fake(
 
 
 class MultiScaleDeformableAttentionFunction(Function):
+    # Under autocast, compute in float32 like the reference implementation
+    # (`grid_sample` autocasts to float32).
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
     def forward(
         context,
         value: Tensor,
@@ -62,6 +65,7 @@ class MultiScaleDeformableAttentionFunction(Function):
 
     @staticmethod
     @once_differentiable
+    @torch.amp.custom_bwd(device_type="cuda")
     def backward(context, grad_output):
         (
             value,
@@ -98,17 +102,6 @@ class MultiScaleDeformableAttention(nn.Module):
         attention_weights: Tensor,
         im2col_step: int,
     ):
-        # The kernel needs a single dtype. Under autocast, Transformers passes
-        # a reduced precision `value` with float32 sampling locations and
-        # attention weights, for which the reference implementation (with
-        # `grid_sample`) computes and returns float32. Do the same.
-        dtype = torch.promote_types(
-            torch.promote_types(value.dtype, sampling_locations.dtype),
-            attention_weights.dtype,
-        )
-        value, sampling_locations, attention_weights = (
-            t.to(dtype) for t in (value, sampling_locations, attention_weights)
-        )
         return MultiScaleDeformableAttentionFunction.apply(
             value,
             value_spatial_shapes,

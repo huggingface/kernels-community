@@ -13,7 +13,5 @@
     kernel-builder.lib.genKernelFlakeOutputs {
       inherit self;
       path = ./.;
-
-      pythonCheckInputs = ps: with ps; [ transformers ];
     };
 }

@@ -251,7 +251,7 @@ def test_empty_batch(deformable_detr):
 
 @pytest.mark.kernels_ci
 @pytest.mark.parametrize("value_dtype", [torch.float16, torch.bfloat16], ids=str)
-def test_layer_mixed_dtypes(deformable_detr, value_dtype):
+def test_layer_autocast(deformable_detr, value_dtype):
     # Under autocast, Transformers passes a reduced precision value with
     # float32 sampling locations and attention weights. Like the reference,
     # the layer then computes and returns float32.
@@ -259,9 +259,16 @@ def test_layer_mixed_dtypes(deformable_detr, value_dtype):
         requires_grad=True
     )
     value = value.detach().to(value_dtype).requires_grad_()
-    out = run_kernel(
-        deformable_detr, value, shapes, level_start_index, sampling_loc, attn_weight, 64
-    )
+    with torch.autocast("cuda", dtype=value_dtype):
+        out = run_kernel(
+            deformable_detr,
+            value,
+            shapes,
+            level_start_index,
+            sampling_loc,
+            attn_weight,
+            64,
+        )
     assert out.dtype == torch.float32
 
     ref_value = value.detach().float().requires_grad_()
