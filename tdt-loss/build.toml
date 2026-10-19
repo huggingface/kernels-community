@@ -1,8 +1,8 @@
 [general]
 name = "tdt-loss"
-license = "Apache-2.0"
 version = 1
-edition = 5
+edition = 6
+license = "Apache-2.0"
 backends = ["cuda"]
 
 [general.hub]
@@ -18,7 +18,7 @@ src = [
 cuda = "2.10"
 
 [kernel.tdt_loss]
-backend = "cuda"
+language = "cpp-cuda"
 depends = ["torch"]
 src = [
     "tdt_loss/common.cuh",

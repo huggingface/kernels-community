@@ -1,7 +1,7 @@
 [general]
 name = "aiter-sage-attention"
 version = 1
-edition = 5
+edition = 6
 license = "MIT"
 backends = ["rocm"]
 
@@ -14,10 +14,23 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
-# Flags follow aiter's JIT build of the same sources (aiter/jit/core.py and the
-# module_gfx1201_sage_* entries of aiter/jit/optCompilerConfig.json).
+[kernel.gfx1201_sage_attention]
+language = "cpp-rocm"
+depends = ["torch"]
+rocm-archs = ["gfx1201"]
+hip-flags = ["-fgpu-flush-denormals-to-zero"]
+include = ["aiter/include"]
+src = [
+    "aiter/include/aiter_stream.h",
+    "aiter/include/aiter_tensor.h",
+    "aiter/include/gfx1201_sage_attention.h",
+    "aiter/include/gfx1201_sage_prepare.h",
+    "aiter/kernels/gfx1201_sage_attention.hip",
+    "aiter/torch_itfs/gfx1201_sage_torch.hip",
+]
+
 [kernel.gfx1201_sage_prepare]
-backend = "rocm"
+language = "cpp-rocm"
 depends = ["torch"]
 rocm-archs = ["gfx1201"]
 hip-flags = [
@@ -30,21 +43,4 @@ src = [
     "aiter/include/aiter_tensor.h",
     "aiter/include/gfx1201_sage_prepare.h",
     "aiter/kernels/gfx1201_sage_prepare.hip",
-]
-
-[kernel.gfx1201_sage_attention]
-backend = "rocm"
-depends = ["torch"]
-rocm-archs = ["gfx1201"]
-hip-flags = [
-    "-fgpu-flush-denormals-to-zero",
-]
-include = ["aiter/include"]
-src = [
-    "aiter/include/aiter_stream.h",
-    "aiter/include/aiter_tensor.h",
-    "aiter/include/gfx1201_sage_attention.h",
-    "aiter/include/gfx1201_sage_prepare.h",
-    "aiter/kernels/gfx1201_sage_attention.hip",
-    "aiter/torch_itfs/gfx1201_sage_torch.hip",
 ]
