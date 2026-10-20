@@ -99,12 +99,13 @@ loader's job (transformers does it with its conversion ops):
 
 - Rows are **interleaved**, `[gate_0, up_0, gate_1, up_1, ...]`. A stacked `[gate; up]` weight is
   not supported and returns wrong results without an error.
-- Gate and up are **quantized separately**, then interleaved: weight rows and scale rows alike.
-  With 128×128 block FP8 the scale grid is then `[gate block 0, up block 0, gate block 1, ...]`,
-  and each scale block covers rows of one projection. A checkpoint that was interleaved *before*
-  being quantized (one scale block mixing gate and up rows) must be requantized at load. The same
-  holds for a stacked `[gate; up]` matrix quantized as one when `N` is not a multiple of 128 (a
-  block at the boundary mixes both).
+- With 128×128 block FP8, **no scale block may mix gate and up rows**: each projection keeps its
+  own scale grid, and the scale rows are interleaved like the weight rows (`[gate block 0, up
+  block 0, gate block 1, ...]`). Separate `gate_proj` / `up_proj` checkpoint tensors satisfy this,
+  and so does a stacked `[gate; up]` matrix quantized as one when `N` is a multiple of 128 (block
+  quantization is local, so the values match). A checkpoint quantized *after* interleaving, or a
+  stacked one with `N` not a multiple of 128, has blocks that mix both and must be requantized at
+  load.
 - Per-row scales (MXFP8, MXFP4, NVFP4) and tensor-wide scales have no such ordering question.
   The NVFP4 per-expert globals of gate and up are merged into one per expert, as described above.
 
