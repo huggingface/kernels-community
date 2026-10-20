@@ -59,23 +59,23 @@ logger = logging.getLogger(__name__)
 # Include the tuner implementation alongside Triton's kernel-source hash.
 _TUNER_SOURCE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
-# Search phases ``FINEGRAINED_AUTOTUNE_CONFIG`` may override for every tuned kernel.
+# Search phases ``FINEGRAINED_KERNELS_AUTOTUNE_CONFIG`` may override for every tuned kernel.
 _SEARCH_OVERRIDES = {"runoff": bool, "basin_probes": bool, "max_refine_iters": int}
 
 
 def _search_overrides() -> dict:
-    """Search-phase overrides from ``FINEGRAINED_AUTOTUNE_CONFIG``: inline JSON or a path to a
+    """Search-phase overrides from ``FINEGRAINED_KERNELS_AUTOTUNE_CONFIG``: inline JSON or a path to a
     JSON file, e.g. ``{"runoff": false, "basin_probes": false, "max_refine_iters": 0}``. Tuner
     kwargs are fixed where each kernel is decorated, so this is the one runtime control, meant
     for fast correctness runs and search studies."""
-    value = os.environ.get("FINEGRAINED_AUTOTUNE_CONFIG")
+    value = os.environ.get("FINEGRAINED_KERNELS_AUTOTUNE_CONFIG")
     if not value:
         return {}
     overrides = json.loads(value if value.lstrip().startswith("{") else Path(value).read_text())
     unknown = set(overrides) - set(_SEARCH_OVERRIDES)
     if unknown:
         raise ValueError(
-            f"FINEGRAINED_AUTOTUNE_CONFIG has unknown keys {sorted(unknown)}; "
+            f"FINEGRAINED_KERNELS_AUTOTUNE_CONFIG has unknown keys {sorted(unknown)}; "
             f"expected a subset of {sorted(_SEARCH_OVERRIDES)}"
         )
     return {k: _SEARCH_OVERRIDES[k](v) for k, v in overrides.items()}
@@ -967,7 +967,7 @@ def bayesian_autotune(
     runoff:                   remeasure the top candidates before choosing the winner
     basin_probes:             measure categorical basin anchors before the TPE
     max_refine_iters:         coordinate-descent iterations after the TPE (0 disables)
-                              (all three overridable at runtime through FINEGRAINED_AUTOTUNE_CONFIG)
+                              (all three overridable at runtime through FINEGRAINED_KERNELS_AUTOTUNE_CONFIG)
     path_anchor_axes:         branch axes (kwarg names) whose values relocate the tile
                               optimum — one guaranteed max-tile anchor per value combo
                               (see _basin_anchor_indices); the kernel declares them, the
