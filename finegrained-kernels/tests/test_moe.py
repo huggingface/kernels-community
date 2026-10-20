@@ -39,6 +39,8 @@ from utils import (  # type: ignore
     quant_dequant_a,
     dq_grouped,
     dq_int,
+    dequant_gate_up,
+    make_gate_up,
 )
 
 from finegrained_kernels import fold_act_order_into_gate_up, moe, scheduling, swizzle_mx_scales  # type: ignore
@@ -270,11 +272,17 @@ def _make_moe_weights(problem: MoEProblem):
     deployment contract, not per call): the gate_up scale is the ONE gate-interleaved artifact
     (6D — the shape carries the layout) and every forward consumes it directly — fused kernels
     read block pairs, the unfused plain GEMM remaps its block index in-kernel."""
-    make = WEIGHTS[problem.weights]["make"]
-    gate_up, gate_up_s, gate_up_g = make(
-        2 * problem.intermediate_dim, problem.hidden_dim, problem.num_experts,
-        **({"group": problem.int_group or problem.hidden_dim} if problem.weights in INT_BITS else {}),
-    )
+    row = WEIGHTS[problem.weights]
+    make = row["make"]
+    if problem.weights in INT_BITS:  # INT groups run along K per row: the stack quantizes as is
+        gate_up, gate_up_s, gate_up_g = make(
+            2 * problem.intermediate_dim, problem.hidden_dim, problem.num_experts,
+            group=problem.int_group or problem.hidden_dim,
+        )
+    else:
+        gate_up, gate_up_s, gate_up_g = make_gate_up(
+            row, problem.intermediate_dim, problem.hidden_dim, problem.num_experts
+        )
     down, down_s, down_g = make(
         problem.hidden_dim, problem.intermediate_dim, problem.num_experts,
         **({"group": problem.int_group or problem.intermediate_dim} if problem.weights in INT_BITS else {}),
@@ -352,7 +360,7 @@ def _static_scales(problem: MoEProblem, hidden, gate_up, gate_up_s, top_k_index)
         if problem.weights in INT_BITS else (
             dq_grouped(gate_up, gate_up_s, 32)
             if problem.weights == "nvfp4" and problem.activation_format == "fp8"
-            else WEIGHTS[problem.weights]["dequant"](gate_up, gate_up_s).float()
+            else dequant_gate_up(WEIGHTS[problem.weights], gate_up, gate_up_s).float()
         )
     )
     inter = fused_glu(

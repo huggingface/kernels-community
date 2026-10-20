@@ -26,7 +26,7 @@ from .bayesian_autotuner import bayesian_autotune
 from .bench import weight_input
 from .compat import add_op_namespace_prefix, FP8_DTYPE, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, persistent_program_count, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, pipeline_autotuning_configs, persistent_programs_per_sm, is_sm10x
 from .descriptors import build_grouped_operand_descriptors, rebind_grouped_descriptors, rebind_grouped_mx_descriptors
-from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
+from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, is_per_expert_global, normalize_global_scale, e2m1_as_uint8, expert_weight_shape, is_mx, mx_scale_family, normalize_per_expert_scale, resolve_activation_format, resolve_output_dtype, routed_rows, row_scale_stride, tokens_per_expert_bucket, ue8m0_as_uint8, validate_dense_operands, weight_block_size, validate_int_operands, INT_WEIGHT_DTYPES
 from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_grouped, mx_act_quant_routed_rows, quantize_routed_rows_per_expert, static_expert_act_operands, swizzle_grouped_mx_scales, tensor_wide_act_operands, prepare_fp8_mx_inputs, permute_routed_rows
 from .swizzle import swizzled_scale_descriptor
 from .loading.scales import apply_row_scale, dequant_block_fp8_weight
@@ -237,8 +237,8 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
             stride_b_k,
             False,
         )
-        # under GATE the tile's two scale blocks are the adjacent pair at 2*pid_n; non-GATE reads
-        # the single block (up_s_ptr dead).
+        # under GATE the tile's two scale blocks are the adjacent (gate, up) pair at 2*pid_n; non-GATE
+        # reads the single block (up_s_ptr dead).
         gate_s_ptr = Bs + expert_id64 * stride_bs_e + ((2 if GATE else 1) * pid_n) * stride_bs_n
         up_s_ptr = gate_s_ptr + stride_bs_n
 
@@ -1802,7 +1802,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
     expert_start: torch.Tensor,
     block_size: List[int],
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1878,7 +1878,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped(
         cs_dtype = bs_u8.dtype
         Cs = torch.empty(S, N // block_n, device=A.device, dtype=cs_dtype)
     else:
-        C = A.new_empty(S, N, dtype=output_dtype)
+        C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
         Cs = None  # unread without an OUTPUT_FORMAT; strides literal below
     num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
@@ -1954,7 +1954,7 @@ def w8a8_block_static_fp8_matmul_grouped(
     expert_start: torch.Tensor,
     block_size: List[int],
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -2010,7 +2010,7 @@ def w8a8_block_static_fp8_matmul_grouped(
         # from this dtype (fp32 weights keep fp32), matching the block-dynamic requant.
         Cs = torch.empty(S, N // block_n, device=A.device, dtype=bs_u8.dtype)
     else:
-        C = A.new_empty(S, N, dtype=output_dtype)
+        C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
         Cs = None  # unread without an OUTPUT_FORMAT; strides literal below
     num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
@@ -2084,7 +2084,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -2149,7 +2149,7 @@ def w8a8_tensor_dynamic_fp8_matmul_grouped(
         if as_stride_m:
             As = row_scales.view(-1)
             as_stride_m = As.stride(0)
-    C = A.new_empty(S, N, dtype=output_dtype)
+    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A, B.view(num_experts, 2 * N if gate else N, K)
     )
@@ -2215,7 +2215,7 @@ def mx_dynamic_matmul_grouped(
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -2445,7 +2445,7 @@ def mx_dynamic_matmul_grouped(
     elif requant:
         C = A.new_empty((S, N), dtype=FP8_DTYPE)
     else:
-        C = A.new_empty((S, N), dtype=output_dtype)
+        C = A.new_empty((S, gate_out_cols(N, gate, act_fn)), dtype=output_dtype)
     if swizzled_out:
         cb_cs = triton.cdiv(N // scale_group, 4)
         cs_ret = torch.empty(1, n_m_tiles, cb_cs, 2, 256, device=A.device, dtype=scale_dtype)
@@ -2544,7 +2544,7 @@ def full_precision_matmul_grouped(
     B: torch.Tensor,
     expert_start: torch.Tensor,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -2581,7 +2581,7 @@ def full_precision_matmul_grouped(
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
 
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    C = A.new_empty(S, N, dtype=output_dtype)
+    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A, B.view(num_experts, 2 * N if gate else N, K)
     )
@@ -2639,7 +2639,7 @@ def block_fp8_weight_only_matmul_grouped(
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -2676,7 +2676,7 @@ def block_fp8_weight_only_matmul_grouped(
     Bs = ue8m0_as_uint8(Bs)
 
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    C = A.new_empty(S, N, dtype=output_dtype)
+    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
     num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(
         A, B.view(num_experts, 2 * N if gate else N, K)
@@ -2741,7 +2741,7 @@ def mx_weight_only_matmul_grouped(
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -2777,7 +2777,7 @@ def mx_weight_only_matmul_grouped(
     a_global_scale = normalize_global_scale(a_global_scale, num_experts)
     S = routed_rows(A, gather_idx, scatter_idx, expert_start, num_experts)
     output_dtype = resolve_output_dtype(output_dtype, A, None)
-    C = A.new_empty(S, N, dtype=output_dtype)
+    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
     b_u8 = e2m1_as_uint8(B)
     bs_u8 = ue8m0_as_uint8(Bs)
     # Operand host-TMA descriptors (A over (S, K), B over the (E, 2N|N, K_bytes) weight view);
@@ -2850,7 +2850,7 @@ def int_weight_only_matmul_grouped(
     Bs: torch.Tensor,
     expert_start: torch.Tensor,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -2888,7 +2888,7 @@ def int_weight_only_matmul_grouped(
             quant_dtype=torch.int8 if smoothquant else FP8_DTYPE,
         )
         gather_idx = None
-    C = A.new_empty(S, N, dtype=output_dtype)
+    C = A.new_empty(S, gate_out_cols(N, gate, act_fn), dtype=output_dtype)
     num_sms = persistent_program_count(A.device.index)
     a_descriptor, b_descriptor = build_grouped_operand_descriptors(A, B)
     schedule = packed_schedule_buffer(S, num_experts, expert_start.device)
@@ -2956,7 +2956,7 @@ def matmul_grouped(
     activation_format: str | None = None,
     activation_scale_ub: float | None = None,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     quantize_output: bool = False,
@@ -2984,7 +2984,8 @@ def matmul_grouped(
     packed E2M1 activations). ``Bs`` ``None`` = unquantized BF16/FP16 weights.
     ``quantize_output`` requantizes the output into ``activation_format`` — the return is then
     ``(C, Cs)``. ``gate``/``act_fn``/``swiglu_alpha``/``swiglu_limit`` fuse the gate|up GLU into the
-    epilogue.
+    epilogue; ``act_fn=None`` with ``gate`` skips it, returning the raw interleaved gate|up
+    output for a host-side activation.
     ``As``/``Bs`` are each a bare block-scale tensor; the two-level NVFP4 second-level scales ride
     the separate ``a_global_scale``/``b_global_scale`` (fp32 per-tensor, weights per-expert ``(E,)``;
     from ``nvfp4_quantize_two_level``), and the op folds ``g_a · g_b`` onto the accumulator. The
@@ -3019,6 +3020,7 @@ def matmul_grouped(
         A, As, B, Bs, a_global_scale, b_global_scale, output_global_scale,
         b_zero, b_perm, a_pre_quant_scale, activation_format, quantize_output, activation_scale_ub,
     )
+    assert act_fn is not None or not quantize_output, "the raw gate|up output (act_fn=None) is not requantized"
     if gather_idx is not None and activation_format == "bf16" and As is None and a_pre_quant_scale is None:
         # weight-only: raw bf16 rows are what the kernel consumes, so the trade is decided
         # here; the QUANTIZED formats decide it in their family wrappers AFTER the act quant

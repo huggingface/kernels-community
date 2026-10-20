@@ -30,7 +30,7 @@ weight scales pre-swizzled into the 5D SWIZZLE_32_4_4 tcgen05 layout — a pure 
 checked against the affine reference).
 Nothing in this file uses a kernel under test as the oracle."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -46,10 +46,12 @@ from utils import (  # type: ignore
     SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
+    dequant_gate_up,
     dq_block_fp8,
     dq_grouped,
     dq_int,
     dq_scale,
+    make_gate_up,
     make_static_activation_scale,
     make_gptq_act_order,
     maybe_compile,
@@ -577,17 +579,12 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
         if problem.activation_format == "fp8":
             global_scale = Bs_global.view(-1, 1, 1)
             W = (W / global_scale).clamp(-448, 448).to(torch.float8_e4m3fn).float() * global_scale
-    elif problem.gate and problem.weights in ("fp8_128x128", "fp8_128x128_ue8m0"):
-        # Gate/up weight rows alternate per value; their calibrated scale rows alternate per block.
-        gate_w = row["dequant"](B[:, 0::2], Bs[:, 0::2])
-        up_w = row["dequant"](B[:, 1::2], Bs[:, 1::2])
-        W = torch.stack((gate_w, up_w), dim=-2).flatten(-3, -2)
+    elif problem.weights == "nvfp4" and problem.activation_format == "fp8":
+        W = dq_grouped(B, Bs, 32) * Bs_global.view(-1, 1, 1)
+    elif problem.gate:
+        W = dequant_gate_up(row, B, Bs, Bs_global)
     else:
-        W = (
-            dq_grouped(B, Bs, 32) * Bs_global.view(-1, 1, 1)
-            if problem.weights == "nvfp4" and problem.activation_format == "fp8"
-            else row["dequant"](B, Bs, Bs_global)
-        )
+        W = row["dequant"](B, Bs, Bs_global)
     if problem.activation_format == "bf16":
         W = W.to(A.dtype).float()
     bias = _bias(problem, op)
@@ -606,7 +603,7 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
         down = (A_raw.float() @ lora_a.float().T).to(problem.dtype)
         correction = (down.float() @ lora_b.float().T).to(problem.dtype)
         ref = ref.to(problem.dtype) + correction
-    if problem.gate:
+    if problem.gate and problem.act_fn is not None:  # act_fn=None: the raw gate|up columns
         gate_v, up_v = ref[..., 0::2], ref[..., 1::2]
         ref = apply_glu(
             gate_v, up_v, problem.act_fn, problem.swiglu_alpha, problem.swiglu_limit
@@ -648,7 +645,8 @@ def _reference(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, A
     return list(REQUANT_FN[problem.activation_format](scaled.to(problem.dtype)))
 
 
-def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_global=None, out_global=None):
+def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_global=None, out_global=None,
+        output_dtype=None):
     """The op half of the symmetric ``(ref, op)`` pair — the same inputs as ``_reference`` (plus
     ``As`` for the pre-quantized-input test). Runs the kernel on the format's operands (swizzling
     weight scales; the two-level per-tensor globals ride as the decoupled ``a_global_scale`` /
@@ -673,7 +671,7 @@ def _op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As=None, As_globa
             swiglu_limit=problem.swiglu_limit,
         )
     if not problem.quantize_output:
-        kw["output_dtype"] = None if problem.prequant else problem.dtype
+        kw["output_dtype"] = output_dtype or (None if problem.prequant else problem.dtype)
     if problem.bias:
         kw["bias"] = _bias(problem, op)
     if problem.zero_points:
@@ -800,9 +798,12 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
 
 
 def _make_weights(problem: Problem, row, E):
-    """The scenario's weights: ``(B, Bs, Bs_global)`` at the stack's row count (doubled under gate)."""
+    """The scenario's weights: ``(B, Bs, Bs_global)``; under gate the interleaved gate|up stack."""
     kwargs = {"group": problem.int_group or problem.K} if problem.weights in INT_BITS else {}
-    B, Bs, Bs_global = row["make"](2 * problem.N if problem.gate else problem.N, problem.K, E, **kwargs)
+    if problem.gate and problem.weights not in INT_BITS:
+        B, Bs, Bs_global = make_gate_up(row, problem.N, problem.K, E)
+    else:  # INT groups run along K per row: the stack quantizes as is
+        B, Bs, Bs_global = row["make"](2 * problem.N if problem.gate else problem.N, problem.K, E, **kwargs)
     if problem.weights == "nvfp4" and problem.activation_format == "fp8":
         Bs = Bs[..., ::2].contiguous()  # valid group-32 E4M3 payload; both FP4 halves use one scale
     if problem.weights in INT_BITS and problem.activation_format == "fp8":
@@ -888,6 +889,26 @@ def _run_ref_vs_op(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, shared
         )
     out = _op(problem, op, A, expert_ids, B, Bs, Bs_global, As=As, As_global=As_global, out_global=g_out)
     _assert_op_layout(problem, op, out)
+    if problem.gate and not problem.quantize_output:
+        # The GLU scales the gate|up accumulation error by |act(gate)|: on a cancelling up column
+        # the summation-order noise of any fp32 GEMM (cuBLAS included) exceeds the output
+        # tolerance. So check the GEMM (raw gate|up, act_fn=None) against the reference, then the
+        # GLU against the reference GLU of the kernel's own gate|up (fp32, as the epilogue reads its
+        # accumulators) — each at its own error scale.
+        raw_problem = replace(problem, act_fn=None)
+        raw_ref = shared.get("raw_ref") if shared else None
+        if raw_ref is None:
+            raw_ref = _fp32_intermediate(raw_problem, op, A, expert_ids, B, Bs, Bs_global, As, As_global)
+            if shared is not None:
+                shared["raw_ref"] = raw_ref
+        raw = _dequant(raw_problem, _op(
+            raw_problem, op, A, expert_ids, B, Bs, Bs_global, As=As, As_global=As_global, out_global=g_out,
+            output_dtype=torch.float32,
+        ), g_out, expert_ids)
+        _check(raw_problem, raw, raw_ref, expert_ids, op)
+        ref = apply_glu(
+            raw[..., 0::2], raw[..., 1::2], problem.act_fn, problem.swiglu_alpha, problem.swiglu_limit
+        ).float()
     _check(
         problem,
         _dequant(problem, out, g_out, expert_ids),
@@ -911,6 +932,8 @@ _SWEEP_CELLS = [
     (Problem(weights="mxfp4", S=8), "batched", mx_dynamic_matmul_batched_kernel),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", mx_dynamic_matmul_grouped_kernel),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", mx_dynamic_matmul_kernel),
+    # non-128 N on the 2D gate|up tile (gpt-oss-style N=320): the BN=128 tile overhangs N
+    (Problem(weights="mxfp4", gate=True, activation_format="mxfp4", quantize_output=True, N=320, K=320), "matmul", mx_dynamic_matmul_kernel),
     (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", mx_dynamic_matmul_batched_kernel),
     (Problem(weights="fp8_128x128", activation_format="bf16"), "grouped", block_fp8_weight_only_matmul_grouped_kernel),
     # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize

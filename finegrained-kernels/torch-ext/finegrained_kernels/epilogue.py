@@ -670,23 +670,31 @@ def gemm_epilogue(
                 BLOCK_SIZE_M, 2 * BLOCK_SIZE_N, FAKE_BATCH,
                 2 * N_COLS if N_COLS > 0 else 0,
             )
-        out = split_gate_up_glu(
-            flat, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB,
-            ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
-        )
-        if OUTPUT_FORMAT == "fp8":
-            _epilogue_requant_fp8(
-                C, Cs, out, out_row, pid_n, row_mask, stride_c_m, stride_c_n, stride_cs_m, stride_cs_n,
-                BLOCK_SIZE_M, BLOCK_SIZE_N, FAKE_BATCH, N_COLS,
+        if ACT_FN is None:  # the raw gate|up tile, activation left to the caller: stored like PreAct
+            _store_out(
+                C, flat,
+                out_row, pid_n, row_mask, stride_c_m, stride_c_n,
+                BLOCK_SIZE_M, 2 * BLOCK_SIZE_N, FAKE_BATCH,
+                2 * N_COLS if N_COLS > 0 else 0,
             )
-        elif OUTPUT_FORMAT is not None:  # "mxfp8" | "mxfp4" | "nvfp4"
-            _epilogue_requant_mx(
-                C, Cs, out, out_row, pid_n, pid_m, row_mask, stride_c_m, stride_c_n, stride_cs_m,
-                stride_cs_n, CSDescriptor, CsGlobal, global_row * stride_cs_global,
-                BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_FORMAT, SWIZZLED_OUT, FAKE_BATCH, N_COLS,
+        else:
+            out = split_gate_up_glu(
+                flat, BLOCK_SIZE_M, BLOCK_SIZE_N, SWAP_AB,
+                ACT_FN, SWIGLU_ALPHA, SWIGLU_LIMIT, SIMULATE_UNFUSED, INTERMEDIATE_DTYPE,
             )
-        else:  # bf16 (unquantized) SwiGLU output
-            _store_out(C, out, out_row, pid_n, row_mask, stride_c_m, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N, FAKE_BATCH, N_COLS)
+            if OUTPUT_FORMAT == "fp8":
+                _epilogue_requant_fp8(
+                    C, Cs, out, out_row, pid_n, row_mask, stride_c_m, stride_c_n, stride_cs_m, stride_cs_n,
+                    BLOCK_SIZE_M, BLOCK_SIZE_N, FAKE_BATCH, N_COLS,
+                )
+            elif OUTPUT_FORMAT is not None:  # "mxfp8" | "mxfp4" | "nvfp4"
+                _epilogue_requant_mx(
+                    C, Cs, out, out_row, pid_n, pid_m, row_mask, stride_c_m, stride_c_n, stride_cs_m,
+                    stride_cs_n, CSDescriptor, CsGlobal, global_row * stride_cs_global,
+                    BLOCK_SIZE_M, BLOCK_SIZE_N, SCALE_GROUP_K, OUTPUT_FORMAT, SWIZZLED_OUT, FAKE_BATCH, N_COLS,
+                )
+            else:  # bf16 (unquantized) SwiGLU output
+                _store_out(C, out, out_row, pid_n, row_mask, stride_c_m, stride_c_n, BLOCK_SIZE_M, BLOCK_SIZE_N, FAKE_BATCH, N_COLS)
     else:  # plain GEMM: cast + store the accumulator (no fused requant on the non-gate path)
         acc = add_bias(
             apply_global_scale(

@@ -26,10 +26,10 @@ from .bayesian_autotuner import bayesian_autotune
 from .bench import weight_input
 from .compat import add_op_namespace_prefix, FP8_DTYPE, is_sm10x, launches_skipped, NIBBLES_PER_BYTE, compile_time_only_triton_op, compile_time_only_triton_wrap, device_context, get_accelerator_autotuning_configs, pdl_launch_kwargs, tl_dtype, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, narrow_dot_autotuning_configs, narrow_scalar_autotuning_configs, split_k_autotuning_configs, persistent_program_count
 from .descriptors import maybe_descriptor, rebind_bd_descriptors, rebind_mx_descriptors, rebind_tiled_descriptors, rebind_weight_only_descriptors, int_weight_only_pre_hook
-from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
+from .formats import FP8_WEIGHT_ONLY_DEQUANT_MIN_M, block_fp8_weight_scale_grid, _validate_quantization_args, global_scale_stride, gate_out_cols, normalize_global_scale, e2m1_as_uint8, is_mx, is_rowwise, mx_scale_family, resolve_activation_format, resolve_output_dtype, row_scale_stride, ue8m0_as_uint8, validate_dense_2d_operands, weight_format, validate_int_operands, validate_svdquant_operands, INT_WEIGHT_DTYPES
 from .swizzle import swizzle_mx_scales, swizzled_scale_descriptor
 from .quant import MX_ACT_QUANT, fp8_act_quant_block_dynamic, maybe_act_quant, mxfp8_act_quant, nvfp4_act_quant, quantize_rows_static, tensor_wide_act_operands, prepare_fp8_mx_inputs, dequantize_int_weight, permute_act_cols, svdquant_act_quant
-from .loading.scales import apply_row_scale, dequant_block_fp8_weight, mx_2d_scale_ptrs
+from .loading.scales import apply_row_scale, dequant_block_fp8_weight, mx_2d_scale_ptrs, weight_scale_rows
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, plain_dot, static_dot, int_weight_only_compute
 from .loading.tiles import (
     advance_ptrs,
@@ -227,15 +227,14 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # Explicit operand-tile pointers on the pointer arm; a scalar placeholder on a descriptor
     # arm (which reads its box via the descriptor — the [BM,BK]/[BK,BN] index tensor would stay
     # live across the K-loop for nothing and spill registers, ~460us / 20pp MFU at wide-N prefill).
-    # Under GATE the weight is the stacked (2N, K) gate|up tile (matmul_weight_ptrs; pointer-only, the
-    # descriptor box can't span the N-apart rows), and its per-weight-row block scale is a 2*BN gather
-    # (gate rows [0,N), up rows offset by N//block_n scale blocks) — the block_dynamic_dot broadcast
-    # then folds it per row exactly as in the dense case.
+    # Under GATE the weight is the interleaved (2N, K) gate|up tile (matmul_weight_ptrs), and its
+    # per-weight-row block scale is a 2*BN gather (``weight_scale_rows``) — the block_dynamic_dot
+    # broadcast then folds it per row exactly as in the dense case.
     a_ptrs = operand_tile_ptrs(A, offs_am, offs_k, stride_a_m, stride_a_k, A_MEMORY_MODE, not SWAP_AB)
     b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
     # the scale-index gather decouples the tile from the scale grid: a wide tile spans several
     # scale columns, a narrow one shares a column
-    bs_ptrs = Bs + (offs_bn_lin // block_n) * stride_bs_n
+    bs_ptrs = Bs + weight_scale_rows(offs_bn_lin, block_n, GATE) * stride_bs_n
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
@@ -548,7 +547,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     # non-affine scale read the wrap induces, matching the block-dynamic kernel above.
     b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE)
     offs_bn_lin = pid_n * n_width + tl.arange(0, n_width)
-    bs_ptrs = Bs + (offs_bn_lin // block_n) * stride_bs_n
+    bs_ptrs = Bs + weight_scale_rows(offs_bn_lin, block_n, GATE) * stride_bs_n
     bs_mask = offs_bn_lin < n_rows
     a_s_static = tl.load(As)
 
@@ -1455,7 +1454,7 @@ def w8a8_block_dynamic_fp8_matmul(
     block_size: List[int],
     output_dtype: torch.dtype | None = None,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1498,7 +1497,7 @@ def w8a8_block_dynamic_fp8_matmul(
     A_q, A_s = fp8_act_quant_block_dynamic(
         A.view(M, K), block_k, use_ue8m0=bs_u8.dtype == torch.uint8
     )
-    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+    C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
     # Host TMA descriptors over the (M, K) / (N, K) matrices — the placeholder box is
     # re-bound per tuned config by rebind_bd_descriptors. Read only by the descriptor
     # (host-TMA) configs the tuner picks for wide-N prefill; pointer configs never touch
@@ -1565,7 +1564,7 @@ def w8a8_block_static_fp8_matmul(
     block_size: List[int],
     output_dtype: torch.dtype | None = None,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1616,7 +1615,7 @@ def w8a8_block_static_fp8_matmul(
         )
 
     bs_u8 = ue8m0_as_uint8(Bs)
-    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+    C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
     As = As.reshape(1).to(torch.float32)
     # M-gated static pre-quant (bit-exact with the inline arm: same scalar, same cast);
     # like MX, the inline form is cheap elementwise work — at M=1 a separate kernel is
@@ -1684,7 +1683,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
     As: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1745,7 +1744,7 @@ def w8a8_tensor_dynamic_fp8_matmul(
         qA = torch.empty(a_rows, K, device=qA.device, dtype=qA.dtype)[:M].copy_(qA)
     Bs = Bs.reshape(-1, 1)
 
-    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+    C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
     # placeholder boxes, re-bound per tuned config by rebind_tiled_descriptors
     a_descriptor = TensorDescriptor(qA, [a_rows, K], [K, 1], [1, 16])
     b_descriptor = maybe_descriptor(B, [1, 16])
@@ -1804,7 +1803,7 @@ def mx_dynamic_matmul(
     output_dtype: torch.dtype | None = None,
     activation_format: str | None = None,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -1966,7 +1965,7 @@ def mx_dynamic_matmul(
     elif output_format == "mxfp8":
         C = A.new_empty(A.shape[:-1] + (N,), dtype=FP8_DTYPE)
     else:
-        C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+        C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
     if swizzled_out:
         cb_cs = triton.cdiv(N // out_g, 4)
         cs_ret = torch.empty(1, triton.cdiv(M, 128), cb_cs, 2, 256, device=A.device, dtype=cs_dtype)
@@ -2082,7 +2081,7 @@ def full_precision_matmul_2d(
     B: torch.Tensor,
     output_dtype: torch.dtype | None = None,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -2099,7 +2098,7 @@ def full_precision_matmul_2d(
     # Under gate|up fusion B is the (2N, K) gate|up stack; N is the per-projection output width.
     N = rows // 2 if gate else rows
     M = A.numel() // A.shape[-1]
-    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+    C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
 
     a_descriptor = maybe_descriptor(A.view(M, K), [16, 32])
     b_descriptor = maybe_descriptor(B, [16, 32])
@@ -2153,7 +2152,7 @@ def mx_weight_only_matmul_2d(
     Bs: torch.Tensor,
     output_dtype: torch.dtype | None = None,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -2192,7 +2191,7 @@ def mx_weight_only_matmul_2d(
     bs_u8 = ue8m0_as_uint8(Bs)
     b_global_scale = normalize_global_scale(b_global_scale, 1)
     a_global_scale = normalize_global_scale(a_global_scale, 1)
-    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+    C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
     # Host-TMA descriptors over the (M, K) bf16 A and packed (N, K_bytes) weight — placeholder box
     # rebound per tuned config by rebind_weight_only_descriptors, read only by the descriptor configs the
     # tuner picks (pointer configs never touch them). Scales stay affine (no scale descriptor).
@@ -2255,7 +2254,7 @@ def block_fp8_weight_only_matmul_2d(
     Bs: torch.Tensor,
     output_dtype: torch.dtype | None = None,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -2272,7 +2271,8 @@ def block_fp8_weight_only_matmul_2d(
     N = rows // 2 if gate else rows
     if M >= FP8_WEIGHT_ONLY_DEQUANT_MIN_M:
         weights = dequant_block_fp8_weight(B, Bs, A.dtype, gate=gate)
-        if (not gate and output_dtype in (None, A.dtype)
+        # no GLU to fuse (ungated, or the raw gate|up output): cuBLAS over the dequantized rows
+        if ((not gate or act_fn is None) and output_dtype in (None, A.dtype)
                 and (bias is None or bias.dtype == A.dtype)):
             native_bias = bias[0] if bias is not None and bias.ndim == 2 else bias
             with torch.autocast(A.device.type, enabled=False):
@@ -2284,7 +2284,7 @@ def block_fp8_weight_only_matmul_2d(
     Bs, scale_block_n, scale_block_k = block_fp8_weight_scale_grid(B, Bs, gate)
     Bs = ue8m0_as_uint8(Bs)
     dtype = resolve_output_dtype(output_dtype, A, None)
-    C = A.new_empty(A.shape[:-1] + (N,), dtype=dtype)
+    C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=dtype)
     a_descriptor = maybe_descriptor(A.view(M, K), [1, 32])
     b_descriptor = maybe_descriptor(B, [1, 32])
     with device_context(A.device):
@@ -2318,7 +2318,7 @@ def int_weight_only_matmul_2d(
     Bs: torch.Tensor,
     output_dtype: torch.dtype | None = None,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
@@ -2355,7 +2355,7 @@ def int_weight_only_matmul_2d(
         and not gate and bias is None and output_dtype in (None, A.dtype)
     ):
         return full_precision_matmul_2d(A, dequantize_int_weight(B, Bs, K, b_zero, dtype=A.dtype), output_dtype)
-    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+    C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
     # placeholder boxes, rebound per tuned config by rebind_weight_only_descriptors
     a_descriptor = TensorDescriptor.from_tensor(A.view(M, K), [1, 32])
     b_descriptor = TensorDescriptor.from_tensor(B, [1, 32])
@@ -2604,7 +2604,7 @@ def matmul_2d(
     activation_format: str | None = None,
     activation_scale_ub: float | None = None,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     quantize_output: bool = False,
@@ -2638,9 +2638,9 @@ def matmul_2d(
     ``activation_format`` is the activations' quantization: ``None`` (default) = the weights' own
     format, ``"bf16"`` = weight-only (no activation quant), or an explicit ``"fp8"`` / ``"mxfp8"`` /
     ``"mxfp4"`` / ``"nvfp4"`` (``"mxfp8"`` on MXFP4 weights = the W4A8 chain; ``check_activation_format``
-    has the per-family matrix). ``gate=True`` reads ``B`` as the ``(2N, K)`` gate|up stack and fuses
-    the ``act_fn`` GLU (``swiglu_alpha``/``swiglu_limit`` its clamped variant), returning the
-    ``[..., N]`` intermediate; ``quantize_output=True`` (MX weights only) stores that intermediate in
+    has the per-family matrix). ``gate=True`` reads ``B`` as the interleaved ``(2N, K)`` gate|up weight and
+    fuses the ``act_fn`` GLU (``swiglu_alpha``/``swiglu_limit`` its clamped variant), returning the
+    ``[..., N]`` intermediate (``act_fn=None``: the raw ``[..., 2N]`` gate|up output instead); ``quantize_output=True`` (MX weights only) stores that intermediate in
     ``activation_format`` and returns ``(C, Cs)`` for the next op.
 
     ``svdquant_lora_a`` (rank, K) and ``svdquant_lora_b`` (N_out, rank) add ModelOpt's
@@ -2662,6 +2662,7 @@ def matmul_2d(
         A, As, B, Bs, a_global_scale, b_global_scale, output_global_scale,
         b_zero, b_perm, a_pre_quant_scale, activation_format, quantize_output, activation_scale_ub,
     )
+    assert act_fn is not None or not quantize_output, "the raw gate|up output (act_fn=None) is not requantized"
     validate_svdquant_operands(A, B, As, Bs, activation_format, output_dtype, svdquant_lora_a, svdquant_lora_b, a_pre_quant_scale)
 
     def _unwrap(ret: list[torch.Tensor]) -> torch.Tensor | tuple[torch.Tensor, ...]:

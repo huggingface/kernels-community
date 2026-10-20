@@ -296,10 +296,11 @@ def _host_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit, gate):
 
 
 def _fused_glu(act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, gate) -> dict:
-    """The gate_up GEMM's fused-GLU kwargs when the activation is a fusable name; ``{}`` (a plain
-    GEMM) sends a callable — or an unfusable name, rejected in ``_host_glu`` — to the host."""
+    """The gate_up GEMM's fused-GLU kwargs when the activation is a fusable name; a callable — or an
+    unfusable name, rejected in ``_host_glu`` — gets ``act_fn=None``: the raw gate|up output, for
+    the host."""
     if not isinstance(act_fn, str) or act_fn not in get_supported_act_fns():
-        return {}
+        return dict(gate=gate, act_fn=None)
     return dict(
         gate=gate,
         act_fn=act_fn,
@@ -437,6 +438,7 @@ def moe_fused_grouped(
     )
     num_top_k = top_k_index.size(-1)
     glu = _fused_glu(act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, gate)
+    fused = glu["act_fn"] is not None
     NUM_EXPERTS = gate_up_proj.size(0)
     expert_start, gather_idx, scatter_idx = compute_grouped_scheduling(
         top_k_index, NUM_EXPERTS, num_top_k
@@ -473,14 +475,14 @@ def moe_fused_grouped(
         # no requant. So does static, whose epilogue has no calibrated scale to requant against.
         activation_format=fmt,
         activation_scale_ub=activation_scale_ub,
-        quantize_output=bool(glu) and fmt != "bf16" and not static_act and not per_token and down_proj_pre_quant_scale is None,
+        quantize_output=fused and fmt != "bf16" and not static_act and not per_token and down_proj_pre_quant_scale is None,
         output_dtype=hidden_states.dtype,
         gather_idx=gather_idx,
     )
     inter, inter_scale = (
         gate_up_out if isinstance(gate_up_out, tuple) else (gate_up_out, None)
     )
-    if not glu:
+    if not fused:
         inter = _host_glu(inter, act_fn, swiglu_alpha, swiglu_limit, gate)
     # Phase 2: grouped down over the expert-ordered pre-quantized intermediate (its dtypes
     # carry the format; gather_idx=None), scattering to routed rows (scatter_idx).
@@ -575,6 +577,7 @@ def moe_fused_batched(
         gate, gate_up_proj_weight_zero_point, down_proj_weight_zero_point,
     )
     glu = _fused_glu(act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, gate)
+    fused = glu["act_fn"] is not None
     NUM_EXPERTS = gate_up_proj.size(0)
     expert_ids = top_k_index.reshape(-1)
     gather_idx = _gather_idx(top_k_index)
@@ -611,7 +614,7 @@ def moe_fused_batched(
         activation_format=fmt,
         activation_scale_ub=activation_scale_ub,
         quantize_output=(
-            bool(glu)
+            fused
             and fmt != "bf16"
             and (fmt != "fp8" or expert_ids.numel() <= GATE_UNSTACK_MAX_S)
             and not static_act
@@ -624,7 +627,7 @@ def moe_fused_batched(
     inter, inter_scale = (
         gate_up_out if isinstance(gate_up_out, tuple) else (gate_up_out, None)
     )
-    if not glu:
+    if not fused:
         inter = _host_glu(inter, act_fn, swiglu_alpha, swiglu_limit, gate)
     # Phase 2: batched down over the intermediate (its dtypes carry the format; already
     # routed-order, no gather).
@@ -748,6 +751,8 @@ def moe_unfused_grouped(
             a_pre_quant_scale=gate_up_proj_pre_quant_scale,
             expert_start=expert_start,
             bias=gate_up_proj_bias,
+            gate=gate,
+            act_fn=None,  # raw gate|up output, the GLU runs on the host
             activation_format=fmt,
             activation_scale_ub=activation_scale_ub,
             output_dtype=hidden_states.dtype,
@@ -1045,6 +1050,8 @@ def moe_unfused_batched(
             a_pre_quant_scale=gate_up_proj_pre_quant_scale,
             expert_ids=expert_ids,
             bias=gate_up_proj_bias,
+            gate=gate,
+            act_fn=None,  # raw gate|up output, the GLU runs on the host
             activation_format=fmt,
             activation_scale_ub=activation_scale_ub,
             output_dtype=hidden_states.dtype,

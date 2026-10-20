@@ -22,6 +22,16 @@ from ..quant import fp8_act_quant_inline, mx_act_quant_inline
 
 
 @triton.jit
+def weight_scale_rows(rows, BLOCK_N: tl.constexpr, GATE_UP: tl.constexpr):
+    """The block-scale row of each weight row. ``GATE_UP`` (an interleaved gate|up weight): a
+    checkpoint quantizes gate and up separately, so row ``r`` is row ``r // 2`` of projection
+    ``r % 2``, and the scale grid interleaves their blocks the same way: ``[gate 0, up 0, ...]``."""
+    if GATE_UP:
+        return 2 * ((rows // 2) // BLOCK_N) + rows % 2
+    return rows // BLOCK_N
+
+
+@triton.jit
 def load_block_fp8_act_tile(
     a_ptrs,
     as_ptrs,
