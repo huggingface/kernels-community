@@ -181,11 +181,45 @@ def compute_grouped_scheduling(
 
 def routed_expert_start(expert_ids: torch.Tensor, num_experts: int) -> torch.Tensor | None:
     """``expert_start`` of an unsorted (batched) routing: its consumers only need which experts
-    have routed rows, to skip per-expert work on the rest. ``None`` (every expert) when the expert
-    count is not a power of 2, which the scheduling kernels cannot hold."""
+    have routed rows, to skip per-expert work on the rest, so only the count and offset launches
+    run (no sort). ``None`` (every expert) when the expert count is not a power of 2, which the
+    scheduling kernels cannot hold."""
     if num_experts & (num_experts - 1):
         return None
-    return compute_grouped_scheduling(expert_ids, num_experts, 1)[0]
+    return _compute_expert_start(expert_ids, num_experts)
+
+
+def _launch_expert_start(expert_ids: torch.Tensor, num_experts: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The count + exclusive-offset launches: ``(expert_start, counters)``, the latter the scatter's
+    per-expert cursors."""
+    device = expert_ids.device
+    expert_freq = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    expert_start = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
+    counters = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
+    with device_context(device):
+        compile_time_only_triton_wrap(_count_kernel)[
+            (triton.cdiv(expert_ids.numel(), _ROUTING_BLOCK_SIZE),)
+        ](
+            expert_ids,
+            expert_freq,
+            expert_ids.numel(),
+            NUM_EXPERTS=num_experts,
+            BLOCK_SIZE=_ROUTING_BLOCK_SIZE,
+        )
+        compile_time_only_triton_wrap(_exclusive_offsets_kernel)[(1,)](
+            expert_freq,
+            expert_start,
+            counters,
+            NUM_EXPERTS=num_experts,
+        )
+    return expert_start, counters
+
+
+@compile_time_only_triton_op(
+    add_op_namespace_prefix("compute_expert_start"), mutates_args=(), opaque=True
+)
+def _compute_expert_start(expert_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
+    return _launch_expert_start(expert_ids.int().contiguous(), num_experts)[0]
 
 
 @compile_time_only_triton_op(
@@ -197,27 +231,10 @@ def _compute_grouped_scheduling(
     device = expert_ids.device
     expert_ids = expert_ids.int().contiguous()  # routing kernels index with unit stride
     num_routed_tokens = expert_ids.numel()  # S = num_tokens * num_top_k
-    expert_freq = torch.zeros(num_experts, dtype=torch.int32, device=device)
-    expert_start = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
-    counters = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
+    expert_start, counters = _launch_expert_start(expert_ids, num_experts)
     perm = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
     perm_token = torch.empty(num_routed_tokens, dtype=torch.int32, device=device)
     with device_context(device):
-        compile_time_only_triton_wrap(_count_kernel)[
-            (triton.cdiv(num_routed_tokens, _ROUTING_BLOCK_SIZE),)
-        ](
-            expert_ids,
-            expert_freq,
-            num_routed_tokens,
-            NUM_EXPERTS=num_experts,
-            BLOCK_SIZE=_ROUTING_BLOCK_SIZE,
-        )
-        compile_time_only_triton_wrap(_exclusive_offsets_kernel)[(1,)](
-            expert_freq,
-            expert_start,
-            counters,
-            NUM_EXPERTS=num_experts,
-        )
         compile_time_only_triton_wrap(_scatter_kernel)[
             (triton.cdiv(num_routed_tokens, _ROUTING_BLOCK_SIZE),)
         ](
