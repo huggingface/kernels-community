@@ -62,7 +62,6 @@ def fp8_act_quant_inline(
 
 
 # Hardware FP4 conversions exist on every Blackwell family, independently of TMEM MMA.
-# Keep software conversion on older GPUs, ROCm, and driverless build hosts.
 _E2M1_HW_CVT = tl.constexpr(is_blackwell())
 
 

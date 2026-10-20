@@ -506,8 +506,7 @@ def is_sm10x() -> bool:
 def is_blackwell() -> bool:
     """Whether the CURRENT device is any Blackwell family: sm_10x (datacenter), sm_11x
     (Jetson Thor) or sm_12x (consumer). Wider than ``is_sm10x``: these share the FP4
-    conversion instructions but not TMEM scaled-MMA. False off-CUDA, on ROCm and on
-    driverless build boxes; cached like ``is_sm10x``."""
+    conversion instructions but not TMEM scaled-MMA."""
     return (
         torch.cuda.is_available()
         and torch.version.hip is None

@@ -272,24 +272,23 @@ def embedding_lookup(
     )
     width, vocab, scale_row, scale_col, row_block, col_block = layout
     out = torch.empty((*indices.shape, width), dtype=dtype, device=weight.device)
-    if indices.numel() == 0:
+    rows, numel = indices.numel(), out.numel()
+    if rows == 0:
         return out
     # Keep small lookups parallel; larger tiles amortize scheduling for bulk lookups.
     block = 256
-    if out.numel() >= 256 * 1024:
+    if numel >= 256 * 1024:
         block = 1024
-    if out.numel() >= 4 * 1024 * 1024:
+    if numel >= 4 * 1024 * 1024:
         block = 4096
     with device_context(weight.device):
-        compile_time_only_triton_wrap(_embedding_kernel)[
-            (triton.cdiv(out.numel(), block),)
-        ](
+        compile_time_only_triton_wrap(_embedding_kernel)[(triton.cdiv(numel, block),)](
             weight,
             indices.reshape(-1),
             scale,
             global_scale,
             out,
-            indices.numel(),
+            rows,
             width,
             vocab,
             weight.stride(0),
