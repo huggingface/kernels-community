@@ -74,7 +74,7 @@ Run: python bench/bench_moe.py                         (all rows, single GPU)
 """
 
 import csv
-import json
+import importlib.util
 import os
 import random
 import subprocess
@@ -118,16 +118,15 @@ REPLOT = ARGS.replot
 # BENCH_SHARD="g/n" marks a worker subprocess spawned by the --gpus coordinator (owns tasks where
 # i % n == g); it is the one switch that stays in the environment because the coordinator sets it.
 _SHARD = os.environ.get("BENCH_SHARD")
-if SMOKE:  # merged into any FINEGRAINED_AUTOTUNE_CONFIG already set (inline JSON or a file)
-    _autotune_config = os.environ.get("FINEGRAINED_AUTOTUNE_CONFIG", "")
-    if _autotune_config.lstrip().startswith("{"):
-        _autotune_config = json.loads(_autotune_config)
-    elif os.path.isfile(_autotune_config):
-        _autotune_config = json.loads(open(_autotune_config).read())
-    else:  # a mode name (``fast``)
-        _autotune_config = {"mode": _autotune_config} if _autotune_config else {}
-    _autotune_config.setdefault("mode", "fast")
-    os.environ["FINEGRAINED_AUTOTUNE_CONFIG"] = json.dumps(_autotune_config)
+if SMOKE:  # merged into any FINEGRAINED_AUTOTUNE_CONFIG already set, before the package import
+    _spec = importlib.util.spec_from_file_location(
+        "finegrained_autotune_config",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "torch-ext", "finegrained_kernels", "autotune_config.py"),
+    )
+    _autotune_config = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_autotune_config)
+    _autotune_config.set_autotune_defaults(mode="fast")
 
 import torch  # noqa: E402
 from triton.testing import do_bench, do_bench_cudagraph  # noqa: E402

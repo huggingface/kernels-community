@@ -54,68 +54,24 @@ from triton.runtime.autotuner import (
     triton_key,
 )
 
+from .autotune_config import load_autotune_config
+
 logger = logging.getLogger(__name__)
 
 # Include the tuner implementation alongside Triton's kernel-source hash.
 _TUNER_SOURCE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-
-# What ``FINEGRAINED_AUTOTUNE_CONFIG`` may override for every tuned kernel: tuner kwargs by name,
-# plus the debugging outputs (``key_log_path``, ``call_count_path``, ``tracebacks``).
-_TUNER_OVERRIDES = {
-    "n_trials": int, "max_failures": int, "runoff": bool, "basin_probes": bool,
-    "max_refine_iters": int, "log_path": str,
-    "key_log_path": str, "call_count_path": str, "tracebacks": bool, "lock_timeout": float,
-}
-# Named presets: ``FINEGRAINED_AUTOTUNE_CONFIG=fast``, or ``"mode"`` inside a JSON config, whose
-# explicit keys then win over the preset's.
-_TUNER_MODES = {
-    # one measured config, no search phases: correctness runs, not performance
-    "fast": {"n_trials": 1, "runoff": False, "basin_probes": False, "max_refine_iters": 0},
-}
-
-
-def _tuner_overrides() -> dict:
-    """Tuner overrides from ``FINEGRAINED_AUTOTUNE_CONFIG``: a mode name (``fast``), inline JSON,
-    or a path to a JSON file, e.g. ``{"mode": "fast", "log_path": "tune.jsonl"}``. Tuner kwargs are
-    fixed where each kernel is decorated, so this is the one runtime control, meant for fast
-    correctness runs, search studies and debugging."""
-    value = os.environ.get("FINEGRAINED_AUTOTUNE_CONFIG")
-    if not value:
-        return {}
-    if value.lstrip().startswith("{"):
-        overrides = json.loads(value)
-    elif os.path.isfile(value):
-        overrides = json.loads(Path(value).read_text())
-    else:
-        overrides = {"mode": value}
-    mode = overrides.pop("mode", None)
-    if mode is not None:
-        if mode not in _TUNER_MODES:
-            raise ValueError(
-                f"FINEGRAINED_AUTOTUNE_CONFIG mode {mode!r} is not one of {sorted(_TUNER_MODES)} "
-                "(or a JSON object / JSON file path)"
-            )
-        overrides = {**_TUNER_MODES[mode], **overrides}
-    unknown = set(overrides) - set(_TUNER_OVERRIDES)
-    if unknown:
-        raise ValueError(
-            f"FINEGRAINED_AUTOTUNE_CONFIG has unknown keys {sorted(unknown)}; "
-            f"expected a subset of {sorted(_TUNER_OVERRIDES)} or \"mode\""
-        )
-    return {k: _TUNER_OVERRIDES[k](v) for k, v in overrides.items()}
-
 
 # Host-execution counter (``call_count_path`` in FINEGRAINED_AUTOTUNE_CONFIG): every
 # BayesianAutotuner.run() call increments its kernel's tally, dumped to that path at exit.
 # Discriminates cudagraph REPLAY (host code runs only at capture) from per-token
 # re-execution — the decode-gap forensics tool.
 _CALL_COUNTS = None
-if _tuner_overrides().get("call_count_path"):
+if load_autotune_config().get("call_count_path"):
     import atexit
 
     _CALL_COUNTS = {}
 
-    def _dump_call_counts(path=_tuner_overrides()["call_count_path"]):
+    def _dump_call_counts(path=load_autotune_config()["call_count_path"]):
         with open(path, "w") as f:
             json.dump(_CALL_COUNTS, f, indent=1, sort_keys=True)
 
@@ -145,7 +101,7 @@ class BayesianAutotuner(Autotuner):
     ):
         super().__init__(*args, **kwargs)
         self.fn_name = getattr(self.fn, "__name__", str(self.fn))
-        overrides = _tuner_overrides()
+        overrides = load_autotune_config()
         # Bayesian trial budget — the per-decorator default, overridable via ``n_trials`` in
         # FINEGRAINED_AUTOTUNE_CONFIG (quick sweeps / exhaustive runs without touching the
         # decorators; set it >= grid size to fall back to stock exhaustive bench-all).
@@ -929,7 +885,7 @@ def _tuning_lock(cache, file_name: str):
         cache_dir = getattr(cache, "cache_dir", None)
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
-            deadline = time.time() + _tuner_overrides().get("lock_timeout", 1800.0)
+            deadline = time.time() + load_autotune_config().get("lock_timeout", 1800.0)
             lock_file = open(os.path.join(cache_dir, f"{file_name}.lock"), "w")
             while True:
                 try:
