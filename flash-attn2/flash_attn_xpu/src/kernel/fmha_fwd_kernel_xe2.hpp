@@ -429,13 +429,13 @@ class XeFMHAFwdKernelXe2 {
           static_cast<int>(p.q_head_stride),
           static_cast<int>(p.q_batch_stride));
       auto stride_k = cutlass::make_stride(
-          static_cast<int>(p.k_row_stride), Int<1>{},
+          static_cast<int64_t>(p.k_row_stride), Int<1>{},
           static_cast<int>(p.k_head_stride),
-          static_cast<int>(p.k_batch_stride));
+          static_cast<int64_t>(p.k_batch_stride));
       auto stride_v = cutlass::make_stride(
-          Int<1>{}, static_cast<int>(p.v_row_stride),
+          Int<1>{}, static_cast<int64_t>(p.v_row_stride),
           static_cast<int>(p.v_head_stride),
-          static_cast<int>(p.v_batch_stride));
+          static_cast<int64_t>(p.v_batch_stride));
       auto stride_o = cutlass::make_stride(
           static_cast<int>(p.o_row_stride), Int<1>{},
           static_cast<int>(p.o_head_stride),
@@ -448,19 +448,15 @@ class XeFMHAFwdKernelXe2 {
 
       // Offset K/V by leftpad to skip left-padding tokens in the cache
       if (leftpad_k > 0) {
-        dcK += leftpad_k * static_cast<int>(p.k_row_stride);
-        dcV += leftpad_k * static_cast<int>(p.v_row_stride);
+        dcK += static_cast<int64_t>(leftpad_k) * p.k_row_stride;
+        dcV += static_cast<int64_t>(leftpad_k) * p.v_row_stride;
       }
 
       auto layout_q = is_var_len
           ? make_ordered_layout(shape_Q, Step<_2, _0, _1, _3>{})
           : make_layout(shape_Q, stride_q);
-      auto layout_k = is_var_len
-          ? make_ordered_layout(shape_K, Step<_2, _0, _1, _3>{})
-          : make_layout(shape_K, stride_k);
-      auto layout_v = is_var_len
-          ? make_ordered_layout(shape_V, Step<_0, _2, _1, _3>{})
-          : make_layout(shape_V, stride_v);
+      auto layout_k = make_layout(shape_K, stride_k);
+      auto layout_v = make_layout(shape_V, stride_v);
       auto layout_o = is_var_len
           ? make_ordered_layout(shape_O, Step<_2, _0, _1, _3>{})
           : make_layout(shape_O, stride_o);
@@ -512,12 +508,16 @@ class XeFMHAFwdKernelXe2 {
       }
 
       CollectiveEpilogue epilogue{params.epilogue, shared_storage.epilogue};
+      int lse_batch_idx = idx_b;
+      if constexpr (is_var_len) {
+        lse_batch_idx = s.seq_len_qo.cumulative_length[idx_b];
+      }
       auto metadata_for_lse = std::make_tuple(
           get<0>(TileShapePV{}),
           p.lse_stride_head,
           p.lse_stride_batch,
           seq_len_qo,
-          idx_b,
+          lse_batch_idx,
           head_q,
           tile_row_idx,
           rows_of_maxima);

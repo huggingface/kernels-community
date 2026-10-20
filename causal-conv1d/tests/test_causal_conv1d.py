@@ -5,15 +5,20 @@ import math
 import torch
 import torch.nn.functional as F
 
+import kernels
 import pytest
 
 from einops import rearrange
 
 
-from causal_conv1d import causal_conv1d_fn, causal_conv1d_update, causal_conv1d_varlen_states
-from causal_conv1d.causal_conv1d_interface import causal_conv1d_ref
-from causal_conv1d.causal_conv1d_interface import causal_conv1d_update_ref
-from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states_ref
+causal_conv1d = kernels.get_kernel("kernels-community/causal-conv1d", version=2)
+
+causal_conv1d_fn = causal_conv1d.causal_conv1d_fn
+causal_conv1d_update = causal_conv1d.causal_conv1d_update
+causal_conv1d_varlen_states = causal_conv1d.causal_conv1d_varlen_states
+causal_conv1d_ref = causal_conv1d.causal_conv1d_interface.causal_conv1d_ref
+causal_conv1d_update_ref = causal_conv1d.causal_conv1d_interface.causal_conv1d_update_ref
+causal_conv1d_varlen_states_ref = causal_conv1d.causal_conv1d_varlen.causal_conv1d_varlen_states_ref
 
 
 DEVICE = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else None

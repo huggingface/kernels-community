@@ -40,6 +40,7 @@ BACKEND_TO_WORKFLOWS = {
     "rocm": {"build.yaml"},
     "metal": {"build-mac.yaml"},
     "xpu": {"build.yaml", "build-windows.yaml"},
+    "tpu": {"build.yaml"},
 }
 
 WORKFLOW_TO_BACKENDS = {
@@ -621,8 +622,8 @@ def main() -> int:
     parser.add_argument(
         "--mode",
         default="release",
-        choices=["pr", "release"],
-        help="Build mode: pr (CI only) or release (build + upload) (default: release)",
+        choices=["pr", "stage", "release"],
+        help="Build mode: pr (CI only), stage (build + upload + test), or release (build + upload) (default: release)",
     )
     parser.add_argument(
         "--repo",

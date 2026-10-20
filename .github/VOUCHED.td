@@ -14,11 +14,13 @@ dacorvo
 danieldk
 drbh
 ebezzam
+EricLBuehler
 eustlb
 githubnemo
 guarin
 hmellor
 IlyasMoutawwakil
+Isalia20
 jiqing-feng
 kaixuanliu
 kashif
@@ -37,6 +39,7 @@ molbap
 NielsRogge
 paulinebm
 pcuenca
+pculliton
 qgallouedec
 regisss
 remi-or
@@ -58,3 +61,4 @@ xenova
 YangKai0616
 ydshieh
 zucchini-nlp
+Shan2L

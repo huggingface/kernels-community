@@ -1,7 +1,7 @@
 [general]
 name = "punica-sgmv"
 version = 1
-edition = 5
+edition = 6
 license = "Apache-2.0"
 backends = ["cuda"]
 
@@ -14,8 +14,30 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
+[kernel.sgmv]
+language = "cpp-cuda"
+depends = [
+    "cutlass_3_8",
+    "torch",
+]
+src = [
+    "sgmv/sgmv_cutlass.cu",
+    "sgmv/sgmv_cutlass.cuh",
+]
+
+[kernel.punica_kernels]
+language = "cpp-cuda"
+depends = ["torch"]
+include = ["."]
+src = [
+    "bgmv/bgmv_config.h",
+    "punica_kernels/punica_ops.cc",
+    "sgmv/sgmv.h",
+    "sgmv_flashinfer/sgmv_config.h",
+]
+
 [kernel.bgmv]
-backend = "cuda"
+language = "cpp-cuda"
 cuda-capabilities = [
     "8.0",
     "8.6",
@@ -38,30 +60,8 @@ src = [
     "flashinfer/vec_dtypes.cuh",
 ]
 
-[kernel.sgmv]
-backend = "cuda"
-depends = [
-    "cutlass_3_8",
-    "torch",
-]
-src = [
-    "sgmv/sgmv_cutlass.cu",
-    "sgmv/sgmv_cutlass.cuh",
-]
-
-[kernel.punica_kernels]
-backend = "cuda"
-depends = ["torch"]
-include = ["."]
-src = [
-    "bgmv/bgmv_config.h",
-    "punica_kernels/punica_ops.cc",
-    "sgmv/sgmv.h",
-    "sgmv_flashinfer/sgmv_config.h",
-]
-
 [kernel.sgmv_flashinfer]
-backend = "cuda"
+language = "cpp-cuda"
 cuda-capabilities = [
     "8.0",
     "8.6",

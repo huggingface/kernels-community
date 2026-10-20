@@ -4,7 +4,7 @@
 #include "torch_binding.h"
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
-  ops.def("flash_attn(Tensor q, Tensor k, Tensor v, Tensor? mask, float scale) -> Tensor");
+  ops.def("flash_attn(Tensor q, Tensor k, Tensor v, Tensor? mask, float scale, Tensor? sinks=None, float softcap=0.0) -> Tensor");
   // Takes no tensor, so it has no device to dispatch on and is registered as a catch-all. Each
   // backend's shared object is its own library namespace, so there is one implementation per build.
   ops.def("supports_flash_attn(int n_q, int head_dim_k, int head_dim_v) -> bool");

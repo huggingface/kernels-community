@@ -7,7 +7,10 @@ import numpy as np
 import pytest
 import torch
 
-from megablocks import ops
+import kernels
+
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=1)
+ops = megablocks.ops
 
 SORT_TESTS = [
     (32, torch.int16, None),

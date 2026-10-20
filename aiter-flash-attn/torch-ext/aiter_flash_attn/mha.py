@@ -53,7 +53,7 @@ def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
 
 def _resolve_mha_impl(
     window_size_right: int,
-    sink: torch.Tensor | None,
+    s_aux: torch.Tensor | None,
     pe_head_dim: int,
     is_fp8: bool,
 ) -> Literal["default", "dao_ai"]:
@@ -79,7 +79,7 @@ def _resolve_mha_impl(
     if (
         impl == "default"
         and window_size_right != -1
-        and sink is None
+        and s_aux is None
         and pe_head_dim == 0
         and not is_fp8
     ):
@@ -107,7 +107,7 @@ def _flash_attn_forward(
     descale_q: torch.Tensor | None = None,
     descale_k: torch.Tensor | None = None,
     descale_v: torch.Tensor | None = None,
-    sink: torch.Tensor | None = None,
+    s_aux: torch.Tensor | None = None,
     config: dict[str, any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int, int]:
 
@@ -131,7 +131,7 @@ def _flash_attn_forward(
     # decision and reused further down.
     IS_FP8 = types._is_fp8(q)
     pe_head_dim = q.shape[-1] - v.shape[-1]
-    impl = _resolve_mha_impl(window_size_right, sink, pe_head_dim, IS_FP8)
+    impl = _resolve_mha_impl(window_size_right, s_aux, pe_head_dim, IS_FP8)
 
     if impl != "dao_ai" and window_size_right != -1:
         raise ValueError("window_size_right is not supported yet in the Triton Backend")
@@ -189,8 +189,8 @@ def _flash_attn_forward(
         IS_FP8 and pe_head_dim == 0
     ), "Positional encoding doesn't support FP8."
 
-    assert (sink is None) or (
-        sink is not None and sink.dim() == 1 and sink.shape[0] == num_q_heads
+    assert (s_aux is None) or (
+        s_aux is not None and s_aux.dim() == 1 and s_aux.shape[0] == num_q_heads
     ), "Sink must be 1D and have one element per query head."
 
     # softmax_lse [batch, num_q_heads, seqlen_q]
@@ -237,7 +237,7 @@ def _flash_attn_forward(
         dropout_mask = None
 
     if impl == "dao_ai":
-        assert sink is None, "dao_ai impl does not support attention sink."
+        assert s_aux is None, "dao_ai impl does not support attention sink."
         assert (
             pe_head_dim == 0
         ), "dao_ai impl does not support positional encoding (pe_head_dim > 0)."
@@ -314,7 +314,7 @@ def _flash_attn_forward(
             s_dmask,
             dropout_mask,
             softmax_lse,
-            sink,
+            s_aux,
             *q_strides,
             *k_strides,
             *v_strides,
@@ -353,7 +353,7 @@ def _flash_attn_forward(
             BATCH=batch,
             NUM_XCD=get_num_xcds(),
             USE_INT64_STRIDES=_USE_INT64_STRIDES,
-            ENABLE_SINK=sink is not None,
+            ENABLE_SINK=s_aux is not None,
             SLIDING_WINDOW=sliding_window,
             # Soundness precondition: only set when every Q/K/V head-axis
             # stride is a multiple of 8 elements. q_strides[1]/k_strides[1]/
@@ -386,12 +386,12 @@ class _FlashAttnFunc(torch.autograd.Function):
         deterministic,
         return_lse,
         return_softmax,
-        sink,
+        s_aux,
         is_grad_enabled,
         config=None,
     ):
         is_grad = is_grad_enabled and any(
-            x is not None and x.requires_grad for x in [q, k, v, sink]
+            x is not None and x.requires_grad for x in [q, k, v, s_aux]
         )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -416,13 +416,13 @@ class _FlashAttnFunc(torch.autograd.Function):
                 return_softmax=return_softmax and dropout_p > 0,
                 max_seqlen_q=q.shape[1],
                 max_seqlen_k=k.shape[1],
-                sink=sink,
+                s_aux=s_aux,
                 config=config,
             )
         )
 
         if is_grad:
-            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, sink)
+            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, s_aux)
             ctx.philox_seed = philox_seed
             ctx.philox_offset = philox_offset
             ctx.dropout_p = dropout_p
@@ -444,12 +444,12 @@ class _FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, *args):
-        q, k, v, out, softmax_lse, sink = ctx.saved_tensors
+        q, k, v, out, softmax_lse, s_aux = ctx.saved_tensors
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None
         dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
-        dsink = (
-            torch.zeros_like(sink, dtype=torch.float32) if sink is not None else None
+        ds_aux = (
+            torch.zeros_like(s_aux, dtype=torch.float32) if s_aux is not None else None
         )
         head_size_v_og = do.size(3)
         do_padded = do
@@ -462,11 +462,11 @@ class _FlashAttnFunc(torch.autograd.Function):
         if ctx.causal and window_size_right >= 0:
             window_size_right = -1
         impl = _resolve_mha_impl(
-            window_size_right, sink, q.shape[-1] - v.shape[-1], types._is_fp8(q)
+            window_size_right, s_aux, q.shape[-1] - v.shape[-1], types._is_fp8(q)
         )
 
         if impl == "dao_ai":
-            assert sink is None, "dao_ai impl does not support attention sink."
+            assert s_aux is None, "dao_ai impl does not support attention sink."
             flash_attn_2.bwd(
                 do_padded,
                 q,
@@ -494,7 +494,7 @@ class _FlashAttnFunc(torch.autograd.Function):
                         "Disable fused backward or use the one-kernel backward."
                     )
                 assert (
-                    sink is None and dsink is None
+                    s_aux is None and ds_aux is None
                 ), "Fused backward doesn't support sinks."
                 flash_attn_fused_backward(
                     do_padded,
@@ -542,8 +542,8 @@ class _FlashAttnFunc(torch.autograd.Function):
                     philox_seed=ctx.philox_seed,
                     philox_offset=ctx.philox_offset,
                     USE_INT64_STRIDES=_USE_INT64_STRIDES,
-                    sink=sink,
-                    dsink=dsink,
+                    s_aux=s_aux,
+                    ds_aux=ds_aux,
                     sliding_window=sliding_window,
                 )
 
@@ -563,7 +563,7 @@ class _FlashAttnFunc(torch.autograd.Function):
             None,  # deterministic
             None,  # return_lse
             None,  # return_softmax
-            dsink,
+            ds_aux,
             None,  # is_grad_enabled
             None,  # config
         )
@@ -582,7 +582,7 @@ def flash_attn_func(
     deterministic=True,
     return_lse=False,
     return_attn_probs=False,
-    sink=None,
+    s_aux=None,
     config: dict[str, any] | None = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -625,7 +625,7 @@ def flash_attn_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
-        sink: (nheads,), attention sink scores (one per Q head), or None
+        s_aux: (nheads,), attention sink scores (one per Q head), or None
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
@@ -651,7 +651,7 @@ def flash_attn_func(
         deterministic,
         return_lse,
         return_attn_probs,
-        sink,
+        s_aux,
         torch.is_grad_enabled(),
         config,
     )
@@ -679,12 +679,12 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         return_softmax,
         block_table,
         out,
-        sink,
+        s_aux,
         is_grad_enabled,
         config=None,
     ):
         is_grad = is_grad_enabled and any(
-            x is not None and x.requires_grad for x in [q, k, v, sink]
+            x is not None and x.requires_grad for x in [q, k, v, s_aux]
         )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -711,13 +711,13 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 max_seqlen_k=max_seqlen_k,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
-                sink=sink,
+                s_aux=s_aux,
                 config=config,
             )
         )
         if is_grad:
             ctx.save_for_backward(
-                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, sink
+                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, s_aux
             )
             ctx.max_seqlen_q = max_seqlen_q
             ctx.max_seqlen_k = max_seqlen_k
@@ -741,12 +741,12 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, sink = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, s_aux = ctx.saved_tensors
         dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None
-        dsink = (
-            torch.zeros_like(sink, dtype=torch.float32) if sink is not None else None
+        ds_aux = (
+            torch.zeros_like(s_aux, dtype=torch.float32) if s_aux is not None else None
         )
         head_size_og = do.size(2)
         do_padded = do
@@ -759,11 +759,11 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         if ctx.causal and window_size_right >= 0:
             window_size_right = -1
         impl = _resolve_mha_impl(
-            window_size_right, sink, q.shape[-1] - v.shape[-1], types._is_fp8(q)
+            window_size_right, s_aux, q.shape[-1] - v.shape[-1], types._is_fp8(q)
         )
 
         if impl == "dao_ai":
-            assert sink is None, "dao_ai impl does not support attention sink."
+            assert s_aux is None, "dao_ai impl does not support attention sink."
             flash_attn_2.varlen_bwd(
                 do_padded,
                 q,
@@ -796,7 +796,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                         "Disable fused backward or use the one-kernel backward."
                     )
                 assert (
-                    sink is None and dsink is None
+                    s_aux is None and ds_aux is None
                 ), "Fused backward doesn't support sinks."
                 flash_attn_fused_backward(
                     do_padded,
@@ -844,8 +844,8 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                     philox_seed=ctx.philox_seed,
                     philox_offset=ctx.philox_offset,
                     USE_INT64_STRIDES=_USE_INT64_STRIDES,
-                    sink=sink,
-                    dsink=dsink,
+                    s_aux=s_aux,
+                    ds_aux=ds_aux,
                     sliding_window=sliding_window,
                 )
 
@@ -871,7 +871,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             None,  # return_softmax
             None,  # block_table
             None,  # out
-            dsink,
+            ds_aux,
             None,  # is_grad_enabled
             None,  # config
         )
@@ -896,7 +896,7 @@ def flash_attn_varlen_func(
     return_attn_probs=False,
     block_table=None,
     out=None,
-    sink=None,
+    s_aux=None,
     config: dict[str, any] | None = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
@@ -945,7 +945,7 @@ def flash_attn_varlen_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
-        sink: (nheads,), attention sink scores (one per Q head), or None
+        s_aux: (nheads,), attention sink scores (one per Q head), or None
     Return:
         out: (total, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -978,7 +978,7 @@ def flash_attn_varlen_func(
         return_attn_probs,
         block_table,
         out,
-        sink,
+        s_aux,
         torch.is_grad_enabled(),
         config,
     )

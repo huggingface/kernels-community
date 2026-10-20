@@ -1,7 +1,7 @@
 [general]
 name = "yoso"
 version = 1
-edition = 5
+edition = 6
 license = "Apache-2.0"
 backends = ["cuda"]
 
@@ -15,7 +15,7 @@ src = [
 ]
 
 [kernel.yoso]
-backend = "cuda"
+language = "cpp-cuda"
 cuda-capabilities = [
     "8.0",
     "8.9",

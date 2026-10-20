@@ -58,9 +58,6 @@ on:
         type: string
         default: ""
 
-permissions:
-  contents: read
-  statuses: write
 
 # These build workflows are reachable only via workflow_dispatch, so `github.head_ref`
 # is always empty and the group used to collapse to `github.run_id` -- unique per run,
@@ -74,9 +71,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ inputs.pr_number || github.run_id }}-${{ inputs.kernel_name }}-upload-${{ inputs.upload }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   # Post a running commit status so the PR shows the build is in progress.
   set-running-status:
+    permissions:
+      statuses: write
     if: inputs.head_sha != ''
     runs-on: ubuntu-latest
     steps:
@@ -96,6 +97,8 @@ jobs:
 
   # Build the kernel for each CUDA/XPU variant; release mode uploads to the Hub.
   build-kernel:
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -404,6 +407,8 @@ jobs:
 
   # Report the final build outcome as a commit status on the PR head SHA.
   report-status:
+    permissions:
+      statuses: write
     if: always() && inputs.head_sha != ''
     needs: [build-kernel]
     runs-on: ubuntu-latest

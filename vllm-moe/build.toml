@@ -1,7 +1,7 @@
 [general]
 name = "vllm-moe"
 version = 0
-edition = 5
+edition = 6
 license = "Apache-2.0"
 upstream = "git+https://github.com/vllm-project/vllm.git"
 backends = ["cuda"]
@@ -24,34 +24,8 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
-[kernel.fp8]
-backend = "cuda"
-depends = ["torch"]
-include = ["."]
-src = [
-    "cuda_compat.h",
-    "dispatch_utils.h",
-    "fp8/amd/hip_float8.h",
-    "fp8/amd/hip_float8_impl.h",
-    "fp8/common.cu",
-    "fp8/common.cuh",
-    "fp8/vectorization.cuh",
-]
-
-[kernel.moe]
-backend = "cuda"
-depends = ["torch"]
-src = [
-    "cuda_compat.h",
-    "dispatch_utils.h",
-    "moe/moe_align_sum_kernels.cu",
-    "moe/moe_wna16.cu",
-    "moe/moe_wna16_utils.h",
-    "moe/topk_softmax_kernels.cu",
-]
-
 [kernel.moe-marlin]
-backend = "cuda"
+language = "cpp-cuda"
 cuda-capabilities = [
     "8.0",
     "8.6",
@@ -78,10 +52,36 @@ src = [
 ]
 
 [kernel.activation]
-backend = "cuda"
+language = "cpp-cuda"
 depends = ["torch"]
 src = [
     "activation/activation_kernels.cu",
     "activation/cuda_compat.h",
     "activation/dispatch_utils.h",
+]
+
+[kernel.moe]
+language = "cpp-cuda"
+depends = ["torch"]
+src = [
+    "cuda_compat.h",
+    "dispatch_utils.h",
+    "moe/moe_align_sum_kernels.cu",
+    "moe/moe_wna16.cu",
+    "moe/moe_wna16_utils.h",
+    "moe/topk_softmax_kernels.cu",
+]
+
+[kernel.fp8]
+language = "cpp-cuda"
+depends = ["torch"]
+include = ["."]
+src = [
+    "cuda_compat.h",
+    "dispatch_utils.h",
+    "fp8/amd/hip_float8.h",
+    "fp8/amd/hip_float8_impl.h",
+    "fp8/common.cu",
+    "fp8/common.cuh",
+    "fp8/vectorization.cuh",
 ]

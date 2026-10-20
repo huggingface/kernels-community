@@ -1,7 +1,7 @@
 [general]
 name = "paged-attention"
-version = 1
-edition = 5
+version = 2
+edition = 6
 license = "Apache-2.0"
 backends = [
     "cuda",
@@ -18,25 +18,12 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
-[kernel.paged_attention_metal]
-backend = "metal"
-depends = ["torch"]
-include = ["."]
-src = [
-    "paged-attention-metal/attention/paged_attention.metal",
-    "paged-attention-metal/cache/copy_blocks.metal",
-    "paged-attention-metal/cache/reshape_and_cache.metal",
-    "paged-attention-metal/convert_fp8.metal",
-    "paged-attention-metal/float8.metal",
-    "paged-attention-metal/utils.metal",
-    "paged-attention-metal/paged_attention.mm",
-    "paged-attention-metal/cache.mm",
-    "paged-attention-metal/convert_fp8.mm",
-    "paged-attention-metal/device.mm",
-]
+[torch.stable-abi]
+cuda = "2.10"
+rocm = "2.10"
 
 [kernel.paged_attention_rocm]
-backend = "rocm"
+language = "cpp-rocm"
 depends = ["torch"]
 rocm-archs = [
     "gfx906",
@@ -70,18 +57,11 @@ src = [
     "paged-attention/dispatch_utils.h",
     "paged-attention/quantization/fp8/amd/quant_utils.cuh",
     "paged-attention/quantization/fp8/nvidia/quant_utils.cuh",
-]
-
-[kernel.cuda_utils]
-backend = "cuda"
-depends = []
-src = [
-    "cuda-utils/cuda_utils.h",
-    "cuda-utils/cuda_utils_kernels.cu",
+    "paged-attention/stable_utils.h",
 ]
 
 [kernel.cuda_utils_rocm]
-backend = "rocm"
+language = "cpp-rocm"
 depends = ["torch"]
 rocm-archs = [
     "gfx906",
@@ -100,7 +80,7 @@ src = [
 ]
 
 [kernel.paged_attention]
-backend = "cuda"
+language = "cpp-cuda"
 depends = ["torch"]
 include = [
     "cuda-utils",
@@ -123,4 +103,30 @@ src = [
     "paged-attention/dispatch_utils.h",
     "paged-attention/quantization/fp8/amd/quant_utils.cuh",
     "paged-attention/quantization/fp8/nvidia/quant_utils.cuh",
+    "paged-attention/stable_utils.h",
+]
+
+[kernel.cuda_utils]
+language = "cpp-cuda"
+depends = []
+src = [
+    "cuda-utils/cuda_utils.h",
+    "cuda-utils/cuda_utils_kernels.cu",
+]
+
+[kernel.paged_attention_metal]
+language = "cpp-metal"
+depends = ["torch"]
+include = ["."]
+src = [
+    "paged-attention-metal/attention/paged_attention.metal",
+    "paged-attention-metal/cache/copy_blocks.metal",
+    "paged-attention-metal/cache/reshape_and_cache.metal",
+    "paged-attention-metal/convert_fp8.metal",
+    "paged-attention-metal/float8.metal",
+    "paged-attention-metal/utils.metal",
+    "paged-attention-metal/paged_attention.mm",
+    "paged-attention-metal/cache.mm",
+    "paged-attention-metal/convert_fp8.mm",
+    "paged-attention-metal/device.mm",
 ]

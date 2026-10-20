@@ -18,6 +18,7 @@ from ._layers.mlp import MLP, SparseMLP
 from ._layers.moe import MoE, ParallelMLP, get_load_balancing_loss
 
 from . import layers
+from . import _private_for_testing
 
 # This section contains the direct kernel exports (not inlcuded in the original code)
 def exclusive_cumsum(x: torch.Tensor, dim: int, out: torch.Tensor) -> torch.Tensor:
@@ -181,7 +182,7 @@ def argsort(x: torch.Tensor, end_bit: int = 32) -> tuple[torch.Tensor, torch.Ten
 
 # Export public API
 __all__ = [
-    "MyReplacementLayer",
+    "_private_for_testing",
     # Direct kernel exports
     "exclusive_cumsum",
     "inclusive_cumsum",
