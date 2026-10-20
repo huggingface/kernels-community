@@ -15,7 +15,7 @@
 import torch
 import triton
 
-from .compat import MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, NVFP4_SCALE_GROUP_K
+from .compat import MX_SCALE_GROUP_K, NIBBLES_PER_BYTE, NVFP4_SCALE_GROUP_K, UE8M0_DTYPE
 
 def ue8m0_as_uint8(scale: torch.Tensor | None) -> torch.Tensor | None:
     """View UE8M0 (``float8_e8m0fnu``) weight scales as ``uint8`` for the Triton
@@ -24,13 +24,19 @@ def ue8m0_as_uint8(scale: torch.Tensor | None) -> torch.Tensor | None:
     optional scale) passes through as ``None`` — kernels take the arg as None."""
     if scale is None:
         return None
-    return scale.view(torch.uint8) if scale.dtype == getattr(torch, "float8_e8m0fnu", None) else scale
+    return scale.view(torch.uint8) if scale.dtype == UE8M0_DTYPE else scale
 
 def e2m1_as_uint8(weight: torch.Tensor) -> torch.Tensor:
     """View an ``int8``-stored MXFP4 (packed E2M1) weight as ``uint8`` — a zero-cost
     reinterpret. ``tl.dot_scaled`` requires the packed rhs as ``uint8``, so do it once here
     instead of casting in-kernel at every load. E4M3 (MXFP8) weights pass through unchanged."""
     return weight.view(torch.uint8) if weight.dtype == torch.int8 else weight
+
+# UE8M0 group-32 scales arrive either as ``float8_e8m0fnu`` or as raw ``uint8`` — the same 8
+# exponent bits, and a common on-disk encoding (e.g. group-32 "mxfp8" checkpoints store the
+# scale tensor as uint8). Both are valid MX scales: ``ue8m0_as_uint8`` reinterprets to uint8
+# and the kernels decode ``2^(exp-127)`` inline, so the detectors accept either dtype.
+UE8M0_SCALE_DTYPES = (torch.uint8,) if UE8M0_DTYPE is None else (UE8M0_DTYPE, torch.uint8)
 
 def _shapes_match(weight: torch.Tensor, scale: torch.Tensor, group: int) -> bool:
     """Shape leg of the family predicates: matching leading dims and a last dim of
@@ -53,7 +59,7 @@ def is_mxfp8(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     separates MXFP8 from 128-block FP8 (which may also carry UE8M0 scales)."""
     return (
         weight.dtype == torch.float8_e4m3fn
-        and scale.dtype in (torch.uint8, getattr(torch, "float8_e8m0fnu", None))
+        and scale.dtype in UE8M0_SCALE_DTYPES
         and _shapes_match(weight, scale, MX_SCALE_GROUP_K)
     )
 
@@ -63,7 +69,7 @@ def is_mxfp4(weight: torch.Tensor, scale: torch.Tensor) -> bool:
     MX_SCALE_GROUP_K`` (unpacked K = ``2 * K_half``), matching leading dims. 2D or 3D."""
     return (
         weight.dtype == torch.int8
-        and scale.dtype in (torch.uint8, getattr(torch, "float8_e8m0fnu", None))
+        and scale.dtype in UE8M0_SCALE_DTYPES
         and _shapes_match(weight, scale, MX_SCALE_GROUP_K)
     )
 
@@ -247,7 +253,7 @@ def mx_scale_family(Bs: torch.Tensor, K: int) -> int:
     validated; callers that need the format read it off ``Bs.dtype`` (``== torch.float8_e4m3fn``
     is NVFP4)."""
     nvfp4 = Bs.dtype == torch.float8_e4m3fn
-    assert nvfp4 or Bs.dtype in (torch.uint8, getattr(torch, "float8_e8m0fnu", None)), (
+    assert nvfp4 or Bs.dtype in UE8M0_SCALE_DTYPES, (
         f"Bs must be UE8M0 (float8_e8m0fnu/uint8) or E4M3 (NVFP4), got {Bs.dtype}"
     )
     scale_group = K // (Bs.shape[2] * 4) if Bs.ndim == 5 else K // Bs.shape[-1]

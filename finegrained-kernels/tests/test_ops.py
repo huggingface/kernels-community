@@ -827,12 +827,14 @@ def test_ue8m0_scale_bytes():
 def test_uint8_mx_scales_without_native_ue8m0(monkeypatch):
     """MX format checks accept raw exponent bytes without a native UE8M0 dtype."""
     scale = torch.full((16, 4), 127, dtype=torch.uint8)
-    if (native_dtype := getattr(torch, "float8_e8m0fnu", None)) is not None:
+    if (native_dtype := finegrained_kernels.compat.UE8M0_DTYPE) is not None:
         native_scale = scale.view(native_dtype)
         assert torch.equal(ue8m0_as_uint8(native_scale), scale)
         assert mx_scale_family(native_scale, 128) == 32
 
-    monkeypatch.delattr(torch, "float8_e8m0fnu", raising=False)
+    # What torch < 2.7 resolves at import time.
+    monkeypatch.setattr(finegrained_kernels.formats, "UE8M0_DTYPE", None)
+    monkeypatch.setattr(finegrained_kernels.formats, "UE8M0_SCALE_DTYPES", (torch.uint8,))
     assert ue8m0_as_uint8(scale) is scale
     assert is_mxfp8(
         torch.empty((16, 128), dtype=torch.float8_e4m3fn), scale

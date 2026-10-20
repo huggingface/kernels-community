@@ -74,6 +74,11 @@ except ImportError:
 # FP8 (E4M3) is the main format for weights and activations;
 FP8_DTYPE = torch.float8_e4m3fn
 
+# UE8M0 MX scales are a torch dtype (``float8_e8m0fnu``) only from torch 2.7. Older torch carries
+# them as raw ``uint8`` exponent bytes, which the kernels decode the same way, so this is ``None``
+# there and the format checks accept ``uint8`` alone.
+UE8M0_DTYPE = torch.float8_e8m0fnu if torch.__version__ >= "2.7" else None
+
 # FP4 (E2M1) packs two 4-bit nibbles per byte. MX formats (MXFP4 weights, MXFP8
 # E4M3 weights/activations) share one UE8M0 scale per 32-element K-group — the OCP
 # MX block size, consumed by ``tl.dot_scaled``. Format constants, not tunables.
