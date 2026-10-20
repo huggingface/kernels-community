@@ -142,13 +142,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Nix toolchain + binary cache setup.
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
         with:
           extra-conf: |
             max-jobs = 2
             cores = 4
             sandbox-fallback = false
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: huggingface
         env:
@@ -237,7 +237,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Nix toolchain + binary cache setup (uses matrix-specific concurrency limits).
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
         with:
           extra-conf: |
             max-jobs = ${{ matrix.max_jobs }}
@@ -245,7 +245,7 @@ jobs:
             sandbox-fallback = false
       - name: Nix info
         run: nix-shell -p nix-info --run "nix-info -m"
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: huggingface
         env:
@@ -390,7 +390,7 @@ jobs:
 
       - name: Upload Hub upload summary
         if: inputs.mode != 'pr' && inputs.upload != false
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: hub-upload-${{ matrix.backend }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/upload*.json
@@ -422,7 +422,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Nix toolchain + binary cache setup.
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
         with:
           extra-conf: |
             max-jobs = 2
@@ -430,7 +430,7 @@ jobs:
             sandbox-fallback = false
       - name: Nix info
         run: nix-shell -p nix-info --run "nix-info -m"
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: huggingface
         env:
@@ -456,7 +456,7 @@ jobs:
 
       # Upload the closure as a short-lived artifact for the GPU test job.
       - name: Upload ci-test closure
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-test-closure
           path: ci-test-closure.nar.zst
@@ -472,12 +472,12 @@ jobs:
       group: aws-g6-12xlarge-plus
     steps:
       # Nix toolchain + binary cache setup (needed to import the closure).
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
         with:
           extra-conf: |
             max-jobs = 2
             cores = 12
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: huggingface
         env:
@@ -494,7 +494,7 @@ jobs:
 
       # Retrieve the ci-test closure built in the previous job.
       - name: Download ci-test closure
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ci-test-closure
 
@@ -558,7 +558,7 @@ jobs:
 
       - name: Download Hub upload summaries
         if: env.REPORT_HUB_UPLOAD == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: hub-upload-*
           path: hub-uploads
