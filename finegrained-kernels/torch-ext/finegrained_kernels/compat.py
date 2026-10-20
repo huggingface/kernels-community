@@ -104,6 +104,12 @@ _SKIP_LAUNCHES_MIRROR = False
 
 
 
+def launches_skipped() -> bool:
+    """Whether this call runs inside an opaque op's fake impl, where only output allocation counts
+    (see ``compile_time_only_triton_wrap``) — for the non-Triton launches an op makes."""
+    return _SKIP_LAUNCHES_MIRROR
+
+
 def compile_time_only_triton_wrap(kernel):
     """``wrap_triton`` while torch.compile is tracing (required to capture a raw Triton
     launch into the graph), the bare kernel in eager. Every kernel launch goes through
@@ -229,16 +235,24 @@ def sm_count(device_index: int) -> int:
 
 
 @functools.lru_cache(maxsize=8)
-def persistent_program_count(device_index: int) -> int:
-    """Grid for the persistent grouped GEMMs, whose tile loop strides by a matching NUM_SMS
-    constexpr — the program count is a free parameter, not a shape.
+def persistent_program_count(device_index: int, block_m: int | None = None) -> int:
+    """Size the persistent grid, including extra programs for small SM10x tiles.
 
-    One program per processor is CUDA sizing: an SM runs the whole CTA and hides latency
-    within it. An Xe-core does not — it holds several hardware threads per vector engine and
-    needs more than one work-group to fill them. Measured on Xe, BF16 MoE prefill: 2x is
-    1.6x faster than 1x (bit-identical output), and 4x and beyond give the win back."""
+    Small tiles need several programs per SM to hide memory latency. Xe uses
+    two work-groups per core regardless of the tile size.
+    """
     n = sm_count(device_index)
+    if block_m is not None and block_m < 64 and is_sm10x():
+        n *= persistent_programs_per_sm(block_m)
     return n * 2 if get_active_device_type() == "xpu" else n
+
+
+def persistent_programs_per_sm(block_m: int) -> int:
+    """Overlap small persistent tiles' load latency with four programs per SM.
+
+    Tiles of 128 rows already occupy an SM's shared memory, so extra programs only add scheduling overhead.
+    """
+    return 1 if block_m >= 128 else 4
 
 
 
@@ -295,6 +309,8 @@ def get_accelerator_autotuning_configs(
     tune_block_n: bool = False,
     tune_block_nk: bool = False,
     swap_ab: bool = False,
+    swap_block_sizes_m=(1,),
+    swap_ab_prefill: bool = False,
     warp_spec: bool = False,
     packed_schedule: bool = False,
     compute_modes=None,
@@ -330,7 +346,11 @@ def get_accelerator_autotuning_configs(
       seat here: at decode's tiny memory-parallelism-bound grids, longer per-iteration
       bursts are the one in-block lever that helps (+12% on the dsv4 swap GEMV; deeper
       num_stages and split-K both measured WORSE). Prefill tunes carry the same rows as
-      trial-budget dilution (descriptor_box_pruner drops the illegal e4m3 boxes).
+      trial-budget dilution.
+    - ``swap_block_sizes_m``: token tiles for swapped plain GEMMs that retain a normal
+      logical accumulator. Padded-single-token helpers require the default ``(1,)``.
+    - ``swap_ab_prefill``: append the measured plain-dot prefill tiles with computed
+      weight rows on the MMA lhs; dense/grouped callers share the same candidate set.
     - ``warp_spec``: warp-specialize the K-loop, crossed over every mode —
       pair it with ``warp_spec_compile_guard_pruner``, which owns the can't-compile
       regions (including dot_scaled + WS, a PassManager failure). Compile support is
@@ -373,7 +393,6 @@ def get_accelerator_autotuning_configs(
     #
     # Axes measured DEAD and deliberately absent (do not re-add without fresh evidence):
     #   num_ctas          slower everywhere + miscompiles with TMA at num_stages<=4
-    #   flatten (tl.range)  proxy +17% never survived e2e (<=1%; gate_up regressed)
     #   persistent 2D     grid-stride 2D prototype's win was an inline-vs-helper artifact
     #   batched WARP_SPEC  decode loops are launch/latency-bound; WS never won a batched
     #                     cell, so the axis is not emitted at the six batched sites
@@ -453,21 +472,20 @@ def get_accelerator_autotuning_configs(
     # The coupled decode (BLOCK_SIZE_M, SWAP_AB) pairs — the single source of the swap/BM
     # coupling. At M=1 the MMA 16-atom is filled either by replicating the token (non-swap
     # BM=16, ~40% over the degenerate BM=1 on plain tl.dot) or by putting the weight's
-    # output rows in M (swap, BM=1). Swap REQUIRES BM=1 (its rhs is the single token
-    # padded to the N=16 atom), so (16, swap) never exists; the tuner picks. Prefill
-    # kernels leave SWAP_AB unset — the prefill swap arms measured losers everywhere
-    # (see the bd 2D kernel's tuner note).
+    # Swapped decode token tiles default to BM=1 for padded-token helpers. Plain GEMMs
+    # can opt into larger token tiles or the measured computed-lhs prefill candidates.
     if swap_ab and tune_block_m:
-        # tuned-BM kernels (the 2D mx GEMM): the prefill BM sweep keeps no-swap; the swap
-        # decode rows are APPENDED at their structural BM=1 (dedup collapses the copies)
+        # Keep the normal BM sweep and append the requested swapped token tiles.
         blocks = [{**b, "SWAP_AB": False} for b in blocks] + [
-            {**b, "BLOCK_SIZE_M": 1, "SWAP_AB": True} for b in blocks
+            {**b, "BLOCK_SIZE_M": bm, "SWAP_AB": True}
+            for b in blocks for bm in swap_block_sizes_m
         ]
     elif swap_ab:
+        orientations = [(1, False), (16, False)] + [(bm, True) for bm in swap_block_sizes_m]
         blocks = [
             {**b, "BLOCK_SIZE_M": bm, "SWAP_AB": sw}
             for b in blocks
-            for bm, sw in ((1, False), (16, False), (1, True))
+            for bm, sw in orientations
         ]
 
     # scalar's BM is STRUCTURALLY 1 (a single-row GEVM reduce — a bigger-BM scalar
@@ -486,20 +504,116 @@ def get_accelerator_autotuning_configs(
         for w in num_warps
         for s in num_stages
     ]
+    if swap_ab_prefill:
+        for config in configs:
+            config.kwargs["SWAP_AB"] = False
+        if is_sm10x():
+            for stages in (2, 3):
+                kwargs = dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=128,
+                              COMPUTE_MODE="dot", WARP_SPEC=True, SWAP_AB=True,
+                              A_MEMORY_MODE="host_descriptor", B_MEMORY_MODE="host_descriptor")
+                if packed_schedule:
+                    kwargs["PACKED_SCHEDULE"] = False
+                configs.append(triton.Config(kwargs, num_warps=8, num_stages=stages, pre_hook=pre_hook))
     # dedup: the scalar BM=1 pin and the MX "dot" BK override collapse swept axes onto
     # one value, leaving identical copies that would each be benched.
     return list({str(c): c for c in configs}.values())
+
+
+def pipeline_autotuning_configs(configs, pipelines, *, num_warps=None):
+    """Expand selected persistent GEMM tiles over compiler-managed output-tile pipelines."""
+    return [
+        triton.Config(
+            dict(config.kwargs, PIPELINE=pipeline),
+            num_warps=num_warps or config.num_warps,
+            num_stages=config.num_stages,
+            num_ctas=config.num_ctas,
+            maxnreg=config.maxnreg,
+            pre_hook=config.pre_hook,
+        )
+        for config in configs
+        for pipeline in pipelines
+    ]
+
+
+def narrow_scalar_autotuning_configs(block_ms=(1,), block_ns=(8, 16, 32), **fixed):
+    """The tiles of a ``scalar`` arm that unpacks a weight tile once for ``BLOCK_SIZE_M`` token rows and reduces it on
+    the CUDA cores (a weight-rows-major GEVM): 8-32 weight rows per program, so a decode grid fills the SMs where the
+    MMA tiles leave them idle (int4 at N=4096: 128 programs at BN=32, 512 at BN=8), and K bursts up to 1024. A tile
+    whose broadcast product (BM x BN x BK fp32) would not fit the registers is left out; ``fixed`` adds kwargs."""
+    blocks = [
+        {"BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk, "COMPUTE_MODE": "scalar", **fixed}
+        for bm in block_ms
+        for bn in block_ns
+        for bk in (128, 256, 512, 1024)
+        if bm * bn * bk <= 8192
+    ]
+    return [triton.Config(b, num_warps=w, num_stages=s) for b in blocks for w in (2, 4) for s in (2, 3, 4, 5, 6)]
+
+
+
+def split_k_autotuning_configs(splits, memory_modes=("descriptor", "pointer"), pre_hook=None, configs=None, **fixed):
+    """The decode ``dot`` tiles (BM=16, BN {16, 32, 64}, BK {128, 256, 512}) crossed with a ``SPLIT_K`` axis: K split
+    across ``splits`` programs per output tile, reduced in-kernel. Matched memory modes, warps {2, 4}, stages 3-5.
+    ``configs`` instead expands caller-selected tiles, e.g. native scaled MMA at decode."""
+    if configs is not None:
+        return [triton.Config(dict(c.kwargs, SPLIT_K=split), num_warps=c.num_warps, num_stages=c.num_stages,
+                              num_ctas=c.num_ctas, maxnreg=c.maxnreg, pre_hook=c.pre_hook)
+                for c in configs for split in splits]
+    modes = resolve_memory_modes(memory_modes)
+    blocks = [
+        {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk, "A_MEMORY_MODE": m, "B_MEMORY_MODE": m,
+         "SPLIT_K": sk, **fixed}
+        for m in modes
+        for bn in (16, 32, 64)
+        for bk in (128, 256, 512)
+        for sk in splits
+    ]
+    return [
+        triton.Config(b, num_warps=w, num_stages=s, pre_hook=pre_hook)
+        for b in blocks
+        for w in (2, 4)
+        for s in (3, 4, 5)
+    ]
+
+
+def narrow_dot_autotuning_configs(
+    memory_modes=("descriptor", "pointer"), pre_hook=None, block_ms=(16,), block_ns=(16,), **fixed,
+):
+    """Narrow decode ``dot`` tiles, by default BM=16/BN=16: the union span's narrowest BN=32 leaves a
+    decode grid of ``N / 32`` programs, fewer than the SMs at N=4096 (128 on a 148-SM B200); BN=16 doubles it. BK
+    {128, 256, 512} (the longer bursts win where the K-loop is long), crossed with both operands' memory modes
+    (matched), warps {2, 4} and stages 2-6; ``fixed`` adds kwargs."""
+    modes = resolve_memory_modes(memory_modes)
+    blocks = [
+        {"BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk, "A_MEMORY_MODE": m, "B_MEMORY_MODE": m, **fixed}
+        for m in modes
+        for bm in block_ms
+        for bn in block_ns
+        for bk in (128, 256, 512)
+    ]
+    return [
+        triton.Config(b, num_warps=w, num_stages=s, pre_hook=pre_hook)
+        for b in blocks
+        for w in (2, 4)
+        for s in (2, 3, 4, 5, 6)
+    ]
 
 
 
 @functools.cache
 def is_sm10x() -> bool:
     """Whether the CURRENT device is Blackwell-datacenter (sm_10x, TMEM scaled-MMA) —
-    the target the ``dot_scaled`` compiler-bug guards are scoped to. False off-CUDA and on
-    driverless build boxes (``torch.cuda.is_available()`` short-circuits before the
-    capability query, which would otherwise raise); cached (pruners call this per tune, and
-    a process is pinned to one device)."""
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+    the target the ``dot_scaled`` compiler-bug guards are scoped to. False off-CUDA, on
+    ROCm (whose gfx10 majors would otherwise match) and on driverless build boxes
+    (``torch.cuda.is_available()`` short-circuits before the capability query, which would
+    otherwise raise); cached (pruners call this per tune, and a process is pinned to one
+    device)."""
+    return (
+        torch.cuda.is_available()
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability()[0] == 10
+    )
 
 
 @functools.cache

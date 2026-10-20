@@ -31,9 +31,9 @@ from .mma import MMA_N_ATOM_WIDTH
 #     scalar "scalar" -> BM=1   the scalar GEVM broadcasts wrong at BM>1 (config builder)
 #     descriptor_needs_prequant_pruner  raw-A inline-quant arm reads a_ptrs, dead under a
 #                               descriptor mode — static 2D
-#     weight_only_swap_scope_pruner  SWAP_AB iff COMPUTE_MODE == "scalar" — the swapped dot
-#                               arms are unimplemented and a non-swapped scalar has no
-#                               accumulator shape — weight-only batched
+#     weight_only_swap_scope_pruner  swapped dot is implemented for batched integer FP8;
+#                               the other batched weight-only kernels swap only for scalar
+#                               decode, which requires the weight-rows-major layout
 #     mma_trap_ok               swapped dot_scaled BK<128 (sticky 716), single-trip
 #                               accumulator-init miscompile, width > 256 (sticky trap),
 #                               packed-fp4 GATE BN<64 silent zeros — mx 2D/batched/grouped;
@@ -55,13 +55,11 @@ from .mma import MMA_N_ATOM_WIDTH
 #                               weight-only grouped
 #     affine_scale_warp_spec_pruner    affine scale gather's other=0.0 can't take
 #                               ttg.partition under WS — mx-dynamic grouped
-#     global_scale_warp_spec_pruner    the NVFP4 global load can't take ttg.partition
-#                               under WS — weight-only grouped, BsGlobal-gated
 #     nvfp4_native_ok (mx_config_pruner)  E4M3-scale dot_scaled PassManager-fails off the
 #                               native staging: M operand < 128, num_warps outside {4, 8},
 #                               or a weight-only kernel (no As — never native)
-#     descriptor_box_pruner     TMA box > 256/dim is illegal — all descriptor-axis kernels
-#     smem_pruner               empirical smem model (B200-sampled, keep-side error) —
+#     descriptor_box_pruner     Descriptor strides and gather architecture — descriptor-axis kernels
+#     smem_pruner               IR allocation bounds (B200-verified, keep-side error) —
 #                               bd/static/mx/weight-only 2D; tensor/mx/weight-only/fp grouped;
 #                               mx batched
 #   RACE guards (Triton 3.7.1 pipeliner, per-loop-structure flake maps):
@@ -111,7 +109,7 @@ RAW_ACT_MAX_BN = 128
 # (WARP_SPEC, PACKED_SCHEDULE, memory modes) share the tile basin shape and stay out —
 # per-basin anchors over the full branch cross starved a 100-trial budget (see
 # _basin_anchor_indices).
-PATH_ANCHOR_AXES = ("COMPUTE_MODE", "SWAP_AB")
+PATH_ANCHOR_AXES = ("COMPUTE_MODE", "SWAP_AB", "PIPELINE")
 
 
 def config_dim(c, all_args, name):
@@ -186,6 +184,29 @@ def block_within_dim_pruner(dim_arg: str, block_key: str = "BLOCK_SIZE_K", when=
     return config_filter(ok, when=when, on_empty=raise_no_dividing_block)
 
 
+def int_scale_group_tile_pruner(divides_k: bool = True):
+    """``early_config_prune`` for the integer weight-only kernels' K tile: whole scale groups (each group's scale
+    broadcasts over its columns of the dequantized tile) or a whole number of tiles per group (a group wider than the
+    tile, per-channel included), and a tile that divides K wherever the K-loop has no tail (``divides_k``: the 2D and
+    grouped kernels) or a group spans tiles (a slid-back tail tile would straddle two groups). The batched loop slides
+    its last tile back in bounds otherwise. Newly admitted within-group tiles start at 128, preserving
+    the existing group-128 grid; narrower tiles add K-loop and metadata traffic."""
+
+    def ok(c, args):
+        # The packed scalar decode helpers support bf16/fp16 and INT8, not FP8 operands.
+        if args["A"].dtype == torch.float8_e4m3fn and c.kwargs.get("COMPUTE_MODE") == "scalar":
+            return False
+        # INT32 partials must stay integral through the final K sum; the split-K workspace is FP32.
+        if args["A"].dtype == torch.int8 and c.kwargs.get("SPLIT_K", 1) != 1:
+            return False
+        bk, group = c.kwargs["BLOCK_SIZE_K"], args["SCALE_GROUP_K"]
+        if group > bk:
+            return bk >= 128 and group % bk == 0 and args["K"] % bk == 0
+        return bk % group == 0 and (not divides_k or args["K"] % bk == 0)
+
+    return config_filter(ok)
+
+
 def block_fits_dim_pruner(dim_arg: str, block_key: str = "BLOCK_SIZE_K"):
     """``early_config_prune`` for a loop whose tail tile SLIDES back in bounds instead of
     running past the row (the weight-only batched K-loop): the tile need not divide the dim,
@@ -232,6 +253,9 @@ def warp_spec_compile_guard_pruner():
     def ok(c, args):
         if not c.kwargs.get("WARP_SPEC"):
             return True
+        # The tile-loop WS candidates require Triton 3.8's partitioning passes.
+        if c.kwargs.get("PIPELINE", "k_loop") != "k_loop" and tuple(int(n) for n in triton.__version__.split(".")[:2]) < (3, 8):
+            return False
         # WS needs num_warps a multiple of 4 (its async producer/consumer partitions) and enough M
         # work — the MMA's M operand, which SWAP_AB moves to BLOCK_SIZE_N (so BM=1 decode can still
         # WS when swapped). dot_scaled + WS + TMA DOES compile here (measured 1995 on a clean
@@ -510,6 +534,9 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
         # token in N.
         if c.kwargs.get("COMPUTE_MODE") != "dot_scaled":
             return True
+        if args.get("SCALE_GROUP_K") == 32:
+            # Mixed tensor-FP8 / group-32 E4M3 FP4 is not the group-16 FP4xFP4 MMA.
+            return False
         if not acts_are_scaled(args) or not 4 <= c.num_warps <= 8:
             return False
         if c.kwargs.get("SWAP_AB"):
@@ -558,6 +585,7 @@ def mx_config_pruner(k_arg: str, n_arg: str | None = None, block_within_k: bool 
             dot_arm_ok,
             when=lambda args: is_sm10x()
             and scaled_mma_available(args)
+            and not (scales_are_e4m3(args) and args.get("SCALE_GROUP_K") == 32)
             and acts_are_scaled(args),
         ),
         config_filter(mma_poison_ok, when=lambda args: is_sm10x()),
@@ -785,7 +813,7 @@ def _warp_spec_needs_descriptor_tile() -> bool:
     return tuple(int(n) for n in triton.__version__.split(".")[:2]) >= (3, 8)
 
 
-def warp_spec_memory_mode_pruner(weight_only: bool = False):
+def warp_spec_memory_mode_pruner(weight_only: bool = False, gather_only: bool = False):
     """``early_config_prune`` dropping ``warp_specialize`` configs the WS passes cannot lower
     (``TritonGPUOptimizePartitionWarps`` / ``RelayoutTritonGPU`` -> ``PassManager::run failed``).
 
@@ -805,6 +833,17 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False):
     REGRESSED in 3.8 and pointer+WS was FIXED. So each version gets the rule its own sweep
     measured, rather than an intersection that would fence off a whole memory mode on both.
 
+    ``gather_only`` applies this restriction only to gathered descriptor A. The raw-activation
+    grouped kernel reproduces the TMA gather layout failure with both BF16 and rescaled FP8
+    weights, while non-gathered descriptor boxes compile at the other warp counts. Pointer A
+    and non-gathered launches retain their existing search space.
+
+    Weight-only dot prefill additionally supports the measured w8 128x128x128 tile at
+    stages 2/3 with both host descriptors, inline scheduling and an already expert-sorted A. Both original
+    and swapped operand orientations lower; descriptor gather is outside this exception.
+    Integer outer pipelines also support eight warps for the 128x64x256 gate tile and
+    the packed, flattened 128x128x256 down tile at stage 2.
+
     ``weight_only`` adds the rows that kernel charted for itself and the sweep did not re-probe:
     ``BN == 32`` with WS, which failed 9/9 cells there, and (below 3.8) its trapping
     pointer/pointer warp counts.
@@ -815,6 +854,10 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False):
     width law and belongs wherever gather width is decided."""
 
     def ok(c, args):
+        if gather_only and (
+            args.get("GatherIdx") is None or c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
+        ):
+            return True
         if not c.kwargs.get("WARP_SPEC"):
             return True
         if weight_only and config_dim(c, args, "BLOCK_SIZE_N") == 32:
@@ -822,8 +865,32 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False):
         a, b = c.kwargs.get("A_MEMORY_MODE"), c.kwargs.get("B_MEMORY_MODE")
         descriptor = a != "pointer" or b != "pointer"
         if _warp_spec_needs_descriptor_tile():
-            # 3.8: one surviving descriptor cell, and pointer/pointer is wide open
-            return not descriptor or (c.num_warps == 4 and config_dim(c, args, "BLOCK_SIZE_M") == 128)
+            prefill_tile = (
+                weight_only and c.kwargs.get("COMPUTE_MODE") == "dot"
+                and a == b == "host_descriptor" and args.get("GatherIdx") is None
+                and not c.kwargs.get("PACKED_SCHEDULE")
+                and config_dim(c, args, "BLOCK_SIZE_N") == 128
+                and config_dim(c, args, "BLOCK_SIZE_K") == 128
+                and c.num_stages in (2, 3)
+            )
+            pipeline_tile = (
+                weight_only and c.kwargs.get("PIPELINE") in ("tile_loop", "flattened")
+                and c.kwargs.get("SWAP_AB")
+                and a == b == "host_descriptor" and args.get("GatherIdx") is None
+                and config_dim(c, args, "BLOCK_SIZE_K") == 256 and c.num_stages == 2
+                and (
+                    args.get("GATE", False) and config_dim(c, args, "BLOCK_SIZE_N") == 64
+                    or (
+                        args.get("INT_BITS") in (2, 4, 8) and not args.get("GATE", False)
+                        and config_dim(c, args, "BLOCK_SIZE_N") == 128
+                        and c.kwargs.get("PACKED_SCHEDULE") and c.kwargs.get("PIPELINE") == "flattened"
+                    )
+                )
+            )
+            return not descriptor or (
+                config_dim(c, args, "BLOCK_SIZE_M") == 128
+                and (c.num_warps == 4 or ((prefill_tile or pipeline_tile) and c.num_warps == 8))
+            )
         if descriptor:
             return True
         traps = _WEIGHT_ONLY_POINTER_TRAPS if weight_only else {}
@@ -832,16 +899,29 @@ def warp_spec_memory_mode_pruner(weight_only: bool = False):
     return config_filter(ok, when=lambda args: is_sm10x())
 
 
-def weight_only_swap_scope_pruner():
-    """``early_config_prune`` binding the weight-only kernel's ``SWAP_AB`` axis to its one
-    implemented arm: the CUDA-core reduce. Swap exists here to drop the MMA entirely — with
-    raw bf16 activations there is no native fp4 x bf16 MMA, so both dot arms pay an M->16 pad
-    and a full-tile upcast, and a swapped ``dot_scaled`` measured no better than the row-major
-    one (35.2 vs 38.0us, gpt-oss gate_up decode). So ``SWAP_AB`` iff ``COMPUTE_MODE`` is
-    ``"scalar"``: the swapped-dot rows would compile into an arm the compute helper does not
-    implement, and a non-swapped scalar row has no accumulator shape."""
+def int_2d_warp_spec_pruner():
+    """``early_config_prune`` for the integer 2D kernel: ``warp_specialize`` with a host-TMA activation and a pointer
+    weight (A descriptor, B pointer) fails ``TritonGPUOptimizePartitionWarps`` (``PassManager::run failed``).
+    Charted on B200 / Triton 3.8 over the kernel's own WS neighbourhood (4- and 8-bit, warps {4, 8, 16}, BM {64, 128},
+    BK {128, 256, 512}, BN {32, 64, 128}, stages {2, 4}, all four operand-mode pairs): every lowering failure is in
+    that pair, at warps 4 and 8 (68 of the 100 cells there that fit shared memory; warps 16 lowers), and none in the
+    other pairs. The pair is fenced whole: its cells that do lower never came within 1.6x of a crown in any recorded
+    tune (decode 5-10x off), so the exact boundary (tile bytes, width, warps) buys nothing. CUDA-only."""
 
     def ok(c, args):
+        mixed = c.kwargs.get("A_MEMORY_MODE", "pointer") != "pointer" and c.kwargs.get("B_MEMORY_MODE", "pointer") == "pointer"
+        return not (c.kwargs.get("WARP_SPEC") and mixed)
+
+    return config_filter(ok, when=lambda args: get_active_device_type() == "cuda")
+
+
+def weight_only_swap_scope_pruner():
+    """Batched FP8 integer-weight dots support the swapped MMA; the other batched weight-only
+    kernels swap only for scalar decode. The scalar reduce requires the swapped row layout."""
+
+    def ok(c, args):
+        if args["A"].dtype == FP8_DTYPE and c.kwargs.get("COMPUTE_MODE") == "dot" and c.kwargs.get("SWAP_AB"):
+            return c.kwargs["BLOCK_SIZE_M"] <= MMA_N_ATOM_WIDTH
         return bool(c.kwargs.get("SWAP_AB")) == (c.kwargs.get("COMPUTE_MODE") == "scalar")
 
     return config_filter(ok)
@@ -874,6 +954,41 @@ def raw_activation_pointer_pruner():
             c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
             and config_dim(c, args, "BLOCK_SIZE_N") <= RAW_ACT_MAX_BN
         )
+
+    return config_filter(ok)
+
+
+def native_mma_m_pruner():
+    """Keep native tcgen05 M tiles for plain FP8 on sm_10x. Narrow unswapped
+    tiles lower to warp MMA and lose warm-cache performance; swapped decode tiles
+    use the weight-row dimension as MMA M and remain eligible."""
+
+    def ok(c, args):
+        return bool(c.kwargs.get("SWAP_AB")) or config_dim(c, args, "BLOCK_SIZE_M") >= 64
+
+    return config_filter(ok, when=lambda args: is_sm10x())
+
+
+def single_row_tile_pruner():
+    """Avoid replicating a single token across a BM=16 warp-MMA tile on sm_10x.
+    BM=1 retains the same compute path with less replicated work."""
+
+    def ok(c, args):
+        return config_dim(c, args, "BLOCK_SIZE_M") == 1
+
+    return config_filter(ok, when=lambda args: is_sm10x())
+
+
+def swap_decode_scope_pruner(max_m: int = 16):
+    """``early_config_prune`` scoping a 2D plain-dot kernel's ``SWAP_AB`` rows (BM=1: the weight's
+    output rows in the MMA M dim, the token padded to the N=16 atom) to decode M, where they run
+    one program row per token, and to a pointer-mode activation (an A-side descriptor under
+    ``SWAP_AB`` traps on Triton 3.8, see ``mx_2d_swap_scope_pruner``). Unswapped rows pass."""
+
+    def ok(c, args):
+        if not c.kwargs.get("SWAP_AB"):
+            return True
+        return args["M"] <= max_m and c.kwargs.get("A_MEMORY_MODE", "pointer") == "pointer"
 
     return config_filter(ok)
 
@@ -1097,6 +1212,79 @@ def scalar_max_m_pruner(m_arg: str, max_m: int = 64):
 
     return config_filter(ok, when=lambda args: args[m_arg] > max_m)
 
+
+def swap_max_m_pruner(m_arg: str, max_m: int):
+    """Keep measured small-row swaps in one M tile, retaining BM1/2 candidates for M1."""
+
+    def ok(c, args):
+        if not c.kwargs.get("SWAP_AB"):
+            return True
+        m = args[m_arg]
+        bm = c.kwargs["BLOCK_SIZE_M"]
+        return m <= max_m and m <= bm <= triton.next_power_of_2(max(2, m))
+
+    return config_filter(ok)
+
+
+def block_m_cap_pruner(m_arg: str, min_bm: int = 16):
+    """``early_config_prune`` dropping configs whose ``BLOCK_SIZE_M`` exceeds the launch's row count rounded up to a
+    power of two (floor ``min_bm``, the MMA atom): a dense GEMM with M below the tile has one M tile either way, so
+    the extra rows only pad the MMA and shrink the grid, and benching them dilutes a decode tune (int4 2D, B200:
+    the 4096x12288 M=16 tune crowned 28.2us against the 25.2us its BM=16 basin holds). Non-empty: ``min_bm`` stays."""
+
+    def ok(c, args):
+        bm = c.kwargs.get("BLOCK_SIZE_M")
+        return bm is None or bm <= max(min_bm, triton.next_power_of_2(args[m_arg]))
+
+    return config_filter(ok)
+
+
+def scalar_block_m_pruner(m_arg: str):
+    """``early_config_prune`` keeping only the ``scalar`` configs whose ``BLOCK_SIZE_M`` is the launch's row count
+    rounded up to a power of two: the reduce dequantizes each weight word once for its BM rows, so a smaller BM
+    re-dequantizes per program and a larger one reduces padding rows (int4 2D, B200, 4096x4096: M=2 BM 1/2/4 =
+    9.0/7.7/10.2us, M=4 14.2/11.2/9.9us), and the TPE missed the matched tile at the default budget. Non-empty:
+    the dot configs stay."""
+
+    def ok(c, args):
+        return c.kwargs.get("COMPUTE_MODE") != "scalar" or c.kwargs["BLOCK_SIZE_M"] == triton.next_power_of_2(args[m_arg])
+
+    return config_filter(ok)
+
+
+def mx_auxiliary_pruner():
+    """SVDQuant native MMA: split the decode reduction or persist across prefill tiles."""
+    def ok(c, args):
+        split = c.kwargs.get("SPLIT_K", 1)
+        persistent = c.kwargs.get("PERSISTENT", False)
+        if split == 1 and not persistent:
+            return True
+        if not is_sm10x() or args["GATE"] or args.get("LORA_RANK", 0) == 0:
+            return False
+        if persistent:
+            return args["M"] >= 128
+        return args["M"] == 1 and args["K"] // c.kwargs["BLOCK_SIZE_K"] >= 2 * split
+    return config_filter(ok)
+
+
+def int_split_k_pruner(m_arg: str, max_m: int):
+    """``early_config_prune`` for a split-K axis: splits only in the decode band (``m_arg`` <= ``max_m``, where the
+    launch allocates the partials) and only where the split divides the K tiles. Sub-16 dot tiles cover the
+    launch's rows in one tile, keeping the counter grid within its allocation and avoiding repeated weight reads."""
+
+    def ok(c, args):
+        bm = c.kwargs.get("BLOCK_SIZE_M", 16)
+        if bm < 16 and c.kwargs.get("COMPUTE_MODE", "dot") != "scalar" and bm != triton.next_power_of_2(args[m_arg]):
+            return False
+        split = c.kwargs.get("SPLIT_K", 1)
+        if split == 1:
+            return True
+        k_tiles = args["K"] // c.kwargs["BLOCK_SIZE_K"]
+        return args[m_arg] <= max_m and k_tiles % split == 0 and k_tiles >= split
+
+    return config_filter(ok)
+
+
 def matched_memory_modes_pruner():
     """Drop configs that mix pointer and descriptor operand loads — for a DENSE 2D GEMM
     only (contiguous A, whole M in one tile). Measured across M=1..8192 on the block-scale
@@ -1134,53 +1322,31 @@ def descriptor_needs_prequant_pruner():
 
 
 def descriptor_box_pruner(k_dim="BLOCK_SIZE_K"):
-    """Drop descriptor configs whose TMA box exceeds the tensormap's 256-per-dim limit:
-    the weight inner dim is the K tile in BYTES over values-per-byte (packed E2M1
-    halves it; E4M3 is one byte per value), so BK=512 e4m3 boxes are illegal while
-    BK=512 packed ones fit. Pointer configs pass untouched. ``k_dim`` names the K-tile
-    axis — ``BLOCK_SIZE_K`` for the tune_block_nk kernels, ``block_k`` for the block-scale
-    kernels whose K tile is the caller's fixed scale block."""
+    """Fence descriptor strides and gather support. Triton splits logical tiles into
+    legal physical TMA boxes; the logical tile may exceed 256 elements per dimension.
+    Pointer configs pass untouched."""
 
     def ok(c, args):
-        # tiles may be tuned (config kwargs) or pinned launch args — config_dim reads both
-        bk = config_dim(c, args, k_dim)
         if c.kwargs.get("B_MEMORY_MODE", "pointer") != "pointer":
-            weight_vpb = (
-                2 if getattr(args.get("B"), "dtype", None) == torch.uint8 else 1
-            )
-            if bk // weight_vpb > 256 or config_dim(c, args, "BLOCK_SIZE_N") > 256:
-                return False
             # A TMA descriptor needs a unit-stride innermost dim; a transposed operand
             # (column-major view, as a backward pass hands in) has none, so only the
             # pointer arm can serve it. The kernel itself is stride-general.
             b = args.get("B")
             if b is not None and getattr(b, "ndim", 0) == 2 and b.stride(-1) != 1:
                 return False
+            if "BDescriptor" in args and args["BDescriptor"] is None:
+                return False
         if c.kwargs.get("A_MEMORY_MODE", "pointer") != "pointer":
+            if "ADescriptor" in args and args["ADescriptor"] is None:
+                return False
             # descriptor A, both arms tuner-routed per the tokens-per-expert key:
             # contiguous boxes (no gather) win at dense routing (-7.1/-7.4%) and lose at
             # skew; tma gather4 (gathered rows, 1-row box, sm_100 only) is MONOTONIC in
             # tokens/expert — 2x loss at 32/expert, parity at 1024, -5.3/-4.7% at 4096
             # (32k tokens, 2026-07-16). Only the arch is fenced.
-            act_vpb = 2 if getattr(args.get("A"), "dtype", None) == torch.uint8 else 1
             if args.get("GatherIdx") is not None and not is_sm10x():
                 return False
-            if bk // act_vpb > 256:
-                return False
         return True
-
-    return config_filter(ok)
-
-
-def global_scale_warp_spec_pruner():
-    """Drop WARP_SPEC configs when the launch carries an NVFP4 global (``BsGlobal`` not None):
-    the per-expert global load cannot take ``ttg.partition`` under warp specialization — the
-    same Triton lowering gap as the affine scale gather's ``other=0.0`` — so every such config
-    is a benign compile-failure inf. Fenced to save the compiles; single-level launches
-    (``BsGlobal`` None) keep their WS rows."""
-
-    def ok(c, args):
-        return not (c.kwargs.get("WARP_SPEC") and args.get("BsGlobal") is not None)
 
     return config_filter(ok)
 
@@ -1230,15 +1396,14 @@ def gate_stacked_tmem_trap_pruner():
 
 def smem_pruner(k_dim="BLOCK_SIZE_K", min_sets: float = 0.5):
     """``early_config_prune`` dropping configs whose shared memory certainly cannot fit,
-    with the bound picked by the operand dtypes (sampled from ``metadata.shared`` across
-    every kernel family, 22 cells):
+    with bounds derived from TTGIR allocations and checked against ``metadata.shared``:
 
     - both operands >= 2-byte floats (the unquantized loops): ``num_stages`` full
       buffers of both tiles (exact) plus the fixed barrier terms at their sampled
       MINIMA (+16 base; +28 warp-spec, observed up to 48 varying with warps; +32
       host-descriptor) — minima keep the bound below the true usage, so a config is
       only ever dropped when its operand buffers alone cannot fit.
-    - quantized ``dot_scaled`` (the only quantized arm whose tiles can reach the limit):
+    - quantized ``dot_scaled``:
       the per-allocation law, every term named by its TTGIR ``local_alloc`` and exact to
       the allocator's alignment/packing slack (<= 16 B observed; barriers pack into
       padding, so no fixed constant is added — the slack is keep-side) —
@@ -1246,8 +1411,12 @@ def smem_pruner(k_dim="BLOCK_SIZE_K", min_sets: float = 0.5):
       full-width even when fp4-packed; GATE shifts the A tile to a full ``num_stages``),
       or the bf16-upcast fallback below the gate (one single-buffered upcast tile,
       packed weights, no A-scale buffers).
-    - quantized ``dot``/``scalar``: the raw-operand floor (their 32-wide K tiles cannot
-      reach the limit).
+    - FP8 weight-only, natural-orientation K loop with host descriptors: ``num_stages``
+      BF16/FP16 A buffers, ``num_stages - 1`` raw FP8 B buffers (``num_stages`` under
+      warp specialization), plus one decoded BF16/FP16 B buffer. Scales, barriers and
+      alignment are omitted from this lower bound. Swapped/output-tile pipelines use
+      different storage and retain the raw floor.
+    - other quantized ``dot``/``scalar``: the raw-operand floor.
 
     ``min_sets`` scales the quantized ``dot_scaled`` bound: the default HALF a set is the
     family-wide keep-side envelope (the 2D nvfp4 arm sub-tiles a request into half a set);
@@ -1256,10 +1425,9 @@ def smem_pruner(k_dim="BLOCK_SIZE_K", min_sets: float = 0.5):
     120 of 162 dead ones did (every BK=512 request, 59/59), so ``min_sets=2`` there halves the
     dead compiles a 100-trial tune pays without dropping a single compiling config.
 
-    Both arms are EMPIRICAL models of this Triton's allocator, fit to and verified
-    against ``metadata.shared`` samples (not derived from a spec) — chosen so the error
-    direction under the sampled behavior is always toward KEEPING a config, which then
-    merely compiles and self-prunes as inf. All samples taken on B200 (sm_100) —
+    These are lower bounds on the observed IR allocations, not a complete allocator
+    model: omitted storage keeps borderline configs for the compiler to check. Samples
+    were taken on B200 (sm_100); the FP8 weight-only extension is scoped to that arch —
     re-verify on a Triton bump AND on H100 or the target device (smem capacity and
     allocator behavior are per-arch). Non-empty fallback."""
 
@@ -1281,9 +1449,9 @@ def smem_pruner(k_dim="BLOCK_SIZE_K", min_sets: float = 0.5):
                 + (28 if c.kwargs.get("WARP_SPEC") else 0)
                 + (32 if c.kwargs.get("B_MEMORY_MODE", "pointer") != "pointer" else 0)
             )
-            need = fixed + stages * bk * (
-                a.element_size() * bm + b.element_size() * tiles * bn
-            )
+            # an integer weight is uint32 words of 32 // bits K values: bits / 8 bytes per K per row
+            b_bytes_per_k = 4 * b.shape[-1] / args["K"] if b.dtype == torch.uint32 else b.element_size()
+            need = fixed + stages * bk * (a.element_size() * bm + b_bytes_per_k * tiles * bn)
         elif c.kwargs.get("COMPUTE_MODE") == "dot_scaled":
             # KEEP-SIDE bound = HALF of one buffer set: operands stored PACKED (fp4 = 2
             # values/byte) plus both group scale tiles (BK/group cols; group 32 UE8M0, 16
@@ -1313,9 +1481,22 @@ def smem_pruner(k_dim="BLOCK_SIZE_K", min_sets: float = 0.5):
             need = int(
                 (a_bytes + b_bytes + (bk // group) * bm + (bk // group) * tiles * bn) * min_sets
             )
+        elif (
+            is_sm10x()
+            and a.dtype in (torch.bfloat16, torch.float16) and b.dtype == FP8_DTYPE
+            and "BLOCK_K" in args
+            and not c.kwargs.get("SWAP_AB", False)
+            and c.kwargs.get("PIPELINE", "k_loop") == "k_loop"
+            and c.kwargs.get("A_MEMORY_MODE") == "host_descriptor"
+            and c.kwargs.get("B_MEMORY_MODE") == "host_descriptor"
+        ):
+            # Concurrent local_alloc buffers: staged raw A/B and one decoded rhs.
+            # Pointer loads can use fewer buffers; a swapped lhs can live in tmem.
+            b_stages = c.num_stages if c.kwargs.get("WARP_SPEC") else c.num_stages - 1
+            need = bk * (c.num_stages * a.element_size() * bm
+                         + (b_stages + a.element_size()) * tiles * bn)
         else:
-            # dot (BK = the 32-group) / scalar: tiles too small to reach the limit —
-            # the raw-operand floor suffices
+            # Other dot/scalar pipelines retain their raw-operand lower bound.
             need = stages * (bk * bm + (bk // packed) * tiles * bn)
         return need <= sm_shared_memory_limit()
 

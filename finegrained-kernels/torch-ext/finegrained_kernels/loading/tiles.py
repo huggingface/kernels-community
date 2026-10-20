@@ -15,7 +15,7 @@
 import triton
 import triton.language as tl
 
-from .scales import load_block_fp8_act_tile, load_mx_act_tile, load_swizzled_scale, load_swizzled_scale_tile, load_weight_scale_tile
+from .scales import dequant_block_fp8_weight_tile, load_block_fp8_act_tile, load_mx_act_tile, load_swizzled_scale, load_swizzled_scale_tile, load_weight_scale_tile
 
 # A-sub-tile byte budget for the 1-byte-activation grouped-swizzle depth cap (see
 # swizzle_offsets): the co-scheduled rows' A tile per K-step (depth*BM*BK bytes) must stay
@@ -34,14 +34,16 @@ def swizzle_offsets(
     BLOCK_SIZE_K: tl.constexpr,
     WEIGHT_VALUES_PER_BYTE: tl.constexpr = 1,
     GATE: tl.constexpr = False,
+    SINGLE_M_TILE: tl.constexpr = False,
+    tile_id=None,
 ):
     """2D-grid tile scheduling shared by the kernels below: grouped-swizzle the
     ``(pid_m, pid_n)`` program ids for L2 locality on B, then build the operand offset
     vectors. Returns ``(pid_m, pid_n, offs_am, offs_bn, offs_k)`` — the swizzled ids
-    (reused by the output store) and the ``%``-wrapped row/col offsets plus the K range.
+    (reused by the output store) and the bounded row/col offsets plus the K range.
 
     ``offs_bn`` is the WEIGHT-side row range: under ``GATE`` the doubled span
-    ``[2*pid_n*BN, 2*(pid_n+1)*BN)`` wrapped at ``2N``. The grid is sized by the OUTPUT tiles.
+    ``[2*pid_n*BN, 2*(pid_n+1)*BN)`` over ``2N`` weight rows. The grid is sized by the OUTPUT tiles.
 
     The swizzle keeps the B (weight) column-tile L2-hot while the co-scheduled rows reuse it,
     so the depth cap is set by the WEIGHT footprint, capped at ``min(num_pid_m, .)``. With
@@ -54,22 +56,34 @@ def swizzle_offsets(
     activation-driven). Uses an EXPLICIT grouped swizzle (linearize the 2D program ids, then
     group), NOT ``tl.swizzle2d`` (which degrades with group depth, -3pp+ MFU at depth 32). Same
     grid launch, same result set — only the program-id -> tile mapping changes."""
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    pid = tl.program_id(axis=1) * num_pid_m + tl.program_id(axis=0)
-    if WEIGHT_VALUES_PER_BYTE == 2:
-        max_group = num_pid_m
+    if SINGLE_M_TILE:
+        # Grouped ordering is the identity when every row fits in one tile.
+        pid_m = 0
+        pid_n = tl.program_id(axis=1)
     else:
-        max_group = SWIZZLE_GROUP_A_BYTES // (BLOCK_SIZE_M * BLOCK_SIZE_K)
-    num_pid_in_group = max_group * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * max_group
-    group_size_m = min(num_pid_m - first_pid_m, max_group)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+        num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+        pid = tl.program_id(axis=1) * num_pid_m + tl.program_id(axis=0) if tile_id is None else tile_id
+        if WEIGHT_VALUES_PER_BYTE == 2:
+            max_group = num_pid_m
+        else:
+            max_group = SWIZZLE_GROUP_A_BYTES // (BLOCK_SIZE_M * BLOCK_SIZE_K)
+        num_pid_in_group = max_group * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * max_group
+        group_size_m = min(num_pid_m - first_pid_m, max_group)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
     WEIGHT_ROWS: tl.constexpr = 2 * BLOCK_SIZE_N if GATE else BLOCK_SIZE_N
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * WEIGHT_ROWS + tl.arange(0, WEIGHT_ROWS)) % (2 * N if GATE else N)
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * WEIGHT_ROWS + tl.arange(0, WEIGHT_ROWS)
+    if SINGLE_M_TILE:
+        # Unused tail lanes can reuse the last valid index; output stores mask them.
+        offs_am = tl.minimum(offs_am, M - 1)
+        offs_bn = tl.minimum(offs_bn, (2 * N if GATE else N) - 1)
+    else:
+        offs_am %= M
+        offs_bn %= 2 * N if GATE else N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     return pid_m, pid_n, offs_am, offs_bn, offs_k
 
@@ -155,8 +169,8 @@ def load_grouped_weight_tile(
     """One K-major (optionally gate|up-stacked) MX weight K-tile for the grouped / batched loop:
     the explicit-pointer tile flattened to the ``[KB, (2|1)*BN]`` rhs (or, under ``SWAP_AB``, the
     ``[(2|1)*BN, KB]`` rows-major lhs — the batched-decode orientation), or the ``[(2|1), BN, KB]``
-    descriptor box over the ``(E, 2N|N, K_bytes)`` weight view, reshaped and transposed to the same
-    form (the fused-era TMA arm: natural orientation + per-iteration trans; grouped/2D never swap).
+    descriptor box over the ``(E, 2N|N, K_bytes)`` weight view, reshaped to ``[(2|1)*BN, KB]`` and, unless
+    ``SWAP_AB`` (rows-major, as the int4 tiles always are), transposed to the same form.
     ``B_DESCRIPTOR_IS_2D`` is the box's RANK, which ``B_MEMORY_MODE`` does not imply: it says the
     caller resolved a 2D box over ONE expert's slab (base already advanced by the expert stride)
     rather than a 3D box over the stack, so the expert axis is gone from both the shape and the
@@ -166,15 +180,13 @@ def load_grouped_weight_tile(
     arm compiles; the caller advances ``w_ptrs`` and passes the box offsets either way."""
     if B_MEMORY_MODE == "pointer":
         w = tl.load(w_ptrs)
-    elif B_DESCRIPTOR_IS_2D:
-        w = tl.trans(w_descriptor.load([n_off, kb_off]))
     else:
-        w = tl.trans(
-            tl.reshape(
-                w_descriptor.load([row0, n_off, kb_off]),
-                ((2 if GATE else 1) * BLOCK_SIZE_N, KB),
-            )
-        )
+        if B_DESCRIPTOR_IS_2D:
+            w = w_descriptor.load([n_off, kb_off])
+        else:
+            w = tl.reshape(w_descriptor.load([row0, n_off, kb_off]), ((2 if GATE else 1) * BLOCK_SIZE_N, KB))
+        if not SWAP_AB:
+            w = tl.trans(w)
     return w
 
 
@@ -305,6 +317,33 @@ def load_act_plain(
         a_ptrs, a_descriptor, m_off, k_off, value_mask, gather_rows, A_MEMORY_MODE, A_GATHER
     )
     return a, a
+
+
+@triton.jit
+def gather_act_cols(a_rows, k_perm, k_off, row_mask, stride_a_k, BLOCK_SIZE_K: tl.constexpr):
+    """An activation K-tile with its columns gathered by an act-order K order: ``a_rows`` holds the tile's
+    ``[BM, 1]`` row pointers and column ``j`` reads ``k_perm[k_off + j]``. ``row_mask`` None loads maskless."""
+    ptrs = a_rows + tl.load(k_perm + k_off + tl.arange(0, BLOCK_SIZE_K))[None, :] * stride_a_k
+    if row_mask is None:
+        a = tl.load(ptrs)
+    else:
+        a = tl.load(ptrs, mask=row_mask[:, None], other=0.0)
+    return a
+
+
+@triton.jit
+def load_act_k_permuted(
+    a_ptrs, a_descriptor, m_off, k_off, row_mask, gather_rows, a_next,
+    A_MEMORY_MODE: tl.constexpr, A_GATHER: tl.constexpr,
+):
+    """``load_act_plain``'s activation K-tile, or, under an act-order K order (``a_next`` not None, pointer arm), the
+    gathered tile the previous K step issued (``gather_act_cols``): the caller issues the next step's gather
+    alongside, so the dependent gather's latency overlaps a step of compute."""
+    if a_next is None:
+        a, _ = load_act_plain(a_ptrs, a_descriptor, m_off, k_off, row_mask, gather_rows, A_MEMORY_MODE, A_GATHER)
+    else:
+        a = a_next
+    return a
 
 
 @triton.jit
@@ -462,6 +501,55 @@ def load_weight_mx(
 
 
 @triton.jit
+def load_weight_int(
+    b_ptrs, b_descriptor, bs_ptrs, bs_ptr, row0, n_off, k_off, expert_id, pid_n, k, N, K,
+    stride_bs_e, stride_bs_n, stride_bs_k,
+    GATE: tl.constexpr, PER_EXPERT: tl.constexpr, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, SCALE_GROUP_K: tl.constexpr,
+    k_col_off=0, GROUPED: tl.constexpr = False, BITS: tl.constexpr = 4,
+):
+    """The integer weight path: a tile of uint32 words (``32 // BITS`` values each) + its affine group scale.
+    ``GROUPED`` reads the expert's tile out of the 3D stack (the grouped kernel's box or pointer arm)."""
+    w = _weight_value(
+        b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N,
+        BLOCK_SIZE_K // (32 // BITS),
+    )
+    w_s = load_weight_int_group(
+        bs_ptrs, bs_ptr, expert_id, pid_n, k, N, K, stride_bs_e, stride_bs_n, stride_bs_k,
+        GATE, PER_EXPERT, BLOCK_SIZE_N, BLOCK_SIZE_K, SCALE_GROUP_K, k_col_off=k_col_off, GROUPED=GROUPED,
+    )
+    return w, w_s
+
+
+@triton.jit
+def int_group_ptrs(ptrs, k, stride_k, BLOCK_SIZE_K: tl.constexpr, SCALE_GROUP_K: tl.constexpr):
+    """Scale / zero-point pointers for K-tile ``k``. Groups no wider than the tile: ``ptrs`` already walks them (the
+    caller advances it ``BLOCK_SIZE_K // SCALE_GROUP_K`` columns a tile) and comes back as is. A group wider than the
+    tile holds it whole: ``ptrs`` stays at column 0 and tile ``k`` reads column ``k * BK // group``."""
+    if SCALE_GROUP_K <= BLOCK_SIZE_K:
+        out = ptrs
+    else:
+        out = ptrs + ((k * BLOCK_SIZE_K) // SCALE_GROUP_K) * stride_k
+    return out
+
+
+@triton.jit
+def load_weight_int_group(
+    bz_ptrs, bz_ptr, expert_id, pid_n, k, N, K, stride_bz_e, stride_bz_n, stride_bz_k,
+    GATE: tl.constexpr, PER_EXPERT: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    SCALE_GROUP_K: tl.constexpr, k_col_off=0, GROUPED: tl.constexpr = False,
+):
+    """Scale or zero-point columns covering this tile, including tiles inside a wider group."""
+    SCALE_COLS: tl.constexpr = max(1, BLOCK_SIZE_K // SCALE_GROUP_K)
+    if SCALE_GROUP_K > BLOCK_SIZE_K:
+        k = (k * BLOCK_SIZE_K) // SCALE_GROUP_K
+    return _weight_scale_mx(
+        bz_ptrs, None, None, bz_ptr, 0, expert_id, pid_n, k, N, K, stride_bz_e, stride_bz_n, stride_bz_k,
+        GROUPED, GATE, PER_EXPERT, False, BLOCK_SIZE_N, SCALE_COLS, SCALE_GROUP_K, k_col_off=k_col_off,
+    )
+
+
+@triton.jit
 def load_weight_block_dynamic(
     b_ptrs, b_descriptor, bs_ptrs, bs_mask, up_s_ptr, row0, n_off, k_off, k, stride_bs_k,
     GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr,
@@ -473,6 +561,30 @@ def load_weight_block_dynamic(
     w = _weight_value(b_ptrs, b_descriptor, row0, n_off, k_off, GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, KB)
     w_s = _weight_scale_block_dynamic(bs_ptrs, up_s_ptr, bs_mask, k, stride_bs_k, GROUPED, GATE, BLOCK_SIZE_N)
     return w, w_s
+
+
+@triton.jit
+def load_weight_block_fp8(
+    b_ptrs, b_descriptor, bs_ptr, row0, n_off, k_off,
+    expert_id, offs_n, offs_k, stride_bs_e, stride_bs_n, stride_bs_k,
+    GATE: tl.constexpr, GROUPED: tl.constexpr, B_MEMORY_MODE: tl.constexpr, SWAP_AB: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GATE_SCALES: tl.constexpr, DTYPE: tl.constexpr,
+    B_DESCRIPTOR_IS_2D: tl.constexpr = False,
+):
+    """Coarse FP8 weight-only tile, rescaled to the raw activation dtype."""
+    w = _weight_value(
+        b_ptrs, b_descriptor, row0, n_off, k_off,
+        GATE, GROUPED, B_MEMORY_MODE, SWAP_AB, BLOCK_SIZE_N, BLOCK_SIZE_K,
+        B_DESCRIPTOR_IS_2D,
+    )
+    w = dequant_block_fp8_weight_tile(
+        w, bs_ptr, expert_id, offs_n, offs_k,
+        stride_bs_e, stride_bs_n, stride_bs_k,
+        BLOCK_N, BLOCK_K, GATE_SCALES, SWAP_AB, DTYPE,
+    )
+    return w
 
 
 @triton.jit

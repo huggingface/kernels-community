@@ -21,7 +21,7 @@ from utils import TEST_DEVICE  # type: ignore
 import triton
 import triton.language as tl
 
-from finegrained_kernels.quant import fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_inline, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant, nvfp4_quantize_two_level  # type: ignore
+from finegrained_kernels.quant import _quant_block_k_pruner, fp8_act_quant_block_dynamic, fp8_act_quant_tensor_wide, mx_act_quant_inline, mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant, nvfp4_quantize_two_level  # type: ignore
 
 
 _FP8_DTYPE = torch.float8_e4m3fn
@@ -415,8 +415,6 @@ def test_the_grouped_quant_grid_admits_only_its_tile_height():
     ``BLOCK_T`` would cover fewer rows than the schedule holds and leave the tail unquantized.
     The dense grid has no such tie and keeps the whole range. Both scale stores reach the grouped
     grid, so the pin cannot hang off the swizzle."""
-    from finegrained_kernels.quant import _quant_block_k_pruner
-
     configs = [
         triton.Config({"BLOCK_K": bk, "BLOCK_T": bt}, num_warps=4)
         for bk in (32, 64)

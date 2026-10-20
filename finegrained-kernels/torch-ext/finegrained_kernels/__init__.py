@@ -22,7 +22,19 @@ from . import backward
 from .formats import get_supported_act_fns
 from .norm import get_supported_norms, rms_norm_rows
 from .swizzle import swizzle_mx_scales, unswizzle_mx_scales
-from .quant import mxfp4_act_quant, mxfp8_act_quant, nvfp4_act_quant
+from .quant import (
+    mxfp8_act_quant,
+    mxfp4_act_quant,
+    nvfp4_act_quant,
+    dequantize_int_weight,
+    interleave_int_words,
+    fold_act_order_into_gate_up,
+    repack_gptq_int4,
+    repack_awq_int4,
+    repack_modelopt_int4,
+    repack_modelopt_int8,
+    repack_ggml_int,
+)
 
 __all__ = [
     # the three GEMM dispatchers (the weight format is read off the tensors; `activation_format`
@@ -41,11 +53,20 @@ __all__ = [
     # the per-expert output norm a model can hand the forwards by name, and its standalone op
     "get_supported_norms",
     "rms_norm_rows",
-    # load-time helpers: the swizzled scale layout the SM100 scaled-MMA reads, and the row-wise
-    # quantizers a loader uses to quantize weights into the group formats
+    # load-time helpers: the swizzled scale layout the SM100 scaled-MMA reads, the row-wise
+    # quantizers a loader uses to quantize weights into the group formats, and the GPTQ / AWQ int4
+    # repacks into the int4 layout
     "swizzle_mx_scales",
     "unswizzle_mx_scales",
     "mxfp8_act_quant",
     "mxfp4_act_quant",
     "nvfp4_act_quant",
+    "dequantize_int_weight",
+    "interleave_int_words",
+    "fold_act_order_into_gate_up",
+    "repack_gptq_int4",
+    "repack_awq_int4",
+    "repack_modelopt_int4",
+    "repack_modelopt_int8",
+    "repack_ggml_int",
 ]
