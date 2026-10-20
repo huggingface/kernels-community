@@ -813,6 +813,26 @@ def packed_schedule_scope_pruner(min_bm: int = 128):
     return config_filter(ok)
 
 
+def tile_order_pruner(min_m_tiles_per_expert: int = 2):
+    """``early_config_prune`` fixing ``TILE_ORDER`` per config instead of searching it: of each
+    otherwise-identical pair it keeps the ordered row iff an expert averages at least two M-tiles
+    (``ceil(S / num_experts) >= 2 * BLOCK_SIZE_M``, the quantity ``tokens_per_expert_bit_length``
+    buckets, so one key never mixes orders), else the row-major one: the space size equals the
+    row-major space. Below that no adjacent M-tiles share a weight tile and the remap is pure
+    overhead (DSV3 E256 block-FP8 down T2048, BM16: 1.016x). Wired only on the kernels where
+    ordering measured a win at the same forced config (B200, T8192): block-dynamic/static FP8
+    gate -6..-11%, block-FP8 weight-only gate -4..-6%, full-precision down -4..-5%; MX
+    (+6..+9%) and INT weight-only (+14..+18% down) lose and stay row-major. Searching the axis
+    instead doubled the space and let a 100-trial tune crown a 1.45x slower config."""
+
+    def ok(c, args):
+        bm = config_dim(c, args, "BLOCK_SIZE_M")
+        ordered = -(-args["S"] // args["num_experts"]) >= min_m_tiles_per_expert * bm
+        return bool(c.kwargs.get("TILE_ORDER")) == ordered
+
+    return config_filter(ok)
+
+
 # Pointer/pointer warp counts that trap on the WEIGHT-ONLY kernel under Triton < 3.8. Charted
 # 2026-08-26 and REPRODUCED on 3.7.1 by the 2026-09-17 two-version sweep, so these rows are real
 # measurements of that compiler, not the mis-chart the descriptor rows turned out to be. Triton

@@ -312,14 +312,22 @@ def load_packed_schedule(Schedule, BLOCK_SIZE_M: tl.constexpr):
 
 
 @triton.jit
-def grouped_tile_order(tile_id, num_m_tiles, num_n_tiles):
-    """Reuse each weight tile across up to eight adjacent M-tiles before advancing N."""
+def grouped_tile_order(tile_id, num_m_tiles, num_n_tiles, TILE_ORDER: tl.constexpr = True):
+    """Reuse each weight tile across up to eight adjacent M-tiles before advancing N.
+    ``TILE_ORDER=False`` keeps the row-major tile id (chosen per config by ``tile_order_pruner``)."""
+    if not TILE_ORDER:
+        return tile_id
     group_first_m = tile_id // (8 * num_n_tiles) * 8
     # Keep a trailing prefetch past the M-grid well-defined.
     group_size_m = tl.maximum(1, tl.minimum(8, num_m_tiles - group_first_m))
-    group_offset = tile_id % (8 * num_n_tiles)
-    pid_m = group_first_m + group_offset % group_size_m
-    pid_n = group_offset // group_size_m
+    group_offset = tile_id - group_first_m * num_n_tiles
+    # Every group but the last holds eight M-tiles: shifts instead of a second runtime division.
+    if group_size_m == 8:
+        pid_m = group_first_m + (group_offset & 7)
+        pid_n = group_offset >> 3
+    else:
+        pid_m = group_first_m + group_offset % group_size_m
+        pid_n = group_offset // group_size_m
     return pid_m * num_n_tiles + pid_n
 
 
