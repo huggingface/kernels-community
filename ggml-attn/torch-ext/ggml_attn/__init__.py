@@ -29,27 +29,34 @@ def flash_attn(
     v: torch.Tensor,
     mask: torch.Tensor | None = None,
     scale: float | None = None,
+    sinks: torch.Tensor | None = None,
+    softcap: float = 0.0,
 ) -> torch.Tensor:
     """Flash attention through ggml's vector kernel — the path upstream picks for decode.
 
     Args:
         q: `(n_seqs, n_heads, n_q, head_dim)`.
         k, v: `(n_seqs, n_heads_kv, n_kv, head_dim)`. Grouped-query attention is native, so do **not**
-            expand them to `n_heads` first — that copy is exactly what this avoids.
+            expand them to `n_heads` first — that copy is exactly what this avoids. An f16 cache is read
+            as f16, as llama.cpp reads its default cache; other dtypes are read as f32.
         mask: `(n_seqs, 1, n_q, n_kv)` additive mask, or None. Cast to f16 internally, as the kernel
             requires. **A None mask means attend to everything**: ggml has no `is_causal` argument, so
             causality has to arrive as a mask. `flash_attn_forward` builds one when it must.
         scale: softmax scale; defaults to `head_dim ** -0.5`.
+        sinks: attention sinks, one logit per query head that joins each row's softmax and takes no
+            value (gpt-oss's `s_aux`); upstream's `ggml_flash_attn_ext_add_sinks`.
+        softcap: logit softcapping, `softcap * tanh(scores / softcap)` before the softmax (Gemma 2's
+            `attn_logit_softcapping`); 0 for none.
 
     Returns:
-        `(n_seqs, n_q, n_heads, head_dim)` — tokens before heads, which is what SDPA gives after its
+        `(n_seqs, n_q, n_heads, head_dim)` f32 — tokens before heads, which is what SDPA gives after its
         own `.transpose(1, 2)`, so a caller usually wants precisely this and no further permute.
 
     Ask `supports_flash_attn` first: it answers for whichever of upstream's two paths the shape selects.
     """
     if scale is None:
         scale = q.shape[-1] ** -0.5
-    return ops.flash_attn(q, k, v, mask, scale)
+    return ops.flash_attn(q, k, v, mask, scale, sinks, softcap)
 
 
 def supports_flash_attn(n_q: int, head_dim_k: int, head_dim_v: int) -> bool:
@@ -62,7 +69,7 @@ def supports_flash_attn(n_q: int, head_dim_k: int, head_dim_v: int) -> bool:
 
 
 @torch.library.register_fake(add_op_namespace_prefix("flash_attn"))
-def _(q, k, v, mask, scale):
+def _(q, k, v, mask, scale, sinks=None, softcap=0.0):
     n_seqs, n_heads, n_q, _ = q.shape
     return q.new_empty((n_seqs, n_q, n_heads, v.shape[-1]))
 
@@ -142,4 +149,8 @@ def flash_attn_forward(
         mask = torch.zeros_like(mask, dtype=query.dtype).masked_fill_(~mask, float("-inf"))
     elif mask is None and n_q > 1:
         mask = _causal_mask(query, key.shape[2])
-    return flash_attn(query, key, value, mask, scaling), None
+    # transformers passes gpt-oss's sinks as `s_aux` and Gemma 2's softcapping as `softcap`
+    sinks = kwargs.get("s_aux")
+    softcap = kwargs.get("softcap") or 0.0
+    # ggml writes f32; hand the model back the dtype it computes in
+    return flash_attn(query, key, value, mask, scaling, sinks, softcap).to(query.dtype), None

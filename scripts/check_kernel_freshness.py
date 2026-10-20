@@ -67,6 +67,7 @@ KERNEL_SOURCE_MAPPING = {
     "aiter-flash-attn": "https://github.com/ROCm/aiter",
     "aiter-flash-attn-ck": "https://github.com/ROCm/aiter",
     "aiter-kernels": "https://github.com/ROCm/aiter",
+    "aiter-sage-attention": "https://github.com/ROCm/aiter",
     # Too much stuff happening in vLLM, not worth reporting as MoE freshness.
     "vllm-moe": "",
     "fla": "github.com/fla-org/flash-linear-attention",

@@ -32,15 +32,27 @@ This kernel walks the three neighbours straight out of the ungathered tensors, s
 - the mask is streamed a tile at a time rather than expanded,
 - tiles the band never reaches are skipped before their two matmuls, not after.
 
-The mask layer builds one packed active-tile representation per forward, shared by all
+The mesh encoder builds one packed active-tile representation per forward, shared by all
 attention layers: CSR offsets, compact tile indices and one uint32 word per query row
 per active 32-key tile, following Faster-WeatherNext. Temporary scan counts and padded
 tile lists are discarded after preparation. The model-facing attention consumes those words directly, without
 unpacking the mask or storing a score matrix. Boolean masks use the same preparation
-when the attention replacement is used without its mask layer.
+when the attention replacement is used without the encoder replacement. Other attention
+implementations keep their original mask preparation and forward.
 
 The fused Triton API is forward only. The model-facing layer uses the differentiable
 fallback when gradients are required.
+
+## Tiled grid inference
+
+The conditioned MLP, grid-to-mesh, mesh-to-grid and forecasting-head replacements process
+grid points and edges in bounded tiles, following
+[Faster-WeatherNext](https://github.com/Raymondlol/Faster-WeatherNext/blob/main/docs/how-it-works.md).
+They reuse the original matrix multiplies and LayerNorm, fuse float32 conditioning and forecast
+output epilogues in Triton, and preserve PyTorch rounding for lower-precision tensors.
+Outputs are preallocated, and the graph replacements update grid latents in place during inference.
+The mesh-to-grid replacement expects receiver-sorted edges, three per grid point.
+Training, gradient-enabled execution and autocast use the reference forward instead.
 
 ## Precision
 
@@ -79,9 +91,8 @@ geometry guarantees this; the empty rows past the last mesh node are handled.
 
 The attention layer accepts boolean geometry masks, with an optional singleton head axis,
 and masks whose block axis is folded into the batch axis. Other tensor layouts take
-the gather-plus-SDPA fallback. `attn_implementation="flex_attention"` is unsupported: that
-hands the layer a `BlockMask`, which neither path can read, so it raises rather than
-quietly dropping the mask.
+the gather-plus-SDPA fallback. The optimized attention requires SDPA; other attention
+implementations, including flex attention, keep their original forward.
 
 ## Validation
 

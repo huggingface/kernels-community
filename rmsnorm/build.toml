@@ -1,7 +1,7 @@
 [general]
 name = "rmsnorm"
 version = 1
-edition = 5
+edition = 6
 license = "Apache-2.0"
 backends = [
     "cpu",
@@ -14,53 +14,8 @@ repo-id = "kernels-community/rmsnorm"
 [torch]
 src = ["torch-ext/torch_binding.cpp"]
 
-[kernel.rmsnorm_cpu_avx512]
-backend = "cpu"
-cxx-flags = [
-    "-mfma",
-    "-fopenmp",
-    "-mf16c",
-    "-mavx512f",
-    "-mavx512bf16",
-    "-mavx512vl",
-]
-depends = ["torch"]
-include = ["rmsnorm_cpu"]
-src = [
-    "rmsnorm_cpu/rmsnorm_avx512.cpp",
-    "rmsnorm_cpu/rmsnorm_avx512.hpp",
-    "rmsnorm_cpu/cpu_types_avx512.hpp",
-]
-
-[kernel.rmsnorm_cpu]
-backend = "cpu"
-depends = ["torch"]
-include = ["rmsnorm_cpu"]
-src = [
-    "rmsnorm_cpu/rmsnorm_cpu_torch.cpp",
-    "rmsnorm_cpu/rmsnorm_cpu.cpp",
-    "rmsnorm_cpu/rmsnorm_cpu.hpp",
-    "rmsnorm_cpu/cpu_features.hpp",
-]
-
-[kernel.rmsnorm_cpu_avx2]
-backend = "cpu"
-cxx-flags = [
-    "-mavx2",
-    "-mfma",
-    "-fopenmp",
-    "-mf16c",
-]
-depends = ["torch"]
-include = ["rmsnorm_cpu"]
-src = [
-    "rmsnorm_cpu/rmsnorm_avx2.cpp",
-    "rmsnorm_cpu/rmsnorm_avx2.hpp",
-    "rmsnorm_cpu/cpu_types_avx2.hpp",
-]
-
 [kernel.rmsnorm_xpu]
-backend = "xpu"
+language = "cpp-xpu"
 depends = ["torch"]
 include = ["rmsnorm_xpu/dpcpp"]
 src = [
@@ -100,4 +55,49 @@ src = [
     "rmsnorm_xpu/dpcpp/oneDNN/Runtime.cpp",
     "rmsnorm_xpu/dpcpp/oneDNN/Runtime.h",
     "rmsnorm_xpu/dpcpp/oneDNN/Utils.h",
+]
+
+[kernel.rmsnorm_cpu_avx512]
+language = "cpp-cpu"
+cxx-flags = [
+    "-mfma",
+    "-fopenmp",
+    "-mf16c",
+    "-mavx512f",
+    "-mavx512bf16",
+    "-mavx512vl",
+]
+depends = ["torch"]
+include = ["rmsnorm_cpu"]
+src = [
+    "rmsnorm_cpu/rmsnorm_avx512.cpp",
+    "rmsnorm_cpu/rmsnorm_avx512.hpp",
+    "rmsnorm_cpu/cpu_types_avx512.hpp",
+]
+
+[kernel.rmsnorm_cpu]
+language = "cpp-cpu"
+depends = ["torch"]
+include = ["rmsnorm_cpu"]
+src = [
+    "rmsnorm_cpu/rmsnorm_cpu_torch.cpp",
+    "rmsnorm_cpu/rmsnorm_cpu.cpp",
+    "rmsnorm_cpu/rmsnorm_cpu.hpp",
+    "rmsnorm_cpu/cpu_features.hpp",
+]
+
+[kernel.rmsnorm_cpu_avx2]
+language = "cpp-cpu"
+cxx-flags = [
+    "-mavx2",
+    "-mfma",
+    "-fopenmp",
+    "-mf16c",
+]
+depends = ["torch"]
+include = ["rmsnorm_cpu"]
+src = [
+    "rmsnorm_cpu/rmsnorm_avx2.cpp",
+    "rmsnorm_cpu/rmsnorm_avx2.hpp",
+    "rmsnorm_cpu/cpu_types_avx2.hpp",
 ]
