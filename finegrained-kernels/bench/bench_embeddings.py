@@ -170,7 +170,7 @@ def benchmark(args):
                 reference = native()
                 for impl, run in zip(IMPLS, (fused, native, compiled)):
                     output = run()
-                    torch.testing.assert_close(output, reference, rtol=0.008, atol=1e-5)
+                    torch.testing.assert_close(output, reference, rtol=8e-3, atol=1e-5)
                     parity = (output.float() - reference.float()).abs().max().item()
                     times = {
                         "eager": do_bench(run, rep=args.rep, return_mode="median") * 1000,

@@ -33,6 +33,72 @@ from .quant import e2m1_cols_to_f32
 
 
 @triton.jit
+def _decode_weight(value, row, FORMAT: tl.constexpr):
+    """Stored weight elements to fp32, before scaling. FP4 unpacks two columns per byte;
+    INT4 takes the looked-up row's nibble (even rows low, odd rows high)."""
+    if FORMAT == "nvfp4" or FORMAT == "mxfp4":
+        value = e2m1_cols_to_f32(value.to(tl.uint8))
+    elif FORMAT == "int4":
+        nibble = (value.to(tl.uint8).to(tl.int32) >> ((row % 2) * 4)) & 15
+        value = ((nibble ^ 8) - 8).to(tl.float32)
+    else:
+        value = value.to(tl.float32)
+    return value
+
+
+@triton.jit
+def _load_scale(
+    S,
+    program,
+    row,
+    col,
+    valid,
+    row_valid,
+    D: tl.constexpr,
+    S_ROW: tl.constexpr,
+    S_COL: tl.constexpr,
+    SCALE_BLOCK_ROW: tl.constexpr,
+    SCALE_BLOCK_COL: tl.constexpr,
+    FORMAT: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PACKING: tl.constexpr,
+):
+    """Decoded fp32 scale for each of the tile's ``BLOCK`` output values."""
+    if (
+        D % BLOCK == 0
+        and S_COL != 0
+        and BLOCK % SCALE_BLOCK_COL == 0
+        and FORMAT != "mxfp8"
+    ):
+        # Load one scale per group; MXFP8 favors its existing flat byte loads.
+        groups = (program % (D // BLOCK)) * (BLOCK // SCALE_BLOCK_COL)
+        groups += tl.arange(0, BLOCK // SCALE_BLOCK_COL)
+        scale = tl.load(
+            S + (row // SCALE_BLOCK_ROW) * S_ROW + groups * S_COL,
+            row_valid,
+            other=0.0,
+        )
+        scale = decode_group_scale(scale).to(tl.float32)
+        scale = tl.broadcast_to(
+            scale[:, None], (BLOCK // SCALE_BLOCK_COL, SCALE_BLOCK_COL)
+        ).reshape((BLOCK,))
+    else:
+        scale_offsets = (row // SCALE_BLOCK_ROW) * S_ROW
+        if S_COL != 0:
+            scale_offsets += (col * PACKING // SCALE_BLOCK_COL) * S_COL
+        scale = tl.load(
+            S + scale_offsets,
+            row_valid if S_COL == 0 else valid,
+            other=0.0,
+        )
+        scale = decode_group_scale(scale).to(tl.float32)
+        if PACKING == 2:
+            scale = tl.broadcast_to(scale, (BLOCK // PACKING,))
+            scale = tl.interleave(scale, scale)
+    return scale
+
+
+@triton.jit
 def _embedding_kernel(
     W,
     Ids,
@@ -69,44 +135,11 @@ def _embedding_kernel(
     col = offsets % (D // packing)
     weight_row = row // 2 if FORMAT == "int4" else row
     value = tl.load(W + weight_row * W_ROW + col * W_COL, valid, other=0.0)
-    if FORMAT == "nvfp4" or FORMAT == "mxfp4":
-        value = e2m1_cols_to_f32(value.to(tl.uint8))
-    elif FORMAT == "int4":
-        nibble = (value.to(tl.uint8).to(tl.int32) >> ((row % 2) * 4)) & 15
-        value = ((nibble ^ 8) - 8).to(tl.float32)
-    else:
-        value = value.to(tl.float32)
-    if (
-        D % BLOCK == 0
-        and S_COL != 0
-        and BLOCK % SCALE_BLOCK_COL == 0
-        and FORMAT != "mxfp8"
-    ):
-        # Load one scale per group; MXFP8 favors its existing flat byte loads.
-        groups = (program % (D // BLOCK)) * (BLOCK // SCALE_BLOCK_COL)
-        groups += tl.arange(0, BLOCK // SCALE_BLOCK_COL)
-        scale = tl.load(
-            S + (row // SCALE_BLOCK_ROW) * S_ROW + groups * S_COL,
-            valid_rows & in_bounds,
-            other=0.0,
-        )
-        scale = decode_group_scale(scale).to(tl.float32)
-        scale = tl.broadcast_to(
-            scale[:, None], (BLOCK // SCALE_BLOCK_COL, SCALE_BLOCK_COL)
-        ).reshape((BLOCK,))
-    else:
-        scale_offsets = (row // SCALE_BLOCK_ROW) * S_ROW
-        if S_COL != 0:
-            scale_offsets += (col * packing // SCALE_BLOCK_COL) * S_COL
-        scale = tl.load(
-            S + scale_offsets,
-            (valid_rows & in_bounds) if S_COL == 0 else valid,
-            other=0.0,
-        )
-        scale = decode_group_scale(scale).to(tl.float32)
-        if packing == 2:
-            scale = tl.broadcast_to(scale, (BLOCK // packing,))
-            scale = tl.interleave(scale, scale)
+    value = _decode_weight(value, row, FORMAT)
+    scale = _load_scale(
+        S, program, row, col, valid, valid_rows & in_bounds, D, S_ROW, S_COL,
+        SCALE_BLOCK_ROW, SCALE_BLOCK_COL, FORMAT, BLOCK, packing,
+    )
     value = value * scale
     if FORMAT == "nvfp4":
         value = value * tl.load(G).to(tl.float32)
@@ -114,32 +147,10 @@ def _embedding_kernel(
     tl.store(Out + output_offsets, value, output_offsets < N * D)
 
 
-@compile_time_only_triton_op(add_op_namespace_prefix("embedding_lookup"))
-def embedding_lookup(
-    weight: torch.Tensor,
-    indices: torch.Tensor,
-    scale: torch.Tensor,
-    global_scale: torch.Tensor | None = None,
-    output_dtype: torch.dtype | None = None,
-    *,
-    weight_format: str | None = None,
-    block_size: int = 128,
-) -> torch.Tensor:
-    """Gather and dequantize selected rows without expanding the embedding table.
-
-    ``weight_format`` selects ``fp8``, ``nvfp4``, ``mxfp8``, ``mxfp4``, ``int8``, or ``int4``.
-    By default, a global scale selects NVFP4, signed int8 weights select INT8, and otherwise
-    FP8 is used. FP8 accepts scalar, per-row, or square block scales (``block_size``).
-    NVFP4 uses E4M3 group-16 scales and one FP32 multiplier; MX formats use UE8M0 group-32
-    scales. FP4 packs adjacent columns, low nibble first. INT8 uses per-row scales; INT4
-    packs adjacent vocabulary rows and uses per-row column groups inferred from its scale
-    grid. Integer values are signed, symmetric, and have no zero point.
-
-    Outputs default to the floating scale dtype, or bf16 for NVFP4/MX. Table/grid strides
-    may describe TP slices. Indices follow ``torch.nn.functional.embedding``: negative and
-    out-of-range values fail; padding indices look up their stored row. Empty, repeated,
-    and noncontiguous indices work.
-    """
+def _check_inputs(weight, indices, scale, global_scale, output_dtype, weight_format, block_size):
+    """Validate an ``embedding_lookup`` call and resolve its format, its scale (UE8M0 viewed
+    as bytes), the ``(width, vocab, scale strides, scale blocks)`` kernel layout and the
+    output dtype. See ``embedding_lookup`` for the accepted layouts."""
     if weight_format is None:
         if global_scale is not None:
             weight_format = "nvfp4"
@@ -151,8 +162,6 @@ def embedding_lookup(
         raise ValueError("Expected a 2D embedding table and int32/int64 indices.")
     if weight.device != indices.device or weight.device != scale.device:
         raise ValueError("Embedding table, indices, and scales must share a device.")
-    if weight.device.type not in ("cuda", "xpu"):
-        raise ValueError("Fused embedding lookup requires a CUDA, ROCm, or XPU device.")
     packed_columns = weight_format in ("nvfp4", "mxfp4")
     width = weight.shape[1] * (2 if packed_columns else 1)
     vocab = weight.shape[0] * (2 if weight_format == "int4" else 1)
@@ -229,6 +238,39 @@ def embedding_lookup(
     )
     if dtype not in float_dtypes:
         raise ValueError("Embedding output must be float16, bfloat16, or float32.")
+    return weight_format, scale, (width, vocab, scale_row, scale_col, row_block, col_block), dtype
+
+
+@compile_time_only_triton_op(add_op_namespace_prefix("embedding_lookup"))
+def embedding_lookup(
+    weight: torch.Tensor,
+    indices: torch.Tensor,
+    scale: torch.Tensor,
+    global_scale: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+    *,
+    weight_format: str | None = None,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """Gather and dequantize selected rows without expanding the embedding table.
+
+    ``weight_format`` selects ``fp8``, ``nvfp4``, ``mxfp8``, ``mxfp4``, ``int8``, or ``int4``.
+    By default, a global scale selects NVFP4, signed int8 weights select INT8, and otherwise
+    FP8 is used. FP8 accepts scalar, per-row, or square block scales (``block_size``).
+    NVFP4 uses E4M3 group-16 scales and one FP32 multiplier; MX formats use UE8M0 group-32
+    scales. FP4 packs adjacent columns, low nibble first. INT8 uses per-row scales; INT4
+    packs adjacent vocabulary rows and uses per-row column groups inferred from its scale
+    grid. Integer values are signed, symmetric, and have no zero point.
+
+    Outputs default to the floating scale dtype, or bf16 for NVFP4/MX. Table/grid strides
+    may describe TP slices. Indices follow ``torch.nn.functional.embedding``: negative and
+    out-of-range values fail; padding indices look up their stored row. Empty, repeated,
+    and noncontiguous indices work.
+    """
+    weight_format, scale, layout, dtype = _check_inputs(
+        weight, indices, scale, global_scale, output_dtype, weight_format, block_size
+    )
+    width, vocab, scale_row, scale_col, row_block, col_block = layout
     out = torch.empty((*indices.shape, width), dtype=dtype, device=weight.device)
     if indices.numel() == 0:
         return out

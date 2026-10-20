@@ -19,7 +19,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
 from .formats import global_scale_stride, is_per_expert_global
-from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, device_context, pdl_launch_kwargs
+from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, device_context, is_blackwell, pdl_launch_kwargs
 from .swizzle import swizzle_store_block
 from .scheduling import build_tile_layout, resolve_tile_inline
 
@@ -61,13 +61,9 @@ def fp8_act_quant_inline(
     return a_fp8, a_scale
 
 
-# FP4 conversions are supported on SM10x, SM11x, and SM12x, independently of TMEM MMA.
+# Hardware FP4 conversions exist on every Blackwell family, independently of TMEM MMA.
 # Keep software conversion on older GPUs, ROCm, and driverless build hosts.
-_E2M1_HW_CVT = tl.constexpr(
-    torch.cuda.is_available()
-    and torch.version.hip is None
-    and torch.cuda.get_device_capability()[0] in (10, 11, 12)
-)
+_E2M1_HW_CVT = tl.constexpr(is_blackwell())
 
 
 @triton.jit
