@@ -1,9 +1,9 @@
 name: Kernel build guidance
 
 on:
-  # Run in the trusted base-repository context so fork PRs can receive a
-  # comment. The workflow only checks out and executes code from the base ref.
-  pull_request_target:
+  # Runs in the untrusted PR context with a read-only token so no secrets or
+  # write access are exposed. Only base-ref code is checked out and executed.
+  pull_request:
     types: [opened, reopened, ready_for_review, synchronize]
 
 
