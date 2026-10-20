@@ -14,6 +14,7 @@
 
 
 import os
+import functools
 from typing import List
 
 import torch
@@ -66,8 +67,20 @@ from .pruners import PATH_ANCHOR_AXES, fp8_dot_warp_pruner, gate_stacked_tmem_tr
 # inline either way.
 MX_MATMUL_ACT_PREQUANT_MIN_M = 16
 STATIC_MATMUL_ACT_PREQUANT_MIN_M = 16
-# the largest M tile of the tensor-wide / row-wise 2D kernel; its derived activations are padded to it
-TENSOR_MATMUL_A_ROW_MULTIPLE = 128
+# the largest M tile of the quantized 2D kernels; the activations they derive are padded to it
+MATMUL_A_ROW_MULTIPLE = 128
+
+
+def _padded_rows(M: int) -> int:
+    """``M`` rounded up to ``MATMUL_A_ROW_MULTIPLE``: the rows an activation descriptor box spans."""
+    return triton.cdiv(M, MATMUL_A_ROW_MULTIPLE) * MATMUL_A_ROW_MULTIPLE
+
+
+def _holds_rows(t: torch.Tensor, rows: int) -> bool:
+    """Whether ``t``'s storage backs ``rows`` rows of its row stride from its offset."""
+    return t.untyped_storage().nbytes() >= (t.storage_offset() + rows * t.stride(0)) * t.element_size()
+
+
 # Block-dynamic has NO gate: offline wins at EVERY M incl. M=1 (24.7 vs 31.0us, isolated
 # arm A/B, graph-timed, H=6144 b128) — the inline arm pays a per-tile fp32 amax+div. The
 # always-offline paths (bd 2D/batched/grouped, fused gate_ups, MX grouped) quantize
@@ -173,6 +186,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     SWIGLU_LIMIT: tl.constexpr = None,
     SIMULATE_UNFUSED: tl.constexpr = False,
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
+    PDL: tl.constexpr = False,
 ):
     """Block-scale FP8 GEMM kernel.
 
@@ -193,6 +207,8 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     128-group scales into a tcgen05 ``dot_scaled`` MMA — see ``block_dynamic_dot``. fp32
     scales, or a narrow M tile (decode), keep the plain ``tl.dot`` + software rescale.
     """
+    if PDL:
+        gdc_wait()
     USE_DOT_SCALED: tl.constexpr = (As.dtype.element_ty == tl.uint8) and (
         (BLOCK_SIZE_N if SWAP_AB else BLOCK_SIZE_M) >= 128
     )
@@ -255,6 +271,8 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
             A_MEMORY_MODE, B_MEMORY_MODE, True, True, False,
         )
 
+    if PDL:
+        gdc_launch_dependents()
     if GATE:
         gemm_epilogue(
             C, None, accumulator, offs_am_lin, pid_n, pid_m, as_mask,
@@ -755,6 +773,7 @@ def mx_dynamic_matmul_kernel(
     INTERMEDIATE_DTYPE: tl.constexpr = tl.bfloat16,
     WARP_SPEC: tl.constexpr = False,  # tuner axis; +4% at prefill (guard: num_warps%4, BM>=64)
     SWAP_AB: tl.constexpr = False,  # swapped decode orientation (BM=1); scoped by mx_2d_swap_scope_pruner
+    PDL: tl.constexpr = False,
 ):
     """Unified MXFP4/MXFP8 (W4A8/W8A8; a ``uint8`` ``A`` is packed E2M1 — W4A4) GEMM.
 
@@ -769,6 +788,8 @@ def mx_dynamic_matmul_kernel(
     rescale (wins at decode; FP4 unpacks E2M1->E4M3 first — lossless). 2D grid with
     swizzle for L2 reuse.
     """
+    if PDL:
+        gdc_wait()
     num_m_tiles = tl.cdiv(M, BLOCK_SIZE_M)
     if PERSISTENT:
         tile_start, tile_end, tile_step = tl.program_id(0), num_m_tiles * tl.cdiv(N, BLOCK_SIZE_N), tl.num_programs(0)
@@ -841,6 +862,10 @@ def mx_dynamic_matmul_kernel(
                 not SWIZZLED_SCALES, (not SWIZZLED_SCALES) and not GATE, False,
             )
 
+        # a persistent program still has tiles ahead: releasing on its first would co-schedule the
+        # dependents against its remaining main loops, so it releases only at exit
+        if PDL and not PERSISTENT:
+            gdc_launch_dependents()
         if SPLIT_K > 1:
             # Decode's padded MMA rows are identical; reduce only the real row.
             first = tl.gather(accumulator, tl.full((1, n_width), 0, tl.int32), 0)
@@ -1496,15 +1521,18 @@ def w8a8_block_dynamic_fp8_matmul(
     bs_u8 = ue8m0_as_uint8(Bs)
     # UE8M0 weight scales are the DeepGEMM-Blackwell format — quantize activations to UE8M0
     # too so the kernel folds both group scales into the tcgen05 dot_scaled MMA (else fp32).
+    # rows padded to the largest M tile, so the A box reads in bounds (see the tensor-dynamic op)
     A_q, A_s = fp8_act_quant_block_dynamic(
-        A.view(M, K), block_k, use_ue8m0=bs_u8.dtype == torch.uint8
+        A.view(M, K), block_k, use_ue8m0=bs_u8.dtype == torch.uint8,
+        row_multiple=MATMUL_A_ROW_MULTIPLE,
     )
+    a_rows = _padded_rows(M)
     C = A.new_empty(A.shape[:-1] + (gate_out_cols(N, gate, act_fn),), dtype=output_dtype)
-    # Host TMA descriptors over the (M, K) / (N, K) matrices — the placeholder box is
+    # Host TMA descriptors over the (a_rows, K) / (N, K) matrices — the placeholder box is
     # re-bound per tuned config by rebind_bd_descriptors. Read only by the descriptor
     # (host-TMA) configs the tuner picks for wide-N prefill; pointer configs never touch
     # them (the constexpr arm folds out in the load helpers).
-    a_descriptor = TensorDescriptor.from_tensor(A_q, [1, block_k])
+    a_descriptor = TensorDescriptor(A_q, [a_rows, K], [K, 1], [1, block_k])
     b_descriptor = maybe_descriptor(B, [1, block_k])
 
     def grid(META):
@@ -1548,6 +1576,7 @@ def w8a8_block_dynamic_fp8_matmul(
             SWIGLU_LIMIT=swiglu_limit,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(resolve_output_dtype(output_dtype, A, None)),
+            **pdl_launch_kwargs(),
         )
 
     return [C]
@@ -1737,13 +1766,11 @@ def w8a8_tensor_dynamic_fp8_matmul(
     # alignment. Rows past M are never stored.
     qA, As, as_stride_m, _ = tensor_wide_act_operands(
         A.reshape(M, K), None if As is None else As.reshape(-1),
-        row_multiple=TENSOR_MATMUL_A_ROW_MULTIPLE,
+        row_multiple=MATMUL_A_ROW_MULTIPLE,
         activation_scale_ub=activation_scale_ub,
     )
-    a_rows = triton.cdiv(M, TENSOR_MATMUL_A_ROW_MULTIPLE) * TENSOR_MATMUL_A_ROW_MULTIPLE
-    if (qA.storage_offset() * qA.element_size()) % 16 or (
-        qA.untyped_storage().nbytes() < (qA.storage_offset() + a_rows * K) * qA.element_size()
-    ):
+    a_rows = _padded_rows(M)
+    if (qA.storage_offset() * qA.element_size()) % 16 or not _holds_rows(qA, a_rows):
         qA = torch.empty(a_rows, K, device=qA.device, dtype=qA.dtype)[:M].copy_(qA)
     Bs = Bs.reshape(-1, 1)
 
@@ -1913,18 +1940,17 @@ def mx_dynamic_matmul(
     # affine in-register even under a swizzled weight — the dot_scaled reads the mixed layout fine.
     # NVFP4 two-level: a_global_scale (the calibrated activation global) normalizes the quant on both
     # arms — the offline kernel divides before the block quant, the inline arm via AsGlobal.
+    # The offline arm pads its value rows to the largest M tile, as the tensor-dynamic op does.
     act_global_scale = normalize_global_scale(a_global_scale, 1)  # g_a; folds in-kernel
     if activation_format == "fp8":
         act_quant = None  # As carries unit group scales; A is already quantized.
-    elif act_global_scale is not None:
-        assert activation_format == "nvfp4", "an activation global requires NVFP4"
-        act_quant = lambda a: MX_ACT_QUANT[activation_format](  # noqa: E731
-            a, swizzled=swizzled_scales, global_scale=act_global_scale
-        )
-    elif swizzled_scales:
-        act_quant = lambda a: MX_ACT_QUANT[activation_format](a, swizzled=True)  # noqa: E731
     else:
-        act_quant = MX_ACT_QUANT[activation_format]
+        assert act_global_scale is None or activation_format == "nvfp4", "an activation global requires NVFP4"
+        globals_kw = {} if act_global_scale is None else {"global_scale": act_global_scale}
+        act_quant = functools.partial(
+            MX_ACT_QUANT[activation_format], swizzled=swizzled_scales,
+            row_multiple=MATMUL_A_ROW_MULTIPLE, **globals_kw,
+        )
     # NVFP4 accumulator correction: the g_a·g_b product folded onto the fp32 accumulator
     input_global_scale = normalize_global_scale(b_global_scale, 1)  # g_b
     out_global_scale = normalize_global_scale(output_global_scale, 1)
@@ -1984,7 +2010,12 @@ def mx_dynamic_matmul(
     # Host-TMA descriptors over the packed (M, K_bytes) / (N, K_bytes) matrices — placeholder
     # box rebound per tuned config by rebind_mx_descriptors. Read only by the descriptor
     # configs the tuner picks; pointer configs never touch them.
-    a_descriptor = TensorDescriptor.from_tensor(A_q, [1, 32])
+    # The A box spans the padded rows where the storage holds them (the offline arm), so it reads
+    # in bounds instead of taking the TMA zero-fill path (see the tensor-dynamic op).
+    a_rows = _padded_rows(M)
+    if not _holds_rows(A_q, a_rows):
+        a_rows = M
+    a_descriptor = TensorDescriptor(A_q, [a_rows, A_q.shape[1]], [A_q.stride(0), 1], [1, 32])
     b_descriptor = TensorDescriptor.from_tensor(b_u8, [1, 32])
     # One scale pointer per operand (as_u8/bs_u8) — the swizzled buffer on the fast path (also the
     # base for the BM<128 / BN<128 scalar gather), the affine scale otherwise — plus its descriptor,
@@ -2070,6 +2101,7 @@ def mx_dynamic_matmul(
             OUTPUT_FORMAT=output_format,
             SIMULATE_UNFUSED=simulate_unfused,
             INTERMEDIATE_DTYPE=tl_dtype(output_dtype),
+            **pdl_launch_kwargs(),
         )
     # NVFP4's block scales are already normalized by the provided output global (CsGlobal =
     # output_global_scale) at requant, so the caller pairs cs_ret with that global as the down's As.

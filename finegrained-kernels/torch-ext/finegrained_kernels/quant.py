@@ -860,6 +860,13 @@ def swizzle_grouped_mx_scales(
     return out.view(scale.dtype), n_m_tiles
 
 
+def row_padded_empty(rows: int, cols: int, row_multiple: int, dtype: torch.dtype, device) -> torch.Tensor:
+    """An empty ``(rows, cols)`` tensor whose storage is rounded up to ``row_multiple`` rows, so a
+    descriptor box over the padded rows reads in bounds (the extra rows are never written)."""
+    padded = triton.cdiv(rows, row_multiple) * row_multiple
+    return torch.empty(padded * cols, device=device, dtype=dtype)[: rows * cols].view(rows, cols)
+
+
 def maybe_act_quant(x, act_quant, min_m):
     """Row-count-gated offline activation pre-quant. Apply ``act_quant`` (a one-pass
     quant kernel, e.g. ``mxfp8_act_quant``) when the GEMM consuming ``x`` is
@@ -878,17 +885,21 @@ def maybe_act_quant(x, act_quant, min_m):
     return x, x
 
 
-def mxfp8_act_quant(x: torch.Tensor, swizzled: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+def mxfp8_act_quant(
+    x: torch.Tensor, swizzled: bool = False, row_multiple: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to MX once (E4M3 values + UE8M0 group-32 uint8 scales)
     instead of inline per weight-tile — the fused gate_up re-ran the inline quant per N-tile
     (16x redundant amax/convert ALU + 2x act bytes), which held it at ~380 TFLOPS while the
     pre-quantized down kernel ran at ~1080. One pass costs ~50µs at 8k tokens. Bit-exact with
     the inline form (same group boundaries). ``swizzled=True`` emits the scale directly in
     SWIZZLE_32_4_4 for the tcgen05 fast path (same dense grid, per-element store)."""
-    return _launch_act_quant(x, "mxfp8", MX_SCALE_GROUP_K, torch.uint8, swizzled)
+    return _launch_act_quant(x, "mxfp8", MX_SCALE_GROUP_K, torch.uint8, swizzled, row_multiple=row_multiple)
 
 
-def mxfp4_act_quant(x: torch.Tensor, swizzled: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+def mxfp4_act_quant(
+    x: torch.Tensor, swizzled: bool = False, row_multiple: int = 1
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to MXFP4 in one kernel pass: packed-E2M1 values
     (``(T, K//2)`` int8, two codes per byte, first value in the low nibble) + UE8M0
     group-32 uint8 scales (``(T, K//32)``, amax/6 ceil'd to a power of two). Bit-identical
@@ -896,7 +907,7 @@ def mxfp4_act_quant(x: torch.Tensor, swizzled: bool = False) -> tuple[torch.Tens
     W4A4 arm of the MX matmul ops; quantizing activations to fp4 at runtime is an
     accuracy call the caller owns — the ops never do it implicitly. ``swizzled=True`` emits the
     scale directly in SWIZZLE_32_4_4 for the tcgen05 fast path."""
-    return _launch_act_quant(x, "mxfp4", MX_SCALE_GROUP_K, torch.uint8, swizzled)
+    return _launch_act_quant(x, "mxfp4", MX_SCALE_GROUP_K, torch.uint8, swizzled, row_multiple=row_multiple)
 
 
 def nvfp4_act_quant(
@@ -905,6 +916,7 @@ def nvfp4_act_quant(
     global_scale: torch.Tensor | None = None,
     expert_index: torch.Tensor | None = None,
     gather_idx: torch.Tensor | None = None,
+    row_multiple: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to NVFP4 in one kernel pass: packed-E2M1 values
     (``(T, K//2)`` int8) + E4M3 group-16 block scales (``(T, K//16)`` — ``amax/6`` rounded to
@@ -920,7 +932,8 @@ def nvfp4_act_quant(
     ``None`` = single-level (``g_a = 1``). ``swizzled=True`` emits the scale directly in
     SWIZZLE_32_4_4 for the tcgen05 fast path."""
     return _launch_act_quant(
-        x, "nvfp4", NVFP4_SCALE_GROUP_K, torch.float8_e4m3fn, swizzled, global_scale, expert_index, gather_idx
+        x, "nvfp4", NVFP4_SCALE_GROUP_K, torch.float8_e4m3fn, swizzled, global_scale, expert_index, gather_idx,
+        row_multiple=row_multiple,
     )
 
 
@@ -1067,7 +1080,7 @@ MX_ACT_QUANT = {
 
 def _launch_act_quant(
     x, activation_format, scale_group, scale_dtype, swizzled=False, global_scale=None,
-    expert_index=None, gather_idx=None, pre_quant_scale=None,
+    expert_index=None, gather_idx=None, pre_quant_scale=None, row_multiple=1,
 ):
     """One-pass activation quant for every format (``mxfp8`` = E4M3 values, else packed E2M1) and
     both scale layouts. ``swizzled=True`` writes the scale straight into the SWIZZLE_32_4_4 buffer
@@ -1076,7 +1089,8 @@ def _launch_act_quant(
     ``(T, K // scale_group)``. ``global_scale`` (NVFP4 two-level, ``(1,)`` fp32) normalizes the
     values before the block quant. ``gather_idx`` quantizes ``x[gather_idx]``, one output row per
     entry, without materializing it — what per-expert globals need for routed rows of one token.
-    Returns ``(values, scales)``."""
+    ``row_multiple`` backs the value rows with storage rounded up to that many rows, as
+    ``fp8_act_quant_tensor_wide``. Returns ``(values, scales)``."""
     K = x.shape[1]
     T = gather_idx.numel() if gather_idx is not None else x.shape[0]
     packed = activation_format != "mxfp8"
@@ -1085,9 +1099,8 @@ def _launch_act_quant(
         assert K % (2 * scale_group) == 0, (
             f"K (={K}) must be a multiple of {2 * scale_group} to pack E2M1 pairs"
         )
-    values = torch.empty(
-        T, K // 2 if packed else K, device=x.device,
-        dtype=torch.uint8 if packed else FP8_DTYPE,
+    values = row_padded_empty(
+        T, K // 2 if packed else K, row_multiple, torch.uint8 if packed else FP8_DTYPE, x.device
     )
     if swizzled:
         cb = triton.cdiv(K // scale_group, 4)
@@ -1182,15 +1195,16 @@ def _fp8_act_quant_block_dynamic_kernel(
 
 
 def fp8_act_quant_block_dynamic(
-    x: torch.Tensor, block_k: int, use_ue8m0: bool = False
+    x: torch.Tensor, block_k: int, use_ue8m0: bool = False, row_multiple: int = 1
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``(T, K)`` activations to block-FP8 once (E4M3 + per-``block_k`` scales)
     instead of inline per weight-tile — same rationale and layout as ``mxfp8_act_quant`` (a
     GEMM re-reads its activation once per N-tile). Bit-exact with the inline form. Scales are
     fp32 (``amax/448``) or, under ``use_ue8m0``, UE8M0 exponent bytes (power-of-two scales)
-    for the tcgen05 ``dot_scaled`` path — the DeepGEMM-Blackwell format."""
+    for the tcgen05 ``dot_scaled`` path — the DeepGEMM-Blackwell format. ``row_multiple`` backs
+    the E4M3 rows with storage rounded up to that many rows, as ``fp8_act_quant_tensor_wide``."""
     T, K = x.shape
-    y = torch.empty(T, K, device=x.device, dtype=FP8_DTYPE)
+    y = row_padded_empty(T, K, row_multiple, FP8_DTYPE, x.device)
     s_dtype = torch.uint8 if use_ue8m0 else torch.float32
     s = torch.empty(T, K // block_k, device=x.device, dtype=s_dtype)
 
@@ -1373,8 +1387,7 @@ def fp8_act_quant_tensor_wide(
     (left unwritten), so a TMA box over the padded extent reads in bounds."""
     assert x.is_contiguous()
     assert x.shape[-1] % block_size == 0
-    padded_rows = triton.cdiv(x.numel() // x.shape[-1], row_multiple) * row_multiple
-    y = x.new_empty(padded_rows * x.shape[-1], dtype=FP8_DTYPE)[: x.numel()].view(x.shape)
+    y = row_padded_empty(x.numel() // x.shape[-1], x.shape[-1], row_multiple, FP8_DTYPE, x.device).view(x.shape)
     grid = (triton.cdiv(x.numel(), block_size),)
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
 

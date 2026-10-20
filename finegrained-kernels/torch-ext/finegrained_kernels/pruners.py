@@ -1269,7 +1269,9 @@ def scalar_block_m_pruner(m_arg: str):
 
 
 def mx_auxiliary_pruner():
-    """SVDQuant native MMA: split the decode reduction or persist across prefill tiles."""
+    """SVDQuant native MMA: split the decode reduction or persist across prefill tiles. Plain NVFP4/MXFP4 M=1 never
+    crowns a split row: the scalar BM=1 GEMV wins (B200 graph, 5120x5120: NVFP4 11.1 vs best split 26.1us, MXFP4 12.6
+    vs 19.5us), so the scope stays."""
     def ok(c, args):
         split = c.kwargs.get("SPLIT_K", 1)
         persistent = c.kwargs.get("PERSISTENT", False)
