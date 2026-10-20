@@ -85,7 +85,7 @@ from .pruners import (
     smem_pruner,
     warp_spec_compile_guard_pruner,
 )
-from .formats import global_scale_stride, normalize_global_scale
+from .formats import global_scale_stride, normalize_global_scale, ue8m0_as_uint8
 from .quant import e2m1_cols_to_bf16, e2m1_cols_to_f32
 from .loading.scales import decode_group_scale
 from .loading.tiles import load_grouped_act_tile, operand_tile_ptrs
@@ -894,8 +894,7 @@ def _dgrad_mx(dY, B, Bs, b_global, out_dtype):
     one value here, a 2D weight being one matrix."""
     if B.dtype == torch.int8:
         B = B.view(torch.uint8)
-    if Bs.dtype == getattr(torch, "float8_e8m0fnu", None):
-        Bs = Bs.view(torch.uint8)
+    Bs = ue8m0_as_uint8(Bs)
     values_per_byte = 2 if B.dtype == torch.uint8 else 1
     K = B.shape[-1] * values_per_byte
     group = K // Bs.shape[-1]
@@ -925,8 +924,7 @@ def _dgrad_grouped(ctx, dY, B, Bs, expert_start, gather_idx, scatter_idx, b_glob
     global folds in the kernel, which already resolves each tile's expert."""
     if B.dtype == torch.int8:
         B = B.view(torch.uint8)
-    if Bs.dtype == getattr(torch, "float8_e8m0fnu", None):
-        Bs = Bs.view(torch.uint8)
+    Bs = ue8m0_as_uint8(Bs)
     values_per_byte = 2 if B.dtype == torch.uint8 else 1
     K = B.shape[-1] * values_per_byte
     dX = dgrad_matmul_grouped(
@@ -1013,8 +1011,7 @@ def _dgrad_batched(ctx, dY, B, Bs, expert_ids, b_global):
     ``_dgrad_grouped`` is that the expert comes from a per-row index rather than sorted ranges."""
     if B.dtype == torch.int8:
         B = B.view(torch.uint8)
-    if Bs.dtype == getattr(torch, "float8_e8m0fnu", None):
-        Bs = Bs.view(torch.uint8)
+    Bs = ue8m0_as_uint8(Bs)
     values_per_byte = 2 if B.dtype == torch.uint8 else 1
     K = B.shape[-1] * values_per_byte
     dX = dgrad_matmul_batched(
