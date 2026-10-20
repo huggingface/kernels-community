@@ -16,7 +16,6 @@
 step, pins each xdist worker to its own GPU, then gates the whole suite on FP8
 hardware support."""
 
-import importlib.util
 import os
 import shutil
 import subprocess
@@ -31,15 +30,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "torch-ext"))
 # both stayed invisible until a bench came back with empty cells). 0 aborts the tune on the
 # first reject so a test reports it. Deployment keeps the default, where forgiveness is what
 # lets a crowned config survive one unrelated bad neighbour.
-# Merged into any FINEGRAINED_AUTOTUNE_CONFIG already set, before the package is imported: the
-# tuner reads it when each kernel is decorated, so the stdlib-only helper is loaded by path.
-_spec = importlib.util.spec_from_file_location(
-    "finegrained_autotune_config",
-    Path(__file__).parent.parent / "torch-ext" / "finegrained_kernels" / "autotune_config.py",
-)
-_autotune_config = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_autotune_config)
-_autotune_config.set_autotune_defaults(max_failures=0)
+# An explicit FINEGRAINED_AUTOTUNE_CONFIG takes over (add "max_failures": 0 to keep this).
+os.environ.setdefault("FINEGRAINED_AUTOTUNE_CONFIG", '{"max_failures": 0}')
 
 
 def _visible_gpu_pool(env_var: str, list_cmd: list[str]) -> list[str]:

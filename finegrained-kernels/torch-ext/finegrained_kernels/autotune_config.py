@@ -17,10 +17,7 @@
 Its value is a mode name (``fast``), inline JSON, or a path to a JSON file. JSON keys are the
 tuner's own options; ``"mode"`` there applies a preset whose keys explicit ones override.
 
-The tuner reads this when each kernel is decorated, i.e. when the package is imported, so
-entry points that set defaults (the test conftest, ``bench --smoke``) must do it first. This
-module therefore uses only the standard library, so they can load it by path without importing
-the package.
+The tuner reads this when each kernel is decorated, i.e. when the package is imported.
 """
 
 import json
@@ -71,11 +68,3 @@ def load_autotune_config() -> dict:
         )
     return {key: KEYS[key](value) for key, value in config.items()}
 
-
-def set_autotune_defaults(**defaults) -> None:
-    """Merge ``defaults`` into the environment's config without overriding what it already sets
-    (a mode or explicit keys). Call before the package is imported."""
-    config = _read(os.environ.get(ENV_VAR, ""))
-    for key, value in defaults.items():
-        config.setdefault(key, value)
-    os.environ[ENV_VAR] = json.dumps(config)
