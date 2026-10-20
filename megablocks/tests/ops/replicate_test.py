@@ -1,16 +1,16 @@
 # Copyright 2024 Databricks
 # SPDX-License-Identifier: Apache-2.0
 
+
+import kernels
 import numpy as np
 import pytest
 import torch
 
-try:
-    from megablocks._ops import ops as backend  # type: ignore
-except ModuleNotFoundError as e:
-    raise ModuleNotFoundError("No module named 'megablocks_ops'.") from e
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=1)
+backend = megablocks._private_for_testing.ops
 
-from megablocks import ops
+ops = megablocks.ops
 
 
 def promote_scalar(x: torch.Tensor) -> torch.Tensor:
