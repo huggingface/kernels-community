@@ -173,6 +173,14 @@ canonical two-level NVFP4 weight quant (`global = amax / (6·448)`). The `*_act_
 the offline activation quants the ops use internally, exposed for pre-quantized (`As`) pipelines;
 `fp8_act_quant_block_dynamic` / `fp8_act_quant_tensor_wide` are their block-FP8 siblings.
 
+CSF-compressed NVFP4 weight scales (a checkpoint's losslessly compressed E4M3 scale bytes) are
+prepared once at load: `prepare_nvfp4_csf_scales(fixed, exceptions)` validates the streams and
+returns `(fixed, exceptions, expert_offsets)`. Pass them to the ops as `Bs=fixed` with
+`b_scale_exceptions` / `b_scale_exception_offsets` (the MoE forwards take
+`*_proj_scale_exceptions` / `*_proj_scale_exception_offsets` beside `*_proj_scale_inv`), and each
+op decodes them before its GEMM, only the experts with routed rows. To keep dense scales instead,
+decode once with `decompress_nvfp4_csf_scales`.
+
 ## Autotuning
 
 Every kernel is tuned by a Tree-structured Parzen Estimator (TPE, the Bayesian search Optuna

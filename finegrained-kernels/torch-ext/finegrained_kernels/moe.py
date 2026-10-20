@@ -58,8 +58,9 @@ from .compat import (
 )
 from .formats import get_supported_act_fns, is_mx, is_mxfp4, is_per_expert_global, mx_scale_family, normalize_global_scale, ue8m0_as_uint8, weight_format
 from .norm import norm_column_factor, rms_inv_rows, rms_norm_rows
+from .loading.scales import csf_weight_scales
 from .quant import _launch_act_quant, MX_ACT_QUANT, mx_act_quant_routed_scales
-from .scheduling import compute_grouped_scheduling, is_off_rank, off_rank
+from .scheduling import compute_grouped_scheduling, is_off_rank, off_rank, routed_expert_start
 from .epilogue import fused_glu
 
 
@@ -245,6 +246,23 @@ def _torch_weighted_reduce(down_out, top_k_index, top_k_weights, num_experts):
     return contrib.view(num_tokens, num_top_k, down_out.size(1)).sum(dim=1)
 
 
+def _csf_weight_scales(
+    gate_up_proj_scale_inv, gate_up_proj_scale_exceptions, gate_up_proj_scale_exception_offsets,
+    down_proj_scale_inv, down_proj_scale_exceptions, down_proj_scale_exception_offsets, expert_start,
+):
+    """Both projections' weight scales for the GEMMs: a CSF fixed stream (given its exceptions)
+    decodes, only the experts with routed rows in ``expert_start``; dense scales pass through."""
+    return (
+        csf_weight_scales(
+            gate_up_proj_scale_inv, gate_up_proj_scale_exceptions, gate_up_proj_scale_exception_offsets,
+            expert_start,
+        ),
+        csf_weight_scales(
+            down_proj_scale_inv, down_proj_scale_exceptions, down_proj_scale_exception_offsets, expert_start
+        ),
+    )
+
+
 def _host_glu(gate_up_out, act_fn, swiglu_alpha, swiglu_limit, gate):
     """The activation on the host, for the arms the epilogue does not fuse: a callable takes the
     raw GEMM output (interleaved gate|up columns when ``gate``) and returns the intermediate —
@@ -345,6 +363,10 @@ def moe_fused_grouped(
     down_proj: torch.Tensor,  # (E, H, I)
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
+    gate_up_proj_scale_exceptions: torch.Tensor | None = None,
+    gate_up_proj_scale_exception_offsets: torch.Tensor | None = None,
+    down_proj_scale_exceptions: torch.Tensor | None = None,
+    down_proj_scale_exception_offsets: torch.Tensor | None = None,
     gate_up_proj_weight_global_scale: torch.Tensor | None = None,
     down_proj_weight_global_scale: torch.Tensor | None = None,
     gate_up_proj_input_global_scale: torch.Tensor | None = None,
@@ -379,17 +401,24 @@ def moe_fused_grouped(
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
     callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
     projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
-    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine."""
-    fmt = _block_format(
-        gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format
-    )
+    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine.
+    ``*_proj_scale_exceptions``/``*_proj_scale_exception_offsets`` mark that projection's
+    ``*_proj_scale_inv`` as a CSF-compressed NVFP4 fixed stream (``prepare_nvfp4_csf_scales``);
+    the block decodes it, only the routed experts, before its GEMMs."""
     num_top_k = top_k_index.size(-1)
-    glu = _fused_glu(act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, gate)
-    fused = glu["act_fn"] is not None
     NUM_EXPERTS = gate_up_proj.size(0)
     expert_start, gather_idx, scatter_idx = compute_grouped_scheduling(
         top_k_index, NUM_EXPERTS, num_top_k
     )
+    gate_up_proj_scale_inv, down_proj_scale_inv = _csf_weight_scales(
+        gate_up_proj_scale_inv, gate_up_proj_scale_exceptions, gate_up_proj_scale_exception_offsets,
+        down_proj_scale_inv, down_proj_scale_exceptions, down_proj_scale_exception_offsets, expert_start,
+    )
+    fmt = _block_format(
+        gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format
+    )
+    glu = _fused_glu(act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, gate)
+    fused = glu["act_fn"] is not None
 
     # Phase 1: gate_up + SiLU + requant in the block format -> expert-ordered quantized
     # intermediate. scatter_idx=None: the down reads the intermediate in place. (C, Cs) under a
@@ -462,6 +491,10 @@ def moe_fused_batched(
     down_proj: torch.Tensor,  # (E, H, I)
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
+    gate_up_proj_scale_exceptions: torch.Tensor | None = None,
+    gate_up_proj_scale_exception_offsets: torch.Tensor | None = None,
+    down_proj_scale_exceptions: torch.Tensor | None = None,
+    down_proj_scale_exception_offsets: torch.Tensor | None = None,
     gate_up_proj_weight_global_scale: torch.Tensor | None = None,
     down_proj_weight_global_scale: torch.Tensor | None = None,
     gate_up_proj_input_global_scale: torch.Tensor | None = None,
@@ -498,14 +531,23 @@ def moe_fused_batched(
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
     callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
     projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
-    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine."""
+    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine.
+    ``*_proj_scale_exceptions``/``*_proj_scale_exception_offsets`` mark that projection's
+    ``*_proj_scale_inv`` as a CSF-compressed NVFP4 fixed stream (``prepare_nvfp4_csf_scales``);
+    the block decodes it, only the routed experts, before its GEMMs."""
+    NUM_EXPERTS = gate_up_proj.size(0)
+    expert_ids = top_k_index.reshape(-1)
+    if gate_up_proj_scale_exceptions is not None or down_proj_scale_exceptions is not None:
+        gate_up_proj_scale_inv, down_proj_scale_inv = _csf_weight_scales(
+            gate_up_proj_scale_inv, gate_up_proj_scale_exceptions, gate_up_proj_scale_exception_offsets,
+            down_proj_scale_inv, down_proj_scale_exceptions, down_proj_scale_exception_offsets,
+            routed_expert_start(expert_ids, NUM_EXPERTS),  # decode only the routed experts
+        )
     fmt = _block_format(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format
     )
     glu = _fused_glu(act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, gate)
     fused = glu["act_fn"] is not None
-    NUM_EXPERTS = gate_up_proj.size(0)
-    expert_ids = top_k_index.reshape(-1)
     gather_idx = _gather_idx(top_k_index)
 
     # Phase 1: gate_up + SiLU + requant in the block format -> per-row quantized
@@ -587,6 +629,10 @@ def moe_unfused_grouped(
     down_proj: torch.Tensor,
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
+    gate_up_proj_scale_exceptions: torch.Tensor | None = None,
+    gate_up_proj_scale_exception_offsets: torch.Tensor | None = None,
+    down_proj_scale_exceptions: torch.Tensor | None = None,
+    down_proj_scale_exception_offsets: torch.Tensor | None = None,
     gate_up_proj_weight_global_scale: torch.Tensor | None = None,
     down_proj_weight_global_scale: torch.Tensor | None = None,
     gate_up_proj_input_global_scale: torch.Tensor | None = None,
@@ -617,15 +663,21 @@ def moe_unfused_grouped(
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
     callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
     projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
-    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine."""
-    fmt = _block_format(
-        gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format
-    )
-
+    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine.
+    ``*_proj_scale_exceptions``/``*_proj_scale_exception_offsets`` mark that projection's
+    ``*_proj_scale_inv`` as a CSF-compressed NVFP4 fixed stream (``prepare_nvfp4_csf_scales``);
+    the block decodes it, only the routed experts, before its GEMMs."""
     num_top_k = top_k_index.size(-1)
     NUM_EXPERTS = gate_up_proj.size(0)
     expert_start, gather_idx, scatter_idx = compute_grouped_scheduling(
         top_k_index, NUM_EXPERTS, num_top_k
+    )
+    gate_up_proj_scale_inv, down_proj_scale_inv = _csf_weight_scales(
+        gate_up_proj_scale_inv, gate_up_proj_scale_exceptions, gate_up_proj_scale_exception_offsets,
+        down_proj_scale_inv, down_proj_scale_exceptions, down_proj_scale_exception_offsets, expert_start,
+    )
+    fmt = _block_format(
+        gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format
     )
 
     # gate_up as a plain GEMM (no gate epilogue) over gathered hidden -> expert-ordered (S, 2I).
@@ -866,6 +918,10 @@ def moe_unfused_batched(
     down_proj: torch.Tensor,
     gate_up_proj_scale_inv: torch.Tensor,
     down_proj_scale_inv: torch.Tensor,
+    gate_up_proj_scale_exceptions: torch.Tensor | None = None,
+    gate_up_proj_scale_exception_offsets: torch.Tensor | None = None,
+    down_proj_scale_exceptions: torch.Tensor | None = None,
+    down_proj_scale_exception_offsets: torch.Tensor | None = None,
     gate_up_proj_weight_global_scale: torch.Tensor | None = None,
     down_proj_weight_global_scale: torch.Tensor | None = None,
     gate_up_proj_input_global_scale: torch.Tensor | None = None,
@@ -895,12 +951,21 @@ def moe_unfused_batched(
     ``get_supported_act_fns()`` name (fused into the gate_up epilogue where the forward fuses) or any
     callable applied on the host to the raw gate_up output; ``gate=False`` runs an ungated
     projection. Scales are affine or pre-swizzled (``SWIZZLE_32_4_4``, self-describing 5-D)
-    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine."""
+    — the swizzled layout is for the dot_scaled arm; weight-only chains take affine.
+    ``*_proj_scale_exceptions``/``*_proj_scale_exception_offsets`` mark that projection's
+    ``*_proj_scale_inv`` as a CSF-compressed NVFP4 fixed stream (``prepare_nvfp4_csf_scales``);
+    the block decodes it, only the routed experts, before its GEMMs."""
+    NUM_EXPERTS = gate_up_proj.size(0)
+    expert_ids = top_k_index.reshape(-1)
+    if gate_up_proj_scale_exceptions is not None or down_proj_scale_exceptions is not None:
+        gate_up_proj_scale_inv, down_proj_scale_inv = _csf_weight_scales(
+            gate_up_proj_scale_inv, gate_up_proj_scale_exceptions, gate_up_proj_scale_exception_offsets,
+            down_proj_scale_inv, down_proj_scale_exceptions, down_proj_scale_exception_offsets,
+            routed_expert_start(expert_ids, NUM_EXPERTS),  # decode only the routed experts
+        )
     fmt = _block_format(
         gate_up_proj, gate_up_proj_scale_inv, down_proj, down_proj_scale_inv, activation_format
     )
-    NUM_EXPERTS = gate_up_proj.size(0)
-    expert_ids = top_k_index.reshape(-1)
     gather_idx = _gather_idx(top_k_index)
 
     # gate_up as a plain GEMM (no gate epilogue) over gathered hidden -> (S, 2I).

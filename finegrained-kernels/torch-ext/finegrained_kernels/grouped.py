@@ -31,6 +31,7 @@ from .quant import fp8_act_quant_block_dynamic, MX_ACT_QUANT, mx_act_quant_group
 from .swizzle import swizzled_scale_descriptor
 from .mma import block_dynamic_dot, fp8_dot, mx_compute, mx_weight_only_compute, static_dot
 from .scheduling import build_tile_layout, expand_gather_below_parity, expand_regime, build_packed_schedule, load_packed_schedule, prefetch_packed_entry, resolve_grouped_tile, resolve_grouped_tile_packed
+from .loading.scales import csf_weight_scales
 from .loading.tiles import (
     load_act_block_dynamic,
     load_act_mx,
@@ -2234,6 +2235,8 @@ def matmul_grouped(
     scatter_idx: torch.Tensor | None = None,
     a_global_scale: torch.Tensor | None = None,
     b_global_scale: torch.Tensor | None = None,
+    b_scale_exceptions: torch.Tensor | None = None,
+    b_scale_exception_offsets: torch.Tensor | None = None,
     output_global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Grouped matmul dispatcher (W8A8 FP8, W4A8/W4A4 FP4, or full-precision).
@@ -2275,7 +2278,11 @@ def matmul_grouped(
     - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) →
       ``w8a8_tensor_dynamic_fp8_matmul_grouped``.
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_grouped``.
+    - CSF-compressed NVFP4 weight scales (``prepare_nvfp4_csf_scales``): ``Bs`` is the fixed
+      stream, ``b_scale_exceptions``/``b_scale_exception_offsets`` its exceptions and expert
+      offsets; the op decodes them before the GEMM (only the routed experts when routing allows).
     """
+    Bs = csf_weight_scales(Bs, b_scale_exceptions, b_scale_exception_offsets, expert_start)
     check_activation_format(activation_format, quantize_output)
     assert act_fn is not None or not quantize_output, "the raw gate|up output (act_fn=None) is not requantized"
     if gather_idx is not None and activation_format == "bf16" and As is None:

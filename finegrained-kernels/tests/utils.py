@@ -23,6 +23,7 @@ from finegrained_kernels.compat import (  # type: ignore
     NVFP4_SCALE_GROUP_K,
     is_sm10x,
 )
+from finegrained_kernels.loading.scales import prepare_nvfp4_csf_scales
 
 
 # ── Device + capability ───────────────────────────────────────────────────────
@@ -476,6 +477,58 @@ def dequantize_weight(
     return out
 
 
+def encode_csf_scales(scales):
+    """Independent CSF fixture encoder; the original dense bytes remain the oracle."""
+    shape = scales.shape
+    values = scales.cpu().contiguous().view(torch.uint8)
+    values = values.reshape(-1, shape[-2], shape[-1])
+    experts, rows, cols = values.shape
+    bases = values.amin(dim=-1, keepdim=True).clamp_max(240)
+    delta = values.to(torch.int16) - bases.to(torch.int16)
+    nibbles = delta.clamp(0, 15).to(torch.uint8)
+    packed = nibbles[:, :, ::2] | (nibbles[:, :, 1::2] << 4)
+    fixed = torch.cat(
+        (
+            bases.reshape(experts, rows // 16, 16),
+            packed.reshape(experts, rows // 16, 16 * cols // 2),
+        ),
+        dim=-1,
+    )
+    streams = []
+    for expert in range(experts):
+        positions = (
+            ((delta[expert] < 0) | (delta[expert] > 15)).flatten().nonzero().flatten()
+        )
+        streams.append(
+            (positions | (values[expert].flatten()[positions].long() << 24)).to(
+                torch.uint32
+            )
+        )
+    return fixed, streams
+
+
+def prepare_csf(scales):
+    """Encode dense NVFP4 scales to the prepared CSF streams ``(fixed, exceptions, expert_offsets)``."""
+    fixed, exceptions = encode_csf_scales(scales)
+    return prepare_nvfp4_csf_scales(
+        fixed.to(scales.device), [stream.to(scales.device) for stream in exceptions]
+    )
+
+
+def prepare_weight_scales(scales, csf_encoding, fn, compiled=False):
+    """Wrap a matrix Problem's existing op; CSF cases hand the op the compressed streams, which
+    it decodes itself (compiled cases capture decode + GEMM together)."""
+    if not csf_encoding:
+        return maybe_compile(fn, compiled)
+    fixed, exceptions, expert_offsets = prepare_csf(scales)
+
+    def run(A, B, As, Bs, **kwargs):
+        return fn(
+            A, B, As, fixed, b_scale_exceptions=exceptions,
+            b_scale_exception_offsets=expert_offsets, **kwargs,
+        )
+
+    return maybe_compile(run, compiled)
 
 
 def interleave_rows(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
