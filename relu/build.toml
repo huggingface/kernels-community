@@ -1,7 +1,7 @@
 [general]
 name = "relu"
 version = 1
-edition = 5
+edition = 6
 license = "Apache-2.0"
 backends = [
     "cpu",
@@ -20,13 +20,27 @@ src = [
     "torch-ext/torch_binding.h",
 ]
 
-[kernel.activation]
-backend = "cuda"
+[kernel.activation_xpu]
+language = "cpp-xpu"
 depends = ["torch"]
-src = ["relu_cuda/relu.cu"]
+src = ["relu_xpu/relu.cpp"]
+
+[kernel.relu_cpu]
+language = "cpp-cpu"
+depends = ["torch"]
+src = ["relu_cpu/relu_cpu.cpp"]
+
+[kernel.activation_metal]
+language = "cpp-metal"
+depends = ["torch"]
+src = [
+    "relu_metal/relu.mm",
+    "relu_metal/relu.metal",
+    "relu_metal/common.h",
+]
 
 [kernel.activation_rocm]
-backend = "rocm"
+language = "cpp-rocm"
 depends = ["torch"]
 rocm-archs = [
     "gfx906",
@@ -41,21 +55,7 @@ rocm-archs = [
 ]
 src = ["relu_cuda/relu.cu"]
 
-[kernel.activation_xpu]
-backend = "xpu"
+[kernel.activation]
+language = "cpp-cuda"
 depends = ["torch"]
-src = ["relu_xpu/relu.cpp"]
-
-[kernel.relu_cpu]
-backend = "cpu"
-depends = ["torch"]
-src = ["relu_cpu/relu_cpu.cpp"]
-
-[kernel.activation_metal]
-backend = "metal"
-depends = ["torch"]
-src = [
-    "relu_metal/relu.mm",
-    "relu_metal/relu.metal",
-    "relu_metal/common.h",
-]
+src = ["relu_cuda/relu.cu"]

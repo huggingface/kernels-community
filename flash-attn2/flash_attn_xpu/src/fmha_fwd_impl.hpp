@@ -33,8 +33,8 @@ template <
     typename ElementO = bfloat16_t,
     typename MMAOperation_ = void,
     typename StrideQ = Stride<int, _1, int, int>,
-    typename StrideK = Stride<int, _1, int, int>,
-    typename StrideV = Stride<_1, int, int, int>,
+    typename StrideK = Stride<int64_t, _1, int, int64_t>,
+    typename StrideV = Stride<_1, int64_t, int, int64_t>,
     typename StrideO = Stride<int, _1, int, int>,
     typename GmemTiledCopyQ = void,
     typename GmemTiledCopyK = void,
@@ -167,9 +167,8 @@ struct FMHAConfig {
     int64_t o_head_stride = head_size;
     int64_t o_batch_stride = sq * nh_q * head_size;
 
-    // LSE strides: (batch, num_heads, max_queries) -- same for varlen.
-    int lse_stride_head = args.max_queries;
-    int lse_stride_batch = args.num_heads_q * lse_stride_head;
+    int lse_stride_head = VarLen ? args.total_seqlen_q : args.max_queries;
+    int lse_stride_batch = VarLen ? 1 : args.num_heads_q * lse_stride_head;
 
     typename FMHAKernel::Arguments arguments{
         {shape,

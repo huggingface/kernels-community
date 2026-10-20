@@ -1,7 +1,7 @@
 [general]
 name = "aiter-kernels"
 version = 2
-edition = 5
+edition = 6
 license = "MIT"
 backends = ["rocm"]
 

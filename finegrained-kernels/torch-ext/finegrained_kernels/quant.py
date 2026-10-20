@@ -19,7 +19,7 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from .bayesian_autotuner import bayesian_autotune
 from .formats import global_scale_stride, is_per_expert_global
-from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, device_context, is_sm10x, pdl_launch_kwargs
+from .compat import FP8_DTYPE, MX_SCALE_GROUP_K, NVFP4_SCALE_GROUP_K, compile_time_only_triton_wrap, device_context, is_blackwell, pdl_launch_kwargs
 from .swizzle import swizzle_store_block
 from .scheduling import build_tile_layout, resolve_tile_inline
 
@@ -61,16 +61,14 @@ def fp8_act_quant_inline(
     return a_fp8, a_scale
 
 
-# cvt.e2m1x2.f32 (hardware FP4 pack) exists only on sm_100 (Blackwell). Resolved once at
-# import as a compile-time constexpr for the jit helper below; the ALU fallback compiles
-# everywhere else. ``is_sm10x`` is driverless-safe, so no import-time guard is needed.
-_E2M1_HW_CVT = tl.constexpr(is_sm10x())
+# Hardware FP4 conversions exist on every Blackwell family, independently of TMEM MMA.
+_E2M1_HW_CVT = tl.constexpr(is_blackwell())
 
 
 @triton.jit
 def _quant_e2m1_packed(v, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
     """Pack signed, pre-scaled values on the E2M1 grid to ``(M, K//2)`` uint8 (first value
-    of each pair in the low nibble). On sm_100 the Blackwell hardware convert
+    of each pair in the low nibble). On Blackwell the hardware convert
     ``cvt.rn.satfinite.e2m1x2.f32`` (two f32 → one packed byte, first operand → HIGH nibble)
     does it in one instruction; elsewhere a ``>=``-threshold bucketize builds the code. The
     two agree except at exact E2M1 midpoints (0.25, 0.75, …), where the hardware rounds to
@@ -187,7 +185,7 @@ def _e2m1_code_to_bf16_bits(code):
 @triton.jit
 def _e2m1_pair_to_f16(packed):
     """One packed E2M1 byte -> the two fp16 values it holds, as a uint32 (low half = low nibble),
-    through the sm_100 CVT unit: ONE instruction per pair against the bit-twiddle form's ~10
+    through the Blackwell CVT unit: ONE instruction per pair against the bit-twiddle form's ~10
     integer ops. Every E2M1 magnitude is exact in fp16, so this is a value-identical decode, and
     the direction of the unpack is irrelevant to the cost — the arithmetic is the whole bill
     (measured on the gpt-oss W4A16 decode weight stream: 39.6us bit-twiddle, either axis, vs
@@ -210,7 +208,7 @@ def e2m1_to_bf16(b_packed):
     interleave along K with a SINGLE 3D axis-swap (``join`` -> ``[R, C, 2]`` -> swap last two ->
     reshape) instead of the three 2D transposes ``e2m1_to_e4m3`` needs — the weight-only unpack hot path
     (fp4 weight upcast in-loop, the caller widening to the activation dtype). K order low-nibble-first, matching
-    ``e2m1_to_e4m3``: ``[byte0_lo, byte0_hi, byte1_lo, ...]``. On sm_100 the codes decode through
+    ``e2m1_to_e4m3``: ``[byte0_lo, byte0_hi, byte1_lo, ...]``. On Blackwell the codes decode through
     the hardware CVT (``_e2m1_pair_to_f16``, fp16 being exact for the grid); elsewhere the integer
     bit-build. Only the taken arm compiles."""
     if _E2M1_HW_CVT:
@@ -288,7 +286,7 @@ def e2m1_cols_to_f32(packed):
 def e2m1_cols_to_e4m3(packed):
     """Column-unpack packed E2M1 (two nibbles per byte along the last dim, low nibble
     first) to E4M3: ``(..., C) uint8 -> (..., 2C)`` — the column-axis counterpart of the
-    row-doubling ``e2m1_to_e4m3``; lossless (every E2M1 value is exact in E4M3). sm_100
+    row-doubling ``e2m1_to_e4m3``; lossless (every E2M1 value is exact in E4M3). Blackwell
     decodes through the CVT unit (``_e2m1_pair_to_e4m3``), elsewhere the integer bit-build;
     either way the bytes are bitcast once. Only the taken arm compiles."""
     if _E2M1_HW_CVT:

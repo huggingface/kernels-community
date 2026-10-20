@@ -26,6 +26,16 @@ from ..quant import fp8_act_quant_inline, mx_act_quant_inline
 
 
 @triton.jit
+def weight_scale_rows(rows, BLOCK_N: tl.constexpr, GATE_UP: tl.constexpr):
+    """The block-scale row of each weight row. ``GATE_UP`` (an interleaved gate|up weight): a
+    checkpoint quantizes gate and up separately, so row ``r`` is row ``r // 2`` of projection
+    ``r % 2``, and the scale grid interleaves their blocks the same way: ``[gate 0, up 0, ...]``."""
+    if GATE_UP:
+        return 2 * ((rows // 2) // BLOCK_N) + rows % 2
+    return rows // BLOCK_N
+
+
+@triton.jit
 def load_block_fp8_act_tile(
     a_ptrs,
     as_ptrs,
@@ -288,7 +298,11 @@ def decode_group_scale(scale):
     branch is a compile-time constant, so only the taken path is emitted (single return —
     Triton requires all ``return`` statements to share a type)."""
     if scale.dtype == tl.uint8:
-        scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        exponent = scale
+        scale = (exponent.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        # UE8M0 reserves byte 255 for NaN; byte 0 is the FP32 subnormal 2^-127.
+        scale = tl.where(exponent == 0, 2.0 ** -127, scale)
+        scale = tl.where(exponent == 255, float("nan"), scale)
     elif scale.dtype == tl.float8e4nv:
         scale = scale.to(tl.float32)
     return scale

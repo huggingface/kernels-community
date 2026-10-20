@@ -27,10 +27,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "torch-ext"))
 # Under test, a config the tuner cannot compile or run is a PRUNER GAP, not something to
 # tolerate: forgiving it leaves the suite green while the arm silently drops out of the search
 # (how a descriptor arm that could not lower, and a swapped gate tile that could not type-check,
-# both stayed invisible until a bench came back with empty cells). 0 aborts the tune on the
+# both stayed invisible until a bench came back with empty cells). Strict mode aborts the tune on the
 # first reject so a test reports it. Deployment keeps the default, where forgiveness is what
 # lets a crowned config survive one unrelated bad neighbour.
-os.environ.setdefault("FINEGRAINED_AUTOTUNE_MAX_FAILURES", "0")
+# An explicit FINEGRAINED_AUTOTUNE_CONFIG takes over (add "strict": true to keep this).
+os.environ.setdefault("FINEGRAINED_AUTOTUNE_CONFIG", '{"strict": true}')
 
 
 def _visible_gpu_pool(env_var: str, list_cmd: list[str]) -> list[str]:

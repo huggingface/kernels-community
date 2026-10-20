@@ -1,7 +1,7 @@
 [general]
 name = "activation"
 version = 1
-edition = 5
+edition = 6
 license = "Apache-2.0"
 backends = [
     "cuda",
@@ -24,26 +24,19 @@ src = [
 cuda = "2.10"
 rocm = "2.10"
 
-[kernel.activation_metal]
-backend = "metal"
+[kernel.activation_cpu]
+language = "cpp-cpu"
 depends = ["torch"]
+include = ["activation_cpu"]
 src = [
-    "activation_metal/activation.mm",
-    "activation_metal/activation.metal",
-]
-
-[kernel.activation_xpu]
-backend = "xpu"
-depends = ["torch"]
-include = ["activation_xpu"]
-src = [
-    "activation_xpu/activation_kernels.cpp",
-    "activation_xpu/activation_xpu_torch.cpp",
-    "activation_xpu/activation_xpu.hpp",
+    "activation_cpu/silu_and_mul_cpu_torch.cpp",
+    "activation_cpu/silu_and_mul_cpu.cpp",
+    "activation_cpu/silu_and_mul_cpu.hpp",
+    "activation_cpu/cpu_features.hpp",
 ]
 
 [kernel.activation]
-backend = "cuda"
+language = "cpp-cuda"
 depends = ["torch"]
 src = [
     "activation/activation_kernels.cu",
@@ -51,8 +44,37 @@ src = [
     "activation/dispatch_utils.h",
 ]
 
+[kernel.activation_metal]
+language = "cpp-metal"
+depends = ["torch"]
+src = [
+    "activation_metal/activation.mm",
+    "activation_metal/activation.metal",
+]
+
+[kernel.activation_cpu_avx512]
+language = "cpp-cpu"
+cxx-flags = [
+    "-O3",
+    "-fopenmp",
+    "-mf16c",
+    "-mavx512f",
+    "-mavx512bf16",
+    "-mavx512vl",
+    "-mavx512dq",
+    "-mavx512bw",
+    "-DCPU_CAPABILITY_AVX512",
+    "-DCPU_CAPABILITY=AVX512",
+]
+depends = ["torch"]
+include = ["activation_cpu"]
+src = [
+    "activation_cpu/silu_and_mul_avx512.cpp",
+    "activation_cpu/silu_and_mul_avx512.hpp",
+]
+
 [kernel.activation_rocm]
-backend = "rocm"
+language = "cpp-rocm"
 depends = ["torch"]
 rocm-archs = [
     "gfx906",
@@ -71,34 +93,12 @@ src = [
     "activation/dispatch_utils.h",
 ]
 
-[kernel.activation_cpu]
-backend = "cpu"
+[kernel.activation_xpu]
+language = "cpp-xpu"
 depends = ["torch"]
-include = ["activation_cpu"]
+include = ["activation_xpu"]
 src = [
-    "activation_cpu/silu_and_mul_cpu_torch.cpp",
-    "activation_cpu/silu_and_mul_cpu.cpp",
-    "activation_cpu/silu_and_mul_cpu.hpp",
-    "activation_cpu/cpu_features.hpp",
-]
-
-[kernel.activation_cpu_avx512]
-backend = "cpu"
-cxx-flags = [
-    "-O3",
-    "-fopenmp",
-    "-mf16c",
-    "-mavx512f",
-    "-mavx512bf16",
-    "-mavx512vl",
-    "-mavx512dq",
-    "-mavx512bw",
-    "-DCPU_CAPABILITY_AVX512",
-    "-DCPU_CAPABILITY=AVX512",
-]
-depends = ["torch"]
-include = ["activation_cpu"]
-src = [
-    "activation_cpu/silu_and_mul_avx512.cpp",
-    "activation_cpu/silu_and_mul_avx512.hpp",
+    "activation_xpu/activation_kernels.cpp",
+    "activation_xpu/activation_xpu_torch.cpp",
+    "activation_xpu/activation_xpu.hpp",
 ]

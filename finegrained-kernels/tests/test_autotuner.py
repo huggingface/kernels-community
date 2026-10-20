@@ -16,6 +16,7 @@ crash-config pruner guards, autotuner resilience and reporting for failing confi
 activation-quant arm equivalence, and cross-process determinism; each docstring
 carries its incident."""
 
+import itertools
 import logging
 import subprocess
 import sys
@@ -306,7 +307,7 @@ def test_compile_failures_are_memoized_across_keys(caplog):
     -stage errors are excluded by design (a sticky-context cascade must never fence
     healthy configs).
 
-    The suite pins ``FINEGRAINED_AUTOTUNE_MAX_FAILURES=0`` so a config the tuner cannot compile
+    The suite pins ``strict`` in FINEGRAINED_AUTOTUNE_CONFIG so a config the tuner cannot compile
     fails loudly instead of being forgiven (conftest). This test IS that machinery and compiles
     a deliberately doomed config, so it passes `max_failures` for its own tune — otherwise the
     first reject aborts before there is anything to memoize."""
@@ -343,3 +344,85 @@ def test_compile_failures_are_memoized_across_keys(caplog):
     assert len(msgs) == 2, msgs
     assert "[memoized]" not in msgs[0] or "[memoized]" in msgs[1]
     assert "[memoized]" in msgs[1], msgs[1]
+
+
+@pytest.mark.kernels_ci
+def test_basin_anchors_cover_interior_and_wide_output_tiles():
+    """Each swap basin gets an interior anchor and a wide output tile, both with
+    middle K, warp, and stage settings rather than lexicographic extremes.
+    """
+    grid = itertools.product(
+        (False, True), (16, 64, 128), (64, 128, 256), (64, 128, 256), (4, 8, 16), (2, 4, 6)
+    )
+    configs = [
+        triton.Config(
+            {"BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk, "SWAP_AB": swap},
+            num_warps=warps, num_stages=stages,
+        )
+        for swap, bm, bn, bk, warps, stages in grid
+    ]
+    @bayesian_autotune(configs, [], path_anchor_axes=("SWAP_AB",))
+    @triton.jit
+    def kernel(
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr, SWAP_AB: tl.constexpr,
+    ):
+        pass
+
+    anchors = [configs[i] for i in kernel._basin_anchor_indices(configs)]
+    assert len(anchors) == 4
+    for c in anchors:
+        assert c.kwargs["BLOCK_SIZE_K"] == 128
+        assert c.num_warps == 8 and c.num_stages == 4
+    assert [(c.kwargs["BLOCK_SIZE_M"], c.kwargs["BLOCK_SIZE_N"]) for c in anchors] == [
+        (64, 128), (128, 256), (64, 128), (128, 256),
+    ]
+
+
+@pytest.mark.kernels_ci
+def test_runoff_winner_uses_remeasured_candidates(monkeypatch):
+    """A fourth tile's stale search sample must not beat the runoff's three fresh samples."""
+    configs = [triton.Config({"BLOCK": block}) for block in (16, 32, 64, 128)]
+
+    @bayesian_autotune(configs, [], n_trials=4, basin_probes=False, max_refine_iters=0)
+    @triton.jit
+    def kernel(BLOCK: tl.constexpr):
+        pass
+
+    # Exercise runoff even when the surrounding correctness run limits tuning to one trial.
+    monkeypatch.setattr(kernel, "n_trials", len(configs))
+    monkeypatch.setattr(kernel, "runoff", True)
+    samples = {16: iter((1.0, 6.0)), 32: iter((2.0, 5.0)),
+               64: iter((3.0, 7.0)), 128: iter((4.0,))}
+    monkeypatch.setattr(kernel, "_bench", lambda *args, config, **kwargs: next(samples[config.kwargs["BLOCK"]]))
+    winner = kernel._bayesian_search(configs, (), {}, ())
+    assert winner.kwargs["BLOCK"] == 32
+
+
+@pytest.mark.kernels_ci
+def test_coupled_axes_cross_refinement_valley(monkeypatch):
+    """K and pipeline stages must change together when either change alone is slower."""
+    configs = [
+        triton.Config({"BLOCK_SIZE_K": bk}, num_stages=stages)
+        for bk in (128, 256) for stages in (2, 3)
+    ]
+    scores = {(128, 2): 10.0, (128, 3): 12.0, (256, 2): 12.0, (256, 3): 1.0}
+    winners = []
+    for coupled_axes in ((), (("BLOCK_SIZE_K", "num_stages"),)):
+        @bayesian_autotune(configs, [], coupled_axes=coupled_axes, cache_results=False)
+        @triton.jit
+        def kernel(BLOCK_SIZE_K: tl.constexpr):
+            pass
+
+        monkeypatch.setattr(kernel, "n_trials", 2)
+        monkeypatch.setattr(kernel, "n_startup_trials", 2)
+        monkeypatch.setattr(kernel, "runoff", False)
+        monkeypatch.setattr(kernel, "basin_probes", True)
+        monkeypatch.setattr(kernel, "max_refine_iters", 1)
+        monkeypatch.setattr(kernel, "_basin_anchor_indices", lambda configs: [0, 1])
+        monkeypatch.setattr(
+            kernel, "_bench", lambda *args, config, **kwargs: scores[(config.kwargs["BLOCK_SIZE_K"], config.num_stages)]
+        )
+        winner = kernel._bayesian_search(configs, (), {}, ())
+        winners.append((winner.kwargs["BLOCK_SIZE_K"], winner.num_stages))
+    assert winners == [(128, 2), (256, 3)]

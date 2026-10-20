@@ -1,7 +1,7 @@
 [general]
 name = "metal-flash-sdpa"
 version = 2
-edition = 5
+edition = 6
 license = "Apache-2.0"
 backends = ["metal"]
 
@@ -15,7 +15,7 @@ src = [
 ]
 
 [kernel.sdpa_metal]
-backend = "metal"
+language = "cpp-metal"
 depends = ["torch"]
 include = ["sdpa-metal"]
 src = [

@@ -279,5 +279,6 @@ void cutlass_fmha_bwd_varlen_impl(
     };
 
     const BwdCutlassType cuType = aten_to_Bwd_Cutlass_dtype(q);
+    args.total_q = q.size(0);
     dispatch_bwd_by_head(queue, cuType, args, args.head_size, is_causal, is_local, true);
 }

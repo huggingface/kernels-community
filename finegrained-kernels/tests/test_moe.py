@@ -32,6 +32,8 @@ from utils import (  # type: ignore
     SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
+    dequant_gate_up,
+    make_gate_up,
     prepare_csf,
 )
 
@@ -225,11 +227,11 @@ def _make_moe_weights(problem: MoEProblem):
     deployment contract, not per call): the gate_up scale is the ONE gate-interleaved artifact
     (6D — the shape carries the layout) and every forward consumes it directly — fused kernels
     read block pairs, the unfused plain GEMM remaps its block index in-kernel."""
-    make = WEIGHTS[problem.weights]["make"]
-    gate_up, gate_up_s, gate_up_g = make(
-        2 * problem.intermediate_dim, problem.hidden_dim, problem.num_experts
+    row = WEIGHTS[problem.weights]
+    gate_up, gate_up_s, gate_up_g = make_gate_up(
+        row, problem.intermediate_dim, problem.hidden_dim, problem.num_experts
     )
-    down, down_s, down_g = make(
+    down, down_s, down_g = row["make"](
         problem.hidden_dim, problem.intermediate_dim, problem.num_experts
     )
     if problem.swizzled:
@@ -297,7 +299,7 @@ def _static_scales(problem: MoEProblem, hidden, gate_up, gate_up_s, top_k_index)
     routed to it. ``None`` on a dynamic problem, which quantizes at runtime instead."""
     if not problem.static:
         return None, None
-    weight = WEIGHTS[problem.weights]["dequant"](gate_up, gate_up_s).float()
+    weight = dequant_gate_up(WEIGHTS[problem.weights], gate_up, gate_up_s).float()
     inter = fused_glu(
         torch.einsum("th,enh->etn", hidden.float(), weight),
         problem.act_fn,

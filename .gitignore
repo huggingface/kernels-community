@@ -22,4 +22,3 @@ __pycache__/
 
 *.png
 *.csv
-finegrained-kernels/bench/bench_moe_csf.json

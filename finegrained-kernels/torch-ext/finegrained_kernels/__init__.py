@@ -17,6 +17,7 @@ from .matmul import matmul_2d
 from .batched import matmul_batched
 from .grouped import matmul_grouped
 from .moe import moe_fused_batched, moe_fused_grouped
+from .embedding import embedding_lookup
 from . import backward
 from .formats import get_supported_act_fns
 from .norm import get_supported_norms, rms_norm_rows
@@ -33,6 +34,8 @@ __all__ = [
     # the fused MoE forwards over them
     "moe_fused_batched",
     "moe_fused_grouped",
+    # selected-row embedding lookup
+    "embedding_lookup",
     # importing it registers the dgrad formulas on the ops, so a forward call differentiates
     "backward",
     "get_supported_act_fns",

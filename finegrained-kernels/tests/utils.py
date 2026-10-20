@@ -529,3 +529,40 @@ def prepare_weight_scales(scales, csf_encoding, fn, compiled=False):
         )
 
     return maybe_compile(run, compiled)
+
+
+def interleave_rows(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """``[g0, u0, g1, u1, ...]`` along the row dim (-2), the fused gate|up weight layout."""
+    byte = gate.element_size() == 1 and gate.dtype.is_floating_point  # fp8/e8m0 can't stack
+    g, u = (gate.view(torch.uint8), up.view(torch.uint8)) if byte else (gate, up)
+    out = torch.stack((g, u), dim=-2).flatten(-3, -2)
+    return out.view(gate.dtype) if byte else out
+
+
+def _row_scaled(Bs, Bs_global) -> bool:
+    """Whether a weight's scales live on its rows (per-row groups or row blocks) with no stack-wide
+    second level — so gate and up can each keep their own, interleaved with the rows."""
+    return Bs is None or (Bs_global is None and Bs.ndim == 3 and Bs.shape[-2] > 1)
+
+
+def make_gate_up(row: dict, N: int, K: int, E):
+    """A ``(E, 2N, K)`` gate|up weight as checkpoints ship it: gate and up quantized as separate
+    projections, then their rows and scale rows interleaved — so a 128x128 scale block covers rows
+    of ONE projection. Never quantize the interleaved stack instead: a reference dequantizing that
+    shares the kernel's ``row // block_n`` assumption and cannot catch a wrong scale lookup. Only a
+    stack-wide scale (tensor-wide FP8, the NVFP4 global) is quantized over the stack, since the
+    kernels take one per expert and a loader folds the two projections' into it."""
+    gate, gate_s, gate_g = row["make"](N, K, E)
+    if not _row_scaled(gate_s, gate_g):
+        return row["make"](2 * N, K, E)
+    up, up_s, _ = row["make"](N, K, E)
+    return interleave_rows(gate, up), None if gate_s is None else interleave_rows(gate_s, up_s), None
+
+
+def dequant_gate_up(row: dict, B, Bs, Bs_global=None) -> torch.Tensor:
+    """fp32 of a ``make_gate_up`` weight, each projection dequantized against its own scales."""
+    if not _row_scaled(Bs, Bs_global):
+        return row["dequant"](B, Bs, Bs_global)
+    return interleave_rows(*(
+        row["dequant"](B[..., p::2, :], None if Bs is None else Bs[..., p::2, :]) for p in (0, 1)
+    ))

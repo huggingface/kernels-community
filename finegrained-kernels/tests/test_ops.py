@@ -34,6 +34,8 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from utils import (  # type: ignore
     DTYPE_TO_TOL,
@@ -42,16 +44,23 @@ from utils import (  # type: ignore
     SUPPORTS_SWIZZLED_SCALES,
     TEST_DEVICE,
     WEIGHTS,
+    dequant_gate_up,
+    dq_block_fp8,
     dq_grouped,
     dq_scale,
+    make_gate_up,
     make_static_activation_scale,
+    maybe_compile,
     quant_dequant_a,
     prepare_weight_scales,
 )
 
 import finegrained_kernels  # type: ignore
+from finegrained_kernels.embedding import embedding_lookup
 from finegrained_kernels import swizzle_mx_scales, unswizzle_mx_scales  # type: ignore
 from finegrained_kernels.compat import NVFP4_SCALE_GROUP_K  # type: ignore
+from finegrained_kernels.formats import is_mxfp4, is_mxfp8, mx_scale_family, ue8m0_as_uint8
+from finegrained_kernels.loading.scales import decode_group_scale
 from finegrained_kernels.quant import nvfp4_act_quant  # type: ignore
 from finegrained_kernels.epilogue import apply_glu  # type: ignore
 
@@ -436,7 +445,8 @@ def _fp32_intermediate(problem: Problem, op, A, expert_ids, B, Bs, Bs_global, As
     the fp32 accumulator directly)."""
     row = WEIGHTS[problem.weights]
     A_dq = _act_dequant(problem, op, A, As, As_global, expert_ids)
-    W = row["dequant"](B, Bs, Bs_global)  # (E, rows, K) fp32
+    # (E, rows, K) fp32
+    W = dequant_gate_up(row, B, Bs, Bs_global) if problem.gate else row["dequant"](B, Bs, Bs_global)
     bias = _bias(problem, op)
     if op == "matmul":
         ref = A_dq @ W[0].T  # single linear, no routing
@@ -632,8 +642,11 @@ def _check(problem: Problem, dq_out, ref_cmp, expert_ids, op):
 
 
 def _make_weights(problem: Problem, row, E):
-    """The scenario's weights: ``(B, Bs, Bs_global)`` at the stack's row count (doubled under gate)."""
-    weight, scales, global_scale = row["make"](2 * problem.N if problem.gate else problem.N, problem.K, E)
+    """The scenario's weights: ``(B, Bs, Bs_global)``; under gate the interleaved gate|up stack."""
+    if problem.gate:
+        weight, scales, global_scale = make_gate_up(row, problem.N, problem.K, E)
+    else:
+        weight, scales, global_scale = row["make"](problem.N, problem.K, E)
     if problem.csf_encoding:
         # E4M3 codes 24 apart (more than the 15 a CSF offset holds): an exception in every expert
         scales[..., 0, :2] = scales.new_tensor([0.125, 1.0])
@@ -730,6 +743,8 @@ _SWEEP_CELLS = [
     (Problem(weights="mxfp4", S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "grouped", "mx_dynamic_matmul_grouped_kernel"),
     (Problem(weights="mxfp8", gate=True, activation_format="mxfp8", quantize_output=True, swizzled=True), "matmul", "mx_dynamic_matmul_kernel"),
+    # non-128 N on the 2D gate|up tile (gpt-oss-style N=320): the BN=128 tile overhangs N
+    (Problem(weights="mxfp4", gate=True, activation_format="mxfp4", quantize_output=True, N=320, K=320), "matmul", "mx_dynamic_matmul_kernel"),
     (Problem(weights="nvfp4", gate=True, activation_format="nvfp4", quantize_output=True, swizzled=True, S=8), "batched", "mx_dynamic_matmul_batched_kernel"),
     # the calibrated (static) arm on per-tensor weights: it hands the kernel a RAW A to quantize
     # per tile, the one activation form that cannot ride the TMA gather, so its admitted set is
@@ -807,3 +822,238 @@ def test_every_admitted_config_is_correct(problem: Problem, op, kernel_name):
         print(f"\n[sweep] {len(forgiven)} admitted config(s) failed to compile/run (forgiven):")
         for cfg, err in forgiven:
             print(f"  {cfg}: {err}")
+
+
+@triton.jit
+def _decode_ue8m0_scales(Scales, Out):
+    offsets = tl.arange(0, 8)
+    tl.store(Out + offsets, decode_group_scale(tl.load(Scales + offsets)))
+
+
+@pytest.mark.kernels_ci
+def test_ue8m0_scale_bytes():
+    values = [0, 1, 2, 126, 127, 128, 254, 255]
+    scales = torch.tensor(values, dtype=torch.uint8, device=TEST_DEVICE)
+    actual = torch.empty(8, dtype=torch.float32, device=TEST_DEVICE)
+    _decode_ue8m0_scales[(1,)](scales, actual)
+    expected = torch.tensor(
+        [2.0 ** (byte - 127) for byte in values[:-1]] + [float("nan")],
+        dtype=torch.float32, device=TEST_DEVICE,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+
+
+@pytest.mark.kernels_ci
+def test_uint8_mx_scales_without_native_ue8m0(monkeypatch):
+    """MX format checks accept raw exponent bytes without a native UE8M0 dtype."""
+    scale = torch.full((16, 4), 127, dtype=torch.uint8)
+    if (native_dtype := finegrained_kernels.compat.UE8M0_DTYPE) is not None:
+        native_scale = scale.view(native_dtype)
+        assert torch.equal(ue8m0_as_uint8(native_scale), scale)
+        assert mx_scale_family(native_scale, 128) == 32
+
+    # What torch < 2.7 resolves at import time.
+    monkeypatch.setattr(finegrained_kernels.formats, "UE8M0_DTYPE", None)
+    monkeypatch.setattr(finegrained_kernels.formats, "UE8M0_SCALE_DTYPES", (torch.uint8,))
+    assert ue8m0_as_uint8(scale) is scale
+    assert is_mxfp8(
+        torch.empty((16, 128), dtype=torch.float8_e4m3fn), scale
+    )
+    assert is_mxfp4(torch.empty((16, 64), dtype=torch.int8), scale)
+    assert mx_scale_family(scale, 128) == 32
+    fp32 = torch.ones((16, 4), dtype=torch.float32)
+    assert ue8m0_as_uint8(fp32) is fp32
+
+
+# Embedding lookup has no GEMM operands or epilogue: check the selected-row operation directly.
+
+
+_EMBEDDING_CASES = [
+    pytest.param("fp8", "tensor", dtype, id=f"fp8_tensor_{dtype}")
+    for dtype in (torch.float32, torch.bfloat16, torch.float16)
+] + [
+    pytest.param("fp8", "row", torch.bfloat16, id="fp8_row"),
+    pytest.param("fp8", "block", torch.float32, id="fp8_block"),
+    pytest.param("nvfp4", "group", torch.bfloat16, id="nvfp4"),
+    pytest.param("mxfp8", "group", torch.bfloat16, id="mxfp8"),
+    pytest.param("mxfp4", "group", torch.float16, id="mxfp4"),
+    pytest.param("int8", "row", torch.float32, id="int8"),
+    pytest.param("int4", "group", torch.bfloat16, id="int4"),
+]
+
+
+def _embedding_table(weight_format, layout, dtype, sliced=False):
+    rows, width = 38, 256 if sliced else 160
+    if weight_format in ("nvfp4", "mxfp4", "int4"):
+        shape = (rows // 2, width) if weight_format == "int4" else (rows, width // 2)
+        weight = torch.randint(0, 256, shape, device=TEST_DEVICE, dtype=torch.uint8)
+        # Every nibble, including signed INT4's -8/-1 and E2M1's signed zero.
+        weight[0] = (
+            torch.arange(16, device=TEST_DEVICE, dtype=torch.uint8)
+            .mul(17)
+            .repeat(shape[1] // 16)
+        )
+    elif weight_format == "int8":
+        weight = torch.randint(
+            -128, 128, (rows, width), device=TEST_DEVICE, dtype=torch.int8
+        )
+    else:
+        weight = (torch.randn(rows, width, device=TEST_DEVICE) * 3).to(
+            torch.float8_e4m3fn
+        )
+    group = 16 if weight_format == "nvfp4" else 32
+    scale_shape = {
+        "tensor": (1,),
+        "row": (rows,),
+        "block": ((rows + 31) // 32, (width + 31) // 32),
+        "group": (rows, width // group),
+    }[layout]
+    if weight_format in ("mxfp8", "mxfp4"):
+        scale = torch.randint(
+            124, 131, scale_shape, device=TEST_DEVICE, dtype=torch.uint8
+        )
+    else:
+        scale_dtype = torch.float8_e4m3fn if weight_format == "nvfp4" else dtype
+        scale = (torch.rand(scale_shape, device=TEST_DEVICE) * 3 + 0.125).to(
+            scale_dtype
+        )
+    global_scale = (
+        torch.tensor([0.0371], device=TEST_DEVICE) if weight_format == "nvfp4" else None
+    )
+    if sliced:
+        if layout == "row":
+            scale = scale[:, None]
+        # Retain shape while exercising non-unit column strides and offset storage.
+        views = []
+        for tensor in (weight, scale):
+            backing = torch.empty(
+                (*tensor.shape[:-1], tensor.shape[-1] * 2 + 1),
+                device=tensor.device,
+                dtype=tensor.dtype,
+            )
+            view = backing[..., 1::2]
+            view.copy_(tensor)
+            views.append(view)
+        weight, scale = views
+        if weight_format == "nvfp4":
+            weight = weight.view(torch.int8)
+            # Zero column stride exercises scalar scale loads in packed decoding.
+            scale = scale[:, :1].expand_as(scale)
+        if weight_format in ("mxfp8", "mxfp4"):
+            scale = scale.view(torch.float8_e8m0fnu)
+    return weight, scale, global_scale
+
+
+def _embedding_reference(
+    weight, ids, scale, global_scale, dtype, weight_format, layout
+):
+    if weight_format == "int4":
+        u = weight.to(torch.uint8).long()
+        values = torch.stack((u & 15, u >> 4), dim=1).reshape(weight.shape[0] * 2, -1)
+        values = torch.where(values >= 8, values - 16, values).float()
+        values = values * scale.repeat_interleave(32, -1)
+    elif layout == "group":
+        values = dq_grouped(weight, scale, 16 if weight_format == "nvfp4" else 32)
+    elif layout == "block":
+        values = dq_block_fp8(weight, scale, 32, 32)
+    else:
+        values = weight.float() * (scale.reshape(-1, 1) if layout == "row" else scale)
+    if global_scale is not None:
+        values = values * global_scale
+    return torch.nn.functional.embedding(ids, values.to(dtype))
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("weight_format,layout,dtype", _EMBEDDING_CASES)
+@pytest.mark.parametrize("sliced", [False, True])
+def test_embedding_lookup_matches_selected_rows(weight_format, layout, dtype, sliced):
+    weight, scale, global_scale = _embedding_table(weight_format, layout, dtype, sliced)
+    ids = torch.tensor([[3, 0, 3], [37, 4, 1]], device=weight.device).t()
+    for indices in (ids, ids.to(torch.int32), ids.new_empty((2, 0)), ids.new_tensor(3)):
+        actual = embedding_lookup(
+            weight,
+            indices,
+            scale,
+            global_scale,
+            dtype,
+            weight_format=weight_format,
+            block_size=32,
+        )
+        torch.testing.assert_close(
+            actual,
+            _embedding_reference(
+                weight, indices, scale, global_scale, dtype, weight_format, layout
+            ),
+            rtol=0,
+            atol=0,
+        )
+        assert actual.dtype == dtype
+    # Keep the original positional FP8/NVFP4 entry points covered.
+    if layout == "tensor" or weight_format == "nvfp4":
+        default = embedding_lookup(weight, ids, scale, global_scale)
+        default_dtype = torch.bfloat16 if weight_format == "nvfp4" else scale.dtype
+        assert default.dtype == default_dtype
+        torch.testing.assert_close(
+            default,
+            _embedding_reference(
+                weight, ids, scale, global_scale, default_dtype, weight_format, layout
+            ),
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("weight_format,layout,dtype", _EMBEDDING_CASES)
+def test_embedding_lookup_fullgraph_compile(weight_format, layout, dtype):
+    weight, scale, global_scale = _embedding_table(
+        weight_format, layout, dtype, sliced=True
+    )
+    ids = torch.tensor([[3, 0, 3], [37, 4, 1]], device=weight.device).t()
+    lookup = maybe_compile(embedding_lookup, True)
+    actual = lookup(
+        weight,
+        ids,
+        scale,
+        global_scale,
+        dtype,
+        weight_format=weight_format,
+        block_size=32,
+    )
+    torch.testing.assert_close(
+        actual,
+        _embedding_reference(
+            weight, ids, scale, global_scale, dtype, weight_format, layout
+        ),
+        rtol=0,
+        atol=0,
+    )
+
+
+def _embedding_invalid_index(_rank, index, packed):
+    weight = torch.ones(37, 16 if packed else 32, device=TEST_DEVICE).to(
+        torch.uint8 if packed else torch.float8_e4m3fn
+    )
+    scale = (
+        torch.ones(37, 2, device=TEST_DEVICE).to(torch.float8_e4m3fn)
+        if packed
+        else torch.ones(1, device=TEST_DEVICE)
+    )
+    global_scale = torch.ones(1, device=TEST_DEVICE) if packed else None
+    embedding_lookup(
+        weight, torch.tensor([index], device=TEST_DEVICE), scale, global_scale
+    )
+    getattr(torch, torch.device(TEST_DEVICE).type).synchronize()
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("index", [-1, 37])
+def test_embedding_invalid_index_fails_in_separate_process(index, packed):
+    # Isolate the poisoned device context, as for native embedding's bounds assertions.
+    with pytest.raises(
+        torch.multiprocessing.ProcessRaisedException,
+        match="(?i)device-side assert|assertion failure",
+    ):
+        torch.multiprocessing.spawn(
+            _embedding_invalid_index, args=(index, packed), nprocs=1
+        )
