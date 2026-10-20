@@ -159,6 +159,9 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     # requant output formats live on the MX kernel). Every arm folds out at compile time when
     # GATE=False (the plain dense GEMM, unchanged).
     GATE: tl.constexpr = False,
+    # B is an interleaved gate|up weight run ungated: its block scales still follow each
+    # projection's own grid, as under GATE
+    INTERLEAVED_GATE_UP: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
@@ -225,7 +228,7 @@ def w8a8_block_dynamic_fp8_matmul_kernel(
     b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE, SWAP_AB)
     # the scale-index gather decouples the tile from the scale grid: a wide tile spans several
     # scale columns, a narrow one shares a column
-    bs_ptrs = Bs + weight_scale_rows(offs_bn_lin, block_n, GATE) * stride_bs_n
+    bs_ptrs = Bs + weight_scale_rows(offs_bn_lin, block_n, GATE or INTERLEAVED_GATE_UP) * stride_bs_n
     accumulator = acc_init("dot", BLOCK_SIZE_M, n_width, SWAP_AB)
 
     for k in tl.range(0, tl.cdiv(K, block_k), warp_specialize=WARP_SPEC):
@@ -469,6 +472,9 @@ def w8a8_block_static_fp8_matmul_kernel(
     # Dense gate|up fusion: B is the (2N, K) gate|up stack, C the [M, N] GLU output. Every arm
     # folds out at compile time when GATE=False (the plain dense GEMM, unchanged).
     GATE: tl.constexpr = False,
+    # B is an interleaved gate|up weight run ungated: its block scales still follow each
+    # projection's own grid, as under GATE
+    INTERLEAVED_GATE_UP: tl.constexpr = False,
     ACT_FN: tl.constexpr = "silu",
     SWIGLU_ALPHA: tl.constexpr = None,
     SWIGLU_LIMIT: tl.constexpr = None,
@@ -499,7 +505,7 @@ def w8a8_block_static_fp8_matmul_kernel(
     # non-affine scale read the wrap induces, matching the block-dynamic kernel above.
     b_ptrs = matmul_weight_ptrs(B, offs_bn, offs_k, stride_b_n, stride_b_k, B_MEMORY_MODE)
     offs_bn_lin = pid_n * n_width + tl.arange(0, n_width)
-    bs_ptrs = Bs + weight_scale_rows(offs_bn_lin, block_n, GATE) * stride_bs_n
+    bs_ptrs = Bs + weight_scale_rows(offs_bn_lin, block_n, GATE or INTERLEAVED_GATE_UP) * stride_bs_n
     bs_mask = offs_bn_lin < n_rows
     a_s_static = tl.load(As)
 
@@ -1031,6 +1037,7 @@ def w8a8_block_dynamic_fp8_matmul(
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     bias: torch.Tensor | None = None,
+    interleaved_gate_up: bool = False,
 ) -> List[torch.Tensor]:
     """Block-scale FP8 matmul: ``C = A @ B.T``; activations quantized offline in one pass.
 
@@ -1041,6 +1048,10 @@ def w8a8_block_dynamic_fp8_matmul(
     ``gate`` fuses the gate|up projection into one stacked GEMM + SwiGLU, returning the
     ``[..., N]`` GLU intermediate (``output_dtype``); the fused-requant output formats stay on
     the MX path. Returns a one-element list (mirrors the MX/grouped/batched op signature).
+
+    ``interleaved_gate_up`` marks an ungated call over the interleaved gate|up weight (a host GLU,
+    or the unstacked ``gate`` band): gate and up are quantized separately, so each row's scale
+    comes from its own projection's blocks rather than ``row // block_n``.
     """
     assert len(block_size) == 2, (
         f"block_size must be [block_n, block_k], got {block_size}"
@@ -1113,6 +1124,7 @@ def w8a8_block_dynamic_fp8_matmul(
             block_n=block_n,
             block_k=block_k,
             GATE=gate,
+            INTERLEAVED_GATE_UP=interleaved_gate_up,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
@@ -1141,6 +1153,7 @@ def w8a8_block_static_fp8_matmul(
     swiglu_limit: float | None = None,
     simulate_unfused: bool = False,
     bias: torch.Tensor | None = None,
+    interleaved_gate_up: bool = False,
 ) -> List[torch.Tensor]:
     """Block-scale FP8 matmul with static (per-tensor) activation quantization.
 
@@ -1151,6 +1164,10 @@ def w8a8_block_static_fp8_matmul(
 
     ``gate`` fuses the gate|up projection into one stacked GEMM + SwiGLU, returning the
     ``[..., N]`` GLU intermediate. Returns a one-element list (mirrors the MX/grouped op).
+
+    ``interleaved_gate_up`` marks an ungated call over the interleaved gate|up weight (a host GLU,
+    or the unstacked ``gate`` band): gate and up are quantized separately, so each row's scale
+    comes from its own projection's blocks rather than ``row // block_n``.
     """
     assert len(block_size) == 2, (
         f"block_size must be [block_n, block_k], got {block_size}"
@@ -1233,6 +1250,7 @@ def w8a8_block_static_fp8_matmul(
             block_n=block_n,
             block_k=block_k,
             GATE=gate,
+            INTERLEAVED_GATE_UP=interleaved_gate_up,
             ACT_FN=act_fn,
             SWIGLU_ALPHA=swiglu_alpha,
             SWIGLU_LIMIT=swiglu_limit,
@@ -1904,7 +1922,7 @@ def matmul_2d(
     bias: torch.Tensor | None = None,  # (E, N_out) per-expert output bias; (N_out,) for 2D
     activation_format: str | None = None,
     gate: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     quantize_output: bool = False,
@@ -1932,9 +1950,9 @@ def matmul_2d(
     ``activation_format`` is the activations' quantization: ``None`` (default) = the weights' own
     format, ``"bf16"`` = weight-only (no activation quant), or an explicit ``"fp8"`` / ``"mxfp8"`` /
     ``"mxfp4"`` / ``"nvfp4"`` (``"mxfp8"`` on MXFP4 weights = the W4A8 chain; ``check_activation_format``
-    has the per-family matrix). ``gate=True`` reads ``B`` as the ``(2N, K)`` gate|up stack and fuses
-    the ``act_fn`` GLU (``swiglu_alpha``/``swiglu_limit`` its clamped variant), returning the
-    ``[..., N]`` intermediate; ``quantize_output=True`` (MX weights only) stores that intermediate in
+    has the per-family matrix). ``gate=True`` reads ``B`` as the interleaved ``(2N, K)`` gate|up weight and
+    fuses the ``act_fn`` GLU (``swiglu_alpha``/``swiglu_limit`` its clamped variant), returning the
+    ``[..., N]`` intermediate (``act_fn=None``: the raw ``[..., 2N]`` gate|up output instead); ``quantize_output=True`` (MX weights only) stores that intermediate in
     ``activation_format`` and returns ``(C, Cs)`` for the next op.
 
     Routes by weight dtype + inferred block: ``Bs`` None → full-precision; MX/NVFP4 (int8/E4M3 weights
@@ -1942,6 +1960,11 @@ def matmul_2d(
     ``Bs``) → ``w8a8_tensor_dynamic_fp8_matmul``; block FP8 → the static variant when ``As`` is a
     per-tensor scalar, else dynamic.
     """
+    # gate with no act_fn: the gate|up GEMM without its GLU, returning the raw interleaved output
+    # (the caller applies the activation); the plain GEMM still reads per-projection block scales
+    raw_gate_up = gate and act_fn is None
+    if act_fn is None:
+        gate, act_fn = False, "silu"
     check_activation_format(activation_format, quantize_output)
     assert (a_global_scale is None and b_global_scale is None) or (
         Bs is not None and weight_format(B, Bs) == "nvfp4"
@@ -2012,10 +2035,10 @@ def matmul_2d(
         return _unwrap(
             w8a8_block_static_fp8_matmul(
                 A, B, As, Bs, block_size, output_dtype,
-                gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, bias=bias)
+                gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, bias=bias, interleaved_gate_up=raw_gate_up)
         )
     return _unwrap(
         w8a8_block_dynamic_fp8_matmul(
             A, B, Bs, block_size, output_dtype,
-            gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, bias=bias)
+            gate, act_fn, swiglu_alpha, swiglu_limit, simulate_unfused, bias=bias, interleaved_gate_up=raw_gate_up)
     )

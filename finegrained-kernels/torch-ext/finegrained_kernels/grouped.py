@@ -2242,8 +2242,7 @@ def matmul_grouped(
     bias: torch.Tensor | None = None,  # (E, N_out) per-expert output bias; (N_out,) for 2D
     activation_format: str | None = None,
     gate: bool = False,
-    interleaved_gate_up: bool = False,
-    act_fn: str = "silu",
+    act_fn: str | None = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
     quantize_output: bool = False,
@@ -2268,9 +2267,8 @@ def matmul_grouped(
     packed E2M1 activations). ``Bs`` ``None`` = unquantized BF16/FP16 weights.
     ``quantize_output`` requantizes the output into ``activation_format`` — the return is then
     ``(C, Cs)``. ``gate``/``act_fn``/``swiglu_alpha``/``swiglu_limit`` fuse the gate|up GLU into the
-    epilogue; ``interleaved_gate_up`` runs that
-    interleaved gate|up weight ungated (a host-side GLU): block-FP8 scales still follow each
-    projection's own block grid; per-row and tensor-wide scales need nothing.
+    epilogue; ``act_fn=None`` with ``gate`` skips it, returning the raw interleaved gate|up
+    output for a host-side activation.
     ``As``/``Bs`` are each a bare block-scale tensor; the two-level NVFP4 second-level scales ride
     the separate ``a_global_scale``/``b_global_scale`` (fp32 per-tensor, weights per-expert ``(E,)``;
     from ``nvfp4_quantize_two_level``), and the op folds ``g_a · g_b`` onto the accumulator. The
@@ -2296,6 +2294,11 @@ def matmul_grouped(
       ``w8a8_tensor_dynamic_fp8_matmul_grouped``.
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_grouped``.
     """
+    # gate with no act_fn: the gate|up GEMM without its GLU, returning the raw interleaved output
+    # (the caller applies the activation); the plain GEMM still reads per-projection block scales
+    raw_gate_up = gate and act_fn is None
+    if act_fn is None:
+        gate, act_fn = False, "silu"
     check_activation_format(activation_format, quantize_output)
     if gather_idx is not None and activation_format == "bf16" and As is None:
         # weight-only: raw bf16 rows are what the kernel consumes, so the trade is decided
@@ -2338,7 +2341,7 @@ def matmul_grouped(
             gather_idx,
             scatter_idx,
             bias=bias,
-            interleaved_gate_up=interleaved_gate_up,
+            interleaved_gate_up=raw_gate_up,
         )
         return out[0] if len(out) == 1 else tuple(out)
 
@@ -2445,7 +2448,7 @@ def matmul_grouped(
             gather_idx,
             scatter_idx,
             bias=bias,
-            interleaved_gate_up=interleaved_gate_up,
+            interleaved_gate_up=raw_gate_up,
         )
     # The ops return a list (torch custom ops can't return a Tensor-or-tuple union): [C] plain,
     # [C, Cs] under ``quantize_output``. Unwrap to the documented Tensor / (Tensor, Tensor) return.
