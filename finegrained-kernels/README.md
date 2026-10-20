@@ -65,9 +65,11 @@ matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None,
   W8A16), or an explicit `"fp8"` / `"mxfp8"` / `"mxfp4"` / `"nvfp4"` (`"mxfp8"` on MXFP4 weights =
   the W4A8 chain). The weight format is never named — it is read off `B`/`Bs`.
 - `gate=True, act_fn="silu", swiglu_alpha=..., swiglu_limit=...` fuses the gate|up GLU: `B` holds
-  the stacked `(2N, K)` gate|up rows and the op returns the activated `(M, N)` intermediate;
-  `quantize_output=True` stores it in `activation_format` for the next op (a `(C, Cs)` tuple is
-  returned instead of a dense tensor).
+  the interleaved `(2N, K)` gate|up rows (see the layout contract below) and the op returns the
+  activated `(M, N)` intermediate; `quantize_output=True` stores it in `activation_format` for the
+  next op (a `(C, Cs)` tuple is returned instead of a dense tensor). `act_fn=None` skips the
+  activation and returns the raw `(M, 2N)` interleaved gate|up output, for an activation applied
+  by the caller.
 - `a_global_scale` / `b_global_scale` / `output_global_scale` are the NVFP4 second level, fp32
   globals folded onto the accumulator: one value for the tensor, or `(E,)` per expert. A
   per-expert `a_global_scale` needs rows that belong to one expert each: `matmul_batched` reads
@@ -89,6 +91,25 @@ matmul_grouped(A, B, As, Bs, *, expert_start, gather_idx=None, scatter_idx=None,
 | MXFP8 | `float8_e4m3fn` | UE8M0 `(N, K/32)` (raw `uint8` accepted) | — |
 | MXFP4 | packed E2M1 (`int8`, 2/byte) | UE8M0 `(N, K/32)` | — |
 | NVFP4 | packed E2M1 (`int8`, 2/byte) | E4M3 `(N, K/16)` | fp32 global(s) |
+
+### Gate|up layout contract
+
+A fused gate|up weight must already be in the layout the kernels read; preparing it is the
+loader's job (transformers does it with its conversion ops):
+
+- Rows are **interleaved**, `[gate_0, up_0, gate_1, up_1, ...]`. A stacked `[gate; up]` weight is
+  not supported and returns wrong results without an error.
+- With 128×128 block FP8, **no scale block may mix gate and up rows**: each projection keeps its
+  own scale grid, and the scale rows are interleaved like the weight rows (`[gate block 0, up
+  block 0, gate block 1, ...]`). Separate `gate_proj` / `up_proj` checkpoint tensors satisfy this,
+  and so does a stacked `[gate; up]` matrix quantized as one when `N` is a multiple of 128 (block
+  quantization is local, so the values match). A checkpoint quantized *after* interleaving, or a
+  stacked one with `N` not a multiple of 128, has blocks that mix both. Moving rows cannot fix that
+  (a 128-row block of one projection would need two scales), so the loader has to requantize those
+  blocks; with power-of-two (UE8M0) scales that rescale is exact unless a value leaves the E4M3
+  range.
+- Per-row scales (MXFP8, MXFP4, NVFP4) and tensor-wide scales have no such ordering question.
+  The NVFP4 per-expert globals of gate and up are merged into one per expert, as described above.
 
 Routed ops carry the expert dim in front (`(E, ...)` weights and scales). MX scales may instead be
 passed **pre-swizzled** — the 5D output of `swizzle_mx_scales` — which is the deployment contract:
