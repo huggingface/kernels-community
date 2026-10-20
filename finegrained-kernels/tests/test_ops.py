@@ -635,7 +635,7 @@ def _make_weights(problem: Problem, row, E):
     """The scenario's weights: ``(B, Bs, Bs_global)`` at the stack's row count (doubled under gate)."""
     weight, scales, global_scale = row["make"](2 * problem.N if problem.gate else problem.N, problem.K, E)
     if problem.csf_encoding:
-        # Their E4M3 byte codes differ by more than 15, requiring an exception in each expert.
+        # E4M3 codes 24 apart (more than the 15 a CSF offset holds): an exception in every expert
         scales[..., 0, :2] = scales.new_tensor([0.125, 1.0])
     return weight, scales, global_scale
 

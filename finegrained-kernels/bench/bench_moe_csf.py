@@ -45,7 +45,13 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "torch-ext"))
 sys.path.insert(0, os.path.join(_ROOT, "tests"))
 
+import matplotlib  # noqa: E402
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
+from triton.testing import do_bench, do_bench_cudagraph  # noqa: E402
 
 import finegrained_kernels  # noqa: E402
 from finegrained_kernels.quant import nvfp4_quantize_two_level  # noqa: E402
@@ -59,9 +65,7 @@ BLUE, ORANGE, GRAY = "#377eb8", "#ff9d36", "#969696"
 
 def latency(fn):
     """Warm and L2-flushed CUDA-graph replay of ``fn``, in microseconds."""
-    from triton.testing import do_bench, do_bench_cudagraph
-
-    fn()
+    fn()  # the first call tunes and compiles, neither of which can run inside graph capture
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -145,12 +149,6 @@ def measure(args):
 
 
 def plot(records):
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
-
     plt.rcParams.update(
         {"font.size": 11, "axes.spines.top": False, "axes.spines.right": False}
     )

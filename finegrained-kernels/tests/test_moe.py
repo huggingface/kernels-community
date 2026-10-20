@@ -238,7 +238,7 @@ def _make_moe_weights(problem: MoEProblem):
         gate_up_s = swizzle_mx_scales(gate_up_s)
         down_s = swizzle_mx_scales(down_s)
     if problem.csf_encoding:
-        # E4M3 codes 16 apart, so every expert of both projections carries a CSF exception
+        # E4M3 codes 24 apart (more than the 15 a CSF offset holds): an exception in every expert, of both projections
         gate_up_s[..., 0, :2] = gate_up_s.new_tensor([0.125, 1.0])
         down_s[..., 0, :2] = down_s.new_tensor([0.125, 1.0])
     return gate_up, gate_up_s, gate_up_g, down, down_s, down_g

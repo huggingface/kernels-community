@@ -1939,13 +1939,15 @@ def matmul_2d(
     ``[..., N]`` intermediate; ``quantize_output=True`` (MX weights only) stores that intermediate in
     ``activation_format`` and returns ``(C, Cs)`` for the next op.
 
-    Routes by weight dtype + inferred block: ``Bs`` None → full-precision; MX/NVFP4 (int8/E4M3 weights
-    with UE8M0 group-32 or E4M3 group-16 ``Bs``) → ``mx_dynamic_matmul``; tensor-wide FP8 (scalar
-    ``Bs``) → ``w8a8_tensor_dynamic_fp8_matmul``; block FP8 → the static variant when ``As`` is a
-    per-tensor scalar, else dynamic.
-    CSF-compressed NVFP4 weight scales (``prepare_nvfp4_csf_scales``) pass as ``Bs`` = the fixed
-    stream with ``b_scale_exceptions``/``b_scale_exception_offsets`` = its exceptions and expert
-    offsets; the op decodes them before the GEMM.
+    Routes by weight dtype + inferred block:
+    - ``Bs`` None → full-precision.
+    - MX/NVFP4 (int8/E4M3 weights with UE8M0 group-32 or E4M3 group-16 ``Bs``) →
+      ``mx_dynamic_matmul``.
+    - tensor-wide FP8 (scalar ``Bs``) → ``w8a8_tensor_dynamic_fp8_matmul``.
+    - block FP8 → the static variant when ``As`` is a per-tensor scalar, else dynamic.
+    - CSF-compressed NVFP4 weight scales (``prepare_nvfp4_csf_scales``): ``Bs`` is the fixed
+      stream, ``b_scale_exceptions``/``b_scale_exception_offsets`` its exceptions and expert
+      offsets; the op decodes them before the GEMM.
     """
     if b_scale_exceptions is not None:  # one prepared matrix decodes as a 1-expert stack
         Bs = csf_weight_scales(Bs, b_scale_exceptions, b_scale_exception_offsets)[0]

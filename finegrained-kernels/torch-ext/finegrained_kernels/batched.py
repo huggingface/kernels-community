@@ -1823,9 +1823,9 @@ def matmul_batched(
     - one scale per expert (``Bs`` ``(E,)``/``(E, 1, 1)``) →
       ``w8a8_tensor_dynamic_fp8_matmul_batched``.
     - block scales (``Bs`` ``(E, N/bn, K/bk)``) → ``w8a8_block_dynamic_fp8_matmul_batched``.
-    CSF-compressed NVFP4 weight scales (``prepare_nvfp4_csf_scales``) pass as ``Bs`` = the fixed
-    stream with ``b_scale_exceptions``/``b_scale_exception_offsets`` = its exceptions and expert
-    offsets; the op decodes them before the GEMM (only the routed experts when routing allows).
+    - CSF-compressed NVFP4 weight scales (``prepare_nvfp4_csf_scales``): ``Bs`` is the fixed
+      stream, ``b_scale_exceptions``/``b_scale_exception_offsets`` its exceptions and expert
+      offsets; the op decodes them before the GEMM (only the routed experts when routing allows).
     """
     if b_scale_exceptions is not None:
         Bs = csf_weight_scales(
