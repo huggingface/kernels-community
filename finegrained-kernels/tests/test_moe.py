@@ -20,7 +20,7 @@ skipping at the reduce, and ``format`` forwarding. Op-level coverage (formats,
 epilogues, requant, routing variants against an independent torch oracle) lives in
 ``test_ops.py``; the weight formats come from the shared ``WEIGHTS`` registry."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
 import pytest
@@ -63,6 +63,8 @@ class MoEProblem:
     sentinel_fraction: float = 0.0
     negative_sentinels: bool = False  # off-rank routes as -1 rather than num_experts
     dtype: torch.dtype = torch.bfloat16
+    # in the CI subset (kernels_ci); the rest run in test_fused_extended
+    ci: bool = field(default=True, compare=False)
     activation_format: Optional[str] = None
     activation_scale_ub: Optional[float] = None
     compile: bool = False
@@ -139,13 +141,13 @@ MOE_PROBLEMS = [
     MoEProblem(weights="fp8_tensor", num_tokens=1024, num_top_k=4, static=True),
     # dynamic per-token activations (tensor-wide, row-wise): the intermediate's whole-row scale is
     # beyond any gate_up epilogue tile, so the chain hands the down a bf16 intermediate to quantize
-    MoEProblem(weights="fp8_tensor", num_top_k=4),
+    MoEProblem(ci=False, weights="fp8_tensor", num_top_k=4),
     # row-wise weights (Llama 4 FP8 experts, top-1): decode, small batch, and a prefill batch
     # deep enough per expert for the grouped kernel's big tiles
-    MoEProblem(weights="fp8_rowwise", num_tokens=1, num_top_k=1),
+    MoEProblem(ci=False, weights="fp8_rowwise", num_tokens=1, num_top_k=1),
     MoEProblem(weights="fp8_rowwise", num_top_k=1),
-    MoEProblem(weights="fp8_rowwise", num_top_k=1, activation_scale_ub=0.5, compile=True),
-    MoEProblem(weights="fp8_rowwise", num_tokens=1024, num_top_k=1),
+    MoEProblem(ci=False, weights="fp8_rowwise", num_top_k=1, activation_scale_ub=0.5, compile=True),
+    MoEProblem(ci=False, weights="fp8_rowwise", num_tokens=1024, num_top_k=1),
     MoEProblem(weights="fp8_rowwise", num_top_k=4, static=True),
     # block-FP8 with UE8M0 (power-of-two) scales — the whole-model UE8M0 contract: acts,
     # weights, and the fused intermediate requant all power-of-two (DeepSeek-V4 attn / B200).
@@ -203,7 +205,7 @@ MOE_PROBLEMS = [
     # ── weight-only: bf16 activations and intermediate (no requantization) ──
     MoEProblem(weights="mxfp4", activation_format="bf16", num_tokens=1),
     MoEProblem(weights="mxfp4", activation_format="bf16"),
-    MoEProblem(weights="fp8_128x128", activation_format="bf16", num_tokens=1, bias=True),
+    MoEProblem(ci=False, weights="fp8_128x128", activation_format="bf16", num_tokens=1, bias=True),
     MoEProblem(weights="fp8_128x128", activation_format="bf16", num_tokens=5, bias=True),
     MoEProblem(weights="fp8_tensor", activation_format="bf16", num_tokens=5, num_top_k=2),
     # ── clamped/scaled SwiGLU (GPT-OSS / MiniMax-M3); glu is format-independent ──
@@ -221,22 +223,22 @@ MOE_PROBLEMS = [
     MoEProblem(weights="fp8_128x128", bias=True),
     MoEProblem(weights="fp8_128x128", num_tokens=1, bias=True),
     MoEProblem(weights="fp8_tensor", num_top_k=4, static=True, bias=True),
-    MoEProblem(weights="fp8_rowwise", num_top_k=4, bias=True),
+    MoEProblem(ci=False, weights="fp8_rowwise", num_top_k=4, bias=True),
     MoEProblem(weights="mxfp8", bias=True),
     MoEProblem(weights="nvfp4", input_globals=True, bias=True),
     MoEProblem(weights="mxfp4", activation_format="bf16", swiglu_alpha=1.702, swiglu_limit=7.0, num_tokens=1, bias=True),
     # ── int4 weight-only (W4A16), symmetric and with zero points: decode, batch, the GPT-OSS-style gate_up
     # (clamped SwiGLU + bias), and EP sentinels ──
-    MoEProblem(weights="int4", num_tokens=1),
-    MoEProblem(weights="int4"),
-    MoEProblem(weights="int4", zero_points=True, num_tokens=1),
+    MoEProblem(ci=False, weights="int4", num_tokens=1),
+    MoEProblem(ci=False, weights="int4"),
+    MoEProblem(ci=False, weights="int4", zero_points=True, num_tokens=1),
     MoEProblem(weights="int4", zero_points=True, num_tokens=64, num_top_k=2),
-    MoEProblem(weights="int4", zero_points=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
-    MoEProblem(weights="int4", num_tokens=8, sentinel_fraction=0.875),
-    MoEProblem(weights="int4", num_tokens=8, sentinel_fraction=0.875, negative_sentinels=True),
+    MoEProblem(ci=False, weights="int4", zero_points=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
+    MoEProblem(ci=False, weights="int4", num_tokens=8, sentinel_fraction=0.875),
+    MoEProblem(ci=False, weights="int4", num_tokens=8, sentinel_fraction=0.875, negative_sentinels=True),
     MoEProblem(weights="int8", zero_points=True, num_tokens=4),
     MoEProblem(weights="int2", zero_points=True, num_tokens=64, num_top_k=2),
-    MoEProblem(weights="int4", int_group=None, zero_points=True),
+    MoEProblem(ci=False, weights="int4", int_group=None, zero_points=True),
     MoEProblem(weights="int4", pre_quant_scale=True, num_tokens=4, num_top_k=2),
     MoEProblem(weights="int4", activation_format="fp8", static=True, pre_quant_scale=True,
                num_tokens=32, num_top_k=2),
@@ -245,7 +247,7 @@ MOE_PROBLEMS = [
     # ── expert parallelism: non-local experts sentinel-masked ──
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="fp8_128x128", num_tokens=8, sentinel_fraction=0.875),
-    MoEProblem(weights="fp8_rowwise", num_tokens=8, sentinel_fraction=0.875),
+    MoEProblem(ci=False, weights="fp8_rowwise", num_tokens=8, sentinel_fraction=0.875),
     MoEProblem(weights="mxfp8", num_tokens=8, sentinel_fraction=0.875, negative_sentinels=True),
     # swizzled MX scales quantize the activations once per token into every routed row's tile, which a token
     # routed only to other ranks' experts must not write
@@ -519,7 +521,7 @@ def test_grouped_scheduling_defines_every_route(sentinel_fraction, negative, num
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-@pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
+@pytest.mark.parametrize("problem", [p for p in MOE_PROBLEMS if p.ci], ids=lambda p: p.id)
 def test_fused_batched(problem):
     """Fused two-kernel MoE (gate_up + activation + requant + down + top-k reduce) via
     ``moe_fused_batched`` vs the unfused reference. ``simulate_unfused`` rounds each
@@ -531,12 +533,25 @@ def test_fused_batched(problem):
 
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
-@pytest.mark.parametrize("problem", MOE_PROBLEMS, ids=lambda p: p.id)
+@pytest.mark.parametrize("problem", [p for p in MOE_PROBLEMS if p.ci], ids=lambda p: p.id)
 def test_fused_grouped(problem):
     """Fused grouped MoE (gather gate_up + activation + requant + grouped down + top-k
     reduce) via ``moe_fused_grouped`` vs the same unfused reference, with
     ``simulate_unfused`` rounding each fused step through the activation dtype."""
     _run_pair(problem, moe.moe_fused_grouped, moe.moe_unfused_grouped)
+
+
+@pytest.mark.skipif(TEST_DEVICE is None, reason="Accelerator not available")
+@pytest.mark.parametrize("problem", [p for p in MOE_PROBLEMS if not p.ci], ids=lambda p: p.id)
+@pytest.mark.parametrize("forward", ["batched", "grouped"])
+def test_fused_extended(problem, forward):
+    """The MoE scenarios outside the CI subset (variants of formats the CI cells cover), on both
+    fused forwards against their unfused references."""
+    fused, unfused = {
+        "batched": (moe.moe_fused_batched, moe.moe_unfused_batched),
+        "grouped": (moe.moe_fused_grouped, moe.moe_unfused_grouped),
+    }[forward]
+    _run_pair(problem, fused, unfused)
 
 
 _PRODUCTION_ARM_PROBLEMS = [

@@ -30,7 +30,7 @@ weight scales pre-swizzled into the 5D SWIZZLE_32_4_4 tcgen05 layout — a pure 
 checked against the affine reference).
 Nothing in this file uses a kernel under test as the oracle."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import pytest
 import torch
@@ -120,6 +120,8 @@ class Problem:
     pre_quant_scale: bool = False  # AWQ input transform, shared for dense or per expert when routed
     svdquant_rank: int = 0  # dense NVFP4 residual plus BF16 low-rank correction
     dtype: torch.dtype = torch.bfloat16
+    # in the CI subset (kernels_ci); the rest run in test_op_scenarios_extended
+    ci: bool = field(default=True, compare=False)
 
     @property
     def id(self):
@@ -198,11 +200,11 @@ def scenarios() -> list[Problem]:
                 out.append(Problem(weights=w, activation_format=fmt))
     out += [
         # Coarse and per-tensor FP8 with raw BF16/FP16 activations.
-        Problem(weights="fp8_128x128", activation_format="bf16", S=1, N=192, K=384, bias=True, dtype=torch.float16),
-        Problem(weights="fp8_128x128_ue8m0", activation_format="bf16", S=8, empty_expert=True, sentinel_fraction=0.25),
+        Problem(ci=False, weights="fp8_128x128", activation_format="bf16", S=1, N=192, K=384, bias=True, dtype=torch.float16),
+        Problem(ci=False, weights="fp8_128x128_ue8m0", activation_format="bf16", S=8, empty_expert=True, sentinel_fraction=0.25),
         Problem(weights="fp8_tensor", activation_format="bf16", S=1, gate=True, bias=True, compile=True),
         Problem(weights="fp8_128x128", activation_format="bf16", S=257, N=256, K=512, gate=True, bias=True, compile=True),
-        Problem(weights="fp8_128x128", activation_format="bf16", S=1025, E=1, N=192, K=384, compile=True, bias=True),
+        Problem(ci=False, weights="fp8_128x128", activation_format="bf16", S=1025, E=1, N=192, K=384, compile=True, bias=True),
         Problem(weights="fp16", dtype=torch.float16),
         # gate WITHOUT requant (raw GLU intermediate) — one quantized + one full format
         Problem(weights="mxfp8", gate=True),
@@ -222,8 +224,8 @@ def scenarios() -> list[Problem]:
         Problem(weights="nvfp4", activation_format="fp8", static=True, gate=True, pre_quant_scale=True, compile=True),
         Problem(weights="nvfp4", S=8, gate=True, pre_quant_scale=True, compile=True),
         Problem(weights="nvfp4", S=1, svdquant_rank=32, pre_quant_scale=True, bias=True),
-        Problem(weights="nvfp4", S=64, N=129, K=320, svdquant_rank=128, pre_quant_scale=True, compile=True),
-        Problem(weights="nvfp4", S=128, svdquant_rank=32, pre_quant_scale=True, gate=True,
+        Problem(ci=False, weights="nvfp4", S=64, N=129, K=320, svdquant_rank=128, pre_quant_scale=True, compile=True),
+        Problem(ci=False, weights="nvfp4", S=128, svdquant_rank=32, pre_quant_scale=True, gate=True,
                 activation_format="nvfp4", quantize_output=True, swizzled=True),
         Problem(weights="mxfp8", sentinel_fraction=0.25),
         # the prefill expansion (>= 4096 routed rows below 1024 per expert) copies only the local rows:
@@ -291,7 +293,7 @@ def scenarios() -> list[Problem]:
         Problem(weights="fp8_128x128", compile=True),
         Problem(weights="mxfp4", compile=True),
         Problem(weights="bf16", compile=True),  # the fp kernel's pre_hook under compile
-        Problem(weights="fp8_rowwise", S=256, activation_scale_ub=0.5, compile=True),
+        Problem(ci=False, weights="fp8_rowwise", S=256, activation_scale_ub=0.5, compile=True),
         Problem(weights="fp8_tensor", static=True, compile=True),  # the static arm's operand marshalling
         # calibrated (static) activation quant, reached when As is a calibrated scale rather than
         # per-block. One value per quantized module, so the OP fixes the shape: a dense linear
@@ -305,16 +307,16 @@ def scenarios() -> list[Problem]:
         # tile folds them on its other axis, a caller's per-token As rides as-is, and the launch-scale shape
         # reaches the grouped kernel's descriptor / warp-specialized arms
         Problem(weights="fp8_rowwise", gate=True),
-        Problem(weights="fp8_rowwise", S=8),
-        Problem(weights="fp8_rowwise", gate=True, S=8),
-        Problem(weights="fp8_rowwise", prequant=True, compile=True),
-        Problem(weights="fp8_rowwise", S=4096, E=8, prequant=True, noncontiguous=True),
+        Problem(ci=False, weights="fp8_rowwise", S=8),
+        Problem(ci=False, weights="fp8_rowwise", gate=True, S=8),
+        Problem(ci=False, weights="fp8_rowwise", prequant=True, compile=True),
+        Problem(ci=False, weights="fp8_rowwise", S=4096, E=8, prequant=True, noncontiguous=True),
         Problem(weights="fp8_rowwise", static=True, S=17),
-        Problem(weights="fp8_rowwise", S=257, bias=True, empty_expert=True, compile=True),
-        Problem(weights="fp8_rowwise", S=2048, E=16, N=512, K=1024),
+        Problem(ci=False, weights="fp8_rowwise", S=257, bias=True, empty_expert=True, compile=True),
+        Problem(ci=False, weights="fp8_rowwise", S=2048, E=16, N=512, K=1024),
         # the prefill expansion lays the routed rows out, and their per-token scales with them
-        Problem(weights="fp8_rowwise", S=4096, E=8, sentinel_fraction=0.5),
-        Problem(weights="fp8_tensor", S=4096, E=8),
+        Problem(ci=False, weights="fp8_rowwise", S=4096, E=8, sentinel_fraction=0.5),
+        Problem(ci=False, weights="fp8_tensor", S=4096, E=8),
         # non-aligned N (64-grid, off the 128-grid — gpt-oss H=I=2880 shape). matmul_2d masks the
         # N-tail; routed MX runs the affine arm (per-row scales, any BN|N); routed FP8 rejects it
         # (its scales are 128-blocked along N — raises pointing to matmul_2d).
@@ -354,27 +356,27 @@ def scenarios() -> list[Problem]:
         # int4 weight-only (the format matrix above gives each row its plain cell): the gated GLU with
         # a bias, decode (the batched swap reduce at S=1), a K off the BK grid (the batched tail tile
         # slides back) and fp16 activations, each with and without zero points
-        Problem(weights="int4", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
+        Problem(ci=False, weights="int4", gate=True, swiglu_alpha=1.702, swiglu_limit=7.0, bias=True),
         Problem(weights="int4", zero_points=True, gate=True, bias=True),
-        Problem(weights="int4", S=1),
-        Problem(weights="int4", zero_points=True, S=8),
-        Problem(weights="int4", zero_points=True, K=640),
-        Problem(weights="int4", dtype=torch.float16),
-        Problem(weights="int4", zero_points=True, dtype=torch.float16),
+        Problem(ci=False, weights="int4", S=1),
+        Problem(ci=False, weights="int4", zero_points=True, S=8),
+        Problem(ci=False, weights="int4", zero_points=True, K=640),
+        Problem(ci=False, weights="int4", dtype=torch.float16),
+        Problem(ci=False, weights="int4", zero_points=True, dtype=torch.float16),
         # the 8- and 2-bit widths ride the same kernels (the width follows from the weight's word count)
-        Problem(weights="int8", zero_points=True, S=1),
-        Problem(weights="int8", zero_points=True, gate=True, bias=True),
-        Problem(weights="int8", dtype=torch.float16),
-        Problem(weights="int2", zero_points=True, S=1),
+        Problem(ci=False, weights="int8", zero_points=True, S=1),
+        Problem(ci=False, weights="int8", zero_points=True, gate=True, bias=True),
+        Problem(ci=False, weights="int8", dtype=torch.float16),
+        Problem(ci=False, weights="int2", zero_points=True, S=1),
         Problem(weights="int2", zero_points=True, gate=True, bias=True),
         # Wide groups and per-channel scales retain rounded weight dequantization.
-        Problem(weights="int2", int_group=512, K=1024),
-        Problem(weights="int4", int_group=512, K=1024, zero_points=True, gate=True, bias=True),
-        Problem(weights="int8", int_group=None, K=1024, zero_points=True),
+        Problem(ci=False, weights="int2", int_group=512, K=1024),
+        Problem(ci=False, weights="int4", int_group=512, K=1024, zero_points=True, gate=True, bias=True),
+        Problem(ci=False, weights="int8", int_group=None, K=1024, zero_points=True),
         # per-channel with K off the 128 grid (gpt-oss K=2880): only a 64-wide K tile divides K
         Problem(weights="int8", int_group=None, K=320),
-        Problem(weights="int4", int_group=None, K=1024, compile=True),
-        Problem(weights="int4", zero_points=True, compile=True),
+        Problem(ci=False, weights="int4", int_group=None, K=1024, compile=True),
+        Problem(ci=False, weights="int4", zero_points=True, compile=True),
         Problem(weights="int4", S=8, gate=True, bias=True, pre_quant_scale=True, compile=True),
         Problem(weights="int4", S=32, gate=True, bias=True, activation_format="fp8", static=True,
                 pre_quant_scale=True, compile=True),
@@ -842,10 +844,22 @@ def _skip_unsupported(problem: Problem, op: str) -> None:
 @pytest.mark.kernels_ci
 @pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
 @pytest.mark.parametrize("op", ["batched", "grouped", "matmul"])
-@pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.id)
+@pytest.mark.parametrize("problem", [p for p in PROBLEMS if p.ci], ids=lambda p: p.id)
 def test_op_scenarios(problem: Problem, op):
     """Reference (the op written in torch) vs op (the kernel): same inputs, each returning the op's
     own output format, compared once through the shared ``_dequant``."""
+    _run_scenario(problem, op)
+
+
+@pytest.mark.skipif(TEST_DEVICE is None, reason="accelerator (CUDA/XPU) required")
+@pytest.mark.parametrize("op", ["batched", "grouped", "matmul"])
+@pytest.mark.parametrize("problem", [p for p in PROBLEMS if not p.ci], ids=lambda p: p.id)
+def test_op_scenarios_extended(problem: Problem, op):
+    """The scenarios outside the CI subset: variants of a format the CI cells already cover."""
+    _run_scenario(problem, op)
+
+
+def _run_scenario(problem: Problem, op):
     _skip_unsupported(problem, op)
     A, expert_ids = _routed(problem)
     row = WEIGHTS[problem.weights]
