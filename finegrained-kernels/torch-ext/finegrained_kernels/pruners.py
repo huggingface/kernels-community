@@ -1283,18 +1283,22 @@ def scalar_block_m_pruner(m_arg: str):
 
 
 def mx_auxiliary_pruner():
-    """SVDQuant native MMA: split the decode reduction or persist across prefill tiles. Plain NVFP4/MXFP4 M=1 never
-    crowns a split row: the scalar BM=1 GEMV wins (B200 graph, 5120x5120: NVFP4 11.1 vs best split 26.1us, MXFP4 12.6
-    vs 19.5us), so the scope stays."""
+    """Split the single-token decode reduction (the launch allocates the partials for M=1 without GATE), or persist
+    across SVDQuant prefill tiles. Plain M=1 splits only the scalar BM=1 reduce: the native split tile pads the token
+    to 128 MMA rows and never crowns there (B200 graph, NVFP4: 5120x5120 scalar 11.3us, scalar split 10.2us, native
+    split 26.2us; N1024 K14336 22.6 / 7.7 / 31.5us); SVDQuant keeps the native split (down: 27.4us vs FlashInfer 33.1us). A split launch also zeroes its arrival
+    counters (one small extra launch, ~10us in host-bound eager decode); graph replay hides it."""
     def ok(c, args):
         split = c.kwargs.get("SPLIT_K", 1)
         persistent = c.kwargs.get("PERSISTENT", False)
         if split == 1 and not persistent:
             return True
-        if not is_sm10x() or args["GATE"] or args.get("LORA_RANK", 0) == 0:
+        if not is_sm10x() or args["GATE"]:
             return False
         if persistent:
-            return args["M"] >= 128
+            return args.get("LORA_RANK", 0) > 0 and args["M"] >= 128
+        if c.kwargs["COMPUTE_MODE"] != "scalar" and args.get("LORA_RANK", 0) == 0:
+            return False
         return args["M"] == 1 and args["K"] // c.kwargs["BLOCK_SIZE_K"] >= 2 * split
     return config_filter(ok)
 

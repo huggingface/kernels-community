@@ -620,6 +620,8 @@ SPLIT_K_VALUES = (2, 4, 8)
 SPLIT_K_MAX_M = 16
 # the widest split-K N tile: the split-K partials buffers are sized for the tile grid at this width
 SPLIT_K_MAX_BLOCK_N = 64
+# the narrowest MX split-K N tile: mx_dynamic_matmul sizes its arrival counters for the tile grid at this width
+MX_SPLIT_K_MIN_BLOCK_N = 32
 
 
 def _mx_matmul_configs():
@@ -648,7 +650,13 @@ def _mx_matmul_configs():
               and not c.kwargs["SWAP_AB"] and c.kwargs["WARP_SPEC"] and c.num_warps in (4, 8)]
     persistent = [triton.Config(dict(c.kwargs, PERSISTENT=True), num_warps=c.num_warps,
                                 num_stages=c.num_stages, pre_hook=c.pre_hook) for c in native]
-    return configs + split_k_autotuning_configs(SPLIT_K_VALUES, configs=native) + persistent
+    # the single-token scalar reduce, split along K: its BM=1 GEVM leaves most SMs idle on a deep K
+    scalar = [c for c in configs if c.kwargs["COMPUTE_MODE"] == "scalar" and c.kwargs["BLOCK_SIZE_M"] == 1
+              and c.kwargs["A_MEMORY_MODE"] == c.kwargs["B_MEMORY_MODE"] == "pointer"
+              and not c.kwargs["SWAP_AB"] and not c.kwargs["WARP_SPEC"]
+              and c.kwargs["BLOCK_SIZE_N"] in (32, 64) and c.kwargs["BLOCK_SIZE_K"] in (256, 512)
+              and c.num_warps in (2, 4, 8) and c.num_stages in (2, 3, 5)]
+    return configs + split_k_autotuning_configs(SPLIT_K_VALUES, configs=native + scalar) + persistent
 
 
 @bayesian_autotune(
@@ -899,6 +907,11 @@ def mx_dynamic_matmul_kernel(
                 stride_li_m=stride_li_m, stride_li_r=stride_li_r,
                 stride_lw_n=stride_lw_n, stride_lw_r=stride_lw_r, LORA_RANK=LORA_RANK, LORA_SPLIT_K=LORA_SPLIT_K,
             )
+
+assert all(
+    MX_SPLIT_K_MIN_BLOCK_N <= c.kwargs["BLOCK_SIZE_N"] <= 256
+    for c in mx_dynamic_matmul_kernel.configs if c.kwargs.get("SPLIT_K", 1) > 1
+), "a split-K config outgrows the partials or counters mx_dynamic_matmul allocates"
 
 
 @bayesian_autotune(
@@ -2038,11 +2051,12 @@ def mx_dynamic_matmul(
             META["SPLIT_K"],
         )
 
-    # Only the one real decode row is stored; native split tiles span 128 or 256 columns.
+    # split-K scratch (single-token decode without GATE, mx_auxiliary_pruner): only the one real row is reduced, so the
+    # partials cover the widest split over the BN=256 padded grid, and the counters the narrowest split tile's grid.
     partials = counters = None
-    if lora_input is not None and M == 1 and not gate:
+    if M == 1 and not gate:
         partials = torch.empty(SPLIT_K_VALUES[-1] * triton.cdiv(N, 256) * 256, device=A.device, dtype=torch.float32)
-        counters = torch.empty(triton.cdiv(N, 128), device=A.device, dtype=torch.int32)
+        counters = torch.empty(triton.cdiv(N, MX_SPLIT_K_MIN_BLOCK_N), device=A.device, dtype=torch.int32)
 
     with device_context(A.device):
         bias_stride_e, bias_stride_n = bias_strides(bias)
