@@ -24,7 +24,7 @@
         builtins.map (
           version:
           if (version.cudaVersion or null) == "12.6" then version // { ptxasVersion = "12.8"; } else version
-        ) allVersions;
+        ) (builtins.filter (version: (version.cudaVersion or null) != "13.2") allVersions);
 
     };
 }
