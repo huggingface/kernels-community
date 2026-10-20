@@ -4,7 +4,10 @@
 import pytest
 import torch
 
-from megablocks import ops
+import kernels
+
+megablocks = kernels.get_kernel("kernels-community/megablocks", version=1)
+ops = megablocks.ops
 
 _HISTOGRAM_TESTS = (
     (1, 32, torch.int16, 128),
