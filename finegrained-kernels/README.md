@@ -104,8 +104,10 @@ loader's job (transformers does it with its conversion ops):
   block 0, gate block 1, ...]`). Separate `gate_proj` / `up_proj` checkpoint tensors satisfy this,
   and so does a stacked `[gate; up]` matrix quantized as one when `N` is a multiple of 128 (block
   quantization is local, so the values match). A checkpoint quantized *after* interleaving, or a
-  stacked one with `N` not a multiple of 128, has blocks that mix both and must be requantized at
-  load.
+  stacked one with `N` not a multiple of 128, has blocks that mix both. Moving rows cannot fix that
+  (a 128-row block of one projection would need two scales), so the loader has to requantize those
+  blocks; with power-of-two (UE8M0) scales that rescale is exact unless a value leaves the E4M3
+  range.
 - Per-row scales (MXFP8, MXFP4, NVFP4) and tensor-wide scales have no such ordering question.
   The NVFP4 per-expert globals of gate and up are merged into one per expert, as described above.
 
