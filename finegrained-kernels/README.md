@@ -328,7 +328,7 @@ How much of the MMA each tile uses.
 | 2D | block FP8 (dynamic act) | 🟠 | 🔴 | 🔴 | ⚪† | ⚪ | ⚪ | 🔴 |
 | 2D | block FP8 (static act) | ⚪ | 🔴 | 🔴 | ⚪† | ⚪ | ⚪ | 🔴 |
 | 2D | tensor / row-wise FP8 | ⚪ | 🟠 | 🔴 | ⚪† | ⚪ | ⚪ | 🟠 |
-| 2D | MXFP8 / MXFP4 / NVFP4 | 🟠 | 🟠 | 🟠 | 🟠 | ⚪ | ⚪ | 🟠 |
+| 2D | MXFP8 / MXFP4 / NVFP4 | 🟠 | 🟠 | 🟠 | 🟢 | ⚪ | ⚪ | 🟠 |
 | 2D | MX weight-only (W4A16 / W8A16) | 🟠 | 🔴 | 🔴 | 🔴 | ⚪ | 🟢 | 🔴 |
 | 2D | FP8 weight-only | ⚪ | 🟠 | 🔴 | 🔴 | ⚪ | 🔴 | 🟠 |
 | 2D | INT2/4/8 (GPTQ, AWQ, SmoothQuant) | ⚪ | 🟠 | 🟠 | 🟠 | ⚪ | 🔴 | 🔴 |
